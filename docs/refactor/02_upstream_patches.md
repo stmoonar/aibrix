@@ -40,6 +40,7 @@ Status: not migrated yet. Keep for a separate P2 commit after gateway wake-up is
 | --- | --- | --- | --- |
 | TRE-PATCH(P2-GW-001) | `eeed0601` | Gateway wake-up dispatcher and env-validated service-manager client. | RED: missing `callWakeUpService`; GREEN: `GOPROXY=https://goproxy.cn,direct /usr/local/go/bin/go test ./pkg/plugins/gateway/... -count=1` |
 | TRE-PATCH(P2-GW-002) | `[P2] gateway: trigger wake-up for zero routable pods` | New-target zero-routable hook in `validateModelAvailability()`. | RED: no wake-up request observed; GREEN: `GOPROXY=https://goproxy.cn,direct /usr/local/go/bin/go test ./pkg/plugins/gateway/... -count=1` |
+| TRE-PATCH(P2-GW-003) | `[P2] gateway: dual-write TRE Redis metrics` | TRE Redis pod-metrics writer with `TRE_REDIS_SCHEMA=v1|v2|dual`, default dual. | RED: undefined writer/schema helpers; GREEN: `go test ./pkg/cache -count=1` and `go test ./pkg/plugins/gateway/... -count=1` |
 | TRE-PATCH(P2-APA-001) | pending | APA sleep-mode service-manager adapter. | Podautoscaler tests |
 
 ## Notes
@@ -89,3 +90,24 @@ GOPROXY=https://goproxy.cn,direct /usr/local/go/bin/go test ./pkg/plugins/gatewa
 ```
 
 Result: all passed on server 76.
+
+
+### TRE-PATCH(P2-GW-003)
+
+RED:
+
+```bash
+GOPROXY=https://goproxy.cn,direct /usr/local/go/bin/go test ./pkg/cache -run TestWriteTREPodMetricsToRedis -count=1
+```
+
+Result: build failed because `writeTREPodMetricsToRedis` and `treMetricSchemaMode` were undefined.
+
+GREEN:
+
+```bash
+GOPROXY=https://goproxy.cn,direct /usr/local/go/bin/go test ./pkg/cache -run TestWriteTREPodMetricsToRedis -count=1
+GOPROXY=https://goproxy.cn,direct /usr/local/go/bin/go test ./pkg/cache -count=1
+GOPROXY=https://goproxy.cn,direct /usr/local/go/bin/go test ./pkg/plugins/gateway/... -count=1
+```
+
+Result: all passed on server 76. Tests use `miniredis` and verify `ZRANGEBYSCORE` can read back `tre:v2:hist:{pod}` / `tre:v2:inst:{pod}` entries. The default mode writes both v1 legacy keys and v2 sorted sets; `TRE_REDIS_SCHEMA=v2` writes only v2.

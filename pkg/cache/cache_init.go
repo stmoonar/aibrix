@@ -365,10 +365,12 @@ func InitWithOptions(config *rest.Config, stopCh <-chan struct{}, opts InitOptio
 			initTraceCache(opts.RedisClient, stopCh)
 		}
 
-		// Initialize gateway snapshot sync if Redis is available
+		// Initialize gateway snapshot sync and TRE pod metric Redis writer if Redis is available.
 		if opts.RedisClient != nil {
 			klog.Info("Initializing gateway snapshot sync")
 			initGatewaySnapshotSync(store, stopCh)
+			// TRE-PATCH(P2-GW-003): dual-write pod metrics for TRE controller compatibility.
+			initTREPodMetricsTraceCache(store, stopCh)
 		}
 
 		// Initialize KV event sync if enabled
