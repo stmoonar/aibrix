@@ -58,6 +58,18 @@ Rules:
 - Persisted bindings without a current pod observation are retained conservatively and reported as warnings.
 - Reconcile persists the merged result only when bindings change, preserving the state version on no-op restart.
 
+## vLLM Ops Contract
+
+The sixth P4 slice adds `tre_sm.ops.vllm_ops`, the retrying boundary for vLLM `/sleep` and `/wake_up` calls.
+
+Rules:
+
+- The HTTP transport is injectable, so unit tests use fake transport and do not touch the network.
+- `sleep()` posts `/sleep`; `wake_up()` posts `/wake_up`; both default to port 8000 and propagate configured timeout.
+- Transient transport exceptions and non-success HTTP responses are retried up to `max_attempts`.
+- HTTP 2xx is success; HTTP 409 is treated as idempotent success for repeated target-state operations.
+- Exhausted retries return a structured `VllmOpResult` instead of raising transport-specific exceptions.
+
 ## Verification Log
 
 ### P4-SM-001 slot allocator
@@ -156,6 +168,25 @@ PYTHONPATH=tre/common:tre/service-manager python3 -m pytest -q tre/service-manag
 
 Result: focused topology tests passed with 2 tests; service-manager tests passed with 11 tests.
 
+### P4-SM-006 vLLM ops wrapper
+
+RED:
+
+```bash
+PYTHONPATH=tre/common:tre/service-manager python3 -m pytest -q tre/service-manager/tests/test_vllm_ops.py
+```
+
+Result: failed during collection because `tre_sm.ops.vllm_ops` did not exist.
+
+GREEN:
+
+```bash
+PYTHONPATH=tre/common:tre/service-manager python3 -m pytest -q tre/service-manager/tests/test_vllm_ops.py
+PYTHONPATH=tre/common:tre/service-manager python3 -m pytest -q tre/service-manager/tests
+```
+
+Result: focused vLLM ops tests passed with 3 tests; service-manager tests passed with 14 tests.
+
 ## Remaining P4 Work
 
-- Implement vLLM/Kubernetes ops wrappers, API v2, and v1 compatibility adapters.
+- Implement Kubernetes ops wrapper, API v2, and v1 compatibility adapters.

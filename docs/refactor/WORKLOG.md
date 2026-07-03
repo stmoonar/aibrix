@@ -174,3 +174,10 @@
 - Reused `SlotAllocator` validation instead of duplicating GPU slot rules in the discovery adapter.
 - Verified remotely: focused topology tests passed with 2 tests, and `tre/service-manager/tests` passed with 11 tests.
 - Next P4 work: vLLM/Kubernetes ops wrappers, then API v2 idempotency.
+
+### P4 vLLM Ops Slice
+
+- Added RED tests for vLLM `/sleep` and `/wake_up` operations with fake HTTP transport: retries, timeout propagation, idempotent 409 handling, and structured failure after exhausted attempts.
+- Implemented `tre_sm.ops.vllm_ops.VllmOps` and `VllmOpResult` with injectable transport and lazy `requests` import for real use.
+- Verified remotely: focused vLLM ops tests passed with 3 tests, and `tre/service-manager/tests` passed with 14 tests.
+- Next P4 work: Kubernetes annotation/discovery ops wrapper, then API v2 idempotency.
