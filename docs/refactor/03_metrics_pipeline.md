@@ -133,4 +133,6 @@ The golden helper is test-only and mirrors the frozen collector formulas: first/
 
 ## Remaining P3 Work
 
-- P3 store slice completed for v2/v1 reads, edge fixtures, golden formula comparison, and 3 model x 8 pod x 30 minute benchmark. Remaining broader P3 follow-up: real Redis dump if cluster Redis is available and P5 integration use of `MetricsSnapshot`.
+- P3 store slice completed for v2/v1 reads, edge fixtures, golden formula comparison, and 3 model x 8 pod x 30 minute benchmark.
+- Real Redis dump was skipped: read-only host probe to the cluster Redis service timed out from server 76.
+- Broader follow-up moves to P5 integration use of `MetricsSnapshot`.
