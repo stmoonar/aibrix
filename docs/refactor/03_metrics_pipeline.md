@@ -82,8 +82,28 @@ cd tre && make smoke
 
 Result: all passed on server 76. The v1 path scans only `aibrix:pod_histogram_metrics_*` and `aibrix:pod_instant_metrics_*`, normalizes timestamp suffixes to milliseconds, filters docs for the requested model, and reuses the v2 aggregation semantics.
 
+
+### P3-METRICS-003 fixture edge cases and snapshots
+
+RED:
+
+```bash
+PYTHONPATH=tre/common:tre/controller:tre/controller/tests python3 -m pytest -q tre/controller/tests/test_metrics_store.py -k snapshot
+```
+
+Result: failed because `MetricsStore` did not expose `read_snapshot()`.
+
+GREEN:
+
+```bash
+PYTHONPATH=tre/common:tre/controller:tre/controller/tests python3 -m pytest -q tre/controller/tests/test_metrics_store.py
+cd tre && make check
+cd tre && make smoke
+```
+
+Result: all passed on server 76. The fixture helper covers out-of-order v2 writes, missing instant samples, and counter reset clamping. `read_snapshot()` now returns `MetricsSnapshot` for every model in the registry, including zero-valued models with no data in the requested window.
+
 ## Remaining P3 Work
 
-- Add a fixture generator with missing samples, out-of-order samples, counter reset, and multi-window scenarios.
-- Add full `MetricsSnapshot` multi-model reads and benchmark the 3 model x 8 pod x 30 minute fixture target.
+- Add multi-window scenarios to the fixture generator and benchmark the 3 model x 8 pod x 30 minute fixture target.
 - Compare the new store against the frozen old collector on the same fixture and document any remaining differences.

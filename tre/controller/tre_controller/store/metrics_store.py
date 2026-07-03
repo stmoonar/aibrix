@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from tre_common.metrics_schema import ModelWindowMetrics, PodWindowMetrics
+from tre_common.metrics_schema import MetricsSnapshot, ModelWindowMetrics, PodWindowMetrics
 from tre_common.percentile import histogram_percentile
 from tre_common.rediskeys import hist_key, inst_key, pods_key
 
@@ -47,6 +47,13 @@ class MetricsStore:
         self._percentile_mode = percentile_mode
         self._schema = schema
         self._window_cache: dict[tuple[str, str, int, int], ModelWindowMetrics] = {}
+
+    def read_snapshot(self, window_start_ms: int, window_end_ms: int) -> MetricsSnapshot:
+        models = {
+            spec.name: self.read_model_window(spec.name, window_start_ms, window_end_ms)
+            for spec in self._registry.models()
+        }
+        return MetricsSnapshot(ts_ms=int(window_end_ms), models=models, stale=False)
 
     def read_model_window(self, model: str, window_start_ms: int, window_end_ms: int) -> ModelWindowMetrics:
         cache_key = (self._schema, model, int(window_start_ms), int(window_end_ms))

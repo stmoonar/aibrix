@@ -1,5 +1,5 @@
 PYTHON ?= python3
-TRE_PYTHONPATH := $(CURDIR)/common:$(CURDIR)/deploy:$(CURDIR)/controller:$(PYTHONPATH)
+TRE_PYTHONPATH := $(CURDIR)/common:$(CURDIR)/deploy:$(CURDIR)/controller:$(CURDIR)/controller/tests:$(PYTHONPATH)
 
 .PHONY: check smoke manifests
 

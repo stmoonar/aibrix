@@ -5,6 +5,7 @@ from pathlib import Path
 
 from tre_common.registry import load_registry
 from tre_controller.store.metrics_store import MetricsStore
+from make_redis_fixture import FakeRedis as FixtureRedis, populate_edge_case_fixture
 
 
 TRE_ROOT = Path(__file__).resolve().parents[2]
@@ -164,3 +165,20 @@ def test_metrics_store_reads_v1_legacy_keys_without_pod_set():
     assert metrics.kv_cache_hit_rate == 0.5
     assert metrics.routable_pods == 1
     assert redis.scan_calls == 2
+
+
+def test_metrics_store_snapshot_reads_all_registry_models_from_fixture():
+    redis = FixtureRedis()
+    window = populate_edge_case_fixture(redis)
+    store = MetricsStore(redis, load_registry(str(REGISTRY_PATH)), instant_sample_interval_ms=5_000)
+
+    snapshot = store.read_snapshot(window.start_ms, window.end_ms)
+
+    assert snapshot.ts_ms == window.end_ms
+    assert snapshot.stale is False
+    assert set(snapshot.models) == {"dsqwen-7b", "dsllama-8b", "dsqwen-14b"}
+    assert snapshot.models["dsqwen-7b"].prompt_tokens == 32.0
+    assert snapshot.models["dsqwen-7b"].avg_waiting == 3.0
+    assert snapshot.models["dsllama-8b"].prompt_tokens == 0.0
+    assert snapshot.models["dsllama-8b"].avg_waiting == 3.0
+    assert snapshot.models["dsqwen-14b"].routable_pods == 0
