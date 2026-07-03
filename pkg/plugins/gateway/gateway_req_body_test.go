@@ -19,6 +19,8 @@ package gateway
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -810,4 +812,44 @@ func TestHandleRequestBody_ModelRPSNotConsumedOnRoutingFailure(t *testing.T) {
 	mockCache.AssertExpectations(t)
 	mockRouter.AssertExpectations(t)
 	mockModelRL.AssertExpectations(t)
+}
+
+func TestValidateModelAvailabilitySubmitsWakeupWhenNoRoutablePods(t *testing.T) {
+	t.Setenv("HOT_SWITCH", "1")
+	t.Setenv("delay_time1", "0")
+	wakeupCalled := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Fatalf("method = %s, want POST", r.Method)
+		}
+		if r.URL.Path != "/wake_up" {
+			t.Fatalf("path = %s, want /wake_up", r.URL.Path)
+		}
+		if got := r.URL.Query().Get("model_name"); got != "test-model" {
+			t.Fatalf("model_name = %s, want test-model", got)
+		}
+		wakeupCalled <- struct{}{}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"success":true,"delayed":false}`))
+	}))
+	defer server.Close()
+	t.Setenv("SERVEMENT_URL", server.URL)
+
+	mockCache := &MockCache{}
+	podList := &utils.PodArray{Pods: []*v1.Pod{{Status: v1.PodStatus{PodIP: "1.2.3.4"}}}}
+	mockCache.On("HasModel", "test-model").Return(true).Once()
+	mockCache.On("ListPodsByModel", "test-model").Return(podList, nil).Once()
+	serverUnderTest := &Server{cache: mockCache}
+
+	pods, resp := serverUnderTest.validateModelAvailability("test-request-id", "test-model")
+
+	assert.Nil(t, pods)
+	assert.NotNil(t, resp)
+	assert.Equal(t, envoyTypePb.StatusCode_ServiceUnavailable, resp.GetImmediateResponse().GetStatus().GetCode())
+	select {
+	case <-wakeupCalled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected wake-up request for zero-routable model")
+	}
+	mockCache.AssertExpectations(t)
 }

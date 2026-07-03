@@ -217,7 +217,15 @@ func (s *Server) validateModelAvailability(requestID, model string) (types.PodLi
 	}
 
 	podsArr, err := s.cache.ListPodsByModel(model)
-	if err != nil || podsArr == nil || utils.CountRoutablePods(podsArr.All()) == 0 {
+	routablePods := 0
+	if podsArr != nil {
+		routablePods = utils.CountRoutablePods(podsArr.All())
+	}
+	if err != nil || podsArr == nil || routablePods == 0 {
+		// TRE-PATCH(P2-GW-002): new gateway rejects before queue routing, so trigger wake-up here.
+		if err == nil && podsArr != nil && routablePods == 0 {
+			routing.SubmitWakeUpIfEnabled(model, 0)
+		}
 		klog.ErrorS(err, "no ready pod available", "requestID", requestID, "model", model)
 		return nil, generateErrorResponse(envoyTypePb.StatusCode_ServiceUnavailable,
 			[]*configPb.HeaderValueOption{{Header: &configPb.HeaderValue{

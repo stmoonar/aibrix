@@ -76,6 +76,15 @@ func init() {
 	go globalDispatcher.run()
 }
 
+// SubmitWakeUpIfEnabled submits a gateway wake-up request when HOT_SWITCH is enabled.
+func SubmitWakeUpIfEnabled(model string, queueLen int) bool {
+	if os.Getenv("HOT_SWITCH") != "1" {
+		return false
+	}
+	globalDispatcher.Submit(model, queueLen)
+	return true
+}
+
 // Submit enqueues a model wake-up request. It is non-blocking and deduplicates by model.
 func (d *WakeUpDispatcher) Submit(model string, queueLen int) {
 	d.queueLen.Store(model, queueLen)

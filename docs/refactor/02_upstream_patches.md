@@ -38,8 +38,8 @@ Status: not migrated yet. Keep for a separate P2 commit after gateway wake-up is
 
 | Patch | Commit | Scope | Verification |
 | --- | --- | --- | --- |
-| TRE-PATCH(P2-GW-001) | pending | Gateway wake-up dispatcher and env-validated service-manager client. | RED: missing `callWakeUpService`; GREEN: `GOPROXY=https://goproxy.cn,direct /usr/local/go/bin/go test ./pkg/plugins/gateway/... -count=1` |
-| TRE-PATCH(P2-GW-002) | pending | New-target zero-routable hook in `validateModelAvailability()`. | Gateway request-body tests plus algorithms tests |
+| TRE-PATCH(P2-GW-001) | `eeed0601` | Gateway wake-up dispatcher and env-validated service-manager client. | RED: missing `callWakeUpService`; GREEN: `GOPROXY=https://goproxy.cn,direct /usr/local/go/bin/go test ./pkg/plugins/gateway/... -count=1` |
+| TRE-PATCH(P2-GW-002) | `[P2] gateway: trigger wake-up for zero routable pods` | New-target zero-routable hook in `validateModelAvailability()`. | RED: no wake-up request observed; GREEN: `GOPROXY=https://goproxy.cn,direct /usr/local/go/bin/go test ./pkg/plugins/gateway/... -count=1` |
 | TRE-PATCH(P2-APA-001) | pending | APA sleep-mode service-manager adapter. | Podautoscaler tests |
 
 ## Notes
@@ -69,3 +69,23 @@ GOPROXY=https://goproxy.cn,direct /usr/local/go/bin/go test ./pkg/plugins/gatewa
 ```
 
 Result: all passed on server 76. `/usr/local/go/bin/go` is required because `go` is not on the SSH PATH. `GOPROXY=https://goproxy.cn,direct` is required because `proxy.golang.org` timed out from the remote host.
+
+
+### TRE-PATCH(P2-GW-002)
+
+RED:
+
+```bash
+GOPROXY=https://goproxy.cn,direct /usr/local/go/bin/go test ./pkg/plugins/gateway -run TestValidateModelAvailabilitySubmitsWakeupWhenNoRoutablePods -count=1
+```
+
+Result: failed after 2 seconds because no wake-up request was sent for a model with only non-routable pods.
+
+GREEN:
+
+```bash
+GOPROXY=https://goproxy.cn,direct /usr/local/go/bin/go test ./pkg/plugins/gateway -run TestValidateModelAvailabilitySubmitsWakeupWhenNoRoutablePods -count=1
+GOPROXY=https://goproxy.cn,direct /usr/local/go/bin/go test ./pkg/plugins/gateway/... -count=1
+```
+
+Result: all passed on server 76.
