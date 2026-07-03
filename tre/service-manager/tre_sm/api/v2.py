@@ -61,6 +61,38 @@ class ServiceManagerV2:
             "actions": actions,
         }
 
+
+    def put_model_routable(self, model: str, *, hidden_pods: list[str]) -> dict:
+        self._registry.model(model)
+        snapshot = self._store.load()
+        model_bindings = [binding for binding in snapshot.bindings if binding.model == model]
+        model_serve_ids = {binding.serve_id for binding in model_bindings}
+        requested_hidden = set(hidden_pods)
+        unknown = requested_hidden - model_serve_ids
+        if unknown:
+            raise ValueError(f"unknown pods for {model}: {sorted(unknown)}")
+
+        actions: list[dict] = []
+        updated_by_serve = {binding.serve_id: binding for binding in snapshot.bindings}
+        for binding in model_bindings:
+            should_hide = binding.serve_id in requested_hidden
+            if binding.hidden == should_hide:
+                continue
+            updated_by_serve[binding.serve_id] = replace(binding, hidden=should_hide)
+            actions.append({"action": "hide" if should_hide else "unhide", "serve_id": binding.serve_id})
+
+        version = snapshot.version
+        if actions:
+            updated = [updated_by_serve[binding.serve_id] for binding in snapshot.bindings]
+            version = self._store.save(updated, expected_version=snapshot.version)
+
+        return {
+            "model": model,
+            "hidden_pods": sorted(requested_hidden),
+            "version": version,
+            "actions": actions,
+        }
+
     def _model_counts(self, bindings: list[Binding]) -> dict[str, dict[str, int]]:
         counts = {model.name: {"awake": 0, "bound": 0} for model in self._registry.models()}
         for binding in bindings:
@@ -77,12 +109,17 @@ class ServiceManagerV2:
             "node": binding.slot.node,
             "gpu_ids": list(binding.slot.gpu_ids),
             "awake": binding.awake,
+            "hidden": binding.hidden,
         }
 
 
 class TargetRequest(BaseModel):
     wake_replicas: int
 
+
+
+class RoutableRequest(BaseModel):
+    hidden_pods: list[str]
 
 def create_app(service: ServiceManagerV2) -> FastAPI:
     app = FastAPI()
@@ -94,6 +131,14 @@ def create_app(service: ServiceManagerV2) -> FastAPI:
     @app.get("/v2/state")
     def get_state() -> dict:
         return service.get_state()
+
+
+    @app.put("/v2/models/{model}/routable")
+    def put_model_routable(model: str, request: RoutableRequest) -> dict:
+        try:
+            return service.put_model_routable(model, hidden_pods=request.hidden_pods)
+        except (KeyError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.put("/v2/models/{model}/target")
     def put_model_target(model: str, request: TargetRequest) -> dict:

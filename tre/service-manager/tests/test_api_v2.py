@@ -80,8 +80,8 @@ def test_v2_state_exposes_version_and_bindings():
     assert state["version"] == 1
     assert state["models"]["m1"] == {"awake": 1, "bound": 2}
     assert state["bindings"] == [
-        {"serve_id": "serve-a", "model": "m1", "node": "node-a", "gpu_ids": [0], "awake": True},
-        {"serve_id": "serve-b", "model": "m1", "node": "node-a", "gpu_ids": [1], "awake": False},
+        {"serve_id": "serve-a", "model": "m1", "node": "node-a", "gpu_ids": [0], "awake": True, "hidden": False},
+        {"serve_id": "serve-b", "model": "m1", "node": "node-a", "gpu_ids": [1], "awake": False, "hidden": False},
     ]
 
 
@@ -149,5 +149,55 @@ def test_v2_fastapi_routes_delegate_to_service_layer():
 
     assert first.status_code == 200
     assert first.json()["actions"] == [{"action": "wake", "serve_id": "serve-b"}]
+    assert second.status_code == 200
+    assert second.json()["actions"] == []
+
+
+def test_v2_put_routable_is_idempotent_and_persists_hidden_pods():
+    store = StateStore(FakeRedis())
+    store.save(
+        [
+            Binding("serve-a", "m1", Slot("node-a", (0,)), awake=True),
+            Binding("serve-b", "m1", Slot("node-a", (1,)), awake=True),
+        ],
+        expected_version=0,
+    )
+    service = ServiceManagerV2(registry(), store)
+
+    first = service.put_model_routable("m1", hidden_pods=["serve-b"])
+    second = service.put_model_routable("m1", hidden_pods=["serve-b"])
+
+    assert first == {
+        "model": "m1",
+        "hidden_pods": ["serve-b"],
+        "version": 2,
+        "actions": [{"action": "hide", "serve_id": "serve-b"}],
+    }
+    assert second == {
+        "model": "m1",
+        "hidden_pods": ["serve-b"],
+        "version": 2,
+        "actions": [],
+    }
+    state = service.get_state()
+    assert state["bindings"][1]["hidden"] is True
+
+
+def test_v2_routable_route_delegates_to_service_layer():
+    store = StateStore(FakeRedis())
+    store.save(
+        [
+            Binding("serve-a", "m1", Slot("node-a", (0,)), awake=True),
+            Binding("serve-b", "m1", Slot("node-a", (1,)), awake=True),
+        ],
+        expected_version=0,
+    )
+    client = TestClient(create_app(ServiceManagerV2(registry(), store)))
+
+    first = client.put("/v2/models/m1/routable", json={"hidden_pods": ["serve-b"]})
+    second = client.put("/v2/models/m1/routable", json={"hidden_pods": ["serve-b"]})
+
+    assert first.status_code == 200
+    assert first.json()["actions"] == [{"action": "hide", "serve_id": "serve-b"}]
     assert second.status_code == 200
     assert second.json()["actions"] == []

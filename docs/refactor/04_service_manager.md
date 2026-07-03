@@ -64,11 +64,12 @@ The eighth P4 slice adds `tre_sm.api.v2`, the declarative API surface required b
 
 Rules:
 
-- `ServiceManagerV2.get_state()` returns current version, per-model awake/bound counts, and deterministic binding rows.
+- `ServiceManagerV2.get_state()` returns current version, per-model awake/bound counts, and deterministic binding rows including hidden state.
 - `ServiceManagerV2.put_model_target(model, wake_replicas=n)` validates registry limits and the already-bound warm pool.
 - Target changes are persisted optimistically only when the desired target differs from current awake state.
 - Repeating the same target is idempotent: no actions and no version bump.
-- `create_app(service)` exposes `/healthz`, `GET /v2/state`, and `PUT /v2/models/{model}/target` as thin FastAPI routes over the service layer.
+- `ServiceManagerV2.put_model_routable(model, hidden_pods=[...])` persists SafeScale route-hidden state and is idempotent.
+- `create_app(service)` exposes `/healthz`, `GET /v2/state`, `PUT /v2/models/{model}/target`, and `PUT /v2/models/{model}/routable` as thin FastAPI routes over the service layer.
 
 ## Kubernetes Ops Contract
 
@@ -249,6 +250,25 @@ PYTHONPATH=tre/common:tre/service-manager python3 -m pytest -q tre/service-manag
 
 Result: focused API v2 tests passed with 4 tests; service-manager tests passed with 20 tests.
 
+### P4-SM-009 API v2 routable hidden pods
+
+RED:
+
+```bash
+PYTHONPATH=tre/common:tre/service-manager python3 -m pytest -q tre/service-manager/tests/test_api_v2.py
+```
+
+Result: failed because `ServiceManagerV2.put_model_routable()` and `/v2/models/{model}/routable` did not exist.
+
+GREEN:
+
+```bash
+PYTHONPATH=tre/common:tre/service-manager python3 -m pytest -q tre/service-manager/tests/test_api_v2.py
+PYTHONPATH=tre/common:tre/service-manager python3 -m pytest -q tre/service-manager/tests
+```
+
+Result: focused API v2 tests passed with 6 tests; service-manager tests passed with 22 tests.
+
 ## Remaining P4 Work
 
-- Implement API v2 routable/reconcile endpoints, FastAPI app wiring, and v1 compatibility adapters.
+- Implement API v2 reconcile endpoint, FastAPI app wiring, and v1 compatibility adapters.

@@ -30,6 +30,7 @@ class PodRecord:
             model=self.model,
             slot=Slot(self.node, _parse_cuda_visible_devices(self.cuda_visible_devices)),
             awake=self.state != POD_STATE_SLEEPING,
+            hidden=self.state == POD_STATE_HIDDEN,
         )
 
 

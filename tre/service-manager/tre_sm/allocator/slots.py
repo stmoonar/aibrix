@@ -21,6 +21,7 @@ class Binding:
     model: str
     slot: Slot
     awake: bool
+    hidden: bool = False
 
 
 @dataclass(frozen=True)
@@ -112,6 +113,7 @@ class SlotAllocator:
                 "node": binding.slot.node,
                 "gpu_ids": list(binding.slot.gpu_ids),
                 "awake": binding.awake,
+                "hidden": binding.hidden,
             }
             for serve_id, binding in sorted(self._bindings.items())
         }

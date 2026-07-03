@@ -197,3 +197,11 @@
 - Added `create_app(service)` exposing `/healthz`, `GET /v2/state`, and `PUT /v2/models/{model}/target` as thin FastAPI routes.
 - Verified remotely: focused API v2 tests passed with 4 tests, and `tre/service-manager/tests` passed with 20 tests.
 - Next P4 work: routable/reconcile endpoints, app wiring, and v1 compatibility adapters.
+
+### P4 API v2 Routable Slice
+
+- Added RED tests for idempotent `PUT /v2/models/{model}/routable` and direct `ServiceManagerV2.put_model_routable()` behavior.
+- Extended `Binding` and `StateStore` with backward-compatible hidden route state persistence; existing records default to `hidden=False`.
+- Updated reconcile so pod state `hidden` maps to an awake-but-hidden binding, matching the plan's route-hidden SafeScale state.
+- Verified remotely: focused API v2 tests passed with 6 tests, and `tre/service-manager/tests` passed with 22 tests.
+- Next P4 work: manual reconcile endpoint/app wiring, then v1 compatibility adapters.

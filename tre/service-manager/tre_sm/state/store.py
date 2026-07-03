@@ -79,6 +79,7 @@ class StateStore:
                         gpu_ids=tuple(int(gpu) for gpu in payload["gpu_ids"]),
                     ),
                     awake=bool(payload["awake"]),
+                    hidden=bool(payload.get("hidden", False)),
                 )
             )
         return bindings
@@ -94,6 +95,7 @@ class StateStore:
                     "node": binding.slot.node,
                     "gpu_ids": list(binding.slot.gpu_ids),
                     "awake": binding.awake,
+                    "hidden": binding.hidden,
                 },
                 sort_keys=True,
                 separators=(",", ":"),
