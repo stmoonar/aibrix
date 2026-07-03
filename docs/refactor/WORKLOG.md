@@ -133,3 +133,12 @@
 - Attempted read-only discovery for a real Redis dump. `kubectl get svc -A` found `aibrix-system/aibrix-redis-master` at `10.111.75.152:6379`, but the host-side Python Redis probe timed out, so no real dump was captured.
 - P3 synthetic verification remains complete: edge fixture, golden collector comparison, and 3 model x 8 pod x 30 minute benchmark under 100 ms.
 - Next phase: P4 service manager rewrite, starting with pure slot allocator tests.
+
+### P4 Slot Allocator Slice
+
+- Read the P4 service-manager target contract and frozen old service-manager resource code.
+- Added RED tests for the required slot allocator behavior: 1-GPU allocations fill a split 2-GPU slot before opening a new slot, and the START.md fragmentation counterexample produces a minimal defrag migration.
+- Implemented pure `tre_sm.allocator.slots` with `Slot`, `Binding`, `Migration`, and `SlotAllocator`.
+- Updated `tre/Makefile` so `make check` includes `service-manager/tests`.
+- Verified remotely: focused slot tests passed, combined Python tests passed with 17 tests, and `cd tre && make check` passed with 17 tests.
+- Next P4 work: allocator property tests, then topology/state/reconcile with fake Redis and fake Kubernetes clients.
