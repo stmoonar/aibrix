@@ -139,7 +139,10 @@ func newReconciler(mgr manager.Manager, runtimeConfig config.RuntimeConfig) (rec
 		externalClient = nil
 	}
 
-	workloadScaleClient := NewWorkloadScale(mgr.GetClient(), mgr.GetRESTMapper())
+	workloadScaleClient, err := NewWorkloadScaleFromEnv(mgr.GetClient(), mgr.GetRESTMapper())
+	if err != nil {
+		return nil, fmt.Errorf("workload scale config: %w", err)
+	}
 
 	// Create factory with all metric fetcher types
 	factory := metrics.NewDefaultMetricFetcherFactory(resourceClient, customClient, externalClient)

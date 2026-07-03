@@ -32,7 +32,7 @@ New target files inspected:
 - `pkg/controller/podautoscaler/autoscaler.go`
 - `pkg/controller/podautoscaler/workload_scale.go`
 
-Status: not migrated yet. Keep for a separate P2 commit after gateway wake-up is isolated.
+Status: migrated in `WorkloadScale` as `TRE-PATCH(P2-APA-001)`. APA sleep mode is enabled by default (`APA_SCALE_SLEEP_MODE != "0"`), requires `SERVICE_MANAGE_URL`, reads wake replicas from `/models_replicas`, and applies desired-replica deltas via `/scale_service`.
 
 ## Patch / Commit Map
 
@@ -41,7 +41,7 @@ Status: not migrated yet. Keep for a separate P2 commit after gateway wake-up is
 | TRE-PATCH(P2-GW-001) | `eeed0601` | Gateway wake-up dispatcher and env-validated service-manager client. | RED: missing `callWakeUpService`; GREEN: `GOPROXY=https://goproxy.cn,direct /usr/local/go/bin/go test ./pkg/plugins/gateway/... -count=1` |
 | TRE-PATCH(P2-GW-002) | `[P2] gateway: trigger wake-up for zero routable pods` | New-target zero-routable hook in `validateModelAvailability()`. | RED: no wake-up request observed; GREEN: `GOPROXY=https://goproxy.cn,direct /usr/local/go/bin/go test ./pkg/plugins/gateway/... -count=1` |
 | TRE-PATCH(P2-GW-003) | `[P2] gateway: dual-write TRE Redis metrics` | TRE Redis pod-metrics writer with `TRE_REDIS_SCHEMA=v1|v2|dual`, default dual. | RED: undefined writer/schema helpers; GREEN: `go test ./pkg/cache -count=1` and `go test ./pkg/plugins/gateway/... -count=1` |
-| TRE-PATCH(P2-APA-001) | pending | APA sleep-mode service-manager adapter. | Podautoscaler tests |
+| TRE-PATCH(P2-APA-001) | `[P2] podautoscaler: add APA sleep-mode service-manager adapter` | APA sleep-mode service-manager adapter in `WorkloadScale`, with pure-env `SERVICE_MANAGE_URL` startup validation. | RED: missing service-manager fields/config; GREEN: `go test ./pkg/controller/podautoscaler/... -count=1` |
 
 ## Notes
 
@@ -111,3 +111,33 @@ GOPROXY=https://goproxy.cn,direct /usr/local/go/bin/go test ./pkg/plugins/gatewa
 ```
 
 Result: all passed on server 76. Tests use `miniredis` and verify `ZRANGEBYSCORE` can read back `tre:v2:hist:{pod}` / `tre:v2:inst:{pod}` entries. The default mode writes both v1 legacy keys and v2 sorted sets; `TRE_REDIS_SCHEMA=v2` writes only v2.
+
+### TRE-PATCH(P2-APA-001)
+
+RED:
+
+```bash
+GOPROXY=https://goproxy.cn,direct /usr/local/go/bin/go test ./pkg/controller/podautoscaler -run TestAPASleepMode -count=1
+```
+
+Result: build failed because `workloadScale` did not yet expose the APA service-manager configuration and `newServiceManageConfigFromEnv` was undefined.
+
+GREEN:
+
+```bash
+GOPROXY=https://goproxy.cn,direct /usr/local/go/bin/go test ./pkg/controller/podautoscaler -run TestAPASleepMode -count=1
+GOPROXY=https://goproxy.cn,direct /usr/local/go/bin/go test ./pkg/controller/podautoscaler -count=1
+GOPROXY=https://goproxy.cn,direct /usr/local/go/bin/go test ./pkg/controller/podautoscaler/... -count=1
+```
+
+Result: all passed on server 76. The adapter preserves the old sleep/wake control plane behavior on the new `WorkloadScale` seam: APA reads current wake replicas from service-manager and sends only the up/down delta to `/scale_service`, while non-APA and `APA_SCALE_SLEEP_MODE=0` continue to use Kubernetes resource scaling.
+
+## P2 Combined Verification
+
+```bash
+GOPROXY=https://goproxy.cn,direct /usr/local/go/bin/go test ./pkg/plugins/gateway/... ./pkg/controller/podautoscaler/... -count=1
+GOPROXY=https://goproxy.cn,direct /usr/local/go/bin/go test ./pkg/cache -count=1
+GOPROXY=https://goproxy.cn,direct /usr/local/go/bin/go build ./...
+```
+
+Result: all passed on server 76 after `TRE-PATCH(P2-APA-001)`.

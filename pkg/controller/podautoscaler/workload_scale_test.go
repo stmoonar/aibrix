@@ -18,6 +18,8 @@ package podautoscaler
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -30,6 +32,7 @@ import (
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
@@ -187,6 +190,112 @@ func TestGetCurrentReplicasFromScale(t *testing.T) {
 			assert.Equal(t, expectedReplicas, currentReplicas)
 		})
 	}
+}
+
+func TestAPASleepModeGetsCurrentReplicasFromServiceManage(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, http.MethodPost, r.Method)
+		assert.Equal(t, "/models_replicas", r.URL.Path)
+		assert.Equal(t, "test-llm", r.URL.Query().Get("models"))
+		_, _ = w.Write([]byte(`{"test-llm":3}`))
+	}))
+	defer server.Close()
+
+	pa := &autoscalingv1alpha1.PodAutoscaler{
+		ObjectMeta: v1.ObjectMeta{Namespace: "default"},
+		Spec: autoscalingv1alpha1.PodAutoscalerSpec{
+			ScalingStrategy: autoscalingv1alpha1.APA,
+			ScaleTargetRef: corev1.ObjectReference{
+				Kind: "Deployment",
+				Name: "test-llm",
+			},
+		},
+	}
+	scale := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"spec": map[string]interface{}{
+				"replicas": int64(99),
+			},
+		},
+	}
+	workloadScale := &workloadScale{
+		serviceManageURL:        server.URL,
+		serviceManageHTTPClient: server.Client(),
+		sleepModeEnabled:        true,
+	}
+
+	currentReplicas, err := workloadScale.GetCurrentReplicasFromScale(context.TODO(), pa, scale)
+
+	assert.NoError(t, err)
+	assert.Equal(t, int32(3), currentReplicas)
+}
+
+func TestAPASleepModeSetDesiredReplicasUsesServiceManageDelta(t *testing.T) {
+	var scaleCalled bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, http.MethodPost, r.Method)
+		switch r.URL.Path {
+		case "/models_replicas":
+			assert.Equal(t, "test-llm", r.URL.Query().Get("models"))
+			_, _ = w.Write([]byte(`{"test-llm":2}`))
+		case "/scale_service":
+			scaleCalled = true
+			query := r.URL.Query()
+			assert.Equal(t, "test-llm", query.Get("model_name"))
+			assert.Equal(t, "up", query.Get("scale_type"))
+			assert.Equal(t, "3", query.Get("scale_value"))
+			_, _ = w.Write([]byte(`{"requested":3,"actual":3}`))
+		default:
+			t.Fatalf("unexpected service_manage path: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	pa := &autoscalingv1alpha1.PodAutoscaler{
+		ObjectMeta: v1.ObjectMeta{Namespace: "default"},
+		Spec: autoscalingv1alpha1.PodAutoscalerSpec{
+			ScalingStrategy: autoscalingv1alpha1.APA,
+			ScaleTargetRef: corev1.ObjectReference{
+				Kind:       "Deployment",
+				Name:       "test-llm",
+				APIVersion: "apps/v1",
+			},
+		},
+	}
+	deployment := &appsv1.Deployment{
+		ObjectMeta: v1.ObjectMeta{
+			Name:      "test-llm",
+			Namespace: "default",
+		},
+		Spec: appsv1.DeploymentSpec{Replicas: ptr.To[int32](1)},
+	}
+	scheme := runtime.NewScheme()
+	_ = autoscalingv1alpha1.AddToScheme(scheme)
+	_ = appsv1.AddToScheme(scheme)
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pa, deployment).Build()
+	workloadScale := &workloadScale{
+		client:                  fakeClient,
+		serviceManageURL:        server.URL,
+		serviceManageHTTPClient: server.Client(),
+		sleepModeEnabled:        true,
+	}
+
+	err := workloadScale.SetDesiredReplicas(context.TODO(), pa, 5)
+
+	assert.NoError(t, err)
+	assert.True(t, scaleCalled)
+	updated := &appsv1.Deployment{}
+	assert.NoError(t, fakeClient.Get(context.TODO(), client.ObjectKey{Namespace: "default", Name: "test-llm"}, updated))
+	assert.Equal(t, int32(1), *updated.Spec.Replicas)
+}
+
+func TestAPASleepModeConfigRequiresServiceManageURL(t *testing.T) {
+	t.Setenv("APA_SCALE_SLEEP_MODE", "1")
+	t.Setenv("SERVICE_MANAGE_URL", "")
+
+	_, err := newServiceManageConfigFromEnv()
+
+	assert.ErrorContains(t, err, "SERVICE_MANAGE_URL")
 }
 
 func TestGetPodSelectorFromScale(t *testing.T) {

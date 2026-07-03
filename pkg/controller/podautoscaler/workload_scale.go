@@ -18,8 +18,14 @@ package podautoscaler
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"os"
 	"strings"
+	"time"
 
 	orchestrationv1alpha1 "github.com/vllm-project/aibrix/api/orchestration/v1alpha1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -39,7 +45,12 @@ import (
 	"github.com/vllm-project/aibrix/pkg/controller/constants"
 )
 
-const AutoscalingStormServiceModeAnnotationKey = "autoscaling.aibrix.ai/storm-service-mode"
+const (
+	AutoscalingStormServiceModeAnnotationKey = "autoscaling.aibrix.ai/storm-service-mode"
+	serviceManageURLEnv                      = "SERVICE_MANAGE_URL"
+	apaScaleSleepModeEnv                     = "APA_SCALE_SLEEP_MODE"
+	defaultServiceManageTimeout              = 10 * time.Second
+)
 
 // WorkloadScale provides scaling operations for different workload types.
 // It provides the mechanism to get/set replica counts on workload resources,
@@ -63,8 +74,16 @@ type WorkloadScale interface {
 
 // workloadScale is a stateless implementation of WorkloadScale
 type workloadScale struct {
-	client     client.Client
-	restMapper meta.RESTMapper
+	client                  client.Client
+	restMapper              meta.RESTMapper
+	serviceManageURL        string
+	serviceManageHTTPClient *http.Client
+	sleepModeEnabled        bool
+}
+
+type serviceManageConfig struct {
+	url              string
+	sleepModeEnabled bool
 }
 
 // NewWorkloadScale creates a stateless WorkloadScale implementation
@@ -73,9 +92,40 @@ func NewWorkloadScale(
 	restMapper meta.RESTMapper,
 ) WorkloadScale {
 	return &workloadScale{
-		client:     client,
-		restMapper: restMapper,
+		client:                  client,
+		restMapper:              restMapper,
+		serviceManageHTTPClient: &http.Client{Timeout: defaultServiceManageTimeout},
 	}
+}
+
+// TRE-PATCH(P2-APA-001): wire APA sleep mode through service-manager without a hard-coded URL.
+func NewWorkloadScaleFromEnv(
+	client client.Client,
+	restMapper meta.RESTMapper,
+) (WorkloadScale, error) {
+	config, err := newServiceManageConfigFromEnv()
+	if err != nil {
+		return nil, err
+	}
+	return &workloadScale{
+		client:                  client,
+		restMapper:              restMapper,
+		serviceManageURL:        config.url,
+		serviceManageHTTPClient: &http.Client{Timeout: defaultServiceManageTimeout},
+		sleepModeEnabled:        config.sleepModeEnabled,
+	}, nil
+}
+
+func newServiceManageConfigFromEnv() (serviceManageConfig, error) {
+	sleepModeEnabled := os.Getenv(apaScaleSleepModeEnv) != "0"
+	serviceManageURL := strings.TrimSpace(os.Getenv(serviceManageURLEnv))
+	if sleepModeEnabled && serviceManageURL == "" {
+		return serviceManageConfig{}, fmt.Errorf("%s must be set when %s is enabled", serviceManageURLEnv, apaScaleSleepModeEnv)
+	}
+	return serviceManageConfig{
+		url:              serviceManageURL,
+		sleepModeEnabled: sleepModeEnabled,
+	}, nil
 }
 
 func (s *workloadScale) Validate(ctx context.Context, pa *autoscalingv1alpha1.PodAutoscaler) error {
@@ -124,6 +174,11 @@ func (s *workloadScale) validateRoleScaling(ctx context.Context, pa *autoscaling
 }
 
 func (s *workloadScale) GetCurrentReplicasFromScale(ctx context.Context, pa *autoscalingv1alpha1.PodAutoscaler, scale *unstructured.Unstructured) (int32, error) {
+	// TRE-PATCH(P2-APA-001): APA sleep mode counts wake replicas from service-manager, not Kubernetes spec.replicas.
+	if s.shouldUseAPASleepMode(pa) {
+		return s.getWakeReplicasFromServiceManage(ctx, pa.Spec.ScaleTargetRef.Name)
+	}
+
 	// Role-level scaling
 	if s.isStormServiceWorkload(scale) && pa.Spec.SubTargetSelector != nil {
 		return s.getCurrentReplicasForRole(ctx, pa)
@@ -183,6 +238,11 @@ func (s *workloadScale) getCurrentReplicasForRole(ctx context.Context, pa *autos
 }
 
 func (s *workloadScale) SetDesiredReplicas(ctx context.Context, pa *autoscalingv1alpha1.PodAutoscaler, replicas int32) error {
+	// TRE-PATCH(P2-APA-001): APA sleep mode applies wake/sleep deltas through service-manager.
+	if s.shouldUseAPASleepMode(pa) {
+		return s.setWakeReplicasViaServiceManage(ctx, pa.Spec.ScaleTargetRef.Name, replicas)
+	}
+
 	// Role-level scaling
 	if pa.Spec.SubTargetSelector != nil {
 		return s.setDesiredReplicasForRole(ctx, pa, replicas)
@@ -269,6 +329,121 @@ func (s *workloadScale) setDesiredReplicasForRole(ctx context.Context, pa *autos
 		}
 		return s.client.Patch(ctx, upd, client.MergeFrom(cur))
 	})
+}
+
+func (s *workloadScale) shouldUseAPASleepMode(pa *autoscalingv1alpha1.PodAutoscaler) bool {
+	return s.sleepModeEnabled && pa.Spec.ScalingStrategy == autoscalingv1alpha1.APA
+}
+
+func (s *workloadScale) serviceManageClient() *http.Client {
+	if s.serviceManageHTTPClient != nil {
+		return s.serviceManageHTTPClient
+	}
+	return &http.Client{Timeout: defaultServiceManageTimeout}
+}
+
+func (s *workloadScale) serviceManageEndpoint(path string, values url.Values) (string, error) {
+	if strings.TrimSpace(s.serviceManageURL) == "" {
+		return "", fmt.Errorf("%s is required for APA sleep mode", serviceManageURLEnv)
+	}
+	endpoint := strings.TrimRight(s.serviceManageURL, "/") + path
+	if len(values) > 0 {
+		endpoint += "?" + values.Encode()
+	}
+	return endpoint, nil
+}
+
+func (s *workloadScale) getWakeReplicasFromServiceManage(ctx context.Context, modelName string) (int32, error) {
+	reqURL, err := s.serviceManageEndpoint("/models_replicas", url.Values{"models": []string{modelName}})
+	if err != nil {
+		return 0, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, nil)
+	if err != nil {
+		return 0, fmt.Errorf("failed to build service_manage /models_replicas request: %w", err)
+	}
+	resp, err := s.serviceManageClient().Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("failed to call service_manage /models_replicas: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return 0, fmt.Errorf("failed to read service_manage response: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("service_manage /models_replicas returned status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var result map[string]int32
+	if err := json.Unmarshal(body, &result); err != nil {
+		return 0, fmt.Errorf("failed to parse service_manage response: %w", err)
+	}
+	replicas, ok := result[modelName]
+	if !ok {
+		return 0, fmt.Errorf("model %s not found in service_manage response", modelName)
+	}
+	return replicas, nil
+}
+
+func (s *workloadScale) setWakeReplicasViaServiceManage(ctx context.Context, modelName string, desiredReplicas int32) error {
+	currentReplicas, err := s.getWakeReplicasFromServiceManage(ctx, modelName)
+	if err != nil {
+		return err
+	}
+	delta := desiredReplicas - currentReplicas
+	if delta == 0 {
+		return nil
+	}
+	scaleType := "up"
+	scaleValue := delta
+	if delta < 0 {
+		scaleType = "down"
+		scaleValue = -delta
+	}
+	return s.scaleViaServiceManage(ctx, modelName, scaleType, scaleValue)
+}
+
+func (s *workloadScale) scaleViaServiceManage(ctx context.Context, modelName, scaleType string, scaleValue int32) error {
+	reqURL, err := s.serviceManageEndpoint("/scale_service", url.Values{
+		"model_name":  []string{modelName},
+		"scale_type":  []string{scaleType},
+		"scale_value": []string{fmt.Sprintf("%d", scaleValue)},
+	})
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, nil)
+	if err != nil {
+		return fmt.Errorf("failed to build service_manage /scale_service request: %w", err)
+	}
+	resp, err := s.serviceManageClient().Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to call service_manage /scale_service: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to read service_manage scale response: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("service_manage /scale_service returned status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var scaleResp struct {
+		Actual    int32 `json:"actual"`
+		Requested int32 `json:"requested"`
+	}
+	if err := json.Unmarshal(body, &scaleResp); err != nil {
+		return fmt.Errorf("failed to parse service_manage scale response: %w", err)
+	}
+	if scaleResp.Actual < scaleResp.Requested {
+		klog.Warningf("service_manage scale_%s for %s: requested %d but only %d succeeded", scaleType, modelName, scaleResp.Requested, scaleResp.Actual)
+	}
+	klog.InfoS("service_manage scale completed", "model", modelName, "scaleType", scaleType, "requested", scaleResp.Requested, "actual", scaleResp.Actual)
+	return nil
 }
 
 func (s *workloadScale) getPodSelectorForRole(ctx context.Context, pa *autoscalingv1alpha1.PodAutoscaler) (labels.Selector, error) {
