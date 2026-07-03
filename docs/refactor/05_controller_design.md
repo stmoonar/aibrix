@@ -25,6 +25,46 @@ Validation rules:
 - `TRE_SIGNAL_SOURCE` is restricted to the four plan-approved values and defaults to `zm`.
 - SafeScale minimum window must not exceed the maximum window.
 
+
+## TRS Signal Contract
+
+The second P5 slice migrates the frozen upstream `python/tre/controller/trs.py` formulas into `tre_controller.signals.trs` without changing behavior.
+
+Implemented pieces:
+
+- `TRSInput`, `TRSResult`, and `TRSComputer` preserve `Y_m`, `y_m`, `Q`, `Q_ctl`, `TRS_raw`, EMA-smoothed `TRS`, `eta_m`, and `Z_m` outputs.
+- `TRSInput.from_metrics()` adapts the P3 `ModelWindowMetrics` schema plus registry `TrsParams` into the migrated formula input.
+- `SaturationGuard` preserves the legacy Gamma calculation and consecutive-window saturation counter.
+- `compute_eta_m()` and `compute_z_m()` keep the old unavailable-value behavior for zero, NaN, infinity, and missing theta.
+
+Golden coverage lives in `tre/controller/tests/golden/legacy_trs.py` and compares migrated output against the frozen implementation on multi-tick EMA, restore/snapshot, saturation, and helper edge cases.
+
+### P5-CTRL-002 TRS signals
+
+RED:
+
+```bash
+PYTHONPATH=tre/common:tre/controller:tre/controller/tests python3 -m pytest -q tre/controller/tests/test_trs_signals.py
+```
+
+Result: failed during collection because `tre_controller.signals` did not exist.
+
+GREEN:
+
+```bash
+PYTHONPATH=tre/common:tre/controller:tre/controller/tests python3 -m pytest -q tre/controller/tests/test_trs_signals.py
+```
+
+Result: focused TRS signal tests passed with 10 tests on server 76.
+
+Full slice verification:
+
+```bash
+cd tre && make check && make smoke
+```
+
+Result: passed with 67 tests and `tre smoke ok` on server 76.
+
 ## Verification Log
 
 ### P5-CTRL-001 centralized config

@@ -234,3 +234,12 @@
 - Implemented `tre_controller.config.ControllerConfig` plus `SafeScaleConfig` as the single env parsing boundary for later P5 controller modules.
 - Verified remotely: focused config tests passed with 14 tests; `cd tre && make check && make smoke` passed with 57 tests and `tre smoke ok`.
 - Next P5 work: migrate `trs.py` signal formulas unchanged with golden comparisons, then pure classifier/planner paths.
+
+### P5 TRS Signal Slice
+
+- Re-read `REFACTOR_PLAN.md` completely before starting the signal migration slice.
+- Read frozen upstream `/root/aibrix-main/python/tre/controller/trs.py` and migrated formulas into `tre_controller.signals.trs` without changing behavior.
+- Added golden tests under `tre/controller/tests/golden/legacy_trs.py` covering TRS EMA sequence behavior, restore/snapshot state, saturation guard, helper edge cases, and the P3 metrics-to-TRS input adapter.
+- Verified RED remotely: `tre_controller.signals` was missing. Verified GREEN remotely: focused TRS signal tests passed with 10 tests; `cd tre && make check && make smoke` passed with 67 tests and `tre smoke ok`.
+- Recorded the legacy replica correction as an implementation-vs-paper note in `docs/refactor/05_paper_vs_impl.md`.
+- Next P5 work: migrate classification/planner pure functions with golden comparisons, starting from the paper path and recording discarded legacy paths.
