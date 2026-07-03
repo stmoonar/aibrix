@@ -321,6 +321,26 @@ PYTHONPATH=tre/common:tre/service-manager python3 -m pytest -q tre/service-manag
 
 Result: focused v1 compatibility tests passed with 3 tests; service-manager tests passed with 28 tests.
 
+## P4 Closure Audit
+
+P4 acceptance coverage:
+
+- Slot allocator: `test_slots.py` covers the required 0/2 fragmentation counterexample, split-slot fill order, cross-node defrag, and a seeded 1000-step allocation/release invariant test.
+- State persistence: `test_state_store.py` covers versioned round-trips, stale writer rejection, and Redis byte/string response compatibility.
+- Restart reconciliation: `test_reconcile.py` constructs persisted state plus fake pod reality and verifies pod `CUDA_VISIBLE_DEVICES` wins, merged state persists, and missing pod observations are retained conservatively.
+- Topology/discovery: `test_topology.py` and `test_k8s_ops.py` cover snapshot normalization, annotation patch bodies, model selectors, and invalid slot rejection with fake Kubernetes clients.
+- Ops: `test_vllm_ops.py` covers sleep/wake endpoint selection, retries, timeout propagation, idempotent 409 handling, and structured failures without network calls.
+- API v2: `test_api_v2.py` and `test_app.py` cover `/healthz`, `GET /v2/state`, `PUT /v2/models/{model}/target`, `PUT /v2/models/{model}/routable`, `POST /v2/reconcile`, app wiring, and target idempotency.
+- v1 compatibility: `test_v1_compat.py` covers `/models_replicas`, `/scale_service`, and `/wake_up` for migrated APA/gateway callers.
+
+Final remote verification command:
+
+```bash
+cd /data/nfs_shared_data/xxy/aibrix/tre && make check && make smoke
+```
+
+Result: passed on server 76 with 43 tests and `tre smoke ok`.
+
 ## Remaining P4 Work
 
-- Final P4 verification and tag.
+- None. P4 is closed by commit/tag after final verification.

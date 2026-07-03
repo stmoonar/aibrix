@@ -221,3 +221,8 @@
 - Registered the v1 adapter in the FastAPI app factory while keeping state mutation centralized in v2 service logic.
 - Verified remotely: focused v1 compatibility tests passed with 3 tests, and `tre/service-manager/tests` passed with 28 tests.
 - Next P4 work: final P4 verification and tag if all P4 acceptance items are covered.
+
+### P4 Closure Audit
+
+- Audited P4 against REFACTOR_PLAN 5.3/6: slots, topology/state/reconcile, ops, API v2, v1 compatibility, idempotent target calls, restart consistency, and allocator property tests all have focused tests.
+- Final verification passed remotely: `cd tre && make check && make smoke` completed with 43 tests and `tre smoke ok`; closure note will be committed and tagged `p4-done`.
