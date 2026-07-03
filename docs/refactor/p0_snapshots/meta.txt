@@ -1,0 +1,9 @@
+2026-07-04T01:59:21+08:00
+nscc-ds-4a100-node10
+/data/nfs_shared_data/xxy/aibrix
+adfe6f8373afe5a90a2e93687474f07a0d4aed26
+
+Snapshot status:
+nvidia-smi: ok
+kubectl pods wide rc: 0
+kubectl all rc: 0
