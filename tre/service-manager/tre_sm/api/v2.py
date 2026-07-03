@@ -7,13 +7,21 @@ from pydantic import BaseModel
 
 from tre_common.registry import Registry
 from tre_sm.allocator.slots import Binding
+from tre_sm.state.reconcile import K8sPodClient, reconcile_state
 from tre_sm.state.store import StateStore
 
 
 class ServiceManagerV2:
-    def __init__(self, registry: Registry, store: StateStore) -> None:
+    def __init__(
+        self,
+        registry: Registry,
+        store: StateStore,
+        *,
+        k8s_client: K8sPodClient | None = None,
+    ) -> None:
         self._registry = registry
         self._store = store
+        self._k8s_client = k8s_client
 
     def get_state(self) -> dict:
         snapshot = self._store.load()
@@ -93,6 +101,17 @@ class ServiceManagerV2:
             "actions": actions,
         }
 
+
+    def reconcile(self) -> dict:
+        if self._k8s_client is None:
+            raise ValueError("k8s_client is required for reconcile")
+        result = reconcile_state(self._registry.topology(), self._store, self._k8s_client)
+        return {
+            "version": result.version,
+            "warnings": result.warnings,
+            "bindings": [self._binding_dict(binding) for binding in result.bindings],
+        }
+
     def _model_counts(self, bindings: list[Binding]) -> dict[str, dict[str, int]]:
         counts = {model.name: {"awake": 0, "bound": 0} for model in self._registry.models()}
         for binding in bindings:
@@ -127,6 +146,14 @@ def create_app(service: ServiceManagerV2) -> FastAPI:
     @app.get("/healthz")
     def healthz() -> dict:
         return {"ok": True}
+
+
+    @app.post("/v2/reconcile")
+    def reconcile() -> dict:
+        try:
+            return service.reconcile()
+        except (KeyError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.get("/v2/state")
     def get_state() -> dict:

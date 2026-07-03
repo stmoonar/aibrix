@@ -69,7 +69,9 @@ Rules:
 - Target changes are persisted optimistically only when the desired target differs from current awake state.
 - Repeating the same target is idempotent: no actions and no version bump.
 - `ServiceManagerV2.put_model_routable(model, hidden_pods=[...])` persists SafeScale route-hidden state and is idempotent.
-- `create_app(service)` exposes `/healthz`, `GET /v2/state`, `PUT /v2/models/{model}/target`, and `PUT /v2/models/{model}/routable` as thin FastAPI routes over the service layer.
+- `ServiceManagerV2.reconcile()` triggers manual startup reconciliation when a Kubernetes pod client is configured.
+- `create_app(service)` exposes `/healthz`, `GET /v2/state`, `PUT /v2/models/{model}/target`, `PUT /v2/models/{model}/routable`, and `POST /v2/reconcile` as thin FastAPI routes over the service layer.
+- `tre_sm.app.create_service_app()` wires registry, state store, and optional Kubernetes pod client into the FastAPI app without constructing live clients in tests.
 
 ## Kubernetes Ops Contract
 
@@ -269,6 +271,26 @@ PYTHONPATH=tre/common:tre/service-manager python3 -m pytest -q tre/service-manag
 
 Result: focused API v2 tests passed with 6 tests; service-manager tests passed with 22 tests.
 
+### P4-SM-010 API v2 reconcile and app wiring
+
+RED:
+
+```bash
+PYTHONPATH=tre/common:tre/service-manager python3 -m pytest -q tre/service-manager/tests/test_api_v2.py
+PYTHONPATH=tre/common:tre/service-manager python3 -m pytest -q tre/service-manager/tests/test_app.py
+```
+
+Result: API tests failed because `ServiceManagerV2` did not accept a Kubernetes pod client for manual reconcile; app tests failed because `tre_sm.app` did not exist.
+
+GREEN:
+
+```bash
+PYTHONPATH=tre/common:tre/service-manager python3 -m pytest -q tre/service-manager/tests/test_app.py tre/service-manager/tests/test_api_v2.py
+PYTHONPATH=tre/common:tre/service-manager python3 -m pytest -q tre/service-manager/tests
+```
+
+Result: focused app/API tests passed with 9 tests; service-manager tests passed with 25 tests.
+
 ## Remaining P4 Work
 
-- Implement API v2 reconcile endpoint, FastAPI app wiring, and v1 compatibility adapters.
+- Implement v1 compatibility adapters.

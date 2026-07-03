@@ -3,6 +3,7 @@ from tre_sm.allocator.slots import Binding, Slot
 from fastapi.testclient import TestClient
 
 from tre_sm.api.v2 import ServiceManagerV2, create_app
+from tre_sm.state.reconcile import PodRecord
 from tre_sm.state.store import StateStore
 
 
@@ -28,6 +29,14 @@ class FakeRedis:
         bucket = self.hashes.setdefault(key, {})
         for field, value in mapping.items():
             bucket[str(field).encode("utf-8")] = str(value).encode("utf-8")
+
+
+class FakeK8sClient:
+    def __init__(self, pods):
+        self._pods = list(pods)
+
+    def list_pods(self):
+        return list(self._pods)
 
 
 def registry():
@@ -201,3 +210,65 @@ def test_v2_routable_route_delegates_to_service_layer():
     assert first.json()["actions"] == [{"action": "hide", "serve_id": "serve-b"}]
     assert second.status_code == 200
     assert second.json()["actions"] == []
+
+
+def test_v2_reconcile_updates_state_from_pod_reality():
+    store = StateStore(FakeRedis())
+    store.save(
+        [Binding("serve-a", "m1", Slot("node-a", (1,)), awake=False)],
+        expected_version=0,
+    )
+    service = ServiceManagerV2(
+        registry(),
+        store,
+        k8s_client=FakeK8sClient(
+            [
+                PodRecord(
+                    serve_id="serve-a",
+                    model="m1",
+                    node="node-a",
+                    cuda_visible_devices="0",
+                    state="awake",
+                )
+            ]
+        ),
+    )
+
+    result = service.reconcile()
+
+    assert result["version"] == 2
+    assert result["warnings"] == ["serve-a: pod reality overrides persisted binding"]
+    assert store.load().bindings == [Binding("serve-a", "m1", Slot("node-a", (0,)), awake=True)]
+
+
+def test_v2_reconcile_route_delegates_to_service_layer():
+    store = StateStore(FakeRedis())
+    store.save(
+        [Binding("serve-a", "m1", Slot("node-a", (1,)), awake=False)],
+        expected_version=0,
+    )
+    client = TestClient(
+        create_app(
+            ServiceManagerV2(
+                registry(),
+                store,
+                k8s_client=FakeK8sClient(
+                    [
+                        PodRecord(
+                            serve_id="serve-a",
+                            model="m1",
+                            node="node-a",
+                            cuda_visible_devices="0",
+                            state="awake",
+                        )
+                    ]
+                ),
+            )
+        )
+    )
+
+    response = client.post("/v2/reconcile")
+
+    assert response.status_code == 200
+    assert response.json()["version"] == 2
+    assert response.json()["warnings"] == ["serve-a: pod reality overrides persisted binding"]

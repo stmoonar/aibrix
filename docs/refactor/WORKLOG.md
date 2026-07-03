@@ -205,3 +205,11 @@
 - Updated reconcile so pod state `hidden` maps to an awake-but-hidden binding, matching the plan's route-hidden SafeScale state.
 - Verified remotely: focused API v2 tests passed with 6 tests, and `tre/service-manager/tests` passed with 22 tests.
 - Next P4 work: manual reconcile endpoint/app wiring, then v1 compatibility adapters.
+
+### P4 API v2 Reconcile/App Slice
+
+- Added RED tests for `ServiceManagerV2.reconcile()`, `POST /v2/reconcile`, and `tre_sm.app.create_service_app()`.
+- Wired manual reconcile through the existing `reconcile_state()` function using an injected Kubernetes pod client, so tests remain offline and no live cluster calls are made.
+- Added `tre_sm.app.create_service_app()` as the FastAPI app factory over registry, state store, and optional pod client.
+- Verified remotely: focused app/API tests passed with 9 tests, and `tre/service-manager/tests` passed with 25 tests.
+- Next P4 work: v1 compatibility adapters and final P4 verification/tagging.
