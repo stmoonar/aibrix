@@ -50,3 +50,19 @@
 - Added `tre/deploy/gen_model_manifests.py` and generated per-slot model Deployment manifests.
 - Added `tre/Makefile` with `check`, `smoke`, and `manifests` targets.
 - Verification recorded in `docs/refactor/01_p1_verification.md`.
+
+
+### P2 Inspection Start
+
+- Inspected new gateway queue-router, SLO router construction, request-body availability check, and old frozen queue wake-up code.
+- Found target-version behavior difference: new gateway rejects zero-routable models before queue-router wake-up can run.
+- Created `docs/refactor/02_upstream_patches.md` with the P2 gateway/APA patch map.
+
+
+### P2 Gateway Wake-Up Dispatcher
+
+- Added RED tests for `callWakeUpService`: missing `SERVEMENT_URL` must fail, configured URL must receive POST `/wake_up` with `model_name`, normalized `kind`, and `queue_len`.
+- RED result used `/usr/local/go/bin/go` and `GOPROXY=https://goproxy.cn,direct`; the test failed because `callWakeUpService` was undefined.
+- Added `pkg/plugins/gateway/algorithms/wakeup.go` for `TRE-PATCH(P2-GW-001)` with service-manager URL sourced only from `SERVEMENT_URL` and no hard-coded fallback.
+- Verified `go test ./pkg/plugins/gateway/... -count=1` passed on server 76 with the regional Go proxy.
+- Next P2 slice: wire zero-routable request handling in `gateway_req_body.go` to submit a wake-up request before returning 503.
