@@ -9,6 +9,7 @@ from tre_common.registry import Registry
 from tre_sm.allocator.slots import Binding
 from tre_sm.state.reconcile import K8sPodClient, reconcile_state
 from tre_sm.state.store import StateStore
+from tre_sm.api.v1_compat import create_v1_compat_router
 
 
 class ServiceManagerV2:
@@ -142,6 +143,7 @@ class RoutableRequest(BaseModel):
 
 def create_app(service: ServiceManagerV2) -> FastAPI:
     app = FastAPI()
+    app.include_router(create_v1_compat_router(service))
 
     @app.get("/healthz")
     def healthz() -> dict:

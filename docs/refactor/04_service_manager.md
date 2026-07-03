@@ -58,6 +58,17 @@ Rules:
 - Persisted bindings without a current pod observation are retained conservatively and reported as warnings.
 - Reconcile persists the merged result only when bindings change, preserving the state version on no-op restart.
 
+## v1 Compatibility Contract
+
+The eleventh P4 slice adds `tre_sm.api.v1_compat`, a thin compatibility adapter for migrated Go callers.
+
+Rules:
+
+- `POST /models_replicas?models=m1[,m2]` returns current awake, non-hidden replicas per model for APA sleep mode.
+- `POST /scale_service?model_name=m&scale_type=up|down&scale_value=n` delegates to v2 target state and returns `{requested, actual}`.
+- `POST /wake_up?model_name=m&kind=...&queue_len=...` wakes one sleeping replica for gateway zero-routable requests and returns the legacy success/delayed/strategy shape.
+- The adapter is route-only: all state mutation stays in `ServiceManagerV2`.
+
 ## API v2 Contract
 
 The eighth P4 slice adds `tre_sm.api.v2`, the declarative API surface required by REFACTOR_PLAN section 5.3.
@@ -291,6 +302,25 @@ PYTHONPATH=tre/common:tre/service-manager python3 -m pytest -q tre/service-manag
 
 Result: focused app/API tests passed with 9 tests; service-manager tests passed with 25 tests.
 
+### P4-SM-011 v1 compatibility adapters
+
+RED:
+
+```bash
+PYTHONPATH=tre/common:tre/service-manager python3 -m pytest -q tre/service-manager/tests/test_v1_compat.py
+```
+
+Result: failed with 404s because `/models_replicas`, `/scale_service`, and `/wake_up` were not registered.
+
+GREEN:
+
+```bash
+PYTHONPATH=tre/common:tre/service-manager python3 -m pytest -q tre/service-manager/tests/test_v1_compat.py
+PYTHONPATH=tre/common:tre/service-manager python3 -m pytest -q tre/service-manager/tests
+```
+
+Result: focused v1 compatibility tests passed with 3 tests; service-manager tests passed with 28 tests.
+
 ## Remaining P4 Work
 
-- Implement v1 compatibility adapters.
+- Final P4 verification and tag.

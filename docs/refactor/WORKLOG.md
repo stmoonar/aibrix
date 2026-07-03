@@ -213,3 +213,11 @@
 - Added `tre_sm.app.create_service_app()` as the FastAPI app factory over registry, state store, and optional pod client.
 - Verified remotely: focused app/API tests passed with 9 tests, and `tre/service-manager/tests` passed with 25 tests.
 - Next P4 work: v1 compatibility adapters and final P4 verification/tagging.
+
+### P4 v1 Compatibility Slice
+
+- Added RED tests for legacy `/models_replicas`, `/scale_service`, and `/wake_up` endpoints used by the migrated APA and gateway patches.
+- Implemented `tre_sm.api.v1_compat` as a route-only adapter over `ServiceManagerV2` state/target methods.
+- Registered the v1 adapter in the FastAPI app factory while keeping state mutation centralized in v2 service logic.
+- Verified remotely: focused v1 compatibility tests passed with 3 tests, and `tre/service-manager/tests` passed with 28 tests.
+- Next P4 work: final P4 verification and tag if all P4 acceptance items are covered.
