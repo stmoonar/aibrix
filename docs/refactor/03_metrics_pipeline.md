@@ -61,9 +61,29 @@ cd tre && make smoke
 
 Result: all passed on server 76. The tests cover v2 sorted-set window reads, legacy histogram first/last deltas, instant gauge expected-sample averaging, default bucket-upper p95, and completed-window cache reuse.
 
+
+### P3-METRICS-002 v1 compatibility reads
+
+RED:
+
+```bash
+PYTHONPATH=tre/common:tre/controller python3 -m pytest -q tre/controller/tests/test_metrics_store.py -k v1_legacy
+```
+
+Result: failed because `MetricsStore.__init__()` did not accept a `schema` mode and had no legacy-key read path.
+
+GREEN:
+
+```bash
+PYTHONPATH=tre/common:tre/controller python3 -m pytest -q tre/controller/tests/test_metrics_store.py
+cd tre && make check
+cd tre && make smoke
+```
+
+Result: all passed on server 76. The v1 path scans only `aibrix:pod_histogram_metrics_*` and `aibrix:pod_instant_metrics_*`, normalizes timestamp suffixes to milliseconds, filters docs for the requested model, and reuses the v2 aggregation semantics.
+
 ## Remaining P3 Work
 
-- Add v1 compatibility reads for legacy `aibrix:pod_*_metrics_*` keys.
 - Add a fixture generator with missing samples, out-of-order samples, counter reset, and multi-window scenarios.
 - Add full `MetricsSnapshot` multi-model reads and benchmark the 3 model x 8 pod x 30 minute fixture target.
 - Compare the new store against the frozen old collector on the same fixture and document any remaining differences.

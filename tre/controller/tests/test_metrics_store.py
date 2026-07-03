@@ -15,7 +15,9 @@ class FakeRedis:
     def __init__(self):
         self.sets = {}
         self.zsets = {}
+        self.strings = {}
         self.zrange_calls = 0
+        self.scan_calls = 0
 
     def sadd(self, key, *values):
         self.sets.setdefault(key, set()).update(values)
@@ -35,11 +37,30 @@ class FakeRedis:
         hi = float(maximum)
         return [member for score, member in self.zsets.get(key, []) if lo <= score <= hi]
 
+    def set(self, key, value):
+        self.strings[key] = value
+
+    def mget(self, keys):
+        return [self.strings.get(key) for key in keys]
+
+    def scan_iter(self, match):
+        self.scan_calls += 1
+        if not match.endswith("*"):
+            return iter(())
+        prefix = match[:-1]
+        return (key for key in sorted(self.strings) if key.startswith(prefix))
+
 
 def add_doc(redis, key, ts_ms, doc):
     body = dict(doc)
     body["timestamp"] = ts_ms
     redis.zadd(key, {json.dumps(body, sort_keys=True): ts_ms})
+
+
+def set_legacy_doc(redis, key, ts_ms, doc):
+    body = dict(doc)
+    body["timestamp"] = ts_ms
+    redis.set(key, json.dumps(body, sort_keys=True))
 
 
 def hist_doc(pod, prompt_sum, prompt_count, ttft_sum, ttft_count, ttft_buckets):
@@ -115,3 +136,31 @@ def test_metrics_store_caches_completed_windows():
 
     assert first == second
     assert redis.zrange_calls == calls_after_first
+
+
+def test_metrics_store_reads_v1_legacy_keys_without_pod_set():
+    redis = FakeRedis()
+    pod = "default/pod-a"
+    start_ms = 1_700_000_001_000
+    mid_ms = 1_700_000_006_000
+    end_ms = 1_700_000_011_000
+    set_legacy_doc(redis, f"aibrix:pod_histogram_metrics_{pod}_{start_ms}", start_ms, hist_doc("pod-a", 10, 1, 1.0, 10, {"0.5": 10}))
+    set_legacy_doc(redis, f"aibrix:pod_histogram_metrics_{pod}_{end_ms}", end_ms, hist_doc("pod-a", 42, 2, 4.0, 20, {"0.5": 20}))
+    set_legacy_doc(redis, f"aibrix:pod_instant_metrics_{pod}_{start_ms}", start_ms, inst_doc("pod-a", waiting=2, running=3, kv_hit=0.25))
+    set_legacy_doc(redis, f"aibrix:pod_instant_metrics_{pod}_{mid_ms}", mid_ms, inst_doc("pod-a", waiting=4, running=5, kv_hit=0.75))
+
+    store = MetricsStore(
+        redis,
+        load_registry(str(REGISTRY_PATH)),
+        instant_sample_interval_ms=5_000,
+        schema="v1",
+    )
+
+    metrics = store.read_model_window("dsqwen-7b", start_ms, end_ms)
+
+    assert metrics.prompt_tokens == 32.0
+    assert metrics.avg_waiting == 3.0
+    assert metrics.avg_running == 4.0
+    assert metrics.kv_cache_hit_rate == 0.5
+    assert metrics.routable_pods == 1
+    assert redis.scan_calls == 2

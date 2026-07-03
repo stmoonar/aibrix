@@ -23,6 +23,9 @@ INSTANT_METRICS = {
     "kv_hit": "kv_cache_hit_rate",
 }
 
+LEGACY_HIST_PREFIX = "aibrix:pod_histogram_metrics_"
+LEGACY_INST_PREFIX = "aibrix:pod_instant_metrics_"
+
 
 class MetricsStore:
     def __init__(
@@ -32,28 +35,35 @@ class MetricsStore:
         *,
         instant_sample_interval_ms: int,
         percentile_mode: str = "bucket_upper",
+        schema: str = "v2",
     ) -> None:
         if instant_sample_interval_ms <= 0:
             raise ValueError("instant_sample_interval_ms must be positive")
+        if schema not in {"v1", "v2"}:
+            raise ValueError("schema must be v1 or v2")
         self._redis = redis_client
         self._registry = registry
         self._instant_sample_interval_ms = instant_sample_interval_ms
         self._percentile_mode = percentile_mode
-        self._window_cache: dict[tuple[str, int, int], ModelWindowMetrics] = {}
+        self._schema = schema
+        self._window_cache: dict[tuple[str, str, int, int], ModelWindowMetrics] = {}
 
     def read_model_window(self, model: str, window_start_ms: int, window_end_ms: int) -> ModelWindowMetrics:
-        cache_key = (model, int(window_start_ms), int(window_end_ms))
+        cache_key = (self._schema, model, int(window_start_ms), int(window_end_ms))
         if cache_key in self._window_cache:
             return self._window_cache[cache_key]
 
-        pods = sorted(_decode_text(pod) for pod in self._redis.smembers(pods_key(model)))
-        per_pod: dict[str, PodWindowMetrics] = {}
-        for pod_key in pods:
-            hist_docs = self._read_zset_docs(hist_key(pod_key), window_start_ms, window_end_ms)
-            inst_docs = self._read_zset_docs(inst_key(pod_key), window_start_ms, window_end_ms)
-            pod_metrics = self._aggregate_pod(model, pod_key, hist_docs, inst_docs, window_start_ms, window_end_ms)
-            if pod_metrics is not None:
-                per_pod[pod_metrics.pod] = pod_metrics
+        if self._schema == "v1":
+            per_pod = self._read_v1_model_window(model, window_start_ms, window_end_ms)
+        else:
+            pods = sorted(_decode_text(pod) for pod in self._redis.smembers(pods_key(model)))
+            per_pod: dict[str, PodWindowMetrics] = {}
+            for pod_key in pods:
+                hist_docs = self._read_zset_docs(hist_key(pod_key), window_start_ms, window_end_ms)
+                inst_docs = self._read_zset_docs(inst_key(pod_key), window_start_ms, window_end_ms)
+                pod_metrics = self._aggregate_pod(model, pod_key, hist_docs, inst_docs, window_start_ms, window_end_ms)
+                if pod_metrics is not None:
+                    per_pod[pod_metrics.pod] = pod_metrics
 
         model_metrics = self._aggregate_model(model, window_start_ms, window_end_ms, per_pod)
         self._window_cache[cache_key] = model_metrics
@@ -71,6 +81,65 @@ class MetricsStore:
                 docs.append(doc)
         docs.sort(key=lambda doc: _number(doc.get("timestamp"), 0.0))
         return docs
+
+    def _read_v1_model_window(
+        self,
+        model: str,
+        window_start_ms: int,
+        window_end_ms: int,
+    ) -> dict[str, PodWindowMetrics]:
+        hist_by_pod = self._read_legacy_docs(LEGACY_HIST_PREFIX, model, window_start_ms, window_end_ms)
+        inst_by_pod = self._read_legacy_docs(LEGACY_INST_PREFIX, model, window_start_ms, window_end_ms)
+        per_pod: dict[str, PodWindowMetrics] = {}
+        for pod_key in sorted(set(hist_by_pod) | set(inst_by_pod)):
+            pod_metrics = self._aggregate_pod(
+                model,
+                pod_key,
+                hist_by_pod.get(pod_key, []),
+                inst_by_pod.get(pod_key, []),
+                window_start_ms,
+                window_end_ms,
+            )
+            if pod_metrics is not None:
+                per_pod[pod_metrics.pod] = pod_metrics
+        return per_pod
+
+    def _read_legacy_docs(
+        self,
+        prefix: str,
+        model: str,
+        window_start_ms: int,
+        window_end_ms: int,
+    ) -> dict[str, list[dict[str, Any]]]:
+        keys: list[str] = []
+        for raw_key in self._redis.scan_iter(prefix + "*"):
+            key = _decode_text(raw_key)
+            parsed = _parse_legacy_key(prefix, key)
+            if parsed is None:
+                continue
+            _, ts_ms = parsed
+            if window_start_ms <= ts_ms <= window_end_ms:
+                keys.append(key)
+        values = self._redis.mget(keys) if keys else []
+        docs_by_pod: dict[str, list[dict[str, Any]]] = {}
+        for key, raw_value in zip(keys, values):
+            if raw_value is None:
+                continue
+            parsed = _parse_legacy_key(prefix, key)
+            if parsed is None:
+                continue
+            pod_key, ts_ms = parsed
+            try:
+                doc = json.loads(_decode_text(raw_value))
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(doc, dict) or not _doc_has_model(doc, model):
+                continue
+            doc.setdefault("timestamp", ts_ms)
+            docs_by_pod.setdefault(pod_key, []).append(doc)
+        for docs in docs_by_pod.values():
+            docs.sort(key=lambda doc: _number(doc.get("timestamp"), 0.0))
+        return docs_by_pod
 
     def _aggregate_pod(
         self,
@@ -179,6 +248,34 @@ class MetricsStore:
                 total += _number(metrics.get(metric_key), 0.0)
         expected_samples = max(1, int((window_end_ms - window_start_ms) / self._instant_sample_interval_ms))
         return total / expected_samples
+
+
+def _parse_legacy_key(prefix: str, key: str) -> tuple[str, int] | None:
+    if not key.startswith(prefix):
+        return None
+    body = key[len(prefix):]
+    try:
+        pod_key, raw_ts = body.rsplit("_", 1)
+        return pod_key, _timestamp_to_ms(int(raw_ts))
+    except (ValueError, TypeError):
+        return None
+
+
+def _timestamp_to_ms(raw: int) -> int:
+    if raw > 1_000_000_000_000_000:
+        return raw // 1_000_000
+    if raw < 100_000_000_000:
+        return raw * 1000
+    return raw
+
+
+def _doc_has_model(doc: dict[str, Any], model: str) -> bool:
+    prefix = model + "/"
+    for field in ("model_histogram_metrics", "model_metrics"):
+        metrics = doc.get(field)
+        if isinstance(metrics, dict) and any(isinstance(key, str) and key.startswith(prefix) for key in metrics):
+            return True
+    return False
 
 
 def _decode_text(value: Any) -> str:
