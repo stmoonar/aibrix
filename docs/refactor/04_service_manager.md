@@ -20,6 +20,18 @@ Implemented rules:
 - `find_slot(2)` only returns a completely empty declared 2-GPU slot.
 - `plan_defrag(2)` handles the required counterexample: two 1-GPU serves on GPUs 0 and 2 leave total free capacity but no complete slot; the plan migrates the serve on GPU 2 to GPU 1, freeing slot `(2,3)`.
 
+## State Store Contract
+
+The second P4 slice adds `tre_sm.state.store`, the persistence boundary that later reconcile/API code will use.
+
+Rules:
+
+- Redis hash `tre:v2:sm:state` stores one JSON payload per `serve_id`.
+- Redis key `tre:v2:sm:version` stores the optimistic version number.
+- `StateStore.load()` returns a deterministic `StateSnapshot(version, bindings)` sorted by `serve_id`.
+- `StateStore.save(bindings, expected_version=...)` rejects stale writers with `StateConflict` before changing state.
+- The store is tested with a fake Redis client and does not contact live Redis during unit tests.
+
 ## Verification Log
 
 ### P4-SM-001 slot allocator
@@ -42,8 +54,27 @@ cd tre && make check
 
 Result: all passed on server 76. `make check` now includes `service-manager/tests` and passed with 17 tests.
 
+### P4-SM-002 state store
+
+RED:
+
+```bash
+PYTHONPATH=tre/common:tre/service-manager python3 -m pytest -q tre/service-manager/tests/test_state_store.py
+```
+
+Result: failed during collection because `tre_sm.state.store` did not exist.
+
+GREEN:
+
+```bash
+PYTHONPATH=tre/common:tre/service-manager python3 -m pytest -q tre/service-manager/tests/test_state_store.py
+PYTHONPATH=tre/common:tre/service-manager python3 -m pytest -q tre/service-manager/tests
+```
+
+Result: focused state-store tests passed with 2 tests; service-manager tests passed with 4 tests.
+
 ## Remaining P4 Work
 
 - Add allocator property/random sequence tests.
-- Implement topology/state store/reconcile with fake Redis and fake Kubernetes clients.
+- Implement topology/reconcile with fake Redis and fake Kubernetes clients.
 - Implement vLLM/Kubernetes ops wrappers, API v2, and v1 compatibility adapters.

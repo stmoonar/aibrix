@@ -142,3 +142,11 @@
 - Updated `tre/Makefile` so `make check` includes `service-manager/tests`.
 - Verified remotely: focused slot tests passed, combined Python tests passed with 17 tests, and `cd tre && make check` passed with 17 tests.
 - Next P4 work: allocator property tests, then topology/state/reconcile with fake Redis and fake Kubernetes clients.
+
+### P4 State Store Slice
+
+- Added RED tests for service-manager state persistence: empty load defaults to version 0, saved bindings round-trip through Redis-style bytes, and stale expected versions fail without overwriting existing bindings.
+- Implemented `tre_sm.state.store.StateStore` backed by `tre:v2:sm:state` and `tre:v2:sm:version` from the shared Redis key schema.
+- Kept the store behind a small Redis protocol so unit tests use a fake client and never touch live Redis.
+- Verified remotely: focused state-store tests passed with 2 tests, and `tre/service-manager/tests` passed with 4 tests.
+- Next P4 work: allocator property tests or reconcile using fake Redis plus fake Kubernetes pod state.
