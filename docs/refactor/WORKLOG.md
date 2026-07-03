@@ -158,3 +158,11 @@
 - Updated `SlotAllocator.plan_defrag(2)` to allow one-GPU migrations into a free half-slot on another node.
 - Verified remotely: focused slot tests passed with 4 tests, `cd tre && make check` passed with 21 tests, and `cd tre && make smoke` passed.
 - Next P4 work: reconcile using fake Redis plus fake Kubernetes pod state.
+
+### P4 Reconcile Slice
+
+- Added RED tests for startup reconciliation: stale Redis bindings are overwritten by existing pod `CUDA_VISIBLE_DEVICES`, while persisted bindings with no pod observation are retained with a warning.
+- Added a state-store regression test for Redis clients that return strings instead of bytes, then fixed `_to_text` to support both forms.
+- Implemented `tre_sm.state.reconcile` with `PodRecord`, `ReconcileResult`, and `reconcile_state()` returning an in-memory `SlotAllocator` after persisting changed merged state.
+- Verified remotely: focused state/reconcile/slot tests passed with 9 tests.
+- Next P4 work: topology builder/discovery adapter, then ops wrappers and API v2 idempotency.

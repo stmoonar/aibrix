@@ -32,6 +32,19 @@ Rules:
 - `StateStore.load()` returns a deterministic `StateSnapshot(version, bindings)` sorted by `serve_id`.
 - `StateStore.save(bindings, expected_version=...)` rejects stale writers with `StateConflict` before changing state.
 - The store is tested with a fake Redis client and does not contact live Redis during unit tests.
+- Redis byte and string response forms are accepted by the loader.
+
+## Reconcile Contract
+
+The fourth P4 slice adds `tre_sm.state.reconcile`, an IO-free startup reconciliation boundary for fake or real Kubernetes pod clients.
+
+Rules:
+
+- `PodRecord` is the normalized pod observation used by tests and future `ops.k8s_ops`.
+- `CUDA_VISIBLE_DEVICES` is parsed into the binding slot and validated by `SlotAllocator`.
+- Pod reality overrides stale Redis state for the same `serve_id`, matching REFACTOR_PLAN section 5.3.
+- Persisted bindings without a current pod observation are retained conservatively and reported as warnings.
+- Reconcile persists the merged result only when bindings change, preserving the state version on no-op restart.
 
 ## Verification Log
 
@@ -93,7 +106,26 @@ cd tre && make check && make smoke
 
 Result: slot tests passed with 4 tests; `make check` passed with 21 tests; smoke passed.
 
+### P4-SM-004 reconcile startup state
+
+RED:
+
+```bash
+PYTHONPATH=tre/common:tre/service-manager python3 -m pytest -q tre/service-manager/tests/test_reconcile.py
+PYTHONPATH=tre/common:tre/service-manager python3 -m pytest -q tre/service-manager/tests/test_state_store.py
+```
+
+Result: reconcile failed during collection because `tre_sm.state.reconcile` did not exist; the state-store regression failed because string Redis responses decoded to `None`.
+
+GREEN:
+
+```bash
+PYTHONPATH=tre/common:tre/service-manager python3 -m pytest -q tre/service-manager/tests/test_state_store.py tre/service-manager/tests/test_reconcile.py tre/service-manager/tests/test_slots.py
+```
+
+Result: focused service-manager tests passed with 9 tests.
+
 ## Remaining P4 Work
 
-- Implement topology/reconcile with fake Redis and fake Kubernetes clients.
+- Implement topology builder/discovery adapter with fake Kubernetes clients.
 - Implement vLLM/Kubernetes ops wrappers, API v2, and v1 compatibility adapters.

@@ -104,3 +104,4 @@ class StateStore:
 def _to_text(value: object) -> str:
     if isinstance(value, bytes):
         return value.decode("utf-8")
+    return str(value)

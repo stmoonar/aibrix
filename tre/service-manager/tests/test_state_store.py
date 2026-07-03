@@ -28,6 +28,17 @@ class FakeRedis:
             bucket[str(field).encode("utf-8")] = str(value).encode("utf-8")
 
 
+class StringRedis(FakeRedis):
+    def get(self, key):
+        return self.values.get(key)
+
+    def hgetall(self, key):
+        return {
+            key.decode("utf-8"): value.decode("utf-8")
+            for key, value in self.hashes.get(key, {}).items()
+        }
+
+
 def test_state_store_round_trips_bindings_and_versions():
     store = StateStore(FakeRedis())
     binding = Binding(
@@ -64,3 +75,23 @@ def test_state_store_rejects_stale_expected_version_without_overwriting():
     )
 
     store.save([first], expected_version=0)
+
+    with pytest.raises(StateConflict):
+        store.save([stale], expected_version=0)
+
+    assert store.load().bindings == [first]
+
+
+def test_state_store_accepts_string_redis_responses():
+    store = StateStore(StringRedis())
+    binding = Binding(
+        serve_id="serve-a",
+        model="dsqwen-7b",
+        slot=Slot("node-a", (0,)),
+        awake=True,
+    )
+
+    store.save([binding], expected_version=0)
+
+    assert store.load().version == 1
+    assert store.load().bindings == [binding]
