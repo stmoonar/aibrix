@@ -34,6 +34,18 @@ Rules:
 - The store is tested with a fake Redis client and does not contact live Redis during unit tests.
 - Redis byte and string response forms are accepted by the loader.
 
+## Topology Adapter Contract
+
+The fifth P4 slice adds `tre_sm.allocator.topology`, the normalized boundary between Kubernetes pod discovery and allocator/reconcile code.
+
+Rules:
+
+- `K8sPodSnapshot` is a small DTO for future real Kubernetes discovery and current fake tests.
+- `pod_records_from_snapshots()` turns snapshots into `PodRecord`s sorted by pod name.
+- `CUDA_VISIBLE_DEVICES` is required and wins over `tre.aibrix.io/gpu-ids` annotations during discovery normalization.
+- `tre.aibrix.io/state` supplies awake/sleeping/hidden state, defaulting to awake when absent.
+- Unknown nodes and invalid GPU slot shapes fail before reconcile by reusing `SlotAllocator` validation.
+
 ## Reconcile Contract
 
 The fourth P4 slice adds `tre_sm.state.reconcile`, an IO-free startup reconciliation boundary for fake or real Kubernetes pod clients.
@@ -125,7 +137,25 @@ PYTHONPATH=tre/common:tre/service-manager python3 -m pytest -q tre/service-manag
 
 Result: focused service-manager tests passed with 9 tests.
 
+### P4-SM-005 topology adapter
+
+RED:
+
+```bash
+PYTHONPATH=tre/common:tre/service-manager python3 -m pytest -q tre/service-manager/tests/test_topology.py
+```
+
+Result: failed during collection because `tre_sm.allocator.topology` did not exist.
+
+GREEN:
+
+```bash
+PYTHONPATH=tre/common:tre/service-manager python3 -m pytest -q tre/service-manager/tests/test_topology.py
+PYTHONPATH=tre/common:tre/service-manager python3 -m pytest -q tre/service-manager/tests
+```
+
+Result: focused topology tests passed with 2 tests; service-manager tests passed with 11 tests.
+
 ## Remaining P4 Work
 
-- Implement topology builder/discovery adapter with fake Kubernetes clients.
 - Implement vLLM/Kubernetes ops wrappers, API v2, and v1 compatibility adapters.

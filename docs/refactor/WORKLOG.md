@@ -166,3 +166,11 @@
 - Implemented `tre_sm.state.reconcile` with `PodRecord`, `ReconcileResult`, and `reconcile_state()` returning an in-memory `SlotAllocator` after persisting changed merged state.
 - Verified remotely: focused state/reconcile/slot tests passed with 9 tests.
 - Next P4 work: topology builder/discovery adapter, then ops wrappers and API v2 idempotency.
+
+### P4 Topology Adapter Slice
+
+- Added RED tests for Kubernetes pod snapshot normalization: `CUDA_VISIBLE_DEVICES` beats stale GPU annotations, state annotations map through, unknown nodes fail, and invalid slot shapes are rejected.
+- Implemented `tre_sm.allocator.topology` with `K8sPodSnapshot`, TRE annotation constants, and `pod_records_from_snapshots()`.
+- Reused `SlotAllocator` validation instead of duplicating GPU slot rules in the discovery adapter.
+- Verified remotely: focused topology tests passed with 2 tests, and `tre/service-manager/tests` passed with 11 tests.
+- Next P4 work: vLLM/Kubernetes ops wrappers, then API v2 idempotency.
