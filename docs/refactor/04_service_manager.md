@@ -58,6 +58,18 @@ Rules:
 - Persisted bindings without a current pod observation are retained conservatively and reported as warnings.
 - Reconcile persists the merged result only when bindings change, preserving the state version on no-op restart.
 
+## Kubernetes Ops Contract
+
+The seventh P4 slice adds `tre_sm.ops.k8s_ops`, the Kubernetes client boundary for pod discovery and TRE annotations.
+
+Rules:
+
+- The Kubernetes API object is injected; unit tests use a fake object and never contact the cluster.
+- `list_pod_snapshots()` lists running, non-deleting pods and maps them into `K8sPodSnapshot` for the topology adapter.
+- The model selector uses `model.aibrix.ai/name=<model>`.
+- `write_binding_annotations()` writes `tre.aibrix.io/gpu-ids` and `tre.aibrix.io/state` in Kubernetes patch body form.
+- Unknown pod states are rejected before any patch call.
+
 ## vLLM Ops Contract
 
 The sixth P4 slice adds `tre_sm.ops.vllm_ops`, the retrying boundary for vLLM `/sleep` and `/wake_up` calls.
@@ -187,6 +199,25 @@ PYTHONPATH=tre/common:tre/service-manager python3 -m pytest -q tre/service-manag
 
 Result: focused vLLM ops tests passed with 3 tests; service-manager tests passed with 14 tests.
 
+### P4-SM-007 Kubernetes ops wrapper
+
+RED:
+
+```bash
+PYTHONPATH=tre/common:tre/service-manager python3 -m pytest -q tre/service-manager/tests/test_k8s_ops.py
+```
+
+Result: failed during collection because `tre_sm.ops.k8s_ops` did not exist.
+
+GREEN:
+
+```bash
+PYTHONPATH=tre/common:tre/service-manager python3 -m pytest -q tre/service-manager/tests/test_k8s_ops.py
+PYTHONPATH=tre/common:tre/service-manager python3 -m pytest -q tre/service-manager/tests
+```
+
+Result: focused Kubernetes ops tests passed with 2 tests; service-manager tests passed with 16 tests.
+
 ## Remaining P4 Work
 
-- Implement Kubernetes ops wrapper, API v2, and v1 compatibility adapters.
+- Implement API v2 and v1 compatibility adapters.

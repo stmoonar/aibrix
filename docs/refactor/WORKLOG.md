@@ -181,3 +181,11 @@
 - Implemented `tre_sm.ops.vllm_ops.VllmOps` and `VllmOpResult` with injectable transport and lazy `requests` import for real use.
 - Verified remotely: focused vLLM ops tests passed with 3 tests, and `tre/service-manager/tests` passed with 14 tests.
 - Next P4 work: Kubernetes annotation/discovery ops wrapper, then API v2 idempotency.
+
+### P4 Kubernetes Ops Slice
+
+- Added RED tests for Kubernetes pod discovery normalization and TRE annotation patching with a fake API object.
+- Implemented `tre_sm.ops.k8s_ops.K8sOps`, including model label selection, running/non-deleting pod filtering, `K8sPodSnapshot` mapping, and binding state annotation patch bodies.
+- Kept Kubernetes API construction out of this slice so unit tests remain offline and future deployment wiring can choose incluster or kubeconfig loading.
+- Verified remotely: focused Kubernetes ops tests passed with 2 tests, and `tre/service-manager/tests` passed with 16 tests.
+- Next P4 work: API v2 idempotent target endpoint/service logic, then v1 compatibility adapters.
