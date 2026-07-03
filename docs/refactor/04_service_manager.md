@@ -58,6 +58,18 @@ Rules:
 - Persisted bindings without a current pod observation are retained conservatively and reported as warnings.
 - Reconcile persists the merged result only when bindings change, preserving the state version on no-op restart.
 
+## API v2 Contract
+
+The eighth P4 slice adds `tre_sm.api.v2`, the declarative API surface required by REFACTOR_PLAN section 5.3.
+
+Rules:
+
+- `ServiceManagerV2.get_state()` returns current version, per-model awake/bound counts, and deterministic binding rows.
+- `ServiceManagerV2.put_model_target(model, wake_replicas=n)` validates registry limits and the already-bound warm pool.
+- Target changes are persisted optimistically only when the desired target differs from current awake state.
+- Repeating the same target is idempotent: no actions and no version bump.
+- `create_app(service)` exposes `/healthz`, `GET /v2/state`, and `PUT /v2/models/{model}/target` as thin FastAPI routes over the service layer.
+
 ## Kubernetes Ops Contract
 
 The seventh P4 slice adds `tre_sm.ops.k8s_ops`, the Kubernetes client boundary for pod discovery and TRE annotations.
@@ -218,6 +230,25 @@ PYTHONPATH=tre/common:tre/service-manager python3 -m pytest -q tre/service-manag
 
 Result: focused Kubernetes ops tests passed with 2 tests; service-manager tests passed with 16 tests.
 
+### P4-SM-008 API v2 state and target
+
+RED:
+
+```bash
+PYTHONPATH=tre/common:tre/service-manager python3 -m pytest -q tre/service-manager/tests/test_api_v2.py
+```
+
+Result: first failed during collection because `tre_sm.api.v2` did not exist; route coverage then failed because `create_app` did not exist.
+
+GREEN:
+
+```bash
+PYTHONPATH=tre/common:tre/service-manager python3 -m pytest -q tre/service-manager/tests/test_api_v2.py
+PYTHONPATH=tre/common:tre/service-manager python3 -m pytest -q tre/service-manager/tests
+```
+
+Result: focused API v2 tests passed with 4 tests; service-manager tests passed with 20 tests.
+
 ## Remaining P4 Work
 
-- Implement API v2 and v1 compatibility adapters.
+- Implement API v2 routable/reconcile endpoints, FastAPI app wiring, and v1 compatibility adapters.

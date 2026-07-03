@@ -189,3 +189,11 @@
 - Kept Kubernetes API construction out of this slice so unit tests remain offline and future deployment wiring can choose incluster or kubeconfig loading.
 - Verified remotely: focused Kubernetes ops tests passed with 2 tests, and `tre/service-manager/tests` passed with 16 tests.
 - Next P4 work: API v2 idempotent target endpoint/service logic, then v1 compatibility adapters.
+
+### P4 API v2 State/Target Slice
+
+- Added RED tests for v2 state serialization, idempotent `PUT /v2/models/{model}/target`, bound-pool validation, and FastAPI route delegation.
+- Implemented `tre_sm.api.v2.ServiceManagerV2` with deterministic state output and optimistic persistence only when target changes produce wake/sleep actions.
+- Added `create_app(service)` exposing `/healthz`, `GET /v2/state`, and `PUT /v2/models/{model}/target` as thin FastAPI routes.
+- Verified remotely: focused API v2 tests passed with 4 tests, and `tre/service-manager/tests` passed with 20 tests.
+- Next P4 work: routable/reconcile endpoints, app wiring, and v1 compatibility adapters.
