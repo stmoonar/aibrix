@@ -89,7 +89,7 @@ class SlotAllocator:
                 continue
             target_free_gpu = next(gpu for gpu in target_pair if gpu not in target_occupied)
             for source_node, source_pair in self._two_gpu_slots():
-                if source_node != target_node or source_pair == target_pair:
+                if source_node == target_node and source_pair == target_pair:
                     continue
                 source_occupied = [gpu for gpu in source_pair if self._is_occupied(source_node, gpu)]
                 if len(source_occupied) != 1:

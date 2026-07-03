@@ -150,3 +150,11 @@
 - Kept the store behind a small Redis protocol so unit tests use a fake client and never touch live Redis.
 - Verified remotely: focused state-store tests passed with 2 tests, and `tre/service-manager/tests` passed with 4 tests.
 - Next P4 work: allocator property tests or reconcile using fake Redis plus fake Kubernetes pod state.
+
+### P4 Allocator Property Slice
+
+- Added RED coverage for cross-node fragmentation: two free half-slots on different nodes now require a defrag migration instead of returning `None`.
+- Added a seeded 1000-step allocation/release property test that asserts bindings never overlap and free capacity is either directly allocatable or defraggable.
+- Updated `SlotAllocator.plan_defrag(2)` to allow one-GPU migrations into a free half-slot on another node.
+- Verified remotely: focused slot tests passed with 4 tests, `cd tre && make check` passed with 21 tests, and `cd tre && make smoke` passed.
+- Next P4 work: reconcile using fake Redis plus fake Kubernetes pod state.
