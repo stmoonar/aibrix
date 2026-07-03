@@ -226,3 +226,11 @@
 
 - Audited P4 against REFACTOR_PLAN 5.3/6: slots, topology/state/reconcile, ops, API v2, v1 compatibility, idempotent target calls, restart consistency, and allocator property tests all have focused tests.
 - Final verification passed remotely: `cd tre && make check && make smoke` completed with 43 tests and `tre smoke ok`; closure note will be committed and tagged `p4-done`.
+
+### P5 Controller Config Slice
+
+- Re-read `REFACTOR_PLAN.md` before starting P5 and began with the required `controller/config.py` step.
+- Added RED tests for centralized controller env parsing, plan ablation switches, signal-source validation, percentile-mode validation, loop interval validation, and legacy SafeScale/state env values.
+- Implemented `tre_controller.config.ControllerConfig` plus `SafeScaleConfig` as the single env parsing boundary for later P5 controller modules.
+- Verified remotely: focused config tests passed with 14 tests; `cd tre && make check && make smoke` passed with 57 tests and `tre smoke ok`.
+- Next P5 work: migrate `trs.py` signal formulas unchanged with golden comparisons, then pure classifier/planner paths.
