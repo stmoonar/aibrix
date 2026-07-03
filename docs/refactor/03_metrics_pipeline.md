@@ -103,7 +103,34 @@ cd tre && make smoke
 
 Result: all passed on server 76. The fixture helper covers out-of-order v2 writes, missing instant samples, and counter reset clamping. `read_snapshot()` now returns `MetricsSnapshot` for every model in the registry, including zero-valued models with no data in the requested window.
 
+
+### P3-METRICS-004 golden comparison and benchmark
+
+RED:
+
+```bash
+PYTHONPATH=tre/common:tre/controller:tre/controller/tests python3 -m pytest -q tre/controller/tests/test_metrics_store.py -k legacy_formula
+```
+
+Result: failed during collection because the golden old-formula helper `golden.legacy_collector` did not exist.
+
+GREEN:
+
+```bash
+PYTHONPATH=tre/common:tre/controller:tre/controller/tests python3 -m pytest -q tre/controller/tests/test_metrics_store.py
+cd tre && make check
+cd tre && make smoke
+PYTHONPATH=tre/common:tre/controller:tre/controller/tests python3 tre/controller/tests/benchmark_metrics_store.py
+```
+
+Result: all passed on server 76. The benchmark output was:
+
+```text
+metrics_store_benchmark models=3 pods=24 duration_minutes=30 elapsed_ms=87.293
+```
+
+The golden helper is test-only and mirrors the frozen collector formulas: first/last histogram deltas, expected-sample instant averaging, counter-reset clamping, and bucket-upper percentile selection. The current store matched that helper on the edge-case fixture.
+
 ## Remaining P3 Work
 
-- Add multi-window scenarios to the fixture generator and benchmark the 3 model x 8 pod x 30 minute fixture target.
-- Compare the new store against the frozen old collector on the same fixture and document any remaining differences.
+- P3 store slice completed for v2/v1 reads, edge fixtures, golden formula comparison, and 3 model x 8 pod x 30 minute benchmark. Remaining broader P3 follow-up: real Redis dump if cluster Redis is available and P5 integration use of `MetricsSnapshot`.

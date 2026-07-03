@@ -6,6 +6,7 @@ from pathlib import Path
 from tre_common.registry import load_registry
 from tre_controller.store.metrics_store import MetricsStore
 from make_redis_fixture import FakeRedis as FixtureRedis, populate_edge_case_fixture
+from golden.legacy_collector import legacy_collect_model_window
 
 
 TRE_ROOT = Path(__file__).resolve().parents[2]
@@ -182,3 +183,19 @@ def test_metrics_store_snapshot_reads_all_registry_models_from_fixture():
     assert snapshot.models["dsllama-8b"].prompt_tokens == 0.0
     assert snapshot.models["dsllama-8b"].avg_waiting == 3.0
     assert snapshot.models["dsqwen-14b"].routable_pods == 0
+
+
+def test_metrics_store_matches_legacy_formula_on_edge_fixture():
+    redis = FixtureRedis()
+    window = populate_edge_case_fixture(redis)
+    registry = load_registry(str(REGISTRY_PATH))
+    store = MetricsStore(redis, registry, instant_sample_interval_ms=5_000)
+
+    current = store.read_model_window("dsqwen-7b", window.start_ms, window.end_ms)
+    legacy = legacy_collect_model_window(redis, "dsqwen-7b", window.start_ms, window.end_ms, instant_sample_interval_ms=5_000)
+
+    assert current.prompt_tokens == legacy.prompt_tokens
+    assert current.avg_waiting == legacy.avg_waiting
+    assert current.avg_running == legacy.avg_running
+    assert current.kv_cache_hit_rate == legacy.kv_cache_hit_rate
+    assert current.ttft_p95_ms == legacy.ttft_p95_ms

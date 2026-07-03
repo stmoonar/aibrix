@@ -119,3 +119,11 @@
 - Updated `tre/Makefile` test path so controller test helpers are importable under `make check`.
 - Verified remotely: focused snapshot test passed, all metrics-store tests passed with 4 tests, `cd tre && make check` passed with 14 tests, and `cd tre && make smoke` passed.
 - Remaining P3 work: multi-window fixture/benchmark, old/new collector comparison, and documented differences.
+
+### P3 Golden Comparison and Benchmark
+
+- Added a test-only golden collector helper that mirrors the frozen collector formulas on v2 fixture data.
+- Added a comparison test proving the current `MetricsStore` matches the golden helper on the edge fixture.
+- Extended `make_redis_fixture.py` with a 3 model x 8 pod x 30 minute synthetic fixture and added `benchmark_metrics_store.py`.
+- Verified remotely: metrics-store tests passed with 5 tests, `cd tre && make check` passed with 15 tests, `cd tre && make smoke` passed, and the benchmark completed in 87.293 ms for 3 models / 24 pods / 30 minutes.
+- Remaining P3 follow-up: optional real Redis dump if accessible and downstream P5 integration of `MetricsSnapshot`.

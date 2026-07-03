@@ -104,3 +104,46 @@ def populate_edge_case_fixture(redis):
     # Missing one instant sample: old semantics still divide by expected sample count.
     add_v2_doc(redis, f"tre:v2:inst:{reset_pod}", window.mid_ms, instant_doc(reset_model, "dsllama-8b-pod-a", waiting=6, running=2, kv_hit=1.0))
     return window
+
+
+def populate_large_fixture(redis, *, start_ms=1_700_001_000_000, duration_minutes=30, sample_interval_ms=5_000, pods_per_model=8):
+    models = ("dsqwen-7b", "dsllama-8b", "dsqwen-14b")
+    samples = int(duration_minutes * 60_000 / sample_interval_ms) + 1
+    for model_index, model in enumerate(models):
+        for pod_index in range(pods_per_model):
+            pod_key = f"default/{model}-pod-{pod_index}"
+            redis.sadd(f"tre:v2:pods:{model}", pod_key)
+            prompt_base = 1_000.0 * (model_index + 1) + pod_index * 10.0
+            ttft_base = 100.0 * (model_index + 1) + pod_index
+            for sample_index in range(samples):
+                ts_ms = start_ms + sample_index * sample_interval_ms
+                prompt_sum = prompt_base + sample_index * (model_index + 1) * (pod_index + 1)
+                prompt_count = 10 + sample_index
+                ttft_count = 100 + sample_index
+                add_v2_doc(
+                    redis,
+                    f"tre:v2:hist:{pod_key}",
+                    ts_ms,
+                    histogram_doc(
+                        model,
+                        f"{model}-pod-{pod_index}",
+                        prompt_sum=prompt_sum,
+                        prompt_count=prompt_count,
+                        ttft_sum=ttft_base + sample_index * 0.05,
+                        ttft_count=ttft_count,
+                        ttft_buckets={"0.1": ttft_count * 0.5, "0.5": ttft_count},
+                    ),
+                )
+                add_v2_doc(
+                    redis,
+                    f"tre:v2:inst:{pod_key}",
+                    ts_ms,
+                    instant_doc(
+                        model,
+                        f"{model}-pod-{pod_index}",
+                        waiting=float((sample_index + pod_index) % 7),
+                        running=float(1 + (sample_index + model_index) % 5),
+                        kv_hit=0.5 + 0.01 * ((sample_index + pod_index) % 10),
+                    ),
+                )
+    return FixtureWindow(start_ms=start_ms, mid_ms=start_ms + sample_interval_ms, end_ms=start_ms + (samples - 1) * sample_interval_ms)
