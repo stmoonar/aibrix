@@ -1,0 +1,9 @@
+[project]
+name = "tre-common"
+version = "0.1.0"
+description = "Shared TRE schemas and helpers."
+requires-python = ">=3.10"
+dependencies = ["PyYAML>=6.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

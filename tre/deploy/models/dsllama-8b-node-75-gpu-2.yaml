@@ -1,0 +1,83 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dsllama-8b-node-75-gpu-2
+  namespace: default
+  labels:
+    model.aibrix.ai/name: dsllama-8b
+    model.aibrix.ai/port: '8000'
+    tre.aibrix.io/managed: 'true'
+    tre.aibrix.io/node: node-75
+    tre.aibrix.io/gpu-ids: '2'
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: dsllama-8b-node-75-gpu-2
+  template:
+    metadata:
+      labels:
+        model.aibrix.ai/name: dsllama-8b
+        model.aibrix.ai/port: '8000'
+        tre.aibrix.io/managed: 'true'
+        tre.aibrix.io/node: node-75
+        tre.aibrix.io/gpu-ids: '2'
+        app: dsllama-8b-node-75-gpu-2
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: node-75
+      volumes:
+      - name: shm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 20Gi
+      - name: models-volume
+        hostPath:
+          path: /data
+      containers:
+      - name: vllm-openai
+        image: vllm/vllm-openai:0.10.1-sleep
+        imagePullPolicy: IfNotPresent
+        command:
+        - python3
+        - -m
+        - vllm.entrypoints.openai.api_server
+        - --host
+        - 0.0.0.0
+        - --port
+        - '8000'
+        - --uvicorn-log-level
+        - warning
+        - --model
+        - /data/nfs_shared_data/DeepSeek-R1-Distill-Llama-8B
+        - --served-model-name
+        - dsllama-8b
+        - --enable_sleep_mode
+        - --no-enable-prefix-caching
+        - --enable-chunked-prefill
+        - --max-num-batched-tokens
+        - '2048'
+        - --swap-space
+        - '20'
+        env:
+        - name: CUDA_VISIBLE_DEVICES
+          value: '2'
+        - name: VLLM_SERVER_DEV_MODE
+          value: '1'
+        - name: VLLM_WORKER_MULTIPROC_METHOD
+          value: spawn
+        - name: VLLM_USE_MODELSCOPE
+          value: 'True'
+        ports:
+        - containerPort: 8000
+          protocol: TCP
+        resources:
+          limits:
+            nvidia.com/gpu: '1'
+          requests:
+            nvidia.com/gpu: '1'
+        volumeMounts:
+        - name: shm
+          mountPath: /dev/shm
+        - name: models-volume
+          mountPath: /data

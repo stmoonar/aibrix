@@ -1,0 +1,81 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dsqwen-14b-node-75-gpu-0-1
+  namespace: default
+  labels:
+    model.aibrix.ai/name: dsqwen-14b
+    model.aibrix.ai/port: '8000'
+    tre.aibrix.io/managed: 'true'
+    tre.aibrix.io/node: node-75
+    tre.aibrix.io/gpu-ids: 0,1
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: dsqwen-14b-node-75-gpu-0-1
+  template:
+    metadata:
+      labels:
+        model.aibrix.ai/name: dsqwen-14b
+        model.aibrix.ai/port: '8000'
+        tre.aibrix.io/managed: 'true'
+        tre.aibrix.io/node: node-75
+        tre.aibrix.io/gpu-ids: 0,1
+        app: dsqwen-14b-node-75-gpu-0-1
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: node-75
+      volumes:
+      - name: shm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 20Gi
+      - name: models-volume
+        hostPath:
+          path: /data
+      containers:
+      - name: vllm-openai
+        image: vllm/vllm-openai:0.10.1-sleep
+        imagePullPolicy: IfNotPresent
+        command:
+        - python3
+        - -m
+        - vllm.entrypoints.openai.api_server
+        - --host
+        - 0.0.0.0
+        - --port
+        - '8000'
+        - --uvicorn-log-level
+        - warning
+        - --model
+        - /data/nfs_shared_data/Models/DeepSeek-R1-Distill-Qwen-14B
+        - --served-model-name
+        - dsqwen-14b
+        - --enable_sleep_mode
+        - --tensor-parallel-size
+        - '2'
+        - --max-model-len
+        - '12288'
+        env:
+        - name: CUDA_VISIBLE_DEVICES
+          value: 0,1
+        - name: VLLM_SERVER_DEV_MODE
+          value: '1'
+        - name: VLLM_WORKER_MULTIPROC_METHOD
+          value: spawn
+        - name: VLLM_USE_MODELSCOPE
+          value: 'True'
+        ports:
+        - containerPort: 8000
+          protocol: TCP
+        resources:
+          limits:
+            nvidia.com/gpu: '2'
+          requests:
+            nvidia.com/gpu: '2'
+        volumeMounts:
+        - name: shm
+          mountPath: /dev/shm
+        - name: models-volume
+          mountPath: /data

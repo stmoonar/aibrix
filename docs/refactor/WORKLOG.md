@@ -41,3 +41,12 @@
 - Added `docs/refactor/00_p0_verification.md`.
 - P0 is ready to commit as documentation/snapshot work.
 - No local tests or local build outputs were used.
+
+
+### P1 Common Skeleton
+
+- Added remote-only P1 `tre/common` package with registry, Redis key, metrics schema, percentile, and JSON logging helpers.
+- Added `tre/deploy/registry.yaml` from frozen old manifests/profile defaults for `dsqwen-7b`, `dsllama-8b`, and `dsqwen-14b`.
+- Added `tre/deploy/gen_model_manifests.py` and generated per-slot model Deployment manifests.
+- Added `tre/Makefile` with `check`, `smoke`, and `manifests` targets.
+- Verification recorded in `docs/refactor/01_p1_verification.md`.
