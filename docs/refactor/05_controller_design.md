@@ -65,6 +65,49 @@ cd tre && make check && make smoke
 
 Result: passed with 67 tests and `tre smoke ok` on server 76.
 
+
+## Classification Contract
+
+The third P5 slice migrates the frozen upstream `paper_state.py` behavior into `tre_controller.planning.classify` as pure functions. This slice covers the paper-state path only; legacy raw-TRS planner classification is intentionally not migrated and will be recorded when the planner slice replaces the old branch.
+
+Implemented pieces:
+
+- `ModelState` and `ModelRole` preserve CRITICAL / LOW / HEALTHY / HIGH plus IDLE and UNKNOWN bypass states.
+- `TauThresholds.from_control()` preserves the legacy `delta_crit` / `delta_high` conversion into `tau_crit`, `tau_low`, and `tau_high`.
+- `classify_model()` preserves Z-threshold behavior and donor tiering by `eta_low`.
+- `classify_all_models()` preserves per-model control overrides and the raw-observation zero-load IDLE donor bypass.
+- `filter_donors_by_eta()` preserves the donor eta gate while allowing IDLE donors through.
+- `split_receivers_donors()` preserves receiver priority sorting and donor mock-cost ordering.
+- `build_comparison_log()` preserves the old transition log shape for migration diagnostics.
+
+Golden coverage lives in `tre/controller/tests/golden/legacy_classify.py` and compares migrated output against the frozen implementation on boundary states, per-model controls, zero-load bypass, donor filtering/sorting, and comparison logs.
+
+### P5-CTRL-003 classification
+
+RED:
+
+```bash
+PYTHONPATH=tre/common:tre/controller:tre/controller/tests python3 -m pytest -q tre/controller/tests/test_classify.py
+```
+
+Result: failed during collection because `tre_controller.planning` did not exist.
+
+GREEN:
+
+```bash
+PYTHONPATH=tre/common:tre/controller:tre/controller/tests python3 -m pytest -q tre/controller/tests/test_classify.py
+```
+
+Result: focused classification tests passed with 11 tests on server 76.
+
+Full slice verification:
+
+```bash
+cd tre && make check && make smoke
+```
+
+Result: passed with 78 tests and `tre smoke ok` on server 76.
+
 ## Verification Log
 
 ### P5-CTRL-001 centralized config

@@ -243,3 +243,12 @@
 - Verified RED remotely: `tre_controller.signals` was missing. Verified GREEN remotely: focused TRS signal tests passed with 10 tests; `cd tre && make check && make smoke` passed with 67 tests and `tre smoke ok`.
 - Recorded the legacy replica correction as an implementation-vs-paper note in `docs/refactor/05_paper_vs_impl.md`.
 - Next P5 work: migrate classification/planner pure functions with golden comparisons, starting from the paper path and recording discarded legacy paths.
+
+### P5 Classification Slice
+
+- Re-read `REFACTOR_PLAN.md` completely before starting the classify/planner segment.
+- Read frozen upstream `paper_state.py` and the planner's paper-state shadow path.
+- Added golden tests under `tre/controller/tests/golden/legacy_classify.py` covering Z-threshold boundaries, zero-load IDLE bypass, per-model control overrides, donor eta filtering/sorting, and comparison logs.
+- Implemented `tre_controller.planning.classify` as pure functions matching the frozen paper-state path.
+- Verified RED remotely: `tre_controller.planning` was missing. Verified GREEN remotely: focused classification tests passed with 11 tests; `cd tre && make check && make smoke` passed with 78 tests and `tre smoke ok`.
+- Next P5 work: migrate `planning/planner.py` as a pure `build_plan()` path, dropping the frozen legacy raw-TRS branch and recording that removal.
