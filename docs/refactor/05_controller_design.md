@@ -108,6 +108,49 @@ cd tre && make check && make smoke
 
 Result: passed with 78 tests and `tre smoke ok` on server 76.
 
+
+## Planner Contract
+
+The fourth P5 slice migrates the frozen upstream planner's paper-state path into `tre_controller.planning.planner` as pure functions returning typed actions.
+
+Implemented pieces:
+
+- `PlanConfig` carries replica bounds, scale-step ratio, and fast/slow cadence due flags.
+- `build_plan()` accepts already-built classifications plus metric contexts and returns only data, with no Redis, HTTP, Kubernetes, or service-manager calls.
+- `ScaleAction`, `HideAction`, `UnhideAction`, and `DefragAction` define the action vocabulary required by the target P5 architecture. This slice wires scale actions; SafeScale and TP-aware defrag will use the same action model in the next sub-slices.
+- CRITICAL receivers follow the frozen paper path: idle capacity, then IDLE/HIGH immediate donors, then HEALTHY/LOW middle-zone SafeScale-gated donors.
+- LOW receivers follow the frozen fairness path and require saturation before donor transfer.
+- IDLE donors shrink immediately; HIGH proactive shrink is SafeScale-gated.
+- The legacy raw-TRS fallback is intentionally dropped. If paper-state input is incomplete, `PlanResult.dropped_legacy_raw_trs` is set and no legacy plan is produced.
+
+Golden coverage lives in `tre/controller/tests/golden/legacy_planner.py` and compares migrated deltas, delayed-down models, and probe-upscale plans against the frozen paper path for rescue, middle-zone SafeScale, and fairness scenarios.
+
+### P5-CTRL-004 planner paper path
+
+RED:
+
+```bash
+PYTHONPATH=tre/common:tre/controller:tre/controller/tests python3 -m pytest -q tre/controller/tests/test_planner.py
+```
+
+Result: failed during collection because `tre_controller.planning.planner` did not exist.
+
+GREEN:
+
+```bash
+PYTHONPATH=tre/common:tre/controller:tre/controller/tests python3 -m pytest -q tre/controller/tests/test_planner.py
+```
+
+Result: focused planner tests passed with 4 tests on server 76.
+
+Full slice verification:
+
+```bash
+cd tre && make check && make smoke
+```
+
+Result: passed with 82 tests and `tre smoke ok` on server 76.
+
 ## Verification Log
 
 ### P5-CTRL-001 centralized config

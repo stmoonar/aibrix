@@ -16,3 +16,11 @@ TRS_raw = TRS_raw * assigned_replicas / routable_pods
 This correction is applied after `Y_m / Q_ctl` and is documented in the frozen upstream `trs.py` as matching the existing `main.py` behavior. It may not appear as a separate term in the paper derivation, so it is recorded here as an implementation contract rather than changed during migration.
 
 The saturation guard formula is preserved as `Gamma_m = (Y_m(t) - Y_m(t-1)) / (Q_ctl(t) - Q_ctl(t-1))`, with saturation only when `Q_ctl >= qsat` and `abs(Gamma_m) <= epsat` for `Hsat` consecutive windows.
+
+## Planner Migration
+
+The frozen planner had two branches: the newer `paper_state` branch and a legacy raw-TRS fallback. P5 keeps the paper-state path and deliberately drops the legacy raw-TRS fallback required by `REFACTOR_PLAN.md`.
+
+When migrated planner input is incomplete (`UNKNOWN` state or missing `Z_m` outside IDLE), `PlanResult.dropped_legacy_raw_trs` is set and no fallback action is emitted. This makes the removed behavior explicit for logs/tests instead of silently preserving the old branch.
+
+The first planner slice preserves the paper-path delta semantics and SafeScale probe metadata. TP-aware slot/defrag selection is still pending and will be layered onto the typed `DefragAction` in a later planner sub-slice.

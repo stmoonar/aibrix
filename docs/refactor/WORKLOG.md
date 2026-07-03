@@ -252,3 +252,12 @@
 - Implemented `tre_controller.planning.classify` as pure functions matching the frozen paper-state path.
 - Verified RED remotely: `tre_controller.planning` was missing. Verified GREEN remotely: focused classification tests passed with 11 tests; `cd tre && make check && make smoke` passed with 78 tests and `tre smoke ok`.
 - Next P5 work: migrate `planning/planner.py` as a pure `build_plan()` path, dropping the frozen legacy raw-TRS branch and recording that removal.
+
+### P5 Planner Paper Path Slice
+
+- Re-read `REFACTOR_PLAN.md` completely before starting the planner segment.
+- Read the frozen upstream `planner.py` paper-state branch and `dual_cadence.py` step/cadence helpers.
+- Added golden tests under `tre/controller/tests/golden/legacy_planner.py` covering CRITICAL rescue from IDLE/HIGH donors, middle-zone SafeScale probe plans, LOW fairness saturation gating, and explicit legacy raw-TRS fallback removal.
+- Implemented `tre_controller.planning.planner` as a pure action-producing paper path with `ScaleAction`, `HideAction`, `UnhideAction`, and `DefragAction` types.
+- Verified RED remotely: `tre_controller.planning.planner` was missing. Verified GREEN remotely: focused planner tests passed with 4 tests; `cd tre && make check && make smoke` passed with 82 tests and `tre smoke ok`.
+- Next P5 work: add TP-aware cluster-view/defrag planning on top of `DefragAction`, then SafeScale state machine.
