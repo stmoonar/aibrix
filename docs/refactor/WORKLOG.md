@@ -551,3 +551,12 @@
 - Implemented `DemandPhase`, `validate_phase_plan()`, and `design_trace_segments()` using section 12.5 phase duration/resonance rules and the capacity surface.
 - Verified remotely: focused design tests passed with 2 tests and all replayer tests passed with 13 tests.
 - Next P7 work: add `orchestrate.py` skeleton and write the old-shell behavior comparison table into `07_replayer_audit.md`.
+
+### P7 Replayer Orchestrate Skeleton Slice
+
+- Audited old shell orchestration at `/root/aibrix-main/CustomTraceGenerator/run_experiment.sh`, `run_experiment_v2.sh`, and `run_6traces_v6_trace_stage.sh`.
+- Added RED tests for Python trace config discovery and an explicit old-shell behavior comparison table; RED failed on missing `tre_replayer.orchestrate`.
+- Implemented `discover_config_traces()`, `BehaviorTableRow`, `build_behavior_table()`, and Markdown rendering. Live cluster steps are marked `not_executed_offline`; dispatch/fetch/compare are documented as planned skeleton steps.
+- Wrote the generated behavior table into `docs/refactor/07_replayer_audit.md`.
+- Verified remotely: focused orchestrate tests passed with 2 tests and all replayer tests passed with 15 tests.
+- Next P7 work: generate lint/oracle reports for existing trace sets using a placeholder or discovered capacity surface, then run the full 60 second precision audit before phase close.

@@ -73,3 +73,17 @@ The module default is the required 60 second offline stub dispatch.
 ## Trace Design Skeleton
 
 Added `tre_replayer.design` with the first section 12.5 constraints and rho-to-RPS conversion. `validate_phase_plan()` rejects phases shorter than `5 * slow_loop_s` and periodic phases whose period is an integer multiple of the control periods (`5s`, `10s`, or `20s`). `design_trace_segments()` maps `rho_m(t)` demand phases to concrete RPS segments by multiplying the fitted capacity surface `C_m(i,o)` and preserving token shapes for later schedule generation.
+
+
+## Orchestrate Shell Comparison
+
+The old `run_experiment.sh` / `run_experiment_v2.sh` flow is captured below. P7 keeps live cluster mutations out of offline verification; cluster-affecting steps are documented as `not_executed_offline` rather than silently stubbed.
+
+| Step | Old shell behavior | Python status | Notes |
+| --- | --- | --- | --- |
+| `discover_traces` | Scan config root for child directories containing config.yaml; support --only prefix filters. | `implemented` | Implemented as deterministic offline discovery only. |
+| `switch_mechanism` | Call toggle_tre_apa_hot_switch.sh to switch APA/TRE and wait for controller restart. | `not_executed_offline` | Cluster mutation is outside P7 offline verification and remains an explicit future command. |
+| `reset_replicas` | Call run_all.sh scale to reset all model replicas to 0 then 1 and wait for readiness. | `not_executed_offline` | Would modify live service-manager/model state, so it is documented but not executed. |
+| `dispatch_trace` | Run CustomTraceGenerator main.py dispatch stage for each trace/mechanism output directory. | `planned` | Future Python path will bind trace loading, scheduling, and dispatcher primitives. |
+| `fetch_metrics` | Run fetch_and_plot.sh to collect TRE logs and plots after a trace run. | `planned` | Requires completed live or smoke run artifacts. |
+| `compare_plots` | Run plot_compare_performance_cdf_latex.py over TRE and APA result directories. | `planned` | Comparison is retained as a post-processing step after real experiments. |
