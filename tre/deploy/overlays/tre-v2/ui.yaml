@@ -20,7 +20,7 @@ spec:
         kubernetes.io/hostname: nscc-ds-4a100-node10
       containers:
         - name: ui
-          image: tre-v2-ui:20260704-eb5942ca
+          image: tre-v2-ui:20260704-669f0381
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8000
