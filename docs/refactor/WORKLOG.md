@@ -280,4 +280,13 @@
 - Added RED tests for probe start persistence, immediate SLO rollback, deadline commit with follow-up upscales, deadline rollback on failed tail health, and restoring unresolved probes from store journal.
 - Implemented `tre_controller.planning.safescale` as a data-only state machine with injected persistence and no Redis/HTTP/Kubernetes calls.
 - Verified RED remotely: `tre_controller.planning.safescale` was missing. Verified GREEN remotely: focused SafeScale tests passed with 6 tests, including restored-journal latency guard coverage.
-- Next P5 work: run full quality gates for this slice, then start loops/action queue wiring.
+- Full quality gates for this slice were completed before commit; next work moved to loops/action queue wiring.
+
+### P5 ActionQueue Arbitration Slice
+
+- Re-read `REFACTOR_PLAN.md` completely on remote server 76 before starting the loops/queue segment.
+- Added RED tests for ActionQueue model in-flight arbitration, rescue replacement of pending fairness actions, typed action dispatch to an injected service-manager client, and failed dispatch retaining in-flight state.
+- Implemented `tre_controller.loops.action_queue` with data-only queueing, rescue-priority replacement, and `drain_once()` dispatch for `ScaleAction`, `HideAction`, `UnhideAction`, and `DefragAction`.
+- Verified RED remotely: `tre_controller.loops` was missing. Verified GREEN remotely: focused ActionQueue tests passed with 4 tests; `cd tre && make check && make smoke` passed with 95 tests and `tre smoke ok`.
+- Scope note: long-running queue loop, real HTTP client, JSON action logs, and rescue cancellation of already-dispatched actions remain for later P5 wiring slices.
+- Next P5 work: service-manager client wrapper or rescue/fairness loop wiring on top of this queue boundary.

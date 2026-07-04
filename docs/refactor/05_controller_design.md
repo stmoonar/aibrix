@@ -273,3 +273,43 @@ cd tre && make check && make smoke
 ```
 
 Result: passed with 91 tests and `tre smoke ok` on server 76.
+
+## ActionQueue Contract
+
+The ActionQueue slice introduces the controller boundary that will own service-manager HTTP calls. It is intentionally driven by an injected client in tests, so loop code can submit typed planner/SafeScale actions without depending on live infrastructure.
+
+Implemented pieces:
+
+- `ActionQueue.submit()` accepts typed `ScaleAction`, `HideAction`, `UnhideAction`, and `DefragAction` values.
+- The queue tracks in-flight models so later fairness actions for the same model are dropped until the current action succeeds.
+- Rescue actions may replace pending fairness actions for the same model, matching the P5 rescue-priority rule.
+- `drain_once()` dispatches to an injected service-manager client and releases a model from in-flight only after a successful response.
+- Failed dispatches keep the model in-flight so later loop ticks do not stack conflicting actions before retry/recovery handling is added.
+
+This slice does not yet implement the long-running `run()` coroutine, real HTTP client, loop tick wiring, or JSON logging; those remain for the next P5 slices.
+
+### P5-CTRL-007 ActionQueue arbitration
+
+RED:
+
+```bash
+PYTHONPATH=tre/common:tre/controller:tre/controller/tests:tre/service-manager python3 -m pytest -q tre/controller/tests/test_action_queue.py
+```
+
+Result: failed during collection because `tre_controller.loops` did not exist.
+
+GREEN:
+
+```bash
+PYTHONPATH=tre/common:tre/controller:tre/controller/tests:tre/service-manager python3 -m pytest -q tre/controller/tests/test_action_queue.py
+```
+
+Result: focused ActionQueue tests passed with 4 tests on server 76.
+
+Full slice verification:
+
+```bash
+cd tre && make check && make smoke
+```
+
+Result: passed with 95 tests and `tre smoke ok` on server 76.
