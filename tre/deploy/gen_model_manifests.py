@@ -77,6 +77,7 @@ def _service(model: ModelSpec) -> dict:
 
 def _deployment(model: ModelSpec, node_name: str, gpu_ids: tuple[int, ...]) -> dict:
     gpu_value = ",".join(str(gpu) for gpu in gpu_ids)
+    gpu_label_value = "-".join(str(gpu) for gpu in gpu_ids)
     cuda_value = ",".join(str(index) for index in range(model.tp_size))
     name = f"{_dns_name(model.name)}-{_dns_name(node_name)}-gpu-{gpu_value.replace(',', '-')}"
     command = [
@@ -103,18 +104,19 @@ def _deployment(model: ModelSpec, node_name: str, gpu_ids: tuple[int, ...]) -> d
         "model.aibrix.ai/port": "8000",
         "tre.aibrix.io/managed": "true",
         "tre.aibrix.io/node": node_name,
-        "tre.aibrix.io/gpu-ids": gpu_value,
+        "tre.aibrix.io/gpu-ids": gpu_label_value,
         ROUTABLE_LABEL: "true",
     }
+    annotations = {"tre.aibrix.io/gpu-ids": gpu_value}
     return {
         "apiVersion": "apps/v1",
         "kind": "Deployment",
-        "metadata": {"name": name, "namespace": "default", "labels": labels},
+        "metadata": {"name": name, "namespace": "default", "labels": labels, "annotations": annotations},
         "spec": {
             "replicas": 1,
             "selector": {"matchLabels": {"app": name}},
             "template": {
-                "metadata": {"labels": labels | {"app": name}},
+                "metadata": {"labels": labels | {"app": name}, "annotations": annotations},
                 "spec": {
                     "nodeSelector": {"kubernetes.io/hostname": node_name},
                     "volumes": [

@@ -76,6 +76,10 @@ def test_build_deployments_encodes_node_gpu_binding_and_vllm_args(tmp_path):
 
     assert rendered["spec"]["template"]["spec"]["nodeSelector"] == {"kubernetes.io/hostname": "node-75"}
     assert rendered["spec"]["template"]["metadata"]["labels"]["tre.aibrix.io/routable"] == "true"
+    assert rendered["metadata"]["annotations"]["tre.aibrix.io/gpu-ids"] == "0,1"
+    assert rendered["spec"]["template"]["metadata"]["annotations"]["tre.aibrix.io/gpu-ids"] == "0,1"
+    assert rendered["metadata"]["labels"]["tre.aibrix.io/gpu-ids"] == "0-1"
+    assert rendered["spec"]["template"]["metadata"]["labels"]["tre.aibrix.io/gpu-ids"] == "0-1"
     assert {"name": "CUDA_VISIBLE_DEVICES", "value": "0,1"} in container["env"]
     assert container["resources"]["limits"]["nvidia.com/gpu"] == "2"
     assert "--tensor-parallel-size" in container["command"]
@@ -119,7 +123,9 @@ def test_cuda_visible_devices_uses_container_local_ordinals(tmp_path):
     assert {"name": "CUDA_VISIBLE_DEVICES", "value": "0"} in one_gpu["env"]
     assert {"name": "CUDA_VISIBLE_DEVICES", "value": "0,1"} in two_gpu["env"]
     assert deployments["one-gpu-node-75-gpu-2"]["metadata"]["labels"]["tre.aibrix.io/gpu-ids"] == "2"
-    assert deployments["two-gpu-node-75-gpu-2-3"]["metadata"]["labels"]["tre.aibrix.io/gpu-ids"] == "2,3"
+    assert deployments["one-gpu-node-75-gpu-2"]["metadata"]["annotations"]["tre.aibrix.io/gpu-ids"] == "2"
+    assert deployments["two-gpu-node-75-gpu-2-3"]["metadata"]["labels"]["tre.aibrix.io/gpu-ids"] == "2-3"
+    assert deployments["two-gpu-node-75-gpu-2-3"]["metadata"]["annotations"]["tre.aibrix.io/gpu-ids"] == "2,3"
 
 
 def test_build_services_creates_one_model_service_with_gateway_selector(tmp_path):
