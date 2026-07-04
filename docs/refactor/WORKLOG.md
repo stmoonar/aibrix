@@ -620,3 +620,9 @@
 - Screenshot skipped because Playwright browser binaries are not installed on server 76 (`chrome-headless-shell` missing; CLI recommends `npx playwright install`).
 - Stopped the mock server and recorded the skip reason in `docs/refactor/08_ui.md`.
 - Next P8 work: final phase audit and `p8-done` tag if the backend/frontend verification remains green.
+
+### P8 Closure Audit
+
+- Added a P8 closure audit to `docs/refactor/08_ui.md`.
+- Evidence covers mock-backed backend APIs, local static frontend serving, no-CDN test coverage, explicit experiment stub, and screenshot skip reason due missing Playwright browser binaries.
+- Next step after final gate: tag `p8-done` and start P9 integration/final report.
