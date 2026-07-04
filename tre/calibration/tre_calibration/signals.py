@@ -39,6 +39,12 @@ class ParameterCandidateScore:
     scored_windows: list[CalibrationWindow]
 
 
+@dataclass(frozen=True)
+class ParameterSearchResult:
+    best: ParameterCandidateScore
+    candidates: list[ParameterCandidateScore]
+
+
 def compute_trs(inputs: SignalInputs, *, w_p: float, lambda_wait: float, qmin: float) -> TrsBreakdown:
     total_tokens = inputs.prompt_tokens_total * (1.0 - inputs.kv_cache_hit_rate) * w_p + inputs.generation_tokens_total
     queue_raw = lambda_wait * inputs.avg_waiting + inputs.avg_running + inputs.avg_swapping
@@ -95,4 +101,44 @@ def score_parameter_candidate(
         spearman_health=metrics.spearman_health,
         auroc=metrics.auroc,
         scored_windows=scored_windows,
+    )
+
+
+def grid_search_parameters(
+    windows: Sequence[CalibrationWindow],
+    inputs: Sequence[SignalInputs],
+    *,
+    w_p_candidates: Sequence[float],
+    lambda_wait_candidates: Sequence[float],
+    qmin_candidates: Sequence[float],
+) -> ParameterSearchResult:
+    candidates: list[ParameterCandidateScore] = []
+    best: ParameterCandidateScore | None = None
+    for w_p in w_p_candidates:
+        for lambda_wait in lambda_wait_candidates:
+            for qmin in qmin_candidates:
+                candidate = score_parameter_candidate(
+                    windows,
+                    inputs,
+                    w_p=w_p,
+                    lambda_wait=lambda_wait,
+                    qmin=qmin,
+                )
+                candidates.append(candidate)
+                if best is None or _candidate_key(candidate) > _candidate_key(best):
+                    best = candidate
+
+    if best is None:
+        raise ValueError("parameter search requires at least one candidate")
+    return ParameterSearchResult(best=best, candidates=candidates)
+
+
+def _candidate_key(candidate: ParameterCandidateScore) -> tuple[float, float, float, float, float, float]:
+    return (
+        candidate.objective,
+        candidate.auroc,
+        candidate.spearman_health,
+        -candidate.w_p,
+        -candidate.lambda_wait,
+        -candidate.qmin,
     )

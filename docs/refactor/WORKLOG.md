@@ -462,3 +462,12 @@
 - Extended `docs/refactor/06_calibration_design.md` with the signal recompute contract.
 - Verified remotely: focused signal tests passed with 2 tests and all calibration tests passed with 8 tests.
 - Next P6 work: add grid search over candidate parameters and emit a deterministic profile patch artifact containing theta and selected parameter metadata.
+
+### P6 Calibration Parameter Search and Profile Patch Slice
+
+- Added RED tests for grid-search selection over candidate TRS parameters and deterministic profile-patch payload construction; RED failed on missing `grid_search_parameters` and `tre_calibration.profile`.
+- Implemented `grid_search_parameters()` and `ParameterSearchResult` using candidate objective/AUROC/Spearman ordering with deterministic tie-breaks.
+- Added `build_profile_patch()` to emit a stable calibration artifact with publish status, theta fit gates, selected TRS parameters, and metrics without mutating the registry.
+- Extended `docs/refactor/06_calibration_design.md` with the search and profile-patch contract.
+- Verified remotely: focused grid/profile tests passed with 2 tests and all calibration tests passed with 10 tests.
+- Next P6 work: wire a small calibration CLI over CSV input and synthetic fixture output, then run final P6 verification/tagging.

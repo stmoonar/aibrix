@@ -29,3 +29,8 @@ The reliability fitter mirrors the archived publish gate at small scale: scan ca
 The third slice extracts the archived TRS formula into `signals.py`. `SignalInputs` carries token totals, queue depths, replica visibility, and KV cache hit rate. `compute_trs()` emits both floor-protected and raw TRS variants using the old formula: prompt tokens are discounted by cache hit rate and weighted by `w_p`, waiting queue depth is scaled by `lambda_wait`, queue floor is bounded by `qmin`, and scores are multiplied by assigned/routable replica ratio.
 
 Candidate scoring currently uses raw TRS (`trs_no_floor`), matching the archived parameter objective path, and evaluates direction with AUROC plus Spearman health correlation. Later slices can grid-search over this helper without mixing formula code into CSV loading or threshold publishing.
+
+
+## Parameter Search and Profile Patch
+
+The fourth slice adds a deterministic grid-search wrapper over candidate `w_p`, `lambda_wait`, and `qmin` values. Candidate ranking uses objective first, then AUROC and Spearman health direction, with smaller parameters as final tie-breakers for reproducibility. The profile patch builder is intentionally separate from registry mutation: it returns a stable payload containing publish status, theta fit gates, selected TRS parameters, and scoring metrics. A later CLI can decide whether to write this payload beside a run or apply it to `registry.yaml`.
