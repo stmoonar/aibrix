@@ -61,7 +61,7 @@ spec:
         - '20'
         env:
         - name: CUDA_VISIBLE_DEVICES
-          value: '3'
+          value: '0'
         - name: VLLM_SERVER_DEV_MODE
           value: '1'
         - name: VLLM_WORKER_MULTIPROC_METHOD

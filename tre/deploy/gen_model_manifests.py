@@ -75,6 +75,7 @@ def _service(model: ModelSpec) -> dict:
 
 def _deployment(model: ModelSpec, node_name: str, gpu_ids: tuple[int, ...]) -> dict:
     gpu_value = ",".join(str(gpu) for gpu in gpu_ids)
+    cuda_value = ",".join(str(index) for index in range(model.tp_size))
     name = f"{_dns_name(model.name)}-{_dns_name(node_name)}-gpu-{gpu_value.replace(',', '-')}"
     command = [
         "python3",
@@ -124,7 +125,7 @@ def _deployment(model: ModelSpec, node_name: str, gpu_ids: tuple[int, ...]) -> d
                             "imagePullPolicy": "IfNotPresent",
                             "command": command,
                             "env": [
-                                {"name": "CUDA_VISIBLE_DEVICES", "value": gpu_value},
+                                {"name": "CUDA_VISIBLE_DEVICES", "value": cuda_value},
                                 {"name": "VLLM_SERVER_DEV_MODE", "value": "1"},
                                 {"name": "VLLM_WORKER_MULTIPROC_METHOD", "value": "spawn"},
                                 {"name": "VLLM_USE_MODELSCOPE", "value": "True"},

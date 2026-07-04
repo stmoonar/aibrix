@@ -733,3 +733,11 @@
 - Service-manager target sleep/wake is still state-only and does not call vLLM operations; direct vLLM `/sleep` measured 7.367s, above the N3 <5s threshold.
 - Live gateway metrics are legacy `aibrix:pod_*` keys, not `tre:v2:hist:*` ZSETs; the v1 reader works but measured 138.169 ms for an uncached one-window read, above the <100ms target.
 - Controller decision evidence exists in `tre:v2:decision:latest`, but controller logs did not emit `trs_calc_result`.
+
+### N3 GPU Slot Semantics Fix
+
+- Investigated the N3 GPU mismatch: the model Deployment carried logical TRE slot `0`, while host `nvidia-smi` showed the allocated physical GPU UUID at host index `2`.
+- Confirmed the NVIDIA device plugin is configured with `DEVICE_ID_STRATEGY=uuid`; it injects `NVIDIA_VISIBLE_DEVICES=<allocated UUID>` and exposes the allocation inside the container as CUDA ordinal `0`.
+- Added RED coverage showing generated manifests for logical slots `2` and `2,3` must use container-local `CUDA_VISIBLE_DEVICES=0` and `0,1`, while preserving `tre.aibrix.io/gpu-ids=2` and `2,3`.
+- Fixed manifest generation and service-manager topology normalization so reconciliation prefers the TRE logical slot annotation and falls back to CUDA env only for unannotated legacy pods.
+- Recorded ADR-0005: physical host GPU index equality is not enforceable with the current generic `nvidia.com/gpu` resource; N3 validates logical TRE slots plus plugin-injected UUID/runtime ordinals instead.

@@ -67,3 +67,24 @@ TRE v2 component images use `tre-v2-<component>:<yyyymmdd>-<git-short-sha>`. `la
 ### Consequences
 
 Local build artifacts and cluster deployments can be tied to a specific source commit. Documentation-only follow-up commits may record build evidence, but deployable image tags still point at the source commit used for the build.
+
+## ADR-0005: TRE GPU ids are logical slots under Kubernetes device-plugin allocation
+
+- Date: 2026-07-04
+- Status: accepted
+
+### Context
+
+N3 live smoke showed a `dsqwen-7b` Deployment labeled as TRE GPU `0`, while host `nvidia-smi` on node9 showed memory on physical GPU `2`. The installed NVIDIA device plugin advertises generic `nvidia.com/gpu`, uses `DEVICE_ID_STRATEGY=uuid`, and injects `NVIDIA_VISIBLE_DEVICES=<allocated GPU UUID>`. Inside the container, the allocated device is exposed as local CUDA ordinal `0`.
+
+The original generated manifests set `CUDA_VISIBLE_DEVICES` to the TRE slot id. That works for logical slot `0`, but a one-GPU pod labeled as slot `2` would receive only one plugin-allocated GPU while also setting `CUDA_VISIBLE_DEVICES=2`, which is not a valid container-local ordinal.
+
+### Decision
+
+TRE slot ids in labels and annotations (`tre.aibrix.io/gpu-ids`) are logical scheduler slots used by the allocator and service-manager state. Generated model manifests set `CUDA_VISIBLE_DEVICES` to container-local ordinals (`0` for one GPU, `0,1` for two GPUs), while preserving the logical slot ids in names, labels, and annotations.
+
+Service-manager reconciliation prefers `tre.aibrix.io/gpu-ids` when present and falls back to `CUDA_VISIBLE_DEVICES` only for unannotated legacy pods.
+
+### Consequences
+
+N3 acceptance checks validate the logical TRE slot, pod annotation, plugin-injected `NVIDIA_VISIBLE_DEVICES` UUID, and container-local CUDA ordinal. Host physical GPU index equality is not an enforceable property with the current generic `nvidia.com/gpu` resource and NVIDIA device-plugin configuration. Deterministic host physical GPU placement would require a separate device-plugin/resource model or scheduler integration and is outside the N3 deployment contract.

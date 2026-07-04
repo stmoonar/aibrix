@@ -32,15 +32,15 @@ def pod_records_from_snapshots(
     for snapshot in sorted(snapshots, key=lambda item: item.name):
         if snapshot.node not in known_nodes:
             raise ValueError(f"unknown node for pod {snapshot.name}: {snapshot.node}")
-        cuda_visible_devices = snapshot.env.get(CUDA_VISIBLE_DEVICES)
-        if not cuda_visible_devices:
-            raise ValueError(f"pod {snapshot.name} missing {CUDA_VISIBLE_DEVICES}")
+        gpu_ids = snapshot.annotations.get(GPU_IDS_ANNOTATION) or snapshot.env.get(CUDA_VISIBLE_DEVICES)
+        if not gpu_ids:
+            raise ValueError(f"pod {snapshot.name} missing {GPU_IDS_ANNOTATION} or {CUDA_VISIBLE_DEVICES}")
         records.append(
             PodRecord(
                 serve_id=snapshot.name,
                 model=snapshot.model,
                 node=snapshot.node,
-                cuda_visible_devices=cuda_visible_devices,
+                cuda_visible_devices=gpu_ids,
                 state=snapshot.annotations.get(STATE_ANNOTATION, POD_STATE_AWAKE),
             )
         )

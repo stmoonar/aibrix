@@ -42,7 +42,7 @@ Rules:
 
 - `K8sPodSnapshot` is a small DTO for future real Kubernetes discovery and current fake tests.
 - `pod_records_from_snapshots()` turns snapshots into `PodRecord`s sorted by pod name.
-- `CUDA_VISIBLE_DEVICES` is required and wins over `tre.aibrix.io/gpu-ids` annotations during discovery normalization.
+- `tre.aibrix.io/gpu-ids` is the preferred logical TRE slot source during discovery normalization; `CUDA_VISIBLE_DEVICES` is only the fallback for unannotated legacy pods.
 - `tre.aibrix.io/state` supplies awake/sleeping/hidden state, defaulting to awake when absent.
 - Unknown nodes and invalid GPU slot shapes fail before reconcile by reusing `SlotAllocator` validation.
 
@@ -53,7 +53,7 @@ The fourth P4 slice adds `tre_sm.state.reconcile`, an IO-free startup reconcilia
 Rules:
 
 - `PodRecord` is the normalized pod observation used by tests and future `ops.k8s_ops`.
-- `CUDA_VISIBLE_DEVICES` is parsed into the binding slot and validated by `SlotAllocator`.
+- The resolved logical GPU id string is parsed into the binding slot and validated by `SlotAllocator`.
 - Pod reality overrides stale Redis state for the same `serve_id`, matching REFACTOR_PLAN section 5.3.
 - Persisted bindings without a current pod observation are retained conservatively and reported as warnings.
 - Reconcile persists the merged result only when bindings change, preserving the state version on no-op restart.
@@ -337,7 +337,7 @@ P4 acceptance coverage:
 
 - Slot allocator: `test_slots.py` covers the required 0/2 fragmentation counterexample, split-slot fill order, cross-node defrag, and a seeded 1000-step allocation/release invariant test.
 - State persistence: `test_state_store.py` covers versioned round-trips, stale writer rejection, and Redis byte/string response compatibility.
-- Restart reconciliation: `test_reconcile.py` constructs persisted state plus fake pod reality and verifies pod `CUDA_VISIBLE_DEVICES` wins, merged state persists, and missing pod observations are retained conservatively.
+- Restart reconciliation: `test_reconcile.py` constructs persisted state plus fake pod reality and verifies pod observations win, merged state persists, and missing pod observations are retained conservatively.
 - Topology/discovery: `test_topology.py` and `test_k8s_ops.py` cover snapshot normalization, annotation patch bodies, model selectors, and invalid slot rejection with fake Kubernetes clients.
 - Ops: `test_vllm_ops.py` covers sleep/wake endpoint selection, retries, timeout propagation, idempotent 409 handling, and structured failures without network calls.
 - API v2: `test_api_v2.py` and `test_app.py` cover `/healthz`, `GET /v2/state`, `PUT /v2/models/{model}/target`, `PUT /v2/models/{model}/routable`, `POST /v2/reconcile`, app wiring, and target idempotency.
