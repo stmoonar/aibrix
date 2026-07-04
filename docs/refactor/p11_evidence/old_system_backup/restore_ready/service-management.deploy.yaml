@@ -1,0 +1,143 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: service-management
+  name: service-management
+  namespace: aibrix-system
+spec:
+  progressDeadlineSeconds: 600
+  replicas: 1
+  revisionHistoryLimit: 10
+  selector:
+    matchLabels:
+      app: service-management
+  strategy:
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 25%
+    type: RollingUpdate
+  template:
+    metadata:
+      creationTimestamp: null
+      labels:
+        app: service-management
+    spec:
+      containers:
+      - env:
+        - name: TARGET_NAMESPACE
+          value: default
+        - name: PORT
+          value: '7001'
+        - name: ENABLE_DELAYED_EVICTION
+          value: '1'
+        - name: WAKE_UP_INTERVAL_MS
+          value: '1000'
+        - name: STARVATION_TTFT_RATIO
+          value: '1.0'
+        - name: SLO_PRIORITY_MODE
+          value: all
+        - name: LD_LIBRARY_PATH
+          value: /usr/local/nvidia/lib64:/usr/lib/x86_64-linux-gnu
+        - name: PROACTIVE_LOOKAHEAD_S
+          value: '2.0'
+        - name: PROACTIVE_WAKEUP_ESTIMATE_S
+          value: '2.0'
+        - name: TRACE_OUTPUT_MOUNT
+          value: /data/trace_output
+        image: service-management:lxt
+        imagePullPolicy: IfNotPresent
+        livenessProbe:
+          failureThreshold: 5
+          httpGet:
+            path: /health
+            port: 7001
+            scheme: HTTP
+          initialDelaySeconds: 10
+          periodSeconds: 300
+          successThreshold: 1
+          timeoutSeconds: 300
+        name: service-management
+        ports:
+        - containerPort: 7001
+          name: http
+          protocol: TCP
+        readinessProbe:
+          failureThreshold: 5
+          httpGet:
+            path: /health
+            port: 7001
+            scheme: HTTP
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          successThreshold: 1
+          timeoutSeconds: 300
+        resources:
+          limits:
+            cpu: 500m
+            memory: 512Mi
+          requests:
+            cpu: 100m
+            memory: 128Mi
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+        volumeMounts:
+        - mountPath: /usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1
+          name: nvidia-lib
+          readOnly: true
+        - mountPath: /dev/nvidiactl
+          name: nvidia-dev-ctl
+        - mountPath: /dev/nvidia-uvm
+          name: nvidia-dev-uvm
+        - mountPath: /dev/nvidia0
+          name: nvidia-dev0
+        - mountPath: /dev/nvidia1
+          name: nvidia-dev1
+        - mountPath: /dev/nvidia2
+          name: nvidia-dev2
+        - mountPath: /dev/nvidia3
+          name: nvidia-dev3
+        - mountPath: /data/trace_output
+          name: trace-output
+          readOnly: true
+      dnsPolicy: ClusterFirst
+      nodeName: nscc-ds-4a100-node10
+      restartPolicy: Always
+      schedulerName: default-scheduler
+      securityContext: {}
+      serviceAccount: service-management-sa
+      serviceAccountName: service-management-sa
+      terminationGracePeriodSeconds: 30
+      volumes:
+      - hostPath:
+          path: /usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1
+          type: ''
+        name: nvidia-lib
+      - hostPath:
+          path: /dev/nvidiactl
+          type: CharDevice
+        name: nvidia-dev-ctl
+      - hostPath:
+          path: /dev/nvidia-uvm
+          type: CharDevice
+        name: nvidia-dev-uvm
+      - hostPath:
+          path: /dev/nvidia0
+          type: CharDevice
+        name: nvidia-dev0
+      - hostPath:
+          path: /dev/nvidia1
+          type: CharDevice
+        name: nvidia-dev1
+      - hostPath:
+          path: /dev/nvidia2
+          type: CharDevice
+        name: nvidia-dev2
+      - hostPath:
+          path: /dev/nvidia3
+          type: CharDevice
+        name: nvidia-dev3
+      - hostPath:
+          path: /root/aibrix-main/lxt-exm/lxtCustomTraceGenerator/output
+          type: Directory
+        name: trace-output

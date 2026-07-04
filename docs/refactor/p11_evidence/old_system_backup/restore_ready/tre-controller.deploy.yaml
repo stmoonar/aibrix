@@ -1,0 +1,85 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  annotations:
+    last-updated: '20260630170214'
+  labels:
+    app: tre-controller
+  name: tre-controller
+  namespace: aibrix-system
+spec:
+  progressDeadlineSeconds: 600
+  replicas: 1
+  revisionHistoryLimit: 10
+  selector:
+    matchLabels:
+      app: tre-controller
+  strategy:
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 25%
+    type: RollingUpdate
+  template:
+    metadata:
+      annotations:
+        kubectl.kubernetes.io/restartedAt: '2026-07-01T18:12:07+08:00'
+      creationTimestamp: null
+      labels:
+        app: tre-controller
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: kubernetes.io/hostname
+                operator: In
+                values:
+                - nscc-ds-4a100-node10
+      containers:
+      - env:
+        - name: TARGET_NAMESPACE
+          value: default
+        - name: ENABLE_TRE_SCALING
+          value: '0'
+        - name: MODELS
+          value: dsqwen-7b,dsllama-8b,dsqwen-14b,dsllama8b,dsqwen7b,dsqwen14b
+        - name: TRE_EXCLUDED_MODELS
+          value: dsllama8b,dsqwen7b,dsqwen14b
+        - name: MONITOR_INTERVAL_SECONDS
+          value: '20'
+        - name: TRS_INTERVAL_SECONDS
+          value: '20'
+        - name: INSTANT_SAMPLING_INTERVAL_SECONDS
+          value: '0.5'
+        - name: TRE_HISTOGRAM_DEBUG
+          value: '0'
+        - name: SCRAPE_PERIOD_SECONDS
+          value: '20'
+        - name: REDIS_HOST
+          value: aibrix-redis-master
+        - name: REDIS_PORT
+          value: '6379'
+        - name: PROFILE
+          value: '1'
+        - name: TRE_METRICS_REDIS_TTL_SECONDS
+          value: '21600'
+        image: aibrix/tre-controller:latest
+        imagePullPolicy: IfNotPresent
+        name: controller
+        resources:
+          limits:
+            cpu: 500m
+            memory: 512Mi
+          requests:
+            cpu: 100m
+            memory: 128Mi
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+      dnsPolicy: ClusterFirst
+      restartPolicy: Always
+      schedulerName: default-scheduler
+      securityContext: {}
+      serviceAccount: tre-controller
+      serviceAccountName: tre-controller
+      terminationGracePeriodSeconds: 30

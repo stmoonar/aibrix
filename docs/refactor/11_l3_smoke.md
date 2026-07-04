@@ -2,62 +2,45 @@
 
 Date: 2026-07-04
 Host: `nscc-ds-4a100-node10` / workspace `/data/nfs_shared_data/xxy/aibrix`
-Status: **PARTIAL - do not tag `n3-done`**
+Status: **PASS - ready for `n3-done`**
 
 ## Summary
 
-N3.1 backup and N3.2 old TRE removal are complete. The `tre-v2` control-plane is deployed and healthy, one `dsqwen-7b` model pod is running, gateway forwarding works for 100 requests, UI state works, and controller decisions are now non-stale after reading live gateway metrics from AIBrix Redis.
+N3.1 backup, N3.2 old TRE removal, and N3.3 `tre-v2` deployment are complete. The live system has one `dsqwen-7b` model pod, the service-manager target path performs real vLLM sleep/wake operations, the gateway serves requests and writes v2 Redis metrics, controller decision logs include `trs_calc_result`, UI state reflects the live service-manager state, and restore-ready rollback manifests pass server-side dry-run.
 
-N3 is not complete because several required smoke checks failed or are only partially implemented:
-
-- The model manifest requested logical GPU `0`, but Kubernetes/NVIDIA device allocation placed the process on physical GPU `2` (`nvidia-smi` on node9 shows GPU2 using ~37 GiB, GPU0 0 MiB).
-- `PUT /v2/models/dsqwen-7b/target` is state-only. It records sleep/wake actions but does not call vLLM `/sleep` or `/wake_up`.
-- Direct vLLM sleep/wake works, but sleep took `7.367s`, above the `<5s` N3 target; wake took `0.812s`.
-- Gateway metrics are present only as legacy `aibrix:pod_*` keys in `aibrix-redis-master`, not as `tre:v2:hist:*` ZSET keys. The controller can read them through the v1 reader, but an uncached one-window read measured `138.169ms`, above the `<100ms` target.
-- Controller logs did not contain `trs_calc_result`; evidence is currently from `tre:v2:decision:latest`, not structured controller log lines.
+GPU acceptance follows ADR-0005: TRE `gpu_ids` are logical scheduler slots. The current NVIDIA device plugin allocates a physical GPU UUID and exposes it inside the container as CUDA ordinal `0`; host physical GPU index equality is not enforceable with the generic `nvidia.com/gpu` resource.
 
 ## Checks
 
 | Check | Result | Evidence |
 | --- | --- | --- |
-| N3.1 old TRE backup committed | PASS | `docs/refactor/p11_evidence/old_system_backup/` contains old deployments, svc/cm/secret snapshot, pods, and nodes. Commit `e97a60e8`. |
-| Old TRE deployments deleted | PASS | `tre-controller`, `service-management-xxy`, `service-management`, and `service-management-lxttest` no longer run in `aibrix-system`. AIBrix base pods remain running. |
-| `tre-v2` overlay deployed | PASS | `tre-v2-controller`, `tre-v2-service-manager`, `tre-v2-ui`, and `tre-v2-redis` all `1/1 Running` on node10. |
-| Model Service for gateway route | PASS after fix | Generated and applied `default/dsqwen-7b` Service. `dsqwen-7b-router` resolves refs after Service creation. |
+| N3.1 old TRE backup committed | PASS | Raw backups are under `docs/refactor/p11_evidence/old_system_backup/`; restore-ready sanitized copies are under `old_system_backup/restore_ready/`. |
+| Old TRE deployments deleted | PASS | `tre-controller`, `service-management-xxy`, `service-management`, and `service-management-lxttest` are no longer running in `aibrix-system`; AIBrix base services remain. |
+| `tre-v2` overlay deployed | PASS | Controller image `tre-v2-controller:20260704-51e6cde3`; service-manager image `tre-v2-service-manager:20260704-eaa117a4`; UI image `tre-v2-ui:20260704-669f0381`. |
+| Model Service for gateway route | PASS | `default/dsqwen-7b` Service exists and the AIBrix HTTPRoute resolves refs. |
 | One `dsqwen-7b` model pod Running | PASS | Pod `dsqwen-7b-nscc-ds-4a100-node9-gpu-0-858d467d84-98mbp` is `1/1 Running` on node9. |
-| GPU memory on expected physical GPU | FAIL | Expected manifest logical GPU `0`; node9 `nvidia-smi` shows physical GPU2 using ~37 GiB and GPU0 using 0 MiB. This is likely NVIDIA device-plugin remapping. |
-| `/v2/reconcile` | PASS after fix | Reconcile dropped stale rollout pod binding and persisted current pod at version 4; later reconcile restored pod reality after state-only sleep. |
-| `PUT /v2/models/dsqwen-7b/target` sleep/wake | PARTIAL | API returns quickly (`0.008s`, `0.003s`) but is state-only and does not call vLLM. Controller idle scale-down also only changed SM state; vLLM remained awake. |
-| Direct vLLM sleep/wake | FAIL threshold | `/sleep` took `7.367s`, `/wake_up` took `0.812s`; N3 target is `<5s`. |
-| Gateway 100 requests | PASS | `100/100` requests through `http://10.99.21.145/v1/completions` with header `model: dsqwen-7b`; p95 `28.33ms`, no errors. |
-| Metrics written after gateway traffic | PARTIAL | Legacy keys exist in `aibrix-redis-master`: `aibrix:pod_histogram_metrics_default/dsqwen-7b...`; no `tre:v2:hist:*` keys in `tre-v2-redis` or AIBrix Redis. |
-| Metrics window read | FAIL threshold | Controller v1 reader can read live metrics, but uncached read measured `138.169ms`, above `<100ms`. |
-| Controller decision | PARTIAL | `tre:v2:decision:latest` hash has `stale=false`, `loop=rescue`, and submitted idle scale actions. Controller logs are empty; no `trs_calc_result` log evidence. |
-| UI `/api/cluster` | PASS | `/healthz` returns `{"ok":true}`; `/api/cluster` shows topology and SM state version 8 with the current `dsqwen-7b` binding. |
-| Rollback dry-run | PARTIAL | Server dry-run succeeded for `tre-controller.deploy.yaml` and `service-management-xxy.deploy.yaml`; remaining backup manifests still need dry-run before any real rollback. |
-| Offline gate after N3 fixes | PASS | `cd tre && make check && make smoke`: `199 passed`, `tre smoke ok`. |
+| GPU binding contract | PASS | Pod annotation `tre.aibrix.io/gpu-ids=0`; container env `CUDA_VISIBLE_DEVICES=0`, `NVIDIA_VISIBLE_DEVICES=GPU-3a113474-dd92-6d52-d05b-491e7b020ded`; container `nvidia-smi` sees that UUID as index 0. Host node9 shows the same UUID at physical index 2, which is expected device-plugin remapping. |
+| `/v2/reconcile` | PASS | State version 24 after cleanup had one binding and `POST /v2/reconcile` returned `warnings: []`. |
+| `PUT /v2/models/dsqwen-7b/target` sleep/wake | PASS | With controller paused: target 1 idempotent `0.008s`; target 0 real sleep `1.116s`; target 1 real wake `0.793s`; final `/is_sleeping` false and pod annotation `state=awake`. A later sleep-only reproduction measured `1.078s` and produced `/is_sleeping: true`, annotation `state=sleeping`. |
+| Runtime target growth guard | PASS | Live service-manager now rejects target growth beyond existing bindings when runtime ops are enabled, preventing state-only phantom bindings. Stale phantoms from earlier smoke were removed through `StateStore` version 23 -> 24; subsequent state stayed one binding. |
+| Gateway 100 requests | PASS | With controller paused and model awake: `ok 100 errors 0`, latency min/avg/p95/max `19.46/25.06/31.16/39.33 ms`. |
+| Gateway v2 metrics written | PASS | AIBrix Redis has `tre:v2:pods:dsqwen-7b`, `tre:v2:hist:default/dsqwen-7b...`, and `tre:v2:inst:default/dsqwen-7b...`; after the gateway burst, hist/inst ZCARD were `141/141`. |
+| Metrics window read | PASS | v2 `MetricsStore.read_snapshot` / model window read against AIBrix Redis measured below target; model window read examples were `2.800 ms`, `0.791 ms`, `0.744 ms`, `0.726 ms`, `0.733 ms`. |
+| Controller decision logs | PASS | Live controller logs contain JSON `trs_calc_result` entries with `stale:false` for rescue/fairness loops. |
+| Control-loop tick timing | PASS | Direct live tick-path benchmark over metrics snapshot read + SM state fetch + cluster-view construction + rescue planning, 30 iterations: min/avg/p95/max `1.121/1.503/1.707/8.877 ms`. |
+| UI `/api/cluster` | PASS | UI `/healthz` returns `{"ok":true}`; `/api/cluster` shows topology and service-manager version 29 with one bound `dsqwen-7b` pod. |
+| Rollback dry-run | PASS | `kubectl apply --dry-run=server -f docs/refactor/p11_evidence/old_system_backup/restore_ready/*.yaml` passed for gateway, svc/cm/secret, and all old TRE deployments. Warnings were only missing last-applied annotations. |
+| Offline gate | PASS | `git diff --check && cd tre && make check && make smoke`: `205 passed`, `tre smoke ok`. |
 
 ## Live Images
 
-- `tre-v2-controller:20260704-a3d756b4`
-- `tre-v2-service-manager:20260704-8af70fe4`
+- `tre-v2-controller:20260704-51e6cde3`
+- `tre-v2-service-manager:20260704-eaa117a4`
 - `tre-v2-ui:20260704-669f0381`
+- `aibrix/gateway-plugins:20260704-0d869b49-nozmq2` with `TRE_REDIS_SCHEMA=dual`
 
-## Fixes Made During N3 Smoke
+## Notes
 
-- Preserved explicit namespaces in the `tre-v2` overlay so default-namespace RBAC is not rewritten into `tre-v2`.
-- Fixed service-manager Kubernetes pod list/object handling and rollout replacement reconciliation.
-- Fixed `dsqwen-7b` model path.
-- Added generated per-model Services so AIBrix HTTPRoutes can resolve model backends.
-- Split controller Redis configuration so state/decisions stay in `tre-v2-redis` while live metrics can be read from `aibrix-redis-master` using the legacy v1 reader.
-
-## Required Before `n3-done`
-
-1. Decide and implement deterministic physical GPU binding, or explicitly revise the acceptance criterion to treat logical CUDA device `0` inside the container as sufficient.
-2. Wire service-manager target sleep/wake to real vLLM operations and reconcile pod annotations/state after those operations.
-3. Bring direct vLLM sleep latency under 5s or revise the threshold with evidence.
-4. Either deploy a v2 gateway metrics writer producing `tre:v2:hist:*` ZSETs, or optimize and formally accept the legacy v1 metrics path for N3.
-5. Add/enable structured controller logs containing `trs_calc_result`, or update the checklist to use `tre:v2:decision:latest` as the authoritative decision evidence.
-6. Complete rollback dry-run for all old-system backup manifests.
-
-No `n3-done` tag was created.
+- The gateway v2 metrics rollout is captured in `docs/refactor/p11_evidence/gateway-v2-metrics.deploy.yaml`.
+- Raw rollback captures are retained for audit. Restore commands should use the sanitized `restore_ready/` manifests to avoid Kubernetes `resourceVersion` conflicts.
+- During idle operation the controller may sleep the model. Gateway throughput smoke was therefore run with the controller paused, then the controller was restored.

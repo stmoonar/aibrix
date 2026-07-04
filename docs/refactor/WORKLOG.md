@@ -741,3 +741,16 @@
 - Added RED coverage showing generated manifests for logical slots `2` and `2,3` must use container-local `CUDA_VISIBLE_DEVICES=0` and `0,1`, while preserving `tre.aibrix.io/gpu-ids=2` and `2,3`.
 - Fixed manifest generation and service-manager topology normalization so reconciliation prefers the TRE logical slot annotation and falls back to CUDA env only for unannotated legacy pods.
 - Recorded ADR-0005: physical host GPU index equality is not enforceable with the current generic `nvidia.com/gpu` resource; N3 validates logical TRE slots plus plugin-injected UUID/runtime ordinals instead.
+
+### N3 Final Smoke Closeout
+
+- Found and fixed a live service-manager safety issue: controller target growth could create Redis-only bindings when no Kubernetes create path existed. Added RED coverage and guarded runtime-enabled target growth with `runtime create is not implemented for target growth beyond existing bindings`.
+- Built and rolled service-manager image `tre-v2-service-manager:20260704-eaa117a4`; overlay and tests now pin that image.
+- Removed stale phantom bindings left by the earlier target-growth behavior through `StateStore` version 23 -> 24, leaving only the observed `dsqwen-7b` pod binding.
+- Verified reconcile cleanly reports one binding with no warnings.
+- Verified real target sleep/wake with controller paused: sleep `1.116s`, wake `0.793s`; a later sleep-only reproduction reported `/is_sleeping: true` and pod annotation `tre.aibrix.io/state=sleeping`.
+- Verified gateway burst through AIBrix gateway: `100/100` requests, p95 `31.16ms`.
+- Verified gateway v2 metrics in AIBrix Redis and v2 MetricsStore read latency below 100ms.
+- Verified controller logs emit `trs_calc_result` with `stale:false`; measured live tick-path p95 `1.707ms` over 30 iterations.
+- Generated restore-ready sanitized rollback manifests under `docs/refactor/p11_evidence/old_system_backup/restore_ready/`; server-side dry-run passed for all restore-ready YAMLs.
+- Updated `docs/refactor/11_l3_smoke.md` to PASS. Next step: commit final evidence and tag `n3-done`.
