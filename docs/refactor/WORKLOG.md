@@ -764,3 +764,18 @@
 - Fixed gateway routing over mixed awake/sleeping pods by adding `tre.aibrix.io/routable=true` to generated Service selectors and pod labels, and by making service-manager sleep/wake plus routable hide/unhide patch that label; rolled images `20260704-264c0124` and `20260704-3190906b`.
 - After labeling live pods and updating `default/dsqwen-7b` Service, endpoints contained only the awake pod and gateway validation passed: 20/20 requests, max `34.96ms`.
 - Ran a 120s single-model step load at 20 RPS / 1 output token: 2401/2401 requests, p95 `28.37ms`. Controller logs remained non-stale but did not wake additional replicas; heavier load is still needed for the CRITICAL expansion requirement.
+
+### N4 Controller Live Scaling Fixes
+
+- Reproduced the N4.3 heavy concurrent load failure with `dsqwen-7b` four-bound/one-awake state: the controller initially drove the only awake endpoint to zero because planner replica counts and service-manager wake-target semantics were using different notions of capacity.
+- Added planner regression coverage and fixes across commits `54313fdd`, `b9a92604`, `9dd7b9ab`, `b17133c9`, and `e0b4bb64`:
+  - per-model min/max replica bounds instead of a cluster-wide min bound;
+  - planner `ScaleAction` decisions use awake/routable replicas for deltas;
+  - bound sleeping replicas are handled as `critical_sleeping_capacity`;
+  - legacy v1 metrics are reconciled with service-manager `ClusterView`;
+  - TRS is computed from awake replicas while planner context retains bound replicas;
+  - live rescue/fairness ticks wait for cluster-view state before scaling.
+- Built and rolled final controller image `tre-v2-controller:20260704-e0b4bb64` (`sha256:386ffa7e3592adb85c971ccc601013d743878d9e346cb9f7ebe4f332117acb6e`).
+- Full verification after the final controller fix passed: `git diff --check && cd tre && make check && make smoke` with 217 tests and `tre smoke ok`.
+- Final heavy concurrent live run passed with `/tmp/tre_concurrent_step_with_controller.py`: 8 workers, `max_tokens=96`, controller enabled after load start, `783` successful requests, `0` errors, p95 `1277.21ms`.
+- Final scaling evidence: `dsqwen-7b` stayed non-empty and expanded from `awake=1,bound=4` to `awake=3,bound=4` at sample `30.4s`, then `awake=4,bound=4` at sample `45.9s`; final Service endpoints contained all four pods.

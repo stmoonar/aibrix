@@ -6,7 +6,7 @@ Status: **IN PROGRESS - do not tag `n4-done`**
 
 ## Summary
 
-N4 started after `n3-done` (`d694bc4e`). The live `tre-v2` control-plane is healthy and the `dsqwen-7b` model pod is available. N4.2 hot-switch validation passed on the deployed model. N4.1, as written, cannot be executed literally because the generated Deployment set requests more GPUs than the pinned nodes can provide; this is recorded as a justified SKIP for the all-at-once variant and needs a sequential-slot validation plan.
+N4 started after `n3-done` (`d694bc4e`). The live `tre-v2` control-plane is healthy and the `dsqwen-7b` node9 subset is available with four bound pods. N4.2 hot-switch validation passed on the deployed model. N4.1, as written, cannot be executed literally because the generated Deployment set requests more GPUs than the pinned nodes can provide; this is recorded as a justified SKIP for the all-at-once variant and needs a sequential-slot validation plan. N4.3 single-model heavy load now expands from one awake pod to all four bound pods without request errors after the controller v1-metrics/cluster-view fixes.
 
 ## N4.1 Full Topology Deployment
 
@@ -63,7 +63,7 @@ Follow-up:
 
 ## N4.3 Control-Loop Real Behavior
 
-Status: **PENDING**
+Status: **PARTIAL**
 
 Required scenarios:
 
@@ -71,9 +71,10 @@ Required scenarios:
 - Alternating two-model load.
 - Output-length drift sample.
 
-Current blocker:
+Remaining work:
 
-- The `dsqwen-7b` subset now has four bound pods, but the first 20 RPS / 1-token output step load stayed low-latency and did not trigger CRITICAL expansion.
+- Single-model low-latency and heavy-load paths have evidence.
+- Alternating two-model load and output-length drift sample are still pending.
 
 ### Single-Model Step Load
 
@@ -111,7 +112,44 @@ Observed controller behavior:
 Conclusion:
 
 - Gateway routing over mixed awake/sleeping pods is now fixed for the service-selector path.
-- The step did not satisfy the "CRITICAL expansion" part of N4.3; a heavier output-token load or synthetic live metrics injection is still needed.
+- This low-latency step did not satisfy the "CRITICAL expansion" part of N4.3; the heavier output-token run below covers that path.
+
+### Single-Model Heavy Concurrent Load
+
+Status: **PASS for single-model expansion**
+
+Setup:
+
+- Controller image: `tre-v2-controller:20260704-e0b4bb64`.
+- Service-manager image: `tre-v2-service-manager:20260704-053e22f2`.
+- `dsqwen-7b` subset: four bound node9 pods, initial target one awake pod.
+- Reproducer: `/tmp/tre_concurrent_step_with_controller.py`, 8 worker threads, `max_tokens=96`, 120 seconds, controller scaled from 0 to 1 after load had started.
+
+Controller fixes required before this pass:
+
+- Per-model min/max bounds in planner config, instead of a single cluster-wide floor.
+- Planner decisions use awake/routable counts for `ScaleAction` deltas and bound counts only for sleeping-capacity wake decisions.
+- Controller overlays service-manager `ClusterView` state onto legacy v1 metrics because v1 metrics continue to list all historical model pods as metric-bearing pods even when they are sleeping.
+- TRS is computed from awake replicas while the planner context keeps bound replicas for `critical_sleeping_capacity`.
+- Rescue/fairness tasks skip live scaling until the service-manager cluster view has been populated, preventing startup ticks from acting on raw v1 pod counts.
+
+Final live result:
+
+```text
+initial_state version=92 dsqwen-7b awake=1 bound=4
+sample_s 30.4 version=94 dsqwen-7b awake=3 bound=4
+sample_s 45.9 version=95 dsqwen-7b awake=4 bound=4
+final_state version=95 dsqwen-7b awake=4 bound=4
+final_endpoints 4 dsqwen-7b endpoints
+ok 783 errors 0
+lat_ms_min_avg_p95_max 1216.24 1236.5 1277.21 1312.88
+```
+
+Controller decision evidence:
+
+- The final run had no `idle_proactive_immediate` downscale before expansion.
+- Controller emitted `critical_sleeping_capacity` scale-up actions for `dsqwen-7b` during the active window.
+- Endpoints remained non-empty throughout the run; no 500/503/timeout errors occurred.
 
 ## N4.4 Defrag And Same-Slot Shrink
 
