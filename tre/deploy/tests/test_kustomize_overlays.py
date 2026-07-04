@@ -30,6 +30,19 @@ def test_tre_v2_overlay_declares_components_and_independent_redis() -> None:
     redis = _load_yaml(overlay / "redis.yaml")
     assert any(item["kind"] == "Service" and item["metadata"]["name"] == "tre-v2-redis" for item in redis["items"])
     assert any(item["kind"] == "Deployment" and item["metadata"]["name"] == "tre-v2-redis" for item in redis["items"])
+    rbac_docs = list(yaml.safe_load_all((overlay / "rbac.yaml").read_text(encoding="utf-8")))
+    assert any(
+        item["kind"] == "Role"
+        and item["metadata"]["name"] == "tre-v2-model-manager"
+        and item["metadata"]["namespace"] == "default"
+        for item in rbac_docs
+    )
+    assert any(
+        item["kind"] == "RoleBinding"
+        and item["metadata"]["name"] == "tre-v2-model-manager"
+        and item["metadata"]["namespace"] == "default"
+        for item in rbac_docs
+    )
 
     controller = _load_yaml(overlay / "controller.yaml")
     sm = _load_yaml(overlay / "service-manager.yaml")
