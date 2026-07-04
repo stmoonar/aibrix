@@ -1,0 +1,95 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Protocol
+
+from tre_common.metrics_schema import MetricsSnapshot, ModelWindowMetrics
+from tre_common.registry import Registry, ModelSpec
+from tre_controller.planning.classify import classify_all_models
+from tre_controller.planning.planner import Action, ClusterView, PlanConfig, build_plan
+from tre_controller.signals.trs import TRSComputer, TRSInput
+
+
+class PlannerQueue(Protocol):
+    def inflight_models(self) -> set[str]: ...
+
+    def submit(self, actions) -> object: ...
+
+
+@dataclass(frozen=True)
+class LoopTickResult:
+    submitted: int
+    actions: tuple[Action, ...] = ()
+    events: tuple[str, ...] = ()
+
+
+def run_planner_tick(
+    snapshot: MetricsSnapshot,
+    *,
+    queue: PlannerQueue,
+    registry: Registry,
+    rescue_due: bool,
+    fairness_due: bool,
+    cluster_view: ClusterView | None = None,
+    active_probe_models: set[str] | None = None,
+) -> LoopTickResult:
+    if snapshot.stale:
+        return LoopTickResult(submitted=0, events=("snapshot_stale",))
+
+    contexts = _model_contexts(snapshot, registry)
+    classifications = classify_all_models(contexts)
+    replicas = {model: int(ctx.get("assigned_replicas", 0)) for model, ctx in contexts.items()}
+    cfg = PlanConfig(
+        min_replicas_per_model=min((spec.min_replicas for spec in registry.models()), default=0),
+        max_replicas_per_model=max((spec.max_replicas for spec in registry.models()), default=0),
+        rescue_due=rescue_due,
+        fairness_due=fairness_due,
+        model_tp_sizes={spec.name: spec.tp_size for spec in registry.models()},
+    )
+    plan = build_plan(
+        model_contexts=contexts,
+        classifications=classifications,
+        model_replicas=replicas,
+        idle_gpus=_idle_gpus(snapshot, registry),
+        cfg=cfg,
+        active_probe_models=active_probe_models or set(),
+        inflight_models=queue.inflight_models(),
+        cluster_view=cluster_view,
+    )
+    actions = tuple(plan.actions)
+    if actions:
+        queue.submit(actions)
+    return LoopTickResult(submitted=len(actions), actions=actions, events=tuple(plan.events))
+
+
+def _model_contexts(snapshot: MetricsSnapshot, registry: Registry) -> dict[str, dict]:
+    contexts: dict[str, dict] = {}
+    for model_name, metrics in snapshot.models.items():
+        spec = registry.model(model_name)
+        result = TRSComputer(ema_alpha=spec.trs.ema_alpha).compute(TRSInput.from_metrics(metrics, spec.trs), theta_m=spec.trs.theta_m)
+        contexts[model_name] = {
+            "trs": result.TRS,
+            "z_m": result.Z_m,
+            "eta_m": result.eta_m,
+            "theta_m": spec.trs.theta_m,
+            "Q": result.Q,
+            "Q_ctl": result.Q_ctl,
+            "Y_m": result.Y_m,
+            "y_m": result.y_m,
+            "routable_pods": metrics.routable_pods,
+            "assigned_replicas": metrics.assigned_replicas,
+            "is_saturated": result.Q_ctl >= spec.trs.qsat,
+        }
+    return contexts
+
+
+def _idle_gpus(snapshot: MetricsSnapshot, registry: Registry) -> int:
+    total_gpus = sum(node.gpus for node in registry.topology().nodes)
+    used_gpus = 0
+    for model_name, metrics in snapshot.models.items():
+        try:
+            spec: ModelSpec = registry.model(model_name)
+            used_gpus += max(0, metrics.assigned_replicas) * spec.tp_size
+        except KeyError:
+            continue
+    return max(0, total_gpus - used_gpus)

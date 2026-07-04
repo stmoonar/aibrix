@@ -351,3 +351,44 @@ cd tre && make check && make smoke
 ```
 
 Result: passed with 101 tests and `tre smoke ok` on server 76.
+
+## Rescue/Fairness Tick Contract
+
+The loop tick slice connects metrics snapshots to the migrated signal, classification, planner, and ActionQueue layers without starting infinite async loops. It keeps the P5 loop invariant testable: tick functions read only the supplied snapshot, registry, cached cluster view, active probes, and queue in-flight state; they perform no Redis or HTTP calls.
+
+Implemented pieces:
+
+- `run_rescue_tick()` calls the shared planner tick with `rescue_due=True` and `fairness_due=False`.
+- `run_fairness_tick()` calls the shared planner tick with `rescue_due=False` and `fairness_due=True`.
+- Stale snapshots are skipped and return a `snapshot_stale` event without submitting actions.
+- Model contexts are derived from `MetricsSnapshot` using migrated TRS computation and paper-state classification.
+- Planner in-flight filtering uses `queue.inflight_models()` so repeated loop ticks do not stack conflicting actions.
+- Idle GPU capacity is derived from registry topology and assigned replicas for offline planner tests.
+
+This slice intentionally avoids the long-running `while True` sleep loops and `SnapshotBox`; those are app-wiring work once the single-tick behavior is stable.
+
+### P5-CTRL-009 loop tick wiring
+
+RED:
+
+```bash
+PYTHONPATH=tre/common:tre/controller:tre/controller/tests:tre/service-manager python3 -m pytest -q tre/controller/tests/test_loop_ticks.py
+```
+
+Result: failed during collection because `tre_controller.loops.fairness_task` did not exist.
+
+GREEN:
+
+```bash
+PYTHONPATH=tre/common:tre/controller:tre/controller/tests:tre/service-manager python3 -m pytest -q tre/controller/tests/test_loop_ticks.py
+```
+
+Result: focused loop tick tests passed with 3 tests on server 76.
+
+Full slice verification:
+
+```bash
+cd tre && make check && make smoke
+```
+
+Result: passed with 104 tests and `tre smoke ok` on server 76.

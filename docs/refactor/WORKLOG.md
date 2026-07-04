@@ -300,3 +300,13 @@
 - Verified RED remotely: `tre_controller.sm_client` was missing. Verified GREEN remotely: focused sm_client tests passed with 6 tests; `cd tre && make check && make smoke` passed with 101 tests and `tre smoke ok`.
 - Scope note: service-manager v2 has no defrag endpoint yet, so defrag dispatch is reported as unsupported until the API is added.
 - Next P5 work: wire rescue/fairness loop ticks to planner, sm_client state, and ActionQueue.
+
+### P5 Rescue/Fairness Tick Slice
+
+- Re-read `REFACTOR_PLAN.md` completely on remote server 76 before starting the loop tick segment.
+- Added RED tests for stale snapshot skip, rescue tick planning from `MetricsSnapshot`, and fairness tick passing queue in-flight models into the planner.
+- Implemented `tre_controller.loops.tick`, `rescue_task.run_rescue_tick()`, and `fairness_task.run_fairness_tick()` as single-tick functions with no Redis/HTTP calls.
+- The tick path derives TRS/Z/context from metrics, classifies paper states, builds `PlanConfig`, calls the pure planner, and submits resulting actions to `ActionQueue`.
+- Verified RED remotely: `tre_controller.loops.fairness_task` was missing. Verified GREEN remotely: focused loop tick tests passed with 3 tests; `cd tre && make check && make smoke` passed with 104 tests and `tre smoke ok`.
+- Scope note: long-running async task loops, `SnapshotBox`, decision snapshot writes, and app assembly remain for later P5 wiring slices.
+- Next P5 work: add SnapshotBox/metrics_task or app assembly around these single-tick functions.
