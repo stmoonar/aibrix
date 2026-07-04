@@ -71,7 +71,7 @@ class ServiceManagerV2:
             wake_existing = min(wake_replicas - len(awake), len(sleeping))
             for binding in sleeping[:wake_existing]:
                 self._apply_runtime_power_action(binding, action="wake")
-                updated_by_serve[binding.serve_id] = replace(binding, awake=True)
+                updated_by_serve[binding.serve_id] = replace(binding, awake=True, hidden=False)
                 actions.append({"action": "wake", "serve_id": binding.serve_id})
             create_count = wake_replicas - len(awake) - wake_existing
             if create_count > 0:
@@ -96,7 +96,7 @@ class ServiceManagerV2:
         elif len(awake) > wake_replicas:
             for binding in reversed(awake[wake_replicas:]):
                 self._apply_runtime_power_action(binding, action="sleep")
-                updated_by_serve[binding.serve_id] = replace(binding, awake=False)
+                updated_by_serve[binding.serve_id] = replace(binding, awake=False, hidden=False)
                 actions.append({"action": "sleep", "serve_id": binding.serve_id})
 
         version = snapshot.version

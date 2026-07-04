@@ -473,6 +473,32 @@ def test_v2_put_target_calls_vllm_and_pod_annotations_for_existing_bindings():
     ]
 
 
+def test_v2_put_target_clears_hidden_state_when_powering_binding():
+    from tre_sm.allocator.topology import K8sPodSnapshot
+
+    store = StateStore(FakeRedis())
+    store.save([Binding("serve-a", "m1", Slot("node-a", (0,)), awake=False, hidden=True)], expected_version=0)
+    runtime_ops = FakeRuntimeOps(
+        [
+            K8sPodSnapshot(
+                name="serve-a",
+                model="m1",
+                node="node-a",
+                env={"CUDA_VISIBLE_DEVICES": "0"},
+                pod_ip="10.0.0.1",
+            )
+        ]
+    )
+    service = ServiceManagerV2(registry(), store, runtime_ops=runtime_ops, vllm_ops=FakeVllmOps())
+
+    result = service.put_model_target("m1", wake_replicas=1)
+    down = service.put_model_target("m1", wake_replicas=0)
+
+    assert result["actions"] == [{"action": "wake", "serve_id": "serve-a"}]
+    assert down["actions"] == [{"action": "sleep", "serve_id": "serve-a"}]
+    assert store.load().bindings == [Binding("serve-a", "m1", Slot("node-a", (0,)), awake=False, hidden=False)]
+
+
 def test_v2_put_target_treats_matching_state_conflict_after_runtime_action_as_success():
     from tre_sm.allocator.topology import K8sPodSnapshot
     from tre_sm.state.store import StateConflict, StateSnapshot
