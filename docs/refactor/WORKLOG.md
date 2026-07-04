@@ -754,3 +754,13 @@
 - Verified controller logs emit `trs_calc_result` with `stale:false`; measured live tick-path p95 `1.707ms` over 30 iterations.
 - Generated restore-ready sanitized rollback manifests under `docs/refactor/p11_evidence/old_system_backup/restore_ready/`; server-side dry-run passed for all restore-ready YAMLs.
 - Updated `docs/refactor/11_l3_smoke.md` to PASS. Next step: commit final evidence and tag `n3-done`.
+
+### N4 Realenv Start
+
+- Created `docs/refactor/12_realenv_tests.md` and recorded that applying every generated model Deployment at once is not feasible: the model set requests 16 GPUs total and 12 GPUs on node9, while node9 has 4 GPUs.
+- Ran N4.2 hot-switch on the live `dsqwen-7b` pod with controller paused: 20 cycles, wake P95 `0.864s`, sleep P95 `1.065s`, no binding drift.
+- Deployed the `dsqwen-7b` node9 subset (`gpu-0..3`) for single-model realenv tests.
+- Fixed service-manager discovery to read `tre.aibrix.io/gpu-ids` from generated pod labels when annotations are absent; rebuilt and rolled `tre-v2-service-manager:20260704-dd1c42a9`.
+- Fixed gateway routing over mixed awake/sleeping pods by adding `tre.aibrix.io/routable=true` to generated Service selectors and pod labels, and by making service-manager sleep/wake plus routable hide/unhide patch that label; rolled images `20260704-264c0124` and `20260704-3190906b`.
+- After labeling live pods and updating `default/dsqwen-7b` Service, endpoints contained only the awake pod and gateway validation passed: 20/20 requests, max `34.96ms`.
+- Ran a 120s single-model step load at 20 RPS / 1 output token: 2401/2401 requests, p95 `28.37ms`. Controller logs remained non-stale but did not wake additional replicas; heavier load is still needed for the CRITICAL expansion requirement.

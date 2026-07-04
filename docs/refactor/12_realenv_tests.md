@@ -10,7 +10,7 @@ N4 started after `n3-done` (`d694bc4e`). The live `tre-v2` control-plane is heal
 
 ## N4.1 Full Topology Deployment
 
-Status: **SKIP for all-at-once deployment; sequential validation pending**
+Status: **SKIP for all-at-once deployment; PASS for `dsqwen-7b` node9 subset**
 
 Evidence:
 
@@ -24,6 +24,14 @@ Decision:
 
 - Do not apply all model manifests at once.
 - Validate slot behavior sequentially or by model subset, and record each subset's pod scheduling, SM reconcile state, and `nvidia-smi` before moving to the next subset.
+
+`dsqwen-7b` node9 subset result:
+
+- Applied slot Deployments `gpu-1`, `gpu-2`, and `gpu-3` in addition to the existing `gpu-0` pod.
+- After fixing discovery to read `tre.aibrix.io/gpu-ids` from pod labels, `POST /v2/reconcile` returned four `dsqwen-7b` bindings with no warnings.
+- `PUT /v2/models/dsqwen-7b/target {"wake_replicas":1}` slept two newly observed awake pods and produced state version 71 with `awake=1`, `bound=4`.
+- Node9 memory after target 1: one awake GPU at ~37470 MiB and three sleeping GPUs at ~1118 MiB.
+- This subset is now the active N4 single-model topology.
 
 ## N4.2 Hot-Switch Round Trip
 
@@ -65,7 +73,45 @@ Required scenarios:
 
 Current blocker:
 
-- Only one `dsqwen-7b` pod is currently bound. Expansion behavior requires additional bound pods or a runtime Kubernetes create path; N3 intentionally added a guard that rejects state-only live target growth.
+- The `dsqwen-7b` subset now has four bound pods, but the first 20 RPS / 1-token output step load stayed low-latency and did not trigger CRITICAL expansion.
+
+### Single-Model Step Load
+
+Status: **PARTIAL**
+
+Setup:
+
+- Active model subset: four bound `dsqwen-7b` pods on node9, one awake and three sleeping.
+- Fixed routing so generated model Services select `tre.aibrix.io/routable=true`.
+- Service-manager now patches `tre.aibrix.io/routable=false` on sleep/hidden and `true` on wake/unhide.
+- Live `default/dsqwen-7b` Service endpoints after target 1: only `10.244.3.47:8000`.
+
+Gateway validation after routing fix:
+
+```text
+ok 20 errors 0
+lat_ms_min_avg_max 21.29 25.30 34.96
+```
+
+Step load:
+
+```text
+duration_s 120
+rps 20
+ok 2401 errors 0
+lat_ms_min_avg_p95_max 19.63 26.27 28.37 56.84
+```
+
+Observed controller behavior:
+
+- Controller logs stayed non-stale and emitted `trs_calc_result`.
+- The controller did not wake additional `dsqwen-7b` replicas during this low-latency load; it kept one Service endpoint.
+- A SafeScale probe marked the already-sleeping `gpu-0` binding hidden, but no scale-up action was observed.
+
+Conclusion:
+
+- Gateway routing over mixed awake/sleeping pods is now fixed for the service-selector path.
+- The step did not satisfy the "CRITICAL expansion" part of N4.3; a heavier output-token load or synthetic live metrics injection is still needed.
 
 ## N4.4 Defrag And Same-Slot Shrink
 
