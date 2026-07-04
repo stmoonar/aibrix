@@ -13,8 +13,8 @@ def test_build_deployments_creates_one_deployment_per_feasible_slot(tmp_path):
             """
             cluster:
               nodes:
-                - {name: node-75, gpus: 4, two_gpu_slots: [[0, 1], [2, 3]]}
-                - {name: node-76, gpus: 4, two_gpu_slots: [[0, 1], [2, 3]]}
+                - {name: node-75, gpus: 4, gpu_uuids: [GPU-75-0, GPU-75-1, GPU-75-2, GPU-75-3], two_gpu_slots: [[0, 1], [2, 3]]}
+                - {name: node-76, gpus: 4, gpu_uuids: [GPU-76-0, GPU-76-1, GPU-76-2, GPU-76-3], two_gpu_slots: [[0, 1], [2, 3]]}
             models:
               - name: one-gpu
                 weights_path: /models/one
@@ -55,7 +55,7 @@ def test_build_deployments_encodes_node_gpu_binding_and_vllm_args(tmp_path):
             """
             cluster:
               nodes:
-                - {name: node-75, gpus: 2, two_gpu_slots: [[0, 1]]}
+                - {name: node-75, gpus: 2, gpu_uuids: [GPU-75-0, GPU-75-1], two_gpu_slots: [[0, 1]]}
             models:
               - name: two-gpu
                 weights_path: /models/two
@@ -74,14 +74,16 @@ def test_build_deployments_encodes_node_gpu_binding_and_vllm_args(tmp_path):
     rendered = yaml.safe_load(yaml.safe_dump(deployment))
     container = rendered["spec"]["template"]["spec"]["containers"][0]
 
-    assert rendered["spec"]["template"]["spec"]["nodeSelector"] == {"kubernetes.io/hostname": "node-75"}
+    assert rendered["spec"]["template"]["spec"]["nodeName"] == "node-75"
     assert rendered["spec"]["template"]["metadata"]["labels"]["tre.aibrix.io/routable"] == "true"
     assert rendered["metadata"]["annotations"]["tre.aibrix.io/gpu-ids"] == "0,1"
     assert rendered["spec"]["template"]["metadata"]["annotations"]["tre.aibrix.io/gpu-ids"] == "0,1"
+    assert rendered["metadata"]["annotations"]["tre.aibrix.io/gpu-uuids"] == "GPU-75-0,GPU-75-1"
+    assert rendered["spec"]["template"]["metadata"]["annotations"]["tre.aibrix.io/gpu-uuids"] == "GPU-75-0,GPU-75-1"
     assert rendered["metadata"]["labels"]["tre.aibrix.io/gpu-ids"] == "0-1"
     assert rendered["spec"]["template"]["metadata"]["labels"]["tre.aibrix.io/gpu-ids"] == "0-1"
-    assert {"name": "CUDA_VISIBLE_DEVICES", "value": "0,1"} in container["env"]
-    assert container["resources"]["limits"]["nvidia.com/gpu"] == "2"
+    assert {"name": "NVIDIA_VISIBLE_DEVICES", "value": "GPU-75-0,GPU-75-1"} in container["env"]
+    assert "nvidia.com/gpu" not in yaml.safe_dump(container.get("resources", {}))
     assert "--tensor-parallel-size" in container["command"]
     assert "--enable_sleep_mode" in container["command"]
 
@@ -93,7 +95,7 @@ def test_cuda_visible_devices_uses_container_local_ordinals(tmp_path):
             """
             cluster:
               nodes:
-                - {name: node-75, gpus: 4, two_gpu_slots: [[0, 1], [2, 3]]}
+                - {name: node-75, gpus: 4, gpu_uuids: [GPU-75-0, GPU-75-1, GPU-75-2, GPU-75-3], two_gpu_slots: [[0, 1], [2, 3]]}
             models:
               - name: one-gpu
                 weights_path: /models/one
@@ -120,12 +122,68 @@ def test_cuda_visible_devices_uses_container_local_ordinals(tmp_path):
 
     one_gpu = deployments["one-gpu-node-75-gpu-2"]["spec"]["template"]["spec"]["containers"][0]
     two_gpu = deployments["two-gpu-node-75-gpu-2-3"]["spec"]["template"]["spec"]["containers"][0]
-    assert {"name": "CUDA_VISIBLE_DEVICES", "value": "0"} in one_gpu["env"]
-    assert {"name": "CUDA_VISIBLE_DEVICES", "value": "0,1"} in two_gpu["env"]
+    assert {"name": "NVIDIA_VISIBLE_DEVICES", "value": "GPU-75-2"} in one_gpu["env"]
+    assert {"name": "NVIDIA_VISIBLE_DEVICES", "value": "GPU-75-2,GPU-75-3"} in two_gpu["env"]
     assert deployments["one-gpu-node-75-gpu-2"]["metadata"]["labels"]["tre.aibrix.io/gpu-ids"] == "2"
     assert deployments["one-gpu-node-75-gpu-2"]["metadata"]["annotations"]["tre.aibrix.io/gpu-ids"] == "2"
     assert deployments["two-gpu-node-75-gpu-2-3"]["metadata"]["labels"]["tre.aibrix.io/gpu-ids"] == "2-3"
     assert deployments["two-gpu-node-75-gpu-2-3"]["metadata"]["annotations"]["tre.aibrix.io/gpu-ids"] == "2,3"
+    assert deployments["one-gpu-node-75-gpu-2"]["metadata"]["annotations"]["tre.aibrix.io/gpu-uuids"] == "GPU-75-2"
+    assert deployments["two-gpu-node-75-gpu-2-3"]["metadata"]["annotations"]["tre.aibrix.io/gpu-uuids"] == "GPU-75-2,GPU-75-3"
+
+
+def test_build_deployments_rejects_gpu_bound_budget_over_three(tmp_path):
+    path = tmp_path / "registry.yaml"
+    path.write_text(
+        textwrap.dedent(
+            """
+            cluster:
+              nodes:
+                - {name: node-75, gpus: 1, gpu_uuids: [GPU-75-0], two_gpu_slots: []}
+            models:
+              - name: m1
+                weights_path: /models/one
+                tp_size: 1
+                min_replicas: 0
+                max_replicas: 1
+                vllm_image: image:one
+                slo: {ttft_p95_ms: 1, tpot_p95_ms: 1, e2e_p95_ms: 1}
+                trs: {w_p: 0.04, w_d: 1.0, lambda_wait: 2.625, qmin: 1.0, ema_alpha: 0.5, theta_m: 0.0, tau_crit: 0.8, tau_low: 1.0, tau_high: 1.25, qsat: 4.0, epsat: 0.05, hsat: 3}
+              - name: m2
+                weights_path: /models/two
+                tp_size: 1
+                min_replicas: 0
+                max_replicas: 1
+                vllm_image: image:two
+                slo: {ttft_p95_ms: 1, tpot_p95_ms: 1, e2e_p95_ms: 1}
+                trs: {w_p: 0.04, w_d: 1.0, lambda_wait: 2.625, qmin: 1.0, ema_alpha: 0.5, theta_m: 0.0, tau_crit: 0.8, tau_low: 1.0, tau_high: 1.25, qsat: 4.0, epsat: 0.05, hsat: 3}
+              - name: m3
+                weights_path: /models/three
+                tp_size: 1
+                min_replicas: 0
+                max_replicas: 1
+                vllm_image: image:three
+                slo: {ttft_p95_ms: 1, tpot_p95_ms: 1, e2e_p95_ms: 1}
+                trs: {w_p: 0.04, w_d: 1.0, lambda_wait: 2.625, qmin: 1.0, ema_alpha: 0.5, theta_m: 0.0, tau_crit: 0.8, tau_low: 1.0, tau_high: 1.25, qsat: 4.0, epsat: 0.05, hsat: 3}
+              - name: m4
+                weights_path: /models/four
+                tp_size: 1
+                min_replicas: 0
+                max_replicas: 1
+                vllm_image: image:four
+                slo: {ttft_p95_ms: 1, tpot_p95_ms: 1, e2e_p95_ms: 1}
+                trs: {w_p: 0.04, w_d: 1.0, lambda_wait: 2.625, qmin: 1.0, ema_alpha: 0.5, theta_m: 0.0, tau_crit: 0.8, tau_low: 1.0, tau_high: 1.25, qsat: 4.0, epsat: 0.05, hsat: 3}
+            """
+        ),
+        encoding="utf-8",
+    )
+
+    try:
+        build_deployments(load_registry(str(path)))
+    except ValueError as exc:
+        assert "bound budget" in str(exc)
+    else:
+        raise AssertionError("expected GPU bound budget violation")
 
 
 def test_build_services_creates_one_model_service_with_gateway_selector(tmp_path):
@@ -135,7 +193,7 @@ def test_build_services_creates_one_model_service_with_gateway_selector(tmp_path
             """
             cluster:
               nodes:
-                - {name: node-75, gpus: 1, two_gpu_slots: []}
+                - {name: node-75, gpus: 1, gpu_uuids: [GPU-75-0], two_gpu_slots: []}
             models:
               - name: dsqwen-7b
                 weights_path: /models/one
@@ -171,7 +229,7 @@ def test_write_manifests_includes_services_and_deployments(tmp_path):
             """
             cluster:
               nodes:
-                - {name: node-75, gpus: 2, two_gpu_slots: [[0, 1]]}
+                - {name: node-75, gpus: 2, gpu_uuids: [GPU-75-0, GPU-75-1], two_gpu_slots: [[0, 1]]}
             models:
               - name: one-gpu
                 weights_path: /models/one

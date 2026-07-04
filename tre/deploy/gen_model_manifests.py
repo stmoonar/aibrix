@@ -7,9 +7,11 @@ from typing import Iterable
 
 import yaml
 
-from tre_common.registry import ModelSpec, Registry, load_registry
+from tre_common.registry import ModelSpec, NodeSpec, Registry, load_registry
 
 ROUTABLE_LABEL = "tre.aibrix.io/routable"
+GPU_UUIDS_ANNOTATION = "tre.aibrix.io/gpu-uuids"
+MAX_BOUND_PER_GPU = 3
 
 
 def feasible_slots(registry: Registry, model: ModelSpec) -> list[tuple[str, tuple[int, ...]]]:
@@ -24,9 +26,12 @@ def feasible_slots(registry: Registry, model: ModelSpec) -> list[tuple[str, tupl
 
 def build_deployments(registry: Registry) -> list[dict]:
     deployments: list[dict] = []
+    nodes = {node.name: node for node in registry.topology().nodes}
+    bound_counts: dict[tuple[str, int], int] = {}
     for model in registry.models():
         for node_name, gpu_ids in feasible_slots(registry, model):
-            deployments.append(_deployment(model, node_name, gpu_ids))
+            _record_bound_budget(bound_counts, node_name, gpu_ids)
+            deployments.append(_deployment(model, nodes[node_name], gpu_ids))
     return deployments
 
 
@@ -75,11 +80,12 @@ def _service(model: ModelSpec) -> dict:
     }
 
 
-def _deployment(model: ModelSpec, node_name: str, gpu_ids: tuple[int, ...]) -> dict:
+def _deployment(model: ModelSpec, node: NodeSpec, gpu_ids: tuple[int, ...]) -> dict:
     gpu_value = ",".join(str(gpu) for gpu in gpu_ids)
     gpu_label_value = "-".join(str(gpu) for gpu in gpu_ids)
     cuda_value = ",".join(str(index) for index in range(model.tp_size))
-    name = f"{_dns_name(model.name)}-{_dns_name(node_name)}-gpu-{gpu_value.replace(',', '-')}"
+    gpu_uuid_value = ",".join(_gpu_uuids_for(node, gpu_ids))
+    name = f"{_dns_name(model.name)}-{_dns_name(node.name)}-gpu-{gpu_value.replace(',', '-')}"
     command = [
         "python3",
         "-m",
@@ -103,11 +109,11 @@ def _deployment(model: ModelSpec, node_name: str, gpu_ids: tuple[int, ...]) -> d
         "model.aibrix.ai/name": model.name,
         "model.aibrix.ai/port": "8000",
         "tre.aibrix.io/managed": "true",
-        "tre.aibrix.io/node": node_name,
+        "tre.aibrix.io/node": node.name,
         "tre.aibrix.io/gpu-ids": gpu_label_value,
         ROUTABLE_LABEL: "true",
     }
-    annotations = {"tre.aibrix.io/gpu-ids": gpu_value}
+    annotations = {"tre.aibrix.io/gpu-ids": gpu_value, GPU_UUIDS_ANNOTATION: gpu_uuid_value}
     return {
         "apiVersion": "apps/v1",
         "kind": "Deployment",
@@ -118,7 +124,7 @@ def _deployment(model: ModelSpec, node_name: str, gpu_ids: tuple[int, ...]) -> d
             "template": {
                 "metadata": {"labels": labels | {"app": name}, "annotations": annotations},
                 "spec": {
-                    "nodeSelector": {"kubernetes.io/hostname": node_name},
+                    "nodeName": node.name,
                     "volumes": [
                         {"name": "shm", "emptyDir": {"medium": "Memory", "sizeLimit": "20Gi"}},
                         {"name": "models-volume", "hostPath": {"path": "/data"}},
@@ -130,16 +136,14 @@ def _deployment(model: ModelSpec, node_name: str, gpu_ids: tuple[int, ...]) -> d
                             "imagePullPolicy": "IfNotPresent",
                             "command": command,
                             "env": [
+                                {"name": "NVIDIA_VISIBLE_DEVICES", "value": gpu_uuid_value},
                                 {"name": "CUDA_VISIBLE_DEVICES", "value": cuda_value},
                                 {"name": "VLLM_SERVER_DEV_MODE", "value": "1"},
                                 {"name": "VLLM_WORKER_MULTIPROC_METHOD", "value": "spawn"},
                                 {"name": "VLLM_USE_MODELSCOPE", "value": "True"},
                             ],
                             "ports": [{"containerPort": 8000, "protocol": "TCP"}],
-                            "resources": {
-                                "limits": {"nvidia.com/gpu": str(model.tp_size)},
-                                "requests": {"nvidia.com/gpu": str(model.tp_size)},
-                            },
+                            "resources": {},
                             "volumeMounts": [
                                 {"name": "shm", "mountPath": "/dev/shm"},
                                 {"name": "models-volume", "mountPath": "/data"},
@@ -154,6 +158,22 @@ def _deployment(model: ModelSpec, node_name: str, gpu_ids: tuple[int, ...]) -> d
 
 def _dns_name(value: str) -> str:
     return re.sub(r"[^a-z0-9-]+", "-", value.lower()).strip("-")
+
+
+def _gpu_uuids_for(node: NodeSpec, gpu_ids: tuple[int, ...]) -> tuple[str, ...]:
+    if len(node.gpu_uuids) != node.gpus:
+        raise ValueError(f"node {node.name}: gpu_uuids length does not match gpus")
+    return tuple(node.gpu_uuids[gpu] for gpu in gpu_ids)
+
+
+def _record_bound_budget(bound_counts: dict[tuple[str, int], int], node_name: str, gpu_ids: tuple[int, ...]) -> None:
+    for gpu in gpu_ids:
+        key = (node_name, gpu)
+        bound_counts[key] = bound_counts.get(key, 0) + 1
+        if bound_counts[key] > MAX_BOUND_PER_GPU:
+            raise ValueError(
+                f"gpu bound budget exceeded for {node_name}/{gpu}: {bound_counts[key]} > {MAX_BOUND_PER_GPU}"
+            )
 
 
 def main(argv: Iterable[str] | None = None) -> None:

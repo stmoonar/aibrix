@@ -10,12 +10,14 @@ The first P4 slice implements the pure, IO-free `tre_sm.allocator.slots` module 
 Types:
 
 - `Slot(node, gpu_ids)` identifies one 1-GPU half-slot or one complete 2-GPU slot.
-- `Binding(serve_id, model, slot, awake)` separates slot binding from awake state; sleeping serves still occupy their slot.
+- `Binding(serve_id, model, slot, awake)` separates logical binding from awake state. After ADR-0006, sleeping serves remain bound for accounting but no longer make their GPU unavailable to another sleeping or awake peer.
 - `Migration(serve_id, from_slot, to_slot)` describes a defrag move.
 - `SlotAllocator(topology, bindings)` tracks only topology and bindings, with no Kubernetes, Redis, or vLLM IO.
 
 Implemented rules:
 
+- At most one awake binding may use a GPU. Sleeping bindings may share a GPU with another sleeping binding or with the single awake binding.
+- `feasible_wake(serve_id)` returns false when waking that serve would overlap an existing awake binding.
 - `find_slot(1)` fills the free half of an already split 2-GPU slot before splitting a new 2-GPU slot.
 - `find_slot(2)` only returns a completely empty declared 2-GPU slot.
 - `plan_defrag(2)` handles the required counterexample: two 1-GPU serves on GPUs 0 and 2 leave total free capacity but no complete slot; the plan migrates the serve on GPU 2 to GPU 1, freeing slot `(2,3)`.
@@ -57,6 +59,7 @@ Rules:
 - Pod reality overrides stale Redis state for the same `serve_id`, matching REFACTOR_PLAN section 5.3.
 - Persisted bindings without a current pod observation are retained conservatively and reported as warnings.
 - Reconcile persists the merged result only when bindings change, preserving the state version on no-op restart.
+- ADR-0006 adds a single-awake invariant: when pod reality reports two awake bindings on the same GPU, reconcile keeps the first deterministic observation awake, marks the later binding sleeping, and records a warning. This is a conservative state repair for external intervention; live N4b canary and defrag paths still must avoid creating the conflict.
 
 ## v1 Compatibility Contract
 
@@ -77,6 +80,7 @@ Rules:
 
 - `ServiceManagerV2.get_state()` returns current version, per-model awake/bound counts, and deterministic binding rows including hidden state.
 - `ServiceManagerV2.put_model_target(model, wake_replicas=n)` validates registry limits and the already-bound warm pool.
+- Wake and unhide paths pass through `SlotAllocator.feasible_wake()` and return HTTP 409 rather than creating a double-awake GPU conflict.
 - Target changes are persisted optimistically only when the desired target differs from current awake state.
 - Repeating the same target is idempotent: no actions and no version bump.
 - `ServiceManagerV2.put_model_routable(model, hidden_pods=[...])` persists SafeScale route-hidden state and is idempotent.

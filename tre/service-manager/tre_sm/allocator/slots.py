@@ -35,7 +35,7 @@ class SlotAllocator:
     def __init__(self, topology: ClusterTopology, bindings: list[Binding]) -> None:
         self._topology = topology
         self._bindings: dict[str, Binding] = {}
-        self._gpu_to_serve: dict[tuple[str, int], str] = {}
+        self._awake_gpu_to_serve: dict[tuple[str, int], str] = {}
         for binding in bindings:
             self.bind(binding.serve_id, binding.model, binding.slot, awake=binding.awake)
 
@@ -61,21 +61,33 @@ class SlotAllocator:
         self._validate_slot(slot)
         if serve_id in self._bindings:
             raise ValueError(f"serve already bound: {serve_id}")
-        for gpu in slot.gpu_ids:
-            if self._is_occupied(slot.node, gpu):
-                raise ValueError(f"gpu already occupied: {slot.node}/{gpu}")
+        if awake:
+            for gpu in slot.gpu_ids:
+                occupant = self._awake_gpu_to_serve.get((slot.node, gpu))
+                if occupant is not None:
+                    raise ValueError(f"gpu already has awake binding: {slot.node}/{gpu} occupied by {occupant}")
         binding = Binding(serve_id=serve_id, model=model, slot=slot, awake=awake)
         self._bindings[serve_id] = binding
-        for gpu in slot.gpu_ids:
-            self._gpu_to_serve[(slot.node, gpu)] = serve_id
+        if awake:
+            for gpu in slot.gpu_ids:
+                self._awake_gpu_to_serve[(slot.node, gpu)] = serve_id
 
     def release(self, serve_id: str) -> None:
         binding = self._bindings.pop(serve_id)
-        for gpu in binding.slot.gpu_ids:
-            self._gpu_to_serve.pop((binding.slot.node, gpu), None)
+        if binding.awake:
+            for gpu in binding.slot.gpu_ids:
+                if self._awake_gpu_to_serve.get((binding.slot.node, gpu)) == serve_id:
+                    self._awake_gpu_to_serve.pop((binding.slot.node, gpu), None)
 
     def feasible_wake(self, serve_id: str) -> bool:
-        return serve_id in self._bindings
+        binding = self._bindings.get(serve_id)
+        if binding is None:
+            return False
+        for gpu in binding.slot.gpu_ids:
+            occupant = self._awake_gpu_to_serve.get((binding.slot.node, gpu))
+            if occupant is not None and occupant != serve_id:
+                return False
+        return True
 
     def plan_defrag(self, tp_size: int) -> list[Migration] | None:
         self._validate_tp_size(tp_size)
@@ -96,7 +108,7 @@ class SlotAllocator:
                 if len(source_occupied) != 1:
                     continue
                 source_gpu = source_occupied[0]
-                serve_id = self._gpu_to_serve[(source_node, source_gpu)]
+                serve_id = self._awake_gpu_to_serve[(source_node, source_gpu)]
                 return [
                     Migration(
                         serve_id=serve_id,
@@ -124,7 +136,7 @@ class SlotAllocator:
                 yield node.name, tuple(pair)
 
     def _is_occupied(self, node: str, gpu: int) -> bool:
-        return (node, gpu) in self._gpu_to_serve
+        return (node, gpu) in self._awake_gpu_to_serve
 
     def _validate_tp_size(self, tp_size: int) -> None:
         if tp_size not in (1, 2):

@@ -7,13 +7,15 @@ from tre_common.registry import load_registry
 
 REGISTRY_YAML = """
 cluster:
-  nodes:
-    - name: node-75
-      gpus: 4
-      two_gpu_slots: [[0, 1], [2, 3]]
-    - name: node-76
-      gpus: 4
-      two_gpu_slots: [[0, 1], [2, 3]]
+    nodes:
+      - name: node-75
+        gpus: 4
+        gpu_uuids: [GPU-75-0, GPU-75-1, GPU-75-2, GPU-75-3]
+        two_gpu_slots: [[0, 1], [2, 3]]
+      - name: node-76
+        gpus: 4
+        gpu_uuids: [GPU-76-0, GPU-76-1, GPU-76-2, GPU-76-3]
+        two_gpu_slots: [[0, 1], [2, 3]]
 models:
   - name: dsqwen-7b
     weights_path: /data/nfs_shared_data/Qwen1.5-7B-Chat
@@ -48,6 +50,7 @@ def test_load_registry_exposes_models_and_cluster_topology(tmp_path):
     assert registry.model("dsqwen-7b").tp_size == 1
     assert registry.model("dsqwen-7b").slo.ttft_p95_ms == 1200.0
     assert registry.model("dsqwen-7b").trs.lambda_wait == 2.625
+    assert registry.topology().nodes[0].gpu_uuids == ("GPU-75-0", "GPU-75-1", "GPU-75-2", "GPU-75-3")
     assert registry.topology().nodes[0].two_gpu_slots == ((0, 1), (2, 3))
     assert registry.validate() == []
 
@@ -70,7 +73,7 @@ def test_registry_reports_validation_errors_for_duplicate_models_and_bad_slots(t
         """
 cluster:
   nodes:
-    - {name: node-75, gpus: 4, two_gpu_slots: [[0, 4]]}
+    - {name: node-75, gpus: 4, gpu_uuids: [GPU-0, GPU-1], two_gpu_slots: [[0, 4]]}
 models:
   - name: m
     weights_path: /m
@@ -95,6 +98,7 @@ models:
     registry = load_registry(str(path))
 
     assert any("duplicate model" in error for error in registry.validate())
+    assert any("gpu_uuids length" in error for error in registry.validate())
     assert any("outside gpu range" in error for error in registry.validate())
     with pytest.raises(KeyError):
         registry.model("missing")

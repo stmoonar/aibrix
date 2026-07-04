@@ -70,6 +70,7 @@ class ServiceManagerV2:
             sleeping = [binding for binding in model_bindings if not binding.awake]
             wake_existing = min(wake_replicas - len(awake), len(sleeping))
             for binding in sleeping[:wake_existing]:
+                self._ensure_feasible_wake(binding, list(updated_by_serve.values()))
                 self._apply_runtime_power_action(binding, action="wake")
                 updated_by_serve[binding.serve_id] = replace(binding, awake=True, hidden=False)
                 actions.append({"action": "wake", "serve_id": binding.serve_id})
@@ -135,6 +136,8 @@ class ServiceManagerV2:
             should_hide = binding.serve_id in requested_hidden
             if binding.hidden == should_hide:
                 continue
+            if not should_hide:
+                self._ensure_feasible_wake(binding, list(updated_by_serve.values()))
             if self._runtime_ops is not None:
                 self._runtime_ops.write_binding_annotations(
                     binding,
@@ -225,6 +228,14 @@ class ServiceManagerV2:
             raise ValueError(f"vLLM {action} failed for {binding.serve_id}: {message}")
         self._runtime_ops.write_binding_annotations(binding, state=state)
 
+    def _ensure_feasible_wake(self, binding: Binding, bindings: list[Binding]) -> None:
+        try:
+            allocator = SlotAllocator(self._registry.topology(), bindings)
+        except ValueError as exc:
+            raise WakeConflict(str(exc)) from exc
+        if not allocator.feasible_wake(binding.serve_id):
+            raise WakeConflict(f"{binding.serve_id}: slot already has awake binding")
+
     def _snapshot_for_binding(self, binding: Binding) -> K8sPodSnapshot:
         snapshots = self._runtime_ops.list_pod_snapshots(model=binding.model) if self._runtime_ops else []
         for snapshot in snapshots:
@@ -256,6 +267,10 @@ class DefragUnavailable(ValueError):
     def __init__(self, reason: str) -> None:
         super().__init__(reason)
         self.reason = reason
+
+
+class WakeConflict(ValueError):
+    pass
 
 
 class TargetRequest(BaseModel):
@@ -305,6 +320,8 @@ def create_app(service: ServiceManagerV2) -> FastAPI:
     def put_model_routable(model: str, request: RoutableRequest) -> dict:
         try:
             return service.put_model_routable(model, hidden_pods=request.hidden_pods)
+        except WakeConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except (KeyError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -312,6 +329,8 @@ def create_app(service: ServiceManagerV2) -> FastAPI:
     def put_model_target(model: str, request: TargetRequest) -> dict:
         try:
             return service.put_model_target(model, wake_replicas=request.wake_replicas)
+        except WakeConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except (KeyError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 

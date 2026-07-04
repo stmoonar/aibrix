@@ -142,3 +142,36 @@ def test_reconcile_drops_stale_binding_when_replacement_pod_reuses_slot():
     assert result.warnings == [
         "serve-old: dropped stale persisted binding that overlaps pod observation",
     ]
+
+
+def test_reconcile_auto_sleeps_later_pod_when_two_awake_pods_share_gpu():
+    store = StateStore(FakeRedis())
+    store.save([], expected_version=0)
+    k8s = FakeK8sClient(
+        [
+            PodRecord(
+                serve_id="serve-a",
+                model="dsqwen-7b",
+                node="node-a",
+                cuda_visible_devices="0",
+                state="awake",
+            ),
+            PodRecord(
+                serve_id="serve-b",
+                model="dsqwen-7b",
+                node="node-a",
+                cuda_visible_devices="0",
+                state="awake",
+            ),
+        ]
+    )
+
+    result = reconcile_state(topology(), store, k8s)
+
+    assert result.bindings == [
+        Binding("serve-a", "dsqwen-7b", Slot("node-a", (0,)), awake=True),
+        Binding("serve-b", "dsqwen-7b", Slot("node-a", (0,)), awake=False),
+    ]
+    assert result.warnings == [
+        "serve-b: auto-slept to preserve single awake GPU invariant on node-a/0",
+    ]

@@ -88,3 +88,24 @@ Service-manager reconciliation prefers `tre.aibrix.io/gpu-ids` when present and 
 ### Consequences
 
 N3 acceptance checks validate the logical TRE slot, pod annotation, plugin-injected `NVIDIA_VISIBLE_DEVICES` UUID, and container-local CUDA ordinal. Host physical GPU index equality is not an enforceable property with the current generic `nvidia.com/gpu` resource and NVIDIA device-plugin configuration. Deterministic host physical GPU placement would require a separate device-plugin/resource model or scheduler integration and is outside the N3 deployment contract.
+
+## ADR-0006: Model pods bind GPUs through NVIDIA_VISIBLE_DEVICES UUIDs
+
+- Date: 2026-07-05
+- Status: accepted
+
+### Context
+
+N4 showed that Kubernetes `nvidia.com/gpu` requests prevent TRE's intended warm-pool multiplexing: sleeping pods still reserve GPU quota, so the cluster cannot bind multiple sleeping model pods to one physical GPU and wake at most one at a time. The old system supported pods with zero GPU requests and recovered GPU binding from `NVIDIA_VISIBLE_DEVICES` or `CUDA_VISIBLE_DEVICES`, which is the resource model TRE needs.
+
+### Decision
+
+Generated model Deployments no longer request or limit `nvidia.com/gpu`. They pin `nodeName`, set `NVIDIA_VISIBLE_DEVICES` to the selected GPU UUIDs from `tre/deploy/registry.yaml`, keep logical GPU ids in `tre.aibrix.io/gpu-ids`, and add `tre.aibrix.io/gpu-uuids` for audit.
+
+The Kubernetes scheduler no longer owns GPU exclusivity for TRE model pods. `SlotAllocator` is the source of truth: multiple sleeping bindings may share a GPU, but a GPU may have at most one awake binding. Service-manager wake and unhide paths check this invariant and reject conflicts with HTTP 409. Reconcile detects externally-created double-awake conflicts and conservatively marks the later observed binding sleeping.
+
+Manifest generation enforces a static bound budget of at most three generated Deployments per GPU, matching the N4 measured 40GB budget of one awake pod plus up to two sleeping pods.
+
+### Consequences
+
+The D7 canary in N4b.3 is mandatory before broad rollout: first prove that a no-GPU-request pod can see only the UUID named by `NVIDIA_VISIBLE_DEVICES` in the current gpu-operator/runtime environment. If it cannot, the fallback chain is `runtimeClassName: nvidia`, then privileged plus `/dev/nvidia*` hostPath. The canary conclusion must be recorded before full topology deployment.

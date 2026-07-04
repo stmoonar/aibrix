@@ -12,6 +12,7 @@ metadata:
     tre.aibrix.io/routable: 'true'
   annotations: &id001
     tre.aibrix.io/gpu-ids: 2,3
+    tre.aibrix.io/gpu-uuids: GPU-3a113474-dd92-6d52-d05b-491e7b020ded,GPU-3c2fb581-708a-5fef-3eaa-5c3cc21a028e
 spec:
   replicas: 1
   selector:
@@ -29,8 +30,7 @@ spec:
         app: dsqwen-14b-nscc-ds-4a100-node9-gpu-2-3
       annotations: *id001
     spec:
-      nodeSelector:
-        kubernetes.io/hostname: nscc-ds-4a100-node9
+      nodeName: nscc-ds-4a100-node9
       volumes:
       - name: shm
         emptyDir:
@@ -63,6 +63,8 @@ spec:
         - --max-model-len
         - '12288'
         env:
+        - name: NVIDIA_VISIBLE_DEVICES
+          value: GPU-3a113474-dd92-6d52-d05b-491e7b020ded,GPU-3c2fb581-708a-5fef-3eaa-5c3cc21a028e
         - name: CUDA_VISIBLE_DEVICES
           value: 0,1
         - name: VLLM_SERVER_DEV_MODE
@@ -74,11 +76,7 @@ spec:
         ports:
         - containerPort: 8000
           protocol: TCP
-        resources:
-          limits:
-            nvidia.com/gpu: '2'
-          requests:
-            nvidia.com/gpu: '2'
+        resources: {}
         volumeMounts:
         - name: shm
           mountPath: /dev/shm

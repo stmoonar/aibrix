@@ -798,3 +798,31 @@
 - Final heavy concurrent live run passed with `/tmp/tre_concurrent_step_with_controller.py`: 8 workers, `max_tokens=96`, controller enabled after load start, `783` successful requests, `0` errors, p95 `1277.21ms`.
 - Final scaling evidence: `dsqwen-7b` stayed non-empty and expanded from `awake=1,bound=4` to `awake=3,bound=4` at sample `30.4s`, then `awake=4,bound=4` at sample `45.9s`; final Service endpoints contained all four pods.
 - Ran the N4.3 output-length drift sample on the four-awake `dsqwen-7b` subset: 20/20 successes for each `max_tokens` setting; p95 latency was `34.74ms` for 1 token, `429.99ms` for 32 tokens, and `1246.39ms` for 96 tokens; post-check remained `awake=4,bound=4` with four Service endpoints.
+
+### N4b.1 D7 GPU Binding Refactor
+
+- First N4b work step committed `docs/refactor/10_next_steps.md` as `[N4b] add next-steps execution plan` (`943ab486`).
+- Baseline before N4b code changes: `cd tre && make check` passed with 220 tests.
+- Added registry `gpu_uuids` support and wrote `tre/deploy/collect_gpu_uuids.py` with unit tests for parsing `nvidia-smi -L` output and updating registry nodes.
+- Read-only UUID collection:
+  - node9 GPU0..3: `GPU-689a3e93-68db-0dac-160b-6a791cf246e8`, `GPU-d0de9f25-c059-d2ee-e7c4-c242bbdc76c7`, `GPU-3a113474-dd92-6d52-d05b-491e7b020ded`, `GPU-3c2fb581-708a-5fef-3eaa-5c3cc21a028e`.
+  - node10 GPU0..3: `GPU-71f560a8-e090-c7e6-325f-2e386c08136f`, `GPU-4bcbcb0c-7eaf-64a1-b3e5-b07cb81d3a96`, `GPU-28af749d-4081-d7b6-0c14-cf9c29aa213d`, `GPU-76a392a5-b027-42be-fb8f-1bfe9079b47c`.
+- Converted generated model Deployments to ADR-0006/D7 form: no `nvidia.com/gpu` requests or limits, `nodeName` pinned, `NVIDIA_VISIBLE_DEVICES` set to UUIDs, logical ids preserved in `tre.aibrix.io/gpu-ids`, and UUIDs recorded in `tre.aibrix.io/gpu-uuids`.
+- Added static manifest budget guard: a generated layout may reference each GPU from at most three model Deployments.
+- Changed `SlotAllocator` semantics from "one bound per GPU" to "one awake per GPU"; sleeping bindings can share a GPU, while `bind(..., awake=True)` and `feasible_wake()` reject double-awake conflicts.
+- Service-manager target wake and routable unhide now check `feasible_wake()` and FastAPI maps conflicts to HTTP 409.
+- Reconcile now detects externally-introduced double-awake GPU conflicts and marks the later deterministic observation sleeping with a warning.
+- RED tests first failed for missing `gpu_uuids`, old `nvidia.com/gpu` manifests, old bound-only allocator semantics, missing 409, and reconcile double-awake failure; GREEN implementation passed the focused N4b.1 subset with 36 tests.
+- Verification:
+  - `cd tre && make check` passed with 227 tests.
+  - `cd tre && make manifests` wrote 15 resources.
+  - `cd tre && make smoke` printed `tre smoke ok`.
+  - Manifest audit: `grep -R 'nvidia.com/gpu' tre/deploy/models` returned no matches; generated files include `nodeName`, `NVIDIA_VISIBLE_DEVICES`, and `tre.aibrix.io/gpu-uuids`.
+
+### N4b Blocked
+
+- None for N4b.1.
+
+### N4b Next
+
+- Continue with 10.2: replace `/v2/defrag` state-only recreate with the real k8s delete/create path behind fake-client tests, reusing the manifest template as the single source of pod specs.

@@ -82,6 +82,33 @@ def test_defrag_can_consolidate_free_halves_across_nodes():
     ]
 
 
+def test_sleeping_bindings_may_share_gpu_but_only_one_awake_binding_can_wake():
+    allocator = SlotAllocator(
+        single_node_topology(),
+        [
+            Binding(serve_id="awake", model="m1", slot=Slot("node-a", (0,)), awake=True),
+            Binding(serve_id="sleeping", model="m2", slot=Slot("node-a", (0,)), awake=False),
+        ],
+    )
+
+    assert allocator.feasible_wake("awake") is True
+    assert allocator.feasible_wake("sleeping") is False
+
+
+def test_bind_rejects_second_awake_binding_on_same_gpu_but_allows_sleeping_bound_peer():
+    allocator = SlotAllocator(single_node_topology(), [])
+    allocator.bind("awake", "m1", Slot("node-a", (0,)), awake=True)
+
+    allocator.bind("sleeping", "m2", Slot("node-a", (0,)), awake=False)
+
+    try:
+        allocator.bind("second-awake", "m3", Slot("node-a", (0,)), awake=True)
+    except ValueError as exc:
+        assert "already has awake binding" in str(exc)
+    else:
+        raise AssertionError("expected awake conflict")
+
+
 def test_random_allocation_release_sequences_remain_disjoint_and_defraggable():
     topology = two_node_topology()
     allocator = SlotAllocator(topology, [])

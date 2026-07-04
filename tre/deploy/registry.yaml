@@ -2,6 +2,11 @@ cluster:
   nodes:
   - name: nscc-ds-4a100-node9
     gpus: 4
+    gpu_uuids:
+    - GPU-689a3e93-68db-0dac-160b-6a791cf246e8
+    - GPU-d0de9f25-c059-d2ee-e7c4-c242bbdc76c7
+    - GPU-3a113474-dd92-6d52-d05b-491e7b020ded
+    - GPU-3c2fb581-708a-5fef-3eaa-5c3cc21a028e
     two_gpu_slots:
     - - 0
       - 1
@@ -9,6 +14,11 @@ cluster:
       - 3
   - name: nscc-ds-4a100-node10
     gpus: 4
+    gpu_uuids:
+    - GPU-71f560a8-e090-c7e6-325f-2e386c08136f
+    - GPU-4bcbcb0c-7eaf-64a1-b3e5-b07cb81d3a96
+    - GPU-28af749d-4081-d7b6-0c14-cf9c29aa213d
+    - GPU-76a392a5-b027-42be-fb8f-1bfe9079b47c
     two_gpu_slots:
     - - 0
       - 1

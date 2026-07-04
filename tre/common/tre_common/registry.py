@@ -35,6 +35,7 @@ class NodeSpec:
     name: str
     gpus: int
     two_gpu_slots: tuple[tuple[int, int], ...]
+    gpu_uuids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -96,6 +97,12 @@ class Registry:
             seen_nodes.add(node.name)
             if node.gpus <= 0:
                 errors.append(f"node {node.name}: gpus must be positive")
+            if len(node.gpu_uuids) != node.gpus:
+                errors.append(
+                    f"node {node.name}: gpu_uuids length {len(node.gpu_uuids)} does not match gpus {node.gpus}"
+                )
+            if len(set(node.gpu_uuids)) != len(node.gpu_uuids):
+                errors.append(f"node {node.name}: duplicate gpu_uuids")
             for slot in node.two_gpu_slots:
                 if len(slot) != 2:
                     errors.append(f"node {node.name}: two_gpu_slot {slot} must contain two GPUs")
@@ -123,7 +130,8 @@ def _parse_registry(raw: dict[str, Any]) -> Registry:
 
 def _parse_node(raw: dict[str, Any]) -> NodeSpec:
     slots = tuple(tuple(int(gpu) for gpu in slot) for slot in raw.get("two_gpu_slots", []))
-    return NodeSpec(name=str(raw["name"]), gpus=int(raw["gpus"]), two_gpu_slots=slots)  # type: ignore[arg-type]
+    gpu_uuids = tuple(str(uuid) for uuid in raw.get("gpu_uuids", []))
+    return NodeSpec(name=str(raw["name"]), gpus=int(raw["gpus"]), two_gpu_slots=slots, gpu_uuids=gpu_uuids)  # type: ignore[arg-type]
 
 
 def _parse_model(raw: dict[str, Any]) -> ModelSpec:

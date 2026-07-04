@@ -285,6 +285,27 @@ def test_v2_fastapi_routes_delegate_to_service_layer():
     assert second.json()["actions"] == []
 
 
+def test_v2_put_target_rejects_wake_when_another_binding_is_awake_on_same_gpu():
+    store = StateStore(FakeRedis())
+    store.save(
+        [
+            Binding("serve-a", "m1", Slot("node-a", (0,)), awake=True),
+            Binding("serve-b", "m1", Slot("node-a", (0,)), awake=False),
+        ],
+        expected_version=0,
+    )
+    client = TestClient(create_app(ServiceManagerV2(registry(), store)))
+
+    response = client.put("/v2/models/m1/target", json={"wake_replicas": 2})
+
+    assert response.status_code == 409
+    assert "already has awake binding" in response.json()["detail"]
+    assert store.load().bindings == [
+        Binding("serve-a", "m1", Slot("node-a", (0,)), awake=True),
+        Binding("serve-b", "m1", Slot("node-a", (0,)), awake=False),
+    ]
+
+
 def test_v2_put_routable_is_idempotent_and_persists_hidden_pods():
     store = StateStore(FakeRedis())
     store.save(
