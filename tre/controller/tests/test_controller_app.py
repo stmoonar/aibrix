@@ -1,14 +1,26 @@
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 
 from tre_controller.app import ControllerDependencies, build_controller_task_specs
 from tre_controller.loops.metrics_task import SnapshotBox
 
+TRE_ROOT = Path(__file__).resolve().parents[2]
+REGISTRY_PATH = TRE_ROOT / "deploy" / "registry.yaml"
+
 
 class FakeQueue:
     async def run(self) -> None:
         return None
+
+
+class EmptyRedis:
+    def smembers(self, key):
+        return set()
+
+    def zrangebyscore(self, key, minimum, maximum):
+        return []
 
 
 def _cfg(
@@ -56,3 +68,95 @@ def test_build_controller_task_specs_disables_scaling_tasks_but_keeps_metrics() 
     specs = build_controller_task_specs(_deps(), _cfg(enable_tre_scaling=False))
 
     assert tuple(spec.name for spec in specs) == ("metrics",)
+
+
+def test_create_controller_dependencies_wires_configured_components() -> None:
+    from tre_controller.app import create_controller_dependencies
+    from tre_controller.config import ControllerConfig
+    from tre_controller.loops.action_queue import ActionQueue
+    from tre_controller.sm_client import ServiceManagerClient
+    from tre_controller.store.metrics_store import MetricsStore
+
+    cfg = ControllerConfig.from_env(
+        {
+            "TRE_REGISTRY_PATH": str(REGISTRY_PATH),
+            "TRE_REDIS_URL": "redis://example:6379/0",
+            "TRE_SERVICE_MANAGER_URL": "http://service-manager:8001/",
+            "TRE_INSTANT_SAMPLE_INTERVAL_MS": "7000",
+            "TRE_PERCENTILE_MODE": "interpolated",
+        }
+    )
+    redis = EmptyRedis()
+
+    deps = create_controller_dependencies(cfg, redis_client=redis)
+
+    assert isinstance(deps.store, MetricsStore)
+    assert deps.store._redis is redis
+    assert deps.store._instant_sample_interval_ms == 7000
+    assert deps.store._percentile_mode == "interpolated"
+    assert isinstance(deps.snapshot_box, SnapshotBox)
+    assert isinstance(deps.queue, ActionQueue)
+    assert isinstance(deps.queue._client, ServiceManagerClient)
+    assert deps.registry.model("dsqwen-7b").tp_size == 1
+
+
+def test_main_builds_config_from_env_and_runs_controller() -> None:
+    import asyncio
+
+    from tre_controller.app import main
+
+    seen = {}
+
+    async def fake_runner(deps, cfg):
+        seen["redis"] = deps.store._redis
+        seen["service_manager_url"] = cfg.service_manager_url
+        seen["registry_models"] = [spec.name for spec in deps.registry.models()]
+
+    asyncio.run(
+        main(
+            env={
+                "TRE_REGISTRY_PATH": str(REGISTRY_PATH),
+                "TRE_REDIS_URL": "redis://example:6379/0",
+                "TRE_SERVICE_MANAGER_URL": "http://service-manager:8001/",
+            },
+            redis_client_factory=lambda url: ("redis", url),
+            runner=fake_runner,
+        )
+    )
+
+    assert seen == {
+        "redis": ("redis", "redis://example:6379/0"),
+        "service_manager_url": "http://service-manager:8001",
+        "registry_models": ["dsqwen-7b", "dsllama-8b", "dsqwen-14b"],
+    }
+
+
+
+def test_main_uses_default_controller_runner_when_runner_not_injected(monkeypatch) -> None:
+    import asyncio
+
+    import tre_controller.app as app
+
+    seen = {}
+
+    async def fake_run_controller(deps, cfg):
+        seen["redis"] = deps.store._redis
+        seen["service_manager_url"] = cfg.service_manager_url
+
+    monkeypatch.setattr(app, "run_controller", fake_run_controller)
+
+    asyncio.run(
+        app.main(
+            env={
+                "TRE_REGISTRY_PATH": str(REGISTRY_PATH),
+                "TRE_REDIS_URL": "redis://example:6379/0",
+                "TRE_SERVICE_MANAGER_URL": "http://service-manager:8001/",
+            },
+            redis_client_factory=lambda url: ("redis", url),
+        )
+    )
+
+    assert seen == {
+        "redis": ("redis", "redis://example:6379/0"),
+        "service_manager_url": "http://service-manager:8001",
+    }

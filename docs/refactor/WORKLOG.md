@@ -332,3 +332,14 @@
 - Verified RED remotely: `tre_controller.app`, `rescue_task()`, `fairness_task()`, and `ActionQueue.run()` were missing. Verified GREEN remotely: focused app/loop/queue tests passed with 13 tests.
 - Full quality gate passed remotely: `cd tre && make check && make smoke` completed with 114 tests and `tre smoke ok`.
 - Next P5 work: concrete controller bootstrap (`ControllerConfig.from_env()`, registry/store/sm_client construction), cluster-view state refresh, and decision snapshot writing.
+
+
+### P5 Controller Bootstrap Slice
+
+- Re-read `REFACTOR_PLAN.md` completely on remote server 76 before starting the bootstrap segment.
+- Inspected current `app.py`, `ControllerConfig`, `MetricsStore`, `ServiceManagerClient`, and dependency files; confirmed there is no mandatory Redis Python dependency in the current tree.
+- Added RED tests for dependency construction from `ControllerConfig` and `main()` parsing env plus delegating to an injected runner.
+- Implemented `create_controller_dependencies()` and `main()` with injectable Redis client/factory and optional service-manager transport.
+- Verified RED remotely: `create_controller_dependencies()` and `main()` were missing. Verified GREEN remotely: focused controller app tests passed with 6 tests.
+- Full quality gate passed remotely: `cd tre && make check && make smoke` completed with 117 tests and `tre smoke ok`.
+- Next P5 work: service-manager state polling into planner `ClusterView`, decision snapshot writing to `tre:v2:decision:latest`, and then fixture-driven end-to-end tick replay.

@@ -470,3 +470,43 @@ cd tre && make check && make smoke
 ```
 
 Result: passed with 114 tests and `tre smoke ok` on server 76.
+
+
+## Controller Bootstrap Contract
+
+The bootstrap slice connects the task assembly boundary to concrete controller configuration and component construction. It keeps Redis creation injectable so unit tests and offline replay do not require a live Redis server, while the runtime entry point can still use `ControllerConfig.from_env()` and build the real controller graph.
+
+Implemented pieces:
+
+- `create_controller_dependencies()` loads the registry from `ControllerConfig.registry_path` and constructs `MetricsStore`, `SnapshotBox`, `ServiceManagerClient`, and `ActionQueue`.
+- Metrics store construction uses the configured `instant_sample_interval_ms` and `percentile_mode` so the bootstrap path preserves P3/P5 metric semantics.
+- `main()` parses `ControllerConfig.from_env()`, creates dependencies, and delegates to the controller runner. Tests inject a Redis client factory and runner, keeping the path offline.
+- Redis client creation uses an injected factory when supplied; otherwise it attempts the optional `redis` package and raises a clear runtime error if the package is absent.
+
+This slice does not yet implement service-manager state polling into `ClusterView`, writing `tre:v2:decision:latest`, or a full end-to-end offline replay process.
+
+### P5-CTRL-012 controller bootstrap
+
+RED:
+
+```bash
+PYTHONPATH=tre/common:tre/controller:tre/controller/tests:tre/service-manager python3 -m pytest -q tre/controller/tests/test_controller_app.py
+```
+
+Result: failed because `create_controller_dependencies()` and `main()` did not exist.
+
+GREEN:
+
+```bash
+PYTHONPATH=tre/common:tre/controller:tre/controller/tests:tre/service-manager python3 -m pytest -q tre/controller/tests/test_controller_app.py
+```
+
+Result: focused controller app tests passed with 6 tests on server 76.
+
+Full slice verification:
+
+```bash
+cd tre && make check && make smoke
+```
+
+Result: passed with 117 tests and `tre smoke ok` on server 76.
