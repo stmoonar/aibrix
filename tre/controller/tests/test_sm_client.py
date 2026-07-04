@@ -40,11 +40,11 @@ async def test_sm_client_scale_model_converts_delta_to_v2_target() -> None:
 
 
 @pytest.mark.asyncio
-async def test_sm_client_scale_model_clamps_down_target_at_zero() -> None:
+async def test_sm_client_scale_model_keeps_one_awake_bound_replica_on_downscale() -> None:
     transport = FakeTransport(
         responses=[
             {"models": {"m": {"awake": 1, "bound": 4}}, "bindings": []},
-            {"model": "m", "wake_replicas": 0, "version": 2, "actions": [{"action": "sleep", "serve_id": "s1"}]},
+            {"model": "m", "wake_replicas": 1, "version": 2, "actions": []},
         ]
     )
     client = ServiceManagerClient("http://sm.local", transport=transport)
@@ -52,7 +52,7 @@ async def test_sm_client_scale_model_clamps_down_target_at_zero() -> None:
     result = await client.scale_model("m", -3)
 
     assert result["ok"] is True
-    assert transport.calls[-1] == ("PUT", "http://sm.local/v2/models/m/target", {"wake_replicas": 0})
+    assert transport.calls[-1] == ("PUT", "http://sm.local/v2/models/m/target", {"wake_replicas": 1})
 
 
 @pytest.mark.asyncio

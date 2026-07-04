@@ -38,8 +38,11 @@ class ServiceManagerClient:
     async def scale_model(self, model: str, delta: int) -> dict:
         try:
             state = await self.get_state()
-            current = int(state.get("models", {}).get(model, {}).get("awake", 0))
-            target = max(0, current + int(delta))
+            counts = state.get("models", {}).get(model, {})
+            current = int(counts.get("awake", 0))
+            bound = int(counts.get("bound", 0))
+            serving_floor = 1 if bound > 0 and current > 0 and int(delta) < 0 else 0
+            target = max(serving_floor, current + int(delta))
             response = await self._request("PUT", f"/v2/models/{model}/target", json={"wake_replicas": target})
             return {"ok": True, "response": response}
         except ServiceManagerError as exc:
