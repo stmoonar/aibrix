@@ -444,3 +444,12 @@
 - Updated `tre/Makefile` so `make check` includes `calibration/tests` and adds `tre/calibration` to `PYTHONPATH`.
 - Verified remotely: focused calibration tests passed with 3 tests; `git diff --check && cd tre && make check && make smoke` passed with 144 tests and `tre smoke ok`. `make` reported clock skew warnings from file mtimes but completed successfully.
 - Next P6 work: add CSV/window loading and healthy-quantile or reliability theta selection with scenario-family coverage checks, still using synthetic fixtures before touching real run data.
+
+### P6 Calibration CSV and Reliability Fit Slice
+
+- Added RED tests for filtered CSV window loading, SLO-derived `slo_met` and continuous health score labels, reliability theta selection, and scenario-family coverage rejection; RED failed on missing `load_windows_from_csv` and `fit_theta_by_reliability`.
+- Implemented CSV loading in `tre_calibration.dataset`, including old-flow filters for warmup, contaminated/filter-reason rows, missing finite values, and zero-token windows.
+- Implemented `fit_theta_by_reliability()` with the archived higher-is-healthier threshold scan, support/attainment/confidence checks, scenario-family coverage, and structured reject reasons.
+- Extended `docs/refactor/06_calibration_design.md` with the CSV-loading and publish-gate contract.
+- Verified remotely: new second-slice tests passed with 3 tests and all calibration tests passed with 6 tests.
+- Next P6 work: add signal recomputation from token/queue columns and parameter search metrics, then wire a profile-patch emission artifact.

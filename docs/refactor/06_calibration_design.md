@@ -15,3 +15,10 @@ The refactor starts with small, testable modules:
 ## First Verification Fixture
 
 The first synthetic fixture uses violating windows below TRS 100 and healthy windows above TRS 100. The expected fit is `theta_m = 100`, AUROC is 1.0, Spearman health direction is 1.0, and threshold classification has no false healthy or false violation windows. This gives P6 a deterministic baseline before porting CSV loading and old-parameter search.
+
+
+## CSV Loading and Publish Gate
+
+The second slice adds filtered CSV loading for the same row classes: warmup rows, contaminated rows, rows with a filter reason, rows without finite signal/SLO fields, and rows with no token traffic are excluded. Active latency SLOs derive both the hard `slo_met` label and the continuous health score `1 / (1 + max_p95_ratio)`.
+
+The reliability fitter mirrors the archived publish gate at small scale: scan candidate thresholds from low to high, select the first threshold whose `signal >= theta` subset has enough support and SLO attainment, then publish only if scenario-family coverage and confidence pass. The output keeps structured reject reasons for later CLI/profile emission.
