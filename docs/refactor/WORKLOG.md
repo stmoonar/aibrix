@@ -696,3 +696,13 @@
   - `tre-v2-service-manager:20260704-b9ee9740`, image id `sha256:4200c08ad138a4d22e3d03686e75d8136d5861603cdc06844235f7258d891718`, size 238218201 bytes.
   - `tre-v2-ui:20260704-b9ee9740`, image id `sha256:36a5e16162718e3488c5b52a682e8b801d60d1b7428c1ed1a851104645c39cb3`, size 238161184 bytes.
 - In-container verification passed: imports for `tre_controller.app`, `tre_sm.app`, and `tre_ui.app`; controller tests passed with 108 tests, service-manager tests with 31 tests, and UI tests with 3 tests. FastAPI/Starlette emitted a deprecation warning about `httpx`, but tests exited 0.
+
+### N2.2/N2.3 Kustomize Overlays
+
+- Added `tre/deploy/overlays/tre-v2` with namespace, service accounts, RBAC, independent Redis, controller, service-manager, and UI resources. Component images use the N2.1 immutable tags and all components point at `redis://tre-v2-redis:6379/0`.
+- Added ablation overlays: `ablation-no-fastloop`, `ablation-no-safescale`, `ablation-bucket-upper`, and `ablation-interpolated`. Each overlay only patches controller env over the `tre-v2` base.
+- Added `tre/deploy/tests/test_kustomize_overlays.py`; focused overlay tests passed with 2 tests.
+- `kubectl kustomize` rendered all five overlays successfully; each rendered output is 304 lines.
+- `kubectl apply --dry-run=client -k` passed for all five real overlays.
+- Server-side dry-run against the real target namespace is blocked in N2 because namespace `tre-v2` does not exist yet and N2 must not mutate the cluster. Verified `namespace.yaml` with `kubectl apply --dry-run=server -f`; then rendered each overlay with `namespace: default` only for schema validation and `kubectl apply --dry-run=server -f -` passed for all five. Actual target-namespace server dry-run should be repeated in N3 immediately after creating or applying the namespace.
+- Full verification after overlays passed: `cd tre && make check && make smoke` completed with 191 tests and `tre smoke ok`.

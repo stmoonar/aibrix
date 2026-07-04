@@ -1,0 +1,13 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tre-v2-controller
+  namespace: tre-v2
+spec:
+  template:
+    spec:
+      containers:
+        - name: controller
+          env:
+            - name: TRE_ABLATION_DISABLE_FAST_LOOP
+              value: "true"

@@ -1,0 +1,13 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tre-v2-controller
+  namespace: tre-v2
+spec:
+  template:
+    spec:
+      containers:
+        - name: controller
+          env:
+            - name: TRE_PERCENTILE_MODE
+              value: interpolated

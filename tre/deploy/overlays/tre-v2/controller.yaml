@@ -1,0 +1,42 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tre-v2-controller
+  namespace: tre-v2
+  labels:
+    app.kubernetes.io/name: tre-v2-controller
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: tre-v2-controller
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: tre-v2-controller
+    spec:
+      serviceAccountName: tre-v2-controller
+      containers:
+        - name: controller
+          image: tre-v2-controller:20260704-b9ee9740
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: TRE_REDIS_URL
+              value: redis://tre-v2-redis:6379/0
+            - name: TRE_SERVICE_MANAGER_URL
+              value: http://tre-v2-service-manager:8000
+            - name: TRE_REGISTRY_PATH
+              value: /app/tre/deploy/registry.yaml
+            - name: TRE_PERCENTILE_MODE
+              value: bucket_upper
+            - name: TRE_ABLATION_DISABLE_FAST_LOOP
+              value: "false"
+            - name: TRE_ABLATION_DISABLE_SAFESCALE
+              value: "false"
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi

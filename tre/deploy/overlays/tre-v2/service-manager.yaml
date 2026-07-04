@@ -1,0 +1,52 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tre-v2-service-manager
+  namespace: tre-v2
+  labels:
+    app.kubernetes.io/name: tre-v2-service-manager
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: tre-v2-service-manager
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: tre-v2-service-manager
+    spec:
+      serviceAccountName: tre-v2-service-manager
+      containers:
+        - name: service-manager
+          image: tre-v2-service-manager:20260704-b9ee9740
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8000
+              name: http
+          env:
+            - name: TRE_REDIS_URL
+              value: redis://tre-v2-redis:6379/0
+            - name: TRE_REGISTRY_PATH
+              value: /app/tre/deploy/registry.yaml
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tre-v2-service-manager
+  namespace: tre-v2
+  labels:
+    app.kubernetes.io/name: tre-v2-service-manager
+spec:
+  selector:
+    app.kubernetes.io/name: tre-v2-service-manager
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
