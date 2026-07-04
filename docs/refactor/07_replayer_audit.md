@@ -87,3 +87,10 @@ The old `run_experiment.sh` / `run_experiment_v2.sh` flow is captured below. P7 
 | `dispatch_trace` | Run CustomTraceGenerator main.py dispatch stage for each trace/mechanism output directory. | `planned` | Future Python path will bind trace loading, scheduling, and dispatcher primitives. |
 | `fetch_metrics` | Run fetch_and_plot.sh to collect TRE logs and plots after a trace run. | `planned` | Requires completed live or smoke run artifacts. |
 | `compare_plots` | Run plot_compare_performance_cdf_latex.py over TRE and APA result directories. | `planned` | Comparison is retained as a post-processing step after real experiments. |
+
+
+## Placeholder Trace Lint Report
+
+Added `tre_replayer.report` to produce JSON-ready per-trace lint summaries. Because no finalized `capacity_<model>.json` surface is available yet in the new tree, the first report uses a clearly labeled low-confidence placeholder: max observed RPS per `(model, input_tokens, output_tokens)` from the discovered trace set. This does not qualify a trace set for final experiments; it only exercises the P7 lint/oracle pipeline and records gaps.
+
+Read-only discovery of frozen `config/traces_v14` found 5 trace cases, not the 7 mentioned by the phase text. The placeholder report was written to `docs/refactor/p7_trace_reports/traces_v14_placeholder_lint.json`. Under the placeholder capacity, all five parsed traces fail C2/C3 and have oracle violation fraction 0.0; this means the placeholder capacity is too weak to prove non-triviality/headroom and should be replaced by real capacity surfaces before final trace-set qualification.

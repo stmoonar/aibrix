@@ -1,0 +1,77 @@
+[
+  {
+    "capacity_low_confidence": true,
+    "capacity_source": "placeholder_from_trace_max_rps",
+    "failed_constraints": [
+      "C2",
+      "C3"
+    ],
+    "indexed": true,
+    "max_headroom": 0.479167,
+    "oracle_violation_fraction": 0.0,
+    "passed": false,
+    "path": "/root/aibrix-main/CustomTraceGenerator/config/traces_v14/Simultaneous_spike_ramp_twice_tps1o2/trace.json",
+    "static_violation_duration_s": 0.0,
+    "trace": "Simultaneous_spike_ramp_twice_tps1o2"
+  },
+  {
+    "capacity_low_confidence": true,
+    "capacity_source": "placeholder_from_trace_max_rps",
+    "failed_constraints": [
+      "C2",
+      "C3"
+    ],
+    "indexed": false,
+    "max_headroom": 0.31383,
+    "oracle_violation_fraction": 0.0,
+    "passed": false,
+    "path": "/root/aibrix-main/CustomTraceGenerator/config/traces_v14/Alternating_hot_model_periodic_A/trace.json",
+    "static_violation_duration_s": 0.0,
+    "trace": "Alternating_hot_model_periodic_A"
+  },
+  {
+    "capacity_low_confidence": true,
+    "capacity_source": "placeholder_from_trace_max_rps",
+    "failed_constraints": [
+      "C2",
+      "C3"
+    ],
+    "indexed": false,
+    "max_headroom": 0.5,
+    "oracle_violation_fraction": 0.0,
+    "passed": false,
+    "path": "/root/aibrix-main/CustomTraceGenerator/config/traces_v14/Decode_heavy_burst/trace.json",
+    "static_violation_duration_s": 0.0,
+    "trace": "Decode_heavy_burst"
+  },
+  {
+    "capacity_low_confidence": true,
+    "capacity_source": "placeholder_from_trace_max_rps",
+    "failed_constraints": [
+      "C2",
+      "C3"
+    ],
+    "indexed": false,
+    "max_headroom": 0.428191,
+    "oracle_violation_fraction": 0.0,
+    "passed": false,
+    "path": "/root/aibrix-main/CustomTraceGenerator/config/traces_v14/Prefill_mixed_corner_decode_mix/trace.json",
+    "static_violation_duration_s": 0.0,
+    "trace": "Prefill_mixed_corner_decode_mix"
+  },
+  {
+    "capacity_low_confidence": true,
+    "capacity_source": "placeholder_from_trace_max_rps",
+    "failed_constraints": [
+      "C2",
+      "C3"
+    ],
+    "indexed": false,
+    "max_headroom": 0.398669,
+    "oracle_violation_fraction": 0.0,
+    "passed": false,
+    "path": "/root/aibrix-main/CustomTraceGenerator/config/traces_v14/Sinusoidal_demand/trace.json",
+    "static_violation_duration_s": 0.0,
+    "trace": "Sinusoidal_demand"
+  }
+]

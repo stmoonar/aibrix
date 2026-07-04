@@ -560,3 +560,11 @@
 - Wrote the generated behavior table into `docs/refactor/07_replayer_audit.md`.
 - Verified remotely: focused orchestrate tests passed with 2 tests and all replayer tests passed with 15 tests.
 - Next P7 work: generate lint/oracle reports for existing trace sets using a placeholder or discovered capacity surface, then run the full 60 second precision audit before phase close.
+
+### P7 Replayer Trace Report Helper Slice
+
+- Added RED tests for `tre_replayer.report` building placeholder capacity from max trace RPS and returning JSON-ready per-trace lint summaries; RED failed on missing `tre_replayer.report`.
+- Implemented `build_placeholder_capacity_surface()`, `lint_trace_case()`, and `write_trace_report()`.
+- Verified remotely: focused report tests passed with 2 tests and all replayer tests passed with 17 tests.
+- Ran the report helper against frozen `config/traces_v14` with placeholder capacity and wrote `docs/refactor/p7_trace_reports/traces_v14_placeholder_lint.json`. It found 5 traces, not 7; all five fail C2/C3 under the low-confidence placeholder capacity.
+- Next P7 work: either derive a real capacity surface from old training-grid output or explicitly carry the placeholder limitation into final P7 closure, then run the full 60 second precision audit.
