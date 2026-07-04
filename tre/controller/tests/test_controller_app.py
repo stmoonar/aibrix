@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -42,11 +43,45 @@ class FakeRegistry:
 
 
 class EmptyRedis:
+    def __init__(self):
+        self.hashes = {}
+        self.lists = {}
+
     def smembers(self, key):
         return set()
 
     def zrangebyscore(self, key, minimum, maximum):
         return []
+
+    def hset(self, name, key=None, value=None, mapping=None):
+        bucket = self.hashes.setdefault(name, {})
+        if mapping is not None:
+            for field, payload in mapping.items():
+                bucket[str(field).encode("utf-8")] = str(payload).encode("utf-8")
+            return len(mapping)
+        bucket[str(key).encode("utf-8")] = str(value).encode("utf-8")
+        return 1
+
+    def hgetall(self, name):
+        return dict(self.hashes.get(name, {}))
+
+    def hdel(self, name, *keys):
+        bucket = self.hashes.setdefault(name, {})
+        removed = 0
+        for key in keys:
+            removed += 1 if bucket.pop(str(key).encode("utf-8"), None) is not None else 0
+        return removed
+
+    def rpush(self, name, *values):
+        bucket = self.lists.setdefault(name, [])
+        for value in values:
+            bucket.append(str(value).encode("utf-8"))
+        return len(bucket)
+
+    def lrange(self, name, start, end):
+        values = self.lists.get(name, [])
+        end_index = None if int(end) == -1 else int(end) + 1
+        return list(values[int(start):end_index])
 
 
 def _cfg(
@@ -136,6 +171,52 @@ def test_create_controller_dependencies_wires_configured_components() -> None:
     assert deps.decision_writer._redis is redis
     assert isinstance(deps.safescale, SafeScaleStateMachine)
     assert deps.registry.model("dsqwen-7b").tp_size == 1
+
+
+def test_create_controller_dependencies_restores_safescale_probe_state() -> None:
+    from tre_controller.app import create_controller_dependencies
+    from tre_controller.config import ControllerConfig
+
+    cfg = ControllerConfig.from_env(
+        {
+            "TRE_REGISTRY_PATH": str(REGISTRY_PATH),
+            "TRE_REDIS_URL": "redis://example:6379/0",
+            "TRE_SERVICE_MANAGER_URL": "http://service-manager:8001/",
+        }
+    )
+    redis = EmptyRedis()
+    redis.hset(
+        "tre:v2:controller:safescale:probes",
+        mapping={
+            "probe-1": json.dumps(
+                {
+                    "model": "donor",
+                    "request_id": "probe-1",
+                    "pods": ["pod-a"],
+                    "start_ms": 1_000,
+                    "deadline_ms": 61_000,
+                    "status": "probing",
+                    "pending_upscales": {"receiver": 1},
+                },
+                sort_keys=True,
+            )
+        },
+    )
+    redis.rpush(
+        "tre:v2:controller:safescale:probe:probe-1:journal",
+        json.dumps(
+            {"last_observation": {"ts_ms": 20_000, "z_m": 1.2, "has_traffic": True}},
+            sort_keys=True,
+        ),
+    )
+
+    deps = create_controller_dependencies(cfg, redis_client=redis)
+
+    restored = deps.safescale.active_probe("donor")
+    assert restored is not None
+    assert restored.request_id == "probe-1"
+    assert restored.pending_upscales == {"receiver": 1}
+    assert len(restored.observations) == 1
 
 
 def test_main_builds_config_from_env_and_runs_controller() -> None:

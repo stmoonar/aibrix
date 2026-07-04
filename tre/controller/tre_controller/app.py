@@ -16,6 +16,7 @@ from tre_controller.loops.safescale_task import safescale_task
 from tre_controller.planning.safescale import SafeScaleStateMachine
 from tre_controller.sm_client import AsyncTransport, ServiceManagerClient
 from tre_controller.store.metrics_store import MetricsStore
+from tre_controller.store.state_store import ControllerStateStore
 
 TaskFactory = Callable[[], Awaitable[None]]
 RedisClientFactory = Callable[[str], Any]
@@ -119,6 +120,8 @@ def create_controller_dependencies(
         percentile_mode=cfg.percentile_mode,
     )
     sm_client = ServiceManagerClient(cfg.service_manager_url, transport=sm_transport)
+    safescale = SafeScaleStateMachine(config=cfg.safescale, store=ControllerStateStore(redis_client))
+    safescale.restore()
     return ControllerDependencies(
         store=store,
         snapshot_box=SnapshotBox(),
@@ -126,7 +129,7 @@ def create_controller_dependencies(
         sm_client=sm_client,
         cluster_view_box=ClusterViewBox(),
         decision_writer=DecisionSnapshotWriter(redis_client),
-        safescale=SafeScaleStateMachine(config=cfg.safescale),
+        safescale=safescale,
         registry=registry,
     )
 

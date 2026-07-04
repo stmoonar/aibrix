@@ -4,6 +4,11 @@ FALLBACK_TTL_SECONDS = 2 * 60 * 60
 DECISION_LATEST_KEY = "tre:v2:decision:latest"
 SM_STATE_KEY = "tre:v2:sm:state"
 SM_VERSION_KEY = "tre:v2:sm:version"
+CONTROLLER_SAFESCALE_PROBES_KEY = "tre:v2:controller:safescale:probes"
+
+
+def controller_safescale_probe_journal_key(request_id: str) -> str:
+    return f"tre:v2:controller:safescale:probe:{request_id}:journal"
 
 
 def hist_key(pod: str) -> str:

@@ -398,3 +398,15 @@
 - Verified GREEN remotely: focused SafeScale task/app tests passed with 8 tests.
 - Full quality gate passed remotely: `git diff --check` was clean, and `cd tre && make check && make smoke` completed with 133 tests and `tre smoke ok`.
 - Next P5 work: persistent controller state-store backing for SafeScale recovery, fixture-driven end-to-end tick replay, and fast-loop jitter verification.
+
+
+### P5 Controller SafeScale State Store Slice
+
+- Re-read `REFACTOR_PLAN.md` completely on remote server 76 before starting the SafeScale state-store segment.
+- Inspected the current SafeScale state machine, app dependency construction, and store patterns; confirmed the state machine had a `ProbeStore` protocol but no concrete controller `state_store.py`, and app startup constructed SafeScale without persistence.
+- Added RED tests for Redis-backed unresolved probe/journal round trips, terminal probe removal, malformed record filtering, and app dependency startup restore of an unresolved probe.
+- Verified RED remotely: focused tests failed on missing `tre_controller.store.state_store`.
+- Implemented `ControllerStateStore` backed by Redis hash/list keys, added controller SafeScale Redis key helpers, and wired `create_controller_dependencies()` to restore SafeScale probes at startup.
+- Verified GREEN remotely: focused controller state-store/app/SafeScale tests passed with 18 tests.
+- Full quality gate passed remotely: `git diff --check` was clean, and `cd tre && make check && make smoke` completed with 137 tests and `tre smoke ok`.
+- Next P5 work: fixture-driven end-to-end tick replay and fast-loop jitter verification.
