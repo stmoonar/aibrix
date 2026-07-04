@@ -480,3 +480,13 @@
 - Extended `docs/refactor/06_calibration_design.md` with the CLI artifact contract.
 - Verified remotely: focused CLI test passed and all calibration tests passed with 11 tests.
 - Next P6 work: final phase audit, full verification, and `p6-done` tag if the audit stays clean.
+
+### P7 Replayer Schedule and Dispatcher Slice
+
+- Re-read `REFACTOR_PLAN.md` and confirmed P7 is the next unfinished phase after `p6-done`.
+- Audited the frozen dispatcher in `/root/aibrix-main/CustomTraceGenerator/src/client_dispatcher.py`; scheduling uses absolute `base_time + request.timestamp` but is coupled to worker processes, OpenAI calls, plotting, and persistence.
+- Added RED tests for deterministic half-open RPS schedule generation and open-loop dispatch timing; RED failed with `ModuleNotFoundError: No module named 'tre_replayer'`.
+- Implemented `tre_replayer.engine.schedule` and `tre_replayer.engine.dispatcher` with injectable clock/sleep hooks and timing reports.
+- Updated `tre/Makefile` so `make check` includes `replayer/tests` and adds `tre/replayer` to `PYTHONPATH`.
+- Verified remotely: focused P7 tests passed with 3 tests.
+- Next P7 work: add trace config loading and Poisson schedule generation before implementing lint/oracle tooling.
