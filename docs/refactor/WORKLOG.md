@@ -642,3 +642,13 @@
 
 - Run final `git diff --check`, `cd tre && make manifests`, `cd tre && make check`, and `cd tre && make smoke`.
 - Commit P9 report/evidence, tag `p9-done` if the final gate passes, and leave the worktree clean.
+
+### N1.1 Defrag Service-Manager Slice
+
+- Started post-P9 work from `docs/refactor/10_next_steps.md`; `10_next_steps.md` is now treated as the tracked N-stage plan.
+- Added RED service-manager tests in `tre/service-manager/tests/test_v2_defrag.py`; RED failed with `/v2/defrag` returning 404.
+- Implemented `ServiceManagerV2.defrag()` and `POST /v2/defrag` using `SlotAllocator.plan_defrag()`, atomic state-store persistence, and an explicit hide/sleep/recreate/wake/unhide action sequence.
+- Added RED controller client coverage for posting `/v2/defrag`; RED failed because `ServiceManagerClient.defrag()` still returned unsupported.
+- Updated `ServiceManagerClient.defrag()` to post `{"tp_size": 2}` and keep the previous unsupported fallback for old service-manager 404 responses.
+- Focused verification passed: `service-manager/tests/test_v2_defrag.py service-manager/tests/test_api_v2.py` passed with 10 tests; `controller/tests/test_sm_client.py controller/tests/test_action_queue.py` passed with 12 tests, with an existing asyncio teardown warning from the controller test process.
+- Remaining N1.1 work: add a broader offline integration case for planner-produced defrag followed by scale behavior, then run the full N1 gate after N1.2/N1.3 are complete.

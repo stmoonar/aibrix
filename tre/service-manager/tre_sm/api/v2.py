@@ -6,7 +6,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 from tre_common.registry import Registry
-from tre_sm.allocator.slots import Binding
+from tre_sm.allocator.slots import Binding, Migration, Slot, SlotAllocator
 from tre_sm.state.reconcile import K8sPodClient, reconcile_state
 from tre_sm.state.store import StateStore
 from tre_sm.api.v1_compat import create_v1_compat_router
@@ -103,6 +103,44 @@ class ServiceManagerV2:
         }
 
 
+    def defrag(self, *, tp_size: int) -> dict:
+        snapshot = self._store.load()
+        allocator = SlotAllocator(self._registry.topology(), snapshot.bindings)
+        migrations = allocator.plan_defrag(tp_size)
+        if migrations is None:
+            raise DefragUnavailable("no_feasible_defrag")
+
+        actions: list[dict] = []
+        updated_by_serve = {binding.serve_id: binding for binding in snapshot.bindings}
+        for migration in migrations:
+            binding = updated_by_serve[migration.serve_id]
+            actions.extend(
+                [
+                    {"action": "hide", "serve_id": migration.serve_id},
+                    {"action": "sleep", "serve_id": migration.serve_id},
+                    {
+                        "action": "recreate",
+                        "serve_id": migration.serve_id,
+                        "node": migration.to_slot.node,
+                        "gpu_ids": list(migration.to_slot.gpu_ids),
+                    },
+                    {"action": "wake", "serve_id": migration.serve_id},
+                    {"action": "unhide", "serve_id": migration.serve_id},
+                ]
+            )
+            updated_by_serve[migration.serve_id] = replace(binding, slot=migration.to_slot, awake=True, hidden=False)
+
+        version = snapshot.version
+        if migrations:
+            updated = [updated_by_serve[binding.serve_id] for binding in snapshot.bindings]
+            version = self._store.save(updated, expected_version=snapshot.version)
+        return {
+            "version": version,
+            "migrations": [_migration_dict(migration) for migration in migrations],
+            "actions": actions,
+        }
+
+
     def reconcile(self) -> dict:
         if self._k8s_client is None:
             raise ValueError("k8s_client is required for reconcile")
@@ -133,8 +171,18 @@ class ServiceManagerV2:
         }
 
 
+class DefragUnavailable(ValueError):
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
 class TargetRequest(BaseModel):
     wake_replicas: int
+
+class DefragRequest(BaseModel):
+    tp_size: int
+
 
 
 
@@ -162,6 +210,16 @@ def create_app(service: ServiceManagerV2) -> FastAPI:
         return service.get_state()
 
 
+    @app.post("/v2/defrag")
+    def defrag(request: DefragRequest) -> dict:
+        try:
+            return service.defrag(tp_size=request.tp_size)
+        except DefragUnavailable as exc:
+            raise HTTPException(status_code=409, detail={"reason": exc.reason}) from exc
+        except (KeyError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
     @app.put("/v2/models/{model}/routable")
     def put_model_routable(model: str, request: RoutableRequest) -> dict:
         try:
@@ -177,3 +235,14 @@ def create_app(service: ServiceManagerV2) -> FastAPI:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     return app
+
+def _migration_dict(migration: Migration) -> dict:
+    return {
+        "serve_id": migration.serve_id,
+        "from_slot": _slot_dict(migration.from_slot),
+        "to_slot": _slot_dict(migration.to_slot),
+    }
+
+
+def _slot_dict(slot: Slot) -> dict:
+    return {"node": slot.node, "gpu_ids": list(slot.gpu_ids)}

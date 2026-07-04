@@ -58,7 +58,13 @@ class ServiceManagerClient:
 
     async def defrag(self, migrations: tuple) -> dict:
         del migrations
-        return {"ok": False, "error": "defrag endpoint is not implemented in service-manager v2"}
+        try:
+            response = await self._request("POST", "/v2/defrag", json={"tp_size": 2})
+            return {"ok": True, "response": response}
+        except ServiceManagerError as exc:
+            if "HTTP 404" in str(exc):
+                return {"ok": False, "error": "defrag endpoint is not implemented in service-manager v2"}
+            return {"ok": False, "error": str(exc)}
 
     async def _request(self, method: str, path: str, *, json: dict | None = None) -> dict:
         url = f"{self._base_url}{path}"

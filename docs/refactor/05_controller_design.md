@@ -710,3 +710,16 @@ cd tre && make check && make smoke
 ```
 
 Result: passed with 133 tests and `tre smoke ok` on server 76.
+
+## N1.1 Defrag Dispatch Contract
+
+N1.1 starts the post-P9 defrag closeout from `docs/refactor/10_next_steps.md`. The controller action vocabulary already includes `DefragAction`; this slice changes the dispatch boundary from an explicit unsupported result to a real service-manager v2 call.
+
+Runtime sequence:
+
+1. The planner emits `DefragAction` with allocator migrations when a TP=2 receiver is blocked by fragmented one-GPU bindings.
+2. `ActionQueue` dispatches the cluster-scoped action through `ServiceManagerClient.defrag()`.
+3. `ServiceManagerClient.defrag()` posts `POST /v2/defrag` with `{"tp_size": 2}`. A 404 keeps the previous unsupported fallback so older service-manager deployments fail closed instead of crashing the controller loop.
+4. `ServiceManagerV2.defrag()` runs `SlotAllocator.plan_defrag()`, persists the new binding layout atomically, and returns the future real-operation sequence: hide route, sleep, recreate on the new slot, wake, unhide route.
+
+The service-manager endpoint intentionally does not mutate Kubernetes or vLLM in this offline N1.1 slice. It returns the exact operation sequence that N4 must bind to `ops/k8s_ops.py` and vLLM sleep/wake validation on the real cluster. Because vLLM sleep-mode wake must return to the original GPU binding, the move is represented as `recreate` on the new slot rather than changing GPU assignment in-place.

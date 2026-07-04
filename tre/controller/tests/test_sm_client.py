@@ -87,8 +87,47 @@ async def test_sm_client_normalizes_http_failure() -> None:
 
 
 @pytest.mark.asyncio
-async def test_sm_client_defrag_is_explicitly_unsupported_until_v2_endpoint_exists() -> None:
-    client = ServiceManagerClient("http://sm.local", transport=FakeTransport())
+async def test_sm_client_defrag_posts_v2_defrag_request() -> None:
+    transport = FakeTransport(
+        responses=[
+            {
+                "version": 2,
+                "migrations": [
+                    {
+                        "serve_id": "serve-b",
+                        "from_slot": {"node": "node-a", "gpu_ids": [2]},
+                        "to_slot": {"node": "node-a", "gpu_ids": [1]},
+                    }
+                ],
+                "actions": [],
+            }
+        ]
+    )
+    client = ServiceManagerClient("http://sm.local", transport=transport)
+
+    result = await client.defrag(())
+
+    assert result == {
+        "ok": True,
+        "response": {
+            "version": 2,
+            "migrations": [
+                {
+                    "serve_id": "serve-b",
+                    "from_slot": {"node": "node-a", "gpu_ids": [2]},
+                    "to_slot": {"node": "node-a", "gpu_ids": [1]},
+                }
+            ],
+            "actions": [],
+        },
+    }
+    assert transport.calls == [("POST", "http://sm.local/v2/defrag", {"tp_size": 2})]
+
+
+@pytest.mark.asyncio
+async def test_sm_client_defrag_keeps_unsupported_fallback_for_old_service_manager() -> None:
+    transport = FakeTransport(responses=[ServiceManagerError("HTTP 404: not found")])
+    client = ServiceManagerClient("http://sm.local", transport=transport)
 
     result = await client.defrag(())
 
