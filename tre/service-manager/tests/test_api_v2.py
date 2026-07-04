@@ -335,6 +335,26 @@ def test_v2_routable_route_delegates_to_service_layer():
     assert second.json()["actions"] == []
 
 
+def test_v2_put_routable_writes_runtime_labels_when_enabled():
+    store = StateStore(FakeRedis())
+    store.save(
+        [
+            Binding("serve-a", "m1", Slot("node-a", (0,)), awake=True),
+            Binding("serve-b", "m1", Slot("node-a", (1,)), awake=True),
+        ],
+        expected_version=0,
+    )
+    runtime_ops = FakeRuntimeOps([])
+    service = ServiceManagerV2(registry(), store, runtime_ops=runtime_ops)
+
+    hidden = service.put_model_routable("m1", hidden_pods=["serve-b"])
+    unhidden = service.put_model_routable("m1", hidden_pods=[])
+
+    assert hidden["actions"] == [{"action": "hide", "serve_id": "serve-b"}]
+    assert unhidden["actions"] == [{"action": "unhide", "serve_id": "serve-b"}]
+    assert runtime_ops.annotations == [("serve-b", "hidden"), ("serve-b", "awake")]
+
+
 def test_v2_reconcile_updates_state_from_pod_reality():
     store = StateStore(FakeRedis())
     store.save(

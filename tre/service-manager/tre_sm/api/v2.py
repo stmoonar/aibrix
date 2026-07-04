@@ -9,7 +9,7 @@ from pydantic import BaseModel
 from tre_common.registry import Registry
 from tre_sm.allocator.slots import Binding, Migration, Slot, SlotAllocator
 from tre_sm.allocator.topology import K8sPodSnapshot
-from tre_sm.state.reconcile import K8sPodClient, POD_STATE_AWAKE, POD_STATE_SLEEPING, reconcile_state
+from tre_sm.state.reconcile import K8sPodClient, POD_STATE_AWAKE, POD_STATE_HIDDEN, POD_STATE_SLEEPING, reconcile_state
 from tre_sm.state.store import StateConflict, StateStore
 from tre_sm.api.v1_compat import create_v1_compat_router
 
@@ -135,6 +135,11 @@ class ServiceManagerV2:
             should_hide = binding.serve_id in requested_hidden
             if binding.hidden == should_hide:
                 continue
+            if self._runtime_ops is not None:
+                self._runtime_ops.write_binding_annotations(
+                    binding,
+                    state=POD_STATE_HIDDEN if should_hide else POD_STATE_AWAKE,
+                )
             updated_by_serve[binding.serve_id] = replace(binding, hidden=should_hide)
             actions.append({"action": "hide" if should_hide else "unhide", "serve_id": binding.serve_id})
 
