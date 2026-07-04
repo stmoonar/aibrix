@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: dsqwen-14b
+  namespace: default
+  labels: &id001
+    model.aibrix.ai/name: dsqwen-14b
+spec:
+  selector: *id001
+  ports:
+  - name: http
+    port: 8000
+    targetPort: 8000
+    protocol: TCP

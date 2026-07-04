@@ -28,14 +28,22 @@ def build_deployments(registry: Registry) -> list[dict]:
     return deployments
 
 
+def build_services(registry: Registry) -> list[dict]:
+    return [_service(model) for model in registry.models()]
+
+
+def build_resources(registry: Registry) -> list[dict]:
+    return build_services(registry) + build_deployments(registry)
+
+
 def write_manifests(registry: Registry, output_dir: Path) -> list[Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
     for old in output_dir.glob("*.yaml"):
         old.unlink()
     written: list[Path] = []
-    for deployment in build_deployments(registry):
-        path = output_dir / f"{deployment['metadata']['name']}.yaml"
-        path.write_text(yaml.safe_dump(deployment, sort_keys=False), encoding="utf-8")
+    for resource in build_resources(registry):
+        path = output_dir / f"{resource['metadata']['name']}.yaml"
+        path.write_text(yaml.safe_dump(resource, sort_keys=False), encoding="utf-8")
         written.append(path)
     resources = [path.name for path in written]
     (output_dir / "kustomization.yaml").write_text(
@@ -43,6 +51,26 @@ def write_manifests(registry: Registry, output_dir: Path) -> list[Path]:
         encoding="utf-8",
     )
     return written
+
+
+def _service(model: ModelSpec) -> dict:
+    labels = {"model.aibrix.ai/name": model.name}
+    return {
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": {"name": _dns_name(model.name), "namespace": "default", "labels": labels},
+        "spec": {
+            "selector": labels,
+            "ports": [
+                {
+                    "name": "http",
+                    "port": 8000,
+                    "targetPort": 8000,
+                    "protocol": "TCP",
+                }
+            ],
+        },
+    }
 
 
 def _deployment(model: ModelSpec, node_name: str, gpu_ids: tuple[int, ...]) -> dict:
@@ -132,7 +160,7 @@ def main(argv: Iterable[str] | None = None) -> None:
     if errors:
         raise SystemExit("registry validation failed:" + chr(10) + chr(10).join(errors))
     written = write_manifests(registry, Path(args.output_dir))
-    print(f"wrote {len(written)} deployments to {args.output_dir}")
+    print(f"wrote {len(written)} resources to {args.output_dir}")
 
 
 if __name__ == "__main__":
