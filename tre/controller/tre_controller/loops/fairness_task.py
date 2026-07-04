@@ -17,6 +17,10 @@ class SnapshotReader(Protocol):
     def get(self) -> MetricsSnapshot | None: ...
 
 
+class DecisionWriter(Protocol):
+    def write(self, loop_name: str, snapshot: MetricsSnapshot, result: LoopTickResult) -> None: ...
+
+
 class FairnessTaskConfig(Protocol):
     fairness_interval_s: float
 
@@ -50,17 +54,20 @@ async def fairness_task(
     cluster_view: ClusterView | None = None,
     cluster_view_box: ClusterViewReader | None = None,
     active_probe_models: set[str] | None = None,
+    decision_writer: DecisionWriter | None = None,
 ) -> None:
     while True:
         snapshot = snapshot_box.get()
         if snapshot is not None:
-            run_fairness_tick(
+            result = run_fairness_tick(
                 snapshot,
                 queue=queue,
                 registry=registry,
                 cluster_view=_current_cluster_view(cluster_view, cluster_view_box),
                 active_probe_models=active_probe_models,
             )
+            if decision_writer is not None:
+                decision_writer.write("fairness", snapshot, result)
         await sleep(cfg.fairness_interval_s)
 
 

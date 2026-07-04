@@ -126,6 +126,14 @@ async def _stop_sleep(seconds: float) -> None:
 _stop_sleep.calls = []
 
 
+class FakeDecisionWriter:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, MetricsSnapshot, object]] = []
+
+    def write(self, loop_name: str, snapshot: MetricsSnapshot, result: object) -> None:
+        self.calls.append((loop_name, snapshot, result))
+
+
 def test_rescue_task_loop_reads_snapshot_and_sleeps_configured_interval() -> None:
     import asyncio
 
@@ -156,6 +164,80 @@ def test_rescue_task_loop_reads_snapshot_and_sleeps_configured_interval() -> Non
 
     assert _stop_sleep.calls == [5.0]
     assert len(queue.submitted) == 1
+
+
+def test_rescue_task_loop_records_decision_snapshot_after_tick() -> None:
+    import asyncio
+
+    from tre_controller.loops.metrics_task import SnapshotBox
+    from tre_controller.loops.rescue_task import rescue_task
+
+    _stop_sleep.calls = []
+    queue = FakeQueue()
+    writer = FakeDecisionWriter()
+    snapshot = MetricsSnapshot(
+        ts_ms=1,
+        stale=False,
+        models={"critical": _metrics("critical", generation=50.0, waiting=10.0, running=1.0, assigned=1)},
+    )
+    cfg = type("Cfg", (), {"rescue_interval_s": 5.0})()
+
+    try:
+        asyncio.run(
+            rescue_task(
+                SnapshotBox(snapshot),
+                queue=queue,
+                registry=_registry(),
+                cfg=cfg,
+                sleep=_stop_sleep,
+                decision_writer=writer,
+            )
+        )
+    except StopLoop:
+        pass
+
+    assert len(writer.calls) == 1
+    loop_name, seen_snapshot, result = writer.calls[0]
+    assert loop_name == "rescue"
+    assert seen_snapshot is snapshot
+    assert result.submitted == 1
+
+
+def test_fairness_task_loop_records_decision_snapshot_after_tick() -> None:
+    import asyncio
+
+    from tre_controller.loops.fairness_task import fairness_task
+    from tre_controller.loops.metrics_task import SnapshotBox
+
+    _stop_sleep.calls = []
+    queue = FakeQueue()
+    writer = FakeDecisionWriter()
+    snapshot = MetricsSnapshot(
+        ts_ms=2,
+        stale=True,
+        models={"critical": _metrics("critical", generation=50.0, waiting=10.0, running=1.0, assigned=1)},
+    )
+    cfg = type("Cfg", (), {"fairness_interval_s": 10.0})()
+
+    try:
+        asyncio.run(
+            fairness_task(
+                SnapshotBox(snapshot),
+                queue=queue,
+                registry=_registry(),
+                cfg=cfg,
+                sleep=_stop_sleep,
+                decision_writer=writer,
+            )
+        )
+    except StopLoop:
+        pass
+
+    assert len(writer.calls) == 1
+    loop_name, seen_snapshot, result = writer.calls[0]
+    assert loop_name == "fairness"
+    assert seen_snapshot is snapshot
+    assert result.events == ("snapshot_stale",)
 
 
 def test_fairness_task_loop_skips_missing_snapshot_and_sleeps_configured_interval() -> None:

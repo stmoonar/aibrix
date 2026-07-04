@@ -549,3 +549,44 @@ cd tre && make check && make smoke
 ```
 
 Result: passed with 121 tests and `tre smoke ok` on server 76.
+
+## Decision Snapshot Contract
+
+The decision snapshot slice writes each rescue/fairness tick result to the Redis hash `tre:v2:decision:latest` for UI and debugging consumers. The planner tick remains pure; the async loop wrappers receive an injected writer and record the tick result after queue submission.
+
+Hash fields:
+
+- `ts_ms`: metrics snapshot timestamp in milliseconds.
+- `loop`: `rescue` or `fairness`.
+- `stale`: `true` or `false`, mirroring `MetricsSnapshot.stale`.
+- `submitted`: number of actions submitted by the tick.
+- `actions`: JSON array of typed action dictionaries for scale, hide, unhide, or defrag actions.
+- `events`: JSON array of planner/tick event strings.
+
+`DecisionSnapshotWriter` uses `tre_common.rediskeys.DECISION_LATEST_KEY`, so the key name stays aligned with the shared schema. Defrag migrations are serialized as `serve_id`, `from_slot`, and `to_slot` objects with node and GPU ids.
+
+### P5-CTRL-014 decision snapshot
+
+RED:
+
+```bash
+PYTHONPATH=tre/common:tre/controller:tre/controller/tests:tre/service-manager python3 -m pytest -q tre/controller/tests/test_decision_snapshot.py tre/controller/tests/test_loop_ticks.py tre/controller/tests/test_controller_app.py
+```
+
+Result: failed on missing serializer/writer behavior, missing `decision_writer` loop parameters, and missing app dependency wiring.
+
+GREEN:
+
+```bash
+PYTHONPATH=tre/common:tre/controller:tre/controller/tests:tre/service-manager python3 -m pytest -q tre/controller/tests/test_decision_snapshot.py tre/controller/tests/test_loop_ticks.py tre/controller/tests/test_controller_app.py
+```
+
+Result: focused decision snapshot, loop, and app tests passed with 16 tests on server 76.
+
+Full slice verification:
+
+```bash
+cd tre && make check && make smoke
+```
+
+Result: passed with 125 tests and `tre smoke ok` on server 76.

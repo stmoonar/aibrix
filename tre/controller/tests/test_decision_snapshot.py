@@ -1,0 +1,96 @@
+from __future__ import annotations
+
+import json
+
+from tre_common.metrics_schema import MetricsSnapshot
+from tre_common.rediskeys import DECISION_LATEST_KEY
+from tre_controller.loops.decision_snapshot import DecisionSnapshotWriter, build_decision_snapshot
+from tre_controller.loops.tick import LoopTickResult
+from tre_controller.planning.planner import DefragAction, ScaleAction
+from tre_sm.allocator.slots import Migration, Slot
+
+
+class FakeRedis:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict[str, str]]] = []
+
+    def hset(self, name: str, mapping: dict[str, str]) -> int:
+        self.calls.append((name, mapping))
+        return len(mapping)
+
+
+def test_build_decision_snapshot_serializes_actions_and_events() -> None:
+    snapshot = MetricsSnapshot(ts_ms=1234, stale=False, models={})
+    result = LoopTickResult(
+        submitted=2,
+        actions=(
+            ScaleAction(
+                model="critical",
+                delta=1,
+                reason="critical_tp_defrag",
+                source_loop="rescue",
+                receiver="critical",
+            ),
+            DefragAction(
+                migrations=(Migration("serve-2", Slot("node-a", (2,)), Slot("node-a", (1,))),),
+                reason="critical_tp_defrag",
+                source_loop="rescue",
+            ),
+        ),
+        events=("capacity_blocked:other",),
+    )
+
+    payload = build_decision_snapshot("rescue", snapshot, result)
+
+    assert payload["ts_ms"] == "1234"
+    assert payload["loop"] == "rescue"
+    assert payload["stale"] == "false"
+    assert payload["submitted"] == "2"
+    assert json.loads(payload["events"]) == ["capacity_blocked:other"]
+    assert json.loads(payload["actions"]) == [
+        {
+            "kind": "scale",
+            "model": "critical",
+            "delta": 1,
+            "reason": "critical_tp_defrag",
+            "source_loop": "rescue",
+            "requires_safescale": False,
+            "receiver": "critical",
+            "donor": None,
+        },
+        {
+            "kind": "defrag",
+            "reason": "critical_tp_defrag",
+            "source_loop": "rescue",
+            "migrations": [
+                {
+                    "serve_id": "serve-2",
+                    "from_slot": {"node": "node-a", "gpu_ids": [2]},
+                    "to_slot": {"node": "node-a", "gpu_ids": [1]},
+                }
+            ],
+        },
+    ]
+
+
+def test_decision_snapshot_writer_writes_latest_hash() -> None:
+    redis = FakeRedis()
+    writer = DecisionSnapshotWriter(redis)
+    snapshot = MetricsSnapshot(ts_ms=42, stale=True, models={})
+    result = LoopTickResult(submitted=0, events=("snapshot_stale",))
+
+    writer.write("fairness", snapshot, result)
+
+    assert redis.calls == [
+        (
+            DECISION_LATEST_KEY,
+            {
+                "ts_ms": "42",
+                "loop": "fairness",
+                "stale": "true",
+                "submitted": "0",
+                "actions": "[]",
+                "events": '["snapshot_stale"]',
+            },
+        )
+    ]

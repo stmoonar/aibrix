@@ -7,6 +7,7 @@ from tre_common.registry import ClusterTopology, NodeSpec
 from tre_controller.app import ControllerDependencies, build_controller_task_specs
 from tre_controller.loops.cluster_view_task import ClusterViewBox
 from tre_controller.loops.metrics_task import SnapshotBox
+from tre_controller.loops.decision_snapshot import DecisionSnapshotWriter
 
 TRE_ROOT = Path(__file__).resolve().parents[2]
 REGISTRY_PATH = TRE_ROOT / "deploy" / "registry.yaml"
@@ -14,6 +15,11 @@ REGISTRY_PATH = TRE_ROOT / "deploy" / "registry.yaml"
 
 class FakeQueue:
     async def run(self) -> None:
+        return None
+
+
+class FakeDecisionWriter:
+    def write(self, loop_name, snapshot, result) -> None:
         return None
 
 
@@ -59,6 +65,7 @@ def _deps() -> ControllerDependencies:
         queue=FakeQueue(),
         sm_client=FakeServiceManagerClient(),
         cluster_view_box=ClusterViewBox(),
+        decision_writer=FakeDecisionWriter(),
         registry=FakeRegistry(),
     )
 
@@ -116,6 +123,8 @@ def test_create_controller_dependencies_wires_configured_components() -> None:
     assert deps.queue._client is deps.sm_client
     assert isinstance(deps.sm_client, ServiceManagerClient)
     assert deps.cluster_view_box.get() is None
+    assert isinstance(deps.decision_writer, DecisionSnapshotWriter)
+    assert deps.decision_writer._redis is redis
     assert deps.registry.model("dsqwen-7b").tp_size == 1
 
 

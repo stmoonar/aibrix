@@ -354,3 +354,14 @@
 - Verified RED remotely: `tre_controller.loops.cluster_view_task` was missing. Verified GREEN remotely: focused cluster-view/app/loop tests passed with 15 tests.
 - Full quality gate passed remotely: `cd tre && make check && make smoke` completed with 121 tests and `tre smoke ok`.
 - Next P5 work: decision snapshot writing to `tre:v2:decision:latest`, then fixture-driven end-to-end tick replay.
+
+### P5 Decision Snapshot Slice
+
+- Re-read `REFACTOR_PLAN.md` completely on remote server 76 before starting the decision snapshot segment.
+- Inspected `tre_common.rediskeys`, planner action/result types, rescue/fairness wrappers, and controller app dependency assembly.
+- Added RED tests for decision snapshot serialization, Redis hash writes to `tre:v2:decision:latest`, rescue/fairness loop writer calls, and app dependency construction.
+- Verified RED remotely: focused tests failed on `NotImplementedError`, missing `decision_writer` loop parameters, and missing `ControllerDependencies.decision_writer`.
+- Implemented `tre_controller.loops.decision_snapshot`, wired `DecisionSnapshotWriter` into controller dependencies, and injected it into rescue/fairness task specs.
+- Verified GREEN remotely: focused decision snapshot/app/loop tests passed with 16 tests.
+- Full quality gate passed remotely: `git diff --check` was clean, and `cd tre && make check && make smoke` completed with 125 tests and `tre smoke ok`.
+- Next P5 work: fixture-driven end-to-end tick replay and remaining SafeScale/slot-aware donor integration.
