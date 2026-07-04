@@ -45,3 +45,8 @@ Added `tre_calibration.capacity` as the first capacity-surface building block fo
 Added `tre_replayer.lint` with the first C1/C2/C3 checks from section 12. C1 computes normalized occupancy from `rho = rps / C_m(i,o)` times model slot width and rejects traces above 95% of total slots. C2 accumulates time where any model exceeds `rho > 1.2` and rejects traces that do not trigger scaling for at least three slow-loop periods. C3 checks the declared headroom tier (`loose`, `medium`, or `tight`) with the plan's +/-0.05 tolerance.
 
 The current C1 implementation is the instantaneous feasibility bound; the full oracle violation-rate check remains to be added in `oracle.py`.
+
+
+## Oracle Lower Bound Foundation
+
+Added `tre_replayer.oracle.compute_oracle_lower_bound()` as the first hand-checkable oracle metric. It partitions the trace by segment boundaries, computes required slots from normalized demand and model slot width, and reports total duration, unavoidable overcapacity duration, violation fraction, and max required slots. This is a conservative lower-bound foundation; future slices can add warm-switch timing and integer slot-shape constraints.

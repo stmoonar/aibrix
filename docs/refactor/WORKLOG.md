@@ -521,3 +521,10 @@
 - Implemented `TraceLintReport` and `lint_trace()` using capacity-surface lookups, model slot widths, segment-boundary intervals, C1 instantaneous headroom, C2 static violation duration, and C3 headroom tier checks.
 - Verified remotely: focused lint tests passed with 2 tests and all replayer tests passed with 8 tests.
 - Next P7 work: implement `oracle.py` lower-bound checks and feed oracle violation results into C1 reports.
+
+### P7 Replayer Oracle Foundation Slice
+
+- Added a RED oracle unit test with a hand-checkable two-interval trace where only the first interval is over capacity; RED failed on missing `tre_replayer.oracle`.
+- Implemented `compute_oracle_lower_bound()` with segment-boundary intervals, normalized demand, model slot widths, violation duration, violation fraction, and max required slots.
+- Verified remotely: focused oracle test passed and all replayer tests passed with 9 tests.
+- Next P7 work: feed oracle lower-bound output into lint reports, then add design/orchestrate skeletons and the offline dispatch precision test.
