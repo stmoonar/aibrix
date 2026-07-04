@@ -64,15 +64,19 @@ async def rescue_task(
     while True:
         snapshot = snapshot_box.get()
         if snapshot is not None:
-            result = run_rescue_tick(
-                snapshot,
-                queue=queue,
-                registry=registry,
-                cluster_view=_current_cluster_view(cluster_view, cluster_view_box),
-                active_probe_models=active_probe_models,
-                signal_source=getattr(cfg, "signal_source", "zm"),
-                safescale=safescale,
-            )
+            current_view = _current_cluster_view(cluster_view, cluster_view_box)
+            if cluster_view is None and cluster_view_box is not None and current_view is None:
+                result = LoopTickResult(submitted=0, events=("cluster_view_unavailable",))
+            else:
+                result = run_rescue_tick(
+                    snapshot,
+                    queue=queue,
+                    registry=registry,
+                    cluster_view=current_view,
+                    active_probe_models=active_probe_models,
+                    signal_source=getattr(cfg, "signal_source", "zm"),
+                    safescale=safescale,
+                )
             if decision_writer is not None:
                 decision_writer.write("rescue", snapshot, result)
         await sleep(cfg.rescue_interval_s)

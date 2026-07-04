@@ -537,6 +537,83 @@ def test_rescue_task_loop_uses_latest_cluster_view_from_box() -> None:
     assert scale.reason == "critical_tp_defrag"
     assert _stop_sleep.calls == [5.0]
 
+
+def test_rescue_task_loop_skips_when_cluster_view_box_is_not_ready() -> None:
+    import asyncio
+
+    from tre_controller.loops.cluster_view_task import ClusterViewBox
+    from tre_controller.loops.metrics_task import SnapshotBox
+    from tre_controller.loops.rescue_task import rescue_task
+
+    _stop_sleep.calls = []
+    queue = FakeQueue()
+    writer = FakeDecisionWriter()
+    snapshot = MetricsSnapshot(
+        ts_ms=1,
+        stale=False,
+        models={"critical": _metrics("critical", generation=50.0, waiting=10.0, running=1.0, assigned=1)},
+    )
+    cfg = type("Cfg", (), {"rescue_interval_s": 5.0})()
+
+    try:
+        asyncio.run(
+            rescue_task(
+                SnapshotBox(snapshot),
+                queue=queue,
+                registry=_registry(),
+                cfg=cfg,
+                sleep=_stop_sleep,
+                cluster_view_box=ClusterViewBox(),
+                decision_writer=writer,
+            )
+        )
+    except StopLoop:
+        pass
+
+    assert queue.submitted == []
+    assert len(writer.calls) == 1
+    assert writer.calls[0][2].events == ("cluster_view_unavailable",)
+    assert _stop_sleep.calls == [5.0]
+
+
+def test_fairness_task_loop_skips_when_cluster_view_box_is_not_ready() -> None:
+    import asyncio
+
+    from tre_controller.loops.cluster_view_task import ClusterViewBox
+    from tre_controller.loops.fairness_task import fairness_task
+    from tre_controller.loops.metrics_task import SnapshotBox
+
+    _stop_sleep.calls = []
+    queue = FakeQueue()
+    writer = FakeDecisionWriter()
+    snapshot = MetricsSnapshot(
+        ts_ms=1,
+        stale=False,
+        models={"critical": _metrics("critical", generation=50.0, waiting=10.0, running=1.0, assigned=1)},
+    )
+    cfg = type("Cfg", (), {"fairness_interval_s": 10.0})()
+
+    try:
+        asyncio.run(
+            fairness_task(
+                SnapshotBox(snapshot),
+                queue=queue,
+                registry=_registry(),
+                cfg=cfg,
+                sleep=_stop_sleep,
+                cluster_view_box=ClusterViewBox(),
+                decision_writer=writer,
+            )
+        )
+    except StopLoop:
+        pass
+
+    assert queue.submitted == []
+    assert len(writer.calls) == 1
+    assert writer.calls[0][2].events == ("cluster_view_unavailable",)
+    assert _stop_sleep.calls == [10.0]
+
+
 def _registry_for_same_slot_shrink() -> Registry:
     base = _registry()
     template = base.model("critical")
