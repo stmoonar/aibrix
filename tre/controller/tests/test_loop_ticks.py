@@ -433,3 +433,69 @@ def test_rescue_task_loop_uses_latest_cluster_view_from_box() -> None:
     )
     assert scale.reason == "critical_tp_defrag"
     assert _stop_sleep.calls == [5.0]
+
+def _registry_for_same_slot_shrink() -> Registry:
+    base = _registry()
+    template = base.model("critical")
+    return Registry(
+        base.topology(),
+        [
+            ModelSpec(
+                name="tp2",
+                weights_path=template.weights_path,
+                tp_size=2,
+                min_replicas=0,
+                max_replicas=2,
+                vllm_image=template.vllm_image,
+                slo=template.slo,
+                trs=template.trs,
+            ),
+            ModelSpec(
+                name="high",
+                weights_path=template.weights_path,
+                tp_size=1,
+                min_replicas=0,
+                max_replicas=2,
+                vllm_image=template.vllm_image,
+                slo=template.slo,
+                trs=template.trs,
+            ),
+        ],
+    )
+
+
+def test_rescue_tick_converts_same_slot_shrink_to_safescale_probe_hide() -> None:
+    from tre_controller.planning.planner import ClusterView
+    from tre_sm.allocator.slots import Binding, Slot
+
+    queue = FakeQueue()
+    safescale = SafeScaleStateMachine(config=SafeScaleConfig(default_window_ms=60_000.0))
+    registry = _registry_for_same_slot_shrink()
+    snapshot = MetricsSnapshot(
+        ts_ms=20_000,
+        stale=False,
+        models={
+            "tp2": _metrics("tp2", generation=50.0, waiting=10.0, running=1.0, assigned=0),
+            "high": _metrics_with_pods("high", generation=200.0, waiting=0.0, running=1.0, pods=("high-0",)),
+        },
+    )
+    cluster_view = ClusterView(
+        topology=registry.topology(),
+        bindings=(
+            Binding("high-0", "high", Slot("node-a", (0,)), awake=True),
+            Binding("other-2", "other", Slot("node-a", (2,)), awake=True),
+        ),
+    )
+
+    result = run_rescue_tick(
+        snapshot,
+        queue=queue,
+        registry=registry,
+        cluster_view=cluster_view,
+        safescale=safescale,
+    )
+
+    assert result.submitted == 1
+    assert queue.submitted == [(HideAction("high", ("high-0",), "probe_started", "rescue"),)]
+    assert safescale.active_probe("high").pending_upscales == {"tp2": 1}
+    assert "safescale_probe_started:high" in result.events

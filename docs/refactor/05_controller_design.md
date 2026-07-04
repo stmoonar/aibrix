@@ -723,3 +723,15 @@ Runtime sequence:
 4. `ServiceManagerV2.defrag()` runs `SlotAllocator.plan_defrag()`, persists the new binding layout atomically, and returns the future real-operation sequence: hide route, sleep, recreate on the new slot, wake, unhide route.
 
 The service-manager endpoint intentionally does not mutate Kubernetes or vLLM in this offline N1.1 slice. It returns the exact operation sequence that N4 must bind to `ops/k8s_ops.py` and vLLM sleep/wake validation on the real cluster. Because vLLM sleep-mode wake must return to the original GPU binding, the move is represented as `recreate` on the new slot rather than changing GPU assignment in-place.
+
+## N1.2 Same-Slot HIGH Shrink Contract
+
+N1.2 adds the first slot-aware donor-priority behavior after P9. When a TP=2 CRITICAL receiver is blocked by fragmented one-GPU bindings, planner now checks for a HIGH one-GPU donor occupying one half of a two-GPU slot while the other half is empty. That donor is cheaper than a defrag migration because a SafeScale-gated shrink can free a complete slot without moving another serve.
+
+Planner behavior:
+
+1. Candidate donor must be classified `HIGH`, must not be the receiver, must have one-GPU binding shape, must be above `min_replicas`, and must not already have an active/inflight action.
+2. Candidate slot must have its mate GPU free in the same declared two-GPU slot.
+3. Multiple candidates are ordered by the lowest `Z_m`, then serve id for deterministic tie-breaking.
+4. Planner emits `ShrinkForSlotAction(donor, beneficiary, serve_id, slot)` instead of `DefragAction` and does not emit the beneficiary scale-up in the same tick. The next rescue tick should naturally find the complete empty slot after the donor shrink commits.
+5. `loops/tick.py` converts `ShrinkForSlotAction` into a SafeScale probe hide action with pending upscale `{beneficiary: 1}`. This matches the existing controller architecture: planner remains pure, tick starts probes, and `safescale_task.py` observes active probes until commit or rollback.

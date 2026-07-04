@@ -6,7 +6,7 @@ from typing import Protocol
 from tre_common.metrics_schema import MetricsSnapshot, ModelWindowMetrics
 from tre_common.registry import Registry, ModelSpec
 from tre_controller.planning.classify import classify_all_models
-from tre_controller.planning.planner import Action, ClusterView, HideAction, PlanConfig, ScaleAction, UnhideAction, build_plan
+from tre_controller.planning.planner import Action, ClusterView, HideAction, PlanConfig, ScaleAction, ShrinkForSlotAction, UnhideAction, build_plan
 from tre_controller.planning.safescale import SafeScaleCommand, SafeScaleDecision
 from tre_controller.signals.sources import get_signal
 from tre_controller.signals.trs import TRSComputer, TRSInput
@@ -94,23 +94,47 @@ def _apply_safescale(
             converted.append(action)
             continue
 
-        pods = _pods_to_probe(snapshot, action.model, abs(action.delta))
+        probe_model = _safescale_probe_model(action)
+        pods = _safescale_probe_pods(snapshot, action)
         decision = safescale.start_probe(
-            model=action.model,
+            model=probe_model,
             pods=pods,
             now_ms=snapshot.ts_ms,
-            pending_upscales=probe_upscale_plans.get(action.model, {}),
+            pending_upscales=_safescale_pending_upscales(action, probe_upscale_plans),
         )
         if decision.status == "none":
-            events.append(f"safescale_probe_skipped:{action.model}:{decision.reason}")
+            events.append(f"safescale_probe_skipped:{probe_model}:{decision.reason}")
             continue
-        events.append(f"safescale_{decision.reason}:{action.model}")
+        events.append(f"safescale_{decision.reason}:{probe_model}")
         converted.extend(_commands_to_actions(decision.commands, source_loop=action.source_loop))
     return tuple(converted), tuple(events)
 
 
 def _requires_safescale_probe(action: Action) -> bool:
-    return isinstance(action, ScaleAction) and action.requires_safescale and action.delta < 0
+    return (isinstance(action, ScaleAction) and action.requires_safescale and action.delta < 0) or isinstance(
+        action, ShrinkForSlotAction
+    )
+
+
+def _safescale_probe_model(action: Action) -> str:
+    if isinstance(action, ShrinkForSlotAction):
+        return action.donor
+    return action.model
+
+
+def _safescale_probe_pods(snapshot: MetricsSnapshot, action: Action) -> tuple[str, ...]:
+    if isinstance(action, ShrinkForSlotAction):
+        return (action.serve_id,)
+    return _pods_to_probe(snapshot, action.model, abs(action.delta))
+
+
+def _safescale_pending_upscales(
+    action: Action,
+    probe_upscale_plans: dict[str, dict[str, int]],
+) -> dict[str, int]:
+    if isinstance(action, ShrinkForSlotAction):
+        return {action.beneficiary: 1}
+    return probe_upscale_plans.get(action.model, {})
 
 
 def _pods_to_probe(snapshot: MetricsSnapshot, model: str, count: int) -> tuple[str, ...]:

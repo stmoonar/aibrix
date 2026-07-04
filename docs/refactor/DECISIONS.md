@@ -33,3 +33,20 @@ Record baseline commit `adfe6f8373afe5a90a2e93687474f07a0d4aed26` in P0 docs and
 ### Consequences
 
 This avoids tagging a state before the refactor plan/documentation commit exists. The baseline is still recoverable by commit hash.
+
+## ADR-0003: Same-slot shrink probes start in loop tick, not safescale_task
+
+- Date: 2026-07-04
+- Status: accepted
+
+### Context
+
+`docs/refactor/10_next_steps.md` N1.2 says the new same-slot HIGH shrink action is consumed by `safescale_task`. The current P5/P9 controller architecture already has a narrower boundary: planner actions are converted to SafeScale probes in `loops/tick.py` through `_apply_safescale()`, while `safescale_task.py` only observes active probes and emits commit/rollback actions.
+
+### Decision
+
+Keep the existing boundary. `ShrinkForSlotAction` is emitted by the pure planner and consumed by `loops/tick.py`, which starts the SafeScale probe with the concrete donor serve id and records the TP=2 beneficiary as a pending upscale. `safescale_task.py` remains the observer for active probes.
+
+### Consequences
+
+This avoids routing planner output into the observation task and preserves the existing SafeScale lifecycle. The behavior still satisfies N1.2's intent: same-slot shrink is SafeScale-gated, and beneficiary expansion is delayed until after donor shrink commits.

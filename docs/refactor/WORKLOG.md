@@ -652,3 +652,12 @@
 - Updated `ServiceManagerClient.defrag()` to post `{"tp_size": 2}` and keep the previous unsupported fallback for old service-manager 404 responses.
 - Focused verification passed: `service-manager/tests/test_v2_defrag.py service-manager/tests/test_api_v2.py` passed with 10 tests; `controller/tests/test_sm_client.py controller/tests/test_action_queue.py` passed with 12 tests, with an existing asyncio teardown warning from the controller test process.
 - Remaining N1.1 work: add a broader offline integration case for planner-produced defrag followed by scale behavior, then run the full N1 gate after N1.2/N1.3 are complete.
+
+### N1.2 Same-Slot HIGH Shrink Slice
+
+- Added RED planner coverage for the N1.2 priority rule: when a HIGH 1-GPU donor occupies one half of a slot and the mate GPU is free, TP=2 CRITICAL capacity planning emits `ShrinkForSlotAction` instead of `DefragAction`.
+- Implemented `ShrinkForSlotAction` and same-slot donor selection in `tre_controller.planning.planner`; candidates require HIGH state, one-GPU binding, above min replicas, no active/inflight action, and a free slot mate. Ties sort by lowest `Z_m`, then serve id.
+- Added RED loop coverage proving `run_rescue_tick()` converts `ShrinkForSlotAction` into a SafeScale hide probe and records pending upscale for the TP=2 beneficiary.
+- Implemented tick-level SafeScale conversion for `ShrinkForSlotAction`, using the concrete `serve_id` as the probe pod and `{beneficiary: 1}` as pending upscale.
+- Focused verification passed: `controller/tests/test_planner.py controller/tests/test_loop_ticks.py` passed with 19 tests.
+- Design deviation recorded: existing architecture starts SafeScale probes inside `loops/tick.py`; `safescale_task.py` observes active probes. This preserves the current boundary instead of moving planner actions into the observation task.

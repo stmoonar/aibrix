@@ -6,7 +6,7 @@ from typing import Any, Literal
 
 from tre_common.registry import ClusterTopology
 from tre_controller.planning.classify import ModelClassification, ModelRole, ModelState, donor_mock_cost_key
-from tre_sm.allocator.slots import Binding, SlotAllocator
+from tre_sm.allocator.slots import Binding, Slot, SlotAllocator
 
 SourceLoop = Literal["rescue", "fairness"]
 
@@ -61,7 +61,17 @@ class DefragAction:
     source_loop: SourceLoop
 
 
-Action = ScaleAction | HideAction | UnhideAction | DefragAction
+@dataclass(frozen=True)
+class ShrinkForSlotAction:
+    donor: str
+    beneficiary: str
+    serve_id: str
+    slot: Slot
+    reason: str
+    source_loop: SourceLoop
+
+
+Action = ScaleAction | HideAction | UnhideAction | DefragAction | ShrinkForSlotAction
 
 
 @dataclass(frozen=True)
@@ -92,6 +102,7 @@ def build_plan(
     probe_upscale_plans: dict[str, dict[str, int]] = {}
     events: list[str] = []
     remaining_idle = idle_gpus
+    slot_shrink_donors: set[str] = set()
 
     if _paper_state_incomplete(classifications):
         return PlanResult(
@@ -128,6 +139,23 @@ def build_plan(
 
             tp_size = cfg.model_tp_sizes.get(recv.model_name, 1)
             if tp_size > 1 and cluster_view is not None:
+                same_slot_shrink = _try_plan_same_slot_high_shrink(
+                    classifications=classifications,
+                    model_contexts=model_contexts,
+                    model_replicas=model_replicas,
+                    cfg=cfg,
+                    cluster_view=cluster_view,
+                    receiver=recv.model_name,
+                    active_probe_models=active_probe_models,
+                    inflight_models=inflight_models,
+                    source_loop="rescue",
+                )
+                if same_slot_shrink is not None:
+                    actions.append(same_slot_shrink)
+                    slot_shrink_donors.add(same_slot_shrink.donor)
+                    delayed_down_models.add(same_slot_shrink.donor)
+                    continue
+
                 tp_planned = _try_plan_tp_capacity(
                     actions,
                     model=recv.model_name,
@@ -262,6 +290,8 @@ def build_plan(
                 )
 
         for high in high_models:
+            if high.model_name in slot_shrink_donors:
+                continue
             if high.model_name in active_probe_models or high.model_name in inflight_models:
                 continue
             if deltas.get(high.model_name, 0) != 0:
@@ -414,6 +444,67 @@ def build_plan(
             needed -= transfer
 
     return PlanResult(actions, delayed_down_models, probe_upscale_plans, events=events)
+
+
+def _try_plan_same_slot_high_shrink(
+    *,
+    classifications: list[ModelClassification],
+    model_contexts: dict[str, dict[str, Any]],
+    model_replicas: dict[str, int],
+    cfg: PlanConfig,
+    cluster_view: ClusterView,
+    receiver: str,
+    active_probe_models: set[str],
+    inflight_models: set[str],
+    source_loop: SourceLoop,
+) -> ShrinkForSlotAction | None:
+    high_by_model = {item.model_name: item for item in classifications if item.state == ModelState.HIGH}
+    candidates: list[tuple[float, Binding]] = []
+    occupied = {(binding.slot.node, gpu) for binding in cluster_view.bindings for gpu in binding.slot.gpu_ids}
+
+    for binding in cluster_view.bindings:
+        high = high_by_model.get(binding.model)
+        if high is None or binding.model in active_probe_models or binding.model in inflight_models:
+            continue
+        if binding.model == receiver or len(binding.slot.gpu_ids) != 1:
+            continue
+        donor_pods = _effective_assigned_replicas(binding.model, model_contexts, model_replicas)
+        if donor_pods <= cfg.min_replicas_per_model:
+            continue
+        if not _slot_mate_is_free(cluster_view, binding.slot, occupied):
+            continue
+        candidates.append((high.Z_m if high.Z_m is not None else math.inf, binding))
+
+    if not candidates:
+        return None
+
+    _, donor_binding = min(candidates, key=lambda item: (item[0], item[1].serve_id))
+    return ShrinkForSlotAction(
+        donor=donor_binding.model,
+        beneficiary=receiver,
+        serve_id=donor_binding.serve_id,
+        slot=donor_binding.slot,
+        reason="critical_same_slot_high_shrink",
+        source_loop=source_loop,
+    )
+
+
+def _slot_mate_is_free(
+    cluster_view: ClusterView,
+    slot: Slot,
+    occupied: set[tuple[str, int]],
+) -> bool:
+    gpu = slot.gpu_ids[0]
+    for node in cluster_view.topology.nodes:
+        if node.name != slot.node:
+            continue
+        for pair in node.two_gpu_slots:
+            pair = tuple(pair)
+            if gpu not in pair:
+                continue
+            mate = next(item for item in pair if item != gpu)
+            return (slot.node, mate) not in occupied
+    return False
 
 
 def _try_plan_tp_capacity(
