@@ -669,3 +669,44 @@ cd tre && make check && make smoke
 ```
 
 Result: passed with 131 tests and `tre smoke ok` on server 76.
+
+## SafeScale Observation Task
+
+The SafeScale observation slice completes the first runtime half of the SafeScale state-machine integration. Probe start is still handled by the planner tick arbitration layer; this task observes active probes against the latest metrics snapshot and turns terminal state-machine commands into queue actions.
+
+Implemented behavior:
+
+- `SafeScaleStateMachine.active_probes()` exposes the currently probing models for the observer task.
+- `run_safescale_observation_tick()` reads the latest `MetricsSnapshot`, computes the selected health signal for each active probe model, and calls `SafeScaleStateMachine.observe()`.
+- Pending probes produce no queue actions and emit `safescale_probe_pending:<model>`.
+- Commit emits `ScaleAction` commands for donor scale-down plus pending receiver scale-up.
+- Rollback emits an `UnhideAction` for hidden pods.
+- `safescale_task()` polls at `cfg.safescale.probe_poll_seconds` and is added to controller task assembly whenever scaling is enabled and SafeScale is not ablated.
+
+Persistent controller state-store backing remains pending; this slice uses the existing in-memory `SafeScaleStateMachine` constructed at controller startup.
+
+### P5-CTRL-017 SafeScale observation task
+
+RED:
+
+```bash
+PYTHONPATH=tre/common:tre/controller:tre/controller/tests:tre/service-manager python3 -m pytest -q tre/controller/tests/test_safescale_task.py tre/controller/tests/test_controller_app.py
+```
+
+Result: initially failed because `tre_controller.loops.safescale_task` did not exist; after adding a collection stub, failed on `NotImplementedError` and missing app task assembly.
+
+GREEN:
+
+```bash
+PYTHONPATH=tre/common:tre/controller:tre/controller/tests:tre/service-manager python3 -m pytest -q tre/controller/tests/test_safescale_task.py tre/controller/tests/test_controller_app.py
+```
+
+Result: focused SafeScale observation and app wiring tests passed with 8 tests on server 76.
+
+Full slice verification:
+
+```bash
+cd tre && make check && make smoke
+```
+
+Result: passed with 133 tests and `tre smoke ok` on server 76.

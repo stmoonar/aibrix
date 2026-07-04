@@ -80,6 +80,9 @@ class SafeScaleStateMachine:
     def active_probe(self, model: str) -> SafeScaleProbe | None:
         return self._probes.get(model)
 
+    def active_probes(self) -> tuple[SafeScaleProbe, ...]:
+        return tuple(self._probes.values())
+
     def start_probe(
         self,
         *,

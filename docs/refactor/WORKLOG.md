@@ -387,3 +387,14 @@
 - Verified GREEN remotely: focused loop/app tests passed with 16 tests.
 - Full quality gate passed remotely: `git diff --check` was clean, and `cd tre && make check && make smoke` completed with 131 tests and `tre smoke ok`.
 - Next P5 work: SafeScale observation/commit/rollback loop integration and fixture-driven end-to-end replay.
+
+### P5 SafeScale Observation Task Slice
+
+- Re-read `REFACTOR_PLAN.md` completely on remote server 76 before starting the SafeScale observation segment.
+- Inspected controller app assembly, the SafeScale state machine, and the prior SafeScale arbitration boundary.
+- Added RED tests for observation pending/commit behavior, rollback unhide behavior, and runtime task assembly including a SafeScale observer.
+- Verified RED remotely: focused tests first failed on missing `tre_controller.loops.safescale_task`, then on `NotImplementedError` and missing `safescale` task assembly.
+- Implemented `tre_controller.loops.safescale_task`, added `SafeScaleStateMachine.active_probes()`, and wired the observer into controller task specs unless SafeScale is ablated.
+- Verified GREEN remotely: focused SafeScale task/app tests passed with 8 tests.
+- Full quality gate passed remotely: `git diff --check` was clean, and `cd tre && make check && make smoke` completed with 133 tests and `tre smoke ok`.
+- Next P5 work: persistent controller state-store backing for SafeScale recovery, fixture-driven end-to-end tick replay, and fast-loop jitter verification.

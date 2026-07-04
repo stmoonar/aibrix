@@ -12,6 +12,7 @@ from tre_controller.loops.decision_snapshot import DecisionSnapshotWriter
 from tre_controller.loops.fairness_task import fairness_task
 from tre_controller.loops.metrics_task import MetricsTaskConfig, SnapshotBox, SnapshotStore, metrics_task
 from tre_controller.loops.rescue_task import rescue_task
+from tre_controller.loops.safescale_task import safescale_task
 from tre_controller.planning.safescale import SafeScaleStateMachine
 from tre_controller.sm_client import AsyncTransport, ServiceManagerClient
 from tre_controller.store.metrics_store import MetricsStore
@@ -85,6 +86,19 @@ def build_controller_task_specs(
             ),
         )
     )
+    if not bool(getattr(cfg, "ablation_disable_safescale", False)):
+        specs.append(
+            ControllerTaskSpec(
+                "safescale",
+                lambda: safescale_task(
+                    deps.snapshot_box,
+                    queue=deps.queue,
+                    registry=deps.registry,
+                    safescale=deps.safescale,
+                    cfg=cfg,
+                ),
+            )
+        )
     specs.append(ControllerTaskSpec("action_queue", lambda: deps.queue.run()))
     return tuple(specs)
 

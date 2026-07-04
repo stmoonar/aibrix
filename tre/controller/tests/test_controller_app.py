@@ -9,6 +9,7 @@ from tre_controller.loops.cluster_view_task import ClusterViewBox
 from tre_controller.loops.metrics_task import SnapshotBox
 from tre_controller.loops.decision_snapshot import DecisionSnapshotWriter
 from tre_controller.planning.safescale import SafeScaleStateMachine
+from tre_controller.config import SafeScaleConfig
 
 TRE_ROOT = Path(__file__).resolve().parents[2]
 REGISTRY_PATH = TRE_ROOT / "deploy" / "registry.yaml"
@@ -60,6 +61,7 @@ def _cfg(
         monitor_interval_s=20.0,
         rescue_interval_s=5.0,
         fairness_interval_s=10.0,
+        safescale=SafeScaleConfig(probe_poll_seconds=2.0),
     )
 
 
@@ -84,6 +86,7 @@ def test_build_controller_task_specs_includes_all_runtime_tasks_by_default() -> 
         "cluster_view",
         "rescue",
         "fairness",
+        "safescale",
         "action_queue",
     )
 
@@ -91,7 +94,7 @@ def test_build_controller_task_specs_includes_all_runtime_tasks_by_default() -> 
 def test_build_controller_task_specs_honors_fast_loop_ablation() -> None:
     specs = build_controller_task_specs(_deps(), _cfg(ablation_disable_fast_loop=True))
 
-    assert tuple(spec.name for spec in specs) == ("metrics", "cluster_view", "fairness", "action_queue")
+    assert tuple(spec.name for spec in specs) == ("metrics", "cluster_view", "fairness", "safescale", "action_queue")
 
 
 def test_build_controller_task_specs_disables_scaling_tasks_but_keeps_metrics() -> None:
