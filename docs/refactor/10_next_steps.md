@@ -252,7 +252,81 @@ R6 replayer 计时对比 (~0.5h) —— 无依赖，任意空档插队
 - 阶段 tag：`n1-done` … `n4-done`；数据 tag：`traceset-v1`、`results-v1`。
 - 回溯：代码任意 `git checkout <tag>`；集群侧新系统 = 删 `tre-v2` overlay 资源，旧系统 = N3.1 备份 yaml 一键恢复。
 
-## 8. 风险提示
+## 8. 进度复核 v3（2026-07-05）与修订后的下一步
+
+### 8.1 进度结论：N1–N4 全部完成，质量高于预期
+
+亲自复核结果（非转述）：`make check` 220 passed（从 176 增长，N4 修 bug 全部带回归测试）；
+`n1-done`…`n4-done` tag 齐全；`tre-v2` 控制面四组件 Running；旧 TRE 四个 Deployment 已删除且
+restore-ready 备份通过 server dry-run；真机证据链完整（`11_l3_smoke.md`、`12_realenv_tests.md`）。
+
+真机验证已通过的核心能力：
+- 热切换往返 20 轮：wake P95 **0.864s**、sleep P95 1.065s，无绑定漂移、无显存泄漏；
+- 真实负载扩容：dsqwen-7b 重负载下 awake 1→3→4，全程 0 错误、endpoint 不断流；
+- 双模型交替负载 10 分钟：两模型均正确扩容，0 错误；
+- 输出长度漂移小样（A3 预演）：p95 随 max_tokens 单调分层（34.7/430/1246ms），指标管道端到端语义正确；
+- 故障注入：controller/SM 重启恢复、Redis 断 30s 降级不崩、reconcile 从真实 pod 重建状态；
+- 15 分钟 soak：RSS 平稳、Redis 键数有界、0 重启。
+
+N4 期间发现并修复了 7 个只有真机才暴露的实质 bug（routable 标签路由、planner awake/bound
+语义分裂、serving floor、启动期 cluster-view 抢跑、Redis 容错等），全部有回归测试与镜像滚动记录。
+
+### 8.2 修订触发点：三个 justified SKIP 里藏着一个架构级问题
+
+| SKIP | 性质 |
+| --- | --- |
+| N4.1 全拓扑（12 Deployment 要 16 GPU，只有 8） | **架构问题，见 8.3，必须先修** |
+| N4.4 live defrag（`/v2/defrag` 只改状态不真搬 k8s Deployment） | 功能缺口，N4b 补 |
+| N4.6 12h soak（只跑了 15 分钟替代） | 补跑即可，可过夜无人值守 |
+
+另有两个小尾巴：dsllama-8b 至今没上过真机；`12_realenv_tests.md` 末尾"“No n4-done tag"陈述已过时（tag 实际已打），顺手修正。
+
+### 8.3 架构决策 D7：模型 pod 改为 env 显式绑卡，放弃 `nvidia.com/gpu` 资源请求（记 ADR）
+
+**问题**：k8s 为 sleeping pod 一样保留 `nvidia.com/gpu` 配额 → bound 总数 ≤ 物理 GPU 数 →
+"多模型 pod 绑同一 GPU、同时至多一个 awake"这一 TRE 的核心多路复用能力在 k8s 调度语义下不可能实现。
+这不是 manifests 写错，是资源模型选错。
+
+**旧系统证据**：`python/service_manage_aibrix/infra/k8s/runtime_discovery.py:97-129` 显式支持
+`requested_gpu_count == 0` 且从 `NVIDIA_VISIBLE_DEVICES`/`CUDA_VISIBLE_DEVICES` env 解析绑卡的
+pod——旧系统正是 env 绑卡、不占 k8s GPU 配额，才能把多模型 bound 到同一批卡上。
+
+**决策（直接执行，不再讨论）**：
+1. `gen_model_manifests.py` 改为：去掉 `nvidia.com/gpu` requests/limits；注入
+   `NVIDIA_VISIBLE_DEVICES=<GPU-UUID>`（**用 UUID 不用 index**——ADR-0005 已确认 index 不可保证；
+   registry.yaml 的 node 条目增加 `gpu_uuids` 列表，由一次性脚本从两节点 `nvidia-smi -L` 采集写入）；
+   `nodeName` 钉节点。无资源请求的 pod 会绕过 device-plugin，由 nvidia container runtime 直接按
+   env 挂卡，这正是旧系统的工作方式。
+2. GPU 互斥从 k8s 调度器移交给 SlotAllocator（它本来就是唯一分配来源，动作经 ActionQueue 串行化）：
+   - SlotAllocator 增加并测试硬不变式：**同一 GPU 上至多一个 awake binding**（`feasible_wake` 拒绝
+     违例，SM wake 路径强制走该检查，RED 测试先行）；
+   - reconcile 增加校验：发现同 GPU 双 awake（外部干预造成）时告警并自动 sleep 后来者。
+3. 显存安全：sleep 副本 ~1.1GiB/卡（N4 实测），共卡 bound 数按 40GB 卡预算上限 = 1 awake + ≤2 sleeping，
+   `gen_model_manifests.py` 生成时检查每 GPU 的 bound 预算。
+
+### 8.4 修订后的执行顺序
+
+```
+N4b GPU 绑定改造 + 补测（先离线后真机，1 个阶段闭环，tag n4b-done）
+  1. D7 改造：manifests 生成器 + registry gpu_uuids + SlotAllocator 不变式（离线 TDD）
+  2. defrag 补真实 k8s 路径：/v2/defrag 内部走"删旧 Deployment → 新槽生成新 Deployment → wake"
+     （复用 N1.1 编排骨架，把打桩的 ops 换成真 k8s 调用；离线用 fake client 测）
+  3. 真机：单 GPU 绑 dsqwen-7b + dsllama-8b 双 pod，交替 wake/sleep 20 轮（dsllama-8b 首次上真机）
+  4. 真机：全拓扑 12 Deployment 部署（D7 后 16 槽位需求不再受 8 GPU 配额限制），重验 N4.1 清单
+  5. 真机：人工碎片化 → live defrag → 2 卡模型起在完整槽（补 N4.4 的 live PASS）
+  6. 三模型 alternating 场景 + 12h 过夜 soak（无人值守，次日查报告）
+       ↓
+N5 长实验（顺序不变：R1 → R3 → R7 → R2 → R4 → R5；R6 任意空档）
+  - R1 前置已就绪：restore_ready 备份已通过 server dry-run
+  - R3 仍是瓶颈（~30h）：D7 改造不影响单 pod 标定，可与 N4b 的 3–6 步并行排期
+```
+
+N4b 期间同步补两处文档：`05_paper_vs_impl.md` 追加 N4 引入的行为契约（TRS 用 awake 副本数、
+planner awake/bound 语义分层、serving floor），D7 记 ADR-0006。
+
+**N4b 的逐步执行计划见第 10 章。**
+
+## 9. 风险提示
 
 | 风险 | 缓解 |
 | --- | --- |
@@ -262,3 +336,105 @@ R6 replayer 计时对比 (~0.5h) —— 无依赖，任意空档插队
 | theta 回填后行为变化 | golden 对拍锁公式不锁参数；回填后重跑 `make check` 确认 |
 | 76 出网受限拉不到镜像 base | 复用旧镜像层做 base，或外部 build 后 `docker save/load` |
 | soak/长实验写爆 NFS | 长操作前 `df -h`；运行数据写本地盘，只把选定结果拷 NFS |
+
+---
+
+## 10. 阶段 N4b 详细执行计划（v3 新增，当前待执行阶段）
+
+> 六个 slice，每个独立可验证、小步提交，沿用 TDD + WORKLOG + 阶段 tag 纪律。
+> 10.1/10.2 纯离线；10.3 起动真机。R3 标定与 10.3–10.6 无资源冲突时可并行排期。
+
+### 10.1 N4b.1 D7 绑卡改造（离线）
+
+1. **registry 增加 UUID**：`registry.yaml` 的每个 node 条目增加 `gpu_uuids` 列表；写一次性脚本
+   `tre/deploy/collect_gpu_uuids.py` 解析两节点 `nvidia-smi -L` 输出并写入；`load_registry`
+   校验 `len(gpu_uuids) == gpus`，缺失时 `make smoke` 报错。
+2. **manifests 生成器改造（TDD）**，RED 断言：
+   - 生成的 Deployment **不含** `nvidia.com/gpu` requests/limits；
+   - env 含 `NVIDIA_VISIBLE_DEVICES=<uuid>`（tp2 为两个 UUID 逗号连接）；`nodeName` 钉节点；
+   - 保留 `tre.aibrix.io/gpu-ids` label（逻辑 id 继续供 SlotAllocator/UI 使用），另加
+     annotation `tre.aibrix.io/gpu-uuids` 便于审计；
+   - **每 GPU bound 预算检查**：同一 GPU 被引用的 Deployment 数 ≤ 3（1 awake + 2 sleeping，
+     按 40GB 卡与 N4 实测 sleeping ~1.1GiB 预算），超出直接报错拒绝生成。
+3. **SlotAllocator 硬不变式（TDD）**：
+   - RED：同 GPU 已有 awake binding 时 `feasible_wake` 返回 False；`bind(awake=True)` 到已有
+     awake 的 GPU 被拒绝；
+   - SM 所有 wake 路径（target 增加、unhide、defrag 内部 wake）强制过 `feasible_wake`，
+     违例返回 409；
+   - reconcile 检测到同 GPU 双 awake（外部干预造成）时：告警 + 自动 sleep 后 wake 的那个，
+     测试覆盖。
+4. 文档：D7 记 **ADR-0006**（含"k8s 调度器不再感知 GPU"的取舍说明）；`04_service_manager.md`
+   更新资源模型一节。
+
+验收：`make check` 全绿（新增 ≥ 8 测试）；`make manifests` 人工审查输出（无 GPU requests、
+UUID 与节点对应正确、预算检查生效）。
+
+### 10.2 N4b.2 defrag 真实 k8s 路径（离线，fake client）
+
+1. `ops/k8s_ops.py` 增加 `delete_model_deployment` / `create_model_deployment(model, slot)`；
+   **create 必须复用 manifests 生成器的同一模板函数**，禁止在 ops 里手写第二份 pod spec
+   （否则 D7 改造会漂移出两个真相源）。
+2. `/v2/defrag` 编排把打桩 ops 换成真实调用（fake k8s client 测试）：
+   `hide → sleep → delete 旧 Deployment → 等 pod 消失（带超时）→ create 新槽 Deployment →
+   等 Ready（带超时）→ wake → unhide`；任一步超时/失败即中止，返回已执行/已回滚清单。
+3. **幂等与崩溃恢复测试**：defrag 中途 crash 后，`POST /v2/reconcile` 能把 binding 与真实
+   pod 状态收敛一致；重复调用 defrag 不产生重复迁移。
+
+验收：`make check`；P9 离线集成 case 更新为走真实 ops 代码路径（fake client），
+"碎片夹具 → defrag → 2 卡模型可扩"仍通过。
+
+### 10.3 N4b.3 真机：单卡双模型共卡热切换（dsllama-8b 首次上真机）
+
+> **先做 canary**：D7 无资源请求的 pod 依赖 nvidia container runtime 按 env 挂卡。在
+> gpu-operator 环境下先单独 apply 一个 D7 版 dsqwen-7b pod 验证：容器内能看到且只能看到
+> 指定 UUID 的卡。若看不到卡，fallback 方案按序尝试：显式 `runtimeClassName: nvidia` →
+> privileged + `/dev/nvidia*` hostPath（旧系统等效方式）。canary 结论记 WORKLOG 后再全量。
+
+1. 选 node9 GPU0：部署 `dsqwen-7b` 与 `dsllama-8b` 两个 Deployment 绑同一 UUID（D7 后无配额冲突）。
+2. 初始态：7b awake、8b sleeping；校验 `nvidia-smi` 单卡显存 ≈ 1 awake(~37G) + 1 sleeping(~1.1G)。
+3. 脚本 20 轮交替：`sleep 7b → wake 8b → 经 gateway 请求 8b 20 条 → sleep 8b → wake 7b →
+   请求 7b 20 条`；**wake 前必须确认对方 `/is_sleeping: true`**（sleep 是异步的，SM 编排
+   必须串行化这个确认，不能只看下发成功）。
+4. 反向测试：对已有 awake 的卡直接调 SM wake → 被 `feasible_wake` 拒绝（409），全程无双 awake。
+
+验收：20 轮无 OOM、无双 awake、wake P95 < 5s、gateway 0 错误；切换耗时分布记入
+`12_realenv_tests.md`。
+
+### 10.4 N4b.4 真机：全拓扑部署（重验 N4.1）
+
+1. apply 全部 12 个模型 Deployment（10.1 预算检查通过的布局）；每模型 target 1 awake。
+2. 验收清单：全部 pod Running 且绑定正确；`/v2/state` bound=12、awake=3；两节点 `nvidia-smi`
+   显存分布与 awake 集合一致；`POST /v2/reconcile` 无 warnings；三模型各经 gateway 发 20 条
+   请求 0 错误。
+3. `12_realenv_tests.md` 的 N4.1 由 SKIP 更新为 live PASS。
+
+### 10.5 N4b.5 真机：live defrag 与同槽先缩（重验 N4.4）
+
+1. 人工造碎片：两个 1 卡模型分别 wake 到同节点两个 slot 的各一半。
+2. 对 dsqwen-14b 加压/直接调 target 请求扩容 → 观察依次触发：HIGH 同槽先缩（若构造了 HIGH
+   donor）或 `/v2/defrag` 真实搬迁 → 14b 起在完整 2 卡槽。
+3. 验收：搬迁全程 gateway 无 5xx（hide-route 生效）；迁移后 reconcile 无 warnings；
+   `12_realenv_tests.md` 的 N4.4 更新为 live PASS。
+
+### 10.6 N4b.6 三模型交替 + 12 小时过夜 soak（重验 N4.6）
+
+1. 三模型 alternating 脚本先跑 15 分钟功能预验（0 错误、三模型均正确扩缩）。
+2. 12h soak 无人值守跑：低压三模型轮询，每小时采样 controller/SM RSS、Redis DBSIZE、
+   `/v2/state`、pod 重启数；`nohup` 挂后台，输出写本地盘（不写 NFS），次日汇总报告。
+3. 验收：无 RSS 增长趋势、无重启、0 请求错误、Redis 键数有界。
+
+### 10.7 N4b 收尾 gate
+
+- `make check` 全绿；`12_realenv_tests.md` 三处 SKIP（N4.1/N4.4/N4.6）全部更新为 live PASS
+  （含证据）；顺手修正文末过时的 "No `n4-done` tag" 陈述；WORKLOG 补全；tag **`n4b-done`**。
+- 收尾后立即进入 N5（第 6 章顺序不变：R1 → R3 → R7 → R2 → R4 → R5）；R3 若已并行开跑，
+  在 `13_experiments_log.md` 登记其输出目录与 commit。
+
+### 10.8 N4b 特有风险
+
+| 风险 | 缓解 |
+| --- | --- |
+| 无资源请求 pod 在 gpu-operator 环境下看不到卡 | 10.3 的 canary 先行；fallback 链：`runtimeClassName: nvidia` → privileged + hostPath；结论记 ADR-0006 |
+| k8s 调度器不再感知 GPU，误调度重叠 | 集群独占 + `nodeName` 钉死 + SlotAllocator 唯一真相源；reconcile 双 awake 自愈兜底 |
+| 共卡 wake 时对方 sleep 未完成导致瞬时双占显存 | wake 编排串行化，必须确认 `/is_sleeping: true` 后才 wake，超时则中止并告警 |
+| defrag 删建期间容量临时下降 | defrag 前置条件加"该模型 awake ≥ 2 或处于非 CRITICAL"，避免删掉唯一副本 |
