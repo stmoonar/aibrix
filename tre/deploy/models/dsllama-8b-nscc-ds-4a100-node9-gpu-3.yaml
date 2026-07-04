@@ -1,31 +1,31 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: dsllama-8b-node-75-gpu-3
+  name: dsllama-8b-nscc-ds-4a100-node9-gpu-3
   namespace: default
   labels:
     model.aibrix.ai/name: dsllama-8b
     model.aibrix.ai/port: '8000'
     tre.aibrix.io/managed: 'true'
-    tre.aibrix.io/node: node-75
+    tre.aibrix.io/node: nscc-ds-4a100-node9
     tre.aibrix.io/gpu-ids: '3'
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: dsllama-8b-node-75-gpu-3
+      app: dsllama-8b-nscc-ds-4a100-node9-gpu-3
   template:
     metadata:
       labels:
         model.aibrix.ai/name: dsllama-8b
         model.aibrix.ai/port: '8000'
         tre.aibrix.io/managed: 'true'
-        tre.aibrix.io/node: node-75
+        tre.aibrix.io/node: nscc-ds-4a100-node9
         tre.aibrix.io/gpu-ids: '3'
-        app: dsllama-8b-node-75-gpu-3
+        app: dsllama-8b-nscc-ds-4a100-node9-gpu-3
     spec:
       nodeSelector:
-        kubernetes.io/hostname: node-75
+        kubernetes.io/hostname: nscc-ds-4a100-node9
       volumes:
       - name: shm
         emptyDir:

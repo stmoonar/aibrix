@@ -1,31 +1,31 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: dsqwen-14b-node-76-gpu-2-3
+  name: dsqwen-14b-nscc-ds-4a100-node9-gpu-2-3
   namespace: default
   labels:
     model.aibrix.ai/name: dsqwen-14b
     model.aibrix.ai/port: '8000'
     tre.aibrix.io/managed: 'true'
-    tre.aibrix.io/node: node-76
+    tre.aibrix.io/node: nscc-ds-4a100-node9
     tre.aibrix.io/gpu-ids: 2,3
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: dsqwen-14b-node-76-gpu-2-3
+      app: dsqwen-14b-nscc-ds-4a100-node9-gpu-2-3
   template:
     metadata:
       labels:
         model.aibrix.ai/name: dsqwen-14b
         model.aibrix.ai/port: '8000'
         tre.aibrix.io/managed: 'true'
-        tre.aibrix.io/node: node-76
+        tre.aibrix.io/node: nscc-ds-4a100-node9
         tre.aibrix.io/gpu-ids: 2,3
-        app: dsqwen-14b-node-76-gpu-2-3
+        app: dsqwen-14b-nscc-ds-4a100-node9-gpu-2-3
     spec:
       nodeSelector:
-        kubernetes.io/hostname: node-76
+        kubernetes.io/hostname: nscc-ds-4a100-node9
       volumes:
       - name: shm
         emptyDir:

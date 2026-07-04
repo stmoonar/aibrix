@@ -1,13 +1,13 @@
 cluster:
   nodes:
-  - name: node-75
+  - name: nscc-ds-4a100-node9
     gpus: 4
     two_gpu_slots:
     - - 0
       - 1
     - - 2
       - 3
-  - name: node-76
+  - name: nscc-ds-4a100-node10
     gpus: 4
     two_gpu_slots:
     - - 0

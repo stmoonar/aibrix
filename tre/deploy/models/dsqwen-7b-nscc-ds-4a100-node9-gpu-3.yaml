@@ -1,31 +1,31 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: dsqwen-7b-node-75-gpu-2
+  name: dsqwen-7b-nscc-ds-4a100-node9-gpu-3
   namespace: default
   labels:
     model.aibrix.ai/name: dsqwen-7b
     model.aibrix.ai/port: '8000'
     tre.aibrix.io/managed: 'true'
-    tre.aibrix.io/node: node-75
-    tre.aibrix.io/gpu-ids: '2'
+    tre.aibrix.io/node: nscc-ds-4a100-node9
+    tre.aibrix.io/gpu-ids: '3'
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: dsqwen-7b-node-75-gpu-2
+      app: dsqwen-7b-nscc-ds-4a100-node9-gpu-3
   template:
     metadata:
       labels:
         model.aibrix.ai/name: dsqwen-7b
         model.aibrix.ai/port: '8000'
         tre.aibrix.io/managed: 'true'
-        tre.aibrix.io/node: node-75
-        tre.aibrix.io/gpu-ids: '2'
-        app: dsqwen-7b-node-75-gpu-2
+        tre.aibrix.io/node: nscc-ds-4a100-node9
+        tre.aibrix.io/gpu-ids: '3'
+        app: dsqwen-7b-nscc-ds-4a100-node9-gpu-3
     spec:
       nodeSelector:
-        kubernetes.io/hostname: node-75
+        kubernetes.io/hostname: nscc-ds-4a100-node9
       volumes:
       - name: shm
         emptyDir:
@@ -61,7 +61,7 @@ spec:
         - '16'
         env:
         - name: CUDA_VISIBLE_DEVICES
-          value: '2'
+          value: '3'
         - name: VLLM_SERVER_DEV_MODE
           value: '1'
         - name: VLLM_WORKER_MULTIPROC_METHOD

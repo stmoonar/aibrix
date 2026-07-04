@@ -1,31 +1,31 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: dsqwen-14b-node-75-gpu-2-3
+  name: dsqwen-7b-nscc-ds-4a100-node9-gpu-1
   namespace: default
   labels:
-    model.aibrix.ai/name: dsqwen-14b
+    model.aibrix.ai/name: dsqwen-7b
     model.aibrix.ai/port: '8000'
     tre.aibrix.io/managed: 'true'
-    tre.aibrix.io/node: node-75
-    tre.aibrix.io/gpu-ids: 2,3
+    tre.aibrix.io/node: nscc-ds-4a100-node9
+    tre.aibrix.io/gpu-ids: '1'
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: dsqwen-14b-node-75-gpu-2-3
+      app: dsqwen-7b-nscc-ds-4a100-node9-gpu-1
   template:
     metadata:
       labels:
-        model.aibrix.ai/name: dsqwen-14b
+        model.aibrix.ai/name: dsqwen-7b
         model.aibrix.ai/port: '8000'
         tre.aibrix.io/managed: 'true'
-        tre.aibrix.io/node: node-75
-        tre.aibrix.io/gpu-ids: 2,3
-        app: dsqwen-14b-node-75-gpu-2-3
+        tre.aibrix.io/node: nscc-ds-4a100-node9
+        tre.aibrix.io/gpu-ids: '1'
+        app: dsqwen-7b-nscc-ds-4a100-node9-gpu-1
     spec:
       nodeSelector:
-        kubernetes.io/hostname: node-75
+        kubernetes.io/hostname: nscc-ds-4a100-node9
       volumes:
       - name: shm
         emptyDir:
@@ -49,17 +49,19 @@ spec:
         - --uvicorn-log-level
         - warning
         - --model
-        - /data/nfs_shared_data/Models/DeepSeek-R1-Distill-Qwen-14B
+        - /data/nfs_shared_data/Qwen1.5-7B-Chat
         - --served-model-name
-        - dsqwen-14b
+        - dsqwen-7b
         - --enable_sleep_mode
-        - --tensor-parallel-size
-        - '2'
-        - --max-model-len
-        - '12288'
+        - --no-enable-prefix-caching
+        - --enable-chunked-prefill
+        - --max-num-batched-tokens
+        - '2048'
+        - --swap-space
+        - '16'
         env:
         - name: CUDA_VISIBLE_DEVICES
-          value: 2,3
+          value: '1'
         - name: VLLM_SERVER_DEV_MODE
           value: '1'
         - name: VLLM_WORKER_MULTIPROC_METHOD
@@ -71,9 +73,9 @@ spec:
           protocol: TCP
         resources:
           limits:
-            nvidia.com/gpu: '2'
+            nvidia.com/gpu: '1'
           requests:
-            nvidia.com/gpu: '2'
+            nvidia.com/gpu: '1'
         volumeMounts:
         - name: shm
           mountPath: /dev/shm
