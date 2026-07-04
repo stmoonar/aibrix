@@ -31,6 +31,34 @@ class FakeRedis:
             bucket[str(field).encode("utf-8")] = str(value).encode("utf-8")
 
 
+
+
+class FakeRuntimeOps:
+    def __init__(self, snapshots):
+        self._snapshots = list(snapshots)
+        self.annotations = []
+
+    def list_pod_snapshots(self, *, model=None):
+        if model is None:
+            return list(self._snapshots)
+        return [snapshot for snapshot in self._snapshots if snapshot.model == model]
+
+    def write_binding_annotations(self, binding, *, state):
+        self.annotations.append((binding.serve_id, state))
+
+
+class FakeVllmOps:
+    def __init__(self):
+        self.calls = []
+
+    def sleep(self, pod_ip, *, port=None):
+        self.calls.append(("sleep", pod_ip, port))
+        return type("Result", (), {"success": True, "message": ""})()
+
+    def wake_up(self, pod_ip, *, port=None):
+        self.calls.append(("wake_up", pod_ip, port))
+        return type("Result", (), {"success": True, "message": ""})()
+
 class FakeK8sClient:
     def __init__(self, pods):
         self._pods = list(pods)
@@ -335,3 +363,59 @@ def test_v2_reconcile_route_delegates_to_service_layer():
     assert response.status_code == 200
     assert response.json()["version"] == 2
     assert response.json()["warnings"] == ["serve-a: pod reality overrides persisted binding"]
+
+
+def test_v2_put_target_calls_vllm_and_pod_annotations_for_existing_bindings():
+    from tre_sm.allocator.topology import K8sPodSnapshot
+
+    store = StateStore(FakeRedis())
+    store.save(
+        [
+            Binding("serve-a", "m1", Slot("node-a", (0,)), awake=True),
+            Binding("serve-b", "m1", Slot("node-a", (1,)), awake=False),
+        ],
+        expected_version=0,
+    )
+    runtime_ops = FakeRuntimeOps(
+        [
+            K8sPodSnapshot(
+                name="serve-a",
+                model="m1",
+                node="node-a",
+                env={"CUDA_VISIBLE_DEVICES": "0"},
+                pod_ip="10.0.0.1",
+            ),
+            K8sPodSnapshot(
+                name="serve-b",
+                model="m1",
+                node="node-a",
+                env={"CUDA_VISIBLE_DEVICES": "1"},
+                pod_ip="10.0.0.2",
+            ),
+        ]
+    )
+    vllm_ops = FakeVllmOps()
+    service = ServiceManagerV2(registry(), store, runtime_ops=runtime_ops, vllm_ops=vllm_ops)
+
+    down = service.put_model_target("m1", wake_replicas=0)
+    up = service.put_model_target("m1", wake_replicas=2)
+
+    assert down["actions"] == [{"action": "sleep", "serve_id": "serve-a"}]
+    assert up["actions"] == [
+        {"action": "wake", "serve_id": "serve-a"},
+        {"action": "wake", "serve_id": "serve-b"},
+    ]
+    assert vllm_ops.calls == [
+        ("sleep", "10.0.0.1", 8000),
+        ("wake_up", "10.0.0.1", 8000),
+        ("wake_up", "10.0.0.2", 8000),
+    ]
+    assert runtime_ops.annotations == [
+        ("serve-a", "sleeping"),
+        ("serve-a", "awake"),
+        ("serve-b", "awake"),
+    ]
+    assert store.load().bindings == [
+        Binding("serve-a", "m1", Slot("node-a", (0,)), awake=True),
+        Binding("serve-b", "m1", Slot("node-a", (1,)), awake=True),
+    ]

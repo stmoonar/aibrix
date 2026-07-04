@@ -49,6 +49,7 @@ class K8sOps:
                     node=str(_field(spec, "nodeName", "node_name")),
                     env=_container_env(pod),
                     annotations=dict(metadata.get("annotations") or {}),
+                    pod_ip=_optional_field(_status(pod), "podIP", "pod_ip"),
                 )
             )
         return sorted(snapshots, key=lambda item: item.name)
@@ -103,6 +104,12 @@ def _field(section: dict, camel: str, snake: str):
     if camel in section:
         return section[camel]
     return section[snake]
+
+
+def _optional_field(section: dict, camel: str, snake: str):
+    if camel in section:
+        return section[camel]
+    return section.get(snake)
 
 
 def _items(value):

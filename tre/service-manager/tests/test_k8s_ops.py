@@ -33,7 +33,7 @@ def pod_dict(name, model, node, cuda, *, phase="Running", annotations=None, dele
                 }
             ],
         },
-        "status": {"phase": phase},
+        "status": {"phase": phase, "podIP": "10.0.0.9"},
     }
 
 
@@ -100,6 +100,7 @@ def test_k8s_ops_lists_running_pod_snapshots_and_applies_model_selector():
             node="node-a",
             env={"CUDA_VISIBLE_DEVICES": "0"},
             annotations={STATE_ANNOTATION: "sleeping"},
+            pod_ip="10.0.0.9",
         )
     ]
 
@@ -116,6 +117,7 @@ def test_k8s_ops_accepts_kubernetes_pod_list_objects():
             node="node-a",
             env={"CUDA_VISIBLE_DEVICES": "0"},
             annotations={},
+            pod_ip="10.0.0.9",
         )
     ]
 

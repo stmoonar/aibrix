@@ -3,7 +3,7 @@ from __future__ import annotations
 from fastapi import FastAPI
 
 from tre_common.registry import Registry
-from tre_sm.api.v2 import ServiceManagerV2, create_app
+from tre_sm.api.v2 import RuntimePodOps, ServiceManagerV2, VllmRuntimeOps, create_app
 from tre_sm.state.reconcile import K8sPodClient
 from tre_sm.state.store import StateStore
 
@@ -13,5 +13,15 @@ def create_service_app(
     store: StateStore,
     *,
     k8s_client: K8sPodClient | None = None,
+    runtime_ops: RuntimePodOps | None = None,
+    vllm_ops: VllmRuntimeOps | None = None,
 ) -> FastAPI:
-    return create_app(ServiceManagerV2(registry, store, k8s_client=k8s_client))
+    return create_app(
+        ServiceManagerV2(
+            registry,
+            store,
+            k8s_client=k8s_client,
+            runtime_ops=runtime_ops,
+            vllm_ops=vllm_ops,
+        )
+    )

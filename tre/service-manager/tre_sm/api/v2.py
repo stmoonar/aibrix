@@ -1,16 +1,31 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from typing import Protocol
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 from tre_common.registry import Registry
 from tre_sm.allocator.slots import Binding, Migration, Slot, SlotAllocator
-from tre_sm.state.reconcile import K8sPodClient, reconcile_state
+from tre_sm.allocator.topology import K8sPodSnapshot
+from tre_sm.state.reconcile import K8sPodClient, POD_STATE_AWAKE, POD_STATE_SLEEPING, reconcile_state
 from tre_sm.state.store import StateStore
 from tre_sm.api.v1_compat import create_v1_compat_router
 
+
+
+
+class RuntimePodOps(Protocol):
+    def list_pod_snapshots(self, *, model: str | None = None) -> list[K8sPodSnapshot]: ...
+
+    def write_binding_annotations(self, binding: Binding, *, state: str) -> None: ...
+
+
+class VllmRuntimeOps(Protocol):
+    def sleep(self, pod_ip: str, *, port: int | None = None): ...
+
+    def wake_up(self, pod_ip: str, *, port: int | None = None): ...
 
 class ServiceManagerV2:
     def __init__(
@@ -19,10 +34,14 @@ class ServiceManagerV2:
         store: StateStore,
         *,
         k8s_client: K8sPodClient | None = None,
+        runtime_ops: RuntimePodOps | None = None,
+        vllm_ops: VllmRuntimeOps | None = None,
     ) -> None:
         self._registry = registry
         self._store = store
         self._k8s_client = k8s_client
+        self._runtime_ops = runtime_ops
+        self._vllm_ops = vllm_ops
 
     def get_state(self) -> dict:
         snapshot = self._store.load()
@@ -49,6 +68,7 @@ class ServiceManagerV2:
             sleeping = [binding for binding in model_bindings if not binding.awake]
             wake_existing = min(wake_replicas - len(awake), len(sleeping))
             for binding in sleeping[:wake_existing]:
+                self._apply_runtime_power_action(binding, action="wake")
                 updated_by_serve[binding.serve_id] = replace(binding, awake=True)
                 actions.append({"action": "wake", "serve_id": binding.serve_id})
             create_count = wake_replicas - len(awake) - wake_existing
@@ -73,6 +93,7 @@ class ServiceManagerV2:
                     )
         elif len(awake) > wake_replicas:
             for binding in reversed(awake[wake_replicas:]):
+                self._apply_runtime_power_action(binding, action="sleep")
                 updated_by_serve[binding.serve_id] = replace(binding, awake=False)
                 actions.append({"action": "sleep", "serve_id": binding.serve_id})
 
@@ -168,6 +189,34 @@ class ServiceManagerV2:
             "warnings": result.warnings,
             "bindings": [self._binding_dict(binding) for binding in result.bindings],
         }
+
+    def _apply_runtime_power_action(self, binding: Binding, *, action: str) -> None:
+        if self._runtime_ops is None or self._vllm_ops is None:
+            return
+        snapshot = self._snapshot_for_binding(binding)
+        if not snapshot.pod_ip:
+            raise ValueError(f"pod {binding.serve_id} has no pod IP for {action}")
+
+        if action == "sleep":
+            result = self._vllm_ops.sleep(snapshot.pod_ip, port=8000)
+            state = POD_STATE_SLEEPING
+        elif action == "wake":
+            result = self._vllm_ops.wake_up(snapshot.pod_ip, port=8000)
+            state = POD_STATE_AWAKE
+        else:
+            raise ValueError(f"unknown runtime action: {action}")
+
+        if not bool(getattr(result, "success", False)):
+            message = getattr(result, "message", "") or "operation failed"
+            raise ValueError(f"vLLM {action} failed for {binding.serve_id}: {message}")
+        self._runtime_ops.write_binding_annotations(binding, state=state)
+
+    def _snapshot_for_binding(self, binding: Binding) -> K8sPodSnapshot:
+        snapshots = self._runtime_ops.list_pod_snapshots(model=binding.model) if self._runtime_ops else []
+        for snapshot in snapshots:
+            if snapshot.name == binding.serve_id:
+                return snapshot
+        raise ValueError(f"pod {binding.serve_id} not found for runtime operation")
 
     def _model_counts(self, bindings: list[Binding]) -> dict[str, dict[str, int]]:
         counts = {model.name: {"awake": 0, "bound": 0} for model in self._registry.models()}

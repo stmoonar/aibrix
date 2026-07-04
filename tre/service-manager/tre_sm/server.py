@@ -10,6 +10,7 @@ from tre_common.registry import load_registry
 from tre_sm.allocator.topology import K8sPodSnapshot, pod_records_from_snapshots
 from tre_sm.app import create_service_app
 from tre_sm.ops.k8s_ops import K8sOps
+from tre_sm.ops.vllm_ops import VllmOps
 from tre_sm.state.reconcile import PodRecord
 from tre_sm.state.store import StateStore
 
@@ -35,14 +36,21 @@ def create_app() -> FastAPI:
 
     registry = load_registry(os.environ.get("TRE_REGISTRY_PATH"))
     redis_url = os.environ.get("TRE_REDIS_URL", "redis://aibrix-redis-master:6379/0")
+    k8s_ops = _create_k8s_ops()
     return create_service_app(
         registry,
         StateStore(redis.Redis.from_url(redis_url)),
-        k8s_client=_create_k8s_pod_client(registry.topology()),
+        k8s_client=K8sPodClientFromOps(registry.topology(), k8s_ops),
+        runtime_ops=k8s_ops,
+        vllm_ops=VllmOps(),
     )
 
 
 def _create_k8s_pod_client(topology: ClusterTopology) -> K8sPodClientFromOps:
+    return K8sPodClientFromOps(topology, _create_k8s_ops())
+
+
+def _create_k8s_ops() -> K8sOps:
     try:
         from kubernetes import client, config  # type: ignore[import-not-found]
     except ModuleNotFoundError as exc:
@@ -54,4 +62,4 @@ def _create_k8s_pod_client(topology: ClusterTopology) -> K8sPodClientFromOps:
         config.load_kube_config()
 
     namespace = os.environ.get("TRE_MODEL_NAMESPACE", os.environ.get("TARGET_NAMESPACE", "default"))
-    return K8sPodClientFromOps(topology, K8sOps(api=client.CoreV1Api(), namespace=namespace))
+    return K8sOps(api=client.CoreV1Api(), namespace=namespace)
