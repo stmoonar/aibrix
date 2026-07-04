@@ -365,3 +365,14 @@
 - Verified GREEN remotely: focused decision snapshot/app/loop tests passed with 16 tests.
 - Full quality gate passed remotely: `git diff --check` was clean, and `cd tre && make check && make smoke` completed with 125 tests and `tre smoke ok`.
 - Next P5 work: fixture-driven end-to-end tick replay and remaining SafeScale/slot-aware donor integration.
+
+### P5 Signal Source Slice
+
+- Re-read `REFACTOR_PLAN.md` completely on remote server 76 before starting the signal-source segment.
+- Inspected current config, TRS tick context construction, classification inputs, registry schema, and loop tests; confirmed `TRE_SIGNAL_SOURCE` was parsed but not wired into decisions.
+- Added RED tests for `zm`, `latency_p95`, and `queue_len` signal normalization plus a rescue tick that changes classification under `latency_p95`.
+- Verified RED remotely: focused tests first failed on the missing `tre_controller.signals.sources` module, then on `NotImplementedError` and missing `signal_source` tick parameter.
+- Implemented `tre_controller.signals.sources`, preserved default `zm` behavior, and threaded `cfg.signal_source` through rescue/fairness wrappers into the pure tick path.
+- Verified GREEN remotely: focused signal source and loop tests passed with 13 tests.
+- Full quality gate passed remotely: `git diff --check` was clean, and `cd tre && make check && make smoke` completed with 130 tests and `tre smoke ok`.
+- Next P5 work: fixture-driven end-to-end tick replay, SafeScale loop integration, and remaining slot-aware donor behavior.

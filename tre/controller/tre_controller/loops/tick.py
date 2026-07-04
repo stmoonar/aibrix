@@ -7,6 +7,7 @@ from tre_common.metrics_schema import MetricsSnapshot, ModelWindowMetrics
 from tre_common.registry import Registry, ModelSpec
 from tre_controller.planning.classify import classify_all_models
 from tre_controller.planning.planner import Action, ClusterView, PlanConfig, build_plan
+from tre_controller.signals.sources import get_signal
 from tre_controller.signals.trs import TRSComputer, TRSInput
 
 
@@ -32,11 +33,12 @@ def run_planner_tick(
     fairness_due: bool,
     cluster_view: ClusterView | None = None,
     active_probe_models: set[str] | None = None,
+    signal_source: str = "zm",
 ) -> LoopTickResult:
     if snapshot.stale:
         return LoopTickResult(submitted=0, events=("snapshot_stale",))
 
-    contexts = _model_contexts(snapshot, registry)
+    contexts = _model_contexts(snapshot, registry, signal_source=signal_source)
     classifications = classify_all_models(contexts)
     replicas = {model: int(ctx.get("assigned_replicas", 0)) for model, ctx in contexts.items()}
     cfg = PlanConfig(
@@ -62,14 +64,19 @@ def run_planner_tick(
     return LoopTickResult(submitted=len(actions), actions=actions, events=tuple(plan.events))
 
 
-def _model_contexts(snapshot: MetricsSnapshot, registry: Registry) -> dict[str, dict]:
+def _model_contexts(snapshot: MetricsSnapshot, registry: Registry, *, signal_source: str = "zm") -> dict[str, dict]:
     contexts: dict[str, dict] = {}
     for model_name, metrics in snapshot.models.items():
         spec = registry.model(model_name)
         result = TRSComputer(ema_alpha=spec.trs.ema_alpha).compute(TRSInput.from_metrics(metrics, spec.trs), theta_m=spec.trs.theta_m)
+        signal = get_signal(metrics, spec, signal_source, trs_z_m=result.Z_m)
         contexts[model_name] = {
             "trs": result.TRS,
-            "z_m": result.Z_m,
+            "z_m": signal.z_m,
+            "signal_source": signal.source,
+            "signal_raw_value": signal.raw_value,
+            "signal_unavailable_reason": signal.unavailable_reason,
+            "trs_z_m": result.Z_m,
             "eta_m": result.eta_m,
             "theta_m": spec.trs.theta_m,
             "Q": result.Q,

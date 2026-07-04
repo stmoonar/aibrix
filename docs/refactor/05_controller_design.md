@@ -590,3 +590,42 @@ cd tre && make check && make smoke
 ```
 
 Result: passed with 125 tests and `tre smoke ok` on server 76.
+
+## Signal Source Contract
+
+The signal-source slice wires `TRE_SIGNAL_SOURCE` into planner tick classification without changing the default `zm` behavior. `tre_controller.signals.sources.get_signal()` returns a `SignalValue` with the selected source, raw value, normalized health value, and an unavailable reason when a source cannot be computed.
+
+Implemented sources:
+
+- `zm`: uses the TRS-derived `Z_m` unchanged.
+- `latency_p95`: uses the worst SLO health ratio across available TTFT, TPOT, and E2E p95 samples; values below 1.0 classify as unhealthy under the existing tau bands.
+- `queue_len`: normalizes the TRS control queue by `qsat`, so larger queues reduce health.
+- `kv_cache`: uses the available cache hit-rate as a provisional health signal against a 0.5 neutral point until calibration emits explicit alternate thresholds.
+
+The loop wrappers read `cfg.signal_source` and pass it into the pure tick path. The context keeps both `z_m` for the selected signal and `trs_z_m` for diagnostics.
+
+### P5-CTRL-015 signal sources
+
+RED:
+
+```bash
+PYTHONPATH=tre/common:tre/controller:tre/controller/tests:tre/service-manager python3 -m pytest -q tre/controller/tests/test_signal_sources.py tre/controller/tests/test_loop_ticks.py
+```
+
+Result: initially failed because `tre_controller.signals.sources` did not exist; after adding a collection stub, failed on unimplemented source behavior and missing `signal_source` tick parameter.
+
+GREEN:
+
+```bash
+PYTHONPATH=tre/common:tre/controller:tre/controller/tests:tre/service-manager python3 -m pytest -q tre/controller/tests/test_signal_sources.py tre/controller/tests/test_loop_ticks.py
+```
+
+Result: focused signal source and loop tests passed with 13 tests on server 76.
+
+Full slice verification:
+
+```bash
+cd tre && make check && make smoke
+```
+
+Result: passed with 130 tests and `tre smoke ok` on server 76.

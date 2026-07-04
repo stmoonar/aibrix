@@ -32,6 +32,7 @@ def run_fairness_tick(
     registry: Registry,
     cluster_view: ClusterView | None = None,
     active_probe_models: set[str] | None = None,
+    signal_source: str = "zm",
 ) -> LoopTickResult:
     return run_planner_tick(
         snapshot,
@@ -41,6 +42,7 @@ def run_fairness_tick(
         fairness_due=True,
         cluster_view=cluster_view,
         active_probe_models=active_probe_models,
+        signal_source=signal_source,
     )
 
 
@@ -65,6 +67,7 @@ async def fairness_task(
                 registry=registry,
                 cluster_view=_current_cluster_view(cluster_view, cluster_view_box),
                 active_probe_models=active_probe_models,
+                signal_source=getattr(cfg, "signal_source", "zm"),
             )
             if decision_writer is not None:
                 decision_writer.write("fairness", snapshot, result)
