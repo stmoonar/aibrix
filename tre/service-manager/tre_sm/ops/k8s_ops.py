@@ -32,21 +32,23 @@ class K8sOps:
         pods = _items(self._api.list_namespaced_pod(namespace=self._namespace, label_selector=selector))
         snapshots: list[K8sPodSnapshot] = []
         for pod in pods:
-            if _metadata(pod).get("deletionTimestamp"):
+            metadata = _metadata(pod)
+            spec = _spec(pod)
+            if _field(metadata, "deletionTimestamp", "deletion_timestamp"):
                 continue
             if _status(pod).get("phase") != "Running":
                 continue
-            labels = _metadata(pod).get("labels") or {}
+            labels = metadata.get("labels") or {}
             model_name = labels.get(MODEL_LABEL)
             if not model_name:
                 continue
             snapshots.append(
                 K8sPodSnapshot(
-                    name=str(_metadata(pod)["name"]),
+                    name=str(metadata["name"]),
                     model=str(model_name),
-                    node=str(_spec(pod)["nodeName"]),
+                    node=str(_field(spec, "nodeName", "node_name")),
                     env=_container_env(pod),
-                    annotations=dict(_metadata(pod).get("annotations") or {}),
+                    annotations=dict(metadata.get("annotations") or {}),
                 )
             )
         return sorted(snapshots, key=lambda item: item.name)
@@ -95,6 +97,12 @@ def _container_env(pod) -> dict[str, str]:
             if item.get("name") == CUDA_VISIBLE_DEVICES:
                 env[CUDA_VISIBLE_DEVICES] = str(item.get("value", ""))
     return env
+
+
+def _field(section: dict, camel: str, snake: str):
+    if camel in section:
+        return section[camel]
+    return section[snake]
 
 
 def _items(value):
