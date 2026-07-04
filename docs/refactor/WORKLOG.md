@@ -849,3 +849,14 @@
 ### N4b Next
 
 - Continue with 10.3 canary first. Before full rollout, apply one no-GPU-request D7 pod and prove the container sees only the UUID named in `NVIDIA_VISIBLE_DEVICES`; record the result in WORKLOG before deploying dsqwen-7b + dsllama-8b together.
+
+### N4b.3 D7 Runtime Canary
+
+- Pre-canary read-only state:
+  - Existing model pods were already running from prior N4: four `dsqwen-7b` pods on node9 and two `dsqwen-14b` pods on node10.
+  - node9 GPU memory: GPU0 1118 MiB, GPU1 1118 MiB, GPU2 36956 MiB, GPU3 1118 MiB. Canary selected node9 GPU0, which only had sleeping-level memory.
+- Applied a temporary pod manifest from `/tmp/tre-n4b-d7-canary.json` in `default`. It used the vLLM image, no `nvidia.com/gpu` requests/limits, no `runtimeClassName`, no privileged mode, and no hostPath `/dev/nvidia*`; it set `NVIDIA_VISIBLE_DEVICES=GPU-689a3e93-68db-0dac-160b-6a791cf246e8` and `CUDA_VISIBLE_DEVICES=0`.
+- Canary result: PASS. `kubectl logs` and `kubectl exec ... nvidia-smi --query-gpu=index,uuid` both showed exactly one visible GPU: `0, GPU-689a3e93-68db-0dac-160b-6a791cf246e8`.
+- Fallbacks were not needed: `runtimeClassName: nvidia`, privileged mode, and `/dev/nvidia*` hostPath were not used.
+- Cleaned up the temporary pod with `kubectl -n default delete pod tre-n4b-d7-canary`.
+- This satisfies the 10.3 canary gate; full D7 rollout may proceed.
