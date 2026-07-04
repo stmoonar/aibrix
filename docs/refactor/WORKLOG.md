@@ -410,3 +410,15 @@
 - Verified GREEN remotely: focused controller state-store/app/SafeScale tests passed with 18 tests.
 - Full quality gate passed remotely: `git diff --check` was clean, and `cd tre && make check && make smoke` completed with 137 tests and `tre smoke ok`.
 - Next P5 work: fixture-driven end-to-end tick replay and fast-loop jitter verification.
+
+
+### P5 Fixture Tick Replay Slice
+
+- Re-read `REFACTOR_PLAN.md` completely on remote server 76 before starting the fixture replay segment.
+- Inspected the planner tick boundary, rescue/fairness wrappers, existing loop tests, and P3 fixture helpers; selected the P5 verification gap for 60-tick offline replay.
+- Added RED tests for a 60-tick CRITICAL scale-up sequence, a HIGH donor SafeScale probe sequence, and a TP=2 defrag sequence.
+- Verified RED remotely: focused replay tests failed on missing `tre_controller.loops.replay`.
+- Implemented `TickReplayStep`, `TickReplayResult`, `ReplayQueue`, and `run_tick_replay()` as an offline deterministic harness around `run_planner_tick()` with mock service-manager completion semantics.
+- Verified GREEN remotely: focused replay tests passed with 3 tests; adjacent replay/loop/planner tests passed with 20 tests.
+- Full quality gate passed remotely: `git diff --check` was clean, and `cd tre && make check && make smoke` completed with 140 tests and `tre smoke ok`.
+- Next P5 work: fast-loop jitter verification under delayed slow-loop scheduling, then reassess remaining P5 closure requirements.
