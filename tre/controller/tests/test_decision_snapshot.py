@@ -94,3 +94,22 @@ def test_decision_snapshot_writer_writes_latest_hash() -> None:
             },
         )
     ]
+
+
+def test_decision_snapshot_writer_logs_trs_calc_result(caplog) -> None:
+    import logging
+
+    redis = FakeRedis()
+    writer = DecisionSnapshotWriter(redis)
+    snapshot = MetricsSnapshot(ts_ms=99, stale=False, models={})
+    result = LoopTickResult(submitted=1, actions=(ScaleAction(model="m1", delta=-1, reason="idle", source_loop="rescue"),))
+
+    with caplog.at_level(logging.INFO, logger="tre_controller.decision"):
+        writer.write("rescue", snapshot, result)
+
+    assert any("trs_calc_result" in record.getMessage() for record in caplog.records)
+    payload = json.loads(next(record.getMessage() for record in caplog.records if "trs_calc_result" in record.getMessage()))
+    assert payload["event"] == "trs_calc_result"
+    assert payload["loop"] == "rescue"
+    assert payload["submitted"] == "1"
+    assert json.loads(payload["actions"])[0]["model"] == "m1"

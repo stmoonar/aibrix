@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 from tre_common.metrics_schema import MetricsSnapshot
 from tre_common.rediskeys import DECISION_LATEST_KEY
 from tre_controller.loops.tick import LoopTickResult
 from tre_controller.planning.planner import DefragAction, HideAction, ScaleAction, UnhideAction
+
+
+_LOGGER = logging.getLogger("tre_controller.decision")
 
 
 def build_decision_snapshot(loop_name: str, snapshot: MetricsSnapshot, result: LoopTickResult) -> dict[str, str]:
@@ -26,7 +30,9 @@ class DecisionSnapshotWriter:
         self._key = key
 
     def write(self, loop_name: str, snapshot: MetricsSnapshot, result: LoopTickResult) -> None:
-        self._redis.hset(self._key, mapping=build_decision_snapshot(loop_name, snapshot, result))
+        payload = build_decision_snapshot(loop_name, snapshot, result)
+        self._redis.hset(self._key, mapping=payload)
+        _LOGGER.info(json.dumps({"event": "trs_calc_result", **payload}, separators=(",", ":")))
 
 
 def _action_to_dict(action: object) -> dict[str, Any]:
