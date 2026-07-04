@@ -50,3 +50,20 @@ Keep the existing boundary. `ShrinkForSlotAction` is emitted by the pure planner
 ### Consequences
 
 This avoids routing planner output into the observation task and preserves the existing SafeScale lifecycle. The behavior still satisfies N1.2's intent: same-slot shrink is SafeScale-gated, and beneficiary expansion is delayed until after donor shrink commits.
+
+## ADR-0004: TRE v2 images use immutable date-plus-git tags
+
+- Date: 2026-07-04
+- Status: accepted
+
+### Context
+
+N2 introduces build artifacts for the controller, service-manager, and UI. The next deploy phases need image references that can be traced back to source without relying on a mutable `latest` tag.
+
+### Decision
+
+TRE v2 component images use `tre-v2-<component>:<yyyymmdd>-<git-short-sha>`. `latest` is not used in Dockerfiles, manifests, or overlays. When images are pushed to an external registry, the pushed digest should be recorded beside this tag in WORKLOG.
+
+### Consequences
+
+Local build artifacts and cluster deployments can be tied to a specific source commit. Documentation-only follow-up commits may record build evidence, but deployable image tags still point at the source commit used for the build.

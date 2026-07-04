@@ -685,3 +685,14 @@
 - Result: full Chromium and FFmpeg downloaded, but the command timed out during `chromium-headless-shell` download and exited non-zero.
 - Follow-up launch probe failed with the same concrete missing binary: `/root/.cache/ms-playwright/chromium_headless_shell-1228/chrome-headless-shell-linux64/chrome-headless-shell`.
 - Per the N1.4 30-minute cap, UI screenshot evidence remains skipped; the exact commands and reason are recorded in `docs/refactor/08_ui.md`.
+
+### N2.1 Component Dockerfiles
+
+- Added shared runtime/test requirements plus Dockerfiles for `tre-v2-controller`, `tre-v2-service-manager`, and `tre-v2-ui`, all based on `python:3.11-slim` to match the frozen old TRE Python image family.
+- Added runtime entrypoints: `python -m tre_controller` for controller, `tre_sm.server:create_app` for service-manager, and `tre_ui.server:create_app` for UI.
+- Added deploy contract coverage in `tre/deploy/tests/test_dockerfiles.py`; `cd tre && make check` passed with 189 tests before image build.
+- Built images from commit `b9ee9740` with immutable tags:
+  - `tre-v2-controller:20260704-b9ee9740`, image id `sha256:72f9a0fd7fbe695333acf5528f0051bd1fe5f1b187daafba989315b35acd6ef4`, size 238495212 bytes.
+  - `tre-v2-service-manager:20260704-b9ee9740`, image id `sha256:4200c08ad138a4d22e3d03686e75d8136d5861603cdc06844235f7258d891718`, size 238218201 bytes.
+  - `tre-v2-ui:20260704-b9ee9740`, image id `sha256:36a5e16162718e3488c5b52a682e8b801d60d1b7428c1ed1a851104645c39cb3`, size 238161184 bytes.
+- In-container verification passed: imports for `tre_controller.app`, `tre_sm.app`, and `tre_ui.app`; controller tests passed with 108 tests, service-manager tests with 31 tests, and UI tests with 3 tests. FastAPI/Starlette emitted a deprecation warning about `httpx`, but tests exited 0.
