@@ -41,18 +41,36 @@ class ServiceManagerV2:
 
         snapshot = self._store.load()
         model_bindings = [binding for binding in snapshot.bindings if binding.model == model]
-        if wake_replicas > len(model_bindings):
-            raise ValueError(f"wake_replicas exceeds bound pool for {model}")
-
         awake = [binding for binding in model_bindings if binding.awake]
         actions: list[dict] = []
         updated_by_serve = {binding.serve_id: binding for binding in snapshot.bindings}
 
         if len(awake) < wake_replicas:
             sleeping = [binding for binding in model_bindings if not binding.awake]
-            for binding in sleeping[: wake_replicas - len(awake)]:
+            wake_existing = min(wake_replicas - len(awake), len(sleeping))
+            for binding in sleeping[:wake_existing]:
                 updated_by_serve[binding.serve_id] = replace(binding, awake=True)
                 actions.append({"action": "wake", "serve_id": binding.serve_id})
+            create_count = wake_replicas - len(awake) - wake_existing
+            if create_count > 0:
+                allocator = SlotAllocator(self._registry.topology(), list(updated_by_serve.values()))
+                existing_serve_ids = set(updated_by_serve)
+                for _ in range(create_count):
+                    slot = allocator.find_slot(spec.tp_size)
+                    if slot is None:
+                        raise ValueError(f"no free slot for {model} tp_size={spec.tp_size}")
+                    serve_id = _next_serve_id(model, existing_serve_ids)
+                    allocator.bind(serve_id, model, slot, awake=True)
+                    existing_serve_ids.add(serve_id)
+                    updated_by_serve[serve_id] = Binding(serve_id, model, slot, awake=True)
+                    actions.append(
+                        {
+                            "action": "create",
+                            "serve_id": serve_id,
+                            "node": slot.node,
+                            "gpu_ids": list(slot.gpu_ids),
+                        }
+                    )
         elif len(awake) > wake_replicas:
             for binding in reversed(awake[wake_replicas:]):
                 updated_by_serve[binding.serve_id] = replace(binding, awake=False)
@@ -60,7 +78,7 @@ class ServiceManagerV2:
 
         version = snapshot.version
         if actions:
-            updated = [updated_by_serve[binding.serve_id] for binding in snapshot.bindings]
+            updated = list(updated_by_serve.values())
             version = self._store.save(updated, expected_version=snapshot.version)
 
         return {
@@ -246,3 +264,11 @@ def _migration_dict(migration: Migration) -> dict:
 
 def _slot_dict(slot: Slot) -> dict:
     return {"node": slot.node, "gpu_ids": list(slot.gpu_ids)}
+
+
+def _next_serve_id(model: str, existing_serve_ids: set[str]) -> str:
+    base = "".join(char if char.isalnum() else "-" for char in model).strip("-") or "serve"
+    index = 1
+    while f"{base}-{index}" in existing_serve_ids:
+        index += 1
+    return f"{base}-{index}"

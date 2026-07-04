@@ -73,6 +73,50 @@ def registry():
     )
 
 
+def registry_with_tp2():
+    topology = ClusterTopology(nodes=(NodeSpec(name="node-a", gpus=4, two_gpu_slots=((0, 1), (2, 3))),))
+    trs = TrsParams(
+        w_p=0.04,
+        w_d=1.0,
+        lambda_wait=2.625,
+        qmin=1.0,
+        ema_alpha=0.5,
+        theta_m=0.0,
+        tau_crit=0.8,
+        tau_low=1.0,
+        tau_high=1.25,
+        qsat=4.0,
+        epsat=0.05,
+        hsat=3,
+    )
+    slo = SloSpec(ttft_p95_ms=1200, tpot_p95_ms=100, e2e_p95_ms=10000)
+    return Registry(
+        topology,
+        [
+            ModelSpec(
+                name="m1",
+                weights_path="/m1",
+                tp_size=1,
+                min_replicas=0,
+                max_replicas=2,
+                vllm_image="image",
+                slo=slo,
+                trs=trs,
+            ),
+            ModelSpec(
+                name="tp2",
+                weights_path="/tp2",
+                tp_size=2,
+                min_replicas=0,
+                max_replicas=1,
+                vllm_image="image",
+                slo=slo,
+                trs=trs,
+            ),
+        ],
+    )
+
+
 def test_v2_state_exposes_version_and_bindings():
     store = StateStore(FakeRedis())
     store.save(
@@ -126,17 +170,36 @@ def test_v2_put_target_is_idempotent_and_returns_diff_actions():
     ]
 
 
-def test_v2_put_target_rejects_target_above_bound_pool():
+def test_v2_put_target_rejects_target_above_model_max_replicas():
     store = StateStore(FakeRedis())
     store.save([Binding("serve-a", "m1", Slot("node-a", (0,)), awake=False)], expected_version=0)
     service = ServiceManagerV2(registry(), store)
 
     try:
-        service.put_model_target("m1", wake_replicas=2)
+        service.put_model_target("m1", wake_replicas=3)
     except ValueError as exc:
-        assert "bound pool" in str(exc)
+        assert "max_replicas" in str(exc)
     else:
-        raise AssertionError("expected target above bound pool to fail")
+        raise AssertionError("expected target above max_replicas to fail")
+
+
+def test_v2_put_target_allocates_new_binding_when_free_slot_exists():
+    store = StateStore(FakeRedis())
+    store.save([Binding("serve-a", "m1", Slot("node-a", (0,)), awake=True)], expected_version=0)
+    service = ServiceManagerV2(registry_with_tp2(), store)
+
+    result = service.put_model_target("tp2", wake_replicas=1)
+
+    assert result == {
+        "model": "tp2",
+        "wake_replicas": 1,
+        "version": 2,
+        "actions": [{"action": "create", "serve_id": "tp2-1", "node": "node-a", "gpu_ids": [2, 3]}],
+    }
+    assert store.load().bindings == [
+        Binding("serve-a", "m1", Slot("node-a", (0,)), awake=True),
+        Binding("tp2-1", "tp2", Slot("node-a", (2, 3)), awake=True),
+    ]
 
 
 def test_v2_fastapi_routes_delegate_to_service_layer():

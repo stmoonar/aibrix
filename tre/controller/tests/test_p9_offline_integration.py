@@ -8,6 +8,7 @@ from tre_common.registry import ClusterTopology, ModelSpec, NodeSpec, Registry, 
 from tre_controller.loops.action_queue import ActionQueue
 from tre_controller.loops.decision_snapshot import DecisionSnapshotWriter
 from tre_controller.offline_integration import run_offline_integration_step
+from tre_controller.planning.planner import ClusterView, DefragAction, ScaleAction
 from tre_controller.sm_client import ServiceManagerClient
 from tre_sm.allocator.slots import Binding, Slot
 from tre_sm.api.v2 import ServiceManagerV2, create_app
@@ -93,7 +94,17 @@ def _registry() -> Registry:
                 vllm_image="image",
                 slo=SloSpec(ttft_p95_ms=1200, tpot_p95_ms=100, e2e_p95_ms=10000),
                 trs=trs,
-            )
+            ),
+            ModelSpec(
+                name="tp2",
+                weights_path="/weights/tp2",
+                tp_size=2,
+                min_replicas=0,
+                max_replicas=1,
+                vllm_image="image",
+                slo=SloSpec(ttft_p95_ms=1200, tpot_p95_ms=100, e2e_p95_ms=10000),
+                trs=trs,
+            ),
         ],
     )
 
@@ -118,6 +129,32 @@ def _critical_snapshot() -> MetricsSnapshot:
                 e2e_p95_ms=1000.0,
                 routable_pods=1,
                 assigned_replicas=1,
+                per_pod={},
+            )
+        },
+    )
+
+
+def _critical_tp2_snapshot() -> MetricsSnapshot:
+    return MetricsSnapshot(
+        ts_ms=300_000,
+        stale=False,
+        models={
+            "tp2": ModelWindowMetrics(
+                model="tp2",
+                window_start_ms=240_000,
+                window_end_ms=300_000,
+                prompt_tokens=0.0,
+                generation_tokens=50.0,
+                avg_waiting=10.0,
+                avg_running=1.0,
+                avg_swapping=0.0,
+                kv_cache_hit_rate=0.0,
+                ttft_p95_ms=100.0,
+                tpot_p95_ms=10.0,
+                e2e_p95_ms=1000.0,
+                routable_pods=0,
+                assigned_replicas=0,
                 per_pod={},
             )
         },
@@ -159,3 +196,44 @@ async def test_p9_offline_integration_step_closes_metrics_decision_dispatch_chai
     decision_hash = redis.hgetall(DECISION_LATEST_KEY)
     assert decision_hash[b"loop"] == b"rescue"
     assert b"critical_idle_capacity" in decision_hash[b"actions"]
+
+
+@pytest.mark.asyncio
+async def test_p9_offline_integration_defrags_fragmented_capacity_then_expands_tp2() -> None:
+    registry = _registry()
+    redis = FakeRedis()
+    sm_store = StateStore(redis)
+    bindings = (
+        Binding("serve-a", "m1", Slot("node-a", (0,)), awake=True),
+        Binding("serve-b", "m1", Slot("node-a", (2,)), awake=True),
+    )
+    sm_store.save(bindings, expected_version=0)
+    transport = AppTransport(create_app(ServiceManagerV2(registry, sm_store)))
+    queue = ActionQueue(ServiceManagerClient("http://service-manager", transport=transport))
+
+    result = await run_offline_integration_step(
+        store=FixtureSnapshotStore(_critical_tp2_snapshot()),
+        queue=queue,
+        decision_writer=DecisionSnapshotWriter(redis),
+        registry=registry,
+        now_ms=360_000,
+        window_ms=60_000,
+        cluster_view=ClusterView(registry.topology(), bindings),
+    )
+
+    assert [type(action) for action in result.decision.actions] == [DefragAction, ScaleAction]
+    assert [action.reason for action in result.decision.actions] == ["critical_tp_defrag", "critical_tp_defrag"]
+    assert [(item.action_kind, item.model, item.ok) for item in result.dispatches] == [
+        ("defrag", "__cluster__", True),
+        ("scale", "tp2", True),
+    ]
+    assert transport.calls == [
+        ("POST", "/v2/defrag", {"tp_size": 2}),
+        ("GET", "/v2/state", None),
+        ("PUT", "/v2/models/tp2/target", {"wake_replicas": 1}),
+    ]
+    assert sm_store.load().bindings == [
+        Binding("serve-a", "m1", Slot("node-a", (0,)), awake=True),
+        Binding("serve-b", "m1", Slot("node-a", (1,)), awake=True),
+        Binding("tp2-1", "tp2", Slot("node-a", (2, 3)), awake=True),
+    ]

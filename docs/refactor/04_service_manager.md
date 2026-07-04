@@ -263,6 +263,16 @@ PYTHONPATH=tre/common:tre/service-manager python3 -m pytest -q tre/service-manag
 
 Result: focused API v2 tests passed with 4 tests; service-manager tests passed with 20 tests.
 
+### N1-SM-001 target allocation after defrag
+
+N1.1 extends `PUT /v2/models/{model}/target` from bound-pool wake/sleep only to target reconciliation with slot allocation. When the requested awake count exceeds existing bound replicas, service-manager now allocates new bindings through `SlotAllocator.find_slot(spec.tp_size)` before persisting state. The action returned to callers is:
+
+```json
+{"action":"create","serve_id":"<model>-<n>","node":"<node>","gpu_ids":[...]}
+```
+
+This keeps offline state semantics aligned with the N1 defrag flow: `/v2/defrag` may free a full TP=2 slot, then the following target call can create the TP=2 binding in that slot. Existing guardrails remain: negative targets fail, targets above `max_replicas` fail, and allocation fails without persisting partial state when no compatible slot is free. N4 still has to wire the returned `create` action to real Kubernetes Deployment creation.
+
 ### P4-SM-009 API v2 routable hidden pods
 
 RED:

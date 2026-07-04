@@ -670,3 +670,18 @@
 - During real dry-run, found a YAML-anchor alias bug: multiple registry models shared the same loaded `trs` dict, so updating the first model polluted later model old-values. Added a regression test and fixed sync by copying each model's `slo` and `trs` dict before mutation.
 - Ran dry-run against `/root/aibrix-main/python/tre/configs/model_slo_profiles.json` and `seed_calibration.json`; then executed sync once. Registry now uses old fitted theta values and profile SLO/TRS controls: dsqwen-7b theta 738.67, dsllama-8b theta 738, dsqwen-14b theta 534; TTFT/TPOT SLOs are 500/75 ms with per-model E2E values.
 - `make smoke` after sync printed no parameter warnings and ended with `tre smoke ok`.
+
+### N1.1 Offline Defrag Integration Completion
+
+- Added broader offline integration coverage for the N1.1 chain: fragmented one-GPU bindings at `(node-a,0)` and `(node-a,2)`, a CRITICAL TP=2 receiver, planner output of `DefragAction` then `ScaleAction`, real in-memory FastAPI service-manager dispatch, and final TP=2 expansion success.
+- RED result: focused tests failed because `/v2/defrag` succeeded but the follow-up target call still rejected growth beyond the existing bound pool.
+- Extended `ServiceManagerV2.put_model_target()` so targets above the current bound count allocate new bindings through `SlotAllocator.find_slot(spec.tp_size)` while preserving the `max_replicas` guard.
+- Added service-manager unit coverage for TP=2 target allocation into a free full slot and updated the old bound-pool rejection test to assert the model max-replica guard instead.
+- Focused verification passed: `PYTHONPATH=common:service-manager:controller pytest -q service-manager/tests/test_api_v2.py controller/tests/test_p9_offline_integration.py` passed with 11 tests; `PYTHONPATH=common:service-manager pytest -q service-manager/tests/test_api_v2.py service-manager/tests/test_v2_defrag.py` passed with 11 tests; `PYTHONPATH=common:controller:service-manager pytest -q controller/tests/test_p9_offline_integration.py controller/tests/test_action_queue.py controller/tests/test_sm_client.py` passed with 14 tests.
+
+### N1.4 UI Screenshot Reattempt
+
+- Ran the bounded browser install from `10_next_steps.md`: `timeout 1800 npx playwright install chromium`.
+- Result: full Chromium and FFmpeg downloaded, but the command timed out during `chromium-headless-shell` download and exited non-zero.
+- Follow-up launch probe failed with the same concrete missing binary: `/root/.cache/ms-playwright/chromium_headless_shell-1228/chrome-headless-shell-linux64/chrome-headless-shell`.
+- Per the N1.4 30-minute cap, UI screenshot evidence remains skipped; the exact commands and reason are recorded in `docs/refactor/08_ui.md`.

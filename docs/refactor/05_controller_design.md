@@ -724,6 +724,8 @@ Runtime sequence:
 
 The service-manager endpoint intentionally does not mutate Kubernetes or vLLM in this offline N1.1 slice. It returns the exact operation sequence that N4 must bind to `ops/k8s_ops.py` and vLLM sleep/wake validation on the real cluster. Because vLLM sleep-mode wake must return to the original GPU binding, the move is represented as `recreate` on the new slot rather than changing GPU assignment in-place.
 
+The broader offline integration case now covers the complete N1.1 controller sequence: a CRITICAL TP=2 receiver produces `DefragAction` followed by `ScaleAction`; `ActionQueue.drain_once()` posts `/v2/defrag`, then the subsequent scale reads the updated service-manager state and calls `PUT /v2/models/tp2/target`. The target endpoint allocates the newly freed TP=2 slot and the final state contains the migrated one-GPU bindings plus the new TP=2 binding.
+
 ## N1.2 Same-Slot HIGH Shrink Contract
 
 N1.2 adds the first slot-aware donor-priority behavior after P9. When a TP=2 CRITICAL receiver is blocked by fragmented one-GPU bindings, planner now checks for a HIGH one-GPU donor occupying one half of a two-GPU slot while the other half is empty. That donor is cheaper than a defrag migration because a SafeScale-gated shrink can free a complete slot without moving another serve.
