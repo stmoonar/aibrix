@@ -95,3 +95,31 @@ def test_action_queue_keeps_failed_model_inflight_for_retry() -> None:
 
     assert results == (DispatchResult(model="m", action_kind="scale", ok=False, error="boom"),)
     assert queue.inflight_models() == {"m"}
+
+
+class StopQueueLoop(Exception):
+    pass
+
+
+async def _stop_queue_sleep(seconds: float) -> None:
+    _stop_queue_sleep.calls.append(seconds)
+    raise StopQueueLoop
+
+
+_stop_queue_sleep.calls = []
+
+
+def test_action_queue_run_drains_pending_actions_before_sleeping() -> None:
+    client = FakeServiceManagerClient()
+    queue = ActionQueue(client)
+    queue.submit((ScaleAction("m", 1, "critical", "rescue"),))
+    _stop_queue_sleep.calls = []
+
+    try:
+        asyncio.run(queue.run(poll_interval_s=0.25, sleep=_stop_queue_sleep))
+    except StopQueueLoop:
+        pass
+
+    assert client.calls == [("scale", "m", 1)]
+    assert _stop_queue_sleep.calls == [0.25]
+    assert queue.pending_actions() == ()

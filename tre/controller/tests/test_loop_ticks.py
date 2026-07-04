@@ -112,3 +112,74 @@ def test_fairness_tick_passes_inflight_models_to_planner() -> None:
 
     assert result.submitted == 0
     assert queue.submitted == []
+
+
+class StopLoop(Exception):
+    pass
+
+
+async def _stop_sleep(seconds: float) -> None:
+    _stop_sleep.calls.append(seconds)
+    raise StopLoop
+
+
+_stop_sleep.calls = []
+
+
+def test_rescue_task_loop_reads_snapshot_and_sleeps_configured_interval() -> None:
+    import asyncio
+
+    from tre_controller.loops.metrics_task import SnapshotBox
+    from tre_controller.loops.rescue_task import rescue_task
+
+    _stop_sleep.calls = []
+    queue = FakeQueue()
+    snapshot = MetricsSnapshot(
+        ts_ms=1,
+        stale=False,
+        models={"critical": _metrics("critical", generation=50.0, waiting=10.0, running=1.0, assigned=1)},
+    )
+    cfg = type("Cfg", (), {"rescue_interval_s": 5.0})()
+
+    try:
+        asyncio.run(
+            rescue_task(
+                SnapshotBox(snapshot),
+                queue=queue,
+                registry=_registry(),
+                cfg=cfg,
+                sleep=_stop_sleep,
+            )
+        )
+    except StopLoop:
+        pass
+
+    assert _stop_sleep.calls == [5.0]
+    assert len(queue.submitted) == 1
+
+
+def test_fairness_task_loop_skips_missing_snapshot_and_sleeps_configured_interval() -> None:
+    import asyncio
+
+    from tre_controller.loops.fairness_task import fairness_task
+    from tre_controller.loops.metrics_task import SnapshotBox
+
+    _stop_sleep.calls = []
+    queue = FakeQueue()
+    cfg = type("Cfg", (), {"fairness_interval_s": 10.0})()
+
+    try:
+        asyncio.run(
+            fairness_task(
+                SnapshotBox(),
+                queue=queue,
+                registry=_registry(),
+                cfg=cfg,
+                sleep=_stop_sleep,
+            )
+        )
+    except StopLoop:
+        pass
+
+    assert _stop_sleep.calls == [10.0]
+    assert queue.submitted == []

@@ -430,3 +430,43 @@ cd tre && make check && make smoke
 ```
 
 Result: passed with 108 tests and `tre smoke ok` on server 76.
+
+
+## Controller App Assembly Contract
+
+The app assembly slice adds the controller task boundary from the P5 asyncio design while keeping concrete infrastructure bootstrap out of scope. The assembly layer is dependency-injected so tests can verify task composition without opening Redis, service-manager HTTP connections, or Kubernetes clients.
+
+Implemented pieces:
+
+- `ControllerDependencies` groups the metrics store, `SnapshotBox`, `ActionQueue`, and registry used by runtime tasks.
+- `build_controller_task_specs()` always starts `metrics`; starts `rescue`, `fairness`, and `action_queue` only when `ENABLE_TRE_SCALING` is true; and honors `TRE_ABLATION_DISABLE_FAST_LOOP` by omitting only `rescue`.
+- `rescue_task()` and `fairness_task()` are long-running async wrappers over the tested single-tick functions. They read only `SnapshotBox`, submit through the queue, and sleep for the configured interval.
+- `ActionQueue.run()` repeatedly drains pending actions and sleeps, keeping service-manager HTTP calls confined to the queue boundary.
+
+This slice intentionally does not create the concrete Redis client, service-manager client, cluster-view refresh path, decision snapshot writer, or `ControllerConfig.from_env()` bootstrap. Those remain separate P5 app-wiring slices.
+
+### P5-CTRL-011 app task assembly
+
+RED:
+
+```bash
+PYTHONPATH=tre/common:tre/controller:tre/controller/tests:tre/service-manager python3 -m pytest -q tre/controller/tests/test_controller_app.py tre/controller/tests/test_loop_ticks.py tre/controller/tests/test_action_queue.py
+```
+
+Result: failed because `tre_controller.app`, `rescue_task()`, `fairness_task()`, and `ActionQueue.run()` did not exist.
+
+GREEN:
+
+```bash
+PYTHONPATH=tre/common:tre/controller:tre/controller/tests:tre/service-manager python3 -m pytest -q tre/controller/tests/test_controller_app.py tre/controller/tests/test_loop_ticks.py tre/controller/tests/test_action_queue.py
+```
+
+Result: focused app/loop/queue tests passed with 13 tests on server 76.
+
+Full slice verification:
+
+```bash
+cd tre && make check && make smoke
+```
+
+Result: passed with 114 tests and `tre smoke ok` on server 76.

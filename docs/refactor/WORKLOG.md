@@ -321,3 +321,14 @@
 - Verified RED remotely: `tre_controller.loops.metrics_task` was missing. Verified GREEN remotely: focused metrics task tests passed with 4 tests.
 - Full quality gate passed remotely: `cd tre && make check && make smoke` completed with 108 tests and `tre smoke ok`.
 - Next P5 work: assemble `app.py` around metrics/rescue/fairness tasks, ActionQueue draining, and ablation switch tests.
+
+
+### P5 Controller App Assembly Slice
+
+- Re-read `REFACTOR_PLAN.md` completely on remote server 76 before starting the app assembly segment.
+- Inspected current controller modules and confirmed `app.py` was absent, while rescue/fairness and queue had only single-tick/drain primitives.
+- Added RED tests for default task assembly, fast-loop ablation, disabled scaling startup, async rescue/fairness wrappers, and `ActionQueue.run()` drain loop behavior.
+- Implemented `tre_controller.app` as a dependency-injected task assembly boundary, plus long-running rescue/fairness wrappers and queue drain loop.
+- Verified RED remotely: `tre_controller.app`, `rescue_task()`, `fairness_task()`, and `ActionQueue.run()` were missing. Verified GREEN remotely: focused app/loop/queue tests passed with 13 tests.
+- Full quality gate passed remotely: `cd tre && make check && make smoke` completed with 114 tests and `tre smoke ok`.
+- Next P5 work: concrete controller bootstrap (`ControllerConfig.from_env()`, registry/store/sm_client construction), cluster-view state refresh, and decision snapshot writing.

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 from collections import deque
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Awaitable, Callable, Protocol
 
 from tre_controller.planning.planner import Action, DefragAction, HideAction, ScaleAction, SourceLoop, UnhideAction
 
@@ -70,6 +71,16 @@ class ActionQueue:
 
     def inflight_models(self) -> set[str]:
         return set(self._inflight)
+
+    async def run(
+        self,
+        *,
+        poll_interval_s: float = 0.1,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    ) -> None:
+        while True:
+            await self.drain_once()
+            await sleep(poll_interval_s)
 
     async def drain_once(self) -> tuple[DispatchResult, ...]:
         results: list[DispatchResult] = []
