@@ -95,6 +95,27 @@ def _registry_with_models(*names: str) -> Registry:
     )
 
 
+def _registry_with_model_bounds(bounds: dict[str, tuple[int, int]]) -> Registry:
+    base = _registry()
+    template = base.model("critical")
+    return Registry(
+        base.topology(),
+        [
+            ModelSpec(
+                name=name,
+                weights_path=template.weights_path,
+                tp_size=template.tp_size,
+                min_replicas=min_replicas,
+                max_replicas=max_replicas,
+                vllm_image=template.vllm_image,
+                slo=template.slo,
+                trs=template.trs,
+            )
+            for name, (min_replicas, max_replicas) in bounds.items()
+        ],
+    )
+
+
 def _pod_metrics(pod: str) -> PodWindowMetrics:
     return PodWindowMetrics(
         pod=pod,
@@ -204,6 +225,21 @@ def test_rescue_tick_honors_latency_signal_source_for_classification() -> None:
     assert action.model == "critical"
     assert action.delta == -1
     assert action.source_loop == "rescue"
+
+
+def test_rescue_tick_honors_per_model_min_replicas_for_idle_model() -> None:
+    queue = FakeQueue()
+    registry = _registry_with_model_bounds({"warm": (1, 4), "cold": (0, 4)})
+    snapshot = MetricsSnapshot(
+        ts_ms=1,
+        stale=False,
+        models={"warm": _metrics("warm", generation=0.0, waiting=0.0, running=0.0, assigned=1)},
+    )
+
+    result = run_rescue_tick(snapshot, queue=queue, registry=registry)
+
+    assert result.submitted == 0
+    assert queue.submitted == []
 
 
 def test_fairness_tick_passes_inflight_models_to_planner() -> None:

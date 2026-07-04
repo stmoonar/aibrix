@@ -60,6 +60,8 @@ def run_planner_tick(
         rescue_due=rescue_due,
         fairness_due=fairness_due,
         model_tp_sizes={spec.name: spec.tp_size for spec in registry.models()},
+        min_replicas_by_model={spec.name: spec.min_replicas for spec in registry.models()},
+        max_replicas_by_model={spec.name: spec.max_replicas for spec in registry.models()},
     )
     plan = build_plan(
         model_contexts=contexts,

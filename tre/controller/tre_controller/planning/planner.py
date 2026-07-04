@@ -19,6 +19,8 @@ class PlanConfig:
     rescue_due: bool = True
     fairness_due: bool = True
     model_tp_sizes: dict[str, int] = field(default_factory=dict)
+    min_replicas_by_model: dict[str, int] = field(default_factory=dict)
+    max_replicas_by_model: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -131,9 +133,10 @@ def build_plan(
             if recv.model_name in inflight_models:
                 continue
             recv_pods = _effective_assigned_replicas(recv.model_name, model_contexts, model_replicas)
-            if recv_pods >= cfg.max_replicas_per_model:
+            recv_max = _max_replicas(cfg, recv.model_name)
+            if recv_pods >= recv_max:
                 continue
-            raw_need = min(_scale_step(recv_pods, cfg.scale_step_ratio), cfg.max_replicas_per_model - recv_pods)
+            raw_need = min(_scale_step(recv_pods, cfg.scale_step_ratio), recv_max - recv_pods)
             if raw_need <= 0:
                 continue
 
@@ -201,13 +204,14 @@ def build_plan(
                 ):
                     continue
                 donor_pods = _effective_assigned_replicas(donor.model_name, model_contexts, model_replicas)
-                if donor_pods <= cfg.min_replicas_per_model:
+                donor_min = _min_replicas(cfg, donor.model_name)
+                if donor_pods <= donor_min:
                     continue
                 planned_take = abs(min(deltas.get(donor.model_name, 0), 0))
                 transfer = min(
                     still_needed,
                     _scale_step(donor_pods, cfg.scale_step_ratio),
-                    max(0, donor_pods - planned_take - cfg.min_replicas_per_model),
+                    max(0, donor_pods - planned_take - donor_min),
                 )
                 if transfer <= 0:
                     continue
@@ -243,13 +247,14 @@ def build_plan(
                 ):
                     continue
                 middle_pods = _effective_assigned_replicas(middle.model_name, model_contexts, model_replicas)
-                if middle_pods <= cfg.min_replicas_per_model:
+                middle_min = _min_replicas(cfg, middle.model_name)
+                if middle_pods <= middle_min:
                     continue
                 planned_take = abs(min(deltas.get(middle.model_name, 0), 0))
                 transfer = min(
                     still_needed,
                     _scale_step(middle_pods, cfg.scale_step_ratio),
-                    max(0, middle_pods - planned_take - cfg.min_replicas_per_model),
+                    max(0, middle_pods - planned_take - middle_min),
                 )
                 if transfer <= 0:
                     continue
@@ -275,9 +280,10 @@ def build_plan(
             if deltas.get(idle.model_name, 0) != 0:
                 continue
             pods = _effective_assigned_replicas(idle.model_name, model_contexts, model_replicas)
-            if pods <= cfg.min_replicas_per_model:
+            idle_min = _min_replicas(cfg, idle.model_name)
+            if pods <= idle_min:
                 continue
-            shrink = min(_scale_step(pods, cfg.scale_step_ratio), pods - cfg.min_replicas_per_model)
+            shrink = min(_scale_step(pods, cfg.scale_step_ratio), pods - idle_min)
             if shrink > 0:
                 _add_scale_action(
                     actions,
@@ -297,9 +303,10 @@ def build_plan(
             if deltas.get(high.model_name, 0) != 0:
                 continue
             pods = _effective_assigned_replicas(high.model_name, model_contexts, model_replicas)
-            if pods <= cfg.min_replicas_per_model:
+            high_min = _min_replicas(cfg, high.model_name)
+            if pods <= high_min:
                 continue
-            shrink = min(_scale_step(pods, cfg.scale_step_ratio), pods - cfg.min_replicas_per_model)
+            shrink = min(_scale_step(pods, cfg.scale_step_ratio), pods - high_min)
             if shrink > 0:
                 _add_scale_action(
                     actions,
@@ -323,7 +330,7 @@ def build_plan(
         if recv.model_name in inflight_models:
             continue
         recv_pods = _effective_assigned_replicas(recv.model_name, model_contexts, model_replicas)
-        receiver_capacity = cfg.max_replicas_per_model - recv_pods - max(0, deltas.get(recv.model_name, 0))
+        receiver_capacity = _max_replicas(cfg, recv.model_name) - recv_pods - max(0, deltas.get(recv.model_name, 0))
         if receiver_capacity <= 0:
             continue
         needed = min(_scale_step(recv_pods, cfg.scale_step_ratio), receiver_capacity)
@@ -359,7 +366,8 @@ def build_plan(
             ):
                 continue
             donor_pods = _effective_assigned_replicas(donor.model_name, model_contexts, model_replicas)
-            if donor_pods <= cfg.min_replicas_per_model:
+            donor_min = _min_replicas(cfg, donor.model_name)
+            if donor_pods <= donor_min:
                 continue
             existing_shrink = abs(min(deltas.get(donor.model_name, 0), 0))
             existing_claimed = sum(probe_upscale_plans.get(donor.model_name, {}).values())
@@ -375,7 +383,7 @@ def build_plan(
             transfer = min(
                 needed,
                 _scale_step(donor_pods, cfg.scale_step_ratio),
-                max(0, donor_pods - planned_take - cfg.min_replicas_per_model),
+                max(0, donor_pods - planned_take - donor_min),
             )
             if transfer <= 0:
                 continue
@@ -407,7 +415,8 @@ def build_plan(
             if middle.model_name == recv.model_name or middle.model_name in active_probe_models or middle.model_name in inflight_models:
                 continue
             donor_pods = _effective_assigned_replicas(middle.model_name, model_contexts, model_replicas)
-            if donor_pods <= cfg.min_replicas_per_model:
+            donor_min = _min_replicas(cfg, middle.model_name)
+            if donor_pods <= donor_min:
                 continue
             existing_shrink = abs(min(deltas.get(middle.model_name, 0), 0))
             existing_claimed = sum(probe_upscale_plans.get(middle.model_name, {}).values())
@@ -423,7 +432,7 @@ def build_plan(
             transfer = min(
                 needed,
                 _scale_step(donor_pods, cfg.scale_step_ratio),
-                max(0, donor_pods - planned_take - cfg.min_replicas_per_model),
+                max(0, donor_pods - planned_take - donor_min),
             )
             if transfer <= 0:
                 continue
@@ -469,7 +478,7 @@ def _try_plan_same_slot_high_shrink(
         if binding.model == receiver or len(binding.slot.gpu_ids) != 1:
             continue
         donor_pods = _effective_assigned_replicas(binding.model, model_contexts, model_replicas)
-        if donor_pods <= cfg.min_replicas_per_model:
+        if donor_pods <= _min_replicas(cfg, binding.model):
             continue
         if not _slot_mate_is_free(cluster_view, binding.slot, occupied):
             continue
@@ -575,6 +584,14 @@ def _scale_step(current_pods: int, ratio: float = 0.1) -> int:
     return max(1, math.ceil(ratio * current_pods))
 
 
+def _min_replicas(cfg: PlanConfig, model_name: str) -> int:
+    return cfg.min_replicas_by_model.get(model_name, cfg.min_replicas_per_model)
+
+
+def _max_replicas(cfg: PlanConfig, model_name: str) -> int:
+    return cfg.max_replicas_by_model.get(model_name, cfg.max_replicas_per_model)
+
+
 def _effective_assigned_replicas(
     model_name: str,
     model_contexts: dict[str, dict[str, Any]],
@@ -583,6 +600,6 @@ def _effective_assigned_replicas(
     ctx = model_contexts.get(model_name, {})
     assigned = model_replicas.get(model_name, ctx.get("assigned_replicas", ctx.get("routable_pods", 1)))
     try:
-        return max(1, int(assigned))
+        return max(0, int(assigned))
     except Exception:
         return 1
