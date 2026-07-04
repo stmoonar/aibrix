@@ -100,3 +100,45 @@ def test_reconcile_keeps_persisted_binding_when_pod_observation_is_missing():
     assert result.warnings == [
         "serve-sleeping: persisted binding has no matching pod observation",
     ]
+
+
+def test_reconcile_drops_stale_binding_when_replacement_pod_reuses_slot():
+    store = StateStore(FakeRedis())
+    store.save(
+        [
+            Binding(
+                serve_id="serve-old",
+                model="dsqwen-7b",
+                slot=Slot("node-a", (0,)),
+                awake=True,
+            )
+        ],
+        expected_version=0,
+    )
+    k8s = FakeK8sClient(
+        [
+            PodRecord(
+                serve_id="serve-new",
+                model="dsqwen-7b",
+                node="node-a",
+                cuda_visible_devices="0",
+                state="awake",
+            )
+        ]
+    )
+
+    result = reconcile_state(topology(), store, k8s)
+
+    assert result.version == 2
+    assert result.bindings == [
+        Binding(
+            serve_id="serve-new",
+            model="dsqwen-7b",
+            slot=Slot("node-a", (0,)),
+            awake=True,
+        )
+    ]
+    assert store.load().bindings == result.bindings
+    assert result.warnings == [
+        "serve-old: dropped stale persisted binding that overlaps pod observation",
+    ]

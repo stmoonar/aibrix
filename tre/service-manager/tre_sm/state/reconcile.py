@@ -65,8 +65,19 @@ def reconcile_state(
             raise ValueError(f"duplicate pod observation: {binding.serve_id}")
         reconciled_by_serve[binding.serve_id] = binding
 
+    observed_slots = {
+        slot_key
+        for binding in reconciled_by_serve.values()
+        for slot_key in _slot_keys(binding.slot)
+    }
+
     for binding in persisted.bindings:
         if binding.serve_id in reconciled_by_serve:
+            continue
+        if any(slot_key in observed_slots for slot_key in _slot_keys(binding.slot)):
+            warnings.append(
+                f"{binding.serve_id}: dropped stale persisted binding that overlaps pod observation"
+            )
             continue
         warnings.append(f"{binding.serve_id}: persisted binding has no matching pod observation")
         reconciled_by_serve[binding.serve_id] = binding
@@ -90,3 +101,7 @@ def _parse_cuda_visible_devices(value: str) -> tuple[int, ...]:
     if not devices:
         raise ValueError("CUDA_VISIBLE_DEVICES must contain at least one GPU id")
     return devices
+
+
+def _slot_keys(slot: Slot) -> tuple[tuple[str, int], ...]:
+    return tuple((slot.node, gpu) for gpu in slot.gpu_ids)
