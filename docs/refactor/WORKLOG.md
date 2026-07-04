@@ -261,3 +261,13 @@
 - Implemented `tre_controller.planning.planner` as a pure action-producing paper path with `ScaleAction`, `HideAction`, `UnhideAction`, and `DefragAction` types.
 - Verified RED remotely: `tre_controller.planning.planner` was missing. Verified GREEN remotely: focused planner tests passed with 4 tests; `cd tre && make check && make smoke` passed with 82 tests and `tre smoke ok`.
 - Next P5 work: add TP-aware cluster-view/defrag planning on top of `DefragAction`, then SafeScale state machine.
+
+### P5 TP-Aware Planner Defrag Slice
+
+- Re-read `REFACTOR_PLAN.md` completely on remote server 76 before continuing the planner segment.
+- Added TP-aware planner tests for complete two-GPU slots, allocator defrag migrations, and explicit capacity-blocked events for 2-card CRITICAL receivers.
+- Verified RED remotely: focused planner tests failed on the TP-aware cases because `_try_plan_tp_capacity` was missing.
+- Implemented `ClusterView`, `PlanConfig.model_tp_sizes`, and pure planner use of `SlotAllocator.find_slot()` / `plan_defrag()` to emit `ScaleAction`, `DefragAction`, or `capacity_blocked` without direct service-manager calls.
+- Verified GREEN remotely: focused planner tests passed with 7 tests; `cd tre && make check && make smoke` passed with 85 tests and `tre smoke ok`.
+- Scope note: HIGH same-slot shrink remains for the next SafeScale/slot-aware donor slice rather than being approximated at model level.
+- Next P5 work: proceed to SafeScale state machine.

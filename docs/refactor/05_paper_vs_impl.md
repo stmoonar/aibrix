@@ -23,4 +23,6 @@ The frozen planner had two branches: the newer `paper_state` branch and a legacy
 
 When migrated planner input is incomplete (`UNKNOWN` state or missing `Z_m` outside IDLE), `PlanResult.dropped_legacy_raw_trs` is set and no fallback action is emitted. This makes the removed behavior explicit for logs/tests instead of silently preserving the old branch.
 
-The first planner slice preserves the paper-path delta semantics and SafeScale probe metadata. TP-aware slot/defrag selection is still pending and will be layered onto the typed `DefragAction` in a later planner sub-slice.
+The first planner slice preserves the paper-path delta semantics and SafeScale probe metadata. The TP-aware planner-defrag slice now layers cached cluster-view input onto the pure planner for 2-card CRITICAL receivers: complete empty slot, allocator `plan_defrag`, or explicit `capacity_blocked` event.
+
+The plan also calls for shrinking HIGH same-slot halves before allocator defrag. That branch remains pending because it needs slot-aware donor selection to be integrated with SafeScale and concrete model occupancy; this slice does not silently approximate it with model-level HIGH shrink decisions.

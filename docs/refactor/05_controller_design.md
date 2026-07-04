@@ -178,3 +178,44 @@ cd tre && make check && make smoke
 ```
 
 Result: passed with 57 tests and `tre smoke ok` on server 76.
+
+## TP-Aware Planner Contract
+
+The fifth P5 controller slice adds the first TP-aware capacity layer to the pure planner. The planner still performs no Redis, HTTP, Kubernetes, or service-manager calls; callers pass a cached `ClusterView` derived from service-manager `/v2/state`.
+
+Implemented pieces:
+
+- `PlanConfig.model_tp_sizes` declares per-model tensor parallelism for planner decisions.
+- `ClusterView` carries service-manager topology and bindings as immutable planner input.
+- CRITICAL receivers with `tp_size > 1` now use the service-manager allocator semantics before generic GPU-count fallback.
+- A complete empty two-GPU slot emits a `ScaleAction` with reason `critical_empty_slot`.
+- Fragmented two-GPU capacity emits a `DefragAction` with allocator migrations plus the receiver `ScaleAction`, both tied to reason `critical_tp_defrag`.
+- If no complete slot or defrag plan exists, no scale action is emitted and `PlanResult.events` records `capacity_blocked:<model>`.
+
+This slice covers the complete-slot, allocator-defrag, and capacity-blocked branches from the P5 TP-aware contract. The explicit "shrink HIGH same-slot halves" branch remains pending because it requires connecting SafeScale donor selection to concrete slot occupancy rather than only model-level classifications.
+
+### P5-CTRL-005 TP-aware planner defrag
+
+RED:
+
+```bash
+PYTHONPATH=tre/common:tre/controller:tre/controller/tests:tre/service-manager python3 -m pytest -q tre/controller/tests/test_planner.py
+```
+
+Result: failed on the three TP-aware tests with `NameError: name '_try_plan_tp_capacity' is not defined`, proving the new tests exercised missing planner behavior.
+
+GREEN:
+
+```bash
+PYTHONPATH=tre/common:tre/controller:tre/controller/tests:tre/service-manager python3 -m pytest -q tre/controller/tests/test_planner.py
+```
+
+Result: focused planner tests passed with 7 tests on server 76.
+
+Full slice verification:
+
+```bash
+cd tre && make check && make smoke
+```
+
+Result: passed with 85 tests and `tre smoke ok` on server 76.

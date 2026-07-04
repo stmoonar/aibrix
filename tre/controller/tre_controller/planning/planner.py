@@ -4,7 +4,9 @@ import math
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
+from tre_common.registry import ClusterTopology
 from tre_controller.planning.classify import ModelClassification, ModelRole, ModelState, donor_mock_cost_key
+from tre_sm.allocator.slots import Binding, SlotAllocator
 
 SourceLoop = Literal["rescue", "fairness"]
 
@@ -16,6 +18,13 @@ class PlanConfig:
     scale_step_ratio: float = 0.1
     rescue_due: bool = True
     fairness_due: bool = True
+    model_tp_sizes: dict[str, int] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class ClusterView:
+    topology: ClusterTopology
+    bindings: tuple[Binding, ...]
 
 
 @dataclass(frozen=True)
@@ -73,6 +82,7 @@ def build_plan(
     cfg: PlanConfig,
     active_probe_models: set[str] | None = None,
     inflight_models: set[str] | None = None,
+    cluster_view: ClusterView | None = None,
 ) -> PlanResult:
     active_probe_models = active_probe_models or set()
     inflight_models = inflight_models or set()
@@ -114,6 +124,28 @@ def build_plan(
                 continue
             raw_need = min(_scale_step(recv_pods, cfg.scale_step_ratio), cfg.max_replicas_per_model - recv_pods)
             if raw_need <= 0:
+                continue
+
+            tp_size = cfg.model_tp_sizes.get(recv.model_name, 1)
+            if tp_size > 1 and cluster_view is not None:
+                tp_planned = _try_plan_tp_capacity(
+                    actions,
+                    model=recv.model_name,
+                    tp_size=tp_size,
+                    cluster_view=cluster_view,
+                    events=events,
+                    source_loop="rescue",
+                )
+                if tp_planned:
+                    _add_scale_action(
+                        actions,
+                        deltas,
+                        model=recv.model_name,
+                        delta=1,
+                        reason=tp_planned,
+                        source_loop="rescue",
+                        receiver=recv.model_name,
+                    )
                 continue
 
             gain_from_idle = min(raw_need, remaining_idle) if remaining_idle > 0 else 0
@@ -382,6 +414,34 @@ def build_plan(
             needed -= transfer
 
     return PlanResult(actions, delayed_down_models, probe_upscale_plans, events=events)
+
+
+def _try_plan_tp_capacity(
+    actions: list[Action],
+    *,
+    model: str,
+    tp_size: int,
+    cluster_view: ClusterView,
+    events: list[str],
+    source_loop: SourceLoop,
+) -> str | None:
+    allocator = SlotAllocator(cluster_view.topology, list(cluster_view.bindings))
+    if allocator.find_slot(tp_size) is not None:
+        return "critical_empty_slot"
+
+    migrations = allocator.plan_defrag(tp_size)
+    if migrations:
+        actions.append(
+            DefragAction(
+                migrations=tuple(migrations),
+                reason="critical_tp_defrag",
+                source_loop=source_loop,
+            )
+        )
+        return "critical_tp_defrag"
+
+    events.append(f"capacity_blocked:{model}")
+    return None
 
 
 def _paper_state_incomplete(classifications: list[ModelClassification]) -> bool:

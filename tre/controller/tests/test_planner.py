@@ -7,7 +7,9 @@ from golden.legacy_planner import (
     legacy_build_paper_plan,
 )
 from tre_controller.planning.classify import ModelClassification, ModelRole, ModelState, TauThresholds
-from tre_controller.planning.planner import PlanConfig, ScaleAction, build_plan
+from tre_common.registry import ClusterTopology, NodeSpec
+from tre_controller.planning.planner import ClusterView, DefragAction, PlanConfig, ScaleAction, build_plan
+from tre_sm.allocator.slots import Binding, Migration, Slot
 
 
 def _classification(model: str, state: ModelState, role: ModelRole, z: float | None, tier: str | None = None) -> ModelClassification:
@@ -174,3 +176,93 @@ def test_build_plan_drops_legacy_raw_trs_fallback_when_paper_state_unknown() -> 
     assert plan.actions == []
     assert plan.dropped_legacy_raw_trs is True
     assert plan.events == ["paper_state_incomplete_drop_legacy_raw_trs"]
+
+
+def _tp2_topology() -> ClusterTopology:
+    return ClusterTopology(nodes=(NodeSpec(name="node-a", gpus=4, two_gpu_slots=((0, 1), (2, 3))),))
+
+
+def test_tp_aware_critical_receiver_uses_complete_two_gpu_slot() -> None:
+    classifications = [_classification("tp2", ModelState.CRITICAL, ModelRole.RECEIVER, 0.5)]
+    contexts = {"tp2": {"assigned_replicas": 0, "routable_pods": 0}}
+    cluster_view = ClusterView(
+        topology=_tp2_topology(),
+        bindings=(Binding("serve-a", "m1", Slot("node-a", (0,)), awake=True),),
+    )
+
+    plan = build_plan(
+        model_contexts=contexts,
+        classifications=classifications,
+        model_replicas={"tp2": 0},
+        idle_gpus=2,
+        cfg=PlanConfig(min_replicas_per_model=0, max_replicas_per_model=2, model_tp_sizes={"tp2": 2}),
+        cluster_view=cluster_view,
+    )
+
+    assert [action for action in plan.actions if isinstance(action, DefragAction)] == []
+    scale = next(action for action in plan.actions if isinstance(action, ScaleAction))
+    assert scale.model == "tp2"
+    assert scale.delta == 1
+    assert scale.reason == "critical_empty_slot"
+
+
+def test_tp_aware_critical_receiver_plans_defrag_for_fragmented_two_gpu_capacity() -> None:
+    classifications = [_classification("tp2", ModelState.CRITICAL, ModelRole.RECEIVER, 0.5)]
+    contexts = {"tp2": {"assigned_replicas": 0, "routable_pods": 0}}
+    cluster_view = ClusterView(
+        topology=_tp2_topology(),
+        bindings=(
+            Binding("serve-0", "m1", Slot("node-a", (0,)), awake=True),
+            Binding("serve-2", "m1", Slot("node-a", (2,)), awake=True),
+        ),
+    )
+
+    plan = build_plan(
+        model_contexts=contexts,
+        classifications=classifications,
+        model_replicas={"tp2": 0},
+        idle_gpus=2,
+        cfg=PlanConfig(min_replicas_per_model=0, max_replicas_per_model=2, model_tp_sizes={"tp2": 2}),
+        cluster_view=cluster_view,
+    )
+
+    defrag = next(action for action in plan.actions if isinstance(action, DefragAction))
+    assert defrag.reason == "critical_tp_defrag"
+    assert defrag.migrations == (
+        Migration(
+            serve_id="serve-2",
+            from_slot=Slot("node-a", (2,)),
+            to_slot=Slot("node-a", (1,)),
+        ),
+    )
+    scale = next(action for action in plan.actions if isinstance(action, ScaleAction))
+    assert scale.model == "tp2"
+    assert scale.delta == 1
+    assert scale.reason == "critical_tp_defrag"
+
+
+def test_tp_aware_critical_receiver_records_capacity_blocked_when_no_slot_or_defrag() -> None:
+    classifications = [_classification("tp2", ModelState.CRITICAL, ModelRole.RECEIVER, 0.5)]
+    contexts = {"tp2": {"assigned_replicas": 0, "routable_pods": 0}}
+    cluster_view = ClusterView(
+        topology=_tp2_topology(),
+        bindings=(
+            Binding("serve-0", "m1", Slot("node-a", (0,)), awake=True),
+            Binding("serve-1", "m1", Slot("node-a", (1,)), awake=True),
+            Binding("serve-2", "m1", Slot("node-a", (2,)), awake=True),
+            Binding("serve-3", "m1", Slot("node-a", (3,)), awake=True),
+        ),
+    )
+
+    plan = build_plan(
+        model_contexts=contexts,
+        classifications=classifications,
+        model_replicas={"tp2": 0},
+        idle_gpus=2,
+        cfg=PlanConfig(min_replicas_per_model=0, max_replicas_per_model=2, model_tp_sizes={"tp2": 2}),
+        cluster_view=cluster_view,
+    )
+
+    assert [action for action in plan.actions if isinstance(action, ScaleAction)] == []
+    assert [action for action in plan.actions if isinstance(action, DefragAction)] == []
+    assert plan.events == ["capacity_blocked:tp2"]
