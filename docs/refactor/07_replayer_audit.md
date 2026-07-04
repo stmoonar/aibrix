@@ -26,3 +26,10 @@ Remaining P7 work: Poisson schedules, trace config loading for existing trace fi
 Existing `trace.json` files under the frozen `config/traces_v14/*/` directories are model-keyed JSON objects. Each model maps to segment dictionaries with `start_time`, `end_time`, `rps`, `input_tokens`, and `max_tokens`. The new loader keeps that format intact and maps it to `RpsSegment` records without requiring YAML config parsing.
 
 `build_poisson_schedule()` now pre-generates arrival timestamps with an explicit seed. This satisfies P7's requirement that the dispatcher consumes a fixed schedule rather than deriving arrivals from response progress. Token controls from the trace segments are copied into every scheduled request for later prompt/token construction.
+
+
+## Trace Set Discovery
+
+`discover_trace_set()` reads `INDEX.json` when present and then scans every immediate child directory containing `trace.json`. Indexed workloads are listed first and marked `indexed=True`; additional trace folders are retained and marked `indexed=False` instead of being silently ignored.
+
+Read-only check against `/root/aibrix-main/CustomTraceGenerator/config/traces_v14` parsed 5 cases: `Simultaneous_spike_ramp_twice_tps1o2` from the index plus unindexed `Alternating_hot_model_periodic_A`, `Decode_heavy_burst`, `Prefill_mixed_corner_decode_mix`, and `Sinusoidal_demand`.

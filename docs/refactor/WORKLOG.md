@@ -498,3 +498,11 @@
 - Extended `RpsSegment` and `ScheduledRequest` with token controls, implemented `build_poisson_schedule()`, and added `tre_replayer.traces.loader.load_trace_segments()`.
 - Verified remotely: focused loader/Poisson tests passed with 2 tests and all replayer tests passed with 5 tests.
 - Next P7 work: add trace-set discovery/loading tests for existing trace folders, then implement lint/oracle foundations.
+
+### P7 Replayer Trace Set Discovery Slice
+
+- Added a RED test for `discover_trace_set()` reading `INDEX.json` while retaining unindexed child trace folders; RED failed on missing `discover_trace_set`.
+- Implemented `TraceSet` and `TraceCase` discovery with indexed workloads first and unindexed trace folders appended by name.
+- Verified remotely: focused discovery test passed and all replayer tests passed with 6 tests.
+- Ran a read-only parse of frozen `config/traces_v14`: parsed 5 trace cases, 1 indexed and 4 unindexed, with segment counts recorded in `docs/refactor/07_replayer_audit.md`.
+- Next P7 work: implement lint foundations (capacity model plus C1/C2/C3 reports) and oracle lower-bound checks.
