@@ -42,7 +42,7 @@ class ControllerStateStore:
     def list_unresolved_probes(self) -> list[dict[str, Any]]:
         try:
             raw = self._redis.hgetall(rediskeys.CONTROLLER_SAFESCALE_PROBES_KEY) or {}
-        except AttributeError:
+        except Exception:
             return []
 
         records: list[tuple[str, dict[str, Any]]] = []
@@ -70,7 +70,7 @@ class ControllerStateStore:
                 0,
                 -1,
             )
-        except AttributeError:
+        except Exception:
             return []
 
         entries: list[dict[str, Any]] = []

@@ -108,3 +108,17 @@ def test_controller_state_store_ignores_malformed_records() -> None:
     store = ControllerStateStore(redis)
 
     assert store.list_unresolved_probes() == [{"request_id": "valid", "model": "m", "status": "probing"}]
+
+
+def test_controller_state_store_treats_redis_read_failure_as_empty_restore_state() -> None:
+    class FailingRedis(FakeRedis):
+        def hgetall(self, name):
+            raise RuntimeError("redis unavailable")
+
+        def lrange(self, name, start, end):
+            raise RuntimeError("redis unavailable")
+
+    store = ControllerStateStore(FailingRedis())
+
+    assert store.list_unresolved_probes() == []
+    assert store.load_probe_journal("probe-1") == []
