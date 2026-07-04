@@ -422,3 +422,15 @@
 - Verified GREEN remotely: focused replay tests passed with 3 tests; adjacent replay/loop/planner tests passed with 20 tests.
 - Full quality gate passed remotely: `git diff --check` was clean, and `cd tre && make check && make smoke` completed with 140 tests and `tre smoke ok`.
 - Next P5 work: fast-loop jitter verification under delayed slow-loop scheduling, then reassess remaining P5 closure requirements.
+
+
+### P5 Fast Loop Jitter Verification Slice
+
+- Re-read `REFACTOR_PLAN.md` completely on remote server 76 before starting the jitter verification segment.
+- Inspected controller task assembly, rescue/fairness loop wrappers, and existing loop/app tests; selected the P5 verification gap for fast-loop jitter under slow-loop delay.
+- Added a RED test for an asyncio fast-loop jitter probe with logical 5s rescue interval, 10s fairness interval, and 2s slow-loop delay, requiring rescue intervals to stay within 5±0.5s.
+- Verified RED remotely: focused jitter test failed on missing `tre_controller.loops.jitter`.
+- Implemented `run_fast_loop_jitter_probe()` and `FastLoopJitterProbeResult` using real asyncio tasks with scaled sleeps and logical time conversion.
+- Verified GREEN remotely: focused jitter test passed with 1 test; adjacent jitter/loop/app tests passed with 18 tests.
+- Full quality gate passed remotely: `git diff --check` was clean, and `cd tre && make check && make smoke` completed with 141 tests and `tre smoke ok`.
+- Next P5 work: reassess remaining P5 closure requirements against `REFACTOR_PLAN.md`, especially any missing stateful TRS/SaturationGuard continuity or controller integration gaps before moving toward P6/P7.
