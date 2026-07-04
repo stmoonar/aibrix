@@ -110,3 +110,8 @@ Result: `passed=True`, 600 requests over the default 60 second schedule, P99 sch
 ## Metric Semantics Contract
 
 Added `tre_replayer.metrics` to make two P7 audit decisions explicit in code. TTFT is defined as time from request send to the first SSE content byte arrival, matching the vLLM bench convention called out in the plan. Token controls are `prompt_tokens` and `max_output_tokens`, which are already carried from trace segments into scheduled requests.
+
+
+## Additional Frozen Trace Report
+
+To cover the plan's "existing traces" requirement more broadly, the same placeholder-capacity report was also run against `/root/aibrix-main/CustomTraceGenerator/config/6traces_v6`, which contains 20 trace folders with `trace.json`. The report was written to `docs/refactor/p7_trace_reports/6traces_v6_placeholder_lint.json`. It parsed 20 cases; 0 passed under the low-confidence placeholder capacity, with failures dominated by C2/C3. This reinforces that the report pipeline works, but final trace qualification requires a real `C_m(i,o)` capacity surface.

@@ -581,3 +581,9 @@
 - Implemented `TTFT_DEFINITION`, `TOKEN_CONTROL_FIELDS`, and `metric_semantics()` to preserve P7's TTFT alignment and token-control contract for future live dispatch code.
 - Verified remotely: focused metric semantics test passed and all replayer tests passed with 18 tests.
 - Next P7 work: final closure audit against P7 requirements and tag `p7-done` if evidence is sufficient.
+
+### P7 Additional Trace Report
+
+- Ran the placeholder lint/oracle report helper against frozen `config/6traces_v6` to cover more than the 5 cases available in `traces_v14`.
+- Wrote `docs/refactor/p7_trace_reports/6traces_v6_placeholder_lint.json`: parsed 20 trace cases, 0 passed under the low-confidence placeholder capacity, with failures dominated by C2/C3.
+- This report is audit evidence for the pipeline, not final trace qualification; real capacity surfaces remain a prerequisite for R7/final trace-set freezing.

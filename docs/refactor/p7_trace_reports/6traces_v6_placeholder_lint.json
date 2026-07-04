@@ -1,0 +1,301 @@
+[
+  {
+    "capacity_low_confidence": true,
+    "capacity_source": "placeholder_from_trace_max_rps",
+    "failed_constraints": [
+      "C2",
+      "C3"
+    ],
+    "indexed": true,
+    "max_headroom": 0.33055,
+    "oracle_violation_fraction": 0.0,
+    "passed": false,
+    "path": "/root/aibrix-main/CustomTraceGenerator/config/6traces_v6/Sinusoidal_demand_periodic_balanced/trace.json",
+    "static_violation_duration_s": 0.0,
+    "trace": "Sinusoidal_demand_periodic_balanced"
+  },
+  {
+    "capacity_low_confidence": true,
+    "capacity_source": "placeholder_from_trace_max_rps",
+    "failed_constraints": [
+      "C2",
+      "C3"
+    ],
+    "indexed": true,
+    "max_headroom": 0.277544,
+    "oracle_violation_fraction": 0.0,
+    "passed": false,
+    "path": "/root/aibrix-main/CustomTraceGenerator/config/6traces_v6/Sinusoidal_demand_periodic_phase_shift/trace.json",
+    "static_violation_duration_s": 0.0,
+    "trace": "Sinusoidal_demand_periodic_phase_shift"
+  },
+  {
+    "capacity_low_confidence": true,
+    "capacity_source": "placeholder_from_trace_max_rps",
+    "failed_constraints": [
+      "C2",
+      "C3"
+    ],
+    "indexed": true,
+    "max_headroom": 0.425502,
+    "oracle_violation_fraction": 0.0,
+    "passed": false,
+    "path": "/root/aibrix-main/CustomTraceGenerator/config/6traces_v6/Sinusoidal_demand_periodic_high/trace.json",
+    "static_violation_duration_s": 0.0,
+    "trace": "Sinusoidal_demand_periodic_high"
+  },
+  {
+    "capacity_low_confidence": true,
+    "capacity_source": "placeholder_from_trace_max_rps",
+    "failed_constraints": [
+      "C2",
+      "C3"
+    ],
+    "indexed": true,
+    "max_headroom": 0.31383,
+    "oracle_violation_fraction": 0.0,
+    "passed": false,
+    "path": "/root/aibrix-main/CustomTraceGenerator/config/6traces_v6/Alternating_hot_model_periodic_A/trace.json",
+    "static_violation_duration_s": 0.0,
+    "trace": "Alternating_hot_model_periodic_A"
+  },
+  {
+    "capacity_low_confidence": true,
+    "capacity_source": "placeholder_from_trace_max_rps",
+    "failed_constraints": [
+      "C2",
+      "C3"
+    ],
+    "indexed": true,
+    "max_headroom": 0.271277,
+    "oracle_violation_fraction": 0.0,
+    "passed": false,
+    "path": "/root/aibrix-main/CustomTraceGenerator/config/6traces_v6/Alternating_hot_model_periodic_B/trace.json",
+    "static_violation_duration_s": 0.0,
+    "trace": "Alternating_hot_model_periodic_B"
+  },
+  {
+    "capacity_low_confidence": true,
+    "capacity_source": "placeholder_from_trace_max_rps",
+    "failed_constraints": [
+      "C2",
+      "C3"
+    ],
+    "indexed": true,
+    "max_headroom": 0.276596,
+    "oracle_violation_fraction": 0.0,
+    "passed": false,
+    "path": "/root/aibrix-main/CustomTraceGenerator/config/6traces_v6/Alternating_hot_model_periodic_decode/trace.json",
+    "static_violation_duration_s": 0.0,
+    "trace": "Alternating_hot_model_periodic_decode"
+  },
+  {
+    "capacity_low_confidence": true,
+    "capacity_source": "placeholder_from_trace_max_rps",
+    "failed_constraints": [
+      "C2",
+      "C3"
+    ],
+    "indexed": true,
+    "max_headroom": 0.425532,
+    "oracle_violation_fraction": 0.0,
+    "passed": false,
+    "path": "/root/aibrix-main/CustomTraceGenerator/config/6traces_v6/Simultaneous_spike_ramp_moderate/trace.json",
+    "static_violation_duration_s": 0.0,
+    "trace": "Simultaneous_spike_ramp_moderate"
+  },
+  {
+    "capacity_low_confidence": true,
+    "capacity_source": "placeholder_from_trace_max_rps",
+    "failed_constraints": [
+      "C2",
+      "C3"
+    ],
+    "indexed": true,
+    "max_headroom": 0.425532,
+    "oracle_violation_fraction": 0.0,
+    "passed": false,
+    "path": "/root/aibrix-main/CustomTraceGenerator/config/6traces_v6/Simultaneous_spike_ramp_twice/trace.json",
+    "static_violation_duration_s": 0.0,
+    "trace": "Simultaneous_spike_ramp_twice"
+  },
+  {
+    "capacity_low_confidence": true,
+    "capacity_source": "placeholder_from_trace_max_rps",
+    "failed_constraints": [
+      "C2",
+      "C3"
+    ],
+    "indexed": true,
+    "max_headroom": 0.425532,
+    "oracle_violation_fraction": 0.0,
+    "passed": false,
+    "path": "/root/aibrix-main/CustomTraceGenerator/config/6traces_v6/Simultaneous_Sharp_spike_marked/trace.json",
+    "static_violation_duration_s": 0.0,
+    "trace": "Simultaneous_Sharp_spike_marked"
+  },
+  {
+    "capacity_low_confidence": true,
+    "capacity_source": "placeholder_from_trace_max_rps",
+    "failed_constraints": [
+      "C2",
+      "C3"
+    ],
+    "indexed": true,
+    "max_headroom": 0.5,
+    "oracle_violation_fraction": 0.0,
+    "passed": false,
+    "path": "/root/aibrix-main/CustomTraceGenerator/config/6traces_v6/Decode_heavy_burst_ramp/trace.json",
+    "static_violation_duration_s": 0.0,
+    "trace": "Decode_heavy_burst_ramp"
+  },
+  {
+    "capacity_low_confidence": true,
+    "capacity_source": "placeholder_from_trace_max_rps",
+    "failed_constraints": [
+      "C2",
+      "C3"
+    ],
+    "indexed": true,
+    "max_headroom": 0.5,
+    "oracle_violation_fraction": 0.0,
+    "passed": false,
+    "path": "/root/aibrix-main/CustomTraceGenerator/config/6traces_v6/Decode_heavy_burst_long_tail/trace.json",
+    "static_violation_duration_s": 0.0,
+    "trace": "Decode_heavy_burst_long_tail"
+  },
+  {
+    "capacity_low_confidence": true,
+    "capacity_source": "placeholder_from_trace_max_rps",
+    "failed_constraints": [
+      "C2",
+      "C3"
+    ],
+    "indexed": true,
+    "max_headroom": 0.5,
+    "oracle_violation_fraction": 0.0,
+    "passed": false,
+    "path": "/root/aibrix-main/CustomTraceGenerator/config/6traces_v6/Decode_heavy_Sharp_spike_marked/trace.json",
+    "static_violation_duration_s": 0.0,
+    "trace": "Decode_heavy_Sharp_spike_marked"
+  },
+  {
+    "capacity_low_confidence": true,
+    "capacity_source": "placeholder_from_trace_max_rps",
+    "failed_constraints": [
+      "C2",
+      "C3"
+    ],
+    "indexed": true,
+    "max_headroom": 0.426649,
+    "oracle_violation_fraction": 0.0,
+    "passed": false,
+    "path": "/root/aibrix-main/CustomTraceGenerator/config/6traces_v6/Prefill_mixed_corner_dual_burst/trace.json",
+    "static_violation_duration_s": 0.0,
+    "trace": "Prefill_mixed_corner_dual_burst"
+  },
+  {
+    "capacity_low_confidence": true,
+    "capacity_source": "placeholder_from_trace_max_rps",
+    "failed_constraints": [
+      "C2",
+      "C3"
+    ],
+    "indexed": true,
+    "max_headroom": 0.356383,
+    "oracle_violation_fraction": 0.0,
+    "passed": false,
+    "path": "/root/aibrix-main/CustomTraceGenerator/config/6traces_v6/Prefill_mixed_corner_cross_model/trace.json",
+    "static_violation_duration_s": 0.0,
+    "trace": "Prefill_mixed_corner_cross_model"
+  },
+  {
+    "capacity_low_confidence": true,
+    "capacity_source": "placeholder_from_trace_max_rps",
+    "failed_constraints": [
+      "C2",
+      "C3"
+    ],
+    "indexed": true,
+    "max_headroom": 0.428191,
+    "oracle_violation_fraction": 0.0,
+    "passed": false,
+    "path": "/root/aibrix-main/CustomTraceGenerator/config/6traces_v6/Prefill_mixed_corner_decode_mix/trace.json",
+    "static_violation_duration_s": 0.0,
+    "trace": "Prefill_mixed_corner_decode_mix"
+  },
+  {
+    "capacity_low_confidence": true,
+    "capacity_source": "placeholder_from_trace_max_rps",
+    "failed_constraints": [
+      "C2",
+      "C3"
+    ],
+    "indexed": false,
+    "max_headroom": 0.29798,
+    "oracle_violation_fraction": 0.0,
+    "passed": false,
+    "path": "/root/aibrix-main/CustomTraceGenerator/config/6traces_v6/Alternating_hot_model/trace.json",
+    "static_violation_duration_s": 0.0,
+    "trace": "Alternating_hot_model"
+  },
+  {
+    "capacity_low_confidence": true,
+    "capacity_source": "placeholder_from_trace_max_rps",
+    "failed_constraints": [
+      "C2",
+      "C3"
+    ],
+    "indexed": false,
+    "max_headroom": 0.5,
+    "oracle_violation_fraction": 0.0,
+    "passed": false,
+    "path": "/root/aibrix-main/CustomTraceGenerator/config/6traces_v6/Decode_heavy_burst/trace.json",
+    "static_violation_duration_s": 0.0,
+    "trace": "Decode_heavy_burst"
+  },
+  {
+    "capacity_low_confidence": true,
+    "capacity_source": "placeholder_from_trace_max_rps",
+    "failed_constraints": [
+      "C2"
+    ],
+    "indexed": false,
+    "max_headroom": 0.75,
+    "oracle_violation_fraction": 0.0,
+    "passed": false,
+    "path": "/root/aibrix-main/CustomTraceGenerator/config/6traces_v6/Prefill_mixed_corner/trace.json",
+    "static_violation_duration_s": 0.0,
+    "trace": "Prefill_mixed_corner"
+  },
+  {
+    "capacity_low_confidence": true,
+    "capacity_source": "placeholder_from_trace_max_rps",
+    "failed_constraints": [
+      "C2",
+      "C3"
+    ],
+    "indexed": false,
+    "max_headroom": 0.5,
+    "oracle_violation_fraction": 0.0,
+    "passed": false,
+    "path": "/root/aibrix-main/CustomTraceGenerator/config/6traces_v6/Simultaneous_spike/trace.json",
+    "static_violation_duration_s": 0.0,
+    "trace": "Simultaneous_spike"
+  },
+  {
+    "capacity_low_confidence": true,
+    "capacity_source": "placeholder_from_trace_max_rps",
+    "failed_constraints": [
+      "C2",
+      "C3"
+    ],
+    "indexed": false,
+    "max_headroom": 0.255371,
+    "oracle_violation_fraction": 0.0,
+    "passed": false,
+    "path": "/root/aibrix-main/CustomTraceGenerator/config/6traces_v6/Sinusoidal_demand/trace.json",
+    "static_violation_duration_s": 0.0,
+    "trace": "Sinusoidal_demand"
+  }
+]
