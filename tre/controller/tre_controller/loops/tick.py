@@ -174,8 +174,11 @@ def _model_contexts(
     for model_name, metrics in snapshot.models.items():
         spec = registry.model(model_name)
         counts = cluster_counts.get(model_name)
+        assigned_replicas = metrics.assigned_replicas
         if counts is not None:
-            metrics = replace(metrics, routable_pods=counts[0], assigned_replicas=counts[1])
+            awake_replicas, bound_replicas = counts
+            assigned_replicas = bound_replicas
+            metrics = replace(metrics, routable_pods=awake_replicas, assigned_replicas=awake_replicas)
         result = TRSComputer(ema_alpha=spec.trs.ema_alpha).compute(TRSInput.from_metrics(metrics, spec.trs), theta_m=spec.trs.theta_m)
         signal = get_signal(metrics, spec, signal_source, trs_z_m=result.Z_m)
         contexts[model_name] = {
@@ -192,7 +195,7 @@ def _model_contexts(
             "Y_m": result.Y_m,
             "y_m": result.y_m,
             "routable_pods": metrics.routable_pods,
-            "assigned_replicas": metrics.assigned_replicas,
+            "assigned_replicas": assigned_replicas,
             "is_saturated": result.Q_ctl >= spec.trs.qsat,
         }
     return contexts
