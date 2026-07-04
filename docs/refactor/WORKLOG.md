@@ -661,3 +661,12 @@
 - Implemented tick-level SafeScale conversion for `ShrinkForSlotAction`, using the concrete `serve_id` as the probe pod and `{beneficiary: 1}` as pending upscale.
 - Focused verification passed: `controller/tests/test_planner.py controller/tests/test_loop_ticks.py` passed with 19 tests.
 - Design deviation recorded: existing architecture starts SafeScale probes inside `loops/tick.py`; `safescale_task.py` observes active probes. This preserves the current boundary instead of moving planner actions into the observation task.
+
+### N1.3 Registry Parameter Sync Slice
+
+- Added `tre/deploy/sync_registry_params.py` with unit tests for merging old `model_slo_profiles.json` and `seed_calibration.json` into `tre/deploy/registry.yaml`.
+- Added `tre/deploy/registry_smoke.py` and updated `make smoke` so smoke still validates registry structure and now prints warnings for `theta_m == 0.0` or SLO drift against the old profile source.
+- RED tests covered missing sync/smoke modules, then GREEN verified sync behavior and smoke warnings.
+- During real dry-run, found a YAML-anchor alias bug: multiple registry models shared the same loaded `trs` dict, so updating the first model polluted later model old-values. Added a regression test and fixed sync by copying each model's `slo` and `trs` dict before mutation.
+- Ran dry-run against `/root/aibrix-main/python/tre/configs/model_slo_profiles.json` and `seed_calibration.json`; then executed sync once. Registry now uses old fitted theta values and profile SLO/TRS controls: dsqwen-7b theta 738.67, dsllama-8b theta 738, dsqwen-14b theta 534; TTFT/TPOT SLOs are 500/75 ms with per-model E2E values.
+- `make smoke` after sync printed no parameter warnings and ended with `tre smoke ok`.

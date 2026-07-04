@@ -1,44 +1,103 @@
 cluster:
   nodes:
-    - {name: node-75, gpus: 4, two_gpu_slots: [[0, 1], [2, 3]]}
-    - {name: node-76, gpus: 4, two_gpu_slots: [[0, 1], [2, 3]]}
+  - name: node-75
+    gpus: 4
+    two_gpu_slots:
+    - - 0
+      - 1
+    - - 2
+      - 3
+  - name: node-76
+    gpus: 4
+    two_gpu_slots:
+    - - 0
+      - 1
+    - - 2
+      - 3
 models:
-  - name: dsqwen-7b
-    weights_path: /data/nfs_shared_data/Qwen1.5-7B-Chat
-    tp_size: 1
-    min_replicas: 1
-    max_replicas: 4
-    vllm_image: vllm/vllm-openai:0.10.1-sleep
-    slo: {ttft_p95_ms: 1200, tpot_p95_ms: 100, e2e_p95_ms: 10000}
-    trs: &trs_defaults
-      w_p: 0.04
-      w_d: 1.0
-      lambda_wait: 2.625
-      qmin: 1.0
-      ema_alpha: 0.5
-      theta_m: 0.0
-      tau_crit: 0.8
-      tau_low: 1.0
-      tau_high: 1.25
-      qsat: 4.0
-      epsat: 0.05
-      hsat: 3
-    vllm_extra_args: [--no-enable-prefix-caching, --enable-chunked-prefill, --max-num-batched-tokens, "2048", --swap-space, "16"]
-  - name: dsllama-8b
-    weights_path: /data/nfs_shared_data/DeepSeek-R1-Distill-Llama-8B
-    tp_size: 1
-    min_replicas: 1
-    max_replicas: 4
-    vllm_image: vllm/vllm-openai:0.10.1-sleep
-    slo: {ttft_p95_ms: 1200, tpot_p95_ms: 100, e2e_p95_ms: 10000}
-    trs: *trs_defaults
-    vllm_extra_args: [--no-enable-prefix-caching, --enable-chunked-prefill, --max-num-batched-tokens, "2048", --swap-space, "20"]
-  - name: dsqwen-14b
-    weights_path: /data/nfs_shared_data/Models/DeepSeek-R1-Distill-Qwen-14B
-    tp_size: 2
-    min_replicas: 0
-    max_replicas: 4
-    vllm_image: vllm/vllm-openai:0.10.1-sleep
-    slo: {ttft_p95_ms: 1200, tpot_p95_ms: 100, e2e_p95_ms: 10000}
-    trs: *trs_defaults
-    vllm_extra_args: [--max-model-len, "12288"]
+- name: dsqwen-7b
+  weights_path: /data/nfs_shared_data/Qwen1.5-7B-Chat
+  tp_size: 1
+  min_replicas: 1
+  max_replicas: 4
+  vllm_image: vllm/vllm-openai:0.10.1-sleep
+  slo:
+    ttft_p95_ms: 500.0
+    tpot_p95_ms: 75.0
+    e2e_p95_ms: 12000.0
+  trs:
+    w_p: 0.08
+    w_d: 1.0
+    lambda_wait: 1.875
+    qmin: 1.0
+    ema_alpha: 0.2485
+    theta_m: 738.67
+    tau_crit: 0.7485
+    tau_low: 1.0
+    tau_high: 1.6296
+    qsat: 4.0
+    epsat: 0.05
+    hsat: 3
+  vllm_extra_args:
+  - --no-enable-prefix-caching
+  - --enable-chunked-prefill
+  - --max-num-batched-tokens
+  - '2048'
+  - --swap-space
+  - '16'
+- name: dsllama-8b
+  weights_path: /data/nfs_shared_data/DeepSeek-R1-Distill-Llama-8B
+  tp_size: 1
+  min_replicas: 1
+  max_replicas: 4
+  vllm_image: vllm/vllm-openai:0.10.1-sleep
+  slo:
+    ttft_p95_ms: 500.0
+    tpot_p95_ms: 75.0
+    e2e_p95_ms: 12000.0
+  trs:
+    w_p: 0.08
+    w_d: 1.0
+    lambda_wait: 1.875
+    qmin: 1.0
+    ema_alpha: 0.2485
+    theta_m: 738
+    tau_crit: 0.7485
+    tau_low: 1.0
+    tau_high: 1.6296
+    qsat: 4.0
+    epsat: 0.05
+    hsat: 3
+  vllm_extra_args:
+  - --no-enable-prefix-caching
+  - --enable-chunked-prefill
+  - --max-num-batched-tokens
+  - '2048'
+  - --swap-space
+  - '20'
+- name: dsqwen-14b
+  weights_path: /data/nfs_shared_data/Models/DeepSeek-R1-Distill-Qwen-14B
+  tp_size: 2
+  min_replicas: 0
+  max_replicas: 4
+  vllm_image: vllm/vllm-openai:0.10.1-sleep
+  slo:
+    ttft_p95_ms: 500.0
+    tpot_p95_ms: 75.0
+    e2e_p95_ms: 15000.0
+  trs:
+    w_p: 0.0575
+    w_d: 1.0
+    lambda_wait: 3.0
+    qmin: 1.0
+    ema_alpha: 0.3935
+    theta_m: 534
+    tau_crit: 0.56
+    tau_low: 1.0
+    tau_high: 1.26
+    qsat: 4.0
+    epsat: 0.05
+    hsat: 3
+  vllm_extra_args:
+  - --max-model-len
+  - '12288'
