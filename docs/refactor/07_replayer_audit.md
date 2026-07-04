@@ -38,3 +38,10 @@ Read-only check against `/root/aibrix-main/CustomTraceGenerator/config/traces_v1
 ## Capacity Surface Foundation
 
 Added `tre_calibration.capacity` as the first capacity-surface building block for P7 trace linting. It fits the max SLO-safe RPS at each `(model, input_tokens, output_tokens)` grid point and marks out-of-grid lookups as `nearest_extrapolated` with `low_confidence=True`. This is intentionally conservative until real training-grid interpolation is added.
+
+
+## Lint Foundations
+
+Added `tre_replayer.lint` with the first C1/C2/C3 checks from section 12. C1 computes normalized occupancy from `rho = rps / C_m(i,o)` times model slot width and rejects traces above 95% of total slots. C2 accumulates time where any model exceeds `rho > 1.2` and rejects traces that do not trigger scaling for at least three slow-loop periods. C3 checks the declared headroom tier (`loose`, `medium`, or `tight`) with the plan's +/-0.05 tolerance.
+
+The current C1 implementation is the instantaneous feasibility bound; the full oracle violation-rate check remains to be added in `oracle.py`.

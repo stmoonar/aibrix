@@ -514,3 +514,10 @@
 - Exported capacity helpers from `tre_calibration.__init__`.
 - Verified remotely: focused capacity tests passed with 2 tests and all calibration tests passed with 13 tests.
 - Next P7 work: consume the capacity surface in `tre_replayer.lint` for C1/C2/C3 trace checks.
+
+### P7 Replayer Lint Foundation Slice
+
+- Added RED tests for lint rejecting overcapacity traces with C1 and traces that never trigger scaling with C2; RED failed on missing `tre_replayer.lint`.
+- Implemented `TraceLintReport` and `lint_trace()` using capacity-surface lookups, model slot widths, segment-boundary intervals, C1 instantaneous headroom, C2 static violation duration, and C3 headroom tier checks.
+- Verified remotely: focused lint tests passed with 2 tests and all replayer tests passed with 8 tests.
+- Next P7 work: implement `oracle.py` lower-bound checks and feed oracle violation results into C1 reports.
