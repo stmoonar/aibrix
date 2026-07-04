@@ -392,3 +392,41 @@ cd tre && make check && make smoke
 ```
 
 Result: passed with 104 tests and `tre smoke ok` on server 76.
+
+
+## SnapshotBox / Metrics Task Contract
+
+The metrics task slice introduces the controller-side snapshot boundary required by the P5 three-task loop design. `MetricsStore` remains the only Redis-facing component; `metrics_task` asks it for the last complete aligned metrics window and atomically replaces the in-process `SnapshotBox` value. Rescue and fairness ticks consume only this snapshot and retain their no-Redis/no-HTTP invariant.
+
+Implemented pieces:
+
+- `SnapshotBox` starts empty and supports atomic whole-snapshot replacement through `get()` and `set()`.
+- `refresh_metrics_once()` aligns `now_ms` to the last complete `metrics_window_ms` boundary, calls `store.read_snapshot(start, end)`, and stores the result.
+- Store read failures do not escape the loop boundary. If a previous snapshot exists, the same data is retained with `stale=True`; without previous data, an empty stale snapshot is published at the attempted window end.
+- `metrics_task()` provides the long-running async wrapper using `ControllerConfig.metrics_window_ms` and `monitor_interval_s`, but tests target the deterministic single-refresh function.
+
+### P5-CTRL-010 metrics snapshot task
+
+RED:
+
+```bash
+PYTHONPATH=tre/common:tre/controller:tre/controller/tests:tre/service-manager python3 -m pytest -q tre/controller/tests/test_metrics_task.py
+```
+
+Result: failed during collection because `tre_controller.loops.metrics_task` did not exist.
+
+GREEN:
+
+```bash
+PYTHONPATH=tre/common:tre/controller:tre/controller/tests:tre/service-manager python3 -m pytest -q tre/controller/tests/test_metrics_task.py
+```
+
+Result: focused metrics task tests passed with 4 tests on server 76.
+
+Full slice verification:
+
+```bash
+cd tre && make check && make smoke
+```
+
+Result: passed with 108 tests and `tre smoke ok` on server 76.

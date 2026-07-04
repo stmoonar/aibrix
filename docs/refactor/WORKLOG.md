@@ -310,3 +310,14 @@
 - Verified RED remotely: `tre_controller.loops.fairness_task` was missing. Verified GREEN remotely: focused loop tick tests passed with 3 tests; `cd tre && make check && make smoke` passed with 104 tests and `tre smoke ok`.
 - Scope note: long-running async task loops, `SnapshotBox`, decision snapshot writes, and app assembly remain for later P5 wiring slices.
 - Next P5 work: add SnapshotBox/metrics_task or app assembly around these single-tick functions.
+
+
+### P5 Metrics Snapshot Task Slice
+
+- Re-read `REFACTOR_PLAN.md` completely on remote server 76 before starting the metrics task segment.
+- Read existing `MetricsStore`, controller config, loop tick functions, and metrics store tests to keep the new task aligned with current synchronous store APIs.
+- Added RED tests for `SnapshotBox` replacement, last-complete-window store reads, stale fallback with a previous snapshot, and stale fallback without previous data.
+- Implemented `tre_controller.loops.metrics_task` with a deterministic `refresh_metrics_once()` plus the long-running async `metrics_task()` wrapper for later app assembly.
+- Verified RED remotely: `tre_controller.loops.metrics_task` was missing. Verified GREEN remotely: focused metrics task tests passed with 4 tests.
+- Full quality gate passed remotely: `cd tre && make check && make smoke` completed with 108 tests and `tre smoke ok`.
+- Next P5 work: assemble `app.py` around metrics/rescue/fairness tasks, ActionQueue draining, and ablation switch tests.
