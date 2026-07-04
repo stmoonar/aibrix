@@ -10,7 +10,7 @@ class FakeK8sApi:
 
     def list_namespaced_pod(self, *, namespace, label_selector=None):
         self.last_list = (namespace, label_selector)
-        return list(self.pods)
+        return self.pods
 
     def patch_namespaced_pod(self, *, name, namespace, body):
         self.patches.append((name, namespace, body))
@@ -35,6 +35,11 @@ def pod_dict(name, model, node, cuda, *, phase="Running", annotations=None, dele
         },
         "status": {"phase": phase},
     }
+
+
+class PodListObject:
+    def __init__(self, items):
+        self.items = items
 
 
 def test_k8s_ops_lists_running_pod_snapshots_and_applies_model_selector():
@@ -63,6 +68,22 @@ def test_k8s_ops_lists_running_pod_snapshots_and_applies_model_selector():
             node="node-a",
             env={"CUDA_VISIBLE_DEVICES": "0"},
             annotations={STATE_ANNOTATION: "sleeping"},
+        )
+    ]
+
+
+def test_k8s_ops_accepts_kubernetes_pod_list_objects():
+    api = FakeK8sApi([pod_dict("serve-a", "dsqwen-7b", "node-a", "0")])
+    api.pods = PodListObject(api.pods)
+    ops = K8sOps(api=api, namespace="default")
+
+    assert ops.list_pod_snapshots() == [
+        K8sPodSnapshot(
+            name="serve-a",
+            model="dsqwen-7b",
+            node="node-a",
+            env={"CUDA_VISIBLE_DEVICES": "0"},
+            annotations={},
         )
     ]
 

@@ -29,7 +29,7 @@ class K8sOps:
 
     def list_pod_snapshots(self, *, model: str | None = None) -> list[K8sPodSnapshot]:
         selector = f"{MODEL_LABEL}={model}" if model else None
-        pods = self._api.list_namespaced_pod(namespace=self._namespace, label_selector=selector)
+        pods = _items(self._api.list_namespaced_pod(namespace=self._namespace, label_selector=selector))
         snapshots: list[K8sPodSnapshot] = []
         for pod in pods:
             if _metadata(pod).get("deletionTimestamp"):
@@ -95,3 +95,12 @@ def _container_env(pod) -> dict[str, str]:
             if item.get("name") == CUDA_VISIBLE_DEVICES:
                 env[CUDA_VISIBLE_DEVICES] = str(item.get("value", ""))
     return env
+
+
+def _items(value):
+    if isinstance(value, list):
+        return value
+    items = getattr(value, "items", None)
+    if items is not None:
+        return list(items)
+    return list(value)
