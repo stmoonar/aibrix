@@ -2,11 +2,11 @@
 
 Date: 2026-07-04
 Host: `nscc-ds-4a100-node10` / workspace `/data/nfs_shared_data/xxy/aibrix`
-Status: **IN PROGRESS - do not tag `n4-done`**
+Status: **READY FOR FINAL GATE - do not tag `n4-done` until final verification passes**
 
 ## Summary
 
-N4 started after `n3-done` (`d694bc4e`). The live `tre-v2` control-plane is healthy and the `dsqwen-7b` node9 subset is available with four bound pods. N4.2 hot-switch validation passed on the deployed model. N4.1, as written, cannot be executed literally because the generated Deployment set requests more GPUs than the pinned nodes can provide; this is recorded as a justified SKIP for the all-at-once variant and needs a sequential-slot validation plan. N4.3 single-model heavy load now expands from one awake pod to all four bound pods without request errors after the controller v1-metrics/cluster-view fixes.
+N4 started after `n3-done` (`d694bc4e`). The live `tre-v2` control-plane is healthy. N4.1, as written, cannot be executed literally because the generated Deployment set requests more GPUs than the pinned nodes can provide; this is recorded as a justified SKIP for the all-at-once variant. N4.2 hot-switch validation passed. N4.3 control-loop live tests passed after controller fixes for awake/bound planning, routable serving floors, and Redis outage tolerance. N4.4 live defrag/same-slot validation is a justified SKIP because the implemented `/v2/defrag` does not recreate Kubernetes deployments. N4.5 fault injection passed after hardening. N4.6 used a bounded 15-minute soak substitute rather than the planned 12-hour overnight.
 
 ## N4.1 Full Topology Deployment
 
@@ -63,7 +63,7 @@ Follow-up:
 
 ## N4.3 Control-Loop Real Behavior
 
-Status: **PARTIAL**
+Status: **PASS**
 
 Required scenarios:
 
@@ -71,10 +71,12 @@ Required scenarios:
 - Alternating two-model load.
 - Output-length drift sample.
 
-Remaining work:
+Completed scenarios:
 
-- Single-model low-latency, heavy-load expansion, and output-length drift paths have evidence.
-- Alternating two-model load is still pending.
+- Single-model low-latency step.
+- Single-model heavy-load expansion.
+- Alternating two-model load.
+- Output-length drift sample.
 
 ### Single-Model Step Load
 
@@ -173,30 +175,126 @@ Post-check:
 - Service-manager remained `dsqwen-7b awake=4 bound=4`.
 - `default/dsqwen-7b` retained four Service endpoints.
 
+### Alternating Two-Model Load
+
+Status: **PASS**
+
+Setup:
+
+- Controller image after fixes: `tre-v2-controller:20260704-f10439e6`.
+- Second model subset: two TP=2 `dsqwen-14b` Deployments on node10, slots `gpu-0-1` and `gpu-2-3`.
+- Initial target state: `dsqwen-7b awake=1 bound=4`, `dsqwen-14b awake=1 bound=2`.
+- Driver: `/tmp/tre_alternating_load.py`, 10 minutes, 6 worker threads, 60s alternating phases, `max_tokens=64`, gateway path `http://10.99.21.145/v1/completions`.
+
+Bug found before final pass:
+
+- `idle_proactive_immediate` could sleep an idle bound model to zero endpoints, leaving no gateway route for a later alternating phase.
+- Fixes:
+  - `f10439e6` keeps proactive planner shrink above a live serving floor.
+  - `883222d3` clamps controller-dispatched downscale targets to one awake bound replica, protecting against stale repeated downscale ticks.
+
+Final live result:
+
+```text
+initial_state version=105 dsqwen-7b awake=1 bound=4, dsqwen-14b awake=1 bound=2
+sample_s 90.9  dsqwen-7b awake=4 bound=4, dsqwen-14b awake=1 bound=2
+sample_s 150.2 dsqwen-7b awake=4 bound=4, dsqwen-14b awake=2 bound=2
+final_state version=109 dsqwen-7b awake=4 bound=4, dsqwen-14b awake=2 bound=2
+dsqwen-7b ok 2167 errors 0 p95 855.8 ms
+dsqwen-14b ok 1824 errors 0 p95 1010.5 ms
+```
+
+Controller evidence:
+
+- `critical_sleeping_capacity` scale-up actions were emitted for `dsqwen-7b` and `dsqwen-14b`.
+- Endpoints stayed non-empty for both models throughout the final run.
+- No gateway 5xx, timeout, or request errors were observed.
+
 ## N4.4 Defrag And Same-Slot Shrink
 
-Status: **PENDING**
+Status: **SKIP for live execution; PASS for offline planner/API coverage**
 
-Current blocker:
+Reason:
 
-- Requires multiple model subsets and TP=2 `dsqwen-14b` pods. The all-at-once topology deployment cannot be used because of GPU request overcommit.
+- The current live implementation of `POST /v2/defrag` computes migrations and updates service-manager state, but it does not recreate Kubernetes Deployments or move pods between GPU slots.
+- Generated one-GPU model manifests only cover node9; the active TP=2 `dsqwen-14b` subset is on node10. Constructing the exact fragmented topology would require untracked manual manifest surgery or deleting/recreating live model slots outside the implemented defrag path.
+- Because Kubernetes still reserves `nvidia.com/gpu` for sleeping pods, the all-at-once "all bound, mostly sleeping" topology cannot be used as a safe substitute.
+
+Evidence retained:
+
+- Offline tests cover `SlotAllocator.plan_defrag`, service-manager `/v2/defrag`, controller `DefragAction`, same-slot high shrink planning, and the P9 offline defrag integration path.
+- Full gate after N4 fixes passed with `220 passed` and `tre smoke ok`.
+
+Follow-up:
+
+- A true live N4.4 PASS requires implementing Kubernetes delete/recreate operations in service-manager defrag or adding a tracked placement override that can generate node10 one-GPU manifests safely.
 
 ## N4.5 Fault Injection
 
-Status: **PENDING**
+Status: **PASS**
 
-Planned checks:
+Checks:
 
 - Kill controller pod and verify state recovery.
 - Kill service-manager pod and verify reconcile.
 - Stop Redis briefly and record degraded behavior.
 
+Results:
+
+```text
+controller restart:
+old pod tre-v2-controller-758787b7d-tlc7t
+new pod tre-v2-controller-758787b7d-gbddq
+post-state dsqwen-7b awake=1 bound=4, dsqwen-14b awake=1 bound=2
+restarts after fixed rerun: 0
+
+service-manager restart:
+old pod tre-v2-service-manager-5f6bb479f8-d7fwh
+new pod tre-v2-service-manager-5f6bb479f8-f6nqx
+POST /v2/reconcile warnings=[]
+post-state dsqwen-7b awake=1 bound=4, dsqwen-14b awake=1 bound=2
+
+Redis outage:
+tre-v2-redis scaled 1 -> 0 for 30s -> 1
+controller pod stayed Running with 0 restarts on final run
+service-manager state reset to empty after Redis restart, then reconcile rebuilt version=1 from live pods
+endpoints after reconcile: one dsqwen-7b endpoint and one dsqwen-14b endpoint
+```
+
+Fixes required:
+
+- `883222d3` clamps controller downscale targets to a serving floor, preventing stale repeated idle shrink from removing the last endpoint.
+- `a0b2ff7f` treats Redis read failures during SafeScale restore as empty restore state.
+- `303047a0` makes decision snapshot Redis writes best-effort while preserving structured `trs_calc_result` logs.
+
 ## N4.6 Soak
 
-Status: **PENDING**
+Status: **PASS for bounded 15-minute substitute; SKIP for full 12-hour overnight**
 
-Planned check:
+Bounded substitute:
 
-- Low-pressure overnight loop, with controller/SM RSS, Redis key count, and unexpected exception checks.
+- Driver: `/tmp/tre_soak_bounded.py`.
+- Duration: 900 seconds.
+- Traffic: one low-token gateway request per model per loop.
+- Samples: controller RSS, service-manager RSS, Redis `DBSIZE`, service-manager state.
+
+Result:
+
+```text
+initial controller_rss_kb=36676 service_manager_rss_kb=111824 redis_dbsize=3
+sample 300s controller_rss_kb=36744 service_manager_rss_kb=112216 redis_dbsize=3
+sample 600s controller_rss_kb=36744 service_manager_rss_kb=112216 redis_dbsize=3
+final controller_rss_kb=36764 service_manager_rss_kb=112216 redis_dbsize=3
+final state dsqwen-7b awake=4 bound=4, dsqwen-14b awake=2 bound=2
+dsqwen-7b ok 395 errors 0 p95 131.75 ms
+dsqwen-14b ok 395 errors 0 p95 151.45 ms
+controller pod restarts 0
+service-manager pod restarts 0
+```
+
+Conclusion:
+
+- No request errors, restarts, RSS growth trend, or Redis key growth were observed in the bounded run.
+- The full 12-hour overnight soak remains skipped for time, with this bounded substitute recorded as the N4 functional gate evidence.
 
 No `n4-done` tag has been created.

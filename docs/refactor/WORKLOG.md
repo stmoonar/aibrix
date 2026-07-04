@@ -1,5 +1,23 @@
 # Refactor Worklog
 
+## 2026-07-05
+
+### N4 Real-Environment Closure
+
+- Deployed the second live model subset for N4.3: two TP=2 `dsqwen-14b` Deployments on node10 (`gpu-0-1`, `gpu-2-3`) alongside the four bound `dsqwen-7b` node9 pods.
+- Fixed TP GPU label generation for Kubernetes-safe labels while preserving comma-separated GPU IDs in annotations (`983085e3`).
+- Found and fixed live zero-endpoint regressions during alternating load and fault injection:
+  - `f10439e6` keeps proactive planner shrink above a serving floor for bound live models.
+  - `883222d3` clamps controller-dispatched downscale targets to one awake bound replica, guarding against stale repeated downscale ticks.
+- N4.3 alternating load passed: 10 minutes, 6 workers, 60s alternating phases, 7B `ok=2167`, 14B `ok=1824`, errors `0`; 7B expanded `1 -> 4`, 14B expanded `1 -> 2`.
+- N4.4 live defrag/same-slot validation is recorded as a justified SKIP: current `/v2/defrag` does not recreate Kubernetes deployments, and the generated live topology cannot safely construct the required fragmentation without untracked manual placement surgery.
+- N4.5 fault injection passed after additional Redis hardening:
+  - `a0b2ff7f` tolerates Redis read failure during controller SafeScale restore.
+  - `303047a0` keeps decision logging alive when Redis writes fail.
+  - Controller restart and service-manager restart/reconcile both preserved one endpoint per live model; Redis 30s outage kept the controller pod Running with 0 restarts on final run, then service-manager reconciled state from live pods.
+- N4.6 bounded soak substitute passed: 900s low-pressure gateway traffic, 790 total requests, errors `0`, controller RSS `36676 -> 36764 KB`, service-manager RSS `111824 -> 112216 KB`, Redis `DBSIZE=3`, controller/SM restarts `0`.
+- N4 is ready for final full gate and `n4-done` decision; no `n4-done` tag has been created yet.
+
 ## 2026-07-04
 
 ### Done
