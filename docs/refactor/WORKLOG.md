@@ -626,3 +626,19 @@
 - Added a P8 closure audit to `docs/refactor/08_ui.md`.
 - Evidence covers mock-backed backend APIs, local static frontend serving, no-CDN test coverage, explicit experiment stub, and screenshot skip reason due missing Playwright browser binaries.
 - Next step after final gate: tag `p8-done` and start P9 integration/final report.
+
+### P9 Integration Closeout
+
+- Added `tre_controller.offline_integration.run_offline_integration_step()` and `controller/tests/test_p9_offline_integration.py` to cover the metrics -> rescue decision -> Redis decision snapshot -> ActionQueue -> service-manager v2 path.
+- RED result: focused test initially failed on missing `tre_controller.offline_integration`; after implementation the focused test passed.
+- Verified `cd tre && make check` passed with 176 tests after the P9 integration slice.
+- Ran `cd tre && make manifests`; it wrote 12 deployment manifests.
+- Ran a temporary 5-minute offline L2 integration on localhost: real FastAPI service-manager process plus separate controller-driver process, fake Redis/state, and fixture data pump. Result: 60 ticks, 296.309 seconds, final awake count 2.
+- Copied the 60-line e2e log to `docs/refactor/p9_evidence/offline_e2e_5min.jsonl`.
+- L3 deploy smoke was skipped with reason: active shared cluster services already running, no verified new image deployment artifact, and host `redis-cli` missing for memory preflight. No Kubernetes write operations were performed.
+- Added `docs/refactor/09_final_report.md` with residual run list R1-R7.
+
+### Next After P9 Docs
+
+- Run final `git diff --check`, `cd tre && make manifests`, `cd tre && make check`, and `cd tre && make smoke`.
+- Commit P9 report/evidence, tag `p9-done` if the final gate passes, and leave the worktree clean.
