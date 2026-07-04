@@ -271,3 +271,13 @@
 - Verified GREEN remotely: focused planner tests passed with 7 tests; `cd tre && make check && make smoke` passed with 85 tests and `tre smoke ok`.
 - Scope note: HIGH same-slot shrink remains for the next SafeScale/slot-aware donor slice rather than being approximated at model level.
 - Next P5 work: proceed to SafeScale state machine.
+
+### P5 SafeScale State Machine Slice
+
+- Re-read `REFACTOR_PLAN.md` completely on remote server 76 before starting the SafeScale segment.
+- Read frozen upstream `safescale.py` start/restore/commit/rollback/tail-guard logic and current centralized `SafeScaleConfig`.
+- Added the SafeScale state diagram to `docs/refactor/05_controller_design.md` before production code, per the P5 plan.
+- Added RED tests for probe start persistence, immediate SLO rollback, deadline commit with follow-up upscales, deadline rollback on failed tail health, and restoring unresolved probes from store journal.
+- Implemented `tre_controller.planning.safescale` as a data-only state machine with injected persistence and no Redis/HTTP/Kubernetes calls.
+- Verified RED remotely: `tre_controller.planning.safescale` was missing. Verified GREEN remotely: focused SafeScale tests passed with 6 tests, including restored-journal latency guard coverage.
+- Next P5 work: run full quality gates for this slice, then start loops/action queue wiring.

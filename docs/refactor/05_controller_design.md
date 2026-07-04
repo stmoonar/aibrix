@@ -219,3 +219,57 @@ cd tre && make check && make smoke
 ```
 
 Result: passed with 85 tests and `tre smoke ok` on server 76.
+
+## SafeScale State Machine
+
+The SafeScale migration is split from loop and queue wiring. This slice defines a pure controller-side state machine that can be driven by future loops and can restore unresolved probes from the controller state store.
+
+```text
+START
+  -> start_probe(model, pods, deadline)
+  -> PROBING(pods, deadline, observations)
+
+PROBING
+  -> ROLLBACK when any observation violates TTFT/TPOT SLO
+  -> PROBING while now < deadline and no violation
+  -> COMMIT when now >= deadline and tail guard passes
+  -> ROLLBACK when now >= deadline and tail guard fails
+
+COMMIT
+  -> emit scale_down donor command and pending receiver scale_up commands
+  -> delete unresolved probe from state store
+
+ROLLBACK
+  -> emit unhide donor pods command
+  -> delete unresolved probe from state store
+```
+
+Tail guard contract: latency must remain OK, tail `z_m` must not fall below `tau_low` when traffic is present, and normalized GPU cache must not exceed 0.8 when observed. No-traffic probes may commit if latency remains OK, matching the frozen implementation's conservative idle handling.
+
+The state machine emits data-only commands (`hide`, `unhide`, `scale_down`, `scale_up`) and performs no Redis, HTTP, Kubernetes, or service-manager calls itself. Persistence is an injected store protocol with `save_probe`, `delete_probe`, `list_unresolved_probes`, `append_probe_journal`, and `load_probe_journal`, keeping restart recovery testable without live infrastructure.
+
+### P5-CTRL-006 SafeScale state machine
+
+RED:
+
+```bash
+PYTHONPATH=tre/common:tre/controller:tre/controller/tests python3 -m pytest -q tre/controller/tests/test_safescale.py
+```
+
+Result: failed during collection because `tre_controller.planning.safescale` did not exist.
+
+GREEN:
+
+```bash
+PYTHONPATH=tre/common:tre/controller:tre/controller/tests python3 -m pytest -q tre/controller/tests/test_safescale.py
+```
+
+Result: focused SafeScale state-machine tests passed with 6 tests on server 76.
+
+Full slice verification:
+
+```bash
+cd tre && make check && make smoke
+```
+
+Result: passed with 91 tests and `tre smoke ok` on server 76.
