@@ -594,3 +594,13 @@
 - P7 evidence covers open-loop dispatch, pre-generated deterministic/Poisson schedules, token controls, TTFT semantics, full 60 second precision audit, capacity/design/lint/oracle modules, trace reports for frozen trace sets, and orchestrate shell-flow comparison.
 - Carried forward the explicit limitation that reports use `placeholder_from_trace_max_rps`; they validate tooling but do not qualify a final trace set. Real capacity surfaces and trace repair remain R7/final-report work.
 - Next step after commit and final gate: tag `p7-done`, then start P8 UI.
+
+### P8 UI Backend API Slice
+
+- Started P8 after tagging `p7-done`; read the P8 plan section and service-manager FastAPI patterns.
+- Added RED tests for a mock-backed UI backend aggregating registry topology/model parameters, service-manager state, Redis `tre:v2:decision:latest`, and experiment-panel stub data; RED failed on missing `tre_ui`.
+- Implemented `tre_ui.app.create_ui_app()` with `/healthz`, `/api/cluster`, `/api/models`, `/api/decision/latest`, and `/api/experiments`.
+- Updated `tre/Makefile` so `make check` includes `ui/tests` and adds `tre/ui` to `PYTHONPATH`.
+- Added `docs/refactor/08_ui.md` documenting the backend API slice.
+- Verified remotely: focused UI backend tests passed with 2 tests.
+- Next P8 work: add the static single-page frontend and serve it from the FastAPI app without external CDN use.
