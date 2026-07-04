@@ -8,6 +8,7 @@ from tre_controller.app import ControllerDependencies, build_controller_task_spe
 from tre_controller.loops.cluster_view_task import ClusterViewBox
 from tre_controller.loops.metrics_task import SnapshotBox
 from tre_controller.loops.decision_snapshot import DecisionSnapshotWriter
+from tre_controller.planning.safescale import SafeScaleStateMachine
 
 TRE_ROOT = Path(__file__).resolve().parents[2]
 REGISTRY_PATH = TRE_ROOT / "deploy" / "registry.yaml"
@@ -21,6 +22,10 @@ class FakeQueue:
 class FakeDecisionWriter:
     def write(self, loop_name, snapshot, result) -> None:
         return None
+
+
+class FakeSafeScale:
+    pass
 
 
 class FakeServiceManagerClient:
@@ -66,6 +71,7 @@ def _deps() -> ControllerDependencies:
         sm_client=FakeServiceManagerClient(),
         cluster_view_box=ClusterViewBox(),
         decision_writer=FakeDecisionWriter(),
+        safescale=FakeSafeScale(),
         registry=FakeRegistry(),
     )
 
@@ -125,6 +131,7 @@ def test_create_controller_dependencies_wires_configured_components() -> None:
     assert deps.cluster_view_box.get() is None
     assert isinstance(deps.decision_writer, DecisionSnapshotWriter)
     assert deps.decision_writer._redis is redis
+    assert isinstance(deps.safescale, SafeScaleStateMachine)
     assert deps.registry.model("dsqwen-7b").tp_size == 1
 
 

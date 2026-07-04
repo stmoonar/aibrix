@@ -12,6 +12,7 @@ from tre_controller.loops.decision_snapshot import DecisionSnapshotWriter
 from tre_controller.loops.fairness_task import fairness_task
 from tre_controller.loops.metrics_task import MetricsTaskConfig, SnapshotBox, SnapshotStore, metrics_task
 from tre_controller.loops.rescue_task import rescue_task
+from tre_controller.planning.safescale import SafeScaleStateMachine
 from tre_controller.sm_client import AsyncTransport, ServiceManagerClient
 from tre_controller.store.metrics_store import MetricsStore
 
@@ -28,6 +29,7 @@ class ControllerDependencies:
     sm_client: ServiceManagerClient
     cluster_view_box: ClusterViewBox
     decision_writer: DecisionSnapshotWriter
+    safescale: SafeScaleStateMachine
     registry: Registry
 
 
@@ -65,6 +67,7 @@ def build_controller_task_specs(
                     cfg=cfg,
                     cluster_view_box=deps.cluster_view_box,
                     decision_writer=deps.decision_writer,
+                    safescale=deps.safescale,
                 ),
             )
         )
@@ -78,6 +81,7 @@ def build_controller_task_specs(
                 cfg=cfg,
                 cluster_view_box=deps.cluster_view_box,
                 decision_writer=deps.decision_writer,
+                safescale=deps.safescale,
             ),
         )
     )
@@ -108,6 +112,7 @@ def create_controller_dependencies(
         sm_client=sm_client,
         cluster_view_box=ClusterViewBox(),
         decision_writer=DecisionSnapshotWriter(redis_client),
+        safescale=SafeScaleStateMachine(config=cfg.safescale),
         registry=registry,
     )
 

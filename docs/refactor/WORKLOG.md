@@ -376,3 +376,14 @@
 - Verified GREEN remotely: focused signal source and loop tests passed with 13 tests.
 - Full quality gate passed remotely: `git diff --check` was clean, and `cd tre && make check && make smoke` completed with 130 tests and `tre smoke ok`.
 - Next P5 work: fixture-driven end-to-end tick replay, SafeScale loop integration, and remaining slot-aware donor behavior.
+
+### P5 SafeScale Tick Arbitration Slice
+
+- Re-read `REFACTOR_PLAN.md` completely on remote server 76 before starting the SafeScale tick arbitration segment.
+- Inspected current planner `requires_safescale` actions, SafeScale state-machine commands, action queue dispatch behavior, and controller app assembly.
+- Added RED tests proving a SafeScale-required downscale starts a probe and submits a `HideAction` instead of an immediate scale-down, plus dependency construction for `SafeScaleStateMachine`.
+- Verified RED remotely: focused tests failed on missing `safescale` tick parameter and missing `ControllerDependencies.safescale`.
+- Implemented SafeScale arbitration in `run_planner_tick()`, threaded the state machine through rescue/fairness wrappers, and constructed it in controller dependencies.
+- Verified GREEN remotely: focused loop/app tests passed with 16 tests.
+- Full quality gate passed remotely: `git diff --check` was clean, and `cd tre && make check && make smoke` completed with 131 tests and `tre smoke ok`.
+- Next P5 work: SafeScale observation/commit/rollback loop integration and fixture-driven end-to-end replay.

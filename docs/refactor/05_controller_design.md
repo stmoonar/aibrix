@@ -629,3 +629,43 @@ cd tre && make check && make smoke
 ```
 
 Result: passed with 130 tests and `tre smoke ok` on server 76.
+
+## SafeScale Tick Arbitration
+
+The SafeScale arbitration slice prevents planner actions marked `requires_safescale=True` from being dispatched as immediate scale-downs. The pure planner still emits the intended donor shrink and `probe_upscale_plans`; the tick layer now converts SafeScale-required negative `ScaleAction`s into state-machine probe commands before queue submission.
+
+Implemented behavior:
+
+- `run_planner_tick()` accepts an injected `SafeScaleController` and keeps the existing behavior when none is provided.
+- For `ScaleAction(delta < 0, requires_safescale=True)`, the tick selects the requested number of pods from the current snapshot, starts a SafeScale probe at `snapshot.ts_ms`, and passes pending receiver upscales from `PlanResult.probe_upscale_plans`.
+- Probe `hide` commands are converted into `HideAction`s and submitted to `ActionQueue`; the immediate downscale action is not submitted.
+- Rescue/fairness async wrappers receive the same `SafeScaleStateMachine` through controller dependencies, so runtime task assembly follows the tested path.
+- Tick events include `safescale_<reason>:<model>` for decision snapshots and debugging.
+
+This slice wires the probe start boundary only. Observation/commit/rollback polling and persistent controller state-store backing remain separate P5 work.
+
+### P5-CTRL-016 SafeScale tick arbitration
+
+RED:
+
+```bash
+PYTHONPATH=tre/common:tre/controller:tre/controller/tests:tre/service-manager python3 -m pytest -q tre/controller/tests/test_loop_ticks.py tre/controller/tests/test_controller_app.py
+```
+
+Result: failed because `run_rescue_tick()` did not accept `safescale`, and controller dependencies did not include a SafeScale state machine.
+
+GREEN:
+
+```bash
+PYTHONPATH=tre/common:tre/controller:tre/controller/tests:tre/service-manager python3 -m pytest -q tre/controller/tests/test_loop_ticks.py tre/controller/tests/test_controller_app.py
+```
+
+Result: focused SafeScale arbitration and app wiring tests passed with 16 tests on server 76.
+
+Full slice verification:
+
+```bash
+cd tre && make check && make smoke
+```
+
+Result: passed with 131 tests and `tre smoke ok` on server 76.

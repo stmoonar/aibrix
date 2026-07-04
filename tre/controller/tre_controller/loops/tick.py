@@ -6,7 +6,8 @@ from typing import Protocol
 from tre_common.metrics_schema import MetricsSnapshot, ModelWindowMetrics
 from tre_common.registry import Registry, ModelSpec
 from tre_controller.planning.classify import classify_all_models
-from tre_controller.planning.planner import Action, ClusterView, PlanConfig, build_plan
+from tre_controller.planning.planner import Action, ClusterView, HideAction, PlanConfig, ScaleAction, UnhideAction, build_plan
+from tre_controller.planning.safescale import SafeScaleCommand, SafeScaleDecision
 from tre_controller.signals.sources import get_signal
 from tre_controller.signals.trs import TRSComputer, TRSInput
 
@@ -15,6 +16,17 @@ class PlannerQueue(Protocol):
     def inflight_models(self) -> set[str]: ...
 
     def submit(self, actions) -> object: ...
+
+
+class SafeScaleController(Protocol):
+    def start_probe(
+        self,
+        *,
+        model: str,
+        pods: tuple[str, ...],
+        now_ms: int,
+        pending_upscales: dict[str, int] | None = None,
+    ) -> SafeScaleDecision: ...
 
 
 @dataclass(frozen=True)
@@ -34,6 +46,7 @@ def run_planner_tick(
     cluster_view: ClusterView | None = None,
     active_probe_models: set[str] | None = None,
     signal_source: str = "zm",
+    safescale: SafeScaleController | None = None,
 ) -> LoopTickResult:
     if snapshot.stale:
         return LoopTickResult(submitted=0, events=("snapshot_stale",))
@@ -58,10 +71,69 @@ def run_planner_tick(
         inflight_models=queue.inflight_models(),
         cluster_view=cluster_view,
     )
-    actions = tuple(plan.actions)
+    actions, safescale_events = _apply_safescale(snapshot, tuple(plan.actions), plan.probe_upscale_plans, safescale=safescale)
     if actions:
         queue.submit(actions)
-    return LoopTickResult(submitted=len(actions), actions=actions, events=tuple(plan.events))
+    return LoopTickResult(submitted=len(actions), actions=actions, events=tuple(plan.events) + safescale_events)
+
+
+def _apply_safescale(
+    snapshot: MetricsSnapshot,
+    actions: tuple[Action, ...],
+    probe_upscale_plans: dict[str, dict[str, int]],
+    *,
+    safescale: SafeScaleController | None,
+) -> tuple[tuple[Action, ...], tuple[str, ...]]:
+    if safescale is None:
+        return actions, ()
+
+    converted: list[Action] = []
+    events: list[str] = []
+    for action in actions:
+        if not _requires_safescale_probe(action):
+            converted.append(action)
+            continue
+
+        pods = _pods_to_probe(snapshot, action.model, abs(action.delta))
+        decision = safescale.start_probe(
+            model=action.model,
+            pods=pods,
+            now_ms=snapshot.ts_ms,
+            pending_upscales=probe_upscale_plans.get(action.model, {}),
+        )
+        if decision.status == "none":
+            events.append(f"safescale_probe_skipped:{action.model}:{decision.reason}")
+            continue
+        events.append(f"safescale_{decision.reason}:{action.model}")
+        converted.extend(_commands_to_actions(decision.commands, source_loop=action.source_loop))
+    return tuple(converted), tuple(events)
+
+
+def _requires_safescale_probe(action: Action) -> bool:
+    return isinstance(action, ScaleAction) and action.requires_safescale and action.delta < 0
+
+
+def _pods_to_probe(snapshot: MetricsSnapshot, model: str, count: int) -> tuple[str, ...]:
+    metrics = snapshot.models.get(model)
+    if metrics is None or count <= 0:
+        return ()
+    if metrics.per_pod:
+        pods = sorted({pod.pod for pod in metrics.per_pod.values() if pod.pod})
+    else:
+        pods = []
+    return tuple(pods[:count])
+
+
+def _commands_to_actions(commands: tuple[SafeScaleCommand, ...], *, source_loop: str) -> tuple[Action, ...]:
+    actions: list[Action] = []
+    for command in commands:
+        if command.kind == "hide":
+            actions.append(HideAction(command.model, command.pods, command.reason, source_loop))
+        elif command.kind == "unhide":
+            actions.append(UnhideAction(command.model, command.pods, command.reason, source_loop))
+        elif command.kind in {"scale_down", "scale_up"}:
+            actions.append(ScaleAction(command.model, command.delta, command.reason, source_loop))
+    return tuple(actions)
 
 
 def _model_contexts(snapshot: MetricsSnapshot, registry: Registry, *, signal_source: str = "zm") -> dict[str, dict]:

@@ -5,7 +5,7 @@ from typing import Awaitable, Callable, Protocol
 
 from tre_common.metrics_schema import MetricsSnapshot
 from tre_common.registry import Registry
-from tre_controller.loops.tick import LoopTickResult, PlannerQueue, run_planner_tick
+from tre_controller.loops.tick import LoopTickResult, PlannerQueue, SafeScaleController, run_planner_tick
 from tre_controller.planning.planner import ClusterView
 
 
@@ -33,6 +33,7 @@ def run_rescue_tick(
     cluster_view: ClusterView | None = None,
     active_probe_models: set[str] | None = None,
     signal_source: str = "zm",
+    safescale: SafeScaleController | None = None,
 ) -> LoopTickResult:
     return run_planner_tick(
         snapshot,
@@ -43,6 +44,7 @@ def run_rescue_tick(
         cluster_view=cluster_view,
         active_probe_models=active_probe_models,
         signal_source=signal_source,
+        safescale=safescale,
     )
 
 
@@ -57,6 +59,7 @@ async def rescue_task(
     cluster_view_box: ClusterViewReader | None = None,
     active_probe_models: set[str] | None = None,
     decision_writer: DecisionWriter | None = None,
+    safescale: SafeScaleController | None = None,
 ) -> None:
     while True:
         snapshot = snapshot_box.get()
@@ -68,6 +71,7 @@ async def rescue_task(
                 cluster_view=_current_cluster_view(cluster_view, cluster_view_box),
                 active_probe_models=active_probe_models,
                 signal_source=getattr(cfg, "signal_source", "zm"),
+                safescale=safescale,
             )
             if decision_writer is not None:
                 decision_writer.write("rescue", snapshot, result)

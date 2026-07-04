@@ -1,10 +1,12 @@
 from __future__ import annotations
 
-from tre_common.metrics_schema import MetricsSnapshot, ModelWindowMetrics
+from tre_common.metrics_schema import MetricsSnapshot, ModelWindowMetrics, PodWindowMetrics
 from tre_common.registry import ClusterTopology, ModelSpec, NodeSpec, Registry, SloSpec, TrsParams
 from tre_controller.loops.fairness_task import run_fairness_tick
 from tre_controller.loops.rescue_task import run_rescue_tick
-from tre_controller.planning.planner import ScaleAction
+from tre_controller.config import SafeScaleConfig
+from tre_controller.planning.planner import HideAction, ScaleAction
+from tre_controller.planning.safescale import SafeScaleStateMachine
 
 
 class FakeQueue:
@@ -70,6 +72,65 @@ def _metrics(model: str, *, generation: float, waiting: float, running: float, a
     )
 
 
+
+
+def _registry_with_models(*names: str) -> Registry:
+    base = _registry()
+    template = base.model("critical")
+    return Registry(
+        base.topology(),
+        [
+            ModelSpec(
+                name=name,
+                weights_path=template.weights_path,
+                tp_size=template.tp_size,
+                min_replicas=template.min_replicas,
+                max_replicas=template.max_replicas,
+                vllm_image=template.vllm_image,
+                slo=template.slo,
+                trs=template.trs,
+            )
+            for name in names
+        ],
+    )
+
+
+def _pod_metrics(pod: str) -> PodWindowMetrics:
+    return PodWindowMetrics(
+        pod=pod,
+        prompt_tokens=0.0,
+        generation_tokens=10.0,
+        avg_waiting=0.0,
+        avg_running=1.0,
+        avg_swapping=0.0,
+        kv_cache_hit_rate=0.0,
+        ttft_p95_ms=100.0,
+        tpot_p95_ms=10.0,
+        e2e_p95_ms=1000.0,
+    )
+
+
+def _metrics_with_pods(model: str, *, generation: float, waiting: float, running: float, pods: tuple[str, ...]) -> ModelWindowMetrics:
+    per_pod = {pod: _pod_metrics(pod) for pod in pods}
+    return ModelWindowMetrics(
+        model=model,
+        window_start_ms=0,
+        window_end_ms=60_000,
+        prompt_tokens=0.0,
+        generation_tokens=generation,
+        avg_waiting=waiting,
+        avg_running=running,
+        avg_swapping=0.0,
+        kv_cache_hit_rate=0.0,
+        ttft_p95_ms=100.0,
+        tpot_p95_ms=10.0,
+        e2e_p95_ms=1000.0,
+        routable_pods=len(pods),
+        assigned_replicas=len(pods),
+        per_pod=per_pod,
+    )
+
+
 def test_rescue_tick_skips_stale_snapshot() -> None:
     queue = FakeQueue()
     snapshot = MetricsSnapshot(ts_ms=1, models={}, stale=True)
@@ -98,6 +159,33 @@ def test_rescue_tick_submits_critical_scale_action_from_snapshot_metrics() -> No
     assert action.model == "critical"
     assert action.delta == 1
     assert action.source_loop == "rescue"
+
+
+def test_rescue_tick_converts_safescale_required_downscale_to_probe_hide() -> None:
+    queue = FakeQueue()
+    safescale = SafeScaleStateMachine(config=SafeScaleConfig(default_window_ms=60_000.0))
+    registry = _registry_with_models("critical", "donor")
+    snapshot = MetricsSnapshot(
+        ts_ms=10_000,
+        stale=False,
+        models={
+            "critical": _metrics_with_pods(
+                "critical", generation=50.0, waiting=10.0, running=1.0, pods=("critical-a", "critical-b")
+            ),
+            "donor": _metrics_with_pods(
+                "donor", generation=100.0, waiting=0.0, running=1.0, pods=("donor-a", "donor-b")
+            ),
+        },
+    )
+
+    result = run_rescue_tick(snapshot, queue=queue, registry=registry, safescale=safescale)
+
+    assert result.submitted == 1
+    assert len(queue.submitted) == 1
+    assert queue.submitted[0] == (HideAction("donor", ("donor-a",), "probe_started", "rescue"),)
+    assert result.actions == queue.submitted[0]
+    assert safescale.active_probe("donor").pending_upscales == {"critical": 1}
+    assert "safescale_probe_started:donor" in result.events
 
 
 def test_rescue_tick_honors_latency_signal_source_for_classification() -> None:
