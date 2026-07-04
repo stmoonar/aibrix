@@ -55,3 +55,16 @@ Added `tre_replayer.oracle.compute_oracle_lower_bound()` as the first hand-check
 ## Oracle in Lint Reports
 
 `TraceLintReport` now includes `oracle_violation_fraction`, and C1 combines both plan checks: instantaneous headroom must stay within 95% of total slots and the oracle lower-bound violation fraction must stay below 1%. Short spikes still fail C1 if their instantaneous demand exceeds the hard headroom bound, matching section 12.3.
+
+
+## Offline Dispatch Precision Helper
+
+Added `tre_replayer.precision.run_offline_precision_check()` on top of the open-loop dispatcher. It builds a deterministic stub schedule, dispatches to an immediate async sender, and reports request count, P99 scheduled-vs-actual delay, and actual RPS error against the P7 limits (`P99 < 10ms`, RPS error `< 1%`). Unit tests use injected clock/sleep hooks so `make check` stays fast. A short real-clock smoke with `duration_s=1.0`, `target_rps=20.0` passed with 20 requests, P99 delay about 1.25 ms, and RPS error about 0.12%.
+
+Full P7 audit command to run before phase close:
+
+```bash
+PYTHONPATH=tre/replayer python3 -m tre_replayer.precision
+```
+
+The module default is the required 60 second offline stub dispatch.

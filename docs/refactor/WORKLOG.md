@@ -536,3 +536,11 @@
 - Wired `compute_oracle_lower_bound()` into `lint_trace()` and made C1 consider both max headroom and oracle violation fraction.
 - Verified remotely: focused lint tests passed with 3 tests and all replayer tests passed with 10 tests.
 - Next P7 work: add the offline dispatch precision test with a local stub sender and implement design/orchestrate skeletons.
+
+### P7 Replayer Offline Precision Helper Slice
+
+- Added a RED test for `run_offline_precision_check()` returning pass/fail status, request count, P99 delay, RPS error, and configured limits; RED failed on missing `tre_replayer.precision`.
+- Implemented `tre_replayer.precision` using deterministic schedules and the existing open-loop dispatcher with an immediate async stub sender.
+- Verified remotely: focused precision test passed, all replayer tests passed with 11 tests, and a short real-clock smoke (`duration_s=1.0`, `target_rps=20.0`) passed with 20 requests, P99 delay ~1.25 ms, and RPS error ~0.12%.
+- Documented the full 60 second audit command in `docs/refactor/07_replayer_audit.md`; it remains to run before `p7-done`.
+- Next P7 work: add `design.py` validation/generation skeleton and `orchestrate.py` shell-flow comparison table.
