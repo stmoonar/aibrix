@@ -20,6 +20,7 @@ def test_lint_trace_rejects_overcapacity_trace_with_c1() -> None:
     assert report.passed is False
     assert "C1" in report.failed_constraints
     assert report.max_headroom == 1.5
+    assert report.oracle_violation_fraction == 1.0
 
 
 def test_lint_trace_rejects_trace_that_never_triggers_scaling_with_c2() -> None:
@@ -31,3 +32,16 @@ def test_lint_trace_rejects_trace_that_never_triggers_scaling_with_c2() -> None:
     assert report.passed is False
     assert "C2" in report.failed_constraints
     assert report.static_violation_duration_s == 0.0
+
+
+def test_lint_trace_reports_oracle_violation_fraction_for_short_instant_spike() -> None:
+    capacity = fit_capacity_surface([CapacitySample("m1", 100, 50, 10.0, True)])
+    segments = [
+        RpsSegment("m1", 0.0, 1.0, 11.0, input_tokens=100, max_output_tokens=50),
+        RpsSegment("m1", 1.0, 200.0, 7.5, input_tokens=100, max_output_tokens=50),
+    ]
+
+    report = lint_trace(segments, capacity, model_slot_widths={"m1": 1.0}, total_slots=1.0, headroom_tier="medium")
+
+    assert report.oracle_violation_fraction == 0.005
+    assert "C1" in report.failed_constraints

@@ -5,6 +5,7 @@ from typing import Mapping, Sequence
 
 from tre_calibration.capacity import CapacitySurface
 from tre_replayer.engine.schedule import RpsSegment
+from tre_replayer.oracle import compute_oracle_lower_bound
 
 
 _HEADROOM_TARGETS = {
@@ -20,6 +21,7 @@ class TraceLintReport:
     failed_constraints: list[str]
     max_headroom: float
     static_violation_duration_s: float
+    oracle_violation_fraction: float
     low_confidence_capacity: bool
 
 
@@ -56,8 +58,15 @@ def lint_trace(
             static_violation_duration_s += end_s - start_s
 
     max_headroom = max_occupancy / total_slots if total_slots > 0.0 else float("inf")
+    oracle = compute_oracle_lower_bound(
+        segments,
+        capacity,
+        model_slot_widths=model_slot_widths,
+        total_slots=total_slots,
+    )
+
     failed: list[str] = []
-    if max_headroom > 0.95:
+    if max_headroom > 0.95 or oracle.violation_fraction >= 0.01:
         failed.append("C1")
     if static_violation_duration_s < 3.0 * slow_loop_s:
         failed.append("C2")
@@ -70,6 +79,7 @@ def lint_trace(
         failed_constraints=failed,
         max_headroom=round(max_headroom, 6),
         static_violation_duration_s=static_violation_duration_s,
+        oracle_violation_fraction=oracle.violation_fraction,
         low_confidence_capacity=low_confidence,
     )
 

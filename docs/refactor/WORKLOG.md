@@ -528,3 +528,11 @@
 - Implemented `compute_oracle_lower_bound()` with segment-boundary intervals, normalized demand, model slot widths, violation duration, violation fraction, and max required slots.
 - Verified remotely: focused oracle test passed and all replayer tests passed with 9 tests.
 - Next P7 work: feed oracle lower-bound output into lint reports, then add design/orchestrate skeletons and the offline dispatch precision test.
+
+### P7 Replayer Oracle-Backed Lint Slice
+
+- Added RED lint assertions for `oracle_violation_fraction` in `TraceLintReport`; RED failed because the field was missing.
+- Corrected the short-spike test to preserve section 12.3's instantaneous C1 headroom bound while still checking oracle fraction output.
+- Wired `compute_oracle_lower_bound()` into `lint_trace()` and made C1 consider both max headroom and oracle violation fraction.
+- Verified remotely: focused lint tests passed with 3 tests and all replayer tests passed with 10 tests.
+- Next P7 work: add the offline dispatch precision test with a local stub sender and implement design/orchestrate skeletons.

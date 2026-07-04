@@ -50,3 +50,8 @@ The current C1 implementation is the instantaneous feasibility bound; the full o
 ## Oracle Lower Bound Foundation
 
 Added `tre_replayer.oracle.compute_oracle_lower_bound()` as the first hand-checkable oracle metric. It partitions the trace by segment boundaries, computes required slots from normalized demand and model slot width, and reports total duration, unavoidable overcapacity duration, violation fraction, and max required slots. This is a conservative lower-bound foundation; future slices can add warm-switch timing and integer slot-shape constraints.
+
+
+## Oracle in Lint Reports
+
+`TraceLintReport` now includes `oracle_violation_fraction`, and C1 combines both plan checks: instantaneous headroom must stay within 95% of total slots and the oracle lower-bound violation fraction must stay below 1%. Short spikes still fail C1 if their instantaneous demand exceeds the hard headroom bound, matching section 12.3.
