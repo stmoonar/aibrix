@@ -186,8 +186,26 @@ def test_k8s_ops_writes_binding_annotations():
                     "annotations": {
                         GPU_IDS_ANNOTATION: "0,1",
                         STATE_ANNOTATION: "hidden",
-                    }
+                    },
+                    "labels": {"tre.aibrix.io/routable": "false"},
                 }
             },
         )
     ]
+
+
+def test_k8s_ops_marks_awake_pods_routable():
+    api = FakeK8sApi([])
+    ops = K8sOps(api=api, namespace="tre-v2")
+
+    ops.write_binding_annotations(
+        Binding(
+            serve_id="serve-a",
+            model="dsqwen-7b",
+            slot=Slot("node-a", (0,)),
+            awake=True,
+        ),
+        state="awake",
+    )
+
+    assert api.patches[0][2]["metadata"]["labels"] == {"tre.aibrix.io/routable": "true"}

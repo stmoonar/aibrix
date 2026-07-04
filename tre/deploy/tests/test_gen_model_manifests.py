@@ -75,6 +75,7 @@ def test_build_deployments_encodes_node_gpu_binding_and_vllm_args(tmp_path):
     container = rendered["spec"]["template"]["spec"]["containers"][0]
 
     assert rendered["spec"]["template"]["spec"]["nodeSelector"] == {"kubernetes.io/hostname": "node-75"}
+    assert rendered["spec"]["template"]["metadata"]["labels"]["tre.aibrix.io/routable"] == "true"
     assert {"name": "CUDA_VISIBLE_DEVICES", "value": "0,1"} in container["env"]
     assert container["resources"]["limits"]["nvidia.com/gpu"] == "2"
     assert "--tensor-parallel-size" in container["command"]
@@ -151,7 +152,7 @@ def test_build_services_creates_one_model_service_with_gateway_selector(tmp_path
         "namespace": "default",
         "labels": {"model.aibrix.ai/name": "dsqwen-7b"},
     }
-    assert service["spec"]["selector"] == {"model.aibrix.ai/name": "dsqwen-7b"}
+    assert service["spec"]["selector"] == {"model.aibrix.ai/name": "dsqwen-7b", "tre.aibrix.io/routable": "true"}
     assert service["spec"]["ports"] == [
         {"name": "http", "port": 8000, "targetPort": 8000, "protocol": "TCP"}
     ]

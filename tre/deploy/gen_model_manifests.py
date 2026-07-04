@@ -9,6 +9,8 @@ import yaml
 
 from tre_common.registry import ModelSpec, Registry, load_registry
 
+ROUTABLE_LABEL = "tre.aibrix.io/routable"
+
 
 def feasible_slots(registry: Registry, model: ModelSpec) -> list[tuple[str, tuple[int, ...]]]:
     slots: list[tuple[str, tuple[int, ...]]] = []
@@ -60,7 +62,7 @@ def _service(model: ModelSpec) -> dict:
         "kind": "Service",
         "metadata": {"name": _dns_name(model.name), "namespace": "default", "labels": labels},
         "spec": {
-            "selector": labels,
+            "selector": labels | {ROUTABLE_LABEL: "true"},
             "ports": [
                 {
                     "name": "http",
@@ -102,6 +104,7 @@ def _deployment(model: ModelSpec, node_name: str, gpu_ids: tuple[int, ...]) -> d
         "tre.aibrix.io/managed": "true",
         "tre.aibrix.io/node": node_name,
         "tre.aibrix.io/gpu-ids": gpu_value,
+        ROUTABLE_LABEL: "true",
     }
     return {
         "apiVersion": "apps/v1",

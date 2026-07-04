@@ -3,10 +3,12 @@ kind: Service
 metadata:
   name: dsllama-8b
   namespace: default
-  labels: &id001
+  labels:
     model.aibrix.ai/name: dsllama-8b
 spec:
-  selector: *id001
+  selector:
+    model.aibrix.ai/name: dsllama-8b
+    tre.aibrix.io/routable: 'true'
   ports:
   - name: http
     port: 8000

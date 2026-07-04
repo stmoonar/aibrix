@@ -9,6 +9,7 @@ metadata:
     tre.aibrix.io/managed: 'true'
     tre.aibrix.io/node: nscc-ds-4a100-node9
     tre.aibrix.io/gpu-ids: '2'
+    tre.aibrix.io/routable: 'true'
 spec:
   replicas: 1
   selector:
@@ -22,6 +23,7 @@ spec:
         tre.aibrix.io/managed: 'true'
         tre.aibrix.io/node: nscc-ds-4a100-node9
         tre.aibrix.io/gpu-ids: '2'
+        tre.aibrix.io/routable: 'true'
         app: dsqwen-7b-nscc-ds-4a100-node9-gpu-2
     spec:
       nodeSelector:

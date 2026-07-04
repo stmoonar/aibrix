@@ -13,6 +13,7 @@ from tre_sm.state.reconcile import POD_STATE_AWAKE, POD_STATE_HIDDEN, POD_STATE_
 
 
 MODEL_LABEL = "model.aibrix.ai/name"
+ROUTABLE_LABEL = "tre.aibrix.io/routable"
 _VALID_STATES = {POD_STATE_AWAKE, POD_STATE_SLEEPING, POD_STATE_HIDDEN}
 
 
@@ -65,7 +66,8 @@ class K8sOps:
                 "annotations": {
                     GPU_IDS_ANNOTATION: ",".join(str(gpu) for gpu in binding.slot.gpu_ids),
                     STATE_ANNOTATION: state,
-                }
+                },
+                "labels": {ROUTABLE_LABEL: "true" if state == POD_STATE_AWAKE else "false"},
             }
         }
         self._api.patch_namespaced_pod(name=binding.serve_id, namespace=self._namespace, body=body)
