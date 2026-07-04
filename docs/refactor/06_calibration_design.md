@@ -22,3 +22,10 @@ The first synthetic fixture uses violating windows below TRS 100 and healthy win
 The second slice adds filtered CSV loading for the same row classes: warmup rows, contaminated rows, rows with a filter reason, rows without finite signal/SLO fields, and rows with no token traffic are excluded. Active latency SLOs derive both the hard `slo_met` label and the continuous health score `1 / (1 + max_p95_ratio)`.
 
 The reliability fitter mirrors the archived publish gate at small scale: scan candidate thresholds from low to high, select the first threshold whose `signal >= theta` subset has enough support and SLO attainment, then publish only if scenario-family coverage and confidence pass. The output keeps structured reject reasons for later CLI/profile emission.
+
+
+## Signal Recompute
+
+The third slice extracts the archived TRS formula into `signals.py`. `SignalInputs` carries token totals, queue depths, replica visibility, and KV cache hit rate. `compute_trs()` emits both floor-protected and raw TRS variants using the old formula: prompt tokens are discounted by cache hit rate and weighted by `w_p`, waiting queue depth is scaled by `lambda_wait`, queue floor is bounded by `qmin`, and scores are multiplied by assigned/routable replica ratio.
+
+Candidate scoring currently uses raw TRS (`trs_no_floor`), matching the archived parameter objective path, and evaluates direction with AUROC plus Spearman health correlation. Later slices can grid-search over this helper without mixing formula code into CSV loading or threshold publishing.

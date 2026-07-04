@@ -453,3 +453,12 @@
 - Extended `docs/refactor/06_calibration_design.md` with the CSV-loading and publish-gate contract.
 - Verified remotely: new second-slice tests passed with 3 tests and all calibration tests passed with 6 tests.
 - Next P6 work: add signal recomputation from token/queue columns and parameter search metrics, then wire a profile-patch emission artifact.
+
+### P6 Calibration Signal Recompute Slice
+
+- Added RED tests for the archived TRS formula and candidate-parameter scoring direction metrics; RED failed with `ModuleNotFoundError: No module named 'tre_calibration.signals'`.
+- Added `tre_calibration.signals` with `SignalInputs`, `compute_trs()`, and `score_parameter_candidate()` using the old token, queue, cache-hit, and replica-factor formula.
+- Added `evaluate_signal_direction()` so parameter scoring can report AUROC and Spearman health correlation before threshold selection.
+- Extended `docs/refactor/06_calibration_design.md` with the signal recompute contract.
+- Verified remotely: focused signal tests passed with 2 tests and all calibration tests passed with 8 tests.
+- Next P6 work: add grid search over candidate parameters and emit a deterministic profile patch artifact containing theta and selected parameter metadata.

@@ -53,6 +53,26 @@ def evaluate_threshold(windows: Iterable[CalibrationWindow], *, theta: float) ->
     )
 
 
+@dataclass(frozen=True)
+class SignalDirectionEvaluation:
+    auroc: float
+    spearman_health: float
+
+
+def evaluate_signal_direction(windows: Iterable[CalibrationWindow]) -> SignalDirectionEvaluation:
+    rows = [row for row in windows if math.isfinite(row.signal)]
+    scores = [row.signal for row in rows]
+    healthy_labels = [1 if row.slo_met else 0 for row in rows]
+    health_scores = [
+        row.health_score if row.health_score is not None else (1.0 if row.slo_met else 0.0)
+        for row in rows
+    ]
+    return SignalDirectionEvaluation(
+        auroc=_auc(scores, healthy_labels),
+        spearman_health=_spearman(scores, health_scores),
+    )
+
+
 def _auc(scores: Sequence[float], labels: Sequence[int]) -> float:
     pos = [score for score, label in zip(scores, labels) if label == 1]
     neg = [score for score, label in zip(scores, labels) if label == 0]
