@@ -32,6 +32,8 @@ items:
           labels:
             app.kubernetes.io/name: tre-v2-redis
         spec:
+          nodeSelector:
+            kubernetes.io/hostname: nscc-ds-4a100-node10
           containers:
             - name: redis
               image: redis:7.2-alpine

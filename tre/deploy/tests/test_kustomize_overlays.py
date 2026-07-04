@@ -44,6 +44,9 @@ def test_tre_v2_overlay_declares_components_and_independent_redis() -> None:
     assert _env(controller)["TRE_SERVICE_MANAGER_URL"] == "http://tre-v2-service-manager:8000"
     assert _env(sm)["TRE_REDIS_URL"] == "redis://tre-v2-redis:6379/0"
     assert _env(ui)["TRE_SERVICE_MANAGER_URL"] == "http://tre-v2-service-manager:8000"
+    assert _node_selector(controller) == {"kubernetes.io/hostname": "nscc-ds-4a100-node10"}
+    assert _node_selector(sm) == {"kubernetes.io/hostname": "nscc-ds-4a100-node10"}
+    assert _node_selector(ui) == {"kubernetes.io/hostname": "nscc-ds-4a100-node10"}
 
 
 def test_ablation_overlays_patch_only_controller_env() -> None:
@@ -73,3 +76,7 @@ def _image(deployment: dict) -> str:
 def _env(deployment: dict) -> dict[str, str]:
     env = deployment["spec"]["template"]["spec"]["containers"][0].get("env", [])
     return {item["name"]: item["value"] for item in env}
+
+
+def _node_selector(deployment: dict) -> dict[str, str]:
+    return deployment["spec"]["template"]["spec"].get("nodeSelector", {})

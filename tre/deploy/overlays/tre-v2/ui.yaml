@@ -16,6 +16,8 @@ spec:
         app.kubernetes.io/name: tre-v2-ui
     spec:
       serviceAccountName: tre-v2-ui
+      nodeSelector:
+        kubernetes.io/hostname: nscc-ds-4a100-node10
       containers:
         - name: ui
           image: tre-v2-ui:20260704-b9ee9740
