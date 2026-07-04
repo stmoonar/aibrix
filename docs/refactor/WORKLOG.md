@@ -574,3 +574,10 @@
 - Ran the required 60 second offline precision command: `PYTHONPATH=tre/replayer python3 -m tre_replayer.precision`.
 - Result on server 76: passed with 600 requests, P99 scheduled-vs-actual delay 1.533 ms, and actual RPS error 0.000019.
 - Next P7 work: final phase audit against each P7 requirement, then tag `p7-done` if the remaining evidence is sufficient or record specific gaps before moving to P8.
+
+### P7 Replayer Metric Semantics Slice
+
+- Added a RED test for code-level TTFT and token-control semantics; RED failed on missing `tre_replayer.metrics`.
+- Implemented `TTFT_DEFINITION`, `TOKEN_CONTROL_FIELDS`, and `metric_semantics()` to preserve P7's TTFT alignment and token-control contract for future live dispatch code.
+- Verified remotely: focused metric semantics test passed and all replayer tests passed with 18 tests.
+- Next P7 work: final closure audit against P7 requirements and tag `p7-done` if evidence is sufficient.

@@ -105,3 +105,8 @@ PYTHONPATH=tre/replayer python3 -m tre_replayer.precision
 ```
 
 Result: `passed=True`, 600 requests over the default 60 second schedule, P99 scheduled-vs-actual delay 1.533 ms, and actual RPS error 0.000019. This satisfies the P7 thresholds (`P99 < 10ms`, RPS error `< 1%`).
+
+
+## Metric Semantics Contract
+
+Added `tre_replayer.metrics` to make two P7 audit decisions explicit in code. TTFT is defined as time from request send to the first SSE content byte arrival, matching the vLLM bench convention called out in the plan. Token controls are `prompt_tokens` and `max_output_tokens`, which are already carried from trace segments into scheduled requests.
