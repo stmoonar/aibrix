@@ -9,6 +9,10 @@ from tre_controller.loops.tick import LoopTickResult, PlannerQueue, run_planner_
 from tre_controller.planning.planner import ClusterView
 
 
+class ClusterViewReader(Protocol):
+    def get(self) -> ClusterView | None: ...
+
+
 class SnapshotReader(Protocol):
     def get(self) -> MetricsSnapshot | None: ...
 
@@ -44,6 +48,7 @@ async def fairness_task(
     cfg: FairnessTaskConfig,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     cluster_view: ClusterView | None = None,
+    cluster_view_box: ClusterViewReader | None = None,
     active_probe_models: set[str] | None = None,
 ) -> None:
     while True:
@@ -53,7 +58,18 @@ async def fairness_task(
                 snapshot,
                 queue=queue,
                 registry=registry,
-                cluster_view=cluster_view,
+                cluster_view=_current_cluster_view(cluster_view, cluster_view_box),
                 active_probe_models=active_probe_models,
             )
         await sleep(cfg.fairness_interval_s)
+
+
+def _current_cluster_view(
+    cluster_view: ClusterView | None,
+    cluster_view_box: ClusterViewReader | None,
+) -> ClusterView | None:
+    if cluster_view is not None:
+        return cluster_view
+    if cluster_view_box is None:
+        return None
+    return cluster_view_box.get()

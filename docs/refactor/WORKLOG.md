@@ -343,3 +343,14 @@
 - Verified RED remotely: `create_controller_dependencies()` and `main()` were missing. Verified GREEN remotely: focused controller app tests passed with 6 tests.
 - Full quality gate passed remotely: `cd tre && make check && make smoke` completed with 117 tests and `tre smoke ok`.
 - Next P5 work: service-manager state polling into planner `ClusterView`, decision snapshot writing to `tre:v2:decision:latest`, and then fixture-driven end-to-end tick replay.
+
+
+### P5 ClusterView Cache Slice
+
+- Re-read `REFACTOR_PLAN.md` completely on remote server 76 before starting the cluster-view segment.
+- Inspected planner `ClusterView`, service-manager v2 state output, current app assembly, and rescue/fairness wrapper behavior.
+- Added RED tests for v2 state to `ClusterView` conversion, successful/failed cache refresh, app task assembly including a cluster-view task, and rescue tick use of cached TP-aware cluster view.
+- Implemented `tre_controller.loops.cluster_view_task` plus `ClusterViewBox`, wired app dependencies/task specs, and made rescue/fairness wrappers read the latest cached view per tick.
+- Verified RED remotely: `tre_controller.loops.cluster_view_task` was missing. Verified GREEN remotely: focused cluster-view/app/loop tests passed with 15 tests.
+- Full quality gate passed remotely: `cd tre && make check && make smoke` completed with 121 tests and `tre smoke ok`.
+- Next P5 work: decision snapshot writing to `tre:v2:decision:latest`, then fixture-driven end-to-end tick replay.

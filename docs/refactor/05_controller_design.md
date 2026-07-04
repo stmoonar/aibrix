@@ -510,3 +510,42 @@ cd tre && make check && make smoke
 ```
 
 Result: passed with 117 tests and `tre smoke ok` on server 76.
+
+
+## ClusterView Cache Contract
+
+The cluster-view slice connects service-manager `/v2/state` to planner TP-aware capacity decisions without allowing rescue or fairness loops to perform HTTP calls. Service-manager polling is isolated in a dedicated async task that refreshes a local `ClusterViewBox`; planner loop wrappers read that cached view at tick time.
+
+Implemented pieces:
+
+- `cluster_view_from_state()` converts v2 state bindings into planner `ClusterView` using registry topology and service-manager binding fields (`serve_id`, `model`, `node`, `gpu_ids`, `awake`, `hidden`).
+- `ClusterViewBox` holds the latest cached cluster view and supports whole-view replacement.
+- `refresh_cluster_view_once()` calls `ServiceManagerClient.get_state()`, replaces the cached view on success, and keeps the previous view on failure.
+- `cluster_view_task()` polls state at the fairness interval; app task assembly starts it whenever scaling is enabled.
+- `rescue_task()` and `fairness_task()` now read the latest `ClusterViewBox` value per tick and still perform no direct HTTP calls.
+
+### P5-CTRL-013 cluster-view cache
+
+RED:
+
+```bash
+PYTHONPATH=tre/common:tre/controller:tre/controller/tests:tre/service-manager python3 -m pytest -q tre/controller/tests/test_cluster_view_task.py tre/controller/tests/test_controller_app.py tre/controller/tests/test_loop_ticks.py
+```
+
+Result: failed during collection because `tre_controller.loops.cluster_view_task` did not exist.
+
+GREEN:
+
+```bash
+PYTHONPATH=tre/common:tre/controller:tre/controller/tests:tre/service-manager python3 -m pytest -q tre/controller/tests/test_cluster_view_task.py tre/controller/tests/test_controller_app.py tre/controller/tests/test_loop_ticks.py
+```
+
+Result: focused cluster-view/app/loop tests passed with 15 tests on server 76.
+
+Full slice verification:
+
+```bash
+cd tre && make check && make smoke
+```
+
+Result: passed with 121 tests and `tre smoke ok` on server 76.

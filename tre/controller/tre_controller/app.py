@@ -7,6 +7,7 @@ from typing import Any, Awaitable, Callable, Mapping
 from tre_common.registry import Registry, load_registry
 from tre_controller.config import ControllerConfig
 from tre_controller.loops.action_queue import ActionQueue
+from tre_controller.loops.cluster_view_task import ClusterViewBox, cluster_view_task
 from tre_controller.loops.fairness_task import fairness_task
 from tre_controller.loops.metrics_task import MetricsTaskConfig, SnapshotBox, SnapshotStore, metrics_task
 from tre_controller.loops.rescue_task import rescue_task
@@ -23,6 +24,8 @@ class ControllerDependencies:
     store: SnapshotStore
     snapshot_box: SnapshotBox
     queue: ActionQueue
+    sm_client: ServiceManagerClient
+    cluster_view_box: ClusterViewBox
     registry: Registry
 
 
@@ -42,17 +45,36 @@ def build_controller_task_specs(
     if not bool(getattr(cfg, "enable_tre_scaling", True)):
         return tuple(specs)
 
+    specs.append(
+        ControllerTaskSpec(
+            "cluster_view",
+            lambda: cluster_view_task(deps.sm_client, deps.registry.topology(), deps.cluster_view_box, cfg),
+        )
+    )
+
     if not bool(getattr(cfg, "ablation_disable_fast_loop", False)):
         specs.append(
             ControllerTaskSpec(
                 "rescue",
-                lambda: rescue_task(deps.snapshot_box, queue=deps.queue, registry=deps.registry, cfg=cfg),
+                lambda: rescue_task(
+                    deps.snapshot_box,
+                    queue=deps.queue,
+                    registry=deps.registry,
+                    cfg=cfg,
+                    cluster_view_box=deps.cluster_view_box,
+                ),
             )
         )
     specs.append(
         ControllerTaskSpec(
             "fairness",
-            lambda: fairness_task(deps.snapshot_box, queue=deps.queue, registry=deps.registry, cfg=cfg),
+            lambda: fairness_task(
+                deps.snapshot_box,
+                queue=deps.queue,
+                registry=deps.registry,
+                cfg=cfg,
+                cluster_view_box=deps.cluster_view_box,
+            ),
         )
     )
     specs.append(ControllerTaskSpec("action_queue", lambda: deps.queue.run()))
@@ -79,6 +101,8 @@ def create_controller_dependencies(
         store=store,
         snapshot_box=SnapshotBox(),
         queue=ActionQueue(sm_client),
+        sm_client=sm_client,
+        cluster_view_box=ClusterViewBox(),
         registry=registry,
     )
 

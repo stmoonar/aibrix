@@ -3,7 +3,9 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
+from tre_common.registry import ClusterTopology, NodeSpec
 from tre_controller.app import ControllerDependencies, build_controller_task_specs
+from tre_controller.loops.cluster_view_task import ClusterViewBox
 from tre_controller.loops.metrics_task import SnapshotBox
 
 TRE_ROOT = Path(__file__).resolve().parents[2]
@@ -13,6 +15,18 @@ REGISTRY_PATH = TRE_ROOT / "deploy" / "registry.yaml"
 class FakeQueue:
     async def run(self) -> None:
         return None
+
+
+class FakeServiceManagerClient:
+    async def get_state(self) -> dict:
+        return {"bindings": []}
+
+
+class FakeRegistry:
+    def topology(self) -> ClusterTopology:
+        return ClusterTopology(
+            nodes=(NodeSpec(name="node-a", gpus=4, two_gpu_slots=((0, 1), (2, 3))),)
+        )
 
 
 class EmptyRedis:
@@ -43,7 +57,9 @@ def _deps() -> ControllerDependencies:
         store=object(),
         snapshot_box=SnapshotBox(),
         queue=FakeQueue(),
-        registry=object(),
+        sm_client=FakeServiceManagerClient(),
+        cluster_view_box=ClusterViewBox(),
+        registry=FakeRegistry(),
     )
 
 
@@ -52,6 +68,7 @@ def test_build_controller_task_specs_includes_all_runtime_tasks_by_default() -> 
 
     assert tuple(spec.name for spec in specs) == (
         "metrics",
+        "cluster_view",
         "rescue",
         "fairness",
         "action_queue",
@@ -61,7 +78,7 @@ def test_build_controller_task_specs_includes_all_runtime_tasks_by_default() -> 
 def test_build_controller_task_specs_honors_fast_loop_ablation() -> None:
     specs = build_controller_task_specs(_deps(), _cfg(ablation_disable_fast_loop=True))
 
-    assert tuple(spec.name for spec in specs) == ("metrics", "fairness", "action_queue")
+    assert tuple(spec.name for spec in specs) == ("metrics", "cluster_view", "fairness", "action_queue")
 
 
 def test_build_controller_task_specs_disables_scaling_tasks_but_keeps_metrics() -> None:
@@ -96,7 +113,9 @@ def test_create_controller_dependencies_wires_configured_components() -> None:
     assert deps.store._percentile_mode == "interpolated"
     assert isinstance(deps.snapshot_box, SnapshotBox)
     assert isinstance(deps.queue, ActionQueue)
-    assert isinstance(deps.queue._client, ServiceManagerClient)
+    assert deps.queue._client is deps.sm_client
+    assert isinstance(deps.sm_client, ServiceManagerClient)
+    assert deps.cluster_view_box.get() is None
     assert deps.registry.model("dsqwen-7b").tp_size == 1
 
 

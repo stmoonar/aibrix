@@ -183,3 +183,65 @@ def test_fairness_task_loop_skips_missing_snapshot_and_sleeps_configured_interva
 
     assert _stop_sleep.calls == [10.0]
     assert queue.submitted == []
+
+
+def test_rescue_task_loop_uses_latest_cluster_view_from_box() -> None:
+    import asyncio
+
+    from tre_controller.loops.cluster_view_task import ClusterViewBox
+    from tre_controller.loops.metrics_task import SnapshotBox
+    from tre_controller.loops.rescue_task import rescue_task
+    from tre_controller.planning.planner import ClusterView, DefragAction, ScaleAction
+    from tre_sm.allocator.slots import Binding, Migration, Slot
+
+    base = _registry()
+    tp2_spec = base.model("critical")
+    tp2_spec = type(tp2_spec)(
+        name=tp2_spec.name,
+        weights_path=tp2_spec.weights_path,
+        tp_size=2,
+        min_replicas=tp2_spec.min_replicas,
+        max_replicas=tp2_spec.max_replicas,
+        vllm_image=tp2_spec.vllm_image,
+        slo=tp2_spec.slo,
+        trs=tp2_spec.trs,
+    )
+    registry = Registry(base.topology(), [tp2_spec])
+    queue = FakeQueue()
+    snapshot = MetricsSnapshot(
+        ts_ms=1,
+        stale=False,
+        models={"critical": _metrics("critical", generation=50.0, waiting=10.0, running=1.0, assigned=0)},
+    )
+    view = ClusterView(
+        topology=registry.topology(),
+        bindings=(
+            Binding("serve-0", "m1", Slot("node-a", (0,)), awake=True),
+            Binding("serve-2", "m1", Slot("node-a", (2,)), awake=True),
+        ),
+    )
+    cfg = type("Cfg", (), {"rescue_interval_s": 5.0})()
+    _stop_sleep.calls = []
+
+    try:
+        asyncio.run(
+            rescue_task(
+                SnapshotBox(snapshot),
+                queue=queue,
+                registry=registry,
+                cfg=cfg,
+                sleep=_stop_sleep,
+                cluster_view_box=ClusterViewBox(view),
+            )
+        )
+    except StopLoop:
+        pass
+
+    actions = queue.submitted[0]
+    defrag = next(action for action in actions if isinstance(action, DefragAction))
+    scale = next(action for action in actions if isinstance(action, ScaleAction))
+    assert defrag.migrations == (
+        Migration("serve-2", Slot("node-a", (2,)), Slot("node-a", (1,))),
+    )
+    assert scale.reason == "critical_tp_defrag"
+    assert _stop_sleep.calls == [5.0]
