@@ -230,6 +230,38 @@ def test_v2_put_target_allocates_new_binding_when_free_slot_exists():
     ]
 
 
+def test_v2_put_target_rejects_state_only_create_when_runtime_ops_are_enabled():
+    from tre_sm.allocator.topology import K8sPodSnapshot
+
+    store = StateStore(FakeRedis())
+    original = [Binding("serve-a", "m1", Slot("node-a", (0,)), awake=True)]
+    store.save(original, expected_version=0)
+    service = ServiceManagerV2(
+        registry(),
+        store,
+        runtime_ops=FakeRuntimeOps(
+            [
+                K8sPodSnapshot(
+                    name="serve-a",
+                    model="m1",
+                    node="node-a",
+                    env={"CUDA_VISIBLE_DEVICES": "0"},
+                    pod_ip="10.0.0.1",
+                )
+            ]
+        ),
+        vllm_ops=FakeVllmOps(),
+    )
+
+    try:
+        service.put_model_target("m1", wake_replicas=2)
+    except ValueError as exc:
+        assert "runtime create is not implemented" in str(exc)
+    else:
+        raise AssertionError("expected runtime create to fail")
+    assert store.load().bindings == original
+
+
 def test_v2_fastapi_routes_delegate_to_service_layer():
     store = StateStore(FakeRedis())
     store.save(

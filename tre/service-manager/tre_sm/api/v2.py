@@ -60,6 +60,8 @@ class ServiceManagerV2:
 
         snapshot = self._store.load()
         model_bindings = [binding for binding in snapshot.bindings if binding.model == model]
+        if self._runtime_ops is not None and wake_replicas > len(model_bindings):
+            raise ValueError("runtime create is not implemented for target growth beyond existing bindings")
         awake = [binding for binding in model_bindings if binding.awake]
         actions: list[dict] = []
         updated_by_serve = {binding.serve_id: binding for binding in snapshot.bindings}
