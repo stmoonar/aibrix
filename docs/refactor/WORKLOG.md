@@ -471,3 +471,12 @@
 - Extended `docs/refactor/06_calibration_design.md` with the search and profile-patch contract.
 - Verified remotely: focused grid/profile tests passed with 2 tests and all calibration tests passed with 10 tests.
 - Next P6 work: wire a small calibration CLI over CSV input and synthetic fixture output, then run final P6 verification/tagging.
+
+### P6 Calibration CLI Slice
+
+- Added a RED test for a synthetic CSV-to-profile-patch CLI flow; RED failed with `ModuleNotFoundError: No module named 'tre_calibration.cli'`.
+- Implemented `tre_calibration.cli.main()` with argparse input, filtered CSV loading, reliability theta fitting, direction metric scoring, and sorted JSON profile-patch output.
+- Kept the CLI artifact-only: it writes a patch and does not mutate `tre/deploy/registry.yaml`.
+- Extended `docs/refactor/06_calibration_design.md` with the CLI artifact contract.
+- Verified remotely: focused CLI test passed and all calibration tests passed with 11 tests.
+- Next P6 work: final phase audit, full verification, and `p6-done` tag if the audit stays clean.

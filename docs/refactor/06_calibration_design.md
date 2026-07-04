@@ -34,3 +34,8 @@ Candidate scoring currently uses raw TRS (`trs_no_floor`), matching the archived
 ## Parameter Search and Profile Patch
 
 The fourth slice adds a deterministic grid-search wrapper over candidate `w_p`, `lambda_wait`, and `qmin` values. Candidate ranking uses objective first, then AUROC and Spearman health direction, with smaller parameters as final tie-breakers for reproducibility. The profile patch builder is intentionally separate from registry mutation: it returns a stable payload containing publish status, theta fit gates, selected TRS parameters, and scoring metrics. A later CLI can decide whether to write this payload beside a run or apply it to `registry.yaml`.
+
+
+## CLI Artifact
+
+The initial CLI is deliberately artifact-only. It reads a filtered window CSV, applies latency SLO labels, fits theta with the reliability gate, evaluates the CSV signal direction, and writes a sorted JSON profile patch. It does not mutate `registry.yaml`; applying or rejecting the patch remains an explicit operator step.
