@@ -99,6 +99,7 @@ Rules:
 - The model selector uses `model.aibrix.ai/name=<model>`.
 - `write_binding_annotations()` writes `tre.aibrix.io/gpu-ids` and `tre.aibrix.io/state` in Kubernetes patch body form.
 - Unknown pod states are rejected before any patch call.
+- N4b.2 extends this boundary with Deployment lifecycle methods. `delete_model_deployment()` deletes the deterministic Deployment name derived from `(model, node, gpu_ids)`. `create_model_deployment()` reuses `tre/deploy/gen_model_manifests.py`'s template helpers as the single source of pod specs. `wait_pod_ready()` resolves the actual Ready pod through the created Deployment's `app` label because Kubernetes pod names differ from Deployment names.
 
 ## vLLM Ops Contract
 

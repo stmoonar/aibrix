@@ -21,6 +21,14 @@ class RuntimePodOps(Protocol):
 
     def write_binding_annotations(self, binding: Binding, *, state: str) -> None: ...
 
+    def delete_model_deployment(self, binding: Binding) -> str: ...
+
+    def create_model_deployment(self, model: str, slot: Slot) -> str: ...
+
+    def wait_pod_deleted(self, serve_id: str): ...
+
+    def wait_pod_ready(self, serve_id: str) -> K8sPodSnapshot: ...
+
 
 class VllmRuntimeOps(Protocol):
     def sleep(self, pod_ip: str, *, port: int | None = None): ...
@@ -60,7 +68,7 @@ class ServiceManagerV2:
 
         snapshot = self._store.load()
         model_bindings = [binding for binding in snapshot.bindings if binding.model == model]
-        if self._runtime_ops is not None and wake_replicas > len(model_bindings):
+        if self._runtime_ops is not None and wake_replicas > len(model_bindings) and not self._has_deployment_ops():
             raise ValueError("runtime create is not implemented for target growth beyond existing bindings")
         awake = [binding for binding in model_bindings if binding.awake]
         actions: list[dict] = []
@@ -84,12 +92,15 @@ class ServiceManagerV2:
                         raise ValueError(f"no free slot for {model} tp_size={spec.tp_size}")
                     serve_id = _next_serve_id(model, existing_serve_ids)
                     allocator.bind(serve_id, model, slot, awake=True)
-                    existing_serve_ids.add(serve_id)
-                    updated_by_serve[serve_id] = Binding(serve_id, model, slot, awake=True)
+                    binding = Binding(serve_id, model, slot, awake=True)
+                    if self._has_deployment_ops():
+                        binding = self._create_and_wake_runtime_binding(model, slot)
+                    existing_serve_ids.add(binding.serve_id)
+                    updated_by_serve[binding.serve_id] = binding
                     actions.append(
                         {
                             "action": "create",
-                            "serve_id": serve_id,
+                            "serve_id": binding.serve_id,
                             "node": slot.node,
                             "gpu_ids": list(slot.gpu_ids),
                         }
@@ -170,25 +181,31 @@ class ServiceManagerV2:
         updated_by_serve = {binding.serve_id: binding for binding in snapshot.bindings}
         for migration in migrations:
             binding = updated_by_serve[migration.serve_id]
-            actions.extend(
-                [
-                    {"action": "hide", "serve_id": migration.serve_id},
-                    {"action": "sleep", "serve_id": migration.serve_id},
-                    {
-                        "action": "recreate",
-                        "serve_id": migration.serve_id,
-                        "node": migration.to_slot.node,
-                        "gpu_ids": list(migration.to_slot.gpu_ids),
-                    },
-                    {"action": "wake", "serve_id": migration.serve_id},
-                    {"action": "unhide", "serve_id": migration.serve_id},
-                ]
-            )
-            updated_by_serve[migration.serve_id] = replace(binding, slot=migration.to_slot, awake=True, hidden=False)
+            if self._has_deployment_ops():
+                migration_actions, moved_binding = self._execute_runtime_defrag_migration(binding, migration)
+                actions.extend(migration_actions)
+                updated_by_serve.pop(binding.serve_id, None)
+                updated_by_serve[moved_binding.serve_id] = moved_binding
+            else:
+                actions.extend(
+                    [
+                        {"action": "hide", "serve_id": migration.serve_id},
+                        {"action": "sleep", "serve_id": migration.serve_id},
+                        {
+                            "action": "recreate",
+                            "serve_id": migration.serve_id,
+                            "node": migration.to_slot.node,
+                            "gpu_ids": list(migration.to_slot.gpu_ids),
+                        },
+                        {"action": "wake", "serve_id": migration.serve_id},
+                        {"action": "unhide", "serve_id": migration.serve_id},
+                    ]
+                )
+                updated_by_serve[migration.serve_id] = replace(binding, slot=migration.to_slot, awake=True, hidden=False)
 
         version = snapshot.version
         if migrations:
-            updated = [updated_by_serve[binding.serve_id] for binding in snapshot.bindings]
+            updated = [updated_by_serve[serve_id] for serve_id in sorted(updated_by_serve)]
             version = self._store.save(updated, expected_version=snapshot.version)
         return {
             "version": version,
@@ -227,6 +244,71 @@ class ServiceManagerV2:
             message = getattr(result, "message", "") or "operation failed"
             raise ValueError(f"vLLM {action} failed for {binding.serve_id}: {message}")
         self._runtime_ops.write_binding_annotations(binding, state=state)
+
+    def _has_deployment_ops(self) -> bool:
+        return self._runtime_ops is not None and all(
+            hasattr(self._runtime_ops, name)
+            for name in (
+                "delete_model_deployment",
+                "create_model_deployment",
+                "wait_pod_deleted",
+                "wait_pod_ready",
+            )
+        )
+
+    def _create_and_wake_runtime_binding(self, model: str, slot: Slot) -> Binding:
+        if self._runtime_ops is None or self._vllm_ops is None:
+            raise ValueError("runtime_ops and vllm_ops are required for runtime create")
+        deployment_id = self._runtime_ops.create_model_deployment(model, slot)
+        ready = self._runtime_ops.wait_pod_ready(deployment_id)
+        if not ready.pod_ip:
+            raise ValueError(f"pod {ready.name} has no pod IP for wake")
+        result = self._vllm_ops.wake_up(ready.pod_ip, port=8000)
+        if not bool(getattr(result, "success", False)):
+            message = getattr(result, "message", "") or "operation failed"
+            raise ValueError(f"vLLM wake failed for {ready.name}: {message}")
+        binding = Binding(ready.name, model, slot, awake=True, hidden=False)
+        self._runtime_ops.write_binding_annotations(binding, state=POD_STATE_AWAKE)
+        return binding
+
+    def _execute_runtime_defrag_migration(self, binding: Binding, migration: Migration) -> tuple[list[dict], Binding]:
+        if self._runtime_ops is None or self._vllm_ops is None:
+            raise ValueError("runtime_ops and vllm_ops are required for runtime defrag")
+
+        actions: list[dict] = []
+        self._runtime_ops.write_binding_annotations(binding, state=POD_STATE_HIDDEN)
+        actions.append({"action": "hide", "serve_id": binding.serve_id})
+
+        self._apply_runtime_power_action(binding, action="sleep")
+        actions.append({"action": "sleep", "serve_id": binding.serve_id})
+
+        self._runtime_ops.delete_model_deployment(binding)
+        actions.append({"action": "delete_deployment", "serve_id": binding.serve_id})
+
+        self._runtime_ops.wait_pod_deleted(binding.serve_id)
+        deployment_id = self._runtime_ops.create_model_deployment(binding.model, migration.to_slot)
+        ready = self._runtime_ops.wait_pod_ready(deployment_id)
+        new_serve_id = ready.name
+        actions.append(
+            {
+                "action": "create_deployment",
+                "serve_id": new_serve_id,
+                "node": migration.to_slot.node,
+                "gpu_ids": list(migration.to_slot.gpu_ids),
+            }
+        )
+        if not ready.pod_ip:
+            raise ValueError(f"pod {new_serve_id} has no pod IP for wake")
+        result = self._vllm_ops.wake_up(ready.pod_ip, port=8000)
+        if not bool(getattr(result, "success", False)):
+            message = getattr(result, "message", "") or "operation failed"
+            raise ValueError(f"vLLM wake failed for {new_serve_id}: {message}")
+
+        moved = Binding(new_serve_id, binding.model, migration.to_slot, awake=True, hidden=False)
+        self._runtime_ops.write_binding_annotations(moved, state=POD_STATE_AWAKE)
+        actions.append({"action": "wake", "serve_id": new_serve_id})
+        actions.append({"action": "unhide", "serve_id": new_serve_id})
+        return actions, moved
 
     def _ensure_feasible_wake(self, binding: Binding, bindings: list[Binding]) -> None:
         try:

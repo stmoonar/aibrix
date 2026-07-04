@@ -826,3 +826,26 @@
 ### N4b Next
 
 - Continue with 10.2: replace `/v2/defrag` state-only recreate with the real k8s delete/create path behind fake-client tests, reusing the manifest template as the single source of pod specs.
+
+### N4b.2 Defrag Real Kubernetes Path
+
+- Added fake-client RED coverage for `K8sOps.delete_model_deployment()` and `create_model_deployment()`. The create path must reuse `gen_model_manifests.py` helpers and must not hand-write a second pod spec.
+- Extended `gen_model_manifests.py` with public `deployment_name()` and `build_model_deployment()` helpers for the service-manager ops layer.
+- Extended `K8sOps` with Deployment delete/create and condition polling. `wait_pod_ready()` resolves the real Pod through the generated Deployment's `app` label, avoiding the Deployment-name vs Pod-name mismatch.
+- Updated `tre_sm.server` wiring so live service-manager uses `CoreV1Api` for pods and `AppsV1Api` for Deployment lifecycle calls, with the loaded registry passed into `K8sOps`.
+- Reworked `/v2/defrag` runtime path to execute `hide -> sleep -> delete Deployment -> wait old pod gone -> create Deployment -> wait Ready pod -> wake -> unhide`.
+- Fixed a real-path state bug caught by RED: recreated Pods can have a different serve id from the deleted binding. The store now records the Ready Pod name returned by `wait_pod_ready()`.
+- Connected target growth to the same fake Deployment path when runtime deployment ops are available. This lets the P9 offline integration cover defrag followed by TP=2 expansion without falling back to Redis-only create.
+- Updated `controller/tests/test_p9_offline_integration.py` so the fragmented-capacity case uses fake runtime ops and verifies the real defrag delete/create path plus subsequent TP=2 create/wake.
+- Verification:
+  - Focused RED/GREEN subset: `pytest -q service-manager/tests/test_k8s_ops.py service-manager/tests/test_v2_defrag.py deploy/tests/test_gen_model_manifests.py` passed with 17 tests.
+  - P9/runtime subset: `pytest -q controller/tests/test_p9_offline_integration.py service-manager/tests/test_api_v2.py service-manager/tests/test_v2_defrag.py service-manager/tests/test_k8s_ops.py` passed with 29 tests.
+  - `cd tre && make check` passed with 231 tests.
+
+### N4b Blocked
+
+- None for N4b.2.
+
+### N4b Next
+
+- Continue with 10.3 canary first. Before full rollout, apply one no-GPU-request D7 pod and prove the container sees only the UUID named in `NVIDIA_VISIBLE_DEVICES`; record the result in WORKLOG before deploying dsqwen-7b + dsllama-8b together.

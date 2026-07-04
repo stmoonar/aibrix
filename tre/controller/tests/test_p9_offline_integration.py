@@ -11,6 +11,7 @@ from tre_controller.offline_integration import run_offline_integration_step
 from tre_controller.planning.planner import ClusterView, DefragAction, ScaleAction
 from tre_controller.sm_client import ServiceManagerClient
 from tre_sm.allocator.slots import Binding, Slot
+from tre_sm.allocator.topology import K8sPodSnapshot
 from tre_sm.api.v2 import ServiceManagerV2, create_app
 from tre_sm.state.store import StateStore
 
@@ -65,6 +66,63 @@ class AppTransport:
         response = self.client.request(method, path, json=json)
         response.raise_for_status()
         return response.json()
+
+
+class FakeRuntimeOps:
+    def __init__(self) -> None:
+        self.calls: list[tuple] = []
+        self.snapshots = {
+            "serve-a": K8sPodSnapshot("serve-a", "m1", "node-a", {"CUDA_VISIBLE_DEVICES": "0"}, pod_ip="10.0.0.1"),
+            "serve-b": K8sPodSnapshot("serve-b", "m1", "node-a", {"CUDA_VISIBLE_DEVICES": "2"}, pod_ip="10.0.0.2"),
+        }
+
+    def list_pod_snapshots(self, *, model=None):
+        snapshots = list(self.snapshots.values())
+        if model is None:
+            return snapshots
+        return [snapshot for snapshot in snapshots if snapshot.model == model]
+
+    def write_binding_annotations(self, binding, *, state):
+        self.calls.append(("annotate", binding.serve_id, state))
+
+    def delete_model_deployment(self, binding):
+        self.calls.append(("delete_deployment", binding.serve_id, tuple(binding.slot.gpu_ids)))
+        self.snapshots.pop(binding.serve_id, None)
+
+    def wait_pod_deleted(self, serve_id):
+        self.calls.append(("wait_deleted", serve_id))
+
+    def create_model_deployment(self, model, slot):
+        self.calls.append(("create_deployment", model, tuple(slot.gpu_ids)))
+        if model == "tp2":
+            name = "tp2-pod"
+            env = {"CUDA_VISIBLE_DEVICES": "0,1"}
+            pod_ip = "10.0.0.4"
+        else:
+            name = "serve-b-new"
+            env = {"CUDA_VISIBLE_DEVICES": "1"}
+            pod_ip = "10.0.0.3"
+        self.snapshots[name] = K8sPodSnapshot(name, model, slot.node, env, pod_ip=pod_ip)
+        return f"{model}-deployment"
+
+    def wait_pod_ready(self, serve_id):
+        self.calls.append(("wait_ready", serve_id))
+        if serve_id == "tp2-deployment":
+            return self.snapshots["tp2-pod"]
+        return self.snapshots["serve-b-new"]
+
+
+class FakeVllmOps:
+    def __init__(self) -> None:
+        self.calls: list[tuple] = []
+
+    def sleep(self, pod_ip, *, port=None):
+        self.calls.append(("sleep", pod_ip, port))
+        return type("Result", (), {"success": True, "message": ""})()
+
+    def wake_up(self, pod_ip, *, port=None):
+        self.calls.append(("wake_up", pod_ip, port))
+        return type("Result", (), {"success": True, "message": ""})()
 
 
 def _registry() -> Registry:
@@ -208,7 +266,9 @@ async def test_p9_offline_integration_defrags_fragmented_capacity_then_expands_t
         Binding("serve-b", "m1", Slot("node-a", (2,)), awake=True),
     )
     sm_store.save(bindings, expected_version=0)
-    transport = AppTransport(create_app(ServiceManagerV2(registry, sm_store)))
+    runtime_ops = FakeRuntimeOps()
+    vllm_ops = FakeVllmOps()
+    transport = AppTransport(create_app(ServiceManagerV2(registry, sm_store, runtime_ops=runtime_ops, vllm_ops=vllm_ops)))
     queue = ActionQueue(ServiceManagerClient("http://service-manager", transport=transport))
 
     result = await run_offline_integration_step(
@@ -234,6 +294,23 @@ async def test_p9_offline_integration_defrags_fragmented_capacity_then_expands_t
     ]
     assert sm_store.load().bindings == [
         Binding("serve-a", "m1", Slot("node-a", (0,)), awake=True),
-        Binding("serve-b", "m1", Slot("node-a", (1,)), awake=True),
-        Binding("tp2-1", "tp2", Slot("node-a", (2, 3)), awake=True),
+        Binding("serve-b-new", "m1", Slot("node-a", (1,)), awake=True),
+        Binding("tp2-pod", "tp2", Slot("node-a", (2, 3)), awake=True),
+    ]
+    assert runtime_ops.calls == [
+        ("annotate", "serve-b", "hidden"),
+        ("annotate", "serve-b", "sleeping"),
+        ("delete_deployment", "serve-b", (2,)),
+        ("wait_deleted", "serve-b"),
+        ("create_deployment", "m1", (1,)),
+        ("wait_ready", "m1-deployment"),
+        ("annotate", "serve-b-new", "awake"),
+        ("create_deployment", "tp2", (2, 3)),
+        ("wait_ready", "tp2-deployment"),
+        ("annotate", "tp2-pod", "awake"),
+    ]
+    assert vllm_ops.calls == [
+        ("sleep", "10.0.0.2", 8000),
+        ("wake_up", "10.0.0.3", 8000),
+        ("wake_up", "10.0.0.4", 8000),
     ]

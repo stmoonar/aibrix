@@ -35,6 +35,16 @@ def build_deployments(registry: Registry) -> list[dict]:
     return deployments
 
 
+def deployment_name(model_name: str, node_name: str, gpu_ids: tuple[int, ...]) -> str:
+    gpu_value = ",".join(str(gpu) for gpu in gpu_ids)
+    return f"{_dns_name(model_name)}-{_dns_name(node_name)}-gpu-{gpu_value.replace(',', '-')}"
+
+
+def build_model_deployment(registry: Registry, model_name: str, node_name: str, gpu_ids: tuple[int, ...]) -> dict:
+    nodes = {node.name: node for node in registry.topology().nodes}
+    return _deployment(registry.model(model_name), nodes[node_name], gpu_ids)
+
+
 def build_services(registry: Registry) -> list[dict]:
     return [_service(model) for model in registry.models()]
 
@@ -85,7 +95,7 @@ def _deployment(model: ModelSpec, node: NodeSpec, gpu_ids: tuple[int, ...]) -> d
     gpu_label_value = "-".join(str(gpu) for gpu in gpu_ids)
     cuda_value = ",".join(str(index) for index in range(model.tp_size))
     gpu_uuid_value = ",".join(_gpu_uuids_for(node, gpu_ids))
-    name = f"{_dns_name(model.name)}-{_dns_name(node.name)}-gpu-{gpu_value.replace(',', '-')}"
+    name = deployment_name(model.name, node.name, gpu_ids)
     command = [
         "python3",
         "-m",

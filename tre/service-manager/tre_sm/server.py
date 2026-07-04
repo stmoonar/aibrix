@@ -36,7 +36,7 @@ def create_app() -> FastAPI:
 
     registry = load_registry(os.environ.get("TRE_REGISTRY_PATH"))
     redis_url = os.environ.get("TRE_REDIS_URL", "redis://aibrix-redis-master:6379/0")
-    k8s_ops = _create_k8s_ops()
+    k8s_ops = _create_k8s_ops(registry)
     return create_service_app(
         registry,
         StateStore(redis.Redis.from_url(redis_url)),
@@ -50,7 +50,7 @@ def _create_k8s_pod_client(topology: ClusterTopology) -> K8sPodClientFromOps:
     return K8sPodClientFromOps(topology, _create_k8s_ops())
 
 
-def _create_k8s_ops() -> K8sOps:
+def _create_k8s_ops(registry=None) -> K8sOps:
     try:
         from kubernetes import client, config  # type: ignore[import-not-found]
     except ModuleNotFoundError as exc:
@@ -62,4 +62,4 @@ def _create_k8s_ops() -> K8sOps:
         config.load_kube_config()
 
     namespace = os.environ.get("TRE_MODEL_NAMESPACE", os.environ.get("TARGET_NAMESPACE", "default"))
-    return K8sOps(api=client.CoreV1Api(), namespace=namespace)
+    return K8sOps(api=client.CoreV1Api(), apps_api=client.AppsV1Api(), namespace=namespace, registry=registry)

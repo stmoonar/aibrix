@@ -262,6 +262,55 @@ def test_v2_put_target_rejects_state_only_create_when_runtime_ops_are_enabled():
     assert store.load().bindings == original
 
 
+def test_v2_put_target_creates_deployment_when_runtime_deployment_ops_are_available():
+    from tre_sm.allocator.topology import K8sPodSnapshot
+
+    class RuntimeWithDeployments(FakeRuntimeOps):
+        def __init__(self):
+            super().__init__([])
+            self.ready = K8sPodSnapshot(
+                name="tp2-pod",
+                model="tp2",
+                node="node-a",
+                env={"CUDA_VISIBLE_DEVICES": "0,1"},
+                pod_ip="10.0.0.9",
+            )
+
+        def delete_model_deployment(self, binding):
+            raise AssertionError("target growth should not delete deployments")
+
+        def wait_pod_deleted(self, serve_id):
+            raise AssertionError("target growth should not wait for deletion")
+
+        def create_model_deployment(self, model, slot):
+            self.annotations.append(("create", model, tuple(slot.gpu_ids)))
+            return "tp2-deployment"
+
+        def wait_pod_ready(self, serve_id):
+            self.annotations.append(("ready", serve_id))
+            return self.ready
+
+    store = StateStore(FakeRedis())
+    store.save([Binding("serve-a", "m1", Slot("node-a", (0,)), awake=True)], expected_version=0)
+    runtime_ops = RuntimeWithDeployments()
+    vllm_ops = FakeVllmOps()
+    service = ServiceManagerV2(registry_with_tp2(), store, runtime_ops=runtime_ops, vllm_ops=vllm_ops)
+
+    result = service.put_model_target("tp2", wake_replicas=1)
+
+    assert result["actions"] == [{"action": "create", "serve_id": "tp2-pod", "node": "node-a", "gpu_ids": [2, 3]}]
+    assert runtime_ops.annotations == [
+        ("create", "tp2", (2, 3)),
+        ("ready", "tp2-deployment"),
+        ("tp2-pod", "awake"),
+    ]
+    assert vllm_ops.calls == [("wake_up", "10.0.0.9", 8000)]
+    assert store.load().bindings == [
+        Binding("serve-a", "m1", Slot("node-a", (0,)), awake=True),
+        Binding("tp2-pod", "tp2", Slot("node-a", (2, 3)), awake=True),
+    ]
+
+
 def test_v2_fastapi_routes_delegate_to_service_layer():
     store = StateStore(FakeRedis())
     store.save(
