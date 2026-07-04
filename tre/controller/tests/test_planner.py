@@ -198,6 +198,26 @@ def test_idle_proactive_honors_per_model_min_replicas() -> None:
     assert plan.actions == []
 
 
+def test_idle_proactive_keeps_one_routable_endpoint_for_bound_zero_min_model() -> None:
+    classifications = [_classification("warm", ModelState.IDLE, ModelRole.DONOR, 10.0, "idle")]
+    contexts = {"warm": {"assigned_replicas": 2, "routable_pods": 1}}
+
+    plan = build_plan(
+        model_contexts=contexts,
+        classifications=classifications,
+        model_replicas={"warm": 2},
+        idle_gpus=2,
+        cfg=PlanConfig(
+            min_replicas_per_model=0,
+            max_replicas_per_model=2,
+            min_replicas_by_model={"warm": 0},
+            max_replicas_by_model={"warm": 2},
+        ),
+    )
+
+    assert plan.actions == []
+
+
 def test_critical_receiver_wakes_sleeping_bound_replica_before_claiming_idle_capacity() -> None:
     classifications = [_classification("warm", ModelState.CRITICAL, ModelRole.RECEIVER, 0.5)]
     contexts = {"warm": {"assigned_replicas": 4, "routable_pods": 1}}

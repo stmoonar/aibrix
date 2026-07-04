@@ -177,7 +177,7 @@ def test_rescue_tick_submits_critical_scale_action_from_snapshot_metrics() -> No
     snapshot = MetricsSnapshot(
         ts_ms=1,
         stale=False,
-        models={"critical": _metrics("critical", generation=50.0, waiting=10.0, running=1.0, assigned=1)},
+        models={"critical": _metrics("critical", generation=50.0, waiting=10.0, running=1.0, assigned=2)},
     )
 
     result = run_rescue_tick(snapshot, queue=queue, registry=_registry())
@@ -223,7 +223,7 @@ def test_rescue_tick_honors_latency_signal_source_for_classification() -> None:
     snapshot = MetricsSnapshot(
         ts_ms=1,
         stale=False,
-        models={"critical": _metrics("critical", generation=50.0, waiting=10.0, running=1.0, assigned=1)},
+        models={"critical": _metrics("critical", generation=50.0, waiting=10.0, running=1.0, assigned=2)},
     )
 
     result = run_rescue_tick(snapshot, queue=queue, registry=_registry(), signal_source="latency_p95")

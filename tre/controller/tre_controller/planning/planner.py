@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, Literal, Mapping
 
 from tre_common.registry import ClusterTopology
 from tre_controller.planning.classify import ModelClassification, ModelRole, ModelState, donor_mock_cost_key
@@ -296,7 +296,7 @@ def build_plan(
             if deltas.get(idle.model_name, 0) != 0:
                 continue
             pods = _effective_routable_replicas(idle.model_name, model_contexts, model_replicas)
-            idle_min = _min_replicas(cfg, idle.model_name)
+            idle_min = _serving_floor(cfg, idle.model_name, model_contexts, model_replicas)
             if pods <= idle_min:
                 continue
             shrink = min(_scale_step(pods, cfg.scale_step_ratio), pods - idle_min)
@@ -319,7 +319,7 @@ def build_plan(
             if deltas.get(high.model_name, 0) != 0:
                 continue
             pods = _effective_routable_replicas(high.model_name, model_contexts, model_replicas)
-            high_min = _min_replicas(cfg, high.model_name)
+            high_min = _serving_floor(cfg, high.model_name, model_contexts, model_replicas)
             if pods <= high_min:
                 continue
             shrink = min(_scale_step(pods, cfg.scale_step_ratio), pods - high_min)
@@ -616,6 +616,20 @@ def _scale_step(current_pods: int, ratio: float = 0.1) -> int:
 
 def _min_replicas(cfg: PlanConfig, model_name: str) -> int:
     return cfg.min_replicas_by_model.get(model_name, cfg.min_replicas_per_model)
+
+
+def _serving_floor(
+    cfg: PlanConfig,
+    model_name: str,
+    model_contexts: Mapping[str, Mapping[str, float | int | None]],
+    model_replicas: Mapping[str, int],
+) -> int:
+    configured_min = _min_replicas(cfg, model_name)
+    context = model_contexts.get(model_name, {})
+    bound_replicas = int(context.get("assigned_replicas") or model_replicas.get(model_name, 0) or 0)
+    if bound_replicas > 0:
+        return max(configured_min, 1)
+    return configured_min
 
 
 def _max_replicas(cfg: PlanConfig, model_name: str) -> int:
