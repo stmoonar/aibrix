@@ -587,3 +587,10 @@
 - Ran the placeholder lint/oracle report helper against frozen `config/6traces_v6` to cover more than the 5 cases available in `traces_v14`.
 - Wrote `docs/refactor/p7_trace_reports/6traces_v6_placeholder_lint.json`: parsed 20 trace cases, 0 passed under the low-confidence placeholder capacity, with failures dominated by C2/C3.
 - This report is audit evidence for the pipeline, not final trace qualification; real capacity surfaces remain a prerequisite for R7/final trace-set freezing.
+
+### P7 Closure Audit
+
+- Added a requirement-by-requirement P7 closure audit to `docs/refactor/07_replayer_audit.md`.
+- P7 evidence covers open-loop dispatch, pre-generated deterministic/Poisson schedules, token controls, TTFT semantics, full 60 second precision audit, capacity/design/lint/oracle modules, trace reports for frozen trace sets, and orchestrate shell-flow comparison.
+- Carried forward the explicit limitation that reports use `placeholder_from_trace_max_rps`; they validate tooling but do not qualify a final trace set. Real capacity surfaces and trace repair remain R7/final-report work.
+- Next step after commit and final gate: tag `p7-done`, then start P8 UI.

@@ -115,3 +115,22 @@ Added `tre_replayer.metrics` to make two P7 audit decisions explicit in code. TT
 ## Additional Frozen Trace Report
 
 To cover the plan's "existing traces" requirement more broadly, the same placeholder-capacity report was also run against `/root/aibrix-main/CustomTraceGenerator/config/6traces_v6`, which contains 20 trace folders with `trace.json`. The report was written to `docs/refactor/p7_trace_reports/6traces_v6_placeholder_lint.json`. It parsed 20 cases; 0 passed under the low-confidence placeholder capacity, with failures dominated by C2/C3. This reinforces that the report pipeline works, but final trace qualification requires a real `C_m(i,o)` capacity surface.
+
+
+## P7 Closure Audit
+
+| Requirement | Evidence | Status |
+| --- | --- | --- |
+| Audit/fix open-loop dispatch | `dispatch_open_loop()` starts sender tasks without waiting for previous responses; `test_dispatch_open_loop_does_not_wait_for_previous_response` covers this. | Complete |
+| Pre-generate arrival schedule | `build_deterministic_schedule()` and `build_poisson_schedule()` generate fixed schedules before dispatch; seed-stability is tested. | Complete |
+| Carry token controls | `load_trace_segments()` and schedule events preserve `input_tokens`/`max_tokens` as `prompt_tokens`/`max_output_tokens`; `tre_replayer.metrics` records the semantic fields. | Complete |
+| TTFT definition aligned with vLLM bench | `tre_replayer.metrics.TTFT_DEFINITION` states request-send to first SSE content byte arrival; covered by `test_metric_semantics_documents_ttft_and_token_controls`. | Complete |
+| Offline dispatch precision | `PYTHONPATH=tre/replayer python3 -m tre_replayer.precision` passed on server 76 with 600 requests, P99 delay 1.533 ms, RPS error 0.000019. | Complete |
+| `capacity.py` foundation | `tre_calibration.capacity` fits max SLO-safe RPS per `(model, input_tokens, output_tokens)` and marks extrapolated lookups low-confidence. | Complete |
+| `design.py` | `tre_replayer.design` validates phase duration/resonance and maps rho demand to RPS segments. | Complete |
+| `lint.py` | `tre_replayer.lint` reports C1/C2/C3 failures and includes oracle violation fraction. | Complete |
+| `oracle.py` | `tre_replayer.oracle` computes hand-checkable overcapacity lower-bound duration/fraction. | Complete |
+| Existing trace lint/oracle reports | Reports generated for frozen `traces_v14` (5 cases) and `6traces_v6` (20 cases) under explicit low-confidence placeholder capacity. | Complete with limitation |
+| Orchestrate shell-flow comparison | `tre_replayer.orchestrate` emits the behavior table included above; live cluster mutations are marked `not_executed_offline`. | Complete |
+
+P7 limitation carried forward: no finalized `capacity_<model>.json` surfaces were available in the new tree, so trace lint reports use `placeholder_from_trace_max_rps`. These reports validate the tooling but do not qualify a final trace set. R7 remains responsible for regenerating or repairing traces after real capacity surfaces are available.
