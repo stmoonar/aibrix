@@ -16,11 +16,11 @@ class FakeK8sApi:
         self.patches.append((name, namespace, body))
 
 
-def pod_dict(name, model, node, cuda, *, phase="Running", annotations=None, deleting=False):
+def pod_dict(name, model, node, cuda, *, phase="Running", annotations=None, labels=None, deleting=False):
     return {
         "metadata": {
             "name": name,
-            "labels": {MODEL_LABEL: model},
+            "labels": {MODEL_LABEL: model, **(labels or {})},
             "annotations": annotations or {},
             "deletionTimestamp": "2026-07-04T00:00:00Z" if deleting else None,
         },
@@ -133,6 +133,32 @@ def test_k8s_ops_accepts_kubernetes_client_snake_case_objects():
             node="node-a",
             env={"CUDA_VISIBLE_DEVICES": "0"},
             annotations={},
+        )
+    ]
+
+
+def test_k8s_ops_uses_gpu_id_label_as_annotation_fallback():
+    api = FakeK8sApi(
+        [
+            pod_dict(
+                "serve-a",
+                "dsqwen-7b",
+                "node-a",
+                "0",
+                labels={GPU_IDS_ANNOTATION: "2"},
+            )
+        ]
+    )
+    ops = K8sOps(api=api, namespace="default")
+
+    assert ops.list_pod_snapshots() == [
+        K8sPodSnapshot(
+            name="serve-a",
+            model="dsqwen-7b",
+            node="node-a",
+            env={"CUDA_VISIBLE_DEVICES": "0"},
+            annotations={GPU_IDS_ANNOTATION: "2"},
+            pod_ip="10.0.0.9",
         )
     ]
 

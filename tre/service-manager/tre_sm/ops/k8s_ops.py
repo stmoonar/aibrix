@@ -42,13 +42,16 @@ class K8sOps:
             model_name = labels.get(MODEL_LABEL)
             if not model_name:
                 continue
+            annotations = dict(metadata.get("annotations") or {})
+            if GPU_IDS_ANNOTATION not in annotations and labels.get(GPU_IDS_ANNOTATION):
+                annotations[GPU_IDS_ANNOTATION] = str(labels[GPU_IDS_ANNOTATION])
             snapshots.append(
                 K8sPodSnapshot(
                     name=str(metadata["name"]),
                     model=str(model_name),
                     node=str(_field(spec, "nodeName", "node_name")),
                     env=_container_env(pod),
-                    annotations=dict(metadata.get("annotations") or {}),
+                    annotations=annotations,
                     pod_ip=_optional_field(_status(pod), "podIP", "pod_ip"),
                 )
             )
