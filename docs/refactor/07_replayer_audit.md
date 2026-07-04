@@ -68,3 +68,8 @@ PYTHONPATH=tre/replayer python3 -m tre_replayer.precision
 ```
 
 The module default is the required 60 second offline stub dispatch.
+
+
+## Trace Design Skeleton
+
+Added `tre_replayer.design` with the first section 12.5 constraints and rho-to-RPS conversion. `validate_phase_plan()` rejects phases shorter than `5 * slow_loop_s` and periodic phases whose period is an integer multiple of the control periods (`5s`, `10s`, or `20s`). `design_trace_segments()` maps `rho_m(t)` demand phases to concrete RPS segments by multiplying the fitted capacity surface `C_m(i,o)` and preserving token shapes for later schedule generation.

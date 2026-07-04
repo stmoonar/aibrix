@@ -544,3 +544,10 @@
 - Verified remotely: focused precision test passed, all replayer tests passed with 11 tests, and a short real-clock smoke (`duration_s=1.0`, `target_rps=20.0`) passed with 20 requests, P99 delay ~1.25 ms, and RPS error ~0.12%.
 - Documented the full 60 second audit command in `docs/refactor/07_replayer_audit.md`; it remains to run before `p7-done`.
 - Next P7 work: add `design.py` validation/generation skeleton and `orchestrate.py` shell-flow comparison table.
+
+### P7 Replayer Design Skeleton Slice
+
+- Added RED tests for `design.py` phase validation and rho-to-RPS segment generation; RED failed on missing `tre_replayer.design`.
+- Implemented `DemandPhase`, `validate_phase_plan()`, and `design_trace_segments()` using section 12.5 phase duration/resonance rules and the capacity surface.
+- Verified remotely: focused design tests passed with 2 tests and all replayer tests passed with 13 tests.
+- Next P7 work: add `orchestrate.py` skeleton and write the old-shell behavior comparison table into `07_replayer_audit.md`.
