@@ -419,3 +419,50 @@ def test_v2_put_target_calls_vllm_and_pod_annotations_for_existing_bindings():
         Binding("serve-a", "m1", Slot("node-a", (0,)), awake=True),
         Binding("serve-b", "m1", Slot("node-a", (1,)), awake=True),
     ]
+
+
+def test_v2_put_target_treats_matching_state_conflict_after_runtime_action_as_success():
+    from tre_sm.allocator.topology import K8sPodSnapshot
+    from tre_sm.state.store import StateConflict, StateSnapshot
+
+    class ConflictingStore:
+        def __init__(self):
+            self.current = StateSnapshot(
+                version=1,
+                bindings=[Binding("serve-a", "m1", Slot("node-a", (0,)), awake=True)],
+            )
+
+        def load(self):
+            return self.current
+
+        def save(self, bindings, *, expected_version):
+            self.current = StateSnapshot(
+                version=2,
+                bindings=[Binding("serve-a", "m1", Slot("node-a", (0,)), awake=False)],
+            )
+            raise StateConflict(expected_version=expected_version, current_version=2)
+
+    runtime_ops = FakeRuntimeOps(
+        [
+            K8sPodSnapshot(
+                name="serve-a",
+                model="m1",
+                node="node-a",
+                env={"CUDA_VISIBLE_DEVICES": "0"},
+                pod_ip="10.0.0.1",
+            )
+        ]
+    )
+    vllm_ops = FakeVllmOps()
+    service = ServiceManagerV2(registry(), ConflictingStore(), runtime_ops=runtime_ops, vllm_ops=vllm_ops)
+
+    result = service.put_model_target("m1", wake_replicas=0)
+
+    assert result == {
+        "model": "m1",
+        "wake_replicas": 0,
+        "version": 2,
+        "actions": [{"action": "sleep", "serve_id": "serve-a"}],
+    }
+    assert vllm_ops.calls == [("sleep", "10.0.0.1", 8000)]
+    assert runtime_ops.annotations == [("serve-a", "sleeping")]

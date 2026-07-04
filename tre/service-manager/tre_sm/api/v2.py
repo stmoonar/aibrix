@@ -10,7 +10,7 @@ from tre_common.registry import Registry
 from tre_sm.allocator.slots import Binding, Migration, Slot, SlotAllocator
 from tre_sm.allocator.topology import K8sPodSnapshot
 from tre_sm.state.reconcile import K8sPodClient, POD_STATE_AWAKE, POD_STATE_SLEEPING, reconcile_state
-from tre_sm.state.store import StateStore
+from tre_sm.state.store import StateConflict, StateStore
 from tre_sm.api.v1_compat import create_v1_compat_router
 
 
@@ -100,7 +100,14 @@ class ServiceManagerV2:
         version = snapshot.version
         if actions:
             updated = list(updated_by_serve.values())
-            version = self._store.save(updated, expected_version=snapshot.version)
+            try:
+                version = self._store.save(updated, expected_version=snapshot.version)
+            except StateConflict:
+                current = self._store.load()
+                current_counts = self._model_counts(current.bindings).get(model, {"awake": 0})
+                if current_counts["awake"] != wake_replicas:
+                    raise
+                version = current.version
 
         return {
             "model": model,
