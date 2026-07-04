@@ -568,3 +568,9 @@
 - Verified remotely: focused report tests passed with 2 tests and all replayer tests passed with 17 tests.
 - Ran the report helper against frozen `config/traces_v14` with placeholder capacity and wrote `docs/refactor/p7_trace_reports/traces_v14_placeholder_lint.json`. It found 5 traces, not 7; all five fail C2/C3 under the low-confidence placeholder capacity.
 - Next P7 work: either derive a real capacity surface from old training-grid output or explicitly carry the placeholder limitation into final P7 closure, then run the full 60 second precision audit.
+
+### P7 Full Offline Precision Audit
+
+- Ran the required 60 second offline precision command: `PYTHONPATH=tre/replayer python3 -m tre_replayer.precision`.
+- Result on server 76: passed with 600 requests, P99 scheduled-vs-actual delay 1.533 ms, and actual RPS error 0.000019.
+- Next P7 work: final phase audit against each P7 requirement, then tag `p7-done` if the remaining evidence is sufficient or record specific gaps before moving to P8.

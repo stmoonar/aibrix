@@ -94,3 +94,14 @@ The old `run_experiment.sh` / `run_experiment_v2.sh` flow is captured below. P7 
 Added `tre_replayer.report` to produce JSON-ready per-trace lint summaries. Because no finalized `capacity_<model>.json` surface is available yet in the new tree, the first report uses a clearly labeled low-confidence placeholder: max observed RPS per `(model, input_tokens, output_tokens)` from the discovered trace set. This does not qualify a trace set for final experiments; it only exercises the P7 lint/oracle pipeline and records gaps.
 
 Read-only discovery of frozen `config/traces_v14` found 5 trace cases, not the 7 mentioned by the phase text. The placeholder report was written to `docs/refactor/p7_trace_reports/traces_v14_placeholder_lint.json`. Under the placeholder capacity, all five parsed traces fail C2/C3 and have oracle violation fraction 0.0; this means the placeholder capacity is too weak to prove non-triviality/headroom and should be replaced by real capacity surfaces before final trace-set qualification.
+
+
+## Full Offline Precision Audit
+
+Ran the required offline stub dispatch command on server 76:
+
+```bash
+PYTHONPATH=tre/replayer python3 -m tre_replayer.precision
+```
+
+Result: `passed=True`, 600 requests over the default 60 second schedule, P99 scheduled-vs-actual delay 1.533 ms, and actual RPS error 0.000019. This satisfies the P7 thresholds (`P99 < 10ms`, RPS error `< 1%`).
