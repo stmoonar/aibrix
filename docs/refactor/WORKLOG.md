@@ -434,3 +434,13 @@
 - Verified GREEN remotely: focused jitter test passed with 1 test; adjacent jitter/loop/app tests passed with 18 tests.
 - Full quality gate passed remotely: `git diff --check` was clean, and `cd tre && make check && make smoke` completed with 141 tests and `tre smoke ok`.
 - Next P5 work: reassess remaining P5 closure requirements against `REFACTOR_PLAN.md`, especially any missing stateful TRS/SaturationGuard continuity or controller integration gaps before moving toward P6/P7.
+
+### P6 Calibration Synthetic Fit Slice
+
+- Read the archived 1939-line `fit_tre_parameters_from_runs.py` and smaller `fit_theta.py` flow enough to capture the first split boundary: higher TRS is healthier, health direction is scored with Spearman/AUROC, theta separates violating and healthy windows, and scenario splits must keep whole scenarios together.
+- Added `docs/refactor/06_calibration_design.md` documenting the old monolith, the initial `dataset.py` / `fit.py` / `evaluate.py` split, and the deterministic synthetic verification fixture.
+- Added RED tests for synthetic theta recovery, scenario-level train/test splitting, and threshold direction metrics; RED failed with `ModuleNotFoundError: No module named 'tre_calibration'`.
+- Implemented `tre_calibration` with `CalibrationWindow`, `split_by_scenario()`, `fit_theta_from_health()`, and no-dependency AUROC/Spearman/balanced-accuracy evaluation.
+- Updated `tre/Makefile` so `make check` includes `calibration/tests` and adds `tre/calibration` to `PYTHONPATH`.
+- Verified remotely: focused calibration tests passed with 3 tests; `git diff --check && cd tre && make check && make smoke` passed with 144 tests and `tre smoke ok`. `make` reported clock skew warnings from file mtimes but completed successfully.
+- Next P6 work: add CSV/window loading and healthy-quantile or reliability theta selection with scenario-family coverage checks, still using synthetic fixtures before touching real run data.
