@@ -612,3 +612,11 @@
 - The page fetches `/api/cluster`, `/api/models`, `/api/decision/latest`, and `/api/experiments`; it renders a GPU grid, decision payload, model table, and experiment stub using local HTML/CSS/JS only.
 - Verified remotely: focused UI tests passed with 3 tests.
 - Next P8 work: run a local FastAPI instance with mock sources and capture a screenshot if browser tooling is available, then close/tag P8 if verification remains green.
+
+### P8 UI Screenshot Attempt
+
+- Started a mock UI server on `127.0.0.1:18080`; `/healthz` returned `{"ok": true}`.
+- Attempted `npx playwright screenshot --full-page --wait-for-selector '#cluster .node' http://127.0.0.1:18080/ docs/refactor/p8_screenshots/ui_mock.png`.
+- Screenshot skipped because Playwright browser binaries are not installed on server 76 (`chrome-headless-shell` missing; CLI recommends `npx playwright install`).
+- Stopped the mock server and recorded the skip reason in `docs/refactor/08_ui.md`.
+- Next P8 work: final phase audit and `p8-done` tag if the backend/frontend verification remains green.
