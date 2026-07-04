@@ -290,3 +290,13 @@
 - Verified RED remotely: `tre_controller.loops` was missing. Verified GREEN remotely: focused ActionQueue tests passed with 4 tests; `cd tre && make check && make smoke` passed with 95 tests and `tre smoke ok`.
 - Scope note: long-running queue loop, real HTTP client, JSON action logs, and rescue cancellation of already-dispatched actions remain for later P5 wiring slices.
 - Next P5 work: service-manager client wrapper or rescue/fairness loop wiring on top of this queue boundary.
+
+### P5 Service Manager Client Slice
+
+- Re-read `REFACTOR_PLAN.md` completely on remote server 76 before starting the sm_client segment.
+- Read service-manager v2 implementation and tests to align with `/v2/state`, `/v2/models/{model}/target`, and `/v2/models/{model}/routable` contracts.
+- Added RED tests for controller `ServiceManagerClient` delta-to-target conversion, downscale clamping, routable hidden pods, state reads, error normalization, and explicit unsupported defrag dispatch.
+- Implemented `tre_controller.sm_client` with injectable async transport and a standard-library urllib transport for real use.
+- Verified RED remotely: `tre_controller.sm_client` was missing. Verified GREEN remotely: focused sm_client tests passed with 6 tests; `cd tre && make check && make smoke` passed with 101 tests and `tre smoke ok`.
+- Scope note: service-manager v2 has no defrag endpoint yet, so defrag dispatch is reported as unsupported until the API is added.
+- Next P5 work: wire rescue/fairness loop ticks to planner, sm_client state, and ActionQueue.

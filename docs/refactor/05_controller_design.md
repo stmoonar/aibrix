@@ -313,3 +313,41 @@ cd tre && make check && make smoke
 ```
 
 Result: passed with 95 tests and `tre smoke ok` on server 76.
+
+## Service Manager Client Contract
+
+The controller `sm_client` slice provides the HTTP boundary used by `ActionQueue`. Tests use an injected async transport so no live service-manager calls are required.
+
+Implemented pieces:
+
+- `get_state()` calls `GET /v2/state` and returns the JSON object for future cluster-view construction.
+- `scale_model(model, delta)` reads current awake replicas from `/v2/state`, converts the delta into an absolute `wake_replicas` target, clamps downscales at zero, and calls `PUT /v2/models/{model}/target`.
+- `set_routable(model, hidden_pods)` calls `PUT /v2/models/{model}/routable` with the hidden serve IDs.
+- Transport failures are normalized into `{"ok": False, "error": ...}` for queue dispatch.
+- `defrag()` currently returns an explicit unsupported result because service-manager v2 does not yet expose a defrag endpoint.
+
+### P5-CTRL-008 service-manager client
+
+RED:
+
+```bash
+PYTHONPATH=tre/common:tre/controller:tre/controller/tests python3 -m pytest -q tre/controller/tests/test_sm_client.py
+```
+
+Result: failed during collection because `tre_controller.sm_client` did not exist.
+
+GREEN:
+
+```bash
+PYTHONPATH=tre/common:tre/controller:tre/controller/tests python3 -m pytest -q tre/controller/tests/test_sm_client.py
+```
+
+Result: focused service-manager client tests passed with 6 tests on server 76.
+
+Full slice verification:
+
+```bash
+cd tre && make check && make smoke
+```
+
+Result: passed with 101 tests and `tre smoke ok` on server 76.

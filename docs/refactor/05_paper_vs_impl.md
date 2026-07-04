@@ -32,3 +32,7 @@ The plan also calls for shrinking HIGH same-slot halves before allocator defrag.
 The migrated SafeScale slice intentionally separates state-machine decisions from the old thread, Redis, and service-manager side effects. It preserves the frozen implementation's key commit guard semantics: immediate rollback on TTFT/TPOT SLO violation, deadline-based commit only when tail latency is OK including observations restored from probe journal, tail `z_m` is not below `tau_low` for traffic-bearing probes, and observed normalized GPU cache does not exceed 0.8.
 
 The old implementation combined probe monitoring, HTTP scale calls, runtime observation capture, and file-backed persistence in one module. P5 records this as an implementation split rather than a formula change: the new state machine emits data-only commands for later queue wiring and accepts an injected store protocol for restart recovery.
+
+## Service Manager Client Gap
+
+The controller client now targets service-manager v2 for state, target replicas, and routable hidden pods. Defrag remains an explicit integration gap: the planner and ActionQueue can represent `DefragAction`, but service-manager v2 currently has no `/v2/defrag` endpoint. Until P4/P5 adds that endpoint, controller dispatch returns a structured unsupported result instead of silently pretending the migration ran.
