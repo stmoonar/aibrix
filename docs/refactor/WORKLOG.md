@@ -714,3 +714,22 @@
 - Backed up `kubectl -n aibrix-system get svc,cm,secret -o yaml` to `aibrix-system-svc-cm-secret.yaml`.
 - Captured read-only context snapshots: `aibrix-system-pods-before-n3.txt` and `nodes-before-n3.txt`.
 - No Kubernetes resources were deleted or applied during this backup step. Next N3 step is allowed only after this backup commit is present.
+
+
+### N3 Partial Smoke Update
+
+- Completed N3.1 backup of old TRE manifests under `docs/refactor/p11_evidence/old_system_backup/` and deleted only the four old TRE deployments from `aibrix-system`.
+- Deployed `tre-v2` control-plane in namespace `tre-v2`; controller, service-manager, UI, and Redis are running on node10 with local pinned images.
+- Deployed one `dsqwen-7b` model pod on node9 and added generated model Services so the existing AIBrix HTTPRoute can resolve `default/dsqwen-7b`.
+- Fixed live service-manager reconcile issues discovered during rollout: Kubernetes object normalization, pod-list handling, namespace-preserving RBAC, and stale rollout replacement bindings.
+- Fixed controller live metric ingestion by splitting controller state Redis (`tre-v2-redis`) from metrics Redis (`aibrix-redis-master`) and using the existing v1 legacy metrics reader.
+- Verified gateway forwarding: 100/100 requests to `dsqwen-7b` through the AIBrix gateway succeeded with p95 28.33 ms.
+- Verified full offline gate after N3 fixes: `cd tre && make check && make smoke` passed with 199 tests and `tre smoke ok`.
+- Recorded N3 smoke evidence in `docs/refactor/11_l3_smoke.md` as PARTIAL; no `n3-done` tag was created.
+
+### N3 Blocked
+
+- Physical GPU placement does not match the manifest intent: logical `gpu_ids: [0]` maps to physical node9 GPU2 in `nvidia-smi`.
+- Service-manager target sleep/wake is still state-only and does not call vLLM operations; direct vLLM `/sleep` measured 7.367s, above the N3 <5s threshold.
+- Live gateway metrics are legacy `aibrix:pod_*` keys, not `tre:v2:hist:*` ZSETs; the v1 reader works but measured 138.169 ms for an uncached one-window read, above the <100ms target.
+- Controller decision evidence exists in `tre:v2:decision:latest`, but controller logs did not emit `trs_calc_result`.
