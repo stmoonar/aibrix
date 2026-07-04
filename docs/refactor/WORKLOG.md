@@ -490,3 +490,11 @@
 - Updated `tre/Makefile` so `make check` includes `replayer/tests` and adds `tre/replayer` to `PYTHONPATH`.
 - Verified remotely: focused P7 tests passed with 3 tests.
 - Next P7 work: add trace config loading and Poisson schedule generation before implementing lint/oracle tooling.
+
+### P7 Replayer Trace Loader and Poisson Schedule Slice
+
+- Inspected frozen `config/traces_v14` trace folders and confirmed `trace.json` uses a model-keyed segment format with `start_time`, `end_time`, `rps`, `input_tokens`, and `max_tokens`.
+- Added RED tests for loading that segment format and seed-stable Poisson pre-generation; RED failed on missing `tre_replayer.traces` and `build_poisson_schedule`.
+- Extended `RpsSegment` and `ScheduledRequest` with token controls, implemented `build_poisson_schedule()`, and added `tre_replayer.traces.loader.load_trace_segments()`.
+- Verified remotely: focused loader/Poisson tests passed with 2 tests and all replayer tests passed with 5 tests.
+- Next P7 work: add trace-set discovery/loading tests for existing trace folders, then implement lint/oracle foundations.

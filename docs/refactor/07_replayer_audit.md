@@ -19,3 +19,10 @@ Added `tre/replayer/tre_replayer/engine/schedule.py` and `dispatcher.py`:
 - Tests use injected clock/sleep hooks for deterministic precision checks without contacting the cluster.
 
 Remaining P7 work: Poisson schedules, trace config loading for existing trace files, 60s aiohttp-stub precision test, capacity/design/lint/oracle tooling, coverage matrix, and final lint/oracle reports for existing traces.
+
+
+## Trace Loading and Poisson Schedules
+
+Existing `trace.json` files under the frozen `config/traces_v14/*/` directories are model-keyed JSON objects. Each model maps to segment dictionaries with `start_time`, `end_time`, `rps`, `input_tokens`, and `max_tokens`. The new loader keeps that format intact and maps it to `RpsSegment` records without requiring YAML config parsing.
+
+`build_poisson_schedule()` now pre-generates arrival timestamps with an explicit seed. This satisfies P7's requirement that the dispatcher consumes a fixed schedule rather than deriving arrivals from response progress. Token controls from the trace segments are copied into every scheduled request for later prompt/token construction.
