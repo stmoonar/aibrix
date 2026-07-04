@@ -52,3 +52,15 @@ def test_ui_backend_exposes_model_parameters_and_latest_decision() -> None:
     assert models["models"][0]["trs"]["lambda_wait"] == 2.625
     assert decision == {"ts_ms": 123, "payload": {"actions": [{"model": "m1", "delta": 1}], "reason": "critical"}}
     assert experiments == {"available": False, "reason": "orchestrate integration is stubbed in P8"}
+
+
+def test_ui_serves_local_single_page_app_without_runtime_cdn() -> None:
+    client = TestClient(create_ui_app(_registry(), FakeRedis(), FakeServiceManagerClient()))
+
+    response = client.get("/")
+
+    assert response.status_code == 200
+    assert "TRE Console" in response.text
+    assert "Cluster Grid" in response.text
+    assert "https://" not in response.text
+    assert "cdn" not in response.text.lower()

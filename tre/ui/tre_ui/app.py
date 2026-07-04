@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any, Protocol
 
 from fastapi import FastAPI
+from fastapi.responses import HTMLResponse
 
 from tre_common.registry import Registry
 
@@ -22,6 +24,10 @@ def create_ui_app(
     service_manager_client: ServiceManagerStateClient,
 ) -> FastAPI:
     app = FastAPI(title="TRE UI")
+
+    @app.get("/", response_class=HTMLResponse)
+    def index() -> str:
+        return (Path(__file__).parent / "static" / "index.html").read_text(encoding="utf-8")
 
     @app.get("/healthz")
     def healthz() -> dict[str, bool]:

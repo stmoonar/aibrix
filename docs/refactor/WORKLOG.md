@@ -604,3 +604,11 @@
 - Added `docs/refactor/08_ui.md` documenting the backend API slice.
 - Verified remotely: focused UI backend tests passed with 2 tests.
 - Next P8 work: add the static single-page frontend and serve it from the FastAPI app without external CDN use.
+
+### P8 UI Static Frontend Slice
+
+- Added a RED test that `GET /` serves a local single-page app containing `TRE Console` and `Cluster Grid` with no runtime CDN references; RED failed with 404.
+- Added `tre_ui/static/index.html` and wired `create_ui_app()` to serve it at `/`.
+- The page fetches `/api/cluster`, `/api/models`, `/api/decision/latest`, and `/api/experiments`; it renders a GPU grid, decision payload, model table, and experiment stub using local HTML/CSS/JS only.
+- Verified remotely: focused UI tests passed with 3 tests.
+- Next P8 work: run a local FastAPI instance with mock sources and capture a screenshot if browser tooling is available, then close/tag P8 if verification remains green.
