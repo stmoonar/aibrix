@@ -96,6 +96,23 @@ def test_decision_snapshot_writer_writes_latest_hash() -> None:
     ]
 
 
+def test_decision_snapshot_writer_logs_even_when_redis_write_fails(caplog) -> None:
+    import logging
+
+    class FailingRedis(FakeRedis):
+        def hset(self, name: str, mapping: dict[str, str]) -> int:
+            raise RuntimeError("redis unavailable")
+
+    writer = DecisionSnapshotWriter(FailingRedis())
+    snapshot = MetricsSnapshot(ts_ms=42, stale=False, models={})
+    result = LoopTickResult(submitted=0, events=("redis_unavailable",))
+
+    with caplog.at_level(logging.INFO, logger="tre_controller.decision"):
+        writer.write("rescue", snapshot, result)
+
+    assert any("trs_calc_result" in record.getMessage() for record in caplog.records)
+
+
 def test_decision_snapshot_writer_logs_trs_calc_result(caplog) -> None:
     import logging
 

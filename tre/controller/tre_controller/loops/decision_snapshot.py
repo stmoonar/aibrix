@@ -31,7 +31,10 @@ class DecisionSnapshotWriter:
 
     def write(self, loop_name: str, snapshot: MetricsSnapshot, result: LoopTickResult) -> None:
         payload = build_decision_snapshot(loop_name, snapshot, result)
-        self._redis.hset(self._key, mapping=payload)
+        try:
+            self._redis.hset(self._key, mapping=payload)
+        except Exception as exc:
+            _LOGGER.warning("decision_snapshot_redis_write_failed: %s", exc)
         _LOGGER.info(json.dumps({"event": "trs_calc_result", **payload}, separators=(",", ":")))
 
 
