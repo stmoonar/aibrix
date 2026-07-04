@@ -180,12 +180,12 @@ def test_build_plan_drops_legacy_raw_trs_fallback_when_paper_state_unknown() -> 
 
 def test_idle_proactive_honors_per_model_min_replicas() -> None:
     classifications = [_classification("warm", ModelState.IDLE, ModelRole.DONOR, 10.0, "idle")]
-    contexts = {"warm": {"assigned_replicas": 1, "routable_pods": 1}}
+    contexts = {"warm": {"assigned_replicas": 4, "routable_pods": 1}}
 
     plan = build_plan(
         model_contexts=contexts,
         classifications=classifications,
-        model_replicas={"warm": 1},
+        model_replicas={"warm": 4},
         idle_gpus=3,
         cfg=PlanConfig(
             min_replicas_per_model=0,
@@ -196,6 +196,34 @@ def test_idle_proactive_honors_per_model_min_replicas() -> None:
     )
 
     assert plan.actions == []
+
+
+def test_critical_receiver_wakes_sleeping_bound_replica_before_claiming_idle_capacity() -> None:
+    classifications = [_classification("warm", ModelState.CRITICAL, ModelRole.RECEIVER, 0.5)]
+    contexts = {"warm": {"assigned_replicas": 4, "routable_pods": 1}}
+
+    plan = build_plan(
+        model_contexts=contexts,
+        classifications=classifications,
+        model_replicas={"warm": 4},
+        idle_gpus=0,
+        cfg=PlanConfig(
+            min_replicas_per_model=0,
+            max_replicas_per_model=4,
+            min_replicas_by_model={"warm": 1},
+            max_replicas_by_model={"warm": 4},
+        ),
+    )
+
+    assert plan.actions == [
+        ScaleAction(
+            model="warm",
+            delta=1,
+            reason="critical_sleeping_capacity",
+            source_loop="rescue",
+            receiver="warm",
+        )
+    ]
 
 
 def test_critical_receiver_with_zero_assigned_can_expand_to_one_replica_max() -> None:

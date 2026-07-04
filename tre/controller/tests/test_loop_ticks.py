@@ -52,7 +52,16 @@ def _registry() -> Registry:
     )
 
 
-def _metrics(model: str, *, generation: float, waiting: float, running: float, assigned: int = 1) -> ModelWindowMetrics:
+def _metrics(
+    model: str,
+    *,
+    generation: float,
+    waiting: float,
+    running: float,
+    assigned: int = 1,
+    routable: int | None = None,
+) -> ModelWindowMetrics:
+    routable = assigned if routable is None else routable
     return ModelWindowMetrics(
         model=model,
         window_start_ms=0,
@@ -66,7 +75,7 @@ def _metrics(model: str, *, generation: float, waiting: float, running: float, a
         ttft_p95_ms=100.0,
         tpot_p95_ms=10.0,
         e2e_p95_ms=1000.0,
-        routable_pods=assigned,
+        routable_pods=routable,
         assigned_replicas=assigned,
         per_pod={},
     )
@@ -233,7 +242,7 @@ def test_rescue_tick_honors_per_model_min_replicas_for_idle_model() -> None:
     snapshot = MetricsSnapshot(
         ts_ms=1,
         stale=False,
-        models={"warm": _metrics("warm", generation=0.0, waiting=0.0, running=0.0, assigned=1)},
+        models={"warm": _metrics("warm", generation=0.0, waiting=0.0, running=0.0, assigned=4, routable=1)},
     )
 
     result = run_rescue_tick(snapshot, queue=queue, registry=registry)

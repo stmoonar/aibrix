@@ -132,13 +132,29 @@ def build_plan(
         for recv in critical_receivers:
             if recv.model_name in inflight_models:
                 continue
-            recv_pods = _effective_assigned_replicas(recv.model_name, model_contexts, model_replicas)
+            recv_pods = _effective_routable_replicas(recv.model_name, model_contexts, model_replicas)
+            recv_assigned = _effective_assigned_replicas(recv.model_name, model_contexts, model_replicas)
             recv_max = _max_replicas(cfg, recv.model_name)
             if recv_pods >= recv_max:
                 continue
             raw_need = min(_scale_step(recv_pods, cfg.scale_step_ratio), recv_max - recv_pods)
             if raw_need <= 0:
                 continue
+
+            gain_from_sleeping = min(raw_need, max(0, recv_assigned - recv_pods))
+            if gain_from_sleeping > 0:
+                _add_scale_action(
+                    actions,
+                    deltas,
+                    model=recv.model_name,
+                    delta=gain_from_sleeping,
+                    reason="critical_sleeping_capacity",
+                    source_loop="rescue",
+                    receiver=recv.model_name,
+                )
+                raw_need -= gain_from_sleeping
+                if raw_need <= 0:
+                    continue
 
             tp_size = cfg.model_tp_sizes.get(recv.model_name, 1)
             if tp_size > 1 and cluster_view is not None:
@@ -203,7 +219,7 @@ def build_plan(
                     or donor.state not in (ModelState.IDLE, ModelState.HIGH)
                 ):
                     continue
-                donor_pods = _effective_assigned_replicas(donor.model_name, model_contexts, model_replicas)
+                donor_pods = _effective_routable_replicas(donor.model_name, model_contexts, model_replicas)
                 donor_min = _min_replicas(cfg, donor.model_name)
                 if donor_pods <= donor_min:
                     continue
@@ -246,7 +262,7 @@ def build_plan(
                     or middle.model_name in inflight_models
                 ):
                     continue
-                middle_pods = _effective_assigned_replicas(middle.model_name, model_contexts, model_replicas)
+                middle_pods = _effective_routable_replicas(middle.model_name, model_contexts, model_replicas)
                 middle_min = _min_replicas(cfg, middle.model_name)
                 if middle_pods <= middle_min:
                     continue
@@ -279,7 +295,7 @@ def build_plan(
                 continue
             if deltas.get(idle.model_name, 0) != 0:
                 continue
-            pods = _effective_assigned_replicas(idle.model_name, model_contexts, model_replicas)
+            pods = _effective_routable_replicas(idle.model_name, model_contexts, model_replicas)
             idle_min = _min_replicas(cfg, idle.model_name)
             if pods <= idle_min:
                 continue
@@ -302,7 +318,7 @@ def build_plan(
                 continue
             if deltas.get(high.model_name, 0) != 0:
                 continue
-            pods = _effective_assigned_replicas(high.model_name, model_contexts, model_replicas)
+            pods = _effective_routable_replicas(high.model_name, model_contexts, model_replicas)
             high_min = _min_replicas(cfg, high.model_name)
             if pods <= high_min:
                 continue
@@ -329,11 +345,25 @@ def build_plan(
     for recv in low_receivers:
         if recv.model_name in inflight_models:
             continue
-        recv_pods = _effective_assigned_replicas(recv.model_name, model_contexts, model_replicas)
+        recv_pods = _effective_routable_replicas(recv.model_name, model_contexts, model_replicas)
+        recv_assigned = _effective_assigned_replicas(recv.model_name, model_contexts, model_replicas)
         receiver_capacity = _max_replicas(cfg, recv.model_name) - recv_pods - max(0, deltas.get(recv.model_name, 0))
         if receiver_capacity <= 0:
             continue
         needed = min(_scale_step(recv_pods, cfg.scale_step_ratio), receiver_capacity)
+
+        sleeping_gain = min(needed, max(0, recv_assigned - recv_pods))
+        if sleeping_gain > 0:
+            _add_scale_action(
+                actions,
+                deltas,
+                model=recv.model_name,
+                delta=sleeping_gain,
+                reason="low_fairness_sleeping_capacity",
+                source_loop="fairness",
+                receiver=recv.model_name,
+            )
+            needed -= sleeping_gain
 
         if remaining_idle > 0:
             idle_gain = min(needed, remaining_idle)
@@ -365,7 +395,7 @@ def build_plan(
                 or donor.state not in (ModelState.IDLE, ModelState.HIGH)
             ):
                 continue
-            donor_pods = _effective_assigned_replicas(donor.model_name, model_contexts, model_replicas)
+            donor_pods = _effective_routable_replicas(donor.model_name, model_contexts, model_replicas)
             donor_min = _min_replicas(cfg, donor.model_name)
             if donor_pods <= donor_min:
                 continue
@@ -414,7 +444,7 @@ def build_plan(
                 break
             if middle.model_name == recv.model_name or middle.model_name in active_probe_models or middle.model_name in inflight_models:
                 continue
-            donor_pods = _effective_assigned_replicas(middle.model_name, model_contexts, model_replicas)
+            donor_pods = _effective_routable_replicas(middle.model_name, model_contexts, model_replicas)
             donor_min = _min_replicas(cfg, middle.model_name)
             if donor_pods <= donor_min:
                 continue
@@ -477,7 +507,7 @@ def _try_plan_same_slot_high_shrink(
             continue
         if binding.model == receiver or len(binding.slot.gpu_ids) != 1:
             continue
-        donor_pods = _effective_assigned_replicas(binding.model, model_contexts, model_replicas)
+        donor_pods = _effective_routable_replicas(binding.model, model_contexts, model_replicas)
         if donor_pods <= _min_replicas(cfg, binding.model):
             continue
         if not _slot_mate_is_free(cluster_view, binding.slot, occupied):
@@ -590,6 +620,21 @@ def _min_replicas(cfg: PlanConfig, model_name: str) -> int:
 
 def _max_replicas(cfg: PlanConfig, model_name: str) -> int:
     return cfg.max_replicas_by_model.get(model_name, cfg.max_replicas_per_model)
+
+
+def _effective_routable_replicas(
+    model_name: str,
+    model_contexts: dict[str, dict[str, Any]],
+    model_replicas: dict[str, int],
+) -> int:
+    ctx = model_contexts.get(model_name, {})
+    routable = ctx.get("routable_pods")
+    if routable is None:
+        routable = model_replicas.get(model_name, ctx.get("assigned_replicas", 1))
+    try:
+        return max(0, int(routable))
+    except Exception:
+        return 1
 
 
 def _effective_assigned_replicas(
