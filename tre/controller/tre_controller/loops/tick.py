@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Protocol
 
 from tre_common.metrics_schema import MetricsSnapshot, ModelWindowMetrics
@@ -51,7 +51,7 @@ def run_planner_tick(
     if snapshot.stale:
         return LoopTickResult(submitted=0, events=("snapshot_stale",))
 
-    contexts = _model_contexts(snapshot, registry, signal_source=signal_source)
+    contexts = _model_contexts(snapshot, registry, signal_source=signal_source, cluster_view=cluster_view)
     classifications = classify_all_models(contexts)
     replicas = {model: int(ctx.get("assigned_replicas", 0)) for model, ctx in contexts.items()}
     cfg = PlanConfig(
@@ -162,10 +162,20 @@ def _commands_to_actions(commands: tuple[SafeScaleCommand, ...], *, source_loop:
     return tuple(actions)
 
 
-def _model_contexts(snapshot: MetricsSnapshot, registry: Registry, *, signal_source: str = "zm") -> dict[str, dict]:
+def _model_contexts(
+    snapshot: MetricsSnapshot,
+    registry: Registry,
+    *,
+    signal_source: str = "zm",
+    cluster_view: ClusterView | None = None,
+) -> dict[str, dict]:
     contexts: dict[str, dict] = {}
+    cluster_counts = _cluster_view_counts(cluster_view)
     for model_name, metrics in snapshot.models.items():
         spec = registry.model(model_name)
+        counts = cluster_counts.get(model_name)
+        if counts is not None:
+            metrics = replace(metrics, routable_pods=counts[0], assigned_replicas=counts[1])
         result = TRSComputer(ema_alpha=spec.trs.ema_alpha).compute(TRSInput.from_metrics(metrics, spec.trs), theta_m=spec.trs.theta_m)
         signal = get_signal(metrics, spec, signal_source, trs_z_m=result.Z_m)
         contexts[model_name] = {
@@ -186,6 +196,19 @@ def _model_contexts(snapshot: MetricsSnapshot, registry: Registry, *, signal_sou
             "is_saturated": result.Q_ctl >= spec.trs.qsat,
         }
     return contexts
+
+
+def _cluster_view_counts(cluster_view: ClusterView | None) -> dict[str, tuple[int, int]]:
+    if cluster_view is None:
+        return {}
+    counts: dict[str, list[int]] = {}
+    for binding in cluster_view.bindings:
+        model_counts = counts.setdefault(binding.model, [0, 0])
+        if not binding.hidden:
+            model_counts[1] += 1
+        if binding.awake and not binding.hidden:
+            model_counts[0] += 1
+    return {model: (values[0], values[1]) for model, values in counts.items()}
 
 
 def _idle_gpus(snapshot: MetricsSnapshot, registry: Registry) -> int:

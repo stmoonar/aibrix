@@ -251,6 +251,33 @@ def test_rescue_tick_honors_per_model_min_replicas_for_idle_model() -> None:
     assert queue.submitted == []
 
 
+def test_rescue_tick_uses_cluster_view_awake_counts_over_legacy_metric_pod_count() -> None:
+    from tre_controller.planning.planner import ClusterView
+    from tre_sm.allocator.slots import Binding, Slot
+
+    queue = FakeQueue()
+    registry = _registry_with_model_bounds({"warm": (1, 4), "cold": (0, 4)})
+    snapshot = MetricsSnapshot(
+        ts_ms=1,
+        stale=False,
+        models={"warm": _metrics("warm", generation=0.0, waiting=0.0, running=0.0, assigned=4, routable=4)},
+    )
+    cluster_view = ClusterView(
+        registry.topology(),
+        (
+            Binding("warm-0", "warm", Slot("node-a", (0,)), awake=True),
+            Binding("warm-1", "warm", Slot("node-a", (1,)), awake=False),
+            Binding("warm-2", "warm", Slot("node-a", (2,)), awake=False),
+            Binding("warm-3", "warm", Slot("node-a", (3,)), awake=False),
+        ),
+    )
+
+    result = run_rescue_tick(snapshot, queue=queue, registry=registry, cluster_view=cluster_view)
+
+    assert result.submitted == 0
+    assert queue.submitted == []
+
+
 def test_fairness_tick_passes_inflight_models_to_planner() -> None:
     queue = FakeQueue(inflight={"critical"})
     snapshot = MetricsSnapshot(
