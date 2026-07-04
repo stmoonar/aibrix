@@ -162,6 +162,7 @@ def test_create_controller_dependencies_wires_configured_components() -> None:
     assert deps.store._redis is redis
     assert deps.store._instant_sample_interval_ms == 7000
     assert deps.store._percentile_mode == "interpolated"
+    assert deps.store._schema == "v2"
     assert isinstance(deps.snapshot_box, SnapshotBox)
     assert isinstance(deps.queue, ActionQueue)
     assert deps.queue._client is deps.sm_client
@@ -171,6 +172,34 @@ def test_create_controller_dependencies_wires_configured_components() -> None:
     assert deps.decision_writer._redis is redis
     assert isinstance(deps.safescale, SafeScaleStateMachine)
     assert deps.registry.model("dsqwen-7b").tp_size == 1
+
+
+def test_create_controller_dependencies_can_split_metrics_redis_from_state_redis() -> None:
+    from tre_controller.app import create_controller_dependencies
+    from tre_controller.config import ControllerConfig
+
+    cfg = ControllerConfig.from_env(
+        {
+            "TRE_REGISTRY_PATH": str(REGISTRY_PATH),
+            "TRE_REDIS_URL": "redis://state:6379/0",
+            "TRE_METRICS_REDIS_URL": "redis://metrics:6379/0",
+            "TRE_METRICS_SCHEMA": "v1",
+            "TRE_SERVICE_MANAGER_URL": "http://service-manager:8001/",
+        }
+    )
+    created = {}
+
+    def factory(url):
+        client = EmptyRedis()
+        created[url] = client
+        return client
+
+    deps = create_controller_dependencies(cfg, redis_client_factory=factory)
+
+    assert deps.store._redis is created["redis://metrics:6379/0"]
+    assert deps.store._schema == "v1"
+    assert deps.decision_writer._redis is created["redis://state:6379/0"]
+    assert deps.safescale._store._redis is created["redis://state:6379/0"]
 
 
 def test_create_controller_dependencies_restores_safescale_probe_state() -> None:

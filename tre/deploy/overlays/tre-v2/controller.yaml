@@ -25,6 +25,10 @@ spec:
           env:
             - name: TRE_REDIS_URL
               value: redis://tre-v2-redis:6379/0
+            - name: TRE_METRICS_REDIS_URL
+              value: redis://aibrix-redis-master.aibrix-system.svc.cluster.local:6379/0
+            - name: TRE_METRICS_SCHEMA
+              value: v1
             - name: TRE_SERVICE_MANAGER_URL
               value: http://tre-v2-service-manager:8000
             - name: TRE_REGISTRY_PATH

@@ -7,6 +7,7 @@ from typing import Mapping
 
 SIGNAL_SOURCES = {"zm", "latency_p95", "queue_len", "kv_cache"}
 PERCENTILE_MODES = {"bucket_upper", "interpolated"}
+METRICS_SCHEMAS = {"v1", "v2"}
 _TRUE_VALUES = {"1", "true", "yes", "y", "on"}
 _FALSE_VALUES = {"0", "false", "no", "n", "off"}
 
@@ -29,6 +30,8 @@ class SafeScaleConfig:
 @dataclass(frozen=True)
 class ControllerConfig:
     redis_url: str
+    metrics_redis_url: str
+    metrics_schema: str
     service_manager_url: str
     registry_path: str
     runtime_state_dir: str
@@ -60,6 +63,12 @@ class ControllerConfig:
         if signal_source not in SIGNAL_SOURCES:
             raise ValueError(f"TRE_SIGNAL_SOURCE must be one of {sorted(SIGNAL_SOURCES)}")
 
+        metrics_schema = _get_str(values, "TRE_METRICS_SCHEMA", "v2")
+        if metrics_schema not in METRICS_SCHEMAS:
+            raise ValueError(f"TRE_METRICS_SCHEMA must be one of {sorted(METRICS_SCHEMAS)}")
+
+        redis_url = _get_str(values, "TRE_REDIS_URL", "redis://aibrix-redis-master:6379/0")
+
         safescale = SafeScaleConfig(
             ttft_p95_slo_ms=_get_positive_float(values, "SAFE_SCALE_TTFT_P95_SLO_MS", 1200.0),
             tpot_p95_slo_ms=_get_positive_float(values, "SAFE_SCALE_TPOT_P95_SLO_MS", 100.0),
@@ -77,7 +86,9 @@ class ControllerConfig:
             raise ValueError("SAFE_SCALE_MIN_WINDOW_MS must be <= SAFE_SCALE_MAX_WINDOW_MS")
 
         return cls(
-            redis_url=_get_str(values, "TRE_REDIS_URL", "redis://aibrix-redis-master:6379/0"),
+            redis_url=redis_url,
+            metrics_redis_url=_get_str(values, "TRE_METRICS_REDIS_URL", redis_url),
+            metrics_schema=metrics_schema,
             service_manager_url=_get_str(
                 values,
                 "TRE_SERVICE_MANAGER_URL",

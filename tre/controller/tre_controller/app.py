@@ -112,12 +112,19 @@ def create_controller_dependencies(
     sm_transport: AsyncTransport | None = None,
 ) -> ControllerDependencies:
     registry = load_registry(cfg.registry_path)
+    injected_redis_client = redis_client is not None
     redis_client = redis_client if redis_client is not None else _create_redis_client(cfg.redis_url, redis_client_factory)
+    metrics_redis_client = (
+        redis_client
+        if injected_redis_client or cfg.metrics_redis_url == cfg.redis_url
+        else _create_redis_client(cfg.metrics_redis_url, redis_client_factory)
+    )
     store = MetricsStore(
-        redis_client,
+        metrics_redis_client,
         registry,
         instant_sample_interval_ms=cfg.instant_sample_interval_ms,
         percentile_mode=cfg.percentile_mode,
+        schema=cfg.metrics_schema,
     )
     sm_client = ServiceManagerClient(cfg.service_manager_url, transport=sm_transport)
     safescale = SafeScaleStateMachine(config=cfg.safescale, store=ControllerStateStore(redis_client))

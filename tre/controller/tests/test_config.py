@@ -9,6 +9,8 @@ def test_config_defaults_are_plan_aligned() -> None:
     config = ControllerConfig.from_env({})
 
     assert config.redis_url == "redis://aibrix-redis-master:6379/0"
+    assert config.metrics_redis_url == "redis://aibrix-redis-master:6379/0"
+    assert config.metrics_schema == "v2"
     assert config.service_manager_url == "http://aibrix-tre-service-manager:8000"
     assert config.registry_path.endswith("tre/deploy/registry.yaml")
     assert config.monitor_interval_s == 20.0
@@ -27,6 +29,8 @@ def test_config_reads_centralized_environment_values() -> None:
     config = ControllerConfig.from_env(
         {
             "TRE_REDIS_URL": "redis://redis.example:6379/2",
+            "TRE_METRICS_REDIS_URL": "redis://metrics.example:6379/0",
+            "TRE_METRICS_SCHEMA": "v1",
             "TRE_SERVICE_MANAGER_URL": "http://service-manager.example:9000",
             "TRE_REGISTRY_PATH": "/etc/aibrix/registry.yaml",
             "TRE_MONITOR_INTERVAL_SECONDS": "30",
@@ -43,6 +47,8 @@ def test_config_reads_centralized_environment_values() -> None:
     )
 
     assert config.redis_url == "redis://redis.example:6379/2"
+    assert config.metrics_redis_url == "redis://metrics.example:6379/0"
+    assert config.metrics_schema == "v1"
     assert config.service_manager_url == "http://service-manager.example:9000"
     assert config.registry_path == "/etc/aibrix/registry.yaml"
     assert config.monitor_interval_s == 30.0
@@ -125,3 +131,8 @@ def test_config_rejects_invalid_signal_source() -> None:
 def test_config_rejects_invalid_bool() -> None:
     with pytest.raises(ValueError, match="ENABLE_TRE_SCALING"):
         ControllerConfig.from_env({"ENABLE_TRE_SCALING": "maybe"})
+
+
+def test_config_rejects_invalid_metrics_schema() -> None:
+    with pytest.raises(ValueError, match="TRE_METRICS_SCHEMA"):
+        ControllerConfig.from_env({"TRE_METRICS_SCHEMA": "legacy"})
