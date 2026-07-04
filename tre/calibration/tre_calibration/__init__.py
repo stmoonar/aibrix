@@ -1,5 +1,6 @@
 """Calibration helpers for TRE signal fitting."""
 
+from tre_calibration.capacity import CapacityPoint, CapacitySample, CapacitySurface, fit_capacity_surface
 from tre_calibration.dataset import CalibrationWindow, load_windows_from_csv, split_by_scenario
 from tre_calibration.evaluate import SignalDirectionEvaluation, ThresholdEvaluation, evaluate_signal_direction, evaluate_threshold
 from tre_calibration.fit import FittedTheta, ReliabilityThetaFit, fit_theta_by_reliability, fit_theta_from_health
@@ -8,6 +9,9 @@ from tre_calibration.signals import ParameterCandidateScore, ParameterSearchResu
 
 __all__ = [
     "CalibrationWindow",
+    "CapacityPoint",
+    "CapacitySample",
+    "CapacitySurface",
     "FittedTheta",
     "ReliabilityThetaFit",
     "ParameterCandidateScore",
@@ -20,6 +24,7 @@ __all__ = [
     "compute_trs",
     "evaluate_signal_direction",
     "evaluate_threshold",
+    "fit_capacity_surface",
     "fit_theta_by_reliability",
     "fit_theta_from_health",
     "grid_search_parameters",

@@ -506,3 +506,11 @@
 - Verified remotely: focused discovery test passed and all replayer tests passed with 6 tests.
 - Ran a read-only parse of frozen `config/traces_v14`: parsed 5 trace cases, 1 indexed and 4 unindexed, with segment counts recorded in `docs/refactor/07_replayer_audit.md`.
 - Next P7 work: implement lint foundations (capacity model plus C1/C2/C3 reports) and oracle lower-bound checks.
+
+### P7 Capacity Surface Foundation Slice
+
+- Added RED tests for fitting single-pod capacity as max SLO-safe RPS per `(model, input_tokens, output_tokens)` grid point and marking out-of-grid lookups low-confidence; RED failed on missing `tre_calibration.capacity`.
+- Implemented `CapacitySample`, `CapacityPoint`, `CapacitySurface`, and `fit_capacity_surface()` as pure calibration helpers for future trace lint/oracle code.
+- Exported capacity helpers from `tre_calibration.__init__`.
+- Verified remotely: focused capacity tests passed with 2 tests and all calibration tests passed with 13 tests.
+- Next P7 work: consume the capacity surface in `tre_replayer.lint` for C1/C2/C3 trace checks.

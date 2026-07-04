@@ -33,3 +33,8 @@ Existing `trace.json` files under the frozen `config/traces_v14/*/` directories 
 `discover_trace_set()` reads `INDEX.json` when present and then scans every immediate child directory containing `trace.json`. Indexed workloads are listed first and marked `indexed=True`; additional trace folders are retained and marked `indexed=False` instead of being silently ignored.
 
 Read-only check against `/root/aibrix-main/CustomTraceGenerator/config/traces_v14` parsed 5 cases: `Simultaneous_spike_ramp_twice_tps1o2` from the index plus unindexed `Alternating_hot_model_periodic_A`, `Decode_heavy_burst`, `Prefill_mixed_corner_decode_mix`, and `Sinusoidal_demand`.
+
+
+## Capacity Surface Foundation
+
+Added `tre_calibration.capacity` as the first capacity-surface building block for P7 trace linting. It fits the max SLO-safe RPS at each `(model, input_tokens, output_tokens)` grid point and marks out-of-grid lookups as `nearest_extrapolated` with `low_confidence=True`. This is intentionally conservative until real training-grid interpolation is added.
