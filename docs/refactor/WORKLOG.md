@@ -779,3 +779,4 @@
 - Full verification after the final controller fix passed: `git diff --check && cd tre && make check && make smoke` with 217 tests and `tre smoke ok`.
 - Final heavy concurrent live run passed with `/tmp/tre_concurrent_step_with_controller.py`: 8 workers, `max_tokens=96`, controller enabled after load start, `783` successful requests, `0` errors, p95 `1277.21ms`.
 - Final scaling evidence: `dsqwen-7b` stayed non-empty and expanded from `awake=1,bound=4` to `awake=3,bound=4` at sample `30.4s`, then `awake=4,bound=4` at sample `45.9s`; final Service endpoints contained all four pods.
+- Ran the N4.3 output-length drift sample on the four-awake `dsqwen-7b` subset: 20/20 successes for each `max_tokens` setting; p95 latency was `34.74ms` for 1 token, `429.99ms` for 32 tokens, and `1246.39ms` for 96 tokens; post-check remained `awake=4,bound=4` with four Service endpoints.

@@ -73,8 +73,8 @@ Required scenarios:
 
 Remaining work:
 
-- Single-model low-latency and heavy-load paths have evidence.
-- Alternating two-model load and output-length drift sample are still pending.
+- Single-model low-latency, heavy-load expansion, and output-length drift paths have evidence.
+- Alternating two-model load is still pending.
 
 ### Single-Model Step Load
 
@@ -150,6 +150,28 @@ Controller decision evidence:
 - The final run had no `idle_proactive_immediate` downscale before expansion.
 - Controller emitted `critical_sleeping_capacity` scale-up actions for `dsqwen-7b` during the active window.
 - Endpoints remained non-empty throughout the run; no 500/503/timeout errors occurred.
+
+### Output-Length Drift Sample
+
+Status: **PASS**
+
+Setup:
+
+- `dsqwen-7b` final state from the heavy run: `awake=4`, `bound=4`.
+- 20 gateway requests per setting, same prompt, `temperature=0`.
+
+Result:
+
+```text
+max_tokens 1 ok 20 errors 0 lat_ms_min_avg_p95_max 20.72 26.49 34.74 41.66
+max_tokens 32 ok 20 errors 0 lat_ms_min_avg_p95_max 412.81 420.96 429.99 433.38
+max_tokens 96 ok 20 errors 0 lat_ms_min_avg_p95_max 1225.75 1235.22 1246.39 1246.84
+```
+
+Post-check:
+
+- Service-manager remained `dsqwen-7b awake=4 bound=4`.
+- `default/dsqwen-7b` retained four Service endpoints.
 
 ## N4.4 Defrag And Same-Slot Shrink
 
