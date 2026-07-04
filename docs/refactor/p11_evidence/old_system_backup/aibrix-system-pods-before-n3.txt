@@ -1,0 +1,16 @@
+NAME                                                       READY   STATUS    RESTARTS   AGE     IP            NODE                   NOMINATED NODE   READINESS GATES
+aibrix-autoscaling-controller-manager-6cbd9c899d-ssfm7     1/1     Running   0          3d5h    10.244.0.32   nscc-ds-4a100-node10   <none>           <none>
+aibrix-controller-manager-6fc5bb5845-jspbq                 1/1     Running   0          3d5h    10.244.0.23   nscc-ds-4a100-node10   <none>           <none>
+aibrix-gateway-plugins-699cccddb9-f4mc2                    1/1     Running   0          3d5h    10.244.0.25   nscc-ds-4a100-node10   <none>           <none>
+aibrix-gateway-visualizer-6b578bcdbf-jjmmg                 1/1     Running   0          3d5h    10.244.0.31   nscc-ds-4a100-node10   <none>           <none>
+aibrix-gateway-visualizer-v2-567c75b54c-czzfr              1/1     Running   0          3d5h    10.244.0.30   nscc-ds-4a100-node10   <none>           <none>
+aibrix-gpu-optimizer-7cf8996c48-mvk42                      1/1     Running   0          3d5h    10.244.0.22   nscc-ds-4a100-node10   <none>           <none>
+aibrix-kuberay-operator-79bb659f74-mkjdz                   1/1     Running   0          3d5h    10.244.0.20   nscc-ds-4a100-node10   <none>           <none>
+aibrix-metadata-service-b77c76d46-6zkjm                    1/1     Running   0          3d5h    10.244.0.24   nscc-ds-4a100-node10   <none>           <none>
+aibrix-orchestration-controller-manager-698fc7986d-chh68   1/1     Running   0          3d6h    10.244.3.8    nscc-ds-4a100-node9    <none>           <none>
+aibrix-orchestration-kuberay-operator-6978856c46-6r7qg     1/1     Running   0          3d6h    10.244.3.7    nscc-ds-4a100-node9    <none>           <none>
+aibrix-redis-master-696649c96c-vsfhz                       1/1     Running   0          3d5h    10.244.0.21   nscc-ds-4a100-node10   <none>           <none>
+lxtaibrix-gateway-plugins-556cf69f9c-nqv24                 1/1     Running   0          3d5h    10.244.0.26   nscc-ds-4a100-node10   <none>           <none>
+service-management-5d7667649d-95r9d                        1/1     Running   0          3d5h    10.244.0.46   nscc-ds-4a100-node10   <none>           <none>
+service-management-xxy-58cbbf6586-9v6r6                    1/1     Running   0          2d22h   10.244.0.90   nscc-ds-4a100-node10   <none>           <none>
+tre-controller-6996d7fbc7-8p5lb                            1/1     Running   0          2d22h   10.244.0.93   nscc-ds-4a100-node10   <none>           <none>

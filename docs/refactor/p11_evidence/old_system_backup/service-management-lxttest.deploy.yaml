@@ -1,0 +1,105 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  annotations:
+    deployment.kubernetes.io/revision: "1"
+  creationTimestamp: "2026-03-07T19:29:10Z"
+  generation: 1
+  labels:
+    app: service-management-lxttest
+  name: service-management-lxttest
+  namespace: aibrix-system
+  resourceVersion: "139878192"
+  uid: 0e891534-9da3-40fa-8c92-7094bf44efab
+spec:
+  progressDeadlineSeconds: 600
+  replicas: 1
+  revisionHistoryLimit: 10
+  selector:
+    matchLabels:
+      app: service-management-lxttest
+  strategy:
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 25%
+    type: RollingUpdate
+  template:
+    metadata:
+      creationTimestamp: null
+      labels:
+        app: service-management-lxttest
+    spec:
+      containers:
+      - env:
+        - name: TARGET_NAMESPACE
+          value: aibrix-system
+        - name: PORT
+          value: "7002"
+        image: service-management-lxttest:lxt
+        imagePullPolicy: IfNotPresent
+        livenessProbe:
+          failureThreshold: 3
+          httpGet:
+            path: /health
+            port: 7002
+            scheme: HTTP
+          initialDelaySeconds: 10
+          periodSeconds: 30
+          successThreshold: 1
+          timeoutSeconds: 1
+        name: service-management-lxttest
+        ports:
+        - containerPort: 7002
+          name: http
+          protocol: TCP
+        readinessProbe:
+          failureThreshold: 3
+          httpGet:
+            path: /health
+            port: 7002
+            scheme: HTTP
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          successThreshold: 1
+          timeoutSeconds: 1
+        resources:
+          limits:
+            cpu: 500m
+            memory: 512Mi
+          requests:
+            cpu: 100m
+            memory: 128Mi
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+      dnsPolicy: ClusterFirst
+      nodeName: nscc-ds-4a100-node10
+      restartPolicy: Always
+      schedulerName: default-scheduler
+      securityContext: {}
+      serviceAccount: service-management-lxttest-sa
+      serviceAccountName: service-management-lxttest-sa
+      terminationGracePeriodSeconds: 30
+status:
+  conditions:
+  - lastTransitionTime: "2026-03-07T19:29:10Z"
+    lastUpdateTime: "2026-03-07T19:29:10Z"
+    message: Deployment does not have minimum availability.
+    reason: MinimumReplicasUnavailable
+    status: "False"
+    type: Available
+  - lastTransitionTime: "2026-03-07T19:29:10Z"
+    lastUpdateTime: "2026-03-07T19:29:10Z"
+    message: 'pods "service-management-lxttest-7f5bb4b9c6-" is forbidden: error looking
+      up service account aibrix-system/service-management-lxttest-sa: serviceaccount
+      "service-management-lxttest-sa" not found'
+    reason: FailedCreate
+    status: "True"
+    type: ReplicaFailure
+  - lastTransitionTime: "2026-03-07T19:39:11Z"
+    lastUpdateTime: "2026-03-07T19:39:11Z"
+    message: ReplicaSet "service-management-lxttest-7f5bb4b9c6" has timed out progressing.
+    reason: ProgressDeadlineExceeded
+    status: "False"
+    type: Progressing
+  observedGeneration: 1
+  unavailableReplicas: 1

@@ -706,3 +706,11 @@
 - `kubectl apply --dry-run=client -k` passed for all five real overlays.
 - Server-side dry-run against the real target namespace is blocked in N2 because namespace `tre-v2` does not exist yet and N2 must not mutate the cluster. Verified `namespace.yaml` with `kubectl apply --dry-run=server -f`; then rendered each overlay with `namespace: default` only for schema validation and `kubectl apply --dry-run=server -f -` passed for all five. Actual target-namespace server dry-run should be repeated in N3 immediately after creating or applying the namespace.
 - Full verification after overlays passed: `cd tre && make check && make smoke` completed with 191 tests and `tre smoke ok`.
+
+### N3.1 Old System Backup
+
+- Created `docs/refactor/p11_evidence/old_system_backup/` before any N3 cluster write.
+- Backed up all four old TRE deployments from `aibrix-system`: `tre-controller`, `service-management-xxy`, `service-management`, and `service-management-lxttest`.
+- Backed up `kubectl -n aibrix-system get svc,cm,secret -o yaml` to `aibrix-system-svc-cm-secret.yaml`.
+- Captured read-only context snapshots: `aibrix-system-pods-before-n3.txt` and `nodes-before-n3.txt`.
+- No Kubernetes resources were deleted or applied during this backup step. Next N3 step is allowed only after this backup commit is present.

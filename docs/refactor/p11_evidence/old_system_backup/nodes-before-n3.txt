@@ -1,0 +1,4 @@
+NAME                   STATUS   ROLES           AGE    VERSION   INTERNAL-IP      EXTERNAL-IP   OS-IMAGE             KERNEL-VERSION       CONTAINER-RUNTIME
+cloud                  Ready    <none>          87d    v1.28.2   192.168.223.85   <none>        Ubuntu 22.04.5 LTS   5.15.0-173-generic   docker://29.4.0
+nscc-ds-4a100-node10   Ready    control-plane   435d   v1.28.2   192.168.223.76   <none>        Ubuntu 22.04.5 LTS   5.15.0-78-generic    docker://29.2.1
+nscc-ds-4a100-node9    Ready    <none>          435d   v1.28.2   192.168.223.75   <none>        Ubuntu 22.04.3 LTS   5.15.0-78-generic    docker://27.5.1
