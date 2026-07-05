@@ -7,8 +7,10 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 from tre_common.registry import Registry
+from tre_common.registry import NodeSpec
 from tre_sm.allocator.slots import Binding, Migration, Slot, SlotAllocator
 from tre_sm.allocator.topology import K8sPodSnapshot
+from tre_sm.gpu_truth import GpuTruthProvider
 from tre_sm.state.reconcile import K8sPodClient, POD_STATE_AWAKE, POD_STATE_HIDDEN, POD_STATE_SLEEPING, reconcile_state
 from tre_sm.state.store import StateConflict, StateStore
 from tre_sm.api.v1_compat import create_v1_compat_router
@@ -44,12 +46,18 @@ class ServiceManagerV2:
         k8s_client: K8sPodClient | None = None,
         runtime_ops: RuntimePodOps | None = None,
         vllm_ops: VllmRuntimeOps | None = None,
+        gpu_truth: GpuTruthProvider | None = None,
+        create_max_used_mib: int = 2500,
+        sleep_leak_used_mib: int = 8192,
     ) -> None:
         self._registry = registry
         self._store = store
         self._k8s_client = k8s_client
         self._runtime_ops = runtime_ops
         self._vllm_ops = vllm_ops
+        self._gpu_truth = gpu_truth
+        self._create_max_used_mib = create_max_used_mib
+        self._sleep_leak_used_mib = sleep_leak_used_mib
 
     def get_state(self) -> dict:
         snapshot = self._store.load()
@@ -227,7 +235,13 @@ class ServiceManagerV2:
     def reconcile(self) -> dict:
         if self._k8s_client is None:
             raise ValueError("k8s_client is required for reconcile")
-        result = reconcile_state(self._registry.topology(), self._store, self._k8s_client)
+        result = reconcile_state(
+            self._registry.topology(),
+            self._store,
+            self._k8s_client,
+            gpu_truth=self._gpu_truth,
+            sleep_leak_used_mib=self._sleep_leak_used_mib,
+        )
         return {
             "version": result.version,
             "warnings": result.warnings,
@@ -269,6 +283,7 @@ class ServiceManagerV2:
     def _create_and_wake_runtime_binding(self, model: str, slot: Slot) -> Binding:
         if self._runtime_ops is None or self._vllm_ops is None:
             raise ValueError("runtime_ops and vllm_ops are required for runtime create")
+        self._ensure_create_headroom(slot)
         deployment_id = self._runtime_ops.create_model_deployment(model, slot)
         ready = self._runtime_ops.wait_pod_ready(deployment_id)
         if not ready.pod_ip:
@@ -300,6 +315,7 @@ class ServiceManagerV2:
         actions.append({"action": "delete_deployment", "serve_id": binding.serve_id})
 
         self._runtime_ops.wait_pod_deleted(binding.serve_id)
+        self._ensure_create_headroom(migration.to_slot)
         deployment_id = self._runtime_ops.create_model_deployment(binding.model, migration.to_slot)
         ready = self._runtime_ops.wait_pod_ready(deployment_id)
         new_serve_id = ready.name
@@ -338,6 +354,23 @@ class ServiceManagerV2:
         except ValueError as exc:
             raise WakeConflict(str(exc)) from exc
         return allocator.feasible_wake(binding.serve_id)
+
+    def _ensure_create_headroom(self, slot: Slot) -> None:
+        if self._gpu_truth is None:
+            return
+        nodes = {node.name: node for node in self._registry.topology().nodes}
+        node = nodes.get(slot.node)
+        for gpu_id in slot.gpu_ids:
+            gpu_uuid = _gpu_uuid(node, gpu_id)
+            if gpu_uuid is None:
+                continue
+            used_mib = self._gpu_truth.used_mib(node=slot.node, gpu_id=gpu_id, gpu_uuid=gpu_uuid)
+            if used_mib is None or used_mib <= self._create_max_used_mib:
+                continue
+            raise ValueError(
+                "insufficient startup headroom: "
+                f"{slot.node}/{gpu_uuid} used_mib={used_mib} max_used_mib={self._create_max_used_mib}"
+            )
 
     def _snapshot_for_binding(self, binding: Binding) -> K8sPodSnapshot:
         snapshots = self._runtime_ops.list_pod_snapshots(model=binding.model) if self._runtime_ops else []
@@ -457,3 +490,11 @@ def _next_serve_id(model: str, existing_serve_ids: set[str]) -> str:
     while f"{base}-{index}" in existing_serve_ids:
         index += 1
     return f"{base}-{index}"
+
+
+def _gpu_uuid(node: NodeSpec | None, gpu_id: int) -> str | None:
+    if node is None:
+        return None
+    if gpu_id < 0 or gpu_id >= len(node.gpu_uuids):
+        return None
+    return node.gpu_uuids[gpu_id]

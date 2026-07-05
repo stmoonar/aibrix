@@ -63,6 +63,15 @@ class FakeVllmOps:
         self.calls.append(("wake_up", pod_ip, port))
         return type("Result", (), {"success": True, "message": ""})()
 
+
+class FakeGpuTruth:
+    def __init__(self, used_by_uuid):
+        self._used_by_uuid = dict(used_by_uuid)
+
+    def used_mib(self, *, node, gpu_id, gpu_uuid):
+        return self._used_by_uuid.get((node, gpu_uuid))
+
+
 class FakeK8sClient:
     def __init__(self, pods):
         self._pods = list(pods)
@@ -72,7 +81,16 @@ class FakeK8sClient:
 
 
 def registry():
-    topology = ClusterTopology(nodes=(NodeSpec(name="node-a", gpus=4, two_gpu_slots=((0, 1), (2, 3))),))
+    topology = ClusterTopology(
+        nodes=(
+            NodeSpec(
+                name="node-a",
+                gpus=4,
+                two_gpu_slots=((0, 1), (2, 3)),
+                gpu_uuids=("GPU-0", "GPU-1", "GPU-2", "GPU-3"),
+            ),
+        )
+    )
     trs = TrsParams(
         w_p=0.04,
         w_d=1.0,
@@ -106,7 +124,16 @@ def registry():
 
 
 def registry_with_tp2():
-    topology = ClusterTopology(nodes=(NodeSpec(name="node-a", gpus=4, two_gpu_slots=((0, 1), (2, 3))),))
+    topology = ClusterTopology(
+        nodes=(
+            NodeSpec(
+                name="node-a",
+                gpus=4,
+                two_gpu_slots=((0, 1), (2, 3)),
+                gpu_uuids=("GPU-0", "GPU-1", "GPU-2", "GPU-3"),
+            ),
+        )
+    )
     trs = TrsParams(
         w_p=0.04,
         w_d=1.0,
@@ -361,6 +388,57 @@ def test_v2_put_target_creates_deployment_when_runtime_deployment_ops_are_availa
         Binding("serve-a", "m1", Slot("node-a", (0,)), awake=True),
         Binding("tp2-pod", "tp2", Slot("node-a", (2, 3)), awake=True),
     ]
+
+
+def test_v2_put_target_rejects_runtime_create_when_gpu_truth_exceeds_headroom_limit():
+    from tre_sm.allocator.topology import K8sPodSnapshot
+
+    class RuntimeWithDeployments(FakeRuntimeOps):
+        def __init__(self):
+            super().__init__(
+                [
+                    K8sPodSnapshot(
+                        name="serve-a",
+                        model="m1",
+                        node="node-a",
+                        env={"CUDA_VISIBLE_DEVICES": "0"},
+                        pod_ip="10.0.0.1",
+                    )
+                ]
+            )
+
+        def delete_model_deployment(self, binding):
+            raise AssertionError("target growth should not delete deployments")
+
+        def wait_pod_deleted(self, serve_id):
+            raise AssertionError("target growth should not wait for deletion")
+
+        def create_model_deployment(self, model, slot):
+            raise AssertionError("headroom check must run before create")
+
+        def wait_pod_ready(self, serve_id):
+            raise AssertionError("headroom check must run before wait")
+
+    store = StateStore(FakeRedis())
+    original = [Binding("serve-a", "m1", Slot("node-a", (0,)), awake=True)]
+    store.save(original, expected_version=0)
+    service = ServiceManagerV2(
+        registry_with_tp2(),
+        store,
+        runtime_ops=RuntimeWithDeployments(),
+        vllm_ops=FakeVllmOps(),
+        gpu_truth=FakeGpuTruth({("node-a", "GPU-2"): 4070, ("node-a", "GPU-3"): 2248}),
+        create_max_used_mib=2500,
+    )
+
+    try:
+        service.put_model_target("tp2", wake_replicas=1)
+    except ValueError as exc:
+        assert "insufficient startup headroom" in str(exc)
+        assert "node-a/GPU-2 used_mib=4070" in str(exc)
+    else:
+        raise AssertionError("expected target growth to fail before create")
+    assert store.load().bindings == original
 
 
 def test_v2_fastapi_routes_delegate_to_service_layer():

@@ -1072,3 +1072,30 @@
 ### Endgame F1 Next
 
 - Proceed to F1.3 GPU truth provider and D8/D10 enforcement using TDD.
+
+### Endgame F1.3 GPU Truth Provider And D8/D10 Offline Slice
+
+- Ran the required read-only Plan A probe first:
+  - Prometheus service exists at `prometheus/prometheus-kube-prometheus-prometheus` (`10.99.1.53:9090`).
+  - `DCGM_FI_DEV_FB_USED`, `DCGM_FI_DEV_FB_USED{Hostname=~".*node9.*"}`, and `DCGM_FI_DEV_FB_USED{node=~".*node9.*"}` all returned an empty vector.
+  - Prometheus metric-name discovery found no DCGM metrics.
+  - `gpu-operator/nvidia-dcgm-exporter` Service endpoints exist, but `curl http://10.107.60.135:9400/metrics` returned HTTP 200 with `Content-Length: 0`.
+  - Conclusion: Plan A is not available in the current cluster without modifying prometheus/gpu-operator, so F1.3 switched to Plan B.
+- Added RED tests before implementation:
+  - `test_gpu_truth.py`: `NullGpuTruth` fallback and `RedisGpuTruth` reading `tre:gpu_truth:<node>` payloads.
+  - `test_gpu_truth_agent.py`: parsing `nvidia-smi --query-gpu=uuid,memory.used,memory.total` CSV and building the Redis payload.
+  - `test_reconcile.py`: `sleep_leak:<serve_id>` warning when a sleeping-only GPU exceeds the truth threshold, and no warning when the GPU has an awake binding.
+  - `test_api_v2.py`: runtime create fails before Deployment creation when GPU truth exceeds the startup headroom threshold.
+- Implemented Plan B offline slice:
+  - `tre_sm.gpu_truth.NullGpuTruth` and `RedisGpuTruth`.
+  - `tre/deploy/scripts/gpu_truth_agent.py`, publishing `tre:gpu_truth:<node>` via `SETEX`.
+  - service-manager reconcile now accepts `gpu_truth` and appends `sleep_leak:<serve_id>` warnings for sleeping-only GPUs over `TRE_SLEEP_LEAK_USED_MIB` (default `8192`).
+  - service-manager runtime create/defrag create now checks `TRE_CREATE_MAX_USED_MIB` (default `2500`) before creating a Deployment when truth is available. Missing truth still falls back to the existing book-state behavior.
+  - server wiring reuses the existing Redis connection for both state and `RedisGpuTruth`.
+- Verification:
+  - Focused tests passed: `29 passed`.
+  - Full `cd tre && make check` passed: `246 passed`.
+
+### Endgame F1 Next
+
+- Build and roll a new service-manager image with the GPU truth provider, run the GPU truth agent once on node9/node10, and validate `POST /v2/reconcile` reports no false leak warnings in the healthy restored topology.

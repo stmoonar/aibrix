@@ -5,7 +5,9 @@ from dataclasses import replace
 from typing import Protocol
 
 from tre_common.registry import ClusterTopology
+from tre_common.registry import NodeSpec
 from tre_sm.allocator.slots import Binding, Slot, SlotAllocator
+from tre_sm.gpu_truth import GpuTruthProvider
 from tre_sm.state.store import StateStore
 
 
@@ -51,6 +53,9 @@ def reconcile_state(
     topology: ClusterTopology,
     store: StateStore,
     k8s_client: K8sPodClient,
+    *,
+    gpu_truth: GpuTruthProvider | None = None,
+    sleep_leak_used_mib: int = 8192,
 ) -> ReconcileResult:
     persisted = store.load()
     persisted_by_serve = {binding.serve_id: binding for binding in persisted.bindings}
@@ -84,6 +89,8 @@ def reconcile_state(
         reconciled_by_serve[binding.serve_id] = binding
 
     bindings = _auto_sleep_awake_conflicts([reconciled_by_serve[serve_id] for serve_id in sorted(reconciled_by_serve)], warnings)
+    if gpu_truth is not None:
+        warnings.extend(_sleep_leak_warnings(topology, bindings, gpu_truth, sleep_leak_used_mib))
     allocator = SlotAllocator(topology, bindings)
     if bindings == persisted.bindings:
         return ReconcileResult(
@@ -131,3 +138,49 @@ def _auto_sleep_awake_conflicts(bindings: list[Binding], warnings: list[str]) ->
         )
         reconciled.append(replace(binding, awake=False, hidden=False))
     return reconciled
+
+
+def _sleep_leak_warnings(
+    topology: ClusterTopology,
+    bindings: list[Binding],
+    gpu_truth: GpuTruthProvider,
+    threshold_mib: int,
+) -> list[str]:
+    warnings: list[str] = []
+    nodes = {node.name: node for node in topology.nodes}
+    warned: set[str] = set()
+    for (node_name, gpu_id), gpu_bindings in _bindings_by_gpu(bindings).items():
+        if any(binding.awake for binding in gpu_bindings):
+            continue
+        node = nodes.get(node_name)
+        gpu_uuid = _gpu_uuid(node, gpu_id)
+        if gpu_uuid is None:
+            continue
+        used_mib = gpu_truth.used_mib(node=node_name, gpu_id=gpu_id, gpu_uuid=gpu_uuid)
+        if used_mib is None or used_mib <= threshold_mib:
+            continue
+        for binding in gpu_bindings:
+            if binding.awake or binding.serve_id in warned:
+                continue
+            warnings.append(
+                f"sleep_leak:{binding.serve_id}: {node_name}/{gpu_uuid} "
+                f"used_mib={used_mib} threshold_mib={threshold_mib}"
+            )
+            warned.add(binding.serve_id)
+    return warnings
+
+
+def _bindings_by_gpu(bindings: list[Binding]) -> dict[tuple[str, int], list[Binding]]:
+    grouped: dict[tuple[str, int], list[Binding]] = {}
+    for binding in bindings:
+        for gpu in binding.slot.gpu_ids:
+            grouped.setdefault((binding.slot.node, gpu), []).append(binding)
+    return grouped
+
+
+def _gpu_uuid(node: NodeSpec | None, gpu_id: int) -> str | None:
+    if node is None:
+        return None
+    if gpu_id < 0 or gpu_id >= len(node.gpu_uuids):
+        return None
+    return node.gpu_uuids[gpu_id]

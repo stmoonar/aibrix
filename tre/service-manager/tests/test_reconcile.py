@@ -37,7 +37,24 @@ class FakeK8sClient:
 
 
 def topology():
-    return ClusterTopology(nodes=(NodeSpec(name="node-a", gpus=4, two_gpu_slots=((0, 1), (2, 3))),))
+    return ClusterTopology(
+        nodes=(
+            NodeSpec(
+                name="node-a",
+                gpus=4,
+                two_gpu_slots=((0, 1), (2, 3)),
+                gpu_uuids=("GPU-0", "GPU-1", "GPU-2", "GPU-3"),
+            ),
+        )
+    )
+
+
+class FakeGpuTruth:
+    def __init__(self, used_by_uuid):
+        self._used_by_uuid = dict(used_by_uuid)
+
+    def used_mib(self, *, node, gpu_id, gpu_uuid):
+        return self._used_by_uuid.get((node, gpu_uuid))
 
 
 def test_reconcile_prefers_existing_pod_cuda_env_over_stale_store_and_persists():
@@ -175,3 +192,53 @@ def test_reconcile_auto_sleeps_later_pod_when_two_awake_pods_share_gpu():
     assert result.warnings == [
         "serve-b: auto-slept to preserve single awake GPU invariant on node-a/0",
     ]
+
+
+def test_reconcile_warns_sleep_leak_when_sleeping_only_gpu_has_high_truth_usage():
+    store = StateStore(FakeRedis())
+    store.save([], expected_version=0)
+    k8s = FakeK8sClient(
+        [
+            PodRecord(
+                serve_id="serve-sleeping",
+                model="dsqwen-7b",
+                node="node-a",
+                cuda_visible_devices="2",
+                state="sleeping",
+            )
+        ]
+    )
+
+    result = reconcile_state(
+        topology(),
+        store,
+        k8s,
+        gpu_truth=FakeGpuTruth({("node-a", "GPU-2"): 24000}),
+        sleep_leak_used_mib=8192,
+    )
+
+    assert result.bindings == [Binding("serve-sleeping", "dsqwen-7b", Slot("node-a", (2,)), awake=False)]
+    assert result.warnings == [
+        "sleep_leak:serve-sleeping: node-a/GPU-2 used_mib=24000 threshold_mib=8192",
+    ]
+
+
+def test_reconcile_does_not_warn_sleep_leak_when_gpu_has_awake_binding():
+    store = StateStore(FakeRedis())
+    store.save([], expected_version=0)
+    k8s = FakeK8sClient(
+        [
+            PodRecord("serve-awake", "dsqwen-7b", "node-a", "2", state="awake"),
+            PodRecord("serve-sleeping", "dsllama-8b", "node-a", "2", state="sleeping"),
+        ]
+    )
+
+    result = reconcile_state(
+        topology(),
+        store,
+        k8s,
+        gpu_truth=FakeGpuTruth({("node-a", "GPU-2"): 39000}),
+        sleep_leak_used_mib=8192,
+    )
+
+    assert all(not warning.startswith("sleep_leak:") for warning in result.warnings)

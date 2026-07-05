@@ -9,6 +9,7 @@ from tre_common.registry import ClusterTopology
 from tre_common.registry import load_registry
 from tre_sm.allocator.topology import K8sPodSnapshot, pod_records_from_snapshots
 from tre_sm.app import create_service_app
+from tre_sm.gpu_truth import RedisGpuTruth
 from tre_sm.ops.k8s_ops import K8sOps
 from tre_sm.ops.vllm_ops import VllmOps
 from tre_sm.state.reconcile import PodRecord
@@ -36,13 +37,17 @@ def create_app() -> FastAPI:
 
     registry = load_registry(os.environ.get("TRE_REGISTRY_PATH"))
     redis_url = os.environ.get("TRE_REDIS_URL", "redis://aibrix-redis-master:6379/0")
+    redis_client = redis.Redis.from_url(redis_url)
     k8s_ops = _create_k8s_ops(registry)
     return create_service_app(
         registry,
-        StateStore(redis.Redis.from_url(redis_url)),
+        StateStore(redis_client),
         k8s_client=K8sPodClientFromOps(registry.topology(), k8s_ops),
         runtime_ops=k8s_ops,
         vllm_ops=VllmOps(),
+        gpu_truth=RedisGpuTruth(redis_client),
+        create_max_used_mib=int(os.environ.get("TRE_CREATE_MAX_USED_MIB", "2500")),
+        sleep_leak_used_mib=int(os.environ.get("TRE_SLEEP_LEAK_USED_MIB", "8192")),
     )
 
 
