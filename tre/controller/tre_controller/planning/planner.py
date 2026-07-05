@@ -9,6 +9,7 @@ from tre_controller.planning.classify import ModelClassification, ModelRole, Mod
 from tre_sm.allocator.slots import Binding, Slot, SlotAllocator
 
 SourceLoop = Literal["rescue", "fairness"]
+IncompletePolicy = Literal["drop_model", "drop_all"]
 
 
 @dataclass(frozen=True)
@@ -21,6 +22,7 @@ class PlanConfig:
     model_tp_sizes: dict[str, int] = field(default_factory=dict)
     min_replicas_by_model: dict[str, int] = field(default_factory=dict)
     max_replicas_by_model: dict[str, int] = field(default_factory=dict)
+    incomplete_policy: IncompletePolicy = "drop_model"
 
 
 @dataclass(frozen=True)
@@ -106,7 +108,8 @@ def build_plan(
     remaining_idle = idle_gpus
     slot_shrink_donors: set[str] = set()
 
-    if _paper_state_incomplete(classifications):
+    incomplete_models = _paper_state_incomplete_models(classifications)
+    if not classifications or (incomplete_models and cfg.incomplete_policy == "drop_all"):
         return PlanResult(
             actions=[],
             delayed_down_models=set(),
@@ -114,6 +117,9 @@ def build_plan(
             dropped_legacy_raw_trs=True,
             events=["paper_state_incomplete_drop_legacy_raw_trs"],
         )
+    if incomplete_models:
+        events.extend(f"paper_state_incomplete_drop:{model}" for model in incomplete_models)
+        classifications = [item for item in classifications if item.model_name not in incomplete_models]
 
     critical_receivers = [item for item in classifications if item.state == ModelState.CRITICAL]
     low_receivers = [item for item in classifications if item.state == ModelState.LOW]
@@ -574,10 +580,12 @@ def _try_plan_tp_capacity(
     return None
 
 
-def _paper_state_incomplete(classifications: list[ModelClassification]) -> bool:
-    if not classifications:
-        return True
-    return any(item.state == ModelState.UNKNOWN or item.Z_m is None and item.state != ModelState.IDLE for item in classifications)
+def _paper_state_incomplete_models(classifications: list[ModelClassification]) -> tuple[str, ...]:
+    return tuple(
+        item.model_name
+        for item in classifications
+        if item.state == ModelState.UNKNOWN or (item.Z_m is None and item.state != ModelState.IDLE)
+    )
 
 
 def _add_scale_action(

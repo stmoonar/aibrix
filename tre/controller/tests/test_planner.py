@@ -161,7 +161,38 @@ def test_build_plan_matches_legacy_low_fairness_saturation_gate() -> None:
     assert {action.source_loop for action in plan.actions} == {"fairness"}
 
 
-def test_build_plan_drops_legacy_raw_trs_fallback_when_paper_state_unknown() -> None:
+def test_build_plan_drops_only_incomplete_model_by_default() -> None:
+    classifications = [
+        _classification("critical", ModelState.CRITICAL, ModelRole.RECEIVER, 0.5),
+        _classification("unknown", ModelState.UNKNOWN, ModelRole.UNKNOWN, None),
+    ]
+    contexts = {
+        "critical": {"assigned_replicas": 1, "routable_pods": 1},
+        "unknown": {"assigned_replicas": 2, "routable_pods": 2, "trs": 10.0},
+    }
+
+    plan = build_plan(
+        model_contexts=contexts,
+        classifications=classifications,
+        model_replicas={"critical": 1, "unknown": 2},
+        idle_gpus=1,
+        cfg=PlanConfig(min_replicas_per_model=1, max_replicas_per_model=4),
+    )
+
+    assert plan.dropped_legacy_raw_trs is False
+    assert plan.events == ["paper_state_incomplete_drop:unknown"]
+    assert plan.actions == [
+        ScaleAction(
+            model="critical",
+            delta=1,
+            reason="critical_idle_capacity",
+            source_loop="rescue",
+            receiver="critical",
+        )
+    ]
+
+
+def test_build_plan_can_keep_legacy_drop_all_for_incomplete_paper_state() -> None:
     classifications = [_classification("unknown", ModelState.UNKNOWN, ModelRole.UNKNOWN, None)]
     contexts = {"unknown": {"assigned_replicas": 2, "routable_pods": 2, "trs": 10.0}}
 
@@ -170,7 +201,7 @@ def test_build_plan_drops_legacy_raw_trs_fallback_when_paper_state_unknown() -> 
         classifications=classifications,
         model_replicas={"unknown": 2},
         idle_gpus=4,
-        cfg=PlanConfig(min_replicas_per_model=1, max_replicas_per_model=4),
+        cfg=PlanConfig(min_replicas_per_model=1, max_replicas_per_model=4, incomplete_policy="drop_all"),
     )
 
     assert plan.actions == []

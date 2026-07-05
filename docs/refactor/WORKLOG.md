@@ -1183,3 +1183,41 @@
 
 - Run full `cd tre && make check`, then commit F2.2 if green.
 - Continue to F2.3 planner per-model incomplete drop policy.
+
+### Endgame F2.3 Per-Model Incomplete Drop Policy
+
+- Added RED planner tests for D9 policy split:
+  - default behavior now drops only incomplete model classifications and allows
+    complete models in the same cycle to plan actions.
+  - `PlanConfig(incomplete_policy="drop_all")` preserves the legacy whole-cycle
+    drop with event `paper_state_incomplete_drop_legacy_raw_trs`.
+- Added RED config tests for `TRE_INCOMPLETE_POLICY`:
+  - default `drop_model`.
+  - env override `drop_all`.
+  - invalid values rejected.
+- Added a loop-level RED test proving `drop_all` can be passed through
+  `run_rescue_tick`; this prevents live env overrides from being hidden by the
+  planner default.
+- Implemented:
+  - `IncompletePolicy = Literal["drop_model", "drop_all"]`.
+  - `PlanConfig.incomplete_policy`, default `drop_model`.
+  - `_paper_state_incomplete_models()` returning the affected model names.
+  - default per-model filtering with events
+    `paper_state_incomplete_drop:<model>`.
+  - compatibility `drop_all` early return using the legacy event and
+    `dropped_legacy_raw_trs=True`.
+  - `ControllerConfig.incomplete_policy` from `TRE_INCOMPLETE_POLICY`.
+  - rescue/fairness/tick parameter plumbing into `PlanConfig`.
+- Verification so far:
+  - Initial RED failures matched expectations:
+    missing `ControllerConfig.incomplete_policy`, default planner still
+    dropping all, and `run_rescue_tick()` rejecting `incomplete_policy`.
+  - F2 focused config/planner/loop tests: `49 passed`.
+  - Controller focused set
+    (`test_config.py`, `test_metrics_store.py`, `test_trs_signals.py`,
+    `test_planner.py`, `test_loop_ticks.py`): `67 passed`.
+
+### Endgame F2 Next
+
+- Run full `cd tre && make check`, then commit F2.3 if green.
+- Continue golden protection/rollout validation from the endgame plan.

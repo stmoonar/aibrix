@@ -8,6 +8,7 @@ from typing import Mapping
 SIGNAL_SOURCES = {"zm", "latency_p95", "queue_len", "kv_cache"}
 PERCENTILE_MODES = {"bucket_upper", "interpolated"}
 METRICS_SCHEMAS = {"v1", "v2"}
+INCOMPLETE_POLICIES = {"drop_model", "drop_all"}
 _TRUE_VALUES = {"1", "true", "yes", "y", "on"}
 _FALSE_VALUES = {"0", "false", "no", "n", "off"}
 
@@ -43,6 +44,7 @@ class ControllerConfig:
     percentile_mode: str
     signal_source: str
     paper_stale_max_windows: int
+    incomplete_policy: str
     enable_tre_scaling: bool
     ablation_disable_fast_loop: bool
     ablation_disable_safescale: bool
@@ -67,6 +69,10 @@ class ControllerConfig:
         metrics_schema = _get_str(values, "TRE_METRICS_SCHEMA", "v2")
         if metrics_schema not in METRICS_SCHEMAS:
             raise ValueError(f"TRE_METRICS_SCHEMA must be one of {sorted(METRICS_SCHEMAS)}")
+
+        incomplete_policy = _get_str(values, "TRE_INCOMPLETE_POLICY", "drop_model")
+        if incomplete_policy not in INCOMPLETE_POLICIES:
+            raise ValueError(f"TRE_INCOMPLETE_POLICY must be one of {sorted(INCOMPLETE_POLICIES)}")
 
         redis_url = _get_str(values, "TRE_REDIS_URL", "redis://aibrix-redis-master:6379/0")
 
@@ -105,6 +111,7 @@ class ControllerConfig:
             percentile_mode=percentile_mode,
             signal_source=signal_source,
             paper_stale_max_windows=_get_positive_int(values, "TRE_PAPER_STALE_MAX_WINDOWS", 3),
+            incomplete_policy=incomplete_policy,
             enable_tre_scaling=_get_bool(values, "ENABLE_TRE_SCALING", True),
             ablation_disable_fast_loop=_get_bool(values, "TRE_ABLATION_DISABLE_FAST_LOOP", False),
             ablation_disable_safescale=_get_bool(values, "TRE_ABLATION_DISABLE_SAFESCALE", False),

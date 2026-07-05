@@ -6,7 +6,17 @@ from typing import Protocol
 from tre_common.metrics_schema import MetricsSnapshot, ModelWindowMetrics
 from tre_common.registry import Registry, ModelSpec
 from tre_controller.planning.classify import classify_all_models
-from tre_controller.planning.planner import Action, ClusterView, HideAction, PlanConfig, ScaleAction, ShrinkForSlotAction, UnhideAction, build_plan
+from tre_controller.planning.planner import (
+    Action,
+    ClusterView,
+    HideAction,
+    IncompletePolicy,
+    PlanConfig,
+    ScaleAction,
+    ShrinkForSlotAction,
+    UnhideAction,
+    build_plan,
+)
 from tre_controller.planning.safescale import SafeScaleCommand, SafeScaleDecision
 from tre_controller.signals.sources import get_signal
 from tre_controller.signals.trs import TRSComputer, TRSInput
@@ -80,6 +90,7 @@ def run_planner_tick(
     signal_source: str = "zm",
     safescale: SafeScaleController | None = None,
     paper_state_cache: PaperStateCache | None = None,
+    incomplete_policy: IncompletePolicy = "drop_model",
 ) -> LoopTickResult:
     if snapshot.stale:
         return LoopTickResult(submitted=0, events=("snapshot_stale",))
@@ -101,6 +112,7 @@ def run_planner_tick(
         model_tp_sizes={spec.name: spec.tp_size for spec in registry.models()},
         min_replicas_by_model={spec.name: spec.min_replicas for spec in registry.models()},
         max_replicas_by_model={spec.name: spec.max_replicas for spec in registry.models()},
+        incomplete_policy=incomplete_policy,
     )
     plan = build_plan(
         model_contexts=contexts,

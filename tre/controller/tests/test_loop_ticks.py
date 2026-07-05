@@ -237,6 +237,30 @@ def test_rescue_tick_marks_paper_state_unknown_after_stale_hold_limit() -> None:
     assert expired.submitted == 0
 
 
+def test_rescue_tick_can_use_legacy_drop_all_for_incomplete_paper_state() -> None:
+    queue = FakeQueue()
+    registry = _registry_with_models("critical", "unknown")
+    snapshot = MetricsSnapshot(
+        ts_ms=1,
+        stale=False,
+        models={
+            "critical": _metrics("critical", generation=50.0, waiting=10.0, running=1.0, assigned=1),
+            "unknown": _metrics("unknown", generation=None, waiting=10.0, running=1.0, assigned=1),
+        },
+    )
+
+    result = run_rescue_tick(
+        snapshot,
+        queue=queue,
+        registry=registry,
+        incomplete_policy="drop_all",
+    )
+
+    assert result.submitted == 0
+    assert result.events == ("paper_state_incomplete_drop_legacy_raw_trs",)
+    assert queue.submitted == []
+
+
 def test_rescue_tick_converts_safescale_required_downscale_to_probe_hide() -> None:
     queue = FakeQueue()
     safescale = SafeScaleStateMachine(config=SafeScaleConfig(default_window_ms=60_000.0))

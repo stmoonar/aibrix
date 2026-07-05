@@ -6,7 +6,7 @@ from typing import Awaitable, Callable, Protocol
 from tre_common.metrics_schema import MetricsSnapshot
 from tre_common.registry import Registry
 from tre_controller.loops.tick import LoopTickResult, PaperStateCache, PlannerQueue, SafeScaleController, run_planner_tick
-from tre_controller.planning.planner import ClusterView
+from tre_controller.planning.planner import ClusterView, IncompletePolicy
 
 
 class ClusterViewReader(Protocol):
@@ -35,6 +35,7 @@ def run_rescue_tick(
     signal_source: str = "zm",
     safescale: SafeScaleController | None = None,
     paper_state_cache: PaperStateCache | None = None,
+    incomplete_policy: IncompletePolicy = "drop_model",
 ) -> LoopTickResult:
     return run_planner_tick(
         snapshot,
@@ -47,6 +48,7 @@ def run_rescue_tick(
         signal_source=signal_source,
         safescale=safescale,
         paper_state_cache=paper_state_cache,
+        incomplete_policy=incomplete_policy,
     )
 
 
@@ -80,6 +82,7 @@ async def rescue_task(
                     signal_source=getattr(cfg, "signal_source", "zm"),
                     safescale=safescale,
                     paper_state_cache=paper_state_cache,
+                    incomplete_policy=getattr(cfg, "incomplete_policy", "drop_model"),
                 )
             if decision_writer is not None:
                 decision_writer.write("rescue", snapshot, result)
