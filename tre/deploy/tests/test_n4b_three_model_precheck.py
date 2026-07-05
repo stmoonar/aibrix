@@ -21,6 +21,8 @@ def test_parse_args_accepts_runtime_overrides() -> None:
             "3",
             "--workers",
             "2",
+            "--baseline-workers-per-model",
+            "1",
             "--max-tokens",
             "16",
             "--sample-seconds",
@@ -36,6 +38,7 @@ def test_parse_args_accepts_runtime_overrides() -> None:
     assert args.duration_seconds == 12
     assert args.phase_seconds == 3
     assert args.workers == 2
+    assert args.baseline_workers_per_model == 1
     assert args.max_tokens == 16
     assert args.sample_seconds == 4
     assert args.request_timeout == 9
@@ -70,6 +73,7 @@ def test_run_precheck_returns_result_without_live_load(monkeypatch) -> None:
     result = run_precheck(args)
 
     assert result["models"] == ["a", "b"]
+    assert result["baseline_workers_per_model"] == 0
     assert result["initial_state"] == {"url": "http://10.111.21.116:8000/v2/state"}
     assert result["final_state"] == {"url": "http://10.111.21.116:8000/v2/state"}
     assert result["errors"] == {}

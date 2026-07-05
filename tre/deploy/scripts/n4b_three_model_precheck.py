@@ -35,6 +35,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--duration-seconds", type=int, default=int(os.environ.get("N4B_DURATION_SECONDS", str(DEFAULT_DURATION_SECONDS))))
     parser.add_argument("--phase-seconds", type=int, default=int(os.environ.get("N4B_PHASE_SECONDS", str(PHASE_SECONDS))))
     parser.add_argument("--workers", type=int, default=int(os.environ.get("N4B_WORKERS", str(DEFAULT_WORKERS))))
+    parser.add_argument(
+        "--baseline-workers-per-model",
+        type=int,
+        default=int(os.environ.get("N4B_BASELINE_WORKERS_PER_MODEL", "0")),
+    )
     parser.add_argument("--max-tokens", type=int, default=int(os.environ.get("N4B_MAX_TOKENS", "96")))
     parser.add_argument("--sample-seconds", type=int, default=int(os.environ.get("N4B_SAMPLE_SECONDS", "30")))
     parser.add_argument("--request-timeout", type=int, default=int(os.environ.get("N4B_REQUEST_TIMEOUT", str(REQUEST_TIMEOUT))))
@@ -133,10 +138,11 @@ def worker(
     gateway_url: str,
     max_tokens: int,
     request_timeout: int,
+    fixed_model: str | None = None,
 ) -> None:
     prompt = "Return exactly one short sentence about capacity planning."
     while not stop.is_set():
-        model = active_model[0]
+        model = fixed_model or active_model[0]
         payload = {
             "model": model,
             "prompt": prompt,
@@ -193,6 +199,21 @@ def run_precheck(args: argparse.Namespace) -> dict:
         )
         for _ in range(args.workers)
     ]
+    for model in args.models:
+        for _ in range(max(0, args.baseline_workers_per_model)):
+            threads.append(
+                threading.Thread(
+                    target=worker,
+                    args=(stop, active_model, counters),
+                    kwargs={
+                        "gateway_url": args.gateway_url,
+                        "max_tokens": args.max_tokens,
+                        "request_timeout": args.request_timeout,
+                        "fixed_model": model,
+                    },
+                    daemon=True,
+                )
+            )
     for thread in threads:
         thread.start()
 
@@ -236,6 +257,7 @@ def run_precheck(args: argparse.Namespace) -> dict:
         "service_manager_url": args.service_manager_url,
         "models": list(args.models),
         "workers": args.workers,
+        "baseline_workers_per_model": args.baseline_workers_per_model,
         "phase_seconds": args.phase_seconds,
         "max_tokens": args.max_tokens,
         "sample_seconds": args.sample_seconds,

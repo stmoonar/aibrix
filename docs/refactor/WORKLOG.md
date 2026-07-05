@@ -1331,3 +1331,38 @@
 
 - Run full `cd tre && make check`, commit the new image pin, roll controller,
   and rerun the 15-minute precheck for final F2.4 evidence.
+
+### Endgame F2.4 Precheck Baseline Workers
+
+- Rolled controller to `tre-v2-controller:20260705-bb37a230`:
+  - pod: `tre-v2-controller-6d899d65f-scvv6`
+  - node: `nscc-ds-4a100-node10`
+  - restarts: `0`.
+- Confirmed `model_states` is present in `tre:v2:decision:latest` and controller
+  logs after rollout.
+- A 15-minute alternating-only precheck completed successfully:
+  - duration: `900.9s`
+  - gateway errors: `{}`
+  - tre-v2 restarts stayed at `0`
+  - post-run reconcile: `warnings=[]`
+  - `paper_state_incomplete_drop=0`, `paper_state_stale_hold=0`,
+    `paper_state_stale_unknown=0`.
+- However, strict wall-clock active-window parsing showed `z_m` was not non-null
+  for every model on every loop. This is expected for an alternating-only load:
+  inactive models can have zero-load metric windows where paper state is IDLE and
+  `z_m` is null. Changing controller semantics to invent a Z value for idle
+  zero-load windows would be the wrong fix.
+- Added `--baseline-workers-per-model` /
+  `N4B_BASELINE_WORKERS_PER_MODEL` to
+  `tre/deploy/scripts/n4b_three_model_precheck.py`. Default remains `0`; the
+  final F2.4 acceptance run will use `1` to keep all three models active while
+  the main load still alternates.
+- Added tests for the new CLI/result field.
+- Verification:
+  - `deploy/tests/test_n4b_three_model_precheck.py`: `4 passed`.
+  - full `cd tre && make check`: `260 passed`.
+
+### Endgame F2 Next
+
+- Commit the precheck baseline-worker enhancement, rerun the 15-minute precheck
+  with `--baseline-workers-per-model 1`, and parse final `model_states` evidence.

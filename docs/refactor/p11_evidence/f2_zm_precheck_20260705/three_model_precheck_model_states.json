@@ -1,0 +1,4935 @@
+{
+  "duration_s": 900.9,
+  "error_samples": {},
+  "errors": {},
+  "final_restarts": {
+    "default": {
+      "dsllama-8b-nscc-ds-4a100-node9-gpu-0-6cbf96cdf5-2lvgv": 0,
+      "dsllama-8b-nscc-ds-4a100-node9-gpu-1-5579b75f9b-kh5fx": 0,
+      "dsllama-8b-nscc-ds-4a100-node9-gpu-2-6774997cb5-4sfmh": 0,
+      "dsllama-8b-nscc-ds-4a100-node9-gpu-3-6bf484f758-8v5fz": 0,
+      "dsqwen-14b-nscc-ds-4a100-node10-gpu-0-1-77d5997485-nc6nv": 0,
+      "dsqwen-14b-nscc-ds-4a100-node10-gpu-2-3-66f57f5575-6dtl7": 0,
+      "dsqwen-14b-nscc-ds-4a100-node9-gpu-0-1-7b8c77ddc5-hw9zp": 0,
+      "dsqwen-14b-nscc-ds-4a100-node9-gpu-2-3-84f8576d97-gk76w": 0,
+      "dsqwen-7b-nscc-ds-4a100-node9-gpu-0-79b869c66b-cndx7": 5,
+      "dsqwen-7b-nscc-ds-4a100-node9-gpu-1-76cf6689c9-qbd4d": 0,
+      "dsqwen-7b-nscc-ds-4a100-node9-gpu-2-7fc65f475b-bq7hm": 0,
+      "dsqwen-7b-nscc-ds-4a100-node9-gpu-3-86c8574f65-g8c4g": 0
+    },
+    "tre-v2": {
+      "tre-v2-controller-6d899d65f-scvv6": 0,
+      "tre-v2-redis-6c47ddfb8d-h26mn": 0,
+      "tre-v2-service-manager-86b985cfbb-zntf2": 0,
+      "tre-v2-ui-65c6c86b45-gfqdb": 0
+    }
+  },
+  "final_state": {
+    "bindings": [
+      {
+        "awake": false,
+        "gpu_ids": [
+          0
+        ],
+        "hidden": false,
+        "model": "dsllama-8b",
+        "node": "nscc-ds-4a100-node9",
+        "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-0-6cbf96cdf5-2lvgv"
+      },
+      {
+        "awake": true,
+        "gpu_ids": [
+          1
+        ],
+        "hidden": false,
+        "model": "dsllama-8b",
+        "node": "nscc-ds-4a100-node9",
+        "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-1-5579b75f9b-kh5fx"
+      },
+      {
+        "awake": false,
+        "gpu_ids": [
+          2
+        ],
+        "hidden": false,
+        "model": "dsllama-8b",
+        "node": "nscc-ds-4a100-node9",
+        "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-2-6774997cb5-4sfmh"
+      },
+      {
+        "awake": false,
+        "gpu_ids": [
+          3
+        ],
+        "hidden": false,
+        "model": "dsllama-8b",
+        "node": "nscc-ds-4a100-node9",
+        "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-3-6bf484f758-8v5fz"
+      },
+      {
+        "awake": true,
+        "gpu_ids": [
+          0,
+          1
+        ],
+        "hidden": false,
+        "model": "dsqwen-14b",
+        "node": "nscc-ds-4a100-node10",
+        "serve_id": "dsqwen-14b-nscc-ds-4a100-node10-gpu-0-1-77d5997485-nc6nv"
+      },
+      {
+        "awake": true,
+        "gpu_ids": [
+          2,
+          3
+        ],
+        "hidden": false,
+        "model": "dsqwen-14b",
+        "node": "nscc-ds-4a100-node10",
+        "serve_id": "dsqwen-14b-nscc-ds-4a100-node10-gpu-2-3-66f57f5575-6dtl7"
+      },
+      {
+        "awake": false,
+        "gpu_ids": [
+          0,
+          1
+        ],
+        "hidden": false,
+        "model": "dsqwen-14b",
+        "node": "nscc-ds-4a100-node9",
+        "serve_id": "dsqwen-14b-nscc-ds-4a100-node9-gpu-0-1-7b8c77ddc5-hw9zp"
+      },
+      {
+        "awake": false,
+        "gpu_ids": [
+          2,
+          3
+        ],
+        "hidden": false,
+        "model": "dsqwen-14b",
+        "node": "nscc-ds-4a100-node9",
+        "serve_id": "dsqwen-14b-nscc-ds-4a100-node9-gpu-2-3-84f8576d97-gk76w"
+      },
+      {
+        "awake": true,
+        "gpu_ids": [
+          0
+        ],
+        "hidden": false,
+        "model": "dsqwen-7b",
+        "node": "nscc-ds-4a100-node9",
+        "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-0-79b869c66b-cndx7"
+      },
+      {
+        "awake": false,
+        "gpu_ids": [
+          1
+        ],
+        "hidden": false,
+        "model": "dsqwen-7b",
+        "node": "nscc-ds-4a100-node9",
+        "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-1-76cf6689c9-qbd4d"
+      },
+      {
+        "awake": true,
+        "gpu_ids": [
+          2
+        ],
+        "hidden": false,
+        "model": "dsqwen-7b",
+        "node": "nscc-ds-4a100-node9",
+        "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-2-7fc65f475b-bq7hm"
+      },
+      {
+        "awake": true,
+        "gpu_ids": [
+          3
+        ],
+        "hidden": false,
+        "model": "dsqwen-7b",
+        "node": "nscc-ds-4a100-node9",
+        "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-3-86c8574f65-g8c4g"
+      }
+    ],
+    "models": {
+      "dsllama-8b": {
+        "awake": 1,
+        "bound": 4
+      },
+      "dsqwen-14b": {
+        "awake": 2,
+        "bound": 4
+      },
+      "dsqwen-7b": {
+        "awake": 3,
+        "bound": 4
+      }
+    },
+    "version": 250
+  },
+  "gateway_url": "http://10.99.21.145/v1/completions",
+  "initial_restarts": {
+    "default": {
+      "dsllama-8b-nscc-ds-4a100-node9-gpu-0-6cbf96cdf5-2lvgv": 0,
+      "dsllama-8b-nscc-ds-4a100-node9-gpu-1-5579b75f9b-kh5fx": 0,
+      "dsllama-8b-nscc-ds-4a100-node9-gpu-2-6774997cb5-4sfmh": 0,
+      "dsllama-8b-nscc-ds-4a100-node9-gpu-3-6bf484f758-8v5fz": 0,
+      "dsqwen-14b-nscc-ds-4a100-node10-gpu-0-1-77d5997485-nc6nv": 0,
+      "dsqwen-14b-nscc-ds-4a100-node10-gpu-2-3-66f57f5575-6dtl7": 0,
+      "dsqwen-14b-nscc-ds-4a100-node9-gpu-0-1-7b8c77ddc5-hw9zp": 0,
+      "dsqwen-14b-nscc-ds-4a100-node9-gpu-2-3-84f8576d97-gk76w": 0,
+      "dsqwen-7b-nscc-ds-4a100-node9-gpu-0-79b869c66b-cndx7": 5,
+      "dsqwen-7b-nscc-ds-4a100-node9-gpu-1-76cf6689c9-qbd4d": 0,
+      "dsqwen-7b-nscc-ds-4a100-node9-gpu-2-7fc65f475b-bq7hm": 0,
+      "dsqwen-7b-nscc-ds-4a100-node9-gpu-3-86c8574f65-g8c4g": 0
+    },
+    "tre-v2": {
+      "tre-v2-controller-6d899d65f-scvv6": 0,
+      "tre-v2-redis-6c47ddfb8d-h26mn": 0,
+      "tre-v2-service-manager-86b985cfbb-zntf2": 0,
+      "tre-v2-ui-65c6c86b45-gfqdb": 0
+    }
+  },
+  "initial_state": {
+    "bindings": [
+      {
+        "awake": false,
+        "gpu_ids": [
+          0
+        ],
+        "hidden": false,
+        "model": "dsllama-8b",
+        "node": "nscc-ds-4a100-node9",
+        "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-0-6cbf96cdf5-2lvgv"
+      },
+      {
+        "awake": true,
+        "gpu_ids": [
+          1
+        ],
+        "hidden": false,
+        "model": "dsllama-8b",
+        "node": "nscc-ds-4a100-node9",
+        "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-1-5579b75f9b-kh5fx"
+      },
+      {
+        "awake": false,
+        "gpu_ids": [
+          2
+        ],
+        "hidden": false,
+        "model": "dsllama-8b",
+        "node": "nscc-ds-4a100-node9",
+        "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-2-6774997cb5-4sfmh"
+      },
+      {
+        "awake": false,
+        "gpu_ids": [
+          3
+        ],
+        "hidden": false,
+        "model": "dsllama-8b",
+        "node": "nscc-ds-4a100-node9",
+        "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-3-6bf484f758-8v5fz"
+      },
+      {
+        "awake": true,
+        "gpu_ids": [
+          0,
+          1
+        ],
+        "hidden": false,
+        "model": "dsqwen-14b",
+        "node": "nscc-ds-4a100-node10",
+        "serve_id": "dsqwen-14b-nscc-ds-4a100-node10-gpu-0-1-77d5997485-nc6nv"
+      },
+      {
+        "awake": false,
+        "gpu_ids": [
+          2,
+          3
+        ],
+        "hidden": false,
+        "model": "dsqwen-14b",
+        "node": "nscc-ds-4a100-node10",
+        "serve_id": "dsqwen-14b-nscc-ds-4a100-node10-gpu-2-3-66f57f5575-6dtl7"
+      },
+      {
+        "awake": false,
+        "gpu_ids": [
+          0,
+          1
+        ],
+        "hidden": false,
+        "model": "dsqwen-14b",
+        "node": "nscc-ds-4a100-node9",
+        "serve_id": "dsqwen-14b-nscc-ds-4a100-node9-gpu-0-1-7b8c77ddc5-hw9zp"
+      },
+      {
+        "awake": false,
+        "gpu_ids": [
+          2,
+          3
+        ],
+        "hidden": false,
+        "model": "dsqwen-14b",
+        "node": "nscc-ds-4a100-node9",
+        "serve_id": "dsqwen-14b-nscc-ds-4a100-node9-gpu-2-3-84f8576d97-gk76w"
+      },
+      {
+        "awake": true,
+        "gpu_ids": [
+          0
+        ],
+        "hidden": false,
+        "model": "dsqwen-7b",
+        "node": "nscc-ds-4a100-node9",
+        "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-0-79b869c66b-cndx7"
+      },
+      {
+        "awake": false,
+        "gpu_ids": [
+          1
+        ],
+        "hidden": false,
+        "model": "dsqwen-7b",
+        "node": "nscc-ds-4a100-node9",
+        "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-1-76cf6689c9-qbd4d"
+      },
+      {
+        "awake": false,
+        "gpu_ids": [
+          2
+        ],
+        "hidden": false,
+        "model": "dsqwen-7b",
+        "node": "nscc-ds-4a100-node9",
+        "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-2-7fc65f475b-bq7hm"
+      },
+      {
+        "awake": false,
+        "gpu_ids": [
+          3
+        ],
+        "hidden": false,
+        "model": "dsqwen-7b",
+        "node": "nscc-ds-4a100-node9",
+        "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-3-86c8574f65-g8c4g"
+      }
+    ],
+    "models": {
+      "dsllama-8b": {
+        "awake": 1,
+        "bound": 4
+      },
+      "dsqwen-14b": {
+        "awake": 1,
+        "bound": 4
+      },
+      "dsqwen-7b": {
+        "awake": 1,
+        "bound": 4
+      }
+    },
+    "version": 247
+  },
+  "latency_ms": {
+    "dsllama-8b": {
+      "avg": 1335.29,
+      "count": 901,
+      "max": 1359.28,
+      "min": 1298.24,
+      "p95": 1348.36
+    },
+    "dsqwen-14b": {
+      "avg": 601.26,
+      "count": 1978,
+      "max": 638.58,
+      "min": 571.73,
+      "p95": 617.4
+    },
+    "dsqwen-7b": {
+      "avg": 1228.89,
+      "count": 984,
+      "max": 1272.07,
+      "min": 1214.2,
+      "p95": 1243.29
+    }
+  },
+  "max_tokens": 96,
+  "models": [
+    "dsqwen-7b",
+    "dsllama-8b",
+    "dsqwen-14b"
+  ],
+  "ok": {
+    "dsllama-8b": 901,
+    "dsqwen-14b": 1978,
+    "dsqwen-7b": 984
+  },
+  "phase_seconds": 60,
+  "phases": [
+    {
+      "elapsed_s": 60.9,
+      "model": "dsllama-8b"
+    },
+    {
+      "elapsed_s": 120.7,
+      "model": "dsqwen-14b"
+    },
+    {
+      "elapsed_s": 180.5,
+      "model": "dsqwen-7b"
+    },
+    {
+      "elapsed_s": 240.3,
+      "model": "dsllama-8b"
+    },
+    {
+      "elapsed_s": 300.0,
+      "model": "dsqwen-14b"
+    },
+    {
+      "elapsed_s": 360.9,
+      "model": "dsqwen-7b"
+    },
+    {
+      "elapsed_s": 420.7,
+      "model": "dsllama-8b"
+    },
+    {
+      "elapsed_s": 480.5,
+      "model": "dsqwen-14b"
+    },
+    {
+      "elapsed_s": 540.3,
+      "model": "dsqwen-7b"
+    },
+    {
+      "elapsed_s": 600.1,
+      "model": "dsllama-8b"
+    },
+    {
+      "elapsed_s": 660.9,
+      "model": "dsqwen-14b"
+    },
+    {
+      "elapsed_s": 720.7,
+      "model": "dsqwen-7b"
+    },
+    {
+      "elapsed_s": 780.5,
+      "model": "dsllama-8b"
+    },
+    {
+      "elapsed_s": 840.4,
+      "model": "dsqwen-14b"
+    }
+  ],
+  "sample_seconds": 30,
+  "samples": [
+    {
+      "active": "dsqwen-7b",
+      "controller_rss_kb": 37284,
+      "elapsed_s": 0.2,
+      "redis_dbsize": 5,
+      "service_manager_rss_kb": 111636,
+      "state": {
+        "bindings": [
+          {
+            "awake": false,
+            "gpu_ids": [
+              0
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-0-6cbf96cdf5-2lvgv"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              1
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-1-5579b75f9b-kh5fx"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              2
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-2-6774997cb5-4sfmh"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              3
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-3-6bf484f758-8v5fz"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              0,
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node10",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node10-gpu-0-1-77d5997485-nc6nv"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              2,
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node10",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node10-gpu-2-3-66f57f5575-6dtl7"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              0,
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node9-gpu-0-1-7b8c77ddc5-hw9zp"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              2,
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node9-gpu-2-3-84f8576d97-gk76w"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              0
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-0-79b869c66b-cndx7"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-1-76cf6689c9-qbd4d"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              2
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-2-7fc65f475b-bq7hm"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-3-86c8574f65-g8c4g"
+          }
+        ],
+        "models": {
+          "dsllama-8b": {
+            "awake": 1,
+            "bound": 4
+          },
+          "dsqwen-14b": {
+            "awake": 1,
+            "bound": 4
+          },
+          "dsqwen-7b": {
+            "awake": 1,
+            "bound": 4
+          }
+        },
+        "version": 247
+      }
+    },
+    {
+      "active": "dsqwen-7b",
+      "controller_rss_kb": 37284,
+      "elapsed_s": 30.1,
+      "redis_dbsize": 5,
+      "service_manager_rss_kb": 111636,
+      "state": {
+        "bindings": [
+          {
+            "awake": false,
+            "gpu_ids": [
+              0
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-0-6cbf96cdf5-2lvgv"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              1
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-1-5579b75f9b-kh5fx"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              2
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-2-6774997cb5-4sfmh"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              3
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-3-6bf484f758-8v5fz"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              0,
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node10",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node10-gpu-0-1-77d5997485-nc6nv"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              2,
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node10",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node10-gpu-2-3-66f57f5575-6dtl7"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              0,
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node9-gpu-0-1-7b8c77ddc5-hw9zp"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              2,
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node9-gpu-2-3-84f8576d97-gk76w"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              0
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-0-79b869c66b-cndx7"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-1-76cf6689c9-qbd4d"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              2
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-2-7fc65f475b-bq7hm"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-3-86c8574f65-g8c4g"
+          }
+        ],
+        "models": {
+          "dsllama-8b": {
+            "awake": 1,
+            "bound": 4
+          },
+          "dsqwen-14b": {
+            "awake": 1,
+            "bound": 4
+          },
+          "dsqwen-7b": {
+            "awake": 1,
+            "bound": 4
+          }
+        },
+        "version": 247
+      }
+    },
+    {
+      "active": "dsllama-8b",
+      "controller_rss_kb": 37404,
+      "elapsed_s": 60.9,
+      "redis_dbsize": 5,
+      "service_manager_rss_kb": 111636,
+      "state": {
+        "bindings": [
+          {
+            "awake": false,
+            "gpu_ids": [
+              0
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-0-6cbf96cdf5-2lvgv"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              1
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-1-5579b75f9b-kh5fx"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              2
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-2-6774997cb5-4sfmh"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              3
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-3-6bf484f758-8v5fz"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              0,
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node10",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node10-gpu-0-1-77d5997485-nc6nv"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              2,
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node10",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node10-gpu-2-3-66f57f5575-6dtl7"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              0,
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node9-gpu-0-1-7b8c77ddc5-hw9zp"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              2,
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node9-gpu-2-3-84f8576d97-gk76w"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              0
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-0-79b869c66b-cndx7"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-1-76cf6689c9-qbd4d"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              2
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-2-7fc65f475b-bq7hm"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-3-86c8574f65-g8c4g"
+          }
+        ],
+        "models": {
+          "dsllama-8b": {
+            "awake": 1,
+            "bound": 4
+          },
+          "dsqwen-14b": {
+            "awake": 1,
+            "bound": 4
+          },
+          "dsqwen-7b": {
+            "awake": 3,
+            "bound": 4
+          }
+        },
+        "version": 249
+      }
+    },
+    {
+      "active": "dsllama-8b",
+      "controller_rss_kb": 37404,
+      "elapsed_s": 90.8,
+      "redis_dbsize": 5,
+      "service_manager_rss_kb": 111636,
+      "state": {
+        "bindings": [
+          {
+            "awake": false,
+            "gpu_ids": [
+              0
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-0-6cbf96cdf5-2lvgv"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              1
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-1-5579b75f9b-kh5fx"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              2
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-2-6774997cb5-4sfmh"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              3
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-3-6bf484f758-8v5fz"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              0,
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node10",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node10-gpu-0-1-77d5997485-nc6nv"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              2,
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node10",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node10-gpu-2-3-66f57f5575-6dtl7"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              0,
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node9-gpu-0-1-7b8c77ddc5-hw9zp"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              2,
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node9-gpu-2-3-84f8576d97-gk76w"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              0
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-0-79b869c66b-cndx7"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-1-76cf6689c9-qbd4d"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              2
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-2-7fc65f475b-bq7hm"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-3-86c8574f65-g8c4g"
+          }
+        ],
+        "models": {
+          "dsllama-8b": {
+            "awake": 1,
+            "bound": 4
+          },
+          "dsqwen-14b": {
+            "awake": 1,
+            "bound": 4
+          },
+          "dsqwen-7b": {
+            "awake": 3,
+            "bound": 4
+          }
+        },
+        "version": 249
+      }
+    },
+    {
+      "active": "dsqwen-14b",
+      "controller_rss_kb": 37420,
+      "elapsed_s": 120.7,
+      "redis_dbsize": 5,
+      "service_manager_rss_kb": 111628,
+      "state": {
+        "bindings": [
+          {
+            "awake": false,
+            "gpu_ids": [
+              0
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-0-6cbf96cdf5-2lvgv"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              1
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-1-5579b75f9b-kh5fx"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              2
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-2-6774997cb5-4sfmh"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              3
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-3-6bf484f758-8v5fz"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              0,
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node10",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node10-gpu-0-1-77d5997485-nc6nv"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              2,
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node10",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node10-gpu-2-3-66f57f5575-6dtl7"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              0,
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node9-gpu-0-1-7b8c77ddc5-hw9zp"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              2,
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node9-gpu-2-3-84f8576d97-gk76w"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              0
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-0-79b869c66b-cndx7"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-1-76cf6689c9-qbd4d"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              2
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-2-7fc65f475b-bq7hm"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-3-86c8574f65-g8c4g"
+          }
+        ],
+        "models": {
+          "dsllama-8b": {
+            "awake": 1,
+            "bound": 4
+          },
+          "dsqwen-14b": {
+            "awake": 1,
+            "bound": 4
+          },
+          "dsqwen-7b": {
+            "awake": 3,
+            "bound": 4
+          }
+        },
+        "version": 249
+      }
+    },
+    {
+      "active": "dsqwen-14b",
+      "controller_rss_kb": 37420,
+      "elapsed_s": 150.6,
+      "redis_dbsize": 5,
+      "service_manager_rss_kb": 111628,
+      "state": {
+        "bindings": [
+          {
+            "awake": false,
+            "gpu_ids": [
+              0
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-0-6cbf96cdf5-2lvgv"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              1
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-1-5579b75f9b-kh5fx"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              2
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-2-6774997cb5-4sfmh"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              3
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-3-6bf484f758-8v5fz"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              0,
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node10",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node10-gpu-0-1-77d5997485-nc6nv"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              2,
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node10",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node10-gpu-2-3-66f57f5575-6dtl7"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              0,
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node9-gpu-0-1-7b8c77ddc5-hw9zp"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              2,
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node9-gpu-2-3-84f8576d97-gk76w"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              0
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-0-79b869c66b-cndx7"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-1-76cf6689c9-qbd4d"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              2
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-2-7fc65f475b-bq7hm"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-3-86c8574f65-g8c4g"
+          }
+        ],
+        "models": {
+          "dsllama-8b": {
+            "awake": 1,
+            "bound": 4
+          },
+          "dsqwen-14b": {
+            "awake": 1,
+            "bound": 4
+          },
+          "dsqwen-7b": {
+            "awake": 3,
+            "bound": 4
+          }
+        },
+        "version": 249
+      }
+    },
+    {
+      "active": "dsqwen-7b",
+      "controller_rss_kb": 37456,
+      "elapsed_s": 180.5,
+      "redis_dbsize": 5,
+      "service_manager_rss_kb": 111636,
+      "state": {
+        "bindings": [
+          {
+            "awake": false,
+            "gpu_ids": [
+              0
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-0-6cbf96cdf5-2lvgv"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              1
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-1-5579b75f9b-kh5fx"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              2
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-2-6774997cb5-4sfmh"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              3
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-3-6bf484f758-8v5fz"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              0,
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node10",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node10-gpu-0-1-77d5997485-nc6nv"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              2,
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node10",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node10-gpu-2-3-66f57f5575-6dtl7"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              0,
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node9-gpu-0-1-7b8c77ddc5-hw9zp"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              2,
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node9-gpu-2-3-84f8576d97-gk76w"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              0
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-0-79b869c66b-cndx7"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-1-76cf6689c9-qbd4d"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              2
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-2-7fc65f475b-bq7hm"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-3-86c8574f65-g8c4g"
+          }
+        ],
+        "models": {
+          "dsllama-8b": {
+            "awake": 1,
+            "bound": 4
+          },
+          "dsqwen-14b": {
+            "awake": 2,
+            "bound": 4
+          },
+          "dsqwen-7b": {
+            "awake": 3,
+            "bound": 4
+          }
+        },
+        "version": 250
+      }
+    },
+    {
+      "active": "dsqwen-7b",
+      "controller_rss_kb": 37456,
+      "elapsed_s": 210.4,
+      "redis_dbsize": 5,
+      "service_manager_rss_kb": 111636,
+      "state": {
+        "bindings": [
+          {
+            "awake": false,
+            "gpu_ids": [
+              0
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-0-6cbf96cdf5-2lvgv"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              1
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-1-5579b75f9b-kh5fx"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              2
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-2-6774997cb5-4sfmh"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              3
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-3-6bf484f758-8v5fz"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              0,
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node10",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node10-gpu-0-1-77d5997485-nc6nv"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              2,
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node10",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node10-gpu-2-3-66f57f5575-6dtl7"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              0,
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node9-gpu-0-1-7b8c77ddc5-hw9zp"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              2,
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node9-gpu-2-3-84f8576d97-gk76w"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              0
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-0-79b869c66b-cndx7"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-1-76cf6689c9-qbd4d"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              2
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-2-7fc65f475b-bq7hm"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-3-86c8574f65-g8c4g"
+          }
+        ],
+        "models": {
+          "dsllama-8b": {
+            "awake": 1,
+            "bound": 4
+          },
+          "dsqwen-14b": {
+            "awake": 2,
+            "bound": 4
+          },
+          "dsqwen-7b": {
+            "awake": 3,
+            "bound": 4
+          }
+        },
+        "version": 250
+      }
+    },
+    {
+      "active": "dsllama-8b",
+      "controller_rss_kb": 37456,
+      "elapsed_s": 240.3,
+      "redis_dbsize": 5,
+      "service_manager_rss_kb": 111636,
+      "state": {
+        "bindings": [
+          {
+            "awake": false,
+            "gpu_ids": [
+              0
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-0-6cbf96cdf5-2lvgv"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              1
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-1-5579b75f9b-kh5fx"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              2
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-2-6774997cb5-4sfmh"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              3
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-3-6bf484f758-8v5fz"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              0,
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node10",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node10-gpu-0-1-77d5997485-nc6nv"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              2,
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node10",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node10-gpu-2-3-66f57f5575-6dtl7"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              0,
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node9-gpu-0-1-7b8c77ddc5-hw9zp"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              2,
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node9-gpu-2-3-84f8576d97-gk76w"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              0
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-0-79b869c66b-cndx7"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-1-76cf6689c9-qbd4d"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              2
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-2-7fc65f475b-bq7hm"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-3-86c8574f65-g8c4g"
+          }
+        ],
+        "models": {
+          "dsllama-8b": {
+            "awake": 1,
+            "bound": 4
+          },
+          "dsqwen-14b": {
+            "awake": 2,
+            "bound": 4
+          },
+          "dsqwen-7b": {
+            "awake": 3,
+            "bound": 4
+          }
+        },
+        "version": 250
+      }
+    },
+    {
+      "active": "dsllama-8b",
+      "controller_rss_kb": 37456,
+      "elapsed_s": 270.1,
+      "redis_dbsize": 5,
+      "service_manager_rss_kb": 111636,
+      "state": {
+        "bindings": [
+          {
+            "awake": false,
+            "gpu_ids": [
+              0
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-0-6cbf96cdf5-2lvgv"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              1
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-1-5579b75f9b-kh5fx"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              2
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-2-6774997cb5-4sfmh"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              3
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-3-6bf484f758-8v5fz"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              0,
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node10",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node10-gpu-0-1-77d5997485-nc6nv"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              2,
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node10",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node10-gpu-2-3-66f57f5575-6dtl7"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              0,
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node9-gpu-0-1-7b8c77ddc5-hw9zp"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              2,
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node9-gpu-2-3-84f8576d97-gk76w"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              0
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-0-79b869c66b-cndx7"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-1-76cf6689c9-qbd4d"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              2
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-2-7fc65f475b-bq7hm"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-3-86c8574f65-g8c4g"
+          }
+        ],
+        "models": {
+          "dsllama-8b": {
+            "awake": 1,
+            "bound": 4
+          },
+          "dsqwen-14b": {
+            "awake": 2,
+            "bound": 4
+          },
+          "dsqwen-7b": {
+            "awake": 3,
+            "bound": 4
+          }
+        },
+        "version": 250
+      }
+    },
+    {
+      "active": "dsqwen-14b",
+      "controller_rss_kb": 37460,
+      "elapsed_s": 300.0,
+      "redis_dbsize": 5,
+      "service_manager_rss_kb": 111636,
+      "state": {
+        "bindings": [
+          {
+            "awake": false,
+            "gpu_ids": [
+              0
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-0-6cbf96cdf5-2lvgv"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              1
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-1-5579b75f9b-kh5fx"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              2
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-2-6774997cb5-4sfmh"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              3
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-3-6bf484f758-8v5fz"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              0,
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node10",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node10-gpu-0-1-77d5997485-nc6nv"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              2,
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node10",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node10-gpu-2-3-66f57f5575-6dtl7"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              0,
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node9-gpu-0-1-7b8c77ddc5-hw9zp"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              2,
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node9-gpu-2-3-84f8576d97-gk76w"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              0
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-0-79b869c66b-cndx7"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-1-76cf6689c9-qbd4d"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              2
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-2-7fc65f475b-bq7hm"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-3-86c8574f65-g8c4g"
+          }
+        ],
+        "models": {
+          "dsllama-8b": {
+            "awake": 1,
+            "bound": 4
+          },
+          "dsqwen-14b": {
+            "awake": 2,
+            "bound": 4
+          },
+          "dsqwen-7b": {
+            "awake": 3,
+            "bound": 4
+          }
+        },
+        "version": 250
+      }
+    },
+    {
+      "active": "dsqwen-14b",
+      "controller_rss_kb": 37460,
+      "elapsed_s": 331.0,
+      "redis_dbsize": 5,
+      "service_manager_rss_kb": 111636,
+      "state": {
+        "bindings": [
+          {
+            "awake": false,
+            "gpu_ids": [
+              0
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-0-6cbf96cdf5-2lvgv"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              1
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-1-5579b75f9b-kh5fx"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              2
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-2-6774997cb5-4sfmh"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              3
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-3-6bf484f758-8v5fz"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              0,
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node10",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node10-gpu-0-1-77d5997485-nc6nv"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              2,
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node10",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node10-gpu-2-3-66f57f5575-6dtl7"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              0,
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node9-gpu-0-1-7b8c77ddc5-hw9zp"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              2,
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node9-gpu-2-3-84f8576d97-gk76w"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              0
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-0-79b869c66b-cndx7"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-1-76cf6689c9-qbd4d"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              2
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-2-7fc65f475b-bq7hm"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-3-86c8574f65-g8c4g"
+          }
+        ],
+        "models": {
+          "dsllama-8b": {
+            "awake": 1,
+            "bound": 4
+          },
+          "dsqwen-14b": {
+            "awake": 2,
+            "bound": 4
+          },
+          "dsqwen-7b": {
+            "awake": 3,
+            "bound": 4
+          }
+        },
+        "version": 250
+      }
+    },
+    {
+      "active": "dsqwen-7b",
+      "controller_rss_kb": 37464,
+      "elapsed_s": 360.9,
+      "redis_dbsize": 5,
+      "service_manager_rss_kb": 111636,
+      "state": {
+        "bindings": [
+          {
+            "awake": false,
+            "gpu_ids": [
+              0
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-0-6cbf96cdf5-2lvgv"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              1
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-1-5579b75f9b-kh5fx"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              2
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-2-6774997cb5-4sfmh"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              3
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-3-6bf484f758-8v5fz"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              0,
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node10",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node10-gpu-0-1-77d5997485-nc6nv"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              2,
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node10",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node10-gpu-2-3-66f57f5575-6dtl7"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              0,
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node9-gpu-0-1-7b8c77ddc5-hw9zp"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              2,
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node9-gpu-2-3-84f8576d97-gk76w"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              0
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-0-79b869c66b-cndx7"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-1-76cf6689c9-qbd4d"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              2
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-2-7fc65f475b-bq7hm"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-3-86c8574f65-g8c4g"
+          }
+        ],
+        "models": {
+          "dsllama-8b": {
+            "awake": 1,
+            "bound": 4
+          },
+          "dsqwen-14b": {
+            "awake": 2,
+            "bound": 4
+          },
+          "dsqwen-7b": {
+            "awake": 3,
+            "bound": 4
+          }
+        },
+        "version": 250
+      }
+    },
+    {
+      "active": "dsqwen-7b",
+      "controller_rss_kb": 37464,
+      "elapsed_s": 390.8,
+      "redis_dbsize": 5,
+      "service_manager_rss_kb": 111636,
+      "state": {
+        "bindings": [
+          {
+            "awake": false,
+            "gpu_ids": [
+              0
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-0-6cbf96cdf5-2lvgv"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              1
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-1-5579b75f9b-kh5fx"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              2
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-2-6774997cb5-4sfmh"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              3
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-3-6bf484f758-8v5fz"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              0,
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node10",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node10-gpu-0-1-77d5997485-nc6nv"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              2,
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node10",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node10-gpu-2-3-66f57f5575-6dtl7"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              0,
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node9-gpu-0-1-7b8c77ddc5-hw9zp"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              2,
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node9-gpu-2-3-84f8576d97-gk76w"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              0
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-0-79b869c66b-cndx7"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-1-76cf6689c9-qbd4d"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              2
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-2-7fc65f475b-bq7hm"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-3-86c8574f65-g8c4g"
+          }
+        ],
+        "models": {
+          "dsllama-8b": {
+            "awake": 1,
+            "bound": 4
+          },
+          "dsqwen-14b": {
+            "awake": 2,
+            "bound": 4
+          },
+          "dsqwen-7b": {
+            "awake": 3,
+            "bound": 4
+          }
+        },
+        "version": 250
+      }
+    },
+    {
+      "active": "dsllama-8b",
+      "controller_rss_kb": 37468,
+      "elapsed_s": 420.7,
+      "redis_dbsize": 5,
+      "service_manager_rss_kb": 111636,
+      "state": {
+        "bindings": [
+          {
+            "awake": false,
+            "gpu_ids": [
+              0
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-0-6cbf96cdf5-2lvgv"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              1
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-1-5579b75f9b-kh5fx"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              2
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-2-6774997cb5-4sfmh"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              3
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-3-6bf484f758-8v5fz"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              0,
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node10",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node10-gpu-0-1-77d5997485-nc6nv"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              2,
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node10",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node10-gpu-2-3-66f57f5575-6dtl7"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              0,
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node9-gpu-0-1-7b8c77ddc5-hw9zp"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              2,
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node9-gpu-2-3-84f8576d97-gk76w"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              0
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-0-79b869c66b-cndx7"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-1-76cf6689c9-qbd4d"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              2
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-2-7fc65f475b-bq7hm"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-3-86c8574f65-g8c4g"
+          }
+        ],
+        "models": {
+          "dsllama-8b": {
+            "awake": 1,
+            "bound": 4
+          },
+          "dsqwen-14b": {
+            "awake": 2,
+            "bound": 4
+          },
+          "dsqwen-7b": {
+            "awake": 3,
+            "bound": 4
+          }
+        },
+        "version": 250
+      }
+    },
+    {
+      "active": "dsllama-8b",
+      "controller_rss_kb": 37468,
+      "elapsed_s": 450.6,
+      "redis_dbsize": 5,
+      "service_manager_rss_kb": 111636,
+      "state": {
+        "bindings": [
+          {
+            "awake": false,
+            "gpu_ids": [
+              0
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-0-6cbf96cdf5-2lvgv"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              1
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-1-5579b75f9b-kh5fx"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              2
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-2-6774997cb5-4sfmh"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              3
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-3-6bf484f758-8v5fz"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              0,
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node10",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node10-gpu-0-1-77d5997485-nc6nv"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              2,
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node10",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node10-gpu-2-3-66f57f5575-6dtl7"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              0,
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node9-gpu-0-1-7b8c77ddc5-hw9zp"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              2,
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node9-gpu-2-3-84f8576d97-gk76w"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              0
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-0-79b869c66b-cndx7"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-1-76cf6689c9-qbd4d"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              2
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-2-7fc65f475b-bq7hm"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-3-86c8574f65-g8c4g"
+          }
+        ],
+        "models": {
+          "dsllama-8b": {
+            "awake": 1,
+            "bound": 4
+          },
+          "dsqwen-14b": {
+            "awake": 2,
+            "bound": 4
+          },
+          "dsqwen-7b": {
+            "awake": 3,
+            "bound": 4
+          }
+        },
+        "version": 250
+      }
+    },
+    {
+      "active": "dsqwen-14b",
+      "controller_rss_kb": 37532,
+      "elapsed_s": 480.5,
+      "redis_dbsize": 5,
+      "service_manager_rss_kb": 111636,
+      "state": {
+        "bindings": [
+          {
+            "awake": false,
+            "gpu_ids": [
+              0
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-0-6cbf96cdf5-2lvgv"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              1
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-1-5579b75f9b-kh5fx"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              2
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-2-6774997cb5-4sfmh"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              3
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-3-6bf484f758-8v5fz"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              0,
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node10",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node10-gpu-0-1-77d5997485-nc6nv"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              2,
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node10",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node10-gpu-2-3-66f57f5575-6dtl7"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              0,
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node9-gpu-0-1-7b8c77ddc5-hw9zp"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              2,
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node9-gpu-2-3-84f8576d97-gk76w"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              0
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-0-79b869c66b-cndx7"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-1-76cf6689c9-qbd4d"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              2
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-2-7fc65f475b-bq7hm"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-3-86c8574f65-g8c4g"
+          }
+        ],
+        "models": {
+          "dsllama-8b": {
+            "awake": 1,
+            "bound": 4
+          },
+          "dsqwen-14b": {
+            "awake": 2,
+            "bound": 4
+          },
+          "dsqwen-7b": {
+            "awake": 3,
+            "bound": 4
+          }
+        },
+        "version": 250
+      }
+    },
+    {
+      "active": "dsqwen-14b",
+      "controller_rss_kb": 37532,
+      "elapsed_s": 510.4,
+      "redis_dbsize": 5,
+      "service_manager_rss_kb": 111636,
+      "state": {
+        "bindings": [
+          {
+            "awake": false,
+            "gpu_ids": [
+              0
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-0-6cbf96cdf5-2lvgv"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              1
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-1-5579b75f9b-kh5fx"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              2
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-2-6774997cb5-4sfmh"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              3
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-3-6bf484f758-8v5fz"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              0,
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node10",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node10-gpu-0-1-77d5997485-nc6nv"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              2,
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node10",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node10-gpu-2-3-66f57f5575-6dtl7"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              0,
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node9-gpu-0-1-7b8c77ddc5-hw9zp"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              2,
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node9-gpu-2-3-84f8576d97-gk76w"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              0
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-0-79b869c66b-cndx7"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-1-76cf6689c9-qbd4d"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              2
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-2-7fc65f475b-bq7hm"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-3-86c8574f65-g8c4g"
+          }
+        ],
+        "models": {
+          "dsllama-8b": {
+            "awake": 1,
+            "bound": 4
+          },
+          "dsqwen-14b": {
+            "awake": 2,
+            "bound": 4
+          },
+          "dsqwen-7b": {
+            "awake": 3,
+            "bound": 4
+          }
+        },
+        "version": 250
+      }
+    },
+    {
+      "active": "dsqwen-7b",
+      "controller_rss_kb": 37536,
+      "elapsed_s": 540.3,
+      "redis_dbsize": 5,
+      "service_manager_rss_kb": 111636,
+      "state": {
+        "bindings": [
+          {
+            "awake": false,
+            "gpu_ids": [
+              0
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-0-6cbf96cdf5-2lvgv"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              1
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-1-5579b75f9b-kh5fx"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              2
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-2-6774997cb5-4sfmh"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              3
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-3-6bf484f758-8v5fz"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              0,
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node10",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node10-gpu-0-1-77d5997485-nc6nv"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              2,
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node10",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node10-gpu-2-3-66f57f5575-6dtl7"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              0,
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node9-gpu-0-1-7b8c77ddc5-hw9zp"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              2,
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node9-gpu-2-3-84f8576d97-gk76w"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              0
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-0-79b869c66b-cndx7"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-1-76cf6689c9-qbd4d"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              2
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-2-7fc65f475b-bq7hm"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-3-86c8574f65-g8c4g"
+          }
+        ],
+        "models": {
+          "dsllama-8b": {
+            "awake": 1,
+            "bound": 4
+          },
+          "dsqwen-14b": {
+            "awake": 2,
+            "bound": 4
+          },
+          "dsqwen-7b": {
+            "awake": 3,
+            "bound": 4
+          }
+        },
+        "version": 250
+      }
+    },
+    {
+      "active": "dsqwen-7b",
+      "controller_rss_kb": 37536,
+      "elapsed_s": 570.2,
+      "redis_dbsize": 5,
+      "service_manager_rss_kb": 111636,
+      "state": {
+        "bindings": [
+          {
+            "awake": false,
+            "gpu_ids": [
+              0
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-0-6cbf96cdf5-2lvgv"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              1
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-1-5579b75f9b-kh5fx"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              2
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-2-6774997cb5-4sfmh"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              3
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-3-6bf484f758-8v5fz"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              0,
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node10",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node10-gpu-0-1-77d5997485-nc6nv"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              2,
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node10",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node10-gpu-2-3-66f57f5575-6dtl7"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              0,
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node9-gpu-0-1-7b8c77ddc5-hw9zp"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              2,
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node9-gpu-2-3-84f8576d97-gk76w"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              0
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-0-79b869c66b-cndx7"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-1-76cf6689c9-qbd4d"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              2
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-2-7fc65f475b-bq7hm"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-3-86c8574f65-g8c4g"
+          }
+        ],
+        "models": {
+          "dsllama-8b": {
+            "awake": 1,
+            "bound": 4
+          },
+          "dsqwen-14b": {
+            "awake": 2,
+            "bound": 4
+          },
+          "dsqwen-7b": {
+            "awake": 3,
+            "bound": 4
+          }
+        },
+        "version": 250
+      }
+    },
+    {
+      "active": "dsllama-8b",
+      "controller_rss_kb": 37572,
+      "elapsed_s": 600.1,
+      "redis_dbsize": 5,
+      "service_manager_rss_kb": 111636,
+      "state": {
+        "bindings": [
+          {
+            "awake": false,
+            "gpu_ids": [
+              0
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-0-6cbf96cdf5-2lvgv"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              1
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-1-5579b75f9b-kh5fx"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              2
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-2-6774997cb5-4sfmh"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              3
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-3-6bf484f758-8v5fz"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              0,
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node10",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node10-gpu-0-1-77d5997485-nc6nv"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              2,
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node10",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node10-gpu-2-3-66f57f5575-6dtl7"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              0,
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node9-gpu-0-1-7b8c77ddc5-hw9zp"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              2,
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node9-gpu-2-3-84f8576d97-gk76w"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              0
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-0-79b869c66b-cndx7"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-1-76cf6689c9-qbd4d"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              2
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-2-7fc65f475b-bq7hm"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-3-86c8574f65-g8c4g"
+          }
+        ],
+        "models": {
+          "dsllama-8b": {
+            "awake": 1,
+            "bound": 4
+          },
+          "dsqwen-14b": {
+            "awake": 2,
+            "bound": 4
+          },
+          "dsqwen-7b": {
+            "awake": 3,
+            "bound": 4
+          }
+        },
+        "version": 250
+      }
+    },
+    {
+      "active": "dsllama-8b",
+      "controller_rss_kb": 37572,
+      "elapsed_s": 630.0,
+      "redis_dbsize": 5,
+      "service_manager_rss_kb": 111636,
+      "state": {
+        "bindings": [
+          {
+            "awake": false,
+            "gpu_ids": [
+              0
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-0-6cbf96cdf5-2lvgv"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              1
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-1-5579b75f9b-kh5fx"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              2
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-2-6774997cb5-4sfmh"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              3
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-3-6bf484f758-8v5fz"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              0,
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node10",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node10-gpu-0-1-77d5997485-nc6nv"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              2,
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node10",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node10-gpu-2-3-66f57f5575-6dtl7"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              0,
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node9-gpu-0-1-7b8c77ddc5-hw9zp"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              2,
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node9-gpu-2-3-84f8576d97-gk76w"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              0
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-0-79b869c66b-cndx7"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-1-76cf6689c9-qbd4d"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              2
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-2-7fc65f475b-bq7hm"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-3-86c8574f65-g8c4g"
+          }
+        ],
+        "models": {
+          "dsllama-8b": {
+            "awake": 1,
+            "bound": 4
+          },
+          "dsqwen-14b": {
+            "awake": 2,
+            "bound": 4
+          },
+          "dsqwen-7b": {
+            "awake": 3,
+            "bound": 4
+          }
+        },
+        "version": 250
+      }
+    },
+    {
+      "active": "dsqwen-14b",
+      "controller_rss_kb": 37604,
+      "elapsed_s": 660.9,
+      "redis_dbsize": 5,
+      "service_manager_rss_kb": 111636,
+      "state": {
+        "bindings": [
+          {
+            "awake": false,
+            "gpu_ids": [
+              0
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-0-6cbf96cdf5-2lvgv"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              1
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-1-5579b75f9b-kh5fx"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              2
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-2-6774997cb5-4sfmh"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              3
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-3-6bf484f758-8v5fz"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              0,
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node10",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node10-gpu-0-1-77d5997485-nc6nv"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              2,
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node10",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node10-gpu-2-3-66f57f5575-6dtl7"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              0,
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node9-gpu-0-1-7b8c77ddc5-hw9zp"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              2,
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node9-gpu-2-3-84f8576d97-gk76w"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              0
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-0-79b869c66b-cndx7"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-1-76cf6689c9-qbd4d"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              2
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-2-7fc65f475b-bq7hm"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-3-86c8574f65-g8c4g"
+          }
+        ],
+        "models": {
+          "dsllama-8b": {
+            "awake": 1,
+            "bound": 4
+          },
+          "dsqwen-14b": {
+            "awake": 2,
+            "bound": 4
+          },
+          "dsqwen-7b": {
+            "awake": 3,
+            "bound": 4
+          }
+        },
+        "version": 250
+      }
+    },
+    {
+      "active": "dsqwen-14b",
+      "controller_rss_kb": 37604,
+      "elapsed_s": 690.8,
+      "redis_dbsize": 5,
+      "service_manager_rss_kb": 111636,
+      "state": {
+        "bindings": [
+          {
+            "awake": false,
+            "gpu_ids": [
+              0
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-0-6cbf96cdf5-2lvgv"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              1
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-1-5579b75f9b-kh5fx"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              2
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-2-6774997cb5-4sfmh"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              3
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-3-6bf484f758-8v5fz"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              0,
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node10",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node10-gpu-0-1-77d5997485-nc6nv"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              2,
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node10",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node10-gpu-2-3-66f57f5575-6dtl7"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              0,
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node9-gpu-0-1-7b8c77ddc5-hw9zp"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              2,
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node9-gpu-2-3-84f8576d97-gk76w"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              0
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-0-79b869c66b-cndx7"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-1-76cf6689c9-qbd4d"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              2
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-2-7fc65f475b-bq7hm"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-3-86c8574f65-g8c4g"
+          }
+        ],
+        "models": {
+          "dsllama-8b": {
+            "awake": 1,
+            "bound": 4
+          },
+          "dsqwen-14b": {
+            "awake": 2,
+            "bound": 4
+          },
+          "dsqwen-7b": {
+            "awake": 3,
+            "bound": 4
+          }
+        },
+        "version": 250
+      }
+    },
+    {
+      "active": "dsqwen-7b",
+      "controller_rss_kb": 37604,
+      "elapsed_s": 720.7,
+      "redis_dbsize": 5,
+      "service_manager_rss_kb": 111636,
+      "state": {
+        "bindings": [
+          {
+            "awake": false,
+            "gpu_ids": [
+              0
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-0-6cbf96cdf5-2lvgv"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              1
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-1-5579b75f9b-kh5fx"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              2
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-2-6774997cb5-4sfmh"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              3
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-3-6bf484f758-8v5fz"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              0,
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node10",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node10-gpu-0-1-77d5997485-nc6nv"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              2,
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node10",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node10-gpu-2-3-66f57f5575-6dtl7"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              0,
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node9-gpu-0-1-7b8c77ddc5-hw9zp"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              2,
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node9-gpu-2-3-84f8576d97-gk76w"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              0
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-0-79b869c66b-cndx7"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-1-76cf6689c9-qbd4d"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              2
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-2-7fc65f475b-bq7hm"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-3-86c8574f65-g8c4g"
+          }
+        ],
+        "models": {
+          "dsllama-8b": {
+            "awake": 1,
+            "bound": 4
+          },
+          "dsqwen-14b": {
+            "awake": 2,
+            "bound": 4
+          },
+          "dsqwen-7b": {
+            "awake": 3,
+            "bound": 4
+          }
+        },
+        "version": 250
+      }
+    },
+    {
+      "active": "dsqwen-7b",
+      "controller_rss_kb": 37604,
+      "elapsed_s": 750.6,
+      "redis_dbsize": 5,
+      "service_manager_rss_kb": 111636,
+      "state": {
+        "bindings": [
+          {
+            "awake": false,
+            "gpu_ids": [
+              0
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-0-6cbf96cdf5-2lvgv"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              1
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-1-5579b75f9b-kh5fx"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              2
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-2-6774997cb5-4sfmh"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              3
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-3-6bf484f758-8v5fz"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              0,
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node10",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node10-gpu-0-1-77d5997485-nc6nv"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              2,
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node10",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node10-gpu-2-3-66f57f5575-6dtl7"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              0,
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node9-gpu-0-1-7b8c77ddc5-hw9zp"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              2,
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node9-gpu-2-3-84f8576d97-gk76w"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              0
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-0-79b869c66b-cndx7"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-1-76cf6689c9-qbd4d"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              2
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-2-7fc65f475b-bq7hm"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-3-86c8574f65-g8c4g"
+          }
+        ],
+        "models": {
+          "dsllama-8b": {
+            "awake": 1,
+            "bound": 4
+          },
+          "dsqwen-14b": {
+            "awake": 2,
+            "bound": 4
+          },
+          "dsqwen-7b": {
+            "awake": 3,
+            "bound": 4
+          }
+        },
+        "version": 250
+      }
+    },
+    {
+      "active": "dsllama-8b",
+      "controller_rss_kb": 37604,
+      "elapsed_s": 780.5,
+      "redis_dbsize": 5,
+      "service_manager_rss_kb": 111636,
+      "state": {
+        "bindings": [
+          {
+            "awake": false,
+            "gpu_ids": [
+              0
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-0-6cbf96cdf5-2lvgv"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              1
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-1-5579b75f9b-kh5fx"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              2
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-2-6774997cb5-4sfmh"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              3
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-3-6bf484f758-8v5fz"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              0,
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node10",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node10-gpu-0-1-77d5997485-nc6nv"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              2,
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node10",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node10-gpu-2-3-66f57f5575-6dtl7"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              0,
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node9-gpu-0-1-7b8c77ddc5-hw9zp"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              2,
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node9-gpu-2-3-84f8576d97-gk76w"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              0
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-0-79b869c66b-cndx7"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-1-76cf6689c9-qbd4d"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              2
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-2-7fc65f475b-bq7hm"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-3-86c8574f65-g8c4g"
+          }
+        ],
+        "models": {
+          "dsllama-8b": {
+            "awake": 1,
+            "bound": 4
+          },
+          "dsqwen-14b": {
+            "awake": 2,
+            "bound": 4
+          },
+          "dsqwen-7b": {
+            "awake": 3,
+            "bound": 4
+          }
+        },
+        "version": 250
+      }
+    },
+    {
+      "active": "dsllama-8b",
+      "controller_rss_kb": 37604,
+      "elapsed_s": 810.5,
+      "redis_dbsize": 5,
+      "service_manager_rss_kb": 111636,
+      "state": {
+        "bindings": [
+          {
+            "awake": false,
+            "gpu_ids": [
+              0
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-0-6cbf96cdf5-2lvgv"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              1
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-1-5579b75f9b-kh5fx"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              2
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-2-6774997cb5-4sfmh"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              3
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-3-6bf484f758-8v5fz"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              0,
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node10",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node10-gpu-0-1-77d5997485-nc6nv"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              2,
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node10",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node10-gpu-2-3-66f57f5575-6dtl7"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              0,
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node9-gpu-0-1-7b8c77ddc5-hw9zp"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              2,
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node9-gpu-2-3-84f8576d97-gk76w"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              0
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-0-79b869c66b-cndx7"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-1-76cf6689c9-qbd4d"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              2
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-2-7fc65f475b-bq7hm"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-3-86c8574f65-g8c4g"
+          }
+        ],
+        "models": {
+          "dsllama-8b": {
+            "awake": 1,
+            "bound": 4
+          },
+          "dsqwen-14b": {
+            "awake": 2,
+            "bound": 4
+          },
+          "dsqwen-7b": {
+            "awake": 3,
+            "bound": 4
+          }
+        },
+        "version": 250
+      }
+    },
+    {
+      "active": "dsqwen-14b",
+      "controller_rss_kb": 37604,
+      "elapsed_s": 840.4,
+      "redis_dbsize": 5,
+      "service_manager_rss_kb": 111636,
+      "state": {
+        "bindings": [
+          {
+            "awake": false,
+            "gpu_ids": [
+              0
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-0-6cbf96cdf5-2lvgv"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              1
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-1-5579b75f9b-kh5fx"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              2
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-2-6774997cb5-4sfmh"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              3
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-3-6bf484f758-8v5fz"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              0,
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node10",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node10-gpu-0-1-77d5997485-nc6nv"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              2,
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node10",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node10-gpu-2-3-66f57f5575-6dtl7"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              0,
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node9-gpu-0-1-7b8c77ddc5-hw9zp"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              2,
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node9-gpu-2-3-84f8576d97-gk76w"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              0
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-0-79b869c66b-cndx7"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-1-76cf6689c9-qbd4d"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              2
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-2-7fc65f475b-bq7hm"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-3-86c8574f65-g8c4g"
+          }
+        ],
+        "models": {
+          "dsllama-8b": {
+            "awake": 1,
+            "bound": 4
+          },
+          "dsqwen-14b": {
+            "awake": 2,
+            "bound": 4
+          },
+          "dsqwen-7b": {
+            "awake": 3,
+            "bound": 4
+          }
+        },
+        "version": 250
+      }
+    },
+    {
+      "active": "dsqwen-14b",
+      "controller_rss_kb": 37604,
+      "elapsed_s": 870.3,
+      "redis_dbsize": 5,
+      "service_manager_rss_kb": 111636,
+      "state": {
+        "bindings": [
+          {
+            "awake": false,
+            "gpu_ids": [
+              0
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-0-6cbf96cdf5-2lvgv"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              1
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-1-5579b75f9b-kh5fx"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              2
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-2-6774997cb5-4sfmh"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              3
+            ],
+            "hidden": false,
+            "model": "dsllama-8b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-3-6bf484f758-8v5fz"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              0,
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node10",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node10-gpu-0-1-77d5997485-nc6nv"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              2,
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node10",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node10-gpu-2-3-66f57f5575-6dtl7"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              0,
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node9-gpu-0-1-7b8c77ddc5-hw9zp"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              2,
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-14b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-14b-nscc-ds-4a100-node9-gpu-2-3-84f8576d97-gk76w"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              0
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-0-79b869c66b-cndx7"
+          },
+          {
+            "awake": false,
+            "gpu_ids": [
+              1
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-1-76cf6689c9-qbd4d"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              2
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-2-7fc65f475b-bq7hm"
+          },
+          {
+            "awake": true,
+            "gpu_ids": [
+              3
+            ],
+            "hidden": false,
+            "model": "dsqwen-7b",
+            "node": "nscc-ds-4a100-node9",
+            "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-3-86c8574f65-g8c4g"
+          }
+        ],
+        "models": {
+          "dsllama-8b": {
+            "awake": 1,
+            "bound": 4
+          },
+          "dsqwen-14b": {
+            "awake": 2,
+            "bound": 4
+          },
+          "dsqwen-7b": {
+            "awake": 3,
+            "bound": 4
+          }
+        },
+        "version": 250
+      }
+    }
+  ],
+  "service_manager_url": "http://10.111.21.116:8000",
+  "started_at": "2026-07-05T11:41:27.616514+00:00",
+  "workers": 4
+}
