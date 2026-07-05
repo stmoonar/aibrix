@@ -1314,3 +1314,20 @@
 - Commit the decision snapshot Z_m evidence fix, rebuild/roll controller, rerun
   the 15-minute precheck, and verify `model_states` has non-null `z_m` for all
   three models during active windows.
+
+### Endgame F2.4 Controller Rebuild With Decision Model States
+
+- Built replacement controller image on node10:
+  - tag: `tre-v2-controller:20260705-bb37a230`
+  - image id: `sha256:bccead0acbc836fabcbf9fcd15a89420c939474813a54f42ee05e149aac54892`
+  - source code commit: `bb37a230`
+- Verified inside the image:
+  - `python -m pytest -q controller/tests/test_decision_snapshot.py controller/tests/test_loop_ticks.py controller/tests/test_config.py controller/tests/test_planner.py controller/tests/test_metrics_store.py controller/tests/test_trs_signals.py`
+  - result: `71 passed`.
+- Updated the tre-v2 controller overlay pin to
+  `tre-v2-controller:20260705-bb37a230`; no `latest` tag introduced.
+
+### Endgame F2 Next
+
+- Run full `cd tre && make check`, commit the new image pin, roll controller,
+  and rerun the 15-minute precheck for final F2.4 evidence.
