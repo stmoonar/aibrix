@@ -1277,3 +1277,40 @@
 - Commit the precheck script return fix, rerun the 15-minute precheck, and then
   analyze controller decision logs for `paper_state_incomplete_drop`, non-null
   `Z_m`, and stale-hold rate.
+
+### Endgame F2.4 Decision Snapshot Z_m Evidence Fix
+
+- Reran the 15-minute precheck after fixing script output. It completed
+  successfully and wrote
+  `docs/refactor/p11_evidence/f2_zm_precheck_20260705/three_model_precheck.json`.
+- Precheck summary:
+  - duration: `900.9s`
+  - gateway errors: `{}`
+  - ok counts: `dsqwen-7b=988`, `dsllama-8b=897`, `dsqwen-14b=1983`
+  - tre-v2 component restarts stayed at `0`
+  - post-run reconcile: `warnings=[]`
+  - controller log counts over the run:
+    `paper_state_incomplete_drop=0`, `paper_state_stale_hold=0`,
+    `paper_state_stale_unknown=0`, `cluster_view_unavailable=0`.
+- The run also exposed an evidence gap: `tre:v2:decision:latest` was a Redis
+  hash containing only `ts_ms`, `loop`, `stale`, `submitted`, `actions`, and
+  `events`; it did not include per-model `Z_m`, so the plan's "Redis decision
+  records have non-null Z_m" acceptance item could not be proven from the
+  artifact.
+- Added RED tests for decision snapshot `model_states` serialization and for
+  loop results carrying `model_contexts`.
+- Implemented:
+  - `LoopTickResult.model_contexts`.
+  - `run_planner_tick()` returns the computed model contexts.
+  - `DecisionSnapshotWriter` writes `model_states` JSON with `z_m`,
+    `trs_z_m`, `signal_source`, and `signal_unavailable_reason` per model.
+- Verification:
+  - focused decision/loop tests: `23 passed`.
+  - controller focused set including decision snapshot: `71 passed`.
+  - full `cd tre && make check`: `260 passed`.
+
+### Endgame F2 Next
+
+- Commit the decision snapshot Z_m evidence fix, rebuild/roll controller, rerun
+  the 15-minute precheck, and verify `model_states` has non-null `z_m` for all
+  three models during active windows.

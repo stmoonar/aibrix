@@ -21,6 +21,7 @@ def build_decision_snapshot(loop_name: str, snapshot: MetricsSnapshot, result: L
         "submitted": str(result.submitted),
         "actions": json.dumps([_action_to_dict(action) for action in result.actions], separators=(",", ":")),
         "events": json.dumps(list(result.events), separators=(",", ":")),
+        "model_states": json.dumps(_model_states(result.model_contexts), separators=(",", ":"), sort_keys=True),
     }
 
 
@@ -74,6 +75,18 @@ def _action_to_dict(action: object) -> dict[str, Any]:
             "migrations": [_migration_to_dict(migration) for migration in action.migrations],
         }
     raise TypeError(f"unsupported decision action: {type(action).__name__}")
+
+
+def _model_states(model_contexts: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    return {
+        model: {
+            "z_m": context.get("z_m"),
+            "trs_z_m": context.get("trs_z_m"),
+            "signal_source": context.get("signal_source"),
+            "signal_unavailable_reason": context.get("signal_unavailable_reason"),
+        }
+        for model, context in sorted(model_contexts.items())
+    }
 
 
 def _migration_to_dict(migration: Any) -> dict[str, Any]:

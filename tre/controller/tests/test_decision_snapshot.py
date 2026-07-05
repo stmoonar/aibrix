@@ -38,6 +38,14 @@ def test_build_decision_snapshot_serializes_actions_and_events() -> None:
             ),
         ),
         events=("capacity_blocked:other",),
+        model_contexts={
+            "critical": {
+                "z_m": 0.5,
+                "trs_z_m": 0.5,
+                "signal_source": "zm",
+                "signal_unavailable_reason": None,
+            }
+        },
     )
 
     payload = build_decision_snapshot("rescue", snapshot, result)
@@ -47,6 +55,14 @@ def test_build_decision_snapshot_serializes_actions_and_events() -> None:
     assert payload["stale"] == "false"
     assert payload["submitted"] == "2"
     assert json.loads(payload["events"]) == ["capacity_blocked:other"]
+    assert json.loads(payload["model_states"]) == {
+        "critical": {
+            "z_m": 0.5,
+            "trs_z_m": 0.5,
+            "signal_source": "zm",
+            "signal_unavailable_reason": None,
+        }
+    }
     assert json.loads(payload["actions"]) == [
         {
             "kind": "scale",
@@ -91,6 +107,7 @@ def test_decision_snapshot_writer_writes_latest_hash() -> None:
                 "submitted": "0",
                 "actions": "[]",
                 "events": '["snapshot_stale"]',
+                "model_states": "{}",
             },
         )
     ]

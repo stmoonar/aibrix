@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Protocol
 
 from tre_common.metrics_schema import MetricsSnapshot, ModelWindowMetrics
@@ -44,6 +44,7 @@ class LoopTickResult:
     submitted: int
     actions: tuple[Action, ...] = ()
     events: tuple[str, ...] = ()
+    model_contexts: dict[str, dict] = field(default_factory=dict)
 
 
 @dataclass
@@ -127,7 +128,12 @@ def run_planner_tick(
     actions, safescale_events = _apply_safescale(snapshot, tuple(plan.actions), plan.probe_upscale_plans, safescale=safescale)
     if actions:
         queue.submit(actions)
-    return LoopTickResult(submitted=len(actions), actions=actions, events=paper_events + tuple(plan.events) + safescale_events)
+    return LoopTickResult(
+        submitted=len(actions),
+        actions=actions,
+        events=paper_events + tuple(plan.events) + safescale_events,
+        model_contexts=contexts,
+    )
 
 
 def _apply_safescale(
