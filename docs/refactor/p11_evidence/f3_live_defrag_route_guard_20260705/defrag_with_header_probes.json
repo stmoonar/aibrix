@@ -1,0 +1,171 @@
+{
+  "defrag": {
+    "body": {
+      "actions": [
+        {
+          "action": "hide",
+          "serve_id": "dsqwen-7b-nscc-ds-4a100-node10-gpu-2-5db6cd86c6-67ml6"
+        },
+        {
+          "action": "sleep",
+          "serve_id": "dsqwen-7b-nscc-ds-4a100-node10-gpu-2-5db6cd86c6-67ml6"
+        },
+        {
+          "action": "delete_deployment",
+          "serve_id": "dsqwen-7b-nscc-ds-4a100-node10-gpu-2-5db6cd86c6-67ml6"
+        },
+        {
+          "action": "create_deployment",
+          "gpu_ids": [
+            3
+          ],
+          "node": "nscc-ds-4a100-node9",
+          "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-3-86c8574f65-k5pn4"
+        },
+        {
+          "action": "wake",
+          "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-3-86c8574f65-k5pn4"
+        },
+        {
+          "action": "unhide",
+          "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-3-86c8574f65-k5pn4"
+        }
+      ],
+      "migrations": [
+        {
+          "from_slot": {
+            "gpu_ids": [
+              2
+            ],
+            "node": "nscc-ds-4a100-node10"
+          },
+          "serve_id": "dsqwen-7b-nscc-ds-4a100-node10-gpu-2-5db6cd86c6-67ml6",
+          "to_slot": {
+            "gpu_ids": [
+              3
+            ],
+            "node": "nscc-ds-4a100-node9"
+          }
+        }
+      ],
+      "version": 303
+    },
+    "duration_s": 110.97085857391357,
+    "finished_at": 1783261813.404421,
+    "started_at": 1783261702.4335625,
+    "status_code": 200
+  },
+  "duration_s": 121.14153909683228,
+  "finished_at": 1783261821.5566359,
+  "gateway_url": "http://10.99.21.145/v1/completions",
+  "models": [
+    "dsqwen-7b",
+    "dsllama-8b",
+    "dsqwen-14b"
+  ],
+  "results": {
+    "dsllama-8b": {
+      "error_counts": {},
+      "errors": 0,
+      "ok": 2053,
+      "samples": []
+    },
+    "dsqwen-14b": {
+      "error_counts": {},
+      "errors": 0,
+      "ok": 1787,
+      "samples": []
+    },
+    "dsqwen-7b": {
+      "error_counts": {
+        "http:502:upstream connect error or disconnect/reset before headers. reset reason: protocol error": 200,
+        "http:503:upstream connect error or disconnect/reset before headers. reset reason: remote connection failure, transport failure reason: delayed connect error: Connection refused": 4904
+      },
+      "errors": 5104,
+      "ok": 1952,
+      "samples": [
+        {
+          "message": "http:502:upstream connect error or disconnect/reset before headers. reset reason: protocol error",
+          "t": 1783261710.0410702
+        },
+        {
+          "message": "http:502:upstream connect error or disconnect/reset before headers. reset reason: protocol error",
+          "t": 1783261710.0468018
+        },
+        {
+          "message": "http:502:upstream connect error or disconnect/reset before headers. reset reason: protocol error",
+          "t": 1783261710.048007
+        },
+        {
+          "message": "http:502:upstream connect error or disconnect/reset before headers. reset reason: protocol error",
+          "t": 1783261710.0523007
+        },
+        {
+          "message": "http:502:upstream connect error or disconnect/reset before headers. reset reason: protocol error",
+          "t": 1783261710.0530336
+        },
+        {
+          "message": "http:502:upstream connect error or disconnect/reset before headers. reset reason: protocol error",
+          "t": 1783261710.0576944
+        },
+        {
+          "message": "http:502:upstream connect error or disconnect/reset before headers. reset reason: protocol error",
+          "t": 1783261710.0584042
+        },
+        {
+          "message": "http:502:upstream connect error or disconnect/reset before headers. reset reason: protocol error",
+          "t": 1783261710.0626204
+        },
+        {
+          "message": "http:502:upstream connect error or disconnect/reset before headers. reset reason: protocol error",
+          "t": 1783261710.063163
+        },
+        {
+          "message": "http:502:upstream connect error or disconnect/reset before headers. reset reason: protocol error",
+          "t": 1783261710.068075
+        },
+        {
+          "message": "http:502:upstream connect error or disconnect/reset before headers. reset reason: protocol error",
+          "t": 1783261710.068879
+        },
+        {
+          "message": "http:502:upstream connect error or disconnect/reset before headers. reset reason: protocol error",
+          "t": 1783261710.0726912
+        },
+        {
+          "message": "http:502:upstream connect error or disconnect/reset before headers. reset reason: protocol error",
+          "t": 1783261710.0732956
+        },
+        {
+          "message": "http:502:upstream connect error or disconnect/reset before headers. reset reason: protocol error",
+          "t": 1783261710.1011817
+        },
+        {
+          "message": "http:502:upstream connect error or disconnect/reset before headers. reset reason: protocol error",
+          "t": 1783261710.1025152
+        },
+        {
+          "message": "http:502:upstream connect error or disconnect/reset before headers. reset reason: protocol error",
+          "t": 1783261710.1048439
+        },
+        {
+          "message": "http:502:upstream connect error or disconnect/reset before headers. reset reason: protocol error",
+          "t": 1783261710.105689
+        },
+        {
+          "message": "http:502:upstream connect error or disconnect/reset before headers. reset reason: protocol error",
+          "t": 1783261710.1086705
+        },
+        {
+          "message": "http:502:upstream connect error or disconnect/reset before headers. reset reason: protocol error",
+          "t": 1783261710.1097353
+        },
+        {
+          "message": "http:502:upstream connect error or disconnect/reset before headers. reset reason: protocol error",
+          "t": 1783261710.1120794
+        }
+      ]
+    }
+  },
+  "started_at": 1783261700.4150968
+}

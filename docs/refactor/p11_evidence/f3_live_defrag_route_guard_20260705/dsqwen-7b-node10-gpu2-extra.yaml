@@ -1,0 +1,86 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dsqwen-7b-nscc-ds-4a100-node10-gpu-2
+  namespace: default
+  labels:
+    model.aibrix.ai/name: dsqwen-7b
+    model.aibrix.ai/port: '8000'
+    tre.aibrix.io/managed: 'true'
+    tre.aibrix.io/node: nscc-ds-4a100-node10
+    tre.aibrix.io/gpu-ids: '2'
+    tre.aibrix.io/routable: 'true'
+  annotations: &id001
+    tre.aibrix.io/gpu-ids: '2'
+    tre.aibrix.io/gpu-uuids: GPU-28af749d-4081-d7b6-0c14-cf9c29aa213d
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: dsqwen-7b-nscc-ds-4a100-node10-gpu-2
+  template:
+    metadata:
+      labels:
+        model.aibrix.ai/name: dsqwen-7b
+        model.aibrix.ai/port: '8000'
+        tre.aibrix.io/managed: 'true'
+        tre.aibrix.io/node: nscc-ds-4a100-node10
+        tre.aibrix.io/gpu-ids: '2'
+        tre.aibrix.io/routable: 'true'
+        app: dsqwen-7b-nscc-ds-4a100-node10-gpu-2
+      annotations: *id001
+    spec:
+      nodeName: nscc-ds-4a100-node10
+      volumes:
+      - name: shm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 20Gi
+      - name: models-volume
+        hostPath:
+          path: /data
+      containers:
+      - name: vllm-openai
+        image: vllm/vllm-openai:0.10.1-sleep
+        imagePullPolicy: IfNotPresent
+        command:
+        - python3
+        - -m
+        - vllm.entrypoints.openai.api_server
+        - --host
+        - 0.0.0.0
+        - --port
+        - '8000'
+        - --uvicorn-log-level
+        - warning
+        - --model
+        - /data/nfs_shared_data/DeepSeek-R1-Distill-Qwen-7B
+        - --served-model-name
+        - dsqwen-7b
+        - --enable_sleep_mode
+        - --no-enable-prefix-caching
+        - --enable-chunked-prefill
+        - --max-num-batched-tokens
+        - '2048'
+        - --swap-space
+        - '16'
+        env:
+        - name: NVIDIA_VISIBLE_DEVICES
+          value: GPU-28af749d-4081-d7b6-0c14-cf9c29aa213d
+        - name: CUDA_VISIBLE_DEVICES
+          value: '0'
+        - name: VLLM_SERVER_DEV_MODE
+          value: '1'
+        - name: VLLM_WORKER_MULTIPROC_METHOD
+          value: spawn
+        - name: VLLM_USE_MODELSCOPE
+          value: 'True'
+        ports:
+        - containerPort: 8000
+          protocol: TCP
+        resources: {}
+        volumeMounts:
+        - name: shm
+          mountPath: /dev/shm
+        - name: models-volume
+          mountPath: /data

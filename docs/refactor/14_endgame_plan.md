@@ -3,8 +3,11 @@
 > 文档编号：`docs/refactor/14_endgame_plan.md`
 > 写作时间：2026-07-05 晚（架构师第三轮审计后）
 > 性质：**这是一份从当前状态直通"TRE 工作全部做完"的完整方案**，不是阶段方案。
-> 覆盖：N4b 两个阻塞点的架构决策与修复 → N4b 收尾（n4b-done）→ N5 全部实验
+> 覆盖：N4b 两个阻塞点的架构决策与修复 → N4b 收尾 → **F4 清场 + AIBrix 0.7.0
+> 声明式重部署（D11，N5 前强制关口）→ 干净集群上 n4b-done** → N5 全部实验
 > （R1–R7）→ 论文数据打包与最终封版。执行模型从头到尾照本文档执行即可。
+> 版本口径：本系统底座 = **AIBrix 0.7.0**（HEAD 在 `v0.7.0` 之后）；`upstream-v0.4.0`
+> 只是**旧系统**的对拍基线，不是本系统版本，勿混淆。
 > 与 `10_next_steps.md` 的关系：第 10 章的 10.1–10.4 已完成不再重复；10.5/10.6/10.7
 > 被本文档第 4 章**取代**（因为两个阻塞点改变了执行前提）。其余纪律条款继续有效。
 
@@ -312,7 +315,124 @@ node9 实测（nvidia-smi compute-apps + /proc cgroup → pod 映射 + /is_sleep
 
 ---
 
-## 5. 阶段 N5：长实验手册（R1–R7 逐项展开；总计算时长 ≈ 35h，建议 4–5 天排完）
+## 5. 阶段 F4：清场 + 声明式全新部署（N5 前的强制关口，预计 1.5–2 天）
+
+> **为什么必须做（架构师 2026-07-06 复核实况）**：
+> - 代码已对齐 **AIBrix 0.7.0**（HEAD = `v0.7.0-198-gxxxxxxx`；`upstream-v0.4.0`
+>   只是**旧系统**的对拍基线，不是本系统底座版本）。
+> - 但**集群里跑的底座不是干净的 0.7.0**——是旧镜像混装：
+>   `aibrix/controller-manager:nightly`、`orchestration-controller:v0.4.1`、
+>   `gateway-plugins:<nightly>`、多个 `:latest`。代码在 0.7.0，底座停在 0.4 时代。
+> - tre-v2 是一路**手工 patch 出来的**（`kubectl set image` 滚镜像、手工重建
+>   HTTPRoute、D8 hygiene 手工删建 Deployment）；**gpu-truth agent 是手工 nohup**
+>   拉起的，清单里根本没有它。
+> - 结论：**当前所有 N4/N4b live 结论都来自一个不可复现的"雪花集群"**。N5 的论文
+>   数字绝不能跑在上面。F4 的产出 = 一个"从干净集群按清单一键拉起、可复现"的
+>   AIBrix 0.7.0 + TRE v2 全栈，N5 全部实验在它上面跑。这是决策 **D11**。
+>
+> **执行顺序**：F3 的路由守卫先在**当前集群**快速复验一次（确认 `f6dce214` 修好了
+> defrag route GC），拿到 N4.4 的初步结论；然后做 F4 清场重部署；**N4b 的正式验收
+> （N4.2 热切换 / N4.4 defrag 零 5xx / N4.6 三模型扩缩 + 12h soak）在 F4 之后的干净
+> 集群上重跑一遍，才是权威 PASS**，`n4b-done` 打在这次干净验收之后。
+
+### 5.1 F4.0 先把手工改动补成声明式（离线，TDD，不动集群）
+
+清场之前，必须先保证"清单里有的 == 手工做过的"，否则重部署会丢功能。逐项审计并补齐：
+
+1. **gpu-truth agent → DaemonSet**（当前最大缺口）。
+   - 新建 `tre/deploy/overlays/tre-v2/gpu-truth-daemonset.yaml`：在两台 GPU 节点上
+     跑 `gpu_truth_agent.py`，`hostPID: false`、只读挂 `nvidia-smi`（用带 CUDA 的
+     基础镜像或把 nvidia-smi 通过 hostPath），env 指 tre-v2 Redis，`SETEX
+     tre:gpu_truth:<node>`。nodeSelector 只选带 GPU 的节点。
+   - 把脚本打进一个 tre-v2 sidecar 镜像或复用现有镜像；agent 逻辑已在
+     `deploy/tests/test_gpu_truth_agent.py` 有覆盖，DaemonSet 清单加进 overlay
+     的 `resources:` 和 overlay 测试。
+2. **model Deployments + HTTPRoutes 纳入一键部署**。
+   - 现状：`tre/deploy/models/` 由 `gen_model_manifests.py` 生成（含 D7 UUID 绑卡 +
+     每模型 HTTPRoute），但 `overlays/tre-v2` 没 include models。
+   - 决定生成时机：GPU **UUID 是每台机器固定的**，可提前用 `collect_gpu_uuids.py`
+     采集写进 registry，再 `gen_model_manifests.py` 生成到 `models/`，纳入版本控制；
+     部署时 `kubectl apply -k tre/deploy/models`。把"采 UUID → 生成 → apply"写成
+     一个 `tre/deploy/scripts/deploy_models.sh`。
+   - HTTPRoute 由生成器产出**初始**版本；运行期由 F3 路由守卫幂等保证存在（双保险）。
+3. **env/阈值全部落 kustomize**：`TRE_SLEEP_LEAK_USED_MIB`、`TRE_CREATE_MAX_USED_MIB`、
+   `TRE_SIGNAL_SOURCE`（默认 zm）、`TRE_PERCENTILE_MODE`（bucket_upper）、
+   `TRE_HIST_BASELINE_LOOKBACK_MS`、`TRE_PAPER_STALE_MAX_WINDOWS`、`TRE_INCOMPLETE_POLICY`
+   等 F1/F2 引入的开关，逐一确认已在 `service-manager.yaml`/`controller.yaml` 里显式
+   声明（不能只活在手工 set env 里）。
+4. **镜像清单固化**：把当前 live 的 SM/controller/ui 镜像 tag + digest 写进
+   `docs/refactor/images.lock.md`；overlay 里 image 引用全部用**带 digest 或固定
+   tag**，禁 latest/nightly。
+5. 全部改完 `cd tre && make check` 全绿，commit。**这一步产出"一键部署包"，是 F4
+   的核心交付物。**
+
+### 5.2 F4.1 全量备份（不可跳，红线）
+
+1. 备份当前 tre-v2 全部资源、model Deployments、所有 model HTTPRoute、当前 AIBrix
+   底座关键 CR/config：`kubectl get ... -o yaml` 落
+   `docs/refactor/p11_evidence/pre_f4_teardown_<date>/`，commit。
+2. 备份当前 Redis 状态（SM state + controller EMA）快照，便于对照。
+3. **确认旧系统基线备份仍在**：`docs/refactor/p11_evidence/old_system_backup/`
+   （R1 要用）——见 5.5 的版本口径提示。
+
+### 5.3 F4.2 清场（第二次动集群，谨慎）
+
+1. 停控制器（已 replicas=0），SM 也缩 0；删 tre-v2 全部 model Deployment + HTTPRoute；
+   `nvidia-smi` 双检两台节点 GPU 全部释放（只剩驱动 residue）。
+2. 删 tre-v2 namespace（redis/ui/sm/controller 一起走）。
+3. **卸载旧 AIBrix 底座**：这是唯一敏感操作。用 AIBrix 0.7.0 官方卸载方式
+   （`kubectl delete -k` 对应 install 清单，或 helm uninstall，视仓库 `config/`
+   或 `dist/` 提供的方式）。**保留** gpu-operator、prometheus、envoy-gateway CRD
+   底座、kube-flannel（这些是集群级依赖，不属于 AIBrix 应用层）——删前用
+   `kubectl get` 确认每个要删的对象归属 AIBrix，逐类删，不用 `delete ns` 扫。
+   **不确定某对象是否该删就记 Blocked 停手问架构师**，宁可留残余也不误删底座。
+
+### 5.4 F4.3 全新部署 AIBrix 0.7.0 + TRE v2（从清单一键起）
+
+1. **装 AIBrix 0.7.0 底座**：用仓库 `config/`（或 `dist/`）的 0.7.0 安装清单，确认
+   装出来的 aibrix-system 组件镜像**全部是 0.7.0 一致版本**（不再有 nightly/v0.4.1
+   混装）。等底座 Ready，验 gateway/redis/controller 健康。
+2. **部署 TRE v2**：`kubectl apply -k tre/deploy/overlays/tre-v2`（含 F4.0 补进的
+   gpu-truth DaemonSet）；`bash tre/deploy/scripts/deploy_models.sh` 起 12 个 model
+   binding。全程**不手工 patch**——凡是需要手工插一刀的，都回 F4.0 补进清单再来。
+3. **冒烟**：三模型 gateway 各 20/20；`POST /v2/reconcile` warnings=[]；gpu-truth
+   两个 key 在刷新；控制器起来后不误扩容。证据落 `p11_evidence/f4_fresh_deploy_<date>/`。
+4. **在干净 0.7.0 底座上重新探测 F1/F2 的两个环境假设**（可能变好，要更新决策）：
+   - DCGM/prometheus GPU 指标在干净 0.7.0 gpu-operator 下是否**有值了**——若有，
+     GPU truth 可从 Plan B(Redis 桥) 升级回 **Plan A(DCGM)**，DaemonSet 可退役，更新
+     D8 记录。
+   - HTTPRoute GC 行为在干净 0.7.0 gateway 下是否仍出现——若 0.7.0 不再 GC，F3 路由
+     守卫从"必需"降为"防御性冗余"，在 12_realenv_tests.md 里注明。
+
+### 5.5 F4.4 干净集群上的 N4b 权威验收（重跑，替代当前雪花上的结论）
+
+在 F4.3 的干净全栈上重跑 N4b 关键验收，作为**权威** PASS：
+- N4.2 热切换往返（20 轮，wake P95 记录）
+- N4.4 live defrag 零 5xx（这次带 F3 路由守卫，且在干净底座上——才算数）
+- N4.6 三模型扩缩（zm 信号，4.2 的分阶段负载）+ 12h 过夜 soak（本地盘输出）
+- 每项证据覆盖 12_realenv_tests.md 对应节，全部 live PASS 后 → `git tag n4b-done`。
+
+> **R1 基线的版本口径提示（重要，写给 N5）**：旧系统基线是 AIBrix **0.4.0** 上的旧
+> TRE；清场后集群是 0.7.0，忠实还原"旧系统 on 0.4.0"代价高且与新系统不同底座、
+> 对比不公平。**建议**：N5 主对照的 `V_static`（静态分配基线）在**同一 0.7.0 底座**
+> 上测（新旧同底座才公平）；旧 0.4.0 TRE 系统作为**次要参考**，若要跑就在 F4 清场
+> **之前**用 old_system_backup 单独跑一次并记录底座版本差异，或直接以"prior work"
+> 口径引用并在 09 报告里注明底座版本 caveat。这条在 N5 的 R1 里对应展开（见 6.1）。
+
+### 5.6 F4 gate
+
+- [ ] F4.0 一键部署包（含 gpu-truth DaemonSet、models apply 脚本、env/镜像固化）
+      commit，`make check` 全绿
+- [ ] 旧底座 + 雪花 tre-v2 清场完成，GPU 双检释放
+- [ ] AIBrix 0.7.0 底座 + TRE v2 从清单**零手工**拉起，冒烟通过
+- [ ] F1/F2 两个环境假设在干净底座上复测并更新决策
+- [ ] N4b 权威验收（N4.2/N4.4/N4.6）在干净集群 live PASS
+- [ ] `git tag n4b-done`（打在干净验收之后，不是雪花上）
+- [ ] ADR：D11（清场重部署 + 一键部署包）记入 DECISIONS.md
+
+---
+
+## 6. 阶段 N5：长实验手册（R1–R7 逐项展开；总计算时长 ≈ 35h，建议 4–5 天排完）
 
 依赖顺序不变：`R1 → R3 → R7 → R2 → R4 → R5`，R6 任意空档。每项跑完立即在
 `docs/refactor/13_experiments_log.md`（新建）里记一条，格式统一为：
@@ -326,7 +446,7 @@ node9 实测（nvidia-smi compute-apps + /proc cgroup → pod 映射 + /is_sleep
 - 异常与处理: <无则写无>
 ```
 
-### 5.1 R1：旧系统基线（约 2h 采集 + 前后各 1h 切换）
+### 6.1 R1：旧系统基线（约 2h 采集 + 前后各 1h 切换）
 
 **目的**：论文对照组 V_baseline(旧 TRE) 与 V_static（静态分配）在基准负载下的表现。
 
@@ -347,7 +467,7 @@ node9 实测（nvidia-smi compute-apps + /proc cgroup → pod 映射 + /is_sleep
 **失败处理**：旧系统起不来 → 按 restore_ready 文档排错，2h 内无解则回滚到新系统并记
 Blocked（R1 可以最后补跑，不阻塞 R3 起步）。
 
-### 5.2 R3：真机重拟合（θ_m + 容量面；每模型 ≈ 10h，共 3 模型，安排 2–3 个夜间）
+### 6.2 R3：真机重拟合（θ_m + 容量面；每模型 ≈ 10h，共 3 模型，安排 2–3 个夜间）
 
 **目的**：产出真实 `theta_m` 与容量面 `C_m(i,o)`，替换 registry 中的旧系统继承值；
 同时落 `bucket_upper` 与 `interpolated` 两套 percentile 口径（否则 R4 要重跑网格）。
@@ -369,14 +489,14 @@ Blocked（R1 可以最后补跑，不阻塞 R3 起步）。
 6. 验收：三模型 × 两口径 共 6 份 profile + 6 份容量面；θ_m 与旧值偏差记录
    （偏差 > 30% 时在 13 号文档里解释原因——硬件/引擎版本差异预期内）。
 
-### 5.3 R7：trace 重生成与冻结（≈ 1h）
+### 6.3 R7：trace 重生成与冻结（≈ 1h）
 
 1. 用 R3 真容量面跑 `tre/replayer` 的 design → `lint.py`（C1/C2/C3 全过）→
    oracle 求解（`oracle.py`）→ 7 条 trace + oracle 值落 `tre/replayer/traces/`。
 2. `git tag traceset-v1`。**此后 R2/R4/R5 期间禁改 trace；结果不满意只能改系统不能改题。**
 3. 13 号文档记：每条 trace 的 ρ 覆盖、V_static / V_oracle 预算值。
 
-### 5.4 R2：新系统 7-trace 回归（bucket_upper；≈ 8h）
+### 6.4 R2：新系统 7-trace 回归（bucket_upper；≈ 8h）
 
 1. 前置：全拓扑稳态、reconcile 干净、controller env `TRE_PERCENTILE_MODE=bucket_upper`
    （现值）。每条 trace 之间执行**状态复位**：全模型缩回 awake=1、清 controller
@@ -387,14 +507,14 @@ Blocked（R1 可以最后补跑，不阻塞 R3 起步）。
 3. 产出 `/root/tre-experiments/r2/<trace>/`；13 号文档汇总表（7 行 × 得分列）。
 4. 期间任何 `sleep_leak` 告警：trace 之间做 hygiene 重建，trace 之中不动、记录。
 
-### 5.5 R4：interpolated 口径复跑（≈ 8h）
+### 6.5 R4：interpolated 口径复跑（≈ 8h）
 
 1. `kubectl apply -k tre/deploy/ablation-interpolated`（只切 controller env）+
    registry 侧确认容量面/θ 用 interpolated 版（R3 已产出——如果 registry 只能装一套，
    overlay 里用 env 指向另一套 profile 文件，实现方式执行时按 config.py 现状选最小改动）。
 2. 复位纪律、7 trace、同 R2 全套记录。跑完切回 bucket_upper 底座。
 
-### 5.6 R5：消融矩阵（≈ 6h）
+### 6.6 R5：消融矩阵（≈ 6h）
 
 - arm 列表：`no-fastloop`、`no-safescale`（现有 overlay）、`signal=queue_len`
   （env TRE_SIGNAL_SOURCE，D9 保留的消融用途）、（percentile 两口径已由 R2/R4 覆盖，
@@ -403,12 +523,12 @@ Blocked（R1 可以最后补跑，不阻塞 R3 起步）。
   3 条及理由，防止事后挑数据）：默认选 ρ 最低/中/最高各一条。
 - 每 arm 跑完恢复默认 overlay 并冒烟，再进下一 arm。
 
-### 5.7 R6：replayer 计时精度（≈ 0.5h，任意空档）
+### 6.7 R6：replayer 计时精度（≈ 0.5h，任意空档）
 
 - replayer 双模式（真实 HTTP vs 干跑计时）对同一 trace 的发压时间轴对比，
   P99 偏差 < 50ms 为过；进 13 号文档。
 
-### 5.8 N5 gate
+### 6.8 N5 gate
 
 - [ ] 13 号文档含 R1–R7 全部条目，每条可复现（版本/命令/数据齐全）
 - [ ] `git tag results-v1`
@@ -416,7 +536,7 @@ Blocked（R1 可以最后补跑，不阻塞 R3 起步）。
 
 ---
 
-## 6. 阶段 F5：论文数据打包与封版（预计 1 天）
+## 7. 阶段 F5：论文数据打包与封版（预计 1 天）
 
 1. `09_final_report.md` 终版：叙事从"重构完成"升级为"重构 + 真机验证 + 全量实验"，
    贴 N4b/N5 关键数字；系统边界与已知限制单列（sleep 泄漏治理、AIBrix 指标节奏依赖、
@@ -431,7 +551,7 @@ Blocked（R1 可以最后补跑，不阻塞 R3 起步）。
 
 ---
 
-## 7. 全局纪律（沿用，此处只列增量）
+## 8. 全局纪律（沿用，此处只列增量）
 
 - `10_next_steps.md` 第 1 章执行原则 v2 全部继续有效（备份后才能删、/root/aibrix-main
   冻结、不动权重/NFS、底座四件套不动、双检 GPU、TDD+tag+WORKLOG、Blocked 不猜）。
@@ -457,24 +577,55 @@ Blocked（R1 可以最后补跑，不阻塞 R3 起步）。
 
 ---
 
-## 8. 给执行模型的开工指令（原样粘贴即可）
+## 9. 给执行模型的开工指令（原样粘贴即可）
 
 ```text
-工作目录：/data/nfs_shared_data/xxy/aibrix（76，权威工作区）。
+你在接手一个进行到中后期的项目：TRE v2（基于 AIBrix 0.7.0 的 MaaS 多模型热切换自动
+扩缩容系统）。工作目录 = 权威工作区：76 服务器 /data/nfs_shared_data/xxy/aibrix
+（git 仓库，HEAD 在 main，已对齐 AIBrix 0.7.0）。
 
-先读 docs/refactor/14_endgame_plan.md 全文——这是从现在直到 TRE 全部做完的唯一任务
-清单，此前 10_next_steps.md 的 10.5–10.7 已被它取代。第 0 章是架构师对你 N4b 工作的
-审计结论（两个 Blocked 的裁决在 0.5），第 1 章是三个新架构决策 D8/D9/D10，照做即可。
+━━ 先读文档（按序读完再动手）━━
+1. docs/refactor/14_endgame_plan.md 全文——从现在到 TRE 全部做完的唯一任务清单。
+   第 0 章=对 N4b 的审计结论，第 1 章=架构决策 D8/D9/D10，第 5 章=D11 清场重部署。
+2. docs/refactor/WORKLOG.md 从 "Endgame F1.1" 读到末尾——F1/F2/F3 的全部执行记录。
+3. docs/refactor/12_realenv_tests.md 的 N4.4 / N4.6 两节现状。
 
-开工第一步：把 14_endgame_plan.md commit 进 git。
-然后按 F1(第2章) → F2(第3章) → F3(第4章, 打 n4b-done) → N5(第5章, R1→R3→R7→R2→R4→R5,
-R6 空档插) → F5(第6章, 打 tre-v2-1.0) 顺序执行。
+━━ 当前进度（截至 2026-07-06 架构师复核）━━
+- P0–P9、N1–N4、N4b.1–.4 全部完成。
+- F1（第2章，泄漏治理）完成：E1 刻画做完；GPU 真值走 Plan B（gpu_truth_agent.py
+  手工 nohup 在 node9/node10，SETEX 到 tre-v2 Redis；DCGM/Plan A 在当前脏底座不可用）；
+  D8 检测+重建、D10 headroom 检查已实装。
+- F2（第3章，zm 信号修复）完成：基线回看 / 按模型降级 / EMA 保持 / ActionQueue
+  inflight bug 全修；已验证 zm 能驱动扩容（dsqwen-7b 高负载 1→3 awake）。
+- F3（第4章）进行中：live defrag 撞上"AIBrix 删/建 pod 时 HTTPRoute 被 GC"导致
+  gateway 5xx 的阻塞；路由守卫 K8sOps.ensure_model_httproute() 已实现并 roll 到
+  live（SM 镜像 tre-v2-service-manager:20260705-f6dce214），make check 264 passed，
+  【但还没用守卫后的镜像重跑 live defrag 验证】。控制器当前 replicas=0（故意暂停）。
 
-执行纪律沿用你 P0–N4b 的方式：TDD 小步提交、每步 `cd tre && make check`、WORKLOG、
-真机 GPU 操作前 nvidia-smi + kubectl 双检、Blocked 记录后继续不受影响的部分。
-新增三条：实验输出写 76 本地盘不写 NFS；当天用过的脚本当天收编进 tre/deploy/scripts/；
+━━ 你的接手顺序 ━━
+第一步：把本文档最新版 commit（若未提交）。
+① F3 收尾：先在当前集群用路由守卫镜像重跑 live defrag，确认 route GC 修好、
+   defrag 期间三模型零 5xx（带 HTTP model 头），拿到 N4.4 初步结论。
+② F4（第5章，清场重部署，D11）：这是 N5 前的强制关口。当前集群是"底座陈旧
+   (nightly/v0.4.1 混装) + tre-v2 手工捏出来"的雪花，N5 论文数字不能跑在上面。
+   F4.0 先把手工改动补成声明式（gpu-truth 做成 DaemonSet、models+HTTPRoute 一键
+   apply 脚本、env/镜像固化）→ F4.1 全量备份 → F4.2 清场旧底座+雪花 →
+   F4.3 从清单零手工拉起 AIBrix 0.7.0 + TRE v2 → F4.4 干净集群上重跑 N4b 权威
+   验收（N4.2/N4.4/N4.6）→ 打 n4b-done（打在干净验收之后）。
+③ N5（第6章）：R1→R3→R7→R2→R4→R5，R6 空档插；跑完打 results-v1。
+④ F5（第7章）：论文数据打包 + 文档终检；打 tre-v2-1.0。收工。
+
+━━ 纪律 ━━
+沿用 P0–N4b：TDD 小步提交、每步 cd tre && make check、WORKLOG 记证据路径、真机 GPU
+操作前 nvidia-smi + kubectl 双检、Blocked 记录后继续做不受影响的部分不猜。
+新增：实验输出写 76 本地盘（/root/tre-experiments、/root/tre-n4b-soak）不写 NFS；
+当天用过的脚本当天收编进 tre/deploy/scripts/（别长住 /tmp，已因此丢过上下文）；
 R2 之后 traceset 冻结不许改。
 
-红线不变：/root/aibrix-main 只读；不动模型权重；AIBrix 底座/envoy/gpu-operator/
-prometheus 不动（读 prometheus 指标可以）；镜像 tag 禁 latest。
+━━ 红线 ━━
+/root/aibrix-main 只读；不动模型权重与 NFS 大文件；删 k8s 资源前先备份 yaml 且提交；
+镜像 tag 禁 latest/nightly。
+【F4 例外】F4.2/F4.3 会显式卸载并重装 AIBrix 0.7.0 应用层底座——这是唯一被授权的
+底座操作，但 gpu-operator / prometheus / envoy-gateway CRD / kube-flannel 仍然不动；
+删任何底座对象前逐类 kubectl get 确认归属，不确定就记 Blocked 停手问架构师。
 ```

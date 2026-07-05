@@ -1,0 +1,3 @@
+httproute.gateway.networking.k8s.io/dsqwen-7b-router configured
+httproute.gateway.networking.k8s.io/dsllama-8b-router configured
+httproute.gateway.networking.k8s.io/dsqwen-14b-router created

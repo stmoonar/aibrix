@@ -1,0 +1,21 @@
+{
+  "find_slot_tp2": null,
+  "plan_defrag_tp2": [
+    {
+      "from_slot": {
+        "gpu_ids": [
+          2
+        ],
+        "node": "nscc-ds-4a100-node10"
+      },
+      "serve_id": "dsqwen-7b-nscc-ds-4a100-node10-gpu-2-5db6cd86c6-67ml6",
+      "to_slot": {
+        "gpu_ids": [
+          3
+        ],
+        "node": "nscc-ds-4a100-node9"
+      }
+    }
+  ],
+  "pre_14b_node10_gpu2_3_feasible_wake": false
+}

@@ -1,0 +1,11 @@
+NAME                                         HOSTNAMES   AGE
+aibrix-reserved-router                                   397d
+aibrix-reserved-router-models-endpoint                   397d
+dsllama-8b-router                                        26m
+dsqwen-7b-router                                         21s
+lxt-aibrix-reserved-router                               122d
+lxt-aibrix-reserved-router-models-endpoint               122d
+qwen-coder-router                                        373d
+qwen-instruct-router                                     373d
+reserved-router                                          374d
+reserved-router-models-endpoint                          374d

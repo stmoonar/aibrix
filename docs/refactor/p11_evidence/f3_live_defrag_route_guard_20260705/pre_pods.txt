@@ -1,0 +1,13 @@
+NAME                                                       READY   STATUS    RESTARTS     AGE     IP             NODE                   NOMINATED NODE   READINESS GATES
+dsllama-8b-nscc-ds-4a100-node9-gpu-0-6cbf96cdf5-2lvgv      1/1     Running   0            9h      10.244.3.52    nscc-ds-4a100-node9    <none>           <none>
+dsllama-8b-nscc-ds-4a100-node9-gpu-1-5579b75f9b-kh5fx      1/1     Running   0            8h      10.244.3.57    nscc-ds-4a100-node9    <none>           <none>
+dsllama-8b-nscc-ds-4a100-node9-gpu-2-6774997cb5-9w5pp      1/1     Running   0            23m     10.244.3.85    nscc-ds-4a100-node9    <none>           <none>
+dsllama-8b-nscc-ds-4a100-node9-gpu-3-6bf484f758-qzchp      1/1     Running   0            51m     10.244.3.81    nscc-ds-4a100-node9    <none>           <none>
+dsqwen-14b-nscc-ds-4a100-node10-gpu-0-1-77d5997485-nc6nv   1/1     Running   0            8h      10.244.0.163   nscc-ds-4a100-node10   <none>           <none>
+dsqwen-14b-nscc-ds-4a100-node10-gpu-2-3-66f57f5575-6dtl7   1/1     Running   0            8h      10.244.0.164   nscc-ds-4a100-node10   <none>           <none>
+dsqwen-14b-nscc-ds-4a100-node9-gpu-0-1-7b8c77ddc5-hw9zp    1/1     Running   0            4h11m   10.244.3.73    nscc-ds-4a100-node9    <none>           <none>
+dsqwen-14b-nscc-ds-4a100-node9-gpu-2-3-84f8576d97-dkskl    1/1     Running   0            21m     10.244.3.86    nscc-ds-4a100-node9    <none>           <none>
+dsqwen-7b-nscc-ds-4a100-node9-gpu-0-79b869c66b-cndx7       1/1     Running   5 (9h ago)   9h      10.244.3.53    nscc-ds-4a100-node9    <none>           <none>
+dsqwen-7b-nscc-ds-4a100-node9-gpu-1-76cf6689c9-qbd4d       1/1     Running   0            4h14m   10.244.3.72    nscc-ds-4a100-node9    <none>           <none>
+dsqwen-7b-nscc-ds-4a100-node9-gpu-2-7fc65f475b-n55bs       1/1     Running   0            53m     10.244.3.80    nscc-ds-4a100-node9    <none>           <none>
+dsqwen-7b-nscc-ds-4a100-node9-gpu-3-86c8574f65-m6k4z       1/1     Running   0            25m     10.244.3.84    nscc-ds-4a100-node9    <none>           <none>

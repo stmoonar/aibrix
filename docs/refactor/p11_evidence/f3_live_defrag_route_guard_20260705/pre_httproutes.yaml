@@ -1,0 +1,254 @@
+apiVersion: v1
+items:
+- apiVersion: gateway.networking.k8s.io/v1
+  kind: HTTPRoute
+  metadata:
+    creationTimestamp: "2026-07-05T13:57:31Z"
+    generation: 1
+    name: dsqwen-7b-router
+    namespace: aibrix-system
+    resourceVersion: "192930591"
+    uid: 294ddab9-dcd2-4455-b7f2-c5a83f42bc6a
+  spec:
+    parentRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: aibrix-eg
+      namespace: aibrix-system
+    rules:
+    - backendRefs:
+      - group: ""
+        kind: Service
+        name: dsqwen-7b
+        namespace: default
+        port: 8000
+        weight: 1
+      matches:
+      - headers:
+        - name: model
+          type: Exact
+          value: dsqwen-7b
+        path:
+          type: PathPrefix
+          value: /v1/completions
+      - headers:
+        - name: model
+          type: Exact
+          value: dsqwen-7b
+        path:
+          type: PathPrefix
+          value: /v1/chat/completions
+      - headers:
+        - name: model
+          type: Exact
+          value: dsqwen-7b
+        path:
+          type: PathPrefix
+          value: /v1/embeddings
+      - headers:
+        - name: model
+          type: Exact
+          value: dsqwen-7b
+        path:
+          type: PathPrefix
+          value: /generate
+      - headers:
+        - name: model
+          type: Exact
+          value: dsqwen-7b
+        path:
+          type: PathPrefix
+          value: /generatevideo
+      timeouts:
+        request: 600s
+  status:
+    parents:
+    - conditions:
+      - lastTransitionTime: "2026-07-05T14:00:00Z"
+        message: Route is accepted
+        observedGeneration: 1
+        reason: Accepted
+        status: "True"
+        type: Accepted
+      - lastTransitionTime: "2026-07-05T14:00:00Z"
+        message: Resolved all the Object references for the Route
+        observedGeneration: 1
+        reason: ResolvedRefs
+        status: "True"
+        type: ResolvedRefs
+      controllerName: gateway.envoyproxy.io/gatewayclass-controller
+      parentRef:
+        group: gateway.networking.k8s.io
+        kind: Gateway
+        name: aibrix-eg
+        namespace: aibrix-system
+- apiVersion: gateway.networking.k8s.io/v1
+  kind: HTTPRoute
+  metadata:
+    creationTimestamp: "2026-07-05T13:59:33Z"
+    generation: 1
+    name: dsllama-8b-router
+    namespace: aibrix-system
+    resourceVersion: "192931233"
+    uid: 7b4834e9-179a-4c23-a76b-7adf6308634a
+  spec:
+    parentRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: aibrix-eg
+      namespace: aibrix-system
+    rules:
+    - backendRefs:
+      - group: ""
+        kind: Service
+        name: dsllama-8b
+        namespace: default
+        port: 8000
+        weight: 1
+      matches:
+      - headers:
+        - name: model
+          type: Exact
+          value: dsllama-8b
+        path:
+          type: PathPrefix
+          value: /v1/completions
+      - headers:
+        - name: model
+          type: Exact
+          value: dsllama-8b
+        path:
+          type: PathPrefix
+          value: /v1/chat/completions
+      - headers:
+        - name: model
+          type: Exact
+          value: dsllama-8b
+        path:
+          type: PathPrefix
+          value: /v1/embeddings
+      - headers:
+        - name: model
+          type: Exact
+          value: dsllama-8b
+        path:
+          type: PathPrefix
+          value: /generate
+      - headers:
+        - name: model
+          type: Exact
+          value: dsllama-8b
+        path:
+          type: PathPrefix
+          value: /generatevideo
+      timeouts:
+        request: 600s
+  status:
+    parents:
+    - conditions:
+      - lastTransitionTime: "2026-07-05T14:02:02Z"
+        message: Route is accepted
+        observedGeneration: 1
+        reason: Accepted
+        status: "True"
+        type: Accepted
+      - lastTransitionTime: "2026-07-05T14:02:02Z"
+        message: Resolved all the Object references for the Route
+        observedGeneration: 1
+        reason: ResolvedRefs
+        status: "True"
+        type: ResolvedRefs
+      controllerName: gateway.envoyproxy.io/gatewayclass-controller
+      parentRef:
+        group: gateway.networking.k8s.io
+        kind: Gateway
+        name: aibrix-eg
+        namespace: aibrix-system
+- apiVersion: gateway.networking.k8s.io/v1
+  kind: HTTPRoute
+  metadata:
+    annotations:
+      kubectl.kubernetes.io/last-applied-configuration: |
+        {"apiVersion":"gateway.networking.k8s.io/v1","kind":"HTTPRoute","metadata":{"annotations":{},"name":"dsqwen-14b-router","namespace":"aibrix-system"},"spec":{"parentRefs":[{"group":"gateway.networking.k8s.io","kind":"Gateway","name":"aibrix-eg","namespace":"aibrix-system"}],"rules":[{"backendRefs":[{"group":"","kind":"Service","name":"dsqwen-14b","namespace":"default","port":8000,"weight":1}],"matches":[{"headers":[{"name":"model","type":"Exact","value":"dsqwen-14b"}],"path":{"type":"PathPrefix","value":"/v1/completions"}},{"headers":[{"name":"model","type":"Exact","value":"dsqwen-14b"}],"path":{"type":"PathPrefix","value":"/v1/chat/completions"}},{"headers":[{"name":"model","type":"Exact","value":"dsqwen-14b"}],"path":{"type":"PathPrefix","value":"/v1/embeddings"}},{"headers":[{"name":"model","type":"Exact","value":"dsqwen-14b"}],"path":{"type":"PathPrefix","value":"/generate"}},{"headers":[{"name":"model","type":"Exact","value":"dsqwen-14b"}],"path":{"type":"PathPrefix","value":"/generatevideo"}}],"timeouts":{"request":"600s"}}]}}
+    creationTimestamp: "2026-07-05T13:56:49Z"
+    generation: 1
+    name: dsqwen-14b-router
+    namespace: aibrix-system
+    resourceVersion: "192930324"
+    uid: 80320a10-8178-46b9-9f6d-9ea362d284a7
+  spec:
+    parentRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: aibrix-eg
+      namespace: aibrix-system
+    rules:
+    - backendRefs:
+      - group: ""
+        kind: Service
+        name: dsqwen-14b
+        namespace: default
+        port: 8000
+        weight: 1
+      matches:
+      - headers:
+        - name: model
+          type: Exact
+          value: dsqwen-14b
+        path:
+          type: PathPrefix
+          value: /v1/completions
+      - headers:
+        - name: model
+          type: Exact
+          value: dsqwen-14b
+        path:
+          type: PathPrefix
+          value: /v1/chat/completions
+      - headers:
+        - name: model
+          type: Exact
+          value: dsqwen-14b
+        path:
+          type: PathPrefix
+          value: /v1/embeddings
+      - headers:
+        - name: model
+          type: Exact
+          value: dsqwen-14b
+        path:
+          type: PathPrefix
+          value: /generate
+      - headers:
+        - name: model
+          type: Exact
+          value: dsqwen-14b
+        path:
+          type: PathPrefix
+          value: /generatevideo
+      timeouts:
+        request: 600s
+  status:
+    parents:
+    - conditions:
+      - lastTransitionTime: "2026-07-05T13:59:18Z"
+        message: Route is accepted
+        observedGeneration: 1
+        reason: Accepted
+        status: "True"
+        type: Accepted
+      - lastTransitionTime: "2026-07-05T13:59:18Z"
+        message: Resolved all the Object references for the Route
+        observedGeneration: 1
+        reason: ResolvedRefs
+        status: "True"
+        type: ResolvedRefs
+      controllerName: gateway.envoyproxy.io/gatewayclass-controller
+      parentRef:
+        group: gateway.networking.k8s.io
+        kind: Gateway
+        name: aibrix-eg
+        namespace: aibrix-system
+kind: List
+metadata:
+  resourceVersion: ""

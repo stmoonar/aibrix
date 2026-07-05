@@ -1,0 +1,1 @@
+deployment.apps/dsqwen-7b-nscc-ds-4a100-node10-gpu-2 created

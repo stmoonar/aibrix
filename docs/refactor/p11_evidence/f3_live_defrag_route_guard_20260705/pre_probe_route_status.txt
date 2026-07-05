@@ -1,0 +1,3 @@
+dsqwen-7b-router    True
+dsllama-8b-router   True
+dsqwen-14b-router   True
