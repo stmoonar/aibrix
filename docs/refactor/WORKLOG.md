@@ -1039,3 +1039,36 @@
 ### Endgame F1 Next
 
 - Complete F1.2 by restoring the missing `dsqwen-7b` GPU1/GPU2 Deployments in sequence and recording clean reconcile/GPU truth.
+
+### Endgame F1.2 Full Topology Restoration
+
+- Repaired live service-manager metadata drift before restoring topology:
+  - `PUT /v2/models/dsllama-8b/target {"wake_replicas":1}` corrected the stale routable label on the sleeping GPU2 pod.
+  - `PUT /v2/models/dsqwen-14b/target {"wake_replicas":1}` slept node10 GPU2-3.
+  - The node9 GPU2-3 14B pod was already `/is_sleeping=true` but lacked complete TRE sleep metadata, so it was patched to `tre.aibrix.io/state=sleeping` and `tre.aibrix.io/routable=false`.
+  - A follow-up `POST /v2/reconcile` returned no warnings.
+- Restored `dsqwen-7b` GPU2:
+  - A first direct recreate failed during vLLM sampler warm-up with CUDA OOM: qwen needed another `150 MiB` while only about `76 MiB` was free with dsllama+14B sleeping residue on GPU2.
+  - Deleted the failed qwen GPU2 Deployment and temporarily deleted `dsqwen-14b` node9 GPU2-3 to free cold-start headroom.
+  - Recreated qwen GPU2, waited for `/is_sleeping=false`, reconciled, and used `PUT /v2/models/dsqwen-7b/target {"wake_replicas":1}` to sleep it.
+  - Recreated 14B node9 GPU2-3, waited for `/is_sleeping=false`, reconciled, and used `PUT /v2/models/dsqwen-14b/target {"wake_replicas":1}` to sleep it.
+- Restored `dsqwen-7b` GPU1:
+  - First slept all dsllama replicas with `PUT /v2/models/dsllama-8b/target {"wake_replicas":0}`.
+  - A direct qwen GPU1 recreate still failed with the same 150 MiB sampler warm-up OOM because 14B node9 GPU0-1 sleeping residue remained on GPU1.
+  - Deleted the failed qwen GPU1 Deployment and temporarily deleted `dsqwen-14b` node9 GPU0-1.
+  - Recreated qwen GPU1, waited for `/is_sleeping=false`, reconciled, slept qwen back to target 1, then temporarily slept qwen target 0 to free GPU0/GPU1 for 14B cold start.
+  - Recreated 14B node9 GPU0-1, waited for `/is_sleeping=false`, reconciled, slept 14B back to target 1, then restored qwen target 1 and dsllama target 1.
+- Final F1.2 evidence directory: `docs/refactor/p11_evidence/f1_restore_20260705/`.
+  - `sm_state.json`: `dsqwen-7b`, `dsllama-8b`, and `dsqwen-14b` are each `awake=1`, `bound=4`.
+  - `reconcile.json`: version `241`, `warnings=[]`.
+  - `probe_sleeping.txt`: all sleeping pods have `routable=false`; only the three awake pods have `routable=true`.
+  - `node9_gpu_memory.txt`: node9 GPU memory is explainable by one awake qwen on GPU0, one awake dsllama on GPU1, and sleeping residue on all co-resident pods.
+  - `gateway_smoke_20x3.jsonl`: gateway smoke passed with 20/20 requests and 0 errors for `dsqwen-7b`, `dsllama-8b`, and `dsqwen-14b`.
+- Final endpoints:
+  - `dsqwen-7b -> 10.244.3.53:8000`
+  - `dsllama-8b -> 10.244.3.57:8000`
+  - `dsqwen-14b -> 10.244.0.163:8000`
+
+### Endgame F1 Next
+
+- Proceed to F1.3 GPU truth provider and D8/D10 enforcement using TDD.

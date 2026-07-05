@@ -1,0 +1,50 @@
+NAME                                                      READY   UP-TO-DATE   AVAILABLE   AGE     CONTAINERS    IMAGES                          SELECTOR
+deployment.apps/dsllama-8b-nscc-ds-4a100-node9-gpu-0      1/1     1            1           5h11m   vllm-openai   vllm/vllm-openai:0.10.1-sleep   app=dsllama-8b-nscc-ds-4a100-node9-gpu-0
+deployment.apps/dsllama-8b-nscc-ds-4a100-node9-gpu-1      1/1     1            1           4h23m   vllm-openai   vllm/vllm-openai:0.10.1-sleep   app=dsllama-8b-nscc-ds-4a100-node9-gpu-1
+deployment.apps/dsllama-8b-nscc-ds-4a100-node9-gpu-2      1/1     1            1           84m     vllm-openai   vllm/vllm-openai:0.10.1-sleep   app=dsllama-8b-nscc-ds-4a100-node9-gpu-2
+deployment.apps/dsllama-8b-nscc-ds-4a100-node9-gpu-3      1/1     1            1           4h19m   vllm-openai   vllm/vllm-openai:0.10.1-sleep   app=dsllama-8b-nscc-ds-4a100-node9-gpu-3
+deployment.apps/dsqwen-14b-nscc-ds-4a100-node10-gpu-0-1   1/1     1            1           4h17m   vllm-openai   vllm/vllm-openai:0.10.1-sleep   app=dsqwen-14b-nscc-ds-4a100-node10-gpu-0-1
+deployment.apps/dsqwen-14b-nscc-ds-4a100-node10-gpu-2-3   1/1     1            1           4h15m   vllm-openai   vllm/vllm-openai:0.10.1-sleep   app=dsqwen-14b-nscc-ds-4a100-node10-gpu-2-3
+deployment.apps/dsqwen-14b-nscc-ds-4a100-node9-gpu-0-1    1/1     1            1           4m43s   vllm-openai   vllm/vllm-openai:0.10.1-sleep   app=dsqwen-14b-nscc-ds-4a100-node9-gpu-0-1
+deployment.apps/dsqwen-14b-nscc-ds-4a100-node9-gpu-2-3    1/1     1            1           20m     vllm-openai   vllm/vllm-openai:0.10.1-sleep   app=dsqwen-14b-nscc-ds-4a100-node9-gpu-2-3
+deployment.apps/dsqwen-7b-nscc-ds-4a100-node9-gpu-0       1/1     1            1           25h     vllm-openai   vllm/vllm-openai:0.10.1-sleep   app=dsqwen-7b-nscc-ds-4a100-node9-gpu-0
+deployment.apps/dsqwen-7b-nscc-ds-4a100-node9-gpu-1       1/1     1            1           7m8s    vllm-openai   vllm/vllm-openai:0.10.1-sleep   app=dsqwen-7b-nscc-ds-4a100-node9-gpu-1
+deployment.apps/dsqwen-7b-nscc-ds-4a100-node9-gpu-2       1/1     1            1           22m     vllm-openai   vllm/vllm-openai:0.10.1-sleep   app=dsqwen-7b-nscc-ds-4a100-node9-gpu-2
+deployment.apps/dsqwen-7b-nscc-ds-4a100-node9-gpu-3       1/1     1            1           4h25m   vllm-openai   vllm/vllm-openai:0.10.1-sleep   app=dsqwen-7b-nscc-ds-4a100-node9-gpu-3
+
+NAME                                                           READY   STATUS    RESTARTS       AGE     IP             NODE                   NOMINATED NODE   READINESS GATES
+pod/dsllama-8b-nscc-ds-4a100-node9-gpu-0-6cbf96cdf5-2lvgv      1/1     Running   0              5h11m   10.244.3.52    nscc-ds-4a100-node9    <none>           <none>
+pod/dsllama-8b-nscc-ds-4a100-node9-gpu-1-5579b75f9b-kh5fx      1/1     Running   0              4h23m   10.244.3.57    nscc-ds-4a100-node9    <none>           <none>
+pod/dsllama-8b-nscc-ds-4a100-node9-gpu-2-6774997cb5-4sfmh      1/1     Running   0              84m     10.244.3.66    nscc-ds-4a100-node9    <none>           <none>
+pod/dsllama-8b-nscc-ds-4a100-node9-gpu-3-6bf484f758-8v5fz      1/1     Running   0              4h19m   10.244.3.59    nscc-ds-4a100-node9    <none>           <none>
+pod/dsqwen-14b-nscc-ds-4a100-node10-gpu-0-1-77d5997485-nc6nv   1/1     Running   0              4h17m   10.244.0.163   nscc-ds-4a100-node10   <none>           <none>
+pod/dsqwen-14b-nscc-ds-4a100-node10-gpu-2-3-66f57f5575-6dtl7   1/1     Running   0              4h15m   10.244.0.164   nscc-ds-4a100-node10   <none>           <none>
+pod/dsqwen-14b-nscc-ds-4a100-node9-gpu-0-1-7b8c77ddc5-hw9zp    1/1     Running   0              4m43s   10.244.3.73    nscc-ds-4a100-node9    <none>           <none>
+pod/dsqwen-14b-nscc-ds-4a100-node9-gpu-2-3-84f8576d97-gk76w    1/1     Running   0              20m     10.244.3.70    nscc-ds-4a100-node9    <none>           <none>
+pod/dsqwen-7b-nscc-ds-4a100-node9-gpu-0-79b869c66b-cndx7       1/1     Running   5 (5h4m ago)   5h11m   10.244.3.53    nscc-ds-4a100-node9    <none>           <none>
+pod/dsqwen-7b-nscc-ds-4a100-node9-gpu-1-76cf6689c9-qbd4d       1/1     Running   0              7m8s    10.244.3.72    nscc-ds-4a100-node9    <none>           <none>
+pod/dsqwen-7b-nscc-ds-4a100-node9-gpu-2-7fc65f475b-bq7hm       1/1     Running   0              22m     10.244.3.69    nscc-ds-4a100-node9    <none>           <none>
+pod/dsqwen-7b-nscc-ds-4a100-node9-gpu-3-86c8574f65-g8c4g       1/1     Running   0              4h25m   10.244.3.56    nscc-ds-4a100-node9    <none>           <none>
+
+NAME                       ENDPOINTS             AGE
+endpoints/dsllama-8b       10.244.3.57:8000      5h11m
+endpoints/dsqwen-14b       10.244.0.163:8000     18h
+endpoints/dsqwen-7b        10.244.3.53:8000      24h
+endpoints/kubernetes       192.168.223.76:6443   436d
+endpoints/lxtdsqwen-14b    <none>                198d
+endpoints/lxtdsqwen-30b    <none>                197d
+endpoints/lxtdsqwen-32b    <none>                198d
+endpoints/lxtdsqwen-7b     <none>                198d
+endpoints/lxtllama-13b     <none>                193d
+endpoints/lxtllama-8b-2    <none>                169d
+endpoints/lxtllama-8b-3    <none>                159d
+endpoints/lxtmodela        <none>                52d
+endpoints/lxtmodelb        <none>                52d
+endpoints/lxtmodelc        <none>                52d
+endpoints/lxtqwen3-1-7b    <none>                198d
+endpoints/lxtqwen3-13b     <none>                193d
+endpoints/lxtqwen3-14b     <none>                198d
+endpoints/lxtqwen3-30b     <none>                169d
+endpoints/lxtqwen3-30b-2   <none>                169d
+endpoints/lxtqwen3-4b      <none>                194d
+endpoints/lxtqwen3-8b-t2   <none>                194d

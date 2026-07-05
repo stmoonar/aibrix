@@ -396,4 +396,45 @@ Current interpretation:
 - `sleep?level=2` did not reduce residue versus level 1 in these tests.
 - D8 remains appropriate as detection + hygiene recreate; the 12h soak should record future leak frequency rather than requiring leak absence.
 
+## Endgame F1.2 Full Topology Restoration
+
+Status: **PASS**
+
+Evidence directory: `docs/refactor/p11_evidence/f1_restore_20260705/`.
+
+Final topology and state:
+
+- `dsqwen-7b`: `awake=1`, `bound=4`.
+- `dsllama-8b`: `awake=1`, `bound=4`.
+- `dsqwen-14b`: `awake=1`, `bound=4`.
+- `POST /v2/reconcile` returned `warnings=[]` at state version `241`.
+- Final routable endpoints:
+  - `dsqwen-7b -> 10.244.3.53:8000`
+  - `dsllama-8b -> 10.244.3.57:8000`
+  - `dsqwen-14b -> 10.244.0.163:8000`
+
+Restoration notes:
+
+- Before restoring missing qwen slots, stale metadata was repaired so routable labels matched actual `/is_sleeping` state.
+- `dsqwen-7b` GPU2 could not cold-start while both dsllama and 14B sleeping residue were present on GPU2; vLLM sampler warm-up failed needing `150 MiB` with only about `76 MiB` free. Temporarily deleting 14B node9 GPU2-3 provided enough headroom, after which qwen GPU2 was created, verified awake, and slept cleanly.
+- `dsqwen-7b` GPU1 required the same headroom discipline. Sleeping dsllama was not enough because 14B node9 GPU0-1 residue still occupied GPU1; temporarily deleting 14B node9 GPU0-1 allowed qwen GPU1 to cold-start and then sleep cleanly.
+- 14B node9 GPU0-1 was restored after temporarily sleeping qwen target 0, then 14B was slept back to target 1 and qwen/dsllama were restored to one awake replica each.
+- These manual steps are the human version of D10: create requires startup headroom, not only final steady-state residue fit.
+
+Final GPU truth:
+
+- `probe_sleeping.txt` shows all sleeping pods have `routable=false`, and only the three awake pods have `routable=true`.
+- `node9_gpu_memory.txt` shows steady memory is explainable:
+  - GPU0: awake `dsqwen-7b` plus dsllama/14B sleeping residue, about `39908 MiB`.
+  - GPU1: awake `dsllama-8b` plus qwen/14B sleeping residue, about `39916 MiB`.
+  - GPU2/GPU3: only sleeping residues, about `4070 MiB` each.
+
+Gateway smoke:
+
+- `gateway_smoke_20x3.jsonl` passed with 20/20 requests and 0 errors for every model.
+- Observed max latencies in the saved run:
+  - `dsqwen-7b`: `37.04 ms`
+  - `dsllama-8b`: `30.72 ms`
+  - `dsqwen-14b`: `30.67 ms`
+
 No `n4-done` tag has been created.
