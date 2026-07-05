@@ -1622,3 +1622,10 @@
 - Verification:
   - focused tests passed: `41 passed`.
   - full `cd tre && make check`: `264 passed`.
+- Built the route-guard service-manager image and prepared rollout:
+  - image: `tre-v2-service-manager:20260705-f6dce214`
+  - image id: `sha256:853929dbd5f0d3eaef24f092ce660cad8b35308cb63c0564bfe8f12f3823fce5`
+  - in-image route guard focused tests: `41 passed`, 1 warning.
+  - overlay/test image pin updated away from
+    `tre-v2-service-manager:20260705-46613bfb`.
+  - full `cd tre && make check`: `264 passed`.
