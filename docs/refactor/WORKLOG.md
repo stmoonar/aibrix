@@ -1221,3 +1221,33 @@
 
 - Run full `cd tre && make check`, then commit F2.3 if green.
 - Continue golden protection/rollout validation from the endgame plan.
+
+### Endgame F2.4 Controller Image And Precheck Script Prep
+
+- Built controller image on node10:
+  - tag: `tre-v2-controller:20260705-7bfb0709`
+  - image id: `sha256:f2bda68a49a0319ebbeddaf5c8c4424b462b28d57f3f24bb5dd42b6c1bcc203c`
+  - source code commit: `7bfb0709`
+- Verified inside the image:
+  - `python -m pytest -q controller/tests/test_config.py controller/tests/test_metrics_store.py controller/tests/test_trs_signals.py controller/tests/test_planner.py controller/tests/test_loop_ticks.py`
+  - result: `67 passed`.
+- Collected `/tmp/n4b_three_model_precheck.py` into
+  `tre/deploy/scripts/n4b_three_model_precheck.py` per the endgame rule that
+  useful scripts must not live only in `/tmp`.
+- Parameterized the precheck script:
+  - `--gateway-url` / `N4B_GATEWAY_URL`
+  - `--service-manager-url` / `N4B_SERVICE_MANAGER_URL`
+  - `--models` / `N4B_MODELS`
+  - duration, phase, workers, max tokens, sample interval, and request timeout.
+- Added deploy tests for model parsing, argument overrides, and latency summary.
+  The latency p95 was aligned with the existing E1 probe nearest-rank behavior.
+- Updated the tre-v2 controller overlay to pin
+  `tre-v2-controller:20260705-7bfb0709`; no `latest` tag introduced.
+- Verification so far:
+  - precheck/E1 script focused tests: `8 passed`.
+  - deploy tests: `27 passed`.
+
+### Endgame F2 Next
+
+- Run full `cd tre && make check`, commit the image/overlay/precheck prep, then
+  roll the controller and execute the 15-minute zm precheck.
