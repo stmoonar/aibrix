@@ -42,6 +42,7 @@ class ControllerConfig:
     instant_sample_interval_ms: int
     percentile_mode: str
     signal_source: str
+    paper_stale_max_windows: int
     enable_tre_scaling: bool
     ablation_disable_fast_loop: bool
     ablation_disable_safescale: bool
@@ -103,6 +104,7 @@ class ControllerConfig:
             instant_sample_interval_ms=_get_positive_int(values, "TRE_INSTANT_SAMPLE_INTERVAL_MS", 5_000),
             percentile_mode=percentile_mode,
             signal_source=signal_source,
+            paper_stale_max_windows=_get_positive_int(values, "TRE_PAPER_STALE_MAX_WINDOWS", 3),
             enable_tre_scaling=_get_bool(values, "ENABLE_TRE_SCALING", True),
             ablation_disable_fast_loop=_get_bool(values, "TRE_ABLATION_DISABLE_FAST_LOOP", False),
             ablation_disable_safescale=_get_bool(values, "TRE_ABLATION_DISABLE_SAFESCALE", False),

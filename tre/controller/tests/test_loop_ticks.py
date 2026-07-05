@@ -4,6 +4,7 @@ from tre_common.metrics_schema import MetricsSnapshot, ModelWindowMetrics, PodWi
 from tre_common.registry import ClusterTopology, ModelSpec, NodeSpec, Registry, SloSpec, TrsParams
 from tre_controller.loops.fairness_task import run_fairness_tick
 from tre_controller.loops.rescue_task import run_rescue_tick
+from tre_controller.loops.tick import PaperStateCache
 from tre_controller.config import SafeScaleConfig
 from tre_controller.planning.planner import HideAction, ScaleAction
 from tre_controller.planning.safescale import SafeScaleStateMachine
@@ -55,7 +56,7 @@ def _registry() -> Registry:
 def _metrics(
     model: str,
     *,
-    generation: float,
+    generation: float | None,
     waiting: float,
     running: float,
     assigned: int = 1,
@@ -189,6 +190,51 @@ def test_rescue_tick_submits_critical_scale_action_from_snapshot_metrics() -> No
     assert action.model == "critical"
     assert action.delta == 1
     assert action.source_loop == "rescue"
+
+
+def test_rescue_tick_holds_previous_paper_state_when_tokens_are_missing_for_one_window() -> None:
+    queue = FakeQueue()
+    cache = PaperStateCache(max_stale_windows=3)
+    first = MetricsSnapshot(
+        ts_ms=1,
+        stale=False,
+        models={"critical": _metrics("critical", generation=50.0, waiting=10.0, running=1.0, assigned=2)},
+    )
+    second = MetricsSnapshot(
+        ts_ms=2,
+        stale=False,
+        models={"critical": _metrics("critical", generation=None, waiting=10.0, running=1.0, assigned=2)},
+    )
+
+    run_rescue_tick(first, queue=queue, registry=_registry(), paper_state_cache=cache)
+    result = run_rescue_tick(second, queue=queue, registry=_registry(), paper_state_cache=cache)
+
+    assert "paper_state_stale_hold:critical" in result.events
+    assert result.submitted == 1
+    assert isinstance(queue.submitted[-1][0], ScaleAction)
+
+
+def test_rescue_tick_marks_paper_state_unknown_after_stale_hold_limit() -> None:
+    queue = FakeQueue()
+    cache = PaperStateCache(max_stale_windows=1)
+    first = MetricsSnapshot(
+        ts_ms=1,
+        stale=False,
+        models={"critical": _metrics("critical", generation=50.0, waiting=10.0, running=1.0, assigned=2)},
+    )
+    missing = MetricsSnapshot(
+        ts_ms=2,
+        stale=False,
+        models={"critical": _metrics("critical", generation=None, waiting=10.0, running=1.0, assigned=2)},
+    )
+
+    run_rescue_tick(first, queue=queue, registry=_registry(), paper_state_cache=cache)
+    held = run_rescue_tick(missing, queue=queue, registry=_registry(), paper_state_cache=cache)
+    expired = run_rescue_tick(missing, queue=queue, registry=_registry(), paper_state_cache=cache)
+
+    assert "paper_state_stale_hold:critical" in held.events
+    assert "paper_state_stale_unknown:critical" in expired.events
+    assert expired.submitted == 0
 
 
 def test_rescue_tick_converts_safescale_required_downscale_to_probe_hide() -> None:

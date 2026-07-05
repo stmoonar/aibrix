@@ -5,7 +5,7 @@ from typing import Awaitable, Callable, Protocol
 
 from tre_common.metrics_schema import MetricsSnapshot
 from tre_common.registry import Registry
-from tre_controller.loops.tick import LoopTickResult, PlannerQueue, SafeScaleController, run_planner_tick
+from tre_controller.loops.tick import LoopTickResult, PaperStateCache, PlannerQueue, SafeScaleController, run_planner_tick
 from tre_controller.planning.planner import ClusterView
 
 
@@ -34,6 +34,7 @@ def run_fairness_tick(
     active_probe_models: set[str] | None = None,
     signal_source: str = "zm",
     safescale: SafeScaleController | None = None,
+    paper_state_cache: PaperStateCache | None = None,
 ) -> LoopTickResult:
     return run_planner_tick(
         snapshot,
@@ -45,6 +46,7 @@ def run_fairness_tick(
         active_probe_models=active_probe_models,
         signal_source=signal_source,
         safescale=safescale,
+        paper_state_cache=paper_state_cache,
     )
 
 
@@ -61,6 +63,7 @@ async def fairness_task(
     decision_writer: DecisionWriter | None = None,
     safescale: SafeScaleController | None = None,
 ) -> None:
+    paper_state_cache = PaperStateCache(max_stale_windows=getattr(cfg, "paper_stale_max_windows", 3))
     while True:
         snapshot = snapshot_box.get()
         if snapshot is not None:
@@ -76,6 +79,7 @@ async def fairness_task(
                     active_probe_models=active_probe_models,
                     signal_source=getattr(cfg, "signal_source", "zm"),
                     safescale=safescale,
+                    paper_state_cache=paper_state_cache,
                 )
             if decision_writer is not None:
                 decision_writer.write("fairness", snapshot, result)

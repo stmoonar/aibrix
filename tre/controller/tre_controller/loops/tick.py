@@ -36,6 +36,38 @@ class LoopTickResult:
     events: tuple[str, ...] = ()
 
 
+@dataclass
+class _PaperState:
+    context: dict
+    stale_windows: int = 0
+
+
+class PaperStateCache:
+    def __init__(self, *, max_stale_windows: int = 3) -> None:
+        self.max_stale_windows = max(0, int(max_stale_windows))
+        self._by_model: dict[str, _PaperState] = {}
+
+    def apply(self, model_name: str, context: dict, *, tokens_available: bool) -> tuple[dict, tuple[str, ...]]:
+        if tokens_available:
+            self._by_model[model_name] = _PaperState(dict(context), stale_windows=0)
+            return context, ()
+
+        previous = self._by_model.get(model_name)
+        if previous is None:
+            return context, (f"paper_state_stale_unknown:{model_name}",)
+        previous.stale_windows += 1
+        if previous.stale_windows > self.max_stale_windows:
+            return context, (f"paper_state_stale_unknown:{model_name}",)
+        held = dict(previous.context)
+        held.update(
+            {
+                "routable_pods": context.get("routable_pods", held.get("routable_pods", 0)),
+                "assigned_replicas": context.get("assigned_replicas", held.get("assigned_replicas", 0)),
+            }
+        )
+        return held, (f"paper_state_stale_hold:{model_name}",)
+
+
 def run_planner_tick(
     snapshot: MetricsSnapshot,
     *,
@@ -47,11 +79,18 @@ def run_planner_tick(
     active_probe_models: set[str] | None = None,
     signal_source: str = "zm",
     safescale: SafeScaleController | None = None,
+    paper_state_cache: PaperStateCache | None = None,
 ) -> LoopTickResult:
     if snapshot.stale:
         return LoopTickResult(submitted=0, events=("snapshot_stale",))
 
-    contexts = _model_contexts(snapshot, registry, signal_source=signal_source, cluster_view=cluster_view)
+    contexts, paper_events = _model_contexts(
+        snapshot,
+        registry,
+        signal_source=signal_source,
+        cluster_view=cluster_view,
+        paper_state_cache=paper_state_cache,
+    )
     classifications = classify_all_models(contexts)
     replicas = {model: int(ctx.get("assigned_replicas", 0)) for model, ctx in contexts.items()}
     cfg = PlanConfig(
@@ -76,7 +115,7 @@ def run_planner_tick(
     actions, safescale_events = _apply_safescale(snapshot, tuple(plan.actions), plan.probe_upscale_plans, safescale=safescale)
     if actions:
         queue.submit(actions)
-    return LoopTickResult(submitted=len(actions), actions=actions, events=tuple(plan.events) + safescale_events)
+    return LoopTickResult(submitted=len(actions), actions=actions, events=paper_events + tuple(plan.events) + safescale_events)
 
 
 def _apply_safescale(
@@ -168,8 +207,10 @@ def _model_contexts(
     *,
     signal_source: str = "zm",
     cluster_view: ClusterView | None = None,
-) -> dict[str, dict]:
+    paper_state_cache: PaperStateCache | None = None,
+) -> tuple[dict[str, dict], tuple[str, ...]]:
     contexts: dict[str, dict] = {}
+    events: list[str] = []
     cluster_counts = _cluster_view_counts(cluster_view)
     for model_name, metrics in snapshot.models.items():
         spec = registry.model(model_name)
@@ -179,26 +220,50 @@ def _model_contexts(
             awake_replicas, bound_replicas = counts
             assigned_replicas = bound_replicas
             metrics = replace(metrics, routable_pods=awake_replicas, assigned_replicas=awake_replicas)
-        result = TRSComputer(ema_alpha=spec.trs.ema_alpha).compute(TRSInput.from_metrics(metrics, spec.trs), theta_m=spec.trs.theta_m)
-        signal = get_signal(metrics, spec, signal_source, trs_z_m=result.Z_m)
-        contexts[model_name] = {
-            "trs": result.TRS,
-            "z_m": signal.z_m,
-            "signal_source": signal.source,
-            "signal_raw_value": signal.raw_value,
-            "signal_unavailable_reason": signal.unavailable_reason,
-            "trs_z_m": result.Z_m,
-            "eta_m": result.eta_m,
-            "theta_m": spec.trs.theta_m,
-            "Q": result.Q,
-            "Q_ctl": result.Q_ctl,
-            "Y_m": result.Y_m,
-            "y_m": result.y_m,
-            "routable_pods": metrics.routable_pods,
-            "assigned_replicas": assigned_replicas,
-            "is_saturated": result.Q_ctl >= spec.trs.qsat,
-        }
-    return contexts
+        tokens_available = metrics.prompt_tokens is not None and metrics.generation_tokens is not None
+        if tokens_available:
+            result = TRSComputer(ema_alpha=spec.trs.ema_alpha).compute(TRSInput.from_metrics(metrics, spec.trs), theta_m=spec.trs.theta_m)
+            signal = get_signal(metrics, spec, signal_source, trs_z_m=result.Z_m)
+            context = {
+                "trs": result.TRS,
+                "z_m": signal.z_m,
+                "signal_source": signal.source,
+                "signal_raw_value": signal.raw_value,
+                "signal_unavailable_reason": signal.unavailable_reason,
+                "trs_z_m": result.Z_m,
+                "eta_m": result.eta_m,
+                "theta_m": spec.trs.theta_m,
+                "Q": result.Q,
+                "Q_ctl": result.Q_ctl,
+                "Y_m": result.Y_m,
+                "y_m": result.y_m,
+                "routable_pods": metrics.routable_pods,
+                "assigned_replicas": assigned_replicas,
+                "is_saturated": result.Q_ctl >= spec.trs.qsat,
+            }
+        else:
+            context = {
+                "trs": 0.0,
+                "z_m": None,
+                "signal_source": signal_source,
+                "signal_raw_value": None,
+                "signal_unavailable_reason": "tokens_missing",
+                "trs_z_m": None,
+                "eta_m": None,
+                "theta_m": spec.trs.theta_m,
+                "Q": metrics.avg_waiting * spec.trs.lambda_wait + metrics.avg_running + metrics.avg_swapping,
+                "Q_ctl": max(metrics.avg_waiting * spec.trs.lambda_wait + metrics.avg_running + metrics.avg_swapping, spec.trs.qmin),
+                "Y_m": None,
+                "y_m": None,
+                "routable_pods": metrics.routable_pods,
+                "assigned_replicas": assigned_replicas,
+                "is_saturated": False,
+            }
+        if paper_state_cache is not None:
+            context, model_events = paper_state_cache.apply(model_name, context, tokens_available=tokens_available)
+            events.extend(model_events)
+        contexts[model_name] = context
+    return contexts, tuple(events)
 
 
 def _cluster_view_counts(cluster_view: ClusterView | None) -> dict[str, tuple[int, int]]:

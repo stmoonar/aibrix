@@ -1151,3 +1151,35 @@
 ### Endgame F2 Next
 
 - Implement TRS/classification stale-hold and per-model planner drop policy.
+
+### Endgame F2.2 TRS/Classification Stale Hold
+
+- Added RED loop tests for token-missing windows after a valid paper-state window:
+  - a single missing-token window holds the previous paper state, emits
+    `paper_state_stale_hold:<model>`, and still allows the rescue scale action.
+  - once the hold limit is exceeded, the model emits
+    `paper_state_stale_unknown:<model>` and no scale action is submitted for that
+    model in the focused case.
+- Implemented `PaperStateCache` in the controller tick path:
+  - valid token windows refresh the cached model context and reset staleness.
+  - missing-token windows reuse the last complete context until the configured
+    stale limit is exceeded.
+  - live routable/assigned replica counts are refreshed on held contexts so the
+    planner still sees current topology.
+- Wired one persistent `PaperStateCache` per rescue/fairness async task. Focused
+  `run_*_tick` helpers accept an explicit cache for deterministic unit coverage.
+- Added `TRE_PAPER_STALE_MAX_WINDOWS` to `ControllerConfig`, default `3`, with
+  positive-int validation. Rescue/fairness tasks read the centralized config
+  field and keep the previous fallback for tests using small Protocol stubs.
+- Verification so far:
+  - RED config test failed as expected before implementation:
+    `AttributeError: 'ControllerConfig' object has no attribute 'paper_stale_max_windows'`.
+  - Focused loop/config tests: `34 passed`.
+  - Controller focused set
+    (`test_config.py`, `test_metrics_store.py`, `test_trs_signals.py`,
+    `test_planner.py`, `test_loop_ticks.py`): `64 passed`.
+
+### Endgame F2 Next
+
+- Run full `cd tre && make check`, then commit F2.2 if green.
+- Continue to F2.3 planner per-model incomplete drop policy.

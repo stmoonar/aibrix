@@ -20,6 +20,7 @@ def test_config_defaults_are_plan_aligned() -> None:
     assert config.instant_sample_interval_ms == 5_000
     assert config.percentile_mode == "bucket_upper"
     assert config.signal_source == "zm"
+    assert config.paper_stale_max_windows == 3
     assert config.enable_tre_scaling is True
     assert config.ablation_disable_fast_loop is False
     assert config.ablation_disable_safescale is False
@@ -40,6 +41,7 @@ def test_config_reads_centralized_environment_values() -> None:
             "TRE_INSTANT_SAMPLE_INTERVAL_MS": "2500",
             "TRE_PERCENTILE_MODE": "interpolated",
             "TRE_SIGNAL_SOURCE": "latency_p95",
+            "TRE_PAPER_STALE_MAX_WINDOWS": "5",
             "ENABLE_TRE_SCALING": "false",
             "TRE_ABLATION_DISABLE_FAST_LOOP": "1",
             "TRE_ABLATION_DISABLE_SAFESCALE": "yes",
@@ -58,6 +60,7 @@ def test_config_reads_centralized_environment_values() -> None:
     assert config.instant_sample_interval_ms == 2_500
     assert config.percentile_mode == "interpolated"
     assert config.signal_source == "latency_p95"
+    assert config.paper_stale_max_windows == 5
     assert config.enable_tre_scaling is False
     assert config.ablation_disable_fast_loop is True
     assert config.ablation_disable_safescale is True
@@ -136,3 +139,8 @@ def test_config_rejects_invalid_bool() -> None:
 def test_config_rejects_invalid_metrics_schema() -> None:
     with pytest.raises(ValueError, match="TRE_METRICS_SCHEMA"):
         ControllerConfig.from_env({"TRE_METRICS_SCHEMA": "legacy"})
+
+
+def test_config_rejects_invalid_paper_stale_window_limit() -> None:
+    with pytest.raises(ValueError, match="TRE_PAPER_STALE_MAX_WINDOWS"):
+        ControllerConfig.from_env({"TRE_PAPER_STALE_MAX_WINDOWS": "0"})
