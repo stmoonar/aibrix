@@ -1,0 +1,237 @@
+{
+  "duration_s": 116.587,
+  "defrag_result": {
+    "status": 200,
+    "body": {
+      "version": 267,
+      "migrations": [
+        {
+          "serve_id": "dsqwen-7b-nscc-ds-4a100-node10-gpu-2-5db6cd86c6-6trt5",
+          "from_slot": {
+            "node": "nscc-ds-4a100-node10",
+            "gpu_ids": [
+              2
+            ]
+          },
+          "to_slot": {
+            "node": "nscc-ds-4a100-node9",
+            "gpu_ids": [
+              3
+            ]
+          }
+        }
+      ],
+      "actions": [
+        {
+          "action": "hide",
+          "serve_id": "dsqwen-7b-nscc-ds-4a100-node10-gpu-2-5db6cd86c6-6trt5"
+        },
+        {
+          "action": "sleep",
+          "serve_id": "dsqwen-7b-nscc-ds-4a100-node10-gpu-2-5db6cd86c6-6trt5"
+        },
+        {
+          "action": "delete_deployment",
+          "serve_id": "dsqwen-7b-nscc-ds-4a100-node10-gpu-2-5db6cd86c6-6trt5"
+        },
+        {
+          "action": "create_deployment",
+          "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-3-86c8574f65-qjhwm",
+          "node": "nscc-ds-4a100-node9",
+          "gpu_ids": [
+            3
+          ]
+        },
+        {
+          "action": "wake",
+          "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-3-86c8574f65-qjhwm"
+        },
+        {
+          "action": "unhide",
+          "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-3-86c8574f65-qjhwm"
+        }
+      ]
+    }
+  },
+  "defrag_error": null,
+  "probe_counts": {
+    "dsqwen-7b": {
+      "ok": 2,
+      "errors": 130,
+      "status": {
+        "502": 130
+      },
+      "samples": [
+        {
+          "ts": 1783256798.6024528,
+          "status": 502,
+          "error": "HTTPError 502"
+        },
+        {
+          "ts": 1783256799.5911925,
+          "status": 502,
+          "error": "HTTPError 502"
+        },
+        {
+          "ts": 1783256800.595431,
+          "status": 502,
+          "error": "HTTPError 502"
+        },
+        {
+          "ts": 1783256801.6054277,
+          "status": 502,
+          "error": "HTTPError 502"
+        },
+        {
+          "ts": 1783256802.5965757,
+          "status": 502,
+          "error": "HTTPError 502"
+        },
+        {
+          "ts": 1783256803.5960782,
+          "status": 502,
+          "error": "HTTPError 502"
+        },
+        {
+          "ts": 1783256804.593265,
+          "status": 502,
+          "error": "HTTPError 502"
+        },
+        {
+          "ts": 1783256805.593278,
+          "status": 502,
+          "error": "HTTPError 502"
+        },
+        {
+          "ts": 1783256806.5957446,
+          "status": 502,
+          "error": "HTTPError 502"
+        },
+        {
+          "ts": 1783256807.5909169,
+          "status": 502,
+          "error": "HTTPError 502"
+        }
+      ]
+    },
+    "dsllama-8b": {
+      "ok": 2,
+      "errors": 130,
+      "status": {
+        "502": 130
+      },
+      "samples": [
+        {
+          "ts": 1783256798.6032383,
+          "status": 502,
+          "error": "HTTPError 502"
+        },
+        {
+          "ts": 1783256799.5912654,
+          "status": 502,
+          "error": "HTTPError 502"
+        },
+        {
+          "ts": 1783256800.5912175,
+          "status": 502,
+          "error": "HTTPError 502"
+        },
+        {
+          "ts": 1783256801.6055083,
+          "status": 502,
+          "error": "HTTPError 502"
+        },
+        {
+          "ts": 1783256802.5966566,
+          "status": 502,
+          "error": "HTTPError 502"
+        },
+        {
+          "ts": 1783256803.5961592,
+          "status": 502,
+          "error": "HTTPError 502"
+        },
+        {
+          "ts": 1783256804.5931864,
+          "status": 502,
+          "error": "HTTPError 502"
+        },
+        {
+          "ts": 1783256805.5932043,
+          "status": 502,
+          "error": "HTTPError 502"
+        },
+        {
+          "ts": 1783256806.5910172,
+          "status": 502,
+          "error": "HTTPError 502"
+        },
+        {
+          "ts": 1783256807.590859,
+          "status": 502,
+          "error": "HTTPError 502"
+        }
+      ]
+    },
+    "dsqwen-14b": {
+      "ok": 0,
+      "errors": 132,
+      "status": {
+        "502": 130,
+        "503": 2
+      },
+      "samples": [
+        {
+          "ts": 1783256798.602517,
+          "status": 502,
+          "error": "HTTPError 502"
+        },
+        {
+          "ts": 1783256799.591799,
+          "status": 502,
+          "error": "HTTPError 502"
+        },
+        {
+          "ts": 1783256800.5955086,
+          "status": 502,
+          "error": "HTTPError 502"
+        },
+        {
+          "ts": 1783256801.5951943,
+          "status": 502,
+          "error": "HTTPError 502"
+        },
+        {
+          "ts": 1783256802.5964987,
+          "status": 502,
+          "error": "HTTPError 502"
+        },
+        {
+          "ts": 1783256803.5924048,
+          "status": 502,
+          "error": "HTTPError 502"
+        },
+        {
+          "ts": 1783256804.5923462,
+          "status": 502,
+          "error": "HTTPError 502"
+        },
+        {
+          "ts": 1783256805.5931375,
+          "status": 502,
+          "error": "HTTPError 502"
+        },
+        {
+          "ts": 1783256806.5963001,
+          "status": 502,
+          "error": "HTTPError 502"
+        },
+        {
+          "ts": 1783256807.607435,
+          "status": 502,
+          "error": "HTTPError 502"
+        }
+      ]
+    }
+  }
+}

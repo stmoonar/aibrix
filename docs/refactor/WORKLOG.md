@@ -1525,3 +1525,74 @@
 - F2.5 hygiene conclusion: D8 delete/recreate cured the post-scale-down qwen
   sleep leak and restored a clean 12-binding topology. Proceeding to commit
   F2.5 evidence after full `make check`, then F3 live defrag.
+
+### Endgame F3 Live Defrag Attempt - Route GC Blocker
+
+- Entered F3 live defrag with full topology clean and controller on
+  `tre-v2-controller:20260705-d795a715`.
+- Constructed a live fragmented topology without cold-starting on an awake GPU:
+  - paused controller
+  - deleted qwen node9 GPU3 and 14B node9 GPU2-3
+  - created temporary qwen node10 GPU2
+  - woke llama GPU2
+  - `SlotAllocator.find_slot(2)` returned `null`
+  - `plan_defrag(2)` preview moved qwen node10 GPU2 -> node9 GPU3
+  - sleeping 14B had no feasible wake slot before defrag
+- First `/v2/defrag` live call succeeded at the API/path level:
+  - action sequence: `hide`, `sleep`, `delete_deployment`,
+    `create_deployment`, `wake`, `unhide`
+  - post-defrag 14B node10 GPU2-3 became `feasible_wake=true`
+  - waking 14B to two replicas succeeded
+  - 14B gateway smoke after wake: `20/20`
+- The first probe script was invalid because it omitted the required HTTP
+  `model` header. This reproduced the old body-only 502 class and is not
+  counted as defrag evidence.
+- Retried with the correct `model` header. Defrag still succeeded, llama and
+  14B had zero probe errors, but qwen had `48/133` gateway `503` during the
+  migration window. Post-defrag qwen returned to `20/20`, so this was a
+  migration-window availability issue.
+- Root cause hypothesis: service-manager hid the source pod and immediately
+  slept/deleted it before Kubernetes Service/EndpointSlice and AIBrix gateway
+  routing had converged.
+- Added RED test requiring runtime defrag to wait for the source pod to leave
+  routable endpoints after `hide` and before `sleep`.
+- Implemented:
+  - `RuntimePodOps.wait_pod_unroutable(binding)`
+  - `K8sOps.wait_pod_unroutable()` polling
+    `model.aibrix.ai/name=<model>,tre.aibrix.io/routable=true`
+  - `ServiceManagerV2._execute_runtime_defrag_migration()` now waits after hide
+    before sleep/delete.
+- Verification:
+  - focused service-manager/controller tests passed.
+  - full `cd tre && make check`: `261 passed`.
+- Built and rolled service-manager:
+  - image: `tre-v2-service-manager:20260705-46613bfb`
+  - image id: `sha256:89f67902b350b7801ec6f213f204241abf942dd73973f2698f94a6324bfbc3fd`
+  - in-image tests: `30 passed`.
+- Retried F3 live defrag after the wait-unroutable fix. The SM defrag API still
+  succeeded, but the live gateway criterion still failed:
+  - qwen probe: `74 ok`, `53 errors`, including
+    `dsqwen-7b-router not found` and connection-refused 503s
+  - 14B probe: `127 errors`, including `dsqwen-14b-router not found`
+  - llama probe: `127 ok`, `0 errors`
+- New blocker: AIBrix model HTTPRoutes can disappear during TRE-managed model
+  delete/recreate even while model Services and direct Service traffic remain
+  healthy. This is the same route-GC class previously seen for qwen, now
+  reproduced for qwen and 14B during live defrag. Waiting for source
+  unroutable is necessary but insufficient.
+- Restored missing model HTTPRoutes idempotently for qwen/llama/14B, performed
+  D8 cleanup of affected node9 GPU2/GPU3 deployments, refreshed node9 GPU
+  truth, and returned the cluster to a clean state:
+  - service-manager image `tre-v2-service-manager:20260705-46613bfb`
+  - controller image `tre-v2-controller:20260705-d795a715`
+  - reconcile `warnings=[]`
+  - all three models `awake=1`, `bound=4`
+  - node9 GPU2/GPU3 each `4070 MiB`
+  - final gateway smoke: `20/20` for qwen, llama, and 14B
+- Controller is intentionally paused at the end of this attempt to avoid stale
+  defrag/smoke metrics causing immediate rescue scale-up again.
+- F3 conclusion: live defrag API and D10 headroom path are working, but N4.4
+  cannot be marked PASS because the required gateway zero-5xx invariant is
+  violated by AIBrix HTTPRoute GC during delete/recreate. Next work should
+  implement an idempotent "ensure model HTTPRoute exists and accepted" guard in
+  the TRE-managed model lifecycle before retrying F3.

@@ -1,0 +1,17 @@
+{
+  "dsqwen-7b": {
+    "ok": 20,
+    "errors": 0,
+    "samples": []
+  },
+  "dsllama-8b": {
+    "ok": 20,
+    "errors": 0,
+    "samples": []
+  },
+  "dsqwen-14b": {
+    "ok": 20,
+    "errors": 0,
+    "samples": []
+  }
+}

@@ -1,0 +1,184 @@
+{
+  "duration_s": 111.31,
+  "defrag_result": {
+    "status": 200,
+    "body": {
+      "version": 293,
+      "migrations": [
+        {
+          "serve_id": "dsqwen-7b-nscc-ds-4a100-node10-gpu-2-5db6cd86c6-w4hqg",
+          "from_slot": {
+            "node": "nscc-ds-4a100-node10",
+            "gpu_ids": [
+              2
+            ]
+          },
+          "to_slot": {
+            "node": "nscc-ds-4a100-node9",
+            "gpu_ids": [
+              3
+            ]
+          }
+        }
+      ],
+      "actions": [
+        {
+          "action": "hide",
+          "serve_id": "dsqwen-7b-nscc-ds-4a100-node10-gpu-2-5db6cd86c6-w4hqg"
+        },
+        {
+          "action": "sleep",
+          "serve_id": "dsqwen-7b-nscc-ds-4a100-node10-gpu-2-5db6cd86c6-w4hqg"
+        },
+        {
+          "action": "delete_deployment",
+          "serve_id": "dsqwen-7b-nscc-ds-4a100-node10-gpu-2-5db6cd86c6-w4hqg"
+        },
+        {
+          "action": "create_deployment",
+          "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-3-86c8574f65-22fst",
+          "node": "nscc-ds-4a100-node9",
+          "gpu_ids": [
+            3
+          ]
+        },
+        {
+          "action": "wake",
+          "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-3-86c8574f65-22fst"
+        },
+        {
+          "action": "unhide",
+          "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-3-86c8574f65-22fst"
+        }
+      ]
+    }
+  },
+  "defrag_error": null,
+  "probe_counts": {
+    "dsqwen-7b": {
+      "ok": 74,
+      "errors": 53,
+      "status": {
+        "503": 53
+      },
+      "samples": [
+        {
+          "ts": 1783259635.9421794,
+          "status": 503,
+          "error": "HTTPError 503: {\"error\":{\"code\":\"service_unavailable\",\"param\":null,\"message\":\"httproutes.gateway.networking.k8s.io \\\"dsqwen-7b-router\\\" not found\",\"type\":\"overloaded_error\"}}"
+        },
+        {
+          "ts": 1783259638.9374745,
+          "status": 503,
+          "error": "HTTPError 503: upstream connect error or disconnect/reset before headers. reset reason: remote connection failure, transport failure reason: delayed connect error: Connection refused"
+        },
+        {
+          "ts": 1783259642.9369864,
+          "status": 503,
+          "error": "HTTPError 503: upstream connect error or disconnect/reset before headers. reset reason: remote connection failure, transport failure reason: delayed connect error: Connection refused"
+        },
+        {
+          "ts": 1783259647.9370782,
+          "status": 503,
+          "error": "HTTPError 503: upstream connect error or disconnect/reset before headers. reset reason: remote connection failure, transport failure reason: delayed connect error: Connection refused"
+        },
+        {
+          "ts": 1783259648.9372067,
+          "status": 503,
+          "error": "HTTPError 503: upstream connect error or disconnect/reset before headers. reset reason: remote connection failure, transport failure reason: delayed connect error: Connection refused"
+        },
+        {
+          "ts": 1783259649.9377,
+          "status": 503,
+          "error": "HTTPError 503: upstream connect error or disconnect/reset before headers. reset reason: remote connection failure, transport failure reason: delayed connect error: Connection refused"
+        },
+        {
+          "ts": 1783259653.938014,
+          "status": 503,
+          "error": "HTTPError 503: upstream connect error or disconnect/reset before headers. reset reason: remote connection failure, transport failure reason: delayed connect error: Connection refused"
+        },
+        {
+          "ts": 1783259654.9382234,
+          "status": 503,
+          "error": "HTTPError 503: upstream connect error or disconnect/reset before headers. reset reason: remote connection failure, transport failure reason: delayed connect error: Connection refused"
+        },
+        {
+          "ts": 1783259655.937932,
+          "status": 503,
+          "error": "HTTPError 503: upstream connect error or disconnect/reset before headers. reset reason: remote connection failure, transport failure reason: delayed connect error: Connection refused"
+        },
+        {
+          "ts": 1783259656.9378178,
+          "status": 503,
+          "error": "HTTPError 503: upstream connect error or disconnect/reset before headers. reset reason: remote connection failure, transport failure reason: delayed connect error: Connection refused"
+        }
+      ]
+    },
+    "dsllama-8b": {
+      "ok": 127,
+      "errors": 0,
+      "status": {},
+      "samples": []
+    },
+    "dsqwen-14b": {
+      "ok": 0,
+      "errors": 127,
+      "status": {
+        "502": 117,
+        "503": 10
+      },
+      "samples": [
+        {
+          "ts": 1783259622.952283,
+          "status": 502,
+          "error": "HTTPError 502: upstream connect error or disconnect/reset before headers. reset reason: protocol error"
+        },
+        {
+          "ts": 1783259623.9408696,
+          "status": 502,
+          "error": "HTTPError 502: upstream connect error or disconnect/reset before headers. reset reason: protocol error"
+        },
+        {
+          "ts": 1783259624.9424047,
+          "status": 502,
+          "error": "HTTPError 502: upstream connect error or disconnect/reset before headers. reset reason: protocol error"
+        },
+        {
+          "ts": 1783259625.944709,
+          "status": 502,
+          "error": "HTTPError 502: upstream connect error or disconnect/reset before headers. reset reason: protocol error"
+        },
+        {
+          "ts": 1783259626.941119,
+          "status": 502,
+          "error": "HTTPError 502: upstream connect error or disconnect/reset before headers. reset reason: protocol error"
+        },
+        {
+          "ts": 1783259627.9473329,
+          "status": 502,
+          "error": "HTTPError 502: upstream connect error or disconnect/reset before headers. reset reason: protocol error"
+        },
+        {
+          "ts": 1783259628.9458783,
+          "status": 503,
+          "error": "HTTPError 503: {\"error\":{\"message\":\"httproutes.gateway.networking.k8s.io \\\"dsqwen-14b-router\\\" not found\",\"type\":\"overloaded_error\",\"code\":\"service_unavailable\",\"param\":null}}"
+        },
+        {
+          "ts": 1783259629.943812,
+          "status": 503,
+          "error": "HTTPError 503: {\"error\":{\"code\":\"service_unavailable\",\"param\":null,\"message\":\"httproutes.gateway.networking.k8s.io \\\"dsqwen-14b-router\\\" not found\",\"type\":\"overloaded_error\"}}"
+        },
+        {
+          "ts": 1783259630.9534147,
+          "status": 503,
+          "error": "HTTPError 503: {\"error\":{\"message\":\"httproutes.gateway.networking.k8s.io \\\"dsqwen-14b-router\\\" not found\",\"type\":\"overloaded_error\",\"code\":\"service_unavailable\",\"param\":null}}"
+        },
+        {
+          "ts": 1783259631.9428446,
+          "status": 503,
+          "error": "HTTPError 503: {\"error\":{\"code\":\"service_unavailable\",\"param\":null,\"message\":\"httproutes.gateway.networking.k8s.io \\\"dsqwen-14b-router\\\" not found\",\"type\":\"overloaded_error\"}}"
+        }
+      ]
+    }
+  }
+}

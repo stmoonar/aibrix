@@ -1,0 +1,2 @@
+NAME                READY   UP-TO-DATE   AVAILABLE   AGE   CONTAINERS   IMAGES                                SELECTOR
+tre-v2-controller   0/0     0            0           28h   controller   tre-v2-controller:20260705-d795a715   app.kubernetes.io/name=tre-v2-controller

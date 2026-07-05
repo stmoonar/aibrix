@@ -1,0 +1,2 @@
+NAME                                 READY   STATUS    RESTARTS   AGE   IP             NODE                   NOMINATED NODE   READINESS GATES
+tre-v2-controller-65bb7cdf46-r89gw   1/1     Running   0          1s    10.244.0.176   nscc-ds-4a100-node10   <none>           <none>

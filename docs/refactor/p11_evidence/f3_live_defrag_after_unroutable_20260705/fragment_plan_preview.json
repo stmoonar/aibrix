@@ -1,0 +1,58 @@
+{
+  "state_models": {
+    "dsqwen-7b": {
+      "awake": 2,
+      "bound": 4
+    },
+    "dsllama-8b": {
+      "awake": 2,
+      "bound": 4
+    },
+    "dsqwen-14b": {
+      "awake": 1,
+      "bound": 3
+    }
+  },
+  "find_slot_tp2": null,
+  "plan_defrag_tp2": [
+    {
+      "serve_id": "dsqwen-7b-nscc-ds-4a100-node10-gpu-2-5db6cd86c6-w4hqg",
+      "from_slot": {
+        "node": "nscc-ds-4a100-node10",
+        "gpu_ids": [
+          2
+        ]
+      },
+      "to_slot": {
+        "node": "nscc-ds-4a100-node9",
+        "gpu_ids": [
+          3
+        ]
+      }
+    }
+  ],
+  "sleeping_14b_feasible": [
+    {
+      "serve_id": "dsqwen-14b-nscc-ds-4a100-node10-gpu-2-3-66f57f5575-6dtl7",
+      "slot": {
+        "node": "nscc-ds-4a100-node10",
+        "gpu_ids": [
+          2,
+          3
+        ]
+      },
+      "feasible_wake": false
+    },
+    {
+      "serve_id": "dsqwen-14b-nscc-ds-4a100-node9-gpu-0-1-7b8c77ddc5-hw9zp",
+      "slot": {
+        "node": "nscc-ds-4a100-node9",
+        "gpu_ids": [
+          0,
+          1
+        ]
+      },
+      "feasible_wake": false
+    }
+  ]
+}

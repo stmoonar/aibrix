@@ -6,7 +6,7 @@ Status: **READY FOR FINAL GATE - do not tag `n4-done` until final verification p
 
 ## Summary
 
-N4 started after `n3-done` (`d694bc4e`). The live `tre-v2` control-plane is healthy. N4.1 originally had an all-at-once SKIP under the old `nvidia.com/gpu` request model; N4b/D7 removed GPU requests and the full 12-Deployment topology now passes live validation. N4.2 hot-switch validation passed. N4.3 control-loop live tests passed after controller fixes for awake/bound planning, routable serving floors, and Redis outage tolerance. N4.4 now has the real Kubernetes delete/create defrag path implemented and covered offline, but the exact live fragmented construction is blocked by vLLM warm-up memory headroom in the D7 co-resident topology. N4.5 fault injection passed after hardening. N4.6 serving traffic is healthy after restoring the missing `dsqwen-7b` model HTTPRoute, but the expansion/shrink part is blocked pending signal and memory-policy decisions.
+N4 started after `n3-done` (`d694bc4e`). The live `tre-v2` control-plane is healthy. N4.1 originally had an all-at-once SKIP under the old `nvidia.com/gpu` request model; N4b/D7 removed GPU requests and the full 12-Deployment topology now passes live validation. N4.2 hot-switch validation passed. N4.3 control-loop live tests passed after controller fixes for awake/bound planning, routable serving floors, and Redis outage tolerance. N4.4 now has the real Kubernetes delete/create defrag path implemented and exercised live, but live PASS is blocked by AIBrix model HTTPRoute disappearance during TRE-managed delete/recreate, which violates the gateway zero-5xx requirement. N4.5 fault injection passed after hardening. N4.6 serving traffic is healthy after restoring model HTTPRoutes, but the expansion/shrink part is blocked pending the same route-lifecycle and long-run acceptance decisions.
 
 ## N4.1 Full Topology Deployment
 
@@ -228,28 +228,57 @@ Controller evidence:
 
 ## N4.4 Defrag And Same-Slot Shrink
 
-Status: **BLOCKED for exact live execution; PASS for offline planner/API/k8s-path coverage**
+Status: **BLOCKED for live gateway zero-5xx; PASS for defrag API/k8s-path execution**
 
 Reason:
 
-- N4b implemented the real `POST /v2/defrag` Kubernetes path: `hide -> sleep -> delete Deployment -> wait old pod gone -> create Deployment on the new slot -> wait Pod Ready -> wait vLLM HTTP readiness -> wake -> unhide`.
-- The live service-manager image containing the final readiness hardening is `tre-v2-service-manager:20260705-ff9d1580`.
-- The exact live fragmented construction is now blocked by model memory headroom in the D7 co-resident topology. Recreating/warming a `dsqwen-7b` pod on a GPU that also holds sleeping TP=2 `dsqwen-14b` state failed during vLLM warm-up with CUDA OOM (`Tried to allocate 150.00 MiB`; only about `74 MiB` free on the target GPU).
-- Continuing this scenario safely would require changing model-serving launch parameters or reducing sleeping co-residency, not another defrag API change.
+- N4b implemented the real `POST /v2/defrag` Kubernetes path:
+  `hide -> wait unroutable -> sleep -> delete Deployment -> wait old pod gone
+  -> create Deployment on the new slot -> wait Pod Ready -> wait vLLM HTTP
+  readiness -> wake -> unhide`.
+- The live service-manager image containing the final defrag route-race
+  hardening is `tre-v2-service-manager:20260705-46613bfb`.
+- The earlier memory-headroom blocker is no longer the current blocker for the
+  constructed F3 scenario: the migration target was prepared so D10 headroom
+  passed and the recreated qwen pod warmed successfully.
+- The live blocker is now gateway route continuity. During delete/recreate,
+  AIBrix model HTTPRoutes can disappear (`dsqwen-7b-router not found`,
+  `dsqwen-14b-router not found`) even while direct model Services remain
+  healthy. This violates the N4.4 requirement that defrag keep the three awake
+  models at zero gateway 5xx.
 
 Evidence retained:
 
-- Offline tests cover `SlotAllocator.plan_defrag`, service-manager `/v2/defrag`, controller `DefragAction`, same-slot high shrink planning, fake Kubernetes Deployment delete/create, recreated-Pod serve-id handling, and the P9 offline defrag integration path.
-- N4b focused verification passed with `service-manager/tests/test_v2_defrag.py`, `service-manager/tests/test_api_v2.py`, `service-manager/tests/test_vllm_ops.py`, and `service-manager/tests/test_k8s_ops.py`.
-- Full N4b gate before the live rollout passed with `233 passed`.
-- After the blocked live construction, the cluster was restored to a clean minimal three-model state:
-  - `dsqwen-7b awake=1 bound=2`, endpoint `10.244.3.53:8000`.
-  - `dsllama-8b awake=1 bound=4`, endpoint `10.244.3.57:8000`.
-  - `dsqwen-14b awake=1 bound=4`, endpoint `10.244.0.163:8000`.
+- Offline and focused tests cover `SlotAllocator.plan_defrag`,
+  service-manager `/v2/defrag`, controller `DefragAction`, same-slot high
+  shrink planning, fake Kubernetes Deployment delete/create, recreated-Pod
+  serve-id handling, wait-unroutable ordering, and the P9 offline defrag
+  integration path.
+- F3 live evidence is retained under:
+  - `docs/refactor/p11_evidence/f3_live_defrag_20260705/`
+  - `docs/refactor/p11_evidence/f3_live_defrag_after_unroutable_20260705/`
+- Defrag API evidence:
+  - preview: `find_slot_tp2=null`; `plan_defrag_tp2` moved qwen node10 GPU2 to
+    node9 GPU3.
+  - `/v2/defrag` returned HTTP 200 and executed the delete/create/wake path.
+  - post-defrag 14B node10 GPU2-3 became `feasible_wake=true`.
+  - 14B wake after defrag succeeded and gateway smoke passed `20/20`.
+- Gateway failure evidence:
+  - before wait-unroutable fix: qwen had migration-window 503s.
+  - after wait-unroutable fix: qwen still had route-not-found/connection-refused
+    503s; 14B had route-not-found errors when its HTTPRoute disappeared.
+- After the blocked live construction, D8 cleanup restored the cluster:
+  - all three models `awake=1`, `bound=4`.
+  - final reconcile `warnings=[]`.
+  - node9 GPU2/GPU3 each about `4070 MiB`.
+  - final gateway smoke `20/20` for qwen, llama, and 14B.
 
 Follow-up:
 
-- A true live N4.4 PASS now requires a serving-capacity decision: lower vLLM memory pressure (`gpu_memory_utilization`, `max_model_len`, `max_num_seqs`, or equivalent) or reduce sleeping co-residency before reconstructing the fragmented topology.
+- A true live N4.4 PASS now requires a model-route lifecycle fix: TRE-managed
+  delete/create paths must idempotently ensure each model HTTPRoute exists,
+  resolves, and remains accepted before and after model Deployment churn. Then
+  rerun the same F3 defrag with the gateway zero-5xx probe.
 
 ## N4.5 Fault Injection
 
