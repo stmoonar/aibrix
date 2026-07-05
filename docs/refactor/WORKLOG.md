@@ -1629,3 +1629,41 @@
   - overlay/test image pin updated away from
     `tre-v2-service-manager:20260705-46613bfb`.
   - full `cd tre && make check`: `264 passed`.
+
+### Endgame F3 Re-verify With Route-Guard Image (preliminary, 2026-07-06)
+
+- Picked up with SM on the route-guard image `tre-v2-service-manager:20260705-f6dce214`
+  (commit `f6dce214`, rolled by `7337a039`). Controller intentionally paused
+  (`replicas=0`).
+- Live state on pickup had drifted from clean baseline (leftover from prior F3
+  attempt): dsqwen-7b `awake=2`, dsllama-8b `awake=2`, dsqwen-14b `awake=1/bound=3`.
+  node9 all four GPUs near-OOM (GPU0/1 ~39.9 GiB, GPU2/3 ~38 GiB used of 40).
+- Route-guard functioning check:
+  - all three model HTTPRoutes present/Accepted in `aibrix-system`
+    (`dsqwen-7b-router`, `dsllama-8b-router`, `dsqwen-14b-router`).
+  - gateway smoke (with required HTTP `model` header) `24/24` zero 5xx across the
+    three models. No route-not-found. Confirms the guard image serves routing
+    correctly and does not regress normal traffic.
+- Restored a clean-ish baseline (also frees node9 for safety; needed for F4 anyway):
+  - `PUT /v2/models/dsqwen-7b/target {"wake_replicas":1}` -> slept gpu-3 replica.
+  - `PUT /v2/models/dsllama-8b/target {"wake_replicas":1}` -> slept gpu-2 replica.
+  - Sleeps were HEALTHY (no leak): node9 GPU2/GPU3 dropped from ~38 GiB to
+    `2248 MiB` each. Post reconcile `warnings=[]`, version 305.
+  - Resulting state: dsqwen-7b `awake=1/bound=4`, dsllama-8b `awake=1/bound=4`,
+    dsqwen-14b `awake=1/bound=3` (14b 4th binding node9 gpu2-3 still absent from
+    prior attempt; immaterial because F4 rebuilds all bindings from manifests).
+
+- **F3 preliminary conclusion / N4.4 disposition**: route-guard image is live and
+  keeps all model HTTPRoutes Accepted with zero-5xx gateway routing; healthy
+  sleep round-trip verified on the guard image. The full live fragmentation-defrag
+  zero-5xx invariant is **deferred to F4.4 authoritative clean-cluster run** per
+  plan section 5.5, for three reasons: (a) the plan itself designates F4.4 on the
+  clean 0.7.0 base as the authoritative N4.4 PASS; (b) node9 GPU0/GPU1 remain
+  near-OOM (a single awake pod each), so constructing + running a fragmentation
+  defrag with cold-start creates on this node carries real OOM/destabilization
+  risk (conservative-default per discipline 9.1); (c) F4 tears down this exact
+  snowflake cluster, so investment here is throwaway. The route guard's
+  create/ensure-HTTPRoute logic is unit-covered (`make check` 264 passed,
+  41 focused route-guard tests). n4b-done tag is intentionally NOT set here; it
+  is set after F4.4 per the plan.
+- Controller left paused; cluster stable, reconcile clean.

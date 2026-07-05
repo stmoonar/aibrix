@@ -280,6 +280,22 @@ Follow-up:
   resolves, and remains accepted before and after model Deployment churn. Then
   rerun the same F3 defrag with the gateway zero-5xx probe.
 
+### N4.4 F3 Re-verify With Route Guard (preliminary, 2026-07-06)
+
+Status: **PRELIMINARY OK (routing); authoritative live-defrag zero-5xx deferred to F4.4**
+
+- SM rolled to the route-guard image `tre-v2-service-manager:20260705-f6dce214`.
+- All three model HTTPRoutes present/Accepted; gateway smoke `24/24` zero 5xx
+  with the required HTTP `model` header. Route guard keeps routes healthy and
+  does not regress normal traffic.
+- Healthy sleep round-trip verified on the guard image (extra awake replicas
+  slept with no leak; node9 GPU2/GPU3 freed to ~2.2 GiB). Reconcile `warnings=[]`.
+- The full fragmentation-defrag zero-5xx invariant is intentionally deferred to
+  the F4.4 authoritative run on the clean AIBrix 0.7.0 cluster (plan section 5.5):
+  the current snowflake node9 GPU0/GPU1 are near-OOM, making a cold-start defrag
+  construction risky, and F4 tears this cluster down. Route-guard create/ensure
+  logic is unit-covered (`make check` 264, 41 focused route-guard tests).
+
 ## N4.5 Fault Injection
 
 Status: **PASS**
