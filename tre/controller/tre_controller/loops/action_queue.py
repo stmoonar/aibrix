@@ -88,8 +88,7 @@ class ActionQueue:
             queued = self._pending.popleft()
             result = await self._dispatch(queued.action, queued.model)
             results.append(result)
-            if result.ok:
-                self._inflight.discard(queued.model)
+            self._inflight.discard(queued.model)
         return tuple(results)
 
     async def _dispatch(self, action: Action, model: str) -> DispatchResult:

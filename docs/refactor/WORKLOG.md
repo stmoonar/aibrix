@@ -1403,3 +1403,41 @@
 
 - Commit final F2.4 evidence, then proceed to F2.5 high-load zm scale-action
   validation from `14_endgame_plan.md` section 3.2 step 3.
+
+### Endgame F2.5 High-Load zm Scale Validation - Inflight Gate Bug
+
+- Ran the first 5-minute dsqwen-7b high-load validation:
+  - command: `python3 tre/deploy/scripts/n4b_three_model_precheck.py --models dsqwen-7b --duration-seconds 300 --phase-seconds 300 --workers 16 --sample-seconds 15 --max-tokens 96`
+  - output: `docs/refactor/p11_evidence/f2_zm_precheck_20260705/dsqwen7b_highload_5m.json`
+  - controller log: `docs/refactor/p11_evidence/f2_zm_precheck_20260705/controller_since_dsqwen7b_highload.log`
+  - post-run reconcile: `docs/refactor/p11_evidence/f2_zm_precheck_20260705/post_dsqwen7b_highload_reconcile.json`
+- Result:
+  - `dsqwen-7b` ok requests: `3691`
+  - errors: one gateway `503`
+  - component restarts stayed at `0`
+  - post-run reconcile: `warnings=[]`
+  - controller actions: `[]`
+  - `dsqwen-7b` decision `z_m` during the run was critical
+    (`min=0.515`, `p50=0.594`, `max=0.723`), so lack of scale action was not
+    caused by insufficient load.
+- Root cause found in `ActionQueue`:
+  - `drain_once()` removed a model from `_inflight` only when dispatch returned
+    `ok=True`.
+  - There is no retry queue for failed dispatches, so one failed SM response can
+    leave the model permanently inflight.
+  - The planner then skips that model via `recv.model_name in inflight_models`,
+    producing no action even when `Z_m` is critical.
+- Added RED test replacing the old "keeps failed model inflight for retry"
+  expectation with "releases failed model after dispatch attempt and accepts a
+  later retry".
+- Implemented the fix: `drain_once()` now discards the model from `_inflight`
+  after every dispatch attempt, success or failure. The `DispatchResult` still
+  records failure for observability.
+- Verification:
+  - focused queue/planner/loop tests: `37 passed`.
+  - full `cd tre && make check`: `260 passed`.
+
+### Endgame F2 Next
+
+- Commit the ActionQueue inflight fix, rebuild/roll controller, and rerun the
+  dsqwen-7b high-load zm validation.

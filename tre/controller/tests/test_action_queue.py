@@ -82,7 +82,7 @@ def test_action_queue_dispatches_scale_hide_unhide_and_defrag_actions() -> None:
     assert queue.inflight_models() == set()
 
 
-def test_action_queue_keeps_failed_model_inflight_for_retry() -> None:
+def test_action_queue_releases_failed_model_after_dispatch_attempt() -> None:
     class FailingClient(FakeServiceManagerClient):
         async def scale_model(self, model: str, delta: int) -> dict:
             self.calls.append(("scale", model, delta))
@@ -94,7 +94,11 @@ def test_action_queue_keeps_failed_model_inflight_for_retry() -> None:
     results = asyncio.run(queue.drain_once())
 
     assert results == (DispatchResult(model="m", action_kind="scale", ok=False, error="boom"),)
-    assert queue.inflight_models() == {"m"}
+    assert queue.inflight_models() == set()
+
+    retry = queue.submit((ScaleAction("m", 1, "critical_retry", "rescue"),))
+
+    assert retry.accepted == 1
 
 
 class StopQueueLoop(Exception):
