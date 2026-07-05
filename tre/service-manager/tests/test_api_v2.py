@@ -37,6 +37,7 @@ class FakeRuntimeOps:
     def __init__(self, snapshots):
         self._snapshots = list(snapshots)
         self.annotations = []
+        self.routes = []
 
     def list_pod_snapshots(self, *, model=None):
         if model is None:
@@ -45,6 +46,9 @@ class FakeRuntimeOps:
 
     def write_binding_annotations(self, binding, *, state):
         self.annotations.append((binding.serve_id, state))
+
+    def ensure_model_httproute(self, model):
+        self.routes.append(model)
 
 
 class FakeVllmOps:
@@ -380,6 +384,7 @@ def test_v2_put_target_creates_deployment_when_runtime_deployment_ops_are_availa
         ("ready", "tp2-deployment"),
         ("tp2-pod", "awake"),
     ]
+    assert runtime_ops.routes == ["tp2", "tp2"]
     assert vllm_ops.calls == [
         ("wait_until_ready", "10.0.0.9", 8000),
         ("wake_up", "10.0.0.9", 8000),

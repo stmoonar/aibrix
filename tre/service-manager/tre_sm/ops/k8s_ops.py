@@ -3,7 +3,16 @@ from __future__ import annotations
 import time
 from typing import Protocol
 
-from gen_model_manifests import build_model_deployment, deployment_name
+from gen_model_manifests import (
+    GATEWAY_API_GROUP,
+    GATEWAY_NAME,
+    GATEWAY_NAMESPACE,
+    HTTPROUTE_API_VERSION,
+    HTTPROUTE_PLURAL,
+    build_model_deployment,
+    build_model_httproute,
+    deployment_name,
+)
 from tre_common.registry import Registry
 from tre_sm.allocator.slots import Binding
 from tre_sm.allocator.topology import (
@@ -32,6 +41,39 @@ class K8sDeploymentApi(Protocol):
     def create_namespaced_deployment(self, *, namespace: str, body: dict): ...
 
 
+class K8sRouteApi(Protocol):
+    def get_namespaced_custom_object(
+        self,
+        *,
+        group: str,
+        version: str,
+        namespace: str,
+        plural: str,
+        name: str,
+    ): ...
+
+    def create_namespaced_custom_object(
+        self,
+        *,
+        group: str,
+        version: str,
+        namespace: str,
+        plural: str,
+        body: dict,
+    ): ...
+
+    def patch_namespaced_custom_object(
+        self,
+        *,
+        group: str,
+        version: str,
+        namespace: str,
+        plural: str,
+        name: str,
+        body: dict,
+    ): ...
+
+
 class K8sOps:
     def __init__(
         self,
@@ -40,10 +82,16 @@ class K8sOps:
         namespace: str,
         registry: Registry | None = None,
         apps_api: K8sDeploymentApi | None = None,
+        route_api: K8sRouteApi | None = None,
+        route_namespace: str = GATEWAY_NAMESPACE,
+        gateway_name: str = GATEWAY_NAME,
     ) -> None:
         self._api = api
         self._apps_api = apps_api or api
+        self._route_api = route_api
         self._namespace = namespace
+        self._route_namespace = route_namespace
+        self._gateway_name = gateway_name
         self._registry = registry
 
     def list_pod_snapshots(self, *, model: str | None = None) -> list[K8sPodSnapshot]:
@@ -115,6 +163,60 @@ class K8sOps:
         body = build_model_deployment(self._registry, model, slot.node, tuple(slot.gpu_ids))
         self._apps_api.create_namespaced_deployment(namespace=self._namespace, body=body)
         return str(body["metadata"]["name"])
+
+    def ensure_model_httproute(self, model: str, *, timeout_s: float = 30.0, interval_s: float = 0.5) -> None:
+        if self._route_api is None:
+            raise ValueError("route_api is required to ensure model HTTPRoutes")
+        body = build_model_httproute(
+            model,
+            model_namespace=self._namespace,
+            gateway_namespace=self._route_namespace,
+            gateway_name=self._gateway_name,
+        )
+        name = str(body["metadata"]["name"])
+        try:
+            self._route_api.get_namespaced_custom_object(
+                group=GATEWAY_API_GROUP,
+                version=HTTPROUTE_API_VERSION,
+                namespace=self._route_namespace,
+                plural=HTTPROUTE_PLURAL,
+                name=name,
+            )
+        except Exception as exc:
+            if not _is_not_found(exc):
+                raise
+            self._route_api.create_namespaced_custom_object(
+                group=GATEWAY_API_GROUP,
+                version=HTTPROUTE_API_VERSION,
+                namespace=self._route_namespace,
+                plural=HTTPROUTE_PLURAL,
+                body=body,
+            )
+        else:
+            self._route_api.patch_namespaced_custom_object(
+                group=GATEWAY_API_GROUP,
+                version=HTTPROUTE_API_VERSION,
+                namespace=self._route_namespace,
+                plural=HTTPROUTE_PLURAL,
+                name=name,
+                body={"metadata": {"labels": body["metadata"].get("labels", {})}, "spec": body["spec"]},
+            )
+        self._wait_httproute_accepted(name, timeout_s=timeout_s, interval_s=interval_s)
+
+    def _wait_httproute_accepted(self, name: str, *, timeout_s: float, interval_s: float) -> None:
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            route = self._route_api.get_namespaced_custom_object(
+                group=GATEWAY_API_GROUP,
+                version=HTTPROUTE_API_VERSION,
+                namespace=self._route_namespace,
+                plural=HTTPROUTE_PLURAL,
+                name=name,
+            )
+            if _httproute_accepted(route):
+                return
+            time.sleep(interval_s)
+        raise TimeoutError(f"HTTPRoute {self._route_namespace}/{name} was not accepted before timeout")
 
     def wait_pod_deleted(self, serve_id: str, *, timeout_s: float = 30.0, interval_s: float = 0.5) -> None:
         deadline = time.monotonic() + timeout_s
@@ -189,3 +291,18 @@ def _items(value):
     if items is not None:
         return list(items)
     return list(value)
+
+
+def _is_not_found(exc: Exception) -> bool:
+    return getattr(exc, "status", None) == 404
+
+
+def _httproute_accepted(route) -> bool:
+    status = route.get("status", {}) if isinstance(route, dict) else getattr(route, "status", {}) or {}
+    parents = status.get("parents", []) if isinstance(status, dict) else []
+    for parent in parents:
+        conditions = parent.get("conditions", []) if isinstance(parent, dict) else []
+        for condition in conditions:
+            if condition.get("type") == "Accepted" and str(condition.get("status")).lower() == "true":
+                return True
+    return False

@@ -4,6 +4,12 @@ from tre_sm.allocator.topology import GPU_IDS_ANNOTATION, STATE_ANNOTATION, K8sP
 from tre_sm.ops.k8s_ops import MODEL_LABEL, K8sOps
 
 
+class ApiError(Exception):
+    def __init__(self, status):
+        super().__init__(str(status))
+        self.status = status
+
+
 class FakeK8sApi:
     def __init__(self, pods):
         self.pods = pods
@@ -27,6 +33,46 @@ class FakeK8sApi:
 
     def create_namespaced_deployment(self, *, namespace, body):
         self.created_deployments.append((namespace, body))
+
+
+class FakeRouteApi:
+    def __init__(self, routes=None):
+        self.routes = dict(routes or {})
+        self.created = []
+        self.patched = []
+        self.get_calls = []
+
+    def get_namespaced_custom_object(self, *, group, version, namespace, plural, name):
+        self.get_calls.append((group, version, namespace, plural, name))
+        key = (namespace, name)
+        if key not in self.routes:
+            raise ApiError(404)
+        return self.routes[key]
+
+    def create_namespaced_custom_object(self, *, group, version, namespace, plural, body):
+        self.created.append((group, version, namespace, plural, body))
+        self.routes[(namespace, body["metadata"]["name"])] = body | {"status": _accepted_status()}
+
+    def patch_namespaced_custom_object(self, *, group, version, namespace, plural, name, body):
+        self.patched.append((group, version, namespace, plural, name, body))
+        current = self.routes[(namespace, name)]
+        current.setdefault("metadata", {}).update(body.get("metadata", {}))
+        current["spec"] = body["spec"]
+
+
+def _accepted_status():
+    return {
+        "parents": [
+            {
+                "conditions": [
+                    {
+                        "type": "Accepted",
+                        "status": "True",
+                    }
+                ]
+            }
+        ]
+    }
 
 
 def pod_dict(name, model, node, cuda, *, phase="Running", annotations=None, labels=None, deleting=False):
@@ -267,6 +313,55 @@ def test_k8s_ops_deletes_and_creates_model_deployments_from_manifest_template():
     container = body["spec"]["template"]["spec"]["containers"][0]
     assert {"name": "NVIDIA_VISIBLE_DEVICES", "value": "GPU-a1"} in container["env"]
     assert "nvidia.com/gpu" not in str(container.get("resources", {}))
+
+
+def test_k8s_ops_creates_missing_model_httproute_and_waits_until_accepted():
+    route_api = FakeRouteApi()
+    ops = K8sOps(api=FakeK8sApi([]), route_api=route_api, namespace="default", registry=registry())
+
+    ops.ensure_model_httproute("m1", timeout_s=0.01, interval_s=0.001)
+
+    [(group, version, namespace, plural, body)] = route_api.created
+    assert (group, version, namespace, plural) == (
+        "gateway.networking.k8s.io",
+        "v1",
+        "aibrix-system",
+        "httproutes",
+    )
+    assert body["metadata"]["name"] == "m1-router"
+    assert body["spec"]["rules"][0]["backendRefs"][0]["namespace"] == "default"
+    assert body["spec"]["rules"][0]["matches"][0]["headers"] == [{"name": "model", "type": "Exact", "value": "m1"}]
+    assert route_api.get_calls[-1] == (
+        "gateway.networking.k8s.io",
+        "v1",
+        "aibrix-system",
+        "httproutes",
+        "m1-router",
+    )
+
+
+def test_k8s_ops_patches_existing_model_httproute_before_waiting():
+    existing = {
+        "metadata": {"name": "m1-router", "namespace": "aibrix-system"},
+        "spec": {"rules": []},
+        "status": _accepted_status(),
+    }
+    route_api = FakeRouteApi({("aibrix-system", "m1-router"): existing})
+    ops = K8sOps(api=FakeK8sApi([]), route_api=route_api, namespace="default", registry=registry())
+
+    ops.ensure_model_httproute("m1", timeout_s=0.01, interval_s=0.001)
+
+    assert route_api.created == []
+    [(group, version, namespace, plural, name, body)] = route_api.patched
+    assert (group, version, namespace, plural, name) == (
+        "gateway.networking.k8s.io",
+        "v1",
+        "aibrix-system",
+        "httproutes",
+        "m1-router",
+    )
+    assert body["metadata"]["labels"] == {"model.aibrix.ai/name": "m1", "tre.aibrix.io/managed": "true"}
+    assert body["spec"]["rules"][0]["backendRefs"][0]["name"] == "m1"
 
 
 def test_k8s_ops_wait_pod_ready_resolves_pod_by_created_deployment_app_label():

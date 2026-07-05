@@ -43,6 +43,27 @@ def test_tre_v2_overlay_declares_components_and_independent_redis() -> None:
         and item["metadata"]["namespace"] == "default"
         for item in rbac_docs
     )
+    assert any(
+        item["kind"] == "Role"
+        and item["metadata"]["name"] == "tre-v2-model-route-manager"
+        and item["metadata"]["namespace"] == "aibrix-system"
+        and any(
+            rule["apiGroups"] == ["gateway.networking.k8s.io"]
+            and rule["resources"] == ["httproutes"]
+            and rule["verbs"] == ["get", "list", "watch", "create", "update", "patch"]
+            for rule in item["rules"]
+        )
+        for item in rbac_docs
+    )
+    assert any(
+        item["kind"] == "RoleBinding"
+        and item["metadata"]["name"] == "tre-v2-model-route-manager"
+        and item["metadata"]["namespace"] == "aibrix-system"
+        and item["subjects"] == [
+            {"kind": "ServiceAccount", "name": "tre-v2-service-manager", "namespace": "tre-v2"}
+        ]
+        for item in rbac_docs
+    )
 
     controller = _load_yaml(overlay / "controller.yaml")
     sm = _load_yaml(overlay / "service-manager.yaml")

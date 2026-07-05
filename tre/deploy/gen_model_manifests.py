@@ -12,6 +12,19 @@ from tre_common.registry import ModelSpec, NodeSpec, Registry, load_registry
 ROUTABLE_LABEL = "tre.aibrix.io/routable"
 GPU_UUIDS_ANNOTATION = "tre.aibrix.io/gpu-uuids"
 MAX_BOUND_PER_GPU = 3
+MODEL_LABEL = "model.aibrix.ai/name"
+GATEWAY_NAMESPACE = "aibrix-system"
+GATEWAY_NAME = "aibrix-eg"
+GATEWAY_API_GROUP = "gateway.networking.k8s.io"
+HTTPROUTE_API_VERSION = "v1"
+HTTPROUTE_PLURAL = "httproutes"
+HTTPROUTE_PATHS = (
+    "/v1/completions",
+    "/v1/chat/completions",
+    "/v1/embeddings",
+    "/generate",
+    "/generatevideo",
+)
 
 
 def feasible_slots(registry: Registry, model: ModelSpec) -> list[tuple[str, tuple[int, ...]]]:
@@ -49,8 +62,64 @@ def build_services(registry: Registry) -> list[dict]:
     return [_service(model) for model in registry.models()]
 
 
+def build_httproutes(registry: Registry) -> list[dict]:
+    return [build_model_httproute(model.name) for model in registry.models()]
+
+
+def build_model_httproute(
+    model_name: str,
+    *,
+    model_namespace: str = "default",
+    gateway_namespace: str = GATEWAY_NAMESPACE,
+    gateway_name: str = GATEWAY_NAME,
+) -> dict:
+    service_name = _dns_name(model_name)
+    labels = {MODEL_LABEL: model_name, "tre.aibrix.io/managed": "true"}
+    return {
+        "apiVersion": f"{GATEWAY_API_GROUP}/{HTTPROUTE_API_VERSION}",
+        "kind": "HTTPRoute",
+        "metadata": {
+            "name": f"{service_name}-router",
+            "namespace": gateway_namespace,
+            "labels": labels,
+        },
+        "spec": {
+            "parentRefs": [
+                {
+                    "group": GATEWAY_API_GROUP,
+                    "kind": "Gateway",
+                    "name": gateway_name,
+                    "namespace": gateway_namespace,
+                }
+            ],
+            "rules": [
+                {
+                    "backendRefs": [
+                        {
+                            "group": "",
+                            "kind": "Service",
+                            "name": service_name,
+                            "namespace": model_namespace,
+                            "port": 8000,
+                            "weight": 1,
+                        }
+                    ],
+                    "matches": [
+                        {
+                            "headers": [{"name": "model", "type": "Exact", "value": model_name}],
+                            "path": {"type": "PathPrefix", "value": path},
+                        }
+                        for path in HTTPROUTE_PATHS
+                    ],
+                    "timeouts": {"request": "600s"},
+                }
+            ],
+        },
+    }
+
+
 def build_resources(registry: Registry) -> list[dict]:
-    return build_services(registry) + build_deployments(registry)
+    return build_services(registry) + build_httproutes(registry) + build_deployments(registry)
 
 
 def write_manifests(registry: Registry, output_dir: Path) -> list[Path]:
@@ -71,7 +140,7 @@ def write_manifests(registry: Registry, output_dir: Path) -> list[Path]:
 
 
 def _service(model: ModelSpec) -> dict:
-    labels = {"model.aibrix.ai/name": model.name}
+    labels = {MODEL_LABEL: model.name}
     return {
         "apiVersion": "v1",
         "kind": "Service",

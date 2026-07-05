@@ -79,3 +79,27 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
   name: tre-v2-model-manager
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: tre-v2-model-route-manager
+  namespace: aibrix-system
+rules:
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["httproutes"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: tre-v2-model-route-manager
+  namespace: aibrix-system
+subjects:
+  - kind: ServiceAccount
+    name: tre-v2-service-manager
+    namespace: tre-v2
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: tre-v2-model-route-manager

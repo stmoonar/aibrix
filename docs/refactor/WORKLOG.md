@@ -1596,3 +1596,29 @@
   violated by AIBrix HTTPRoute GC during delete/recreate. Next work should
   implement an idempotent "ensure model HTTPRoute exists and accepted" guard in
   the TRE-managed model lifecycle before retrying F3.
+
+### Endgame F3 Route Lifecycle Guard - TDD Implementation
+
+- Added RED coverage for model HTTPRoute lifecycle:
+  - manifest generation now expects one `aibrix-system/<model>-router`
+    HTTPRoute per registry model, with `model` header matches forwarding to
+    `default/<model>:8000`.
+  - `K8sOps.ensure_model_httproute()` must create a missing route, patch an
+    existing route back to the TRE-managed spec, and wait for `Accepted=True`.
+  - runtime defrag must ensure all registry model routes before a real
+    migration, and ensure the migrated model route again after create.
+  - runtime target growth must ensure the target model route before and after
+    creating its Deployment.
+  - overlay RBAC must grant the service-manager only the minimal
+    `aibrix-system` `httproutes.gateway.networking.k8s.io` permissions.
+- Implemented the route guard in TRE service-manager only:
+  - no AIBrix base, envoy, gpu-operator, or prometheus changes.
+  - `tre/deploy/gen_model_manifests.py` is the shared HTTPRoute shape source.
+  - `tre_sm.ops.K8sOps` now uses `CustomObjectsApi` for Gateway API
+    HTTPRoutes and waits on the route status rather than relying on
+    `kubectl wait`.
+  - `tre_sm.server` injects `CustomObjectsApi`; route namespace and gateway
+    name default to `aibrix-system` and `aibrix-eg`.
+- Verification:
+  - focused tests passed: `41 passed`.
+  - full `cd tre && make check`: `264 passed`.

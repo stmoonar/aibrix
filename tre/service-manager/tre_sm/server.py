@@ -67,4 +67,12 @@ def _create_k8s_ops(registry=None) -> K8sOps:
         config.load_kube_config()
 
     namespace = os.environ.get("TRE_MODEL_NAMESPACE", os.environ.get("TARGET_NAMESPACE", "default"))
-    return K8sOps(api=client.CoreV1Api(), apps_api=client.AppsV1Api(), namespace=namespace, registry=registry)
+    return K8sOps(
+        api=client.CoreV1Api(),
+        apps_api=client.AppsV1Api(),
+        route_api=client.CustomObjectsApi(),
+        namespace=namespace,
+        route_namespace=os.environ.get("TRE_ROUTE_NAMESPACE", "aibrix-system"),
+        gateway_name=os.environ.get("TRE_GATEWAY_NAME", "aibrix-eg"),
+        registry=registry,
+    )

@@ -25,6 +25,8 @@ class RuntimePodOps(Protocol):
 
     def wait_pod_unroutable(self, binding: Binding): ...
 
+    def ensure_model_httproute(self, model: str): ...
+
     def delete_model_deployment(self, binding: Binding) -> str: ...
 
     def create_model_deployment(self, model: str, slot: Slot) -> str: ...
@@ -196,6 +198,8 @@ class ServiceManagerV2:
         migrations = allocator.plan_defrag(tp_size)
         if migrations is None:
             raise DefragUnavailable("no_feasible_defrag")
+        if migrations:
+            self._ensure_all_model_routes()
 
         actions: list[dict] = []
         updated_by_serve = {binding.serve_id: binding for binding in snapshot.bindings}
@@ -286,7 +290,9 @@ class ServiceManagerV2:
         if self._runtime_ops is None or self._vllm_ops is None:
             raise ValueError("runtime_ops and vllm_ops are required for runtime create")
         self._ensure_create_headroom(slot)
+        self._ensure_model_route(model)
         deployment_id = self._runtime_ops.create_model_deployment(model, slot)
+        self._ensure_model_route(model)
         ready = self._runtime_ops.wait_pod_ready(deployment_id)
         if not ready.pod_ip:
             raise ValueError(f"pod {ready.name} has no pod IP for wake")
@@ -320,6 +326,7 @@ class ServiceManagerV2:
         self._runtime_ops.wait_pod_deleted(binding.serve_id)
         self._ensure_create_headroom(migration.to_slot)
         deployment_id = self._runtime_ops.create_model_deployment(binding.model, migration.to_slot)
+        self._ensure_model_route(binding.model)
         ready = self._runtime_ops.wait_pod_ready(deployment_id)
         new_serve_id = ready.name
         actions.append(
@@ -350,6 +357,14 @@ class ServiceManagerV2:
     def _ensure_feasible_wake(self, binding: Binding, bindings: list[Binding]) -> None:
         if not self._feasible_wake(binding, bindings):
             raise WakeConflict(f"{binding.serve_id}: slot already has awake binding")
+
+    def _ensure_model_route(self, model: str) -> None:
+        if self._runtime_ops is not None and hasattr(self._runtime_ops, "ensure_model_httproute"):
+            self._runtime_ops.ensure_model_httproute(model)
+
+    def _ensure_all_model_routes(self) -> None:
+        for model in self._registry.models():
+            self._ensure_model_route(model.name)
 
     def _feasible_wake(self, binding: Binding, bindings: list[Binding]) -> bool:
         try:
