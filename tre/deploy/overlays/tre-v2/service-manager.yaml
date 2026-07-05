@@ -30,6 +30,20 @@ spec:
               value: redis://tre-v2-redis:6379/0
             - name: TRE_REGISTRY_PATH
               value: /app/tre/deploy/registry.yaml
+            # Model Deployments + their HTTPRoutes live in these namespaces.
+            - name: TRE_MODEL_NAMESPACE
+              value: default
+            - name: TRE_ROUTE_NAMESPACE
+              value: aibrix-system
+            - name: TRE_GATEWAY_NAME
+              value: aibrix-eg
+            # --- D8/D10 GPU-truth governance thresholds (Plan B: SM reads
+            # tre:gpu_truth:<node> from the same TRE Redis, written by the
+            # gpu-truth DaemonSet). ---
+            - name: TRE_CREATE_MAX_USED_MIB
+              value: "2500"
+            - name: TRE_SLEEP_LEAK_USED_MIB
+              value: "8192"
           resources:
             requests:
               cpu: 250m

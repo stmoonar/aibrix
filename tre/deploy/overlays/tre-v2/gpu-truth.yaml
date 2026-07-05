@@ -1,0 +1,189 @@
+# ConfigMap data below is a byte-for-byte copy of
+# tre/deploy/scripts/gpu_truth_agent.py, kept in sync by
+# deploy/tests/test_gpu_truth_daemonset.py (asserts equality). Regenerate with:
+#   python3 deploy/gen_gpu_truth_manifest.py
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tre-v2-gpu-truth-agent
+  namespace: tre-v2
+data:
+  gpu_truth_agent.py: |
+    from __future__ import annotations
+
+    import argparse
+    import json
+    import socket
+    import subprocess
+    import time
+    from urllib.parse import urlparse
+
+
+    def parse_nvidia_smi_csv(text: str) -> list[dict]:
+        rows: list[dict] = []
+        for line in text.splitlines():
+            parts = [part.strip() for part in line.split(",")]
+            if len(parts) != 3:
+                continue
+            uuid, used, total = parts
+            try:
+                rows.append(
+                    {
+                        "uuid": uuid,
+                        "used_mib": _parse_mib(used),
+                        "total_mib": _parse_mib(total),
+                    }
+                )
+            except ValueError:
+                continue
+        return rows
+
+
+    def build_payload(node: str, gpus: list[dict], *, now: float | None = None) -> dict:
+        return {
+            "node": node,
+            "timestamp": time.time() if now is None else now,
+            "gpus": gpus,
+        }
+
+
+    def collect_nvidia_smi() -> list[dict]:
+        output = subprocess.check_output(
+            [
+                "nvidia-smi",
+                "--query-gpu=uuid,memory.used,memory.total",
+                "--format=csv,noheader,nounits",
+            ],
+            text=True,
+        )
+        return parse_nvidia_smi_csv(output)
+
+
+    def publish_once(redis_client, *, node: str, ttl_s: int) -> dict:
+        payload = build_payload(node, collect_nvidia_smi())
+        redis_client.setex(f"tre:gpu_truth:{node}", ttl_s, json.dumps(payload, separators=(",", ":")))
+        return payload
+
+
+    class RawRedisSetexClient:
+        def __init__(self, redis_url: str) -> None:
+            parsed = urlparse(redis_url)
+            if parsed.scheme != "redis":
+                raise ValueError(f"unsupported redis url scheme: {parsed.scheme}")
+            self._host = parsed.hostname or "localhost"
+            self._port = parsed.port or 6379
+
+        def setex(self, key: str, ttl_s: int, value: str) -> None:
+            command = encode_setex_command(key, ttl_s, value)
+            with socket.create_connection((self._host, self._port), timeout=5) as sock:
+                sock.sendall(command)
+                response = sock.recv(1024)
+            if not response.startswith(b"+OK"):
+                raise RuntimeError(f"redis SETEX failed: {response!r}")
+
+
+    def encode_setex_command(key: str, ttl_s: int, value: str) -> bytes:
+        parts = ["SETEX", key, str(ttl_s), value]
+        encoded = [part.encode("utf-8") for part in parts]
+        out = [f"*{len(encoded)}\r\n".encode("ascii")]
+        for part in encoded:
+            out.append(f"${len(part)}\r\n".encode("ascii"))
+            out.append(part)
+            out.append(b"\r\n")
+        return b"".join(out)
+
+
+    def main() -> int:
+        parser = argparse.ArgumentParser(description="Publish node GPU memory truth to TRE Redis.")
+        parser.add_argument("--redis-url", required=True)
+        parser.add_argument("--node", default=socket.gethostname())
+        parser.add_argument("--interval-s", type=float, default=30.0)
+        parser.add_argument("--ttl-s", type=int, default=120)
+        parser.add_argument("--once", action="store_true")
+        args = parser.parse_args()
+
+        try:
+            import redis  # type: ignore[import-not-found]
+
+            client = redis.Redis.from_url(args.redis_url)
+        except ModuleNotFoundError:
+            client = RawRedisSetexClient(args.redis_url)
+        while True:
+            publish_once(client, node=args.node, ttl_s=args.ttl_s)
+            if args.once:
+                return 0
+            time.sleep(args.interval_s)
+
+
+    def _parse_mib(value: str) -> int:
+        return int(value.replace("MiB", "").strip())
+
+
+    if __name__ == "__main__":
+        raise SystemExit(main())
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: tre-v2-gpu-truth
+  namespace: tre-v2
+  labels:
+    app.kubernetes.io/name: tre-v2-gpu-truth
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: tre-v2-gpu-truth
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: tre-v2-gpu-truth
+    spec:
+      # hostPID stays false: the agent only reads nvidia-smi inside its own
+      # container (GPUs injected via NVIDIA_VISIBLE_DEVICES), never the host PID ns.
+      hostPID: false
+      nodeSelector:
+        nvidia.com/gpu.present: "true"
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+      volumes:
+        - name: agent
+          configMap:
+            name: tre-v2-gpu-truth-agent
+      containers:
+        - name: gpu-truth
+          # Reuse the vllm image already present on both GPU nodes (has python3 +
+          # nvidia-smi); no new image build/push required. The agent script is
+          # mounted from a ConfigMap so the source of truth stays
+          # tre/deploy/scripts/gpu_truth_agent.py.
+          image: vllm/vllm-openai:0.10.1-sleep
+          imagePullPolicy: IfNotPresent
+          command:
+            - python3
+            - /agent/gpu_truth_agent.py
+            - --redis-url
+            - redis://tre-v2-redis:6379/0
+            - --node
+            - $(NODE_NAME)
+            - --interval-s
+            - "30"
+            - --ttl-s
+            - "120"
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: NVIDIA_VISIBLE_DEVICES
+              value: all
+          volumeMounts:
+            - name: agent
+              mountPath: /agent
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi

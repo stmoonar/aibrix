@@ -118,8 +118,33 @@ def build_model_httproute(
     }
 
 
+def build_referencegrant(
+    *,
+    model_namespace: str = "default",
+    gateway_namespace: str = GATEWAY_NAMESPACE,
+) -> dict:
+    # Cross-namespace HTTPRoute (aibrix-system) -> Service (default) needs a
+    # ReferenceGrant. Ship a TRE-managed one so  is
+    # self-sufficient and does not depend on an AIBrix-base reserved grant.
+    return {
+        "apiVersion": f"{GATEWAY_API_GROUP}/v1beta1",
+        "kind": "ReferenceGrant",
+        "metadata": {
+            "name": "tre-v2-model-referencegrant-in-default",
+            "namespace": model_namespace,
+            "labels": {"tre.aibrix.io/managed": "true"},
+        },
+        "spec": {
+            "from": [
+                {"group": GATEWAY_API_GROUP, "kind": "HTTPRoute", "namespace": gateway_namespace}
+            ],
+            "to": [{"group": "", "kind": "Service"}],
+        },
+    }
+
+
 def build_resources(registry: Registry) -> list[dict]:
-    return build_services(registry) + build_httproutes(registry) + build_deployments(registry)
+    return [build_referencegrant()] + build_services(registry) + build_httproutes(registry) + build_deployments(registry)
 
 
 def write_manifests(registry: Registry, output_dir: Path) -> list[Path]:

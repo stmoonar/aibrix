@@ -1,0 +1,15 @@
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata:
+  name: tre-v2-model-referencegrant-in-default
+  namespace: default
+  labels:
+    tre.aibrix.io/managed: 'true'
+spec:
+  from:
+  - group: gateway.networking.k8s.io
+    kind: HTTPRoute
+    namespace: aibrix-system
+  to:
+  - group: ''
+    kind: Service

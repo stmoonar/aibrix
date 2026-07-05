@@ -25,6 +25,7 @@ spec:
           env:
             - name: TRE_REDIS_URL
               value: redis://tre-v2-redis:6379/0
+            # AIBrix base gateway writes v1 histogram keys; keep v1 read schema.
             - name: TRE_METRICS_REDIS_URL
               value: redis://aibrix-redis-master.aibrix-system.svc.cluster.local:6379/0
             - name: TRE_METRICS_SCHEMA
@@ -33,8 +34,30 @@ spec:
               value: http://tre-v2-service-manager:8000
             - name: TRE_REGISTRY_PATH
               value: /app/tre/deploy/registry.yaml
+            # --- Signal / percentile口径 (F2 + D2) ---
+            - name: TRE_SIGNAL_SOURCE
+              value: zm
             - name: TRE_PERCENTILE_MODE
               value: bucket_upper
+            # --- F2 zm read-side fixes (baseline lookback / degrade / EMA hold) ---
+            - name: TRE_HIST_BASELINE_LOOKBACK_MS
+              value: "90000"
+            - name: TRE_INCOMPLETE_POLICY
+              value: drop_model
+            - name: TRE_PAPER_STALE_MAX_WINDOWS
+              value: "3"
+            # --- Loop cadence / windows (D2) ---
+            - name: TRE_MONITOR_INTERVAL_SECONDS
+              value: "20"
+            - name: TRE_RESCUE_INTERVAL_SECONDS
+              value: "5"
+            - name: TRE_FAIRNESS_INTERVAL_SECONDS
+              value: "10"
+            - name: TRE_METRICS_WINDOW_MS
+              value: "60000"
+            # --- Ablation switches (D4); production defaults ---
+            - name: ENABLE_TRE_SCALING
+              value: "true"
             - name: TRE_ABLATION_DISABLE_FAST_LOOP
               value: "false"
             - name: TRE_ABLATION_DISABLE_SAFESCALE

@@ -18,6 +18,7 @@ def test_config_defaults_are_plan_aligned() -> None:
     assert config.fairness_interval_s == 10.0
     assert config.metrics_window_ms == 60_000
     assert config.instant_sample_interval_ms == 5_000
+    assert config.histogram_lookback_ms == 90_000
     assert config.percentile_mode == "bucket_upper"
     assert config.signal_source == "zm"
     assert config.paper_stale_max_windows == 3
@@ -40,6 +41,7 @@ def test_config_reads_centralized_environment_values() -> None:
             "TRE_FAIRNESS_INTERVAL_SECONDS": "7.25",
             "TRE_METRICS_WINDOW_MS": "45000",
             "TRE_INSTANT_SAMPLE_INTERVAL_MS": "2500",
+            "TRE_HIST_BASELINE_LOOKBACK_MS": "120000",
             "TRE_PERCENTILE_MODE": "interpolated",
             "TRE_SIGNAL_SOURCE": "latency_p95",
             "TRE_PAPER_STALE_MAX_WINDOWS": "5",
@@ -60,6 +62,7 @@ def test_config_reads_centralized_environment_values() -> None:
     assert config.fairness_interval_s == 7.25
     assert config.metrics_window_ms == 45_000
     assert config.instant_sample_interval_ms == 2_500
+    assert config.histogram_lookback_ms == 120_000
     assert config.percentile_mode == "interpolated"
     assert config.signal_source == "latency_p95"
     assert config.paper_stale_max_windows == 5

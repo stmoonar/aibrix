@@ -1667,3 +1667,46 @@
   41 focused route-guard tests). n4b-done tag is intentionally NOT set here; it
   is set after F4.4 per the plan.
 - Controller left paused; cluster stable, reconcile clean.
+
+### Endgame F4.0 Declarative Deploy Package (offline, TDD, 2026-07-06)
+
+F4.0 makes every manual tre-v2 change declarative so F4.3 can bring the stack up
+from manifests with zero手工 patch. All offline; cluster untouched.
+
+- **gpu-truth DaemonSet** (biggest gap; was manual nohup on node9/node10):
+  - `deploy/overlays/tre-v2/gpu-truth.yaml` = ConfigMap (`tre-v2-gpu-truth-agent`,
+    embeds `deploy/scripts/gpu_truth_agent.py` byte-for-byte) + DaemonSet
+    (`tre-v2-gpu-truth`). Reuses the vllm image already on both GPU nodes
+    (python3 + nvidia-smi), NVIDIA_VISIBLE_DEVICES=all, hostPID:false,
+    nodeSelector `nvidia.com/gpu.present=true`, control-plane toleration, writes
+    `SETEX tre:gpu_truth:<node>` to `redis://tre-v2-redis:6379/0`.
+  - Kustomize default load restrictor forbids a `configMapGenerator` reading
+    `../../scripts/*`, so the ConfigMap is inlined and kept in sync by
+    `deploy/gen_gpu_truth_manifest.py` + `deploy/tests/test_gpu_truth_daemonset.py`
+    (asserts byte-equality with the script + generator reproducibility).
+  - Wired into `overlays/tre-v2/kustomization.yaml`; `kubectl kustomize` builds.
+- **models one-click apply**:
+  - Regenerated `deploy/models/` via `make manifests`: the committed dir was
+    stale (missing the 3 `<model>-router` HTTPRoutes the route-guard generator
+    now emits). Now carries Services + HTTPRoutes + Deployments.
+  - Added a TRE-managed cross-ns `ReferenceGrant`
+    (`tre-v2-model-referencegrant-in-default`) to `gen_model_manifests.py` so
+    `kubectl apply -k deploy/models` is self-sufficient (aibrix-system HTTPRoute
+    -> default Service no longer depends on the AIBrix-base "reserved" grant
+    surviving a 0.7.0 reinstall). +test.
+  - `deploy/scripts/deploy_models.sh`: idempotent `kubectl apply -k deploy/models`
+    (UUIDs are baked/stable; documents the collect+regen refresh path).
+- **env/thresholds explicit in yaml** (F4.0.3): controller.yaml now declares
+  TRE_SIGNAL_SOURCE=zm, TRE_PERCENTILE_MODE=bucket_upper, TRE_INCOMPLETE_POLICY,
+  TRE_PAPER_STALE_MAX_WINDOWS, TRE_HIST_BASELINE_LOOKBACK_MS, cadence/window,
+  ENABLE_TRE_SCALING; service-manager.yaml declares TRE_MODEL_NAMESPACE,
+  TRE_ROUTE_NAMESPACE, TRE_GATEWAY_NAME, TRE_CREATE_MAX_USED_MIB=2500,
+  TRE_SLEEP_LEAK_USED_MIB=8192. Overlay test asserts them.
+  - Wired `TRE_HIST_BASELINE_LOOKBACK_MS` (was a hardcoded 90s MetricsStore
+    default) through `ControllerConfig` (+`_get_nonneg_int`) and `app.py`; +tests.
+- **images.lock.md** (F4.0.4): recorded SM/controller/ui/redis/vllm tags + local
+  build digests; noted the controller image must be rebuilt from post-F4.0 HEAD
+  before F4.3 (benign env mismatch until then).
+- Gate: `cd tre && make check` **268 passed** (was 264, +4). All 5 overlays +
+  models `kubectl kustomize` build clean. Cluster untouched (controller still
+  paused, SM/redis/ui Running).

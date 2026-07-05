@@ -125,6 +125,7 @@ def create_controller_dependencies(
         instant_sample_interval_ms=cfg.instant_sample_interval_ms,
         percentile_mode=cfg.percentile_mode,
         schema=cfg.metrics_schema,
+        histogram_lookback_ms=cfg.histogram_lookback_ms,
     )
     sm_client = ServiceManagerClient(cfg.service_manager_url, transport=sm_transport)
     safescale = SafeScaleStateMachine(config=cfg.safescale, store=ControllerStateStore(redis_client))

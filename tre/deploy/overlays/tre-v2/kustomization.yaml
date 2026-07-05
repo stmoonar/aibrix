@@ -8,3 +8,4 @@ resources:
   - service-manager.yaml
   - controller.yaml
   - ui.yaml
+  - gpu-truth.yaml

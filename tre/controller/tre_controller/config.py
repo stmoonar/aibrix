@@ -41,6 +41,7 @@ class ControllerConfig:
     fairness_interval_s: float
     metrics_window_ms: int
     instant_sample_interval_ms: int
+    histogram_lookback_ms: int
     percentile_mode: str
     signal_source: str
     paper_stale_max_windows: int
@@ -108,6 +109,7 @@ class ControllerConfig:
             fairness_interval_s=_get_positive_float(values, "TRE_FAIRNESS_INTERVAL_SECONDS", 10.0),
             metrics_window_ms=_get_positive_int(values, "TRE_METRICS_WINDOW_MS", 60_000),
             instant_sample_interval_ms=_get_positive_int(values, "TRE_INSTANT_SAMPLE_INTERVAL_MS", 5_000),
+            histogram_lookback_ms=_get_nonneg_int(values, "TRE_HIST_BASELINE_LOOKBACK_MS", 90_000),
             percentile_mode=percentile_mode,
             signal_source=signal_source,
             paper_stale_max_windows=_get_positive_int(values, "TRE_PAPER_STALE_MAX_WINDOWS", 3),
@@ -159,4 +161,15 @@ def _get_positive_int(env: Mapping[str, str], key: str, default: int) -> int:
         raise ValueError(f"{key} must be an integer") from exc
     if value <= 0:
         raise ValueError(f"{key} must be positive")
+    return value
+
+
+def _get_nonneg_int(env: Mapping[str, str], key: str, default: int) -> int:
+    raw = env.get(key, str(default))
+    try:
+        value = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{key} must be an integer") from exc
+    if value < 0:
+        raise ValueError(f"{key} must be non-negative")
     return value

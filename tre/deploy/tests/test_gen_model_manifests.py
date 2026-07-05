@@ -316,13 +316,27 @@ def test_write_manifests_includes_services_and_deployments(tmp_path):
 
     written = write_manifests(registry, tmp_path / "models")
 
-    assert len(build_resources(registry)) == 7
+    assert len(build_resources(registry)) == 8
     assert sorted(item.name for item in written) == [
         "one-gpu-node-75-gpu-0.yaml",
         "one-gpu-node-75-gpu-1.yaml",
         "one-gpu-router.yaml",
         "one-gpu.yaml",
+        "tre-v2-model-referencegrant-in-default.yaml",
         "two-gpu-node-75-gpu-0-1.yaml",
         "two-gpu-router.yaml",
         "two-gpu.yaml",
     ]
+
+
+def test_build_referencegrant_allows_aibrix_httproute_to_default_service() -> None:
+    from gen_model_manifests import build_referencegrant
+
+    grant = build_referencegrant()
+    assert grant["kind"] == "ReferenceGrant"
+    assert grant["metadata"]["namespace"] == "default"
+    assert grant["metadata"]["labels"]["tre.aibrix.io/managed"] == "true"
+    assert grant["spec"]["from"] == [
+        {"group": "gateway.networking.k8s.io", "kind": "HTTPRoute", "namespace": "aibrix-system"}
+    ]
+    assert grant["spec"]["to"] == [{"group": "", "kind": "Service"}]
