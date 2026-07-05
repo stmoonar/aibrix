@@ -1099,3 +1099,30 @@
 ### Endgame F1 Next
 
 - Build and roll a new service-manager image with the GPU truth provider, run the GPU truth agent once on node9/node10, and validate `POST /v2/reconcile` reports no false leak warnings in the healthy restored topology.
+
+### Endgame F1.3 GPU Truth Rollout And Live Validation
+
+- Fixed the Plan B agent for bare host execution:
+  - node10 had the Python `redis` package, but node9 did not.
+  - Added a standard-library Redis `SETEX` fallback using a RESP encoder, with RED/GREEN coverage in `deploy/tests/test_gpu_truth_agent.py`.
+  - Full `cd tre && make check` passed with `247 passed`.
+- Updated the tre-v2 service-manager overlay and overlay test to pin `tre-v2-service-manager:20260705-ba88b1b0`.
+- Rebuilt the service-manager image and verified inside the image:
+  - `python -m pytest -q service-manager/tests/test_gpu_truth.py service-manager/tests/test_reconcile.py service-manager/tests/test_api_v2.py deploy/tests/test_gpu_truth_agent.py`
+  - Result: `30 passed`, one existing Starlette/httpx deprecation warning.
+- Started GPU truth agents on both GPU nodes with local `/tmp` logs:
+  - node9: `/tmp/tre_gpu_truth_agent_node9.log`, process evidence in `docs/refactor/p11_evidence/f1_gpu_truth_20260705/node9_agent_process.txt`.
+  - node10: `/tmp/tre_gpu_truth_agent_node10.log`, process evidence in `docs/refactor/p11_evidence/f1_gpu_truth_20260705/node10_agent_process.txt`.
+  - Redis TTL check showed both `tre:gpu_truth:<node>` keys refreshing.
+- Rolled service-manager only via `kubectl -n tre-v2 set image`, leaving the paused controller untouched.
+  - New pod: `tre-v2-service-manager-86b985cfbb-zntf2`.
+  - `/healthz` returned `{"ok":true}` and `/v2/state` preserved the 12-binding topology.
+- Live truth validation:
+  - Healthy truth reconcile returned `warnings=[]`.
+  - Synthetic Redis truth injection set node9 GPU2 `used_mib=24000`; `POST /v2/reconcile` returned expected `sleep_leak:` warnings for the three sleeping bindings sharing GPU2.
+  - Re-running node9 agent restored real truth, and the next reconcile returned `warnings=[]`.
+  - Evidence directory: `docs/refactor/p11_evidence/f1_gpu_truth_20260705/`.
+
+### Endgame F1 Next
+
+- Commit the service-manager rollout artifacts, then continue to F2 zm signal repair.

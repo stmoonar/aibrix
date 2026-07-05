@@ -1,0 +1,1 @@
+4188585 python3 /data/nfs_shared_data/xxy/aibrix/tre/deploy/scripts/gpu_truth_agent.py --redis-url redis://10.108.91.99:6379/0 --node nscc-ds-4a100-node10 --interval-s 30 --ttl-s 120

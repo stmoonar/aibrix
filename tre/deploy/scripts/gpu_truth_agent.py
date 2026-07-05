@@ -5,6 +5,7 @@ import json
 import socket
 import subprocess
 import time
+from urllib.parse import urlparse
 
 
 def parse_nvidia_smi_csv(text: str) -> list[dict]:
@@ -53,6 +54,34 @@ def publish_once(redis_client, *, node: str, ttl_s: int) -> dict:
     return payload
 
 
+class RawRedisSetexClient:
+    def __init__(self, redis_url: str) -> None:
+        parsed = urlparse(redis_url)
+        if parsed.scheme != "redis":
+            raise ValueError(f"unsupported redis url scheme: {parsed.scheme}")
+        self._host = parsed.hostname or "localhost"
+        self._port = parsed.port or 6379
+
+    def setex(self, key: str, ttl_s: int, value: str) -> None:
+        command = encode_setex_command(key, ttl_s, value)
+        with socket.create_connection((self._host, self._port), timeout=5) as sock:
+            sock.sendall(command)
+            response = sock.recv(1024)
+        if not response.startswith(b"+OK"):
+            raise RuntimeError(f"redis SETEX failed: {response!r}")
+
+
+def encode_setex_command(key: str, ttl_s: int, value: str) -> bytes:
+    parts = ["SETEX", key, str(ttl_s), value]
+    encoded = [part.encode("utf-8") for part in parts]
+    out = [f"*{len(encoded)}\r\n".encode("ascii")]
+    for part in encoded:
+        out.append(f"${len(part)}\r\n".encode("ascii"))
+        out.append(part)
+        out.append(b"\r\n")
+    return b"".join(out)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Publish node GPU memory truth to TRE Redis.")
     parser.add_argument("--redis-url", required=True)
@@ -62,9 +91,12 @@ def main() -> int:
     parser.add_argument("--once", action="store_true")
     args = parser.parse_args()
 
-    import redis  # type: ignore[import-not-found]
+    try:
+        import redis  # type: ignore[import-not-found]
 
-    client = redis.Redis.from_url(args.redis_url)
+        client = redis.Redis.from_url(args.redis_url)
+    except ModuleNotFoundError:
+        client = RawRedisSetexClient(args.redis_url)
     while True:
         publish_once(client, node=args.node, ttl_s=args.ttl_s)
         if args.once:

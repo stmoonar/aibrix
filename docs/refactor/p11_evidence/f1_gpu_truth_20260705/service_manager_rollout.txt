@@ -1,0 +1,4 @@
+NAME                     READY   UP-TO-DATE   AVAILABLE   AGE   CONTAINERS        IMAGES                                     SELECTOR
+tre-v2-service-manager   1/1     1            1           26h   service-manager   tre-v2-service-manager:20260705-ba88b1b0   app.kubernetes.io/name=tre-v2-service-manager
+NAME                                      READY   STATUS    RESTARTS   AGE   IP             NODE                   NOMINATED NODE   READINESS GATES
+tre-v2-service-manager-86b985cfbb-zntf2   1/1     Running   0          72s   10.244.0.169   nscc-ds-4a100-node10   <none>           <none>
