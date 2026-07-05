@@ -6,6 +6,7 @@ from typing import Protocol
 
 class HttpTransport(Protocol):
     def post(self, url: str, *, timeout: float): ...
+    def get(self, url: str, *, timeout: float): ...
 
 
 @dataclass(frozen=True)
@@ -40,6 +41,50 @@ class VllmOps:
 
     def wake_up(self, pod_ip: str, *, port: int | None = None) -> VllmOpResult:
         return self._post(pod_ip, "wake_up", port=port)
+
+    def wait_until_ready(
+        self,
+        pod_ip: str,
+        *,
+        port: int | None = None,
+        timeout_s: float = 180.0,
+        interval_s: float = 2.0,
+    ) -> VllmOpResult:
+        import time
+
+        url = f"http://{pod_ip}:{port or self._default_port}/is_sleeping"
+        deadline = time.monotonic() + timeout_s
+        attempts = 0
+        last_status: int | None = None
+        last_message = ""
+        while time.monotonic() < deadline:
+            attempts += 1
+            try:
+                response = self._http.get(url, timeout=self._timeout_s)
+            except Exception as exc:  # pragma: no cover - exact transport exceptions vary.
+                last_message = str(exc)
+            else:
+                last_status = int(response.status_code)
+                last_message = getattr(response, "text", "") or ""
+                if 200 <= last_status < 300:
+                    return VllmOpResult(
+                        success=True,
+                        action="wait_until_ready",
+                        url=url,
+                        attempts=attempts,
+                        status_code=last_status,
+                        message=last_message,
+                    )
+            time.sleep(interval_s)
+
+        return VllmOpResult(
+            success=False,
+            action="wait_until_ready",
+            url=url,
+            attempts=attempts,
+            status_code=last_status,
+            message=last_message or "timed out waiting for vLLM HTTP readiness",
+        )
 
     def _post(self, pod_ip: str, action: str, *, port: int | None) -> VllmOpResult:
         url = f"http://{pod_ip}:{port or self._default_port}/{action}"
@@ -85,6 +130,11 @@ class VllmOps:
 
 
 class _RequestsTransport:
+    def get(self, url: str, *, timeout: float):
+        import requests
+
+        return requests.get(url, timeout=timeout)
+
     def post(self, url: str, *, timeout: float):
         import requests
 

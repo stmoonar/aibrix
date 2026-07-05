@@ -51,6 +51,10 @@ class FakeVllmOps:
     def __init__(self):
         self.calls = []
 
+    def wait_until_ready(self, pod_ip, *, port=None):
+        self.calls.append(("wait_until_ready", pod_ip, port))
+        return type("Result", (), {"success": True, "message": ""})()
+
     def sleep(self, pod_ip, *, port=None):
         self.calls.append(("sleep", pod_ip, port))
         return type("Result", (), {"success": True, "message": ""})()
@@ -349,7 +353,10 @@ def test_v2_put_target_creates_deployment_when_runtime_deployment_ops_are_availa
         ("ready", "tp2-deployment"),
         ("tp2-pod", "awake"),
     ]
-    assert vllm_ops.calls == [("wake_up", "10.0.0.9", 8000)]
+    assert vllm_ops.calls == [
+        ("wait_until_ready", "10.0.0.9", 8000),
+        ("wake_up", "10.0.0.9", 8000),
+    ]
     assert store.load().bindings == [
         Binding("serve-a", "m1", Slot("node-a", (0,)), awake=True),
         Binding("tp2-pod", "tp2", Slot("node-a", (2, 3)), awake=True),

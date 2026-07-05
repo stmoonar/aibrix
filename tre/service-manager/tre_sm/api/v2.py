@@ -273,6 +273,10 @@ class ServiceManagerV2:
         ready = self._runtime_ops.wait_pod_ready(deployment_id)
         if not ready.pod_ip:
             raise ValueError(f"pod {ready.name} has no pod IP for wake")
+        ready_result = self._vllm_ops.wait_until_ready(ready.pod_ip, port=8000)
+        if not bool(getattr(ready_result, "success", False)):
+            message = getattr(ready_result, "message", "") or "operation failed"
+            raise ValueError(f"vLLM readiness failed for {ready.name}: {message}")
         result = self._vllm_ops.wake_up(ready.pod_ip, port=8000)
         if not bool(getattr(result, "success", False)):
             message = getattr(result, "message", "") or "operation failed"
@@ -309,6 +313,10 @@ class ServiceManagerV2:
         )
         if not ready.pod_ip:
             raise ValueError(f"pod {new_serve_id} has no pod IP for wake")
+        ready_result = self._vllm_ops.wait_until_ready(ready.pod_ip, port=8000)
+        if not bool(getattr(ready_result, "success", False)):
+            message = getattr(ready_result, "message", "") or "operation failed"
+            raise ValueError(f"vLLM readiness failed for {new_serve_id}: {message}")
         result = self._vllm_ops.wake_up(ready.pod_ip, port=8000)
         if not bool(getattr(result, "success", False)):
             message = getattr(result, "message", "") or "operation failed"

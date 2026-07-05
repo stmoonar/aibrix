@@ -79,6 +79,10 @@ class FakeVllmOps:
     def __init__(self):
         self.calls = []
 
+    def wait_until_ready(self, pod_ip, *, port=None):
+        self.calls.append(("wait_until_ready", pod_ip, port))
+        return type("Result", (), {"success": True, "message": ""})()
+
     def sleep(self, pod_ip, *, port=None):
         self.calls.append(("sleep", pod_ip, port))
         return type("Result", (), {"success": True, "message": ""})()
@@ -213,6 +217,7 @@ def test_v2_defrag_uses_runtime_delete_create_path_and_is_idempotent():
     ]
     assert vllm_ops.calls == [
         ("sleep", "10.0.0.2", 8000),
+        ("wait_until_ready", "10.0.0.3", 8000),
         ("wake_up", "10.0.0.3", 8000),
     ]
     assert store.load().bindings == [

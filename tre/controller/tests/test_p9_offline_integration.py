@@ -116,6 +116,10 @@ class FakeVllmOps:
     def __init__(self) -> None:
         self.calls: list[tuple] = []
 
+    def wait_until_ready(self, pod_ip, *, port=None):
+        self.calls.append(("wait_until_ready", pod_ip, port))
+        return type("Result", (), {"success": True, "message": ""})()
+
     def sleep(self, pod_ip, *, port=None):
         self.calls.append(("sleep", pod_ip, port))
         return type("Result", (), {"success": True, "message": ""})()
@@ -311,6 +315,8 @@ async def test_p9_offline_integration_defrags_fragmented_capacity_then_expands_t
     ]
     assert vllm_ops.calls == [
         ("sleep", "10.0.0.2", 8000),
+        ("wait_until_ready", "10.0.0.3", 8000),
         ("wake_up", "10.0.0.3", 8000),
+        ("wait_until_ready", "10.0.0.4", 8000),
         ("wake_up", "10.0.0.4", 8000),
     ]
