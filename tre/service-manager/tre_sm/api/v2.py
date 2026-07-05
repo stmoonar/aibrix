@@ -76,13 +76,23 @@ class ServiceManagerV2:
 
         if len(awake) < wake_replicas:
             sleeping = [binding for binding in model_bindings if not binding.awake]
-            wake_existing = min(wake_replicas - len(awake), len(sleeping))
-            for binding in sleeping[:wake_existing]:
-                self._ensure_feasible_wake(binding, list(updated_by_serve.values()))
+            wake_existing = 0
+            wake_needed = wake_replicas - len(awake)
+            skipped_conflict: str | None = None
+            for binding in sleeping:
+                if wake_existing >= wake_needed:
+                    break
+                if not self._feasible_wake(binding, list(updated_by_serve.values())):
+                    if skipped_conflict is None:
+                        skipped_conflict = f"{binding.serve_id}: slot already has awake binding"
+                    continue
                 self._apply_runtime_power_action(binding, action="wake")
                 updated_by_serve[binding.serve_id] = replace(binding, awake=True, hidden=False)
                 actions.append({"action": "wake", "serve_id": binding.serve_id})
-            create_count = wake_replicas - len(awake) - wake_existing
+                wake_existing += 1
+            create_count = max(0, wake_replicas - len(model_bindings))
+            if len(awake) + wake_existing + create_count < wake_replicas:
+                raise WakeConflict(skipped_conflict or f"{model}: no feasible sleeping binding for target")
             if create_count > 0:
                 allocator = SlotAllocator(self._registry.topology(), list(updated_by_serve.values()))
                 existing_serve_ids = set(updated_by_serve)
@@ -311,12 +321,15 @@ class ServiceManagerV2:
         return actions, moved
 
     def _ensure_feasible_wake(self, binding: Binding, bindings: list[Binding]) -> None:
+        if not self._feasible_wake(binding, bindings):
+            raise WakeConflict(f"{binding.serve_id}: slot already has awake binding")
+
+    def _feasible_wake(self, binding: Binding, bindings: list[Binding]) -> bool:
         try:
             allocator = SlotAllocator(self._registry.topology(), bindings)
         except ValueError as exc:
             raise WakeConflict(str(exc)) from exc
-        if not allocator.feasible_wake(binding.serve_id):
-            raise WakeConflict(f"{binding.serve_id}: slot already has awake binding")
+        return allocator.feasible_wake(binding.serve_id)
 
     def _snapshot_for_binding(self, binding: Binding) -> K8sPodSnapshot:
         snapshots = self._runtime_ops.list_pod_snapshots(model=binding.model) if self._runtime_ops else []
