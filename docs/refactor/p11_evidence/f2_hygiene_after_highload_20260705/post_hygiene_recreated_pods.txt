@@ -1,0 +1,4 @@
+NAME                                                       READY   STATUS    RESTARTS        AGE     IP             NODE                   NOMINATED NODE   READINESS GATES
+dsqwen-14b-nscc-ds-4a100-node9-gpu-2-3-84f8576d97-wx5tb    1/1     Running   0               3m23s   10.244.3.76    nscc-ds-4a100-node9    <none>           <none>
+dsqwen-7b-nscc-ds-4a100-node9-gpu-2-7fc65f475b-zmnpj       1/1     Running   0               14m     10.244.3.74    nscc-ds-4a100-node9    <none>           <none>
+dsqwen-7b-nscc-ds-4a100-node9-gpu-3-86c8574f65-rx4hq       1/1     Running   0               5m53s   10.244.3.75    nscc-ds-4a100-node9    <none>           <none>

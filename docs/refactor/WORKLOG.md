@@ -1458,3 +1458,70 @@
 
 - Run full `cd tre && make check`, commit the image pin, roll controller, and
   rerun high-load zm scale validation.
+
+### Endgame F2.5 High-Load zm Validation After Inflight Fix
+
+- Rolled controller image `tre-v2-controller:20260705-d795a715` and reran the
+  dsqwen-7b high-load validation:
+  - command: `python3 tre/deploy/scripts/n4b_three_model_precheck.py --models dsqwen-7b --duration-seconds 300 --phase-seconds 300 --workers 16 --sample-seconds 15 --max-tokens 96`
+  - output: `docs/refactor/p11_evidence/f2_zm_precheck_20260705/dsqwen7b_highload_after_inflight_fix.json`
+  - controller log: `docs/refactor/p11_evidence/f2_zm_precheck_20260705/controller_since_dsqwen7b_highload_after_inflight_fix.log`
+  - post-run reconcile: `docs/refactor/p11_evidence/f2_zm_precheck_20260705/post_dsqwen7b_highload_after_inflight_fix_reconcile.json`
+- Result:
+  - duration: `301.6s`
+  - ok requests: `dsqwen-7b=3808`
+  - errors: one gateway `503`
+  - restart deltas: none
+  - initial state: all three models `awake=1`, `bound=4`
+  - final run state: `dsqwen-7b awake=3`, `bound=4`; other models stayed
+    `awake=1`, `bound=4`
+  - controller submitted `54` scale actions, all
+    `kind=scale`, `model=dsqwen-7b`, `delta=1`,
+    `reason=critical_sleeping_capacity`, `source_loop=rescue`
+  - `dsqwen-7b z_m` during the run: `81` non-null samples,
+    `min=0.539`, `p50=0.700`, `max=0.703`
+- F2.5 scale-action conclusion: after the ActionQueue inflight fix, critical
+  `Z_m` did produce zm-based scale actions and the live topology scaled qwen
+  from one awake replica to three awake replicas. The remaining issue after the
+  run was GPU hygiene when scaling back down, not planner action generation.
+
+### Endgame F2.5 Post-High-Load D8 Hygiene
+
+- Reduced qwen back to target `wake_replicas=1` after the high-load run. Manual
+  node9 `nvidia-smi` inspection showed the sleeping qwen GPU2/GPU3 replicas
+  still holding about `36.9 GiB` each, i.e. a true sleep leak rather than stale
+  GPU truth.
+- Paused controller before hygiene:
+  - `kubectl -n tre-v2 scale deploy/tre-v2-controller --replicas=0`
+- Hygiene actions:
+  - saved pre-delete deployment/reconcile evidence under
+    `docs/refactor/p11_evidence/f2_hygiene_after_highload_20260705/`
+  - deleted the leaked qwen GPU2/GPU3 deployments and the co-resident 14B node9
+    GPU2-3 deployment
+  - recreated `dsqwen-7b` node9 GPU2, waited for HTTP health, reconciled, and
+    set qwen target back to `awake=1`; `/is_sleeping` returned true
+  - recreated `dsqwen-7b` node9 GPU3 with the same sequence; after sleep, node9
+    GPU2/GPU3 each held about `2248 MiB`, matching two sleeping single-GPU pods
+  - recreated `dsqwen-14b` node9 GPU2-3, waited for HTTP health, reconciled,
+    set 14B target back to `awake=1`; `/is_sleeping` returned true
+- Post-hygiene evidence:
+  - `post_hygiene_reconcile.json`: `warnings=[]`
+  - `post_hygiene_state.json`: all three models `awake=1`, `bound=4`
+  - `post_hygiene_sleep_probes.json`: qwen GPU2, qwen GPU3, and 14B GPU2-3 all
+    report `is_sleeping=true`
+  - `node9_post_hygiene_nvidia.txt`: GPU2/GPU3 each at `4070 MiB`, with
+    `1090 MiB` llama + `1054 MiB` qwen + `1766 MiB` 14B sleeping processes
+  - `post_hygiene_recreated_deployments.yaml`,
+    `post_hygiene_recreated_pods.txt`,
+    `post_hygiene_controller_deploy.yaml`,
+    `post_hygiene_controller_pod.txt`,
+    `post_hygiene_controller_since_restore.log`
+- Resumed controller after full topology was restored:
+  - `kubectl -n tre-v2 scale deploy/tre-v2-controller --replicas=1`
+  - controller pod: `tre-v2-controller-65bb7cdf46-7tnmp`
+  - image: `tre-v2-controller:20260705-d795a715`
+  - 35-second post-restore check: reconcile still `warnings=[]`, state still all
+    three models `awake=1`, `bound=4`, node9 GPU2/GPU3 still `4070 MiB`.
+- F2.5 hygiene conclusion: D8 delete/recreate cured the post-scale-down qwen
+  sleep leak and restored a clean 12-binding topology. Proceeding to commit
+  F2.5 evidence after full `make check`, then F3 live defrag.

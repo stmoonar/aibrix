@@ -1,0 +1,20 @@
+[
+  {
+    "app": "dsqwen-7b-nscc-ds-4a100-node9-gpu-2",
+    "pod": "dsqwen-7b-nscc-ds-4a100-node9-gpu-2-7fc65f475b-zmnpj",
+    "ip": "10.244.3.74",
+    "is_sleeping": true
+  },
+  {
+    "app": "dsqwen-7b-nscc-ds-4a100-node9-gpu-3",
+    "pod": "dsqwen-7b-nscc-ds-4a100-node9-gpu-3-86c8574f65-rx4hq",
+    "ip": "10.244.3.75",
+    "is_sleeping": true
+  },
+  {
+    "app": "dsqwen-14b-nscc-ds-4a100-node9-gpu-2-3",
+    "pod": "dsqwen-14b-nscc-ds-4a100-node9-gpu-2-3-84f8576d97-wx5tb",
+    "ip": "10.244.3.76",
+    "is_sleeping": true
+  }
+]
