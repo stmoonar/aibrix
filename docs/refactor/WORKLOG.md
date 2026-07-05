@@ -1126,3 +1126,28 @@
 ### Endgame F1 Next
 
 - Commit the service-manager rollout artifacts, then continue to F2 zm signal repair.
+
+### Endgame F2.1 Metrics Baseline Lookback
+
+- Completed F2 step 0 read-only measurement against production AIBrix Redis:
+  - Key family: `aibrix:pod_histogram_metrics_*`.
+  - Active pod sampled: `default/dsllama-8b-nscc-ds-4a100-node9-gpu-1-5579b75f9b-kh5fx`.
+  - Recent samples: 50.
+  - Adjacent timestamp intervals: min `0 ms`, p50 `5000 ms`, p95 `5000 ms`, max `5000 ms`.
+  - Selected histogram lookback: `90000 ms`.
+  - Recorded in `docs/refactor/03_metrics_pipeline.md`.
+- Added RED tests for metrics baseline behavior:
+  - v2 zset path: one in-window histogram doc plus pre-window baseline computes the correct delta.
+  - v2 zset path: no in-window histogram doc yields `prompt_tokens=None` / `generation_tokens=None` while instant metrics still aggregate.
+  - v1 legacy key path: one in-window histogram doc plus pre-window baseline computes the correct delta from parsed key timestamps.
+- Implemented `MetricsStore(histogram_lookback_ms=90000)`:
+  - `_read_zset_docs` and `_read_legacy_docs` include the last pre-window baseline document.
+  - Histogram delta/avg/percentile functions require at least one in-window histogram metric before computing.
+  - Token fields in `PodWindowMetrics` and `ModelWindowMetrics` are now `float | None`; model aggregation returns `None` only when no pod has token data for the window.
+- Verification:
+  - Focused `controller/tests/test_metrics_store.py`: `8 passed`.
+  - Full `cd tre && make check`: `250 passed`.
+
+### Endgame F2 Next
+
+- Implement TRS/classification stale-hold and per-model planner drop policy.

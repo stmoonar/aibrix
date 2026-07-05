@@ -136,3 +136,21 @@ The golden helper is test-only and mirrors the frozen collector formulas: first/
 - P3 store slice completed for v2/v1 reads, edge fixtures, golden formula comparison, and 3 model x 8 pod x 30 minute benchmark.
 - Real Redis dump was skipped: read-only host probe to the cluster Redis service timed out from server 76.
 - Broader follow-up moves to P5 integration use of `MetricsSnapshot`.
+## F2 Redis Histogram Interval Probe
+
+Date: 2026-07-05.
+
+Read-only probe against production AIBrix Redis (`aibrix-system/aibrix-redis-master`) for legacy
+`aibrix:pod_histogram_metrics_*` keys:
+
+- Active pod sampled: `default/dsllama-8b-nscc-ds-4a100-node9-gpu-1-5579b75f9b-kh5fx`.
+- Recent samples: 50.
+- Adjacent timestamp interval distribution:
+  - min: `0 ms`
+  - p50: `5000 ms`
+  - p95: `5000 ms`
+  - max: `5000 ms`
+- F2 lookback parameter: `max(90s, 3 * p95) = 90000 ms`.
+
+Implementation note: legacy v1 metrics use timestamp-suffixed string keys, not v2 zset scores, so the
+same lookback rule is applied to parsed key timestamps for `_read_legacy_docs`.

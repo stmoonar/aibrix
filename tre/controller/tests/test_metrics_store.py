@@ -168,6 +168,53 @@ def test_metrics_store_reads_v1_legacy_keys_without_pod_set():
     assert redis.scan_calls == 2
 
 
+def test_metrics_store_uses_pre_window_v2_baseline_for_single_hist_doc_delta():
+    redis = FakeRedis()
+    pod = "default/pod-a"
+    redis.sadd("tre:v2:pods:dsqwen-7b", pod)
+    add_doc(redis, "tre:v2:hist:" + pod, 1_000, hist_doc("pod-a", 10, 1, 1.0, 10, {"0.5": 10}))
+    add_doc(redis, "tre:v2:hist:" + pod, 11_000, hist_doc("pod-a", 42, 2, 4.0, 20, {"0.5": 20}))
+
+    store = MetricsStore(redis, load_registry(str(REGISTRY_PATH)), instant_sample_interval_ms=5_000)
+
+    metrics = store.read_model_window("dsqwen-7b", 10_000, 20_000)
+
+    assert metrics.prompt_tokens == 32.0
+    assert metrics.ttft_p95_ms == 500.0
+
+
+def test_metrics_store_returns_none_tokens_when_window_has_no_hist_docs():
+    redis = FakeRedis()
+    pod = "default/pod-a"
+    redis.sadd("tre:v2:pods:dsqwen-7b", pod)
+    add_doc(redis, "tre:v2:hist:" + pod, 1_000, hist_doc("pod-a", 10, 1, 1.0, 10, {"0.5": 10}))
+    add_doc(redis, "tre:v2:inst:" + pod, 11_000, inst_doc("pod-a", waiting=2, running=1, kv_hit=0.50))
+
+    store = MetricsStore(redis, load_registry(str(REGISTRY_PATH)), instant_sample_interval_ms=5_000)
+
+    metrics = store.read_model_window("dsqwen-7b", 10_000, 20_000)
+
+    assert metrics.prompt_tokens is None
+    assert metrics.generation_tokens is None
+    assert metrics.avg_waiting == 1.0
+
+
+def test_metrics_store_uses_pre_window_v1_baseline_for_single_hist_doc_delta():
+    redis = FakeRedis()
+    pod = "default/pod-a"
+    baseline_ms = 1_700_000_001_000
+    end_ms = 1_700_000_011_000
+    set_legacy_doc(redis, f"aibrix:pod_histogram_metrics_{pod}_{baseline_ms}", baseline_ms, hist_doc("pod-a", 10, 1, 1.0, 10, {"0.5": 10}))
+    set_legacy_doc(redis, f"aibrix:pod_histogram_metrics_{pod}_{end_ms}", end_ms, hist_doc("pod-a", 42, 2, 4.0, 20, {"0.5": 20}))
+
+    store = MetricsStore(redis, load_registry(str(REGISTRY_PATH)), instant_sample_interval_ms=5_000, schema="v1")
+
+    metrics = store.read_model_window("dsqwen-7b", baseline_ms + 5_000, baseline_ms + 20_000)
+
+    assert metrics.prompt_tokens == 32.0
+    assert metrics.ttft_p95_ms == 500.0
+
+
 def test_metrics_store_snapshot_reads_all_registry_models_from_fixture():
     redis = FixtureRedis()
     window = populate_edge_case_fixture(redis)

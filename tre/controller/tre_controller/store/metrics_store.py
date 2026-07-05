@@ -36,9 +36,12 @@ class MetricsStore:
         instant_sample_interval_ms: int,
         percentile_mode: str = "bucket_upper",
         schema: str = "v2",
+        histogram_lookback_ms: int = 90_000,
     ) -> None:
         if instant_sample_interval_ms <= 0:
             raise ValueError("instant_sample_interval_ms must be positive")
+        if histogram_lookback_ms < 0:
+            raise ValueError("histogram_lookback_ms must be non-negative")
         if schema not in {"v1", "v2"}:
             raise ValueError("schema must be v1 or v2")
         self._redis = redis_client
@@ -46,6 +49,7 @@ class MetricsStore:
         self._instant_sample_interval_ms = instant_sample_interval_ms
         self._percentile_mode = percentile_mode
         self._schema = schema
+        self._histogram_lookback_ms = histogram_lookback_ms
         self._window_cache: dict[tuple[str, str, int, int], ModelWindowMetrics] = {}
 
     def read_snapshot(self, window_start_ms: int, window_end_ms: int) -> MetricsSnapshot:
@@ -66,7 +70,12 @@ class MetricsStore:
             pods = sorted(_decode_text(pod) for pod in self._redis.smembers(pods_key(model)))
             per_pod: dict[str, PodWindowMetrics] = {}
             for pod_key in pods:
-                hist_docs = self._read_zset_docs(hist_key(pod_key), window_start_ms, window_end_ms)
+                hist_docs = self._read_zset_docs(
+                    hist_key(pod_key),
+                    window_start_ms,
+                    window_end_ms,
+                    lookback_ms=self._histogram_lookback_ms,
+                )
                 inst_docs = self._read_zset_docs(inst_key(pod_key), window_start_ms, window_end_ms)
                 pod_metrics = self._aggregate_pod(model, pod_key, hist_docs, inst_docs, window_start_ms, window_end_ms)
                 if pod_metrics is not None:
@@ -76,8 +85,15 @@ class MetricsStore:
         self._window_cache[cache_key] = model_metrics
         return model_metrics
 
-    def _read_zset_docs(self, key: str, window_start_ms: int, window_end_ms: int) -> list[dict[str, Any]]:
-        raw_members = self._redis.zrangebyscore(key, window_start_ms, window_end_ms)
+    def _read_zset_docs(
+        self,
+        key: str,
+        window_start_ms: int,
+        window_end_ms: int,
+        *,
+        lookback_ms: int = 0,
+    ) -> list[dict[str, Any]]:
+        raw_members = self._redis.zrangebyscore(key, max(0, window_start_ms - lookback_ms), window_end_ms)
         docs: list[dict[str, Any]] = []
         for raw in raw_members:
             try:
@@ -87,7 +103,7 @@ class MetricsStore:
             if isinstance(doc, dict):
                 docs.append(doc)
         docs.sort(key=lambda doc: _number(doc.get("timestamp"), 0.0))
-        return docs
+        return _with_baseline_doc(docs, window_start_ms) if lookback_ms else docs
 
     def _read_v1_model_window(
         self,
@@ -95,7 +111,13 @@ class MetricsStore:
         window_start_ms: int,
         window_end_ms: int,
     ) -> dict[str, PodWindowMetrics]:
-        hist_by_pod = self._read_legacy_docs(LEGACY_HIST_PREFIX, model, window_start_ms, window_end_ms)
+        hist_by_pod = self._read_legacy_docs(
+            LEGACY_HIST_PREFIX,
+            model,
+            window_start_ms,
+            window_end_ms,
+            lookback_ms=self._histogram_lookback_ms,
+        )
         inst_by_pod = self._read_legacy_docs(LEGACY_INST_PREFIX, model, window_start_ms, window_end_ms)
         per_pod: dict[str, PodWindowMetrics] = {}
         for pod_key in sorted(set(hist_by_pod) | set(inst_by_pod)):
@@ -117,6 +139,8 @@ class MetricsStore:
         model: str,
         window_start_ms: int,
         window_end_ms: int,
+        *,
+        lookback_ms: int = 0,
     ) -> dict[str, list[dict[str, Any]]]:
         keys: list[str] = []
         for raw_key in self._redis.scan_iter(prefix + "*"):
@@ -125,7 +149,7 @@ class MetricsStore:
             if parsed is None:
                 continue
             _, ts_ms = parsed
-            if window_start_ms <= ts_ms <= window_end_ms:
+            if max(0, window_start_ms - lookback_ms) <= ts_ms <= window_end_ms:
                 keys.append(key)
         values = self._redis.mget(keys) if keys else []
         docs_by_pod: dict[str, list[dict[str, Any]]] = {}
@@ -146,6 +170,8 @@ class MetricsStore:
             docs_by_pod.setdefault(pod_key, []).append(doc)
         for docs in docs_by_pod.values():
             docs.sort(key=lambda doc: _number(doc.get("timestamp"), 0.0))
+        if lookback_ms:
+            return {pod: _with_baseline_doc(docs, window_start_ms) for pod, docs in docs_by_pod.items()}
         return docs_by_pod
 
     def _aggregate_pod(
@@ -161,15 +187,15 @@ class MetricsStore:
             return None
         pod_name = _pod_name(hist_docs, inst_docs, pod_key)
 
-        prompt_tokens = self._hist_sum_delta(model, HISTOGRAM_METRICS["prompt_tokens"], hist_docs)
-        generation_tokens = self._hist_sum_delta(model, HISTOGRAM_METRICS["generation_tokens"], hist_docs)
-        ttft_avg_s = self._hist_avg_delta(model, HISTOGRAM_METRICS["ttft"], hist_docs)
-        tpot_avg_s = self._hist_avg_delta(model, HISTOGRAM_METRICS["tpot"], hist_docs)
-        e2e_avg_s = self._hist_avg_delta(model, HISTOGRAM_METRICS["e2e"], hist_docs)
+        prompt_tokens = self._hist_sum_delta(model, HISTOGRAM_METRICS["prompt_tokens"], hist_docs, window_start_ms)
+        generation_tokens = self._hist_sum_delta(model, HISTOGRAM_METRICS["generation_tokens"], hist_docs, window_start_ms)
+        ttft_avg_s = self._hist_avg_delta(model, HISTOGRAM_METRICS["ttft"], hist_docs, window_start_ms)
+        tpot_avg_s = self._hist_avg_delta(model, HISTOGRAM_METRICS["tpot"], hist_docs, window_start_ms)
+        e2e_avg_s = self._hist_avg_delta(model, HISTOGRAM_METRICS["e2e"], hist_docs, window_start_ms)
 
-        ttft_p95_s = self._hist_percentile(model, HISTOGRAM_METRICS["ttft"], hist_docs)
-        tpot_p95_s = self._hist_percentile(model, HISTOGRAM_METRICS["tpot"], hist_docs)
-        e2e_p95_s = self._hist_percentile(model, HISTOGRAM_METRICS["e2e"], hist_docs)
+        ttft_p95_s = self._hist_percentile(model, HISTOGRAM_METRICS["ttft"], hist_docs, window_start_ms)
+        tpot_p95_s = self._hist_percentile(model, HISTOGRAM_METRICS["tpot"], hist_docs, window_start_ms)
+        e2e_p95_s = self._hist_percentile(model, HISTOGRAM_METRICS["e2e"], hist_docs, window_start_ms)
 
         return PodWindowMetrics(
             pod=pod_name,
@@ -198,8 +224,8 @@ class MetricsStore:
             model=model,
             window_start_ms=window_start_ms,
             window_end_ms=window_end_ms,
-            prompt_tokens=sum(pod.prompt_tokens for pod in pods),
-            generation_tokens=sum(pod.generation_tokens for pod in pods),
+            prompt_tokens=_sum_optional([pod.prompt_tokens for pod in pods]),
+            generation_tokens=_sum_optional([pod.generation_tokens for pod in pods]),
             avg_waiting=sum(pod.avg_waiting for pod in pods),
             avg_running=sum(pod.avg_running for pod in pods),
             avg_swapping=sum(pod.avg_swapping for pod in pods),
@@ -212,13 +238,17 @@ class MetricsStore:
             per_pod=per_pod,
         )
 
-    def _hist_sum_delta(self, model: str, metric: str, docs: list[dict[str, Any]]) -> float:
+    def _hist_sum_delta(self, model: str, metric: str, docs: list[dict[str, Any]], window_start_ms: int) -> float | None:
+        if not _has_window_hist_doc(docs, window_start_ms):
+            return None
         first, last = _first_last_metric(model, metric, docs)
         if first is None or last is None:
             return 0.0
         return max(0.0, _number(last.get("sum"), 0.0) - _number(first.get("sum"), 0.0))
 
-    def _hist_avg_delta(self, model: str, metric: str, docs: list[dict[str, Any]]) -> float | None:
+    def _hist_avg_delta(self, model: str, metric: str, docs: list[dict[str, Any]], window_start_ms: int) -> float | None:
+        if not _has_window_metric(model, metric, docs, window_start_ms):
+            return None
         first, last = _first_last_metric(model, metric, docs)
         if first is None or last is None:
             return None
@@ -228,7 +258,9 @@ class MetricsStore:
             return None
         return sum_delta / count_delta
 
-    def _hist_percentile(self, model: str, metric: str, docs: list[dict[str, Any]]) -> float | None:
+    def _hist_percentile(self, model: str, metric: str, docs: list[dict[str, Any]], window_start_ms: int) -> float | None:
+        if not _has_window_metric(model, metric, docs, window_start_ms):
+            return None
         first, last = _first_last_metric(model, metric, docs)
         if first is None or last is None:
             return None
@@ -316,12 +348,42 @@ def _metric_entry(model: str, metric: str, doc: dict[str, Any]) -> dict[str, Any
     return entry if isinstance(entry, dict) else None
 
 
+def _has_window_metric(model: str, metric: str, docs: list[dict[str, Any]], window_start_ms: int) -> bool:
+    for doc in docs:
+        if _number(doc.get("timestamp"), 0.0) < window_start_ms:
+            continue
+        if _metric_entry(model, metric, doc) is not None:
+            return True
+    return False
+
+
+def _has_window_hist_doc(docs: list[dict[str, Any]], window_start_ms: int) -> bool:
+    return any(
+        _number(doc.get("timestamp"), 0.0) >= window_start_ms
+        and isinstance(doc.get("model_histogram_metrics"), dict)
+        for doc in docs
+    )
+
+
 def _first_last_metric(model: str, metric: str, docs: list[dict[str, Any]]) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     entries = [_metric_entry(model, metric, doc) for doc in docs]
     entries = [entry for entry in entries if entry is not None]
     if not entries:
         return None, None
     return entries[0], entries[-1]
+
+
+def _with_baseline_doc(docs: list[dict[str, Any]], window_start_ms: int) -> list[dict[str, Any]]:
+    baseline = None
+    window_docs: list[dict[str, Any]] = []
+    for doc in docs:
+        if _number(doc.get("timestamp"), 0.0) < window_start_ms:
+            baseline = doc
+        else:
+            window_docs.append(doc)
+    if baseline is None:
+        return window_docs
+    return [baseline, *window_docs]
 
 
 def _normal_buckets(raw: Any) -> dict[float, float]:
@@ -354,6 +416,11 @@ def _bucket_delta(first: dict[float, float], last: dict[float, float]) -> dict[f
 
 def _seconds_to_ms(value: float | None) -> float | None:
     return None if value is None else value * 1000.0
+
+
+def _sum_optional(values: list[float | None]) -> float | None:
+    present = [value for value in values if value is not None]
+    return sum(present) if present else None
 
 
 def _max_optional(values: list[float | None]) -> float | None:

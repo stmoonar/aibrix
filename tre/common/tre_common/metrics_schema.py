@@ -6,8 +6,8 @@ from dataclasses import dataclass
 @dataclass(frozen=True)
 class PodWindowMetrics:
     pod: str
-    prompt_tokens: float
-    generation_tokens: float
+    prompt_tokens: float | None
+    generation_tokens: float | None
     avg_waiting: float
     avg_running: float
     avg_swapping: float
@@ -22,8 +22,8 @@ class ModelWindowMetrics:
     model: str
     window_start_ms: int
     window_end_ms: int
-    prompt_tokens: float
-    generation_tokens: float
+    prompt_tokens: float | None
+    generation_tokens: float | None
     avg_waiting: float
     avg_running: float
     avg_swapping: float
