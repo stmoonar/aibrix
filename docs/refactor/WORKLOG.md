@@ -1016,7 +1016,18 @@
   - Evidence: `docs/refactor/p11_evidence/f1_pre_cleanup_20260705/n4b_e1_dsllama_gpu2_b.json`.
   - `wake` used `36936 MiB`.
   - `wake -> 20 short requests -> sleep` returned to `1090 MiB`.
+- Extended the E1 probe script with `--concurrency` using RED/GREEN coverage. Focused tests now pass with 4 tests; full `cd tre && make check` passed with 237 tests.
+- Ran E1-c on the same `dsllama-8b-gpu-2` pod:
+  - Evidence: `docs/refactor/p11_evidence/f1_pre_cleanup_20260705/n4b_e1_dsllama_gpu2_c.json`.
+  - `wake -> 200 requests, concurrency=8, max_tokens=96 -> sleep` returned to `1090 MiB`.
+- Ran E1-d on the same pod:
+  - Evidence: `docs/refactor/p11_evidence/f1_pre_cleanup_20260705/n4b_e1_dsllama_gpu2_d.json`.
+  - Ten consecutive rounds of `wake -> 200 requests, concurrency=8, max_tokens=96 -> sleep` all returned to `1090 MiB`; no one-time step leak and no rising trend.
+- Ran E1-e on the same pod:
+  - Evidence: `docs/refactor/p11_evidence/f1_pre_cleanup_20260705/n4b_e1_dsllama_gpu2_e_level2.json`.
+  - Two rounds using `sleep?level=2` returned to `1090 MiB` and the second wake succeeded. For this model/image path, level 2 did not reduce residue below level 1.
+- Current E1 interpretation for single-GPU `dsllama-8b`: the previously leaked pod was cured by delete/recreate, and a clean replacement does not reproduce the leak under zero traffic, short traffic, 200-request concurrent traffic, 10 repeated heavy rounds, or level-2 sleep.
 
 ### Endgame F1 Next
 
-- Continue E1 with the heavier mixed/concurrent dsllama case and TP=2 `dsqwen-14b` cases. Then complete F1.2 by restoring the full 12-binding topology in sequence and recording clean reconcile/GPU truth.
+- Continue E1 with TP=2 `dsqwen-14b` cases. Then complete F1.2 by restoring the full 12-binding topology in sequence and recording clean reconcile/GPU truth.

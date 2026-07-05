@@ -1,4 +1,7 @@
-from scripts.n4b_e1_sleep_probe import parse_gpu_memory, percentile95, summarize_used_mib
+import threading
+import time
+
+from scripts.n4b_e1_sleep_probe import parse_gpu_memory, percentile95, run_request_batch, summarize_used_mib
 
 
 def test_parse_gpu_memory_groups_rows_by_uuid() -> None:
@@ -30,3 +33,22 @@ def test_percentile95_uses_nearest_rank() -> None:
     assert percentile95([1.0, 2.0, 3.0, 100.0]) == 100.0
     assert percentile95([3.0]) == 3.0
     assert percentile95([]) is None
+
+
+def test_run_request_batch_respects_concurrency() -> None:
+    active = 0
+    max_active = 0
+    lock = threading.Lock()
+
+    def sender(_idx: int) -> None:
+        nonlocal active, max_active
+        with lock:
+            active += 1
+            max_active = max(max_active, active)
+        time.sleep(0.03)
+        with lock:
+            active -= 1
+
+    run_request_batch(total=8, concurrency=4, sender=sender)
+
+    assert max_active > 1

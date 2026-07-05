@@ -9,6 +9,7 @@ import time
 import urllib.error
 import urllib.request
 from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
 
@@ -41,6 +42,16 @@ def percentile95(values: Iterable[float]) -> float | None:
         return None
     rank = max(1, math.ceil(0.95 * len(ordered)))
     return ordered[rank - 1]
+
+
+def run_request_batch(*, total: int, concurrency: int, sender) -> None:
+    if total <= 0:
+        return
+    workers = max(1, min(int(concurrency), int(total)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(sender, idx) for idx in range(total)]
+        for future in as_completed(futures):
+            future.result()
 
 
 def run(cmd: list[str], *, timeout_s: int = 120) -> str:
@@ -137,8 +148,11 @@ def run_probe(args: argparse.Namespace) -> dict[str, Any]:
         post_vllm(args.kubectl_host, pod["ip"], "/wake_up")
         time.sleep(args.wake_wait_s)
         samples.append({"event": f"round_{round_idx}_wake", "gpu": sample_gpu(args.node_host, args.gpu_uuid)})
-        for _ in range(args.requests):
-            send_completion(args.kubectl_host, pod["ip"], args.model, max_tokens=args.max_tokens)
+        run_request_batch(
+            total=args.requests,
+            concurrency=args.concurrency,
+            sender=lambda _idx: send_completion(args.kubectl_host, pod["ip"], args.model, max_tokens=args.max_tokens),
+        )
         post_vllm(args.kubectl_host, pod["ip"], f"/sleep?level={args.sleep_level}")
         time.sleep(args.sleep_wait_s)
         sleep_sample = sample_gpu(args.node_host, args.gpu_uuid)
@@ -152,6 +166,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, Any]:
         "gpu_uuid": args.gpu_uuid,
         "rounds": args.rounds,
         "requests_per_round": args.requests,
+        "concurrency": args.concurrency,
         "sleep_level": args.sleep_level,
         "duration_s": round(time.time() - started, 3),
         "sleep_used_mib_p95": percentile95(sleep_used),
@@ -169,6 +184,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gpu-uuid", required=True)
     parser.add_argument("--rounds", type=int, default=1)
     parser.add_argument("--requests", type=int, default=20)
+    parser.add_argument("--concurrency", type=int, default=1)
     parser.add_argument("--max-tokens", type=int, default=32)
     parser.add_argument("--sleep-level", type=int, default=1)
     parser.add_argument("--initial-sleep", action="store_true")

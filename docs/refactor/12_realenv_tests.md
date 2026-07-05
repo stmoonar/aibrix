@@ -368,6 +368,12 @@ Initial dsllama-8b GPU2 probe:
 - E1-b evidence: `docs/refactor/p11_evidence/f1_pre_cleanup_20260705/n4b_e1_dsllama_gpu2_b.json`.
   - `wake`: `36936 MiB`.
   - `wake -> 20 short requests -> sleep`: `1090 MiB`.
-- Current interpretation: zero-traffic sleep and short-request sleep do not reproduce the leak for single-GPU `dsllama-8b`; heavier mixed/concurrent traffic and TP=2 `dsqwen-14b` still need to be characterized.
+- E1-c evidence: `docs/refactor/p11_evidence/f1_pre_cleanup_20260705/n4b_e1_dsllama_gpu2_c.json`.
+  - `wake -> 200 requests, concurrency=8, max_tokens=96 -> sleep`: `1090 MiB`.
+- E1-d evidence: `docs/refactor/p11_evidence/f1_pre_cleanup_20260705/n4b_e1_dsllama_gpu2_d.json`.
+  - Ten consecutive heavy rounds all returned to `1090 MiB` after sleep.
+- E1-e evidence: `docs/refactor/p11_evidence/f1_pre_cleanup_20260705/n4b_e1_dsllama_gpu2_e_level2.json`.
+  - Two rounds with `sleep?level=2` both returned to `1090 MiB`; wake after level-2 sleep remained functional.
+- Current interpretation: a clean replacement `dsllama-8b` pod does not reproduce the leak under the tested single-GPU scenarios. TP=2 `dsqwen-14b` still needs to be characterized.
 
 No `n4-done` tag has been created.
