@@ -1441,3 +1441,20 @@
 
 - Commit the ActionQueue inflight fix, rebuild/roll controller, and rerun the
   dsqwen-7b high-load zm validation.
+
+### Endgame F2.5 Controller Rebuild With Inflight Fix
+
+- Built controller image on node10:
+  - tag: `tre-v2-controller:20260705-d795a715`
+  - image id: `sha256:6b722a12a4aadb01dd3b485d5d537196deb337c0d4ebd7d63b54269b5eb118d3`
+  - source code commit: `d795a715`
+- Verified inside the image:
+  - `python -m pytest -q controller/tests/test_action_queue.py controller/tests/test_loop_ticks.py controller/tests/test_planner.py controller/tests/test_decision_snapshot.py`
+  - result: `41 passed`.
+- Updated the tre-v2 controller overlay pin to
+  `tre-v2-controller:20260705-d795a715`; no `latest` tag introduced.
+
+### Endgame F2 Next
+
+- Run full `cd tre && make check`, commit the image pin, roll controller, and
+  rerun high-load zm scale validation.
