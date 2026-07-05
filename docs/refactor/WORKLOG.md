@@ -988,3 +988,35 @@
 ### N4b Next
 
 - Do not start the 12h soak until the architect chooses the signal/memory policy above; otherwise the soak would only prove steady serving at the current awake set, not the 10.6 expansion/shrink contract.
+
+### Endgame F1.1/F1.2 Sleep Leak Evidence And First Probe
+
+- Committed the new authority plan `docs/refactor/14_endgame_plan.md` as `[Endgame] add final execution plan` (`0e9ac5e4`); post-commit `cd tre && make check` passed with 233 tests.
+- Paused `tre-v2-controller` during manual F1 operations with `kubectl -n tre-v2 scale deploy/tre-v2-controller --replicas=0`.
+- Captured the pre-cleanup state under `docs/refactor/p11_evidence/f1_pre_cleanup_20260705/`:
+  - `model_deployments.yaml`
+  - `pods_endpoints.yaml`
+  - `sm_state.json`
+  - `node_gpu_memory.txt`
+- Pre-cleanup node9 GPU truth confirmed the architect's leak finding:
+  - GPU2 had `dsllama-8b-gpu-2` at `22856 MiB` and `dsqwen-14b-node9-gpu-2-3` shard at `16946 MiB`, while both pods reported `/is_sleeping=true`.
+  - GPU3 had the paired `dsqwen-14b-node9-gpu-2-3` shard at `37838 MiB`, while `/is_sleeping=true`.
+- Deleted the two leaking Deployments:
+  - `dsllama-8b-nscc-ds-4a100-node9-gpu-2`
+  - `dsqwen-14b-nscc-ds-4a100-node9-gpu-2-3`
+- Post-delete node9 GPU truth:
+  - GPU2 returned to `0 MiB`.
+  - GPU3 returned to `2248 MiB`, matching only healthy sleeping residue from `dsqwen-7b-gpu-3` and `dsllama-8b-gpu-3`.
+- Added `tre/deploy/scripts/n4b_e1_sleep_probe.py` and focused tests in `tre/deploy/tests/test_n4b_e1_sleep_probe.py`; RED failed on missing module, GREEN passed with 3 tests, then full `cd tre && make check` passed with 236 tests.
+- Ran E1-a on clean node9 GPU2 using `dsllama-8b-gpu-2`:
+  - Evidence: `docs/refactor/p11_evidence/f1_pre_cleanup_20260705/n4b_e1_dsllama_gpu2_a.json`.
+  - `create -> ready` used `37414 MiB`.
+  - `sleep` after zero traffic returned to `1090 MiB`.
+- Ran E1-b on the same pod:
+  - Evidence: `docs/refactor/p11_evidence/f1_pre_cleanup_20260705/n4b_e1_dsllama_gpu2_b.json`.
+  - `wake` used `36936 MiB`.
+  - `wake -> 20 short requests -> sleep` returned to `1090 MiB`.
+
+### Endgame F1 Next
+
+- Continue E1 with the heavier mixed/concurrent dsllama case and TP=2 `dsqwen-14b` cases. Then complete F1.2 by restoring the full 12-binding topology in sequence and recording clean reconcile/GPU truth.

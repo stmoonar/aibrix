@@ -1,0 +1,55 @@
+﻿{
+  "deployment": "dsllama-8b-nscc-ds-4a100-node9-gpu-2",
+  "duration_s": 37.699,
+  "gpu_uuid": "GPU-3a113474-dd92-6d52-d05b-491e7b020ded",
+  "model": "dsllama-8b",
+  "pod": {
+    "ip": "10.244.3.66",
+    "name": "dsllama-8b-nscc-ds-4a100-node9-gpu-2-6774997cb5-4sfmh"
+  },
+  "requests_per_round": 20,
+  "rounds": 1,
+  "samples": [
+    {
+      "event": "ready",
+      "gpu": {
+        "processes": 1,
+        "raw": [
+          {
+            "pid": "3763514",
+            "used_mib": 1090
+          }
+        ],
+        "used_mib": 1090
+      }
+    },
+    {
+      "event": "round_0_wake",
+      "gpu": {
+        "processes": 1,
+        "raw": [
+          {
+            "pid": "3763514",
+            "used_mib": 36936
+          }
+        ],
+        "used_mib": 36936
+      }
+    },
+    {
+      "event": "round_0_sleep",
+      "gpu": {
+        "processes": 1,
+        "raw": [
+          {
+            "pid": "3763514",
+            "used_mib": 1090
+          }
+        ],
+        "used_mib": 1090
+      }
+    }
+  ],
+  "sleep_level": 1,
+  "sleep_used_mib_p95": 1090.0
+}

@@ -347,4 +347,27 @@ N4b follow-up:
   - or approve `queue_len` as an N4b soak fallback,
   - and separately reduce vLLM startup memory pressure or sleeping co-residency before controller-driven expansion.
 
+## N4b.E1 Sleep Leak Characterization
+
+Status: **IN PROGRESS**
+
+Pre-cleanup evidence:
+
+- Evidence directory: `docs/refactor/p11_evidence/f1_pre_cleanup_20260705/`.
+- Node9 GPU2/GPU3 leak was reproduced from live state before cleanup:
+  - `dsllama-8b-nscc-ds-4a100-node9-gpu-2` reported `/is_sleeping=true` while using `22856 MiB` on GPU2.
+  - `dsqwen-14b-nscc-ds-4a100-node9-gpu-2-3` reported `/is_sleeping=true` while using `16946 MiB` on GPU2 and `37838 MiB` on GPU3.
+- Deleting those two Deployments returned GPU2 to `0 MiB` and GPU3 to `2248 MiB`.
+
+Initial dsllama-8b GPU2 probe:
+
+- Probe script: `tre/deploy/scripts/n4b_e1_sleep_probe.py`.
+- E1-a evidence: `docs/refactor/p11_evidence/f1_pre_cleanup_20260705/n4b_e1_dsllama_gpu2_a.json`.
+  - `create -> ready`: `37414 MiB`.
+  - `sleep` after zero traffic: `1090 MiB`.
+- E1-b evidence: `docs/refactor/p11_evidence/f1_pre_cleanup_20260705/n4b_e1_dsllama_gpu2_b.json`.
+  - `wake`: `36936 MiB`.
+  - `wake -> 20 short requests -> sleep`: `1090 MiB`.
+- Current interpretation: zero-traffic sleep and short-request sleep do not reproduce the leak for single-GPU `dsllama-8b`; heavier mixed/concurrent traffic and TP=2 `dsqwen-14b` still need to be characterized.
+
 No `n4-done` tag has been created.

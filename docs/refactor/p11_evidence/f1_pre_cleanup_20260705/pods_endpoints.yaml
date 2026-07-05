@@ -1,0 +1,1925 @@
+apiVersion: v1
+items:
+- apiVersion: v1
+  kind: Pod
+  metadata:
+    annotations:
+      tre.aibrix.io/gpu-ids: "0"
+      tre.aibrix.io/gpu-uuids: GPU-689a3e93-68db-0dac-160b-6a791cf246e8
+      tre.aibrix.io/state: sleeping
+    creationTimestamp: "2026-07-05T05:04:53Z"
+    generateName: dsllama-8b-nscc-ds-4a100-node9-gpu-0-6cbf96cdf5-
+    labels:
+      app: dsllama-8b-nscc-ds-4a100-node9-gpu-0
+      model.aibrix.ai/name: dsllama-8b
+      model.aibrix.ai/port: "8000"
+      pod-template-hash: 6cbf96cdf5
+      tre.aibrix.io/gpu-ids: "0"
+      tre.aibrix.io/managed: "true"
+      tre.aibrix.io/node: nscc-ds-4a100-node9
+      tre.aibrix.io/routable: "false"
+    name: dsllama-8b-nscc-ds-4a100-node9-gpu-0-6cbf96cdf5-2lvgv
+    namespace: default
+    ownerReferences:
+    - apiVersion: apps/v1
+      blockOwnerDeletion: true
+      controller: true
+      kind: ReplicaSet
+      name: dsllama-8b-nscc-ds-4a100-node9-gpu-0-6cbf96cdf5
+      uid: 76df0bfc-2749-434b-aafd-89781b9c7aec
+    resourceVersion: "192774249"
+    uid: 1382b7da-fa4a-4e98-84b3-9b500116e7d9
+  spec:
+    containers:
+    - command:
+      - python3
+      - -m
+      - vllm.entrypoints.openai.api_server
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --uvicorn-log-level
+      - warning
+      - --model
+      - /data/nfs_shared_data/DeepSeek-R1-Distill-Llama-8B
+      - --served-model-name
+      - dsllama-8b
+      - --enable_sleep_mode
+      - --no-enable-prefix-caching
+      - --enable-chunked-prefill
+      - --max-num-batched-tokens
+      - "2048"
+      - --swap-space
+      - "20"
+      env:
+      - name: NVIDIA_VISIBLE_DEVICES
+        value: GPU-689a3e93-68db-0dac-160b-6a791cf246e8
+      - name: CUDA_VISIBLE_DEVICES
+        value: "0"
+      - name: VLLM_SERVER_DEV_MODE
+        value: "1"
+      - name: VLLM_WORKER_MULTIPROC_METHOD
+        value: spawn
+      - name: VLLM_USE_MODELSCOPE
+        value: "True"
+      image: vllm/vllm-openai:0.10.1-sleep
+      imagePullPolicy: IfNotPresent
+      name: vllm-openai
+      ports:
+      - containerPort: 8000
+        protocol: TCP
+      resources: {}
+      terminationMessagePath: /dev/termination-log
+      terminationMessagePolicy: File
+      volumeMounts:
+      - mountPath: /dev/shm
+        name: shm
+      - mountPath: /data
+        name: models-volume
+      - mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+        name: kube-api-access-8vzzg
+        readOnly: true
+    dnsPolicy: ClusterFirst
+    enableServiceLinks: true
+    nodeName: nscc-ds-4a100-node9
+    preemptionPolicy: PreemptLowerPriority
+    priority: 0
+    restartPolicy: Always
+    schedulerName: default-scheduler
+    securityContext: {}
+    serviceAccount: default
+    serviceAccountName: default
+    terminationGracePeriodSeconds: 30
+    tolerations:
+    - effect: NoExecute
+      key: node.kubernetes.io/not-ready
+      operator: Exists
+      tolerationSeconds: 300
+    - effect: NoExecute
+      key: node.kubernetes.io/unreachable
+      operator: Exists
+      tolerationSeconds: 300
+    volumes:
+    - emptyDir:
+        medium: Memory
+        sizeLimit: 20Gi
+      name: shm
+    - hostPath:
+        path: /data
+        type: ""
+      name: models-volume
+    - name: kube-api-access-8vzzg
+      projected:
+        defaultMode: 420
+        sources:
+        - serviceAccountToken:
+            expirationSeconds: 3607
+            path: token
+        - configMap:
+            items:
+            - key: ca.crt
+              path: ca.crt
+            name: kube-root-ca.crt
+        - downwardAPI:
+            items:
+            - fieldRef:
+                apiVersion: v1
+                fieldPath: metadata.namespace
+              path: namespace
+  status:
+    conditions:
+    - lastProbeTime: null
+      lastTransitionTime: "2026-07-05T05:07:22Z"
+      status: "True"
+      type: Initialized
+    - lastProbeTime: null
+      lastTransitionTime: "2026-07-05T05:07:24Z"
+      status: "True"
+      type: Ready
+    - lastProbeTime: null
+      lastTransitionTime: "2026-07-05T05:07:24Z"
+      status: "True"
+      type: ContainersReady
+    - lastProbeTime: null
+      lastTransitionTime: "2026-07-05T05:07:22Z"
+      status: "True"
+      type: PodScheduled
+    containerStatuses:
+    - containerID: docker://15e311d4f1a844a01c71aa3f54737c0e48c530ba9a9d7fc5c72b66c6ee0fdf4a
+      image: vllm/vllm-openai:0.10.1-sleep
+      imageID: docker://sha256:6a3a5efad7779b594bf82dbda62c47efa789786a38963acb869142d9d8406492
+      lastState: {}
+      name: vllm-openai
+      ready: true
+      restartCount: 0
+      started: true
+      state:
+        running:
+          startedAt: "2026-07-05T05:07:23Z"
+    hostIP: 192.168.223.75
+    phase: Running
+    podIP: 10.244.3.52
+    podIPs:
+    - ip: 10.244.3.52
+    qosClass: BestEffort
+    startTime: "2026-07-05T05:07:22Z"
+- apiVersion: v1
+  kind: Pod
+  metadata:
+    annotations:
+      tre.aibrix.io/gpu-ids: "1"
+      tre.aibrix.io/gpu-uuids: GPU-d0de9f25-c059-d2ee-e7c4-c242bbdc76c7
+      tre.aibrix.io/state: awake
+    creationTimestamp: "2026-07-05T05:52:53Z"
+    generateName: dsllama-8b-nscc-ds-4a100-node9-gpu-1-5579b75f9b-
+    labels:
+      app: dsllama-8b-nscc-ds-4a100-node9-gpu-1
+      model.aibrix.ai/name: dsllama-8b
+      model.aibrix.ai/port: "8000"
+      pod-template-hash: 5579b75f9b
+      tre.aibrix.io/gpu-ids: "1"
+      tre.aibrix.io/managed: "true"
+      tre.aibrix.io/node: nscc-ds-4a100-node9
+      tre.aibrix.io/routable: "true"
+    name: dsllama-8b-nscc-ds-4a100-node9-gpu-1-5579b75f9b-kh5fx
+    namespace: default
+    ownerReferences:
+    - apiVersion: apps/v1
+      blockOwnerDeletion: true
+      controller: true
+      kind: ReplicaSet
+      name: dsllama-8b-nscc-ds-4a100-node9-gpu-1-5579b75f9b
+      uid: 8dae06d9-b174-4bb5-ac70-445cf60ab6d1
+    resourceVersion: "192799511"
+    uid: aac1f699-04bd-4f13-aad9-a7ea014691c5
+  spec:
+    containers:
+    - command:
+      - python3
+      - -m
+      - vllm.entrypoints.openai.api_server
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --uvicorn-log-level
+      - warning
+      - --model
+      - /data/nfs_shared_data/DeepSeek-R1-Distill-Llama-8B
+      - --served-model-name
+      - dsllama-8b
+      - --enable_sleep_mode
+      - --no-enable-prefix-caching
+      - --enable-chunked-prefill
+      - --max-num-batched-tokens
+      - "2048"
+      - --swap-space
+      - "20"
+      env:
+      - name: NVIDIA_VISIBLE_DEVICES
+        value: GPU-d0de9f25-c059-d2ee-e7c4-c242bbdc76c7
+      - name: CUDA_VISIBLE_DEVICES
+        value: "0"
+      - name: VLLM_SERVER_DEV_MODE
+        value: "1"
+      - name: VLLM_WORKER_MULTIPROC_METHOD
+        value: spawn
+      - name: VLLM_USE_MODELSCOPE
+        value: "True"
+      image: vllm/vllm-openai:0.10.1-sleep
+      imagePullPolicy: IfNotPresent
+      name: vllm-openai
+      ports:
+      - containerPort: 8000
+        protocol: TCP
+      resources: {}
+      terminationMessagePath: /dev/termination-log
+      terminationMessagePolicy: File
+      volumeMounts:
+      - mountPath: /dev/shm
+        name: shm
+      - mountPath: /data
+        name: models-volume
+      - mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+        name: kube-api-access-9ldkp
+        readOnly: true
+    dnsPolicy: ClusterFirst
+    enableServiceLinks: true
+    nodeName: nscc-ds-4a100-node9
+    preemptionPolicy: PreemptLowerPriority
+    priority: 0
+    restartPolicy: Always
+    schedulerName: default-scheduler
+    securityContext: {}
+    serviceAccount: default
+    serviceAccountName: default
+    terminationGracePeriodSeconds: 30
+    tolerations:
+    - effect: NoExecute
+      key: node.kubernetes.io/not-ready
+      operator: Exists
+      tolerationSeconds: 300
+    - effect: NoExecute
+      key: node.kubernetes.io/unreachable
+      operator: Exists
+      tolerationSeconds: 300
+    volumes:
+    - emptyDir:
+        medium: Memory
+        sizeLimit: 20Gi
+      name: shm
+    - hostPath:
+        path: /data
+        type: ""
+      name: models-volume
+    - name: kube-api-access-9ldkp
+      projected:
+        defaultMode: 420
+        sources:
+        - serviceAccountToken:
+            expirationSeconds: 3607
+            path: token
+        - configMap:
+            items:
+            - key: ca.crt
+              path: ca.crt
+            name: kube-root-ca.crt
+        - downwardAPI:
+            items:
+            - fieldRef:
+                apiVersion: v1
+                fieldPath: metadata.namespace
+              path: namespace
+  status:
+    conditions:
+    - lastProbeTime: null
+      lastTransitionTime: "2026-07-05T05:55:21Z"
+      status: "True"
+      type: Initialized
+    - lastProbeTime: null
+      lastTransitionTime: "2026-07-05T05:55:23Z"
+      status: "True"
+      type: Ready
+    - lastProbeTime: null
+      lastTransitionTime: "2026-07-05T05:55:23Z"
+      status: "True"
+      type: ContainersReady
+    - lastProbeTime: null
+      lastTransitionTime: "2026-07-05T05:55:21Z"
+      status: "True"
+      type: PodScheduled
+    containerStatuses:
+    - containerID: docker://90f4d5e1ac37bacc8022ba44b2cabb98883866cd915402cf2835f939a7324678
+      image: vllm/vllm-openai:0.10.1-sleep
+      imageID: docker://sha256:6a3a5efad7779b594bf82dbda62c47efa789786a38963acb869142d9d8406492
+      lastState: {}
+      name: vllm-openai
+      ready: true
+      restartCount: 0
+      started: true
+      state:
+        running:
+          startedAt: "2026-07-05T05:55:22Z"
+    hostIP: 192.168.223.75
+    phase: Running
+    podIP: 10.244.3.57
+    podIPs:
+    - ip: 10.244.3.57
+    qosClass: BestEffort
+    startTime: "2026-07-05T05:55:21Z"
+- apiVersion: v1
+  kind: Pod
+  metadata:
+    annotations:
+      tre.aibrix.io/gpu-ids: "2"
+      tre.aibrix.io/gpu-uuids: GPU-3a113474-dd92-6d52-d05b-491e7b020ded
+      tre.aibrix.io/state: sleeping
+    creationTimestamp: "2026-07-05T05:54:44Z"
+    generateName: dsllama-8b-nscc-ds-4a100-node9-gpu-2-6774997cb5-
+    labels:
+      app: dsllama-8b-nscc-ds-4a100-node9-gpu-2
+      model.aibrix.ai/name: dsllama-8b
+      model.aibrix.ai/port: "8000"
+      pod-template-hash: 6774997cb5
+      tre.aibrix.io/gpu-ids: "2"
+      tre.aibrix.io/managed: "true"
+      tre.aibrix.io/node: nscc-ds-4a100-node9
+      tre.aibrix.io/routable: "false"
+    name: dsllama-8b-nscc-ds-4a100-node9-gpu-2-6774997cb5-796br
+    namespace: default
+    ownerReferences:
+    - apiVersion: apps/v1
+      blockOwnerDeletion: true
+      controller: true
+      kind: ReplicaSet
+      name: dsllama-8b-nscc-ds-4a100-node9-gpu-2-6774997cb5
+      uid: c7d36efc-5f54-4292-9eca-ac2c8f5497d0
+    resourceVersion: "192807389"
+    uid: 920a8caf-ae70-439a-873f-c9300cf0c2b2
+  spec:
+    containers:
+    - command:
+      - python3
+      - -m
+      - vllm.entrypoints.openai.api_server
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --uvicorn-log-level
+      - warning
+      - --model
+      - /data/nfs_shared_data/DeepSeek-R1-Distill-Llama-8B
+      - --served-model-name
+      - dsllama-8b
+      - --enable_sleep_mode
+      - --no-enable-prefix-caching
+      - --enable-chunked-prefill
+      - --max-num-batched-tokens
+      - "2048"
+      - --swap-space
+      - "20"
+      env:
+      - name: NVIDIA_VISIBLE_DEVICES
+        value: GPU-3a113474-dd92-6d52-d05b-491e7b020ded
+      - name: CUDA_VISIBLE_DEVICES
+        value: "0"
+      - name: VLLM_SERVER_DEV_MODE
+        value: "1"
+      - name: VLLM_WORKER_MULTIPROC_METHOD
+        value: spawn
+      - name: VLLM_USE_MODELSCOPE
+        value: "True"
+      image: vllm/vllm-openai:0.10.1-sleep
+      imagePullPolicy: IfNotPresent
+      name: vllm-openai
+      ports:
+      - containerPort: 8000
+        protocol: TCP
+      resources: {}
+      terminationMessagePath: /dev/termination-log
+      terminationMessagePolicy: File
+      volumeMounts:
+      - mountPath: /dev/shm
+        name: shm
+      - mountPath: /data
+        name: models-volume
+      - mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+        name: kube-api-access-jqtmx
+        readOnly: true
+    dnsPolicy: ClusterFirst
+    enableServiceLinks: true
+    nodeName: nscc-ds-4a100-node9
+    preemptionPolicy: PreemptLowerPriority
+    priority: 0
+    restartPolicy: Always
+    schedulerName: default-scheduler
+    securityContext: {}
+    serviceAccount: default
+    serviceAccountName: default
+    terminationGracePeriodSeconds: 30
+    tolerations:
+    - effect: NoExecute
+      key: node.kubernetes.io/not-ready
+      operator: Exists
+      tolerationSeconds: 300
+    - effect: NoExecute
+      key: node.kubernetes.io/unreachable
+      operator: Exists
+      tolerationSeconds: 300
+    volumes:
+    - emptyDir:
+        medium: Memory
+        sizeLimit: 20Gi
+      name: shm
+    - hostPath:
+        path: /data
+        type: ""
+      name: models-volume
+    - name: kube-api-access-jqtmx
+      projected:
+        defaultMode: 420
+        sources:
+        - serviceAccountToken:
+            expirationSeconds: 3607
+            path: token
+        - configMap:
+            items:
+            - key: ca.crt
+              path: ca.crt
+            name: kube-root-ca.crt
+        - downwardAPI:
+            items:
+            - fieldRef:
+                apiVersion: v1
+                fieldPath: metadata.namespace
+              path: namespace
+  status:
+    conditions:
+    - lastProbeTime: null
+      lastTransitionTime: "2026-07-05T05:57:13Z"
+      status: "True"
+      type: Initialized
+    - lastProbeTime: null
+      lastTransitionTime: "2026-07-05T05:57:15Z"
+      status: "True"
+      type: Ready
+    - lastProbeTime: null
+      lastTransitionTime: "2026-07-05T05:57:15Z"
+      status: "True"
+      type: ContainersReady
+    - lastProbeTime: null
+      lastTransitionTime: "2026-07-05T05:57:13Z"
+      status: "True"
+      type: PodScheduled
+    containerStatuses:
+    - containerID: docker://d2bc384c09ef4e0c98c97d76378189473a64a1d0766d1e11ac7c5128e9f82d90
+      image: vllm/vllm-openai:0.10.1-sleep
+      imageID: docker://sha256:6a3a5efad7779b594bf82dbda62c47efa789786a38963acb869142d9d8406492
+      lastState: {}
+      name: vllm-openai
+      ready: true
+      restartCount: 0
+      started: true
+      state:
+        running:
+          startedAt: "2026-07-05T05:57:14Z"
+    hostIP: 192.168.223.75
+    phase: Running
+    podIP: 10.244.3.58
+    podIPs:
+    - ip: 10.244.3.58
+    qosClass: BestEffort
+    startTime: "2026-07-05T05:57:13Z"
+- apiVersion: v1
+  kind: Pod
+  metadata:
+    annotations:
+      tre.aibrix.io/gpu-ids: "3"
+      tre.aibrix.io/gpu-uuids: GPU-3c2fb581-708a-5fef-3eaa-5c3cc21a028e
+      tre.aibrix.io/state: sleeping
+    creationTimestamp: "2026-07-05T05:56:36Z"
+    generateName: dsllama-8b-nscc-ds-4a100-node9-gpu-3-6bf484f758-
+    labels:
+      app: dsllama-8b-nscc-ds-4a100-node9-gpu-3
+      model.aibrix.ai/name: dsllama-8b
+      model.aibrix.ai/port: "8000"
+      pod-template-hash: 6bf484f758
+      tre.aibrix.io/gpu-ids: "3"
+      tre.aibrix.io/managed: "true"
+      tre.aibrix.io/node: nscc-ds-4a100-node9
+      tre.aibrix.io/routable: "false"
+    name: dsllama-8b-nscc-ds-4a100-node9-gpu-3-6bf484f758-8v5fz
+    namespace: default
+    ownerReferences:
+    - apiVersion: apps/v1
+      blockOwnerDeletion: true
+      controller: true
+      kind: ReplicaSet
+      name: dsllama-8b-nscc-ds-4a100-node9-gpu-3-6bf484f758
+      uid: 8ff05eab-bee9-47fd-b691-0e9fe52b2835
+    resourceVersion: "192807375"
+    uid: 72b8d5fc-34ef-4942-a3d8-ea1380872686
+  spec:
+    containers:
+    - command:
+      - python3
+      - -m
+      - vllm.entrypoints.openai.api_server
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --uvicorn-log-level
+      - warning
+      - --model
+      - /data/nfs_shared_data/DeepSeek-R1-Distill-Llama-8B
+      - --served-model-name
+      - dsllama-8b
+      - --enable_sleep_mode
+      - --no-enable-prefix-caching
+      - --enable-chunked-prefill
+      - --max-num-batched-tokens
+      - "2048"
+      - --swap-space
+      - "20"
+      env:
+      - name: NVIDIA_VISIBLE_DEVICES
+        value: GPU-3c2fb581-708a-5fef-3eaa-5c3cc21a028e
+      - name: CUDA_VISIBLE_DEVICES
+        value: "0"
+      - name: VLLM_SERVER_DEV_MODE
+        value: "1"
+      - name: VLLM_WORKER_MULTIPROC_METHOD
+        value: spawn
+      - name: VLLM_USE_MODELSCOPE
+        value: "True"
+      image: vllm/vllm-openai:0.10.1-sleep
+      imagePullPolicy: IfNotPresent
+      name: vllm-openai
+      ports:
+      - containerPort: 8000
+        protocol: TCP
+      resources: {}
+      terminationMessagePath: /dev/termination-log
+      terminationMessagePolicy: File
+      volumeMounts:
+      - mountPath: /dev/shm
+        name: shm
+      - mountPath: /data
+        name: models-volume
+      - mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+        name: kube-api-access-7fqdp
+        readOnly: true
+    dnsPolicy: ClusterFirst
+    enableServiceLinks: true
+    nodeName: nscc-ds-4a100-node9
+    preemptionPolicy: PreemptLowerPriority
+    priority: 0
+    restartPolicy: Always
+    schedulerName: default-scheduler
+    securityContext: {}
+    serviceAccount: default
+    serviceAccountName: default
+    terminationGracePeriodSeconds: 30
+    tolerations:
+    - effect: NoExecute
+      key: node.kubernetes.io/not-ready
+      operator: Exists
+      tolerationSeconds: 300
+    - effect: NoExecute
+      key: node.kubernetes.io/unreachable
+      operator: Exists
+      tolerationSeconds: 300
+    volumes:
+    - emptyDir:
+        medium: Memory
+        sizeLimit: 20Gi
+      name: shm
+    - hostPath:
+        path: /data
+        type: ""
+      name: models-volume
+    - name: kube-api-access-7fqdp
+      projected:
+        defaultMode: 420
+        sources:
+        - serviceAccountToken:
+            expirationSeconds: 3607
+            path: token
+        - configMap:
+            items:
+            - key: ca.crt
+              path: ca.crt
+            name: kube-root-ca.crt
+        - downwardAPI:
+            items:
+            - fieldRef:
+                apiVersion: v1
+                fieldPath: metadata.namespace
+              path: namespace
+  status:
+    conditions:
+    - lastProbeTime: null
+      lastTransitionTime: "2026-07-05T05:59:05Z"
+      status: "True"
+      type: Initialized
+    - lastProbeTime: null
+      lastTransitionTime: "2026-07-05T05:59:06Z"
+      status: "True"
+      type: Ready
+    - lastProbeTime: null
+      lastTransitionTime: "2026-07-05T05:59:06Z"
+      status: "True"
+      type: ContainersReady
+    - lastProbeTime: null
+      lastTransitionTime: "2026-07-05T05:59:05Z"
+      status: "True"
+      type: PodScheduled
+    containerStatuses:
+    - containerID: docker://1ff35df07ac796e9c2cbf642be0b9b7197c7fc30859fc94b3c1a31f100a1884c
+      image: vllm/vllm-openai:0.10.1-sleep
+      imageID: docker://sha256:6a3a5efad7779b594bf82dbda62c47efa789786a38963acb869142d9d8406492
+      lastState: {}
+      name: vllm-openai
+      ready: true
+      restartCount: 0
+      started: true
+      state:
+        running:
+          startedAt: "2026-07-05T05:59:05Z"
+    hostIP: 192.168.223.75
+    phase: Running
+    podIP: 10.244.3.59
+    podIPs:
+    - ip: 10.244.3.59
+    qosClass: BestEffort
+    startTime: "2026-07-05T05:59:05Z"
+- apiVersion: v1
+  kind: Pod
+  metadata:
+    annotations:
+      tre.aibrix.io/gpu-ids: 0,1
+      tre.aibrix.io/gpu-uuids: GPU-71f560a8-e090-c7e6-325f-2e386c08136f,GPU-4bcbcb0c-7eaf-64a1-b3e5-b07cb81d3a96
+      tre.aibrix.io/state: awake
+    creationTimestamp: "2026-07-05T05:58:29Z"
+    generateName: dsqwen-14b-nscc-ds-4a100-node10-gpu-0-1-77d5997485-
+    labels:
+      app: dsqwen-14b-nscc-ds-4a100-node10-gpu-0-1
+      model.aibrix.ai/name: dsqwen-14b
+      model.aibrix.ai/port: "8000"
+      pod-template-hash: 77d5997485
+      tre.aibrix.io/gpu-ids: 0-1
+      tre.aibrix.io/managed: "true"
+      tre.aibrix.io/node: nscc-ds-4a100-node10
+      tre.aibrix.io/routable: "true"
+    name: dsqwen-14b-nscc-ds-4a100-node10-gpu-0-1-77d5997485-nc6nv
+    namespace: default
+    ownerReferences:
+    - apiVersion: apps/v1
+      blockOwnerDeletion: true
+      controller: true
+      kind: ReplicaSet
+      name: dsqwen-14b-nscc-ds-4a100-node10-gpu-0-1-77d5997485
+      uid: 211503c1-523c-4b81-8bfa-2a12ed59a41f
+    resourceVersion: "192799501"
+    uid: 971a5458-b19d-4f87-af91-ecff5bab9651
+  spec:
+    containers:
+    - command:
+      - python3
+      - -m
+      - vllm.entrypoints.openai.api_server
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --uvicorn-log-level
+      - warning
+      - --model
+      - /data/nfs_shared_data/Models/DeepSeek-R1-Distill-Qwen-14B
+      - --served-model-name
+      - dsqwen-14b
+      - --enable_sleep_mode
+      - --tensor-parallel-size
+      - "2"
+      - --max-model-len
+      - "12288"
+      env:
+      - name: NVIDIA_VISIBLE_DEVICES
+        value: GPU-71f560a8-e090-c7e6-325f-2e386c08136f,GPU-4bcbcb0c-7eaf-64a1-b3e5-b07cb81d3a96
+      - name: CUDA_VISIBLE_DEVICES
+        value: 0,1
+      - name: VLLM_SERVER_DEV_MODE
+        value: "1"
+      - name: VLLM_WORKER_MULTIPROC_METHOD
+        value: spawn
+      - name: VLLM_USE_MODELSCOPE
+        value: "True"
+      image: vllm/vllm-openai:0.10.1-sleep
+      imagePullPolicy: IfNotPresent
+      name: vllm-openai
+      ports:
+      - containerPort: 8000
+        protocol: TCP
+      resources: {}
+      terminationMessagePath: /dev/termination-log
+      terminationMessagePolicy: File
+      volumeMounts:
+      - mountPath: /dev/shm
+        name: shm
+      - mountPath: /data
+        name: models-volume
+      - mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+        name: kube-api-access-hzjb8
+        readOnly: true
+    dnsPolicy: ClusterFirst
+    enableServiceLinks: true
+    nodeName: nscc-ds-4a100-node10
+    preemptionPolicy: PreemptLowerPriority
+    priority: 0
+    restartPolicy: Always
+    schedulerName: default-scheduler
+    securityContext: {}
+    serviceAccount: default
+    serviceAccountName: default
+    terminationGracePeriodSeconds: 30
+    tolerations:
+    - effect: NoExecute
+      key: node.kubernetes.io/not-ready
+      operator: Exists
+      tolerationSeconds: 300
+    - effect: NoExecute
+      key: node.kubernetes.io/unreachable
+      operator: Exists
+      tolerationSeconds: 300
+    volumes:
+    - emptyDir:
+        medium: Memory
+        sizeLimit: 20Gi
+      name: shm
+    - hostPath:
+        path: /data
+        type: ""
+      name: models-volume
+    - name: kube-api-access-hzjb8
+      projected:
+        defaultMode: 420
+        sources:
+        - serviceAccountToken:
+            expirationSeconds: 3607
+            path: token
+        - configMap:
+            items:
+            - key: ca.crt
+              path: ca.crt
+            name: kube-root-ca.crt
+        - downwardAPI:
+            items:
+            - fieldRef:
+                apiVersion: v1
+                fieldPath: metadata.namespace
+              path: namespace
+  status:
+    conditions:
+    - lastProbeTime: null
+      lastTransitionTime: "2026-07-05T05:58:29Z"
+      status: "True"
+      type: Initialized
+    - lastProbeTime: null
+      lastTransitionTime: "2026-07-05T05:58:31Z"
+      status: "True"
+      type: Ready
+    - lastProbeTime: null
+      lastTransitionTime: "2026-07-05T05:58:31Z"
+      status: "True"
+      type: ContainersReady
+    - lastProbeTime: null
+      lastTransitionTime: "2026-07-05T05:58:29Z"
+      status: "True"
+      type: PodScheduled
+    containerStatuses:
+    - containerID: docker://15a22501e85152cdcbc53ebe731f8807715580866b5de9b57835483b8fb8df56
+      image: vllm/vllm-openai:0.10.1-sleep
+      imageID: docker://sha256:6a3a5efad7779b594bf82dbda62c47efa789786a38963acb869142d9d8406492
+      lastState: {}
+      name: vllm-openai
+      ready: true
+      restartCount: 0
+      started: true
+      state:
+        running:
+          startedAt: "2026-07-05T05:58:30Z"
+    hostIP: 192.168.223.76
+    phase: Running
+    podIP: 10.244.0.163
+    podIPs:
+    - ip: 10.244.0.163
+    qosClass: BestEffort
+    startTime: "2026-07-05T05:58:29Z"
+- apiVersion: v1
+  kind: Pod
+  metadata:
+    annotations:
+      tre.aibrix.io/gpu-ids: 2,3
+      tre.aibrix.io/gpu-uuids: GPU-28af749d-4081-d7b6-0c14-cf9c29aa213d,GPU-76a392a5-b027-42be-fb8f-1bfe9079b47c
+      tre.aibrix.io/state: awake
+    creationTimestamp: "2026-07-05T06:00:56Z"
+    generateName: dsqwen-14b-nscc-ds-4a100-node10-gpu-2-3-66f57f5575-
+    labels:
+      app: dsqwen-14b-nscc-ds-4a100-node10-gpu-2-3
+      model.aibrix.ai/name: dsqwen-14b
+      model.aibrix.ai/port: "8000"
+      pod-template-hash: 66f57f5575
+      tre.aibrix.io/gpu-ids: 2-3
+      tre.aibrix.io/managed: "true"
+      tre.aibrix.io/node: nscc-ds-4a100-node10
+      tre.aibrix.io/routable: "true"
+    name: dsqwen-14b-nscc-ds-4a100-node10-gpu-2-3-66f57f5575-6dtl7
+    namespace: default
+    ownerReferences:
+    - apiVersion: apps/v1
+      blockOwnerDeletion: true
+      controller: true
+      kind: ReplicaSet
+      name: dsqwen-14b-nscc-ds-4a100-node10-gpu-2-3-66f57f5575
+      uid: 418e6c51-c982-4e8e-b51e-20edebd52393
+    resourceVersion: "192815068"
+    uid: e8d97002-331f-4b26-a2be-8efb6c4c6c5b
+  spec:
+    containers:
+    - command:
+      - python3
+      - -m
+      - vllm.entrypoints.openai.api_server
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --uvicorn-log-level
+      - warning
+      - --model
+      - /data/nfs_shared_data/Models/DeepSeek-R1-Distill-Qwen-14B
+      - --served-model-name
+      - dsqwen-14b
+      - --enable_sleep_mode
+      - --tensor-parallel-size
+      - "2"
+      - --max-model-len
+      - "12288"
+      env:
+      - name: NVIDIA_VISIBLE_DEVICES
+        value: GPU-28af749d-4081-d7b6-0c14-cf9c29aa213d,GPU-76a392a5-b027-42be-fb8f-1bfe9079b47c
+      - name: CUDA_VISIBLE_DEVICES
+        value: 0,1
+      - name: VLLM_SERVER_DEV_MODE
+        value: "1"
+      - name: VLLM_WORKER_MULTIPROC_METHOD
+        value: spawn
+      - name: VLLM_USE_MODELSCOPE
+        value: "True"
+      image: vllm/vllm-openai:0.10.1-sleep
+      imagePullPolicy: IfNotPresent
+      name: vllm-openai
+      ports:
+      - containerPort: 8000
+        protocol: TCP
+      resources: {}
+      terminationMessagePath: /dev/termination-log
+      terminationMessagePolicy: File
+      volumeMounts:
+      - mountPath: /dev/shm
+        name: shm
+      - mountPath: /data
+        name: models-volume
+      - mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+        name: kube-api-access-lpdf9
+        readOnly: true
+    dnsPolicy: ClusterFirst
+    enableServiceLinks: true
+    nodeName: nscc-ds-4a100-node10
+    preemptionPolicy: PreemptLowerPriority
+    priority: 0
+    restartPolicy: Always
+    schedulerName: default-scheduler
+    securityContext: {}
+    serviceAccount: default
+    serviceAccountName: default
+    terminationGracePeriodSeconds: 30
+    tolerations:
+    - effect: NoExecute
+      key: node.kubernetes.io/not-ready
+      operator: Exists
+      tolerationSeconds: 300
+    - effect: NoExecute
+      key: node.kubernetes.io/unreachable
+      operator: Exists
+      tolerationSeconds: 300
+    volumes:
+    - emptyDir:
+        medium: Memory
+        sizeLimit: 20Gi
+      name: shm
+    - hostPath:
+        path: /data
+        type: ""
+      name: models-volume
+    - name: kube-api-access-lpdf9
+      projected:
+        defaultMode: 420
+        sources:
+        - serviceAccountToken:
+            expirationSeconds: 3607
+            path: token
+        - configMap:
+            items:
+            - key: ca.crt
+              path: ca.crt
+            name: kube-root-ca.crt
+        - downwardAPI:
+            items:
+            - fieldRef:
+                apiVersion: v1
+                fieldPath: metadata.namespace
+              path: namespace
+  status:
+    conditions:
+    - lastProbeTime: null
+      lastTransitionTime: "2026-07-05T06:00:56Z"
+      status: "True"
+      type: Initialized
+    - lastProbeTime: null
+      lastTransitionTime: "2026-07-05T06:00:57Z"
+      status: "True"
+      type: Ready
+    - lastProbeTime: null
+      lastTransitionTime: "2026-07-05T06:00:57Z"
+      status: "True"
+      type: ContainersReady
+    - lastProbeTime: null
+      lastTransitionTime: "2026-07-05T06:00:56Z"
+      status: "True"
+      type: PodScheduled
+    containerStatuses:
+    - containerID: docker://cadb7155a97693e87d19d0f15cd0f6cac8e0c99f52a62761e4c4c181008c8db7
+      image: vllm/vllm-openai:0.10.1-sleep
+      imageID: docker://sha256:6a3a5efad7779b594bf82dbda62c47efa789786a38963acb869142d9d8406492
+      lastState: {}
+      name: vllm-openai
+      ready: true
+      restartCount: 0
+      started: true
+      state:
+        running:
+          startedAt: "2026-07-05T06:00:57Z"
+    hostIP: 192.168.223.76
+    phase: Running
+    podIP: 10.244.0.164
+    podIPs:
+    - ip: 10.244.0.164
+    qosClass: BestEffort
+    startTime: "2026-07-05T06:00:56Z"
+- apiVersion: v1
+  kind: Pod
+  metadata:
+    annotations:
+      tre.aibrix.io/gpu-ids: 0,1
+      tre.aibrix.io/gpu-uuids: GPU-689a3e93-68db-0dac-160b-6a791cf246e8,GPU-d0de9f25-c059-d2ee-e7c4-c242bbdc76c7
+      tre.aibrix.io/state: sleeping
+    creationTimestamp: "2026-07-05T06:03:22Z"
+    generateName: dsqwen-14b-nscc-ds-4a100-node9-gpu-0-1-7b8c77ddc5-
+    labels:
+      app: dsqwen-14b-nscc-ds-4a100-node9-gpu-0-1
+      model.aibrix.ai/name: dsqwen-14b
+      model.aibrix.ai/port: "8000"
+      pod-template-hash: 7b8c77ddc5
+      tre.aibrix.io/gpu-ids: 0-1
+      tre.aibrix.io/managed: "true"
+      tre.aibrix.io/node: nscc-ds-4a100-node9
+      tre.aibrix.io/routable: "false"
+    name: dsqwen-14b-nscc-ds-4a100-node9-gpu-0-1-7b8c77ddc5-49bxg
+    namespace: default
+    ownerReferences:
+    - apiVersion: apps/v1
+      blockOwnerDeletion: true
+      controller: true
+      kind: ReplicaSet
+      name: dsqwen-14b-nscc-ds-4a100-node9-gpu-0-1-7b8c77ddc5
+      uid: cba76424-be71-4995-8b44-a25c33668feb
+    resourceVersion: "192786260"
+    uid: 1ff9dd88-eec2-4ff8-b423-49e32089c132
+  spec:
+    containers:
+    - command:
+      - python3
+      - -m
+      - vllm.entrypoints.openai.api_server
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --uvicorn-log-level
+      - warning
+      - --model
+      - /data/nfs_shared_data/Models/DeepSeek-R1-Distill-Qwen-14B
+      - --served-model-name
+      - dsqwen-14b
+      - --enable_sleep_mode
+      - --tensor-parallel-size
+      - "2"
+      - --max-model-len
+      - "12288"
+      env:
+      - name: NVIDIA_VISIBLE_DEVICES
+        value: GPU-689a3e93-68db-0dac-160b-6a791cf246e8,GPU-d0de9f25-c059-d2ee-e7c4-c242bbdc76c7
+      - name: CUDA_VISIBLE_DEVICES
+        value: 0,1
+      - name: VLLM_SERVER_DEV_MODE
+        value: "1"
+      - name: VLLM_WORKER_MULTIPROC_METHOD
+        value: spawn
+      - name: VLLM_USE_MODELSCOPE
+        value: "True"
+      image: vllm/vllm-openai:0.10.1-sleep
+      imagePullPolicy: IfNotPresent
+      name: vllm-openai
+      ports:
+      - containerPort: 8000
+        protocol: TCP
+      resources: {}
+      terminationMessagePath: /dev/termination-log
+      terminationMessagePolicy: File
+      volumeMounts:
+      - mountPath: /dev/shm
+        name: shm
+      - mountPath: /data
+        name: models-volume
+      - mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+        name: kube-api-access-crdmr
+        readOnly: true
+    dnsPolicy: ClusterFirst
+    enableServiceLinks: true
+    nodeName: nscc-ds-4a100-node9
+    preemptionPolicy: PreemptLowerPriority
+    priority: 0
+    restartPolicy: Always
+    schedulerName: default-scheduler
+    securityContext: {}
+    serviceAccount: default
+    serviceAccountName: default
+    terminationGracePeriodSeconds: 30
+    tolerations:
+    - effect: NoExecute
+      key: node.kubernetes.io/not-ready
+      operator: Exists
+      tolerationSeconds: 300
+    - effect: NoExecute
+      key: node.kubernetes.io/unreachable
+      operator: Exists
+      tolerationSeconds: 300
+    volumes:
+    - emptyDir:
+        medium: Memory
+        sizeLimit: 20Gi
+      name: shm
+    - hostPath:
+        path: /data
+        type: ""
+      name: models-volume
+    - name: kube-api-access-crdmr
+      projected:
+        defaultMode: 420
+        sources:
+        - serviceAccountToken:
+            expirationSeconds: 3607
+            path: token
+        - configMap:
+            items:
+            - key: ca.crt
+              path: ca.crt
+            name: kube-root-ca.crt
+        - downwardAPI:
+            items:
+            - fieldRef:
+                apiVersion: v1
+                fieldPath: metadata.namespace
+              path: namespace
+  status:
+    conditions:
+    - lastProbeTime: null
+      lastTransitionTime: "2026-07-05T06:05:51Z"
+      status: "True"
+      type: Initialized
+    - lastProbeTime: null
+      lastTransitionTime: "2026-07-05T06:05:52Z"
+      status: "True"
+      type: Ready
+    - lastProbeTime: null
+      lastTransitionTime: "2026-07-05T06:05:52Z"
+      status: "True"
+      type: ContainersReady
+    - lastProbeTime: null
+      lastTransitionTime: "2026-07-05T06:05:51Z"
+      status: "True"
+      type: PodScheduled
+    containerStatuses:
+    - containerID: docker://15f4dc7f6e3c0970173b87da319d7c502fddc8603a3572e758f61520200dc8fd
+      image: vllm/vllm-openai:0.10.1-sleep
+      imageID: docker://sha256:6a3a5efad7779b594bf82dbda62c47efa789786a38963acb869142d9d8406492
+      lastState: {}
+      name: vllm-openai
+      ready: true
+      restartCount: 0
+      started: true
+      state:
+        running:
+          startedAt: "2026-07-05T06:05:52Z"
+    hostIP: 192.168.223.75
+    phase: Running
+    podIP: 10.244.3.60
+    podIPs:
+    - ip: 10.244.3.60
+    qosClass: BestEffort
+    startTime: "2026-07-05T06:05:51Z"
+- apiVersion: v1
+  kind: Pod
+  metadata:
+    annotations:
+      tre.aibrix.io/gpu-ids: 2,3
+      tre.aibrix.io/gpu-uuids: GPU-3a113474-dd92-6d52-d05b-491e7b020ded,GPU-3c2fb581-708a-5fef-3eaa-5c3cc21a028e
+      tre.aibrix.io/state: sleeping
+    creationTimestamp: "2026-07-05T06:05:46Z"
+    generateName: dsqwen-14b-nscc-ds-4a100-node9-gpu-2-3-84f8576d97-
+    labels:
+      app: dsqwen-14b-nscc-ds-4a100-node9-gpu-2-3
+      model.aibrix.ai/name: dsqwen-14b
+      model.aibrix.ai/port: "8000"
+      pod-template-hash: 84f8576d97
+      tre.aibrix.io/gpu-ids: 2-3
+      tre.aibrix.io/managed: "true"
+      tre.aibrix.io/node: nscc-ds-4a100-node9
+      tre.aibrix.io/routable: "false"
+    name: dsqwen-14b-nscc-ds-4a100-node9-gpu-2-3-84f8576d97-pxx56
+    namespace: default
+    ownerReferences:
+    - apiVersion: apps/v1
+      blockOwnerDeletion: true
+      controller: true
+      kind: ReplicaSet
+      name: dsqwen-14b-nscc-ds-4a100-node9-gpu-2-3-84f8576d97
+      uid: f7ca70c5-ad03-4acc-9a15-886bc1914cc0
+    resourceVersion: "192787020"
+    uid: 8911c2a7-eb4c-462d-80c0-aab0f7939034
+  spec:
+    containers:
+    - command:
+      - python3
+      - -m
+      - vllm.entrypoints.openai.api_server
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --uvicorn-log-level
+      - warning
+      - --model
+      - /data/nfs_shared_data/Models/DeepSeek-R1-Distill-Qwen-14B
+      - --served-model-name
+      - dsqwen-14b
+      - --enable_sleep_mode
+      - --tensor-parallel-size
+      - "2"
+      - --max-model-len
+      - "12288"
+      env:
+      - name: NVIDIA_VISIBLE_DEVICES
+        value: GPU-3a113474-dd92-6d52-d05b-491e7b020ded,GPU-3c2fb581-708a-5fef-3eaa-5c3cc21a028e
+      - name: CUDA_VISIBLE_DEVICES
+        value: 0,1
+      - name: VLLM_SERVER_DEV_MODE
+        value: "1"
+      - name: VLLM_WORKER_MULTIPROC_METHOD
+        value: spawn
+      - name: VLLM_USE_MODELSCOPE
+        value: "True"
+      image: vllm/vllm-openai:0.10.1-sleep
+      imagePullPolicy: IfNotPresent
+      name: vllm-openai
+      ports:
+      - containerPort: 8000
+        protocol: TCP
+      resources: {}
+      terminationMessagePath: /dev/termination-log
+      terminationMessagePolicy: File
+      volumeMounts:
+      - mountPath: /dev/shm
+        name: shm
+      - mountPath: /data
+        name: models-volume
+      - mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+        name: kube-api-access-xq5sx
+        readOnly: true
+    dnsPolicy: ClusterFirst
+    enableServiceLinks: true
+    nodeName: nscc-ds-4a100-node9
+    preemptionPolicy: PreemptLowerPriority
+    priority: 0
+    restartPolicy: Always
+    schedulerName: default-scheduler
+    securityContext: {}
+    serviceAccount: default
+    serviceAccountName: default
+    terminationGracePeriodSeconds: 30
+    tolerations:
+    - effect: NoExecute
+      key: node.kubernetes.io/not-ready
+      operator: Exists
+      tolerationSeconds: 300
+    - effect: NoExecute
+      key: node.kubernetes.io/unreachable
+      operator: Exists
+      tolerationSeconds: 300
+    volumes:
+    - emptyDir:
+        medium: Memory
+        sizeLimit: 20Gi
+      name: shm
+    - hostPath:
+        path: /data
+        type: ""
+      name: models-volume
+    - name: kube-api-access-xq5sx
+      projected:
+        defaultMode: 420
+        sources:
+        - serviceAccountToken:
+            expirationSeconds: 3607
+            path: token
+        - configMap:
+            items:
+            - key: ca.crt
+              path: ca.crt
+            name: kube-root-ca.crt
+        - downwardAPI:
+            items:
+            - fieldRef:
+                apiVersion: v1
+                fieldPath: metadata.namespace
+              path: namespace
+  status:
+    conditions:
+    - lastProbeTime: null
+      lastTransitionTime: "2026-07-05T06:08:15Z"
+      status: "True"
+      type: Initialized
+    - lastProbeTime: null
+      lastTransitionTime: "2026-07-05T06:08:17Z"
+      status: "True"
+      type: Ready
+    - lastProbeTime: null
+      lastTransitionTime: "2026-07-05T06:08:17Z"
+      status: "True"
+      type: ContainersReady
+    - lastProbeTime: null
+      lastTransitionTime: "2026-07-05T06:08:15Z"
+      status: "True"
+      type: PodScheduled
+    containerStatuses:
+    - containerID: docker://ac5dcafc2540f413148d4aedb8c3eaa9661acc971c9b7075f4e6143ccbcfcc06
+      image: vllm/vllm-openai:0.10.1-sleep
+      imageID: docker://sha256:6a3a5efad7779b594bf82dbda62c47efa789786a38963acb869142d9d8406492
+      lastState: {}
+      name: vllm-openai
+      ready: true
+      restartCount: 0
+      started: true
+      state:
+        running:
+          startedAt: "2026-07-05T06:08:16Z"
+    hostIP: 192.168.223.75
+    phase: Running
+    podIP: 10.244.3.61
+    podIPs:
+    - ip: 10.244.3.61
+    qosClass: BestEffort
+    startTime: "2026-07-05T06:08:15Z"
+- apiVersion: v1
+  kind: Pod
+  metadata:
+    annotations:
+      tre.aibrix.io/gpu-ids: "0"
+      tre.aibrix.io/gpu-uuids: GPU-689a3e93-68db-0dac-160b-6a791cf246e8
+      tre.aibrix.io/state: awake
+    creationTimestamp: "2026-07-05T05:04:59Z"
+    generateName: dsqwen-7b-nscc-ds-4a100-node9-gpu-0-79b869c66b-
+    labels:
+      app: dsqwen-7b-nscc-ds-4a100-node9-gpu-0
+      model.aibrix.ai/name: dsqwen-7b
+      model.aibrix.ai/port: "8000"
+      pod-template-hash: 79b869c66b
+      tre.aibrix.io/gpu-ids: "0"
+      tre.aibrix.io/managed: "true"
+      tre.aibrix.io/node: nscc-ds-4a100-node9
+      tre.aibrix.io/routable: "true"
+    name: dsqwen-7b-nscc-ds-4a100-node9-gpu-0-79b869c66b-cndx7
+    namespace: default
+    ownerReferences:
+    - apiVersion: apps/v1
+      blockOwnerDeletion: true
+      controller: true
+      kind: ReplicaSet
+      name: dsqwen-7b-nscc-ds-4a100-node9-gpu-0-79b869c66b
+      uid: bac79295-8f99-49de-a654-5c68e4b927cc
+    resourceVersion: "192799496"
+    uid: 1b6546ea-b5be-4e36-b540-00f32ae96dd4
+  spec:
+    containers:
+    - command:
+      - python3
+      - -m
+      - vllm.entrypoints.openai.api_server
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --uvicorn-log-level
+      - warning
+      - --model
+      - /data/nfs_shared_data/DeepSeek-R1-Distill-Qwen-7B
+      - --served-model-name
+      - dsqwen-7b
+      - --enable_sleep_mode
+      - --no-enable-prefix-caching
+      - --enable-chunked-prefill
+      - --max-num-batched-tokens
+      - "2048"
+      - --swap-space
+      - "16"
+      env:
+      - name: NVIDIA_VISIBLE_DEVICES
+        value: GPU-689a3e93-68db-0dac-160b-6a791cf246e8
+      - name: CUDA_VISIBLE_DEVICES
+        value: "0"
+      - name: VLLM_SERVER_DEV_MODE
+        value: "1"
+      - name: VLLM_WORKER_MULTIPROC_METHOD
+        value: spawn
+      - name: VLLM_USE_MODELSCOPE
+        value: "True"
+      image: vllm/vllm-openai:0.10.1-sleep
+      imagePullPolicy: IfNotPresent
+      name: vllm-openai
+      ports:
+      - containerPort: 8000
+        protocol: TCP
+      resources: {}
+      terminationMessagePath: /dev/termination-log
+      terminationMessagePolicy: File
+      volumeMounts:
+      - mountPath: /dev/shm
+        name: shm
+      - mountPath: /data
+        name: models-volume
+      - mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+        name: kube-api-access-8jbjt
+        readOnly: true
+    dnsPolicy: ClusterFirst
+    enableServiceLinks: true
+    nodeName: nscc-ds-4a100-node9
+    preemptionPolicy: PreemptLowerPriority
+    priority: 0
+    restartPolicy: Always
+    schedulerName: default-scheduler
+    securityContext: {}
+    serviceAccount: default
+    serviceAccountName: default
+    terminationGracePeriodSeconds: 30
+    tolerations:
+    - effect: NoExecute
+      key: node.kubernetes.io/not-ready
+      operator: Exists
+      tolerationSeconds: 300
+    - effect: NoExecute
+      key: node.kubernetes.io/unreachable
+      operator: Exists
+      tolerationSeconds: 300
+    volumes:
+    - emptyDir:
+        medium: Memory
+        sizeLimit: 20Gi
+      name: shm
+    - hostPath:
+        path: /data
+        type: ""
+      name: models-volume
+    - name: kube-api-access-8jbjt
+      projected:
+        defaultMode: 420
+        sources:
+        - serviceAccountToken:
+            expirationSeconds: 3607
+            path: token
+        - configMap:
+            items:
+            - key: ca.crt
+              path: ca.crt
+            name: kube-root-ca.crt
+        - downwardAPI:
+            items:
+            - fieldRef:
+                apiVersion: v1
+                fieldPath: metadata.namespace
+              path: namespace
+  status:
+    conditions:
+    - lastProbeTime: null
+      lastTransitionTime: "2026-07-05T05:07:28Z"
+      status: "True"
+      type: Initialized
+    - lastProbeTime: null
+      lastTransitionTime: "2026-07-05T05:12:39Z"
+      status: "True"
+      type: Ready
+    - lastProbeTime: null
+      lastTransitionTime: "2026-07-05T05:12:39Z"
+      status: "True"
+      type: ContainersReady
+    - lastProbeTime: null
+      lastTransitionTime: "2026-07-05T05:07:28Z"
+      status: "True"
+      type: PodScheduled
+    containerStatuses:
+    - containerID: docker://d356d34042ed76f755a6e0cdf951acd4a598d6eef3c0c1909f8994dde482ccd4
+      image: vllm/vllm-openai:0.10.1-sleep
+      imageID: docker://sha256:6a3a5efad7779b594bf82dbda62c47efa789786a38963acb869142d9d8406492
+      lastState:
+        terminated:
+          containerID: docker://a3a5159779d1fe3ffbe9fbc7fbdb05f4b954d408f028f70bc2c10e0a8a2bdbdb
+          exitCode: 1
+          finishedAt: "2026-07-05T05:11:08Z"
+          reason: Error
+          startedAt: "2026-07-05T05:10:40Z"
+      name: vllm-openai
+      ready: true
+      restartCount: 5
+      started: true
+      state:
+        running:
+          startedAt: "2026-07-05T05:12:38Z"
+    hostIP: 192.168.223.75
+    phase: Running
+    podIP: 10.244.3.53
+    podIPs:
+    - ip: 10.244.3.53
+    qosClass: BestEffort
+    startTime: "2026-07-05T05:07:28Z"
+- apiVersion: v1
+  kind: Pod
+  metadata:
+    annotations:
+      tre.aibrix.io/gpu-ids: "3"
+      tre.aibrix.io/gpu-uuids: GPU-3c2fb581-708a-5fef-3eaa-5c3cc21a028e
+      tre.aibrix.io/state: sleeping
+    creationTimestamp: "2026-07-05T05:50:56Z"
+    generateName: dsqwen-7b-nscc-ds-4a100-node9-gpu-3-86c8574f65-
+    labels:
+      app: dsqwen-7b-nscc-ds-4a100-node9-gpu-3
+      model.aibrix.ai/name: dsqwen-7b
+      model.aibrix.ai/port: "8000"
+      pod-template-hash: 86c8574f65
+      tre.aibrix.io/gpu-ids: "3"
+      tre.aibrix.io/managed: "true"
+      tre.aibrix.io/node: nscc-ds-4a100-node9
+      tre.aibrix.io/routable: "false"
+    name: dsqwen-7b-nscc-ds-4a100-node9-gpu-3-86c8574f65-g8c4g
+    namespace: default
+    ownerReferences:
+    - apiVersion: apps/v1
+      blockOwnerDeletion: true
+      controller: true
+      kind: ReplicaSet
+      name: dsqwen-7b-nscc-ds-4a100-node9-gpu-3-86c8574f65
+      uid: 27da2d70-6197-4cbe-b404-784de94ee034
+    resourceVersion: "192814976"
+    uid: 05607f02-5522-4e07-987a-09f14da9561a
+  spec:
+    containers:
+    - command:
+      - python3
+      - -m
+      - vllm.entrypoints.openai.api_server
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --uvicorn-log-level
+      - warning
+      - --model
+      - /data/nfs_shared_data/DeepSeek-R1-Distill-Qwen-7B
+      - --served-model-name
+      - dsqwen-7b
+      - --enable_sleep_mode
+      - --no-enable-prefix-caching
+      - --enable-chunked-prefill
+      - --max-num-batched-tokens
+      - "2048"
+      - --swap-space
+      - "16"
+      env:
+      - name: NVIDIA_VISIBLE_DEVICES
+        value: GPU-3c2fb581-708a-5fef-3eaa-5c3cc21a028e
+      - name: CUDA_VISIBLE_DEVICES
+        value: "0"
+      - name: VLLM_SERVER_DEV_MODE
+        value: "1"
+      - name: VLLM_WORKER_MULTIPROC_METHOD
+        value: spawn
+      - name: VLLM_USE_MODELSCOPE
+        value: "True"
+      image: vllm/vllm-openai:0.10.1-sleep
+      imagePullPolicy: IfNotPresent
+      name: vllm-openai
+      ports:
+      - containerPort: 8000
+        protocol: TCP
+      resources: {}
+      terminationMessagePath: /dev/termination-log
+      terminationMessagePolicy: File
+      volumeMounts:
+      - mountPath: /dev/shm
+        name: shm
+      - mountPath: /data
+        name: models-volume
+      - mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+        name: kube-api-access-g8qcf
+        readOnly: true
+    dnsPolicy: ClusterFirst
+    enableServiceLinks: true
+    nodeName: nscc-ds-4a100-node9
+    preemptionPolicy: PreemptLowerPriority
+    priority: 0
+    restartPolicy: Always
+    schedulerName: default-scheduler
+    securityContext: {}
+    serviceAccount: default
+    serviceAccountName: default
+    terminationGracePeriodSeconds: 30
+    tolerations:
+    - effect: NoExecute
+      key: node.kubernetes.io/not-ready
+      operator: Exists
+      tolerationSeconds: 300
+    - effect: NoExecute
+      key: node.kubernetes.io/unreachable
+      operator: Exists
+      tolerationSeconds: 300
+    volumes:
+    - emptyDir:
+        medium: Memory
+        sizeLimit: 20Gi
+      name: shm
+    - hostPath:
+        path: /data
+        type: ""
+      name: models-volume
+    - name: kube-api-access-g8qcf
+      projected:
+        defaultMode: 420
+        sources:
+        - serviceAccountToken:
+            expirationSeconds: 3607
+            path: token
+        - configMap:
+            items:
+            - key: ca.crt
+              path: ca.crt
+            name: kube-root-ca.crt
+        - downwardAPI:
+            items:
+            - fieldRef:
+                apiVersion: v1
+                fieldPath: metadata.namespace
+              path: namespace
+  status:
+    conditions:
+    - lastProbeTime: null
+      lastTransitionTime: "2026-07-05T05:53:25Z"
+      status: "True"
+      type: Initialized
+    - lastProbeTime: null
+      lastTransitionTime: "2026-07-05T05:53:27Z"
+      status: "True"
+      type: Ready
+    - lastProbeTime: null
+      lastTransitionTime: "2026-07-05T05:53:27Z"
+      status: "True"
+      type: ContainersReady
+    - lastProbeTime: null
+      lastTransitionTime: "2026-07-05T05:53:25Z"
+      status: "True"
+      type: PodScheduled
+    containerStatuses:
+    - containerID: docker://63bd0755468be335a172ba1df53a464239c56fd879f7b95fb3825e6dbd7cb238
+      image: vllm/vllm-openai:0.10.1-sleep
+      imageID: docker://sha256:6a3a5efad7779b594bf82dbda62c47efa789786a38963acb869142d9d8406492
+      lastState: {}
+      name: vllm-openai
+      ready: true
+      restartCount: 0
+      started: true
+      state:
+        running:
+          startedAt: "2026-07-05T05:53:26Z"
+    hostIP: 192.168.223.75
+    phase: Running
+    podIP: 10.244.3.56
+    podIPs:
+    - ip: 10.244.3.56
+    qosClass: BestEffort
+    startTime: "2026-07-05T05:53:25Z"
+- apiVersion: v1
+  kind: Endpoints
+  metadata:
+    creationTimestamp: "2026-07-05T05:04:53Z"
+    labels:
+      model.aibrix.ai/name: dsllama-8b
+    name: dsllama-8b
+    namespace: default
+    resourceVersion: "192807391"
+    uid: a8efc8e7-0994-4eb8-bc35-4cc8a784f986
+  subsets:
+  - addresses:
+    - ip: 10.244.3.57
+      nodeName: nscc-ds-4a100-node9
+      targetRef:
+        kind: Pod
+        name: dsllama-8b-nscc-ds-4a100-node9-gpu-1-5579b75f9b-kh5fx
+        namespace: default
+        uid: aac1f699-04bd-4f13-aad9-a7ea014691c5
+    ports:
+    - name: http
+      port: 8000
+      protocol: TCP
+- apiVersion: v1
+  kind: Endpoints
+  metadata:
+    annotations:
+      endpoints.kubernetes.io/last-change-trigger-time: "2026-07-05T06:00:57Z"
+    creationTimestamp: "2026-07-04T15:50:23Z"
+    labels:
+      model.aibrix.ai/name: dsqwen-14b
+    name: dsqwen-14b
+    namespace: default
+    resourceVersion: "192815070"
+    uid: dbc18812-e69a-4bcd-8d5f-573a076df357
+  subsets:
+  - addresses:
+    - ip: 10.244.0.163
+      nodeName: nscc-ds-4a100-node10
+      targetRef:
+        kind: Pod
+        name: dsqwen-14b-nscc-ds-4a100-node10-gpu-0-1-77d5997485-nc6nv
+        namespace: default
+        uid: 971a5458-b19d-4f87-af91-ecff5bab9651
+    - ip: 10.244.0.164
+      nodeName: nscc-ds-4a100-node10
+      targetRef:
+        kind: Pod
+        name: dsqwen-14b-nscc-ds-4a100-node10-gpu-2-3-66f57f5575-6dtl7
+        namespace: default
+        uid: e8d97002-331f-4b26-a2be-8efb6c4c6c5b
+    ports:
+    - name: http
+      port: 8000
+      protocol: TCP
+- apiVersion: v1
+  kind: Endpoints
+  metadata:
+    creationTimestamp: "2026-07-04T09:18:47Z"
+    labels:
+      model.aibrix.ai/name: dsqwen-7b
+    name: dsqwen-7b
+    namespace: default
+    resourceVersion: "192814977"
+    uid: 353dd429-f569-4712-a261-9423582ade8d
+  subsets:
+  - addresses:
+    - ip: 10.244.3.53
+      nodeName: nscc-ds-4a100-node9
+      targetRef:
+        kind: Pod
+        name: dsqwen-7b-nscc-ds-4a100-node9-gpu-0-79b869c66b-cndx7
+        namespace: default
+        uid: 1b6546ea-b5be-4e36-b540-00f32ae96dd4
+    ports:
+    - name: http
+      port: 8000
+      protocol: TCP
+- apiVersion: v1
+  kind: Endpoints
+  metadata:
+    creationTimestamp: "2025-04-25T06:56:48Z"
+    labels:
+      endpointslice.kubernetes.io/skip-mirror: "true"
+    name: kubernetes
+    namespace: default
+    resourceVersion: "161988319"
+    uid: 0a70e69d-1a49-4a19-8227-37e2d22c1119
+  subsets:
+  - addresses:
+    - ip: 192.168.223.76
+    ports:
+    - name: https
+      port: 6443
+      protocol: TCP
+- apiVersion: v1
+  kind: Endpoints
+  metadata:
+    creationTimestamp: "2025-12-19T08:31:47Z"
+    labels:
+      model.aibrix.ai/name: lxtdsqwen-14b
+      prometheus-discovery: "true"
+    name: lxtdsqwen-14b
+    namespace: default
+    resourceVersion: "105266373"
+    uid: f27d94a6-3300-4bbe-bcbb-97d070973b4c
+- apiVersion: v1
+  kind: Endpoints
+  metadata:
+    creationTimestamp: "2025-12-19T15:37:47Z"
+    labels:
+      model.aibrix.ai/name: lxtdsqwen-30b
+      prometheus-discovery: "true"
+    name: lxtdsqwen-30b
+    namespace: default
+    resourceVersion: "105736382"
+    uid: c982bbdd-ae6a-41d3-966f-e54c0dca63c0
+- apiVersion: v1
+  kind: Endpoints
+  metadata:
+    creationTimestamp: "2025-12-19T09:04:25Z"
+    labels:
+      model.aibrix.ai/name: lxtdsqwen-32b
+      prometheus-discovery: "true"
+    name: lxtdsqwen-32b
+    namespace: default
+    resourceVersion: "106011670"
+    uid: 3780f79e-3969-4097-bdbf-52f65a8b247e
+- apiVersion: v1
+  kind: Endpoints
+  metadata:
+    creationTimestamp: "2025-12-19T06:49:06Z"
+    labels:
+      model.aibrix.ai/name: lxtdsqwen-7b
+      prometheus-discovery: "true"
+    name: lxtdsqwen-7b
+    namespace: default
+    resourceVersion: "105110925"
+    uid: 498f6a14-f109-439f-8b22-f287c06b4276
+- apiVersion: v1
+  kind: Endpoints
+  metadata:
+    creationTimestamp: "2025-12-23T13:36:41Z"
+    labels:
+      model.aibrix.ai/name: lxtllama-13b
+      prometheus-discovery: "true"
+    name: lxtllama-13b
+    namespace: default
+    resourceVersion: "109147787"
+    uid: fc856bd4-f7f5-4a8d-b688-0e3cd93674f1
+- apiVersion: v1
+  kind: Endpoints
+  metadata:
+    creationTimestamp: "2026-01-16T17:54:42Z"
+    labels:
+      model.aibrix.ai/name: lxtllama-8b-2
+      prometheus-discovery: "true"
+    name: lxtllama-8b-2
+    namespace: default
+    resourceVersion: "127336919"
+    uid: 0bd001b7-e0c6-4b60-9696-53e139aa4f82
+- apiVersion: v1
+  kind: Endpoints
+  metadata:
+    creationTimestamp: "2026-01-26T14:48:01Z"
+    labels:
+      model.aibrix.ai/name: lxtllama-8b-3
+      prometheus-discovery: "true"
+    name: lxtllama-8b-3
+    namespace: default
+    resourceVersion: "127336951"
+    uid: 9e4061de-4ccd-421e-86c4-2de6ebb718dc
+- apiVersion: v1
+  kind: Endpoints
+  metadata:
+    creationTimestamp: "2026-05-13T11:53:02Z"
+    labels:
+      model.aibrix.ai/name: lxtmodela
+      prometheus-discovery: "true"
+    name: lxtmodela
+    namespace: default
+    resourceVersion: "170048861"
+    uid: bb18b918-53e3-42c8-805f-696919c157a5
+- apiVersion: v1
+  kind: Endpoints
+  metadata:
+    creationTimestamp: "2026-05-13T12:17:21Z"
+    labels:
+      model.aibrix.ai/name: lxtmodelb
+      prometheus-discovery: "true"
+    name: lxtmodelb
+    namespace: default
+    resourceVersion: "170048765"
+    uid: d0af58bf-5590-4010-84be-28ed2b9b0aea
+- apiVersion: v1
+  kind: Endpoints
+  metadata:
+    creationTimestamp: "2026-05-13T11:52:45Z"
+    labels:
+      model.aibrix.ai/name: lxtmodelc
+      prometheus-discovery: "true"
+    name: lxtmodelc
+    namespace: default
+    resourceVersion: "170048639"
+    uid: 77df5ee2-404d-4c00-b43e-3c2ad5262c12
+- apiVersion: v1
+  kind: Endpoints
+  metadata:
+    creationTimestamp: "2025-12-19T09:09:12Z"
+    labels:
+      model.aibrix.ai/name: lxtqwen3-1-7b
+      prometheus-discovery: "true"
+    name: lxtqwen3-1-7b
+    namespace: default
+    resourceVersion: "106012062"
+    uid: 9f75b07d-9a12-41aa-94b0-5b16f75f83bb
+- apiVersion: v1
+  kind: Endpoints
+  metadata:
+    creationTimestamp: "2025-12-23T13:35:22Z"
+    labels:
+      model.aibrix.ai/name: lxtqwen3-13b
+      prometheus-discovery: "true"
+    name: lxtqwen3-13b
+    namespace: default
+    resourceVersion: "107433750"
+    uid: e8d5ac1b-cca9-44ce-a3bb-a8c23af269bd
+- apiVersion: v1
+  kind: Endpoints
+  metadata:
+    creationTimestamp: "2025-12-19T07:37:31Z"
+    labels:
+      model.aibrix.ai/name: lxtqwen3-14b
+      prometheus-discovery: "true"
+    name: lxtqwen3-14b
+    namespace: default
+    resourceVersion: "109147743"
+    uid: da44b8fd-918b-436c-bd51-250d7e409348
+- apiVersion: v1
+  kind: Endpoints
+  metadata:
+    creationTimestamp: "2026-01-16T13:05:00Z"
+    labels:
+      model.aibrix.ai/name: lxtqwen3-30b
+      prometheus-discovery: "true"
+    name: lxtqwen3-30b
+    namespace: default
+    resourceVersion: "127337065"
+    uid: 1250b889-5a76-4ccd-8523-fc4f116f48a0
+- apiVersion: v1
+  kind: Endpoints
+  metadata:
+    creationTimestamp: "2026-01-16T17:37:47Z"
+    labels:
+      model.aibrix.ai/name: lxtqwen3-30b-2
+      prometheus-discovery: "true"
+    name: lxtqwen3-30b-2
+    namespace: default
+    resourceVersion: "127337116"
+    uid: 7fb04628-c9ec-4011-b866-86afb24b1bec
+- apiVersion: v1
+  kind: Endpoints
+  metadata:
+    creationTimestamp: "2025-12-23T07:59:52Z"
+    labels:
+      model.aibrix.ai/name: lxtqwen3-4b
+      prometheus-discovery: "true"
+    name: lxtqwen3-4b
+    namespace: default
+    resourceVersion: "107351321"
+    uid: 29ac51c5-5f43-4ad2-85e5-a33062bd4f38
+- apiVersion: v1
+  kind: Endpoints
+  metadata:
+    creationTimestamp: "2025-12-23T08:17:56Z"
+    labels:
+      model.aibrix.ai/name: lxtqwen3-8b-t2
+      prometheus-discovery: "true"
+    name: lxtqwen3-8b-t2
+    namespace: default
+    resourceVersion: "107432379"
+    uid: f1a958d6-035c-4139-a6d8-160e0092f0b0
+kind: List
+metadata:
+  resourceVersion: ""
