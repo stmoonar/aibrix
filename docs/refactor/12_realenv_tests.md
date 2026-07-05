@@ -374,6 +374,26 @@ Initial dsllama-8b GPU2 probe:
   - Ten consecutive heavy rounds all returned to `1090 MiB` after sleep.
 - E1-e evidence: `docs/refactor/p11_evidence/f1_pre_cleanup_20260705/n4b_e1_dsllama_gpu2_e_level2.json`.
   - Two rounds with `sleep?level=2` both returned to `1090 MiB`; wake after level-2 sleep remained functional.
-- Current interpretation: a clean replacement `dsllama-8b` pod does not reproduce the leak under the tested single-GPU scenarios. TP=2 `dsqwen-14b` still needs to be characterized.
+
+TP=2 dsqwen-14b node9 GPU2/GPU3 probe:
+
+- E1-a evidence: `docs/refactor/p11_evidence/f1_pre_cleanup_20260705/n4b_e1_dsqwen14b_node9_gpu23_a.json`.
+  - `create -> ready`: about `37756 MiB` per 14B shard.
+  - `sleep` after zero traffic: `1766 MiB` per 14B shard.
+- E1-b evidence: `docs/refactor/p11_evidence/f1_pre_cleanup_20260705/n4b_e1_dsqwen14b_node9_gpu23_b.json`.
+  - `wake -> 20 short requests -> sleep`: `1766 MiB` per 14B shard.
+- E1-c evidence: `docs/refactor/p11_evidence/f1_pre_cleanup_20260705/n4b_e1_dsqwen14b_node9_gpu23_c.json`.
+  - `wake -> 200 requests, concurrency=8, max_tokens=96 -> sleep`: `1766 MiB` per 14B shard.
+- E1-d evidence: `docs/refactor/p11_evidence/f1_pre_cleanup_20260705/n4b_e1_dsqwen14b_node9_gpu23_d.json`.
+  - Ten consecutive heavy rounds stayed flat after sleep: GPU2 total `2856 MiB`, GPU3 total `3910 MiB`; 14B shard contribution remained `1766 MiB` on each GPU.
+- E1-e evidence: `docs/refactor/p11_evidence/f1_pre_cleanup_20260705/n4b_e1_dsqwen14b_node9_gpu23_e_level2.json`.
+  - Two level-2 sleep rounds returned to the same residue and wake remained functional.
+
+Current interpretation:
+
+- The known leaked pods were cured by delete/recreate.
+- Clean replacement `dsllama-8b` and `dsqwen-14b` pods did not reproduce the leak under the tested E1 matrix.
+- `sleep?level=2` did not reduce residue versus level 1 in these tests.
+- D8 remains appropriate as detection + hygiene recreate; the 12h soak should record future leak frequency rather than requiring leak absence.
 
 No `n4-done` tag has been created.

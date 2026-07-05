@@ -1027,7 +1027,15 @@
   - Evidence: `docs/refactor/p11_evidence/f1_pre_cleanup_20260705/n4b_e1_dsllama_gpu2_e_level2.json`.
   - Two rounds using `sleep?level=2` returned to `1090 MiB` and the second wake succeeded. For this model/image path, level 2 did not reduce residue below level 1.
 - Current E1 interpretation for single-GPU `dsllama-8b`: the previously leaked pod was cured by delete/recreate, and a clean replacement does not reproduce the leak under zero traffic, short traffic, 200-request concurrent traffic, 10 repeated heavy rounds, or level-2 sleep.
+- Extended the E1 probe script with multi-GPU sampling support for TP=2 pods. Focused tests now pass with 5 tests; full `cd tre && make check` passed with 238 tests.
+- Recreated `dsqwen-14b-nscc-ds-4a100-node9-gpu-2-3` on node9 GPU2/GPU3 and ran E1-a..E1-e:
+  - E1-a evidence: `docs/refactor/p11_evidence/f1_pre_cleanup_20260705/n4b_e1_dsqwen14b_node9_gpu23_a.json`. Ready used about `37756 MiB` per 14B shard; zero-traffic sleep returned each 14B shard to `1766 MiB`.
+  - E1-b evidence: `docs/refactor/p11_evidence/f1_pre_cleanup_20260705/n4b_e1_dsqwen14b_node9_gpu23_b.json`. `wake -> 20 short requests -> sleep` returned each 14B shard to `1766 MiB`.
+  - E1-c evidence: `docs/refactor/p11_evidence/f1_pre_cleanup_20260705/n4b_e1_dsqwen14b_node9_gpu23_c.json`. `wake -> 200 requests, concurrency=8, max_tokens=96 -> sleep` returned each 14B shard to `1766 MiB`.
+  - E1-d evidence: `docs/refactor/p11_evidence/f1_pre_cleanup_20260705/n4b_e1_dsqwen14b_node9_gpu23_d.json`. Ten consecutive heavy rounds stayed flat: GPU2 total `2856 MiB`, GPU3 total `3910 MiB` after every sleep; the 14B shard contribution remained `1766 MiB` on each GPU.
+  - E1-e evidence: `docs/refactor/p11_evidence/f1_pre_cleanup_20260705/n4b_e1_dsqwen14b_node9_gpu23_e_level2.json`. Two level-2 sleep rounds returned to the same residue and the second wake succeeded.
+- Current E1 interpretation across dsllama and 14B: the known leaked pods were cured by delete/recreate, and clean replacement pods did not reproduce the leak under the tested traffic matrix. Level 2 sleep did not reduce residue in these tests. Keep D8 detection+hygiene design; use soak to measure future leak frequency.
 
 ### Endgame F1 Next
 
-- Continue E1 with TP=2 `dsqwen-14b` cases. Then complete F1.2 by restoring the full 12-binding topology in sequence and recording clean reconcile/GPU truth.
+- Complete F1.2 by restoring the missing `dsqwen-7b` GPU1/GPU2 Deployments in sequence and recording clean reconcile/GPU truth.

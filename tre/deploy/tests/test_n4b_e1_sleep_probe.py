@@ -1,7 +1,13 @@
 import threading
 import time
 
-from scripts.n4b_e1_sleep_probe import parse_gpu_memory, percentile95, run_request_batch, summarize_used_mib
+from scripts.n4b_e1_sleep_probe import (
+    parse_gpu_memory,
+    percentile95,
+    run_request_batch,
+    summarize_many_gpus,
+    summarize_used_mib,
+)
 
 
 def test_parse_gpu_memory_groups_rows_by_uuid() -> None:
@@ -27,6 +33,21 @@ def test_summarize_used_mib_reports_total_for_selected_uuid() -> None:
 
     assert summarize_used_mib(rows, "GPU-a") == {"processes": 2, "used_mib": 40}
     assert summarize_used_mib(rows, "missing") == {"processes": 0, "used_mib": 0}
+
+
+def test_summarize_many_gpus_reports_each_uuid_and_total() -> None:
+    rows = {
+        "GPU-a": [{"pid": "111", "used_mib": 10}, {"pid": "333", "used_mib": 30}],
+        "GPU-b": [{"pid": "222", "used_mib": 20}],
+    }
+
+    assert summarize_many_gpus(rows, ["GPU-a", "GPU-b"]) == {
+        "total_used_mib": 60,
+        "gpus": {
+            "GPU-a": {"processes": 2, "used_mib": 40},
+            "GPU-b": {"processes": 1, "used_mib": 20},
+        },
+    }
 
 
 def test_percentile95_uses_nearest_rank() -> None:

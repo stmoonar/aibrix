@@ -36,6 +36,14 @@ def summarize_used_mib(rows: dict[str, list[dict[str, int | str]]], gpu_uuid: st
     }
 
 
+def summarize_many_gpus(rows: dict[str, list[dict[str, int | str]]], gpu_uuids: list[str]) -> dict[str, Any]:
+    per_gpu = {gpu_uuid: summarize_used_mib(rows, gpu_uuid) for gpu_uuid in gpu_uuids}
+    return {
+        "total_used_mib": sum(item["used_mib"] for item in per_gpu.values()),
+        "gpus": per_gpu,
+    }
+
+
 def percentile95(values: Iterable[float]) -> float | None:
     ordered = sorted(values)
     if not ordered:
@@ -81,15 +89,19 @@ with urllib.request.urlopen(req, timeout={timeout_s}) as resp:
     return json.loads(out)
 
 
-def sample_gpu(node_host: str, gpu_uuid: str) -> dict[str, Any]:
+def parse_gpu_uuids(raw: str) -> list[str]:
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+def sample_gpu(node_host: str, gpu_uuids: list[str]) -> dict[str, Any]:
     text = ssh(
         node_host,
         "nvidia-smi --query-compute-apps=gpu_uuid,pid,used_memory --format=csv,noheader,nounits",
         timeout_s=30,
     )
     rows = parse_gpu_memory(text)
-    summary = summarize_used_mib(rows, gpu_uuid)
-    summary["raw"] = rows.get(gpu_uuid, [])
+    summary = summarize_many_gpus(rows, gpu_uuids)
+    summary["raw"] = {gpu_uuid: rows.get(gpu_uuid, []) for gpu_uuid in gpu_uuids}
     return summary
 
 
@@ -131,23 +143,24 @@ def get_pod(kubectl_host: str, app: str) -> dict[str, str]:
 
 def run_probe(args: argparse.Namespace) -> dict[str, Any]:
     started = time.time()
+    gpu_uuids = parse_gpu_uuids(args.gpu_uuid)
     kubectl(args.kubectl_host, f"apply -f {args.manifest}", timeout_s=60)
     kubectl(args.kubectl_host, f"-n default rollout status deploy/{args.deployment} --timeout=600s", timeout_s=660)
     pod = get_pod(args.kubectl_host, args.deployment)
     wait_http_ready(args.kubectl_host, pod["ip"], timeout_s=args.ready_timeout_s)
 
-    samples: list[dict[str, Any]] = [{"event": "ready", "gpu": sample_gpu(args.node_host, args.gpu_uuid)}]
+    samples: list[dict[str, Any]] = [{"event": "ready", "gpu": sample_gpu(args.node_host, gpu_uuids)}]
 
     if args.initial_sleep:
         post_vllm(args.kubectl_host, pod["ip"], f"/sleep?level={args.sleep_level}")
         time.sleep(args.sleep_wait_s)
-        samples.append({"event": "initial_sleep", "gpu": sample_gpu(args.node_host, args.gpu_uuid)})
+        samples.append({"event": "initial_sleep", "gpu": sample_gpu(args.node_host, gpu_uuids)})
 
     sleep_used: list[float] = []
     for round_idx in range(args.rounds):
         post_vllm(args.kubectl_host, pod["ip"], "/wake_up")
         time.sleep(args.wake_wait_s)
-        samples.append({"event": f"round_{round_idx}_wake", "gpu": sample_gpu(args.node_host, args.gpu_uuid)})
+        samples.append({"event": f"round_{round_idx}_wake", "gpu": sample_gpu(args.node_host, gpu_uuids)})
         run_request_batch(
             total=args.requests,
             concurrency=args.concurrency,
@@ -155,15 +168,16 @@ def run_probe(args: argparse.Namespace) -> dict[str, Any]:
         )
         post_vllm(args.kubectl_host, pod["ip"], f"/sleep?level={args.sleep_level}")
         time.sleep(args.sleep_wait_s)
-        sleep_sample = sample_gpu(args.node_host, args.gpu_uuid)
+        sleep_sample = sample_gpu(args.node_host, gpu_uuids)
         samples.append({"event": f"round_{round_idx}_sleep", "gpu": sleep_sample})
-        sleep_used.append(float(sleep_sample["used_mib"]))
+        sleep_used.append(float(sleep_sample["total_used_mib"]))
 
     return {
         "deployment": args.deployment,
         "model": args.model,
         "pod": pod,
         "gpu_uuid": args.gpu_uuid,
+        "gpu_uuids": gpu_uuids,
         "rounds": args.rounds,
         "requests_per_round": args.requests,
         "concurrency": args.concurrency,
