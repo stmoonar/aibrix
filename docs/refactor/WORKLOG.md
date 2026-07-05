@@ -1366,3 +1366,40 @@
 
 - Commit the precheck baseline-worker enhancement, rerun the 15-minute precheck
   with `--baseline-workers-per-model 1`, and parse final `model_states` evidence.
+
+### Endgame F2.4 Final 15-Minute zm Precheck
+
+- Before final precheck, reset all three models to target `awake=1`.
+- A reconcile immediately after reset briefly reported `sleep_leak` warnings on
+  node9 GPU2, but node9 `nvidia-smi` showed GPU2/GPU3 at `4070 MiB` each. The
+  warning was caused by stale GPU truth data; running the node9 GPU truth agent
+  once refreshed Redis and the next reconcile returned `warnings=[]`. No
+  hygiene recreate was needed.
+- Final precheck command:
+  - `python3 tre/deploy/scripts/n4b_three_model_precheck.py --duration-seconds 900 --phase-seconds 60 --workers 4 --baseline-workers-per-model 1 --sample-seconds 30 --max-tokens 96`
+  - output: `docs/refactor/p11_evidence/f2_zm_precheck_20260705/three_model_precheck_baseline.json`
+  - controller log: `docs/refactor/p11_evidence/f2_zm_precheck_20260705/controller_since_baseline_precheck.log`
+  - post-run reconcile: `docs/refactor/p11_evidence/f2_zm_precheck_20260705/post_baseline_reconcile.json`
+- Final precheck result:
+  - duration: `900.9s`
+  - gateway errors: `{}`
+  - ok counts: `dsqwen-7b=1694`, `dsllama-8b=1573`, `dsqwen-14b=3468`
+  - final state: all three models `awake=1`, `bound=4`
+  - tre-v2 component restarts stayed at `0`
+  - post-run reconcile: `warnings=[]`
+  - controller event counts:
+    `paper_state_incomplete_drop=0`, `paper_state_stale_hold=0`,
+    `paper_state_stale_unknown=0`, `cluster_view_unavailable=0`
+  - decision `model_states` coverage during the run:
+    `dsqwen-7b z_m non-null 255/259`,
+    `dsllama-8b z_m non-null 255/259`,
+    `dsqwen-14b z_m non-null 255/259`.
+    The four null samples per model are the initial warm-up decisions before the
+    first complete metrics window; after warm-up, Z state stayed populated.
+- F2.4 conclusion: zm signal path is usable on live traffic with no incomplete
+  drops and with decision snapshots now carrying per-model Z evidence.
+
+### Endgame F2 Next
+
+- Commit final F2.4 evidence, then proceed to F2.5 high-load zm scale-action
+  validation from `14_endgame_plan.md` section 3.2 step 3.
