@@ -250,6 +250,7 @@ def run_precheck(args: argparse.Namespace) -> dict:
         "initial_restarts": initial_restarts,
         "final_restarts": final_restarts,
     }
+    return result
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -1,4 +1,5 @@
-from scripts.n4b_three_model_precheck import parse_args, parse_models, summarize_latencies
+from scripts import n4b_three_model_precheck as precheck
+from scripts.n4b_three_model_precheck import parse_args, parse_models, run_precheck, summarize_latencies
 
 
 def test_parse_models_trims_and_drops_empty_items() -> None:
@@ -48,3 +49,28 @@ def test_summarize_latencies_reports_nearest_rank_p95() -> None:
         "p95": 100.0,
         "max": 100.0,
     }
+
+
+def test_run_precheck_returns_result_without_live_load(monkeypatch) -> None:
+    monkeypatch.setattr(precheck, "pod_restarts", lambda namespace, selector=None: {namespace: 0})
+    monkeypatch.setattr(precheck, "http_json", lambda method, url, payload=None, headers=None, timeout=10: {"url": url})
+    monkeypatch.setattr(precheck, "rss_kb", lambda namespace, selector: 123)
+    monkeypatch.setattr(precheck, "redis_dbsize", lambda: 7)
+    args = parse_args(
+        [
+            "--models",
+            "a,b",
+            "--duration-seconds",
+            "0",
+            "--workers",
+            "0",
+        ]
+    )
+
+    result = run_precheck(args)
+
+    assert result["models"] == ["a", "b"]
+    assert result["initial_state"] == {"url": "http://10.111.21.116:8000/v2/state"}
+    assert result["final_state"] == {"url": "http://10.111.21.116:8000/v2/state"}
+    assert result["errors"] == {}
+    assert result["latency_ms"]["a"]["count"] == 0

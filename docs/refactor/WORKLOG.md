@@ -1251,3 +1251,29 @@
 
 - Run full `cd tre && make check`, commit the image/overlay/precheck prep, then
   roll the controller and execute the 15-minute zm precheck.
+
+### Endgame F2.4 Precheck Script Return Fix
+
+- Rolled controller to `tre-v2-controller:20260705-7bfb0709`:
+  - pod: `tre-v2-controller-d6d498484-tk57g`
+  - node: `nscc-ds-4a100-node10`
+  - restarts: `0`
+  - image verified in Deployment template.
+- Pre-roll reconcile was clean: `warnings=[]`; state remained
+  `awake=1/bound=4` for all three models.
+- First 15-minute precheck attempt did run live load, but the collected JSON was
+  invalid (`null`) because the newly collected script built `result` without
+  returning it. The script exited with
+  `TypeError: 'NoneType' object is not subscriptable` at final status handling.
+- Added a RED unit test for `run_precheck()` using monkeypatched kubectl/http/rss
+  helpers and `duration=0/workers=0`; it failed with `NoneType`.
+- Fixed `run_precheck()` to return the result dictionary.
+- Verification:
+  - `deploy/tests/test_n4b_three_model_precheck.py`: `4 passed`.
+  - Full `cd tre && make check`: `260 passed`.
+
+### Endgame F2 Next
+
+- Commit the precheck script return fix, rerun the 15-minute precheck, and then
+  analyze controller decision logs for `paper_state_incomplete_drop`, non-null
+  `Z_m`, and stale-hold rate.
