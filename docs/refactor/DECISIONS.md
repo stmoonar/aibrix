@@ -109,3 +109,51 @@ Manifest generation enforces a static bound budget of at most three generated De
 ### Consequences
 
 The D7 canary in N4b.3 is mandatory before broad rollout: first prove that a no-GPU-request pod can see only the UUID named by `NVIDIA_VISIBLE_DEVICES` in the current gpu-operator/runtime environment. If it cannot, the fallback chain is `runtimeClassName: nvidia`, then privileged plus `/dev/nvidia*` hostPath. The canary conclusion must be recorded before full topology deployment.
+
+## ADR-0007: F4 base teardown (D11) BLOCKED — aibrix-system is a shared multi-tenant base
+
+- Status: **Blocked / needs architect (human) decision**. Date: 2026-07-06.
+- Context: Endgame plan §5 (D11) directs F4.2 to uninstall the AIBrix application
+  base in `aibrix-system` and F4.3 to reinstall a clean AIBrix 0.7.0, on the
+  premise that "the whole cluster base is a TRE snowflake". Live inspection on
+  2026-07-06 contradicts that premise:
+  - `aibrix-system` hosts ONE shared AIBrix base (controller-manager,
+    gateway-plugins, redis-master, autoscaling-controller, gpu-optimizer,
+    kuberay-operator, metadata-service, orchestration-controller, visualizers;
+    290 days old, restarted ~4d14h ago).
+  - A SEPARATE tenant runs on the same base: `lxtaibrix-gateway-plugins` (Running),
+    `lxt-aibrix-eg` gateway + `lxt-aibrix-reserved-router` (all ~4d15h).
+  - `qwen-coder-router` and `qwen-instruct-router` (373d) parent to the SAME
+    `aibrix-eg` gateway that the TRE model routers (dsqwen-7b/14b, dsllama-8b) use.
+  - AIBrix CRDs (`model.aibrix.ai`, `autoscaling.aibrix.ai`,
+    `orchestration.aibrix.ai`, `ray.io`) are cluster-scoped and shared by all tenants.
+  - The TRE controller itself reads metrics from the shared
+    `aibrix-redis-master.aibrix-system`.
+- Decision: **Do NOT execute F4.2/F4.3 autonomously.** Uninstalling the shared base
+  or reinstalling it as 0.7.0 would (a) break the lxt tenant, (b) break
+  qwen-coder/qwen-instruct serving via the shared `aibrix-eg` gateway, (c) force a
+  CRD/controller version change (0.4→0.7) on all co-tenants, (d) delete the shared
+  redis other components depend on. This violates red line 2.2 ("禁止改动破坏机器环境
+  /其它工作负载") and the plan's own F4.2 caveat ("删任何底座对象前逐类确认归属，
+  不确定就记 Blocked 停手问架构师；宁可留残余也不误删底座").
+- Consequences: F4.4 (authoritative N4b on a clean 0.7.0 base) and the paper-grade
+  N5 numbers that the plan gates behind it are ON HOLD pending one of the options
+  below, to be chosen by the architect/human:
+  1. **Isolated base for TRE**: install a second AIBrix 0.7.0 base in a NEW namespace
+     (e.g. `aibrix-tre`) with its own gateway/redis, leaving `aibrix-system`
+     untouched; retarget tre-v2 controller/SM/routes at the new base. (Cleanest;
+     no third-party impact. Requires confirming 0.7.0 supports side-by-side install
+     and the GPU nodes can host both bases' pods.)
+  2. **Coordinated maintenance window**: get explicit sign-off from the lxt /
+     qwen-coder / qwen-instruct owners, snapshot+restore their resources, then do
+     the in-place 0.7.0 upgrade of the shared base during an agreed downtime.
+  3. **Accept the current base for N5**: run N5 on the existing shared base with a
+     documented version caveat (base is mixed 0.4-era images, not clean 0.7.0),
+     skip F4.2/F4.3, and note the reproducibility limitation in the paper. Numbers
+     would not be on a pristine 0.7.0 base.
+- Recommendation: Option 1 (isolated `aibrix-tre` base) if 0.7.0 supports it;
+  else Option 3 with a clear caveat. Option 2 only with explicit co-tenant sign-off.
+- What proceeds regardless (not blocked): F4.0 declarative package (done); live
+  NON-destructive validation of that package on the current cluster (gpu-truth
+  DaemonSet, ReferenceGrant, regenerated model routes — all additive/idempotent);
+  N5 driver tooling (r3_grid.py, reset scripts, 13_experiments_log scaffold).

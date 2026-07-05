@@ -1710,3 +1710,25 @@ from manifests with zero手工 patch. All offline; cluster untouched.
 - Gate: `cd tre && make check` **268 passed** (was 264, +4). All 5 overlays +
   models `kubectl kustomize` build clean. Cluster untouched (controller still
   paused, SM/redis/ui Running).
+
+### Endgame F4.1/F4.2 BLOCKED — shared aibrix-system base (2026-07-06)
+
+Before the F4.2 teardown I audited base ownership (plan F4.2 mandates "逐类确认归属").
+Finding: `aibrix-system` is a **shared multi-tenant** AIBrix base, not a TRE
+snowflake:
+- shared base: aibrix-controller-manager / gateway-plugins / redis-master /
+  autoscaling-controller / gpu-optimizer / kuberay / metadata / orchestration
+  (290d, restarted ~4d14h);
+- other tenant lxt: `lxtaibrix-gateway-plugins`, `lxt-aibrix-eg`,
+  `lxt-aibrix-reserved-router` (~4d15h, Running);
+- `qwen-coder-router` + `qwen-instruct-router` (373d) share OUR `aibrix-eg` gateway;
+- AIBrix CRDs cluster-scoped + shared; TRE controller reads shared
+  `aibrix-redis-master`.
+Uninstalling/reinstalling this base would break third-party production workloads
+and force a CRD/controller version change on all co-tenants → violates red line
+2.2 and F4.2's own stop-and-ask caveat. Recorded ADR-0007; **stopped the
+destructive path, did not touch the base.** Surfacing to the architect: options
+= (1) isolated `aibrix-tre` 0.7.0 base in a new namespace, (2) coordinated
+maintenance window with co-tenant sign-off, (3) accept current base for N5 with a
+version caveat. Continuing with non-blocked work (live validation of the F4.0
+package, N5 driver tooling) while awaiting the decision.
