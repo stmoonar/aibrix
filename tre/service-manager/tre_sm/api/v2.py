@@ -23,6 +23,8 @@ class RuntimePodOps(Protocol):
 
     def write_binding_annotations(self, binding: Binding, *, state: str) -> None: ...
 
+    def wait_pod_unroutable(self, binding: Binding): ...
+
     def delete_model_deployment(self, binding: Binding) -> str: ...
 
     def create_model_deployment(self, model: str, slot: Slot) -> str: ...
@@ -307,6 +309,7 @@ class ServiceManagerV2:
         actions: list[dict] = []
         self._runtime_ops.write_binding_annotations(binding, state=POD_STATE_HIDDEN)
         actions.append({"action": "hide", "serve_id": binding.serve_id})
+        self._runtime_ops.wait_pod_unroutable(binding)
 
         self._apply_runtime_power_action(binding, action="sleep")
         actions.append({"action": "sleep", "serve_id": binding.serve_id})

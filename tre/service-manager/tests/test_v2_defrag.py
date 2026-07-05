@@ -58,6 +58,9 @@ class FakeRuntimeOps:
     def write_binding_annotations(self, binding, *, state):
         self.calls.append(("annotate", binding.serve_id, state))
 
+    def wait_pod_unroutable(self, binding):
+        self.calls.append(("wait_unroutable", binding.serve_id))
+
     def delete_model_deployment(self, binding):
         self.calls.append(("delete_deployment", binding.serve_id, binding.slot.gpu_ids))
         self.snapshots.pop(binding.serve_id, None)
@@ -208,6 +211,7 @@ def test_v2_defrag_uses_runtime_delete_create_path_and_is_idempotent():
     assert second["actions"] == []
     assert runtime_ops.calls == [
         ("annotate", "serve-b", "hidden"),
+        ("wait_unroutable", "serve-b"),
         ("annotate", "serve-b", "sleeping"),
         ("delete_deployment", "serve-b", (2,)),
         ("wait_deleted", "serve-b"),

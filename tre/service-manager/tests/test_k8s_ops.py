@@ -10,9 +10,13 @@ class FakeK8sApi:
         self.patches = []
         self.deleted_deployments = []
         self.created_deployments = []
+        self.list_calls = []
 
     def list_namespaced_pod(self, *, namespace, label_selector=None):
         self.last_list = (namespace, label_selector)
+        self.list_calls.append((namespace, label_selector))
+        if isinstance(self.pods, list) and self.pods and isinstance(self.pods[0], list):
+            return self.pods.pop(0)
         return self.pods
 
     def patch_namespaced_pod(self, *, name, namespace, body):
@@ -218,6 +222,32 @@ def test_k8s_ops_marks_awake_pods_routable():
     )
 
     assert api.patches[0][2]["metadata"]["labels"] == {"tre.aibrix.io/routable": "true"}
+
+
+def test_k8s_ops_waits_until_pod_is_not_routable():
+    api = FakeK8sApi(
+        [
+            [pod_dict("serve-a", "dsqwen-7b", "node-a", "0", labels={"tre.aibrix.io/routable": "true"})],
+            [],
+        ]
+    )
+    ops = K8sOps(api=api, namespace="default")
+
+    ops.wait_pod_unroutable(
+        Binding(
+            serve_id="serve-a",
+            model="dsqwen-7b",
+            slot=Slot("node-a", (0,)),
+            awake=True,
+        ),
+        timeout_s=0.1,
+        interval_s=0.001,
+    )
+
+    assert api.list_calls == [
+        ("default", "model.aibrix.ai/name=dsqwen-7b,tre.aibrix.io/routable=true"),
+        ("default", "model.aibrix.ai/name=dsqwen-7b,tre.aibrix.io/routable=true"),
+    ]
 
 
 def test_k8s_ops_deletes_and_creates_model_deployments_from_manifest_template():

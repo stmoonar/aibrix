@@ -93,6 +93,17 @@ class K8sOps:
         }
         self._api.patch_namespaced_pod(name=binding.serve_id, namespace=self._namespace, body=body)
 
+    def wait_pod_unroutable(self, binding: Binding, *, timeout_s: float = 30.0, interval_s: float = 0.5) -> None:
+        deadline = time.monotonic() + timeout_s
+        selector = f"{MODEL_LABEL}={binding.model},{ROUTABLE_LABEL}=true"
+        while time.monotonic() < deadline:
+            pods = _items(self._api.list_namespaced_pod(namespace=self._namespace, label_selector=selector))
+            routable_names = {str(_metadata(pod).get("name")) for pod in pods}
+            if binding.serve_id not in routable_names:
+                return
+            time.sleep(interval_s)
+        raise TimeoutError(f"pod {binding.serve_id} remained routable before timeout")
+
     def delete_model_deployment(self, binding: Binding) -> str:
         name = deployment_name(binding.model, binding.slot.node, binding.slot.gpu_ids)
         self._apps_api.delete_namespaced_deployment(name=name, namespace=self._namespace)
