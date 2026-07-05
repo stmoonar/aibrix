@@ -6,11 +6,11 @@ Status: **READY FOR FINAL GATE - do not tag `n4-done` until final verification p
 
 ## Summary
 
-N4 started after `n3-done` (`d694bc4e`). The live `tre-v2` control-plane is healthy. N4.1, as written, cannot be executed literally because the generated Deployment set requests more GPUs than the pinned nodes can provide; this is recorded as a justified SKIP for the all-at-once variant. N4.2 hot-switch validation passed. N4.3 control-loop live tests passed after controller fixes for awake/bound planning, routable serving floors, and Redis outage tolerance. N4.4 live defrag/same-slot validation is a justified SKIP because the implemented `/v2/defrag` does not recreate Kubernetes deployments. N4.5 fault injection passed after hardening. N4.6 used a bounded 15-minute soak substitute rather than the planned 12-hour overnight.
+N4 started after `n3-done` (`d694bc4e`). The live `tre-v2` control-plane is healthy. N4.1 originally had an all-at-once SKIP under the old `nvidia.com/gpu` request model; N4b/D7 removed GPU requests and the full 12-Deployment topology now passes live validation. N4.2 hot-switch validation passed. N4.3 control-loop live tests passed after controller fixes for awake/bound planning, routable serving floors, and Redis outage tolerance. N4.4 live defrag/same-slot validation is a justified SKIP because the implemented `/v2/defrag` does not recreate Kubernetes deployments. N4.5 fault injection passed after hardening. N4.6 used a bounded 15-minute soak substitute rather than the planned 12-hour overnight.
 
 ## N4.1 Full Topology Deployment
 
-Status: **SKIP for all-at-once deployment; PASS for `dsqwen-7b` node9 subset**
+Status: **PASS for N4b/D7 full topology**
 
 Evidence:
 
@@ -32,6 +32,22 @@ Decision:
 - `PUT /v2/models/dsqwen-7b/target {"wake_replicas":1}` slept two newly observed awake pods and produced state version 71 with `awake=1`, `bound=4`.
 - Node9 memory after target 1: one awake GPU at ~37470 MiB and three sleeping GPUs at ~1118 MiB.
 - This subset is now the active N4 single-model topology.
+
+N4b/D7 full-topology result:
+
+- D7 manifests remove `nvidia.com/gpu` requests/limits and bind GPUs by `NVIDIA_VISIBLE_DEVICES=<GPU UUID>` plus pinned `nodeName`.
+- Sequential rollout converged all 12 model Deployments to D7 spec, sleeping each newly started pod before creating the next overlapping pod.
+- Evidence files on local disk: `/tmp/n4b_full_topology_1783230135.json` and `/tmp/n4b_full_topology_verify_1783231975.json`.
+- Final service-manager state: `dsqwen-7b awake=1 bound=4`, `dsllama-8b awake=1 bound=4`, `dsqwen-14b awake=1 bound=4`.
+- `POST /v2/reconcile` returned no warnings.
+- All 12 model pods expose `NVIDIA_VISIBLE_DEVICES` with the expected UUID(s).
+- Live endpoints matched the awake set:
+  - `dsqwen-7b -> 10.244.3.53:8000`
+  - `dsllama-8b -> 10.244.3.57:8000`
+  - `dsqwen-14b -> 10.244.0.163:8000`
+- Gateway validation passed with 20/20 requests for each model and 0 errors. Max latency was `35.51ms` for `dsqwen-7b`, `38.91ms` for `dsllama-8b`, and `36.63ms` for `dsqwen-14b`.
+- Node9 memory matched the awake set: GPU0 `39908 MiB`, GPU1 `39916 MiB`, GPU2 `4070 MiB`, GPU3 `4070 MiB`.
+- Node10 memory matched the awake set: GPU0 `37157 MiB`, GPU1 `37157 MiB`, GPU2 `1825 MiB`, GPU3 `1825 MiB`.
 
 ## N4.2 Hot-Switch Round Trip
 

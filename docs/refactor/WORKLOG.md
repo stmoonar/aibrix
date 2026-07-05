@@ -882,3 +882,32 @@
 ### N4b Next
 
 - Continue with 10.4 full topology rollout only after committing this WORKLOG update and re-running `cd tre && make check`.
+
+### N4b.4 Full Topology D7 Rollout
+
+- While preparing 10.4, found a D7-era target-selection bug: when the first sleeping binding for a model was on a GPU already occupied by another awake model, `PUT /v2/models/{model}/target` returned 409 instead of trying the next feasible sleeping binding.
+- Added RED coverage in `service-manager/tests/test_api_v2.py` and changed service-manager target growth to skip infeasible sleeping bindings while preserving the existing 409 behavior when no feasible existing binding can satisfy the target. Verification passed: focused service-manager subset 27 tests and `cd tre && make check` with 233 tests.
+- Built and rolled service-manager image `tre-v2-service-manager:20260705-7278875d`; container pytest for API/slots/reconcile passed with 27 tests. Live `tre-v2-service-manager` rolled successfully to pod `tre-v2-service-manager-dccbd689d-hdw9b`.
+- Full-topology rollout had to be sequential, not a single `kubectl apply -k`, because vLLM pods start awake before they can be slept. The operational script waits for vLLM `/is_sleeping` readiness after Kubernetes rollout, then reconciles and sleeps the model before moving to the next overlapping Deployment.
+- Recreated or created all non-D7/missing model Deployments so every live model pod now has `NVIDIA_VISIBLE_DEVICES=<GPU UUID>`:
+  - `dsqwen-7b`: four node9 one-GPU pods.
+  - `dsllama-8b`: four node9 one-GPU pods.
+  - `dsqwen-14b`: two node10 TP=2 pods and two node9 TP=2 pods.
+- Main rollout script completed the topology and target setup but failed only at its final node9 `nvidia-smi` collection because the remote shell on 76 cannot resolve the local SSH alias `A100_75`. This did not affect cluster state; final verification was rerun separately.
+- Final verification:
+  - Evidence: `/tmp/n4b_full_topology_verify_1783231975.json`.
+  - State: `dsqwen-7b awake=1 bound=4`, `dsllama-8b awake=1 bound=4`, `dsqwen-14b awake=1 bound=4`.
+  - `POST /v2/reconcile` returned no warnings.
+  - Endpoints: `dsqwen-7b -> 10.244.3.53:8000`, `dsllama-8b -> 10.244.3.57:8000`, `dsqwen-14b -> 10.244.0.163:8000`.
+  - Gateway: each model served 20/20 requests through AIBrix gateway with 0 errors; max latency `35.51ms` / `38.91ms` / `36.63ms`.
+  - Node9 memory: GPU0 `39908 MiB`, GPU1 `39916 MiB`, GPU2 `4070 MiB`, GPU3 `4070 MiB`.
+  - Node10 memory: GPU0 `37157 MiB`, GPU1 `37157 MiB`, GPU2 `1825 MiB`, GPU3 `1825 MiB`.
+- Updated `docs/refactor/12_realenv_tests.md` N4.1 from the old GPU-request-era SKIP to N4b/D7 full-topology PASS.
+
+### N4b Blocked
+
+- None for N4b.4.
+
+### N4b Next
+
+- Continue with 10.5 live defrag and same-slot shrink validation.
