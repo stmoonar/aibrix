@@ -860,3 +860,25 @@
 - Fallbacks were not needed: `runtimeClassName: nvidia`, privileged mode, and `/dev/nvidia*` hostPath were not used.
 - Cleaned up the temporary pod with `kubectl -n default delete pod tre-n4b-d7-canary`.
 - This satisfies the 10.3 canary gate; full D7 rollout may proceed.
+
+### N4b.3 Shared-GPU Dual-Model Switch
+
+- Paused the v2 controller during the manual 10.3 test with `kubectl -n tre-v2 scale deploy/tre-v2-controller --replicas=0`; service-manager remained live on image `tre-v2-service-manager:20260705-fa313832`.
+- Applied the D7 `dsllama-8b` single-GPU Deployment on node9 GPU0 alongside D7 `dsqwen-7b` on the same GPU UUID. Both pods used `NVIDIA_VISIBLE_DEVICES=GPU-689a3e93-68db-0dac-160b-6a791cf246e8` with no `nvidia.com/gpu` requests or limits.
+- Found and fixed one live reconciliation bug before accepting 10.3: `pod_records_from_snapshots()` rejected a double-awake observation before reconcile could repair it. Added regression coverage and rolled `tre-v2-service-manager:20260705-fa313832`; `cd tre && make check` passed with 232 tests.
+- Initial dual-switch scripts produced gateway 502s. Root cause was the temporary validation traffic, not D7 binding: body-only requests lacked the HTTP `model` header required by the existing `HTTPRoute` match and fell through to `reserved-router` / `aibrix-gateway-plugins:50052`, producing Envoy `protocol_error`. A controlled probe showed body-only requests 502 and identical requests with `model: dsqwen-7b` header 200.
+- Re-ran the official 20-round shared-GPU switch with both JSON body `model` and HTTP `model` header:
+  - Script/output: `/tmp/n4b_dual_switch_header_1783229055.json` on local disk.
+  - 20 rounds alternated `sleep dsqwen-7b -> wake dsllama-8b -> gateway 20 requests -> sleep dsllama-8b -> wake dsqwen-7b -> gateway 20 requests`.
+  - Gateway result: `errors=0`, `readiness_errors=0`.
+  - Wake P95 including SM target call: `dsllama-8b 1.3426s`, `dsqwen-7b 1.2343s`.
+  - Per-round gateway request p95 stayed below `49ms`; no double-awake condition was detected.
+- Final state after the script intentionally left `dsqwen-7b` awake and `dsllama-8b` sleeping on node9 GPU0. Endpoints matched routability: `dsqwen-7b -> 10.244.3.53:8000`, `dsllama-8b -> <none>`.
+
+### N4b Blocked
+
+- None for N4b.3.
+
+### N4b Next
+
+- Continue with 10.4 full topology rollout only after committing this WORKLOG update and re-running `cd tre && make check`.
