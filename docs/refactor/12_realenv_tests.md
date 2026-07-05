@@ -6,7 +6,7 @@ Status: **READY FOR FINAL GATE - do not tag `n4-done` until final verification p
 
 ## Summary
 
-N4 started after `n3-done` (`d694bc4e`). The live `tre-v2` control-plane is healthy. N4.1 originally had an all-at-once SKIP under the old `nvidia.com/gpu` request model; N4b/D7 removed GPU requests and the full 12-Deployment topology now passes live validation. N4.2 hot-switch validation passed. N4.3 control-loop live tests passed after controller fixes for awake/bound planning, routable serving floors, and Redis outage tolerance. N4.4 now has the real Kubernetes delete/create defrag path implemented and covered offline, but the exact live fragmented construction is blocked by vLLM warm-up memory headroom in the D7 co-resident topology. N4.5 fault injection passed after hardening. N4.6 used a bounded 15-minute soak substitute rather than the planned 12-hour overnight.
+N4 started after `n3-done` (`d694bc4e`). The live `tre-v2` control-plane is healthy. N4.1 originally had an all-at-once SKIP under the old `nvidia.com/gpu` request model; N4b/D7 removed GPU requests and the full 12-Deployment topology now passes live validation. N4.2 hot-switch validation passed. N4.3 control-loop live tests passed after controller fixes for awake/bound planning, routable serving floors, and Redis outage tolerance. N4.4 now has the real Kubernetes delete/create defrag path implemented and covered offline, but the exact live fragmented construction is blocked by vLLM warm-up memory headroom in the D7 co-resident topology. N4.5 fault injection passed after hardening. N4.6 serving traffic is healthy after restoring the missing `dsqwen-7b` model HTTPRoute, but the expansion/shrink part is blocked pending signal and memory-policy decisions.
 
 ## N4.1 Full Topology Deployment
 
@@ -291,7 +291,7 @@ Fixes required:
 
 ## N4.6 Soak
 
-Status: **PASS for bounded 15-minute substitute; SKIP for full 12-hour overnight**
+Status: **BLOCKED for N4b full acceptance; PASS for repaired three-model serving precheck**
 
 Bounded substitute:
 
@@ -318,5 +318,33 @@ Conclusion:
 
 - No request errors, restarts, RSS growth trend, or Redis key growth were observed in the bounded run.
 - The full 12-hour overnight soak remains skipped for time, with this bounded substitute recorded as the N4 functional gate evidence.
+
+N4b update:
+
+- First N4b three-model alternating precheck failed for `dsqwen-7b` only because `aibrix-system/dsqwen-7b-router` was missing; direct `default/dsqwen-7b` Service and Pod probes were healthy.
+- Restored `dsqwen-7b-router` with the same `model` header matches and `default/dsqwen-7b:8000` backend pattern already used by `dsllama-8b-router` and `dsqwen-14b-router`.
+- Post-route-repair precheck passed serving health:
+  - Evidence: `/tmp/n4b_three_model_precheck_1783235642.json`.
+  - Duration `901.0s`, gateway errors `{}`.
+  - `dsqwen-7b ok=978`, p95 `1245.60 ms`.
+  - `dsllama-8b ok=906`, p95 `1347.73 ms`.
+  - `dsqwen-14b ok=1947`, p95 `621.17 ms`.
+  - Controller RSS `37032 -> 37144 KB`; service-manager RSS `111228 -> 111244 KB`; Redis `DBSIZE=3 -> 3`; TRE pod restart deltas `0`.
+- This precheck did not satisfy the 10.6 expansion/shrink requirement: all three models stayed at one awake replica while the controller ran with the default `TRE_SIGNAL_SOURCE=zm`.
+- Controller logs showed repeated `paper_state_incomplete_drop_legacy_raw_trs`. Local inspection of AIBrix v1 metric windows showed token histograms can be absent in the completed window even when pod/running queue data exists, leaving paper `Z_m` unavailable.
+- A temporary `TRE_SIGNAL_SOURCE=queue_len` canary proved the controller can issue live scale actions from available queue metrics:
+  - Evidence: `/tmp/n4b_queue_signal_canary_1783236733.json`.
+  - Controller emitted `critical_sleeping_capacity` actions for all three models.
+  - `dsqwen-7b` reached `awake=2`; `dsqwen-14b` reached `awake=2`.
+  - The run still failed N4b acceptance because `dsqwen-7b` had 202 gateway errors during expansion.
+- The qwen expansion failure was the same memory-headroom class as N4.4/10.5: recreated `dsqwen-7b` GPU2 pod entered CrashLoopBackOff because vLLM startup required `35.44 GiB` at `gpu_memory_utilization=0.9`, but only `14.75/39.38 GiB` was free with co-resident sleeping state.
+- The failed qwen GPU2 Deployment was deleted, service-manager was reconciled, and the controller was restored to default signal configuration.
+
+N4b follow-up:
+
+- Do not start the 12-hour soak as an acceptance run until the architecture decision is made:
+  - either fix/bridge live metric completeness for paper `zm`,
+  - or approve `queue_len` as an N4b soak fallback,
+  - and separately reduce vLLM startup memory pressure or sleeping co-residency before controller-driven expansion.
 
 No `n4-done` tag has been created.

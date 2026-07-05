@@ -938,3 +938,53 @@
 ### N4b Next
 
 - Continue with the unaffected part of 10.6: three-model alternating/gateway stability and 12-hour local-disk soak, using the restored minimal three-model state unless the controller test needs a narrower topology.
+
+### N4b.6 Three-Model Alternating And Soak Handoff
+
+- Re-enabled the v2 controller from the manual-test pause. Deployment image remained `tre-v2-controller:20260704-303047a0`.
+- First 15-minute three-model alternating precheck failed only for `dsqwen-7b` gateway traffic:
+  - Evidence: `/tmp/n4b_three_model_precheck_1783234432.json`.
+  - `dsllama-8b`: `ok=920`, `errors=0`.
+  - `dsqwen-14b`: `ok=1956`, `errors=0`.
+  - `dsqwen-7b`: `errors=4653`, all gateway 502/503 class.
+  - Direct Service and Pod probes for `dsqwen-7b` were healthy; gateway returned `httproutes.gateway.networking.k8s.io "dsqwen-7b-router" not found`.
+- Restored the missing model HTTPRoute `aibrix-system/dsqwen-7b-router` using the same header-match/backend pattern already present for `dsllama-8b-router` and `dsqwen-14b-router`. This is model-route repair, not a change to the AIBrix gateway base deployment.
+- Reran the 15-minute alternating precheck after route repair:
+  - Evidence: `/tmp/n4b_three_model_precheck_1783235642.json`.
+  - Result: `errors={}`.
+  - `dsqwen-7b ok=978`, p95 `1245.60 ms`.
+  - `dsllama-8b ok=906`, p95 `1347.73 ms`.
+  - `dsqwen-14b ok=1947`, p95 `621.17 ms`.
+  - Controller RSS `37032 -> 37144 KB`; service-manager RSS `111228 -> 111244 KB`; Redis `DBSIZE=3 -> 3`; TRE pod restart deltas all `0`.
+  - However, all models stayed at `awake=1`; this does not satisfy the "三模型均正确扩缩" half of 10.6.
+- Root cause for missing expansion under the default controller signal was live metrics incompleteness:
+  - Controller logs repeatedly emitted `paper_state_incomplete_drop_legacy_raw_trs`.
+  - A local metrics inspection showed AIBrix v1 windows can include pod/running queue data without matching token histograms in the same completed window, leaving paper `Z_m` unavailable for non-idle models.
+  - With `TRE_SIGNAL_SOURCE=zm` (the default/paper path), planner drops actions when any non-idle model has incomplete paper state.
+- Queue-length signal canary:
+  - Temporarily rolled controller with `TRE_SIGNAL_SOURCE=queue_len` to test whether the control loop can still issue actions from available live metrics.
+  - Evidence: `/tmp/n4b_queue_signal_canary_1783236733.json`.
+  - Controller produced `critical_sleeping_capacity` scale actions for `dsqwen-7b`, `dsllama-8b`, and `dsqwen-14b`.
+  - Serving result over 300s: `dsqwen-7b ok=601/errors=202`, `dsllama-8b ok=590/errors=0`, `dsqwen-14b ok=1297/errors=0`.
+  - `dsqwen-7b` reached `awake=2`, `dsqwen-14b` reached `awake=2`; `dsllama-8b` action was emitted but the observed awake count stayed at 1 during the sample.
+- The queue-signal canary exposed the same model-memory blocker as 10.5:
+  - Controller target growth recreated `dsqwen-7b-nscc-ds-4a100-node9-gpu-2`.
+  - The pod entered CrashLoopBackOff because vLLM startup required `35.44 GiB` at `gpu_memory_utilization=0.9`, but only `14.75/39.38 GiB` was free on the target GPU due to co-resident sleeping state.
+  - Deleted the failed qwen GPU2 Deployment, reconciled service-manager state, restored controller to default signal env, and reset `dsqwen-7b`/`dsllama-8b` to one awake. The controller subsequently woke `dsqwen-14b` back to two awake replicas.
+
+### N4b Blocked
+
+- 10.6 cannot honestly be marked live PASS yet. Serving-only alternating traffic is healthy after restoring `dsqwen-7b-router`, but the required expansion/shrink behavior is blocked by two architectural/runtime questions:
+  - The paper `zm` signal path drops actions when AIBrix v1 metric windows do not contain complete token histograms for every active model.
+  - The fallback `queue_len` signal can drive expansion, but D7 co-resident sleeping pods leave insufficient vLLM startup headroom for some recreated 7B slots.
+
+### N4b Architecture Decision Needed
+
+- Choose one of these before rerunning 10.6 and 12h soak:
+  - Keep paper `zm` as mandatory and fix/bridge the live metrics feed so completed windows always provide usable token histograms per active model.
+  - Allow a documented live fallback to `queue_len` for N4b soak, while keeping paper `zm` as the intended production signal.
+  - Reduce serving memory pressure/co-residency before controller-driven expansion, for example by lowering vLLM `gpu_memory_utilization`/`max_model_len`/`max_num_seqs` or reducing the number of sleeping pods per GPU.
+
+### N4b Next
+
+- Do not start the 12h soak until the architect chooses the signal/memory policy above; otherwise the soak would only prove steady serving at the current awake set, not the 10.6 expansion/shrink contract.
