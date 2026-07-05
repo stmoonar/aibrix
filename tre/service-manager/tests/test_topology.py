@@ -77,6 +77,33 @@ def test_pod_records_from_snapshots_rejects_unknown_node_or_invalid_gpu_slot():
             ],
         )
 
+
+def test_pod_records_from_snapshots_allows_double_awake_for_reconcile_repair():
+    records = pod_records_from_snapshots(
+        topology(),
+        [
+            K8sPodSnapshot(
+                name="serve-a",
+                model="m1",
+                node="node-a",
+                env={"CUDA_VISIBLE_DEVICES": "0"},
+                annotations={GPU_IDS_ANNOTATION: "0"},
+            ),
+            K8sPodSnapshot(
+                name="serve-b",
+                model="m2",
+                node="node-a",
+                env={"CUDA_VISIBLE_DEVICES": "0"},
+                annotations={GPU_IDS_ANNOTATION: "0"},
+            ),
+        ],
+    )
+
+    assert records == [
+        PodRecord("serve-a", "m1", "node-a", "0", "awake"),
+        PodRecord("serve-b", "m2", "node-a", "0", "awake"),
+    ]
+
     with pytest.raises(ValueError, match="invalid slot"):
         pod_records_from_snapshots(
             topology(),

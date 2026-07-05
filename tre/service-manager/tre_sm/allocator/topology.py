@@ -45,5 +45,6 @@ def pod_records_from_snapshots(
             )
         )
 
-    SlotAllocator(topology, [record.to_binding() for record in records])
+    for record in records:
+        SlotAllocator(topology, [record.to_binding()])
     return records
