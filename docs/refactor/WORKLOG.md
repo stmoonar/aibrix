@@ -911,3 +911,30 @@
 ### N4b Next
 
 - Continue with 10.5 live defrag and same-slot shrink validation.
+
+### N4b.5 Live Defrag And Same-Slot Shrink
+
+- Added and verified one more live-path hardening fix before the final 10.5 attempt: recreated vLLM pods can report Kubernetes Ready before their HTTP server is ready for `/wake_up`. `VllmOps.wait_until_ready()` now polls `/is_sleeping` after `K8sOps.wait_pod_ready()` in both target-create and defrag-create paths, so wake is only sent after the vLLM API is accepting requests.
+- Verification for the readiness fix passed:
+  - Focused service-manager subset: `pytest -q service-manager/tests/test_v2_defrag.py service-manager/tests/test_api_v2.py service-manager/tests/test_vllm_ops.py service-manager/tests/test_k8s_ops.py` passed with 31 tests.
+  - P9/runtime subset: `pytest -q controller/tests/test_p9_offline_integration.py service-manager/tests/test_api_v2.py service-manager/tests/test_v2_defrag.py service-manager/tests/test_k8s_ops.py` passed.
+  - Full gate before rollout: `cd tre && make check` passed with 233 tests.
+- Built and rolled service-manager image `tre-v2-service-manager:20260705-ff9d1580`; rollout completed as `tre-v2-service-manager-6468f98ff5-4gjkl`.
+- Live defrag construction then hit a model-memory budget blocker rather than another service-manager logic bug:
+  - The N4b/D7 full topology leaves multiple sleeping vLLM processes co-resident on node9 GPUs.
+  - Constructing the fragmented 10.5 case required recreating/warming a `dsqwen-7b` pod on a GPU that also held sleeping TP=2 `dsqwen-14b` state.
+  - vLLM failed during warm-up with CUDA OOM (`Tried to allocate 150.00 MiB`; only about `74 MiB` free on the target GPU).
+  - This prevents a safe live PASS for the exact "fragment -> `/v2/defrag` -> 14b wakes in complete slot" scenario under the current launch parameters.
+- Restored the live service to a clean minimal three-model state after the failed construction:
+  - `dsqwen-7b awake=1 bound=2`, endpoint `10.244.3.53:8000`.
+  - `dsllama-8b awake=1 bound=4`, endpoint `10.244.3.57:8000`.
+  - `dsqwen-14b awake=1 bound=4`, endpoint `10.244.0.163:8000`.
+  - `POST /v2/reconcile` repaired stale state; `python3 /tmp/probe_sleeping.py` showed routability aligned with the three awake endpoints and no stale qwen GPU1 pod.
+
+### N4b Blocked
+
+- 10.5 live defrag is blocked by GPU memory headroom in the D7 full topology. Completing it safely requires reducing sleeping co-residency or changing vLLM launch parameters such as `gpu_memory_utilization`, `max_model_len`, or `max_num_seqs`; those are outside the N4b defrag-path change and would need a separate model-serving decision.
+
+### N4b Next
+
+- Continue with the unaffected part of 10.6: three-model alternating/gateway stability and 12-hour local-disk soak, using the restored minimal three-model state unless the controller test needs a narrower topology.

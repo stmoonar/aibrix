@@ -6,7 +6,7 @@ Status: **READY FOR FINAL GATE - do not tag `n4-done` until final verification p
 
 ## Summary
 
-N4 started after `n3-done` (`d694bc4e`). The live `tre-v2` control-plane is healthy. N4.1 originally had an all-at-once SKIP under the old `nvidia.com/gpu` request model; N4b/D7 removed GPU requests and the full 12-Deployment topology now passes live validation. N4.2 hot-switch validation passed. N4.3 control-loop live tests passed after controller fixes for awake/bound planning, routable serving floors, and Redis outage tolerance. N4.4 live defrag/same-slot validation is a justified SKIP because the implemented `/v2/defrag` does not recreate Kubernetes deployments. N4.5 fault injection passed after hardening. N4.6 used a bounded 15-minute soak substitute rather than the planned 12-hour overnight.
+N4 started after `n3-done` (`d694bc4e`). The live `tre-v2` control-plane is healthy. N4.1 originally had an all-at-once SKIP under the old `nvidia.com/gpu` request model; N4b/D7 removed GPU requests and the full 12-Deployment topology now passes live validation. N4.2 hot-switch validation passed. N4.3 control-loop live tests passed after controller fixes for awake/bound planning, routable serving floors, and Redis outage tolerance. N4.4 now has the real Kubernetes delete/create defrag path implemented and covered offline, but the exact live fragmented construction is blocked by vLLM warm-up memory headroom in the D7 co-resident topology. N4.5 fault injection passed after hardening. N4.6 used a bounded 15-minute soak substitute rather than the planned 12-hour overnight.
 
 ## N4.1 Full Topology Deployment
 
@@ -228,22 +228,28 @@ Controller evidence:
 
 ## N4.4 Defrag And Same-Slot Shrink
 
-Status: **SKIP for live execution; PASS for offline planner/API coverage**
+Status: **BLOCKED for exact live execution; PASS for offline planner/API/k8s-path coverage**
 
 Reason:
 
-- The current live implementation of `POST /v2/defrag` computes migrations and updates service-manager state, but it does not recreate Kubernetes Deployments or move pods between GPU slots.
-- Generated one-GPU model manifests only cover node9; the active TP=2 `dsqwen-14b` subset is on node10. Constructing the exact fragmented topology would require untracked manual manifest surgery or deleting/recreating live model slots outside the implemented defrag path.
-- Because Kubernetes still reserves `nvidia.com/gpu` for sleeping pods, the all-at-once "all bound, mostly sleeping" topology cannot be used as a safe substitute.
+- N4b implemented the real `POST /v2/defrag` Kubernetes path: `hide -> sleep -> delete Deployment -> wait old pod gone -> create Deployment on the new slot -> wait Pod Ready -> wait vLLM HTTP readiness -> wake -> unhide`.
+- The live service-manager image containing the final readiness hardening is `tre-v2-service-manager:20260705-ff9d1580`.
+- The exact live fragmented construction is now blocked by model memory headroom in the D7 co-resident topology. Recreating/warming a `dsqwen-7b` pod on a GPU that also holds sleeping TP=2 `dsqwen-14b` state failed during vLLM warm-up with CUDA OOM (`Tried to allocate 150.00 MiB`; only about `74 MiB` free on the target GPU).
+- Continuing this scenario safely would require changing model-serving launch parameters or reducing sleeping co-residency, not another defrag API change.
 
 Evidence retained:
 
-- Offline tests cover `SlotAllocator.plan_defrag`, service-manager `/v2/defrag`, controller `DefragAction`, same-slot high shrink planning, and the P9 offline defrag integration path.
-- Full gate after N4 fixes passed with `220 passed` and `tre smoke ok`.
+- Offline tests cover `SlotAllocator.plan_defrag`, service-manager `/v2/defrag`, controller `DefragAction`, same-slot high shrink planning, fake Kubernetes Deployment delete/create, recreated-Pod serve-id handling, and the P9 offline defrag integration path.
+- N4b focused verification passed with `service-manager/tests/test_v2_defrag.py`, `service-manager/tests/test_api_v2.py`, `service-manager/tests/test_vllm_ops.py`, and `service-manager/tests/test_k8s_ops.py`.
+- Full N4b gate before the live rollout passed with `233 passed`.
+- After the blocked live construction, the cluster was restored to a clean minimal three-model state:
+  - `dsqwen-7b awake=1 bound=2`, endpoint `10.244.3.53:8000`.
+  - `dsllama-8b awake=1 bound=4`, endpoint `10.244.3.57:8000`.
+  - `dsqwen-14b awake=1 bound=4`, endpoint `10.244.0.163:8000`.
 
 Follow-up:
 
-- A true live N4.4 PASS requires implementing Kubernetes delete/recreate operations in service-manager defrag or adding a tracked placement override that can generate node10 one-GPU manifests safely.
+- A true live N4.4 PASS now requires a serving-capacity decision: lower vLLM memory pressure (`gpu_memory_utilization`, `max_model_len`, `max_num_seqs`, or equivalent) or reduce sleeping co-residency before reconstructing the fragmented topology.
 
 ## N4.5 Fault Injection
 
