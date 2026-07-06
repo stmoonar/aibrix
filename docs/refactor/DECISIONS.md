@@ -348,3 +348,27 @@ The D7 canary in N4b.3 is mandatory before broad rollout: first prove that a no-
   start until W is FROZEN on the clean cluster (and S4 raw-logging is done). The controller image
   and overlay already carry W=30000 + sliding + 5s; the clean deploy needs no extra S1 code.
 - Reversible: if F4 slips, the W-freeze can still be run on the current cluster with the same image.
+
+### ADR-0012 correction (2026-07-06, same day): "F4.3 clean cluster" reframed per ADR-0008
+
+The original ADR-0012 text above referenced deferring the authoritative W-freeze to an
+"F4.3 clean-cluster redeploy". That wording predates my reading of **ADR-0007/0008** and is
+misleading: **there is NO base teardown/reinstall** — ADR-0008 CANCELLED D11's F4.2/F4.3
+(aibrix-system is a shared multi-tenant base). The authoritative "clean cluster" is the
+**minimal isolated TRE data plane in the `tre-v2` namespace** (own `tre-aibrix-eg` gateway +
+`tre-gateway-plugins` + `tre-v2-redis`), already stood up via ADR-0008 Phases A/B and made
+declarative by F4.0. This is the SAME plane the S1 controller image (446ce73a) was just
+validated on.
+
+Corrected decision (unchanged in substance): the authoritative lag-P95 measurement + FINAL
+W-freeze run on the **isolated tre-v2 data plane** (not a torn-down base), as part of the
+R3-prep load runs (R3 grids run on that plane anyway). There is no teardown blocking it; the
+remaining reason to fold it in with R3-prep rather than do a standalone load experiment now is
+efficiency (R3 drives the same models under load) + doing it after F4.4's authoritative N4b
+stabilization. Provisional W=30000 stands (trim to 25000 if P95>35s). S1.4/R3 hard-gate INTACT:
+R3 must not start until W is frozen on the isolated plane.
+
+Sequencing per ADR-0008/0009: (isolated plane Phases A/B done) -> F4.4 authoritative N4b
+(N4.2/N4.4/N4.6 + 12h soak on the isolated path) -> n4b-done -> R3 (with S1.2 W-freeze + S2/S3,
+S4 raw-logging first) -> R7/R2/R4/R5. Phase C (delete the 3 old aibrix-system model routes) after
+>=24h stable, touching nothing else in the shared base.
