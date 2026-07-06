@@ -41,10 +41,18 @@ class DispatchResult:
 
 
 class ActionQueue:
-    def __init__(self, client: ServiceManagerClient) -> None:
+    def __init__(
+        self,
+        client: ServiceManagerClient,
+        *,
+        is_observe: Callable[[], bool] | None = None,
+    ) -> None:
         self._client = client
         self._pending: deque[QueuedAction] = deque()
         self._inflight: set[str] = set()
+        # When this returns True the controller is paused: queued actions are drained
+        # (inflight cleared, so the next tick can re-plan) but NEVER dispatched.
+        self._is_observe = is_observe or (lambda: False)
 
     def submit(self, actions: tuple[Action, ...] | list[Action]) -> SubmitResult:
         accepted = 0
@@ -83,11 +91,15 @@ class ActionQueue:
             await sleep(poll_interval_s)
 
     async def drain_once(self) -> tuple[DispatchResult, ...]:
+        observe = self._is_observe()
         results: list[DispatchResult] = []
         while self._pending:
             queued = self._pending.popleft()
-            result = await self._dispatch(queued.action, queued.model)
-            results.append(result)
+            if observe:
+                results.append(DispatchResult(model=queued.model, action_kind=_action_kind(queued.action),
+                                              ok=True, error="observe_skipped"))
+            else:
+                results.append(await self._dispatch(queued.action, queued.model))
             self._inflight.discard(queued.model)
         return tuple(results)
 
@@ -119,6 +131,18 @@ class ActionQueue:
             retained.append(item)
         self._pending = retained
         return tuple(removed)
+
+
+def _action_kind(action: Action) -> str:
+    if isinstance(action, ScaleAction):
+        return "scale"
+    if isinstance(action, HideAction):
+        return "hide"
+    if isinstance(action, UnhideAction):
+        return "unhide"
+    if isinstance(action, DefragAction):
+        return "defrag"
+    return "unknown"
 
 
 def _queued_action(action: Action) -> QueuedAction:

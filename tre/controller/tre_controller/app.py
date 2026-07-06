@@ -7,6 +7,7 @@ from typing import Any, Awaitable, Callable, Mapping
 from tre_common.registry import Registry, load_registry
 from tre_controller.config import ControllerConfig
 from tre_controller.loops.action_queue import ActionQueue
+from tre_controller.mode import ObserveModeGate
 from tre_controller.loops.cluster_view_task import ClusterViewBox, cluster_view_task
 from tre_controller.loops.decision_snapshot import DecisionSnapshotWriter
 from tre_controller.loops.fairness_task import fairness_task
@@ -138,10 +139,11 @@ def create_controller_dependencies(
     )
     safescale = SafeScaleStateMachine(config=cfg.safescale, store=ControllerStateStore(redis_client))
     safescale.restore()
+    observe_gate = ObserveModeGate(redis_client)
     return ControllerDependencies(
         store=store,
         snapshot_box=SnapshotBox(),
-        queue=ActionQueue(sm_client),
+        queue=ActionQueue(sm_client, is_observe=observe_gate.is_observe),
         sm_client=sm_client,
         cluster_view_box=ClusterViewBox(),
         decision_writer=DecisionSnapshotWriter(redis_client),

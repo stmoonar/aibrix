@@ -127,3 +127,29 @@ def test_action_queue_run_drains_pending_actions_before_sleeping() -> None:
     assert client.calls == [("scale", "m", 1)]
     assert _stop_queue_sleep.calls == [0.25]
     assert queue.pending_actions() == ()
+
+
+def test_action_queue_observe_mode_drains_without_dispatching() -> None:
+    client = FakeServiceManagerClient()
+    observe = {"on": True}
+    queue = ActionQueue(client, is_observe=lambda: observe["on"])
+    queue.submit(
+        (
+            ScaleAction("m", 1, "critical", "rescue"),
+            HideAction("d", ("pod-a",), "probe", "fairness"),
+        )
+    )
+
+    results = asyncio.run(queue.drain_once())
+
+    # queue was drained (inflight cleared so the next tick can re-plan) but nothing hit the SM
+    assert client.calls == []
+    assert queue.inflight_models() == set()
+    assert queue.pending_actions() == ()
+    assert [(r.action_kind, r.error) for r in results] == [("scale", "observe_skipped"), ("hide", "observe_skipped")]
+
+    # flipping back to active dispatches normally
+    observe["on"] = False
+    queue.submit((ScaleAction("m", 1, "critical", "rescue"),))
+    asyncio.run(queue.drain_once())
+    assert client.calls == [("scale", "m", 1)]
