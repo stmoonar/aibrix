@@ -12,7 +12,7 @@ Captured: 2026-07-06 (F4.0). Source commit for tre-v2 images: see per-image note
 |---|---|---|---|
 | service-manager | `tre-v2-service-manager:20260706-a1d21c00` | `` | commit `f6dce214` (route guard) |
 | controller | `tre-v2-controller:20260706-6fd540e6` | `4f315e82427d9c98d7a937a60686900404f16174f0a26e00e63e48002807552c` | commit `6fd540e6` (S1 signal freshness + F-onset warmup guard ADR-0013) |
-| ui | `tre-v2-ui:20260704-669f0381` | `e81b68295f31103c22a24b51f1645e21e4d927b58e11f7127388628110ff06bc` | commit `669f0381` |
+| ui | `tre-v2-ui:20260706-b593243e` | `7fa29a6051428f85a416b932daaafee3b8eb61ed83dbff111b4c6ace784af41a` | commit `b593243e` (S5 console) |
 | redis | `redis:7.2-alpine` | `dfa18828cbc07b3ae6a95ec7343f6c214fdee2d836197b4be8e9904420762cd8` | upstream |
 | vllm (model pods + gpu-truth DaemonSet) | `vllm/vllm-openai:0.10.1-sleep` | `6a3a5efad7779b594bf82dbda62c47efa789786a38963acb869142d9d8406492` | upstream (sleep-mode build) |
 | tre-gateway-plugins (ADR-0008 isolated metrics scraper) | `aibrix/gateway-plugins:20260704-0d869b49-nozmq2` | `050845eaeca2beaa1e1357fefe0b0339d0f274ae5fd38a31b2f5c83ccafaf634` | TRE-patched gateway-plugins build (dual redis schema) |
