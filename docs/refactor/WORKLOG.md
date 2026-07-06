@@ -1840,3 +1840,42 @@ n4b-done. Controller rebuild from post-F4.0 HEAD before authoritative runs
 (images.lock note; current d795a715 image + runtime env is functionally
 equivalent — only the histogram-lookback env-wiring differs, old image defaults
 to the same 90s).
+
+### Endgame session checkpoint (2026-07-06) — isolated plane live, F4.4/N5 remain
+
+Informal N4.2 spot-check on the isolated gateway (NOT the authoritative result):
+20 wake/sleep rounds on dsqwen-7b through tre-aibrix-eg gave 20/20 gateway probes
+and node9 GPU2/GPU3 returned to 2248 MiB (no leak from wake->minimal-traffic->sleep,
+consistent with D8). The wake-latency numbers were invalid (my poller measured the
+SM awake-flag flip, not the vLLM /wake_up weight-load, and probes were served by the
+always-awake replica). Authoritative N4.2 needs per-pod /is_sleeping instrumentation
+— deferred into F4.4 proper.
+
+CURRENT SYSTEM STATE (end of session):
+- Isolated TRE data plane LIVE on the shared cluster (no third-party impact):
+  serving via Gateway `tre-aibrix-eg` (envoy 10.103.92.7:80), metrics via
+  `tre-gateway-plugins` -> `tre-v2-redis`, SM retargeted (route ns tre-v2), all
+  state on tre-v2-redis, gpu-truth DaemonSet live. reconcile warnings=[].
+- Controller: **intentionally PAUSED (replicas=0)** after proving cutover — safe
+  idle state (avoids idle no-op-thrash + any residual leak risk overnight). All
+  models awake=1/bound; tre-v2 components 0 restarts.
+- Old shared aibrix-eg path still also serves TRE (harmless redundancy) pending
+  Phase C.
+- git: clean working tree; all F3/F4.0/F4-isolation/PhaseA/PhaseB work committed
+  (HEAD 361dbf0d area). `cd tre && make check` = 272 passed.
+
+EXACT NEXT CONTINUATION (next session):
+1. F4.4 authoritative N4b on the isolated plane (unpause controller = step 1):
+   - N4.2 hot-switch 20 rounds with CORRECT wake-P95 (poll per-pod /is_sleeping),
+   - N4.4 live defrag zero-5xx through tre-aibrix-eg (route guard + isolated gw;
+     node9 GPU2/GPU3 now have headroom so a fragmentation-defrag is feasible),
+   - N4.6 three-model scale exercise (zm) + 12h soak (76 local disk),
+   - rebuild controller image from post-F4.0 HEAD first (images.lock note),
+   - then tag n4b-done.
+2. Phase C (>=24h after Phase B): delete ONLY the 3 legacy TRE routers in
+   aibrix-system; touch nothing else.
+3. N5 (R1->R3->R7->R2->R4->R5, R6 gap): experiments on the isolated plane; log in
+   13_experiments_log.md; tag results-v1.
+4. F5: paper data packaging + doc final check; tag tre-v2-1.0.
+Reference: ADR-0008 (isolated plane design + phases), 13_experiments_log.md (N5),
+images.lock.md (controller rebuild), architect = Fable5 model (consult via subagent).

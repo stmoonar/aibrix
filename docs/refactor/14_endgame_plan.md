@@ -317,6 +317,15 @@ node9 实测（nvidia-smi compute-apps + /proc cgroup → pod 映射 + /is_sleep
 
 ## 5. 阶段 F4：清场 + 声明式全新部署（N5 前的强制关口，预计 1.5–2 天）
 
+> **SUPERSEDED 2026-07-06 by ADR-0008**: live audit found aibrix-system is a
+> SHARED multi-tenant base (lxt + qwen-coder/instruct), so the teardown+reinstall
+> below is CANCELLED. Replaced by a minimal isolated TRE data plane in the tre-v2
+> namespace (Gateway tre-aibrix-eg + tre-gateway-plugins scraper -> tre-v2-redis;
+> no ext-proc). Phase A (additive) + Phase B (cutover) DONE and live; Phase C
+> (delete 3 legacy routes, >=24h gate) + F4.4 authoritative N4b remain. See
+> DECISIONS.md ADR-0007/0008 and the WORKLOG F4 entries. The §5.x text below is
+> retained for history only.
+
 > **为什么必须做（架构师 2026-07-06 复核实况）**：
 > - 代码已对齐 **AIBrix 0.7.0**（HEAD = `v0.7.0-198-gxxxxxxx`；`upstream-v0.4.0`
 >   只是**旧系统**的对拍基线，不是本系统底座版本）。
