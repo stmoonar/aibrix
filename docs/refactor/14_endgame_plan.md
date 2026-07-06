@@ -326,6 +326,15 @@ node9 实测（nvidia-smi compute-apps + /proc cgroup → pod 映射 + /is_sleep
 > DECISIONS.md ADR-0007/0008 and the WORKLOG F4 entries. The §5.x text below is
 > retained for history only.
 
+> **REORDER 2026-07-06 (ADR-0009)**: the N4.6 pre-flight showed the inherited
+> theta_m makes idle read CRITICAL (over-provision, never shrink), and exposed an
+> SM routable/is_sleeping desync bug. New order: (1) fix SM desync (two-layer
+> reconcile, TDD) -> (2) restore canonical fleet (4 bindings/model) declaratively
+> -> (3) R3 refit (real theta + capacity surface) -> (4) N4.6 expand/shrink +
+> scale-cycle soak ON REAL THETA -> tag n4b-done. The 12h soak is split into
+> Endurance (theta-independent, not the gate) and Scale-cycle (theta-dependent,
+> certifies n4b-done, consumes R3 output). See DECISIONS.md ADR-0009.
+
 > **为什么必须做（架构师 2026-07-06 复核实况）**：
 > - 代码已对齐 **AIBrix 0.7.0**（HEAD = `v0.7.0-198-gxxxxxxx`；`upstream-v0.4.0`
 >   只是**旧系统**的对拍基线，不是本系统底座版本）。

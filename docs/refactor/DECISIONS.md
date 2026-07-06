@@ -204,3 +204,44 @@ The D7 canary in N4b.3 is mandatory before broad rollout: first prove that a no-
   rerun N4.2/N4.4/N4.6 + 12h soak on the new path after Phase B, then tag n4b-done.
   V_static runs through the identical data plane (only controller policy differs).
   R1 old-system stays prior-work/secondary; old env now survives (no teardown).
+
+## ADR-0009: SM reconcile two-layer model + reorder R3 before F4.4 scale-cycle
+
+- Status: **Accepted** (architect ruling, 2026-07-06). Prompted by N4.6 pre-flight.
+- Root cause (verified in code): `reconcile.py` reads the `tre.aibrix.io/state`
+  annotation (a write-through cache of the last value SM wrote) as "reality" and
+  never consults the physical vLLM `/is_sleeping`. Two gaps: (A) stale-truth —
+  a physically-awake-but-annotated-sleeping leaked pod is invisible; (B) no
+  enforcement — reconcile computes desired bindings + store.save but never writes
+  the `routable` label back to pods, and `_auto_sleep_awake_conflicts` flips only
+  the store record. Under scaling churn the routable label desyncs from physical
+  reality → empty Service endpoints → models 0/4.
+- Decision (SM fix, TDD before any further live scaling):
+  - Physical `/is_sleeping` (+ gpu_truth used_mib) = OBSERVED ground truth; store
+    `binding.awake` = DESIRED; annotation = write-through cache only (never read as reality).
+  - **Layer 1 (safety invariant, every reconcile, idempotent, patch-on-diff):**
+    `routable = true  iff  physical /is_sleeping == false  AND  not hidden`.
+    Reconcile probes each pod and re-asserts the routable label from physical reality.
+  - **Layer 2 (convergence):** where observed physical awake-set != desired store
+    awake-set, re-issue wake/sleep (subject to single-awake-per-GPU + capacity).
+    Non-converging pods (/wake_up 500 or sleep-leak) stay non-routable, emit the
+    leak warning, surface as D8 candidate — no infinite wake loop.
+  - 6 TDD cases: (1) awake+routable=false -> true; (2) sleeping+routable=true -> false;
+    (3) annotation vs /is_sleeping mismatch -> physical wins, both corrected;
+    (4) leaked pod stays non-routable + D8 candidate, no loop; (5) idempotence -> 0 patches;
+    (6) auto-slept binding's pod label driven false.
+- Decision (reorder): F4.4-before-R3 assumed realistic theta; the pre-flight
+  falsified it (inherited theta 738.67/738/534 -> idle Z_m~0.04 << tau_crit -> all
+  models CRITICAL at baseline -> over-provision, never shrink). New order:
+  1. Fix SM desync (Q2) via TDD [blocks all].
+  2. Restore canonical fleet (4 bindings/model) declaratively.
+  3. R3 refit -> real theta_m + capacity surface.
+  4. N4.6 expand/shrink + scale-cycle soak on real theta -> tag n4b-done.
+  - Soak split: **Endurance** (restarts/RSS/redis-growth/zero-5xx at steady state;
+    theta-independent; may run early, NOT the authoritative gate) vs **Scale-cycle**
+    (>=5 clean expand/shrink; theta-dependent; step 4; certifies n4b-done).
+  - Rejected: hand-tuning baseline into a "healthy" zm band (indefensible in paper).
+- Recreate leaked dsllama gpu-0: YES, but only AFTER the SM fix lands AND
+  nvidia-smi confirms gpu-0 memory freed, via the declarative path (deploy_models.sh),
+  never manual kubectl.
+- Plan patch: §5.5/§6 note F4.4's scale-cycle gate now consumes R3 output.
