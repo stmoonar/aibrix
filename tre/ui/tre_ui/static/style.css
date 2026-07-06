@@ -212,6 +212,22 @@ table.params td:last-child { font-family: var(--mono); text-align: right; }
 
 .empty-state { color: var(--muted); font-size: 14px; padding: 40px; text-align: center; border: 1px dashed var(--line-strong); border-radius: var(--radius); }
 
+/* ---------- params editing ---------- */
+.params-bar { margin: 0 0 18px; }
+.restart-strip { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; padding: 11px 16px; border-radius: var(--radius); background: var(--panel); border: 1px solid var(--line); font-size: 13.5px; }
+.restart-strip.pending { background: var(--low-bg); border-color: var(--low); color: var(--low); }
+.restart-strip #rollout-status { margin-left: auto; }
+.pform { margin: 12px 0 4px; }
+.prow { display: grid; grid-template-columns: 96px 1fr 62px; align-items: center; gap: 8px; padding: 3px 0; font-size: 13px; }
+.plabel { color: var(--ink-soft); }
+.pinput { font-family: var(--mono); font-size: 13px; padding: 4px 8px; border: 1px solid var(--line-strong); border-radius: 6px; background: var(--panel); color: var(--ink); width: 100%; }
+.pinput:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+.pinput.dirty { border-color: var(--high); background: var(--high-bg); }
+.phint { font-family: var(--mono); font-size: 10.5px; color: var(--muted); text-align: right; }
+.locked-note { margin: 10px 0 4px; font-size: 11.5px; display: flex; flex-wrap: wrap; gap: 5px; align-items: center; }
+.lchip { font-family: var(--mono); font-size: 10.5px; padding: 1px 7px; border-radius: 999px; background: var(--panel-2); border: 1px solid var(--line); color: var(--muted); cursor: help; }
+.perr { color: var(--crit); font-size: 12px; margin: 6px 0; min-height: 0; }
+
 @media (max-width: 720px) {
   body { grid-template-columns: 1fr; }
   .rail { position: static; height: auto; flex-direction: row; flex-wrap: wrap; }

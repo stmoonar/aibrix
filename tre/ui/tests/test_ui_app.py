@@ -45,6 +45,10 @@ class FakeRedis:
         self.kv[key] = value
         return True
 
+    def rpush(self, key, value):
+        self.kv.setdefault(key, []).append(value)
+        return len(self.kv[key])
+
 
 class FakeServiceManagerClient:
     def __init__(self) -> None:
@@ -58,6 +62,50 @@ class FakeServiceManagerClient:
         return {"ok": True, "version": 8, "warnings": []}
 
 
+_REGISTRY_YAML = """
+cluster:
+  nodes: [{name: node-a, gpus: 4, two_gpu_slots: [[0, 1], [2, 3]]}]
+models:
+  - name: m1
+    weights_path: /w/m1
+    tp_size: 1
+    min_replicas: 1
+    max_replicas: 4
+    vllm_image: img:1
+    slo: {ttft_p95_ms: 500.0, tpot_p95_ms: 75.0, e2e_p95_ms: 12000.0}
+    trs: {w_p: 0.08, w_d: 1.0, lambda_wait: 1.875, qmin: 1.0, ema_alpha: 0.25,
+          theta_m: 738.0, tau_crit: 0.75, tau_low: 1.0, tau_high: 1.63, qsat: 4.0,
+          epsat: 0.1, hsat: 4, ema_tau_ms: 20000}
+"""
+
+
+class FakeK8s:
+    def __init__(self) -> None:
+        self.cm = {"metadata": {"name": "tre-v2-registry", "resourceVersion": "100"},
+                   "data": {"registry.yaml": _REGISTRY_YAML}}
+        self.deploy = {"metadata": {"name": "tre-v2-controller", "generation": 3},
+                       "spec": {"replicas": 1, "template": {"metadata": {"annotations": {}}}},
+                       "status": {"observedGeneration": 3, "updatedReplicas": 1, "readyReplicas": 1, "conditions": []}}
+        self.patches: list = []
+
+    def get_configmap(self, name):
+        return self.cm
+
+    def replace_configmap(self, name, data, resource_version):
+        assert resource_version == self.cm["metadata"]["resourceVersion"]
+        self.cm = {"metadata": {"name": name, "resourceVersion": str(int(resource_version) + 1)}, "data": data}
+        return self.cm
+
+    def get_deployment(self, name):
+        return self.deploy
+
+    def patch_deployment(self, name, patch):
+        self.patches.append(patch)
+        anns = patch["spec"]["template"]["metadata"]["annotations"]
+        self.deploy["spec"]["template"]["metadata"]["annotations"].update(anns)
+        return self.deploy
+
+
 def _registry() -> Registry:
     topology = ClusterTopology(nodes=(NodeSpec("node-a", 4, ((0, 1), (2, 3))),))
     trs = TrsParams(0.04, 1.0, 2.625, 1.0, 0.5, 0.0, 0.8, 1.0, 1.25, 4.0, 0.05, 3)
@@ -65,9 +113,9 @@ def _registry() -> Registry:
     return Registry(topology, [ModelSpec("m1", "/weights/m1", 1, 0, 2, "image", slo, trs)])
 
 
-def _client() -> tuple[TestClient, FakeServiceManagerClient]:
+def _client(k8s: FakeK8s | None = None) -> tuple[TestClient, FakeServiceManagerClient]:
     sm = FakeServiceManagerClient()
-    app = create_ui_app(_registry(), FakeRedis(), sm)
+    app = create_ui_app(_registry(), FakeRedis(), sm, k8s)
     # Populate the sampler cache deterministically without spawning the background thread
     # (TestClient is used without the lifespan context, so startup does not fire).
     app.state.sampler.sample_once()
@@ -140,3 +188,46 @@ def test_ui_serves_local_single_page_app_without_runtime_cdn() -> None:
     assert "TRE Console" in response.text
     assert "https://" not in response.text
     assert "cdn" not in response.text.lower()
+
+
+# ---- param editing (P0-4B) ----
+
+def test_params_unavailable_without_k8s() -> None:
+    client, _ = _client()  # no k8s client
+    assert client.get("/api/params").status_code == 503
+
+
+def test_get_params_view_and_pending_restart() -> None:
+    client, _ = _client(FakeK8s())
+    body = client.get("/api/params").json()
+    assert body["models"]["m1"]["editable"]["trs.theta_m"]["value"] == 738.0
+    assert body["resource_version"] == "100"
+    assert body["pending_restart"] is False  # no applied hash annotation yet
+
+
+def test_put_params_validates_writes_and_restart_flow() -> None:
+    k8s = FakeK8s()
+    client, _ = _client(k8s)
+    # invalid: out of bounds -> 422, no write
+    bad = client.put("/api/params", json={"models": {"m1": {"trs": {"tau_crit": 9.9}}}})
+    assert bad.status_code == 422
+    assert k8s.cm["metadata"]["resourceVersion"] == "100"
+    # valid edit -> CM rewritten, rv bumped
+    ok = client.put("/api/params", json={"expected_resource_version": "100", "models": {"m1": {"trs": {"theta_m": 800.0}}}})
+    assert ok.status_code == 200
+    assert "800.0" in k8s.cm["data"]["registry.yaml"]
+    # stale rv -> 409
+    stale = client.put("/api/params", json={"expected_resource_version": "100", "models": {"m1": {"trs": {"theta_m": 810.0}}}})
+    assert stale.status_code == 409
+    # after edit, applied hash (none) != current -> pending_restart True
+    assert client.get("/api/params").json()["pending_restart"] is False  # still no annotation
+    # restart stamps the hash annotation -> pending clears
+    r = client.post("/api/ops/controller/restart", json={"reason": "apply theta"})
+    assert r.status_code == 200 and r.json()["ok"] is True
+    assert k8s.patches and "tre.dev/params-hash" in k8s.patches[0]["spec"]["template"]["metadata"]["annotations"]
+    assert client.get("/api/params").json()["pending_restart"] is False
+
+
+def test_rollout_state_reports_ready() -> None:
+    client, _ = _client(FakeK8s())
+    assert client.get("/api/ops/controller/rollout").json()["state"] == "ready"

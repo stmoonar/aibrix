@@ -44,4 +44,14 @@ def create_app() -> FastAPI:
     registry = load_registry(os.environ.get("TRE_REGISTRY_PATH"))
     redis_url = os.environ.get("TRE_REDIS_URL", "redis://aibrix-redis-master:6379/0")
     sm_url = os.environ.get("TRE_SERVICE_MANAGER_URL", "http://aibrix-tre-service-manager:8000")
-    return create_ui_app(registry, redis.Redis.from_url(redis_url), ServiceManagerStateClient(sm_url))
+    # In-cluster kubernetes access for param editing (restart-to-apply). Absent outside a
+    # pod (e.g. local dev) -> param endpoints return 503, everything else still works.
+    k8s_client: Any | None = None
+    try:
+        from tre_ui.k8s_client import InClusterK8sClient
+
+        if os.path.exists("/var/run/secrets/kubernetes.io/serviceaccount/token"):
+            k8s_client = InClusterK8sClient()
+    except Exception:  # noqa: BLE001
+        k8s_client = None
+    return create_ui_app(registry, redis.Redis.from_url(redis_url), ServiceManagerStateClient(sm_url), k8s_client)

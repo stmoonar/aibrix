@@ -290,13 +290,55 @@ function gpuCell(node, g, idx, resident, thr) {
 }
 
 /* ---------- CONTROL ---------- */
+// friendly labels + display precision for editable param fields
+const FIELD_LABEL = {
+  'trs.theta_m': 'θₘ (theta)', 'trs.tau_crit': 'τ crit', 'trs.tau_low': 'τ low', 'trs.tau_high': 'τ high',
+  'trs.w_p': 'w_p', 'trs.w_d': 'w_d', 'trs.lambda_wait': 'λ wait', 'trs.qmin': 'q_min', 'trs.qsat': 'q_sat',
+  'trs.ema_alpha': 'EMA α', 'trs.epsat': 'ε_sat', 'trs.hsat': 'h_sat',
+  'slo.ttft_p95_ms': 'SLO ttft p95', 'slo.tpot_p95_ms': 'SLO tpot p95', 'slo.e2e_p95_ms': 'SLO e2e p95',
+  'min_replicas': 'replicas min', 'max_replicas': 'replicas max',
+};
+const FIELD_ORDER = ['trs.theta_m', 'trs.tau_crit', 'trs.tau_low', 'trs.tau_high', 'trs.qmin', 'trs.qsat',
+  'trs.w_p', 'trs.w_d', 'trs.lambda_wait', 'trs.ema_alpha', 'trs.epsat', 'trs.hsat',
+  'slo.ttft_p95_ms', 'slo.tpot_p95_ms', 'slo.e2e_p95_ms', 'min_replicas', 'max_replicas'];
+
 function renderControl() {
   const grid = $('#ctl-grid'); grid.innerHTML = '';
   (S.meta.models || []).forEach(meta => grid.appendChild(controlPanel(meta)));
+  loadParams();
+}
+
+async function loadParams() {
+  try {
+    S.params = await api('/api/params');
+    S.paramsAvailable = true;
+  } catch (e) {
+    S.paramsAvailable = false;
+    S.paramsError = /503/.test(e.message) ? 'Parameter editing needs in-cluster access (kubernetes). Values shown read-only.' : e.message;
+  }
+  // rebuild panels now that we know editable bounds/values
+  const grid = $('#ctl-grid'); grid.innerHTML = '';
+  (S.meta.models || []).forEach(meta => grid.appendChild(controlPanel(meta)));
+  renderParamsBar();
+}
+
+function renderParamsBar() {
+  const bar = $('#params-bar'); if (!bar) return; bar.innerHTML = '';
+  if (S.paramsAvailable === false) { bar.appendChild(Object.assign(el('div', 'sub'), { textContent: S.paramsError || '' })); return; }
+  const pend = S.params && S.params.pending_restart;
+  const wrap = el('div', 'restart-strip' + (pend ? ' pending' : ''));
+  wrap.appendChild(el('span', null, pend ? '⚠ Edited params are saved but NOT applied — restart the controller to load them.' : 'Params in sync with the running controller.'));
+  const btn = el('button', 'btn ' + (pend ? 'primary' : ''), 'Restart controller');
+  btn.disabled = !pend;
+  btn.onclick = restartController;
+  wrap.appendChild(btn);
+  const status = el('span', 'sub', ''); status.id = 'rollout-status'; wrap.appendChild(status);
+  bar.appendChild(wrap);
 }
 
 function controlPanel(meta) {
   const name = meta.name, color = S.colors[name];
+  const view = (S.params && S.params.models && S.params.models[name]) || null;
   const p = el('div', 'panel'); p.style.setProperty('--accent', color); p.dataset.model = name;
   p.appendChild(el('h3', null, name));
   p.appendChild(el('div', 'accent-bar'));
@@ -305,6 +347,7 @@ function controlPanel(meta) {
   liveRow.innerHTML = `<span class="muted">awake / bound</span><span class="num" data-fld="awb">—</span>`;
   p.appendChild(liveRow);
 
+  // wake target stepper (live operate)
   const tRow = el('div', 'row');
   tRow.appendChild(Object.assign(el('span', 'muted'), { textContent: 'wake target' }));
   const stepper = el('div', 'stepper');
@@ -312,28 +355,100 @@ function controlPanel(meta) {
   let target = 0; const setT = (v) => { target = Math.max(meta.min_replicas, Math.min(meta.max_replicas, v)); val.textContent = target; };
   dec.onclick = () => setT(target - 1); inc.onclick = () => setT(target + 1);
   stepper.append(dec, val, inc); tRow.appendChild(stepper);
+  const setBtn = el('button', 'btn', 'Set');
+  setBtn.onclick = () => confirmOp(`Set ${name} wake target to ${target}?`, () => api(`/api/ops/models/${name}/target`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ wake_replicas: target }) }), `${name} target → ${target}`);
+  tRow.appendChild(setBtn);
   p.appendChild(tRow);
-  p.dataset.max = meta.max_replicas;
 
+  if (!view) {   // read-only fallback (no k8s)
+    const P = meta.trs, SLO = meta.slo;
+    const tbl = el('table', 'params');
+    [['θₘ', fmt(P.theta_m, 2)], ['τ c/l/h', `${fmt(P.tau_crit, 2)}/${fmt(P.tau_low, 2)}/${fmt(P.tau_high, 2)}`],
+     ['SLO ttft/tpot/e2e', `${fmtInt(SLO.ttft_p95_ms)}/${fmtInt(SLO.tpot_p95_ms)}/${fmtInt(SLO.e2e_p95_ms)}`]]
+      .forEach(([k, v]) => { const tr = el('tr'); tr.appendChild(el('td', null, k)); tr.appendChild(el('td', null, v)); tbl.appendChild(tr); });
+    p.appendChild(tbl);
+    return p;
+  }
+
+  // editable param form
+  const form = el('div', 'pform'); form.dataset.model = name;
+  FIELD_ORDER.forEach(fld => {
+    const spec = view.editable[fld]; if (!spec) return;
+    const rowE = el('label', 'prow');
+    rowE.appendChild(el('span', 'plabel', FIELD_LABEL[fld] || fld));
+    const input = el('input', 'pinput num'); input.type = 'number'; input.value = spec.value;
+    input.step = spec.type === 'int' ? '1' : 'any'; input.min = spec.min; input.max = spec.max;
+    input.dataset.field = fld; input.dataset.orig = String(spec.value);
+    input.oninput = () => { input.classList.toggle('dirty', input.value !== input.dataset.orig); markPanelDirty(p); };
+    rowE.appendChild(input);
+    rowE.appendChild(el('span', 'phint', `${spec.min}–${spec.max}`));
+    form.appendChild(rowE);
+  });
+  p.appendChild(form);
+
+  // locked fields (compact)
+  const locked = el('div', 'locked-note');
+  locked.appendChild(el('span', 'muted', 'locked: '));
+  Object.entries(view.locked).forEach(([k, info]) => {
+    const chip = el('span', 'lchip', k.replace('trs.', '')); chip.title = info.reason + ' = ' + info.value; locked.appendChild(chip);
+  });
+  p.appendChild(locked);
+
+  const err = el('div', 'perr'); err.dataset.err = name; p.appendChild(err);
   const actions = el('div', 'actions');
-  const applyBtn = el('button', 'btn primary', 'Set target');
-  applyBtn.onclick = () => confirmOp(`Set ${name} wake target to ${target}?`, () => api(`/api/ops/models/${name}/target`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ wake_replicas: target }) }), `${name} target → ${target}`);
-  actions.appendChild(applyBtn);
-  p.appendChild(actions);
-
-  // static params table
-  const tbl = el('table', 'params');
-  const P = meta.trs, SLO = meta.slo;
-  const params = [
-    ['θₘ (theta)', fmt(P.theta_m, 3)], ['τ crit / low / high', `${fmt(P.tau_crit, 2)} / ${fmt(P.tau_low, 2)} / ${fmt(P.tau_high, 2)}`],
-    ['q_sat', fmt(P.qsat, 2)], ['EMA τ (ms)', fmtInt(P.ema_tau_ms)],
-    ['SLO ttft/tpot/e2e p95', `${fmtInt(SLO.ttft_p95_ms)} / ${fmtInt(SLO.tpot_p95_ms)} / ${fmtInt(SLO.e2e_p95_ms)}`],
-    ['replicas min / max', `${fmtInt(meta.min_replicas)} / ${fmtInt(meta.max_replicas)}`],
-  ];
-  params.forEach(([k, v]) => { const tr = el('tr'); tr.appendChild(el('td', null, k)); tr.appendChild(el('td', null, v)); tbl.appendChild(tr); });
-  p.appendChild(tbl);
-  p.appendChild(Object.assign(el('div', 'sub'), { textContent: 'Parameter editing (restart-to-apply) ships in P0-4.', style: 'margin:10px 0 0;font-size:12px' }));
+  const save = el('button', 'btn primary', 'Save params'); save.dataset.save = name; save.disabled = true;
+  save.onclick = () => saveModelParams(name, p);
+  const reset = el('button', 'btn', 'Reset');
+  reset.onclick = () => { p.querySelectorAll('.pinput').forEach(i => { i.value = i.dataset.orig; i.classList.remove('dirty'); }); markPanelDirty(p); };
+  actions.append(save, reset); p.appendChild(actions);
   return p;
+}
+
+function markPanelDirty(panel) {
+  const dirty = panel.querySelectorAll('.pinput.dirty').length > 0;
+  const save = panel.querySelector('[data-save]'); if (save) save.disabled = !dirty;
+}
+
+async function saveModelParams(name, panel) {
+  const changes = { trs: {}, slo: {} };
+  panel.querySelectorAll('.pinput.dirty').forEach(i => {
+    const [sec, key] = i.dataset.field.includes('.') ? i.dataset.field.split('.') : [null, i.dataset.field];
+    const v = i.step === '1' ? parseInt(i.value, 10) : parseFloat(i.value);
+    if (sec) changes[sec][key] = v; else changes[key] = v;
+  });
+  const errBox = panel.querySelector('[data-err]'); errBox.textContent = '';
+  if (!window.confirm(`Save ${name} parameter changes? Takes effect after a controller restart.`)) return;
+  try {
+    S.params = await api('/api/params', { method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ expected_resource_version: S.params.resource_version, models: { [name]: changes } }) });
+    toast(`${name} params saved — restart to apply`);
+    const grid = $('#ctl-grid'); grid.innerHTML = ''; (S.meta.models || []).forEach(m => grid.appendChild(controlPanel(m)));
+    renderParamsBar(); renderControlLive();
+  } catch (e) {
+    const m = e.message.match(/\{.*\}/s);
+    if (m) { try { const d = JSON.parse(m[0]); errBox.textContent = (d.errors || []).map(x => `${x.field || ''}: ${x.error}${x.detail ? ' (' + x.detail + ')' : ''}`).join('; '); } catch (_) { errBox.textContent = e.message; } }
+    else errBox.textContent = e.message;
+    toast('save rejected', true);
+  }
+}
+
+async function restartController() {
+  if (!window.confirm('Restart the controller to apply saved params? Brief (~seconds) control pause; decisions resume automatically.')) return;
+  try {
+    await api('/api/ops/controller/restart', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ reason: 'apply params from console' }) });
+    toast('controller restart requested'); pollRollout(0);
+  } catch (e) { toast('restart failed: ' + e.message, true); }
+}
+
+async function pollRollout(n) {
+  const status = $('#rollout-status'); if (!status) return;
+  try {
+    const r = await api('/api/ops/controller/rollout');
+    status.textContent = `rollout: ${r.state} (${r.ready_replicas}/${r.desired})`;
+    if (r.state === 'ready') { toast('controller restarted — params applied'); loadParams(); return; }
+    if (r.state === 'failed') { status.textContent = 'rollout FAILED: ' + (r.message || ''); toast('rollout failed', true); return; }
+  } catch (_) {}
+  if (n < 40) setTimeout(() => pollRollout(n + 1), 2000);
 }
 
 function renderControlLive() {

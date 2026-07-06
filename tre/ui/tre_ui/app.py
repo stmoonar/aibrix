@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -12,11 +14,16 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 
 from tre_common.registry import Registry
+from tre_ui import params as params_mod
 from tre_ui.sampler import Sampler
 
 _AUDIT = logging.getLogger("tre_ui.audit")
 _STATIC = Path(__file__).parent / "static"
 _CONTROLLER_MODE_KEY = "tre:v2:controller:mode"
+_REGISTRY_CM = "tre-v2-registry"
+_CONTROLLER_DEPLOY = "tre-v2-controller"
+_HASH_ANNOTATION = "tre.dev/params-hash"
+_PARAMS_AUDIT_KEY = "tre:v2:audit:params"
 
 
 class RedisClient(Protocol):
@@ -29,6 +36,8 @@ class RedisClient(Protocol):
     def get(self, key: str) -> Any: ...
 
     def set(self, key: str, value: str) -> Any: ...
+
+    def rpush(self, key: str, value: str) -> Any: ...
 
 
 class ServiceManagerClient(Protocol):
@@ -53,10 +62,20 @@ class _ModeBody(BaseModel):
     mode: str  # "active" | "observe"
 
 
+class _ParamsBody(BaseModel):
+    expected_resource_version: str | None = None
+    models: dict[str, Any] = {}
+
+
+class _RestartBody(BaseModel):
+    reason: str = ""
+
+
 def create_ui_app(
     registry: Registry,
     redis_client: RedisClient,
     service_manager_client: ServiceManagerClient,
+    k8s_client: Any | None = None,
 ) -> FastAPI:
     model_names = [m.name for m in registry.models()]
     model_max = {m.name: m.max_replicas for m in registry.models()}
@@ -154,6 +173,85 @@ def create_ui_app(
             raise HTTPException(status_code=502, detail=f"redis set failed: {exc}") from exc
         return {"ok": True, "mode": body.mode}
 
+    # ---- params: edit per-model registry via ConfigMap, restart-to-apply ----
+
+    def _require_k8s() -> Any:
+        if k8s_client is None:
+            raise HTTPException(status_code=503, detail="param editing unavailable (no kubernetes access)")
+        return k8s_client
+
+    @app.get("/api/params")
+    def get_params() -> dict[str, Any]:
+        client = _require_k8s()
+        try:
+            cm = client.get_configmap(_REGISTRY_CM)
+            registry_yaml = (cm.get("data") or {}).get("registry.yaml", "")
+            rv = (cm.get("metadata") or {}).get("resourceVersion")
+            deploy = client.get_deployment(_CONTROLLER_DEPLOY)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=502, detail=f"kubernetes read failed: {exc}") from exc
+        current_hash = _hash(registry_yaml)
+        applied = _template_annotations(deploy).get(_HASH_ANNOTATION)
+        return {
+            "models": params_mod.build_view(registry_yaml),
+            "resource_version": rv,
+            "params_hash": current_hash,
+            "pending_restart": applied is not None and applied != current_hash,
+            "last_restart": {k: v for k, v in _template_annotations(deploy).items() if k.startswith("tre.dev/")},
+        }
+
+    @app.put("/api/params")
+    def put_params(body: _ParamsBody) -> dict[str, Any]:
+        client = _require_k8s()
+        try:
+            cm = client.get_configmap(_REGISTRY_CM)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=502, detail=f"kubernetes read failed: {exc}") from exc
+        rv = (cm.get("metadata") or {}).get("resourceVersion")
+        if body.expected_resource_version is not None and body.expected_resource_version != rv:
+            raise HTTPException(status_code=409, detail="configmap changed since load; refresh and retry")
+        registry_yaml = (cm.get("data") or {}).get("registry.yaml", "")
+        try:
+            new_yaml = params_mod.apply_and_validate(registry_yaml, body.models)
+        except params_mod.ParamValidationError as exc:
+            raise HTTPException(status_code=422, detail={"errors": exc.errors}) from exc
+        _AUDIT.info(json.dumps({"op": "params_edit", "models": list(body.models), "diff": body.models}))
+        _record_audit(redis_client, {"op": "params_edit", "diff": body.models, "prev_rv": rv})
+        try:
+            client.replace_configmap(_REGISTRY_CM, {"registry.yaml": new_yaml}, rv)
+        except Exception as exc:  # noqa: BLE001
+            status = getattr(exc, "status", 502)
+            raise HTTPException(status_code=409 if status == 409 else 502, detail=f"configmap write failed: {exc}") from exc
+        return get_params()
+
+    @app.post("/api/ops/controller/restart")
+    def restart_controller(body: _RestartBody) -> dict[str, Any]:
+        client = _require_k8s()
+        try:
+            cm = client.get_configmap(_REGISTRY_CM)
+            registry_yaml = (cm.get("data") or {}).get("registry.yaml", "")
+            now = datetime.now(timezone.utc).isoformat()
+            patch = {"spec": {"template": {"metadata": {"annotations": {
+                "kubectl.kubernetes.io/restartedAt": now,
+                "tre.dev/restarted-by": "tre-v2-ui",
+                "tre.dev/restart-reason": body.reason[:200],
+                _HASH_ANNOTATION: _hash(registry_yaml),
+            }}}}}
+            _AUDIT.info(json.dumps({"op": "controller_restart", "reason": body.reason}))
+            deploy = client.patch_deployment(_CONTROLLER_DEPLOY, patch)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=502, detail=f"restart failed: {exc}") from exc
+        return {"ok": True, "generation": (deploy.get("metadata") or {}).get("generation"), "restarted_at": now}
+
+    @app.get("/api/ops/controller/rollout")
+    def controller_rollout() -> dict[str, Any]:
+        client = _require_k8s()
+        try:
+            deploy = client.get_deployment(_CONTROLLER_DEPLOY)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=502, detail=f"kubernetes read failed: {exc}") from exc
+        return _rollout_state(deploy)
+
     # ---- observe (legacy per-request reads; superseded by /api/stream, kept for compatibility) ----
 
     @app.get("/api/cluster")
@@ -231,6 +329,39 @@ def _proxy(client: ServiceManagerClient, method: str, path: str, payload: dict[s
         return {"ok": True, "response": client.request(method, path, payload)}
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"service-manager {method} {path} failed: {exc}") from exc
+
+
+def _hash(text: str) -> str:
+    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()[:16]
+
+
+def _template_annotations(deploy: dict) -> dict[str, str]:
+    return (((deploy.get("spec") or {}).get("template") or {}).get("metadata") or {}).get("annotations") or {}
+
+
+def _rollout_state(deploy: dict) -> dict[str, Any]:
+    status = deploy.get("status") or {}
+    spec = deploy.get("spec") or {}
+    desired = spec.get("replicas", 1)
+    updated = status.get("updatedReplicas", 0)
+    ready = status.get("readyReplicas", 0)
+    conditions = {c.get("type"): c for c in status.get("conditions", [])}
+    progressing = conditions.get("Progressing", {})
+    if progressing.get("reason") == "ProgressDeadlineExceeded":
+        state = "failed"
+    elif updated >= desired and ready >= desired and status.get("observedGeneration", 0) >= (deploy.get("metadata") or {}).get("generation", 0):
+        state = "ready"
+    else:
+        state = "progressing"
+    return {"state": state, "ready_replicas": ready, "desired": desired,
+            "message": progressing.get("message", ""), "observed_generation": status.get("observedGeneration")}
+
+
+def _record_audit(redis_client: Any, entry: dict) -> None:
+    try:
+        redis_client.rpush(_PARAMS_AUDIT_KEY, json.dumps(entry, separators=(",", ":")))
+    except Exception:  # noqa: BLE001 - audit is best-effort, never blocks the edit
+        pass
 
 
 def _static_asset(name: str, media_type: str) -> Response:
