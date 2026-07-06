@@ -1,0 +1,1 @@
+{"model": "dsqwen-7b", "workers": 1, "max_tokens": 96, "duration_s": 180.0, "pace_s": 1.0, "ok": 121, "err": 1, "rps": 0.67, "lat_p50_ms": 1239.6, "lat_p95_ms": 1257.9, "errors": {"TimeoutError": 1}}

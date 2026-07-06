@@ -2217,3 +2217,36 @@ never sees. Fixed the driver's trs computation. make check 315.
   `rewindow_from_raw.py --window-ms=<W> --step-ms=<refresh>` + per-request JSONL logging in drive_cell
   (streaming for ttft + usage). S4 is intricate (p95 bucket-reconciliation vs metrics_store) and R3 is
   gated well downstream (post W-freeze + F4.4), so it remains an R3-prerequisite task, not yet done.
+
+### S1 pipeline shakedown (~short live run on isolated tre-v2 plane) — PASS w/ 1 must-fix finding (2026-07-06)
+
+Ran the architect's §2 shakedown on the isolated plane (dsqwen-7b only, avoided the B1 defrag
+path). Controller un-paused (image 446ce73a) then re-paused; fleet restored. Evidence:
+docs/refactor/p11_evidence/s1_shortwindow_20260706/ (pre/, decisions.log, p1_load.json).
+
+WHAT PASSED (full control path validated end-to-end, HEALTHY):
+- P0 idle: decisions every ~5.7s, window_end advancing (sliding), all z_m null, zero actions.
+- S1 freshness live: z_m responded to load onset within ~1 window (~30s); decisions every ~5.7s.
+- Under load: rescue scale-up woke sleeping replicas with D10 headroom checks (NO OOM), gateway
+  routed correctly, SafeScale proactive probe -> shrink commit, reconcile warnings=[] throughout.
+- P1 load through the churn: 121 ok / 1 timeout (99.2%), p95 ~1258ms. No leak (woken ~39.9GiB awake,
+  slept back to ~2.2GiB), no desync, no crash, no restarts.
+- Restore: all 3 models back to awake=1, smoke 3/3 HTTP 200, GPU residency == baseline, controller paused.
+
+FINDING F-ONSET (control-QUALITY, must fix before the paper experiments; not a safety bug):
+- **Load-onset over-scale.** z_m trajectory from onset: 0.274 -> 0.274 -> 0.545 -> 0.748 -> 1.171 ->
+  1.43 -> 1.6 -> 2.0 -> 2.4. While the sliding 30s window was still FILLING, TRS was transiently low
+  -> z_m transiently CRITICAL (<tau_crit=0.7485) -> rescue fired **4x critical_sleeping_capacity
+  scale-ups in ~20s**, over-scaling dsqwen-7b 1 -> 3 on a 1 req/s trickle that needs 1 pod. Then z_m
+  climbed to HIGH and proactive SafeScale self-corrected it back to 1.
+- Root cause: window-fill transient (no traffic history at load onset -> low TRS), AMPLIFIED by S1's
+  fast 5s refresh (acts on the transient before the signal stabilizes). This is the N3/N4 territory
+  that was deferred pending real data — now justified.
+- Impact on paper: would inflate "avg awake replicas" (resource cost) and "switching count" (both are
+  reported metrics), and cause unnecessary churn at every load ramp in R2 traces. MUST fix first.
+- Candidate fixes (architect to rule): (a) warmup/window-fill guard — don't classify CRITICAL until
+  the model's window has >= X s of accumulated traffic; (b) CRITICAL hysteresis — require z_m<tau_crit
+  for >=K consecutive ticks before rescue scales; (c) N4 action cooldown — min interval between scale-ups.
+
+Shakedown VERDICT: the code path is sound and safe (would have caught this exact issue before a 12h
+soak) — proceed to fix F-onset, then the parallel UI + replayer builds, then the long runs.
