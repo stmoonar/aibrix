@@ -1,214 +1,75 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>TRE Console</title>
-<style>
-  :root{
-    --ink:#12151c; --ink-2:#181c25; --ink-3:#1f2530; --line:#2b3340;
-    --fg:#d7dce4; --fg-dim:#8a93a4; --fg-mute:#5c6675;
-    --crit:#e8894a; --low:#d9c15a; --healthy:#5fb98f; --high:#5a8fd6; --unknown:#586173;
-    --accent:#c9a36a; --danger:#d76b5c;
-    --mono:ui-monospace,"Cascadia Code","SF Mono",Menlo,monospace;
-    --sans:"Segoe UI",system-ui,-apple-system,sans-serif;
-  }
-  *{box-sizing:border-box}
-  body{margin:0;background:
-      radial-gradient(1200px 600px at 80% -10%, #1a2130 0%, transparent 60%),
-      var(--ink);color:var(--fg);font-family:var(--sans);font-size:14px;line-height:1.4}
-  .num{font-family:var(--mono);font-variant-numeric:tabular-nums}
-  header{display:flex;align-items:baseline;gap:18px;padding:16px 24px;border-bottom:1px solid var(--line)}
-  header h1{margin:0;font-size:18px;font-weight:600;letter-spacing:.14em;text-transform:uppercase}
-  header h1 b{color:var(--accent);font-weight:700}
-  .sub{color:var(--fg-mute);font-size:12px;letter-spacing:.06em}
-  .spacer{flex:1}
-  .pill{font-family:var(--mono);font-size:11px;padding:3px 9px;border:1px solid var(--line);border-radius:2px;color:var(--fg-dim)}
-  .pill.live{color:var(--healthy);border-color:#2c4a3d}
-  .pill.stale{color:var(--danger);border-color:#4a2f2c}
-  button{font-family:var(--sans);font-size:12px;color:var(--fg-dim);background:transparent;
-    border:1px solid var(--line);border-radius:2px;padding:5px 11px;cursor:pointer;transition:.12s ease-out}
-  button:hover{color:var(--fg);border-color:var(--fg-mute)}
-  button.act{color:var(--accent);border-color:#4a3f2c}
-  button.danger:hover{color:var(--danger);border-color:#4a2f2c}
-  main{display:grid;grid-template-columns:minmax(0,1.55fr) minmax(320px,1fr);gap:22px;padding:22px 24px;align-items:start}
-  @media(max-width:960px){main{grid-template-columns:1fr}}
-  .col{display:flex;flex-direction:column;gap:18px;min-width:0}
-  .eyebrow{font-size:11px;letter-spacing:.18em;text-transform:uppercase;color:var(--fg-mute);margin:0 0 10px 2px}
-  /* model panels */
-  .model{border:1px solid var(--line);border-left:2px solid var(--edge,var(--unknown));background:linear-gradient(180deg,var(--ink-2),var(--ink));padding:14px 16px}
-  .model .top{display:flex;align-items:baseline;gap:12px;margin-bottom:8px}
-  .model .name{font-weight:600;font-size:15px}
-  .state{font-family:var(--mono);font-size:11px;letter-spacing:.08em;padding:2px 7px;border-radius:2px;color:var(--ink);background:var(--edge,var(--unknown))}
-  .metrics{display:flex;gap:20px;color:var(--fg-dim);font-size:12px;margin-left:auto}
-  .metrics b{color:var(--fg);font-weight:600}
-  .chartwrap{position:relative;margin-top:6px}
-  svg.chart{display:block;width:100%;height:86px}
-  .ops{display:flex;gap:6px;margin-top:10px;align-items:center}
-  .ops .rep{font-family:var(--mono);font-size:12px;color:var(--fg-dim);margin-right:auto}
-  .ops button{padding:3px 9px}
-  /* gpu grid */
-  .node{margin-bottom:14px}
-  .node .h{font-family:var(--mono);font-size:11px;color:var(--fg-mute);margin-bottom:6px}
-  .gpus{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}
-  .gpu{border:1px solid var(--line);background:var(--ink-2);padding:8px;min-height:74px;display:flex;flex-direction:column;gap:5px}
-  .gpu .g{font-family:var(--mono);font-size:10px;color:var(--fg-mute);display:flex;justify-content:space-between}
-  .gpu .m{font-size:12px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--gpc,var(--fg-dim))}
-  .gpu .bar{height:5px;background:var(--ink-3);border-radius:3px;overflow:hidden}
-  .gpu .bar>i{display:block;height:100%;background:var(--gpc,var(--fg-mute))}
-  .gpu .tag{font-family:var(--mono);font-size:9px;letter-spacing:.05em;color:var(--fg-mute)}
-  .gpu.awake{border-color:#3a4657}
-  .gpu.leak{border-color:var(--danger)}
-  /* ticker */
-  .ticker{border:1px solid var(--line);background:var(--ink-2);max-height:340px;overflow:auto}
-  .ev{display:flex;gap:10px;padding:6px 12px;border-bottom:1px solid #232a35;font-size:12px}
-  .ev:last-child{border-bottom:0}
-  .ev .t{font-family:var(--mono);color:var(--fg-mute);font-size:11px;flex-shrink:0}
-  .ev .x{color:var(--fg-dim)}
-  .ev.scale .x{color:var(--high)} .ev.crit .x{color:var(--crit)} .ev.supp .x{color:var(--healthy)} .ev.warn .x{color:var(--danger)}
-  .empty{color:var(--fg-mute);font-size:12px;padding:14px;text-align:center}
-  footer{color:var(--fg-mute);font-size:11px;padding:10px 24px;border-top:1px solid var(--line);display:flex;gap:16px}
-  .toast{position:fixed;right:18px;bottom:18px;background:var(--ink-3);border:1px solid var(--line);padding:10px 14px;font-size:12px;max-width:340px;opacity:0;transform:translateY(8px);transition:.2s}
-  .toast.show{opacity:1;transform:none}
-</style>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>TRE Console</title>
+  <link rel="stylesheet" href="/style.css" />
 </head>
 <body>
-<header>
-  <h1>TRE&nbsp;<b>Console</b></h1>
-  <span class="sub">multi-model hot-swap autoscaler</span>
-  <span class="spacer"></span>
-  <span id="freshness" class="pill">—</span>
-  <button class="act" onclick="reconcile()">Reconcile</button>
-</header>
-<main>
-  <div class="col">
-    <div><p class="eyebrow">Models · TSS / Z<sub>m</sub> signal</p><div id="models"></div></div>
-  </div>
-  <div class="col">
-    <div><p class="eyebrow">GPU topology · resident memory (DCGM/gpu-truth)</p><div id="gpus"></div></div>
-    <div><p class="eyebrow">Decision stream</p><div id="ticker" class="ticker"><div class="empty">waiting for controller…</div></div></div>
-  </div>
-</main>
-<footer>
-  <span id="ver" class="num"></span><span class="spacer" style="flex:1"></span>
-  <span>Z<sub>m</sub> = TSS / θ<sub>m</sub> · bands: crit &lt; τ<sub>crit</sub> &lt; low &lt; 1 &lt; healthy ≤ τ<sub>high</sub> &lt; high</span>
-</footer>
-<div id="toast" class="toast"></div>
-<script>
-const STATE_COLOR={CRITICAL:'var(--crit)',LOW:'var(--low)',HEALTHY:'var(--healthy)',HIGH:'var(--high)',IDLE:'var(--high)',UNKNOWN:'var(--unknown)'};
-const MODEL_COLOR={};const PALETTE=['#5fb98f','#5a8fd6','#c9a36a','#b07ac2','#d98a8a'];
-let PARAMS={};
-const $=s=>document.querySelector(s);
-const fmt=(v,d=2)=>v==null?'—':(typeof v==='number'?v.toFixed(d):v);
-function toast(m){const t=$('#toast');t.textContent=m;t.classList.add('show');clearTimeout(t._h);t._h=setTimeout(()=>t.classList.remove('show'),2600);}
-async function api(p){const r=await fetch(p);if(!r.ok)throw new Error(p+' '+r.status);return r.json();}
-async function post(p,b){const r=await fetch(p,{method:'POST',headers:{'Content-Type':'application/json'},body:b?JSON.stringify(b):null});const j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.detail||('HTTP '+r.status));return j;}
+  <nav class="rail">
+    <div class="brand">TRE Console<small>hot-swap autoscaler</small></div>
+    <div id="nav"></div>
+    <div class="rail-foot">
+      Live via in-pod sampler · SSE 0.5s<br />
+      <span id="ver" class="num">v0</span> · read-only on the control loop
+    </div>
+  </nav>
 
-async function boot(){
-  const m=await api('/api/models');
-  m.models.forEach((mo,i)=>{PARAMS[mo.name]=mo;MODEL_COLOR[mo.name]=PALETTE[i%PALETTE.length];});
-}
-function bands(p,h,scale){
-  // draw τ zones for a model's z chart. scale maps z->y.
-  const zones=[['var(--crit)',0,p.trs.tau_crit],['var(--low)',p.trs.tau_crit,p.trs.tau_low],
-    ['var(--healthy)',p.trs.tau_low,p.trs.tau_high],['var(--high)',p.trs.tau_high,scale.zmax]];
-  return zones.map(([c,a,b])=>{const y2=scale.y(a),y1=scale.y(b);
-    return `<rect x="0" y="${y1.toFixed(1)}" width="100%" height="${Math.max(0,y2-y1).toFixed(1)}" fill="${c}" opacity="0.09"/>`;}).join('');
-}
-function chart(p,pts){
-  const W=560,H=86,zmax=Math.max(p.trs.tau_high*1.5, ...pts.map(d=>d.z_m||0),2);
-  const xs=pts.length>1?pts:[...pts,...pts];
-  const t0=xs[0].ts,t1=xs[xs.length-1].ts||t0+1,span=Math.max(1,t1-t0);
-  const y=z=>H-4-(Math.max(0,Math.min(z,zmax))/zmax)*(H-8);
-  const x=t=>((t-t0)/span)*W;
-  const scale={y,zmax};
-  const line=pts.filter(d=>d.z_m!=null).map((d,i)=>`${i?'L':'M'}${x(d.ts).toFixed(1)},${y(d.z_m).toFixed(1)}`).join(' ');
-  const y1=y(1).toFixed(1);
-  return `<svg class="chart" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">
-    ${bands(p,H,scale)}
-    <line x1="0" y1="${y1}" x2="${W}" y2="${y1}" stroke="var(--fg-mute)" stroke-dasharray="3 3" stroke-width="0.6" opacity="0.5"/>
-    <path d="${line||''}" fill="none" stroke="${MODEL_COLOR[p.name]}" stroke-width="1.6"/>
-  </svg>`;
-}
-async function drawModels(dec){
-  const box=$('#models');const now=Date.now();
-  const cards=await Promise.all(PARAMS?Object.values(PARAMS).map(async p=>{
-    let pts=[];try{pts=(await api(`/api/signal/history?model=${p.name}&since_ms=${now-15*60000}`)).points;}catch(e){}
-    const st=(dec.model_states||{})[p.name]||{};
-    const state=st.state||'UNKNOWN';const col=STATE_COLOR[state]||'var(--unknown)';
-    const cur=pts.length?pts[pts.length-1]:st;
-    return `<div class="model" style="--edge:${col}">
-      <div class="top"><span class="name" style="color:${MODEL_COLOR[p.name]}">${p.name}</span>
-        <span class="state" style="background:${col}">${state}</span>
-        <span class="metrics">
-          <span>Z<sub>m</sub> <b class="num">${fmt(st.z_m??cur.z_m)}</b></span>
-          <span>TSS <b class="num">${fmt(st.trs??cur.trs,0)}</b></span>
-          <span>θ <b class="num">${fmt(p.trs.theta_m,0)}</b></span>
-          <span>Q<sub>ctl</sub> <b class="num">${fmt(st.q_ctl,1)}</b></span>
-        </span></div>
-      ${chart(p,pts.length?pts:[{ts:now,z_m:null}])}
-      <div class="ops"><span class="rep">awake <b>${st.routable_pods??'?'}</b> · bound ${st.assigned_replicas??'?'} · max ${p.max_replicas}${st.signal_warm===false?' · <span style="color:var(--healthy)">warming</span>':''}</span>
-        <button onclick="target('${p.name}',-1)">− sleep</button>
-        <button class="act" onclick="target('${p.name}',1)">+ wake</button>
-      </div></div>`;
-  }):[]);
-  box.innerHTML=cards.join('')||'<div class="empty">no models</div>';
-}
-function drawGpus(cluster,truth){
-  const bindings=(cluster.service_manager&&cluster.service_manager.bindings)||[];
-  const byGpu={};bindings.forEach(b=>{const n=b.node||(b.slot&&b.slot.node);const ids=b.gpu_ids||(b.slot&&b.slot.gpu_ids)||[];ids.forEach(g=>{(byGpu[n+'/'+g]=byGpu[n+'/'+g]||[]).push(b);});});
-  const mem={};(truth.nodes||[]).forEach(nd=>(nd.gpus||[]).forEach((g,i)=>{mem[nd.node+'/'+i]={used:g.used_mib,total:g.total_mib};}));
-  const nodes=(cluster.topology&&cluster.topology.nodes)||[];
-  $('#gpus').innerHTML=nodes.map(nd=>{
-    const cells=[...Array(nd.gpus).keys()].map(g=>{
-      const bs=byGpu[nd.name+'/'+g]||[];const awake=bs.find(b=>b.awake);const b=awake||bs[0];
-      const mm=mem[nd.name+'/'+g];const pct=mm?Math.round(100*mm.used/mm.total):0;
-      const leak=b&&!awake&&mm&&mm.used>4096;
-      const col=b?MODEL_COLOR[b.model]||'var(--fg-dim)':'var(--fg-mute)';
-      const tag=!b?'free':awake?(b.hidden?'awake·hidden':'awake'):'sleeping';
-      return `<div class="gpu ${awake?'awake':''} ${leak?'leak':''}" style="--gpc:${col}">
-        <div class="g"><span>GPU ${g}</span><span>${mm?mm.used+'M':''}</span></div>
-        <div class="m">${b?b.model:'—'}</div>
-        <div class="bar"><i style="width:${pct}%"></i></div>
-        <div class="tag">${tag}${leak?' ⚠leak':''}</div></div>`;}).join('');
-    return `<div class="node"><div class="h">${nd.name}</div><div class="gpus">${cells}</div></div>`;
-  }).join('');
-}
-const TICK=[];
-function drawTicker(dec){
-  if(dec.ts_ms){
-    const evs=dec.events||[];const acts=(dec.actions||[]).map(a=>`${a.kind}:${a.model||''} ${a.delta>0?'+'+a.delta:a.delta||''}`);
-    const items=[...acts.map(x=>['act',x]),...evs.filter(e=>/critical|suppress|scale|defrag|leak|safescale|hide/.test(e)).map(e=>['ev',e])];
-    if(items.length){const ts=new Date(dec.ts_ms).toLocaleTimeString();
-      items.forEach(([k,x])=>{const cls=/suppress/.test(x)?'supp':/critical|crit/.test(x)?'crit':/scale|wake|defrag/.test(x)?'scale':/leak|warn|fail/.test(x)?'warn':'';
-        TICK.unshift(`<div class="ev ${cls}"><span class="t">${ts} ${dec.loop||''}</span><span class="x">${x}</span></div>`);});
-      while(TICK.length>60)TICK.pop();}
-  }
-  $('#ticker').innerHTML=TICK.join('')||'<div class="empty">no scaling activity yet</div>';
-}
-async function target(model,delta){
-  const p=PARAMS[model];const dec=window._dec||{};const st=(dec.model_states||{})[model]||{};
-  const cur=st.routable_pods||1;const to=Math.max(p.min_replicas,Math.min(p.max_replicas,cur+delta));
-  if(to===cur){toast(`${model} already at ${cur}`);return;}
-  if(!confirm(`${delta>0?'Wake':'Sleep'} ${model}: awake ${cur} → ${to}?`))return;
-  try{await post(`/api/ops/models/${model}/target`,{wake_replicas:to});toast(`${model} → target ${to}`);tick();}catch(e){toast('failed: '+e.message);}
-}
-async function reconcile(){if(!confirm('Trigger SM reconcile?'))return;try{const j=await post('/api/ops/reconcile');toast('reconcile: warnings='+JSON.stringify((j.response||{}).warnings||[]));tick();}catch(e){toast('failed: '+e.message);}}
+  <main class="stage">
+    <header class="topbar">
+      <h1 id="view-title">Live Signals</h1>
+      <span id="stamp" class="sub" style="margin:0"></span>
+      <span class="spacer"></span>
+      <span id="mode-badge" class="pill"><span class="dot"></span><span id="mode-badge-txt">controller <b>—</b></span></span>
+      <span id="loop" class="pill"><span class="dot"></span><span id="loop-txt">loop <b>—</b></span></span>
+      <span id="gpufresh" class="pill"><span class="dot"></span>GPU truth <b>—</b></span>
+      <span id="conn" class="pill"><span id="conn-dot" class="dot"></span><span id="conn-txt">connecting</span></span>
+    </header>
 
-async function tick(){
-  try{
-    const [cluster,dec,truth]=await Promise.all([api('/api/cluster'),api('/api/decision/latest'),api('/api/gputruth')]);
-    window._dec=dec;
-    const age=dec.ts_ms?(Date.now()-dec.ts_ms)/1000:null;
-    const f=$('#freshness');
-    if(age==null){f.textContent='controller paused';f.className='pill';}
-    else if(age<20){f.textContent='live · '+age.toFixed(0)+'s';f.className='pill live';}
-    else{f.textContent='stale · '+age.toFixed(0)+'s';f.className='pill stale';}
-    $('#ver').textContent=cluster.service_manager&&cluster.service_manager.version!=null?('SM state v'+cluster.service_manager.version):'';
-    await drawModels(dec);drawGpus(cluster,truth);drawTicker(dec);
-  }catch(e){$('#freshness').textContent='api error';$('#freshness').className='pill stale';}
-}
-boot().then(tick).then(()=>setInterval(tick,4000));
-</script>
+    <div class="content">
+      <!-- LIVE -->
+      <section id="view-live" class="view active">
+        <div class="two-col">
+          <div>
+            <h2 class="section">Per-model signals</h2>
+            <p class="sub">Zₘ = TRSₘ / θₘ. Dashed lines mark τ<sub>crit</sub>/τ<sub>low</sub>/τ<sub>high</sub>. State band comes from the controller classification.</p>
+            <div id="live-grid" class="grid-live"></div>
+          </div>
+          <div>
+            <h2 class="section">Event feed</h2>
+            <p class="sub">Scale, hide, safescale, leak &amp; warmup events as the loops emit them.</p>
+            <div id="feed" class="feed"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- FLEET -->
+      <section id="view-fleet" class="view">
+        <h2 class="section">GPU co-residency</h2>
+        <p class="sub">Each GPU can hold multiple resident models (weights kept while sleeping); at most one is awake. Joined from service-manager bindings × GPU-truth memory by node &amp; index.</p>
+        <div id="fleet-root"></div>
+      </section>
+
+      <!-- CONTROL -->
+      <section id="view-control" class="view">
+        <h2 class="section">Controller mode</h2>
+        <p class="sub">Observe pauses actuation (no scale/hide) while decisions keep computing — safe for inspecting behaviour without perturbing tenants.</p>
+        <div class="actions" style="margin:0 0 22px">
+          <div class="mode-toggle">
+            <button id="mode-active" onclick="TRE.setMode('active')">Active</button>
+            <button id="mode-observe" onclick="TRE.setMode('observe')">Observe</button>
+          </div>
+          <button class="btn" onclick="TRE.reconcile()">Reconcile now</button>
+          <button class="btn" onclick="TRE.defrag()">Defrag (tp=2)</button>
+        </div>
+        <h2 class="section">Deployments &amp; parameters</h2>
+        <p class="sub">The three paper-relevant models. Set wake target live; parameters are read-only until P0-4.</p>
+        <div id="ctl-grid" class="ctl-grid"></div>
+      </section>
+    </div>
+  </main>
+
+  <script src="/app.js"></script>
 </body>
 </html>
