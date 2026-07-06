@@ -1879,3 +1879,46 @@ EXACT NEXT CONTINUATION (next session):
 4. F5: paper data packaging + doc final check; tag tre-v2-1.0.
 Reference: ADR-0008 (isolated plane design + phases), 13_experiments_log.md (N5),
 images.lock.md (controller rebuild), architect = Fable5 model (consult via subagent).
+
+### Endgame F4.4 N4.6 pre-flight — BLOCKED: idle-critical theta + SM routable desync (2026-07-06)
+
+Ran a 200s N4.6 scale-exercise pre-flight (driver `n4b_scale_exercise.py`) on the
+isolated plane with the controller unpaused, BEFORE launching the 12h soak. It
+exposed two real problems and I aborted the soak plan:
+
+1. **Idle/low-load reads as CRITICAL with inherited theta_m** (TRS degeneracy at
+   low throughput: Y_m->0, Q_ctl->qmin => TRS->0 => Z_m~0.04 << tau_crit). With
+   the driver's 1 req/s baseline, ALL THREE models scaled 1->2 (not just the
+   saturated one), and they never shrank (baseline stays "critical"). N4.6's
+   expand-then-shrink criterion and the soak's ">=5 clean expand/shrink cycles"
+   are UNACHIEVABLE with the current inherited theta. This is a calibration
+   dependency: meaningful N4.6/soak needs R3-refit theta (or a load design whose
+   baseline sits in the HEALTHY zm band).
+2. **SM routable/awake desync bug under scaling churn**: the over-scale on the
+   near-full node9 hit the "single awake per GPU" invariant, SM auto-slept pods,
+   and afterwards the SM binding.awake RECORD diverged from pod reality
+   (`is_sleeping`), AND awake pods were left routable=false -> Services lost
+   endpoints -> dsllama-8b and dsqwen-7b returned 0/4 through the gateway. Neither
+   reconcile nor idempotent PUT target self-healed it (reconcile only warns
+   "pod reality overrides persisted binding"; it does not re-assert routable from
+   reality). Root cause class: routable label is not reconciled from actual
+   `is_sleeping` state. FLAGGED as an SM bug for a code fix (add a
+   "reconcile routable from is_sleeping reality" path).
+
+Remediation (cluster restored to serving):
+- Paused controller; scaled all models target=1.
+- D8-deleted a genuinely leaked dsllama-8b node9 gpu-0 (is_sleeping=true yet
+  38-40 GiB resident, /wake_up 500) -> node9 GPU0 partly freed. dsllama now
+  bound=3 (leaked binding removed; recreate deferred).
+- Deterministic routing repair: labeled each model's ACTUALLY-awake pod
+  (is_sleeping=false) routable=true. Final: **all 3 models 5/5 via tre-aibrix-eg**,
+  awake=1 each (7b bound=4, llama/14b bound=3). node9 GPU2/GPU3 = 2248 MiB (clean),
+  node10 GPU2/GPU3 = 1825 MiB (clean, no persistent leak). Controller PAUSED
+  (stable; no actor will churn the state).
+- NOTE: SM binding.awake record may still point at different pods than reality
+  (desync); a reconcile could re-break routing, so left un-reconciled while serving.
+
+Process note: I ran this load pre-flight before consulting on the theta/idle
+question — that was premature and caused avoidable churn. Consulting the architect
+now on (a) F4.4-vs-R3 ordering and (b) the SM routable-desync fix before any
+further live scaling.
