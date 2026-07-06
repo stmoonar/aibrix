@@ -51,3 +51,16 @@ main comparison table {old, new bucket_upper, interpolated, ablation arms} × or
   ~10h/model) with this driver; output feeds `calibration fit --input <csv> --signal trs`.
 - R3 full-run reminder: recreate the fleet at 0.85 (ADR-0010) first for a consistent
   capacity baseline; drive each model's Service directly (bypass gateway) per plan 6.2.
+
+## R3 dsqwen-7b grid — LAUNCHED (running)  2026-07-06
+- System: git HEAD (isolated plane, SM fix a1d21c00, dsqwen-7b awake=1 @ util 0.9 live);
+  traceset n/a (calibration grid).
+- Command: `r3_grid.py --model dsqwen-7b --gateway-url http://10.105.5.99:8000/v1/completions
+  --input-buckets 128,512,1024 --output-buckets 128,512 --concurrency 1,2,4,8,16,32
+  --cell-seconds 300 --window-ms 60000 --metrics-schema v1` (controller paused; direct
+  model Service per plan 6.2).
+- Output: `/root/tre-experiments/r3/dsqwen-7b_util09.csv` (local disk, checkpointed).
+- Baseline: util 0.9 (LIVE operational awake pod). registry 0.85 (ADR-0010) is
+  recreate-hygiene only and does not affect r3_grid (reads trs params, not util).
+- Est ~3h (36 cells x 300s). Feeds `calibration fit --input <csv> --signal trs`.
+- Status: LAUNCHED PID 1008477. Result + theta fit to follow.
