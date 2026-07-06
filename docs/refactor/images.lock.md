@@ -11,7 +11,7 @@ Captured: 2026-07-06 (F4.0). Source commit for tre-v2 images: see per-image note
 | Component | Image tag | Image ID (sha256) | Source |
 |---|---|---|---|
 | service-manager | `tre-v2-service-manager:20260706-a1d21c00` | `` | commit `f6dce214` (route guard) |
-| controller | `tre-v2-controller:20260706-446ce73a` | `617607e8fbd26d14f11a2bc05c2cc5577001723e3789dfeb5b7f7fdb40a3bd4b` | commit `446ce73a` (S1 signal freshness: sliding window, 5s refresh, time-constant EMA, N1/N2) |
+| controller | `tre-v2-controller:20260706-6fd540e6` | `4f315e82427d9c98d7a937a60686900404f16174f0a26e00e63e48002807552c` | commit `6fd540e6` (S1 signal freshness + F-onset warmup guard ADR-0013) |
 | ui | `tre-v2-ui:20260704-669f0381` | `e81b68295f31103c22a24b51f1645e21e4d927b58e11f7127388628110ff06bc` | commit `669f0381` |
 | redis | `redis:7.2-alpine` | `dfa18828cbc07b3ae6a95ec7343f6c214fdee2d836197b4be8e9904420762cd8` | upstream |
 | vllm (model pods + gpu-truth DaemonSet) | `vllm/vllm-openai:0.10.1-sleep` | `6a3a5efad7779b594bf82dbda62c47efa789786a38963acb869142d9d8406492` | upstream (sleep-mode build) |

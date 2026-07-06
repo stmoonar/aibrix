@@ -2250,3 +2250,29 @@ FINDING F-ONSET (control-QUALITY, must fix before the paper experiments; not a s
 
 Shakedown VERDICT: the code path is sound and safe (would have caught this exact issue before a 12h
 soak) — proceed to fix F-onset, then the parallel UI + replayer builds, then the long runs.
+
+### F-onset mini re-shakedown — trickle PASS (fix confirmed live); saturation insight (2026-07-06)
+
+Built + rolled controller tre-v2-controller:20260706-6fd540e6 (F-onset, ADR-0013; TRE_SIGNAL_WARMUP_MS
+default -1 auto), un-paused, ran the architect's two legs, restored (awake=1, reconcile [], smoke 3/3
+HTTP 200), re-paused. Evidence: docs/refactor/p11_evidence/s1_shortwindow_20260706/reshake_*.
+
+- **Trickle leg PASS** (1 req/s, 96 tok, 150s — the over-scale replay): critical_sleeping_capacity
+  actions = **0** (was 4 pre-fix); receiver_suppressed_signal_warmup:dsqwen-7b = **5**; z_m opened at
+  0.685 (CRITICAL) and was SUPPRESSED through the window-fill transient (0.685/0.685/0.685/0.960/0.960),
+  then went warm (z=1.16+ HEALTHY); **awake stayed 1** (no over-scale). Fix works live.
+- **Spike legs INCONCLUSIVE-but-informative** (20w then 64w×512tok): could NOT drive dsqwen-7b CRITICAL.
+  20w: z_m 5.4-6.8 (HIGH), 0 err, p95 1.44s. 64w×512tok: z_m 4-6 (HIGH), 0 err, **p95 8.8s**, 7.68 rps.
+  At e2e 8.8s the pod is STILL WITHIN the registry SLO (e2e_p95=12000ms, tpot 75ms -> observed ~17ms),
+  so HIGH/no-scale is CORRECT. The saturation bypass couldn't be exercised live (no genuine SLO breach);
+  it is covered by the unit test test_build_plan_saturation_bypasses_warmup. No misbehavior, awake=1.
+
+**INSIGHT for experiments (R2 trace design / R3 capacity):** with the current loose SLOs (e2e 12s), a
+single 7B pod absorbs 64 concurrent × 512 tokens within SLO -> the models are HARD to drive CRITICAL at
+1 pod. R2 traces must drive much higher load (or the capacity surface C_m(i,o) must set the right rho),
+else TRE and baselines both stay HEALTHY (plan §12.1 "trace 作废类型 2: 不触发扩缩容"). Also reinforces
+N3: theta_m/tau (fit on 60s windows) badly need re-centering on the frozen 30s window at R3 — under an
+8.8s-latency deep queue the signal reads HIGH, which is SLO-correct here but leaves little CRITICAL margin.
+
+F-onset VERDICT: fix validated (suppression live-confirmed; bypass unit-tested). Image pinned
+(overlay + images.lock + kustomize test -> 6fd540e6). Controller PAUSED. Next: S5.1 + UI; Codex replayer.
