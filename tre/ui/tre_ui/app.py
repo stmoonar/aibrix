@@ -1,17 +1,22 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Protocol
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 
 from tre_common.registry import Registry
+from tre_ui.sampler import Sampler
 
 _AUDIT = logging.getLogger("tre_ui.audit")
+_STATIC = Path(__file__).parent / "static"
+_CONTROLLER_MODE_KEY = "tre:v2:controller:mode"
 
 
 class RedisClient(Protocol):
@@ -22,6 +27,8 @@ class RedisClient(Protocol):
     def scan_iter(self, match: str) -> Any: ...
 
     def get(self, key: str) -> Any: ...
+
+    def set(self, key: str, value: str) -> Any: ...
 
 
 class ServiceManagerClient(Protocol):
@@ -42,24 +49,112 @@ class _DefragBody(BaseModel):
     tp_size: int = 2
 
 
+class _ModeBody(BaseModel):
+    mode: str  # "active" | "observe"
+
+
 def create_ui_app(
     registry: Registry,
     redis_client: RedisClient,
     service_manager_client: ServiceManagerClient,
 ) -> FastAPI:
-    app = FastAPI(title="TRE Console")
     model_names = [m.name for m in registry.models()]
     model_max = {m.name: m.max_replicas for m in registry.models()}
+    sampler = Sampler(redis_client, service_manager_client.get_state, model_names=model_names)
+
+    @asynccontextmanager
+    async def _lifespan(_app: FastAPI):
+        sampler.start()
+        try:
+            yield
+        finally:
+            sampler.stop()
+
+    app = FastAPI(title="TRE Console", lifespan=_lifespan)
+    app.state.sampler = sampler
 
     @app.get("/", response_class=HTMLResponse)
     def index() -> str:
-        return (Path(__file__).parent / "static" / "index.html").read_text(encoding="utf-8")
+        return (_STATIC / "index.html").read_text(encoding="utf-8")
+
+    @app.get("/app.js")
+    def app_js() -> Response:
+        return _static_asset("app.js", "application/javascript")
+
+    @app.get("/style.css")
+    def style_css() -> Response:
+        return _static_asset("style.css", "text/css")
 
     @app.get("/healthz")
     def healthz() -> dict[str, bool]:
         return {"ok": True}
 
-    # ---- observe ----
+    # ---- live: served from the in-pod sampler cache; browsers NEVER trigger an upstream read ----
+
+    @app.get("/api/snapshot")
+    def snapshot(request: Request) -> Response:
+        snap = sampler.snapshot()
+        etag = f'W/"{snap.get("version", 0)}"'
+        if request.headers.get("if-none-match") == etag:
+            return Response(status_code=304, headers={"ETag": etag})
+        return Response(json.dumps(snap, separators=(",", ":")), media_type="application/json",
+                        headers={"ETag": etag})
+
+    @app.get("/api/stream")
+    async def stream() -> StreamingResponse:
+        async def gen():
+            last = -1
+            beats = 0
+            while True:
+                version = sampler.version()
+                if version != last:
+                    last = version
+                    yield f"data: {json.dumps(sampler.snapshot(), separators=(',', ':'))}\n\n"
+                    beats = 0
+                else:
+                    beats += 1
+                    if beats % 30 == 0:  # ~15s keep-alive when idle
+                        yield ": keep-alive\n\n"
+                await asyncio.sleep(0.5)
+
+        return StreamingResponse(gen(), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no",
+                                          "Connection": "keep-alive"})
+
+    @app.get("/api/events")
+    def events(limit: int = 200) -> dict[str, Any]:
+        return {"events": sampler.events(limit)}
+
+    @app.get("/api/meta")
+    def meta() -> dict[str, Any]:
+        return {
+            "models": [_model_payload(model) for model in registry.models()],
+            "topology": _topology_payload(registry),
+            "thresholds": {"create_max_used_mib": 2500, "sleep_leak_used_mib": 8192},
+            "sampler_version": sampler.version(),
+        }
+
+    @app.get("/api/ops/controller/mode")
+    def get_mode() -> dict[str, Any]:
+        try:
+            raw = redis_client.get(_CONTROLLER_MODE_KEY)
+        except Exception:  # noqa: BLE001
+            raw = None
+        mode = (raw.decode() if isinstance(raw, bytes) else raw) or "active"
+        return {"mode": mode}
+
+    @app.post("/api/ops/controller/mode")
+    def set_mode(body: _ModeBody) -> dict[str, Any]:
+        if body.mode not in ("active", "observe"):
+            raise HTTPException(status_code=400, detail="mode must be active or observe")
+        _AUDIT.info(json.dumps({"op": "controller_mode", "mode": body.mode}))
+        try:
+            redis_client.set(_CONTROLLER_MODE_KEY, body.mode)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=502, detail=f"redis set failed: {exc}") from exc
+        return {"ok": True, "mode": body.mode}
+
+    # ---- observe (legacy per-request reads; superseded by /api/stream, kept for compatibility) ----
 
     @app.get("/api/cluster")
     def cluster() -> dict[str, Any]:
@@ -136,6 +231,13 @@ def _proxy(client: ServiceManagerClient, method: str, path: str, payload: dict[s
         return {"ok": True, "response": client.request(method, path, payload)}
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"service-manager {method} {path} failed: {exc}") from exc
+
+
+def _static_asset(name: str, media_type: str) -> Response:
+    path = _STATIC / name
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="not found")
+    return Response(path.read_text(encoding="utf-8"), media_type=media_type)
 
 
 def _safe(fn: Any) -> Any:
