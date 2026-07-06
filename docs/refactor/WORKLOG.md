@@ -1799,3 +1799,44 @@ paused):
 - **Old path unaffected**: shared aibrix-eg smoke 12/12. Both scrapers run
   concurrently during transition (shared -> aibrix-redis-master, tre -> tre-v2-redis).
 Phase A PASS. Proceeding to Phase B (cutover).
+
+### Endgame F4 Phase B — cutover to isolated plane (ADR-0008, 2026-07-06)
+
+Rolled SM + controller onto the isolated data plane:
+- **SM**: applied retargeted service-manager.yaml (TRE_ROUTE_NAMESPACE=tre-v2,
+  TRE_GATEWAY_NAME=tre-aibrix-eg; D8/D10 thresholds now explicit). Rolled clean,
+  reconcile warnings=[]. Route-guard now manages the tre-v2 model routes.
+- **Controller**: applied retargeted controller.yaml (TRE_METRICS_REDIS_URL=
+  redis://tre-v2-redis:6379/0) and unpaused (replicas 0->1). Verified live:
+  - controller reads zm from **tre-v2-redis** and populates Z_m
+    (dsllama 0.044 / dsqwen-14b 0.061 / dsqwen-7b 0.044 — near-idle values, no load).
+  - `tre:v2:decision:latest` present (controller writing decisions).
+  - **Stability**: SM version steady at 311 across repeated reads; all models
+    awake=1/bound; no pod churn; reconcile warnings=[]; tre-v2 components 0 restarts.
+- Known idle characteristic (NOT a cutover regression): with zero experimental
+  load, TRS→0 so Z_m→0 reads as CRITICAL and rescue submits scale+1 while
+  idle-proactive submits scale-1; both are no-op'd by the serving floor
+  (min awake=1) + D10 headroom, so SM state stays fixed (version stable) — no
+  wake/sleep churn, hence no D8 leak risk. This is the same idle behavior that
+  previously motivated pausing the controller; under real N5 load the signals
+  reflect true utilization and the controller scales correctly (proven in F2.5:
+  dsqwen-7b 1->3 awake under load).
+
+**Phase B PASS.** Isolated TRE data plane is live & operational: serving via
+tre-aibrix-eg (smoke 24/24), metrics via tre-gateway-plugins -> tre-v2-redis,
+SM + controller retargeted, all state on tre-v2-redis. TRE no longer depends on
+the shared aibrix-eg gateway or aibrix-redis-master for its data/control path.
+
+**Phase C (deferred, >=24h gate)**: after >=24h stable, delete ONLY the 3 legacy
+TRE routers in aibrix-system (dsqwen-7b/14b-router, dsllama-8b-router). Touch
+nothing else there; leave the shared gateway-plugins image (co-tenants depend on
+it). The old aibrix-eg path currently still serves TRE traffic too (harmless
+redundancy) until Phase C.
+
+**Next (F4.4 authoritative N4b on the clean isolated plane)**: N4.2 hot-switch
+(20 rounds), N4.4 live defrag zero-5xx (now with route guard + isolated gateway),
+N4.6 three-model scale exercise (zm) + 12h soak (76 local disk). Then tag
+n4b-done. Controller rebuild from post-F4.0 HEAD before authoritative runs
+(images.lock note; current d795a715 image + runtime env is functionally
+equivalent — only the histogram-lookback env-wiring differs, old image defaults
+to the same 90s).
