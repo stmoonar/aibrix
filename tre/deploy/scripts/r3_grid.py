@@ -152,6 +152,8 @@ def main() -> int:
     ap.add_argument("--window-ms", type=int, default=60000)
     ap.add_argument("--redis-url", default="redis://tre-v2-redis:6379/0")
     ap.add_argument("--metrics-schema", default="v1")
+    ap.add_argument("--instant-sample-ms", type=int, default=5000)
+    ap.add_argument("--percentile-mode", default="bucket_upper")
     ap.add_argument("--registry", default=None)
     ap.add_argument("--only-first-cell", action="store_true")
     args = ap.parse_args()
@@ -176,7 +178,12 @@ def main() -> int:
     registry = load_registry(args.registry)
     spec = registry.model(args.model)
     redis_client = redis.Redis.from_url(args.redis_url)
-    store = MetricsStore(redis_client, registry, schema=args.metrics_schema)
+    store = MetricsStore(
+        redis_client, registry,
+        instant_sample_interval_ms=args.instant_sample_ms,
+        percentile_mode=args.percentile_mode,
+        schema=args.metrics_schema,
+    )
 
     rows: list[dict] = []
     for cell in cells:

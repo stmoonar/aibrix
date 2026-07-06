@@ -36,3 +36,18 @@ Entry template:
 
 N5 gate: this log has R1–R7 entries, each reproducible; `git tag results-v1`;
 main comparison table {old, new bucket_upper, interpolated, ablation arms} × oracle-normalized score.
+
+## R3 grid driver — built + validated  2026-07-06
+- Tool: `tre/deploy/scripts/r3_grid.py` (reuses MetricsStore window aggregation +
+  TRSComputer for the trs column; per-cell checkpoint/resume; make check 289 with
+  4 unit tests in `deploy/tests/test_r3_grid.py`).
+- End-to-end smoke (1 cell, dsqwen-7b, 40s @ concurrency 4, direct model Service
+  10.105.5.99:8000, controller paused): produced a calibration-ready CSV row —
+  prompt_tokens=16512, gen_tokens=8192, p95_ttft=60ms, p95_tpot=25ms, **trs=4756.48**
+  (Z_m~=6.4, healthy/high under load — the signal behaves correctly under real load;
+  the earlier idle-critical was the zero-load degenerate case).
+- Pipeline validated: drive -> tre-gateway-plugins scrape -> tre-v2-redis ->
+  MetricsStore -> TRSComputer -> CSV. R3 can now run the full grid (i x o x concurrency,
+  ~10h/model) with this driver; output feeds `calibration fit --input <csv> --signal trs`.
+- R3 full-run reminder: recreate the fleet at 0.85 (ADR-0010) first for a consistent
+  capacity baseline; drive each model's Service directly (bypass gateway) per plan 6.2.
