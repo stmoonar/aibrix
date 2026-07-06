@@ -1759,3 +1759,43 @@ Live-validated the additive F4.0 pieces (non-destructive, per ADR-0007/0008 item
   14b node9-gpu-2-3 as an awake pod); model Deployment/route idempotence is unit-
   tested and the live routes already exist (route-guard). The model HTTPRoutes will
   be regenerated to the tre-v2 gateway in the isolation package (ADR-0008 step 3).
+
+### Endgame F4 Isolation Package + Phase A (ADR-0008, 2026-07-06)
+
+Architect (Fable5) build spec (SendMessage follow-up): ext-proc is NOT on TRE's
+serving path (per-model routers win match precedence -> Service -> routable pods);
+zm metrics come from a background scrape loop in gateway-plugins
+(AIBRIX_POD_METRIC_REFRESH_INTERVAL_MS) writing to REDIS_HOST, independent of
+routing. So the isolated plane needs only: Gateway + per-model routers (serving)
+and tre-gateway-plugins + pod-list RBAC + REDIS_HOST=tre-v2-redis (metrics). NO
+reserved-router / ext-proc policy / skip-ext-proc / gwp :50052 Service.
+
+Isolation package (offline TDD, make check 272):
+- `deploy/overlays/tre-v2/gateway.yaml`: Gateway `tre-aibrix-eg` (gatewayClassName
+  aibrix-eg, listener :80, allowedRoutes from Same).
+- `deploy/overlays/tre-v2/gateway-plugins.yaml`: SA + cloned tre-scoped ClusterRole
+  (pods/modeladapters/httproutes) + binding + Deployment (pinned image
+  `aibrix/gateway-plugins:20260704-0d869b49-nozmq2`, REDIS_HOST=tre-v2-redis,
+  TRE_REDIS_SCHEMA=dual, scraper env carried over, SERVEMENT_URL dropped, init-c
+  waits on tre-v2-redis) + Service (metrics/profiling only, no :50052).
+- Parameterized `gen_model_manifests.py` gateway ns/name (env/CLI; defaults
+  tre-v2/tre-aibrix-eg); regenerated model routers into tre-v2; ReferenceGrant
+  `from: tre-v2`.
+- Retargeted SM env TRE_ROUTE_NAMESPACE=tre-v2 / TRE_GATEWAY_NAME=tre-aibrix-eg;
+  controller TRE_METRICS_REDIS_URL=redis://tre-v2-redis:6379/0. Route-guard
+  K8sOps default now tre-v2/tre-aibrix-eg. New test `test_isolated_dataplane.py`;
+  images.lock updated.
+
+Phase A (additive live deploy, touched nothing in aibrix-system, controller stayed
+paused):
+- Applied gateway + gateway-plugins + 3 tre-v2 routers + tre-v2 ReferenceGrant.
+- `tre-aibrix-eg` listener Programmed/Accepted/ResolvedRefs; dedicated envoy proxy
+  `envoy-tre-v2-tre-aibrix-eg-*` Running; envoy ClusterIP 10.103.92.7:80.
+- **Smoke via NEW gateway: 24/24** (8/8 each model), zero errors.
+- **zm metrics isolation confirmed**: tre-gateway-plugins writes
+  `aibrix:pod_instant_metrics_default/<pod>_<ts>` to tre-v2-redis with ts advancing
+  (…510000 → …520000 → …530000), 88 histogram keys present. Controller (paused)
+  is not the writer -> proves the isolated scraper works.
+- **Old path unaffected**: shared aibrix-eg smoke 12/12. Both scrapers run
+  concurrently during transition (shared -> aibrix-redis-master, tre -> tre-v2-redis).
+Phase A PASS. Proceeding to Phase B (cutover).
