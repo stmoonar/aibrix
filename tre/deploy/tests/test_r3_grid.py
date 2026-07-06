@@ -21,18 +21,28 @@ class _FakeWindow:
     generation_tokens: float
     ttft_p95_ms: float
     tpot_p95_ms: float
+    avg_waiting: float = 0.0
+    avg_running: float = 0.0
+    avg_swapping: float = 0.0
+    e2e_p95_ms: float = 0.0
 
 
 def test_window_row_maps_calibration_columns() -> None:
     cell = r3_grid.GridCell(512, 128, 8)
-    wm = _FakeWindow(1000, 61000, 4096.0, 1024.0, 480.0, 55.0)
-    row = r3_grid.window_row(cell, wm, trs=734.5)
+    wm = _FakeWindow(1000, 61000, 4096.0, 1024.0, 480.0, 55.0,
+                     avg_waiting=1.5, avg_running=3.0, avg_swapping=0.5, e2e_p95_ms=9000.0)
+    row = r3_grid.window_row(cell, wm, trs=734.5, queue_control=7.4375)
     assert row["scenario_id"] == "i512_o128_c8"
     assert row["scenario_family"] == "i512_o128"
     assert row["prompt_tokens_total"] == 4096.0
     assert row["generation_tokens_total"] == 1024.0
+    assert row["avg_waiting"] == 1.5
+    assert row["avg_running"] == 3.0
+    assert row["avg_swapping"] == 0.5
+    assert row["queue_control"] == 7.4375
     assert row["p95_ttft"] == 480.0
     assert row["p95_tpot"] == 55.0
+    assert row["p95_e2e"] == 9000.0
     assert row["trs"] == 734.5
     assert set(row.keys()) == set(r3_grid.CSV_COLUMNS)
 
@@ -42,10 +52,11 @@ def test_write_csv_roundtrip(tmp_path: Path) -> None:
     cell = r3_grid.GridCell(128, 128, 1)
     wm = _FakeWindow(0, 60000, 1.0, 2.0, 3.0, 4.0)
     out = tmp_path / "grid.csv"
-    r3_grid.write_csv([r3_grid.window_row(cell, wm, 10.0)], out)
+    r3_grid.write_csv([r3_grid.window_row(cell, wm, 10.0, queue_control=1.0)], out)
     reader = list(csv.DictReader(out.open()))
     assert reader[0]["scenario_id"] == "i128_o128_c1"
     assert reader[0]["trs"] == "10.0"
+    assert reader[0]["queue_control"] == "1.0"
 
 
 def test_compute_window_trs_uses_time_constant_ema() -> None:
@@ -68,13 +79,16 @@ def test_compute_window_trs_uses_time_constant_ema() -> None:
         )
 
     windows = [win(200.0, 2.0, 30000), win(400.0, 2.0, 60000)]  # raw TRS 100 then 200
-    vals = r3_grid.compute_window_trs(windows, spec)
+    results = r3_grid.compute_window_results(windows, spec)
+    vals = [r.TRS for r in results]
     assert vals[0] == 100.0  # first window seeds from raw
     decay = math.exp(-30000 / 20000)  # dt=30000 (tumbling), tau=20000
     expected = decay * 100.0 + (1 - decay) * 200.0
     assert abs(vals[1] - expected) < 1e-6
     assert abs(vals[1] - 200.0) > 1.0  # not raw
     assert abs(vals[1] - 150.0) > 1.0  # not the old fixed-alpha(0.5) value
+    # Q_ctl is exposed for the queue_control CSV column (S2/S3): running=2, waiting=0 -> 2.0
+    assert results[0].Q_ctl == 2.0
 
 
 def test_checkpoint_resume(tmp_path: Path) -> None:

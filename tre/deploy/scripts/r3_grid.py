@@ -49,7 +49,7 @@ def enumerate_cells(
     return cells
 
 
-def compute_window_trs(windows: list, spec) -> list[float]:
+def compute_window_results(windows: list, spec) -> list:
     """EMA'd TRS series over a sequence of windows, using the SAME shared time-constant
     EMA the live controller uses (ema_tau_ms + window_end_ms deltas, ADR-0011), so theta
     is fit on the signal the controller actually sees (S1.4). One TRSComputer across the
@@ -65,17 +65,20 @@ def compute_window_trs(windows: list, spec) -> list[float]:
     from tre_controller.signals.trs import TRSComputer, TRSInput
 
     computer = TRSComputer(ema_alpha=spec.trs.ema_alpha, ema_tau_ms=spec.trs.ema_tau_ms)
-    values: list[float] = []
+    results = []
     for wm in windows:
         inp = TRSInput.from_metrics(wm, spec.trs)
-        result = computer.compute(inp, theta_m=spec.trs.theta_m, window_end_ms=wm.window_end_ms)
-        values.append(result.TRS)
-    return values
+        results.append(computer.compute(inp, theta_m=spec.trs.theta_m, window_end_ms=wm.window_end_ms))
+    return results
 
 
-def window_row(cell: GridCell, window_metrics, trs: float) -> dict:
+def window_row(cell: GridCell, window_metrics, trs: float, queue_control: float) -> dict:
     """Assemble one calibration CSV row from an aggregated window + its trs.
     Pure: window_metrics is a ModelWindowMetrics-like object.
+
+    Includes the queue observables S2 (grid_search w_p/lambda/qmin) and S3 (qsat fit)
+    need — avg_waiting/running/swapping + queue_control (Q_ctl) + p95_e2e — so those
+    refits are recoverable from the R3 CSV without a re-run (B2).
     """
     return {
         "scenario_id": cell.scenario_id,
@@ -87,8 +90,13 @@ def window_row(cell: GridCell, window_metrics, trs: float) -> dict:
         "window_end_ms": window_metrics.window_end_ms,
         "prompt_tokens_total": window_metrics.prompt_tokens,
         "generation_tokens_total": window_metrics.generation_tokens,
+        "avg_waiting": window_metrics.avg_waiting,
+        "avg_running": window_metrics.avg_running,
+        "avg_swapping": window_metrics.avg_swapping,
+        "queue_control": queue_control,
         "p95_ttft": window_metrics.ttft_p95_ms,
         "p95_tpot": window_metrics.tpot_p95_ms,
+        "p95_e2e": window_metrics.e2e_p95_ms,
         "trs": trs,
     }
 
@@ -96,7 +104,8 @@ def window_row(cell: GridCell, window_metrics, trs: float) -> dict:
 CSV_COLUMNS = [
     "scenario_id", "scenario_family", "input_tokens", "output_tokens", "concurrency",
     "window_start_ms", "window_end_ms", "prompt_tokens_total", "generation_tokens_total",
-    "p95_ttft", "p95_tpot", "trs",
+    "avg_waiting", "avg_running", "avg_swapping", "queue_control",
+    "p95_ttft", "p95_tpot", "p95_e2e", "trs",
 ]
 
 
@@ -180,6 +189,7 @@ def main() -> int:
     ap.add_argument("--metrics-schema", default="v1")
     ap.add_argument("--instant-sample-ms", type=int, default=5000)
     ap.add_argument("--percentile-mode", default="bucket_upper")
+    ap.add_argument("--min-latency-samples", type=int, default=10)  # align with live TRE_MIN_LATENCY_SAMPLES
     ap.add_argument("--registry", default=None)
     ap.add_argument("--only-first-cell", action="store_true")
     args = ap.parse_args()
@@ -208,6 +218,7 @@ def main() -> int:
         instant_sample_interval_ms=args.instant_sample_ms,
         percentile_mode=args.percentile_mode,
         schema=args.metrics_schema,
+        min_latency_samples=args.min_latency_samples,  # align p95 with the live N1 guard
     )
 
     rows: list[dict] = []
@@ -220,9 +231,9 @@ def main() -> int:
         while w + args.window_ms <= end_ms:
             windows.append(store.read_model_window(args.model, w, w + args.window_ms))
             w += args.window_ms
-        trs_values = compute_window_trs(windows, spec)  # shared time-constant EMA (S1.4)
-        for wm, trs in zip(windows, trs_values):
-            rows.append(window_row(cell, wm, trs))
+        results = compute_window_results(windows, spec)  # shared time-constant EMA (S1.4)
+        for wm, result in zip(windows, results):
+            rows.append(window_row(cell, wm, result.TRS, result.Q_ctl))
         cell_windows = len(windows)
         ckpt.mark(cell)
         write_csv(rows, out)
