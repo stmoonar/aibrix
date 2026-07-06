@@ -11,18 +11,23 @@ Captured: 2026-07-06 (F4.0). Source commit for tre-v2 images: see per-image note
 | Component | Image tag | Image ID (sha256) | Source |
 |---|---|---|---|
 | service-manager | `tre-v2-service-manager:20260706-a1d21c00` | `` | commit `f6dce214` (route guard) |
-| controller | `tre-v2-controller:20260705-d795a715` | `6b722a12a4aadb01dd3b485d5d537196deb337c0d4ebd7d63b54269b5eb118d3` | commit `d795a715` (inflight fix) |
+| controller | `tre-v2-controller:20260706-446ce73a` | `617607e8fbd26d14f11a2bc05c2cc5577001723e3789dfeb5b7f7fdb40a3bd4b` | commit `446ce73a` (S1 signal freshness: sliding window, 5s refresh, time-constant EMA, N1/N2) |
 | ui | `tre-v2-ui:20260704-669f0381` | `e81b68295f31103c22a24b51f1645e21e4d927b58e11f7127388628110ff06bc` | commit `669f0381` |
 | redis | `redis:7.2-alpine` | `dfa18828cbc07b3ae6a95ec7343f6c214fdee2d836197b4be8e9904420762cd8` | upstream |
 | vllm (model pods + gpu-truth DaemonSet) | `vllm/vllm-openai:0.10.1-sleep` | `6a3a5efad7779b594bf82dbda62c47efa789786a38963acb869142d9d8406492` | upstream (sleep-mode build) |
 | tre-gateway-plugins (ADR-0008 isolated metrics scraper) | `aibrix/gateway-plugins:20260704-0d869b49-nozmq2` | `050845eaeca2beaa1e1357fefe0b0339d0f274ae5fd38a31b2f5c83ccafaf634` | TRE-patched gateway-plugins build (dual redis schema) |
 
-## Rebuild note (F4.3)
+## Rebuild note (F4.3) — RESOLVED 2026-07-06
 
-The `controller` image above (`d795a715`) predates the F4.0 code change that wires
-`TRE_HIST_BASELINE_LOOKBACK_MS` through `ControllerConfig`. The mismatch is benign
-at runtime (an image that does not read the env falls back to the same 90s default),
-but before the F4.3 clean deploy the controller image MUST be rebuilt from the
-post-F4.0 HEAD and this table + `deploy/overlays/tre-v2/controller.yaml` updated to
-the new tag/digest. The service-manager (`f6dce214`) and ui images are unchanged by
-F4.0 and remain valid.
+The controller image was rebuilt from post-S1 HEAD `446ce73a` (tag
+`tre-v2-controller:20260706-446ce73a`, digest `617607e8…`), superseding the stale
+`d795a715` build. It now carries the full F1/F2 read-side fixes **and** the S1
+signal-freshness changes (sliding window, 5s refresh decoupled from monitor_interval,
+wall-clock time-constant EMA / ADR-0011, N1 min-latency-sample guard, N2 window
+invariant guard). `deploy/overlays/tre-v2/controller.yaml`, the images.lock table
+above, and `deploy/tests/test_kustomize_overlays.py` are all updated to this tag.
+service-manager (`a1d21c00`) and ui images are unchanged and remain valid.
+
+> S1.2 real-machine W-freeze: this image is what the S1.2 acceptance (freeze the
+> 30s window, lag P95 ≤ 35s) must run — either on the current cluster or, per D11,
+> folded into the F4.3 clean redeploy immediately before R3 (S1.4's hard gate).
