@@ -85,6 +85,11 @@ class ControllerConfig:
         if metrics_window_mode not in WINDOW_MODES:
             raise ValueError(f"TRE_METRICS_WINDOW_MODE must be one of {sorted(WINDOW_MODES)}")
 
+        try:
+            signal_warmup_ms = int(str(values.get("TRE_SIGNAL_WARMUP_MS", "-1")).strip())
+        except (TypeError, ValueError) as exc:
+            raise ValueError("TRE_SIGNAL_WARMUP_MS must be an integer (-1 auto, 0 off, >0 ms)") from exc
+
         redis_url = _get_str(values, "TRE_REDIS_URL", "redis://aibrix-redis-master:6379/0")
 
         safescale = SafeScaleConfig(
@@ -152,7 +157,7 @@ class ControllerConfig:
             signal_source=signal_source,
             # F-onset warmup guard: -1 auto (window fully inside traffic period),
             # 0 disabled (A/B ablation), >0 explicit span-since-onset in ms.
-            signal_warmup_ms=int(str(values.get("TRE_SIGNAL_WARMUP_MS", "-1")).strip()),
+            signal_warmup_ms=signal_warmup_ms,
             paper_stale_max_windows=_get_positive_int(values, "TRE_PAPER_STALE_MAX_WINDOWS", 3),
             incomplete_policy=incomplete_policy,
             enable_tre_scaling=_get_bool(values, "ENABLE_TRE_SCALING", True),

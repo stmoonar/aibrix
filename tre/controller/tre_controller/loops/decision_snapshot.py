@@ -49,15 +49,18 @@ class DecisionSnapshotWriter:
         _LOGGER.info(json.dumps({"event": "trs_calc_result", **payload}, separators=(",", ":")))
 
     def _append_history(self, snapshot: MetricsSnapshot, result: LoopTickResult) -> None:
-        # S5.1: per-model decision time-series. Scored by window_end_ms so rescue and
-        # fairness reads of the same window collapse to one point (member is window-derived).
+        # S5.1: per-model decision time-series, scored by window_end_ms. rescue and fairness
+        # both write per tick; on the same window they usually collapse to one member, but a
+        # scale action or stale-hold divergence between the two loops can leave two members at
+        # the same score (review F3) -> readers dedup by window_end_ms. Trimmed to ~24h + TTL.
         states = _model_states(result.model_contexts, getattr(result, "classifications", {}), snapshot)
         for model, state in states.items():
+            score = state.get("window_end_ms") or snapshot.ts_ms
             member = json.dumps({"ts": snapshot.ts_ms, "model": model, **state}, sort_keys=True, separators=(",", ":"))
             key = decision_hist_key(model)
             try:
-                self._redis.zadd(key, {member: float(snapshot.ts_ms)})
-                self._redis.zremrangebyscore(key, "-inf", snapshot.ts_ms - DECISION_HIST_RETENTION_MS)
+                self._redis.zadd(key, {member: float(score)})
+                self._redis.zremrangebyscore(key, "-inf", int(score) - DECISION_HIST_RETENTION_MS)
                 self._redis.expire(key, DECISION_HIST_TTL_SECONDS)
             except Exception as exc:  # noqa: BLE001 - history is best-effort, never blocks decisions.
                 _LOGGER.warning("decision_hist_write_failed:%s: %s", model, exc)

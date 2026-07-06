@@ -31,6 +31,16 @@ def test_window_violations_flags_high_p95() -> None:
     assert any(w["violated"] for w in wins)
 
 
+def test_compute_v_sys_none_when_nothing_scored() -> None:
+    # F7: a too-short run (no full window) must not read as "perfect" -> None, not 0.0.
+    v = compute_v_sys([], ttft_slo_ms=500, tpot_slo_ms=75, e2e_slo_ms=12000)
+    assert v["violation_time_frac"] is None and v["violation_request_frac"] is None
+    recs = [_rec(i * 100, 50.0, 200.0, 10) for i in range(3)]  # 3 requests, < one 30s window
+    v2 = compute_v_sys(recs, ttft_slo_ms=500, tpot_slo_ms=75, e2e_slo_ms=12000)
+    assert v2["n_windows_scored"] == 0 and v2["violation_time_frac"] is None
+    assert v2["violation_request_frac"] == 0.0  # requests present -> request fraction is real
+
+
 def test_oracle_normalized_score() -> None:
     assert oracle_normalized_score(0.5, 0.1, 0.0) == 0.8  # (0.5-0.1)/(0.5-0)
     assert oracle_normalized_score(0.5, 0.5, 0.0) == 0.0  # no better than static

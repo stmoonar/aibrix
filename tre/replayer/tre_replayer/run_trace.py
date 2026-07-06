@@ -37,15 +37,21 @@ def run_trace(
     dry_run: bool = False,
     window_ms: int = 30_000,
     step_ms: int = 5_000,
+    max_in_flight: int = 512,
     sleep: Any = None,
 ) -> dict[str, Any]:
     from tre_common.registry import load_registry
 
     segments = load_trace_segments(trace_path)
     schedule = build_poisson_schedule(segments, seed=seed)
-    sender = StreamingHttpSender(gateway_url, stream_call=_dry_stream_call if dry_run else None)
+    sender = StreamingHttpSender(
+        gateway_url, stream_call=_dry_stream_call if dry_run else None, max_in_flight=max_in_flight
+    )
     dispatch_kwargs = {"sleep": sleep} if sleep is not None else {}
-    report = asyncio.run(dispatch_open_loop(schedule, sender, **dispatch_kwargs))
+    try:
+        report = asyncio.run(dispatch_open_loop(schedule, sender, **dispatch_kwargs))
+    finally:
+        sender.close()
     if out_path:
         sender.write_jsonl(out_path)
 
@@ -72,6 +78,7 @@ def run_trace(
         "requests": len(sender.records),
         "schedule_p99_delay_ms": round(report.p99_delay_ms, 2),
         "schedule_rps_error": round(report.actual_rps_error_ratio, 4),
+        "max_pool_wait_ms": round(sender.max_pool_wait_ms(), 2),  # F5: high -> sender pool starved
         "per_model": per_model,
     }
 
@@ -86,10 +93,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--window-ms", type=int, default=30_000)
     ap.add_argument("--step-ms", type=int, default=5_000)
+    ap.add_argument("--max-in-flight", type=int, default=512)  # sender thread pool (F5)
     args = ap.parse_args(argv)
     summary = run_trace(
         args.trace, gateway_url=args.gateway_url, out_path=args.out, registry_path=args.registry,
         seed=args.seed, dry_run=args.dry_run, window_ms=args.window_ms, step_ms=args.step_ms,
+        max_in_flight=args.max_in_flight,
     )
     print(json.dumps(summary, indent=2))
     return 0

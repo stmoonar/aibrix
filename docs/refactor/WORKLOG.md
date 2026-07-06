@@ -2323,3 +2323,43 @@ it directly. make check 338. Unblocks R2/R4/R5.
 - Tests: 3 http_sender + 5 scoring + 1 run_trace dry-run.
 - OUT OF SCOPE (deferred): gen_traces.py (the 7 real trace.json from R3 capacity surfaces) — needs R3
   data; run_trace replays any trace.json meanwhile.
+
+### Architect review (Fable5) of the session batch + fixes applied (2026-07-06)
+
+Verdict: batch sound to proceed to controller rebuild -> W-freeze -> R3; 1 BLOCKER gated R2 (not R3),
+now fixed. make check 340. Fixes applied this pass:
+- **F1 (SHOULD-FIX, controller)**: tick.py no longer resets the traffic-onset cursor on tokens-MISSING
+  (scrape gap) — only genuine idle (tokens present, Y<=1e-9) resets. Prevents re-suppressing a real
+  CRITICAL for a window after every metrics hiccup (was biasing against TRE). +regression test
+  (tokens-missing holds onset; idle resets).
+- **F3 (SHOULD-FIX, controller)**: decision_snapshot hist now scored by window_end_ms; comment corrected
+  (rescue+fairness may leave 2 members/window on divergence -> readers dedup by window_end_ms).
+- **config NIT**: TRE_SIGNAL_WARMUP_MS parsed with a clear ValueError instead of crashing startup.
+- **F5 (BLOCKER, replayer)**: StreamingHttpSender used asyncio.to_thread (default executor ~32) ->
+  "open-loop" silently degraded to closed-loop-32 under saturation, under-driving the system and
+  invalidating R2 load levels. Now a dedicated ThreadPoolExecutor(max_in_flight, default 512) +
+  pool_wait_ms per-request gauge + run_trace reports max_pool_wait_ms (high => pool starved). --max-in-flight
+  CLI. Live smoke: max_pool_wait_ms 0.7ms.
+- **F7 (replayer)**: compute_v_sys returns None (not 0.0) for violation_time_frac when no windows scored,
+  and None request_frac when no requests -> a too-short run no longer reads as "perfect". +test.
+- **F6 ruling (replayer, doc)**: tpot = per-request mean ITL, p95 across requests (standard serving-bench
+  def; fair across systems); documented that it differs from R3's vLLM histogram tpot_p95 (calibration
+  input, not the reported SLO). Paper must state the single SLO definition.
+- **UI NITs**: op_target clamps wake_replicas to [0, max_replicas]; _decode_decision guards ts_ms.
+- NIT: replayer JSONL scheduled_ts_ms renamed scheduled_offset_ms (monotonic offset, NOT epoch) so the
+  S4 reuse of this log can't mis-correlate with controller epoch timestamps.
+
+TRACKED (architect-flagged, before their milestones):
+- **F4 (before R3 grid runs)**: S4 rewindow_from_raw can rebuild the TRS NUMERATOR (tokens) from the
+  per-request JSONL but NOT the denominator Q_ctl — avg_waiting/running/swapping are server gauges absent
+  from the log, and Redis inst samples (tre:v2:inst:*) retain only ~30min (RETENTION_MS). Before the ~10h
+  grid: either dump tre:v2:inst:* continuously (5s poll) during the grid, or accept tumbling-only Q_ctl.
+- **F2 (-> N3)**: warmup guard only covers ramp-from-zero; a sustained low-nonzero-rate segment stays
+  qmin-clamped CRITICAL-and-warm -> over-scale. Constrains R2 trace design (no long low-rate segments)
+  until theta/tau re-centered at R3. Already in ADR-0013.
+- Controller image still pinned pre-S5.1 (6fd540e6); rebuild from HEAD (folds F1/F3 + S5.1/B1) before any
+  long run -> next step. B1's residual (inflight freed on a true 300s timeout) + serial drain head-of-line
+  blocking noted; reconcile-before-replan is a tracked follow-up.
+
+VERIFIED clean (no change needed): F-onset accounting/golden parity, B1 path coverage, B2 columns (Q_ctl +
+raw gauges so S2 can recompute), TTFT/SSE + usage capture, oracle_normalized_score, UI safety/no-CDN.

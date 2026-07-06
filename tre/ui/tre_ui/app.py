@@ -49,6 +49,7 @@ def create_ui_app(
 ) -> FastAPI:
     app = FastAPI(title="TRE Console")
     model_names = [m.name for m in registry.models()]
+    model_max = {m.name: m.max_replicas for m in registry.models()}
 
     @app.get("/", response_class=HTMLResponse)
     def index() -> str:
@@ -102,8 +103,9 @@ def create_ui_app(
     @app.post("/api/ops/models/{model}/target")
     def op_target(model: str, body: _TargetBody) -> dict[str, Any]:
         _require_model(model, model_names)
-        _AUDIT.info(json.dumps({"op": "target", "model": model, "wake_replicas": body.wake_replicas}))
-        return _proxy(service_manager_client, "PUT", f"/v2/models/{model}/target", {"wake_replicas": body.wake_replicas})
+        target = max(0, min(int(body.wake_replicas), model_max.get(model, int(body.wake_replicas))))
+        _AUDIT.info(json.dumps({"op": "target", "model": model, "wake_replicas": target}))
+        return _proxy(service_manager_client, "PUT", f"/v2/models/{model}/target", {"wake_replicas": target})
 
     @app.post("/api/ops/models/{model}/routable")
     def op_routable(model: str, body: _RoutableBody) -> dict[str, Any]:
@@ -178,8 +180,9 @@ def _decode_decision(raw: dict[Any, Any]) -> dict[str, Any]:
     hashmap = {_to_text(k): _to_text(v) for k, v in raw.items()}
     if not hashmap:
         return {"ts_ms": None, "loop": None, "model_states": {}, "actions": [], "events": []}
+    ts_raw = hashmap.get("ts_ms", "")
     return {
-        "ts_ms": int(hashmap["ts_ms"]) if "ts_ms" in hashmap else None,
+        "ts_ms": int(ts_raw) if ts_raw.lstrip("-").isdigit() else None,
         "loop": hashmap.get("loop"),
         "stale": hashmap.get("stale") == "true",
         "submitted": int(hashmap["submitted"]) if hashmap.get("submitted", "").isdigit() else 0,

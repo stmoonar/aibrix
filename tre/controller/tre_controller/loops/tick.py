@@ -287,14 +287,12 @@ def _model_contexts(
                 "signal_warm": signal_warm,
             }
         else:
-            if signal_state is not None:
-                # no tokens this window -> idle -> reset the traffic-onset cursor.
-                signal_state.observe_traffic(
-                    model_name,
-                    has_traffic=False,
-                    window_start_ms=metrics.window_start_ms,
-                    window_end_ms=metrics.window_end_ms,
-                )
+            # tokens_available=False means the metrics are MISSING (scrape gap / stale store),
+            # not that the model is idle (a live idle pod reports zero-delta tokens, which is the
+            # tokens branch above with Y_m<=1e-9). Do NOT touch the traffic-onset cursor here:
+            # resetting on a transient scrape hiccup would re-suppress a genuinely-CRITICAL model
+            # for a full window after metrics recover (review F1). Hold the cursor.
+            pass
             context = {
                 "trs": 0.0,
                 "z_m": None,

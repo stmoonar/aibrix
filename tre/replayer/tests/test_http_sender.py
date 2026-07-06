@@ -21,8 +21,10 @@ def test_sender_records_streamed_result_and_delay() -> None:
 
     sender = StreamingHttpSender("http://gw/v1/completions", stream_call=fake, now_ms=lambda: 1000)
     asyncio.run(sender(_req(), scheduled_ts=10.0, actual_ts=10.05))
+    sender.close()
 
     rec = sender.records[0]
+    assert "pool_wait_ms" in rec  # F5 starvation gauge
     assert rec["ttft_ms"] == 90.0 and rec["e2e_ms"] == 300.0
     assert rec["completion_tokens"] == 64 and rec["http_status"] == 200 and rec["error"] is None
     assert rec["actual_send_ts_ms"] == 1000
@@ -34,6 +36,7 @@ def test_sender_records_streamed_result_and_delay() -> None:
 def test_sender_records_error_status() -> None:
     sender = StreamingHttpSender("http://gw", stream_call=lambda *a: StreamResult(500, None, 12.0, error="HTTP 500"))
     asyncio.run(sender(_req(), 0.0, 0.0))
+    sender.close()
     assert sender.records[0]["http_status"] == 500 and sender.records[0]["error"] == "HTTP 500"
     assert sender.records[0]["ttft_ms"] is None
 
@@ -41,6 +44,7 @@ def test_sender_records_error_status() -> None:
 def test_sender_write_jsonl(tmp_path) -> None:
     sender = StreamingHttpSender("http://gw", stream_call=lambda *a: StreamResult(200, 10.0, 20.0, 1, 1))
     asyncio.run(sender(_req(), 0.0, 0.0))
+    sender.close()
     path = tmp_path / "raw.jsonl"
     n = sender.write_jsonl(str(path))
     assert n == 1

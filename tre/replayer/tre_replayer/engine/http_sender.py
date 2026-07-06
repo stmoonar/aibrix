@@ -12,7 +12,8 @@ from __future__ import annotations
 
 import json
 import time
-from dataclasses import dataclass, field
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from typing import Any, Callable
 
 from tre_replayer.engine.schedule import ScheduledRequest
@@ -47,23 +48,40 @@ class StreamingHttpSender:
         stream_call: StreamCall | None = None,
         input_tokens_default: int = 64,
         output_tokens_default: int = 128,
+        max_in_flight: int = 512,
         now_ms: Callable[[], int] = _now_ms,
+        mono: Callable[[], float] = time.monotonic,
     ) -> None:
         self._url = gateway_url
         self._call = stream_call or _default_stream_call
         self._in = input_tokens_default
         self._out = output_tokens_default
         self._now = now_ms
+        self._mono = mono
+        # F5: each streamed request blocks a worker for its whole e2e. asyncio.to_thread's
+        # default executor is capped at ~32, which would silently turn the open-loop replay
+        # into a closed-loop-32 and under-drive the system under saturation. Use a dedicated
+        # pool sized for the peak in-flight, and record pool_wait_ms so starvation is visible.
+        self._executor = ThreadPoolExecutor(max_workers=max(1, max_in_flight), thread_name_prefix="trepl-send")
         self.records: list[dict[str, Any]] = []
 
     async def __call__(self, request: ScheduledRequest, scheduled_ts: float, actual_ts: float) -> None:
-        # dispatch_open_loop awaits us; keep the (blocking) network call off the event loop.
         import asyncio
 
-        record = await asyncio.to_thread(self._send_one, request, scheduled_ts, actual_ts)
+        loop = asyncio.get_event_loop()
+        record = await loop.run_in_executor(self._executor, self._send_one, request, scheduled_ts, actual_ts)
         self.records.append(record)
 
+    def close(self) -> None:
+        self._executor.shutdown(wait=True)
+
+    def max_pool_wait_ms(self) -> float:
+        return max((r.get("pool_wait_ms", 0.0) for r in self.records), default=0.0)
+
     def _send_one(self, request: ScheduledRequest, scheduled_ts: float, actual_ts: float) -> dict[str, Any]:
+        # time from the dispatcher scheduling this send to a worker actually picking it up;
+        # a large p99 here means the pool starved and the replay under-drove the target (F5).
+        pool_wait_ms = max(0.0, (self._mono() - actual_ts) * 1000.0)
         out_tokens = request.max_output_tokens or self._out
         in_tokens = request.prompt_tokens or self._in
         prompt = request.prompt or " ".join(["token"] * max(1, in_tokens))
@@ -84,9 +102,10 @@ class StreamingHttpSender:
         return {
             "request_id": request.request_id,
             "model": request.model,
-            "scheduled_ts_ms": int(scheduled_ts * 1000),
+            "scheduled_offset_ms": int(scheduled_ts * 1000),  # dispatcher monotonic clock, NOT epoch
             "actual_send_ts_ms": send_ts_ms,
             "schedule_delay_ms": max(0.0, (actual_ts - scheduled_ts) * 1000.0),
+            "pool_wait_ms": round(pool_wait_ms, 3),
             "ttft_ms": res.first_token_ms,
             "e2e_ms": res.done_ms,
             "input_tokens": in_tokens,

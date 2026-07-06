@@ -78,6 +78,33 @@ def _snapshot(*, window_end_ms: int, generation: float, running: float) -> Metri
     return MetricsSnapshot(ts_ms=window_end_ms, models={"m": metrics}, stale=False)
 
 
+def _snapshot_tokens_missing(*, window_end_ms: int) -> MetricsSnapshot:
+    metrics = ModelWindowMetrics(
+        model="m", window_start_ms=window_end_ms - 30_000, window_end_ms=window_end_ms,
+        prompt_tokens=None, generation_tokens=None, avg_waiting=0.0, avg_running=1.0, avg_swapping=0.0,
+        kv_cache_hit_rate=0.0, ttft_p95_ms=None, tpot_p95_ms=None, e2e_p95_ms=None,
+        routable_pods=1, assigned_replicas=1, per_pod={},
+    )
+    return MetricsSnapshot(ts_ms=window_end_ms, models={"m": metrics}, stale=False)
+
+
+def test_tokens_missing_holds_traffic_onset_cursor() -> None:
+    # F1: a metrics scrape gap (tokens missing) must NOT reset the traffic-onset cursor,
+    # else a genuinely-loaded model is re-suppressed for a full window after metrics recover.
+    from tre_controller.loops.tick import _model_contexts
+
+    state = SignalState(warmup_ms=-1)
+    registry = _registry(20_000)
+    _model_contexts(_snapshot(window_end_ms=60_000, generation=200.0, running=2.0), registry, signal_state=state)
+    assert state._onset_ms["m"] == 60_000
+    # scrape gap: tokens missing -> onset held (not reset)
+    _model_contexts(_snapshot_tokens_missing(window_end_ms=65_000), registry, signal_state=state)
+    assert state._onset_ms["m"] == 60_000
+    # genuine idle (tokens present, zero) DOES reset
+    _model_contexts(_snapshot(window_end_ms=70_000, generation=0.0, running=0.0), registry, signal_state=state)
+    assert state._onset_ms["m"] is None
+
+
 def test_shared_signal_state_persists_ema_across_ticks() -> None:
     registry = _registry(20_000)
     state = SignalState()

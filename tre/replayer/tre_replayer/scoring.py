@@ -3,6 +3,15 @@
 Pure functions over the per-request JSONL the StreamingHttpSender produces. Reports SLO
 violation as both a time fraction (fraction of windows in violation) and a request fraction,
 and the paper's oracle-normalized score (V_static - V_sys) / (V_static - V_oracle).
+
+TPOT DEFINITION (review F6, ruling): here tpot is the per-request MEAN inter-token latency
+(e2e - ttft) / (completion_tokens - 1), and its p95 is taken ACROSS requests. This is the
+standard serving-benchmark definition and is used identically for every system under test, so
+TRE-vs-baseline comparisons are fair. Note it is NOT the same statistic as the controller/R3
+`tpot_p95` column, which is vLLM's per-token-gap histogram p95 (metrics_store). Both are compared
+to the same registry SLO (75ms); p95-of-per-request-means <= p95-of-per-token-gaps, so this scorer
+is the more lenient of the two. The paper must state this single SLO definition; R3's histogram
+`tpot_p95` is a calibration input, not the reported SLO metric.
 """
 from __future__ import annotations
 
@@ -95,10 +104,12 @@ def compute_v_sys(
         window_ms=window_ms, step_ms=step_ms, min_samples=min_samples,
     )
     scored = [w for w in windows if w["n_requests"] >= min_samples]
-    time_frac = (sum(1 for w in scored if w["violated"]) / len(scored)) if scored else 0.0
+    # F7: None (not 0.0) when nothing was scored -> a too-short / too-sparse run must not read
+    # as "perfect". Callers/aggregators must handle None explicitly.
+    time_frac = (sum(1 for w in scored if w["violated"]) / len(scored)) if scored else None
     return {
         "violation_time_frac": time_frac,
-        "violation_request_frac": (req_viol / n_req) if n_req else 0.0,
+        "violation_request_frac": (req_viol / n_req) if n_req else None,
         "n_requests": n_req,
         "n_windows_scored": len(scored),
     }
