@@ -1,0 +1,88 @@
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  annotations:
+    kubectl.kubernetes.io/last-applied-configuration: |
+      {"apiVersion":"gateway.networking.k8s.io/v1","kind":"HTTPRoute","metadata":{"annotations":{},"labels":{"model.aibrix.ai/name":"dsqwen-14b","tre.aibrix.io/managed":"true"},"name":"dsqwen-14b-router","namespace":"tre-v2"},"spec":{"parentRefs":[{"group":"gateway.networking.k8s.io","kind":"Gateway","name":"tre-aibrix-eg","namespace":"tre-v2"}],"rules":[{"backendRefs":[{"group":"","kind":"Service","name":"dsqwen-14b","namespace":"default","port":8000,"weight":1}],"matches":[{"headers":[{"name":"model","type":"Exact","value":"dsqwen-14b"}],"path":{"type":"PathPrefix","value":"/v1/completions"}},{"headers":[{"name":"model","type":"Exact","value":"dsqwen-14b"}],"path":{"type":"PathPrefix","value":"/v1/chat/completions"}},{"headers":[{"name":"model","type":"Exact","value":"dsqwen-14b"}],"path":{"type":"PathPrefix","value":"/v1/embeddings"}},{"headers":[{"name":"model","type":"Exact","value":"dsqwen-14b"}],"path":{"type":"PathPrefix","value":"/generate"}},{"headers":[{"name":"model","type":"Exact","value":"dsqwen-14b"}],"path":{"type":"PathPrefix","value":"/generatevideo"}}],"timeouts":{"request":"600s"}}]}}
+  creationTimestamp: "2026-07-06T02:38:09Z"
+  generation: 1
+  labels:
+    model.aibrix.ai/name: dsqwen-14b
+    tre.aibrix.io/managed: "true"
+  name: dsqwen-14b-router
+  namespace: tre-v2
+  resourceVersion: "193159241"
+  uid: ecdac7f3-f79a-4eb1-8787-3248d654a77b
+spec:
+  parentRefs:
+  - group: gateway.networking.k8s.io
+    kind: Gateway
+    name: tre-aibrix-eg
+    namespace: tre-v2
+  rules:
+  - backendRefs:
+    - group: ""
+      kind: Service
+      name: dsqwen-14b
+      namespace: default
+      port: 8000
+      weight: 1
+    matches:
+    - headers:
+      - name: model
+        type: Exact
+        value: dsqwen-14b
+      path:
+        type: PathPrefix
+        value: /v1/completions
+    - headers:
+      - name: model
+        type: Exact
+        value: dsqwen-14b
+      path:
+        type: PathPrefix
+        value: /v1/chat/completions
+    - headers:
+      - name: model
+        type: Exact
+        value: dsqwen-14b
+      path:
+        type: PathPrefix
+        value: /v1/embeddings
+    - headers:
+      - name: model
+        type: Exact
+        value: dsqwen-14b
+      path:
+        type: PathPrefix
+        value: /generate
+    - headers:
+      - name: model
+        type: Exact
+        value: dsqwen-14b
+      path:
+        type: PathPrefix
+        value: /generatevideo
+    timeouts:
+      request: 600s
+status:
+  parents:
+  - conditions:
+    - lastTransitionTime: "2026-07-06T02:40:38Z"
+      message: Route is accepted
+      observedGeneration: 1
+      reason: Accepted
+      status: "True"
+      type: Accepted
+    - lastTransitionTime: "2026-07-06T02:40:38Z"
+      message: Resolved all the Object references for the Route
+      observedGeneration: 1
+      reason: ResolvedRefs
+      status: "True"
+      type: ResolvedRefs
+    controllerName: gateway.envoyproxy.io/gatewayclass-controller
+    parentRef:
+      group: gateway.networking.k8s.io
+      kind: Gateway
+      name: tre-aibrix-eg
+      namespace: tre-v2

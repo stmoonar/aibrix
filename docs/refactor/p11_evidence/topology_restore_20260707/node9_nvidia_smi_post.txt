@@ -1,0 +1,20 @@
+=== per-gpu ===
+index, memory.used [MiB]
+0, 40286 MiB
+1, 39936 MiB
+2, 4070 MiB
+3, 4070 MiB
+=== compute-apps ===
+gpu_uuid, pid, used_gpu_memory [MiB]
+GPU-689a3e93-68db-0dac-160b-6a791cf246e8, 3616557, 37270 MiB
+GPU-689a3e93-68db-0dac-160b-6a791cf246e8, 3826547, 1766 MiB
+GPU-689a3e93-68db-0dac-160b-6a791cf246e8, 207641, 1090 MiB
+GPU-d0de9f25-c059-d2ee-e7c4-c242bbdc76c7, 3644073, 36956 MiB
+GPU-d0de9f25-c059-d2ee-e7c4-c242bbdc76c7, 3823900, 1054 MiB
+GPU-d0de9f25-c059-d2ee-e7c4-c242bbdc76c7, 3826548, 1766 MiB
+GPU-3a113474-dd92-6d52-d05b-491e7b020ded, 3937867, 1054 MiB
+GPU-3a113474-dd92-6d52-d05b-491e7b020ded, 3960120, 1090 MiB
+GPU-3a113474-dd92-6d52-d05b-491e7b020ded, 620678, 1766 MiB
+GPU-3c2fb581-708a-5fef-3eaa-5c3cc21a028e, 3940139, 1090 MiB
+GPU-3c2fb581-708a-5fef-3eaa-5c3cc21a028e, 3978010, 1054 MiB
+GPU-3c2fb581-708a-5fef-3eaa-5c3cc21a028e, 620679, 1766 MiB

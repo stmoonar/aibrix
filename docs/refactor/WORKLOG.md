@@ -2405,3 +2405,35 @@ Deferred (tracked): tuning-CM env split (loop cadences/ablation) — skipped to 
 test + ablation-overlay entanglement and keep the migration byte-identical; registry CM
 already delivers the R3 recalibration surface. Console P1 (Trace Lab) + P2 (Calibration
 Lab) still pending. Endgame guardrails unchanged: W-freeze before R3, S1/S4 ordering.
+
+### N4b topology restore — rebuild dsqwen-14b node9-gpu-2-3 (12 bindings) — 2026-07-07
+
+Restored the missing 4th dsqwen-14b replica (node9 GPU2-3, TP=2) in place; fleet back to the
+full 12-binding topology (7b×4, 8b×4, 14b×4), each model bound=4 awake=1.
+
+Procedure (D10 human-check + §2.2 rebuild discipline):
+- Paused actuation: SET tre:v2:controller:mode=observe; verified decisions kept publishing
+  (decision:latest ts_ms advanced ~5.9s while paused). Restored to active at the end.
+- D10 headroom (pre): node9 GPU2/GPU3 = 2248 MiB each, only 2 sleeping residues per GPU
+  (7b ~1054 + 8b ~1090 MiB), NO awake binding, every pod ≤1.1GiB → no leak, no unknown PID.
+- Applied committed manifest tre/deploy/models/dsqwen-14b-nscc-ds-4a100-node9-gpu-2-3.yaml
+  (same GPU UUIDs GPU-3a113474…/GPU-3c2fb581…, D7 binding). HTTPRoute dsqwen-14b-router
+  already covers the model by selector — no route change needed.
+- vLLM readiness: k8s Ready at ~10s but vLLM /health only 200 at ~130s (N4b lesson — waited
+  on HTTP, not k8s Ready). Pod came up awake (GPU2/3 → 37994 MiB each).
+- Adopt+sleep via SM正规 path: POST /v2/reconcile (12 bindings, warnings=[]) →
+  PUT /v2/models/dsqwen-14b/target {wake_replicas:1} slept exactly the new pod →
+  is_sleeping:true; GPU2/3 fell to 4070 MiB (3 sleeping residues, new 14b ~1766 MiB/GPU ≤2GiB).
+- POST /v2/reconcile again: 12 bindings, warnings=[] (no sleep_leak).
+
+Acceptance (measured):
+- GET /v2/state v393: 12 bindings; 7b/8b/14b all bound=4 awake=1; no overlapping awake slot.
+- reconcile warnings=[] (before AND after restoring active mode).
+- Gateway smoke (http://10.99.21.145/v1/completions): dsqwen-7b 20/20, dsllama-8b 20/20,
+  dsqwen-14b 20/20.
+- node9 residency explainable: GPU0 40286 / GPU1 39936 (1 awake + sleeping residues),
+  GPU2 4070 / GPU3 4070 (3 sleeping residues each, all ≤2GiB).
+- Restored controller mode=active; no erroneous scaling (stayed 12 bindings under zero traffic).
+
+Evidence: docs/refactor/p11_evidence/topology_restore_20260707/ (state_pre/post.json,
+node9_nvidia_smi_post.txt, smoke.py+smoke_result.txt, reconcile_post.json, backup_*_pre.yaml).
