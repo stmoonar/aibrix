@@ -336,6 +336,17 @@ Fixes required:
 
 ## N4.6 Soak
 
+> **ADR-0009 reorder (2026-07-06)**: N4.6 (expand/shrink) and the soak's
+> scale-cycle criterion are now GATED on R3 refit. A 200s N4.6 pre-flight on the
+> isolated plane showed the inherited theta_m makes idle read CRITICAL -> all
+> models over-provision and never shrink, and exposed an SM routable/is_sleeping
+> desync bug (fixed under ADR-0009). New order: SM fix -> canonical fleet
+> (4 bindings/model) -> R3 refit (real theta) -> N4.6 + scale-cycle soak on real
+> theta -> tag n4b-done. Soak split: Endurance (theta-independent, may run early,
+> not the gate) vs Scale-cycle (theta-dependent, certifies n4b-done). Authoritative
+> run on the isolated tre-aibrix-eg plane. See DECISIONS.md ADR-0008/0009.
+
+
 Status: **BLOCKED for N4b full acceptance; PASS for repaired three-model serving precheck**
 
 Bounded substitute:
