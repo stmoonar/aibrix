@@ -7,6 +7,7 @@ from tre_common.metrics_schema import MetricsSnapshot
 from tre_common.registry import Registry
 from tre_controller.loops.tick import LoopTickResult, PaperStateCache, PlannerQueue, SafeScaleController, run_planner_tick
 from tre_controller.planning.planner import ClusterView, IncompletePolicy
+from tre_controller.signals.trs import SignalState
 
 
 class ClusterViewReader(Protocol):
@@ -36,6 +37,7 @@ def run_rescue_tick(
     safescale: SafeScaleController | None = None,
     paper_state_cache: PaperStateCache | None = None,
     incomplete_policy: IncompletePolicy = "drop_model",
+    signal_state: SignalState | None = None,
 ) -> LoopTickResult:
     return run_planner_tick(
         snapshot,
@@ -49,6 +51,7 @@ def run_rescue_tick(
         safescale=safescale,
         paper_state_cache=paper_state_cache,
         incomplete_policy=incomplete_policy,
+        signal_state=signal_state,
     )
 
 
@@ -64,6 +67,7 @@ async def rescue_task(
     active_probe_models: set[str] | None = None,
     decision_writer: DecisionWriter | None = None,
     safescale: SafeScaleController | None = None,
+    signal_state: SignalState | None = None,
 ) -> None:
     paper_state_cache = PaperStateCache(max_stale_windows=getattr(cfg, "paper_stale_max_windows", 3))
     while True:
@@ -83,6 +87,7 @@ async def rescue_task(
                     safescale=safescale,
                     paper_state_cache=paper_state_cache,
                     incomplete_policy=getattr(cfg, "incomplete_policy", "drop_model"),
+                    signal_state=signal_state,
                 )
             if decision_writer is not None:
                 decision_writer.write("rescue", snapshot, result)

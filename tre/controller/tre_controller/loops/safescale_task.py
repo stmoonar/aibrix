@@ -9,7 +9,7 @@ from tre_common.registry import Registry
 from tre_controller.planning.planner import Action, ScaleAction, UnhideAction
 from tre_controller.planning.safescale import ProbeObservation, SafeScaleCommand, SafeScaleProbe
 from tre_controller.signals.sources import get_signal
-from tre_controller.signals.trs import TRSComputer, TRSInput
+from tre_controller.signals.trs import SignalState, TRSComputer, TRSInput
 
 
 class SnapshotReader(Protocol):
@@ -44,6 +44,7 @@ def run_safescale_observation_tick(
     registry: Registry,
     safescale: SafeScaleObserver,
     signal_source: str = "zm",
+    signal_state: SignalState | None = None,
 ) -> SafeScaleObservationResult:
     if snapshot.stale:
         return SafeScaleObservationResult(submitted=0, events=("snapshot_stale",))
@@ -55,7 +56,9 @@ def run_safescale_observation_tick(
         if metrics is None:
             events.append(f"safescale_observation_missing:{probe.model}")
             continue
-        observation = _observation_from_metrics(snapshot.ts_ms, metrics, registry.model(probe.model), signal_source)
+        observation = _observation_from_metrics(
+            snapshot.ts_ms, metrics, registry.model(probe.model), signal_source, signal_state=signal_state
+        )
         decision = safescale.observe(probe.model, observation, now_ms=snapshot.ts_ms)
         events.append(f"safescale_{decision.reason}:{probe.model}")
         actions.extend(_commands_to_actions(decision.commands))
@@ -73,6 +76,7 @@ async def safescale_task(
     safescale: SafeScaleObserver,
     cfg: SafeScaleTaskConfig,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    signal_state: SignalState | None = None,
 ) -> None:
     while True:
         snapshot = snapshot_box.get()
@@ -83,13 +87,30 @@ async def safescale_task(
                 registry=registry,
                 safescale=safescale,
                 signal_source=getattr(cfg, "signal_source", "zm"),
+                signal_state=signal_state,
             )
         interval = getattr(getattr(cfg, "safescale"), "probe_poll_seconds")
         await sleep(interval)
 
 
-def _observation_from_metrics(ts_ms: int, metrics: ModelWindowMetrics, spec, signal_source: str) -> ProbeObservation:
-    result = TRSComputer(ema_alpha=spec.trs.ema_alpha).compute(TRSInput.from_metrics(metrics, spec.trs), theta_m=spec.trs.theta_m)
+def _observation_from_metrics(
+    ts_ms: int,
+    metrics: ModelWindowMetrics,
+    spec,
+    signal_source: str,
+    signal_state: SignalState | None = None,
+) -> ProbeObservation:
+    if signal_state is not None:
+        computer = signal_state.computer_for(
+            spec.name, ema_alpha=spec.trs.ema_alpha, ema_tau_ms=spec.trs.ema_tau_ms
+        )
+    else:
+        computer = TRSComputer(ema_alpha=spec.trs.ema_alpha, ema_tau_ms=spec.trs.ema_tau_ms)
+    result = computer.compute(
+        TRSInput.from_metrics(metrics, spec.trs),
+        theta_m=spec.trs.theta_m,
+        window_end_ms=metrics.window_end_ms,
+    )
     signal = get_signal(metrics, spec, signal_source, trs_z_m=result.Z_m)
     return ProbeObservation(
         ts_ms=ts_ms,

@@ -17,6 +17,32 @@ This correction is applied after `Y_m / Q_ctl` and is documented in the frozen u
 
 The saturation guard formula is preserved as `Gamma_m = (Y_m(t) - Y_m(t-1)) / (Q_ctl(t) - Q_ctl(t-1))`, with saturation only when `Q_ctl >= qsat` and `abs(Gamma_m) <= epsat` for `Hsat` consecutive windows.
 
+### TRS EMA is a shared, per-model, wall-clock time-constant filter (S1.3 / ADR-0011, 2026-07-06)
+
+Contract: the TRS EMA is **not** a fixed-alpha-per-step filter. It is a wall-clock
+time-constant filter — `decay = exp(-dt_ms / ema_tau_ms)`, `ema = decay*prev + (1-decay)*raw`
+— where `dt_ms` is the delta of the metrics window's `window_end_ms` (data time, not
+scheduler wall-clock). Smoothing strength is set by `ema_tau_ms` alone and is decoupled
+from the refresh cadence, so shortening the window / speeding refresh (S1.2) does not
+change the smoothing. The EMA advances **at most once per distinct `window_end_ms`**
+(a per-window dedup): rescue (5s), fairness (10s), and safescale all read the same shared
+snapshot between metrics refreshes, and a single shared `TRSComputer` per model
+(`SignalState`) must not over-advance on duplicate reads. **One EMA per model** — rescue
+and fairness share it (one window, one theta, one EMA).
+
+Correction to the migration record: prior to S1.3 the live path constructed a fresh
+`TRSComputer` every tick with no EMA restore, so live `TRS == TRS_raw` and `ema_alpha`
+had no live effect (the only smoothing was the 60s tumbling window). See ADR-0011.
+`ema_alpha` is retained only for the offline legacy path (when `ema_tau_ms` is unset and
+no `window_end_ms` is supplied, the fixed-alpha branch is byte-identical to the frozen
+`legacy_trs` golden). EMA state is in-process only (no Redis persistence); on restart it
+re-seeds from raw and reconverges within ~tau.
+
+Still-divergent (recorded, not yet reconciled): `SaturationGuard`/gamma is dead in the
+live control path (tick.py uses the direct `Q_ctl >= qsat` threshold, never the guard);
+and `r3_grid.py`'s `trs` CSV column is within-cell EMA'd while the live signal was raw —
+R3/S1.4 must make r3_grid replicate the live EMA semantics before refitting theta.
+
 ## Planner Migration
 
 The frozen planner had two branches: the newer `paper_state` branch and a legacy raw-TRS fallback. P5 keeps the paper-state path and deliberately drops the legacy raw-TRS fallback required by `REFACTOR_PLAN.md`.

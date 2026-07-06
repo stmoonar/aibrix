@@ -270,3 +270,52 @@ The D7 canary in N4b.3 is mandatory before broad rollout: first prove that a no-
      `deploy_models.sh` still needs a STAGGERED create->wait-ready->sleep path for
      fresh clusters (warned in-script; TODO before any F4.3-style fresh deploy).
 - Reversible: drop the two args from registry.yaml + regenerate to return to 0.9.
+
+## ADR-0011: TRS EMA is a shared, per-model, wall-clock time-constant filter (S1.3)
+
+- Status: **Accepted** (2026-07-06). Architect (Fable5) ruling after the executor
+  found a premise error in `15_signal_and_window_plan.md` §0.
+- **Finding (verified independently on 76)**: the live control path was constructing
+  a *fresh* `TRSComputer` every tick (`loops/tick.py:_model_contexts`,
+  `loops/safescale_task.py:_observation_from_metrics`) and never restoring EMA state
+  (`store/state_store.py` is SafeScale-probes-only; `app.py` only `safescale.restore()`).
+  So `_update_ema` always saw `_trs_ema is None` -> returned raw. **Live `TRS == TRS_raw`
+  every tick; `ema_alpha` (e.g. 0.2485) had zero live effect** — the only production
+  smoothing was the 60s tumbling window itself. Doc 15 §0 ("EMA advances ~every 60s;
+  ema_alpha was tuned for that") was wrong about the live path.
+- **Why it matters**: S1.2 shortens the window and speeds refresh to 5s, which removes
+  the window's implicit smoothing. A real EMA must therefore exist *before* S1.2, or S1.2
+  lands a short, fast, unsmoothed (jittery) signal. The fix is not separable from S1.2 —
+  it is its precondition. (Rejected: B = ship formula only / leave EMA dead; C = keep
+  raw-live by design.)
+- **Decision (Option A-minimal)**:
+  1. `TRSComputer` gains `ema_tau_ms`; `compute(..., window_end_ms=...)`. When tau is set:
+     decay = exp(-dt_ms / tau); ema = decay*prev + (1-decay)*raw, where dt_ms is the delta
+     of window_end_ms (data time, not scheduler wall-clock) so the EMA advances only when
+     the underlying window advances. Smoothing strength is set by tau alone, decoupled
+     from refresh frequency.
+  2. **Per-window dedup (both modes, load-bearing)**: the EMA advances at most once per
+     distinct window_end_ms. rescue(5s)/fairness(10s)/safescale all re-read the same
+     snapshot_box between refreshes; without dedup a shared computer over-advances on
+     duplicate snapshots.
+  3. **One shared TRSComputer per model** (`SignalState`, created once in
+     create_controller_dependencies, threaded through rescue/fairness/safescale). One EMA
+     per model — rescue and fairness share it ("one window, one theta, one EMA").
+  4. **In-process only, no Redis persistence**: on controller restart the EMA re-seeds
+     from raw and reconverges within ~tau. snapshot()/restore() kept unchanged (3 keys) to
+     preserve golden legacy_trs parity; restore() gained an optional last_update_ms.
+  5. ema_tau_ms=20000 (20s) seeded in deploy/registry.yaml as a **starting point** to be
+     frozen during S1.2 real-machine acceptance. ema_alpha retained for the offline legacy
+     path (tau None -> byte-identical fixed-alpha branch).
+- **Consequences / follow-ups**:
+  - 05_paper_vs_impl.md contract updated: TRS EMA is a shared wall-clock-tau filter.
+  - **R3/S1.4 gate strengthened**: r3_grid.py must replicate the live EMA semantics (tau +
+    window_end deltas) when generating refit data, else theta is fit on a signal the
+    controller never sees. (Today r3_grid's trs CSV column is within-cell EMA'd while live
+    was raw — a mismatch to fix at R3.)
+  - **Out of scope, recorded**: SaturationGuard/gamma is also dead in the live path (never
+    instantiated live; tick.py uses the direct Q_ctl >= qsat threshold). Whether to wire it
+    live is a separate decision.
+- Evidence: make check 305 passed; new tests controller/tests/test_trs_ema_timeconstant.py
+  (8) + test_signal_state_loops.py (3); golden test_trs_signals.py unchanged & green.
+- Reversible: set ema_tau_ms null in registry -> live path returns to fresh-per-tick raw.

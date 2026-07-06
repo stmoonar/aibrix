@@ -10,6 +10,7 @@ from tre_controller.loops.cluster_view_task import ClusterViewBox
 from tre_controller.loops.metrics_task import SnapshotBox
 from tre_controller.loops.decision_snapshot import DecisionSnapshotWriter
 from tre_controller.planning.safescale import SafeScaleStateMachine
+from tre_controller.signals.trs import SignalState
 from tre_controller.config import SafeScaleConfig
 
 TRE_ROOT = Path(__file__).resolve().parents[2]
@@ -110,6 +111,7 @@ def _deps() -> ControllerDependencies:
         decision_writer=FakeDecisionWriter(),
         safescale=FakeSafeScale(),
         registry=FakeRegistry(),
+        signal_state=SignalState(),
     )
 
 

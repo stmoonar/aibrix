@@ -48,6 +48,7 @@ models:
     qsat: 4.0
     epsat: 0.05
     hsat: 3
+    ema_tau_ms: 20000
   vllm_extra_args:
   - --no-enable-prefix-caching
   - --enable-chunked-prefill
@@ -80,6 +81,7 @@ models:
     qsat: 4.0
     epsat: 0.05
     hsat: 3
+    ema_tau_ms: 20000
   vllm_extra_args:
   - --no-enable-prefix-caching
   - --enable-chunked-prefill
@@ -112,6 +114,7 @@ models:
     qsat: 4.0
     epsat: 0.05
     hsat: 3
+    ema_tau_ms: 20000
   vllm_extra_args:
   - --max-model-len
   - '12288'

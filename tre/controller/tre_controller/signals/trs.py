@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -56,11 +57,13 @@ class TRSResult:
 
 
 class TRSComputer:
-    def __init__(self, ema_alpha: float = 0.5) -> None:
+    def __init__(self, ema_alpha: float = 0.5, ema_tau_ms: float | None = None) -> None:
         self.ema_alpha = ema_alpha
+        self.ema_tau_ms = ema_tau_ms
         self._trs_ema: float | None = None
         self._prev_Y: float | None = None
         self._prev_Q_ctl: float | None = None
+        self._last_update_ms: int | None = None
 
     @property
     def current_ema(self) -> float | None:
@@ -72,6 +75,7 @@ class TRSComputer:
         ema: float | None = None,
         prev_Y: float | None = None,
         prev_Q_ctl: float | None = None,
+        last_update_ms: int | None = None,
     ) -> None:
         if ema is not None:
             self._trs_ema = ema
@@ -79,11 +83,15 @@ class TRSComputer:
             self._prev_Y = prev_Y
         if prev_Q_ctl is not None:
             self._prev_Q_ctl = prev_Q_ctl
+        if last_update_ms is not None:
+            self._last_update_ms = last_update_ms
 
     def snapshot(self) -> dict[str, Any]:
         return {"ema": self._trs_ema, "prev_Y": self._prev_Y, "prev_Q_ctl": self._prev_Q_ctl}
 
-    def compute(self, inp: TRSInput, theta_m: float | None = None) -> TRSResult:
+    def compute(
+        self, inp: TRSInput, theta_m: float | None = None, *, window_end_ms: int | None = None
+    ) -> TRSResult:
         y_total = inp.prompt_tokens_total * (1 - inp.kv_cache_hit_rate) * inp.w_p + inp.generation_tokens_total * inp.w_d
         effective_pods = max(1, inp.routable_pods)
         y_per_pod = y_total / effective_pods
@@ -98,7 +106,7 @@ class TRSComputer:
             effective_assigned = effective_pods
         if effective_pods > 0:
             trs_raw = trs_raw * effective_assigned / effective_pods
-        trs = self._update_ema(trs_raw)
+        trs = self._update_ema(trs_raw, window_end_ms=window_end_ms)
         eta = compute_eta_m(trs, effective_pods)
         z_m = compute_z_m(trs, theta_m)
         saved_prev_y = self._prev_Y
@@ -119,16 +127,53 @@ class TRSComputer:
             prev_Q_ctl=saved_prev_q_ctl,
         )
 
-    def _update_ema(self, raw: float) -> float:
+    def _update_ema(self, raw: float, window_end_ms: int | None = None) -> float:
         if not _is_finite_positive(raw):
+            # Non-finite/zero raw is a passthrough: never advance EMA or timestamp
+            # (mirrors legacy behaviour; keeps the window_end_ms cursor clean).
             return raw
+        # Per-window dedup (both modes): a shared computer is re-read by
+        # rescue(5s)/fairness(10s)/safescale between metrics refreshes. The EMA
+        # must advance at most once per distinct window_end_ms, else it over-
+        # smooths on duplicate snapshots. When window_end_ms is None (offline /
+        # golden path) this guard is inert and behaviour is byte-identical.
+        if window_end_ms is not None and window_end_ms == self._last_update_ms and self._trs_ema is not None:
+            return self._trs_ema
+        tau = self.ema_tau_ms
+        if tau is not None and tau > 0:
+            # Wall-clock time-constant EMA (S1.3 / ADR-0011): smoothing strength is
+            # set by tau alone, decoupled from refresh frequency. dt is measured in
+            # data time (window_end_ms deltas), not scheduler wall-clock, so it only
+            # advances when the underlying window actually advances.
+            if window_end_ms is None:
+                # No time reference -> cannot advance a wall-clock EMA. Passthrough.
+                return raw
+            if self._trs_ema is None or self._last_update_ms is None:
+                self._trs_ema = raw
+                self._last_update_ms = window_end_ms
+                return raw
+            dt_ms = window_end_ms - self._last_update_ms
+            if dt_ms <= 0:
+                # Window regressed (clock/window rewind): keep EMA, don't advance.
+                return self._trs_ema
+            decay = math.exp(-dt_ms / tau)
+            self._trs_ema = decay * self._trs_ema + (1.0 - decay) * raw
+            self._last_update_ms = window_end_ms
+            return self._trs_ema
+        # Legacy fixed-alpha branch: byte-identical to pre-S1.3 behaviour when
+        # window_end_ms is None (golden). With a shared computer + window_end_ms it
+        # advances once per window (the dedup above) using the fixed alpha.
         if self.ema_alpha <= 0:
             self._trs_ema = raw
+            if window_end_ms is not None:
+                self._last_update_ms = window_end_ms
             return raw
         if self._trs_ema is None:
             self._trs_ema = raw
         else:
             self._trs_ema = self.ema_alpha * self._trs_ema + (1 - self.ema_alpha) * raw
+        if window_end_ms is not None:
+            self._last_update_ms = window_end_ms
         return self._trs_ema
 
 
@@ -217,3 +262,27 @@ def compute_z_m(trs: float, theta_m: float | None) -> float | None:
 
 
 _compute_z_m = compute_z_m
+
+
+class SignalState:
+    """Per-model registry of stateful ``TRSComputer`` instances shared across the
+    rescue / fairness / safescale loops (S1.3 / ADR-0011).
+
+    The live control path previously constructed a fresh ``TRSComputer`` every
+    tick, so the EMA never persisted (``TRS == TRS_raw`` always). Holding one
+    computer per model here lets the wall-clock time-constant EMA carry across
+    ticks. One shared computer per model means one EMA per model (rescue and
+    fairness share it), per the "one window, one theta, one EMA" contract.
+
+    In-process only: on controller restart the EMA re-seeds from raw within ~tau.
+    """
+
+    def __init__(self) -> None:
+        self._by_model: dict[str, TRSComputer] = {}
+
+    def computer_for(self, model: str, *, ema_alpha: float, ema_tau_ms: float | None) -> TRSComputer:
+        computer = self._by_model.get(model)
+        if computer is None:
+            computer = TRSComputer(ema_alpha=ema_alpha, ema_tau_ms=ema_tau_ms)
+            self._by_model[model] = computer
+        return computer

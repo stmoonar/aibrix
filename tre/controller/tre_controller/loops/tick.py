@@ -19,7 +19,7 @@ from tre_controller.planning.planner import (
 )
 from tre_controller.planning.safescale import SafeScaleCommand, SafeScaleDecision
 from tre_controller.signals.sources import get_signal
-from tre_controller.signals.trs import TRSComputer, TRSInput
+from tre_controller.signals.trs import SignalState, TRSComputer, TRSInput
 
 
 class PlannerQueue(Protocol):
@@ -92,6 +92,7 @@ def run_planner_tick(
     safescale: SafeScaleController | None = None,
     paper_state_cache: PaperStateCache | None = None,
     incomplete_policy: IncompletePolicy = "drop_model",
+    signal_state: SignalState | None = None,
 ) -> LoopTickResult:
     if snapshot.stale:
         return LoopTickResult(submitted=0, events=("snapshot_stale",))
@@ -102,6 +103,7 @@ def run_planner_tick(
         signal_source=signal_source,
         cluster_view=cluster_view,
         paper_state_cache=paper_state_cache,
+        signal_state=signal_state,
     )
     classifications = classify_all_models(contexts)
     replicas = {model: int(ctx.get("assigned_replicas", 0)) for model, ctx in contexts.items()}
@@ -226,6 +228,7 @@ def _model_contexts(
     signal_source: str = "zm",
     cluster_view: ClusterView | None = None,
     paper_state_cache: PaperStateCache | None = None,
+    signal_state: SignalState | None = None,
 ) -> tuple[dict[str, dict], tuple[str, ...]]:
     contexts: dict[str, dict] = {}
     events: list[str] = []
@@ -240,7 +243,17 @@ def _model_contexts(
             metrics = replace(metrics, routable_pods=awake_replicas, assigned_replicas=awake_replicas)
         tokens_available = metrics.prompt_tokens is not None and metrics.generation_tokens is not None
         if tokens_available:
-            result = TRSComputer(ema_alpha=spec.trs.ema_alpha).compute(TRSInput.from_metrics(metrics, spec.trs), theta_m=spec.trs.theta_m)
+            if signal_state is not None:
+                computer = signal_state.computer_for(
+                    model_name, ema_alpha=spec.trs.ema_alpha, ema_tau_ms=spec.trs.ema_tau_ms
+                )
+            else:
+                computer = TRSComputer(ema_alpha=spec.trs.ema_alpha, ema_tau_ms=spec.trs.ema_tau_ms)
+            result = computer.compute(
+                TRSInput.from_metrics(metrics, spec.trs),
+                theta_m=spec.trs.theta_m,
+                window_end_ms=metrics.window_end_ms,
+            )
             signal = get_signal(metrics, spec, signal_source, trs_z_m=result.Z_m)
             context = {
                 "trs": result.TRS,

@@ -14,6 +14,7 @@ from tre_controller.loops.metrics_task import MetricsTaskConfig, SnapshotBox, Sn
 from tre_controller.loops.rescue_task import rescue_task
 from tre_controller.loops.safescale_task import safescale_task
 from tre_controller.planning.safescale import SafeScaleStateMachine
+from tre_controller.signals.trs import SignalState
 from tre_controller.sm_client import AsyncTransport, ServiceManagerClient
 from tre_controller.store.metrics_store import MetricsStore
 from tre_controller.store.state_store import ControllerStateStore
@@ -33,6 +34,7 @@ class ControllerDependencies:
     decision_writer: DecisionSnapshotWriter
     safescale: SafeScaleStateMachine
     registry: Registry
+    signal_state: SignalState
 
 
 @dataclass(frozen=True)
@@ -70,6 +72,7 @@ def build_controller_task_specs(
                     cluster_view_box=deps.cluster_view_box,
                     decision_writer=deps.decision_writer,
                     safescale=deps.safescale,
+                    signal_state=deps.signal_state,
                 ),
             )
         )
@@ -84,6 +87,7 @@ def build_controller_task_specs(
                 cluster_view_box=deps.cluster_view_box,
                 decision_writer=deps.decision_writer,
                 safescale=deps.safescale,
+                signal_state=deps.signal_state,
             ),
         )
     )
@@ -97,6 +101,7 @@ def build_controller_task_specs(
                     registry=deps.registry,
                     safescale=deps.safescale,
                     cfg=cfg,
+                    signal_state=deps.signal_state,
                 ),
             )
         )
@@ -139,6 +144,7 @@ def create_controller_dependencies(
         decision_writer=DecisionSnapshotWriter(redis_client),
         safescale=safescale,
         registry=registry,
+        signal_state=SignalState(),
     )
 
 

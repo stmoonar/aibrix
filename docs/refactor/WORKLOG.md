@@ -2037,3 +2037,41 @@ CLEAN CHECKPOINT: isolated plane serving 4/4; SM two-layer fix deployed+verified
 controller PAUSED; GPUs clean; reconcile clean; make check 285; tree committed.
 Remaining: 14b gpu2-3 (optional) -> R3 refit (recreate fleet at 0.85 for consistent
 capacity) -> N4.6 + scale-cycle soak -> n4b-done -> Phase C -> N5 -> F5 (wall-clock).
+
+### Signal Plan S1.3 — TRS EMA -> wall-clock time-constant (ADR-0011) DONE (offline) 2026-07-06
+
+Context handoff: resumed on 76 (/data/nfs_shared_data/xxy/aibrix). First priority per
+new goal = 15_signal_and_window_plan.md S1 (TSS lag fix), strict order S1.3->S1.1->S1.2->S1.4.
+
+**Premise error found & escalated (architect Fable5, verified independently):** doc 15 §0
+claimed the live TRS EMA advances ~every 60s with ema_alpha=0.2485 tuned for that. Code
+fact: the live path builds a FRESH TRSComputer every tick (tick.py:_model_contexts:243,
+safescale_task.py:_observation_from_metrics:92) with no EMA restore anywhere
+(state_store = SafeScale-probes-only; app.py only safescale.restore()). So live
+TRS == TRS_raw always and ema_alpha had ZERO live effect — only the 60s tumbling window
+smoothed. Architect ruling: **Option A-minimal** (build a real shared, in-process,
+wall-clock time-constant EMA now; it is S1.2's precondition, not separable). Full ruling
+-> ADR-0011.
+
+**Implemented (TDD, make check 305 passed, was ~289):**
+- signals/trs.py: TRSComputer.ema_tau_ms + compute(window_end_ms=...);
+  time-constant `_update_ema` (decay=exp(-dt/tau) over window_end_ms deltas) with a
+  per-window dedup guard shared by both tau and legacy-alpha branches (advance once per
+  distinct window_end_ms). Legacy path (tau None, no window_end_ms) byte-identical ->
+  golden legacy_trs unchanged & green. New `SignalState` (per-model shared computer holder).
+- common/registry.py: TrsParams gains optional ema_tau_ms; parsed from registry.yaml.
+- deploy/registry.yaml: ema_tau_ms=20000 seeded for all 3 models (starting point; frozen at S1.2).
+- loops tick/rescue/fairness/safescale + app.py: thread SignalState from
+  create_controller_dependencies through the three loops (one EMA per model, rescue+fairness+
+  safescale share it). signal_state optional -> back-compat (None = fresh-per-tick raw).
+- Tests: controller/tests/test_trs_ema_timeconstant.py (8: seed=raw, decay formula, alpha<->tau
+  equivalence at 60s & 5s, dup-window hold, non-finite passthrough, legacy branch, SignalState
+  sharing) + test_signal_state_loops.py (3: EMA persists across ticks, rescue-then-fairness
+  same snapshot no double-advance, no-signal_state == raw). test_controller_app deps updated.
+
+**Recorded:** ADR-0011 (DECISIONS.md); doc 15 §0 dated correction note; 05_paper_vs_impl.md
+EMA contract. Bonus findings logged for later: (a) SaturationGuard/gamma also dead live
+(out of S1.3 scope); (b) r3_grid trs column is within-cell EMA'd vs live raw — R3 must
+replicate live EMA semantics (S1.4 gate strengthened).
+
+Next: S1.1 (sliding window in metrics_task, + window_cache leak fix). Controller still PAUSED.
