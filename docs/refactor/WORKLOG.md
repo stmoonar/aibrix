@@ -2305,3 +2305,21 @@ Rebuilt tre/ui from a 113-line read-only skeleton into an operational console. m
   ticker; per-model wake/sleep + reconcile buttons with confirm+toast. Polls every 4s.
 - Note: decision:hist populates only while the controller runs (S5.1 in image 54cd2582+); timelines
   are empty when the controller is paused. UI image rebuild + roll next.
+
+### Replayer / B3 — trace HTTP driver + scorer (took over from stalled Codex, 2026-07-06)
+
+Codex task produced NOTHING (can not handle the SSH-remote-repo workflow); took the lead and built
+it directly. make check 338. Unblocks R2/R4/R5.
+- engine/http_sender.py: StreamingHttpSender (open-loop, plugs into dispatch_open_loop). Streams the
+  completion to capture ttft + usage; one per-request JSONL record {request_id, model, scheduled/
+  actual/schedule_delay, ttft_ms, e2e_ms, in/out tokens, prompt/completion_tokens, http_status, error}
+  — this IS the S4 raw-logger format too. Network is an injectable seam (stream_call) -> tests use a
+  fake, no network. Default seam = urllib + SSE parse.
+- scoring.py (pure): request_metrics (tpot=(e2e-ttft)/(comp-1)), window_violations (per-window p95 vs
+  SLO w/ min-sample guard), compute_v_sys (violation time-frac + request-frac), oracle_normalized_score
+  ((V_static-V_sys)/(V_static-V_oracle), degenerate-safe).
+- run_trace.py (CLI + fn): trace.json -> seeded poisson schedule -> sender -> JSONL -> per-model V_sys
+  (registry SLOs). --dry-run (fake sender) makes the whole pipeline testable in CI; injectable sleep.
+- Tests: 3 http_sender + 5 scoring + 1 run_trace dry-run.
+- OUT OF SCOPE (deferred): gen_traces.py (the 7 real trace.json from R3 capacity surfaces) — needs R3
+  data; run_trace replays any trace.json meanwhile.
