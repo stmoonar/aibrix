@@ -24,6 +24,7 @@ def test_tre_v2_overlay_declares_components_and_independent_redis() -> None:
         "redis.yaml",
         "service-manager.yaml",
         "controller.yaml",
+        "params.yaml",
         "ui.yaml",
         "gpu-truth.yaml",
         "gateway.yaml",
@@ -97,6 +98,33 @@ def test_tre_v2_overlay_declares_components_and_independent_redis() -> None:
     assert _node_selector(controller) == {"kubernetes.io/hostname": "nscc-ds-4a100-node10"}
     assert _node_selector(sm) == {"kubernetes.io/hostname": "nscc-ds-4a100-node10"}
     assert _node_selector(ui) == {"kubernetes.io/hostname": "nscc-ds-4a100-node10"}
+
+    # P0-4A: per-model params load from a mounted ConfigMap so the console can edit +
+    # restart-to-apply. W stays frozen as an explicit env value (not in the CM).
+    assert _env(controller)["TRE_REGISTRY_PATH"] == "/etc/tre/registry.yaml"
+    assert _env(controller)["TRE_METRICS_WINDOW_MS"] == "30000"  # W freeze artifact (explicit env lock)
+    assert controller["spec"]["strategy"] == {"type": "Recreate"}  # no dual-controller actuation
+    mounts = controller["spec"]["template"]["spec"]["containers"][0]["volumeMounts"]
+    assert {"name": "registry", "mountPath": "/etc/tre", "readOnly": True} in mounts
+    volumes = controller["spec"]["template"]["spec"]["volumes"]
+    assert any(v["name"] == "registry" and v["configMap"]["name"] == "tre-v2-registry" for v in volumes)
+
+    params = _load_yaml(overlay / "params.yaml")
+    assert params["kind"] == "ConfigMap" and params["metadata"]["name"] == "tre-v2-registry"
+    assert params["metadata"]["namespace"] == "tre-v2"
+    assert "registry.yaml" in params["data"]
+
+    # UI param-edit RBAC: namespace-scoped Role, resourceName-bound, no cluster scope.
+    ui_role = next(d for d in rbac_docs if d["kind"] == "Role" and d["metadata"]["name"] == "tre-v2-ui-params")
+    assert ui_role["metadata"]["namespace"] == "tre-v2"
+    cm_rule = next(r for r in ui_role["rules"] if r["resources"] == ["configmaps"])
+    assert cm_rule["resourceNames"] == ["tre-v2-registry"]
+    assert sorted(cm_rule["verbs"]) == ["get", "patch", "update"]
+    dep_rule = next(r for r in ui_role["rules"] if r["resources"] == ["deployments"])
+    assert dep_rule["resourceNames"] == ["tre-v2-controller"]
+    assert sorted(dep_rule["verbs"]) == ["get", "patch"]
+    ui_binding = next(d for d in rbac_docs if d["kind"] == "RoleBinding" and d["metadata"]["name"] == "tre-v2-ui-params")
+    assert ui_binding["subjects"] == [{"kind": "ServiceAccount", "name": "tre-v2-ui", "namespace": "tre-v2"}]
 
 
 def test_ablation_overlays_patch_only_controller_env() -> None:

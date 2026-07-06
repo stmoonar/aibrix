@@ -1,0 +1,129 @@
+apiVersion: v1
+data:
+  registry.yaml: |
+    cluster:
+      nodes:
+      - name: nscc-ds-4a100-node9
+        gpus: 4
+        gpu_uuids:
+        - GPU-689a3e93-68db-0dac-160b-6a791cf246e8
+        - GPU-d0de9f25-c059-d2ee-e7c4-c242bbdc76c7
+        - GPU-3a113474-dd92-6d52-d05b-491e7b020ded
+        - GPU-3c2fb581-708a-5fef-3eaa-5c3cc21a028e
+        two_gpu_slots:
+        - - 0
+          - 1
+        - - 2
+          - 3
+      - name: nscc-ds-4a100-node10
+        gpus: 4
+        gpu_uuids:
+        - GPU-71f560a8-e090-c7e6-325f-2e386c08136f
+        - GPU-4bcbcb0c-7eaf-64a1-b3e5-b07cb81d3a96
+        - GPU-28af749d-4081-d7b6-0c14-cf9c29aa213d
+        - GPU-76a392a5-b027-42be-fb8f-1bfe9079b47c
+        two_gpu_slots:
+        - - 0
+          - 1
+        - - 2
+          - 3
+    models:
+    - name: dsqwen-7b
+      weights_path: /data/nfs_shared_data/DeepSeek-R1-Distill-Qwen-7B
+      tp_size: 1
+      min_replicas: 1
+      max_replicas: 4
+      vllm_image: vllm/vllm-openai:0.10.1-sleep
+      slo:
+        ttft_p95_ms: 500.0
+        tpot_p95_ms: 75.0
+        e2e_p95_ms: 12000.0
+      trs:
+        w_p: 0.08
+        w_d: 1.0
+        lambda_wait: 1.875
+        qmin: 1.0
+        ema_alpha: 0.2485
+        theta_m: 738.67
+        tau_crit: 0.7485
+        tau_low: 1.0
+        tau_high: 1.6296
+        qsat: 4.0
+        epsat: 0.05
+        hsat: 3
+        ema_tau_ms: 20000
+      vllm_extra_args:
+      - --no-enable-prefix-caching
+      - --enable-chunked-prefill
+      - --max-num-batched-tokens
+      - '2048'
+      - --swap-space
+      - '16'
+      - --gpu-memory-utilization
+      - '0.85'
+    - name: dsllama-8b
+      weights_path: /data/nfs_shared_data/DeepSeek-R1-Distill-Llama-8B
+      tp_size: 1
+      min_replicas: 1
+      max_replicas: 4
+      vllm_image: vllm/vllm-openai:0.10.1-sleep
+      slo:
+        ttft_p95_ms: 500.0
+        tpot_p95_ms: 75.0
+        e2e_p95_ms: 12000.0
+      trs:
+        w_p: 0.08
+        w_d: 1.0
+        lambda_wait: 1.875
+        qmin: 1.0
+        ema_alpha: 0.2485
+        theta_m: 738
+        tau_crit: 0.7485
+        tau_low: 1.0
+        tau_high: 1.6296
+        qsat: 4.0
+        epsat: 0.05
+        hsat: 3
+        ema_tau_ms: 20000
+      vllm_extra_args:
+      - --no-enable-prefix-caching
+      - --enable-chunked-prefill
+      - --max-num-batched-tokens
+      - '2048'
+      - --swap-space
+      - '20'
+      - --gpu-memory-utilization
+      - '0.85'
+    - name: dsqwen-14b
+      weights_path: /data/nfs_shared_data/Models/DeepSeek-R1-Distill-Qwen-14B
+      tp_size: 2
+      min_replicas: 0
+      max_replicas: 4
+      vllm_image: vllm/vllm-openai:0.10.1-sleep
+      slo:
+        ttft_p95_ms: 500.0
+        tpot_p95_ms: 75.0
+        e2e_p95_ms: 15000.0
+      trs:
+        w_p: 0.0575
+        w_d: 1.0
+        lambda_wait: 3.0
+        qmin: 1.0
+        ema_alpha: 0.3935
+        theta_m: 534
+        tau_crit: 0.56
+        tau_low: 1.0
+        tau_high: 1.26
+        qsat: 4.0
+        epsat: 0.05
+        hsat: 3
+        ema_tau_ms: 20000
+      vllm_extra_args:
+      - --max-model-len
+      - '12288'
+      - --gpu-memory-utilization
+      - '0.85'
+kind: ConfigMap
+metadata:
+  name: tre-v2-registry
+  namespace: tre-v2

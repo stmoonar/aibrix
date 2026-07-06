@@ -103,3 +103,34 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
   name: tre-v2-model-route-manager
+---
+# Console (tre-v2-ui) param editing: namespace-scoped, resourceName-bound to exactly the
+# registry ConfigMap and the controller Deployment. No list, no pods, no other namespace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: tre-v2-ui-params
+  namespace: tre-v2
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["tre-v2-registry"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    resourceNames: ["tre-v2-controller"]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: tre-v2-ui-params
+  namespace: tre-v2
+subjects:
+  - kind: ServiceAccount
+    name: tre-v2-ui
+    namespace: tre-v2
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: tre-v2-ui-params

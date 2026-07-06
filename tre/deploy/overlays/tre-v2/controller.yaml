@@ -7,6 +7,11 @@ metadata:
     app.kubernetes.io/name: tre-v2-controller
 spec:
   replicas: 1
+  # Singleton controller with no leader election: a RollingUpdate would run old+new
+  # pods concurrently and both could actuate. Recreate guarantees at most one controller.
+  strategy:
+    type: Recreate
+  progressDeadlineSeconds: 120
   selector:
     matchLabels:
       app.kubernetes.io/name: tre-v2-controller
@@ -33,8 +38,12 @@ spec:
               value: v1
             - name: TRE_SERVICE_MANAGER_URL
               value: http://tre-v2-service-manager:8000
+            # Per-model params load from the tre-v2-registry ConfigMap mounted below, so
+            # the console can edit theta_m/tau_*/SLOs and restart-to-apply without an image
+            # rebuild. The baked /app/tre/deploy/registry.yaml stays as an escape-hatch
+            # fallback (flip this value back to it via `kubectl set env`).
             - name: TRE_REGISTRY_PATH
-              value: /app/tre/deploy/registry.yaml
+              value: /etc/tre/registry.yaml
             # --- Signal / percentile口径 (F2 + D2) ---
             - name: TRE_SIGNAL_SOURCE
               value: zm
@@ -84,3 +93,13 @@ spec:
             limits:
               cpu: "1"
               memory: 1Gi
+          volumeMounts:
+            - name: registry
+              mountPath: /etc/tre
+              readOnly: true
+      volumes:
+        # Non-optional: a missing/deleted ConfigMap blocks the new pod at ContainerCreating
+        # rather than silently booting stale or absent config.
+        - name: registry
+          configMap:
+            name: tre-v2-registry
