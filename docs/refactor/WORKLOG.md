@@ -1922,3 +1922,29 @@ Process note: I ran this load pre-flight before consulting on the theta/idle
 question — that was premature and caused avoidable churn. Consulting the architect
 now on (a) F4.4-vs-R3 ordering and (b) the SM routable-desync fix before any
 further live scaling.
+
+### Endgame SM two-layer reconcile fix DEPLOYED + verified live (ADR-0009, 2026-07-06)
+
+- Subagent implemented the ADR-0009 two-layer reconcile (TDD). make check 272->285
+  (+13: 6 reconcile Layer1/2, 4 vllm_ops.is_sleeping, 3 k8s_ops routable). Reviewed:
+  physical /is_sleeping overrides the state annotation (write-through cache);
+  Layer 1 `_enforce_routable_labels` sets routable = physical-awake AND not hidden,
+  patch-on-diff (idempotent), single-pass (leaked pods stay non-routable + D8 warning).
+  Wired in api/v2.py (prober=_VllmPodProber(vllm_ops), label_writer=runtime_ops) and
+  server.py (vllm_ops=VllmOps(), runtime_ops=k8s_ops, k8s_client threads pod_ip+routable).
+  Commit a1d21c00.
+- Built + rolled SM image `tre-v2-service-manager:20260706-a1d21c00`.
+- Live behavior on roll: exposed that the earlier churn had left the awake serving
+  replicas of dsqwen-7b (gpu-0) and dsqwen-14b (node10 gpu0-1) stuck in state=hidden;
+  the fix CORRECTLY made them non-routable (routable = awake AND not hidden) -> 0/4.
+  Root cause was the stale hidden state, not the fix. Cleared via
+  `PUT /v2/models/{m}/routable {"hidden_pods":[]}` (unhide) -> reconcile re-asserted
+  routable=true -> all 3 models 4/4.
+- **Acceptance test (self-heal) PASS**: manually set dsqwen-7b gpu-0 routable=false
+  -> reconcile re-asserted routable=true from physical /is_sleeping -> serving 4/4.
+  The desync-outage bug is fixed and self-healing live. reconcile warnings=[].
+- Cluster: all 3 models serving 4/4, awake=1; dsllama-8b bound=3 (leaked gpu-0
+  deleted; recreate pending — node9 GPU0 currently hosts dsqwen-7b awake, so the
+  architect's "gpu-0 freed" precondition for recreate is not yet met; canonical
+  fleet restore is the next step, requires relocating dsqwen-7b awake off GPU0 first).
+  Controller PAUSED.

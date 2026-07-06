@@ -10,7 +10,7 @@ Captured: 2026-07-06 (F4.0). Source commit for tre-v2 images: see per-image note
 
 | Component | Image tag | Image ID (sha256) | Source |
 |---|---|---|---|
-| service-manager | `tre-v2-service-manager:20260706-a1d21c00` | `853929dbd5f0d3eaef24f092ce660cad8b35308cb63c0564bfe8f12f3823fce5` | commit `f6dce214` (route guard) |
+| service-manager | `tre-v2-service-manager:20260706-a1d21c00` | `` | commit `f6dce214` (route guard) |
 | controller | `tre-v2-controller:20260705-d795a715` | `6b722a12a4aadb01dd3b485d5d537196deb337c0d4ebd7d63b54269b5eb118d3` | commit `d795a715` (inflight fix) |
 | ui | `tre-v2-ui:20260704-669f0381` | `e81b68295f31103c22a24b51f1645e21e4d927b58e11f7127388628110ff06bc` | commit `669f0381` |
 | redis | `redis:7.2-alpine` | `dfa18828cbc07b3ae6a95ec7343f6c214fdee2d836197b4be8e9904420762cd8` | upstream |
