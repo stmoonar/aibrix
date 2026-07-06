@@ -1,0 +1,395 @@
+apiVersion: v1
+items:
+- apiVersion: apps/v1
+  kind: Deployment
+  metadata:
+    annotations:
+      deployment.kubernetes.io/revision: "8"
+    creationTimestamp: "2026-04-16T19:45:06Z"
+    generation: 8
+    labels:
+      app.kubernetes.io/component: aibrix-gateway-plugin
+      app.kubernetes.io/managed-by: kubectl
+      app.kubernetes.io/name: aibrix
+      app.kubernetes.io/version: nightly
+    name: aibrix-gateway-plugins
+    namespace: aibrix-system
+    resourceVersion: "192530425"
+    uid: fe7c513b-f185-4367-b1a2-d920c8d3c24c
+  spec:
+    progressDeadlineSeconds: 600
+    replicas: 1
+    revisionHistoryLimit: 10
+    selector:
+      matchLabels:
+        app: gateway-plugins
+    strategy:
+      rollingUpdate:
+        maxSurge: 1
+        maxUnavailable: 1
+      type: RollingUpdate
+    template:
+      metadata:
+        annotations:
+          kubectl.kubernetes.io/restartedAt: "2026-07-05T00:01:16+08:00"
+        creationTimestamp: null
+        labels:
+          app: gateway-plugins
+      spec:
+        affinity:
+          nodeAffinity:
+            preferredDuringSchedulingIgnoredDuringExecution:
+            - preference:
+                matchExpressions:
+                - key: nvidia.com/gpu.present
+                  operator: NotIn
+                  values:
+                  - "true"
+              weight: 100
+          podAntiAffinity:
+            preferredDuringSchedulingIgnoredDuringExecution:
+            - podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                  - key: app
+                    operator: In
+                    values:
+                    - gateway-plugins
+                topologyKey: kubernetes.io/hostname
+              weight: 100
+        containers:
+        - env:
+          - name: TRE_DEFAULT_RPM
+            value: "8000"
+          - name: TRE_DEFAULT_TPM_MULTIPLIER
+            value: "5000"
+          - name: TRE_CHECK_RPM
+            value: "0"
+          - name: DEBUG_POD_LIST
+            value: "1"
+          - name: HOT_SWITCH
+            value: "1"
+          - name: SERVEMENT_URL
+            value: http://10.244.0.234:7001
+          - name: QZ_KIND
+            value: "0"
+          - name: delay_time1
+            value: "4000"
+          - name: AIBRIX_GPU_OPTIMIZER_TRACING_FLAG
+            value: "true"
+          - name: TRE_TRACING_FLAG
+            value: "true"
+          - name: TRE_DEBUG_FLAG
+            value: "false"
+          - name: AIBRIX_VISUAL_TRACING_FLAG
+            value: "true"
+          - name: AIBRIX_PREFIX_CACHE_TOKENIZER_TYPE
+            value: character
+          - name: AIBRIX_PREFIX_CACHE_BLOCK_SIZE
+            value: "128"
+          - name: AIBRIX_PREFIX_CACHE_BLOCK_NUMBER
+            value: "200000"
+          - name: AIBRIX_PREFIX_CACHE_POD_RUNNING_REQUEST_IMBALANCE_ABS_COUNT
+            value: "16"
+          - name: AIBRIX_PREFIX_CACHE_STANDARD_DEVIATION_FACTOR
+            value: "2"
+          - name: REDIS_HOST
+            value: aibrix-redis-master
+          - name: REDIS_PORT
+            value: "6379"
+          - name: AIBRIX_POD_METRIC_REFRESH_INTERVAL_MS
+            value: "50"
+          - name: AIBRIX_PREFILL_REQUEST_TIMEOUT
+            value: "60"
+          - name: POD_NAME
+            valueFrom:
+              fieldRef:
+                apiVersion: v1
+                fieldPath: metadata.name
+          - name: POD_NAMESPACE
+            valueFrom:
+              fieldRef:
+                apiVersion: v1
+                fieldPath: metadata.namespace
+          - name: TRE_REDIS_SCHEMA
+            value: dual
+          image: aibrix/gateway-plugins:20260704-0d869b49-nozmq2
+          imagePullPolicy: IfNotPresent
+          livenessProbe:
+            failureThreshold: 5
+            grpc:
+              port: 50052
+              service: ""
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            successThreshold: 1
+            timeoutSeconds: 5
+          name: gateway-plugin
+          ports:
+          - containerPort: 50052
+            name: gateway
+            protocol: TCP
+          - containerPort: 6060
+            name: profiling
+            protocol: TCP
+          - containerPort: 8080
+            name: metrics
+            protocol: TCP
+          readinessProbe:
+            failureThreshold: 5
+            grpc:
+              port: 50052
+              service: ""
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            successThreshold: 1
+            timeoutSeconds: 5
+          resources:
+            limits:
+              cpu: "2"
+              memory: 8Gi
+            requests:
+              cpu: "2"
+              memory: 8Gi
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+        dnsPolicy: ClusterFirst
+        initContainers:
+        - command:
+          - sh
+          - -c
+          - until echo "ping" | nc aibrix-redis-master 6379 -w 1  | grep -c PONG;
+            do echo waiting for service aibrix-redis-master; sleep 2; done
+          env:
+          - name: TRE_REDIS_SCHEMA
+            value: dual
+          image: busybox:stable
+          imagePullPolicy: IfNotPresent
+          name: init-c
+          resources: {}
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+        nodeName: nscc-ds-4a100-node10
+        restartPolicy: Always
+        schedulerName: default-scheduler
+        securityContext: {}
+        serviceAccount: aibrix-gateway-plugins
+        serviceAccountName: aibrix-gateway-plugins
+        terminationGracePeriodSeconds: 30
+  status:
+    availableReplicas: 1
+    conditions:
+    - lastTransitionTime: "2026-04-16T19:45:06Z"
+      lastUpdateTime: "2026-04-16T19:45:06Z"
+      message: Deployment has minimum availability.
+      reason: MinimumReplicasAvailable
+      status: "True"
+      type: Available
+    - lastTransitionTime: "2026-04-16T19:45:06Z"
+      lastUpdateTime: "2026-07-04T16:01:36Z"
+      message: ReplicaSet "aibrix-gateway-plugins-54bf764f7c" has successfully progressed.
+      reason: NewReplicaSetAvailable
+      status: "True"
+      type: Progressing
+    observedGeneration: 8
+    readyReplicas: 1
+    replicas: 1
+    updatedReplicas: 1
+- apiVersion: apps/v1
+  kind: Deployment
+  metadata:
+    annotations:
+      deployment.kubernetes.io/revision: "1"
+    creationTimestamp: "2026-04-27T19:24:31Z"
+    generation: 1
+    labels:
+      app.kubernetes.io/component: lxt-gateway-plugin
+      app.kubernetes.io/managed-by: kubectl
+      app.kubernetes.io/name: aibrix
+      app.kubernetes.io/version: nightly
+    name: lxtaibrix-gateway-plugins
+    namespace: aibrix-system
+    resourceVersion: "190983845"
+    uid: 7acc3c64-4fcf-48e1-b045-870f5923b765
+  spec:
+    progressDeadlineSeconds: 600
+    replicas: 1
+    revisionHistoryLimit: 10
+    selector:
+      matchLabels:
+        app: lxt-gateway-plugins
+    strategy:
+      rollingUpdate:
+        maxSurge: 1
+        maxUnavailable: 1
+      type: RollingUpdate
+    template:
+      metadata:
+        creationTimestamp: null
+        labels:
+          app: lxt-gateway-plugins
+      spec:
+        affinity:
+          nodeAffinity:
+            preferredDuringSchedulingIgnoredDuringExecution:
+            - preference:
+                matchExpressions:
+                - key: nvidia.com/gpu.present
+                  operator: NotIn
+                  values:
+                  - "true"
+              weight: 100
+          podAntiAffinity:
+            preferredDuringSchedulingIgnoredDuringExecution:
+            - podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                  - key: app
+                    operator: In
+                    values:
+                    - lxt-gateway-plugins
+                topologyKey: kubernetes.io/hostname
+              weight: 100
+        containers:
+        - env:
+          - name: TRE_DEFAULT_RPM
+            value: "8000"
+          - name: TRE_DEFAULT_TPM_MULTIPLIER
+            value: "5000"
+          - name: TRE_CHECK_RPM
+            value: "0"
+          - name: DEBUG_POD_LIST
+            value: "1"
+          - name: HOT_SWITCH
+            value: "1"
+          - name: SERVEMENT_URL
+            value: http://10.244.0.3:7001
+          - name: SERVEMENT_URL2
+            value: http://10.244.0.213:7001
+          - name: QZ_KIND
+            value: "0"
+          - name: delay_time1
+            value: "1000"
+          - name: SERVE_STUCK_THRESHOLD_MS
+            value: "3000"
+          - name: WAKEUP_STATUS_TTL
+            value: "1000"
+          - name: AIBRIX_GPU_OPTIMIZER_TRACING_FLAG
+            value: "true"
+          - name: TRE_TRACING_FLAG
+            value: "true"
+          - name: TRE_DEBUG_FLAG
+            value: "false"
+          - name: AIBRIX_VISUAL_TRACING_FLAG
+            value: "true"
+          - name: AIBRIX_PREFIX_CACHE_TOKENIZER_TYPE
+            value: character
+          - name: AIBRIX_PREFIX_CACHE_BLOCK_SIZE
+            value: "128"
+          - name: AIBRIX_PREFIX_CACHE_BLOCK_NUMBER
+            value: "200000"
+          - name: AIBRIX_PREFIX_CACHE_POD_RUNNING_REQUEST_IMBALANCE_ABS_COUNT
+            value: "16"
+          - name: AIBRIX_PREFIX_CACHE_STANDARD_DEVIATION_FACTOR
+            value: "2"
+          - name: REDIS_HOST
+            value: aibrix-redis-master
+          - name: REDIS_PORT
+            value: "6379"
+          - name: AIBRIX_POD_METRIC_REFRESH_INTERVAL_MS
+            value: "50"
+          - name: AIBRIX_PREFILL_REQUEST_TIMEOUT
+            value: "60"
+          - name: POD_NAME
+            valueFrom:
+              fieldRef:
+                apiVersion: v1
+                fieldPath: metadata.name
+          - name: POD_NAMESPACE
+            valueFrom:
+              fieldRef:
+                apiVersion: v1
+                fieldPath: metadata.namespace
+          image: aibrix/gateway-plugins:latest
+          imagePullPolicy: IfNotPresent
+          livenessProbe:
+            failureThreshold: 5
+            grpc:
+              port: 50052
+              service: ""
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            successThreshold: 1
+            timeoutSeconds: 5
+          name: gateway-plugin
+          ports:
+          - containerPort: 50052
+            name: gateway
+            protocol: TCP
+          - containerPort: 6060
+            name: profiling
+            protocol: TCP
+          - containerPort: 8080
+            name: metrics
+            protocol: TCP
+          readinessProbe:
+            failureThreshold: 5
+            grpc:
+              port: 50052
+              service: ""
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            successThreshold: 1
+            timeoutSeconds: 5
+          resources:
+            limits:
+              cpu: "2"
+              memory: 8Gi
+            requests:
+              cpu: "2"
+              memory: 8Gi
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+        dnsPolicy: ClusterFirst
+        initContainers:
+        - command:
+          - sh
+          - -c
+          - until echo "ping" | nc aibrix-redis-master 6379 -w 1  | grep -c PONG;
+            do echo waiting for service aibrix-redis-master; sleep 2; done
+          image: busybox:stable
+          imagePullPolicy: IfNotPresent
+          name: init-c
+          resources: {}
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+        nodeName: nscc-ds-4a100-node10
+        restartPolicy: Always
+        schedulerName: default-scheduler
+        securityContext: {}
+        serviceAccount: aibrix-gateway-plugins
+        serviceAccountName: aibrix-gateway-plugins
+        terminationGracePeriodSeconds: 30
+  status:
+    availableReplicas: 1
+    conditions:
+    - lastTransitionTime: "2026-04-27T19:24:31Z"
+      lastUpdateTime: "2026-04-27T19:24:31Z"
+      message: Deployment has minimum availability.
+      reason: MinimumReplicasAvailable
+      status: "True"
+      type: Available
+    - lastTransitionTime: "2026-04-27T19:24:31Z"
+      lastUpdateTime: "2026-04-27T19:24:52Z"
+      message: ReplicaSet "lxtaibrix-gateway-plugins-556cf69f9c" has successfully
+        progressed.
+      reason: NewReplicaSetAvailable
+      status: "True"
+      type: Progressing
+    observedGeneration: 1
+    readyReplicas: 1
+    replicas: 1
+    updatedReplicas: 1
+kind: List
+metadata:
+  resourceVersion: ""

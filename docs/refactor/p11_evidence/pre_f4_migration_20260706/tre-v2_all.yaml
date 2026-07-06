@@ -1,0 +1,3456 @@
+apiVersion: v1
+items:
+- apiVersion: v1
+  kind: Pod
+  metadata:
+    creationTimestamp: "2026-07-06T02:20:25Z"
+    generateName: tre-v2-gpu-truth-
+    labels:
+      app.kubernetes.io/name: tre-v2-gpu-truth
+      controller-revision-hash: 5984497ddf
+      pod-template-generation: "2"
+    name: tre-v2-gpu-truth-6b5bx
+    namespace: tre-v2
+    ownerReferences:
+    - apiVersion: apps/v1
+      blockOwnerDeletion: true
+      controller: true
+      kind: DaemonSet
+      name: tre-v2-gpu-truth
+      uid: 91966cbc-fee7-4c3d-81eb-784ddb0f3cb4
+    resourceVersion: "193153799"
+    uid: 92591d1e-f6de-4a34-9ee6-eed984451bc7
+  spec:
+    affinity:
+      nodeAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          nodeSelectorTerms:
+          - matchFields:
+            - key: metadata.name
+              operator: In
+              values:
+              - nscc-ds-4a100-node9
+    containers:
+    - command:
+      - python3
+      - /agent/gpu_truth_agent.py
+      - --redis-url
+      - redis://tre-v2-redis:6379/0
+      - --node
+      - $(NODE_NAME)
+      - --interval-s
+      - "30"
+      - --ttl-s
+      - "120"
+      env:
+      - name: NODE_NAME
+        valueFrom:
+          fieldRef:
+            apiVersion: v1
+            fieldPath: spec.nodeName
+      - name: NVIDIA_VISIBLE_DEVICES
+        value: all
+      image: vllm/vllm-openai:0.10.1-sleep
+      imagePullPolicy: IfNotPresent
+      name: gpu-truth
+      resources:
+        limits:
+          cpu: 250m
+          memory: 256Mi
+        requests:
+          cpu: 50m
+          memory: 64Mi
+      terminationMessagePath: /dev/termination-log
+      terminationMessagePolicy: File
+      volumeMounts:
+      - mountPath: /agent
+        name: agent
+      - mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+        name: kube-api-access-q6nkr
+        readOnly: true
+    dnsPolicy: ClusterFirst
+    enableServiceLinks: true
+    nodeName: nscc-ds-4a100-node9
+    preemptionPolicy: PreemptLowerPriority
+    priority: 0
+    restartPolicy: Always
+    schedulerName: default-scheduler
+    securityContext: {}
+    serviceAccount: default
+    serviceAccountName: default
+    terminationGracePeriodSeconds: 30
+    tolerations:
+    - effect: NoSchedule
+      key: node-role.kubernetes.io/control-plane
+      operator: Exists
+    - effect: NoExecute
+      key: node.kubernetes.io/not-ready
+      operator: Exists
+    - effect: NoExecute
+      key: node.kubernetes.io/unreachable
+      operator: Exists
+    - effect: NoSchedule
+      key: node.kubernetes.io/disk-pressure
+      operator: Exists
+    - effect: NoSchedule
+      key: node.kubernetes.io/memory-pressure
+      operator: Exists
+    - effect: NoSchedule
+      key: node.kubernetes.io/pid-pressure
+      operator: Exists
+    - effect: NoSchedule
+      key: node.kubernetes.io/unschedulable
+      operator: Exists
+    volumes:
+    - configMap:
+        defaultMode: 420
+        name: tre-v2-gpu-truth-agent
+      name: agent
+    - name: kube-api-access-q6nkr
+      projected:
+        defaultMode: 420
+        sources:
+        - serviceAccountToken:
+            expirationSeconds: 3607
+            path: token
+        - configMap:
+            items:
+            - key: ca.crt
+              path: ca.crt
+            name: kube-root-ca.crt
+        - downwardAPI:
+            items:
+            - fieldRef:
+                apiVersion: v1
+                fieldPath: metadata.namespace
+              path: namespace
+  status:
+    conditions:
+    - lastProbeTime: null
+      lastTransitionTime: "2026-07-06T02:22:54Z"
+      status: "True"
+      type: Initialized
+    - lastProbeTime: null
+      lastTransitionTime: "2026-07-06T02:22:55Z"
+      status: "True"
+      type: Ready
+    - lastProbeTime: null
+      lastTransitionTime: "2026-07-06T02:22:55Z"
+      status: "True"
+      type: ContainersReady
+    - lastProbeTime: null
+      lastTransitionTime: "2026-07-06T02:20:25Z"
+      status: "True"
+      type: PodScheduled
+    containerStatuses:
+    - containerID: docker://024a7165bfc1d2ef4a990091ced05c5b5f4341f7008b42dd9c45d5bc7ddcf254
+      image: vllm/vllm-openai:0.10.1-sleep
+      imageID: docker://sha256:6a3a5efad7779b594bf82dbda62c47efa789786a38963acb869142d9d8406492
+      lastState: {}
+      name: gpu-truth
+      ready: true
+      restartCount: 0
+      started: true
+      state:
+        running:
+          startedAt: "2026-07-06T02:22:54Z"
+    hostIP: 192.168.223.75
+    phase: Running
+    podIP: 10.244.3.89
+    podIPs:
+    - ip: 10.244.3.89
+    qosClass: Burstable
+    startTime: "2026-07-06T02:22:54Z"
+- apiVersion: v1
+  kind: Pod
+  metadata:
+    creationTimestamp: "2026-07-06T02:20:57Z"
+    generateName: tre-v2-gpu-truth-
+    labels:
+      app.kubernetes.io/name: tre-v2-gpu-truth
+      controller-revision-hash: 5984497ddf
+      pod-template-generation: "2"
+    name: tre-v2-gpu-truth-9k5p6
+    namespace: tre-v2
+    ownerReferences:
+    - apiVersion: apps/v1
+      blockOwnerDeletion: true
+      controller: true
+      kind: DaemonSet
+      name: tre-v2-gpu-truth
+      uid: 91966cbc-fee7-4c3d-81eb-784ddb0f3cb4
+    resourceVersion: "193153983"
+    uid: 99f21990-ce08-4e25-aa33-e6a6496bb04c
+  spec:
+    affinity:
+      nodeAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          nodeSelectorTerms:
+          - matchFields:
+            - key: metadata.name
+              operator: In
+              values:
+              - nscc-ds-4a100-node10
+    containers:
+    - command:
+      - python3
+      - /agent/gpu_truth_agent.py
+      - --redis-url
+      - redis://tre-v2-redis:6379/0
+      - --node
+      - $(NODE_NAME)
+      - --interval-s
+      - "30"
+      - --ttl-s
+      - "120"
+      env:
+      - name: NODE_NAME
+        valueFrom:
+          fieldRef:
+            apiVersion: v1
+            fieldPath: spec.nodeName
+      - name: NVIDIA_VISIBLE_DEVICES
+        value: all
+      image: vllm/vllm-openai:0.10.1-sleep
+      imagePullPolicy: IfNotPresent
+      name: gpu-truth
+      resources:
+        limits:
+          cpu: 250m
+          memory: 256Mi
+        requests:
+          cpu: 50m
+          memory: 64Mi
+      terminationMessagePath: /dev/termination-log
+      terminationMessagePolicy: File
+      volumeMounts:
+      - mountPath: /agent
+        name: agent
+      - mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+        name: kube-api-access-m8pqd
+        readOnly: true
+    dnsPolicy: ClusterFirst
+    enableServiceLinks: true
+    nodeName: nscc-ds-4a100-node10
+    preemptionPolicy: PreemptLowerPriority
+    priority: 0
+    restartPolicy: Always
+    schedulerName: default-scheduler
+    securityContext: {}
+    serviceAccount: default
+    serviceAccountName: default
+    terminationGracePeriodSeconds: 30
+    tolerations:
+    - effect: NoSchedule
+      key: node-role.kubernetes.io/control-plane
+      operator: Exists
+    - effect: NoExecute
+      key: node.kubernetes.io/not-ready
+      operator: Exists
+    - effect: NoExecute
+      key: node.kubernetes.io/unreachable
+      operator: Exists
+    - effect: NoSchedule
+      key: node.kubernetes.io/disk-pressure
+      operator: Exists
+    - effect: NoSchedule
+      key: node.kubernetes.io/memory-pressure
+      operator: Exists
+    - effect: NoSchedule
+      key: node.kubernetes.io/pid-pressure
+      operator: Exists
+    - effect: NoSchedule
+      key: node.kubernetes.io/unschedulable
+      operator: Exists
+    volumes:
+    - configMap:
+        defaultMode: 420
+        name: tre-v2-gpu-truth-agent
+      name: agent
+    - name: kube-api-access-m8pqd
+      projected:
+        defaultMode: 420
+        sources:
+        - serviceAccountToken:
+            expirationSeconds: 3607
+            path: token
+        - configMap:
+            items:
+            - key: ca.crt
+              path: ca.crt
+            name: kube-root-ca.crt
+        - downwardAPI:
+            items:
+            - fieldRef:
+                apiVersion: v1
+                fieldPath: metadata.namespace
+              path: namespace
+  status:
+    conditions:
+    - lastProbeTime: null
+      lastTransitionTime: "2026-07-06T02:20:57Z"
+      status: "True"
+      type: Initialized
+    - lastProbeTime: null
+      lastTransitionTime: "2026-07-06T02:21:00Z"
+      status: "True"
+      type: Ready
+    - lastProbeTime: null
+      lastTransitionTime: "2026-07-06T02:21:00Z"
+      status: "True"
+      type: ContainersReady
+    - lastProbeTime: null
+      lastTransitionTime: "2026-07-06T02:20:57Z"
+      status: "True"
+      type: PodScheduled
+    containerStatuses:
+    - containerID: docker://9a163d27160c388f22d9abe71edda9d7fe7c985c899dc40bcaf3ead651ac0405
+      image: vllm/vllm-openai:0.10.1-sleep
+      imageID: docker://sha256:6a3a5efad7779b594bf82dbda62c47efa789786a38963acb869142d9d8406492
+      lastState: {}
+      name: gpu-truth
+      ready: true
+      restartCount: 0
+      started: true
+      state:
+        running:
+          startedAt: "2026-07-06T02:20:58Z"
+    hostIP: 192.168.223.76
+    phase: Running
+    podIP: 10.244.0.184
+    podIPs:
+    - ip: 10.244.0.184
+    qosClass: Burstable
+    startTime: "2026-07-06T02:20:57Z"
+- apiVersion: v1
+  kind: Pod
+  metadata:
+    creationTimestamp: "2026-07-04T16:50:02Z"
+    generateName: tre-v2-redis-6c47ddfb8d-
+    labels:
+      app.kubernetes.io/name: tre-v2-redis
+      pod-template-hash: 6c47ddfb8d
+    name: tre-v2-redis-6c47ddfb8d-h26mn
+    namespace: tre-v2
+    ownerReferences:
+    - apiVersion: apps/v1
+      blockOwnerDeletion: true
+      controller: true
+      kind: ReplicaSet
+      name: tre-v2-redis-6c47ddfb8d
+      uid: 3162fc72-f2a8-4f8c-8f94-c29b32019f1b
+    resourceVersion: "192545599"
+    uid: bbf242f3-5cee-4be3-83ac-2db72d764aad
+  spec:
+    containers:
+    - image: redis:7.2-alpine
+      imagePullPolicy: IfNotPresent
+      name: redis
+      ports:
+      - containerPort: 6379
+        name: redis
+        protocol: TCP
+      resources:
+        limits:
+          cpu: 500m
+          memory: 512Mi
+        requests:
+          cpu: 100m
+          memory: 128Mi
+      terminationMessagePath: /dev/termination-log
+      terminationMessagePolicy: File
+      volumeMounts:
+      - mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+        name: kube-api-access-fwzgg
+        readOnly: true
+    dnsPolicy: ClusterFirst
+    enableServiceLinks: true
+    nodeName: nscc-ds-4a100-node10
+    nodeSelector:
+      kubernetes.io/hostname: nscc-ds-4a100-node10
+    preemptionPolicy: PreemptLowerPriority
+    priority: 0
+    restartPolicy: Always
+    schedulerName: default-scheduler
+    securityContext: {}
+    serviceAccount: default
+    serviceAccountName: default
+    terminationGracePeriodSeconds: 30
+    tolerations:
+    - effect: NoExecute
+      key: node.kubernetes.io/not-ready
+      operator: Exists
+      tolerationSeconds: 300
+    - effect: NoExecute
+      key: node.kubernetes.io/unreachable
+      operator: Exists
+      tolerationSeconds: 300
+    volumes:
+    - name: kube-api-access-fwzgg
+      projected:
+        defaultMode: 420
+        sources:
+        - serviceAccountToken:
+            expirationSeconds: 3607
+            path: token
+        - configMap:
+            items:
+            - key: ca.crt
+              path: ca.crt
+            name: kube-root-ca.crt
+        - downwardAPI:
+            items:
+            - fieldRef:
+                apiVersion: v1
+                fieldPath: metadata.namespace
+              path: namespace
+  status:
+    conditions:
+    - lastProbeTime: null
+      lastTransitionTime: "2026-07-04T16:50:02Z"
+      status: "True"
+      type: Initialized
+    - lastProbeTime: null
+      lastTransitionTime: "2026-07-04T16:50:04Z"
+      status: "True"
+      type: Ready
+    - lastProbeTime: null
+      lastTransitionTime: "2026-07-04T16:50:04Z"
+      status: "True"
+      type: ContainersReady
+    - lastProbeTime: null
+      lastTransitionTime: "2026-07-04T16:50:02Z"
+      status: "True"
+      type: PodScheduled
+    containerStatuses:
+    - containerID: docker://cec82d658bda28eb275dd8af7fd8f4e975579badb017447a3787c0e90e259610
+      image: redis:7.2-alpine
+      imageID: docker-pullable://redis@sha256:dfa18828cbc07b3ae6a95ec7343f6c214fdee2d836197b4be8e9904420762cd8
+      lastState: {}
+      name: redis
+      ready: true
+      restartCount: 0
+      started: true
+      state:
+        running:
+          startedAt: "2026-07-04T16:50:03Z"
+    hostIP: 192.168.223.76
+    phase: Running
+    podIP: 10.244.0.159
+    podIPs:
+    - ip: 10.244.0.159
+    qosClass: Burstable
+    startTime: "2026-07-04T16:50:02Z"
+- apiVersion: v1
+  kind: Pod
+  metadata:
+    creationTimestamp: "2026-07-05T14:22:27Z"
+    generateName: tre-v2-service-manager-659c9bf97f-
+    labels:
+      app.kubernetes.io/name: tre-v2-service-manager
+      pod-template-hash: 659c9bf97f
+    name: tre-v2-service-manager-659c9bf97f-srkt5
+    namespace: tre-v2
+    ownerReferences:
+    - apiVersion: apps/v1
+      blockOwnerDeletion: true
+      controller: true
+      kind: ReplicaSet
+      name: tre-v2-service-manager-659c9bf97f
+      uid: 6f131c26-3213-4709-8577-317097ac4a44
+    resourceVersion: "192938192"
+    uid: 407c8bba-3cdc-43dd-a524-f1b6fb5ff19f
+  spec:
+    containers:
+    - env:
+      - name: TRE_REDIS_URL
+        value: redis://tre-v2-redis:6379/0
+      - name: TRE_REGISTRY_PATH
+        value: /app/tre/deploy/registry.yaml
+      image: tre-v2-service-manager:20260705-f6dce214
+      imagePullPolicy: IfNotPresent
+      name: service-manager
+      ports:
+      - containerPort: 8000
+        name: http
+        protocol: TCP
+      resources:
+        limits:
+          cpu: "1"
+          memory: 1Gi
+        requests:
+          cpu: 250m
+          memory: 256Mi
+      terminationMessagePath: /dev/termination-log
+      terminationMessagePolicy: File
+      volumeMounts:
+      - mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+        name: kube-api-access-srtz9
+        readOnly: true
+    dnsPolicy: ClusterFirst
+    enableServiceLinks: true
+    nodeName: nscc-ds-4a100-node10
+    nodeSelector:
+      kubernetes.io/hostname: nscc-ds-4a100-node10
+    preemptionPolicy: PreemptLowerPriority
+    priority: 0
+    restartPolicy: Always
+    schedulerName: default-scheduler
+    securityContext: {}
+    serviceAccount: tre-v2-service-manager
+    serviceAccountName: tre-v2-service-manager
+    terminationGracePeriodSeconds: 30
+    tolerations:
+    - effect: NoExecute
+      key: node.kubernetes.io/not-ready
+      operator: Exists
+      tolerationSeconds: 300
+    - effect: NoExecute
+      key: node.kubernetes.io/unreachable
+      operator: Exists
+      tolerationSeconds: 300
+    volumes:
+    - name: kube-api-access-srtz9
+      projected:
+        defaultMode: 420
+        sources:
+        - serviceAccountToken:
+            expirationSeconds: 3607
+            path: token
+        - configMap:
+            items:
+            - key: ca.crt
+              path: ca.crt
+            name: kube-root-ca.crt
+        - downwardAPI:
+            items:
+            - fieldRef:
+                apiVersion: v1
+                fieldPath: metadata.namespace
+              path: namespace
+  status:
+    conditions:
+    - lastProbeTime: null
+      lastTransitionTime: "2026-07-05T14:22:27Z"
+      status: "True"
+      type: Initialized
+    - lastProbeTime: null
+      lastTransitionTime: "2026-07-05T14:22:29Z"
+      status: "True"
+      type: Ready
+    - lastProbeTime: null
+      lastTransitionTime: "2026-07-05T14:22:29Z"
+      status: "True"
+      type: ContainersReady
+    - lastProbeTime: null
+      lastTransitionTime: "2026-07-05T14:22:27Z"
+      status: "True"
+      type: PodScheduled
+    containerStatuses:
+    - containerID: docker://caf052344f8c017d4da7d067e21cf43d5ae8c72a04a39fab4aa24af51e3ada12
+      image: tre-v2-service-manager:20260705-f6dce214
+      imageID: docker://sha256:853929dbd5f0d3eaef24f092ce660cad8b35308cb63c0564bfe8f12f3823fce5
+      lastState: {}
+      name: service-manager
+      ready: true
+      restartCount: 0
+      started: true
+      state:
+        running:
+          startedAt: "2026-07-05T14:22:28Z"
+    hostIP: 192.168.223.76
+    phase: Running
+    podIP: 10.244.0.181
+    podIPs:
+    - ip: 10.244.0.181
+    qosClass: Burstable
+    startTime: "2026-07-05T14:22:27Z"
+- apiVersion: v1
+  kind: Pod
+  metadata:
+    creationTimestamp: "2026-07-04T08:50:17Z"
+    generateName: tre-v2-ui-65c6c86b45-
+    labels:
+      app.kubernetes.io/name: tre-v2-ui
+      pod-template-hash: 65c6c86b45
+    name: tre-v2-ui-65c6c86b45-gfqdb
+    namespace: tre-v2
+    ownerReferences:
+    - apiVersion: apps/v1
+      blockOwnerDeletion: true
+      controller: true
+      kind: ReplicaSet
+      name: tre-v2-ui-65c6c86b45
+      uid: a08086ed-f459-4e44-909f-755b64096067
+    resourceVersion: "192399083"
+    uid: 82c2a59a-fe36-4377-b34e-b7f20d44027a
+  spec:
+    containers:
+    - env:
+      - name: TRE_REDIS_URL
+        value: redis://tre-v2-redis:6379/0
+      - name: TRE_SERVICE_MANAGER_URL
+        value: http://tre-v2-service-manager:8000
+      - name: TRE_REGISTRY_PATH
+        value: /app/tre/deploy/registry.yaml
+      image: tre-v2-ui:20260704-669f0381
+      imagePullPolicy: IfNotPresent
+      name: ui
+      ports:
+      - containerPort: 8000
+        name: http
+        protocol: TCP
+      resources:
+        limits:
+          cpu: 500m
+          memory: 512Mi
+        requests:
+          cpu: 100m
+          memory: 128Mi
+      terminationMessagePath: /dev/termination-log
+      terminationMessagePolicy: File
+      volumeMounts:
+      - mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+        name: kube-api-access-npsrf
+        readOnly: true
+    dnsPolicy: ClusterFirst
+    enableServiceLinks: true
+    nodeName: nscc-ds-4a100-node10
+    nodeSelector:
+      kubernetes.io/hostname: nscc-ds-4a100-node10
+    preemptionPolicy: PreemptLowerPriority
+    priority: 0
+    restartPolicy: Always
+    schedulerName: default-scheduler
+    securityContext: {}
+    serviceAccount: tre-v2-ui
+    serviceAccountName: tre-v2-ui
+    terminationGracePeriodSeconds: 30
+    tolerations:
+    - effect: NoExecute
+      key: node.kubernetes.io/not-ready
+      operator: Exists
+      tolerationSeconds: 300
+    - effect: NoExecute
+      key: node.kubernetes.io/unreachable
+      operator: Exists
+      tolerationSeconds: 300
+    volumes:
+    - name: kube-api-access-npsrf
+      projected:
+        defaultMode: 420
+        sources:
+        - serviceAccountToken:
+            expirationSeconds: 3607
+            path: token
+        - configMap:
+            items:
+            - key: ca.crt
+              path: ca.crt
+            name: kube-root-ca.crt
+        - downwardAPI:
+            items:
+            - fieldRef:
+                apiVersion: v1
+                fieldPath: metadata.namespace
+              path: namespace
+  status:
+    conditions:
+    - lastProbeTime: null
+      lastTransitionTime: "2026-07-04T08:50:17Z"
+      status: "True"
+      type: Initialized
+    - lastProbeTime: null
+      lastTransitionTime: "2026-07-04T08:50:19Z"
+      status: "True"
+      type: Ready
+    - lastProbeTime: null
+      lastTransitionTime: "2026-07-04T08:50:19Z"
+      status: "True"
+      type: ContainersReady
+    - lastProbeTime: null
+      lastTransitionTime: "2026-07-04T08:50:17Z"
+      status: "True"
+      type: PodScheduled
+    containerStatuses:
+    - containerID: docker://2852d4a603fe621b6045da5af9940ab06df36598b1bcf559e6f173c95b4bf03d
+      image: tre-v2-ui:20260704-669f0381
+      imageID: docker://sha256:e81b68295f31103c22a24b51f1645e21e4d927b58e11f7127388628110ff06bc
+      lastState: {}
+      name: ui
+      ready: true
+      restartCount: 0
+      started: true
+      state:
+        running:
+          startedAt: "2026-07-04T08:50:18Z"
+    hostIP: 192.168.223.76
+    phase: Running
+    podIP: 10.244.0.105
+    podIPs:
+    - ip: 10.244.0.105
+    qosClass: Burstable
+    startTime: "2026-07-04T08:50:17Z"
+- apiVersion: v1
+  kind: Service
+  metadata:
+    annotations:
+      kubectl.kubernetes.io/last-applied-configuration: |
+        {"apiVersion":"v1","kind":"Service","metadata":{"annotations":{},"labels":{"app.kubernetes.io/name":"tre-v2-redis"},"name":"tre-v2-redis","namespace":"tre-v2"},"spec":{"ports":[{"name":"redis","port":6379,"targetPort":6379}],"selector":{"app.kubernetes.io/name":"tre-v2-redis"}}}
+    creationTimestamp: "2026-07-04T08:33:57Z"
+    labels:
+      app.kubernetes.io/name: tre-v2-redis
+    name: tre-v2-redis
+    namespace: tre-v2
+    resourceVersion: "192393782"
+    uid: bdb28989-4d2b-4857-8ead-2fac6d057822
+  spec:
+    clusterIP: 10.108.91.99
+    clusterIPs:
+    - 10.108.91.99
+    internalTrafficPolicy: Cluster
+    ipFamilies:
+    - IPv4
+    ipFamilyPolicy: SingleStack
+    ports:
+    - name: redis
+      port: 6379
+      protocol: TCP
+      targetPort: 6379
+    selector:
+      app.kubernetes.io/name: tre-v2-redis
+    sessionAffinity: None
+    type: ClusterIP
+  status:
+    loadBalancer: {}
+- apiVersion: v1
+  kind: Service
+  metadata:
+    annotations:
+      kubectl.kubernetes.io/last-applied-configuration: |
+        {"apiVersion":"v1","kind":"Service","metadata":{"annotations":{},"labels":{"app.kubernetes.io/name":"tre-v2-service-manager"},"name":"tre-v2-service-manager","namespace":"tre-v2"},"spec":{"ports":[{"name":"http","port":8000,"targetPort":8000}],"selector":{"app.kubernetes.io/name":"tre-v2-service-manager"}}}
+    creationTimestamp: "2026-07-04T08:33:57Z"
+    labels:
+      app.kubernetes.io/name: tre-v2-service-manager
+    name: tre-v2-service-manager
+    namespace: tre-v2
+    resourceVersion: "192393786"
+    uid: 339af81d-d6b2-46ca-9080-7a5320022a18
+  spec:
+    clusterIP: 10.111.21.116
+    clusterIPs:
+    - 10.111.21.116
+    internalTrafficPolicy: Cluster
+    ipFamilies:
+    - IPv4
+    ipFamilyPolicy: SingleStack
+    ports:
+    - name: http
+      port: 8000
+      protocol: TCP
+      targetPort: 8000
+    selector:
+      app.kubernetes.io/name: tre-v2-service-manager
+    sessionAffinity: None
+    type: ClusterIP
+  status:
+    loadBalancer: {}
+- apiVersion: v1
+  kind: Service
+  metadata:
+    annotations:
+      kubectl.kubernetes.io/last-applied-configuration: |
+        {"apiVersion":"v1","kind":"Service","metadata":{"annotations":{},"labels":{"app.kubernetes.io/name":"tre-v2-ui"},"name":"tre-v2-ui","namespace":"tre-v2"},"spec":{"ports":[{"name":"http","port":8000,"targetPort":8000}],"selector":{"app.kubernetes.io/name":"tre-v2-ui"}}}
+    creationTimestamp: "2026-07-04T08:33:57Z"
+    labels:
+      app.kubernetes.io/name: tre-v2-ui
+    name: tre-v2-ui
+    namespace: tre-v2
+    resourceVersion: "192393790"
+    uid: 84ab96d7-6adb-4824-80ec-32c9ba318766
+  spec:
+    clusterIP: 10.99.39.121
+    clusterIPs:
+    - 10.99.39.121
+    internalTrafficPolicy: Cluster
+    ipFamilies:
+    - IPv4
+    ipFamilyPolicy: SingleStack
+    ports:
+    - name: http
+      port: 8000
+      protocol: TCP
+      targetPort: 8000
+    selector:
+      app.kubernetes.io/name: tre-v2-ui
+    sessionAffinity: None
+    type: ClusterIP
+  status:
+    loadBalancer: {}
+- apiVersion: apps/v1
+  kind: DaemonSet
+  metadata:
+    annotations:
+      deprecated.daemonset.template.generation: "2"
+      kubectl.kubernetes.io/last-applied-configuration: |
+        {"apiVersion":"apps/v1","kind":"DaemonSet","metadata":{"annotations":{},"labels":{"app.kubernetes.io/name":"tre-v2-gpu-truth"},"name":"tre-v2-gpu-truth","namespace":"tre-v2"},"spec":{"selector":{"matchLabels":{"app.kubernetes.io/name":"tre-v2-gpu-truth"}},"template":{"metadata":{"labels":{"app.kubernetes.io/name":"tre-v2-gpu-truth"}},"spec":{"affinity":{"nodeAffinity":{"requiredDuringSchedulingIgnoredDuringExecution":{"nodeSelectorTerms":[{"matchExpressions":[{"key":"kubernetes.io/hostname","operator":"In","values":["nscc-ds-4a100-node9","nscc-ds-4a100-node10"]}]}]}}},"containers":[{"command":["python3","/agent/gpu_truth_agent.py","--redis-url","redis://tre-v2-redis:6379/0","--node","$(NODE_NAME)","--interval-s","30","--ttl-s","120"],"env":[{"name":"NODE_NAME","valueFrom":{"fieldRef":{"fieldPath":"spec.nodeName"}}},{"name":"NVIDIA_VISIBLE_DEVICES","value":"all"}],"image":"vllm/vllm-openai:0.10.1-sleep","imagePullPolicy":"IfNotPresent","name":"gpu-truth","resources":{"limits":{"cpu":"250m","memory":"256Mi"},"requests":{"cpu":"50m","memory":"64Mi"}},"volumeMounts":[{"mountPath":"/agent","name":"agent"}]}],"hostPID":false,"tolerations":[{"effect":"NoSchedule","key":"node-role.kubernetes.io/control-plane","operator":"Exists"}],"volumes":[{"configMap":{"name":"tre-v2-gpu-truth-agent"},"name":"agent"}]}}}}
+    creationTimestamp: "2026-07-06T02:18:11Z"
+    generation: 2
+    labels:
+      app.kubernetes.io/name: tre-v2-gpu-truth
+    name: tre-v2-gpu-truth
+    namespace: tre-v2
+    resourceVersion: "193153984"
+    uid: 91966cbc-fee7-4c3d-81eb-784ddb0f3cb4
+  spec:
+    revisionHistoryLimit: 10
+    selector:
+      matchLabels:
+        app.kubernetes.io/name: tre-v2-gpu-truth
+    template:
+      metadata:
+        creationTimestamp: null
+        labels:
+          app.kubernetes.io/name: tre-v2-gpu-truth
+      spec:
+        affinity:
+          nodeAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              nodeSelectorTerms:
+              - matchExpressions:
+                - key: kubernetes.io/hostname
+                  operator: In
+                  values:
+                  - nscc-ds-4a100-node9
+                  - nscc-ds-4a100-node10
+        containers:
+        - command:
+          - python3
+          - /agent/gpu_truth_agent.py
+          - --redis-url
+          - redis://tre-v2-redis:6379/0
+          - --node
+          - $(NODE_NAME)
+          - --interval-s
+          - "30"
+          - --ttl-s
+          - "120"
+          env:
+          - name: NODE_NAME
+            valueFrom:
+              fieldRef:
+                apiVersion: v1
+                fieldPath: spec.nodeName
+          - name: NVIDIA_VISIBLE_DEVICES
+            value: all
+          image: vllm/vllm-openai:0.10.1-sleep
+          imagePullPolicy: IfNotPresent
+          name: gpu-truth
+          resources:
+            limits:
+              cpu: 250m
+              memory: 256Mi
+            requests:
+              cpu: 50m
+              memory: 64Mi
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+          volumeMounts:
+          - mountPath: /agent
+            name: agent
+        dnsPolicy: ClusterFirst
+        restartPolicy: Always
+        schedulerName: default-scheduler
+        securityContext: {}
+        terminationGracePeriodSeconds: 30
+        tolerations:
+        - effect: NoSchedule
+          key: node-role.kubernetes.io/control-plane
+          operator: Exists
+        volumes:
+        - configMap:
+            defaultMode: 420
+            name: tre-v2-gpu-truth-agent
+          name: agent
+    updateStrategy:
+      rollingUpdate:
+        maxSurge: 0
+        maxUnavailable: 1
+      type: RollingUpdate
+  status:
+    currentNumberScheduled: 2
+    desiredNumberScheduled: 2
+    numberAvailable: 2
+    numberMisscheduled: 0
+    numberReady: 2
+    observedGeneration: 2
+    updatedNumberScheduled: 2
+- apiVersion: apps/v1
+  kind: Deployment
+  metadata:
+    annotations:
+      deployment.kubernetes.io/revision: "19"
+      kubectl.kubernetes.io/last-applied-configuration: |
+        {"apiVersion":"apps/v1","kind":"Deployment","metadata":{"annotations":{},"labels":{"app.kubernetes.io/name":"tre-v2-controller"},"name":"tre-v2-controller","namespace":"tre-v2"},"spec":{"replicas":1,"selector":{"matchLabels":{"app.kubernetes.io/name":"tre-v2-controller"}},"template":{"metadata":{"labels":{"app.kubernetes.io/name":"tre-v2-controller"}},"spec":{"containers":[{"env":[{"name":"TRE_REDIS_URL","value":"redis://tre-v2-redis:6379/0"},{"name":"TRE_METRICS_REDIS_URL","value":"redis://aibrix-redis-master.aibrix-system.svc.cluster.local:6379/0"},{"name":"TRE_METRICS_SCHEMA","value":"v1"},{"name":"TRE_SERVICE_MANAGER_URL","value":"http://tre-v2-service-manager:8000"},{"name":"TRE_REGISTRY_PATH","value":"/app/tre/deploy/registry.yaml"},{"name":"TRE_PERCENTILE_MODE","value":"bucket_upper"},{"name":"TRE_ABLATION_DISABLE_FAST_LOOP","value":"false"},{"name":"TRE_ABLATION_DISABLE_SAFESCALE","value":"false"}],"image":"tre-v2-controller:20260705-d795a715","imagePullPolicy":"IfNotPresent","name":"controller","resources":{"limits":{"cpu":"1","memory":"1Gi"},"requests":{"cpu":"250m","memory":"256Mi"}}}],"nodeSelector":{"kubernetes.io/hostname":"nscc-ds-4a100-node10"},"serviceAccountName":"tre-v2-controller"}}}}
+    creationTimestamp: "2026-07-04T08:33:57Z"
+    generation: 67
+    labels:
+      app.kubernetes.io/name: tre-v2-controller
+    name: tre-v2-controller
+    namespace: tre-v2
+    resourceVersion: "192928705"
+    uid: 812be1b6-d112-46e8-abc1-e1d4324a3d94
+  spec:
+    progressDeadlineSeconds: 600
+    replicas: 0
+    revisionHistoryLimit: 10
+    selector:
+      matchLabels:
+        app.kubernetes.io/name: tre-v2-controller
+    strategy:
+      rollingUpdate:
+        maxSurge: 25%
+        maxUnavailable: 25%
+      type: RollingUpdate
+    template:
+      metadata:
+        creationTimestamp: null
+        labels:
+          app.kubernetes.io/name: tre-v2-controller
+      spec:
+        containers:
+        - env:
+          - name: TRE_REDIS_URL
+            value: redis://tre-v2-redis:6379/0
+          - name: TRE_METRICS_REDIS_URL
+            value: redis://aibrix-redis-master.aibrix-system.svc.cluster.local:6379/0
+          - name: TRE_METRICS_SCHEMA
+            value: v1
+          - name: TRE_SERVICE_MANAGER_URL
+            value: http://tre-v2-service-manager:8000
+          - name: TRE_REGISTRY_PATH
+            value: /app/tre/deploy/registry.yaml
+          - name: TRE_PERCENTILE_MODE
+            value: bucket_upper
+          - name: TRE_ABLATION_DISABLE_FAST_LOOP
+            value: "false"
+          - name: TRE_ABLATION_DISABLE_SAFESCALE
+            value: "false"
+          image: tre-v2-controller:20260705-d795a715
+          imagePullPolicy: IfNotPresent
+          name: controller
+          resources:
+            limits:
+              cpu: "1"
+              memory: 1Gi
+            requests:
+              cpu: 250m
+              memory: 256Mi
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+        dnsPolicy: ClusterFirst
+        nodeSelector:
+          kubernetes.io/hostname: nscc-ds-4a100-node10
+        restartPolicy: Always
+        schedulerName: default-scheduler
+        securityContext: {}
+        serviceAccount: tre-v2-controller
+        serviceAccountName: tre-v2-controller
+        terminationGracePeriodSeconds: 30
+  status:
+    conditions:
+    - lastTransitionTime: "2026-07-04T08:33:57Z"
+      lastUpdateTime: "2026-07-05T12:30:39Z"
+      message: ReplicaSet "tre-v2-controller-65bb7cdf46" has successfully progressed.
+      reason: NewReplicaSetAvailable
+      status: "True"
+      type: Progressing
+    - lastTransitionTime: "2026-07-05T13:41:28Z"
+      lastUpdateTime: "2026-07-05T13:41:28Z"
+      message: Deployment has minimum availability.
+      reason: MinimumReplicasAvailable
+      status: "True"
+      type: Available
+    observedGeneration: 67
+- apiVersion: apps/v1
+  kind: Deployment
+  metadata:
+    annotations:
+      deployment.kubernetes.io/revision: "1"
+      kubectl.kubernetes.io/last-applied-configuration: |
+        {"apiVersion":"apps/v1","kind":"Deployment","metadata":{"annotations":{},"labels":{"app.kubernetes.io/name":"tre-v2-redis"},"name":"tre-v2-redis","namespace":"tre-v2"},"spec":{"replicas":1,"selector":{"matchLabels":{"app.kubernetes.io/name":"tre-v2-redis"}},"template":{"metadata":{"labels":{"app.kubernetes.io/name":"tre-v2-redis"}},"spec":{"containers":[{"image":"redis:7.2-alpine","imagePullPolicy":"IfNotPresent","name":"redis","ports":[{"containerPort":6379,"name":"redis"}],"resources":{"limits":{"cpu":"500m","memory":"512Mi"},"requests":{"cpu":"100m","memory":"128Mi"}}}],"nodeSelector":{"kubernetes.io/hostname":"nscc-ds-4a100-node10"}}}}}
+    creationTimestamp: "2026-07-04T08:33:57Z"
+    generation: 7
+    labels:
+      app.kubernetes.io/name: tre-v2-redis
+    name: tre-v2-redis
+    namespace: tre-v2
+    resourceVersion: "192545603"
+    uid: c88a270e-ece2-4d34-a4d6-263f8448bd2e
+  spec:
+    progressDeadlineSeconds: 600
+    replicas: 1
+    revisionHistoryLimit: 10
+    selector:
+      matchLabels:
+        app.kubernetes.io/name: tre-v2-redis
+    strategy:
+      rollingUpdate:
+        maxSurge: 25%
+        maxUnavailable: 25%
+      type: RollingUpdate
+    template:
+      metadata:
+        creationTimestamp: null
+        labels:
+          app.kubernetes.io/name: tre-v2-redis
+      spec:
+        containers:
+        - image: redis:7.2-alpine
+          imagePullPolicy: IfNotPresent
+          name: redis
+          ports:
+          - containerPort: 6379
+            name: redis
+            protocol: TCP
+          resources:
+            limits:
+              cpu: 500m
+              memory: 512Mi
+            requests:
+              cpu: 100m
+              memory: 128Mi
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+        dnsPolicy: ClusterFirst
+        nodeSelector:
+          kubernetes.io/hostname: nscc-ds-4a100-node10
+        restartPolicy: Always
+        schedulerName: default-scheduler
+        securityContext: {}
+        terminationGracePeriodSeconds: 30
+  status:
+    availableReplicas: 1
+    conditions:
+    - lastTransitionTime: "2026-07-04T08:33:57Z"
+      lastUpdateTime: "2026-07-04T08:34:26Z"
+      message: ReplicaSet "tre-v2-redis-6c47ddfb8d" has successfully progressed.
+      reason: NewReplicaSetAvailable
+      status: "True"
+      type: Progressing
+    - lastTransitionTime: "2026-07-04T16:50:04Z"
+      lastUpdateTime: "2026-07-04T16:50:04Z"
+      message: Deployment has minimum availability.
+      reason: MinimumReplicasAvailable
+      status: "True"
+      type: Available
+    observedGeneration: 7
+    readyReplicas: 1
+    replicas: 1
+    updatedReplicas: 1
+- apiVersion: apps/v1
+  kind: Deployment
+  metadata:
+    annotations:
+      deployment.kubernetes.io/revision: "21"
+      kubectl.kubernetes.io/last-applied-configuration: |
+        {"apiVersion":"apps/v1","kind":"Deployment","metadata":{"annotations":{},"labels":{"app.kubernetes.io/name":"tre-v2-service-manager"},"name":"tre-v2-service-manager","namespace":"tre-v2"},"spec":{"replicas":1,"selector":{"matchLabels":{"app.kubernetes.io/name":"tre-v2-service-manager"}},"template":{"metadata":{"labels":{"app.kubernetes.io/name":"tre-v2-service-manager"}},"spec":{"containers":[{"env":[{"name":"TRE_REDIS_URL","value":"redis://tre-v2-redis:6379/0"},{"name":"TRE_REGISTRY_PATH","value":"/app/tre/deploy/registry.yaml"}],"image":"tre-v2-service-manager:20260705-f6dce214","imagePullPolicy":"IfNotPresent","name":"service-manager","ports":[{"containerPort":8000,"name":"http"}],"resources":{"limits":{"cpu":"1","memory":"1Gi"},"requests":{"cpu":"250m","memory":"256Mi"}}}],"nodeSelector":{"kubernetes.io/hostname":"nscc-ds-4a100-node10"},"serviceAccountName":"tre-v2-service-manager"}}}}
+    creationTimestamp: "2026-07-04T08:33:57Z"
+    generation: 21
+    labels:
+      app.kubernetes.io/name: tre-v2-service-manager
+    name: tre-v2-service-manager
+    namespace: tre-v2
+    resourceVersion: "192938206"
+    uid: a1e3bd5d-7e30-4941-bbe3-8f575278c395
+  spec:
+    progressDeadlineSeconds: 600
+    replicas: 1
+    revisionHistoryLimit: 10
+    selector:
+      matchLabels:
+        app.kubernetes.io/name: tre-v2-service-manager
+    strategy:
+      rollingUpdate:
+        maxSurge: 25%
+        maxUnavailable: 25%
+      type: RollingUpdate
+    template:
+      metadata:
+        creationTimestamp: null
+        labels:
+          app.kubernetes.io/name: tre-v2-service-manager
+      spec:
+        containers:
+        - env:
+          - name: TRE_REDIS_URL
+            value: redis://tre-v2-redis:6379/0
+          - name: TRE_REGISTRY_PATH
+            value: /app/tre/deploy/registry.yaml
+          image: tre-v2-service-manager:20260705-f6dce214
+          imagePullPolicy: IfNotPresent
+          name: service-manager
+          ports:
+          - containerPort: 8000
+            name: http
+            protocol: TCP
+          resources:
+            limits:
+              cpu: "1"
+              memory: 1Gi
+            requests:
+              cpu: 250m
+              memory: 256Mi
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+        dnsPolicy: ClusterFirst
+        nodeSelector:
+          kubernetes.io/hostname: nscc-ds-4a100-node10
+        restartPolicy: Always
+        schedulerName: default-scheduler
+        securityContext: {}
+        serviceAccount: tre-v2-service-manager
+        serviceAccountName: tre-v2-service-manager
+        terminationGracePeriodSeconds: 30
+  status:
+    availableReplicas: 1
+    conditions:
+    - lastTransitionTime: "2026-07-04T16:40:22Z"
+      lastUpdateTime: "2026-07-04T16:40:22Z"
+      message: Deployment has minimum availability.
+      reason: MinimumReplicasAvailable
+      status: "True"
+      type: Available
+    - lastTransitionTime: "2026-07-04T08:33:57Z"
+      lastUpdateTime: "2026-07-05T14:22:29Z"
+      message: ReplicaSet "tre-v2-service-manager-659c9bf97f" has successfully progressed.
+      reason: NewReplicaSetAvailable
+      status: "True"
+      type: Progressing
+    observedGeneration: 21
+    readyReplicas: 1
+    replicas: 1
+    updatedReplicas: 1
+- apiVersion: apps/v1
+  kind: Deployment
+  metadata:
+    annotations:
+      deployment.kubernetes.io/revision: "3"
+      kubectl.kubernetes.io/last-applied-configuration: |
+        {"apiVersion":"apps/v1","kind":"Deployment","metadata":{"annotations":{},"labels":{"app.kubernetes.io/name":"tre-v2-ui"},"name":"tre-v2-ui","namespace":"tre-v2"},"spec":{"replicas":1,"selector":{"matchLabels":{"app.kubernetes.io/name":"tre-v2-ui"}},"template":{"metadata":{"labels":{"app.kubernetes.io/name":"tre-v2-ui"}},"spec":{"containers":[{"env":[{"name":"TRE_REDIS_URL","value":"redis://tre-v2-redis:6379/0"},{"name":"TRE_SERVICE_MANAGER_URL","value":"http://tre-v2-service-manager:8000"},{"name":"TRE_REGISTRY_PATH","value":"/app/tre/deploy/registry.yaml"}],"image":"tre-v2-ui:20260704-669f0381","imagePullPolicy":"IfNotPresent","name":"ui","ports":[{"containerPort":8000,"name":"http"}],"resources":{"limits":{"cpu":"500m","memory":"512Mi"},"requests":{"cpu":"100m","memory":"128Mi"}}}],"nodeSelector":{"kubernetes.io/hostname":"nscc-ds-4a100-node10"},"serviceAccountName":"tre-v2-ui"}}}}
+    creationTimestamp: "2026-07-04T08:33:57Z"
+    generation: 3
+    labels:
+      app.kubernetes.io/name: tre-v2-ui
+    name: tre-v2-ui
+    namespace: tre-v2
+    resourceVersion: "192399120"
+    uid: 35f38c6c-57eb-4ce5-bf42-87e65cac2051
+  spec:
+    progressDeadlineSeconds: 600
+    replicas: 1
+    revisionHistoryLimit: 10
+    selector:
+      matchLabels:
+        app.kubernetes.io/name: tre-v2-ui
+    strategy:
+      rollingUpdate:
+        maxSurge: 25%
+        maxUnavailable: 25%
+      type: RollingUpdate
+    template:
+      metadata:
+        creationTimestamp: null
+        labels:
+          app.kubernetes.io/name: tre-v2-ui
+      spec:
+        containers:
+        - env:
+          - name: TRE_REDIS_URL
+            value: redis://tre-v2-redis:6379/0
+          - name: TRE_SERVICE_MANAGER_URL
+            value: http://tre-v2-service-manager:8000
+          - name: TRE_REGISTRY_PATH
+            value: /app/tre/deploy/registry.yaml
+          image: tre-v2-ui:20260704-669f0381
+          imagePullPolicy: IfNotPresent
+          name: ui
+          ports:
+          - containerPort: 8000
+            name: http
+            protocol: TCP
+          resources:
+            limits:
+              cpu: 500m
+              memory: 512Mi
+            requests:
+              cpu: 100m
+              memory: 128Mi
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+        dnsPolicy: ClusterFirst
+        nodeSelector:
+          kubernetes.io/hostname: nscc-ds-4a100-node10
+        restartPolicy: Always
+        schedulerName: default-scheduler
+        securityContext: {}
+        serviceAccount: tre-v2-ui
+        serviceAccountName: tre-v2-ui
+        terminationGracePeriodSeconds: 30
+  status:
+    availableReplicas: 1
+    conditions:
+    - lastTransitionTime: "2026-07-04T08:33:58Z"
+      lastUpdateTime: "2026-07-04T08:33:58Z"
+      message: Deployment has minimum availability.
+      reason: MinimumReplicasAvailable
+      status: "True"
+      type: Available
+    - lastTransitionTime: "2026-07-04T08:33:57Z"
+      lastUpdateTime: "2026-07-04T08:50:19Z"
+      message: ReplicaSet "tre-v2-ui-65c6c86b45" has successfully progressed.
+      reason: NewReplicaSetAvailable
+      status: "True"
+      type: Progressing
+    observedGeneration: 3
+    readyReplicas: 1
+    replicas: 1
+    updatedReplicas: 1
+- apiVersion: apps/v1
+  kind: ReplicaSet
+  metadata:
+    annotations:
+      deployment.kubernetes.io/desired-replicas: "1"
+      deployment.kubernetes.io/max-replicas: "2"
+      deployment.kubernetes.io/revision: "13"
+    creationTimestamp: "2026-07-04T16:45:34Z"
+    generation: 2
+    labels:
+      app.kubernetes.io/name: tre-v2-controller
+      pod-template-hash: 575cbdc66b
+    name: tre-v2-controller-575cbdc66b
+    namespace: tre-v2
+    ownerReferences:
+    - apiVersion: apps/v1
+      blockOwnerDeletion: true
+      controller: true
+      kind: Deployment
+      name: tre-v2-controller
+      uid: 812be1b6-d112-46e8-abc1-e1d4324a3d94
+    resourceVersion: "192545323"
+    uid: 006255a6-0166-4a8e-b300-14a564661fe3
+  spec:
+    replicas: 0
+    selector:
+      matchLabels:
+        app.kubernetes.io/name: tre-v2-controller
+        pod-template-hash: 575cbdc66b
+    template:
+      metadata:
+        creationTimestamp: null
+        labels:
+          app.kubernetes.io/name: tre-v2-controller
+          pod-template-hash: 575cbdc66b
+      spec:
+        containers:
+        - env:
+          - name: TRE_REDIS_URL
+            value: redis://tre-v2-redis:6379/0
+          - name: TRE_METRICS_REDIS_URL
+            value: redis://aibrix-redis-master.aibrix-system.svc.cluster.local:6379/0
+          - name: TRE_METRICS_SCHEMA
+            value: v1
+          - name: TRE_SERVICE_MANAGER_URL
+            value: http://tre-v2-service-manager:8000
+          - name: TRE_REGISTRY_PATH
+            value: /app/tre/deploy/registry.yaml
+          - name: TRE_PERCENTILE_MODE
+            value: bucket_upper
+          - name: TRE_ABLATION_DISABLE_FAST_LOOP
+            value: "false"
+          - name: TRE_ABLATION_DISABLE_SAFESCALE
+            value: "false"
+          image: tre-v2-controller:20260704-a0b2ff7f
+          imagePullPolicy: IfNotPresent
+          name: controller
+          resources:
+            limits:
+              cpu: "1"
+              memory: 1Gi
+            requests:
+              cpu: 250m
+              memory: 256Mi
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+        dnsPolicy: ClusterFirst
+        nodeSelector:
+          kubernetes.io/hostname: nscc-ds-4a100-node10
+        restartPolicy: Always
+        schedulerName: default-scheduler
+        securityContext: {}
+        serviceAccount: tre-v2-controller
+        serviceAccountName: tre-v2-controller
+        terminationGracePeriodSeconds: 30
+  status:
+    observedGeneration: 2
+    replicas: 0
+- apiVersion: apps/v1
+  kind: ReplicaSet
+  metadata:
+    annotations:
+      deployment.kubernetes.io/desired-replicas: "0"
+      deployment.kubernetes.io/max-replicas: "0"
+      deployment.kubernetes.io/revision: "9"
+    creationTimestamp: "2026-07-04T15:32:20Z"
+    generation: 3
+    labels:
+      app.kubernetes.io/name: tre-v2-controller
+      pod-template-hash: 5b7bffff55
+    name: tre-v2-controller-5b7bffff55
+    namespace: tre-v2
+    ownerReferences:
+    - apiVersion: apps/v1
+      blockOwnerDeletion: true
+      controller: true
+      kind: Deployment
+      name: tre-v2-controller
+      uid: 812be1b6-d112-46e8-abc1-e1d4324a3d94
+    resourceVersion: "192523022"
+    uid: a2e7f768-9330-490c-aff4-c0bd98c62377
+  spec:
+    replicas: 0
+    selector:
+      matchLabels:
+        app.kubernetes.io/name: tre-v2-controller
+        pod-template-hash: 5b7bffff55
+    template:
+      metadata:
+        creationTimestamp: null
+        labels:
+          app.kubernetes.io/name: tre-v2-controller
+          pod-template-hash: 5b7bffff55
+      spec:
+        containers:
+        - env:
+          - name: TRE_REDIS_URL
+            value: redis://tre-v2-redis:6379/0
+          - name: TRE_METRICS_REDIS_URL
+            value: redis://aibrix-redis-master.aibrix-system.svc.cluster.local:6379/0
+          - name: TRE_METRICS_SCHEMA
+            value: v1
+          - name: TRE_SERVICE_MANAGER_URL
+            value: http://tre-v2-service-manager:8000
+          - name: TRE_REGISTRY_PATH
+            value: /app/tre/deploy/registry.yaml
+          - name: TRE_PERCENTILE_MODE
+            value: bucket_upper
+          - name: TRE_ABLATION_DISABLE_FAST_LOOP
+            value: "false"
+          - name: TRE_ABLATION_DISABLE_SAFESCALE
+            value: "false"
+          image: tre-v2-controller:20260704-b17133c9
+          imagePullPolicy: IfNotPresent
+          name: controller
+          resources:
+            limits:
+              cpu: "1"
+              memory: 1Gi
+            requests:
+              cpu: 250m
+              memory: 256Mi
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+        dnsPolicy: ClusterFirst
+        nodeSelector:
+          kubernetes.io/hostname: nscc-ds-4a100-node10
+        restartPolicy: Always
+        schedulerName: default-scheduler
+        securityContext: {}
+        serviceAccount: tre-v2-controller
+        serviceAccountName: tre-v2-controller
+        terminationGracePeriodSeconds: 30
+  status:
+    observedGeneration: 3
+    replicas: 0
+- apiVersion: apps/v1
+  kind: ReplicaSet
+  metadata:
+    annotations:
+      deployment.kubernetes.io/desired-replicas: "0"
+      deployment.kubernetes.io/max-replicas: "0"
+      deployment.kubernetes.io/revision: "19"
+    creationTimestamp: "2026-07-05T12:30:37Z"
+    generation: 8
+    labels:
+      app.kubernetes.io/name: tre-v2-controller
+      pod-template-hash: 65bb7cdf46
+    name: tre-v2-controller-65bb7cdf46
+    namespace: tre-v2
+    ownerReferences:
+    - apiVersion: apps/v1
+      blockOwnerDeletion: true
+      controller: true
+      kind: Deployment
+      name: tre-v2-controller
+      uid: 812be1b6-d112-46e8-abc1-e1d4324a3d94
+    resourceVersion: "192928704"
+    uid: f5240224-681e-493b-9f56-df9e89949dcb
+  spec:
+    replicas: 0
+    selector:
+      matchLabels:
+        app.kubernetes.io/name: tre-v2-controller
+        pod-template-hash: 65bb7cdf46
+    template:
+      metadata:
+        creationTimestamp: null
+        labels:
+          app.kubernetes.io/name: tre-v2-controller
+          pod-template-hash: 65bb7cdf46
+      spec:
+        containers:
+        - env:
+          - name: TRE_REDIS_URL
+            value: redis://tre-v2-redis:6379/0
+          - name: TRE_METRICS_REDIS_URL
+            value: redis://aibrix-redis-master.aibrix-system.svc.cluster.local:6379/0
+          - name: TRE_METRICS_SCHEMA
+            value: v1
+          - name: TRE_SERVICE_MANAGER_URL
+            value: http://tre-v2-service-manager:8000
+          - name: TRE_REGISTRY_PATH
+            value: /app/tre/deploy/registry.yaml
+          - name: TRE_PERCENTILE_MODE
+            value: bucket_upper
+          - name: TRE_ABLATION_DISABLE_FAST_LOOP
+            value: "false"
+          - name: TRE_ABLATION_DISABLE_SAFESCALE
+            value: "false"
+          image: tre-v2-controller:20260705-d795a715
+          imagePullPolicy: IfNotPresent
+          name: controller
+          resources:
+            limits:
+              cpu: "1"
+              memory: 1Gi
+            requests:
+              cpu: 250m
+              memory: 256Mi
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+        dnsPolicy: ClusterFirst
+        nodeSelector:
+          kubernetes.io/hostname: nscc-ds-4a100-node10
+        restartPolicy: Always
+        schedulerName: default-scheduler
+        securityContext: {}
+        serviceAccount: tre-v2-controller
+        serviceAccountName: tre-v2-controller
+        terminationGracePeriodSeconds: 30
+  status:
+    observedGeneration: 8
+    replicas: 0
+- apiVersion: apps/v1
+  kind: ReplicaSet
+  metadata:
+    annotations:
+      deployment.kubernetes.io/desired-replicas: "0"
+      deployment.kubernetes.io/max-replicas: "0"
+      deployment.kubernetes.io/revision: "11"
+    creationTimestamp: "2026-07-04T16:18:39Z"
+    generation: 3
+    labels:
+      app.kubernetes.io/name: tre-v2-controller
+      pod-template-hash: 6d5655d5b
+    name: tre-v2-controller-6d5655d5b
+    namespace: tre-v2
+    ownerReferences:
+    - apiVersion: apps/v1
+      blockOwnerDeletion: true
+      controller: true
+      kind: Deployment
+      name: tre-v2-controller
+      uid: 812be1b6-d112-46e8-abc1-e1d4324a3d94
+    resourceVersion: "192540512"
+    uid: 87bb7253-44d3-4c9b-9064-0b270b06db77
+  spec:
+    replicas: 0
+    selector:
+      matchLabels:
+        app.kubernetes.io/name: tre-v2-controller
+        pod-template-hash: 6d5655d5b
+    template:
+      metadata:
+        creationTimestamp: null
+        labels:
+          app.kubernetes.io/name: tre-v2-controller
+          pod-template-hash: 6d5655d5b
+      spec:
+        containers:
+        - env:
+          - name: TRE_REDIS_URL
+            value: redis://tre-v2-redis:6379/0
+          - name: TRE_METRICS_REDIS_URL
+            value: redis://aibrix-redis-master.aibrix-system.svc.cluster.local:6379/0
+          - name: TRE_METRICS_SCHEMA
+            value: v1
+          - name: TRE_SERVICE_MANAGER_URL
+            value: http://tre-v2-service-manager:8000
+          - name: TRE_REGISTRY_PATH
+            value: /app/tre/deploy/registry.yaml
+          - name: TRE_PERCENTILE_MODE
+            value: bucket_upper
+          - name: TRE_ABLATION_DISABLE_FAST_LOOP
+            value: "false"
+          - name: TRE_ABLATION_DISABLE_SAFESCALE
+            value: "false"
+          image: tre-v2-controller:20260704-f10439e6
+          imagePullPolicy: IfNotPresent
+          name: controller
+          resources:
+            limits:
+              cpu: "1"
+              memory: 1Gi
+            requests:
+              cpu: 250m
+              memory: 256Mi
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+        dnsPolicy: ClusterFirst
+        nodeSelector:
+          kubernetes.io/hostname: nscc-ds-4a100-node10
+        restartPolicy: Always
+        schedulerName: default-scheduler
+        securityContext: {}
+        serviceAccount: tre-v2-controller
+        serviceAccountName: tre-v2-controller
+        terminationGracePeriodSeconds: 30
+  status:
+    observedGeneration: 3
+    replicas: 0
+- apiVersion: apps/v1
+  kind: ReplicaSet
+  metadata:
+    annotations:
+      deployment.kubernetes.io/desired-replicas: "1"
+      deployment.kubernetes.io/max-replicas: "2"
+      deployment.kubernetes.io/revision: "18"
+    creationTimestamp: "2026-07-05T11:40:28Z"
+    generation: 2
+    labels:
+      app.kubernetes.io/name: tre-v2-controller
+      pod-template-hash: 6d899d65f
+    name: tre-v2-controller-6d899d65f
+    namespace: tre-v2
+    ownerReferences:
+    - apiVersion: apps/v1
+      blockOwnerDeletion: true
+      controller: true
+      kind: Deployment
+      name: tre-v2-controller
+      uid: 812be1b6-d112-46e8-abc1-e1d4324a3d94
+    resourceVersion: "192903517"
+    uid: 988f9417-01da-4e32-8327-84ba5551919e
+  spec:
+    replicas: 0
+    selector:
+      matchLabels:
+        app.kubernetes.io/name: tre-v2-controller
+        pod-template-hash: 6d899d65f
+    template:
+      metadata:
+        creationTimestamp: null
+        labels:
+          app.kubernetes.io/name: tre-v2-controller
+          pod-template-hash: 6d899d65f
+      spec:
+        containers:
+        - env:
+          - name: TRE_REDIS_URL
+            value: redis://tre-v2-redis:6379/0
+          - name: TRE_METRICS_REDIS_URL
+            value: redis://aibrix-redis-master.aibrix-system.svc.cluster.local:6379/0
+          - name: TRE_METRICS_SCHEMA
+            value: v1
+          - name: TRE_SERVICE_MANAGER_URL
+            value: http://tre-v2-service-manager:8000
+          - name: TRE_REGISTRY_PATH
+            value: /app/tre/deploy/registry.yaml
+          - name: TRE_PERCENTILE_MODE
+            value: bucket_upper
+          - name: TRE_ABLATION_DISABLE_FAST_LOOP
+            value: "false"
+          - name: TRE_ABLATION_DISABLE_SAFESCALE
+            value: "false"
+          image: tre-v2-controller:20260705-bb37a230
+          imagePullPolicy: IfNotPresent
+          name: controller
+          resources:
+            limits:
+              cpu: "1"
+              memory: 1Gi
+            requests:
+              cpu: 250m
+              memory: 256Mi
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+        dnsPolicy: ClusterFirst
+        nodeSelector:
+          kubernetes.io/hostname: nscc-ds-4a100-node10
+        restartPolicy: Always
+        schedulerName: default-scheduler
+        securityContext: {}
+        serviceAccount: tre-v2-controller
+        serviceAccountName: tre-v2-controller
+        terminationGracePeriodSeconds: 30
+  status:
+    observedGeneration: 2
+    replicas: 0
+- apiVersion: apps/v1
+  kind: ReplicaSet
+  metadata:
+    annotations:
+      deployment.kubernetes.io/desired-replicas: "1"
+      deployment.kubernetes.io/max-replicas: "2"
+      deployment.kubernetes.io/revision: "12"
+    creationTimestamp: "2026-07-04T16:38:13Z"
+    generation: 3
+    labels:
+      app.kubernetes.io/name: tre-v2-controller
+      pod-template-hash: 758787b7d
+    name: tre-v2-controller-758787b7d
+    namespace: tre-v2
+    ownerReferences:
+    - apiVersion: apps/v1
+      blockOwnerDeletion: true
+      controller: true
+      kind: Deployment
+      name: tre-v2-controller
+      uid: 812be1b6-d112-46e8-abc1-e1d4324a3d94
+    resourceVersion: "192544116"
+    uid: 2ba14a90-82c4-41bb-a37a-cb275e152c93
+  spec:
+    replicas: 0
+    selector:
+      matchLabels:
+        app.kubernetes.io/name: tre-v2-controller
+        pod-template-hash: 758787b7d
+    template:
+      metadata:
+        creationTimestamp: null
+        labels:
+          app.kubernetes.io/name: tre-v2-controller
+          pod-template-hash: 758787b7d
+      spec:
+        containers:
+        - env:
+          - name: TRE_REDIS_URL
+            value: redis://tre-v2-redis:6379/0
+          - name: TRE_METRICS_REDIS_URL
+            value: redis://aibrix-redis-master.aibrix-system.svc.cluster.local:6379/0
+          - name: TRE_METRICS_SCHEMA
+            value: v1
+          - name: TRE_SERVICE_MANAGER_URL
+            value: http://tre-v2-service-manager:8000
+          - name: TRE_REGISTRY_PATH
+            value: /app/tre/deploy/registry.yaml
+          - name: TRE_PERCENTILE_MODE
+            value: bucket_upper
+          - name: TRE_ABLATION_DISABLE_FAST_LOOP
+            value: "false"
+          - name: TRE_ABLATION_DISABLE_SAFESCALE
+            value: "false"
+          image: tre-v2-controller:20260704-883222d3
+          imagePullPolicy: IfNotPresent
+          name: controller
+          resources:
+            limits:
+              cpu: "1"
+              memory: 1Gi
+            requests:
+              cpu: 250m
+              memory: 256Mi
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+        dnsPolicy: ClusterFirst
+        nodeSelector:
+          kubernetes.io/hostname: nscc-ds-4a100-node10
+        restartPolicy: Always
+        schedulerName: default-scheduler
+        securityContext: {}
+        serviceAccount: tre-v2-controller
+        serviceAccountName: tre-v2-controller
+        terminationGracePeriodSeconds: 30
+  status:
+    observedGeneration: 3
+    replicas: 0
+- apiVersion: apps/v1
+  kind: ReplicaSet
+  metadata:
+    annotations:
+      deployment.kubernetes.io/desired-replicas: "0"
+      deployment.kubernetes.io/max-replicas: "0"
+      deployment.kubernetes.io/revision: "16"
+      deployment.kubernetes.io/revision-history: "14"
+    creationTimestamp: "2026-07-04T16:49:14Z"
+    generation: 6
+    labels:
+      app.kubernetes.io/name: tre-v2-controller
+      pod-template-hash: 77cfd77dc8
+    name: tre-v2-controller-77cfd77dc8
+    namespace: tre-v2
+    ownerReferences:
+    - apiVersion: apps/v1
+      blockOwnerDeletion: true
+      controller: true
+      kind: Deployment
+      name: tre-v2-controller
+      uid: 812be1b6-d112-46e8-abc1-e1d4324a3d94
+    resourceVersion: "192835715"
+    uid: 6a9bf1e0-1164-4c68-8d11-2df3285bcfb8
+  spec:
+    replicas: 0
+    selector:
+      matchLabels:
+        app.kubernetes.io/name: tre-v2-controller
+        pod-template-hash: 77cfd77dc8
+    template:
+      metadata:
+        creationTimestamp: null
+        labels:
+          app.kubernetes.io/name: tre-v2-controller
+          pod-template-hash: 77cfd77dc8
+      spec:
+        containers:
+        - env:
+          - name: TRE_REDIS_URL
+            value: redis://tre-v2-redis:6379/0
+          - name: TRE_METRICS_REDIS_URL
+            value: redis://aibrix-redis-master.aibrix-system.svc.cluster.local:6379/0
+          - name: TRE_METRICS_SCHEMA
+            value: v1
+          - name: TRE_SERVICE_MANAGER_URL
+            value: http://tre-v2-service-manager:8000
+          - name: TRE_REGISTRY_PATH
+            value: /app/tre/deploy/registry.yaml
+          - name: TRE_PERCENTILE_MODE
+            value: bucket_upper
+          - name: TRE_ABLATION_DISABLE_FAST_LOOP
+            value: "false"
+          - name: TRE_ABLATION_DISABLE_SAFESCALE
+            value: "false"
+          image: tre-v2-controller:20260704-303047a0
+          imagePullPolicy: IfNotPresent
+          name: controller
+          resources:
+            limits:
+              cpu: "1"
+              memory: 1Gi
+            requests:
+              cpu: 250m
+              memory: 256Mi
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+        dnsPolicy: ClusterFirst
+        nodeSelector:
+          kubernetes.io/hostname: nscc-ds-4a100-node10
+        restartPolicy: Always
+        schedulerName: default-scheduler
+        securityContext: {}
+        serviceAccount: tre-v2-controller
+        serviceAccountName: tre-v2-controller
+        terminationGracePeriodSeconds: 30
+  status:
+    observedGeneration: 6
+    replicas: 0
+- apiVersion: apps/v1
+  kind: ReplicaSet
+  metadata:
+    annotations:
+      deployment.kubernetes.io/desired-replicas: "0"
+      deployment.kubernetes.io/max-replicas: "0"
+      deployment.kubernetes.io/revision: "8"
+    creationTimestamp: "2026-07-04T15:18:36Z"
+    generation: 3
+    labels:
+      app.kubernetes.io/name: tre-v2-controller
+      pod-template-hash: 7b8b5b74fb
+    name: tre-v2-controller-7b8b5b74fb
+    namespace: tre-v2
+    ownerReferences:
+    - apiVersion: apps/v1
+      blockOwnerDeletion: true
+      controller: true
+      kind: Deployment
+      name: tre-v2-controller
+      uid: 812be1b6-d112-46e8-abc1-e1d4324a3d94
+    resourceVersion: "192519265"
+    uid: a90c898c-b501-411a-b421-0f4fa284dfa5
+  spec:
+    replicas: 0
+    selector:
+      matchLabels:
+        app.kubernetes.io/name: tre-v2-controller
+        pod-template-hash: 7b8b5b74fb
+    template:
+      metadata:
+        creationTimestamp: null
+        labels:
+          app.kubernetes.io/name: tre-v2-controller
+          pod-template-hash: 7b8b5b74fb
+      spec:
+        containers:
+        - env:
+          - name: TRE_REDIS_URL
+            value: redis://tre-v2-redis:6379/0
+          - name: TRE_METRICS_REDIS_URL
+            value: redis://aibrix-redis-master.aibrix-system.svc.cluster.local:6379/0
+          - name: TRE_METRICS_SCHEMA
+            value: v1
+          - name: TRE_SERVICE_MANAGER_URL
+            value: http://tre-v2-service-manager:8000
+          - name: TRE_REGISTRY_PATH
+            value: /app/tre/deploy/registry.yaml
+          - name: TRE_PERCENTILE_MODE
+            value: bucket_upper
+          - name: TRE_ABLATION_DISABLE_FAST_LOOP
+            value: "false"
+          - name: TRE_ABLATION_DISABLE_SAFESCALE
+            value: "false"
+          image: tre-v2-controller:20260704-9dd7b9ab
+          imagePullPolicy: IfNotPresent
+          name: controller
+          resources:
+            limits:
+              cpu: "1"
+              memory: 1Gi
+            requests:
+              cpu: 250m
+              memory: 256Mi
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+        dnsPolicy: ClusterFirst
+        nodeSelector:
+          kubernetes.io/hostname: nscc-ds-4a100-node10
+        restartPolicy: Always
+        schedulerName: default-scheduler
+        securityContext: {}
+        serviceAccount: tre-v2-controller
+        serviceAccountName: tre-v2-controller
+        terminationGracePeriodSeconds: 30
+  status:
+    observedGeneration: 3
+    replicas: 0
+- apiVersion: apps/v1
+  kind: ReplicaSet
+  metadata:
+    annotations:
+      deployment.kubernetes.io/desired-replicas: "0"
+      deployment.kubernetes.io/max-replicas: "0"
+      deployment.kubernetes.io/revision: "10"
+    creationTimestamp: "2026-07-04T15:40:29Z"
+    generation: 5
+    labels:
+      app.kubernetes.io/name: tre-v2-controller
+      pod-template-hash: 7d677cb4df
+    name: tre-v2-controller-7d677cb4df
+    namespace: tre-v2
+    ownerReferences:
+    - apiVersion: apps/v1
+      blockOwnerDeletion: true
+      controller: true
+      kind: Deployment
+      name: tre-v2-controller
+      uid: 812be1b6-d112-46e8-abc1-e1d4324a3d94
+    resourceVersion: "192533188"
+    uid: 9852a8f9-c923-455b-b07d-1f10b96d73fb
+  spec:
+    replicas: 0
+    selector:
+      matchLabels:
+        app.kubernetes.io/name: tre-v2-controller
+        pod-template-hash: 7d677cb4df
+    template:
+      metadata:
+        creationTimestamp: null
+        labels:
+          app.kubernetes.io/name: tre-v2-controller
+          pod-template-hash: 7d677cb4df
+      spec:
+        containers:
+        - env:
+          - name: TRE_REDIS_URL
+            value: redis://tre-v2-redis:6379/0
+          - name: TRE_METRICS_REDIS_URL
+            value: redis://aibrix-redis-master.aibrix-system.svc.cluster.local:6379/0
+          - name: TRE_METRICS_SCHEMA
+            value: v1
+          - name: TRE_SERVICE_MANAGER_URL
+            value: http://tre-v2-service-manager:8000
+          - name: TRE_REGISTRY_PATH
+            value: /app/tre/deploy/registry.yaml
+          - name: TRE_PERCENTILE_MODE
+            value: bucket_upper
+          - name: TRE_ABLATION_DISABLE_FAST_LOOP
+            value: "false"
+          - name: TRE_ABLATION_DISABLE_SAFESCALE
+            value: "false"
+          image: tre-v2-controller:20260704-e0b4bb64
+          imagePullPolicy: IfNotPresent
+          name: controller
+          resources:
+            limits:
+              cpu: "1"
+              memory: 1Gi
+            requests:
+              cpu: 250m
+              memory: 256Mi
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+        dnsPolicy: ClusterFirst
+        nodeSelector:
+          kubernetes.io/hostname: nscc-ds-4a100-node10
+        restartPolicy: Always
+        schedulerName: default-scheduler
+        securityContext: {}
+        serviceAccount: tre-v2-controller
+        serviceAccountName: tre-v2-controller
+        terminationGracePeriodSeconds: 30
+  status:
+    observedGeneration: 5
+    replicas: 0
+- apiVersion: apps/v1
+  kind: ReplicaSet
+  metadata:
+    annotations:
+      deployment.kubernetes.io/desired-replicas: "0"
+      deployment.kubernetes.io/max-replicas: "0"
+      deployment.kubernetes.io/revision: "15"
+    creationTimestamp: "2026-07-05T07:31:48Z"
+    generation: 2
+    labels:
+      app.kubernetes.io/name: tre-v2-controller
+      pod-template-hash: 7d9b8dfdd6
+    name: tre-v2-controller-7d9b8dfdd6
+    namespace: tre-v2
+    ownerReferences:
+    - apiVersion: apps/v1
+      blockOwnerDeletion: true
+      controller: true
+      kind: Deployment
+      name: tre-v2-controller
+      uid: 812be1b6-d112-46e8-abc1-e1d4324a3d94
+    resourceVersion: "192814910"
+    uid: c90448bb-e3c8-4fa0-974f-83961562ea38
+  spec:
+    replicas: 0
+    selector:
+      matchLabels:
+        app.kubernetes.io/name: tre-v2-controller
+        pod-template-hash: 7d9b8dfdd6
+    template:
+      metadata:
+        creationTimestamp: null
+        labels:
+          app.kubernetes.io/name: tre-v2-controller
+          pod-template-hash: 7d9b8dfdd6
+      spec:
+        containers:
+        - env:
+          - name: TRE_REDIS_URL
+            value: redis://tre-v2-redis:6379/0
+          - name: TRE_METRICS_REDIS_URL
+            value: redis://aibrix-redis-master.aibrix-system.svc.cluster.local:6379/0
+          - name: TRE_METRICS_SCHEMA
+            value: v1
+          - name: TRE_SERVICE_MANAGER_URL
+            value: http://tre-v2-service-manager:8000
+          - name: TRE_REGISTRY_PATH
+            value: /app/tre/deploy/registry.yaml
+          - name: TRE_PERCENTILE_MODE
+            value: bucket_upper
+          - name: TRE_ABLATION_DISABLE_FAST_LOOP
+            value: "false"
+          - name: TRE_ABLATION_DISABLE_SAFESCALE
+            value: "false"
+          - name: TRE_SIGNAL_SOURCE
+            value: queue_len
+          image: tre-v2-controller:20260704-303047a0
+          imagePullPolicy: IfNotPresent
+          name: controller
+          resources:
+            limits:
+              cpu: "1"
+              memory: 1Gi
+            requests:
+              cpu: 250m
+              memory: 256Mi
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+        dnsPolicy: ClusterFirst
+        nodeSelector:
+          kubernetes.io/hostname: nscc-ds-4a100-node10
+        restartPolicy: Always
+        schedulerName: default-scheduler
+        securityContext: {}
+        serviceAccount: tre-v2-controller
+        serviceAccountName: tre-v2-controller
+        terminationGracePeriodSeconds: 30
+  status:
+    observedGeneration: 2
+    replicas: 0
+- apiVersion: apps/v1
+  kind: ReplicaSet
+  metadata:
+    annotations:
+      deployment.kubernetes.io/desired-replicas: "1"
+      deployment.kubernetes.io/max-replicas: "2"
+      deployment.kubernetes.io/revision: "17"
+    creationTimestamp: "2026-07-05T11:01:39Z"
+    generation: 3
+    labels:
+      app.kubernetes.io/name: tre-v2-controller
+      pod-template-hash: d6d498484
+    name: tre-v2-controller-d6d498484
+    namespace: tre-v2
+    ownerReferences:
+    - apiVersion: apps/v1
+      blockOwnerDeletion: true
+      controller: true
+      kind: Deployment
+      name: tre-v2-controller
+      uid: 812be1b6-d112-46e8-abc1-e1d4324a3d94
+    resourceVersion: "192888379"
+    uid: c8dace72-fcb9-400a-90ff-7224b61aab22
+  spec:
+    replicas: 0
+    selector:
+      matchLabels:
+        app.kubernetes.io/name: tre-v2-controller
+        pod-template-hash: d6d498484
+    template:
+      metadata:
+        creationTimestamp: null
+        labels:
+          app.kubernetes.io/name: tre-v2-controller
+          pod-template-hash: d6d498484
+      spec:
+        containers:
+        - env:
+          - name: TRE_REDIS_URL
+            value: redis://tre-v2-redis:6379/0
+          - name: TRE_METRICS_REDIS_URL
+            value: redis://aibrix-redis-master.aibrix-system.svc.cluster.local:6379/0
+          - name: TRE_METRICS_SCHEMA
+            value: v1
+          - name: TRE_SERVICE_MANAGER_URL
+            value: http://tre-v2-service-manager:8000
+          - name: TRE_REGISTRY_PATH
+            value: /app/tre/deploy/registry.yaml
+          - name: TRE_PERCENTILE_MODE
+            value: bucket_upper
+          - name: TRE_ABLATION_DISABLE_FAST_LOOP
+            value: "false"
+          - name: TRE_ABLATION_DISABLE_SAFESCALE
+            value: "false"
+          image: tre-v2-controller:20260705-7bfb0709
+          imagePullPolicy: IfNotPresent
+          name: controller
+          resources:
+            limits:
+              cpu: "1"
+              memory: 1Gi
+            requests:
+              cpu: 250m
+              memory: 256Mi
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+        dnsPolicy: ClusterFirst
+        nodeSelector:
+          kubernetes.io/hostname: nscc-ds-4a100-node10
+        restartPolicy: Always
+        schedulerName: default-scheduler
+        securityContext: {}
+        serviceAccount: tre-v2-controller
+        serviceAccountName: tre-v2-controller
+        terminationGracePeriodSeconds: 30
+  status:
+    observedGeneration: 3
+    replicas: 0
+- apiVersion: apps/v1
+  kind: ReplicaSet
+  metadata:
+    annotations:
+      deployment.kubernetes.io/desired-replicas: "1"
+      deployment.kubernetes.io/max-replicas: "2"
+      deployment.kubernetes.io/revision: "1"
+    creationTimestamp: "2026-07-04T08:33:57Z"
+    generation: 7
+    labels:
+      app.kubernetes.io/name: tre-v2-redis
+      pod-template-hash: 6c47ddfb8d
+    name: tre-v2-redis-6c47ddfb8d
+    namespace: tre-v2
+    ownerReferences:
+    - apiVersion: apps/v1
+      blockOwnerDeletion: true
+      controller: true
+      kind: Deployment
+      name: tre-v2-redis
+      uid: c88a270e-ece2-4d34-a4d6-263f8448bd2e
+    resourceVersion: "192545602"
+    uid: 3162fc72-f2a8-4f8c-8f94-c29b32019f1b
+  spec:
+    replicas: 1
+    selector:
+      matchLabels:
+        app.kubernetes.io/name: tre-v2-redis
+        pod-template-hash: 6c47ddfb8d
+    template:
+      metadata:
+        creationTimestamp: null
+        labels:
+          app.kubernetes.io/name: tre-v2-redis
+          pod-template-hash: 6c47ddfb8d
+      spec:
+        containers:
+        - image: redis:7.2-alpine
+          imagePullPolicy: IfNotPresent
+          name: redis
+          ports:
+          - containerPort: 6379
+            name: redis
+            protocol: TCP
+          resources:
+            limits:
+              cpu: 500m
+              memory: 512Mi
+            requests:
+              cpu: 100m
+              memory: 128Mi
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+        dnsPolicy: ClusterFirst
+        nodeSelector:
+          kubernetes.io/hostname: nscc-ds-4a100-node10
+        restartPolicy: Always
+        schedulerName: default-scheduler
+        securityContext: {}
+        terminationGracePeriodSeconds: 30
+  status:
+    availableReplicas: 1
+    fullyLabeledReplicas: 1
+    observedGeneration: 7
+    readyReplicas: 1
+    replicas: 1
+- apiVersion: apps/v1
+  kind: ReplicaSet
+  metadata:
+    annotations:
+      deployment.kubernetes.io/desired-replicas: "1"
+      deployment.kubernetes.io/max-replicas: "2"
+      deployment.kubernetes.io/revision: "15"
+    creationTimestamp: "2026-07-05T05:02:02Z"
+    generation: 2
+    labels:
+      app.kubernetes.io/name: tre-v2-service-manager
+      pod-template-hash: 58c55ccb47
+    name: tre-v2-service-manager-58c55ccb47
+    namespace: tre-v2
+    ownerReferences:
+    - apiVersion: apps/v1
+      blockOwnerDeletion: true
+      controller: true
+      kind: Deployment
+      name: tre-v2-service-manager
+      uid: a1e3bd5d-7e30-4941-bbe3-8f575278c395
+    resourceVersion: "192767691"
+    uid: 5e8584d1-73bd-4bd1-b4d3-3c019fbf5a54
+  spec:
+    replicas: 0
+    selector:
+      matchLabels:
+        app.kubernetes.io/name: tre-v2-service-manager
+        pod-template-hash: 58c55ccb47
+    template:
+      metadata:
+        creationTimestamp: null
+        labels:
+          app.kubernetes.io/name: tre-v2-service-manager
+          pod-template-hash: 58c55ccb47
+      spec:
+        containers:
+        - env:
+          - name: TRE_REDIS_URL
+            value: redis://tre-v2-redis:6379/0
+          - name: TRE_REGISTRY_PATH
+            value: /app/tre/deploy/registry.yaml
+          image: tre-v2-service-manager:20260705-a3bcf79b
+          imagePullPolicy: IfNotPresent
+          name: service-manager
+          ports:
+          - containerPort: 8000
+            name: http
+            protocol: TCP
+          resources:
+            limits:
+              cpu: "1"
+              memory: 1Gi
+            requests:
+              cpu: 250m
+              memory: 256Mi
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+        dnsPolicy: ClusterFirst
+        nodeSelector:
+          kubernetes.io/hostname: nscc-ds-4a100-node10
+        restartPolicy: Always
+        schedulerName: default-scheduler
+        securityContext: {}
+        serviceAccount: tre-v2-service-manager
+        serviceAccountName: tre-v2-service-manager
+        terminationGracePeriodSeconds: 30
+  status:
+    observedGeneration: 2
+    replicas: 0
+- apiVersion: apps/v1
+  kind: ReplicaSet
+  metadata:
+    annotations:
+      deployment.kubernetes.io/desired-replicas: "1"
+      deployment.kubernetes.io/max-replicas: "2"
+      deployment.kubernetes.io/revision: "16"
+    creationTimestamp: "2026-07-05T05:09:21Z"
+    generation: 2
+    labels:
+      app.kubernetes.io/name: tre-v2-service-manager
+      pod-template-hash: 5d9d9776f5
+    name: tre-v2-service-manager-5d9d9776f5
+    namespace: tre-v2
+    ownerReferences:
+    - apiVersion: apps/v1
+      blockOwnerDeletion: true
+      controller: true
+      kind: Deployment
+      name: tre-v2-service-manager
+      uid: a1e3bd5d-7e30-4941-bbe3-8f575278c395
+    resourceVersion: "192779375"
+    uid: fcc9901b-6722-499c-b008-8d4a1d6df4d6
+  spec:
+    replicas: 0
+    selector:
+      matchLabels:
+        app.kubernetes.io/name: tre-v2-service-manager
+        pod-template-hash: 5d9d9776f5
+    template:
+      metadata:
+        creationTimestamp: null
+        labels:
+          app.kubernetes.io/name: tre-v2-service-manager
+          pod-template-hash: 5d9d9776f5
+      spec:
+        containers:
+        - env:
+          - name: TRE_REDIS_URL
+            value: redis://tre-v2-redis:6379/0
+          - name: TRE_REGISTRY_PATH
+            value: /app/tre/deploy/registry.yaml
+          image: tre-v2-service-manager:20260705-fa313832
+          imagePullPolicy: IfNotPresent
+          name: service-manager
+          ports:
+          - containerPort: 8000
+            name: http
+            protocol: TCP
+          resources:
+            limits:
+              cpu: "1"
+              memory: 1Gi
+            requests:
+              cpu: 250m
+              memory: 256Mi
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+        dnsPolicy: ClusterFirst
+        nodeSelector:
+          kubernetes.io/hostname: nscc-ds-4a100-node10
+        restartPolicy: Always
+        schedulerName: default-scheduler
+        securityContext: {}
+        serviceAccount: tre-v2-service-manager
+        serviceAccountName: tre-v2-service-manager
+        terminationGracePeriodSeconds: 30
+  status:
+    observedGeneration: 2
+    replicas: 0
+- apiVersion: apps/v1
+  kind: ReplicaSet
+  metadata:
+    annotations:
+      deployment.kubernetes.io/desired-replicas: "1"
+      deployment.kubernetes.io/max-replicas: "2"
+      deployment.kubernetes.io/revision: "18"
+    creationTimestamp: "2026-07-05T06:24:57Z"
+    generation: 2
+    labels:
+      app.kubernetes.io/name: tre-v2-service-manager
+      pod-template-hash: 5db6bbdd5f
+    name: tre-v2-service-manager-5db6bbdd5f
+    namespace: tre-v2
+    ownerReferences:
+    - apiVersion: apps/v1
+      blockOwnerDeletion: true
+      controller: true
+      kind: Deployment
+      name: tre-v2-service-manager
+      uid: a1e3bd5d-7e30-4941-bbe3-8f575278c395
+    resourceVersion: "192868459"
+    uid: 39ac99d9-f4e5-45a0-ac39-8b29bc484805
+  spec:
+    replicas: 0
+    selector:
+      matchLabels:
+        app.kubernetes.io/name: tre-v2-service-manager
+        pod-template-hash: 5db6bbdd5f
+    template:
+      metadata:
+        creationTimestamp: null
+        labels:
+          app.kubernetes.io/name: tre-v2-service-manager
+          pod-template-hash: 5db6bbdd5f
+      spec:
+        containers:
+        - env:
+          - name: TRE_REDIS_URL
+            value: redis://tre-v2-redis:6379/0
+          - name: TRE_REGISTRY_PATH
+            value: /app/tre/deploy/registry.yaml
+          image: tre-v2-service-manager:20260705-ff9d1580
+          imagePullPolicy: IfNotPresent
+          name: service-manager
+          ports:
+          - containerPort: 8000
+            name: http
+            protocol: TCP
+          resources:
+            limits:
+              cpu: "1"
+              memory: 1Gi
+            requests:
+              cpu: 250m
+              memory: 256Mi
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+        dnsPolicy: ClusterFirst
+        nodeSelector:
+          kubernetes.io/hostname: nscc-ds-4a100-node10
+        restartPolicy: Always
+        schedulerName: default-scheduler
+        securityContext: {}
+        serviceAccount: tre-v2-service-manager
+        serviceAccountName: tre-v2-service-manager
+        terminationGracePeriodSeconds: 30
+  status:
+    observedGeneration: 2
+    replicas: 0
+- apiVersion: apps/v1
+  kind: ReplicaSet
+  metadata:
+    annotations:
+      deployment.kubernetes.io/desired-replicas: "1"
+      deployment.kubernetes.io/max-replicas: "2"
+      deployment.kubernetes.io/revision: "14"
+    creationTimestamp: "2026-07-04T13:42:51Z"
+    generation: 2
+    labels:
+      app.kubernetes.io/name: tre-v2-service-manager
+      pod-template-hash: 5f6bb479f8
+    name: tre-v2-service-manager-5f6bb479f8
+    namespace: tre-v2
+    ownerReferences:
+    - apiVersion: apps/v1
+      blockOwnerDeletion: true
+      controller: true
+      kind: Deployment
+      name: tre-v2-service-manager
+      uid: a1e3bd5d-7e30-4941-bbe3-8f575278c395
+    resourceVersion: "192765246"
+    uid: 679fd1f2-161e-41e4-bffe-4cac5e84ec15
+  spec:
+    replicas: 0
+    selector:
+      matchLabels:
+        app.kubernetes.io/name: tre-v2-service-manager
+        pod-template-hash: 5f6bb479f8
+    template:
+      metadata:
+        creationTimestamp: null
+        labels:
+          app.kubernetes.io/name: tre-v2-service-manager
+          pod-template-hash: 5f6bb479f8
+      spec:
+        containers:
+        - env:
+          - name: TRE_REDIS_URL
+            value: redis://tre-v2-redis:6379/0
+          - name: TRE_REGISTRY_PATH
+            value: /app/tre/deploy/registry.yaml
+          image: tre-v2-service-manager:20260704-053e22f2
+          imagePullPolicy: IfNotPresent
+          name: service-manager
+          ports:
+          - containerPort: 8000
+            name: http
+            protocol: TCP
+          resources:
+            limits:
+              cpu: "1"
+              memory: 1Gi
+            requests:
+              cpu: 250m
+              memory: 256Mi
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+        dnsPolicy: ClusterFirst
+        nodeSelector:
+          kubernetes.io/hostname: nscc-ds-4a100-node10
+        restartPolicy: Always
+        schedulerName: default-scheduler
+        securityContext: {}
+        serviceAccount: tre-v2-service-manager
+        serviceAccountName: tre-v2-service-manager
+        terminationGracePeriodSeconds: 30
+  status:
+    observedGeneration: 2
+    replicas: 0
+- apiVersion: apps/v1
+  kind: ReplicaSet
+  metadata:
+    annotations:
+      deployment.kubernetes.io/desired-replicas: "1"
+      deployment.kubernetes.io/max-replicas: "2"
+      deployment.kubernetes.io/revision: "11"
+    creationTimestamp: "2026-07-04T13:19:29Z"
+    generation: 2
+    labels:
+      app.kubernetes.io/name: tre-v2-service-manager
+      pod-template-hash: 64d578b7df
+    name: tre-v2-service-manager-64d578b7df
+    namespace: tre-v2
+    ownerReferences:
+    - apiVersion: apps/v1
+      blockOwnerDeletion: true
+      controller: true
+      kind: Deployment
+      name: tre-v2-service-manager
+      uid: a1e3bd5d-7e30-4941-bbe3-8f575278c395
+    resourceVersion: "192483491"
+    uid: dc258cec-596f-454e-b209-5d284ed1e8d0
+  spec:
+    replicas: 0
+    selector:
+      matchLabels:
+        app.kubernetes.io/name: tre-v2-service-manager
+        pod-template-hash: 64d578b7df
+    template:
+      metadata:
+        creationTimestamp: null
+        labels:
+          app.kubernetes.io/name: tre-v2-service-manager
+          pod-template-hash: 64d578b7df
+      spec:
+        containers:
+        - env:
+          - name: TRE_REDIS_URL
+            value: redis://tre-v2-redis:6379/0
+          - name: TRE_REGISTRY_PATH
+            value: /app/tre/deploy/registry.yaml
+          image: tre-v2-service-manager:20260704-dd1c42a9
+          imagePullPolicy: IfNotPresent
+          name: service-manager
+          ports:
+          - containerPort: 8000
+            name: http
+            protocol: TCP
+          resources:
+            limits:
+              cpu: "1"
+              memory: 1Gi
+            requests:
+              cpu: 250m
+              memory: 256Mi
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+        dnsPolicy: ClusterFirst
+        nodeSelector:
+          kubernetes.io/hostname: nscc-ds-4a100-node10
+        restartPolicy: Always
+        schedulerName: default-scheduler
+        securityContext: {}
+        serviceAccount: tre-v2-service-manager
+        serviceAccountName: tre-v2-service-manager
+        terminationGracePeriodSeconds: 30
+  status:
+    observedGeneration: 2
+    replicas: 0
+- apiVersion: apps/v1
+  kind: ReplicaSet
+  metadata:
+    annotations:
+      deployment.kubernetes.io/desired-replicas: "1"
+      deployment.kubernetes.io/max-replicas: "2"
+      deployment.kubernetes.io/revision: "21"
+    creationTimestamp: "2026-07-05T14:22:27Z"
+    generation: 1
+    labels:
+      app.kubernetes.io/name: tre-v2-service-manager
+      pod-template-hash: 659c9bf97f
+    name: tre-v2-service-manager-659c9bf97f
+    namespace: tre-v2
+    ownerReferences:
+    - apiVersion: apps/v1
+      blockOwnerDeletion: true
+      controller: true
+      kind: Deployment
+      name: tre-v2-service-manager
+      uid: a1e3bd5d-7e30-4941-bbe3-8f575278c395
+    resourceVersion: "192938193"
+    uid: 6f131c26-3213-4709-8577-317097ac4a44
+  spec:
+    replicas: 1
+    selector:
+      matchLabels:
+        app.kubernetes.io/name: tre-v2-service-manager
+        pod-template-hash: 659c9bf97f
+    template:
+      metadata:
+        creationTimestamp: null
+        labels:
+          app.kubernetes.io/name: tre-v2-service-manager
+          pod-template-hash: 659c9bf97f
+      spec:
+        containers:
+        - env:
+          - name: TRE_REDIS_URL
+            value: redis://tre-v2-redis:6379/0
+          - name: TRE_REGISTRY_PATH
+            value: /app/tre/deploy/registry.yaml
+          image: tre-v2-service-manager:20260705-f6dce214
+          imagePullPolicy: IfNotPresent
+          name: service-manager
+          ports:
+          - containerPort: 8000
+            name: http
+            protocol: TCP
+          resources:
+            limits:
+              cpu: "1"
+              memory: 1Gi
+            requests:
+              cpu: 250m
+              memory: 256Mi
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+        dnsPolicy: ClusterFirst
+        nodeSelector:
+          kubernetes.io/hostname: nscc-ds-4a100-node10
+        restartPolicy: Always
+        schedulerName: default-scheduler
+        securityContext: {}
+        serviceAccount: tre-v2-service-manager
+        serviceAccountName: tre-v2-service-manager
+        terminationGracePeriodSeconds: 30
+  status:
+    availableReplicas: 1
+    fullyLabeledReplicas: 1
+    observedGeneration: 1
+    readyReplicas: 1
+    replicas: 1
+- apiVersion: apps/v1
+  kind: ReplicaSet
+  metadata:
+    annotations:
+      deployment.kubernetes.io/desired-replicas: "1"
+      deployment.kubernetes.io/max-replicas: "2"
+      deployment.kubernetes.io/revision: "20"
+    creationTimestamp: "2026-07-05T13:50:15Z"
+    generation: 2
+    labels:
+      app.kubernetes.io/name: tre-v2-service-manager
+      pod-template-hash: 7778548fbb
+    name: tre-v2-service-manager-7778548fbb
+    namespace: tre-v2
+    ownerReferences:
+    - apiVersion: apps/v1
+      blockOwnerDeletion: true
+      controller: true
+      kind: Deployment
+      name: tre-v2-service-manager
+      uid: a1e3bd5d-7e30-4941-bbe3-8f575278c395
+    resourceVersion: "192938205"
+    uid: b26fcf99-3f18-48dd-9c39-9c6de2dc2f6b
+  spec:
+    replicas: 0
+    selector:
+      matchLabels:
+        app.kubernetes.io/name: tre-v2-service-manager
+        pod-template-hash: 7778548fbb
+    template:
+      metadata:
+        creationTimestamp: null
+        labels:
+          app.kubernetes.io/name: tre-v2-service-manager
+          pod-template-hash: 7778548fbb
+      spec:
+        containers:
+        - env:
+          - name: TRE_REDIS_URL
+            value: redis://tre-v2-redis:6379/0
+          - name: TRE_REGISTRY_PATH
+            value: /app/tre/deploy/registry.yaml
+          image: tre-v2-service-manager:20260705-46613bfb
+          imagePullPolicy: IfNotPresent
+          name: service-manager
+          ports:
+          - containerPort: 8000
+            name: http
+            protocol: TCP
+          resources:
+            limits:
+              cpu: "1"
+              memory: 1Gi
+            requests:
+              cpu: 250m
+              memory: 256Mi
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+        dnsPolicy: ClusterFirst
+        nodeSelector:
+          kubernetes.io/hostname: nscc-ds-4a100-node10
+        restartPolicy: Always
+        schedulerName: default-scheduler
+        securityContext: {}
+        serviceAccount: tre-v2-service-manager
+        serviceAccountName: tre-v2-service-manager
+        terminationGracePeriodSeconds: 30
+  status:
+    observedGeneration: 2
+    replicas: 0
+- apiVersion: apps/v1
+  kind: ReplicaSet
+  metadata:
+    annotations:
+      deployment.kubernetes.io/desired-replicas: "1"
+      deployment.kubernetes.io/max-replicas: "2"
+      deployment.kubernetes.io/revision: "13"
+    creationTimestamp: "2026-07-04T13:35:11Z"
+    generation: 2
+    labels:
+      app.kubernetes.io/name: tre-v2-service-manager
+      pod-template-hash: 7c44bfd497
+    name: tre-v2-service-manager-7c44bfd497
+    namespace: tre-v2
+    ownerReferences:
+    - apiVersion: apps/v1
+      blockOwnerDeletion: true
+      controller: true
+      kind: Deployment
+      name: tre-v2-service-manager
+      uid: a1e3bd5d-7e30-4941-bbe3-8f575278c395
+    resourceVersion: "192488177"
+    uid: 485837e1-bee6-41b7-8c1f-7547e94b71cc
+  spec:
+    replicas: 0
+    selector:
+      matchLabels:
+        app.kubernetes.io/name: tre-v2-service-manager
+        pod-template-hash: 7c44bfd497
+    template:
+      metadata:
+        creationTimestamp: null
+        labels:
+          app.kubernetes.io/name: tre-v2-service-manager
+          pod-template-hash: 7c44bfd497
+      spec:
+        containers:
+        - env:
+          - name: TRE_REDIS_URL
+            value: redis://tre-v2-redis:6379/0
+          - name: TRE_REGISTRY_PATH
+            value: /app/tre/deploy/registry.yaml
+          image: tre-v2-service-manager:20260704-3190906b
+          imagePullPolicy: IfNotPresent
+          name: service-manager
+          ports:
+          - containerPort: 8000
+            name: http
+            protocol: TCP
+          resources:
+            limits:
+              cpu: "1"
+              memory: 1Gi
+            requests:
+              cpu: 250m
+              memory: 256Mi
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+        dnsPolicy: ClusterFirst
+        nodeSelector:
+          kubernetes.io/hostname: nscc-ds-4a100-node10
+        restartPolicy: Always
+        schedulerName: default-scheduler
+        securityContext: {}
+        serviceAccount: tre-v2-service-manager
+        serviceAccountName: tre-v2-service-manager
+        terminationGracePeriodSeconds: 30
+  status:
+    observedGeneration: 2
+    replicas: 0
+- apiVersion: apps/v1
+  kind: ReplicaSet
+  metadata:
+    annotations:
+      deployment.kubernetes.io/desired-replicas: "1"
+      deployment.kubernetes.io/max-replicas: "2"
+      deployment.kubernetes.io/revision: "19"
+    creationTimestamp: "2026-07-05T10:34:21Z"
+    generation: 2
+    labels:
+      app.kubernetes.io/name: tre-v2-service-manager
+      pod-template-hash: 86b985cfbb
+    name: tre-v2-service-manager-86b985cfbb
+    namespace: tre-v2
+    ownerReferences:
+    - apiVersion: apps/v1
+      blockOwnerDeletion: true
+      controller: true
+      kind: Deployment
+      name: tre-v2-service-manager
+      uid: a1e3bd5d-7e30-4941-bbe3-8f575278c395
+    resourceVersion: "192928226"
+    uid: aa371eb4-0a1c-46a7-8b24-24232ae9a9d3
+  spec:
+    replicas: 0
+    selector:
+      matchLabels:
+        app.kubernetes.io/name: tre-v2-service-manager
+        pod-template-hash: 86b985cfbb
+    template:
+      metadata:
+        creationTimestamp: null
+        labels:
+          app.kubernetes.io/name: tre-v2-service-manager
+          pod-template-hash: 86b985cfbb
+      spec:
+        containers:
+        - env:
+          - name: TRE_REDIS_URL
+            value: redis://tre-v2-redis:6379/0
+          - name: TRE_REGISTRY_PATH
+            value: /app/tre/deploy/registry.yaml
+          image: tre-v2-service-manager:20260705-ba88b1b0
+          imagePullPolicy: IfNotPresent
+          name: service-manager
+          ports:
+          - containerPort: 8000
+            name: http
+            protocol: TCP
+          resources:
+            limits:
+              cpu: "1"
+              memory: 1Gi
+            requests:
+              cpu: 250m
+              memory: 256Mi
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+        dnsPolicy: ClusterFirst
+        nodeSelector:
+          kubernetes.io/hostname: nscc-ds-4a100-node10
+        restartPolicy: Always
+        schedulerName: default-scheduler
+        securityContext: {}
+        serviceAccount: tre-v2-service-manager
+        serviceAccountName: tre-v2-service-manager
+        terminationGracePeriodSeconds: 30
+  status:
+    observedGeneration: 2
+    replicas: 0
+- apiVersion: apps/v1
+  kind: ReplicaSet
+  metadata:
+    annotations:
+      deployment.kubernetes.io/desired-replicas: "1"
+      deployment.kubernetes.io/max-replicas: "2"
+      deployment.kubernetes.io/revision: "12"
+    creationTimestamp: "2026-07-04T13:27:37Z"
+    generation: 2
+    labels:
+      app.kubernetes.io/name: tre-v2-service-manager
+      pod-template-hash: 948f7f5b5
+    name: tre-v2-service-manager-948f7f5b5
+    namespace: tre-v2
+    ownerReferences:
+    - apiVersion: apps/v1
+      blockOwnerDeletion: true
+      controller: true
+      kind: Deployment
+      name: tre-v2-service-manager
+      uid: a1e3bd5d-7e30-4941-bbe3-8f575278c395
+    resourceVersion: "192485839"
+    uid: aec36eab-87d5-4172-9079-1c23405b98da
+  spec:
+    replicas: 0
+    selector:
+      matchLabels:
+        app.kubernetes.io/name: tre-v2-service-manager
+        pod-template-hash: 948f7f5b5
+    template:
+      metadata:
+        creationTimestamp: null
+        labels:
+          app.kubernetes.io/name: tre-v2-service-manager
+          pod-template-hash: 948f7f5b5
+      spec:
+        containers:
+        - env:
+          - name: TRE_REDIS_URL
+            value: redis://tre-v2-redis:6379/0
+          - name: TRE_REGISTRY_PATH
+            value: /app/tre/deploy/registry.yaml
+          image: tre-v2-service-manager:20260704-264c0124
+          imagePullPolicy: IfNotPresent
+          name: service-manager
+          ports:
+          - containerPort: 8000
+            name: http
+            protocol: TCP
+          resources:
+            limits:
+              cpu: "1"
+              memory: 1Gi
+            requests:
+              cpu: 250m
+              memory: 256Mi
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+        dnsPolicy: ClusterFirst
+        nodeSelector:
+          kubernetes.io/hostname: nscc-ds-4a100-node10
+        restartPolicy: Always
+        schedulerName: default-scheduler
+        securityContext: {}
+        serviceAccount: tre-v2-service-manager
+        serviceAccountName: tre-v2-service-manager
+        terminationGracePeriodSeconds: 30
+  status:
+    observedGeneration: 2
+    replicas: 0
+- apiVersion: apps/v1
+  kind: ReplicaSet
+  metadata:
+    annotations:
+      deployment.kubernetes.io/desired-replicas: "1"
+      deployment.kubernetes.io/max-replicas: "2"
+      deployment.kubernetes.io/revision: "17"
+    creationTimestamp: "2026-07-05T05:44:04Z"
+    generation: 2
+    labels:
+      app.kubernetes.io/name: tre-v2-service-manager
+      pod-template-hash: dccbd689d
+    name: tre-v2-service-manager-dccbd689d
+    namespace: tre-v2
+    ownerReferences:
+    - apiVersion: apps/v1
+      blockOwnerDeletion: true
+      controller: true
+      kind: Deployment
+      name: tre-v2-service-manager
+      uid: a1e3bd5d-7e30-4941-bbe3-8f575278c395
+    resourceVersion: "192792278"
+    uid: 50bea81c-7468-487b-9c85-2bd65cf16246
+  spec:
+    replicas: 0
+    selector:
+      matchLabels:
+        app.kubernetes.io/name: tre-v2-service-manager
+        pod-template-hash: dccbd689d
+    template:
+      metadata:
+        creationTimestamp: null
+        labels:
+          app.kubernetes.io/name: tre-v2-service-manager
+          pod-template-hash: dccbd689d
+      spec:
+        containers:
+        - env:
+          - name: TRE_REDIS_URL
+            value: redis://tre-v2-redis:6379/0
+          - name: TRE_REGISTRY_PATH
+            value: /app/tre/deploy/registry.yaml
+          image: tre-v2-service-manager:20260705-7278875d
+          imagePullPolicy: IfNotPresent
+          name: service-manager
+          ports:
+          - containerPort: 8000
+            name: http
+            protocol: TCP
+          resources:
+            limits:
+              cpu: "1"
+              memory: 1Gi
+            requests:
+              cpu: 250m
+              memory: 256Mi
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+        dnsPolicy: ClusterFirst
+        nodeSelector:
+          kubernetes.io/hostname: nscc-ds-4a100-node10
+        restartPolicy: Always
+        schedulerName: default-scheduler
+        securityContext: {}
+        serviceAccount: tre-v2-service-manager
+        serviceAccountName: tre-v2-service-manager
+        terminationGracePeriodSeconds: 30
+  status:
+    observedGeneration: 2
+    replicas: 0
+- apiVersion: apps/v1
+  kind: ReplicaSet
+  metadata:
+    annotations:
+      deployment.kubernetes.io/desired-replicas: "1"
+      deployment.kubernetes.io/max-replicas: "2"
+      deployment.kubernetes.io/revision: "1"
+    creationTimestamp: "2026-07-04T08:33:57Z"
+    generation: 2
+    labels:
+      app.kubernetes.io/name: tre-v2-ui
+      pod-template-hash: 5db666747f
+    name: tre-v2-ui-5db666747f
+    namespace: tre-v2
+    ownerReferences:
+    - apiVersion: apps/v1
+      blockOwnerDeletion: true
+      controller: true
+      kind: Deployment
+      name: tre-v2-ui
+      uid: 35f38c6c-57eb-4ce5-bf42-87e65cac2051
+    resourceVersion: "192396647"
+    uid: fdaab928-fb0a-4a91-acef-c4d1f966a167
+  spec:
+    replicas: 0
+    selector:
+      matchLabels:
+        app.kubernetes.io/name: tre-v2-ui
+        pod-template-hash: 5db666747f
+    template:
+      metadata:
+        creationTimestamp: null
+        labels:
+          app.kubernetes.io/name: tre-v2-ui
+          pod-template-hash: 5db666747f
+      spec:
+        containers:
+        - env:
+          - name: TRE_REDIS_URL
+            value: redis://tre-v2-redis:6379/0
+          - name: TRE_SERVICE_MANAGER_URL
+            value: http://tre-v2-service-manager:8000
+          - name: TRE_REGISTRY_PATH
+            value: /app/tre/deploy/registry.yaml
+          image: tre-v2-ui:20260704-b9ee9740
+          imagePullPolicy: IfNotPresent
+          name: ui
+          ports:
+          - containerPort: 8000
+            name: http
+            protocol: TCP
+          resources:
+            limits:
+              cpu: 500m
+              memory: 512Mi
+            requests:
+              cpu: 100m
+              memory: 128Mi
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+        dnsPolicy: ClusterFirst
+        nodeSelector:
+          kubernetes.io/hostname: nscc-ds-4a100-node10
+        restartPolicy: Always
+        schedulerName: default-scheduler
+        securityContext: {}
+        serviceAccount: tre-v2-ui
+        serviceAccountName: tre-v2-ui
+        terminationGracePeriodSeconds: 30
+  status:
+    observedGeneration: 2
+    replicas: 0
+- apiVersion: apps/v1
+  kind: ReplicaSet
+  metadata:
+    annotations:
+      deployment.kubernetes.io/desired-replicas: "1"
+      deployment.kubernetes.io/max-replicas: "2"
+      deployment.kubernetes.io/revision: "3"
+    creationTimestamp: "2026-07-04T08:50:17Z"
+    generation: 1
+    labels:
+      app.kubernetes.io/name: tre-v2-ui
+      pod-template-hash: 65c6c86b45
+    name: tre-v2-ui-65c6c86b45
+    namespace: tre-v2
+    ownerReferences:
+    - apiVersion: apps/v1
+      blockOwnerDeletion: true
+      controller: true
+      kind: Deployment
+      name: tre-v2-ui
+      uid: 35f38c6c-57eb-4ce5-bf42-87e65cac2051
+    resourceVersion: "192399089"
+    uid: a08086ed-f459-4e44-909f-755b64096067
+  spec:
+    replicas: 1
+    selector:
+      matchLabels:
+        app.kubernetes.io/name: tre-v2-ui
+        pod-template-hash: 65c6c86b45
+    template:
+      metadata:
+        creationTimestamp: null
+        labels:
+          app.kubernetes.io/name: tre-v2-ui
+          pod-template-hash: 65c6c86b45
+      spec:
+        containers:
+        - env:
+          - name: TRE_REDIS_URL
+            value: redis://tre-v2-redis:6379/0
+          - name: TRE_SERVICE_MANAGER_URL
+            value: http://tre-v2-service-manager:8000
+          - name: TRE_REGISTRY_PATH
+            value: /app/tre/deploy/registry.yaml
+          image: tre-v2-ui:20260704-669f0381
+          imagePullPolicy: IfNotPresent
+          name: ui
+          ports:
+          - containerPort: 8000
+            name: http
+            protocol: TCP
+          resources:
+            limits:
+              cpu: 500m
+              memory: 512Mi
+            requests:
+              cpu: 100m
+              memory: 128Mi
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+        dnsPolicy: ClusterFirst
+        nodeSelector:
+          kubernetes.io/hostname: nscc-ds-4a100-node10
+        restartPolicy: Always
+        schedulerName: default-scheduler
+        securityContext: {}
+        serviceAccount: tre-v2-ui
+        serviceAccountName: tre-v2-ui
+        terminationGracePeriodSeconds: 30
+  status:
+    availableReplicas: 1
+    fullyLabeledReplicas: 1
+    observedGeneration: 1
+    readyReplicas: 1
+    replicas: 1
+- apiVersion: apps/v1
+  kind: ReplicaSet
+  metadata:
+    annotations:
+      deployment.kubernetes.io/desired-replicas: "1"
+      deployment.kubernetes.io/max-replicas: "2"
+      deployment.kubernetes.io/revision: "2"
+    creationTimestamp: "2026-07-04T08:42:44Z"
+    generation: 2
+    labels:
+      app.kubernetes.io/name: tre-v2-ui
+      pod-template-hash: 85df4b6c6c
+    name: tre-v2-ui-85df4b6c6c
+    namespace: tre-v2
+    ownerReferences:
+    - apiVersion: apps/v1
+      blockOwnerDeletion: true
+      controller: true
+      kind: Deployment
+      name: tre-v2-ui
+      uid: 35f38c6c-57eb-4ce5-bf42-87e65cac2051
+    resourceVersion: "192399118"
+    uid: c4ff2474-75af-4711-887b-9d3aa12c1591
+  spec:
+    replicas: 0
+    selector:
+      matchLabels:
+        app.kubernetes.io/name: tre-v2-ui
+        pod-template-hash: 85df4b6c6c
+    template:
+      metadata:
+        creationTimestamp: null
+        labels:
+          app.kubernetes.io/name: tre-v2-ui
+          pod-template-hash: 85df4b6c6c
+      spec:
+        containers:
+        - env:
+          - name: TRE_REDIS_URL
+            value: redis://tre-v2-redis:6379/0
+          - name: TRE_SERVICE_MANAGER_URL
+            value: http://tre-v2-service-manager:8000
+          - name: TRE_REGISTRY_PATH
+            value: /app/tre/deploy/registry.yaml
+          image: tre-v2-ui:20260704-eb5942ca
+          imagePullPolicy: IfNotPresent
+          name: ui
+          ports:
+          - containerPort: 8000
+            name: http
+            protocol: TCP
+          resources:
+            limits:
+              cpu: 500m
+              memory: 512Mi
+            requests:
+              cpu: 100m
+              memory: 128Mi
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+        dnsPolicy: ClusterFirst
+        nodeSelector:
+          kubernetes.io/hostname: nscc-ds-4a100-node10
+        restartPolicy: Always
+        schedulerName: default-scheduler
+        securityContext: {}
+        serviceAccount: tre-v2-ui
+        serviceAccountName: tre-v2-ui
+        terminationGracePeriodSeconds: 30
+  status:
+    observedGeneration: 2
+    replicas: 0
+- apiVersion: v1
+  data:
+    ca.crt: |
+      -----BEGIN CERTIFICATE-----
+      MIIDBTCCAe2gAwIBAgIIFyAwAvJ1BHwwDQYJKoZIhvcNAQELBQAwFTETMBEGA1UE
+      AxMKa3ViZXJuZXRlczAeFw0yNTA0MjUwNjUxNDBaFw0zNTA0MjMwNjU2NDBaMBUx
+      EzARBgNVBAMTCmt1YmVybmV0ZXMwggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEK
+      AoIBAQDJEyVm3MofmI9WVwymtACZmKXxYKUoX4HXa9xuzzjxGIenhkxT5V1z8mo0
+      DCKA9DlhMEsS6Jbd8JMIWA/sho9z0cPkEGg/yeeDKWhi6EuMJslSEglZY88iyJ+e
+      uv7vYnGOVNTtmbUmoLFbTYyXiuyRx1XLtjV6jY3f26fac5ki3bFxPY5uG8TjLTJI
+      OiGPao3cTbyF4SLjSrD5arta/4t0fK9aYSHN/ADPejk0dWmUQAdiD2StchWW5+/0
+      YxmsFpfnyf/fELfxk/lan9zqVEF5mZcXcSrJQpsd6MXVPqD7iwjtxet2KS3eE1Jk
+      vm2DHGRsIgiloqQroJX0Z+wQ/YeDAgMBAAGjWTBXMA4GA1UdDwEB/wQEAwICpDAP
+      BgNVHRMBAf8EBTADAQH/MB0GA1UdDgQWBBSPdz8f+mTs/wQr3b4NjQDwLevtIzAV
+      BgNVHREEDjAMggprdWJlcm5ldGVzMA0GCSqGSIb3DQEBCwUAA4IBAQCsuHGBxusw
+      unU7HcCBJmEKf3Y1C7Ks4LuGCW9CFEkroaLy3KLlNUwyqAuCYDGi6QzFjJVOvspc
+      T4a13Otboye+XgEUfdJcZvrJ4qyZXm0sjkY7Z9tBjLzt7pF2KbOMGRV1JOxcZJuY
+      WKvo541BghH2H+5WYZmZQAZu+Um7o2LBnLwzsBtC8Vlq0fW5IXUm9c9/YN5F+m2S
+      H3wUCG3hVnm7LAW+WKJpkHVinXiqlimXvPE4dyHhi6Q6HpBROBkJ27GsNZV06/eV
+      i/BKQt1QCfHFdcUwpPdE6ufOZuX3dVl1609VB6IH8N/jPML7zLhBAXKNY1nhtChZ
+      LBgdLKbt5K8H
+      -----END CERTIFICATE-----
+  kind: ConfigMap
+  metadata:
+    annotations:
+      kubernetes.io/description: Contains a CA bundle that can be used to verify the
+        kube-apiserver when using internal endpoints such as the internal service
+        IP or kubernetes.default.svc. No other usage is guaranteed across distributions
+        of Kubernetes clusters.
+    creationTimestamp: "2026-07-04T08:33:55Z"
+    name: kube-root-ca.crt
+    namespace: tre-v2
+    resourceVersion: "192393763"
+    uid: 958ad610-54fd-4772-a0b6-d6e216accf96
+- apiVersion: v1
+  data:
+    gpu_truth_agent.py: |
+      from __future__ import annotations
+
+      import argparse
+      import json
+      import socket
+      import subprocess
+      import time
+      from urllib.parse import urlparse
+
+
+      def parse_nvidia_smi_csv(text: str) -> list[dict]:
+          rows: list[dict] = []
+          for line in text.splitlines():
+              parts = [part.strip() for part in line.split(",")]
+              if len(parts) != 3:
+                  continue
+              uuid, used, total = parts
+              try:
+                  rows.append(
+                      {
+                          "uuid": uuid,
+                          "used_mib": _parse_mib(used),
+                          "total_mib": _parse_mib(total),
+                      }
+                  )
+              except ValueError:
+                  continue
+          return rows
+
+
+      def build_payload(node: str, gpus: list[dict], *, now: float | None = None) -> dict:
+          return {
+              "node": node,
+              "timestamp": time.time() if now is None else now,
+              "gpus": gpus,
+          }
+
+
+      def collect_nvidia_smi() -> list[dict]:
+          output = subprocess.check_output(
+              [
+                  "nvidia-smi",
+                  "--query-gpu=uuid,memory.used,memory.total",
+                  "--format=csv,noheader,nounits",
+              ],
+              text=True,
+          )
+          return parse_nvidia_smi_csv(output)
+
+
+      def publish_once(redis_client, *, node: str, ttl_s: int) -> dict:
+          payload = build_payload(node, collect_nvidia_smi())
+          redis_client.setex(f"tre:gpu_truth:{node}", ttl_s, json.dumps(payload, separators=(",", ":")))
+          return payload
+
+
+      class RawRedisSetexClient:
+          def __init__(self, redis_url: str) -> None:
+              parsed = urlparse(redis_url)
+              if parsed.scheme != "redis":
+                  raise ValueError(f"unsupported redis url scheme: {parsed.scheme}")
+              self._host = parsed.hostname or "localhost"
+              self._port = parsed.port or 6379
+
+          def setex(self, key: str, ttl_s: int, value: str) -> None:
+              command = encode_setex_command(key, ttl_s, value)
+              with socket.create_connection((self._host, self._port), timeout=5) as sock:
+                  sock.sendall(command)
+                  response = sock.recv(1024)
+              if not response.startswith(b"+OK"):
+                  raise RuntimeError(f"redis SETEX failed: {response!r}")
+
+
+      def encode_setex_command(key: str, ttl_s: int, value: str) -> bytes:
+          parts = ["SETEX", key, str(ttl_s), value]
+          encoded = [part.encode("utf-8") for part in parts]
+          out = [f"*{len(encoded)}\r\n".encode("ascii")]
+          for part in encoded:
+              out.append(f"${len(part)}\r\n".encode("ascii"))
+              out.append(part)
+              out.append(b"\r\n")
+          return b"".join(out)
+
+
+      def main() -> int:
+          parser = argparse.ArgumentParser(description="Publish node GPU memory truth to TRE Redis.")
+          parser.add_argument("--redis-url", required=True)
+          parser.add_argument("--node", default=socket.gethostname())
+          parser.add_argument("--interval-s", type=float, default=30.0)
+          parser.add_argument("--ttl-s", type=int, default=120)
+          parser.add_argument("--once", action="store_true")
+          args = parser.parse_args()
+
+          try:
+              import redis  # type: ignore[import-not-found]
+
+              client = redis.Redis.from_url(args.redis_url)
+          except ModuleNotFoundError:
+              client = RawRedisSetexClient(args.redis_url)
+          while True:
+              publish_once(client, node=args.node, ttl_s=args.ttl_s)
+              if args.once:
+                  return 0
+              time.sleep(args.interval_s)
+
+
+      def _parse_mib(value: str) -> int:
+          return int(value.replace("MiB", "").strip())
+
+
+      if __name__ == "__main__":
+          raise SystemExit(main())
+  kind: ConfigMap
+  metadata:
+    annotations:
+      kubectl.kubernetes.io/last-applied-configuration: |
+        {"apiVersion":"v1","data":{"gpu_truth_agent.py":"from __future__ import annotations\n\nimport argparse\nimport json\nimport socket\nimport subprocess\nimport time\nfrom urllib.parse import urlparse\n\n\ndef parse_nvidia_smi_csv(text: str) -\u003e list[dict]:\n    rows: list[dict] = []\n    for line in text.splitlines():\n        parts = [part.strip() for part in line.split(\",\")]\n        if len(parts) != 3:\n            continue\n        uuid, used, total = parts\n        try:\n            rows.append(\n                {\n                    \"uuid\": uuid,\n                    \"used_mib\": _parse_mib(used),\n                    \"total_mib\": _parse_mib(total),\n                }\n            )\n        except ValueError:\n            continue\n    return rows\n\n\ndef build_payload(node: str, gpus: list[dict], *, now: float | None = None) -\u003e dict:\n    return {\n        \"node\": node,\n        \"timestamp\": time.time() if now is None else now,\n        \"gpus\": gpus,\n    }\n\n\ndef collect_nvidia_smi() -\u003e list[dict]:\n    output = subprocess.check_output(\n        [\n            \"nvidia-smi\",\n            \"--query-gpu=uuid,memory.used,memory.total\",\n            \"--format=csv,noheader,nounits\",\n        ],\n        text=True,\n    )\n    return parse_nvidia_smi_csv(output)\n\n\ndef publish_once(redis_client, *, node: str, ttl_s: int) -\u003e dict:\n    payload = build_payload(node, collect_nvidia_smi())\n    redis_client.setex(f\"tre:gpu_truth:{node}\", ttl_s, json.dumps(payload, separators=(\",\", \":\")))\n    return payload\n\n\nclass RawRedisSetexClient:\n    def __init__(self, redis_url: str) -\u003e None:\n        parsed = urlparse(redis_url)\n        if parsed.scheme != \"redis\":\n            raise ValueError(f\"unsupported redis url scheme: {parsed.scheme}\")\n        self._host = parsed.hostname or \"localhost\"\n        self._port = parsed.port or 6379\n\n    def setex(self, key: str, ttl_s: int, value: str) -\u003e None:\n        command = encode_setex_command(key, ttl_s, value)\n        with socket.create_connection((self._host, self._port), timeout=5) as sock:\n            sock.sendall(command)\n            response = sock.recv(1024)\n        if not response.startswith(b\"+OK\"):\n            raise RuntimeError(f\"redis SETEX failed: {response!r}\")\n\n\ndef encode_setex_command(key: str, ttl_s: int, value: str) -\u003e bytes:\n    parts = [\"SETEX\", key, str(ttl_s), value]\n    encoded = [part.encode(\"utf-8\") for part in parts]\n    out = [f\"*{len(encoded)}\\r\\n\".encode(\"ascii\")]\n    for part in encoded:\n        out.append(f\"${len(part)}\\r\\n\".encode(\"ascii\"))\n        out.append(part)\n        out.append(b\"\\r\\n\")\n    return b\"\".join(out)\n\n\ndef main() -\u003e int:\n    parser = argparse.ArgumentParser(description=\"Publish node GPU memory truth to TRE Redis.\")\n    parser.add_argument(\"--redis-url\", required=True)\n    parser.add_argument(\"--node\", default=socket.gethostname())\n    parser.add_argument(\"--interval-s\", type=float, default=30.0)\n    parser.add_argument(\"--ttl-s\", type=int, default=120)\n    parser.add_argument(\"--once\", action=\"store_true\")\n    args = parser.parse_args()\n\n    try:\n        import redis  # type: ignore[import-not-found]\n\n        client = redis.Redis.from_url(args.redis_url)\n    except ModuleNotFoundError:\n        client = RawRedisSetexClient(args.redis_url)\n    while True:\n        publish_once(client, node=args.node, ttl_s=args.ttl_s)\n        if args.once:\n            return 0\n        time.sleep(args.interval_s)\n\n\ndef _parse_mib(value: str) -\u003e int:\n    return int(value.replace(\"MiB\", \"\").strip())\n\n\nif __name__ == \"__main__\":\n    raise SystemExit(main())\n"},"kind":"ConfigMap","metadata":{"annotations":{},"name":"tre-v2-gpu-truth-agent","namespace":"tre-v2"}}
+    creationTimestamp: "2026-07-06T02:18:11Z"
+    name: tre-v2-gpu-truth-agent
+    namespace: tre-v2
+    resourceVersion: "193153037"
+    uid: 2e348d3f-15c2-4953-b3d0-33e0f7d61109
+- apiVersion: v1
+  kind: ServiceAccount
+  metadata:
+    creationTimestamp: "2026-07-04T08:33:55Z"
+    name: default
+    namespace: tre-v2
+    resourceVersion: "192393762"
+    uid: 43714be0-9075-4e06-b2ed-11476b2b05b3
+- apiVersion: v1
+  kind: ServiceAccount
+  metadata:
+    annotations:
+      kubectl.kubernetes.io/last-applied-configuration: |
+        {"apiVersion":"v1","kind":"ServiceAccount","metadata":{"annotations":{},"name":"tre-v2-controller","namespace":"tre-v2"}}
+    creationTimestamp: "2026-07-04T08:33:57Z"
+    name: tre-v2-controller
+    namespace: tre-v2
+    resourceVersion: "192393774"
+    uid: 5ba42b39-6446-433c-848c-954805c0a875
+- apiVersion: v1
+  kind: ServiceAccount
+  metadata:
+    annotations:
+      kubectl.kubernetes.io/last-applied-configuration: |
+        {"apiVersion":"v1","kind":"ServiceAccount","metadata":{"annotations":{},"name":"tre-v2-service-manager","namespace":"tre-v2"}}
+    creationTimestamp: "2026-07-04T08:33:57Z"
+    name: tre-v2-service-manager
+    namespace: tre-v2
+    resourceVersion: "192393775"
+    uid: 58d64cd5-52be-4bd3-b70c-bc7dd8dcd637
+- apiVersion: v1
+  kind: ServiceAccount
+  metadata:
+    annotations:
+      kubectl.kubernetes.io/last-applied-configuration: |
+        {"apiVersion":"v1","kind":"ServiceAccount","metadata":{"annotations":{},"name":"tre-v2-ui","namespace":"tre-v2"}}
+    creationTimestamp: "2026-07-04T08:33:57Z"
+    name: tre-v2-ui
+    namespace: tre-v2
+    resourceVersion: "192393776"
+    uid: 2c3ef8c8-9196-4873-8dda-452a1b20148a
+- apiVersion: rbac.authorization.k8s.io/v1
+  kind: Role
+  metadata:
+    annotations:
+      kubectl.kubernetes.io/last-applied-configuration: |
+        {"apiVersion":"rbac.authorization.k8s.io/v1","kind":"Role","metadata":{"annotations":{},"name":"tre-v2-manager","namespace":"tre-v2"},"rules":[{"apiGroups":[""],"resources":["pods","services","configmaps","endpoints"],"verbs":["get","list","watch","create","update","patch","delete"]},{"apiGroups":["apps"],"resources":["deployments","replicasets"],"verbs":["get","list","watch","create","update","patch","delete"]}]}
+    creationTimestamp: "2026-07-04T08:33:57Z"
+    name: tre-v2-manager
+    namespace: tre-v2
+    resourceVersion: "192393777"
+    uid: 972dc446-d89c-4f6a-812b-013ecf8b519f
+  rules:
+  - apiGroups:
+    - ""
+    resources:
+    - pods
+    - services
+    - configmaps
+    - endpoints
+    verbs:
+    - get
+    - list
+    - watch
+    - create
+    - update
+    - patch
+    - delete
+  - apiGroups:
+    - apps
+    resources:
+    - deployments
+    - replicasets
+    verbs:
+    - get
+    - list
+    - watch
+    - create
+    - update
+    - patch
+    - delete
+- apiVersion: rbac.authorization.k8s.io/v1
+  kind: Role
+  metadata:
+    annotations:
+      kubectl.kubernetes.io/last-applied-configuration: |
+        {"apiVersion":"rbac.authorization.k8s.io/v1","kind":"Role","metadata":{"annotations":{},"name":"tre-v2-model-manager","namespace":"tre-v2"},"rules":[{"apiGroups":[""],"resources":["pods"],"verbs":["get","list","watch","patch","update"]},{"apiGroups":["apps"],"resources":["deployments","replicasets"],"verbs":["get","list","watch","create","update","patch","delete"]}]}
+    creationTimestamp: "2026-07-04T08:50:17Z"
+    name: tre-v2-model-manager
+    namespace: tre-v2
+    resourceVersion: "192399025"
+    uid: d0a01ce6-eb31-4ca7-bbb6-0d3d4f07e9f2
+  rules:
+  - apiGroups:
+    - ""
+    resources:
+    - pods
+    verbs:
+    - get
+    - list
+    - watch
+    - patch
+    - update
+  - apiGroups:
+    - apps
+    resources:
+    - deployments
+    - replicasets
+    verbs:
+    - get
+    - list
+    - watch
+    - create
+    - update
+    - patch
+    - delete
+- apiVersion: rbac.authorization.k8s.io/v1
+  kind: RoleBinding
+  metadata:
+    annotations:
+      kubectl.kubernetes.io/last-applied-configuration: |
+        {"apiVersion":"rbac.authorization.k8s.io/v1","kind":"RoleBinding","metadata":{"annotations":{},"name":"tre-v2-manager","namespace":"tre-v2"},"roleRef":{"apiGroup":"rbac.authorization.k8s.io","kind":"Role","name":"tre-v2-manager"},"subjects":[{"kind":"ServiceAccount","name":"tre-v2-controller","namespace":"tre-v2"},{"kind":"ServiceAccount","name":"tre-v2-service-manager","namespace":"tre-v2"}]}
+    creationTimestamp: "2026-07-04T08:33:57Z"
+    name: tre-v2-manager
+    namespace: tre-v2
+    resourceVersion: "192393779"
+    uid: d93db6f4-27d6-40bc-805f-470d5b3a3155
+  roleRef:
+    apiGroup: rbac.authorization.k8s.io
+    kind: Role
+    name: tre-v2-manager
+  subjects:
+  - kind: ServiceAccount
+    name: tre-v2-controller
+    namespace: tre-v2
+  - kind: ServiceAccount
+    name: tre-v2-service-manager
+    namespace: tre-v2
+- apiVersion: rbac.authorization.k8s.io/v1
+  kind: RoleBinding
+  metadata:
+    annotations:
+      kubectl.kubernetes.io/last-applied-configuration: |
+        {"apiVersion":"rbac.authorization.k8s.io/v1","kind":"RoleBinding","metadata":{"annotations":{},"name":"tre-v2-model-manager","namespace":"tre-v2"},"roleRef":{"apiGroup":"rbac.authorization.k8s.io","kind":"Role","name":"tre-v2-model-manager"},"subjects":[{"kind":"ServiceAccount","name":"tre-v2-service-manager","namespace":"tre-v2"}]}
+    creationTimestamp: "2026-07-04T08:50:17Z"
+    name: tre-v2-model-manager
+    namespace: tre-v2
+    resourceVersion: "192399026"
+    uid: 5ad61f3a-c4e6-428a-b277-6fcc17f7f385
+  roleRef:
+    apiGroup: rbac.authorization.k8s.io
+    kind: Role
+    name: tre-v2-model-manager
+  subjects:
+  - kind: ServiceAccount
+    name: tre-v2-service-manager
+    namespace: tre-v2
+kind: List
+metadata:
+  resourceVersion: ""

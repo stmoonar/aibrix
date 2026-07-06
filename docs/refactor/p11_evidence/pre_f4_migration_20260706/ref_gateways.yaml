@@ -1,0 +1,140 @@
+apiVersion: v1
+items:
+- apiVersion: gateway.networking.k8s.io/v1
+  kind: Gateway
+  metadata:
+    annotations:
+      aibrix.ai/touch: "1776367470"
+      kubectl.kubernetes.io/last-applied-configuration: |
+        {"apiVersion":"gateway.networking.k8s.io/v1","kind":"Gateway","metadata":{"annotations":{},"labels":{"app.kubernetes.io/component":"lxt-gateway-plugin","app.kubernetes.io/managed-by":"kubectl","app.kubernetes.io/name":"aibrix","app.kubernetes.io/version":"nightly"},"name":"lxt-aibrix-eg","namespace":"aibrix-system"},"spec":{"gatewayClassName":"aibrix-eg","listeners":[{"name":"http","port":80,"protocol":"HTTP"}]}}
+    creationTimestamp: "2026-03-05T12:56:58Z"
+    generation: 1
+    labels:
+      app.kubernetes.io/component: lxt-gateway-plugin
+      app.kubernetes.io/managed-by: kubectl
+      app.kubernetes.io/name: aibrix
+      app.kubernetes.io/version: nightly
+    name: lxt-aibrix-eg
+    namespace: aibrix-system
+    resourceVersion: "193154259"
+    uid: 062a7157-ec64-4d92-9514-8c51c894dfd0
+  spec:
+    gatewayClassName: aibrix-eg
+    listeners:
+    - allowedRoutes:
+        namespaces:
+          from: Same
+      name: http
+      port: 80
+      protocol: HTTP
+  status:
+    conditions:
+    - lastTransitionTime: "2026-07-06T02:24:22Z"
+      message: The Gateway has been scheduled by Envoy Gateway
+      observedGeneration: 1
+      reason: Accepted
+      status: "True"
+      type: Accepted
+    - lastTransitionTime: "2026-07-06T02:24:22Z"
+      message: No addresses have been assigned to the Gateway
+      observedGeneration: 1
+      reason: AddressNotAssigned
+      status: "False"
+      type: Programmed
+    listeners:
+    - attachedRoutes: 2
+      conditions:
+      - lastTransitionTime: "2026-07-06T02:24:22Z"
+        message: Sending translated listener configuration to the data plane
+        observedGeneration: 1
+        reason: Programmed
+        status: "True"
+        type: Programmed
+      - lastTransitionTime: "2026-07-06T02:24:22Z"
+        message: Listener has been successfully translated
+        observedGeneration: 1
+        reason: Accepted
+        status: "True"
+        type: Accepted
+      - lastTransitionTime: "2026-07-06T02:24:22Z"
+        message: Listener references have been resolved
+        observedGeneration: 1
+        reason: ResolvedRefs
+        status: "True"
+        type: ResolvedRefs
+      name: http
+      supportedKinds:
+      - group: gateway.networking.k8s.io
+        kind: HTTPRoute
+      - group: gateway.networking.k8s.io
+        kind: GRPCRoute
+- apiVersion: gateway.networking.k8s.io/v1
+  kind: Gateway
+  metadata:
+    annotations:
+      kubectl.kubernetes.io/last-applied-configuration: |
+        {"apiVersion":"gateway.networking.k8s.io/v1","kind":"Gateway","metadata":{"annotations":{},"labels":{"app.kubernetes.io/component":"aibrix-gateway-plugin","app.kubernetes.io/managed-by":"kubectl","app.kubernetes.io/name":"aibrix","app.kubernetes.io/version":"nightly"},"name":"aibrix-eg","namespace":"aibrix-system"},"spec":{"gatewayClassName":"aibrix-eg","listeners":[{"name":"http","port":80,"protocol":"HTTP"}]}}
+    creationTimestamp: "2025-06-03T11:04:23Z"
+    generation: 1
+    labels:
+      app.kubernetes.io/component: aibrix-gateway-plugin
+      app.kubernetes.io/managed-by: kubectl
+      app.kubernetes.io/name: aibrix
+      app.kubernetes.io/version: nightly
+    name: aibrix-eg
+    namespace: aibrix-system
+    resourceVersion: "193154257"
+    uid: 8155d771-14cd-402a-97fc-ff5316ff70ae
+  spec:
+    gatewayClassName: aibrix-eg
+    listeners:
+    - allowedRoutes:
+        namespaces:
+          from: Same
+      name: http
+      port: 80
+      protocol: HTTP
+  status:
+    conditions:
+    - lastTransitionTime: "2026-07-06T02:24:22Z"
+      message: The Gateway has been scheduled by Envoy Gateway
+      observedGeneration: 1
+      reason: Accepted
+      status: "True"
+      type: Accepted
+    - lastTransitionTime: "2026-07-06T02:24:22Z"
+      message: No addresses have been assigned to the Gateway
+      observedGeneration: 1
+      reason: AddressNotAssigned
+      status: "False"
+      type: Programmed
+    listeners:
+    - attachedRoutes: 9
+      conditions:
+      - lastTransitionTime: "2026-07-06T02:24:22Z"
+        message: Sending translated listener configuration to the data plane
+        observedGeneration: 1
+        reason: Programmed
+        status: "True"
+        type: Programmed
+      - lastTransitionTime: "2026-07-06T02:24:22Z"
+        message: Listener has been successfully translated
+        observedGeneration: 1
+        reason: Accepted
+        status: "True"
+        type: Accepted
+      - lastTransitionTime: "2026-07-06T02:24:22Z"
+        message: Listener references have been resolved
+        observedGeneration: 1
+        reason: ResolvedRefs
+        status: "True"
+        type: ResolvedRefs
+      name: http
+      supportedKinds:
+      - group: gateway.networking.k8s.io
+        kind: HTTPRoute
+      - group: gateway.networking.k8s.io
+        kind: GRPCRoute
+kind: List
+metadata:
+  resourceVersion: ""

@@ -1,0 +1,2118 @@
+apiVersion: v1
+items:
+- apiVersion: apps/v1
+  kind: Deployment
+  metadata:
+    annotations:
+      deployment.kubernetes.io/revision: "1"
+      kubectl.kubernetes.io/last-applied-configuration: |
+        {"apiVersion":"apps/v1","kind":"Deployment","metadata":{"annotations":{"tre.aibrix.io/gpu-ids":"0","tre.aibrix.io/gpu-uuids":"GPU-689a3e93-68db-0dac-160b-6a791cf246e8"},"labels":{"model.aibrix.ai/name":"dsllama-8b","model.aibrix.ai/port":"8000","tre.aibrix.io/gpu-ids":"0","tre.aibrix.io/managed":"true","tre.aibrix.io/node":"nscc-ds-4a100-node9","tre.aibrix.io/routable":"true"},"name":"dsllama-8b-nscc-ds-4a100-node9-gpu-0","namespace":"default"},"spec":{"replicas":1,"selector":{"matchLabels":{"app":"dsllama-8b-nscc-ds-4a100-node9-gpu-0"}},"template":{"metadata":{"annotations":{"tre.aibrix.io/gpu-ids":"0","tre.aibrix.io/gpu-uuids":"GPU-689a3e93-68db-0dac-160b-6a791cf246e8"},"labels":{"app":"dsllama-8b-nscc-ds-4a100-node9-gpu-0","model.aibrix.ai/name":"dsllama-8b","model.aibrix.ai/port":"8000","tre.aibrix.io/gpu-ids":"0","tre.aibrix.io/managed":"true","tre.aibrix.io/node":"nscc-ds-4a100-node9","tre.aibrix.io/routable":"true"}},"spec":{"containers":[{"command":["python3","-m","vllm.entrypoints.openai.api_server","--host","0.0.0.0","--port","8000","--uvicorn-log-level","warning","--model","/data/nfs_shared_data/DeepSeek-R1-Distill-Llama-8B","--served-model-name","dsllama-8b","--enable_sleep_mode","--no-enable-prefix-caching","--enable-chunked-prefill","--max-num-batched-tokens","2048","--swap-space","20"],"env":[{"name":"NVIDIA_VISIBLE_DEVICES","value":"GPU-689a3e93-68db-0dac-160b-6a791cf246e8"},{"name":"CUDA_VISIBLE_DEVICES","value":"0"},{"name":"VLLM_SERVER_DEV_MODE","value":"1"},{"name":"VLLM_WORKER_MULTIPROC_METHOD","value":"spawn"},{"name":"VLLM_USE_MODELSCOPE","value":"True"}],"image":"vllm/vllm-openai:0.10.1-sleep","imagePullPolicy":"IfNotPresent","name":"vllm-openai","ports":[{"containerPort":8000,"protocol":"TCP"}],"resources":{},"volumeMounts":[{"mountPath":"/dev/shm","name":"shm"},{"mountPath":"/data","name":"models-volume"}]}],"nodeName":"nscc-ds-4a100-node9","volumes":[{"emptyDir":{"medium":"Memory","sizeLimit":"20Gi"},"name":"shm"},{"hostPath":{"path":"/data"},"name":"models-volume"}]}}}}
+      tre.aibrix.io/gpu-ids: "0"
+      tre.aibrix.io/gpu-uuids: GPU-689a3e93-68db-0dac-160b-6a791cf246e8
+    creationTimestamp: "2026-07-05T05:04:53Z"
+    generation: 1
+    labels:
+      model.aibrix.ai/name: dsllama-8b
+      model.aibrix.ai/port: "8000"
+      tre.aibrix.io/gpu-ids: "0"
+      tre.aibrix.io/managed: "true"
+      tre.aibrix.io/node: nscc-ds-4a100-node9
+      tre.aibrix.io/routable: "true"
+    name: dsllama-8b-nscc-ds-4a100-node9-gpu-0
+    namespace: default
+    resourceVersion: "192766164"
+    uid: cd40e76c-7b3d-4f63-b148-caf3c19b4048
+  spec:
+    progressDeadlineSeconds: 600
+    replicas: 1
+    revisionHistoryLimit: 10
+    selector:
+      matchLabels:
+        app: dsllama-8b-nscc-ds-4a100-node9-gpu-0
+    strategy:
+      rollingUpdate:
+        maxSurge: 25%
+        maxUnavailable: 25%
+      type: RollingUpdate
+    template:
+      metadata:
+        annotations:
+          tre.aibrix.io/gpu-ids: "0"
+          tre.aibrix.io/gpu-uuids: GPU-689a3e93-68db-0dac-160b-6a791cf246e8
+        creationTimestamp: null
+        labels:
+          app: dsllama-8b-nscc-ds-4a100-node9-gpu-0
+          model.aibrix.ai/name: dsllama-8b
+          model.aibrix.ai/port: "8000"
+          tre.aibrix.io/gpu-ids: "0"
+          tre.aibrix.io/managed: "true"
+          tre.aibrix.io/node: nscc-ds-4a100-node9
+          tre.aibrix.io/routable: "true"
+      spec:
+        containers:
+        - command:
+          - python3
+          - -m
+          - vllm.entrypoints.openai.api_server
+          - --host
+          - 0.0.0.0
+          - --port
+          - "8000"
+          - --uvicorn-log-level
+          - warning
+          - --model
+          - /data/nfs_shared_data/DeepSeek-R1-Distill-Llama-8B
+          - --served-model-name
+          - dsllama-8b
+          - --enable_sleep_mode
+          - --no-enable-prefix-caching
+          - --enable-chunked-prefill
+          - --max-num-batched-tokens
+          - "2048"
+          - --swap-space
+          - "20"
+          env:
+          - name: NVIDIA_VISIBLE_DEVICES
+            value: GPU-689a3e93-68db-0dac-160b-6a791cf246e8
+          - name: CUDA_VISIBLE_DEVICES
+            value: "0"
+          - name: VLLM_SERVER_DEV_MODE
+            value: "1"
+          - name: VLLM_WORKER_MULTIPROC_METHOD
+            value: spawn
+          - name: VLLM_USE_MODELSCOPE
+            value: "True"
+          image: vllm/vllm-openai:0.10.1-sleep
+          imagePullPolicy: IfNotPresent
+          name: vllm-openai
+          ports:
+          - containerPort: 8000
+            protocol: TCP
+          resources: {}
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+          volumeMounts:
+          - mountPath: /dev/shm
+            name: shm
+          - mountPath: /data
+            name: models-volume
+        dnsPolicy: ClusterFirst
+        nodeName: nscc-ds-4a100-node9
+        restartPolicy: Always
+        schedulerName: default-scheduler
+        securityContext: {}
+        terminationGracePeriodSeconds: 30
+        volumes:
+        - emptyDir:
+            medium: Memory
+            sizeLimit: 20Gi
+          name: shm
+        - hostPath:
+            path: /data
+            type: ""
+          name: models-volume
+  status:
+    availableReplicas: 1
+    conditions:
+    - lastTransitionTime: "2026-07-05T05:04:55Z"
+      lastUpdateTime: "2026-07-05T05:04:55Z"
+      message: Deployment has minimum availability.
+      reason: MinimumReplicasAvailable
+      status: "True"
+      type: Available
+    - lastTransitionTime: "2026-07-05T05:04:53Z"
+      lastUpdateTime: "2026-07-05T05:04:55Z"
+      message: ReplicaSet "dsllama-8b-nscc-ds-4a100-node9-gpu-0-6cbf96cdf5" has successfully
+        progressed.
+      reason: NewReplicaSetAvailable
+      status: "True"
+      type: Progressing
+    observedGeneration: 1
+    readyReplicas: 1
+    replicas: 1
+    updatedReplicas: 1
+- apiVersion: apps/v1
+  kind: Deployment
+  metadata:
+    annotations:
+      deployment.kubernetes.io/revision: "1"
+      kubectl.kubernetes.io/last-applied-configuration: |
+        {"apiVersion":"apps/v1","kind":"Deployment","metadata":{"annotations":{"tre.aibrix.io/gpu-ids":"1","tre.aibrix.io/gpu-uuids":"GPU-d0de9f25-c059-d2ee-e7c4-c242bbdc76c7"},"labels":{"model.aibrix.ai/name":"dsllama-8b","model.aibrix.ai/port":"8000","tre.aibrix.io/gpu-ids":"1","tre.aibrix.io/managed":"true","tre.aibrix.io/node":"nscc-ds-4a100-node9","tre.aibrix.io/routable":"true"},"name":"dsllama-8b-nscc-ds-4a100-node9-gpu-1","namespace":"default"},"spec":{"replicas":1,"selector":{"matchLabels":{"app":"dsllama-8b-nscc-ds-4a100-node9-gpu-1"}},"template":{"metadata":{"annotations":{"tre.aibrix.io/gpu-ids":"1","tre.aibrix.io/gpu-uuids":"GPU-d0de9f25-c059-d2ee-e7c4-c242bbdc76c7"},"labels":{"app":"dsllama-8b-nscc-ds-4a100-node9-gpu-1","model.aibrix.ai/name":"dsllama-8b","model.aibrix.ai/port":"8000","tre.aibrix.io/gpu-ids":"1","tre.aibrix.io/managed":"true","tre.aibrix.io/node":"nscc-ds-4a100-node9","tre.aibrix.io/routable":"true"}},"spec":{"containers":[{"command":["python3","-m","vllm.entrypoints.openai.api_server","--host","0.0.0.0","--port","8000","--uvicorn-log-level","warning","--model","/data/nfs_shared_data/DeepSeek-R1-Distill-Llama-8B","--served-model-name","dsllama-8b","--enable_sleep_mode","--no-enable-prefix-caching","--enable-chunked-prefill","--max-num-batched-tokens","2048","--swap-space","20"],"env":[{"name":"NVIDIA_VISIBLE_DEVICES","value":"GPU-d0de9f25-c059-d2ee-e7c4-c242bbdc76c7"},{"name":"CUDA_VISIBLE_DEVICES","value":"0"},{"name":"VLLM_SERVER_DEV_MODE","value":"1"},{"name":"VLLM_WORKER_MULTIPROC_METHOD","value":"spawn"},{"name":"VLLM_USE_MODELSCOPE","value":"True"}],"image":"vllm/vllm-openai:0.10.1-sleep","imagePullPolicy":"IfNotPresent","name":"vllm-openai","ports":[{"containerPort":8000,"protocol":"TCP"}],"resources":{},"volumeMounts":[{"mountPath":"/dev/shm","name":"shm"},{"mountPath":"/data","name":"models-volume"}]}],"nodeName":"nscc-ds-4a100-node9","volumes":[{"emptyDir":{"medium":"Memory","sizeLimit":"20Gi"},"name":"shm"},{"hostPath":{"path":"/data"},"name":"models-volume"}]}}}}
+      tre.aibrix.io/gpu-ids: "1"
+      tre.aibrix.io/gpu-uuids: GPU-d0de9f25-c059-d2ee-e7c4-c242bbdc76c7
+    creationTimestamp: "2026-07-05T05:52:53Z"
+    generation: 1
+    labels:
+      model.aibrix.ai/name: dsllama-8b
+      model.aibrix.ai/port: "8000"
+      tre.aibrix.io/gpu-ids: "1"
+      tre.aibrix.io/managed: "true"
+      tre.aibrix.io/node: nscc-ds-4a100-node9
+      tre.aibrix.io/routable: "true"
+    name: dsllama-8b-nscc-ds-4a100-node9-gpu-1
+    namespace: default
+    resourceVersion: "192782197"
+    uid: 96ef5109-14b4-4ea6-8045-e9762bed86d8
+  spec:
+    progressDeadlineSeconds: 600
+    replicas: 1
+    revisionHistoryLimit: 10
+    selector:
+      matchLabels:
+        app: dsllama-8b-nscc-ds-4a100-node9-gpu-1
+    strategy:
+      rollingUpdate:
+        maxSurge: 25%
+        maxUnavailable: 25%
+      type: RollingUpdate
+    template:
+      metadata:
+        annotations:
+          tre.aibrix.io/gpu-ids: "1"
+          tre.aibrix.io/gpu-uuids: GPU-d0de9f25-c059-d2ee-e7c4-c242bbdc76c7
+        creationTimestamp: null
+        labels:
+          app: dsllama-8b-nscc-ds-4a100-node9-gpu-1
+          model.aibrix.ai/name: dsllama-8b
+          model.aibrix.ai/port: "8000"
+          tre.aibrix.io/gpu-ids: "1"
+          tre.aibrix.io/managed: "true"
+          tre.aibrix.io/node: nscc-ds-4a100-node9
+          tre.aibrix.io/routable: "true"
+      spec:
+        containers:
+        - command:
+          - python3
+          - -m
+          - vllm.entrypoints.openai.api_server
+          - --host
+          - 0.0.0.0
+          - --port
+          - "8000"
+          - --uvicorn-log-level
+          - warning
+          - --model
+          - /data/nfs_shared_data/DeepSeek-R1-Distill-Llama-8B
+          - --served-model-name
+          - dsllama-8b
+          - --enable_sleep_mode
+          - --no-enable-prefix-caching
+          - --enable-chunked-prefill
+          - --max-num-batched-tokens
+          - "2048"
+          - --swap-space
+          - "20"
+          env:
+          - name: NVIDIA_VISIBLE_DEVICES
+            value: GPU-d0de9f25-c059-d2ee-e7c4-c242bbdc76c7
+          - name: CUDA_VISIBLE_DEVICES
+            value: "0"
+          - name: VLLM_SERVER_DEV_MODE
+            value: "1"
+          - name: VLLM_WORKER_MULTIPROC_METHOD
+            value: spawn
+          - name: VLLM_USE_MODELSCOPE
+            value: "True"
+          image: vllm/vllm-openai:0.10.1-sleep
+          imagePullPolicy: IfNotPresent
+          name: vllm-openai
+          ports:
+          - containerPort: 8000
+            protocol: TCP
+          resources: {}
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+          volumeMounts:
+          - mountPath: /dev/shm
+            name: shm
+          - mountPath: /data
+            name: models-volume
+        dnsPolicy: ClusterFirst
+        nodeName: nscc-ds-4a100-node9
+        restartPolicy: Always
+        schedulerName: default-scheduler
+        securityContext: {}
+        terminationGracePeriodSeconds: 30
+        volumes:
+        - emptyDir:
+            medium: Memory
+            sizeLimit: 20Gi
+          name: shm
+        - hostPath:
+            path: /data
+            type: ""
+          name: models-volume
+  status:
+    availableReplicas: 1
+    conditions:
+    - lastTransitionTime: "2026-07-05T05:52:54Z"
+      lastUpdateTime: "2026-07-05T05:52:54Z"
+      message: Deployment has minimum availability.
+      reason: MinimumReplicasAvailable
+      status: "True"
+      type: Available
+    - lastTransitionTime: "2026-07-05T05:52:53Z"
+      lastUpdateTime: "2026-07-05T05:52:54Z"
+      message: ReplicaSet "dsllama-8b-nscc-ds-4a100-node9-gpu-1-5579b75f9b" has successfully
+        progressed.
+      reason: NewReplicaSetAvailable
+      status: "True"
+      type: Progressing
+    observedGeneration: 1
+    readyReplicas: 1
+    replicas: 1
+    updatedReplicas: 1
+- apiVersion: apps/v1
+  kind: Deployment
+  metadata:
+    annotations:
+      deployment.kubernetes.io/revision: "1"
+      kubectl.kubernetes.io/last-applied-configuration: |
+        {"apiVersion":"apps/v1","kind":"Deployment","metadata":{"annotations":{"tre.aibrix.io/gpu-ids":"2","tre.aibrix.io/gpu-uuids":"GPU-3a113474-dd92-6d52-d05b-491e7b020ded"},"labels":{"model.aibrix.ai/name":"dsllama-8b","model.aibrix.ai/port":"8000","tre.aibrix.io/gpu-ids":"2","tre.aibrix.io/managed":"true","tre.aibrix.io/node":"nscc-ds-4a100-node9","tre.aibrix.io/routable":"true"},"name":"dsllama-8b-nscc-ds-4a100-node9-gpu-2","namespace":"default"},"spec":{"replicas":1,"selector":{"matchLabels":{"app":"dsllama-8b-nscc-ds-4a100-node9-gpu-2"}},"template":{"metadata":{"annotations":{"tre.aibrix.io/gpu-ids":"2","tre.aibrix.io/gpu-uuids":"GPU-3a113474-dd92-6d52-d05b-491e7b020ded"},"labels":{"app":"dsllama-8b-nscc-ds-4a100-node9-gpu-2","model.aibrix.ai/name":"dsllama-8b","model.aibrix.ai/port":"8000","tre.aibrix.io/gpu-ids":"2","tre.aibrix.io/managed":"true","tre.aibrix.io/node":"nscc-ds-4a100-node9","tre.aibrix.io/routable":"true"}},"spec":{"containers":[{"command":["python3","-m","vllm.entrypoints.openai.api_server","--host","0.0.0.0","--port","8000","--uvicorn-log-level","warning","--model","/data/nfs_shared_data/DeepSeek-R1-Distill-Llama-8B","--served-model-name","dsllama-8b","--enable_sleep_mode","--no-enable-prefix-caching","--enable-chunked-prefill","--max-num-batched-tokens","2048","--swap-space","20"],"env":[{"name":"NVIDIA_VISIBLE_DEVICES","value":"GPU-3a113474-dd92-6d52-d05b-491e7b020ded"},{"name":"CUDA_VISIBLE_DEVICES","value":"0"},{"name":"VLLM_SERVER_DEV_MODE","value":"1"},{"name":"VLLM_WORKER_MULTIPROC_METHOD","value":"spawn"},{"name":"VLLM_USE_MODELSCOPE","value":"True"}],"image":"vllm/vllm-openai:0.10.1-sleep","imagePullPolicy":"IfNotPresent","name":"vllm-openai","ports":[{"containerPort":8000,"protocol":"TCP"}],"resources":{},"volumeMounts":[{"mountPath":"/dev/shm","name":"shm"},{"mountPath":"/data","name":"models-volume"}]}],"nodeName":"nscc-ds-4a100-node9","volumes":[{"emptyDir":{"medium":"Memory","sizeLimit":"20Gi"},"name":"shm"},{"hostPath":{"path":"/data"},"name":"models-volume"}]}}}}
+      tre.aibrix.io/gpu-ids: "2"
+      tre.aibrix.io/gpu-uuids: GPU-3a113474-dd92-6d52-d05b-491e7b020ded
+    creationTimestamp: "2026-07-05T13:59:33Z"
+    generation: 1
+    labels:
+      model.aibrix.ai/name: dsllama-8b
+      model.aibrix.ai/port: "8000"
+      tre.aibrix.io/gpu-ids: "2"
+      tre.aibrix.io/managed: "true"
+      tre.aibrix.io/node: nscc-ds-4a100-node9
+      tre.aibrix.io/routable: "true"
+    name: dsllama-8b-nscc-ds-4a100-node9-gpu-2
+    namespace: default
+    resourceVersion: "192931252"
+    uid: 9aed735e-8d9f-460d-b6ce-f1787da77fe7
+  spec:
+    progressDeadlineSeconds: 600
+    replicas: 1
+    revisionHistoryLimit: 10
+    selector:
+      matchLabels:
+        app: dsllama-8b-nscc-ds-4a100-node9-gpu-2
+    strategy:
+      rollingUpdate:
+        maxSurge: 25%
+        maxUnavailable: 25%
+      type: RollingUpdate
+    template:
+      metadata:
+        annotations:
+          tre.aibrix.io/gpu-ids: "2"
+          tre.aibrix.io/gpu-uuids: GPU-3a113474-dd92-6d52-d05b-491e7b020ded
+        creationTimestamp: null
+        labels:
+          app: dsllama-8b-nscc-ds-4a100-node9-gpu-2
+          model.aibrix.ai/name: dsllama-8b
+          model.aibrix.ai/port: "8000"
+          tre.aibrix.io/gpu-ids: "2"
+          tre.aibrix.io/managed: "true"
+          tre.aibrix.io/node: nscc-ds-4a100-node9
+          tre.aibrix.io/routable: "true"
+      spec:
+        containers:
+        - command:
+          - python3
+          - -m
+          - vllm.entrypoints.openai.api_server
+          - --host
+          - 0.0.0.0
+          - --port
+          - "8000"
+          - --uvicorn-log-level
+          - warning
+          - --model
+          - /data/nfs_shared_data/DeepSeek-R1-Distill-Llama-8B
+          - --served-model-name
+          - dsllama-8b
+          - --enable_sleep_mode
+          - --no-enable-prefix-caching
+          - --enable-chunked-prefill
+          - --max-num-batched-tokens
+          - "2048"
+          - --swap-space
+          - "20"
+          env:
+          - name: NVIDIA_VISIBLE_DEVICES
+            value: GPU-3a113474-dd92-6d52-d05b-491e7b020ded
+          - name: CUDA_VISIBLE_DEVICES
+            value: "0"
+          - name: VLLM_SERVER_DEV_MODE
+            value: "1"
+          - name: VLLM_WORKER_MULTIPROC_METHOD
+            value: spawn
+          - name: VLLM_USE_MODELSCOPE
+            value: "True"
+          image: vllm/vllm-openai:0.10.1-sleep
+          imagePullPolicy: IfNotPresent
+          name: vllm-openai
+          ports:
+          - containerPort: 8000
+            protocol: TCP
+          resources: {}
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+          volumeMounts:
+          - mountPath: /dev/shm
+            name: shm
+          - mountPath: /data
+            name: models-volume
+        dnsPolicy: ClusterFirst
+        nodeName: nscc-ds-4a100-node9
+        restartPolicy: Always
+        schedulerName: default-scheduler
+        securityContext: {}
+        terminationGracePeriodSeconds: 30
+        volumes:
+        - emptyDir:
+            medium: Memory
+            sizeLimit: 20Gi
+          name: shm
+        - hostPath:
+            path: /data
+            type: ""
+          name: models-volume
+  status:
+    availableReplicas: 1
+    conditions:
+    - lastTransitionTime: "2026-07-05T13:59:34Z"
+      lastUpdateTime: "2026-07-05T13:59:34Z"
+      message: Deployment has minimum availability.
+      reason: MinimumReplicasAvailable
+      status: "True"
+      type: Available
+    - lastTransitionTime: "2026-07-05T13:59:33Z"
+      lastUpdateTime: "2026-07-05T13:59:34Z"
+      message: ReplicaSet "dsllama-8b-nscc-ds-4a100-node9-gpu-2-6774997cb5" has successfully
+        progressed.
+      reason: NewReplicaSetAvailable
+      status: "True"
+      type: Progressing
+    observedGeneration: 1
+    readyReplicas: 1
+    replicas: 1
+    updatedReplicas: 1
+- apiVersion: apps/v1
+  kind: Deployment
+  metadata:
+    annotations:
+      deployment.kubernetes.io/revision: "1"
+      kubectl.kubernetes.io/last-applied-configuration: |
+        {"apiVersion":"apps/v1","kind":"Deployment","metadata":{"annotations":{"tre.aibrix.io/gpu-ids":"3","tre.aibrix.io/gpu-uuids":"GPU-3c2fb581-708a-5fef-3eaa-5c3cc21a028e"},"labels":{"model.aibrix.ai/name":"dsllama-8b","model.aibrix.ai/port":"8000","tre.aibrix.io/gpu-ids":"3","tre.aibrix.io/managed":"true","tre.aibrix.io/node":"nscc-ds-4a100-node9","tre.aibrix.io/routable":"true"},"name":"dsllama-8b-nscc-ds-4a100-node9-gpu-3","namespace":"default"},"spec":{"replicas":1,"selector":{"matchLabels":{"app":"dsllama-8b-nscc-ds-4a100-node9-gpu-3"}},"template":{"metadata":{"annotations":{"tre.aibrix.io/gpu-ids":"3","tre.aibrix.io/gpu-uuids":"GPU-3c2fb581-708a-5fef-3eaa-5c3cc21a028e"},"labels":{"app":"dsllama-8b-nscc-ds-4a100-node9-gpu-3","model.aibrix.ai/name":"dsllama-8b","model.aibrix.ai/port":"8000","tre.aibrix.io/gpu-ids":"3","tre.aibrix.io/managed":"true","tre.aibrix.io/node":"nscc-ds-4a100-node9","tre.aibrix.io/routable":"true"}},"spec":{"containers":[{"command":["python3","-m","vllm.entrypoints.openai.api_server","--host","0.0.0.0","--port","8000","--uvicorn-log-level","warning","--model","/data/nfs_shared_data/DeepSeek-R1-Distill-Llama-8B","--served-model-name","dsllama-8b","--enable_sleep_mode","--no-enable-prefix-caching","--enable-chunked-prefill","--max-num-batched-tokens","2048","--swap-space","20"],"env":[{"name":"NVIDIA_VISIBLE_DEVICES","value":"GPU-3c2fb581-708a-5fef-3eaa-5c3cc21a028e"},{"name":"CUDA_VISIBLE_DEVICES","value":"0"},{"name":"VLLM_SERVER_DEV_MODE","value":"1"},{"name":"VLLM_WORKER_MULTIPROC_METHOD","value":"spawn"},{"name":"VLLM_USE_MODELSCOPE","value":"True"}],"image":"vllm/vllm-openai:0.10.1-sleep","imagePullPolicy":"IfNotPresent","name":"vllm-openai","ports":[{"containerPort":8000,"protocol":"TCP"}],"resources":{},"volumeMounts":[{"mountPath":"/dev/shm","name":"shm"},{"mountPath":"/data","name":"models-volume"}]}],"nodeName":"nscc-ds-4a100-node9","volumes":[{"emptyDir":{"medium":"Memory","sizeLimit":"20Gi"},"name":"shm"},{"hostPath":{"path":"/data"},"name":"models-volume"}]}}}}
+      tre.aibrix.io/gpu-ids: "3"
+      tre.aibrix.io/gpu-uuids: GPU-3c2fb581-708a-5fef-3eaa-5c3cc21a028e
+    creationTimestamp: "2026-07-05T13:31:46Z"
+    generation: 1
+    labels:
+      model.aibrix.ai/name: dsllama-8b
+      model.aibrix.ai/port: "8000"
+      tre.aibrix.io/gpu-ids: "3"
+      tre.aibrix.io/managed: "true"
+      tre.aibrix.io/node: nscc-ds-4a100-node9
+      tre.aibrix.io/routable: "true"
+    name: dsllama-8b-nscc-ds-4a100-node9-gpu-3
+    namespace: default
+    resourceVersion: "192922581"
+    uid: a1a71907-c282-4014-8386-5c0d6e9a5065
+  spec:
+    progressDeadlineSeconds: 600
+    replicas: 1
+    revisionHistoryLimit: 10
+    selector:
+      matchLabels:
+        app: dsllama-8b-nscc-ds-4a100-node9-gpu-3
+    strategy:
+      rollingUpdate:
+        maxSurge: 25%
+        maxUnavailable: 25%
+      type: RollingUpdate
+    template:
+      metadata:
+        annotations:
+          tre.aibrix.io/gpu-ids: "3"
+          tre.aibrix.io/gpu-uuids: GPU-3c2fb581-708a-5fef-3eaa-5c3cc21a028e
+        creationTimestamp: null
+        labels:
+          app: dsllama-8b-nscc-ds-4a100-node9-gpu-3
+          model.aibrix.ai/name: dsllama-8b
+          model.aibrix.ai/port: "8000"
+          tre.aibrix.io/gpu-ids: "3"
+          tre.aibrix.io/managed: "true"
+          tre.aibrix.io/node: nscc-ds-4a100-node9
+          tre.aibrix.io/routable: "true"
+      spec:
+        containers:
+        - command:
+          - python3
+          - -m
+          - vllm.entrypoints.openai.api_server
+          - --host
+          - 0.0.0.0
+          - --port
+          - "8000"
+          - --uvicorn-log-level
+          - warning
+          - --model
+          - /data/nfs_shared_data/DeepSeek-R1-Distill-Llama-8B
+          - --served-model-name
+          - dsllama-8b
+          - --enable_sleep_mode
+          - --no-enable-prefix-caching
+          - --enable-chunked-prefill
+          - --max-num-batched-tokens
+          - "2048"
+          - --swap-space
+          - "20"
+          env:
+          - name: NVIDIA_VISIBLE_DEVICES
+            value: GPU-3c2fb581-708a-5fef-3eaa-5c3cc21a028e
+          - name: CUDA_VISIBLE_DEVICES
+            value: "0"
+          - name: VLLM_SERVER_DEV_MODE
+            value: "1"
+          - name: VLLM_WORKER_MULTIPROC_METHOD
+            value: spawn
+          - name: VLLM_USE_MODELSCOPE
+            value: "True"
+          image: vllm/vllm-openai:0.10.1-sleep
+          imagePullPolicy: IfNotPresent
+          name: vllm-openai
+          ports:
+          - containerPort: 8000
+            protocol: TCP
+          resources: {}
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+          volumeMounts:
+          - mountPath: /dev/shm
+            name: shm
+          - mountPath: /data
+            name: models-volume
+        dnsPolicy: ClusterFirst
+        nodeName: nscc-ds-4a100-node9
+        restartPolicy: Always
+        schedulerName: default-scheduler
+        securityContext: {}
+        terminationGracePeriodSeconds: 30
+        volumes:
+        - emptyDir:
+            medium: Memory
+            sizeLimit: 20Gi
+          name: shm
+        - hostPath:
+            path: /data
+            type: ""
+          name: models-volume
+  status:
+    availableReplicas: 1
+    conditions:
+    - lastTransitionTime: "2026-07-05T13:31:48Z"
+      lastUpdateTime: "2026-07-05T13:31:48Z"
+      message: Deployment has minimum availability.
+      reason: MinimumReplicasAvailable
+      status: "True"
+      type: Available
+    - lastTransitionTime: "2026-07-05T13:31:46Z"
+      lastUpdateTime: "2026-07-05T13:31:48Z"
+      message: ReplicaSet "dsllama-8b-nscc-ds-4a100-node9-gpu-3-6bf484f758" has successfully
+        progressed.
+      reason: NewReplicaSetAvailable
+      status: "True"
+      type: Progressing
+    observedGeneration: 1
+    readyReplicas: 1
+    replicas: 1
+    updatedReplicas: 1
+- apiVersion: apps/v1
+  kind: Deployment
+  metadata:
+    annotations:
+      deployment.kubernetes.io/revision: "1"
+      kubectl.kubernetes.io/last-applied-configuration: |
+        {"apiVersion":"apps/v1","kind":"Deployment","metadata":{"annotations":{"tre.aibrix.io/gpu-ids":"0,1","tre.aibrix.io/gpu-uuids":"GPU-71f560a8-e090-c7e6-325f-2e386c08136f,GPU-4bcbcb0c-7eaf-64a1-b3e5-b07cb81d3a96"},"labels":{"model.aibrix.ai/name":"dsqwen-14b","model.aibrix.ai/port":"8000","tre.aibrix.io/gpu-ids":"0-1","tre.aibrix.io/managed":"true","tre.aibrix.io/node":"nscc-ds-4a100-node10","tre.aibrix.io/routable":"true"},"name":"dsqwen-14b-nscc-ds-4a100-node10-gpu-0-1","namespace":"default"},"spec":{"replicas":1,"selector":{"matchLabels":{"app":"dsqwen-14b-nscc-ds-4a100-node10-gpu-0-1"}},"template":{"metadata":{"annotations":{"tre.aibrix.io/gpu-ids":"0,1","tre.aibrix.io/gpu-uuids":"GPU-71f560a8-e090-c7e6-325f-2e386c08136f,GPU-4bcbcb0c-7eaf-64a1-b3e5-b07cb81d3a96"},"labels":{"app":"dsqwen-14b-nscc-ds-4a100-node10-gpu-0-1","model.aibrix.ai/name":"dsqwen-14b","model.aibrix.ai/port":"8000","tre.aibrix.io/gpu-ids":"0-1","tre.aibrix.io/managed":"true","tre.aibrix.io/node":"nscc-ds-4a100-node10","tre.aibrix.io/routable":"true"}},"spec":{"containers":[{"command":["python3","-m","vllm.entrypoints.openai.api_server","--host","0.0.0.0","--port","8000","--uvicorn-log-level","warning","--model","/data/nfs_shared_data/Models/DeepSeek-R1-Distill-Qwen-14B","--served-model-name","dsqwen-14b","--enable_sleep_mode","--tensor-parallel-size","2","--max-model-len","12288"],"env":[{"name":"NVIDIA_VISIBLE_DEVICES","value":"GPU-71f560a8-e090-c7e6-325f-2e386c08136f,GPU-4bcbcb0c-7eaf-64a1-b3e5-b07cb81d3a96"},{"name":"CUDA_VISIBLE_DEVICES","value":"0,1"},{"name":"VLLM_SERVER_DEV_MODE","value":"1"},{"name":"VLLM_WORKER_MULTIPROC_METHOD","value":"spawn"},{"name":"VLLM_USE_MODELSCOPE","value":"True"}],"image":"vllm/vllm-openai:0.10.1-sleep","imagePullPolicy":"IfNotPresent","name":"vllm-openai","ports":[{"containerPort":8000,"protocol":"TCP"}],"resources":{},"volumeMounts":[{"mountPath":"/dev/shm","name":"shm"},{"mountPath":"/data","name":"models-volume"}]}],"nodeName":"nscc-ds-4a100-node10","volumes":[{"emptyDir":{"medium":"Memory","sizeLimit":"20Gi"},"name":"shm"},{"hostPath":{"path":"/data"},"name":"models-volume"}]}}}}
+      tre.aibrix.io/gpu-ids: 0,1
+      tre.aibrix.io/gpu-uuids: GPU-71f560a8-e090-c7e6-325f-2e386c08136f,GPU-4bcbcb0c-7eaf-64a1-b3e5-b07cb81d3a96
+    creationTimestamp: "2026-07-05T05:58:29Z"
+    generation: 1
+    labels:
+      model.aibrix.ai/name: dsqwen-14b
+      model.aibrix.ai/port: "8000"
+      tre.aibrix.io/gpu-ids: 0-1
+      tre.aibrix.io/managed: "true"
+      tre.aibrix.io/node: nscc-ds-4a100-node10
+      tre.aibrix.io/routable: "true"
+    name: dsqwen-14b-nscc-ds-4a100-node10-gpu-0-1
+    namespace: default
+    resourceVersion: "192783990"
+    uid: f67c09a2-e08f-45fe-b9d1-136ee3cc66a7
+  spec:
+    progressDeadlineSeconds: 600
+    replicas: 1
+    revisionHistoryLimit: 10
+    selector:
+      matchLabels:
+        app: dsqwen-14b-nscc-ds-4a100-node10-gpu-0-1
+    strategy:
+      rollingUpdate:
+        maxSurge: 25%
+        maxUnavailable: 25%
+      type: RollingUpdate
+    template:
+      metadata:
+        annotations:
+          tre.aibrix.io/gpu-ids: 0,1
+          tre.aibrix.io/gpu-uuids: GPU-71f560a8-e090-c7e6-325f-2e386c08136f,GPU-4bcbcb0c-7eaf-64a1-b3e5-b07cb81d3a96
+        creationTimestamp: null
+        labels:
+          app: dsqwen-14b-nscc-ds-4a100-node10-gpu-0-1
+          model.aibrix.ai/name: dsqwen-14b
+          model.aibrix.ai/port: "8000"
+          tre.aibrix.io/gpu-ids: 0-1
+          tre.aibrix.io/managed: "true"
+          tre.aibrix.io/node: nscc-ds-4a100-node10
+          tre.aibrix.io/routable: "true"
+      spec:
+        containers:
+        - command:
+          - python3
+          - -m
+          - vllm.entrypoints.openai.api_server
+          - --host
+          - 0.0.0.0
+          - --port
+          - "8000"
+          - --uvicorn-log-level
+          - warning
+          - --model
+          - /data/nfs_shared_data/Models/DeepSeek-R1-Distill-Qwen-14B
+          - --served-model-name
+          - dsqwen-14b
+          - --enable_sleep_mode
+          - --tensor-parallel-size
+          - "2"
+          - --max-model-len
+          - "12288"
+          env:
+          - name: NVIDIA_VISIBLE_DEVICES
+            value: GPU-71f560a8-e090-c7e6-325f-2e386c08136f,GPU-4bcbcb0c-7eaf-64a1-b3e5-b07cb81d3a96
+          - name: CUDA_VISIBLE_DEVICES
+            value: 0,1
+          - name: VLLM_SERVER_DEV_MODE
+            value: "1"
+          - name: VLLM_WORKER_MULTIPROC_METHOD
+            value: spawn
+          - name: VLLM_USE_MODELSCOPE
+            value: "True"
+          image: vllm/vllm-openai:0.10.1-sleep
+          imagePullPolicy: IfNotPresent
+          name: vllm-openai
+          ports:
+          - containerPort: 8000
+            protocol: TCP
+          resources: {}
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+          volumeMounts:
+          - mountPath: /dev/shm
+            name: shm
+          - mountPath: /data
+            name: models-volume
+        dnsPolicy: ClusterFirst
+        nodeName: nscc-ds-4a100-node10
+        restartPolicy: Always
+        schedulerName: default-scheduler
+        securityContext: {}
+        terminationGracePeriodSeconds: 30
+        volumes:
+        - emptyDir:
+            medium: Memory
+            sizeLimit: 20Gi
+          name: shm
+        - hostPath:
+            path: /data
+            type: ""
+          name: models-volume
+  status:
+    availableReplicas: 1
+    conditions:
+    - lastTransitionTime: "2026-07-05T05:58:31Z"
+      lastUpdateTime: "2026-07-05T05:58:31Z"
+      message: Deployment has minimum availability.
+      reason: MinimumReplicasAvailable
+      status: "True"
+      type: Available
+    - lastTransitionTime: "2026-07-05T05:58:29Z"
+      lastUpdateTime: "2026-07-05T05:58:31Z"
+      message: ReplicaSet "dsqwen-14b-nscc-ds-4a100-node10-gpu-0-1-77d5997485" has
+        successfully progressed.
+      reason: NewReplicaSetAvailable
+      status: "True"
+      type: Progressing
+    observedGeneration: 1
+    readyReplicas: 1
+    replicas: 1
+    updatedReplicas: 1
+- apiVersion: apps/v1
+  kind: Deployment
+  metadata:
+    annotations:
+      deployment.kubernetes.io/revision: "1"
+      kubectl.kubernetes.io/last-applied-configuration: |
+        {"apiVersion":"apps/v1","kind":"Deployment","metadata":{"annotations":{"tre.aibrix.io/gpu-ids":"2,3","tre.aibrix.io/gpu-uuids":"GPU-28af749d-4081-d7b6-0c14-cf9c29aa213d,GPU-76a392a5-b027-42be-fb8f-1bfe9079b47c"},"labels":{"model.aibrix.ai/name":"dsqwen-14b","model.aibrix.ai/port":"8000","tre.aibrix.io/gpu-ids":"2-3","tre.aibrix.io/managed":"true","tre.aibrix.io/node":"nscc-ds-4a100-node10","tre.aibrix.io/routable":"true"},"name":"dsqwen-14b-nscc-ds-4a100-node10-gpu-2-3","namespace":"default"},"spec":{"replicas":1,"selector":{"matchLabels":{"app":"dsqwen-14b-nscc-ds-4a100-node10-gpu-2-3"}},"template":{"metadata":{"annotations":{"tre.aibrix.io/gpu-ids":"2,3","tre.aibrix.io/gpu-uuids":"GPU-28af749d-4081-d7b6-0c14-cf9c29aa213d,GPU-76a392a5-b027-42be-fb8f-1bfe9079b47c"},"labels":{"app":"dsqwen-14b-nscc-ds-4a100-node10-gpu-2-3","model.aibrix.ai/name":"dsqwen-14b","model.aibrix.ai/port":"8000","tre.aibrix.io/gpu-ids":"2-3","tre.aibrix.io/managed":"true","tre.aibrix.io/node":"nscc-ds-4a100-node10","tre.aibrix.io/routable":"true"}},"spec":{"containers":[{"command":["python3","-m","vllm.entrypoints.openai.api_server","--host","0.0.0.0","--port","8000","--uvicorn-log-level","warning","--model","/data/nfs_shared_data/Models/DeepSeek-R1-Distill-Qwen-14B","--served-model-name","dsqwen-14b","--enable_sleep_mode","--tensor-parallel-size","2","--max-model-len","12288"],"env":[{"name":"NVIDIA_VISIBLE_DEVICES","value":"GPU-28af749d-4081-d7b6-0c14-cf9c29aa213d,GPU-76a392a5-b027-42be-fb8f-1bfe9079b47c"},{"name":"CUDA_VISIBLE_DEVICES","value":"0,1"},{"name":"VLLM_SERVER_DEV_MODE","value":"1"},{"name":"VLLM_WORKER_MULTIPROC_METHOD","value":"spawn"},{"name":"VLLM_USE_MODELSCOPE","value":"True"}],"image":"vllm/vllm-openai:0.10.1-sleep","imagePullPolicy":"IfNotPresent","name":"vllm-openai","ports":[{"containerPort":8000,"protocol":"TCP"}],"resources":{},"volumeMounts":[{"mountPath":"/dev/shm","name":"shm"},{"mountPath":"/data","name":"models-volume"}]}],"nodeName":"nscc-ds-4a100-node10","volumes":[{"emptyDir":{"medium":"Memory","sizeLimit":"20Gi"},"name":"shm"},{"hostPath":{"path":"/data"},"name":"models-volume"}]}}}}
+      tre.aibrix.io/gpu-ids: 2,3
+      tre.aibrix.io/gpu-uuids: GPU-28af749d-4081-d7b6-0c14-cf9c29aa213d,GPU-76a392a5-b027-42be-fb8f-1bfe9079b47c
+    creationTimestamp: "2026-07-05T06:00:56Z"
+    generation: 1
+    labels:
+      model.aibrix.ai/name: dsqwen-14b
+      model.aibrix.ai/port: "8000"
+      tre.aibrix.io/gpu-ids: 2-3
+      tre.aibrix.io/managed: "true"
+      tre.aibrix.io/node: nscc-ds-4a100-node10
+      tre.aibrix.io/routable: "true"
+    name: dsqwen-14b-nscc-ds-4a100-node10-gpu-2-3
+    namespace: default
+    resourceVersion: "192784770"
+    uid: d7f8841e-986a-4e3a-b72f-7b980c417f01
+  spec:
+    progressDeadlineSeconds: 600
+    replicas: 1
+    revisionHistoryLimit: 10
+    selector:
+      matchLabels:
+        app: dsqwen-14b-nscc-ds-4a100-node10-gpu-2-3
+    strategy:
+      rollingUpdate:
+        maxSurge: 25%
+        maxUnavailable: 25%
+      type: RollingUpdate
+    template:
+      metadata:
+        annotations:
+          tre.aibrix.io/gpu-ids: 2,3
+          tre.aibrix.io/gpu-uuids: GPU-28af749d-4081-d7b6-0c14-cf9c29aa213d,GPU-76a392a5-b027-42be-fb8f-1bfe9079b47c
+        creationTimestamp: null
+        labels:
+          app: dsqwen-14b-nscc-ds-4a100-node10-gpu-2-3
+          model.aibrix.ai/name: dsqwen-14b
+          model.aibrix.ai/port: "8000"
+          tre.aibrix.io/gpu-ids: 2-3
+          tre.aibrix.io/managed: "true"
+          tre.aibrix.io/node: nscc-ds-4a100-node10
+          tre.aibrix.io/routable: "true"
+      spec:
+        containers:
+        - command:
+          - python3
+          - -m
+          - vllm.entrypoints.openai.api_server
+          - --host
+          - 0.0.0.0
+          - --port
+          - "8000"
+          - --uvicorn-log-level
+          - warning
+          - --model
+          - /data/nfs_shared_data/Models/DeepSeek-R1-Distill-Qwen-14B
+          - --served-model-name
+          - dsqwen-14b
+          - --enable_sleep_mode
+          - --tensor-parallel-size
+          - "2"
+          - --max-model-len
+          - "12288"
+          env:
+          - name: NVIDIA_VISIBLE_DEVICES
+            value: GPU-28af749d-4081-d7b6-0c14-cf9c29aa213d,GPU-76a392a5-b027-42be-fb8f-1bfe9079b47c
+          - name: CUDA_VISIBLE_DEVICES
+            value: 0,1
+          - name: VLLM_SERVER_DEV_MODE
+            value: "1"
+          - name: VLLM_WORKER_MULTIPROC_METHOD
+            value: spawn
+          - name: VLLM_USE_MODELSCOPE
+            value: "True"
+          image: vllm/vllm-openai:0.10.1-sleep
+          imagePullPolicy: IfNotPresent
+          name: vllm-openai
+          ports:
+          - containerPort: 8000
+            protocol: TCP
+          resources: {}
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+          volumeMounts:
+          - mountPath: /dev/shm
+            name: shm
+          - mountPath: /data
+            name: models-volume
+        dnsPolicy: ClusterFirst
+        nodeName: nscc-ds-4a100-node10
+        restartPolicy: Always
+        schedulerName: default-scheduler
+        securityContext: {}
+        terminationGracePeriodSeconds: 30
+        volumes:
+        - emptyDir:
+            medium: Memory
+            sizeLimit: 20Gi
+          name: shm
+        - hostPath:
+            path: /data
+            type: ""
+          name: models-volume
+  status:
+    availableReplicas: 1
+    conditions:
+    - lastTransitionTime: "2026-07-05T06:00:58Z"
+      lastUpdateTime: "2026-07-05T06:00:58Z"
+      message: Deployment has minimum availability.
+      reason: MinimumReplicasAvailable
+      status: "True"
+      type: Available
+    - lastTransitionTime: "2026-07-05T06:00:56Z"
+      lastUpdateTime: "2026-07-05T06:00:58Z"
+      message: ReplicaSet "dsqwen-14b-nscc-ds-4a100-node10-gpu-2-3-66f57f5575" has
+        successfully progressed.
+      reason: NewReplicaSetAvailable
+      status: "True"
+      type: Progressing
+    observedGeneration: 1
+    readyReplicas: 1
+    replicas: 1
+    updatedReplicas: 1
+- apiVersion: apps/v1
+  kind: Deployment
+  metadata:
+    annotations:
+      deployment.kubernetes.io/revision: "1"
+      kubectl.kubernetes.io/last-applied-configuration: |
+        {"apiVersion":"apps/v1","kind":"Deployment","metadata":{"annotations":{"tre.aibrix.io/gpu-ids":"0,1","tre.aibrix.io/gpu-uuids":"GPU-689a3e93-68db-0dac-160b-6a791cf246e8,GPU-d0de9f25-c059-d2ee-e7c4-c242bbdc76c7"},"labels":{"model.aibrix.ai/name":"dsqwen-14b","model.aibrix.ai/port":"8000","tre.aibrix.io/gpu-ids":"0-1","tre.aibrix.io/managed":"true","tre.aibrix.io/node":"nscc-ds-4a100-node9","tre.aibrix.io/routable":"true"},"name":"dsqwen-14b-nscc-ds-4a100-node9-gpu-0-1","namespace":"default"},"spec":{"replicas":1,"selector":{"matchLabels":{"app":"dsqwen-14b-nscc-ds-4a100-node9-gpu-0-1"}},"template":{"metadata":{"annotations":{"tre.aibrix.io/gpu-ids":"0,1","tre.aibrix.io/gpu-uuids":"GPU-689a3e93-68db-0dac-160b-6a791cf246e8,GPU-d0de9f25-c059-d2ee-e7c4-c242bbdc76c7"},"labels":{"app":"dsqwen-14b-nscc-ds-4a100-node9-gpu-0-1","model.aibrix.ai/name":"dsqwen-14b","model.aibrix.ai/port":"8000","tre.aibrix.io/gpu-ids":"0-1","tre.aibrix.io/managed":"true","tre.aibrix.io/node":"nscc-ds-4a100-node9","tre.aibrix.io/routable":"true"}},"spec":{"containers":[{"command":["python3","-m","vllm.entrypoints.openai.api_server","--host","0.0.0.0","--port","8000","--uvicorn-log-level","warning","--model","/data/nfs_shared_data/Models/DeepSeek-R1-Distill-Qwen-14B","--served-model-name","dsqwen-14b","--enable_sleep_mode","--tensor-parallel-size","2","--max-model-len","12288"],"env":[{"name":"NVIDIA_VISIBLE_DEVICES","value":"GPU-689a3e93-68db-0dac-160b-6a791cf246e8,GPU-d0de9f25-c059-d2ee-e7c4-c242bbdc76c7"},{"name":"CUDA_VISIBLE_DEVICES","value":"0,1"},{"name":"VLLM_SERVER_DEV_MODE","value":"1"},{"name":"VLLM_WORKER_MULTIPROC_METHOD","value":"spawn"},{"name":"VLLM_USE_MODELSCOPE","value":"True"}],"image":"vllm/vllm-openai:0.10.1-sleep","imagePullPolicy":"IfNotPresent","name":"vllm-openai","ports":[{"containerPort":8000,"protocol":"TCP"}],"resources":{},"volumeMounts":[{"mountPath":"/dev/shm","name":"shm"},{"mountPath":"/data","name":"models-volume"}]}],"nodeName":"nscc-ds-4a100-node9","volumes":[{"emptyDir":{"medium":"Memory","sizeLimit":"20Gi"},"name":"shm"},{"hostPath":{"path":"/data"},"name":"models-volume"}]}}}}
+      tre.aibrix.io/gpu-ids: 0,1
+      tre.aibrix.io/gpu-uuids: GPU-689a3e93-68db-0dac-160b-6a791cf246e8,GPU-d0de9f25-c059-d2ee-e7c4-c242bbdc76c7
+    creationTimestamp: "2026-07-05T10:11:24Z"
+    generation: 1
+    labels:
+      model.aibrix.ai/name: dsqwen-14b
+      model.aibrix.ai/port: "8000"
+      tre.aibrix.io/gpu-ids: 0-1
+      tre.aibrix.io/managed: "true"
+      tre.aibrix.io/node: nscc-ds-4a100-node9
+      tre.aibrix.io/routable: "true"
+    name: dsqwen-14b-nscc-ds-4a100-node9-gpu-0-1
+    namespace: default
+    resourceVersion: "192861517"
+    uid: 89506860-b24d-432e-a9ab-6566b1c55646
+  spec:
+    progressDeadlineSeconds: 600
+    replicas: 1
+    revisionHistoryLimit: 10
+    selector:
+      matchLabels:
+        app: dsqwen-14b-nscc-ds-4a100-node9-gpu-0-1
+    strategy:
+      rollingUpdate:
+        maxSurge: 25%
+        maxUnavailable: 25%
+      type: RollingUpdate
+    template:
+      metadata:
+        annotations:
+          tre.aibrix.io/gpu-ids: 0,1
+          tre.aibrix.io/gpu-uuids: GPU-689a3e93-68db-0dac-160b-6a791cf246e8,GPU-d0de9f25-c059-d2ee-e7c4-c242bbdc76c7
+        creationTimestamp: null
+        labels:
+          app: dsqwen-14b-nscc-ds-4a100-node9-gpu-0-1
+          model.aibrix.ai/name: dsqwen-14b
+          model.aibrix.ai/port: "8000"
+          tre.aibrix.io/gpu-ids: 0-1
+          tre.aibrix.io/managed: "true"
+          tre.aibrix.io/node: nscc-ds-4a100-node9
+          tre.aibrix.io/routable: "true"
+      spec:
+        containers:
+        - command:
+          - python3
+          - -m
+          - vllm.entrypoints.openai.api_server
+          - --host
+          - 0.0.0.0
+          - --port
+          - "8000"
+          - --uvicorn-log-level
+          - warning
+          - --model
+          - /data/nfs_shared_data/Models/DeepSeek-R1-Distill-Qwen-14B
+          - --served-model-name
+          - dsqwen-14b
+          - --enable_sleep_mode
+          - --tensor-parallel-size
+          - "2"
+          - --max-model-len
+          - "12288"
+          env:
+          - name: NVIDIA_VISIBLE_DEVICES
+            value: GPU-689a3e93-68db-0dac-160b-6a791cf246e8,GPU-d0de9f25-c059-d2ee-e7c4-c242bbdc76c7
+          - name: CUDA_VISIBLE_DEVICES
+            value: 0,1
+          - name: VLLM_SERVER_DEV_MODE
+            value: "1"
+          - name: VLLM_WORKER_MULTIPROC_METHOD
+            value: spawn
+          - name: VLLM_USE_MODELSCOPE
+            value: "True"
+          image: vllm/vllm-openai:0.10.1-sleep
+          imagePullPolicy: IfNotPresent
+          name: vllm-openai
+          ports:
+          - containerPort: 8000
+            protocol: TCP
+          resources: {}
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+          volumeMounts:
+          - mountPath: /dev/shm
+            name: shm
+          - mountPath: /data
+            name: models-volume
+        dnsPolicy: ClusterFirst
+        nodeName: nscc-ds-4a100-node9
+        restartPolicy: Always
+        schedulerName: default-scheduler
+        securityContext: {}
+        terminationGracePeriodSeconds: 30
+        volumes:
+        - emptyDir:
+            medium: Memory
+            sizeLimit: 20Gi
+          name: shm
+        - hostPath:
+            path: /data
+            type: ""
+          name: models-volume
+  status:
+    availableReplicas: 1
+    conditions:
+    - lastTransitionTime: "2026-07-05T10:11:26Z"
+      lastUpdateTime: "2026-07-05T10:11:26Z"
+      message: Deployment has minimum availability.
+      reason: MinimumReplicasAvailable
+      status: "True"
+      type: Available
+    - lastTransitionTime: "2026-07-05T10:11:24Z"
+      lastUpdateTime: "2026-07-05T10:11:26Z"
+      message: ReplicaSet "dsqwen-14b-nscc-ds-4a100-node9-gpu-0-1-7b8c77ddc5" has
+        successfully progressed.
+      reason: NewReplicaSetAvailable
+      status: "True"
+      type: Progressing
+    observedGeneration: 1
+    readyReplicas: 1
+    replicas: 1
+    updatedReplicas: 1
+- apiVersion: apps/v1
+  kind: Deployment
+  metadata:
+    annotations:
+      deployment.kubernetes.io/revision: "3"
+      kubectl.kubernetes.io/last-applied-configuration: |
+        {"apiVersion":"apps/v1","kind":"Deployment","metadata":{"annotations":{"tre.aibrix.io/gpu-ids":"0","tre.aibrix.io/gpu-uuids":"GPU-689a3e93-68db-0dac-160b-6a791cf246e8"},"labels":{"model.aibrix.ai/name":"dsqwen-7b","model.aibrix.ai/port":"8000","tre.aibrix.io/gpu-ids":"0","tre.aibrix.io/managed":"true","tre.aibrix.io/node":"nscc-ds-4a100-node9","tre.aibrix.io/routable":"true"},"name":"dsqwen-7b-nscc-ds-4a100-node9-gpu-0","namespace":"default"},"spec":{"replicas":1,"selector":{"matchLabels":{"app":"dsqwen-7b-nscc-ds-4a100-node9-gpu-0"}},"template":{"metadata":{"annotations":{"tre.aibrix.io/gpu-ids":"0","tre.aibrix.io/gpu-uuids":"GPU-689a3e93-68db-0dac-160b-6a791cf246e8"},"labels":{"app":"dsqwen-7b-nscc-ds-4a100-node9-gpu-0","model.aibrix.ai/name":"dsqwen-7b","model.aibrix.ai/port":"8000","tre.aibrix.io/gpu-ids":"0","tre.aibrix.io/managed":"true","tre.aibrix.io/node":"nscc-ds-4a100-node9","tre.aibrix.io/routable":"true"}},"spec":{"containers":[{"command":["python3","-m","vllm.entrypoints.openai.api_server","--host","0.0.0.0","--port","8000","--uvicorn-log-level","warning","--model","/data/nfs_shared_data/DeepSeek-R1-Distill-Qwen-7B","--served-model-name","dsqwen-7b","--enable_sleep_mode","--no-enable-prefix-caching","--enable-chunked-prefill","--max-num-batched-tokens","2048","--swap-space","16"],"env":[{"name":"NVIDIA_VISIBLE_DEVICES","value":"GPU-689a3e93-68db-0dac-160b-6a791cf246e8"},{"name":"CUDA_VISIBLE_DEVICES","value":"0"},{"name":"VLLM_SERVER_DEV_MODE","value":"1"},{"name":"VLLM_WORKER_MULTIPROC_METHOD","value":"spawn"},{"name":"VLLM_USE_MODELSCOPE","value":"True"}],"image":"vllm/vllm-openai:0.10.1-sleep","imagePullPolicy":"IfNotPresent","name":"vllm-openai","ports":[{"containerPort":8000,"protocol":"TCP"}],"resources":{},"volumeMounts":[{"mountPath":"/dev/shm","name":"shm"},{"mountPath":"/data","name":"models-volume"}]}],"nodeName":"nscc-ds-4a100-node9","volumes":[{"emptyDir":{"medium":"Memory","sizeLimit":"20Gi"},"name":"shm"},{"hostPath":{"path":"/data"},"name":"models-volume"}]}}}}
+      tre.aibrix.io/gpu-ids: "0"
+      tre.aibrix.io/gpu-uuids: GPU-689a3e93-68db-0dac-160b-6a791cf246e8
+    creationTimestamp: "2026-07-04T08:43:16Z"
+    generation: 3
+    labels:
+      model.aibrix.ai/name: dsqwen-7b
+      model.aibrix.ai/port: "8000"
+      tre.aibrix.io/gpu-ids: "0"
+      tre.aibrix.io/managed: "true"
+      tre.aibrix.io/node: nscc-ds-4a100-node9
+      tre.aibrix.io/routable: "true"
+    name: dsqwen-7b-nscc-ds-4a100-node9-gpu-0
+    namespace: default
+    resourceVersion: "192767943"
+    uid: d17fe1d4-747c-4aed-bb60-6eb8ff442723
+  spec:
+    progressDeadlineSeconds: 600
+    replicas: 1
+    revisionHistoryLimit: 10
+    selector:
+      matchLabels:
+        app: dsqwen-7b-nscc-ds-4a100-node9-gpu-0
+    strategy:
+      rollingUpdate:
+        maxSurge: 25%
+        maxUnavailable: 25%
+      type: RollingUpdate
+    template:
+      metadata:
+        annotations:
+          tre.aibrix.io/gpu-ids: "0"
+          tre.aibrix.io/gpu-uuids: GPU-689a3e93-68db-0dac-160b-6a791cf246e8
+        creationTimestamp: null
+        labels:
+          app: dsqwen-7b-nscc-ds-4a100-node9-gpu-0
+          model.aibrix.ai/name: dsqwen-7b
+          model.aibrix.ai/port: "8000"
+          tre.aibrix.io/gpu-ids: "0"
+          tre.aibrix.io/managed: "true"
+          tre.aibrix.io/node: nscc-ds-4a100-node9
+          tre.aibrix.io/routable: "true"
+      spec:
+        containers:
+        - command:
+          - python3
+          - -m
+          - vllm.entrypoints.openai.api_server
+          - --host
+          - 0.0.0.0
+          - --port
+          - "8000"
+          - --uvicorn-log-level
+          - warning
+          - --model
+          - /data/nfs_shared_data/DeepSeek-R1-Distill-Qwen-7B
+          - --served-model-name
+          - dsqwen-7b
+          - --enable_sleep_mode
+          - --no-enable-prefix-caching
+          - --enable-chunked-prefill
+          - --max-num-batched-tokens
+          - "2048"
+          - --swap-space
+          - "16"
+          env:
+          - name: NVIDIA_VISIBLE_DEVICES
+            value: GPU-689a3e93-68db-0dac-160b-6a791cf246e8
+          - name: CUDA_VISIBLE_DEVICES
+            value: "0"
+          - name: VLLM_SERVER_DEV_MODE
+            value: "1"
+          - name: VLLM_WORKER_MULTIPROC_METHOD
+            value: spawn
+          - name: VLLM_USE_MODELSCOPE
+            value: "True"
+          image: vllm/vllm-openai:0.10.1-sleep
+          imagePullPolicy: IfNotPresent
+          name: vllm-openai
+          ports:
+          - containerPort: 8000
+            protocol: TCP
+          resources: {}
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+          volumeMounts:
+          - mountPath: /dev/shm
+            name: shm
+          - mountPath: /data
+            name: models-volume
+        dnsPolicy: ClusterFirst
+        nodeName: nscc-ds-4a100-node9
+        restartPolicy: Always
+        schedulerName: default-scheduler
+        securityContext: {}
+        terminationGracePeriodSeconds: 30
+        volumes:
+        - emptyDir:
+            medium: Memory
+            sizeLimit: 20Gi
+          name: shm
+        - hostPath:
+            path: /data
+            type: ""
+          name: models-volume
+  status:
+    availableReplicas: 1
+    conditions:
+    - lastTransitionTime: "2026-07-04T08:43:16Z"
+      lastUpdateTime: "2026-07-05T05:05:01Z"
+      message: ReplicaSet "dsqwen-7b-nscc-ds-4a100-node9-gpu-0-79b869c66b" has successfully
+        progressed.
+      reason: NewReplicaSetAvailable
+      status: "True"
+      type: Progressing
+    - lastTransitionTime: "2026-07-05T05:10:10Z"
+      lastUpdateTime: "2026-07-05T05:10:10Z"
+      message: Deployment has minimum availability.
+      reason: MinimumReplicasAvailable
+      status: "True"
+      type: Available
+    observedGeneration: 3
+    readyReplicas: 1
+    replicas: 1
+    updatedReplicas: 1
+- apiVersion: apps/v1
+  kind: Deployment
+  metadata:
+    annotations:
+      deployment.kubernetes.io/revision: "1"
+      kubectl.kubernetes.io/last-applied-configuration: |
+        {"apiVersion":"apps/v1","kind":"Deployment","metadata":{"annotations":{"tre.aibrix.io/gpu-ids":"1","tre.aibrix.io/gpu-uuids":"GPU-d0de9f25-c059-d2ee-e7c4-c242bbdc76c7"},"labels":{"model.aibrix.ai/name":"dsqwen-7b","model.aibrix.ai/port":"8000","tre.aibrix.io/gpu-ids":"1","tre.aibrix.io/managed":"true","tre.aibrix.io/node":"nscc-ds-4a100-node9","tre.aibrix.io/routable":"true"},"name":"dsqwen-7b-nscc-ds-4a100-node9-gpu-1","namespace":"default"},"spec":{"replicas":1,"selector":{"matchLabels":{"app":"dsqwen-7b-nscc-ds-4a100-node9-gpu-1"}},"template":{"metadata":{"annotations":{"tre.aibrix.io/gpu-ids":"1","tre.aibrix.io/gpu-uuids":"GPU-d0de9f25-c059-d2ee-e7c4-c242bbdc76c7"},"labels":{"app":"dsqwen-7b-nscc-ds-4a100-node9-gpu-1","model.aibrix.ai/name":"dsqwen-7b","model.aibrix.ai/port":"8000","tre.aibrix.io/gpu-ids":"1","tre.aibrix.io/managed":"true","tre.aibrix.io/node":"nscc-ds-4a100-node9","tre.aibrix.io/routable":"true"}},"spec":{"containers":[{"command":["python3","-m","vllm.entrypoints.openai.api_server","--host","0.0.0.0","--port","8000","--uvicorn-log-level","warning","--model","/data/nfs_shared_data/DeepSeek-R1-Distill-Qwen-7B","--served-model-name","dsqwen-7b","--enable_sleep_mode","--no-enable-prefix-caching","--enable-chunked-prefill","--max-num-batched-tokens","2048","--swap-space","16"],"env":[{"name":"NVIDIA_VISIBLE_DEVICES","value":"GPU-d0de9f25-c059-d2ee-e7c4-c242bbdc76c7"},{"name":"CUDA_VISIBLE_DEVICES","value":"0"},{"name":"VLLM_SERVER_DEV_MODE","value":"1"},{"name":"VLLM_WORKER_MULTIPROC_METHOD","value":"spawn"},{"name":"VLLM_USE_MODELSCOPE","value":"True"}],"image":"vllm/vllm-openai:0.10.1-sleep","imagePullPolicy":"IfNotPresent","name":"vllm-openai","ports":[{"containerPort":8000,"protocol":"TCP"}],"resources":{},"volumeMounts":[{"mountPath":"/dev/shm","name":"shm"},{"mountPath":"/data","name":"models-volume"}]}],"nodeName":"nscc-ds-4a100-node9","volumes":[{"emptyDir":{"medium":"Memory","sizeLimit":"20Gi"},"name":"shm"},{"hostPath":{"path":"/data"},"name":"models-volume"}]}}}}
+      tre.aibrix.io/gpu-ids: "1"
+      tre.aibrix.io/gpu-uuids: GPU-d0de9f25-c059-d2ee-e7c4-c242bbdc76c7
+    creationTimestamp: "2026-07-05T10:08:59Z"
+    generation: 1
+    labels:
+      model.aibrix.ai/name: dsqwen-7b
+      model.aibrix.ai/port: "8000"
+      tre.aibrix.io/gpu-ids: "1"
+      tre.aibrix.io/managed: "true"
+      tre.aibrix.io/node: nscc-ds-4a100-node9
+      tre.aibrix.io/routable: "true"
+    name: dsqwen-7b-nscc-ds-4a100-node9-gpu-1
+    namespace: default
+    resourceVersion: "192860744"
+    uid: 7391a805-4f28-45d6-9d84-020c1092d49e
+  spec:
+    progressDeadlineSeconds: 600
+    replicas: 1
+    revisionHistoryLimit: 10
+    selector:
+      matchLabels:
+        app: dsqwen-7b-nscc-ds-4a100-node9-gpu-1
+    strategy:
+      rollingUpdate:
+        maxSurge: 25%
+        maxUnavailable: 25%
+      type: RollingUpdate
+    template:
+      metadata:
+        annotations:
+          tre.aibrix.io/gpu-ids: "1"
+          tre.aibrix.io/gpu-uuids: GPU-d0de9f25-c059-d2ee-e7c4-c242bbdc76c7
+        creationTimestamp: null
+        labels:
+          app: dsqwen-7b-nscc-ds-4a100-node9-gpu-1
+          model.aibrix.ai/name: dsqwen-7b
+          model.aibrix.ai/port: "8000"
+          tre.aibrix.io/gpu-ids: "1"
+          tre.aibrix.io/managed: "true"
+          tre.aibrix.io/node: nscc-ds-4a100-node9
+          tre.aibrix.io/routable: "true"
+      spec:
+        containers:
+        - command:
+          - python3
+          - -m
+          - vllm.entrypoints.openai.api_server
+          - --host
+          - 0.0.0.0
+          - --port
+          - "8000"
+          - --uvicorn-log-level
+          - warning
+          - --model
+          - /data/nfs_shared_data/DeepSeek-R1-Distill-Qwen-7B
+          - --served-model-name
+          - dsqwen-7b
+          - --enable_sleep_mode
+          - --no-enable-prefix-caching
+          - --enable-chunked-prefill
+          - --max-num-batched-tokens
+          - "2048"
+          - --swap-space
+          - "16"
+          env:
+          - name: NVIDIA_VISIBLE_DEVICES
+            value: GPU-d0de9f25-c059-d2ee-e7c4-c242bbdc76c7
+          - name: CUDA_VISIBLE_DEVICES
+            value: "0"
+          - name: VLLM_SERVER_DEV_MODE
+            value: "1"
+          - name: VLLM_WORKER_MULTIPROC_METHOD
+            value: spawn
+          - name: VLLM_USE_MODELSCOPE
+            value: "True"
+          image: vllm/vllm-openai:0.10.1-sleep
+          imagePullPolicy: IfNotPresent
+          name: vllm-openai
+          ports:
+          - containerPort: 8000
+            protocol: TCP
+          resources: {}
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+          volumeMounts:
+          - mountPath: /dev/shm
+            name: shm
+          - mountPath: /data
+            name: models-volume
+        dnsPolicy: ClusterFirst
+        nodeName: nscc-ds-4a100-node9
+        restartPolicy: Always
+        schedulerName: default-scheduler
+        securityContext: {}
+        terminationGracePeriodSeconds: 30
+        volumes:
+        - emptyDir:
+            medium: Memory
+            sizeLimit: 20Gi
+          name: shm
+        - hostPath:
+            path: /data
+            type: ""
+          name: models-volume
+  status:
+    availableReplicas: 1
+    conditions:
+    - lastTransitionTime: "2026-07-05T10:09:00Z"
+      lastUpdateTime: "2026-07-05T10:09:00Z"
+      message: Deployment has minimum availability.
+      reason: MinimumReplicasAvailable
+      status: "True"
+      type: Available
+    - lastTransitionTime: "2026-07-05T10:08:59Z"
+      lastUpdateTime: "2026-07-05T10:09:00Z"
+      message: ReplicaSet "dsqwen-7b-nscc-ds-4a100-node9-gpu-1-76cf6689c9" has successfully
+        progressed.
+      reason: NewReplicaSetAvailable
+      status: "True"
+      type: Progressing
+    observedGeneration: 1
+    readyReplicas: 1
+    replicas: 1
+    updatedReplicas: 1
+- apiVersion: apps/v1
+  kind: Deployment
+  metadata:
+    annotations:
+      deployment.kubernetes.io/revision: "1"
+      kubectl.kubernetes.io/last-applied-configuration: |
+        {"apiVersion":"apps/v1","kind":"Deployment","metadata":{"annotations":{"tre.aibrix.io/gpu-ids":"2","tre.aibrix.io/gpu-uuids":"GPU-3a113474-dd92-6d52-d05b-491e7b020ded"},"labels":{"model.aibrix.ai/name":"dsqwen-7b","model.aibrix.ai/port":"8000","tre.aibrix.io/gpu-ids":"2","tre.aibrix.io/managed":"true","tre.aibrix.io/node":"nscc-ds-4a100-node9","tre.aibrix.io/routable":"true"},"name":"dsqwen-7b-nscc-ds-4a100-node9-gpu-2","namespace":"default"},"spec":{"replicas":1,"selector":{"matchLabels":{"app":"dsqwen-7b-nscc-ds-4a100-node9-gpu-2"}},"template":{"metadata":{"annotations":{"tre.aibrix.io/gpu-ids":"2","tre.aibrix.io/gpu-uuids":"GPU-3a113474-dd92-6d52-d05b-491e7b020ded"},"labels":{"app":"dsqwen-7b-nscc-ds-4a100-node9-gpu-2","model.aibrix.ai/name":"dsqwen-7b","model.aibrix.ai/port":"8000","tre.aibrix.io/gpu-ids":"2","tre.aibrix.io/managed":"true","tre.aibrix.io/node":"nscc-ds-4a100-node9","tre.aibrix.io/routable":"true"}},"spec":{"containers":[{"command":["python3","-m","vllm.entrypoints.openai.api_server","--host","0.0.0.0","--port","8000","--uvicorn-log-level","warning","--model","/data/nfs_shared_data/DeepSeek-R1-Distill-Qwen-7B","--served-model-name","dsqwen-7b","--enable_sleep_mode","--no-enable-prefix-caching","--enable-chunked-prefill","--max-num-batched-tokens","2048","--swap-space","16"],"env":[{"name":"NVIDIA_VISIBLE_DEVICES","value":"GPU-3a113474-dd92-6d52-d05b-491e7b020ded"},{"name":"CUDA_VISIBLE_DEVICES","value":"0"},{"name":"VLLM_SERVER_DEV_MODE","value":"1"},{"name":"VLLM_WORKER_MULTIPROC_METHOD","value":"spawn"},{"name":"VLLM_USE_MODELSCOPE","value":"True"}],"image":"vllm/vllm-openai:0.10.1-sleep","imagePullPolicy":"IfNotPresent","name":"vllm-openai","ports":[{"containerPort":8000,"protocol":"TCP"}],"resources":{},"volumeMounts":[{"mountPath":"/dev/shm","name":"shm"},{"mountPath":"/data","name":"models-volume"}]}],"nodeName":"nscc-ds-4a100-node9","volumes":[{"emptyDir":{"medium":"Memory","sizeLimit":"20Gi"},"name":"shm"},{"hostPath":{"path":"/data"},"name":"models-volume"}]}}}}
+      tre.aibrix.io/gpu-ids: "2"
+      tre.aibrix.io/gpu-uuids: GPU-3a113474-dd92-6d52-d05b-491e7b020ded
+    creationTimestamp: "2026-07-05T13:29:36Z"
+    generation: 1
+    labels:
+      model.aibrix.ai/name: dsqwen-7b
+      model.aibrix.ai/port: "8000"
+      tre.aibrix.io/gpu-ids: "2"
+      tre.aibrix.io/managed: "true"
+      tre.aibrix.io/node: nscc-ds-4a100-node9
+      tre.aibrix.io/routable: "true"
+    name: dsqwen-7b-nscc-ds-4a100-node9-gpu-2
+    namespace: default
+    resourceVersion: "192921874"
+    uid: 74c1b99a-e15a-4e3f-852c-be7c06268a82
+  spec:
+    progressDeadlineSeconds: 600
+    replicas: 1
+    revisionHistoryLimit: 10
+    selector:
+      matchLabels:
+        app: dsqwen-7b-nscc-ds-4a100-node9-gpu-2
+    strategy:
+      rollingUpdate:
+        maxSurge: 25%
+        maxUnavailable: 25%
+      type: RollingUpdate
+    template:
+      metadata:
+        annotations:
+          tre.aibrix.io/gpu-ids: "2"
+          tre.aibrix.io/gpu-uuids: GPU-3a113474-dd92-6d52-d05b-491e7b020ded
+        creationTimestamp: null
+        labels:
+          app: dsqwen-7b-nscc-ds-4a100-node9-gpu-2
+          model.aibrix.ai/name: dsqwen-7b
+          model.aibrix.ai/port: "8000"
+          tre.aibrix.io/gpu-ids: "2"
+          tre.aibrix.io/managed: "true"
+          tre.aibrix.io/node: nscc-ds-4a100-node9
+          tre.aibrix.io/routable: "true"
+      spec:
+        containers:
+        - command:
+          - python3
+          - -m
+          - vllm.entrypoints.openai.api_server
+          - --host
+          - 0.0.0.0
+          - --port
+          - "8000"
+          - --uvicorn-log-level
+          - warning
+          - --model
+          - /data/nfs_shared_data/DeepSeek-R1-Distill-Qwen-7B
+          - --served-model-name
+          - dsqwen-7b
+          - --enable_sleep_mode
+          - --no-enable-prefix-caching
+          - --enable-chunked-prefill
+          - --max-num-batched-tokens
+          - "2048"
+          - --swap-space
+          - "16"
+          env:
+          - name: NVIDIA_VISIBLE_DEVICES
+            value: GPU-3a113474-dd92-6d52-d05b-491e7b020ded
+          - name: CUDA_VISIBLE_DEVICES
+            value: "0"
+          - name: VLLM_SERVER_DEV_MODE
+            value: "1"
+          - name: VLLM_WORKER_MULTIPROC_METHOD
+            value: spawn
+          - name: VLLM_USE_MODELSCOPE
+            value: "True"
+          image: vllm/vllm-openai:0.10.1-sleep
+          imagePullPolicy: IfNotPresent
+          name: vllm-openai
+          ports:
+          - containerPort: 8000
+            protocol: TCP
+          resources: {}
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+          volumeMounts:
+          - mountPath: /dev/shm
+            name: shm
+          - mountPath: /data
+            name: models-volume
+        dnsPolicy: ClusterFirst
+        nodeName: nscc-ds-4a100-node9
+        restartPolicy: Always
+        schedulerName: default-scheduler
+        securityContext: {}
+        terminationGracePeriodSeconds: 30
+        volumes:
+        - emptyDir:
+            medium: Memory
+            sizeLimit: 20Gi
+          name: shm
+        - hostPath:
+            path: /data
+            type: ""
+          name: models-volume
+  status:
+    availableReplicas: 1
+    conditions:
+    - lastTransitionTime: "2026-07-05T13:29:38Z"
+      lastUpdateTime: "2026-07-05T13:29:38Z"
+      message: Deployment has minimum availability.
+      reason: MinimumReplicasAvailable
+      status: "True"
+      type: Available
+    - lastTransitionTime: "2026-07-05T13:29:36Z"
+      lastUpdateTime: "2026-07-05T13:29:38Z"
+      message: ReplicaSet "dsqwen-7b-nscc-ds-4a100-node9-gpu-2-7fc65f475b" has successfully
+        progressed.
+      reason: NewReplicaSetAvailable
+      status: "True"
+      type: Progressing
+    observedGeneration: 1
+    readyReplicas: 1
+    replicas: 1
+    updatedReplicas: 1
+- apiVersion: apps/v1
+  kind: Deployment
+  metadata:
+    annotations:
+      deployment.kubernetes.io/revision: "1"
+      tre.aibrix.io/gpu-ids: "3"
+      tre.aibrix.io/gpu-uuids: GPU-3c2fb581-708a-5fef-3eaa-5c3cc21a028e
+    creationTimestamp: "2026-07-05T14:28:30Z"
+    generation: 1
+    labels:
+      model.aibrix.ai/name: dsqwen-7b
+      model.aibrix.ai/port: "8000"
+      tre.aibrix.io/gpu-ids: "3"
+      tre.aibrix.io/managed: "true"
+      tre.aibrix.io/node: nscc-ds-4a100-node9
+      tre.aibrix.io/routable: "true"
+    name: dsqwen-7b-nscc-ds-4a100-node9-gpu-3
+    namespace: default
+    resourceVersion: "192940149"
+    uid: 90a8204a-14b8-431e-b21e-9b5e33a8abac
+  spec:
+    progressDeadlineSeconds: 600
+    replicas: 1
+    revisionHistoryLimit: 10
+    selector:
+      matchLabels:
+        app: dsqwen-7b-nscc-ds-4a100-node9-gpu-3
+    strategy:
+      rollingUpdate:
+        maxSurge: 25%
+        maxUnavailable: 25%
+      type: RollingUpdate
+    template:
+      metadata:
+        annotations:
+          tre.aibrix.io/gpu-ids: "3"
+          tre.aibrix.io/gpu-uuids: GPU-3c2fb581-708a-5fef-3eaa-5c3cc21a028e
+        creationTimestamp: null
+        labels:
+          app: dsqwen-7b-nscc-ds-4a100-node9-gpu-3
+          model.aibrix.ai/name: dsqwen-7b
+          model.aibrix.ai/port: "8000"
+          tre.aibrix.io/gpu-ids: "3"
+          tre.aibrix.io/managed: "true"
+          tre.aibrix.io/node: nscc-ds-4a100-node9
+          tre.aibrix.io/routable: "true"
+      spec:
+        containers:
+        - command:
+          - python3
+          - -m
+          - vllm.entrypoints.openai.api_server
+          - --host
+          - 0.0.0.0
+          - --port
+          - "8000"
+          - --uvicorn-log-level
+          - warning
+          - --model
+          - /data/nfs_shared_data/DeepSeek-R1-Distill-Qwen-7B
+          - --served-model-name
+          - dsqwen-7b
+          - --enable_sleep_mode
+          - --no-enable-prefix-caching
+          - --enable-chunked-prefill
+          - --max-num-batched-tokens
+          - "2048"
+          - --swap-space
+          - "16"
+          env:
+          - name: NVIDIA_VISIBLE_DEVICES
+            value: GPU-3c2fb581-708a-5fef-3eaa-5c3cc21a028e
+          - name: CUDA_VISIBLE_DEVICES
+            value: "0"
+          - name: VLLM_SERVER_DEV_MODE
+            value: "1"
+          - name: VLLM_WORKER_MULTIPROC_METHOD
+            value: spawn
+          - name: VLLM_USE_MODELSCOPE
+            value: "True"
+          image: vllm/vllm-openai:0.10.1-sleep
+          imagePullPolicy: IfNotPresent
+          name: vllm-openai
+          ports:
+          - containerPort: 8000
+            protocol: TCP
+          resources: {}
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+          volumeMounts:
+          - mountPath: /dev/shm
+            name: shm
+          - mountPath: /data
+            name: models-volume
+        dnsPolicy: ClusterFirst
+        nodeName: nscc-ds-4a100-node9
+        restartPolicy: Always
+        schedulerName: default-scheduler
+        securityContext: {}
+        terminationGracePeriodSeconds: 30
+        volumes:
+        - emptyDir:
+            medium: Memory
+            sizeLimit: 20Gi
+          name: shm
+        - hostPath:
+            path: /data
+            type: ""
+          name: models-volume
+  status:
+    availableReplicas: 1
+    conditions:
+    - lastTransitionTime: "2026-07-05T14:28:32Z"
+      lastUpdateTime: "2026-07-05T14:28:32Z"
+      message: Deployment has minimum availability.
+      reason: MinimumReplicasAvailable
+      status: "True"
+      type: Available
+    - lastTransitionTime: "2026-07-05T14:28:30Z"
+      lastUpdateTime: "2026-07-05T14:28:32Z"
+      message: ReplicaSet "dsqwen-7b-nscc-ds-4a100-node9-gpu-3-86c8574f65" has successfully
+        progressed.
+      reason: NewReplicaSetAvailable
+      status: "True"
+      type: Progressing
+    observedGeneration: 1
+    readyReplicas: 1
+    replicas: 1
+    updatedReplicas: 1
+- apiVersion: v1
+  kind: Service
+  metadata:
+    annotations:
+      kubectl.kubernetes.io/last-applied-configuration: |
+        {"apiVersion":"v1","kind":"Service","metadata":{"annotations":{},"labels":{"model.aibrix.ai/name":"dsllama-8b"},"name":"dsllama-8b","namespace":"default"},"spec":{"ports":[{"name":"http","port":8000,"protocol":"TCP","targetPort":8000}],"selector":{"model.aibrix.ai/name":"dsllama-8b","tre.aibrix.io/routable":"true"}}}
+    creationTimestamp: "2026-07-05T05:04:53Z"
+    labels:
+      model.aibrix.ai/name: dsllama-8b
+    name: dsllama-8b
+    namespace: default
+    resourceVersion: "192766128"
+    uid: 16f8cccf-5c68-4972-afdc-e35d9128d053
+  spec:
+    clusterIP: 10.103.137.6
+    clusterIPs:
+    - 10.103.137.6
+    internalTrafficPolicy: Cluster
+    ipFamilies:
+    - IPv4
+    ipFamilyPolicy: SingleStack
+    ports:
+    - name: http
+      port: 8000
+      protocol: TCP
+      targetPort: 8000
+    selector:
+      model.aibrix.ai/name: dsllama-8b
+      tre.aibrix.io/routable: "true"
+    sessionAffinity: None
+    type: ClusterIP
+  status:
+    loadBalancer: {}
+- apiVersion: v1
+  kind: Service
+  metadata:
+    annotations:
+      kubectl.kubernetes.io/last-applied-configuration: |
+        {"apiVersion":"v1","kind":"Service","metadata":{"annotations":{},"labels":{"model.aibrix.ai/name":"dsqwen-14b"},"name":"dsqwen-14b","namespace":"default"},"spec":{"ports":[{"name":"http","port":8000,"protocol":"TCP","targetPort":8000}],"selector":{"model.aibrix.ai/name":"dsqwen-14b","tre.aibrix.io/routable":"true"}}}
+    creationTimestamp: "2026-07-04T15:50:23Z"
+    labels:
+      model.aibrix.ai/name: dsqwen-14b
+    name: dsqwen-14b
+    namespace: default
+    resourceVersion: "192526951"
+    uid: fd227da4-85b5-4d21-bf43-84b6afb3c897
+  spec:
+    clusterIP: 10.111.255.205
+    clusterIPs:
+    - 10.111.255.205
+    internalTrafficPolicy: Cluster
+    ipFamilies:
+    - IPv4
+    ipFamilyPolicy: SingleStack
+    ports:
+    - name: http
+      port: 8000
+      protocol: TCP
+      targetPort: 8000
+    selector:
+      model.aibrix.ai/name: dsqwen-14b
+      tre.aibrix.io/routable: "true"
+    sessionAffinity: None
+    type: ClusterIP
+  status:
+    loadBalancer: {}
+- apiVersion: v1
+  kind: Service
+  metadata:
+    annotations:
+      kubectl.kubernetes.io/last-applied-configuration: |
+        {"apiVersion":"v1","kind":"Service","metadata":{"annotations":{},"labels":{"model.aibrix.ai/name":"dsqwen-7b"},"name":"dsqwen-7b","namespace":"default"},"spec":{"ports":[{"name":"http","port":8000,"protocol":"TCP","targetPort":8000}],"selector":{"model.aibrix.ai/name":"dsqwen-7b","tre.aibrix.io/routable":"true"}}}
+    creationTimestamp: "2026-07-04T09:18:47Z"
+    labels:
+      model.aibrix.ai/name: dsqwen-7b
+    name: dsqwen-7b
+    namespace: default
+    resourceVersion: "192483621"
+    uid: f768cb90-d3ba-4e66-b029-fa50c270a0d8
+  spec:
+    clusterIP: 10.105.5.99
+    clusterIPs:
+    - 10.105.5.99
+    internalTrafficPolicy: Cluster
+    ipFamilies:
+    - IPv4
+    ipFamilyPolicy: SingleStack
+    ports:
+    - name: http
+      port: 8000
+      protocol: TCP
+      targetPort: 8000
+    selector:
+      model.aibrix.ai/name: dsqwen-7b
+      tre.aibrix.io/routable: "true"
+    sessionAffinity: None
+    type: ClusterIP
+  status:
+    loadBalancer: {}
+- apiVersion: v1
+  kind: Service
+  metadata:
+    annotations:
+      kubectl.kubernetes.io/last-applied-configuration: |
+        {"apiVersion":"v1","kind":"Service","metadata":{"annotations":{"prometheus.io/port":"7100","prometheus.io/scrape":"true"},"labels":{"model.aibrix.ai/name":"lxtdsqwen-14b","prometheus-discovery":"true"},"name":"lxtdsqwen-14b","namespace":"default"},"spec":{"ports":[{"name":"serve","port":7100,"protocol":"TCP","targetPort":7100}],"selector":{"model.aibrix.ai/name":"lxtdsqwen-14b"},"type":"ClusterIP"}}
+      prometheus.io/port: "7100"
+      prometheus.io/scrape: "true"
+    creationTimestamp: "2025-12-19T08:31:47Z"
+    labels:
+      model.aibrix.ai/name: lxtdsqwen-14b
+      prometheus-discovery: "true"
+    name: lxtdsqwen-14b
+    namespace: default
+    resourceVersion: "105236221"
+    uid: c25a955f-5c49-4b7c-996e-64c2757c5547
+  spec:
+    clusterIP: 10.96.169.251
+    clusterIPs:
+    - 10.96.169.251
+    internalTrafficPolicy: Cluster
+    ipFamilies:
+    - IPv4
+    ipFamilyPolicy: SingleStack
+    ports:
+    - name: serve
+      port: 7100
+      protocol: TCP
+      targetPort: 7100
+    selector:
+      model.aibrix.ai/name: lxtdsqwen-14b
+    sessionAffinity: None
+    type: ClusterIP
+  status:
+    loadBalancer: {}
+- apiVersion: v1
+  kind: Service
+  metadata:
+    annotations:
+      kubectl.kubernetes.io/last-applied-configuration: |
+        {"apiVersion":"v1","kind":"Service","metadata":{"annotations":{"prometheus.io/port":"7100","prometheus.io/scrape":"true"},"labels":{"model.aibrix.ai/name":"lxtdsqwen-30b","prometheus-discovery":"true"},"name":"lxtdsqwen-30b","namespace":"default"},"spec":{"ports":[{"name":"serve","port":7100,"protocol":"TCP","targetPort":7100}],"selector":{"model.aibrix.ai/name":"lxtdsqwen-30b"},"type":"ClusterIP"}}
+      prometheus.io/port: "7100"
+      prometheus.io/scrape: "true"
+    creationTimestamp: "2025-12-19T15:37:47Z"
+    labels:
+      model.aibrix.ai/name: lxtdsqwen-30b
+      prometheus-discovery: "true"
+    name: lxtdsqwen-30b
+    namespace: default
+    resourceVersion: "105715477"
+    uid: 62e0f886-2d93-4e91-b8d8-3fa020c57942
+  spec:
+    clusterIP: 10.98.33.174
+    clusterIPs:
+    - 10.98.33.174
+    internalTrafficPolicy: Cluster
+    ipFamilies:
+    - IPv4
+    ipFamilyPolicy: SingleStack
+    ports:
+    - name: serve
+      port: 7100
+      protocol: TCP
+      targetPort: 7100
+    selector:
+      model.aibrix.ai/name: lxtdsqwen-30b
+    sessionAffinity: None
+    type: ClusterIP
+  status:
+    loadBalancer: {}
+- apiVersion: v1
+  kind: Service
+  metadata:
+    annotations:
+      kubectl.kubernetes.io/last-applied-configuration: |
+        {"apiVersion":"v1","kind":"Service","metadata":{"annotations":{"prometheus.io/port":"7100","prometheus.io/scrape":"true"},"labels":{"model.aibrix.ai/name":"lxtdsqwen-32b","prometheus-discovery":"true"},"name":"lxtdsqwen-32b","namespace":"default"},"spec":{"ports":[{"name":"serve","port":7100,"protocol":"TCP","targetPort":7100}],"selector":{"model.aibrix.ai/name":"lxtdsqwen-32b"},"type":"ClusterIP"}}
+      prometheus.io/port: "7100"
+      prometheus.io/scrape: "true"
+    creationTimestamp: "2025-12-19T09:04:25Z"
+    labels:
+      model.aibrix.ai/name: lxtdsqwen-32b
+      prometheus-discovery: "true"
+    name: lxtdsqwen-32b
+    namespace: default
+    resourceVersion: "105270485"
+    uid: c55577dc-e51c-4973-96f4-607d86216e3b
+  spec:
+    clusterIP: 10.101.56.175
+    clusterIPs:
+    - 10.101.56.175
+    internalTrafficPolicy: Cluster
+    ipFamilies:
+    - IPv4
+    ipFamilyPolicy: SingleStack
+    ports:
+    - name: serve
+      port: 7100
+      protocol: TCP
+      targetPort: 7100
+    selector:
+      model.aibrix.ai/name: lxtdsqwen-32b
+    sessionAffinity: None
+    type: ClusterIP
+  status:
+    loadBalancer: {}
+- apiVersion: v1
+  kind: Service
+  metadata:
+    annotations:
+      kubectl.kubernetes.io/last-applied-configuration: |
+        {"apiVersion":"v1","kind":"Service","metadata":{"annotations":{"prometheus.io/port":"7100","prometheus.io/scrape":"true"},"labels":{"model.aibrix.ai/name":"lxtdsqwen-7b","prometheus-discovery":"true"},"name":"lxtdsqwen-7b","namespace":"default"},"spec":{"ports":[{"name":"serve","port":7100,"protocol":"TCP","targetPort":7100}],"selector":{"model.aibrix.ai/name":"lxtdsqwen-7b"},"type":"ClusterIP"}}
+      prometheus.io/port: "7100"
+      prometheus.io/scrape: "true"
+    creationTimestamp: "2025-12-19T06:49:06Z"
+    labels:
+      model.aibrix.ai/name: lxtdsqwen-7b
+      prometheus-discovery: "true"
+    name: lxtdsqwen-7b
+    namespace: default
+    resourceVersion: "105076796"
+    uid: 2bec336b-0a9a-4eb4-869c-1a49ecfa4645
+  spec:
+    clusterIP: 10.99.75.109
+    clusterIPs:
+    - 10.99.75.109
+    internalTrafficPolicy: Cluster
+    ipFamilies:
+    - IPv4
+    ipFamilyPolicy: SingleStack
+    ports:
+    - name: serve
+      port: 7100
+      protocol: TCP
+      targetPort: 7100
+    selector:
+      model.aibrix.ai/name: lxtdsqwen-7b
+    sessionAffinity: None
+    type: ClusterIP
+  status:
+    loadBalancer: {}
+- apiVersion: v1
+  kind: Service
+  metadata:
+    annotations:
+      kubectl.kubernetes.io/last-applied-configuration: |
+        {"apiVersion":"v1","kind":"Service","metadata":{"annotations":{"prometheus.io/port":"7100","prometheus.io/scrape":"true"},"labels":{"model.aibrix.ai/name":"lxtllama-13b","prometheus-discovery":"true"},"name":"lxtllama-13b","namespace":"default"},"spec":{"ports":[{"name":"serve","port":7100,"protocol":"TCP","targetPort":7100}],"selector":{"model.aibrix.ai/name":"lxtllama-13b"},"type":"ClusterIP"}}
+      prometheus.io/port: "7100"
+      prometheus.io/scrape: "true"
+    creationTimestamp: "2025-12-23T13:36:41Z"
+    labels:
+      model.aibrix.ai/name: lxtllama-13b
+      prometheus-discovery: "true"
+    name: lxtllama-13b
+    namespace: default
+    resourceVersion: "107433914"
+    uid: d30c293a-a187-48d8-bf91-5e4faf4005af
+  spec:
+    clusterIP: 10.108.190.53
+    clusterIPs:
+    - 10.108.190.53
+    internalTrafficPolicy: Cluster
+    ipFamilies:
+    - IPv4
+    ipFamilyPolicy: SingleStack
+    ports:
+    - name: serve
+      port: 7100
+      protocol: TCP
+      targetPort: 7100
+    selector:
+      model.aibrix.ai/name: lxtllama-13b
+    sessionAffinity: None
+    type: ClusterIP
+  status:
+    loadBalancer: {}
+- apiVersion: v1
+  kind: Service
+  metadata:
+    annotations:
+      prometheus.io/port: "8000"
+      prometheus.io/scrape: "true"
+    creationTimestamp: "2026-01-16T17:54:42Z"
+    labels:
+      model.aibrix.ai/name: lxtllama-8b-2
+      prometheus-discovery: "true"
+    name: lxtllama-8b-2
+    namespace: default
+    resourceVersion: "117925963"
+    uid: 9949e56d-5004-4050-b8e5-f966a3c37dd5
+  spec:
+    clusterIP: 10.105.6.53
+    clusterIPs:
+    - 10.105.6.53
+    internalTrafficPolicy: Cluster
+    ipFamilies:
+    - IPv4
+    ipFamilyPolicy: SingleStack
+    ports:
+    - name: serve
+      port: 8000
+      protocol: TCP
+      targetPort: 8000
+    selector:
+      model.aibrix.ai/name: lxtllama-8b-2
+    sessionAffinity: None
+    type: ClusterIP
+  status:
+    loadBalancer: {}
+- apiVersion: v1
+  kind: Service
+  metadata:
+    annotations:
+      prometheus.io/port: "8000"
+      prometheus.io/scrape: "true"
+    creationTimestamp: "2026-01-26T14:48:01Z"
+    labels:
+      model.aibrix.ai/name: lxtllama-8b-3
+      prometheus-discovery: "true"
+    name: lxtllama-8b-3
+    namespace: default
+    resourceVersion: "122190964"
+    uid: 5c969b84-b0da-4f52-9c92-cce0a6afea13
+  spec:
+    clusterIP: 10.103.157.78
+    clusterIPs:
+    - 10.103.157.78
+    internalTrafficPolicy: Cluster
+    ipFamilies:
+    - IPv4
+    ipFamilyPolicy: SingleStack
+    ports:
+    - name: serve
+      port: 8000
+      protocol: TCP
+      targetPort: 8000
+    selector:
+      model.aibrix.ai/name: lxtllama-8b-3
+    sessionAffinity: None
+    type: ClusterIP
+  status:
+    loadBalancer: {}
+- apiVersion: v1
+  kind: Service
+  metadata:
+    annotations:
+      prometheus.io/port: "8000"
+      prometheus.io/scrape: "true"
+    creationTimestamp: "2026-05-13T11:53:02Z"
+    labels:
+      model.aibrix.ai/name: lxtmodela
+      prometheus-discovery: "true"
+    name: lxtmodela
+    namespace: default
+    resourceVersion: "169746046"
+    uid: c530ccfb-61d1-4748-8b94-b2a0ac2950ff
+  spec:
+    clusterIP: 10.104.153.22
+    clusterIPs:
+    - 10.104.153.22
+    internalTrafficPolicy: Cluster
+    ipFamilies:
+    - IPv4
+    ipFamilyPolicy: SingleStack
+    ports:
+    - name: serve
+      port: 8000
+      protocol: TCP
+      targetPort: 8000
+    selector:
+      model.aibrix.ai/name: lxtmodela
+    sessionAffinity: None
+    type: ClusterIP
+  status:
+    loadBalancer: {}
+- apiVersion: v1
+  kind: Service
+  metadata:
+    annotations:
+      prometheus.io/port: "8000"
+      prometheus.io/scrape: "true"
+    creationTimestamp: "2026-05-13T12:17:21Z"
+    labels:
+      model.aibrix.ai/name: lxtmodelb
+      prometheus-discovery: "true"
+    name: lxtmodelb
+    namespace: default
+    resourceVersion: "169776695"
+    uid: 66fb1c25-ad6f-4c40-ad47-12ec781caa52
+  spec:
+    clusterIP: 10.105.41.198
+    clusterIPs:
+    - 10.105.41.198
+    internalTrafficPolicy: Cluster
+    ipFamilies:
+    - IPv4
+    ipFamilyPolicy: SingleStack
+    ports:
+    - name: serve
+      port: 8000
+      protocol: TCP
+      targetPort: 8000
+    selector:
+      model.aibrix.ai/name: lxtmodelb
+    sessionAffinity: None
+    type: ClusterIP
+  status:
+    loadBalancer: {}
+- apiVersion: v1
+  kind: Service
+  metadata:
+    annotations:
+      prometheus.io/port: "8000"
+      prometheus.io/scrape: "true"
+    creationTimestamp: "2026-05-13T11:52:45Z"
+    labels:
+      model.aibrix.ai/name: lxtmodelc
+      prometheus-discovery: "true"
+    name: lxtmodelc
+    namespace: default
+    resourceVersion: "169745930"
+    uid: 18c1cdd7-7030-4b4d-aeb7-d028933498df
+  spec:
+    clusterIP: 10.97.109.176
+    clusterIPs:
+    - 10.97.109.176
+    internalTrafficPolicy: Cluster
+    ipFamilies:
+    - IPv4
+    ipFamilyPolicy: SingleStack
+    ports:
+    - name: serve
+      port: 8000
+      protocol: TCP
+      targetPort: 8000
+    selector:
+      model.aibrix.ai/name: lxtmodelc
+    sessionAffinity: None
+    type: ClusterIP
+  status:
+    loadBalancer: {}
+- apiVersion: v1
+  kind: Service
+  metadata:
+    annotations:
+      kubectl.kubernetes.io/last-applied-configuration: |
+        {"apiVersion":"v1","kind":"Service","metadata":{"annotations":{"prometheus.io/port":"7100","prometheus.io/scrape":"true"},"labels":{"model.aibrix.ai/name":"lxtqwen3-1-7b","prometheus-discovery":"true"},"name":"lxtqwen3-1-7b","namespace":"default"},"spec":{"ports":[{"name":"serve","port":7100,"protocol":"TCP","targetPort":7100}],"selector":{"model.aibrix.ai/name":"lxtqwen3-1-7b"},"type":"ClusterIP"}}
+      prometheus.io/port: "7100"
+      prometheus.io/scrape: "true"
+    creationTimestamp: "2025-12-19T09:09:12Z"
+    labels:
+      model.aibrix.ai/name: lxtqwen3-1-7b
+      prometheus-discovery: "true"
+    name: lxtqwen3-1-7b
+    namespace: default
+    resourceVersion: "105273081"
+    uid: b28798e7-3082-40b4-9a0c-18f945ce364d
+  spec:
+    clusterIP: 10.98.134.222
+    clusterIPs:
+    - 10.98.134.222
+    internalTrafficPolicy: Cluster
+    ipFamilies:
+    - IPv4
+    ipFamilyPolicy: SingleStack
+    ports:
+    - name: serve
+      port: 7100
+      protocol: TCP
+      targetPort: 7100
+    selector:
+      model.aibrix.ai/name: lxtqwen3-1-7b
+    sessionAffinity: None
+    type: ClusterIP
+  status:
+    loadBalancer: {}
+- apiVersion: v1
+  kind: Service
+  metadata:
+    annotations:
+      kubectl.kubernetes.io/last-applied-configuration: |
+        {"apiVersion":"v1","kind":"Service","metadata":{"annotations":{"prometheus.io/port":"7100","prometheus.io/scrape":"true"},"labels":{"model.aibrix.ai/name":"lxtqwen3-13b","prometheus-discovery":"true"},"name":"lxtqwen3-13b","namespace":"default"},"spec":{"ports":[{"name":"serve","port":7100,"protocol":"TCP","targetPort":7100}],"selector":{"model.aibrix.ai/name":"lxtqwen3-13b"},"type":"ClusterIP"}}
+      prometheus.io/port: "7100"
+      prometheus.io/scrape: "true"
+    creationTimestamp: "2025-12-23T13:35:22Z"
+    labels:
+      model.aibrix.ai/name: lxtqwen3-13b
+      prometheus-discovery: "true"
+    name: lxtqwen3-13b
+    namespace: default
+    resourceVersion: "107433468"
+    uid: 84af7354-41e9-4128-9f25-fa5067185891
+  spec:
+    clusterIP: 10.108.239.104
+    clusterIPs:
+    - 10.108.239.104
+    internalTrafficPolicy: Cluster
+    ipFamilies:
+    - IPv4
+    ipFamilyPolicy: SingleStack
+    ports:
+    - name: serve
+      port: 7100
+      protocol: TCP
+      targetPort: 7100
+    selector:
+      model.aibrix.ai/name: lxtqwen3-13b
+    sessionAffinity: None
+    type: ClusterIP
+  status:
+    loadBalancer: {}
+- apiVersion: v1
+  kind: Service
+  metadata:
+    annotations:
+      kubectl.kubernetes.io/last-applied-configuration: |
+        {"apiVersion":"v1","kind":"Service","metadata":{"annotations":{"prometheus.io/port":"7100","prometheus.io/scrape":"true"},"labels":{"model.aibrix.ai/name":"lxtqwen3-14b","prometheus-discovery":"true"},"name":"lxtqwen3-14b","namespace":"default"},"spec":{"ports":[{"name":"serve","port":7100,"protocol":"TCP","targetPort":7100}],"selector":{"model.aibrix.ai/name":"lxtqwen3-14b"},"type":"ClusterIP"}}
+      prometheus.io/port: "7100"
+      prometheus.io/scrape: "true"
+    creationTimestamp: "2025-12-19T07:37:31Z"
+    labels:
+      model.aibrix.ai/name: lxtqwen3-14b
+      prometheus-discovery: "true"
+    name: lxtqwen3-14b
+    namespace: default
+    resourceVersion: "105151322"
+    uid: f98fb7d0-ab61-41f1-98d9-cb231ba05bf8
+  spec:
+    clusterIP: 10.109.81.184
+    clusterIPs:
+    - 10.109.81.184
+    internalTrafficPolicy: Cluster
+    ipFamilies:
+    - IPv4
+    ipFamilyPolicy: SingleStack
+    ports:
+    - name: serve
+      port: 7100
+      protocol: TCP
+      targetPort: 7100
+    selector:
+      model.aibrix.ai/name: lxtqwen3-14b
+    sessionAffinity: None
+    type: ClusterIP
+  status:
+    loadBalancer: {}
+- apiVersion: v1
+  kind: Service
+  metadata:
+    annotations:
+      prometheus.io/port: "8000"
+      prometheus.io/scrape: "true"
+    creationTimestamp: "2026-01-16T13:05:00Z"
+    labels:
+      model.aibrix.ai/name: lxtqwen3-30b
+      prometheus-discovery: "true"
+    name: lxtqwen3-30b
+    namespace: default
+    resourceVersion: "117838592"
+    uid: d81426fd-9ad4-42c1-8e4a-80a752d518db
+  spec:
+    clusterIP: 10.99.141.104
+    clusterIPs:
+    - 10.99.141.104
+    internalTrafficPolicy: Cluster
+    ipFamilies:
+    - IPv4
+    ipFamilyPolicy: SingleStack
+    ports:
+    - name: serve
+      port: 8000
+      protocol: TCP
+      targetPort: 8000
+    selector:
+      model.aibrix.ai/name: lxtqwen3-30b
+    sessionAffinity: None
+    type: ClusterIP
+  status:
+    loadBalancer: {}
+- apiVersion: v1
+  kind: Service
+  metadata:
+    annotations:
+      prometheus.io/port: "8000"
+      prometheus.io/scrape: "true"
+    creationTimestamp: "2026-01-16T17:37:47Z"
+    labels:
+      model.aibrix.ai/name: lxtqwen3-30b-2
+      prometheus-discovery: "true"
+    name: lxtqwen3-30b-2
+    namespace: default
+    resourceVersion: "117920574"
+    uid: fec28b0a-203f-44c4-9325-14340008968a
+  spec:
+    clusterIP: 10.104.132.147
+    clusterIPs:
+    - 10.104.132.147
+    internalTrafficPolicy: Cluster
+    ipFamilies:
+    - IPv4
+    ipFamilyPolicy: SingleStack
+    ports:
+    - name: serve
+      port: 8000
+      protocol: TCP
+      targetPort: 8000
+    selector:
+      model.aibrix.ai/name: lxtqwen3-30b-2
+    sessionAffinity: None
+    type: ClusterIP
+  status:
+    loadBalancer: {}
+- apiVersion: v1
+  kind: Service
+  metadata:
+    annotations:
+      kubectl.kubernetes.io/last-applied-configuration: |
+        {"apiVersion":"v1","kind":"Service","metadata":{"annotations":{"prometheus.io/port":"7100","prometheus.io/scrape":"true"},"labels":{"model.aibrix.ai/name":"lxtqwen3-4b","prometheus-discovery":"true"},"name":"lxtqwen3-4b","namespace":"default"},"spec":{"ports":[{"name":"serve","port":7100,"protocol":"TCP","targetPort":7100}],"selector":{"model.aibrix.ai/name":"lxtqwen3-4b"},"type":"ClusterIP"}}
+      prometheus.io/port: "7100"
+      prometheus.io/scrape: "true"
+    creationTimestamp: "2025-12-23T07:59:52Z"
+    labels:
+      model.aibrix.ai/name: lxtqwen3-4b
+      prometheus-discovery: "true"
+    name: lxtqwen3-4b
+    namespace: default
+    resourceVersion: "107331817"
+    uid: 3695481a-db2f-4ad7-94b7-8d0b7bbc8e02
+  spec:
+    clusterIP: 10.102.209.59
+    clusterIPs:
+    - 10.102.209.59
+    internalTrafficPolicy: Cluster
+    ipFamilies:
+    - IPv4
+    ipFamilyPolicy: SingleStack
+    ports:
+    - name: serve
+      port: 7100
+      protocol: TCP
+      targetPort: 7100
+    selector:
+      model.aibrix.ai/name: lxtqwen3-4b
+    sessionAffinity: None
+    type: ClusterIP
+  status:
+    loadBalancer: {}
+- apiVersion: v1
+  kind: Service
+  metadata:
+    annotations:
+      kubectl.kubernetes.io/last-applied-configuration: |
+        {"apiVersion":"v1","kind":"Service","metadata":{"annotations":{"prometheus.io/port":"7100","prometheus.io/scrape":"true"},"labels":{"model.aibrix.ai/name":"lxtqwen3-8b-t2","prometheus-discovery":"true"},"name":"lxtqwen3-8b-t2","namespace":"default"},"spec":{"ports":[{"name":"serve","port":7100,"protocol":"TCP","targetPort":7100}],"selector":{"model.aibrix.ai/name":"lxtqwen3-8b-t2"},"type":"ClusterIP"}}
+      prometheus.io/port: "7100"
+      prometheus.io/scrape: "true"
+    creationTimestamp: "2025-12-23T08:17:56Z"
+    labels:
+      model.aibrix.ai/name: lxtqwen3-8b-t2
+      prometheus-discovery: "true"
+    name: lxtqwen3-8b-t2
+    namespace: default
+    resourceVersion: "107337504"
+    uid: 6f8266e2-cace-4b39-8bcb-59a8c2a15a3a
+  spec:
+    clusterIP: 10.98.60.35
+    clusterIPs:
+    - 10.98.60.35
+    internalTrafficPolicy: Cluster
+    ipFamilies:
+    - IPv4
+    ipFamilyPolicy: SingleStack
+    ports:
+    - name: serve
+      port: 7100
+      protocol: TCP
+      targetPort: 7100
+    selector:
+      model.aibrix.ai/name: lxtqwen3-8b-t2
+    sessionAffinity: None
+    type: ClusterIP
+  status:
+    loadBalancer: {}
+kind: List
+metadata:
+  resourceVersion: ""

@@ -1,0 +1,44 @@
+apiVersion: v1
+items:
+- apiVersion: gateway.networking.k8s.io/v1beta1
+  kind: ReferenceGrant
+  metadata:
+    creationTimestamp: "2026-07-04T08:43:16Z"
+    generation: 1
+    name: aibrix-system-reserved-referencegrant-in-default
+    namespace: default
+    resourceVersion: "192396824"
+    uid: 14ee5bb3-df19-4d32-9776-43597ae81a47
+  spec:
+    from:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      namespace: aibrix-system
+    to:
+    - group: ""
+      kind: Service
+- apiVersion: gateway.networking.k8s.io/v1beta1
+  kind: ReferenceGrant
+  metadata:
+    annotations:
+      kubectl.kubernetes.io/last-applied-configuration: |
+        {"apiVersion":"gateway.networking.k8s.io/v1beta1","kind":"ReferenceGrant","metadata":{"annotations":{},"labels":{"tre.aibrix.io/managed":"true"},"name":"tre-v2-model-referencegrant-in-default","namespace":"default"},"spec":{"from":[{"group":"gateway.networking.k8s.io","kind":"HTTPRoute","namespace":"aibrix-system"}],"to":[{"group":"","kind":"Service"}]}}
+    creationTimestamp: "2026-07-06T02:21:53Z"
+    generation: 1
+    labels:
+      tre.aibrix.io/managed: "true"
+    name: tre-v2-model-referencegrant-in-default
+    namespace: default
+    resourceVersion: "193154256"
+    uid: a4e07409-5424-4987-92e7-dff59bbfd494
+  spec:
+    from:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      namespace: aibrix-system
+    to:
+    - group: ""
+      kind: Service
+kind: List
+metadata:
+  resourceVersion: ""
