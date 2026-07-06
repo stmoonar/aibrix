@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import re
 from pathlib import Path
 from typing import Iterable
@@ -13,8 +14,8 @@ ROUTABLE_LABEL = "tre.aibrix.io/routable"
 GPU_UUIDS_ANNOTATION = "tre.aibrix.io/gpu-uuids"
 MAX_BOUND_PER_GPU = 3
 MODEL_LABEL = "model.aibrix.ai/name"
-GATEWAY_NAMESPACE = "aibrix-system"
-GATEWAY_NAME = "aibrix-eg"
+GATEWAY_NAMESPACE = "tre-v2"
+GATEWAY_NAME = "tre-aibrix-eg"
 GATEWAY_API_GROUP = "gateway.networking.k8s.io"
 HTTPROUTE_API_VERSION = "v1"
 HTTPROUTE_PLURAL = "httproutes"
@@ -62,8 +63,16 @@ def build_services(registry: Registry) -> list[dict]:
     return [_service(model) for model in registry.models()]
 
 
-def build_httproutes(registry: Registry) -> list[dict]:
-    return [build_model_httproute(model.name) for model in registry.models()]
+def build_httproutes(
+    registry: Registry,
+    *,
+    gateway_namespace: str = GATEWAY_NAMESPACE,
+    gateway_name: str = GATEWAY_NAME,
+) -> list[dict]:
+    return [
+        build_model_httproute(model.name, gateway_namespace=gateway_namespace, gateway_name=gateway_name)
+        for model in registry.models()
+    ]
 
 
 def build_model_httproute(
@@ -143,16 +152,32 @@ def build_referencegrant(
     }
 
 
-def build_resources(registry: Registry) -> list[dict]:
-    return [build_referencegrant()] + build_services(registry) + build_httproutes(registry) + build_deployments(registry)
+def build_resources(
+    registry: Registry,
+    *,
+    gateway_namespace: str = GATEWAY_NAMESPACE,
+    gateway_name: str = GATEWAY_NAME,
+) -> list[dict]:
+    return (
+        [build_referencegrant(gateway_namespace=gateway_namespace)]
+        + build_services(registry)
+        + build_httproutes(registry, gateway_namespace=gateway_namespace, gateway_name=gateway_name)
+        + build_deployments(registry)
+    )
 
 
-def write_manifests(registry: Registry, output_dir: Path) -> list[Path]:
+def write_manifests(
+    registry: Registry,
+    output_dir: Path,
+    *,
+    gateway_namespace: str = GATEWAY_NAMESPACE,
+    gateway_name: str = GATEWAY_NAME,
+) -> list[Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
     for old in output_dir.glob("*.yaml"):
         old.unlink()
     written: list[Path] = []
-    for resource in build_resources(registry):
+    for resource in build_resources(registry, gateway_namespace=gateway_namespace, gateway_name=gateway_name):
         path = output_dir / f"{resource['metadata']['name']}.yaml"
         path.write_text(yaml.safe_dump(resource, sort_keys=False), encoding="utf-8")
         written.append(path)
@@ -284,12 +309,19 @@ def main(argv: Iterable[str] | None = None) -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--registry", default="tre/deploy/registry.yaml")
     parser.add_argument("--output-dir", default="tre/deploy/models")
+    parser.add_argument("--gateway-namespace", default=os.environ.get("TRE_GATEWAY_NAMESPACE", GATEWAY_NAMESPACE))
+    parser.add_argument("--gateway-name", default=os.environ.get("TRE_GATEWAY_NAME", GATEWAY_NAME))
     args = parser.parse_args(list(argv) if argv is not None else None)
     registry = load_registry(args.registry)
     errors = registry.validate()
     if errors:
         raise SystemExit("registry validation failed:" + chr(10) + chr(10).join(errors))
-    written = write_manifests(registry, Path(args.output_dir))
+    written = write_manifests(
+        registry,
+        Path(args.output_dir),
+        gateway_namespace=args.gateway_namespace,
+        gateway_name=args.gateway_name,
+    )
     print(f"wrote {len(written)} resources to {args.output_dir}")
 
 

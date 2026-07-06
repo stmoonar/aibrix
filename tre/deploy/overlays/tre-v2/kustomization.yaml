@@ -9,3 +9,5 @@ resources:
   - controller.yaml
   - ui.yaml
   - gpu-truth.yaml
+  - gateway.yaml
+  - gateway-plugins.yaml

@@ -250,15 +250,15 @@ def test_build_httproutes_creates_model_header_route_to_service(tmp_path):
     assert route["kind"] == "HTTPRoute"
     assert route["metadata"] == {
         "name": "dsqwen-7b-router",
-        "namespace": "aibrix-system",
+        "namespace": "tre-v2",
         "labels": {"model.aibrix.ai/name": "dsqwen-7b", "tre.aibrix.io/managed": "true"},
     }
     assert route["spec"]["parentRefs"] == [
         {
             "group": "gateway.networking.k8s.io",
             "kind": "Gateway",
-            "name": "aibrix-eg",
-            "namespace": "aibrix-system",
+            "name": "tre-aibrix-eg",
+            "namespace": "tre-v2",
         }
     ]
     [rule] = route["spec"]["rules"]
@@ -337,6 +337,6 @@ def test_build_referencegrant_allows_aibrix_httproute_to_default_service() -> No
     assert grant["metadata"]["namespace"] == "default"
     assert grant["metadata"]["labels"]["tre.aibrix.io/managed"] == "true"
     assert grant["spec"]["from"] == [
-        {"group": "gateway.networking.k8s.io", "kind": "HTTPRoute", "namespace": "aibrix-system"}
+        {"group": "gateway.networking.k8s.io", "kind": "HTTPRoute", "namespace": "tre-v2"}
     ]
     assert grant["spec"]["to"] == [{"group": "", "kind": "Service"}]

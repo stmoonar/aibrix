@@ -1,0 +1,21 @@
+# Isolated TRE serving gateway (ADR-0008). Dedicated Envoy proxy, own listener;
+# TRE model routers parent this gateway instead of the shared aibrix-eg. No
+# ext-proc: TRE serving is plain per-model HTTPRoute -> model Service -> routable
+# pods (Service selector tre.aibrix.io/routable=true).
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: tre-aibrix-eg
+  namespace: tre-v2
+  labels:
+    app.kubernetes.io/name: tre-aibrix-eg
+    tre.aibrix.io/managed: "true"
+spec:
+  gatewayClassName: aibrix-eg
+  listeners:
+    - name: http
+      port: 80
+      protocol: HTTP
+      allowedRoutes:
+        namespaces:
+          from: Same

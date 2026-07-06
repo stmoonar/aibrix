@@ -325,7 +325,7 @@ def test_k8s_ops_creates_missing_model_httproute_and_waits_until_accepted():
     assert (group, version, namespace, plural) == (
         "gateway.networking.k8s.io",
         "v1",
-        "aibrix-system",
+        "tre-v2",
         "httproutes",
     )
     assert body["metadata"]["name"] == "m1-router"
@@ -334,7 +334,7 @@ def test_k8s_ops_creates_missing_model_httproute_and_waits_until_accepted():
     assert route_api.get_calls[-1] == (
         "gateway.networking.k8s.io",
         "v1",
-        "aibrix-system",
+        "tre-v2",
         "httproutes",
         "m1-router",
     )
@@ -342,11 +342,11 @@ def test_k8s_ops_creates_missing_model_httproute_and_waits_until_accepted():
 
 def test_k8s_ops_patches_existing_model_httproute_before_waiting():
     existing = {
-        "metadata": {"name": "m1-router", "namespace": "aibrix-system"},
+        "metadata": {"name": "m1-router", "namespace": "tre-v2"},
         "spec": {"rules": []},
         "status": _accepted_status(),
     }
-    route_api = FakeRouteApi({("aibrix-system", "m1-router"): existing})
+    route_api = FakeRouteApi({("tre-v2", "m1-router"): existing})
     ops = K8sOps(api=FakeK8sApi([]), route_api=route_api, namespace="default", registry=registry())
 
     ops.ensure_model_httproute("m1", timeout_s=0.01, interval_s=0.001)
@@ -356,7 +356,7 @@ def test_k8s_ops_patches_existing_model_httproute_before_waiting():
     assert (group, version, namespace, plural, name) == (
         "gateway.networking.k8s.io",
         "v1",
-        "aibrix-system",
+        "tre-v2",
         "httproutes",
         "m1-router",
     )

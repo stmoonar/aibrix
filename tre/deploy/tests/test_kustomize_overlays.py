@@ -26,6 +26,8 @@ def test_tre_v2_overlay_declares_components_and_independent_redis() -> None:
         "controller.yaml",
         "ui.yaml",
         "gpu-truth.yaml",
+        "gateway.yaml",
+        "gateway-plugins.yaml",
     ]
 
     redis = _load_yaml(overlay / "redis.yaml")
@@ -87,8 +89,9 @@ def test_tre_v2_overlay_declares_components_and_independent_redis() -> None:
     assert _env(controller)["TRE_PAPER_STALE_MAX_WINDOWS"] == "3"
     assert _env(controller)["TRE_METRICS_SCHEMA"] == "v1"
     assert _env(controller)["ENABLE_TRE_SCALING"] == "true"
-    assert _env(sm)["TRE_ROUTE_NAMESPACE"] == "aibrix-system"
-    assert _env(sm)["TRE_GATEWAY_NAME"] == "aibrix-eg"
+    assert _env(sm)["TRE_ROUTE_NAMESPACE"] == "tre-v2"
+    assert _env(sm)["TRE_GATEWAY_NAME"] == "tre-aibrix-eg"
+    assert _env(controller)["TRE_METRICS_REDIS_URL"] == "redis://tre-v2-redis:6379/0"
     assert _env(sm)["TRE_CREATE_MAX_USED_MIB"] == "2500"
     assert _env(sm)["TRE_SLEEP_LEAK_USED_MIB"] == "8192"
     assert _node_selector(controller) == {"kubernetes.io/hostname": "nscc-ds-4a100-node10"}

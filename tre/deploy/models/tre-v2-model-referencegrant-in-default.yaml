@@ -9,7 +9,7 @@ spec:
   from:
   - group: gateway.networking.k8s.io
     kind: HTTPRoute
-    namespace: aibrix-system
+    namespace: tre-v2
   to:
   - group: ''
     kind: Service

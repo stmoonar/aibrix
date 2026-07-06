@@ -1,0 +1,170 @@
+# Isolated TRE metrics scraper (ADR-0008). gateway-plugins runs a background pod
+# discovery + vLLM /metrics scrape loop (AIBRIX_POD_METRIC_REFRESH_INTERVAL_MS)
+# that writes zm keys to REDIS_HOST, independent of request routing / ext-proc.
+# Here it targets tre-v2-redis so the retargeted controller reads TRE-owned
+# metrics. No ext-proc (:50052) wiring, reserved-router, or ext-proc policy is
+# created -- those are serving-path concerns TRE does not use.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: tre-gateway-plugins
+  namespace: tre-v2
+---
+# Cloned tre-scoped copy of aibrix-gateway-plugins-role. Cluster-scoped but
+# additive (distinct name/subject; no collision with the shared role). The pods
+# verb is required for the scraper to list routable model pods in `default`;
+# modeladapters is retained only to avoid a startup watch error (TRE creates none).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: tre-gateway-plugins-role
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
+  - apiGroups: ["model.aibrix.ai"]
+    resources: ["modeladapters"]
+    verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["httproutes"]
+    verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: tre-gateway-plugins-rolebinding
+subjects:
+  - kind: ServiceAccount
+    name: tre-gateway-plugins
+    namespace: tre-v2
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: tre-gateway-plugins-role
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tre-gateway-plugins
+  namespace: tre-v2
+  labels:
+    app: tre-gateway-plugins
+    app.kubernetes.io/name: tre-gateway-plugins
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: tre-gateway-plugins
+  template:
+    metadata:
+      labels:
+        app: tre-gateway-plugins
+    spec:
+      serviceAccountName: tre-gateway-plugins
+      nodeSelector:
+        kubernetes.io/hostname: nscc-ds-4a100-node10
+      initContainers:
+        - name: init-c
+          image: busybox:stable
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - 'until echo "ping" | nc tre-v2-redis 6379 -w 1 | grep -c PONG; do echo waiting for service tre-v2-redis; sleep 2; done'
+          env:
+            - name: TRE_REDIS_SCHEMA
+              value: dual
+      containers:
+        - name: gateway-plugins
+          image: aibrix/gateway-plugins:20260704-0d869b49-nozmq2
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 50052
+              name: gateway
+            - containerPort: 6060
+              name: profiling
+            - containerPort: 8080
+              name: metrics
+          env:
+            - name: REDIS_HOST
+              value: tre-v2-redis
+            - name: REDIS_PORT
+              value: "6379"
+            - name: TRE_REDIS_SCHEMA
+              value: dual
+            - name: AIBRIX_POD_METRIC_REFRESH_INTERVAL_MS
+              value: "50"
+            - name: AIBRIX_PREFILL_REQUEST_TIMEOUT
+              value: "60"
+            - name: TRE_DEFAULT_RPM
+              value: "8000"
+            - name: TRE_DEFAULT_TPM_MULTIPLIER
+              value: "5000"
+            - name: TRE_CHECK_RPM
+              value: "0"
+            - name: DEBUG_POD_LIST
+              value: "1"
+            - name: HOT_SWITCH
+              value: "1"
+            - name: QZ_KIND
+              value: "0"
+            - name: delay_time1
+              value: "4000"
+            - name: AIBRIX_GPU_OPTIMIZER_TRACING_FLAG
+              value: "true"
+            - name: TRE_TRACING_FLAG
+              value: "true"
+            - name: TRE_DEBUG_FLAG
+              value: "false"
+            - name: AIBRIX_VISUAL_TRACING_FLAG
+              value: "true"
+            - name: AIBRIX_PREFIX_CACHE_TOKENIZER_TYPE
+              value: character
+            - name: AIBRIX_PREFIX_CACHE_BLOCK_SIZE
+              value: "128"
+            - name: AIBRIX_PREFIX_CACHE_BLOCK_NUMBER
+              value: "200000"
+            - name: AIBRIX_PREFIX_CACHE_POD_RUNNING_REQUEST_IMBALANCE_ABS_COUNT
+              value: "16"
+            - name: AIBRIX_PREFIX_CACHE_STANDARD_DEVIATION_FACTOR
+              value: "2"
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  apiVersion: v1
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  apiVersion: v1
+                  fieldPath: metadata.namespace
+          resources:
+            requests:
+              cpu: "2"
+              memory: 8Gi
+            limits:
+              cpu: "2"
+              memory: 8Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tre-gateway-plugins
+  namespace: tre-v2
+  labels:
+    app: tre-gateway-plugins
+    app.kubernetes.io/name: tre-gateway-plugins
+  annotations:
+    prometheus.io/path: /metrics
+    prometheus.io/port: "8080"
+    prometheus.io/scrape: "true"
+spec:
+  selector:
+    app: tre-gateway-plugins
+  ports:
+    - name: profiling
+      port: 6060
+      targetPort: 6060
+    - name: metrics
+      port: 8080
+      targetPort: 8080

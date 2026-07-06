@@ -34,9 +34,9 @@ spec:
             - name: TRE_MODEL_NAMESPACE
               value: default
             - name: TRE_ROUTE_NAMESPACE
-              value: aibrix-system
+              value: tre-v2
             - name: TRE_GATEWAY_NAME
-              value: aibrix-eg
+              value: tre-aibrix-eg
             # --- D8/D10 GPU-truth governance thresholds (Plan B: SM reads
             # tre:gpu_truth:<node> from the same TRE Redis, written by the
             # gpu-truth DaemonSet). ---
