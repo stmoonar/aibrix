@@ -317,24 +317,6 @@ node9 实测（nvidia-smi compute-apps + /proc cgroup → pod 映射 + /is_sleep
 
 ## 5. 阶段 F4：清场 + 声明式全新部署（N5 前的强制关口，预计 1.5–2 天）
 
-> **SUPERSEDED 2026-07-06 by ADR-0008**: live audit found aibrix-system is a
-> SHARED multi-tenant base (lxt + qwen-coder/instruct), so the teardown+reinstall
-> below is CANCELLED. Replaced by a minimal isolated TRE data plane in the tre-v2
-> namespace (Gateway tre-aibrix-eg + tre-gateway-plugins scraper -> tre-v2-redis;
-> no ext-proc). Phase A (additive) + Phase B (cutover) DONE and live; Phase C
-> (delete 3 legacy routes, >=24h gate) + F4.4 authoritative N4b remain. See
-> DECISIONS.md ADR-0007/0008 and the WORKLOG F4 entries. The §5.x text below is
-> retained for history only.
-
-> **REORDER 2026-07-06 (ADR-0009)**: the N4.6 pre-flight showed the inherited
-> theta_m makes idle read CRITICAL (over-provision, never shrink), and exposed an
-> SM routable/is_sleeping desync bug. New order: (1) fix SM desync (two-layer
-> reconcile, TDD) -> (2) restore canonical fleet (4 bindings/model) declaratively
-> -> (3) R3 refit (real theta + capacity surface) -> (4) N4.6 expand/shrink +
-> scale-cycle soak ON REAL THETA -> tag n4b-done. The 12h soak is split into
-> Endurance (theta-independent, not the gate) and Scale-cycle (theta-dependent,
-> certifies n4b-done, consumes R3 output). See DECISIONS.md ADR-0009.
-
 > **为什么必须做（架构师 2026-07-06 复核实况）**：
 > - 代码已对齐 **AIBrix 0.7.0**（HEAD = `v0.7.0-198-gxxxxxxx`；`upstream-v0.4.0`
 >   只是**旧系统**的对拍基线，不是本系统底座版本）。
@@ -486,6 +468,12 @@ node9 实测（nvidia-smi compute-apps + /proc cgroup → pod 映射 + /is_sleep
 Blocked（R1 可以最后补跑，不阻塞 R3 起步）。
 
 ### 6.2 R3：真机重拟合（θ_m + 容量面；每模型 ≈ 10h，共 3 模型，安排 2–3 个夜间）
+
+> **前置硬护栏（架构师 2026-07-06 定，见 `15_signal_and_window_plan.md` S1.4）**：
+> R3 **不许在 S1（TSS 控制窗口改造）的窗口口径最终冻结之前开跑**。θ_m 必须在"最终确定
+> 的窗口"上拟合；窗口若还会变，R3 的数据与 θ_m 全部作废、每模型 10h 白跑。且 S4（r3_grid
+> 原始日志落盘）也必须在 R3 前完成，以便一次采集支撑多窗口/多口径离线重拟。顺序：
+> 先做完 S1 + S4 → 再开 R3。TRS 量纲保持"每窗口 token"不变，不用缩放捷径，就是重新拟合。
 
 **目的**：产出真实 `theta_m` 与容量面 `C_m(i,o)`，替换 registry 中的旧系统继承值；
 同时落 `bucket_upper` 与 `interpolated` 两套 percentile 口径（否则 R4 要重跑网格）。
