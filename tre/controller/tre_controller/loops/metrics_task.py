@@ -9,11 +9,14 @@ from tre_common.metrics_schema import MetricsSnapshot
 
 
 class SnapshotStore(Protocol):
-    def read_snapshot(self, window_start_ms: int, window_end_ms: int) -> MetricsSnapshot: ...
+    def read_snapshot(
+        self, window_start_ms: int, window_end_ms: int, *, use_cache: bool = True
+    ) -> MetricsSnapshot: ...
 
 
 class MetricsTaskConfig(Protocol):
     metrics_window_ms: int
+    metrics_window_mode: str
     monitor_interval_s: float
 
 
@@ -43,10 +46,23 @@ def refresh_metrics_once(
     *,
     now_ms: int,
     window_ms: int,
+    window_mode: str = "tumbling",
 ) -> MetricsRefreshResult:
-    window_start_ms, window_end_ms = _last_complete_window(now_ms, window_ms)
+    # window_mode defaults to "tumbling" here so existing callers/tests keep the old
+    # behaviour; the live controller passes cfg.metrics_window_mode (default "sliding").
+    sliding = window_mode == "sliding"
+    if sliding:
+        window_start_ms, window_end_ms = _sliding_window(now_ms, window_ms)
+    else:
+        window_start_ms, window_end_ms = _last_complete_window(now_ms, window_ms)
+    # Tumbling calls read_snapshot with its original signature (no use_cache) so existing
+    # SnapshotStore fakes keep working; only sliding opts out of the per-window cache
+    # (every sliding window is unique -> the cache never hits and would grow, S1.1).
     try:
-        snapshot = store.read_snapshot(window_start_ms, window_end_ms)
+        if sliding:
+            snapshot = store.read_snapshot(window_start_ms, window_end_ms, use_cache=False)
+        else:
+            snapshot = store.read_snapshot(window_start_ms, window_end_ms)
     except Exception as exc:  # noqa: BLE001 - metrics loop degrades through stale snapshots.
         snapshot = _stale_snapshot(snapshot_box.get(), fallback_ts_ms=window_end_ms)
         snapshot_box.set(snapshot)
@@ -74,6 +90,7 @@ async def metrics_task(store: SnapshotStore, snapshot_box: SnapshotBox, cfg: Met
             snapshot_box,
             now_ms=int(time.time() * 1000),
             window_ms=cfg.metrics_window_ms,
+            window_mode=getattr(cfg, "metrics_window_mode", "sliding"),
         )
         await asyncio.sleep(cfg.monitor_interval_s)
 
@@ -82,6 +99,16 @@ def _last_complete_window(now_ms: int, window_ms: int) -> tuple[int, int]:
     if window_ms <= 0:
         raise ValueError("window_ms must be positive")
     window_end_ms = max(0, int(now_ms) // window_ms * window_ms)
+    window_start_ms = max(0, window_end_ms - window_ms)
+    return window_start_ms, window_end_ms
+
+
+def _sliding_window(now_ms: int, window_ms: int) -> tuple[int, int]:
+    # Sliding window ending at now: no epoch alignment, no "last complete block".
+    # Removes the 60-120s staleness of tumbling by always ending at the newest data (S1.1).
+    if window_ms <= 0:
+        raise ValueError("window_ms must be positive")
+    window_end_ms = max(0, int(now_ms))
     window_start_ms = max(0, window_end_ms - window_ms)
     return window_start_ms, window_end_ms
 

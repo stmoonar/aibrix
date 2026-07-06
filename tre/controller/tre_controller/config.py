@@ -7,6 +7,7 @@ from typing import Mapping
 
 SIGNAL_SOURCES = {"zm", "latency_p95", "queue_len", "kv_cache"}
 PERCENTILE_MODES = {"bucket_upper", "interpolated"}
+WINDOW_MODES = {"tumbling", "sliding"}
 METRICS_SCHEMAS = {"v1", "v2"}
 INCOMPLETE_POLICIES = {"drop_model", "drop_all"}
 _TRUE_VALUES = {"1", "true", "yes", "y", "on"}
@@ -40,6 +41,7 @@ class ControllerConfig:
     rescue_interval_s: float
     fairness_interval_s: float
     metrics_window_ms: int
+    metrics_window_mode: str
     instant_sample_interval_ms: int
     histogram_lookback_ms: int
     percentile_mode: str
@@ -75,6 +77,10 @@ class ControllerConfig:
         if incomplete_policy not in INCOMPLETE_POLICIES:
             raise ValueError(f"TRE_INCOMPLETE_POLICY must be one of {sorted(INCOMPLETE_POLICIES)}")
 
+        metrics_window_mode = _get_str(values, "TRE_METRICS_WINDOW_MODE", "sliding")
+        if metrics_window_mode not in WINDOW_MODES:
+            raise ValueError(f"TRE_METRICS_WINDOW_MODE must be one of {sorted(WINDOW_MODES)}")
+
         redis_url = _get_str(values, "TRE_REDIS_URL", "redis://aibrix-redis-master:6379/0")
 
         safescale = SafeScaleConfig(
@@ -108,6 +114,7 @@ class ControllerConfig:
             rescue_interval_s=_get_positive_float(values, "TRE_RESCUE_INTERVAL_SECONDS", 5.0),
             fairness_interval_s=_get_positive_float(values, "TRE_FAIRNESS_INTERVAL_SECONDS", 10.0),
             metrics_window_ms=_get_positive_int(values, "TRE_METRICS_WINDOW_MS", 60_000),
+            metrics_window_mode=metrics_window_mode,
             instant_sample_interval_ms=_get_positive_int(values, "TRE_INSTANT_SAMPLE_INTERVAL_MS", 5_000),
             histogram_lookback_ms=_get_nonneg_int(values, "TRE_HIST_BASELINE_LOOKBACK_MS", 90_000),
             percentile_mode=percentile_mode,

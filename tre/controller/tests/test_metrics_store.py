@@ -140,6 +140,23 @@ def test_metrics_store_caches_completed_windows():
     assert redis.zrange_calls == calls_after_first
 
 
+def test_metrics_store_sliding_reads_do_not_grow_window_cache():
+    # S1.1: sliding windows end at a moving `now`, so every [start, end] is unique.
+    # With use_cache=False the per-window cache must not accumulate entries (no leak).
+    redis = FakeRedis()
+    pod = "default/pod-a"
+    redis.sadd("tre:v2:pods:dsqwen-7b", pod)
+    add_doc(redis, "tre:v2:hist:" + pod, 1_000, hist_doc("pod-a", 1, 1, 1.0, 1, {"0.5": 1}))
+    add_doc(redis, "tre:v2:hist:" + pod, 11_000, hist_doc("pod-a", 3, 2, 2.0, 2, {"0.5": 2}))
+
+    store = MetricsStore(redis, load_registry(str(REGISTRY_PATH)), instant_sample_interval_ms=5_000)
+
+    for end in range(11_000, 11_100):  # 100 distinct sliding windows
+        store.read_model_window("dsqwen-7b", end - 10_000, end, use_cache=False)
+
+    assert len(store._window_cache) == 0
+
+
 def test_metrics_store_reads_v1_legacy_keys_without_pod_set():
     redis = FakeRedis()
     pod = "default/pod-a"

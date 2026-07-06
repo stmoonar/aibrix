@@ -2075,3 +2075,34 @@ EMA contract. Bonus findings logged for later: (a) SaturationGuard/gamma also de
 replicate live EMA semantics (S1.4 gate strengthened).
 
 Next: S1.1 (sliding window in metrics_task, + window_cache leak fix). Controller still PAUSED.
+
+### Signal Plan S1.1 — sliding window in metrics_task DONE (offline) 2026-07-06
+
+Removed the 60-120s tumbling staleness. make check 310 passed (was 305).
+- loops/metrics_task.py: new `_sliding_window(now, W) -> (max(0,now-W), now)` (no epoch
+  align, no last-complete block). `refresh_metrics_once(..., window_mode="tumbling")` —
+  default kept tumbling so existing callers/tests are byte-identical; live controller passes
+  cfg.metrics_window_mode. Tumbling calls read_snapshot with the ORIGINAL signature (no
+  use_cache kwarg) so existing SnapshotStore fakes keep working; only the sliding path passes
+  use_cache=False. MetricsTaskConfig protocol += metrics_window_mode; SnapshotStore protocol
+  read_snapshot += use_cache.
+- store/metrics_store.py: read_snapshot/read_model_window += `use_cache: bool = True`.
+  Sliding passes False -> the per-window `_window_cache` is not read or written (every sliding
+  window is unique -> cache never hits and would grow unboundedly = leak). Tumbling unchanged.
+- config.py: WINDOW_MODES={tumbling,sliding}; ControllerConfig.metrics_window_mode
+  (env TRE_METRICS_WINDOW_MODE, default **sliding**, validated).
+- Tests: test_metrics_task.py (_sliding_window value, sliding reads [now-W,now] with
+  use_cache=False, tumbling default uses cache) + test_metrics_store.py (100 distinct sliding
+  windows -> _window_cache stays size 0) + test_config.py (default sliding + validation).
+
+Regression caught & fixed during make check: initially refresh_metrics_once passed use_cache on
+EVERY read; test_p9_offline_integration's own FixtureSnapshotStore.read_snapshot lacks that
+kwarg -> TypeError swallowed by the stale-fallback try/except -> empty decisions -> 2 failures.
+Fixed by only passing use_cache on the sliding path (tumbling call byte-identical).
+
+**Real-machine deferred to S1.2**: S1.1's live check (Z_m changes every refresh, no 60s step)
+is folded into S1.2's combined real-machine acceptance that freezes W — avoids rolling the
+PAUSED controller twice (once for sliding@60s, again for short-window@30s+5s).
+
+Next: S1.2 (metrics_refresh_interval_s=5s decoupled from monitor_interval; window default
+60000->30000; N1 min-sample guard for p95; N5 window aligns to write period). Controller PAUSED.

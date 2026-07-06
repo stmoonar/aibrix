@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from tre_common.metrics_schema import MetricsSnapshot, ModelWindowMetrics
-from tre_controller.loops.metrics_task import SnapshotBox, refresh_metrics_once
+from tre_controller.loops.metrics_task import SnapshotBox, _sliding_window, refresh_metrics_once
 
 
 class FakeStore:
@@ -9,9 +9,13 @@ class FakeStore:
         self.snapshot = snapshot
         self.exc = exc
         self.calls: list[tuple[int, int]] = []
+        self.use_cache_calls: list[bool] = []
 
-    def read_snapshot(self, window_start_ms: int, window_end_ms: int) -> MetricsSnapshot:
+    def read_snapshot(
+        self, window_start_ms: int, window_end_ms: int, *, use_cache: bool = True
+    ) -> MetricsSnapshot:
         self.calls.append((window_start_ms, window_end_ms))
+        self.use_cache_calls.append(use_cache)
         if self.exc is not None:
             raise self.exc
         assert self.snapshot is not None
@@ -69,6 +73,37 @@ def test_refresh_metrics_once_reads_last_complete_aligned_window() -> None:
     assert result.stale is False
     assert store.calls == [(60_000, 120_000)]
     assert box.get() == snapshot
+
+
+def test_sliding_window_ends_at_now_without_alignment() -> None:
+    # S1.1: sliding window ends at now (no epoch alignment, no last-complete block).
+    assert _sliding_window(125_000, 60_000) == (65_000, 125_000)
+    # Contrast with tumbling for the same inputs (returns (60_000, 120_000)).
+
+
+def test_refresh_metrics_once_sliding_reads_now_minus_w_to_now_without_cache() -> None:
+    snapshot = _snapshot(125_000)
+    store = FakeStore(snapshot=snapshot)
+    box = SnapshotBox()
+
+    result = refresh_metrics_once(store, box, now_ms=125_000, window_ms=60_000, window_mode="sliding")
+
+    assert result.window_start_ms == 65_000
+    assert result.window_end_ms == 125_000
+    assert store.calls == [(65_000, 125_000)]
+    assert store.use_cache_calls == [False]  # sliding must not populate the per-window cache
+    assert box.get() == snapshot
+
+
+def test_refresh_metrics_once_tumbling_default_uses_cache() -> None:
+    snapshot = _snapshot(120_000)
+    store = FakeStore(snapshot=snapshot)
+    box = SnapshotBox()
+
+    refresh_metrics_once(store, box, now_ms=125_999, window_ms=60_000)  # default tumbling
+
+    assert store.calls == [(60_000, 120_000)]
+    assert store.use_cache_calls == [True]
 
 
 def test_refresh_metrics_once_marks_previous_snapshot_stale_on_read_failure() -> None:

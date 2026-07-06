@@ -17,6 +17,7 @@ def test_config_defaults_are_plan_aligned() -> None:
     assert config.rescue_interval_s == 5.0
     assert config.fairness_interval_s == 10.0
     assert config.metrics_window_ms == 60_000
+    assert config.metrics_window_mode == "sliding"
     assert config.instant_sample_interval_ms == 5_000
     assert config.histogram_lookback_ms == 90_000
     assert config.percentile_mode == "bucket_upper"
@@ -120,6 +121,12 @@ def test_config_centralizes_legacy_safescale_and_state_values() -> None:
 def test_config_rejects_invalid_percentile_mode() -> None:
     with pytest.raises(ValueError, match="TRE_PERCENTILE_MODE"):
         ControllerConfig.from_env({"TRE_PERCENTILE_MODE": "nearest"})
+
+
+def test_metrics_window_mode_can_be_overridden_and_validated() -> None:
+    assert ControllerConfig.from_env({"TRE_METRICS_WINDOW_MODE": "tumbling"}).metrics_window_mode == "tumbling"
+    with pytest.raises(ValueError):
+        ControllerConfig.from_env({"TRE_METRICS_WINDOW_MODE": "rolling"})
 
 
 def test_config_rejects_inverted_safescale_window_bounds() -> None:

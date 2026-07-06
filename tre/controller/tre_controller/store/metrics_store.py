@@ -52,16 +52,23 @@ class MetricsStore:
         self._histogram_lookback_ms = histogram_lookback_ms
         self._window_cache: dict[tuple[str, str, int, int], ModelWindowMetrics] = {}
 
-    def read_snapshot(self, window_start_ms: int, window_end_ms: int) -> MetricsSnapshot:
+    def read_snapshot(
+        self, window_start_ms: int, window_end_ms: int, *, use_cache: bool = True
+    ) -> MetricsSnapshot:
         models = {
-            spec.name: self.read_model_window(spec.name, window_start_ms, window_end_ms)
+            spec.name: self.read_model_window(spec.name, window_start_ms, window_end_ms, use_cache=use_cache)
             for spec in self._registry.models()
         }
         return MetricsSnapshot(ts_ms=int(window_end_ms), models=models, stale=False)
 
-    def read_model_window(self, model: str, window_start_ms: int, window_end_ms: int) -> ModelWindowMetrics:
+    def read_model_window(
+        self, model: str, window_start_ms: int, window_end_ms: int, *, use_cache: bool = True
+    ) -> ModelWindowMetrics:
         cache_key = (self._schema, model, int(window_start_ms), int(window_end_ms))
-        if cache_key in self._window_cache:
+        # Sliding windows (S1.1) pass use_cache=False: every window is unique, so the
+        # per-window cache never hits and would grow without bound. Only tumbling reads
+        # (repeated identical [start, end] within a block) benefit from caching.
+        if use_cache and cache_key in self._window_cache:
             return self._window_cache[cache_key]
 
         if self._schema == "v1":
@@ -82,7 +89,8 @@ class MetricsStore:
                     per_pod[pod_metrics.pod] = pod_metrics
 
         model_metrics = self._aggregate_model(model, window_start_ms, window_end_ms, per_pod)
-        self._window_cache[cache_key] = model_metrics
+        if use_cache:
+            self._window_cache[cache_key] = model_metrics
         return model_metrics
 
     def _read_zset_docs(
