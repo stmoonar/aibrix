@@ -2276,3 +2276,15 @@ N3: theta_m/tau (fit on 60s windows) badly need re-centering on the frozen 30s w
 
 F-onset VERDICT: fix validated (suppression live-confirmed; bypass unit-tested). Image pinned
 (overlay + images.lock + kustomize test -> 6fd540e6). Controller PAUSED. Next: S5.1 + UI; Codex replayer.
+
+### S5.1 decision time-series + B1 SM timeout (2026-07-06)
+
+Bundled (both controller-side; one rebuild next). make check 326.
+- S5.1: LoopTickResult += classifications; DecisionSnapshotWriter now ZADDs each model to
+  tre:v2:decision:hist:{model} (score=window_end_ms, member=window-derived signal state), 24h
+  retention + TTL. Enriched model_states (trs/q_ctl/y_m/eta_m/theta_m/routable/assigned/is_saturated/
+  signal_warm/state/window_end_ms). Backs the UI timelines + post-hoc analysis. rediskeys.decision_hist_key.
+- B1: sm_client per-action timeout — scale_model(target wake/create) + defrag use slow_timeout_s
+  (env TRE_SM_SLOW_TIMEOUT_SECONDS default 300); get_state/set_routable stay 5s. Prevents the 5s
+  client timeout firing mid-migration and freeing inflight -> stale replan (the old desync-churn class).
+- Tests: decision hist ZADD + enriched model_states; sm_client slow-vs-fast timeout; config defaults.

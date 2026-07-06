@@ -35,6 +35,7 @@ class ControllerConfig:
     metrics_redis_url: str
     metrics_schema: str
     service_manager_url: str
+    sm_slow_timeout_s: float
     registry_path: str
     runtime_state_dir: str
     monitor_interval_s: float
@@ -132,6 +133,8 @@ class ControllerConfig:
                 "TRE_SERVICE_MANAGER_URL",
                 "http://aibrix-tre-service-manager:8000",
             ).rstrip("/"),
+            # B1: wake/create + defrag run for minutes inside the SM handler.
+            sm_slow_timeout_s=_get_positive_float(values, "TRE_SM_SLOW_TIMEOUT_SECONDS", 300.0),
             registry_path=_get_str(values, "TRE_REGISTRY_PATH", str(default_registry)),
             runtime_state_dir=_get_str(values, "TRE_RUNTIME_STATE_DIR", str(default_state_dir)),
             monitor_interval_s=_get_positive_float(values, "TRE_MONITOR_INTERVAL_SECONDS", 20.0),

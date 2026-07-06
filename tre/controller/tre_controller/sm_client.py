@@ -21,10 +21,21 @@ class UrllibTransport:
 
 
 class ServiceManagerClient:
-    def __init__(self, base_url: str, *, transport: AsyncTransport | None = None, timeout_s: float = 5.0) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        *,
+        transport: AsyncTransport | None = None,
+        timeout_s: float = 5.0,
+        slow_timeout_s: float = 300.0,
+    ) -> None:
         self._base_url = base_url.rstrip("/")
         self._transport = transport or UrllibTransport()
         self._timeout_s = timeout_s
+        # B1: wake/create (target) and defrag run synchronously inside the SM handler for
+        # minutes; the default 5s timeout would fire mid-migration and free the inflight,
+        # letting the controller replan against a stale view. Give them a long timeout.
+        self._slow_timeout_s = slow_timeout_s
 
     async def get_state(self) -> dict:
         return await self._request("GET", "/v2/state")
@@ -43,7 +54,9 @@ class ServiceManagerClient:
             bound = int(counts.get("bound", 0))
             serving_floor = 1 if bound > 0 and current > 0 and int(delta) < 0 else 0
             target = max(serving_floor, current + int(delta))
-            response = await self._request("PUT", f"/v2/models/{model}/target", json={"wake_replicas": target})
+            response = await self._request(
+                "PUT", f"/v2/models/{model}/target", json={"wake_replicas": target}, timeout_s=self._slow_timeout_s
+            )
             return {"ok": True, "response": response}
         except ServiceManagerError as exc:
             return {"ok": False, "error": str(exc)}
@@ -62,17 +75,21 @@ class ServiceManagerClient:
     async def defrag(self, migrations: tuple) -> dict:
         del migrations
         try:
-            response = await self._request("POST", "/v2/defrag", json={"tp_size": 2})
+            response = await self._request(
+                "POST", "/v2/defrag", json={"tp_size": 2}, timeout_s=self._slow_timeout_s
+            )
             return {"ok": True, "response": response}
         except ServiceManagerError as exc:
             if "HTTP 404" in str(exc):
                 return {"ok": False, "error": "defrag endpoint is not implemented in service-manager v2"}
             return {"ok": False, "error": str(exc)}
 
-    async def _request(self, method: str, path: str, *, json: dict | None = None) -> dict:
+    async def _request(self, method: str, path: str, *, json: dict | None = None, timeout_s: float | None = None) -> dict:
         url = f"{self._base_url}{path}"
         try:
-            response = await self._transport.request(method, url, json=json, timeout_s=self._timeout_s)
+            response = await self._transport.request(
+                method, url, json=json, timeout_s=self._timeout_s if timeout_s is None else timeout_s
+            )
         except ServiceManagerError:
             raise
         except Exception as exc:

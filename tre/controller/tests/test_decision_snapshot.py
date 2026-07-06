@@ -13,10 +13,21 @@ from tre_sm.allocator.slots import Migration, Slot
 class FakeRedis:
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict[str, str]]] = []
+        self.zadds: list[tuple[str, dict]] = []
 
     def hset(self, name: str, mapping: dict[str, str]) -> int:
         self.calls.append((name, mapping))
         return len(mapping)
+
+    def zadd(self, name: str, mapping: dict) -> int:
+        self.zadds.append((name, mapping))
+        return len(mapping)
+
+    def zremrangebyscore(self, name: str, mn, mx) -> int:
+        return 0
+
+    def expire(self, name: str, ttl: int) -> bool:
+        return True
 
 
 def test_build_decision_snapshot_serializes_actions_and_events() -> None:
@@ -59,8 +70,19 @@ def test_build_decision_snapshot_serializes_actions_and_events() -> None:
         "critical": {
             "z_m": 0.5,
             "trs_z_m": 0.5,
+            "trs": None,
+            "q_ctl": None,
+            "y_m": None,
+            "eta_m": None,
+            "theta_m": None,
+            "routable_pods": None,
+            "assigned_replicas": None,
+            "is_saturated": None,
+            "signal_warm": None,
+            "state": None,
             "signal_source": "zm",
             "signal_unavailable_reason": None,
+            "window_end_ms": None,
         }
     }
     assert json.loads(payload["actions"]) == [
@@ -111,6 +133,26 @@ def test_decision_snapshot_writer_writes_latest_hash() -> None:
             },
         )
     ]
+
+
+def test_decision_snapshot_writer_appends_per_model_history() -> None:
+    from tre_common.rediskeys import decision_hist_key
+
+    redis = FakeRedis()
+    writer = DecisionSnapshotWriter(redis)
+    snapshot = MetricsSnapshot(ts_ms=1000, stale=False, models={})
+    result = LoopTickResult(submitted=0, model_contexts={"m": {"z_m": 1.2, "trs": 500.0}})
+
+    writer.write("rescue", snapshot, result)
+
+    # one zadd to the model's per-model hist zset, scored by ts_ms; member carries the signal.
+    assert len(redis.zadds) == 1
+    name, mapping = redis.zadds[0]
+    assert name == decision_hist_key("m")
+    member, score = next(iter(mapping.items()))
+    assert score == 1000.0
+    decoded = json.loads(member)
+    assert decoded["model"] == "m" and decoded["z_m"] == 1.2 and decoded["trs"] == 500.0
 
 
 def test_decision_snapshot_writer_logs_even_when_redis_write_fails(caplog) -> None:

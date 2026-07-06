@@ -9,9 +9,11 @@ class FakeTransport:
     def __init__(self, responses: list[dict] | None = None) -> None:
         self.responses = list(responses or [])
         self.calls: list[tuple[str, str, dict | None]] = []
+        self.timeouts: list[float] = []
 
     async def request(self, method: str, url: str, *, json: dict | None = None, timeout_s: float) -> dict:
         self.calls.append((method, url, json))
+        self.timeouts.append(timeout_s)
         if not self.responses:
             return {"ok": True}
         response = self.responses.pop(0)
@@ -37,6 +39,23 @@ async def test_sm_client_scale_model_converts_delta_to_v2_target() -> None:
         ("GET", "http://sm.local/v2/state", None),
         ("PUT", "http://sm.local/v2/models/m/target", {"wake_replicas": 3}),
     ]
+
+
+@pytest.mark.asyncio
+async def test_sm_client_scale_and_defrag_use_slow_timeout_b1() -> None:
+    # B1: wake/create (target) and defrag run for minutes in the SM -> long timeout;
+    # get_state / set_routable stay on the fast timeout.
+    t = FakeTransport(responses=[{"models": {"m": {"awake": 1, "bound": 4}}, "bindings": []}, {"actions": []}])
+    await ServiceManagerClient("http://sm.local/", transport=t, timeout_s=5.0, slow_timeout_s=300.0).scale_model("m", 1)
+    assert t.timeouts == [5.0, 300.0]  # GET state fast, PUT target slow
+
+    t2 = FakeTransport(responses=[{"ok": True}])
+    await ServiceManagerClient("http://sm.local/", transport=t2, timeout_s=5.0, slow_timeout_s=300.0).defrag(())
+    assert t2.timeouts == [300.0]
+
+    t3 = FakeTransport(responses=[{"model": "m", "hidden_pods": [], "version": 1, "actions": []}])
+    await ServiceManagerClient("http://sm.local/", transport=t3, timeout_s=5.0, slow_timeout_s=300.0).set_routable("m", ())
+    assert t3.timeouts == [5.0]
 
 
 @pytest.mark.asyncio

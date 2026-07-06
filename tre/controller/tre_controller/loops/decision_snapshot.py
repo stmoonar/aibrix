@@ -5,7 +5,12 @@ import logging
 from typing import Any
 
 from tre_common.metrics_schema import MetricsSnapshot
-from tre_common.rediskeys import DECISION_LATEST_KEY
+from tre_common.rediskeys import (
+    DECISION_HIST_RETENTION_MS,
+    DECISION_HIST_TTL_SECONDS,
+    DECISION_LATEST_KEY,
+    decision_hist_key,
+)
 from tre_controller.loops.tick import LoopTickResult
 from tre_controller.planning.planner import DefragAction, HideAction, ScaleAction, UnhideAction
 
@@ -21,7 +26,11 @@ def build_decision_snapshot(loop_name: str, snapshot: MetricsSnapshot, result: L
         "submitted": str(result.submitted),
         "actions": json.dumps([_action_to_dict(action) for action in result.actions], separators=(",", ":")),
         "events": json.dumps(list(result.events), separators=(",", ":")),
-        "model_states": json.dumps(_model_states(result.model_contexts), separators=(",", ":"), sort_keys=True),
+        "model_states": json.dumps(
+            _model_states(result.model_contexts, getattr(result, "classifications", {}), snapshot),
+            separators=(",", ":"),
+            sort_keys=True,
+        ),
     }
 
 
@@ -36,7 +45,22 @@ class DecisionSnapshotWriter:
             self._redis.hset(self._key, mapping=payload)
         except Exception as exc:
             _LOGGER.warning("decision_snapshot_redis_write_failed: %s", exc)
+        self._append_history(snapshot, result)
         _LOGGER.info(json.dumps({"event": "trs_calc_result", **payload}, separators=(",", ":")))
+
+    def _append_history(self, snapshot: MetricsSnapshot, result: LoopTickResult) -> None:
+        # S5.1: per-model decision time-series. Scored by window_end_ms so rescue and
+        # fairness reads of the same window collapse to one point (member is window-derived).
+        states = _model_states(result.model_contexts, getattr(result, "classifications", {}), snapshot)
+        for model, state in states.items():
+            member = json.dumps({"ts": snapshot.ts_ms, "model": model, **state}, sort_keys=True, separators=(",", ":"))
+            key = decision_hist_key(model)
+            try:
+                self._redis.zadd(key, {member: float(snapshot.ts_ms)})
+                self._redis.zremrangebyscore(key, "-inf", snapshot.ts_ms - DECISION_HIST_RETENTION_MS)
+                self._redis.expire(key, DECISION_HIST_TTL_SECONDS)
+            except Exception as exc:  # noqa: BLE001 - history is best-effort, never blocks decisions.
+                _LOGGER.warning("decision_hist_write_failed:%s: %s", model, exc)
 
 
 def _action_to_dict(action: object) -> dict[str, Any]:
@@ -77,16 +101,36 @@ def _action_to_dict(action: object) -> dict[str, Any]:
     raise TypeError(f"unsupported decision action: {type(action).__name__}")
 
 
-def _model_states(model_contexts: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
-    return {
-        model: {
+def _model_states(
+    model_contexts: dict[str, dict[str, Any]],
+    classifications: dict[str, Any] | None = None,
+    snapshot: MetricsSnapshot | None = None,
+) -> dict[str, dict[str, Any]]:
+    classifications = classifications or {}
+    models = snapshot.models if snapshot is not None else {}
+    out: dict[str, dict[str, Any]] = {}
+    for model, context in sorted(model_contexts.items()):
+        cls = classifications.get(model)
+        state = getattr(getattr(cls, "state", None), "value", None)
+        window = models.get(model)
+        out[model] = {
             "z_m": context.get("z_m"),
             "trs_z_m": context.get("trs_z_m"),
+            "trs": context.get("trs"),
+            "q_ctl": context.get("Q_ctl"),
+            "y_m": context.get("Y_m"),
+            "eta_m": context.get("eta_m"),
+            "theta_m": context.get("theta_m"),
+            "routable_pods": context.get("routable_pods"),
+            "assigned_replicas": context.get("assigned_replicas"),
+            "is_saturated": context.get("is_saturated"),
+            "signal_warm": context.get("signal_warm"),
+            "state": state,
             "signal_source": context.get("signal_source"),
             "signal_unavailable_reason": context.get("signal_unavailable_reason"),
+            "window_end_ms": getattr(window, "window_end_ms", None),
         }
-        for model, context in sorted(model_contexts.items())
-    }
+    return out
 
 
 def _migration_to_dict(migration: Any) -> dict[str, Any]:

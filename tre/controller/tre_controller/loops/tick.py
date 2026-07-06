@@ -45,6 +45,7 @@ class LoopTickResult:
     actions: tuple[Action, ...] = ()
     events: tuple[str, ...] = ()
     model_contexts: dict[str, dict] = field(default_factory=dict)
+    classifications: dict = field(default_factory=dict)  # model -> ModelClassification (S5.1)
 
 
 @dataclass
@@ -135,6 +136,7 @@ def run_planner_tick(
         actions=actions,
         events=paper_events + tuple(plan.events) + safescale_events,
         model_contexts=contexts,
+        classifications={item.model_name: item for item in classifications},
     )
 
 

@@ -133,7 +133,9 @@ def create_controller_dependencies(
         histogram_lookback_ms=cfg.histogram_lookback_ms,
         min_latency_samples=cfg.min_latency_samples,
     )
-    sm_client = ServiceManagerClient(cfg.service_manager_url, transport=sm_transport)
+    sm_client = ServiceManagerClient(
+        cfg.service_manager_url, transport=sm_transport, slow_timeout_s=cfg.sm_slow_timeout_s
+    )
     safescale = SafeScaleStateMachine(config=cfg.safescale, store=ControllerStateStore(redis_client))
     safescale.restore()
     return ControllerDependencies(
