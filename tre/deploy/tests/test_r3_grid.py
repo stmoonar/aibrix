@@ -48,6 +48,35 @@ def test_write_csv_roundtrip(tmp_path: Path) -> None:
     assert reader[0]["trs"] == "10.0"
 
 
+def test_compute_window_trs_uses_time_constant_ema() -> None:
+    # S1.4: the trs column must use the live shared time-constant EMA (ema_tau_ms +
+    # window_end_ms deltas), not the old fixed-alpha EMA, so theta is fit on the live signal.
+    import math
+    from types import SimpleNamespace
+
+    trs = SimpleNamespace(
+        w_p=0.04, w_d=1.0, lambda_wait=2.625, qmin=1.0,
+        ema_alpha=0.5, ema_tau_ms=20000, theta_m=100.0,
+    )
+    spec = SimpleNamespace(trs=trs)
+
+    def win(gen: float, running: float, end: int) -> SimpleNamespace:
+        return SimpleNamespace(
+            prompt_tokens=0.0, generation_tokens=gen, avg_waiting=0.0, avg_running=running,
+            avg_swapping=0.0, routable_pods=1, assigned_replicas=1, kv_cache_hit_rate=0.0,
+            window_end_ms=end,
+        )
+
+    windows = [win(200.0, 2.0, 30000), win(400.0, 2.0, 60000)]  # raw TRS 100 then 200
+    vals = r3_grid.compute_window_trs(windows, spec)
+    assert vals[0] == 100.0  # first window seeds from raw
+    decay = math.exp(-30000 / 20000)  # dt=30000 (tumbling), tau=20000
+    expected = decay * 100.0 + (1 - decay) * 200.0
+    assert abs(vals[1] - expected) < 1e-6
+    assert abs(vals[1] - 200.0) > 1.0  # not raw
+    assert abs(vals[1] - 150.0) > 1.0  # not the old fixed-alpha(0.5) value
+
+
 def test_checkpoint_resume(tmp_path: Path) -> None:
     p = tmp_path / "ck.json"
     ck = r3_grid.Checkpoint.load(p)

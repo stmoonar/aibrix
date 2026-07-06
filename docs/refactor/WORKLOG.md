@@ -2200,3 +2200,20 @@ drifted from manifests (apply-k risk); (c) worst-case lag at W=30s is ~36s (=300
 
 S1 STATUS: all offline code done (S1.3/S1.1/S1.2/N1/N5/N2, make check 314, ADR-0011/0012). Pipeline validated
 live. Remaining: authoritative W-freeze (F4.3) -> S1.4/R3 (+S2/S3) -> then S4 before R3. N3/N4 deferred.
+
+### R3-prep — r3_grid trs column aligned to live time-constant EMA (S1.4 partial) 2026-07-06
+
+Architect (S1.3 consult) flagged: r3_grid's trs CSV column was within-cell FIXED-ALPHA EMA'd
+while live is now the shared time-constant EMA -> theta would be fit on a signal the controller
+never sees. Fixed the driver's trs computation. make check 315.
+- r3_grid.py: extracted compute_window_trs(windows, spec) using TRSComputer(ema_alpha, **ema_tau_ms**)
+  + compute(**window_end_ms=**wm.window_end_ms) — replicates the live shared time-constant EMA.
+  --window-ms default 60000 -> 30000 (MUST equal the frozen control W; theta on a different window
+  is invalid, S1.4 gate). Test: compute_window_trs reflects exp(-dt/tau) decay, not raw, not fixed-alpha.
+- KNOWN GAP (documented in the helper docstring): live uses a SLIDING window refreshed every ~5s
+  (EMA advances every ~5s), r3_grid re-windows TUMBLING at window_ms (EMA advances every window_ms) —
+  same tau, different advance cadence. For AUTHORITATIVE R3 the trs must be re-aggregated with a
+  SLIDING window at the live refresh step from the raw per-request log. That is the remaining S4 work:
+  `rewindow_from_raw.py --window-ms=<W> --step-ms=<refresh>` + per-request JSONL logging in drive_cell
+  (streaming for ttft + usage). S4 is intricate (p95 bucket-reconciliation vs metrics_store) and R3 is
+  gated well downstream (post W-freeze + F4.4), so it remains an R3-prerequisite task, not yet done.

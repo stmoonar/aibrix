@@ -49,6 +49,30 @@ def enumerate_cells(
     return cells
 
 
+def compute_window_trs(windows: list, spec) -> list[float]:
+    """EMA'd TRS series over a sequence of windows, using the SAME shared time-constant
+    EMA the live controller uses (ema_tau_ms + window_end_ms deltas, ADR-0011), so theta
+    is fit on the signal the controller actually sees (S1.4). One TRSComputer across the
+    cell's windows (state persists), mirroring the live shared per-model computer.
+
+    CAVEAT (authoritative R3): live uses a SLIDING window refreshed every ~5s (the EMA
+    advances every ~5s with dt~=5s), whereas this driver re-windows TUMBLING at window_ms
+    (dt=window_ms). Same tau, different advance cadence -> a coarser approximation. For the
+    authoritative R3 trs column, re-aggregate from the raw per-request log with a SLIDING
+    window at the live refresh step (S4 `rewindow_from_raw --window-ms=<W> --step-ms=<refresh>`).
+    This tumbling series is kept for the online quick-look CSV.
+    """
+    from tre_controller.signals.trs import TRSComputer, TRSInput
+
+    computer = TRSComputer(ema_alpha=spec.trs.ema_alpha, ema_tau_ms=spec.trs.ema_tau_ms)
+    values: list[float] = []
+    for wm in windows:
+        inp = TRSInput.from_metrics(wm, spec.trs)
+        result = computer.compute(inp, theta_m=spec.trs.theta_m, window_end_ms=wm.window_end_ms)
+        values.append(result.TRS)
+    return values
+
+
 def window_row(cell: GridCell, window_metrics, trs: float) -> dict:
     """Assemble one calibration CSV row from an aggregated window + its trs.
     Pure: window_metrics is a ModelWindowMetrics-like object.
@@ -149,7 +173,9 @@ def main() -> int:
     ap.add_argument("--output-buckets", default="128,512")
     ap.add_argument("--concurrency", default="1,2,4,8,16")
     ap.add_argument("--cell-seconds", type=float, default=60.0)
-    ap.add_argument("--window-ms", type=int, default=60000)
+    # MUST equal the frozen control window W (S1.2; provisional 30000). theta fit on a
+    # different window is invalid (S1.4 hard gate).
+    ap.add_argument("--window-ms", type=int, default=30000)
     ap.add_argument("--redis-url", default="redis://tre-v2-redis:6379/0")
     ap.add_argument("--metrics-schema", default="v1")
     ap.add_argument("--instant-sample-ms", type=int, default=5000)
@@ -173,7 +199,6 @@ def main() -> int:
     import redis  # type: ignore[import-not-found]
     from tre_common.registry import load_registry
     from tre_controller.store.metrics_store import MetricsStore
-    from tre_controller.signals.trs import TRSComputer, TRSInput
 
     registry = load_registry(args.registry)
     spec = registry.model(args.model)
@@ -190,16 +215,15 @@ def main() -> int:
         if ckpt.is_done(cell):
             continue
         start_ms, end_ms = drive_cell(args.gateway_url, args.model, cell, args.cell_seconds)
-        trs_computer = TRSComputer(ema_alpha=spec.trs.ema_alpha)
+        windows = []
         w = start_ms
-        cell_windows = 0
         while w + args.window_ms <= end_ms:
-            wm = store.read_model_window(args.model, w, w + args.window_ms)
-            inp = TRSInput.from_metrics(wm, spec.trs)
-            result = trs_computer.compute(inp, theta_m=spec.trs.theta_m)
-            rows.append(window_row(cell, wm, result.TRS))
-            cell_windows += 1
+            windows.append(store.read_model_window(args.model, w, w + args.window_ms))
             w += args.window_ms
+        trs_values = compute_window_trs(windows, spec)  # shared time-constant EMA (S1.4)
+        for wm, trs in zip(windows, trs_values):
+            rows.append(window_row(cell, wm, trs))
+        cell_windows = len(windows)
         ckpt.mark(cell)
         write_csv(rows, out)
         print(f"cell {cell.scenario_id}: {cell_windows} windows")
