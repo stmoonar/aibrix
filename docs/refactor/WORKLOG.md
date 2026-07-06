@@ -1983,3 +1983,36 @@ fix deployed (tre-v2-service-manager:20260706-a1d21c00) + verified (self-heal +
 under-churn); controller PAUSED; node9/node10 GPUs clean; reconcile warnings=[];
 make check 285; tree committed. Next: canonical dsllama gpu-0 (SM create path) ->
 R3 refit -> N4.6 + scale-cycle soak -> n4b-done -> Phase C -> N5 -> F5.
+
+### Endgame canonical restore — root-caused, blocked on D8 config decision (2026-07-06)
+
+Retried dsllama gpu-0 recreate on a settled clean GPU0 (2942 MiB). It OOM'd again
+(restarts, never HTTP-ready). Precise root cause (from vLLM logs):
+  "CUDA out of memory ... warming up sampler with 256 dummy requests ... GPU 0 has
+   112 MiB free ... total 39.38 GiB"
+At gpu_memory_utilization=0.9 the pod targets ~36 GiB; GPU0 already hosts co-resident
+sleeping pods (dsqwen-7b gpu-0 ~2 GiB + dsqwen-14b node9 gpu0-1 ~1.7 GiB) => ~40 GiB,
+and the sampler warmup pushes over the 40 GiB card limit. The ORIGINAL 12-binding
+topology avoided this via creation ORDER (each GPU's pods warmed up at 0.9 while the
+GPU was still empty, then slept to ~2 GiB before the next pod was added). Recreating
+a single binding into an already-populated GPU breaks that assumption.
+
+This is exactly the plan D8 case: "only if cold-start headroom is insufficient, add
+`--gpu-memory-utilization 0.85` to registry vllm_extra_args (rebuilds all model pods,
+costly, don't do lightly)". Options for the canonical restore (needs a deliberate
+decision, ideally architect-confirmed, at the R3 session start):
+  (a) D8 path: set gpu_memory_utilization=0.85 in registry vllm config, regenerate
+      all model manifests, recreate the fleet cleanly in creation-order. Consistent
+      but disruptive (rebuilds all 12 pods). 0.85*40=34 GiB + 4 co-resident = 38 < 40.
+  (b) One-off 0.85 on just the dsllama gpu-0 recreate manifest (fits, but util
+      inconsistent with the other pods; acceptable if gpu-0 stays a sleeping binding,
+      but affects R3 capacity measurement if it becomes the awake replica).
+  (c) Temporarily evacuate GPU0 co-residents, recreate dsllama gpu-0 at 0.9 when GPU0
+      is empty, sleep it, restore others (complex: 14b gpu0-1 is a 2-GPU binding).
+Recommendation: (a) at R3 start (R3 rebuilds/recreates the fleet for the capacity
+grid anyway, so folding the 0.85 change in is low marginal cost and consistent).
+
+Deleted the failing recreate -> dsllama clean bound=3, serving 3/3, reconcile clean.
+CLEAN CHECKPOINT holds: isolated plane serving 3/3, SM two-layer fix deployed+verified
+(self-heal + under-churn), controller PAUSED, GPUs clean, make check 285, tree committed.
+Canonical bound=4 + R3 + N4.6/soak + Phase C + N5 + F5 remain (config decision + wall-clock).
