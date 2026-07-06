@@ -41,7 +41,11 @@ def test_daemonset_targets_gpu_nodes_and_writes_tre_v2_redis() -> None:
     assert ds["metadata"]["namespace"] == "tre-v2"
     spec = ds["spec"]["template"]["spec"]
     assert spec["hostPID"] is False
-    assert spec["nodeSelector"] == {"nvidia.com/gpu.present": "true"}
+    terms = spec["affinity"]["nodeAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"]["nodeSelectorTerms"]
+    hostnames = terms[0]["matchExpressions"][0]
+    assert hostnames["key"] == "kubernetes.io/hostname"
+    assert hostnames["operator"] == "In"
+    assert set(hostnames["values"]) == {"nscc-ds-4a100-node9", "nscc-ds-4a100-node10"}
     container = spec["containers"][0]
     assert container["image"] == "vllm/vllm-openai:0.10.1-sleep"
     command = container["command"]

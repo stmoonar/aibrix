@@ -1732,3 +1732,30 @@ destructive path, did not touch the base.** Surfacing to the architect: options
 maintenance window with co-tenant sign-off, (3) accept current base for N5 with a
 version caveat. Continuing with non-blocked work (live validation of the F4.0
 package, N5 driver tooling) while awaiting the decision.
+
+### Endgame F4.0 live validation + ADR-0008 kickoff (2026-07-06)
+
+Architect (Fable5) ruling recorded as ADR-0008: cancel D11 base teardown; instead
+stand up a minimal isolated TRE data plane in tre-v2 (own Gateway tre-aibrix-eg +
+tre-gateway-plugins + policies + retarget), mirroring the lxt tenant. Phases
+A(additive)/B(cutover)/C(cleanup); execution model may proceed without further gate
+unless Phase A smoke fails.
+
+Live-validated the additive F4.0 pieces (non-destructive, per ADR-0007/0008 item 2):
+- **gpu-truth DaemonSet** deployed to tre-v2 and now the sole GPU-truth source:
+  - First apply used nodeSelector `nvidia.com/gpu.present=true` which matched a
+    THIRD out-of-scope A100 node ("cloud", not in registry) -> CrashLoop there.
+    Fixed the generator template to nodeAffinity hostname In {node9,node10}
+    (consistent with registry + existing SM/controller nodeSelector); +test updated;
+    regenerated; make-check-local green.
+  - DaemonSet 2/2 Running on node9/node10; writes `tre:gpu_truth:<node>` with correct
+    per-UUID used/total MiB (matches nvidia-smi), TTL refreshing (~30s interval /
+    120s TTL). Retired the two manual Jul05 nohup agents (node9 PID 3837984,
+    node10 PID 4188585). SM reconcile warnings=[] served purely by the DaemonSet.
+- **TRE-managed ReferenceGrant** `tre-v2-model-referencegrant-in-default` applied;
+  coexists with the AIBrix-base reserved grant (additive). Makes `apply -k models`
+  self-sufficient for cross-ns routing.
+- Note: did NOT `apply -k deploy/models` wholesale (would cold-start the missing
+  14b node9-gpu-2-3 as an awake pod); model Deployment/route idempotence is unit-
+  tested and the live routes already exist (route-guard). The model HTTPRoutes will
+  be regenerated to the tre-v2 gateway in the isolation package (ADR-0008 step 3).

@@ -49,8 +49,18 @@ spec:
       # hostPID stays false: the agent only reads nvidia-smi inside its own
       # container (GPUs injected via NVIDIA_VISIBLE_DEVICES), never the host PID ns.
       hostPID: false
-      nodeSelector:
-        nvidia.com/gpu.present: "true"
+      # Restrict to the two TRE GPU nodes (registry cluster). The cluster has a
+      # third A100 node ("cloud") out of TRE scope; gpu.present matches it too.
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: In
+                    values:
+                      - nscc-ds-4a100-node9
+                      - nscc-ds-4a100-node10
       tolerations:
         - key: node-role.kubernetes.io/control-plane
           operator: Exists
