@@ -1948,3 +1948,38 @@ further live scaling.
   architect's "gpu-0 freed" precondition for recreate is not yet met; canonical
   fleet restore is the next step, requires relocating dsqwen-7b awake off GPU0 first).
   Controller PAUSED.
+
+### Endgame canonical fleet restore — partial; fix validated under churn (2026-07-06)
+
+Attempted ADR-0009 step 2 (restore dsllama-8b to canonical bound=4) with the SM
+fix now deployed:
+- **Freed node9 GPU0** by relocating dsqwen-7b's awake replica gpu-0 -> gpu-2:
+  direct `/wake_up` gpu-2, reconcile, then direct `/sleep` gpu-0. The two-layer
+  fix handled this flawlessly — each reconcile's physical `/is_sleeping` override
+  ("pod reality overrides persisted binding") synced the store + routable labels
+  to reality, and dsqwen-7b served continuously (3/3) throughout the relocation.
+  GPU0 dropped 38800 -> 2942 MiB. **Strong live validation of the fix under real
+  wake/sleep churn** (the exact scenario that previously caused the desync outage).
+- **dsllama gpu-0 recreate FAILED (CUDA OOM CrashLoop, 3 restarts)**: raw
+  `kubectl apply` of the Deployment bypassed the SM D10 headroom gate; during the
+  ~2min vLLM load a 36 GiB process re-occupied GPU0 (leaving 112 MiB), so the new
+  pod OOM'd on sampler warmup. Deleted it -> dsllama back to clean bound=3,
+  serving 4/4. node9 GPU0 settled to 2942 MiB, reconcile warnings=[].
+- **Canonical restore deferred** (next session, before R3): recreate the 4th
+  dsllama binding via the SM create path (D10 headroom check + wait-vLLM-ready),
+  NOT raw apply; ensure GPU0 is guaranteed free for the full load with no
+  concurrent wakes. dsllama bound=3 serves fine meanwhile; only R3's canonical
+  capacity-surface measurement needs the 4th binding.
+
+Follow-up refinement noted (minor, non-blocking): Layer 1 marks a physically-awake
+-but-still-loading pod routable (is_sleeping=false during vLLM init) -> it briefly
+receives traffic before ready (observed dsllama 2/3 during the recreate load).
+routable should arguably also gate on vLLM HTTP readiness, not just not-sleeping.
+Only manifests during the rare pod-creation window; add a readiness check to the
+routable invariant in a future SM iteration.
+
+CLEAN CHECKPOINT: isolated plane serving all 3 models 4/4; SM two-layer reconcile
+fix deployed (tre-v2-service-manager:20260706-a1d21c00) + verified (self-heal +
+under-churn); controller PAUSED; node9/node10 GPUs clean; reconcile warnings=[];
+make check 285; tree committed. Next: canonical dsllama gpu-0 (SM create path) ->
+R3 refit -> N4.6 + scale-cycle soak -> n4b-done -> Phase C -> N5 -> F5.
