@@ -42,3 +42,15 @@ def test_surface_keeps_max_slo_met_rps() -> None:
     assert surface.points[("m", 128, 64)] == 8.0
     js = r3_capacity.surface_to_json("m", surface)
     assert js["capacity"][0] == {"input_tokens": 128, "output_tokens": 64, "rps": 8.0}
+
+
+def test_load_capacity_surface_roundtrip(tmp_path):
+    import json
+    from tre_calibration.capacity import CapacitySample, fit_capacity_surface
+    surface = fit_capacity_surface([CapacitySample("dsqwen-7b", 128, 64, 4.27, True)])
+    js = r3_capacity.surface_to_json("dsqwen-7b", surface)
+    path = tmp_path / "cap.json"
+    path.write_text(json.dumps(js))
+    loaded = r3_capacity.load_capacity_surface([path])
+    pt = loaded.capacity_at("dsqwen-7b", input_tokens=128, output_tokens=64)
+    assert pt.rps == 4.27 and pt.reason == "exact"

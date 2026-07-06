@@ -63,6 +63,20 @@ def surface_to_json(model: str, surface) -> dict:
     }
 
 
+def load_capacity_surface(paths):
+    """Reconstruct a CapacitySurface from one or more capacity_<model>.json files
+    (the r3_capacity output). Enables R7 design/lint/oracle to consume R3 output.
+    """
+    from tre_calibration.capacity import CapacitySurface
+    points = {}
+    for path in paths:
+        data = json.loads(Path(path).read_text())
+        model = data["model"]
+        for pt in data["capacity"]:
+            points[(model, int(pt["input_tokens"]), int(pt["output_tokens"]))] = float(pt["rps"])
+    return CapacitySurface(points=points)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--input", required=True, help="r3_grid CSV")
