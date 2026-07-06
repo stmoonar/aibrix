@@ -242,3 +242,170 @@ def test_reconcile_does_not_warn_sleep_leak_when_gpu_has_awake_binding():
     )
 
     assert all(not warning.startswith("sleep_leak:") for warning in result.warnings)
+
+
+# ---------------------------------------------------------------------------
+# ADR-0009 two-layer controller: physical /is_sleeping drives the routable
+# label. Layer 1 (safety invariant) re-asserts routable = physical-awake AND
+# not hidden; the state annotation is demoted to a write-through cache.
+# ---------------------------------------------------------------------------
+
+
+class FakeProber:
+    def __init__(self, sleeping_by_serve):
+        self._sleeping = dict(sleeping_by_serve)
+        self.calls = []
+
+    def is_sleeping(self, pod):
+        self.calls.append(pod.serve_id)
+        return self._sleeping.get(pod.serve_id)
+
+
+class FakeLabelWriter:
+    def __init__(self):
+        self.calls = []
+
+    def set_pod_routable(self, serve_id, *, routable):
+        self.calls.append((serve_id, routable))
+
+
+def test_reconcile_reasserts_routable_true_for_physically_awake_pod():
+    store = StateStore(FakeRedis())
+    store.save([], expected_version=0)
+    k8s = FakeK8sClient(
+        [
+            PodRecord(
+                serve_id="serve-a",
+                model="dsqwen-7b",
+                node="node-a",
+                cuda_visible_devices="0",
+                state="awake",
+                pod_ip="10.0.0.1",
+                routable=False,
+            )
+        ]
+    )
+    prober = FakeProber({"serve-a": False})
+    writer = FakeLabelWriter()
+
+    result = reconcile_state(topology(), store, k8s, prober=prober, label_writer=writer)
+
+    assert writer.calls == [("serve-a", True)]
+    assert result.bindings == [Binding("serve-a", "dsqwen-7b", Slot("node-a", (0,)), awake=True)]
+
+
+def test_reconcile_sets_routable_false_for_physically_sleeping_pod():
+    store = StateStore(FakeRedis())
+    store.save([], expected_version=0)
+    k8s = FakeK8sClient(
+        [
+            PodRecord(
+                serve_id="serve-a",
+                model="dsqwen-7b",
+                node="node-a",
+                cuda_visible_devices="0",
+                state="awake",
+                pod_ip="10.0.0.1",
+                routable=True,
+            )
+        ]
+    )
+    prober = FakeProber({"serve-a": True})
+    writer = FakeLabelWriter()
+
+    result = reconcile_state(topology(), store, k8s, prober=prober, label_writer=writer)
+
+    assert writer.calls == [("serve-a", False)]
+    assert result.bindings == [Binding("serve-a", "dsqwen-7b", Slot("node-a", (0,)), awake=False)]
+
+
+def test_reconcile_physical_truth_overrides_state_annotation_for_routable():
+    store = StateStore(FakeRedis())
+    store.save([], expected_version=0)
+    k8s = FakeK8sClient(
+        [
+            # annotation says awake but physically sleeping -> physical wins.
+            PodRecord("serve-a", "dsqwen-7b", "node-a", "0", state="awake", pod_ip="10.0.0.1", routable=True),
+            # annotation says sleeping but physically awake -> physical wins.
+            PodRecord("serve-b", "dsqwen-7b", "node-a", "2", state="sleeping", pod_ip="10.0.0.2", routable=False),
+        ]
+    )
+    prober = FakeProber({"serve-a": True, "serve-b": False})
+    writer = FakeLabelWriter()
+
+    result = reconcile_state(topology(), store, k8s, prober=prober, label_writer=writer)
+
+    assert sorted(writer.calls) == [("serve-a", False), ("serve-b", True)]
+    bindings = {binding.serve_id: binding for binding in result.bindings}
+    assert bindings["serve-a"].awake is False
+    assert bindings["serve-b"].awake is True
+
+
+def test_reconcile_leaked_pod_stays_unroutable_and_flags_leak_without_wake_loop():
+    store = StateStore(FakeRedis())
+    # Store desires the pod awake, but it is a physical sleep-leak: /is_sleeping
+    # true yet high used_mib (and /wake_up would 500). Must stay non-routable.
+    store.save([Binding("serve-leak", "dsqwen-7b", Slot("node-a", (2,)), awake=True)], expected_version=0)
+    k8s = FakeK8sClient(
+        [
+            PodRecord("serve-leak", "dsqwen-7b", "node-a", "2", state="sleeping", pod_ip="10.0.0.3", routable=True),
+        ]
+    )
+    prober = FakeProber({"serve-leak": True})
+    writer = FakeLabelWriter()
+
+    result = reconcile_state(
+        topology(),
+        store,
+        k8s,
+        gpu_truth=FakeGpuTruth({("node-a", "GPU-2"): 39000}),
+        sleep_leak_used_mib=8192,
+        prober=prober,
+        label_writer=writer,
+    )
+
+    assert writer.calls == [("serve-leak", False)]
+    assert any(warning.startswith("sleep_leak:serve-leak:") for warning in result.warnings)
+    # Physical state probed exactly once: reconcile never loops trying to wake a
+    # pod that refuses to converge.
+    assert prober.calls == ["serve-leak"]
+
+
+def test_reconcile_is_idempotent_when_routable_labels_match_physical():
+    store = StateStore(FakeRedis())
+    store.save([], expected_version=0)
+    k8s = FakeK8sClient(
+        [
+            PodRecord("serve-a", "dsqwen-7b", "node-a", "0", state="awake", pod_ip="10.0.0.1", routable=True),
+            PodRecord("serve-b", "dsqwen-7b", "node-a", "2", state="sleeping", pod_ip="10.0.0.2", routable=False),
+        ]
+    )
+    prober = FakeProber({"serve-a": False, "serve-b": True})
+    writer = FakeLabelWriter()
+
+    reconcile_state(topology(), store, k8s, prober=prober, label_writer=writer)
+
+    assert writer.calls == []
+
+
+def test_reconcile_auto_slept_pod_is_driven_non_routable():
+    store = StateStore(FakeRedis())
+    store.save([], expected_version=0)
+    # Two physically-awake pods share GPU 0. The single-awake invariant auto-
+    # sleeps serve-b (Gap B): its routable label must be driven to false.
+    k8s = FakeK8sClient(
+        [
+            PodRecord("serve-a", "dsqwen-7b", "node-a", "0", state="awake", pod_ip="10.0.0.1", routable=True),
+            PodRecord("serve-b", "dsqwen-7b", "node-a", "0", state="awake", pod_ip="10.0.0.2", routable=True),
+        ]
+    )
+    prober = FakeProber({"serve-a": False, "serve-b": False})
+    writer = FakeLabelWriter()
+
+    result = reconcile_state(topology(), store, k8s, prober=prober, label_writer=writer)
+
+    assert writer.calls == [("serve-b", False)]
+    bindings = {binding.serve_id: binding for binding in result.bindings}
+    assert bindings["serve-a"].awake is True
+    assert bindings["serve-b"].awake is False
+    assert any("auto-slept" in warning for warning in result.warnings)

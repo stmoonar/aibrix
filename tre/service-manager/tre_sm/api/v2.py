@@ -23,6 +23,8 @@ class RuntimePodOps(Protocol):
 
     def write_binding_annotations(self, binding: Binding, *, state: str) -> None: ...
 
+    def set_pod_routable(self, serve_id: str, *, routable: bool) -> None: ...
+
     def wait_pod_unroutable(self, binding: Binding): ...
 
     def ensure_model_httproute(self, model: str): ...
@@ -40,6 +42,21 @@ class VllmRuntimeOps(Protocol):
     def sleep(self, pod_ip: str, *, port: int | None = None): ...
 
     def wake_up(self, pod_ip: str, *, port: int | None = None): ...
+
+    def is_sleeping(self, pod_ip: str, *, port: int | None = None) -> bool | None: ...
+
+
+class _VllmPodProber:
+    """Adapt VllmRuntimeOps.is_sleeping to the reconcile PodPhysicalProber."""
+
+    def __init__(self, vllm_ops: VllmRuntimeOps) -> None:
+        self._vllm_ops = vllm_ops
+
+    def is_sleeping(self, pod) -> bool | None:
+        pod_ip = getattr(pod, "pod_ip", None)
+        if not pod_ip:
+            return None
+        return self._vllm_ops.is_sleeping(pod_ip, port=8000)
 
 class ServiceManagerV2:
     def __init__(
@@ -241,12 +258,20 @@ class ServiceManagerV2:
     def reconcile(self) -> dict:
         if self._k8s_client is None:
             raise ValueError("k8s_client is required for reconcile")
+        prober = None
+        if self._vllm_ops is not None and hasattr(self._vllm_ops, "is_sleeping"):
+            prober = _VllmPodProber(self._vllm_ops)
+        label_writer = None
+        if self._runtime_ops is not None and hasattr(self._runtime_ops, "set_pod_routable"):
+            label_writer = self._runtime_ops
         result = reconcile_state(
             self._registry.topology(),
             self._store,
             self._k8s_client,
             gpu_truth=self._gpu_truth,
             sleep_leak_used_mib=self._sleep_leak_used_mib,
+            prober=prober,
+            label_writer=label_writer,
         )
         return {
             "version": result.version,

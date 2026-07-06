@@ -21,6 +21,7 @@ class K8sPodSnapshot:
     env: Mapping[str, str]
     annotations: Mapping[str, str] = field(default_factory=dict)
     pod_ip: str | None = None
+    routable: bool | None = None
 
 
 def pod_records_from_snapshots(
@@ -42,6 +43,8 @@ def pod_records_from_snapshots(
                 node=snapshot.node,
                 cuda_visible_devices=gpu_ids,
                 state=snapshot.annotations.get(STATE_ANNOTATION, POD_STATE_AWAKE),
+                pod_ip=snapshot.pod_ip,
+                routable=snapshot.routable,
             )
         )
 

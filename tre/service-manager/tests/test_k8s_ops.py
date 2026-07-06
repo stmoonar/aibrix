@@ -419,3 +419,32 @@ def registry():
             )
         ],
     )
+
+
+def test_k8s_ops_captures_routable_label_in_snapshot():
+    api = FakeK8sApi(
+        [pod_dict("serve-a", "dsqwen-7b", "node-a", "0", labels={"tre.aibrix.io/routable": "true"})]
+    )
+    ops = K8sOps(api=api, namespace="default")
+
+    snapshots = ops.list_pod_snapshots()
+
+    assert snapshots[0].routable is True
+
+
+def test_k8s_ops_snapshot_routable_is_none_when_label_absent():
+    api = FakeK8sApi([pod_dict("serve-a", "dsqwen-7b", "node-a", "0")])
+    ops = K8sOps(api=api, namespace="default")
+
+    assert ops.list_pod_snapshots()[0].routable is None
+
+
+def test_k8s_ops_set_pod_routable_patches_only_the_label():
+    api = FakeK8sApi([])
+    ops = K8sOps(api=api, namespace="tre-v2")
+
+    ops.set_pod_routable("serve-a", routable=False)
+
+    assert api.patches == [
+        ("serve-a", "tre-v2", {"metadata": {"labels": {"tre.aibrix.io/routable": "false"}}})
+    ]

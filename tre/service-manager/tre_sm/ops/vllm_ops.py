@@ -42,6 +42,25 @@ class VllmOps:
     def wake_up(self, pod_ip: str, *, port: int | None = None) -> VllmOpResult:
         return self._post(pod_ip, "wake_up", port=port)
 
+    def is_sleeping(self, pod_ip: str, *, port: int | None = None) -> bool | None:
+        """Physical /is_sleeping probe (OBSERVED ground truth).
+
+        Returns True/False for the physical sleep state, or None when the
+        pod is unreachable or returns an undecodable/non-2xx response.
+        """
+        url = f"http://{pod_ip}:{port or self._default_port}/is_sleeping"
+        try:
+            response = self._http.get(url, timeout=self._timeout_s)
+        except Exception:  # pragma: no cover - exact transport exceptions vary.
+            return None
+        try:
+            status = int(response.status_code)
+        except Exception:
+            return None
+        if not (200 <= status < 300):
+            return None
+        return _parse_is_sleeping(response)
+
     def wait_until_ready(
         self,
         pod_ip: str,
@@ -127,6 +146,31 @@ class VllmOps:
             status_code=last_status,
             message=last_message,
         )
+
+
+def _parse_is_sleeping(response) -> bool | None:
+    payload = None
+    json_method = getattr(response, "json", None)
+    if callable(json_method):
+        try:
+            payload = json_method()
+        except Exception:
+            payload = None
+    if payload is None:
+        text = (getattr(response, "text", "") or "").strip()
+        if not text:
+            return None
+        import json as _json
+
+        try:
+            payload = _json.loads(text)
+        except Exception:
+            return None
+    if isinstance(payload, bool):
+        return payload
+    if isinstance(payload, dict) and "is_sleeping" in payload:
+        return bool(payload["is_sleeping"])
+    return None
 
 
 class _RequestsTransport:

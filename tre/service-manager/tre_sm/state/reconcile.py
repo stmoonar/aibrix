@@ -24,6 +24,11 @@ class PodRecord:
     node: str
     cuda_visible_devices: str
     state: str = POD_STATE_AWAKE
+    # pod_ip lets the physical prober reach the vLLM /is_sleeping endpoint.
+    pod_ip: str | None = None
+    # routable mirrors the current tre.aibrix.io/routable label (write-through
+    # cache) so Layer 1 can patch-on-diff rather than unconditionally.
+    routable: bool | None = None
 
     def to_binding(self) -> Binding:
         if self.state not in _VALID_POD_STATES:
@@ -41,6 +46,22 @@ class K8sPodClient(Protocol):
     def list_pods(self) -> list[PodRecord]: ...
 
 
+class PodPhysicalProber(Protocol):
+    """Physical /is_sleeping probe: OBSERVED ground truth.
+
+    Returns True if the pod is physically sleeping, False if physically awake,
+    and None when the physical state cannot be determined (unreachable pod).
+    """
+
+    def is_sleeping(self, pod: PodRecord) -> bool | None: ...
+
+
+class RoutableLabelWriter(Protocol):
+    """Write-path for the tre.aibrix.io/routable label (Layer 1 enforcement)."""
+
+    def set_pod_routable(self, serve_id: str, *, routable: bool) -> None: ...
+
+
 @dataclass(frozen=True)
 class ReconcileResult:
     version: int
@@ -56,14 +77,25 @@ def reconcile_state(
     *,
     gpu_truth: GpuTruthProvider | None = None,
     sleep_leak_used_mib: int = 8192,
+    prober: PodPhysicalProber | None = None,
+    label_writer: RoutableLabelWriter | None = None,
 ) -> ReconcileResult:
     persisted = store.load()
     persisted_by_serve = {binding.serve_id: binding for binding in persisted.bindings}
     reconciled_by_serve: dict[str, Binding] = {}
     warnings: list[str] = []
 
-    for pod in sorted(k8s_client.list_pods(), key=lambda item: item.serve_id):
+    observed = list(k8s_client.list_pods())
+    observed_by_serve = {pod.serve_id: pod for pod in observed}
+
+    for pod in sorted(observed, key=lambda item: item.serve_id):
         binding = pod.to_binding()
+        # Physical /is_sleeping is OBSERVED ground truth and wins over the
+        # tre.aibrix.io/state annotation, which is only a write-through cache.
+        if prober is not None:
+            sleeping = prober.is_sleeping(pod)
+            if sleeping is not None:
+                binding = replace(binding, awake=not sleeping)
         previous = persisted_by_serve.get(binding.serve_id)
         if previous is not None and previous != binding:
             warnings.append(f"{binding.serve_id}: pod reality overrides persisted binding")
@@ -91,6 +123,14 @@ def reconcile_state(
     bindings = _auto_sleep_awake_conflicts([reconciled_by_serve[serve_id] for serve_id in sorted(reconciled_by_serve)], warnings)
     if gpu_truth is not None:
         warnings.extend(_sleep_leak_warnings(topology, bindings, gpu_truth, sleep_leak_used_mib))
+
+    # Layer 1 (SAFETY INVARIANT): re-assert routable = physical-awake AND not
+    # hidden onto every observed pod, patch-on-diff (idempotent). This never
+    # loops: a pod that refuses to converge (leak) is simply left non-routable
+    # and surfaced via the sleep_leak warning above (D8 leak candidate).
+    if label_writer is not None:
+        _enforce_routable_labels(bindings, observed_by_serve, label_writer)
+
     allocator = SlotAllocator(topology, bindings)
     if bindings == persisted.bindings:
         return ReconcileResult(
@@ -102,6 +142,22 @@ def reconcile_state(
 
     version = store.save(bindings, expected_version=persisted.version)
     return ReconcileResult(version=version, bindings=bindings, warnings=warnings, allocator=allocator)
+
+
+def _enforce_routable_labels(
+    bindings: list[Binding],
+    observed_by_serve: dict[str, PodRecord],
+    label_writer: RoutableLabelWriter,
+) -> None:
+    for binding in bindings:
+        pod = observed_by_serve.get(binding.serve_id)
+        if pod is None:
+            # No live pod observation -> nothing to re-assert.
+            continue
+        desired_routable = binding.awake and not binding.hidden
+        if pod.routable == desired_routable:
+            continue
+        label_writer.set_pod_routable(binding.serve_id, routable=desired_routable)
 
 
 def _parse_cuda_visible_devices(value: str) -> tuple[int, ...]:

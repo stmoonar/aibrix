@@ -112,6 +112,7 @@ class K8sOps:
             model_name = labels.get(MODEL_LABEL)
             if not model_name:
                 continue
+            routable = _parse_routable(labels.get(ROUTABLE_LABEL))
             annotations = dict(metadata.get("annotations") or {})
             if GPU_IDS_ANNOTATION not in annotations and labels.get(GPU_IDS_ANNOTATION):
                 annotations[GPU_IDS_ANNOTATION] = str(labels[GPU_IDS_ANNOTATION])
@@ -123,6 +124,7 @@ class K8sOps:
                     env=_container_env(pod),
                     annotations=annotations,
                     pod_ip=_optional_field(_status(pod), "podIP", "pod_ip"),
+                    routable=routable,
                 )
             )
         return sorted(snapshots, key=lambda item: item.name)
@@ -140,6 +142,10 @@ class K8sOps:
             }
         }
         self._api.patch_namespaced_pod(name=binding.serve_id, namespace=self._namespace, body=body)
+
+    def set_pod_routable(self, serve_id: str, *, routable: bool) -> None:
+        body = {"metadata": {"labels": {ROUTABLE_LABEL: "true" if routable else "false"}}}
+        self._api.patch_namespaced_pod(name=serve_id, namespace=self._namespace, body=body)
 
     def wait_pod_unroutable(self, binding: Binding, *, timeout_s: float = 30.0, interval_s: float = 0.5) -> None:
         deadline = time.monotonic() + timeout_s
@@ -291,6 +297,17 @@ def _items(value):
     if items is not None:
         return list(items)
     return list(value)
+
+
+def _parse_routable(value) -> bool | None:
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if text == "true":
+        return True
+    if text == "false":
+        return False
+    return None
 
 
 def _is_not_found(exc: Exception) -> bool:

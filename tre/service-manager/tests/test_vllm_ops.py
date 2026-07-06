@@ -57,3 +57,44 @@ def test_vllm_ops_reports_failure_after_exhausting_attempts():
     assert result.status_code == 503
     assert result.attempts == 2
     assert result.message == "busy"
+
+
+class FakeGetHttp:
+    def __init__(self, response):
+        self._response = response
+        self.calls = []
+
+    def get(self, url, *, timeout):
+        self.calls.append((url, timeout))
+        if isinstance(self._response, Exception):
+            raise self._response
+        return self._response
+
+    def post(self, url, *, timeout):  # pragma: no cover - defensive
+        raise AssertionError("is_sleeping must not POST")
+
+
+def test_vllm_ops_is_sleeping_parses_json_object_true():
+    http = FakeGetHttp(FakeResponse(200, '{"is_sleeping": true}'))
+    ops = VllmOps(http=http)
+
+    assert ops.is_sleeping("10.0.0.9") is True
+    assert http.calls == [("http://10.0.0.9:8000/is_sleeping", 5.0)]
+
+
+def test_vllm_ops_is_sleeping_parses_bare_boolean_false():
+    ops = VllmOps(http=FakeGetHttp(FakeResponse(200, "false")))
+
+    assert ops.is_sleeping("10.0.0.9", port=18000) is False
+
+
+def test_vllm_ops_is_sleeping_returns_none_on_non_2xx():
+    ops = VllmOps(http=FakeGetHttp(FakeResponse(503, "busy")))
+
+    assert ops.is_sleeping("10.0.0.9") is None
+
+
+def test_vllm_ops_is_sleeping_returns_none_on_transport_error():
+    ops = VllmOps(http=FakeGetHttp(TimeoutError("boom")))
+
+    assert ops.is_sleeping("10.0.0.9") is None
