@@ -329,8 +329,7 @@ function renderParamsBar() {
   const wrap = el('div', 'restart-strip' + (pend ? ' pending' : ''));
   wrap.appendChild(el('span', null, pend ? '⚠ Edited params are saved but NOT applied — restart the controller to load them.' : 'Params in sync with the running controller.'));
   const btn = el('button', 'btn ' + (pend ? 'primary' : ''), 'Restart controller');
-  btn.disabled = !pend;
-  btn.onclick = restartController;
+  btn.onclick = restartController;  // always allowed; restarting is safe
   wrap.appendChild(btn);
   const status = el('span', 'sub', ''); status.id = 'rollout-status'; wrap.appendChild(status);
   bar.appendChild(wrap);

@@ -208,20 +208,21 @@ def test_get_params_view_and_pending_restart() -> None:
 def test_put_params_validates_writes_and_restart_flow() -> None:
     k8s = FakeK8s()
     client, _ = _client(k8s)
+    # first read seeds the applied baseline -> in sync
+    assert client.get("/api/params").json()["pending_restart"] is False
     # invalid: out of bounds -> 422, no write
     bad = client.put("/api/params", json={"models": {"m1": {"trs": {"tau_crit": 9.9}}}})
     assert bad.status_code == 422
     assert k8s.cm["metadata"]["resourceVersion"] == "100"
-    # valid edit -> CM rewritten, rv bumped
+    # valid edit -> CM rewritten, rv bumped, and now pending a restart
     ok = client.put("/api/params", json={"expected_resource_version": "100", "models": {"m1": {"trs": {"theta_m": 800.0}}}})
     assert ok.status_code == 200
     assert "800.0" in k8s.cm["data"]["registry.yaml"]
+    assert ok.json()["pending_restart"] is True
     # stale rv -> 409
     stale = client.put("/api/params", json={"expected_resource_version": "100", "models": {"m1": {"trs": {"theta_m": 810.0}}}})
     assert stale.status_code == 409
-    # after edit, applied hash (none) != current -> pending_restart True
-    assert client.get("/api/params").json()["pending_restart"] is False  # still no annotation
-    # restart stamps the hash annotation -> pending clears
+    # restart stamps the hash annotation + applied baseline -> pending clears
     r = client.post("/api/ops/controller/restart", json={"reason": "apply theta"})
     assert r.status_code == 200 and r.json()["ok"] is True
     assert k8s.patches and "tre.dev/params-hash" in k8s.patches[0]["spec"]["template"]["metadata"]["annotations"]

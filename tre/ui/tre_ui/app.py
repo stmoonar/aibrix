@@ -24,6 +24,7 @@ _REGISTRY_CM = "tre-v2-registry"
 _CONTROLLER_DEPLOY = "tre-v2-controller"
 _HASH_ANNOTATION = "tre.dev/params-hash"
 _PARAMS_AUDIT_KEY = "tre:v2:audit:params"
+_PARAMS_APPLIED_KEY = "tre:v2:ui:params-applied-hash"
 
 
 class RedisClient(Protocol):
@@ -191,12 +192,19 @@ def create_ui_app(
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(status_code=502, detail=f"kubernetes read failed: {exc}") from exc
         current_hash = _hash(registry_yaml)
-        applied = _template_annotations(deploy).get(_HASH_ANNOTATION)
+        # "Applied" hash is tracked in Redis (UI-writable, no extra RBAC) and seeded to the
+        # current config on first read, so a fresh deploy reads as in-sync and the first edit
+        # correctly flips to pending. The controller restart also stamps it.
+        applied = _get_applied_hash(redis_client)
+        if applied is None:
+            _set_applied_hash(redis_client, current_hash)
+            applied = current_hash
         return {
             "models": params_mod.build_view(registry_yaml),
             "resource_version": rv,
             "params_hash": current_hash,
-            "pending_restart": applied is not None and applied != current_hash,
+            "applied_hash": applied,
+            "pending_restart": applied != current_hash,
             "last_restart": {k: v for k, v in _template_annotations(deploy).items() if k.startswith("tre.dev/")},
         }
 
@@ -241,6 +249,7 @@ def create_ui_app(
             deploy = client.patch_deployment(_CONTROLLER_DEPLOY, patch)
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(status_code=502, detail=f"restart failed: {exc}") from exc
+        _set_applied_hash(redis_client, _hash(registry_yaml))
         return {"ok": True, "generation": (deploy.get("metadata") or {}).get("generation"), "restarted_at": now}
 
     @app.get("/api/ops/controller/rollout")
@@ -355,6 +364,21 @@ def _rollout_state(deploy: dict) -> dict[str, Any]:
         state = "progressing"
     return {"state": state, "ready_replicas": ready, "desired": desired,
             "message": progressing.get("message", ""), "observed_generation": status.get("observedGeneration")}
+
+
+def _get_applied_hash(redis_client: Any) -> str | None:
+    try:
+        raw = redis_client.get(_PARAMS_APPLIED_KEY)
+    except Exception:  # noqa: BLE001
+        return None
+    return raw.decode() if isinstance(raw, bytes) else raw
+
+
+def _set_applied_hash(redis_client: Any, value: str) -> None:
+    try:
+        redis_client.set(_PARAMS_APPLIED_KEY, value)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _record_audit(redis_client: Any, entry: dict) -> None:
