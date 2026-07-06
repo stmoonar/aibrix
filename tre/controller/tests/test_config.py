@@ -21,6 +21,7 @@ def test_config_defaults_are_plan_aligned() -> None:
     assert config.metrics_window_mode == "sliding"
     assert config.instant_sample_interval_ms == 5_000
     assert config.histogram_lookback_ms == 90_000
+    assert config.min_latency_samples == 10
     assert config.percentile_mode == "bucket_upper"
     assert config.signal_source == "zm"
     assert config.paper_stale_max_windows == 3

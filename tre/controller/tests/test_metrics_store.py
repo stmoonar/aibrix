@@ -157,6 +157,38 @@ def test_metrics_store_sliding_reads_do_not_grow_window_cache():
     assert len(store._window_cache) == 0
 
 
+def test_metrics_store_min_latency_samples_nulls_noisy_p95():
+    # N1: with fewer than min_latency_samples latency observations in a window, p95 is
+    # too noisy -> None (not 0), so the signal/safescale layer treats it as unavailable.
+    redis = FakeRedis()
+    pod = "default/pod-a"
+    redis.sadd("tre:v2:pods:dsqwen-7b", pod)
+    # ttft count delta = 5 - 2 = 3 observations in the window (< guard 10).
+    add_doc(redis, "tre:v2:hist:" + pod, 1_000, hist_doc("pod-a", 10, 1, 1.0, 2, {"0.1": 1, "0.5": 2}))
+    add_doc(redis, "tre:v2:hist:" + pod, 11_000, hist_doc("pod-a", 70, 2, 3.0, 5, {"0.1": 2, "0.5": 5}))
+    registry = load_registry(str(REGISTRY_PATH))
+
+    guarded = MetricsStore(redis, registry, instant_sample_interval_ms=5_000, min_latency_samples=10)
+    assert guarded.read_model_window("dsqwen-7b", 1_000, 11_000).ttft_p95_ms is None
+
+    # Guard disabled (default 0) -> the same sparse window still yields a p95 value.
+    unguarded = MetricsStore(redis, registry, instant_sample_interval_ms=5_000)
+    assert unguarded.read_model_window("dsqwen-7b", 1_000, 11_000).ttft_p95_ms is not None
+
+
+def test_metrics_store_p95_present_when_enough_samples_with_guard():
+    redis = FakeRedis()
+    pod = "default/pod-a"
+    redis.sadd("tre:v2:pods:dsqwen-7b", pod)
+    # ttft count delta = 15 - 2 = 13 observations (>= guard 10) -> p95 computed.
+    add_doc(redis, "tre:v2:hist:" + pod, 1_000, hist_doc("pod-a", 10, 1, 1.0, 2, {"0.1": 1, "0.5": 2}))
+    add_doc(redis, "tre:v2:hist:" + pod, 11_000, hist_doc("pod-a", 70, 2, 9.0, 15, {"0.1": 6, "0.5": 15}))
+    registry = load_registry(str(REGISTRY_PATH))
+
+    guarded = MetricsStore(redis, registry, instant_sample_interval_ms=5_000, min_latency_samples=10)
+    assert guarded.read_model_window("dsqwen-7b", 1_000, 11_000).ttft_p95_ms is not None
+
+
 def test_metrics_store_reads_v1_legacy_keys_without_pod_set():
     redis = FakeRedis()
     pod = "default/pod-a"

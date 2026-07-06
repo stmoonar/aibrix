@@ -45,6 +45,7 @@ class ControllerConfig:
     metrics_window_mode: str
     instant_sample_interval_ms: int
     histogram_lookback_ms: int
+    min_latency_samples: int
     percentile_mode: str
     signal_source: str
     paper_stale_max_windows: int
@@ -121,6 +122,7 @@ class ControllerConfig:
             metrics_window_mode=metrics_window_mode,
             instant_sample_interval_ms=_get_positive_int(values, "TRE_INSTANT_SAMPLE_INTERVAL_MS", 5_000),
             histogram_lookback_ms=_get_nonneg_int(values, "TRE_HIST_BASELINE_LOOKBACK_MS", 90_000),
+            min_latency_samples=_get_nonneg_int(values, "TRE_MIN_LATENCY_SAMPLES", 10),
             percentile_mode=percentile_mode,
             signal_source=signal_source,
             paper_stale_max_windows=_get_positive_int(values, "TRE_PAPER_STALE_MAX_WINDOWS", 3),

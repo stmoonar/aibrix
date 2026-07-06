@@ -2124,3 +2124,26 @@ make check 311 passed; kustomize build OK. Single snapshot_box preserved (NO fas
 Pending in S1.2: (a) N1 min-sample p95 guard (next commit); (b) REAL-MACHINE acceptance to
 FREEZE W (roll controller with sliding/30s/5s, lag P95<=35s, Z_m jitter stddev) — deferred to a
 live session; HARD prerequisite for S1.4/R3. Controller PAUSED.
+
+### Signal Plan N1 — min-sample guard for p95 latency DONE (offline) 2026-07-06
+
+make check 313; kustomize OK. Short windows + low QPS can leave single-digit latency
+samples -> a p95 estimate is just noise. Guard nulls it.
+- metrics_store.py: MetricsStore(min_latency_samples: int = 0). In _hist_percentile, if
+  the window count delta (last.count - first.count) < min_latency_samples -> return None
+  (per-pod; _aggregate_models _max_optional ignores None, so pods with enough samples
+
+### Signal Plan N1 — min-sample guard for p95 latency DONE (offline) 2026-07-06
+
+make check 313; kustomize OK. Short windows + low QPS can leave single-digit latency
+samples so a p95 estimate is just noise. The guard nulls it.
+- metrics_store.py: MetricsStore gains min_latency_samples (default 0). In _hist_percentile,
+  when the window count delta (last.count minus first.count) is below min_latency_samples,
+  return None (per-pod; _aggregate_model's _max_optional ignores None, so pods with enough
+  samples still contribute). Default 0 = OFF so existing store tests stay green; live enables it.
+- config.py: min_latency_samples (env TRE_MIN_LATENCY_SAMPLES, default 10); app.py wires it
+  into MetricsStore. controller.yaml overlay sets 10.
+- Tests: sparse window (3 samples) -> ttft_p95 None with guard, value with guard off; window
+  with 13 samples -> value with guard on. config default 10.
+
+Threshold 10 rejects single-digit counts (doc N1 framing); revisit at S1.2 real-machine acceptance.

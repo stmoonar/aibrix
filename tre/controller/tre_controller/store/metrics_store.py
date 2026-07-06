@@ -37,11 +37,14 @@ class MetricsStore:
         percentile_mode: str = "bucket_upper",
         schema: str = "v2",
         histogram_lookback_ms: int = 90_000,
+        min_latency_samples: int = 0,
     ) -> None:
         if instant_sample_interval_ms <= 0:
             raise ValueError("instant_sample_interval_ms must be positive")
         if histogram_lookback_ms < 0:
             raise ValueError("histogram_lookback_ms must be non-negative")
+        if min_latency_samples < 0:
+            raise ValueError("min_latency_samples must be non-negative")
         if schema not in {"v1", "v2"}:
             raise ValueError("schema must be v1 or v2")
         self._redis = redis_client
@@ -50,6 +53,10 @@ class MetricsStore:
         self._percentile_mode = percentile_mode
         self._schema = schema
         self._histogram_lookback_ms = histogram_lookback_ms
+        # N1: below this many latency observations in a window, a p95 estimate is too
+        # noisy to decide on (short windows + low QPS can have single-digit samples).
+        # 0 disables the guard (default; the live controller sets it from config).
+        self._min_latency_samples = min_latency_samples
         self._window_cache: dict[tuple[str, str, int, int], ModelWindowMetrics] = {}
 
     def read_snapshot(
@@ -272,6 +279,13 @@ class MetricsStore:
         first, last = _first_last_metric(model, metric, docs)
         if first is None or last is None:
             return None
+        if self._min_latency_samples > 0:
+            count_delta = max(0.0, _number(last.get("count"), 0.0) - _number(first.get("count"), 0.0))
+            if count_delta < self._min_latency_samples:
+                # N1: too few observations for a stable p95 -> None (not 0), so the
+                # signal/safescale layer treats the latency metric as unavailable rather
+                # than deciding on noise.
+                return None
         first_buckets = _normal_buckets(first.get("buckets"))
         last_buckets = _normal_buckets(last.get("buckets"))
         if not first_buckets or not last_buckets:

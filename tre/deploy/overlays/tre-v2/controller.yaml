@@ -43,6 +43,10 @@ spec:
             # --- F2 zm read-side fixes (baseline lookback / degrade / EMA hold) ---
             - name: TRE_HIST_BASELINE_LOOKBACK_MS
               value: "90000"
+            # N1: short windows + low QPS can leave single-digit latency samples; below
+            # this count a window's p95 is nulled (unavailable) rather than decided on.
+            - name: TRE_MIN_LATENCY_SAMPLES
+              value: "10"
             - name: TRE_INCOMPLETE_POLICY
               value: drop_model
             - name: TRE_PAPER_STALE_MAX_WINDOWS
