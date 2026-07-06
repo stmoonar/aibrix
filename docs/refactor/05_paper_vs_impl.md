@@ -59,6 +59,42 @@ The migrated SafeScale slice intentionally separates state-machine decisions fro
 
 The old implementation combined probe monitoring, HTTP scale calls, runtime observation capture, and file-backed persistence in one module. P5 records this as an implementation split rather than a formula change: the new state machine emits data-only commands for later queue wiring and accepts an injected store protocol for restart recovery.
 
+### SafeScale window vs the shared metrics window (S1 N2, architect-ruled 2026-07-06)
+
+There are **two distinct, orthogonal windows** and they must not be conflated:
+
+1. `metrics_window_ms` (30s, sliding, ends at now) — the per-observation aggregation
+   history. Each `ProbeObservation` carries ttft/tpot p95 and z_m computed from the
+   single shared `snapshot_box` (same window / theta / EMA as rescue and fairness, ADR-0011).
+2. `SafeScaleConfig.default_window_ms` (60s) — the wall-clock **probe deadline**:
+   `deadline = hide_start + default_window_ms`. safescale_task polls the shared snapshot
+   every `probe_poll_seconds` (2s) and appends an observation each tick.
+
+**Invariant (hard, enforced at startup):**
+`default_window_ms · (1 − hq) ≥ metrics_window_ms`. The commit gate (`_summarize_tail`)
+inspects only the tail (`hq`=0.25 fraction) of observations; those tail observations'
+metrics windows must be **fully post-hide**. At defaults 60000·0.75 = 45000 ≥ 30000
+(margin 15s; refined form including one refresh interval is 45s ≥ 35s). This is enforced
+in `ControllerConfig.from_env` — setting e.g. `SAFE_SCALE_DEFAULT_WINDOW_MS=15000` with a
+30s metrics window now raises, instead of silently diluting the commit gate with pre-hide
+traffic. For `hq ≥ 1` (absolute tail count) the tail span is `hq · probe_poll_seconds`.
+
+**Direction-of-error note:** per-observation `_violates_slo` on the early *blended* windows
+(right after a hide, the sliding 30s window still contains mostly pre-hide traffic) and the
+count-based tail under sparse observations can only ever cause **extra rollbacks, never a
+false commit** (latency is an AND, z_m a min over the tail). Shortening `metrics_window_ms`
+strictly **speeds up** rollback detection — a benefit, not a conflict. No SafeScale logic
+or warmup-discount change was needed for S1; the tail-only gate already excludes the blended
+early observations from the commit decision.
+
+**Dead-config landmine:** `SafeScaleConfig.min_window_ms` (15000) / `max_window_ms` (300000)
+are currently **unused** — only a `min ≤ max` parse check exists; no code path sets a probe
+deadline from them (they are a placeholder for the paper's adaptive probe window). They are
+intentionally NOT guarded at startup (guarding would reject valid current defaults). Whoever
+later wires the adaptive window must make the effective window satisfy the invariant above —
+with current parameters the floor is `metrics_window_ms / (1 − hq)` = 40s, so `min_window_ms`
+= 15000 must be raised (or the clamp re-expressed in terms of `metrics_window_ms`) at that time.
+
 ## Service Manager Client Gap
 
 The controller client now targets service-manager v2 for state, target replicas, and routable hidden pods. Defrag remains an explicit integration gap: the planner and ActionQueue can represent `DefragAction`, but service-manager v2 currently has no `/v2/defrag` endpoint. Until P4/P5 adds that endpoint, controller dispatch returns a structured unsupported result instead of silently pretending the migration ran.

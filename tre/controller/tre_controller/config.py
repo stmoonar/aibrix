@@ -101,6 +101,27 @@ class ControllerConfig:
         if safescale.min_window_ms > safescale.max_window_ms:
             raise ValueError("SAFE_SCALE_MIN_WINDOW_MS must be <= SAFE_SCALE_MAX_WINDOW_MS")
 
+        metrics_window_ms = _get_positive_int(values, "TRE_METRICS_WINDOW_MS", 30_000)
+        # N2 invariant (plan 15 §6 N2, architect-ruled): the SafeScale commit gate only
+        # inspects the tail (hq fraction) of probe observations. Those tail observations'
+        # metrics windows must be fully post-hide, i.e. the probe must run at least one
+        # metrics window past the tail start: default_window_ms - tail_span >= metrics_window_ms.
+        # Guards a future SAFE_SCALE_DEFAULT_WINDOW_MS being set too short for the metrics
+        # window (e.g. 15000 < 30000) from silently diluting the commit gate with pre-hide
+        # traffic. (SafeScaleConfig.min_window_ms=15000 is currently DEAD config — never wired
+        # to a probe deadline — so it is not guarded here; see 05_paper_vs_impl.md.)
+        if safescale.hq < 1.0:
+            tail_span_ms = safescale.hq * safescale.default_window_ms
+        else:
+            tail_span_ms = safescale.hq * safescale.probe_poll_seconds * 1000.0
+        if safescale.default_window_ms - tail_span_ms < metrics_window_ms:
+            raise ValueError(
+                "SAFE_SCALE_DEFAULT_WINDOW_MS minus the commit-gate tail span must be >= "
+                "TRE_METRICS_WINDOW_MS so SafeScale probe tail observations are fully post-hide "
+                f"(default_window_ms={safescale.default_window_ms}, hq={safescale.hq}, "
+                f"metrics_window_ms={metrics_window_ms})"
+            )
+
         return cls(
             redis_url=redis_url,
             metrics_redis_url=_get_str(values, "TRE_METRICS_REDIS_URL", redis_url),
@@ -118,7 +139,7 @@ class ControllerConfig:
             ),
             rescue_interval_s=_get_positive_float(values, "TRE_RESCUE_INTERVAL_SECONDS", 5.0),
             fairness_interval_s=_get_positive_float(values, "TRE_FAIRNESS_INTERVAL_SECONDS", 10.0),
-            metrics_window_ms=_get_positive_int(values, "TRE_METRICS_WINDOW_MS", 30_000),
+            metrics_window_ms=metrics_window_ms,
             metrics_window_mode=metrics_window_mode,
             instant_sample_interval_ms=_get_positive_int(values, "TRE_INSTANT_SAMPLE_INTERVAL_MS", 5_000),
             histogram_lookback_ms=_get_nonneg_int(values, "TRE_HIST_BASELINE_LOOKBACK_MS", 90_000),

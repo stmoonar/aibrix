@@ -2147,3 +2147,31 @@ samples so a p95 estimate is just noise. The guard nulls it.
   with 13 samples -> value with guard on. config default 10.
 
 Threshold 10 rejects single-digit counts (doc N1 framing); revisit at S1.2 real-machine acceptance.
+
+### Signal Plan N2 — safescale window vs shared metrics window RESOLVED (architect Fable5) 2026-07-06
+
+Flagged 记Blocked问架构师. Investigated + consulted architect (background). Ruling: the two
+windows are orthogonal and compatible; NO SafeScale logic change; add ONE startup guard +
+document. make check 314.
+
+Analysis (architect-VERIFIED, 3 refinements): metrics_window_ms (30s sliding) = per-observation
+aggregation history; SafeScaleConfig.default_window_ms (60s) = wall-clock probe deadline
+(deadline = hide_start + 60s). Commit gate _summarize_tail inspects only the tail (hq=0.25) of
+observations; those tail windows are fully post-hide since 60*(1-0.25)=45s >= 30s. Per-observation
+_violates_slo on early blended windows + count-based tail are conservative-only (latency AND /
+z_m min) -> extra rollbacks, never false commit. Shortening the metrics window strictly SPEEDS UP
+rollback detection.
+
+Change (config guard, TDD): ControllerConfig.from_env now enforces
+default_window_ms*(1-hq) >= metrics_window_ms (hq<1: tail=hq*default_window_ms; hq>=1:
+tail=hq*probe_poll_seconds*1000). Rejects e.g. SAFE_SCALE_DEFAULT_WINDOW_MS=15000 with 30s
+metrics window (would silently dilute the gate with pre-hide traffic). RED/GREEN: 15000 & 39999
+reject; 40000 (exact boundary 30000) + defaults load.
+
+Recorded in 05_paper_vs_impl.md (SafeScale section): the two-window model, the hard invariant
+(+ refined +refresh form), the direction-of-error safety note, and the DEAD-CONFIG landmine:
+SafeScaleConfig.min_window_ms=15000 / max_window_ms are UNUSED (placeholder for the paper's
+adaptive probe window; only a min<=max parse check). Not guarded now (would reject valid
+defaults); whoever wires the adaptive window must floor it at metrics_window_ms/(1-hq)=40s.
+
+N3/N4 remain DEFERRED to post-real-machine-acceptance (plan §7 step5, as-needed).

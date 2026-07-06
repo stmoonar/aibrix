@@ -131,6 +131,28 @@ def test_metrics_window_mode_can_be_overridden_and_validated() -> None:
         ControllerConfig.from_env({"TRE_METRICS_WINDOW_MODE": "rolling"})
 
 
+def test_safescale_window_must_cover_metrics_window_post_hide_tail() -> None:
+    # N2 invariant: default_window_ms*(1-hq) >= metrics_window_ms so the commit-gate
+    # tail observations are fully post-hide. hq default 0.25.
+    # 15000*0.75 = 11250 < 30000 -> reject (the exact case the guard exists for).
+    with pytest.raises(ValueError):
+        ControllerConfig.from_env(
+            {"SAFE_SCALE_DEFAULT_WINDOW_MS": "15000", "TRE_METRICS_WINDOW_MS": "30000"}
+        )
+    # Just below the boundary: 39999*0.75 = 29999.25 < 30000 -> reject.
+    with pytest.raises(ValueError):
+        ControllerConfig.from_env(
+            {"SAFE_SCALE_DEFAULT_WINDOW_MS": "39999", "TRE_METRICS_WINDOW_MS": "30000"}
+        )
+    # Exact boundary: 40000*0.75 = 30000 >= 30000 -> loads.
+    cfg = ControllerConfig.from_env(
+        {"SAFE_SCALE_DEFAULT_WINDOW_MS": "40000", "TRE_METRICS_WINDOW_MS": "30000"}
+    )
+    assert cfg.metrics_window_ms == 30_000
+    # Defaults (60000 / hq 0.25 / 30000) load fine.
+    ControllerConfig.from_env({})
+
+
 def test_config_rejects_inverted_safescale_window_bounds() -> None:
     with pytest.raises(ValueError, match="SAFE_SCALE_MIN_WINDOW_MS"):
         ControllerConfig.from_env(
