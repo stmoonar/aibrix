@@ -48,9 +48,13 @@ metadata:
   labels:
     app.kubernetes.io/name: tre-v2-ui
 spec:
+  # NodePort so the console is reachable directly at http://<node-ip>:30812 without a
+  # port-forward (browsed by the researcher operating experiments). tre-v2 only; no base impact.
+  type: NodePort
   selector:
     app.kubernetes.io/name: tre-v2-ui
   ports:
     - name: http
       port: 8000
       targetPort: 8000
+      nodePort: 30812
