@@ -112,7 +112,7 @@ The D7 canary in N4b.3 is mandatory before broad rollout: first prove that a no-
 
 ## ADR-0007: F4 base teardown (D11) BLOCKED — aibrix-system is a shared multi-tenant base
 
-- Status: **Blocked / needs architect (human) decision**. Date: 2026-07-06.
+- Status: **Resolved by ADR-0008** (re-scoped to isolated TRE data plane). Original: Blocked / needed architect decision. Date: 2026-07-06.
 - Context: Endgame plan §5 (D11) directs F4.2 to uninstall the AIBrix application
   base in `aibrix-system` and F4.3 to reinstall a clean AIBrix 0.7.0, on the
   premise that "the whole cluster base is a TRE snowflake". Live inspection on
@@ -157,3 +157,50 @@ The D7 canary in N4b.3 is mandatory before broad rollout: first prove that a no-
   NON-destructive validation of that package on the current cluster (gpu-truth
   DaemonSet, ReferenceGrant, regenerated model routes — all additive/idempotent);
   N5 driver tooling (r3_grid.py, reset scripts, 13_experiments_log scaffold).
+
+## ADR-0008: D11 re-scoped — minimal isolated TRE data plane (supersedes F4.2/F4.3 teardown)
+
+- Status: **Accepted** (architect ruling, 2026-07-06). Resolves ADR-0007.
+- Ruling: The D11 "snowflake teardown + AIBrix 0.7.0 reinstall" is **cancelled**.
+  A full side-by-side 0.7.0 base is infeasible (cluster-scoped AIBrix CRDs would
+  schema-upgrade under co-tenants; duplicate controller/webhooks fight over shared
+  CRs) AND unnecessary — TRE consumes NO AIBrix CRs (models are plain Deployments
+  in `default`; the only PodAutoscaler `dsqwen14b-apa` is a dead 49d leftover),
+  keeps its own state on `tre-v2-redis`, and replaces the AIBrix autoscaler. TRE's
+  only couplings to the shared base are (a) the `aibrix-eg` Gateway + shared
+  `aibrix-gateway-plugins` ext-proc (routing + zm metrics) and (b)
+  `TRE_METRICS_REDIS_URL=aibrix-redis-master`.
+- Decision: stand up a **minimal isolated TRE data plane inside the existing
+  `tre-v2` namespace**, mirroring the proven lxt-tenant pattern (own Gateway + own
+  gateway-plugins + own Envoy policies; no CRDs/controller/webhooks/base-redis):
+  1. Gateway `tre-aibrix-eg` (tre-v2, `gatewayClassName: aibrix-eg`,
+     `allowedRoutes.from: Same`).
+  2. `tre-gateway-plugins` Deployment (tre-v2) = pinned TRE gateway-plugins image
+     (`aibrix/gateway-plugins:20260704-0d869b49-nozmq2`), env REDIS_HOST=tre-v2-redis,
+     TRE_REDIS_SCHEMA=dual (+RPM/tracing env); cloned SA/RBAC (list pods/services in default).
+  3. EnvoyExtensionPolicy `tre-gateway-plugins-extension-policy` -> tre-aibrix-eg,
+     ext-proc backend tre-gateway-plugins; clone lxt's epp + circuit-breaker patch
+     policies with `tre-` prefix.
+  4. Parameterize `gen_model_manifests.py` gateway ns/name (defaults
+     tre-v2/tre-aibrix-eg); regenerate model HTTPRoutes into tre-v2; ReferenceGrant
+     in default allows `from: tre-v2`.
+  5. Retarget SM/controller env: TRE_ROUTE_NAMESPACE=tre-v2,
+     TRE_GATEWAY_NAME=tre-aibrix-eg, TRE_METRICS_REDIS_URL=redis://tre-v2-redis:6379/0.
+  6. Skip metadata-service (models-endpoint route only; add later if a driver needs /v1/models).
+- Migration (each phase reversible):
+  - **Phase A** additive: deploy Gateway + gateway-plugins + policies + new routes;
+    old path keeps serving; smoke 20/20 per model through the new envoy + zm keys in tre-v2-redis.
+  - **Phase B** cutover: roll SM/controller env to new targets; verify sleep round-trip,
+    reconcile warnings=[], route-guard on new routes; point N5 drivers at new gateway.
+  - **Phase C** cleanup (after >=24h stable): delete ONLY the 3 TRE model HTTPRoutes
+    in aibrix-system. Touch nothing else there; do NOT revert the shared
+    gateway-plugins image (co-tenants now depend on its current behavior; documented here).
+- Fallback: if tre-gateway-plugins hard-requires an un-clonable base component
+  (no evidence — lxt runs standalone), fall back to ADR-0007 Option 2 (shared base
+  + caveat). Option 3 (maintenance window) rejected.
+- N5 impact: "clean base" claim re-scoped to TRE's own data path (model pods +
+  tre-aibrix-eg envoy + tre-gateway-plugins@digest + tre-v2-redis + controller/SM),
+  a STRONGER reproducibility + traffic-isolation claim. F4.4 authoritative N4b =
+  rerun N4.2/N4.4/N4.6 + 12h soak on the new path after Phase B, then tag n4b-done.
+  V_static runs through the identical data plane (only controller policy differs).
+  R1 old-system stays prior-work/secondary; old env now survives (no teardown).
