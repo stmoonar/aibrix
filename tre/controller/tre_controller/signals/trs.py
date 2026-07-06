@@ -275,10 +275,22 @@ class SignalState:
     fairness share it), per the "one window, one theta, one EMA" contract.
 
     In-process only: on controller restart the EMA re-seeds from raw within ~tau.
+
+    Also tracks a per-model **traffic-onset** cursor for the F-onset warmup guard
+    (see ``observe_traffic``): at load onset the sliding window is still filling with
+    traffic, so TRS is structurally low (window-fill fraction) and z_m dips falsely
+    CRITICAL. The guard suppresses receiver (CRITICAL/LOW) scale-ups until the window
+    lies fully inside the traffic period, with a saturation bypass in the planner so a
+    genuine flash crowd is still honoured. In-process only, like the EMA: after a
+    restart mid-traffic, one window of receiver-suppression (unless saturated).
     """
 
-    def __init__(self) -> None:
+    def __init__(self, warmup_ms: int = -1) -> None:
         self._by_model: dict[str, TRSComputer] = {}
+        # warmup_ms: -1 = auto (window fully inside traffic period), 0 = disabled
+        # (pre-fix behaviour, for A/B ablation), >0 = explicit span since onset.
+        self._warmup_ms = warmup_ms
+        self._onset_ms: dict[str, int | None] = {}
 
     def computer_for(self, model: str, *, ema_alpha: float, ema_tau_ms: float | None) -> TRSComputer:
         computer = self._by_model.get(model)
@@ -286,3 +298,26 @@ class SignalState:
             computer = TRSComputer(ema_alpha=ema_alpha, ema_tau_ms=ema_tau_ms)
             self._by_model[model] = computer
         return computer
+
+    def observe_traffic(
+        self, model: str, *, has_traffic: bool, window_start_ms: int, window_end_ms: int
+    ) -> bool:
+        """Return whether ``model``'s signal is 'warm' (trustworthy on the low side).
+
+        Records the traffic-onset window_end on the first traffic-bearing tick; resets
+        on an idle (no-traffic) tick. Warm iff the current sliding window no longer
+        straddles the onset. Idempotent under the duplicate-window_end re-reads the
+        rescue/fairness/safescale loops do (mirrors the EMA per-window dedup)."""
+        if self._warmup_ms == 0:
+            return True  # disabled
+        if not has_traffic:
+            self._onset_ms[model] = None
+            return True  # idle -> UNKNOWN, nothing to warm up for
+        onset = self._onset_ms.get(model)
+        if onset is None:
+            onset = window_end_ms
+            self._onset_ms[model] = onset
+        if self._warmup_ms < 0:
+            # auto: warm once the whole window lies inside the traffic period.
+            return window_start_ms >= onset
+        return (window_end_ms - onset) >= self._warmup_ms

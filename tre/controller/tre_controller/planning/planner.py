@@ -121,6 +121,24 @@ def build_plan(
         events.extend(f"paper_state_incomplete_drop:{model}" for model in incomplete_models)
         classifications = [item for item in classifications if item.model_name not in incomplete_models]
 
+    # F-onset warmup guard: a receiver (CRITICAL/LOW) whose signal is not yet 'warm'
+    # (the sliding window still straddles this model's traffic onset -> TRS structurally
+    # low -> false CRITICAL/LOW) is suppressed for this tick, UNLESS it is genuinely
+    # saturated (Q_ctl >= qsat) -- the saturation bypass keeps a real flash crowd honoured.
+    # Applies to both receiver states, so it is consistent across rescue and fairness.
+    warmup_suppressed: list[str] = []
+    kept: list = []
+    for item in classifications:
+        if item.role == ModelRole.RECEIVER:
+            ctx = model_contexts.get(item.model_name, {})
+            if not ctx.get("signal_warm", True) and not ctx.get("is_saturated", False):
+                warmup_suppressed.append(item.model_name)
+                continue
+        kept.append(item)
+    if warmup_suppressed:
+        events.extend(f"receiver_suppressed_signal_warmup:{model}" for model in warmup_suppressed)
+        classifications = kept
+
     critical_receivers = [item for item in classifications if item.state == ModelState.CRITICAL]
     low_receivers = [item for item in classifications if item.state == ModelState.LOW]
     high_models = [item for item in classifications if item.state == ModelState.HIGH]

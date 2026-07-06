@@ -145,7 +145,7 @@ def create_controller_dependencies(
         decision_writer=DecisionSnapshotWriter(redis_client),
         safescale=safescale,
         registry=registry,
-        signal_state=SignalState(),
+        signal_state=SignalState(warmup_ms=cfg.signal_warmup_ms),
     )
 
 

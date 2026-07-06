@@ -372,3 +372,40 @@ Sequencing per ADR-0008/0009: (isolated plane Phases A/B done) -> F4.4 authorita
 (N4.2/N4.4/N4.6 + 12h soak on the isolated path) -> n4b-done -> R3 (with S1.2 W-freeze + S2/S3,
 S4 raw-logging first) -> R7/R2/R4/R5. Phase C (delete the 3 old aibrix-system model routes) after
 >=24h stable, touching nothing else in the shared base.
+
+## ADR-0013: F-onset traffic-warmup guard (suppress false-CRITICAL over-scale at load onset)
+
+- Status: **Accepted** (2026-07-06). Architect (Fable5) ruling after the S1 shakedown caught it live.
+- Problem (verified live + in code): on a 1 req/s trickle, dsqwen-7b over-scaled 1->3 in ~20s. At load
+  onset the sliding 30s window is still filling with traffic, so the per-window token sum (TRS numerator)
+  ramps linearly from 0 over one window; in the low-concurrency regime Q clamps at qmin=1.0 so
+  TRS = Y/qmin is *exactly proportional to window-fill fraction* -> z_m dips falsely CRITICAL for
+  ~ceil(0.31*W/refresh) ticks, and the unthrottled 5s rescue fired 4 spurious scale-ups before the
+  signal stabilized. Deterministic and structural — would fire at every load ramp in R2/R4/R5, inflating
+  the reported "avg awake replicas" and "switching count".
+- Decision: **traffic-warmup guard with a saturation bypass.** (Rejected: (b) hysteresis — needs K>=5-6
+  ticks, delays *every* genuine CRITICAL ~30s; (c) N4 cooldown — doesn't stop the first wrong scale-up
+  nor fix the root cause. Both blunt or under-fix.)
+  - State in `SignalState` (`signals/trs.py`) — the one per-model object already shared across
+    rescue/fairness/safescale. `observe_traffic(model, has_traffic, window_start_ms, window_end_ms)`:
+    records the traffic-onset window_end on first traffic; resets on an idle tick; **warm iff the window
+    lies fully inside the traffic period** (`window_start_ms >= onset`). Auto-sized from the window bounds
+    -> tracks the W=30000->25000 trim at F4.3 with zero re-tuning. Idempotent under duplicate-window reads.
+  - Plumbed via `loops/tick.py::_model_contexts` -> `context["signal_warm"]` (True when `signal_state`
+    is None -> golden/offline byte-identical).
+  - Enforced at one choke point in `planning/planner.py::build_plan` (after incomplete filtering, before
+    receiver lists): a RECEIVER (CRITICAL or LOW) that is `not signal_warm and not is_saturated` is
+    excluded + event `receiver_suppressed_signal_warmup:{model}`. Applies to both loops (build_plan serves
+    rescue and fairness).
+  - **Saturation bypass is the safety valve** (not configurable): `is_saturated` (Q_ctl>=qsat) already in
+    context; a genuine flash crowd piles real waiting requests -> Q crosses qsat within ~1-2 refreshes ->
+    CRITICAL honoured. Sustained CRITICAL under warm signal -> byte-identical to today, zero added latency.
+  - Knob `TRE_SIGNAL_WARMUP_MS` (ControllerConfig): default **-1 = auto**; **0 = disabled** (A/B ablation);
+    **>0 = explicit span** since onset.
+- Restart semantics: in-process (like the EMA) — one window of receiver-suppression after a mid-traffic restart.
+- N3 (theta/tau re-centering): **DEFERRED** to the R3 refit on the frozen W (magnitudes are provisional on
+  the unfrozen 30s window; the onset fix is magnitude-independent). Add a 1 req/s trickle cell to the R3 grid
+  so the refit tau band is checked against the qmin-clamped regime.
+- Tests: `test_signal_warmup.py` (5 observe_traffic unit + 4 planner suppression/bypass/warm/back-compat).
+  make check 324. Mini re-shakedown (trickle-suppressed + spike-bypassed legs) required before closing.
+- Reversible: `TRE_SIGNAL_WARMUP_MS=0` restores pre-fix behaviour.

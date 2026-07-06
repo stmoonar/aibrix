@@ -255,6 +255,17 @@ def _model_contexts(
                 window_end_ms=metrics.window_end_ms,
             )
             signal = get_signal(metrics, spec, signal_source, trs_z_m=result.Z_m)
+            # F-onset warmup guard: signal is trustworthy on the low side only once the
+            # window lies fully inside the traffic period (see SignalState.observe_traffic).
+            if signal_state is not None:
+                signal_warm = signal_state.observe_traffic(
+                    model_name,
+                    has_traffic=result.Y_m > 1e-9,
+                    window_start_ms=metrics.window_start_ms,
+                    window_end_ms=metrics.window_end_ms,
+                )
+            else:
+                signal_warm = True
             context = {
                 "trs": result.TRS,
                 "z_m": signal.z_m,
@@ -271,8 +282,17 @@ def _model_contexts(
                 "routable_pods": metrics.routable_pods,
                 "assigned_replicas": assigned_replicas,
                 "is_saturated": result.Q_ctl >= spec.trs.qsat,
+                "signal_warm": signal_warm,
             }
         else:
+            if signal_state is not None:
+                # no tokens this window -> idle -> reset the traffic-onset cursor.
+                signal_state.observe_traffic(
+                    model_name,
+                    has_traffic=False,
+                    window_start_ms=metrics.window_start_ms,
+                    window_end_ms=metrics.window_end_ms,
+                )
             context = {
                 "trs": 0.0,
                 "z_m": None,

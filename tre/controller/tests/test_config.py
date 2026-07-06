@@ -24,6 +24,7 @@ def test_config_defaults_are_plan_aligned() -> None:
     assert config.min_latency_samples == 10
     assert config.percentile_mode == "bucket_upper"
     assert config.signal_source == "zm"
+    assert config.signal_warmup_ms == -1
     assert config.paper_stale_max_windows == 3
     assert config.incomplete_policy == "drop_model"
     assert config.enable_tre_scaling is True

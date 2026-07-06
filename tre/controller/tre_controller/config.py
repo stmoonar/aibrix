@@ -48,6 +48,7 @@ class ControllerConfig:
     min_latency_samples: int
     percentile_mode: str
     signal_source: str
+    signal_warmup_ms: int
     paper_stale_max_windows: int
     incomplete_policy: str
     enable_tre_scaling: bool
@@ -146,6 +147,9 @@ class ControllerConfig:
             min_latency_samples=_get_nonneg_int(values, "TRE_MIN_LATENCY_SAMPLES", 10),
             percentile_mode=percentile_mode,
             signal_source=signal_source,
+            # F-onset warmup guard: -1 auto (window fully inside traffic period),
+            # 0 disabled (A/B ablation), >0 explicit span-since-onset in ms.
+            signal_warmup_ms=int(str(values.get("TRE_SIGNAL_WARMUP_MS", "-1")).strip()),
             paper_stale_max_windows=_get_positive_int(values, "TRE_PAPER_STALE_MAX_WINDOWS", 3),
             incomplete_policy=incomplete_policy,
             enable_tre_scaling=_get_bool(values, "ENABLE_TRE_SCALING", True),
