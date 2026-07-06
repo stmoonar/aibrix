@@ -2016,3 +2016,24 @@ Deleted the failing recreate -> dsllama clean bound=3, serving 3/3, reconcile cl
 CLEAN CHECKPOINT holds: isolated plane serving 3/3, SM two-layer fix deployed+verified
 (self-heal + under-churn), controller PAUSED, GPUs clean, make check 285, tree committed.
 Canonical bound=4 + R3 + N4.6/soak + Phase C + N5 + F5 remain (config decision + wall-clock).
+
+### Endgame canonical restore — dsllama bound=4 via D8 0.85 (2026-07-06)
+
+Applied ADR-0010 (gpu_memory_utilization=0.85, registry + all manifests, make check
+285) and recreated dsllama-8b node9 gpu-0 with the 0.85 manifest:
+- Loaded cleanly with NO OOM (0.85*40 = 34 GiB + ~4 GiB co-resident sleeping = 38 < 40),
+  vLLM became ready, slept it -> node9 GPU0 = 4070 MiB (3 healthy sleeping pods).
+- reconcile version 379, no non-leak warnings; **dsllama-8b now bound=4**; all 3
+  models serving 4/4 via the isolated gateway. D8 0.85 path VALIDATED live.
+- Canonical fleet now 11/12 bindings: dsqwen-7b bound=4, dsllama-8b bound=4,
+  dsqwen-14b bound=3 (missing node9 gpu2-3). The 14b 2-GPU binding needs node9
+  GPU2+GPU3 free of awake, but GPU2 currently hosts the relocated dsqwen-7b awake;
+  restoring it needs another relocation (wake dsqwen-7b elsewhere -> sleep its GPU2
+  replica -> create 14b gpu2-3 at 0.85). Deferred (optional pre-N4.6; 14b serves
+  fine at bound=3, and R3 single-pod capacity is unaffected by bound count).
+
+CLEAN CHECKPOINT: isolated plane serving 4/4; SM two-layer fix deployed+verified
+(self-heal + under-churn); D8 0.85 applied + validated; dsllama bound=4 restored;
+controller PAUSED; GPUs clean; reconcile clean; make check 285; tree committed.
+Remaining: 14b gpu2-3 (optional) -> R3 refit (recreate fleet at 0.85 for consistent
+capacity) -> N4.6 + scale-cycle soak -> n4b-done -> Phase C -> N5 -> F5 (wall-clock).
