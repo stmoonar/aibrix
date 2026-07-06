@@ -2363,3 +2363,45 @@ TRACKED (architect-flagged, before their milestones):
 
 VERIFIED clean (no change needed): F-onset accounting/golden parity, B1 path coverage, B2 columns (Q_ctl +
 raw gauges so S2 can recompute), TTFT/SSE + usage capture, oracle_normalized_score, UI safety/no-CDN.
+
+### Operator console P0 (Live / Fleet / Control + param editing) — 2026-07-06
+
+Redesigned the UI into a light-theme operator console per the user request (light theme,
+larger fonts, understandable function separation, GPU co-residency bug fixed, 0.5s live
+refresh with zero control-loop overhead). Architect (Fable5) directed the design + the
+P0-4 ConfigMap migration. Delivered in 5 committed increments, all make check green
+(340 -> 358), all image-built + rolled + live-verified, tre-v2 only.
+
+- P0-1 (ef2df1aa): tre_ui/sampler.py — ONE in-pod background thread owns all upstream
+  reads (decision 1s, hist/sm/probes 2s, gpu 5s), publishes a versioned cached snapshot.
+  Browsers consume via /api/snapshot (ETag) + /api/stream (SSE 0.5s, delta-on-version).
+  Any number of tabs => zero extra upstream reads; console cannot perturb control loop.
+- P0-2 (e3275bf5 / roll 9b1b9550): light "instrument panel" SPA (local assets, no CDN).
+  Live Signals (Zₘ cards + SVG τ-band timelines + event feed), GPU Fleet (co-residency
+  grid joining SM bindings × gpu_truth by node+index — FIXES the "one model per GPU" bug;
+  verified node9 gpu0 shows all three models resident, one awake), Control (operate).
+- P0-3 (0e2a50f6 / roll bee1e3c7): controller observe/pause mode. ObserveModeGate reads
+  tre:v2:controller:mode (1s TTL, fail-safe active), gates ActionQueue.drain_once — the
+  single dispatch choke point — so Observe pauses ALL actuation while decisions keep
+  publishing. Controller roll also lit up S5.1 full model_states + decision hist.
+- P0-4A (8cace421): migrated registry.yaml -> tre-v2-registry ConfigMap mounted at
+  /etc/tre (TRE_REGISTRY_PATH flipped), so per-model TRS/SLO params are editable without
+  an image rebuild. W stays FROZEN as explicit container env (wins over any CM) + guard-
+  test-pinned. strategy: Recreate (no dual-controller actuation). tre-v2-ui-params Role:
+  namespace-scoped, resourceName-bound to the CM + controller Deployment only. Migration
+  was byte-identical + verified (CM==baked, mounted==baked, RBAC negatives confirmed).
+- P0-4B (1f8276a8 + fix d3531795 / roll 8dc88d73): stdlib in-cluster k8s client (no dep,
+  SA token re-read per request), GET/PUT /api/params (closed whitelist + bounds + cross-
+  field, re-parsed via controller's own load_registry before write; 422/409; audit),
+  POST /api/ops/controller/restart (pod-template annotation), GET .../rollout. Frontend
+  editable forms + pending-restart banner. Redis-baselined pending (no first-edit dead-end).
+  LIVE round-trip verified: invalid->422, locked->422, valid theta_m 738.67->739.0 written
+  to CM, controller unchanged until restart, restart applied 739.0, then restored to 738.67.
+
+State left clean: all tre-v2 pods Running, controller mode=active, CM==committed,
+console at http://192.168.223.76:30812, git HEAD 8dc88d73, make check 358.
+
+Deferred (tracked): tuning-CM env split (loop cadences/ablation) — skipped to avoid guard-
+test + ablation-overlay entanglement and keep the migration byte-identical; registry CM
+already delivers the R3 recalibration surface. Console P1 (Trace Lab) + P2 (Calibration
+Lab) still pending. Endgame guardrails unchanged: W-freeze before R3, S1/S4 ordering.
