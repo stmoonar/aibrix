@@ -1,0 +1,26 @@
+=== refresh cadence (rescue ticks: window_end_ms delta) ===
+distinct window_end_ms samples: 34
+deltas ms: [5666, 5643, 5781, 5663, 5903, 5681, 5718, 5753, 5918, 5729, 5734, 5732, 5628, 5698, 5688, 5687, 5640, 5749, 5702, 5714, 5646, 5691, 5980, 5994, 5919, 5910, 5898, 5785, 5741, 5656, 5686, 5634, 5914]
+median refresh ms: 5718  (target ~5000, was 60000 tumbling)
+=== action count in sample (must be 0 on idle fleet) ===
+
+=== S1.2 real-machine validation conclusion (2026-07-06, current/snowflake cluster) ===
+Image: tre-v2-controller:20260706-446ce73a (S1: sliding window, 5s refresh, time-constant EMA/ADR-0011, N1, N2 guard).
+Rolled controller-only (surgical apply of overlay controller.yaml; replicas 0->1); other resources untouched.
+Env active: TRE_METRICS_WINDOW_MODE=sliding, TRE_METRICS_WINDOW_MS=30000, TRE_METRICS_REFRESH_INTERVAL_SECONDS=5, TRE_MIN_LATENCY_SAMPLES=10.
+
+RESULT:
+- Controller healthy (1/1, 0 restarts). Ran ~2 min.
+- Window/refresh cadence: 34 distinct window_end_ms samples, delta median 5718ms (range 5628-5994ms).
+  => the metric window now ADVANCES every ~5.7s (sliding), vs the old 60000ms tumbling jump. ~10x fresher.
+  This satisfies S1.1's real-machine criterion: Z_m changes every refresh, no 60s step.
+- Idle fleet: all 3 models z_m=null (idle -> TRS~0 -> Z_m None -> UNKNOWN). submitted=0 on all 53 sampled ticks
+  (ZERO scaling actions). Fleet GPU state identical before/after (node10 GPU0/1=37179, GPU2/3=1825). Not mutated.
+- Controller re-paused (replicas=0) afterward -> deliberate paused state restored.
+
+LAG NOTE (important for W-freeze): worst-case zm-lag ~= W + refresh + write = 30000 + ~5718 + write ~= 36s,
+which is right AT/slightly OVER the P95<=35s target. This matches doc15 N5's hint that W may need trimming
+toward 25000. The absolute lag-under-step-load P95 was NOT measured here (would require a fleet-mutating load
+experiment on a to-be-torn-down snowflake). W is PROVISIONALLY 30000; authoritative P95 measurement + final
+W-freeze folded into the F4.3 clean cluster immediately before R3 (D11); trim to 25000 if P95>35s there.
+S1.4/R3 hard-gate remains: R3 must not start until W is FROZEN on the clean cluster.

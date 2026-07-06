@@ -2175,3 +2175,28 @@ adaptive probe window; only a min<=max parse check). Not guarded now (would reje
 defaults); whoever wires the adaptive window must floor it at metrics_window_ms/(1-hq)=40s.
 
 N3/N4 remain DEFERRED to post-real-machine-acceptance (plan §7 step5, as-needed).
+
+### Signal Plan S1.2 real-machine — S1 pipeline VALIDATED live; W provisional 30s, authoritative freeze -> F4.3 clean (2026-07-06)
+
+Built controller image tre-v2-controller:20260706-446ce73a (post-S1 HEAD 446ce73a; committed +
+overlay/pin/images.lock updated, resolves the F4.3 rebuild debt). Surgical controller-only roll on
+the CURRENT cluster (apply overlay controller.yaml, replicas 0->1; no other resources touched), then
+re-paused.
+
+Live result (evidence: docs/refactor/p11_evidence/s1_shortwindow_20260706/):
+- Controller healthy; decisions every ~5.7s with continuously-advancing window_end_ms (34 samples,
+  delta median 5718ms) => sliding window + 5s refresh CONFIRMED live (was 60000ms tumbling). Satisfies
+  S1.1 real-machine criterion (Z_m every refresh, no 60s step).
+- Idle fleet -> z_m=null all models -> submitted=0 on all 53 sampled ticks (zero actions); GPU state
+  identical before/after (fleet not mutated). Controller re-paused (replicas=0), safe state restored.
+
+Decision (recorded ADR-0012): the AUTHORITATIVE lag-P95-under-step-load + FINAL W-freeze are folded into
+the F4.3 clean-cluster redeploy immediately before R3, per D11 (authoritative numbers must run on the clean
+cluster, not the hand-patched snowflake; and R3/S1.4 consume the frozen W there). Reasons: (a) a lag-P95
+measurement needs a fleet-mutating load experiment, wasteful on a cluster F4 tears down; (b) the snowflake is
+drifted from manifests (apply-k risk); (c) worst-case lag at W=30s is ~36s (=30000+~5718+write), right at the
+35s target -> the clean-cluster P95 decides whether to keep 30000 or trim to 25000 (doc15 N5). W PROVISIONAL
+= 30000. S1.4/R3 hard-gate INTACT: R3 blocked until W frozen on clean cluster.
+
+S1 STATUS: all offline code done (S1.3/S1.1/S1.2/N1/N5/N2, make check 314, ADR-0011/0012). Pipeline validated
+live. Remaining: authoritative W-freeze (F4.3) -> S1.4/R3 (+S2/S3) -> then S4 before R3. N3/N4 deferred.

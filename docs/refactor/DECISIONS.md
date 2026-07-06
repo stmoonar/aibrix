@@ -319,3 +319,32 @@ The D7 canary in N4b.3 is mandatory before broad rollout: first prove that a no-
 - Evidence: make check 305 passed; new tests controller/tests/test_trs_ema_timeconstant.py
   (8) + test_signal_state_loops.py (3); golden test_trs_signals.py unchanged & green.
 - Reversible: set ema_tau_ms null in registry -> live path returns to fresh-per-tick raw.
+
+## ADR-0012: S1.2 authoritative W-freeze runs on the F4.3 clean cluster (not the snowflake)
+
+- Status: **Accepted** (2026-07-06).
+- Context: plan 15 S1.2 says to freeze the control window W via real-machine acceptance on
+  the current cluster (lag P95 ≤ 35s). The S1 code + controller image
+  (`tre-v2-controller:20260706-446ce73a`) are ready and were rolled live on the current
+  ("snowflake") cluster for validation.
+- What was validated live on the current cluster (evidence
+  `docs/refactor/p11_evidence/s1_shortwindow_20260706/`): the S1 metric pipeline runs healthy;
+  the window advances every ~5.7s (sliding, 34 samples, median 5718ms delta) vs the old 60000ms
+  tumbling jump; zero scaling actions on the idle fleet; fleet GPU state unchanged; controller
+  re-paused afterward. This confirms S1.1/S1.2 mechanics live.
+- Decision: the **authoritative lag-P95-under-step-load measurement and the FINAL W-freeze** are
+  deferred to the **F4.3 clean-cluster redeploy**, immediately before R3, rather than run on the
+  current cluster. Rationale:
+  1. **D11**: authoritative numbers (N4b, N5, R3, and the W that R3 fits θ on) must run on the
+     clean, from-manifest cluster — not the hand-patched snowflake. A snowflake W-freeze would be
+     re-validated on the clean cluster anyway.
+  2. A lag-P95 measurement requires a **fleet-mutating load experiment** (drive a model to move
+     Z_m, possibly trigger a scale-up); wasteful and risky on a cluster F4 tears down, and the
+     snowflake is drifted from manifests (`kubectl apply -k` risk).
+  3. Worst-case lag at W=30000 is ~36s (= 30000 + ~5718 refresh + write), right at the 35s target,
+     so the clean-cluster P95 is what decides whether to keep **30000** or trim to **25000**
+     (doc15 N5 flagged this exact tension). W is **provisional 30000** until then.
+- Consequence / guardrail: the **S1.4 / N5-R3 hard gate is preserved** — R3 (θ_m refit) must NOT
+  start until W is FROZEN on the clean cluster (and S4 raw-logging is done). The controller image
+  and overlay already carry W=30000 + sliding + 5s; the clean deploy needs no extra S1 code.
+- Reversible: if F4 slips, the W-freeze can still be run on the current cluster with the same image.
