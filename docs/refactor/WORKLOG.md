@@ -2288,3 +2288,20 @@ Bundled (both controller-side; one rebuild next). make check 326.
   (env TRE_SM_SLOW_TIMEOUT_SECONDS default 300); get_state/set_routable stay 5s. Prevents the 5s
   client timeout firing mid-migration and freeing inflight -> stale replan (the old desync-churn class).
 - Tests: decision hist ZADD + enriched model_states; sm_client slow-vs-fast timeout; config defaults.
+
+### UI (S5) — control-room console: timelines + GPU heatmap + operate (2026-07-06)
+
+Rebuilt tre/ui from a 113-line read-only skeleton into an operational console. make check 329.
+- Backend (app.py): RedisClient/ServiceManagerClient protocols extended. New endpoints:
+  GET /api/decision/latest (fixed to decode the real hash + model_states), /api/signal/history
+  (ZRANGEBYSCORE decision:hist:{model} -> S5.1 time-series), /api/gputruth (scan tre:gpu_truth:*);
+  POST operate proxies /api/ops/models/{m}/target|routable, /api/ops/reconcile, /api/ops/defrag
+  (audited, model-validated, 502 on SM failure). server.py SM client gains request() (PUT/POST,
+  300s for operate). 6 UI tests.
+- Frontend (static/index.html, self-contained, no CDN): per-model Z_m/TSS timelines with the
+  tau_crit/tau_low/tau_high bands drawn as zones (watch a model cross into CRITICAL), state badges,
+  live/stale freshness pill; physical GPU-grid heatmap (nodes x GPUs: resident model color +
+  memory bar + awake/sleeping/hidden + leak flag) from gpu-truth + SM bindings; decision/scaling
+  ticker; per-model wake/sleep + reconcile buttons with confirm+toast. Polls every 4s.
+- Note: decision:hist populates only while the controller runs (S5.1 in image 54cd2582+); timelines
+  are empty when the controller is paused. UI image rebuild + roll next.

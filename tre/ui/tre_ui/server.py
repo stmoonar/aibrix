@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 from typing import Any
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
 from fastapi import FastAPI
 
@@ -16,11 +16,23 @@ class ServiceManagerStateClient:
         self._base_url = base_url.rstrip("/")
 
     def get_state(self) -> dict[str, Any]:
-        with urlopen(f"{self._base_url}/v2/state", timeout=5.0) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-        if not isinstance(payload, dict):
-            raise RuntimeError("service-manager state response must be a JSON object")
-        return payload
+        return self.request("GET", "/v2/state")
+
+    def request(self, method: str, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        body = None
+        headers = {"Accept": "application/json"}
+        if payload is not None:
+            body = json.dumps(payload).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        # Operate calls (target/defrag) can run for minutes in the SM; observe calls are fast.
+        timeout = 5.0 if method == "GET" else 300.0
+        request = Request(f"{self._base_url}{path}", data=body, headers=headers, method=method)
+        with urlopen(request, timeout=timeout) as response:
+            raw = response.read().decode("utf-8")
+        decoded = json.loads(raw) if raw else {}
+        if not isinstance(decoded, dict):
+            raise RuntimeError("service-manager response must be a JSON object")
+        return decoded
 
 
 def create_app() -> FastAPI:
