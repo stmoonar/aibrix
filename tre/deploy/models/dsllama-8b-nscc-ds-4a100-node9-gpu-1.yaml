@@ -64,6 +64,8 @@ spec:
         - '2048'
         - --swap-space
         - '20'
+        - --gpu-memory-utilization
+        - '0.85'
         env:
         - name: NVIDIA_VISIBLE_DEVICES
           value: GPU-d0de9f25-c059-d2ee-e7c4-c242bbdc76c7

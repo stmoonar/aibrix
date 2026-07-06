@@ -245,3 +245,28 @@ The D7 canary in N4b.3 is mandatory before broad rollout: first prove that a no-
   nvidia-smi confirms gpu-0 memory freed, via the declarative path (deploy_models.sh),
   never manual kubectl.
 - Plan patch: §5.5/§6 note F4.4's scale-cycle gate now consumes R3 output.
+
+## ADR-0010: Apply D8 gpu_memory_utilization=0.85 (co-resident cold-start headroom)
+
+- Status: **Accepted** (2026-07-06). Authorized by plan D8, whose precondition
+  ("only if E1 proves healthy-path cold-start headroom insufficient") is now met.
+- Evidence: recreating a single model binding into a GPU already hosting co-resident
+  sleeping pods OOMs at the default 0.9 util — vLLM sampler warmup needs >40 GiB
+  (0.9*40 = 36 GiB target + ~4 GiB co-resident sleeping pods + warmup). The original
+  12-binding topology only avoided this via creation ORDER (each pod warmed up at 0.9
+  while its GPU was still empty, then slept to ~2 GiB before the next was added).
+- Decision: add `--gpu-memory-utilization 0.85` to every model's `vllm_extra_args` in
+  `deploy/registry.yaml`; regenerated all model manifests (make check 285). 0.85*40 =
+  34 GiB + ~4 co-resident = 38 < 40, so a binding can be (re)created into a populated
+  GPU without OOM.
+- Consequences:
+  1. **R3 capacity baseline is now 0.85** (less KV cache than 0.9). This is a
+     system-parameter choice that propagates into all N5 capacity/theta numbers — the
+     paper must report util=0.85. Kept consistent by regenerating all manifests.
+  2. LIVE serving pods still run at 0.9 (their pods predate this change); they take
+     0.85 only when recreated. **R3 setup must recreate the fleet at 0.85** for a
+     consistent capacity measurement (R3 already prepares the fleet, so low marginal cost).
+  3. Does NOT fix concurrent fresh bring-up: 3 pods/GPU loading at 0.85 = 102 GiB > 40.
+     `deploy_models.sh` still needs a STAGGERED create->wait-ready->sleep path for
+     fresh clusters (warned in-script; TODO before any F4.3-style fresh deploy).
+- Reversible: drop the two args from registry.yaml + regenerate to return to 0.9.

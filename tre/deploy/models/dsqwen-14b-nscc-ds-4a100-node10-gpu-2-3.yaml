@@ -62,6 +62,8 @@ spec:
         - '2'
         - --max-model-len
         - '12288'
+        - --gpu-memory-utilization
+        - '0.85'
         env:
         - name: NVIDIA_VISIBLE_DEVICES
           value: GPU-28af749d-4081-d7b6-0c14-cf9c29aa213d,GPU-76a392a5-b027-42be-fb8f-1bfe9079b47c

@@ -55,6 +55,8 @@ models:
   - '2048'
   - --swap-space
   - '16'
+  - --gpu-memory-utilization
+  - '0.85'
 - name: dsllama-8b
   weights_path: /data/nfs_shared_data/DeepSeek-R1-Distill-Llama-8B
   tp_size: 1
@@ -85,6 +87,8 @@ models:
   - '2048'
   - --swap-space
   - '20'
+  - --gpu-memory-utilization
+  - '0.85'
 - name: dsqwen-14b
   weights_path: /data/nfs_shared_data/Models/DeepSeek-R1-Distill-Qwen-14B
   tp_size: 2
@@ -111,3 +115,5 @@ models:
   vllm_extra_args:
   - --max-model-len
   - '12288'
+  - --gpu-memory-utilization
+  - '0.85'
