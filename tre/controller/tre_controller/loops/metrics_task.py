@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass, replace
-from typing import Protocol
+from typing import Awaitable, Callable, Protocol
 
 from tre_common.metrics_schema import MetricsSnapshot
 
@@ -18,6 +18,7 @@ class MetricsTaskConfig(Protocol):
     metrics_window_ms: int
     metrics_window_mode: str
     monitor_interval_s: float
+    metrics_refresh_interval_s: float
 
 
 class SnapshotBox:
@@ -83,7 +84,18 @@ def refresh_metrics_once(
     )
 
 
-async def metrics_task(store: SnapshotStore, snapshot_box: SnapshotBox, cfg: MetricsTaskConfig) -> None:
+async def metrics_task(
+    store: SnapshotStore,
+    snapshot_box: SnapshotBox,
+    cfg: MetricsTaskConfig,
+    *,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+) -> None:
+    # S1.2: refresh cadence is decoupled from monitor_interval_s and set to
+    # metrics_refresh_interval_s (default 5s) so the single shared snapshot is never
+    # staler than the fastest decision loop (rescue, 5s). Single snapshot_box only —
+    # no fast/slow split (ADR-0011 / plan S1.2: rescue and fairness share one window).
+    refresh_interval_s = getattr(cfg, "metrics_refresh_interval_s", cfg.monitor_interval_s)
     while True:
         refresh_metrics_once(
             store,
@@ -92,7 +104,7 @@ async def metrics_task(store: SnapshotStore, snapshot_box: SnapshotBox, cfg: Met
             window_ms=cfg.metrics_window_ms,
             window_mode=getattr(cfg, "metrics_window_mode", "sliding"),
         )
-        await asyncio.sleep(cfg.monitor_interval_s)
+        await sleep(refresh_interval_s)
 
 
 def _last_complete_window(now_ms: int, window_ms: int) -> tuple[int, int]:

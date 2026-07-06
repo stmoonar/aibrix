@@ -2106,3 +2106,21 @@ PAUSED controller twice (once for sliding@60s, again for short-window@30s+5s).
 
 Next: S1.2 (metrics_refresh_interval_s=5s decoupled from monitor_interval; window default
 60000->30000; N1 min-sample guard for p95; N5 window aligns to write period). Controller PAUSED.
+
+### Signal Plan S1.2 (core) — single shared short window + 5s refresh DONE (offline) 2026-07-06
+
+make check 311 passed; kustomize build OK. Single snapshot_box preserved (NO fast/slow split).
+- config.py: metrics_refresh_interval_s (env TRE_METRICS_REFRESH_INTERVAL_SECONDS, default 5.0)
+  decoupled from monitor_interval_s; metrics_window_ms default 60000 -> 30000 (N5: 3x the 10s
+  write period, integer multiple, covers 3 histogram points; doc N5 typo "25000" ignored per its
+  own integer-multiple rule).
+- loops/metrics_task.py: metrics_task sleeps on metrics_refresh_interval_s (getattr fallback to
+  monitor_interval_s); injectable sleep for testing. Still ONE snapshot_box (rescue+fairness share).
+- deploy/overlays/tre-v2/controller.yaml: TRE_METRICS_WINDOW_MODE=sliding,
+  TRE_METRICS_REFRESH_INTERVAL_SECONDS=5, TRE_METRICS_WINDOW_MS 60000->30000 (STARTING value;
+  freeze after real-machine acceptance). kustomize build verified, envs present.
+- Tests: metrics_task interval test (asyncio.run + fake sleep -> [5.0], not 20.0); config defaults.
+
+Pending in S1.2: (a) N1 min-sample p95 guard (next commit); (b) REAL-MACHINE acceptance to
+FREEZE W (roll controller with sliding/30s/5s, lag P95<=35s, Z_m jitter stddev) — deferred to a
+live session; HARD prerequisite for S1.4/R3. Controller PAUSED.

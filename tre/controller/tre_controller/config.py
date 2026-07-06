@@ -38,6 +38,7 @@ class ControllerConfig:
     registry_path: str
     runtime_state_dir: str
     monitor_interval_s: float
+    metrics_refresh_interval_s: float
     rescue_interval_s: float
     fairness_interval_s: float
     metrics_window_ms: int
@@ -111,9 +112,12 @@ class ControllerConfig:
             registry_path=_get_str(values, "TRE_REGISTRY_PATH", str(default_registry)),
             runtime_state_dir=_get_str(values, "TRE_RUNTIME_STATE_DIR", str(default_state_dir)),
             monitor_interval_s=_get_positive_float(values, "TRE_MONITOR_INTERVAL_SECONDS", 20.0),
+            metrics_refresh_interval_s=_get_positive_float(
+                values, "TRE_METRICS_REFRESH_INTERVAL_SECONDS", 5.0
+            ),
             rescue_interval_s=_get_positive_float(values, "TRE_RESCUE_INTERVAL_SECONDS", 5.0),
             fairness_interval_s=_get_positive_float(values, "TRE_FAIRNESS_INTERVAL_SECONDS", 10.0),
-            metrics_window_ms=_get_positive_int(values, "TRE_METRICS_WINDOW_MS", 60_000),
+            metrics_window_ms=_get_positive_int(values, "TRE_METRICS_WINDOW_MS", 30_000),
             metrics_window_mode=metrics_window_mode,
             instant_sample_interval_ms=_get_positive_int(values, "TRE_INSTANT_SAMPLE_INTERVAL_MS", 5_000),
             histogram_lookback_ms=_get_nonneg_int(values, "TRE_HIST_BASELINE_LOOKBACK_MS", 90_000),

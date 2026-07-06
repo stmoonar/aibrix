@@ -47,15 +47,25 @@ spec:
               value: drop_model
             - name: TRE_PAPER_STALE_MAX_WINDOWS
               value: "3"
-            # --- Loop cadence / windows (D2) ---
+            # --- Loop cadence / windows (D2; S1.1/S1.2 signal-freshness) ---
             - name: TRE_MONITOR_INTERVAL_SECONDS
               value: "20"
+            # S1.2: metrics refresh decoupled from monitor_interval, set to the fastest
+            # decision loop (rescue 5s) so the shared snapshot is never staler than 5s.
+            - name: TRE_METRICS_REFRESH_INTERVAL_SECONDS
+              value: "5"
             - name: TRE_RESCUE_INTERVAL_SECONDS
               value: "5"
             - name: TRE_FAIRNESS_INTERVAL_SECONDS
               value: "10"
+            # S1.1: sliding window (no 60-120s tumbling staleness).
+            - name: TRE_METRICS_WINDOW_MODE
+              value: "sliding"
+            # S1.2: single shared window shortened 60s->30s (3x the 10s write period,
+            # covers 3 histogram points). STARTING value — freeze after S1.2 real-machine
+            # acceptance (lag P95 <= 35s). Do NOT start R3 refit until this W is frozen.
             - name: TRE_METRICS_WINDOW_MS
-              value: "60000"
+              value: "30000"
             # --- Ablation switches (D4); production defaults ---
             - name: ENABLE_TRE_SCALING
               value: "true"

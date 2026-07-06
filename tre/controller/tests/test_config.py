@@ -14,9 +14,10 @@ def test_config_defaults_are_plan_aligned() -> None:
     assert config.service_manager_url == "http://aibrix-tre-service-manager:8000"
     assert config.registry_path.endswith("tre/deploy/registry.yaml")
     assert config.monitor_interval_s == 20.0
+    assert config.metrics_refresh_interval_s == 5.0
     assert config.rescue_interval_s == 5.0
     assert config.fairness_interval_s == 10.0
-    assert config.metrics_window_ms == 60_000
+    assert config.metrics_window_ms == 30_000
     assert config.metrics_window_mode == "sliding"
     assert config.instant_sample_interval_ms == 5_000
     assert config.histogram_lookback_ms == 90_000

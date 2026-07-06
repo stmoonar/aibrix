@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import asyncio
+from types import SimpleNamespace
+
 from tre_common.metrics_schema import MetricsSnapshot, ModelWindowMetrics
-from tre_controller.loops.metrics_task import SnapshotBox, _sliding_window, refresh_metrics_once
+from tre_controller.loops.metrics_task import SnapshotBox, _sliding_window, metrics_task, refresh_metrics_once
 
 
 class FakeStore:
@@ -121,6 +124,37 @@ def test_refresh_metrics_once_marks_previous_snapshot_stale_on_read_failure() ->
     assert result.snapshot.models == previous.models
     assert result.snapshot.stale is True
     assert box.get() == result.snapshot
+
+
+def test_metrics_task_refreshes_on_refresh_interval_not_monitor_interval() -> None:
+    # S1.2: the refresh cadence is metrics_refresh_interval_s (5s), decoupled from the
+    # (slower) monitor_interval_s (20s), so the shared snapshot keeps up with rescue (5s).
+    intervals: list[float] = []
+
+    class _Stop(Exception):
+        pass
+
+    async def fake_sleep(seconds: float) -> None:
+        intervals.append(seconds)
+        raise _Stop()
+
+    cfg = SimpleNamespace(
+        metrics_window_ms=30_000,
+        metrics_window_mode="sliding",
+        monitor_interval_s=20.0,
+        metrics_refresh_interval_s=5.0,
+    )
+    store = FakeStore(snapshot=_snapshot())
+    box = SnapshotBox()
+
+    try:
+        asyncio.run(metrics_task(store, box, cfg, sleep=fake_sleep))
+    except _Stop:
+        pass
+
+    assert intervals == [5.0]
+    assert box.get() is not None  # a refresh happened before the first sleep
+    assert store.use_cache_calls == [False]  # sliding default from cfg
 
 
 def test_refresh_metrics_once_creates_empty_stale_snapshot_without_previous_data() -> None:
