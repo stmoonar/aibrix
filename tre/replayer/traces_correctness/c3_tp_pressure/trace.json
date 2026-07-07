@@ -1,0 +1,50 @@
+{
+  "dsqwen-7b": [
+    {
+      "start_time": 0,
+      "end_time": 1080,
+      "rps": 1.0,
+      "input_tokens": 256,
+      "max_tokens": 128
+    }
+  ],
+  "dsllama-8b": [
+    {
+      "start_time": 0,
+      "end_time": 1080,
+      "rps": 1.0,
+      "input_tokens": 256,
+      "max_tokens": 128
+    }
+  ],
+  "dsqwen-14b": [
+    {
+      "start_time": 0,
+      "end_time": 150,
+      "rps": 0.5,
+      "input_tokens": 256,
+      "max_tokens": 128
+    },
+    {
+      "start_time": 150,
+      "end_time": 443,
+      "rps": 3.5,
+      "input_tokens": 512,
+      "max_tokens": 256
+    },
+    {
+      "start_time": 443,
+      "end_time": 697,
+      "rps": 5,
+      "input_tokens": 512,
+      "max_tokens": 256
+    },
+    {
+      "start_time": 697,
+      "end_time": 1080,
+      "rps": 0.5,
+      "input_tokens": 256,
+      "max_tokens": 128
+    }
+  ]
+}

@@ -1,0 +1,71 @@
+{
+  "dsqwen-7b": [
+    {
+      "start_time": 0,
+      "end_time": 150,
+      "rps": 1.0,
+      "input_tokens": 256,
+      "max_tokens": 128
+    },
+    {
+      "start_time": 150,
+      "end_time": 167,
+      "rps": 12,
+      "input_tokens": 512,
+      "max_tokens": 256
+    },
+    {
+      "start_time": 167,
+      "end_time": 345,
+      "rps": 1.0,
+      "input_tokens": 256,
+      "max_tokens": 128
+    },
+    {
+      "start_time": 345,
+      "end_time": 467,
+      "rps": 12,
+      "input_tokens": 512,
+      "max_tokens": 256
+    },
+    {
+      "start_time": 467,
+      "end_time": 960,
+      "rps": 1.0,
+      "input_tokens": 256,
+      "max_tokens": 128
+    }
+  ],
+  "dsllama-8b": [
+    {
+      "start_time": 0,
+      "end_time": 643,
+      "rps": 1.0,
+      "input_tokens": 256,
+      "max_tokens": 128
+    },
+    {
+      "start_time": 643,
+      "end_time": 660,
+      "rps": 12,
+      "input_tokens": 512,
+      "max_tokens": 256
+    },
+    {
+      "start_time": 660,
+      "end_time": 960,
+      "rps": 1.0,
+      "input_tokens": 256,
+      "max_tokens": 128
+    }
+  ],
+  "dsqwen-14b": [
+    {
+      "start_time": 0,
+      "end_time": 960,
+      "rps": 0.5,
+      "input_tokens": 256,
+      "max_tokens": 128
+    }
+  ]
+}

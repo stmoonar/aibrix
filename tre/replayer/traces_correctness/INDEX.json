@@ -1,0 +1,11 @@
+{
+  "version": "correctness-v0",
+  "workloads": [
+    "c1_staged_saturation",
+    "c2_anticorrelated",
+    "c3_tp_pressure",
+    "c4_spike_glitch",
+    "c2b_anticorrelated_hot",
+    "c3b_tp_pressure_hot"
+  ]
+}

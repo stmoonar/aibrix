@@ -1,0 +1,152 @@
+{
+  "name": "c1_staged_saturation",
+  "meta": {
+    "name": "c1_staged_saturation",
+    "trace": "/data/nfs_shared_data/xxy/aibrix/tre/replayer/traces_correctness/c1_staged_saturation/trace.json",
+    "trace_dur_s": 1320,
+    "post_s": 480,
+    "start_ms": 1783359412373,
+    "end_ms": 1783361214283,
+    "run_trace_rc": 0
+  },
+  "n_requests": 9616,
+  "err_rate": 0.00416,
+  "n_err": 40,
+  "err_by_model": {
+    "dsllama-8b": {
+      "err": 40,
+      "tot": 4482
+    },
+    "dsqwen-7b": {
+      "err": 0,
+      "tot": 4454
+    },
+    "dsqwen-14b": {
+      "err": 0,
+      "tot": 680
+    }
+  },
+  "err_times_rel_s": [
+    828.6,
+    828.8,
+    829.0,
+    829.1,
+    829.3,
+    829.5,
+    829.6,
+    830.0,
+    830.1,
+    830.2,
+    830.3,
+    830.4,
+    830.5,
+    830.5,
+    830.5,
+    830.7,
+    830.8,
+    830.9,
+    898.2,
+    898.3,
+    898.4,
+    898.6,
+    898.6,
+    898.7,
+    898.7,
+    898.8,
+    898.8,
+    898.9,
+    899.0,
+    899.0,
+    899.1,
+    899.2,
+    899.4,
+    899.7,
+    899.7,
+    899.8,
+    900.0,
+    900.1,
+    900.2,
+    900.5
+  ],
+  "min_awake": {
+    "dsqwen-7b": 1,
+    "dsllama-8b": 1,
+    "dsqwen-14b": 1
+  },
+  "max_awake": {
+    "dsqwen-7b": 1,
+    "dsllama-8b": 3,
+    "dsqwen-14b": 1
+  },
+  "scale_events": {
+    "dsqwen-7b": [],
+    "dsllama-8b": [
+      [
+        730.7,
+        1,
+        2
+      ],
+      [
+        741.1,
+        2,
+        3
+      ],
+      [
+        832.4,
+        3,
+        2
+      ],
+      [
+        903.4,
+        2,
+        1
+      ]
+    ],
+    "dsqwen-14b": []
+  },
+  "first_scaleup_rel_s": {
+    "dsqwen-7b": null,
+    "dsllama-8b": 730.7,
+    "dsqwen-14b": null
+  },
+  "zm_min": {
+    "dsqwen-7b": 0.8044729040031409,
+    "dsllama-8b": 0.8052032520325203,
+    "dsqwen-14b": 0.267373595505618
+  },
+  "critical_frac": {
+    "dsqwen-7b": 0.0,
+    "dsllama-8b": 0.0,
+    "dsqwen-14b": 0.013
+  },
+  "restarts": {
+    "tre-gateway-plugins-679bd4dc5-pmk6z": [
+      "0"
+    ],
+    "tre-v2-controller-866ccb4d69-65bvg": [
+      "0"
+    ],
+    "tre-v2-gpu-truth-6b5bx": [
+      "0"
+    ],
+    "tre-v2-gpu-truth-9k5p6": [
+      "1"
+    ],
+    "tre-v2-redis-6c47ddfb8d-h26mn": [
+      "0"
+    ],
+    "tre-v2-service-manager-579d84546b-xchgr": [
+      "0"
+    ],
+    "tre-v2-ui-6967667b6f-mwwbq": [
+      "0"
+    ]
+  },
+  "reconcile_warnings_union": [
+    "sleep_leak:dsllama-8b-nscc-ds-4a100-node9-gpu-2-6774997cb5-9w5pp: nscc-ds-4a100-node9/GPU-3a113474-dd92-6d52-d05b-491e7b020ded used_mib=40272 threshold_mib=8192",
+    "sleep_leak:dsqwen-14b-nscc-ds-4a100-node9-gpu-2-3-69c86d8db7-c5ngp: nscc-ds-4a100-node9/GPU-3a113474-dd92-6d52-d05b-491e7b020ded used_mib=40272 threshold_mib=8192",
+    "sleep_leak:dsqwen-7b-nscc-ds-4a100-node9-gpu-2-7fc65f475b-n55bs: nscc-ds-4a100-node9/GPU-3a113474-dd92-6d52-d05b-491e7b020ded used_mib=40272 threshold_mib=8192"
+  ],
+  "reconcile_last": [],
+  "n_samples": 178
+}

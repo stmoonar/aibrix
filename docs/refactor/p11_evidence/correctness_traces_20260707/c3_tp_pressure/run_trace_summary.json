@@ -1,0 +1,27 @@
+{
+  "trace": "/data/nfs_shared_data/xxy/aibrix/tre/replayer/traces_correctness/c3_tp_pressure/trace.json",
+  "requests": 4714,
+  "schedule_p99_delay_ms": 5.62,
+  "schedule_rps_error": 0.0,
+  "max_pool_wait_ms": 360.85,
+  "per_model": {
+    "dsllama-8b": {
+      "violation_time_frac": 0.02843601895734597,
+      "violation_request_frac": 0.0037174721189591076,
+      "n_requests": 1076,
+      "n_windows_scored": 211
+    },
+    "dsqwen-14b": {
+      "violation_time_frac": 0.02843601895734597,
+      "violation_request_frac": 0.0007671653241273494,
+      "n_requests": 2607,
+      "n_windows_scored": 211
+    },
+    "dsqwen-7b": {
+      "violation_time_frac": 0.04739336492890995,
+      "violation_request_frac": 0.007759456838021339,
+      "n_requests": 1031,
+      "n_windows_scored": 211
+    }
+  }
+}
