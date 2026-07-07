@@ -79,6 +79,14 @@ spec:
             # acceptance (lag P95 <= 35s). Do NOT start R3 refit until this W is frozen.
             - name: TRE_METRICS_WINDOW_MS
               value: "30000"
+            # G5/N1.3: SafeScale commit-gate SLOs pinned explicitly to match the
+            # registry.yaml calibration SLOs (ttft 500 / tpot 75), overriding the
+            # looser 1200/100 code defaults so the shrink safety gate cannot silently
+            # drift wider than calibration.
+            - name: SAFE_SCALE_TTFT_P95_SLO_MS
+              value: "500"
+            - name: SAFE_SCALE_TPOT_P95_SLO_MS
+              value: "75"
             # --- Ablation switches (D4); production defaults ---
             - name: ENABLE_TRE_SCALING
               value: "true"

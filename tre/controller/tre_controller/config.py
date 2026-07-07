@@ -16,8 +16,8 @@ _FALSE_VALUES = {"0", "false", "no", "n", "off"}
 
 @dataclass(frozen=True)
 class SafeScaleConfig:
-    ttft_p95_slo_ms: float = 1200.0
-    tpot_p95_slo_ms: float = 100.0
+    ttft_p95_slo_ms: float = 500.0
+    tpot_p95_slo_ms: float = 75.0
     default_window_ms: float = 60_000.0
     min_window_ms: float = 15_000.0
     max_window_ms: float = 300_000.0
@@ -93,8 +93,8 @@ class ControllerConfig:
         redis_url = _get_str(values, "TRE_REDIS_URL", "redis://aibrix-redis-master:6379/0")
 
         safescale = SafeScaleConfig(
-            ttft_p95_slo_ms=_get_positive_float(values, "SAFE_SCALE_TTFT_P95_SLO_MS", 1200.0),
-            tpot_p95_slo_ms=_get_positive_float(values, "SAFE_SCALE_TPOT_P95_SLO_MS", 100.0),
+            ttft_p95_slo_ms=_get_positive_float(values, "SAFE_SCALE_TTFT_P95_SLO_MS", 500.0),
+            tpot_p95_slo_ms=_get_positive_float(values, "SAFE_SCALE_TPOT_P95_SLO_MS", 75.0),
             default_window_ms=_get_positive_float(values, "SAFE_SCALE_DEFAULT_WINDOW_MS", 60_000.0),
             min_window_ms=_get_positive_float(values, "SAFE_SCALE_MIN_WINDOW_MS", 15_000.0),
             max_window_ms=_get_positive_float(values, "SAFE_SCALE_MAX_WINDOW_MS", 300_000.0),
