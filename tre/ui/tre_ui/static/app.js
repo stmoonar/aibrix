@@ -171,7 +171,6 @@ function modelCard(meta, st) {
   chips.appendChild(el('span', 'chip', `awake ${awake}/${bound}`));
   if (st.signal_warm === true) chips.appendChild(el('span', 'chip warm', 'warm'));
   else if (st.signal_warm === false) chips.appendChild(el('span', 'chip cold', 'warming'));
-  if (st.is_saturated) chips.appendChild(el('span', 'chip', 'saturated'));
   if (st.signal_unavailable_reason) chips.appendChild(el('span', 'chip cold', st.signal_unavailable_reason));
   card.appendChild(chips);
   return card;

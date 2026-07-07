@@ -122,31 +122,22 @@ def test_build_plan_matches_legacy_middle_zone_safescale_probe_path() -> None:
     assert shrink.reason == "critical_middle_zone_safescale"
 
 
-def test_build_plan_matches_legacy_low_fairness_saturation_gate() -> None:
+def test_build_plan_low_fairness_receiver_needs_no_saturation() -> None:
+    # ADR-0014 (behaviour change): fairness receiver eligibility is z_m-band only. A LOW
+    # receiver that is NOT saturated now receives donor surplus. Previously the planner
+    # emitted "fairness_blocked_unsaturated" and gave nothing unless is_saturated was set.
+    # (No legacy parity here: the frozen legacy planner still has the removed gate and
+    # would diverge -- that divergence is the whole point of ADR-0014.)
     classifications = [
         _classification("low", ModelState.LOW, ModelRole.RECEIVER, 0.9),
         _classification("high", ModelState.HIGH, ModelRole.DONOR, 1.6, "surplus"),
     ]
-    legacy_classifications = [
-        _legacy_classification("low", ModelState.LOW, ModelRole.RECEIVER, 0.9),
-        _legacy_classification("high", ModelState.HIGH, ModelRole.DONOR, 1.6, "surplus"),
-    ]
     contexts = {
-        "low": {"assigned_replicas": 2, "routable_pods": 2, "is_saturated": True},
+        "low": {"assigned_replicas": 2, "routable_pods": 2},  # NOTE: no is_saturated
         "high": {"assigned_replicas": 3, "routable_pods": 3},
     }
     replicas = {"low": 2, "high": 3}
 
-    expected = legacy_build_paper_plan(
-        classifications=legacy_classifications,
-        model_contexts=contexts,
-        model_replicas=replicas,
-        idle_gpus=0,
-        min_replicas_per_model=1,
-        max_replicas_per_model=4,
-        rescue_due=False,
-        fairness_due=True,
-    )
     plan = build_plan(
         model_contexts=contexts,
         classifications=classifications,
@@ -155,9 +146,9 @@ def test_build_plan_matches_legacy_low_fairness_saturation_gate() -> None:
         cfg=PlanConfig(min_replicas_per_model=1, max_replicas_per_model=4, rescue_due=False, fairness_due=True),
     )
 
-    assert _deltas([action for action in plan.actions if isinstance(action, ScaleAction)]) == expected.deltas
-    assert plan.delayed_down_models == expected.delayed_down_models
-    assert plan.probe_upscale_plans == expected.probe_upscale_plans
+    upscales = [a for a in plan.actions if isinstance(a, ScaleAction) and a.delta > 0]
+    assert any(a.model == "low" for a in upscales), "non-saturated LOW receiver must now receive"
+    assert not any(e.startswith("fairness_blocked_unsaturated") for e in plan.events)
     assert {action.source_loop for action in plan.actions} == {"fairness"}
 
 

@@ -1,7 +1,8 @@
 """F-onset warmup guard (architect-ruled): at load onset the sliding window is still
 filling with traffic -> TRS structurally low -> false CRITICAL/LOW. Suppress receiver
-scale-ups until the window lies fully inside the traffic period, UNLESS the model is
-genuinely saturated (Q_ctl >= qsat). Preserves genuine sustained-CRITICAL responsiveness."""
+scale-ups until the window lies fully inside the traffic period. ADR-0014 removed the
+former saturation bypass, so warmup suppression is now unconditional (a genuine flash
+crowd in the warmup window is delayed at most one window)."""
 
 from __future__ import annotations
 
@@ -50,7 +51,7 @@ def test_observe_traffic_explicit_span() -> None:
     assert s.observe_traffic("m", has_traffic=True, window_start_ms=20000, window_end_ms=50000) is True  # 20000 >= 20000
 
 
-# --- planner enforcement (suppression + saturation bypass) ---
+# --- planner enforcement (unconditional warmup suppression, ADR-0014) ---
 
 def _crit(model: str, z: float = 0.5) -> ModelClassification:
     return ModelClassification(
@@ -59,8 +60,8 @@ def _crit(model: str, z: float = 0.5) -> ModelClassification:
     )
 
 
-def _ctx(*, warm: bool, saturated: bool, assigned: int = 3, routable: int = 1) -> dict:
-    return {"assigned_replicas": assigned, "routable_pods": routable, "signal_warm": warm, "is_saturated": saturated}
+def _ctx(*, warm: bool, assigned: int = 3, routable: int = 1) -> dict:
+    return {"assigned_replicas": assigned, "routable_pods": routable, "signal_warm": warm}
 
 
 def _cfg() -> PlanConfig:
@@ -73,25 +74,28 @@ def _upscales(plan) -> list[ScaleAction]:
 
 def test_build_plan_suppresses_unwarm_critical_receiver() -> None:
     plan = build_plan(
-        model_contexts={"m": _ctx(warm=False, saturated=False)},
+        model_contexts={"m": _ctx(warm=False)},
         classifications=[_crit("m")], model_replicas={"m": 3}, idle_gpus=0, cfg=_cfg(),
     )
     assert _upscales(plan) == []
     assert "receiver_suppressed_signal_warmup:m" in plan.events
 
 
-def test_build_plan_saturation_bypasses_warmup() -> None:
+def test_build_plan_warmup_suppression_has_no_saturation_bypass() -> None:
+    # ADR-0014 (behaviour change): the former saturation bypass is gone. An unwarm
+    # CRITICAL receiver is suppressed for this tick regardless of queue depth / any
+    # would-be saturation -- the context no longer carries an is_saturated escape hatch.
     plan = build_plan(
-        model_contexts={"m": _ctx(warm=False, saturated=True)},
+        model_contexts={"m": _ctx(warm=False)},
         classifications=[_crit("m")], model_replicas={"m": 3}, idle_gpus=0, cfg=_cfg(),
     )
-    assert any(a.model == "m" and a.delta > 0 for a in _upscales(plan))
-    assert "receiver_suppressed_signal_warmup:m" not in plan.events
+    assert _upscales(plan) == []
+    assert "receiver_suppressed_signal_warmup:m" in plan.events
 
 
 def test_build_plan_warm_critical_receiver_scales_first_tick() -> None:
     plan = build_plan(
-        model_contexts={"m": _ctx(warm=True, saturated=False)},
+        model_contexts={"m": _ctx(warm=True)},
         classifications=[_crit("m")], model_replicas={"m": 3}, idle_gpus=0, cfg=_cfg(),
     )
     assert any(a.model == "m" and a.delta > 0 for a in _upscales(plan))

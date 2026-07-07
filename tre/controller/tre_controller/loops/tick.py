@@ -283,7 +283,6 @@ def _model_contexts(
                 "y_m": result.y_m,
                 "routable_pods": metrics.routable_pods,
                 "assigned_replicas": assigned_replicas,
-                "is_saturated": result.Q_ctl >= spec.trs.qsat,
                 "signal_warm": signal_warm,
             }
         else:
@@ -308,7 +307,6 @@ def _model_contexts(
                 "y_m": None,
                 "routable_pods": metrics.routable_pods,
                 "assigned_replicas": assigned_replicas,
-                "is_saturated": False,
             }
         if paper_state_cache is not None:
             context, model_events = paper_state_cache.apply(model_name, context, tokens_available=tokens_available)

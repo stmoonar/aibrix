@@ -5,7 +5,6 @@ import math
 import pytest
 
 from golden.legacy_trs import (
-    LegacySaturationGuard,
     LegacyTRSComputer,
     LegacyTRSInput,
     legacy_compute_eta_m,
@@ -14,7 +13,6 @@ from golden.legacy_trs import (
 from tre_common.metrics_schema import ModelWindowMetrics
 from tre_common.registry import TrsParams
 from tre_controller.signals.trs import (
-    SaturationGuard,
     TRSComputer,
     TRSInput,
     compute_eta_m,
@@ -110,29 +108,9 @@ def test_trs_restore_matches_legacy_state() -> None:
     )
 
 
-def test_saturation_guard_matches_legacy_sequence() -> None:
-    legacy_computer = LegacyTRSComputer(ema_alpha=0.5)
-    migrated_computer = TRSComputer(ema_alpha=0.5)
-    legacy_guard = LegacySaturationGuard(qsat=4.0, epsat=0.05, Hsat=2)
-    migrated_guard = SaturationGuard(qsat=4.0, epsat=0.05, Hsat=2)
-    inputs = [
-        LegacyTRSInput(100.0, 96.0, avg_waiting=0.0, avg_running=4.0, avg_swapping=0.0, routable_pods=1, assigned_replicas=1),
-        LegacyTRSInput(100.0, 96.0, avg_waiting=0.0, avg_running=5.0, avg_swapping=0.0, routable_pods=1, assigned_replicas=1),
-        LegacyTRSInput(100.0, 96.0, avg_waiting=0.0, avg_running=6.0, avg_swapping=0.0, routable_pods=1, assigned_replicas=1),
-        LegacyTRSInput(200.0, 180.0, avg_waiting=0.0, avg_running=7.0, avg_swapping=0.0, routable_pods=1, assigned_replicas=1),
-    ]
-
-    for item in inputs:
-        expected_result = legacy_computer.compute(item, theta_m=10.0)
-        actual_result = migrated_computer.compute(TRSInput(**item.__dict__), theta_m=10.0)
-        expected = legacy_guard.evaluate(expected_result)
-        actual = migrated_guard.evaluate(actual_result)
-        _assert_float_or_none_equal(actual.gamma, expected.gamma)
-        assert actual.sat_windows == expected.sat_windows
-        assert actual.is_saturated is expected.is_saturated
-        assert actual.last_q_ctl == pytest.approx(expected.last_q_ctl)
-        assert actual.last_y == pytest.approx(expected.last_y)
-        assert migrated_guard.snapshot() == pytest.approx(legacy_guard.snapshot())
+# ADR-0014: SaturationGuard was removed (z_m threshold bands are the sole scaling
+# trigger), so the former test_saturation_guard_matches_legacy_sequence parity test
+# was deleted. The legacy reference class survives only in golden/legacy_trs.py.
 
 
 def test_trs_input_can_be_built_from_model_metrics_and_registry_params() -> None:

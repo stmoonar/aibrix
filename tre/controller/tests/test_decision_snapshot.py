@@ -77,7 +77,6 @@ def test_build_decision_snapshot_serializes_actions_and_events() -> None:
             "theta_m": None,
             "routable_pods": None,
             "assigned_replicas": None,
-            "is_saturated": None,
             "signal_warm": None,
             "state": None,
             "signal_source": "zm",

@@ -113,6 +113,8 @@ node9 实测（nvidia-smi compute-apps + /proc cgroup → pod 映射 + /is_sleep
 
 - **立场**：论文的核心贡献就是 TRS/Z_m 控制，长实验（N5）绝不允许跑在 queue_len 上。
   queue_len 只保留两个用途：R5 消融实验的一个 arm；文档化的紧急逃生舱。
+
+> **2026-07-07 架构变更（ADR-0014）**：饱和段（`SaturationGuard`/`is_saturated`，`qsat/epsat/hsat`）已从控制器移除；扩缩容与 fairness 受者资格纯由 z_m 阈值分带（tau_crit/tau_low/tau_high）决定。后续所有实验（R2/R3/R5）按无饱和段语义执行：R3 不再拟合 qsat/epsat/hsat（仅拟合 theta_m）；若 queue_len R5 arm 需要 qsat，它是固定归一化常数而非拟合的饱和阈值。详见 `DECISIONS.md` ADR-0014。
 - **修复三点**（全在读侧，细节见第 3 章）：
   1. **基线回看**：hist 文档读取范围扩为 `[window_start − lookback, window_end]`，
      delta = 窗口内最后一个文档 − 窗口起点前最后一个文档。窗口内**有 1 个文档即可**成 delta。

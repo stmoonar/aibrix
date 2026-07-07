@@ -177,60 +177,9 @@ class TRSComputer:
         return self._trs_ema
 
 
-@dataclass
-class SaturationResult:
-    gamma: float | None
-    sat_windows: int
-    is_saturated: bool
-    last_q_ctl: float
-    last_y: float
-
-
-class SaturationGuard:
-    def __init__(self, qsat: float = 4.0, epsat: float = 0.05, Hsat: int = 3) -> None:
-        self.qsat = qsat
-        self.epsat = epsat
-        self.Hsat = Hsat
-        self._sat_windows = 0
-        self._last_gamma: float | None = None
-
-    @property
-    def current_sat_windows(self) -> int:
-        return self._sat_windows
-
-    @property
-    def last_gamma(self) -> float | None:
-        return self._last_gamma
-
-    def restore(self, sat_windows: int = 0, gamma: float | None = None) -> None:
-        self._sat_windows = max(0, sat_windows)
-        self._last_gamma = gamma
-
-    def snapshot(self) -> dict[str, Any]:
-        return {"sat_windows": self._sat_windows, "gamma": self._last_gamma}
-
-    def evaluate(self, trs_result: TRSResult) -> SaturationResult:
-        gamma: float | None = None
-        if trs_result.prev_Y is not None and trs_result.prev_Q_ctl is not None:
-            dq = trs_result.Q_ctl - trs_result.prev_Q_ctl
-            if abs(dq) > 1e-12:
-                gamma = (trs_result.Y_m - trs_result.prev_Y) / dq
-        sat_this_window = False
-        if trs_result.Q_ctl >= self.qsat and gamma is not None and abs(gamma) <= self.epsat:
-            sat_this_window = True
-        if sat_this_window:
-            self._sat_windows += 1
-        else:
-            self._sat_windows = 0
-        is_saturated = self._sat_windows >= self.Hsat
-        self._last_gamma = gamma
-        return SaturationResult(
-            gamma=gamma,
-            sat_windows=self._sat_windows,
-            is_saturated=is_saturated,
-            last_q_ctl=trs_result.Q_ctl,
-            last_y=trs_result.Y_m,
-        )
+# ADR-0014: the SaturationResult / SaturationGuard classes (qsat/epsat/hsat -> is_saturated)
+# were removed. Scaling and fairness receiver eligibility are decided solely by z_m
+# threshold bands (tau_crit/tau_low/tau_high). See docs/refactor/DECISIONS.md ADR-0014.
 
 
 def _is_finite_positive(value: float) -> bool:
@@ -280,9 +229,9 @@ class SignalState:
     (see ``observe_traffic``): at load onset the sliding window is still filling with
     traffic, so TRS is structurally low (window-fill fraction) and z_m dips falsely
     CRITICAL. The guard suppresses receiver (CRITICAL/LOW) scale-ups until the window
-    lies fully inside the traffic period, with a saturation bypass in the planner so a
-    genuine flash crowd is still honoured. In-process only, like the EMA: after a
-    restart mid-traffic, one window of receiver-suppression (unless saturated).
+    lies fully inside the traffic period (ADR-0014: the saturation bypass was removed, so
+    a genuine flash crowd in the warmup window is delayed at most one window). In-process
+    only, like the EMA: after a restart mid-traffic, one window of receiver-suppression.
     """
 
     def __init__(self, warmup_ms: int = -1) -> None:

@@ -25,6 +25,11 @@ class TrsParams:
     tau_crit: float
     tau_low: float
     tau_high: float
+    # DEPRECATED (ADR-0014): the saturation-segment concept was removed; scaling and
+    # fairness receiver eligibility are decided solely by z_m threshold bands. These
+    # fields are retained only for backward-compatible registry.yaml parsing and are no
+    # longer fitted by R3. `qsat` is still consumed as the queue_len signal's z_m
+    # normalizer in signals/sources.py; `epsat`/`hsat` are now inert.
     qsat: float
     epsat: float
     hsat: int

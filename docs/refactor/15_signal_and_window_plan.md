@@ -216,6 +216,8 @@ W 值 + 依据"写进 WORKLOG 和 `06_calibration_design.md`。证据存 `s1_sho
 先完成 S1.1–S1.3 并通过 S1.2 真机验收把**唯一的**窗口长度 W **冻结**，再开 R3；R3 里就在
 这个 W 上拟合 theta。**不采纳任何缩放/换量纲的过渡捷径**（见 S1.0）。
 
+> **2026-07-07 架构变更（ADR-0014）**：饱和段（saturation segment）概念已移除，扩缩容与 fairness 受者资格纯由 z_m 阈值分带决定。**上面“theta（以及 S2/S3 的 w_p/qsat）都必须在最终窗口 W 上拟合”中的 qsat 部分作废**：R3/S2/S3 不再拟合 `qsat/epsat/hsat`（三者已弃用；`epsat/hsat` 完全失效，`qsat` 仅作 queue_len 信号的 z_m 归一化常数保留）。R3 在冻结 W 上只拟合 `theta_m`（rescue/fairness 共用一个）。后续 R2/R3/R5 一律按无饱和段语义执行——别按本节旧文去拟合 qsat。详见 `DECISIONS.md` ADR-0014。
+
 **只有一个窗口、一个 theta（rescue 和 fairness 共用，不要双 theta）**：
 - R3 的 r3_grid 用冻结的 `--window-ms=W` 采集，对每个模型拟合**一个** `theta_m`，写回
   registry 的 `theta_m` 字段（覆盖旧继承值）。`classify` 里 rescue 和 fairness 用的是同一个

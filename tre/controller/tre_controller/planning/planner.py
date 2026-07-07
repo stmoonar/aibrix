@@ -123,15 +123,17 @@ def build_plan(
 
     # F-onset warmup guard: a receiver (CRITICAL/LOW) whose signal is not yet 'warm'
     # (the sliding window still straddles this model's traffic onset -> TRS structurally
-    # low -> false CRITICAL/LOW) is suppressed for this tick, UNLESS it is genuinely
-    # saturated (Q_ctl >= qsat) -- the saturation bypass keeps a real flash crowd honoured.
-    # Applies to both receiver states, so it is consistent across rescue and fairness.
+    # low -> false CRITICAL/LOW) is suppressed for this tick. Applies to both receiver
+    # states, so it is consistent across rescue and fairness.
+    # ADR-0014: the former saturation bypass ("unless Q_ctl >= qsat") was removed. Warmup
+    # suppression is now unconditional; a genuine flash crowd in the warmup window is
+    # delayed at most one window (until the sliding window clears the traffic onset).
     warmup_suppressed: list[str] = []
     kept: list = []
     for item in classifications:
         if item.role == ModelRole.RECEIVER:
             ctx = model_contexts.get(item.model_name, {})
-            if not ctx.get("signal_warm", True) and not ctx.get("is_saturated", False):
+            if not ctx.get("signal_warm", True):
                 warmup_suppressed.append(item.model_name)
                 continue
         kept.append(item)
@@ -405,9 +407,9 @@ def build_plan(
                 needed -= idle_gain
         if needed <= 0:
             continue
-        if not bool(model_contexts.get(recv.model_name, {}).get("is_saturated", False)):
-            events.append(f"fairness_blocked_unsaturated:{recv.model_name}")
-            continue
+        # ADR-0014: fairness receiver eligibility is z_m-band only (CRITICAL/LOW). The
+        # former saturation gate (emit "fairness_blocked_unsaturated" unless Q_ctl >= qsat)
+        # was removed -- a non-saturated LOW/CRITICAL receiver now receives donor surplus.
 
         for donor in paper_donors:
             if needed <= 0:

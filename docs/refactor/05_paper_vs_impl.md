@@ -98,3 +98,16 @@ with current parameters the floor is `metrics_window_ms / (1 − hq)` = 40s, so 
 ## Service Manager Client Gap
 
 The controller client now targets service-manager v2 for state, target replicas, and routable hidden pods. Defrag remains an explicit integration gap: the planner and ActionQueue can represent `DefragAction`, but service-manager v2 currently has no `/v2/defrag` endpoint. Until P4/P5 adds that endpoint, controller dispatch returns a structured unsupported result instead of silently pretending the migration ran.
+
+## Saturation segment removed (2026-07-07, ADR-0014)
+
+The "saturation guard formula ... preserved" note above (`Gamma_m`, `Q_ctl >= qsat`,
+`epsat`, `Hsat`) and the "Still-divergent: `SaturationGuard`/gamma is dead in the live
+path" note are **superseded**: the saturation-segment concept has been **removed** from the
+controller rather than reconciled with the paper. Scaling and fairness receiver eligibility
+are now decided solely by the `z_m` threshold bands (`tau_crit/tau_low/tau_high`).
+`SaturationGuard`/`SaturationResult` are deleted; the live `Q_ctl >= qsat` threshold,
+`is_saturated`, and the `fairness_blocked_unsaturated` gate are gone. `qsat/epsat/hsat`
+remain in the registry schema only for parse-compat (deprecated; `qsat` still serves as the
+`queue_len` signal's z_m normalizer). **Paper-vs-impl delta:** the paper's saturation-guard
+derivation has *no corresponding implementation* as of ADR-0014. See `DECISIONS.md` ADR-0014.

@@ -409,3 +409,77 @@ S4 raw-logging first) -> R7/R2/R4/R5. Phase C (delete the 3 old aibrix-system mo
 - Tests: `test_signal_warmup.py` (5 observe_traffic unit + 4 planner suppression/bypass/warm/back-compat).
   make check 324. Mini re-shakedown (trickle-suppressed + spike-bypassed legs) required before closing.
 - Reversible: `TRE_SIGNAL_WARMUP_MS=0` restores pre-fix behaviour.
+
+## ADR-0014: Remove saturation-segment concept; z_m thresholds are the sole scaling trigger
+
+**Date:** 2026-07-07 · **Status:** Accepted (user-ruled) · **Supersedes the saturation
+elements of:** ADR-0013 (the F-onset warmup guard's "saturation bypass") and the "preserved
+saturation guard" / "still-divergent SaturationGuard" notes in `05_paper_vs_impl.md`.
+
+### Background
+The controller carried two parallel notions of "load high enough to act":
+1. **z_m threshold bands** — `tau_crit / tau_low / tau_high` map `z_m` to
+   CRITICAL / LOW / HEALTHY / HIGH (the paper's actual control signal), and
+2. a **saturation segment** — `SaturationGuard` (`qsat/epsat/hsat`) producing an
+   `is_saturated` flag (`Q_ctl >= qsat`, plus a gamma-flatness test), used as a *second*
+   gate on top of the bands.
+
+The c1 experiment exposed the redundancy as a live divergence: 7b and 8b measured
+z_min 0.804 / 0.805 — effectively identical, both below tau_crit — yet one scaled and the
+other did not. Root cause was in the saturation-decision chain: fairness receiver
+eligibility (`planner`: `fairness_blocked_unsaturated`) and the warmup bypass both keyed
+off `is_saturated`, a condition that is (a) **redundant** with z_m (a truly CRITICAL model
+is already caught by the band) and (b) **unpredictable** relative to z_m (`Q_ctl >= qsat`
+is a coarser, differently-scaled quantity than the theta-normalized `z_m`, so two models
+with the same z_m can land on opposite sides of qsat). The net effect was scaling that
+could not be reasoned about from the z_m the operator actually sees.
+
+Note also (recorded in ADR-0011 / 05_paper_vs_impl): `SaturationGuard` itself was already
+**dead code** in the live path — `tick.py` computed `is_saturated = Q_ctl >= spec.trs.qsat`
+directly and never instantiated the guard (the gamma/`Hsat` hysteresis never ran live). So
+the live behaviour was a bare `Q_ctl >= qsat` threshold, not even the full guard the docs
+described.
+
+### Decision
+Remove the saturation-segment concept entirely. **z_m threshold bands are the sole scaling
+trigger and the sole fairness receiver-eligibility test.**
+- `SaturationGuard` / `SaturationResult` deleted from `signals/trs.py`.
+- `is_saturated` removed from the tick context (`loops/tick.py`) and the decision snapshot
+  (`loops/decision_snapshot.py`); the UI "saturated" chip is removed.
+- Fairness: the `fairness_blocked_unsaturated` gate (`planner.py`) is deleted — a CRITICAL
+  or LOW receiver (by band) is eligible regardless of qsat.
+- Warmup guard (ADR-0013) is **retained** but its saturation bypass is removed: a
+  not-yet-warm receiver is suppressed unconditionally for that tick.
+
+### Trade-off
+Removing the warmup saturation bypass means a genuine flash crowd arriving *during* the
+F-onset warmup window is delayed by **at most one control window** (until the sliding window
+clears the traffic onset and the signal goes warm), instead of being rescued immediately
+via the qsat bypass. Accepted because: the bypass keyed on the same redundant/unpredictable
+qsat; sustained CRITICAL is honoured the very next window; and the ADR-0013 guard exists
+precisely because the signal is untrustworthy in that window — acting on qsat there was
+acting on an equally-untrustworthy proxy.
+
+### Impact
+- `qsat / epsat / hsat` in `TrsParams` (`common/registry.py`) are **deprecated but retained**
+  for backward-compatible `registry.yaml` parsing (marked deprecated in code + here).
+  `epsat` and `hsat` are now fully inert. `qsat` is **still consumed** as the `queue_len`
+  signal's z_m normalizer (`signals/sources.py`: `z_m = qsat / control_queue`) — a separate
+  z_m *producer*, not the saturation segment, and unaffected by this ADR.
+- **R3 refit no longer produces `qsat / epsat / hsat`.** Plan text that says R3/S2/S3 fits
+  `w_p / qsat` on the frozen window W is superseded for the qsat part (see the annotations
+  added to `15_signal_and_window_plan.md` §1.4 and `14_endgame_plan.md` §1.2). If the
+  `queue_len` R5 ablation arm needs a qsat, it is a fixed normalizer constant, not a fitted
+  saturation threshold.
+- **Golden / behaviour-contract change (per this ADR):** the `test_planner` low-fairness
+  parity test against the frozen `legacy_planner` (which still has the gate) was replaced by
+  a direct new-semantics test; `test_saturation_guard_matches_legacy_sequence` and
+  `test_build_plan_saturation_bypasses_warmup` were deleted. The frozen `golden/legacy_*`
+  references are left intact (they encode the *old* code by design); only the assertions that
+  the *new* controller must reproduce the old saturation behaviour were removed.
+
+### Rollback
+Revert the ADR-0014 commit. All state is code-level (no data migration): `is_saturated`
+re-enters the tick context, the fairness gate and warmup bypass return, and the deleted
+tests come back. `qsat/epsat/hsat` were never removed from the registry schema, so no
+`registry.yaml` change is needed either way.

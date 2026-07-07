@@ -2437,3 +2437,38 @@ Acceptance (measured):
 
 Evidence: docs/refactor/p11_evidence/topology_restore_20260707/ (state_pre/post.json,
 node9_nvidia_smi_post.txt, smoke.py+smoke_result.txt, reconcile_post.json, backup_*_pre.yaml).
+
+### [ADR-0014] Controller — remove saturation-segment concept, z_m-only scaling (2026-07-07)
+
+Architecture decision (user-ruled): removed the "saturation segment" (`is_saturated` /
+`SaturationGuard`, `qsat/epsat/hsat`). Scaling triggers AND fairness receiver eligibility
+are now decided **solely** by the z_m threshold bands (tau_crit/tau_low/tau_high →
+CRITICAL/LOW/HEALTHY/HIGH). Motivated by c1: 7b/8b measured z_min 0.804/0.805 (≈identical)
+yet one scaled and one did not — the divergence lived entirely in the saturation-decision
+chain, a gate redundant with and unpredictable relative to z_m. (`SaturationGuard` was also
+already dead in the live path — tick.py used a bare `Q_ctl >= qsat`.)
+
+Code (only these files touched):
+- `signals/trs.py`: deleted `SaturationResult` + `SaturationGuard`; docstring de-saturated.
+- `loops/tick.py`: removed `is_saturated` from both tick-context branches.
+- `loops/decision_snapshot.py`: dropped the `is_saturated` published field.
+- `planning/planner.py`: warmup guard now suppresses on `not signal_warm` alone (bypass
+  gone); deleted the fairness `fairness_blocked_unsaturated` gate.
+- `common/registry.py`: `qsat/epsat/hsat` kept for registry.yaml parse-compat, marked
+  DEPRECATED. `epsat/hsat` inert; `qsat` still used as the queue_len z_m normalizer.
+- `ui/static/app.js`: removed the "saturated" chip.
+
+Tests (intentional behaviour changes): deleted `test_saturation_guard_matches_legacy_sequence`;
+replaced `test_build_plan_saturation_bypasses_warmup` with
+`test_build_plan_warmup_suppression_has_no_saturation_bypass`; replaced the legacy fairness
+parity test with `test_build_plan_low_fairness_receiver_needs_no_saturation` (non-saturated
+LOW receiver now receives, no `fairness_blocked_unsaturated`); dropped `is_saturated` from the
+decision-snapshot expectation. Frozen `golden/legacy_*` left intact by design. `make check`:
+**357 passed** (was 358; net −1 from the deleted parity test).
+
+Trade-off (in ADR-0014): a flash crowd during the F-onset warmup window is delayed at most one
+control window (no qsat bypass). Impact: R3 refit no longer produces qsat/epsat/hsat — plan
+docs annotated (DECISIONS.md ADR-0014, 15_signal §1.4, 14_endgame §1.2, 05_paper_vs_impl).
+
+Deploy: controller image built (NOT rolled). Overlay tag bump + redeploy-guard pin left for
+the architect to apply after the running experiment series — see the handoff note.

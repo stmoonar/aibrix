@@ -126,7 +126,6 @@ def _model_states(
             "theta_m": context.get("theta_m"),
             "routable_pods": context.get("routable_pods"),
             "assigned_replicas": context.get("assigned_replicas"),
-            "is_saturated": context.get("is_saturated"),
             "signal_warm": context.get("signal_warm"),
             "state": state,
             "signal_source": context.get("signal_source"),
