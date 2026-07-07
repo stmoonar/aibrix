@@ -100,3 +100,114 @@ def test_checkpoint_resume(tmp_path: Path) -> None:
     # reload from disk -> resumes
     ck2 = r3_grid.Checkpoint.load(p)
     assert ck2.is_done(cell)
+
+
+# --- S4 raw logging (doc15 §4) -----------------------------------------------------------
+from types import SimpleNamespace
+
+
+def _stream_result(status=200, first_token_ms=120.0, done_ms=5000.0, prompt_tokens=130, completion_tokens=64):
+    return SimpleNamespace(
+        status=status, first_token_ms=first_token_ms, done_ms=done_ms,
+        prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
+    )
+
+
+def test_from_scenario_id_roundtrip() -> None:
+    cell = r3_grid.GridCell(512, 128, 8)
+    assert r3_grid.GridCell.from_scenario_id(cell.scenario_id) == cell
+    import pytest
+    with pytest.raises(ValueError):
+        r3_grid.GridCell.from_scenario_id("i512_o128_c8.instant")
+
+
+def test_build_raw_record_maps_schema() -> None:
+    res = _stream_result(first_token_ms=120.0, done_ms=5000.0, prompt_tokens=130, completion_tokens=64)
+    rec = r3_grid.build_raw_record("i512_o128_c8", send_ts_ms=1_000, res=res)
+    assert set(rec.keys()) == set(r3_grid.RAW_COLUMNS)
+    assert rec["send_ts_ms"] == 1_000
+    assert rec["recv_first_token_ts_ms"] == 1_120
+    assert rec["done_ts_ms"] == 6_000
+    assert rec["input_tokens"] == 130
+    assert rec["output_tokens"] == 64
+    assert rec["ttft_ms"] == 120.0
+    assert rec["e2e_ms"] == 5000.0
+    # tpot = (e2e - ttft) / (completion - 1)
+    assert rec["tpot_ms"] == (5000.0 - 120.0) / (64 - 1)
+    assert rec["http_status"] == 200
+    assert rec["cell_id"] == "i512_o128_c8"
+
+
+def test_build_raw_record_nulls_when_unavailable() -> None:
+    # error/no-usage response: durations + tokens genuinely unavailable -> null, not faked.
+    res = _stream_result(status=0, first_token_ms=None, done_ms=4200.0, prompt_tokens=None, completion_tokens=None)
+    rec = r3_grid.build_raw_record("i128_o128_c1", send_ts_ms=500, res=res)
+    assert rec["ttft_ms"] is None
+    assert rec["recv_first_token_ts_ms"] is None
+    assert rec["done_ts_ms"] == 4_700
+    assert rec["input_tokens"] is None
+    assert rec["output_tokens"] is None
+    assert rec["tpot_ms"] is None  # needs ttft + completion>1
+
+
+def test_build_raw_record_tpot_null_single_token() -> None:
+    res = _stream_result(first_token_ms=100.0, done_ms=100.0, completion_tokens=1)
+    rec = r3_grid.build_raw_record("i128_o128_c1", send_ts_ms=0, res=res)
+    assert rec["tpot_ms"] is None
+
+
+def test_drive_cell_writes_raw_jsonl(tmp_path) -> None:
+    import json as _json
+    import time as _time
+
+    calls = {"n": 0}
+
+    def fake_stream_call(url, headers, body, timeout):
+        calls["n"] += 1
+        _time.sleep(0.01)
+        return _stream_result()
+
+    raw_path = tmp_path / "i512_o128_c8.jsonl"
+    cell = r3_grid.GridCell(512, 128, 8)
+    start_ms, end_ms = r3_grid.drive_cell(
+        "http://gw", "dsqwen-7b", cell, duration_s=0.05,
+        raw_path=raw_path, stream_call=fake_stream_call,
+    )
+    assert end_ms >= start_ms
+    lines = [l for l in raw_path.read_text().splitlines() if l.strip()]
+    assert lines  # at least one request logged
+    rec = _json.loads(lines[0])
+    assert set(rec.keys()) == set(r3_grid.RAW_COLUMNS)
+    assert rec["cell_id"] == "i512_o128_c8"
+    assert rec["input_tokens"] == 130
+
+
+def test_drive_cell_writes_instant_sidecar(tmp_path) -> None:
+    import json as _json
+
+    def fake_stream_call(url, headers, body, timeout):
+        return _stream_result()
+
+    def fake_sampler(now):
+        return {"waiting": 2.0, "running": 5.0, "swapping": 1.0}
+
+    raw_path = tmp_path / "i128_o128_c1.jsonl"
+    instant_path = tmp_path / "i128_o128_c1.instant.jsonl"
+    cell = r3_grid.GridCell(128, 128, 1)
+    r3_grid.drive_cell(
+        "http://gw", "dsqwen-7b", cell, duration_s=0.06,
+        raw_path=raw_path, instant_path=instant_path,
+        instant_sampler=fake_sampler, instant_interval_s=0.02, stream_call=fake_stream_call,
+    )
+    inst_lines = [l for l in instant_path.read_text().splitlines() if l.strip()]
+    assert inst_lines
+    snap = _json.loads(inst_lines[0])
+    assert set(snap.keys()) == {"ts_ms", "waiting", "running", "swapping"}
+    assert snap["running"] == 5.0
+
+
+def test_estimate_capture_bytes_scales_with_grid() -> None:
+    cells = r3_grid.enumerate_cells([128], [128], [1, 2])
+    est = r3_grid.estimate_capture_bytes(cells, cell_seconds=60.0, assumed_rps_per_worker=2.0)
+    # (1 + 2) workers * 60s * 2 rps * 200 bytes
+    assert est == int((1 + 2) * 60.0 * 2.0 * r3_grid.RAW_BYTES_PER_REQUEST)
