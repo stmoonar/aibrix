@@ -9,6 +9,7 @@ ARG TARGETOS
 ARG TARGETARCH
 
 WORKDIR /workspace
+ENV GOPROXY=https://goproxy.cn,direct
 
 RUN apt-get update && apt-get install -y \
     libkrb5-dev libzmq3-dev

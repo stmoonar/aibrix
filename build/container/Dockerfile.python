@@ -21,6 +21,7 @@ WORKDIR /app
 ARG POETRY_VERSION=1.8.3
 
 # Install dependencies
+RUN chmod 1777 /tmp && sed -i 's|deb.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources
 RUN apt-get update \
     && apt-get install -y python3-dev build-essential \
     && apt-get clean && \
@@ -47,6 +48,7 @@ COPY --from=builder /app/dist/*.whl ./
 
 # Install build dependencies and clean up in one step (avoiding creating another new layer)
 # procps grep mawk are for batch worker to kill llm engine
+RUN chmod 1777 /tmp && sed -i 's|deb.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources
 RUN apt-get update \
     && apt-get install -y --no-install-recommends gcc python3-dev mawk procps grep  \
     && apt-get clean \
