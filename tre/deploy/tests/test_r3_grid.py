@@ -91,6 +91,67 @@ def test_compute_window_trs_uses_time_constant_ema() -> None:
     assert results[0].Q_ctl == 2.0
 
 
+def test_resume_preserves_prior_rows(tmp_path: Path) -> None:
+    # Regression (resume truncation bug): the per-cell full rewrite (write_csv opens "w")
+    # must not drop rows captured by a prior run. On resume, load_existing_rows re-seeds the
+    # in-memory rows from the on-disk CSV for the checkpoint-done cells so appending a new
+    # cell preserves the old ones and leaves exactly one header.
+    import csv
+
+    out = tmp_path / "grid.csv"
+    ck = tmp_path / "grid.checkpoint.json"
+
+    # First run: cell A captured + checkpointed.
+    cell_a = r3_grid.GridCell(128, 128, 1)
+    wm_a = _FakeWindow(0, 30000, 1.0, 2.0, 3.0, 4.0)
+    r3_grid.write_csv([r3_grid.window_row(cell_a, wm_a, 10.0, queue_control=1.0)], out)
+    ckpt = r3_grid.Checkpoint.load(ck)
+    ckpt.mark(cell_a)
+
+    # Resume: reload prior rows for done cells, drive cell B, rewrite.
+    ckpt2 = r3_grid.Checkpoint.load(ck)
+    rows = r3_grid.load_existing_rows(out, ckpt2.done)
+    assert [r["scenario_id"] for r in rows] == ["i128_o128_c1"]  # prior row reloaded
+    cell_b = r3_grid.GridCell(512, 128, 2)
+    wm_b = _FakeWindow(0, 30000, 5.0, 6.0, 7.0, 8.0)
+    rows.append(r3_grid.window_row(cell_b, wm_b, 20.0, queue_control=2.0))
+    r3_grid.write_csv(rows, out)
+
+    text = out.read_text()
+    assert text.count("scenario_id,scenario_family") == 1  # exactly one header, no dup
+    reader = list(csv.DictReader(out.open()))
+    ids = [row["scenario_id"] for row in reader]
+    assert ids == ["i128_o128_c1", "i512_o128_c2"]  # old row preserved AND new row appended
+    assert len(reader) == 2  # nothing lost
+
+
+def test_load_existing_rows_fresh_run_reloads_nothing(tmp_path: Path) -> None:
+    # Fresh run (empty checkpoint) must reload nothing even if a stale CSV exists, so the
+    # original truncate-and-restart behaviour is preserved.
+    out = tmp_path / "grid.csv"
+    cell = r3_grid.GridCell(128, 128, 1)
+    wm = _FakeWindow(0, 30000, 1.0, 2.0, 3.0, 4.0)
+    r3_grid.write_csv([r3_grid.window_row(cell, wm, 10.0, queue_control=1.0)], out)
+    assert r3_grid.load_existing_rows(out, set()) == []
+    assert r3_grid.load_existing_rows(tmp_path / "missing.csv", {"i128_o128_c1"}) == []
+
+
+def test_load_existing_rows_excludes_not_done_cells(tmp_path: Path) -> None:
+    # A row on disk whose cell is NOT in the checkpoint done set must be dropped (it will be
+    # re-driven; keeping it would duplicate).
+    out = tmp_path / "grid.csv"
+    wm = _FakeWindow(0, 30000, 1.0, 2.0, 3.0, 4.0)
+    r3_grid.write_csv(
+        [
+            r3_grid.window_row(r3_grid.GridCell(128, 128, 1), wm, 10.0, queue_control=1.0),
+            r3_grid.window_row(r3_grid.GridCell(512, 128, 2), wm, 20.0, queue_control=2.0),
+        ],
+        out,
+    )
+    kept = r3_grid.load_existing_rows(out, {"i128_o128_c1"})
+    assert [r["scenario_id"] for r in kept] == ["i128_o128_c1"]
+
+
 def test_checkpoint_resume(tmp_path: Path) -> None:
     p = tmp_path / "ck.json"
     ck = r3_grid.Checkpoint.load(p)

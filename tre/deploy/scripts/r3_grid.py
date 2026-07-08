@@ -159,6 +159,28 @@ def write_csv(rows: list[dict], path: Path) -> None:
             writer.writerow(row)
 
 
+def load_existing_rows(path: Path, keep_scenarios: set) -> list[dict]:
+    """Reload already-written window rows for the checkpoint-completed cells so a resumed
+    run APPENDS to (rather than truncates) prior output.
+
+    The bug this fixes: ``main`` rewrites the whole CSV (``write_csv`` opens "w") after
+    every cell from the in-memory ``rows`` list. On resume, done cells are ``continue``d
+    and never re-added to ``rows``, so the first ``write_csv`` after a resume truncated the
+    file down to only the newly-driven cells and silently dropped every previously-captured
+    window row. Seeding ``rows`` from the on-disk CSV (filtered to the checkpoint's done
+    set, so a not-yet-done cell can never be duplicated) preserves them.
+
+    Rows are filtered to ``keep_scenarios`` (the checkpoint done set): only cells the
+    checkpoint says are complete are trusted from disk; anything else is re-driven and would
+    otherwise duplicate. An empty ``keep_scenarios`` (fresh run) reloads nothing, preserving
+    the original truncate-and-restart behaviour."""
+    if not path.exists() or not keep_scenarios:
+        return []
+    with path.open("r", newline="") as fh:
+        reader = csv.DictReader(fh)
+        return [row for row in reader if row.get("scenario_id") in keep_scenarios]
+
+
 @dataclass
 class Checkpoint:
     path: Path
@@ -410,7 +432,9 @@ def main() -> int:
     # then takes the freshest bucket, not a lookback-wide average.
     instant_sampler = _make_live_instant_sampler(store, args.model, 2 * SCRAPE_INTERVAL_MS)
 
-    rows: list[dict] = []
+    # Resume-safe: seed rows from the rows already on disk for checkpoint-done cells, so the
+    # per-cell full rewrite below appends instead of truncating away prior captures.
+    rows: list[dict] = load_existing_rows(out, ckpt.done)
     for cell in cells:
         if ckpt.is_done(cell):
             continue
