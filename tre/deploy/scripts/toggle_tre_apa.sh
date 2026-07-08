@@ -21,6 +21,9 @@ CONTROLLER_DEPLOY="${CONTROLLER_DEPLOY:-tre-v2-controller}"
 APA_NS="${APA_NS:-default}"
 APA_DIR="${APA_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../baselines/apa" && pwd)}"
 APA_CRS=(dsqwen-7b-apa.yaml dsllama-8b-apa.yaml dsqwen-14b-apa.yaml)
+# Inert 0-replica scale anchors; the patched podautoscaler still resolves scaleTargetRef
+# to read the pod selector for KVCache scraping, so APA errors FailedGetScale without them.
+APA_ANCHORS=(dsqwen-7b-apa-anchor.yaml dsllama-8b-apa-anchor.yaml dsqwen-14b-apa-anchor.yaml)
 
 log() { echo "[toggle] $*"; }
 die() { echo "[toggle][ERROR] $*" >&2; exit 1; }
@@ -49,6 +52,18 @@ apply_apa_crs() {
   done
 }
 
+apply_apa_anchors() {
+  for f in "${APA_ANCHORS[@]}"; do
+    kubectl -n "$APA_NS" apply -f "$APA_DIR/$f"
+  done
+}
+
+delete_apa_anchors() {
+  for f in "${APA_ANCHORS[@]}"; do
+    kubectl -n "$APA_NS" delete -f "$APA_DIR/$f" --ignore-not-found --wait=true
+  done
+}
+
 set_tre_scaling() {
   kubectl -n "$TRE_NS" set env "deploy/$CONTROLLER_DEPLOY" "ENABLE_TRE_SCALING=$1"
   kubectl -n "$TRE_NS" rollout status "deploy/$CONTROLLER_DEPLOY" --timeout=120s
@@ -60,7 +75,8 @@ cmd_tre() {
   delete_apa_crs
   local n; n="$(apa_cr_count)"
   [[ "$n" -eq 0 ]] || die "APA still has $n PodAutoscaler CR(s); refusing to enable TRE (would double-drive scaling)"
-  log "2/3 verified 0 APA PodAutoscaler CRs"
+  log "2/3 verified 0 APA PodAutoscaler CRs; deleting APA scale anchors"
+  delete_apa_anchors
   log "3/3 enabling TRE scaling + restarting controller"
   set_tre_scaling true
   kubectl -n "$TRE_NS" rollout restart "deploy/$CONTROLLER_DEPLOY"
@@ -74,7 +90,8 @@ cmd_apa() {
   set_tre_scaling false
   if tre_scaling_enabled; then die "TRE scaling still enabled after set env; refusing to apply APA (would double-drive scaling)"; fi
   log "2/3 verified TRE scaling is off"
-  log "3/3 applying APA PodAutoscaler CRs"
+  log "3/3 applying APA scale anchors + PodAutoscaler CRs"
+  apply_apa_anchors
   apply_apa_crs
   log "done: APA is the active decision source"
 }

@@ -63,3 +63,7 @@ def test_toggle_script_enforces_stop_old_before_start_new() -> None:
     # APA arm: disable TRE and verify off before applying APA CRs.
     assert "refusing to apply APA" in script
     assert "ENABLE_TRE_SCALING" in script
+    # APA needs the inert scale anchors to resolve scaleTargetRef (else FailedGetScale):
+    # the APA arm applies them, the TRE arm removes them.
+    assert "APA_ANCHORS" in script
+    assert "apply_apa_anchors" in script and "delete_apa_anchors" in script
