@@ -86,7 +86,7 @@ def run_trace(
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--trace", required=True)
-    ap.add_argument("--gateway-url", default="http://10.103.92.7/v1/completions")
+    ap.add_argument("--gateway-url", default="http://192.168.223.76:31592/v1/completions")
     ap.add_argument("--out", default=None)
     ap.add_argument("--registry", default=None)
     ap.add_argument("--seed", type=int, default=0)

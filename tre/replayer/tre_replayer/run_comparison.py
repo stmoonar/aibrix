@@ -84,7 +84,7 @@ def run_comparison(
     *,
     dry_run: bool = True,
     execute_cluster_ops: bool = False,
-    gateway_url: str = "http://10.103.92.7/v1/completions",
+    gateway_url: str = "http://192.168.223.76:31592/v1/completions",
     registry_path: str | None = None,
     seed: int = 0,
 ) -> dict:
@@ -124,7 +124,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--trace-root", required=True, help="trace set dir (INDEX.json + <name>/trace.json)")
     ap.add_argument("--out-root", required=True)
     ap.add_argument("--arm", action="append", dest="arms", help="repeat; default tre then apa")
-    ap.add_argument("--gateway-url", default="http://10.103.92.7/v1/completions")
+    ap.add_argument("--gateway-url", default="http://192.168.223.76:31592/v1/completions")
     ap.add_argument("--registry", default=None)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--dry-run", action="store_true", help="fake sender; no network")
