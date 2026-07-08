@@ -75,8 +75,11 @@ spec:
             - name: TRE_METRICS_WINDOW_MODE
               value: "sliding"
             # S1.2: single shared window shortened 60s->30s (3x the 10s write period,
-            # covers 3 histogram points). STARTING value — freeze after S1.2 real-machine
-            # acceptance (lag P95 <= 35s). Do NOT start R3 refit until this W is frozen.
+            # covers 3 histogram points). FROZEN 2026-07-08 (ADR-0012): S1.2 real-machine acceptance on the
+            # isolated tre-v2 plane, n=12 step-load trials over 3 models; first-reflection lag
+            # (onset->first non-null z_m) P50=11.0s P95=12.7s max=14.9s <= 35s target -> W
+            # authoritative at 30000. Evidence: docs/refactor/p11_evidence/s1_shortwindow_20260708/.
+            # This is the single window S1.4 / R3 theta_m refit must use.
             - name: TRE_METRICS_WINDOW_MS
               value: "30000"
             # G5/N1.3: SafeScale commit-gate SLOs pinned explicitly to match the

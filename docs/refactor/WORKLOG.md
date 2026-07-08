@@ -2472,3 +2472,38 @@ docs annotated (DECISIONS.md ADR-0014, 15_signal §1.4, 14_endgame §1.2, 05_pap
 
 Deploy: controller image built (NOT rolled). Overlay tag bump + redeploy-guard pin left for
 the architect to apply after the running experiment series — see the handoff note.
+
+## 2026-07-08
+
+### [S1.2] Authoritative W-freeze — W=30000 FROZEN (ADR-0012)
+
+Ran the S1.2 real-machine acceptance on the isolated `tre-v2` data plane (the authoritative plane
+per the ADR-0012 correction / ADR-0008) to freeze the single shared TSS control window W.
+
+- Setup: controller image `tre-v2-controller:20260707-07717371`, mode **OBSERVE** the entire run
+  (decisions computed + logged, zero fleet actuation — so Z_m is read straight from the decision
+  store while the fleet stays put). Signal env under test: sliding window,
+  `TRE_METRICS_WINDOW_MS=30000`, refresh 5s, `TRE_MIN_LATENCY_SAMPLES=10`. Fleet
+  dsqwen-7b / dsllama-8b / dsqwen-14b each awake:1 (`routable_pods=1`) + 17 sleeping — unchanged
+  before/after.
+- Method: 12 step-load trials (4 rounds × 3 models). Per trial: idle-guard (confirm z_m null),
+  record onset, fire a 20-worker saturating load (max_tokens=128, input=64) for 60s, then 45s
+  cooldown to drain the sliding window back to idle. z_m read from the per-model decision-history
+  zset `tre:v2:decision:hist:<model>`; load driven from the node10 host so onset and decision ts
+  share one clock. All 12 trials: baseline idle confirmed, 0 request errors, client p95 1.9–2.2s.
+- Primary metric `lag_first` = onset → first decision entry with `z_m != null` (the moment the
+  shared signal first REFLECTS the load; apples-to-apples with the pre-change 60–120s
+  first-reflection lag of the old 60s *tumbling* window). Doc bound: `<= W + refresh + write ~= 35s`.
+- **RESULT (pooled n=12): `lag_first` P50=11.0s, P95=12.7s, max=14.9s** — comfortably ≤ 35s and
+  ~5–10× better than the pre-change 60–120s. (Context only: `lag_settle` to 90% of the saturated
+  plateau P95 ~51s; inherently ≥ W from single-replica queue growth under sustained saturation, not
+  the gated quantity.)
+- **JUDGMENT: P95 12.7s ≤ 35s ⇒ W AUTHORITATIVELY FROZEN at `TRE_METRICS_WINDOW_MS=30000`**
+  (sliding, 5s refresh). This is the single window S1.4 / R3 `theta_m` refit must use; the R3 W-side
+  hard gate is now satisfied (S4 raw-logging remains its own precondition). Overlay
+  `controller.yaml` comment updated STARTING→FROZEN; `06_calibration_design.md` updated with the
+  freeze conclusion.
+- Evidence: `docs/refactor/p11_evidence/s1_shortwindow_20260708/` (summary.txt / summary.json,
+  trials.json, raw_decision_hist.json, measure.py, analyze.py, README.md, pilot_*).
+- Post-run: all 3 models returned to idle (z_m null); fleet unchanged (awake:1×3 + 17 sleeping,
+  routable_pods=1 each); controller still OBSERVE; no scaling actions occurred.

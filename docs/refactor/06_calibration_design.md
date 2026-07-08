@@ -39,3 +39,8 @@ The fourth slice adds a deterministic grid-search wrapper over candidate `w_p`, 
 ## CLI Artifact
 
 The initial CLI is deliberately artifact-only. It reads a filtered window CSV, applies latency SLO labels, fits theta with the reliability gate, evaluates the CSV signal direction, and writes a sorted JSON profile patch. It does not mutate `registry.yaml`; applying or rejecting the patch remains an explicit operator step.
+
+
+## Control window W (S1.2 freeze, 2026-07-08)
+
+The single shared TSS control window is **frozen at W = `TRE_METRICS_WINDOW_MS` = 30000** (sliding, 5s refresh) by the S1.2 real-machine acceptance (ADR-0012), run on the isolated `tre-v2` plane in controller **observe** mode. Twelve step-load trials over `dsqwen-7b` / `dsllama-8b` / `dsqwen-14b` gave a first-reflection lag (onset → first non-null `z_m`) of **P50 = 11.0s, P95 = 12.7s, max = 14.9s**, comfortably under the 35s (`W + refresh + write`) target and ~5–10× better than the pre-change 60–120s. **This W = 30000 is the single window R3 must use when refitting `theta_m`** (and the window S1.4 depends on); R3 must not start until this freeze — now done. Evidence: `p11_evidence/s1_shortwindow_20260708/`.

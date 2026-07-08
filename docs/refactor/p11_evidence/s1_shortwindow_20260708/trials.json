@@ -1,0 +1,218 @@
+[
+  {
+    "trial": 1,
+    "round": 1,
+    "model": "dsqwen-7b",
+    "idle_guard": {
+      "idle": true,
+      "waited_s": 0.2,
+      "last_ts": 1783488606057
+    },
+    "onset_ms": 1783488610543,
+    "load_end_ms": 1783488671908,
+    "ok": 660,
+    "err": 0,
+    "rps": 11.0,
+    "lat_p50_ms": 1856.5,
+    "lat_p95_ms": 1879.2,
+    "errors": {}
+  },
+  {
+    "trial": 2,
+    "round": 1,
+    "model": "dsllama-8b",
+    "idle_guard": {
+      "idle": true,
+      "waited_s": 0.2,
+      "last_ts": 1783488715977
+    },
+    "onset_ms": 1783488717148,
+    "load_end_ms": 1783488777920,
+    "ok": 580,
+    "err": 0,
+    "rps": 9.67,
+    "lat_p50_ms": 2091.6,
+    "lat_p95_ms": 2138.2,
+    "errors": {}
+  },
+  {
+    "trial": 3,
+    "round": 1,
+    "model": "dsqwen-14b",
+    "idle_guard": {
+      "idle": true,
+      "waited_s": 0.2,
+      "last_ts": 1783488820089
+    },
+    "onset_ms": 1783488823216,
+    "load_end_ms": 1783488883771,
+    "ok": 560,
+    "err": 0,
+    "rps": 9.33,
+    "lat_p50_ms": 2151.9,
+    "lat_p95_ms": 2184.4,
+    "errors": {}
+  },
+  {
+    "trial": 4,
+    "round": 2,
+    "model": "dsqwen-7b",
+    "idle_guard": {
+      "idle": true,
+      "waited_s": 0.2,
+      "last_ts": 1783488923929
+    },
+    "onset_ms": 1783488929087,
+    "load_end_ms": 1783488990659,
+    "ok": 660,
+    "err": 0,
+    "rps": 11.0,
+    "lat_p50_ms": 1859.3,
+    "lat_p95_ms": 1884.5,
+    "errors": {}
+  },
+  {
+    "trial": 5,
+    "round": 2,
+    "model": "dsllama-8b",
+    "idle_guard": {
+      "idle": true,
+      "waited_s": 0.2,
+      "last_ts": 1783489028890
+    },
+    "onset_ms": 1783489035970,
+    "load_end_ms": 1783489097169,
+    "ok": 580,
+    "err": 0,
+    "rps": 9.67,
+    "lat_p50_ms": 2101.9,
+    "lat_p95_ms": 2150.6,
+    "errors": {}
+  },
+  {
+    "trial": 6,
+    "round": 2,
+    "model": "dsqwen-14b",
+    "idle_guard": {
+      "idle": true,
+      "waited_s": 0.2,
+      "last_ts": 1783489139715
+    },
+    "onset_ms": 1783489142478,
+    "load_end_ms": 1783489203217,
+    "ok": 560,
+    "err": 0,
+    "rps": 9.33,
+    "lat_p50_ms": 2155.2,
+    "lat_p95_ms": 2190.6,
+    "errors": {}
+  },
+  {
+    "trial": 7,
+    "round": 3,
+    "model": "dsqwen-7b",
+    "idle_guard": {
+      "idle": true,
+      "waited_s": 0.2,
+      "last_ts": 1783489241882
+    },
+    "onset_ms": 1783489248518,
+    "load_end_ms": 1783489309922,
+    "ok": 660,
+    "err": 0,
+    "rps": 11.0,
+    "lat_p50_ms": 1856.0,
+    "lat_p95_ms": 1884.6,
+    "errors": {}
+  },
+  {
+    "trial": 8,
+    "round": 3,
+    "model": "dsllama-8b",
+    "idle_guard": {
+      "idle": true,
+      "waited_s": 0.2,
+      "last_ts": 1783489348687
+    },
+    "onset_ms": 1783489355229,
+    "load_end_ms": 1783489415940,
+    "ok": 580,
+    "err": 0,
+    "rps": 9.67,
+    "lat_p50_ms": 2090.5,
+    "lat_p95_ms": 2124.9,
+    "errors": {}
+  },
+  {
+    "trial": 9,
+    "round": 3,
+    "model": "dsqwen-14b",
+    "idle_guard": {
+      "idle": true,
+      "waited_s": 0.2,
+      "last_ts": 1783489454982
+    },
+    "onset_ms": 1783489461242,
+    "load_end_ms": 1783489521562,
+    "ok": 560,
+    "err": 0,
+    "rps": 9.33,
+    "lat_p50_ms": 2147.8,
+    "lat_p95_ms": 2177.1,
+    "errors": {}
+  },
+  {
+    "trial": 10,
+    "round": 4,
+    "model": "dsqwen-7b",
+    "idle_guard": {
+      "idle": true,
+      "waited_s": 0.2,
+      "last_ts": 1783489563092
+    },
+    "onset_ms": 1783489566868,
+    "load_end_ms": 1783489628337,
+    "ok": 660,
+    "err": 0,
+    "rps": 11.0,
+    "lat_p50_ms": 1858.7,
+    "lat_p95_ms": 1889.4,
+    "errors": {}
+  },
+  {
+    "trial": 11,
+    "round": 4,
+    "model": "dsllama-8b",
+    "idle_guard": {
+      "idle": true,
+      "waited_s": 0.2,
+      "last_ts": 1783489672102
+    },
+    "onset_ms": 1783489673637,
+    "load_end_ms": 1783489734325,
+    "ok": 580,
+    "err": 0,
+    "rps": 9.67,
+    "lat_p50_ms": 2088.3,
+    "lat_p95_ms": 2121.3,
+    "errors": {}
+  },
+  {
+    "trial": 12,
+    "round": 4,
+    "model": "dsqwen-14b",
+    "idle_guard": {
+      "idle": true,
+      "waited_s": 0.2,
+      "last_ts": 1783489775284
+    },
+    "onset_ms": 1783489779625,
+    "load_end_ms": 1783489839958,
+    "ok": 560,
+    "err": 0,
+    "rps": 9.33,
+    "lat_p50_ms": 2147.7,
+    "lat_p95_ms": 2172.7,
+    "errors": {}
+  }
+]

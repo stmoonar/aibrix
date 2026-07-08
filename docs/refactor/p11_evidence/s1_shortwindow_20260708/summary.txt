@@ -1,0 +1,66 @@
+=== S1.2 AUTHORITATIVE W-FREEZE — real-machine acceptance (2026-07-08) ===
+Plan: docs/refactor/15_signal_and_window_plan.md §1.2 ; ADR-0012 (+correction) in DECISIONS.md.
+
+SETUP
+- Cluster: isolated tre-v2 data plane (ADR-0008), the authoritative plane the freeze must run on.
+- Controller image: tre-v2-controller:20260707-07717371.
+- Controller mode: OBSERVE for the entire run (decisions computed + logged, NO fleet actuation).
+  => Z_m read straight from the decision store while the fleet stays put (3 awake, 17 sleeping).
+- Signal env under test: TRE_METRICS_WINDOW_MODE=sliding, TRE_METRICS_WINDOW_MS=30000,
+  TRE_METRICS_REFRESH_INTERVAL_SECONDS=5, TRE_MIN_LATENCY_SAMPLES=10.
+- Fleet: dsqwen-7b / dsllama-8b / dsqwen-14b each awake:1 (routable_pods=1), 17 sleeping. Unchanged before/after.
+
+METHOD
+- Step load driven from node10 host (same host clock as the redis/controller pods -> onset and
+  decision ts share one clock; measured skew = one refresh cadence only).
+- Per trial: (a) idle-guard — confirm the model's latest decision entry is idle (z_m null, trs 0);
+  (b) record onset_ms = wall clock at first request; (c) fire a 20-worker saturating step load
+  (max_tokens=128, input=64) for 60s; (d) 45s cooldown to drain the sliding window back to idle.
+- z_m source: per-model decision-history zset tre:v2:decision:hist:<model> (scored by window_end_ms),
+  dumped by score range after the run. Each entry carries z_m/trs/trs_z_m/state/signal_warm/window_end_ms.
+- 12 trials = 4 rounds x {dsqwen-7b, dsllama-8b, dsqwen-14b}. Models pooled for statistics
+  (plan15 §1.2 does not prescribe a per-model split; pooling noted here).
+
+PRIMARY METRIC (apples-to-apples with the pre-change 60-120s number, which was the first-reflection
+lag under the old 60s TUMBLING window):
+  lag_first = t(first decision entry after onset with z_m != null) - t(onset)
+  i.e. how long until the shared TSS signal first REFLECTS the added load.
+  Doc bound: <= W + refresh + write granularity ~= 35s worst case at W=30000.
+
+RESULTS (all 12 trials: baseline idle confirmed, 0 request errors, client p95 1.9-2.2s)
+ T  model        lag_first_s  first_z_m  state  lag_state_s  plateau_z_m  lag_settle_s
+ 1  dsqwen-7b     8.0          2.164      high   8.0          5.71         51.0
+ 2  dsllama-8b    11.0         3.249      high   11.0         4.62         35.6
+ 3  dsqwen-14b    14.9         3.700      high   2.8          6.53         45.2
+ 4  dsqwen-7b     7.3          3.246      high   7.3          6.58         43.6
+ 5  dsllama-8b    11.3         4.332      high   11.3         5.07         35.8
+ 6  dsqwen-14b    3.4          1.480      high   3.4          6.27         47.4
+ 7  dsqwen-7b     12.7         3.246      high   6.4          5.39         44.4
+ 8  dsllama-8b    11.6         4.332      high   11.6         5.45         41.7
+ 9  dsqwen-14b    6.5          1.480      high   6.5          6.11         44.9
+10  dsqwen-7b     8.8          4.328      high   8.8          5.78         41.7
+11  dsllama-8b    11.4         2.707      high   4.8          4.61         43.6
+12  dsqwen-14b    7.8          2.960      high   7.8          6.37         52.7
+
+AGGREGATE (n=12, models pooled)
+  lag_first  (PRIMARY; onset -> first non-null z_m):  P50=11.0s  P95=12.7s  max=14.9s  min=3.4s
+  lag_state  (onset -> state leaves idle):            P50=7.8s   P95=11.3s  max=11.6s
+  lag_settle (onset -> z_m >= 90% of trial plateau):  P50=44.4s  P95=51.0s  max=52.7s   [context only]
+
+INTERPRETATION
+- lag_first P95 = 12.7s (max 14.9s) is comfortably <= the 35s target and ~5-10x better than the
+  pre-change 60-120s tumbling-window first-reflection lag. This is the acceptance quantity: the
+  first moment Z_m reflects the load rise, bounded in theory by W + refresh + write (~35s worst case).
+- lag_settle (44-52s) is the time for z_m to reach ~90% of its saturated plateau. It is inherently
+  >= W and keeps climbing as the single replica's queue builds under sustained saturation; it is NOT
+  the "reflect" latency the criterion gates on, and is reported only as context.
+
+JUDGMENT
+  lag_first P95 = 12.7s  <=  35s  =>  PASS.
+  ==> W is AUTHORITATIVELY FROZEN at TRE_METRICS_WINDOW_MS = 30000 (sliding, 5s refresh).
+  This is the single window S1.4 / R3 theta_m refit must use. The S1.4/R3 hard gate is now satisfied
+  on the W side (S4 raw-logging remains its own precondition).
+
+POST-RUN STATE
+  All 3 models returned to idle (z_m null); fleet unchanged (awake:1x3 + 17 sleeping, routable_pods=1
+  each); controller still in OBSERVE. No scaling actions occurred (observe mode).
