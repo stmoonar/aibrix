@@ -80,8 +80,8 @@ so `generalizes=True`.
 
 ## Follow-up: 7b capacity monotonicity supplement (A3 dependency)
 
-Supplemental sweep  (4 cells x 300s) appended to 
-(540 -> 580 rows), then  re-fit (, ttft 500 / tpot 75).
-C(512, o) four points: o128 **11.733** > o256 **9.600** > o384 **8.533** > o512 **6.400** rps —
+Supplemental sweep `i512 o256/384 c48/c64` (4 cells x 300s) appended to `r3_7b_sweep.csv`
+(540 -> 580 rows), then `r3_capacity.py` re-fit (`capacity_dsqwen-7b.json`, ttft 500 / tpot 75).
+C(512, o) four points: o128 **11.733** > o256 **9.600** > o384 **8.533** > o512 **6.400** rps --
 strictly decreasing, monotonicity RESOLVED (was 7.467 / 5.333 for o256/o384 with the
 low-concurrency-only support, which dipped below o512).
