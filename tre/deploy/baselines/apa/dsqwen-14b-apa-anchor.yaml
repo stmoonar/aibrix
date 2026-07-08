@@ -1,0 +1,27 @@
+# Scale anchor for the dsqwen-14b APA baseline. See dsqwen-7b-apa-anchor.yaml for rationale.
+# 0-replica Deployment named after the model; publishes the model.aibrix.ai/name selector so
+# APA scrapes gpu_cache_usage_perc across all awake dsqwen-14b pods. Apply BEFORE the CR.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dsqwen-14b
+  namespace: default
+  labels:
+    app.kubernetes.io/name: tre-v2
+    tre.aibrix.io/baseline: apa
+    tre.aibrix.io/apa-scale-anchor: 'true'
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      model.aibrix.ai/name: dsqwen-14b
+  template:
+    metadata:
+      labels:
+        model.aibrix.ai/name: dsqwen-14b
+        model.aibrix.ai/port: '8000'
+        tre.aibrix.io/apa-scale-anchor: 'true'
+    spec:
+      containers:
+        - name: anchor
+          image: registry.k8s.io/pause:3.9

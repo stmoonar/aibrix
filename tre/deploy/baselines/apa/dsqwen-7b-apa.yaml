@@ -1,0 +1,35 @@
+# APA (KVCache) baseline autoscaler for dsqwen-7b (experiment 3 control arm).
+# scaleTargetRef.Name MUST equal the registry model name: the patched aibrix podautoscaler
+# controller passes it verbatim as the model to service-manager /models_replicas and
+# /scale_service (TRE-PATCH P2-APA-001, pkg/controller/podautoscaler/workload_scale.go:179,243,357,409).
+# The scale-anchor Deployment of the same name (dsqwen-7b-apa-anchor.yaml) provides the
+# scalable object + pod selector the reconcile still resolves; sleep mode never touches its
+# replicas. Apply/remove via deploy/scripts/toggle_tre_apa.sh (never alongside TRE).
+apiVersion: autoscaling.aibrix.ai/v1alpha1
+kind: PodAutoscaler
+metadata:
+  name: dsqwen-7b-apa
+  namespace: default
+  labels:
+    app.kubernetes.io/name: tre-v2
+    tre.aibrix.io/baseline: apa
+    model.aibrix.ai/name: dsqwen-7b
+  annotations:
+    autoscaling.aibrix.ai/up-fluctuation-tolerance: '0.1'
+    autoscaling.aibrix.ai/down-fluctuation-tolerance: '0.2'
+    apa.autoscaling.aibrix.ai/window: 30s
+spec:
+  scalingStrategy: APA
+  minReplicas: 1
+  maxReplicas: 8
+  metricsSources:
+    - metricSourceType: pod
+      protocolType: http
+      port: '8000'
+      path: metrics
+      targetMetric: gpu_cache_usage_perc
+      targetValue: '0.5'
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: dsqwen-7b

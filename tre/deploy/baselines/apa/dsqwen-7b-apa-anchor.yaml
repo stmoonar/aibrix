@@ -1,0 +1,32 @@
+# Scale anchor for the dsqwen-7b APA baseline.
+# The patched podautoscaler still resolves the scaleTargetRef to a scalable object to read
+# the pod label selector for KVCache metric scraping (getScaleResource ->
+# GetPodSelectorFromScale). tre-v2 has no aggregate Deployment per model (pods are per-GPU
+# deployments), so this 0-replica Deployment exists ONLY to (1) be that scalable object named
+# after the model and (2) publish the selector model.aibrix.ai/name=dsqwen-7b so APA scrapes
+# gpu_cache_usage_perc across all awake dsqwen-7b pods. APA sleep mode never changes its
+# replicas -- actual scaling goes through service-manager. Apply this BEFORE the PodAutoscaler.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dsqwen-7b
+  namespace: default
+  labels:
+    app.kubernetes.io/name: tre-v2
+    tre.aibrix.io/baseline: apa
+    tre.aibrix.io/apa-scale-anchor: 'true'
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      model.aibrix.ai/name: dsqwen-7b
+  template:
+    metadata:
+      labels:
+        model.aibrix.ai/name: dsqwen-7b
+        model.aibrix.ai/port: '8000'
+        tre.aibrix.io/apa-scale-anchor: 'true'
+    spec:
+      containers:
+        - name: anchor
+          image: registry.k8s.io/pause:3.9
