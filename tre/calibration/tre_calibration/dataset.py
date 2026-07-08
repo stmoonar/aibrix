@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import math
 from dataclasses import dataclass
 from pathlib import Path
@@ -85,6 +86,49 @@ def split_by_scenario(
         else:
             train.append(window)
     return train, test
+
+
+def select_test_scenarios(
+    windows: Iterable[CalibrationWindow],
+    *,
+    test_fraction: float = 0.2,
+    seed: str = "tre-v2-ranking",
+) -> set[str]:
+    """Deterministically pick whole scenarios for the held-out test set.
+
+    ``docs/refactor/06_calibration_design.md`` ("Split Target") assigns
+    scenario-level train/test splitting to this module "so scenario IDs never
+    leak across sets". The plan does not pin a ratio or an RNG, so this uses a
+    reproducible scenario-id hash split (default 80/20 train/test):
+
+      * the split unit is the whole scenario (grid cell) -- every window of a
+        scenario lands in the same set, so no cell can leak across train/test;
+      * scenarios are ranked by ``sha256(seed:scenario_id)`` using ``hashlib``
+        (NOT the builtin ``hash``, which is salted per-process via
+        ``PYTHONHASHSEED``), so the split is byte-identical across processes and
+        machines for the same CSV, ``seed`` and ``test_fraction``;
+      * the ``round(n * test_fraction)`` lowest-hash scenarios become test,
+        clamped to ``1 <= n_test <= n - 1`` whenever there are >= 2 scenarios so
+        that neither train nor test is empty.
+
+    A single-scenario CSV cannot be split without leaking, so this returns an
+    empty test set; the caller is expected to report that (and skip test-set
+    evaluation) rather than fit theta on an empty train set.
+    """
+    if not 0.0 < test_fraction < 1.0:
+        raise ValueError("test_fraction must be in the open interval (0, 1)")
+    scenario_ids = sorted({window.scenario_id for window in windows})
+    n = len(scenario_ids)
+    if n < 2:
+        return set()
+    n_test = round(n * test_fraction)
+    n_test = max(1, min(n_test, n - 1))
+    ranked = sorted(scenario_ids, key=lambda sid: (_scenario_hash(sid, seed), sid))
+    return set(ranked[:n_test])
+
+
+def _scenario_hash(scenario_id: str, seed: str) -> str:
+    return hashlib.sha256(f"{seed}:{scenario_id}".encode("utf-8")).hexdigest()
 
 
 def _resolve_latency_columns(latency_slo_ms: Mapping[str, float]) -> dict[str, str]:
