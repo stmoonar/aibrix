@@ -1,0 +1,90 @@
+{
+  "version": "experiment3-v1",
+  "total_slots": 8.0,
+  "model_slot_widths": {
+    "dsqwen-7b": 1.0,
+    "dsllama-8b": 1.0,
+    "dsqwen-14b": 2.0
+  },
+  "workloads": [
+    "t1_a1_demand_shift",
+    "t2_a2_anticorrelated",
+    "t3_a3_io_drift",
+    "t4_a4_spike_vs_burst",
+    "t5_a5_tp_pressure",
+    "t6_a6_control",
+    "t7_a2b_anticorrelated_hot"
+  ],
+  "designs": [
+    {
+      "name": "t1_a1_demand_shift",
+      "axis": "A1",
+      "headroom_tier": "tight",
+      "headroom_target": 0.9,
+      "peak_occupancy_slots": 7.2,
+      "peak_headroom": 0.9,
+      "headroom_is_capacity_dependent": false,
+      "mechanism": "Hard demand handoff 7b->8b; peak occupancy 0.90. Hot-switch should follow the step within the fast loop while cold-start scaling lags; neither model drops its serving floor."
+    },
+    {
+      "name": "t2_a2_anticorrelated",
+      "axis": "A2",
+      "headroom_tier": "medium",
+      "headroom_target": 0.75,
+      "peak_occupancy_slots": 6.0,
+      "peak_headroom": 0.75,
+      "headroom_is_capacity_dependent": false,
+      "mechanism": "Anti-correlated 7b/8b, Sum(rho)~5.2 constant across 233s phases; donor/receiver rebalance (slow loop) should migrate capacity each phase without both models staying high; 14b never participates."
+    },
+    {
+      "name": "t3_a3_io_drift",
+      "axis": "A3",
+      "headroom_tier": "medium",
+      "headroom_target": 0.75,
+      "peak_occupancy_slots": 6.0,
+      "peak_headroom": 0.75,
+      "headroom_is_capacity_dependent": true,
+      "mechanism": "RPS held constant while dsqwen-7b output grows 128->512 (decode gets heavier). Queue length / KVCache signals lag, so APA reacts late; TSS weighted throughput reflects the rising load immediately, so TRE should scale earlier."
+    },
+    {
+      "name": "t4_a4_spike_vs_burst",
+      "axis": "A4",
+      "headroom_tier": "medium",
+      "headroom_target": 0.75,
+      "peak_occupancy_slots": 6.0,
+      "peak_headroom": 0.75,
+      "headroom_is_capacity_dependent": false,
+      "mechanism": "Narrow 17s spikes (shorter than the EMA time constant) must NOT trigger a full scale-up or churn; the 127s wide burst (> 3 slow loops) must. Also exercises SafeScale rollback."
+    },
+    {
+      "name": "t5_a5_tp_pressure",
+      "axis": "A5",
+      "headroom_tier": "tight",
+      "headroom_target": 0.9,
+      "peak_occupancy_slots": 7.2,
+      "peak_headroom": 0.9,
+      "headroom_is_capacity_dependent": false,
+      "mechanism": "dsqwen-14b (tp_size=2) ramps to peak occupancy 0.90 while 7b/8b hold single-GPU slots awake, forcing the allocator to defragment two-GPU placement without breaking the 1-slot models' serving floor."
+    },
+    {
+      "name": "t6_a6_control",
+      "axis": "A6",
+      "headroom_tier": "loose",
+      "headroom_target": 0.6,
+      "peak_occupancy_slots": 4.6,
+      "peak_headroom": 0.575,
+      "headroom_is_capacity_dependent": false,
+      "mechanism": "Gentle in-phase ramp across all models to peak occupancy ~0.575 (loose); no model sustains rho > 1.2 so it stays below the C2 non-triviality threshold. Fairness control: TRE and APA should tie here, proving the other traces' gaps are real."
+    },
+    {
+      "name": "t7_a2b_anticorrelated_hot",
+      "axis": "A2",
+      "headroom_tier": "tight",
+      "headroom_target": 0.9,
+      "peak_occupancy_slots": 7.2,
+      "peak_headroom": 0.9,
+      "headroom_is_capacity_dependent": false,
+      "mechanism": "Anti-correlated 7b/8b, Sum(rho)~6.4 constant across 233s phases; donor/receiver rebalance (slow loop) should migrate capacity each phase without both models staying high; 14b never participates."
+    }
+  ]
+}

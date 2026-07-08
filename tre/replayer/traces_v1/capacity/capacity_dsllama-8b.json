@@ -1,0 +1,35 @@
+{
+  "model": "dsllama-8b",
+  "capacity": [
+    {
+      "input_tokens": 128,
+      "output_tokens": 128,
+      "rps": 13.866666666666667
+    },
+    {
+      "input_tokens": 128,
+      "output_tokens": 512,
+      "rps": 4.266666666666667
+    },
+    {
+      "input_tokens": 512,
+      "output_tokens": 128,
+      "rps": 10.666666666666666
+    },
+    {
+      "input_tokens": 512,
+      "output_tokens": 512,
+      "rps": 3.2
+    },
+    {
+      "input_tokens": 1024,
+      "output_tokens": 128,
+      "rps": 5.333333333333333
+    },
+    {
+      "input_tokens": 1024,
+      "output_tokens": 512,
+      "rps": 3.2
+    }
+  ]
+}

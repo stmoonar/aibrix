@@ -57,9 +57,13 @@ SATURATION_SHAPE = (512, 256)
 # A3 output-length drift ladder at fixed input; decode weight rises left to right.
 A3_INPUT = 512
 A3_OUTPUT_LADDER = (128, 256, 384, 512)
-# A3 target constant RPS = A3_RPS_MULT x single-pod capacity at the heaviest output shape,
-# so the heaviest drift phase sits above 1 pod (rho > 1) and the controller must react.
-A3_RPS_MULT = 1.5
+# A3 target constant RPS = A3_RPS_MULT x single-pod capacity at the heaviest output shape.
+# The heaviest drift phase's peak occupancy is A3_RPS_MULT (7b) + 1.2 (the constant 0.4-rho
+# 8b/14b floor: 0.4*1 + 0.4*2) slots, so A3_RPS_MULT is calibrated to 4.8 to land the peak on
+# the medium headroom tier (6.0 / 8 slots = 0.75) and pass lint C3. RPS is still held constant
+# across the drift while decode grows, so every phase sits above 1 pod (rho > 1) -- the
+# rate-signal-lag scenario A3 tests -- now with the whole drift in the saturated regime.
+A3_RPS_MULT = 4.8
 
 HEADROOM_TARGETS = {"loose": 0.60, "medium": 0.75, "tight": 0.90}
 
