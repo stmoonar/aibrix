@@ -2557,3 +2557,45 @@ the controller runs (doc15 §4), so theta is fit on the exact signal the live pa
 - Evidence: `docs/refactor/p11_evidence/r3_calibration_20260709/` (README + theta_fit_*_v2.json,
   theta_fit_14b.json, refit_*_report.json, ranking_*_final[_seedB].json, summary_3models.json). Large
   slide CSVs / raw JSONL live on node10 `76` under `/root/tre-experiments/` (paths in the README).
+
+### [infra] Envoy gateway upstream socket-exhaustion hardening (t1 503-storm fix) — 2026-07-09
+
+**Problem (t1 diagnosis).** TRE-vs-APA t1 (tight load): 45902 reqs / 49.6% got 503; envoy access
+log showed 10309/10310 as `response_flags=UF` +
+`upstream_reset_before_response_started{local_connection_failure|socket_creation_failure}` — envoy
+could not create the upstream socket (requests never reached vLLM). An innocent model (14b, 6rps)
+took 47% collateral 503s. Path: NodePort 31592 → Gateway `aibrix-system/aibrix-eg` → per-model
+HTTPRoute → model Service (default ns).
+
+**Root cause (confirmed on cluster).**
+1. The aibrix-system envoy container had `RLIMIT_NOFILE` **soft=1024** (hard=524288) — the node10
+   container-runtime default; the tre-v2 envoy happened to land on a node with default 1048576,
+   which is why only the APA/aibrix-system path hit the wall.
+2. Every model cluster had **no connection cap** — only `max_retries:1024` was set, so
+   `max_connections/max_pending_requests/max_requests` used Envoy's default 1024 **per cluster**.
+   The saturated model's long requests (p50 9s / p99 34s) pile up HTTP/1.1 upstream sockets (1 per
+   in-flight req); 3 clusters sharing one 1024-fd budget exhaust it globally → socket creation fails
+   for **every** model → innocent models collateral-damaged.
+
+**Fix (declarative, in-repo — `tre/deploy/gateway-hardening/`).**
+- `backendtrafficpolicy-aibrix-system.yaml` + `backendtrafficpolicy-tre-v2.yaml`: one
+  BackendTrafficPolicy per model per gateway (6 total), circuitBreaker
+  **maxConnections 256 / maxPendingRequests 64 / maxParallelRequests 256 / maxParallelRetries 16**.
+  Each model gets its own bounded quota → overload fast-fails as 503 **UO** (overflow, ms-latency,
+  before any socket attempt), confined to the saturated model. maxParallelRetries 16 caps the
+  1024-default retry amplification.
+- `envoyproxy-nofile-patch.yaml`: **SHARED-RESOURCE MODIFICATION (aibrix-system).** JSON merge
+  patch on the aibrix-owned EnvoyProxy `aibrix-custom-proxy-config` (GatewayClass-level → both
+  envoys) adding a shell wrapper `ulimit -n 65536; exec /usr/local/bin/envoy "$@"` to the envoy
+  container (65536 < hard 524288, unprivileged; EG args preserved). Rollback: re-apply patch with
+  the `command:` removed. Both envoy deployments rolled out cleanly.
+
+**Validation (bounded pressure, 2026-07-08T21:36–21:39Z).** Flooded 7b at conc 500 for 140s while
+probing 14b at 2rps. Envoy access-log flags over the window:
+- dsqwen-7b: **78085 × 503 flags=UO** (fast-fail, client-observed p50 125ms / p99 689ms) + 3609×200
+  — **zero UF/socket_creation_failure** under load heavier than t1 itself.
+- dsqwen-14b (innocent, concurrent): **52/52 × 200** — perfect isolation (t1 had 47% collateral).
+- Post-test: envoy fd back to 414 idle baseline, all 3 models 200 @ ~130ms; queues drained.
+
+`make check` → **417 passed**. New files are standalone (kubectl apply / kubectl patch), not part of
+any kustomize overlay, so no guard-test change needed.

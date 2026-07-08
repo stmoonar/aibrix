@@ -1,0 +1,64 @@
+# Per-model circuit breakers for the TRE serving data path (traffic: NodePort
+# 31094 -> Gateway tre-v2/tre-aibrix-eg -> per-model HTTPRoute in tre-v2 ns ->
+# model Service in default ns). Same fix and sizing rationale as
+# backendtrafficpolicy-aibrix-system.yaml (see that file's header for the full
+# t1 diagnosis). The TRE gateway has its OWN envoy pod (envoy-tre-v2-...) with
+# the identical RLIMIT_NOFILE=1024 exposure, so it needs the same protection;
+# the fd raise (envoyproxy-nofile-patch.yaml) is class-level and covers both
+# envoys at once.
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: BackendTrafficPolicy
+metadata:
+  name: dsqwen-7b-circuitbreaker
+  namespace: tre-v2
+  labels:
+    tre.aibrix.io/managed: 'true'
+    tre.aibrix.io/purpose: gateway-hardening
+spec:
+  targetRefs:
+  - group: gateway.networking.k8s.io
+    kind: HTTPRoute
+    name: dsqwen-7b-router
+  circuitBreaker:
+    maxConnections: 256
+    maxPendingRequests: 64
+    maxParallelRequests: 256
+    maxParallelRetries: 16
+---
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: BackendTrafficPolicy
+metadata:
+  name: dsqwen-14b-circuitbreaker
+  namespace: tre-v2
+  labels:
+    tre.aibrix.io/managed: 'true'
+    tre.aibrix.io/purpose: gateway-hardening
+spec:
+  targetRefs:
+  - group: gateway.networking.k8s.io
+    kind: HTTPRoute
+    name: dsqwen-14b-router
+  circuitBreaker:
+    maxConnections: 256
+    maxPendingRequests: 64
+    maxParallelRequests: 256
+    maxParallelRetries: 16
+---
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: BackendTrafficPolicy
+metadata:
+  name: dsllama-8b-circuitbreaker
+  namespace: tre-v2
+  labels:
+    tre.aibrix.io/managed: 'true'
+    tre.aibrix.io/purpose: gateway-hardening
+spec:
+  targetRefs:
+  - group: gateway.networking.k8s.io
+    kind: HTTPRoute
+    name: dsllama-8b-router
+  circuitBreaker:
+    maxConnections: 256
+    maxPendingRequests: 64
+    maxParallelRequests: 256
+    maxParallelRetries: 16

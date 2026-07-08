@@ -1,0 +1,53 @@
+# SHARED-RESOURCE MODIFICATION (aibrix-system). Raises RLIMIT_NOFILE on the
+# Envoy data-plane container from the container-runtime default soft=1024
+# (hard=524288) up to 65536. 1024 fds is dangerously low for an L7 gateway that
+# opens one HTTP/1.1 upstream socket per in-flight request across multiple model
+# clusters; it is the hard ceiling behind the t1 UF/socket_creation_failure
+# storm (see backendtrafficpolicy-aibrix-system.yaml header).
+#
+# This is a JSON *merge* patch against the aibrix-owned EnvoyProxy CR
+# 'aibrix-custom-proxy-config' (referenced by GatewayClass aibrix-eg, so it
+# applies to BOTH the aibrix-system and tre-v2 envoy deployments). The CR's own
+# StrategicMerge patch renders these containers into the managed Deployment; we
+# add a shell wrapper that raises the soft limit (65536 < hard 524288, allowed
+# unprivileged) then exec's envoy with EG's original args untouched ("$@").
+# The full containers array is restated because merge-patch replaces arrays.
+#
+# APPLY:
+#   kubectl patch envoyproxy aibrix-custom-proxy-config -n aibrix-system #     --type merge --patch-file envoyproxy-nofile-patch.yaml
+#   kubectl -n envoy-gateway-system rollout status deploy/envoy-aibrix-system-aibrix-eg-903790dc
+#   kubectl -n envoy-gateway-system rollout status deploy/envoy-tre-v2-tre-aibrix-eg-161007f9
+# VERIFY:  kubectl -n envoy-gateway-system exec <envoy-pod> -c envoy -- cat /proc/1/limits | grep 'open files'
+# ROLLBACK: re-apply the same patch with the 'command:' line removed from the
+#   envoy container (reverts to EG's default entrypoint / soft=1024).
+spec:
+  provider:
+    kubernetes:
+      envoyDeployment:
+        patch:
+          type: StrategicMerge
+          value:
+            spec:
+              template:
+                spec:
+                  containers:
+                  - name: envoy
+                    image: envoyproxy/envoy:v1.33.2
+                    command:
+                    - /bin/sh
+                    - -c
+                    - 'ulimit -n 65536 2>/dev/null || true; exec /usr/local/bin/envoy "$@"'
+                    - envoy
+                    resources:
+                      limits:
+                        cpu: 1
+                        memory: 1Gi
+                      requests:
+                        cpu: 1
+                        memory: 1Gi
+                  - name: shutdown-manager
+                    image: envoyproxy/gateway:v1.2.8
+                    resources:
+                      requests:
+                        cpu: 10m
+                        memory: 32Mi

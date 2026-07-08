@@ -1,0 +1,88 @@
+# Per-model circuit breakers for the APA / experiment-3 control-arm data path
+# (traffic: NodePort 31592 -> Gateway aibrix-system/aibrix-eg -> per-model
+# HTTPRoute -> model Service in default ns).
+#
+# WHY (t1 diagnosis, 2026-07): under the tight load t1, 45902 reqs / 49.6% got
+# 503; envoy access log showed 10309/10310 of them were response_flags=UF +
+# upstream_reset_before_response_started{local_connection_failure|
+# socket_creation_failure}: envoy could not create the upstream socket. Root
+# cause = the shared envoy container has RLIMIT_NOFILE soft=1024 (see
+# envoyproxy-nofile-patch.yaml), AND each model cluster had NO connection cap
+# (Envoy default max_connections/max_pending/max_requests = 1024 PER cluster,
+# only max_retries was set). The saturated model's long requests (p50 9s /
+# p99 34s) pile up HTTP/1.1 upstream connections (1 conn per in-flight req);
+# with 3 clusters sharing one 1024-fd budget the pool is exhausted globally, so
+# socket creation fails for EVERY model -- an innocent model (14b, 6rps) took
+# 47% collateral 503s.
+#
+# FIX: give each model cluster its own bounded quota. Overload now fast-fails as
+# 503 UO (overflow, returned in ms before any socket attempt) confined to the
+# saturated model, instead of UF socket_creation_failure that spreads across all
+# models. This is per-model isolation, not a promise that tight load all
+# succeeds (the physically-impossible part still fails -- but cleanly).
+#
+# SIZING: cap = ceiling, not steady target. Each model currently has 1 routable
+# replica (A100-40G vLLM). maxConnections/maxParallelRequests=256 is a runaway
+# ceiling (a single pod's productive concurrency is far below this; the cap only
+# stops the pile-up). maxPendingRequests=64 = small admission queue -> beyond
+# 256 active + 64 pending, requests overflow immediately (fast 503). Aggregate
+# ceiling 3x256=768 upstream conns sits well inside the raised fd budget
+# (envoyproxy-nofile-patch.yaml -> 65536). maxParallelRetries=16 caps retry
+# amplification (was defaulting to 1024). Tune per real per-model capacity as
+# replicas scale (cap is cluster-wide, shared across a model's replicas).
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: BackendTrafficPolicy
+metadata:
+  name: dsqwen-7b-circuitbreaker
+  namespace: aibrix-system
+  labels:
+    tre.aibrix.io/managed: 'true'
+    tre.aibrix.io/purpose: gateway-hardening
+spec:
+  targetRefs:
+  - group: gateway.networking.k8s.io
+    kind: HTTPRoute
+    name: dsqwen-7b-router
+  circuitBreaker:
+    maxConnections: 256
+    maxPendingRequests: 64
+    maxParallelRequests: 256
+    maxParallelRetries: 16
+---
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: BackendTrafficPolicy
+metadata:
+  name: dsqwen-14b-circuitbreaker
+  namespace: aibrix-system
+  labels:
+    tre.aibrix.io/managed: 'true'
+    tre.aibrix.io/purpose: gateway-hardening
+spec:
+  targetRefs:
+  - group: gateway.networking.k8s.io
+    kind: HTTPRoute
+    name: dsqwen-14b-router
+  circuitBreaker:
+    maxConnections: 256
+    maxPendingRequests: 64
+    maxParallelRequests: 256
+    maxParallelRetries: 16
+---
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: BackendTrafficPolicy
+metadata:
+  name: dsllama-8b-circuitbreaker
+  namespace: aibrix-system
+  labels:
+    tre.aibrix.io/managed: 'true'
+    tre.aibrix.io/purpose: gateway-hardening
+spec:
+  targetRefs:
+  - group: gateway.networking.k8s.io
+    kind: HTTPRoute
+    name: dsllama-8b-router
+  circuitBreaker:
+    maxConnections: 256
+    maxPendingRequests: 64
+    maxParallelRequests: 256
+    maxParallelRetries: 16
