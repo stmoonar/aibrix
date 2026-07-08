@@ -29,7 +29,7 @@ models:
   weights_path: /data/nfs_shared_data/DeepSeek-R1-Distill-Qwen-7B
   tp_size: 1
   min_replicas: 1
-  max_replicas: 4
+  max_replicas: 8
   vllm_image: vllm/vllm-openai:0.10.1-sleep
   slo:
     ttft_p95_ms: 500.0
@@ -62,7 +62,7 @@ models:
   weights_path: /data/nfs_shared_data/DeepSeek-R1-Distill-Llama-8B
   tp_size: 1
   min_replicas: 1
-  max_replicas: 4
+  max_replicas: 8
   vllm_image: vllm/vllm-openai:0.10.1-sleep
   slo:
     ttft_p95_ms: 500.0
