@@ -19,12 +19,32 @@ generator parameterises those designs against capacity and adds the two missing 
     should handle. It intentionally stays below the C2 non-triviality threshold (no model
     sustains rho > 1.2); its purpose is fairness evidence, not to stress the controller.
 
-Headroom tiers (loose 0.60 / medium 0.75 / tight 0.90) mirror lint._HEADROOM_TARGETS and
-are the *peak cluster occupancy* Sum_m rho_m * slot_width_m / total_slots. For every axis
-except A3 the peak occupancy is capacity-independent (lint recomputes rho = rps/C = the
-design rho, so C cancels), so the tier is hit exactly by construction and is unit-tested.
-A3's rho is capacity-derived, so its achieved headroom depends on the real surface and is
-reported (not pinned) -- see INDEX.json and the leftover notes in the module README.
+traceset-v2 -- integer-feasible occupancy
+-----------------------------------------
+traceset-v1 sized the tiers on *fractional* occupancy Sum_m rho_m * slot_width_m / slots.
+That is a physics bug: a model at rho=6.0 needs ceil(6)=6 integer replicas, every model
+with traffic needs >=1 awake replica (serving floor), and dsqwen-14b is tp2 (2 GPU/replica).
+v1's A1 "tight" phase (rho_7b=6.0 + the 0.4 floors) reads as 7.2/8=0.90 fractional but
+actually demands 6+1+2 = 9 GPU > 8 -- physically infeasible, a root cause of the t1 TRE-arm
+503 storm. traceset-v2 re-sizes every design so the *integer* GPU requirement
+Sum_m ceil(rho_m) * slot_width_m (>=1 replica per model that has traffic) is <= 8 at all
+times, and reports occupancy on that integer basis:
+
+  loose  = 4/8 (resting floor: one replica per model; 14b tp2 => 1+1+2)
+  medium = 6/8 (25% GPU headroom)
+  tight  = 8/8 (hugging the physical limit, still integer-feasible)
+
+assert_feasible() enforces the <= 8 invariant per phase at generation time; lint's C1 now
+checks the same integer occupancy (<= 1.0). For every axis except A3 the integer occupancy
+is capacity-independent (lint recomputes rho = rps/C = the design rho, so C cancels), so the
+tier is hit exactly by construction and is unit-tested. A3's rho is capacity-derived, so its
+achieved integer occupancy depends on the real surface and is reported, not pinned.
+
+Token shapes are pinned to *measured* capacity grid points so the replayer's real RPS is not
+built on an over-optimistic nearest-neighbour extrapolation (another t1 failure mode: 8b/14b
+at (512,256) borrowed the lighter (512,128) capacity). Baseline (128,128) and saturation
+(512,512) are measured for all three models; the A3 7b output ladder (512,{128,256,384,512})
+is measured for dsqwen-7b.
 
 Cluster shape (slot widths, total slots) comes from deploy/registry.yaml: dsqwen-7b and
 dsllama-8b are tp_size=1 (1 slot), dsqwen-14b is tp_size=2 (2 slots); the cluster is two
@@ -42,6 +62,7 @@ from typing import Callable, Mapping, Sequence
 from tre_calibration.capacity import CapacitySurface
 from tre_replayer.design import DemandPhase, design_trace_segments
 from tre_replayer.engine.schedule import RpsSegment
+from tre_replayer.lint import replicas_for_rho
 
 MODEL_7B = "dsqwen-7b"
 MODEL_8B = "dsllama-8b"
@@ -51,21 +72,25 @@ MODEL_14B = "dsqwen-14b"
 MODEL_SLOT_WIDTH: dict[str, float] = {MODEL_7B: 1.0, MODEL_8B: 1.0, MODEL_14B: 2.0}
 TOTAL_SLOTS = 8.0
 
-# Token shapes reused from the correctness set convention (README): baseline vs saturation.
-BASELINE_SHAPE = (256, 128)
-SATURATION_SHAPE = (512, 256)
-# A3 output-length drift ladder at fixed input; decode weight rises left to right.
+# Token shapes pinned to MEASURED capacity grid points (traceset-v2). Baseline (128,128) and
+# saturation (512,512) are measured for dsqwen-7b, dsllama-8b and dsqwen-14b, so the replayer's
+# real RPS never rests on a nearest-neighbour capacity extrapolation.
+BASELINE_SHAPE = (128, 128)
+SATURATION_SHAPE = (512, 512)
+# A3 output-length drift ladder at fixed input; decode weight rises left to right. All four
+# shapes (512,{128,256,384,512}) are measured grid points for dsqwen-7b (the only drift model).
 A3_INPUT = 512
 A3_OUTPUT_LADDER = (128, 256, 384, 512)
 # A3 target constant RPS = A3_RPS_MULT x single-pod capacity at the heaviest output shape.
-# The heaviest drift phase's peak occupancy is A3_RPS_MULT (7b) + 1.2 (the constant 0.4-rho
-# 8b/14b floor: 0.4*1 + 0.4*2) slots, so A3_RPS_MULT is calibrated to 4.8 to land the peak on
-# the medium headroom tier (6.0 / 8 slots = 0.75) and pass lint C3. RPS is still held constant
-# across the drift while decode grows, so every phase sits above 1 pod (rho > 1) -- the
-# rate-signal-lag scenario A3 tests -- now with the whole drift in the saturated regime.
-A3_RPS_MULT = 4.8
+# The heaviest drift phase needs ceil(A3_RPS_MULT) 7b replicas + the constant 8b/14b floor
+# (1 + 2 = 3 slots), so A3_RPS_MULT is calibrated to 2.8 (ceil = 3) to land the peak integer
+# occupancy on the medium tier (3 + 1 + 2 = 6 / 8 slots = 0.75) and pass lint C3. RPS is held
+# constant across the drift while decode grows, so every phase sits above 1 pod (rho > 1) --
+# the rate-signal-lag scenario A3 tests -- now integer-feasible.
+A3_RPS_MULT = 2.8
 
-HEADROOM_TARGETS = {"loose": 0.60, "medium": 0.75, "tight": 0.90}
+# Tiers are peak INTEGER GPU occupancy / total_slots; see module docstring and lint._HEADROOM_TARGETS.
+HEADROOM_TARGETS = {"loose": 0.50, "medium": 0.75, "tight": 1.00}
 
 DEFAULT_MODELS = (MODEL_7B, MODEL_8B, MODEL_14B)
 
@@ -94,14 +119,15 @@ def _design_a1_demand_shift() -> TraceDesign:
     """A1: staged saturation with a hard step -- only hot-switch keeps up on the handoff."""
     phases = [
         DemandPhase("warmup", 0.0, 113.0, _base()),
-        DemandPhase("qwen7b_saturate", 113.0, 400.0, _base(rho_7b=6.0), token_shapes=_sat_shapes(MODEL_7B)),
-        DemandPhase("handoff_llama8b", 400.0, 687.0, _base(rho_8b=6.0), token_shapes=_sat_shapes(MODEL_8B)),
+        DemandPhase("qwen7b_saturate", 113.0, 400.0, _base(rho_7b=4.8), token_shapes=_sat_shapes(MODEL_7B)),
+        DemandPhase("handoff_llama8b", 400.0, 687.0, _base(rho_8b=4.8), token_shapes=_sat_shapes(MODEL_8B)),
         DemandPhase("cooldown", 687.0, 800.0, _base()),
     ]
     return TraceDesign(
         "t1_a1_demand_shift", "A1", "tight",
-        "Hard demand handoff 7b->8b; peak occupancy 0.90. Hot-switch should follow the step "
-        "within the fast loop while cold-start scaling lags; neither model drops its serving floor.",
+        "Hard demand handoff 7b->8b; peak integer occupancy 8/8 (hot model 5 replicas + 8b/14b "
+        "floors 1+2). Hot-switch should follow the step within the fast loop while cold-start "
+        "scaling lags; neither model drops its serving floor.",
         phases, {m: BASELINE_SHAPE for m in DEFAULT_MODELS},
     )
 
@@ -119,9 +145,10 @@ def _design_a2_anticorrelated(name: str, headroom: str, hi: float, lo: float) ->
     ]
     return TraceDesign(
         name, "A2", headroom,
-        f"Anti-correlated 7b/8b, Sum(rho)~{hi + lo:g} constant across 233s phases; donor/receiver "
-        "rebalance (slow loop) should migrate capacity each phase without both models staying "
-        "high; 14b never participates.",
+        f"Anti-correlated 7b/8b, Sum(rho)~{hi + lo:g} constant across 233s phases; hot model "
+        f"{replicas_for_rho(hi)} replicas + donor 1 + 14b floor 2 = {replicas_for_rho(hi) + 1 + 2}/8. "
+        "Donor/receiver rebalance (slow loop) should migrate capacity each phase without both "
+        "models staying high; 14b never participates.",
         phases, {m: BASELINE_SHAPE for m in DEFAULT_MODELS},
     )
 
@@ -156,7 +183,7 @@ def _design_a3_io_drift(capacity: CapacitySurface) -> TraceDesign:
 
 def _design_a4_spike_vs_burst() -> TraceDesign:
     """A4: 17s narrow spike (below EMA tau) vs 127s wide burst -- same amplitude, differ in width."""
-    hi = 4.8
+    hi = 2.8
     phases = [
         DemandPhase("warmup", 0.0, 150.0, _base()),
         DemandPhase("narrow_spike_7b", 150.0, 167.0, _base(rho_7b=hi), token_shapes=_sat_shapes(MODEL_7B), allow_short=True),
@@ -181,21 +208,21 @@ def _design_a5_tp_pressure() -> TraceDesign:
         DemandPhase("warmup", 0.0, 120.0, _base()),
         DemandPhase("ramp1_14b", 120.0, 353.0, {**hold, MODEL_14B: 1.0}, token_shapes=_sat_shapes(MODEL_14B)),
         DemandPhase("ramp2_14b", 353.0, 586.0, {**hold, MODEL_14B: 2.0}, token_shapes=_sat_shapes(MODEL_14B)),
-        DemandPhase("ramp3_14b", 586.0, 819.0, {**hold, MODEL_14B: 3.1}, token_shapes=_sat_shapes(MODEL_14B)),
+        DemandPhase("ramp3_14b", 586.0, 819.0, {**hold, MODEL_14B: 2.8}, token_shapes=_sat_shapes(MODEL_14B)),
         DemandPhase("cooldown", 819.0, 900.0, _base()),
     ]
     return TraceDesign(
         "t5_a5_tp_pressure", "A5", "tight",
-        "dsqwen-14b (tp_size=2) ramps to peak occupancy 0.90 while 7b/8b hold single-GPU slots "
-        "awake, forcing the allocator to defragment two-GPU placement without breaking the "
-        "1-slot models' serving floor.",
+        "dsqwen-14b (tp_size=2) ramps 1->2->3 replicas to peak integer occupancy 8/8 (14b 3 "
+        "replicas x2 GPU + 7b/8b holding one GPU slot each) while 7b/8b stay awake, forcing the "
+        "allocator to defragment two-GPU placement without breaking the 1-slot models' serving floor.",
         phases, {m: BASELINE_SHAPE for m in DEFAULT_MODELS},
     )
 
 
 def _design_a6_control() -> TraceDesign:
     """A6: gentle in-phase ramp at loose headroom; every system should cope. Control/fairness."""
-    levels = (0.35, 0.75, 1.15, 0.75, 0.35)
+    levels = (0.35, 0.65, 0.95, 0.65, 0.35)
     phases: list[DemandPhase] = []
     start = 0.0
     for i, lvl in enumerate(levels):
@@ -204,9 +231,10 @@ def _design_a6_control() -> TraceDesign:
         start = end
     return TraceDesign(
         "t6_a6_control", "A6", "loose",
-        "Gentle in-phase ramp across all models to peak occupancy ~0.575 (loose); no model "
-        "sustains rho > 1.2 so it stays below the C2 non-triviality threshold. Fairness control: "
-        "TRE and APA should tie here, proving the other traces' gaps are real.",
+        "Gentle in-phase ramp across all models; every model stays at rho <= 0.95 so no model "
+        "ever needs a second replica -- integer occupancy holds at the 4/8 resting floor (loose). "
+        "It stays below the C2 non-triviality threshold (rho <= 1.2). Fairness control: TRE and "
+        "APA should tie here, proving the other traces' gaps are real.",
         phases, {m: BASELINE_SHAPE for m in DEFAULT_MODELS},
     )
 
@@ -215,12 +243,12 @@ def build_designs(capacity: CapacitySurface) -> list[TraceDesign]:
     """The seven formal traces: six mechanism axes A1..A6 plus a tight A2 variant."""
     return [
         _design_a1_demand_shift(),
-        _design_a2_anticorrelated("t2_a2_anticorrelated", "medium", hi=4.4, lo=0.8),
+        _design_a2_anticorrelated("t2_a2_anticorrelated", "medium", hi=2.8, lo=0.8),
         _design_a3_io_drift(capacity),
         _design_a4_spike_vs_burst(),
         _design_a5_tp_pressure(),
         _design_a6_control(),
-        _design_a2_anticorrelated("t7_a2b_anticorrelated_hot", "tight", hi=5.6, lo=0.8),
+        _design_a2_anticorrelated("t7_a2b_anticorrelated_hot", "tight", hi=4.8, lo=0.8),
     ]
 
 
@@ -232,12 +260,92 @@ def peak_occupancy(
     capacity: CapacitySurface,
     default_shapes: Mapping[str, tuple[int, int]],
 ) -> float:
-    """Peak Sum_m rho_m * slot_width_m over phases (lint's occupancy, pre-division)."""
+    """Peak fractional Sum_m rho_m * slot_width_m over phases (aggregate lower bound)."""
     peak = 0.0
     for phase in phases:
         occ = sum(rho * MODEL_SLOT_WIDTH[model] for model, rho in phase.rho_by_model.items() if rho > 0.0)
         peak = max(peak, occ)
     return peak
+
+
+# --- integer GPU feasibility (traceset-v2) --------------------------------------------------
+# The effective rho lint sees equals the design rho (rps = rho * C so rho = rps/C cancels the
+# surface). Integer feasibility therefore reads straight off phase.rho_by_model: every model
+# with rho > 0 needs ceil(rho) replicas (>= 1 serving floor), each occupying slot_width GPUs.
+
+
+def phase_replica_table(
+    phase: DemandPhase,
+    slot_widths: Mapping[str, float] = MODEL_SLOT_WIDTH,
+) -> dict:
+    """Per-model replica/GPU requirement for one phase, plus the phase GPU total."""
+    per_model: dict[str, dict] = {}
+    gpu_total = 0.0
+    for model, rho in phase.rho_by_model.items():
+        if rho <= 0.0:
+            continue
+        replicas = replicas_for_rho(rho)
+        width = float(slot_widths[model])
+        gpu = replicas * width
+        per_model[model] = {
+            "rho": round(rho, 4),
+            "replicas": replicas,
+            "slot_width": width,
+            "gpu": gpu,
+        }
+        gpu_total += gpu
+    return {
+        "phase": phase.name,
+        "start_s": _round(phase.start_s),
+        "end_s": _round(phase.end_s),
+        "per_model": per_model,
+        "gpu_total": gpu_total,
+    }
+
+
+def peak_integer_occupancy(
+    phases: Sequence[DemandPhase],
+    slot_widths: Mapping[str, float] = MODEL_SLOT_WIDTH,
+) -> float:
+    """Peak Sum_m ceil(rho_m) * slot_width_m over phases -- the real physical GPU requirement."""
+    return max((phase_replica_table(p, slot_widths)["gpu_total"] for p in phases), default=0.0)
+
+
+def assert_feasible(
+    design: "TraceDesign",
+    slot_widths: Mapping[str, float] = MODEL_SLOT_WIDTH,
+    total_slots: float = TOTAL_SLOTS,
+) -> None:
+    """Reject a design whose integer GPU requirement exceeds the cluster in any phase.
+
+    This is the guard traceset-v1 lacked: fractional occupancy Sum(rho*width) can read <= 8
+    while the integer requirement Sum(ceil(rho)*width) exceeds 8 (v1's A1: 6.8 fractional but
+    9 integer). Such a trace is physically unservable regardless of the controller.
+    """
+    for phase in design.phases:
+        table = phase_replica_table(phase, slot_widths)
+        if table["gpu_total"] > total_slots + 1e-9:
+            raise ValueError(
+                f"infeasible trace {design.name}: phase {phase.name} needs "
+                f"{table['gpu_total']:g} GPU > {total_slots:g} slots; per-model {table['per_model']}"
+            )
+
+
+def feasibility_proof(
+    phases: Sequence[DemandPhase],
+    slot_widths: Mapping[str, float] = MODEL_SLOT_WIDTH,
+    total_slots: float = TOTAL_SLOTS,
+) -> dict:
+    """Per-phase replica-requirement table used as the INDEX feasibility proof (<= total_slots)."""
+    tables = [phase_replica_table(p, slot_widths) for p in phases]
+    peak = max(tables, key=lambda t: t["gpu_total"]) if tables else {"phase": None, "gpu_total": 0.0}
+    return {
+        "total_slots": total_slots,
+        "peak_gpu": peak["gpu_total"],
+        "peak_phase": peak["phase"],
+        "feasible": peak["gpu_total"] <= total_slots + 1e-9,
+        "phases": tables,
+    }
 
 
 def segments_to_trace_json(segments: Sequence[RpsSegment]) -> dict[str, list[dict]]:
@@ -276,7 +384,7 @@ def generate_trace_set(
     capacity: CapacitySurface,
     out_dir: str | Path,
     *,
-    version: str = "experiment3-v1",
+    version: str = "experiment3-v2",
     designs_factory: Callable[[CapacitySurface], list[TraceDesign]] = build_designs,
 ) -> dict:
     """Write trace.json per design + INDEX.json; return the INDEX payload."""
@@ -286,22 +394,30 @@ def generate_trace_set(
 
     entries: list[dict] = []
     for design in designs:
+        # Physical feasibility guard: reject any design that needs > TOTAL_SLOTS integer GPUs.
+        assert_feasible(design)
         segments = design_trace_segments(design.phases, capacity, token_shapes=dict(design.default_shapes))
         trace = segments_to_trace_json(segments)
         case_dir = root / design.name
         case_dir.mkdir(parents=True, exist_ok=True)
         (case_dir / "trace.json").write_text(json.dumps(trace, indent=2) + "\n", encoding="utf-8")
 
-        occ = peak_occupancy(design.phases, capacity, design.default_shapes)
+        frac = peak_occupancy(design.phases, capacity, design.default_shapes)
+        integer_occ = peak_integer_occupancy(design.phases)
         entries.append(
             {
                 "name": design.name,
                 "axis": design.axis,
                 "headroom_tier": design.headroom,
                 "headroom_target": HEADROOM_TARGETS[design.headroom],
-                "peak_occupancy_slots": round(occ, 4),
-                "peak_headroom": round(occ / TOTAL_SLOTS, 4),
+                # traceset-v2 occupancy basis: integer replicas x slot_width.
+                "integer_gpu_occupancy": integer_occ,
+                "peak_integer_headroom": round(integer_occ / TOTAL_SLOTS, 4),
+                # fractional Sum(rho*width) kept for reference (the aggregate lower bound).
+                "peak_fractional_occupancy_slots": round(frac, 4),
+                "peak_fractional_headroom": round(frac / TOTAL_SLOTS, 4),
                 "headroom_is_capacity_dependent": design.headroom_is_capacity_dependent,
+                "feasibility": feasibility_proof(design.phases),
                 "mechanism": design.mechanism,
             }
         )
@@ -325,7 +441,7 @@ def main(argv: list[str] | None = None) -> int:
         help="capacity_<model>.json (repeat for each model, e.g. --capacity a.json --capacity b.json)",
     )
     ap.add_argument("--out-dir", required=True, help="output directory for the trace set")
-    ap.add_argument("--version", default="experiment3-v1")
+    ap.add_argument("--version", default="experiment3-v2")
     args = ap.parse_args(argv)
 
     capacity = load_capacity_surface(args.capacity)

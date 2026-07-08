@@ -1,0 +1,35 @@
+{
+  "model": "dsqwen-14b",
+  "capacity": [
+    {
+      "input_tokens": 128,
+      "output_tokens": 128,
+      "rps": 14.9
+    },
+    {
+      "input_tokens": 128,
+      "output_tokens": 512,
+      "rps": 4.266666666666667
+    },
+    {
+      "input_tokens": 512,
+      "output_tokens": 128,
+      "rps": 32.96666666666667
+    },
+    {
+      "input_tokens": 512,
+      "output_tokens": 512,
+      "rps": 12.8
+    },
+    {
+      "input_tokens": 1024,
+      "output_tokens": 128,
+      "rps": 32.0
+    },
+    {
+      "input_tokens": 1024,
+      "output_tokens": 512,
+      "rps": 12.8
+    }
+  ]
+}

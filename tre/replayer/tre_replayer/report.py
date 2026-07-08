@@ -44,6 +44,7 @@ def lint_trace_case(
         "passed": report.passed,
         "failed_constraints": report.failed_constraints,
         "max_headroom": report.max_headroom,
+        "max_fractional_headroom": report.max_fractional_headroom,
         "static_violation_duration_s": report.static_violation_duration_s,
         "oracle_violation_fraction": report.oracle_violation_fraction,
         "capacity_low_confidence": report.low_confidence_capacity or capacity_source.startswith("placeholder"),

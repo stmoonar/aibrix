@@ -1,0 +1,134 @@
+{
+  "dsllama-8b": [
+    {
+      "start_time": 0,
+      "end_time": 113,
+      "rps": 5.5467,
+      "input_tokens": 128,
+      "max_tokens": 128
+    },
+    {
+      "start_time": 113,
+      "end_time": 340,
+      "rps": 5.5467,
+      "input_tokens": 128,
+      "max_tokens": 128
+    },
+    {
+      "start_time": 340,
+      "end_time": 567,
+      "rps": 5.5467,
+      "input_tokens": 128,
+      "max_tokens": 128
+    },
+    {
+      "start_time": 567,
+      "end_time": 794,
+      "rps": 5.5467,
+      "input_tokens": 128,
+      "max_tokens": 128
+    },
+    {
+      "start_time": 794,
+      "end_time": 1021,
+      "rps": 5.5467,
+      "input_tokens": 128,
+      "max_tokens": 128
+    },
+    {
+      "start_time": 1021,
+      "end_time": 1088,
+      "rps": 5.5467,
+      "input_tokens": 128,
+      "max_tokens": 128
+    }
+  ],
+  "dsqwen-14b": [
+    {
+      "start_time": 0,
+      "end_time": 113,
+      "rps": 5.96,
+      "input_tokens": 128,
+      "max_tokens": 128
+    },
+    {
+      "start_time": 113,
+      "end_time": 340,
+      "rps": 5.96,
+      "input_tokens": 128,
+      "max_tokens": 128
+    },
+    {
+      "start_time": 340,
+      "end_time": 567,
+      "rps": 5.96,
+      "input_tokens": 128,
+      "max_tokens": 128
+    },
+    {
+      "start_time": 567,
+      "end_time": 794,
+      "rps": 5.96,
+      "input_tokens": 128,
+      "max_tokens": 128
+    },
+    {
+      "start_time": 794,
+      "end_time": 1021,
+      "rps": 5.96,
+      "input_tokens": 128,
+      "max_tokens": 128
+    },
+    {
+      "start_time": 1021,
+      "end_time": 1088,
+      "rps": 5.96,
+      "input_tokens": 128,
+      "max_tokens": 128
+    }
+  ],
+  "dsqwen-7b": [
+    {
+      "start_time": 0,
+      "end_time": 113,
+      "rps": 6.4,
+      "input_tokens": 128,
+      "max_tokens": 128
+    },
+    {
+      "start_time": 113,
+      "end_time": 340,
+      "rps": 17.92,
+      "input_tokens": 512,
+      "max_tokens": 128
+    },
+    {
+      "start_time": 340,
+      "end_time": 567,
+      "rps": 17.92,
+      "input_tokens": 512,
+      "max_tokens": 256
+    },
+    {
+      "start_time": 567,
+      "end_time": 794,
+      "rps": 17.92,
+      "input_tokens": 512,
+      "max_tokens": 384
+    },
+    {
+      "start_time": 794,
+      "end_time": 1021,
+      "rps": 17.92,
+      "input_tokens": 512,
+      "max_tokens": 512
+    },
+    {
+      "start_time": 1021,
+      "end_time": 1088,
+      "rps": 6.4,
+      "input_tokens": 128,
+      "max_tokens": 128
+    }
+  ]
+}
