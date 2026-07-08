@@ -42,6 +42,7 @@ from typing import Iterable, Optional
 
 from tre_common.metrics_schema import ModelWindowMetrics
 from tre_common.percentile import histogram_percentile
+from tre_common.rediskeys import SCRAPE_INTERVAL_MS
 
 from scripts import r3_grid
 
@@ -223,7 +224,10 @@ def main() -> int:
     ap.add_argument("--step-ms", type=int, default=None, help="slide step; default = window-ms (tumbling)")
     ap.add_argument("--percentile-mode", default="bucket_upper", choices=["bucket_upper", "interpolated"])
     ap.add_argument("--min-latency-samples", type=int, default=10)
-    ap.add_argument("--instant-sample-ms", type=int, default=5000)
+    # Must equal the r3 sidecar sampling cadence (== gateway scrape cadence,
+    # SCRAPE_INTERVAL_MS) so offline expected_samples matches the actual instant samples in
+    # each window; a mismatch halves the offline queue vs. the online path.
+    ap.add_argument("--instant-sample-ms", type=int, default=SCRAPE_INTERVAL_MS)
     ap.add_argument("--registry", default=None)
     ap.add_argument("--routable-pods", type=int, default=1)
     ap.add_argument("--assigned-replicas", type=int, default=1)

@@ -295,3 +295,60 @@ def test_metrics_store_matches_legacy_formula_on_edge_fixture():
     assert current.avg_running == legacy.avg_running
     assert current.kv_cache_hit_rate == legacy.kv_cache_hit_rate
     assert current.ttft_p95_ms == legacy.ttft_p95_ms
+
+
+# --- read_latest_instant: r3 sidecar freshness (SMOKE_FINDINGS defect 1) -----------------
+
+def test_read_latest_instant_captures_bucket_a_narrow_window_would_miss():
+    # Freshness/lag gap: the only instant bucket is at t=0, but the r3 sidecar samples at
+    # real time now=10_000. The buggy sampler read [now-5000, now]=[5000, 10000] -> bucket
+    # excluded -> avg 0 (34/34 zero samples). A >=2x-cadence lookback catches it as the
+    # LATEST value, not zero.
+    redis = FakeRedis()
+    pod = "default/pod-a"
+    redis.sadd("tre:v2:pods:dsqwen-7b", pod)
+    add_doc(redis, "tre:v2:inst:" + pod, 0, inst_doc("pod-a", waiting=2, running=6, kv_hit=0.5))
+
+    store = MetricsStore(redis, load_registry(str(REGISTRY_PATH)), instant_sample_interval_ms=10_000)
+
+    # narrow window (old behaviour) -> zero
+    narrow = store.read_model_window("dsqwen-7b", 5_000, 10_000, use_cache=False)
+    assert narrow.avg_running == 0.0
+    # latest read with 2x-cadence lookback -> the true value, not zero
+    snap = store.read_latest_instant("dsqwen-7b", now_ms=10_000, lookback_ms=20_000)
+    assert snap["running"] == 6.0
+    assert snap["waiting"] == 2.0
+    assert snap["swapping"] == 0.0
+
+
+def test_read_latest_instant_takes_freshest_not_average():
+    # Two buckets in the lookback window: must return the LATEST (running=8), never an
+    # average like (4+8)/2=6 or a halved (4+8)/expected_samples — the sidecar records an
+    # instant snapshot, and averaging is the offline rewindow step's job.
+    redis = FakeRedis()
+    pod = "default/pod-a"
+    redis.sadd("tre:v2:pods:dsqwen-7b", pod)
+    add_doc(redis, "tre:v2:inst:" + pod, 0, inst_doc("pod-a", waiting=1, running=4, kv_hit=0.5))
+    add_doc(redis, "tre:v2:inst:" + pod, 10_000, inst_doc("pod-a", waiting=2, running=8, kv_hit=0.5))
+
+    store = MetricsStore(redis, load_registry(str(REGISTRY_PATH)), instant_sample_interval_ms=10_000)
+    snap = store.read_latest_instant("dsqwen-7b", now_ms=12_000, lookback_ms=20_000)
+    assert snap["running"] == 8.0
+    assert snap["waiting"] == 2.0
+
+
+def test_read_latest_instant_sums_pods_and_handles_v1():
+    # Multi-pod: latest bucket per pod, summed (matches _aggregate_model per-pod sum). Also
+    # exercises the v1 legacy-key path used by the live controller / r3 driver.
+    redis = FakeRedis()
+    ts0, ts1 = 1_700_000_000_000, 1_700_000_010_000
+    for pod in ("default/pod-a", "default/pod-b"):
+        set_legacy_doc(redis, f"aibrix:pod_instant_metrics_{pod}_{ts0}", ts0, inst_doc(pod, waiting=1, running=2, kv_hit=0.5))
+    # only pod-a advances to a fresher bucket
+    set_legacy_doc(redis, f"aibrix:pod_instant_metrics_default/pod-a_{ts1}", ts1, inst_doc("pod-a", waiting=5, running=9, kv_hit=0.5))
+
+    store = MetricsStore(redis, load_registry(str(REGISTRY_PATH)), instant_sample_interval_ms=10_000, schema="v1")
+    snap = store.read_latest_instant("dsqwen-7b", now_ms=ts1 + 2_000, lookback_ms=20_000)
+    # pod-a latest running 9 + pod-b latest running 2 = 11
+    assert snap["running"] == 11.0
+    assert snap["waiting"] == 6.0

@@ -100,6 +100,43 @@ class MetricsStore:
             self._window_cache[cache_key] = model_metrics
         return model_metrics
 
+    def read_latest_instant(self, model: str, now_ms: int, lookback_ms: int) -> dict[str, float]:
+        """Latest instant queue snapshot (waiting/running/swapping), summed across pods.
+
+        Unlike ``read_model_window`` this returns the single most-recent scrape value per
+        pod (not a windowed average divided by expected_samples). The gateway writes the
+        instant buckets on a boundary-aligned ~10s ticker (SCRAPE_INTERVAL_MS); at real
+        time ``now`` the current bucket may not be written yet, so a narrow read can miss
+        it and record 0 (r3 SMOKE_FINDINGS defect 1: 34/34 zero samples). ``lookback_ms``
+        should be >= ~2x SCRAPE_INTERVAL_MS so the last-written bucket is always in range;
+        taking the latest doc (not an average) avoids the halving that a windowed read
+        would suffer when only one bucket is present. Used by the offline r3 sidecar
+        sampler to capture a queue snapshot that reconciles with the online average.
+        """
+        start_ms = max(0, now_ms - lookback_ms)
+        if self._schema == "v1":
+            inst_by_pod = self._read_legacy_docs(LEGACY_INST_PREFIX, model, start_ms, now_ms)
+        else:
+            inst_by_pod = {
+                _decode_text(pod): self._read_zset_docs(inst_key(_decode_text(pod)), start_ms, now_ms)
+                for pod in self._redis.smembers(pods_key(model))
+            }
+        totals = {"waiting": 0.0, "running": 0.0, "swapping": 0.0}
+        for docs in inst_by_pod.values():
+            if not docs:
+                continue
+            latest = docs[-1]  # _read_* sort ascending by timestamp -> last is freshest
+            metrics = latest.get("model_metrics")
+            if not isinstance(metrics, dict):
+                continue
+            for out_key, metric in (
+                ("waiting", INSTANT_METRICS["waiting"]),
+                ("running", INSTANT_METRICS["running"]),
+                ("swapping", INSTANT_METRICS["swapping"]),
+            ):
+                totals[out_key] += _number(metrics.get(f"{model}/{metric}"), 0.0)
+        return totals
+
     def _read_zset_docs(
         self,
         key: str,

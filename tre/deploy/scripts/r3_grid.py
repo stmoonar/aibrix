@@ -36,6 +36,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable, Optional
 
+from tre_common.rediskeys import SCRAPE_INTERVAL_MS
+
 
 @dataclass(frozen=True)
 class GridCell:
@@ -314,14 +316,17 @@ def estimate_capture_bytes(cells: list[GridCell], cell_seconds: float, assumed_r
     return int(total_requests * RAW_BYTES_PER_REQUEST)
 
 
-def _make_live_instant_sampler(store, model: str, interval_ms: int) -> Callable[[int], dict]:
-    """Instant queue snapshot from the live MetricsStore (reuses its instant aggregation
-    rather than re-reading Redis by hand). Reads a one-interval window ending at ``now``;
-    with expected_samples==1 the avg collapses to the latest instant sample."""
+def _make_live_instant_sampler(store, model: str, lookback_ms: int) -> Callable[[int], dict]:
+    """Instant queue snapshot from the live MetricsStore, reusing its instant read seam.
+
+    Returns the LATEST scrape value (via store.read_latest_instant), not a windowed
+    average. The gateway writes the instant buckets on a boundary-aligned ~10s ticker
+    (SCRAPE_INTERVAL_MS), so a naive [now-5000, now] read misses the current bucket and
+    records 0 (r3 SMOKE_FINDINGS defect 1). ``lookback_ms`` must be >= ~2x the scrape
+    cadence so the last-written bucket is always captured."""
 
     def sample(now: int) -> dict:
-        wm = store.read_model_window(model, now - interval_ms, now, use_cache=False)
-        return {"waiting": wm.avg_waiting, "running": wm.avg_running, "swapping": wm.avg_swapping}
+        return store.read_latest_instant(model, now, lookback_ms)
 
     return sample
 
@@ -340,7 +345,10 @@ def main() -> int:
     ap.add_argument("--window-ms", type=int, default=30000)
     ap.add_argument("--redis-url", default="redis://tre-v2-redis:6379/0")
     ap.add_argument("--metrics-schema", default="v1")
-    ap.add_argument("--instant-sample-ms", type=int, default=5000)
+    # Instant sampler cadence + expected_samples divisor. MUST match the gateway scrape
+    # cadence (SCRAPE_INTERVAL_MS=10000): a smaller value doubles expected_samples and
+    # halves the offline queue average vs. the online path (r3 SMOKE_FINDINGS defect 2).
+    ap.add_argument("--instant-sample-ms", type=int, default=SCRAPE_INTERVAL_MS)
     ap.add_argument("--percentile-mode", default="bucket_upper")
     ap.add_argument("--min-latency-samples", type=int, default=10)  # align with live TRE_MIN_LATENCY_SAMPLES
     ap.add_argument("--registry", default=None)
@@ -392,7 +400,10 @@ def main() -> int:
         schema=args.metrics_schema,
         min_latency_samples=args.min_latency_samples,  # align p95 with the live N1 guard
     )
-    instant_sampler = _make_live_instant_sampler(store, args.model, args.instant_sample_ms)
+    # Freshness lookback = 2x scrape cadence so the last-written 10s bucket is always in
+    # range even with scrape/write lag (r3 SMOKE_FINDINGS defect 1); read_latest_instant
+    # then takes the freshest bucket, not a lookback-wide average.
+    instant_sampler = _make_live_instant_sampler(store, args.model, 2 * SCRAPE_INTERVAL_MS)
 
     rows: list[dict] = []
     for cell in cells:

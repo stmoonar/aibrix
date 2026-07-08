@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from tre_common.rediskeys import SCRAPE_INTERVAL_MS
 from tre_controller.config import ControllerConfig
 
 
@@ -19,7 +20,9 @@ def test_config_defaults_are_plan_aligned() -> None:
     assert config.fairness_interval_s == 10.0
     assert config.metrics_window_ms == 30_000
     assert config.metrics_window_mode == "sliding"
-    assert config.instant_sample_interval_ms == 5_000
+    # Must default to the gateway scrape cadence so expected_samples matches the real 10s
+    # write cadence (r3 SMOKE_FINDINGS defect 2): a mismatch halves the controller's queue.
+    assert config.instant_sample_interval_ms == SCRAPE_INTERVAL_MS == 10_000
     assert config.histogram_lookback_ms == 90_000
     assert config.min_latency_samples == 10
     assert config.percentile_mode == "bucket_upper"

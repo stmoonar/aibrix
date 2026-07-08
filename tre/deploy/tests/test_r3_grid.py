@@ -206,6 +206,41 @@ def test_drive_cell_writes_instant_sidecar(tmp_path) -> None:
     assert snap["running"] == 5.0
 
 
+def test_make_live_instant_sampler_reads_latest_not_window_average() -> None:
+    # The sidecar sampler must delegate to store.read_latest_instant (freshest bucket),
+    # NOT read_model_window (which would zero-out on the freshness gap or halve the value).
+    # r3 SMOKE_FINDINGS defect 1.
+    class _FakeStore:
+        def __init__(self):
+            self.latest_calls = []
+            self.window_calls = 0
+
+        def read_latest_instant(self, model, now_ms, lookback_ms):
+            self.latest_calls.append((model, now_ms, lookback_ms))
+            return {"waiting": 2.0, "running": 6.0, "swapping": 0.0}
+
+        def read_model_window(self, *a, **k):  # must NOT be used by the sampler
+            self.window_calls += 1
+            raise AssertionError("sampler must not use read_model_window")
+
+    store = _FakeStore()
+    sampler = r3_grid._make_live_instant_sampler(store, "dsqwen-7b", lookback_ms=20_000)
+    snap = sampler(123_000)
+    assert snap == {"waiting": 2.0, "running": 6.0, "swapping": 0.0}
+    assert store.window_calls == 0
+    assert store.latest_calls == [("dsqwen-7b", 123_000, 20_000)]
+
+
+def test_r3_grid_uses_single_source_scrape_cadence() -> None:
+    # r3_grid must derive the instant-sample / expected_samples cadence from the single
+    # source of truth (tre_common.rediskeys.SCRAPE_INTERVAL_MS = 10s gateway write
+    # cadence), not a local magic number (r3 SMOKE_FINDINGS defect 2).
+    from tre_common.rediskeys import SCRAPE_INTERVAL_MS
+
+    assert r3_grid.SCRAPE_INTERVAL_MS is SCRAPE_INTERVAL_MS
+    assert SCRAPE_INTERVAL_MS == 10_000
+
+
 def test_estimate_capture_bytes_scales_with_grid() -> None:
     cells = r3_grid.enumerate_cells([128], [128], [1, 2])
     est = r3_grid.estimate_capture_bytes(cells, cell_seconds=60.0, assumed_rps_per_worker=2.0)

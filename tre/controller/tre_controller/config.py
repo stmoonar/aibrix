@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
 
+from tre_common.rediskeys import SCRAPE_INTERVAL_MS
+
 SIGNAL_SOURCES = {"zm", "latency_p95", "queue_len", "kv_cache"}
 PERCENTILE_MODES = {"bucket_upper", "interpolated"}
 WINDOW_MODES = {"tumbling", "sliding"}
@@ -150,7 +152,14 @@ class ControllerConfig:
             fairness_interval_s=_get_positive_float(values, "TRE_FAIRNESS_INTERVAL_SECONDS", 10.0),
             metrics_window_ms=metrics_window_ms,
             metrics_window_mode=metrics_window_mode,
-            instant_sample_interval_ms=_get_positive_int(values, "TRE_INSTANT_SAMPLE_INTERVAL_MS", 5_000),
+            # Must equal the gateway scrape cadence (SCRAPE_INTERVAL_MS): _instant_avg
+            # divides the summed in-window instant buckets by expected_samples =
+            # window_ms / this. A smaller value inflates expected_samples and HALVES the
+            # queue average the controller sees (r3 SMOKE_FINDINGS defect 2). Aligned to
+            # the real 10s write cadence; do not re-introduce a 5s magic number.
+            instant_sample_interval_ms=_get_positive_int(
+                values, "TRE_INSTANT_SAMPLE_INTERVAL_MS", SCRAPE_INTERVAL_MS
+            ),
             histogram_lookback_ms=_get_nonneg_int(values, "TRE_HIST_BASELINE_LOOKBACK_MS", 90_000),
             min_latency_samples=_get_nonneg_int(values, "TRE_MIN_LATENCY_SAMPLES", 10),
             percentile_mode=percentile_mode,

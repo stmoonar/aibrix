@@ -1,6 +1,17 @@
 RETENTION_MS = 30 * 60 * 1000
 FALLBACK_TTL_SECONDS = 2 * 60 * 60
 
+# SINGLE SOURCE OF TRUTH for the instant/histogram scrape cadence. The AIBrix gateway
+# writes the redis inst/hist buckets (inst_key/hist_key, and the legacy
+# aibrix:pod_instant_metrics_* keys) on a fixed, boundary-aligned ticker whose period is
+# the Go constant `RequestTraceWriteInterval = 10 * time.Second`
+# (aibrix pkg/cache/trace.go). That constant lives in aibrix-system and is not tunable
+# from TRE, so the Python side must mirror it here rather than re-inventing a second magic
+# number. `MetricsStore._instant_avg` uses this to count expected samples in a window, and
+# the offline r3 sidecar sampler uses ~2x this as its freshness lookback. Keep in sync if
+# the gateway's RequestTraceWriteInterval ever changes.
+SCRAPE_INTERVAL_MS = 10_000
+
 DECISION_LATEST_KEY = "tre:v2:decision:latest"
 # S5.1: per-model decision time-series (score = window_end_ms). Backs the UI timelines
 # and post-hoc experiment analysis. Retained ~24h with a TTL backstop.
