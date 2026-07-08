@@ -1,0 +1,104 @@
+{
+  "best": {
+    "auroc": 0.8740771148817126,
+    "lambda_wait": 3.0,
+    "objective": 0.8224645921883137,
+    "qmin": 1.0,
+    "spearman_health": 0.6449291843766274,
+    "w_p": 0.02
+  },
+  "comparison": {
+    "auroc_delta": 0.0027032779906343007,
+    "auroc_delta_pct": 0.31023171412618517,
+    "auroc_exceeds": false,
+    "spearman_delta": 0.10224524915731703,
+    "spearman_delta_pct": 18.8406625886203,
+    "spearman_exceeds": true,
+    "threshold_pct": 5.0
+  },
+  "generated_at": "2026-07-08T13:16:37.329947+00:00",
+  "grid": {
+    "candidate_count": 25,
+    "lambda_wait_candidates": [
+      1.5,
+      1.875,
+      2.25,
+      2.625,
+      3.0
+    ],
+    "qmin_candidates": [
+      1.0
+    ],
+    "w_p_candidates": [
+      0.02,
+      0.04,
+      0.06,
+      0.08,
+      0.1
+    ]
+  },
+  "inherited": {
+    "auroc": 0.8713738368910783,
+    "lambda_wait": 1.875,
+    "objective": 0.7713419676096551,
+    "qmin": 1.0,
+    "source": "registry",
+    "spearman_health": 0.5426839352193104,
+    "w_p": 0.08
+  },
+  "model_name": "dsllama-8b",
+  "recommendation": "adopt_refit",
+  "signal_column": "trs",
+  "slo": {
+    "e2e_p95": 12000.0,
+    "tpot_p95": 75.0,
+    "ttft_p95": 500.0
+  },
+  "top5": [
+    {
+      "auroc": 0.8740771148817126,
+      "lambda_wait": 3.0,
+      "objective": 0.8224645921883137,
+      "qmin": 1.0,
+      "spearman_health": 0.6449291843766274,
+      "w_p": 0.02
+    },
+    {
+      "auroc": 0.873709177157453,
+      "lambda_wait": 2.625,
+      "objective": 0.821852211920735,
+      "qmin": 1.0,
+      "spearman_health": 0.64370442384147,
+      "w_p": 0.02
+    },
+    {
+      "auroc": 0.8706318798272821,
+      "lambda_wait": 2.25,
+      "objective": 0.8197481339561163,
+      "qmin": 1.0,
+      "spearman_health": 0.6394962679122327,
+      "w_p": 0.02
+    },
+    {
+      "auroc": 0.8661923006750593,
+      "lambda_wait": 1.875,
+      "objective": 0.8172788154872205,
+      "qmin": 1.0,
+      "spearman_health": 0.634557630974441,
+      "w_p": 0.02
+    },
+    {
+      "auroc": 0.8636015325670499,
+      "lambda_wait": 1.5,
+      "objective": 0.8151846782082055,
+      "qmin": 1.0,
+      "spearman_health": 0.6303693564164109,
+      "w_p": 0.02
+    }
+  ],
+  "window": {
+    "count": 1671,
+    "healthy": 1566,
+    "violation": 105
+  }
+}

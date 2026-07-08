@@ -2507,3 +2507,53 @@ per the ADR-0012 correction / ADR-0008) to freeze the single shared TSS control 
   trials.json, raw_decision_hist.json, measure.py, analyze.py, README.md, pilot_*).
 - Post-run: all 3 models returned to idle (z_m null); fleet unchanged (awake:1×3 + 17 sleeping,
   routable_pods=1 each); controller still OBSERVE; no scaling actions occurred.
+
+## 2026-07-09
+
+### [R3 / S2] Calibration write-back — three-model theta_m + 7b/llama trs params LANDED (doc15 §1.4 / §2, ADR-0012)
+
+Final R3 calibration landing on the frozen control window **W=30000 sliding** (ADR-0012). The `trs`
+signal is the offline re-window of the R3 raw per-request logs through the same shared `TRSComputer`
+the controller runs (doc15 §4), so theta is fit on the exact signal the live path sees (S1.4).
+
+- **Grid**: R3 sweep enriched beyond the base 36-cell grid. 7b = 54 cells (base + `i512 o256/384`
+  input/output family + high-concurrency `c48/c64` on several families); 14b = 52 cells (base +
+  `c48..192`); llama unchanged (base 36). Slide CSVs re-windowed at **window=30000ms step=5000ms**,
+  `bucket_upper`, instant-sample 10000ms. Window counts: 7b 2979, llama 1984, 14b 2873.
+- **S2 param refit (`refit_*_report.json`, doc15 §2 5% criterion)**:
+  - **dsqwen-7b → adopt_refit**: best `w_p=0.02, lambda_wait=3.0` (from 0.08/1.875). Spearman-health
+    +8.61% over inherited (> 5% gate); AUROC +1.17% (within noise). Adopt.
+  - **dsllama-8b → adopt_refit**: best `w_p=0.02, lambda_wait=3.0`. Spearman-health +18.84% (> 5%);
+    AUROC +0.31%. Adopt.
+  - **dsqwen-14b → keep_inherited**: `w_p=0.0575, lambda_wait=3.0` already best-tier. No change.
+- **theta_m re-fit** (reliability 0.9; 7b/llama on the **new-param** trs, e2e SLO 12000; 14b on the
+  enriched fit). All publish=true, coverage_pass=true:
+  - dsqwen-7b  theta_m **715.2709967116108** (AUROC 0.9287, spearman 0.7542, support 2619) — was 738.67
+  - dsllama-8b theta_m **209.6470588235294** (AUROC 0.9235, spearman 0.6948, support 1671) — was 738
+  - dsqwen-14b theta_m **247.4172794117647** (AUROC 0.9802, spearman 0.8209, support 2543) — was 534
+- **Ranking separation** (`eval_ranking_separation.py`, train/test scenario holdout, two seeds each —
+  `tre-v2-ranking` + `tre-v2-ranking-b`). 7b train AUROC 0.91–0.96 / test 0.82–0.97; llama train
+  0.93–0.96 / test 0.77–0.90; both `false_healthy` low but non-zero ⇒ `generalizes=False` (the gate
+  is strict: any test violation labelled healthy fails it). 14b train AUROC ~0.978 both seeds,
+  `generalizes=True`.
+- **Violation占比** (window-level p95 > SLO, invariant to trs params): 7b 7.42% (221/2979; ttft 190 /
+  e2e 65), llama 6.28% (105/1671; ttft 55 / e2e 56), 14b 4.49% (129/2873; e2e 116 / ttft 28).
+- **Write-back**: `deploy/registry.yaml` — 7b/llama `w_p 0.08→0.02`, `lambda_wait 1.875→3.0`, theta_m
+  as above; 14b theta_m only. All other trs fields (tau_*, qmin, ema_*, qsat/epsat/hsat, w_d) untouched.
+  Golden test `deploy/tests/test_refit_trs_params.py::test_resolve_inherited_reads_registry_defaults`
+  updated to the new 7b registry defaults (0.02/3.0/1.0). `make check` → **406 passed**.
+- **Cluster**: `kubectl apply -k tre/deploy/overlays/tre-v2` refreshed the `tre-v2-registry`
+  ConfigMap; controller rolled to pick up the new theta. Mode stayed **observe** (redis
+  `tre:v2:controller:mode` unchanged across restart).
+
+**Known issues**:
+- **14b ranking test split artifact**: both seeds pin test AUROC at 0.500 because the held-out
+  scenarios carry **zero** SLO-violation windows (single-class → AUROC undefined → 0.5). Not a signal
+  regression (full-fit 14b AUROC 0.9802); `false_healthy=0` on test ⇒ `generalizes=True`.
+- **7b o384 capacity under-estimation**: the `C(512, o384)` capacity point is under-supported at the
+  top of the concurrency range; a supplemental `i512 o256/384 c48/c64` sweep was run to fill it
+  (see follow-up entry / `capacity_dsqwen-7b.json`).
+
+- Evidence: `docs/refactor/p11_evidence/r3_calibration_20260709/` (README + theta_fit_*_v2.json,
+  theta_fit_14b.json, refit_*_report.json, ranking_*_final[_seedB].json, summary_3models.json). Large
+  slide CSVs / raw JSONL live on node10 `76` under `/root/tre-experiments/` (paths in the README).

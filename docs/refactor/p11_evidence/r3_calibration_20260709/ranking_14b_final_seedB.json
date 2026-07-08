@@ -1,0 +1,112 @@
+{
+  "generalizes": true,
+  "generated_at": "2026-07-08T18:24:22.302624+00:00",
+  "model_name": "dsqwen-14b",
+  "signal_column": "trs",
+  "split": {
+    "leakage_free": true,
+    "method": "scenario_hash_holdout",
+    "seed": "tre-v2-ranking-b",
+    "test_fraction": 0.2,
+    "test_scenarios": [
+      "i1024_o128_c32",
+      "i1024_o512_c64",
+      "i128_o512_c16",
+      "i128_o512_c4",
+      "i512_o128_c2",
+      "i512_o128_c32",
+      "i512_o128_c4",
+      "i512_o128_c64",
+      "i512_o512_c16"
+    ],
+    "test_window_count": 495,
+    "total_scenarios": 46,
+    "total_windows": 2543,
+    "train_scenarios": [
+      "i1024_o128_c1",
+      "i1024_o128_c16",
+      "i1024_o128_c2",
+      "i1024_o128_c4",
+      "i1024_o128_c48",
+      "i1024_o128_c64",
+      "i1024_o128_c8",
+      "i1024_o128_c96",
+      "i1024_o512_c128",
+      "i1024_o512_c16",
+      "i1024_o512_c192",
+      "i1024_o512_c32",
+      "i1024_o512_c4",
+      "i1024_o512_c48",
+      "i1024_o512_c8",
+      "i1024_o512_c96",
+      "i128_o128_c1",
+      "i128_o128_c16",
+      "i128_o128_c2",
+      "i128_o128_c32",
+      "i128_o128_c4",
+      "i128_o128_c8",
+      "i128_o512_c32",
+      "i128_o512_c8",
+      "i512_o128_c1",
+      "i512_o128_c16",
+      "i512_o128_c48",
+      "i512_o128_c8",
+      "i512_o128_c96",
+      "i512_o512_c128",
+      "i512_o512_c192",
+      "i512_o512_c32",
+      "i512_o512_c4",
+      "i512_o512_c48",
+      "i512_o512_c64",
+      "i512_o512_c8",
+      "i512_o512_c96"
+    ],
+    "train_window_count": 2048
+  },
+  "test": {
+    "direction": {
+      "auroc": 0.5,
+      "healthy_windows": 495,
+      "spearman_health": 0.8333402180872632,
+      "violation_windows": 0,
+      "window_count": 495
+    },
+    "threshold": {
+      "auroc": 0.5,
+      "balanced_accuracy": 0.5,
+      "false_healthy": 0,
+      "false_violation": 0,
+      "spearman_health": 0.8333402180872632,
+      "theta": 247.4172794117647,
+      "true_healthy": 495,
+      "true_violation": 0
+    }
+  },
+  "train": {
+    "direction": {
+      "auroc": 0.9772127763571951,
+      "healthy_windows": 1919,
+      "spearman_health": 0.8213465433327966,
+      "violation_windows": 129,
+      "window_count": 2048
+    },
+    "fit": {
+      "attainment": 0.93701171875,
+      "candidate_count": 2021,
+      "confidence": 0.93701171875,
+      "coverage_pass": true,
+      "family_counts": {
+        "i1024_o128": 440,
+        "i1024_o512": 446,
+        "i128_o128": 330,
+        "i128_o512": 111,
+        "i512_o128": 275,
+        "i512_o512": 446
+      },
+      "publish": true,
+      "reject_reason": null,
+      "support": 2048,
+      "theta_m": 247.4172794117647
+    }
+  }
+}

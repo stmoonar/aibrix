@@ -216,7 +216,7 @@ def test_resolve_inherited_reads_registry_defaults() -> None:
     triple, source = refit_trs_params.resolve_inherited(
         "dsqwen-7b", w_p=None, lambda_wait=None, qmin=None
     )
-    assert triple == (0.08, 1.875, 1.0)
+    assert triple == (0.02, 3.0, 1.0)
     assert source == "registry"
     triple14, _ = refit_trs_params.resolve_inherited(
         "dsqwen-14b", w_p=None, lambda_wait=None, qmin=None

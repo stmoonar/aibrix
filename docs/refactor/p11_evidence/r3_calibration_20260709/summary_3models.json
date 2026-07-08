@@ -1,0 +1,163 @@
+{
+  "generated_at": "2026-07-09",
+  "models": {
+    "dsllama-8b": {
+      "auroc_full": 0.9261022927689594,
+      "auroc_test": 0.8802364864864864,
+      "auroc_train": 0.9374130998459284,
+      "bal_acc_test": 0.4972972972972973,
+      "generalizes": false,
+      "publish": true,
+      "s2_best": {
+        "auroc": 0.8741,
+        "lambda_wait": 3.0,
+        "objective": 0.8225,
+        "qmin": 1.0,
+        "w_p": 0.02
+      },
+      "s2_inherited": {
+        "auroc": 0.8714,
+        "lambda_wait": 1.875,
+        "objective": 0.7713,
+        "qmin": 1.0,
+        "w_p": 0.08
+      },
+      "s2_recommendation": "adopt_refit",
+      "spearman_test": 0.7789211826742075,
+      "theta_m_full": 296.4705882352941,
+      "violation": {
+        "e2e_slo": 12000,
+        "pct": 6.28,
+        "types": {
+          "e2e": 56,
+          "tpot": 0,
+          "ttft": 55
+        },
+        "violations": 105,
+        "windows": 1671
+      }
+    },
+    "dsqwen-14b": {
+      "auroc_full": 0.9802235666621709,
+      "auroc_test": 0.5,
+      "auroc_train": 0.9789217648700125,
+      "bal_acc_test": 0.49899396378269617,
+      "generalizes": true,
+      "publish": true,
+      "s2_best": {
+        "auroc": 0.941,
+        "lambda_wait": 1.5,
+        "objective": 0.8678,
+        "qmin": 1.0,
+        "w_p": 0.1
+      },
+      "s2_inherited": {
+        "auroc": 0.941,
+        "lambda_wait": 3.0,
+        "objective": 0.8598,
+        "qmin": 1.0,
+        "w_p": 0.0575
+      },
+      "s2_recommendation": "keep_inherited",
+      "spearman_test": 0.8484513128853121,
+      "theta_m_full": 247.4172794117647,
+      "violation": {
+        "e2e_slo": 15000,
+        "pct": 4.49,
+        "types": {
+          "e2e": 116,
+          "tpot": 0,
+          "ttft": 28
+        },
+        "violations": 129,
+        "windows": 2873
+      }
+    },
+    "dsqwen-7b": {
+      "auroc_full": 0.9169726657584186,
+      "auroc_test": 0.804901185770751,
+      "auroc_train": 0.9398050270143293,
+      "bal_acc_test": 0.5,
+      "generalizes": false,
+      "publish": true,
+      "s2_best": {
+        "auroc": 0.9115,
+        "lambda_wait": 3.0,
+        "objective": 0.8494,
+        "qmin": 1.0,
+        "w_p": 0.02
+      },
+      "s2_inherited": {
+        "auroc": 0.901,
+        "lambda_wait": 1.875,
+        "objective": 0.8217,
+        "qmin": 1.0,
+        "w_p": 0.08
+      },
+      "s2_recommendation": "adopt_refit",
+      "spearman_test": 0.7124435459401146,
+      "theta_m_full": 1031.7962728565115,
+      "violation": {
+        "e2e_slo": 12000,
+        "pct": 7.42,
+        "types": {
+          "e2e": 65,
+          "tpot": 0,
+          "ttft": 190
+        },
+        "violations": 221,
+        "windows": 2979
+      }
+    }
+  },
+  "note": "theta_m=theta_fit full fit; ranking/refit metrics on CSV trs column; violation stats = window-level p95>SLO on slide CSV",
+  "supplement_before": {
+    "dsqwen-14b": {
+      "auroc_full": 0.5,
+      "s2_best": {
+        "auroc": 0.5,
+        "lambda_wait": 1.5,
+        "objective": 0.7958,
+        "qmin": 1.0,
+        "w_p": 0.1
+      },
+      "s2_recommendation": "adopt_refit",
+      "theta_m_full": 247.4172794117647,
+      "violation": {
+        "e2e_slo": 15000,
+        "pct": 0.0,
+        "types": {
+          "e2e": 0,
+          "tpot": 0,
+          "ttft": 0
+        },
+        "violations": 0,
+        "windows": 1652
+      }
+    },
+    "dsqwen-7b": {
+      "auroc_full": 0.7116761029804508,
+      "s2_best": {
+        "auroc": 0.816,
+        "lambda_wait": 3.0,
+        "objective": 0.7885,
+        "qmin": 1.0,
+        "w_p": 0.02
+      },
+      "s2_recommendation": "adopt_refit",
+      "theta_m_full": 1722.2576099557664,
+      "violation": {
+        "e2e_slo": 12000,
+        "pct": 1.9,
+        "types": {
+          "e2e": 0,
+          "tpot": 0,
+          "ttft": 33
+        },
+        "violations": 33,
+        "windows": 1735
+      }
+    }
+  },
+  "supplement_note": "7b/14b re-fit after R3 supplemental sweep (7b 36->54 cells incl i512 o256/384 + high-conc; 14b 36->52 cells incl c48-192). llama unchanged. slide CSV window=30000 step=5000. Pre-supplement values preserved under supplement_before."
+}

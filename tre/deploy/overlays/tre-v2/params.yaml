@@ -39,12 +39,12 @@ data:
         tpot_p95_ms: 75.0
         e2e_p95_ms: 12000.0
       trs:
-        w_p: 0.08
+        w_p: 0.02
         w_d: 1.0
-        lambda_wait: 1.875
+        lambda_wait: 3.0
         qmin: 1.0
         ema_alpha: 0.2485
-        theta_m: 738.67
+        theta_m: 715.2709967116108
         tau_crit: 0.7485
         tau_low: 1.0
         tau_high: 1.6296
@@ -72,12 +72,12 @@ data:
         tpot_p95_ms: 75.0
         e2e_p95_ms: 12000.0
       trs:
-        w_p: 0.08
+        w_p: 0.02
         w_d: 1.0
-        lambda_wait: 1.875
+        lambda_wait: 3.0
         qmin: 1.0
         ema_alpha: 0.2485
-        theta_m: 738
+        theta_m: 209.6470588235294
         tau_crit: 0.7485
         tau_low: 1.0
         tau_high: 1.6296
@@ -110,7 +110,7 @@ data:
         lambda_wait: 3.0
         qmin: 1.0
         ema_alpha: 0.3935
-        theta_m: 534
+        theta_m: 247.4172794117647
         tau_crit: 0.56
         tau_low: 1.0
         tau_high: 1.26

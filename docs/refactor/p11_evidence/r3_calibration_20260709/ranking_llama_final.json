@@ -1,0 +1,99 @@
+{
+  "generalizes": false,
+  "generated_at": "2026-07-08T18:24:19.437555+00:00",
+  "model_name": "dsllama-8b",
+  "signal_column": "trs",
+  "split": {
+    "leakage_free": true,
+    "method": "scenario_hash_holdout",
+    "seed": "tre-v2-ranking",
+    "test_fraction": 0.2,
+    "test_scenarios": [
+      "i1024_o128_c1",
+      "i1024_o512_c16",
+      "i1024_o512_c8",
+      "i128_o512_c4",
+      "i512_o128_c1",
+      "i512_o128_c2",
+      "i512_o512_c16"
+    ],
+    "test_window_count": 386,
+    "total_scenarios": 33,
+    "total_windows": 1671,
+    "train_scenarios": [
+      "i1024_o128_c16",
+      "i1024_o128_c2",
+      "i1024_o128_c32",
+      "i1024_o128_c4",
+      "i1024_o128_c8",
+      "i1024_o512_c2",
+      "i1024_o512_c32",
+      "i1024_o512_c4",
+      "i128_o128_c1",
+      "i128_o128_c16",
+      "i128_o128_c2",
+      "i128_o128_c32",
+      "i128_o128_c4",
+      "i128_o128_c8",
+      "i128_o512_c16",
+      "i128_o512_c2",
+      "i128_o512_c32",
+      "i128_o512_c8",
+      "i512_o128_c16",
+      "i512_o128_c32",
+      "i512_o128_c4",
+      "i512_o128_c8",
+      "i512_o512_c2",
+      "i512_o512_c32",
+      "i512_o512_c4",
+      "i512_o512_c8"
+    ],
+    "train_window_count": 1285
+  },
+  "test": {
+    "direction": {
+      "auroc": 0.8981418918918919,
+      "healthy_windows": 370,
+      "spearman_health": 0.7164211695696437,
+      "violation_windows": 16,
+      "window_count": 386
+    },
+    "threshold": {
+      "auroc": 0.8981418918918919,
+      "balanced_accuracy": 0.4972972972972973,
+      "false_healthy": 16,
+      "false_violation": 2,
+      "spearman_health": 0.7164211695696437,
+      "theta": 1030.8221363976527,
+      "true_healthy": 368,
+      "true_violation": 0
+    }
+  },
+  "train": {
+    "direction": {
+      "auroc": 0.9279527263161851,
+      "healthy_windows": 1196,
+      "spearman_health": 0.671596621597623,
+      "violation_windows": 89,
+      "window_count": 1285
+    },
+    "fit": {
+      "attainment": 0.930739299610895,
+      "candidate_count": 1280,
+      "confidence": 0.930739299610895,
+      "coverage_pass": true,
+      "family_counts": {
+        "i1024_o128": 274,
+        "i1024_o512": 114,
+        "i128_o128": 329,
+        "i128_o512": 177,
+        "i512_o128": 220,
+        "i512_o512": 171
+      },
+      "publish": true,
+      "reject_reason": null,
+      "support": 1285,
+      "theta_m": 1030.8221363976527
+    }
+  }
+}
