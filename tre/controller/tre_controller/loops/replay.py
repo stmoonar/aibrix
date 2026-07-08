@@ -48,6 +48,7 @@ def run_tick_replay(
     registry: Registry,
     safescale: SafeScaleController | None = None,
     signal_source: str = "zm",
+    suppress_hot_proactive_probe: bool = True,
 ) -> TickReplayResult:
     queue = ReplayQueue()
     results: list[LoopTickResult] = []
@@ -67,6 +68,7 @@ def run_tick_replay(
             cluster_view=step.cluster_view,
             active_probe_models=set(active_probe_models),
             signal_source=signal_source,
+            suppress_hot_proactive_probe=suppress_hot_proactive_probe,
             safescale=safescale,
         )
         results.append(result)

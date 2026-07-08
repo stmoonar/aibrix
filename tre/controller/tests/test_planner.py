@@ -74,7 +74,11 @@ def test_build_plan_matches_legacy_rescue_idle_and_high_donor_path() -> None:
         classifications=classifications,
         model_replicas=replicas,
         idle_gpus=0,
-        cfg=PlanConfig(min_replicas_per_model=1, max_replicas_per_model=4),
+        # This is a pure legacy-parity regression test for the frozen paper path. The t1
+        # suppress-hot-proactive guard is a deliberate post-migration divergence, so it is
+        # disabled here to keep the migration faithfulness check meaningful. The guarded
+        # (default-on) behaviour is covered by the dedicated tests below.
+        cfg=PlanConfig(min_replicas_per_model=1, max_replicas_per_model=4, suppress_hot_proactive_probe=False),
     )
 
     assert _deltas([action for action in plan.actions if isinstance(action, ScaleAction)]) == expected.deltas
@@ -429,3 +433,149 @@ def test_tp_aware_critical_receiver_prefers_high_same_slot_shrink_before_defrag(
             source_loop="rescue",
         )
     ]
+
+
+# --- t1 regression: suppress the receiver-less proactive scale-down probe on hot donors ---
+# Diagnosis (TRE vs APA, timeline.csv): during a 7b/8b traffic spike the model is momentarily
+# classified HIGH (TSS = throughput/queue spikes up), and the rescue-loop high_proactive
+# block hid one of its in-service pods (routable 4->3) as a speculative surplus-reclaim probe
+# with NO beneficiary -- deepening saturation right as load climbed. The guard (default on)
+# must reject that probe while leaving demand-driven preemption and idle shrink untouched.
+
+
+def test_high_proactive_probe_suppressed_for_hot_model_by_default() -> None:
+    # A lone HIGH (hot, z_m far above tau_high) model with no receiver needing capacity.
+    classifications = [_classification("hot", ModelState.HIGH, ModelRole.DONOR, 1.6, "surplus")]
+    contexts = {"hot": {"assigned_replicas": 4, "routable_pods": 4}}
+
+    plan = build_plan(
+        model_contexts=contexts,
+        classifications=classifications,
+        model_replicas={"hot": 4},
+        idle_gpus=0,
+        cfg=PlanConfig(min_replicas_per_model=1, max_replicas_per_model=4),  # guard default ON
+    )
+
+    assert [a for a in plan.actions if isinstance(a, ScaleAction) and a.requires_safescale] == []
+    assert not any(a for a in plan.actions if isinstance(a, ScaleAction) and a.delta < 0)
+    assert "safescale_probe_suppressed_hot:hot" in plan.events
+    assert plan.delayed_down_models == set()
+    assert plan.probe_upscale_plans == {}
+
+
+def test_high_proactive_probe_emitted_when_guard_disabled() -> None:
+    # Ablation path (TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE=0): legacy proactive release fires.
+    classifications = [_classification("hot", ModelState.HIGH, ModelRole.DONOR, 1.6, "surplus")]
+    contexts = {"hot": {"assigned_replicas": 4, "routable_pods": 4}}
+
+    plan = build_plan(
+        model_contexts=contexts,
+        classifications=classifications,
+        model_replicas={"hot": 4},
+        idle_gpus=0,
+        cfg=PlanConfig(min_replicas_per_model=1, max_replicas_per_model=4, suppress_hot_proactive_probe=False),
+    )
+
+    shrink = next(a for a in plan.actions if isinstance(a, ScaleAction) and a.model == "hot")
+    assert shrink.delta < 0
+    assert shrink.requires_safescale is True
+    assert shrink.reason == "high_proactive_safescale"
+    assert plan.delayed_down_models == {"hot"}
+    assert "safescale_probe_suppressed_hot:hot" not in plan.events
+
+
+def test_critical_preemption_of_hot_donor_survives_guard() -> None:
+    # Demand-driven preemption: a TP=2 CRITICAL receiver blocked on a fragmented slot with no
+    # idle capacity legitimately shrinks a HIGH donor sharing its two-GPU slot. The guard is ON
+    # (default) yet this MUST still fire, tagged with an explicit preemption reason.
+    classifications = [
+        _classification("tp2", ModelState.CRITICAL, ModelRole.RECEIVER, 0.5),
+        _classification("high", ModelState.HIGH, ModelRole.DONOR, 1.4, "surplus"),
+        _classification("other", ModelState.HEALTHY, ModelRole.NEUTRAL, 1.1),
+    ]
+    contexts = {
+        "tp2": {"assigned_replicas": 0, "routable_pods": 0},
+        "high": {"assigned_replicas": 1, "routable_pods": 1},
+        "other": {"assigned_replicas": 1, "routable_pods": 1},
+    }
+    cluster_view = ClusterView(
+        topology=_tp2_topology(),
+        bindings=(
+            Binding("high-0", "high", Slot("node-a", (0,)), awake=True),
+            Binding("other-2", "other", Slot("node-a", (2,)), awake=True),
+        ),
+    )
+
+    plan = build_plan(
+        model_contexts=contexts,
+        classifications=classifications,
+        model_replicas={"tp2": 0, "high": 1, "other": 1},
+        idle_gpus=2,
+        cfg=PlanConfig(
+            min_replicas_per_model=0,
+            max_replicas_per_model=2,
+            model_tp_sizes={"tp2": 2, "high": 1, "other": 1},
+        ),  # guard default ON
+        cluster_view=cluster_view,
+    )
+
+    assert plan.actions == [
+        ShrinkForSlotAction(
+            donor="high",
+            beneficiary="tp2",
+            serve_id="high-0",
+            slot=Slot("node-a", (0,)),
+            reason="critical_same_slot_high_shrink",
+            source_loop="rescue",
+        )
+    ]
+    assert "safescale_preemption:high->tp2:critical_same_slot_high_shrink" in plan.events
+    assert not any(e.startswith("safescale_probe_suppressed_hot") for e in plan.events)
+
+
+def test_middle_zone_safescale_donor_not_suppressed_by_hot_guard() -> None:
+    # The middle-zone donor is HEALTHY (not hot) and feeds a CRITICAL receiver, so the guard
+    # (default ON) must leave the demand-driven middle-zone SafeScale probe intact.
+    classifications = [
+        _classification("critical", ModelState.CRITICAL, ModelRole.RECEIVER, 0.5),
+        _classification("healthy", ModelState.HEALTHY, ModelRole.NEUTRAL, 1.2),
+    ]
+    contexts = {
+        "critical": {"assigned_replicas": 2, "routable_pods": 2},
+        "healthy": {"assigned_replicas": 3, "routable_pods": 3},
+    }
+
+    plan = build_plan(
+        model_contexts=contexts,
+        classifications=classifications,
+        model_replicas={"critical": 2, "healthy": 3},
+        idle_gpus=0,
+        cfg=PlanConfig(min_replicas_per_model=1, max_replicas_per_model=4),  # guard default ON
+    )
+
+    shrink = next(a for a in plan.actions if isinstance(a, ScaleAction) and a.model == "healthy")
+    assert shrink.requires_safescale is True
+    assert shrink.reason == "critical_middle_zone_safescale"
+    assert plan.probe_upscale_plans == {"healthy": {"critical": 1}}
+    assert not any(e.startswith("safescale_probe_suppressed_hot") for e in plan.events)
+
+
+def test_idle_proactive_immediate_shrink_not_affected_by_hot_guard() -> None:
+    # Genuine idle over-provisioning is reclaimed by idle_proactive_immediate (no SafeScale
+    # probe). The hot guard (default ON) must not touch it.
+    classifications = [_classification("idle", ModelState.IDLE, ModelRole.DONOR, 10.0, "idle")]
+    contexts = {"idle": {"assigned_replicas": 4, "routable_pods": 4, "Y_m": 0.0, "Q": 0.0}}
+
+    plan = build_plan(
+        model_contexts=contexts,
+        classifications=classifications,
+        model_replicas={"idle": 4},
+        idle_gpus=0,
+        cfg=PlanConfig(min_replicas_per_model=1, max_replicas_per_model=4),  # guard default ON
+    )
+
+    shrink = next(a for a in plan.actions if isinstance(a, ScaleAction) and a.model == "idle")
+    assert shrink.delta < 0
+    assert shrink.requires_safescale is False
+    assert shrink.reason == "idle_proactive_immediate"
+    assert not any(e.startswith("safescale_probe_suppressed_hot") for e in plan.events)

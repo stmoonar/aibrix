@@ -94,6 +94,7 @@ def run_planner_tick(
     paper_state_cache: PaperStateCache | None = None,
     incomplete_policy: IncompletePolicy = "drop_model",
     signal_state: SignalState | None = None,
+    suppress_hot_proactive_probe: bool = True,
 ) -> LoopTickResult:
     if snapshot.stale:
         return LoopTickResult(submitted=0, events=("snapshot_stale",))
@@ -117,6 +118,7 @@ def run_planner_tick(
         min_replicas_by_model={spec.name: spec.min_replicas for spec in registry.models()},
         max_replicas_by_model={spec.name: spec.max_replicas for spec in registry.models()},
         incomplete_policy=incomplete_policy,
+        suppress_hot_proactive_probe=suppress_hot_proactive_probe,
     )
     plan = build_plan(
         model_contexts=contexts,

@@ -38,6 +38,7 @@ def run_fairness_tick(
     paper_state_cache: PaperStateCache | None = None,
     incomplete_policy: IncompletePolicy = "drop_model",
     signal_state: SignalState | None = None,
+    suppress_hot_proactive_probe: bool = True,
 ) -> LoopTickResult:
     return run_planner_tick(
         snapshot,
@@ -52,6 +53,7 @@ def run_fairness_tick(
         paper_state_cache=paper_state_cache,
         incomplete_policy=incomplete_policy,
         signal_state=signal_state,
+        suppress_hot_proactive_probe=suppress_hot_proactive_probe,
     )
 
 
@@ -88,6 +90,7 @@ async def fairness_task(
                     paper_state_cache=paper_state_cache,
                     incomplete_policy=getattr(cfg, "incomplete_policy", "drop_model"),
                     signal_state=signal_state,
+                    suppress_hot_proactive_probe=getattr(cfg, "safescale_suppress_hot_proactive", True),
                 )
             if decision_writer is not None:
                 decision_writer.write("fairness", snapshot, result)

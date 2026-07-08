@@ -23,6 +23,16 @@ class PlanConfig:
     min_replicas_by_model: dict[str, int] = field(default_factory=dict)
     max_replicas_by_model: dict[str, int] = field(default_factory=dict)
     incomplete_policy: IncompletePolicy = "drop_model"
+    # t1 diagnosis (TRE vs APA): the rescue-loop "high_proactive_safescale" block used to
+    # hide a serving pod of any HIGH model as a speculative surplus-reclaim probe -- with
+    # NO demand-driven receiver. During a traffic spike a busy model is momentarily HIGH
+    # (TSS = throughput/queue spikes up), so the probe hid a serving pod exactly as load
+    # climbed, deepening saturation (routable 4->3, then CRITICAL->rescale oscillation).
+    # When enabled (default) this suppresses that receiver-less proactive probe on hot
+    # (HIGH/CRITICAL) donors. Demand-driven preemption (idle/HIGH immediate donors and the
+    # TP critical_same_slot_high_shrink -> CRITICAL beneficiary) is a separate path and is
+    # intentionally NOT gated. Ablate via TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE=0.
+    suppress_hot_proactive_probe: bool = True
 
 
 @dataclass(frozen=True)
@@ -196,9 +206,17 @@ def build_plan(
                     source_loop="rescue",
                 )
                 if same_slot_shrink is not None:
+                    # t1: this IS a legitimate scale-down probe on a hot (HIGH) donor, but
+                    # it is demand-driven preemption -- a CRITICAL receiver blocked on a
+                    # fragmented TP slot and no idle capacity. Keep it (the suppress-hot
+                    # guard only gates the receiver-less proactive path) and log the
+                    # preemption reason explicitly in the decision stream.
                     actions.append(same_slot_shrink)
                     slot_shrink_donors.add(same_slot_shrink.donor)
                     delayed_down_models.add(same_slot_shrink.donor)
+                    events.append(
+                        f"safescale_preemption:{same_slot_shrink.donor}->{recv.model_name}:{same_slot_shrink.reason}"
+                    )
                     continue
 
                 tp_planned = _try_plan_tp_capacity(
@@ -350,6 +368,12 @@ def build_plan(
                 continue
             shrink = min(_scale_step(pods, cfg.scale_step_ratio), pods - high_min)
             if shrink > 0:
+                # t1 guard: never launch a receiver-less proactive scale-down probe on a
+                # hot (HIGH) donor. It has no beneficiary and, during a spike, hiding a
+                # serving pod is pro-cyclical (see PlanConfig.suppress_hot_proactive_probe).
+                if cfg.suppress_hot_proactive_probe:
+                    events.append(f"safescale_probe_suppressed_hot:{high.model_name}")
+                    continue
                 _add_scale_action(
                     actions,
                     deltas,

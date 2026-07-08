@@ -57,6 +57,10 @@ class ControllerConfig:
     enable_tre_scaling: bool
     ablation_disable_fast_loop: bool
     ablation_disable_safescale: bool
+    # t1: suppress the receiver-less proactive scale-down probe on hot (HIGH) donors
+    # (planner high_proactive_safescale). Default True (guard on); set env
+    # TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE=0 to restore the legacy proactive-release path.
+    safescale_suppress_hot_proactive: bool
     proactive_release_min_trs: float
     safescale: SafeScaleConfig
 
@@ -172,6 +176,9 @@ class ControllerConfig:
             enable_tre_scaling=_get_bool(values, "ENABLE_TRE_SCALING", True),
             ablation_disable_fast_loop=_get_bool(values, "TRE_ABLATION_DISABLE_FAST_LOOP", False),
             ablation_disable_safescale=_get_bool(values, "TRE_ABLATION_DISABLE_SAFESCALE", False),
+            safescale_suppress_hot_proactive=_get_bool(
+                values, "TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE", True
+            ),
             proactive_release_min_trs=_get_positive_float(values, "PROACTIVE_RELEASE_MIN_TRS", 2000.0),
             safescale=safescale,
         )

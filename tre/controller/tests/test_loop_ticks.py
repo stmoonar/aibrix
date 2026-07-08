@@ -298,7 +298,17 @@ def test_rescue_tick_honors_latency_signal_source_for_classification() -> None:
         models={"critical": _metrics("critical", generation=50.0, waiting=10.0, running=1.0, assigned=2)},
     )
 
-    result = run_rescue_tick(snapshot, queue=queue, registry=_registry(), signal_source="latency_p95")
+    # This test exercises signal-source plumbing: under latency_p95 the model classifies HIGH
+    # (good latency) and the proactive scale-down is the observable proving the signal was
+    # applied. The t1 suppress-hot-proactive guard is disabled here so that observable remains;
+    # the guard's own behaviour is covered in test_planner.py.
+    result = run_rescue_tick(
+        snapshot,
+        queue=queue,
+        registry=_registry(),
+        signal_source="latency_p95",
+        suppress_hot_proactive_probe=False,
+    )
 
     assert result.submitted == 1
     action = queue.submitted[0][0]
