@@ -14,6 +14,13 @@ class DemandPhase:
     end_s: float
     rho_by_model: Mapping[str, float]
     period_s: float | None = None
+    # Per-phase, per-model (input_tokens, output_tokens) override. When a model is
+    # absent here design_trace_segments falls back to the trace-wide token_shapes.
+    # This is what lets a single model change its i/o shape across phases (axis A3).
+    token_shapes: Mapping[str, tuple[int, int]] | None = None
+    # Intentional sub-minimum phases (e.g. the A4 narrow spike shorter than the EMA
+    # time constant) opt out of the min-duration guard; the resonance guard still runs.
+    allow_short: bool = False
 
 
 def validate_phase_plan(
@@ -25,7 +32,7 @@ def validate_phase_plan(
     min_phase_s = 5.0 * slow_loop_s
     for phase in phases:
         duration_s = phase.end_s - phase.start_s
-        if duration_s < min_phase_s:
+        if duration_s < min_phase_s and not phase.allow_short:
             raise ValueError(f"phase too short: {phase.name} duration={duration_s:g}s min={min_phase_s:g}s")
         if phase.period_s is not None and _is_resonant_period(phase.period_s, control_periods_s):
             raise ValueError(f"resonant period: {phase.name} period={phase.period_s:g}s")
@@ -40,10 +47,11 @@ def design_trace_segments(
     validate_phase_plan(phases)
     segments: list[RpsSegment] = []
     for phase in phases:
+        overrides = phase.token_shapes or {}
         for model, rho in phase.rho_by_model.items():
             if rho <= 0.0:
                 continue
-            input_tokens, output_tokens = token_shapes[model]
+            input_tokens, output_tokens = overrides.get(model, token_shapes[model])
             point = capacity.capacity_at(model, input_tokens=input_tokens, output_tokens=output_tokens)
             segments.append(
                 RpsSegment(
