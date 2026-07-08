@@ -77,3 +77,11 @@ so `generalizes=True`.
 - Raw per-request + instant JSONL: `/root/tre-experiments/r3_raw/{r3_7b_sweep,r3_llama_sweep,r3_14b_sweep}/`.
 - Re-window used a temp registry `/root/tre-experiments/registry_v2_7b_llama.yaml` (7b/llama w_p0.02/λ3.0)
   since `rewindow_from_raw.py` reads trs params from the registry `spec`.
+
+## Follow-up: 7b capacity monotonicity supplement (A3 dependency)
+
+Supplemental sweep  (4 cells x 300s) appended to 
+(540 -> 580 rows), then  re-fit (, ttft 500 / tpot 75).
+C(512, o) four points: o128 **11.733** > o256 **9.600** > o384 **8.533** > o512 **6.400** rps —
+strictly decreasing, monotonicity RESOLVED (was 7.467 / 5.333 for o256/o384 with the
+low-concurrency-only support, which dipped below o512).
