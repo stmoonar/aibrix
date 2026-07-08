@@ -69,11 +69,16 @@ def enumerate_cells(
     output_buckets: Iterable[int],
     concurrency_levels: Iterable[int],
 ) -> list[GridCell]:
+    # Materialize first: callers may pass generators, and reusing a generator in a
+    # nested loop silently exhausts it after the first outer iteration (truncated grid).
+    inputs = [int(i) for i in input_buckets]
+    outputs = [int(o) for o in output_buckets]
+    concs = [int(c) for c in concurrency_levels]
     cells: list[GridCell] = []
-    for i in input_buckets:
-        for o in output_buckets:
-            for c in concurrency_levels:
-                cells.append(GridCell(int(i), int(o), int(c)))
+    for i in inputs:
+        for o in outputs:
+            for c in concs:
+                cells.append(GridCell(i, o, c))
     return cells
 
 

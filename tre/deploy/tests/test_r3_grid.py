@@ -246,3 +246,16 @@ def test_estimate_capture_bytes_scales_with_grid() -> None:
     est = r3_grid.estimate_capture_bytes(cells, cell_seconds=60.0, assumed_rps_per_worker=2.0)
     # (1 + 2) workers * 60s * 2 rps * 200 bytes
     assert est == int((1 + 2) * 60.0 * 2.0 * r3_grid.RAW_BYTES_PER_REQUEST)
+
+
+def test_enumerate_cells_accepts_generators_full_cartesian():
+    # Regression: main() passes generators; nested reuse must not exhaust them.
+    from scripts.r3_grid import enumerate_cells
+
+    cells = enumerate_cells(
+        (int(x) for x in "128,512,1024".split(",")),
+        (int(x) for x in "128,512".split(",")),
+        (int(x) for x in "1,2,4,8,16,32".split(",")),
+    )
+    assert len(cells) == 3 * 2 * 6
+    assert len({(c.input_tokens, c.output_tokens, c.concurrency) for c in cells}) == 36
