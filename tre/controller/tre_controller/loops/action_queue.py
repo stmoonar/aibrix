@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from collections import deque
 from dataclasses import dataclass
 from typing import Awaitable, Callable, Protocol
 
 from tre_controller.planning.planner import Action, DefragAction, HideAction, ScaleAction, SourceLoop, UnhideAction
+
+if False:  # annotations are strings (from __future__); avoids an import cycle
+    from tre_controller.profiling import TickProfiler
 
 CLUSTER_MODEL = "__cluster__"
 
@@ -46,6 +50,7 @@ class ActionQueue:
         client: ServiceManagerClient,
         *,
         is_observe: Callable[[], bool] | None = None,
+        prof: "TickProfiler | None" = None,
     ) -> None:
         self._client = client
         self._pending: deque[QueuedAction] = deque()
@@ -53,6 +58,7 @@ class ActionQueue:
         # When this returns True the controller is paused: queued actions are drained
         # (inflight cleared, so the next tick can re-plan) but NEVER dispatched.
         self._is_observe = is_observe or (lambda: False)
+        self._prof = prof
 
     def submit(self, actions: tuple[Action, ...] | list[Action]) -> SubmitResult:
         accepted = 0
@@ -99,6 +105,9 @@ class ActionQueue:
         # in _pending (keeping the model inflight so no conflicting action is queued) so
         # they dispatch for real once mode returns to non-observe.
         held: deque[QueuedAction] = deque()
+        _prof_on = self._prof is not None
+        _dispatched = 0
+        _http_ns = 0
         while self._pending:
             queued = self._pending.popleft()
             if observe and queued.source_loop == "safescale":
@@ -108,9 +117,24 @@ class ActionQueue:
                 results.append(DispatchResult(model=queued.model, action_kind=_action_kind(queued.action),
                                               ok=True, error="observe_skipped"))
             else:
-                results.append(await self._dispatch(queued.action, queued.model))
+                if _prof_on:
+                    _d0 = time.perf_counter_ns()
+                    results.append(await self._dispatch(queued.action, queued.model))
+                    _http_ns += time.perf_counter_ns() - _d0
+                    _dispatched += 1
+                else:
+                    results.append(await self._dispatch(queued.action, queued.model))
             self._inflight.discard(queued.model)
         self._pending = held
+        if _prof_on and _dispatched:
+            self._prof.record(
+                {
+                    "kind": "dispatch",
+                    "ts_ms": self._prof.now_ms(),
+                    "n_actions": _dispatched,
+                    "http_ns": _http_ns,
+                }
+            )
         return tuple(results)
 
     async def _dispatch(self, action: Action, model: str) -> DispatchResult:

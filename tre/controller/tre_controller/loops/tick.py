@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field, replace
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
+
+if TYPE_CHECKING:
+    from tre_controller.profiling import TickProfiler
 
 from tre_common.metrics_schema import MetricsSnapshot, ModelWindowMetrics
 from tre_common.registry import Registry, ModelSpec
@@ -95,9 +99,17 @@ def run_planner_tick(
     incomplete_policy: IncompletePolicy = "drop_model",
     signal_state: SignalState | None = None,
     suppress_hot_proactive_probe: bool = True,
+    prof: "TickProfiler | None" = None,
+    loop: str = "tick",
 ) -> LoopTickResult:
     if snapshot.stale:
         return LoopTickResult(submitted=0, events=("snapshot_stale",))
+
+    _prof_on = prof is not None
+    if _prof_on:
+        _tick_t0 = time.perf_counter_ns()
+        _ru_u0, _ru_s0 = prof.rusage_ms()
+        _phase_t0 = _tick_t0
 
     contexts, paper_events = _model_contexts(
         snapshot,
@@ -108,6 +120,9 @@ def run_planner_tick(
         signal_state=signal_state,
     )
     classifications = classify_all_models(contexts)
+    if _prof_on:
+        _signals_ns = time.perf_counter_ns() - _phase_t0
+        _phase_t0 = time.perf_counter_ns()
     replicas = {model: int(ctx.get("assigned_replicas", 0)) for model, ctx in contexts.items()}
     cfg = PlanConfig(
         min_replicas_per_model=min((spec.min_replicas for spec in registry.models()), default=0),
@@ -130,9 +145,36 @@ def run_planner_tick(
         inflight_models=queue.inflight_models(),
         cluster_view=cluster_view,
     )
+    if _prof_on:
+        _plan_ns = time.perf_counter_ns() - _phase_t0
+        _phase_t0 = time.perf_counter_ns()
     actions, safescale_events = _apply_safescale(snapshot, tuple(plan.actions), plan.probe_upscale_plans, safescale=safescale)
+    if _prof_on:
+        _safescale_ns = time.perf_counter_ns() - _phase_t0
+        _phase_t0 = time.perf_counter_ns()
     if actions:
         queue.submit(actions)
+    if _prof_on:
+        _submit_ns = time.perf_counter_ns() - _phase_t0
+        _ru_u1, _ru_s1 = prof.rusage_ms()
+        prof.record(
+            {
+                "kind": "tick",
+                "loop": loop,
+                "seq": prof.next_seq(loop),
+                "ts_ms": prof.now_ms(),
+                "n_models": len(contexts),
+                "n_pods": sum(int(ctx.get("assigned_replicas", 0)) for ctx in contexts.values()),
+                "n_actions": len(actions),
+                "signals_ns": _signals_ns,
+                "plan_ns": _plan_ns,
+                "safescale_ns": _safescale_ns,
+                "submit_ns": _submit_ns,
+                "tick_total_ns": time.perf_counter_ns() - _tick_t0,
+                "cpu_user_ms_delta": _ru_u1 - _ru_u0,
+                "cpu_sys_ms_delta": _ru_s1 - _ru_s0,
+            }
+        )
     return LoopTickResult(
         submitted=len(actions),
         actions=actions,

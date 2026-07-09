@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import Awaitable, Callable, Protocol
 
 from tre_common.metrics_schema import MetricsSnapshot
@@ -8,6 +9,9 @@ from tre_common.registry import Registry
 from tre_controller.loops.tick import LoopTickResult, PaperStateCache, PlannerQueue, SafeScaleController, run_planner_tick
 from tre_controller.planning.planner import ClusterView, IncompletePolicy
 from tre_controller.signals.trs import SignalState
+
+if False:  # TYPE_CHECKING guard without importing typing symbol here
+    from tre_controller.profiling import TickProfiler
 
 
 class ClusterViewReader(Protocol):
@@ -39,6 +43,7 @@ def run_fairness_tick(
     incomplete_policy: IncompletePolicy = "drop_model",
     signal_state: SignalState | None = None,
     suppress_hot_proactive_probe: bool = True,
+    prof: "TickProfiler | None" = None,
 ) -> LoopTickResult:
     return run_planner_tick(
         snapshot,
@@ -54,6 +59,8 @@ def run_fairness_tick(
         incomplete_policy=incomplete_policy,
         signal_state=signal_state,
         suppress_hot_proactive_probe=suppress_hot_proactive_probe,
+        prof=prof,
+        loop="fairness",
     )
 
 
@@ -70,6 +77,7 @@ async def fairness_task(
     decision_writer: DecisionWriter | None = None,
     safescale: SafeScaleController | None = None,
     signal_state: SignalState | None = None,
+    prof: "TickProfiler | None" = None,
 ) -> None:
     paper_state_cache = PaperStateCache(max_stale_windows=getattr(cfg, "paper_stale_max_windows", 3))
     while True:
@@ -91,9 +99,22 @@ async def fairness_task(
                     incomplete_policy=getattr(cfg, "incomplete_policy", "drop_model"),
                     signal_state=signal_state,
                     suppress_hot_proactive_probe=getattr(cfg, "safescale_suppress_hot_proactive", True),
+                    prof=prof,
                 )
             if decision_writer is not None:
-                decision_writer.write("fairness", snapshot, result)
+                if prof is not None:
+                    _dw_t0 = time.perf_counter_ns()
+                    decision_writer.write("fairness", snapshot, result)
+                    prof.record(
+                        {
+                            "kind": "decision",
+                            "loop": "fairness",
+                            "ts_ms": prof.now_ms(),
+                            "decision_write_ns": time.perf_counter_ns() - _dw_t0,
+                        }
+                    )
+                else:
+                    decision_writer.write("fairness", snapshot, result)
         await sleep(cfg.fairness_interval_s)
 
 

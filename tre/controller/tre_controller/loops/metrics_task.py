@@ -7,6 +7,9 @@ from typing import Awaitable, Callable, Protocol
 
 from tre_common.metrics_schema import MetricsSnapshot
 
+if False:  # annotations are strings (from __future__); avoids an import cycle
+    from tre_controller.profiling import TickProfiler
+
 
 class SnapshotStore(Protocol):
     def read_snapshot(
@@ -48,6 +51,7 @@ def refresh_metrics_once(
     now_ms: int,
     window_ms: int,
     window_mode: str = "tumbling",
+    prof: "TickProfiler | None" = None,
 ) -> MetricsRefreshResult:
     # window_mode defaults to "tumbling" here so existing callers/tests keep the old
     # behaviour; the live controller passes cfg.metrics_window_mode (default "sliding").
@@ -59,6 +63,7 @@ def refresh_metrics_once(
     # Tumbling calls read_snapshot with its original signature (no use_cache) so existing
     # SnapshotStore fakes keep working; only sliding opts out of the per-window cache
     # (every sliding window is unique -> the cache never hits and would grow, S1.1).
+    _fetch_t0 = time.perf_counter_ns() if prof is not None else 0
     try:
         if sliding:
             snapshot = store.read_snapshot(window_start_ms, window_end_ms, use_cache=False)
@@ -67,6 +72,16 @@ def refresh_metrics_once(
     except Exception as exc:  # noqa: BLE001 - metrics loop degrades through stale snapshots.
         snapshot = _stale_snapshot(snapshot_box.get(), fallback_ts_ms=window_end_ms)
         snapshot_box.set(snapshot)
+        if prof is not None:
+            prof.record(
+                {
+                    "kind": "poll",
+                    "ts_ms": prof.now_ms(),
+                    "fetch_ns": time.perf_counter_ns() - _fetch_t0,
+                    "n_models": len(snapshot.models),
+                    "stale": True,
+                }
+            )
         return MetricsRefreshResult(
             window_start_ms=window_start_ms,
             window_end_ms=window_end_ms,
@@ -75,6 +90,16 @@ def refresh_metrics_once(
             error=str(exc),
         )
 
+    if prof is not None:
+        prof.record(
+            {
+                "kind": "poll",
+                "ts_ms": prof.now_ms(),
+                "fetch_ns": time.perf_counter_ns() - _fetch_t0,
+                "n_models": len(snapshot.models),
+                "stale": bool(snapshot.stale),
+            }
+        )
     snapshot_box.set(snapshot)
     return MetricsRefreshResult(
         window_start_ms=window_start_ms,
@@ -90,6 +115,7 @@ async def metrics_task(
     cfg: MetricsTaskConfig,
     *,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    prof: "TickProfiler | None" = None,
 ) -> None:
     # S1.2: refresh cadence is decoupled from monitor_interval_s and set to
     # metrics_refresh_interval_s (default 5s) so the single shared snapshot is never
@@ -103,6 +129,7 @@ async def metrics_task(
             now_ms=int(time.time() * 1000),
             window_ms=cfg.metrics_window_ms,
             window_mode=getattr(cfg, "metrics_window_mode", "sliding"),
+            prof=prof,
         )
         await sleep(refresh_interval_s)
 

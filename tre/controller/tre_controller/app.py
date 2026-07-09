@@ -8,6 +8,7 @@ from tre_common.registry import Registry, load_registry
 from tre_controller.config import ControllerConfig
 from tre_controller.loops.action_queue import ActionQueue
 from tre_controller.mode import ObserveModeGate
+from tre_controller.profiling import TickProfiler, build_profiler
 from tre_controller.loops.cluster_view_task import ClusterViewBox, cluster_view_task
 from tre_controller.loops.decision_snapshot import DecisionSnapshotWriter
 from tre_controller.loops.fairness_task import fairness_task
@@ -36,6 +37,7 @@ class ControllerDependencies:
     safescale: SafeScaleStateMachine
     registry: Registry
     signal_state: SignalState
+    profiler: "TickProfiler | None" = None
 
 
 @dataclass(frozen=True)
@@ -49,7 +51,7 @@ def build_controller_task_specs(
     cfg: MetricsTaskConfig,
 ) -> tuple[ControllerTaskSpec, ...]:
     specs: list[ControllerTaskSpec] = [
-        ControllerTaskSpec("metrics", lambda: metrics_task(deps.store, deps.snapshot_box, cfg)),
+        ControllerTaskSpec("metrics", lambda: metrics_task(deps.store, deps.snapshot_box, cfg, prof=deps.profiler)),
     ]
     if not bool(getattr(cfg, "enable_tre_scaling", True)):
         return tuple(specs)
@@ -74,6 +76,7 @@ def build_controller_task_specs(
                     decision_writer=deps.decision_writer,
                     safescale=deps.safescale,
                     signal_state=deps.signal_state,
+                    prof=deps.profiler,
                 ),
             )
         )
@@ -89,6 +92,7 @@ def build_controller_task_specs(
                 decision_writer=deps.decision_writer,
                 safescale=deps.safescale,
                 signal_state=deps.signal_state,
+                prof=deps.profiler,
             ),
         )
     )
@@ -107,6 +111,16 @@ def build_controller_task_specs(
             )
         )
     specs.append(ControllerTaskSpec("action_queue", lambda: deps.queue.run()))
+    if deps.profiler is not None:
+        specs.append(ControllerTaskSpec("profile_flush", lambda: deps.profiler.flush_loop()))
+        specs.append(
+            ControllerTaskSpec(
+                "profile_proc_sampler",
+                lambda: deps.profiler.proc_sampler_loop(
+                    interval_s=getattr(cfg, "profile_proc_sample_interval_s", 5.0)
+                ),
+            )
+        )
     return tuple(specs)
 
 
@@ -140,16 +154,18 @@ def create_controller_dependencies(
     safescale = SafeScaleStateMachine(config=cfg.safescale, store=ControllerStateStore(redis_client))
     safescale.restore()
     observe_gate = ObserveModeGate(redis_client)
+    profiler = build_profiler(cfg, redis_client)
     return ControllerDependencies(
         store=store,
         snapshot_box=SnapshotBox(),
-        queue=ActionQueue(sm_client, is_observe=observe_gate.is_observe),
+        queue=ActionQueue(sm_client, is_observe=observe_gate.is_observe, prof=profiler),
         sm_client=sm_client,
         cluster_view_box=ClusterViewBox(),
         decision_writer=DecisionSnapshotWriter(redis_client),
         safescale=safescale,
         registry=registry,
         signal_state=SignalState(warmup_ms=cfg.signal_warmup_ms),
+        profiler=profiler,
     )
 
 

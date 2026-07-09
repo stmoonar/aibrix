@@ -97,6 +97,11 @@ spec:
               value: "false"
             - name: TRE_ABLATION_DISABLE_SAFESCALE
               value: "false"
+            # Opt-in control-loop profiling capability (measures TRE's own per-tick
+            # latency + CPU for the paper). OFF by default; an operator flips this to
+            # "true" and restarts the pod for a profiling run. See tre_controller.profiling.
+            - name: TRE_PROFILE
+              value: "false"
           resources:
             requests:
               cpu: 250m
