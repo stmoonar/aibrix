@@ -41,7 +41,7 @@ models:
     lambda_wait: 3.0
     qmin: 1.0
     ema_alpha: 0.2485
-    theta_m: 715.2709967116108
+    theta_m: 993.4687597800112
     tau_crit: 0.7485
     tau_low: 1.0
     tau_high: 1.6296
@@ -74,7 +74,7 @@ models:
     lambda_wait: 3.0
     qmin: 1.0
     ema_alpha: 0.2485
-    theta_m: 209.6470588235294
+    theta_m: 1290.915
     tau_crit: 0.7485
     tau_low: 1.0
     tau_high: 1.6296
@@ -107,7 +107,7 @@ models:
     lambda_wait: 3.0
     qmin: 1.0
     ema_alpha: 0.3935
-    theta_m: 247.4172794117647
+    theta_m: 1020.235
     tau_crit: 0.56
     tau_low: 1.0
     tau_high: 1.26
