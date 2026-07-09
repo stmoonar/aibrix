@@ -200,3 +200,236 @@ Additional large artifacts left only on node10:
 - `/root/tre-experiments/r3_llama_sweep.csv` -- full 54-cell sweep CSV.
 - `/root/tre-experiments/r3_llama_sweep.checkpoint.json` -- exactly 54 completed cells.
 - `/root/tre-experiments/r3_llama_slide_supp.csv` -- supplemented 30s/5s sliding-window CSV.
+
+## 14b violation-densification supplement (follow-up)
+
+Follow-up to the bootstrap-CI diagnostic above: 14b's CV=1.02 was traced to violation
+concentration, not a fit-code issue. Of 129 violating windows in the published `r3_14b_slide.csv`
+(46-cell sweep, 52 cells checkpointed), **113 (87.6%) came from exactly 2 cells**:
+`i1024_o512_c192` (57/57 windows violating) and `i512_o512_c192` (56/56) — both sitting at the
+very top of their concurrency ladders, with the next-richest evidence (`i1024_o512_c128`, 9/57)
+two rungs down and a large gap (128→192) never sampled in between. `i128_o512` was also never
+extended past c32, unlike its two sibling o512 families.
+
+**Fix**: densify the onset region rather than add more cells overall. Ran 7 new cells at 300s
+each (`--cell-seconds 300 --window-ms 30000`, same `r3_grid.py` invocation pattern as the
+original supplement) — safety gates confirmed clean beforehand (`tre:v2:controller:mode=observe`,
+service-manager `/v2/state` showed `dsqwen-14b` awake on `nscc-ds-4a100-node10` GPU0-1):
+
+| new cell | R3 tumbling windows |
+|---|---:|
+| i1024_o512_c112 | 10 |
+| i1024_o512_c160 | 10 |
+| i512_o512_c112 | 10 |
+| i512_o512_c160 | 10 |
+| i128_o512_c96 | 10 |
+| i128_o512_c128 | 10 |
+| i128_o512_c192 | 10 |
+
+Checkpoint went from 52 -> 59 cells with no unexpected scenario IDs re-driven. Re-window
+(`rewindow_from_raw.py --model dsqwen-14b --raw-dir /root/tre-experiments/r3_raw/r3_14b_sweep
+--registry deploy/registry.yaml --window-ms 30000 --step-ms 5000`, same config as the published
+`r3_14b_slide.csv`) produced **3263 sliding windows** -> `/root/tre-experiments/r3_14b_slide_supp2.csv`.
+
+Production refit (`tre_calibration.cli`, same fit-config as always: reliability 0.9, min_support 3,
+min_confidence 0.9, min_scenario_families 2, max_single_scenario_ratio 0.7, w_p=0.0575,
+lambda_wait=3.0, qmin=1.0, SLO ttft=500/tpot=75/e2e=15000):
+
+| dataset | cells | fit windows | support | point theta | boot median | 95% CI [p2.5, p97.5] | mean | std | CV (std/point) | publish_rate |
+|---|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|
+| published (46 cells) | 46 | 2543 | 2543 | 247.417 | 247.417 | [247.417, 1020.715] | 428.56 | 251.70 | **1.02** | 1.00 |
+| densified supplement (59 cells) | 53 | 2933 | 2913 | **934.996** | 905.895 | [247.417, 1147.889] | 737.10 | 354.41 | **0.379** | 1.00 |
+
+Violation concentration on the 59-cell dataset (`p95_e2e>15000` / `p95_ttft>500` / `p95_tpot>75`,
+same rule as the original diagnostic):
+
+| concentration metric | before (46 cells, 129 violations) | after (59 cells, 309 violations) |
+|---|---:|---:|
+| single-cell max share | 44.2% (57/129, `i1024_o512_c192`) | 18.4% (57/309, tied `i1024_o512_c160`/`c192`) |
+| two-cell combined share | 87.6% (113/129) | 36.9% (114/309) |
+| five-cell combined share | n/a (only 2 cells drove almost everything) | 90.6% (280/309: `i1024_o512_c160/c192`, `i512_o512_c160/c192`, `i128_o512_c192`, each 55-57 windows, ~18% each) |
+
+**Reading**: the densification fix worked exactly as predicted. theta_m jumped 3.78x
+(247.417 -> 934.996) and bootstrap CV collapsed 2.7x (1.02 -> 0.379) — the old point estimate was
+an artifact of two sparse, saturated cells clearing the reliability gate too easily; once the
+128->192 gap was filled, the fit discovered the true onset sits far higher, and violations are now
+spread across 5 cells at a near-uniform ~18% each instead of concentrated in 2. The new 934.996
+lands almost exactly inside the *old* bootstrap's own upper mode (97.5th pct was 1020.7) —
+convergence with the old distribution's blow-up half, not a new instability.
+
+New files in this evidence directory: `theta_fit_14b_supp2.json`, `bootstrap_theta_14b_supp2.json`.
+Large artifact: `/root/tre-experiments/r3_14b_slide_supp2.csv` (node10 only).
+
+## 14b convergence probe (Fable 5 follow-up, step 1)
+
+Architect review (Fable 5) on the above result: the theta jump is a **safety improvement**
+(higher theta_m => lower Z_m for the same real TRS => controller reads 14b as *more*
+capacity-tense, i.e. the old 247.417 was too permissive), not a regression — corroborated by the
+934.996 landing inside the old CI's upper mode. Fable's prediction: theta is set by the
+onset/boundary region, not by how deep saturation goes, so extending the ladder into deeper
+saturation shouldn't move theta much further (those cells sit *below* theta, they don't define it).
+
+Tested with 3 more cells at the same 300s/window-30000ms convention: a new boundary midpoint
+`c144` for both rich o512 families, plus a deep-saturation control `i1024_o512_c256`. Safety gates
+re-checked and still clean before this run (`observe` mode, `dsqwen-14b` binding still awake,
+ClusterIPs unchanged: `dsqwen-14b` 10.98.154.51, `tre-v2-redis` 10.109.196.83). Checkpoint went
+59 -> 62 cells. Re-window (same command, now against all 62 cells) produced 3431 sliding windows
+-> `/root/tre-experiments/r3_14b_slide_supp3.csv`.
+
+| dataset | cells | fit windows | support | point theta | boot median | CV | 97.5pct |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| densified supp2 (59 cells) | 53 | 2933 | 2913 | 934.996 | 905.895 | 0.379 | 1147.889 |
+| convergence-probe supp3 (62 cells) | 56 | 3101 | 3008 | **1020.235** | 1004.209 | **0.321** | 1166.606 |
+
+theta_m moved **+9.12%** (934.996 -> 1020.235) — under Fable's 15% "converged, freeze it"
+threshold. **Verdict: converged.** Bootstrap CV kept improving (0.379 -> 0.321), consistent with
+more evidence tightening the fit rather than the estimate still hunting for a ceiling.
+
+New-cell TRS values and violation status (direct check of Fable's "deep saturation sits below
+theta" prediction):
+
+| cell | windows | TRS min | TRS median | TRS max | violations |
+|---|---:|---:|---:|---:|---:|
+| i512_o512_c144 | 56 | 1102.26 | 1189.11 | 1436.06 | 0/56 |
+| i1024_o512_c144 | 57 | 1157.56 | 1244.64 | 1712.81 | 27/57 |
+| i1024_o512_c256 | 55 | 755.18 | 994.57 | 1255.38 | 55/55 |
+
+**Nuance, reported plainly rather than forcing Fable's clean prediction**: `c144` (the new
+boundary midpoint) actually has *higher* TRS than `c256` and is only partially violating —
+consistent with it being a genuine boundary-region point, and its own high-TRS/non-violating
+windows are what pushed theta up the further +9.1%, not saturation. `c256` (deep saturation, 100%
+violating) has median TRS 994.57, only ~2.5% below the new theta (1020.235) — directionally
+correct (below theta, in the violating set) but not a dramatically wide gap; the control cell
+confirms the *sign* of the prediction (saturation windows sit at/under theta, not above it) but
+the margin is narrower than "clearly below" would suggest. Overall this is best read as: the
+onset region (c112-c160) is what defines theta and is now well localized; deeper saturation
+doesn't drive theta further up, it just confirms it's on the correct side of the boundary.
+
+Violation concentration re-checked on the final 62-cell / 3431-window dataset (391 total
+violations, up from 309 with the addition of the new cells):
+
+| concentration metric | 59-cell (309 viol.) | 62-cell final (391 viol.) |
+|---|---:|---:|
+| single-cell max share | 18.4% | 14.58% (57/391) |
+| two-cell combined share | 36.9% | 29.16% (114/391) |
+| five-cell combined share | 90.6% | 71.61% (280/391; a 6th cell, `i1024_o512_c256`, adds another 14.1%, ~85.7% for 6 cells) |
+
+Concentration kept flattening as more onset-region data arrived — further confirmation the
+densification fix is real and not an artifact of which 7 cells happened to be picked.
+
+New files in this evidence directory: `theta_fit_14b_supp3.json`, `bootstrap_theta_14b_supp3.json`.
+Large artifact: `/root/tre-experiments/r3_14b_slide_supp3.csv` (node10 only, 62 cells / 3431 rows).
+
+**Per Fable's explicit guidance (step 4), no broad llama-style re-scan was run for 14b** — the
+boundary is now localized to c112-c256 and these 3 targeted probes were judged to strictly
+dominate a broad re-scan; that path was deliberately not taken.
+
+## TRS / tau_high shrink-eligibility check (Fable 5 follow-up, step 2)
+
+Concern: shrink-eligibility requires `Z_m > tau_high (1.26)`, i.e. `TRS > tau_high * theta_m`. At
+the old theta (247.417) that bar is 311.75; at the converged new theta (1020.235) it is **1285.50**
+— nearly 4.1x higher. Could 14b become permanently un-shrinkable?
+
+**(a) Calibration-side ceiling.** Across the final 62-cell / 3431-window dataset, low-concurrency
+cells (c<=8, where queueing is near-floor and TRS = throughput/queue should sit at its structural
+peak) give:
+
+| stat | low-concurrency (c<=8), n=1320 | all windows, n=3431 |
+|---|---:|---:|
+| min | 143.34 | 143.34 |
+| p50 | 2180.96 | 1987.90 |
+| p95 | 2961.65 | 2818.65 |
+| max | 4206.09 | 4206.09 |
+
+Even the **median** low-concurrency TRS (2180.96) clears the new tau_high bar (1285.50) by
+**1.70x**, and the max clears it by **3.27x**. **14b is not at risk of becoming permanently
+un-shrinkable at theta=1020.235** — there is ample structural TRS headroom above tau_high; the
+model simply needs to actually be at low/idle concurrency when the slow loop evaluates
+shrink-eligibility (normal — that is the intended condition for a shrink check to fire).
+
+**(b) Real-trace check.** HANDOFF.md's open item #1 references a `timeline_tre.csv` for trial t5
+as evidence for "14b's Z_m/theta not crossing delta_high" during an unexplained scale-up failure.
+That file exists at `docs/refactor/p11_evidence/exp3_comparison_20260709/timeline_tre.csv` (458
+rows) but its schema is only `ts, awake, submitted, loop, actions` — **no per-window Z_m/TRS value
+was ever persisted**, so it cannot be used to literally reconstruct 14b's historical Z_m
+trajectory. The only real numeric evidence available is the t5 trial-level summary
+(`summary_tre_t5.json`): 14b was in deep saturation during that trace (`violation_time_frac=0.84`,
+`p95_e2e_ms=35833`), i.e. that trial exercised the **low-Z_m / scale-up boundary** (`delta_high`),
+not the **high-Z_m / shrink boundary** (`tau_high`) this check is about — so t5 is simply not
+informative for the tau_high question either way, and the two open items (t5's scale-up gap,
+this task's tau_high risk) are about different, unrelated thresholds despite both citing 14b's
+theta_m. Flagging as a logging gap: no per-window Z_m/TRS is persisted anywhere for any real
+serving trial, which is worth fixing so this class of question can be answered directly next time
+rather than only via calibration-side proxies.
+
+**Verdict**: based on (a), 14b is **not** at material risk of becoming permanently un-shrinkable
+under theta=1020.235 — the structural TRS ceiling clears the raised tau_high bar with 1.7-3.3x
+headroom. (b) neither confirms nor refutes this from production data since the needed signal was
+never logged; it is a gap, not a contradiction. `tau_high` does not need to move purely on this
+evidence, though re-verifying with an actual Z_m timeline (once logged) would be worthwhile before
+fully closing this question.
+
+## Backlog: theta-stability acceptance gate + 7b/llama grid-gap audit (Fable 5 follow-up, step 3)
+
+**Backlog note.** This round's whole finding (14b's original theta was 3.78x too low because of a
+masked ladder gap) was only caught by an after-the-fact bootstrap-CV audit. Future calibration
+rounds should run the cell-level bootstrap CI (`tre_calibration.bootstrap.bootstrap_theta` /
+`deploy/scripts/bootstrap_theta_ci.py`, already built and reused unchanged throughout this whole
+diagnostic) as a **go/no-go acceptance gate before writing to `registry.yaml`**, not just as a
+follow-up diagnostic after publishing. A reasonable starting gate: reject (or require ladder
+densification before) any fit with CV > ~0.5-0.6, given 7b's CV=0.24 is comfortably stable and
+14b's original 1.02 / llama's original 2.36 were both clearly unstable by inspection.
+
+**Gap audit — does the same masked-boundary pattern exist for 7b / llama?** (No new load-scan
+cells run for either model — this is purely a read of the existing sweep/slide CSVs already on
+disk, same method used to find 14b's original gap: last thin-violation point vs. top of tested
+ladder, per family.)
+
+*dsqwen-7b* (ladders per family, from `r3_7b_sweep.csv`; violations from `r3_7b_slide_v2.csv`,
+e2e SLO 12000, 221 total violations):
+
+| family | ladder top | violations at top-of-ladder cell | share of total |
+|---|---:|---:|---:|
+| i1024_o512 (top=c64) | 64 | 56 | 25.3% |
+| i1024_o128 (top=c64) | 64 | 40 | 18.1% |
+| i512_o512 (top=c64) | 64 | 15 (peak is c48=27, i.e. *before* the top) | 6.8% |
+
+Two of three violating families (`i1024_o512`, `i1024_o128`) have their **single worst violation
+count sitting exactly at the top of the tested ladder** (c64), with no cell beyond it to confirm
+the onset has actually plateaued — the same qualitative signature 14b had before this fix.
+Combined, these two top-of-ladder cells hold 96/221 = **43.4%** of all 7b violations. The
+`i512_o512` family, by contrast, already shows its peak one rung *before* the top (c48 > c64),
+suggesting that family's boundary is already captured mid-ladder — a healthier sign. Despite this,
+7b's own bootstrap CV (0.24) is by far the tightest of the three models, so if a masked boundary
+exists here it has not yet destabilized the fit the way it did for 14b/llama — but the structural
+gap (`i1024_o512`/`i1024_o128` never extended past c64) is real and worth a cheap follow-up probe
+(e.g. c80/c96) if 7b's calibration is revisited.
+
+*dsllama-8b* (ladders from `r3_llama_sweep.csv`, **all six families capped at c32**, before this
+task's already-committed broad-grid supplement above; violations from `r3_llama_slide_v2.csv`,
+e2e SLO 12000, 105 total violations):
+
+| family | ladder top (pre-supplement) | violations at top-of-ladder cell | share of total |
+|---|---:|---:|---:|
+| i1024_o512 (top=c32) | 32 | 56 | 53.3% |
+| i512_o128 (top=c32) | 32 | 15 | 14.3% |
+| i512_o512 (top=c32) | 32 | 15 | 14.3% |
+
+llama's single worst cell (`i1024_o512_c32`, at the absolute top of a ladder that **never
+extended past c32 in any family**) held **53.3%** of all violations by itself — a more extreme
+single-cell concentration than 14b's original 44.2% — and the top-of-ladder cells across all three
+violating families combined for 86/105 = **81.9%**. This is the *same* masked-boundary pattern as
+14b's, and structurally worse (no family got extended at all, vs. 14b where some families reached
+c96-c192 before this task). This lines up exactly with why llama's original bootstrap CV (2.36) was
+by far the worst of the three in the diagnostic above, and independently corroborates it via a
+different signal (violation concentration vs. the tested ladder). Note: llama's broad-grid
+supplement (committed separately, `28443563`, see the `## dsllama-8b broad grid supplement`
+section above) already addressed this — its post-supplement CV of 0.083 confirms the same
+densification approach that worked for 14b also worked for llama.
+
+**Takeaway**: this is a **systemic pattern**, not a 14b-specific fluke — every model's calibration
+grid had at least one family whose top-of-ladder cell held an outsized share of total violations
+with no cell beyond it to confirm a plateau. 7b's is present but has not (yet) visibly destabilized
+its fit; llama's was the most severe and has already been fixed; 14b's has now also been fixed and
+converged. Recommend making the "densify past the last thin-violation point" check a standard part
+of grid design for any future model onboarding, informed by the acceptance-gate backlog item above.

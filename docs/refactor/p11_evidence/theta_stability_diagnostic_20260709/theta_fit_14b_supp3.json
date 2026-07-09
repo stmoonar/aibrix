@@ -1,0 +1,32 @@
+{
+  "fit": {
+    "attainment": 0.9002659574468085,
+    "candidate_count": 3054,
+    "confidence": 0.9002659574468085,
+    "coverage_pass": true,
+    "family_counts": {
+      "i1024_o128": 493,
+      "i1024_o512": 679,
+      "i128_o128": 330,
+      "i128_o512": 363,
+      "i512_o128": 494,
+      "i512_o512": 649
+    },
+    "reject_reason": null,
+    "support": 3008
+  },
+  "generated_at": "2026-07-09T08:55:58.004646+00:00",
+  "metrics": {
+    "auroc": 0.9642873321316333,
+    "objective": 0.9451498760639592,
+    "spearman_health": 0.8902997521279185
+  },
+  "model_name": "dsqwen-14b",
+  "publish": true,
+  "trs": {
+    "lambda_wait": 3.0,
+    "qmin": 1.0,
+    "theta_m": 1020.2350905172023,
+    "w_p": 0.0575
+  }
+}
