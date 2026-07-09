@@ -2599,3 +2599,43 @@ probing 14b at 2rps. Envoy access-log flags over the window:
 
 `make check` → **417 passed**. New files are standalone (kubectl apply / kubectl patch), not part of
 any kustomize overlay, so no guard-test change needed.
+
+### Experiment 3 — TRE vs APA full 7×2 (traceset-v2): scored, analyzed, filed
+
+Collected and scored the full experiment-3 comparison (14 runs = 7 traces × {TRE, APA}) on
+`/root/tre-experiments/comparison_v2`. STATUS=DONE 2026-07-09T01:49:47Z; all 14 runs passed the
+infra gate (envoy **UF=0, SOCKFAIL=0**, zero unforced 5xx). Terminal state verified clean:
+controller=observe, signal_source=zm (TRE active), 0 PodAutoscaler CRs, routable/awake 1/1/1,
+console 200.
+
+**Three fixes** that made this pass (background): `bde7376f`(+roll `f2699d84`) controller
+hot-proactive SafeScale guard; `04de30a1` replayer traceset-v2 (integer-feasible GPU occupancy,
+8 slots); `e017cffb` gateway/envoy socket-exhaustion hardening → zero UF.
+
+**Scoring** used `tre_replayer.scoring.compute_v_sys` (registry SLOs: ttft 500 / tpot 75 / e2e
+12000 for 7b·llama, 15000 for 14b; 30s window / 5s step). Recomputed per-model V_sys matches the
+run.log summaries exactly.
+
+**Key results** (system V_req, lower better; 503 = per-model unload count):
+- **TRE wins 5/7**: t1 0.427 vs 0.555, t2 0.200 vs 0.402, t3 0.029 vs **0.501**, t4 0.088 vs 0.195,
+  t7 0.405 vs 0.529. Every win is TRE proactively scaling the hot 1-slot 7b via TSS/Z_m and cutting
+  7b 503-shedding ~2x (tight) to 20–4888x (loose/drift).
+- **t3 (A3 io_drift) is the headline**: constant RPS, output drifts heavier. TRE scaled 7b at 172s
+  proactively → **1** total 7b 503; APA's KVCache signal lagged, 7b 503 ramp 15→291/30s, never
+  recovered → **4888** 7b 503. Rate-signal-lag hypothesis confirmed (oracle-norm 0.943).
+- **t6 (control) tie/打平**: both ~0 (V_req 0.0001), confirming TRE adds no penalty when no scaling
+  is needed.
+- **t5 (A5 tp_pressure) tie — ANOMALY**: neither arm scaled the 2-slot 14b; near-identical 503
+  curves (~8.3k each), TRE marginally worse. TRE had 4 free slots but did not place a 2nd 14b
+  replica; no env scale-freeze. Flagged 待深挖 (2-GPU placement gating or 14b Z_m/theta_m not
+  crossing delta_high).
+
+**Honest caveats**: (a) APA scales AIBrix PodAutoscaler CRs on separate anchor deployments, so the
+timeline `awake` column is faithful only for TRE — APA behaviour was read from its 503-over-time
+signal (authoritative JSONL). (b) On tight t1/t7 both arms recover simultaneously when the demand
+phase ends → TRE's advantage is *lower loss during* saturation, not *faster recovery*. (c) t1 7b
+topped at 4 replicas where 5 is feasible (one-short under-scale).
+
+**Evidence filed**: `docs/refactor/p11_evidence/exp3_comparison_20260709/` (final_report.{json,md},
+14 per-run summary JSON, timeline_{tre,apa}.csv, README with large-file paths + traceset-v2 tag +
+three-fix commits). Large JSONL stays on the run host. `make check` green.
