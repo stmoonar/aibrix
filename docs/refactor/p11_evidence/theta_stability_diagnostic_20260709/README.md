@@ -433,3 +433,98 @@ with no cell beyond it to confirm a plateau. 7b's is present but has not (yet) v
 its fit; llama's was the most severe and has already been fixed; 14b's has now also been fixed and
 converged. Recommend making the "densify past the last thin-violation point" check a standard part
 of grid design for any future model onboarding, informed by the acceptance-gate backlog item above.
+
+## dsqwen-7b two-round convergence probe + registry adoption (2026-07-09/10, Fable 5 follow-up)
+
+Follow-up to the gap audit above, which flagged `i1024_o512`/`i1024_o128` as having the same
+masked-boundary pattern as llama/14b (43.4% of 7b's violations sitting at the untested top of a
+c64 ladder), though 7b's original bootstrap CV (0.24) had not yet visibly destabilized.
+
+**Round 1**: added `c80`/`c96` to both flagged families (4 cells, 300s each, same load-driver
+convention as llama/14b). Refit on the resulting 62-cell dataset:
+
+| dataset | cells | fit windows | point theta | CI95 | std | CV |
+|---|---:|---:|---:|---|---:|---:|
+| published (58 cells) | 49 | 2619 | 715.271 | [715.271, 1202.131] | 170.87 | 0.24 |
+| round-1 (62 cells) | 57 | 3062 | **993.469** | [463.043, 1212.399] | 231.85 | 0.233 |
+
+theta_m moved **+38.9%**, above Fable 5's 15% convergence threshold (set during the 14b
+diagnostic) — the CV stayed roughly flat rather than collapsing the way llama/14b's did, and the
+CI floor (previously always equal to the point, a structural property of the reliability fit) for
+the first time sat *below* the point, traced to `i1024_o512_c80`'s lowest-TRS window being the
+cell's chronologically-first window (rank 0 of 56) — a ramp-up/pre-steady-state artifact, not a
+real operating point.
+
+**Fable 5's round-2 prescription** (architect consult, not a broad re-scan): 3 cells, all in
+`i1024_o128` only (`i1024_o512` was already cleanly saturated at 100% since c64, no more boundary
+information available there) — a fresh **`c64` re-run** as a control (to separate a suspected
+cross-run confound from a real regime change behind a 40→17 violation-count dip between the
+original session and round 1), plus **`c128`** and **`c160`** to find the actual plateau.
+
+**Round 2 result**: theta_m came back **bit-identical to round 1**: `993.4687597800112`, a 0.0%
+move, on a differently-composed cell pool (57 vs 59 cells). The `c64` re-run gave 21/55 violations
+— between the original session's 40 and round-1's 17 — confirming the dip was a cross-run
+confound (warmup/prefix-cache state), not a real regime change. `c128`/`c160` both saturate
+cleanly to 55/55 (100%) violations with TRS collapsing to a median of 375/287, giving `i1024_o128`
+the same clean plateau shape `i1024_o512` already had — the open ladder edge the gap audit
+flagged is now closed.
+
+| dataset | cells | fit windows | point theta | CI95 | std | CV |
+|---|---:|---:|---:|---:|---|---:|---:|
+| round-1 (62 cells) | 57 | 3062 | 993.469 | [463.043, 1212.399] | 231.85 | 0.233 |
+| round-2 (64 cells) | 59 | 3172 | **993.469 (unchanged)** | [188.906, 1207.525] | 300.42 | **0.302** |
+
+The bootstrap CV widened further (0.233→0.302) despite the point being frozen — Fable 5's read,
+after reviewing both rounds: this is a *different* mechanism than llama/14b's CV collapse. Llama/14b
+improved because thin boundary-adjacent data was replaced with dense boundary data (genuine
+location uncertainty shrinking). 7b's CV widened because the new cells are unambiguously
+*non-boundary* (100%-violating, TRS 130-186) — adding them to the cell-resampled bootstrap pool
+mechanically increases resample diversity: on the rare draws where the true boundary-anchoring
+cell doesn't get sampled, the fit substitutes new, very-low-TRS material instead, pulling the
+floor down. This is an expected side effect of confirming the plateau exists, not new evidence
+that the point location is uncertain — and it's structurally distinct from the earlier ramp-edge
+artifact (verified separately: the actual anchor window defining `993.4687597800112`, found by
+exact-match on the TRS value, sits at chronological rank 11 of 56 in its cell — solidly mid-cell,
+not an edge case).
+
+**Verdict (Fable 5): converged.** 0% point movement (not just under the 15% threshold) plus a
+confirmed plateau plus a mechanistically-explained (not just observed) CV trend together clear the
+bar; another round would burn probe budget re-confirming an already-stable number. The ramp-edge
+artifact does not gate the write (both rounds' points are demonstrably insensitive to it) but was
+flagged as a fast-follow: trim the first window per cell in `rewindow_from_raw.py` / the driver's
+ramp phase, then re-verify all three models' bootstrap CIs (not just refit their points) — this
+became more urgent after the exp2 rerun below, since the same raw CSVs feed both the bootstrap and
+the ranking-separation train/test splits, and 7b's post-recalibration seed-A split explicitly draws
+`i1024_o512_c80` (the confirmed ramp-edge cell) into its test fold.
+
+**Registry adoption**: per user decision, all three models' candidate thetas were written together
+as one batch — `dsqwen-7b` 715.271→993.4687597800112, `dsllama-8b` 209.647→1290.915, `dsqwen-14b`
+247.417→1020.235 — committed `a4fe6e17`, pushed to the live `tre-v2-registry` ConfigMap via
+`/api/params` (not `kubectl apply -k`; the git-tracked `deploy/overlays/tre-v2/params.yaml` overlay
+is a stale bootstrap copy and is NOT the live update path — confirmed the live ConfigMap already
+diverged from it before this change, via the console's PUT/restart API instead), and the controller
+was explicitly restarted and verified: both the running pod's mounted `/etc/tre/registry.yaml` and
+the live `/api/decision/latest` output show the new theta_m values.
+
+New files in this evidence directory: `theta_fit_7b_convprobe.json`, `bootstrap_theta_7b_convprobe.json`
+(round 1), `theta_fit_7b_convprobe2.json`, `bootstrap_theta_7b_convprobe2.json` (round 2).
+Large artifacts (node10 only): `/root/tre-experiments/r3_7b_slide_convprobe.csv`,
+`/root/tre-experiments/r3_7b_slide_convprobe2.csv`, raw per-request logs under
+`/root/tre-experiments/r3_raw/r3_7b_sweep/` (64 cells; original `i1024_o128_c64` raw data backed up
+as `*.bak_round1` before the round-2 control re-run overwrote it).
+
+## Post-recalibration experiment reruns (2026-07-10)
+
+With the new registry live, experiments 2 (ranking separation) and 3 (TRE vs APA full comparison)
+were rerun to validate the recalibration end-to-end. Full results and Fable 5's analysis:
+`docs/refactor/p11_evidence/exp2_ranking_20260710_posttheta/README.md` and
+`docs/refactor/p11_evidence/exp3_comparison_20260710_posttheta/README.md`.
+
+Headline: experiment 3's `t5` trace — previously a mutual TRE/APA failure (both ~55.3% violation
+rate) attributed to 14b's Z_m never crossing the fairness-loop's receiver-eligibility band — is now
+a clean TRE win (31.78% vs APA's 55.35%, -23.57pp) because 14b's peak replica count during t5 rose
+1→3, confirmed at the action-log level (`source_loop=fairness`, `reason=low_fairness_sleeping_capacity`).
+Experiment 2's AUROC numbers look similar before/after, but the operationally important number
+changed: pre-recalibration, the published theta caught **zero** real violations in every held-out
+test split that contained any (14b's test splits had none at all, making its "generalizes=True"
+vacuous); post-recalibration, 5 of 6 model/seed pairs get nonzero recall for the first time.

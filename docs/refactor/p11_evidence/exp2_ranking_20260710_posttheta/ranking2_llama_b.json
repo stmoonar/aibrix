@@ -1,0 +1,117 @@
+{
+  "generalizes": false,
+  "generated_at": "2026-07-09T17:16:05.578086+00:00",
+  "model_name": "dsllama-8b",
+  "signal_column": "trs",
+  "split": {
+    "leakage_free": true,
+    "method": "scenario_hash_holdout",
+    "seed": "tre-v2-ranking-b",
+    "test_fraction": 0.2,
+    "test_scenarios": [
+      "i1024_o512_c64",
+      "i128_o128_c48",
+      "i128_o512_c16",
+      "i128_o512_c4",
+      "i128_o512_c64",
+      "i512_o128_c2",
+      "i512_o128_c32",
+      "i512_o128_c4",
+      "i512_o128_c64",
+      "i512_o512_c16"
+    ],
+    "test_window_count": 555,
+    "total_scenarios": 51,
+    "total_windows": 2672,
+    "train_scenarios": [
+      "i1024_o128_c1",
+      "i1024_o128_c16",
+      "i1024_o128_c2",
+      "i1024_o128_c32",
+      "i1024_o128_c4",
+      "i1024_o128_c48",
+      "i1024_o128_c64",
+      "i1024_o128_c8",
+      "i1024_o128_c96",
+      "i1024_o512_c16",
+      "i1024_o512_c2",
+      "i1024_o512_c32",
+      "i1024_o512_c4",
+      "i1024_o512_c48",
+      "i1024_o512_c8",
+      "i1024_o512_c96",
+      "i128_o128_c1",
+      "i128_o128_c16",
+      "i128_o128_c2",
+      "i128_o128_c32",
+      "i128_o128_c4",
+      "i128_o128_c64",
+      "i128_o128_c8",
+      "i128_o128_c96",
+      "i128_o512_c2",
+      "i128_o512_c32",
+      "i128_o512_c48",
+      "i128_o512_c8",
+      "i128_o512_c96",
+      "i512_o128_c1",
+      "i512_o128_c16",
+      "i512_o128_c48",
+      "i512_o128_c8",
+      "i512_o128_c96",
+      "i512_o512_c2",
+      "i512_o512_c32",
+      "i512_o512_c4",
+      "i512_o512_c48",
+      "i512_o512_c64",
+      "i512_o512_c8",
+      "i512_o512_c96"
+    ],
+    "train_window_count": 2117
+  },
+  "test": {
+    "direction": {
+      "auroc": 0.9347718764142017,
+      "healthy_windows": 446,
+      "spearman_health": 0.8852252492856608,
+      "violation_windows": 109,
+      "window_count": 555
+    },
+    "threshold": {
+      "auroc": 0.9347718764142017,
+      "balanced_accuracy": 0.8587238244127207,
+      "false_healthy": 22,
+      "false_violation": 36,
+      "spearman_health": 0.8852252492856608,
+      "theta": 1322.4391426911645,
+      "true_healthy": 410,
+      "true_violation": 87
+    }
+  },
+  "train": {
+    "direction": {
+      "auroc": 0.8792669252818996,
+      "healthy_windows": 1544,
+      "spearman_health": 0.8250956541879706,
+      "violation_windows": 573,
+      "window_count": 2117
+    },
+    "fit": {
+      "attainment": 0.9004837595024188,
+      "candidate_count": 2077,
+      "confidence": 0.9004837595024188,
+      "coverage_pass": true,
+      "family_counts": {
+        "i1024_o128": 273,
+        "i1024_o512": 209,
+        "i128_o128": 399,
+        "i128_o512": 199,
+        "i512_o128": 166,
+        "i512_o512": 201
+      },
+      "publish": true,
+      "reject_reason": null,
+      "support": 1447,
+      "theta_m": 1322.4391426911645
+    }
+  }
+}
