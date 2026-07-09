@@ -1,0 +1,51 @@
+{
+  "bootstrap": {
+    "n_cells_resampled": 51,
+    "n_published": 2000,
+    "n_resamples": 2000,
+    "publish_rate": 1.0,
+    "seed": 42,
+    "theta_mean": 1266.7827790586168,
+    "theta_p2_5": 981.8426174406414,
+    "theta_p50": 1290.2685798591003,
+    "theta_p97_5": 1384.117091810518,
+    "theta_std": 106.88030704271952
+  },
+  "fit_config": {
+    "max_single_scenario_ratio": 0.7,
+    "min_confidence": 0.9,
+    "min_scenario_families": 2,
+    "min_support": 3,
+    "reliability_target": 0.9
+  },
+  "generated_at": "2026-07-09T10:40:09.659253+00:00",
+  "model_name": "dsllama-8b",
+  "point_fit": {
+    "attainment": 0.9001568217459488,
+    "candidate_count": 2629,
+    "confidence": 0.9001568217459488,
+    "coverage_pass": true,
+    "family_counts": {
+      "i1024_o128": 273,
+      "i1024_o512": 219,
+      "i128_o128": 459,
+      "i128_o512": 367,
+      "i512_o128": 333,
+      "i512_o512": 262
+    },
+    "publish": true,
+    "reject_reason": null,
+    "support": 1913,
+    "theta": 1290.9145158066265
+  },
+  "signal_column": "trs",
+  "slo": {
+    "e2e_p95": 12000.0,
+    "tpot_p95": 75.0,
+    "ttft_p95": 500.0
+  },
+  "window": {
+    "count": 2672,
+    "n_cells": 51
+  }
+}

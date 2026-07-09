@@ -109,3 +109,94 @@ wide error bars"; do NOT trust 209.647 as a sharp number.
 - `registry_llama_inherited.yaml` — temp registry (llama `w_p=0.08, λ=1.875`) used for the
   re-window. Not part of the deployed config.
 - Raw per-request + instant JSONL: `/root/tre-experiments/r3_raw/r3_llama_sweep/`.
+
+## dsllama-8b broad grid supplement
+
+Run date: 2026-07-09. Safety gates before load generation were clean: Redis `tre:v2:controller:mode` was `observe`, and service-manager `/v2/state` showed one awake, non-hidden `dsllama-8b` binding (`nscc-ds-4a100-node9`, GPU0). No controller mode, registry, pod, deployment, or routing state was changed.
+
+Supplement command added exactly the sibling-model first-round broad grid: every llama family got concurrency 48, 64, and 96. The resumable checkpoint and sweep CSV ended at exactly **54 cells** (old 36 + new 18), with no unexpected scenario IDs. The live R3 run emitted 10 tumbling windows per new cell to `/root/tre-experiments/r3_llama_sweep.csv`; offline re-windowing at the published sliding config (`window_ms=30000`, `step_ms=5000`) produced **2985 CSV rows** from the full raw directory, and the production loader retained **2672 fit windows / 51 latency-valid cells**.
+
+| new cell | R3 tumbling windows | sliding windows | violation windows |
+|---|---:|---:|---:|
+| i1024_o128_c48 | 10 | 55 | 8 |
+| i1024_o128_c64 | 10 | 55 | 2 |
+| i1024_o128_c96 | 10 | 55 | 55 |
+| i1024_o512_c48 | 10 | 57 | 57 |
+| i1024_o512_c64 | 10 | 57 | 57 |
+| i1024_o512_c96 | 10 | 57 | 57 |
+| i128_o128_c48 | 10 | 55 | 0 |
+| i128_o128_c64 | 10 | 55 | 1 |
+| i128_o128_c96 | 10 | 55 | 45 |
+| i128_o512_c48 | 10 | 56 | 0 |
+| i128_o512_c64 | 10 | 56 | 10 |
+| i128_o512_c96 | 10 | 55 | 55 |
+| i512_o128_c48 | 10 | 55 | 19 |
+| i512_o128_c64 | 10 | 55 | 25 |
+| i512_o128_c96 | 10 | 55 | 18 |
+| i512_o512_c48 | 10 | 55 | 55 |
+| i512_o512_c64 | 10 | 57 | 57 |
+| i512_o512_c96 | 10 | 56 | 56 |
+
+Re-window command:
+
+```bash
+cd /data/nfs_shared_data/xxy/aibrix/tre
+PYTHONPATH=common:controller:service-manager:replayer:deploy \
+/root/miniconda3/bin/python deploy/scripts/rewindow_from_raw.py \
+  --model dsllama-8b \
+  --raw-dir /root/tre-experiments/r3_raw/r3_llama_sweep \
+  --output /root/tre-experiments/r3_llama_slide_supp.csv \
+  --window-ms 30000 --step-ms 5000 \
+  --percentile-mode bucket_upper --instant-sample-ms 10000 \
+  --registry /root/tre-experiments/registry_v2_7b_llama.yaml
+```
+
+Production refit on the supplemented sliding CSV publishes cleanly:
+
+| dataset | cells used by bootstrap | fit windows | support | point theta | boot median | 95% CI [p2.5, p97.5] | mean | std | CV (std/point) | publish_rate |
+|---|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|
+| published llama v2 | 33 | 1671 | 1671 | 209.647 | 209.647 | [209.647, 1351.199] | 648.07 | 494.74 | **2.36** | 1.00 |
+| broad supplement | 51 | 2672 | 1913 | 1290.915 | 1290.269 | [981.843, 1384.117] | 1266.78 | 106.88 | **0.083** | 1.00 |
+
+The supplement shifted the point estimate upward by **1081.27** TRS units (**+516%**, 6.16x the published value) and collapsed the relative bootstrap instability from CV **2.36** to **0.083** (about **28.5x lower**). The point no longer sits at the floor of a huge distribution; the bootstrap mass is tightly centered around ~1.27k, with a 95% span of 402.27 TRS units instead of 1141.55.
+
+Violation concentration was recomputed on `/root/tre-experiments/r3_llama_slide_supp.csv` using the same window-level rule as the sibling diagnostic: a violation is any window where `p95_ttft > 500`, `p95_tpot > 75`, or `p95_e2e > 12000`.
+
+| concentration metric | value |
+|---|---:|
+| latency-valid cells | 51 |
+| cells with >=1 violation | 24 |
+| total violation windows | 682 |
+| max single-cell share | 8.36% (57 / 682) |
+| top-2 share | 16.72% (114 / 682) |
+| top-3 share | 25.07% (171 / 682) |
+| top-5 share | 41.64% (284 / 682) |
+| top-10 share | 80.65% (550 / 682) |
+
+Top cells are high-concurrency, long-output cases, but none dominates alone:
+
+| rank | cell | violation windows | share | main failing SLOs |
+|---:|---|---:|---:|---|
+| 1 | i1024_o512_c48 | 57 | 8.36% | e2e, sparse ttft |
+| 2 | i1024_o512_c64 | 57 | 8.36% | e2e, sparse ttft |
+| 3 | i1024_o512_c96 | 57 | 8.36% | e2e, ttft |
+| 4 | i512_o512_c64 | 57 | 8.36% | e2e, ttft |
+| 5 | i1024_o512_c32 | 56 | 8.21% | e2e, sparse ttft |
+| 6 | i512_o512_c96 | 56 | 8.21% | e2e, ttft |
+| 7 | i1024_o128_c96 | 55 | 8.06% | tpot, sparse ttft/e2e |
+| 8 | i128_o512_c96 | 55 | 8.06% | e2e, ttft |
+| 9 | i512_o512_c48 | 55 | 8.06% | e2e, sparse ttft |
+| 10 | i128_o128_c96 | 45 | 6.60% | ttft |
+
+**Verdict**: the broad supplement worked for stability. Llama no longer has the original thin-data / giant-CV failure mode, and it does **not** reveal the sibling model's cheap targeted fix pattern (that sibling had 87.6% of violations concentrated in 2 cells; llama's top 2 are only 16.7%). The new theta is much higher than the published 209.647, so this should be treated as a material calibration update candidate rather than a minor confidence tweak. On data quality alone, the supplemented llama calibration is now publishable enough for human review; if more work is done, it should be a confirmatory repeat or a few boundary cells around the high-concurrency long-output front, not a narrow two-cell concentration repair.
+
+New files in this evidence directory:
+
+- `theta_fit_llama_supp.json` -- production fit on `/root/tre-experiments/r3_llama_slide_supp.csv`.
+- `bootstrap_theta_llama_supp.json` -- cell-level bootstrap, n_resamples=2000, seed=42.
+
+Additional large artifacts left only on node10:
+
+- `/root/tre-experiments/r3_llama_sweep.csv` -- full 54-cell sweep CSV.
+- `/root/tre-experiments/r3_llama_sweep.checkpoint.json` -- exactly 54 completed cells.
+- `/root/tre-experiments/r3_llama_slide_supp.csv` -- supplemented 30s/5s sliding-window CSV.
