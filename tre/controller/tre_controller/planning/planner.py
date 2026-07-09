@@ -8,7 +8,7 @@ from tre_common.registry import ClusterTopology
 from tre_controller.planning.classify import ModelClassification, ModelRole, ModelState, donor_mock_cost_key
 from tre_sm.allocator.slots import Binding, Slot, SlotAllocator
 
-SourceLoop = Literal["rescue", "fairness"]
+SourceLoop = Literal["rescue", "fairness", "safescale"]
 IncompletePolicy = Literal["drop_model", "drop_all"]
 
 

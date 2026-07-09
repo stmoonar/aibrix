@@ -127,7 +127,7 @@ def _commands_to_actions(commands: tuple[SafeScaleCommand, ...]) -> tuple[Action
     actions: list[Action] = []
     for command in commands:
         if command.kind == "unhide":
-            actions.append(UnhideAction(command.model, command.pods, command.reason, "fairness"))
+            actions.append(UnhideAction(command.model, command.pods, command.reason, "safescale"))
         elif command.kind in {"scale_down", "scale_up"}:
-            actions.append(ScaleAction(command.model, command.delta, command.reason, "fairness"))
+            actions.append(ScaleAction(command.model, command.delta, command.reason, "safescale"))
     return tuple(actions)

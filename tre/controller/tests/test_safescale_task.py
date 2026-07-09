@@ -95,8 +95,8 @@ def test_safescale_observation_tick_submits_commit_actions_after_deadline() -> N
     assert committed.submitted == 2
     assert queue.submitted == [
         (
-            ScaleAction("donor", -1, "formal_commit_gate_passed", "fairness"),
-            ScaleAction("receiver", 1, "safescale_followup_upscale", "fairness"),
+            ScaleAction("donor", -1, "formal_commit_gate_passed", "safescale"),
+            ScaleAction("receiver", 1, "safescale_followup_upscale", "safescale"),
         )
     ]
     assert committed.events == ("safescale_formal_commit_gate_passed:donor",)
@@ -115,5 +115,5 @@ def test_safescale_observation_tick_submits_rollback_unhide_on_slo_violation() -
     )
 
     assert result.submitted == 1
-    assert queue.submitted == [(UnhideAction("donor", ("pod-a",), "slo_violation", "fairness"),)]
+    assert queue.submitted == [(UnhideAction("donor", ("pod-a",), "slo_violation", "safescale"),)]
     assert result.events == ("safescale_slo_violation:donor",)

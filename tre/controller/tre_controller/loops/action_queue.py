@@ -93,14 +93,24 @@ class ActionQueue:
     async def drain_once(self) -> tuple[DispatchResult, ...]:
         observe = self._is_observe()
         results: list[DispatchResult] = []
+        # Safescale resolution commands are one-shot (they are never re-emitted by the
+        # SafeScaleStateMachine, which deletes the probe on resolve). If we are paused in
+        # observe mode we must NOT drop them like idempotent planner actions -- hold them
+        # in _pending (keeping the model inflight so no conflicting action is queued) so
+        # they dispatch for real once mode returns to non-observe.
+        held: deque[QueuedAction] = deque()
         while self._pending:
             queued = self._pending.popleft()
+            if observe and queued.source_loop == "safescale":
+                held.append(queued)
+                continue
             if observe:
                 results.append(DispatchResult(model=queued.model, action_kind=_action_kind(queued.action),
                                               ok=True, error="observe_skipped"))
             else:
                 results.append(await self._dispatch(queued.action, queued.model))
             self._inflight.discard(queued.model)
+        self._pending = held
         return tuple(results)
 
     async def _dispatch(self, action: Action, model: str) -> DispatchResult:
