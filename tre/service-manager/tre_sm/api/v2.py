@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+from collections import Counter
 from dataclasses import replace
 from typing import Protocol
 
@@ -16,6 +18,7 @@ from tre_sm.state.store import StateConflict, StateStore
 from tre_sm.api.v1_compat import create_v1_compat_router
 
 
+_NAT_SPLIT = re.compile(r"(\d+)")
 
 
 class RuntimePodOps(Protocol):
@@ -105,6 +108,14 @@ class ServiceManagerV2:
 
         if len(awake) < wake_replicas:
             sleeping = [binding for binding in model_bindings if not binding.awake]
+            awake_by_node = Counter(
+                binding.slot.node for binding in snapshot.bindings if binding.awake
+            )
+            sleeping.sort(
+                key=lambda binding: (
+                    awake_by_node[binding.slot.node], _natural_key(binding.serve_id)
+                )
+            )
             wake_existing = 0
             wake_needed = wake_replicas - len(awake)
             skipped_conflict: str | None = None
@@ -186,13 +197,13 @@ class ServiceManagerV2:
             should_hide = binding.serve_id in requested_hidden
             if binding.hidden == should_hide:
                 continue
-            if not should_hide:
+            if not should_hide and binding.awake:
                 self._ensure_feasible_wake(binding, list(updated_by_serve.values()))
             if self._runtime_ops is not None:
-                self._runtime_ops.write_binding_annotations(
-                    binding,
-                    state=POD_STATE_HIDDEN if should_hide else POD_STATE_AWAKE,
+                state = POD_STATE_HIDDEN if should_hide else (
+                    POD_STATE_AWAKE if binding.awake else POD_STATE_SLEEPING
                 )
+                self._runtime_ops.write_binding_annotations(binding, state=state)
             updated_by_serve[binding.serve_id] = replace(binding, hidden=should_hide)
             actions.append({"action": "hide" if should_hide else "unhide", "serve_id": binding.serve_id})
 
@@ -514,6 +525,10 @@ def create_app(service: ServiceManagerV2) -> FastAPI:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     return app
+
+def _natural_key(value: str) -> tuple[object, ...]:
+    return tuple(int(part) if part.isdigit() else part for part in _NAT_SPLIT.split(value))
+
 
 def _migration_dict(migration: Migration) -> dict:
     return {
