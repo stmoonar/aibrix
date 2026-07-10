@@ -1,0 +1,4 @@
+model,cycles,requests,errors,error_rate,cycle_p99_median_ms,cycle_p99_max_ms
+dsllama-8b,5,650,20,0.030769,2255.752,2284.918
+dsqwen-14b,5,655,20,0.030534,2853.411,2927.065
+dsqwen-7b,5,650,20,0.030769,2230.84,2276.491

@@ -1,0 +1,10 @@
+{
+  "baseline_layout_restored": true,
+  "complete_cycles": 75,
+  "cycles_per_model": 25,
+  "models": 3,
+  "orphan_alerts_after": 0,
+  "orphan_alerts_before": 0,
+  "orphan_log_events": 0,
+  "transition_rows": 150
+}
