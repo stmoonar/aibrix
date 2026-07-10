@@ -70,3 +70,41 @@ def test_load_windows_from_csv_filters_and_labels_slo_health(tmp_path) -> None:
     assert windows[1].signal == 80.0
     assert windows[1].slo_met is False
     assert round(windows[1].health_score or 0.0, 6) == round(1.0 / 2.3, 6)
+
+
+def test_load_windows_trims_earliest_window_per_scenario_by_timestamp(tmp_path) -> None:
+    src = tmp_path / "windows.csv"
+    rows = [
+        _window_row("trace-a", 2000, 120),
+        _window_row("trace-b", 1000, 80),
+        _window_row("trace-a", 1000, 60),
+        _window_row("trace-b", 2000, 130),
+    ]
+    with src.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+
+    windows = load_windows_from_csv(
+        src,
+        latency_slo_ms={"ttft_p95": 100.0, "tpot_p95": 50.0},
+        trim_ramp_windows=1,
+    )
+
+    assert [(window.scenario_id, window.signal) for window in windows] == [
+        ("trace-a", 120.0),
+        ("trace-b", 130.0),
+    ]
+
+
+def _window_row(scenario_id: str, start_ms: int, signal: int) -> dict[str, str]:
+    return {
+        "scenario_id": scenario_id,
+        "scenario_family": "synthetic",
+        "window_start_ms": str(start_ms),
+        "trs": str(signal),
+        "p95_ttft": "80",
+        "p95_tpot": "40",
+        "prompt_tokens_total": "100",
+        "generation_tokens_total": "50",
+    }

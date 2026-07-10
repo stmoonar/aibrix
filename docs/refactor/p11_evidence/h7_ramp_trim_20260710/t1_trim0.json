@@ -1,0 +1,58 @@
+{
+  "per_model": {
+    "dsllama-8b": {
+      "n_requests": 7193,
+      "n_requests_total": 7193,
+      "n_requests_trimmed": 0,
+      "n_success": 6073,
+      "n_windows_scored": 155,
+      "scoring_start_ms": 1783617496155,
+      "success_rate": 0.844293062699847,
+      "trim_ramp_windows": 0,
+      "violation_request_frac": 0.605727790907827,
+      "violation_time_frac": 0.4064516129032258
+    },
+    "dsqwen-14b": {
+      "n_requests": 4937,
+      "n_requests_total": 4937,
+      "n_requests_trimmed": 0,
+      "n_success": 4937,
+      "n_windows_scored": 155,
+      "scoring_start_ms": 1783617496155,
+      "success_rate": 1.0,
+      "trim_ramp_windows": 0,
+      "violation_request_frac": 0.0,
+      "violation_time_frac": 0.0
+    },
+    "dsqwen-7b": {
+      "n_requests": 12052,
+      "n_requests_total": 12052,
+      "n_requests_trimmed": 0,
+      "n_success": 8724,
+      "n_windows_scored": 155,
+      "scoring_start_ms": 1783617496155,
+      "success_rate": 0.7238632592100896,
+      "trim_ramp_windows": 0,
+      "violation_request_frac": 0.4865582475937604,
+      "violation_time_frac": 0.4064516129032258
+    }
+  },
+  "scoring": {
+    "min_samples": 5,
+    "step_ms": 5000,
+    "trace_start_ms": 1783617496155,
+    "trim_ramp_windows": 0,
+    "trim_scope": "trace_start_only",
+    "window_ms": 30000
+  },
+  "source": "/root/tre-experiments/comparison_v2_posttheta/tre/t1/requests.jsonl",
+  "system": {
+    "n_requests": 24182,
+    "n_requests_total": 24182,
+    "n_requests_trimmed": 0,
+    "n_success": 19734,
+    "success_rate": 0.8160615333719295,
+    "violation_request_frac": 0.4226697543627492,
+    "violation_time_frac": 0.32347040320579684
+  }
+}

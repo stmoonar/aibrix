@@ -31,6 +31,59 @@ def test_window_violations_flags_high_p95() -> None:
     assert any(w["violated"] for w in wins)
 
 
+def test_compute_v_sys_trims_first_ramp_window_from_vreq_and_success() -> None:
+    ramp = [_rec(i * 1000, 50.0, 900.0, 10, status=503) for i in range(6)]
+    steady = [_rec(6_000 + i * 1000, 50.0, 400.0, 10) for i in range(55)]
+    recs = ramp + steady
+    kwargs = dict(
+        ttft_slo_ms=500,
+        tpot_slo_ms=200,
+        e2e_slo_ms=500,
+        window_ms=30_000,
+        step_ms=5_000,
+        min_samples=3,
+    )
+
+    untrimmed = compute_v_sys(recs, trim_ramp_windows=0, **kwargs)
+    trimmed = compute_v_sys(recs, trim_ramp_windows=1, **kwargs)
+
+    assert untrimmed["violation_request_frac"] > 0.0
+    assert untrimmed["success_rate"] < 1.0
+    assert trimmed["violation_request_frac"] == 0.0
+    assert trimmed["success_rate"] == 1.0
+    assert trimmed["n_requests_trimmed"] == 6
+    assert trimmed["trim_ramp_windows"] == 1
+
+
+def test_trim_uses_trace_start_not_late_model_phase_start() -> None:
+    late_model_records = [_rec(40_000 + i * 1000, 50.0, 400.0, 10) for i in range(10)]
+
+    scored = compute_v_sys(
+        late_model_records,
+        ttft_slo_ms=500,
+        tpot_slo_ms=200,
+        e2e_slo_ms=500,
+        window_ms=30_000,
+        trim_ramp_windows=1,
+        trace_start_ms=0,
+    )
+
+    assert scored["n_requests"] == 10
+    assert scored["n_requests_trimmed"] == 0
+
+def test_compute_v_sys_rejects_negative_trim() -> None:
+    try:
+        compute_v_sys(
+            [],
+            ttft_slo_ms=500,
+            tpot_slo_ms=75,
+            e2e_slo_ms=12_000,
+            trim_ramp_windows=-1,
+        )
+    except ValueError as exc:
+        assert str(exc) == "trim_ramp_windows must be non-negative"
+    else:
+        raise AssertionError("negative trim must fail")
 def test_compute_v_sys_none_when_nothing_scored() -> None:
     # F7: a too-short run (no full window) must not read as "perfect" -> None, not 0.0.
     v = compute_v_sys([], ttft_slo_ms=500, tpot_slo_ms=75, e2e_slo_ms=12000)

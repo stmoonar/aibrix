@@ -86,6 +86,44 @@ def window_violations(
     return windows
 
 
+def trim_trace_start(
+    records: list[dict[str, Any]],
+    *,
+    trim_ramp_windows: int,
+    step_ms: int,
+    trace_start_ms: int | None = None,
+) -> tuple[list[dict[str, Any]], int | None]:
+    """Advance past leading sliding-window positions at the trace start.
+
+    Requests without a send timestamp are retained: they cannot be attributed to the
+    ramp interval and silently discarding them would hide sender failures.
+    """
+    if trim_ramp_windows < 0:
+        raise ValueError("trim_ramp_windows must be non-negative")
+    if step_ms <= 0:
+        raise ValueError("step_ms must be positive")
+    if trim_ramp_windows == 0:
+        return list(records), trace_start_ms
+
+    timestamps = [
+        metric["ts_ms"]
+        for metric in (request_metrics(record) for record in records)
+        if metric["ts_ms"] is not None
+    ]
+    if trace_start_ms is None and not timestamps:
+        return list(records), None
+
+    trace_start = trace_start_ms if trace_start_ms is not None else min(timestamps)
+    scoring_start_ms = trace_start + trim_ramp_windows * step_ms
+    kept = [
+        record
+        for record in records
+        if record.get("actual_send_ts_ms") is None
+        or record["actual_send_ts_ms"] > scoring_start_ms
+    ]
+    return kept, scoring_start_ms
+
+
 def compute_v_sys(
     records: list[dict[str, Any]],
     *,
@@ -95,13 +133,28 @@ def compute_v_sys(
     window_ms: int = 30_000,
     step_ms: int = 5_000,
     min_samples: int = 5,
+    trim_ramp_windows: int = 0,
+    trace_start_ms: int | None = None,
 ) -> dict[str, Any]:
-    metrics = [request_metrics(r) for r in records]
+    scored_records, scoring_start_ms = trim_trace_start(
+        records,
+        trim_ramp_windows=trim_ramp_windows,
+        step_ms=step_ms,
+        trace_start_ms=trace_start_ms,
+    )
+    metrics = [request_metrics(r) for r in scored_records]
     n_req = len(metrics)
+    n_success = sum(1 for metric in metrics if metric["ok"])
     req_viol = sum(1 for m in metrics if _violates(m, ttft_slo_ms, tpot_slo_ms, e2e_slo_ms))
     windows = window_violations(
-        records, ttft_slo_ms=ttft_slo_ms, tpot_slo_ms=tpot_slo_ms, e2e_slo_ms=e2e_slo_ms,
-        window_ms=window_ms, step_ms=step_ms, min_samples=min_samples,
+        scored_records,
+        ttft_slo_ms=ttft_slo_ms,
+        tpot_slo_ms=tpot_slo_ms,
+        e2e_slo_ms=e2e_slo_ms,
+        window_ms=window_ms,
+        step_ms=step_ms,
+        t0_ms=scoring_start_ms,
+        min_samples=min_samples,
     )
     scored = [w for w in windows if w["n_requests"] >= min_samples]
     # F7: None (not 0.0) when nothing was scored -> a too-short / too-sparse run must not read
@@ -111,7 +164,13 @@ def compute_v_sys(
         "violation_time_frac": time_frac,
         "violation_request_frac": (req_viol / n_req) if n_req else None,
         "n_requests": n_req,
+        "n_requests_total": len(records),
+        "n_requests_trimmed": len(records) - n_req,
+        "n_success": n_success,
+        "success_rate": (n_success / n_req) if n_req else None,
         "n_windows_scored": len(scored),
+        "trim_ramp_windows": trim_ramp_windows,
+        "scoring_start_ms": scoring_start_ms,
     }
 
 

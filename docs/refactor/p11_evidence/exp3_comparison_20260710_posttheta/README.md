@@ -98,6 +98,9 @@ recalibration wins** — they sit within or barely above this comparison's own m
    theta-independent arm; a cheap repeated-seed rerun of just t1/t3/t6 would confirm whether the
    noise floor is stable (~0.1pp) or t3's 0.50pp was itself an outlier worth understanding.
 
+**Ramp trim**: 	rim_ramp_windows=0 (historical pre-H7 scoring). The H7 trim-1 rescore of
+TRE/t1 is recorded in ../h7_ramp_trim_20260710/.
+
 ## Files here
 
 `final_report.json`, `timeline_{tre,apa}.csv`, `summary_{tre,apa}_{t1..t7}.json`. Full markdown

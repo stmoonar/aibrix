@@ -87,6 +87,7 @@ def run_comparison(
     gateway_url: str = "http://192.168.223.76:31592/v1/completions",
     registry_path: str | None = None,
     seed: int = 0,
+    trim_ramp_windows: int = 1,
 ) -> dict:
     out_root = Path(out_root)
     out_root.mkdir(parents=True, exist_ok=True)
@@ -94,6 +95,7 @@ def run_comparison(
         "arms": sorted({s.arm for s in steps}),
         "dry_run": dry_run,
         "execute_cluster_ops": execute_cluster_ops,
+        "trim_ramp_windows": trim_ramp_windows,
         "steps": [asdict(s) for s in steps],
     }
     (out_root / "plan.json").write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")
@@ -112,6 +114,7 @@ def run_comparison(
             registry_path=registry_path,
             seed=seed,
             dry_run=dry_run,
+            trim_ramp_windows=trim_ramp_windows,
         )
         summary["arm"] = step.arm
         Path(step.replay.summary_json).write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
@@ -127,6 +130,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--gateway-url", default="http://192.168.223.76:31592/v1/completions")
     ap.add_argument("--registry", default=None)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--trim-ramp-windows", type=int, default=1)
     ap.add_argument("--dry-run", action="store_true", help="fake sender; no network")
     ap.add_argument(
         "--execute-cluster-ops", action="store_true",
@@ -139,6 +143,7 @@ def main(argv: list[str] | None = None) -> int:
     out = run_comparison(
         steps, args.out_root, dry_run=args.dry_run, execute_cluster_ops=args.execute_cluster_ops,
         gateway_url=args.gateway_url, registry_path=args.registry, seed=args.seed,
+        trim_ramp_windows=args.trim_ramp_windows,
     )
     print(json.dumps({"arms": out["plan"]["arms"], "results": len(out["results"])}, indent=2))
     return 0

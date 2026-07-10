@@ -25,6 +25,7 @@ def test_cli_writes_profile_patch_from_synthetic_csv(tmp_path) -> None:
         "--input", str(src),
         "--output", str(out),
         "--model-name", "dsqwen-7b",
+        "--trim-ramp-windows", "0",
         "--ttft-p95-ms", "100",
         "--tpot-p95-ms", "50",
         "--reliability-target", "0.9",

@@ -78,6 +78,7 @@ def run_ranking_separation(
     min_scenario_families: int = 2,
     max_single_scenario_ratio: float = 0.7,
     signal_column: str = "trs",
+    trim_ramp_windows: int = 0,
     generated_at: str | None = None,
 ) -> dict[str, Any]:
     """Fit theta on a deterministic train split, report generalisation on the test split."""
@@ -136,6 +137,7 @@ def run_ranking_separation(
         "split": {
             "method": "scenario_hash_holdout",
             "seed": split_seed,
+            "trim_ramp_windows": trim_ramp_windows,
             "test_fraction": test_fraction,
             "total_windows": len(windows),
             "total_scenarios": len(_scenarios(windows)),
@@ -161,7 +163,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         latency_slo_ms["e2e_p95"] = args.e2e_p95_ms
 
     windows = load_windows_from_csv(
-        args.input, latency_slo_ms=latency_slo_ms, signal_column=args.signal_column
+        args.input,
+        latency_slo_ms=latency_slo_ms,
+        signal_column=args.signal_column,
+        trim_ramp_windows=args.trim_ramp_windows,
     )
     report = run_ranking_separation(
         windows,
@@ -174,6 +179,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         min_scenario_families=args.min_scenario_families,
         max_single_scenario_ratio=args.max_single_scenario_ratio,
         signal_column=args.signal_column,
+        trim_ramp_windows=args.trim_ramp_windows,
         generated_at=args.generated_at,
     )
 
@@ -217,6 +223,7 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument("--output", required=True, help="Path to write the JSON separation report")
     parser.add_argument("--model-name", required=True)
     parser.add_argument("--signal-column", default="trs")
+    parser.add_argument("--trim-ramp-windows", type=int, default=1)
     parser.add_argument("--ttft-p95-ms", type=float, required=True)
     parser.add_argument("--tpot-p95-ms", type=float, required=True)
     parser.add_argument("--e2e-p95-ms", type=float)

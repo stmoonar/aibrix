@@ -15,6 +15,7 @@ def _write_csv(path, rows) -> None:
     fieldnames = [
         "scenario_id",
         "scenario_family",
+        "window_start_ms",
         "trs",
         "prompt_tokens_total",
         "generation_tokens_total",
@@ -170,6 +171,7 @@ def test_report_schema_and_grid(tmp_path) -> None:
         "generated_at",
         "model_name",
         "signal_column",
+        "trim_ramp_windows",
         "slo",
         "window",
         "grid",
@@ -234,6 +236,7 @@ def test_cli_writes_report_from_csv(tmp_path) -> None:
             "--input", str(src),
             "--output", str(out),
             "--model-name", "dsqwen-7b",
+            "--trim-ramp-windows", "0",
             "--ttft-p95-ms", str(_TTFT_SLO),
             "--tpot-p95-ms", str(_TPOT_SLO),
             "--inherited-w-p", "0.08",
@@ -245,7 +248,27 @@ def test_cli_writes_report_from_csv(tmp_path) -> None:
     assert rc == 0
     report = json.loads(out.read_text(encoding="utf-8"))
     assert report["model_name"] == "dsqwen-7b"
+    assert report["trim_ramp_windows"] == 0
     assert report["inherited"]["source"] == "cli"
     assert report["best"]["w_p"] == 0.1
     assert report["recommendation"] == "adopt_refit"
     assert report["slo"] == {"ttft_p95": _TTFT_SLO, "tpot_p95": _TPOT_SLO}
+
+
+def test_load_windows_and_inputs_trims_aligned_ramp_rows(tmp_path) -> None:
+    src = tmp_path / "trim.csv"
+    rows = _keep_rows()[:4]
+    for index, row in enumerate(rows):
+        row["scenario_id"] = "cell-a" if index < 2 else "cell-b"
+        row["window_start_ms"] = 1000 if index % 2 == 0 else 2000
+    _write_csv(src, rows)
+
+    windows, inputs = refit_trs_params.load_windows_and_inputs(
+        src,
+        latency_slo_ms={"ttft_p95": _TTFT_SLO, "tpot_p95": _TPOT_SLO},
+        trim_ramp_windows=1,
+    )
+
+    assert [window.window_start_ms for window in windows] == [2000.0, 2000.0]
+    assert len(inputs) == len(windows) == 2
+    assert [item.prompt_tokens_total for item in inputs] == [200.0, 400.0]

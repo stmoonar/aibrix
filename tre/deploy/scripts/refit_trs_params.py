@@ -58,6 +58,7 @@ from tre_calibration.dataset import (
     _as_float,
     _resolve_latency_columns,
     _skip_row,
+    trim_scenario_ramp_windows,
 )
 from tre_calibration.signals import (
     ParameterCandidateScore,
@@ -81,6 +82,7 @@ def load_windows_and_inputs(
     *,
     latency_slo_ms: dict[str, float],
     signal_column: str = "trs",
+    trim_ramp_windows: int = 0,
 ) -> tuple[list[CalibrationWindow], list[SignalInputs]]:
     """Load aligned ``(windows, inputs)`` from an R3 window CSV.
 
@@ -129,6 +131,7 @@ def load_windows_and_inputs(
                     signal=signal,
                     slo_met=all(ratio <= 1.0 for ratio in ratios),
                     health_score=1.0 / (1.0 + p95_ratio_max),
+                    window_start_ms=_as_float(row.get("window_start_ms")),
                 )
             )
             inputs.append(
@@ -143,7 +146,14 @@ def load_windows_and_inputs(
                     kv_cache_hit_rate=_as_float(row.get("kv_cache_hit_rate"), 0.0) or 0.0,
                 )
             )
-    return windows, inputs
+    kept_windows = trim_scenario_ramp_windows(windows, count=trim_ramp_windows)
+    kept_ids = {id(window) for window in kept_windows}
+    kept_inputs = [
+        signal_input
+        for window, signal_input in zip(windows, inputs)
+        if id(window) in kept_ids
+    ]
+    return kept_windows, kept_inputs
 
 
 def resolve_inherited(
@@ -214,6 +224,7 @@ def build_report(
     signal_column: str = "trs",
     slo: dict[str, float] | None = None,
     generated_at: str | None = None,
+    trim_ramp_windows: int = 0,
 ) -> dict[str, Any]:
     """Score inherited vs grid-best and assemble the comparison report."""
     if not windows:
@@ -252,6 +263,7 @@ def build_report(
         "generated_at": generated_at or datetime.now(timezone.utc).isoformat(),
         "model_name": model_name,
         "signal_column": signal_column,
+        "trim_ramp_windows": trim_ramp_windows,
         "slo": dict(slo) if slo else None,
         "window": {
             "count": len(windows),
@@ -291,7 +303,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         latency_slo_ms["e2e_p95"] = args.e2e_p95_ms
 
     windows, inputs = load_windows_and_inputs(
-        args.input, latency_slo_ms=latency_slo_ms, signal_column=args.signal_column
+        args.input,
+        latency_slo_ms=latency_slo_ms,
+        signal_column=args.signal_column,
+        trim_ramp_windows=args.trim_ramp_windows,
     )
 
     (inherited_w_p, inherited_lambda_wait, inherited_qmin), inherited_source = resolve_inherited(
@@ -317,6 +332,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         signal_column=args.signal_column,
         slo=dict(latency_slo_ms),
         generated_at=args.generated_at,
+        trim_ramp_windows=args.trim_ramp_windows,
     )
 
     out = Path(args.output)
@@ -362,6 +378,7 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument("--output", required=True, help="Path to write the JSON comparison report")
     parser.add_argument("--model-name", required=True)
     parser.add_argument("--signal-column", default="trs")
+    parser.add_argument("--trim-ramp-windows", type=int, default=1)
     parser.add_argument("--ttft-p95-ms", type=float, required=True)
     parser.add_argument("--tpot-p95-ms", type=float, required=True)
     parser.add_argument("--e2e-p95-ms", type=float)

@@ -26,4 +26,5 @@ the large per-request JSONL (~8.5 MB each × 14) stays on the run host.
   3. `e017cffb` — gateway/envoy: harden against upstream socket exhaustion → zero UF (t1 503 fix).
 - **SLO** (registry): ttft_p95 500 ms, tpot_p95 75 ms, e2e_p95 12000 ms (7b/llama) / 15000 ms (14b).
 - **Scoring**: `tre_replayer.scoring.compute_v_sys` (30s window / 5s step / min_samples 5).
+- **Ramp trim**: `trim_ramp_windows=0` (historical pre-H7 scoring).
 - **Status**: DONE 2026-07-09T01:49:47Z. Terminal state: controller=observe, signal_source=zm, 0 PodAutoscaler CRs, routable/awake 1/1/1, console 200.

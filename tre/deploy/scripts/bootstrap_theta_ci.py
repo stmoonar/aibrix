@@ -34,7 +34,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         latency_slo_ms["e2e_p95"] = args.e2e_p95_ms
 
     windows = load_windows_from_csv(
-        args.input, latency_slo_ms=latency_slo_ms, signal_column=args.signal_column
+        args.input,
+        latency_slo_ms=latency_slo_ms,
+        signal_column=args.signal_column,
+        trim_ramp_windows=args.trim_ramp_windows,
     )
     n_cells = len({w.scenario_id for w in windows})
 
@@ -61,6 +64,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "generated_at": args.generated_at or datetime.now(timezone.utc).isoformat(),
         "model_name": args.model_name,
         "signal_column": args.signal_column,
+        "trim_ramp_windows": args.trim_ramp_windows,
         "slo": dict(latency_slo_ms),
         "fit_config": {
             "reliability_target": args.reliability_target,
@@ -128,6 +132,7 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument("--output", required=True, help="Path to write the JSON bootstrap report")
     parser.add_argument("--model-name", required=True)
     parser.add_argument("--signal-column", default="trs")
+    parser.add_argument("--trim-ramp-windows", type=int, default=1)
     parser.add_argument("--ttft-p95-ms", type=float, required=True)
     parser.add_argument("--tpot-p95-ms", type=float, required=True)
     parser.add_argument("--e2e-p95-ms", type=float)

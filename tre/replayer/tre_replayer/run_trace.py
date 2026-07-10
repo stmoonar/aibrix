@@ -38,6 +38,7 @@ def run_trace(
     window_ms: int = 30_000,
     step_ms: int = 5_000,
     max_in_flight: int = 512,
+    trim_ramp_windows: int = 1,
     sleep: Any = None,
 ) -> dict[str, Any]:
     from tre_common.registry import load_registry
@@ -59,6 +60,12 @@ def run_trace(
     slos = {m.name: m.slo for m in registry.models()}
     per_model: dict[str, Any] = {}
     by_model: dict[str, list[dict]] = {}
+    trace_timestamps = [
+        record.get("actual_send_ts_ms")
+        for record in sender.records
+        if record.get("actual_send_ts_ms") is not None
+    ]
+    trace_start_ms = min(trace_timestamps) if trace_timestamps else None
     for rec in sender.records:
         by_model.setdefault(rec["model"], []).append(rec)
     for model, recs in sorted(by_model.items()):
@@ -72,6 +79,8 @@ def run_trace(
             e2e_slo_ms=slo.e2e_p95_ms,
             window_ms=window_ms,
             step_ms=step_ms,
+            trim_ramp_windows=trim_ramp_windows,
+            trace_start_ms=trace_start_ms,
         )
     return {
         "trace": trace_path,
@@ -79,6 +88,7 @@ def run_trace(
         "schedule_p99_delay_ms": round(report.p99_delay_ms, 2),
         "schedule_rps_error": round(report.actual_rps_error_ratio, 4),
         "max_pool_wait_ms": round(sender.max_pool_wait_ms(), 2),  # F5: high -> sender pool starved
+        "trim_ramp_windows": trim_ramp_windows,
         "per_model": per_model,
     }
 
@@ -94,11 +104,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--window-ms", type=int, default=30_000)
     ap.add_argument("--step-ms", type=int, default=5_000)
     ap.add_argument("--max-in-flight", type=int, default=512)  # sender thread pool (F5)
+    ap.add_argument("--trim-ramp-windows", type=int, default=1)
     args = ap.parse_args(argv)
     summary = run_trace(
         args.trace, gateway_url=args.gateway_url, out_path=args.out, registry_path=args.registry,
         seed=args.seed, dry_run=args.dry_run, window_ms=args.window_ms, step_ms=args.step_ms,
-        max_in_flight=args.max_in_flight,
+        max_in_flight=args.max_in_flight, trim_ramp_windows=args.trim_ramp_windows,
     )
     print(json.dumps(summary, indent=2))
     return 0

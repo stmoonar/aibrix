@@ -50,6 +50,7 @@ def test_dry_run_replays_and_scores_each_arm_trace(tmp_path: Path) -> None:
     plan = json.loads((out_root / "plan.json").read_text())
     assert plan["arms"] == ["apa", "tre"]
     assert plan["execute_cluster_ops"] is False
+    assert plan["trim_ramp_windows"] == 1
 
     assert len(result["results"]) == 4
     for arm in ("tre", "apa"):

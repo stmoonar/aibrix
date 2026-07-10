@@ -18,7 +18,7 @@ def test_run_trace_dry_run_scores_within_slo(tmp_path) -> None:
 
     summary = run_trace(
         str(trace), gateway_url="http://x", out_path=str(out), seed=1, dry_run=True,
-        window_ms=1000, step_ms=1000, sleep=_instant_sleep,
+        window_ms=1000, step_ms=1000, trim_ramp_windows=0, sleep=_instant_sleep,
     )
 
     assert summary["requests"] > 0

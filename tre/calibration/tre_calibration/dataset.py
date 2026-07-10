@@ -22,6 +22,7 @@ class CalibrationWindow:
     signal: float
     slo_met: bool
     health_score: float | None = None
+    window_start_ms: float | None = None
 
 
 def load_windows_from_csv(
@@ -29,6 +30,7 @@ def load_windows_from_csv(
     *,
     latency_slo_ms: Mapping[str, float],
     signal_column: str = "trs",
+    trim_ramp_windows: int = 0,
 ) -> list[CalibrationWindow]:
     active_columns = _resolve_latency_columns(latency_slo_ms)
     if not active_columns:
@@ -68,9 +70,42 @@ def load_windows_from_csv(
                     signal=signal,
                     slo_met=all(ratio <= 1.0 for ratio in ratios),
                     health_score=1.0 / (1.0 + p95_ratio_max),
+                    window_start_ms=_as_float(row.get("window_start_ms")),
                 )
             )
-    return windows
+    return trim_scenario_ramp_windows(windows, count=trim_ramp_windows)
+
+
+def trim_scenario_ramp_windows(
+    windows: Iterable[CalibrationWindow],
+    *,
+    count: int,
+) -> list[CalibrationWindow]:
+    """Drop the earliest windows of each scenario while preserving CSV row order."""
+    if count < 0:
+        raise ValueError("trim_ramp_windows must be non-negative")
+    rows = list(windows)
+    if count == 0:
+        return rows
+
+    by_scenario: dict[str, list[tuple[int, CalibrationWindow]]] = {}
+    for index, window in enumerate(rows):
+        by_scenario.setdefault(window.scenario_id, []).append((index, window))
+
+    dropped: set[int] = set()
+    for entries in by_scenario.values():
+        ordered = sorted(
+            entries,
+            key=lambda item: (
+                item[1].window_start_ms is None,
+                item[1].window_start_ms
+                if item[1].window_start_ms is not None
+                else item[0],
+                item[0],
+            ),
+        )
+        dropped.update(index for index, _window in ordered[:count])
+    return [window for index, window in enumerate(rows) if index not in dropped]
 
 
 def split_by_scenario(

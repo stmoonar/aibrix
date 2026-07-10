@@ -124,6 +124,10 @@ def test_cli_writes_report_from_csv(tmp_path) -> None:
     assert rc == 0
     report = json.loads(out.read_text(encoding="utf-8"))
     assert report["model_name"] == "dsqwen-7b"
+    assert report["split"]["trim_ramp_windows"] == 1
+    assert report["split"]["total_windows"] == 12
+    assert report["split"]["train_window_count"] == 9
+    assert report["split"]["test_window_count"] == 3
     assert report["split"]["leakage_free"] is True
     assert report["train"]["fit"]["publish"] is True
     assert report["test"]["threshold"] is not None

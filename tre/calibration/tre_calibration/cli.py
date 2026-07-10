@@ -22,7 +22,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.e2e_p95_ms is not None:
         latency_slo_ms["e2e_p95"] = args.e2e_p95_ms
 
-    windows = load_windows_from_csv(args.input, latency_slo_ms=latency_slo_ms, signal_column=args.signal_column)
+    windows = load_windows_from_csv(
+        args.input,
+        latency_slo_ms=latency_slo_ms,
+        signal_column=args.signal_column,
+        trim_ramp_windows=args.trim_ramp_windows,
+    )
     theta_fit = fit_theta_by_reliability(
         windows,
         reliability_target=args.reliability_target,
@@ -60,6 +65,7 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument("--output", required=True, help="Path to write the calibration profile patch JSON")
     parser.add_argument("--model-name", required=True)
     parser.add_argument("--signal-column", default="trs")
+    parser.add_argument("--trim-ramp-windows", type=int, default=1)
     parser.add_argument("--ttft-p95-ms", type=float, required=True)
     parser.add_argument("--tpot-p95-ms", type=float, required=True)
     parser.add_argument("--e2e-p95-ms", type=float)
