@@ -1,0 +1,148 @@
+{
+  "canary_overrides": {
+    "cooldown_s": 2,
+    "post_drain_s": 2
+  },
+  "canary_trace": {
+    "duration_s": 30,
+    "input_tokens": 32,
+    "max_tokens": 16,
+    "per_model_rps": 0.5,
+    "seed": 20260715
+  },
+  "check": "Phase 4 TRE+APA full queue canary",
+  "deployment_head": "4a3b8b9678200a7fe0db4f64b3eef6bb5541c5df",
+  "final": {
+    "apa_cr_count": 0,
+    "awake": [
+      {
+        "gpu_ids": [
+          1
+        ],
+        "model": "dsllama-8b",
+        "node": "nscc-ds-4a100-node9",
+        "serve_id": "dsllama-8b-nscc-ds-4a100-node9-gpu-1-5cb98fdbb6-mr5b7"
+      },
+      {
+        "gpu_ids": [
+          0
+        ],
+        "model": "dsqwen-7b",
+        "node": "nscc-ds-4a100-node9",
+        "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-0-546d5d9f88-f94nf"
+      },
+      {
+        "gpu_ids": [
+          2,
+          3
+        ],
+        "model": "dsqwen-14b",
+        "node": "nscc-ds-4a100-node9",
+        "serve_id": "dsqwen-14b-nscc-ds-4a100-node9-gpu-2-3-69c86d8db7-vnxtl"
+      }
+    ],
+    "controller_env": {
+      "ENABLE_TRE_SCALING": "true",
+      "TRE_DISABLE_ETA_GATE": "false",
+      "TRE_SIGNAL_SOURCE": "zm"
+    },
+    "controller_mode": "observe",
+    "orphan_alerts": 0,
+    "safescale_probes": 0
+  },
+  "formal_manifest": {
+    "cooldown_s": 600,
+    "post_drain_s": 30,
+    "runs": 18
+  },
+  "frozen_sha": "ca61e485d229ecfa9aff209d7f29d24baf2db18f",
+  "passed": true,
+  "runs": [
+    {
+      "actual_actions": 0,
+      "apa_cr_count": 0,
+      "artifact_files": [
+        "STATUS",
+        "actual_actions.csv",
+        "command.json",
+        "controller.log",
+        "controller_decisions.jsonl",
+        "cooldown.json",
+        "freeze.json",
+        "layout_timeline.csv",
+        "params.json",
+        "pod_events_default.json",
+        "pod_events_tre_v2.json",
+        "proposed_actions.jsonl",
+        "redis_reset.json",
+        "request_health.json",
+        "requests.jsonl.gz",
+        "reset_state.json",
+        "run.json",
+        "run_trace.stderr",
+        "run_trace_summary.json",
+        "safescale.json",
+        "score.json",
+        "score.log",
+        "sm_state_end.json",
+        "sm_state_start.json",
+        "timeline_signals.csv",
+        "violation_windows.csv"
+      ],
+      "controller_mode": "active",
+      "finite_counterfactual_rows": {
+        "decode_tps": 12,
+        "prefill_tps": 12,
+        "queue_len": 12
+      },
+      "requests": 44,
+      "run_id": "canary_tre",
+      "signal_rows": 12,
+      "status": "DONE",
+      "trim_ramp_windows": 1
+    },
+    {
+      "actual_actions": 0,
+      "apa_cr_count": 3,
+      "artifact_files": [
+        "STATUS",
+        "actual_actions.csv",
+        "command.json",
+        "controller.log",
+        "controller_decisions.jsonl",
+        "cooldown.json",
+        "freeze.json",
+        "layout_timeline.csv",
+        "params.json",
+        "pod_events_default.json",
+        "pod_events_tre_v2.json",
+        "proposed_actions.jsonl",
+        "redis_reset.json",
+        "request_health.json",
+        "requests.jsonl.gz",
+        "reset_state.json",
+        "run.json",
+        "run_trace.stderr",
+        "run_trace_summary.json",
+        "safescale.json",
+        "score.json",
+        "score.log",
+        "sm_state_end.json",
+        "sm_state_start.json",
+        "timeline_signals.csv",
+        "violation_windows.csv"
+      ],
+      "controller_mode": "observe",
+      "finite_counterfactual_rows": {
+        "decode_tps": 12,
+        "prefill_tps": 12,
+        "queue_len": 12
+      },
+      "requests": 44,
+      "run_id": "canary_apa",
+      "signal_rows": 12,
+      "status": "DONE",
+      "trim_ramp_windows": 1
+    }
+  ]
+}
