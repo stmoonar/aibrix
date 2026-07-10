@@ -1,0 +1,8 @@
+trace,verdict,mean_node10_share_diff,tre_max_coresidency_node10,apa_max_coresidency_node10,tre_count_mismatches,apa_count_mismatches,reason
+t1,FLAG,0.3641456582633057,3,3,20,14,node10_share_diff
+t2,FLAG,0.5187793427230054,3,3,25,0,node10_share_diff
+t3,FLAG,0.41999999999999993,3,3,25,0,node10_share_diff
+t4,FLAG,0.35416666666666663,3,3,24,0,node10_share_diff
+t5,FLAG,0.34088669950738837,3,3,26,0,node10_share_diff
+t6,PASS,0.050909090909090904,3,3,7,0,placement_symmetric
+t7,FLAG,0.4022817460317456,3,3,21,0,node10_share_diff
