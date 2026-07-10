@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
 
 from tre_common.rediskeys import SCRAPE_INTERVAL_MS
+from tre_common.registry import EXPECTED_SIGNAL_DIRECTIONS, load_registry
 
 SIGNAL_SOURCES = {"zm", "latency_p95", "queue_len", "kv_cache"}
 PERCENTILE_MODES = {"bucket_upper", "interpolated"}
@@ -78,6 +80,7 @@ class ControllerConfig:
         repo_tre_dir = Path(__file__).resolve().parents[2]
         default_registry = repo_tre_dir / "deploy" / "registry.yaml"
         default_state_dir = repo_tre_dir / ".runtime"
+        registry_path = _get_str(values, "TRE_REGISTRY_PATH", str(default_registry))
 
         percentile_mode = _get_str(values, "TRE_PERCENTILE_MODE", "bucket_upper")
         if percentile_mode not in PERCENTILE_MODES:
@@ -86,6 +89,7 @@ class ControllerConfig:
         signal_source = _get_str(values, "TRE_SIGNAL_SOURCE", "zm")
         if signal_source not in SIGNAL_SOURCES:
             raise ValueError(f"TRE_SIGNAL_SOURCE must be one of {sorted(SIGNAL_SOURCES)}")
+        _validate_signal_thresholds(registry_path, signal_source)
 
         metrics_schema = _get_str(values, "TRE_METRICS_SCHEMA", "v2")
         if metrics_schema not in METRICS_SCHEMAS:
@@ -154,7 +158,7 @@ class ControllerConfig:
             ).rstrip("/"),
             # B1: wake/create + defrag run for minutes inside the SM handler.
             sm_slow_timeout_s=_get_positive_float(values, "TRE_SM_SLOW_TIMEOUT_SECONDS", 300.0),
-            registry_path=_get_str(values, "TRE_REGISTRY_PATH", str(default_registry)),
+            registry_path=registry_path,
             runtime_state_dir=_get_str(values, "TRE_RUNTIME_STATE_DIR", str(default_state_dir)),
             monitor_interval_s=_get_positive_float(values, "TRE_MONITOR_INTERVAL_SECONDS", 20.0),
             metrics_refresh_interval_s=_get_positive_float(
@@ -199,6 +203,31 @@ class ControllerConfig:
                 values, "TRE_PROFILE_FLUSH_INTERVAL_SECONDS", 1.0
             ),
             safescale=safescale,
+        )
+
+
+def _validate_signal_thresholds(registry_path: str, signal_source: str) -> None:
+    expected_direction = EXPECTED_SIGNAL_DIRECTIONS.get(signal_source)
+    if expected_direction is None:
+        return
+    registry = load_registry(registry_path)
+    missing = []
+    invalid_direction = []
+    for model in registry.models():
+        threshold = model.alt_thresholds.get(signal_source)
+        if threshold is None or not math.isfinite(threshold.theta) or threshold.theta <= 0.0:
+            missing.append(model.name)
+        elif threshold.direction != expected_direction:
+            invalid_direction.append(model.name)
+    if missing:
+        raise ValueError(
+            f"TRE_SIGNAL_SOURCE={signal_source} requires fitted alt_thresholds for every model; "
+            f"missing={sorted(missing)}"
+        )
+    if invalid_direction:
+        raise ValueError(
+            f"TRE_SIGNAL_SOURCE={signal_source} requires direction={expected_direction}; "
+            f"invalid={sorted(invalid_direction)}"
         )
 
 

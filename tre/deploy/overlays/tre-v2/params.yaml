@@ -38,6 +38,10 @@ data:
         ttft_p95_ms: 500.0
         tpot_p95_ms: 75.0
         e2e_p95_ms: 12000.0
+      alt_thresholds:
+        queue_len:
+          theta: 78.3333333333333
+          direction: lower_is_healthier
       trs:
         w_p: 0.02
         w_d: 1.0
@@ -71,6 +75,10 @@ data:
         ttft_p95_ms: 500.0
         tpot_p95_ms: 75.0
         e2e_p95_ms: 12000.0
+      alt_thresholds:
+        queue_len:
+          theta: 46.3333333333333
+          direction: lower_is_healthier
       trs:
         w_p: 0.02
         w_d: 1.0
@@ -104,6 +112,10 @@ data:
         ttft_p95_ms: 500.0
         tpot_p95_ms: 75.0
         e2e_p95_ms: 15000.0
+      alt_thresholds:
+        queue_len:
+          theta: 191.666666666667
+          direction: lower_is_healthier
       trs:
         w_p: 0.0575
         w_d: 1.0

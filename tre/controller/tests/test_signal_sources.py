@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from tre_common.metrics_schema import ModelWindowMetrics
-from tre_common.registry import ModelSpec, SloSpec, TrsParams
+from tre_common.registry import AltThreshold, ModelSpec, SloSpec, TrsParams
 from tre_controller.signals.sources import get_signal
 
 
@@ -28,6 +28,9 @@ def _spec() -> ModelSpec:
             epsat=0.05,
             hsat=1,
         ),
+        alt_thresholds={
+            "queue_len": AltThreshold(theta=4.0, direction="lower_is_healthier")
+        },
     )
 
 
@@ -75,12 +78,24 @@ def test_latency_signal_uses_worst_slo_health_ratio() -> None:
     assert signal.z_m == 0.5
 
 
-def test_queue_signal_normalizes_control_queue_by_qsat() -> None:
+def test_queue_signal_uses_fitted_lower_is_healthier_threshold() -> None:
     signal = get_signal(_metrics(avg_waiting=3.0, avg_running=2.0), _spec(), "queue_len", trs_z_m=9.0)
 
     assert signal.source == "queue_len"
     assert signal.raw_value == 8.0
     assert signal.z_m == 0.5
+
+
+def test_queue_signal_direction_boundaries_and_idle_cap() -> None:
+    spec = _spec()
+    at_theta = get_signal(_metrics(avg_running=4.0), spec, "queue_len", trs_z_m=9.0)
+    twice_theta = get_signal(_metrics(avg_running=8.0), spec, "queue_len", trs_z_m=9.0)
+    idle = get_signal(_metrics(avg_running=0.0), spec, "queue_len", trs_z_m=9.0)
+
+    assert at_theta.z_m == 1.0
+    assert twice_theta.z_m == 0.5
+    assert idle.raw_value == 0.0
+    assert idle.z_m == 10.0
 
 
 def test_latency_signal_is_unavailable_when_no_latency_samples_exist() -> None:

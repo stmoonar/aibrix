@@ -8,13 +8,14 @@ rather than crashlooping the controller on restart.
 """
 from __future__ import annotations
 
+import math
 import tempfile
 from pathlib import Path
 from typing import Any, Callable
 
 import yaml
 
-from tre_common.registry import load_registry
+from tre_common.registry import EXPECTED_SIGNAL_DIRECTIONS, load_registry
 
 # field -> (min, max, kind, min_exclusive, max_exclusive)
 _TRS_BOUNDS: dict[str, tuple] = {
@@ -31,6 +32,8 @@ _TRS_BOUNDS: dict[str, tuple] = {
     "epsat": (0, 0.5, "float", True, True),
     "hsat": (1, 20, "int", False, False),
 }
+_ALT_THRESHOLD_BOUNDS = (0, 1_000_000_000, "float", True, False)
+
 _SLO_BOUNDS: dict[str, tuple] = {
     "ttft_p95_ms": (50, 5000, "float", False, False),
     "tpot_p95_ms": (10, 500, "float", False, False),
@@ -38,7 +41,7 @@ _SLO_BOUNDS: dict[str, tuple] = {
 }
 _TOP_BOUNDS: dict[str, tuple] = {
     "min_replicas": (0, 4, "int", False, False),
-    "max_replicas": (1, 4, "int", False, False),
+    "max_replicas": (1, 8, "int", False, False),
 }
 _LOCKED = {
     "name": "identity; change via git redeploy",
@@ -67,9 +70,19 @@ def build_view(registry_yaml: str) -> dict[str, Any]:
         name = model.get("name")
         trs = model.get("trs") or {}
         slo = model.get("slo") or {}
+        alt_thresholds = model.get("alt_thresholds") or {}
         editable = {}
         for field, spec in _TRS_BOUNDS.items():
             editable[f"trs.{field}"] = _field_view(trs.get(field), spec)
+        for signal, threshold in sorted(alt_thresholds.items()):
+            editable[f"alt_thresholds.{signal}.theta"] = _field_view(
+                threshold.get("theta"), _ALT_THRESHOLD_BOUNDS
+            )
+            editable[f"alt_thresholds.{signal}.direction"] = {
+                "value": threshold.get("direction"),
+                "type": "enum",
+                "choices": [EXPECTED_SIGNAL_DIRECTIONS.get(signal)],
+            }
         for field, spec in _SLO_BOUNDS.items():
             editable[f"slo.{field}"] = _field_view(slo.get(field), spec)
         for field, spec in _TOP_BOUNDS.items():
@@ -114,6 +127,12 @@ def apply_and_validate(
             errors.append({"model": model_name, "field": "", "error": "unknown_model"})
             continue
         _apply_section(model.setdefault("trs", {}), changes.get("trs", {}), _TRS_BOUNDS, model_name, "trs.", errors)
+        _apply_alt_thresholds(
+            model.setdefault("alt_thresholds", {}),
+            changes.get("alt_thresholds", {}),
+            model_name,
+            errors,
+        )
         _apply_section(model.setdefault("slo", {}), changes.get("slo", {}), _SLO_BOUNDS, model_name, "slo.", errors)
         top = {k: v for k, v in changes.items() if k in _TOP_BOUNDS}
         _apply_section(model, top, _TOP_BOUNDS, model_name, "", errors)
@@ -158,12 +177,51 @@ def _apply_section(target: dict, changes: dict, bounds: dict, model: str, prefix
             target[field] = coerced
 
 
+def _apply_alt_thresholds(target: dict, changes: dict, model: str, errors: list) -> None:
+    if not isinstance(changes, dict):
+        errors.append({"model": model, "field": "alt_thresholds", "error": "not_an_object"})
+        return
+    for signal, raw in changes.items():
+        key = f"alt_thresholds.{signal}"
+        expected_direction = EXPECTED_SIGNAL_DIRECTIONS.get(signal)
+        if expected_direction is None:
+            errors.append({"model": model, "field": key, "error": "unknown_signal"})
+            continue
+        if not isinstance(raw, dict):
+            errors.append({"model": model, "field": key, "error": "not_an_object"})
+            continue
+        unknown = sorted(set(raw) - {"theta", "direction"})
+        for field in unknown:
+            errors.append({"model": model, "field": f"{key}.{field}", "error": "unknown_field"})
+        threshold = target.setdefault(signal, {})
+        if "theta" in raw:
+            theta = _coerce(raw["theta"], _ALT_THRESHOLD_BOUNDS, model, f"{key}.theta", errors)
+            if theta is not None:
+                threshold["theta"] = theta
+        if "direction" in raw:
+            direction = str(raw["direction"])
+            if direction != expected_direction:
+                errors.append(
+                    {
+                        "model": model,
+                        "field": f"{key}.direction",
+                        "error": "invalid_direction",
+                        "expected": expected_direction,
+                    }
+                )
+            else:
+                threshold["direction"] = direction
+
+
 def _coerce(raw: Any, spec: tuple, model: str, key: str, errors: list) -> Any:
     lo, hi, kind, lo_ex, hi_ex = spec
     try:
         value = int(raw) if kind == "int" else float(raw)
     except (TypeError, ValueError):
         errors.append({"model": model, "field": key, "error": f"not_a_{kind}"})
+        return None
+    if not math.isfinite(value):
+        errors.append({"model": model, "field": key, "error": "not_finite"})
         return None
     if (value <= lo if lo_ex else value < lo) or (value >= hi if hi_ex else value > hi):
         errors.append({"model": model, "field": key, "error": "out_of_bounds", "min": lo, "max": hi})

@@ -4,9 +4,12 @@ import math
 from dataclasses import dataclass
 
 from tre_common.metrics_schema import ModelWindowMetrics
-from tre_common.registry import ModelSpec
+from tre_common.registry import AltThreshold, ModelSpec
 
 SignalSource = str
+
+EPS = 1e-6
+Z_MAX = 10.0
 
 
 @dataclass(frozen=True)
@@ -55,13 +58,34 @@ def _latency_signal(metrics: ModelWindowMetrics, spec: ModelSpec) -> SignalValue
 
 def _queue_signal(metrics: ModelWindowMetrics, spec: ModelSpec) -> SignalValue:
     control_queue = max(
-        spec.trs.qmin,
+        0.0,
         metrics.avg_running + metrics.avg_swapping + metrics.avg_waiting * spec.trs.lambda_wait,
     )
-    qsat = _positive_float(spec.trs.qsat)
-    if qsat is None or control_queue <= 0.0:
-        return SignalValue("queue_len", raw_value=control_queue, z_m=None, unavailable_reason="queue_threshold_missing")
-    return SignalValue("queue_len", raw_value=control_queue, z_m=qsat / control_queue)
+    threshold = spec.alt_thresholds.get("queue_len")
+    z_m = normalize_signal(control_queue, threshold)
+    if z_m is None:
+        return SignalValue(
+            "queue_len",
+            raw_value=control_queue,
+            z_m=None,
+            unavailable_reason="queue_threshold_missing",
+        )
+    return SignalValue("queue_len", raw_value=control_queue, z_m=z_m)
+
+
+def normalize_signal(value: float | int | None, threshold: AltThreshold | None) -> float | None:
+    if threshold is None or threshold.theta <= 0.0 or value is None:
+        return None
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed < 0.0:
+        return None
+    if threshold.direction == "higher_is_healthier":
+        normalized = parsed / threshold.theta
+    elif threshold.direction == "lower_is_healthier":
+        normalized = threshold.theta / max(parsed, EPS)
+    else:
+        return None
+    return min(Z_MAX, normalized)
 
 
 def _kv_cache_signal(metrics: ModelWindowMetrics) -> SignalValue:

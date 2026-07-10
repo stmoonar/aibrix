@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
+import yaml
 
 from tre_common.rediskeys import SCRAPE_INTERVAL_MS
 from tre_controller.config import ControllerConfig
@@ -83,6 +86,19 @@ def test_config_reads_centralized_environment_values() -> None:
 @pytest.mark.parametrize("source", ["zm", "latency_p95", "queue_len", "kv_cache"])
 def test_config_accepts_plan_signal_sources(source: str) -> None:
     assert ControllerConfig.from_env({"TRE_SIGNAL_SOURCE": source}).signal_source == source
+
+
+def test_queue_signal_source_rejects_missing_model_threshold(tmp_path) -> None:
+    source = Path(__file__).parents[2] / "deploy" / "registry.yaml"
+    registry = yaml.safe_load(source.read_text(encoding="utf-8"))
+    registry["models"][0].pop("alt_thresholds")
+    path = tmp_path / "registry.yaml"
+    path.write_text(yaml.safe_dump(registry, sort_keys=False), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="missing=.*dsqwen-7b"):
+        ControllerConfig.from_env(
+            {"TRE_SIGNAL_SOURCE": "queue_len", "TRE_REGISTRY_PATH": str(path)}
+        )
 
 
 @pytest.mark.parametrize("key", ["TRE_MONITOR_INTERVAL_SECONDS", "TRE_RESCUE_INTERVAL_SECONDS", "TRE_FAIRNESS_INTERVAL_SECONDS"])

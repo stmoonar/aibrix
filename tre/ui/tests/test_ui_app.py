@@ -73,6 +73,7 @@ models:
     max_replicas: 4
     vllm_image: img:1
     slo: {ttft_p95_ms: 500.0, tpot_p95_ms: 75.0, e2e_p95_ms: 12000.0}
+    alt_thresholds: {queue_len: {theta: 6.5, direction: lower_is_healthier}}
     trs: {w_p: 0.08, w_d: 1.0, lambda_wait: 1.875, qmin: 1.0, ema_alpha: 0.25,
           theta_m: 738.0, tau_crit: 0.75, tau_low: 1.0, tau_high: 1.63, qsat: 4.0,
           epsat: 0.1, hsat: 4, ema_tau_ms: 20000}
@@ -201,6 +202,7 @@ def test_get_params_view_and_pending_restart() -> None:
     client, _ = _client(FakeK8s())
     body = client.get("/api/params").json()
     assert body["models"]["m1"]["editable"]["trs.theta_m"]["value"] == 738.0
+    assert body["models"]["m1"]["editable"]["alt_thresholds.queue_len.theta"]["value"] == 6.5
     assert body["resource_version"] == "100"
     assert body["pending_restart"] is False  # no applied hash annotation yet
 
@@ -215,9 +217,26 @@ def test_put_params_validates_writes_and_restart_flow() -> None:
     assert bad.status_code == 422
     assert k8s.cm["metadata"]["resourceVersion"] == "100"
     # valid edit -> CM rewritten, rv bumped, and now pending a restart
-    ok = client.put("/api/params", json={"expected_resource_version": "100", "models": {"m1": {"trs": {"theta_m": 800.0}}}})
+    ok = client.put(
+        "/api/params",
+        json={
+            "expected_resource_version": "100",
+            "models": {
+                "m1": {
+                    "trs": {"theta_m": 800.0},
+                    "alt_thresholds": {
+                        "queue_len": {
+                            "theta": 7.25,
+                            "direction": "lower_is_healthier",
+                        }
+                    },
+                }
+            },
+        },
+    )
     assert ok.status_code == 200
     assert "800.0" in k8s.cm["data"]["registry.yaml"]
+    assert "7.25" in k8s.cm["data"]["registry.yaml"]
     assert ok.json()["pending_restart"] is True
     # stale rv -> 409
     stale = client.put("/api/params", json={"expected_resource_version": "100", "models": {"m1": {"trs": {"theta_m": 810.0}}}})

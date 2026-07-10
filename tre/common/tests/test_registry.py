@@ -24,6 +24,8 @@ models:
     max_replicas: 4
     vllm_image: vllm/vllm-openai:0.10.1-sleep
     slo: {ttft_p95_ms: 1200, tpot_p95_ms: 100, e2e_p95_ms: 10000}
+    alt_thresholds:
+      queue_len: {theta: 6.5, direction: lower_is_healthier}
     trs:
       w_p: 0.04
       w_d: 1.0
@@ -50,6 +52,7 @@ def test_load_registry_exposes_models_and_cluster_topology(tmp_path):
     assert registry.model("dsqwen-7b").tp_size == 1
     assert registry.model("dsqwen-7b").slo.ttft_p95_ms == 1200.0
     assert registry.model("dsqwen-7b").trs.lambda_wait == 2.625
+    assert registry.model("dsqwen-7b").alt_thresholds["queue_len"].theta == 6.5
     assert registry.topology().nodes[0].gpu_uuids == ("GPU-75-0", "GPU-75-1", "GPU-75-2", "GPU-75-3")
     assert registry.topology().nodes[0].two_gpu_slots == ((0, 1), (2, 3))
     assert registry.validate() == []
@@ -102,3 +105,20 @@ models:
     assert any("outside gpu range" in error for error in registry.validate())
     with pytest.raises(KeyError):
         registry.model("missing")
+
+
+def test_registry_validates_alt_threshold_direction_and_theta(tmp_path):
+    path = tmp_path / "registry.yaml"
+    bad_direction = textwrap.dedent(REGISTRY_YAML).replace(
+        "direction: lower_is_healthier", "direction: higher_is_healthier"
+    )
+    path.write_text(bad_direction, encoding="utf-8")
+    errors = load_registry(str(path)).validate()
+    assert any("alt_thresholds.queue_len.direction" in error for error in errors)
+
+    path.write_text(
+        textwrap.dedent(REGISTRY_YAML).replace("theta: 6.5", "theta: 0"),
+        encoding="utf-8",
+    )
+    errors = load_registry(str(path)).validate()
+    assert any("alt_thresholds.queue_len.theta must be positive" in error for error in errors)

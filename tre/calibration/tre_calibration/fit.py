@@ -65,15 +65,24 @@ def fit_theta_by_reliability(
     min_confidence: float,
     min_scenario_families: int,
     max_single_scenario_ratio: float,
+    direction: str = "higher_is_healthier",
 ) -> ReliabilityThetaFit:
+    if direction not in {"higher_is_healthier", "lower_is_healthier"}:
+        raise ValueError("direction must be higher_is_healthier or lower_is_healthier")
     rows = [row for row in windows if math.isfinite(row.signal)]
-    candidates = sorted({row.signal for row in rows})
+    candidates = sorted(
+        {row.signal for row in rows},
+        reverse=direction == "lower_is_healthier",
+    )
     selected_subset: list[CalibrationWindow] = []
     selected_theta: float | None = None
     selected_attainment = 0.0
 
     for theta in candidates:
-        subset = [row for row in rows if row.signal >= theta]
+        if direction == "higher_is_healthier":
+            subset = [row for row in rows if row.signal >= theta]
+        else:
+            subset = [row for row in rows if row.signal <= theta]
         support = len(subset)
         if support == 0:
             continue

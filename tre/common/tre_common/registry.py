@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+import math
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +13,20 @@ class SloSpec:
     ttft_p95_ms: float
     tpot_p95_ms: float
     e2e_p95_ms: float
+
+
+ALT_THRESHOLD_DIRECTIONS = {"higher_is_healthier", "lower_is_healthier"}
+EXPECTED_SIGNAL_DIRECTIONS = {
+    "queue_len": "lower_is_healthier",
+    "decode_tps": "higher_is_healthier",
+    "prefill_tps": "higher_is_healthier",
+}
+
+
+@dataclass(frozen=True)
+class AltThreshold:
+    theta: float
+    direction: str
 
 
 @dataclass(frozen=True)
@@ -28,8 +43,8 @@ class TrsParams:
     # DEPRECATED (ADR-0014): the saturation-segment concept was removed; scaling and
     # fairness receiver eligibility are decided solely by z_m threshold bands. These
     # fields are retained only for backward-compatible registry.yaml parsing and are no
-    # longer fitted by R3. `qsat` is still consumed as the queue_len signal's z_m
-    # normalizer in signals/sources.py; `epsat`/`hsat` are now inert.
+    # longer fitted by R3. `qsat`/`epsat`/`hsat` are now inert; queue_len uses the
+    # model-specific alt_thresholds entry.
     qsat: float
     epsat: float
     hsat: int
@@ -60,6 +75,7 @@ class ModelSpec:
     slo: SloSpec
     trs: TrsParams
     vllm_extra_args: tuple[str, ...] = ()
+    alt_thresholds: dict[str, AltThreshold] = field(default_factory=dict)
 
 
 class Registry:
@@ -95,6 +111,19 @@ class Registry:
                 errors.append(f"model {model.name}: min_replicas must be non-negative")
             if model.max_replicas < model.min_replicas:
                 errors.append(f"model {model.name}: max_replicas below min_replicas")
+            for signal, threshold in model.alt_thresholds.items():
+                if not math.isfinite(threshold.theta) or threshold.theta <= 0.0:
+                    errors.append(f"model {model.name}: alt_thresholds.{signal}.theta must be positive")
+                if threshold.direction not in ALT_THRESHOLD_DIRECTIONS:
+                    errors.append(
+                        f"model {model.name}: alt_thresholds.{signal}.direction must be one of "
+                        f"{sorted(ALT_THRESHOLD_DIRECTIONS)}"
+                    )
+                expected = EXPECTED_SIGNAL_DIRECTIONS.get(signal)
+                if expected is not None and threshold.direction != expected:
+                    errors.append(
+                        f"model {model.name}: alt_thresholds.{signal}.direction must be {expected}"
+                    )
 
         seen_nodes: set[str] = set()
         for node in self._topology.nodes:
@@ -171,4 +200,11 @@ def _parse_model(raw: dict[str, Any]) -> ModelSpec:
             ema_tau_ms=(float(trs["ema_tau_ms"]) if trs.get("ema_tau_ms") is not None else None),
         ),
         vllm_extra_args=tuple(str(arg) for arg in raw.get("vllm_extra_args", [])),
+        alt_thresholds={
+            str(signal): AltThreshold(
+                theta=float(values["theta"]),
+                direction=str(values["direction"]),
+            )
+            for signal, values in (raw.get("alt_thresholds") or {}).items()
+        },
     )
