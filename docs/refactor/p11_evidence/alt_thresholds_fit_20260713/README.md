@@ -59,3 +59,55 @@ ConfigMap payload. The live `/api/params` PUT and controller restart are intenti
 to the single merged Phase 3 rollout, so current cluster behavior is unchanged.
 
 Verification at the fit-code SHA: authoritative `make check` passed 478 tests.
+
+## A2 token-rate pressure fits
+
+The runtime implementation computes completed prompt/generation token deltas per second per
+awake replica. R3 is a cross-load scan, so this raw rate is empirically a **pressure** signal:
+higher completed-token rates occur at the high-concurrency edge where latency violations are
+more frequent. It is not a load-independent estimate of maximum service capacity.
+
+The fit tool evaluates both directions. For all three decode fits, the planned
+`higher_is_healthier` direction is unpublished (`insufficient_support_or_attainment`). For
+prefill it is also unpublished for every model (14B finds a tiny pure subset but fails family
+coverage). The registered direction is therefore `lower_is_healthier`, which is the only
+fully covered, reliability-publishing interpretation of these recorded counters.
+
+### Decode TPS
+
+| model | theta (tokens/s/awake replica) | support | attainment | opposite higher direction |
+|---|---:|---:|---:|---|
+| dsqwen-7b | 2218.666667 | 2,671 | 0.901161 | unpublished |
+| dsllama-8b | 1634.133333 | 1,691 | 0.902425 | unpublished |
+| dsqwen-14b | 6536.533333 | 2,870 | 0.924390 | unpublished |
+
+### Prefill TPS
+
+| model | theta (tokens/s/awake replica) | support | attainment | opposite higher direction |
+|---|---:|---:|---:|---|
+| dsqwen-7b | 6081.666667 | 2,705 | 0.900185 | unpublished |
+| dsllama-8b | 2186.666667 | 1,540 | 0.901299 | unpublished |
+| dsqwen-14b | 10670.400000 | 2,580 | 0.902713 | unpublished (coverage) |
+
+The exact selected and opposite-direction results are in `token_rates/*_fit.yaml`; plots and
+raw curve CSVs are in the same subtree. Fit-code SHA:
+`c40db84e49bda6befeb9a84f6b8260e65d29e91e`.
+
+Regenerate either signal by replacing `SIGNAL` below with `decode_tps` or `prefill_tps`:
+
+```bash
+SIGNAL=decode_tps
+PYTHONPATH=common:calibration python3 calibration/scripts/fit_alt_thresholds.py \
+  --registry deploy/registry.yaml --signal "$SIGNAL" \
+  --model-input dsqwen-7b=/root/tre-experiments/r3_7b_slide_convprobe2.csv \
+  --model-input dsllama-8b=/root/tre-experiments/r3_llama_slide_supp.csv \
+  --model-input dsqwen-14b=/root/tre-experiments/r3_14b_slide_supp3.csv \
+  --trim-ramp-windows 1 \
+  --generated-at 2026-07-10T00:00:00+08:00 \
+  --output "../docs/refactor/p11_evidence/alt_thresholds_fit_20260713/token_rates/${SIGNAL}_fit.yaml" \
+  --curve-dir ../docs/refactor/p11_evidence/alt_thresholds_fit_20260713/token_rates/curves \
+  --plot-output "../docs/refactor/p11_evidence/alt_thresholds_fit_20260713/token_rates/${SIGNAL}_reliability.svg"
+```
+
+The exact thresholds are already mirrored in `deploy/registry.yaml` and the bootstrap
+ConfigMap payload. Live application remains deferred to the merged Phase 3 rollout.
