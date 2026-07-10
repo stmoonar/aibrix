@@ -67,6 +67,7 @@ class ControllerConfig:
     enable_tre_scaling: bool
     ablation_disable_fast_loop: bool
     ablation_disable_safescale: bool
+    disable_eta_gate: bool
     orphan_scan_enabled: bool
     orphan_grace_s: float
     # t1: suppress the receiver-less proactive scale-down probe on hot (HIGH) donors
@@ -199,6 +200,7 @@ class ControllerConfig:
             enable_tre_scaling=_get_bool(values, "ENABLE_TRE_SCALING", True),
             ablation_disable_fast_loop=_get_bool(values, "TRE_ABLATION_DISABLE_FAST_LOOP", False),
             ablation_disable_safescale=_get_bool(values, "TRE_ABLATION_DISABLE_SAFESCALE", False),
+            disable_eta_gate=_get_bool(values, "TRE_DISABLE_ETA_GATE", False),
             orphan_scan_enabled=_get_bool(values, "TRE_ORPHAN_SCAN_ENABLED", True),
             orphan_grace_s=_get_positive_float(values, "TRE_ORPHAN_GRACE_S", 600.0),
             safescale_suppress_hot_proactive=_get_bool(

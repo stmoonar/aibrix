@@ -33,6 +33,7 @@ class PlanConfig:
     # TP critical_same_slot_high_shrink -> CRITICAL beneficiary) is a separate path and is
     # intentionally NOT gated. Ablate via TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE=0.
     suppress_hot_proactive_probe: bool = True
+    disable_eta_gate: bool = False
 
 
 @dataclass(frozen=True)
@@ -156,7 +157,11 @@ def build_plan(
     high_models = [item for item in classifications if item.state == ModelState.HIGH]
     idle_models = [item for item in classifications if item.state == ModelState.IDLE]
     paper_donors = [item for item in classifications if item.role == ModelRole.DONOR]
-    paper_donors.sort(key=donor_mock_cost_key)
+    paper_donors.sort(
+        key=lambda item: donor_mock_cost_key(
+            item, disable_eta_gate=cfg.disable_eta_gate
+        )
+    )
     middle_zone = [
         item
         for item in classifications

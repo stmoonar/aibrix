@@ -100,6 +100,7 @@ def run_planner_tick(
     incomplete_policy: IncompletePolicy = "drop_model",
     signal_state: SignalState | None = None,
     suppress_hot_proactive_probe: bool = True,
+    disable_eta_gate: bool = False,
     prof: "TickProfiler | None" = None,
     loop: str = "tick",
 ) -> LoopTickResult:
@@ -137,6 +138,7 @@ def run_planner_tick(
         max_replicas_by_model={spec.name: spec.max_replicas for spec in registry.models()},
         incomplete_policy=incomplete_policy,
         suppress_hot_proactive_probe=suppress_hot_proactive_probe,
+        disable_eta_gate=disable_eta_gate,
     )
     plan = build_plan(
         model_contexts=contexts,

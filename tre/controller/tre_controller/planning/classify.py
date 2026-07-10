@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
@@ -181,7 +182,11 @@ def classify_all_models(
 
 def filter_donors_by_eta(
     donors: list[ModelClassification],
+    *,
+    disabled: bool = False,
 ) -> tuple[list[ModelClassification], list[ModelClassification]]:
+    if disabled:
+        return list(donors), []
     eligible: list[ModelClassification] = []
     filtered_out: list[ModelClassification] = []
     for donor in donors:
@@ -199,13 +204,20 @@ def split_receivers_donors(
     classifications: list[ModelClassification],
     *,
     apply_eta_gate: bool = True,
+    disable_eta_gate: bool = False,
 ) -> tuple[list[ModelClassification], list[ModelClassification]]:
     receivers = [item for item in classifications if item.role == ModelRole.RECEIVER]
     donors = [item for item in classifications if item.role == ModelRole.DONOR]
     receivers.sort(key=_receiver_sort_key)
-    donors.sort(key=donor_mock_cost_key)
+    donors.sort(
+        key=lambda item: donor_mock_cost_key(
+            item, disable_eta_gate=disable_eta_gate
+        )
+    )
     if apply_eta_gate:
-        donors, _filtered = filter_donors_by_eta(donors)
+        donors, _filtered = filter_donors_by_eta(
+            donors, disabled=disable_eta_gate
+        )
     return receivers, donors
 
 
@@ -239,7 +251,13 @@ def build_comparison_log(
     }
 
 
-def donor_mock_cost_key(classification: Any) -> tuple[int, float, float]:
+def donor_mock_cost_key(
+    classification: Any,
+    *,
+    disable_eta_gate: bool = False,
+) -> Any:
+    if disable_eta_gate:
+        return _natural_text_key(str(getattr(classification, "model_name", "")))
     donor_tier = getattr(classification, "donor_tier", None)
     if donor_tier == "idle":
         donor_prio = -1
@@ -252,6 +270,15 @@ def donor_mock_cost_key(classification: Any) -> tuple[int, float, float]:
     eta_m_raw = _float_or(getattr(classification, "eta_m", None), None)
     eta_m = eta_m_raw if eta_m_raw is not None else float("inf")
     return (donor_prio, -z_m, eta_m)
+
+
+def _natural_text_key(value: str) -> tuple[tuple[int, Any], ...]:
+    parts = re.split(r"(\d+)", value.casefold())
+    return tuple(
+        (0, int(part)) if part.isdigit() else (1, part)
+        for part in parts
+        if part
+    )
 
 
 def _receiver_sort_key(classification: ModelClassification) -> tuple[int, float]:

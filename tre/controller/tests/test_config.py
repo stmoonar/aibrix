@@ -38,6 +38,7 @@ def test_config_defaults_are_plan_aligned() -> None:
     assert config.enable_tre_scaling is True
     assert config.ablation_disable_fast_loop is False
     assert config.ablation_disable_safescale is False
+    assert config.disable_eta_gate is False
 
 
 def test_config_reads_centralized_environment_values() -> None:
@@ -61,6 +62,7 @@ def test_config_reads_centralized_environment_values() -> None:
             "ENABLE_TRE_SCALING": "false",
             "TRE_ABLATION_DISABLE_FAST_LOOP": "1",
             "TRE_ABLATION_DISABLE_SAFESCALE": "yes",
+            "TRE_DISABLE_ETA_GATE": "true",
         }
     )
 
@@ -82,6 +84,7 @@ def test_config_reads_centralized_environment_values() -> None:
     assert config.enable_tre_scaling is False
     assert config.ablation_disable_fast_loop is True
     assert config.ablation_disable_safescale is True
+    assert config.disable_eta_gate is True
 
 
 @pytest.mark.parametrize(

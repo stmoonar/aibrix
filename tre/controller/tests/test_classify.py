@@ -19,6 +19,7 @@ from tre_controller.planning.classify import (
     build_comparison_log,
     classify_all_models,
     classify_model,
+    donor_mock_cost_key,
     filter_donors_by_eta,
     split_receivers_donors,
 )
@@ -234,3 +235,50 @@ def test_zero_load_still_uses_idle_reclamation_tier() -> None:
     classification = classify_all_models(contexts, signal_idle_rps_eps=0.05)[0]
     assert classification.state.value == "idle"
     assert classification.donor_tier == "idle"
+
+def test_disable_eta_gate_keeps_all_donors_and_uses_natural_model_order() -> None:
+    contexts = {
+        "model-10": {
+            "Y_m": 1.0,
+            "Q": 1.0,
+            "z_m": 1.8,
+            "eta_m": 100.0,
+            "trs": 1800.0,
+            "theta_m": 1000.0,
+        },
+        "model-2": {
+            "Y_m": 1.0,
+            "Q": 1.0,
+            "z_m": 1.4,
+            "eta_m": 250.0,
+            "trs": 1400.0,
+            "theta_m": 1000.0,
+        },
+        "model-1": {
+            "Y_m": 1.0,
+            "Q": 1.0,
+            "z_m": 1.6,
+            "eta_m": 500.0,
+            "trs": 1600.0,
+            "theta_m": 1000.0,
+        },
+    }
+    controls = {
+        model: {"receiver_thrashing_eff": 200.0, "donor_waste_eff": 300.0}
+        for model in contexts
+    }
+    classifications = classify_all_models(contexts, model_control_configs=controls)
+    donors = [item for item in classifications if item.role.value == "donor"]
+
+    eligible, filtered = filter_donors_by_eta(donors, disabled=True)
+    assert {item.model_name for item in eligible} == set(contexts)
+    assert filtered == []
+
+    _receivers, ordered = split_receivers_donors(
+        classifications, disable_eta_gate=True
+    )
+    assert [item.model_name for item in ordered] == ["model-1", "model-2", "model-10"]
+    assert sorted(
+        donors,
+        key=lambda item: donor_mock_cost_key(item, disable_eta_gate=True),
+    ) == ordered

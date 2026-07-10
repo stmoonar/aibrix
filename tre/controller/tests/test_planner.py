@@ -579,3 +579,36 @@ def test_idle_proactive_immediate_shrink_not_affected_by_hot_guard() -> None:
     assert shrink.requires_safescale is False
     assert shrink.reason == "idle_proactive_immediate"
     assert not any(e.startswith("safescale_probe_suppressed_hot") for e in plan.events)
+
+
+def test_disable_eta_gate_uses_signal_independent_natural_donor_order() -> None:
+    classifications = [
+        _classification("receiver", ModelState.CRITICAL, ModelRole.RECEIVER, 0.5),
+        _classification("model-10", ModelState.HIGH, ModelRole.DONOR, 2.0, "surplus"),
+        _classification("model-2", ModelState.HIGH, ModelRole.DONOR, 1.5, "surplus"),
+    ]
+    contexts = {
+        "receiver": {"assigned_replicas": 1, "routable_pods": 1},
+        "model-10": {"assigned_replicas": 2, "routable_pods": 2},
+        "model-2": {"assigned_replicas": 2, "routable_pods": 2},
+    }
+
+    plan = build_plan(
+        model_contexts=contexts,
+        classifications=classifications,
+        model_replicas={"receiver": 1, "model-10": 2, "model-2": 2},
+        idle_gpus=0,
+        cfg=PlanConfig(
+            min_replicas_per_model=1,
+            max_replicas_per_model=4,
+            disable_eta_gate=True,
+        ),
+    )
+
+    donor_shrinks = [
+        action
+        for action in plan.actions
+        if isinstance(action, ScaleAction) and action.delta < 0
+    ]
+    assert donor_shrinks
+    assert donor_shrinks[0].model == "model-2"

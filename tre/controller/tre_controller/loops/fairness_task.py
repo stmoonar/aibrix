@@ -44,6 +44,7 @@ def run_fairness_tick(
     incomplete_policy: IncompletePolicy = "drop_model",
     signal_state: SignalState | None = None,
     suppress_hot_proactive_probe: bool = True,
+    disable_eta_gate: bool = False,
     prof: "TickProfiler | None" = None,
 ) -> LoopTickResult:
     return run_planner_tick(
@@ -61,6 +62,7 @@ def run_fairness_tick(
         incomplete_policy=incomplete_policy,
         signal_state=signal_state,
         suppress_hot_proactive_probe=suppress_hot_proactive_probe,
+        disable_eta_gate=disable_eta_gate,
         prof=prof,
         loop="fairness",
     )
@@ -102,6 +104,7 @@ async def fairness_task(
                     incomplete_policy=getattr(cfg, "incomplete_policy", "drop_model"),
                     signal_state=signal_state,
                     suppress_hot_proactive_probe=getattr(cfg, "safescale_suppress_hot_proactive", True),
+                    disable_eta_gate=getattr(cfg, "disable_eta_gate", False),
                     prof=prof,
                 )
             if decision_writer is not None:
