@@ -120,6 +120,31 @@ def test_wake_equal_node_counts_use_natural_serve_id_order():
     ]
 
 
+def test_multi_wake_rebalances_node_count_after_each_selection():
+    node9 = "nscc-ds-4a100-node9"
+    node10 = "nscc-ds-4a100-node10"
+    service, store = _service(
+        [
+            _binding("target-node9-gpu-0", "target", node9, (0,), awake=False),
+            _binding("target-node9-gpu-1", "target", node9, (1,), awake=False),
+            _binding("target-node10-gpu-0", "target", node10, (0,), awake=False),
+            _binding("target-node10-gpu-1", "target", node10, (1,), awake=False),
+        ]
+    )
+
+    result = service.put_model_target("target", wake_replicas=2)
+
+    assert result["actions"] == [
+        {"action": "wake", "serve_id": "target-node9-gpu-0"},
+        {"action": "wake", "serve_id": "target-node10-gpu-0"},
+    ]
+    awake_nodes = {
+        binding.slot.node
+        for binding in store.load().bindings
+        if binding.model == "target" and binding.awake
+    }
+    assert awake_nodes == {node9, node10}
+
 def test_wake_skips_infeasible_candidate_on_least_loaded_node():
     node9 = "nscc-ds-4a100-node9"
     node10 = "nscc-ds-4a100-node10"

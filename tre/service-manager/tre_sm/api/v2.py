@@ -111,23 +111,32 @@ class ServiceManagerV2:
             awake_by_node = Counter(
                 binding.slot.node for binding in snapshot.bindings if binding.awake
             )
-            sleeping.sort(
-                key=lambda binding: (
-                    awake_by_node[binding.slot.node], _natural_key(binding.serve_id)
-                )
-            )
             wake_existing = 0
             wake_needed = wake_replicas - len(awake)
             skipped_conflict: str | None = None
-            for binding in sleeping:
-                if wake_existing >= wake_needed:
+            while sleeping and wake_existing < wake_needed:
+                feasible = [
+                    binding
+                    for binding in sleeping
+                    if self._feasible_wake(binding, list(updated_by_serve.values()))
+                ]
+                if not feasible:
+                    skipped_conflict = skipped_conflict or (
+                        f"{sleeping[0].serve_id}: slot already has awake binding"
+                    )
                     break
-                if not self._feasible_wake(binding, list(updated_by_serve.values())):
-                    if skipped_conflict is None:
-                        skipped_conflict = f"{binding.serve_id}: slot already has awake binding"
-                    continue
+                binding = min(
+                    feasible,
+                    key=lambda item: (
+                        awake_by_node[item.slot.node], _natural_key(item.serve_id)
+                    ),
+                )
+                sleeping.remove(binding)
                 self._apply_runtime_power_action(binding, action="wake")
-                updated_by_serve[binding.serve_id] = replace(binding, awake=True, hidden=False)
+                updated_by_serve[binding.serve_id] = replace(
+                    binding, awake=True, hidden=False
+                )
+                awake_by_node[binding.slot.node] += 1
                 actions.append({"action": "wake", "serve_id": binding.serve_id})
                 wake_existing += 1
             create_count = max(0, wake_replicas - len(model_bindings))
