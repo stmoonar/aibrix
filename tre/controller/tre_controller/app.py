@@ -8,6 +8,7 @@ from tre_common.registry import Registry, load_registry
 from tre_controller.config import ControllerConfig
 from tre_controller.loops.action_queue import ActionQueue
 from tre_controller.mode import ObserveModeGate
+from tre_controller.reconcile.hidden_orphans import HiddenOrphanDetector
 from tre_controller.profiling import TickProfiler, build_profiler
 from tre_controller.loops.cluster_view_task import ClusterViewBox, cluster_view_task
 from tre_controller.loops.decision_snapshot import DecisionSnapshotWriter
@@ -38,6 +39,7 @@ class ControllerDependencies:
     registry: Registry
     signal_state: SignalState
     profiler: "TickProfiler | None" = None
+    hidden_orphan_detector: "HiddenOrphanDetector | None" = None
 
 
 @dataclass(frozen=True)
@@ -53,6 +55,11 @@ def build_controller_task_specs(
     specs: list[ControllerTaskSpec] = [
         ControllerTaskSpec("metrics", lambda: metrics_task(deps.store, deps.snapshot_box, cfg, prof=deps.profiler)),
     ]
+    if (
+        bool(getattr(cfg, "orphan_scan_enabled", True))
+        and deps.hidden_orphan_detector is not None
+    ):
+        specs.append(ControllerTaskSpec("hidden_orphans", deps.hidden_orphan_detector.run))
     if not bool(getattr(cfg, "enable_tre_scaling", True)):
         return tuple(specs)
 
@@ -166,6 +173,9 @@ def create_controller_dependencies(
         registry=registry,
         signal_state=SignalState(warmup_ms=cfg.signal_warmup_ms),
         profiler=profiler,
+        hidden_orphan_detector=HiddenOrphanDetector(
+            redis_client, grace_s=cfg.orphan_grace_s
+        ),
     )
 
 

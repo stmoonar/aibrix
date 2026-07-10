@@ -20,6 +20,8 @@ DECISION_HIST_TTL_SECONDS = 25 * 60 * 60
 SM_STATE_KEY = "tre:v2:sm:state"
 SM_VERSION_KEY = "tre:v2:sm:version"
 CONTROLLER_SAFESCALE_PROBES_KEY = "tre:v2:controller:safescale:probes"
+CONTROLLER_ORPHAN_WATCH_KEY = "tre:v2:controller:orphan_watch"
+CONTROLLER_HIDDEN_ORPHAN_ALERTS_KEY = "tre:v2:controller:alerts:hidden_orphans"
 
 
 def controller_safescale_probe_journal_key(request_id: str) -> str:

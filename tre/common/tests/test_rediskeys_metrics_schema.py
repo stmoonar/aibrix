@@ -13,6 +13,11 @@ def test_redis_key_builders_match_v2_schema():
     assert rediskeys.DECISION_LATEST_KEY == "tre:v2:decision:latest"
     assert rediskeys.SM_STATE_KEY == "tre:v2:sm:state"
     assert rediskeys.SM_VERSION_KEY == "tre:v2:sm:version"
+    assert rediskeys.CONTROLLER_ORPHAN_WATCH_KEY == "tre:v2:controller:orphan_watch"
+    assert (
+        rediskeys.CONTROLLER_HIDDEN_ORPHAN_ALERTS_KEY
+        == "tre:v2:controller:alerts:hidden_orphans"
+    )
     assert rediskeys.RETENTION_MS == 30 * 60 * 1000
     assert rediskeys.FALLBACK_TTL_SECONDS == 2 * 60 * 60
 
