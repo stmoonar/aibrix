@@ -326,6 +326,7 @@ def _model_contexts(
                 "signal_source": signal.source,
                 "signal_raw_value": signal.raw_value,
                 "signal_unavailable_reason": signal.unavailable_reason,
+                "signal_theta": _signal_theta(spec, signal.source),
                 "trs_z_m": result.Z_m,
                 "eta_m": result.eta_m,
                 "theta_m": spec.trs.theta_m,
@@ -353,6 +354,7 @@ def _model_contexts(
                 "signal_source": signal_source,
                 "signal_raw_value": None,
                 "signal_unavailable_reason": "tokens_missing",
+                "signal_theta": _signal_theta(spec, signal_source),
                 "trs_z_m": None,
                 "eta_m": None,
                 "theta_m": spec.trs.theta_m,
@@ -371,6 +373,13 @@ def _model_contexts(
             events.extend(model_events)
         contexts[model_name] = context
     return contexts, tuple(events)
+
+
+def _signal_theta(spec: ModelSpec, source: str) -> float | None:
+    if source == "zm":
+        return spec.trs.theta_m
+    threshold = spec.alt_thresholds.get(source)
+    return threshold.theta if threshold is not None else None
 
 
 def _request_rate_rps(metrics: ModelWindowMetrics) -> float | None:

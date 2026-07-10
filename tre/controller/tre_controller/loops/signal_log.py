@@ -62,12 +62,11 @@ class SignalLogWriter:
             source = str(context.get("signal_source") or "unknown")
             if source == "zm":
                 raw_signal = context.get("trs")
-                theta = context.get("theta_m")
                 active_z = context.get("trs_z_m")
             else:
                 raw_signal = context.get("signal_raw_value")
-                theta = None
                 active_z = context.get("z_m")
+            theta = context.get("signal_theta")
             replicas_awake = int(context.get("routable_pods") or 0)
             replicas_target = max(
                 0, replicas_awake + delta_by_model.get(model, 0)
@@ -85,8 +84,8 @@ class SignalLogWriter:
                 "theta_m": _format(context.get("theta_m")),
                 "z_m": _format(context.get("trs_z_m")),
                 "queue_len": _format(context.get("Q")),
-                "decode_tps": "nan",
-                "prefill_tps": "nan",
+                "decode_tps": _format(context.get("decode_tps")),
+                "prefill_tps": _format(context.get("prefill_tps")),
                 "replicas_awake": str(replicas_awake),
                 "replicas_target": str(replicas_target),
                 "tier": _tier(classification),

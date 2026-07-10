@@ -44,11 +44,14 @@ def _result():
         model: {
             "signal_source": "zm",
             "signal_raw_value": 0.8,
+            "signal_theta": 100.0,
             "z_m": 0.8,
             "trs_z_m": 0.8,
             "trs": 125.0,
             "theta_m": 100.0,
             "Q": 4.0,
+            "decode_tps": 4.0,
+            "prefill_tps": 2.0,
             "routable_pods": 1,
             "eta_m": 5.0,
         }
@@ -85,7 +88,36 @@ def test_signal_log_writes_one_complete_row_per_model_and_window():
     assert first["raw_signal"] == "125.0"
     assert first["theta"] == "100.0"
     assert first["z"] == "0.8"
-    assert first["decode_tps"] == "nan"
+    assert first["decode_tps"] == "4.0"
+    assert first["prefill_tps"] == "2.0"
     assert first["replicas_target"] == "2"
     assert first["tier"] == "crit"
     assert first["action"] == "scale_up"
+
+
+def test_signal_log_records_active_alternate_semantics_and_all_counterfactuals():
+    redis = FakeRedis()
+    writer = SignalLogWriter(redis)
+    result = _result()
+    context = result.model_contexts["m1"]
+    context.update(
+        {
+            "signal_source": "queue_len",
+            "signal_raw_value": 4.0,
+            "signal_theta": 8.0,
+            "z_m": 0.5,
+        }
+    )
+
+    assert writer.write(_snapshot(10_000), result) == 2
+
+    first = redis.entries[0][1]
+    assert first["signal_source"] == "queue_len"
+    assert first["raw_signal"] == "4.0"
+    assert first["theta"] == "8.0"
+    assert first["z"] == "0.5"
+    assert first["tss"] == "125.0"
+    assert first["z_m"] == "0.8"
+    assert first["queue_len"] == "4.0"
+    assert first["decode_tps"] == "4.0"
+    assert first["prefill_tps"] == "2.0"
