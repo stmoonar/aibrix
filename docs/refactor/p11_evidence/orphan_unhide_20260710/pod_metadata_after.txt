@@ -1,0 +1,3 @@
+timestamp_utc=2026-07-10T05:18:40Z
+{"name":"dsllama-8b-nscc-ds-4a100-node10-gpu-0-5f474d7f85-7mns7","state":"sleeping","routable":"false"}
+{"name":"dsqwen-7b-nscc-ds-4a100-node10-gpu-0-78588bb7d8-b4p5p","state":"sleeping","routable":"false"}
