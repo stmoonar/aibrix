@@ -9,7 +9,14 @@ from typing import Mapping
 from tre_common.rediskeys import SCRAPE_INTERVAL_MS
 from tre_common.registry import EXPECTED_SIGNAL_DIRECTIONS, load_registry
 
-SIGNAL_SOURCES = {"zm", "latency_p95", "queue_len", "kv_cache"}
+SIGNAL_SOURCES = {
+    "zm",
+    "latency_p95",
+    "queue_len",
+    "decode_tps",
+    "prefill_tps",
+    "kv_cache",
+}
 PERCENTILE_MODES = {"bucket_upper", "interpolated"}
 WINDOW_MODES = {"tumbling", "sliding"}
 METRICS_SCHEMAS = {"v1", "v2"}

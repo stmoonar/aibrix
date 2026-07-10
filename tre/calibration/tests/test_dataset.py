@@ -108,3 +108,31 @@ def _window_row(scenario_id: str, start_ms: int, signal: int) -> dict[str, str]:
         "prompt_tokens_total": "100",
         "generation_tokens_total": "50",
     }
+
+def test_load_windows_accepts_derived_signal_transform(tmp_path) -> None:
+    src = tmp_path / "windows.csv"
+    rows = [
+        {
+            "scenario_id": "cell-a",
+            "scenario_family": "synthetic",
+            "window_start_ms": "1000",
+            "window_end_ms": "31000",
+            "generation_tokens_total": "3000",
+            "prompt_tokens_total": "100",
+            "p95_ttft": "80",
+            "p95_tpot": "40",
+        }
+    ]
+    with src.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+
+    windows = load_windows_from_csv(
+        src,
+        latency_slo_ms={"ttft_p95": 100.0, "tpot_p95": 50.0},
+        signal_transform=lambda row: float(row["generation_tokens_total"]) / 30.0,
+    )
+
+    assert len(windows) == 1
+    assert windows[0].signal == 100.0

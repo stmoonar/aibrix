@@ -99,7 +99,7 @@ def populate_edge_case_fixture(redis):
     reset_pod = "default/dsllama-8b-pod-a"
     redis.sadd(f"tre:v2:pods:{reset_model}", reset_pod)
     add_v2_doc(redis, f"tre:v2:hist:{reset_pod}", window.start_ms, histogram_doc(reset_model, "dsllama-8b-pod-a", 50, 5, 1.0, 5, {"0.5": 5}))
-    # Counter reset: prompt sum goes down. Delta must clamp to zero, never negative.
+    # Counter reset: prompt sum goes down. Token-rate signals must mark this window unavailable.
     add_v2_doc(redis, f"tre:v2:hist:{reset_pod}", window.end_ms, histogram_doc(reset_model, "dsllama-8b-pod-a", 30, 2, 0.5, 2, {"0.5": 2}))
     # Missing one instant sample: old semantics still divide by expected sample count.
     add_v2_doc(redis, f"tre:v2:inst:{reset_pod}", window.mid_ms, instant_doc(reset_model, "dsllama-8b-pod-a", waiting=6, running=2, kv_hit=1.0))

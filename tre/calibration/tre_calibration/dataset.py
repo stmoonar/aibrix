@@ -5,7 +5,7 @@ import hashlib
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 
 _LATENCY_COLUMNS = {
@@ -30,6 +30,7 @@ def load_windows_from_csv(
     *,
     latency_slo_ms: Mapping[str, float],
     signal_column: str = "trs",
+    signal_transform: Callable[[Mapping[str, Any]], float | None] | None = None,
     trim_ramp_windows: int = 0,
 ) -> list[CalibrationWindow]:
     active_columns = _resolve_latency_columns(latency_slo_ms)
@@ -43,7 +44,10 @@ def load_windows_from_csv(
             if _skip_row(row):
                 continue
 
-            signal = _as_float(row.get(signal_column))
+            raw_signal = (
+                signal_transform(row) if signal_transform is not None else row.get(signal_column)
+            )
+            signal = _as_float(raw_signal)
             if signal is None:
                 continue
             prompt_tokens = _as_float(row.get("prompt_tokens_total"), 0.0) or 0.0

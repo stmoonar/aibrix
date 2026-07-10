@@ -33,6 +33,12 @@ def get_signal(
         return _latency_signal(metrics, spec)
     if source == "queue_len":
         return _queue_signal(metrics, spec)
+    if source == "decode_tps":
+        return _token_rate_signal(
+            metrics, spec, source, metrics.generation_tokens
+        )
+    if source == "prefill_tps":
+        return _token_rate_signal(metrics, spec, source, metrics.prompt_tokens)
     if source == "kv_cache":
         return _kv_cache_signal(metrics)
     raise ValueError(f"unsupported signal source: {source}")
@@ -71,6 +77,47 @@ def _queue_signal(metrics: ModelWindowMetrics, spec: ModelSpec) -> SignalValue:
             unavailable_reason="queue_threshold_missing",
         )
     return SignalValue("queue_len", raw_value=control_queue, z_m=z_m)
+
+
+def per_replica_token_rate(
+    metrics: ModelWindowMetrics, token_total: float | int | None
+) -> float | None:
+    if (
+        token_total is None
+        or metrics.routable_pods <= 0
+        or metrics.token_counter_reset
+    ):
+        return None
+    total = float(token_total)
+    duration_s = (metrics.window_end_ms - metrics.window_start_ms) / 1000.0
+    if not math.isfinite(total) or total < 0.0 or duration_s <= 0.0:
+        return None
+    return total / duration_s / metrics.routable_pods
+
+
+def _token_rate_signal(
+    metrics: ModelWindowMetrics,
+    spec: ModelSpec,
+    source: str,
+    token_total: float | int | None,
+) -> SignalValue:
+    raw_value = per_replica_token_rate(metrics, token_total)
+    if raw_value is None:
+        return SignalValue(
+            source,
+            raw_value=None,
+            z_m=None,
+            unavailable_reason=f"{source}_counter_missing",
+        )
+    z_m = normalize_signal(raw_value, spec.alt_thresholds.get(source))
+    if z_m is None:
+        return SignalValue(
+            source,
+            raw_value=raw_value,
+            z_m=None,
+            unavailable_reason=f"{source}_threshold_missing",
+        )
+    return SignalValue(source, raw_value=raw_value, z_m=z_m)
 
 
 def normalize_signal(value: float | int | None, threshold: AltThreshold | None) -> float | None:

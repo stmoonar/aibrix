@@ -16,6 +16,7 @@ class PodWindowMetrics:
     tpot_p95_ms: float | None
     e2e_p95_ms: float | None
     request_count: float | None = None
+    token_counter_reset: bool = False
 
 
 @dataclass(frozen=True)
@@ -36,6 +37,7 @@ class ModelWindowMetrics:
     assigned_replicas: int
     per_pod: dict[str, PodWindowMetrics]
     request_count: float | None = None
+    token_counter_reset: bool = False
 
 
 @dataclass(frozen=True)

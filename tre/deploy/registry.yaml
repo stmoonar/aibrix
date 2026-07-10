@@ -39,6 +39,12 @@ models:
     queue_len:
       theta: 78.33333333333333
       direction: lower_is_healthier
+    decode_tps:
+      theta: 2218.6666666666665
+      direction: lower_is_healthier
+    prefill_tps:
+      theta: 6081.666666666667
+      direction: lower_is_healthier
   trs:
     w_p: 0.02
     w_d: 1.0
@@ -76,6 +82,12 @@ models:
     queue_len:
       theta: 46.333333333333336
       direction: lower_is_healthier
+    decode_tps:
+      theta: 1634.1333333333334
+      direction: lower_is_healthier
+    prefill_tps:
+      theta: 2186.6666666666665
+      direction: lower_is_healthier
   trs:
     w_p: 0.02
     w_d: 1.0
@@ -112,6 +124,12 @@ models:
   alt_thresholds:
     queue_len:
       theta: 191.66666666666666
+      direction: lower_is_healthier
+    decode_tps:
+      theta: 6536.533333333334
+      direction: lower_is_healthier
+    prefill_tps:
+      theta: 10670.4
       direction: lower_is_healthier
   trs:
     w_p: 0.0575

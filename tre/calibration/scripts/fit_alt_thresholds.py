@@ -3,8 +3,10 @@
 
 Queue length uses the native lower-is-healthier branch in
 ``fit_theta_by_reliability``. The reported theta therefore stays in raw queue units; no
-reciprocal transform is written into the registry. The first ramp window of every R3 cell
-is trimmed by default, matching the experiment scorer.
+reciprocal transform is written into the registry. Decode/prefill TPS are completed-token
+rates, so across an R3 load scan they are pressure signals (lower is healthier), not
+load-independent service-capacity estimates. The first ramp window of every R3 cell is
+trimmed by default, matching the experiment scorer.
 """
 from __future__ import annotations
 
@@ -27,6 +29,8 @@ from tre_common.registry import load_registry
 
 _SIGNAL_CONFIG = {
     "queue_len": ("queue_control", "lower_is_healthier"),
+    "decode_tps": (None, "lower_is_healthier"),
+    "prefill_tps": (None, "lower_is_healthier"),
 }
 
 
@@ -71,6 +75,29 @@ def reliability_curve(
     return rows
 
 
+def tps_transform(signal: str):
+    token_column = (
+        "generation_tokens_total" if signal == "decode_tps" else "prompt_tokens_total"
+    )
+
+    def transform(row) -> float | None:
+        try:
+            token_total = float(row[token_column])
+            start_ms = float(row["window_start_ms"])
+            end_ms = float(row["window_end_ms"])
+            replicas = float(
+                row.get("assigned_replicas") or row.get("routable_pods") or 1.0
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
+        duration_s = (end_ms - start_ms) / 1000.0
+        if token_total < 0.0 or duration_s <= 0.0 or replicas <= 0.0:
+            return None
+        return token_total / duration_s / replicas
+
+    return transform
+
+
 def fit_model(
     model_name: str,
     input_path: Path,
@@ -93,7 +120,8 @@ def fit_model(
             "tpot_p95": spec.slo.tpot_p95_ms,
             "e2e_p95": spec.slo.e2e_p95_ms,
         },
-        signal_column=signal_column,
+        signal_column=signal_column or signal,
+        signal_transform=tps_transform(signal) if signal_column is None else None,
         trim_ramp_windows=trim_ramp_windows,
     )
     fit = fit_theta_by_reliability(
@@ -136,6 +164,9 @@ def write_reliability_svg(
     path: str | Path,
     curves: dict[str, list[dict[str, Any]]],
     selected_thetas: dict[str, float],
+    *,
+    signal: str,
+    direction: str,
 ) -> None:
     width, height = 900, 520
     left, right, top, bottom = 72, 24, 32, 64
@@ -156,7 +187,7 @@ def write_reliability_svg(
             "xmlns": "http://www.w3.org/2000/svg",
             "viewBox": f"0 0 {width} {height}",
             "role": "img",
-            "aria-label": "Queue threshold reliability curves",
+            "aria-label": f"{signal} threshold reliability curves",
         },
     )
     ET.SubElement(svg, "rect", {"width": str(width), "height": str(height), "fill": "white"})
@@ -196,8 +227,12 @@ def write_reliability_svg(
         ET.SubElement(svg, "line", {"x1": str(width - 260), "y1": str(legend_y), "x2": str(width - 230), "y2": str(legend_y), "stroke": color, "stroke-width": "3"})
         ET.SubElement(svg, "text", {"x": str(width - 220), "y": str(legend_y + 5), "font-size": "13", "fill": "#222"}).text = f"{model} theta={selected:.2f}"
 
-    ET.SubElement(svg, "text", {"x": str(width / 2), "y": str(height - 12), "text-anchor": "middle", "font-size": "15", "fill": "#111"}).text = "queue_len theta (raw queue units)"
-    ET.SubElement(svg, "text", {"x": "18", "y": str(height / 2), "text-anchor": "middle", "font-size": "15", "fill": "#111", "transform": f"rotate(-90 18 {height / 2})"}).text = "healthy attainment for queue <= theta"
+    ET.SubElement(svg, "text", {"x": str(width / 2), "y": str(height - 12), "text-anchor": "middle", "font-size": "15", "fill": "#111"}).text = f"{signal} theta (raw per-replica units)"
+    ET.SubElement(svg, "text", {"x": "18", "y": str(height / 2), "text-anchor": "middle", "font-size": "15", "fill": "#111", "transform": f"rotate(-90 18 {height / 2})"}).text = (
+        "healthy attainment for value <= theta"
+        if direction == "lower_is_healthier"
+        else "healthy attainment for value >= theta"
+    )
     output = Path(path)
     output.parent.mkdir(parents=True, exist_ok=True)
     ET.ElementTree(svg).write(output, encoding="utf-8", xml_declaration=True)
@@ -295,6 +330,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 model: payload["alt_thresholds"][args.signal]["theta"]
                 for model, payload in models.items()
             },
+            signal=args.signal,
+            direction=_SIGNAL_CONFIG[args.signal][1],
         )
 
     for model, payload in models.items():

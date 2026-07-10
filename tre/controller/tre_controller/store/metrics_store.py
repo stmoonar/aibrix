@@ -263,6 +263,14 @@ class MetricsStore:
             request_count=self._hist_count_delta(
                 model, HISTOGRAM_METRICS["prompt_tokens"], hist_docs, window_start_ms
             ),
+            token_counter_reset=(
+                self._hist_counter_reset(
+                    model, HISTOGRAM_METRICS["prompt_tokens"], hist_docs
+                )
+                or self._hist_counter_reset(
+                    model, HISTOGRAM_METRICS["generation_tokens"], hist_docs
+                )
+            ),
         )
 
     def _aggregate_model(
@@ -292,6 +300,7 @@ class MetricsStore:
             assigned_replicas=routable_pods,
             per_pod=per_pod,
             request_count=_sum_optional([pod.request_count for pod in pods]),
+            token_counter_reset=any(pod.token_counter_reset for pod in pods),
         )
 
     def _hist_sum_delta(self, model: str, metric: str, docs: list[dict[str, Any]], window_start_ms: int) -> float | None:
@@ -300,7 +309,16 @@ class MetricsStore:
         first, last = _first_last_metric(model, metric, docs)
         if first is None or last is None:
             return 0.0
-        return max(0.0, _number(last.get("sum"), 0.0) - _number(first.get("sum"), 0.0))
+        delta = _number(last.get("sum"), 0.0) - _number(first.get("sum"), 0.0)
+        return delta if delta >= 0.0 else None
+
+    def _hist_counter_reset(
+        self, model: str, metric: str, docs: list[dict[str, Any]]
+    ) -> bool:
+        first, last = _first_last_metric(model, metric, docs)
+        if first is None or last is None:
+            return False
+        return _number(last.get("sum"), 0.0) < _number(first.get("sum"), 0.0)
 
     def _hist_count_delta(
         self, model: str, metric: str, docs: list[dict[str, Any]], window_start_ms: int
@@ -492,6 +510,7 @@ def _bucket_delta(first: dict[float, float], last: dict[float, float]) -> dict[f
 
 def _seconds_to_ms(value: float | None) -> float | None:
     return None if value is None else value * 1000.0
+
 
 
 def _sum_optional(values: list[float | None]) -> float | None:

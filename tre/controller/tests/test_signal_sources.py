@@ -29,7 +29,9 @@ def _spec() -> ModelSpec:
             hsat=1,
         ),
         alt_thresholds={
-            "queue_len": AltThreshold(theta=4.0, direction="lower_is_healthier")
+            "queue_len": AltThreshold(theta=4.0, direction="lower_is_healthier"),
+            "decode_tps": AltThreshold(theta=25.0, direction="lower_is_healthier"),
+            "prefill_tps": AltThreshold(theta=50.0, direction="lower_is_healthier"),
         },
     )
 
@@ -96,6 +98,53 @@ def test_queue_signal_direction_boundaries_and_idle_cap() -> None:
     assert twice_theta.z_m == 0.5
     assert idle.raw_value == 0.0
     assert idle.z_m == 10.0
+
+
+def test_decode_tps_is_windowed_per_replica_pressure() -> None:
+    spec = _spec()
+    at_theta = get_signal(
+        _metrics(
+            window_end_ms=60_000,
+            generation_tokens=3_000.0,
+            routable_pods=2,
+        ),
+        spec,
+        "decode_tps",
+        trs_z_m=9.0,
+    )
+    twice_theta = get_signal(
+        _metrics(generation_tokens=6_000.0, routable_pods=2),
+        spec,
+        "decode_tps",
+        trs_z_m=9.0,
+    )
+
+    assert at_theta.raw_value == 25.0
+    assert at_theta.z_m == 1.0
+    assert twice_theta.raw_value == 50.0
+    assert twice_theta.z_m == 0.5
+
+
+def test_prefill_tps_uses_prompt_counter_delta() -> None:
+    signal = get_signal(
+        _metrics(prompt_tokens=6_000.0, routable_pods=2),
+        _spec(),
+        "prefill_tps",
+        trs_z_m=9.0,
+    )
+    assert signal.raw_value == 50.0
+    assert signal.z_m == 1.0
+
+
+def test_tps_signal_is_unavailable_after_counter_reset() -> None:
+    signal = get_signal(
+        _metrics(generation_tokens=3_000.0, token_counter_reset=True),
+        _spec(),
+        "decode_tps",
+        trs_z_m=9.0,
+    )
+    assert signal.z_m is None
+    assert signal.unavailable_reason == "decode_tps_counter_missing"
 
 
 def test_latency_signal_is_unavailable_when_no_latency_samples_exist() -> None:

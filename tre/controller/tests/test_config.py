@@ -84,7 +84,10 @@ def test_config_reads_centralized_environment_values() -> None:
     assert config.ablation_disable_safescale is True
 
 
-@pytest.mark.parametrize("source", ["zm", "latency_p95", "queue_len", "kv_cache"])
+@pytest.mark.parametrize(
+    "source",
+    ["zm", "latency_p95", "queue_len", "decode_tps", "prefill_tps", "kv_cache"],
+)
 def test_config_accepts_plan_signal_sources(source: str) -> None:
     assert ControllerConfig.from_env({"TRE_SIGNAL_SOURCE": source}).signal_source == source
 
@@ -99,6 +102,20 @@ def test_queue_signal_source_rejects_missing_model_threshold(tmp_path) -> None:
     with pytest.raises(ValueError, match="missing=.*dsqwen-7b"):
         ControllerConfig.from_env(
             {"TRE_SIGNAL_SOURCE": "queue_len", "TRE_REGISTRY_PATH": str(path)}
+        )
+
+
+@pytest.mark.parametrize("source", ["decode_tps", "prefill_tps"])
+def test_tps_signal_source_rejects_missing_model_threshold(tmp_path, source) -> None:
+    registry_path = Path(__file__).parents[2] / "deploy" / "registry.yaml"
+    registry = yaml.safe_load(registry_path.read_text(encoding="utf-8"))
+    registry["models"][0]["alt_thresholds"].pop(source)
+    path = tmp_path / "registry.yaml"
+    path.write_text(yaml.safe_dump(registry, sort_keys=False), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="missing=.*dsqwen-7b"):
+        ControllerConfig.from_env(
+            {"TRE_SIGNAL_SOURCE": source, "TRE_REGISTRY_PATH": str(path)}
         )
 
 

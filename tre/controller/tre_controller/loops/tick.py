@@ -22,7 +22,7 @@ from tre_controller.planning.planner import (
     build_plan,
 )
 from tre_controller.planning.safescale import SafeScaleCommand, SafeScaleDecision
-from tre_controller.signals.sources import get_signal
+from tre_controller.signals.sources import get_signal, per_replica_token_rate
 from tre_controller.signals.trs import SignalState, TRSComputer, TRSInput
 
 
@@ -292,6 +292,8 @@ def _model_contexts(
             metrics = replace(metrics, routable_pods=awake_replicas, assigned_replicas=awake_replicas)
         tokens_available = metrics.prompt_tokens is not None and metrics.generation_tokens is not None
         request_rate_rps = _request_rate_rps(metrics)
+        decode_tps = per_replica_token_rate(metrics, metrics.generation_tokens)
+        prefill_tps = per_replica_token_rate(metrics, metrics.prompt_tokens)
         if tokens_available:
             if signal_state is not None:
                 computer = signal_state.computer_for(
@@ -333,6 +335,8 @@ def _model_contexts(
                 "assigned_replicas": assigned_replicas,
                 "signal_warm": signal_warm,
                 "request_rate_rps": request_rate_rps,
+                "decode_tps": decode_tps,
+                "prefill_tps": prefill_tps,
             }
         else:
             # tokens_available=False means the metrics are MISSING (scrape gap / stale store),
@@ -357,6 +361,8 @@ def _model_contexts(
                 "routable_pods": metrics.routable_pods,
                 "assigned_replicas": assigned_replicas,
                 "request_rate_rps": request_rate_rps,
+                "decode_tps": decode_tps,
+                "prefill_tps": prefill_tps,
             }
         if paper_state_cache is not None:
             context, model_events = paper_state_cache.apply(model_name, context, tokens_available=tokens_available)

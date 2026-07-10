@@ -192,6 +192,8 @@ def test_rescue_tick_submits_critical_scale_action_from_snapshot_metrics() -> No
     assert action.source_loop == "rescue"
     assert result.model_contexts["critical"]["z_m"] is not None
     assert result.model_contexts["critical"]["signal_source"] == "zm"
+    assert result.model_contexts["critical"]["decode_tps"] == 50.0 / 60.0 / 2.0
+    assert result.model_contexts["critical"]["prefill_tps"] == 0.0
 
 
 def test_rescue_tick_holds_previous_paper_state_when_tokens_are_missing_for_one_window() -> None:

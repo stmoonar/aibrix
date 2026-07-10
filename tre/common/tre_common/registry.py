@@ -18,8 +18,8 @@ class SloSpec:
 ALT_THRESHOLD_DIRECTIONS = {"higher_is_healthier", "lower_is_healthier"}
 EXPECTED_SIGNAL_DIRECTIONS = {
     "queue_len": "lower_is_healthier",
-    "decode_tps": "higher_is_healthier",
-    "prefill_tps": "higher_is_healthier",
+    "decode_tps": "lower_is_healthier",
+    "prefill_tps": "lower_is_healthier",
 }
 
 

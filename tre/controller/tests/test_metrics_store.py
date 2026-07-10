@@ -233,6 +233,31 @@ def test_metrics_store_uses_pre_window_v2_baseline_for_single_hist_doc_delta():
     assert metrics.ttft_p95_ms == 500.0
 
 
+def test_metrics_store_marks_counter_reset_as_missing() -> None:
+    redis = FakeRedis()
+    pod = "default/pod-a"
+    redis.sadd("tre:v2:pods:dsqwen-7b", pod)
+    add_doc(
+        redis,
+        "tre:v2:hist:" + pod,
+        1_000,
+        hist_doc("pod-a", 100, 1, 1.0, 10, {"0.5": 10}),
+    )
+    add_doc(
+        redis,
+        "tre:v2:hist:" + pod,
+        11_000,
+        hist_doc("pod-a", 25, 2, 2.0, 20, {"0.5": 20}),
+    )
+    store = MetricsStore(
+        redis, load_registry(str(REGISTRY_PATH)), instant_sample_interval_ms=5_000
+    )
+
+    metrics = store.read_model_window("dsqwen-7b", 1_000, 11_000)
+    assert metrics.prompt_tokens is None
+    assert metrics.token_counter_reset is True
+
+
 def test_metrics_store_returns_none_tokens_when_window_has_no_hist_docs():
     redis = FakeRedis()
     pod = "default/pod-a"
@@ -277,7 +302,8 @@ def test_metrics_store_snapshot_reads_all_registry_models_from_fixture():
     assert set(snapshot.models) == {"dsqwen-7b", "dsllama-8b", "dsqwen-14b"}
     assert snapshot.models["dsqwen-7b"].prompt_tokens == 32.0
     assert snapshot.models["dsqwen-7b"].avg_waiting == 3.0
-    assert snapshot.models["dsllama-8b"].prompt_tokens == 0.0
+    assert snapshot.models["dsllama-8b"].prompt_tokens is None
+    assert snapshot.models["dsllama-8b"].token_counter_reset is True
     assert snapshot.models["dsllama-8b"].avg_waiting == 3.0
     assert snapshot.models["dsqwen-14b"].routable_pods == 0
 
