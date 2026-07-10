@@ -73,9 +73,9 @@ def test_tre_v2_overlay_declares_components_and_independent_redis() -> None:
     sm = _load_yaml(overlay / "service-manager.yaml")
     ui = _load_yaml(overlay / "ui.yaml")
 
-    assert _image(controller) == "tre-v2-controller:20260709-aa528998"
-    assert _image(sm) == "tre-v2-service-manager:20260707-07717371"
-    assert _image(ui) == "tre-v2-ui:20260707-07717371"
+    assert _image(controller) == "tre-v2-controller:20260710-1b94a9a1"
+    assert _image(sm) == "tre-v2-service-manager:20260710-1b94a9a1"
+    assert _image(ui) == "tre-v2-ui:20260710-1b94a9a1"
     assert "latest" not in "\n".join([_image(controller), _image(sm), _image(ui)]).lower()
 
     assert _env(controller)["TRE_REDIS_URL"] == "redis://tre-v2-redis:6379/0"
