@@ -189,6 +189,39 @@ class ServiceManagerV2:
             "actions": actions,
         }
 
+    def put_binding_power(self, serve_id: str, *, awake: bool) -> dict:
+        snapshot = self._store.load()
+        binding = next(
+            (item for item in snapshot.bindings if item.serve_id == serve_id),
+            None,
+        )
+        if binding is None:
+            raise ValueError(f"unknown binding: {serve_id}")
+
+        actions: list[dict] = []
+        version = snapshot.version
+        updated_binding = binding
+        if binding.awake != awake:
+            action = "wake" if awake else "sleep"
+            if awake:
+                self._ensure_feasible_wake(binding, snapshot.bindings)
+            self._apply_runtime_power_action(binding, action=action)
+            updated_binding = replace(binding, awake=awake, hidden=False)
+            updated = [
+                updated_binding if item.serve_id == serve_id else item
+                for item in snapshot.bindings
+            ]
+            version = self._store.save(updated, expected_version=snapshot.version)
+            actions.append({"action": action, "serve_id": serve_id})
+
+        return {
+            "serve_id": serve_id,
+            "awake": awake,
+            "version": version,
+            "actions": actions,
+            "binding": self._binding_dict(updated_binding),
+        }
+
 
     def put_model_routable(self, model: str, *, hidden_pods: list[str]) -> dict:
         self._registry.model(model)
@@ -475,6 +508,11 @@ class WakeConflict(ValueError):
 class TargetRequest(BaseModel):
     wake_replicas: int
 
+
+class BindingPowerRequest(BaseModel):
+    awake: bool
+
+
 class DefragRequest(BaseModel):
     tp_size: int
 
@@ -528,6 +566,15 @@ def create_app(service: ServiceManagerV2) -> FastAPI:
     def put_model_target(model: str, request: TargetRequest) -> dict:
         try:
             return service.put_model_target(model, wake_replicas=request.wake_replicas)
+        except WakeConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except (KeyError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.put("/v2/bindings/{serve_id}/power")
+    def put_binding_power(serve_id: str, request: BindingPowerRequest) -> dict:
+        try:
+            return service.put_binding_power(serve_id, awake=request.awake)
         except WakeConflict as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except (KeyError, ValueError) as exc:

@@ -233,6 +233,87 @@ def test_v2_put_target_is_idempotent_and_returns_diff_actions():
     ]
 
 
+def test_v2_put_binding_power_uses_runtime_path_and_is_idempotent():
+    from tre_sm.allocator.topology import K8sPodSnapshot
+
+    store = StateStore(FakeRedis())
+    binding = Binding("serve-a", "m1", Slot("node-a", (0,)), awake=True)
+    store.save([binding], expected_version=0)
+    runtime = FakeRuntimeOps(
+        [
+            K8sPodSnapshot(
+                name="serve-a",
+                model="m1",
+                node="node-a",
+                env={"CUDA_VISIBLE_DEVICES": "0"},
+                pod_ip="10.0.0.1",
+            )
+        ]
+    )
+    vllm = FakeVllmOps()
+    service = ServiceManagerV2(
+        registry(), store, runtime_ops=runtime, vllm_ops=vllm
+    )
+
+    slept = service.put_binding_power("serve-a", awake=False)
+    repeated_sleep = service.put_binding_power("serve-a", awake=False)
+    woke = service.put_binding_power("serve-a", awake=True)
+    repeated_wake = service.put_binding_power("serve-a", awake=True)
+
+    assert slept["actions"] == [{"action": "sleep", "serve_id": "serve-a"}]
+    assert slept["binding"]["awake"] is False
+    assert repeated_sleep["actions"] == []
+    assert woke["actions"] == [{"action": "wake", "serve_id": "serve-a"}]
+    assert woke["binding"]["awake"] is True
+    assert repeated_wake["actions"] == []
+    assert vllm.calls == [
+        ("sleep", "10.0.0.1", 8000),
+        ("wake_up", "10.0.0.1", 8000),
+    ]
+    assert runtime.annotations == [
+        ("serve-a", "sleeping"),
+        ("serve-a", "awake"),
+    ]
+    assert store.load().bindings == [
+        Binding("serve-a", "m1", Slot("node-a", (0,)), awake=True)
+    ]
+
+
+def test_v2_put_binding_power_rejects_gpu_conflict_before_runtime_action():
+    from tre_sm.allocator.topology import K8sPodSnapshot
+
+    store = StateStore(FakeRedis())
+    original = [
+        Binding("serve-a", "m1", Slot("node-a", (0,)), awake=True),
+        Binding("serve-b", "m1", Slot("node-a", (0,)), awake=False),
+    ]
+    store.save(original, expected_version=0)
+    runtime = FakeRuntimeOps(
+        [
+            K8sPodSnapshot(
+                name="serve-b",
+                model="m1",
+                node="node-a",
+                env={"CUDA_VISIBLE_DEVICES": "0"},
+                pod_ip="10.0.0.2",
+            )
+        ]
+    )
+    vllm = FakeVllmOps()
+    service = ServiceManagerV2(
+        registry(), store, runtime_ops=runtime, vllm_ops=vllm
+    )
+
+    try:
+        service.put_binding_power("serve-b", awake=True)
+    except ValueError as exc:
+        assert "already has awake binding" in str(exc)
+    else:
+        raise AssertionError("expected conflicting exact wake to fail")
+
+    assert vllm.calls == []
+    assert store.load().bindings == original
+
 def test_v2_put_target_wakes_first_feasible_sleeping_binding():
     from tre_sm.allocator.topology import K8sPodSnapshot
 
@@ -467,6 +548,17 @@ def test_v2_fastapi_routes_delegate_to_service_layer():
     assert first.json()["actions"] == [{"action": "wake", "serve_id": "serve-b"}]
     assert second.status_code == 200
     assert second.json()["actions"] == []
+
+    exact = client.put("/v2/bindings/serve-a/power", json={"awake": False})
+    repeated = client.put("/v2/bindings/serve-a/power", json={"awake": False})
+    missing = client.put("/v2/bindings/missing/power", json={"awake": False})
+
+    assert exact.status_code == 200
+    assert exact.json()["actions"] == [{"action": "sleep", "serve_id": "serve-a"}]
+    assert repeated.status_code == 200
+    assert repeated.json()["actions"] == []
+    assert missing.status_code == 400
+    assert missing.json()["detail"] == "unknown binding: missing"
 
 
 def test_v2_put_target_rejects_wake_when_another_binding_is_awake_on_same_gpu():
