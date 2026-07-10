@@ -1,0 +1,19 @@
+{
+  "check": "H2 hidden orphan live fire drill",
+  "image": "tre-v2-controller:20260710-1b94a9a1",
+  "serve_id": "dsqwen-7b-nscc-ds-4a100-node9-gpu-0-546d5d9f88-f94nf",
+  "model": "dsqwen-7b",
+  "pod_was_awake": false,
+  "grace_s": 600,
+  "background_scan_interval_s": 60,
+  "method": "deployed detector scan against live SM/Redis; second scan used now+601s",
+  "precheck": {"safescale_probes": 0, "hidden_orphan_alerts": 0},
+  "watch_since_ts": 1783670721.6363907,
+  "alert": {
+    "detected_ts": 1783671322.6363907,
+    "mode": "alert_only",
+    "hidden_for_s": 601
+  },
+  "cleanup": {"unhidden": true, "watch_exists": false, "alert_exists": false},
+  "passed": true
+}

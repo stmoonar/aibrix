@@ -1,0 +1,1 @@
+{"model":"dsqwen-7b","wake_replicas":3,"version":101,"actions":[{"action":"wake","serve_id":"dsqwen-7b-nscc-ds-4a100-node9-gpu-1-6cdfd4649-gjpqf"},{"action":"wake","serve_id":"dsqwen-7b-nscc-ds-4a100-node10-gpu-0-78588bb7d8-b4p5p"}]}

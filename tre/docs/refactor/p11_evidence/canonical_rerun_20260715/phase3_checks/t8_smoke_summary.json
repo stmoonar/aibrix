@@ -1,0 +1,46 @@
+{
+  "trace": "/tmp/t8-smoke-600.json",
+  "requests": 11023,
+  "schedule_p99_delay_ms": 2.36,
+  "schedule_rps_error": 0.0,
+  "max_pool_wait_ms": 57.69,
+  "trim_ramp_windows": 1,
+  "per_model": {
+    "dsllama-8b": {
+      "violation_time_frac": 0.05263157894736842,
+      "violation_request_frac": 0.002053388090349076,
+      "n_requests": 4383,
+      "n_requests_total": 4404,
+      "n_requests_trimmed": 21,
+      "n_success": 4383,
+      "success_rate": 1.0,
+      "n_windows_scored": 114,
+      "trim_ramp_windows": 1,
+      "scoring_start_ms": 1783671704212
+    },
+    "dsqwen-14b": {
+      "violation_time_frac": 0.0,
+      "violation_request_frac": 0.001455604075691412,
+      "n_requests": 2748,
+      "n_requests_total": 2761,
+      "n_requests_trimmed": 13,
+      "n_success": 2748,
+      "success_rate": 1.0,
+      "n_windows_scored": 114,
+      "trim_ramp_windows": 1,
+      "scoring_start_ms": 1783671704212
+    },
+    "dsqwen-7b": {
+      "violation_time_frac": 0.08771929824561403,
+      "violation_request_frac": 0.03279541905257678,
+      "n_requests": 3842,
+      "n_requests_total": 3858,
+      "n_requests_trimmed": 16,
+      "n_success": 3842,
+      "success_rate": 1.0,
+      "n_windows_scored": 114,
+      "trim_ramp_windows": 1,
+      "scoring_start_ms": 1783671704212
+    }
+  }
+}
