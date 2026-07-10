@@ -1,0 +1,36 @@
+{
+  "capacity_sources": [
+    "replayer/traces_v2/capacity/capacity_dsqwen-7b.json",
+    "replayer/traces_v2/capacity/capacity_dsllama-8b.json",
+    "replayer/traces_v2/capacity/capacity_dsqwen-14b.json"
+  ],
+  "total_gpu_slots": 8,
+  "model_slot_widths": {
+    "dsqwen-7b": 1,
+    "dsllama-8b": 1,
+    "dsqwen-14b": 2
+  },
+  "interpretation": "C1 is the feasibility gate. C3 is not applicable because production-derived traces have no synthetic headroom tier. low_confidence_capacity is expected where production token shapes are outside the measured R3 grid.",
+  "traces": {
+    "t8_azure_conv": {
+      "c1_feasible": true,
+      "max_integer_gpu": 7.0,
+      "max_integer_headroom": 0.875,
+      "max_fractional_headroom": 0.544231,
+      "oracle_violation_fraction": 0.0,
+      "static_violation_duration_s": 695.0,
+      "low_confidence_capacity": true,
+      "raw_lint_failed_constraints": ["C3"]
+    },
+    "t9_burstgpt": {
+      "c1_feasible": true,
+      "max_integer_gpu": 7.0,
+      "max_integer_headroom": 0.875,
+      "max_fractional_headroom": 0.498326,
+      "oracle_violation_fraction": 0.0,
+      "static_violation_duration_s": 135.0,
+      "low_confidence_capacity": true,
+      "raw_lint_failed_constraints": ["C3"]
+    }
+  }
+}

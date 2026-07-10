@@ -1,0 +1,70 @@
+{
+  "sources": {
+    "azure": {
+      "url": "https://github.com/Azure/AzurePublicDataset/releases/download/dataset-llm-2024/AzureLLMInferenceTrace_conv_1week.csv",
+      "sha256": "a0cc9b969a9bbf0fd811802cbf4323edd3a209ace791e3799ad4f9207f213941",
+      "download_date": "2026-07-10"
+    },
+    "burstgpt": {
+      "url": "https://github.com/HPMLL/BurstGPT/releases/download/v2.0/BurstGPT_3.csv",
+      "sha256": "2299986a07388aa303ec2c41d1131e756db650a39ed6ef9dfe7cc3d7f9a43b8f",
+      "download_date": "2026-07-10"
+    }
+  },
+  "parameters": {
+    "target_duration_s": 1120,
+    "duration_basis": "maximum observed traceset-v2 t1-t7 duration (t2/t7)",
+    "bin_width_s": 5,
+    "target_peak_rps": 29.426667,
+    "peak_basis": "observed aggregate peak of traceset-v2 t4_a4_spike_vs_burst",
+    "seed": 20260713,
+    "model_weights": {
+      "dsllama-8b": 0.4,
+      "dsqwen-7b": 0.35,
+      "dsqwen-14b": 0.25
+    },
+    "max_input_tokens": 8192,
+    "max_output_tokens": 2048,
+    "token_aggregation": "arithmetic mean per compressed time bin and assigned model"
+  },
+  "reports": {
+    "t8_azure_conv": {
+      "valid_source_rows": 27303999,
+      "source_start": 1715472000.001163,
+      "source_end": 1716076799.99546,
+      "source_span_s": 604799.9942970276,
+      "target_duration_s": 1120,
+      "bin_width_s": 5,
+      "raw_peak_rps_after_time_compression": 40618.4,
+      "rate_scale": 0.0007244664240836664,
+      "derived_peak_rps": 29.426667000000002,
+      "model_request_counts": {
+        "dsllama-8b": 10919178,
+        "dsqwen-7b": 9560223,
+        "dsqwen-14b": 6824598
+      },
+      "input_rows_clamped": 0,
+      "output_rows_clamped": 0,
+      "output_sha256": "f80c915ac3c8e90b44900d48d6337d9f571f81589642586b732de5ac21ab4403"
+    },
+    "t9_burstgpt": {
+      "valid_source_rows": 231761,
+      "source_start": 19440110.0,
+      "source_end": 28943974.0,
+      "source_span_s": 9503864.0,
+      "target_duration_s": 1120,
+      "bin_width_s": 5,
+      "raw_peak_rps_after_time_compression": 785.2,
+      "rate_scale": 0.03747665180845644,
+      "derived_peak_rps": 29.426667000000002,
+      "model_request_counts": {
+        "dsllama-8b": 91872,
+        "dsqwen-7b": 83047,
+        "dsqwen-14b": 56842
+      },
+      "input_rows_clamped": 930,
+      "output_rows_clamped": 1,
+      "output_sha256": "7edc26bc08940ffd8ed173692fec3d56664e58712f7e02d4531f84c5bb30adeb"
+    }
+  }
+}

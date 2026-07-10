@@ -1,10 +1,10 @@
 # traceset-v2 — experiment-3 (TRE vs APA) frozen trace set
 
-Seven capacity-calibrated traces covering the six mechanism axes A1..A6 of
-REFACTOR_PLAN.md section 12.4 (A2 has a medium + a tight variant). Generated from the R3
-single-pod capacity surfaces by `tre_replayer.gen_traces`. This directory is the frozen,
-git-tagged (`traceset-v2`) input to `run_comparison.py`; per section 12.7 it must not be
-edited in place — iterate on scratch traces and cut a new version instead.
+Nine workloads: seven capacity-calibrated synthetic traces covering the six mechanism axes
+A1..A6 of REFACTOR_PLAN.md section 12.4 (A2 has a medium + a tight variant), plus the two
+production-derived workloads t8/t9 required by the 2026-07-10 architecture and experiment
+plan. The seven synthetic traces were generated from the R3 single-pod capacity surfaces by
+`tre_replayer.gen_traces` and remain byte-unchanged from the frozen `traceset-v2` tag.
 
 ## Why v2 exists: v1's occupancy口径 was physically infeasible
 
@@ -63,6 +63,19 @@ silently saturated the cluster. v2 makes it genuinely loose.
    `feasibility` block — a per-phase, per-model replica-requirement table
    (`{rho, replicas, slot_width, gpu}` + `gpu_total`) proving `≤ 8` at all times.
 
+## Production-derived extension (t8/t9)
+
+A4 explicitly requires t8/t9 to live beside t1-t7 so `run_comparison.py` discovers one
+canonical trace root. `INDEX.json` therefore lists them under `workloads` and records their
+provenance separately under `real_trace_derivations`; they are not synthetic `designs` and
+do not claim an R3 capacity-lint tier. No t1-t7 bytes or design metadata were changed.
+
+Both traces are deterministic 1120-second, 5-second-binned derivatives of public CC-BY-4.0
+production traces. Their aggregate peak is rescaled to the observed t4 peak (29.426667 RPS),
+and sessions are assigned to models with weights 0.40/0.35/0.25. Full source hashes,
+selection rules, token bounds, exact regeneration command, and derived checksums are in
+`docs/refactor/p11_evidence/real_traces_20260713/`.
+
 ## Generation command
 
 ```bash
@@ -92,6 +105,8 @@ dsqwen-7b/dsllama-8b = 1 (tp1), dsqwen-14b = 2 (tp2).
 | t5_a5_tp_pressure | A5 TP-heterogeneous pressure | tight 1.00 | 8/8 (3×2 + 1 + 1) | PASS |
 | t6_a6_control | A6 fairness control | loose 0.50 | 4/8 (flat floor) | C2 waived (by design) |
 | t7_a2b_anticorrelated_hot | A2 (tight variant) | tight 1.00 | 8/8 (5 + 1 + 2) | PASS |
+| t8_azure_conv | production temporal structure | n/a | peak-scaled | schema/schedule validated |
+| t9_burstgpt | production burst/session structure | n/a | peak-scaled | schema/schedule validated |
 
 ## Lint (`lint_report.json`)
 
