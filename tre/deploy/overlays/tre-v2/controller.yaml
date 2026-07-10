@@ -25,7 +25,7 @@ spec:
         kubernetes.io/hostname: nscc-ds-4a100-node10
       containers:
         - name: controller
-          image: tre-v2-controller:20260710-45f7bb81
+          image: tre-v2-controller:20260710-f0703a4b
           imagePullPolicy: IfNotPresent
           env:
             - name: TRE_REDIS_URL
