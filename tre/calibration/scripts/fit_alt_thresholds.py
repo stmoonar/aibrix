@@ -133,6 +133,20 @@ def fit_model(
         max_single_scenario_ratio=max_single_scenario_ratio,
         direction=direction,
     )
+    opposite_direction = (
+        "higher_is_healthier"
+        if direction == "lower_is_healthier"
+        else "lower_is_healthier"
+    )
+    opposite_fit = fit_theta_by_reliability(
+        windows,
+        reliability_target=reliability_target,
+        min_support=min_support,
+        min_confidence=min_confidence,
+        min_scenario_families=min_scenario_families,
+        max_single_scenario_ratio=max_single_scenario_ratio,
+        direction=opposite_direction,
+    )
     if not fit.publish or fit.theta is None:
         raise RuntimeError(
             f"{model_name}/{signal} did not publish: {fit.reject_reason} "
@@ -155,6 +169,15 @@ def fit_model(
             "coverage_pass": fit.coverage_pass,
             "family_counts": fit.family_counts,
             "candidate_count": fit.candidate_count,
+        },
+        "opposite_direction_diagnostic": {
+            "direction": opposite_direction,
+            "publish": opposite_fit.publish,
+            "theta": opposite_fit.theta,
+            "support": opposite_fit.support,
+            "attainment": opposite_fit.attainment,
+            "coverage_pass": opposite_fit.coverage_pass,
+            "reject_reason": opposite_fit.reject_reason,
         },
     }
     return payload, reliability_curve(windows, direction=direction)
