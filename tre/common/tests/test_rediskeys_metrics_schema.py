@@ -18,6 +18,7 @@ def test_redis_key_builders_match_v2_schema():
         rediskeys.CONTROLLER_HIDDEN_ORPHAN_ALERTS_KEY
         == "tre:v2:controller:alerts:hidden_orphans"
     )
+    assert rediskeys.CONTROLLER_SIGNAL_LOG_KEY == "tre:v2:controller:signal_log"
     assert rediskeys.RETENTION_MS == 30 * 60 * 1000
     assert rediskeys.FALLBACK_TTL_SECONDS == 2 * 60 * 60
 

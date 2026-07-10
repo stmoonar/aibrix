@@ -12,6 +12,7 @@ from tre_common.rediskeys import (
     decision_hist_key,
 )
 from tre_controller.loops.tick import LoopTickResult
+from tre_controller.loops.signal_log import SignalLogWriter
 from tre_controller.planning.planner import DefragAction, HideAction, ScaleAction, UnhideAction
 
 
@@ -35,9 +36,16 @@ def build_decision_snapshot(loop_name: str, snapshot: MetricsSnapshot, result: L
 
 
 class DecisionSnapshotWriter:
-    def __init__(self, redis_client: Any, key: str = DECISION_LATEST_KEY) -> None:
+    def __init__(
+        self,
+        redis_client: Any,
+        key: str = DECISION_LATEST_KEY,
+        *,
+        signal_log_writer: SignalLogWriter | None = None,
+    ) -> None:
         self._redis = redis_client
         self._key = key
+        self._signal_log_writer = signal_log_writer or SignalLogWriter(redis_client)
 
     def write(self, loop_name: str, snapshot: MetricsSnapshot, result: LoopTickResult) -> None:
         payload = build_decision_snapshot(loop_name, snapshot, result)
@@ -46,6 +54,7 @@ class DecisionSnapshotWriter:
         except Exception as exc:
             _LOGGER.warning("decision_snapshot_redis_write_failed: %s", exc)
         self._append_history(snapshot, result)
+        self._signal_log_writer.write(snapshot, result)
         _LOGGER.info(json.dumps({"event": "trs_calc_result", **payload}, separators=(",", ":")))
 
     def _append_history(self, snapshot: MetricsSnapshot, result: LoopTickResult) -> None:
