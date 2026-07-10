@@ -192,3 +192,39 @@ def test_unhide_sleeping_binding_does_not_require_wake_feasibility():
     binding = next(item for item in store.load().bindings if item.serve_id == "sleeping-hidden")
     assert binding.awake is False
     assert binding.hidden is False
+
+
+def test_7b_target_five_uses_all_four_node9_slots():
+    node9 = "nscc-ds-4a100-node9"
+    node10 = "nscc-ds-4a100-node10"
+    service, store = _service(
+        [
+            _binding("awake-14b", "dsqwen-14b", node10, (0, 1), awake=True),
+            _binding("awake-7b", "target", node10, (2,), awake=True),
+            _binding("awake-llama", "dsllama-8b", node10, (3,), awake=True),
+            _binding("target-node9-gpu-0", "target", node9, (0,), awake=False),
+            _binding("target-node9-gpu-1", "target", node9, (1,), awake=False),
+            _binding("target-node9-gpu-2", "target", node9, (2,), awake=False),
+            _binding("target-node9-gpu-3", "target", node9, (3,), awake=False),
+            _binding("target-node10-gpu-0", "target", node10, (0,), awake=False),
+            _binding("target-node10-gpu-1", "target", node10, (1,), awake=False),
+            _binding("target-node10-gpu-3", "target", node10, (3,), awake=False),
+        ]
+    )
+
+    result = service.put_model_target("target", wake_replicas=5)
+
+    assert result["wake_replicas"] == 5
+    assert [action["serve_id"] for action in result["actions"]] == [
+        "target-node9-gpu-0",
+        "target-node9-gpu-1",
+        "target-node9-gpu-2",
+        "target-node9-gpu-3",
+    ]
+    awake = [
+        binding
+        for binding in store.load().bindings
+        if binding.model == "target" and binding.awake
+    ]
+    assert len(awake) == 5
+    assert sum(binding.slot.node == node9 for binding in awake) == 4

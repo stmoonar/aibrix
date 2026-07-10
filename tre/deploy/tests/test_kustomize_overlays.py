@@ -113,6 +113,7 @@ def test_tre_v2_overlay_declares_components_and_independent_redis() -> None:
     assert params["kind"] == "ConfigMap" and params["metadata"]["name"] == "tre-v2-registry"
     assert params["metadata"]["namespace"] == "tre-v2"
     assert "registry.yaml" in params["data"]
+    assert yaml.safe_load(params["data"]["registry.yaml"]) == _load_yaml(DEPLOY_ROOT / "registry.yaml")
 
     # UI param-edit RBAC: namespace-scoped Role, resourceName-bound, no cluster scope.
     ui_role = next(d for d in rbac_docs if d["kind"] == "Role" and d["metadata"]["name"] == "tre-v2-ui-params")

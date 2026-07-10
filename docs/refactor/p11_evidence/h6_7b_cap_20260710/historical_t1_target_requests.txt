@@ -1,0 +1,6 @@
+# Historical post-theta t1 target requests (UTC)
+2026-07-09T17:17:40.467494577Z INFO:     10.244.0.1:56680 - "PUT /v2/models/dsqwen-7b/target HTTP/1.1" 200 OK
+2026-07-09T17:20:37.625877826Z INFO:     10.244.0.26:39294 - "PUT /v2/models/dsqwen-7b/target HTTP/1.1" 200 OK
+2026-07-09T17:20:44.676822201Z INFO:     10.244.0.26:39318 - "PUT /v2/models/dsqwen-7b/target HTTP/1.1" 200 OK
+2026-07-09T17:20:51.090886271Z INFO:     10.244.0.26:49112 - "PUT /v2/models/dsqwen-7b/target HTTP/1.1" 200 OK
+2026-07-09T17:20:57.580008658Z INFO:     10.244.0.26:42014 - "PUT /v2/models/dsqwen-7b/target HTTP/1.1" 400 Bad Request
