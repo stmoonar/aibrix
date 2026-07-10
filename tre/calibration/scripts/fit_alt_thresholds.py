@@ -281,7 +281,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             with (curve_dir / f"{model}_{args.signal}_curve.csv").open(
                 "w", encoding="utf-8", newline=""
             ) as destination:
-                writer = csv.DictWriter(destination, fieldnames=list(rows[0]))
+                writer = csv.DictWriter(
+                    destination, fieldnames=list(rows[0]), lineterminator="\n"
+                )
                 writer.writeheader()
                 writer.writerows(rows)
 
