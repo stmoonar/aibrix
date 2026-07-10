@@ -507,6 +507,7 @@ def main() -> int:
     parser.add_argument("--load-pre-s", type=float, default=30.0)
     parser.add_argument("--load-post-s", type=float, default=30.0)
     parser.add_argument("--transition-timeout-s", type=float, default=60.0)
+    parser.add_argument("--sample-settle-s", type=float, default=1.2)
     args = parser.parse_args()
 
     output = Path(args.output_dir)
@@ -577,12 +578,14 @@ def main() -> int:
                         node_clock_offset_s=clock["offset_s"],
                         excerpt_path=excerpt, timeout_s=args.transition_timeout_s,
                     ))
+                    time.sleep(args.sample_settle_s)
                     pair.append(run_transition(
                         target, awake=True, cycle_idx=cycle_idx,
                         sm_url=args.sm_url, namespace=args.namespace,
                         node_clock_offset_s=clock["offset_s"],
                         excerpt_path=excerpt, timeout_s=args.transition_timeout_s,
                     ))
+                    time.sleep(args.sample_settle_s)
                     if load is not None:
                         time.sleep(args.load_post_s)
                 finally:
