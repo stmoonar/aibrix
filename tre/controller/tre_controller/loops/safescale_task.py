@@ -21,6 +21,8 @@ class SafeScaleObserver(Protocol):
 
     def observe(self, model: str, observation: ProbeObservation, *, now_ms: int): ...
 
+    def resolve(self, model: str, *, status: str, reason: str, now_ms: int) -> bool: ...
+
 
 class PlannerQueue(Protocol):
     def submit(self, actions) -> object: ...
@@ -49,8 +51,9 @@ def run_safescale_observation_tick(
     if snapshot.stale:
         return SafeScaleObservationResult(submitted=0, events=("snapshot_stale",))
 
-    actions: list[Action] = []
+    accepted_actions: list[Action] = []
     events: list[str] = []
+    submitted = 0
     for probe in safescale.active_probes():
         metrics = snapshot.models.get(probe.model)
         if metrics is None:
@@ -61,12 +64,34 @@ def run_safescale_observation_tick(
         )
         decision = safescale.observe(probe.model, observation, now_ms=snapshot.ts_ms)
         events.append(f"safescale_{decision.reason}:{probe.model}")
-        actions.extend(_commands_to_actions(decision.commands))
+        actions = _commands_to_actions(decision.commands)
+        if not actions:
+            continue
+        try:
+            submit_result = queue.submit(actions)
+        except Exception as exc:
+            events.append(f"safescale_enqueue_failed:{probe.model}:{type(exc).__name__}")
+            continue
+        accepted = int(getattr(submit_result, "accepted", 0))
+        if accepted != len(actions):
+            events.append(f"safescale_enqueue_rejected:{probe.model}")
+            continue
+        if not safescale.resolve(
+            probe.model,
+            status=decision.status,
+            reason=decision.reason,
+            now_ms=snapshot.ts_ms,
+        ):
+            events.append(f"safescale_resolve_missing:{probe.model}")
+            continue
+        accepted_actions.extend(actions)
+        submitted += accepted
 
-    if actions:
-        queue.submit(tuple(actions))
-    return SafeScaleObservationResult(submitted=len(actions), actions=tuple(actions), events=tuple(events))
-
+    return SafeScaleObservationResult(
+        submitted=submitted,
+        actions=tuple(accepted_actions),
+        events=tuple(events),
+    )
 
 async def safescale_task(
     snapshot_box: SnapshotReader,

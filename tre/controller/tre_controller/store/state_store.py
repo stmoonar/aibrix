@@ -39,6 +39,30 @@ class ControllerStateStore:
     def delete_probe(self, request_id: str) -> None:
         self._redis.hdel(rediskeys.CONTROLLER_SAFESCALE_PROBES_KEY, request_id)
 
+    def gc_resolved_probes(
+        self,
+        *,
+        now_ts: float,
+        max_age_s: float = 3600.0,
+    ) -> tuple[str, ...]:
+        raw = self._redis.hgetall(rediskeys.CONTROLLER_SAFESCALE_PROBES_KEY) or {}
+        expired: list[str] = []
+        for raw_request_id, raw_payload in raw.items():
+            record = _decode_mapping(raw_payload)
+            if record is None or record.get("status") != "resolved":
+                continue
+            try:
+                resolved_ts = float(record["resolved_ts"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if float(now_ts) - resolved_ts > float(max_age_s):
+                expired.append(_to_text(raw_request_id))
+        if expired:
+            self._redis.hdel(
+                rediskeys.CONTROLLER_SAFESCALE_PROBES_KEY, *sorted(expired)
+            )
+        return tuple(sorted(expired))
+
     def list_unresolved_probes(self) -> list[dict[str, Any]]:
         try:
             raw = self._redis.hgetall(rediskeys.CONTROLLER_SAFESCALE_PROBES_KEY) or {}

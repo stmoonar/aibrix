@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 
-from tre_controller.loops.action_queue import ActionQueue, DispatchResult
+from tre_controller.loops.action_queue import ActionQueue, DispatchResult, SubmitResult
 from tre_controller.planning.planner import DefragAction, HideAction, ScaleAction, UnhideAction
 from tre_sm.allocator.slots import Migration, Slot
 
@@ -161,7 +161,8 @@ def test_action_queue_holds_safescale_action_through_observe_then_dispatches() -
     client = FakeServiceManagerClient()
     observe = {"on": True}
     queue = ActionQueue(client, is_observe=lambda: observe["on"])
-    queue.submit((UnhideAction("dsllama-8b", ("pod-a",), "slo_violation", "safescale"),))
+    submitted = queue.submit((UnhideAction("dsllama-8b", ("pod-a",), "slo_violation", "safescale"),))
+    assert submitted == SubmitResult(accepted=1, held=1)
 
     # Observe mode: the safescale action is held, not dispatched and not lost.
     results = asyncio.run(queue.drain_once())
@@ -212,3 +213,27 @@ def test_action_queue_observe_mode_still_drops_non_safescale_actions() -> None:
     assert [item.action for item in queue.pending_actions()] == [
         UnhideAction("safe", ("pod-z",), "slo_violation", "safescale")
     ]
+
+
+def test_action_queue_rejects_conflicted_safescale_batch_atomically() -> None:
+    queue = ActionQueue(FakeServiceManagerClient())
+    queue.submit((ScaleAction("receiver", 1, "critical", "rescue"),))
+
+    result = queue.submit(
+        (
+            ScaleAction("donor", -1, "commit", "safescale"),
+            ScaleAction("receiver", 1, "followup", "safescale"),
+        )
+    )
+
+    assert result == SubmitResult(
+        accepted=0,
+        dropped=(
+            ("donor", "atomic_batch_conflict"),
+            ("receiver", "atomic_batch_conflict"),
+        ),
+    )
+    assert [item.action for item in queue.pending_actions()] == [
+        ScaleAction("receiver", 1, "critical", "rescue")
+    ]
+    assert queue.inflight_models() == {"receiver"}

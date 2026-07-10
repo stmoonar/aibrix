@@ -3,6 +3,7 @@ from __future__ import annotations
 from tre_common.metrics_schema import MetricsSnapshot, ModelWindowMetrics
 from tre_common.registry import ClusterTopology, ModelSpec, NodeSpec, Registry, SloSpec, TrsParams
 from tre_controller.config import SafeScaleConfig
+from tre_controller.loops.action_queue import SubmitResult
 from tre_controller.loops.safescale_task import run_safescale_observation_tick
 from tre_controller.planning.planner import ScaleAction, UnhideAction
 from tre_controller.planning.safescale import SafeScaleStateMachine
@@ -12,9 +13,9 @@ class FakeQueue:
     def __init__(self) -> None:
         self.submitted: list[tuple] = []
 
-    def submit(self, actions) -> object:
+    def submit(self, actions) -> SubmitResult:
         self.submitted.append(tuple(actions))
-        return object()
+        return SubmitResult(accepted=len(actions))
 
 
 def _registry() -> Registry:

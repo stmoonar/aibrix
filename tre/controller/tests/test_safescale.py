@@ -103,8 +103,16 @@ def test_safescale_rolls_back_immediately_on_slo_violation() -> None:
         reason="slo_violation",
         commands=(SafeScaleCommand(kind="unhide", model="donor", pods=("pod-a",), reason="slo_violation"),),
     )
+    assert machine.active_probe("donor") is not None
+    assert store.deleted == []
+    assert machine.resolve(
+        "donor", status="rollback", reason=decision.reason, now_ms=2_000
+    )
     assert machine.active_probe("donor") is None
-    assert store.deleted
+    record = next(iter(store.records.values()))
+    assert record["status"] == "resolved"
+    assert record["resolution"] == "rollback"
+    assert record["resolved_ts"] == 2.0
 
 
 def test_safescale_commits_after_deadline_when_tail_is_healthy() -> None:
@@ -121,8 +129,16 @@ def test_safescale_commits_after_deadline_when_tail_is_healthy() -> None:
         SafeScaleCommand(kind="scale_down", model="donor", delta=-1, reason="formal_commit_gate_passed"),
         SafeScaleCommand(kind="scale_up", model="receiver", delta=1, reason="safescale_followup_upscale"),
     )
+    assert machine.active_probe("donor") is not None
+    assert store.deleted == []
+    assert machine.resolve(
+        "donor", status="commit", reason=decision.reason, now_ms=61_000
+    )
     assert machine.active_probe("donor") is None
-    assert store.deleted
+    record = next(iter(store.records.values()))
+    assert record["status"] == "resolved"
+    assert record["resolution"] == "commit"
+    assert record["resolved_ts"] == 61.0
 
 
 def test_safescale_rolls_back_at_deadline_when_tail_health_fails() -> None:

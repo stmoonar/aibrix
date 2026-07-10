@@ -8,6 +8,7 @@ from collections.abc import Awaitable, Callable, Iterable, Mapping
 from typing import Any
 
 from tre_common import rediskeys
+from tre_controller.store.state_store import ControllerStateStore
 
 _SCAN_INTERVAL_S = 60.0
 _LOG = logging.getLogger(__name__)
@@ -28,9 +29,11 @@ class HiddenOrphanDetector:
         self._grace_s = float(grace_s)
         self._now = now
         self._logger = logger
+        self._probe_store = ControllerStateStore(redis_client)
 
     def scan(self, *, now: float | None = None) -> tuple[str, ...]:
         detected_ts = float(self._now() if now is None else now)
+        self._probe_store.gc_resolved_probes(now_ts=detected_ts)
         sm_state = _decode_hash(self._redis.hgetall(rediskeys.SM_STATE_KEY))
         probes = _decode_hash(
             self._redis.hgetall(rediskeys.CONTROLLER_SAFESCALE_PROBES_KEY)

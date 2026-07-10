@@ -32,6 +32,7 @@ class QueuedAction:
 @dataclass(frozen=True)
 class SubmitResult:
     accepted: int
+    held: int = 0
     dropped: tuple[tuple[str, str], ...] = ()
     replaced: tuple[tuple[str, SourceLoop], ...] = ()
 
@@ -61,12 +62,28 @@ class ActionQueue:
         self._prof = prof
 
     def submit(self, actions: tuple[Action, ...] | list[Action]) -> SubmitResult:
+        queued_actions = tuple(_queued_action(action) for action in actions)
+        if len(queued_actions) > 1 and all(
+            queued.source_loop == "safescale" for queued in queued_actions
+        ):
+            models = [queued.model for queued in queued_actions]
+            has_conflict = len(set(models)) != len(models) or any(
+                model in self._inflight or self._has_pending_model(model)
+                for model in models
+            )
+            if has_conflict:
+                return SubmitResult(
+                    accepted=0,
+                    dropped=tuple((model, "atomic_batch_conflict") for model in models),
+                )
+
         accepted = 0
+        held = 0
         dropped: list[tuple[str, str]] = []
         replaced: list[tuple[str, SourceLoop]] = []
+        observe = self._is_observe()
 
-        for action in actions:
-            queued = _queued_action(action)
+        for queued in queued_actions:
             if queued.source_loop == "rescue":
                 removed = self._remove_pending_fairness_for_model(queued.model)
                 replaced.extend(removed)
@@ -77,8 +94,15 @@ class ActionQueue:
             self._pending.append(queued)
             self._inflight.add(queued.model)
             accepted += 1
+            if observe and queued.source_loop == "safescale":
+                held += 1
 
-        return SubmitResult(accepted=accepted, dropped=tuple(dropped), replaced=tuple(replaced))
+        return SubmitResult(
+            accepted=accepted,
+            held=held,
+            dropped=tuple(dropped),
+            replaced=tuple(replaced),
+        )
 
     def pending_actions(self) -> tuple[QueuedAction, ...]:
         return tuple(self._pending)

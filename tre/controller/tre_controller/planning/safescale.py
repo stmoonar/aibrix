@@ -152,7 +152,6 @@ class SafeScaleStateMachine:
         return restored
 
     def _commit(self, probe: SafeScaleProbe, *, reason: str) -> SafeScaleDecision:
-        self._probes.pop(probe.model, None)
         commands: list[SafeScaleCommand] = [
             SafeScaleCommand(kind="scale_down", model=probe.model, delta=-len(probe.pods), reason=reason)
         ]
@@ -160,17 +159,34 @@ class SafeScaleStateMachine:
             commands.append(
                 SafeScaleCommand(kind="scale_up", model=model, delta=delta, reason="safescale_followup_upscale")
             )
-        self._finish_probe(probe, status="commit", reason=reason)
         return SafeScaleDecision(status="commit", reason=reason, commands=tuple(commands))
 
     def _rollback(self, probe: SafeScaleProbe, *, reason: str) -> SafeScaleDecision:
-        self._probes.pop(probe.model, None)
-        self._finish_probe(probe, status="rollback", reason=reason)
         return SafeScaleDecision(
             status="rollback",
             reason=reason,
             commands=(SafeScaleCommand(kind="unhide", model=probe.model, pods=probe.pods, reason=reason),),
         )
+
+    def resolve(
+        self,
+        model: str,
+        *,
+        status: Literal["commit", "rollback"],
+        reason: str,
+        now_ms: int,
+    ) -> bool:
+        probe = self._probes.get(model)
+        if probe is None:
+            return False
+        self._finish_probe(
+            probe,
+            status=status,
+            reason=reason,
+            resolved_ts=float(now_ms) / 1000.0,
+        )
+        self._probes.pop(model, None)
+        return True
 
     def _violates_slo(self, observation: ProbeObservation) -> bool:
         return (
@@ -193,11 +209,26 @@ class SafeScaleStateMachine:
         record["last_observation"] = _observation_record(observation)
         self._store.append_probe_journal(probe.request_id, record)
 
-    def _finish_probe(self, probe: SafeScaleProbe, *, status: Literal["commit", "rollback"], reason: str) -> None:
+    def _finish_probe(
+        self,
+        probe: SafeScaleProbe,
+        *,
+        status: Literal["commit", "rollback"],
+        reason: str,
+        resolved_ts: float,
+    ) -> None:
         if self._store is None:
             return
-        self._store.save_probe(probe.request_id, _probe_record(probe, terminal_reason=reason, status=status))
-        self._store.delete_probe(probe.request_id)
+        self._store.save_probe(
+            probe.request_id,
+            _probe_record(
+                probe,
+                terminal_reason=reason,
+                status="resolved",
+                resolution=status,
+                resolved_ts=resolved_ts,
+            ),
+        )
 
 
 def _replace_observations(probe: SafeScaleProbe, observations: tuple[ProbeObservation, ...]) -> SafeScaleProbe:
@@ -277,8 +308,10 @@ def _probe_record(
     *,
     terminal_reason: str | None = None,
     status: str = "probing",
+    resolution: str | None = None,
+    resolved_ts: float | None = None,
 ) -> dict[str, Any]:
-    return {
+    record = {
         "model": probe.model,
         "request_id": probe.request_id,
         "pods": list(probe.pods),
@@ -289,6 +322,11 @@ def _probe_record(
         "pending_upscales": dict(probe.pending_upscales),
         "terminal_reason": terminal_reason,
     }
+    if resolution is not None:
+        record["resolution"] = resolution
+    if resolved_ts is not None:
+        record["resolved_ts"] = resolved_ts
+    return record
 
 
 def _observation_record(observation: ProbeObservation) -> dict[str, Any]:
