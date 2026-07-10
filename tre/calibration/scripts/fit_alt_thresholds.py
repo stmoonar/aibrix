@@ -17,6 +17,7 @@ from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
+from xml.etree import ElementTree as ET
 
 import yaml
 
@@ -131,6 +132,77 @@ def fit_model(
     return payload, reliability_curve(windows, direction=direction)
 
 
+def write_reliability_svg(
+    path: str | Path,
+    curves: dict[str, list[dict[str, Any]]],
+    selected_thetas: dict[str, float],
+) -> None:
+    width, height = 900, 520
+    left, right, top, bottom = 72, 24, 32, 64
+    plot_width = width - left - right
+    plot_height = height - top - bottom
+    max_theta = max(row["theta"] for rows in curves.values() for row in rows)
+    colors = ["#006d77", "#d1495b", "#6a4c93"]
+
+    def x(value: float) -> float:
+        return left + (value / max_theta) * plot_width
+
+    def y(value: float) -> float:
+        return top + (1.0 - value) * plot_height
+
+    svg = ET.Element(
+        "svg",
+        {
+            "xmlns": "http://www.w3.org/2000/svg",
+            "viewBox": f"0 0 {width} {height}",
+            "role": "img",
+            "aria-label": "Queue threshold reliability curves",
+        },
+    )
+    ET.SubElement(svg, "rect", {"width": str(width), "height": str(height), "fill": "white"})
+    ET.SubElement(
+        svg,
+        "line",
+        {"x1": str(left), "y1": str(y(0.9)), "x2": str(width - right), "y2": str(y(0.9)), "stroke": "#777", "stroke-dasharray": "6 5"},
+    )
+    for tick in (0.0, 0.5, 0.9, 1.0):
+        ET.SubElement(
+            svg,
+            "text",
+            {"x": str(left - 10), "y": str(y(tick) + 5), "text-anchor": "end", "font-size": "13", "fill": "#222"},
+        ).text = f"{tick:.1f}"
+    for tick in range(5):
+        value = max_theta * tick / 4
+        ET.SubElement(
+            svg,
+            "text",
+            {"x": str(x(value)), "y": str(height - bottom + 24), "text-anchor": "middle", "font-size": "13", "fill": "#222"},
+        ).text = f"{value:.0f}"
+    ET.SubElement(svg, "line", {"x1": str(left), "y1": str(top), "x2": str(left), "y2": str(height - bottom), "stroke": "#222"})
+    ET.SubElement(svg, "line", {"x1": str(left), "y1": str(height - bottom), "x2": str(width - right), "y2": str(height - bottom), "stroke": "#222"})
+
+    for index, (model, rows) in enumerate(sorted(curves.items())):
+        color = colors[index % len(colors)]
+        points = " ".join(f"{x(row['theta']):.2f},{y(row['attainment']):.2f}" for row in rows)
+        ET.SubElement(svg, "polyline", {"points": points, "fill": "none", "stroke": color, "stroke-width": "2"})
+        selected = selected_thetas[model]
+        selected_row = min(rows, key=lambda row: abs(row["theta"] - selected))
+        ET.SubElement(
+            svg,
+            "circle",
+            {"cx": f"{x(selected):.2f}", "cy": f"{y(selected_row['attainment']):.2f}", "r": "5", "fill": color, "stroke": "white", "stroke-width": "1.5"},
+        )
+        legend_y = top + 18 * index
+        ET.SubElement(svg, "line", {"x1": str(width - 260), "y1": str(legend_y), "x2": str(width - 230), "y2": str(legend_y), "stroke": color, "stroke-width": "3"})
+        ET.SubElement(svg, "text", {"x": str(width - 220), "y": str(legend_y + 5), "font-size": "13", "fill": "#222"}).text = f"{model} theta={selected:.2f}"
+
+    ET.SubElement(svg, "text", {"x": str(width / 2), "y": str(height - 12), "text-anchor": "middle", "font-size": "15", "fill": "#111"}).text = "queue_len theta (raw queue units)"
+    ET.SubElement(svg, "text", {"x": "18", "y": str(height / 2), "text-anchor": "middle", "font-size": "15", "fill": "#111", "transform": f"rotate(-90 18 {height / 2})"}).text = "healthy attainment for queue <= theta"
+    output = Path(path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    ET.ElementTree(svg).write(output, encoding="utf-8", xml_declaration=True)
+
+
 def _git_sha() -> str:
     result = subprocess.run(
         ["git", "rev-parse", "HEAD"],
@@ -148,6 +220,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--signal", choices=sorted(_SIGNAL_CONFIG), default="queue_len")
     parser.add_argument("--output", required=True)
     parser.add_argument("--curve-dir")
+    parser.add_argument("--plot-output")
     parser.add_argument("--trim-ramp-windows", type=int, default=1)
     parser.add_argument("--reliability-target", type=float, default=0.9)
     parser.add_argument("--min-support", type=int, default=3)
@@ -211,6 +284,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 writer = csv.DictWriter(destination, fieldnames=list(rows[0]))
                 writer.writeheader()
                 writer.writerows(rows)
+
+    if args.plot_output:
+        write_reliability_svg(
+            args.plot_output,
+            curves,
+            {
+                model: payload["alt_thresholds"][args.signal]["theta"]
+                for model, payload in models.items()
+            },
+        )
 
     for model, payload in models.items():
         threshold = payload["alt_thresholds"][args.signal]

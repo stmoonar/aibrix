@@ -161,3 +161,76 @@ def test_build_comparison_log_matches_legacy() -> None:
         legacy_type="SURPLUS",
         paper_cls=legacy_cls,
     )
+
+
+def test_idle_rps_guard_neutralizes_low_rate_nonzero_queue_signal() -> None:
+    classification = classify_model(
+        model_name="queue-arm",
+        trs=0.0,
+        Z_m=0.1,
+        eta_m=None,
+        theta_m=None,
+        tau=TauThresholds.from_control(),
+        request_rate_rps=0.01,
+        idle_rps_eps=0.05,
+    )
+
+    assert classification.state.value == "healthy"
+    assert classification.role.value == "neutral"
+
+
+def test_idle_rps_guard_is_noop_for_recorded_busy_zm_contexts() -> None:
+    contexts = {
+        "critical": {
+            "Y_m": 100.0,
+            "Q": 2.0,
+            "z_m": 0.7,
+            "eta_m": 250.0,
+            "trs": 700.0,
+            "theta_m": 1000.0,
+            "request_rate_rps": 0.8,
+        },
+        "healthy": {
+            "Y_m": 100.0,
+            "Q": 1.0,
+            "z_m": 1.1,
+            "eta_m": 320.0,
+            "trs": 1100.0,
+            "theta_m": 1000.0,
+            "request_rate_rps": 1.2,
+        },
+        "high": {
+            "Y_m": 100.0,
+            "Q": 1.0,
+            "z_m": 1.5,
+            "eta_m": 350.0,
+            "trs": 1500.0,
+            "theta_m": 1000.0,
+            "request_rate_rps": 0.4,
+        },
+    }
+
+    without_guard = classify_all_models(contexts, signal_idle_rps_eps=0.0)
+    with_guard = classify_all_models(contexts, signal_idle_rps_eps=0.05)
+
+    assert [_simple(item) for item in with_guard] == [
+        _simple(item) for item in without_guard
+    ]
+
+
+def test_zero_load_still_uses_idle_reclamation_tier() -> None:
+    contexts = {
+        "idle": {
+            "Y_m": 0.0,
+            "Q": 0.0,
+            "z_m": 0.0,
+            "eta_m": 0.0,
+            "trs": 0.0,
+            "theta_m": 1000.0,
+            "request_rate_rps": 0.0,
+        }
+    }
+
+    classification = classify_all_models(contexts, signal_idle_rps_eps=0.05)[0]
+    assert classification.state.value == "idle"
+    assert classification.donor_tier == "idle"

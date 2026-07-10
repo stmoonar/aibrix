@@ -94,6 +94,7 @@ def run_planner_tick(
     cluster_view: ClusterView | None = None,
     active_probe_models: set[str] | None = None,
     signal_source: str = "zm",
+    signal_idle_rps_eps: float = 0.05,
     safescale: SafeScaleController | None = None,
     paper_state_cache: PaperStateCache | None = None,
     incomplete_policy: IncompletePolicy = "drop_model",
@@ -119,7 +120,9 @@ def run_planner_tick(
         paper_state_cache=paper_state_cache,
         signal_state=signal_state,
     )
-    classifications = classify_all_models(contexts)
+    classifications = classify_all_models(
+        contexts, signal_idle_rps_eps=signal_idle_rps_eps
+    )
     if _prof_on:
         _signals_ns = time.perf_counter_ns() - _phase_t0
         _phase_t0 = time.perf_counter_ns()
@@ -288,6 +291,7 @@ def _model_contexts(
             assigned_replicas = bound_replicas
             metrics = replace(metrics, routable_pods=awake_replicas, assigned_replicas=awake_replicas)
         tokens_available = metrics.prompt_tokens is not None and metrics.generation_tokens is not None
+        request_rate_rps = _request_rate_rps(metrics)
         if tokens_available:
             if signal_state is not None:
                 computer = signal_state.computer_for(
@@ -328,6 +332,7 @@ def _model_contexts(
                 "routable_pods": metrics.routable_pods,
                 "assigned_replicas": assigned_replicas,
                 "signal_warm": signal_warm,
+                "request_rate_rps": request_rate_rps,
             }
         else:
             # tokens_available=False means the metrics are MISSING (scrape gap / stale store),
@@ -351,12 +356,22 @@ def _model_contexts(
                 "y_m": None,
                 "routable_pods": metrics.routable_pods,
                 "assigned_replicas": assigned_replicas,
+                "request_rate_rps": request_rate_rps,
             }
         if paper_state_cache is not None:
             context, model_events = paper_state_cache.apply(model_name, context, tokens_available=tokens_available)
             events.extend(model_events)
         contexts[model_name] = context
     return contexts, tuple(events)
+
+
+def _request_rate_rps(metrics: ModelWindowMetrics) -> float | None:
+    if metrics.request_count is None:
+        return None
+    duration_s = (metrics.window_end_ms - metrics.window_start_ms) / 1000.0
+    if duration_s <= 0.0:
+        return None
+    return max(0.0, float(metrics.request_count)) / duration_s
 
 
 def _cluster_view_counts(cluster_view: ClusterView | None) -> dict[str, tuple[int, int]]:

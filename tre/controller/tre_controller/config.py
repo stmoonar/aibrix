@@ -53,6 +53,7 @@ class ControllerConfig:
     min_latency_samples: int
     percentile_mode: str
     signal_source: str
+    signal_idle_rps_eps: float
     signal_warmup_ms: int
     paper_stale_max_windows: int
     incomplete_policy: str
@@ -180,6 +181,9 @@ class ControllerConfig:
             min_latency_samples=_get_nonneg_int(values, "TRE_MIN_LATENCY_SAMPLES", 10),
             percentile_mode=percentile_mode,
             signal_source=signal_source,
+            signal_idle_rps_eps=_get_nonneg_float(
+                values, "TRE_SIGNAL_IDLE_RPS_EPS", 0.05
+            ),
             # F-onset warmup guard: -1 auto (window fully inside traffic period),
             # 0 disabled (A/B ablation), >0 explicit span-since-onset in ms.
             signal_warmup_ms=signal_warmup_ms,
@@ -259,6 +263,17 @@ def _get_positive_float(env: Mapping[str, str], key: str, default: float) -> flo
         raise ValueError(f"{key} must be a number") from exc
     if value <= 0.0:
         raise ValueError(f"{key} must be positive")
+    return value
+
+
+def _get_nonneg_float(env: Mapping[str, str], key: str, default: float) -> float:
+    raw = env.get(key, str(default))
+    try:
+        value = float(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{key} must be a number") from exc
+    if not math.isfinite(value) or value < 0.0:
+        raise ValueError(f"{key} must be non-negative and finite")
     return value
 
 

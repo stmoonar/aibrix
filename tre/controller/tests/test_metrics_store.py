@@ -113,6 +113,7 @@ def test_metrics_store_reads_v2_window_with_legacy_delta_semantics():
 
     assert metrics.model == "dsqwen-7b"
     assert metrics.prompt_tokens == 105.0
+    assert metrics.request_count == 2.0
     assert metrics.avg_waiting == 5.0
     assert metrics.avg_running == 5.0
     assert metrics.kv_cache_hit_rate == 0.6875

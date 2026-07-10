@@ -260,6 +260,9 @@ class MetricsStore:
             ttft_p95_ms=_seconds_to_ms(ttft_p95_s),
             tpot_p95_ms=_seconds_to_ms(tpot_p95_s),
             e2e_p95_ms=_seconds_to_ms(e2e_p95_s),
+            request_count=self._hist_count_delta(
+                model, HISTOGRAM_METRICS["prompt_tokens"], hist_docs, window_start_ms
+            ),
         )
 
     def _aggregate_model(
@@ -288,6 +291,7 @@ class MetricsStore:
             routable_pods=routable_pods,
             assigned_replicas=routable_pods,
             per_pod=per_pod,
+            request_count=_sum_optional([pod.request_count for pod in pods]),
         )
 
     def _hist_sum_delta(self, model: str, metric: str, docs: list[dict[str, Any]], window_start_ms: int) -> float | None:
@@ -297,6 +301,19 @@ class MetricsStore:
         if first is None or last is None:
             return 0.0
         return max(0.0, _number(last.get("sum"), 0.0) - _number(first.get("sum"), 0.0))
+
+    def _hist_count_delta(
+        self, model: str, metric: str, docs: list[dict[str, Any]], window_start_ms: int
+    ) -> float | None:
+        if not _has_window_hist_doc(docs, window_start_ms):
+            return None
+        first, last = _first_last_metric(model, metric, docs)
+        if first is None or last is None:
+            return 0.0
+        return max(
+            0.0,
+            _number(last.get("count"), 0.0) - _number(first.get("count"), 0.0),
+        )
 
     def _hist_avg_delta(self, model: str, metric: str, docs: list[dict[str, Any]], window_start_ms: int) -> float | None:
         if not _has_window_metric(model, metric, docs, window_start_ms):

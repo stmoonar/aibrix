@@ -15,6 +15,7 @@ class PodWindowMetrics:
     ttft_p95_ms: float | None
     tpot_p95_ms: float | None
     e2e_p95_ms: float | None
+    request_count: float | None = None
 
 
 @dataclass(frozen=True)
@@ -34,6 +35,7 @@ class ModelWindowMetrics:
     routable_pods: int
     assigned_replicas: int
     per_pod: dict[str, PodWindowMetrics]
+    request_count: float | None = None
 
 
 @dataclass(frozen=True)

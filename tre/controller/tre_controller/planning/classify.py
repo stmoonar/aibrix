@@ -58,7 +58,24 @@ def classify_model(
     tau: TauThresholds,
     eta_crit: float | None = None,
     eta_low: float | None = None,
+    request_rate_rps: float | None = None,
+    idle_rps_eps: float = 0.05,
 ) -> ModelClassification:
+    request_rate = _as_nonneg_float(request_rate_rps)
+    if request_rate is not None and request_rate < max(0.0, idle_rps_eps):
+        return ModelClassification(
+            model_name=model_name,
+            state=ModelState.HEALTHY,
+            role=ModelRole.NEUTRAL,
+            Z_m=Z_m,
+            eta_m=eta_m,
+            trs=trs,
+            theta_m=theta_m,
+            tau=tau,
+            eta_crit=eta_crit,
+            eta_low=eta_low,
+        )
+
     if Z_m is None:
         return ModelClassification(
             model_name=model_name,
@@ -111,6 +128,7 @@ def classify_all_models(
     delta_crit: float = 0.2,
     delta_high: float = 0.25,
     model_control_configs: dict[str, dict[str, Any]] | None = None,
+    signal_idle_rps_eps: float = 0.05,
 ) -> list[ModelClassification]:
     results: list[ModelClassification] = []
 
@@ -153,6 +171,8 @@ def classify_all_models(
                 tau=tau,
                 eta_crit=eta_crit,
                 eta_low=eta_low,
+                request_rate_rps=ctx.get("request_rate_rps"),
+                idle_rps_eps=signal_idle_rps_eps,
             )
         )
 

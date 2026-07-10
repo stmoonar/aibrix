@@ -30,6 +30,7 @@ def test_config_defaults_are_plan_aligned() -> None:
     assert config.min_latency_samples == 10
     assert config.percentile_mode == "bucket_upper"
     assert config.signal_source == "zm"
+    assert config.signal_idle_rps_eps == 0.05
     assert config.signal_warmup_ms == -1
     assert config.sm_slow_timeout_s == 300.0
     assert config.paper_stale_max_windows == 3
@@ -182,6 +183,14 @@ def test_config_rejects_inverted_safescale_window_bounds() -> None:
                 "SAFE_SCALE_MAX_WINDOW_MS": "15000",
             }
         )
+
+
+def test_config_reads_and_validates_signal_idle_rps_epsilon() -> None:
+    assert ControllerConfig.from_env(
+        {"TRE_SIGNAL_IDLE_RPS_EPS": "0"}
+    ).signal_idle_rps_eps == 0.0
+    with pytest.raises(ValueError, match="TRE_SIGNAL_IDLE_RPS_EPS"):
+        ControllerConfig.from_env({"TRE_SIGNAL_IDLE_RPS_EPS": "-0.1"})
 
 
 def test_config_rejects_invalid_signal_source() -> None:
