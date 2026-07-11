@@ -15,10 +15,12 @@ spec:
   selector:
     matchLabels:
       model.aibrix.ai/name: dsllama-8b
+      tre.aibrix.io/routable: 'true'
   template:
     metadata:
       labels:
         model.aibrix.ai/name: dsllama-8b
+        tre.aibrix.io/routable: 'true'
         model.aibrix.ai/port: '8000'
         tre.aibrix.io/apa-scale-anchor: 'true'
     spec:
