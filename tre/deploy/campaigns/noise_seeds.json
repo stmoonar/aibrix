@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "frozen_sha": "ca61e485d229ecfa9aff209d7f29d24baf2db18f",
+  "frozen_sha": "1457e54ae20da445eb1e11aef7c17a0ce884f612",
   "params_hash": "328bcfd2b54ca2db",
   "images": {
     "controller": "tre-v2-controller:20260710-ca61e485",

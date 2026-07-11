@@ -1,0 +1,73 @@
+{
+  "schema_version": 1,
+  "frozen_sha": "1457e54ae20da445eb1e11aef7c17a0ce884f612",
+  "params_hash": "328bcfd2b54ca2db",
+  "images": {
+    "controller": "tre-v2-controller:20260710-ca61e485",
+    "service-manager": "tre-v2-service-manager:20260710-ca61e485",
+    "ui": "tre-v2-ui:20260710-ca61e485"
+  },
+  "baseline": {
+    "dsllama-8b": "dsllama-8b-nscc-ds-4a100-node9-gpu-1-5cb98fdbb6-mr5b7",
+    "dsqwen-7b": "dsqwen-7b-nscc-ds-4a100-node9-gpu-0-546d5d9f88-f94nf",
+    "dsqwen-14b": "dsqwen-14b-nscc-ds-4a100-node9-gpu-2-3-69c86d8db7-vnxtl"
+  },
+  "cooldown_s": 600,
+  "post_drain_s": 30,
+  "runs": [
+    {
+      "id": "t1_apa_seed1",
+      "trace": "replayer/traces_v2/t1_a1_demand_shift/trace.json",
+      "arm": "apa",
+      "seed": 20260715
+    },
+    {
+      "id": "t2_apa_seed1",
+      "trace": "replayer/traces_v2/t2_a2_anticorrelated/trace.json",
+      "arm": "apa",
+      "seed": 20260715
+    },
+    {
+      "id": "t3_apa_seed1",
+      "trace": "replayer/traces_v2/t3_a3_io_drift/trace.json",
+      "arm": "apa",
+      "seed": 20260715
+    },
+    {
+      "id": "t4_apa_seed1",
+      "trace": "replayer/traces_v2/t4_a4_spike_vs_burst/trace.json",
+      "arm": "apa",
+      "seed": 20260715
+    },
+    {
+      "id": "t5_apa_seed1",
+      "trace": "replayer/traces_v2/t5_a5_tp_pressure/trace.json",
+      "arm": "apa",
+      "seed": 20260715
+    },
+    {
+      "id": "t6_apa_seed1",
+      "trace": "replayer/traces_v2/t6_a6_control/trace.json",
+      "arm": "apa",
+      "seed": 20260715
+    },
+    {
+      "id": "t7_apa_seed1",
+      "trace": "replayer/traces_v2/t7_a2b_anticorrelated_hot/trace.json",
+      "arm": "apa",
+      "seed": 20260715
+    },
+    {
+      "id": "t8_apa_seed1",
+      "trace": "replayer/traces_v2/t8_azure_conv/trace.json",
+      "arm": "apa",
+      "seed": 20260715
+    },
+    {
+      "id": "t9_apa_seed1",
+      "trace": "replayer/traces_v2/t9_burstgpt/trace.json",
+      "arm": "apa",
+      "seed": 20260715
+    }
+  ]
+}
