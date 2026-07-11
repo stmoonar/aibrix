@@ -1,0 +1,29 @@
+{
+  "arm": "apa",
+  "command": [
+    "/usr/bin/python3",
+    "-m",
+    "tre_replayer.run_trace",
+    "--trace",
+    "/data/nfs_shared_data/xxy/aibrix/tre/replayer/traces_v2/t9_burstgpt/trace.json",
+    "--gateway-url",
+    "http://192.168.223.76:31592/v1/completions",
+    "--out",
+    "/data/nfs_shared_data/xxy/aibrix/tre/docs/refactor/p11_evidence/canonical_rerun_20260715/t9_apa_seed1/requests.jsonl",
+    "--registry",
+    "/data/nfs_shared_data/xxy/aibrix/tre/deploy/registry.yaml",
+    "--seed",
+    "20260715",
+    "--max-in-flight",
+    "512",
+    "--trim-ramp-windows",
+    "1"
+  ],
+  "controller_pod": "tre-v2-controller-66994945c7-n85gz",
+  "gateway": "http://192.168.223.76:31592/v1/completions",
+  "operator": "root via Codex",
+  "run_id": "t9_apa_seed1",
+  "seed": 20260715,
+  "trace": "replayer/traces_v2/t9_burstgpt/trace.json",
+  "trace_sha256": "7edc26bc08940ffd8ed173692fec3d56664e58712f7e02d4531f84c5bb30adeb"
+}

@@ -1,0 +1,652 @@
+{
+  "applied_hash": "328bcfd2b54ca2db",
+  "last_restart": {
+    "tre.dev/params-hash": "328bcfd2b54ca2db",
+    "tre.dev/restart-reason": "phase3 alt_thresholds freeze",
+    "tre.dev/restarted-by": "tre-v2-ui"
+  },
+  "models": {
+    "dsllama-8b": {
+      "constraints": [
+        "tau_crit <= tau_low < tau_high",
+        "qmin <= qsat",
+        "min_replicas <= max_replicas",
+        "w_p and w_d not both 0"
+      ],
+      "editable": {
+        "alt_thresholds.decode_tps.direction": {
+          "choices": [
+            "lower_is_healthier"
+          ],
+          "type": "enum",
+          "value": "lower_is_healthier"
+        },
+        "alt_thresholds.decode_tps.theta": {
+          "max": 1000000000,
+          "max_exclusive": false,
+          "min": 0,
+          "min_exclusive": true,
+          "type": "float",
+          "value": 1634.1333333333334
+        },
+        "alt_thresholds.prefill_tps.direction": {
+          "choices": [
+            "lower_is_healthier"
+          ],
+          "type": "enum",
+          "value": "lower_is_healthier"
+        },
+        "alt_thresholds.prefill_tps.theta": {
+          "max": 1000000000,
+          "max_exclusive": false,
+          "min": 0,
+          "min_exclusive": true,
+          "type": "float",
+          "value": 2186.6666666666665
+        },
+        "alt_thresholds.queue_len.direction": {
+          "choices": [
+            "lower_is_healthier"
+          ],
+          "type": "enum",
+          "value": "lower_is_healthier"
+        },
+        "alt_thresholds.queue_len.theta": {
+          "max": 1000000000,
+          "max_exclusive": false,
+          "min": 0,
+          "min_exclusive": true,
+          "type": "float",
+          "value": 46.333333333333336
+        },
+        "max_replicas": {
+          "max": 8,
+          "max_exclusive": false,
+          "min": 1,
+          "min_exclusive": false,
+          "type": "int",
+          "value": 8
+        },
+        "min_replicas": {
+          "max": 4,
+          "max_exclusive": false,
+          "min": 0,
+          "min_exclusive": false,
+          "type": "int",
+          "value": 1
+        },
+        "slo.e2e_p95_ms": {
+          "max": 120000,
+          "max_exclusive": false,
+          "min": 1000,
+          "min_exclusive": false,
+          "type": "float",
+          "value": 12000.0
+        },
+        "slo.tpot_p95_ms": {
+          "max": 500,
+          "max_exclusive": false,
+          "min": 10,
+          "min_exclusive": false,
+          "type": "float",
+          "value": 75.0
+        },
+        "slo.ttft_p95_ms": {
+          "max": 5000,
+          "max_exclusive": false,
+          "min": 50,
+          "min_exclusive": false,
+          "type": "float",
+          "value": 500.0
+        },
+        "trs.ema_alpha": {
+          "max": 1,
+          "max_exclusive": true,
+          "min": 0,
+          "min_exclusive": true,
+          "type": "float",
+          "value": 0.2485
+        },
+        "trs.epsat": {
+          "max": 0.5,
+          "max_exclusive": true,
+          "min": 0,
+          "min_exclusive": true,
+          "type": "float",
+          "value": 0.05
+        },
+        "trs.hsat": {
+          "max": 20,
+          "max_exclusive": false,
+          "min": 1,
+          "min_exclusive": false,
+          "type": "int",
+          "value": 3
+        },
+        "trs.lambda_wait": {
+          "max": 20,
+          "max_exclusive": false,
+          "min": 0,
+          "min_exclusive": false,
+          "type": "float",
+          "value": 3.0
+        },
+        "trs.qmin": {
+          "max": 16,
+          "max_exclusive": false,
+          "min": 0,
+          "min_exclusive": false,
+          "type": "float",
+          "value": 1.0
+        },
+        "trs.qsat": {
+          "max": 64,
+          "max_exclusive": false,
+          "min": 0,
+          "min_exclusive": true,
+          "type": "float",
+          "value": 4.0
+        },
+        "trs.tau_crit": {
+          "max": 2,
+          "max_exclusive": false,
+          "min": 0,
+          "min_exclusive": true,
+          "type": "float",
+          "value": 0.7485
+        },
+        "trs.tau_high": {
+          "max": 8,
+          "max_exclusive": false,
+          "min": 0,
+          "min_exclusive": true,
+          "type": "float",
+          "value": 1.6296
+        },
+        "trs.tau_low": {
+          "max": 4,
+          "max_exclusive": false,
+          "min": 0,
+          "min_exclusive": true,
+          "type": "float",
+          "value": 1.0
+        },
+        "trs.theta_m": {
+          "max": 20000,
+          "max_exclusive": false,
+          "min": 0,
+          "min_exclusive": true,
+          "type": "float",
+          "value": 1290.915
+        },
+        "trs.w_d": {
+          "max": 10,
+          "max_exclusive": false,
+          "min": 0,
+          "min_exclusive": false,
+          "type": "float",
+          "value": 1.0
+        },
+        "trs.w_p": {
+          "max": 10,
+          "max_exclusive": false,
+          "min": 0,
+          "min_exclusive": false,
+          "type": "float",
+          "value": 0.02
+        }
+      },
+      "locked": {
+        "name": {
+          "reason": "identity; change via git redeploy",
+          "value": "dsllama-8b"
+        },
+        "tp_size": {
+          "reason": "placement/structural; git redeploy",
+          "value": 1
+        },
+        "trs.ema_tau_ms": {
+          "reason": "window-coupled; frozen with W",
+          "value": 20000
+        },
+        "vllm_image": {
+          "reason": "placement/structural; git redeploy",
+          "value": "vllm/vllm-openai:0.10.1-sleep"
+        },
+        "weights_path": {
+          "reason": "placement/structural; git redeploy",
+          "value": "/data/nfs_shared_data/DeepSeek-R1-Distill-Llama-8B"
+        }
+      }
+    },
+    "dsqwen-14b": {
+      "constraints": [
+        "tau_crit <= tau_low < tau_high",
+        "qmin <= qsat",
+        "min_replicas <= max_replicas",
+        "w_p and w_d not both 0"
+      ],
+      "editable": {
+        "alt_thresholds.decode_tps.direction": {
+          "choices": [
+            "lower_is_healthier"
+          ],
+          "type": "enum",
+          "value": "lower_is_healthier"
+        },
+        "alt_thresholds.decode_tps.theta": {
+          "max": 1000000000,
+          "max_exclusive": false,
+          "min": 0,
+          "min_exclusive": true,
+          "type": "float",
+          "value": 6536.533333333334
+        },
+        "alt_thresholds.prefill_tps.direction": {
+          "choices": [
+            "lower_is_healthier"
+          ],
+          "type": "enum",
+          "value": "lower_is_healthier"
+        },
+        "alt_thresholds.prefill_tps.theta": {
+          "max": 1000000000,
+          "max_exclusive": false,
+          "min": 0,
+          "min_exclusive": true,
+          "type": "float",
+          "value": 10670.4
+        },
+        "alt_thresholds.queue_len.direction": {
+          "choices": [
+            "lower_is_healthier"
+          ],
+          "type": "enum",
+          "value": "lower_is_healthier"
+        },
+        "alt_thresholds.queue_len.theta": {
+          "max": 1000000000,
+          "max_exclusive": false,
+          "min": 0,
+          "min_exclusive": true,
+          "type": "float",
+          "value": 191.66666666666666
+        },
+        "max_replicas": {
+          "max": 8,
+          "max_exclusive": false,
+          "min": 1,
+          "min_exclusive": false,
+          "type": "int",
+          "value": 4
+        },
+        "min_replicas": {
+          "max": 4,
+          "max_exclusive": false,
+          "min": 0,
+          "min_exclusive": false,
+          "type": "int",
+          "value": 0
+        },
+        "slo.e2e_p95_ms": {
+          "max": 120000,
+          "max_exclusive": false,
+          "min": 1000,
+          "min_exclusive": false,
+          "type": "float",
+          "value": 15000.0
+        },
+        "slo.tpot_p95_ms": {
+          "max": 500,
+          "max_exclusive": false,
+          "min": 10,
+          "min_exclusive": false,
+          "type": "float",
+          "value": 75.0
+        },
+        "slo.ttft_p95_ms": {
+          "max": 5000,
+          "max_exclusive": false,
+          "min": 50,
+          "min_exclusive": false,
+          "type": "float",
+          "value": 500.0
+        },
+        "trs.ema_alpha": {
+          "max": 1,
+          "max_exclusive": true,
+          "min": 0,
+          "min_exclusive": true,
+          "type": "float",
+          "value": 0.3935
+        },
+        "trs.epsat": {
+          "max": 0.5,
+          "max_exclusive": true,
+          "min": 0,
+          "min_exclusive": true,
+          "type": "float",
+          "value": 0.05
+        },
+        "trs.hsat": {
+          "max": 20,
+          "max_exclusive": false,
+          "min": 1,
+          "min_exclusive": false,
+          "type": "int",
+          "value": 3
+        },
+        "trs.lambda_wait": {
+          "max": 20,
+          "max_exclusive": false,
+          "min": 0,
+          "min_exclusive": false,
+          "type": "float",
+          "value": 3.0
+        },
+        "trs.qmin": {
+          "max": 16,
+          "max_exclusive": false,
+          "min": 0,
+          "min_exclusive": false,
+          "type": "float",
+          "value": 1.0
+        },
+        "trs.qsat": {
+          "max": 64,
+          "max_exclusive": false,
+          "min": 0,
+          "min_exclusive": true,
+          "type": "float",
+          "value": 4.0
+        },
+        "trs.tau_crit": {
+          "max": 2,
+          "max_exclusive": false,
+          "min": 0,
+          "min_exclusive": true,
+          "type": "float",
+          "value": 0.56
+        },
+        "trs.tau_high": {
+          "max": 8,
+          "max_exclusive": false,
+          "min": 0,
+          "min_exclusive": true,
+          "type": "float",
+          "value": 1.26
+        },
+        "trs.tau_low": {
+          "max": 4,
+          "max_exclusive": false,
+          "min": 0,
+          "min_exclusive": true,
+          "type": "float",
+          "value": 1.0
+        },
+        "trs.theta_m": {
+          "max": 20000,
+          "max_exclusive": false,
+          "min": 0,
+          "min_exclusive": true,
+          "type": "float",
+          "value": 1020.235
+        },
+        "trs.w_d": {
+          "max": 10,
+          "max_exclusive": false,
+          "min": 0,
+          "min_exclusive": false,
+          "type": "float",
+          "value": 1.0
+        },
+        "trs.w_p": {
+          "max": 10,
+          "max_exclusive": false,
+          "min": 0,
+          "min_exclusive": false,
+          "type": "float",
+          "value": 0.0575
+        }
+      },
+      "locked": {
+        "name": {
+          "reason": "identity; change via git redeploy",
+          "value": "dsqwen-14b"
+        },
+        "tp_size": {
+          "reason": "placement/structural; git redeploy",
+          "value": 2
+        },
+        "trs.ema_tau_ms": {
+          "reason": "window-coupled; frozen with W",
+          "value": 20000
+        },
+        "vllm_image": {
+          "reason": "placement/structural; git redeploy",
+          "value": "vllm/vllm-openai:0.10.1-sleep"
+        },
+        "weights_path": {
+          "reason": "placement/structural; git redeploy",
+          "value": "/data/nfs_shared_data/Models/DeepSeek-R1-Distill-Qwen-14B"
+        }
+      }
+    },
+    "dsqwen-7b": {
+      "constraints": [
+        "tau_crit <= tau_low < tau_high",
+        "qmin <= qsat",
+        "min_replicas <= max_replicas",
+        "w_p and w_d not both 0"
+      ],
+      "editable": {
+        "alt_thresholds.decode_tps.direction": {
+          "choices": [
+            "lower_is_healthier"
+          ],
+          "type": "enum",
+          "value": "lower_is_healthier"
+        },
+        "alt_thresholds.decode_tps.theta": {
+          "max": 1000000000,
+          "max_exclusive": false,
+          "min": 0,
+          "min_exclusive": true,
+          "type": "float",
+          "value": 2218.6666666666665
+        },
+        "alt_thresholds.prefill_tps.direction": {
+          "choices": [
+            "lower_is_healthier"
+          ],
+          "type": "enum",
+          "value": "lower_is_healthier"
+        },
+        "alt_thresholds.prefill_tps.theta": {
+          "max": 1000000000,
+          "max_exclusive": false,
+          "min": 0,
+          "min_exclusive": true,
+          "type": "float",
+          "value": 6081.666666666667
+        },
+        "alt_thresholds.queue_len.direction": {
+          "choices": [
+            "lower_is_healthier"
+          ],
+          "type": "enum",
+          "value": "lower_is_healthier"
+        },
+        "alt_thresholds.queue_len.theta": {
+          "max": 1000000000,
+          "max_exclusive": false,
+          "min": 0,
+          "min_exclusive": true,
+          "type": "float",
+          "value": 78.33333333333333
+        },
+        "max_replicas": {
+          "max": 8,
+          "max_exclusive": false,
+          "min": 1,
+          "min_exclusive": false,
+          "type": "int",
+          "value": 8
+        },
+        "min_replicas": {
+          "max": 4,
+          "max_exclusive": false,
+          "min": 0,
+          "min_exclusive": false,
+          "type": "int",
+          "value": 1
+        },
+        "slo.e2e_p95_ms": {
+          "max": 120000,
+          "max_exclusive": false,
+          "min": 1000,
+          "min_exclusive": false,
+          "type": "float",
+          "value": 12000.0
+        },
+        "slo.tpot_p95_ms": {
+          "max": 500,
+          "max_exclusive": false,
+          "min": 10,
+          "min_exclusive": false,
+          "type": "float",
+          "value": 75.0
+        },
+        "slo.ttft_p95_ms": {
+          "max": 5000,
+          "max_exclusive": false,
+          "min": 50,
+          "min_exclusive": false,
+          "type": "float",
+          "value": 500.0
+        },
+        "trs.ema_alpha": {
+          "max": 1,
+          "max_exclusive": true,
+          "min": 0,
+          "min_exclusive": true,
+          "type": "float",
+          "value": 0.2485
+        },
+        "trs.epsat": {
+          "max": 0.5,
+          "max_exclusive": true,
+          "min": 0,
+          "min_exclusive": true,
+          "type": "float",
+          "value": 0.05
+        },
+        "trs.hsat": {
+          "max": 20,
+          "max_exclusive": false,
+          "min": 1,
+          "min_exclusive": false,
+          "type": "int",
+          "value": 3
+        },
+        "trs.lambda_wait": {
+          "max": 20,
+          "max_exclusive": false,
+          "min": 0,
+          "min_exclusive": false,
+          "type": "float",
+          "value": 3.0
+        },
+        "trs.qmin": {
+          "max": 16,
+          "max_exclusive": false,
+          "min": 0,
+          "min_exclusive": false,
+          "type": "float",
+          "value": 1.0
+        },
+        "trs.qsat": {
+          "max": 64,
+          "max_exclusive": false,
+          "min": 0,
+          "min_exclusive": true,
+          "type": "float",
+          "value": 4.0
+        },
+        "trs.tau_crit": {
+          "max": 2,
+          "max_exclusive": false,
+          "min": 0,
+          "min_exclusive": true,
+          "type": "float",
+          "value": 0.7485
+        },
+        "trs.tau_high": {
+          "max": 8,
+          "max_exclusive": false,
+          "min": 0,
+          "min_exclusive": true,
+          "type": "float",
+          "value": 1.6296
+        },
+        "trs.tau_low": {
+          "max": 4,
+          "max_exclusive": false,
+          "min": 0,
+          "min_exclusive": true,
+          "type": "float",
+          "value": 1.0
+        },
+        "trs.theta_m": {
+          "max": 20000,
+          "max_exclusive": false,
+          "min": 0,
+          "min_exclusive": true,
+          "type": "float",
+          "value": 993.4687597800112
+        },
+        "trs.w_d": {
+          "max": 10,
+          "max_exclusive": false,
+          "min": 0,
+          "min_exclusive": false,
+          "type": "float",
+          "value": 1.0
+        },
+        "trs.w_p": {
+          "max": 10,
+          "max_exclusive": false,
+          "min": 0,
+          "min_exclusive": false,
+          "type": "float",
+          "value": 0.02
+        }
+      },
+      "locked": {
+        "name": {
+          "reason": "identity; change via git redeploy",
+          "value": "dsqwen-7b"
+        },
+        "tp_size": {
+          "reason": "placement/structural; git redeploy",
+          "value": 1
+        },
+        "trs.ema_tau_ms": {
+          "reason": "window-coupled; frozen with W",
+          "value": 20000
+        },
+        "vllm_image": {
+          "reason": "placement/structural; git redeploy",
+          "value": "vllm/vllm-openai:0.10.1-sleep"
+        },
+        "weights_path": {
+          "reason": "placement/structural; git redeploy",
+          "value": "/data/nfs_shared_data/DeepSeek-R1-Distill-Qwen-7B"
+        }
+      }
+    }
+  },
+  "params_hash": "328bcfd2b54ca2db",
+  "pending_restart": false,
+  "resource_version": "194709416"
+}

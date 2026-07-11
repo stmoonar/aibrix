@@ -1,0 +1,7 @@
+{
+  "http_5xx": 0,
+  "http_5xx_frac": 0.0,
+  "requests": 8683,
+  "status_zero": 0,
+  "status_zero_frac": 0.0
+}

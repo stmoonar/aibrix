@@ -1,0 +1,5 @@
+ts,model,action,serve_id
+2026-07-10T17:56:56.395453Z,dsllama-8b,wake,dsllama-8b-nscc-ds-4a100-node10-gpu-0-5f474d7f85-7mns7
+2026-07-10T17:57:17.399913Z,dsllama-8b,wake,dsllama-8b-nscc-ds-4a100-node10-gpu-1-56b6bfcfdd-npqs2
+2026-07-10T17:57:27.401863Z,dsllama-8b,wake,dsllama-8b-nscc-ds-4a100-node10-gpu-2-55484bc5d7-kvtvr
+2026-07-10T17:57:37.903852Z,dsllama-8b,wake,dsllama-8b-nscc-ds-4a100-node10-gpu-3-77966677f4-95m45

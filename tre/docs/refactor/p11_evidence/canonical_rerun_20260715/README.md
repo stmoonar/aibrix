@@ -93,9 +93,52 @@ symmetry must still be checked across TRE/APA with the H4 audit before publicati
 
 | run | seed | start | end | params hash | verdict | evidence |
 | --- | ---: | --- | --- | --- | --- | --- |
-| _pending_ | | | | `328bcfd2b54ca2db` | | |
+| `t1_tre_seed1` | 20260715 | 2026-07-10T10:18:32Z | 2026-07-10T10:32:25Z | `328bcfd2b54ca2db` | DONE, V_req=43.300% | `t1_tre_seed1/` |
+| `t1_apa_seed1` | 20260715 | 2026-07-10T10:44:21Z | 2026-07-10T10:58:14Z | `328bcfd2b54ca2db` | DONE, V_req=55.810% | `t1_apa_seed1/` |
+| `t2_tre_seed1` | 20260715 | 2026-07-10T11:10:03Z | 2026-07-10T11:29:16Z | `328bcfd2b54ca2db` | DONE, V_req=17.224% | `t2_tre_seed1/` |
+| `t2_apa_seed1` | 20260715 | 2026-07-10T11:41:14Z | 2026-07-10T12:00:28Z | `328bcfd2b54ca2db` | DONE, V_req=39.885% | `t2_apa_seed1/` |
+| `t3_tre_seed1` | 20260715 | 2026-07-10T12:12:17Z | 2026-07-10T12:30:59Z | `328bcfd2b54ca2db` | DONE, V_req=0.616% | `t3_tre_seed1/` |
+| `t3_apa_seed1` | 20260715 | 2026-07-10T12:42:57Z | 2026-07-10T13:01:38Z | `328bcfd2b54ca2db` | DONE, V_req=48.163% | `t3_apa_seed1/` |
+| `t4_tre_seed1` | 20260715 | 2026-07-10T13:13:28Z | 2026-07-10T13:26:20Z | `328bcfd2b54ca2db` | DONE, V_req=6.003% | `t4_tre_seed1/` |
+| `t4_apa_seed1` | 20260715 | 2026-07-10T13:38:20Z | 2026-07-10T13:51:12Z | `328bcfd2b54ca2db` | DONE, V_req=19.904% | `t4_apa_seed1/` |
+| `t5_tre_seed1` | 20260715 | 2026-07-10T14:02:59Z | 2026-07-10T14:18:33Z | `328bcfd2b54ca2db` | DONE, V_req=31.152% | `t5_tre_seed1/` |
+| `t5_apa_seed1` | 20260715 | 2026-07-10T14:30:28Z | 2026-07-10T14:46:01Z | `328bcfd2b54ca2db` | DONE, V_req=55.025% | `t5_apa_seed1/` |
+| `t6_tre_seed1` | 20260715 | 2026-07-10T14:57:49Z | 2026-07-10T15:12:47Z | `328bcfd2b54ca2db` | DONE, V_req=0.004% | `t6_tre_seed1/` |
+| `t6_apa_seed1` | 20260715 | 2026-07-10T15:24:36Z | 2026-07-10T15:39:34Z | `328bcfd2b54ca2db` | DONE, V_req=0.004% | `t6_apa_seed1/` |
+| `t7_tre_seed1` | 20260715 | 2026-07-10T15:51:23Z | 2026-07-10T16:10:37Z | `328bcfd2b54ca2db` | DONE, V_req=38.818% | `t7_tre_seed1/` |
+| `t7_apa_seed1` | 20260715 | 2026-07-10T16:22:33Z | 2026-07-10T16:41:47Z | `328bcfd2b54ca2db` | DONE, V_req=52.850% | `t7_apa_seed1/` |
+| `t8_tre_seed1` | 20260715 | 2026-07-10T16:53:38Z | 2026-07-10T17:12:50Z | `328bcfd2b54ca2db` | DONE, V_req=0.850% | `t8_tre_seed1/` |
+| `t8_apa_seed1` | 20260715 | 2026-07-10T17:24:49Z | 2026-07-10T17:44:18Z | `328bcfd2b54ca2db` | DONE, V_req=67.707% | `t8_apa_seed1/` |
+| `t9_tre_seed1` | 20260715 | 2026-07-10T17:56:06Z | 2026-07-10T18:15:22Z | `328bcfd2b54ca2db` | DONE, V_req=0.000% | `t9_tre_seed1/` |
+| `t9_apa_seed1` | 20260715 | 2026-07-10T18:27:19Z | 2026-07-10T18:46:35Z | `328bcfd2b54ca2db` | DONE, V_req=7.663% | `t9_apa_seed1/` |
 
 Per-run directories must be named `t<k>_<arm>_seed<j>/` and contain request JSONL,
 `timeline_signals.csv`, action journal, pod events, params dump, exact command, timestamps,
 image tags, and scored verdict. Figure regeneration commands will be added when E1/E2 data
 exists; no paper figure may cite the Phase 3 smoke as a canonical result.
+
+## E1 results: system V_req (request-weighted, trim=1)
+
+Audit over all 18 runs: 26 required artifacts each, gzip/uncompressed SHA and line
+counts match `run.json` and `queue_status.json`, `trim_ramp_windows=1`, freeze SHA
+`ca61e485` and params `328bcfd2b54ca2db` everywhere, stderr empty, all three models'
+queue/decode/prefill signal values finite. Sole flag: both t6 arms have an empty
+`proposed_actions.jsonl` — legitimate zero-action runs (`run.json` proposed=actual=0,
+220 controller decision rows alive, V_req~0.004% both arms), not a harvest defect.
+
+| trace | TRE V_req | APA V_req | diff (APA-TRE) | winner |
+| --- | ---: | ---: | ---: | --- |
+| t1 | 43.300% | 55.810% | +12.509pp | TRE |
+| t2 | 17.224% | 39.885% | +22.661pp | TRE |
+| t3 | 0.616% | 48.163% | +47.546pp | TRE |
+| t4 | 6.003% | 19.904% | +13.901pp | TRE |
+| t5 | 31.152% | 55.025% | +23.873pp | TRE |
+| t6 | 0.004% | 0.004% | +0.000pp | tie |
+| t7 | 38.818% | 52.850% | +14.032pp | TRE |
+| t8 | 0.850% | 67.707% | +66.857pp | TRE |
+| t9 | 0.000% | 7.663% | +7.663pp | TRE |
+
+TRE wins 8/9 with 1 tie (t6: both arms ~0.004%, zero-pressure trace;
+both arms proposed zero actions). Largest gaps: t8 (+66.86pp) and t3 (+47.55pp).
+`SHA256SUMS` in this directory pins every per-run artifact plus queue plan/status;
+verify with `sha256sum -c SHA256SUMS` from this directory.

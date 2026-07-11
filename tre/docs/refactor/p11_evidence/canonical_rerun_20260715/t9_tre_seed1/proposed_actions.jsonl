@@ -1,0 +1,6 @@
+{"delta":1,"donor":null,"kind":"scale","loop":"fairness","model":"dsllama-8b","reason":"low_fairness_sleeping_capacity","receiver":"dsllama-8b","requires_safescale":false,"source_loop":"fairness","ts_ms":1783706210305}
+{"delta":1,"donor":null,"kind":"scale","loop":"fairness","model":"dsllama-8b","reason":"low_fairness_sleeping_capacity","receiver":"dsllama-8b","requires_safescale":false,"source_loop":"fairness","ts_ms":1783706231588}
+{"delta":1,"donor":null,"kind":"scale","loop":"fairness","model":"dsllama-8b","reason":"low_fairness_sleeping_capacity","receiver":"dsllama-8b","requires_safescale":false,"source_loop":"fairness","ts_ms":1783706244624}
+{"delta":1,"donor":null,"kind":"scale","loop":"fairness","model":"dsllama-8b","reason":"low_fairness_sleeping_capacity","receiver":"dsllama-8b","requires_safescale":false,"source_loop":"fairness","ts_ms":1783706251061}
+{"delta":1,"donor":null,"kind":"scale","loop":"fairness","model":"dsllama-8b","reason":"low_fairness_sleeping_capacity","receiver":"dsllama-8b","requires_safescale":false,"source_loop":"fairness","ts_ms":1783706264081}
+{"delta":-1,"donor":"dsllama-8b","kind":"scale","loop":"rescue","model":"dsllama-8b","reason":"idle_proactive_immediate","receiver":null,"requires_safescale":false,"source_loop":"rescue","ts_ms":1783707320472}

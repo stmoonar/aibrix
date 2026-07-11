@@ -1,0 +1,7 @@
+ts,model,action,serve_id
+2026-07-10T10:19:11.644624Z,dsllama-8b,wake,dsllama-8b-nscc-ds-4a100-node10-gpu-0-5f474d7f85-7mns7
+2026-07-10T10:21:03.167054Z,dsqwen-7b,wake,dsqwen-7b-nscc-ds-4a100-node10-gpu-1-56fdbbc6ff-xhgdd
+2026-07-10T10:21:10.168359Z,dsqwen-7b,wake,dsqwen-7b-nscc-ds-4a100-node10-gpu-2-656bc4f9db-7shnz
+2026-07-10T10:21:17.169900Z,dsqwen-7b,wake,dsqwen-7b-nscc-ds-4a100-node10-gpu-3-5bdcc7896f-7sn2s
+2026-07-10T10:32:23.316452Z,dsqwen-7b,sleep,dsqwen-7b-nscc-ds-4a100-node10-gpu-3-5bdcc7896f-7sn2s
+2026-07-10T10:32:24.316648Z,dsllama-8b,sleep,dsllama-8b-nscc-ds-4a100-node10-gpu-0-5f474d7f85-7mns7
