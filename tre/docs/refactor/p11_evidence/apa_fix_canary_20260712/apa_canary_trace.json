@@ -1,0 +1,1 @@
+{"dsqwen-7b": [{"start_time": 0, "end_time": 180, "rps": 30, "input_tokens": 1024, "max_tokens": 256}], "dsllama-8b": [{"start_time": 0, "end_time": 180, "rps": 0.1, "input_tokens": 128, "max_tokens": 32}], "dsqwen-14b": [{"start_time": 0, "end_time": 180, "rps": 0.1, "input_tokens": 128, "max_tokens": 32}]}
