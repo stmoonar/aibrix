@@ -142,3 +142,16 @@ TRE wins 8/9 with 1 tie (t6: both arms ~0.004%, zero-pressure trace;
 both arms proposed zero actions). Largest gaps: t8 (+66.86pp) and t3 (+47.55pp).
 `SHA256SUMS` in this directory pins every per-run artifact plus queue plan/status;
 verify with `sha256sum -c SHA256SUMS` from this directory.
+
+## Diagnosis: the "7b capped at 4 on t1/t7" backlog item is GPU contention, not a planner bug
+
+Pre-rerun reports had 7b peaking at 4 awake replicas on t1/t7 with "5 physically feasible".
+This rerun resolves it. On t7 7b in fact reached 5 awake (target 6) while llama stayed at 1.
+On t1, llama legitimately woke `dsllama-8b-...-node10-gpu-0` at 10:19:11Z — before any of
+7b's three wakes (10:21:03Z+) — after which all 8 GPUs were occupied (7b x4, llama x2,
+14b x1 on 2 GPUs). A 5th 7b replica was physically infeasible for the rest of the run; the
+rescue loop kept proposing `delta=1` for 7b (53 proposed vs 6 actual actions) and each
+proposal correctly failed placement. The old "feasible 5" claim assumed llama pinned at 1,
+which the demand-shift trace violates. Remaining open question (policy, not bug): whether
+rescue should become donor-aware under full-GPU pressure and preempt a lower-utility replica;
+that is a post-campaign design decision, out of scope for the frozen runtime.
