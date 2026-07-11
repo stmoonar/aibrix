@@ -1,0 +1,29 @@
+{
+  "arm": "queue_len",
+  "command": [
+    "/usr/bin/python3",
+    "-m",
+    "tre_replayer.run_trace",
+    "--trace",
+    "/data/nfs_shared_data/xxy/aibrix/tre/replayer/traces_v2/t5_a5_tp_pressure/trace.json",
+    "--gateway-url",
+    "http://192.168.223.76:31094/v1/completions",
+    "--out",
+    "/data/nfs_shared_data/xxy/aibrix/tre/docs/refactor/p11_evidence/ablation_e2_20260715/t5_queue_len_seed1/requests.jsonl",
+    "--registry",
+    "/data/nfs_shared_data/xxy/aibrix/tre/deploy/registry.yaml",
+    "--seed",
+    "20260715",
+    "--max-in-flight",
+    "512",
+    "--trim-ramp-windows",
+    "1"
+  ],
+  "controller_pod": "tre-v2-controller-5894d654b9-x4jtj",
+  "gateway": "http://192.168.223.76:31094/v1/completions",
+  "operator": "root via Codex",
+  "run_id": "t5_queue_len_seed1",
+  "seed": 20260715,
+  "trace": "replayer/traces_v2/t5_a5_tp_pressure/trace.json",
+  "trace_sha256": "807c6f811126c19ac6f07f165781df95a525df65f8902294b2a7451ad3acdc2b"
+}

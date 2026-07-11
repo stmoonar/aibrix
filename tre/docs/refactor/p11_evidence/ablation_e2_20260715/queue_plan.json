@@ -1,0 +1,61 @@
+{
+  "execute": true,
+  "frozen_sha": "ca61e485d229ecfa9aff209d7f29d24baf2db18f",
+  "manifest": "/data/nfs_shared_data/xxy/aibrix/tre/deploy/campaigns/ablation_e2.json",
+  "selected_runs": [
+    {
+      "arm": "zm",
+      "run_id": "t2_zm_seed1",
+      "seed": 20260715,
+      "trace": "replayer/traces_v2/t2_a2_anticorrelated/trace.json"
+    },
+    {
+      "arm": "queue_len",
+      "run_id": "t2_queue_len_seed1",
+      "seed": 20260715,
+      "trace": "replayer/traces_v2/t2_a2_anticorrelated/trace.json"
+    },
+    {
+      "arm": "decode_tps",
+      "run_id": "t2_decode_tps_seed1",
+      "seed": 20260715,
+      "trace": "replayer/traces_v2/t2_a2_anticorrelated/trace.json"
+    },
+    {
+      "arm": "zm",
+      "run_id": "t4_zm_seed1",
+      "seed": 20260715,
+      "trace": "replayer/traces_v2/t4_a4_spike_vs_burst/trace.json"
+    },
+    {
+      "arm": "queue_len",
+      "run_id": "t4_queue_len_seed1",
+      "seed": 20260715,
+      "trace": "replayer/traces_v2/t4_a4_spike_vs_burst/trace.json"
+    },
+    {
+      "arm": "decode_tps",
+      "run_id": "t4_decode_tps_seed1",
+      "seed": 20260715,
+      "trace": "replayer/traces_v2/t4_a4_spike_vs_burst/trace.json"
+    },
+    {
+      "arm": "zm",
+      "run_id": "t5_zm_seed1",
+      "seed": 20260715,
+      "trace": "replayer/traces_v2/t5_a5_tp_pressure/trace.json"
+    },
+    {
+      "arm": "queue_len",
+      "run_id": "t5_queue_len_seed1",
+      "seed": 20260715,
+      "trace": "replayer/traces_v2/t5_a5_tp_pressure/trace.json"
+    },
+    {
+      "arm": "decode_tps",
+      "run_id": "t5_decode_tps_seed1",
+      "seed": 20260715,
+      "trace": "replayer/traces_v2/t5_a5_tp_pressure/trace.json"
+    }
+  ]
+}

@@ -1,0 +1,58 @@
+{
+  "per_model": {
+    "dsllama-8b": {
+      "n_requests": 10752,
+      "n_requests_total": 10777,
+      "n_requests_trimmed": 25,
+      "n_success": 9341,
+      "n_windows_scored": 219,
+      "scoring_start_ms": 1783794987626,
+      "success_rate": 0.8687686011904762,
+      "trim_ramp_windows": 1,
+      "violation_request_frac": 0.44168526785714285,
+      "violation_time_frac": 0.5981735159817352
+    },
+    "dsqwen-14b": {
+      "n_requests": 6657,
+      "n_requests_total": 6677,
+      "n_requests_trimmed": 20,
+      "n_success": 6657,
+      "n_windows_scored": 218,
+      "scoring_start_ms": 1783794987626,
+      "success_rate": 1.0,
+      "trim_ramp_windows": 1,
+      "violation_request_frac": 0.0,
+      "violation_time_frac": 0.0
+    },
+    "dsqwen-7b": {
+      "n_requests": 15992,
+      "n_requests_total": 16021,
+      "n_requests_trimmed": 29,
+      "n_success": 15574,
+      "n_windows_scored": 218,
+      "scoring_start_ms": 1783794987626,
+      "success_rate": 0.9738619309654828,
+      "trim_ramp_windows": 1,
+      "violation_request_frac": 0.10536518259129565,
+      "violation_time_frac": 0.23853211009174313
+    }
+  },
+  "scoring": {
+    "min_samples": 5,
+    "step_ms": 5000,
+    "trace_start_ms": 1783794982626,
+    "trim_ramp_windows": 1,
+    "trim_scope": "trace_start_only",
+    "window_ms": 30000
+  },
+  "source": "/data/nfs_shared_data/xxy/aibrix/tre/docs/refactor/p11_evidence/ablation_e2_20260715/t2_decode_tps_seed1/requests.jsonl",
+  "system": {
+    "n_requests": 33401,
+    "n_requests_total": 33475,
+    "n_requests_trimmed": 74,
+    "n_success": 31572,
+    "success_rate": 0.9452411604442981,
+    "violation_request_frac": 0.19262896320469447,
+    "violation_time_frac": 0.3067622870100528
+  }
+}

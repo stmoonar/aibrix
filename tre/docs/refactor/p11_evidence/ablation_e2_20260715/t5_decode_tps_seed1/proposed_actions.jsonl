@@ -1,0 +1,1 @@
+{"delta":1,"donor":null,"kind":"scale","loop":"fairness","model":"dsqwen-14b","reason":"low_fairness_sleeping_capacity","receiver":"dsqwen-14b","requires_safescale":false,"source_loop":"fairness","ts_ms":1783804805640}

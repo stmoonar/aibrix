@@ -1,0 +1,1719 @@
+{
+  "apiVersion": "v1",
+  "items": [
+    {
+      "action": "Binding",
+      "apiVersion": "v1",
+      "eventTime": "2026-07-11T20:49:13.831860Z",
+      "firstTimestamp": null,
+      "involvedObject": {
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "name": "tre-v2-controller-5894d654b9-x4jtj",
+        "namespace": "tre-v2",
+        "resourceVersion": "195240575",
+        "uid": "fb53883b-52c3-4e12-9aff-965bd1f95f92"
+      },
+      "kind": "Event",
+      "lastTimestamp": null,
+      "message": "Successfully assigned tre-v2/tre-v2-controller-5894d654b9-x4jtj to nscc-ds-4a100-node10",
+      "metadata": {
+        "creationTimestamp": "2026-07-11T20:49:13Z",
+        "name": "tre-v2-controller-5894d654b9-x4jtj.18c15755e470e2b7",
+        "namespace": "tre-v2",
+        "resourceVersion": "195240580",
+        "uid": "f154237e-ee5b-46de-bc34-62637c3d15bb"
+      },
+      "reason": "Scheduled",
+      "reportingComponent": "default-scheduler",
+      "reportingInstance": "default-scheduler-nscc-ds-4a100-node10",
+      "source": {},
+      "type": "Normal"
+    },
+    {
+      "apiVersion": "v1",
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-07-11T20:49:14Z",
+      "involvedObject": {
+        "apiVersion": "v1",
+        "fieldPath": "spec.containers{controller}",
+        "kind": "Pod",
+        "name": "tre-v2-controller-5894d654b9-x4jtj",
+        "namespace": "tre-v2",
+        "resourceVersion": "195240578",
+        "uid": "fb53883b-52c3-4e12-9aff-965bd1f95f92"
+      },
+      "kind": "Event",
+      "lastTimestamp": "2026-07-11T20:49:14Z",
+      "message": "Container image \"tre-v2-controller:20260710-ca61e485\" already present on machine",
+      "metadata": {
+        "creationTimestamp": "2026-07-11T20:49:14Z",
+        "name": "tre-v2-controller-5894d654b9-x4jtj.18c1575612f55f9e",
+        "namespace": "tre-v2",
+        "resourceVersion": "195240587",
+        "uid": "2249a071-4ef7-4cfe-af29-d17af5f41935"
+      },
+      "reason": "Pulled",
+      "reportingComponent": "kubelet",
+      "reportingInstance": "nscc-ds-4a100-node10",
+      "source": {
+        "component": "kubelet",
+        "host": "nscc-ds-4a100-node10"
+      },
+      "type": "Normal"
+    },
+    {
+      "apiVersion": "v1",
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-07-11T20:49:14Z",
+      "involvedObject": {
+        "apiVersion": "v1",
+        "fieldPath": "spec.containers{controller}",
+        "kind": "Pod",
+        "name": "tre-v2-controller-5894d654b9-x4jtj",
+        "namespace": "tre-v2",
+        "resourceVersion": "195240578",
+        "uid": "fb53883b-52c3-4e12-9aff-965bd1f95f92"
+      },
+      "kind": "Event",
+      "lastTimestamp": "2026-07-11T20:49:14Z",
+      "message": "Created container controller",
+      "metadata": {
+        "creationTimestamp": "2026-07-11T20:49:14Z",
+        "name": "tre-v2-controller-5894d654b9-x4jtj.18c15756196a471e",
+        "namespace": "tre-v2",
+        "resourceVersion": "195240590",
+        "uid": "9d007f54-e40c-4919-96fe-72da56924318"
+      },
+      "reason": "Created",
+      "reportingComponent": "kubelet",
+      "reportingInstance": "nscc-ds-4a100-node10",
+      "source": {
+        "component": "kubelet",
+        "host": "nscc-ds-4a100-node10"
+      },
+      "type": "Normal"
+    },
+    {
+      "apiVersion": "v1",
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-07-11T20:49:14Z",
+      "involvedObject": {
+        "apiVersion": "v1",
+        "fieldPath": "spec.containers{controller}",
+        "kind": "Pod",
+        "name": "tre-v2-controller-5894d654b9-x4jtj",
+        "namespace": "tre-v2",
+        "resourceVersion": "195240578",
+        "uid": "fb53883b-52c3-4e12-9aff-965bd1f95f92"
+      },
+      "kind": "Event",
+      "lastTimestamp": "2026-07-11T20:49:14Z",
+      "message": "Started container controller",
+      "metadata": {
+        "creationTimestamp": "2026-07-11T20:49:14Z",
+        "name": "tre-v2-controller-5894d654b9-x4jtj.18c1575626300ec8",
+        "namespace": "tre-v2",
+        "resourceVersion": "195240592",
+        "uid": "8aee3a06-6141-4d51-bcbe-02a405b94b3c"
+      },
+      "reason": "Started",
+      "reportingComponent": "kubelet",
+      "reportingInstance": "nscc-ds-4a100-node10",
+      "source": {
+        "component": "kubelet",
+        "host": "nscc-ds-4a100-node10"
+      },
+      "type": "Normal"
+    },
+    {
+      "apiVersion": "v1",
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-07-11T21:04:55Z",
+      "involvedObject": {
+        "apiVersion": "v1",
+        "fieldPath": "spec.containers{controller}",
+        "kind": "Pod",
+        "name": "tre-v2-controller-5894d654b9-x4jtj",
+        "namespace": "tre-v2",
+        "resourceVersion": "195240578",
+        "uid": "fb53883b-52c3-4e12-9aff-965bd1f95f92"
+      },
+      "kind": "Event",
+      "lastTimestamp": "2026-07-11T21:04:55Z",
+      "message": "Stopping container controller",
+      "metadata": {
+        "creationTimestamp": "2026-07-11T21:04:55Z",
+        "name": "tre-v2-controller-5894d654b9-x4jtj.18c158311f51c92a",
+        "namespace": "tre-v2",
+        "resourceVersion": "195244353",
+        "uid": "6a0e62e1-1661-4644-a7ff-0093471ab9ca"
+      },
+      "reason": "Killing",
+      "reportingComponent": "kubelet",
+      "reportingInstance": "nscc-ds-4a100-node10",
+      "source": {
+        "component": "kubelet",
+        "host": "nscc-ds-4a100-node10"
+      },
+      "type": "Normal"
+    },
+    {
+      "apiVersion": "v1",
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-07-11T20:49:13Z",
+      "involvedObject": {
+        "apiVersion": "apps/v1",
+        "kind": "ReplicaSet",
+        "name": "tre-v2-controller-5894d654b9",
+        "namespace": "tre-v2",
+        "resourceVersion": "195240573",
+        "uid": "a92570bc-6e30-406e-981e-d34d675e78a8"
+      },
+      "kind": "Event",
+      "lastTimestamp": "2026-07-11T20:49:13Z",
+      "message": "Created pod: tre-v2-controller-5894d654b9-x4jtj",
+      "metadata": {
+        "creationTimestamp": "2026-07-11T20:49:13Z",
+        "name": "tre-v2-controller-5894d654b9.18c15755e40f9417",
+        "namespace": "tre-v2",
+        "resourceVersion": "195240577",
+        "uid": "f72d5654-0be5-4e00-8cb1-ecd72aa77c22"
+      },
+      "reason": "SuccessfulCreate",
+      "reportingComponent": "replicaset-controller",
+      "reportingInstance": "",
+      "source": {
+        "component": "replicaset-controller"
+      },
+      "type": "Normal"
+    },
+    {
+      "apiVersion": "v1",
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-07-11T21:04:55Z",
+      "involvedObject": {
+        "apiVersion": "apps/v1",
+        "kind": "ReplicaSet",
+        "name": "tre-v2-controller-5894d654b9",
+        "namespace": "tre-v2",
+        "resourceVersion": "195244348",
+        "uid": "a92570bc-6e30-406e-981e-d34d675e78a8"
+      },
+      "kind": "Event",
+      "lastTimestamp": "2026-07-11T21:04:55Z",
+      "message": "Deleted pod: tre-v2-controller-5894d654b9-x4jtj",
+      "metadata": {
+        "creationTimestamp": "2026-07-11T21:04:55Z",
+        "name": "tre-v2-controller-5894d654b9.18c158311f3ae22e",
+        "namespace": "tre-v2",
+        "resourceVersion": "195244352",
+        "uid": "b12cf975-4097-42ed-ac06-d7fe55a95bc8"
+      },
+      "reason": "SuccessfulDelete",
+      "reportingComponent": "replicaset-controller",
+      "reportingInstance": "",
+      "source": {
+        "component": "replicaset-controller"
+      },
+      "type": "Normal"
+    },
+    {
+      "action": "Binding",
+      "apiVersion": "v1",
+      "eventTime": "2026-07-11T21:16:40.814444Z",
+      "firstTimestamp": null,
+      "involvedObject": {
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "name": "tre-v2-controller-5c5574d4f7-nvkmv",
+        "namespace": "tre-v2",
+        "resourceVersion": "195247248",
+        "uid": "ef0b10bb-c49b-4dfd-a97a-3372007b5fc6"
+      },
+      "kind": "Event",
+      "lastTimestamp": null,
+      "message": "Successfully assigned tre-v2/tre-v2-controller-5c5574d4f7-nvkmv to nscc-ds-4a100-node10",
+      "metadata": {
+        "creationTimestamp": "2026-07-11T21:16:40Z",
+        "name": "tre-v2-controller-5c5574d4f7-nvkmv.18c158d55c40b7df",
+        "namespace": "tre-v2",
+        "resourceVersion": "195247252",
+        "uid": "e4a5e391-8621-4ae6-96bd-951ec940b3e6"
+      },
+      "reason": "Scheduled",
+      "reportingComponent": "default-scheduler",
+      "reportingInstance": "default-scheduler-nscc-ds-4a100-node10",
+      "source": {},
+      "type": "Normal"
+    },
+    {
+      "apiVersion": "v1",
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-07-11T21:16:41Z",
+      "involvedObject": {
+        "apiVersion": "v1",
+        "fieldPath": "spec.containers{controller}",
+        "kind": "Pod",
+        "name": "tre-v2-controller-5c5574d4f7-nvkmv",
+        "namespace": "tre-v2",
+        "resourceVersion": "195247250",
+        "uid": "ef0b10bb-c49b-4dfd-a97a-3372007b5fc6"
+      },
+      "kind": "Event",
+      "lastTimestamp": "2026-07-11T21:16:41Z",
+      "message": "Container image \"tre-v2-controller:20260710-ca61e485\" already present on machine",
+      "metadata": {
+        "creationTimestamp": "2026-07-11T21:16:41Z",
+        "name": "tre-v2-controller-5c5574d4f7-nvkmv.18c158d58aac4ae5",
+        "namespace": "tre-v2",
+        "resourceVersion": "195247261",
+        "uid": "dda81d53-3cb0-459e-9d80-09fdde7b89b4"
+      },
+      "reason": "Pulled",
+      "reportingComponent": "kubelet",
+      "reportingInstance": "nscc-ds-4a100-node10",
+      "source": {
+        "component": "kubelet",
+        "host": "nscc-ds-4a100-node10"
+      },
+      "type": "Normal"
+    },
+    {
+      "apiVersion": "v1",
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-07-11T21:16:41Z",
+      "involvedObject": {
+        "apiVersion": "v1",
+        "fieldPath": "spec.containers{controller}",
+        "kind": "Pod",
+        "name": "tre-v2-controller-5c5574d4f7-nvkmv",
+        "namespace": "tre-v2",
+        "resourceVersion": "195247250",
+        "uid": "ef0b10bb-c49b-4dfd-a97a-3372007b5fc6"
+      },
+      "kind": "Event",
+      "lastTimestamp": "2026-07-11T21:16:41Z",
+      "message": "Created container controller",
+      "metadata": {
+        "creationTimestamp": "2026-07-11T21:16:41Z",
+        "name": "tre-v2-controller-5c5574d4f7-nvkmv.18c158d58d54fbf6",
+        "namespace": "tre-v2",
+        "resourceVersion": "195247262",
+        "uid": "1d7619af-48c8-4ac0-97d1-4b99a9bf20aa"
+      },
+      "reason": "Created",
+      "reportingComponent": "kubelet",
+      "reportingInstance": "nscc-ds-4a100-node10",
+      "source": {
+        "component": "kubelet",
+        "host": "nscc-ds-4a100-node10"
+      },
+      "type": "Normal"
+    },
+    {
+      "apiVersion": "v1",
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-07-11T21:16:41Z",
+      "involvedObject": {
+        "apiVersion": "v1",
+        "fieldPath": "spec.containers{controller}",
+        "kind": "Pod",
+        "name": "tre-v2-controller-5c5574d4f7-nvkmv",
+        "namespace": "tre-v2",
+        "resourceVersion": "195247250",
+        "uid": "ef0b10bb-c49b-4dfd-a97a-3372007b5fc6"
+      },
+      "kind": "Event",
+      "lastTimestamp": "2026-07-11T21:16:41Z",
+      "message": "Started container controller",
+      "metadata": {
+        "creationTimestamp": "2026-07-11T21:16:41Z",
+        "name": "tre-v2-controller-5c5574d4f7-nvkmv.18c158d598b934d6",
+        "namespace": "tre-v2",
+        "resourceVersion": "195247263",
+        "uid": "afaaafbc-b24d-4c4e-aa2c-5bfcd98a0644"
+      },
+      "reason": "Started",
+      "reportingComponent": "kubelet",
+      "reportingInstance": "nscc-ds-4a100-node10",
+      "source": {
+        "component": "kubelet",
+        "host": "nscc-ds-4a100-node10"
+      },
+      "type": "Normal"
+    },
+    {
+      "apiVersion": "v1",
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-07-11T21:16:40Z",
+      "involvedObject": {
+        "apiVersion": "apps/v1",
+        "kind": "ReplicaSet",
+        "name": "tre-v2-controller-5c5574d4f7",
+        "namespace": "tre-v2",
+        "resourceVersion": "195247245",
+        "uid": "c97f3967-2136-4362-92cd-24ad657b3ff6"
+      },
+      "kind": "Event",
+      "lastTimestamp": "2026-07-11T21:16:40Z",
+      "message": "Created pod: tre-v2-controller-5c5574d4f7-nvkmv",
+      "metadata": {
+        "creationTimestamp": "2026-07-11T21:16:40Z",
+        "name": "tre-v2-controller-5c5574d4f7.18c158d55c011cd4",
+        "namespace": "tre-v2",
+        "resourceVersion": "195247249",
+        "uid": "67a63d1f-e8b0-4c9a-a98f-f51e16198feb"
+      },
+      "reason": "SuccessfulCreate",
+      "reportingComponent": "replicaset-controller",
+      "reportingInstance": "",
+      "source": {
+        "component": "replicaset-controller"
+      },
+      "type": "Normal"
+    },
+    {
+      "action": "Binding",
+      "apiVersion": "v1",
+      "eventTime": "2026-07-11T20:37:58.776303Z",
+      "firstTimestamp": null,
+      "involvedObject": {
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "name": "tre-v2-controller-5c98fbf474-8cmt9",
+        "namespace": "tre-v2",
+        "resourceVersion": "195237814",
+        "uid": "575bbac5-3c24-4913-a0c3-d5cbca81b518"
+      },
+      "kind": "Event",
+      "lastTimestamp": null,
+      "message": "Successfully assigned tre-v2/tre-v2-controller-5c98fbf474-8cmt9 to nscc-ds-4a100-node10",
+      "metadata": {
+        "creationTimestamp": "2026-07-11T20:37:58Z",
+        "name": "tre-v2-controller-5c98fbf474-8cmt9.18c156b8b7fe8767",
+        "namespace": "tre-v2",
+        "resourceVersion": "195237819",
+        "uid": "092fe968-b170-4383-8c2c-dd4f9b8750f2"
+      },
+      "reason": "Scheduled",
+      "reportingComponent": "default-scheduler",
+      "reportingInstance": "default-scheduler-nscc-ds-4a100-node10",
+      "source": {},
+      "type": "Normal"
+    },
+    {
+      "apiVersion": "v1",
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-07-11T20:37:59Z",
+      "involvedObject": {
+        "apiVersion": "v1",
+        "fieldPath": "spec.containers{controller}",
+        "kind": "Pod",
+        "name": "tre-v2-controller-5c98fbf474-8cmt9",
+        "namespace": "tre-v2",
+        "resourceVersion": "195237816",
+        "uid": "575bbac5-3c24-4913-a0c3-d5cbca81b518"
+      },
+      "kind": "Event",
+      "lastTimestamp": "2026-07-11T20:37:59Z",
+      "message": "Container image \"tre-v2-controller:20260710-ca61e485\" already present on machine",
+      "metadata": {
+        "creationTimestamp": "2026-07-11T20:37:59Z",
+        "name": "tre-v2-controller-5c98fbf474-8cmt9.18c156b8e48247ea",
+        "namespace": "tre-v2",
+        "resourceVersion": "195237831",
+        "uid": "afb78848-c2bf-4d6f-abb1-62056e531feb"
+      },
+      "reason": "Pulled",
+      "reportingComponent": "kubelet",
+      "reportingInstance": "nscc-ds-4a100-node10",
+      "source": {
+        "component": "kubelet",
+        "host": "nscc-ds-4a100-node10"
+      },
+      "type": "Normal"
+    },
+    {
+      "apiVersion": "v1",
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-07-11T20:37:59Z",
+      "involvedObject": {
+        "apiVersion": "v1",
+        "fieldPath": "spec.containers{controller}",
+        "kind": "Pod",
+        "name": "tre-v2-controller-5c98fbf474-8cmt9",
+        "namespace": "tre-v2",
+        "resourceVersion": "195237816",
+        "uid": "575bbac5-3c24-4913-a0c3-d5cbca81b518"
+      },
+      "kind": "Event",
+      "lastTimestamp": "2026-07-11T20:37:59Z",
+      "message": "Created container controller",
+      "metadata": {
+        "creationTimestamp": "2026-07-11T20:37:59Z",
+        "name": "tre-v2-controller-5c98fbf474-8cmt9.18c156b8e7278d0d",
+        "namespace": "tre-v2",
+        "resourceVersion": "195237832",
+        "uid": "46cb957a-658a-48b1-9ee4-c1a7bb46446f"
+      },
+      "reason": "Created",
+      "reportingComponent": "kubelet",
+      "reportingInstance": "nscc-ds-4a100-node10",
+      "source": {
+        "component": "kubelet",
+        "host": "nscc-ds-4a100-node10"
+      },
+      "type": "Normal"
+    },
+    {
+      "apiVersion": "v1",
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-07-11T20:37:59Z",
+      "involvedObject": {
+        "apiVersion": "v1",
+        "fieldPath": "spec.containers{controller}",
+        "kind": "Pod",
+        "name": "tre-v2-controller-5c98fbf474-8cmt9",
+        "namespace": "tre-v2",
+        "resourceVersion": "195237816",
+        "uid": "575bbac5-3c24-4913-a0c3-d5cbca81b518"
+      },
+      "kind": "Event",
+      "lastTimestamp": "2026-07-11T20:37:59Z",
+      "message": "Started container controller",
+      "metadata": {
+        "creationTimestamp": "2026-07-11T20:37:59Z",
+        "name": "tre-v2-controller-5c98fbf474-8cmt9.18c156b8f3146ed5",
+        "namespace": "tre-v2",
+        "resourceVersion": "195237833",
+        "uid": "8573d5b8-136a-4202-968e-f20028a5a707"
+      },
+      "reason": "Started",
+      "reportingComponent": "kubelet",
+      "reportingInstance": "nscc-ds-4a100-node10",
+      "source": {
+        "component": "kubelet",
+        "host": "nscc-ds-4a100-node10"
+      },
+      "type": "Normal"
+    },
+    {
+      "apiVersion": "v1",
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-07-11T20:48:08Z",
+      "involvedObject": {
+        "apiVersion": "v1",
+        "fieldPath": "spec.containers{controller}",
+        "kind": "Pod",
+        "name": "tre-v2-controller-5c98fbf474-8cmt9",
+        "namespace": "tre-v2",
+        "resourceVersion": "195237816",
+        "uid": "575bbac5-3c24-4913-a0c3-d5cbca81b518"
+      },
+      "kind": "Event",
+      "lastTimestamp": "2026-07-11T20:48:08Z",
+      "message": "Stopping container controller",
+      "metadata": {
+        "creationTimestamp": "2026-07-11T20:48:08Z",
+        "name": "tre-v2-controller-5c98fbf474-8cmt9.18c15746a44ad581",
+        "namespace": "tre-v2",
+        "resourceVersion": "195240274",
+        "uid": "17550f4d-abcf-45c0-baa2-4c8443c06617"
+      },
+      "reason": "Killing",
+      "reportingComponent": "kubelet",
+      "reportingInstance": "nscc-ds-4a100-node10",
+      "source": {
+        "component": "kubelet",
+        "host": "nscc-ds-4a100-node10"
+      },
+      "type": "Normal"
+    },
+    {
+      "apiVersion": "v1",
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-07-11T20:37:58Z",
+      "involvedObject": {
+        "apiVersion": "apps/v1",
+        "kind": "ReplicaSet",
+        "name": "tre-v2-controller-5c98fbf474",
+        "namespace": "tre-v2",
+        "resourceVersion": "195237812",
+        "uid": "543ea09d-6dae-492e-82c5-62279941d967"
+      },
+      "kind": "Event",
+      "lastTimestamp": "2026-07-11T20:37:58Z",
+      "message": "Created pod: tre-v2-controller-5c98fbf474-8cmt9",
+      "metadata": {
+        "creationTimestamp": "2026-07-11T20:37:58Z",
+        "name": "tre-v2-controller-5c98fbf474.18c156b8b7c95122",
+        "namespace": "tre-v2",
+        "resourceVersion": "195237817",
+        "uid": "8bc32439-42c3-4c6a-b9bf-5b0f8f36dfd0"
+      },
+      "reason": "SuccessfulCreate",
+      "reportingComponent": "replicaset-controller",
+      "reportingInstance": "",
+      "source": {
+        "component": "replicaset-controller"
+      },
+      "type": "Normal"
+    },
+    {
+      "apiVersion": "v1",
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-07-11T20:48:08Z",
+      "involvedObject": {
+        "apiVersion": "apps/v1",
+        "kind": "ReplicaSet",
+        "name": "tre-v2-controller-5c98fbf474",
+        "namespace": "tre-v2",
+        "resourceVersion": "195240269",
+        "uid": "543ea09d-6dae-492e-82c5-62279941d967"
+      },
+      "kind": "Event",
+      "lastTimestamp": "2026-07-11T20:48:08Z",
+      "message": "Deleted pod: tre-v2-controller-5c98fbf474-8cmt9",
+      "metadata": {
+        "creationTimestamp": "2026-07-11T20:48:08Z",
+        "name": "tre-v2-controller-5c98fbf474.18c15746a41ba68c",
+        "namespace": "tre-v2",
+        "resourceVersion": "195240272",
+        "uid": "70444647-3526-4c7a-9bc4-ebe06c1f7060"
+      },
+      "reason": "SuccessfulDelete",
+      "reportingComponent": "replicaset-controller",
+      "reportingInstance": "",
+      "source": {
+        "component": "replicaset-controller"
+      },
+      "type": "Normal"
+    },
+    {
+      "action": "Binding",
+      "apiVersion": "v1",
+      "eventTime": "2026-07-11T21:16:05.948326Z",
+      "firstTimestamp": null,
+      "involvedObject": {
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "name": "tre-v2-controller-7667f8d4c-g6snz",
+        "namespace": "tre-v2",
+        "resourceVersion": "195247069",
+        "uid": "f8be0074-5ab9-4d0b-a50f-3e79c8f36d3d"
+      },
+      "kind": "Event",
+      "lastTimestamp": null,
+      "message": "Successfully assigned tre-v2/tre-v2-controller-7667f8d4c-g6snz to nscc-ds-4a100-node10",
+      "metadata": {
+        "creationTimestamp": "2026-07-11T21:16:05Z",
+        "name": "tre-v2-controller-7667f8d4c-g6snz.18c158cd3e120d7d",
+        "namespace": "tre-v2",
+        "resourceVersion": "195247074",
+        "uid": "5e1e30cb-e2fe-44c5-9f0a-d698c952cd42"
+      },
+      "reason": "Scheduled",
+      "reportingComponent": "default-scheduler",
+      "reportingInstance": "default-scheduler-nscc-ds-4a100-node10",
+      "source": {},
+      "type": "Normal"
+    },
+    {
+      "apiVersion": "v1",
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-07-11T21:16:06Z",
+      "involvedObject": {
+        "apiVersion": "v1",
+        "fieldPath": "spec.containers{controller}",
+        "kind": "Pod",
+        "name": "tre-v2-controller-7667f8d4c-g6snz",
+        "namespace": "tre-v2",
+        "resourceVersion": "195247071",
+        "uid": "f8be0074-5ab9-4d0b-a50f-3e79c8f36d3d"
+      },
+      "kind": "Event",
+      "lastTimestamp": "2026-07-11T21:16:06Z",
+      "message": "Container image \"tre-v2-controller:20260710-ca61e485\" already present on machine",
+      "metadata": {
+        "creationTimestamp": "2026-07-11T21:16:06Z",
+        "name": "tre-v2-controller-7667f8d4c-g6snz.18c158cd697b03ff",
+        "namespace": "tre-v2",
+        "resourceVersion": "195247081",
+        "uid": "21ca3672-c90d-46a8-a46f-e967aefb2ed7"
+      },
+      "reason": "Pulled",
+      "reportingComponent": "kubelet",
+      "reportingInstance": "nscc-ds-4a100-node10",
+      "source": {
+        "component": "kubelet",
+        "host": "nscc-ds-4a100-node10"
+      },
+      "type": "Normal"
+    },
+    {
+      "apiVersion": "v1",
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-07-11T21:16:06Z",
+      "involvedObject": {
+        "apiVersion": "v1",
+        "fieldPath": "spec.containers{controller}",
+        "kind": "Pod",
+        "name": "tre-v2-controller-7667f8d4c-g6snz",
+        "namespace": "tre-v2",
+        "resourceVersion": "195247071",
+        "uid": "f8be0074-5ab9-4d0b-a50f-3e79c8f36d3d"
+      },
+      "kind": "Event",
+      "lastTimestamp": "2026-07-11T21:16:06Z",
+      "message": "Created container controller",
+      "metadata": {
+        "creationTimestamp": "2026-07-11T21:16:06Z",
+        "name": "tre-v2-controller-7667f8d4c-g6snz.18c158cd6bf0c26e",
+        "namespace": "tre-v2",
+        "resourceVersion": "195247082",
+        "uid": "cba888af-9bae-48cd-afb9-e9438fbbc64d"
+      },
+      "reason": "Created",
+      "reportingComponent": "kubelet",
+      "reportingInstance": "nscc-ds-4a100-node10",
+      "source": {
+        "component": "kubelet",
+        "host": "nscc-ds-4a100-node10"
+      },
+      "type": "Normal"
+    },
+    {
+      "apiVersion": "v1",
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-07-11T21:16:06Z",
+      "involvedObject": {
+        "apiVersion": "v1",
+        "fieldPath": "spec.containers{controller}",
+        "kind": "Pod",
+        "name": "tre-v2-controller-7667f8d4c-g6snz",
+        "namespace": "tre-v2",
+        "resourceVersion": "195247071",
+        "uid": "f8be0074-5ab9-4d0b-a50f-3e79c8f36d3d"
+      },
+      "kind": "Event",
+      "lastTimestamp": "2026-07-11T21:16:06Z",
+      "message": "Started container controller",
+      "metadata": {
+        "creationTimestamp": "2026-07-11T21:16:06Z",
+        "name": "tre-v2-controller-7667f8d4c-g6snz.18c158cd78f0f160",
+        "namespace": "tre-v2",
+        "resourceVersion": "195247087",
+        "uid": "f19eb6a9-304e-42ec-9098-dc2214100bf8"
+      },
+      "reason": "Started",
+      "reportingComponent": "kubelet",
+      "reportingInstance": "nscc-ds-4a100-node10",
+      "source": {
+        "component": "kubelet",
+        "host": "nscc-ds-4a100-node10"
+      },
+      "type": "Normal"
+    },
+    {
+      "apiVersion": "v1",
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-07-11T21:16:10Z",
+      "involvedObject": {
+        "apiVersion": "v1",
+        "fieldPath": "spec.containers{controller}",
+        "kind": "Pod",
+        "name": "tre-v2-controller-7667f8d4c-g6snz",
+        "namespace": "tre-v2",
+        "resourceVersion": "195247071",
+        "uid": "f8be0074-5ab9-4d0b-a50f-3e79c8f36d3d"
+      },
+      "kind": "Event",
+      "lastTimestamp": "2026-07-11T21:16:10Z",
+      "message": "Stopping container controller",
+      "metadata": {
+        "creationTimestamp": "2026-07-11T21:16:10Z",
+        "name": "tre-v2-controller-7667f8d4c-g6snz.18c158ce31895b14",
+        "namespace": "tre-v2",
+        "resourceVersion": "195247116",
+        "uid": "0a793db1-7217-4cd8-8861-b81fc989a215"
+      },
+      "reason": "Killing",
+      "reportingComponent": "kubelet",
+      "reportingInstance": "nscc-ds-4a100-node10",
+      "source": {
+        "component": "kubelet",
+        "host": "nscc-ds-4a100-node10"
+      },
+      "type": "Normal"
+    },
+    {
+      "apiVersion": "v1",
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-07-11T21:16:05Z",
+      "involvedObject": {
+        "apiVersion": "apps/v1",
+        "kind": "ReplicaSet",
+        "name": "tre-v2-controller-7667f8d4c",
+        "namespace": "tre-v2",
+        "resourceVersion": "195247067",
+        "uid": "be3fd239-8ded-4334-a8e5-c948b9f336c6"
+      },
+      "kind": "Event",
+      "lastTimestamp": "2026-07-11T21:16:05Z",
+      "message": "Created pod: tre-v2-controller-7667f8d4c-g6snz",
+      "metadata": {
+        "creationTimestamp": "2026-07-11T21:16:05Z",
+        "name": "tre-v2-controller-7667f8d4c.18c158cd3dccef8a",
+        "namespace": "tre-v2",
+        "resourceVersion": "195247072",
+        "uid": "699368bd-e02a-4571-86c4-f30426fd3b24"
+      },
+      "reason": "SuccessfulCreate",
+      "reportingComponent": "replicaset-controller",
+      "reportingInstance": "",
+      "source": {
+        "component": "replicaset-controller"
+      },
+      "type": "Normal"
+    },
+    {
+      "apiVersion": "v1",
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-07-11T21:16:08Z",
+      "involvedObject": {
+        "apiVersion": "apps/v1",
+        "kind": "ReplicaSet",
+        "name": "tre-v2-controller-7667f8d4c",
+        "namespace": "tre-v2",
+        "resourceVersion": "195247097",
+        "uid": "be3fd239-8ded-4334-a8e5-c948b9f336c6"
+      },
+      "kind": "Event",
+      "lastTimestamp": "2026-07-11T21:16:08Z",
+      "message": "Deleted pod: tre-v2-controller-7667f8d4c-g6snz",
+      "metadata": {
+        "creationTimestamp": "2026-07-11T21:16:08Z",
+        "name": "tre-v2-controller-7667f8d4c.18c158cdcb3eed76",
+        "namespace": "tre-v2",
+        "resourceVersion": "195247100",
+        "uid": "34b4d942-9c60-4985-b048-710160cb2566"
+      },
+      "reason": "SuccessfulDelete",
+      "reportingComponent": "replicaset-controller",
+      "reportingInstance": "",
+      "source": {
+        "component": "replicaset-controller"
+      },
+      "type": "Normal"
+    },
+    {
+      "action": "Binding",
+      "apiVersion": "v1",
+      "eventTime": "2026-07-11T20:48:38.873020Z",
+      "firstTimestamp": null,
+      "involvedObject": {
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "name": "tre-v2-controller-7c4ff4dbdc-spfjw",
+        "namespace": "tre-v2",
+        "resourceVersion": "195240404",
+        "uid": "8358f31f-0047-4c59-88b5-a901e3738771"
+      },
+      "kind": "Event",
+      "lastTimestamp": null,
+      "message": "Successfully assigned tre-v2/tre-v2-controller-7c4ff4dbdc-spfjw to nscc-ds-4a100-node10",
+      "metadata": {
+        "creationTimestamp": "2026-07-11T20:48:38Z",
+        "name": "tre-v2-controller-7c4ff4dbdc-spfjw.18c1574dc0bb6079",
+        "namespace": "tre-v2",
+        "resourceVersion": "195240408",
+        "uid": "30cdd08a-9f11-4f37-89a4-31d2ad6aa52e"
+      },
+      "reason": "Scheduled",
+      "reportingComponent": "default-scheduler",
+      "reportingInstance": "default-scheduler-nscc-ds-4a100-node10",
+      "source": {},
+      "type": "Normal"
+    },
+    {
+      "apiVersion": "v1",
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-07-11T20:48:39Z",
+      "involvedObject": {
+        "apiVersion": "v1",
+        "fieldPath": "spec.containers{controller}",
+        "kind": "Pod",
+        "name": "tre-v2-controller-7c4ff4dbdc-spfjw",
+        "namespace": "tre-v2",
+        "resourceVersion": "195240405",
+        "uid": "8358f31f-0047-4c59-88b5-a901e3738771"
+      },
+      "kind": "Event",
+      "lastTimestamp": "2026-07-11T20:48:39Z",
+      "message": "Container image \"tre-v2-controller:20260710-ca61e485\" already present on machine",
+      "metadata": {
+        "creationTimestamp": "2026-07-11T20:48:39Z",
+        "name": "tre-v2-controller-7c4ff4dbdc-spfjw.18c1574def2180aa",
+        "namespace": "tre-v2",
+        "resourceVersion": "195240414",
+        "uid": "cde29528-687e-45b6-9cc8-b910da708c10"
+      },
+      "reason": "Pulled",
+      "reportingComponent": "kubelet",
+      "reportingInstance": "nscc-ds-4a100-node10",
+      "source": {
+        "component": "kubelet",
+        "host": "nscc-ds-4a100-node10"
+      },
+      "type": "Normal"
+    },
+    {
+      "apiVersion": "v1",
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-07-11T20:48:39Z",
+      "involvedObject": {
+        "apiVersion": "v1",
+        "fieldPath": "spec.containers{controller}",
+        "kind": "Pod",
+        "name": "tre-v2-controller-7c4ff4dbdc-spfjw",
+        "namespace": "tre-v2",
+        "resourceVersion": "195240405",
+        "uid": "8358f31f-0047-4c59-88b5-a901e3738771"
+      },
+      "kind": "Event",
+      "lastTimestamp": "2026-07-11T20:48:39Z",
+      "message": "Created container controller",
+      "metadata": {
+        "creationTimestamp": "2026-07-11T20:48:39Z",
+        "name": "tre-v2-controller-7c4ff4dbdc-spfjw.18c1574df1b38cbb",
+        "namespace": "tre-v2",
+        "resourceVersion": "195240415",
+        "uid": "3f5f0ef6-3e5a-4905-b868-8907e911b836"
+      },
+      "reason": "Created",
+      "reportingComponent": "kubelet",
+      "reportingInstance": "nscc-ds-4a100-node10",
+      "source": {
+        "component": "kubelet",
+        "host": "nscc-ds-4a100-node10"
+      },
+      "type": "Normal"
+    },
+    {
+      "apiVersion": "v1",
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-07-11T20:48:39Z",
+      "involvedObject": {
+        "apiVersion": "v1",
+        "fieldPath": "spec.containers{controller}",
+        "kind": "Pod",
+        "name": "tre-v2-controller-7c4ff4dbdc-spfjw",
+        "namespace": "tre-v2",
+        "resourceVersion": "195240405",
+        "uid": "8358f31f-0047-4c59-88b5-a901e3738771"
+      },
+      "kind": "Event",
+      "lastTimestamp": "2026-07-11T20:48:39Z",
+      "message": "Started container controller",
+      "metadata": {
+        "creationTimestamp": "2026-07-11T20:48:39Z",
+        "name": "tre-v2-controller-7c4ff4dbdc-spfjw.18c1574dfdf00bd8",
+        "namespace": "tre-v2",
+        "resourceVersion": "195240421",
+        "uid": "fee93266-6ce1-4e7b-908f-dbbd3d4e8011"
+      },
+      "reason": "Started",
+      "reportingComponent": "kubelet",
+      "reportingInstance": "nscc-ds-4a100-node10",
+      "source": {
+        "component": "kubelet",
+        "host": "nscc-ds-4a100-node10"
+      },
+      "type": "Normal"
+    },
+    {
+      "apiVersion": "v1",
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-07-11T20:48:43Z",
+      "involvedObject": {
+        "apiVersion": "v1",
+        "fieldPath": "spec.containers{controller}",
+        "kind": "Pod",
+        "name": "tre-v2-controller-7c4ff4dbdc-spfjw",
+        "namespace": "tre-v2",
+        "resourceVersion": "195240405",
+        "uid": "8358f31f-0047-4c59-88b5-a901e3738771"
+      },
+      "kind": "Event",
+      "lastTimestamp": "2026-07-11T20:48:43Z",
+      "message": "Stopping container controller",
+      "metadata": {
+        "creationTimestamp": "2026-07-11T20:48:43Z",
+        "name": "tre-v2-controller-7c4ff4dbdc-spfjw.18c1574eb6f29c3f",
+        "namespace": "tre-v2",
+        "resourceVersion": "195240448",
+        "uid": "4534fe88-fb61-4efa-8df1-d54033241bde"
+      },
+      "reason": "Killing",
+      "reportingComponent": "kubelet",
+      "reportingInstance": "nscc-ds-4a100-node10",
+      "source": {
+        "component": "kubelet",
+        "host": "nscc-ds-4a100-node10"
+      },
+      "type": "Normal"
+    },
+    {
+      "apiVersion": "v1",
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-07-11T20:48:38Z",
+      "involvedObject": {
+        "apiVersion": "apps/v1",
+        "kind": "ReplicaSet",
+        "name": "tre-v2-controller-7c4ff4dbdc",
+        "namespace": "tre-v2",
+        "resourceVersion": "195240401",
+        "uid": "699fb798-0ae5-4212-94d1-6a948862db60"
+      },
+      "kind": "Event",
+      "lastTimestamp": "2026-07-11T20:48:38Z",
+      "message": "Created pod: tre-v2-controller-7c4ff4dbdc-spfjw",
+      "metadata": {
+        "creationTimestamp": "2026-07-11T20:48:38Z",
+        "name": "tre-v2-controller-7c4ff4dbdc.18c1574dc003d895",
+        "namespace": "tre-v2",
+        "resourceVersion": "195240406",
+        "uid": "76679526-a413-47ec-ba63-2a794931e259"
+      },
+      "reason": "SuccessfulCreate",
+      "reportingComponent": "replicaset-controller",
+      "reportingInstance": "",
+      "source": {
+        "component": "replicaset-controller"
+      },
+      "type": "Normal"
+    },
+    {
+      "apiVersion": "v1",
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-07-11T20:48:41Z",
+      "involvedObject": {
+        "apiVersion": "apps/v1",
+        "kind": "ReplicaSet",
+        "name": "tre-v2-controller-7c4ff4dbdc",
+        "namespace": "tre-v2",
+        "resourceVersion": "195240431",
+        "uid": "699fb798-0ae5-4212-94d1-6a948862db60"
+      },
+      "kind": "Event",
+      "lastTimestamp": "2026-07-11T20:48:41Z",
+      "message": "Deleted pod: tre-v2-controller-7c4ff4dbdc-spfjw",
+      "metadata": {
+        "creationTimestamp": "2026-07-11T20:48:41Z",
+        "name": "tre-v2-controller-7c4ff4dbdc.18c1574e5266b875",
+        "namespace": "tre-v2",
+        "resourceVersion": "195240435",
+        "uid": "c779d0dd-762d-4d76-8bf1-af380308b9bc"
+      },
+      "reason": "SuccessfulDelete",
+      "reportingComponent": "replicaset-controller",
+      "reportingInstance": "",
+      "source": {
+        "component": "replicaset-controller"
+      },
+      "type": "Normal"
+    },
+    {
+      "apiVersion": "v1",
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-07-11T20:37:28Z",
+      "involvedObject": {
+        "apiVersion": "v1",
+        "fieldPath": "spec.containers{controller}",
+        "kind": "Pod",
+        "name": "tre-v2-controller-7dfc7c584-54v6x",
+        "namespace": "tre-v2",
+        "resourceVersion": "195233911",
+        "uid": "e288d619-11f9-4ee1-92f9-921a0d5ef55b"
+      },
+      "kind": "Event",
+      "lastTimestamp": "2026-07-11T20:37:28Z",
+      "message": "Stopping container controller",
+      "metadata": {
+        "creationTimestamp": "2026-07-11T20:37:28Z",
+        "name": "tre-v2-controller-7dfc7c584-54v6x.18c156b196caf567",
+        "namespace": "tre-v2",
+        "resourceVersion": "195237685",
+        "uid": "2b108201-c17d-4c34-b43d-9756d938ba39"
+      },
+      "reason": "Killing",
+      "reportingComponent": "kubelet",
+      "reportingInstance": "nscc-ds-4a100-node10",
+      "source": {
+        "component": "kubelet",
+        "host": "nscc-ds-4a100-node10"
+      },
+      "type": "Normal"
+    },
+    {
+      "apiVersion": "v1",
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-07-11T20:37:28Z",
+      "involvedObject": {
+        "apiVersion": "apps/v1",
+        "kind": "ReplicaSet",
+        "name": "tre-v2-controller-7dfc7c584",
+        "namespace": "tre-v2",
+        "resourceVersion": "195237680",
+        "uid": "fdb43cc3-28ef-4a96-a636-e366771610f4"
+      },
+      "kind": "Event",
+      "lastTimestamp": "2026-07-11T20:37:28Z",
+      "message": "Deleted pod: tre-v2-controller-7dfc7c584-54v6x",
+      "metadata": {
+        "creationTimestamp": "2026-07-11T20:37:28Z",
+        "name": "tre-v2-controller-7dfc7c584.18c156b196aacb9a",
+        "namespace": "tre-v2",
+        "resourceVersion": "195237684",
+        "uid": "ceb869b7-5fb1-4c89-bd29-b022069e0ed0"
+      },
+      "reason": "SuccessfulDelete",
+      "reportingComponent": "replicaset-controller",
+      "reportingInstance": "",
+      "source": {
+        "component": "replicaset-controller"
+      },
+      "type": "Normal"
+    },
+    {
+      "action": "Binding",
+      "apiVersion": "v1",
+      "eventTime": "2026-07-11T21:05:26.045893Z",
+      "firstTimestamp": null,
+      "involvedObject": {
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "name": "tre-v2-controller-86bff5445f-bpvf8",
+        "namespace": "tre-v2",
+        "resourceVersion": "195244485",
+        "uid": "b7c8009a-5bb7-4216-a4d4-845b2efa896b"
+      },
+      "kind": "Event",
+      "lastTimestamp": null,
+      "message": "Successfully assigned tre-v2/tre-v2-controller-86bff5445f-bpvf8 to nscc-ds-4a100-node10",
+      "metadata": {
+        "creationTimestamp": "2026-07-11T21:05:26Z",
+        "name": "tre-v2-controller-86bff5445f-bpvf8.18c1583840e9e89c",
+        "namespace": "tre-v2",
+        "resourceVersion": "195244490",
+        "uid": "3ee26c84-ad57-40cc-9abf-17c215480da0"
+      },
+      "reason": "Scheduled",
+      "reportingComponent": "default-scheduler",
+      "reportingInstance": "default-scheduler-nscc-ds-4a100-node10",
+      "source": {},
+      "type": "Normal"
+    },
+    {
+      "apiVersion": "v1",
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-07-11T21:05:26Z",
+      "involvedObject": {
+        "apiVersion": "v1",
+        "fieldPath": "spec.containers{controller}",
+        "kind": "Pod",
+        "name": "tre-v2-controller-86bff5445f-bpvf8",
+        "namespace": "tre-v2",
+        "resourceVersion": "195244488",
+        "uid": "b7c8009a-5bb7-4216-a4d4-845b2efa896b"
+      },
+      "kind": "Event",
+      "lastTimestamp": "2026-07-11T21:05:26Z",
+      "message": "Container image \"tre-v2-controller:20260710-ca61e485\" already present on machine",
+      "metadata": {
+        "creationTimestamp": "2026-07-11T21:05:26Z",
+        "name": "tre-v2-controller-86bff5445f-bpvf8.18c158386e384510",
+        "namespace": "tre-v2",
+        "resourceVersion": "195244499",
+        "uid": "e3695c8e-474d-4adc-bada-cdf98d96df60"
+      },
+      "reason": "Pulled",
+      "reportingComponent": "kubelet",
+      "reportingInstance": "nscc-ds-4a100-node10",
+      "source": {
+        "component": "kubelet",
+        "host": "nscc-ds-4a100-node10"
+      },
+      "type": "Normal"
+    },
+    {
+      "apiVersion": "v1",
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-07-11T21:05:26Z",
+      "involvedObject": {
+        "apiVersion": "v1",
+        "fieldPath": "spec.containers{controller}",
+        "kind": "Pod",
+        "name": "tre-v2-controller-86bff5445f-bpvf8",
+        "namespace": "tre-v2",
+        "resourceVersion": "195244488",
+        "uid": "b7c8009a-5bb7-4216-a4d4-845b2efa896b"
+      },
+      "kind": "Event",
+      "lastTimestamp": "2026-07-11T21:05:26Z",
+      "message": "Created container controller",
+      "metadata": {
+        "creationTimestamp": "2026-07-11T21:05:26Z",
+        "name": "tre-v2-controller-86bff5445f-bpvf8.18c1583870f37238",
+        "namespace": "tre-v2",
+        "resourceVersion": "195244500",
+        "uid": "3da287f0-811c-42c0-b3b6-dc2a62b74479"
+      },
+      "reason": "Created",
+      "reportingComponent": "kubelet",
+      "reportingInstance": "nscc-ds-4a100-node10",
+      "source": {
+        "component": "kubelet",
+        "host": "nscc-ds-4a100-node10"
+      },
+      "type": "Normal"
+    },
+    {
+      "apiVersion": "v1",
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-07-11T21:05:27Z",
+      "involvedObject": {
+        "apiVersion": "v1",
+        "fieldPath": "spec.containers{controller}",
+        "kind": "Pod",
+        "name": "tre-v2-controller-86bff5445f-bpvf8",
+        "namespace": "tre-v2",
+        "resourceVersion": "195244488",
+        "uid": "b7c8009a-5bb7-4216-a4d4-845b2efa896b"
+      },
+      "kind": "Event",
+      "lastTimestamp": "2026-07-11T21:05:27Z",
+      "message": "Started container controller",
+      "metadata": {
+        "creationTimestamp": "2026-07-11T21:05:27Z",
+        "name": "tre-v2-controller-86bff5445f-bpvf8.18c158387d2de7ac",
+        "namespace": "tre-v2",
+        "resourceVersion": "195244502",
+        "uid": "2fe8a2f5-c9d9-4e75-a9cd-7439df028dd0"
+      },
+      "reason": "Started",
+      "reportingComponent": "kubelet",
+      "reportingInstance": "nscc-ds-4a100-node10",
+      "source": {
+        "component": "kubelet",
+        "host": "nscc-ds-4a100-node10"
+      },
+      "type": "Normal"
+    },
+    {
+      "apiVersion": "v1",
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-07-11T21:15:35Z",
+      "involvedObject": {
+        "apiVersion": "v1",
+        "fieldPath": "spec.containers{controller}",
+        "kind": "Pod",
+        "name": "tre-v2-controller-86bff5445f-bpvf8",
+        "namespace": "tre-v2",
+        "resourceVersion": "195244488",
+        "uid": "b7c8009a-5bb7-4216-a4d4-845b2efa896b"
+      },
+      "kind": "Event",
+      "lastTimestamp": "2026-07-11T21:15:35Z",
+      "message": "Stopping container controller",
+      "metadata": {
+        "creationTimestamp": "2026-07-11T21:15:35Z",
+        "name": "tre-v2-controller-86bff5445f-bpvf8.18c158c61cd0d91f",
+        "namespace": "tre-v2",
+        "resourceVersion": "195246942",
+        "uid": "e2714960-8fbd-48ef-aadb-25d7707f6567"
+      },
+      "reason": "Killing",
+      "reportingComponent": "kubelet",
+      "reportingInstance": "nscc-ds-4a100-node10",
+      "source": {
+        "component": "kubelet",
+        "host": "nscc-ds-4a100-node10"
+      },
+      "type": "Normal"
+    },
+    {
+      "apiVersion": "v1",
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-07-11T21:05:26Z",
+      "involvedObject": {
+        "apiVersion": "apps/v1",
+        "kind": "ReplicaSet",
+        "name": "tre-v2-controller-86bff5445f",
+        "namespace": "tre-v2",
+        "resourceVersion": "195244483",
+        "uid": "ddbdb844-db60-4203-8c03-5280c2366648"
+      },
+      "kind": "Event",
+      "lastTimestamp": "2026-07-11T21:05:26Z",
+      "message": "Created pod: tre-v2-controller-86bff5445f-bpvf8",
+      "metadata": {
+        "creationTimestamp": "2026-07-11T21:05:26Z",
+        "name": "tre-v2-controller-86bff5445f.18c15838408b738c",
+        "namespace": "tre-v2",
+        "resourceVersion": "195244487",
+        "uid": "8b2356b7-346c-4d15-bb85-e4719ca06f74"
+      },
+      "reason": "SuccessfulCreate",
+      "reportingComponent": "replicaset-controller",
+      "reportingInstance": "",
+      "source": {
+        "component": "replicaset-controller"
+      },
+      "type": "Normal"
+    },
+    {
+      "apiVersion": "v1",
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-07-11T21:15:35Z",
+      "involvedObject": {
+        "apiVersion": "apps/v1",
+        "kind": "ReplicaSet",
+        "name": "tre-v2-controller-86bff5445f",
+        "namespace": "tre-v2",
+        "resourceVersion": "195246937",
+        "uid": "ddbdb844-db60-4203-8c03-5280c2366648"
+      },
+      "kind": "Event",
+      "lastTimestamp": "2026-07-11T21:15:35Z",
+      "message": "Deleted pod: tre-v2-controller-86bff5445f-bpvf8",
+      "metadata": {
+        "creationTimestamp": "2026-07-11T21:15:35Z",
+        "name": "tre-v2-controller-86bff5445f.18c158c61cb189f8",
+        "namespace": "tre-v2",
+        "resourceVersion": "195246941",
+        "uid": "5cb08126-0d22-45f2-adb3-99982024a1da"
+      },
+      "reason": "SuccessfulDelete",
+      "reportingComponent": "replicaset-controller",
+      "reportingInstance": "",
+      "source": {
+        "component": "replicaset-controller"
+      },
+      "type": "Normal"
+    },
+    {
+      "apiVersion": "v1",
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-07-11T20:37:28Z",
+      "involvedObject": {
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "name": "tre-v2-controller",
+        "namespace": "tre-v2",
+        "resourceVersion": "195237679",
+        "uid": "d6d246a7-c9ec-4e33-95be-28a2d7c5814e"
+      },
+      "kind": "Event",
+      "lastTimestamp": "2026-07-11T20:37:28Z",
+      "message": "Scaled down replica set tre-v2-controller-7dfc7c584 to 0 from 1",
+      "metadata": {
+        "creationTimestamp": "2026-07-11T20:37:28Z",
+        "name": "tre-v2-controller.18c156b195d1b7b1",
+        "namespace": "tre-v2",
+        "resourceVersion": "195237681",
+        "uid": "c5eec4c2-b2ac-4500-8e2a-4635746cf9bb"
+      },
+      "reason": "ScalingReplicaSet",
+      "reportingComponent": "deployment-controller",
+      "reportingInstance": "",
+      "source": {
+        "component": "deployment-controller"
+      },
+      "type": "Normal"
+    },
+    {
+      "apiVersion": "v1",
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-07-11T20:37:58Z",
+      "involvedObject": {
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "name": "tre-v2-controller",
+        "namespace": "tre-v2",
+        "resourceVersion": "195237688",
+        "uid": "d6d246a7-c9ec-4e33-95be-28a2d7c5814e"
+      },
+      "kind": "Event",
+      "lastTimestamp": "2026-07-11T20:37:58Z",
+      "message": "Scaled up replica set tre-v2-controller-5c98fbf474 to 1",
+      "metadata": {
+        "creationTimestamp": "2026-07-11T20:37:58Z",
+        "name": "tre-v2-controller.18c156b8b76c212b",
+        "namespace": "tre-v2",
+        "resourceVersion": "195237813",
+        "uid": "e998c6f5-2a96-4d1a-b3d2-4b9146251a37"
+      },
+      "reason": "ScalingReplicaSet",
+      "reportingComponent": "deployment-controller",
+      "reportingInstance": "",
+      "source": {
+        "component": "deployment-controller"
+      },
+      "type": "Normal"
+    },
+    {
+      "apiVersion": "v1",
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-07-11T20:48:08Z",
+      "involvedObject": {
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "name": "tre-v2-controller",
+        "namespace": "tre-v2",
+        "resourceVersion": "195240268",
+        "uid": "d6d246a7-c9ec-4e33-95be-28a2d7c5814e"
+      },
+      "kind": "Event",
+      "lastTimestamp": "2026-07-11T20:48:08Z",
+      "message": "Scaled down replica set tre-v2-controller-5c98fbf474 to 0 from 1",
+      "metadata": {
+        "creationTimestamp": "2026-07-11T20:48:08Z",
+        "name": "tre-v2-controller.18c15746a3c4a385",
+        "namespace": "tre-v2",
+        "resourceVersion": "195240271",
+        "uid": "9aeaa882-159b-42fc-8bcb-9a970664b58b"
+      },
+      "reason": "ScalingReplicaSet",
+      "reportingComponent": "deployment-controller",
+      "reportingInstance": "",
+      "source": {
+        "component": "deployment-controller"
+      },
+      "type": "Normal"
+    },
+    {
+      "apiVersion": "v1",
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-07-11T20:48:38Z",
+      "involvedObject": {
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "name": "tre-v2-controller",
+        "namespace": "tre-v2",
+        "resourceVersion": "195240277",
+        "uid": "d6d246a7-c9ec-4e33-95be-28a2d7c5814e"
+      },
+      "kind": "Event",
+      "lastTimestamp": "2026-07-11T20:48:38Z",
+      "message": "Scaled up replica set tre-v2-controller-7c4ff4dbdc to 1",
+      "metadata": {
+        "creationTimestamp": "2026-07-11T20:48:38Z",
+        "name": "tre-v2-controller.18c1574dbf77c7c3",
+        "namespace": "tre-v2",
+        "resourceVersion": "195240402",
+        "uid": "021e1af2-6975-458b-b6c2-1a80f6be05d4"
+      },
+      "reason": "ScalingReplicaSet",
+      "reportingComponent": "deployment-controller",
+      "reportingInstance": "",
+      "source": {
+        "component": "deployment-controller"
+      },
+      "type": "Normal"
+    },
+    {
+      "apiVersion": "v1",
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-07-11T20:48:41Z",
+      "involvedObject": {
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "name": "tre-v2-controller",
+        "namespace": "tre-v2",
+        "resourceVersion": "195240430",
+        "uid": "d6d246a7-c9ec-4e33-95be-28a2d7c5814e"
+      },
+      "kind": "Event",
+      "lastTimestamp": "2026-07-11T20:48:41Z",
+      "message": "Scaled down replica set tre-v2-controller-7c4ff4dbdc to 0 from 1",
+      "metadata": {
+        "creationTimestamp": "2026-07-11T20:48:41Z",
+        "name": "tre-v2-controller.18c1574e522c1af3",
+        "namespace": "tre-v2",
+        "resourceVersion": "195240432",
+        "uid": "35f0b6ca-b17c-4357-ab41-954a1b33d6c8"
+      },
+      "reason": "ScalingReplicaSet",
+      "reportingComponent": "deployment-controller",
+      "reportingInstance": "",
+      "source": {
+        "component": "deployment-controller"
+      },
+      "type": "Normal"
+    },
+    {
+      "apiVersion": "v1",
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-07-11T20:49:13Z",
+      "involvedObject": {
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "name": "tre-v2-controller",
+        "namespace": "tre-v2",
+        "resourceVersion": "195240440",
+        "uid": "d6d246a7-c9ec-4e33-95be-28a2d7c5814e"
+      },
+      "kind": "Event",
+      "lastTimestamp": "2026-07-11T20:49:13Z",
+      "message": "Scaled up replica set tre-v2-controller-5894d654b9 to 1",
+      "metadata": {
+        "creationTimestamp": "2026-07-11T20:49:13Z",
+        "name": "tre-v2-controller.18c15755e38ff571",
+        "namespace": "tre-v2",
+        "resourceVersion": "195240574",
+        "uid": "15cf6f37-fd29-49e1-819f-015167140f38"
+      },
+      "reason": "ScalingReplicaSet",
+      "reportingComponent": "deployment-controller",
+      "reportingInstance": "",
+      "source": {
+        "component": "deployment-controller"
+      },
+      "type": "Normal"
+    },
+    {
+      "apiVersion": "v1",
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-07-11T21:04:55Z",
+      "involvedObject": {
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "name": "tre-v2-controller",
+        "namespace": "tre-v2",
+        "resourceVersion": "195244347",
+        "uid": "d6d246a7-c9ec-4e33-95be-28a2d7c5814e"
+      },
+      "kind": "Event",
+      "lastTimestamp": "2026-07-11T21:04:55Z",
+      "message": "Scaled down replica set tre-v2-controller-5894d654b9 to 0 from 1",
+      "metadata": {
+        "creationTimestamp": "2026-07-11T21:04:55Z",
+        "name": "tre-v2-controller.18c158311ee1afba",
+        "namespace": "tre-v2",
+        "resourceVersion": "195244349",
+        "uid": "16ccbd59-4017-4ada-a576-8ffcfc989713"
+      },
+      "reason": "ScalingReplicaSet",
+      "reportingComponent": "deployment-controller",
+      "reportingInstance": "",
+      "source": {
+        "component": "deployment-controller"
+      },
+      "type": "Normal"
+    },
+    {
+      "apiVersion": "v1",
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-07-11T21:05:26Z",
+      "involvedObject": {
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "name": "tre-v2-controller",
+        "namespace": "tre-v2",
+        "resourceVersion": "195244356",
+        "uid": "d6d246a7-c9ec-4e33-95be-28a2d7c5814e"
+      },
+      "kind": "Event",
+      "lastTimestamp": "2026-07-11T21:05:26Z",
+      "message": "Scaled up replica set tre-v2-controller-86bff5445f to 1",
+      "metadata": {
+        "creationTimestamp": "2026-07-11T21:05:26Z",
+        "name": "tre-v2-controller.18c15838401bc4a3",
+        "namespace": "tre-v2",
+        "resourceVersion": "195244484",
+        "uid": "b819c6fb-e454-45b7-abde-7b0e817c0e37"
+      },
+      "reason": "ScalingReplicaSet",
+      "reportingComponent": "deployment-controller",
+      "reportingInstance": "",
+      "source": {
+        "component": "deployment-controller"
+      },
+      "type": "Normal"
+    },
+    {
+      "apiVersion": "v1",
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-07-11T21:15:35Z",
+      "involvedObject": {
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "name": "tre-v2-controller",
+        "namespace": "tre-v2",
+        "resourceVersion": "195246936",
+        "uid": "d6d246a7-c9ec-4e33-95be-28a2d7c5814e"
+      },
+      "kind": "Event",
+      "lastTimestamp": "2026-07-11T21:15:35Z",
+      "message": "Scaled down replica set tre-v2-controller-86bff5445f to 0 from 1",
+      "metadata": {
+        "creationTimestamp": "2026-07-11T21:15:35Z",
+        "name": "tre-v2-controller.18c158c61c6aeccf",
+        "namespace": "tre-v2",
+        "resourceVersion": "195246938",
+        "uid": "67571a42-1a7c-4df2-82e7-8eecf68ed6db"
+      },
+      "reason": "ScalingReplicaSet",
+      "reportingComponent": "deployment-controller",
+      "reportingInstance": "",
+      "source": {
+        "component": "deployment-controller"
+      },
+      "type": "Normal"
+    },
+    {
+      "apiVersion": "v1",
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-07-11T21:16:05Z",
+      "involvedObject": {
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "name": "tre-v2-controller",
+        "namespace": "tre-v2",
+        "resourceVersion": "195246945",
+        "uid": "d6d246a7-c9ec-4e33-95be-28a2d7c5814e"
+      },
+      "kind": "Event",
+      "lastTimestamp": "2026-07-11T21:16:05Z",
+      "message": "Scaled up replica set tre-v2-controller-7667f8d4c to 1",
+      "metadata": {
+        "creationTimestamp": "2026-07-11T21:16:05Z",
+        "name": "tre-v2-controller.18c158cd3d5a1f05",
+        "namespace": "tre-v2",
+        "resourceVersion": "195247068",
+        "uid": "b7b6237b-a77c-47db-93d8-c1d707bdf258"
+      },
+      "reason": "ScalingReplicaSet",
+      "reportingComponent": "deployment-controller",
+      "reportingInstance": "",
+      "source": {
+        "component": "deployment-controller"
+      },
+      "type": "Normal"
+    },
+    {
+      "apiVersion": "v1",
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-07-11T21:16:08Z",
+      "involvedObject": {
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "name": "tre-v2-controller",
+        "namespace": "tre-v2",
+        "resourceVersion": "195247096",
+        "uid": "d6d246a7-c9ec-4e33-95be-28a2d7c5814e"
+      },
+      "kind": "Event",
+      "lastTimestamp": "2026-07-11T21:16:08Z",
+      "message": "Scaled down replica set tre-v2-controller-7667f8d4c to 0 from 1",
+      "metadata": {
+        "creationTimestamp": "2026-07-11T21:16:08Z",
+        "name": "tre-v2-controller.18c158cdcaf20672",
+        "namespace": "tre-v2",
+        "resourceVersion": "195247098",
+        "uid": "61d31d2b-8403-418f-b7b7-88d63d3daaa8"
+      },
+      "reason": "ScalingReplicaSet",
+      "reportingComponent": "deployment-controller",
+      "reportingInstance": "",
+      "source": {
+        "component": "deployment-controller"
+      },
+      "type": "Normal"
+    },
+    {
+      "apiVersion": "v1",
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-07-11T21:16:40Z",
+      "involvedObject": {
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "name": "tre-v2-controller",
+        "namespace": "tre-v2",
+        "resourceVersion": "195247108",
+        "uid": "d6d246a7-c9ec-4e33-95be-28a2d7c5814e"
+      },
+      "kind": "Event",
+      "lastTimestamp": "2026-07-11T21:16:40Z",
+      "message": "Scaled up replica set tre-v2-controller-5c5574d4f7 to 1",
+      "metadata": {
+        "creationTimestamp": "2026-07-11T21:16:40Z",
+        "name": "tre-v2-controller.18c158d55b25ed02",
+        "namespace": "tre-v2",
+        "resourceVersion": "195247246",
+        "uid": "1141dde9-aacd-4265-be79-0f75c46e88d1"
+      },
+      "reason": "ScalingReplicaSet",
+      "reportingComponent": "deployment-controller",
+      "reportingInstance": "",
+      "source": {
+        "component": "deployment-controller"
+      },
+      "type": "Normal"
+    }
+  ],
+  "kind": "List",
+  "metadata": {
+    "resourceVersion": ""
+  }
+}

@@ -1,0 +1,9 @@
+{"delta":1,"donor":null,"kind":"scale","loop":"fairness","model":"dsqwen-7b","reason":"low_fairness_sleeping_capacity","receiver":"dsqwen-7b","requires_safescale":false,"source_loop":"fairness","ts_ms":1783797024195}
+{"delta":1,"donor":null,"kind":"scale","loop":"rescue","model":"dsqwen-7b","reason":"critical_sleeping_capacity","receiver":"dsqwen-7b","requires_safescale":false,"source_loop":"rescue","ts_ms":1783797031012}
+{"delta":1,"donor":null,"kind":"scale","loop":"rescue","model":"dsqwen-7b","reason":"critical_sleeping_capacity","receiver":"dsqwen-7b","requires_safescale":false,"source_loop":"rescue","ts_ms":1783797037633}
+{"delta":1,"donor":null,"kind":"scale","loop":"fairness","model":"dsqwen-7b","reason":"low_fairness_sleeping_capacity","receiver":"dsqwen-7b","requires_safescale":false,"source_loop":"fairness","ts_ms":1783797043808}
+{"delta":1,"donor":null,"kind":"scale","loop":"fairness","model":"dsllama-8b","reason":"low_fairness_sleeping_capacity","receiver":"dsllama-8b","requires_safescale":false,"source_loop":"fairness","ts_ms":1783797489114}
+{"delta":1,"donor":null,"kind":"scale","loop":"rescue","model":"dsllama-8b","reason":"critical_sleeping_capacity","receiver":"dsllama-8b","requires_safescale":false,"source_loop":"rescue","ts_ms":1783797495576}
+{"delta":1,"donor":null,"kind":"scale","loop":"rescue","model":"dsllama-8b","reason":"critical_sleeping_capacity","receiver":"dsllama-8b","requires_safescale":false,"source_loop":"rescue","ts_ms":1783797502171}
+{"delta":1,"donor":null,"kind":"scale","loop":"rescue","model":"dsllama-8b","reason":"critical_sleeping_capacity","receiver":"dsllama-8b","requires_safescale":false,"source_loop":"rescue","ts_ms":1783797508599}
+{"delta":1,"donor":null,"kind":"scale","loop":"rescue","model":"dsllama-8b","reason":"critical_sleeping_capacity","receiver":"dsllama-8b","requires_safescale":false,"source_loop":"rescue","ts_ms":1783797514847}
