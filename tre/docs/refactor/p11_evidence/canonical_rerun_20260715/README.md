@@ -155,3 +155,26 @@ proposal correctly failed placement. The old "feasible 5" claim assumed llama pi
 which the demand-shift trace violates. Remaining open question (policy, not bug): whether
 rescue should become donor-aware under full-GPU pressure and preempt a lower-utility replica;
 that is a post-campaign design decision, out of scope for the frozen runtime.
+
+## INVALIDATION NOTICE (2026-07-12): the APA arm never actuated — all 9 APA runs are a static-1-replica baseline
+
+Post-campaign analysis found `replicas_awake` flat at 1 for every model in every APA run
+(t1-t9), and zero pod events. The aibrix controller-manager logs prove the APA loop itself
+was healthy — it collected metrics and computed recommendations throughout — but every
+recommendation was `DesiredReplicas: 1`. Root cause: the scale-anchor selector
+(`model.aibrix.ai/name: <model>`) matches ALL pods of the model, awake AND sleeping
+(log evidence: `pods=8` for 7b with only 1 awake). Sleeping vLLM pods stay Running and
+report `gpu_cache_usage_perc ~= 0.00005`, so the APA mean is diluted by up to 8x: with
+1 awake pod the mean cannot exceed 0.125, below the 0.5 target — **scale-up was
+mathematically impossible**. Max observed mean over the campaign: 0.077 (awake pod ~0.61).
+The baselines/apa README explicitly intended awake-only averaging ("That selector matches
+all awake pods"), so this is a defect, not a design choice. The same defect affects the
+pre-canonical exp3 comparisons (their APA arms also never scaled — verified against
+`/root/tre-experiments/comparison_v2_posttheta/apa/timeline.csv`, peak 1/1/1).
+
+Consequences: TRE-arm results in this directory remain valid; APA-arm V_req values measure
+a no-autoscaler control, not APA. Fix: add `tre.aibrix.io/routable: "true"` (an SM-maintained
+pod label, awake=true / sleeping=false) to each anchor Deployment selector so APA averages
+awake pods only. All 9 APA runs must be re-executed after the fix + a live scale-up canary;
+noise-seed APA arms must run on the fixed configuration. E2 (TRE-signal ablation, no APA
+arm) is unaffected.
