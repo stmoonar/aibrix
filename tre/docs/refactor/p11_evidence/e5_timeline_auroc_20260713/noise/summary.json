@@ -1,0 +1,1490 @@
+{
+  "meta": {
+    "evidence_root": "docs/refactor/p11_evidence/noise_seeds_20260716",
+    "runs_glob": "t*_*_seed*",
+    "runs_matched": 12,
+    "lead_windows": 3
+  },
+  "rows": [
+    {
+      "run_id": "t1_apa_seed2",
+      "model": "dsllama-8b",
+      "signal": "z_m",
+      "n_windows": 155,
+      "n_violated": 60,
+      "n_missing_signal": 0,
+      "auroc": 0.9157894736842105,
+      "auroc_lead3": 0.8832465277777778
+    },
+    {
+      "run_id": "t1_apa_seed2",
+      "model": "dsllama-8b",
+      "signal": "queue_len",
+      "n_windows": 155,
+      "n_violated": 60,
+      "n_missing_signal": 0,
+      "auroc": 0.945,
+      "auroc_lead3": 0.9149305555555556
+    },
+    {
+      "run_id": "t1_apa_seed2",
+      "model": "dsllama-8b",
+      "signal": "decode_tps",
+      "n_windows": 155,
+      "n_violated": 60,
+      "n_missing_signal": 0,
+      "auroc": 0.8123684210526316,
+      "auroc_lead3": 0.7940972222222222
+    },
+    {
+      "run_id": "t1_apa_seed2",
+      "model": "dsllama-8b",
+      "signal": "prefill_tps",
+      "n_windows": 155,
+      "n_violated": 60,
+      "n_missing_signal": 0,
+      "auroc": 0.8123684210526316,
+      "auroc_lead3": 0.7940972222222222
+    },
+    {
+      "run_id": "t1_apa_seed2",
+      "model": "dsqwen-14b",
+      "signal": "z_m",
+      "n_windows": 154,
+      "n_violated": 0,
+      "n_missing_signal": 0,
+      "auroc": null,
+      "auroc_lead3": null
+    },
+    {
+      "run_id": "t1_apa_seed2",
+      "model": "dsqwen-14b",
+      "signal": "queue_len",
+      "n_windows": 154,
+      "n_violated": 0,
+      "n_missing_signal": 0,
+      "auroc": null,
+      "auroc_lead3": null
+    },
+    {
+      "run_id": "t1_apa_seed2",
+      "model": "dsqwen-14b",
+      "signal": "decode_tps",
+      "n_windows": 154,
+      "n_violated": 0,
+      "n_missing_signal": 0,
+      "auroc": null,
+      "auroc_lead3": null
+    },
+    {
+      "run_id": "t1_apa_seed2",
+      "model": "dsqwen-14b",
+      "signal": "prefill_tps",
+      "n_windows": 154,
+      "n_violated": 0,
+      "n_missing_signal": 0,
+      "auroc": null,
+      "auroc_lead3": null
+    },
+    {
+      "run_id": "t1_apa_seed2",
+      "model": "dsqwen-7b",
+      "signal": "z_m",
+      "n_windows": 154,
+      "n_violated": 66,
+      "n_missing_signal": 0,
+      "auroc": 0.9860537190082644,
+      "auroc_lead3": 0.9805363321799307
+    },
+    {
+      "run_id": "t1_apa_seed2",
+      "model": "dsqwen-7b",
+      "signal": "queue_len",
+      "n_windows": 154,
+      "n_violated": 66,
+      "n_missing_signal": 0,
+      "auroc": 0.9738292011019284,
+      "auroc_lead3": 0.9650519031141869
+    },
+    {
+      "run_id": "t1_apa_seed2",
+      "model": "dsqwen-7b",
+      "signal": "decode_tps",
+      "n_windows": 154,
+      "n_violated": 66,
+      "n_missing_signal": 0,
+      "auroc": 0.9176997245179064,
+      "auroc_lead3": 0.9001730103806228
+    },
+    {
+      "run_id": "t1_apa_seed2",
+      "model": "dsqwen-7b",
+      "signal": "prefill_tps",
+      "n_windows": 154,
+      "n_violated": 66,
+      "n_missing_signal": 0,
+      "auroc": 0.9176997245179064,
+      "auroc_lead3": 0.9001730103806228
+    },
+    {
+      "run_id": "t1_apa_seed3",
+      "model": "dsllama-8b",
+      "signal": "z_m",
+      "n_windows": 154,
+      "n_violated": 64,
+      "n_missing_signal": 0,
+      "auroc": 0.9876736111111111,
+      "auroc_lead3": 0.9598571926158133
+    },
+    {
+      "run_id": "t1_apa_seed3",
+      "model": "dsllama-8b",
+      "signal": "queue_len",
+      "n_windows": 154,
+      "n_violated": 64,
+      "n_missing_signal": 0,
+      "auroc": 0.9908854166666666,
+      "auroc_lead3": 0.974486241727621
+    },
+    {
+      "run_id": "t1_apa_seed3",
+      "model": "dsllama-8b",
+      "signal": "decode_tps",
+      "n_windows": 154,
+      "n_violated": 64,
+      "n_missing_signal": 0,
+      "auroc": 0.8752604166666667,
+      "auroc_lead3": 0.8487460815047022
+    },
+    {
+      "run_id": "t1_apa_seed3",
+      "model": "dsllama-8b",
+      "signal": "prefill_tps",
+      "n_windows": 154,
+      "n_violated": 64,
+      "n_missing_signal": 0,
+      "auroc": 0.8752604166666667,
+      "auroc_lead3": 0.8487460815047022
+    },
+    {
+      "run_id": "t1_apa_seed3",
+      "model": "dsqwen-14b",
+      "signal": "z_m",
+      "n_windows": 155,
+      "n_violated": 6,
+      "n_missing_signal": 0,
+      "auroc": 0.5274049217002237,
+      "auroc_lead3": 0.4571917808219178
+    },
+    {
+      "run_id": "t1_apa_seed3",
+      "model": "dsqwen-14b",
+      "signal": "queue_len",
+      "n_windows": 155,
+      "n_violated": 6,
+      "n_missing_signal": 0,
+      "auroc": 0.40939597315436244,
+      "auroc_lead3": 0.4272260273972603
+    },
+    {
+      "run_id": "t1_apa_seed3",
+      "model": "dsqwen-14b",
+      "signal": "decode_tps",
+      "n_windows": 155,
+      "n_violated": 6,
+      "n_missing_signal": 0,
+      "auroc": 0.441834451901566,
+      "auroc_lead3": 0.4922945205479452
+    },
+    {
+      "run_id": "t1_apa_seed3",
+      "model": "dsqwen-14b",
+      "signal": "prefill_tps",
+      "n_windows": 155,
+      "n_violated": 6,
+      "n_missing_signal": 0,
+      "auroc": 0.441834451901566,
+      "auroc_lead3": 0.4922945205479452
+    },
+    {
+      "run_id": "t1_apa_seed3",
+      "model": "dsqwen-7b",
+      "signal": "z_m",
+      "n_windows": 154,
+      "n_violated": 66,
+      "n_missing_signal": 0,
+      "auroc": 0.9569559228650137,
+      "auroc_lead3": 0.9214532871972319
+    },
+    {
+      "run_id": "t1_apa_seed3",
+      "model": "dsqwen-7b",
+      "signal": "queue_len",
+      "n_windows": 154,
+      "n_violated": 66,
+      "n_missing_signal": 0,
+      "auroc": 0.9711604683195593,
+      "auroc_lead3": 0.9333910034602076
+    },
+    {
+      "run_id": "t1_apa_seed3",
+      "model": "dsqwen-7b",
+      "signal": "decode_tps",
+      "n_windows": 154,
+      "n_violated": 66,
+      "n_missing_signal": 0,
+      "auroc": 0.912620523415978,
+      "auroc_lead3": 0.8884948096885813
+    },
+    {
+      "run_id": "t1_apa_seed3",
+      "model": "dsqwen-7b",
+      "signal": "prefill_tps",
+      "n_windows": 154,
+      "n_violated": 66,
+      "n_missing_signal": 0,
+      "auroc": 0.912620523415978,
+      "auroc_lead3": 0.8884948096885813
+    },
+    {
+      "run_id": "t1_tre_seed2",
+      "model": "dsllama-8b",
+      "signal": "z_m",
+      "n_windows": 155,
+      "n_violated": 66,
+      "n_missing_signal": 0,
+      "auroc": 0.9749744637385087,
+      "auroc_lead3": 0.9425444596443229
+    },
+    {
+      "run_id": "t1_tre_seed2",
+      "model": "dsllama-8b",
+      "signal": "queue_len",
+      "n_windows": 155,
+      "n_violated": 66,
+      "n_missing_signal": 0,
+      "auroc": 0.9759959141981613,
+      "auroc_lead3": 0.949469904240766
+    },
+    {
+      "run_id": "t1_tre_seed2",
+      "model": "dsllama-8b",
+      "signal": "decode_tps",
+      "n_windows": 155,
+      "n_violated": 66,
+      "n_missing_signal": 0,
+      "auroc": 0.869084099421178,
+      "auroc_lead3": 0.8457592339261286
+    },
+    {
+      "run_id": "t1_tre_seed2",
+      "model": "dsllama-8b",
+      "signal": "prefill_tps",
+      "n_windows": 155,
+      "n_violated": 66,
+      "n_missing_signal": 0,
+      "auroc": 0.869084099421178,
+      "auroc_lead3": 0.8457592339261286
+    },
+    {
+      "run_id": "t1_tre_seed2",
+      "model": "dsqwen-14b",
+      "signal": "z_m",
+      "n_windows": 154,
+      "n_violated": 0,
+      "n_missing_signal": 0,
+      "auroc": null,
+      "auroc_lead3": null
+    },
+    {
+      "run_id": "t1_tre_seed2",
+      "model": "dsqwen-14b",
+      "signal": "queue_len",
+      "n_windows": 154,
+      "n_violated": 0,
+      "n_missing_signal": 0,
+      "auroc": null,
+      "auroc_lead3": null
+    },
+    {
+      "run_id": "t1_tre_seed2",
+      "model": "dsqwen-14b",
+      "signal": "decode_tps",
+      "n_windows": 154,
+      "n_violated": 0,
+      "n_missing_signal": 0,
+      "auroc": null,
+      "auroc_lead3": null
+    },
+    {
+      "run_id": "t1_tre_seed2",
+      "model": "dsqwen-14b",
+      "signal": "prefill_tps",
+      "n_windows": 154,
+      "n_violated": 0,
+      "n_missing_signal": 0,
+      "auroc": null,
+      "auroc_lead3": null
+    },
+    {
+      "run_id": "t1_tre_seed2",
+      "model": "dsqwen-7b",
+      "signal": "z_m",
+      "n_windows": 154,
+      "n_violated": 69,
+      "n_missing_signal": 0,
+      "auroc": 0.9645353793691389,
+      "auroc_lead3": 0.969263698630137
+    },
+    {
+      "run_id": "t1_tre_seed2",
+      "model": "dsqwen-7b",
+      "signal": "queue_len",
+      "n_windows": 154,
+      "n_violated": 69,
+      "n_missing_signal": 0,
+      "auroc": 0.958312020460358,
+      "auroc_lead3": 0.9316780821917808
+    },
+    {
+      "run_id": "t1_tre_seed2",
+      "model": "dsqwen-7b",
+      "signal": "decode_tps",
+      "n_windows": 154,
+      "n_violated": 69,
+      "n_missing_signal": 0,
+      "auroc": 0.9532821824381926,
+      "auroc_lead3": 0.9526541095890411
+    },
+    {
+      "run_id": "t1_tre_seed2",
+      "model": "dsqwen-7b",
+      "signal": "prefill_tps",
+      "n_windows": 154,
+      "n_violated": 69,
+      "n_missing_signal": 0,
+      "auroc": 0.9532821824381926,
+      "auroc_lead3": 0.9526541095890411
+    },
+    {
+      "run_id": "t1_tre_seed3",
+      "model": "dsllama-8b",
+      "signal": "z_m",
+      "n_windows": 154,
+      "n_violated": 66,
+      "n_missing_signal": 0,
+      "auroc": 0.9899276859504132,
+      "auroc_lead3": 0.9720588235294118
+    },
+    {
+      "run_id": "t1_tre_seed3",
+      "model": "dsllama-8b",
+      "signal": "queue_len",
+      "n_windows": 154,
+      "n_violated": 66,
+      "n_missing_signal": 0,
+      "auroc": 0.987517217630854,
+      "auroc_lead3": 0.9624567474048443
+    },
+    {
+      "run_id": "t1_tre_seed3",
+      "model": "dsllama-8b",
+      "signal": "decode_tps",
+      "n_windows": 154,
+      "n_violated": 66,
+      "n_missing_signal": 0,
+      "auroc": 0.8851584022038568,
+      "auroc_lead3": 0.8486159169550173
+    },
+    {
+      "run_id": "t1_tre_seed3",
+      "model": "dsllama-8b",
+      "signal": "prefill_tps",
+      "n_windows": 154,
+      "n_violated": 66,
+      "n_missing_signal": 0,
+      "auroc": 0.8851584022038568,
+      "auroc_lead3": 0.8486159169550173
+    },
+    {
+      "run_id": "t1_tre_seed3",
+      "model": "dsqwen-14b",
+      "signal": "z_m",
+      "n_windows": 155,
+      "n_violated": 0,
+      "n_missing_signal": 0,
+      "auroc": null,
+      "auroc_lead3": null
+    },
+    {
+      "run_id": "t1_tre_seed3",
+      "model": "dsqwen-14b",
+      "signal": "queue_len",
+      "n_windows": 155,
+      "n_violated": 0,
+      "n_missing_signal": 0,
+      "auroc": null,
+      "auroc_lead3": null
+    },
+    {
+      "run_id": "t1_tre_seed3",
+      "model": "dsqwen-14b",
+      "signal": "decode_tps",
+      "n_windows": 155,
+      "n_violated": 0,
+      "n_missing_signal": 0,
+      "auroc": null,
+      "auroc_lead3": null
+    },
+    {
+      "run_id": "t1_tre_seed3",
+      "model": "dsqwen-14b",
+      "signal": "prefill_tps",
+      "n_windows": 155,
+      "n_violated": 0,
+      "n_missing_signal": 0,
+      "auroc": null,
+      "auroc_lead3": null
+    },
+    {
+      "run_id": "t1_tre_seed3",
+      "model": "dsqwen-7b",
+      "signal": "z_m",
+      "n_windows": 154,
+      "n_violated": 63,
+      "n_missing_signal": 0,
+      "auroc": 0.9602302459445317,
+      "auroc_lead3": 0.9453671328671329
+    },
+    {
+      "run_id": "t1_tre_seed3",
+      "model": "dsqwen-7b",
+      "signal": "queue_len",
+      "n_windows": 154,
+      "n_violated": 63,
+      "n_missing_signal": 0,
+      "auroc": 0.9767137624280482,
+      "auroc_lead3": 0.9518356643356644
+    },
+    {
+      "run_id": "t1_tre_seed3",
+      "model": "dsqwen-7b",
+      "signal": "decode_tps",
+      "n_windows": 154,
+      "n_violated": 63,
+      "n_missing_signal": 0,
+      "auroc": 0.975492761207047,
+      "auroc_lead3": 0.9701048951048951
+    },
+    {
+      "run_id": "t1_tre_seed3",
+      "model": "dsqwen-7b",
+      "signal": "prefill_tps",
+      "n_windows": 154,
+      "n_violated": 63,
+      "n_missing_signal": 0,
+      "auroc": 0.975492761207047,
+      "auroc_lead3": 0.9701048951048951
+    },
+    {
+      "run_id": "t3_apa_seed2",
+      "model": "dsllama-8b",
+      "signal": "z_m",
+      "n_windows": 212,
+      "n_violated": 6,
+      "n_missing_signal": 0,
+      "auroc": 0.2872168284789644,
+      "auroc_lead3": 0.2857142857142857
+    },
+    {
+      "run_id": "t3_apa_seed2",
+      "model": "dsllama-8b",
+      "signal": "queue_len",
+      "n_windows": 212,
+      "n_violated": 6,
+      "n_missing_signal": 0,
+      "auroc": 0.3814724919093851,
+      "auroc_lead3": 0.4664408866995074
+    },
+    {
+      "run_id": "t3_apa_seed2",
+      "model": "dsllama-8b",
+      "signal": "decode_tps",
+      "n_windows": 212,
+      "n_violated": 6,
+      "n_missing_signal": 0,
+      "auroc": 0.42192556634304207,
+      "auroc_lead3": 0.6028325123152709
+    },
+    {
+      "run_id": "t3_apa_seed2",
+      "model": "dsllama-8b",
+      "signal": "prefill_tps",
+      "n_windows": 212,
+      "n_violated": 6,
+      "n_missing_signal": 0,
+      "auroc": 0.42192556634304207,
+      "auroc_lead3": 0.6028325123152709
+    },
+    {
+      "run_id": "t3_apa_seed2",
+      "model": "dsqwen-14b",
+      "signal": "z_m",
+      "n_windows": 212,
+      "n_violated": 0,
+      "n_missing_signal": 0,
+      "auroc": null,
+      "auroc_lead3": null
+    },
+    {
+      "run_id": "t3_apa_seed2",
+      "model": "dsqwen-14b",
+      "signal": "queue_len",
+      "n_windows": 212,
+      "n_violated": 0,
+      "n_missing_signal": 0,
+      "auroc": null,
+      "auroc_lead3": null
+    },
+    {
+      "run_id": "t3_apa_seed2",
+      "model": "dsqwen-14b",
+      "signal": "decode_tps",
+      "n_windows": 212,
+      "n_violated": 0,
+      "n_missing_signal": 0,
+      "auroc": null,
+      "auroc_lead3": null
+    },
+    {
+      "run_id": "t3_apa_seed2",
+      "model": "dsqwen-14b",
+      "signal": "prefill_tps",
+      "n_windows": 212,
+      "n_violated": 0,
+      "n_missing_signal": 0,
+      "auroc": null,
+      "auroc_lead3": null
+    },
+    {
+      "run_id": "t3_apa_seed2",
+      "model": "dsqwen-7b",
+      "signal": "z_m",
+      "n_windows": 212,
+      "n_violated": 181,
+      "n_missing_signal": 0,
+      "auroc": 0.9765638923543041,
+      "auroc_lead3": 0.9371101871101871
+    },
+    {
+      "run_id": "t3_apa_seed2",
+      "model": "dsqwen-7b",
+      "signal": "queue_len",
+      "n_windows": 212,
+      "n_violated": 181,
+      "n_missing_signal": 0,
+      "auroc": 0.994475138121547,
+      "auroc_lead3": 0.9788981288981289
+    },
+    {
+      "run_id": "t3_apa_seed2",
+      "model": "dsqwen-7b",
+      "signal": "decode_tps",
+      "n_windows": 212,
+      "n_violated": 181,
+      "n_missing_signal": 0,
+      "auroc": 0.8988593833541259,
+      "auroc_lead3": 0.8387733887733888
+    },
+    {
+      "run_id": "t3_apa_seed2",
+      "model": "dsqwen-7b",
+      "signal": "prefill_tps",
+      "n_windows": 212,
+      "n_violated": 181,
+      "n_missing_signal": 0,
+      "auroc": 0.8170557832828372,
+      "auroc_lead3": 0.8188149688149688
+    },
+    {
+      "run_id": "t3_apa_seed3",
+      "model": "dsllama-8b",
+      "signal": "z_m",
+      "n_windows": 212,
+      "n_violated": 0,
+      "n_missing_signal": 0,
+      "auroc": null,
+      "auroc_lead3": null
+    },
+    {
+      "run_id": "t3_apa_seed3",
+      "model": "dsllama-8b",
+      "signal": "queue_len",
+      "n_windows": 212,
+      "n_violated": 0,
+      "n_missing_signal": 0,
+      "auroc": null,
+      "auroc_lead3": null
+    },
+    {
+      "run_id": "t3_apa_seed3",
+      "model": "dsllama-8b",
+      "signal": "decode_tps",
+      "n_windows": 212,
+      "n_violated": 0,
+      "n_missing_signal": 0,
+      "auroc": null,
+      "auroc_lead3": null
+    },
+    {
+      "run_id": "t3_apa_seed3",
+      "model": "dsllama-8b",
+      "signal": "prefill_tps",
+      "n_windows": 212,
+      "n_violated": 0,
+      "n_missing_signal": 0,
+      "auroc": null,
+      "auroc_lead3": null
+    },
+    {
+      "run_id": "t3_apa_seed3",
+      "model": "dsqwen-14b",
+      "signal": "z_m",
+      "n_windows": 212,
+      "n_violated": 0,
+      "n_missing_signal": 0,
+      "auroc": null,
+      "auroc_lead3": null
+    },
+    {
+      "run_id": "t3_apa_seed3",
+      "model": "dsqwen-14b",
+      "signal": "queue_len",
+      "n_windows": 212,
+      "n_violated": 0,
+      "n_missing_signal": 0,
+      "auroc": null,
+      "auroc_lead3": null
+    },
+    {
+      "run_id": "t3_apa_seed3",
+      "model": "dsqwen-14b",
+      "signal": "decode_tps",
+      "n_windows": 212,
+      "n_violated": 0,
+      "n_missing_signal": 0,
+      "auroc": null,
+      "auroc_lead3": null
+    },
+    {
+      "run_id": "t3_apa_seed3",
+      "model": "dsqwen-14b",
+      "signal": "prefill_tps",
+      "n_windows": 212,
+      "n_violated": 0,
+      "n_missing_signal": 0,
+      "auroc": null,
+      "auroc_lead3": null
+    },
+    {
+      "run_id": "t3_apa_seed3",
+      "model": "dsqwen-7b",
+      "signal": "z_m",
+      "n_windows": 212,
+      "n_violated": 150,
+      "n_missing_signal": 0,
+      "auroc": 0.99,
+      "auroc_lead3": 0.987957181088314
+    },
+    {
+      "run_id": "t3_apa_seed3",
+      "model": "dsqwen-7b",
+      "signal": "queue_len",
+      "n_windows": 212,
+      "n_violated": 150,
+      "n_missing_signal": 0,
+      "auroc": 0.9891935483870967,
+      "auroc_lead3": 0.9813224799286352
+    },
+    {
+      "run_id": "t3_apa_seed3",
+      "model": "dsqwen-7b",
+      "signal": "decode_tps",
+      "n_windows": 212,
+      "n_violated": 150,
+      "n_missing_signal": 0,
+      "auroc": 0.9156451612903226,
+      "auroc_lead3": 0.8912243532560215
+    },
+    {
+      "run_id": "t3_apa_seed3",
+      "model": "dsqwen-7b",
+      "signal": "prefill_tps",
+      "n_windows": 212,
+      "n_violated": 150,
+      "n_missing_signal": 0,
+      "auroc": 0.5383870967741935,
+      "auroc_lead3": 0.5428189116859946
+    },
+    {
+      "run_id": "t3_tre_seed2",
+      "model": "dsllama-8b",
+      "signal": "z_m",
+      "n_windows": 212,
+      "n_violated": 0,
+      "n_missing_signal": 0,
+      "auroc": null,
+      "auroc_lead3": null
+    },
+    {
+      "run_id": "t3_tre_seed2",
+      "model": "dsllama-8b",
+      "signal": "queue_len",
+      "n_windows": 212,
+      "n_violated": 0,
+      "n_missing_signal": 0,
+      "auroc": null,
+      "auroc_lead3": null
+    },
+    {
+      "run_id": "t3_tre_seed2",
+      "model": "dsllama-8b",
+      "signal": "decode_tps",
+      "n_windows": 212,
+      "n_violated": 0,
+      "n_missing_signal": 0,
+      "auroc": null,
+      "auroc_lead3": null
+    },
+    {
+      "run_id": "t3_tre_seed2",
+      "model": "dsllama-8b",
+      "signal": "prefill_tps",
+      "n_windows": 212,
+      "n_violated": 0,
+      "n_missing_signal": 0,
+      "auroc": null,
+      "auroc_lead3": null
+    },
+    {
+      "run_id": "t3_tre_seed2",
+      "model": "dsqwen-14b",
+      "signal": "z_m",
+      "n_windows": 212,
+      "n_violated": 6,
+      "n_missing_signal": 0,
+      "auroc": 0.6067961165048543,
+      "auroc_lead3": 0.6219211822660099
+    },
+    {
+      "run_id": "t3_tre_seed2",
+      "model": "dsqwen-14b",
+      "signal": "queue_len",
+      "n_windows": 212,
+      "n_violated": 6,
+      "n_missing_signal": 0,
+      "auroc": 0.5315533980582524,
+      "auroc_lead3": 0.6560960591133005
+    },
+    {
+      "run_id": "t3_tre_seed2",
+      "model": "dsqwen-14b",
+      "signal": "decode_tps",
+      "n_windows": 212,
+      "n_violated": 6,
+      "n_missing_signal": 0,
+      "auroc": 0.5343851132686084,
+      "auroc_lead3": 0.5886699507389163
+    },
+    {
+      "run_id": "t3_tre_seed2",
+      "model": "dsqwen-14b",
+      "signal": "prefill_tps",
+      "n_windows": 212,
+      "n_violated": 6,
+      "n_missing_signal": 0,
+      "auroc": 0.5343851132686084,
+      "auroc_lead3": 0.5886699507389163
+    },
+    {
+      "run_id": "t3_tre_seed2",
+      "model": "dsqwen-7b",
+      "signal": "z_m",
+      "n_windows": 212,
+      "n_violated": 36,
+      "n_missing_signal": 0,
+      "auroc": 0.8097380050505051,
+      "auroc_lead3": 0.7339412084921066
+    },
+    {
+      "run_id": "t3_tre_seed2",
+      "model": "dsqwen-7b",
+      "signal": "queue_len",
+      "n_windows": 212,
+      "n_violated": 36,
+      "n_missing_signal": 0,
+      "auroc": 0.7805397727272727,
+      "auroc_lead3": 0.7161812738160044
+    },
+    {
+      "run_id": "t3_tre_seed2",
+      "model": "dsqwen-7b",
+      "signal": "decode_tps",
+      "n_windows": 212,
+      "n_violated": 36,
+      "n_missing_signal": 0,
+      "auroc": 0.7485795454545454,
+      "auroc_lead3": 0.706314643440392
+    },
+    {
+      "run_id": "t3_tre_seed2",
+      "model": "dsqwen-7b",
+      "signal": "prefill_tps",
+      "n_windows": 212,
+      "n_violated": 36,
+      "n_missing_signal": 0,
+      "auroc": 0.6654829545454546,
+      "auroc_lead3": 0.5632825258573761
+    },
+    {
+      "run_id": "t3_tre_seed3",
+      "model": "dsllama-8b",
+      "signal": "z_m",
+      "n_windows": 212,
+      "n_violated": 12,
+      "n_missing_signal": 0,
+      "auroc": 0.6235416666666667,
+      "auroc_lead3": 0.6602564102564102
+    },
+    {
+      "run_id": "t3_tre_seed3",
+      "model": "dsllama-8b",
+      "signal": "queue_len",
+      "n_windows": 212,
+      "n_violated": 12,
+      "n_missing_signal": 0,
+      "auroc": 0.43375,
+      "auroc_lead3": 0.5314102564102564
+    },
+    {
+      "run_id": "t3_tre_seed3",
+      "model": "dsllama-8b",
+      "signal": "decode_tps",
+      "n_windows": 212,
+      "n_violated": 12,
+      "n_missing_signal": 0,
+      "auroc": 0.36375,
+      "auroc_lead3": 0.3873397435897436
+    },
+    {
+      "run_id": "t3_tre_seed3",
+      "model": "dsllama-8b",
+      "signal": "prefill_tps",
+      "n_windows": 212,
+      "n_violated": 12,
+      "n_missing_signal": 0,
+      "auroc": 0.36375,
+      "auroc_lead3": 0.3873397435897436
+    },
+    {
+      "run_id": "t3_tre_seed3",
+      "model": "dsqwen-14b",
+      "signal": "z_m",
+      "n_windows": 212,
+      "n_violated": 0,
+      "n_missing_signal": 0,
+      "auroc": null,
+      "auroc_lead3": null
+    },
+    {
+      "run_id": "t3_tre_seed3",
+      "model": "dsqwen-14b",
+      "signal": "queue_len",
+      "n_windows": 212,
+      "n_violated": 0,
+      "n_missing_signal": 0,
+      "auroc": null,
+      "auroc_lead3": null
+    },
+    {
+      "run_id": "t3_tre_seed3",
+      "model": "dsqwen-14b",
+      "signal": "decode_tps",
+      "n_windows": 212,
+      "n_violated": 0,
+      "n_missing_signal": 0,
+      "auroc": null,
+      "auroc_lead3": null
+    },
+    {
+      "run_id": "t3_tre_seed3",
+      "model": "dsqwen-14b",
+      "signal": "prefill_tps",
+      "n_windows": 212,
+      "n_violated": 0,
+      "n_missing_signal": 0,
+      "auroc": null,
+      "auroc_lead3": null
+    },
+    {
+      "run_id": "t3_tre_seed3",
+      "model": "dsqwen-7b",
+      "signal": "z_m",
+      "n_windows": 212,
+      "n_violated": 22,
+      "n_missing_signal": 0,
+      "auroc": 0.9114832535885168,
+      "auroc_lead3": 0.9237006237006237
+    },
+    {
+      "run_id": "t3_tre_seed3",
+      "model": "dsqwen-7b",
+      "signal": "queue_len",
+      "n_windows": 212,
+      "n_violated": 22,
+      "n_missing_signal": 0,
+      "auroc": 0.9260765550239235,
+      "auroc_lead3": 0.9185031185031185
+    },
+    {
+      "run_id": "t3_tre_seed3",
+      "model": "dsqwen-7b",
+      "signal": "decode_tps",
+      "n_windows": 212,
+      "n_violated": 22,
+      "n_missing_signal": 0,
+      "auroc": 0.886244019138756,
+      "auroc_lead3": 0.8669438669438669
+    },
+    {
+      "run_id": "t3_tre_seed3",
+      "model": "dsqwen-7b",
+      "signal": "prefill_tps",
+      "n_windows": 212,
+      "n_violated": 22,
+      "n_missing_signal": 0,
+      "auroc": 0.5782296650717703,
+      "auroc_lead3": 0.508939708939709
+    },
+    {
+      "run_id": "t6_apa_seed2",
+      "model": "dsllama-8b",
+      "signal": "z_m",
+      "n_windows": 167,
+      "n_violated": 0,
+      "n_missing_signal": 0,
+      "auroc": null,
+      "auroc_lead3": null
+    },
+    {
+      "run_id": "t6_apa_seed2",
+      "model": "dsllama-8b",
+      "signal": "queue_len",
+      "n_windows": 167,
+      "n_violated": 0,
+      "n_missing_signal": 0,
+      "auroc": null,
+      "auroc_lead3": null
+    },
+    {
+      "run_id": "t6_apa_seed2",
+      "model": "dsllama-8b",
+      "signal": "decode_tps",
+      "n_windows": 167,
+      "n_violated": 0,
+      "n_missing_signal": 0,
+      "auroc": null,
+      "auroc_lead3": null
+    },
+    {
+      "run_id": "t6_apa_seed2",
+      "model": "dsllama-8b",
+      "signal": "prefill_tps",
+      "n_windows": 167,
+      "n_violated": 0,
+      "n_missing_signal": 0,
+      "auroc": null,
+      "auroc_lead3": null
+    },
+    {
+      "run_id": "t6_apa_seed2",
+      "model": "dsqwen-14b",
+      "signal": "z_m",
+      "n_windows": 167,
+      "n_violated": 6,
+      "n_missing_signal": 0,
+      "auroc": 0.6765010351966874,
+      "auroc_lead3": 0.7879746835443038
+    },
+    {
+      "run_id": "t6_apa_seed2",
+      "model": "dsqwen-14b",
+      "signal": "queue_len",
+      "n_windows": 167,
+      "n_violated": 6,
+      "n_missing_signal": 0,
+      "auroc": 0.7851966873706004,
+      "auroc_lead3": 0.7650316455696202
+    },
+    {
+      "run_id": "t6_apa_seed2",
+      "model": "dsqwen-14b",
+      "signal": "decode_tps",
+      "n_windows": 167,
+      "n_violated": 6,
+      "n_missing_signal": 0,
+      "auroc": 0.7562111801242236,
+      "auroc_lead3": 0.7191455696202531
+    },
+    {
+      "run_id": "t6_apa_seed2",
+      "model": "dsqwen-14b",
+      "signal": "prefill_tps",
+      "n_windows": 167,
+      "n_violated": 6,
+      "n_missing_signal": 0,
+      "auroc": 0.7562111801242236,
+      "auroc_lead3": 0.7191455696202531
+    },
+    {
+      "run_id": "t6_apa_seed2",
+      "model": "dsqwen-7b",
+      "signal": "z_m",
+      "n_windows": 167,
+      "n_violated": 0,
+      "n_missing_signal": 0,
+      "auroc": null,
+      "auroc_lead3": null
+    },
+    {
+      "run_id": "t6_apa_seed2",
+      "model": "dsqwen-7b",
+      "signal": "queue_len",
+      "n_windows": 167,
+      "n_violated": 0,
+      "n_missing_signal": 0,
+      "auroc": null,
+      "auroc_lead3": null
+    },
+    {
+      "run_id": "t6_apa_seed2",
+      "model": "dsqwen-7b",
+      "signal": "decode_tps",
+      "n_windows": 167,
+      "n_violated": 0,
+      "n_missing_signal": 0,
+      "auroc": null,
+      "auroc_lead3": null
+    },
+    {
+      "run_id": "t6_apa_seed2",
+      "model": "dsqwen-7b",
+      "signal": "prefill_tps",
+      "n_windows": 167,
+      "n_violated": 0,
+      "n_missing_signal": 0,
+      "auroc": null,
+      "auroc_lead3": null
+    },
+    {
+      "run_id": "t6_apa_seed3",
+      "model": "dsllama-8b",
+      "signal": "z_m",
+      "n_windows": 167,
+      "n_violated": 0,
+      "n_missing_signal": 0,
+      "auroc": null,
+      "auroc_lead3": null
+    },
+    {
+      "run_id": "t6_apa_seed3",
+      "model": "dsllama-8b",
+      "signal": "queue_len",
+      "n_windows": 167,
+      "n_violated": 0,
+      "n_missing_signal": 0,
+      "auroc": null,
+      "auroc_lead3": null
+    },
+    {
+      "run_id": "t6_apa_seed3",
+      "model": "dsllama-8b",
+      "signal": "decode_tps",
+      "n_windows": 167,
+      "n_violated": 0,
+      "n_missing_signal": 0,
+      "auroc": null,
+      "auroc_lead3": null
+    },
+    {
+      "run_id": "t6_apa_seed3",
+      "model": "dsllama-8b",
+      "signal": "prefill_tps",
+      "n_windows": 167,
+      "n_violated": 0,
+      "n_missing_signal": 0,
+      "auroc": null,
+      "auroc_lead3": null
+    },
+    {
+      "run_id": "t6_apa_seed3",
+      "model": "dsqwen-14b",
+      "signal": "z_m",
+      "n_windows": 167,
+      "n_violated": 6,
+      "n_missing_signal": 0,
+      "auroc": 0.9228778467908902,
+      "auroc_lead3": 0.7072784810126582
+    },
+    {
+      "run_id": "t6_apa_seed3",
+      "model": "dsqwen-14b",
+      "signal": "queue_len",
+      "n_windows": 167,
+      "n_violated": 6,
+      "n_missing_signal": 0,
+      "auroc": 0.7168737060041408,
+      "auroc_lead3": 0.5712025316455697
+    },
+    {
+      "run_id": "t6_apa_seed3",
+      "model": "dsqwen-14b",
+      "signal": "decode_tps",
+      "n_windows": 167,
+      "n_violated": 6,
+      "n_missing_signal": 0,
+      "auroc": 0.6190476190476191,
+      "auroc_lead3": 0.44145569620253167
+    },
+    {
+      "run_id": "t6_apa_seed3",
+      "model": "dsqwen-14b",
+      "signal": "prefill_tps",
+      "n_windows": 167,
+      "n_violated": 6,
+      "n_missing_signal": 0,
+      "auroc": 0.6190476190476191,
+      "auroc_lead3": 0.44145569620253167
+    },
+    {
+      "run_id": "t6_apa_seed3",
+      "model": "dsqwen-7b",
+      "signal": "z_m",
+      "n_windows": 168,
+      "n_violated": 6,
+      "n_missing_signal": 0,
+      "auroc": 0.8945473251028807,
+      "auroc_lead3": 0.7468553459119497
+    },
+    {
+      "run_id": "t6_apa_seed3",
+      "model": "dsqwen-7b",
+      "signal": "queue_len",
+      "n_windows": 168,
+      "n_violated": 6,
+      "n_missing_signal": 0,
+      "auroc": 0.9284979423868313,
+      "auroc_lead3": 0.8789308176100629
+    },
+    {
+      "run_id": "t6_apa_seed3",
+      "model": "dsqwen-7b",
+      "signal": "decode_tps",
+      "n_windows": 168,
+      "n_violated": 6,
+      "n_missing_signal": 0,
+      "auroc": 0.8549382716049383,
+      "auroc_lead3": 0.7716194968553459
+    },
+    {
+      "run_id": "t6_apa_seed3",
+      "model": "dsqwen-7b",
+      "signal": "prefill_tps",
+      "n_windows": 168,
+      "n_violated": 6,
+      "n_missing_signal": 0,
+      "auroc": 0.8549382716049383,
+      "auroc_lead3": 0.7716194968553459
+    },
+    {
+      "run_id": "t6_tre_seed2",
+      "model": "dsllama-8b",
+      "signal": "z_m",
+      "n_windows": 167,
+      "n_violated": 6,
+      "n_missing_signal": 0,
+      "auroc": 0.2318840579710145,
+      "auroc_lead3": 0.17721518987341772
+    },
+    {
+      "run_id": "t6_tre_seed2",
+      "model": "dsllama-8b",
+      "signal": "queue_len",
+      "n_windows": 167,
+      "n_violated": 6,
+      "n_missing_signal": 0,
+      "auroc": 0.17650103519668736,
+      "auroc_lead3": 0.1617879746835443
+    },
+    {
+      "run_id": "t6_tre_seed2",
+      "model": "dsllama-8b",
+      "signal": "decode_tps",
+      "n_windows": 167,
+      "n_violated": 6,
+      "n_missing_signal": 0,
+      "auroc": 0.13457556935817805,
+      "auroc_lead3": 0.1574367088607595
+    },
+    {
+      "run_id": "t6_tre_seed2",
+      "model": "dsllama-8b",
+      "signal": "prefill_tps",
+      "n_windows": 167,
+      "n_violated": 6,
+      "n_missing_signal": 0,
+      "auroc": 0.13457556935817805,
+      "auroc_lead3": 0.1574367088607595
+    },
+    {
+      "run_id": "t6_tre_seed2",
+      "model": "dsqwen-14b",
+      "signal": "z_m",
+      "n_windows": 167,
+      "n_violated": 0,
+      "n_missing_signal": 0,
+      "auroc": null,
+      "auroc_lead3": null
+    },
+    {
+      "run_id": "t6_tre_seed2",
+      "model": "dsqwen-14b",
+      "signal": "queue_len",
+      "n_windows": 167,
+      "n_violated": 0,
+      "n_missing_signal": 0,
+      "auroc": null,
+      "auroc_lead3": null
+    },
+    {
+      "run_id": "t6_tre_seed2",
+      "model": "dsqwen-14b",
+      "signal": "decode_tps",
+      "n_windows": 167,
+      "n_violated": 0,
+      "n_missing_signal": 0,
+      "auroc": null,
+      "auroc_lead3": null
+    },
+    {
+      "run_id": "t6_tre_seed2",
+      "model": "dsqwen-14b",
+      "signal": "prefill_tps",
+      "n_windows": 167,
+      "n_violated": 0,
+      "n_missing_signal": 0,
+      "auroc": null,
+      "auroc_lead3": null
+    },
+    {
+      "run_id": "t6_tre_seed2",
+      "model": "dsqwen-7b",
+      "signal": "z_m",
+      "n_windows": 167,
+      "n_violated": 23,
+      "n_missing_signal": 0,
+      "auroc": 0.5904287439613527,
+      "auroc_lead3": 0.5742753623188406
+    },
+    {
+      "run_id": "t6_tre_seed2",
+      "model": "dsqwen-7b",
+      "signal": "queue_len",
+      "n_windows": 167,
+      "n_violated": 23,
+      "n_missing_signal": 0,
+      "auroc": 0.5688405797101449,
+      "auroc_lead3": 0.609083850931677
+    },
+    {
+      "run_id": "t6_tre_seed2",
+      "model": "dsqwen-7b",
+      "signal": "decode_tps",
+      "n_windows": 167,
+      "n_violated": 23,
+      "n_missing_signal": 0,
+      "auroc": 0.5822765700483091,
+      "auroc_lead3": 0.6277173913043478
+    },
+    {
+      "run_id": "t6_tre_seed2",
+      "model": "dsqwen-7b",
+      "signal": "prefill_tps",
+      "n_windows": 167,
+      "n_violated": 23,
+      "n_missing_signal": 0,
+      "auroc": 0.5822765700483091,
+      "auroc_lead3": 0.6277173913043478
+    },
+    {
+      "run_id": "t6_tre_seed3",
+      "model": "dsllama-8b",
+      "signal": "z_m",
+      "n_windows": 167,
+      "n_violated": 6,
+      "n_missing_signal": 0,
+      "auroc": 0.9591097308488613,
+      "auroc_lead3": 0.9264240506329114
+    },
+    {
+      "run_id": "t6_tre_seed3",
+      "model": "dsllama-8b",
+      "signal": "queue_len",
+      "n_windows": 167,
+      "n_violated": 6,
+      "n_missing_signal": 0,
+      "auroc": 0.7644927536231884,
+      "auroc_lead3": 0.6700949367088608
+    },
+    {
+      "run_id": "t6_tre_seed3",
+      "model": "dsllama-8b",
+      "signal": "decode_tps",
+      "n_windows": 167,
+      "n_violated": 6,
+      "n_missing_signal": 0,
+      "auroc": 0.5967908902691511,
+      "auroc_lead3": 0.4877373417721519
+    },
+    {
+      "run_id": "t6_tre_seed3",
+      "model": "dsllama-8b",
+      "signal": "prefill_tps",
+      "n_windows": 167,
+      "n_violated": 6,
+      "n_missing_signal": 0,
+      "auroc": 0.5967908902691511,
+      "auroc_lead3": 0.4877373417721519
+    },
+    {
+      "run_id": "t6_tre_seed3",
+      "model": "dsqwen-14b",
+      "signal": "z_m",
+      "n_windows": 167,
+      "n_violated": 6,
+      "n_missing_signal": 0,
+      "auroc": 0.34316770186335405,
+      "auroc_lead3": 0.3694620253164557
+    },
+    {
+      "run_id": "t6_tre_seed3",
+      "model": "dsqwen-14b",
+      "signal": "queue_len",
+      "n_windows": 167,
+      "n_violated": 6,
+      "n_missing_signal": 0,
+      "auroc": 0.7908902691511387,
+      "auroc_lead3": 0.7420886075949367
+    },
+    {
+      "run_id": "t6_tre_seed3",
+      "model": "dsqwen-14b",
+      "signal": "decode_tps",
+      "n_windows": 167,
+      "n_violated": 6,
+      "n_missing_signal": 0,
+      "auroc": 0.8555900621118012,
+      "auroc_lead3": 0.7978639240506329
+    },
+    {
+      "run_id": "t6_tre_seed3",
+      "model": "dsqwen-14b",
+      "signal": "prefill_tps",
+      "n_windows": 167,
+      "n_violated": 6,
+      "n_missing_signal": 0,
+      "auroc": 0.8555900621118012,
+      "auroc_lead3": 0.7978639240506329
+    },
+    {
+      "run_id": "t6_tre_seed3",
+      "model": "dsqwen-7b",
+      "signal": "z_m",
+      "n_windows": 168,
+      "n_violated": 0,
+      "n_missing_signal": 0,
+      "auroc": null,
+      "auroc_lead3": null
+    },
+    {
+      "run_id": "t6_tre_seed3",
+      "model": "dsqwen-7b",
+      "signal": "queue_len",
+      "n_windows": 168,
+      "n_violated": 0,
+      "n_missing_signal": 0,
+      "auroc": null,
+      "auroc_lead3": null
+    },
+    {
+      "run_id": "t6_tre_seed3",
+      "model": "dsqwen-7b",
+      "signal": "decode_tps",
+      "n_windows": 168,
+      "n_violated": 0,
+      "n_missing_signal": 0,
+      "auroc": null,
+      "auroc_lead3": null
+    },
+    {
+      "run_id": "t6_tre_seed3",
+      "model": "dsqwen-7b",
+      "signal": "prefill_tps",
+      "n_windows": 168,
+      "n_violated": 0,
+      "n_missing_signal": 0,
+      "auroc": null,
+      "auroc_lead3": null
+    },
+    {
+      "run_id": "__macro__",
+      "model": "__all__",
+      "signal": "z_m",
+      "n_windows": 23,
+      "n_violated": "",
+      "n_missing_signal": "",
+      "auroc": 0.7864087664239249,
+      "auroc_lead3": 0.7596350196740065
+    },
+    {
+      "run_id": "__macro__",
+      "model": "__all__",
+      "signal": "queue_len",
+      "n_windows": 23,
+      "n_violated": "",
+      "n_missing_signal": "",
+      "auroc": 0.7807462544187019,
+      "auroc_lead3": 0.7677216825017874
+    },
+    {
+      "run_id": "__macro__",
+      "model": "__all__",
+      "signal": "decode_tps",
+      "n_windows": 23,
+      "n_violated": "",
+      "n_missing_signal": "",
+      "auroc": 0.7309399971408105,
+      "auroc_lead3": 0.714174538593164
+    },
+    {
+      "run_id": "__macro__",
+      "model": "__all__",
+      "signal": "prefill_tps",
+      "n_windows": 23,
+      "n_violated": "",
+      "n_missing_signal": "",
+      "auroc": 0.69397597063805,
+      "auroc_lead3": 0.6763745326316155
+    }
+  ]
+}
