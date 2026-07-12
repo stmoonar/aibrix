@@ -1,0 +1,381 @@
+{
+  "apiVersion": "v1",
+  "items": [
+    {
+      "apiVersion": "v1",
+      "count": 2,
+      "eventTime": null,
+      "firstTimestamp": "2026-07-12T00:58:14Z",
+      "involvedObject": {
+        "apiVersion": "autoscaling.aibrix.ai/v1alpha1",
+        "kind": "PodAutoscaler",
+        "name": "dsllama-8b-apa",
+        "namespace": "default",
+        "resourceVersion": "195299584",
+        "uid": "ff95d7f5-edfc-4e2a-a257-d12cea9b4e77"
+      },
+      "kind": "Event",
+      "lastTimestamp": "2026-07-12T01:05:54Z",
+      "message": "APA algorithm completed. currentReplicas: 1, desiredReplicas: 2, shouldScale: true",
+      "metadata": {
+        "creationTimestamp": "2026-07-12T00:58:14Z",
+        "name": "dsllama-8b-apa.18c164ec7d9a6a79",
+        "namespace": "default",
+        "resourceVersion": "195303529",
+        "uid": "abf32199-1134-4e47-ac37-294207ed7318"
+      },
+      "reason": "AlgorithmRun",
+      "reportingComponent": "PodAutoscaler",
+      "reportingInstance": "",
+      "source": {
+        "component": "PodAutoscaler"
+      },
+      "type": "Normal"
+    },
+    {
+      "apiVersion": "v1",
+      "count": 2,
+      "eventTime": null,
+      "firstTimestamp": "2026-07-12T00:58:15Z",
+      "involvedObject": {
+        "apiVersion": "autoscaling.aibrix.ai/v1alpha1",
+        "kind": "PodAutoscaler",
+        "name": "dsllama-8b-apa",
+        "namespace": "default",
+        "resourceVersion": "195299584",
+        "uid": "ff95d7f5-edfc-4e2a-a257-d12cea9b4e77"
+      },
+      "kind": "Event",
+      "lastTimestamp": "2026-07-12T01:05:55Z",
+      "message": "New size: 2; reason: apa above target",
+      "metadata": {
+        "creationTimestamp": "2026-07-12T00:58:15Z",
+        "name": "dsllama-8b-apa.18c164ecad47b6d3",
+        "namespace": "default",
+        "resourceVersion": "195303541",
+        "uid": "815f4956-ed8d-4ae0-916e-37a6bea2b4d8"
+      },
+      "reason": "SuccessfulRescale",
+      "reportingComponent": "PodAutoscaler",
+      "reportingInstance": "",
+      "source": {
+        "component": "PodAutoscaler"
+      },
+      "type": "Normal"
+    },
+    {
+      "apiVersion": "v1",
+      "count": 2,
+      "eventTime": null,
+      "firstTimestamp": "2026-07-12T00:58:15Z",
+      "involvedObject": {
+        "apiVersion": "autoscaling.aibrix.ai/v1alpha1",
+        "kind": "PodAutoscaler",
+        "name": "dsllama-8b-apa",
+        "namespace": "default",
+        "resourceVersion": "195301622",
+        "uid": "ff95d7f5-edfc-4e2a-a257-d12cea9b4e77"
+      },
+      "kind": "Event",
+      "lastTimestamp": "2026-07-12T01:05:55Z",
+      "message": "APA algorithm completed. currentReplicas: 2, desiredReplicas: 3, shouldScale: true",
+      "metadata": {
+        "creationTimestamp": "2026-07-12T00:58:15Z",
+        "name": "dsllama-8b-apa.18c164ecbd41f7d0",
+        "namespace": "default",
+        "resourceVersion": "195303545",
+        "uid": "0f082a45-5239-4a71-8fb3-708c636640d1"
+      },
+      "reason": "AlgorithmRun",
+      "reportingComponent": "PodAutoscaler",
+      "reportingInstance": "",
+      "source": {
+        "component": "PodAutoscaler"
+      },
+      "type": "Normal"
+    },
+    {
+      "apiVersion": "v1",
+      "count": 2,
+      "eventTime": null,
+      "firstTimestamp": "2026-07-12T00:58:16Z",
+      "involvedObject": {
+        "apiVersion": "autoscaling.aibrix.ai/v1alpha1",
+        "kind": "PodAutoscaler",
+        "name": "dsllama-8b-apa",
+        "namespace": "default",
+        "resourceVersion": "195301622",
+        "uid": "ff95d7f5-edfc-4e2a-a257-d12cea9b4e77"
+      },
+      "kind": "Event",
+      "lastTimestamp": "2026-07-12T01:05:56Z",
+      "message": "New size: 3; reason: apa above target",
+      "metadata": {
+        "creationTimestamp": "2026-07-12T00:58:16Z",
+        "name": "dsllama-8b-apa.18c164eceed8fe89",
+        "namespace": "default",
+        "resourceVersion": "195303555",
+        "uid": "57efc9c9-31f2-49ce-8a6d-f3a49b6765cb"
+      },
+      "reason": "SuccessfulRescale",
+      "reportingComponent": "PodAutoscaler",
+      "reportingInstance": "",
+      "source": {
+        "component": "PodAutoscaler"
+      },
+      "type": "Normal"
+    },
+    {
+      "apiVersion": "v1",
+      "count": 2,
+      "eventTime": null,
+      "firstTimestamp": "2026-07-12T00:58:16Z",
+      "involvedObject": {
+        "apiVersion": "autoscaling.aibrix.ai/v1alpha1",
+        "kind": "PodAutoscaler",
+        "name": "dsllama-8b-apa",
+        "namespace": "default",
+        "resourceVersion": "195301639",
+        "uid": "ff95d7f5-edfc-4e2a-a257-d12cea9b4e77"
+      },
+      "kind": "Event",
+      "lastTimestamp": "2026-07-12T01:05:57Z",
+      "message": "APA algorithm completed. currentReplicas: 3, desiredReplicas: 4, shouldScale: true",
+      "metadata": {
+        "creationTimestamp": "2026-07-12T00:58:16Z",
+        "name": "dsllama-8b-apa.18c164ed03974463",
+        "namespace": "default",
+        "resourceVersion": "195303562",
+        "uid": "95045dac-0d07-401f-b787-d04154daf5b3"
+      },
+      "reason": "AlgorithmRun",
+      "reportingComponent": "PodAutoscaler",
+      "reportingInstance": "",
+      "source": {
+        "component": "PodAutoscaler"
+      },
+      "type": "Normal"
+    },
+    {
+      "apiVersion": "v1",
+      "count": 2,
+      "eventTime": null,
+      "firstTimestamp": "2026-07-12T00:58:17Z",
+      "involvedObject": {
+        "apiVersion": "autoscaling.aibrix.ai/v1alpha1",
+        "kind": "PodAutoscaler",
+        "name": "dsllama-8b-apa",
+        "namespace": "default",
+        "resourceVersion": "195301639",
+        "uid": "ff95d7f5-edfc-4e2a-a257-d12cea9b4e77"
+      },
+      "kind": "Event",
+      "lastTimestamp": "2026-07-12T01:05:58Z",
+      "message": "New size: 4; reason: apa above target",
+      "metadata": {
+        "creationTimestamp": "2026-07-12T00:58:17Z",
+        "name": "dsllama-8b-apa.18c164ed425f9e4b",
+        "namespace": "default",
+        "resourceVersion": "195303572",
+        "uid": "9264f6b4-4373-4c07-84fa-9b6867a643d8"
+      },
+      "reason": "SuccessfulRescale",
+      "reportingComponent": "PodAutoscaler",
+      "reportingInstance": "",
+      "source": {
+        "component": "PodAutoscaler"
+      },
+      "type": "Normal"
+    },
+    {
+      "apiVersion": "v1",
+      "count": 2,
+      "eventTime": null,
+      "firstTimestamp": "2026-07-12T00:58:18Z",
+      "involvedObject": {
+        "apiVersion": "autoscaling.aibrix.ai/v1alpha1",
+        "kind": "PodAutoscaler",
+        "name": "dsllama-8b-apa",
+        "namespace": "default",
+        "resourceVersion": "195301650",
+        "uid": "ff95d7f5-edfc-4e2a-a257-d12cea9b4e77"
+      },
+      "kind": "Event",
+      "lastTimestamp": "2026-07-12T01:05:59Z",
+      "message": "APA algorithm completed. currentReplicas: 4, desiredReplicas: 5, shouldScale: true",
+      "metadata": {
+        "creationTimestamp": "2026-07-12T00:58:18Z",
+        "name": "dsllama-8b-apa.18c164ed72659d66",
+        "namespace": "default",
+        "resourceVersion": "195303579",
+        "uid": "8ba50d68-eea1-482d-ab38-e0b7c5ecd77d"
+      },
+      "reason": "AlgorithmRun",
+      "reportingComponent": "PodAutoscaler",
+      "reportingInstance": "",
+      "source": {
+        "component": "PodAutoscaler"
+      },
+      "type": "Normal"
+    },
+    {
+      "apiVersion": "v1",
+      "count": 2,
+      "eventTime": null,
+      "firstTimestamp": "2026-07-12T00:58:19Z",
+      "involvedObject": {
+        "apiVersion": "autoscaling.aibrix.ai/v1alpha1",
+        "kind": "PodAutoscaler",
+        "name": "dsllama-8b-apa",
+        "namespace": "default",
+        "resourceVersion": "195301650",
+        "uid": "ff95d7f5-edfc-4e2a-a257-d12cea9b4e77"
+      },
+      "kind": "Event",
+      "lastTimestamp": "2026-07-12T01:06:00Z",
+      "message": "New size: 5; reason: apa above target",
+      "metadata": {
+        "creationTimestamp": "2026-07-12T00:58:19Z",
+        "name": "dsllama-8b-apa.18c164eda1a67974",
+        "namespace": "default",
+        "resourceVersion": "195303587",
+        "uid": "e83f3c9e-1664-487c-ad24-f69dbe4379ba"
+      },
+      "reason": "SuccessfulRescale",
+      "reportingComponent": "PodAutoscaler",
+      "reportingInstance": "",
+      "source": {
+        "component": "PodAutoscaler"
+      },
+      "type": "Normal"
+    },
+    {
+      "apiVersion": "v1",
+      "count": 4,
+      "eventTime": null,
+      "firstTimestamp": "2026-07-12T00:58:20Z",
+      "involvedObject": {
+        "apiVersion": "autoscaling.aibrix.ai/v1alpha1",
+        "kind": "PodAutoscaler",
+        "name": "dsllama-8b-apa",
+        "namespace": "default",
+        "resourceVersion": "195301670",
+        "uid": "ff95d7f5-edfc-4e2a-a257-d12cea9b4e77"
+      },
+      "kind": "Event",
+      "lastTimestamp": "2026-07-12T01:06:55Z",
+      "message": "APA algorithm completed. currentReplicas: 5, desiredReplicas: 6, shouldScale: true",
+      "metadata": {
+        "creationTimestamp": "2026-07-12T00:58:20Z",
+        "name": "dsllama-8b-apa.18c164edd77ed482",
+        "namespace": "default",
+        "resourceVersion": "195303809",
+        "uid": "f15f80e6-9e97-44e2-a4b6-b3617ebc722f"
+      },
+      "reason": "AlgorithmRun",
+      "reportingComponent": "PodAutoscaler",
+      "reportingInstance": "",
+      "source": {
+        "component": "PodAutoscaler"
+      },
+      "type": "Normal"
+    },
+    {
+      "apiVersion": "v1",
+      "count": 4,
+      "eventTime": null,
+      "firstTimestamp": "2026-07-12T00:58:20Z",
+      "involvedObject": {
+        "apiVersion": "autoscaling.aibrix.ai/v1alpha1",
+        "kind": "PodAutoscaler",
+        "name": "dsllama-8b-apa",
+        "namespace": "default",
+        "resourceVersion": "195301670",
+        "uid": "ff95d7f5-edfc-4e2a-a257-d12cea9b4e77"
+      },
+      "kind": "Event",
+      "lastTimestamp": "2026-07-12T01:06:55Z",
+      "message": "service_manage /scale_service returned status 400: {\"detail\":\"dsllama-8b-nscc-ds-4a100-node9-gpu-0-5787b4856f-x29t9: slot already has awake binding\"}",
+      "metadata": {
+        "creationTimestamp": "2026-07-12T00:58:20Z",
+        "name": "dsllama-8b-apa.18c164eddd52f2ca",
+        "namespace": "default",
+        "resourceVersion": "195303813",
+        "uid": "7130f08f-eb91-4ad7-80c8-74a8817c681e"
+      },
+      "reason": "FailedRescale",
+      "reportingComponent": "PodAutoscaler",
+      "reportingInstance": "",
+      "source": {
+        "component": "PodAutoscaler"
+      },
+      "type": "Warning"
+    },
+    {
+      "apiVersion": "v1",
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-07-12T01:00:24Z",
+      "involvedObject": {
+        "apiVersion": "autoscaling.aibrix.ai/v1alpha1",
+        "kind": "PodAutoscaler",
+        "name": "dsllama-8b-apa",
+        "namespace": "default",
+        "resourceVersion": "195301693",
+        "uid": "ff95d7f5-edfc-4e2a-a257-d12cea9b4e77"
+      },
+      "kind": "Event",
+      "lastTimestamp": "2026-07-12T01:00:24Z",
+      "message": "APA algorithm completed. currentReplicas: 5, desiredReplicas: 1, shouldScale: true",
+      "metadata": {
+        "creationTimestamp": "2026-07-12T01:00:24Z",
+        "name": "dsllama-8b-apa.18c1650ada0e5f99",
+        "namespace": "default",
+        "resourceVersion": "195302181",
+        "uid": "cf700b90-27a2-4fdf-8ac7-c60b4ba6ef3b"
+      },
+      "reason": "AlgorithmRun",
+      "reportingComponent": "PodAutoscaler",
+      "reportingInstance": "",
+      "source": {
+        "component": "PodAutoscaler"
+      },
+      "type": "Normal"
+    },
+    {
+      "apiVersion": "v1",
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-07-12T01:00:30Z",
+      "involvedObject": {
+        "apiVersion": "autoscaling.aibrix.ai/v1alpha1",
+        "kind": "PodAutoscaler",
+        "name": "dsllama-8b-apa",
+        "namespace": "default",
+        "resourceVersion": "195301693",
+        "uid": "ff95d7f5-edfc-4e2a-a257-d12cea9b4e77"
+      },
+      "kind": "Event",
+      "lastTimestamp": "2026-07-12T01:00:30Z",
+      "message": "New size: 1; reason: All metrics below target",
+      "metadata": {
+        "creationTimestamp": "2026-07-12T01:00:30Z",
+        "name": "dsllama-8b-apa.18c1650c518e1837",
+        "namespace": "default",
+        "resourceVersion": "195302230",
+        "uid": "2d22519f-c835-4424-9dfe-51dce9422cbe"
+      },
+      "reason": "SuccessfulRescale",
+      "reportingComponent": "PodAutoscaler",
+      "reportingInstance": "",
+      "source": {
+        "component": "PodAutoscaler"
+      },
+      "type": "Normal"
+    }
+  ],
+  "kind": "List",
+  "metadata": {
+    "resourceVersion": ""
+  }
+}

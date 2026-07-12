@@ -1,0 +1,17 @@
+ts,model,action,serve_id
+2026-07-11T22:37:35.374236Z,dsllama-8b,wake,dsllama-8b-nscc-ds-4a100-node10-gpu-0-5f474d7f85-7mns7
+2026-07-11T22:37:36.874539Z,dsllama-8b,wake,dsllama-8b-nscc-ds-4a100-node10-gpu-1-56b6bfcfdd-npqs2
+2026-07-11T22:37:38.374840Z,dsllama-8b,wake,dsllama-8b-nscc-ds-4a100-node10-gpu-2-55484bc5d7-kvtvr
+2026-07-11T22:37:39.875125Z,dsllama-8b,wake,dsllama-8b-nscc-ds-4a100-node10-gpu-3-77966677f4-95m45
+2026-07-11T22:39:41.402514Z,dsllama-8b,sleep,dsllama-8b-nscc-ds-4a100-node10-gpu-0-5f474d7f85-7mns7
+2026-07-11T22:39:41.402514Z,dsllama-8b,sleep,dsllama-8b-nscc-ds-4a100-node10-gpu-1-56b6bfcfdd-npqs2
+2026-07-11T22:39:41.402514Z,dsllama-8b,sleep,dsllama-8b-nscc-ds-4a100-node10-gpu-2-55484bc5d7-kvtvr
+2026-07-11T22:39:41.402514Z,dsllama-8b,sleep,dsllama-8b-nscc-ds-4a100-node10-gpu-3-77966677f4-95m45
+2026-07-11T22:45:25.980081Z,dsllama-8b,wake,dsllama-8b-nscc-ds-4a100-node10-gpu-0-5f474d7f85-7mns7
+2026-07-11T22:45:26.980292Z,dsllama-8b,wake,dsllama-8b-nscc-ds-4a100-node10-gpu-1-56b6bfcfdd-npqs2
+2026-07-11T22:45:28.480596Z,dsllama-8b,wake,dsllama-8b-nscc-ds-4a100-node10-gpu-2-55484bc5d7-kvtvr
+2026-07-11T22:45:29.980928Z,dsllama-8b,wake,dsllama-8b-nscc-ds-4a100-node10-gpu-3-77966677f4-95m45
+2026-07-11T22:47:32.505889Z,dsllama-8b,sleep,dsllama-8b-nscc-ds-4a100-node10-gpu-0-5f474d7f85-7mns7
+2026-07-11T22:47:32.505889Z,dsllama-8b,sleep,dsllama-8b-nscc-ds-4a100-node10-gpu-1-56b6bfcfdd-npqs2
+2026-07-11T22:47:32.505889Z,dsllama-8b,sleep,dsllama-8b-nscc-ds-4a100-node10-gpu-2-55484bc5d7-kvtvr
+2026-07-11T22:47:32.505889Z,dsllama-8b,sleep,dsllama-8b-nscc-ds-4a100-node10-gpu-3-77966677f4-95m45
