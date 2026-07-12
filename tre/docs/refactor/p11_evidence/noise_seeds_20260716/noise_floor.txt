@@ -1,0 +1,12 @@
+cell            seed1    seed2    seed3   range     std
+t1_tre       43.300%  42.187%  41.593%  1.707pp  0.867pp
+t1_apa       48.811%  49.190%  53.736%  4.925pp  2.741pp
+t3_tre        0.616%   1.995%   0.756%  1.379pp  0.759pp
+t3_apa       47.536%  49.361%  42.680%  6.681pp  3.453pp
+t6_tre        0.004%   0.022%   0.036%  0.031pp  0.016pp
+t6_apa        0.013%   0.004%   0.009%  0.009pp  0.004pp
+tre max seed-range across t1/t3/t6: 1.707pp
+apa max seed-range across t1/t3/t6: 6.681pp
+
+Use max range as the conservative noise floor when judging E1 per-trace
+margins and the E1-tre vs E2-zm eta-gate deltas.

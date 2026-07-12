@@ -1,0 +1,29 @@
+{
+  "arm": "apa",
+  "command": [
+    "/usr/bin/python3",
+    "-m",
+    "tre_replayer.run_trace",
+    "--trace",
+    "/data/nfs_shared_data/xxy/aibrix/tre/replayer/traces_v2/t1_a1_demand_shift/trace.json",
+    "--gateway-url",
+    "http://192.168.223.76:31592/v1/completions",
+    "--out",
+    "/data/nfs_shared_data/xxy/aibrix/tre/docs/refactor/p11_evidence/noise_seeds_20260716/t1_apa_seed2/requests.jsonl",
+    "--registry",
+    "/data/nfs_shared_data/xxy/aibrix/tre/deploy/registry.yaml",
+    "--seed",
+    "20260716",
+    "--max-in-flight",
+    "512",
+    "--trim-ramp-windows",
+    "1"
+  ],
+  "controller_pod": "tre-v2-controller-787c4d7cf-hcbsg",
+  "gateway": "http://192.168.223.76:31592/v1/completions",
+  "operator": "root via Codex",
+  "run_id": "t1_apa_seed2",
+  "seed": 20260716,
+  "trace": "replayer/traces_v2/t1_a1_demand_shift/trace.json",
+  "trace_sha256": "f521d56606fc1d22236a80266864736202ab5a64c54c90e995340ad7aa6be8da"
+}

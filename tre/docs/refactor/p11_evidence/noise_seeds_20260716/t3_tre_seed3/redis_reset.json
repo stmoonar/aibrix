@@ -1,0 +1,15 @@
+{
+  "cleared_keys": [
+    "tre:v2:controller:alerts:hidden_orphans",
+    "tre:v2:controller:orphan_watch",
+    "tre:v2:controller:safescale:probes",
+    "tre:v2:controller:signal_log",
+    "tre:v2:decision:hist:dsllama-8b",
+    "tre:v2:decision:hist:dsqwen-14b",
+    "tre:v2:decision:hist:dsqwen-7b",
+    "tre:v2:decision:latest",
+    "tre:v2:profile:events"
+  ],
+  "preserved_sm_state_fields": 20,
+  "preserved_sm_version": "479"
+}

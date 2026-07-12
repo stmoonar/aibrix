@@ -1,0 +1,79 @@
+{
+  "execute": true,
+  "frozen_sha": "1457e54ae20da445eb1e11aef7c17a0ce884f612",
+  "manifest": "/data/nfs_shared_data/xxy/aibrix/tre/deploy/campaigns/noise_seeds.json",
+  "selected_runs": [
+    {
+      "arm": "tre",
+      "run_id": "t1_tre_seed2",
+      "seed": 20260716,
+      "trace": "replayer/traces_v2/t1_a1_demand_shift/trace.json"
+    },
+    {
+      "arm": "apa",
+      "run_id": "t1_apa_seed2",
+      "seed": 20260716,
+      "trace": "replayer/traces_v2/t1_a1_demand_shift/trace.json"
+    },
+    {
+      "arm": "tre",
+      "run_id": "t3_tre_seed2",
+      "seed": 20260716,
+      "trace": "replayer/traces_v2/t3_a3_io_drift/trace.json"
+    },
+    {
+      "arm": "apa",
+      "run_id": "t3_apa_seed2",
+      "seed": 20260716,
+      "trace": "replayer/traces_v2/t3_a3_io_drift/trace.json"
+    },
+    {
+      "arm": "tre",
+      "run_id": "t6_tre_seed2",
+      "seed": 20260716,
+      "trace": "replayer/traces_v2/t6_a6_control/trace.json"
+    },
+    {
+      "arm": "apa",
+      "run_id": "t6_apa_seed2",
+      "seed": 20260716,
+      "trace": "replayer/traces_v2/t6_a6_control/trace.json"
+    },
+    {
+      "arm": "tre",
+      "run_id": "t1_tre_seed3",
+      "seed": 20260717,
+      "trace": "replayer/traces_v2/t1_a1_demand_shift/trace.json"
+    },
+    {
+      "arm": "apa",
+      "run_id": "t1_apa_seed3",
+      "seed": 20260717,
+      "trace": "replayer/traces_v2/t1_a1_demand_shift/trace.json"
+    },
+    {
+      "arm": "tre",
+      "run_id": "t3_tre_seed3",
+      "seed": 20260717,
+      "trace": "replayer/traces_v2/t3_a3_io_drift/trace.json"
+    },
+    {
+      "arm": "apa",
+      "run_id": "t3_apa_seed3",
+      "seed": 20260717,
+      "trace": "replayer/traces_v2/t3_a3_io_drift/trace.json"
+    },
+    {
+      "arm": "tre",
+      "run_id": "t6_tre_seed3",
+      "seed": 20260717,
+      "trace": "replayer/traces_v2/t6_a6_control/trace.json"
+    },
+    {
+      "arm": "apa",
+      "run_id": "t6_apa_seed3",
+      "seed": 20260717,
+      "trace": "replayer/traces_v2/t6_a6_control/trace.json"
+    }
+  ]
+}

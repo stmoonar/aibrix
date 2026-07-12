@@ -1,0 +1,3 @@
+{"delta":1,"donor":null,"kind":"scale","loop":"fairness","model":"dsqwen-7b","reason":"low_fairness_sleeping_capacity","receiver":"dsqwen-7b","requires_safescale":false,"source_loop":"fairness","ts_ms":1783836494752}
+{"delta":1,"donor":null,"kind":"scale","loop":"fairness","model":"dsqwen-7b","reason":"low_fairness_sleeping_capacity","receiver":"dsqwen-7b","requires_safescale":false,"source_loop":"fairness","ts_ms":1783836501305}
+{"delta":1,"donor":null,"kind":"scale","loop":"fairness","model":"dsqwen-7b","reason":"low_fairness_sleeping_capacity","receiver":"dsqwen-7b","requires_safescale":false,"source_loop":"fairness","ts_ms":1783836514887}
