@@ -570,6 +570,7 @@ class ServiceManagerV2:
         )
         if not stale:
             return None
+        self.enter_recovery_observe()
         newest = stale[0]
         request = newest.get("request") or {}
         return self.start_fleet_repair(
@@ -580,6 +581,11 @@ class ServiceManagerV2:
                 str(record["operation_id"]) for record in stale
             ],
         )
+
+    def enter_recovery_observe(self) -> str:
+        if self._safety_gate is None:
+            raise ValueError("fleet repair safety gate is not configured")
+        return self._safety_gate.enter_recovery_observe()
 
     def detect_fleet_drift(self) -> list[dict]:
         if self._runtime_ops is None or self._fleet_store is None:

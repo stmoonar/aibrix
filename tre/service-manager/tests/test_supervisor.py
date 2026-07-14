@@ -7,6 +7,7 @@ class FakeService:
         self.stale = None
         self.repairs = []
         self.converges = 0
+        self.observe_handoffs = 0
 
     def converge_startups(self):
         self.converges += 1
@@ -24,6 +25,10 @@ class FakeService:
         self.repairs.append(True)
         return {"operation_id": "repair-1"}
 
+    def enter_recovery_observe(self):
+        self.observe_handoffs += 1
+        return "active"
+
 
 def test_supervisor_debounces_batch_drift_before_repair():
     service = FakeService()
@@ -38,9 +43,11 @@ def test_supervisor_debounces_batch_drift_before_repair():
     supervisor.run_once()
     supervisor.run_once()
     assert service.repairs == []
+    assert service.observe_handoffs == 0
     supervisor.run_once()
 
     assert service.repairs == [True]
+    assert service.observe_handoffs == 1
     assert service.converges == 3
     assert supervisor.snapshot().last_recovery_operation_id == "repair-1"
 

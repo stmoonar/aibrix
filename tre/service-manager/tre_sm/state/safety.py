@@ -9,6 +9,7 @@ from tre_sm.state.operations import OperationHandle
 
 class SafetyRedis(Protocol):
     def get(self, key: str): ...
+    def set(self, key: str, value: str): ...
 
 
 class PressureSource(Protocol):
@@ -54,6 +55,14 @@ class ClusterSafetyGate:
             raise ControllerNotPaused(
                 f"controller must be observe before fleet repair, got {mode}"
             )
+
+    def enter_recovery_observe(self) -> str:
+        """Fail-safe handoff used only by the automatic fleet supervisor."""
+        raw = self._redis.get(rediskeys.CONTROLLER_MODE_KEY)
+        previous = "active" if raw is None else _text(raw)
+        if previous != "observe":
+            self._redis.set(rediskeys.CONTROLLER_MODE_KEY, "observe")
+        return previous
 
     def assert_no_pressure(self) -> None:
         reasons = self._pressure_source.node_pressure_reasons()

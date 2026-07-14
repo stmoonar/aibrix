@@ -14,6 +14,7 @@ class SupervisedService(Protocol):
     def recover_stale_fleet_repairs(self) -> dict | None: ...
     def detect_fleet_drift(self) -> list[dict]: ...
     def start_fleet_repair(self, *, awake_binding_ids=None, recovered_from=None) -> dict: ...
+    def enter_recovery_observe(self) -> str: ...
 
 
 @dataclass(frozen=True)
@@ -112,6 +113,7 @@ class FleetSupervisor:
             and now - self._last_repair_at < self._repair_cooldown_s
         ):
             return
+        self._service.enter_recovery_observe()
         submitted = self._service.start_fleet_repair()
         self._last_repair_at = now
         self._last_recovery_operation_id = str(submitted["operation_id"])

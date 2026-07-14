@@ -7,10 +7,16 @@ from tre_sm.state.safety import ClusterSafetyGate, ControllerNotPaused
 class FakeRedis:
     def __init__(self, mode="observe"):
         self.mode = mode
+        self.sets = []
 
     def get(self, key):
         assert key == rediskeys.CONTROLLER_MODE_KEY
         return self.mode.encode()
+
+    def set(self, key, value):
+        assert key == rediskeys.CONTROLLER_MODE_KEY
+        self.mode = value
+        self.sets.append((key, value))
 
 
 class FakePressure:
@@ -50,6 +56,23 @@ def test_safety_gate_rejects_repair_while_controller_active():
 
     with pytest.raises(ControllerNotPaused):
         gate.assert_controller_observe()
+
+
+def test_safety_gate_hands_controller_to_observe_for_automatic_recovery():
+    redis = FakeRedis("active")
+    gate = ClusterSafetyGate(redis, FakePressure([{}]))
+
+    assert gate.enter_recovery_observe() == "active"
+    assert redis.mode == "observe"
+    assert redis.sets == [(rediskeys.CONTROLLER_MODE_KEY, "observe")]
+
+
+def test_safety_gate_observe_handoff_is_idempotent():
+    redis = FakeRedis("observe")
+    gate = ClusterSafetyGate(redis, FakePressure([{}]))
+
+    assert gate.enter_recovery_observe() == "observe"
+    assert redis.sets == []
 
 
 def test_safety_gate_pauses_on_pressure_and_requires_clear_hysteresis():
