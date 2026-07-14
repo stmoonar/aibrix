@@ -20,11 +20,18 @@ spec:
         kubernetes.io/hostname: nscc-ds-4a100-node10
       containers:
         - name: service-manager
-          image: tre-v2-service-manager:20260715-475e3415
+          image: tre-v2-service-manager:20260715-461d5396
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8000
               name: http
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 2
+            timeoutSeconds: 2
+            failureThreshold: 15
           env:
             - name: TRE_REDIS_URL
               value: redis://tre-v2-redis:6379/0
