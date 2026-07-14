@@ -13,6 +13,7 @@ from tre_sm.gpu_truth import RedisGpuTruth
 from tre_sm.ops.k8s_ops import K8sOps
 from tre_sm.ops.vllm_ops import VllmOps
 from tre_sm.state.reconcile import PodRecord
+from tre_sm.state.operations import OperationCoordinator
 from tre_sm.state.store import StateStore
 
 
@@ -39,15 +40,21 @@ def create_app() -> FastAPI:
     redis_url = os.environ.get("TRE_REDIS_URL", "redis://aibrix-redis-master:6379/0")
     redis_client = redis.Redis.from_url(redis_url)
     k8s_ops = _create_k8s_ops(registry)
+    operation_coordinator = OperationCoordinator(
+        redis_client,
+        owner=os.environ.get("HOSTNAME", "tre-v2-service-manager"),
+        lease_ttl_ms=int(os.environ.get("TRE_SM_WRITER_LEASE_TTL_MS", "30000")),
+    )
     return create_service_app(
         registry,
-        StateStore(redis_client),
+        StateStore(redis_client, require_fence=True),
         k8s_client=K8sPodClientFromOps(registry.topology(), k8s_ops),
         runtime_ops=k8s_ops,
         vllm_ops=VllmOps(),
         gpu_truth=RedisGpuTruth(redis_client),
         create_max_used_mib=int(os.environ.get("TRE_CREATE_MAX_USED_MIB", "2500")),
         sleep_leak_used_mib=int(os.environ.get("TRE_SLEEP_LEAK_USED_MIB", "8192")),
+        operation_coordinator=operation_coordinator,
     )
 
 

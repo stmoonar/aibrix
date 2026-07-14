@@ -3,9 +3,11 @@ from __future__ import annotations
 import re
 from collections import Counter
 from dataclasses import replace
+from functools import wraps
 from typing import Protocol
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from tre_common.registry import Registry
@@ -14,11 +16,27 @@ from tre_sm.allocator.slots import Binding, Migration, Slot, SlotAllocator
 from tre_sm.allocator.topology import K8sPodSnapshot
 from tre_sm.gpu_truth import GpuTruthProvider
 from tre_sm.state.reconcile import K8sPodClient, POD_STATE_AWAKE, POD_STATE_HIDDEN, POD_STATE_SLEEPING, audit_state, reconcile_state
-from tre_sm.state.store import StateConflict, StateStore
+from tre_sm.state.operations import OperationBusy, OperationCoordinator
+from tre_sm.state.store import StateConflict, StateFenceError, StateStore
 from tre_sm.api.v1_compat import create_v1_compat_router
 
 
 _NAT_SPLIT = re.compile(r"(\d+)")
+
+
+def serialized_operation(kind: str):
+    def decorate(method):
+        @wraps(method)
+        def wrapped(self, *args, **kwargs):
+            if self._operation_coordinator is None:
+                return method(self, *args, **kwargs)
+            with self._operation_coordinator.operation(kind) as operation:
+                operation.advance("executing")
+                return method(self, *args, **kwargs)
+
+        return wrapped
+
+    return decorate
 
 
 class RuntimePodOps(Protocol):
@@ -73,6 +91,7 @@ class ServiceManagerV2:
         gpu_truth: GpuTruthProvider | None = None,
         create_max_used_mib: int = 2500,
         sleep_leak_used_mib: int = 8192,
+        operation_coordinator: OperationCoordinator | None = None,
     ) -> None:
         self._registry = registry
         self._store = store
@@ -82,6 +101,7 @@ class ServiceManagerV2:
         self._gpu_truth = gpu_truth
         self._create_max_used_mib = create_max_used_mib
         self._sleep_leak_used_mib = sleep_leak_used_mib
+        self._operation_coordinator = operation_coordinator
 
     def get_state(self) -> dict:
         snapshot = self._store.load()
@@ -91,6 +111,7 @@ class ServiceManagerV2:
             "bindings": [self._binding_dict(binding) for binding in snapshot.bindings],
         }
 
+    @serialized_operation("put_model_target")
     def put_model_target(self, model: str, *, wake_replicas: int) -> dict:
         spec = self._registry.model(model)
         if wake_replicas < 0:
@@ -189,6 +210,7 @@ class ServiceManagerV2:
             "actions": actions,
         }
 
+    @serialized_operation("put_binding_power")
     def put_binding_power(self, serve_id: str, *, awake: bool) -> dict:
         snapshot = self._store.load()
         binding = next(
@@ -223,6 +245,7 @@ class ServiceManagerV2:
         }
 
 
+    @serialized_operation("put_model_routable")
     def put_model_routable(self, model: str, *, hidden_pods: list[str]) -> dict:
         self._registry.model(model)
         snapshot = self._store.load()
@@ -262,6 +285,7 @@ class ServiceManagerV2:
         }
 
 
+    @serialized_operation("defrag")
     def defrag(self, *, tp_size: int) -> dict:
         snapshot = self._store.load()
         allocator = SlotAllocator(self._registry.topology(), snapshot.bindings)
@@ -321,6 +345,7 @@ class ServiceManagerV2:
             "issues": result.issues,
         }
 
+    @serialized_operation("reconcile")
     def reconcile(self, *, drop_missing: bool = False) -> dict:
         if self._k8s_client is None:
             raise ValueError("k8s_client is required for reconcile")
@@ -345,6 +370,19 @@ class ServiceManagerV2:
             "warnings": result.warnings,
             "bindings": [self._binding_dict(binding) for binding in result.bindings],
         }
+
+    def list_operations(self, *, limit: int = 100) -> list[dict]:
+        if self._operation_coordinator is None:
+            return []
+        return self._operation_coordinator.list_operations(limit=limit)
+
+    def get_operation(self, operation_id: str) -> dict:
+        if self._operation_coordinator is None:
+            raise KeyError(operation_id)
+        operation = self._operation_coordinator.get_operation(operation_id)
+        if operation is None:
+            raise KeyError(operation_id)
+        return operation
 
     def _apply_runtime_power_action(self, binding: Binding, *, action: str) -> None:
         if self._runtime_ops is None or self._vllm_ops is None:
@@ -545,6 +583,21 @@ def create_app(service: ServiceManagerV2) -> FastAPI:
     app = FastAPI()
     app.include_router(create_v1_compat_router(service))
 
+    @app.exception_handler(OperationBusy)
+    async def operation_busy_handler(
+        _request: Request, exc: OperationBusy
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=409,
+            content={"detail": str(exc), "current_writer": exc.current_writer},
+        )
+
+    @app.exception_handler(StateFenceError)
+    async def state_fence_handler(
+        _request: Request, exc: StateFenceError
+    ) -> JSONResponse:
+        return JSONResponse(status_code=409, content={"detail": str(exc)})
+
     @app.get("/healthz")
     def healthz() -> dict:
         return {"ok": True}
@@ -570,6 +623,21 @@ def create_app(service: ServiceManagerV2) -> FastAPI:
     @app.get("/v2/state")
     def get_state() -> dict:
         return service.get_state()
+
+
+    @app.get("/v2/operations")
+    def list_operations(limit: int = 100) -> dict:
+        if limit < 1 or limit > 1000:
+            raise HTTPException(status_code=400, detail="limit must be between 1 and 1000")
+        return {"operations": service.list_operations(limit=limit)}
+
+
+    @app.get("/v2/operations/{operation_id}")
+    def get_operation(operation_id: str) -> dict:
+        try:
+            return service.get_operation(operation_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="operation not found") from exc
 
 
     @app.post("/v2/defrag")
