@@ -906,6 +906,9 @@ def test_startup_admission_sleeps_overlap_and_records_restore_intent():
         def release(self, binding):
             self.calls.append(("release", binding.binding_id))
 
+        def load(self):
+            return []
+
     resident = K8sPodSnapshot(
         name="m2-old",
         model="m2",
@@ -978,17 +981,24 @@ def test_drift_detector_treats_pending_admitted_startup_as_present():
         "m1/node-a/0", "m1", "node-a", (0,), "resident", "sleeping",
         False, 1, now, "test", "test",
     )
+    peer = DesiredBinding(
+        "m2/node-a/0", "m2", "node-a", (0,), "resident", "sleeping",
+        False, 1, now, "test", "test",
+    )
 
     class FleetStore:
         def load_desired(self):
-            return DesiredSnapshot(1, [desired])
+            return DesiredSnapshot(1, [desired, peer])
 
         def load_observed(self):
             return type("Observed", (), {"bindings": []})()
 
     class Runtime:
         def list_model_deployments(self):
-            return [ModelDeploymentRecord("m1-node-a-gpu-0", "m1", "node-a", (0,), 1)]
+            return [
+                ModelDeploymentRecord("m1-node-a-gpu-0", "m1", "node-a", (0,), 1),
+                ModelDeploymentRecord("m2-node-a-gpu-0", "m2", "node-a", (0,), 1),
+            ]
 
         def list_pod_snapshots(self, *, model=None):
             return []

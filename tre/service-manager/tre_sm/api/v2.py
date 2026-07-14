@@ -592,10 +592,8 @@ class ServiceManagerV2:
         for pod in self._runtime_ops.list_pod_snapshots():
             binding = _binding_from_snapshot(pod)
             snapshots.setdefault(binding.binding_id, []).append(pod)
-        admitted_startups = {
-            pod.binding_id
-            for pod in self._runtime_ops.list_admitted_startup_pods()
-        }
+        admitted_startups = self._runtime_ops.list_admitted_startup_pods()
+        admitted_ids = {pod.binding_id for pod in admitted_startups}
         observed = {
             item.binding_id: item
             for item in self._fleet_store.load_observed().bindings
@@ -613,7 +611,11 @@ class ServiceManagerV2:
                 continue
             pods = snapshots.get(binding_id, [])
             if len(pods) != 1:
-                if binding_id in admitted_startups:
+                if binding_id in admitted_ids or any(
+                    pod.node == desired.node
+                    and set(pod.gpu_ids).intersection(desired.gpu_ids)
+                    for pod in admitted_startups
+                ):
                     continue
                 issues.append(
                     {
@@ -699,6 +701,13 @@ class ServiceManagerV2:
                 }
             raise OperationBusy(
                 f"{active.get('owner')}:{active.get('fencing_token')}"
+            )
+
+        conflict = self._conflicting_transient_lease(pod)
+        if conflict is not None:
+            gpu_id, occupant = conflict
+            raise GpuLeaseConflict(
+                gpu=f"{pod.node}/{gpu_id}", occupant=occupant
             )
 
         request = {"pod_name": pod_name, "pod_uid": pod_uid}
@@ -897,9 +906,26 @@ class ServiceManagerV2:
             for lease in self._gpu_leases.load()
         )
 
+    def _conflicting_transient_lease(
+        self, pod: StartupPodRecord
+    ) -> tuple[int, str] | None:
+        if self._gpu_leases is None:
+            return None
+        target_gpus = set(pod.gpu_ids)
+        for lease in self._gpu_leases.load():
+            if (
+                lease.binding_id != pod.binding_id
+                and lease.node == pod.node
+                and lease.phase in {"starting", "waking"}
+            ):
+                overlap = sorted(target_gpus.intersection(lease.gpu_ids))
+                if overlap:
+                    return overlap[0], lease.binding_id
+        return None
+
     def _assert_startup_overlaps_sleeping(self, pod: StartupPodRecord) -> None:
         target_gpus = set(pod.gpu_ids)
-        for snapshot in self._runtime_ops.list_pod_snapshots():
+        for snapshot in self._runtime_ops.list_startup_resident_snapshots():
             if snapshot.name == pod.name or snapshot.node != pod.node:
                 continue
             binding = _binding_from_snapshot(snapshot)
