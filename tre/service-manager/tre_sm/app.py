@@ -51,6 +51,9 @@ def create_service_app(
             service, interval_s=supervisor_interval_s
         )
         service.set_supervisor(supervisor)
-        app.add_event_handler("startup", supervisor.start)
-        app.add_event_handler("shutdown", supervisor.stop)
+        # FastAPI 0.12x removed the application-level convenience method;
+        # Starlette's router lifecycle API remains stable across our dev and
+        # runtime versions.
+        app.router.add_event_handler("startup", supervisor.start)
+        app.router.add_event_handler("shutdown", supervisor.stop)
     return app
