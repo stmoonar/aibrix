@@ -213,3 +213,12 @@ cd /data/nfs_shared_data/xxy/aibrix/tre
 ```
 
 第一阶段明确没有把以下事项伪装成已完成：StateStore 原子 CAS、desired/observed/journal 拆分、GPU lease/fencing、DiskPressure watcher、受 SM 控制的 launcher/startup gate、异步 `/v2/fleet/repair`。这些仍是 P0 后半与 P1/P2；在 startup gate 落地前，普通 Deployment 自愈仍可能绕过 SM，因此 fresh fleet 禁止直接 `kubectl apply -k deploy/models`。
+
+### 上线与验收
+
+- 实现提交：`78a8d542`；镜像/部署提交：`203855c8`。
+- service-manager 镜像：`tre-v2-service-manager:20260715-78a8d542`，已在 node10 成功滚动，Pod `Ready=1/1`、restart=0。
+- 权威检查：`make check` 为 **533 passed**；真实 20 份 model manifest 的 staggered dry-run 正确生成 20 个 stable binding 和标准 1/1/1 wake 集。
+- 新 `/v2/audit` 在线返回 `healthy=true, version=493, issues=[]`。
+- 连续两次在线 `/v2/reconcile` 均为 `version=493, warnings=[]`，验证 natural-sort 修复后没有 version churn。
+- 滚动后模型池保持 20/20 Running+Ready、总 restart=0；SM 仍为 7B `1/8`、Llama `1/8`、14B `1/4`；三个 Service 仍各只有一个标准基线 endpoint；controller 为 observe，DiskPressure 全部 False，safescale/orphan/hidden-orphan 三个 guard hash 均为 0。
