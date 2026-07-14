@@ -58,6 +58,7 @@ class RedisOperationClient(Protocol):
     def eval(self, script: str, numkeys: int, *keys_and_args): ...
     def hgetall(self, key: str) -> Mapping[object, object]: ...
     def hget(self, key: str, field: str): ...
+    def get(self, key: str): ...
 
 
 @dataclass(frozen=True)
@@ -136,6 +137,15 @@ class OperationHandle:
         self.assert_active()
         record = self._record(status="running", phase=phase, details=details)
         if not self._coordinator._update(self.fence, record):
+            self._lost.set()
+            self.assert_active()
+
+    def supersede(self, operation_id: str) -> None:
+        """Close a journal entry left running by a dead service-manager."""
+        self.assert_active()
+        if not self._coordinator._supersede(
+            self.fence, operation_id, replacement_id=self.operation_id
+        ):
             self._lost.set()
             self.assert_active()
 
@@ -304,6 +314,32 @@ class OperationCoordinator:
         raw = self._redis.hget(rediskeys.SM_OPERATIONS_KEY, operation_id)
         return None if raw is None else json.loads(_text(raw))
 
+    def active_operation(self, *, kind: str | None = None) -> dict | None:
+        """Return the journal record protected by the live writer lease."""
+        raw_lock = self._redis.get(rediskeys.SM_WRITER_LOCK_KEY)
+        if raw_lock is None:
+            return None
+        lock_value = _text(raw_lock)
+        for record in self.list_operations(limit=1000):
+            expected = f"{record.get('owner')}:{record.get('fencing_token')}"
+            if expected != lock_value or record.get("status") != "running":
+                continue
+            if kind is not None and record.get("kind") != kind:
+                return None
+            return record
+        return None
+
+    def stale_running_operations(self, *, kind: str | None = None) -> list[dict]:
+        active = self.active_operation()
+        active_id = None if active is None else active.get("operation_id")
+        return [
+            record
+            for record in self.list_operations(limit=1000)
+            if record.get("status") == "running"
+            and record.get("operation_id") != active_id
+            and (kind is None or record.get("kind") == kind)
+        ]
+
     def _renew(self, fence: WriterFence) -> bool:
         result = self._redis.eval(
             _RENEW_SCRIPT,
@@ -334,6 +370,41 @@ class OperationCoordinator:
             rediskeys.SM_OPERATIONS_KEY,
             fence.lock_value,
             fence.operation_id,
+            json.dumps(record, sort_keys=True, separators=(",", ":")),
+        )
+        return int(result) == 1
+
+    def _supersede(
+        self, fence: WriterFence, operation_id: str, *, replacement_id: str
+    ) -> bool:
+        raw = self._redis.hget(rediskeys.SM_OPERATIONS_KEY, operation_id)
+        if raw is None:
+            return True
+        record = json.loads(_text(raw))
+        if record.get("status") != "running":
+            return True
+        now = _utc_now()
+        record.update(
+            {
+                "status": "superseded",
+                "phase": "superseded",
+                "updated_at": now,
+                "finished_at": now,
+                "replacement_operation_id": replacement_id,
+            }
+        )
+        return self._update_record_under_fence(fence, operation_id, record)
+
+    def _update_record_under_fence(
+        self, fence: WriterFence, operation_id: str, record: dict
+    ) -> bool:
+        result = self._redis.eval(
+            _UPDATE_SCRIPT,
+            2,
+            rediskeys.SM_WRITER_LOCK_KEY,
+            rediskeys.SM_OPERATIONS_KEY,
+            fence.lock_value,
+            operation_id,
             json.dumps(record, sort_keys=True, separators=(",", ":")),
         )
         return int(result) == 1

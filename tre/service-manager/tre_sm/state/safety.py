@@ -23,6 +23,10 @@ class PressureWaitTimeout(RuntimeError):
     pass
 
 
+class NodePressureActive(RuntimeError):
+    pass
+
+
 class ClusterSafetyGate:
     def __init__(
         self,
@@ -50,6 +54,11 @@ class ClusterSafetyGate:
             raise ControllerNotPaused(
                 f"controller must be observe before fleet repair, got {mode}"
             )
+
+    def assert_no_pressure(self) -> None:
+        reasons = self._pressure_source.node_pressure_reasons()
+        if reasons:
+            raise NodePressureActive(f"node pressure blocks cold start: {reasons}")
 
     def wait_until_healthy(self, operation: OperationHandle) -> None:
         """Pause during pressure and require a continuous clear hysteresis window."""

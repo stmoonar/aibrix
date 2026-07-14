@@ -1,8 +1,14 @@
+from contextlib import contextmanager
+from datetime import datetime, timezone
+
 from tre_common.registry import ClusterTopology, ModelSpec, NodeSpec, Registry, SloSpec, TrsParams
 from tre_sm.allocator.slots import Binding, Slot
+from tre_sm.allocator.topology import K8sPodSnapshot
 from fastapi.testclient import TestClient
 
 from tre_sm.api.v2 import ServiceManagerV2, create_app
+from tre_sm.ops.k8s_ops import StartupPodRecord
+from tre_sm.state.fleet_store import DesiredBinding, DesiredSnapshot
 from tre_sm.state.reconcile import PodRecord
 from tre_sm.state.store import StateStore
 
@@ -859,6 +865,108 @@ def test_v2_fleet_repair_accepts_async_operation_with_stable_awake_targets():
     assert coordinator.calls[0][2] == {
         "awake_binding_ids": ["m1/node-a/0"]
     }
+
+
+def test_startup_admission_sleeps_overlap_and_records_restore_intent():
+    now = datetime.now(timezone.utc).isoformat()
+    desired = [
+        DesiredBinding("m1/node-a/0", "m1", "node-a", (0,), "resident", "sleeping", False, 1, now, "test", "test"),
+        DesiredBinding("m2/node-a/0", "m2", "node-a", (0,), "resident", "awake", False, 1, now, "test", "test"),
+    ]
+
+    class FleetStore:
+        def load_desired(self):
+            return DesiredSnapshot(1, desired)
+
+    class Handle:
+        operation_id = "startup-op"
+
+        def advance(self, *_args, **_kwargs):
+            return None
+
+    class Coordinator:
+        def active_operation(self, *, kind=None):
+            return None
+
+        @contextmanager
+        def operation(self, *_args, **_kwargs):
+            yield Handle()
+
+    class Safety:
+        def assert_no_pressure(self):
+            return None
+
+    class Leases:
+        def __init__(self):
+            self.calls = []
+
+        def acquire(self, binding, *, phase):
+            self.calls.append(("acquire", binding.binding_id, phase))
+
+        def release(self, binding):
+            self.calls.append(("release", binding.binding_id))
+
+    resident = K8sPodSnapshot(
+        name="m2-old",
+        model="m2",
+        node="node-a",
+        env={"CUDA_VISIBLE_DEVICES": "0"},
+        annotations={"tre.aibrix.io/gpu-ids": "0", "tre.aibrix.io/state": "awake"},
+        pod_ip="10.0.0.2",
+        ready=True,
+        pod_uid="old-uid",
+    )
+
+    class Runtime(FakeRuntimeOps):
+        def __init__(self):
+            super().__init__([resident])
+            self.admission = None
+
+        def get_startup_pod(self, name):
+            return StartupPodRecord(
+                name=name, uid="new-uid", model="m1", node="node-a",
+                gpu_ids=(0,), annotations={}, labels={}, pod_ip=None,
+                phase="Pending", ready=False,
+            )
+
+        def admit_startup_pod(self, name, **kwargs):
+            self.admission = (name, kwargs)
+
+    class Vllm(FakeVllmOps):
+        def __init__(self):
+            super().__init__()
+            self.sleeping = False
+
+        def is_sleeping(self, *_args, **_kwargs):
+            return self.sleeping
+
+        def sleep(self, pod_ip, *, port=None):
+            self.sleeping = True
+            return super().sleep(pod_ip, port=port)
+
+    store = StateStore(FakeRedis())
+    store.save(
+        [Binding("m2-old", "m2", Slot("node-a", (0,)), awake=True)],
+        expected_version=0,
+    )
+    runtime = Runtime()
+    leases = Leases()
+    service = ServiceManagerV2(
+        registry(), store, runtime_ops=runtime, vllm_ops=Vllm(),
+        operation_coordinator=Coordinator(), safety_gate=Safety(),
+        fleet_store=FleetStore(), gpu_leases=leases,
+    )
+
+    result = service.admit_startup(pod_name="m1-new", pod_uid="new-uid")
+
+    assert result["suspended_binding_ids"] == ["m2/node-a/0"]
+    assert store.load().bindings[0].awake is False
+    assert runtime.admission[1]["pod_uid"] == "new-uid"
+    assert runtime.admission[1]["suspended_binding_ids"] == ["m2/node-a/0"]
+    assert leases.calls == [
+        ("release", "m2/node-a/0"),
+        ("acquire", "m1/node-a/0", "starting"),
+    ]
 
 
 def test_v2_put_target_calls_vllm_and_pod_annotations_for_existing_bindings():

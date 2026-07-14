@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import time
 from typing import Protocol
 
@@ -35,6 +36,7 @@ class K8sApi(Protocol):
     def list_namespaced_pod(self, *, namespace: str, label_selector: str | None = None): ...
 
     def patch_namespaced_pod(self, *, name: str, namespace: str, body: dict) -> None: ...
+    def read_namespaced_pod(self, *, name: str, namespace: str): ...
     def list_node(self): ...
 
 
@@ -53,6 +55,25 @@ class ModelDeploymentRecord:
     node: str
     gpu_ids: tuple[int, ...]
     replicas: int
+
+    @property
+    def binding_id(self) -> str:
+        gpu_ids = ",".join(str(gpu_id) for gpu_id in self.gpu_ids)
+        return f"{self.model}/{self.node}/{gpu_ids}"
+
+
+@dataclass(frozen=True)
+class StartupPodRecord:
+    name: str
+    uid: str
+    model: str
+    node: str
+    gpu_ids: tuple[int, ...]
+    annotations: dict[str, str]
+    labels: dict[str, str]
+    pod_ip: str | None
+    phase: str
+    ready: bool
 
     @property
     def binding_id(self) -> str:
@@ -149,6 +170,94 @@ class K8sOps:
                 )
             )
         return sorted(records, key=lambda item: item.binding_id)
+
+    def get_startup_pod(self, name: str) -> StartupPodRecord:
+        pod = self._api.read_namespaced_pod(name=name, namespace=self._namespace)
+        return self._startup_record_from_pod(pod)
+
+    def list_admitted_startup_pods(self) -> list[StartupPodRecord]:
+        pods = _items(
+            self._api.list_namespaced_pod(
+                namespace=self._namespace,
+                label_selector=f"{MANAGED_LABEL}=true",
+            )
+        )
+        admitted: list[StartupPodRecord] = []
+        for pod in pods:
+            metadata = _metadata(pod)
+            annotations = metadata.get("annotations") or {}
+            uid = str(metadata.get("uid", ""))
+            if annotations.get("tre.aibrix.io/startup-admitted-uid") != uid:
+                continue
+            admitted.append(self._startup_record_from_pod(pod))
+        return sorted(admitted, key=lambda item: item.binding_id)
+
+    def _startup_record_from_pod(self, pod) -> StartupPodRecord:
+        metadata = _metadata(pod)
+        spec = _spec(pod)
+        status = _status(pod)
+        labels = dict(metadata.get("labels") or {})
+        annotations = dict(metadata.get("annotations") or {})
+        gpu_text = annotations.get(GPU_IDS_ANNOTATION)
+        model = labels.get(MODEL_LABEL)
+        node = _optional_field(spec, "nodeName", "node_name")
+        if not model or not node or not gpu_text:
+            raise ValueError(
+                f"Pod {metadata.get('name')} lacks stable model/node/GPU identity"
+            )
+        return StartupPodRecord(
+            name=str(metadata["name"]),
+            uid=str(metadata["uid"]),
+            model=str(model),
+            node=str(node),
+            gpu_ids=tuple(int(part) for part in str(gpu_text).split(",")),
+            annotations=annotations,
+            labels=labels,
+            pod_ip=_optional_field(status, "podIP", "pod_ip"),
+            phase=str(status.get("phase", "Unknown")),
+            ready=_pod_ready(pod),
+        )
+
+    def admit_startup_pod(
+        self,
+        name: str,
+        *,
+        pod_uid: str,
+        suspended_binding_ids: list[str],
+        operation_id: str,
+    ) -> None:
+        self._api.patch_namespaced_pod(
+            name=name,
+            namespace=self._namespace,
+            body={
+                "metadata": {
+                    "labels": {ROUTABLE_LABEL: "false"},
+                    "annotations": {
+                        STATE_ANNOTATION: POD_STATE_HIDDEN,
+                        "tre.aibrix.io/startup-admitted-uid": pod_uid,
+                        "tre.aibrix.io/startup-operation-id": operation_id,
+                        "tre.aibrix.io/startup-suspended-bindings": json.dumps(
+                            sorted(set(suspended_binding_ids)), separators=(",", ":")
+                        ),
+                    },
+                }
+            },
+        )
+
+    def clear_startup_admission(self, name: str) -> None:
+        self._api.patch_namespaced_pod(
+            name=name,
+            namespace=self._namespace,
+            body={
+                "metadata": {
+                    "annotations": {
+                        "tre.aibrix.io/startup-admitted-uid": None,
+                        "tre.aibrix.io/startup-operation-id": None,
+                        "tre.aibrix.io/startup-suspended-bindings": None,
+                    }
+                }
+            },
+        )
 
     def scale_model_deployment(self, name: str, *, replicas: int) -> None:
         if replicas not in (0, 1):

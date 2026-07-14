@@ -11,6 +11,7 @@ from tre_sm.state.safety import ClusterSafetyGate
 from tre_sm.state.fleet_store import FleetStateStore
 from tre_sm.state.gpu_leases import GpuLeaseStore
 from tre_sm.state.store import StateStore
+from tre_sm.state.supervisor import FleetSupervisor
 
 
 def create_service_app(
@@ -27,9 +28,10 @@ def create_service_app(
     safety_gate: ClusterSafetyGate | None = None,
     fleet_store: FleetStateStore | None = None,
     gpu_leases: GpuLeaseStore | None = None,
+    supervisor_enabled: bool = False,
+    supervisor_interval_s: float = 5.0,
 ) -> FastAPI:
-    return create_app(
-        ServiceManagerV2(
+    service = ServiceManagerV2(
             registry,
             store,
             k8s_client=k8s_client,
@@ -43,4 +45,12 @@ def create_service_app(
             fleet_store=fleet_store,
             gpu_leases=gpu_leases,
         )
-    )
+    app = create_app(service)
+    if supervisor_enabled:
+        supervisor = FleetSupervisor(
+            service, interval_s=supervisor_interval_s
+        )
+        service.set_supervisor(supervisor)
+        app.add_event_handler("startup", supervisor.start)
+        app.add_event_handler("shutdown", supervisor.stop)
+    return app

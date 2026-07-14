@@ -27,6 +27,22 @@ HTTPROUTE_PATHS = (
     "/generatevideo",
 )
 
+STARTUP_GATE_CLIENT = """\
+import json, os, time, urllib.request
+url = os.environ.get('TRE_SM_URL', 'http://tre-v2-service-manager.tre-v2.svc.cluster.local:8000') + '/v2/startup/admit'
+payload = json.dumps({'pod_name': os.environ['POD_NAME'], 'pod_uid': os.environ['POD_UID']}).encode()
+while True:
+    try:
+        request = urllib.request.Request(url, data=payload, headers={'Content-Type': 'application/json'}, method='POST')
+        with urllib.request.urlopen(request, timeout=15) as response:
+            if response.status == 200:
+                print(response.read().decode(), flush=True)
+                break
+    except Exception as exc:
+        print('TRE startup admission waiting:', exc, flush=True)
+    time.sleep(2)
+"""
+
 
 def feasible_slots(registry: Registry, model: ModelSpec) -> list[tuple[str, tuple[int, ...]]]:
     slots: list[tuple[str, tuple[int, ...]]] = []
@@ -240,9 +256,15 @@ def _deployment(model: ModelSpec, node: NodeSpec, gpu_ids: tuple[int, ...]) -> d
         "tre.aibrix.io/managed": "true",
         "tre.aibrix.io/node": node.name,
         "tre.aibrix.io/gpu-ids": gpu_label_value,
-        ROUTABLE_LABEL: "true",
+        # A Pod is never routable merely because Kubernetes created it. The
+        # service-manager flips this only after startup admission converges.
+        ROUTABLE_LABEL: "false",
     }
-    annotations = {"tre.aibrix.io/gpu-ids": gpu_value, GPU_UUIDS_ANNOTATION: gpu_uuid_value}
+    annotations = {
+        "tre.aibrix.io/gpu-ids": gpu_value,
+        GPU_UUIDS_ANNOTATION: gpu_uuid_value,
+        "tre.aibrix.io/state": "hidden",
+    }
     return {
         "apiVersion": "apps/v1",
         "kind": "Deployment",
@@ -258,6 +280,28 @@ def _deployment(model: ModelSpec, node: NodeSpec, gpu_ids: tuple[int, ...]) -> d
                         {"name": "shm", "emptyDir": {"medium": "Memory", "sizeLimit": "20Gi"}},
                         {"name": "models-volume", "hostPath": {"path": "/data"}},
                     ],
+                    "initContainers": [
+                        {
+                            "name": "tre-startup-gate",
+                            "image": model.vllm_image,
+                            "imagePullPolicy": "IfNotPresent",
+                            "command": ["python3", "-c", STARTUP_GATE_CLIENT],
+                            "env": [
+                                {
+                                    "name": "POD_NAME",
+                                    "valueFrom": {
+                                        "fieldRef": {"fieldPath": "metadata.name"}
+                                    },
+                                },
+                                {
+                                    "name": "POD_UID",
+                                    "valueFrom": {
+                                        "fieldRef": {"fieldPath": "metadata.uid"}
+                                    },
+                                },
+                            ],
+                        }
+                    ],
                     "containers": [
                         {
                             "name": "vllm-openai",
@@ -272,6 +316,12 @@ def _deployment(model: ModelSpec, node: NodeSpec, gpu_ids: tuple[int, ...]) -> d
                                 {"name": "VLLM_USE_MODELSCOPE", "value": "True"},
                             ],
                             "ports": [{"containerPort": 8000, "protocol": "TCP"}],
+                            "readinessProbe": {
+                                "httpGet": {"path": "/health", "port": 8000},
+                                "periodSeconds": 2,
+                                "timeoutSeconds": 2,
+                                "failureThreshold": 300,
+                            },
                             "resources": {},
                             "volumeMounts": [
                                 {"name": "shm", "mountPath": "/dev/shm"},

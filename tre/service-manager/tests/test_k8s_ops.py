@@ -255,6 +255,33 @@ def test_k8s_ops_uses_gpu_id_label_as_annotation_fallback():
     ]
 
 
+def test_k8s_ops_lists_admitted_startups_including_pending_pods():
+    admitted = pod_dict(
+        "serve-new", "dsqwen-7b", "node-a", "0", phase="Pending",
+        labels={"tre.aibrix.io/managed": "true"},
+        annotations={GPU_IDS_ANNOTATION: "0"},
+    )
+    admitted["metadata"]["uid"] = "uid-new"
+    admitted["metadata"]["annotations"][
+        "tre.aibrix.io/startup-admitted-uid"
+    ] = "uid-new"
+    unrelated = pod_dict(
+        "serve-old", "dsqwen-7b", "node-a", "1",
+        labels={"tre.aibrix.io/managed": "true"},
+        annotations={GPU_IDS_ANNOTATION: "1"},
+    )
+    unrelated["metadata"]["uid"] = "uid-old"
+    api = FakeK8sApi([admitted, unrelated])
+    ops = K8sOps(api=api, namespace="default")
+
+    [record] = ops.list_admitted_startup_pods()
+
+    assert record.name == "serve-new"
+    assert record.uid == "uid-new"
+    assert record.binding_id == "dsqwen-7b/node-a/0"
+    assert record.phase == "Pending"
+
+
 def test_k8s_ops_lists_and_scales_stable_model_deployments():
     api = FakeK8sApi([])
     api.deployments = [

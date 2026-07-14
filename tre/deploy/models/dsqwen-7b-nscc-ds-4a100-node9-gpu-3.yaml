@@ -9,10 +9,11 @@ metadata:
     tre.aibrix.io/managed: 'true'
     tre.aibrix.io/node: nscc-ds-4a100-node9
     tre.aibrix.io/gpu-ids: '3'
-    tre.aibrix.io/routable: 'true'
+    tre.aibrix.io/routable: 'false'
   annotations: &id001
     tre.aibrix.io/gpu-ids: '3'
     tre.aibrix.io/gpu-uuids: GPU-3c2fb581-708a-5fef-3eaa-5c3cc21a028e
+    tre.aibrix.io/state: hidden
 spec:
   replicas: 1
   selector:
@@ -26,7 +27,7 @@ spec:
         tre.aibrix.io/managed: 'true'
         tre.aibrix.io/node: nscc-ds-4a100-node9
         tre.aibrix.io/gpu-ids: '3'
-        tre.aibrix.io/routable: 'true'
+        tre.aibrix.io/routable: 'false'
         app: dsqwen-7b-nscc-ds-4a100-node9-gpu-3
       annotations: *id001
     spec:
@@ -39,6 +40,31 @@ spec:
       - name: models-volume
         hostPath:
           path: /data
+      initContainers:
+      - name: tre-startup-gate
+        image: vllm/vllm-openai:0.10.1-sleep
+        imagePullPolicy: IfNotPresent
+        command:
+        - python3
+        - -c
+        - "import json, os, time, urllib.request\nurl = os.environ.get('TRE_SM_URL',\
+          \ 'http://tre-v2-service-manager.tre-v2.svc.cluster.local:8000') + '/v2/startup/admit'\n\
+          payload = json.dumps({'pod_name': os.environ['POD_NAME'], 'pod_uid': os.environ['POD_UID']}).encode()\n\
+          while True:\n    try:\n        request = urllib.request.Request(url, data=payload,\
+          \ headers={'Content-Type': 'application/json'}, method='POST')\n       \
+          \ with urllib.request.urlopen(request, timeout=15) as response:\n      \
+          \      if response.status == 200:\n                print(response.read().decode(),\
+          \ flush=True)\n                break\n    except Exception as exc:\n   \
+          \     print('TRE startup admission waiting:', exc, flush=True)\n    time.sleep(2)\n"
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_UID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.uid
       containers:
       - name: vllm-openai
         image: vllm/vllm-openai:0.10.1-sleep
@@ -80,6 +106,13 @@ spec:
         ports:
         - containerPort: 8000
           protocol: TCP
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          periodSeconds: 2
+          timeoutSeconds: 2
+          failureThreshold: 300
         resources: {}
         volumeMounts:
         - name: shm

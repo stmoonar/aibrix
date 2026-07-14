@@ -272,6 +272,25 @@ def test_submitted_operation_runs_under_fence_and_persists_result():
     assert record["status"] == "succeeded"
 
 
+def test_stale_running_operation_is_superseded_under_new_fence():
+    redis = ScriptRedis()
+    coordinator = OperationCoordinator(redis, owner="sm-pod")
+    stale = coordinator.acquire(
+        "fleet_repair", request={"awake_binding_ids": ["m1/node-a/0"]}
+    )
+    redis.values.pop(rediskeys.SM_WRITER_LOCK_KEY)
+
+    [record] = coordinator.stale_running_operations(kind="fleet_repair")
+    assert record["operation_id"] == stale.operation_id
+
+    with coordinator.operation("fleet_repair") as replacement:
+        replacement.supersede(stale.operation_id)
+
+    recovered = coordinator.get_operation(stale.operation_id)
+    assert recovered["status"] == "superseded"
+    assert recovered["replacement_operation_id"] == replacement.operation_id
+
+
 def test_desired_intent_commits_before_observed_state_converges():
     redis = ScriptRedis()
     coordinator = OperationCoordinator(redis, owner="sm-pod")

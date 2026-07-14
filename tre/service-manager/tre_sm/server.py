@@ -8,6 +8,7 @@ from fastapi import FastAPI
 from tre_common.registry import ClusterTopology
 from tre_common.registry import load_registry
 from tre_sm.allocator.topology import K8sPodSnapshot, pod_records_from_snapshots
+from tre_sm.allocator.slots import Binding, Slot
 from tre_sm.app import create_service_app
 from tre_sm.gpu_truth import RedisGpuTruth
 from tre_sm.ops.k8s_ops import K8sOps
@@ -51,9 +52,22 @@ def create_app() -> FastAPI:
     legacy_store = StateStore(redis_client, require_fence=True)
     fleet_store = FleetStateStore(redis_client)
     gpu_leases = GpuLeaseStore(redis_client)
+    starting_bindings = [
+        Binding(
+            pod.name,
+            pod.model,
+            Slot(pod.node, pod.gpu_ids),
+            awake=False,
+            hidden=True,
+        )
+        for pod in k8s_ops.list_admitted_startup_pods()
+    ]
     with operation_coordinator.operation("bootstrap_fleet_state"):
         fleet_store.bootstrap(legacy_store.load().bindings)
-        gpu_leases.rebuild_awake(legacy_store.load().bindings)
+        gpu_leases.rebuild_awake(
+            legacy_store.load().bindings,
+            starting_bindings=starting_bindings,
+        )
     safety_gate = ClusterSafetyGate(
         redis_client,
         k8s_ops,
@@ -77,6 +91,12 @@ def create_app() -> FastAPI:
         safety_gate=safety_gate,
         fleet_store=fleet_store,
         gpu_leases=gpu_leases,
+        supervisor_enabled=os.environ.get(
+            "TRE_SM_SUPERVISOR_ENABLED", "true"
+        ).lower() in {"1", "true", "yes"},
+        supervisor_interval_s=float(
+            os.environ.get("TRE_SM_SUPERVISOR_INTERVAL_S", "5")
+        ),
     )
 
 

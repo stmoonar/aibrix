@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import json
 from collections import Counter
 from dataclasses import replace
 from dataclasses import asdict
@@ -16,12 +17,13 @@ from tre_common.registry import NodeSpec
 from tre_sm.allocator.slots import Binding, Migration, Slot, SlotAllocator
 from tre_sm.allocator.topology import K8sPodSnapshot
 from tre_sm.gpu_truth import GpuTruthProvider
+from tre_sm.ops.k8s_ops import StartupPodRecord
 from tre_sm.state.reconcile import K8sPodClient, POD_STATE_AWAKE, POD_STATE_HIDDEN, POD_STATE_SLEEPING, audit_state, reconcile_state
 from tre_sm.state.operations import OperationBusy, OperationCoordinator
 from tre_sm.state.fleet_repair import FleetRepairExecutor
 from tre_sm.state.fleet_store import DesiredBinding, FleetStateStore, ObservedBinding
-from tre_sm.state.safety import ClusterSafetyGate, ControllerNotPaused
-from tre_sm.state.gpu_leases import GpuLeaseStore
+from tre_sm.state.safety import ClusterSafetyGate, ControllerNotPaused, NodePressureActive
+from tre_sm.state.gpu_leases import GpuLeaseConflict, GpuLeaseStore
 from tre_sm.state.store import StateConflict, StateFenceError, StateStore
 from tre_sm.api.v1_compat import create_v1_compat_router
 
@@ -62,6 +64,19 @@ class RuntimePodOps(Protocol):
     def wait_pod_deleted(self, serve_id: str): ...
 
     def wait_pod_ready(self, serve_id: str) -> K8sPodSnapshot: ...
+
+    def get_startup_pod(self, name: str) -> StartupPodRecord: ...
+
+    def admit_startup_pod(
+        self,
+        name: str,
+        *,
+        pod_uid: str,
+        suspended_binding_ids: list[str],
+        operation_id: str,
+    ) -> None: ...
+
+    def clear_startup_admission(self, name: str) -> None: ...
 
 
 class VllmRuntimeOps(Protocol):
@@ -113,6 +128,7 @@ class ServiceManagerV2:
         self._safety_gate = safety_gate
         self._fleet_store = fleet_store
         self._gpu_leases = gpu_leases
+        self._supervisor = None
         self._fleet_repair = None
         if (
             runtime_ops is not None
@@ -133,6 +149,14 @@ class ServiceManagerV2:
                 safety_gate=safety_gate,
                 gpu_leases=gpu_leases,
             )
+
+    def set_supervisor(self, supervisor) -> None:
+        self._supervisor = supervisor
+
+    def get_supervisor_state(self) -> dict:
+        if self._supervisor is None:
+            return {"running": False, "enabled": False}
+        return {"enabled": True, **asdict(self._supervisor.snapshot())}
 
     def get_state(self) -> dict:
         snapshot = self._store.load()
@@ -485,7 +509,10 @@ class ServiceManagerV2:
         }
 
     def start_fleet_repair(
-        self, *, awake_binding_ids: list[str] | None = None
+        self,
+        *,
+        awake_binding_ids: list[str] | None = None,
+        recovered_from: list[str] | None = None,
     ) -> dict:
         if self._operation_coordinator is None or self._fleet_repair is None:
             raise ValueError("fleet repair runtime is not configured")
@@ -500,6 +527,8 @@ class ServiceManagerV2:
         )
 
         def run(operation) -> None:
+            for stale_operation_id in recovered_from or []:
+                operation.supersede(stale_operation_id)
             self._fleet_repair.run(
                 operation,
                 awake_binding_ids=targets,
@@ -510,16 +539,368 @@ class ServiceManagerV2:
                 audit=self.audit,
             )
 
+        operation_request = {"awake_binding_ids": targets}
+        if recovered_from:
+            operation_request["recovered_from"] = recovered_from
         operation_id = self._operation_coordinator.submit(
             "fleet_repair",
             run,
-            request={"awake_binding_ids": targets},
+            request=operation_request,
         )
-        return {
+        response = {
             "operation_id": operation_id,
             "status": "accepted",
             "awake_binding_ids": targets,
         }
+        if recovered_from:
+            response["recovered_from"] = recovered_from
+        return response
+
+    def recover_stale_fleet_repairs(self) -> dict | None:
+        if self._operation_coordinator is None:
+            return None
+        if self._operation_coordinator.active_operation() is not None:
+            return None
+        stale = self._operation_coordinator.stale_running_operations(
+            kind="fleet_repair"
+        )
+        if not stale:
+            return None
+        newest = stale[0]
+        request = newest.get("request") or {}
+        return self.start_fleet_repair(
+            awake_binding_ids=[
+                str(item) for item in request.get("awake_binding_ids", [])
+            ],
+            recovered_from=[
+                str(record["operation_id"]) for record in stale
+            ],
+        )
+
+    def detect_fleet_drift(self) -> list[dict]:
+        if self._runtime_ops is None or self._fleet_store is None:
+            return []
+        deployments = {
+            item.binding_id: item
+            for item in self._runtime_ops.list_model_deployments()
+        }
+        snapshots: dict[str, list[K8sPodSnapshot]] = {}
+        for pod in self._runtime_ops.list_pod_snapshots():
+            binding = _binding_from_snapshot(pod)
+            snapshots.setdefault(binding.binding_id, []).append(pod)
+        observed = {
+            item.binding_id: item
+            for item in self._fleet_store.load_observed().bindings
+        }
+        issues: list[dict] = []
+        for binding_id, desired in {
+            item.binding_id: item
+            for item in self._fleet_store.load_desired().bindings
+            if item.lifecycle == "resident"
+        }.items():
+            if binding_id not in deployments:
+                issues.append(
+                    {"code": "deployment_missing", "binding_id": binding_id}
+                )
+                continue
+            pods = snapshots.get(binding_id, [])
+            if len(pods) != 1:
+                issues.append(
+                    {
+                        "code": "pod_cardinality",
+                        "binding_id": binding_id,
+                        "count": len(pods),
+                    }
+                )
+                continue
+            pod = pods[0]
+            if not pod.ready and not pod.annotations.get(
+                "tre.aibrix.io/startup-admitted-uid"
+            ):
+                issues.append(
+                    {"code": "pod_not_ready", "binding_id": binding_id}
+                )
+            previous = observed.get(binding_id)
+            if (
+                previous is not None
+                and previous.pod_uid
+                and pod.pod_uid
+                and previous.pod_uid != pod.pod_uid
+                and not pod.annotations.get("tre.aibrix.io/startup-admitted-uid")
+            ):
+                issues.append(
+                    {
+                        "code": "pod_uid_changed_without_admission",
+                        "binding_id": binding_id,
+                        "old_uid": previous.pod_uid,
+                        "new_uid": pod.pod_uid,
+                    }
+                )
+        return issues
+
+    def admit_startup(self, *, pod_name: str, pod_uid: str) -> dict:
+        """Authorize a Pod to start vLLM only after its GPU slot is safe."""
+        if (
+            self._operation_coordinator is None
+            or self._runtime_ops is None
+            or self._vllm_ops is None
+            or self._gpu_leases is None
+            or self._fleet_store is None
+            or self._safety_gate is None
+        ):
+            raise ValueError("startup admission runtime is not configured")
+        pod = self._runtime_ops.get_startup_pod(pod_name)
+        if pod.uid != pod_uid:
+            raise ValueError(f"Pod UID changed for {pod_name}")
+        admitted_uid = pod.annotations.get("tre.aibrix.io/startup-admitted-uid")
+        if admitted_uid == pod_uid:
+            return {
+                "status": "admitted",
+                "binding_id": pod.binding_id,
+                "operation_id": pod.annotations.get(
+                    "tre.aibrix.io/startup-operation-id"
+                ),
+                "idempotent": True,
+            }
+
+        # A fleet repair already owns the global writer fence and has acquired
+        # the target lease before scaling the Deployment. Reuse that prepared
+        # phase instead of deadlocking the init gate on a second writer.
+        active = self._operation_coordinator.active_operation(kind="fleet_repair")
+        if active is not None:
+            details = active.get("details") or {}
+            if (
+                active.get("phase") == "starting_binding"
+                and details.get("binding_id") == pod.binding_id
+                and self._lease_matches(pod.binding_id, phase="starting")
+            ):
+                self._assert_startup_overlaps_sleeping(pod)
+                self._runtime_ops.admit_startup_pod(
+                    pod.name,
+                    pod_uid=pod.uid,
+                    suspended_binding_ids=[],
+                    operation_id=str(active["operation_id"]),
+                )
+                return {
+                    "status": "admitted",
+                    "binding_id": pod.binding_id,
+                    "operation_id": active["operation_id"],
+                    "prepared_by_fleet_repair": True,
+                }
+            raise OperationBusy(
+                f"{active.get('owner')}:{active.get('fencing_token')}"
+            )
+
+        request = {"pod_name": pod_name, "pod_uid": pod_uid}
+        with self._operation_coordinator.operation(
+            "startup_admit", request=request
+        ) as operation:
+            operation.advance("validating_startup", details={"binding_id": pod.binding_id})
+            self._safety_gate.assert_no_pressure()
+            desired = self._desired_binding(pod.binding_id)
+            if desired.lifecycle != "resident":
+                raise ValueError(
+                    f"startup denied for non-resident desired binding {pod.binding_id}"
+                )
+
+            suspended: list[str] = []
+            legacy = self._store.load()
+            updated = {binding.binding_id: binding for binding in legacy.bindings}
+            target_gpus = set(pod.gpu_ids)
+            for snapshot in self._runtime_ops.list_pod_snapshots():
+                if snapshot.name == pod.name or snapshot.node != pod.node:
+                    continue
+                binding = _binding_from_snapshot(snapshot)
+                if not target_gpus.intersection(binding.slot.gpu_ids):
+                    continue
+                if not snapshot.pod_ip or not snapshot.ready:
+                    raise ValueError(
+                        f"overlapping resident {binding.binding_id} is not Ready"
+                    )
+                physical_sleeping = self._vllm_ops.is_sleeping(
+                    snapshot.pod_ip, port=8000
+                )
+                if physical_sleeping is None:
+                    raise ValueError(
+                        f"cannot verify overlapping resident {binding.binding_id}"
+                    )
+                wanted = self._desired_binding(binding.binding_id)
+                if not physical_sleeping:
+                    self._runtime_ops.write_binding_annotations(
+                        binding, state=POD_STATE_HIDDEN
+                    )
+                    self._apply_runtime_power_action(binding, action="sleep")
+                    updated[binding.binding_id] = replace(
+                        binding, awake=False, hidden=False
+                    )
+                if wanted.power == "awake" and binding.binding_id != pod.binding_id:
+                    suspended.append(binding.binding_id)
+
+            if list(updated.values()) != legacy.bindings:
+                self._store.save(
+                    list(updated.values()), expected_version=legacy.version
+                )
+            planned = Binding(
+                pod.name,
+                pod.model,
+                Slot(pod.node, pod.gpu_ids),
+                awake=False,
+                hidden=True,
+            )
+            self._gpu_leases.acquire(planned, phase="starting")
+            self._runtime_ops.admit_startup_pod(
+                pod.name,
+                pod_uid=pod.uid,
+                suspended_binding_ids=suspended,
+                operation_id=operation.operation_id,
+            )
+            operation.advance(
+                "startup_admitted",
+                details={
+                    "binding_id": pod.binding_id,
+                    "suspended_binding_ids": suspended,
+                },
+            )
+            return {
+                "status": "admitted",
+                "binding_id": pod.binding_id,
+                "operation_id": operation.operation_id,
+                "suspended_binding_ids": suspended,
+            }
+
+    def converge_startups(self) -> dict:
+        """Converge admitted Pods after vLLM becomes reachable."""
+        if self._runtime_ops is None or self._vllm_ops is None:
+            return {"converged": [], "pending": []}
+        converged: list[str] = []
+        pending: list[str] = []
+        for snapshot in self._runtime_ops.list_pod_snapshots():
+            admitted_uid = snapshot.annotations.get(
+                "tre.aibrix.io/startup-admitted-uid"
+            )
+            if not admitted_uid or admitted_uid != snapshot.pod_uid:
+                continue
+            if not snapshot.pod_ip:
+                pending.append(snapshot.name)
+                continue
+            physical_sleeping = self._vllm_ops.is_sleeping(
+                snapshot.pod_ip, port=8000
+            )
+            if physical_sleeping is None:
+                pending.append(snapshot.name)
+                continue
+            try:
+                self._converge_startup(snapshot, physical_sleeping)
+            except OperationBusy:
+                pending.append(snapshot.name)
+                continue
+            converged.append(snapshot.name)
+        return {"converged": converged, "pending": pending}
+
+    @serialized_operation("startup_converge")
+    def _converge_startup(
+        self, snapshot: K8sPodSnapshot, physical_sleeping: bool
+    ) -> None:
+        if self._fleet_store is None or self._gpu_leases is None:
+            raise ValueError("startup convergence state is not configured")
+        binding = _binding_from_snapshot(snapshot)
+        desired = self._desired_binding(binding.binding_id)
+        if desired.power == "sleeping":
+            if not physical_sleeping:
+                self._apply_runtime_power_action(binding, action="sleep")
+            else:
+                self._runtime_ops.write_binding_annotations(
+                    binding, state=POD_STATE_SLEEPING
+                )
+                self._gpu_leases.release(binding)
+            binding = replace(binding, awake=False, hidden=False)
+        else:
+            if physical_sleeping:
+                self._apply_runtime_power_action(binding, action="wake")
+            else:
+                self._runtime_ops.write_binding_annotations(
+                    binding,
+                    state=POD_STATE_HIDDEN if desired.hidden else POD_STATE_AWAKE,
+                )
+                self._gpu_leases.acquire(binding, phase="awake")
+            binding = replace(
+                binding, awake=True, hidden=desired.hidden
+            )
+
+        legacy = self._store.load()
+        by_id = {item.binding_id: item for item in legacy.bindings}
+        by_id[binding.binding_id] = binding
+        self._store.save(list(by_id.values()), expected_version=legacy.version)
+
+        suspended_raw = snapshot.annotations.get(
+            "tre.aibrix.io/startup-suspended-bindings", "[]"
+        )
+        suspended = [str(item) for item in json.loads(suspended_raw)]
+        if desired.power == "awake" and suspended:
+            raise ValueError(
+                f"awake startup {binding.binding_id} conflicts with suspended {suspended}"
+            )
+        for binding_id in suspended:
+            wanted = self._desired_binding(binding_id)
+            if wanted.lifecycle == "resident" and wanted.power == "awake":
+                self._restore_desired_awake(binding_id)
+        self._runtime_ops.clear_startup_admission(snapshot.name)
+        self._reconcile_unlocked(drop_missing=False)
+
+    def _restore_desired_awake(self, binding_id: str) -> None:
+        snapshot = self._store.load()
+        binding = next(
+            (item for item in snapshot.bindings if item.binding_id == binding_id),
+            None,
+        )
+        if binding is None or binding.awake:
+            return
+        self._ensure_feasible_wake(binding, snapshot.bindings)
+        self._apply_runtime_power_action(binding, action="wake")
+        updated = [
+            replace(item, awake=True, hidden=False)
+            if item.binding_id == binding_id
+            else item
+            for item in snapshot.bindings
+        ]
+        self._store.save(updated, expected_version=snapshot.version)
+
+    def _desired_binding(self, binding_id: str) -> DesiredBinding:
+        if self._fleet_store is None:
+            raise ValueError("desired fleet state is not configured")
+        matches = [
+            item
+            for item in self._fleet_store.load_desired().bindings
+            if item.binding_id == binding_id
+        ]
+        if len(matches) != 1:
+            raise ValueError(
+                f"stable binding {binding_id} resolved to {len(matches)} desired records"
+            )
+        return matches[0]
+
+    def _lease_matches(self, binding_id: str, *, phase: str) -> bool:
+        if self._gpu_leases is None:
+            return False
+        return any(
+            lease.binding_id == binding_id and lease.phase == phase
+            for lease in self._gpu_leases.load()
+        )
+
+    def _assert_startup_overlaps_sleeping(self, pod: StartupPodRecord) -> None:
+        target_gpus = set(pod.gpu_ids)
+        for snapshot in self._runtime_ops.list_pod_snapshots():
+            if snapshot.name == pod.name or snapshot.node != pod.node:
+                continue
+            binding = _binding_from_snapshot(snapshot)
+            if not target_gpus.intersection(binding.slot.gpu_ids):
+                continue
+            if not snapshot.pod_ip or self._vllm_ops.is_sleeping(
+                snapshot.pod_ip, port=8000
+            ) is not True:
+                raise ValueError(
+                    f"overlapping resident {binding.binding_id} is not physically sleeping"
+                )
 
     def _set_binding_power_by_id_unlocked(
         self, binding_id: str, awake: bool
@@ -1052,6 +1433,11 @@ class ReconcileRequest(BaseModel):
 class FleetRepairRequest(BaseModel):
     awake_binding_ids: list[str] | None = None
 
+
+class StartupAdmissionRequest(BaseModel):
+    pod_name: str
+    pod_uid: str
+
 def create_app(service: ServiceManagerV2) -> FastAPI:
     app = FastAPI()
     app.include_router(create_v1_compat_router(service))
@@ -1074,6 +1460,18 @@ def create_app(service: ServiceManagerV2) -> FastAPI:
     @app.exception_handler(ControllerNotPaused)
     async def controller_not_paused_handler(
         _request: Request, exc: ControllerNotPaused
+    ) -> JSONResponse:
+        return JSONResponse(status_code=409, content={"detail": str(exc)})
+
+    @app.exception_handler(NodePressureActive)
+    async def node_pressure_handler(
+        _request: Request, exc: NodePressureActive
+    ) -> JSONResponse:
+        return JSONResponse(status_code=503, content={"detail": str(exc)})
+
+    @app.exception_handler(GpuLeaseConflict)
+    async def gpu_lease_conflict_handler(
+        _request: Request, exc: GpuLeaseConflict
     ) -> JSONResponse:
         return JSONResponse(status_code=409, content={"detail": str(exc)})
 
@@ -1109,6 +1507,19 @@ def create_app(service: ServiceManagerV2) -> FastAPI:
         except (KeyError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    @app.post("/v2/startup/admit")
+    def admit_startup(request: StartupAdmissionRequest) -> dict:
+        try:
+            return service.admit_startup(
+                pod_name=request.pod_name, pod_uid=request.pod_uid
+            )
+        except (KeyError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/v2/startup/converge")
+    def converge_startups() -> dict:
+        return service.converge_startups()
+
     @app.get("/v2/state")
     def get_state() -> dict:
         return service.get_state()
@@ -1132,6 +1543,10 @@ def create_app(service: ServiceManagerV2) -> FastAPI:
             return service.get_operation(operation_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="operation not found") from exc
+
+    @app.get("/v2/supervisor")
+    def get_supervisor() -> dict:
+        return service.get_supervisor_state()
 
 
     @app.post("/v2/defrag")
@@ -1195,6 +1610,23 @@ def _next_serve_id(model: str, existing_serve_ids: set[str]) -> str:
     while f"{base}-{index}" in existing_serve_ids:
         index += 1
     return f"{base}-{index}"
+
+
+def _binding_from_snapshot(snapshot: K8sPodSnapshot) -> Binding:
+    gpu_text = snapshot.annotations.get("tre.aibrix.io/gpu-ids")
+    if not gpu_text:
+        raise ValueError(f"Pod {snapshot.name} has no stable GPU annotation")
+    state = snapshot.annotations.get("tre.aibrix.io/state", POD_STATE_AWAKE)
+    return Binding(
+        serve_id=snapshot.name,
+        model=snapshot.model,
+        slot=Slot(
+            snapshot.node,
+            tuple(int(part) for part in str(gpu_text).split(",")),
+        ),
+        awake=state != POD_STATE_SLEEPING,
+        hidden=state == POD_STATE_HIDDEN,
+    )
 
 
 def _gpu_uuid(node: NodeSpec | None, gpu_id: int) -> str | None:

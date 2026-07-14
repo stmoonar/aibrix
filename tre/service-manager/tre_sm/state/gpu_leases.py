@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 import json
+import time
 from typing import Mapping, Protocol
 
 from tre_common import rediskeys
@@ -166,7 +167,12 @@ class GpuLeaseStore:
         if int(result) == -1:
             raise StateFenceError("writer fence is no longer active")
 
-    def rebuild_awake(self, bindings: list[Binding]) -> None:
+    def rebuild_awake(
+        self,
+        bindings: list[Binding],
+        *,
+        starting_bindings: list[Binding] | None = None,
+    ) -> None:
         fence = current_fence()
         if fence is None:
             raise StateFenceError("GPU lease rebuild requires an active writer fence")
@@ -192,6 +198,30 @@ class GpuLeaseStore:
                 field = _gpu_field(binding.slot.node, gpu_id)
                 if field in mapping:
                     other = json.loads(mapping[field])["binding_id"]
+                    raise GpuLeaseConflict(gpu=field, occupant=other)
+                mapping[field] = payload
+        for binding in starting_bindings or []:
+            record = GpuLease(
+                binding_id=binding.binding_id,
+                node=binding.slot.node,
+                gpu_ids=binding.slot.gpu_ids,
+                owner=fence.owner,
+                fencing_token=fence.token,
+                phase="starting",
+                expires_at_ms=int(time.time() * 1000) + self._transient_ttl_ms,
+            )
+            payload = json.dumps(
+                {**asdict(record), "gpu_ids": list(record.gpu_ids)},
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            for gpu_id in binding.slot.gpu_ids:
+                field = _gpu_field(binding.slot.node, gpu_id)
+                if field in mapping:
+                    other = json.loads(mapping[field])["binding_id"]
+                    if other == binding.binding_id:
+                        mapping[field] = payload
+                        continue
                     raise GpuLeaseConflict(gpu=field, occupant=other)
                 mapping[field] = payload
         args = [fence.lock_value]

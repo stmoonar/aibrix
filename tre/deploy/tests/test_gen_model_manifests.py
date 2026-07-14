@@ -75,7 +75,8 @@ def test_build_deployments_encodes_node_gpu_binding_and_vllm_args(tmp_path):
     container = rendered["spec"]["template"]["spec"]["containers"][0]
 
     assert rendered["spec"]["template"]["spec"]["nodeName"] == "node-75"
-    assert rendered["spec"]["template"]["metadata"]["labels"]["tre.aibrix.io/routable"] == "true"
+    assert rendered["spec"]["template"]["metadata"]["labels"]["tre.aibrix.io/routable"] == "false"
+    assert rendered["spec"]["template"]["metadata"]["annotations"]["tre.aibrix.io/state"] == "hidden"
     assert rendered["metadata"]["annotations"]["tre.aibrix.io/gpu-ids"] == "0,1"
     assert rendered["spec"]["template"]["metadata"]["annotations"]["tre.aibrix.io/gpu-ids"] == "0,1"
     assert rendered["metadata"]["annotations"]["tre.aibrix.io/gpu-uuids"] == "GPU-75-0,GPU-75-1"
@@ -86,6 +87,10 @@ def test_build_deployments_encodes_node_gpu_binding_and_vllm_args(tmp_path):
     assert "nvidia.com/gpu" not in yaml.safe_dump(container.get("resources", {}))
     assert "--tensor-parallel-size" in container["command"]
     assert "--enable_sleep_mode" in container["command"]
+    [gate] = rendered["spec"]["template"]["spec"]["initContainers"]
+    assert gate["name"] == "tre-startup-gate"
+    assert "/v2/startup/admit" in gate["command"][2]
+    assert container["readinessProbe"]["httpGet"] == {"path": "/health", "port": 8000}
 
 
 def test_cuda_visible_devices_uses_container_local_ordinals(tmp_path):

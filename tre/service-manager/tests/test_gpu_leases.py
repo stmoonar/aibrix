@@ -160,6 +160,24 @@ def test_rebuild_awake_rejects_overlapping_physical_truth():
     assert store.load() == []
 
 
+def test_bootstrap_preserves_admitted_starting_lease():
+    redis = FakeRedis()
+    store = GpuLeaseStore(redis)
+    starting = _binding("new-pod", "m1", (0, 1))
+
+    with Fence(redis, 3):
+        store.rebuild_awake([], starting_bindings=[starting])
+
+    [lease] = store.load()
+    assert lease.binding_id == "m1/node-a/0,1"
+    assert lease.phase == "starting"
+    assert lease.expires_at_ms > 0
+    assert sorted(redis.hashes[rediskeys.SM_GPU_LEASES_KEY]) == [
+        "node-a/0",
+        "node-a/1",
+    ]
+
+
 def replace_awake(binding):
     return Binding(
         binding.serve_id, binding.model, binding.slot, awake=True
