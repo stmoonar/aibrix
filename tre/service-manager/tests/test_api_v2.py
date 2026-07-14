@@ -813,6 +813,54 @@ def test_v2_audit_reports_cross_model_physical_gpu_conflict():
     ]
 
 
+def test_v2_fleet_repair_accepts_async_operation_with_stable_awake_targets():
+    class Coordinator:
+        def __init__(self):
+            self.calls = []
+
+        def submit(self, kind, target, *, request=None):
+            self.calls.append((kind, target, request))
+            return "operation-1"
+
+        def list_operations(self, *, limit=100):
+            return []
+
+    class Safety:
+        def assert_controller_observe(self):
+            return None
+
+    store = StateStore(FakeRedis())
+    store.save(
+        [
+            Binding("pod-awake", "m1", Slot("node-a", (0,)), awake=True),
+            Binding("pod-sleeping", "m1", Slot("node-a", (1,)), awake=False),
+        ],
+        expected_version=0,
+    )
+    coordinator = Coordinator()
+    service = ServiceManagerV2(
+        registry(),
+        store,
+        operation_coordinator=coordinator,
+        safety_gate=Safety(),
+    )
+    service._fleet_repair = object()
+    client = TestClient(create_app(service))
+
+    response = client.post("/v2/fleet/repair", json={})
+
+    assert response.status_code == 202
+    assert response.json() == {
+        "operation_id": "operation-1",
+        "status": "accepted",
+        "awake_binding_ids": ["m1/node-a/0"],
+    }
+    assert coordinator.calls[0][0] == "fleet_repair"
+    assert coordinator.calls[0][2] == {
+        "awake_binding_ids": ["m1/node-a/0"]
+    }
+
+
 def test_v2_put_target_calls_vllm_and_pod_annotations_for_existing_bindings():
     from tre_sm.allocator.topology import K8sPodSnapshot
 

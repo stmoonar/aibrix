@@ -22,6 +22,7 @@ class K8sPodSnapshot:
     annotations: Mapping[str, str] = field(default_factory=dict)
     pod_ip: str | None = None
     routable: bool | None = None
+    ready: bool = True
 
 
 def pod_records_from_snapshots(
@@ -45,6 +46,7 @@ def pod_records_from_snapshots(
                 state=snapshot.annotations.get(STATE_ANNOTATION, POD_STATE_AWAKE),
                 pod_ip=snapshot.pod_ip,
                 routable=snapshot.routable,
+                ready=snapshot.ready,
             )
         )
 

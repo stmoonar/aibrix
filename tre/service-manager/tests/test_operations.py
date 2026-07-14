@@ -16,6 +16,7 @@ from tre_sm.state.operations import (
     _RENEW_SCRIPT,
     _UPDATE_SCRIPT,
     current_fence,
+    current_operation,
 )
 from tre_sm.state.store import (
     StateConflict,
@@ -65,7 +66,7 @@ class ScriptRedis:
             self.values[counter_key] = str(token)
             if lock_key in self.values:
                 return [0, self.values[lock_key]]
-            owner, _ttl, operation_id, kind, started_at = args
+            owner, _ttl, operation_id, kind, started_at, request_json = args
             lock_value = f"{owner}:{token}"
             self.values[lock_key] = lock_value
             self.hashes.setdefault(operations_key, {})[operation_id] = json.dumps(
@@ -78,6 +79,7 @@ class ScriptRedis:
                     "phase": "acquired",
                     "started_at": started_at,
                     "updated_at": started_at,
+                    "request": json.loads(request_json),
                 }
             )
             return [token, lock_value]
@@ -237,3 +239,22 @@ def test_http_mutation_uses_fence_and_exposes_operation_journal():
     assert operations[0]["status"] == "succeeded"
     operation_id = operations[0]["operation_id"]
     assert client.get(f"/v2/operations/{operation_id}").json() == operations[0]
+
+
+def test_submitted_operation_runs_under_fence_and_persists_result():
+    redis = ScriptRedis()
+    coordinator = OperationCoordinator(redis, owner="sm-pod")
+    observed = []
+
+    operation_id = coordinator.submit(
+        "fleet_repair",
+        lambda handle: observed.append(
+            (handle.operation_id, current_fence(), current_operation())
+        ),
+    )
+
+    assert coordinator.wait(operation_id, timeout_s=2.0) is True
+    assert observed[0][0] == operation_id
+    assert observed[0][1] == observed[0][2].fence
+    record = coordinator.get_operation(operation_id)
+    assert record["status"] == "succeeded"

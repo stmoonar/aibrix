@@ -17,6 +17,9 @@ class FakeK8sApi:
         self.deleted_deployments = []
         self.created_deployments = []
         self.list_calls = []
+        self.deployments = []
+        self.nodes = []
+        self.scale_patches = []
 
     def list_namespaced_pod(self, *, namespace, label_selector=None):
         self.last_list = (namespace, label_selector)
@@ -33,6 +36,16 @@ class FakeK8sApi:
 
     def create_namespaced_deployment(self, *, namespace, body):
         self.created_deployments.append((namespace, body))
+
+    def list_namespaced_deployment(self, *, namespace, label_selector=None):
+        self.last_deployment_list = (namespace, label_selector)
+        return self.deployments
+
+    def patch_namespaced_deployment_scale(self, *, name, namespace, body):
+        self.scale_patches.append((name, namespace, body))
+
+    def list_node(self):
+        return self.nodes
 
 
 class FakeRouteApi:
@@ -93,6 +106,26 @@ def pod_dict(name, model, node, cuda, *, phase="Running", annotations=None, labe
             ],
         },
         "status": {"phase": phase, "podIP": "10.0.0.9"},
+    }
+
+
+def deployment_dict(name, model, node, gpu_ids, replicas=1):
+    gpu_text = ",".join(str(gpu_id) for gpu_id in gpu_ids)
+    return {
+        "metadata": {"name": name},
+        "spec": {
+            "replicas": replicas,
+            "template": {
+                "metadata": {
+                    "labels": {
+                        MODEL_LABEL: model,
+                        "tre.aibrix.io/managed": "true",
+                    },
+                    "annotations": {GPU_IDS_ANNOTATION: gpu_text},
+                },
+                "spec": {"nodeName": node},
+            },
+        },
     }
 
 
@@ -220,6 +253,49 @@ def test_k8s_ops_uses_gpu_id_label_as_annotation_fallback():
             pod_ip="10.0.0.9",
         )
     ]
+
+
+def test_k8s_ops_lists_and_scales_stable_model_deployments():
+    api = FakeK8sApi([])
+    api.deployments = [
+        deployment_dict("m1-node-a-gpu-0", "m1", "node-a", (0,)),
+        deployment_dict("m2-node-a-gpu-0-1", "m2", "node-a", (0, 1), replicas=0),
+    ]
+    ops = K8sOps(api=api, apps_api=api, namespace="default")
+
+    records = ops.list_model_deployments()
+    ops.scale_model_deployment("m2-node-a-gpu-0-1", replicas=1)
+
+    assert [record.binding_id for record in records] == [
+        "m1/node-a/0",
+        "m2/node-a/0,1",
+    ]
+    assert records[1].replicas == 0
+    assert api.scale_patches == [
+        ("m2-node-a-gpu-0-1", "default", {"spec": {"replicas": 1}})
+    ]
+
+
+def test_k8s_ops_reports_node_pressure_reasons():
+    api = FakeK8sApi([])
+    api.nodes = [
+        {
+            "metadata": {"name": "node-a"},
+            "status": {
+                "conditions": [
+                    {"type": "DiskPressure", "status": "True"},
+                    {"type": "MemoryPressure", "status": "False"},
+                ]
+            },
+        },
+        {
+            "metadata": {"name": "node-b"},
+            "status": {"conditions": [{"type": "PIDPressure", "status": "False"}]},
+        },
+    ]
+    ops = K8sOps(api=api, namespace="default")
+
+    assert ops.node_pressure_reasons() == {"node-a": ["DiskPressure"]}
 
 
 def test_k8s_ops_writes_binding_annotations():

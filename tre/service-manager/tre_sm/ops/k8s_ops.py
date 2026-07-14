@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 import time
 from typing import Protocol
 
@@ -26,6 +27,7 @@ from tre_sm.state.reconcile import POD_STATE_AWAKE, POD_STATE_HIDDEN, POD_STATE_
 
 MODEL_LABEL = "model.aibrix.ai/name"
 ROUTABLE_LABEL = "tre.aibrix.io/routable"
+MANAGED_LABEL = "tre.aibrix.io/managed"
 _VALID_STATES = {POD_STATE_AWAKE, POD_STATE_SLEEPING, POD_STATE_HIDDEN}
 
 
@@ -33,12 +35,29 @@ class K8sApi(Protocol):
     def list_namespaced_pod(self, *, namespace: str, label_selector: str | None = None): ...
 
     def patch_namespaced_pod(self, *, name: str, namespace: str, body: dict) -> None: ...
+    def list_node(self): ...
 
 
 class K8sDeploymentApi(Protocol):
     def delete_namespaced_deployment(self, *, name: str, namespace: str): ...
 
     def create_namespaced_deployment(self, *, namespace: str, body: dict): ...
+    def list_namespaced_deployment(self, *, namespace: str, label_selector: str | None = None): ...
+    def patch_namespaced_deployment_scale(self, *, name: str, namespace: str, body: dict): ...
+
+
+@dataclass(frozen=True)
+class ModelDeploymentRecord:
+    name: str
+    model: str
+    node: str
+    gpu_ids: tuple[int, ...]
+    replicas: int
+
+    @property
+    def binding_id(self) -> str:
+        gpu_ids = ",".join(str(gpu_id) for gpu_id in self.gpu_ids)
+        return f"{self.model}/{self.node}/{gpu_ids}"
 
 
 class K8sRouteApi(Protocol):
@@ -99,6 +118,92 @@ class K8sOps:
         pods = _items(self._api.list_namespaced_pod(namespace=self._namespace, label_selector=selector))
         return self._snapshots_from_pods(pods)
 
+    def list_model_deployments(self) -> list[ModelDeploymentRecord]:
+        deployments = _items(
+            self._apps_api.list_namespaced_deployment(
+                namespace=self._namespace,
+                label_selector=f"{MANAGED_LABEL}=true",
+            )
+        )
+        records: list[ModelDeploymentRecord] = []
+        for deployment in deployments:
+            metadata = _metadata(deployment)
+            spec = _spec(deployment)
+            template = spec.get("template") or {}
+            template_metadata = _section(template, "metadata")
+            template_spec = _section(template, "spec")
+            labels = template_metadata.get("labels") or {}
+            annotations = template_metadata.get("annotations") or {}
+            model = labels.get(MODEL_LABEL)
+            gpu_text = annotations.get(GPU_IDS_ANNOTATION)
+            node = _optional_field(template_spec, "nodeName", "node_name")
+            if not model or not gpu_text or not node:
+                continue
+            records.append(
+                ModelDeploymentRecord(
+                    name=str(metadata["name"]),
+                    model=str(model),
+                    node=str(node),
+                    gpu_ids=tuple(int(part) for part in str(gpu_text).split(",")),
+                    replicas=int(spec.get("replicas", 1)),
+                )
+            )
+        return sorted(records, key=lambda item: item.binding_id)
+
+    def scale_model_deployment(self, name: str, *, replicas: int) -> None:
+        if replicas not in (0, 1):
+            raise ValueError("model Deployment replicas must be 0 or 1")
+        self._apps_api.patch_namespaced_deployment_scale(
+            name=name,
+            namespace=self._namespace,
+            body={"spec": {"replicas": replicas}},
+        )
+
+    def wait_deployment_pods_deleted(
+        self,
+        deployment_name: str,
+        *,
+        timeout_s: float = 120.0,
+        interval_s: float = 1.0,
+    ) -> None:
+        deadline = time.monotonic() + timeout_s
+        selector = f"app={deployment_name}"
+        while time.monotonic() < deadline:
+            pods = _items(
+                self._api.list_namespaced_pod(
+                    namespace=self._namespace, label_selector=selector
+                )
+            )
+            live = [
+                pod
+                for pod in pods
+                if not _optional_field(
+                    _metadata(pod), "deletionTimestamp", "deletion_timestamp"
+                )
+            ]
+            if not live:
+                return
+            time.sleep(interval_s)
+        raise TimeoutError(
+            f"Deployment {deployment_name} still has Pods after timeout"
+        )
+
+    def node_pressure_reasons(self) -> dict[str, list[str]]:
+        pressured: dict[str, list[str]] = {}
+        for node in _items(self._api.list_node()):
+            metadata = _metadata(node)
+            conditions = _status(node).get("conditions") or []
+            reasons = [
+                str(_field(condition, "type", "type"))
+                for condition in conditions
+                if str(_field(condition, "type", "type"))
+                in {"DiskPressure", "MemoryPressure", "PIDPressure"}
+                and str(_field(condition, "status", "status")) == "True"
+            ]
+            if reasons:
+                pressured[str(metadata["name"])] = reasons
+        return pressured
+
     def _snapshots_from_pods(self, pods) -> list[K8sPodSnapshot]:
         snapshots: list[K8sPodSnapshot] = []
         for pod in pods:
@@ -125,6 +230,7 @@ class K8sOps:
                     annotations=annotations,
                     pod_ip=_optional_field(_status(pod), "podIP", "pod_ip"),
                     routable=routable,
+                    ready=_pod_ready(pod),
                 )
             )
         return sorted(snapshots, key=lambda item: item.name)
@@ -308,6 +414,20 @@ def _parse_routable(value) -> bool | None:
     if text == "false":
         return False
     return None
+
+
+def _pod_ready(pod) -> bool:
+    status = _status(pod)
+    container_statuses = _optional_field(
+        status, "containerStatuses", "container_statuses"
+    )
+    if container_statuses is None:
+        # Compatibility for synthetic API objects in tests. Real Kubernetes
+        # Running Pods always include containerStatuses.
+        return status.get("phase") == "Running"
+    return bool(container_statuses) and all(
+        bool(_field(item, "ready", "ready")) for item in container_statuses
+    )
 
 
 def _is_not_found(exc: Exception) -> bool:

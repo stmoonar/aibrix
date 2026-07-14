@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
 import threading
-from typing import Iterator, Mapping, Protocol
+from typing import Callable, Iterator, Mapping, Protocol
 from uuid import uuid4
 
 from tre_common import rediskeys
@@ -22,7 +22,7 @@ end
 local record = cjson.encode({
   operation_id=ARGV[3], kind=ARGV[4], owner=ARGV[1],
   fencing_token=token, status='running', phase='acquired',
-  started_at=ARGV[5], updated_at=ARGV[5]
+  started_at=ARGV[5], updated_at=ARGV[5], request=cjson.decode(ARGV[6])
 })
 redis.call('HSET', KEYS[3], ARGV[3], record)
 return {token, value}
@@ -71,10 +71,17 @@ class WriterFence:
 _CURRENT_FENCE: ContextVar[WriterFence | None] = ContextVar(
     "tre_sm_current_fence", default=None
 )
+_CURRENT_OPERATION: ContextVar["OperationHandle | None"] = ContextVar(
+    "tre_sm_current_operation", default=None
+)
 
 
 def current_fence() -> WriterFence | None:
     return _CURRENT_FENCE.get()
+
+
+def current_operation() -> "OperationHandle | None":
+    return _CURRENT_OPERATION.get()
 
 
 class OperationBusy(RuntimeError):
@@ -96,12 +103,14 @@ class OperationHandle:
         kind: str,
         fence: WriterFence,
         started_at: str,
+        request: dict | None = None,
     ) -> None:
         self._coordinator = coordinator
         self.operation_id = operation_id
         self.kind = kind
         self.fence = fence
         self.started_at = started_at
+        self.request = dict(request or {})
         self._lost = threading.Event()
         self._stop = threading.Event()
         self._thread = threading.Thread(
@@ -164,6 +173,8 @@ class OperationHandle:
         }
         if details:
             record["details"] = details
+        if self.request:
+            record["request"] = self.request
         if finished:
             record["finished_at"] = now
         return record
@@ -189,11 +200,16 @@ class OperationCoordinator:
         self.owner = owner
         self.lease_ttl_ms = lease_ttl_ms
         self.renew_interval_s = lease_ttl_ms / 3000.0
+        self._submitted: dict[str, threading.Thread] = {}
+        self._submitted_lock = threading.Lock()
 
     @contextmanager
-    def operation(self, kind: str) -> Iterator[OperationHandle]:
-        handle = self.acquire(kind)
-        token = _CURRENT_FENCE.set(handle.fence)
+    def operation(
+        self, kind: str, *, request: dict | None = None
+    ) -> Iterator[OperationHandle]:
+        handle = self.acquire(kind, request=request)
+        fence_token = _CURRENT_FENCE.set(handle.fence)
+        operation_token = _CURRENT_OPERATION.set(handle)
         handle.start()
         error: BaseException | None = None
         try:
@@ -210,9 +226,40 @@ class OperationCoordinator:
                     error=str(error) if error else None,
                 )
             finally:
-                _CURRENT_FENCE.reset(token)
+                _CURRENT_OPERATION.reset(operation_token)
+                _CURRENT_FENCE.reset(fence_token)
 
-    def acquire(self, kind: str) -> OperationHandle:
+    def submit(
+        self,
+        kind: str,
+        target: Callable[[OperationHandle], None],
+        *,
+        request: dict | None = None,
+    ) -> str:
+        """Acquire the writer fence synchronously, then run work in background."""
+        handle = self.acquire(kind, request=request)
+        thread = threading.Thread(
+            target=self._run_submitted,
+            args=(handle, target),
+            name=f"tre-sm-operation-{handle.operation_id}",
+            daemon=True,
+        )
+        with self._submitted_lock:
+            self._submitted[handle.operation_id] = thread
+        thread.start()
+        return handle.operation_id
+
+    def wait(self, operation_id: str, *, timeout_s: float | None = None) -> bool:
+        with self._submitted_lock:
+            thread = self._submitted.get(operation_id)
+        if thread is None:
+            return True
+        thread.join(timeout=timeout_s)
+        return not thread.is_alive()
+
+    def acquire(
+        self, kind: str, *, request: dict | None = None
+    ) -> OperationHandle:
         operation_id = str(uuid4())
         started_at = _utc_now()
         result = self._redis.eval(
@@ -226,6 +273,7 @@ class OperationCoordinator:
             operation_id,
             kind,
             started_at,
+            json.dumps(request or {}, sort_keys=True, separators=(",", ":")),
         )
         token = int(result[0])
         lock_value = _text(result[1])
@@ -243,6 +291,7 @@ class OperationCoordinator:
             kind=kind,
             fence=fence,
             started_at=started_at,
+            request=request,
         )
 
     def list_operations(self, *, limit: int = 100) -> list[dict]:
@@ -288,6 +337,35 @@ class OperationCoordinator:
             json.dumps(record, sort_keys=True, separators=(",", ":")),
         )
         return int(result) == 1
+
+    def _run_submitted(
+        self,
+        handle: OperationHandle,
+        target: Callable[[OperationHandle], None],
+    ) -> None:
+        fence_token = _CURRENT_FENCE.set(handle.fence)
+        operation_token = _CURRENT_OPERATION.set(handle)
+        handle.start()
+        error: BaseException | None = None
+        try:
+            target(handle)
+            handle.assert_active()
+        except BaseException as exc:  # background result is persisted in journal.
+            error = exc
+        finally:
+            handle.stop()
+            try:
+                handle.finish(
+                    status="failed" if error else "succeeded",
+                    error=str(error) if error else None,
+                )
+            except OperationFenceLost:
+                pass
+            finally:
+                _CURRENT_OPERATION.reset(operation_token)
+                _CURRENT_FENCE.reset(fence_token)
+                with self._submitted_lock:
+                    self._submitted.pop(handle.operation_id, None)
 
 
 def _utc_now() -> str:

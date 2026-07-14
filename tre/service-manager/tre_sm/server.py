@@ -14,6 +14,7 @@ from tre_sm.ops.k8s_ops import K8sOps
 from tre_sm.ops.vllm_ops import VllmOps
 from tre_sm.state.reconcile import PodRecord
 from tre_sm.state.operations import OperationCoordinator
+from tre_sm.state.safety import ClusterSafetyGate
 from tre_sm.state.store import StateStore
 
 
@@ -45,6 +46,16 @@ def create_app() -> FastAPI:
         owner=os.environ.get("HOSTNAME", "tre-v2-service-manager"),
         lease_ttl_ms=int(os.environ.get("TRE_SM_WRITER_LEASE_TTL_MS", "30000")),
     )
+    safety_gate = ClusterSafetyGate(
+        redis_client,
+        k8s_ops,
+        clear_hysteresis_s=float(
+            os.environ.get("TRE_SM_PRESSURE_CLEAR_HYSTERESIS_S", "60")
+        ),
+        pressure_timeout_s=float(
+            os.environ.get("TRE_SM_PRESSURE_TIMEOUT_S", "3600")
+        ),
+    )
     return create_service_app(
         registry,
         StateStore(redis_client, require_fence=True),
@@ -55,6 +66,7 @@ def create_app() -> FastAPI:
         create_max_used_mib=int(os.environ.get("TRE_CREATE_MAX_USED_MIB", "2500")),
         sleep_leak_used_mib=int(os.environ.get("TRE_SLEEP_LEAK_USED_MIB", "8192")),
         operation_coordinator=operation_coordinator,
+        safety_gate=safety_gate,
     )
 
 

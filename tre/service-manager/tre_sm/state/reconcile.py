@@ -29,6 +29,8 @@ class PodRecord:
     # routable mirrors the current tre.aibrix.io/routable label (write-through
     # cache) so Layer 1 can patch-on-diff rather than unconditionally.
     routable: bool | None = None
+    # Running is not sufficient for routing; all containers must be Ready.
+    ready: bool = True
 
     def to_binding(self) -> Binding:
         if self.state not in _VALID_POD_STATES:
@@ -143,6 +145,15 @@ def audit_state(
                 }
             )
 
+        if not pod.ready:
+            issues.append(
+                {
+                    "code": "pod_not_ready",
+                    "binding_id": binding_id,
+                    "serve_id": live.serve_id,
+                }
+            )
+
         physical_awake: bool | None = live.awake
         if prober is not None:
             sleeping = prober.is_sleeping(pod)
@@ -185,7 +196,10 @@ def audit_state(
                     physically_awake_by_gpu[gpu_key] = live.serve_id
 
         expected_routable = (
-            bool(physical_awake) and not stored.hidden and not live.hidden
+            bool(physical_awake)
+            and pod.ready
+            and not stored.hidden
+            and not live.hidden
         )
         if pod.routable is None or pod.routable != expected_routable:
             issues.append(
@@ -301,7 +315,7 @@ def _enforce_routable_labels(
         if pod is None:
             # No live pod observation -> nothing to re-assert.
             continue
-        desired_routable = binding.awake and not binding.hidden
+        desired_routable = binding.awake and pod.ready and not binding.hidden
         if pod.routable == desired_routable:
             continue
         label_writer.set_pod_routable(binding.serve_id, routable=desired_routable)

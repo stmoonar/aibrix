@@ -17,6 +17,8 @@ from tre_sm.allocator.topology import K8sPodSnapshot
 from tre_sm.gpu_truth import GpuTruthProvider
 from tre_sm.state.reconcile import K8sPodClient, POD_STATE_AWAKE, POD_STATE_HIDDEN, POD_STATE_SLEEPING, audit_state, reconcile_state
 from tre_sm.state.operations import OperationBusy, OperationCoordinator
+from tre_sm.state.fleet_repair import FleetRepairExecutor
+from tre_sm.state.safety import ClusterSafetyGate, ControllerNotPaused
 from tre_sm.state.store import StateConflict, StateFenceError, StateStore
 from tre_sm.api.v1_compat import create_v1_compat_router
 
@@ -92,6 +94,7 @@ class ServiceManagerV2:
         create_max_used_mib: int = 2500,
         sleep_leak_used_mib: int = 8192,
         operation_coordinator: OperationCoordinator | None = None,
+        safety_gate: ClusterSafetyGate | None = None,
     ) -> None:
         self._registry = registry
         self._store = store
@@ -102,6 +105,26 @@ class ServiceManagerV2:
         self._create_max_used_mib = create_max_used_mib
         self._sleep_leak_used_mib = sleep_leak_used_mib
         self._operation_coordinator = operation_coordinator
+        self._safety_gate = safety_gate
+        self._fleet_repair = None
+        if (
+            runtime_ops is not None
+            and vllm_ops is not None
+            and safety_gate is not None
+            and all(
+                hasattr(runtime_ops, name)
+                for name in (
+                    "list_model_deployments",
+                    "scale_model_deployment",
+                    "wait_deployment_pods_deleted",
+                )
+            )
+        ):
+            self._fleet_repair = FleetRepairExecutor(
+                runtime_ops=runtime_ops,
+                vllm_ops=vllm_ops,
+                safety_gate=safety_gate,
+            )
 
     def get_state(self) -> dict:
         snapshot = self._store.load()
@@ -212,6 +235,9 @@ class ServiceManagerV2:
 
     @serialized_operation("put_binding_power")
     def put_binding_power(self, serve_id: str, *, awake: bool) -> dict:
+        return self._put_binding_power_unlocked(serve_id, awake=awake)
+
+    def _put_binding_power_unlocked(self, serve_id: str, *, awake: bool) -> dict:
         snapshot = self._store.load()
         binding = next(
             (item for item in snapshot.bindings if item.serve_id == serve_id),
@@ -347,6 +373,9 @@ class ServiceManagerV2:
 
     @serialized_operation("reconcile")
     def reconcile(self, *, drop_missing: bool = False) -> dict:
+        return self._reconcile_unlocked(drop_missing=drop_missing)
+
+    def _reconcile_unlocked(self, *, drop_missing: bool = False) -> dict:
         if self._k8s_client is None:
             raise ValueError("k8s_client is required for reconcile")
         prober = None
@@ -370,6 +399,64 @@ class ServiceManagerV2:
             "warnings": result.warnings,
             "bindings": [self._binding_dict(binding) for binding in result.bindings],
         }
+
+    def start_fleet_repair(
+        self, *, awake_binding_ids: list[str] | None = None
+    ) -> dict:
+        if self._operation_coordinator is None or self._fleet_repair is None:
+            raise ValueError("fleet repair runtime is not configured")
+        if self._safety_gate is None:
+            raise ValueError("fleet repair safety gate is not configured")
+        self._safety_gate.assert_controller_observe()
+        snapshot = self._store.load()
+        targets = (
+            sorted(set(awake_binding_ids))
+            if awake_binding_ids is not None
+            else sorted(
+                binding.binding_id
+                for binding in snapshot.bindings
+                if binding.awake
+            )
+        )
+
+        def run(operation) -> None:
+            self._fleet_repair.run(
+                operation,
+                awake_binding_ids=targets,
+                reconcile=lambda strict: self._reconcile_unlocked(
+                    drop_missing=strict
+                ),
+                set_binding_power=self._set_binding_power_by_id_unlocked,
+                audit=self.audit,
+            )
+
+        operation_id = self._operation_coordinator.submit(
+            "fleet_repair",
+            run,
+            request={"awake_binding_ids": targets},
+        )
+        return {
+            "operation_id": operation_id,
+            "status": "accepted",
+            "awake_binding_ids": targets,
+        }
+
+    def _set_binding_power_by_id_unlocked(
+        self, binding_id: str, awake: bool
+    ) -> dict:
+        snapshot = self._store.load()
+        matches = [
+            binding
+            for binding in snapshot.bindings
+            if binding.binding_id == binding_id
+        ]
+        if len(matches) != 1:
+            raise ValueError(
+                f"stable binding {binding_id} resolved to {len(matches)} instances"
+            )
+        return self._put_binding_power_unlocked(
+            matches[0].serve_id, awake=awake
+        )
 
     def list_operations(self, *, limit: int = 100) -> list[dict]:
         if self._operation_coordinator is None:
@@ -579,6 +666,10 @@ class RoutableRequest(BaseModel):
 class ReconcileRequest(BaseModel):
     drop_missing: bool = False
 
+
+class FleetRepairRequest(BaseModel):
+    awake_binding_ids: list[str] | None = None
+
 def create_app(service: ServiceManagerV2) -> FastAPI:
     app = FastAPI()
     app.include_router(create_v1_compat_router(service))
@@ -595,6 +686,12 @@ def create_app(service: ServiceManagerV2) -> FastAPI:
     @app.exception_handler(StateFenceError)
     async def state_fence_handler(
         _request: Request, exc: StateFenceError
+    ) -> JSONResponse:
+        return JSONResponse(status_code=409, content={"detail": str(exc)})
+
+    @app.exception_handler(ControllerNotPaused)
+    async def controller_not_paused_handler(
+        _request: Request, exc: ControllerNotPaused
     ) -> JSONResponse:
         return JSONResponse(status_code=409, content={"detail": str(exc)})
 
@@ -616,6 +713,16 @@ def create_app(service: ServiceManagerV2) -> FastAPI:
         try:
             return service.reconcile(
                 drop_missing=request.drop_missing if request is not None else False
+            )
+        except (KeyError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+    @app.post("/v2/fleet/repair", status_code=202)
+    def start_fleet_repair(request: FleetRepairRequest) -> dict:
+        try:
+            return service.start_fleet_repair(
+                awake_binding_ids=request.awake_binding_ids
             )
         except (KeyError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
