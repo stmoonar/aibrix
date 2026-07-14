@@ -13,6 +13,7 @@ from tre_sm.state.reconcile import (
     POD_STATE_SLEEPING,
 )
 from tre_sm.state.safety import ClusterSafetyGate
+from tre_sm.state.gpu_leases import GpuLeaseStore
 
 
 class FleetRuntimeOps(Protocol):
@@ -37,6 +38,7 @@ class FleetRepairExecutor:
         runtime_ops: FleetRuntimeOps,
         vllm_ops: FleetVllmOps,
         safety_gate: ClusterSafetyGate,
+        gpu_leases: GpuLeaseStore | None = None,
         physical_timeout_s: float = 120.0,
         poll_interval_s: float = 2.0,
         monotonic: Callable[[], float] = time.monotonic,
@@ -45,6 +47,7 @@ class FleetRepairExecutor:
         self._runtime = runtime_ops
         self._vllm = vllm_ops
         self._safety = safety_gate
+        self._gpu_leases = gpu_leases
         self._physical_timeout_s = physical_timeout_s
         self._poll_interval_s = poll_interval_s
         self._monotonic = monotonic
@@ -106,6 +109,14 @@ class FleetRepairExecutor:
                     "completed_binding_ids": completed,
                 },
             )
+            planned = Binding(
+                serve_id=deployment.name,
+                model=deployment.model,
+                slot=Slot(deployment.node, deployment.gpu_ids),
+                awake=False,
+            )
+            if self._gpu_leases is not None:
+                self._gpu_leases.acquire(planned, phase="starting")
             self._runtime.scale_model_deployment(deployment.name, replicas=1)
             pod = self._runtime.wait_pod_ready(deployment.name)
             if not pod.pod_ip:
@@ -198,6 +209,8 @@ class FleetRepairExecutor:
             )
         self._wait_physical(pod_ip, sleeping=True)
         self._runtime.write_binding_annotations(binding, state=POD_STATE_SLEEPING)
+        if self._gpu_leases is not None:
+            self._gpu_leases.release(binding)
 
     def _wait_physical(self, pod_ip: str, *, sleeping: bool) -> None:
         deadline = self._monotonic() + self._physical_timeout_s

@@ -231,6 +231,9 @@ class K8sOps:
                     pod_ip=_optional_field(_status(pod), "podIP", "pod_ip"),
                     routable=routable,
                     ready=_pod_ready(pod),
+                    pod_uid=_optional_field(metadata, "uid", "uid"),
+                    phase=str(_status(pod).get("phase", "Unknown")),
+                    restart_count=_pod_restart_count(pod),
                 )
             )
         return sorted(snapshots, key=lambda item: item.name)
@@ -427,6 +430,15 @@ def _pod_ready(pod) -> bool:
         return status.get("phase") == "Running"
     return bool(container_statuses) and all(
         bool(_field(item, "ready", "ready")) for item in container_statuses
+    )
+
+
+def _pod_restart_count(pod) -> int:
+    statuses = _optional_field(
+        _status(pod), "containerStatuses", "container_statuses"
+    ) or []
+    return sum(
+        int(_field(item, "restartCount", "restart_count")) for item in statuses
     )
 
 

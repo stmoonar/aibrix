@@ -8,6 +8,8 @@ from tre_sm.gpu_truth import GpuTruthProvider
 from tre_sm.state.reconcile import K8sPodClient
 from tre_sm.state.operations import OperationCoordinator
 from tre_sm.state.safety import ClusterSafetyGate
+from tre_sm.state.fleet_store import FleetStateStore
+from tre_sm.state.gpu_leases import GpuLeaseStore
 from tre_sm.state.store import StateStore
 
 
@@ -23,6 +25,8 @@ def create_service_app(
     sleep_leak_used_mib: int = 8192,
     operation_coordinator: OperationCoordinator | None = None,
     safety_gate: ClusterSafetyGate | None = None,
+    fleet_store: FleetStateStore | None = None,
+    gpu_leases: GpuLeaseStore | None = None,
 ) -> FastAPI:
     return create_app(
         ServiceManagerV2(
@@ -36,5 +40,7 @@ def create_service_app(
             sleep_leak_used_mib=sleep_leak_used_mib,
             operation_coordinator=operation_coordinator,
             safety_gate=safety_gate,
+            fleet_store=fleet_store,
+            gpu_leases=gpu_leases,
         )
     )

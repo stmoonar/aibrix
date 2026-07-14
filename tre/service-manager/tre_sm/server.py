@@ -15,6 +15,8 @@ from tre_sm.ops.vllm_ops import VllmOps
 from tre_sm.state.reconcile import PodRecord
 from tre_sm.state.operations import OperationCoordinator
 from tre_sm.state.safety import ClusterSafetyGate
+from tre_sm.state.fleet_store import FleetStateStore
+from tre_sm.state.gpu_leases import GpuLeaseStore
 from tre_sm.state.store import StateStore
 
 
@@ -46,6 +48,12 @@ def create_app() -> FastAPI:
         owner=os.environ.get("HOSTNAME", "tre-v2-service-manager"),
         lease_ttl_ms=int(os.environ.get("TRE_SM_WRITER_LEASE_TTL_MS", "30000")),
     )
+    legacy_store = StateStore(redis_client, require_fence=True)
+    fleet_store = FleetStateStore(redis_client)
+    gpu_leases = GpuLeaseStore(redis_client)
+    with operation_coordinator.operation("bootstrap_fleet_state"):
+        fleet_store.bootstrap(legacy_store.load().bindings)
+        gpu_leases.rebuild_awake(legacy_store.load().bindings)
     safety_gate = ClusterSafetyGate(
         redis_client,
         k8s_ops,
@@ -58,7 +66,7 @@ def create_app() -> FastAPI:
     )
     return create_service_app(
         registry,
-        StateStore(redis_client, require_fence=True),
+        legacy_store,
         k8s_client=K8sPodClientFromOps(registry.topology(), k8s_ops),
         runtime_ops=k8s_ops,
         vllm_ops=VllmOps(),
@@ -67,6 +75,8 @@ def create_app() -> FastAPI:
         sleep_leak_used_mib=int(os.environ.get("TRE_SLEEP_LEAK_USED_MIB", "8192")),
         operation_coordinator=operation_coordinator,
         safety_gate=safety_gate,
+        fleet_store=fleet_store,
+        gpu_leases=gpu_leases,
     )
 
 

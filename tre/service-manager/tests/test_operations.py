@@ -24,6 +24,7 @@ from tre_sm.state.store import (
     StateStore,
     _SAVE_SCRIPT,
 )
+from tre_sm.state.fleet_store import FleetStateStore, _SAVE_HASH_SCRIPT
 
 
 class ScriptRedis:
@@ -110,6 +111,17 @@ class ScriptRedis:
                 return [-1, current]
             mapping = dict(zip(pairs[::2], pairs[1::2]))
             self.hashes[state_key] = mapping
+            self.values[version_key] = str(next_version)
+            return [1, int(next_version)]
+        if script == _SAVE_HASH_SCRIPT:
+            state_key, version_key, lock_key = keys
+            expected, next_version, lock_value, *pairs = args
+            current = int(self.values.get(version_key, 0))
+            if current != int(expected):
+                return [0, current]
+            if self.values.get(lock_key) != lock_value:
+                return [-1, current]
+            self.hashes[state_key] = dict(zip(pairs[::2], pairs[1::2]))
             self.values[version_key] = str(next_version)
             return [1, int(next_version)]
         raise AssertionError("unexpected Lua script")
@@ -258,3 +270,37 @@ def test_submitted_operation_runs_under_fence_and_persists_result():
     assert observed[0][1] == observed[0][2].fence
     record = coordinator.get_operation(operation_id)
     assert record["status"] == "succeeded"
+
+
+def test_desired_intent_commits_before_observed_state_converges():
+    redis = ScriptRedis()
+    coordinator = OperationCoordinator(redis, owner="sm-pod")
+    legacy_store = StateStore(redis, require_fence=True)
+    fleet_store = FleetStateStore(redis)
+    sleeping = Binding("pod-a", "m1", Slot("node-a", (0,)), awake=False)
+    with coordinator.operation("bootstrap"):
+        legacy_store.save([sleeping], expected_version=0)
+        fleet_store.bootstrap([sleeping])
+    service = ServiceManagerV2(
+        _registry(),
+        legacy_store,
+        operation_coordinator=coordinator,
+        fleet_store=fleet_store,
+    )
+    client = TestClient(create_app(service))
+
+    response = client.put("/v2/models/m1/target", json={"wake_replicas": 1})
+    fleet = client.get("/v2/fleet/state").json()
+
+    assert response.status_code == 200
+    assert fleet["desired"][0]["power"] == "awake"
+    assert fleet["desired"][0]["generation"] == 2
+    assert fleet["observed"][0]["physical_power"] == "sleeping"
+    assert fleet["mismatches"] == [
+        {
+            "code": "desired_power_mismatch",
+            "binding_id": "m1/node-a/0",
+            "desired_power": "awake",
+            "observed_power": "sleeping",
+        }
+    ]

@@ -31,6 +31,9 @@ class PodRecord:
     routable: bool | None = None
     # Running is not sufficient for routing; all containers must be Ready.
     ready: bool = True
+    pod_uid: str | None = None
+    phase: str = "Running"
+    restart_count: int = 0
 
     def to_binding(self) -> Binding:
         if self.state not in _VALID_POD_STATES:
@@ -70,6 +73,14 @@ class ReconcileResult:
     bindings: list[Binding]
     warnings: list[str]
     allocator: SlotAllocator
+    observations: list["BindingObservation"]
+
+
+@dataclass(frozen=True)
+class BindingObservation:
+    binding: Binding
+    pod: PodRecord
+    physical_awake: bool | None
 
 
 @dataclass(frozen=True)
@@ -233,6 +244,7 @@ def reconcile_state(
 
     observed = list(k8s_client.list_pods())
     observed_by_serve = {pod.serve_id: pod for pod in observed}
+    physical_by_serve: dict[str, bool | None] = {}
 
     for pod in sorted(observed, key=lambda item: binding_sort_key(item.to_binding())):
         binding = pod.to_binding()
@@ -240,6 +252,9 @@ def reconcile_state(
         # tre.aibrix.io/state annotation, which is only a write-through cache.
         if prober is not None:
             sleeping = prober.is_sleeping(pod)
+            physical_by_serve[pod.serve_id] = (
+                None if sleeping is None else not sleeping
+            )
             if sleeping is not None:
                 binding = replace(binding, awake=not sleeping)
             else:
@@ -250,6 +265,8 @@ def reconcile_state(
                 warnings.append(
                     f"{binding.serve_id}: physical power state unknown; quarantined unroutable"
                 )
+        else:
+            physical_by_serve[pod.serve_id] = binding.awake
         previous = persisted_by_serve.get(binding.serve_id)
         if previous is not None and previous != binding:
             warnings.append(f"{binding.serve_id}: pod reality overrides persisted binding")
@@ -293,16 +310,32 @@ def reconcile_state(
         _enforce_routable_labels(bindings, observed_by_serve, label_writer)
 
     allocator = SlotAllocator(topology, bindings, allow_awake_conflicts=True)
+    observations = [
+        BindingObservation(
+            binding=binding,
+            pod=observed_by_serve[binding.serve_id],
+            physical_awake=physical_by_serve.get(binding.serve_id),
+        )
+        for binding in bindings
+        if binding.serve_id in observed_by_serve
+    ]
     if bindings == persisted.bindings:
         return ReconcileResult(
             version=persisted.version,
             bindings=bindings,
             warnings=warnings,
             allocator=allocator,
+            observations=observations,
         )
 
     version = store.save(bindings, expected_version=persisted.version)
-    return ReconcileResult(version=version, bindings=bindings, warnings=warnings, allocator=allocator)
+    return ReconcileResult(
+        version=version,
+        bindings=bindings,
+        warnings=warnings,
+        allocator=allocator,
+        observations=observations,
+    )
 
 
 def _enforce_routable_labels(

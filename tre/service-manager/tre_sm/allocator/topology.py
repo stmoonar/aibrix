@@ -23,6 +23,9 @@ class K8sPodSnapshot:
     pod_ip: str | None = None
     routable: bool | None = None
     ready: bool = True
+    pod_uid: str | None = None
+    phase: str = "Running"
+    restart_count: int = 0
 
 
 def pod_records_from_snapshots(
@@ -47,6 +50,9 @@ def pod_records_from_snapshots(
                 pod_ip=snapshot.pod_ip,
                 routable=snapshot.routable,
                 ready=snapshot.ready,
+                pod_uid=snapshot.pod_uid,
+                phase=snapshot.phase,
+                restart_count=snapshot.restart_count,
             )
         )
 

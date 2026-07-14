@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from collections import Counter
 from dataclasses import replace
+from dataclasses import asdict
 from functools import wraps
 from typing import Protocol
 
@@ -18,7 +19,9 @@ from tre_sm.gpu_truth import GpuTruthProvider
 from tre_sm.state.reconcile import K8sPodClient, POD_STATE_AWAKE, POD_STATE_HIDDEN, POD_STATE_SLEEPING, audit_state, reconcile_state
 from tre_sm.state.operations import OperationBusy, OperationCoordinator
 from tre_sm.state.fleet_repair import FleetRepairExecutor
+from tre_sm.state.fleet_store import DesiredBinding, FleetStateStore, ObservedBinding
 from tre_sm.state.safety import ClusterSafetyGate, ControllerNotPaused
+from tre_sm.state.gpu_leases import GpuLeaseStore
 from tre_sm.state.store import StateConflict, StateFenceError, StateStore
 from tre_sm.api.v1_compat import create_v1_compat_router
 
@@ -95,6 +98,8 @@ class ServiceManagerV2:
         sleep_leak_used_mib: int = 8192,
         operation_coordinator: OperationCoordinator | None = None,
         safety_gate: ClusterSafetyGate | None = None,
+        fleet_store: FleetStateStore | None = None,
+        gpu_leases: GpuLeaseStore | None = None,
     ) -> None:
         self._registry = registry
         self._store = store
@@ -106,6 +111,8 @@ class ServiceManagerV2:
         self._sleep_leak_used_mib = sleep_leak_used_mib
         self._operation_coordinator = operation_coordinator
         self._safety_gate = safety_gate
+        self._fleet_store = fleet_store
+        self._gpu_leases = gpu_leases
         self._fleet_repair = None
         if (
             runtime_ops is not None
@@ -124,15 +131,19 @@ class ServiceManagerV2:
                 runtime_ops=runtime_ops,
                 vllm_ops=vllm_ops,
                 safety_gate=safety_gate,
+                gpu_leases=gpu_leases,
             )
 
     def get_state(self) -> dict:
         snapshot = self._store.load()
-        return {
+        state = {
             "version": snapshot.version,
             "models": self._model_counts(snapshot.bindings),
             "bindings": [self._binding_dict(binding) for binding in snapshot.bindings],
         }
+        if self._fleet_store is not None:
+            state["fleet"] = self.get_fleet_state()
+        return state
 
     @serialized_operation("put_model_target")
     def put_model_target(self, model: str, *, wake_replicas: int) -> dict:
@@ -146,73 +157,49 @@ class ServiceManagerV2:
         model_bindings = [binding for binding in snapshot.bindings if binding.model == model]
         if self._runtime_ops is not None and wake_replicas > len(model_bindings) and not self._has_deployment_ops():
             raise ValueError("runtime create is not implemented for target growth beyond existing bindings")
-        awake = [binding for binding in model_bindings if binding.awake]
+        plan = self._plan_model_target(
+            model=model,
+            wake_replicas=wake_replicas,
+            bindings=snapshot.bindings,
+            tp_size=spec.tp_size,
+        )
+        self._set_model_desired_target(
+            model=model,
+            target_bindings=plan["target_bindings"],
+            reason="model_target_request",
+        )
         actions: list[dict] = []
         updated_by_serve = {binding.serve_id: binding for binding in snapshot.bindings}
 
-        if len(awake) < wake_replicas:
-            sleeping = [binding for binding in model_bindings if not binding.awake]
-            awake_by_node = Counter(
-                binding.slot.node for binding in snapshot.bindings if binding.awake
+        for binding in plan["sleep"]:
+            self._apply_runtime_power_action(binding, action="sleep")
+            updated_by_serve[binding.serve_id] = replace(
+                binding, awake=False, hidden=False
             )
-            wake_existing = 0
-            wake_needed = wake_replicas - len(awake)
-            skipped_conflict: str | None = None
-            while sleeping and wake_existing < wake_needed:
-                feasible = [
-                    binding
-                    for binding in sleeping
-                    if self._feasible_wake(binding, list(updated_by_serve.values()))
-                ]
-                if not feasible:
-                    skipped_conflict = skipped_conflict or (
-                        f"{sleeping[0].serve_id}: slot already has awake binding"
-                    )
-                    break
-                binding = min(
-                    feasible,
-                    key=lambda item: (
-                        awake_by_node[item.slot.node], _natural_key(item.serve_id)
-                    ),
+            actions.append({"action": "sleep", "serve_id": binding.serve_id})
+
+        for binding in plan["wake"]:
+            self._apply_runtime_power_action(binding, action="wake")
+            updated_by_serve[binding.serve_id] = replace(
+                binding, awake=True, hidden=False
+            )
+            actions.append({"action": "wake", "serve_id": binding.serve_id})
+
+        for planned in plan["create"]:
+            binding = planned
+            if self._has_deployment_ops():
+                binding = self._create_and_wake_runtime_binding(
+                    model, planned.slot
                 )
-                sleeping.remove(binding)
-                self._apply_runtime_power_action(binding, action="wake")
-                updated_by_serve[binding.serve_id] = replace(
-                    binding, awake=True, hidden=False
-                )
-                awake_by_node[binding.slot.node] += 1
-                actions.append({"action": "wake", "serve_id": binding.serve_id})
-                wake_existing += 1
-            create_count = max(0, wake_replicas - len(model_bindings))
-            if len(awake) + wake_existing + create_count < wake_replicas:
-                raise WakeConflict(skipped_conflict or f"{model}: no feasible sleeping binding for target")
-            if create_count > 0:
-                allocator = SlotAllocator(self._registry.topology(), list(updated_by_serve.values()))
-                existing_serve_ids = set(updated_by_serve)
-                for _ in range(create_count):
-                    slot = allocator.find_slot(spec.tp_size)
-                    if slot is None:
-                        raise ValueError(f"no free slot for {model} tp_size={spec.tp_size}")
-                    serve_id = _next_serve_id(model, existing_serve_ids)
-                    allocator.bind(serve_id, model, slot, awake=True)
-                    binding = Binding(serve_id, model, slot, awake=True)
-                    if self._has_deployment_ops():
-                        binding = self._create_and_wake_runtime_binding(model, slot)
-                    existing_serve_ids.add(binding.serve_id)
-                    updated_by_serve[binding.serve_id] = binding
-                    actions.append(
-                        {
-                            "action": "create",
-                            "serve_id": binding.serve_id,
-                            "node": slot.node,
-                            "gpu_ids": list(slot.gpu_ids),
-                        }
-                    )
-        elif len(awake) > wake_replicas:
-            for binding in reversed(awake[wake_replicas:]):
-                self._apply_runtime_power_action(binding, action="sleep")
-                updated_by_serve[binding.serve_id] = replace(binding, awake=False, hidden=False)
-                actions.append({"action": "sleep", "serve_id": binding.serve_id})
+            updated_by_serve[binding.serve_id] = binding
+            actions.append(
+                {
+                    "action": "create",
+                    "serve_id": binding.serve_id,
+                    "node": binding.slot.node,
+                    "gpu_ids": list(binding.slot.gpu_ids),
+                }
+            )
 
         version = snapshot.version
         if actions:
@@ -233,6 +220,81 @@ class ServiceManagerV2:
             "actions": actions,
         }
 
+    def _plan_model_target(
+        self,
+        *,
+        model: str,
+        wake_replicas: int,
+        bindings: list[Binding],
+        tp_size: int,
+    ) -> dict[str, list[Binding]]:
+        model_bindings = [binding for binding in bindings if binding.model == model]
+        awake = [binding for binding in model_bindings if binding.awake]
+        planning = {binding.serve_id: binding for binding in bindings}
+        if len(awake) >= wake_replicas:
+            sleeping = list(reversed(awake[wake_replicas:]))
+            target = awake[:wake_replicas]
+            return {
+                "sleep": sleeping,
+                "wake": [],
+                "create": [],
+                "target_bindings": target,
+            }
+
+        target = list(awake)
+        sleeping = [binding for binding in model_bindings if not binding.awake]
+        awake_by_node = Counter(
+            binding.slot.node for binding in bindings if binding.awake
+        )
+        wakes: list[Binding] = []
+        existing_target = min(wake_replicas, len(model_bindings))
+        while sleeping and len(target) < existing_target:
+            feasible = [
+                binding
+                for binding in sleeping
+                if self._feasible_wake(binding, list(planning.values()))
+            ]
+            if not feasible:
+                raise WakeConflict(
+                    f"{sleeping[0].serve_id}: slot already has awake binding"
+                )
+            binding = min(
+                feasible,
+                key=lambda item: (
+                    awake_by_node[item.slot.node], _natural_key(item.serve_id)
+                ),
+            )
+            sleeping.remove(binding)
+            planning[binding.serve_id] = replace(
+                binding, awake=True, hidden=False
+            )
+            wakes.append(binding)
+            target.append(planning[binding.serve_id])
+            awake_by_node[binding.slot.node] += 1
+
+        creates: list[Binding] = []
+        existing_ids = set(planning)
+        allocator = SlotAllocator(
+            self._registry.topology(), list(planning.values())
+        )
+        while len(target) + len(creates) < wake_replicas:
+            slot = allocator.find_slot(tp_size)
+            if slot is None:
+                raise ValueError(f"no free slot for {model} tp_size={tp_size}")
+            serve_id = _next_serve_id(model, existing_ids)
+            allocator.bind(serve_id, model, slot, awake=True)
+            planned = Binding(serve_id, model, slot, awake=True)
+            planning[serve_id] = planned
+            existing_ids.add(serve_id)
+            creates.append(planned)
+
+        return {
+            "sleep": [],
+            "wake": wakes,
+            "create": creates,
+            "target_bindings": target + creates,
+        }
+
     @serialized_operation("put_binding_power")
     def put_binding_power(self, serve_id: str, *, awake: bool) -> dict:
         return self._put_binding_power_unlocked(serve_id, awake=awake)
@@ -245,6 +307,12 @@ class ServiceManagerV2:
         )
         if binding is None:
             raise ValueError(f"unknown binding: {serve_id}")
+
+        self._update_desired(
+            {binding.binding_id: {"power": "awake" if awake else "sleeping"}},
+            updated_by="service-manager-api",
+            reason="binding_power_request",
+        )
 
         actions: list[dict] = []
         version = snapshot.version
@@ -282,6 +350,17 @@ class ServiceManagerV2:
         if unknown:
             raise ValueError(f"unknown pods for {model}: {sorted(unknown)}")
 
+        self._update_desired(
+            {
+                binding.binding_id: {
+                    "hidden": binding.serve_id in requested_hidden
+                }
+                for binding in model_bindings
+            },
+            updated_by="service-manager-api",
+            reason="model_routable_request",
+        )
+
         actions: list[dict] = []
         updated_by_serve = {binding.serve_id: binding for binding in snapshot.bindings}
         for binding in model_bindings:
@@ -318,6 +397,7 @@ class ServiceManagerV2:
         migrations = allocator.plan_defrag(tp_size)
         if migrations is None:
             raise DefragUnavailable("no_feasible_defrag")
+        self._set_defrag_desired(snapshot.bindings, migrations)
         if migrations:
             self._ensure_all_model_routes()
 
@@ -365,10 +445,13 @@ class ServiceManagerV2:
         if self._vllm_ops is not None and hasattr(self._vllm_ops, "is_sleeping"):
             prober = _VllmPodProber(self._vllm_ops)
         result = audit_state(self._store, self._k8s_client, prober=prober)
+        issues = list(result.issues)
+        if self._fleet_store is not None:
+            issues.extend(self._fleet_mismatches())
         return {
-            "healthy": result.healthy,
+            "healthy": not issues,
             "version": result.version,
-            "issues": result.issues,
+            "issues": issues,
         }
 
     @serialized_operation("reconcile")
@@ -394,6 +477,7 @@ class ServiceManagerV2:
             label_writer=label_writer,
             drop_missing=drop_missing,
         )
+        self._sync_observed(result.observations)
         return {
             "version": result.version,
             "warnings": result.warnings,
@@ -412,11 +496,7 @@ class ServiceManagerV2:
         targets = (
             sorted(set(awake_binding_ids))
             if awake_binding_ids is not None
-            else sorted(
-                binding.binding_id
-                for binding in snapshot.bindings
-                if binding.awake
-            )
+            else self._desired_awake_binding_ids(snapshot.bindings)
         )
 
         def run(operation) -> None:
@@ -471,6 +551,282 @@ class ServiceManagerV2:
             raise KeyError(operation_id)
         return operation
 
+    def get_fleet_state(self) -> dict:
+        if self._fleet_store is None:
+            return {
+                "desired_version": 0,
+                "observed_version": 0,
+                "desired": [],
+                "observed": [],
+                "mismatches": [],
+            }
+        desired = self._fleet_store.load_desired()
+        observed = self._fleet_store.load_observed()
+        result = {
+            "desired_version": desired.version,
+            "observed_version": observed.version,
+            "desired": [asdict(binding) for binding in desired.bindings],
+            "observed": [asdict(binding) for binding in observed.bindings],
+            "mismatches": self._fleet_mismatches(
+                desired_bindings=desired.bindings,
+                observed_bindings=observed.bindings,
+            ),
+        }
+        if self._gpu_leases is not None:
+            result["gpu_leases"] = [
+                asdict(lease) for lease in self._gpu_leases.load()
+            ]
+        return result
+
+    def _desired_awake_binding_ids(
+        self, legacy_bindings: list[Binding]
+    ) -> list[str]:
+        if self._fleet_store is None:
+            return sorted(
+                binding.binding_id for binding in legacy_bindings if binding.awake
+            )
+        return sorted(
+            binding.binding_id
+            for binding in self._fleet_store.load_desired().bindings
+            if binding.lifecycle == "resident" and binding.power == "awake"
+        )
+
+    def _update_desired(
+        self,
+        updates: dict[str, dict[str, object]],
+        *,
+        updated_by: str,
+        reason: str,
+    ) -> None:
+        if self._fleet_store is None or not updates:
+            return
+        snapshot = self._fleet_store.load_desired()
+        by_id = {binding.binding_id: binding for binding in snapshot.bindings}
+        unknown = sorted(set(updates) - set(by_id))
+        if unknown:
+            raise ValueError(f"desired state missing stable binding(s): {unknown}")
+        changed = False
+        for binding_id, fields in updates.items():
+            current = by_id[binding_id]
+            updated = current.with_intent(
+                power=fields.get("power"),
+                hidden=fields.get("hidden"),
+                lifecycle=fields.get("lifecycle"),
+                updated_by=updated_by,
+                reason=reason,
+            )
+            by_id[binding_id] = updated
+            changed = changed or updated is not current
+        if changed:
+            self._fleet_store.save_desired(
+                list(by_id.values()), expected_version=snapshot.version
+            )
+
+    def _set_model_desired_target(
+        self,
+        *,
+        model: str,
+        target_bindings: list[Binding],
+        reason: str,
+    ) -> None:
+        if self._fleet_store is None:
+            return
+        snapshot = self._fleet_store.load_desired()
+        by_id = {binding.binding_id: binding for binding in snapshot.bindings}
+        target_by_id = {
+            binding.binding_id: binding for binding in target_bindings
+        }
+        changed = False
+        for binding_id, desired in list(by_id.items()):
+            if desired.model != model:
+                continue
+            updated = desired.with_intent(
+                lifecycle="resident",
+                power="awake" if binding_id in target_by_id else "sleeping",
+                hidden=False,
+                updated_by="service-manager-api",
+                reason=reason,
+            )
+            by_id[binding_id] = updated
+            changed = changed or updated is not desired
+        for binding_id, planned in target_by_id.items():
+            if binding_id in by_id:
+                continue
+            by_id[binding_id] = DesiredBinding.from_binding(
+                planned,
+                updated_by="service-manager-api",
+                reason=reason,
+            )
+            changed = True
+        if changed:
+            self._fleet_store.save_desired(
+                list(by_id.values()), expected_version=snapshot.version
+            )
+
+    def _set_defrag_desired(
+        self, bindings: list[Binding], migrations: list[Migration]
+    ) -> None:
+        if self._fleet_store is None or not migrations:
+            return
+        desired_snapshot = self._fleet_store.load_desired()
+        by_id = {
+            binding.binding_id: binding
+            for binding in desired_snapshot.bindings
+        }
+        actual_by_serve = {binding.serve_id: binding for binding in bindings}
+        for migration in migrations:
+            actual = actual_by_serve[migration.serve_id]
+            old_id = actual.binding_id
+            old = by_id.get(old_id)
+            if old is None:
+                raise ValueError(f"desired state missing stable binding: {old_id}")
+            by_id[old_id] = old.with_intent(
+                lifecycle="absent",
+                power="sleeping",
+                hidden=True,
+                updated_by="service-manager-api",
+                reason="defrag_source_removed",
+            )
+            planned = Binding(
+                serve_id=actual.serve_id,
+                model=actual.model,
+                slot=migration.to_slot,
+                awake=True,
+            )
+            existing = by_id.get(planned.binding_id)
+            if existing is None:
+                by_id[planned.binding_id] = DesiredBinding.from_binding(
+                    planned,
+                    updated_by="service-manager-api",
+                    reason="defrag_destination",
+                )
+            else:
+                by_id[planned.binding_id] = existing.with_intent(
+                    lifecycle="resident",
+                    power="awake",
+                    hidden=False,
+                    updated_by="service-manager-api",
+                    reason="defrag_destination",
+                )
+        self._fleet_store.save_desired(
+            list(by_id.values()), expected_version=desired_snapshot.version
+        )
+
+    def _sync_observed(self, observations) -> None:
+        if self._fleet_store is None:
+            return
+        snapshot = self._fleet_store.load_observed()
+        records = []
+        for observation in observations:
+            binding = observation.binding
+            pod = observation.pod
+            physical_power = (
+                "unknown"
+                if observation.physical_awake is None
+                else "awake" if observation.physical_awake else "sleeping"
+            )
+            records.append(
+                ObservedBinding(
+                    binding_id=binding.binding_id,
+                    model=binding.model,
+                    node=binding.slot.node,
+                    gpu_ids=binding.slot.gpu_ids,
+                    pod_name=binding.serve_id,
+                    pod_uid=pod.pod_uid,
+                    pod_ip=pod.pod_ip,
+                    phase=pod.phase,
+                    ready=pod.ready,
+                    restart_count=pod.restart_count,
+                    physical_power=physical_power,
+                    routable=pod.routable,
+                    hidden=binding.hidden,
+                    error=(
+                        "physical_probe_unreachable"
+                        if observation.physical_awake is None
+                        else None
+                    ),
+                )
+            )
+        records.sort(key=lambda item: item.binding_id)
+        if records != snapshot.bindings:
+            self._fleet_store.save_observed(
+                records, expected_version=snapshot.version
+            )
+
+    def _fleet_mismatches(
+        self,
+        *,
+        desired_bindings: list[DesiredBinding] | None = None,
+        observed_bindings: list[ObservedBinding] | None = None,
+    ) -> list[dict]:
+        if self._fleet_store is None:
+            return []
+        desired_bindings = (
+            self._fleet_store.load_desired().bindings
+            if desired_bindings is None
+            else desired_bindings
+        )
+        observed_bindings = (
+            self._fleet_store.load_observed().bindings
+            if observed_bindings is None
+            else observed_bindings
+        )
+        desired = {binding.binding_id: binding for binding in desired_bindings}
+        observed = {binding.binding_id: binding for binding in observed_bindings}
+        issues: list[dict] = []
+        for binding_id in sorted(set(desired) | set(observed)):
+            wanted = desired.get(binding_id)
+            actual = observed.get(binding_id)
+            if wanted is None:
+                issues.append({"code": "observed_without_desired", "binding_id": binding_id})
+                continue
+            if actual is None:
+                if wanted.lifecycle == "resident":
+                    issues.append({"code": "desired_binding_missing", "binding_id": binding_id})
+                continue
+            if wanted.lifecycle == "absent":
+                issues.append({"code": "desired_absent_but_observed", "binding_id": binding_id})
+                continue
+            if actual.physical_power != wanted.power:
+                issues.append(
+                    {
+                        "code": "desired_power_mismatch",
+                        "binding_id": binding_id,
+                        "desired_power": wanted.power,
+                        "observed_power": actual.physical_power,
+                    }
+                )
+            if actual.hidden != wanted.hidden:
+                issues.append(
+                    {
+                        "code": "desired_hidden_mismatch",
+                        "binding_id": binding_id,
+                        "desired_hidden": wanted.hidden,
+                        "observed_hidden": actual.hidden,
+                    }
+                )
+        if self._gpu_leases is not None:
+            leases = {
+                lease.binding_id: lease for lease in self._gpu_leases.load()
+            }
+            for binding_id, actual in observed.items():
+                has_lease = binding_id in leases
+                if actual.physical_power == "awake" and not has_lease:
+                    issues.append(
+                        {
+                            "code": "awake_without_gpu_lease",
+                            "binding_id": binding_id,
+                        }
+                    )
+                if actual.physical_power == "sleeping" and has_lease:
+                    issues.append(
+                        {
+                            "code": "gpu_lease_without_awake",
+                            "binding_id": binding_id,
+                        }
+                    )
+        return issues
+
     def _apply_runtime_power_action(self, binding: Binding, *, action: str) -> None:
         if self._runtime_ops is None or self._vllm_ops is None:
             return
@@ -482,6 +838,8 @@ class ServiceManagerV2:
             result = self._vllm_ops.sleep(snapshot.pod_ip, port=8000)
             state = POD_STATE_SLEEPING
         elif action == "wake":
+            if self._gpu_leases is not None:
+                self._gpu_leases.acquire(binding, phase="waking")
             result = self._vllm_ops.wake_up(snapshot.pod_ip, port=8000)
             state = POD_STATE_AWAKE
         else:
@@ -490,7 +848,19 @@ class ServiceManagerV2:
         if not bool(getattr(result, "success", False)):
             message = getattr(result, "message", "") or "operation failed"
             raise ValueError(f"vLLM {action} failed for {binding.serve_id}: {message}")
+        if hasattr(self._vllm_ops, "is_sleeping"):
+            physical = self._vllm_ops.is_sleeping(snapshot.pod_ip, port=8000)
+            expected_sleeping = action == "sleep"
+            if physical is not expected_sleeping:
+                raise ValueError(
+                    f"vLLM {action} did not physically converge for {binding.serve_id}"
+                )
         self._runtime_ops.write_binding_annotations(binding, state=state)
+        if self._gpu_leases is not None:
+            if action == "sleep":
+                self._gpu_leases.release(binding)
+            else:
+                self._gpu_leases.acquire(binding, phase="awake")
 
     def _has_deployment_ops(self) -> bool:
         return self._runtime_ops is not None and all(
@@ -507,6 +877,9 @@ class ServiceManagerV2:
         if self._runtime_ops is None or self._vllm_ops is None:
             raise ValueError("runtime_ops and vllm_ops are required for runtime create")
         self._ensure_create_headroom(slot)
+        planned = Binding("startup", model, slot, awake=False)
+        if self._gpu_leases is not None:
+            self._gpu_leases.acquire(planned, phase="starting")
         self._ensure_model_route(model)
         deployment_id = self._runtime_ops.create_model_deployment(model, slot)
         self._ensure_model_route(model)
@@ -523,6 +896,8 @@ class ServiceManagerV2:
             raise ValueError(f"vLLM wake failed for {ready.name}: {message}")
         binding = Binding(ready.name, model, slot, awake=True, hidden=False)
         self._runtime_ops.write_binding_annotations(binding, state=POD_STATE_AWAKE)
+        if self._gpu_leases is not None:
+            self._gpu_leases.acquire(binding, phase="awake")
         return binding
 
     def _execute_runtime_defrag_migration(self, binding: Binding, migration: Migration) -> tuple[list[dict], Binding]:
@@ -542,6 +917,11 @@ class ServiceManagerV2:
 
         self._runtime_ops.wait_pod_deleted(binding.serve_id)
         self._ensure_create_headroom(migration.to_slot)
+        planned = Binding(
+            "defrag-startup", binding.model, migration.to_slot, awake=False
+        )
+        if self._gpu_leases is not None:
+            self._gpu_leases.acquire(planned, phase="starting")
         deployment_id = self._runtime_ops.create_model_deployment(binding.model, migration.to_slot)
         self._ensure_model_route(binding.model)
         ready = self._runtime_ops.wait_pod_ready(deployment_id)
@@ -567,6 +947,8 @@ class ServiceManagerV2:
 
         moved = Binding(new_serve_id, binding.model, migration.to_slot, awake=True, hidden=False)
         self._runtime_ops.write_binding_annotations(moved, state=POD_STATE_AWAKE)
+        if self._gpu_leases is not None:
+            self._gpu_leases.acquire(moved, phase="awake")
         actions.append({"action": "wake", "serve_id": new_serve_id})
         actions.append({"action": "unhide", "serve_id": new_serve_id})
         return actions, moved
@@ -730,6 +1112,11 @@ def create_app(service: ServiceManagerV2) -> FastAPI:
     @app.get("/v2/state")
     def get_state() -> dict:
         return service.get_state()
+
+
+    @app.get("/v2/fleet/state")
+    def get_fleet_state() -> dict:
+        return service.get_fleet_state()
 
 
     @app.get("/v2/operations")
