@@ -929,6 +929,9 @@ def test_startup_admission_sleeps_overlap_and_records_restore_intent():
                 phase="Pending", ready=False,
             )
 
+        def list_startup_resident_snapshots(self):
+            return self.list_pod_snapshots()
+
         def admit_startup_pod(self, name, **kwargs):
             self.admission = (name, kwargs)
 

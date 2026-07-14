@@ -282,6 +282,22 @@ def test_k8s_ops_lists_admitted_startups_including_pending_pods():
     assert record.phase == "Pending"
 
 
+def test_startup_conflict_inventory_keeps_terminating_resident():
+    terminating = pod_dict(
+        "serve-old", "dsqwen-7b", "node-a", "0", deleting=True,
+        labels={"tre.aibrix.io/managed": "true"},
+        annotations={GPU_IDS_ANNOTATION: "0"},
+    )
+    api = FakeK8sApi([terminating])
+    ops = K8sOps(api=api, namespace="default")
+
+    assert ops.list_pod_snapshots() == []
+    [resident] = ops.list_startup_resident_snapshots()
+
+    assert resident.name == "serve-old"
+    assert resident.annotations[GPU_IDS_ANNOTATION] == "0"
+
+
 def test_k8s_ops_lists_and_scales_stable_model_deployments():
     api = FakeK8sApi([])
     api.deployments = [

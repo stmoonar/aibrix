@@ -80,6 +80,8 @@ class RuntimePodOps(Protocol):
 
     def list_admitted_startup_pods(self) -> list[StartupPodRecord]: ...
 
+    def list_startup_resident_snapshots(self) -> list[K8sPodSnapshot]: ...
+
 
 class VllmRuntimeOps(Protocol):
     def sleep(self, pod_ip: str, *, port: int | None = None): ...
@@ -715,7 +717,7 @@ class ServiceManagerV2:
             legacy = self._store.load()
             updated = {binding.binding_id: binding for binding in legacy.bindings}
             target_gpus = set(pod.gpu_ids)
-            for snapshot in self._runtime_ops.list_pod_snapshots():
+            for snapshot in self._runtime_ops.list_startup_resident_snapshots():
                 if snapshot.name == pod.name or snapshot.node != pod.node:
                     continue
                 binding = _binding_from_snapshot(snapshot)
@@ -782,7 +784,7 @@ class ServiceManagerV2:
             return {"converged": [], "pending": []}
         converged: list[str] = []
         pending: list[str] = []
-        for snapshot in self._runtime_ops.list_pod_snapshots():
+        for snapshot in self._runtime_ops.list_startup_resident_snapshots():
             admitted_uid = snapshot.annotations.get(
                 "tre.aibrix.io/startup-admitted-uid"
             )

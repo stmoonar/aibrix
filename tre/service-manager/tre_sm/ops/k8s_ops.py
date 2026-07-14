@@ -139,6 +139,16 @@ class K8sOps:
         pods = _items(self._api.list_namespaced_pod(namespace=self._namespace, label_selector=selector))
         return self._snapshots_from_pods(pods)
 
+    def list_startup_resident_snapshots(self) -> list[K8sPodSnapshot]:
+        """Include terminating residents in cold-start conflict checks."""
+        pods = _items(
+            self._api.list_namespaced_pod(
+                namespace=self._namespace,
+                label_selector=f"{MANAGED_LABEL}=true",
+            )
+        )
+        return self._snapshots_from_pods(pods, include_terminating=True)
+
     def list_model_deployments(self) -> list[ModelDeploymentRecord]:
         deployments = _items(
             self._apps_api.list_namespaced_deployment(
@@ -313,12 +323,17 @@ class K8sOps:
                 pressured[str(metadata["name"])] = reasons
         return pressured
 
-    def _snapshots_from_pods(self, pods) -> list[K8sPodSnapshot]:
+    def _snapshots_from_pods(
+        self, pods, *, include_terminating: bool = False
+    ) -> list[K8sPodSnapshot]:
         snapshots: list[K8sPodSnapshot] = []
         for pod in pods:
             metadata = _metadata(pod)
             spec = _spec(pod)
-            if _field(metadata, "deletionTimestamp", "deletion_timestamp"):
+            if (
+                _field(metadata, "deletionTimestamp", "deletion_timestamp")
+                and not include_terminating
+            ):
                 continue
             if _status(pod).get("phase") != "Running":
                 continue
