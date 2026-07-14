@@ -39,6 +39,11 @@ def test_tre_v2_overlay_declares_components_and_independent_redis() -> None:
         item["kind"] == "Role"
         and item["metadata"]["name"] == "tre-v2-model-manager"
         and item["metadata"]["namespace"] == "default"
+        and any(
+            "deployments/scale" in rule["resources"]
+            and "patch" in rule["verbs"]
+            for rule in item["rules"]
+        )
         for item in rbac_docs
     )
     assert any(

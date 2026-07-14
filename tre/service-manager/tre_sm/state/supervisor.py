@@ -40,10 +40,14 @@ class FleetSupervisor:
         *,
         interval_s: float = 5.0,
         drift_observations_required: int = 3,
+        repair_cooldown_s: float = 60.0,
+        monotonic=time.monotonic,
     ) -> None:
         self._service = service
         self._interval_s = interval_s
         self._required = drift_observations_required
+        self._repair_cooldown_s = repair_cooldown_s
+        self._monotonic = monotonic
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._last_signature: tuple | None = None
@@ -51,6 +55,7 @@ class FleetSupervisor:
         self._last_drift: list[dict] = []
         self._last_error: str | None = None
         self._last_recovery_operation_id: str | None = None
+        self._last_repair_at: float | None = None
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -101,7 +106,14 @@ class FleetSupervisor:
         self._last_drift = drift
         if self._drift_observations < self._required:
             return
+        now = self._monotonic()
+        if (
+            self._last_repair_at is not None
+            and now - self._last_repair_at < self._repair_cooldown_s
+        ):
+            return
         submitted = self._service.start_fleet_repair()
+        self._last_repair_at = now
         self._last_recovery_operation_id = str(submitted["operation_id"])
         self._reset_drift()
 
@@ -122,4 +134,3 @@ class FleetSupervisor:
         self._last_signature = None
         self._drift_observations = 0
         self._last_drift = []
-

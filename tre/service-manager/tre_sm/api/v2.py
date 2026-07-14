@@ -78,6 +78,8 @@ class RuntimePodOps(Protocol):
 
     def clear_startup_admission(self, name: str) -> None: ...
 
+    def list_admitted_startup_pods(self) -> list[StartupPodRecord]: ...
+
 
 class VllmRuntimeOps(Protocol):
     def sleep(self, pod_ip: str, *, port: int | None = None): ...
@@ -588,6 +590,10 @@ class ServiceManagerV2:
         for pod in self._runtime_ops.list_pod_snapshots():
             binding = _binding_from_snapshot(pod)
             snapshots.setdefault(binding.binding_id, []).append(pod)
+        admitted_startups = {
+            pod.binding_id
+            for pod in self._runtime_ops.list_admitted_startup_pods()
+        }
         observed = {
             item.binding_id: item
             for item in self._fleet_store.load_observed().bindings
@@ -605,6 +611,8 @@ class ServiceManagerV2:
                 continue
             pods = snapshots.get(binding_id, [])
             if len(pods) != 1:
+                if binding_id in admitted_startups:
+                    continue
                 issues.append(
                     {
                         "code": "pod_cardinality",

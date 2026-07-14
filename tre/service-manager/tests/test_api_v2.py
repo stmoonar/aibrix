@@ -7,7 +7,7 @@ from tre_sm.allocator.topology import K8sPodSnapshot
 from fastapi.testclient import TestClient
 
 from tre_sm.api.v2 import ServiceManagerV2, create_app
-from tre_sm.ops.k8s_ops import StartupPodRecord
+from tre_sm.ops.k8s_ops import ModelDeploymentRecord, StartupPodRecord
 from tre_sm.state.fleet_store import DesiredBinding, DesiredSnapshot
 from tre_sm.state.reconcile import PodRecord
 from tre_sm.state.store import StateStore
@@ -967,6 +967,44 @@ def test_startup_admission_sleeps_overlap_and_records_restore_intent():
         ("release", "m2/node-a/0"),
         ("acquire", "m1/node-a/0", "starting"),
     ]
+
+
+def test_drift_detector_treats_pending_admitted_startup_as_present():
+    now = datetime.now(timezone.utc).isoformat()
+    desired = DesiredBinding(
+        "m1/node-a/0", "m1", "node-a", (0,), "resident", "sleeping",
+        False, 1, now, "test", "test",
+    )
+
+    class FleetStore:
+        def load_desired(self):
+            return DesiredSnapshot(1, [desired])
+
+        def load_observed(self):
+            return type("Observed", (), {"bindings": []})()
+
+    class Runtime:
+        def list_model_deployments(self):
+            return [ModelDeploymentRecord("m1-node-a-gpu-0", "m1", "node-a", (0,), 1)]
+
+        def list_pod_snapshots(self, *, model=None):
+            return []
+
+        def list_admitted_startup_pods(self):
+            return [
+                StartupPodRecord(
+                    "m1-new", "uid", "m1", "node-a", (0,),
+                    {"tre.aibrix.io/startup-admitted-uid": "uid"}, {},
+                    None, "Pending", False,
+                )
+            ]
+
+    service = ServiceManagerV2(
+        registry(), StateStore(FakeRedis()), runtime_ops=Runtime(),
+        fleet_store=FleetStore(),
+    )
+
+    assert service.detect_fleet_drift() == []
 
 
 def test_v2_put_target_calls_vllm_and_pod_annotations_for_existing_bindings():
