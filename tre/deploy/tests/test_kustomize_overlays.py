@@ -79,7 +79,7 @@ def test_tre_v2_overlay_declares_components_and_independent_redis() -> None:
     ui = _load_yaml(overlay / "ui.yaml")
 
     assert _image(controller) == "tre-v2-controller:20260710-ca61e485"
-    assert _image(sm) == "tre-v2-service-manager:20260715-461d5396"
+    assert _image(sm) == "tre-v2-service-manager:20260715-a4454807"
     sm_container = sm["spec"]["template"]["spec"]["containers"][0]
     assert sm_container["readinessProbe"]["httpGet"] == {
         "path": "/healthz",
@@ -105,6 +105,8 @@ def test_tre_v2_overlay_declares_components_and_independent_redis() -> None:
     assert _env(controller)["TRE_METRICS_REDIS_URL"] == "redis://tre-v2-redis:6379/0"
     assert _env(sm)["TRE_CREATE_MAX_USED_MIB"] == "2500"
     assert _env(sm)["TRE_SLEEP_LEAK_USED_MIB"] == "8192"
+    assert _env(sm)["TRE_SM_SUPERVISOR_ENABLED"] == "true"
+    assert _env(sm)["TRE_SM_SUPERVISOR_INTERVAL_S"] == "5"
     assert _node_selector(controller) == {"kubernetes.io/hostname": "nscc-ds-4a100-node10"}
     assert _node_selector(sm) == {"kubernetes.io/hostname": "nscc-ds-4a100-node10"}
     assert _node_selector(ui) == {"kubernetes.io/hostname": "nscc-ds-4a100-node10"}

@@ -20,7 +20,7 @@ spec:
         kubernetes.io/hostname: nscc-ds-4a100-node10
       containers:
         - name: service-manager
-          image: tre-v2-service-manager:20260715-461d5396
+          image: tre-v2-service-manager:20260715-a4454807
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8000
@@ -51,6 +51,10 @@ spec:
               value: "2500"
             - name: TRE_SLEEP_LEAK_USED_MIB
               value: "8192"
+            - name: TRE_SM_SUPERVISOR_ENABLED
+              value: "true"
+            - name: TRE_SM_SUPERVISOR_INTERVAL_S
+              value: "5"
           resources:
             requests:
               cpu: 250m
