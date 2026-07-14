@@ -109,6 +109,27 @@ def test_bind_rejects_second_awake_binding_on_same_gpu_but_allows_sleeping_bound
         raise AssertionError("expected awake conflict")
 
 
+def test_binding_id_is_stable_across_pod_replacement():
+    old = Binding("pod-old-abc", "m1", Slot("node-a", (0, 1)), awake=False)
+    new = Binding("pod-new-xyz", "m1", Slot("node-a", (0, 1)), awake=True)
+
+    assert old.binding_id == new.binding_id == "m1/node-a/0,1"
+
+
+def test_allocator_can_represent_reconcile_conflict_without_making_it_feasible():
+    allocator = SlotAllocator(
+        single_node_topology(),
+        [
+            Binding("serve-a", "m1", Slot("node-a", (0,)), awake=True),
+            Binding("serve-b", "m2", Slot("node-a", (0,)), awake=True, hidden=True),
+        ],
+        allow_awake_conflicts=True,
+    )
+
+    assert allocator.feasible_wake("serve-a") is True
+    assert allocator.feasible_wake("serve-b") is False
+
+
 def test_random_allocation_release_sequences_remain_disjoint_and_defraggable():
     topology = two_node_topology()
     allocator = SlotAllocator(topology, [])

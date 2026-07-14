@@ -6,7 +6,7 @@ from typing import Protocol
 
 from tre_common.registry import ClusterTopology
 from tre_common.registry import NodeSpec
-from tre_sm.allocator.slots import Binding, Slot, SlotAllocator
+from tre_sm.allocator.slots import Binding, Slot, SlotAllocator, binding_sort_key
 from tre_sm.gpu_truth import GpuTruthProvider
 from tre_sm.state.store import StateStore
 
@@ -70,6 +70,137 @@ class ReconcileResult:
     allocator: SlotAllocator
 
 
+@dataclass(frozen=True)
+class AuditResult:
+    version: int
+    issues: list[dict[str, object]]
+
+    @property
+    def healthy(self) -> bool:
+        return not self.issues
+
+
+def audit_state(
+    store: StateStore,
+    k8s_client: K8sPodClient,
+    *,
+    prober: PodPhysicalProber | None = None,
+) -> AuditResult:
+    """Compare persisted, Kubernetes and physical state without writing any of them."""
+    persisted = store.load()
+    observed = list(k8s_client.list_pods())
+    issues: list[dict[str, object]] = []
+
+    persisted_by_id = _unique_bindings_by_id(
+        persisted.bindings, source="persisted", issues=issues
+    )
+    observed_by_id: dict[str, tuple[PodRecord, Binding]] = {}
+    physically_awake_by_gpu: dict[tuple[str, int], str] = {}
+    for pod in sorted(observed, key=lambda item: binding_sort_key(item.to_binding())):
+        binding = pod.to_binding()
+        if binding.binding_id in observed_by_id:
+            issues.append(
+                {
+                    "code": "duplicate_observed_binding_id",
+                    "binding_id": binding.binding_id,
+                    "serve_id": binding.serve_id,
+                }
+            )
+            continue
+        observed_by_id[binding.binding_id] = (pod, binding)
+
+    for binding_id in sorted(set(persisted_by_id) | set(observed_by_id)):
+        stored = persisted_by_id.get(binding_id)
+        observed_item = observed_by_id.get(binding_id)
+        if stored is None:
+            pod, live = observed_item
+            issues.append(
+                {
+                    "code": "untracked_pod",
+                    "binding_id": binding_id,
+                    "serve_id": live.serve_id,
+                }
+            )
+            continue
+        if observed_item is None:
+            issues.append(
+                {
+                    "code": "ghost_binding",
+                    "binding_id": binding_id,
+                    "serve_id": stored.serve_id,
+                }
+            )
+            continue
+
+        pod, live = observed_item
+        if stored.serve_id != live.serve_id:
+            issues.append(
+                {
+                    "code": "instance_replaced",
+                    "binding_id": binding_id,
+                    "persisted_serve_id": stored.serve_id,
+                    "observed_serve_id": live.serve_id,
+                }
+            )
+
+        physical_awake: bool | None = live.awake
+        if prober is not None:
+            sleeping = prober.is_sleeping(pod)
+            physical_awake = None if sleeping is None else not sleeping
+            if physical_awake is None:
+                issues.append(
+                    {
+                        "code": "physical_state_unknown",
+                        "binding_id": binding_id,
+                        "serve_id": live.serve_id,
+                    }
+                )
+        if physical_awake is not None and stored.awake != physical_awake:
+            issues.append(
+                {
+                    "code": "power_mismatch",
+                    "binding_id": binding_id,
+                    "serve_id": live.serve_id,
+                    "persisted_awake": stored.awake,
+                    "physical_awake": physical_awake,
+                }
+            )
+
+        if physical_awake:
+            for gpu_key in _slot_keys(live.slot):
+                occupant = physically_awake_by_gpu.get(gpu_key)
+                if occupant is not None:
+                    node, gpu_id = gpu_key
+                    issues.append(
+                        {
+                            "code": "awake_gpu_conflict",
+                            "binding_id": binding_id,
+                            "serve_id": live.serve_id,
+                            "node": node,
+                            "gpu_id": gpu_id,
+                            "conflicts_with": occupant,
+                        }
+                    )
+                else:
+                    physically_awake_by_gpu[gpu_key] = live.serve_id
+
+        expected_routable = (
+            bool(physical_awake) and not stored.hidden and not live.hidden
+        )
+        if pod.routable is None or pod.routable != expected_routable:
+            issues.append(
+                {
+                    "code": "routable_mismatch",
+                    "binding_id": binding_id,
+                    "serve_id": live.serve_id,
+                    "observed_routable": pod.routable,
+                    "expected_routable": expected_routable,
+                }
+            )
+
+    return AuditResult(version=persisted.version, issues=issues)
+
+
 def reconcile_state(
     topology: ClusterTopology,
     store: StateStore,
@@ -79,6 +210,7 @@ def reconcile_state(
     sleep_leak_used_mib: int = 8192,
     prober: PodPhysicalProber | None = None,
     label_writer: RoutableLabelWriter | None = None,
+    drop_missing: bool = False,
 ) -> ReconcileResult:
     persisted = store.load()
     persisted_by_serve = {binding.serve_id: binding for binding in persisted.bindings}
@@ -88,7 +220,7 @@ def reconcile_state(
     observed = list(k8s_client.list_pods())
     observed_by_serve = {pod.serve_id: pod for pod in observed}
 
-    for pod in sorted(observed, key=lambda item: item.serve_id):
+    for pod in sorted(observed, key=lambda item: binding_sort_key(item.to_binding())):
         binding = pod.to_binding()
         # Physical /is_sleeping is OBSERVED ground truth and wins over the
         # tre.aibrix.io/state annotation, which is only a write-through cache.
@@ -96,6 +228,14 @@ def reconcile_state(
             sleeping = prober.is_sleeping(pod)
             if sleeping is not None:
                 binding = replace(binding, awake=not sleeping)
+            else:
+                # Unknown physical state is never eligible for routing. Keeping
+                # awake as observed avoids claiming that a physical sleep was
+                # performed; hidden is the fail-closed quarantine bit.
+                binding = replace(binding, hidden=True)
+                warnings.append(
+                    f"{binding.serve_id}: physical power state unknown; quarantined unroutable"
+                )
         previous = persisted_by_serve.get(binding.serve_id)
         if previous is not None and previous != binding:
             warnings.append(f"{binding.serve_id}: pod reality overrides persisted binding")
@@ -117,10 +257,17 @@ def reconcile_state(
                 f"{binding.serve_id}: dropped stale persisted binding that overlaps pod observation"
             )
             continue
+        if drop_missing:
+            warnings.append(
+                f"{binding.serve_id}: dropped persisted binding with no pod observation (strict)"
+            )
+            continue
         warnings.append(f"{binding.serve_id}: persisted binding has no matching pod observation")
         reconciled_by_serve[binding.serve_id] = binding
 
-    bindings = _auto_sleep_awake_conflicts([reconciled_by_serve[serve_id] for serve_id in sorted(reconciled_by_serve)], warnings)
+    bindings = _quarantine_awake_conflicts(
+        sorted(reconciled_by_serve.values(), key=binding_sort_key), warnings
+    )
     if gpu_truth is not None:
         warnings.extend(_sleep_leak_warnings(topology, bindings, gpu_truth, sleep_leak_used_mib))
 
@@ -131,7 +278,7 @@ def reconcile_state(
     if label_writer is not None:
         _enforce_routable_labels(bindings, observed_by_serve, label_writer)
 
-    allocator = SlotAllocator(topology, bindings)
+    allocator = SlotAllocator(topology, bindings, allow_awake_conflicts=True)
     if bindings == persisted.bindings:
         return ReconcileResult(
             version=persisted.version,
@@ -171,7 +318,28 @@ def _slot_keys(slot: Slot) -> tuple[tuple[str, int], ...]:
     return tuple((slot.node, gpu) for gpu in slot.gpu_ids)
 
 
-def _auto_sleep_awake_conflicts(bindings: list[Binding], warnings: list[str]) -> list[Binding]:
+def _unique_bindings_by_id(
+    bindings: list[Binding],
+    *,
+    source: str,
+    issues: list[dict[str, object]],
+) -> dict[str, Binding]:
+    indexed: dict[str, Binding] = {}
+    for binding in sorted(bindings, key=binding_sort_key):
+        if binding.binding_id in indexed:
+            issues.append(
+                {
+                    "code": f"duplicate_{source}_binding_id",
+                    "binding_id": binding.binding_id,
+                    "serve_id": binding.serve_id,
+                }
+            )
+            continue
+        indexed[binding.binding_id] = binding
+    return indexed
+
+
+def _quarantine_awake_conflicts(bindings: list[Binding], warnings: list[str]) -> list[Binding]:
     awake_by_gpu: dict[tuple[str, int], str] = {}
     reconciled: list[Binding] = []
     for binding in bindings:
@@ -190,9 +358,12 @@ def _auto_sleep_awake_conflicts(bindings: list[Binding], warnings: list[str]) ->
 
         node, gpu = conflict_key
         warnings.append(
-            f"{binding.serve_id}: auto-slept to preserve single awake GPU invariant on {node}/{gpu}"
+            f"{binding.serve_id}: awake GPU conflict on {node}/{gpu}; quarantined unroutable"
         )
-        reconciled.append(replace(binding, awake=False, hidden=False))
+        # Never claim a physical sleep that reconcile did not perform. Hidden
+        # keeps the conflicting pod out of Service endpoints while awake=True
+        # truthfully records the probed physical state.
+        reconciled.append(replace(binding, hidden=True))
     return reconciled
 
 

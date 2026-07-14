@@ -1,14 +1,11 @@
 from __future__ import annotations
 
 import json
-import re
 from dataclasses import dataclass
 from typing import Iterable, Mapping, Protocol
 
 from tre_common import rediskeys
-from tre_sm.allocator.slots import Binding, Slot
-
-_NAT_SPLIT = re.compile(r"(\d+)")
+from tre_sm.allocator.slots import Binding, Slot, natural_key
 
 
 class RedisStateClient(Protocol):
@@ -70,7 +67,7 @@ class StateStore:
     def _load_bindings(self) -> list[Binding]:
         raw = self._redis.hgetall(rediskeys.SM_STATE_KEY) or {}
         bindings: list[Binding] = []
-        for raw_serve_id, raw_payload in sorted(raw.items(), key=lambda item: _natural_key(item[0])):
+        for raw_serve_id, raw_payload in sorted(raw.items(), key=lambda item: natural_key(_to_text(item[0]))):
             serve_id = _to_text(raw_serve_id)
             payload = json.loads(_to_text(raw_payload))
             bindings.append(
@@ -104,11 +101,6 @@ class StateStore:
                 separators=(",", ":"),
             )
         return encoded
-
-
-def _natural_key(value: object) -> tuple[object, ...]:
-    return tuple(int(part) if part.isdigit() else part for part in _NAT_SPLIT.split(_to_text(value)))
-
 
 def _to_text(value: object) -> str:
     if isinstance(value, bytes):

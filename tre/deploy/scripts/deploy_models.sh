@@ -17,15 +17,19 @@
 # (~36 GiB each) simultaneously -> >40 GiB per card -> mass OOM. The fleet must be
 # brought up STAGGERED: create <=1 loading pod per GPU at a time, wait vLLM ready,
 # /sleep it (drops to ~2 GiB), then create the next. Rounds = max bindings/GPU (3).
-# This script currently does the plain apply and is CORRECT ONLY for re-applying an
-# already-present (running/sleeping) fleet. Fresh bring-up + single-binding recreate
-# into a populated GPU need the staggered path (see WORKLOG 'canonical restore' /
-# 'deploy co-residency' + DECISIONS D8 gpu_memory_utilization). TODO: implement
-# --staggered mode (per-round apply -> wait-ready -> sleep) before F4.3 fresh deploy.
+# Plain apply is CORRECT ONLY for re-applying an already-present resident fleet.
+# Fresh bring-up and recovery must use --staggered, which scales the fleet to zero
+# and then starts/sleeps exactly one binding at a time with physical verification.
 set -euo pipefail
 
 DEPLOY_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MODELS_DIR="$DEPLOY_DIR/models"
+
+if [[ "${1:-}" == "--staggered" ]]; then
+  shift
+  exec python3 "$DEPLOY_DIR/scripts/staggered_model_fleet.py" \
+    --models-dir "$MODELS_DIR" "$@"
+fi
 
 echo "[deploy_models] applying $MODELS_DIR ..."
 kubectl apply -k "$MODELS_DIR"

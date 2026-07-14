@@ -2,8 +2,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 
 from tre_common.registry import ClusterTopology
+
+
+_NAT_SPLIT = re.compile(r"(\d+)")
 
 
 @dataclass(frozen=True)
@@ -23,6 +27,24 @@ class Binding:
     awake: bool
     hidden: bool = False
 
+    @property
+    def binding_id(self) -> str:
+        """Stable logical identity; pod names remain replaceable observations."""
+        gpu_ids = ",".join(str(gpu_id) for gpu_id in self.slot.gpu_ids)
+        return f"{self.model}/{self.slot.node}/{gpu_ids}"
+
+
+def binding_sort_key(binding: Binding) -> tuple[object, ...]:
+    """Canonical ordering shared by reconciliation and persistence."""
+    return natural_key(binding.serve_id)
+
+
+def natural_key(value: object) -> tuple[object, ...]:
+    return tuple(
+        int(part) if part.isdigit() else part
+        for part in _NAT_SPLIT.split(str(value))
+    )
+
 
 @dataclass(frozen=True)
 class Migration:
@@ -32,8 +54,15 @@ class Migration:
 
 
 class SlotAllocator:
-    def __init__(self, topology: ClusterTopology, bindings: list[Binding]) -> None:
+    def __init__(
+        self,
+        topology: ClusterTopology,
+        bindings: list[Binding],
+        *,
+        allow_awake_conflicts: bool = False,
+    ) -> None:
         self._topology = topology
+        self._allow_awake_conflicts = allow_awake_conflicts
         self._bindings: dict[str, Binding] = {}
         self._awake_gpu_to_serve: dict[tuple[str, int], str] = {}
         for binding in bindings:
@@ -65,12 +94,14 @@ class SlotAllocator:
             for gpu in slot.gpu_ids:
                 occupant = self._awake_gpu_to_serve.get((slot.node, gpu))
                 if occupant is not None:
+                    if self._allow_awake_conflicts:
+                        continue
                     raise ValueError(f"gpu already has awake binding: {slot.node}/{gpu} occupied by {occupant}")
         binding = Binding(serve_id=serve_id, model=model, slot=slot, awake=awake)
         self._bindings[serve_id] = binding
         if awake:
             for gpu in slot.gpu_ids:
-                self._awake_gpu_to_serve[(slot.node, gpu)] = serve_id
+                self._awake_gpu_to_serve.setdefault((slot.node, gpu), serve_id)
 
     def release(self, serve_id: str) -> None:
         binding = self._bindings.pop(serve_id)

@@ -13,7 +13,7 @@ from tre_common.registry import NodeSpec
 from tre_sm.allocator.slots import Binding, Migration, Slot, SlotAllocator
 from tre_sm.allocator.topology import K8sPodSnapshot
 from tre_sm.gpu_truth import GpuTruthProvider
-from tre_sm.state.reconcile import K8sPodClient, POD_STATE_AWAKE, POD_STATE_HIDDEN, POD_STATE_SLEEPING, reconcile_state
+from tre_sm.state.reconcile import K8sPodClient, POD_STATE_AWAKE, POD_STATE_HIDDEN, POD_STATE_SLEEPING, audit_state, reconcile_state
 from tre_sm.state.store import StateConflict, StateStore
 from tre_sm.api.v1_compat import create_v1_compat_router
 
@@ -308,7 +308,20 @@ class ServiceManagerV2:
         }
 
 
-    def reconcile(self) -> dict:
+    def audit(self) -> dict:
+        if self._k8s_client is None:
+            raise ValueError("k8s_client is required for audit")
+        prober = None
+        if self._vllm_ops is not None and hasattr(self._vllm_ops, "is_sleeping"):
+            prober = _VllmPodProber(self._vllm_ops)
+        result = audit_state(self._store, self._k8s_client, prober=prober)
+        return {
+            "healthy": result.healthy,
+            "version": result.version,
+            "issues": result.issues,
+        }
+
+    def reconcile(self, *, drop_missing: bool = False) -> dict:
         if self._k8s_client is None:
             raise ValueError("k8s_client is required for reconcile")
         prober = None
@@ -325,6 +338,7 @@ class ServiceManagerV2:
             sleep_leak_used_mib=self._sleep_leak_used_mib,
             prober=prober,
             label_writer=label_writer,
+            drop_missing=drop_missing,
         )
         return {
             "version": result.version,
@@ -486,6 +500,7 @@ class ServiceManagerV2:
 
     def _binding_dict(self, binding: Binding) -> dict:
         return {
+            "binding_id": binding.binding_id,
             "serve_id": binding.serve_id,
             "model": binding.model,
             "node": binding.slot.node,
@@ -522,6 +537,10 @@ class DefragRequest(BaseModel):
 class RoutableRequest(BaseModel):
     hidden_pods: list[str]
 
+
+class ReconcileRequest(BaseModel):
+    drop_missing: bool = False
+
 def create_app(service: ServiceManagerV2) -> FastAPI:
     app = FastAPI()
     app.include_router(create_v1_compat_router(service))
@@ -531,10 +550,20 @@ def create_app(service: ServiceManagerV2) -> FastAPI:
         return {"ok": True}
 
 
-    @app.post("/v2/reconcile")
-    def reconcile() -> dict:
+    @app.get("/v2/audit")
+    def audit() -> dict:
         try:
-            return service.reconcile()
+            return service.audit()
+        except (KeyError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+    @app.post("/v2/reconcile")
+    def reconcile(request: ReconcileRequest | None = None) -> dict:
+        try:
+            return service.reconcile(
+                drop_missing=request.drop_missing if request is not None else False
+            )
         except (KeyError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 

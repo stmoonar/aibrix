@@ -119,6 +119,28 @@ def test_reconcile_keeps_persisted_binding_when_pod_observation_is_missing():
     ]
 
 
+def test_reconcile_strict_mode_drops_persisted_binding_without_live_pod():
+    store = StateStore(FakeRedis())
+    persisted = Binding(
+        serve_id="serve-ghost",
+        model="dsqwen-7b",
+        slot=Slot("node-a", (0,)),
+        awake=False,
+    )
+    store.save([persisted], expected_version=0)
+
+    result = reconcile_state(
+        topology(), store, FakeK8sClient([]), drop_missing=True
+    )
+
+    assert result.version == 2
+    assert result.bindings == []
+    assert store.load().bindings == []
+    assert result.warnings == [
+        "serve-ghost: dropped persisted binding with no pod observation (strict)",
+    ]
+
+
 def test_reconcile_drops_stale_binding_when_replacement_pod_reuses_slot():
     store = StateStore(FakeRedis())
     store.save(
@@ -161,7 +183,7 @@ def test_reconcile_drops_stale_binding_when_replacement_pod_reuses_slot():
     ]
 
 
-def test_reconcile_auto_sleeps_later_pod_when_two_awake_pods_share_gpu():
+def test_reconcile_quarantines_later_pod_without_faking_physical_sleep():
     store = StateStore(FakeRedis())
     store.save([], expected_version=0)
     k8s = FakeK8sClient(
@@ -187,10 +209,10 @@ def test_reconcile_auto_sleeps_later_pod_when_two_awake_pods_share_gpu():
 
     assert result.bindings == [
         Binding("serve-a", "dsqwen-7b", Slot("node-a", (0,)), awake=True),
-        Binding("serve-b", "dsqwen-7b", Slot("node-a", (0,)), awake=False),
+        Binding("serve-b", "dsqwen-7b", Slot("node-a", (0,)), awake=True, hidden=True),
     ]
     assert result.warnings == [
-        "serve-b: auto-slept to preserve single awake GPU invariant on node-a/0",
+        "serve-b: awake GPU conflict on node-a/0; quarantined unroutable",
     ]
 
 
@@ -388,11 +410,62 @@ def test_reconcile_is_idempotent_when_routable_labels_match_physical():
     assert writer.calls == []
 
 
-def test_reconcile_auto_slept_pod_is_driven_non_routable():
+def test_reconcile_second_pass_does_not_increment_version_for_natural_order():
+    store = StateStore(FakeRedis())
+    store.save([], expected_version=0)
+    pods = [
+        PodRecord("serve-10", "dsqwen-7b", "node-a", "2", state="sleeping"),
+        PodRecord("serve-2", "dsqwen-7b", "node-a", "0", state="sleeping"),
+    ]
+
+    first = reconcile_state(topology(), store, FakeK8sClient(pods))
+    second = reconcile_state(topology(), store, FakeK8sClient(pods))
+
+    assert first.version == 2
+    assert second.version == first.version
+    assert [binding.serve_id for binding in second.bindings] == ["serve-2", "serve-10"]
+
+
+def test_reconcile_unknown_physical_state_is_quarantined_and_unroutable():
+    store = StateStore(FakeRedis())
+    store.save([], expected_version=0)
+    writer = FakeLabelWriter()
+
+    result = reconcile_state(
+        topology(),
+        store,
+        FakeK8sClient(
+            [
+                PodRecord(
+                    "serve-a",
+                    "dsqwen-7b",
+                    "node-a",
+                    "0",
+                    state="awake",
+                    pod_ip="10.0.0.1",
+                    routable=True,
+                )
+            ]
+        ),
+        prober=FakeProber({}),
+        label_writer=writer,
+    )
+
+    assert result.bindings == [
+        Binding("serve-a", "dsqwen-7b", Slot("node-a", (0,)), awake=True, hidden=True)
+    ]
+    assert writer.calls == [("serve-a", False)]
+    assert result.warnings == [
+        "serve-a: physical power state unknown; quarantined unroutable"
+    ]
+
+
+def test_reconcile_conflicting_pod_is_driven_non_routable():
     store = StateStore(FakeRedis())
     store.save([], expected_version=0)
     # Two physically-awake pods share GPU 0. The single-awake invariant auto-
-    # sleeps serve-b (Gap B): its routable label must be driven to false.
+    # quarantines serve-b: its routable label must be driven to false without
+    # falsely claiming that /sleep was called.
     k8s = FakeK8sClient(
         [
             PodRecord("serve-a", "dsqwen-7b", "node-a", "0", state="awake", pod_ip="10.0.0.1", routable=True),
@@ -407,5 +480,6 @@ def test_reconcile_auto_slept_pod_is_driven_non_routable():
     assert writer.calls == [("serve-b", False)]
     bindings = {binding.serve_id: binding for binding in result.bindings}
     assert bindings["serve-a"].awake is True
-    assert bindings["serve-b"].awake is False
-    assert any("auto-slept" in warning for warning in result.warnings)
+    assert bindings["serve-b"].awake is True
+    assert bindings["serve-b"].hidden is True
+    assert any("quarantined" in warning for warning in result.warnings)

@@ -182,3 +182,34 @@ Pending → Quarantined → LeaseAcquired → Starting → Ready
 4. 全量物理探测通过后 reconcile；
 5. 仅通过 SM wake 目标基线；
 6. 同时核验 SM、Pod UID、`/is_sleeping`、GPU memory、routable label 和 Service endpoints。
+
+## 9. 2026-07-15 P0 第一阶段实现记录
+
+本阶段已在 76 的权威仓库实现以下最小闭环，目标是先消除本次事故中已经确认的“假一致”和并发冷启动入口：
+
+1. `Binding.binding_id` 使用 `<model>/<node>/<gpu_ids>` 计算稳定槽位身份；`/v2/state` 和 reconcile 响应同时保留临时 `serve_id` 并新增 `binding_id`，兼容现有调用方。
+2. 新增只读 `GET /v2/audit`，按 stable binding 对比 Redis、Kubernetes Pod、物理 `/is_sleeping` 和 routable label，报告 `ghost_binding`、`untracked_pod`、`instance_replaced`、`power_mismatch`、`physical_state_unknown`、`routable_mismatch` 等结构化问题，不写 Redis、不改 Pod。
+3. `POST /v2/reconcile` 新增可选请求体 `{"drop_missing": true}`。默认仍保留暂时不可见的 binding，避免把短暂 Pending/重启误判为永久删除；fleet 恢复在 Pod 全部明确 scale 0 后使用严格模式清 ghost。
+4. reconcile 与 StateStore 统一 natural sort，重复 reconcile 不再因 `pod-2`/`pod-10` 排序差异无意义增加 version。
+5. 物理探测不可达时不再根据 annotation 放行路由，而是保持当前物理事实为 Unknown、将 binding hidden 并强制 unroutable。
+6. 同卡出现两个 physically awake binding 时不再伪造其中一个 `awake=false`。后出现的 binding 保持真实 `awake=true`、标记 hidden 并摘路由，等待显式 repair；allocator 只在 reconcile 结果中允许表示这种非法现场，普通 wake/allocate 路径仍拒绝冲突。
+7. 新增 `deploy/scripts/staggered_model_fleet.py`，并由 `deploy_models.sh --staggered` 调用。工具默认 dry-run；真实执行必须同时给 `--execute --confirm-reset-fleet`，并执行以下门控：controller 必须为 observe、所有 Node 必须 `DiskPressure=False`、先把模型 Deployment 以 replicas=0/hidden/routable=false 应用、严格清 ghost、逐 binding 启动、启动前确认重叠 GPU 上所有居民 physically sleeping、HTTP ready 后立即 `/sleep` 并复核，最后仅通过 SM wake 指定 stable binding，且以 `/v2/audit healthy=true` 收尾。
+8. 恢复工具只 apply `default` 模型命名空间内的 Service/ReferenceGrant/Deployment，不修改共享 `aibrix-system` 中的 HTTPRoute。
+
+标准基线的 dry-run 命令：
+
+```bash
+cd /data/nfs_shared_data/xxy/aibrix/tre
+./deploy/scripts/deploy_models.sh --staggered \
+  --wake dsqwen-7b/nscc-ds-4a100-node9/0 \
+  --wake dsllama-8b/nscc-ds-4a100-node9/1 \
+  --wake dsqwen-14b/nscc-ds-4a100-node9/2,3
+```
+
+确认确实需要销毁并重建整个 resident pool 后，才追加：
+
+```text
+--execute --confirm-reset-fleet
+```
+
+第一阶段明确没有把以下事项伪装成已完成：StateStore 原子 CAS、desired/observed/journal 拆分、GPU lease/fencing、DiskPressure watcher、受 SM 控制的 launcher/startup gate、异步 `/v2/fleet/repair`。这些仍是 P0 后半与 P1/P2；在 startup gate 落地前，普通 Deployment 自愈仍可能绕过 SM，因此 fresh fleet 禁止直接 `kubectl apply -k deploy/models`。

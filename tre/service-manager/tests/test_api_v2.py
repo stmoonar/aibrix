@@ -196,8 +196,8 @@ def test_v2_state_exposes_version_and_bindings():
     assert state["version"] == 1
     assert state["models"]["m1"] == {"awake": 1, "bound": 2}
     assert state["bindings"] == [
-        {"serve_id": "serve-a", "model": "m1", "node": "node-a", "gpu_ids": [0], "awake": True, "hidden": False},
-        {"serve_id": "serve-b", "model": "m1", "node": "node-a", "gpu_ids": [1], "awake": False, "hidden": False},
+        {"binding_id": "m1/node-a/0", "serve_id": "serve-a", "model": "m1", "node": "node-a", "gpu_ids": [0], "awake": True, "hidden": False},
+        {"binding_id": "m1/node-a/1", "serve_id": "serve-b", "model": "m1", "node": "node-a", "gpu_ids": [1], "awake": False, "hidden": False},
     ]
 
 
@@ -712,6 +712,105 @@ def test_v2_reconcile_route_delegates_to_service_layer():
     assert response.status_code == 200
     assert response.json()["version"] == 2
     assert response.json()["warnings"] == ["serve-a: pod reality overrides persisted binding"]
+
+
+def test_v2_reconcile_strict_route_removes_ghost_binding():
+    store = StateStore(FakeRedis())
+    store.save(
+        [Binding("serve-ghost", "m1", Slot("node-a", (0,)), awake=False)],
+        expected_version=0,
+    )
+    client = TestClient(
+        create_app(
+            ServiceManagerV2(
+                registry(), store, k8s_client=FakeK8sClient([])
+            )
+        )
+    )
+
+    response = client.post("/v2/reconcile", json={"drop_missing": True})
+
+    assert response.status_code == 200
+    assert response.json()["bindings"] == []
+    assert store.load().bindings == []
+
+
+def test_v2_audit_is_read_only_and_uses_stable_binding_identity():
+    store = StateStore(FakeRedis())
+    store.save(
+        [Binding("pod-old", "m1", Slot("node-a", (0,)), awake=True)],
+        expected_version=0,
+    )
+    client = TestClient(
+        create_app(
+            ServiceManagerV2(
+                registry(),
+                store,
+                k8s_client=FakeK8sClient(
+                    [
+                        PodRecord(
+                            "pod-new",
+                            "m1",
+                            "node-a",
+                            "0",
+                            state="awake",
+                            routable=True,
+                        )
+                    ]
+                ),
+            )
+        )
+    )
+
+    response = client.get("/v2/audit")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["healthy"] is False
+    assert payload["issues"] == [
+        {
+            "code": "instance_replaced",
+            "binding_id": "m1/node-a/0",
+            "persisted_serve_id": "pod-old",
+            "observed_serve_id": "pod-new",
+        }
+    ]
+    assert store.load().version == 1
+
+
+def test_v2_audit_reports_cross_model_physical_gpu_conflict():
+    store = StateStore(FakeRedis())
+    store.save(
+        [
+            Binding("pod-a", "m1", Slot("node-a", (0,)), awake=True),
+            Binding("pod-b", "other", Slot("node-a", (0,)), awake=True, hidden=True),
+        ],
+        expected_version=0,
+    )
+    service = ServiceManagerV2(
+        registry(),
+        store,
+        k8s_client=FakeK8sClient(
+            [
+                PodRecord("pod-a", "m1", "node-a", "0", state="awake", routable=True),
+                PodRecord("pod-b", "other", "node-a", "0", state="hidden", routable=False),
+            ]
+        ),
+    )
+
+    result = service.audit()
+
+    assert result["healthy"] is False
+    assert result["issues"] == [
+        {
+            "code": "awake_gpu_conflict",
+            "binding_id": "other/node-a/0",
+            "serve_id": "pod-b",
+            "node": "node-a",
+            "gpu_id": 0,
+            "conflicts_with": "pod-a",
+        }
+    ]
 
 
 def test_v2_put_target_calls_vllm_and_pod_annotations_for_existing_bindings():
