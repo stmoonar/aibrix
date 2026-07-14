@@ -79,7 +79,7 @@ def test_tre_v2_overlay_declares_components_and_independent_redis() -> None:
     ui = _load_yaml(overlay / "ui.yaml")
 
     assert _image(controller) == "tre-v2-controller:20260710-ca61e485"
-    assert _image(sm) == "tre-v2-service-manager:20260715-a4454807"
+    assert _image(sm) == "tre-v2-service-manager:20260715-7d4a03a2"
     sm_container = sm["spec"]["template"]["spec"]["containers"][0]
     assert sm_container["readinessProbe"]["httpGet"] == {
         "path": "/healthz",
