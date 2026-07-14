@@ -222,3 +222,82 @@ cd /data/nfs_shared_data/xxy/aibrix/tre
 - 新 `/v2/audit` 在线返回 `healthy=true, version=493, issues=[]`。
 - 连续两次在线 `/v2/reconcile` 均为 `version=493, warnings=[]`，验证 natural-sort 修复后没有 version churn。
 - 滚动后模型池保持 20/20 Running+Ready、总 restart=0；SM 仍为 7B `1/8`、Llama `1/8`、14B `1/4`；三个 Service 仍各只有一个标准基线 endpoint；controller 为 observe，DiskPressure 全部 False，safescale/orphan/hidden-orphan 三个 guard hash 均为 0。
+
+## 10. 2026-07-15 P0-P2 完整实现
+
+第一阶段列出的核心缺口现已全部进入正式代码和运行环境：
+
+1. **原子状态与单写者 fencing**：Redis desired/observed 更新由 Lua CAS 完成，generation 不匹配时拒绝覆盖；operation lock、writer token 和 journal 共同阻止两个 repair 同时推进。
+2. **desired / observed / operation 分层**：desired 只保存稳定 binding 的生命周期、power 和 hidden 意图；observed 保存实际 Pod UID/name/IP、Ready、物理 power 和时间戳；Pod 换代不再改变 desired 身份。
+3. **GPU lease**：每张 GPU 一个带 fencing token 的 lease；TP2 在一段 Lua 中原子获取两张卡，失败时不会留下半个 lease。只有当前 lease owner 能提交启动结果。
+4. **异步 fleet repair**：`POST /v2/fleet/repair` 生成 operation，后台按 GPU 冲突图串行恢复，持续写 phase/journal；Node 存在 Disk/Memory/PIDPressure 时暂停，连续健康达到 hysteresis 后才继续。
+5. **startup gate**：20 份模型 Deployment 都增加由 service-manager admission 控制的 init container；Pod 模板默认 hidden、`routable=false`，vLLM 就绪探针使用 `/health`。ReplicaSet 可以补空壳 Pod，但没有 admission 就不会加载模型。
+6. **后台 supervisor**：持续收敛 startup gate、识别 stale operation，并对连续多次相同的 fleet drift 自动提交 repair。普通 Pending/Terminating、同 GPU 已有启动中的 peer 和短暂 lease 竞争不会被误判成新的故障。
+7. **控制权交接**：健康巡检不修改 controller mode；只有确认存在 stale operation 或持久漂移并即将自动 repair 时，supervisor 才原子地把 controller 切到 `observe`。repair 结束后保持 observe，必须由运维确认审计健康后显式恢复 active。
+
+人工调用 repair 仍然 fail-closed：如果 controller 不是 observe，请求直接拒绝。自动接管是 supervisor 专用路径，不能被普通 API 调用绕过。
+
+关键提交链（从基础能力到最终部署）：
+
+```text
+829e2977  Redis CAS、fenced state writes
+aeb899f4  异步、pressure-gated fleet repair
+0cf7dd00  desired/observed 与 GPU/TP2 lease
+475e3415  startup gate、supervisor、fleet recovery
+461d5396  FastAPI lifecycle 兼容修复
+a4454807  Pending/admitted drift 与 deployments/scale RBAC
+7d4a03a2  把 Terminating resident 纳入启动冲突检查
+53f10605  同 GPU peer drift 抑制与瞬时 lease preflight
+60e258de  自动 repair 前将 controller 交接到 observe
+3737f60b  部署 tre-v2-service-manager:20260715-60e258de
+```
+
+最终权威检查为 `make check`: **566 passed**。
+
+## 11. 在线迁移与故障注入记录
+
+20 个既有模型 Pod 采用逐 binding 串行滚动方式接入 startup gate。每次迁移均等待新 Pod 通过 gate、HTTP ready、按 desired 收敛为 sleeping/awake，并验证同卡其他 resident 已 physically asleep 后才继续。整个迁移耗时约 2344 秒，最终 20/20 Pod restart=0；期间在线验证了单卡同驻留模型的 sleep/restore，以及 TP2 启动前同时让两个 GPU 上的基线模型 sleep、完成后恢复。
+
+迁移和故障注入暴露并修复了四个真实竞态：
+
+- FastAPI 版本不支持应用对象上的 lifecycle 注册方式；改用 router lifecycle，并给 service-manager Deployment 增加 readiness，避免错误 rollout 被当成成功。
+- startup admission 需要 `deployments/scale` RBAC；同时，正常 Pending Pod 不能立即被 supervisor 判为 missing drift。
+- 新旧 Pod 交替时，Terminating resident 仍可能占显存，必须纳入同 GPU 冲突清单。
+- 同时删除同 GPU 的 7B、Llama 与跨 GPU 的 14B 后，等待 admission 的 peer 不能触发第二个 repair；瞬时 lease 竞争也必须在创建 operation journal 前 preflight。
+
+最终故障注入同时删除 node10 GPU0 上的三个 sleeping resident（其中 14B 为 GPU0-1 TP2）。修复后的 supervisor 经过 drift debounce 后只提交一个 repair operation：
+
+```text
+operation_id = 1b699405-8bd7-4aec-ab3a-16db61c5001c
+result       = succeeded
+```
+
+三个 Pod 按 GPU 冲突关系串行重建并回到 sleeping，过程中标准 awake 基线按需安全 sleep/restore；最终无 GPU 并发冷启动、无容器重启、无遗留 drift。service-manager 进程重启与 stale journal 接管已由单元测试覆盖，并在故障处理过程中部分在线经历；没有为了测试而主动制造真实 DiskPressure，pressure pause/hysteresis 由测试覆盖，现场只验证压力解除时的正常路径。
+
+## 12. 最终运行态与标准处置
+
+2026-07-15 最终独立核验同时读取 Kubernetes、Redis、service-manager 和 20 个 vLLM `/is_sleeping`：
+
+- audit `healthy=true`、issues/mismatches 为空；supervisor running、无 error、无 drift；
+- 20 个 desired、20 个 observed、20 个 Running+Ready Pod，UID 全部对应，模型容器 restart 总数 0；
+- 17 个 physically sleeping；3 个标准 binding awake：node9 的 7B/GPU0、Llama/GPU1、14B/GPU2-3；
+- 只有这 3 个 binding 持有 awake GPU lease，routable 标签与物理状态一致；
+- 20/20 Deployment 均有 startup gate、默认 hidden/routable=false 和 `/health` readiness；
+- service-manager 镜像为 `tre-v2-service-manager:20260715-60e258de`，Pod Ready、restart=0；controller 保持 observe。
+
+以后遇到批量驱逐、节点恢复或管理面状态不一致时，不再删除整池后手工 wake。标准流程为：
+
+1. 不并行 scale 模型 Deployment，也不直接修改 routable/state annotation。
+2. 等待 supervisor debounce；它会在确认持久 drift 时把 controller 切到 observe，并通过 startup gate 串行恢复。
+3. 查看 `/v2/supervisor`、`/v2/operations/<id>`、`/v2/fleet/state` 和 `/v2/audit`；存在 Node pressure 时保持等待，不绕过 gate。
+4. repair 完成后逐项确认 audit healthy、mismatch 为空、物理 `/is_sleeping`、Pod UID、GPU lease 和 Service endpoint 一致。
+5. 只有完成上述核验后，才由运维显式把 controller 恢复 active。supervisor 故意不自动恢复 active，避免尚未识别的现场问题重新触发调度写入。
+
+结论：**冷启动应该且已经交给 service-manager 治理**。Kubernetes 仍负责对象生命周期和容器自愈；service-manager 独占 GPU admission、模型加载、sleep/wake、路由和状态提交。desired 是意图，Kubernetes/vLLM/GPU truth 是 observed 证据，journal/lease/fencing 保证故障恢复过程可重入且只有一个有效写者。
+
+## 13. 不阻塞上线的后续加固
+
+- operation journal 当前保留全部事故记录；应增加按时间/数量归档与压缩，避免 Redis hash 长期无界增长。本次保留失败记录作为事故证据，没有手工清空。
+- 增加定期、非生产破坏性的 chaos 套件，覆盖 service-manager 在 Starting、sleep 后、commit 前分别退出，以及测试集群中的真实 DiskPressure 恢复；当前对应状态机与 pressure 行为已有单元测试，但未在生产集群完整注入全部相位。
+- UI 可进一步突出“controller 因自动恢复被切到 observe”及需人工恢复 active 的原因，减少把安全停机误认为 controller 故障。
+- 若未来引入 `ModelBinding` CRD，应只作为 desired API 和 Kubernetes owner reference；不能重新让 kube controller 绕过 service-manager 直接启动 vLLM。当前 init gate 已满足本次事故所需的控制闭环，CRD 不是前置条件。
