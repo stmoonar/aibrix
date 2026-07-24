@@ -75,11 +75,25 @@ class FakeVllmOps:
 
 
 class FakeGpuTruth:
-    def __init__(self, used_by_uuid):
+    def __init__(self, used_by_uuid, *, unavailable_nodes=()):
         self._used_by_uuid = dict(used_by_uuid)
+        self._unavailable_nodes = set(unavailable_nodes)
+
+    def node_truth(self, *, node):
+        from tre_sm.gpu_truth import NodeGpuTruth
+
+        if node in self._unavailable_nodes:
+            return None
+        return NodeGpuTruth(
+            node=node,
+            used_by_uuid={
+                uuid: mib for (n, uuid), mib in self._used_by_uuid.items() if n == node
+            },
+        )
 
     def used_mib(self, *, node, gpu_id, gpu_uuid):
-        return self._used_by_uuid.get((node, gpu_uuid))
+        truth = self.node_truth(node=node)
+        return None if truth is None else truth.used_mib(gpu_uuid)
 
 
 class FakeK8sClient:
@@ -1147,3 +1161,100 @@ def test_v2_put_target_treats_matching_state_conflict_after_runtime_action_as_su
     }
     assert vllm_ops.calls == [("sleep", "10.0.0.1", 8000)]
     assert runtime_ops.annotations == [("serve-a", "sleeping")]
+
+
+class _HeadroomProbeRuntime(FakeRuntimeOps):
+    """Runtime whose create marks that the headroom gate let us through."""
+
+    def __init__(self):
+        from tre_sm.allocator.topology import K8sPodSnapshot
+
+        super().__init__(
+            [
+                K8sPodSnapshot(
+                    name="serve-a",
+                    model="m1",
+                    node="node-a",
+                    env={"CUDA_VISIBLE_DEVICES": "0"},
+                    pod_ip="10.0.0.1",
+                )
+            ]
+        )
+
+    def delete_model_deployment(self, binding):
+        raise AssertionError("target growth should not delete deployments")
+
+    def wait_pod_deleted(self, serve_id):
+        raise AssertionError("target growth should not wait for deletion")
+
+    def create_model_deployment(self, model, slot):
+        raise ValueError("headroom-gate-passed")
+
+    def wait_pod_ready(self, serve_id):
+        raise AssertionError("headroom check must run before wait")
+
+
+def test_v2_put_target_refuses_runtime_create_when_gpu_truth_is_unavailable():
+    store = StateStore(FakeRedis())
+    original = [Binding("serve-a", "m1", Slot("node-a", (0,)), awake=True)]
+    store.save(original, expected_version=0)
+    service = ServiceManagerV2(
+        registry_with_tp2(),
+        store,
+        runtime_ops=_HeadroomProbeRuntime(),
+        vllm_ops=FakeVllmOps(),
+        gpu_truth=FakeGpuTruth({}, unavailable_nodes={"node-a"}),
+        create_max_used_mib=2500,
+    )
+
+    try:
+        service.put_model_target("tp2", wake_replicas=1)
+    except ValueError as exc:
+        assert "gpu truth unavailable" in str(exc)
+        assert "node-a" in str(exc)
+    else:
+        raise AssertionError("expected cold start to be refused without gpu truth")
+    assert store.load().bindings == original
+
+
+def test_v2_put_target_refuses_runtime_create_when_the_slot_gpu_has_no_truth_entry():
+    store = StateStore(FakeRedis())
+    original = [Binding("serve-a", "m1", Slot("node-a", (0,)), awake=True)]
+    store.save(original, expected_version=0)
+    service = ServiceManagerV2(
+        registry_with_tp2(),
+        store,
+        runtime_ops=_HeadroomProbeRuntime(),
+        vllm_ops=FakeVllmOps(),
+        gpu_truth=FakeGpuTruth({("node-a", "GPU-2"): 100}),
+        create_max_used_mib=2500,
+    )
+
+    try:
+        service.put_model_target("tp2", wake_replicas=1)
+    except ValueError as exc:
+        assert "gpu truth unavailable" in str(exc)
+        assert "GPU-3" in str(exc)
+    else:
+        raise AssertionError("expected cold start to be refused for the untracked gpu")
+
+
+def test_v2_put_target_allows_runtime_create_without_truth_when_not_required():
+    store = StateStore(FakeRedis())
+    store.save([Binding("serve-a", "m1", Slot("node-a", (0,)), awake=True)], expected_version=0)
+    service = ServiceManagerV2(
+        registry_with_tp2(),
+        store,
+        runtime_ops=_HeadroomProbeRuntime(),
+        vllm_ops=FakeVllmOps(),
+        gpu_truth=FakeGpuTruth({}, unavailable_nodes={"node-a"}),
+        create_max_used_mib=2500,
+        require_gpu_truth=False,
+    )
+
+    try:
+        service.put_model_target("tp2", wake_replicas=1)
+    except ValueError as exc:
+        assert "headroom-gate-passed" in str(exc)
+    else:
+        raise AssertionError("expected the create path to be reached")

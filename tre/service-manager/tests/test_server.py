@@ -32,3 +32,17 @@ def test_k8s_pod_client_from_ops_converts_snapshots_to_reconcile_records() -> No
             cuda_visible_devices="0",
         )
     ]
+
+
+def test_gpu_truth_required_from_env_defaults_to_fail_closed() -> None:
+    from tre_sm.server import gpu_truth_required_from_env
+
+    assert gpu_truth_required_from_env({}) is True
+
+
+def test_gpu_truth_required_from_env_can_be_disabled_for_emergencies() -> None:
+    from tre_sm.server import gpu_truth_required_from_env
+
+    assert gpu_truth_required_from_env({"TRE_GPU_TRUTH_REQUIRED": "false"}) is False
+    assert gpu_truth_required_from_env({"TRE_GPU_TRUTH_REQUIRED": "0"}) is False
+    assert gpu_truth_required_from_env({"TRE_GPU_TRUTH_REQUIRED": "true"}) is True

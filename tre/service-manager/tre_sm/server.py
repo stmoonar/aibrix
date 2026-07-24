@@ -87,6 +87,7 @@ def create_app() -> FastAPI:
         gpu_truth=RedisGpuTruth(redis_client),
         create_max_used_mib=int(os.environ.get("TRE_CREATE_MAX_USED_MIB", "2500")),
         sleep_leak_used_mib=int(os.environ.get("TRE_SLEEP_LEAK_USED_MIB", "8192")),
+        require_gpu_truth=gpu_truth_required_from_env(os.environ),
         operation_coordinator=operation_coordinator,
         safety_gate=safety_gate,
         fleet_store=fleet_store,
@@ -125,3 +126,17 @@ def _create_k8s_ops(registry=None) -> K8sOps:
         gateway_name=os.environ.get("TRE_GATEWAY_NAME", "aibrix-eg"),
         registry=registry,
     )
+
+
+def gpu_truth_required_from_env(environ) -> bool:
+    """Whether a missing GPU truth payload must block cold starts.
+
+    Defaults to True (fail closed). Operators can set
+    TRE_GPU_TRUTH_REQUIRED=false to fall back to the permissive behaviour if
+    the gpu-truth DaemonSet is unavailable during an emergency.
+    """
+    return str(environ.get("TRE_GPU_TRUTH_REQUIRED", "true")).strip().lower() not in {
+        "0",
+        "false",
+        "no",
+    }

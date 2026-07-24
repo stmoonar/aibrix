@@ -115,6 +115,7 @@ class ServiceManagerV2:
         gpu_truth: GpuTruthProvider | None = None,
         create_max_used_mib: int = 2500,
         sleep_leak_used_mib: int = 8192,
+        require_gpu_truth: bool = True,
         operation_coordinator: OperationCoordinator | None = None,
         safety_gate: ClusterSafetyGate | None = None,
         fleet_store: FleetStateStore | None = None,
@@ -128,6 +129,7 @@ class ServiceManagerV2:
         self._gpu_truth = gpu_truth
         self._create_max_used_mib = create_max_used_mib
         self._sleep_leak_used_mib = sleep_leak_used_mib
+        self._require_gpu_truth = require_gpu_truth
         self._operation_coordinator = operation_coordinator
         self._safety_gate = safety_gate
         self._fleet_store = fleet_store
@@ -1396,16 +1398,37 @@ class ServiceManagerV2:
         return allocator.feasible_wake(binding.serve_id)
 
     def _ensure_create_headroom(self, slot: Slot) -> None:
+        # Fail closed: a cold start writes model weights onto a GPU we believe
+        # is free. When the gpu-truth DaemonSet is down its Redis key expires,
+        # and absent truth used to silently skip this gate -- the one guard
+        # standing between a stale view and two models on one GPU. Refuse
+        # instead. Set TRE_GPU_TRUTH_REQUIRED=false to restore the old
+        # permissive behaviour if truth is unavailable during an emergency.
         if self._gpu_truth is None:
             return
+        node_truth = self._gpu_truth.node_truth(node=slot.node)
+        if node_truth is None:
+            if not self._require_gpu_truth:
+                return
+            raise ValueError(
+                f"gpu truth unavailable for node {slot.node}: refusing cold start "
+                "(is the tre-v2-gpu-truth DaemonSet healthy?)"
+            )
         nodes = {node.name: node for node in self._registry.topology().nodes}
         node = nodes.get(slot.node)
         for gpu_id in slot.gpu_ids:
             gpu_uuid = _gpu_uuid(node, gpu_id)
             if gpu_uuid is None:
                 continue
-            used_mib = self._gpu_truth.used_mib(node=slot.node, gpu_id=gpu_id, gpu_uuid=gpu_uuid)
-            if used_mib is None or used_mib <= self._create_max_used_mib:
+            used_mib = node_truth.used_mib(gpu_uuid)
+            if used_mib is None:
+                if not self._require_gpu_truth:
+                    continue
+                raise ValueError(
+                    f"gpu truth unavailable for {slot.node}/{gpu_uuid}: refusing cold start "
+                    "(gpu missing from the node truth payload)"
+                )
+            if used_mib <= self._create_max_used_mib:
                 continue
             raise ValueError(
                 "insufficient startup headroom: "

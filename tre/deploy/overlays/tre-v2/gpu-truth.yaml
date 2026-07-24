@@ -15,6 +15,7 @@ data:
     import json
     import socket
     import subprocess
+    import sys
     import time
     from urllib.parse import urlparse
 
@@ -47,7 +48,12 @@ data:
         }
 
 
-    def collect_nvidia_smi() -> list[dict]:
+    NVIDIA_SMI_TIMEOUT_S = 20.0
+
+
+    def collect_nvidia_smi(*, timeout_s: float = NVIDIA_SMI_TIMEOUT_S) -> list[dict]:
+        # timeout_s bounds a wedged driver: nvidia-smi can hang indefinitely on a
+        # stuck GPU, which would silently freeze the publish loop.
         output = subprocess.check_output(
             [
                 "nvidia-smi",
@@ -55,14 +61,54 @@ data:
                 "--format=csv,noheader,nounits",
             ],
             text=True,
+            timeout=timeout_s,
         )
         return parse_nvidia_smi_csv(output)
 
 
-    def publish_once(redis_client, *, node: str, ttl_s: int) -> dict:
-        payload = build_payload(node, collect_nvidia_smi())
+    def publish_once(redis_client, *, node: str, ttl_s: int, collect=None) -> dict:
+        collect = collect or collect_nvidia_smi
+        payload = build_payload(node, collect())
         redis_client.setex(f"tre:gpu_truth:{node}", ttl_s, json.dumps(payload, separators=(",", ":")))
         return payload
+
+
+    def run_agent(
+        redis_client,
+        *,
+        node: str,
+        ttl_s: int,
+        interval_s: float,
+        collect=None,
+        sleep=None,
+        iterations: int | None = None,
+        error_stream=None,
+    ) -> int:
+        """Publish GPU truth forever, surviving transient collection/publish faults.
+
+        A single nvidia-smi hiccup (exit 255 on a driver blip) used to kill the
+        process and put the DaemonSet into CrashLoopBackOff. On failure we log and
+        retry instead, and deliberately leave the Redis key untouched: letting its
+        TTL expire is precisely the signal service-manager needs to treat GPU truth
+        as unavailable and fail its startup-headroom gate closed.
+        """
+        sleep = sleep or time.sleep
+        stream = error_stream if error_stream is not None else sys.stderr
+        completed = 0
+        while iterations is None or completed < iterations:
+            try:
+                publish_once(redis_client, node=node, ttl_s=ttl_s, collect=collect)
+            except Exception as exc:  # noqa: BLE001 - the loop must outlive any fault
+                print(
+                    f"gpu_truth: publish failed for node={node}: {exc!r}",
+                    file=stream,
+                    flush=True,
+                )
+            completed += 1
+            if iterations is not None and completed >= iterations:
+                break
+            sleep(interval_s)
+        return 0
 
 
     class RawRedisSetexClient:
@@ -108,11 +154,16 @@ data:
             client = redis.Redis.from_url(args.redis_url)
         except ModuleNotFoundError:
             client = RawRedisSetexClient(args.redis_url)
-        while True:
+        if args.once:
+            # --once stays fail-fast so operators can use it as a diagnostic probe.
             publish_once(client, node=args.node, ttl_s=args.ttl_s)
-            if args.once:
-                return 0
-            time.sleep(args.interval_s)
+            return 0
+        return run_agent(
+            client,
+            node=args.node,
+            ttl_s=args.ttl_s,
+            interval_s=args.interval_s,
+        )
 
 
     def _parse_mib(value: str) -> int:
