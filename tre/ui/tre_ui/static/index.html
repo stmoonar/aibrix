@@ -12,65 +12,91 @@
     <div id="nav"></div>
     <div class="rail-foot">
       Live via in-pod sampler · SSE 0.5s<br />
-      <span id="ver" class="num">v0</span> · read-only on the control loop
+      <span id="ver" class="num">v0</span> · browsers never read upstream
     </div>
   </nav>
 
   <main class="stage">
     <header class="topbar">
-      <h1 id="view-title">Live Signals</h1>
+      <h1 id="view-title">Overview</h1>
       <span id="stamp" class="sub" style="margin:0"></span>
       <span class="spacer"></span>
       <span id="mode-badge" class="pill"><span class="dot"></span><span id="mode-badge-txt">controller <b>—</b></span></span>
-      <span id="loop" class="pill"><span class="dot"></span><span id="loop-txt">loop <b>—</b></span></span>
+      <span id="sup-badge" class="pill"><span class="dot"></span><span id="sup-badge-txt">supervisor <b>—</b></span></span>
+      <span id="audit-badge" class="pill"><span class="dot"></span><span id="audit-badge-txt">audit <b>—</b></span></span>
       <span id="gpufresh" class="pill"><span class="dot"></span>GPU truth <b>—</b></span>
       <span id="conn" class="pill"><span id="conn-dot" class="dot"></span><span id="conn-txt">connecting</span></span>
     </header>
 
     <div class="content">
-      <!-- LIVE -->
-      <section id="view-live" class="view active">
-        <div class="two-col">
-          <div>
-            <h2 class="section">Per-model signals</h2>
-            <p class="sub">Zₘ = TRSₘ / θₘ. Dashed lines mark τ<sub>crit</sub>/τ<sub>low</sub>/τ<sub>high</sub>. State band comes from the controller classification.</p>
-            <div id="live-grid" class="grid-live"></div>
-          </div>
-          <div>
-            <h2 class="section">Event feed</h2>
-            <p class="sub">Scale, hide, safescale, leak &amp; warmup events as the loops emit them.</p>
-            <div id="feed" class="feed"></div>
-          </div>
-        </div>
+      <section id="view-overview" class="view active">
+        <h2 class="section">系统状态</h2>
+        <p class="sub">这一页只回答一个问题：现在需不需要深入看。全绿就可以走。</p>
+        <div id="ov-health" class="health-grid"></div>
+
+        <h2 class="section">意图 vs 实际 (desired ↔ observed)</h2>
+        <p class="sub">service-manager 的 desired 是意图，observed 是 Kubernetes/vLLM/GPU 的实测证据。两者不一致就是待收敛的 drift。</p>
+        <div id="ov-fleet" class="fleet-summary"></div>
+
+        <h2 class="section">每模型</h2>
+        <div id="ov-models" class="ov-models"></div>
+
+        <h2 class="section">最近动作</h2>
+        <div id="ov-feed" class="feed"></div>
       </section>
 
-      <!-- FLEET -->
+      <section id="view-signals" class="view">
+        <div class="signals-bar">
+          <div class="seg" id="sig-window"></div>
+          <button class="btn" id="sig-pause">暂停</button>
+          <label class="chk"><input type="checkbox" id="sig-tps" /> 显示吞吐 decode/prefill</label>
+          <span class="spacer"></span>
+          <span class="sub" id="sig-status"></span>
+        </div>
+        <div id="sig-charts"></div>
+      </section>
+
       <section id="view-fleet" class="view">
-        <h2 class="section">GPU co-residency</h2>
-        <p class="sub">Each GPU can hold multiple resident models (weights kept while sleeping); at most one is awake. Joined from service-manager bindings × GPU-truth memory by node &amp; index.</p>
+        <h2 class="section">GPU 共驻</h2>
+        <p class="sub">每张卡可驻留多个模型（睡眠时权重仍留在显存/内存），最多一个 awake。lease 的 fencing token 标识当前唯一写者。</p>
         <div id="fleet-root"></div>
       </section>
 
-      <!-- CONTROL -->
-      <section id="view-control" class="view">
-        <h2 class="section">Controller mode</h2>
-        <p class="sub">Observe pauses actuation (no scale/hide) while decisions keep computing — safe for inspecting behaviour without perturbing tenants.</p>
+      <section id="view-ops" class="view">
+        <h2 class="section">Operation journal</h2>
+        <p class="sub">service-manager 的操作日志：每次 wake/sleep/create/repair 的状态与失败原因。</p>
+        <div id="ops-journal" class="journal"></div>
+
+        <h2 class="section">Supervisor</h2>
+        <div id="ops-supervisor" class="kv-grid"></div>
+
+        <h2 class="section">一致性审计</h2>
+        <p class="sub">审计会列出全部 pod 并逐个探测 vLLM 的 /is_sleeping，因此只在你点击时运行，不做自动轮询——实验负载期间请勿频繁点击。</p>
+        <div class="actions" style="margin:0 0 12px">
+          <button class="btn primary" id="ops-audit-run">运行审计</button>
+          <span class="sub" id="ops-audit-when"></span>
+        </div>
+        <div id="ops-audit" class="issues"></div>
+
+        <h2 class="section">Controller 模式</h2>
+        <p class="sub">observe 暂停执行（不扩缩、不 hide），决策照常计算——适合在不扰动租户的情况下观察行为。</p>
         <div class="actions" style="margin:0 0 22px">
           <div class="mode-toggle">
-            <button id="mode-active" onclick="TRE.setMode('active')">Active</button>
-            <button id="mode-observe" onclick="TRE.setMode('observe')">Observe</button>
+            <button id="mode-active">Active</button>
+            <button id="mode-observe">Observe</button>
           </div>
-          <button class="btn" onclick="TRE.reconcile()">Reconcile now</button>
-          <button class="btn" onclick="TRE.defrag()">Defrag (tp=2)</button>
+          <button class="btn" id="op-reconcile">Reconcile now</button>
+          <button class="btn" id="op-defrag">Defrag (tp=2)</button>
         </div>
-        <h2 class="section">Deployments &amp; parameters</h2>
-        <p class="sub">Edit per-model TRS/SLO/replica params and restart-to-apply. W (metrics window) is locked while frozen ahead of R3. Structural fields (image, weights, tp_size) are locked.</p>
+
+        <h2 class="section">参数</h2>
+        <p class="sub">编辑后需重启 controller 才生效。W（指标窗口）在 R3 前冻结；结构性字段（镜像、权重、tp_size）锁定。</p>
         <div id="params-bar" class="params-bar"></div>
         <div id="ctl-grid" class="ctl-grid"></div>
       </section>
     </div>
   </main>
 
-  <script src="/static/app.js"></script>
+  <script type="module" src="/static/js/main.js"></script>
 </body>
 </html>
