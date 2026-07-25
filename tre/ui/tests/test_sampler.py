@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from tre_ui.sampler import decode_decision, diff_events, merge_hist
+from tre_ui.sampler import _RATES, Sampler, decode_decision, diff_events, merge_hist
 
 
 def test_decode_decision_parses_hash_and_json_fields() -> None:
@@ -46,3 +46,84 @@ def test_merge_hist_dedups_by_window_keeping_latest_ts() -> None:
     windows = [p["window_end_ms"] for p in merged]
     assert windows == [1000, 2000]
     assert merged[0]["z_m"] == 1.4  # newer ts won
+
+
+# ---- sampler upstream sources (Task 1) ----
+
+
+class FakeRedis:
+    """Minimal Redis stand-in: every read the sampler makes returns empty."""
+
+    def __init__(self) -> None:
+        self.hashes: dict[str, dict] = {}
+
+    def hgetall(self, key):
+        return self.hashes.get(key, {})
+
+    def zrangebyscore(self, key, minimum, maximum):
+        return []
+
+    def scan_iter(self, match):
+        return iter(())
+
+    def get(self, key):
+        return None
+
+
+class FakeSmClient:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def get_state(self):
+        self.calls.append("/v2/state")
+        return {"version": 1, "bindings": []}
+
+    def request(self, method, path, payload=None):
+        self.calls.append(path)
+        if path == "/v2/fleet/state":
+            return {"desired_version": 3, "observed_version": 3,
+                    "desired": [], "observed": [], "mismatches": []}
+        if path == "/v2/supervisor":
+            return {"enabled": True, "running": True, "drift_observations": 0}
+        if path.startswith("/v2/operations"):
+            return {"operations": [{"id": "op-1", "status": "succeeded"}]}
+        raise AssertionError(f"unexpected path {path}")
+
+
+def test_sampler_publishes_fleet_supervisor_and_operations() -> None:
+    sampler = Sampler(FakeRedis(), FakeSmClient(), model_names=["m1"])
+
+    sampler.sample_once()
+    snap = sampler.snapshot()
+
+    assert snap["fleet"]["state"]["desired_version"] == 3
+    assert snap["fleet"]["supervisor"]["running"] is True
+    assert snap["operations"]["items"][0]["id"] == "op-1"
+
+
+def test_sampler_never_polls_the_expensive_audit_endpoint() -> None:
+    """Guard: /v2/audit lists k8s pods and HTTP-probes every vLLM pod.
+
+    Polling it would load the model pods and perturb scaling experiments, so it
+    must stay button-triggered only. See docs/design/20260725-console-redesign.md.
+    """
+    client = FakeSmClient()
+    sampler = Sampler(FakeRedis(), client, model_names=["m1"])
+
+    for _ in range(20):
+        sampler.sample_once()
+
+    assert not any("audit" in path for path in client.calls)
+    assert not any("audit" in source for source in _RATES)
+
+
+def test_sampler_publishes_gpu_leases() -> None:
+    redis = FakeRedis()
+    redis.hashes["tre:v2:sm:gpu_leases"] = {
+        b"node-a/0": b'{"binding_id":"m1/node-a/0","phase":"awake","fencing_token":7}'
+    }
+    sampler = Sampler(redis, FakeSmClient(), model_names=["m1"])
+
+    sampler.sample_once()
+
+    assert sampler.snapshot()["leases"]["gpus"]["node-a/0"]["fencing_token"] == 7

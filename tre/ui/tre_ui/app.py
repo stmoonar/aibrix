@@ -80,7 +80,7 @@ def create_ui_app(
 ) -> FastAPI:
     model_names = [m.name for m in registry.models()]
     model_max = {m.name: m.max_replicas for m in registry.models()}
-    sampler = Sampler(redis_client, service_manager_client.get_state, model_names=model_names)
+    sampler = Sampler(redis_client, service_manager_client, model_names=model_names)
 
     @asynccontextmanager
     async def _lifespan(_app: FastAPI):

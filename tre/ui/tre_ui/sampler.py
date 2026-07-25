@@ -19,7 +19,10 @@ from typing import Any, Callable
 from tre_common.rediskeys import CONTROLLER_SAFESCALE_PROBES_KEY, DECISION_LATEST_KEY, decision_hist_key
 
 # per-source cadence (seconds) -- all far below the controller's own Redis load per tick.
-_RATES = {"decision": 1.0, "hist": 2.0, "sm": 2.0, "gpu": 5.0, "probes": 2.0}
+_RATES = {"decision": 1.0, "hist": 2.0, "sm": 2.0, "gpu": 5.0, "probes": 2.0,
+          "fleet": 2.0, "ops": 2.0}
+_OPS_LIMIT = 50
+GPU_LEASES_KEY = "tre:v2:sm:gpu_leases"
 _HIST_RING = 2000  # points kept per model in memory (~1h at 2s)
 _HIST_TAIL = 240   # points embedded in each snapshot (browser gets the rest via /api/signal/history)
 _EVENTS = 5000
@@ -116,14 +119,14 @@ class Sampler:
     def __init__(
         self,
         redis_client: Any,
-        sm_get_state: Callable[[], dict[str, Any]],
+        sm_client: Any,
         *,
         model_names: list[str],
         clock: Callable[[], float] = time.monotonic,
         now_ms: Callable[[], int] = lambda: int(time.time() * 1000),
     ) -> None:
         self._redis = redis_client
-        self._sm_get_state = sm_get_state
+        self._sm = sm_client
         self._models = model_names
         self._clock = clock
         self._now_ms = now_ms
@@ -164,6 +167,7 @@ class Sampler:
         for source, reader in (
             ("decision", self._read_decision), ("hist", self._read_hist), ("sm", self._read_sm),
             ("gpu", self._read_gpu), ("probes", self._read_probes),
+            ("fleet", self._read_fleet), ("ops", self._read_ops),
         ):
             if now >= self._next[source]:
                 self._next[source] = now + _RATES[source]
@@ -194,7 +198,7 @@ class Sampler:
 
     def _read_sm(self) -> bool:
         try:
-            self._parts["sm"] = self._sm_get_state()
+            self._parts["sm"] = self._sm.get_state()
             self._ages["sm"] = self._now_ms()
         except Exception as exc:  # noqa: BLE001
             self._parts["sm"] = {"error": str(exc)}
@@ -211,7 +215,38 @@ class Sampler:
             pass
         nodes.sort(key=lambda n: str(n.get("node", "")))
         self._parts["gpu_truth"] = {"nodes": nodes}
+        try:
+            raw = self._redis.hgetall(GPU_LEASES_KEY) or {}
+            self._parts["leases"] = {_text(k): _loads(v) for k, v in raw.items()}
+        except Exception:  # noqa: BLE001
+            self._parts["leases"] = {}
         self._ages["gpu"] = self._now_ms()
+        return True
+
+    def _read_fleet(self) -> bool:
+        # Cheap: fleet state is two Redis reads and supervisor is in-memory.
+        # NEVER add /v2/audit here -- it lists k8s pods and HTTP-probes every
+        # vLLM pod, so polling it would perturb the models under load.
+        try:
+            state = self._sm.request("GET", "/v2/fleet/state")
+        except Exception as exc:  # noqa: BLE001
+            state = {"error": str(exc)}
+        try:
+            supervisor = self._sm.request("GET", "/v2/supervisor")
+        except Exception as exc:  # noqa: BLE001
+            supervisor = {"error": str(exc)}
+        self._parts["fleet"] = {"state": state, "supervisor": supervisor}
+        self._ages["fleet"] = self._now_ms()
+        return True
+
+    def _read_ops(self) -> bool:
+        try:
+            payload = self._sm.request("GET", f"/v2/operations?limit={_OPS_LIMIT}")
+            items = payload.get("operations", [])
+        except Exception:  # noqa: BLE001
+            items = []
+        self._parts["operations"] = items
+        self._ages["ops"] = self._now_ms()
         return True
 
     def _read_probes(self) -> bool:
@@ -235,6 +270,12 @@ class Sampler:
             },
             "sm": {"state": self._parts.get("sm", {}), "age_ms": self._age(now, "sm")},
             "gpu_truth": {**(self._parts.get("gpu_truth") or {"nodes": []}), "age_ms": self._age(now, "gpu")},
+            "fleet": {**(self._parts.get("fleet") or {"state": {}, "supervisor": {}}),
+                      "age_ms": self._age(now, "fleet")},
+            "operations": {"items": self._parts.get("operations", []),
+                           "age_ms": self._age(now, "ops")},
+            "leases": {"gpus": self._parts.get("leases", {}),
+                       "age_ms": self._age(now, "gpu")},
             "probes": self._parts.get("probes", []),
             "events_head": list(self._events)[:80],
         }
