@@ -287,6 +287,17 @@ def create_ui_app(
         points = [p for p in (_decode_json(item) for item in raw) if p is not None]
         return {"model": model, "points": points[-limit:]}
 
+    @app.get("/api/signal/timeline")
+    def signal_timeline(model: str, since_ms: int = 0) -> dict[str, Any]:
+        """Richer per-window series (queue_len, throughput, tier, action).
+
+        Served from the sampler's in-memory ring so browsers never trigger an
+        upstream read, however many tabs are open.
+        """
+        if model not in model_names:
+            raise HTTPException(status_code=404, detail="unknown model")
+        return {"model": model, "points": sampler.timeline(model, since_ms=since_ms)}
+
     @app.get("/api/gputruth")
     def gpu_truth() -> dict[str, Any]:
         nodes: list[dict[str, Any]] = []

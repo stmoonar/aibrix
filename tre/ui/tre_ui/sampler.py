@@ -16,13 +16,23 @@ import time
 from collections import deque
 from typing import Any, Callable
 
-from tre_common.rediskeys import CONTROLLER_SAFESCALE_PROBES_KEY, DECISION_LATEST_KEY, decision_hist_key
+from tre_common.rediskeys import (
+    CONTROLLER_SAFESCALE_PROBES_KEY,
+    CONTROLLER_SIGNAL_LOG_KEY,
+    DECISION_LATEST_KEY,
+    decision_hist_key,
+)
 
 # per-source cadence (seconds) -- all far below the controller's own Redis load per tick.
 _RATES = {"decision": 1.0, "hist": 2.0, "sm": 2.0, "gpu": 5.0, "probes": 2.0,
-          "fleet": 2.0, "ops": 2.0}
+          "fleet": 2.0, "ops": 2.0, "timeline": 2.0}
 _OPS_LIMIT = 50
 GPU_LEASES_KEY = "tre:v2:sm:gpu_leases"
+_TIMELINE_RING = 1200      # points per model (~1h at one 5s window per model)
+_TIMELINE_BACKFILL = 4000  # bounded first read; the stream holds ~200k entries
+_TIMELINE_INCREMENT = 500  # bounded per-tick read
+_TIMELINE_NUMERIC = ("z_m", "tss", "queue_len", "decode_tps", "prefill_tps",
+                     "replicas_awake", "replicas_target", "theta_m")
 _HIST_RING = 2000  # points kept per model in memory (~1h at 2s)
 _HIST_TAIL = 240   # points embedded in each snapshot (browser gets the rest via /api/signal/history)
 _EVENTS = 5000
@@ -92,6 +102,31 @@ def _event_model(text: str) -> str | None:
     return text.rsplit(":", 1)[-1] if ":" in text else None
 
 
+def decode_signal_row(fields: dict[Any, Any]) -> dict[str, Any]:
+    """Decode one signal_log entry; nan and absent numerics both become None.
+
+    The controller writes nan for an unavailable signal (e.g. an idle model with
+    no traffic). Callers must be able to tell that apart from a healthy zero, so
+    it decodes to None and the console labels it explicitly.
+    """
+    row = {_text(k): _text(v) for k, v in (fields or {}).items()}
+    out: dict[str, Any] = {
+        "model": row.get("model"),
+        "tier": row.get("tier"),
+        "action": row.get("action"),
+        "signal_source": row.get("signal_source"),
+    }
+    window = row.get("window_id", "")
+    out["ts_ms"] = int(window) if window.lstrip("-").isdigit() else None
+    for field in _TIMELINE_NUMERIC:
+        try:
+            value = float(row.get(field))
+        except (TypeError, ValueError):
+            value = float("nan")
+        out[field] = None if value != value else value  # nan -> None
+    return out
+
+
 def merge_hist(existing: list[dict], new_points: list[Any]) -> list[dict]:
     """Append decoded new points, dedup by window_end_ms keeping the max ts (review F3)."""
     by_window: dict[int, dict] = {}
@@ -134,6 +169,8 @@ class Sampler:
         self._version = 0
         self._snapshot: dict[str, Any] = {"version": 0}
         self._hist: dict[str, list[dict]] = {m: [] for m in model_names}
+        self._timeline: dict[str, list[dict]] = {m: [] for m in model_names}
+        self._timeline_last_id: str | None = None
         self._events: deque[dict] = deque(maxlen=_EVENTS)
         self._seen_decision: tuple | None = None
         self._parts: dict[str, Any] = {}
@@ -168,6 +205,7 @@ class Sampler:
             ("decision", self._read_decision), ("hist", self._read_hist), ("sm", self._read_sm),
             ("gpu", self._read_gpu), ("probes", self._read_probes),
             ("fleet", self._read_fleet), ("ops", self._read_ops),
+            ("timeline", self._read_timeline),
         ):
             if now >= self._next[source]:
                 self._next[source] = now + _RATES[source]
@@ -257,6 +295,34 @@ class Sampler:
             self._parts["probes"] = []
         return True
 
+    def _read_timeline(self) -> bool:
+        # Bounded reads only: signal_log is capped at 200k entries, so a full
+        # XRANGE would be a multi-second scan on every tick. The first read
+        # backfills a bounded tail; later reads walk forward from the last id.
+        try:
+            if self._timeline_last_id is None:
+                entries = list(reversed(
+                    self._redis.xrevrange(CONTROLLER_SIGNAL_LOG_KEY, count=_TIMELINE_BACKFILL)
+                ))
+            else:
+                entries = self._redis.xrange(
+                    CONTROLLER_SIGNAL_LOG_KEY,
+                    min=f"({self._timeline_last_id}",
+                    count=_TIMELINE_INCREMENT,
+                )
+        except Exception:  # noqa: BLE001
+            return False
+        for entry_id, fields in entries or []:
+            self._timeline_last_id = _text(entry_id)
+            row = decode_signal_row(fields)
+            model = row.get("model")
+            if model in self._timeline and row.get("ts_ms") is not None:
+                ring = self._timeline[model]
+                ring.append(row)
+                if len(ring) > _TIMELINE_RING:
+                    del ring[: len(ring) - _TIMELINE_RING]
+        return bool(entries)
+
     def _rebuild(self) -> None:
         now = self._now_ms()
         decision = self._parts.get("decision") or {"ts_ms": None, "model_states": {}}
@@ -298,6 +364,9 @@ class Sampler:
 
     def history(self, model: str, since_ms: int = 0) -> list[dict]:
         return [p for p in self._hist.get(model, []) if (p.get("window_end_ms") or p.get("ts") or 0) >= since_ms]
+
+    def timeline(self, model: str, since_ms: int = 0) -> list[dict]:
+        return [p for p in self._timeline.get(model, []) if (p.get("ts_ms") or 0) >= since_ms]
 
     def events(self, limit: int = 200) -> list[dict]:
         return list(self._events)[:limit]

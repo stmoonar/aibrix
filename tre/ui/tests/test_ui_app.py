@@ -16,6 +16,12 @@ class FakeRedis:
         }
         self.gpu = {"tre:gpu_truth:node-a": b'{"node":"node-a","gpus":[{"uuid":"G0","used_mib":37000,"total_mib":40960}]}'}
         self.kv: dict[str, str] = {}
+        self.stream = [(
+            "1-0",
+            {b"window_id": b"2000", b"model": b"m1", b"z_m": b"0.6", b"queue_len": b"4",
+             b"decode_tps": b"90", b"prefill_tps": b"310", b"replicas_awake": b"1",
+             b"replicas_target": b"2", b"tier": b"critical", b"action": b"scale_up"},
+        )]
 
     def hgetall(self, key):
         if key == "tre:v2:decision:latest":
@@ -49,6 +55,14 @@ class FakeRedis:
         self.kv.setdefault(key, []).append(value)
         return len(self.kv[key])
 
+    def xrevrange(self, key, max="+", min="-", count=None):
+        return list(reversed(self.stream))[:count] if count else list(reversed(self.stream))
+
+    def xrange(self, key, min="-", max="+", count=None):
+        start = str(min).lstrip("(")
+        out = [e for e in self.stream if e[0] > start]
+        return out[:count] if count else out
+
 
 class FakeServiceManagerClient:
     def __init__(self) -> None:
@@ -59,6 +73,15 @@ class FakeServiceManagerClient:
 
     def request(self, method, path, payload=None):
         self.calls.append((method, path, payload))
+        if path == "/v2/fleet/state":
+            return {"desired_version": 4, "observed_version": 4,
+                    "desired": [], "observed": [], "mismatches": []}
+        if path == "/v2/supervisor":
+            return {"enabled": True, "running": True, "drift_observations": 0}
+        if path.startswith("/v2/operations"):
+            return {"operations": [{"id": "op-9", "status": "succeeded"}]}
+        if path == "/v2/audit":
+            return {"healthy": True, "version": 12, "issues": []}
         return {"ok": True, "version": 8, "warnings": []}
 
 
@@ -251,3 +274,27 @@ def test_put_params_validates_writes_and_restart_flow() -> None:
 def test_rollout_state_reports_ready() -> None:
     client, _ = _client(FakeK8s())
     assert client.get("/api/ops/controller/rollout").json()["state"] == "ready"
+
+
+# ---- timeline endpoint (Task 2) ----
+
+def test_signal_timeline_returns_points_for_a_known_model() -> None:
+    client, _ = _client()
+
+    payload = client.get("/api/signal/timeline?model=m1").json()
+
+    assert payload["model"] == "m1"
+    assert payload["points"][0]["queue_len"] == 4.0
+    assert payload["points"][0]["action"] == "scale_up"
+
+
+def test_signal_timeline_rejects_an_unknown_model() -> None:
+    client, _ = _client()
+
+    assert client.get("/api/signal/timeline?model=nope").status_code == 404
+
+
+def test_signal_timeline_honours_since_ms() -> None:
+    client, _ = _client()
+
+    assert client.get("/api/signal/timeline?model=m1&since_ms=9999").json()["points"] == []
