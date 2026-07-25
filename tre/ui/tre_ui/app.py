@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-import time
-
 import asyncio
 import hashlib
 import json
 import logging
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -13,6 +12,7 @@ from typing import Any, Protocol
 
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from tre_common.registry import Registry
@@ -94,18 +94,13 @@ def create_ui_app(
 
     app = FastAPI(title="TRE Console", lifespan=_lifespan)
     app.state.sampler = sampler
+    # One mount instead of a route per asset: the console is now several ES
+    # modules, and hand-rolling a route for each would be pure friction.
+    app.mount("/static", StaticFiles(directory=str(_STATIC)), name="static")
 
     @app.get("/", response_class=HTMLResponse)
     def index() -> str:
         return (_STATIC / "index.html").read_text(encoding="utf-8")
-
-    @app.get("/app.js")
-    def app_js() -> Response:
-        return _static_asset("app.js", "application/javascript")
-
-    @app.get("/style.css")
-    def style_css() -> Response:
-        return _static_asset("style.css", "text/css")
 
     @app.get("/healthz")
     def healthz() -> dict[str, bool]:
@@ -421,13 +416,6 @@ def _record_audit(redis_client: Any, entry: dict) -> None:
         redis_client.rpush(_PARAMS_AUDIT_KEY, json.dumps(entry, separators=(",", ":")))
     except Exception:  # noqa: BLE001 - audit is best-effort, never blocks the edit
         pass
-
-
-def _static_asset(name: str, media_type: str) -> Response:
-    path = _STATIC / name
-    if not path.exists():
-        raise HTTPException(status_code=404, detail="not found")
-    return Response(path.read_text(encoding="utf-8"), media_type=media_type)
 
 
 def _safe(fn: Any) -> Any:

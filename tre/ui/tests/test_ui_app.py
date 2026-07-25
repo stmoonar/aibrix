@@ -329,3 +329,21 @@ def test_audit_surfaces_service_manager_failures() -> None:
 
     assert TestClient(app).post("/api/ops/audit").status_code == 502
 
+
+# ---- static mount (Task 4) ----
+
+def test_static_assets_are_served_from_the_static_mount() -> None:
+    client, _ = _client()
+
+    assert client.get("/static/style.css").status_code == 200
+    assert client.get("/static/js/main.js").status_code == 200
+
+
+def test_index_still_serves_the_console_shell() -> None:
+    client, _ = _client()
+
+    response = client.get("/")
+
+    assert response.status_code == 200
+    assert "/static/" in response.text
+
