@@ -85,7 +85,7 @@ def test_tre_v2_overlay_declares_components_and_independent_redis() -> None:
         "path": "/healthz",
         "port": "http",
     }
-    assert _image(ui) == "tre-v2-ui:20260710-ca61e485"
+    assert _image(ui) == "tre-v2-ui:20260725-1420d762"
     assert "latest" not in "\n".join([_image(controller), _image(sm), _image(ui)]).lower()
 
     assert _env(controller)["TRE_REDIS_URL"] == "redis://tre-v2-redis:6379/0"
