@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+
 import asyncio
 import hashlib
 import json
@@ -153,6 +155,28 @@ def create_ui_app(
             "thresholds": {"create_max_used_mib": 2500, "sleep_leak_used_mib": 8192},
             "sampler_version": sampler.version(),
         }
+
+    audit_cache: dict[str, Any] = {"ran_at_ms": None, "result": None}
+
+    @app.get("/api/ops/audit")
+    def get_audit() -> dict[str, Any]:
+        return dict(audit_cache)
+
+    @app.post("/api/ops/audit")
+    def run_audit() -> dict[str, Any]:
+        """Run the fleet audit on demand.
+
+        Deliberately manual and never on a timer: /v2/audit lists k8s pods and
+        HTTP-probes every vLLM pod, so polling it would load the model pods and
+        perturb scaling experiments.
+        """
+        try:
+            result = service_manager_client.request("GET", "/v2/audit")
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        audit_cache["ran_at_ms"] = int(time.time() * 1000)
+        audit_cache["result"] = result
+        return dict(audit_cache)
 
     @app.get("/api/ops/controller/mode")
     def get_mode() -> dict[str, Any]:

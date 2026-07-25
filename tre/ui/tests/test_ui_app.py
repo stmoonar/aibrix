@@ -298,3 +298,34 @@ def test_signal_timeline_honours_since_ms() -> None:
     client, _ = _client()
 
     assert client.get("/api/signal/timeline?model=m1&since_ms=9999").json()["points"] == []
+
+
+# ---- manual audit (Task 3) ----
+
+def test_audit_runs_only_when_explicitly_posted() -> None:
+    """/v2/audit lists k8s pods and probes every vLLM pod, so it must be manual."""
+    client, sm = _client()
+
+    assert client.get("/api/ops/audit").json()["ran_at_ms"] is None
+    assert not any("audit" in path for _, path, _ in sm.calls)
+
+    posted = client.post("/api/ops/audit")
+
+    assert posted.status_code == 200
+    assert posted.json()["result"]["healthy"] is True
+    assert posted.json()["ran_at_ms"] is not None
+    assert client.get("/api/ops/audit").json()["result"]["version"] == 12
+
+
+def test_audit_surfaces_service_manager_failures() -> None:
+    class FailingSm(FakeServiceManagerClient):
+        def request(self, method, path, payload=None):
+            if path == "/v2/audit":
+                raise RuntimeError("service-manager unreachable")
+            return super().request(method, path, payload)
+
+    app = create_ui_app(_registry(), FakeRedis(), FailingSm(), None)
+    app.state.sampler.sample_once()
+
+    assert TestClient(app).post("/api/ops/audit").status_code == 502
+
