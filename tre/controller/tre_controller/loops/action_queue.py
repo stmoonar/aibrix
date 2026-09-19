@@ -173,8 +173,8 @@ class ActionQueue:
 
     async def _dispatch(self, action: Action, model: str) -> DispatchResult:
         if isinstance(action, ScaleAction):
-            if action.delta < 0 and action.pods:
-                return await self._dispatch_binding_sleep(action)
+            if action.delta != 0 and action.pods:
+                return await self._dispatch_binding_power(action)
             response = await self._client.scale_model(action.model, action.delta)
             return _dispatch_result(model=action.model, action_kind="scale", response=response)
         if isinstance(action, HideAction):
@@ -188,11 +188,12 @@ class ActionQueue:
             return _dispatch_result(model=CLUSTER_MODEL, action_kind="defrag", response=response)
         return DispatchResult(model=model, action_kind="unknown", ok=False, error="unsupported_action")
 
-    async def _dispatch_binding_sleep(self, action: ScaleAction) -> DispatchResult:
-        # Sleep exactly the named bindings (safescale commit of the hidden pod, or a
-        # slot-targeted donor). Stops at the first failure.
+    async def _dispatch_binding_power(self, action: ScaleAction) -> DispatchResult:
+        # Sleep (delta < 0) or wake (delta > 0) exactly the named bindings: safescale
+        # commit of the hidden pod, slot-targeted donor, or a planned slot-aware wake.
+        # Stops at the first failure.
         for pod in action.pods:
-            response = await self._client.set_binding_power(pod, awake=False)
+            response = await self._client.set_binding_power(pod, awake=action.delta > 0)
             if not bool(response.get("ok", False)):
                 return _dispatch_result(model=action.model, action_kind="scale", response=response)
         return DispatchResult(model=action.model, action_kind="scale", ok=True)
@@ -234,8 +235,8 @@ def _action_direction(action: Action) -> str | None:
         return "up" if action.delta > 0 else "down" if action.delta < 0 else None
     if isinstance(action, HideAction):
         return "down"
-    if isinstance(action, UnhideAction):
-        return "up"
+    # UnhideAction (safescale rollback) restores capacity; it is not a scaling decision
+    # and must not hold a CRITICAL model in cooldown (review P2-4).
     return None
 
 

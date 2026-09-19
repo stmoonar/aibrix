@@ -235,7 +235,7 @@ def test_rescue_task_reads_action_cooldown_from_config() -> None:
     assert "cooldown_hold:critical" not in run(False)
 
 
-def test_action_queue_records_direction_per_model_on_success() -> None:
+def test_action_queue_records_direction_per_model_on_success_but_not_unhide() -> None:
     from tre_controller.planning.planner import DefragAction, HideAction, UnhideAction
 
     clock = _Clock(1_000)
@@ -246,4 +246,5 @@ def test_action_queue_records_direction_per_model_on_success() -> None:
     queue.submit([UnhideAction("b", ("b-1",), "slo_violation", "safescale")])
     asyncio.run(queue.drain_once())
 
-    assert queue.last_actions() == {"a": (1_000, "down"), "b": (2_000, "up")}
+    # Unhide (probe rollback) restores capacity and is not a cooldown-starting action.
+    assert queue.last_actions() == {"a": (1_000, "down")}

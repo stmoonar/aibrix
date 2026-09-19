@@ -221,7 +221,7 @@ def _run_rescue_once(*, probed: bool) -> list:
         ts_ms=1,
         stale=False,
         models={
-            "critical": _window("critical", generation=50.0, waiting=10.0, running=1.0, pods=1),
+            "critical": _window("critical", generation=50.0, waiting=10.0, running=1.0, pods=1),  # + sleeping critical-1 under donor-1
             "donor": _window("donor", generation=100_000.0, waiting=0.0, running=1.0, pods=3),
         },
     )
@@ -229,6 +229,7 @@ def _run_rescue_once(*, probed: bool) -> list:
         registry.topology(),
         (
             Binding("critical-0", "critical", Slot("node-a", (0,)), awake=True),
+            Binding("critical-1", "critical", Slot("node-a", (1,)), awake=False),
             Binding("donor-1", "donor", Slot("node-a", (1,)), awake=True),
             Binding("donor-2", "donor", Slot("node-a", (2,)), awake=True),
             Binding("donor-3", "donor", Slot("node-a", (3,)), awake=True),
