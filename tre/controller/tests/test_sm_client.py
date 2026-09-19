@@ -151,3 +151,15 @@ async def test_sm_client_defrag_keeps_unsupported_fallback_for_old_service_manag
     result = await client.defrag(())
 
     assert result == {"ok": False, "error": "defrag endpoint is not implemented in service-manager v2"}
+
+
+@pytest.mark.asyncio
+async def test_sm_client_set_binding_power_puts_binding_power_endpoint() -> None:
+    transport = FakeTransport(responses=[{"serve_id": "p1", "awake": False, "actions": [{"action": "sleep", "serve_id": "p1"}]}])
+    client = ServiceManagerClient("http://sm.local/", transport=transport, timeout_s=5.0, slow_timeout_s=300.0)
+
+    result = await client.set_binding_power("p1", awake=False)
+
+    assert result["ok"] is True
+    assert transport.calls == [("PUT", "http://sm.local/v2/bindings/p1/power", {"awake": False})]
+    assert transport.timeouts == [300.0]

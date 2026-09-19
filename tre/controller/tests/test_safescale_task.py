@@ -96,7 +96,7 @@ def test_safescale_observation_tick_submits_commit_actions_after_deadline() -> N
     assert committed.submitted == 2
     assert queue.submitted == [
         (
-            ScaleAction("donor", -1, "formal_commit_gate_passed", "safescale"),
+            ScaleAction("donor", -1, "formal_commit_gate_passed", "safescale", pods=("pod-a",)),
             ScaleAction("receiver", 1, "safescale_followup_upscale", "safescale"),
         )
     ]

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Callable, Protocol, Union
 
 if TYPE_CHECKING:
     from tre_controller.profiling import TickProfiler
@@ -24,6 +24,7 @@ from tre_controller.planning.planner import (
 from tre_controller.planning.safescale import SafeScaleCommand, SafeScaleDecision
 from tre_controller.signals.sources import get_signal, per_replica_token_rate
 from tre_controller.signals.trs import SignalState, TRSComputer, TRSInput
+from tre_sm.allocator.slots import natural_key
 
 
 class PlannerQueue(Protocol):
@@ -41,6 +42,19 @@ class SafeScaleController(Protocol):
         now_ms: int,
         pending_upscales: dict[str, int] | None = None,
     ) -> SafeScaleDecision: ...
+
+
+# A static set (tests) or a live provider read every tick (app wiring: the models the
+# SafeScaleStateMachine is currently probing), so planner donor paths exclude them.
+ActiveProbeModels = Union[set[str], Callable[[], set[str]], None]
+
+
+def resolve_active_probe_models(source: ActiveProbeModels) -> set[str]:
+    if source is None:
+        return set()
+    if callable(source):
+        return set(source())
+    return set(source)
 
 
 @dataclass(frozen=True)
@@ -144,7 +158,7 @@ def run_planner_tick(
         model_contexts=contexts,
         classifications=classifications,
         model_replicas=replicas,
-        idle_gpus=_idle_gpus(snapshot, registry),
+        idle_gpus=_idle_gpus(snapshot, registry, cluster_view),
         cfg=cfg,
         active_probe_models=active_probe_models or set(),
         inflight_models=queue.inflight_models(),
@@ -153,7 +167,9 @@ def run_planner_tick(
     if _prof_on:
         _plan_ns = time.perf_counter_ns() - _phase_t0
         _phase_t0 = time.perf_counter_ns()
-    actions, safescale_events = _apply_safescale(snapshot, tuple(plan.actions), plan.probe_upscale_plans, safescale=safescale)
+    actions, safescale_events = _apply_safescale(
+        snapshot, tuple(plan.actions), plan.probe_upscale_plans, safescale=safescale, cluster_view=cluster_view
+    )
     if _prof_on:
         _safescale_ns = time.perf_counter_ns() - _phase_t0
         _phase_t0 = time.perf_counter_ns()
@@ -195,6 +211,7 @@ def _apply_safescale(
     probe_upscale_plans: dict[str, dict[str, int]],
     *,
     safescale: SafeScaleController | None,
+    cluster_view: ClusterView | None = None,
 ) -> tuple[tuple[Action, ...], tuple[str, ...]]:
     if safescale is None:
         return actions, ()
@@ -207,7 +224,7 @@ def _apply_safescale(
             continue
 
         probe_model = _safescale_probe_model(action)
-        pods = _safescale_probe_pods(snapshot, action)
+        pods = _safescale_probe_pods(snapshot, action, cluster_view)
         decision = safescale.start_probe(
             model=probe_model,
             pods=pods,
@@ -234,10 +251,16 @@ def _safescale_probe_model(action: Action) -> str:
     return action.model
 
 
-def _safescale_probe_pods(snapshot: MetricsSnapshot, action: Action) -> tuple[str, ...]:
+def _safescale_probe_pods(
+    snapshot: MetricsSnapshot,
+    action: Action,
+    cluster_view: ClusterView | None = None,
+) -> tuple[str, ...]:
     if isinstance(action, ShrinkForSlotAction):
         return (action.serve_id,)
-    return _pods_to_probe(snapshot, action.model, abs(action.delta))
+    if isinstance(action, ScaleAction) and action.pods:
+        return tuple(action.pods)
+    return _pods_to_probe(snapshot, action.model, abs(action.delta), cluster_view=cluster_view)
 
 
 def _safescale_pending_upscales(
@@ -249,9 +272,30 @@ def _safescale_pending_upscales(
     return probe_upscale_plans.get(action.model, {})
 
 
-def _pods_to_probe(snapshot: MetricsSnapshot, model: str, count: int) -> tuple[str, ...]:
+def _pods_to_probe(
+    snapshot: MetricsSnapshot,
+    model: str,
+    count: int,
+    *,
+    cluster_view: ClusterView | None = None,
+) -> tuple[str, ...]:
+    if count <= 0:
+        return ()
+    if cluster_view is not None:
+        # Review F3: probe only serving bindings (awake and not already hidden). The
+        # metrics per_pod map also lists sleeping pods, which must never be "hidden" as
+        # a scale-down probe (it would remove no capacity and the commit would be a no-op).
+        pods = sorted(
+            (
+                binding.serve_id
+                for binding in cluster_view.bindings
+                if binding.model == model and binding.awake and not binding.hidden
+            ),
+            key=natural_key,
+        )
+        return tuple(pods[:count])
     metrics = snapshot.models.get(model)
-    if metrics is None or count <= 0:
+    if metrics is None:
         return ()
     if metrics.per_pod:
         pods = sorted({pod.pod for pod in metrics.per_pod.values() if pod.pod})
@@ -268,7 +312,8 @@ def _commands_to_actions(commands: tuple[SafeScaleCommand, ...], *, source_loop:
         elif command.kind == "unhide":
             actions.append(UnhideAction(command.model, command.pods, command.reason, source_loop))
         elif command.kind in {"scale_down", "scale_up"}:
-            actions.append(ScaleAction(command.model, command.delta, command.reason, source_loop))
+            pods = command.pods if command.kind == "scale_down" else ()
+            actions.append(ScaleAction(command.model, command.delta, command.reason, source_loop, pods=pods))
     return tuple(actions)
 
 
@@ -404,7 +449,27 @@ def _cluster_view_counts(cluster_view: ClusterView | None) -> dict[str, tuple[in
     return {model: (values[0], values[1]) for model, values in counts.items()}
 
 
-def _idle_gpus(snapshot: MetricsSnapshot, registry: Registry) -> int:
+def _idle_gpus(
+    snapshot: MetricsSnapshot,
+    registry: Registry,
+    cluster_view: ClusterView | None = None,
+) -> int:
+    if cluster_view is not None:
+        # GPUs with no awake binding (hidden-but-awake still occupies its GPU). The
+        # scrape-based count below treats every resident (sleeping) binding as free
+        # capacity, which is wrong under multi-model-per-GPU residency.
+        occupied = {
+            (binding.slot.node, gpu)
+            for binding in cluster_view.bindings
+            if binding.awake
+            for gpu in binding.slot.gpu_ids
+        }
+        return sum(
+            1
+            for node in cluster_view.topology.nodes
+            for gpu in range(node.gpus)
+            if (node.name, gpu) not in occupied
+        )
     total_gpus = sum(node.gpus for node in registry.topology().nodes)
     used_gpus = 0
     for model_name, metrics in snapshot.models.items():

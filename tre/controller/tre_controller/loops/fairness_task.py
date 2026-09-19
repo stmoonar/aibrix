@@ -6,7 +6,15 @@ from typing import Awaitable, Callable, Protocol
 
 from tre_common.metrics_schema import MetricsSnapshot
 from tre_common.registry import Registry
-from tre_controller.loops.tick import LoopTickResult, PaperStateCache, PlannerQueue, SafeScaleController, run_planner_tick
+from tre_controller.loops.tick import (
+    ActiveProbeModels,
+    LoopTickResult,
+    PaperStateCache,
+    PlannerQueue,
+    SafeScaleController,
+    resolve_active_probe_models,
+    run_planner_tick,
+)
 from tre_controller.planning.planner import ClusterView, IncompletePolicy
 from tre_controller.signals.trs import SignalState
 
@@ -77,7 +85,7 @@ async def fairness_task(
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     cluster_view: ClusterView | None = None,
     cluster_view_box: ClusterViewReader | None = None,
-    active_probe_models: set[str] | None = None,
+    active_probe_models: ActiveProbeModels = None,
     decision_writer: DecisionWriter | None = None,
     safescale: SafeScaleController | None = None,
     signal_state: SignalState | None = None,
@@ -96,7 +104,7 @@ async def fairness_task(
                     queue=queue,
                     registry=registry,
                     cluster_view=current_view,
-                    active_probe_models=active_probe_models,
+                    active_probe_models=resolve_active_probe_models(active_probe_models),
                     signal_source=getattr(cfg, "signal_source", "zm"),
                     signal_idle_rps_eps=getattr(cfg, "signal_idle_rps_eps", 0.05),
                     safescale=safescale,

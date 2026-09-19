@@ -77,7 +77,7 @@ class DecisionSnapshotWriter:
 
 def _action_to_dict(action: object) -> dict[str, Any]:
     if isinstance(action, ScaleAction):
-        return {
+        payload = {
             "kind": "scale",
             "model": action.model,
             "delta": action.delta,
@@ -87,6 +87,9 @@ def _action_to_dict(action: object) -> dict[str, Any]:
             "receiver": action.receiver,
             "donor": action.donor,
         }
+        if action.pods:
+            payload["pods"] = list(action.pods)
+        return payload
     if isinstance(action, HideAction):
         return {
             "kind": "hide",

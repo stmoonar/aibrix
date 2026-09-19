@@ -152,8 +152,17 @@ class SafeScaleStateMachine:
         return restored
 
     def _commit(self, probe: SafeScaleProbe, *, reason: str) -> SafeScaleDecision:
+        # Review F2/F3: commit sleeps exactly the hidden probe pods (binding-level power).
+        # A model-level scale_down(-n) let the SM pick the tail of `awake`, which could
+        # sleep a serving pod and leave the hidden one awake as an orphan.
         commands: list[SafeScaleCommand] = [
-            SafeScaleCommand(kind="scale_down", model=probe.model, delta=-len(probe.pods), reason=reason)
+            SafeScaleCommand(
+                kind="scale_down",
+                model=probe.model,
+                pods=probe.pods,
+                delta=-len(probe.pods),
+                reason=reason,
+            )
         ]
         for model, delta in sorted(probe.pending_upscales.items()):
             commands.append(

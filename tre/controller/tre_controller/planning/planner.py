@@ -51,6 +51,10 @@ class ScaleAction:
     requires_safescale: bool = False
     receiver: str | None = None
     donor: str | None = None
+    # Explicit binding identities (serve_id == pod name). For a negative delta the
+    # dispatcher sleeps exactly these bindings (binding-level power) instead of letting
+    # the SM pick the tail of the model; for a safescale probe they are the pods to hide.
+    pods: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -648,6 +652,7 @@ def _add_scale_action(
     requires_safescale: bool = False,
     receiver: str | None = None,
     donor: str | None = None,
+    pods: tuple[str, ...] = (),
 ) -> None:
     if delta == 0:
         return
@@ -661,6 +666,7 @@ def _add_scale_action(
             requires_safescale=requires_safescale,
             receiver=receiver,
             donor=donor,
+            pods=tuple(pods),
         )
     )
 

@@ -126,7 +126,7 @@ def test_safescale_commits_after_deadline_when_tail_is_healthy() -> None:
     assert decision.status == "commit"
     assert decision.reason == "formal_commit_gate_passed"
     assert decision.commands == (
-        SafeScaleCommand(kind="scale_down", model="donor", delta=-1, reason="formal_commit_gate_passed"),
+        SafeScaleCommand(kind="scale_down", model="donor", pods=("pod-a",), delta=-1, reason="formal_commit_gate_passed"),
         SafeScaleCommand(kind="scale_up", model="receiver", delta=1, reason="safescale_followup_upscale"),
     )
     assert machine.active_probe("donor") is not None
@@ -201,6 +201,7 @@ def test_safescale_restores_unresolved_probe_and_commits() -> None:
     assert decision.commands[0] == SafeScaleCommand(
         kind="scale_down",
         model="donor",
+        pods=("pod-a",),
         delta=-1,
         reason="formal_commit_gate_passed",
     )

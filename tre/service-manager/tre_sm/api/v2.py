@@ -262,8 +262,23 @@ class ServiceManagerV2:
         awake = [binding for binding in model_bindings if binding.awake]
         planning = {binding.serve_id: binding for binding in bindings}
         if len(awake) >= wake_replicas:
-            sleeping = list(reversed(awake[wake_replicas:]))
-            target = awake[:wake_replicas]
+            # Review F2: when shrinking, sleep hidden (safescale-probed, unroutable)
+            # bindings first so a serving pod is never slept while the hidden one stays
+            # awake as an orphan. Without hidden bindings this is exactly the legacy
+            # "sleep the tail of awake" order.
+            shrink = len(awake) - wake_replicas
+            hidden = sorted(
+                (binding for binding in awake if binding.hidden),
+                key=lambda item: _natural_key(item.serve_id),
+            )
+            candidates = hidden + [
+                binding for binding in reversed(awake) if not binding.hidden
+            ]
+            sleeping = candidates[:shrink]
+            sleeping_ids = {binding.serve_id for binding in sleeping}
+            target = [
+                binding for binding in awake if binding.serve_id not in sleeping_ids
+            ]
             return {
                 "sleep": sleeping,
                 "wake": [],
@@ -338,8 +353,13 @@ class ServiceManagerV2:
         if binding is None:
             raise ValueError(f"unknown binding: {serve_id}")
 
+        intent: dict[str, object] = {"power": "awake" if awake else "sleeping"}
+        if not awake:
+            # Sleeping clears the hidden flag in the legacy store below; keep the
+            # desired state consistent (a safescale commit sleeps a hidden binding).
+            intent["hidden"] = False
         self._update_desired(
-            {binding.binding_id: {"power": "awake" if awake else "sleeping"}},
+            {binding.binding_id: intent},
             updated_by="service-manager-api",
             reason="binding_power_request",
         )

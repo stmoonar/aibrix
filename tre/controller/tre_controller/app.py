@@ -80,6 +80,7 @@ def build_controller_task_specs(
                     registry=deps.registry,
                     cfg=cfg,
                     cluster_view_box=deps.cluster_view_box,
+                    active_probe_models=lambda: _active_probe_models(deps.safescale),
                     decision_writer=deps.decision_writer,
                     safescale=deps.safescale,
                     signal_state=deps.signal_state,
@@ -96,6 +97,7 @@ def build_controller_task_specs(
                 registry=deps.registry,
                 cfg=cfg,
                 cluster_view_box=deps.cluster_view_box,
+                active_probe_models=lambda: _active_probe_models(deps.safescale),
                 decision_writer=deps.decision_writer,
                 safescale=deps.safescale,
                 signal_state=deps.signal_state,
@@ -129,6 +131,12 @@ def build_controller_task_specs(
             )
         )
     return tuple(specs)
+
+
+def _active_probe_models(safescale: SafeScaleStateMachine) -> set[str]:
+    # Live read each tick: models with an unresolved safescale probe (hidden pod) must
+    # not be picked as planner donors (review F3).
+    return {probe.model for probe in safescale.active_probes()}
 
 
 def create_controller_dependencies(

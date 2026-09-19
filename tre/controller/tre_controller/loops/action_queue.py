@@ -19,6 +19,8 @@ class ServiceManagerClient(Protocol):
 
     async def set_routable(self, model: str, hidden_pods: tuple[str, ...]) -> dict: ...
 
+    async def set_binding_power(self, serve_id: str, *, awake: bool) -> dict: ...
+
     async def defrag(self, migrations: tuple) -> dict: ...
 
 
@@ -163,6 +165,8 @@ class ActionQueue:
 
     async def _dispatch(self, action: Action, model: str) -> DispatchResult:
         if isinstance(action, ScaleAction):
+            if action.delta < 0 and action.pods:
+                return await self._dispatch_binding_sleep(action)
             response = await self._client.scale_model(action.model, action.delta)
             return _dispatch_result(model=action.model, action_kind="scale", response=response)
         if isinstance(action, HideAction):
@@ -175,6 +179,15 @@ class ActionQueue:
             response = await self._client.defrag(tuple(action.migrations))
             return _dispatch_result(model=CLUSTER_MODEL, action_kind="defrag", response=response)
         return DispatchResult(model=model, action_kind="unknown", ok=False, error="unsupported_action")
+
+    async def _dispatch_binding_sleep(self, action: ScaleAction) -> DispatchResult:
+        # Sleep exactly the named bindings (safescale commit of the hidden pod, or a
+        # slot-targeted donor). Stops at the first failure.
+        for pod in action.pods:
+            response = await self._client.set_binding_power(pod, awake=False)
+            if not bool(response.get("ok", False)):
+                return _dispatch_result(model=action.model, action_kind="scale", response=response)
+        return DispatchResult(model=action.model, action_kind="scale", ok=True)
 
     def _has_pending_model(self, model: str) -> bool:
         return any(item.model == model for item in self._pending)

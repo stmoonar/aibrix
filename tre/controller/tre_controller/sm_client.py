@@ -61,6 +61,20 @@ class ServiceManagerClient:
         except ServiceManagerError as exc:
             return {"ok": False, "error": str(exc)}
 
+    async def set_binding_power(self, serve_id: str, *, awake: bool) -> dict:
+        # Binding-level power (PUT /v2/bindings/{serve_id}/power): used to sleep exactly
+        # one chosen binding (safescale commit of the hidden pod, slot-targeted donor).
+        try:
+            response = await self._request(
+                "PUT",
+                f"/v2/bindings/{serve_id}/power",
+                json={"awake": bool(awake)},
+                timeout_s=self._slow_timeout_s,
+            )
+            return {"ok": True, "response": response}
+        except ServiceManagerError as exc:
+            return {"ok": False, "error": str(exc)}
+
     async def set_routable(self, model: str, hidden_pods: tuple[str, ...]) -> dict:
         try:
             response = await self._request(

@@ -1258,3 +1258,67 @@ def test_v2_put_target_allows_runtime_create_without_truth_when_not_required():
         assert "headroom-gate-passed" in str(exc)
     else:
         raise AssertionError("expected the create path to be reached")
+
+
+def test_v2_put_target_shrink_sleeps_hidden_binding_first():
+    store = StateStore(FakeRedis())
+    store.save(
+        [
+            Binding("serve-a", "m1", Slot("node-a", (0,)), awake=True, hidden=True),
+            Binding("serve-b", "m1", Slot("node-a", (1,)), awake=True),
+        ],
+        expected_version=0,
+    )
+    service = ServiceManagerV2(registry(), store)
+
+    result = service.put_model_target("m1", wake_replicas=1)
+
+    # Legacy order would sleep the tail (serve-b, a serving pod) and leave the hidden
+    # safescale pod awake as an orphan.
+    assert result["actions"] == [{"action": "sleep", "serve_id": "serve-a"}]
+    assert store.load().bindings == [
+        Binding("serve-a", "m1", Slot("node-a", (0,)), awake=False, hidden=False),
+        Binding("serve-b", "m1", Slot("node-a", (1,)), awake=True),
+    ]
+
+
+def test_v2_put_target_shrink_without_hidden_keeps_tail_order():
+    store = StateStore(FakeRedis())
+    store.save(
+        [
+            Binding("serve-a", "m1", Slot("node-a", (0,)), awake=True),
+            Binding("serve-b", "m1", Slot("node-a", (1,)), awake=True),
+        ],
+        expected_version=0,
+    )
+    service = ServiceManagerV2(registry(), store)
+
+    result = service.put_model_target("m1", wake_replicas=1)
+
+    assert result["actions"] == [{"action": "sleep", "serve_id": "serve-b"}]
+
+
+def test_v2_put_binding_power_sleep_clears_desired_hidden():
+    hidden = Binding("serve-a", "m1", Slot("node-a", (0,)), awake=True, hidden=True)
+    store = StateStore(FakeRedis())
+    store.save([hidden], expected_version=0)
+
+    class FleetStore:
+        def __init__(self):
+            self.snapshot = DesiredSnapshot(1, [DesiredBinding.from_binding(hidden)])
+
+        def load_desired(self):
+            return self.snapshot
+
+        def save_desired(self, bindings, *, expected_version):
+            self.snapshot = DesiredSnapshot(expected_version + 1, list(bindings))
+            return expected_version + 1
+
+    fleet = FleetStore()
+    service = ServiceManagerV2(registry(), store, fleet_store=fleet)
+
+    service.put_binding_power("serve-a", awake=False)
+
+    assert store.load().bindings == [Binding("serve-a", "m1", Slot("node-a", (0,)), awake=False, hidden=False)]
+    desired = fleet.load_desired().bindings[0]
+    assert (desired.power, desired.hidden) == ("sleeping", False)
