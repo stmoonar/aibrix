@@ -54,6 +54,7 @@ class ActionQueue:
         *,
         is_observe: Callable[[], bool] | None = None,
         prof: "TickProfiler | None" = None,
+        now_ms: Callable[[], int] | None = None,
     ) -> None:
         self._client = client
         self._pending: deque[QueuedAction] = deque()
@@ -62,6 +63,9 @@ class ActionQueue:
         # (inflight cleared, so the next tick can re-plan) but NEVER dispatched.
         self._is_observe = is_observe or (lambda: False)
         self._prof = prof
+        # Review F4: model -> (epoch ms the last successful dispatch completed, "up"/"down").
+        self._now_ms = now_ms or (lambda: int(time.time() * 1000))
+        self._last_done: dict[str, tuple[int, str]] = {}
 
     def submit(self, actions: tuple[Action, ...] | list[Action]) -> SubmitResult:
         queued_actions = tuple(_queued_action(action) for action in actions)
@@ -112,6 +116,9 @@ class ActionQueue:
     def inflight_models(self) -> set[str]:
         return set(self._inflight)
 
+    def last_actions(self) -> dict[str, tuple[int, str]]:
+        return dict(self._last_done)
+
     async def run(
         self,
         *,
@@ -150,6 +157,7 @@ class ActionQueue:
                     _dispatched += 1
                 else:
                     results.append(await self._dispatch(queued.action, queued.model))
+                self._record_done(queued, results[-1])
             self._inflight.discard(queued.model)
         self._pending = held
         if _prof_on and _dispatched:
@@ -189,6 +197,11 @@ class ActionQueue:
                 return _dispatch_result(model=action.model, action_kind="scale", response=response)
         return DispatchResult(model=action.model, action_kind="scale", ok=True)
 
+    def _record_done(self, queued: QueuedAction, result: DispatchResult) -> None:
+        direction = _action_direction(queued.action)
+        if result.ok and direction is not None:
+            self._last_done[queued.model] = (int(self._now_ms()), direction)
+
     def _has_pending_model(self, model: str) -> bool:
         return any(item.model == model for item in self._pending)
 
@@ -214,6 +227,16 @@ def _action_kind(action: Action) -> str:
     if isinstance(action, DefragAction):
         return "defrag"
     return "unknown"
+
+
+def _action_direction(action: Action) -> str | None:
+    if isinstance(action, ScaleAction):
+        return "up" if action.delta > 0 else "down" if action.delta < 0 else None
+    if isinstance(action, HideAction):
+        return "down"
+    if isinstance(action, UnhideAction):
+        return "up"
+    return None
 
 
 def _queued_action(action: Action) -> QueuedAction:

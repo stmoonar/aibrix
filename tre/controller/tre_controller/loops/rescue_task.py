@@ -54,6 +54,7 @@ def run_rescue_tick(
     suppress_hot_proactive_probe: bool = True,
     disable_eta_gate: bool = False,
     prof: "TickProfiler | None" = None,
+    action_cooldown: bool = False,
 ) -> LoopTickResult:
     return run_planner_tick(
         snapshot,
@@ -73,6 +74,7 @@ def run_rescue_tick(
         disable_eta_gate=disable_eta_gate,
         prof=prof,
         loop="rescue",
+        action_cooldown=action_cooldown,
     )
 
 
@@ -114,6 +116,7 @@ async def rescue_task(
                     suppress_hot_proactive_probe=getattr(cfg, "safescale_suppress_hot_proactive", True),
                     disable_eta_gate=getattr(cfg, "disable_eta_gate", False),
                     prof=prof,
+                    action_cooldown=getattr(cfg, "action_cooldown", True),
                 )
             if decision_writer is not None:
                 if prof is not None:

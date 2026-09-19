@@ -75,6 +75,9 @@ class ControllerConfig:
     # TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE=0 to restore the legacy proactive-release path.
     safescale_suppress_hot_proactive: bool
     proactive_release_min_trs: float
+    # Review F4: per-model action cooldown (hold a model's next action until a metrics
+    # window starting after its last executed action). TRE_ACTION_COOLDOWN=0 disables.
+    action_cooldown: bool
     # Opt-in control-loop profiling (research toggle, off by default). When
     # profile_enabled is False the profiler object is None everywhere (zero overhead).
     profile_enabled: bool
@@ -207,6 +210,7 @@ class ControllerConfig:
                 values, "TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE", True
             ),
             proactive_release_min_trs=_get_positive_float(values, "PROACTIVE_RELEASE_MIN_TRS", 2000.0),
+            action_cooldown=_get_bool(values, "TRE_ACTION_COOLDOWN", True),
             profile_enabled=_get_bool(values, "TRE_PROFILE", False),
             profile_stream_maxlen=_get_positive_int(values, "TRE_PROFILE_STREAM_MAXLEN", 200_000),
             profile_proc_sample_interval_s=_get_positive_float(

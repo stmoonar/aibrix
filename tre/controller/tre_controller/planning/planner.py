@@ -112,6 +112,7 @@ def build_plan(
     active_probe_models: set[str] | None = None,
     inflight_models: set[str] | None = None,
     cluster_view: ClusterView | None = None,
+    cooldowns: Mapping[str, str] | None = None,
 ) -> PlanResult:
     active_probe_models = active_probe_models or set()
     inflight_models = inflight_models or set()
@@ -125,6 +126,9 @@ def build_plan(
     # Sleeping-capacity deadlock fix: GPU-slot occupancy so a receiver's sleeping binding
     # only counts as wakeable capacity when its slot has no awake binding (of any model).
     occupancy = _SlotOccupancy(cluster_view) if cluster_view is not None else None
+    # Review F4 per-model cooldown: model -> direction ("up"/"down") of its last executed
+    # action whose effect the decision window does not yet fully reflect.
+    cooldown = _Cooldown(cooldowns or {}, events)
 
     incomplete_models = _paper_state_incomplete_models(classifications)
     if not classifications or (incomplete_models and cfg.incomplete_policy == "drop_all"):
@@ -180,6 +184,8 @@ def build_plan(
         for recv in critical_receivers:
             if recv.model_name in inflight_models:
                 continue
+            if cooldown.blocks(recv.model_name, "up", critical=True):
+                continue
             recv_pods = _effective_routable_replicas(recv.model_name, model_contexts, model_replicas)
             recv_assigned = _effective_assigned_replicas(recv.model_name, model_contexts, model_replicas)
             recv_max = _max_replicas(cfg, recv.model_name)
@@ -221,7 +227,7 @@ def build_plan(
                     cluster_view=cluster_view,
                     receiver=recv.model_name,
                     active_probe_models=active_probe_models,
-                    inflight_models=inflight_models,
+                    inflight_models=inflight_models | cooldown.down_blocked(),
                     source_loop="rescue",
                 )
                 if same_slot_shrink is not None:
@@ -282,6 +288,8 @@ def build_plan(
                     or donor.state not in (ModelState.IDLE, ModelState.HIGH)
                 ):
                     continue
+                if cooldown.blocks(donor.model_name, "down"):
+                    continue
                 donor_pods = _effective_routable_replicas(donor.model_name, model_contexts, model_replicas)
                 donor_min = _min_replicas(cfg, donor.model_name)
                 if donor_pods <= donor_min:
@@ -329,6 +337,8 @@ def build_plan(
                     or middle.model_name in inflight_models
                 ):
                     continue
+                if cooldown.blocks(middle.model_name, "down"):
+                    continue
                 middle_pods = _effective_routable_replicas(middle.model_name, model_contexts, model_replicas)
                 middle_min = _min_replicas(cfg, middle.model_name)
                 if middle_pods <= middle_min:
@@ -366,6 +376,8 @@ def build_plan(
                 continue
             if deltas.get(idle.model_name, 0) != 0:
                 continue
+            if cooldown.blocks(idle.model_name, "down"):
+                continue
             pods = _effective_routable_replicas(idle.model_name, model_contexts, model_replicas)
             idle_min = _serving_floor(cfg, idle.model_name, model_contexts, model_replicas)
             if pods <= idle_min:
@@ -388,6 +400,8 @@ def build_plan(
             if high.model_name in active_probe_models or high.model_name in inflight_models:
                 continue
             if deltas.get(high.model_name, 0) != 0:
+                continue
+            if cooldown.blocks(high.model_name, "down"):
                 continue
             pods = _effective_routable_replicas(high.model_name, model_contexts, model_replicas)
             high_min = _serving_floor(cfg, high.model_name, model_contexts, model_replicas)
@@ -421,6 +435,8 @@ def build_plan(
 
     for recv in low_receivers:
         if recv.model_name in inflight_models:
+            continue
+        if cooldown.blocks(recv.model_name, "up"):
             continue
         recv_pods = _effective_routable_replicas(recv.model_name, model_contexts, model_replicas)
         recv_assigned = _effective_assigned_replicas(recv.model_name, model_contexts, model_replicas)
@@ -479,6 +495,8 @@ def build_plan(
                 or donor.state not in (ModelState.IDLE, ModelState.HIGH)
             ):
                 continue
+            if cooldown.blocks(donor.model_name, "down"):
+                continue
             donor_pods = _effective_routable_replicas(donor.model_name, model_contexts, model_replicas)
             donor_min = _min_replicas(cfg, donor.model_name)
             if donor_pods <= donor_min:
@@ -532,6 +550,8 @@ def build_plan(
                 break
             if middle.model_name == recv.model_name or middle.model_name in active_probe_models or middle.model_name in inflight_models:
                 continue
+            if cooldown.blocks(middle.model_name, "down"):
+                continue
             donor_pods = _effective_routable_replicas(middle.model_name, model_contexts, model_replicas)
             donor_min = _min_replicas(cfg, middle.model_name)
             if donor_pods <= donor_min:
@@ -575,6 +595,30 @@ def build_plan(
             needed -= transfer
 
     return PlanResult(actions, delayed_down_models, probe_upscale_plans, events=events)
+
+
+class _Cooldown:
+    """Review F4: hold a model's next action until a fresh metrics window reflects its
+    last executed one. Same direction is held; after a scale-up a scale-down is held too;
+    after a scale-down a scale-up is allowed only for a CRITICAL receiver (safety)."""
+
+    def __init__(self, cooldowns: Mapping[str, str], events: list[str]) -> None:
+        self._cooldowns = dict(cooldowns)
+        self._events = events
+
+    def blocks(self, model: str, direction: str, *, critical: bool = False) -> bool:
+        last = self._cooldowns.get(model)
+        if last is None:
+            return False
+        if direction == "up" and last == "down" and critical:
+            return False
+        event = f"cooldown_hold:{model}"
+        if event not in self._events:
+            self._events.append(event)
+        return True
+
+    def down_blocked(self) -> set[str]:
+        return set(self._cooldowns)
 
 
 class _SlotOccupancy:

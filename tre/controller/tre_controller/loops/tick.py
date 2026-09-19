@@ -117,6 +117,7 @@ def run_planner_tick(
     disable_eta_gate: bool = False,
     prof: "TickProfiler | None" = None,
     loop: str = "tick",
+    action_cooldown: bool = False,
 ) -> LoopTickResult:
     if snapshot.stale:
         return LoopTickResult(submitted=0, events=("snapshot_stale",))
@@ -163,6 +164,7 @@ def run_planner_tick(
         active_probe_models=active_probe_models or set(),
         inflight_models=queue.inflight_models(),
         cluster_view=cluster_view,
+        cooldowns=_action_cooldowns(snapshot, queue) if action_cooldown else None,
     )
     if _prof_on:
         _plan_ns = time.perf_counter_ns() - _phase_t0
@@ -203,6 +205,20 @@ def run_planner_tick(
         model_contexts=contexts,
         classifications={item.model_name: item for item in classifications},
     )
+
+
+def _action_cooldowns(snapshot: MetricsSnapshot, queue: PlannerQueue) -> dict[str, str]:
+    """Models whose decision window starts before their last executed action completed
+    (the window does not yet fully reflect it) -> direction of that action."""
+    last_actions = getattr(queue, "last_actions", None)
+    if last_actions is None:
+        return {}
+    cooldowns: dict[str, str] = {}
+    for model, (done_ms, direction) in last_actions().items():
+        metrics = snapshot.models.get(model)
+        if metrics is not None and metrics.window_start_ms < done_ms:
+            cooldowns[model] = direction
+    return cooldowns
 
 
 def _apply_safescale(
