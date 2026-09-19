@@ -6,7 +6,7 @@ from typing import Any, Literal, Mapping
 
 from tre_common.registry import ClusterTopology
 from tre_controller.planning.classify import ModelClassification, ModelRole, ModelState, donor_mock_cost_key
-from tre_sm.allocator.slots import Binding, Slot, SlotAllocator
+from tre_sm.allocator.slots import Binding, Slot, SlotAllocator, natural_key
 
 SourceLoop = Literal["rescue", "fairness", "safescale"]
 IncompletePolicy = Literal["drop_model", "drop_all"]
@@ -122,6 +122,9 @@ def build_plan(
     events: list[str] = []
     remaining_idle = idle_gpus
     slot_shrink_donors: set[str] = set()
+    # Sleeping-capacity deadlock fix: GPU-slot occupancy so a receiver's sleeping binding
+    # only counts as wakeable capacity when its slot has no awake binding (of any model).
+    occupancy = _SlotOccupancy(cluster_view) if cluster_view is not None else None
 
     incomplete_models = _paper_state_incomplete_models(classifications)
     if not classifications or (incomplete_models and cfg.incomplete_policy == "drop_all"):
@@ -186,7 +189,14 @@ def build_plan(
             if raw_need <= 0:
                 continue
 
-            gain_from_sleeping = min(raw_need, max(0, recv_assigned - recv_pods))
+            gain_from_sleeping, freed_idle = _plan_sleeping_wakes(
+                occupancy,
+                receiver=recv.model_name,
+                need=min(raw_need, max(0, recv_assigned - recv_pods)),
+                events=events,
+                blocked_event="critical_sleeping_blocked",
+            )
+            remaining_idle = max(0, remaining_idle - freed_idle)
             if gain_from_sleeping > 0:
                 _add_scale_action(
                     actions,
@@ -262,7 +272,7 @@ def build_plan(
                 remaining_idle -= gain_from_idle
 
             still_needed = raw_need - gain_from_idle
-            for donor in paper_donors:
+            for donor in _slot_matched_first(paper_donors, occupancy, recv.model_name):
                 if still_needed <= 0:
                     break
                 if (
@@ -284,6 +294,9 @@ def build_plan(
                 )
                 if transfer <= 0:
                     continue
+                transfer, donor_slot_pods = _slot_targeted_transfer(
+                    occupancy, donor=donor.model_name, receiver=recv.model_name, transfer=transfer
+                )
                 _add_scale_action(
                     actions,
                     deltas,
@@ -293,6 +306,7 @@ def build_plan(
                     source_loop="rescue",
                     donor=donor.model_name,
                     receiver=recv.model_name,
+                    pods=donor_slot_pods,
                 )
                 _add_scale_action(
                     actions,
@@ -306,7 +320,7 @@ def build_plan(
                 )
                 still_needed -= transfer
 
-            for middle in middle_zone:
+            for middle in _slot_matched_first(middle_zone, occupancy, recv.model_name):
                 if still_needed <= 0:
                     break
                 if (
@@ -327,6 +341,9 @@ def build_plan(
                 )
                 if transfer <= 0:
                     continue
+                transfer, middle_slot_pods = _slot_targeted_transfer(
+                    occupancy, donor=middle.model_name, receiver=recv.model_name, transfer=transfer
+                )
                 _add_scale_action(
                     actions,
                     deltas,
@@ -337,6 +354,7 @@ def build_plan(
                     requires_safescale=True,
                     donor=middle.model_name,
                     receiver=recv.model_name,
+                    pods=middle_slot_pods,
                 )
                 delayed_down_models.add(middle.model_name)
                 pending = probe_upscale_plans.setdefault(middle.model_name, {})
@@ -411,7 +429,14 @@ def build_plan(
             continue
         needed = min(_scale_step(recv_pods, cfg.scale_step_ratio), receiver_capacity)
 
-        sleeping_gain = min(needed, max(0, recv_assigned - recv_pods))
+        sleeping_gain, freed_idle = _plan_sleeping_wakes(
+            occupancy,
+            receiver=recv.model_name,
+            need=min(needed, max(0, recv_assigned - recv_pods)),
+            events=events,
+            blocked_event="low_fairness_sleeping_blocked",
+        )
+        remaining_idle = max(0, remaining_idle - freed_idle)
         if sleeping_gain > 0:
             _add_scale_action(
                 actions,
@@ -444,7 +469,7 @@ def build_plan(
         # former saturation gate (emit "fairness_blocked_unsaturated" unless Q_ctl >= qsat)
         # was removed -- a non-saturated LOW/CRITICAL receiver now receives donor surplus.
 
-        for donor in paper_donors:
+        for donor in _slot_matched_first(paper_donors, occupancy, recv.model_name):
             if needed <= 0:
                 break
             if (
@@ -476,6 +501,9 @@ def build_plan(
             )
             if transfer <= 0:
                 continue
+            transfer, donor_slot_pods = _slot_targeted_transfer(
+                occupancy, donor=donor.model_name, receiver=recv.model_name, transfer=transfer
+            )
             _add_scale_action(
                 actions,
                 deltas,
@@ -485,6 +513,7 @@ def build_plan(
                 source_loop="fairness",
                 donor=donor.model_name,
                 receiver=recv.model_name,
+                pods=donor_slot_pods,
             )
             _add_scale_action(
                 actions,
@@ -498,7 +527,7 @@ def build_plan(
             )
             needed -= transfer
 
-        for middle in middle_zone:
+        for middle in _slot_matched_first(middle_zone, occupancy, recv.model_name):
             if needed <= 0:
                 break
             if middle.model_name == recv.model_name or middle.model_name in active_probe_models or middle.model_name in inflight_models:
@@ -525,6 +554,9 @@ def build_plan(
             )
             if transfer <= 0:
                 continue
+            transfer, middle_slot_pods = _slot_targeted_transfer(
+                occupancy, donor=middle.model_name, receiver=recv.model_name, transfer=transfer
+            )
             _add_scale_action(
                 actions,
                 deltas,
@@ -535,6 +567,7 @@ def build_plan(
                 requires_safescale=True,
                 donor=middle.model_name,
                 receiver=recv.model_name,
+                pods=middle_slot_pods,
             )
             delayed_down_models.add(middle.model_name)
             pending = probe_upscale_plans.setdefault(middle.model_name, {})
@@ -542,6 +575,127 @@ def build_plan(
             needed -= transfer
 
     return PlanResult(actions, delayed_down_models, probe_upscale_plans, events=events)
+
+
+class _SlotOccupancy:
+    """GPU-slot occupancy for wake planning within one build_plan call.
+
+    Under multi-model-per-GPU residency a receiver's sleeping binding is only real
+    capacity when no other binding is awake on its GPU(s); the SM rejects any other wake
+    with WakeConflict (the E1 dsllama-8b deadlock). Slots claimed by a planned wake (or
+    freed by a planned slot-targeted donor sleep) are not counted twice in one tick.
+    """
+
+    def __init__(self, cluster_view: ClusterView) -> None:
+        self._bindings = tuple(cluster_view.bindings)
+        self._awake: dict[tuple[str, int], Binding] = {}
+        for binding in self._bindings:
+            if binding.awake:
+                for gpu in binding.slot.gpu_ids:
+                    self._awake[(binding.slot.node, gpu)] = binding
+        self._claimed: set[tuple[str, int]] = set()
+
+    @staticmethod
+    def _gpus(binding: Binding) -> set[tuple[str, int]]:
+        return {(binding.slot.node, gpu) for gpu in binding.slot.gpu_ids}
+
+    def sleeping(self, model: str) -> list[Binding]:
+        return sorted(
+            (
+                binding
+                for binding in self._bindings
+                if binding.model == model and not binding.awake and not binding.hidden
+            ),
+            key=lambda binding: natural_key(binding.serve_id),
+        )
+
+    def wakeable(self, model: str) -> list[Binding]:
+        return [
+            binding
+            for binding in self.sleeping(model)
+            if not any(gpu in self._awake or gpu in self._claimed for gpu in self._gpus(binding))
+        ]
+
+    def claim(self, binding: Binding) -> None:
+        self._claimed |= self._gpus(binding)
+
+    def donor_slot_pods(self, donor: str, receiver: str) -> list[tuple[str, Binding]]:
+        """(donor serve_id, receiver sleeping binding) pairs: sleeping that single awake
+        donor binding frees exactly a slot the receiver can wake into."""
+        pairs: list[tuple[str, Binding]] = []
+        used: set[str] = set()
+        for receiver_binding in self.sleeping(receiver):
+            gpus = self._gpus(receiver_binding)
+            if any(gpu in self._claimed for gpu in gpus):
+                continue
+            occupants = {self._awake[gpu] for gpu in gpus if gpu in self._awake}
+            if len(occupants) != 1:
+                continue
+            occupant = next(iter(occupants))
+            if occupant.model != donor or occupant.hidden or occupant.serve_id in used:
+                continue
+            used.add(occupant.serve_id)
+            pairs.append((occupant.serve_id, receiver_binding))
+        return pairs
+
+
+def _plan_sleeping_wakes(
+    occupancy: _SlotOccupancy | None,
+    *,
+    receiver: str,
+    need: int,
+    events: list[str],
+    blocked_event: str,
+) -> tuple[int, int]:
+    """Return (replicas wakeable from sleeping bindings, idle GPUs they consume).
+
+    Without a cluster view this is the legacy count (every sleeping binding counts)."""
+    need = max(0, need)
+    if occupancy is None or need <= 0:
+        return need, 0
+    wakeable = occupancy.wakeable(receiver)[:need]
+    freed_idle = 0
+    for binding in wakeable:
+        occupancy.claim(binding)
+        freed_idle += len(binding.slot.gpu_ids)
+    if len(wakeable) < need:
+        events.append(f"{blocked_event}:{receiver}")
+    return len(wakeable), freed_idle
+
+
+def _slot_matched_first(
+    candidates: list[ModelClassification],
+    occupancy: _SlotOccupancy | None,
+    receiver: str,
+) -> list[ModelClassification]:
+    """Stable re-order: donors whose awake binding sits on a receiver-sleeping slot first."""
+    if occupancy is None or not occupancy.sleeping(receiver):
+        return candidates
+    return sorted(
+        candidates,
+        key=lambda item: 0 if occupancy.donor_slot_pods(item.model_name, receiver) else 1,
+    )
+
+
+def _slot_targeted_transfer(
+    occupancy: _SlotOccupancy | None,
+    *,
+    donor: str,
+    receiver: str,
+    transfer: int,
+) -> tuple[int, tuple[str, ...]]:
+    """Pin a donor shrink to the bindings that free receiver-sleeping slots.
+
+    Returns the (possibly reduced) transfer and the donor pods to sleep/probe. Without a
+    slot match the legacy model-level shrink is kept (no pods)."""
+    if occupancy is None:
+        return transfer, ()
+    pairs = occupancy.donor_slot_pods(donor, receiver)[:transfer]
+    if not pairs:
+        return transfer, ()
+    for _, receiver_binding in pairs:
+        occupancy.claim(receiver_binding)
+    return len(pairs), tuple(pod for pod, _ in pairs)
 
 
 def _try_plan_same_slot_high_shrink(
