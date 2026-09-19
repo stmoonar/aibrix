@@ -76,6 +76,10 @@ class ModelSpec:
     trs: TrsParams
     vllm_extra_args: tuple[str, ...] = ()
     alt_thresholds: dict[str, AltThreshold] = field(default_factory=dict)
+    # Utilisation-gated scale-down (TRE_UTIL_SCALE_DOWN): max per-replica in-flight load
+    # (avg_running + avg_waiting) after removing one replica. Optional; None -> controller
+    # default. Registry key: models[].scale_down_q_per_replica.
+    scale_down_q_per_replica: float | None = None
 
 
 class Registry:
@@ -111,6 +115,10 @@ class Registry:
                 errors.append(f"model {model.name}: min_replicas must be non-negative")
             if model.max_replicas < model.min_replicas:
                 errors.append(f"model {model.name}: max_replicas below min_replicas")
+            if model.scale_down_q_per_replica is not None and not (
+                math.isfinite(model.scale_down_q_per_replica) and model.scale_down_q_per_replica > 0.0
+            ):
+                errors.append(f"model {model.name}: scale_down_q_per_replica must be positive")
             for signal, threshold in model.alt_thresholds.items():
                 if not math.isfinite(threshold.theta) or threshold.theta <= 0.0:
                     errors.append(f"model {model.name}: alt_thresholds.{signal}.theta must be positive")
@@ -207,4 +215,9 @@ def _parse_model(raw: dict[str, Any]) -> ModelSpec:
             )
             for signal, values in (raw.get("alt_thresholds") or {}).items()
         },
+        scale_down_q_per_replica=(
+            float(raw["scale_down_q_per_replica"])
+            if raw.get("scale_down_q_per_replica") is not None
+            else None
+        ),
     )
