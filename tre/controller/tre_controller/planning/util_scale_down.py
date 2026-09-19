@@ -9,6 +9,11 @@ path uses the per-replica load *after* removing one replica instead:
 Q_raw is deliberately the unweighted in-flight count (not the lambda_wait-weighted TRS
 queue Q_ctl): the per-model defaults were derived from R3 single-replica sweeps binned on
 exactly avg_running + avg_waiting (see deploy/registry.yaml scale_down_q_per_replica).
+
+HIGH models are eligible on purpose (HIGH is the common state of a lightly loaded
+model); the non-rising-load condition is the spike guard. TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE
+governs only the Z_m-driven high_proactive_safescale path, NOT this one: ablations that
+must not shrink receiver-less have to set TRE_UTIL_SCALE_DOWN explicitly.
 """
 from __future__ import annotations
 

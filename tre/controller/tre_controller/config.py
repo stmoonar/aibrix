@@ -83,6 +83,9 @@ class ControllerConfig:
     # TRE_UTIL_SCALE_DOWN (default on), TRE_UTIL_SCALE_DOWN_WINDOWS (distinct metrics
     # windows, default 6 ~= 30s at the 5s refresh), TRE_UTIL_SCALE_DOWN_Q_PER_REPLICA
     # ("2.5" or "model=v,..."; overrides the registry scale_down_q_per_replica).
+    # Independent of TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE (which gates only the Z_m
+    # high_proactive_safescale path); HIGH models are eligible here. Ablations must set
+    # TRE_UTIL_SCALE_DOWN explicitly.
     util_scale_down: bool
     util_scale_down_windows: int
     util_scale_down_q_per_replica: dict[str, float]
