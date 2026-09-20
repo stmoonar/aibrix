@@ -16,6 +16,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from tre_replayer.engine.prompts import MODE_TOKEN_IDS, build_prompt
 from tre_replayer.engine.schedule import ScheduledRequest
 
 
@@ -49,6 +50,7 @@ class StreamingHttpSender:
         input_tokens_default: int = 64,
         output_tokens_default: int = 128,
         max_in_flight: int = 512,
+        prompt_mode: str = MODE_TOKEN_IDS,
         now_ms: Callable[[], int] = _now_ms,
         mono: Callable[[], float] = time.monotonic,
     ) -> None:
@@ -56,6 +58,7 @@ class StreamingHttpSender:
         self._call = stream_call or _default_stream_call
         self._in = input_tokens_default
         self._out = output_tokens_default
+        self._prompt_mode = prompt_mode
         self._now = now_ms
         self._mono = mono
         # F5: each streamed request blocks a worker for its whole e2e. asyncio.to_thread's
@@ -84,7 +87,14 @@ class StreamingHttpSender:
         pool_wait_ms = max(0.0, (self._mono() - actual_ts) * 1000.0)
         out_tokens = request.max_output_tokens or self._out
         in_tokens = request.prompt_tokens or self._in
-        prompt = request.prompt or " ".join(["token"] * max(1, in_tokens))
+        # A trace may carry its own prompt text; otherwise synthesise one that is unique
+        # to this request. A constant prompt would be served from the prefix cache on any
+        # engine that has it enabled, making prefill free and the measurement worthless
+        # (see tre_replayer.engine.prompts). Seed key = model + request_id, both
+        # deterministic per trace, so a replay sends byte-identical prompts.
+        prompt = request.prompt or build_prompt(
+            in_tokens, f"{request.model}|{request.request_id}", mode=self._prompt_mode
+        )
         body = json.dumps(
             {
                 "model": request.model,

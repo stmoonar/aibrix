@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import itertools
 import json
 import threading
 import time
@@ -201,8 +202,24 @@ class Checkpoint:
         return cell.scenario_id in self.done
 
 
-def _make_prompt(input_tokens: int) -> str:
-    return " ".join(["token"] * max(1, input_tokens))
+#: Mirror of ``tre_replayer.engine.prompts.MODE_TOKEN_IDS``, repeated here so importing
+#: this module never requires the replayer package (guarded by a test).
+PROMPT_MODE_DEFAULT = "token_ids"
+
+
+def _make_prompt(input_tokens: int, seed_key: str, mode: str = PROMPT_MODE_DEFAULT):
+    """One request's prompt: ``input_tokens`` long and unique to ``seed_key``.
+
+    The grid used to send one constant prompt for a whole cell. On an engine with
+    prefix caching enabled that serves every request after the first from cache, so
+    prefill costs nothing and the measured capacity *rises* with prompt length - the
+    calibration built on it is then meaningless. Uniqueness and the seed policy live in
+    :mod:`tre_replayer.engine.prompts`; the import is lazy for the same reason as
+    :func:`_default_stream_call`.
+    """
+    from tre_replayer.engine.prompts import build_prompt
+
+    return build_prompt(input_tokens, seed_key, mode=mode)
 
 
 def build_raw_record(cell_id: str, send_ts_ms: int, res) -> dict:
@@ -261,10 +278,16 @@ def drive_cell(
     instant_sampler: Optional[Callable[[int], dict]] = None,
     instant_interval_s: float = 5.0,
     stream_call: Optional[Callable] = None,
+    prompt_mode: str = PROMPT_MODE_DEFAULT,
+    run_key: str = "r3",
     now_ms: Callable[[], int] = lambda: int(time.time() * 1000),
 ) -> tuple[int, int]:
     """Drive cell.concurrency workers against the model for duration_s.
     Returns (start_ms, end_ms). Fixed output length via max_tokens + ignore_eos.
+
+    Every request gets its own prompt, keyed by ``run_key``/cell/sequence (see
+    :func:`_make_prompt`); the sequence counter is shared by the workers, so the *set*
+    of prompts a cell sends is reproducible even though which worker sends which is not.
 
     S4: when ``raw_path`` is given, each request is streamed (via ``stream_call``, default
     the replayer SSE seam) and its per-request record appended to that JSONL. When
@@ -272,7 +295,6 @@ def drive_cell(
     every ``instant_interval_s`` into that sidecar. Both writes go to local disk.
     """
     stop = threading.Event()
-    prompt = _make_prompt(cell.input_tokens)
     call = stream_call or _default_stream_call()
     records: list[dict] = []
     instants: list[dict] = []
@@ -284,14 +306,21 @@ def drive_cell(
         "Accept": "text/event-stream",
         "model": model,
     }
-    body = json.dumps({
-        "model": model, "prompt": prompt, "max_tokens": cell.output_tokens,
-        "temperature": 0, "ignore_eos": True,
-        "stream": True, "stream_options": {"include_usage": True},
-    }).encode()
+    # next() on an itertools.count is atomic under CPython, so the workers can share one
+    # sequence without a lock; each value is used by exactly one request.
+    sequence = itertools.count()
+
+    def request_body(seq: int) -> bytes:
+        prompt = _make_prompt(cell.input_tokens, f"{run_key}|{cell_id}|{seq}", prompt_mode)
+        return json.dumps({
+            "model": model, "prompt": prompt, "max_tokens": cell.output_tokens,
+            "temperature": 0, "ignore_eos": True,
+            "stream": True, "stream_options": {"include_usage": True},
+        }).encode()
 
     def worker() -> None:
         while not stop.is_set():
+            body = request_body(next(sequence))
             send_ts = now_ms()
             try:
                 res = call(gateway_url, headers, body, timeout)
@@ -387,6 +416,13 @@ def main() -> int:
     ap.add_argument("--disk-warn-gib", type=float, default=DEFAULT_DISK_WARN_BYTES / 1024**3)
     ap.add_argument("--assumed-rps-per-worker", type=float, default=2.0,
                     help="only used for the pre-run raw disk estimate")
+    # Prompt synthesis. token_ids sends an explicit token-id list, so the realised
+    # prompt length is exact; text is the fallback for an endpoint that only accepts a
+    # string. Either way each request gets its own prompt (no prefix-cache freebies).
+    ap.add_argument("--prompt-mode", default=PROMPT_MODE_DEFAULT, choices=["token_ids", "text"])
+    # Seeds prompt content. Defaults to the output stem so two runs writing different
+    # CSVs differ, and re-running the same output reproduces the same prompts.
+    ap.add_argument("--run-key", default=None)
     args = ap.parse_args()
 
     cells = enumerate_cells(
@@ -398,6 +434,7 @@ def main() -> int:
         cells = cells[:1]
 
     out = Path(args.output)
+    run_key = args.run_key or out.stem
     out.parent.mkdir(parents=True, exist_ok=True)
     ckpt = Checkpoint.load(out.with_suffix(".checkpoint.json"))
 
@@ -444,6 +481,7 @@ def main() -> int:
             args.gateway_url, args.model, cell, args.cell_seconds,
             raw_path=raw_path, instant_path=instant_path,
             instant_sampler=instant_sampler, instant_interval_s=args.instant_sample_ms / 1000.0,
+            prompt_mode=args.prompt_mode, run_key=run_key,
         )
         windows = []
         w = start_ms

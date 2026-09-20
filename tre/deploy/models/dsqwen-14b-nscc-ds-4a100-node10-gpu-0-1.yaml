@@ -86,6 +86,7 @@ spec:
         - --enable_sleep_mode
         - --tensor-parallel-size
         - '2'
+        - --no-enable-prefix-caching
         - --max-model-len
         - '12288'
         - --gpu-memory-utilization

@@ -152,6 +152,7 @@ data:
         hsat: 3
         ema_tau_ms: 20000
       vllm_extra_args:
+      - --no-enable-prefix-caching
       - --max-model-len
       - '12288'
       - --gpu-memory-utilization

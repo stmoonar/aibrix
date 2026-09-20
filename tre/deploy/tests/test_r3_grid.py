@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -320,3 +321,65 @@ def test_enumerate_cells_accepts_generators_full_cartesian():
     )
     assert len(cells) == 3 * 2 * 6
     assert len({(c.input_tokens, c.output_tokens, c.concurrency) for c in cells}) == 36
+
+
+def test_prompt_mode_default_mirrors_the_replayer_constant() -> None:
+    from tre_replayer.engine import prompts
+
+    assert r3_grid.PROMPT_MODE_DEFAULT == prompts.MODE_TOKEN_IDS
+
+
+def test_drive_cell_sends_a_distinct_prompt_of_the_requested_length_per_request() -> None:
+    """One prompt per cell made prefill free under prefix caching; each request now
+    carries its own, keyed by run/cell/sequence."""
+    bodies: list[dict] = []
+
+    class _Res:
+        status = 200
+        first_token_ms = 1.0
+        done_ms = 2.0
+        prompt_tokens = 128
+        completion_tokens = 8
+
+    def fake_call(url, headers, body, timeout):
+        bodies.append(json.loads(body))
+        return _Res()
+
+    cell = r3_grid.GridCell(128, 8, 4)
+    r3_grid.drive_cell(
+        "http://gw", "m", cell, 0.2, stream_call=fake_call, run_key="unit",
+    )
+
+    assert len(bodies) >= 8  # 4 workers x 0.2 s against an instant fake
+    sent = [tuple(b["prompt"]) for b in bodies]
+    assert all(len(p) == 128 for p in sent)  # exact token count
+    assert len(set(sent)) == len(sent)  # every request distinct
+    assert len({p[:4] for p in sent}) == len(sent)  # distinct from the first tokens
+
+
+def test_drive_cell_prompts_are_reproducible_for_the_same_run_key() -> None:
+    def run(run_key: str) -> list:
+        bodies: list[dict] = []
+
+        class _Res:
+            status = 200
+            first_token_ms = 1.0
+            done_ms = 2.0
+            prompt_tokens = 16
+            completion_tokens = 4
+
+        def fake_call(url, headers, body, timeout):
+            bodies.append(json.loads(body))
+            return _Res()
+
+        r3_grid.drive_cell(
+            "http://gw", "m", r3_grid.GridCell(16, 4, 1), 0.1,
+            stream_call=fake_call, run_key=run_key,
+        )
+        return [b["prompt"] for b in bodies]
+
+    first, second, other = run("unit"), run("unit"), run("other")
+    n = min(len(first), len(second), len(other))
+    assert n >= 2
+    assert first[:n] == second[:n]  # same run key, same prompt sequence
+    assert other[:n] != first[:n]  # a different run key moves them
