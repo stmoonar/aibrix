@@ -525,10 +525,17 @@ def main() -> int:
     ap.add_argument("--window-ms", type=int, default=30000)
     ap.add_argument("--redis-url", default="redis://tre-v2-redis:6379/0")
     ap.add_argument("--metrics-schema", default="v1")
-    # Instant sampler cadence + expected_samples divisor. MUST match the gateway scrape
-    # cadence (SCRAPE_INTERVAL_MS=10000): a smaller value doubles expected_samples and
-    # halves the offline queue average vs. the online path (r3 SMOKE_FINDINGS defect 2).
-    ap.add_argument("--instant-sample-ms", type=int, default=SCRAPE_INTERVAL_MS)
+    # Sidecar sampling cadence (how often WE sample the queue into the .instant.jsonl).
+    # This is NOT the divisor MetricsStore uses: the redis buckets it reads are written by
+    # the gateway on its own 10 s ticker, so that divisor is --store-instant-sample-ms and
+    # must stay at SCRAPE_INTERVAL_MS. An offline rewindow_from_raw of this capture must be
+    # passed --instant-sample-ms equal to the value used here.
+    # Closed-loop default stays the gateway cadence. Schedule mode defaults to 1 s: the
+    # gateway grid gives 3 samples per 30 s window, which aliases away the short-lived
+    # waiting queue the bursts primitive exists to produce (see scripts/openloop.py).
+    ap.add_argument("--instant-sample-ms", type=int, default=None)
+    # expected_samples divisor for the redis windows: the gateway's cadence, not ours.
+    ap.add_argument("--store-instant-sample-ms", type=int, default=SCRAPE_INTERVAL_MS)
     ap.add_argument("--percentile-mode", default="bucket_upper")
     ap.add_argument("--min-latency-samples", type=int, default=10)  # align with live TRE_MIN_LATENCY_SAMPLES
     ap.add_argument("--registry", default=None)
@@ -575,6 +582,12 @@ def main() -> int:
     if args.schedule is None and args.instant_source == "pod":
         # The closed-loop path historically reads the store; keep that default intact.
         args.instant_source = "store"
+    if args.instant_sample_ms is None:
+        args.instant_sample_ms = (
+            int(openloop.DEFAULT_SIDECAR_INTERVAL_S * 1000)
+            if args.schedule is not None
+            else SCRAPE_INTERVAL_MS
+        )
 
     cells = enumerate_cells(
         (int(x) for x in args.input_buckets.split(",")),
@@ -614,7 +627,7 @@ def main() -> int:
     redis_client = redis.Redis.from_url(args.redis_url)
     store = MetricsStore(
         redis_client, registry,
-        instant_sample_interval_ms=args.instant_sample_ms,
+        instant_sample_interval_ms=args.store_instant_sample_ms,
         percentile_mode=args.percentile_mode,
         schema=args.metrics_schema,
         min_latency_samples=args.min_latency_samples,  # align p95 with the live N1 guard

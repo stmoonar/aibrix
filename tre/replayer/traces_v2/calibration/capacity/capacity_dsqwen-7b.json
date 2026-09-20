@@ -1,0 +1,45 @@
+{
+  "model": "dsqwen-7b",
+  "capacity": [
+    {
+      "input_tokens": 128,
+      "output_tokens": 128,
+      "rps": 16.0
+    },
+    {
+      "input_tokens": 128,
+      "output_tokens": 512,
+      "rps": 4.266666666666667
+    },
+    {
+      "input_tokens": 512,
+      "output_tokens": 128,
+      "rps": 11.733333333333333
+    },
+    {
+      "input_tokens": 512,
+      "output_tokens": 256,
+      "rps": 9.6
+    },
+    {
+      "input_tokens": 512,
+      "output_tokens": 384,
+      "rps": 8.533333333333333
+    },
+    {
+      "input_tokens": 512,
+      "output_tokens": 512,
+      "rps": 6.4
+    },
+    {
+      "input_tokens": 1024,
+      "output_tokens": 128,
+      "rps": 6.1
+    },
+    {
+      "input_tokens": 1024,
+      "output_tokens": 512,
+      "rps": 4.2
+    }
+  ]
+}

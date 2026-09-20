@@ -833,6 +833,423 @@
       ],
       "peak_offered_rps": 14.9408,
       "path": "dsllama-8b/M_bursts.json"
+    },
+    {
+      "model": "dsqwen-14b",
+      "shape": "S1",
+      "primitive": "ramp",
+      "cell_id": "i256_o128_c160",
+      "held_out": false,
+      "capacity_prior_rps": 6.2582,
+      "duration_s": 540,
+      "planned_requests": 3605,
+      "components": [
+        {
+          "weight": 1.0,
+          "input_tokens": 256,
+          "max_tokens": 128
+        }
+      ],
+      "peak_offered_rps": 10.0131,
+      "path": "dsqwen-14b/S1_ramp.json"
+    },
+    {
+      "model": "dsqwen-14b",
+      "shape": "S1",
+      "primitive": "steps",
+      "cell_id": "i256_o128_c95",
+      "held_out": false,
+      "capacity_prior_rps": 6.2582,
+      "duration_s": 450,
+      "planned_requests": 2309,
+      "components": [
+        {
+          "weight": 1.0,
+          "input_tokens": 256,
+          "max_tokens": 128
+        }
+      ],
+      "peak_offered_rps": 5.9453,
+      "discard_after_s": [
+        0,
+        90,
+        210
+      ],
+      "path": "dsqwen-14b/S1_steps.json"
+    },
+    {
+      "model": "dsqwen-14b",
+      "shape": "S1",
+      "primitive": "bursts",
+      "cell_id": "i256_o128_c60",
+      "held_out": false,
+      "capacity_prior_rps": 6.2582,
+      "duration_s": 360,
+      "planned_requests": 1452,
+      "components": [
+        {
+          "weight": 1.0,
+          "input_tokens": 256,
+          "max_tokens": 128
+        }
+      ],
+      "peak_offered_rps": 16.2713,
+      "path": "dsqwen-14b/S1_bursts.json"
+    },
+    {
+      "model": "dsqwen-14b",
+      "shape": "S2",
+      "primitive": "ramp",
+      "cell_id": "i768_o192_c160",
+      "held_out": false,
+      "capacity_prior_rps": 3.3069,
+      "duration_s": 540,
+      "planned_requests": 1905,
+      "components": [
+        {
+          "weight": 1.0,
+          "input_tokens": 768,
+          "max_tokens": 192
+        }
+      ],
+      "peak_offered_rps": 5.2911,
+      "path": "dsqwen-14b/S2_ramp.json"
+    },
+    {
+      "model": "dsqwen-14b",
+      "shape": "S2",
+      "primitive": "steps",
+      "cell_id": "i768_o192_c95",
+      "held_out": false,
+      "capacity_prior_rps": 3.3069,
+      "duration_s": 450,
+      "planned_requests": 1220,
+      "components": [
+        {
+          "weight": 1.0,
+          "input_tokens": 768,
+          "max_tokens": 192
+        }
+      ],
+      "peak_offered_rps": 3.1416,
+      "discard_after_s": [
+        0,
+        90,
+        210
+      ],
+      "path": "dsqwen-14b/S2_steps.json"
+    },
+    {
+      "model": "dsqwen-14b",
+      "shape": "S2",
+      "primitive": "bursts",
+      "cell_id": "i768_o192_c60",
+      "held_out": false,
+      "capacity_prior_rps": 3.3069,
+      "duration_s": 360,
+      "planned_requests": 767,
+      "components": [
+        {
+          "weight": 1.0,
+          "input_tokens": 768,
+          "max_tokens": 192
+        }
+      ],
+      "peak_offered_rps": 8.5981,
+      "path": "dsqwen-14b/S2_bursts.json"
+    },
+    {
+      "model": "dsqwen-14b",
+      "shape": "S3",
+      "primitive": "ramp",
+      "cell_id": "i2048_o96_c160",
+      "held_out": false,
+      "capacity_prior_rps": 2.3644,
+      "duration_s": 540,
+      "planned_requests": 1362,
+      "components": [
+        {
+          "weight": 1.0,
+          "input_tokens": 2048,
+          "max_tokens": 96
+        }
+      ],
+      "peak_offered_rps": 3.7831,
+      "path": "dsqwen-14b/S3_ramp.json"
+    },
+    {
+      "model": "dsqwen-14b",
+      "shape": "S3",
+      "primitive": "steps",
+      "cell_id": "i2048_o96_c95",
+      "held_out": false,
+      "capacity_prior_rps": 2.3644,
+      "duration_s": 450,
+      "planned_requests": 872,
+      "components": [
+        {
+          "weight": 1.0,
+          "input_tokens": 2048,
+          "max_tokens": 96
+        }
+      ],
+      "peak_offered_rps": 2.2462,
+      "discard_after_s": [
+        0,
+        90,
+        210
+      ],
+      "path": "dsqwen-14b/S3_steps.json"
+    },
+    {
+      "model": "dsqwen-14b",
+      "shape": "S3",
+      "primitive": "bursts",
+      "cell_id": "i2048_o96_c60",
+      "held_out": false,
+      "capacity_prior_rps": 2.3644,
+      "duration_s": 360,
+      "planned_requests": 549,
+      "components": [
+        {
+          "weight": 1.0,
+          "input_tokens": 2048,
+          "max_tokens": 96
+        }
+      ],
+      "peak_offered_rps": 6.1474,
+      "path": "dsqwen-14b/S3_bursts.json"
+    },
+    {
+      "model": "dsqwen-14b",
+      "shape": "S4",
+      "primitive": "ramp",
+      "cell_id": "i256_o448_c160",
+      "held_out": false,
+      "capacity_prior_rps": 2.199,
+      "duration_s": 540,
+      "planned_requests": 1267,
+      "components": [
+        {
+          "weight": 1.0,
+          "input_tokens": 256,
+          "max_tokens": 448
+        }
+      ],
+      "peak_offered_rps": 3.5184,
+      "path": "dsqwen-14b/S4_ramp.json"
+    },
+    {
+      "model": "dsqwen-14b",
+      "shape": "S4",
+      "primitive": "steps",
+      "cell_id": "i256_o448_c95",
+      "held_out": false,
+      "capacity_prior_rps": 2.199,
+      "duration_s": 450,
+      "planned_requests": 811,
+      "components": [
+        {
+          "weight": 1.0,
+          "input_tokens": 256,
+          "max_tokens": 448
+        }
+      ],
+      "peak_offered_rps": 2.0891,
+      "discard_after_s": [
+        0,
+        90,
+        210
+      ],
+      "path": "dsqwen-14b/S4_steps.json"
+    },
+    {
+      "model": "dsqwen-14b",
+      "shape": "S4",
+      "primitive": "bursts",
+      "cell_id": "i256_o448_c60",
+      "held_out": false,
+      "capacity_prior_rps": 2.199,
+      "duration_s": 360,
+      "planned_requests": 510,
+      "components": [
+        {
+          "weight": 1.0,
+          "input_tokens": 256,
+          "max_tokens": 448
+        }
+      ],
+      "peak_offered_rps": 5.7174,
+      "path": "dsqwen-14b/S4_bursts.json"
+    },
+    {
+      "model": "dsqwen-14b",
+      "shape": "S5",
+      "primitive": "ramp",
+      "cell_id": "i768_o384_c160",
+      "held_out": false,
+      "capacity_prior_rps": 2.0861,
+      "duration_s": 540,
+      "planned_requests": 1202,
+      "components": [
+        {
+          "weight": 1.0,
+          "input_tokens": 768,
+          "max_tokens": 384
+        }
+      ],
+      "peak_offered_rps": 3.3377,
+      "path": "dsqwen-14b/S5_ramp.json"
+    },
+    {
+      "model": "dsqwen-14b",
+      "shape": "S5",
+      "primitive": "steps",
+      "cell_id": "i768_o384_c95",
+      "held_out": false,
+      "capacity_prior_rps": 2.0861,
+      "duration_s": 450,
+      "planned_requests": 770,
+      "components": [
+        {
+          "weight": 1.0,
+          "input_tokens": 768,
+          "max_tokens": 384
+        }
+      ],
+      "peak_offered_rps": 1.9818,
+      "discard_after_s": [
+        0,
+        90,
+        210
+      ],
+      "path": "dsqwen-14b/S5_steps.json"
+    },
+    {
+      "model": "dsqwen-14b",
+      "shape": "S5",
+      "primitive": "bursts",
+      "cell_id": "i768_o384_c60",
+      "held_out": false,
+      "capacity_prior_rps": 2.0861,
+      "duration_s": 360,
+      "planned_requests": 484,
+      "components": [
+        {
+          "weight": 1.0,
+          "input_tokens": 768,
+          "max_tokens": 384
+        }
+      ],
+      "peak_offered_rps": 5.4237,
+      "path": "dsqwen-14b/S5_bursts.json"
+    },
+    {
+      "model": "dsqwen-14b",
+      "shape": "M",
+      "primitive": "ramp",
+      "cell_id": "i0_o0_c160",
+      "held_out": true,
+      "capacity_prior_rps": 3.1654,
+      "duration_s": 540,
+      "planned_requests": 1823,
+      "components": [
+        {
+          "weight": 0.4,
+          "input_tokens": 256,
+          "max_tokens": 128
+        },
+        {
+          "weight": 0.3,
+          "input_tokens": 1024,
+          "max_tokens": 256
+        },
+        {
+          "weight": 0.2,
+          "input_tokens": 128,
+          "max_tokens": 384
+        },
+        {
+          "weight": 0.1,
+          "input_tokens": 3072,
+          "max_tokens": 64
+        }
+      ],
+      "peak_offered_rps": 5.0647,
+      "path": "dsqwen-14b/M_ramp.json"
+    },
+    {
+      "model": "dsqwen-14b",
+      "shape": "M",
+      "primitive": "steps",
+      "cell_id": "i0_o0_c95",
+      "held_out": true,
+      "capacity_prior_rps": 3.1654,
+      "duration_s": 450,
+      "planned_requests": 1168,
+      "components": [
+        {
+          "weight": 0.4,
+          "input_tokens": 256,
+          "max_tokens": 128
+        },
+        {
+          "weight": 0.3,
+          "input_tokens": 1024,
+          "max_tokens": 256
+        },
+        {
+          "weight": 0.2,
+          "input_tokens": 128,
+          "max_tokens": 384
+        },
+        {
+          "weight": 0.1,
+          "input_tokens": 3072,
+          "max_tokens": 64
+        }
+      ],
+      "peak_offered_rps": 3.0071,
+      "discard_after_s": [
+        0,
+        90,
+        210
+      ],
+      "path": "dsqwen-14b/M_steps.json"
+    },
+    {
+      "model": "dsqwen-14b",
+      "shape": "M",
+      "primitive": "bursts",
+      "cell_id": "i0_o0_c60",
+      "held_out": true,
+      "capacity_prior_rps": 3.1654,
+      "duration_s": 360,
+      "planned_requests": 734,
+      "components": [
+        {
+          "weight": 0.4,
+          "input_tokens": 256,
+          "max_tokens": 128
+        },
+        {
+          "weight": 0.3,
+          "input_tokens": 1024,
+          "max_tokens": 256
+        },
+        {
+          "weight": 0.2,
+          "input_tokens": 128,
+          "max_tokens": 384
+        },
+        {
+          "weight": 0.1,
+          "input_tokens": 3072,
+          "max_tokens": 64
+        }
+      ],
+      "peak_offered_rps": 8.2303,
+      "path": "dsqwen-14b/M_bursts.json"
     }
   ],
   "capacity_models": {
@@ -847,6 +1264,12 @@
       "decode_tokens_per_s": 2260.7,
       "fitted_from_points": 6,
       "rms_relative_error": 0.0993
+    },
+    "dsqwen-14b": {
+      "prefill_tokens_per_s": 6123.5,
+      "decode_tokens_per_s": 1084.89,
+      "fitted_from_points": 5,
+      "rms_relative_error": 0.2916
     }
   },
   "shapes": {

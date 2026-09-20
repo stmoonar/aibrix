@@ -31,8 +31,14 @@ bursts  base rho 0.6 for 360 s with a 2 s spike every 90 s carrying B = 2 * C_s 
 
 Capacity priors and the C_s model
 ---------------------------------
-rho is relative to a per-shape single-pod capacity prior C_s (rps). The measured priors
-(``traces_v2/capacity/capacity_<model>.json``) only cover a sparse (i, o) grid and none
+rho is relative to a per-shape single-pod capacity prior C_s (rps). The priors live in
+``traces_v2/calibration/capacity/`` - a campaign-local copy, deliberately NOT the frozen
+``traces_v2/capacity/`` set that experiment-3's traceset-v2 was generated from (that one
+stays byte-unchanged for provenance). The dsqwen-14b prior there was re-measured on
+2026-09-20 with the unique-per-request-prompt sender and prefix caching off; the frozen
+2026-07-09 one is contaminated (its capacity RISES with prompt length: 14.9 -> 33.0 ->
+32.0 rps for input 128 -> 512 -> 1024, the signature of an identical-prompt sender
+against an engine with prefix caching on). The priors only cover a sparse (i, o) grid and none
 of the campaign shapes sit on it, so nearest-neighbour would silently borrow a lighter
 point's capacity (the v1 trace-set failure documented in traces_v2/README.md).
 
@@ -371,7 +377,8 @@ def generate(
 def main() -> int:
     here = Path(__file__).resolve().parents[2]
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--capacity-dir", type=Path, default=here / "replayer/traces_v2/capacity")
+    ap.add_argument("--capacity-dir", type=Path,
+                    default=here / "replayer/traces_v2/calibration/capacity")
     ap.add_argument("--output-dir", type=Path, default=here / "replayer/traces_v2/calibration")
     ap.add_argument("--models", default=",".join(MODELS))
     args = ap.parse_args()
