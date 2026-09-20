@@ -20,7 +20,7 @@ spec:
     kind: HTTPRoute
     name: dsqwen-7b-router
   circuitBreaker:
-    maxConnections: 256
+    maxConnections: 4096
     maxPendingRequests: 1024
     maxParallelRequests: 4096
     maxParallelRetries: 16
@@ -39,7 +39,7 @@ spec:
     kind: HTTPRoute
     name: dsqwen-14b-router
   circuitBreaker:
-    maxConnections: 256
+    maxConnections: 4096
     maxPendingRequests: 1024
     maxParallelRequests: 4096
     maxParallelRetries: 16
@@ -58,7 +58,7 @@ spec:
     kind: HTTPRoute
     name: dsllama-8b-router
   circuitBreaker:
-    maxConnections: 256
+    maxConnections: 4096
     maxPendingRequests: 1024
     maxParallelRequests: 4096
     maxParallelRetries: 16
