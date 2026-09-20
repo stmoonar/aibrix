@@ -1,0 +1,25 @@
+{
+  "dsllama-8b": [
+    {
+      "start_time": 0,
+      "end_time": 90,
+      "rps": 5.9233,
+      "input_tokens": 256,
+      "max_tokens": 128
+    },
+    {
+      "start_time": 90,
+      "end_time": 210,
+      "rps": 9.4773,
+      "input_tokens": 256,
+      "max_tokens": 128
+    },
+    {
+      "start_time": 210,
+      "end_time": 450,
+      "rps": 11.2543,
+      "input_tokens": 256,
+      "max_tokens": 128
+    }
+  ]
+}

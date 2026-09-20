@@ -24,6 +24,16 @@ column, re-aggregate from the raw log with a sliding window at the live refresh 
 (`rewindow_from_raw --window-ms=<W> --step-ms=<refresh>`); the tumbling series here is the
 online quick-look. The streaming raw-logger reuses the replayer's http_sender SSE/usage
 parser (`tre_replayer.engine.http_sender`), so there is a single sender/parse implementation.
+
+OPEN-LOOP MODE (`--schedule <file>`): the worker-pool driver above is closed-loop, so it
+can never offer more load than the engine drains and never produces a waiting queue (see
+`scripts/openloop.py` for the measurements that forced this). With `--schedule` the cell is
+driven instead from a replayer trace file through `dispatch_open_loop`: requests fire at
+wall-clock offsets regardless of completions. The raw JSONL / instant sidecar schemas and
+the window CSV are unchanged, so `rewindow_from_raw.py` and `tre_calibration` consume both
+modes identically -- except that the sidecar samples at `--instant-sample-ms` (1000 ms for
+the calibration campaign, vs the live 10 s gateway grid), so an offline re-window must be
+given the matching `--instant-sample-ms`.
 """
 from __future__ import annotations
 
@@ -38,6 +48,8 @@ from pathlib import Path
 from typing import Callable, Iterable, Optional
 
 from tre_common.rediskeys import SCRAPE_INTERVAL_MS
+
+from scripts import openloop
 
 
 @dataclass(frozen=True)
@@ -387,6 +399,118 @@ def _make_live_instant_sampler(store, model: str, lookback_ms: int) -> Callable[
     return sample
 
 
+def discover_pod_metrics_endpoints(model: str, namespace: str, port: int) -> list[str]:
+    """/metrics URLs of the model's routable pods, via kubectl.
+
+    Only routable pods are scraped: a sleeping/hidden resident on the same card is not
+    serving this load and its (zero) gauges would dilute the queue average, which is the
+    one observable the open-loop primitives exist to measure.
+    """
+    import subprocess
+
+    out = subprocess.run(
+        [
+            "kubectl", "-n", namespace, "get", "pods",
+            "-l", f"model.aibrix.ai/name={model},tre.aibrix.io/routable=true",
+            "-o", "jsonpath={range .items[*]}{.status.podIP}{\"\\n\"}{end}",
+        ],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    ips = [line.strip() for line in out.splitlines() if line.strip()]
+    if not ips:
+        raise RuntimeError(
+            f"no routable pods found for model {model!r} in namespace {namespace!r}; "
+            "the sidecar would have nothing to sample"
+        )
+    return [f"http://{ip}:{port}/metrics" for ip in ips]
+
+
+def run_schedule_cell(args, store, spec) -> tuple[list, "openloop.CellGuard"]:
+    """Drive one open-loop cell from --schedule and return (window rows, guard)."""
+    from tre_replayer.traces.loader import load_trace_segments
+
+    segments = [
+        seg for seg in load_trace_segments(args.schedule) if seg.model == args.model
+    ]
+    if not segments:
+        raise SystemExit(
+            f"schedule {args.schedule} has no segments for model {args.model!r}"
+        )
+    cell_id = args.cell_id or _cell_id_from_schedule(Path(args.schedule), args.model, segments)
+    cell = GridCell.from_scenario_id(cell_id)  # fail now, not in rewindow_from_raw
+
+    if args.instant_source == "pod":
+        endpoints = args.pod_endpoint or discover_pod_metrics_endpoints(
+            args.model, args.namespace, args.pod_metrics_port
+        )
+        sampler = openloop.make_pod_metrics_sampler(endpoints)
+        print(f"sidecar: {len(endpoints)} pod /metrics endpoint(s) @ {args.instant_sample_ms}ms")
+    else:
+        sampler = _make_live_instant_sampler(store, args.model, 2 * SCRAPE_INTERVAL_MS)
+
+    raw_dir = None if args.no_raw else Path(args.raw_dir) / Path(args.output).stem
+    if raw_dir is not None:
+        raw_dir.mkdir(parents=True, exist_ok=True)
+    raw_path = raw_dir / f"{cell_id}.jsonl" if raw_dir is not None else None
+    instant_path = raw_dir / f"{cell_id}.instant.jsonl" if raw_dir is not None else None
+
+    start_ms, end_ms, guard = openloop.drive_cell_schedule(
+        args.gateway_url, args.model, cell_id, segments,
+        seed=args.schedule_seed,
+        raw_path=raw_path, instant_path=instant_path,
+        instant_sampler=sampler,
+        instant_interval_s=args.instant_sample_ms / 1000.0,
+        prompt_mode=args.prompt_mode,
+        max_in_flight=args.max_in_flight,
+        guard_kwargs={
+            "max_p99_delay_ms": args.max_p99_delay_ms,
+            "max_p99_pool_wait_ms": args.max_p99_pool_wait_ms,
+            "max_error_rate": args.max_error_rate,
+        },
+    )
+    print(f"cell {cell_id} guard: {json.dumps(guard.as_dict(), sort_keys=True)}")
+    if args.guard_mode == "fail":
+        openloop.raise_on_guard(guard)
+    elif not guard.ok:
+        print(f"WARNING: cell {cell_id} guard failed (continuing on --guard-mode warn)")
+
+    windows = []
+    w = start_ms
+    while w + args.window_ms <= end_ms:
+        windows.append(store.read_model_window(args.model, w, w + args.window_ms))
+        w += args.window_ms
+    results = compute_window_results(windows, spec)
+    rows = [
+        window_row(cell, wm, result.TRS, result.Q_ctl)
+        for wm, result in zip(windows, results)
+    ]
+    return rows, guard
+
+
+def _cell_id_from_schedule(path: Path, model: str, segments: list) -> str:
+    """Default scenario id for a schedule file: ``i<in>_o<out>_c<load-code>``.
+
+    The load code is 100x the primitive's characteristic rho, as written by
+    gen_calibration_schedules.py, and is recovered here from the file name so a schedule
+    run from the committed tree needs no extra flag. A mixture schedule (several token
+    shapes) records i0_o0, which r3_capacity then correctly declines to fit.
+    """
+    from scripts.gen_calibration_schedules import LOAD_CODE
+
+    stem = path.stem  # <shape>_<primitive>
+    primitive = stem.rsplit("_", 1)[-1]
+    if primitive not in LOAD_CODE:
+        raise SystemExit(
+            f"cannot derive a cell id from {path.name!r}; pass --cell-id explicitly"
+        )
+    shapes = {(s.input_tokens, s.max_output_tokens) for s in segments}
+    if len(shapes) == 1:
+        i, o = next(iter(shapes))
+    else:
+        i, o = 0, 0
+    return f"i{i or 0}_o{o or 0}_c{LOAD_CODE[primitive]}"
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
@@ -408,6 +532,7 @@ def main() -> int:
     ap.add_argument("--percentile-mode", default="bucket_upper")
     ap.add_argument("--min-latency-samples", type=int, default=10)  # align with live TRE_MIN_LATENCY_SAMPLES
     ap.add_argument("--registry", default=None)
+    ap.add_argument("--namespace", default="default", help="namespace holding the model pods")
     ap.add_argument("--only-first-cell", action="store_true")
     # S4: raw per-request log lands on local disk (NOT NFS: doc15 §4.3). Default is 76's
     # local experiments dir; a subdir per output stem keeps concurrent runs separate.
@@ -423,7 +548,33 @@ def main() -> int:
     # Seeds prompt content. Defaults to the output stem so two runs writing different
     # CSVs differ, and re-running the same output reproduces the same prompts.
     ap.add_argument("--run-key", default=None)
+    # ---- open-loop (schedule-driven) mode ----
+    ap.add_argument("--schedule", default=None,
+                    help="replayer trace file; switches this cell to the open-loop driver")
+    ap.add_argument("--cell-id", default=None,
+                    help="scenario id for the schedule cell (default: from the schedule INDEX "
+                         "convention i<in>_o<out>_c<load-code>); must parse as a GridCell or "
+                         "rewindow_from_raw will skip the raw file")
+    ap.add_argument("--schedule-seed", type=int, default=1234)
+    ap.add_argument("--max-in-flight", type=int, default=openloop.DEFAULT_MAX_IN_FLIGHT)
+    # Sidecar source. "pod" scrapes the model pods' /metrics directly at
+    # --instant-sample-ms (1 s for the campaign); "store" is the legacy redis read, which
+    # cannot resolve faster than the gateway's 10 s grid.
+    ap.add_argument("--instant-source", default="pod", choices=["pod", "store"])
+    ap.add_argument("--pod-metrics-port", type=int, default=8000)
+    ap.add_argument("--pod-endpoint", action="append", default=[],
+                    help="explicit http://ip:port/metrics endpoint; repeatable. Default: "
+                         "discovered from the routable pods of --model")
+    ap.add_argument("--max-p99-delay-ms", type=float, default=openloop.DEFAULT_MAX_P99_DELAY_MS)
+    ap.add_argument("--max-p99-pool-wait-ms", type=float,
+                    default=openloop.DEFAULT_MAX_P99_POOL_WAIT_MS)
+    ap.add_argument("--max-error-rate", type=float, default=openloop.DEFAULT_MAX_ERROR_RATE)
+    ap.add_argument("--guard-mode", default="fail", choices=["fail", "warn"],
+                    help="fail: a cell that did not deliver its load aborts the run")
     args = ap.parse_args()
+    if args.schedule is None and args.instant_source == "pod":
+        # The closed-loop path historically reads the store; keep that default intact.
+        args.instant_source = "store"
 
     cells = enumerate_cells(
         (int(x) for x in args.input_buckets.split(",")),
@@ -431,6 +582,10 @@ def main() -> int:
         (int(x) for x in args.concurrency.split(",")),
     )
     if args.only_first_cell:
+        cells = cells[:1]
+    if args.schedule is not None:
+        # The schedule replaces the grid entirely; keep one nominal cell only so the raw
+        # disk estimate below has something to size against.
         cells = cells[:1]
 
     out = Path(args.output)
@@ -468,6 +623,12 @@ def main() -> int:
     # range even with scrape/write lag (r3 SMOKE_FINDINGS defect 1); read_latest_instant
     # then takes the freshest bucket, not a lookback-wide average.
     instant_sampler = _make_live_instant_sampler(store, args.model, 2 * SCRAPE_INTERVAL_MS)
+
+    if args.schedule is not None:
+        rows, _guard = run_schedule_cell(args, store, spec)
+        write_csv(rows, out)
+        print(f"wrote {len(rows)} rows to {out}")
+        return 0
 
     # Resume-safe: seed rows from the rows already on disk for checkpoint-done cells, so the
     # per-cell full rewrite below appends instead of truncating away prior captures.

@@ -1,0 +1,262 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+from scripts import openloop, r3_grid
+
+
+# --------------------------------------------------------------------- guards
+
+
+def _record(status=200, e2e=100.0, pool_wait=1.0, request_id="r0"):
+    return {
+        "request_id": request_id,
+        "http_status": status,
+        "e2e_ms": e2e,
+        "ttft_ms": 20.0,
+        "pool_wait_ms": pool_wait,
+        "actual_send_ts_ms": 1_000,
+        "prompt_tokens": 256,
+        "completion_tokens": 128,
+    }
+
+
+def test_guard_accepts_a_clean_cell() -> None:
+    guard = openloop.check_cell(
+        "i256_o128_c60", scheduled=100, records=[_record() for _ in range(100)], p99_delay_ms=5.0
+    )
+    assert guard.ok
+    assert guard.completed == 100 and guard.errors == 0
+
+
+def test_guard_rejects_a_cell_that_sent_nothing() -> None:
+    # The closed-loop worker swallows every send exception, so a misconfigured sender
+    # produces an empty raw file and a silently-zero row. In open-loop mode that must be
+    # a hard, named failure.
+    guard = openloop.check_cell("i256_o128_c60", scheduled=42, records=[], p99_delay_ms=0.0)
+    assert not guard.ok
+    assert any("0 requests were sent" in issue for issue in guard.issues)
+    with pytest.raises(openloop.CellGuardError) as excinfo:
+        openloop.raise_on_guard(guard)
+    assert "i256_o128_c60" in str(excinfo.value)
+
+
+def test_guard_rejects_an_empty_schedule() -> None:
+    guard = openloop.check_cell("i0_o0_c95", scheduled=0, records=[], p99_delay_ms=0.0)
+    assert any("0 requests" in issue for issue in guard.issues)
+
+
+def test_guard_rejects_all_failed_sends() -> None:
+    records = [_record(status=0, e2e=None) for _ in range(20)]
+    guard = openloop.check_cell("i256_o128_c60", scheduled=20, records=records, p99_delay_ms=1.0)
+    assert not guard.ok
+    assert any("0/20 requests completed" in issue for issue in guard.issues)
+
+
+def test_guard_rejects_an_error_rate_above_threshold() -> None:
+    records = [_record() for _ in range(90)] + [_record(status=503, e2e=None) for _ in range(10)]
+    guard = openloop.check_cell(
+        "i256_o128_c60", scheduled=100, records=records, p99_delay_ms=1.0, max_error_rate=0.05
+    )
+    assert any("error rate" in issue for issue in guard.issues)
+
+
+def test_guard_rejects_schedule_slip_and_pool_starvation() -> None:
+    # Either of these means the driver, not the engine, limited the offered load: the
+    # "open loop" silently became a closed loop and the cell measures nothing useful.
+    slipped = openloop.check_cell(
+        "i256_o128_c160", scheduled=10, records=[_record() for _ in range(10)], p99_delay_ms=900.0
+    )
+    assert any("dispatch delay" in issue for issue in slipped.issues)
+
+    starved = openloop.check_cell(
+        "i256_o128_c160",
+        scheduled=10,
+        records=[_record(pool_wait=4000.0) for _ in range(10)],
+        p99_delay_ms=1.0,
+    )
+    assert any("pool wait" in issue for issue in starved.issues)
+
+
+# ----------------------------------------------------------------- pod gauges
+
+
+VLLM_METRICS = """
+# HELP vllm:num_requests_running Number of requests currently running.
+# TYPE vllm:num_requests_running gauge
+vllm:num_requests_running{model_name="dsqwen-7b"} 12.0
+# HELP vllm:num_requests_waiting Number of requests waiting to be processed.
+# TYPE vllm:num_requests_waiting gauge
+vllm:num_requests_waiting{model_name="dsqwen-7b"} 37.0
+vllm:gpu_cache_usage_perc{model_name="dsqwen-7b"} 0.61
+"""
+
+
+def test_parse_pod_gauges_reads_waiting_and_running() -> None:
+    gauges = openloop.parse_pod_gauges(VLLM_METRICS)
+    assert gauges["waiting"] == 37.0
+    assert gauges["running"] == 12.0
+    # num_requests_swapped is absent on the V1 engine: genuinely zero, never an exception.
+    assert gauges["swapping"] == 0.0
+
+
+def test_parse_pod_gauges_sums_label_sets() -> None:
+    text = (
+        'vllm:num_requests_waiting{model_name="m",engine="0"} 3.0\n'
+        'vllm:num_requests_waiting{model_name="m",engine="1"} 4.0\n'
+    )
+    assert openloop.parse_pod_gauges(text)["waiting"] == 7.0
+
+
+def test_pod_sampler_sums_across_pods_and_survives_a_dead_pod() -> None:
+    def fetch(url: str) -> str:
+        if "dead" in url:
+            raise OSError("connection refused")
+        return VLLM_METRICS
+
+    sampler = openloop.make_pod_metrics_sampler(
+        ["http://a:8000/metrics", "http://b:8000/metrics", "http://dead:8000/metrics"],
+        fetch=fetch,
+    )
+    snap = sampler(0)
+    assert snap["waiting"] == 74.0  # two live pods
+    assert snap["scrape_errors"] == 1.0
+    assert snap["pods_scraped"] == 2.0
+
+
+def test_pod_sampler_requires_at_least_one_endpoint() -> None:
+    with pytest.raises(ValueError):
+        openloop.make_pod_metrics_sampler([])
+
+
+# ------------------------------------------------------------- grid alignment
+
+
+def test_mark_live_grid_tags_one_sample_per_10s_bucket() -> None:
+    samples = [{"ts_ms": 100_000 + 1000 * k, "waiting": 0.0} for k in range(25)]
+    tagged = openloop.mark_live_grid(samples)
+    on_grid = [s for s in tagged if s["on_live_grid"]]
+    # 25 s of 1 Hz samples straddle three 10 s buckets.
+    assert len(on_grid) == 3
+    assert [s["ts_ms"] for s in on_grid] == [100_000, 110_000, 120_000]
+
+
+def test_windows_observing_exposes_the_aliasing_the_bursts_target() -> None:
+    # A 3 s waiting-queue spike sitting between two live grid ticks: visible at 1 Hz,
+    # invisible at the gateway's 10 s cadence. This is exactly the failure mode that left
+    # avg_waiting == 0 in ~100 % of the 14b calibration windows.
+    samples = []
+    for k in range(65):  # two full 30 s windows (the last partial window is dropped)
+        ts = 0 + 1000 * k
+        waiting = 9.0 if 32 <= k < 35 else 0.0
+        samples.append({"ts_ms": ts, "waiting": waiting})
+    tagged = openloop.mark_live_grid(samples)
+
+    truth = openloop.windows_observing(tagged, window_ms=30_000)
+    aliased = openloop.windows_observing(tagged, window_ms=30_000, grid_only=True)
+    assert truth[0] == 1 and truth[1] == 2
+    assert aliased[0] == 0  # the controller would have seen an empty queue
+    assert aliased[1] == truth[1]
+
+
+# -------------------------------------------------------------------- driver
+
+
+class _FakeStream:
+    """Deterministic stand-in for the SSE seam: never touches the network."""
+
+    def __init__(self) -> None:
+        self.calls: list[bytes] = []
+
+    def __call__(self, url, headers, body, timeout):
+        from tre_replayer.engine.http_sender import StreamResult
+
+        self.calls.append(body)
+        payload = json.loads(body)
+        prompt = payload["prompt"]
+        n_in = len(prompt) if isinstance(prompt, list) else len(prompt.split())
+        return StreamResult(200, 11.0, 40.0, n_in, payload["max_tokens"])
+
+
+def test_drive_cell_schedule_writes_the_r3_raw_schema(tmp_path: Path) -> None:
+    from tre_replayer.engine.schedule import RpsSegment
+
+    seg = RpsSegment("dsqwen-7b", 0.0, 0.4, 40.0, input_tokens=256, max_output_tokens=128)
+    raw = tmp_path / "i256_o128_c60.jsonl"
+    instant = tmp_path / "i256_o128_c60.instant.jsonl"
+    stream = _FakeStream()
+    samples: list[int] = []
+
+    def sampler(now_ms: int) -> dict:
+        samples.append(now_ms)
+        return {"waiting": 2.0, "running": 1.0, "swapping": 0.0}
+
+    start_ms, end_ms, guard = openloop.drive_cell_schedule(
+        "http://gw/v1/completions", "dsqwen-7b", "i256_o128_c60", [seg],
+        raw_path=raw, instant_path=instant,
+        instant_sampler=sampler, instant_interval_s=0.05,
+        stream_call=stream,
+    )
+    assert end_ms >= start_ms
+    assert guard.ok, guard.issues
+    assert guard.sent == guard.scheduled > 0
+
+    rows = [json.loads(line) for line in raw.read_text().splitlines()]
+    assert len(rows) == guard.sent
+    # identical schema to the closed-loop path -> rewindow_from_raw needs no change
+    assert set(rows[0]) == set(r3_grid.RAW_COLUMNS)
+    assert rows[0]["cell_id"] == "i256_o128_c60"
+    assert rows[0]["input_tokens"] == 256 and rows[0]["output_tokens"] == 128
+
+    inst = [json.loads(line) for line in instant.read_text().splitlines()]
+    assert inst and all("on_live_grid" in s for s in inst)
+    assert all(s["waiting"] == 2.0 for s in inst)
+
+
+def test_drive_cell_schedule_sends_a_unique_prompt_per_request(tmp_path: Path) -> None:
+    # A shared prompt is served from the prefix cache and makes prefill free; the whole
+    # capacity surface then inverts (the 14b prior pathology).
+    from tre_replayer.engine.schedule import RpsSegment
+
+    seg = RpsSegment("dsqwen-7b", 0.0, 0.3, 50.0, input_tokens=64, max_output_tokens=16)
+    stream = _FakeStream()
+    openloop.drive_cell_schedule(
+        "http://gw/v1/completions", "dsqwen-7b", "i64_o16_c60", [seg], stream_call=stream
+    )
+    prompts = [tuple(json.loads(b)["prompt"]) for b in stream.calls]
+    assert len(prompts) > 3
+    assert len(set(prompts)) == len(prompts)
+
+
+def test_drive_cell_schedule_superposes_overlapping_segments() -> None:
+    # The bursts primitive relies on this: a spike segment laid on top of the base rate
+    # must add requests, not replace them.
+    from tre_replayer.engine.schedule import RpsSegment
+
+    base = RpsSegment("m", 0.0, 0.4, 20.0, input_tokens=32, max_output_tokens=8)
+    spike = RpsSegment("m", 0.1, 0.2, 200.0, input_tokens=32, max_output_tokens=8)
+    stream = _FakeStream()
+    _s, _e, only_base = openloop.drive_cell_schedule(
+        "http://gw", "m", "i32_o8_c60", [base], stream_call=stream
+    )
+    stream2 = _FakeStream()
+    _s, _e, both = openloop.drive_cell_schedule(
+        "http://gw", "m", "i32_o8_c60", [base, spike], stream_call=stream2
+    )
+    assert both.sent > only_base.sent
+
+
+def test_drive_cell_schedule_ignores_other_models_in_the_trace() -> None:
+    from tre_replayer.engine.schedule import RpsSegment
+
+    mine = RpsSegment("dsqwen-7b", 0.0, 0.2, 30.0, input_tokens=32, max_output_tokens=8)
+    theirs = RpsSegment("dsllama-8b", 0.0, 0.2, 30.0, input_tokens=32, max_output_tokens=8)
+    stream = _FakeStream()
+    _s, _e, guard = openloop.drive_cell_schedule(
+        "http://gw", "dsqwen-7b", "i32_o8_c60", [mine, theirs], stream_call=stream
+    )
+    assert guard.ok
+    assert all(json.loads(b)["model"] == "dsqwen-7b" for b in stream.calls)
