@@ -206,7 +206,7 @@ def test_drive_cell_schedule_writes_the_r3_raw_schema(tmp_path: Path) -> None:
         "http://gw/v1/completions", "dsqwen-7b", "i256_o128_c60", [seg],
         raw_path=raw, instant_path=instant,
         instant_sampler=sampler, instant_interval_s=0.05,
-        stream_call=stream,
+        stream_call=stream, prompt_mode="token_ids",
     )
     assert end_ms >= start_ms
     assert guard.ok, guard.issues
@@ -248,11 +248,11 @@ def test_drive_cell_schedule_superposes_overlapping_segments() -> None:
     spike = RpsSegment("m", 0.1, 0.2, 200.0, input_tokens=32, max_output_tokens=8)
     stream = _FakeStream()
     _s, _e, only_base = openloop.drive_cell_schedule(
-        "http://gw", "m", "i32_o8_c60", [base], stream_call=stream
+        "http://gw", "m", "i32_o8_c60", [base], stream_call=stream, prompt_mode="token_ids"
     )
     stream2 = _FakeStream()
     _s, _e, both = openloop.drive_cell_schedule(
-        "http://gw", "m", "i32_o8_c60", [base, spike], stream_call=stream2
+        "http://gw", "m", "i32_o8_c60", [base, spike], stream_call=stream2, prompt_mode="token_ids"
     )
     assert both.sent > only_base.sent
 
@@ -460,3 +460,58 @@ def test_failure_signature_keeps_the_body_verbatim() -> None:
     assert signature["failure_class"] == openloop.FAILURE_PROXY
     assert signature["error_body"] == MEASURED_SHED["error_body"]
     assert signature["error_headers"]["content-type"] == "text/plain"
+
+
+def test_routing_balance_counts_requests_per_pod() -> None:
+    records = [{"target_pod": "pod-a"}] * 6 + [{"target_pod": "pod-b"}] * 2
+    balance = openloop.routing_balance(records)
+    assert balance["pods"] == 2
+    assert balance["per_pod"] == {"pod-a": 6, "pod-b": 2}
+    assert balance["imbalance_ratio"] == 3.0
+    assert balance["attributed"] == 8 and balance["unattributed"] == 0
+
+
+def test_routing_balance_reports_unattributed_rather_than_claiming_balance() -> None:
+    """The campaign's serving path names no pod. That must read as 'not measured', not
+    as 'perfectly balanced' - the whole point of the check is to catch a hidden skew."""
+    balance = openloop.routing_balance([{"target_pod": None}, {}, {"target_pod": ""}])
+    assert balance["pods"] == 0
+    assert balance["attributed"] == 0 and balance["unattributed"] == 3
+    assert balance["imbalance_ratio"] is None
+
+
+def test_cell_guard_artifact_surfaces_the_routing_balance() -> None:
+    records = [_ok_record(pod="pod-a") for _ in range(4)] + [_ok_record(pod="pod-b")]
+    guard = openloop.check_cell("i128_o128_c4", scheduled=5, records=records, p99_delay_ms=1.0)
+    assert guard.ok, guard.issues
+    artifact = guard.as_dict()
+    assert artifact["routing_balance"]["per_pod"] == {"pod-a": 4, "pod-b": 1}
+    assert artifact["routing_balance"]["imbalance_ratio"] == 4.0
+
+
+def test_cell_guard_fails_an_imbalanced_cell_only_when_a_ceiling_is_set() -> None:
+    """An aggregate capacity signal averages over pods, so a skewed router hides one
+    pod's exploding p95 inside a healthy-looking Z. Off by default because nobody has
+    calibrated a threshold yet - reporting it is the deliverable, gating on it is opt-in."""
+    records = [_ok_record(pod="pod-a") for _ in range(9)] + [_ok_record(pod="pod-b")]
+    assert openloop.check_cell("c", scheduled=10, records=records, p99_delay_ms=1.0).ok
+    gated = openloop.check_cell(
+        "c", scheduled=10, records=records, p99_delay_ms=1.0, max_routing_imbalance=3.0
+    )
+    assert not gated.ok
+    assert any("imbalance" in issue for issue in gated.issues)
+
+
+def test_cell_guard_does_not_gate_on_a_single_pod() -> None:
+    records = [_ok_record(pod="pod-a") for _ in range(10)]
+    guard = openloop.check_cell(
+        "c", scheduled=10, records=records, p99_delay_ms=1.0, max_routing_imbalance=1.5
+    )
+    assert guard.ok, guard.issues
+
+
+def _ok_record(pod: str | None = None) -> dict:
+    return {
+        "http_status": 200, "e2e_ms": 120.0, "error": None, "pool_wait_ms": 0.0,
+        "target_pod": pod,
+    }

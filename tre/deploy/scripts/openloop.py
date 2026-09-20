@@ -212,6 +212,45 @@ class CellGuardError(RuntimeError):
     """A cell's load was not actually delivered as specified."""
 
 
+#: Default ceiling on a cell's per-pod request imbalance (max/min). None means "report
+#: the balance in the artifact but never fail on it", which is what the campaign uses:
+#: the number is new evidence, and turning it into a gate before anyone has looked at a
+#: run's worth of it would fail cells for a reason nobody has calibrated yet.
+DEFAULT_MAX_ROUTING_IMBALANCE: Optional[float] = None
+
+
+def routing_balance(records: Sequence[dict]) -> dict:
+    """How this cell's requests were spread over the pods that served them.
+
+    The capacity signal the calibration fits is an *aggregate* over a model's pods, so an
+    imbalanced router hides inside it: aggregate Z looks fine while one pod carries twice
+    its share and its p95 explodes. This is the check that makes that visible - but only
+    where the answers name a pod. On the per-model HTTPRoute path (the campaign default)
+    nothing does, so ``attributed`` is 0 and ``ratio`` is None; a reader must treat that
+    as "not measured", not as "balanced". See
+    :func:`tre_replayer.engine.http_sender.build_request_headers`.
+    """
+    counts: dict[str, int] = {}
+    for record in records:
+        pod = record.get("target_pod")
+        if pod:
+            counts[str(pod)] = counts.get(str(pod), 0) + 1
+    attributed = sum(counts.values())
+    values = sorted(counts.values())
+    ratio = None
+    if values and values[0] > 0:
+        ratio = values[-1] / values[0]
+    return {
+        "pods": len(counts),
+        "attributed": attributed,
+        "unattributed": max(0, len(records) - attributed),
+        "per_pod": dict(sorted(counts.items())),
+        "max_requests": values[-1] if values else None,
+        "min_requests": values[0] if values else None,
+        "imbalance_ratio": None if ratio is None else round(ratio, 4),
+    }
+
+
 #: Issue text prefix for the truncation-evidence verdict, so re-deciding it later can
 #: find and replace exactly that issue without disturbing the dispatch-level ones.
 TRUNCATION_EVIDENCE_ISSUE = "truncated before collecting enough evidence"
@@ -238,6 +277,9 @@ class CellGuard:
     #: Windows above the SLO collected before truncation; None when not yet counted.
     slo_windows: Optional[int] = None
     min_slo_windows: int = DEFAULT_MIN_SLO_WINDOWS
+    #: :func:`routing_balance` over this cell's records; None only for a guard built
+    #: before the balance was computed.
+    routing: Optional[dict] = None
     issues: tuple[str, ...] = ()
 
     @property
@@ -278,6 +320,7 @@ class CellGuard:
             "censored": self.censored,
             "slo_windows": self.slo_windows,
             "min_slo_windows": self.min_slo_windows,
+            "routing_balance": self.routing,
             "issues": list(self.issues),
             "ok": self.ok,
         }
@@ -329,6 +372,7 @@ def check_cell(
     censored: int = 0,
     slo_windows: Optional[int] = None,
     min_slo_windows: int = DEFAULT_MIN_SLO_WINDOWS,
+    max_routing_imbalance: Optional[float] = DEFAULT_MAX_ROUTING_IMBALANCE,
 ) -> CellGuard:
     """Verdict on a dispatched cell. Pure - takes the sender's records, no network.
 
@@ -372,6 +416,20 @@ def check_cell(
             f"p99 sender pool wait {p99_pool_wait_ms:.1f}ms > {max_p99_pool_wait_ms:.1f}ms "
             "(sender threads starved: the open loop degenerated into a closed loop)"
         )
+    routing = routing_balance(records)
+    imbalance = routing["imbalance_ratio"]
+    if (
+        max_routing_imbalance is not None
+        and imbalance is not None
+        and routing["pods"] > 1
+        and imbalance > max_routing_imbalance
+    ):
+        issues.append(
+            f"per-pod request imbalance {imbalance:.2f}x > {max_routing_imbalance:.2f}x "
+            f"across {routing['pods']} pod(s) ({routing['max_requests']} vs "
+            f"{routing['min_requests']}); the aggregate capacity signal averages over "
+            "pods, so one overloaded pod's p95 hides inside a healthy-looking Z"
+        )
     guard = CellGuard(
         cell_id=cell_id,
         scheduled=scheduled,
@@ -386,6 +444,7 @@ def check_cell(
         truncated_at_ts_ms=truncated_at_ts_ms,
         censored=int(censored),
         min_slo_windows=int(min_slo_windows),
+        routing=routing,
         issues=tuple(issues),
     )
     if slo_windows is not None:
@@ -635,7 +694,8 @@ def drive_cell_schedule(
     instant_path: Optional[Path] = None,
     instant_sampler: Optional[Callable[[int], dict]] = None,
     instant_interval_s: float = DEFAULT_SIDECAR_INTERVAL_S,
-    prompt_mode: str = "token_ids",
+    prompt_mode: Optional[str] = None,
+    routing_strategy: Optional[str] = None,
     max_in_flight: int = DEFAULT_MAX_IN_FLIGHT,
     stream_call: Optional[Callable] = None,
     now_ms: Callable[[], int] = lambda: int(time.time() * 1000),
@@ -656,6 +716,12 @@ def drive_cell_schedule(
     jumps to ``drain_start_s``; see :class:`TruncateOnProxyShed`. Classified failures are
     written verbatim to ``failures_path`` so a later reader can re-judge the attribution.
 
+    ``prompt_mode`` None means "whatever the sender defaults to"
+    (:data:`tre_replayer.engine.prompts.DEFAULT_MODE`), so the default lives in exactly
+    one place. ``routing_strategy`` moves the requests onto the AIBrix-routed path, which
+    is the only path that reports a serving pod and is therefore the only way
+    :func:`routing_balance` sees anything - at the cost of changing who picks the pod.
+
     The per-request raw lines use ``r3_grid.RAW_COLUMNS`` and the instant sidecar uses the
     ``r3_grid`` sidecar schema plus ``on_live_grid``, so the offline re-windowing path is
     unchanged (pass ``--instant-sample-ms 1000`` to ``rewindow_from_raw`` to match this
@@ -668,12 +734,14 @@ def drive_cell_schedule(
     events = [e for e in build_poisson_schedule(segments, seed=seed) if e.model == model]
     scheduled = len(events)
 
+    sender_kwargs = {} if prompt_mode is None else {"prompt_mode": prompt_mode}
     sender = StreamingHttpSender(
         gateway_url,
         stream_call=stream_call,
         max_in_flight=max_in_flight,
-        prompt_mode=prompt_mode,
+        routing_strategy=routing_strategy,
         now_ms=now_ms,
+        **sender_kwargs,
     )
     sidecar = None
     if instant_sampler is not None:
@@ -738,6 +806,7 @@ def _raw_from_sender_record(cell_id: str, record: dict) -> dict:
         done_ms=record.get("e2e_ms"),
         prompt_tokens=record.get("prompt_tokens"),
         completion_tokens=record.get("completion_tokens"),
+        target_pod=record.get("target_pod"),
     )
     return r3_grid.build_raw_record(cell_id, int(record["actual_send_ts_ms"]), res)
 

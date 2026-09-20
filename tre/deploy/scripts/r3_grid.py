@@ -156,6 +156,9 @@ RAW_COLUMNS = [
     "send_ts_ms", "recv_first_token_ts_ms", "done_ts_ms",
     "input_tokens", "output_tokens", "ttft_ms", "tpot_ms", "e2e_ms",
     "http_status", "cell_id",
+    # Pod that served the request, when the serving path names one. Per-pod attribution
+    # has to be captured here or not at all: nothing downstream can reconstruct it.
+    "target_pod",
 ]
 
 # S4 disk estimate: each per-request line is ~200 bytes of JSON. Warn if a full run is
@@ -214,12 +217,15 @@ class Checkpoint:
         return cell.scenario_id in self.done
 
 
-#: Mirror of ``tre_replayer.engine.prompts.MODE_TOKEN_IDS``, repeated here so importing
-#: this module never requires the replayer package (guarded by a test).
-PROMPT_MODE_DEFAULT = "token_ids"
+#: Mirror of ``tre_replayer.engine.prompts.DEFAULT_MODE`` and ``MODES``, repeated here so
+#: importing this module never requires the replayer package (guarded by a test).
+PROMPT_MODE_DEFAULT = "natural"
+PROMPT_MODES = ("token_ids", "text", "natural")
 
 
-def _make_prompt(input_tokens: int, seed_key: str, mode: str = PROMPT_MODE_DEFAULT):
+def _make_prompt(
+    input_tokens: int, seed_key: str, mode: str = PROMPT_MODE_DEFAULT, model: str | None = None
+):
     """One request's prompt: ``input_tokens`` long and unique to ``seed_key``.
 
     The grid used to send one constant prompt for a whole cell. On an engine with
@@ -231,7 +237,7 @@ def _make_prompt(input_tokens: int, seed_key: str, mode: str = PROMPT_MODE_DEFAU
     """
     from tre_replayer.engine.prompts import build_prompt
 
-    return build_prompt(input_tokens, seed_key, mode=mode)
+    return build_prompt(input_tokens, seed_key, mode=mode, model=model)
 
 
 def build_raw_record(cell_id: str, send_ts_ms: int, res) -> dict:
@@ -262,7 +268,15 @@ def build_raw_record(cell_id: str, send_ts_ms: int, res) -> dict:
         "e2e_ms": e2e_ms,
         "http_status": res.status,
         "cell_id": cell_id,
+        "target_pod": getattr(res, "target_pod", None),
     }
+
+
+def _request_headers(model: str, routing_strategy: Optional[str] = None) -> dict:
+    """Same rule as the replayer's sender; lazy import for the same reason."""
+    from tre_replayer.engine.http_sender import build_request_headers
+
+    return build_request_headers(model, routing_strategy)
 
 
 def _default_stream_call():
@@ -291,6 +305,7 @@ def drive_cell(
     instant_interval_s: float = 5.0,
     stream_call: Optional[Callable] = None,
     prompt_mode: str = PROMPT_MODE_DEFAULT,
+    routing_strategy: Optional[str] = None,
     run_key: str = "r3",
     now_ms: Callable[[], int] = lambda: int(time.time() * 1000),
 ) -> tuple[int, int]:
@@ -313,17 +328,13 @@ def drive_cell(
     lock = threading.Lock()
     cell_id = cell.scenario_id
     timeout = max(30.0, cell.output_tokens / 4.0)
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "text/event-stream",
-        "model": model,
-    }
+    headers = _request_headers(model, routing_strategy)
     # next() on an itertools.count is atomic under CPython, so the workers can share one
     # sequence without a lock; each value is used by exactly one request.
     sequence = itertools.count()
 
     def request_body(seq: int) -> bytes:
-        prompt = _make_prompt(cell.input_tokens, f"{run_key}|{cell_id}|{seq}", prompt_mode)
+        prompt = _make_prompt(cell.input_tokens, f"{run_key}|{cell_id}|{seq}", prompt_mode, model)
         return json.dumps({
             "model": model, "prompt": prompt, "max_tokens": cell.output_tokens,
             "temperature": 0, "ignore_eos": True,
@@ -526,6 +537,7 @@ def run_schedule_cell(args, store, spec) -> tuple[list, "openloop.CellGuard"]:
         instant_sampler=sampler,
         instant_interval_s=args.instant_sample_ms / 1000.0,
         prompt_mode=args.prompt_mode,
+        routing_strategy=args.routing_strategy,
         max_in_flight=args.max_in_flight,
         truncate_on_proxy_shed=args.truncate_on_proxy_shed,
         drain_start_s=drain_start_s,
@@ -535,6 +547,7 @@ def run_schedule_cell(args, store, spec) -> tuple[list, "openloop.CellGuard"]:
             "max_p99_pool_wait_ms": args.max_p99_pool_wait_ms,
             "max_model_error_rate": args.max_model_error_rate,
             "min_slo_windows": args.min_slo_windows,
+            "max_routing_imbalance": args.max_routing_imbalance,
         },
     )
 
@@ -565,6 +578,10 @@ def run_schedule_cell(args, store, spec) -> tuple[list, "openloop.CellGuard"]:
         "start_ms": start_ms,
         "end_ms": end_ms,
         "instant_sample_ms": args.instant_sample_ms,
+        # How the load was actually generated and routed. Recorded per cell because a
+        # capacity number is only comparable to another one made the same way.
+        "prompt_mode": args.prompt_mode,
+        "routing_strategy": args.routing_strategy,
     })
     if raw_dir is not None:
         (raw_dir / f"{cell_id}.guard.json").write_text(
@@ -649,7 +666,22 @@ def main() -> int:
     # Prompt synthesis. token_ids sends an explicit token-id list, so the realised
     # prompt length is exact; text is the fallback for an endpoint that only accepts a
     # string. Either way each request gets its own prompt (no prefix-cache freebies).
-    ap.add_argument("--prompt-mode", default=PROMPT_MODE_DEFAULT, choices=["token_ids", "text"])
+    ap.add_argument("--prompt-mode", default=PROMPT_MODE_DEFAULT, choices=list(PROMPT_MODES),
+                    help="natural: English prose cut to the exact token count with the "
+                         "model's own tokenizer (default). token_ids: uniformly random "
+                         "ids - exact, but not language. text: nominal length only.")
+    ap.add_argument("--routing-strategy", default=None,
+                    help="Route via the AIBrix gateway plugin with this strategy (e.g. "
+                         "least-request) instead of the per-model HTTPRoute. This is the "
+                         "only way the answers name a serving pod, so it is what makes "
+                         "the per-pod routing-balance check in the guard artifact "
+                         "non-empty - but it also changes who picks the pod, so runs made "
+                         "with and without it are not comparable.")
+    ap.add_argument("--max-routing-imbalance", type=float,
+                    default=openloop.DEFAULT_MAX_ROUTING_IMBALANCE,
+                    help="Fail a cell whose busiest pod served more than this multiple of "
+                         "its quietest pod's requests. Unset by default: the balance is "
+                         "reported in the guard artifact but never gates a cell.")
     # Seeds prompt content. Defaults to the output stem so two runs writing different
     # CSVs differ, and re-running the same output reproduces the same prompts.
     ap.add_argument("--run-key", default=None)
@@ -773,7 +805,8 @@ def main() -> int:
             args.gateway_url, args.model, cell, args.cell_seconds,
             raw_path=raw_path, instant_path=instant_path,
             instant_sampler=instant_sampler, instant_interval_s=args.instant_sample_ms / 1000.0,
-            prompt_mode=args.prompt_mode, run_key=run_key,
+            prompt_mode=args.prompt_mode, routing_strategy=args.routing_strategy,
+            run_key=run_key,
         )
         windows = []
         w = start_ms

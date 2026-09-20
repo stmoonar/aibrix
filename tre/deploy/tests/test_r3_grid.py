@@ -324,9 +324,13 @@ def test_enumerate_cells_accepts_generators_full_cartesian():
 
 
 def test_prompt_mode_default_mirrors_the_replayer_constant() -> None:
+    """The grid mirrors the replayer's constants rather than importing them (so this
+    module imports without the replayer package), which only works while a test pins the
+    two together."""
     from tre_replayer.engine import prompts
 
-    assert r3_grid.PROMPT_MODE_DEFAULT == prompts.MODE_TOKEN_IDS
+    assert r3_grid.PROMPT_MODE_DEFAULT == prompts.DEFAULT_MODE == prompts.MODE_NATURAL
+    assert tuple(r3_grid.PROMPT_MODES) == tuple(prompts.MODES)
 
 
 def test_drive_cell_sends_a_distinct_prompt_of_the_requested_length_per_request() -> None:
@@ -348,6 +352,7 @@ def test_drive_cell_sends_a_distinct_prompt_of_the_requested_length_per_request(
     cell = r3_grid.GridCell(128, 8, 4)
     r3_grid.drive_cell(
         "http://gw", "m", cell, 0.2, stream_call=fake_call, run_key="unit",
+        prompt_mode="token_ids",
     )
 
     assert len(bodies) >= 8  # 4 workers x 0.2 s against an instant fake
@@ -374,7 +379,7 @@ def test_drive_cell_prompts_are_reproducible_for_the_same_run_key() -> None:
 
         r3_grid.drive_cell(
             "http://gw", "m", r3_grid.GridCell(16, 4, 1), 0.1,
-            stream_call=fake_call, run_key=run_key,
+            stream_call=fake_call, run_key=run_key, prompt_mode="token_ids",
         )
         return [b["prompt"] for b in bodies]
 
@@ -383,3 +388,50 @@ def test_drive_cell_prompts_are_reproducible_for_the_same_run_key() -> None:
     assert n >= 2
     assert first[:n] == second[:n]  # same run key, same prompt sequence
     assert other[:n] != first[:n]  # a different run key moves them
+
+
+def test_raw_record_carries_the_serving_pod() -> None:
+    """Per-pod attribution has to survive into the raw JSONL: nothing offline can
+    reconstruct which pod served a request once the response headers are gone."""
+    from types import SimpleNamespace
+
+    res = SimpleNamespace(
+        status=200, first_token_ms=10.0, done_ms=50.0, prompt_tokens=8,
+        completion_tokens=4, target_pod="dsqwen-7b-node9-gpu-0-abc",
+    )
+    rec = r3_grid.build_raw_record("i128_o128_c1", send_ts_ms=1_000, res=res)
+    assert rec["target_pod"] == "dsqwen-7b-node9-gpu-0-abc"
+    assert "target_pod" in r3_grid.RAW_COLUMNS
+    assert set(rec.keys()) == set(r3_grid.RAW_COLUMNS)
+
+
+def test_raw_record_pod_is_null_when_the_seam_does_not_report_one() -> None:
+    from types import SimpleNamespace
+
+    res = SimpleNamespace(
+        status=200, first_token_ms=10.0, done_ms=50.0, prompt_tokens=8, completion_tokens=4
+    )
+    assert r3_grid.build_raw_record("i128_o128_c1", send_ts_ms=1_000, res=res)["target_pod"] is None
+
+
+def test_drive_cell_routing_strategy_changes_the_request_headers() -> None:
+    seen: list[dict] = []
+
+    class _Res:
+        status = 200
+        first_token_ms = 1.0
+        done_ms = 2.0
+        prompt_tokens = 16
+        completion_tokens = 4
+
+    def fake_call(url, headers, body, timeout):
+        seen.append(dict(headers))
+        return _Res()
+
+    r3_grid.drive_cell(
+        "http://gw", "dsqwen-7b", r3_grid.GridCell(16, 4, 1), 0.1,
+        stream_call=fake_call, run_key="unit", prompt_mode="token_ids",
+        routing_strategy="least-request",
+    )
+    assert seen and seen[0]["routing-strategy"] == "least-request"
+    assert "model" not in seen[0]  # else the per-model HTTPRoute wins and no pod is named
