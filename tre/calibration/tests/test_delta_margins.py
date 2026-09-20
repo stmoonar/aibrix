@@ -125,3 +125,88 @@ def test_delta_crit_falls_back_when_no_window_is_labelled_critical() -> None:
     assert fit.crit.used_fallback is True
     assert fit.crit.delta == pytest.approx(FALLBACK_DELTA_CRIT)
     assert fit.crit.tau == pytest.approx(1.0 - FALLBACK_DELTA_CRIT)
+
+
+def _floor_fixture() -> list[CalibrationWindow]:
+    """Windows where the best-BA threshold misses the recall floor by exactly one window.
+
+    20 critical windows: 16 at z <= 0.80, 2 in the last per-mille under z = 1, 2 above it.
+    The best threshold (~0.84) recalls 16 of 20 = 0.80 with perfect specificity; the floor
+    of 0.85 needs 17. Every candidate that clears the floor has to reach into the busy-but-
+    healthy crowd just under tau_low, and the best of those is clipped to the bound - so
+    the floor, applied first, buys 0.05 of recall for 0.20 of balanced accuracy. This is
+    dsqwen-14b's situation in miniature (116 of 137 recalled, 117 needed).
+    """
+    rows: list[CalibrationWindow] = []
+    index = 0
+    for i in range(16):  # criticals, comfortably below the split
+        rows.append(_window(index, signal=THETA * (0.50 + 0.02 * i), slo_met=False,
+                            latency_ratio_p95=2.0, queue_raw=40.0))
+        index += 1
+    for z in (0.995, 0.997):  # criticals hiding in the last per-mille under tau_low
+        rows.append(_window(index, signal=THETA * z, slo_met=False,
+                            latency_ratio_p95=2.0, queue_raw=40.0))
+        index += 1
+    for z in (1.10, 1.20):  # criticals above tau_low: their quantiles get clipped
+        rows.append(_window(index, signal=THETA * z, slo_met=False,
+                            latency_ratio_p95=2.0, queue_raw=40.0))
+        index += 1
+    for i in range(30):  # healthy but busy: between the split and tau_low
+        rows.append(_window(index, signal=THETA * (0.86 + 0.004 * i), slo_met=True,
+                            latency_ratio_p95=0.85, queue_raw=14.0))
+        index += 1
+    for i in range(30):  # healthy with headroom
+        rows.append(_window(index, signal=THETA * (1.10 + 0.02 * i), slo_met=True,
+                            latency_ratio_p95=0.30, queue_raw=2.0))
+        index += 1
+    return rows
+
+
+def test_soft_floor_keeps_the_best_balanced_accuracy_candidate() -> None:
+    fit = fit_delta_margins(_floor_fixture(), theta=THETA)
+
+    assert fit.crit.floor_mode == "soft"
+    assert fit.crit.meets_target_floor is False  # one window short of 0.85
+    assert fit.crit.recall_pos == pytest.approx(0.80)
+    assert fit.crit.clamped is False and fit.crit.clamp_reason is None
+    assert fit.crit.tau < 0.9  # a real threshold, not the tau_low bound
+    assert fit.crit.delta > 0.05
+
+
+def test_strict_floor_reproduces_the_clamped_choice_and_records_it() -> None:
+    soft = fit_delta_margins(_floor_fixture(), theta=THETA)
+    strict = fit_delta_margins(_floor_fixture(), theta=THETA, floor_mode="strict")
+
+    assert strict.crit.floor_mode == "strict"
+    assert strict.crit.meets_target_floor is True
+    # The floor outranks the objective, so strict pays for it in balanced accuracy...
+    assert strict.crit.balanced_accuracy < soft.crit.balanced_accuracy
+    # ...and lands on the bound, which must now be visible rather than silent.
+    assert strict.crit.clamped is True
+    assert strict.crit.clamp_reason == "quantile_on_wrong_side_of_tau_low_clipped_to_bound"
+    assert strict.crit.tau == pytest.approx(1.0 - 1e-6)
+    assert strict.crit.used_fallback is False  # the old silent-clamp signature
+
+
+def test_clamp_is_recorded_when_every_candidate_sits_above_tau_low() -> None:
+    rows: list[CalibrationWindow] = []
+    index = 0
+    for i in range(10):  # all critical windows above tau_low: no candidate can fit below
+        rows.append(_window(index, signal=THETA * (1.05 + 0.03 * i), slo_met=False,
+                            latency_ratio_p95=2.0, queue_raw=40.0))
+        index += 1
+    for i in range(10):
+        rows.append(_window(index, signal=THETA * (1.40 + 0.05 * i), slo_met=True,
+                            latency_ratio_p95=0.30, queue_raw=2.0))
+        index += 1
+
+    fit = fit_delta_margins(rows, theta=THETA)
+
+    assert fit.crit.clamped is True
+    assert fit.crit.clamp_reason is not None
+    assert fit.crit.delta == pytest.approx(1e-6)
+
+
+def test_unknown_floor_mode_is_rejected() -> None:
+    with pytest.raises(ValueError):
+        fit_delta_margins(_windows(), theta=THETA, floor_mode="lenient")

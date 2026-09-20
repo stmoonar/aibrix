@@ -12,9 +12,11 @@ from tre_calibration.evaluate import evaluate_signal_direction
 from tre_calibration.fit import (
     DEFAULT_CRITICAL_VIOLATION_QUANTILE,
     DEFAULT_HEALTHY_QUANTILE_CANDIDATES,
+    DEFAULT_DELTA_FLOOR_MODE,
     DEFAULT_MIN_CRITICAL_RECALL,
     DEFAULT_MIN_HEALTHY_RECALL,
     DEFAULT_MIN_SURPLUS_PRECISION,
+    FLOOR_MODES,
     DEFAULT_SURPLUS_LATENCY_QUANTILE,
     DEFAULT_SURPLUS_QUEUE_QUANTILE,
     DEFAULT_THETA_CRITERION,
@@ -77,6 +79,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             surplus_queue_quantile=args.surplus_queue_quantile,
             min_critical_recall=args.min_critical_recall,
             min_surplus_precision=args.min_surplus_precision,
+            floor_mode=args.delta_floor_mode,
         )
 
     direction = evaluate_signal_direction(windows)
@@ -96,6 +99,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "latency_slo_ms": dict(sorted(latency_slo_ms.items())),
         "max_single_scenario_ratio": args.max_single_scenario_ratio,
         "min_confidence": args.min_confidence,
+        "delta_floor_mode": args.delta_floor_mode,
         "min_critical_recall": args.min_critical_recall,
         "min_healthy_recall": args.min_healthy_recall,
         "min_scenario_families": args.min_scenario_families,
@@ -198,6 +202,16 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument("--surplus-queue-quantile", type=float, default=DEFAULT_SURPLUS_QUEUE_QUANTILE)
     parser.add_argument("--min-critical-recall", type=float, default=DEFAULT_MIN_CRITICAL_RECALL)
     parser.add_argument("--min-surplus-precision", type=float, default=DEFAULT_MIN_SURPLUS_PRECISION)
+    parser.add_argument(
+        "--delta-floor-mode",
+        choices=list(FLOOR_MODES),
+        default=DEFAULT_DELTA_FLOOR_MODE,
+        help=(
+            "how the acceptance floors rank candidates: soft (default) selects on "
+            "balanced accuracy and uses the floor only as a tie-break; strict keeps "
+            "the older behaviour where a candidate missing the floor always loses"
+        ),
+    )
     parser.add_argument("--w-p", type=float, default=0.04)
     parser.add_argument("--lambda-wait", type=float, default=2.625)
     parser.add_argument("--qmin", type=float, default=1.0)

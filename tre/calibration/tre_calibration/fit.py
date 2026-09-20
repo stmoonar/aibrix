@@ -193,6 +193,26 @@ DEFAULT_SURPLUS_QUEUE_QUANTILE = 0.50
 DEFAULT_MIN_CRITICAL_RECALL = 0.85
 DEFAULT_MIN_SURPLUS_PRECISION = 0.80
 
+#: How the acceptance floor enters the candidate choice.
+#:
+#: ``strict`` is lexicographic: a candidate that misses the floor loses to any candidate
+#: that meets it, whatever their balanced accuracies. That is how dsqwen-14b's LOW band
+#: collapsed - its best-BA candidate recalled 116 of 137 critical windows against a floor
+#: needing 117, so only candidates clipped to the ``tau_low`` bound survived and
+#: ``tau_crit`` came out at ``tau_low - 1e-6``.
+#:
+#: ``soft`` (the default) selects on balanced accuracy and uses the floor only to break
+#: ties, so one window either side of the floor can no longer flip the fit. The mode that
+#: ran is recorded on the result and therefore in the artifact.
+FLOOR_MODE_SOFT = "soft"
+FLOOR_MODE_STRICT = "strict"
+FLOOR_MODES = (FLOOR_MODE_SOFT, FLOOR_MODE_STRICT)
+DEFAULT_DELTA_FLOOR_MODE = FLOOR_MODE_SOFT
+
+#: A fitted tau this close to a bound is reported as ``clamped`` - the band it opens is
+#: degenerate, and the number must never look like an ordinary fit.
+CLAMP_TOLERANCE = 1e-5
+
 #: Weights blending the p95 and average latency-ratio into one severity score.
 DEFAULT_P95_WEIGHT = 0.8
 DEFAULT_AVG_WEIGHT = 0.2
@@ -240,6 +260,12 @@ class DeltaMarginFit:
     meets_target_floor: bool
     used_fallback: bool
     reject_reason: str | None
+    #: Which role the acceptance floor played (see :data:`DEFAULT_DELTA_FLOOR_MODE`).
+    floor_mode: str = DEFAULT_DELTA_FLOOR_MODE
+    #: True when ``tau`` sits on (or within :data:`CLAMP_TOLERANCE` of) a bound rather
+    #: than where the data put it. A clamped side opens a degenerate band.
+    clamped: bool = False
+    clamp_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -381,6 +407,7 @@ def fit_delta_margins(
     candidate_quantiles: Sequence[float] = DEFAULT_DELTA_CANDIDATE_QUANTILES,
     min_critical_recall: float = DEFAULT_MIN_CRITICAL_RECALL,
     min_surplus_precision: float = DEFAULT_MIN_SURPLUS_PRECISION,
+    floor_mode: str = DEFAULT_DELTA_FLOOR_MODE,
     fallback_delta_crit: float = FALLBACK_DELTA_CRIT,
     fallback_delta_high: float = FALLBACK_DELTA_HIGH,
 ) -> DeltaMarginsFit:
@@ -392,6 +419,11 @@ def fit_delta_margins(
     ``critical_violation_quantile`` of all violations; *surplus* = a healthy window
     that is both comfortable on latency and short on queue. ``surplus`` labels require
     ``queue_raw``; without it the high side falls back to ``fallback_delta_high``.
+
+    ``min_critical_recall`` / ``min_surplus_precision`` are acceptance floors whose role
+    is set by ``floor_mode``: ``soft`` (default) ranks candidates by balanced accuracy and
+    only breaks ties with the floor, ``strict`` keeps the older lexicographic filter. Each
+    side reports the mode it ran under and whether its ``tau`` ended up clamped to a bound.
     """
     if not math.isfinite(theta) or theta <= 0.0:
         raise ValueError("theta must be finite and positive")
@@ -453,6 +485,7 @@ def fit_delta_margins(
         tau_low=tau_low,
         candidate_quantiles=candidate_quantiles,
         target_floor=min_critical_recall,
+        floor_mode=floor_mode,
         fallback_delta=fallback_delta_crit,
     )
     high = _fit_one_delta_margin(
@@ -462,6 +495,7 @@ def fit_delta_margins(
         tau_low=tau_low,
         candidate_quantiles=candidate_quantiles,
         target_floor=min_surplus_precision,
+        floor_mode=floor_mode,
         fallback_delta=fallback_delta_high,
     )
 
@@ -489,10 +523,13 @@ def _fit_one_delta_margin(
     tau_low: float,
     candidate_quantiles: Sequence[float],
     target_floor: float,
+    floor_mode: str = DEFAULT_DELTA_FLOOR_MODE,
     fallback_delta: float,
 ) -> DeltaMarginFit:
     if direction not in {"low", "high"}:
         raise ValueError("direction must be low or high")
+    if floor_mode not in FLOOR_MODES:
+        raise ValueError(f"floor_mode must be one of {FLOOR_MODES}, got {floor_mode!r}")
 
     finite = [(float(s), int(l)) for s, l in zip(scores, labels) if math.isfinite(s)]
     positive_scores = [s for s, l in finite if l == 1]
@@ -503,38 +540,54 @@ def _fit_one_delta_margin(
             fallback_delta=fallback_delta,
             reject_reason="insufficient_label_separation",
             candidate_count=0,
+            floor_mode=floor_mode,
         )
 
     best: dict[str, float] | None = None
     best_quantile: float | None = None
     candidate_count = 0
     for quantile in candidate_quantiles:
-        tau = _quantile(positive_scores, quantile)
-        if tau is None or not math.isfinite(tau):
+        raw_tau = _quantile(positive_scores, quantile)
+        if raw_tau is None or not math.isfinite(raw_tau):
             continue
-        tau = min(tau, tau_low - 1e-6) if direction == "low" else max(tau, tau_low + 1e-6)
+        bound = tau_low - 1e-6 if direction == "low" else tau_low + 1e-6
+        tau = min(raw_tau, bound) if direction == "low" else max(raw_tau, bound)
         metrics = _threshold_metrics_at(scores, labels, tau, direction=direction)
         meets = (
             metrics["recall_pos"] >= target_floor
             if direction == "low"
             else metrics["precision_pos"] >= target_floor
         )
-        candidate = {"tau": tau, "meets_target_floor": 1.0 if meets else 0.0, **metrics}
+        candidate = {
+            "tau": tau,
+            "meets_target_floor": 1.0 if meets else 0.0,
+            "clipped_to_bound": 1.0 if tau != raw_tau else 0.0,
+            **metrics,
+        }
         candidate_count += 1
         if best is None:
             best, best_quantile = candidate, quantile
             continue
         best_ok = bool(best["meets_target_floor"])
         cand_ok = bool(candidate["meets_target_floor"])
-        if cand_ok and not best_ok:
-            best, best_quantile = candidate, quantile
-            continue
-        if best_ok and not cand_ok:
-            continue
+        if floor_mode == FLOOR_MODE_STRICT:
+            # Lexicographic: the floor outranks the objective. Kept for reproducing
+            # older fits; see DEFAULT_DELTA_FLOOR_MODE for why it is not the default.
+            if cand_ok and not best_ok:
+                best, best_quantile = candidate, quantile
+                continue
+            if best_ok and not cand_ok:
+                continue
         if candidate["balanced_accuracy"] > best["balanced_accuracy"] + 1e-12:
             best, best_quantile = candidate, quantile
             continue
         if best["balanced_accuracy"] > candidate["balanced_accuracy"] + 1e-12:
+            continue
+        # Equal balanced accuracy: now the acceptance floor speaks (soft mode's only say).
+        if cand_ok and not best_ok:
+            best, best_quantile = candidate, quantile
+            continue
+        if best_ok and not cand_ok:
             continue
         secondary = "precision_pos" if direction == "low" else "recall_pos"
         if candidate[secondary] > best[secondary] + 1e-12:
@@ -552,9 +605,13 @@ def _fit_one_delta_margin(
             fallback_delta=fallback_delta,
             reject_reason="no_valid_candidates",
             candidate_count=candidate_count,
+            floor_mode=floor_mode,
         )
 
     tau = float(best["tau"])
+    clamped, clamp_reason = _clamp_state(
+        tau, tau_low, clipped=bool(best["clipped_to_bound"])
+    )
     return DeltaMarginFit(
         delta=abs(tau - tau_low),
         tau=tau,
@@ -568,7 +625,28 @@ def _fit_one_delta_margin(
         meets_target_floor=bool(best["meets_target_floor"]),
         used_fallback=False,
         reject_reason=None,
+        floor_mode=floor_mode,
+        clamped=clamped,
+        clamp_reason=clamp_reason,
     )
+
+
+def _clamp_state(tau: float, tau_low: float, *, clipped: bool) -> tuple[bool, str | None]:
+    """Was ``tau`` put where the data wanted it, or on a bound?
+
+    ``clipped`` means the candidate quantile fell on the wrong side of ``tau_low`` and was
+    pushed back to the bound. Either way, a ``tau`` within :data:`CLAMP_TOLERANCE` of
+    ``tau_low`` opens an empty band, so it is reported rather than returned silently.
+    """
+    if abs(tau - tau_low) <= CLAMP_TOLERANCE:
+        return True, (
+            "quantile_on_wrong_side_of_tau_low_clipped_to_bound"
+            if clipped
+            else "tau_within_clamp_tolerance_of_tau_low"
+        )
+    if clipped:
+        return True, "quantile_on_wrong_side_of_tau_low_clipped_to_bound"
+    return False, None
 
 
 def _delta_fallback(
@@ -578,8 +656,10 @@ def _delta_fallback(
     fallback_delta: float,
     reject_reason: str,
     candidate_count: int,
+    floor_mode: str = DEFAULT_DELTA_FLOOR_MODE,
 ) -> DeltaMarginFit:
     tau = tau_low - fallback_delta if direction == "low" else tau_low + fallback_delta
+    clamped, clamp_reason = _clamp_state(tau, tau_low, clipped=False)
     return DeltaMarginFit(
         delta=abs(tau - tau_low),
         tau=tau,
@@ -593,6 +673,9 @@ def _delta_fallback(
         meets_target_floor=False,
         used_fallback=True,
         reject_reason=reject_reason,
+        floor_mode=floor_mode,
+        clamped=clamped,
+        clamp_reason=clamp_reason,
     )
 
 

@@ -90,6 +90,7 @@ def main():
         "generated_at": GENERATED_AT,
         "trim_ramp_windows": TRIM,
         "theta_criterion": "balanced_accuracy",
+        "delta_floor_mode": "soft",
         "min_healthy_recall": 0.0,
         "healthy_quantile_candidates": list(DEFAULT_HEALTHY_QUANTILE_CANDIDATES),
         "models": {},
@@ -110,6 +111,8 @@ def main():
         ba = fit_theta_by_balanced_accuracy(windows, min_healthy_recall=0.0)
         ba_floor = fit_theta_by_balanced_accuracy(windows, min_healthy_recall=0.90)
         delta = fit_delta_margins(windows, theta=ba.theta)
+        # kept only as a comparison: the lexicographic floor that collapsed 14b's LOW band
+        delta_strict = fit_delta_margins(windows, theta=ba.theta, floor_mode="strict")
 
         direction = evaluate_signal_direction(windows)
         score = ParameterCandidateScore(
@@ -120,6 +123,7 @@ def main():
         )
         fit_config = {
             "critical_violation_quantile": 0.65,
+            "delta_floor_mode": "soft",
             "fit_delta": True,
             "healthy_quantile_candidates": list(DEFAULT_HEALTHY_QUANTILE_CANDIDATES),
             "latency_slo_ms": dict(sorted(cfg["slo"].items())),
@@ -154,6 +158,16 @@ def main():
             delta_fit=delta, inputs=inputs,
         )
         patch["comparison"] = {
+            "delta_with_strict_floor": {
+                "delta_crit": delta_strict.crit.delta,
+                "delta_high": delta_strict.high.delta,
+                "tau_crit": delta_strict.crit.tau,
+                "tau_high": delta_strict.high.tau,
+                "crit_balanced_accuracy": delta_strict.crit.balanced_accuracy,
+                "crit_recall_pos": delta_strict.crit.recall_pos,
+                "crit_clamped": delta_strict.crit.clamped,
+                "crit_clamp_reason": delta_strict.crit.clamp_reason,
+            },
             "theta_live": cfg["theta_live"],
             "theta_ratio_vs_live": ba.theta / cfg["theta_live"],
             "reliability_criterion_theta": rel.theta,
@@ -169,6 +183,13 @@ def main():
             json.dumps(patch, indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )
         summary["models"][cfg["model"]] = {
+            "delta_crit_clamped": delta.crit.clamped,
+            "delta_crit_clamp_reason": delta.crit.clamp_reason,
+            "delta_crit_meets_recall_floor": delta.crit.meets_target_floor,
+            "delta_crit_strict_floor": delta_strict.crit.delta,
+            "delta_floor_mode": "soft",
+            "delta_high_clamped": delta.high.clamped,
+            "delta_high_strict_floor": delta_strict.high.delta,
             "csv_path": cfg["csv"],
             "csv_sha256": inputs["csv_sha256"],
             "window_count": len(windows),
@@ -192,7 +213,8 @@ def main():
             f"{cfg['model']}: n={len(windows)} cells={inputs['scenario_count']} "
             f"theta={ba.theta:.4f} ({ba.theta / cfg['theta_live']:.3f}x live) "
             f"q={ba.healthy_quantile} BA={ba.balanced_accuracy:.4f} rec={ba.recall_good:.3f} "
-            f"| d_crit={delta.crit.delta:.4f} d_high={delta.high.delta:.4f} "
+            f"| d_crit={delta.crit.delta:.4f} (strict {delta_strict.crit.delta:.4f}, "
+            f"clamped={delta.crit.clamped}) d_high={delta.high.delta:.4f} "
             f"| reliability={rel.theta:.6f} repro={abs(rel.theta - cfg['theta_live']) < 1e-6}"
         )
 

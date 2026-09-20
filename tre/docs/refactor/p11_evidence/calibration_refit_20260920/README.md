@@ -22,6 +22,14 @@ the same low-theta bias.
 per model from severity-labelled windows, so the control bands are model-specific
 instead of the generic 0.2 / 0.25.
 
+The acceptance floors (`min_critical_recall = 0.85`, `min_surplus_precision = 0.80`) are
+now **soft**: candidates are ranked by balanced accuracy and the floor only breaks ties
+(`delta_floor_mode = "soft"`, recorded in every artifact). They used to be a hard
+pre-filter that outranked the objective, which is what collapsed dsqwen-14b's LOW band —
+see *The 14b clamp* below. The old behaviour is still reachable with
+`--delta-floor-mode strict` and is reported per model under
+`comparison.delta_with_strict_floor`.
+
 ## Files
 
 | file | contents |
@@ -51,20 +59,58 @@ to a default.
 
 ## Results
 
-| model | theta (was) | theta (now) | x live | healthy quantile | in-sample BA | delta_crit (was 0.2515 / 0.44) | delta_high (was 0.6296 / 0.26) |
+| model | theta (was) | theta (now) | x live | healthy quantile | in-sample BA | delta_crit | delta_high |
 |---|---|---|---|---|---|---|---|
-| dsqwen-7b | 993.469 | 1718.237 | 1.730 | 0.20 | 0.867 | 0.0881 | 0.2967 |
-| dsllama-8b | 1290.915 | 1494.662 | 1.158 | 0.20 | 0.861 | 0.1113 | 0.3976 |
-| dsqwen-14b | 1020.235 | 1414.082 | 1.386 | 0.15 | 0.902 | 1.0e-06 | 0.6930 |
+| dsqwen-7b | 993.469 | 1718.237 | 1.730 | 0.20 | 0.867 | 0.2087 | 0.2967 |
+| dsllama-8b | 1290.915 | 1494.662 | 1.158 | 0.20 | 0.861 | 0.2112 | 0.3976 |
+| dsqwen-14b | 1020.235 | 1414.082 | 1.386 | 0.15 | 0.902 | 0.1727 | 0.4448 |
+
+`theta` is unchanged by the soft floor — only the margins move. Against the hard-filter
+fit that this directory first shipped (and against the pre-refit deployed bands):
+
+| model | delta_crit deployed | delta_crit hard filter | delta_crit now | delta_high deployed | delta_high hard filter | delta_high now |
+|---|---|---|---|---|---|---|
+| dsqwen-7b | 0.2515 | 0.0881 | **0.2087** | 0.6296 | 0.2967 | **0.2967** |
+| dsllama-8b | 0.2515 | 0.1113 | **0.2112** | 0.6296 | 0.3976 | **0.3976** |
+| dsqwen-14b | 0.44 | 1.0e-06 | **0.1727** | 0.26 | 0.6930 | **0.4448** |
+
+Every side of every fit now also carries `clamped` / `clamp_reason`; all six are
+`clamped: false` in this refit.
 
 Reproduction check: running `fit_theta_by_reliability` on the same loaded windows
 returns the deployed thetas bit-exactly for all three models, so the difference is the
 criterion and nothing else.
 
-dsqwen-14b's `delta_crit` collapses to the clamp (`tau_crit = 0.999999`). That is not a
-fit failure — every candidate quantile of its critically-labelled `z` sits above 1.0,
-i.e. in R3 its severe violations do not occur at low `Z`. Its LOW band is therefore
-empty and anything under `Z = 1` is CRITICAL.
+### The 14b clamp
+
+An earlier version of this README said dsqwen-14b's `delta_crit` collapsed to
+`tau_crit = 0.999999` because "every candidate quantile of its critically-labelled `z`
+sits above 1.0". **That is wrong.** Only 2 of the 19 candidate quantiles (q = 0.90 and
+0.95) are above 1.0; the other 17 sit between 0.594 and 0.938, and the severe violations
+are spread right across that range.
+
+The real cause was the acceptance floor being applied as a hard pre-filter, ahead of the
+objective. With 137 critically-labelled windows the 0.85 floor needs 117 of them
+recalled. The candidate quantiles give:
+
+| q | tau | critical windows recalled | balanced accuracy |
+|---|---|---|---|
+| 0.75 | 0.8273 | 103 / 137 (0.752) | **0.8418** (best) |
+| 0.80 | 0.8838 | 109 / 137 (0.796) | 0.8373 |
+| 0.85 | 0.9377 | 116 / 137 (0.847) | 0.8343 |
+| 0.90 | 1.0344 → clipped to 0.999999 | 119 / 137 (0.869) | 0.8230 |
+| 0.95 | 1.1239 → clipped to 0.999999 | 119 / 137 (0.869) | 0.8230 |
+
+q = 0.85 misses the floor **by one window** (116, needs 117). The only candidates that
+clear it are the two that got clipped to the `tau_low` bound, so the filter handed the
+fit to a clamped candidate: `tau_crit = tau_low - 1e-6`, an empty LOW band, and 0.02 of
+balanced accuracy given away for 0.12 of recall. Nothing in the artifact said so —
+`used_fallback` was `false` and `reject_reason` was `null`.
+
+Both halves are fixed: the floor is now a tie-break (soft mode) and any `tau` that lands
+on or within `1e-5` of a bound is reported as `clamped` with a reason. Under the soft
+criterion 14b takes the best-BA candidate, q = 0.75, so `delta_crit = 0.1727` and the LOW
+band is a real band again.
 
 ## Validation on E1
 
@@ -77,6 +123,13 @@ empty and anything under `Z = 1` is CRITICAL.
 | deployed theta, `Z < 0.8` | 0.740 | 0.482 | — |
 
 Per model at `Z < 1`: 7b BA 0.881 / recall 0.905, 8b 0.958 / 0.964, 14b 0.946 / 0.910.
+
+**Do not quote 14b's 0.910 as validation.** It rests on 78 violating windows, and all 78
+come from a single run, `t5_tre_seed1` — one arm of one experiment, not an independent
+sample. 70.5 % of them sit inside the last 5 % below theta (`0.95 <= Z < 1.0`), so the
+number is a statement about where that run happened to stop, not about separation: move
+the threshold to `theta x 0.95` and 14b's recall falls from 0.910 to **0.205**. The 7b and
+8b figures rest on broader support; 14b's needs a second E1 run before it means anything.
 This is the first configuration in which `Z = 1` means what the design says it means.
 
 ## What this refit does *not* settle
