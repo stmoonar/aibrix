@@ -87,6 +87,8 @@ spec:
         - --tensor-parallel-size
         - '2'
         - --no-enable-prefix-caching
+        - --max-num-seqs
+        - '256'
         - --max-model-len
         - '12288'
         - --gpu-memory-utilization

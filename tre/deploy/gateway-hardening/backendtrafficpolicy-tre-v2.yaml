@@ -21,8 +21,8 @@ spec:
     name: dsqwen-7b-router
   circuitBreaker:
     maxConnections: 256
-    maxPendingRequests: 64
-    maxParallelRequests: 256
+    maxPendingRequests: 1024
+    maxParallelRequests: 4096
     maxParallelRetries: 16
 ---
 apiVersion: gateway.envoyproxy.io/v1alpha1
@@ -40,8 +40,8 @@ spec:
     name: dsqwen-14b-router
   circuitBreaker:
     maxConnections: 256
-    maxPendingRequests: 64
-    maxParallelRequests: 256
+    maxPendingRequests: 1024
+    maxParallelRequests: 4096
     maxParallelRetries: 16
 ---
 apiVersion: gateway.envoyproxy.io/v1alpha1
@@ -59,6 +59,6 @@ spec:
     name: dsllama-8b-router
   circuitBreaker:
     maxConnections: 256
-    maxPendingRequests: 64
-    maxParallelRequests: 256
+    maxPendingRequests: 1024
+    maxParallelRequests: 4096
     maxParallelRetries: 16
