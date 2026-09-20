@@ -52,10 +52,10 @@ models:
     lambda_wait: 3.0
     qmin: 1.0
     ema_alpha: 0.2485
-    theta_m: 993.4687597800112
-    tau_crit: 0.7485
+    theta_m: 1718.2369972339602
+    tau_crit: 0.9118532557046685
     tau_low: 1.0
-    tau_high: 1.6296
+    tau_high: 1.2966928263995934
     qsat: 4.0
     epsat: 0.05
     hsat: 3
@@ -96,10 +96,10 @@ models:
     lambda_wait: 3.0
     qmin: 1.0
     ema_alpha: 0.2485
-    theta_m: 1290.915
-    tau_crit: 0.7485
+    theta_m: 1494.6623828437275
+    tau_crit: 0.8887151193204268
     tau_low: 1.0
-    tau_high: 1.6296
+    tau_high: 1.3976424286238496
     qsat: 4.0
     epsat: 0.05
     hsat: 3
@@ -140,10 +140,10 @@ models:
     lambda_wait: 3.0
     qmin: 1.0
     ema_alpha: 0.3935
-    theta_m: 1020.235
-    tau_crit: 0.56
+    theta_m: 1414.0815004549904
+    tau_crit: 0.999999
     tau_low: 1.0
-    tau_high: 1.26
+    tau_high: 1.692971972362841
     qsat: 4.0
     epsat: 0.05
     hsat: 3

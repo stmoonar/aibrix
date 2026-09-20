@@ -9,7 +9,10 @@ if TYPE_CHECKING:
 
 from tre_common.metrics_schema import MetricsSnapshot, ModelWindowMetrics
 from tre_common.registry import Registry, ModelSpec
-from tre_controller.planning.classify import classify_all_models
+from tre_controller.planning.classify import (
+    classify_all_models,
+    model_control_configs_from_registry,
+)
 from tre_controller.planning.planner import (
     Action,
     ClusterView,
@@ -138,8 +141,13 @@ def run_planner_tick(
         paper_state_cache=paper_state_cache,
         signal_state=signal_state,
     )
+    # Without model_control_configs every model silently falls back to the generic
+    # delta_crit=0.2 / delta_high=0.25 and the fitted per-model bands in registry.yaml
+    # are dead keys.
     classifications = classify_all_models(
-        contexts, signal_idle_rps_eps=signal_idle_rps_eps
+        contexts,
+        model_control_configs=model_control_configs_from_registry(registry),
+        signal_idle_rps_eps=signal_idle_rps_eps,
     )
     if _prof_on:
         _signals_ns = time.perf_counter_ns() - _phase_t0

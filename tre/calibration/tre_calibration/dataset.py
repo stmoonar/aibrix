@@ -23,6 +23,15 @@ class CalibrationWindow:
     slo_met: bool
     health_score: float | None = None
     window_start_ms: float | None = None
+    # Extra columns the delta-margin fit needs (see tre_calibration.fit.fit_delta_margins).
+    # ``latency_ratio_p95`` is max(p95_metric / its SLO); ``latency_ratio_avg`` is the
+    # same over average latencies and is None whenever the sweep did not record them
+    # (the fit then falls back to the p95 ratio). ``queue_raw`` is the unfloored control
+    # queue lambda_wait*waiting + running + swapping, populated only when the loader is
+    # given ``lambda_wait``.
+    latency_ratio_p95: float | None = None
+    latency_ratio_avg: float | None = None
+    queue_raw: float | None = None
 
 
 def load_windows_from_csv(
@@ -32,7 +41,20 @@ def load_windows_from_csv(
     signal_column: str = "trs",
     signal_transform: Callable[[Mapping[str, Any]], float | None] | None = None,
     trim_ramp_windows: int = 0,
+    lambda_wait: float | None = None,
 ) -> list[CalibrationWindow]:
+    """Load per-window calibration rows from a load-scan CSV.
+
+    ``trim_ramp_windows`` drops that many earliest windows per scenario; it shifts the
+    fitted theta by a few percent, so callers record the value they used in the
+    calibration artifact rather than relying on a default.
+
+    ``lambda_wait`` is optional and only used to reconstruct ``queue_raw`` from the
+    ``avg_waiting`` / ``avg_running`` / ``avg_swapping`` columns. Pass the model's
+    registry value whenever the caller intends to run
+    :func:`tre_calibration.fit.fit_delta_margins`, whose surplus labels need the
+    queue depth; leave it None and the high-side margin falls back to its default.
+    """
     active_columns = _resolve_latency_columns(latency_slo_ms)
     if not active_columns:
         raise ValueError("latency_slo_ms must contain at least one active SLO")
@@ -67,6 +89,13 @@ def load_windows_from_csv(
                 continue
 
             p95_ratio_max = max(ratios)
+            queue_raw: float | None = None
+            if lambda_wait is not None and _as_float(row.get("avg_running")) is not None:
+                queue_raw = (
+                    float(lambda_wait) * (_as_float(row.get("avg_waiting"), 0.0) or 0.0)
+                    + (_as_float(row.get("avg_running"), 0.0) or 0.0)
+                    + (_as_float(row.get("avg_swapping"), 0.0) or 0.0)
+                )
             windows.append(
                 CalibrationWindow(
                     scenario_id=(row.get("scenario_id") or "unknown").strip() or "unknown",
@@ -75,6 +104,9 @@ def load_windows_from_csv(
                     slo_met=all(ratio <= 1.0 for ratio in ratios),
                     health_score=1.0 / (1.0 + p95_ratio_max),
                     window_start_ms=_as_float(row.get("window_start_ms")),
+                    latency_ratio_p95=p95_ratio_max,
+                    latency_ratio_avg=_avg_latency_ratio(row, latency_slo_ms),
+                    queue_raw=queue_raw,
                 )
             )
     return trim_scenario_ramp_windows(windows, count=trim_ramp_windows)
@@ -197,3 +229,28 @@ def _as_float(value: Any, default: float | None = None) -> float | None:
     if not math.isfinite(out):
         return default
     return out
+
+
+_AVG_LATENCY_COLUMNS = {
+    "ttft_p95": "avg_ttft",
+    "tpot_p95": "avg_tpot",
+    "e2e_p95": "avg_e2e",
+}
+
+
+def _avg_latency_ratio(
+    row: Mapping[str, Any], latency_slo_ms: Mapping[str, float]
+) -> float | None:
+    """Mean of the average-latency/SLO ratios, or None when the CSV lacks them."""
+    ratios: list[float] = []
+    for slo_key in latency_slo_ms:
+        column = _AVG_LATENCY_COLUMNS.get(slo_key)
+        if column is None:
+            return None
+        value = _as_float(row.get(column))
+        if value is None:
+            return None
+        ratios.append(value / float(latency_slo_ms[slo_key]))
+    if not ratios:
+        return None
+    return sum(ratios) / len(ratios)

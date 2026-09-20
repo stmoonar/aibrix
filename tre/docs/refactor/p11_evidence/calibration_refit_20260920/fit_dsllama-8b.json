@@ -1,0 +1,138 @@
+{
+  "comparison": {
+    "balanced_accuracy_with_recall_floor_0_90": {
+      "balanced_accuracy": 0.6596774193548387,
+      "healthy_quantile": 0.1,
+      "recall_good": 0.9,
+      "theta": 1082.3145025101994
+    },
+    "reliability_criterion_theta": 1290.9145158066265,
+    "reliability_reproduces_live": true,
+    "theta_live": 1290.9145158066265,
+    "theta_ratio_vs_live": 1.1578321914753507
+  },
+  "delta_fit": {
+    "crit": {
+      "balanced_accuracy": 0.829157831559433,
+      "candidate_count": 19,
+      "candidate_quantile": 0.9,
+      "delta": 0.1112848806795732,
+      "meets_target_floor": true,
+      "precision_pos": 0.26807980049875313,
+      "recall_pos": 0.899581589958159,
+      "reject_reason": null,
+      "specificity_neg": 0.758734073160707,
+      "support_pos": 239,
+      "tau": 0.8887151193204268,
+      "used_fallback": false
+    },
+    "high": {
+      "balanced_accuracy": 0.8917162834423598,
+      "candidate_count": 19,
+      "candidate_quantile": 0.05,
+      "delta": 0.3976424286238496,
+      "meets_target_floor": false,
+      "precision_pos": 0.6179401993355482,
+      "recall_pos": 0.9489795918367347,
+      "reject_reason": null,
+      "specificity_neg": 0.8344529750479847,
+      "support_pos": 588,
+      "tau": 1.3976424286238496,
+      "used_fallback": false
+    },
+    "labels": {
+      "critical_cut": 1.246924405451864,
+      "critical_positive_count": 239,
+      "queue_available": true,
+      "surplus_latency_cut": 0.5418294966220856,
+      "surplus_positive_count": 588,
+      "surplus_queue_cut": 8.0
+    },
+    "tau_low": 1.0,
+    "theta": 1494.6623828437275
+  },
+  "fit": {
+    "balanced_accuracy": 0.8611436950146627,
+    "candidate_count": 10,
+    "coverage_pass": true,
+    "family_counts": {
+      "i1024_o128": 270,
+      "i1024_o512": 174,
+      "i128_o128": 397,
+      "i128_o512": 302,
+      "i512_o128": 282,
+      "i512_o512": 220
+    },
+    "healthy_quantile": 0.2,
+    "healthy_window_count": 1990,
+    "min_healthy_recall": 0.0,
+    "precision_good": 0.9677811550151976,
+    "recall_good": 0.8,
+    "reject_reason": null,
+    "specificity_bad": 0.9222873900293255,
+    "violating_window_count": 682
+  },
+  "fit_config": {
+    "critical_violation_quantile": 0.65,
+    "fit_delta": true,
+    "healthy_quantile_candidates": [
+      0.05,
+      0.1,
+      0.15,
+      0.2,
+      0.25,
+      0.3,
+      0.35,
+      0.4,
+      0.45,
+      0.5
+    ],
+    "latency_slo_ms": {
+      "e2e_p95": 12000.0,
+      "tpot_p95": 75.0,
+      "ttft_p95": 500.0
+    },
+    "max_single_scenario_ratio": 0.7,
+    "min_critical_recall": 0.85,
+    "min_healthy_recall": 0.0,
+    "min_scenario_families": 2,
+    "min_surplus_precision": 0.8,
+    "signal_column": "trs",
+    "surplus_latency_quantile": 0.35,
+    "surplus_queue_quantile": 0.5,
+    "theta_criterion": "balanced_accuracy",
+    "trim_ramp_windows": 0
+  },
+  "generated_at": "2026-09-20T00:00:00+00:00",
+  "inputs": {
+    "csv_path": "/root/tre-experiments/r3_llama_slide_supp.csv",
+    "csv_sha256": "49efbc466cbb8b61e0c5800140b86a56c6cb17992589fe5fa1629acc8e2a99c4",
+    "lambda_wait_note": "lambda_wait is NOT identifiable from this closed-loop R3 data: avg_waiting is exactly 0 in 81.5% / 90.7% / 100.0% of windows (7b/8b/14b), so the term multiplies a zero. The inherited 3.0 is carried over unvalidated; re-deriving it needs an open-loop (fixed-rate) sweep.",
+    "lambda_wait_used_for_queue_raw": 3.0,
+    "lambda_wait_validated": false,
+    "scenario_count": 51,
+    "window_count": 2672
+  },
+  "method": {
+    "delta_method": "severity_quantile_balanced_accuracy",
+    "theta_m_method": "healthy_quantile_balanced_accuracy"
+  },
+  "metrics": {
+    "auroc": 0.8903807895783905,
+    "objective": 0.9194957288399905,
+    "spearman_health": 0.838991457679981
+  },
+  "model_name": "dsllama-8b",
+  "publish": true,
+  "trs": {
+    "delta_crit": 0.1112848806795732,
+    "delta_high": 0.3976424286238496,
+    "lambda_wait": 3.0,
+    "qmin": 1.0,
+    "tau_crit": 0.8887151193204268,
+    "tau_high": 1.3976424286238496,
+    "tau_low": 1.0,
+    "theta_m": 1494.6623828437275,
+    "w_p": 0.02
+  }
+}

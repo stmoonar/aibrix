@@ -1,0 +1,123 @@
+{
+  "e1_validation": {
+    "deployed_shared_threshold_Z_lt_0_8": {
+      "balanced_accuracy": 0.7395468484664137,
+      "n": 3968,
+      "precision": 0.9578059071729957,
+      "recall": 0.4819532908704883,
+      "threshold": 0.8
+    },
+    "label": "vrate > 0.10",
+    "refit_per_model_at_Z_lt_1": {
+      "dsllama-8b": {
+        "balanced_accuracy": 0.9580654309733616,
+        "n": 1322,
+        "precision": 0.8037037037037037,
+        "recall": 0.9644444444444444,
+        "threshold": 1.0
+      },
+      "dsqwen-14b": {
+        "balanced_accuracy": 0.9454896509113376,
+        "n": 1323,
+        "precision": 0.7473684210526316,
+        "recall": 0.9102564102564102,
+        "threshold": 1.0
+      },
+      "dsqwen-7b": {
+        "balanced_accuracy": 0.8813852813852814,
+        "n": 1323,
+        "precision": 0.4810126582278481,
+        "recall": 0.9047619047619048,
+        "threshold": 1.0
+      }
+    },
+    "refit_shared_threshold_Z_lt_1": {
+      "balanced_accuracy": 0.9326331881679595,
+      "n": 3968,
+      "precision": 0.6461086637298091,
+      "recall": 0.9341825902335457,
+      "threshold": 1.0
+    },
+    "source": "/tmp/theta_forensics/windows.json",
+    "window_count": 3968
+  },
+  "generated_at": "2026-09-20T00:00:00+00:00",
+  "healthy_quantile_candidates": [
+    0.05,
+    0.1,
+    0.15,
+    0.2,
+    0.25,
+    0.3,
+    0.35,
+    0.4,
+    0.45,
+    0.5
+  ],
+  "min_healthy_recall": 0.0,
+  "models": {
+    "dsllama-8b": {
+      "csv_path": "/root/tre-experiments/r3_llama_slide_supp.csv",
+      "csv_sha256": "49efbc466cbb8b61e0c5800140b86a56c6cb17992589fe5fa1629acc8e2a99c4",
+      "delta_crit": 0.1112848806795732,
+      "delta_crit_used_fallback": false,
+      "delta_high": 0.3976424286238496,
+      "delta_high_used_fallback": false,
+      "healthy_quantile": 0.2,
+      "in_sample_balanced_accuracy": 0.8611436950146627,
+      "in_sample_recall_good": 0.8,
+      "reliability_criterion_theta": 1290.9145158066265,
+      "reliability_reproduces_live": true,
+      "scenario_count": 51,
+      "tau_crit": 0.8887151193204268,
+      "tau_high": 1.3976424286238496,
+      "theta_live": 1290.9145158066265,
+      "theta_m": 1494.6623828437275,
+      "theta_ratio_vs_live": 1.1578321914753507,
+      "window_count": 2672
+    },
+    "dsqwen-14b": {
+      "csv_path": "/root/tre-experiments/r3_14b_slide_supp3.csv",
+      "csv_sha256": "98df06e2e59c16706cdaadc2732619e7d872fb7621158d4cf954aac27f28150f",
+      "delta_crit": 1.0000000000287557e-06,
+      "delta_crit_used_fallback": false,
+      "delta_high": 0.6929719723628409,
+      "delta_high_used_fallback": false,
+      "healthy_quantile": 0.15,
+      "in_sample_balanced_accuracy": 0.9018898462641916,
+      "in_sample_recall_good": 0.8498154981549816,
+      "reliability_criterion_theta": 1020.2350905172023,
+      "reliability_reproduces_live": true,
+      "scenario_count": 56,
+      "tau_crit": 0.999999,
+      "tau_high": 1.692971972362841,
+      "theta_live": 1020.2350905172023,
+      "theta_m": 1414.0815004549904,
+      "theta_ratio_vs_live": 1.3860349576273936,
+      "window_count": 3101
+    },
+    "dsqwen-7b": {
+      "csv_path": "/root/tre-experiments/r3_7b_slide_convprobe2.csv",
+      "csv_sha256": "91674fa707d9d9576725f0e7f4736f09edd29b4ad9cfd9bb725680f9a4e39584",
+      "delta_crit": 0.08814674429533154,
+      "delta_crit_used_fallback": false,
+      "delta_high": 0.2966928263995934,
+      "delta_high_used_fallback": false,
+      "healthy_quantile": 0.2,
+      "in_sample_balanced_accuracy": 0.8668239903171912,
+      "in_sample_recall_good": 0.7999247837532907,
+      "reliability_criterion_theta": 993.4687597800112,
+      "reliability_reproduces_live": true,
+      "scenario_count": 59,
+      "tau_crit": 0.9118532557046685,
+      "tau_high": 1.2966928263995934,
+      "theta_live": 993.4687597800112,
+      "theta_m": 1718.2369972339602,
+      "theta_ratio_vs_live": 1.7295329926775334,
+      "window_count": 3172
+    }
+  },
+  "repo_head": "9052d3fe799ce3d044897e2550eeb35c5e4b0811",
+  "theta_criterion": "balanced_accuracy",
+  "trim_ramp_windows": 0
+}

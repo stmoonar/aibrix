@@ -123,6 +123,27 @@ def classify_model(
     )
 
 
+def model_control_configs_from_registry(registry: Any) -> dict[str, dict[str, Any]]:
+    """Per-model control knobs for :func:`classify_all_models`, read from the registry.
+
+    ``registry.yaml`` stores the fitted band edges as ``trs.tau_crit`` / ``trs.tau_high``
+    around ``trs.tau_low``; :class:`TauThresholds` is built from the *margins*, so they are
+    converted back here. Models missing from the registry simply get no entry, and
+    ``classify_all_models`` then applies its ``delta_crit`` / ``delta_high`` defaults --
+    the documented fallback, identical to the behaviour before per-model margins were
+    threaded through.
+    """
+    configs: dict[str, dict[str, Any]] = {}
+    for spec in registry.models():
+        trs = spec.trs
+        tau_low = float(trs.tau_low)
+        configs[spec.name] = {
+            "delta_crit": tau_low - float(trs.tau_crit),
+            "delta_high": float(trs.tau_high) - tau_low,
+        }
+    return configs
+
+
 def classify_all_models(
     model_contexts: dict[str, dict[str, Any]],
     *,
