@@ -31,6 +31,15 @@ class StreamResult:
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
     error: str | None = None
+    #: Verbatim body of a non-2xx answer, truncated. A failure cannot be attributed
+    #: without it: the serving path has two rejections wearing the same status code -
+    #: the engine answering with its own JSON error, and the gateway circuit breaker
+    #: rejecting at the Envoy cluster with a plain-text body, having never reached the
+    #: engine at all. See ``scripts.openloop.classify_failure``.
+    error_body: str | None = None
+    #: Lower-cased response headers of a non-2xx answer. The content type and any
+    #: ``x-envoy-*`` marker are what the classifier reads.
+    error_headers: dict[str, str] | None = None
 
 
 # seam: (url, headers, body_bytes, timeout_s) -> StreamResult
@@ -124,6 +133,8 @@ class StreamingHttpSender:
             "completion_tokens": res.completion_tokens,
             "http_status": res.status,
             "error": res.error,
+            "error_body": res.error_body,
+            "error_headers": res.error_headers,
         }
 
     def write_jsonl(self, path: str) -> int:
@@ -165,9 +176,51 @@ def _default_stream_call(url: str, headers: dict[str, str], body: bytes, timeout
         done_ms = (time.perf_counter() - start) * 1000.0
         return StreamResult(status, first_token_ms, done_ms, prompt_tokens, completion_tokens)
     except HTTPError as exc:
-        return StreamResult(exc.code, None, (time.perf_counter() - start) * 1000.0, error=f"HTTP {exc.code}")
+        return StreamResult(
+            exc.code,
+            None,
+            (time.perf_counter() - start) * 1000.0,
+            error=f"HTTP {exc.code}",
+            error_body=read_error_body(exc),
+            error_headers=lower_headers(exc.headers),
+        )
     except (URLError, TimeoutError, OSError) as exc:  # noqa: BLE001
         return StreamResult(0, None, (time.perf_counter() - start) * 1000.0, error=type(exc).__name__)
+
+
+
+#: How much of a non-2xx body to keep. An Envoy circuit-breaker body is ~80 bytes and a
+#: vLLM JSON error is small too; the cap only bounds a pathological upstream.
+MAX_ERROR_BODY_CHARS = 2048
+
+
+def read_error_body(exc) -> str | None:
+    """Verbatim body of an HTTPError, best effort.
+
+    Reading it can itself fail on a connection the proxy already reset, and losing the
+    body must never lose the request record - an unattributable failure is still a
+    failure, and the classifier has a documented fallback for a missing body.
+    """
+    try:
+        raw = exc.read()
+    except Exception:  # noqa: BLE001
+        return None
+    if not raw:
+        return None
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", errors="replace")
+    return raw[:MAX_ERROR_BODY_CHARS]
+
+
+def lower_headers(headers) -> dict[str, str] | None:
+    """Response headers as a lower-cased dict, or None when there are none."""
+    if not headers:
+        return None
+    try:
+        items = list(headers.items())
+    except AttributeError:
+        return None
+    return {str(key).lower(): str(value) for key, value in items}
 
 
 def _chunk_has_content(chunk: dict[str, Any]) -> bool:

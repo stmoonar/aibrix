@@ -1,5 +1,12 @@
 {
   "model": "dsqwen-7b",
+  "kv_cache_tokens": 349232,
+  "kv_cache_provenance": {
+    "source": "vllm startup log line GPU KV cache size",
+    "measured": "2026-09-20",
+    "pod": "dsqwen-7b-nscc-ds-4a100-node10-gpu-0-7fd7f4cd7d-qczvn",
+    "note": "identical across replicas; per-engine total"
+  },
   "capacity": [
     {
       "input_tokens": 128,

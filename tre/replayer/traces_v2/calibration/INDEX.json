@@ -1,14 +1,31 @@
 {
+  "admission_cap": {
+    "name": "gateway-capped",
+    "max_parallel_requests": 256,
+    "max_pending_requests": 64,
+    "max_num_seqs": null,
+    "sequence_limit": 1024,
+    "replicas": 1,
+    "fleet_sequence_limit": 1024,
+    "shed_ceiling": 320,
+    "admission_controller": "gateway",
+    "typical_running": 110,
+    "burst_request_cap": 240,
+    "burst_overshoot_factor": 1.5,
+    "ramp_excess_budget": 140,
+    "ramp_max_s": 300.0
+  },
   "schedules": [
     {
       "model": "dsqwen-7b",
       "shape": "S1",
       "primitive": "ramp",
-      "cell_id": "i256_o128_c160",
+      "cell_id": "i256_o128_c120",
       "held_out": false,
-      "capacity_prior_rps": 16.6407,
-      "duration_s": 540,
-      "planned_requests": 9585,
+      "capacity_rps": 16.6407,
+      "capacity_source": "prior_fit",
+      "admission_cap": "gateway-capped",
+      "skipped": false,
       "components": [
         {
           "weight": 1.0,
@@ -16,7 +33,18 @@
           "max_tokens": 128
         }
       ],
-      "peak_offered_rps": 26.6252,
+      "rho_start": 0.4,
+      "rho_end": 1.2,
+      "ramp_s": 112.175,
+      "hold_s": 28.044,
+      "drain_rho": 0.5,
+      "drain_s": 60.0,
+      "drain_start_s": 140.218,
+      "backlog_coefficient": 0.07499999999999998,
+      "ramp_excess_budget": 140,
+      "duration_s": 200.218,
+      "planned_requests": 2553,
+      "peak_offered_rps": 19.9689,
       "path": "dsqwen-7b/S1_ramp.json"
     },
     {
@@ -25,9 +53,10 @@
       "primitive": "steps",
       "cell_id": "i256_o128_c95",
       "held_out": false,
-      "capacity_prior_rps": 16.6407,
-      "duration_s": 450,
-      "planned_requests": 6140,
+      "capacity_rps": 16.6407,
+      "capacity_source": "prior_fit",
+      "admission_cap": "gateway-capped",
+      "skipped": false,
       "components": [
         {
           "weight": 1.0,
@@ -35,6 +64,8 @@
           "max_tokens": 128
         }
       ],
+      "duration_s": 450,
+      "planned_requests": 6140,
       "peak_offered_rps": 15.8087,
       "discard_after_s": [
         0,
@@ -49,9 +80,10 @@
       "primitive": "bursts",
       "cell_id": "i256_o128_c60",
       "held_out": false,
-      "capacity_prior_rps": 16.6407,
-      "duration_s": 360,
-      "planned_requests": 3861,
+      "capacity_rps": 16.6407,
+      "capacity_source": "prior_fit",
+      "admission_cap": "gateway-capped",
+      "skipped": true,
       "components": [
         {
           "weight": 1.0,
@@ -59,18 +91,28 @@
           "max_tokens": 128
         }
       ],
-      "peak_offered_rps": 43.2659,
-      "path": "dsqwen-7b/S1_bursts.json"
+      "kv_cache_tokens": 349232,
+      "tokens_per_request": 384.0,
+      "burst_requests": 240,
+      "burst_requests_needed": 1364,
+      "burst_request_cap": 240,
+      "engine_running_limit": 909,
+      "sequence_limit": 1024,
+      "kv_request_limit": 909,
+      "reachable": false,
+      "binding_limit": "kv_cache",
+      "reason": "reaching waiting > 0 needs 1364 concurrent requests (1.5x the 909-request engine running limit, kv_cache-bound), but the gateway-capped policy admits at most 240 (75% of the 320-request shed ceiling); the spike would be shed by the gateway instead of queued by the engine"
     },
     {
       "model": "dsqwen-7b",
       "shape": "S2",
       "primitive": "ramp",
-      "cell_id": "i768_o192_c160",
+      "cell_id": "i768_o192_c120",
       "held_out": false,
-      "capacity_prior_rps": 8.1832,
-      "duration_s": 540,
-      "planned_requests": 4714,
+      "capacity_rps": 8.1832,
+      "capacity_source": "prior_fit",
+      "admission_cap": "gateway-capped",
+      "skipped": false,
       "components": [
         {
           "weight": 1.0,
@@ -78,7 +120,18 @@
           "max_tokens": 192
         }
       ],
-      "peak_offered_rps": 13.0931,
+      "rho_start": 0.4,
+      "rho_end": 1.2,
+      "ramp_s": 228.11,
+      "hold_s": 57.027,
+      "drain_rho": 0.5,
+      "drain_s": 60.0,
+      "drain_start_s": 285.137,
+      "backlog_coefficient": 0.07499999999999998,
+      "ramp_excess_budget": 140,
+      "duration_s": 345.137,
+      "planned_requests": 2299,
+      "peak_offered_rps": 9.8198,
       "path": "dsqwen-7b/S2_ramp.json"
     },
     {
@@ -87,9 +140,10 @@
       "primitive": "steps",
       "cell_id": "i768_o192_c95",
       "held_out": false,
-      "capacity_prior_rps": 8.1832,
-      "duration_s": 450,
-      "planned_requests": 3020,
+      "capacity_rps": 8.1832,
+      "capacity_source": "prior_fit",
+      "admission_cap": "gateway-capped",
+      "skipped": false,
       "components": [
         {
           "weight": 1.0,
@@ -97,6 +151,8 @@
           "max_tokens": 192
         }
       ],
+      "duration_s": 450,
+      "planned_requests": 3020,
       "peak_offered_rps": 7.774,
       "discard_after_s": [
         0,
@@ -111,9 +167,10 @@
       "primitive": "bursts",
       "cell_id": "i768_o192_c60",
       "held_out": false,
-      "capacity_prior_rps": 8.1832,
-      "duration_s": 360,
-      "planned_requests": 1898,
+      "capacity_rps": 8.1832,
+      "capacity_source": "prior_fit",
+      "admission_cap": "gateway-capped",
+      "skipped": true,
       "components": [
         {
           "weight": 1.0,
@@ -121,18 +178,28 @@
           "max_tokens": 192
         }
       ],
-      "peak_offered_rps": 21.2763,
-      "path": "dsqwen-7b/S2_bursts.json"
+      "kv_cache_tokens": 349232,
+      "tokens_per_request": 960.0,
+      "burst_requests": 240,
+      "burst_requests_needed": 545,
+      "burst_request_cap": 240,
+      "engine_running_limit": 363,
+      "sequence_limit": 1024,
+      "kv_request_limit": 363,
+      "reachable": false,
+      "binding_limit": "kv_cache",
+      "reason": "reaching waiting > 0 needs 545 concurrent requests (1.5x the 363-request engine running limit, kv_cache-bound), but the gateway-capped policy admits at most 240 (75% of the 320-request shed ceiling); the spike would be shed by the gateway instead of queued by the engine"
     },
     {
       "model": "dsqwen-7b",
       "shape": "S3",
       "primitive": "ramp",
-      "cell_id": "i2048_o96_c160",
+      "cell_id": "i2048_o96_c120",
       "held_out": false,
-      "capacity_prior_rps": 4.9992,
-      "duration_s": 540,
-      "planned_requests": 2880,
+      "capacity_rps": 4.9992,
+      "capacity_source": "prior_fit",
+      "admission_cap": "gateway-capped",
+      "skipped": false,
       "components": [
         {
           "weight": 1.0,
@@ -140,7 +207,18 @@
           "max_tokens": 96
         }
       ],
-      "peak_offered_rps": 7.9987,
+      "rho_start": 0.4,
+      "rho_end": 1.2,
+      "ramp_s": 300,
+      "hold_s": 75,
+      "drain_rho": 0.5,
+      "drain_s": 60.0,
+      "drain_start_s": 375,
+      "backlog_coefficient": 0.07499999999999998,
+      "ramp_excess_budget": 140,
+      "duration_s": 435,
+      "planned_requests": 1800,
+      "peak_offered_rps": 5.999,
       "path": "dsqwen-7b/S3_ramp.json"
     },
     {
@@ -149,9 +227,10 @@
       "primitive": "steps",
       "cell_id": "i2048_o96_c95",
       "held_out": false,
-      "capacity_prior_rps": 4.9992,
-      "duration_s": 450,
-      "planned_requests": 1845,
+      "capacity_rps": 4.9992,
+      "capacity_source": "prior_fit",
+      "admission_cap": "gateway-capped",
+      "skipped": false,
       "components": [
         {
           "weight": 1.0,
@@ -159,6 +238,8 @@
           "max_tokens": 96
         }
       ],
+      "duration_s": 450,
+      "planned_requests": 1845,
       "peak_offered_rps": 4.7492,
       "discard_after_s": [
         0,
@@ -173,9 +254,10 @@
       "primitive": "bursts",
       "cell_id": "i2048_o96_c60",
       "held_out": false,
-      "capacity_prior_rps": 4.9992,
-      "duration_s": 360,
-      "planned_requests": 1160,
+      "capacity_rps": 4.9992,
+      "capacity_source": "prior_fit",
+      "admission_cap": "gateway-capped",
+      "skipped": true,
       "components": [
         {
           "weight": 1.0,
@@ -183,18 +265,28 @@
           "max_tokens": 96
         }
       ],
-      "peak_offered_rps": 12.9978,
-      "path": "dsqwen-7b/S3_bursts.json"
+      "kv_cache_tokens": 349232,
+      "tokens_per_request": 2144.0,
+      "burst_requests": 240,
+      "burst_requests_needed": 243,
+      "burst_request_cap": 240,
+      "engine_running_limit": 162,
+      "sequence_limit": 1024,
+      "kv_request_limit": 162,
+      "reachable": false,
+      "binding_limit": "kv_cache",
+      "reason": "reaching waiting > 0 needs 243 concurrent requests (1.5x the 162-request engine running limit, kv_cache-bound), but the gateway-capped policy admits at most 240 (75% of the 320-request shed ceiling); the spike would be shed by the gateway instead of queued by the engine"
     },
     {
       "model": "dsqwen-7b",
       "shape": "S4",
       "primitive": "ramp",
-      "cell_id": "i256_o448_c160",
+      "cell_id": "i256_o448_c120",
       "held_out": false,
-      "capacity_prior_rps": 6.3738,
-      "duration_s": 540,
-      "planned_requests": 3671,
+      "capacity_rps": 6.3738,
+      "capacity_source": "prior_fit",
+      "admission_cap": "gateway-capped",
+      "skipped": false,
       "components": [
         {
           "weight": 1.0,
@@ -202,7 +294,18 @@
           "max_tokens": 448
         }
       ],
-      "peak_offered_rps": 10.1981,
+      "rho_start": 0.4,
+      "rho_end": 1.2,
+      "ramp_s": 292.865,
+      "hold_s": 73.216,
+      "drain_rho": 0.5,
+      "drain_s": 60.0,
+      "drain_start_s": 366.081,
+      "backlog_coefficient": 0.07499999999999998,
+      "ramp_excess_budget": 140,
+      "duration_s": 426.081,
+      "planned_requests": 2245,
+      "peak_offered_rps": 7.6486,
       "path": "dsqwen-7b/S4_ramp.json"
     },
     {
@@ -211,9 +314,10 @@
       "primitive": "steps",
       "cell_id": "i256_o448_c95",
       "held_out": false,
-      "capacity_prior_rps": 6.3738,
-      "duration_s": 450,
-      "planned_requests": 2352,
+      "capacity_rps": 6.3738,
+      "capacity_source": "prior_fit",
+      "admission_cap": "gateway-capped",
+      "skipped": false,
       "components": [
         {
           "weight": 1.0,
@@ -221,6 +325,8 @@
           "max_tokens": 448
         }
       ],
+      "duration_s": 450,
+      "planned_requests": 2352,
       "peak_offered_rps": 6.0551,
       "discard_after_s": [
         0,
@@ -235,9 +341,10 @@
       "primitive": "bursts",
       "cell_id": "i256_o448_c60",
       "held_out": false,
-      "capacity_prior_rps": 6.3738,
-      "duration_s": 360,
-      "planned_requests": 1479,
+      "capacity_rps": 6.3738,
+      "capacity_source": "prior_fit",
+      "admission_cap": "gateway-capped",
+      "skipped": true,
       "components": [
         {
           "weight": 1.0,
@@ -245,18 +352,28 @@
           "max_tokens": 448
         }
       ],
-      "peak_offered_rps": 16.5719,
-      "path": "dsqwen-7b/S4_bursts.json"
+      "kv_cache_tokens": 349232,
+      "tokens_per_request": 704.0,
+      "burst_requests": 240,
+      "burst_requests_needed": 744,
+      "burst_request_cap": 240,
+      "engine_running_limit": 496,
+      "sequence_limit": 1024,
+      "kv_request_limit": 496,
+      "reachable": false,
+      "binding_limit": "kv_cache",
+      "reason": "reaching waiting > 0 needs 744 concurrent requests (1.5x the 496-request engine running limit, kv_cache-bound), but the gateway-capped policy admits at most 240 (75% of the 320-request shed ceiling); the spike would be shed by the gateway instead of queued by the engine"
     },
     {
       "model": "dsqwen-7b",
       "shape": "S5",
       "primitive": "ramp",
-      "cell_id": "i768_o384_c160",
+      "cell_id": "i768_o384_c120",
       "held_out": false,
-      "capacity_prior_rps": 5.5469,
-      "duration_s": 540,
-      "planned_requests": 3195,
+      "capacity_rps": 5.5469,
+      "capacity_source": "prior_fit",
+      "admission_cap": "gateway-capped",
+      "skipped": false,
       "components": [
         {
           "weight": 1.0,
@@ -264,7 +381,18 @@
           "max_tokens": 384
         }
       ],
-      "peak_offered_rps": 8.8751,
+      "rho_start": 0.4,
+      "rho_end": 1.2,
+      "ramp_s": 300,
+      "hold_s": 75,
+      "drain_rho": 0.5,
+      "drain_s": 60.0,
+      "drain_start_s": 375,
+      "backlog_coefficient": 0.07499999999999998,
+      "ramp_excess_budget": 140,
+      "duration_s": 435,
+      "planned_requests": 1997,
+      "peak_offered_rps": 6.6563,
       "path": "dsqwen-7b/S5_ramp.json"
     },
     {
@@ -273,9 +401,10 @@
       "primitive": "steps",
       "cell_id": "i768_o384_c95",
       "held_out": false,
-      "capacity_prior_rps": 5.5469,
-      "duration_s": 450,
-      "planned_requests": 2047,
+      "capacity_rps": 5.5469,
+      "capacity_source": "prior_fit",
+      "admission_cap": "gateway-capped",
+      "skipped": false,
       "components": [
         {
           "weight": 1.0,
@@ -283,6 +412,8 @@
           "max_tokens": 384
         }
       ],
+      "duration_s": 450,
+      "planned_requests": 2047,
       "peak_offered_rps": 5.2696,
       "discard_after_s": [
         0,
@@ -297,9 +428,10 @@
       "primitive": "bursts",
       "cell_id": "i768_o384_c60",
       "held_out": false,
-      "capacity_prior_rps": 5.5469,
-      "duration_s": 360,
-      "planned_requests": 1287,
+      "capacity_rps": 5.5469,
+      "capacity_source": "prior_fit",
+      "admission_cap": "gateway-capped",
+      "skipped": true,
       "components": [
         {
           "weight": 1.0,
@@ -307,18 +439,28 @@
           "max_tokens": 384
         }
       ],
-      "peak_offered_rps": 14.4219,
-      "path": "dsqwen-7b/S5_bursts.json"
+      "kv_cache_tokens": 349232,
+      "tokens_per_request": 1152.0,
+      "burst_requests": 240,
+      "burst_requests_needed": 455,
+      "burst_request_cap": 240,
+      "engine_running_limit": 303,
+      "sequence_limit": 1024,
+      "kv_request_limit": 303,
+      "reachable": false,
+      "binding_limit": "kv_cache",
+      "reason": "reaching waiting > 0 needs 455 concurrent requests (1.5x the 303-request engine running limit, kv_cache-bound), but the gateway-capped policy admits at most 240 (75% of the 320-request shed ceiling); the spike would be shed by the gateway instead of queued by the engine"
     },
     {
       "model": "dsqwen-7b",
       "shape": "M",
       "primitive": "ramp",
-      "cell_id": "i0_o0_c160",
+      "cell_id": "i0_o0_c120",
       "held_out": true,
-      "capacity_prior_rps": 7.9446,
-      "duration_s": 540,
-      "planned_requests": 4576,
+      "capacity_rps": 7.9446,
+      "capacity_source": "prior_fit",
+      "admission_cap": "gateway-capped",
+      "skipped": false,
       "components": [
         {
           "weight": 0.4,
@@ -341,7 +483,18 @@
           "max_tokens": 64
         }
       ],
-      "peak_offered_rps": 12.7113,
+      "rho_start": 0.4,
+      "rho_end": 1.2,
+      "ramp_s": 234.961,
+      "hold_s": 58.74,
+      "drain_rho": 0.5,
+      "drain_s": 60.0,
+      "drain_start_s": 293.701,
+      "backlog_coefficient": 0.07499999999999998,
+      "ramp_excess_budget": 140,
+      "duration_s": 353.701,
+      "planned_requests": 2292,
+      "peak_offered_rps": 9.5334,
       "path": "dsqwen-7b/M_ramp.json"
     },
     {
@@ -350,9 +503,10 @@
       "primitive": "steps",
       "cell_id": "i0_o0_c95",
       "held_out": true,
-      "capacity_prior_rps": 7.9446,
-      "duration_s": 450,
-      "planned_requests": 2932,
+      "capacity_rps": 7.9446,
+      "capacity_source": "prior_fit",
+      "admission_cap": "gateway-capped",
+      "skipped": false,
       "components": [
         {
           "weight": 0.4,
@@ -375,6 +529,8 @@
           "max_tokens": 64
         }
       ],
+      "duration_s": 450,
+      "planned_requests": 2932,
       "peak_offered_rps": 7.5473,
       "discard_after_s": [
         0,
@@ -389,9 +545,10 @@
       "primitive": "bursts",
       "cell_id": "i0_o0_c60",
       "held_out": true,
-      "capacity_prior_rps": 7.9446,
-      "duration_s": 360,
-      "planned_requests": 1843,
+      "capacity_rps": 7.9446,
+      "capacity_source": "prior_fit",
+      "admission_cap": "gateway-capped",
+      "skipped": true,
       "components": [
         {
           "weight": 0.4,
@@ -414,18 +571,28 @@
           "max_tokens": 64
         }
       ],
-      "peak_offered_rps": 20.6558,
-      "path": "dsqwen-7b/M_bursts.json"
+      "kv_cache_tokens": 349232,
+      "tokens_per_request": 953.6,
+      "burst_requests": 240,
+      "burst_requests_needed": 549,
+      "burst_request_cap": 240,
+      "engine_running_limit": 366,
+      "sequence_limit": 1024,
+      "kv_request_limit": 366,
+      "reachable": false,
+      "binding_limit": "kv_cache",
+      "reason": "reaching waiting > 0 needs 549 concurrent requests (1.5x the 366-request engine running limit, kv_cache-bound), but the gateway-capped policy admits at most 240 (75% of the 320-request shed ceiling); the spike would be shed by the gateway instead of queued by the engine"
     },
     {
       "model": "dsllama-8b",
       "shape": "S1",
       "primitive": "ramp",
-      "cell_id": "i256_o128_c160",
+      "cell_id": "i256_o128_c120",
       "held_out": false,
-      "capacity_prior_rps": 11.8466,
-      "duration_s": 540,
-      "planned_requests": 6824,
+      "capacity_rps": 11.8466,
+      "capacity_source": "prior_fit",
+      "admission_cap": "gateway-capped",
+      "skipped": false,
       "components": [
         {
           "weight": 1.0,
@@ -433,7 +600,18 @@
           "max_tokens": 128
         }
       ],
-      "peak_offered_rps": 18.9546,
+      "rho_start": 0.4,
+      "rho_end": 1.2,
+      "ramp_s": 157.57,
+      "hold_s": 39.392,
+      "drain_rho": 0.5,
+      "drain_s": 60.0,
+      "drain_start_s": 196.962,
+      "backlog_coefficient": 0.07499999999999998,
+      "ramp_excess_budget": 140,
+      "duration_s": 256.962,
+      "planned_requests": 2409,
+      "peak_offered_rps": 14.2159,
       "path": "dsllama-8b/S1_ramp.json"
     },
     {
@@ -442,9 +620,10 @@
       "primitive": "steps",
       "cell_id": "i256_o128_c95",
       "held_out": false,
-      "capacity_prior_rps": 11.8466,
-      "duration_s": 450,
-      "planned_requests": 4371,
+      "capacity_rps": 11.8466,
+      "capacity_source": "prior_fit",
+      "admission_cap": "gateway-capped",
+      "skipped": false,
       "components": [
         {
           "weight": 1.0,
@@ -452,6 +631,8 @@
           "max_tokens": 128
         }
       ],
+      "duration_s": 450,
+      "planned_requests": 4371,
       "peak_offered_rps": 11.2543,
       "discard_after_s": [
         0,
@@ -466,9 +647,10 @@
       "primitive": "bursts",
       "cell_id": "i256_o128_c60",
       "held_out": false,
-      "capacity_prior_rps": 11.8466,
-      "duration_s": 360,
-      "planned_requests": 2748,
+      "capacity_rps": 11.8466,
+      "capacity_source": "prior_fit",
+      "admission_cap": "gateway-capped",
+      "skipped": true,
       "components": [
         {
           "weight": 1.0,
@@ -476,18 +658,28 @@
           "max_tokens": 128
         }
       ],
-      "peak_offered_rps": 30.8012,
-      "path": "dsllama-8b/S1_bursts.json"
+      "kv_cache_tokens": 147536,
+      "tokens_per_request": 384.0,
+      "burst_requests": 240,
+      "burst_requests_needed": 576,
+      "burst_request_cap": 240,
+      "engine_running_limit": 384,
+      "sequence_limit": 1024,
+      "kv_request_limit": 384,
+      "reachable": false,
+      "binding_limit": "kv_cache",
+      "reason": "reaching waiting > 0 needs 576 concurrent requests (1.5x the 384-request engine running limit, kv_cache-bound), but the gateway-capped policy admits at most 240 (75% of the 320-request shed ceiling); the spike would be shed by the gateway instead of queued by the engine"
     },
     {
       "model": "dsllama-8b",
       "shape": "S2",
       "primitive": "ramp",
-      "cell_id": "i768_o192_c160",
+      "cell_id": "i768_o192_c120",
       "held_out": false,
-      "capacity_prior_rps": 5.9415,
-      "duration_s": 540,
-      "planned_requests": 3422,
+      "capacity_rps": 5.9415,
+      "capacity_source": "prior_fit",
+      "admission_cap": "gateway-capped",
+      "skipped": false,
       "components": [
         {
           "weight": 1.0,
@@ -495,7 +687,18 @@
           "max_tokens": 192
         }
       ],
-      "peak_offered_rps": 9.5064,
+      "rho_start": 0.4,
+      "rho_end": 1.2,
+      "ramp_s": 300,
+      "hold_s": 75,
+      "drain_rho": 0.5,
+      "drain_s": 60.0,
+      "drain_start_s": 375,
+      "backlog_coefficient": 0.07499999999999998,
+      "ramp_excess_budget": 140,
+      "duration_s": 435,
+      "planned_requests": 2139,
+      "peak_offered_rps": 7.1298,
       "path": "dsllama-8b/S2_ramp.json"
     },
     {
@@ -504,9 +707,10 @@
       "primitive": "steps",
       "cell_id": "i768_o192_c95",
       "held_out": false,
-      "capacity_prior_rps": 5.9415,
-      "duration_s": 450,
-      "planned_requests": 2192,
+      "capacity_rps": 5.9415,
+      "capacity_source": "prior_fit",
+      "admission_cap": "gateway-capped",
+      "skipped": false,
       "components": [
         {
           "weight": 1.0,
@@ -514,6 +718,8 @@
           "max_tokens": 192
         }
       ],
+      "duration_s": 450,
+      "planned_requests": 2192,
       "peak_offered_rps": 5.6444,
       "discard_after_s": [
         0,
@@ -528,9 +734,10 @@
       "primitive": "bursts",
       "cell_id": "i768_o192_c60",
       "held_out": false,
-      "capacity_prior_rps": 5.9415,
-      "duration_s": 360,
-      "planned_requests": 1378,
+      "capacity_rps": 5.9415,
+      "capacity_source": "prior_fit",
+      "admission_cap": "gateway-capped",
+      "skipped": false,
       "components": [
         {
           "weight": 1.0,
@@ -538,18 +745,33 @@
           "max_tokens": 192
         }
       ],
-      "peak_offered_rps": 15.4479,
+      "kv_cache_tokens": 147536,
+      "tokens_per_request": 960.0,
+      "burst_requests": 230,
+      "burst_requests_needed": 230,
+      "burst_request_cap": 240,
+      "engine_running_limit": 153,
+      "sequence_limit": 1024,
+      "kv_request_limit": 153,
+      "reachable": true,
+      "binding_limit": "kv_cache",
+      "reason": "230 concurrent requests overshoot the engine running limit of 153 (kv_cache-bound) and fit under the 240-request admission budget of the gateway-capped policy",
+      "burst_segment_rps": 115.0,
+      "duration_s": 360,
+      "planned_requests": 2203,
+      "peak_offered_rps": 118.5649,
       "path": "dsllama-8b/S2_bursts.json"
     },
     {
       "model": "dsllama-8b",
       "shape": "S3",
       "primitive": "ramp",
-      "cell_id": "i2048_o96_c160",
+      "cell_id": "i2048_o96_c120",
       "held_out": false,
-      "capacity_prior_rps": 3.7763,
-      "duration_s": 540,
-      "planned_requests": 2175,
+      "capacity_rps": 3.7763,
+      "capacity_source": "prior_fit",
+      "admission_cap": "gateway-capped",
+      "skipped": false,
       "components": [
         {
           "weight": 1.0,
@@ -557,7 +779,18 @@
           "max_tokens": 96
         }
       ],
-      "peak_offered_rps": 6.0421,
+      "rho_start": 0.4,
+      "rho_end": 1.2,
+      "ramp_s": 300,
+      "hold_s": 75,
+      "drain_rho": 0.5,
+      "drain_s": 60.0,
+      "drain_start_s": 375,
+      "backlog_coefficient": 0.07499999999999998,
+      "ramp_excess_budget": 140,
+      "duration_s": 435,
+      "planned_requests": 1359,
+      "peak_offered_rps": 4.5316,
       "path": "dsllama-8b/S3_ramp.json"
     },
     {
@@ -566,9 +799,10 @@
       "primitive": "steps",
       "cell_id": "i2048_o96_c95",
       "held_out": false,
-      "capacity_prior_rps": 3.7763,
-      "duration_s": 450,
-      "planned_requests": 1393,
+      "capacity_rps": 3.7763,
+      "capacity_source": "prior_fit",
+      "admission_cap": "gateway-capped",
+      "skipped": false,
       "components": [
         {
           "weight": 1.0,
@@ -576,6 +810,8 @@
           "max_tokens": 96
         }
       ],
+      "duration_s": 450,
+      "planned_requests": 1393,
       "peak_offered_rps": 3.5875,
       "discard_after_s": [
         0,
@@ -590,9 +826,10 @@
       "primitive": "bursts",
       "cell_id": "i2048_o96_c60",
       "held_out": false,
-      "capacity_prior_rps": 3.7763,
-      "duration_s": 360,
-      "planned_requests": 876,
+      "capacity_rps": 3.7763,
+      "capacity_source": "prior_fit",
+      "admission_cap": "gateway-capped",
+      "skipped": false,
       "components": [
         {
           "weight": 1.0,
@@ -600,18 +837,33 @@
           "max_tokens": 96
         }
       ],
-      "peak_offered_rps": 9.8185,
+      "kv_cache_tokens": 147536,
+      "tokens_per_request": 2144.0,
+      "burst_requests": 102,
+      "burst_requests_needed": 102,
+      "burst_request_cap": 240,
+      "engine_running_limit": 68,
+      "sequence_limit": 1024,
+      "kv_request_limit": 68,
+      "reachable": true,
+      "binding_limit": "kv_cache",
+      "reason": "102 concurrent requests overshoot the engine running limit of 68 (kv_cache-bound) and fit under the 240-request admission budget of the gateway-capped policy",
+      "burst_segment_rps": 51.0,
+      "duration_s": 360,
+      "planned_requests": 1224,
+      "peak_offered_rps": 53.2658,
       "path": "dsllama-8b/S3_bursts.json"
     },
     {
       "model": "dsllama-8b",
       "shape": "S4",
       "primitive": "ramp",
-      "cell_id": "i256_o448_c160",
+      "cell_id": "i256_o448_c120",
       "held_out": false,
-      "capacity_prior_rps": 4.4255,
-      "duration_s": 540,
-      "planned_requests": 2549,
+      "capacity_rps": 4.4255,
+      "capacity_source": "prior_fit",
+      "admission_cap": "gateway-capped",
+      "skipped": false,
       "components": [
         {
           "weight": 1.0,
@@ -619,7 +871,18 @@
           "max_tokens": 448
         }
       ],
-      "peak_offered_rps": 7.0809,
+      "rho_start": 0.4,
+      "rho_end": 1.2,
+      "ramp_s": 300,
+      "hold_s": 75,
+      "drain_rho": 0.5,
+      "drain_s": 60.0,
+      "drain_start_s": 375,
+      "backlog_coefficient": 0.07499999999999998,
+      "ramp_excess_budget": 140,
+      "duration_s": 435,
+      "planned_requests": 1593,
+      "peak_offered_rps": 5.3106,
       "path": "dsllama-8b/S4_ramp.json"
     },
     {
@@ -628,9 +891,10 @@
       "primitive": "steps",
       "cell_id": "i256_o448_c95",
       "held_out": false,
-      "capacity_prior_rps": 4.4255,
-      "duration_s": 450,
-      "planned_requests": 1633,
+      "capacity_rps": 4.4255,
+      "capacity_source": "prior_fit",
+      "admission_cap": "gateway-capped",
+      "skipped": false,
       "components": [
         {
           "weight": 1.0,
@@ -638,6 +902,8 @@
           "max_tokens": 448
         }
       ],
+      "duration_s": 450,
+      "planned_requests": 1633,
       "peak_offered_rps": 4.2043,
       "discard_after_s": [
         0,
@@ -652,9 +918,10 @@
       "primitive": "bursts",
       "cell_id": "i256_o448_c60",
       "held_out": false,
-      "capacity_prior_rps": 4.4255,
-      "duration_s": 360,
-      "planned_requests": 1027,
+      "capacity_rps": 4.4255,
+      "capacity_source": "prior_fit",
+      "admission_cap": "gateway-capped",
+      "skipped": true,
       "components": [
         {
           "weight": 1.0,
@@ -662,18 +929,28 @@
           "max_tokens": 448
         }
       ],
-      "peak_offered_rps": 11.5064,
-      "path": "dsllama-8b/S4_bursts.json"
+      "kv_cache_tokens": 147536,
+      "tokens_per_request": 704.0,
+      "burst_requests": 240,
+      "burst_requests_needed": 314,
+      "burst_request_cap": 240,
+      "engine_running_limit": 209,
+      "sequence_limit": 1024,
+      "kv_request_limit": 209,
+      "reachable": false,
+      "binding_limit": "kv_cache",
+      "reason": "reaching waiting > 0 needs 314 concurrent requests (1.5x the 209-request engine running limit, kv_cache-bound), but the gateway-capped policy admits at most 240 (75% of the 320-request shed ceiling); the spike would be shed by the gateway instead of queued by the engine"
     },
     {
       "model": "dsllama-8b",
       "shape": "S5",
       "primitive": "ramp",
-      "cell_id": "i768_o384_c160",
+      "cell_id": "i768_o384_c120",
       "held_out": false,
-      "capacity_prior_rps": 3.9489,
-      "duration_s": 540,
-      "planned_requests": 2275,
+      "capacity_rps": 3.9489,
+      "capacity_source": "prior_fit",
+      "admission_cap": "gateway-capped",
+      "skipped": false,
       "components": [
         {
           "weight": 1.0,
@@ -681,7 +958,18 @@
           "max_tokens": 384
         }
       ],
-      "peak_offered_rps": 6.3182,
+      "rho_start": 0.4,
+      "rho_end": 1.2,
+      "ramp_s": 300,
+      "hold_s": 75,
+      "drain_rho": 0.5,
+      "drain_s": 60.0,
+      "drain_start_s": 375,
+      "backlog_coefficient": 0.07499999999999998,
+      "ramp_excess_budget": 140,
+      "duration_s": 435,
+      "planned_requests": 1422,
+      "peak_offered_rps": 4.7386,
       "path": "dsllama-8b/S5_ramp.json"
     },
     {
@@ -690,9 +978,10 @@
       "primitive": "steps",
       "cell_id": "i768_o384_c95",
       "held_out": false,
-      "capacity_prior_rps": 3.9489,
-      "duration_s": 450,
-      "planned_requests": 1457,
+      "capacity_rps": 3.9489,
+      "capacity_source": "prior_fit",
+      "admission_cap": "gateway-capped",
+      "skipped": false,
       "components": [
         {
           "weight": 1.0,
@@ -700,6 +989,8 @@
           "max_tokens": 384
         }
       ],
+      "duration_s": 450,
+      "planned_requests": 1457,
       "peak_offered_rps": 3.7514,
       "discard_after_s": [
         0,
@@ -714,9 +1005,10 @@
       "primitive": "bursts",
       "cell_id": "i768_o384_c60",
       "held_out": false,
-      "capacity_prior_rps": 3.9489,
-      "duration_s": 360,
-      "planned_requests": 916,
+      "capacity_rps": 3.9489,
+      "capacity_source": "prior_fit",
+      "admission_cap": "gateway-capped",
+      "skipped": false,
       "components": [
         {
           "weight": 1.0,
@@ -724,18 +1016,33 @@
           "max_tokens": 384
         }
       ],
-      "peak_offered_rps": 10.267,
+      "kv_cache_tokens": 147536,
+      "tokens_per_request": 1152.0,
+      "burst_requests": 192,
+      "burst_requests_needed": 192,
+      "burst_request_cap": 240,
+      "engine_running_limit": 128,
+      "sequence_limit": 1024,
+      "kv_request_limit": 128,
+      "reachable": true,
+      "binding_limit": "kv_cache",
+      "reason": "192 concurrent requests overshoot the engine running limit of 128 (kv_cache-bound) and fit under the 240-request admission budget of the gateway-capped policy",
+      "burst_segment_rps": 96.0,
+      "duration_s": 360,
+      "planned_requests": 1621,
+      "peak_offered_rps": 98.3693,
       "path": "dsllama-8b/S5_bursts.json"
     },
     {
       "model": "dsllama-8b",
       "shape": "M",
       "primitive": "ramp",
-      "cell_id": "i0_o0_c160",
+      "cell_id": "i0_o0_c120",
       "held_out": true,
-      "capacity_prior_rps": 5.7464,
-      "duration_s": 540,
-      "planned_requests": 3310,
+      "capacity_rps": 5.7464,
+      "capacity_source": "prior_fit",
+      "admission_cap": "gateway-capped",
+      "skipped": false,
       "components": [
         {
           "weight": 0.4,
@@ -758,7 +1065,18 @@
           "max_tokens": 64
         }
       ],
-      "peak_offered_rps": 9.1943,
+      "rho_start": 0.4,
+      "rho_end": 1.2,
+      "ramp_s": 300,
+      "hold_s": 75,
+      "drain_rho": 0.5,
+      "drain_s": 60.0,
+      "drain_start_s": 375,
+      "backlog_coefficient": 0.07499999999999998,
+      "ramp_excess_budget": 140,
+      "duration_s": 435,
+      "planned_requests": 2069,
+      "peak_offered_rps": 6.8957,
       "path": "dsllama-8b/M_ramp.json"
     },
     {
@@ -767,9 +1085,10 @@
       "primitive": "steps",
       "cell_id": "i0_o0_c95",
       "held_out": true,
-      "capacity_prior_rps": 5.7464,
-      "duration_s": 450,
-      "planned_requests": 2120,
+      "capacity_rps": 5.7464,
+      "capacity_source": "prior_fit",
+      "admission_cap": "gateway-capped",
+      "skipped": false,
       "components": [
         {
           "weight": 0.4,
@@ -792,6 +1111,8 @@
           "max_tokens": 64
         }
       ],
+      "duration_s": 450,
+      "planned_requests": 2120,
       "peak_offered_rps": 5.459,
       "discard_after_s": [
         0,
@@ -806,9 +1127,10 @@
       "primitive": "bursts",
       "cell_id": "i0_o0_c60",
       "held_out": true,
-      "capacity_prior_rps": 5.7464,
-      "duration_s": 360,
-      "planned_requests": 1333,
+      "capacity_rps": 5.7464,
+      "capacity_source": "prior_fit",
+      "admission_cap": "gateway-capped",
+      "skipped": false,
       "components": [
         {
           "weight": 0.4,
@@ -831,18 +1153,33 @@
           "max_tokens": 64
         }
       ],
-      "peak_offered_rps": 14.9408,
+      "kv_cache_tokens": 147536,
+      "tokens_per_request": 953.6,
+      "burst_requests": 231,
+      "burst_requests_needed": 231,
+      "burst_request_cap": 240,
+      "engine_running_limit": 154,
+      "sequence_limit": 1024,
+      "kv_request_limit": 154,
+      "reachable": true,
+      "binding_limit": "kv_cache",
+      "reason": "231 concurrent requests overshoot the engine running limit of 154 (kv_cache-bound) and fit under the 240-request admission budget of the gateway-capped policy",
+      "burst_segment_rps": 115.5,
+      "duration_s": 360,
+      "planned_requests": 2165,
+      "peak_offered_rps": 118.9479,
       "path": "dsllama-8b/M_bursts.json"
     },
     {
       "model": "dsqwen-14b",
       "shape": "S1",
       "primitive": "ramp",
-      "cell_id": "i256_o128_c160",
+      "cell_id": "i256_o128_c120",
       "held_out": false,
-      "capacity_prior_rps": 6.2582,
-      "duration_s": 540,
-      "planned_requests": 3605,
+      "capacity_rps": 6.2582,
+      "capacity_source": "prior_fit",
+      "admission_cap": "gateway-capped",
+      "skipped": false,
       "components": [
         {
           "weight": 1.0,
@@ -850,7 +1187,18 @@
           "max_tokens": 128
         }
       ],
-      "peak_offered_rps": 10.0131,
+      "rho_start": 0.4,
+      "rho_end": 1.2,
+      "ramp_s": 298.276,
+      "hold_s": 74.569,
+      "drain_rho": 0.5,
+      "drain_s": 60.0,
+      "drain_start_s": 372.844,
+      "backlog_coefficient": 0.07499999999999998,
+      "ramp_excess_budget": 140,
+      "duration_s": 432.844,
+      "planned_requests": 2241,
+      "peak_offered_rps": 7.5098,
       "path": "dsqwen-14b/S1_ramp.json"
     },
     {
@@ -859,9 +1207,10 @@
       "primitive": "steps",
       "cell_id": "i256_o128_c95",
       "held_out": false,
-      "capacity_prior_rps": 6.2582,
-      "duration_s": 450,
-      "planned_requests": 2309,
+      "capacity_rps": 6.2582,
+      "capacity_source": "prior_fit",
+      "admission_cap": "gateway-capped",
+      "skipped": false,
       "components": [
         {
           "weight": 1.0,
@@ -869,6 +1218,8 @@
           "max_tokens": 128
         }
       ],
+      "duration_s": 450,
+      "planned_requests": 2309,
       "peak_offered_rps": 5.9453,
       "discard_after_s": [
         0,
@@ -883,9 +1234,10 @@
       "primitive": "bursts",
       "cell_id": "i256_o128_c60",
       "held_out": false,
-      "capacity_prior_rps": 6.2582,
-      "duration_s": 360,
-      "planned_requests": 1452,
+      "capacity_rps": 6.2582,
+      "capacity_source": "prior_fit",
+      "admission_cap": "gateway-capped",
+      "skipped": true,
       "components": [
         {
           "weight": 1.0,
@@ -893,18 +1245,28 @@
           "max_tokens": 128
         }
       ],
-      "peak_offered_rps": 16.2713,
-      "path": "dsqwen-14b/S1_bursts.json"
+      "kv_cache_tokens": 202336,
+      "tokens_per_request": 384.0,
+      "burst_requests": 240,
+      "burst_requests_needed": 789,
+      "burst_request_cap": 240,
+      "engine_running_limit": 526,
+      "sequence_limit": 1024,
+      "kv_request_limit": 526,
+      "reachable": false,
+      "binding_limit": "kv_cache",
+      "reason": "reaching waiting > 0 needs 789 concurrent requests (1.5x the 526-request engine running limit, kv_cache-bound), but the gateway-capped policy admits at most 240 (75% of the 320-request shed ceiling); the spike would be shed by the gateway instead of queued by the engine"
     },
     {
       "model": "dsqwen-14b",
       "shape": "S2",
       "primitive": "ramp",
-      "cell_id": "i768_o192_c160",
+      "cell_id": "i768_o192_c120",
       "held_out": false,
-      "capacity_prior_rps": 3.3069,
-      "duration_s": 540,
-      "planned_requests": 1905,
+      "capacity_rps": 3.3069,
+      "capacity_source": "prior_fit",
+      "admission_cap": "gateway-capped",
+      "skipped": false,
       "components": [
         {
           "weight": 1.0,
@@ -912,7 +1274,18 @@
           "max_tokens": 192
         }
       ],
-      "peak_offered_rps": 5.2911,
+      "rho_start": 0.4,
+      "rho_end": 1.2,
+      "ramp_s": 300,
+      "hold_s": 75,
+      "drain_rho": 0.5,
+      "drain_s": 60.0,
+      "drain_start_s": 375,
+      "backlog_coefficient": 0.07499999999999998,
+      "ramp_excess_budget": 140,
+      "duration_s": 435,
+      "planned_requests": 1190,
+      "peak_offered_rps": 3.9683,
       "path": "dsqwen-14b/S2_ramp.json"
     },
     {
@@ -921,9 +1294,10 @@
       "primitive": "steps",
       "cell_id": "i768_o192_c95",
       "held_out": false,
-      "capacity_prior_rps": 3.3069,
-      "duration_s": 450,
-      "planned_requests": 1220,
+      "capacity_rps": 3.3069,
+      "capacity_source": "prior_fit",
+      "admission_cap": "gateway-capped",
+      "skipped": false,
       "components": [
         {
           "weight": 1.0,
@@ -931,6 +1305,8 @@
           "max_tokens": 192
         }
       ],
+      "duration_s": 450,
+      "planned_requests": 1220,
       "peak_offered_rps": 3.1416,
       "discard_after_s": [
         0,
@@ -945,9 +1321,10 @@
       "primitive": "bursts",
       "cell_id": "i768_o192_c60",
       "held_out": false,
-      "capacity_prior_rps": 3.3069,
-      "duration_s": 360,
-      "planned_requests": 767,
+      "capacity_rps": 3.3069,
+      "capacity_source": "prior_fit",
+      "admission_cap": "gateway-capped",
+      "skipped": true,
       "components": [
         {
           "weight": 1.0,
@@ -955,18 +1332,28 @@
           "max_tokens": 192
         }
       ],
-      "peak_offered_rps": 8.5981,
-      "path": "dsqwen-14b/S2_bursts.json"
+      "kv_cache_tokens": 202336,
+      "tokens_per_request": 960.0,
+      "burst_requests": 240,
+      "burst_requests_needed": 315,
+      "burst_request_cap": 240,
+      "engine_running_limit": 210,
+      "sequence_limit": 1024,
+      "kv_request_limit": 210,
+      "reachable": false,
+      "binding_limit": "kv_cache",
+      "reason": "reaching waiting > 0 needs 315 concurrent requests (1.5x the 210-request engine running limit, kv_cache-bound), but the gateway-capped policy admits at most 240 (75% of the 320-request shed ceiling); the spike would be shed by the gateway instead of queued by the engine"
     },
     {
       "model": "dsqwen-14b",
       "shape": "S3",
       "primitive": "ramp",
-      "cell_id": "i2048_o96_c160",
+      "cell_id": "i2048_o96_c120",
       "held_out": false,
-      "capacity_prior_rps": 2.3644,
-      "duration_s": 540,
-      "planned_requests": 1362,
+      "capacity_rps": 2.3644,
+      "capacity_source": "prior_fit",
+      "admission_cap": "gateway-capped",
+      "skipped": false,
       "components": [
         {
           "weight": 1.0,
@@ -974,7 +1361,18 @@
           "max_tokens": 96
         }
       ],
-      "peak_offered_rps": 3.7831,
+      "rho_start": 0.4,
+      "rho_end": 1.2,
+      "ramp_s": 300,
+      "hold_s": 75,
+      "drain_rho": 0.5,
+      "drain_s": 60.0,
+      "drain_start_s": 375,
+      "backlog_coefficient": 0.07499999999999998,
+      "ramp_excess_budget": 140,
+      "duration_s": 435,
+      "planned_requests": 851,
+      "peak_offered_rps": 2.8373,
       "path": "dsqwen-14b/S3_ramp.json"
     },
     {
@@ -983,9 +1381,10 @@
       "primitive": "steps",
       "cell_id": "i2048_o96_c95",
       "held_out": false,
-      "capacity_prior_rps": 2.3644,
-      "duration_s": 450,
-      "planned_requests": 872,
+      "capacity_rps": 2.3644,
+      "capacity_source": "prior_fit",
+      "admission_cap": "gateway-capped",
+      "skipped": false,
       "components": [
         {
           "weight": 1.0,
@@ -993,6 +1392,8 @@
           "max_tokens": 96
         }
       ],
+      "duration_s": 450,
+      "planned_requests": 872,
       "peak_offered_rps": 2.2462,
       "discard_after_s": [
         0,
@@ -1007,9 +1408,10 @@
       "primitive": "bursts",
       "cell_id": "i2048_o96_c60",
       "held_out": false,
-      "capacity_prior_rps": 2.3644,
-      "duration_s": 360,
-      "planned_requests": 549,
+      "capacity_rps": 2.3644,
+      "capacity_source": "prior_fit",
+      "admission_cap": "gateway-capped",
+      "skipped": false,
       "components": [
         {
           "weight": 1.0,
@@ -1017,18 +1419,33 @@
           "max_tokens": 96
         }
       ],
-      "peak_offered_rps": 6.1474,
+      "kv_cache_tokens": 202336,
+      "tokens_per_request": 2144.0,
+      "burst_requests": 141,
+      "burst_requests_needed": 141,
+      "burst_request_cap": 240,
+      "engine_running_limit": 94,
+      "sequence_limit": 1024,
+      "kv_request_limit": 94,
+      "reachable": true,
+      "binding_limit": "kv_cache",
+      "reason": "141 concurrent requests overshoot the engine running limit of 94 (kv_cache-bound) and fit under the 240-request admission budget of the gateway-capped policy",
+      "burst_segment_rps": 70.5,
+      "duration_s": 360,
+      "planned_requests": 1075,
+      "peak_offered_rps": 71.9186,
       "path": "dsqwen-14b/S3_bursts.json"
     },
     {
       "model": "dsqwen-14b",
       "shape": "S4",
       "primitive": "ramp",
-      "cell_id": "i256_o448_c160",
+      "cell_id": "i256_o448_c120",
       "held_out": false,
-      "capacity_prior_rps": 2.199,
-      "duration_s": 540,
-      "planned_requests": 1267,
+      "capacity_rps": 2.199,
+      "capacity_source": "prior_fit",
+      "admission_cap": "gateway-capped",
+      "skipped": false,
       "components": [
         {
           "weight": 1.0,
@@ -1036,7 +1453,18 @@
           "max_tokens": 448
         }
       ],
-      "peak_offered_rps": 3.5184,
+      "rho_start": 0.4,
+      "rho_end": 1.2,
+      "ramp_s": 300,
+      "hold_s": 75,
+      "drain_rho": 0.5,
+      "drain_s": 60.0,
+      "drain_start_s": 375,
+      "backlog_coefficient": 0.07499999999999998,
+      "ramp_excess_budget": 140,
+      "duration_s": 435,
+      "planned_requests": 792,
+      "peak_offered_rps": 2.6388,
       "path": "dsqwen-14b/S4_ramp.json"
     },
     {
@@ -1045,9 +1473,10 @@
       "primitive": "steps",
       "cell_id": "i256_o448_c95",
       "held_out": false,
-      "capacity_prior_rps": 2.199,
-      "duration_s": 450,
-      "planned_requests": 811,
+      "capacity_rps": 2.199,
+      "capacity_source": "prior_fit",
+      "admission_cap": "gateway-capped",
+      "skipped": false,
       "components": [
         {
           "weight": 1.0,
@@ -1055,6 +1484,8 @@
           "max_tokens": 448
         }
       ],
+      "duration_s": 450,
+      "planned_requests": 811,
       "peak_offered_rps": 2.0891,
       "discard_after_s": [
         0,
@@ -1069,9 +1500,10 @@
       "primitive": "bursts",
       "cell_id": "i256_o448_c60",
       "held_out": false,
-      "capacity_prior_rps": 2.199,
-      "duration_s": 360,
-      "planned_requests": 510,
+      "capacity_rps": 2.199,
+      "capacity_source": "prior_fit",
+      "admission_cap": "gateway-capped",
+      "skipped": true,
       "components": [
         {
           "weight": 1.0,
@@ -1079,18 +1511,28 @@
           "max_tokens": 448
         }
       ],
-      "peak_offered_rps": 5.7174,
-      "path": "dsqwen-14b/S4_bursts.json"
+      "kv_cache_tokens": 202336,
+      "tokens_per_request": 704.0,
+      "burst_requests": 240,
+      "burst_requests_needed": 431,
+      "burst_request_cap": 240,
+      "engine_running_limit": 287,
+      "sequence_limit": 1024,
+      "kv_request_limit": 287,
+      "reachable": false,
+      "binding_limit": "kv_cache",
+      "reason": "reaching waiting > 0 needs 431 concurrent requests (1.5x the 287-request engine running limit, kv_cache-bound), but the gateway-capped policy admits at most 240 (75% of the 320-request shed ceiling); the spike would be shed by the gateway instead of queued by the engine"
     },
     {
       "model": "dsqwen-14b",
       "shape": "S5",
       "primitive": "ramp",
-      "cell_id": "i768_o384_c160",
+      "cell_id": "i768_o384_c120",
       "held_out": false,
-      "capacity_prior_rps": 2.0861,
-      "duration_s": 540,
-      "planned_requests": 1202,
+      "capacity_rps": 2.0861,
+      "capacity_source": "prior_fit",
+      "admission_cap": "gateway-capped",
+      "skipped": false,
       "components": [
         {
           "weight": 1.0,
@@ -1098,7 +1540,18 @@
           "max_tokens": 384
         }
       ],
-      "peak_offered_rps": 3.3377,
+      "rho_start": 0.4,
+      "rho_end": 1.2,
+      "ramp_s": 300,
+      "hold_s": 75,
+      "drain_rho": 0.5,
+      "drain_s": 60.0,
+      "drain_start_s": 375,
+      "backlog_coefficient": 0.07499999999999998,
+      "ramp_excess_budget": 140,
+      "duration_s": 435,
+      "planned_requests": 751,
+      "peak_offered_rps": 2.5033,
       "path": "dsqwen-14b/S5_ramp.json"
     },
     {
@@ -1107,9 +1560,10 @@
       "primitive": "steps",
       "cell_id": "i768_o384_c95",
       "held_out": false,
-      "capacity_prior_rps": 2.0861,
-      "duration_s": 450,
-      "planned_requests": 770,
+      "capacity_rps": 2.0861,
+      "capacity_source": "prior_fit",
+      "admission_cap": "gateway-capped",
+      "skipped": false,
       "components": [
         {
           "weight": 1.0,
@@ -1117,6 +1571,8 @@
           "max_tokens": 384
         }
       ],
+      "duration_s": 450,
+      "planned_requests": 770,
       "peak_offered_rps": 1.9818,
       "discard_after_s": [
         0,
@@ -1131,9 +1587,10 @@
       "primitive": "bursts",
       "cell_id": "i768_o384_c60",
       "held_out": false,
-      "capacity_prior_rps": 2.0861,
-      "duration_s": 360,
-      "planned_requests": 484,
+      "capacity_rps": 2.0861,
+      "capacity_source": "prior_fit",
+      "admission_cap": "gateway-capped",
+      "skipped": true,
       "components": [
         {
           "weight": 1.0,
@@ -1141,18 +1598,28 @@
           "max_tokens": 384
         }
       ],
-      "peak_offered_rps": 5.4237,
-      "path": "dsqwen-14b/S5_bursts.json"
+      "kv_cache_tokens": 202336,
+      "tokens_per_request": 1152.0,
+      "burst_requests": 240,
+      "burst_requests_needed": 263,
+      "burst_request_cap": 240,
+      "engine_running_limit": 175,
+      "sequence_limit": 1024,
+      "kv_request_limit": 175,
+      "reachable": false,
+      "binding_limit": "kv_cache",
+      "reason": "reaching waiting > 0 needs 263 concurrent requests (1.5x the 175-request engine running limit, kv_cache-bound), but the gateway-capped policy admits at most 240 (75% of the 320-request shed ceiling); the spike would be shed by the gateway instead of queued by the engine"
     },
     {
       "model": "dsqwen-14b",
       "shape": "M",
       "primitive": "ramp",
-      "cell_id": "i0_o0_c160",
+      "cell_id": "i0_o0_c120",
       "held_out": true,
-      "capacity_prior_rps": 3.1654,
-      "duration_s": 540,
-      "planned_requests": 1823,
+      "capacity_rps": 3.1654,
+      "capacity_source": "prior_fit",
+      "admission_cap": "gateway-capped",
+      "skipped": false,
       "components": [
         {
           "weight": 0.4,
@@ -1175,7 +1642,18 @@
           "max_tokens": 64
         }
       ],
-      "peak_offered_rps": 5.0647,
+      "rho_start": 0.4,
+      "rho_end": 1.2,
+      "ramp_s": 300,
+      "hold_s": 75,
+      "drain_rho": 0.5,
+      "drain_s": 60.0,
+      "drain_start_s": 375,
+      "backlog_coefficient": 0.07499999999999998,
+      "ramp_excess_budget": 140,
+      "duration_s": 435,
+      "planned_requests": 1140,
+      "peak_offered_rps": 3.7986,
       "path": "dsqwen-14b/M_ramp.json"
     },
     {
@@ -1184,9 +1662,10 @@
       "primitive": "steps",
       "cell_id": "i0_o0_c95",
       "held_out": true,
-      "capacity_prior_rps": 3.1654,
-      "duration_s": 450,
-      "planned_requests": 1168,
+      "capacity_rps": 3.1654,
+      "capacity_source": "prior_fit",
+      "admission_cap": "gateway-capped",
+      "skipped": false,
       "components": [
         {
           "weight": 0.4,
@@ -1209,6 +1688,8 @@
           "max_tokens": 64
         }
       ],
+      "duration_s": 450,
+      "planned_requests": 1168,
       "peak_offered_rps": 3.0071,
       "discard_after_s": [
         0,
@@ -1223,9 +1704,10 @@
       "primitive": "bursts",
       "cell_id": "i0_o0_c60",
       "held_out": true,
-      "capacity_prior_rps": 3.1654,
-      "duration_s": 360,
-      "planned_requests": 734,
+      "capacity_rps": 3.1654,
+      "capacity_source": "prior_fit",
+      "admission_cap": "gateway-capped",
+      "skipped": true,
       "components": [
         {
           "weight": 0.4,
@@ -1248,8 +1730,17 @@
           "max_tokens": 64
         }
       ],
-      "peak_offered_rps": 8.2303,
-      "path": "dsqwen-14b/M_bursts.json"
+      "kv_cache_tokens": 202336,
+      "tokens_per_request": 953.6,
+      "burst_requests": 240,
+      "burst_requests_needed": 318,
+      "burst_request_cap": 240,
+      "engine_running_limit": 212,
+      "sequence_limit": 1024,
+      "kv_request_limit": 212,
+      "reachable": false,
+      "binding_limit": "kv_cache",
+      "reason": "reaching waiting > 0 needs 318 concurrent requests (1.5x the 212-request engine running limit, kv_cache-bound), but the gateway-capped policy admits at most 240 (75% of the 320-request shed ceiling); the spike would be shed by the gateway instead of queued by the engine"
     }
   ],
   "capacity_models": {
@@ -1257,19 +1748,22 @@
       "prefill_tokens_per_s": 11977.05,
       "decode_tokens_per_s": 3305.85,
       "fitted_from_points": 8,
-      "rms_relative_error": 0.2444
+      "rms_relative_error": 0.2444,
+      "kv_cache_tokens": 349232
     },
     "dsllama-8b": {
       "prefill_tokens_per_s": 9211.02,
       "decode_tokens_per_s": 2260.7,
       "fitted_from_points": 6,
-      "rms_relative_error": 0.0993
+      "rms_relative_error": 0.0993,
+      "kv_cache_tokens": 147536
     },
     "dsqwen-14b": {
       "prefill_tokens_per_s": 6123.5,
       "decode_tokens_per_s": 1084.89,
       "fitted_from_points": 5,
-      "rms_relative_error": 0.2916
+      "rms_relative_error": 0.2916,
+      "kv_cache_tokens": 202336
     }
   },
   "shapes": {
@@ -1321,13 +1815,14 @@
   },
   "primitives": {
     "ramp": {
-      "rho_start": 0.8,
-      "rho_end": 1.6,
-      "ramp_s": 360.0,
+      "rho_start": 0.4,
+      "rho_end": 1.2,
       "segment_s": 5.0,
-      "hold_s": 60.0,
-      "drain_rho": 0.4,
-      "drain_s": 120.0
+      "hold_fraction": 0.25,
+      "backlog_coefficient": 0.07499999999999998,
+      "ramp_s_formula": "min(cap.ramp_max_s, cap.ramp_excess_budget / (backlog_coefficient * capacity_rps))",
+      "drain_rho": 0.5,
+      "drain_s": 60.0
     },
     "steps": {
       "levels": [
@@ -1350,7 +1845,7 @@
       "duration_s": 360.0,
       "period_s": 90.0,
       "width_s": 2.0,
-      "multiplier": 2.0,
+      "burst_requests_formula": "ceil(cap.burst_overshoot_factor * min(cap.sequence_limit, floor(kv_cache_tokens / tokens_per_request))), skipped when it exceeds cap.burst_request_cap",
       "count": 4,
       "first_s": 60.0
     }

@@ -11,7 +11,8 @@ from scripts import openloop, r3_grid
 # --------------------------------------------------------------------- guards
 
 
-def _record(status=200, e2e=100.0, pool_wait=1.0, request_id="r0"):
+def _record(status=200, e2e=100.0, pool_wait=1.0, request_id="r0",
+            error_body=None, error_headers=None):
     return {
         "request_id": request_id,
         "http_status": status,
@@ -21,6 +22,8 @@ def _record(status=200, e2e=100.0, pool_wait=1.0, request_id="r0"):
         "actual_send_ts_ms": 1_000,
         "prompt_tokens": 256,
         "completion_tokens": 128,
+        "error_body": error_body,
+        "error_headers": error_headers,
     }
 
 
@@ -57,9 +60,14 @@ def test_guard_rejects_all_failed_sends() -> None:
 
 
 def test_guard_rejects_an_error_rate_above_threshold() -> None:
-    records = [_record() for _ in range(90)] + [_record(status=503, e2e=None) for _ in range(10)]
+    # 500 with an engine body: the request reached vLLM and failed there, so it counts
+    # against the model budget. A bare 503 would not - that is a gateway shed.
+    records = [_record() for _ in range(90)] + [
+        _record(status=500, e2e=None, error_body='{"error": "engine failure"}') for _ in range(10)
+    ]
     guard = openloop.check_cell(
-        "i256_o128_c60", scheduled=100, records=records, p99_delay_ms=1.0, max_error_rate=0.05
+        "i256_o128_c60", scheduled=100, records=records, p99_delay_ms=1.0,
+        max_model_error_rate=0.05,
     )
     assert any("error rate" in issue for issue in guard.issues)
 
@@ -68,12 +76,12 @@ def test_guard_rejects_schedule_slip_and_pool_starvation() -> None:
     # Either of these means the driver, not the engine, limited the offered load: the
     # "open loop" silently became a closed loop and the cell measures nothing useful.
     slipped = openloop.check_cell(
-        "i256_o128_c160", scheduled=10, records=[_record() for _ in range(10)], p99_delay_ms=900.0
+        "i256_o128_c120", scheduled=10, records=[_record() for _ in range(10)], p99_delay_ms=900.0
     )
     assert any("dispatch delay" in issue for issue in slipped.issues)
 
     starved = openloop.check_cell(
-        "i256_o128_c160",
+        "i256_o128_c120",
         scheduled=10,
         records=[_record(pool_wait=4000.0) for _ in range(10)],
         p99_delay_ms=1.0,
@@ -260,3 +268,195 @@ def test_drive_cell_schedule_ignores_other_models_in_the_trace() -> None:
     )
     assert guard.ok
     assert all(json.loads(b)["model"] == "dsqwen-7b" for b in stream.calls)
+
+
+# --------------------------------------------------------------- failure classifier
+
+#: The verbatim Envoy circuit-breaker response measured against the live gateway on
+#: 2026-09-20 at in-flight 321. It carries NO x-envoy-* header, so a classifier keyed on
+#: those headers alone would mis-attribute every shed in the campaign to the model.
+MEASURED_SHED = {
+    "http_status": 503,
+    "e2e_ms": 3.0,
+    "error": "HTTP 503",
+    "error_body": (
+        "upstream connect error or disconnect/reset before headers. "
+        "reset reason: overflow"
+    ),
+    "error_headers": {
+        "content-length": "81",
+        "content-type": "text/plain",
+        "date": "Sun, 20 Sep 2026 12:13:38 GMT",
+        "connection": "close",
+    },
+}
+
+
+def test_classifier_attributes_the_measured_shed_to_the_proxy() -> None:
+    assert openloop.classify_failure(MEASURED_SHED) == openloop.FAILURE_PROXY
+
+
+def test_classifier_attributes_an_engine_json_error_to_the_model() -> None:
+    record = {
+        "http_status": 503,
+        "e2e_ms": 12.0,
+        "error_body": '{"object": "error", "message": "no free blocks"}',
+        "error_headers": {"content-type": "application/json"},
+    }
+    assert openloop.classify_failure(record) == openloop.FAILURE_MODEL
+
+
+def test_classifier_attributes_a_timeout_to_the_model() -> None:
+    # vLLM queues rather than shedding, so a request that never answered was waiting on
+    # the engine, not rejected by the gateway.
+    record = {"http_status": 0, "e2e_ms": None, "error": "TimeoutError"}
+    assert openloop.classify_failure(record) == openloop.FAILURE_MODEL
+
+
+def test_classifier_attributes_an_unknown_failure_to_the_model() -> None:
+    # Attributing the unknown to the proxy would exempt it from the error budget.
+    record = {"http_status": 418, "e2e_ms": 1.0, "error_body": "teapot"}
+    assert openloop.classify_failure(record) == openloop.FAILURE_MODEL
+
+
+def test_classifier_honours_an_explicit_envoy_marker_header() -> None:
+    record = {"http_status": 429, "e2e_ms": 1.0, "error_headers": {"x-envoy-overloaded": "true"}}
+    assert openloop.classify_failure(record) == openloop.FAILURE_PROXY
+
+
+def test_served_request_is_not_a_failure() -> None:
+    assert openloop.classify_failure(_record()) == openloop.FAILURE_NONE
+
+
+# ------------------------------------------------------------------ split error budget
+
+
+def test_proxy_sheds_do_not_fail_the_cell() -> None:
+    # Half the cell shed by the gateway, and the cell still passes on the error budget:
+    # the shed says the campaign hit the admission ceiling, not that the model failed.
+    records = [_record() for _ in range(50)] + [dict(MEASURED_SHED) for _ in range(50)]
+    guard = openloop.check_cell(
+        "i256_o128_c60", scheduled=100, records=records, p99_delay_ms=1.0,
+    )
+    assert guard.proxy_errors == 50
+    assert guard.model_errors == 0
+    assert not any("error rate" in issue for issue in guard.issues)
+
+
+def test_truncated_cell_passes_with_enough_slo_evidence() -> None:
+    records = [_record() for _ in range(40)] + [dict(MEASURED_SHED)]
+    guard = openloop.check_cell(
+        "i256_o128_c120", scheduled=100, records=records, p99_delay_ms=1.0,
+        truncated=True, truncated_at_offset_s=210.0, truncated_at_ts_ms=1700,
+        censored=59, slo_windows=4,
+    )
+    assert guard.truncated
+    assert guard.censored == 59
+    assert guard.ok, guard.issues
+
+
+def test_truncated_cell_fails_without_enough_slo_evidence() -> None:
+    records = [_record() for _ in range(40)] + [dict(MEASURED_SHED)]
+    guard = openloop.check_cell(
+        "i256_o128_c120", scheduled=100, records=records, p99_delay_ms=1.0,
+        truncated=True, truncated_at_offset_s=12.0, truncated_at_ts_ms=1700,
+        censored=59, slo_windows=1,
+    )
+    assert not guard.ok
+    assert any(openloop.TRUNCATION_EVIDENCE_ISSUE in issue for issue in guard.issues)
+
+
+def test_censored_requests_are_not_counted_as_under_delivery() -> None:
+    # Without the censored allowance the truncation itself would fail the cell for
+    # "only 41/100 scheduled requests were sent".
+    records = [_record() for _ in range(41)]
+    guard = openloop.check_cell(
+        "i256_o128_c120", scheduled=100, records=records, p99_delay_ms=1.0,
+        truncated=True, censored=59, slo_windows=3,
+    )
+    assert guard.ok, guard.issues
+
+
+def test_with_slo_windows_replaces_rather_than_accumulates_its_verdict() -> None:
+    guard = openloop.check_cell(
+        "i256_o128_c120", scheduled=10, records=[_record() for _ in range(10)],
+        p99_delay_ms=1.0, truncated=True, slo_windows=0,
+    )
+    assert not guard.ok
+    revised = guard.with_slo_windows(5)
+    assert revised.ok, revised.issues
+    assert revised.slo_windows == 5
+
+
+# ---------------------------------------------------------------------- truncation
+
+
+class _FakeSender:
+    """Records what it was asked to send, and answers with a scripted status."""
+
+    def __init__(self, shed_after: int) -> None:
+        self.records: list = []
+        self._shed_after = shed_after
+        self.sent = 0
+
+    async def __call__(self, request, scheduled_ts, actual_ts) -> None:
+        self.sent += 1
+        if self.sent > self._shed_after:
+            self.records.append(dict(MEASURED_SHED, request_id=request.request_id))
+        else:
+            self.records.append(_record(request_id=request.request_id))
+
+
+class _Request:
+    def __init__(self, request_id: str, offset_s: float) -> None:
+        self.request_id = request_id
+        self.scheduled_offset_s = offset_s
+
+
+def _drive(wrapper, offsets) -> None:
+    import asyncio
+
+    async def run() -> None:
+        for index, offset in enumerate(offsets):
+            await wrapper(_Request(f"r{index}", offset), 0.0, 0.0)
+
+    asyncio.run(run())
+
+
+def test_truncation_drops_pre_drain_requests_and_keeps_the_drain() -> None:
+    sender = _FakeSender(shed_after=2)
+    wrapper = openloop.TruncateOnProxyShed(sender, drain_start_s=100.0)
+    _drive(wrapper, [0.0, 10.0, 20.0, 30.0, 40.0, 100.0, 110.0])
+
+    assert wrapper.truncated
+    assert wrapper.truncated_at_offset_s == 20.0
+    # r0..r2 sent, r3/r4 censored (before the drain), r5/r6 sent (the drain itself).
+    assert wrapper.censored == 2
+    assert [r["request_id"] for r in sender.records] == ["r0", "r1", "r2", "r5", "r6"]
+
+
+def test_truncation_without_a_drain_segment_stops_sending() -> None:
+    sender = _FakeSender(shed_after=1)
+    wrapper = openloop.TruncateOnProxyShed(sender, drain_start_s=None)
+    _drive(wrapper, [0.0, 10.0, 20.0, 30.0])
+
+    assert wrapper.truncated
+    assert wrapper.censored == 2
+    assert [r["request_id"] for r in sender.records] == ["r0", "r1"]
+
+
+def test_no_truncation_when_every_request_is_served() -> None:
+    sender = _FakeSender(shed_after=99)
+    wrapper = openloop.TruncateOnProxyShed(sender, drain_start_s=100.0)
+    _drive(wrapper, [0.0, 10.0, 20.0])
+
+    assert not wrapper.truncated
+    assert wrapper.censored == 0
+    assert len(sender.records) == 3
+
+
+def test_failure_signature_keeps_the_body_verbatim() -> None:
+    signature = openloop.failure_signature(MEASURED_SHED)
+    assert signature["failure_class"] == openloop.FAILURE_PROXY
+    assert signature["error_body"] == MEASURED_SHED["error_body"]
+    assert signature["error_headers"]["content-type"] == "text/plain"

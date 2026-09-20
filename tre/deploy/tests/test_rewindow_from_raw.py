@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import json
+import sys
 from collections import Counter
 from pathlib import Path
 
 import pytest
 
+from tre_common.rediskeys import SCRAPE_INTERVAL_MS
 from tre_common.registry import load_registry
 from tre_controller.store.metrics_store import MetricsStore
-from scripts import r3_grid, rewindow_from_raw
+from scripts import openloop, r3_grid, rewindow_from_raw
 
 TRE_ROOT = Path(__file__).resolve().parents[2]
 REGISTRY_PATH = TRE_ROOT / "deploy" / "registry.yaml"
@@ -269,3 +271,314 @@ def test_load_jsonl_roundtrip(tmp_path: Path) -> None:
     loaded = rewindow_from_raw.load_jsonl(path)
     assert len(loaded) == 3
     assert loaded[0]["cell_id"] == "i512_o128_c8"
+
+
+# --- sidecar cadence: the capture is 1 Hz, the live control path is a 10 s grid --------
+def _hz_sidecar(
+    *,
+    n: int = 60,
+    spacing_ms: int = 1_000,
+    waiting_at_s: tuple[int, ...] = (),
+    running_at_s: tuple[int, ...] = (),
+    tagged: bool = True,
+) -> list[dict]:
+    """``n`` samples ``spacing_ms`` apart from ts 0, non-zero only at the given seconds.
+
+    ``tagged=True`` runs them through ``openloop.mark_live_grid``, i.e. exactly what the
+    campaign sidecar carries; ``tagged=False`` reproduces a pre-existing closed-loop
+    capture that predates the flag.
+    """
+    samples = [
+        {
+            "ts_ms": i * spacing_ms,
+            "waiting": 3.0 if i in waiting_at_s else 0.0,
+            "running": 2.0 if i in running_at_s else 0.0,
+            "swapping": 0.0,
+        }
+        for i in range(n)
+    ]
+    return openloop.mark_live_grid(samples) if tagged else samples
+
+
+def test_live_grid_rejects_capture_cadence_naming_both_numbers() -> None:
+    # Hazard 1: --instant-sample-ms is the divisor for the queue average. In live mode the
+    # consumed spacing IS the gateway cadence, so the campaign's 1000 would divide by 10x
+    # too little. Must fail loudly, naming both numbers and the consequence.
+    samples = _hz_sidecar()
+    with pytest.raises(rewindow_from_raw.CadenceMismatchError) as exc:
+        rewindow_from_raw.resolve_instant_cadence(
+            samples, instant_grid="live", instant_sample_ms=1_000
+        )
+    message = str(exc.value)
+    assert "1000" in message
+    assert str(SCRAPE_INTERVAL_MS) in message
+    assert "10x" in message
+
+
+def test_live_grid_accepts_scrape_interval() -> None:
+    samples = _hz_sidecar()
+    assert rewindow_from_raw.resolve_instant_cadence(
+        samples, instant_grid="live", instant_sample_ms=SCRAPE_INTERVAL_MS
+    ) == SCRAPE_INTERVAL_MS
+
+
+def test_raw_mode_rejects_spacing_mismatch_on_tagged_sidecar() -> None:
+    # The default --instant-sample-ms is the live cadence; pointed at a 1 Hz campaign
+    # sidecar in raw mode it would scale every queue average by 10x.
+    samples = _hz_sidecar()
+    with pytest.raises(rewindow_from_raw.CadenceMismatchError) as exc:
+        rewindow_from_raw.resolve_instant_cadence(
+            samples, instant_grid="raw", instant_sample_ms=SCRAPE_INTERVAL_MS, source="i512_o128_c8"
+        )
+    message = str(exc.value)
+    assert "1000 ms between samples" in message
+    assert f"--instant-sample-ms={SCRAPE_INTERVAL_MS}" in message
+    assert "10x" in message
+    assert "i512_o128_c8" in message
+
+
+def test_raw_mode_accepts_matching_cadence() -> None:
+    samples = _hz_sidecar()
+    assert rewindow_from_raw.resolve_instant_cadence(
+        samples, instant_grid="raw", instant_sample_ms=1_000
+    ) == 1_000
+
+
+def test_raw_mode_tolerates_sampler_jitter() -> None:
+    # Wall-clock jitter is normal; only an order-of-magnitude mismatch is an error.
+    samples = _hz_sidecar(spacing_ms=1_100)
+    assert rewindow_from_raw.resolve_instant_cadence(
+        samples, instant_grid="raw", instant_sample_ms=1_000
+    ) == 1_000
+
+
+def test_raw_mode_keeps_untagged_sidecar_working() -> None:
+    # Pre-existing closed-loop captures carry no on_live_grid field: nothing to check
+    # against, so they must keep working (this is the r3_grid sidecar at 10 s).
+    samples = _hz_sidecar(n=6, spacing_ms=5_000, tagged=False)
+    assert not rewindow_from_raw.sidecar_has_live_grid_tags(samples)
+    assert rewindow_from_raw.resolve_instant_cadence(
+        samples, instant_grid="raw", instant_sample_ms=SCRAPE_INTERVAL_MS
+    ) == SCRAPE_INTERVAL_MS
+
+
+def test_resolve_instant_cadence_rejects_nonpositive() -> None:
+    with pytest.raises(rewindow_from_raw.CadenceMismatchError):
+        rewindow_from_raw.resolve_instant_cadence([], instant_grid="raw", instant_sample_ms=0)
+
+
+def test_observed_sample_spacing_is_median_not_mean() -> None:
+    samples = [{"ts_ms": 0}, {"ts_ms": 1_000}, {"ts_ms": 2_000}, {"ts_ms": 60_000}]
+    assert rewindow_from_raw.observed_sample_spacing_ms(samples) == pytest.approx(1_000.0)
+    assert rewindow_from_raw.observed_sample_spacing_ms([{"ts_ms": 0}]) is None
+
+
+def test_select_instant_samples_live_keeps_only_grid_samples() -> None:
+    samples = _hz_sidecar(n=30)
+    live = rewindow_from_raw.select_instant_samples(samples, "live")
+    assert [s["ts_ms"] for s in live] == [0, 10_000, 20_000]
+    assert len(rewindow_from_raw.select_instant_samples(samples, "raw")) == 30
+    with pytest.raises(ValueError):
+        rewindow_from_raw.select_instant_samples(samples, "grid")
+
+
+# --- observability gap -------------------------------------------------------------
+def test_observability_gap_all_bursts_missed() -> None:
+    # Queue spikes at t=5s and t=15s fall strictly between live-grid samples: the 1 Hz
+    # capture sees two 10 s windows cross, the controller's grid sees none.
+    samples = _hz_sidecar(waiting_at_s=(5, 15))
+    gap = rewindow_from_raw.observability_gap(samples, window_ms=10_000)
+    assert (gap.raw_crossings, gap.live_crossings) == (2, 0)
+    assert gap.total_windows == 5  # span 0..59s -> five whole 10s windows
+    assert gap.gap == pytest.approx(1.0)
+    assert gap.as_dict()["observability_gap"] == pytest.approx(1.0)
+
+
+def test_observability_gap_partial() -> None:
+    # t=20s IS a live-grid sample, so one of the three crossings is observed.
+    samples = _hz_sidecar(waiting_at_s=(5, 15, 20))
+    gap = rewindow_from_raw.observability_gap(samples, window_ms=10_000)
+    assert (gap.raw_crossings, gap.live_crossings) == (3, 1)
+    assert gap.gap == pytest.approx(1.0 - 1.0 / 3.0)
+
+
+def test_observability_gap_zero_when_nothing_to_miss() -> None:
+    gap = rewindow_from_raw.observability_gap(_hz_sidecar(), window_ms=10_000)
+    assert gap.raw_crossings == 0
+    assert gap.gap == 0.0
+
+
+def test_observability_gap_accepts_any_sidecar_key() -> None:
+    samples = _hz_sidecar(waiting_at_s=(5,), running_at_s=(25,))
+    on_running = rewindow_from_raw.observability_gap(samples, window_ms=10_000, key="running")
+    assert (on_running.raw_crossings, on_running.live_crossings) == (1, 0)
+    assert on_running.key == "running"
+    # threshold above the sample value -> no crossing at all
+    high = rewindow_from_raw.observability_gap(samples, window_ms=10_000, threshold=5.0)
+    assert (high.raw_crossings, high.gap) == (0, 0.0)
+
+
+def test_observability_gap_reuses_openloop_windowing(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Guard against a private re-implementation drifting from the capture's own definition
+    # of the live grid: the metric must go through openloop.windows_observing.
+    calls: list[dict] = []
+    real = openloop.windows_observing
+
+    def spy(samples, **kwargs):
+        calls.append(kwargs)
+        return real(samples, **kwargs)
+
+    monkeypatch.setattr(openloop, "windows_observing", spy)
+    rewindow_from_raw.observability_gap(_hz_sidecar(waiting_at_s=(5,)), window_ms=10_000)
+    assert [c["grid_only"] for c in calls] == [False, True]
+
+
+def test_combine_observability_gaps_pools_counts() -> None:
+    a = rewindow_from_raw.observability_gap(_hz_sidecar(waiting_at_s=(5, 15)), window_ms=10_000)
+    b = rewindow_from_raw.observability_gap(_hz_sidecar(waiting_at_s=(20,)), window_ms=10_000)
+    pooled = rewindow_from_raw.combine_observability_gaps([a, b])
+    assert (pooled.raw_crossings, pooled.live_crossings) == (3, 1)
+    assert pooled.gap == pytest.approx(1.0 - 1.0 / 3.0)
+    assert rewindow_from_raw.combine_observability_gaps([]) is None
+
+
+# --- live-grid re-window + meta provenance -----------------------------------------
+def test_rewindow_cell_live_grid_uses_only_grid_samples() -> None:
+    # theta is a threshold on the signal the controller consumes, so a live-grid fit must
+    # average the 10 s subsample (/6 over a 60 s window), not the 1 Hz stream.
+    registry = load_registry(str(REGISTRY_PATH))
+    spec = registry.model(MODEL)
+    cell = r3_grid.GridCell.from_scenario_id("i512_o128_c8")
+    samples = _hz_sidecar(waiting_at_s=(5, 20))
+
+    live_rows = rewindow_from_raw.rewindow_cell(
+        _make_requests(), samples, cell, spec,
+        window_ms=60_000, step_ms=60_000, percentile_mode="bucket_upper",
+        min_latency_samples=0, instant_sample_interval_ms=SCRAPE_INTERVAL_MS,
+        instant_grid="live", start_ms=0, end_ms=60_000,
+    )
+    raw_rows = rewindow_from_raw.rewindow_cell(
+        _make_requests(), samples, cell, spec,
+        window_ms=60_000, step_ms=60_000, percentile_mode="bucket_upper",
+        min_latency_samples=0, instant_sample_interval_ms=1_000,
+        instant_grid="raw", start_ms=0, end_ms=60_000,
+    )
+    # live: only the t=20s spike is on the grid -> 3.0 / (60000/10000)
+    assert live_rows[0]["avg_waiting"] == pytest.approx(3.0 / 6)
+    # raw: both spikes, divided by 60 expected samples
+    assert raw_rows[0]["avg_waiting"] == pytest.approx(6.0 / 60)
+
+
+def test_rewindow_cell_fails_loudly_on_cadence_mismatch() -> None:
+    registry = load_registry(str(REGISTRY_PATH))
+    spec = registry.model(MODEL)
+    cell = r3_grid.GridCell.from_scenario_id("i512_o128_c8")
+    with pytest.raises(rewindow_from_raw.CadenceMismatchError):
+        rewindow_from_raw.rewindow_cell(
+            _make_requests(), _hz_sidecar(), cell, spec,
+            window_ms=60_000, step_ms=60_000, percentile_mode="bucket_upper",
+            min_latency_samples=0, instant_sample_interval_ms=SCRAPE_INTERVAL_MS,
+            instant_grid="raw", start_ms=0, end_ms=60_000,
+        )
+
+
+def test_meta_path_sits_next_to_the_csv(tmp_path: Path) -> None:
+    out = tmp_path / "sub" / "rewindow_20s.csv"
+    assert rewindow_from_raw.meta_path_for(out) == tmp_path / "sub" / "rewindow_20s.meta.json"
+
+
+def test_build_meta_records_cadence_and_gap() -> None:
+    gap = rewindow_from_raw.observability_gap(_hz_sidecar(waiting_at_s=(5,)), window_ms=10_000)
+    meta = rewindow_from_raw.build_meta(
+        model=MODEL, raw_dir="/data/raw", cells=["i512_o128_c8"],
+        window_ms=20_000, step_ms=20_000, instant_sample_ms=1_000, instant_grid="raw",
+        percentile_mode="bucket_upper", min_latency_samples=10,
+        routable_pods=1, assigned_replicas=1, rows=3,
+        gap_per_cell={"i512_o128_c8": gap}, gap_overall=gap,
+        git_sha="deadbee", generated_at="2026-01-01T00:00:00+00:00",
+    )
+    assert meta["instant_sample_ms"] == 1_000
+    assert meta["instant_grid"] == "raw"
+    assert meta["live_grid_ms"] == SCRAPE_INTERVAL_MS
+    assert meta["git_short_sha"] == "deadbee"
+    assert meta["observability_gap"]["overall"]["raw_crossings"] == 1
+    assert "i512_o128_c8" in meta["observability_gap"]["per_cell"]
+    json.dumps(meta)  # must be serialisable as written
+
+
+def _write_campaign_raw(raw_dir: Path, cell_id: str = "i512_o128_c8") -> None:
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    with (raw_dir / f"{cell_id}.jsonl").open("w", encoding="utf-8") as fh:
+        for r in _make_requests():
+            fh.write(json.dumps(r) + "\n")
+    with (raw_dir / f"{cell_id}.instant.jsonl").open("w", encoding="utf-8") as fh:
+        for s in _hz_sidecar(waiting_at_s=(5, 15)):
+            fh.write(json.dumps(s) + "\n")
+
+
+def _run_main(monkeypatch: pytest.MonkeyPatch, argv: list[str]) -> int:
+    monkeypatch.setattr(sys, "argv", ["rewindow_from_raw.py", *argv])
+    return rewindow_from_raw.main()
+
+
+def test_main_writes_meta_json_beside_csv(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys) -> None:
+    raw_dir = tmp_path / "raw"
+    _write_campaign_raw(raw_dir)
+    out = tmp_path / "out" / "rewindow_20s.csv"
+    rc = _run_main(monkeypatch, [
+        "--model", MODEL, "--raw-dir", str(raw_dir), "--output", str(out),
+        "--window-ms", "20000", "--instant-sample-ms", "1000", "--instant-grid", "raw",
+        "--min-latency-samples", "0", "--registry", str(REGISTRY_PATH),
+    ])
+    assert rc == 0
+    assert out.exists()
+    meta = json.loads((tmp_path / "out" / "rewindow_20s.meta.json").read_text(encoding="utf-8"))
+    assert meta["instant_sample_ms"] == 1_000
+    assert meta["instant_grid"] == "raw"
+    assert meta["window_ms"] == 20_000 and meta["step_ms"] == 20_000
+    assert meta["model"] == MODEL
+    assert meta["raw_dir"] == str(raw_dir)
+    assert meta["cells"] == ["i512_o128_c8"]
+    assert meta["percentile_mode"] == "bucket_upper"
+    assert meta["min_latency_samples"] == 0
+    assert meta["routable_pods"] == 1 and meta["assigned_replicas"] == 1
+    assert meta["generated_at_utc"].endswith("+00:00")
+    assert "git_short_sha" in meta
+    assert meta["observability_gap"]["overall"]["observability_gap"] == pytest.approx(1.0)
+    assert meta["observability_gap"]["per_cell"]["i512_o128_c8"]["key"] == "waiting"
+    # the cadence is on stdout too, so a campaign log records it without opening the json
+    printed = capsys.readouterr().out
+    assert "--instant-grid raw --instant-sample-ms 1000" in printed
+
+
+def test_main_refuses_mismatched_cadence(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    raw_dir = tmp_path / "raw"
+    _write_campaign_raw(raw_dir)
+    with pytest.raises(rewindow_from_raw.CadenceMismatchError):
+        _run_main(monkeypatch, [
+            "--model", MODEL, "--raw-dir", str(raw_dir),
+            "--output", str(tmp_path / "out" / "bad.csv"),
+            "--window-ms", "20000", "--instant-grid", "live", "--instant-sample-ms", "1000",
+            "--registry", str(REGISTRY_PATH),
+        ])
+
+
+def test_main_live_grid_records_gap_threshold(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    raw_dir = tmp_path / "raw"
+    _write_campaign_raw(raw_dir)
+    out = tmp_path / "out" / "rewindow_live.csv"
+    rc = _run_main(monkeypatch, [
+        "--model", MODEL, "--raw-dir", str(raw_dir), "--output", str(out),
+        "--window-ms", "20000", "--instant-grid", "live",
+        "--instant-sample-ms", str(SCRAPE_INTERVAL_MS),
+        "--gap-threshold", "5.0", "--min-latency-samples", "0",
+        "--registry", str(REGISTRY_PATH),
+    ])
+    assert rc == 0
+    meta = json.loads((tmp_path / "out" / "rewindow_live.meta.json").read_text(encoding="utf-8"))
+    assert meta["instant_grid"] == "live"
+    assert meta["instant_sample_ms"] == SCRAPE_INTERVAL_MS
+    gap = meta["observability_gap"]["overall"]
+    assert gap["threshold"] == pytest.approx(5.0)
+    assert gap["raw_crossings"] == 0  # waiting never exceeds 5 -> nothing to miss
+    assert gap["observability_gap"] == 0.0

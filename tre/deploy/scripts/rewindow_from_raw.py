@@ -23,6 +23,23 @@ those into the SAME window CSV the online path emits (r3_grid.CSV_COLUMNS), at a
                       so the trs column is byte-identical to the online path.
   * row assembly   -> r3_grid.window_row / write_csv.
 
+Sidecar cadence (why `--instant-grid` exists)
+---------------------------------------------
+The open-loop campaign (`openloop.py`) samples the queue gauges at 1 Hz, while the live
+control path only ever sees the gateway's boundary-aligned
+:data:`tre_common.rediskeys.SCRAPE_INTERVAL_MS` grid. `openloop.mark_live_grid` tags each
+sidecar sample with ``on_live_grid``, so one capture answers both questions. Two things
+follow, and both are enforced here rather than left to the operator:
+
+  * ``--instant-sample-ms`` is the *divisor* that turns instant samples into a window
+    average. Pointing it at the wrong cadence rescales every queue average (1000 vs 10000
+    ms = 10x) with no other symptom, so a mismatch is a hard error, and the cadence that
+    was actually used is written to a sibling ``<output stem>.meta.json``.
+  * theta is a decision threshold on the signal the controller *consumes*, so a fit must
+    re-window from the live-grid subsample (``--instant-grid live``). The 1 Hz stream is
+    kept for the aliasing figure and for the observability-gap metric below: the fraction
+    of 1 Hz threshold crossings that the live grid never saw.
+
 Assumptions (documented, doc15 §4 leaves them to "most conservative choice"):
   * Requests are bucketed into a window by done_ts_ms (completion time), half-open
     [window_start, window_end), matching when a vLLM completion increments the histograms.
@@ -36,15 +53,41 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 from collections import Counter
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable, Optional
+from statistics import median
+from typing import Iterable, Mapping, Optional, Sequence
 
 from tre_common.metrics_schema import ModelWindowMetrics
 from tre_common.percentile import histogram_percentile
 from tre_common.rediskeys import SCRAPE_INTERVAL_MS
 
-from scripts import r3_grid
+from scripts import openloop, r3_grid
+
+#: ``--instant-grid`` choices. ``raw`` consumes every sidecar sample (campaign cadence
+#: 1000 ms); ``live`` keeps only the samples the gateway ticker would have written, which
+#: is the signal the controller actually consumes and therefore the one theta is fit on.
+INSTANT_GRID_RAW = "raw"
+INSTANT_GRID_LIVE = "live"
+INSTANT_GRID_CHOICES = (INSTANT_GRID_RAW, INSTANT_GRID_LIVE)
+
+#: How far the observed sidecar spacing may drift from ``--instant-sample-ms`` before the
+#: run is refused. Jitter in a wall-clock sampler is normal; a cadence *mismatch* is not,
+#: and the two are orders of magnitude apart (10x), so a loose tolerance still catches it.
+SPACING_TOLERANCE = 0.25
+
+#: The sidecar key the observability gap is measured on unless told otherwise.
+DEFAULT_GAP_KEY = "waiting"
+
+
+class CadenceMismatchError(ValueError):
+    """``--instant-sample-ms`` disagrees with the cadence the sidecar was captured at.
+
+    Raised instead of silently rescaling every queue average by the cadence ratio.
+    """
 
 
 def load_jsonl(path: Path) -> list[dict]:
@@ -63,6 +106,245 @@ def load_jsonl(path: Path) -> list[dict]:
             if isinstance(doc, dict):
                 records.append(doc)
     return records
+
+
+# ------------------------------------------------------------------ sidecar cadence
+
+
+def sidecar_has_live_grid_tags(instant_samples: Iterable[Mapping]) -> bool:
+    """True when the sidecar was written by a capture that tagged the live grid.
+
+    Pre-existing closed-loop captures have no such tag; they stay usable in ``raw`` mode
+    and are simply exempt from the spacing check (there is nothing to check against).
+    """
+    return any("on_live_grid" in s for s in instant_samples)
+
+
+def observed_sample_spacing_ms(instant_samples: Sequence[Mapping]) -> Optional[float]:
+    """Median spacing between consecutive sidecar timestamps, or None if undecidable.
+
+    The median (not the mean) so a single gap — a restarted sampler, a scrape timeout —
+    does not move the verdict.
+    """
+    stamps = sorted(int(s["ts_ms"]) for s in instant_samples if s.get("ts_ms") is not None)
+    deltas = [b - a for a, b in zip(stamps, stamps[1:]) if b > a]
+    if not deltas:
+        return None
+    return float(median(deltas))
+
+
+def select_instant_samples(instant_samples: Sequence[dict], instant_grid: str) -> list[dict]:
+    """The sidecar samples one grid mode consumes.
+
+    ``live`` keeps only ``on_live_grid`` samples — the ones the gateway ticker would have
+    written — so the re-window reproduces what the controller sees.
+    """
+    if instant_grid == INSTANT_GRID_RAW:
+        return list(instant_samples)
+    if instant_grid == INSTANT_GRID_LIVE:
+        return [s for s in instant_samples if bool(s.get("on_live_grid", False))]
+    raise ValueError(f"unknown instant_grid {instant_grid!r}; expected one of {INSTANT_GRID_CHOICES}")
+
+
+def resolve_instant_cadence(
+    instant_samples: Sequence[Mapping],
+    *,
+    instant_grid: str,
+    instant_sample_ms: int,
+    source: Optional[str] = None,
+) -> int:
+    """Validate the declared cadence against the mode and the sidecar, return it.
+
+    Fails loudly instead of rescaling: the returned value is the divisor
+    ``aggregate_window`` uses for the queue average, so a wrong one is a silent nx error
+    on every queue column in the fit.
+    """
+    if instant_grid not in INSTANT_GRID_CHOICES:
+        raise ValueError(f"unknown instant_grid {instant_grid!r}; expected one of {INSTANT_GRID_CHOICES}")
+    if instant_sample_ms <= 0:
+        raise CadenceMismatchError(f"instant_sample_ms must be positive, got {instant_sample_ms}")
+    where = f" (sidecar {source})" if source else ""
+
+    if instant_grid == INSTANT_GRID_LIVE:
+        if instant_sample_ms != SCRAPE_INTERVAL_MS:
+            ratio = instant_sample_ms / SCRAPE_INTERVAL_MS
+            raise CadenceMismatchError(
+                f"--instant-grid live consumes only the live-grid subsample, whose spacing is "
+                f"the gateway cadence SCRAPE_INTERVAL_MS={SCRAPE_INTERVAL_MS} ms, but "
+                f"--instant-sample-ms={instant_sample_ms} ms{where}. That flag is the divisor "
+                f"that turns instant samples into a window average, so keeping it would scale "
+                f"every queue average by {SCRAPE_INTERVAL_MS / instant_sample_ms:.6g}x "
+                f"(declared/actual = {ratio:.6g}). Pass --instant-sample-ms {SCRAPE_INTERVAL_MS}."
+            )
+        return SCRAPE_INTERVAL_MS
+
+    # raw mode: only a tagged sidecar tells us what cadence it was captured at.
+    if sidecar_has_live_grid_tags(instant_samples):
+        observed = observed_sample_spacing_ms(instant_samples)
+        if observed is not None and abs(observed - instant_sample_ms) > SPACING_TOLERANCE * instant_sample_ms:
+            raise CadenceMismatchError(
+                f"the capture{where} has ~{observed:.0f} ms between samples but "
+                f"--instant-sample-ms={instant_sample_ms} ms (more than "
+                f"{SPACING_TOLERANCE * 100:.0f}% apart). That flag is the divisor that turns "
+                f"instant samples into a window average, so every queue average would be scaled "
+                f"by {instant_sample_ms / observed:.6g}x. Pass --instant-sample-ms {observed:.0f} "
+                f"for the raw stream, or --instant-grid live with "
+                f"--instant-sample-ms {SCRAPE_INTERVAL_MS} to fit on the signal the controller sees."
+            )
+    return instant_sample_ms
+
+
+# ------------------------------------------------------------- observability gap
+
+
+@dataclass(frozen=True)
+class ObservabilityGap:
+    """How much of the 1 Hz truth the live grid never saw, on one key and threshold."""
+
+    key: str
+    threshold: float
+    window_ms: int
+    raw_crossings: int
+    live_crossings: int
+    total_windows: int
+
+    @property
+    def gap(self) -> float:
+        # Nothing to miss -> no gap. Defined, not NaN, so it aggregates and serialises.
+        if self.raw_crossings == 0:
+            return 0.0
+        return 1.0 - (self.live_crossings / self.raw_crossings)
+
+    def as_dict(self) -> dict:
+        return {
+            "key": self.key,
+            "threshold": self.threshold,
+            "window_ms": self.window_ms,
+            "raw_crossings": self.raw_crossings,
+            "live_crossings": self.live_crossings,
+            "total_windows": self.total_windows,
+            "observability_gap": round(self.gap, 6),
+        }
+
+
+def observability_gap(
+    instant_samples: Sequence[dict],
+    *,
+    window_ms: int,
+    key: str = DEFAULT_GAP_KEY,
+    threshold: float = 0.0,
+) -> ObservabilityGap:
+    """1 - (windows the live grid saw cross ``threshold``) / (windows the 1 Hz stream did).
+
+    The windowing itself is ``openloop.windows_observing`` (same tumbling bound, same
+    ``on_live_grid`` restriction) so the metric cannot drift from the capture's own
+    definition of the live grid.
+    """
+    raw_crossings, total = openloop.windows_observing(
+        instant_samples, window_ms=window_ms, key=key, grid_only=False, threshold=threshold
+    )
+    live_crossings, _ = openloop.windows_observing(
+        instant_samples, window_ms=window_ms, key=key, grid_only=True, threshold=threshold
+    )
+    return ObservabilityGap(
+        key=key,
+        threshold=float(threshold),
+        window_ms=window_ms,
+        raw_crossings=raw_crossings,
+        live_crossings=live_crossings,
+        total_windows=total,
+    )
+
+
+def combine_observability_gaps(gaps: Sequence[ObservabilityGap]) -> Optional[ObservabilityGap]:
+    """Pool per-cell crossings into one fleet-level gap (counts add, ratios do not)."""
+    if not gaps:
+        return None
+    head = gaps[0]
+    return ObservabilityGap(
+        key=head.key,
+        threshold=head.threshold,
+        window_ms=head.window_ms,
+        raw_crossings=sum(g.raw_crossings for g in gaps),
+        live_crossings=sum(g.live_crossings for g in gaps),
+        total_windows=sum(g.total_windows for g in gaps),
+    )
+
+
+# ------------------------------------------------------------------ run provenance
+
+
+def git_short_sha(worktree: Path) -> Optional[str]:
+    """Short SHA of the worktree the script lives in, or None when git cannot answer."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(worktree), "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    sha = proc.stdout.strip()
+    return sha if proc.returncode == 0 and sha else None
+
+
+def meta_path_for(output: Path) -> Path:
+    """``<output stem>.meta.json`` next to the CSV."""
+    return output.parent / f"{output.stem}.meta.json"
+
+
+def build_meta(
+    *,
+    model: str,
+    raw_dir: Path | str,
+    cells: Sequence[str],
+    window_ms: int,
+    step_ms: int,
+    instant_sample_ms: int,
+    instant_grid: str,
+    percentile_mode: str,
+    min_latency_samples: int,
+    routable_pods: int,
+    assigned_replicas: int,
+    rows: Optional[int] = None,
+    gap_per_cell: Optional[Mapping[str, ObservabilityGap]] = None,
+    gap_overall: Optional[ObservabilityGap] = None,
+    git_sha: Optional[str] = None,
+    generated_at: Optional[str] = None,
+) -> dict:
+    """The record that answers "which cadence did this fit use" (plus the gap metric)."""
+    meta: dict = {
+        "generated_at_utc": generated_at or datetime.now(timezone.utc).isoformat(),
+        "git_short_sha": git_sha,
+        "model": model,
+        "raw_dir": str(raw_dir),
+        "cells": list(cells),
+        "rows": rows,
+        "window_ms": window_ms,
+        "step_ms": step_ms,
+        "instant_sample_ms": instant_sample_ms,
+        "instant_grid": instant_grid,
+        "live_grid_ms": SCRAPE_INTERVAL_MS,
+        "percentile_mode": percentile_mode,
+        "min_latency_samples": min_latency_samples,
+        "routable_pods": routable_pods,
+        "assigned_replicas": assigned_replicas,
+    }
+    if gap_overall is not None or gap_per_cell:
+        meta["observability_gap"] = {
+            "overall": gap_overall.as_dict() if gap_overall is not None else None,
+            "per_cell": {cid: g.as_dict() for cid, g in sorted((gap_per_cell or {}).items())},
+        }
+    return meta
+
+
+def write_meta(output: Path, meta: dict) -> Path:
+    path = meta_path_for(output)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(meta, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return path
+
+
+# ------------------------------------------------------------------- aggregation
 
 
 def _samples_to_cumulative(samples: Iterable[float]) -> list[tuple[float, float]]:
@@ -183,6 +465,7 @@ def rewindow_cell(
     percentile_mode: str,
     min_latency_samples: int,
     instant_sample_interval_ms: int,
+    instant_grid: str = INSTANT_GRID_RAW,
     start_ms: Optional[int] = None,
     end_ms: Optional[int] = None,
     routable_pods: int = 1,
@@ -190,6 +473,13 @@ def rewindow_cell(
 ) -> list[dict]:
     """Re-window one cell's raw into calibration CSV rows (reusing r3_grid.window_row +
     compute_window_results for the trs column)."""
+    instant_sample_interval_ms = resolve_instant_cadence(
+        instant_samples,
+        instant_grid=instant_grid,
+        instant_sample_ms=instant_sample_interval_ms,
+        source=cell.scenario_id,
+    )
+    instant_samples = select_instant_samples(instant_samples, instant_grid)
     if start_ms is None or end_ms is None:
         span = _time_span(records, instant_samples)
         if span is None:
@@ -224,10 +514,26 @@ def main() -> int:
     ap.add_argument("--step-ms", type=int, default=None, help="slide step; default = window-ms (tumbling)")
     ap.add_argument("--percentile-mode", default="bucket_upper", choices=["bucket_upper", "interpolated"])
     ap.add_argument("--min-latency-samples", type=int, default=10)
-    # Must equal the r3 sidecar sampling cadence (== gateway scrape cadence,
-    # SCRAPE_INTERVAL_MS) so offline expected_samples matches the actual instant samples in
-    # each window; a mismatch halves the offline queue vs. the online path.
+    # The divisor for the queue average. It MUST equal the spacing of the samples actually
+    # consumed: the sidecar capture cadence in `raw` mode (campaign value 1000), the
+    # gateway cadence in `live` mode. A mismatch is refused, not silently rescaled.
     ap.add_argument("--instant-sample-ms", type=int, default=SCRAPE_INTERVAL_MS)
+    ap.add_argument(
+        "--instant-grid", default=INSTANT_GRID_RAW, choices=list(INSTANT_GRID_CHOICES),
+        help=(
+            "raw: every sidecar sample (ground truth, 1 Hz in the campaign). "
+            f"live: only samples tagged on_live_grid, i.e. the {SCRAPE_INTERVAL_MS} ms signal the "
+            "controller consumes — use this for a theta fit."
+        ),
+    )
+    ap.add_argument(
+        "--gap-threshold", type=float, default=0.0,
+        help="threshold for the observability-gap metric (default 0.0 = any non-zero waiting)",
+    )
+    ap.add_argument(
+        "--gap-key", default=DEFAULT_GAP_KEY,
+        help=f"sidecar key the observability gap is measured on (default {DEFAULT_GAP_KEY})",
+    )
     ap.add_argument("--registry", default=None)
     ap.add_argument("--routable-pods", type=int, default=1)
     ap.add_argument("--assigned-replicas", type=int, default=1)
@@ -241,6 +547,10 @@ def main() -> int:
     warn_bytes = int(args.disk_warn_gib * 1024**3)
     note = "  !! EXCEEDS WARN THRESHOLD" if size > warn_bytes else ""
     print(f"reading raw from {raw_dir}: {size / 1024**2:.1f} MiB on disk{note}")
+    print(
+        f"instant cadence: --instant-grid {args.instant_grid} "
+        f"--instant-sample-ms {args.instant_sample_ms} (live grid SCRAPE_INTERVAL_MS={SCRAPE_INTERVAL_MS} ms)"
+    )
 
     from tre_common.registry import load_registry
 
@@ -248,6 +558,8 @@ def main() -> int:
     spec = registry.model(args.model)
 
     rows: list[dict] = []
+    cells: list[str] = []
+    gap_per_cell: dict[str, ObservabilityGap] = {}
     cell_files = sorted(p for p in raw_dir.glob("*.jsonl") if not p.name.endswith(".instant.jsonl"))
     for raw_path in cell_files:
         cell_id = raw_path.stem
@@ -264,15 +576,51 @@ def main() -> int:
             percentile_mode=args.percentile_mode,
             min_latency_samples=args.min_latency_samples,
             instant_sample_interval_ms=args.instant_sample_ms,
+            instant_grid=args.instant_grid,
             routable_pods=args.routable_pods, assigned_replicas=args.assigned_replicas,
         )
         rows.extend(cell_rows)
+        cells.append(cell_id)
+        # The gap is measured on the FULL sidecar: it is precisely the comparison between
+        # the 1 Hz truth and its live-grid subsample, so it does not depend on --instant-grid.
+        if sidecar_has_live_grid_tags(instant_samples):
+            gap_per_cell[cell_id] = observability_gap(
+                instant_samples, window_ms=args.window_ms,
+                key=args.gap_key, threshold=args.gap_threshold,
+            )
         print(f"cell {cell_id}: {len(cell_rows)} windows")
 
     out = Path(args.output)
     out.parent.mkdir(parents=True, exist_ok=True)
     r3_grid.write_csv(rows, out)
     print(f"wrote {len(rows)} rows to {out} (window={args.window_ms}ms step={step_ms}ms)")
+
+    gap_overall = combine_observability_gaps(list(gap_per_cell.values()))
+    meta = build_meta(
+        model=args.model,
+        raw_dir=raw_dir,
+        cells=cells,
+        window_ms=args.window_ms,
+        step_ms=step_ms,
+        instant_sample_ms=args.instant_sample_ms,
+        instant_grid=args.instant_grid,
+        percentile_mode=args.percentile_mode,
+        min_latency_samples=args.min_latency_samples,
+        routable_pods=args.routable_pods,
+        assigned_replicas=args.assigned_replicas,
+        rows=len(rows),
+        gap_per_cell=gap_per_cell,
+        gap_overall=gap_overall,
+        git_sha=git_short_sha(Path(__file__).resolve().parents[2]),
+    )
+    meta_path = write_meta(out, meta)
+    print(f"wrote cadence metadata to {meta_path}")
+    if gap_overall is not None:
+        print(
+            f"observability gap ({args.gap_key} > {args.gap_threshold}): "
+            f"{gap_overall.gap:.3f} "
+            f"({gap_overall.live_crossings}/{gap_overall.raw_crossings} crossings seen on the live grid)"
+        )
     return 0
 
 

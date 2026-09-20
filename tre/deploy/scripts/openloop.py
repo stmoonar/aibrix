@@ -46,7 +46,7 @@ import json
 import math
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable, Iterable, Optional, Sequence
 
@@ -65,7 +65,12 @@ LIVE_GRID_MS = SCRAPE_INTERVAL_MS
 #: bounded by the driver, which is the exact failure this whole module exists to avoid.
 DEFAULT_MAX_P99_DELAY_MS = 250.0
 DEFAULT_MAX_P99_POOL_WAIT_MS = 250.0
-DEFAULT_MAX_ERROR_RATE = 0.05
+#: Only MODEL errors count against this. A gateway shed is not the model failing, it is
+#: the campaign hitting the admission ceiling, and it is handled by truncation instead.
+DEFAULT_MAX_MODEL_ERROR_RATE = 0.05
+#: Windows above the SLO a truncated cell must already have collected for its evidence
+#: to be usable. Below that the cell was cut short before it had said anything.
+DEFAULT_MIN_SLO_WINDOWS = 3
 #: Sender threads. An open-loop cell at rho>1 accumulates backlog for its whole duration,
 #: so the pool must be sized for the peak in-flight, not for the offered rate.
 DEFAULT_MAX_IN_FLIGHT = 4096
@@ -80,8 +85,136 @@ POD_INSTANT_GAUGES = {
 }
 
 
+# ------------------------------------------------------------------------- classifier
+
+#: A request that was served.
+FAILURE_NONE = "ok"
+#: The gateway rejected the request at its circuit breaker; it never reached vLLM. This
+#: says nothing about the model and everything about the admission policy.
+FAILURE_PROXY = "proxy"
+#: The model itself failed or was too slow. vLLM queues rather than shedding, so a
+#: non-2xx that carries an engine body, and any timeout, is a statement about the model.
+FAILURE_MODEL = "model"
+
+#: Statuses only the proxy can produce: they all mean "no usable answer from upstream",
+#: which an engine that queues its work never needs to say. A 503 is the circuit
+#: breaker; 502 and 504 are the same shed wearing different numbers.
+PROXY_STATUSES = frozenset({502, 503, 504})
+
+#: Headers Envoy sets when it is the one rejecting. Definitive when present - but the
+#: measured circuit-breaker response carries NONE of them, so they can never be the only
+#: test (see the pre-check signature in the module docstring of the campaign runner).
+PROXY_HEADER_MARKERS = ("x-envoy-overloaded", "x-envoy-ratelimited", "x-envoy-upstream-service-time")
+
+#: Phrases in Envoy's plain-text rejection bodies. The circuit-breaker body measured on
+#: 2026-09-20 was exactly:
+#:   upstream connect error or disconnect/reset before headers. reset reason: overflow
+PROXY_BODY_MARKERS = (
+    "upstream connect error",
+    "upstream request timeout",
+    "no healthy upstream",
+    "reset reason",
+    "overflow",
+    "connection termination",
+)
+
+
+def _has_structured_body(body: Optional[str]) -> bool:
+    """True when the body is a JSON document, i.e. the upstream answered with its own
+    structured error rather than a proxy writing a plain-text rejection over it."""
+    if not body:
+        return False
+    text = body.strip()
+    if not text or text[0] not in "{[":
+        return False
+    try:
+        json.loads(text)
+    except ValueError:
+        return False
+    return True
+
+
+def classify_failure(record: dict) -> str:
+    """Attribute one request record to the model or to the gateway.
+
+    The distinction decides what the campaign does about it, so it must not be guessed
+    from the status code alone. A gateway shed means offered load exceeded the admission
+    ceiling: the requests after it measure the circuit breaker, not the engine, so the
+    cell is truncated and its later windows censored. A model error means the engine
+    failed under the offered load, which is a real finding and fails the cell past a
+    threshold.
+
+    Rules, in order:
+
+    * 2xx with a measured end-to-end time -> served.
+    * an explicit Envoy marker header -> proxy.
+    * no status at all (transport failure, timeout) -> model. vLLM queues rather than
+      shedding, so a request that hung was waiting on the engine.
+    * a proxy status carrying a JSON body -> model: the engine answered for itself and
+      the proxy only relayed it.
+    * a proxy status with a plain-text body matching a known Envoy phrase, or with no
+      body at all (the connection was reset before the body could be read) -> proxy.
+    * anything else -> model, because attributing an unknown failure to the proxy would
+      silently exempt it from the error budget.
+    """
+    status = record.get("http_status")
+    if status is not None and 200 <= int(status) < 300 and record.get("e2e_ms") is not None:
+        return FAILURE_NONE
+
+    raw_headers = record.get("error_headers") or {}
+    headers = {str(k).lower(): str(v) for k, v in raw_headers.items()}
+    if any(name in headers for name in PROXY_HEADER_MARKERS):
+        return FAILURE_PROXY
+
+    if not status:
+        return FAILURE_MODEL
+
+    if int(status) in PROXY_STATUSES:
+        body = record.get("error_body") or ""
+        if _has_structured_body(body):
+            return FAILURE_MODEL
+        lowered = body.lower()
+        if not body.strip() or any(marker in lowered for marker in PROXY_BODY_MARKERS):
+            return FAILURE_PROXY
+    return FAILURE_MODEL
+
+
+def failure_signature(record: dict) -> dict:
+    """The evidence behind one classification, for the cell artifact. Keeping the body
+    and headers verbatim is what lets a later reader re-judge a call this made."""
+    return {
+        "request_id": record.get("request_id"),
+        "send_ts_ms": record.get("actual_send_ts_ms"),
+        "http_status": record.get("http_status"),
+        "error": record.get("error"),
+        "error_body": record.get("error_body"),
+        "error_headers": record.get("error_headers"),
+        "e2e_ms": record.get("e2e_ms"),
+        "failure_class": classify_failure(record),
+    }
+
+
+def count_failures(records: Sequence[dict]) -> tuple[int, int, int]:
+    """(served, model errors, proxy errors) over a cell's sender records."""
+    served = model_errors = proxy_errors = 0
+    for record in records:
+        verdict = classify_failure(record)
+        if verdict == FAILURE_NONE:
+            served += 1
+        elif verdict == FAILURE_PROXY:
+            proxy_errors += 1
+        else:
+            model_errors += 1
+    return served, model_errors, proxy_errors
+
+
 class CellGuardError(RuntimeError):
     """A cell's load was not actually delivered as specified."""
+
+
+#: Issue text prefix for the truncation-evidence verdict, so re-deciding it later can
+#: find and replace exactly that issue without disturbing the dispatch-level ones.
+TRUNCATION_EVIDENCE_ISSUE = "truncated before collecting enough evidence"
 
 
 @dataclass(frozen=True)
@@ -92,9 +225,19 @@ class CellGuard:
     scheduled: int
     sent: int
     completed: int
-    errors: int
+    model_errors: int
+    proxy_errors: int
     p99_delay_ms: float
     p99_pool_wait_ms: float
+    #: Set when a gateway shed cut the cell short and it jumped to its drain segment.
+    truncated: bool = False
+    truncated_at_offset_s: Optional[float] = None
+    truncated_at_ts_ms: Optional[int] = None
+    #: Scheduled requests deliberately not sent after truncation.
+    censored: int = 0
+    #: Windows above the SLO collected before truncation; None when not yet counted.
+    slo_windows: Optional[int] = None
+    min_slo_windows: int = DEFAULT_MIN_SLO_WINDOWS
     issues: tuple[str, ...] = ()
 
     @property
@@ -102,8 +245,20 @@ class CellGuard:
         return not self.issues
 
     @property
+    def errors(self) -> int:
+        return self.model_errors + self.proxy_errors
+
+    @property
     def error_rate(self) -> float:
         return 0.0 if self.sent == 0 else self.errors / self.sent
+
+    @property
+    def model_error_rate(self) -> float:
+        return 0.0 if self.sent == 0 else self.model_errors / self.sent
+
+    @property
+    def proxy_error_rate(self) -> float:
+        return 0.0 if self.sent == 0 else self.proxy_errors / self.sent
 
     def as_dict(self) -> dict:
         return {
@@ -111,13 +266,44 @@ class CellGuard:
             "scheduled": self.scheduled,
             "sent": self.sent,
             "completed": self.completed,
-            "errors": self.errors,
-            "error_rate": round(self.error_rate, 6),
+            "model_errors": self.model_errors,
+            "proxy_errors": self.proxy_errors,
+            "model_error_rate": round(self.model_error_rate, 6),
+            "proxy_error_rate": round(self.proxy_error_rate, 6),
             "p99_delay_ms": round(self.p99_delay_ms, 3),
             "p99_pool_wait_ms": round(self.p99_pool_wait_ms, 3),
+            "truncated": self.truncated,
+            "truncated_at_offset_s": self.truncated_at_offset_s,
+            "truncated_at_ts_ms": self.truncated_at_ts_ms,
+            "censored": self.censored,
+            "slo_windows": self.slo_windows,
+            "min_slo_windows": self.min_slo_windows,
             "issues": list(self.issues),
             "ok": self.ok,
         }
+
+    def with_slo_windows(self, count: int, *, min_slo_windows: Optional[int] = None) -> "CellGuard":
+        """Fold the window-level evidence count into the verdict.
+
+        A truncated cell still passes when it had already collected at least
+        ``min_slo_windows`` windows above the SLO before the gateway cut it off: the
+        violation boundary was crossed and observed, which is the whole point of the
+        cell. Below that it was cut off before saying anything and must be re-run.
+        """
+        floor_windows = self.min_slo_windows if min_slo_windows is None else int(min_slo_windows)
+        issues = [issue for issue in self.issues if not issue.startswith(TRUNCATION_EVIDENCE_ISSUE)]
+        if self.truncated and int(count) < floor_windows:
+            issues.append(
+                f"{TRUNCATION_EVIDENCE_ISSUE}: only {int(count)} window(s) above the SLO "
+                f"before the gateway shed at offset {self.truncated_at_offset_s}s, "
+                f"need >= {floor_windows}"
+            )
+        return replace(
+            self,
+            slo_windows=int(count),
+            min_slo_windows=floor_windows,
+            issues=tuple(issues),
+        )
 
 
 def _p99(values: Sequence[float]) -> float:
@@ -136,32 +322,45 @@ def check_cell(
     p99_delay_ms: float,
     max_p99_delay_ms: float = DEFAULT_MAX_P99_DELAY_MS,
     max_p99_pool_wait_ms: float = DEFAULT_MAX_P99_POOL_WAIT_MS,
-    max_error_rate: float = DEFAULT_MAX_ERROR_RATE,
+    max_model_error_rate: float = DEFAULT_MAX_MODEL_ERROR_RATE,
+    truncated: bool = False,
+    truncated_at_offset_s: Optional[float] = None,
+    truncated_at_ts_ms: Optional[int] = None,
+    censored: int = 0,
+    slo_windows: Optional[int] = None,
+    min_slo_windows: int = DEFAULT_MIN_SLO_WINDOWS,
 ) -> CellGuard:
     """Verdict on a dispatched cell. Pure - takes the sender's records, no network.
 
     ``records`` are :class:`tre_replayer.engine.http_sender.StreamingHttpSender` rows.
-    A record counts as an error when the HTTP status is not 2xx (status 0 is the
-    sender's "transport failed" code) or no end-to-end time was measured.
+    Failures are attributed by :func:`classify_failure` rather than counted together:
+    a model error is the engine failing under load and fails the cell past
+    ``max_model_error_rate``, while a proxy shed is the campaign hitting the admission
+    ceiling and is handled by truncation, because failing on it would throw away a cell
+    that had already measured everything it was built to measure.
     """
     sent = len(records)
-    errors = sum(1 for r in records if not _record_ok(r))
-    completed = sent - errors
+    served, model_errors, proxy_errors = count_failures(records)
     pool_waits = [float(r.get("pool_wait_ms", 0.0) or 0.0) for r in records]
     p99_pool_wait_ms = _p99(pool_waits)
+    expected_sent = max(0, scheduled - int(censored))
 
     issues: list[str] = []
     if scheduled <= 0:
         issues.append("schedule produced 0 requests (empty or mis-filtered segments)")
     if sent == 0:
         issues.append("0 requests were sent")
-    elif sent < scheduled:
-        issues.append(f"only {sent}/{scheduled} scheduled requests were sent")
-    if sent > 0 and completed == 0:
+    elif sent < expected_sent:
+        detail = f"only {sent}/{expected_sent} scheduled requests were sent"
+        if censored:
+            detail += f" ({censored} more were censored by truncation)"
+        issues.append(detail)
+    if sent > 0 and served == 0:
         issues.append(f"0/{sent} requests completed (every send failed)")
-    if sent > 0 and errors / sent > max_error_rate:
+    if sent > 0 and model_errors / sent > max_model_error_rate:
         issues.append(
-            f"error rate {errors / sent:.1%} > {max_error_rate:.1%} ({errors}/{sent})"
+            f"model error rate {model_errors / sent:.1%} > {max_model_error_rate:.1%} "
+            f"({model_errors}/{sent}); these reached vLLM and failed there"
         )
     if p99_delay_ms > max_p99_delay_ms:
         issues.append(
@@ -173,23 +372,26 @@ def check_cell(
             f"p99 sender pool wait {p99_pool_wait_ms:.1f}ms > {max_p99_pool_wait_ms:.1f}ms "
             "(sender threads starved: the open loop degenerated into a closed loop)"
         )
-    return CellGuard(
+    guard = CellGuard(
         cell_id=cell_id,
         scheduled=scheduled,
         sent=sent,
-        completed=completed,
-        errors=errors,
+        completed=served,
+        model_errors=model_errors,
+        proxy_errors=proxy_errors,
         p99_delay_ms=float(p99_delay_ms),
         p99_pool_wait_ms=p99_pool_wait_ms,
+        truncated=bool(truncated),
+        truncated_at_offset_s=truncated_at_offset_s,
+        truncated_at_ts_ms=truncated_at_ts_ms,
+        censored=int(censored),
+        min_slo_windows=int(min_slo_windows),
         issues=tuple(issues),
     )
+    if slo_windows is not None:
+        guard = guard.with_slo_windows(slo_windows)
+    return guard
 
-
-def _record_ok(record: dict) -> bool:
-    status = record.get("http_status")
-    if status is None or not (200 <= int(status) < 300):
-        return False
-    return record.get("e2e_ms") is not None
 
 
 def raise_on_guard(guard: CellGuard) -> None:
@@ -329,6 +531,61 @@ def windows_observing(
     return hits, total
 
 
+class TruncateOnProxyShed:
+    """Sender wrapper that cuts a cell short at the first gateway shed.
+
+    Once the circuit breaker rejects, offered load is above what the gateway will admit,
+    so every subsequent request measures the admission policy rather than the engine -
+    and the engine, starved of exactly the surplus that would have queued, reports a
+    queue that never formed. Continuing would fill the raw log with that. Instead the
+    cell jumps to its drain segment: requests scheduled before ``drain_start_s`` are
+    dropped and counted as censored, while the drain itself still fires so the recovery
+    tail is captured. A primitive with no drain segment (``drain_start_s`` None) simply
+    stops sending.
+
+    The scan over the wrapped sender's records is safe without a lock: every wrapper
+    coroutine runs on one asyncio loop and only yields at its own await, so no record can
+    be appended between the await returning and the scan finishing.
+    """
+
+    def __init__(self, sender, *, drain_start_s: Optional[float] = None) -> None:
+        self._sender = sender
+        self._drain_start_s = drain_start_s
+        self._cursor = 0
+        self.truncated = False
+        self.truncated_at_offset_s: Optional[float] = None
+        self.truncated_at_ts_ms: Optional[int] = None
+        self.first_proxy_record: Optional[dict] = None
+        self.censored = 0
+
+    @property
+    def records(self) -> list:
+        return self._sender.records
+
+    async def __call__(self, request, scheduled_ts: float, actual_ts: float) -> None:
+        offset_s = float(getattr(request, "scheduled_offset_s", 0.0))
+        if self.truncated and (self._drain_start_s is None or offset_s < self._drain_start_s):
+            self.censored += 1
+            return
+        await self._sender(request, scheduled_ts, actual_ts)
+        self._scan(offset_s)
+
+    def _scan(self, offset_s: float) -> None:
+        if self.truncated:
+            return
+        records = self._sender.records
+        while self._cursor < len(records):
+            record = records[self._cursor]
+            if classify_failure(record) == FAILURE_PROXY:
+                self.truncated = True
+                self.truncated_at_offset_s = offset_s
+                self.truncated_at_ts_ms = record.get("actual_send_ts_ms")
+                self.first_proxy_record = record
+                return
+            self._cursor += 1
+
+
+
 # ---------------------------------------------------------------------------- driver
 
 
@@ -383,6 +640,9 @@ def drive_cell_schedule(
     stream_call: Optional[Callable] = None,
     now_ms: Callable[[], int] = lambda: int(time.time() * 1000),
     guard_kwargs: Optional[dict] = None,
+    truncate_on_proxy_shed: bool = False,
+    drain_start_s: Optional[float] = None,
+    failures_path: Optional[Path] = None,
 ) -> tuple:
     """Drive one open-loop cell from ``segments``; returns (start_ms, end_ms, guard).
 
@@ -391,6 +651,10 @@ def drive_cell_schedule(
     segments superpose (each is sampled independently), which is how the bursts primitive
     lays a 2 s spike on top of its base rate and how the mixture shape runs four parallel
     token-shape streams.
+
+    With ``truncate_on_proxy_shed`` the first gateway shed cuts the cell short and it
+    jumps to ``drain_start_s``; see :class:`TruncateOnProxyShed`. Classified failures are
+    written verbatim to ``failures_path`` so a later reader can re-judge the attribution.
 
     The per-request raw lines use ``r3_grid.RAW_COLUMNS`` and the instant sidecar uses the
     ``r3_grid`` sidecar schema plus ``on_live_grid``, so the offline re-windowing path is
@@ -415,12 +679,18 @@ def drive_cell_schedule(
     if instant_sampler is not None:
         sidecar = _Sidecar(sampler=instant_sampler, interval_s=instant_interval_s, now_ms=now_ms)
 
+    truncator = (
+        TruncateOnProxyShed(sender, drain_start_s=drain_start_s)
+        if truncate_on_proxy_shed
+        else None
+    )
+
     start_ms = now_ms()
     instants: list = []
     if sidecar is not None:
         sidecar.start()
     try:
-        report = asyncio.run(dispatch_open_loop(events, sender))
+        report = asyncio.run(dispatch_open_loop(events, truncator or sender))
     finally:
         sender.close()
         if sidecar is not None:
@@ -432,8 +702,20 @@ def drive_cell_schedule(
         scheduled=scheduled,
         records=sender.records,
         p99_delay_ms=report.p99_delay_ms,
+        truncated=bool(truncator and truncator.truncated),
+        truncated_at_offset_s=truncator.truncated_at_offset_s if truncator else None,
+        truncated_at_ts_ms=truncator.truncated_at_ts_ms if truncator else None,
+        censored=truncator.censored if truncator else 0,
         **(guard_kwargs or {}),
     )
+    if failures_path is not None:
+        failures = [
+            failure_signature(record)
+            for record in sender.records
+            if classify_failure(record) != FAILURE_NONE
+        ]
+        if failures:
+            _append_jsonl(failures_path, failures)
 
     if raw_path is not None:
         raw = [_raw_from_sender_record(cell_id, rec) for rec in sender.records]

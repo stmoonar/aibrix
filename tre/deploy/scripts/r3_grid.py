@@ -45,7 +45,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Iterable, Optional
+from typing import Callable, Iterable, Optional, Sequence
 
 from tre_common.rediskeys import SCRAPE_INTERVAL_MS
 
@@ -425,6 +425,60 @@ def discover_pod_metrics_endpoints(model: str, namespace: str, port: int) -> lis
     return [f"http://{ip}:{port}/metrics" for ip in ips]
 
 
+def drain_start_from_index(schedule_path: Path, model: str) -> Optional[float]:
+    """The offset of a schedule's drain segment, read from its generated INDEX.json.
+
+    A cell truncated by a gateway shed jumps to that offset instead of stopping dead, so
+    the recovery tail is still captured. The lookup is best effort: a schedule run from
+    outside a generated set simply has no drain segment to jump to, and truncation then
+    means "stop sending", which is still correct - just less informative.
+    """
+    index_path = Path(schedule_path).resolve().parent.parent / "INDEX.json"
+    if not index_path.exists():
+        return None
+    try:
+        index = json.loads(index_path.read_text(encoding="utf-8"))
+    except (ValueError, OSError):
+        return None
+    wanted = f"{model}/{Path(schedule_path).name}"
+    for entry in index.get("schedules", []):
+        if entry.get("path") == wanted or Path(str(entry.get("path", ""))).name == Path(schedule_path).name:
+            value = entry.get("drain_start_s")
+            return None if value is None else float(value)
+    return None
+
+
+def count_slo_windows(rows: Sequence[dict], *, ttft_slo_ms: float, tpot_slo_ms: float) -> int:
+    """Windows whose p95 latency is above the SLO.
+
+    This is the evidence a cell exists to produce: theta is a threshold on the signal at
+    the moment the model stops meeting its SLO, so a cell that never crossed measured
+    nothing about it. A window with no p95 at all (too few samples) is not a crossing.
+    """
+    crossed = 0
+    for row in rows:
+        ttft = row.get("p95_ttft")
+        tpot = row.get("p95_tpot")
+        if ttft is not None and float(ttft) > ttft_slo_ms:
+            crossed += 1
+        elif tpot is not None and float(tpot) > tpot_slo_ms:
+            crossed += 1
+    return crossed
+
+
+def censor_after(rows: Sequence[dict], truncated_at_ts_ms: Optional[int]) -> tuple[list, int]:
+    """Drop the windows that start at or after a truncation. Returns (kept, dropped).
+
+    After a gateway shed the offered load is no longer what the schedule says: the driver
+    has stopped sending and the engine is draining. Those windows describe the recovery,
+    not the operating point, so they must not reach the fit.
+    """
+    if truncated_at_ts_ms is None:
+        return list(rows), 0
+    kept = [row for row in rows if int(row["window_start_ms"]) < int(truncated_at_ts_ms)]
+    return kept, len(rows) - len(kept)
+
+
 def run_schedule_cell(args, store, spec) -> tuple[list, "openloop.CellGuard"]:
     """Drive one open-loop cell from --schedule and return (window rows, guard)."""
     from tre_replayer.traces.loader import load_trace_segments
@@ -453,6 +507,17 @@ def run_schedule_cell(args, store, spec) -> tuple[list, "openloop.CellGuard"]:
         raw_dir.mkdir(parents=True, exist_ok=True)
     raw_path = raw_dir / f"{cell_id}.jsonl" if raw_dir is not None else None
     instant_path = raw_dir / f"{cell_id}.instant.jsonl" if raw_dir is not None else None
+    failures_path = raw_dir / f"{cell_id}.failures.jsonl" if raw_dir is not None else None
+
+    drain_start_s = args.drain_start_s
+    if drain_start_s is None:
+        drain_start_s = drain_start_from_index(Path(args.schedule), args.model)
+    if args.truncate_on_proxy_shed:
+        where = "stop sending" if drain_start_s is None else f"jump to {drain_start_s:.1f}s (drain)"
+        print(f"truncation armed: first gateway shed -> {where}")
+
+    ttft_slo_ms = args.ttft_slo_ms if args.ttft_slo_ms is not None else spec.slo.ttft_p95_ms
+    tpot_slo_ms = args.tpot_slo_ms if args.tpot_slo_ms is not None else spec.slo.tpot_p95_ms
 
     start_ms, end_ms, guard = openloop.drive_cell_schedule(
         args.gateway_url, args.model, cell_id, segments,
@@ -462,17 +527,16 @@ def run_schedule_cell(args, store, spec) -> tuple[list, "openloop.CellGuard"]:
         instant_interval_s=args.instant_sample_ms / 1000.0,
         prompt_mode=args.prompt_mode,
         max_in_flight=args.max_in_flight,
+        truncate_on_proxy_shed=args.truncate_on_proxy_shed,
+        drain_start_s=drain_start_s,
+        failures_path=failures_path,
         guard_kwargs={
             "max_p99_delay_ms": args.max_p99_delay_ms,
             "max_p99_pool_wait_ms": args.max_p99_pool_wait_ms,
-            "max_error_rate": args.max_error_rate,
+            "max_model_error_rate": args.max_model_error_rate,
+            "min_slo_windows": args.min_slo_windows,
         },
     )
-    print(f"cell {cell_id} guard: {json.dumps(guard.as_dict(), sort_keys=True)}")
-    if args.guard_mode == "fail":
-        openloop.raise_on_guard(guard)
-    elif not guard.ok:
-        print(f"WARNING: cell {cell_id} guard failed (continuing on --guard-mode warn)")
 
     windows = []
     w = start_ms
@@ -484,6 +548,40 @@ def run_schedule_cell(args, store, spec) -> tuple[list, "openloop.CellGuard"]:
         window_row(cell, wm, result.TRS, result.Q_ctl)
         for wm, result in zip(windows, results)
     ]
+    rows, censored_windows = censor_after(rows, guard.truncated_at_ts_ms)
+    guard = guard.with_slo_windows(
+        count_slo_windows(rows, ttft_slo_ms=ttft_slo_ms, tpot_slo_ms=tpot_slo_ms)
+    )
+
+    artifact = guard.as_dict()
+    artifact.update({
+        "schedule": str(args.schedule),
+        "model": args.model,
+        "drain_start_s": drain_start_s,
+        "censored_windows": censored_windows,
+        "windows": len(rows),
+        "ttft_slo_ms": ttft_slo_ms,
+        "tpot_slo_ms": tpot_slo_ms,
+        "start_ms": start_ms,
+        "end_ms": end_ms,
+        "instant_sample_ms": args.instant_sample_ms,
+    })
+    if raw_dir is not None:
+        (raw_dir / f"{cell_id}.guard.json").write_text(
+            json.dumps(artifact, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+    print(f"cell {cell_id} guard: {json.dumps(artifact, sort_keys=True)}")
+    if guard.truncated:
+        print(
+            f"cell {cell_id} was TRUNCATED by a gateway shed at offset "
+            f"{guard.truncated_at_offset_s}s: {guard.censored} request(s) censored, "
+            f"{censored_windows} window(s) dropped, {guard.slo_windows} window(s) above "
+            f"the SLO kept"
+        )
+    if args.guard_mode == "fail":
+        openloop.raise_on_guard(guard)
+    elif not guard.ok:
+        print(f"WARNING: cell {cell_id} guard failed (continuing on --guard-mode warn)")
     return rows, guard
 
 
@@ -575,7 +673,27 @@ def main() -> int:
     ap.add_argument("--max-p99-delay-ms", type=float, default=openloop.DEFAULT_MAX_P99_DELAY_MS)
     ap.add_argument("--max-p99-pool-wait-ms", type=float,
                     default=openloop.DEFAULT_MAX_P99_POOL_WAIT_MS)
-    ap.add_argument("--max-error-rate", type=float, default=openloop.DEFAULT_MAX_ERROR_RATE)
+    # Only MODEL errors count against the budget. A gateway shed is the campaign hitting
+    # the admission ceiling, not the engine failing, and it truncates the cell instead.
+    ap.add_argument("--max-model-error-rate", type=float,
+                    default=openloop.DEFAULT_MAX_MODEL_ERROR_RATE)
+    ap.add_argument("--truncate-on-proxy-shed", action="store_true", default=True,
+                    help="on the first gateway shed, jump to the schedule drain segment "
+                         "and censor the windows after it (default: on)")
+    ap.add_argument("--no-truncate-on-proxy-shed", action="store_false",
+                    dest="truncate_on_proxy_shed",
+                    help="keep offering load after a gateway shed (the cell then measures "
+                         "the circuit breaker, not the engine)")
+    ap.add_argument("--drain-start-s", type=float, default=None,
+                    help="offset a truncated cell jumps to (default: the schedule's "
+                         "drain_start_s from its generated INDEX.json)")
+    ap.add_argument("--min-slo-windows", type=int, default=openloop.DEFAULT_MIN_SLO_WINDOWS,
+                    help="windows above the SLO a truncated cell must already have "
+                         "collected to still pass")
+    ap.add_argument("--ttft-slo-ms", type=float, default=None,
+                    help="p95 TTFT SLO for the window evidence count (default: registry)")
+    ap.add_argument("--tpot-slo-ms", type=float, default=None,
+                    help="p95 TPOT SLO for the window evidence count (default: registry)")
     ap.add_argument("--guard-mode", default="fail", choices=["fail", "warn"],
                     help="fail: a cell that did not deliver its load aborts the run")
     args = ap.parse_args()

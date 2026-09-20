@@ -10,28 +10,28 @@
     {
       "start_time": 60,
       "end_time": 62,
-      "rps": 11.883,
+      "rps": 115.0,
       "input_tokens": 768,
       "max_tokens": 192
     },
     {
       "start_time": 150,
       "end_time": 152,
-      "rps": 11.883,
+      "rps": 115.0,
       "input_tokens": 768,
       "max_tokens": 192
     },
     {
       "start_time": 240,
       "end_time": 242,
-      "rps": 11.883,
+      "rps": 115.0,
       "input_tokens": 768,
       "max_tokens": 192
     },
     {
       "start_time": 330,
       "end_time": 332,
-      "rps": 11.883,
+      "rps": 115.0,
       "input_tokens": 768,
       "max_tokens": 192
     }
