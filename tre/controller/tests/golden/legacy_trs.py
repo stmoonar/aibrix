@@ -112,62 +112,6 @@ class LegacyTRSComputer:
         return self._trs_ema
 
 
-@dataclass
-class LegacySaturationResult:
-    gamma: Optional[float]
-    sat_windows: int
-    is_saturated: bool
-    last_q_ctl: float
-    last_y: float
-
-
-class LegacySaturationGuard:
-    def __init__(self, qsat: float = 4.0, epsat: float = 0.05, Hsat: int = 3) -> None:
-        self.qsat = qsat
-        self.epsat = epsat
-        self.Hsat = Hsat
-        self._sat_windows = 0
-        self._last_gamma: Optional[float] = None
-
-    @property
-    def current_sat_windows(self) -> int:
-        return self._sat_windows
-
-    @property
-    def last_gamma(self) -> Optional[float]:
-        return self._last_gamma
-
-    def restore(self, sat_windows: int = 0, gamma: Optional[float] = None) -> None:
-        self._sat_windows = max(0, sat_windows)
-        self._last_gamma = gamma
-
-    def snapshot(self) -> dict[str, Any]:
-        return {"sat_windows": self._sat_windows, "gamma": self._last_gamma}
-
-    def evaluate(self, trs_result: LegacyTRSResult) -> LegacySaturationResult:
-        gamma: Optional[float] = None
-        if trs_result.prev_Y is not None and trs_result.prev_Q_ctl is not None:
-            dq = trs_result.Q_ctl - trs_result.prev_Q_ctl
-            if abs(dq) > 1e-12:
-                gamma = (trs_result.Y_m - trs_result.prev_Y) / dq
-        sat_this_window = False
-        if trs_result.Q_ctl >= self.qsat and gamma is not None and abs(gamma) <= self.epsat:
-            sat_this_window = True
-        if sat_this_window:
-            self._sat_windows += 1
-        else:
-            self._sat_windows = 0
-        is_saturated = self._sat_windows >= self.Hsat
-        self._last_gamma = gamma
-        return LegacySaturationResult(
-            gamma=gamma,
-            sat_windows=self._sat_windows,
-            is_saturated=is_saturated,
-            last_q_ctl=trs_result.Q_ctl,
-            last_y=trs_result.Y_m,
-        )
-
-
 def legacy_is_finite_positive(value: float) -> bool:
     if value != value:
         return False

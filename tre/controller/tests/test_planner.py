@@ -1,11 +1,5 @@
 from __future__ import annotations
 
-from golden.legacy_planner import (
-    LegacyClassification,
-    LegacyModelRole,
-    LegacyModelState,
-    legacy_build_paper_plan,
-)
 from tre_controller.planning.classify import ModelClassification, ModelRole, ModelState, TauThresholds
 from tre_common.registry import ClusterTopology, NodeSpec
 from tre_controller.planning.planner import ClusterView, DefragAction, PlanConfig, ScaleAction, ShrinkForSlotAction, build_plan
@@ -26,16 +20,6 @@ def _classification(model: str, state: ModelState, role: ModelRole, z: float | N
     )
 
 
-def _legacy_classification(model: str, state: ModelState, role: ModelRole, z: float | None, tier: str | None = None) -> LegacyClassification:
-    return LegacyClassification(
-        model_name=model,
-        state=LegacyModelState(state.value),
-        role=LegacyModelRole(role.value),
-        Z_m=z,
-        donor_tier=tier,
-    )
-
-
 def _deltas(actions: list[ScaleAction]) -> dict[str, int]:
     out: dict[str, int] = {}
     for action in actions:
@@ -43,16 +27,26 @@ def _deltas(actions: list[ScaleAction]) -> dict[str, int]:
     return out
 
 
-def test_build_plan_matches_legacy_rescue_idle_and_high_donor_path() -> None:
+def test_build_plan_rescue_serves_critical_from_idle_and_probes_the_high_donor() -> None:
+    """Donor arithmetic across three models inside one plan, two donor tiers at once.
+
+    These expectations used to be produced by a frozen copy of the pre-migration planner
+    (removed with this rewrite). It was frozen on 2026-07-04 and still carried the
+    ``is_saturated`` fairness gate ADR-0014 deleted, so it disagreed with the planner on
+    any scenario holding a LOW receiver: it shrinks the donor and hands the replica to
+    nobody. Keeping the two in step meant keeping the scenario inside the narrowing gap
+    where they happened to agree, which is the opposite of what a regression test is for.
+    The values below are the planner's own answer, inlined; the scenario and the compound
+    assertion are unchanged, and the new
+    LOW-receiver test below now covers the path this pair used to avoid.
+
+    ``suppress_hot_proactive_probe=False`` is what keeps the HIGH surplus donor in the
+    plan at all; the guarded default is asserted at the end of this test.
+    """
     classifications = [
         _classification("critical", ModelState.CRITICAL, ModelRole.RECEIVER, 0.5),
         _classification("idle", ModelState.IDLE, ModelRole.DONOR, 10.0, "idle"),
         _classification("high", ModelState.HIGH, ModelRole.DONOR, 1.6, "surplus"),
-    ]
-    legacy_classifications = [
-        _legacy_classification("critical", ModelState.CRITICAL, ModelRole.RECEIVER, 0.5),
-        _legacy_classification("idle", ModelState.IDLE, ModelRole.DONOR, 10.0, "idle"),
-        _legacy_classification("high", ModelState.HIGH, ModelRole.DONOR, 1.6, "surplus"),
     ]
     contexts = {
         "critical": {"assigned_replicas": 2, "routable_pods": 2},
@@ -61,40 +55,58 @@ def test_build_plan_matches_legacy_rescue_idle_and_high_donor_path() -> None:
     }
     replicas = {"critical": 2, "idle": 3, "high": 2}
 
-    expected = legacy_build_paper_plan(
-        classifications=legacy_classifications,
-        model_contexts=contexts,
-        model_replicas=replicas,
-        idle_gpus=0,
-        min_replicas_per_model=1,
-        max_replicas_per_model=4,
-    )
     plan = build_plan(
         model_contexts=contexts,
         classifications=classifications,
         model_replicas=replicas,
         idle_gpus=0,
-        # This is a pure legacy-parity regression test for the frozen paper path. The t1
-        # suppress-hot-proactive guard is a deliberate post-migration divergence, so it is
-        # disabled here to keep the migration faithfulness check meaningful. The guarded
-        # (default-on) behaviour is covered by the dedicated tests below.
         cfg=PlanConfig(min_replicas_per_model=1, max_replicas_per_model=4, suppress_hot_proactive_probe=False),
     )
 
-    assert _deltas([action for action in plan.actions if isinstance(action, ScaleAction)]) == expected.deltas
-    assert plan.delayed_down_models == expected.delayed_down_models
-    assert plan.probe_upscale_plans == expected.probe_upscale_plans
+    scale_actions = [action for action in plan.actions if isinstance(action, ScaleAction)]
+    # The idle donor's replica moves to the critical receiver in the same tick; the high
+    # donor is serving, so it is only probed (safescale) and never shrunk outright.
+    assert _deltas(scale_actions) == {"idle": -1, "critical": 1, "high": -1}
+    assert plan.delayed_down_models == {"high"}
+    assert plan.probe_upscale_plans == {}
+    assert plan.events == []
     assert all(action.source_loop == "rescue" for action in plan.actions)
+    assert {(a.model, a.reason, a.requires_safescale) for a in scale_actions} == {
+        ("idle", "critical_donor_immediate", False),
+        ("critical", "critical_donor_immediate", False),
+        ("high", "high_proactive_safescale", True),
+    }
+    assert {(a.model, a.donor, a.receiver) for a in scale_actions} == {
+        ("idle", "idle", "critical"),
+        ("critical", "idle", "critical"),
+        ("high", "high", None),
+    }
+
+    # The t1 guard is on by default: the high donor's probe is dropped and recorded,
+    # while the idle -> critical transfer is untouched.
+    guarded = build_plan(
+        model_contexts=contexts,
+        classifications=classifications,
+        model_replicas=replicas,
+        idle_gpus=0,
+        cfg=PlanConfig(min_replicas_per_model=1, max_replicas_per_model=4),
+    )
+    assert _deltas([a for a in guarded.actions if isinstance(a, ScaleAction)]) == {"idle": -1, "critical": 1}
+    assert guarded.delayed_down_models == set()
+    assert guarded.events == ["safescale_probe_suppressed_hot:high"]
 
 
-def test_build_plan_matches_legacy_middle_zone_safescale_probe_path() -> None:
+def test_build_plan_middle_zone_shrinks_healthy_under_safescale_for_a_critical_receiver() -> None:
+    """A HEALTHY neutral in the middle zone is the donor of last resort: it is never
+    shrunk outright, only behind a safescale probe that already knows who gets the
+    replica if the probe holds.
+
+    Expectations inlined for the reason given on
+    test_build_plan_rescue_serves_critical_from_idle_and_probes_the_high_donor.
+    """
     classifications = [
         _classification("critical", ModelState.CRITICAL, ModelRole.RECEIVER, 0.5),
         _classification("healthy", ModelState.HEALTHY, ModelRole.NEUTRAL, 1.2),
-    ]
-    legacy_classifications = [
-        _legacy_classification("critical", ModelState.CRITICAL, ModelRole.RECEIVER, 0.5),
-        _legacy_classification("healthy", ModelState.HEALTHY, ModelRole.NEUTRAL, 1.2),
     ]
     contexts = {
         "critical": {"assigned_replicas": 2, "routable_pods": 2},
@@ -102,14 +114,6 @@ def test_build_plan_matches_legacy_middle_zone_safescale_probe_path() -> None:
     }
     replicas = {"critical": 2, "healthy": 3}
 
-    expected = legacy_build_paper_plan(
-        classifications=legacy_classifications,
-        model_contexts=contexts,
-        model_replicas=replicas,
-        idle_gpus=0,
-        min_replicas_per_model=1,
-        max_replicas_per_model=4,
-    )
     plan = build_plan(
         model_contexts=contexts,
         classifications=classifications,
@@ -118,12 +122,64 @@ def test_build_plan_matches_legacy_middle_zone_safescale_probe_path() -> None:
         cfg=PlanConfig(min_replicas_per_model=1, max_replicas_per_model=4),
     )
 
-    assert _deltas([action for action in plan.actions if isinstance(action, ScaleAction)]) == expected.deltas
+    scale_actions = [action for action in plan.actions if isinstance(action, ScaleAction)]
+    # No immediate +1 for the receiver: the replica is only promised, via the probe plan.
+    assert _deltas(scale_actions) == {"healthy": -1}
     assert plan.delayed_down_models == {"healthy"}
     assert plan.probe_upscale_plans == {"healthy": {"critical": 1}}
-    shrink = next(action for action in plan.actions if isinstance(action, ScaleAction) and action.model == "healthy")
+    assert plan.events == []
+    assert all(action.source_loop == "rescue" for action in plan.actions)
+    shrink = next(action for action in scale_actions if action.model == "healthy")
     assert shrink.requires_safescale is True
     assert shrink.reason == "critical_middle_zone_safescale"
+    assert (shrink.donor, shrink.receiver) == ("healthy", "critical")
+
+
+def test_build_plan_serves_a_low_and_a_critical_receiver_in_one_tick() -> None:
+    """The path the two tests above used to be steered around.
+
+    With a LOW receiver in the scenario the frozen legacy planner answers
+    ``{"idle": -1, "critical": 1}``: the ADR-0014 ``is_saturated`` gate it still carries
+    blocks the fairness receiver, so a shrunk donor can lose a replica to nobody. The
+    planner has to drain the idle donor twice in the same tick -- once on the rescue loop
+    for the critical receiver, once on the fairness loop for the low one -- and every
+    replica taken from a donor has to land on a named receiver.
+    """
+    classifications = [
+        _classification("critical", ModelState.CRITICAL, ModelRole.RECEIVER, 0.5),
+        _classification("low", ModelState.LOW, ModelRole.RECEIVER, 0.9),
+        _classification("idle", ModelState.IDLE, ModelRole.DONOR, 10.0, "idle"),
+        _classification("high", ModelState.HIGH, ModelRole.DONOR, 1.6, "surplus"),
+    ]
+    contexts = {
+        "critical": {"assigned_replicas": 2, "routable_pods": 2},
+        "low": {"assigned_replicas": 1, "routable_pods": 1},  # NOTE: no is_saturated
+        "idle": {"assigned_replicas": 3, "routable_pods": 3},
+        "high": {"assigned_replicas": 3, "routable_pods": 3},
+    }
+    replicas = {"critical": 2, "low": 1, "idle": 3, "high": 3}
+
+    plan = build_plan(
+        model_contexts=contexts,
+        classifications=classifications,
+        model_replicas=replicas,
+        idle_gpus=0,
+        cfg=PlanConfig(min_replicas_per_model=1, max_replicas_per_model=4),
+    )
+
+    scale_actions = [action for action in plan.actions if isinstance(action, ScaleAction)]
+    assert _deltas(scale_actions) == {"idle": -2, "critical": 1, "low": 1}
+    # Conservation: what leaves the donors is exactly what reaches the receivers.
+    assert sum(action.delta for action in scale_actions) == 0
+    assert {(a.model, a.delta, a.reason, a.source_loop, a.donor, a.receiver) for a in scale_actions} == {
+        ("idle", -1, "critical_donor_immediate", "rescue", "idle", "critical"),
+        ("critical", 1, "critical_donor_immediate", "rescue", "idle", "critical"),
+        ("idle", -1, "low_fairness_donor_immediate", "fairness", "idle", "low"),
+        ("low", 1, "low_fairness_donor_immediate", "fairness", "idle", "low"),
+    }
+    assert not any(event.startswith("fairness_blocked_unsaturated") for event in plan.events)
+    assert plan.events == ["safescale_probe_suppressed_hot:high"]
+    assert plan.delayed_down_models == set()
 
 
 def test_build_plan_low_fairness_receiver_needs_no_saturation() -> None:

@@ -109,8 +109,9 @@ def test_trs_restore_matches_legacy_state() -> None:
 
 
 # ADR-0014: SaturationGuard was removed (z_m threshold bands are the sole scaling
-# trigger), so the former test_saturation_guard_matches_legacy_sequence parity test
-# was deleted. The legacy reference class survives only in golden/legacy_trs.py.
+# trigger), so the former test_saturation_guard_matches_legacy_sequence parity test was
+# deleted. Its frozen reference class outlived it in golden/legacy_trs.py with nothing
+# importing it, and has since been deleted too.
 
 
 def test_trs_input_can_be_built_from_model_metrics_and_registry_params() -> None:
