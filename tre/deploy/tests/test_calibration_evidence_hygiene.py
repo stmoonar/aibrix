@@ -153,3 +153,26 @@ def test_the_committed_index_marks_the_held_out_cells_so_the_fit_can_find_them()
         if entry["cell_id"] in excluded
     }
     assert held_shapes == {gen.MIXTURE_NAME}
+
+
+# --------------------------------------------- a voided capture stays out of the fit
+
+
+def test_the_window_csv_has_somewhere_to_record_an_unserved_request() -> None:
+    # Separate from model_errors: a connection that died under a request is not the
+    # engine failing, and a window must not be able to claim it was.
+    assert "proxy_transient_errors" in r3_grid.CSV_COLUMNS
+    assert "model_errors" in r3_grid.CSV_COLUMNS
+
+
+def test_a_quarantined_capture_falls_outside_the_fitting_glob(tmp_path: Path) -> None:
+    # The fitting re-window globs every <cell>.jsonl under the raw root and filters only
+    # by cell id, so a voided capture left in place is silently re-windowed - and a
+    # re-run, writing the same cell id again, would pool both attempts into one fit.
+    kept_file = tmp_path / "i256_o128_c95.jsonl"
+    kept_file.write_text("{}\n", encoding="utf-8")
+    voided = tmp_path / ("i256_o128_c99.jsonl" + r3_grid.VOID_RAW_SUFFIX)
+    voided.write_text("{}\n", encoding="utf-8")
+
+    kept, _ = rewindow_from_raw.discover_cell_files(tmp_path)
+    assert [p.name for p in kept] == ["i256_o128_c95.jsonl"]

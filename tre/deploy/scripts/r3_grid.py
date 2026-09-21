@@ -140,13 +140,24 @@ def window_row(cell: GridCell, window_metrics, trs: float, queue_control: float)
         "p95_tpot": window_metrics.tpot_p95_ms,
         "p95_e2e": window_metrics.e2e_p95_ms,
         "trs": trs,
-        # Requests the ENGINE failed inside this window, and the resulting verdict. A
+        # Requests that went unserved inside this window, and the resulting verdict. A
         # failed request contributes no latency sample, so a window whose slowest work
         # all errored out otherwise shows a comfortable p95 and is scored as healthy.
-        # Both default to "none seen"; openloop.mark_model_error_windows fills them in.
+        # model_errors is the ENGINE failing; proxy_transient_errors is a connection
+        # under the request dying, which is not evidence about the engine but is still a
+        # request nobody served. They are separate columns so the second can never be
+        # read as an engine fault. All three default to "none seen";
+        # openloop.mark_unserved_request_windows fills them in.
         "model_errors": 0,
+        "proxy_transient_errors": 0,
         "slo_violated": False,
     }
+
+
+#: What a voided cell's raw capture is renamed to. It falls outside
+#: ``rewindow_from_raw``'s ``*.jsonl`` glob, which is the point: a voided cell must not
+#: reach a fit, and leaving the file in place is how it would.
+VOID_RAW_SUFFIX = ".void"
 
 
 CSV_COLUMNS = [
@@ -154,7 +165,7 @@ CSV_COLUMNS = [
     "window_start_ms", "window_end_ms", "prompt_tokens_total", "generation_tokens_total",
     "avg_waiting", "avg_running", "avg_swapping", "queue_control",
     "p95_ttft", "p95_tpot", "p95_e2e", "trs",
-    "model_errors", "slo_violated",
+    "model_errors", "proxy_transient_errors", "slo_violated",
 ]
 
 # S4 per-request raw JSONL schema (doc15 §4). Queue observables are NOT here (they are an
@@ -476,8 +487,9 @@ def count_slo_windows(rows: Sequence[dict], *, ttft_slo_ms: float, tpot_slo_ms: 
     crossed = 0
     for row in rows:
         if row.get("slo_violated"):
-            # Marked by openloop.mark_model_error_windows: the engine failed requests in
-            # this window, which is a violation even when the surviving p95 looks fine.
+            # Marked by openloop.mark_unserved_request_windows: a request in this
+            # window went unserved, which is a violation even when the p95 of the
+            # requests that did survive looks fine.
             crossed += 1
             continue
         ttft = row.get("p95_ttft")
@@ -588,6 +600,8 @@ def run_schedule_cell(args, store, spec) -> tuple[list, "openloop.CellGuard"]:
             "max_p99_delay_ms": args.max_p99_delay_ms,
             "max_p99_pool_wait_ms": args.max_p99_pool_wait_ms,
             "max_model_error_rate": args.max_model_error_rate,
+            "max_proxy_transient_rate": args.max_proxy_transient_rate,
+            "proxy_transient_allowance": args.proxy_transient_allowance,
             "min_slo_windows": args.min_slo_windows,
             "max_routing_imbalance": args.max_routing_imbalance,
             "shed_policy": args.shed_policy,
@@ -608,7 +622,7 @@ def run_schedule_cell(args, store, spec) -> tuple[list, "openloop.CellGuard"]:
     ]
     # A window holding a model error is a violation and is KEPT. Dropping it would remove
     # exactly the overloaded windows and pull theta towards health.
-    rows = openloop.mark_model_error_windows(rows, sender_records)
+    rows = openloop.mark_unserved_request_windows(rows, sender_records)
     if guard.shed_policy == openloop.SHED_POLICY_VOID and guard.voided:
         # Nothing from a voided cell may reach the fit - not even the windows taken
         # before the shed, which are precisely the healthy ones.
@@ -648,15 +662,36 @@ def run_schedule_cell(args, store, spec) -> tuple[list, "openloop.CellGuard"]:
             json.dumps(artifact, indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )
     print(f"cell {cell_id} guard: {json.dumps(artifact, sort_keys=True)}")
+    if guard.unrecognised_proxy_failures:
+        # Never silent. A wording no rule matched was counted as transient, which is the
+        # forgiving side; if Envoy changed its wording for a real admission rejection,
+        # this line is the only place it shows before theta quietly moves.
+        print(
+            f"WARNING: cell {cell_id} saw {guard.unrecognised_proxy_failures} proxy "
+            f"failure(s) whose wording matched no rule and were counted as transient: "
+            f"{json.dumps(guard.proxy_failure_reasons or {}, sort_keys=True)}"
+        )
+    if guard.sentinel_contradiction:
+        print(f"WARNING: cell {cell_id} sentinel disagreement: {guard.sentinel_contradiction}")
     if guard.voided:
         print(
             f"cell {cell_id} is VOID ({', '.join(guard.void_reasons)}): "
             f"{censored_windows} window(s) discarded, nothing from this cell may be fitted; "
             "re-run it"
         )
+        # ... and nothing from it may reach the fit through the back door either. The
+        # fitting re-window globs every <cell>.jsonl under the raw root and filters only
+        # by cell id, so a voided capture left in place is silently re-windowed - and a
+        # re-run, which writes the same cell id again, would pool both attempts into one
+        # fit. Renaming it out of the glob is the whole of the fix; the bytes are kept,
+        # under a name that says what they are.
+        if raw_path is not None and Path(raw_path).exists():
+            quarantined = Path(str(raw_path) + VOID_RAW_SUFFIX)
+            Path(raw_path).replace(quarantined)
+            print(f"cell {cell_id} raw capture quarantined -> {quarantined}")
     if guard.truncated:
         print(
-            f"cell {cell_id} was TRUNCATED by a gateway shed at offset "
+            f"cell {cell_id} was TRUNCATED by an admission overflow at offset "
             f"{guard.truncated_at_offset_s}s: {guard.censored} request(s) censored, "
             f"{censored_windows} window(s) dropped, {guard.slo_windows} window(s) above "
             f"the SLO kept"
@@ -784,13 +819,28 @@ def main() -> int:
     ap.add_argument("--max-p99-delay-ms", type=float, default=openloop.DEFAULT_MAX_P99_DELAY_MS)
     ap.add_argument("--max-p99-pool-wait-ms", type=float,
                     default=openloop.DEFAULT_MAX_P99_POOL_WAIT_MS)
-    # Only MODEL errors count against the budget. A gateway shed is the campaign hitting
-    # the admission ceiling, not the engine failing, and it truncates the cell instead.
+    # Only MODEL errors count against this budget. An admission overflow is the
+    # campaign hitting the admission ceiling, not the engine failing, and it truncates or
+    # voids the cell instead.
     ap.add_argument("--max-model-error-rate", type=float,
                     default=openloop.DEFAULT_MAX_MODEL_ERROR_RATE)
+    # Transient proxy errors - a connection carrying the request died - get their own,
+    # tighter budget. They are not an admission decision, so one of them must not void a
+    # cell; a path that keeps dropping connections still must.
+    ap.add_argument("--max-proxy-transient-rate", type=float,
+                    default=openloop.DEFAULT_MAX_PROXY_TRANSIENT_RATE,
+                    help="a cell whose TRANSIENT proxy error rate exceeds this is void "
+                         "and must be re-run; the individual windows are marked as "
+                         "violations and kept either way")
+    ap.add_argument("--proxy-transient-allowance", type=int,
+                    default=openloop.DEFAULT_PROXY_TRANSIENT_ALLOWANCE,
+                    help="transient proxy errors a cell is never voided on, whatever its "
+                         "size: one dropped connection is not a rate")
     ap.add_argument("--truncate-on-proxy-shed", action="store_true", default=True,
-                    help="on the first gateway shed, jump to the schedule drain segment "
-                         "and censor the windows after it (default: on)")
+                    help="on the first admission overflow, jump to the schedule drain "
+                         "segment and censor the windows after it (default: on). A "
+                         "transient proxy error never truncates; under --shed-policy "
+                         "void the drain is skipped because the cell is void anyway")
     ap.add_argument("--no-truncate-on-proxy-shed", action="store_false",
                     dest="truncate_on_proxy_shed",
                     help="keep offering load after a gateway shed (the cell then measures "
@@ -806,10 +856,14 @@ def main() -> int:
                          "because the windows before a shed are exactly the healthy ones "
                          "and keeping them biases theta towards health.")
     ap.add_argument("--envoy-stats-url", default=None,
-                    help="Envoy admin /stats endpoint. When set, the cell records the "
-                         "change in upstream_rq_pending_overflow across it and is voided "
-                         "if it moved. Validity sentinel only: it never enters a fit or a "
-                         "control law.")
+                    help="Envoy stats endpoint - in this cluster "
+                         "http://<envoy-pod-ip>:19001/stats/prometheus, because the admin "
+                         "listener on :19000 is bound inside the container and the envoy "
+                         "container has no curl. When set, the cell records the change in "
+                         "upstream_rq_pending_overflow across it, is voided if it moved, "
+                         "and cross-checks it against the requests the client classified "
+                         "as admission overflow. Validity sentinel only: it never enters "
+                         "a fit or a control law.")
     ap.add_argument("--envoy-cluster-filter", default=None,
                     help="only count overflow counters whose stat name contains this "
                          "(e.g. the model's cluster name)")

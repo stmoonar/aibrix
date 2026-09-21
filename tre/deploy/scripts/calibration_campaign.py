@@ -47,10 +47,28 @@ construction. What survives from the measurement is the classifier's constraint:
 :func:`scripts.openloop.classify_failure` cannot key on Envoy headers, because a shed
 carries none.
 
-What a shed now does to a calibration cell is **void it**. Truncating and keeping the
-earlier windows keeps exactly the healthy part of the cell and discards the overloaded
-part, which biases every theta fitted on it towards health - the same direction the
-superseded values were wrong in. See :data:`scripts.openloop.SHED_POLICY_VOID`.
+What an **admission overflow** now does to a calibration cell is **void it**.
+Truncating and keeping the earlier windows keeps exactly the healthy part of the cell and
+discards the overloaded part, which biases every theta fitted on it towards health - the
+same direction the superseded values were wrong in. See
+:data:`scripts.openloop.SHED_POLICY_VOID`.
+
+A **transient proxy error** - a connection carrying one request dying, which Envoy
+reports as ``reset reason: connection termination`` rather than ``overflow`` - is not
+that. It says one request went unserved and nothing about the admission ceiling, and
+treating it as a shed is how a 450 s dsqwen-7b cell with 1 bad request in 1296, at
+in-flight 43 under a 4096 circuit breaker, wrote zero rows. It marks its own window as a
+violation, keeps it, and only voids the cell past
+:data:`scripts.openloop.DEFAULT_MAX_PROXY_TRANSIENT_RATE`.
+
+What a voided cell does to the campaign
+---------------------------------------
+It is **re-run once, in place**; a second void stops the whole campaign. The rule is
+:func:`scripts.adaptive_boundary.next_void_attempt`, the same one the boundary search
+applies to a voided probe, because "re-run once, then stop" is one statement about what a
+void costs and two copies of it drift. Continuing instead - which is what
+``--guard-mode warn`` did on its own - writes a zero-row CSV per cell and still prints
+``campaign complete``: five hours of offered load and no rows anywhere.
 
 Artifacts
 ---------
@@ -500,6 +518,8 @@ def cell_command(cell: Cell, args, schedule_path: Path, output: Path) -> list[st
         command += ["--drain-start-s", str(cell.drain_start_s)]
     if getattr(args, "envoy_stats_url", None):
         command += ["--envoy-stats-url", args.envoy_stats_url]
+    if getattr(args, "envoy_cluster_filter", None):
+        command += ["--envoy-cluster-filter", args.envoy_cluster_filter]
     if args.registry:
         command += ["--registry", args.registry]
     if args.redis_url:
@@ -543,6 +563,84 @@ def regenerate_ramp(
     cell.duration_s = float(meta.get("duration_s") or cell.duration_s)
     cell.capacity_source = measured.capacity_source
     return path
+
+
+# ---------------------------------------------------------------- voided cell policy
+
+
+class CellVoided(RuntimeError):
+    """A cell voided on every attempt the retry rule allows, so the campaign stops."""
+
+    def __init__(self, cell_id: str, attempts: int, void_reasons: Sequence[str]) -> None:
+        self.cell_id = cell_id
+        self.attempts = int(attempts)
+        self.void_reasons = tuple(str(r) for r in void_reasons)
+        super().__init__(
+            f"cell {cell_id} was voided on all {int(attempts)} attempt(s) "
+            f"({', '.join(self.void_reasons) or 'no reason recorded'}); stopping the "
+            "campaign rather than going on writing cells that measured nothing"
+        )
+
+
+def read_cell_guard(
+    raw_dir: Path, output: Path, cell_id: str, *, returncode: int = 0
+) -> dict:
+    """The guard artifact ``r3_grid`` wrote for one driven cell.
+
+    A driver that died before writing one is itself a void: the absence of a verdict is
+    not a passing verdict, and without this the campaign would read an exit code 1 as a
+    cell with no void reasons and go on to the next one.
+    """
+    guard_path = Path(raw_dir) / Path(output).stem / f"{cell_id}.guard.json"
+    guard: dict = {}
+    if guard_path.exists():
+        try:
+            guard = json.loads(guard_path.read_text(encoding="utf-8"))
+        except ValueError:
+            guard = {}
+    if returncode != 0 and not guard.get("void_reasons"):
+        guard = dict(guard)
+        guard["void_reasons"] = [f"driver exited {returncode}"]
+    return guard
+
+
+def attempt_output_path(output: Path, attempt: int) -> Path:
+    """Where attempt ``attempt`` of a cell writes.
+
+    Attempt 1 keeps the plain name so the artifact layout is unchanged; a re-run gets its
+    own, because the raw JSONL is appended to and a second attempt writing the same file
+    would pool the capture that failed with the one that replaced it.
+    """
+    path = Path(output)
+    if int(attempt) <= 1:
+        return path
+    return path.with_name(f"{path.stem}_a{int(attempt)}{path.suffix}")
+
+
+def drive_until_valid(
+    cell_id: str, drive, *, max_retries: int = boundary.MAX_VOID_RETRIES
+) -> tuple[dict, int]:
+    """Drive a cell until it produces a verdict that is not a void, or give up loudly.
+
+    ``drive(attempt) -> guard``. The retry rule is
+    :func:`scripts.adaptive_boundary.next_void_attempt` - the boundary search's rule for
+    a voided probe, used here unchanged so the campaign has one answer to "how many times
+    do we try" rather than two.
+    """
+    attempt = 1
+    while True:
+        guard = drive(attempt)
+        void_reasons = tuple(str(r) for r in (guard.get("void_reasons") or ()))
+        if not void_reasons:
+            return guard, attempt
+        nxt = boundary.next_void_attempt(attempt, max_retries=max_retries)
+        if nxt is None:
+            raise CellVoided(cell_id, attempt, void_reasons)
+        print(
+            f"  cell {cell_id} is VOID ({', '.join(void_reasons)}); re-running it as "
+            f"attempt {nxt}"
+        )
+        attempt = nxt
 
 
 # ------------------------------------------------------------------ boundary search
@@ -993,18 +1091,9 @@ def drive_boundary_search(
         if result.returncode != 0:
             print(f"  probe failed with exit {result.returncode}")
         rows = read_window_rows(output)
-        guard_path = (
-            Path(args.raw_dir) / output.stem / f"{cell_id}.guard.json"
+        guard = read_cell_guard(
+            Path(args.raw_dir), output, cell_id, returncode=result.returncode
         )
-        guard: dict = {}
-        if guard_path.exists():
-            try:
-                guard = json.loads(guard_path.read_text(encoding="utf-8"))
-            except ValueError:
-                guard = {}
-        if result.returncode != 0 and not guard.get("void_reasons"):
-            guard = dict(guard)
-            guard["void_reasons"] = [f"driver exited {result.returncode}"]
         time.sleep(args.cooldown_s)
         return rows, guard
 
@@ -1122,15 +1211,36 @@ def run_campaign(args) -> int:
             print(f"regenerated ramp from {measurement.capacity_source}: "
                   f"C_s {measurement.capacity_prior_rps} -> {measurement.capacity_used_rps} rps")
 
-        output = out_dir / f"{cell.model}_{cell.shape}_{cell.primitive}.csv"
-        command = cell_command(cell, args, schedule_path, output)
-        print(f"[{position}/{len(runnable)}] {cell.model} {cell.shape} {cell.primitive} "
-              f"({cell.duration_s:.0f}s): {' '.join(command)}")
-        result = subprocess.run(command, check=False)
-        if result.returncode != 0:
-            print(f"cell failed with exit {result.returncode}")
-            if args.stop_on_failure:
-                return result.returncode
+        base_output = out_dir / f"{cell.model}_{cell.shape}_{cell.primitive}.csv"
+        output = base_output
+        exit_code = 0
+
+        def drive(attempt: int, cell=cell, schedule_path=schedule_path,
+                  base_output=base_output, position=position) -> dict:
+            nonlocal output, exit_code
+            output = attempt_output_path(base_output, attempt)
+            if attempt > 1:
+                # The re-run starts from the same quiet fleet the first attempt did.
+                time.sleep(args.cooldown_s)
+            command = cell_command(cell, args, schedule_path, output)
+            print(f"[{position}/{len(runnable)}] {cell.model} {cell.shape} "
+                  f"{cell.primitive} ({cell.duration_s:.0f}s, attempt {attempt}): "
+                  f"{' '.join(command)}")
+            result = subprocess.run(command, check=False)
+            exit_code = result.returncode
+            if result.returncode != 0:
+                print(f"cell failed with exit {result.returncode}")
+            return read_cell_guard(
+                raw_dir, output, cell.cell_id, returncode=result.returncode
+            )
+
+        try:
+            drive_until_valid(cell.cell_id, drive)
+        except CellVoided as voided:
+            print(str(voided))
+            return 1
+        if exit_code != 0 and args.stop_on_failure:
+            return exit_code
 
         if cell.primitive == "steps":
             raw_path = raw_dir / output.stem / f"{cell.cell_id}.jsonl"
@@ -1209,16 +1319,29 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     help="a cell whose MODEL error rate exceeds this is void and must be "
                          "re-run; the individual error windows are kept and counted as "
                          "violations either way")
+    ap.add_argument("--envoy-cluster-filter", default=None,
+                    help="only count Envoy overflow counters whose stat name or labels "
+                         "contain this (e.g. the model's cluster name). Without it the "
+                         "sentinel sums every cluster on the gateway, so another model's "
+                         "overflow voids this cell")
     ap.add_argument("--envoy-stats-url", default=None,
-                    help="Envoy admin /stats endpoint. Every cell then records the change "
-                         "in upstream_rq_pending_overflow across it and is voided if it "
-                         "moved. Validity sentinel only - never a control input.")
+                    help="Envoy stats endpoint - in this cluster "
+                         "http://<envoy-pod-ip>:19001/stats/prometheus, because the admin "
+                         "listener on :19000 is not reachable from the node and the envoy "
+                         "container has no curl. Every cell then records the change in "
+                         "upstream_rq_pending_overflow across it, is voided if it moved, "
+                         "and records any disagreement with what the client classified as "
+                         "admission overflow. Validity sentinel only - never a control "
+                         "input.")
     ap.add_argument("--skip-boundary-search", action="store_true",
                     help="run only the committed primitives (steps/ramp/bursts) and skip "
                          "the adaptive boundary search")
     ap.add_argument("--guard-mode", default="warn", choices=["fail", "warn"],
-                    help="a failed cell should not abandon the campaign by default; the "
-                         "guard verdict is recorded per cell either way")
+                    help="how the per-cell driver reacts to its own guard. This does NOT "
+                         "decide what a VOID cell does to the campaign: a voided cell is "
+                         "always re-run once and a second void always stops the run, "
+                         "whatever this is set to. The guard verdict is recorded per "
+                         "cell either way")
     ap.add_argument("--stop-on-failure", action="store_true")
     ap.add_argument("--registry", default=None)
     ap.add_argument("--redis-url", default=None)

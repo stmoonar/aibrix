@@ -594,3 +594,70 @@ def test_every_cell_materialises_its_prompts_into_this_campaigns_output_dir() ->
         assert command[command.index("--prompt-dir") + 1] == str(
             Path("/campaign/run7") / "prompts"
         )
+
+
+# ================================================= a voided cell is re-run, not skipped
+#
+# The failure these replace: --guard-mode warn printed a WARNING per voided cell, wrote
+# 0 rows, carried on, and finished with "campaign complete" after five hours.
+
+
+def test_a_voided_cell_is_re_run_in_place() -> None:
+    attempts: list[int] = []
+
+    def drive(attempt: int) -> dict:
+        attempts.append(attempt)
+        return {"void_reasons": ["gateway admission overflow"]} if attempt == 1 else {}
+
+    guard, attempt = campaign.drive_until_valid("i256_o128_c95", drive)
+    assert attempts == [1, 2]
+    assert attempt == 2 and guard == {}
+
+
+def test_a_cell_that_voids_twice_stops_the_campaign_and_says_why() -> None:
+    attempts: list[int] = []
+
+    def drive(attempt: int) -> dict:
+        attempts.append(attempt)
+        return {"void_reasons": ["transient proxy error rate"]}
+
+    with pytest.raises(campaign.CellVoided) as excinfo:
+        campaign.drive_until_valid("i256_o128_c95", drive)
+    assert attempts == [1, 2]
+    assert excinfo.value.void_reasons == ("transient proxy error rate",)
+    assert "voided on all 2 attempt(s)" in str(excinfo.value)
+
+
+def test_the_scheduled_cells_retry_rule_is_the_boundary_search_s_own_rule() -> None:
+    # One rule in one place. Two copies of "re-run once, then stop" drift, and the one
+    # that drifts is the one nobody is watching.
+    assert boundary.next_void_attempt(1) == 2
+    assert boundary.next_void_attempt(2) is None
+    assert boundary.MAX_VOID_RETRIES == 1
+
+
+def test_a_re_run_writes_beside_the_attempt_it_replaces_not_over_it() -> None:
+    # The raw JSONL is appended to, so a second attempt writing the same path would pool
+    # the capture that failed with the one that replaced it.
+    base = Path("/out/dsqwen-7b_S1_steps.csv")
+    assert campaign.attempt_output_path(base, 1) == base
+    assert campaign.attempt_output_path(base, 2) == Path("/out/dsqwen-7b_S1_steps_a2.csv")
+
+
+def test_a_driver_that_died_without_writing_a_verdict_is_itself_a_void(tmp_path) -> None:
+    # Absence of a verdict is not a passing verdict.
+    guard = campaign.read_cell_guard(
+        tmp_path, tmp_path / "dsqwen-7b_S1_steps.csv", "i256_o128_c95", returncode=1
+    )
+    assert guard["void_reasons"] == ["driver exited 1"]
+
+
+def test_the_guard_artifact_is_read_back_from_where_the_driver_wrote_it(tmp_path) -> None:
+    output = tmp_path / "dsqwen-7b_S1_steps.csv"
+    cell_dir = tmp_path / output.stem
+    cell_dir.mkdir()
+    (cell_dir / "i256_o128_c95.guard.json").write_text(
+        json.dumps({"void_reasons": ["model error rate"], "sent": 10}), encoding="utf-8"
+    )
+    guard = campaign.read_cell_guard(tmp_path, output, "i256_o128_c95")
+    assert guard["void_reasons"] == ["model error rate"] and guard["sent"] == 10

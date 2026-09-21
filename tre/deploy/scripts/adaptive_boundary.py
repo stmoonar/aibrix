@@ -35,11 +35,13 @@ calibrated against.
 
 What a probe does NOT do
 ------------------------
-A probe never averages a voided cell into its verdict. A cell voided by a shed, by a
-dispatch-delay breach, by the model error budget or by the overflow sentinel carries no
-information about the boundary: it is re-run once, and if it voids again the search stops
-and says so rather than bisecting on noise. Silently treating "we could not measure it"
-as "it did not violate" would walk the bracket upwards on every failure.
+A probe never averages a voided cell into its verdict. A cell voided by an admission
+overflow, by a dispatch-delay breach, by the model error budget, by the transient proxy
+error budget or by the overflow sentinel carries no information about the boundary: it is
+re-run once, and if it voids again the search stops and says so rather than bisecting on
+noise. Silently treating "we could not measure it" as "it did not violate" would walk the
+bracket upwards on every failure. :func:`next_void_attempt` is that rule, and the
+campaign's scheduled cells obey the same one.
 """
 from __future__ import annotations
 
@@ -75,8 +77,29 @@ VIOLATION_WINDOW_FRACTION = 0.5
 #: fraction above is being computed on a handful of samples.
 MIN_PROBE_WINDOWS = 3
 
-#: A voided probe is re-driven this many times before the search gives up on it.
-MAX_PROBE_RETRIES = 1
+#: A voided cell is re-driven this many times before whoever asked for it gives up.
+#:
+#: This is the rule for every voided cell in the campaign, not only for a probe: the
+#: scheduled primitives re-drive through :func:`next_void_attempt` as well. One rule in
+#: one place, because "re-run once, stop on the second void" is a statement about how
+#: much a void costs, and two copies of it drift.
+MAX_VOID_RETRIES = 1
+
+
+def next_void_attempt(
+    attempt: int, *, max_retries: int = MAX_VOID_RETRIES
+) -> Optional[int]:
+    """The attempt number to re-drive a voided cell as, or None when the rule says stop.
+
+    A voided cell measured nothing, so it is evidence in no direction: re-running it once
+    is the cheapest way to tell an infrastructure hiccup from a real inability to offer
+    the load. A second void is the second one - carrying on past it means building a fit
+    (or a bisection) on cells that never measured anything, which is the failure this
+    whole guard exists to prevent.
+    """
+    if int(attempt) > int(max_retries):
+        return None
+    return int(attempt) + 1
 
 STAGE_COARSE = "coarse"
 STAGE_BISECT = "bisect"
@@ -209,7 +232,7 @@ class BoundarySearch:
     bisect_seconds: float = BISECT_SECONDS
     dwell_fraction: float = DWELL_FRACTION
     dwell_seconds: float = DWELL_SECONDS
-    max_retries: int = MAX_PROBE_RETRIES
+    max_retries: int = MAX_VOID_RETRIES
 
     results: list[ProbeResult] = field(default_factory=list)
     #: Highest rho observed healthy, and lowest observed violating. Either may be None.
@@ -221,7 +244,6 @@ class BoundarySearch:
     _bisect_done: int = 0
     _dwell_done: bool = False
     _pending: Optional[Probe] = None
-    _retries: int = 0
 
     # ------------------------------------------------------------------ progression
 
@@ -305,11 +327,12 @@ class BoundarySearch:
         self.results.append(result)
         self._pending = None
         if not result.valid:
-            self._retries += 1
-            if self._retries > self.max_retries:
+            attempt = int(result.probe.attempt)
+            nxt = next_void_attempt(attempt, max_retries=self.max_retries)
+            if nxt is None:
                 self.stopped_reason = (
                     f"probe at rho={result.probe.rho:g} was voided "
-                    f"{self._retries} time(s) ({', '.join(result.void_reasons) or 'no reason recorded'}); "
+                    f"{attempt} time(s) ({', '.join(result.void_reasons) or 'no reason recorded'}); "
                     "the search will not bisect on a cell that measured nothing"
                 )
                 return
@@ -318,11 +341,10 @@ class BoundarySearch:
                 result.probe.rho,
                 result.probe.duration_s,
                 result.probe.stage,
-                attempt=result.probe.attempt + 1,
+                attempt=nxt,
             )
             return
 
-        self._retries = 0
         if result.violated:
             if self.violating_rho is None or result.probe.rho < self.violating_rho:
                 self.violating_rho = result.probe.rho

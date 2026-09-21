@@ -29,7 +29,9 @@ What is in here
   nothing, completed nothing, errored too often, or could not keep its schedule is a
   hard failure.
 * :func:`count_outcomes` / :func:`goodput` - the per-cell accounting. Every request is
-  one of four outcomes (ok / shed / model_error / client_timeout) and every cell reports
+  one of five outcomes (ok / shed / proxy_transient / model_error / client_timeout), where
+  ``shed`` means the admission ceiling refused it and ``proxy_transient`` means a
+  connection carrying it died, and every cell reports
   offered / admitted / completed, because the campaign's headline metric is
   ``G = #(admitted AND met every SLO) / #offered``: a denominator of *offered* makes a
   rejection a loss instead of an absence, which is the only way a boundary search can
@@ -100,9 +102,29 @@ DEFAULT_MAX_P99_POOL_WAIT_MS = 250.0
 #: schedule says it did - the cell is then measuring the driver, and a calibration point
 #: that measures the driver is worse than no point at all.
 CALIBRATION_MAX_P99_DELAY_MS = 50.0
-#: Only MODEL errors count against this. A gateway shed is not the model failing, it is
-#: the campaign hitting the admission ceiling; a client timeout is the driver giving up.
+#: Only MODEL errors count against this. An admission overflow is not the model
+#: failing, it is the campaign hitting the admission ceiling; a client timeout is the
+#: driver giving up; a transient proxy error has its own, tighter budget below.
 DEFAULT_MAX_MODEL_ERROR_RATE = 0.05
+
+#: Ceiling on a cell's *transient* proxy errors - ten times tighter than the model's.
+#:
+#: A transient proxy error is a request the infrastructure dropped. Unlike a model error
+#: it carries no information about the engine, and unlike an admission overflow it says
+#: nothing about where the admission ceiling is, so it should be near zero and it is
+#: budgeted harder. Both numbers that bracket it are measured on this cluster: the
+#: background rate is 1/1296 = 0.08 % (one ``connection termination`` in a 450 s
+#: dsqwen-7b cell, at in-flight 43 under a 4096 circuit breaker), and a path that has
+#: actually broken is three orders of magnitude above that (the t1 storm: 49.6 % of
+#: 45902 requests). 0.5 % sits an order of magnitude above the background and well below
+#: the failure, so keep-alive churn never voids a cell and a broken path always does.
+DEFAULT_MAX_PROXY_TRANSIENT_RATE = 0.005
+
+#: ... and no cell is voided on a single transient error, whatever its size. One dropped
+#: connection is not a rate: it takes two before "this path is unhealthy" is
+#: distinguishable from "one keep-alive connection was recycled". Without this floor a
+#: 60 s boundary probe of 150 requests would void on its first one, at 0.67 % > 0.5 %.
+DEFAULT_PROXY_TRANSIENT_ALLOWANCE = 1
 
 #: What a cell does when the gateway sheds.
 #:
@@ -139,9 +161,19 @@ POD_INSTANT_GAUGES = {
 
 #: A request that was served.
 FAILURE_NONE = "ok"
-#: The gateway rejected the request at its circuit breaker; it never reached vLLM. This
-#: says nothing about the model and everything about the admission policy.
-FAILURE_PROXY = "proxy"
+#: The gateway refused the request at its admission ceiling: Envoy's circuit breaker
+#: rejected it in milliseconds, before any upstream socket was attempted. Offered load is
+#: then above what the gateway will admit, every request after it measures the admission
+#: policy rather than the engine, and a calibration cell that sees one has nothing to
+#: salvage.
+FAILURE_ADMISSION_OVERFLOW = "admission_overflow"
+#: The proxy could not carry this one request, and nothing in what came back says the
+#: admission ceiling was reached: an established keep-alive connection was closed under
+#: the request, a connect attempt failed, no endpoint was ready. That is a connectivity
+#: event, not a decision about load - the cell was still offering exactly what it was
+#: asked to offer. Voiding a whole cell for one of these is how a 450 s cell with 1 bad
+#: request in 1296 produced zero rows.
+FAILURE_PROXY_TRANSIENT = "proxy_transient"
 #: The model itself failed. vLLM queues rather than shedding, so a non-2xx that carries
 #: an engine body, and any transport failure that is not the client's own deadline, is a
 #: statement about the model.
@@ -152,30 +184,47 @@ FAILURE_MODEL = "model"
 #: read as an admission decision nobody made. It is recorded, never budgeted.
 FAILURE_CLIENT_TIMEOUT = "client_timeout"
 
-#: The four outcomes one request can have, under the names the cell artifacts use.
-#: ``FAILURE_PROXY`` is spelled ``shed`` outward because that is what it is; the constant
-#: keeps its original value so captures written before this split still read back.
-FAILURE_CLASSES = (FAILURE_NONE, FAILURE_PROXY, FAILURE_MODEL, FAILURE_CLIENT_TIMEOUT)
+#: The five outcomes one request can have, under the names the cell artifacts use.
+#: ``FAILURE_ADMISSION_OVERFLOW`` is spelled ``shed`` outward because that is what it is,
+#: and because every consumer of ``outcomes["shed"]`` - admitted, goodput, the void rule -
+#: means the admission ceiling by it and nothing else.
+FAILURE_CLASSES = (
+    FAILURE_NONE,
+    FAILURE_ADMISSION_OVERFLOW,
+    FAILURE_PROXY_TRANSIENT,
+    FAILURE_MODEL,
+    FAILURE_CLIENT_TIMEOUT,
+)
+#: The two classes the proxy answers for rather than the engine.
+PROXY_FAILURE_CLASSES = (FAILURE_ADMISSION_OVERFLOW, FAILURE_PROXY_TRANSIENT)
 OUTCOME_NAMES = {
     FAILURE_NONE: "ok",
-    FAILURE_PROXY: "shed",
+    FAILURE_ADMISSION_OVERFLOW: "shed",
+    FAILURE_PROXY_TRANSIENT: "proxy_transient",
     FAILURE_MODEL: "model_error",
     FAILURE_CLIENT_TIMEOUT: "client_timeout",
 }
 
 #: Statuses only the proxy can produce: they all mean "no usable answer from upstream",
 #: which an engine that queues its work never needs to say. A 503 is the circuit
-#: breaker; 502 and 504 are the same shed wearing different numbers.
+#: breaker; 502 and 504 are the same rejection wearing different numbers.
 PROXY_STATUSES = frozenset({502, 503, 504})
 
-#: Headers Envoy sets when it is the one rejecting. Definitive when present - but the
-#: measured circuit-breaker response carries NONE of them, so they can never be the only
-#: test (see the pre-check signature in the module docstring of the campaign runner).
+#: Headers Envoy sets when it is the one answering. Definitive for "the proxy wrote this"
+#: when present - but the measured circuit-breaker response carries NONE of them, so they
+#: can never be the only test (see the pre-check signature in the module docstring of the
+#: campaign runner).
 PROXY_HEADER_MARKERS = ("x-envoy-overloaded", "x-envoy-ratelimited", "x-envoy-upstream-service-time")
 
-#: Phrases in Envoy's plain-text rejection bodies. The circuit-breaker body measured on
-#: 2026-09-20 was exactly:
-#:   upstream connect error or disconnect/reset before headers. reset reason: overflow
+#: The subset of those that is itself a statement about *load*: Envoy saying it refused
+#: the request because it was over a limit. The remaining marker only says the proxy was
+#: involved, which is a different question.
+OVERLOAD_HEADER_MARKERS = ("x-envoy-overloaded", "x-envoy-ratelimited")
+
+#: Phrases in Envoy's plain-text rejection bodies. These decide proxy-vs-model only. What
+#: KIND of proxy failure it was is decided by the reset reason below, because this prefix
+#: text is shared by every one of them - which is precisely why a classifier keyed on it
+#: read a closed connection as an admission decision.
 PROXY_BODY_MARKERS = (
     "upstream connect error",
     "upstream request timeout",
@@ -184,6 +233,162 @@ PROXY_BODY_MARKERS = (
     "overflow",
     "connection termination",
 )
+
+#: Envoy writes ``... reset reason: <reason>`` into the body of a rejection it generated
+#: itself. That trailing reason - not the status, not the sentence in front of it - is the
+#: only part of the response that says *why*, so it is what the split keys on.
+RESET_REASON_PREFIX = "reset reason:"
+
+#: The reset reason a circuit-breaker rejection carries, measured verbatim against the
+#: live gateway on 2026-09-20 at in-flight 321 and recorded in
+#: ``deploy/gateway-hardening/README.md`` as the 503 **UO** fast-fail:
+#:   upstream connect error or disconnect/reset before headers. reset reason: overflow
+ADMISSION_OVERFLOW_RESET_REASONS = ("overflow",)
+
+#: Reset reasons that describe a connection rather than an admission decision.
+#: ``connection termination`` is the upstream closing a keep-alive connection that had a
+#: request on it; the rest are the connect attempt itself failing. The circuit breaker
+#: cannot produce any of them: it rejects before a socket is attempted, which is why one
+#: of these arriving at in-flight 43 under a 4096 limit was never an admission event.
+TRANSIENT_RESET_REASONS = (
+    "connection termination",
+    "connection failure",
+    "remote connection failure",
+    "local connection failure",
+    "connection timeout",
+    "remote reset",
+    "local reset",
+    "connection reset",
+    "protocol error",
+)
+
+#: Proxy rejections that carry no reset reason but still name a non-admission cause: no
+#: endpoint was ready, or the route's own timeout fired.
+TRANSIENT_BODY_MARKERS = ("no healthy upstream", "upstream request timeout")
+
+#: Reasons this module synthesises when the response carried none of its own. They are
+#: reported in the guard artifact exactly like a real reset reason, so a cell never hides
+#: that its classification rested on an absence of evidence.
+PROXY_REASON_OVERLOAD_HEADER = "envoy overload header"
+PROXY_REASON_EMPTY_BODY = "empty body"
+PROXY_REASON_UNRECOGNISED = "unrecognised"
+
+
+def parse_reset_reason(body: Optional[str]) -> Optional[str]:
+    """The ``reset reason: <reason>`` Envoy wrote into a rejection body, lowercased.
+
+    None when the body carries no reset reason, which is itself evidence: a rejection
+    Envoy generated on the request path always says why, so a body without one did not
+    come from that path.
+    """
+    if not body:
+        return None
+    lowered = str(body).lower()
+    at = lowered.find(RESET_REASON_PREFIX)
+    if at < 0:
+        return None
+    reason = lowered[at + len(RESET_REASON_PREFIX):].strip()
+    if not reason:
+        return None
+    reason = reason.splitlines()[0].strip().rstrip(".;,")
+    return reason or None
+
+
+def proxy_failure_reason(record: dict) -> str:
+    """Why the proxy refused this request, in the proxy's own words where it gave any.
+
+    The return value is the evidence the split is made on and it goes into the cell
+    artifact verbatim, so a later reader can re-judge the call. It is one of: a reset
+    reason Envoy wrote, a :data:`TRANSIENT_BODY_MARKERS` phrase,
+    :data:`PROXY_REASON_OVERLOAD_HEADER` when Envoy flagged the rejection as an overload
+    in a header, :data:`PROXY_REASON_EMPTY_BODY` when the connection went away before any
+    body could be read, or :data:`PROXY_REASON_UNRECOGNISED`.
+    """
+    raw_headers = record.get("error_headers") or {}
+    headers = {str(k).lower() for k in raw_headers}
+    if any(name in headers for name in OVERLOAD_HEADER_MARKERS):
+        return PROXY_REASON_OVERLOAD_HEADER
+    body = record.get("error_body") or ""
+    reason = parse_reset_reason(body)
+    if reason:
+        return reason
+    lowered = body.lower()
+    for marker in TRANSIENT_BODY_MARKERS:
+        if marker in lowered:
+            return marker
+    if not body.strip():
+        return PROXY_REASON_EMPTY_BODY
+    return PROXY_REASON_UNRECOGNISED
+
+
+def is_admission_overflow_reason(reason: str) -> bool:
+    """True only for evidence that the *admission ceiling* was reached.
+
+    Everything else - including a wording nobody has seen before - is treated as
+    transient. The asymmetry is deliberate. Reading a transient reset as an overflow
+    voids a cell that offered exactly the load it was asked to, and one wording change in
+    Envoy would then void every cell of a campaign. Reading an overflow as transient
+    costs at worst one cell, and both the transient-rate rule and the Envoy sentinel
+    still see it.
+    """
+    text = str(reason).lower()
+    if text == PROXY_REASON_OVERLOAD_HEADER:
+        return True
+    return any(marker in text for marker in ADMISSION_OVERFLOW_RESET_REASONS)
+
+
+def is_recognised_proxy_reason(reason: str) -> bool:
+    """True when this module has a rule for that wording, rather than a fallback."""
+    text = str(reason).lower()
+    if text in (PROXY_REASON_UNRECOGNISED, PROXY_REASON_EMPTY_BODY):
+        return False
+    if text == PROXY_REASON_OVERLOAD_HEADER:
+        return True
+    known = (
+        tuple(ADMISSION_OVERFLOW_RESET_REASONS)
+        + tuple(TRANSIENT_RESET_REASONS)
+        + tuple(TRANSIENT_BODY_MARKERS)
+    )
+    return any(marker in text for marker in known)
+
+
+def _proxy_failure_class(record: dict) -> str:
+    return (
+        FAILURE_ADMISSION_OVERFLOW
+        if is_admission_overflow_reason(proxy_failure_reason(record))
+        else FAILURE_PROXY_TRANSIENT
+    )
+
+
+def proxy_reason_histogram(records: Sequence[dict]) -> dict:
+    """``{reason: count}`` over every proxy-attributed failure in a cell.
+
+    This is what keeps the split auditable: a reader sees the exact wording each decision
+    was made on, and a wording no rule matched gets its own bucket instead of being
+    absorbed into a named one.
+    """
+    counts: dict[str, int] = {}
+    for record in records:
+        if classify_failure(record) not in PROXY_FAILURE_CLASSES:
+            continue
+        reason = proxy_failure_reason(record)
+        counts[reason] = counts.get(reason, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def count_unrecognised_proxy_failures(records: Sequence[dict]) -> int:
+    """Proxy failures whose wording matched no rule.
+
+    Reported in the guard artifact and printed by the driver rather than absorbed
+    silently: a classification rule that quietly stopped matching is exactly the failure
+    mode that looks like success.
+    """
+    return sum(
+        1
+        for record in records
+        if classify_failure(record) in PROXY_FAILURE_CLASSES
+        and not is_recognised_proxy_reason(proxy_failure_reason(record))
+    )
 
 
 def _has_structured_body(body: Optional[str]) -> bool:
@@ -226,6 +431,14 @@ def classify_failure(record: dict) -> str:
       body at all (the connection was reset before the body could be read) -> proxy.
     * anything else -> model, because attributing an unknown failure to the proxy would
       silently exempt it from the error budget.
+
+    A failure attributed to the proxy is then split again, by
+    :func:`proxy_failure_reason`, into :data:`FAILURE_ADMISSION_OVERFLOW` - the circuit
+    breaker refused it, so the cell reached the admission ceiling and has nothing to
+    salvage - and :data:`FAILURE_PROXY_TRANSIENT` - a connection carrying the request
+    died, which says this one request went unserved and nothing more. Collapsing the two
+    is what let a single ``connection termination`` at in-flight 43, under a 4096
+    circuit breaker, void a whole 450 s cell.
     """
     status = record.get("http_status")
     if status is not None and 200 <= int(status) < 300 and record.get("e2e_ms") is not None:
@@ -237,7 +450,7 @@ def classify_failure(record: dict) -> str:
     raw_headers = record.get("error_headers") or {}
     headers = {str(k).lower(): str(v) for k, v in raw_headers.items()}
     if any(name in headers for name in PROXY_HEADER_MARKERS):
-        return FAILURE_PROXY
+        return _proxy_failure_class(record)
 
     if not status:
         return FAILURE_MODEL
@@ -248,7 +461,7 @@ def classify_failure(record: dict) -> str:
             return FAILURE_MODEL
         lowered = body.lower()
         if not body.strip() or any(marker in lowered for marker in PROXY_BODY_MARKERS):
-            return FAILURE_PROXY
+            return _proxy_failure_class(record)
     return FAILURE_MODEL
 
 
@@ -273,6 +486,11 @@ def failure_signature(record: dict) -> dict:
         "request_timeout_s": record.get("request_timeout_s"),
         "failure_class": verdict,
         "outcome": OUTCOME_NAMES[verdict],
+        # The exact wording the overflow-vs-transient split was decided on, so the call
+        # can be re-judged later without re-parsing the body.
+        "proxy_reason": (
+            proxy_failure_reason(record) if verdict in PROXY_FAILURE_CLASSES else None
+        ),
     }
 
 
@@ -286,6 +504,10 @@ class CellOutcomes:
       rejects half its traffic score the same as one that serves it.
     * ``admitted`` - requests that reached vLLM, i.e. everything not shed at the proxy.
     * ``completed`` - requests that came back 2xx with a measured end-to-end time.
+
+    A ``proxy_transient`` request counts as admitted: nothing refused it, a connection
+    under it died. It must not move the admission rate, which is the campaign's measure
+    of how much load the gateway was willing to take.
     """
 
     offered: int
@@ -295,6 +517,7 @@ class CellOutcomes:
     shed: int
     model_error: int
     client_timeout: int
+    proxy_transient: int = 0
 
     def as_dict(self) -> dict:
         return {
@@ -305,11 +528,12 @@ class CellOutcomes:
             "shed": self.shed,
             "model_error": self.model_error,
             "client_timeout": self.client_timeout,
+            "proxy_transient": self.proxy_transient,
         }
 
 
 def count_outcomes(records: Sequence[dict]) -> CellOutcomes:
-    """Four-way classification of a cell's sender records, plus offered/admitted/completed."""
+    """Five-way classification of a cell's sender records, plus offered/admitted/completed."""
     counts = {name: 0 for name in OUTCOME_NAMES.values()}
     for record in records:
         counts[OUTCOME_NAMES[classify_failure(record)]] += 1
@@ -322,14 +546,16 @@ def count_outcomes(records: Sequence[dict]) -> CellOutcomes:
         shed=counts["shed"],
         model_error=counts["model_error"],
         client_timeout=counts["client_timeout"],
+        proxy_transient=counts["proxy_transient"],
     )
 
 
 def count_failures(records: Sequence[dict]) -> tuple[int, int, int]:
-    """(served, model errors, proxy errors) over a cell's sender records.
+    """(served, model errors, admission overflows) over a cell's sender records.
 
-    Client timeouts are in none of the three: they are counted on their own in
-    :func:`count_outcomes` and deliberately kept out of the model's error budget.
+    Client timeouts are in none of the three, and neither are transient proxy errors:
+    both are counted on their own in :func:`count_outcomes` and deliberately kept out of
+    the model's error budget.
     """
     outcomes = count_outcomes(records)
     return outcomes.ok, outcomes.model_error, outcomes.shed
@@ -463,11 +689,18 @@ TRUNCATION_EVIDENCE_ISSUE = "truncated before collecting enough evidence"
 #: Why a cell's evidence was thrown away. Each one is a separate rule with a separate
 #: test, because a void rule that silently stops firing does not fail anything - it just
 #: lets a polluted cell into the fit, and theta moves without anyone seeing why.
-VOID_SHED = "gateway shed"
+VOID_SHED = "gateway admission overflow"
 VOID_DISPATCH_DELAY = "client dispatch delay"
 VOID_MODEL_ERRORS = "model error rate"
+VOID_PROXY_TRANSIENT = "transient proxy error rate"
 VOID_PENDING_OVERFLOW = "envoy pending overflow"
-VOID_REASONS = (VOID_SHED, VOID_DISPATCH_DELAY, VOID_MODEL_ERRORS, VOID_PENDING_OVERFLOW)
+VOID_REASONS = (
+    VOID_SHED,
+    VOID_DISPATCH_DELAY,
+    VOID_MODEL_ERRORS,
+    VOID_PROXY_TRANSIENT,
+    VOID_PENDING_OVERFLOW,
+)
 
 
 @dataclass(frozen=True)
@@ -509,6 +742,22 @@ class CellGuard:
     routing: Optional[dict] = None
     #: Requests the client abandoned at its own deadline. Recorded, never budgeted.
     client_timeouts: int = 0
+    #: Requests a proxy dropped without refusing them at the admission ceiling: a
+    #: connection carrying the request died. Counted apart from ``proxy_errors`` because
+    #: the two say opposite things about whether the cell offered the load it was asked
+    #: to - an overflow means it could not, a transient error means it did.
+    proxy_transient_errors: int = 0
+    #: ``{reason: count}`` over every proxy-attributed failure, in Envoy's own wording.
+    #: The evidence each classification was made on, kept so it can be re-judged.
+    proxy_failure_reasons: Optional[dict] = None
+    #: Proxy failures whose wording matched no rule, and which were therefore counted as
+    #: transient. Surfaced rather than absorbed: a non-zero value here says the split
+    #: rested on a fallback and the vocabulary needs extending.
+    unrecognised_proxy_failures: int = 0
+    #: Set when the client's account of admission overflow and Envoy's own counter
+    #: disagree. Evidence about whether the classification can be believed at all; never
+    #: a void reason by itself, because a missing cluster filter produces it too.
+    sentinel_contradiction: Optional[str] = None
     #: What this cell does about a shed; see :data:`SHED_POLICIES`.
     shed_policy: str = DEFAULT_SHED_POLICY
     #: :func:`count_outcomes` for this cell, as a dict.
@@ -535,7 +784,7 @@ class CellGuard:
 
     @property
     def errors(self) -> int:
-        return self.model_errors + self.proxy_errors
+        return self.model_errors + self.proxy_errors + self.proxy_transient_errors
 
     @property
     def error_rate(self) -> float:
@@ -549,6 +798,10 @@ class CellGuard:
     def proxy_error_rate(self) -> float:
         return 0.0 if self.sent == 0 else self.proxy_errors / self.sent
 
+    @property
+    def proxy_transient_rate(self) -> float:
+        return 0.0 if self.sent == 0 else self.proxy_transient_errors / self.sent
+
     def as_dict(self) -> dict:
         return {
             "cell_id": self.cell_id,
@@ -557,8 +810,13 @@ class CellGuard:
             "completed": self.completed,
             "model_errors": self.model_errors,
             "proxy_errors": self.proxy_errors,
+            "proxy_transient_errors": self.proxy_transient_errors,
             "model_error_rate": round(self.model_error_rate, 6),
             "proxy_error_rate": round(self.proxy_error_rate, 6),
+            "proxy_transient_rate": round(self.proxy_transient_rate, 6),
+            "proxy_failure_reasons": self.proxy_failure_reasons,
+            "unrecognised_proxy_failures": self.unrecognised_proxy_failures,
+            "sentinel_contradiction": self.sentinel_contradiction,
             "p99_delay_ms": round(self.p99_delay_ms, 3),
             "p99_pool_wait_ms": round(self.p99_pool_wait_ms, 3),
             "p99_body_build_ms": round(self.p99_body_build_ms, 3),
@@ -630,6 +888,8 @@ def check_cell(
     max_p99_delay_ms: float = DEFAULT_MAX_P99_DELAY_MS,
     max_p99_pool_wait_ms: float = DEFAULT_MAX_P99_POOL_WAIT_MS,
     max_model_error_rate: float = DEFAULT_MAX_MODEL_ERROR_RATE,
+    max_proxy_transient_rate: float = DEFAULT_MAX_PROXY_TRANSIENT_RATE,
+    proxy_transient_allowance: int = DEFAULT_PROXY_TRANSIENT_ALLOWANCE,
     truncated: bool = False,
     truncated_at_offset_s: Optional[float] = None,
     truncated_at_ts_ms: Optional[int] = None,
@@ -652,9 +912,15 @@ def check_cell(
 
     * a **model error** is the engine failing under load. The window it lands in is a
       violation and is kept; past ``max_model_error_rate`` of the cell, the cell is void.
-    * a **gateway shed** means the load never reached the engine. Under
+    * an **admission overflow** means the load never reached the engine. Under
       ``SHED_POLICY_TRUNCATE`` the cell is cut short and its earlier windows are kept;
       under ``SHED_POLICY_VOID`` the whole cell is void.
+    * a **transient proxy error** is one request a connection failure dropped. It says
+      nothing about the admission ceiling, so it follows the model-error rule instead:
+      the window it lands in is a violation and is kept, and only past
+      ``max_proxy_transient_rate`` (and more than ``proxy_transient_allowance``
+      requests) is the cell void. Voiding on the first one is what made a 450 s cell
+      with 1 bad request in 1296 write zero rows.
     * a **client timeout** is the driver's own deadline. Counted on its own and budgeted
       against nothing.
     * an **on-wire delay** above ``max_p99_delay_ms`` means the schedule was not
@@ -673,6 +939,9 @@ def check_cell(
     sent = len(records)
     outcomes = count_outcomes(records)
     served, model_errors, proxy_errors = outcomes.ok, outcomes.model_error, outcomes.shed
+    proxy_transient_errors = outcomes.proxy_transient
+    proxy_reasons = proxy_reason_histogram(records)
+    unrecognised = count_unrecognised_proxy_failures(records)
     pool_waits = [float(r.get("pool_wait_ms", 0.0) or 0.0) for r in records]
     p99_pool_wait_ms = _p99(pool_waits)
     p99_body_build_ms = _p99([float(r.get("body_build_ms", 0.0) or 0.0) for r in records])
@@ -701,6 +970,18 @@ def check_cell(
             f"({model_errors}/{sent}); these reached vLLM and failed there"
         )
         void_reasons.append(VOID_MODEL_ERRORS)
+    transient_budget = max(
+        float(proxy_transient_allowance), float(max_proxy_transient_rate) * sent
+    )
+    if sent > 0 and proxy_transient_errors > transient_budget:
+        issues.append(
+            f"{VOID_PROXY_TRANSIENT} {proxy_transient_errors / sent:.2%} > "
+            f"{max_proxy_transient_rate:.2%} ({proxy_transient_errors}/{sent}, allowance "
+            f"{int(proxy_transient_allowance)}); these were dropped by the proxy without "
+            "reaching the admission ceiling, so the path itself was unhealthy for this "
+            f"cell. Reasons seen: {json.dumps(proxy_reasons, sort_keys=True)}"
+        )
+        void_reasons.append(VOID_PROXY_TRANSIENT)
     if shed_policy == SHED_POLICY_VOID and proxy_errors > 0:
         issues.append(
             f"{VOID_SHED}: {proxy_errors}/{sent} request(s) were refused at the Envoy "
@@ -718,6 +999,26 @@ def check_cell(
             "under-delivered and this is not an open loop)"
         )
         void_reasons.append(VOID_DISPATCH_DELAY)
+    sentinel_contradiction = None
+    if pending_overflow_delta is not None:
+        # Cross-check. Envoy's own counter is the authority on whether an admission
+        # overflow happened at all; the client only ever sees a consequence of one. When
+        # the two disagree the classification is not trustworthy for this cell, and that
+        # has to be on the record whichever way it points. It is not a void reason:
+        # a cluster filter that names no live cluster produces the same disagreement.
+        delta_count = int(pending_overflow_delta)
+        if proxy_errors > 0 and delta_count == 0:
+            sentinel_contradiction = (
+                f"{proxy_errors} request(s) were classified as admission overflow but "
+                "Envoy's upstream_rq_pending_overflow did not move; either the "
+                "classification is wrong or the sentinel is reading the wrong cluster"
+            )
+        elif delta_count > 0 and proxy_errors == 0:
+            sentinel_contradiction = (
+                f"Envoy's upstream_rq_pending_overflow rose by {delta_count} but no "
+                "request was classified as admission overflow; the proxy refused work "
+                "this cell never saw attributed to it"
+            )
     if pending_overflow_delta is not None and int(pending_overflow_delta) > 0:
         issues.append(
             f"{VOID_PENDING_OVERFLOW}: Envoy's upstream_rq_pending_overflow rose by "
@@ -769,6 +1070,10 @@ def check_cell(
         min_slo_windows=int(min_slo_windows),
         routing=routing,
         client_timeouts=outcomes.client_timeout,
+        proxy_transient_errors=proxy_transient_errors,
+        proxy_failure_reasons=proxy_reasons,
+        unrecognised_proxy_failures=unrecognised,
+        sentinel_contradiction=sentinel_contradiction,
         shed_policy=shed_policy,
         outcomes=outcomes.as_dict(),
         goodput=cell_goodput,
@@ -930,28 +1235,63 @@ def windows_observing(
 PENDING_OVERFLOW_COUNTER = "upstream_rq_pending_overflow"
 
 
-def parse_envoy_counters(text: str, counter: str, *, cluster_filter: str = "") -> int:
-    """Sum one Envoy admin counter over the clusters whose name contains ``cluster_filter``.
+def parse_envoy_counters(
+    text: str, counter: str, *, cluster_filter: str = ""
+) -> Optional[int]:
+    """Sum one Envoy counter over the clusters whose name contains ``cluster_filter``.
 
-    The admin ``/stats`` body is ``<name>: <value>`` per line. Summing rather than
-    picking one line is deliberate: a model is served by one cluster today, but a name
-    change or a second listener would otherwise make the sentinel silently read zero.
+    Two exposition formats are understood, because only one of them is actually
+    reachable from where a cell runs:
+
+    * the admin ``/stats`` body, ``<name>: <value>`` per line, on the admin listener;
+    * the Prometheus body, ``envoy_cluster_<name>{labels} <value>``, which is what the
+      gateway pod exposes on its ``metrics`` container port. The admin listener binds to
+      localhost inside the container and the container has no ``curl``, so off-pod the
+      Prometheus listener is the only way in - a parser that only understood the admin
+      format would read every campaign cell as a clean zero.
+
+    Summing rather than picking one line is deliberate: a model is served by one cluster
+    today, but a name change or a second listener would otherwise make the sentinel
+    silently read zero.
+
+    Returns None when the body mentions the counter nowhere at all. That is "not
+    measured", and it must not be reported as zero: a sentinel that answers "clean" to a
+    body it cannot parse is worse than no sentinel, because it certifies the cell.
     """
     total = 0
+    seen = False
     for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
         name, sep, value = line.partition(":")
-        if not sep:
+        if sep and "{" not in name and " " not in name.strip():
+            name = name.strip()
+            if not name.endswith("." + counter) and name != counter:
+                continue
+            if cluster_filter and cluster_filter not in name:
+                continue
+            seen = True
+            try:
+                total += int(float(value.strip()))
+            except ValueError:
+                continue
             continue
-        name = name.strip()
-        if not name.endswith("." + counter) and name != counter:
+        head, _, value = line.rpartition(" ")
+        if not head:
             continue
-        if cluster_filter and cluster_filter not in name:
+        metric, _, labels = head.partition("{")
+        metric = metric.strip()
+        if not metric.endswith(counter):
             continue
+        if cluster_filter and cluster_filter not in labels and cluster_filter not in metric:
+            continue
+        seen = True
         try:
-            total += int(value.strip())
+            total += int(float(value.strip()))
         except ValueError:
             continue
-    return total
+    return total if seen else None
 
 
 @dataclass
@@ -963,9 +1303,15 @@ class PendingOverflowSentinel:
     admission policy, and a control law that reacted to it would be steering on the proxy
     rather than on the model.
 
-    ``read`` is injected (``() -> str``, the admin ``/stats`` body) so tests and dry runs
-    never touch the network. A read that fails yields ``None``, which is reported as
-    "not measured" rather than as zero - an unread sentinel must not look like a clean one.
+    It is also the cross-check on the client-side classification: the counter is
+    Envoy's own statement that it refused work, so it decides whether an
+    :data:`FAILURE_ADMISSION_OVERFLOW` the client thinks it saw really happened.
+    :func:`check_cell` records any disagreement between the two in the cell artifact.
+
+    ``read`` is injected (``() -> str``, a ``/stats`` or ``/stats/prometheus`` body) so
+    tests and dry runs never touch the network. A read that fails, or a body that does
+    not mention the counter at all, yields ``None``, which is reported as "not measured"
+    rather than as zero - an unread sentinel must not look like a clean one.
     """
 
     read: Callable[[], str]
@@ -995,7 +1341,15 @@ class PendingOverflowSentinel:
 
 
 def make_envoy_stats_reader(url: str, *, fetch: Callable[[str], str] = _default_fetch) -> Callable[[], str]:
-    """``() -> /stats body`` for an Envoy admin endpoint."""
+    """``() -> stats body`` for an Envoy stats endpoint.
+
+    Measured on 2026-09-21 against the deployed gateways: the admin listener (``:19000``)
+    is bound inside the container and is not reachable from the node, and the envoy
+    container has no ``curl`` to reach it from within. What IS reachable from the node is
+    the pod's ``metrics`` container port, ``http://<pod-ip>:19001/stats/prometheus``
+    (``/stats`` there is a 404). That URL is what ``--envoy-stats-url`` should be given;
+    :func:`parse_envoy_counters` reads both formats.
+    """
 
     def read() -> str:
         return fetch(url)
@@ -1006,10 +1360,13 @@ def make_envoy_stats_reader(url: str, *, fetch: Callable[[str], str] = _default_
 # ------------------------------------------------------------- model-error windowing
 
 
-def mark_model_error_windows(
+def mark_unserved_request_windows(
     rows: Sequence[dict], records: Sequence[dict]
 ) -> list[dict]:
-    """Label every window that contains a model error as an SLO violation, and keep it.
+    """Label every window holding a request that went unserved as an SLO violation, and
+    keep the window.
+
+    Two classes qualify, counted separately in the row and for the same reason.
 
     A request the engine failed is evidence about the engine at that operating point -
     arguably the strongest evidence a window can carry - so dropping those windows would
@@ -1018,30 +1375,47 @@ def mark_model_error_windows(
     which is what happens if nothing marks it: a window whose slowest requests all
     errored out can otherwise show a comfortable p95.
 
+    A request a transient proxy failure dropped is not evidence about the engine, but it
+    is still a request the system did not serve, and goodput counts it as a loss. Marking
+    its window keeps the window's verdict and the cell's goodput saying the same thing;
+    it is counted in its own column so it is never mistaken for an engine fault.
+
+    An admission overflow is in neither: it is handled by the shed policy, which either
+    truncates the cell or voids it outright.
+
     A request is attributed to a window by its send time, because that is the operating
     point that produced the failure; a failed request often has no completion time at all.
     """
-    errors: list[int] = []
-    for record in records:
-        if classify_failure(record) != FAILURE_MODEL:
-            continue
-        ts = record.get("actual_send_ts_ms", record.get("send_ts_ms"))
-        if ts is not None:
-            errors.append(int(ts))
+    def send_times(wanted: str) -> list[int]:
+        out: list[int] = []
+        for record in records:
+            if classify_failure(record) != wanted:
+                continue
+            ts = record.get("actual_send_ts_ms", record.get("send_ts_ms"))
+            if ts is not None:
+                out.append(int(ts))
+        return out
+
+    model_errors = send_times(FAILURE_MODEL)
+    transient = send_times(FAILURE_PROXY_TRANSIENT)
     marked: list[dict] = []
     for row in rows:
         out = dict(row)
         start = int(row["window_start_ms"])
         end = int(row["window_end_ms"])
-        count = sum(1 for ts in errors if start <= ts < end)
+        count = sum(1 for ts in model_errors if start <= ts < end)
+        transient_count = sum(1 for ts in transient if start <= ts < end)
         out["model_errors"] = count
-        out["slo_violated"] = bool(row.get("slo_violated")) or count > 0
+        out["proxy_transient_errors"] = transient_count
+        out["slo_violated"] = (
+            bool(row.get("slo_violated")) or count > 0 or transient_count > 0
+        )
         marked.append(out)
     return marked
 
 
 class TruncateOnProxyShed:
-    """Sender wrapper that cuts a cell short at the first gateway shed.
+    """Sender wrapper that cuts a cell short at the first *admission overflow*.
 
     Once the circuit breaker rejects, offered load is above what the gateway will admit,
     so every subsequent request measures the admission policy rather than the engine -
@@ -1052,19 +1426,40 @@ class TruncateOnProxyShed:
     tail is captured. A primitive with no drain segment (``drain_start_s`` None) simply
     stops sending.
 
+    A transient proxy error does NOT trigger this. It is one request a connection
+    failure dropped; the gateway went on admitting everything after it, so there is
+    nothing about the rest of the cell that stops measuring the engine.
+
+    Why truncate at all when the policy is :data:`SHED_POLICY_VOID` and the cell is going
+    to be re-run whatever it collected? Because under ``void`` truncation is no longer
+    evidence preservation - it is an early exit, and it earns its keep for two reasons
+    that have nothing to do with the fit: it stops the driver hammering a gateway that is
+    already refusing, and it lets the inter-cell cooldown start against a quiet fleet
+    instead of handing the next cell an inherited backlog. The drain segment is the part
+    whose only purpose is evidence, so under ``void`` it is skipped (``keep_drain``
+    False) and the cell simply stops sending - which is also the several minutes of wall
+    clock a re-run has to pay for.
+
     The scan over the wrapped sender's records is safe without a lock: every wrapper
     coroutine runs on one asyncio loop and only yields at its own await, so no record can
     be appended between the await returning and the scan finishing.
     """
 
-    def __init__(self, sender, *, drain_start_s: Optional[float] = None) -> None:
+    def __init__(
+        self,
+        sender,
+        *,
+        drain_start_s: Optional[float] = None,
+        keep_drain: bool = True,
+    ) -> None:
         self._sender = sender
-        self._drain_start_s = drain_start_s
+        self.keep_drain = bool(keep_drain)
+        self._drain_start_s = drain_start_s if self.keep_drain else None
         self._cursor = 0
         self.truncated = False
         self.truncated_at_offset_s: Optional[float] = None
         self.truncated_at_ts_ms: Optional[int] = None
-        self.first_proxy_record: Optional[dict] = None
+        self.first_overflow_record: Optional[dict] = None
         self.censored = 0
 
     @property
@@ -1085,11 +1480,11 @@ class TruncateOnProxyShed:
         records = self._sender.records
         while self._cursor < len(records):
             record = records[self._cursor]
-            if classify_failure(record) == FAILURE_PROXY:
+            if classify_failure(record) == FAILURE_ADMISSION_OVERFLOW:
                 self.truncated = True
                 self.truncated_at_offset_s = offset_s
                 self.truncated_at_ts_ms = record.get("actual_send_ts_ms")
-                self.first_proxy_record = record
+                self.first_overflow_record = record
                 return
             self._cursor += 1
 
@@ -1168,9 +1563,11 @@ def drive_cell_schedule(
     lays a 2 s spike on top of its base rate and how the mixture shape runs four parallel
     token-shape streams.
 
-    With ``truncate_on_proxy_shed`` the first gateway shed cuts the cell short and it
-    jumps to ``drain_start_s``; see :class:`TruncateOnProxyShed`. Classified failures are
-    written verbatim to ``failures_path`` so a later reader can re-judge the attribution.
+    With ``truncate_on_proxy_shed`` the first *admission overflow* cuts the cell short
+    and it jumps to ``drain_start_s`` - except under ``SHED_POLICY_VOID``, where the
+    drain is skipped because the cell is void anyway; see :class:`TruncateOnProxyShed`.
+    A transient proxy error never truncates. Classified failures are written verbatim to
+    ``failures_path`` so a later reader can re-judge the attribution.
 
     ``prompt_mode`` None means "whatever the sender defaults to"
     (:data:`tre_replayer.engine.prompts.DEFAULT_MODE`), so the default lives in exactly
@@ -1229,8 +1626,16 @@ def drive_cell_schedule(
     if instant_sampler is not None:
         sidecar = _Sidecar(sampler=instant_sampler, interval_s=instant_interval_s, now_ms=now_ms)
 
+    # Under SHED_POLICY_VOID the cell will be re-run whatever it collects, so the drain
+    # segment - whose only job is to capture a recovery tail as evidence - is dead time.
+    # Truncation itself is kept: see TruncateOnProxyShed.
+    shed_policy = (guard_kwargs or {}).get("shed_policy", DEFAULT_SHED_POLICY)
     truncator = (
-        TruncateOnProxyShed(sender, drain_start_s=drain_start_s)
+        TruncateOnProxyShed(
+            sender,
+            drain_start_s=drain_start_s,
+            keep_drain=shed_policy != SHED_POLICY_VOID,
+        )
         if truncate_on_proxy_shed
         else None
     )

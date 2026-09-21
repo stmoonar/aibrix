@@ -293,7 +293,7 @@ MEASURED_SHED = {
 
 
 def test_classifier_attributes_the_measured_shed_to_the_proxy() -> None:
-    assert openloop.classify_failure(MEASURED_SHED) == openloop.FAILURE_PROXY
+    assert openloop.classify_failure(MEASURED_SHED) == openloop.FAILURE_ADMISSION_OVERFLOW
 
 
 def test_classifier_attributes_an_engine_json_error_to_the_model() -> None:
@@ -321,7 +321,7 @@ def test_classifier_attributes_an_unknown_failure_to_the_model() -> None:
 
 def test_classifier_honours_an_explicit_envoy_marker_header() -> None:
     record = {"http_status": 429, "e2e_ms": 1.0, "error_headers": {"x-envoy-overloaded": "true"}}
-    assert openloop.classify_failure(record) == openloop.FAILURE_PROXY
+    assert openloop.classify_failure(record) == openloop.FAILURE_ADMISSION_OVERFLOW
 
 
 def test_served_request_is_not_a_failure() -> None:
@@ -457,7 +457,9 @@ def test_no_truncation_when_every_request_is_served() -> None:
 
 def test_failure_signature_keeps_the_body_verbatim() -> None:
     signature = openloop.failure_signature(MEASURED_SHED)
-    assert signature["failure_class"] == openloop.FAILURE_PROXY
+    assert signature["failure_class"] == openloop.FAILURE_ADMISSION_OVERFLOW
+    # The wording the split was decided on travels with the evidence.
+    assert signature["proxy_reason"] == "overflow"
     assert signature["error_body"] == MEASURED_SHED["error_body"]
     assert signature["error_headers"]["content-type"] == "text/plain"
 
@@ -679,16 +681,17 @@ def test_a_window_holding_a_model_error_is_marked_violating_and_kept() -> None:
         {"window_start_ms": 1000, "window_end_ms": 2000, "p95_ttft": 50.0},
     ]
     records = [_model_error(actual_send_ts_ms=1500), _served(actual_send_ts_ms=10)]
-    marked = openloop.mark_model_error_windows(rows, records)
+    marked = openloop.mark_unserved_request_windows(rows, records)
     assert len(marked) == 2  # kept, not dropped
     assert marked[0]["model_errors"] == 0 and marked[0]["slo_violated"] is False
     assert marked[1]["model_errors"] == 1 and marked[1]["slo_violated"] is True
 
 
-def test_a_shed_does_not_mark_a_window_violating() -> None:
-    # It never reached the engine, so it says nothing about the engine's health.
+def test_an_admission_overflow_does_not_mark_a_window_violating() -> None:
+    # It never reached the engine, so it says nothing about the engine's health - and
+    # the shed policy has already decided what happens to the cell as a whole.
     rows = [{"window_start_ms": 0, "window_end_ms": 1000, "p95_ttft": 50.0}]
-    marked = openloop.mark_model_error_windows(rows, [_shed(actual_send_ts_ms=500)])
+    marked = openloop.mark_unserved_request_windows(rows, [_shed(actual_send_ts_ms=500)])
     assert marked[0]["model_errors"] == 0 and marked[0]["slo_violated"] is False
 
 
@@ -950,3 +953,301 @@ def test_achieved_offsets_are_read_off_the_schedule_grid() -> None:
         {"on_wire_delay_ms": 10.0},  # pre-dates the field: skipped, never guessed
     ]
     assert openloop.achieved_arrival_offsets(records) == [4.25, 4.5]
+
+
+# ============================== admission overflow vs transient proxy error
+#
+# Two different things the gateway does, which used to be one class. Each rule gets its
+# own test, because collapsing them again fails nothing visibly: it just voids cells that
+# offered exactly the load they were asked to, and a campaign then writes zero rows and
+# still prints "complete".
+
+#: The verbatim failure that voided a real calibration cell on 2026-09-21 - 1 request out
+#: of 1296 in a 450 s dsqwen-7b steps cell. ``in_flight_at_send`` is 43, under a circuit
+#: breaker admitting 4096 parallel / 1024 pending, so the breaker cannot arithmetically
+#: have produced it; and the reset reason says the same thing in Envoy's own words.
+MEASURED_CONNECTION_TERMINATION = {
+    "request_id": "dsqwen-7b-001295",
+    "http_status": 503,
+    "error_body": (
+        "upstream connect error or disconnect/reset before headers. "
+        "reset reason: connection termination"
+    ),
+    "error_headers": {
+        "content-length": "95",
+        "content-type": "text/plain",
+        "connection": "close",
+    },
+    "e2e_ms": 2.92,
+    "in_flight_at_send": 43,
+    "actual_send_ts_ms": 1_000,
+    "ttft_ms": None,
+    "tpot_ms": None,
+}
+
+
+def _terminated(**over):
+    record = dict(MEASURED_CONNECTION_TERMINATION)
+    record.update(over)
+    return record
+
+
+def test_the_measured_connection_termination_is_not_an_admission_decision() -> None:
+    assert (
+        openloop.classify_failure(MEASURED_CONNECTION_TERMINATION)
+        == openloop.FAILURE_PROXY_TRANSIENT
+    )
+    assert (
+        openloop.proxy_failure_reason(MEASURED_CONNECTION_TERMINATION)
+        == "connection termination"
+    )
+    # Same sentence in front, opposite meaning behind it: the prefix cannot be the test.
+    assert openloop.classify_failure(MEASURED_SHED) == openloop.FAILURE_ADMISSION_OVERFLOW
+    assert openloop.proxy_failure_reason(MEASURED_SHED) == "overflow"
+
+
+def test_one_connection_termination_does_not_void_a_calibration_cell() -> None:
+    # The cell this is taken from: 1296 requests, 1 of them this one, and 450 s of
+    # offered load thrown away for it.
+    records = [_served() for _ in range(1295)] + [_terminated()]
+    guard = openloop.check_cell(
+        "i256_o128_c95", scheduled=1296, records=records, p99_delay_ms=1.0,
+        shed_policy=openloop.SHED_POLICY_VOID,
+    )
+    assert not guard.voided
+    assert guard.proxy_transient_errors == 1 and guard.proxy_errors == 0
+    assert guard.outcomes["proxy_transient"] == 1 and guard.outcomes["shed"] == 0
+    # ... and it is still counted against what the cell delivered, not forgiven.
+    assert guard.outcomes["admitted"] == 1296 and guard.outcomes["ok"] == 1295
+
+
+def test_one_admission_overflow_still_voids_a_calibration_cell() -> None:
+    records = [_served() for _ in range(1295)] + [_shed()]
+    guard = openloop.check_cell(
+        "i256_o128_c95", scheduled=1296, records=records, p99_delay_ms=1.0,
+        shed_policy=openloop.SHED_POLICY_VOID,
+    )
+    assert guard.voided and openloop.VOID_SHED in guard.void_reasons
+    assert guard.proxy_errors == 1 and guard.proxy_transient_errors == 0
+
+
+def test_transient_proxy_errors_past_their_budget_void_the_cell() -> None:
+    # 1 % of the cell, twice the 0.5 % budget: the path itself was unhealthy and the
+    # windows measured a system that was dropping connections.
+    records = [_served() for _ in range(990)] + [_terminated() for _ in range(10)]
+    guard = openloop.check_cell(
+        "c", scheduled=1000, records=records, p99_delay_ms=1.0,
+        shed_policy=openloop.SHED_POLICY_VOID,
+    )
+    assert guard.voided and openloop.VOID_PROXY_TRANSIENT in guard.void_reasons
+    # and it is a reason of its own, never folded into the admission-overflow one
+    assert openloop.VOID_SHED not in guard.void_reasons
+
+
+def test_a_cell_is_never_voided_on_a_single_transient_error_however_small_it_is() -> None:
+    # 1/150 is 0.67 %, above the rate - but one dropped connection is not a rate, and a
+    # 60 s boundary probe must not void on it.
+    records = [_served() for _ in range(149)] + [_terminated()]
+    guard = openloop.check_cell(
+        "c", scheduled=150, records=records, p99_delay_ms=1.0,
+        shed_policy=openloop.SHED_POLICY_VOID,
+    )
+    assert not guard.voided
+    # Two of them in the same small cell is a rate, and does void it.
+    records = [_served() for _ in range(148)] + [_terminated(), _terminated()]
+    guard = openloop.check_cell(
+        "c", scheduled=150, records=records, p99_delay_ms=1.0,
+        shed_policy=openloop.SHED_POLICY_VOID,
+    )
+    assert guard.voided and openloop.VOID_PROXY_TRANSIENT in guard.void_reasons
+
+
+def test_an_unknown_proxy_wording_is_counted_as_transient_and_stays_visible() -> None:
+    # A wording nobody has a rule for must not void the cell - one phrasing change in
+    # Envoy would otherwise void every cell of a campaign - but it must not disappear
+    # either, or the split would quietly stop being made on evidence.
+    unknown = _served(
+        http_status=503, e2e_ms=4.0, ttft_ms=None, tpot_ms=None,
+        error_body="upstream connect error or disconnect/reset before headers. "
+                   "reset reason: something nobody has seen",
+        error_headers={"content-type": "text/plain"},
+    )
+    assert openloop.classify_failure(unknown) == openloop.FAILURE_PROXY_TRANSIENT
+    guard = openloop.check_cell(
+        "c", scheduled=100, records=[_served() for _ in range(99)] + [unknown],
+        p99_delay_ms=1.0, shed_policy=openloop.SHED_POLICY_VOID,
+    )
+    assert not guard.voided
+    assert guard.unrecognised_proxy_failures == 1
+    assert guard.proxy_failure_reasons == {"something nobody has seen": 1}
+
+
+def test_a_proxy_rejection_with_no_body_is_transient_and_flagged_unrecognised() -> None:
+    # The connection went away before a body could be read, so there is no evidence
+    # either way. That is the conservative side, and it is reported as a fallback.
+    headless = _served(
+        http_status=503, e2e_ms=1.0, ttft_ms=None, tpot_ms=None,
+        error_body="", error_headers={},
+    )
+    assert openloop.classify_failure(headless) == openloop.FAILURE_PROXY_TRANSIENT
+    guard = openloop.check_cell(
+        "c", scheduled=10, records=[_served() for _ in range(9)] + [headless],
+        p99_delay_ms=1.0, shed_policy=openloop.SHED_POLICY_VOID,
+    )
+    assert not guard.voided and guard.unrecognised_proxy_failures == 1
+    assert guard.proxy_failure_reasons == {openloop.PROXY_REASON_EMPTY_BODY: 1}
+
+
+def test_an_envoy_overload_header_is_read_as_an_admission_decision() -> None:
+    # The one case where Envoy says "I shed this because of load" without a reset reason.
+    record = _served(
+        http_status=429, e2e_ms=1.0, ttft_ms=None, tpot_ms=None,
+        error_headers={"x-envoy-overloaded": "true"}, error_body="",
+    )
+    assert openloop.classify_failure(record) == openloop.FAILURE_ADMISSION_OVERFLOW
+
+
+def test_a_transient_error_is_a_goodput_loss_but_not_a_rejection() -> None:
+    records = [_served()] * 8 + [_terminated()] + [_shed()]
+    result = openloop.goodput(records, ttft_slo_ms=500.0, tpot_slo_ms=75.0)
+    # admitted excludes only the shed: nothing refused the terminated request.
+    assert result.offered == 10 and result.admitted == 9 and result.good == 8
+
+
+# ------------------------------------------------------- window marking
+
+
+def test_a_window_holding_a_transient_proxy_error_is_marked_violating_and_kept() -> None:
+    # The request went unserved, so the window is a loss; but it is counted in its own
+    # column, because it is not evidence that the ENGINE failed.
+    rows = [
+        {"window_start_ms": 0, "window_end_ms": 1000, "p95_ttft": 50.0},
+        {"window_start_ms": 1000, "window_end_ms": 2000, "p95_ttft": 50.0},
+    ]
+    marked = openloop.mark_unserved_request_windows(
+        rows, [_terminated(actual_send_ts_ms=1500)]
+    )
+    assert [r["slo_violated"] for r in marked] == [False, True]
+    assert [r["proxy_transient_errors"] for r in marked] == [0, 1]
+    assert [r["model_errors"] for r in marked] == [0, 0]
+
+
+# ------------------------------------------------------- truncation
+
+
+class _SenderFailingWith:
+    """Fake sender that answers with ``failure`` from request ``after`` onwards."""
+
+    def __init__(self, failure: dict, *, after: int) -> None:
+        self.records: list = []
+        self._failure = failure
+        self._after = after
+        self.sent = 0
+
+    async def __call__(self, request, scheduled_ts, actual_ts) -> None:
+        self.sent += 1
+        if self.sent > self._after:
+            self.records.append(dict(self._failure, request_id=request.request_id))
+        else:
+            self.records.append(_record(request_id=request.request_id))
+
+
+def test_a_transient_proxy_error_does_not_truncate_the_cell() -> None:
+    # The gateway went on admitting everything after it, so the rest of the cell is
+    # still measuring the engine and there is nothing to cut short.
+    sender = _SenderFailingWith(MEASURED_CONNECTION_TERMINATION, after=2)
+    wrapper = openloop.TruncateOnProxyShed(sender, drain_start_s=100.0)
+    _drive(wrapper, [0.0, 10.0, 20.0, 30.0, 40.0])
+
+    assert not wrapper.truncated
+    assert wrapper.censored == 0
+    assert len(sender.records) == 5
+
+
+def test_the_void_policy_skips_the_drain_because_its_only_purpose_is_evidence() -> None:
+    # Under void the cell is re-run whatever it collected, so replaying the drain buys
+    # no evidence and costs wall clock the re-run needs. Truncation itself stays: it
+    # stops hammering a gateway that is already refusing.
+    sender = _SenderFailingWith(MEASURED_SHED, after=2)
+    wrapper = openloop.TruncateOnProxyShed(sender, drain_start_s=100.0, keep_drain=False)
+    _drive(wrapper, [0.0, 10.0, 20.0, 30.0, 40.0, 100.0, 110.0])
+
+    assert wrapper.truncated and not wrapper.keep_drain
+    assert wrapper.censored == 4
+    assert [r["request_id"] for r in sender.records] == ["r0", "r1", "r2"]
+
+
+# ------------------------------------------------------- the sentinel as cross-check
+
+#: What the node can actually reach: the gateway pod's metrics port. Measured
+#: 2026-09-21 - the admin listener on :19000 refuses from off-pod and the envoy container
+#: has no curl, so this Prometheus body is the only form the sentinel will ever see live.
+ENVOY_PROMETHEUS_STATS = """
+# TYPE envoy_cluster_upstream_rq_pending_overflow counter
+envoy_cluster_upstream_rq_pending_overflow{envoy_cluster_name="httproute/tre-v2/dsqwen-7b-router/rule/0"} 80
+envoy_cluster_upstream_rq_pending_overflow{envoy_cluster_name="httproute/tre-v2/dsqwen-14b-router/rule/0"} 0
+envoy_cluster_upstream_rq_total{envoy_cluster_name="httproute/tre-v2/dsqwen-7b-router/rule/0"} 99999
+"""
+
+
+def test_the_sentinel_reads_the_listener_the_node_can_actually_reach() -> None:
+    assert openloop.parse_envoy_counters(
+        ENVOY_PROMETHEUS_STATS, openloop.PENDING_OVERFLOW_COUNTER
+    ) == 80
+    assert openloop.parse_envoy_counters(
+        ENVOY_PROMETHEUS_STATS, openloop.PENDING_OVERFLOW_COUNTER,
+        cluster_filter="dsqwen-14b",
+    ) == 0
+
+
+def test_a_stats_body_without_the_counter_is_not_measured_rather_than_clean() -> None:
+    # The failure this closes: the admin-format parser fed a Prometheus body summed
+    # nothing and returned 0, and the sentinel then certified every cell of a campaign.
+    assert openloop.parse_envoy_counters(
+        "envoy_cluster_upstream_rq_total{envoy_cluster_name=\"x\"} 5",
+        openloop.PENDING_OVERFLOW_COUNTER,
+    ) is None
+    sentinel = openloop.PendingOverflowSentinel(
+        read=lambda: "envoy_cluster_upstream_rq_total{envoy_cluster_name=\"x\"} 5"
+    )
+    assert sentinel.start() is None
+    assert sentinel.delta() is None
+
+
+def test_the_sentinel_contradicting_the_client_is_recorded_both_ways() -> None:
+    # The client saw an overflow Envoy's own counter never accounted for.
+    guard = openloop.check_cell(
+        "c", scheduled=10, records=[_served()] * 9 + [_shed()], p99_delay_ms=1.0,
+        pending_overflow_delta=0, shed_policy=openloop.SHED_POLICY_VOID,
+    )
+    assert guard.sentinel_contradiction
+    assert "did not move" in guard.sentinel_contradiction
+
+    # ... and the other way: Envoy refused work no request was attributed to.
+    guard = openloop.check_cell(
+        "c", scheduled=10, records=[_served()] * 10, p99_delay_ms=1.0,
+        pending_overflow_delta=3,
+    )
+    assert guard.sentinel_contradiction and "rose by 3" in guard.sentinel_contradiction
+
+
+def test_the_sentinel_agreeing_with_the_client_records_no_contradiction() -> None:
+    guard = openloop.check_cell(
+        "c", scheduled=10, records=[_served()] * 9 + [_shed()], p99_delay_ms=1.0,
+        pending_overflow_delta=1, shed_policy=openloop.SHED_POLICY_VOID,
+    )
+    assert guard.sentinel_contradiction is None
+    guard = openloop.check_cell(
+        "c", scheduled=10, records=[_served()] * 10, p99_delay_ms=1.0,
+        pending_overflow_delta=0,
+    )
+    assert guard.sentinel_contradiction is None
+
+
+def test_an_unmeasured_sentinel_claims_no_contradiction_either() -> None:
+    # "Not measured" must not read as "Envoy says this never happened".
+    guard = openloop.check_cell(
+        "c", scheduled=10, records=[_served()] * 9 + [_shed()], p99_delay_ms=1.0,
+        pending_overflow_delta=None, shed_policy=openloop.SHED_POLICY_VOID,
+    )
+    assert guard.sentinel_contradiction is None
