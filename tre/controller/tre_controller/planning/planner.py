@@ -7,7 +7,17 @@ from typing import Any, Literal, Mapping
 from tre_common.registry import ClusterTopology
 from tre_controller.planning.classify import ModelClassification, ModelRole, ModelState, donor_mock_cost_key
 from tre_controller.planning.util_scale_down import UtilWindow, util_scale_down_ready
-from tre_sm.allocator.slots import Binding, Slot, SlotAllocator, natural_key
+from tre_common.gpu_placement import plan_placements
+from tre_sm.allocator.slots import (
+    Binding,
+    Slot,
+    SlotAllocator,
+    gpu_slot_candidates,
+    is_buddy_aligned,
+    natural_key,
+    node_gpu_counts,
+    slot_block,
+)
 
 SourceLoop = Literal["rescue", "fairness", "safescale"]
 IncompletePolicy = Literal["drop_model", "drop_all"]
@@ -715,6 +725,7 @@ class _SlotOccupancy:
 
     def __init__(self, cluster_view: ClusterView) -> None:
         self._topology = cluster_view.topology
+        self._nodes = node_gpu_counts(cluster_view.topology)
         self._planned_wakes: set[str] = set()
         self._bindings = tuple(cluster_view.bindings)
         self._awake: dict[tuple[str, int], Binding] = {}
@@ -738,12 +749,53 @@ class _SlotOccupancy:
             key=lambda binding: natural_key(binding.serve_id),
         )
 
+    def occupied(self) -> set[tuple[str, int]]:
+        """Every GPU an awake binding holds or a planned wake has claimed."""
+        return set(self._awake) | set(self._claimed)
+
     def wakeable(self, model: str) -> list[Binding]:
-        return [
+        """Sleeping bindings whose slot is free, least wasteful first."""
+        return self.plan_wakes(model, len(self.sleeping(model)))
+
+    def plan_wakes(self, model: str, need: int) -> list[Binding]:
+        """Up to ``need`` sleeping bindings to wake, in buddy best-fit order.
+
+        Each pick is scored against the GPUs the earlier picks take, so waking
+        three single-GPU replicas fills one pair before it breaks the next one --
+        a first-fit order would strand a tp=2 model with no aligned pair left.
+        """
+        need = max(0, need)
+        sleeping = [
             binding
             for binding in self.sleeping(model)
             if not any(gpu in self._awake or gpu in self._claimed for gpu in self._gpus(binding))
         ]
+        if need <= 0 or not sleeping:
+            return []
+        aligned = [
+            binding for binding in sleeping if is_buddy_aligned(binding.slot, self._nodes)
+        ]
+        scorable: list[Binding] = []
+        if aligned:
+            # One model has one tp_size; anything else cannot be compared with it.
+            tp_size = len(aligned[0].slot.gpu_ids)
+            scorable = [
+                binding for binding in aligned if len(binding.slot.gpu_ids) == tp_size
+            ]
+        scorable_ids = {binding.serve_id for binding in scorable}
+        ranked: list[Binding] = []
+        if scorable:
+            picks = plan_placements(
+                [slot_block(binding.slot) for binding in scorable],
+                nodes=self._nodes,
+                occupied=self.occupied(),
+                tp_size=len(scorable[0].slot.gpu_ids),
+                count=need,
+            )
+            ranked = [scorable[pick.index] for pick in picks]
+        # Slots the buddy model cannot score keep the old natural order, at the tail.
+        rest = [binding for binding in sleeping if binding.serve_id not in scorable_ids]
+        return (ranked + rest)[:need]
 
     def claim(self, binding: Binding) -> None:
         self._claimed |= self._gpus(binding)
@@ -755,17 +807,22 @@ class _SlotOccupancy:
         return any(binding.serve_id not in self._planned_wakes for binding in self.sleeping(model))
 
     def free_groups(self, tp_size: int) -> list[set[tuple[str, int]]]:
-        groups: list[set[tuple[str, int]]] = []
-        for node in self._topology.nodes:
-            if tp_size > 1:
-                candidates = [tuple(pair) for pair in node.two_gpu_slots]
-            else:
-                candidates = [(gpu,) for gpu in range(node.gpus)]
-            for candidate in candidates:
-                gpus = {(node.name, gpu) for gpu in candidate}
-                if not any(gpu in self._awake or gpu in self._claimed for gpu in gpus):
-                    groups.append(gpus)
-        return groups
+        """Free ``tp_size``-GPU slots, least wasteful first (buddy best-fit).
+
+        Ordered like :meth:`plan_wakes`, and sequentially: taking a prefix of the
+        result is the same packing a one-at-a-time loop would produce.
+        """
+        candidates = gpu_slot_candidates(self._topology, tp_size)
+        if not candidates:
+            return []
+        picks = plan_placements(
+            [slot_block(slot) for slot in candidates],
+            nodes=self._nodes,
+            occupied=self.occupied(),
+            tp_size=tp_size,
+            count=len(candidates),
+        )
+        return [set(pick.block.keys) for pick in picks]
 
     def claim_gpus(self, gpus: set[tuple[str, int]]) -> None:
         self._claimed |= gpus
@@ -806,7 +863,7 @@ def _plan_sleeping_wakes(
     need = max(0, need)
     if occupancy is None or need <= 0:
         return need, ()
-    wakeable = occupancy.wakeable(receiver)[:need]
+    wakeable = occupancy.plan_wakes(receiver, need)
     for binding in wakeable:
         occupancy.claim(binding)
     if len(wakeable) < need:

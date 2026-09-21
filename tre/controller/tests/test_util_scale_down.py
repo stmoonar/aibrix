@@ -196,7 +196,10 @@ def _run(
 def test_sustained_low_load_proposes_exactly_one_probe() -> None:
     results, hides, machine = _run([1.0] * 9, util=UtilScaleDown())
 
-    assert hides == [HideAction("m", ("m-0",), "probe_started", "fairness")]
+    # m-0/m-1/m-2 awake on gpu 0/1/2, m-3 sleeping on gpu 3: hiding m-2 is the only
+    # shrink that hands back an aligned pair (2,3) for a tp=2 model, so release order
+    # puts it first (a lexicographic order would have probed m-0 and freed nothing).
+    assert hides == [HideAction("m", ("m-2",), "probe_started", "fairness")]
     assert [i for i, r in enumerate(results) if any(e.startswith("util_scale_down_proposed:m") for e in r.events)] == [5]
     assert "util_scale_down_proposed:m:q_after=0.50" in results[5].events
     assert machine.active_probe("m").pending_upscales == {}

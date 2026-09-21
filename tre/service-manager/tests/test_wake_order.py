@@ -120,7 +120,12 @@ def test_wake_equal_node_counts_use_natural_serve_id_order():
     ]
 
 
-def test_multi_wake_rebalances_node_count_after_each_selection():
+def test_multi_wake_packs_one_pair_instead_of_spreading_over_nodes():
+    """Spreading 1+1 over two nodes splits two pairs and starves every tp=2 model.
+
+    The wake picker now shares the controller's buddy best-fit, so the second wake
+    lands on the mate of the first and node10's pair stays whole.
+    """
     node9 = "nscc-ds-4a100-node9"
     node10 = "nscc-ds-4a100-node10"
     service, store = _service(
@@ -136,14 +141,74 @@ def test_multi_wake_rebalances_node_count_after_each_selection():
 
     assert result["actions"] == [
         {"action": "wake", "serve_id": "target-node9-gpu-0"},
-        {"action": "wake", "serve_id": "target-node10-gpu-0"},
+        {"action": "wake", "serve_id": "target-node9-gpu-1"},
     ]
     awake_nodes = {
         binding.slot.node
         for binding in store.load().bindings
         if binding.model == "target" and binding.awake
     }
-    assert awake_nodes == {node9, node10}
+    assert awake_nodes == {node9}
+
+
+def test_wake_fills_a_half_used_pair_before_breaking_an_empty_one():
+    node9 = "nscc-ds-4a100-node9"
+    node10 = "nscc-ds-4a100-node10"
+    service, _store = _service(
+        [
+            _binding("other-node10-gpu-2", "other", node10, (2,), awake=True),
+            _binding("target-node9-gpu-0", "target", node9, (0,), awake=False),
+            _binding("target-node10-gpu-3", "target", node10, (3,), awake=False),
+        ]
+    )
+
+    result = service.put_model_target("target", wake_replicas=1)
+
+    # node10 gpu3's pair is already broken (split_cost 0); node9 gpu0 would cost a
+    # whole free node. A lexicographic pick would have taken node9 gpu0.
+    assert result["actions"] == [{"action": "wake", "serve_id": "target-node10-gpu-3"}]
+
+
+def test_shrink_sleeps_the_replicas_that_rebuild_an_aligned_pair():
+    node9 = "nscc-ds-4a100-node9"
+    service, store = _service(
+        [
+            # Creation order deliberately unrelated to GPU address: the old
+            # "reversed(awake)" tail order would have slept gpu2 and gpu0 and left
+            # gpu1 + gpu3 awake, i.e. no aligned pair anywhere.
+            _binding("target-b", "target", node9, (1,), awake=True),
+            _binding("target-d", "target", node9, (3,), awake=True),
+            _binding("target-a", "target", node9, (0,), awake=True),
+            _binding("target-c", "target", node9, (2,), awake=True),
+        ]
+    )
+
+    result = service.put_model_target("target", wake_replicas=2)
+
+    assert [action["serve_id"] for action in result["actions"]] == ["target-d", "target-c"]
+    awake_gpu_ids = {
+        binding.slot.gpu_ids[0]
+        for binding in store.load().bindings
+        if binding.model == "target" and binding.awake
+    }
+    assert awake_gpu_ids == {0, 1}  # gpu 2+3 free again -> a tp=2 replica fits
+
+
+def test_shrink_still_sleeps_hidden_bindings_before_serving_ones():
+    node9 = "nscc-ds-4a100-node9"
+    service, store = _service(
+        [
+            # gpu0 is the worst release by buddy value, but it is already drained.
+            _binding("target-a", "target", node9, (0,), awake=True, hidden=True),
+            _binding("target-b", "target", node9, (1,), awake=True),
+            _binding("target-c", "target", node9, (2,), awake=True),
+        ]
+    )
+
+    result = service.put_model_target("target", wake_replicas=2)
+
+    assert [action["serve_id"] for action in result["actions"]] == ["target-a"]
+    assert not any(binding.hidden for binding in store.load().bindings)
 
 def test_wake_skips_infeasible_candidate_on_least_loaded_node():
     node9 = "nscc-ds-4a100-node9"

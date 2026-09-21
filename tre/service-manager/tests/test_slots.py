@@ -172,3 +172,21 @@ def _occupied_gpus(snapshot: dict) -> list[tuple[str, int]]:
         node = binding["node"]
         occupied.extend((node, gpu) for gpu in binding["gpu_ids"])
     return occupied
+
+
+def test_find_slot_prefers_a_half_used_pair_over_splitting_a_free_node():
+    topology = ClusterTopology(
+        nodes=(
+            NodeSpec(name="node-a", gpus=4, two_gpu_slots=((0, 1), (2, 3))),
+            NodeSpec(name="node-b", gpus=4, two_gpu_slots=((0, 1), (2, 3))),
+        )
+    )
+    allocator = SlotAllocator(
+        topology, [Binding("x", "m", Slot("node-b", (2,)), awake=True)]
+    )
+
+    # node-b gpu3 costs nothing more to use; node-a gpu0 would break an untouched node.
+    assert allocator.find_slot(1) == Slot("node-b", (3,))
+    # Same reasoning one order up: node-b's pair (0,1) is the only whole pair on an
+    # already-used node, so taking it keeps node-a free for a future 4-GPU block.
+    assert allocator.find_slot(2) == Slot("node-b", (0, 1))

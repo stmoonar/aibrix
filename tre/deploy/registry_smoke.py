@@ -11,6 +11,8 @@ from sync_registry_params import DEFAULT_PROFILES_PATH
 
 def registry_warnings(registry: Registry, *, profiles: dict[str, Any] | None = None) -> list[str]:
     warnings: list[str] = []
+    for node in registry.topology().nodes:
+        _check_slot_coverage(warnings, node)
     profile_models = (profiles or {}).get("models") or {}
     for model in registry.models():
         if model.trs.theta_m == 0.0:
@@ -21,6 +23,22 @@ def registry_warnings(registry: Registry, *, profiles: dict[str, Any] | None = N
         _compare_slo(warnings, model.name, "tpot_p95_ms", model.slo.tpot_p95_ms, slo.get("tpot_p95"))
         _compare_slo(warnings, model.name, "e2e_p95_ms", model.slo.e2e_p95_ms, slo.get("e2e_p95"))
     return warnings
+
+
+def _check_slot_coverage(warnings: list[str], node: Any) -> None:
+    """Every GPU must appear in a declared pair.
+
+    Placement enumerates candidate blocks from ``two_gpu_slots``, so a GPU
+    left out of every pair is invisible to the planner: capacity silently
+    disappears instead of failing loudly.
+    """
+    covered = {gpu for pair in node.two_gpu_slots for gpu in pair}
+    missing = sorted(set(range(node.gpus)) - covered)
+    if missing:
+        warnings.append(
+            f"WARNING {node.name}.two_gpu_slots omits gpu(s) {missing}; "
+            "placement cannot use them"
+        )
 
 
 def _compare_slo(warnings: list[str], model: str, field: str, current: float, expected: object) -> None:

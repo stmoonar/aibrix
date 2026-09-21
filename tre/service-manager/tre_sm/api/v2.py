@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import re
 import json
-from collections import Counter
 from dataclasses import replace
 from dataclasses import asdict
 from functools import wraps
@@ -14,7 +13,18 @@ from pydantic import BaseModel
 
 from tre_common.registry import Registry
 from tre_common.registry import NodeSpec
-from tre_sm.allocator.slots import Binding, Migration, Slot, SlotAllocator
+from tre_common.gpu_placement import choose_placement
+from tre_sm.allocator.slots import (
+    Binding,
+    Migration,
+    Slot,
+    SlotAllocator,
+    awake_gpus,
+    is_buddy_aligned,
+    node_gpu_counts,
+    release_order,
+    slot_block,
+)
 from tre_sm.allocator.topology import K8sPodSnapshot
 from tre_sm.gpu_truth import GpuTruthProvider
 from tre_sm.ops.k8s_ops import StartupPodRecord
@@ -271,9 +281,16 @@ class ServiceManagerV2:
                 (binding for binding in awake if binding.hidden),
                 key=lambda item: _natural_key(item.serve_id),
             )
-            candidates = hidden + [
-                binding for binding in reversed(awake) if not binding.hidden
-            ]
+            # Hidden first (they are already drained); the rest in buddy-release
+            # order so shrinking off four GPUs hands back an aligned pair instead
+            # of two orphaned singles.
+            serving = release_order(
+                [binding for binding in awake if not binding.hidden],
+                bindings=bindings,
+                topology=self._registry.topology(),
+                already_released=hidden[:shrink],
+            )
+            candidates = hidden + serving
             sleeping = candidates[:shrink]
             sleeping_ids = {binding.serve_id for binding in sleeping}
             target = [
@@ -288,9 +305,7 @@ class ServiceManagerV2:
 
         target = list(awake)
         sleeping = [binding for binding in model_bindings if not binding.awake]
-        awake_by_node = Counter(
-            binding.slot.node for binding in bindings if binding.awake
-        )
+        topology = self._registry.topology()
         wakes: list[Binding] = []
         existing_target = min(wake_replicas, len(model_bindings))
         while sleeping and len(target) < existing_target:
@@ -303,19 +318,13 @@ class ServiceManagerV2:
                 raise WakeConflict(
                     f"{sleeping[0].serve_id}: slot already has awake binding"
                 )
-            binding = min(
-                feasible,
-                key=lambda item: (
-                    awake_by_node[item.slot.node], _natural_key(item.serve_id)
-                ),
-            )
+            binding = _wake_pick(feasible, planning.values(), topology)
             sleeping.remove(binding)
             planning[binding.serve_id] = replace(
                 binding, awake=True, hidden=False
             )
             wakes.append(binding)
             target.append(planning[binding.serve_id])
-            awake_by_node[binding.slot.node] += 1
 
         creates: list[Binding] = []
         existing_ids = set(planning)
@@ -1687,6 +1696,32 @@ def _migration_dict(migration: Migration) -> dict:
 
 def _slot_dict(slot: Slot) -> dict:
     return {"node": slot.node, "gpu_ids": list(slot.gpu_ids)}
+
+
+def _wake_pick(feasible, planned, topology) -> Binding:
+    """Which sleeping binding to wake: buddy best-fit, same rule as the planner.
+
+    Packing beats spreading here: two single-GPU replicas on one aligned pair keep
+    the other pair whole for a tp=2 model, where one replica per node would leave
+    neither node able to host it.
+    """
+    nodes = node_gpu_counts(topology)
+    scorable = [
+        binding
+        for binding in feasible
+        if is_buddy_aligned(binding.slot, nodes)
+        and len(binding.slot.gpu_ids) == len(feasible[0].slot.gpu_ids)
+    ]
+    if scorable:
+        choice = choose_placement(
+            [slot_block(binding.slot) for binding in scorable],
+            nodes=nodes,
+            occupied=awake_gpus(planned),
+            tp_size=len(scorable[0].slot.gpu_ids),
+        )
+        if choice is not None:
+            return scorable[choice.index]
+    return min(feasible, key=lambda item: _natural_key(item.serve_id))
 
 
 def _next_serve_id(model: str, existing_serve_ids: set[str]) -> str:

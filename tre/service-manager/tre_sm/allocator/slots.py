@@ -2,8 +2,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Mapping
 import re
 
+from tre_common.gpu_placement import (
+    GpuBlock,
+    choose_placement,
+    enumerate_blocks,
+    plan_releases,
+)
 from tre_common.registry import ClusterTopology
 
 
@@ -46,6 +53,107 @@ def natural_key(value: object) -> tuple[object, ...]:
     )
 
 
+def node_gpu_counts(topology: ClusterTopology) -> dict[str, int]:
+    """``{node name: gpu count}`` in the shape :mod:`tre_common.gpu_placement` wants."""
+    return {node.name: node.gpus for node in topology.nodes}
+
+
+def slot_block(slot: Slot) -> GpuBlock:
+    return GpuBlock(slot.node, tuple(slot.gpu_ids))
+
+
+def block_slot(block: GpuBlock) -> Slot:
+    return Slot(block.node, tuple(block.gpu_ids))
+
+
+def is_buddy_aligned(slot: Slot, nodes: Mapping[str, int]) -> bool:
+    """True when ``slot`` is an aligned power-of-two run inside a known node.
+
+    Placement scoring is only defined for buddy blocks; a slot that fails this
+    (a hand-written registry pairing gpu 1 with gpu 2, say) is ranked last by
+    natural order instead of raising out of the planner.
+    """
+    gpu_ids = tuple(slot.gpu_ids)
+    size = len(gpu_ids)
+    if size == 0 or (size & (size - 1)) != 0:
+        return False
+    gpus = nodes.get(slot.node)
+    if gpus is None:
+        return False
+    if gpu_ids != tuple(range(gpu_ids[0], gpu_ids[0] + size)):
+        return False
+    return gpu_ids[0] % size == 0 and gpu_ids[-1] < gpus
+
+
+def gpu_slot_candidates(topology: ClusterTopology, tp_size: int) -> list[Slot]:
+    """Every aligned ``tp_size``-GPU slot the topology declares, low address first.
+
+    ``two_gpu_slots`` stays the authority on which GPUs are bindable at all (it is
+    what :meth:`SlotAllocator._validate_slot` enforces); this narrows that set to
+    the buddy blocks of the requested width.
+    """
+    nodes = node_gpu_counts(topology)
+    if not nodes or tp_size > max(nodes.values()):
+        return []
+    declared = {
+        node.name: {gpu for pair in node.two_gpu_slots for gpu in pair}
+        for node in topology.nodes
+    }
+    return [
+        block_slot(block)
+        for block in enumerate_blocks(nodes, tp_size)
+        if declared.get(block.node, set()).issuperset(block.gpu_ids)
+    ]
+
+
+def awake_gpus(bindings) -> set[tuple[str, int]]:
+    """``(node, gpu)`` of every GPU an awake binding holds."""
+    return {
+        (binding.slot.node, gpu)
+        for binding in bindings
+        if binding.awake
+        for gpu in binding.slot.gpu_ids
+    }
+
+
+def release_order(
+    candidates: list["Binding"],
+    *,
+    bindings: list["Binding"],
+    topology: ClusterTopology,
+    already_released: "list[Binding] | tuple[Binding, ...]" = (),
+) -> list["Binding"]:
+    """Awake bindings ordered by how much free space stopping them gives back.
+
+    Mirror image of :func:`gpu_slot_candidates` placement: the replica whose slot
+    merges into the largest free block goes first, so shrinking off four GPUs
+    hands back an aligned pair instead of two orphaned singles.  Shared by the
+    service-manager shrink and the controller's safescale probe order.
+    ``already_released`` are bindings the caller stops first (the hidden ones), so
+    their GPUs count as free while the rest are scored.
+    """
+    if len(candidates) <= 1:
+        return list(candidates)
+    nodes = node_gpu_counts(topology)
+    scorable = [
+        binding for binding in candidates if is_buddy_aligned(binding.slot, nodes)
+    ]
+    if not scorable:
+        return list(candidates)
+    scorable_ids = {binding.serve_id for binding in scorable}
+    rest = [binding for binding in candidates if binding.serve_id not in scorable_ids]
+    occupied = awake_gpus(bindings)
+    for binding in already_released:
+        occupied -= {(binding.slot.node, gpu) for gpu in binding.slot.gpu_ids}
+    picks = plan_releases(
+        [slot_block(binding.slot) for binding in scorable],
+        nodes=nodes,
+        occupied=occupied,
+        count=len(scorable),
+    )
+    return [scorable[pick.index] for pick in picks] + rest
+
+
 @dataclass(frozen=True)
 class Migration:
     serve_id: str
@@ -69,22 +177,23 @@ class SlotAllocator:
             self.bind(binding.serve_id, binding.model, binding.slot, awake=binding.awake)
 
     def find_slot(self, tp_size: int) -> Slot | None:
-        self._validate_tp_size(tp_size)
-        if tp_size == 2:
-            for node, pair in self._two_gpu_slots():
-                if all(not self._is_occupied(node, gpu) for gpu in pair):
-                    return Slot(node, pair)
-            return None
+        """Least wasteful free slot of ``tp_size`` GPUs (buddy best-fit).
 
-        for node, pair in self._two_gpu_slots():
-            occupied = [gpu for gpu in pair if self._is_occupied(node, gpu)]
-            if len(occupied) == 1:
-                free_gpu = next(gpu for gpu in pair if gpu not in occupied)
-                return Slot(node, (free_gpu,))
-        for node, pair in self._two_gpu_slots():
-            if all(not self._is_occupied(node, gpu) for gpu in pair):
-                return Slot(node, (pair[0],))
-        return None
+        Shares :func:`tre_common.gpu_placement.choose_placement` with the
+        controller, so a cold create packs the same way a wake does: a single-GPU
+        replica lands beside an existing one before it splits an empty pair.
+        """
+        self._validate_tp_size(tp_size)
+        candidates = gpu_slot_candidates(self._topology, tp_size)
+        if not candidates:
+            return None
+        choice = choose_placement(
+            [slot_block(slot) for slot in candidates],
+            nodes=node_gpu_counts(self._topology),
+            occupied=set(self._awake_gpu_to_serve),
+            tp_size=tp_size,
+        )
+        return None if choice is None else block_slot(choice.block)
 
     def bind(self, serve_id: str, model: str, slot: Slot, *, awake: bool = True) -> None:
         self._validate_slot(slot)

@@ -154,12 +154,15 @@ def test_probe_hides_serving_pod_and_commit_sleeps_exactly_that_pod() -> None:
 
     view = cluster_view_from_state(service.get_state(), registry.topology())
     pods = _pods_to_probe(snapshot, "donor", 1, cluster_view=view)
-    assert pods == ("p1",)  # awake && !hidden, natural order; the sleeping s0 is never probed
+    # awake && !hidden only -- the sleeping s0 is never probed. p1..p4 fill the node, so
+    # no single release merges upwards; the tie goes to the highest address, p4.
+    assert pods == ("p4",)
+    assert "s0" not in pods
 
     started = machine.start_probe(model="donor", pods=pods, now_ms=0)
     queue.submit(_commands_to_actions(started.commands, source_loop="rescue"))
     asyncio.run(queue.drain_once())
-    assert {b.serve_id for b in store.load().bindings if b.hidden} == {"p1"}
+    assert {b.serve_id for b in store.load().bindings if b.hidden} == {"p4"}
 
     for ts in (500, 1000):
         run_safescale_observation_tick(
@@ -170,12 +173,34 @@ def test_probe_hides_serving_pod_and_commit_sleeps_exactly_that_pod() -> None:
         )
     asyncio.run(queue.drain_once())
 
-    assert ("set_binding_power", "p1", False) in sm.calls
+    assert ("set_binding_power", "p4", False) in sm.calls
     assert not any(call[0] == "scale_model" for call in sm.calls)
     bindings = {b.serve_id: b for b in store.load().bindings}
-    assert bindings["p1"].awake is False and bindings["p1"].hidden is False
-    assert all(bindings[p].awake and not bindings[p].hidden for p in ("p2", "p3", "p4"))
+    assert bindings["p4"].awake is False and bindings["p4"].hidden is False
+    assert all(bindings[p].awake and not bindings[p].hidden for p in ("p1", "p2", "p3"))
     assert not any(b.hidden for b in bindings.values())  # no hidden orphan
+
+
+def test_probe_order_frees_an_aligned_pair_before_a_stranded_gpu() -> None:
+    """Shrinking by one must give back a pair a tp=2 model can wake into."""
+    registry = _registry("donor")
+    view = ClusterView(
+        registry.topology(),
+        (
+            Binding("d-0", "donor", Slot("node-a", (2,)), awake=True),
+            Binding("d-1", "donor", Slot("node-a", (3,)), awake=True),
+            Binding("d-2", "donor", Slot("node-a", (0,)), awake=True),
+        ),
+    )
+    snapshot = MetricsSnapshot(ts_ms=0, stale=False, models={})
+
+    # gpu1 is already free, so sleeping d-2 (gpu0) completes the aligned pair (0,1),
+    # while sleeping d-0 or d-1 only strands another single GPU. Lexicographic order
+    # would have probed d-0 and freed nothing a tp=2 model can use.
+    assert _pods_to_probe(snapshot, "donor", 1, cluster_view=view) == ("d-2",)
+    # Second pick is scored with gpu0 already released: neither remaining GPU merges,
+    # so the tie goes to the highest address.
+    assert _pods_to_probe(snapshot, "donor", 2, cluster_view=view) == ("d-2", "d-1")
 
 
 def test_idle_gpus_counts_gpus_without_awake_binding_from_cluster_view() -> None:

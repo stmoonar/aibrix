@@ -28,7 +28,7 @@ from tre_controller.planning.safescale import SafeScaleCommand, SafeScaleDecisio
 from tre_controller.planning.util_scale_down import UtilScaleDown
 from tre_controller.signals.sources import get_signal, per_replica_token_rate
 from tre_controller.signals.trs import SignalState, TRSComputer, TRSInput
-from tre_sm.allocator.slots import natural_key
+from tre_sm.allocator.slots import natural_key, release_order
 
 
 class PlannerQueue(Protocol):
@@ -341,15 +341,21 @@ def _pods_to_probe(
         # Review F3: probe only serving bindings (awake and not already hidden). The
         # metrics per_pod map also lists sleeping pods, which must never be "hidden" as
         # a scale-down probe (it would remove no capacity and the commit would be a no-op).
-        pods = sorted(
+        # Among those, release_order puts the replica whose slot merges into the largest
+        # free block first, so a committed shrink hands back an aligned pair a tp=2 model
+        # can actually use instead of scattered single GPUs.
+        serving = sorted(
             (
-                binding.serve_id
+                binding
                 for binding in cluster_view.bindings
                 if binding.model == model and binding.awake and not binding.hidden
             ),
-            key=natural_key,
+            key=lambda binding: natural_key(binding.serve_id),
         )
-        return tuple(pods[:count])
+        ordered = release_order(
+            serving, bindings=list(cluster_view.bindings), topology=cluster_view.topology
+        )
+        return tuple(binding.serve_id for binding in ordered[:count])
     metrics = snapshot.models.get(model)
     if metrics is None:
         return ()

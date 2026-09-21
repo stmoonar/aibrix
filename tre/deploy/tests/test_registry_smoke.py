@@ -53,3 +53,23 @@ def test_registry_warnings_is_empty_when_parameters_match_profiles() -> None:
     profiles = {"models": {"m1": {"latency_slo_ms": {"ttft_p95": 500.0, "tpot_p95": 100.0, "e2e_p95": 10000.0}}}}
 
     assert registry_warnings(registry, profiles=profiles) == []
+
+
+def test_registry_warnings_flag_gpus_missing_from_every_declared_pair() -> None:
+    registry = Registry(
+        ClusterTopology(nodes=(NodeSpec(name="node-a", gpus=4, two_gpu_slots=((0, 1),)),)),
+        [_model("m1", theta=100.0, ttft=500.0)],
+    )
+
+    warnings = registry_warnings(registry)
+
+    assert "WARNING node-a.two_gpu_slots omits gpu(s) [2, 3]; placement cannot use them" in warnings
+
+
+def test_registry_warnings_accept_pairs_that_cover_every_gpu() -> None:
+    registry = Registry(
+        ClusterTopology(nodes=(NodeSpec(name="node-a", gpus=4, two_gpu_slots=((0, 1), (2, 3))),)),
+        [_model("m1", theta=100.0, ttft=500.0)],
+    )
+
+    assert registry_warnings(registry) == []

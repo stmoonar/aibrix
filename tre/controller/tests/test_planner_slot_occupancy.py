@@ -8,7 +8,14 @@ import asyncio
 from tre_common.registry import ClusterTopology, ModelSpec, NodeSpec, Registry, SloSpec, TrsParams
 from tre_controller.loops.action_queue import ActionQueue
 from tre_controller.planning.classify import ModelClassification, ModelRole, ModelState, TauThresholds
-from tre_controller.planning.planner import ClusterView, PlanConfig, ScaleAction, build_plan
+from tre_controller.planning.planner import (
+    ClusterView,
+    PlanConfig,
+    ScaleAction,
+    _plan_sleeping_wakes,
+    _SlotOccupancy,
+    build_plan,
+)
 from tre_sm.allocator.slots import Binding, Slot
 from tre_sm.api.v2 import ServiceManagerV2
 from tre_sm.state.store import StateStore
@@ -199,3 +206,83 @@ def test_e1_plan_executes_through_serial_queue_without_wake_conflict() -> None:
     assert bindings["7b-0"].awake is False
     assert bindings["8b-0"].awake is True
     assert sum(b.awake for b in bindings.values() if b.model == "dsqwen-7b") == 7
+
+
+# ---------------------------------------------------------------- buddy packing
+
+
+def _packing_view() -> ClusterView:
+    """node10 already fragmented (gpu0/gpu2 taken), node9 completely free.
+
+    dsqwen-7b holds a sleeping binding on every free GPU. Serve ids follow creation
+    order, not GPU address -- which is exactly why the old natural-key first-fit
+    picked 7b-0/7b-1/7b-2 and broke both of node9's pairs.
+    """
+    return ClusterView(
+        TOPOLOGY,
+        (
+            Binding("other-0", "other", Slot("node10", (0,)), awake=True),
+            Binding("other-1", "other", Slot("node10", (2,)), awake=True),
+            Binding("7b-0", "dsqwen-7b", Slot("node9", (0,)), awake=False),
+            Binding("7b-1", "dsqwen-7b", Slot("node9", (2,)), awake=False),
+            Binding("7b-2", "dsqwen-7b", Slot("node10", (1,)), awake=False),
+            Binding("7b-3", "dsqwen-7b", Slot("node9", (1,)), awake=False),
+            Binding("7b-4", "dsqwen-7b", Slot("node9", (3,)), awake=False),
+            Binding("7b-5", "dsqwen-7b", Slot("node10", (3,)), awake=False),
+        ),
+    )
+
+
+def test_three_single_gpu_wakes_leave_an_aligned_pair_for_a_tp2_model() -> None:
+    occupancy = _SlotOccupancy(_packing_view())
+
+    picks = occupancy.plan_wakes("dsqwen-7b", 3)
+    for binding in picks:
+        occupancy.claim(binding)
+
+    # The already-broken node10 halves are spent first; node9's pair (2,3) survives.
+    assert [binding.serve_id for binding in picks] == ["7b-2", "7b-5", "7b-0"]
+    assert occupancy.free_groups(2) == [{("node9", 2), ("node9", 3)}]
+
+
+def test_plan_sleeping_wakes_dispatches_the_buddy_packed_bindings() -> None:
+    occupancy = _SlotOccupancy(_packing_view())
+    events: list[str] = []
+
+    count, pods = _plan_sleeping_wakes(
+        occupancy, receiver="dsqwen-7b", need=3, events=events, blocked_event="blocked"
+    )
+
+    assert (count, pods) == (3, ("7b-2", "7b-5", "7b-0"))
+    assert events == []
+    assert occupancy.free_groups(2) == [{("node9", 2), ("node9", 3)}]
+
+
+def test_create_capacity_takes_the_least_wasteful_slots_first() -> None:
+    occupancy = _SlotOccupancy(_packing_view())
+
+    groups = occupancy.free_groups(1)
+
+    # Halves of an already-split pair (split_cost 0) rank ahead of GPUs on the
+    # untouched node, which would cost a whole free node to break open.
+    assert groups[:2] == [{("node10", 1)}, {("node10", 3)}]
+    assert all(gpu[0] == "node9" for group in groups[2:] for gpu in group)
+
+
+def test_packing_still_skips_blocked_and_hidden_sleeping_bindings() -> None:
+    view = ClusterView(
+        TOPOLOGY,
+        (
+            Binding("other-0", "other", Slot("node9", (1,)), awake=True),
+            Binding("7b-0", "dsqwen-7b", Slot("node9", (1,)), awake=False),
+            Binding("7b-1", "dsqwen-7b", Slot("node9", (3,)), awake=False, hidden=True),
+            Binding("7b-2", "dsqwen-7b", Slot("node9", (0,)), awake=False),
+        ),
+    )
+    occupancy = _SlotOccupancy(view)
+
+    # 7b-0 sits under an awake binding, 7b-1 is hidden: neither is wakeable capacity.
+    assert [binding.serve_id for binding in occupancy.plan_wakes("dsqwen-7b", 3)] == ["7b-2"]
+    assert occupancy.has_unplanned_sleeping("dsqwen-7b") is True
+    occupancy.claim(view.bindings[-1])
+    assert occupancy.has_unplanned_sleeping("dsqwen-7b") is True  # 7b-0 is still unplanned
