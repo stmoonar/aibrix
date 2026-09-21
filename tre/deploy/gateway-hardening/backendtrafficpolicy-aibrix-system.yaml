@@ -21,15 +21,30 @@
 # models. This is per-model isolation, not a promise that tight load all
 # succeeds (the physically-impossible part still fails -- but cleanly).
 #
-# SIZING: cap = ceiling, not steady target. Each model currently has 1 routable
-# replica (A100-40G vLLM). maxConnections/maxParallelRequests=256 is a runaway
-# ceiling (a single pod's productive concurrency is far below this; the cap only
-# stops the pile-up). maxPendingRequests=64 = small admission queue -> beyond
-# 256 active + 64 pending, requests overflow immediately (fast 503). Aggregate
-# ceiling 3x256=768 upstream conns sits well inside the raised fd budget
-# (envoyproxy-nofile-patch.yaml -> 65536). maxParallelRetries=16 caps retry
-# amplification (was defaulting to 1024). Tune per real per-model capacity as
-# replicas scale (cap is cluster-wide, shared across a model's replicas).
+# SIZING (revised 2026-09-21): cap = ceiling, not steady target. The original
+# 256/64 was sized against an assumed RLIMIT_NOFILE of 1024 (3x256=768 upstream
+# conns). The fd raise in envoyproxy-nofile-patch.yaml is live on BOTH envoy
+# pods -- /proc/1/limits reports 65536 soft and hard, with ~414 fds in use at
+# idle -- so the old ceiling was two orders of magnitude below what the proxy
+# can hold, and it, not vLLM, was the admission controller.
+#
+# WHY IT MOVED: at 256+64 the cap is per Envoy CLUSTER, shared by every replica
+# of a model, so it does not grow when TRE scales out. Calibration fitted
+# theta_m against that ceiling and mistook it for capacity, and in E1 a large
+# share of the 58907 errors were Envoy shed rather than real SLO failures.
+#
+# WHY IT MUST MATCH THE TRE ARM: this file governs the APA / control arm
+# (NodePort 31592) and backendtrafficpolicy-tre-v2.yaml governs the TRE arm
+# (NodePort 31094). A/B results are only interpretable if both arms admit
+# traffic under identical rules -- otherwise "TRE served more" can just mean
+# "APA was shed sooner". Keep the two files numerically identical; change them
+# together or not at all.
+#
+# NEW VALUES: maxConnections/maxParallelRequests 4096, maxPendingRequests 1024,
+# maxParallelRetries 16 (unchanged; caps retry amplification). Aggregate
+# ceiling 3x4096=12288 upstream conns sits well inside the 65536 fd budget.
+# Real admission control now lives where it belongs: vLLM --max-num-seqs 256
+# per replica, which DOES scale with replica count.
 apiVersion: gateway.envoyproxy.io/v1alpha1
 kind: BackendTrafficPolicy
 metadata:
@@ -44,9 +59,9 @@ spec:
     kind: HTTPRoute
     name: dsqwen-7b-router
   circuitBreaker:
-    maxConnections: 256
-    maxPendingRequests: 64
-    maxParallelRequests: 256
+    maxConnections: 4096
+    maxPendingRequests: 1024
+    maxParallelRequests: 4096
     maxParallelRetries: 16
 ---
 apiVersion: gateway.envoyproxy.io/v1alpha1
@@ -63,9 +78,9 @@ spec:
     kind: HTTPRoute
     name: dsqwen-14b-router
   circuitBreaker:
-    maxConnections: 256
-    maxPendingRequests: 64
-    maxParallelRequests: 256
+    maxConnections: 4096
+    maxPendingRequests: 1024
+    maxParallelRequests: 4096
     maxParallelRetries: 16
 ---
 apiVersion: gateway.envoyproxy.io/v1alpha1
@@ -82,7 +97,7 @@ spec:
     kind: HTTPRoute
     name: dsllama-8b-router
   circuitBreaker:
-    maxConnections: 256
-    maxPendingRequests: 64
-    maxParallelRequests: 256
+    maxConnections: 4096
+    maxPendingRequests: 1024
+    maxParallelRequests: 4096
     maxParallelRetries: 16

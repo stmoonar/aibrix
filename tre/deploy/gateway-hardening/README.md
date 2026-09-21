@@ -30,15 +30,45 @@ collateral 503s. Two compounding root causes:
 | `backendtrafficpolicy-tre-v2.yaml` | per-model circuit breakers on the TRE serving path (Gateway tre-v2/tre-aibrix-eg, NodePort 31094) | additive, tre-v2 ns |
 | `envoyproxy-nofile-patch.yaml` | raise envoy RLIMIT_NOFILE 1024→65536 | **modifies shared aibrix-system EnvoyProxy** (class-level → both envoys) |
 
-Circuit-breaker values (per model, per gateway): maxConnections 256,
-maxPendingRequests 64, maxParallelRequests 256, maxParallelRetries 16. Each model
-gets its own bounded quota, so overload fast-fails as 503 **UO** (overflow,
+Circuit-breaker values (per model, per gateway): maxConnections 4096,
+maxPendingRequests 1024, maxParallelRequests 4096, maxParallelRetries 16. Each
+model gets its own bounded quota, so overload fast-fails as 503 **UO** (overflow,
 returned in ms before any socket attempt) confined to the saturated model, instead
 of UF socket_creation_failure that spreads across all models. The cap is a
-ceiling, not a steady target (a single A100-40G vLLM replica's productive
-concurrency is well below 256); it only stops the runaway pile-up. Aggregate
-ceiling 3×256=768 upstream conns sits well inside the raised 65536 fd budget. The
-cap is cluster-wide (shared across a model's replicas) — retune as replicas scale.
+ceiling, not a steady target; it only stops the runaway pile-up.
+
+### The two arms must carry identical values
+
+`backendtrafficpolicy-aibrix-system.yaml` governs the **APA / control arm**
+(NodePort 31592) and `backendtrafficpolicy-tre-v2.yaml` governs the **TRE arm**
+(NodePort 31094). An A/B result is only interpretable if both arms admit traffic
+under the same rules: otherwise "TRE served more requests" is indistinguishable
+from "APA was shed sooner". **Change the two files together or not at all** —
+`deploy/tests/test_gateway_arm_symmetry.py` fails if they drift.
+
+This is not hypothetical. On 2026-09-20 the TRE arm was raised to 4096/1024 while
+the APA arm was left at 256/64; the asymmetry was caught before the re-run, but a
+comparison made in that window would have been meaningless.
+
+### Why the values moved (2026-09-21)
+
+The original 256/64 was sized against an assumed `RLIMIT_NOFILE` of 1024
+(3×256=768 upstream conns). That assumption is stale: the fd raise in
+`envoyproxy-nofile-patch.yaml` is live on **both** envoy pods — `/proc/1/limits`
+reports 65536 soft and hard, with ~414 fds in use at idle. So the old ceiling sat
+two orders of magnitude below what the proxy can hold.
+
+Because the cap is per Envoy **cluster**, it is shared by every replica of a model
+and does **not** grow when TRE scales out. Two consequences, both measured:
+
+- calibration fitted `theta_m` against that ceiling and mistook it for capacity,
+  which is why the 1718/1494/1414 values are invalid by construction;
+- in E1 a large share of the 58,907 errors were Envoy shed rather than real SLO
+  failures, and removing them flipped the winner on trace t1.
+
+Aggregate ceiling 3×4096=12288 upstream conns still sits well inside the 65536 fd
+budget. Real admission control now lives where it belongs: vLLM
+`--max-num-seqs 256` per replica, which **does** scale with replica count.
 
 ## Apply
 
