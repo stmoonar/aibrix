@@ -1,0 +1,658 @@
+#!/usr/bin/env python3
+"""Generate the open-loop calibration schedule files (one per model x shape x primitive).
+
+Output layout (committed, so a campaign run is reproducible from the tree alone)::
+
+    replayer/traces_v2/calibration/
+        INDEX.json                      # every cell + its provenance and metadata
+        <model>/<shape>_<primitive>.json   # replayer trace.json schema
+
+Each schedule file uses the ordinary model-keyed replayer trace schema
+(``{model: [{start_time, end_time, rps, input_tokens, max_tokens}, ...]}``), so it loads
+with ``tre_replayer.traces.loader.load_trace_segments`` and runs with
+``r3_grid.py --schedule``. Overlapping segments superpose, because
+``build_poisson_schedule`` samples each segment independently - that is how the bursts
+primitive lays a spike on top of its base rate and how the mixture shape runs four
+parallel token-shape streams.
+
+What actually limits admission
+------------------------------
+Every primitive here is sized against an :class:`~scripts.admission_cap.AdmissionCap`:
+the Envoy circuit breaker (``maxParallelRequests`` + ``maxPendingRequests``, per cluster,
+shared across replicas) together with vLLM's own per-pod running-set limit. Which of the
+two binds decides what a primitive can observe at all - the gateway *sheds* past its
+ceiling and the request never reaches vLLM, whereas the engine *queues*, and only a
+queue moves ``vllm:num_requests_waiting``. Under the deployed ``gateway-capped`` policy
+the shed ceiling is 320 and vLLM's sequence limit is the unreachable 1024 default, so
+the only remaining route to a non-zero waiting count is KV-cache exhaustion; under the
+proposed ``engine-capped`` policy the binding limit moves into the engine and every
+shape becomes observable. ``--cap`` selects the policy, and ``index["admission_cap"]``
+records which one a schedule set was generated for.
+
+The three primitives
+--------------------
+ramp    rho 0.4 -> 1.2 linearly over ``T_r = cap.ramp_seconds(C_s, COEF)`` seconds in
+        ~5 s segments, hold 1.2 for ``T_r / 4``, then 60 s at rho 0.5 to drain. ``COEF``
+        is :data:`RAMP_BACKLOG_COEFFICIENT`, the backlog one ramp+hold accumulates per
+        ``C_s * T_r``, derived from the rho endpoints rather than restated; T_r is then
+        whatever keeps that backlog inside the cap's excess-request headroom (146 slots
+        quantised to 140, under the deployed policy). Backlog accrues at up to
+        ``0.2 * C_s`` per second once rho > 1, so the crossing is still guaranteed. A
+        fixed 0.8 -> 1.6 / 360 s ramp - the previous shape - overshoots that headroom by
+        a wide margin and would have been truncated by gateway shedding rather than by
+        the engine, i.e. it would have measured the proxy, not the model.
+steps   rho 0.5 (90 s) -> 0.8 (120 s) -> 0.95 (240 s), monotone. 450 s. Each level is
+        long enough to reach steady state; the first control window after each step is
+        transient and is discarded downstream (``discard_after_s`` in the index).
+bursts  base rho 0.6 for 360 s with a 2 s spike every 90 s carrying
+        ``B = cap.burst_sizing(K_kv, tokens_per_request).requests`` requests: enough to
+        overshoot the engine's running limit ``min(max_num_seqs, floor(K_kv /
+        tokens_per_request))``, because the engine only queues past that limit. 4 bursts.
+        This is the only primitive that drives a waiting queue, which is what makes
+        lambda_wait identifiable at all. When the overshoot needs more requests than the
+        cap admits, the spike would be shed rather than queued, so ``reachable`` is False
+        and no schedule is written - the index records the skip and the arithmetic behind
+        it instead of shipping a cell that can only measure the gateway.
+
+Capacity priors and the C_s model
+---------------------------------
+rho is relative to a per-shape single-pod capacity prior C_s (rps). The priors live in
+``traces_v2/calibration/capacity/`` - a campaign-local copy, deliberately NOT the frozen
+``traces_v2/capacity/`` set that experiment-3's traceset-v2 was generated from (that one
+stays byte-unchanged for provenance). The dsqwen-14b prior there was re-measured on
+2026-09-20 with the unique-per-request-prompt sender and prefix caching off; the frozen
+2026-07-09 one is contaminated (its capacity RISES with prompt length: 14.9 -> 33.0 ->
+32.0 rps for input 128 -> 512 -> 1024, the signature of an identical-prompt sender
+against an engine with prefix caching on). The priors only cover a sparse (i, o) grid and none
+of the campaign shapes sit on it, so nearest-neighbour would silently borrow a lighter
+point's capacity (the trace-set failure documented in traces_v2/README.md).
+
+Instead we fit a two-parameter physical model per model::
+
+    1 / C(i, o) = i / P + o / D
+
+P is the pod's prefill throughput (prompt tokens/s) and D its decode throughput
+(generated tokens/s): serving R rps of shape (i, o) spends R*i/P of each second in
+prefill and R*o/D in decode, and saturates when that sums to 1. The fit is a
+least-squares solve on the measured 1/C points, so it interpolates smoothly and
+extrapolates to shapes nobody measured, and it is monotone-decreasing in both i and o by
+construction - which is the property the contaminated 14b prior violated.
+
+For the mixture shape M the capacity prior is the load-weighted harmonic combination::
+
+    C_M = 1 / sum_k(w_k / C(i_k, o_k))
+
+i.e. the total rps at which the blended stream saturates the pod. Its
+``tokens_per_request`` (the burst sizing input) is instead the load-weighted arithmetic
+mean ``sum_k w_k * (i_k + o_k)``, because what fills the KV cache is tokens per admitted
+request, not rps.
+
+The same capacity files carry ``kv_cache_tokens``: the engine's own "GPU KV cache size"
+startup log line, with the pod it was read from recorded alongside it.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable, Optional, Sequence
+
+from scripts.admission_cap import (
+    CAPS,
+    DEFAULT_CAP_NAME,
+    AdmissionCap,
+    get_cap,
+    ramp_backlog_coefficient,
+)
+
+#: Training shapes. (input_tokens, max_output_tokens).
+SHAPES: dict[str, tuple[int, int]] = {
+    "S1": (256, 128),
+    "S2": (768, 192),
+    "S3": (2048, 96),
+    "S4": (256, 448),
+    "S5": (768, 384),
+}
+
+#: Held-out validation shape: a mixture of four token shapes running in parallel.
+#: NEVER used for fitting - it exists to test that a theta fit on S1..S5 generalises.
+MIXTURE_NAME = "M"
+MIXTURE: tuple[tuple[float, int, int], ...] = (
+    (0.40, 256, 128),
+    (0.30, 1024, 256),
+    (0.20, 128, 384),
+    (0.10, 3072, 64),
+)
+
+MODELS = ("dsqwen-7b", "dsllama-8b", "dsqwen-14b")
+
+# ---- primitive parameters (single source of truth; the index records them) ----
+RAMP_RHO_START = 0.4
+RAMP_RHO_END = 1.2
+RAMP_SEGMENT_S = 5.0
+RAMP_HOLD_FRACTION = 0.25
+RAMP_DRAIN_RHO = 0.5
+RAMP_DRAIN_S = 60.0
+#: Backlog one ramp+hold accumulates, per C_s * T_r. Derived from the rho endpoints, so
+#: changing the ramp shape cannot leave the budget arithmetic behind.
+RAMP_BACKLOG_COEFFICIENT = ramp_backlog_coefficient(
+    RAMP_RHO_START, RAMP_RHO_END, RAMP_HOLD_FRACTION
+)
+RAMP_DURATION_FORMULA = (
+    "min(cap.ramp_max_s, cap.ramp_excess_budget / (backlog_coefficient * capacity_rps))"
+)
+
+STEPS: tuple[tuple[float, float], ...] = ((0.5, 90.0), (0.8, 120.0), (0.95, 240.0))
+
+BURST_BASE_RHO = 0.6
+BURST_DURATION_S = 360.0
+BURST_PERIOD_S = 90.0
+BURST_WIDTH_S = 2.0
+BURST_FIRST_S = 60.0
+BURST_COUNT = 4
+BURST_REQUEST_FORMULA = (
+    "ceil(cap.burst_overshoot_factor * min(cap.sequence_limit, "
+    "floor(kv_cache_tokens / tokens_per_request))), skipped when it exceeds "
+    "cap.burst_request_cap"
+)
+
+#: c<N> in the cell id is NOT a concurrency in schedule mode - it is an offered-load code,
+#: round(100 * the primitive's characteristic rho). The cell id must stay parseable by
+#: ``r3_grid.GridCell.from_scenario_id`` or ``rewindow_from_raw`` silently skips the file.
+LOAD_CODE = {"ramp": round(100 * RAMP_RHO_END), "steps": 95, "bursts": 60}
+
+PRIMITIVES = ("ramp", "steps", "bursts")
+
+
+@dataclass(frozen=True)
+class CapacityModel:
+    """Per-model prefill/decode throughput fit; ``rps(i, o)`` is the capacity prior."""
+
+    model: str
+    prefill_tps: float
+    decode_tps: float
+    n_points: int
+    rms_rel_error: float
+
+    def rps(self, input_tokens: int, output_tokens: int) -> float:
+        cost = input_tokens / self.prefill_tps + output_tokens / self.decode_tps
+        if cost <= 0.0:
+            raise ValueError("degenerate capacity model")
+        return 1.0 / cost
+
+    def mixture_rps(self, mixture: Sequence[tuple[float, int, int]]) -> float:
+        total = sum(w / self.rps(i, o) for w, i, o in mixture)
+        return 1.0 / total
+
+
+def fit_capacity_model(model: str, points: Sequence[tuple[int, int, float]]) -> CapacityModel:
+    """Least-squares fit of 1/C = i/P + o/D over measured (i, o, rps) points.
+
+    Solves the 2x2 normal equations for a = 1/P, b = 1/D directly (no numpy dependency
+    in the deploy scripts). Raises if the solution is not physically usable (a or b <= 0),
+    which is exactly what a contaminated prior whose capacity *rises* with prompt length
+    would produce - better a loud failure than a silently inverted capacity surface.
+    """
+    if len(points) < 2:
+        raise ValueError(f"{model}: need >= 2 capacity points, got {len(points)}")
+    sii = sio = soo = si_y = so_y = 0.0
+    for i, o, rps in points:
+        if rps <= 0.0:
+            raise ValueError(f"{model}: non-positive rps at ({i},{o})")
+        y = 1.0 / rps
+        sii += i * i
+        sio += i * o
+        soo += o * o
+        si_y += i * y
+        so_y += o * y
+    det = sii * soo - sio * sio
+    if abs(det) < 1e-12:
+        raise ValueError(f"{model}: capacity points are collinear; cannot separate P and D")
+    a = (si_y * soo - so_y * sio) / det
+    b = (so_y * sii - si_y * sio) / det
+    if a <= 0.0 or b <= 0.0:
+        raise ValueError(
+            f"{model}: capacity fit is unphysical (1/P={a:.3e}, 1/D={b:.3e}). "
+            "This means measured capacity does not decrease with token count - "
+            "re-measure the prior before generating schedules."
+        )
+    fitted = CapacityModel(model, 1.0 / a, 1.0 / b, len(points), 0.0)
+    errs = [(fitted.rps(i, o) - rps) / rps for i, o, rps in points]
+    rms = (sum(e * e for e in errs) / len(errs)) ** 0.5
+    return CapacityModel(model, 1.0 / a, 1.0 / b, len(points), rms)
+
+
+def load_capacity_points(path: Path) -> tuple[str, list[tuple[int, int, float]]]:
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    points = [
+        (int(p["input_tokens"]), int(p["output_tokens"]), float(p["rps"]))
+        for p in data["capacity"]
+    ]
+    return str(data["model"]), points
+
+
+def load_kv_cache_tokens(path: Path) -> int:
+    """The engine's GPU KV cache size (tokens) recorded next to the capacity prior.
+
+    Burst sizing is meaningless without it - with no KV number there is no way to know how
+    many concurrent requests the engine can run before it starts queueing, and a guess
+    would silently produce cells that only measure the Envoy gateway. So this fails
+    loudly.
+    """
+    path = Path(path)
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if "kv_cache_tokens" not in data:
+        raise ValueError(
+            f"{path}: missing 'kv_cache_tokens'. Read it from the model's vLLM startup log "
+            "line \"GPU KV cache size: N tokens\" (kubectl -n tre-v2 logs <pod> | grep 'KV cache "
+            "size') and record it together with 'kv_cache_provenance' (source, measured, pod)."
+        )
+    tokens = int(data["kv_cache_tokens"])
+    if tokens <= 0:
+        raise ValueError(f"{path}: 'kv_cache_tokens' must be positive, got {tokens}")
+    return tokens
+
+
+# ------------------------------------------------------------------ shape helpers
+
+
+def shape_components(shape_name: str) -> tuple[tuple[float, int, int], ...]:
+    """(weight, input_tokens, max_output_tokens) streams that make up a shape."""
+    if shape_name == MIXTURE_NAME:
+        return MIXTURE
+    i, o = SHAPES[shape_name]
+    return ((1.0, i, o),)
+
+
+def tokens_per_request(shape_name: str) -> float:
+    """i + o for a plain shape; the load-weighted mean sum(w * (i + o)) for the mixture.
+
+    This is the KV-cache footprint of one admitted request at its longest, which is what
+    sets how many of them the engine can run before the surplus has to wait.
+    """
+    return sum(w * (i + o) for w, i, o in shape_components(shape_name))
+
+
+def ramp_duration_s(capacity_rps: float, cap: AdmissionCap) -> float:
+    """T_r: long enough to cross rho = 1 slowly, short enough that the backlog it builds
+    still fits the cap's admission headroom."""
+    return cap.ramp_seconds(capacity_rps, RAMP_BACKLOG_COEFFICIENT)
+
+
+# ------------------------------------------------------------------ primitives
+
+
+def ramp_segments(capacity_rps: float, ramp_s: float) -> list[dict]:
+    """rho ramps linearly in ~RAMP_SEGMENT_S steps, holds at the peak, then drains.
+
+    ``ramp_s`` is passed in rather than derived from ``capacity_rps`` because the mixture
+    shape builds one stream per component at a fraction of C_s: every component has to
+    share the timeline that the *total* C_s produced, or the four streams would ramp at
+    different speeds.
+
+    It is split into the nearest whole number of RAMP_SEGMENT_S-long segments, so a
+    segment is ~5 s and the ramp ends exactly at T_r. Each segment uses the rho at its
+    *midpoint*, so the piecewise-constant schedule integrates to the same request count as
+    the continuous ramp it approximates.
+    """
+    segments: list[dict] = []
+    n = max(1, int(round(ramp_s / RAMP_SEGMENT_S)))
+    for k in range(n):
+        frac = (k + 0.5) / n
+        rho = RAMP_RHO_START + (RAMP_RHO_END - RAMP_RHO_START) * frac
+        segments.append(
+            _segment(k * ramp_s / n, (k + 1) * ramp_s / n, rho * capacity_rps)
+        )
+    hold_end = ramp_s + ramp_s * RAMP_HOLD_FRACTION
+    segments.append(_segment(ramp_s, hold_end, RAMP_RHO_END * capacity_rps))
+    segments.append(_segment(hold_end, hold_end + RAMP_DRAIN_S, RAMP_DRAIN_RHO * capacity_rps))
+    return segments
+
+
+def step_segments(capacity_rps: float) -> list[dict]:
+    segments: list[dict] = []
+    t = 0.0
+    for rho, duration in STEPS:
+        segments.append(_segment(t, t + duration, rho * capacity_rps))
+        t += duration
+    return segments
+
+
+def burst_segments(capacity_rps: float, requests_per_burst: float) -> list[dict]:
+    """Base rate for the whole cell, with BURST_COUNT spikes superposed on top.
+
+    A spike carries ``requests_per_burst`` requests inside BURST_WIDTH_S seconds, so its
+    segment rate is ``requests_per_burst / BURST_WIDTH_S`` on top of the base. Sized by
+    ``AdmissionCap.burst_sizing``, that is enough concurrent work to push the engine past
+    its running limit, so the surplus queues - the observable the whole primitive exists
+    to produce. Like the ramp, the count is passed in so the mixture's component streams
+    split one burst between them instead of each firing a full one.
+    """
+    segments = [_segment(0.0, BURST_DURATION_S, BURST_BASE_RHO * capacity_rps)]
+    for k in range(BURST_COUNT):
+        start = BURST_FIRST_S + k * BURST_PERIOD_S
+        end = start + BURST_WIDTH_S
+        if end > BURST_DURATION_S:
+            raise ValueError("burst falls outside the cell duration")
+        segments.append(_segment(start, end, requests_per_burst / BURST_WIDTH_S))
+    return segments
+
+
+def _segment(start_s: float, end_s: float, rps: float) -> dict:
+    return {"start_time": _round(start_s), "end_time": _round(end_s), "rps": round(rps, 4)}
+
+
+def _round(value: float) -> float:
+    return int(value) if float(value).is_integer() else round(value, 3)
+
+
+def capacity_rps_for_shape(capacity: CapacityModel, shape_name: str) -> float:
+    """The fitted single-pod capacity prior C_s for one shape."""
+    if shape_name == MIXTURE_NAME:
+        return capacity.mixture_rps(MIXTURE)
+    i, o = SHAPES[shape_name]
+    return capacity.rps(i, o)
+
+
+def build_schedule(
+    model: str,
+    shape_name: str,
+    primitive: str,
+    capacity: CapacityModel,
+    kv_cache_tokens: Optional[int] = None,
+    *,
+    cap: Optional[AdmissionCap] = None,
+) -> tuple[Optional[dict], dict]:
+    """(trace.json body, index metadata) for one (model, shape, primitive).
+
+    Thin wrapper over :func:`build_schedule_from_capacity_rps` that derives C_s from the
+    fitted capacity prior. ``kv_cache_tokens`` is required for the bursts primitive only.
+    """
+    return build_schedule_from_capacity_rps(
+        model,
+        shape_name,
+        primitive,
+        capacity_rps_for_shape(capacity, shape_name),
+        kv_cache_tokens=kv_cache_tokens,
+        capacity_source="prior_fit",
+        cap=cap,
+    )
+
+
+def build_schedule_from_capacity_rps(
+    model: str,
+    shape_name: str,
+    primitive: str,
+    capacity_rps: float,
+    *,
+    kv_cache_tokens: Optional[int] = None,
+    capacity_source: str = "prior_fit",
+    cap: Optional[AdmissionCap] = None,
+) -> tuple[Optional[dict], dict]:
+    """(trace.json body, index metadata) for one (model, shape, primitive) at an
+    explicitly supplied single-pod capacity, so a campaign can regenerate a schedule from
+    a measured C_s instead of the fitted prior.
+
+    ``capacity_source`` is recorded in the metadata next to the capacity actually used, so
+    a schedule regenerated mid-campaign is never mistaken for one built from the prior.
+    ``cap`` is the admission policy the cell is sized for; it defaults to the deployed
+    one, which is also what the committed set is generated against.
+
+    The body is ``None`` when the cell is skipped - today only the bursts primitive skips,
+    when no gateway-admissible spike can push the engine past its running limit. The
+    metadata still goes into the index, carrying the arithmetic that justified the skip.
+    """
+    cap = cap or get_cap(DEFAULT_CAP_NAME)
+    components = shape_components(shape_name)
+    c_s = float(capacity_rps)
+    if c_s <= 0.0:
+        raise ValueError(f"{model} {shape_name}: capacity_rps must be positive, got {c_s}")
+    if shape_name == MIXTURE_NAME:
+        # A mixture has no single (i, o), so its cell id records 0/0. r3_capacity's
+        # sample_from_row then skips it (output_tokens 0 -> unusable), which is correct:
+        # M is held-out validation, never a capacity or theta training point.
+        cell_in, cell_out = 0, 0
+    else:
+        cell_in, cell_out = SHAPES[shape_name]
+    if primitive == "bursts" and kv_cache_tokens is None:
+        raise ValueError(
+            f"{model} {shape_name}: the bursts primitive needs kv_cache_tokens (the engine's "
+            "GPU KV cache size in tokens) - burst size is derived from the engine's running "
+            "limit, not from C_s."
+        )
+
+    meta: dict = {
+        "model": model,
+        "shape": shape_name,
+        "primitive": primitive,
+        "cell_id": f"i{cell_in}_o{cell_out}_c{LOAD_CODE[primitive]}",
+        "held_out": shape_name == MIXTURE_NAME,
+        "capacity_rps": round(c_s, 4),
+        "capacity_source": capacity_source,
+        "admission_cap": cap.name,
+        "skipped": False,
+        "components": [
+            {"weight": w, "input_tokens": i, "max_tokens": o} for w, i, o in components
+        ],
+    }
+
+    extra: dict = {}
+    build: Callable[[float], list[dict]]
+    if primitive == "ramp":
+        ramp_s = ramp_duration_s(c_s, cap)
+        hold_s = ramp_s * RAMP_HOLD_FRACTION
+        extra = {
+            "rho_start": RAMP_RHO_START,
+            "rho_end": RAMP_RHO_END,
+            "ramp_s": _round(ramp_s),
+            "hold_s": _round(hold_s),
+            "drain_rho": RAMP_DRAIN_RHO,
+            "drain_s": RAMP_DRAIN_S,
+            # where a cell truncated on the first proxy 503 jumps to
+            "drain_start_s": _round(ramp_s + hold_s),
+            "backlog_coefficient": RAMP_BACKLOG_COEFFICIENT,
+            "ramp_excess_budget": cap.ramp_excess_budget,
+        }
+
+        def build(weight: float) -> list[dict]:
+            return ramp_segments(c_s * weight, ramp_s)
+
+    elif primitive == "steps":
+
+        def build(weight: float) -> list[dict]:
+            return step_segments(c_s * weight)
+
+    elif primitive == "bursts":
+        tokens_per_req = tokens_per_request(shape_name)
+        kv_cache_tokens = int(kv_cache_tokens)
+        sizing = cap.burst_sizing(kv_cache_tokens, tokens_per_req)
+        sizing_meta = {
+            "kv_cache_tokens": kv_cache_tokens,
+            "tokens_per_request": round(tokens_per_req, 4),
+            **sizing.as_dict(),
+        }
+        if not sizing.reachable:
+            meta["skipped"] = True
+            meta.update(sizing_meta)
+            return None, meta
+        requests = sizing.requests
+        extra = {
+            **sizing_meta,
+            "burst_segment_rps": round(requests / BURST_WIDTH_S, 4),
+        }
+
+        def build(weight: float) -> list[dict]:
+            return burst_segments(c_s * weight, requests * weight)
+
+    else:  # pragma: no cover - PRIMITIVES is the only caller
+        raise ValueError(f"unknown primitive {primitive!r}")
+
+    segments: list[dict] = []
+    for weight, i, o in components:
+        for seg in build(weight):
+            entry = dict(seg)
+            entry["input_tokens"] = i
+            entry["max_tokens"] = o
+            segments.append(entry)
+    segments.sort(key=lambda s: (s["start_time"], s["input_tokens"], s["max_tokens"]))
+
+    duration = max(s["end_time"] for s in segments)
+    planned = sum((s["end_time"] - s["start_time"]) * s["rps"] for s in segments)
+    meta.update(extra)
+    meta["duration_s"] = duration
+    meta["planned_requests"] = int(round(planned))
+    meta["peak_offered_rps"] = round(max(_offered_rps_at(segments)), 4)
+    if primitive == "steps":
+        t = 0.0
+        boundaries = []
+        for _rho, duration_s in STEPS:
+            boundaries.append(_round(t))
+            t += duration_s
+        meta["discard_after_s"] = boundaries
+    return {model: segments}, meta
+
+
+def _offered_rps_at(segments: Sequence[dict]) -> list[float]:
+    """Total offered rps at each segment boundary (superposed overlapping segments)."""
+    edges = sorted({s["start_time"] for s in segments} | {s["end_time"] for s in segments})
+    totals = []
+    for k in range(len(edges) - 1):
+        mid = (edges[k] + edges[k + 1]) / 2.0
+        totals.append(
+            sum(s["rps"] for s in segments if s["start_time"] <= mid < s["end_time"])
+        )
+    return totals or [0.0]
+
+
+def generate(
+    capacity_dir: Path,
+    output_dir: Path,
+    models: Sequence[str],
+    *,
+    capacity_overrides: dict | None = None,
+    kv_cache_overrides: dict | None = None,
+    cap: Optional[AdmissionCap] = None,
+) -> dict:
+    cap = cap or get_cap(DEFAULT_CAP_NAME)
+    index: dict = {
+        "admission_cap": cap.as_dict(),
+        "schedules": [],
+        "capacity_models": {},
+        "shapes": {},
+        "primitives": {},
+    }
+    index["shapes"] = {
+        **{name: {"input_tokens": i, "max_tokens": o} for name, (i, o) in SHAPES.items()},
+        MIXTURE_NAME: {
+            "held_out": True,
+            "components": [
+                {"weight": w, "input_tokens": i, "max_tokens": o} for w, i, o in MIXTURE
+            ],
+        },
+    }
+    # Only shape-independent constants belong here: T_r and B depend on C_s, on the
+    # shape's token count and on the admission cap, and are recorded per cell instead.
+    index["primitives"] = {
+        "ramp": {
+            "rho_start": RAMP_RHO_START, "rho_end": RAMP_RHO_END,
+            "segment_s": RAMP_SEGMENT_S,
+            "hold_fraction": RAMP_HOLD_FRACTION,
+            "backlog_coefficient": RAMP_BACKLOG_COEFFICIENT,
+            "ramp_s_formula": RAMP_DURATION_FORMULA,
+            "drain_rho": RAMP_DRAIN_RHO, "drain_s": RAMP_DRAIN_S,
+        },
+        "steps": {"levels": [{"rho": r, "duration_s": d} for r, d in STEPS]},
+        "bursts": {
+            "base_rho": BURST_BASE_RHO, "duration_s": BURST_DURATION_S,
+            "period_s": BURST_PERIOD_S, "width_s": BURST_WIDTH_S,
+            "burst_requests_formula": BURST_REQUEST_FORMULA,
+            "count": BURST_COUNT, "first_s": BURST_FIRST_S,
+        },
+    }
+
+    for model in models:
+        override = (capacity_overrides or {}).get(model)
+        capacity_path = capacity_dir / f"capacity_{model}.json"
+        if override is not None:
+            _name, points = override
+        else:
+            _name, points = load_capacity_points(capacity_path)
+        kv_override = (kv_cache_overrides or {}).get(model)
+        if kv_override is not None:
+            kv_cache_tokens = int(kv_override)
+        elif override is not None:
+            raise ValueError(
+                f"{model}: a capacity override was supplied without a kv_cache_overrides "
+                "entry; burst sizing needs the engine's GPU KV cache size."
+            )
+        else:
+            kv_cache_tokens = load_kv_cache_tokens(capacity_path)
+        capacity = fit_capacity_model(model, points)
+        index["capacity_models"][model] = {
+            "prefill_tokens_per_s": round(capacity.prefill_tps, 2),
+            "decode_tokens_per_s": round(capacity.decode_tps, 2),
+            "fitted_from_points": capacity.n_points,
+            "rms_relative_error": round(capacity.rms_rel_error, 4),
+            "kv_cache_tokens": kv_cache_tokens,
+        }
+        model_dir = output_dir / model
+        model_dir.mkdir(parents=True, exist_ok=True)
+        for shape_name in [*SHAPES, MIXTURE_NAME]:
+            for primitive in PRIMITIVES:
+                body, meta = build_schedule(
+                    model, shape_name, primitive, capacity, kv_cache_tokens, cap=cap
+                )
+                if body is not None:
+                    path = model_dir / f"{shape_name}_{primitive}.json"
+                    path.write_text(json.dumps(body, indent=2) + "\n", encoding="utf-8")
+                    meta["path"] = str(path.relative_to(output_dir))
+                index["schedules"].append(meta)
+    return index
+
+
+def main() -> int:
+    here = Path(__file__).resolve().parents[2]
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--capacity-dir", type=Path,
+                    default=here / "replayer/traces_v2/calibration/capacity")
+    ap.add_argument("--output-dir", type=Path, default=here / "replayer/traces_v2/calibration")
+    ap.add_argument("--models", default=",".join(MODELS))
+    ap.add_argument("--cap", choices=sorted(CAPS), default=DEFAULT_CAP_NAME,
+                    help="admission policy the schedules are sized for "
+                         f"(default: {DEFAULT_CAP_NAME}, which is what is deployed)")
+    args = ap.parse_args()
+
+    cap = get_cap(args.cap)
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    index = generate(
+        args.capacity_dir, args.output_dir, [m for m in args.models.split(",") if m], cap=cap
+    )
+    (args.output_dir / "INDEX.json").write_text(
+        json.dumps(index, indent=2, sort_keys=False) + "\n", encoding="utf-8"
+    )
+    written = [m for m in index["schedules"] if not m["skipped"]]
+    skipped = [m for m in index["schedules"] if m["skipped"]]
+    print(
+        f"wrote {len(written)} schedules to {args.output_dir} for the {cap.name} policy "
+        f"({cap.admission_controller}-bound, shed ceiling {cap.shed_ceiling}, "
+        f"{len(skipped)} cells skipped)"
+    )
+    for model, cm in index["capacity_models"].items():
+        print(
+            f"  {model}: prefill {cm['prefill_tokens_per_s']} tok/s, "
+            f"decode {cm['decode_tokens_per_s']} tok/s, "
+            f"rms rel err {cm['rms_relative_error']:.1%}, "
+            f"kv cache {cm['kv_cache_tokens']} tokens"
+        )
+    for meta in skipped:
+        print(
+            f"  skipped {meta['model']} {meta['shape']} {meta['primitive']}: "
+            f"needs {meta['burst_requests_needed']} requests > cap "
+            f"{meta['burst_request_cap']} ({meta['binding_limit']}-bound)"
+        )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

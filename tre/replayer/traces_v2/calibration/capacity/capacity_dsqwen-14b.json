@@ -1,0 +1,37 @@
+{
+  "model": "dsqwen-14b",
+  "kv_cache_tokens": 202336,
+  "kv_cache_provenance": {
+    "source": "vllm startup log line GPU KV cache size",
+    "measured": "2026-09-20",
+    "pod": "dsqwen-14b-nscc-ds-4a100-node10-gpu-0-1-899746bf-skzvp",
+    "note": "identical across replicas; per-engine total"
+  },
+  "capacity": [
+    {
+      "input_tokens": 128,
+      "output_tokens": 128,
+      "rps": 12.8
+    },
+    {
+      "input_tokens": 128,
+      "output_tokens": 512,
+      "rps": 1.8666666666666667
+    },
+    {
+      "input_tokens": 512,
+      "output_tokens": 128,
+      "rps": 8.733333333333333
+    },
+    {
+      "input_tokens": 512,
+      "output_tokens": 512,
+      "rps": 1.8666666666666667
+    },
+    {
+      "input_tokens": 1024,
+      "output_tokens": 128,
+      "rps": 2.933333333333333
+    }
+  ]
+}

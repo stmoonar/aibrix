@@ -24,6 +24,16 @@ column, re-aggregate from the raw log with a sliding window at the live refresh 
 (`rewindow_from_raw --window-ms=<W> --step-ms=<refresh>`); the tumbling series here is the
 online quick-look. The streaming raw-logger reuses the replayer's http_sender SSE/usage
 parser (`tre_replayer.engine.http_sender`), so there is a single sender/parse implementation.
+
+OPEN-LOOP MODE (`--schedule <file>`): the worker-pool driver above is closed-loop, so it
+can never offer more load than the engine drains and never produces a waiting queue (see
+`scripts/openloop.py` for the measurements that forced this). With `--schedule` the cell is
+driven instead from a replayer trace file through `dispatch_open_loop`: requests fire at
+wall-clock offsets regardless of completions. The raw JSONL / instant sidecar schemas and
+the window CSV are unchanged, so `rewindow_from_raw.py` and `tre_calibration` consume both
+modes identically -- except that the sidecar samples at `--instant-sample-ms` (1000 ms for
+the calibration campaign, vs the live 10 s gateway grid), so an offline re-window must be
+given the matching `--instant-sample-ms`.
 """
 from __future__ import annotations
 
@@ -35,9 +45,11 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Iterable, Optional
+from typing import Callable, Iterable, Optional, Sequence
 
 from tre_common.rediskeys import SCRAPE_INTERVAL_MS
+
+from scripts import openloop
 
 
 @dataclass(frozen=True)
@@ -144,6 +156,9 @@ RAW_COLUMNS = [
     "send_ts_ms", "recv_first_token_ts_ms", "done_ts_ms",
     "input_tokens", "output_tokens", "ttft_ms", "tpot_ms", "e2e_ms",
     "http_status", "cell_id",
+    # Pod that served the request, when the serving path names one. Per-pod attribution
+    # has to be captured here or not at all: nothing downstream can reconstruct it.
+    "target_pod",
 ]
 
 # S4 disk estimate: each per-request line is ~200 bytes of JSON. Warn if a full run is
@@ -202,12 +217,15 @@ class Checkpoint:
         return cell.scenario_id in self.done
 
 
-#: Mirror of ``tre_replayer.engine.prompts.MODE_TOKEN_IDS``, repeated here so importing
-#: this module never requires the replayer package (guarded by a test).
-PROMPT_MODE_DEFAULT = "token_ids"
+#: Mirror of ``tre_replayer.engine.prompts.DEFAULT_MODE`` and ``MODES``, repeated here so
+#: importing this module never requires the replayer package (guarded by a test).
+PROMPT_MODE_DEFAULT = "natural"
+PROMPT_MODES = ("token_ids", "text", "natural")
 
 
-def _make_prompt(input_tokens: int, seed_key: str, mode: str = PROMPT_MODE_DEFAULT):
+def _make_prompt(
+    input_tokens: int, seed_key: str, mode: str = PROMPT_MODE_DEFAULT, model: str | None = None
+):
     """One request's prompt: ``input_tokens`` long and unique to ``seed_key``.
 
     The grid used to send one constant prompt for a whole cell. On an engine with
@@ -219,7 +237,7 @@ def _make_prompt(input_tokens: int, seed_key: str, mode: str = PROMPT_MODE_DEFAU
     """
     from tre_replayer.engine.prompts import build_prompt
 
-    return build_prompt(input_tokens, seed_key, mode=mode)
+    return build_prompt(input_tokens, seed_key, mode=mode, model=model)
 
 
 def build_raw_record(cell_id: str, send_ts_ms: int, res) -> dict:
@@ -250,7 +268,15 @@ def build_raw_record(cell_id: str, send_ts_ms: int, res) -> dict:
         "e2e_ms": e2e_ms,
         "http_status": res.status,
         "cell_id": cell_id,
+        "target_pod": getattr(res, "target_pod", None),
     }
+
+
+def _request_headers(model: str, routing_strategy: Optional[str] = None) -> dict:
+    """Same rule as the replayer's sender; lazy import for the same reason."""
+    from tre_replayer.engine.http_sender import build_request_headers
+
+    return build_request_headers(model, routing_strategy)
 
 
 def _default_stream_call():
@@ -279,6 +305,7 @@ def drive_cell(
     instant_interval_s: float = 5.0,
     stream_call: Optional[Callable] = None,
     prompt_mode: str = PROMPT_MODE_DEFAULT,
+    routing_strategy: Optional[str] = None,
     run_key: str = "r3",
     now_ms: Callable[[], int] = lambda: int(time.time() * 1000),
 ) -> tuple[int, int]:
@@ -301,17 +328,13 @@ def drive_cell(
     lock = threading.Lock()
     cell_id = cell.scenario_id
     timeout = max(30.0, cell.output_tokens / 4.0)
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "text/event-stream",
-        "model": model,
-    }
+    headers = _request_headers(model, routing_strategy)
     # next() on an itertools.count is atomic under CPython, so the workers can share one
     # sequence without a lock; each value is used by exactly one request.
     sequence = itertools.count()
 
     def request_body(seq: int) -> bytes:
-        prompt = _make_prompt(cell.input_tokens, f"{run_key}|{cell_id}|{seq}", prompt_mode)
+        prompt = _make_prompt(cell.input_tokens, f"{run_key}|{cell_id}|{seq}", prompt_mode, model)
         return json.dumps({
             "model": model, "prompt": prompt, "max_tokens": cell.output_tokens,
             "temperature": 0, "ignore_eos": True,
@@ -387,6 +410,222 @@ def _make_live_instant_sampler(store, model: str, lookback_ms: int) -> Callable[
     return sample
 
 
+def discover_pod_metrics_endpoints(model: str, namespace: str, port: int) -> list[str]:
+    """/metrics URLs of the model's routable pods, via kubectl.
+
+    Only routable pods are scraped: a sleeping/hidden resident on the same card is not
+    serving this load and its (zero) gauges would dilute the queue average, which is the
+    one observable the open-loop primitives exist to measure.
+    """
+    import subprocess
+
+    out = subprocess.run(
+        [
+            "kubectl", "-n", namespace, "get", "pods",
+            "-l", f"model.aibrix.ai/name={model},tre.aibrix.io/routable=true",
+            "-o", "jsonpath={range .items[*]}{.status.podIP}{\"\\n\"}{end}",
+        ],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    ips = [line.strip() for line in out.splitlines() if line.strip()]
+    if not ips:
+        raise RuntimeError(
+            f"no routable pods found for model {model!r} in namespace {namespace!r}; "
+            "the sidecar would have nothing to sample"
+        )
+    return [f"http://{ip}:{port}/metrics" for ip in ips]
+
+
+def drain_start_from_index(schedule_path: Path, model: str) -> Optional[float]:
+    """The offset of a schedule's drain segment, read from its generated INDEX.json.
+
+    A cell truncated by a gateway shed jumps to that offset instead of stopping dead, so
+    the recovery tail is still captured. The lookup is best effort: a schedule run from
+    outside a generated set simply has no drain segment to jump to, and truncation then
+    means "stop sending", which is still correct - just less informative.
+    """
+    index_path = Path(schedule_path).resolve().parent.parent / "INDEX.json"
+    if not index_path.exists():
+        return None
+    try:
+        index = json.loads(index_path.read_text(encoding="utf-8"))
+    except (ValueError, OSError):
+        return None
+    wanted = f"{model}/{Path(schedule_path).name}"
+    for entry in index.get("schedules", []):
+        if entry.get("path") == wanted or Path(str(entry.get("path", ""))).name == Path(schedule_path).name:
+            value = entry.get("drain_start_s")
+            return None if value is None else float(value)
+    return None
+
+
+def count_slo_windows(rows: Sequence[dict], *, ttft_slo_ms: float, tpot_slo_ms: float) -> int:
+    """Windows whose p95 latency is above the SLO.
+
+    This is the evidence a cell exists to produce: theta is a threshold on the signal at
+    the moment the model stops meeting its SLO, so a cell that never crossed measured
+    nothing about it. A window with no p95 at all (too few samples) is not a crossing.
+    """
+    crossed = 0
+    for row in rows:
+        ttft = row.get("p95_ttft")
+        tpot = row.get("p95_tpot")
+        if ttft is not None and float(ttft) > ttft_slo_ms:
+            crossed += 1
+        elif tpot is not None and float(tpot) > tpot_slo_ms:
+            crossed += 1
+    return crossed
+
+
+def censor_after(rows: Sequence[dict], truncated_at_ts_ms: Optional[int]) -> tuple[list, int]:
+    """Drop the windows that start at or after a truncation. Returns (kept, dropped).
+
+    After a gateway shed the offered load is no longer what the schedule says: the driver
+    has stopped sending and the engine is draining. Those windows describe the recovery,
+    not the operating point, so they must not reach the fit.
+    """
+    if truncated_at_ts_ms is None:
+        return list(rows), 0
+    kept = [row for row in rows if int(row["window_start_ms"]) < int(truncated_at_ts_ms)]
+    return kept, len(rows) - len(kept)
+
+
+def run_schedule_cell(args, store, spec) -> tuple[list, "openloop.CellGuard"]:
+    """Drive one open-loop cell from --schedule and return (window rows, guard)."""
+    from tre_replayer.traces.loader import load_trace_segments
+
+    segments = [
+        seg for seg in load_trace_segments(args.schedule) if seg.model == args.model
+    ]
+    if not segments:
+        raise SystemExit(
+            f"schedule {args.schedule} has no segments for model {args.model!r}"
+        )
+    cell_id = args.cell_id or _cell_id_from_schedule(Path(args.schedule), args.model, segments)
+    cell = GridCell.from_scenario_id(cell_id)  # fail now, not in rewindow_from_raw
+
+    if args.instant_source == "pod":
+        endpoints = args.pod_endpoint or discover_pod_metrics_endpoints(
+            args.model, args.namespace, args.pod_metrics_port
+        )
+        sampler = openloop.make_pod_metrics_sampler(endpoints)
+        print(f"sidecar: {len(endpoints)} pod /metrics endpoint(s) @ {args.instant_sample_ms}ms")
+    else:
+        sampler = _make_live_instant_sampler(store, args.model, 2 * SCRAPE_INTERVAL_MS)
+
+    raw_dir = None if args.no_raw else Path(args.raw_dir) / Path(args.output).stem
+    if raw_dir is not None:
+        raw_dir.mkdir(parents=True, exist_ok=True)
+    raw_path = raw_dir / f"{cell_id}.jsonl" if raw_dir is not None else None
+    instant_path = raw_dir / f"{cell_id}.instant.jsonl" if raw_dir is not None else None
+    failures_path = raw_dir / f"{cell_id}.failures.jsonl" if raw_dir is not None else None
+
+    drain_start_s = args.drain_start_s
+    if drain_start_s is None:
+        drain_start_s = drain_start_from_index(Path(args.schedule), args.model)
+    if args.truncate_on_proxy_shed:
+        where = "stop sending" if drain_start_s is None else f"jump to {drain_start_s:.1f}s (drain)"
+        print(f"truncation armed: first gateway shed -> {where}")
+
+    ttft_slo_ms = args.ttft_slo_ms if args.ttft_slo_ms is not None else spec.slo.ttft_p95_ms
+    tpot_slo_ms = args.tpot_slo_ms if args.tpot_slo_ms is not None else spec.slo.tpot_p95_ms
+
+    start_ms, end_ms, guard = openloop.drive_cell_schedule(
+        args.gateway_url, args.model, cell_id, segments,
+        seed=args.schedule_seed,
+        raw_path=raw_path, instant_path=instant_path,
+        instant_sampler=sampler,
+        instant_interval_s=args.instant_sample_ms / 1000.0,
+        prompt_mode=args.prompt_mode,
+        routing_strategy=args.routing_strategy,
+        max_in_flight=args.max_in_flight,
+        truncate_on_proxy_shed=args.truncate_on_proxy_shed,
+        drain_start_s=drain_start_s,
+        failures_path=failures_path,
+        guard_kwargs={
+            "max_p99_delay_ms": args.max_p99_delay_ms,
+            "max_p99_pool_wait_ms": args.max_p99_pool_wait_ms,
+            "max_model_error_rate": args.max_model_error_rate,
+            "min_slo_windows": args.min_slo_windows,
+            "max_routing_imbalance": args.max_routing_imbalance,
+        },
+    )
+
+    windows = []
+    w = start_ms
+    while w + args.window_ms <= end_ms:
+        windows.append(store.read_model_window(args.model, w, w + args.window_ms))
+        w += args.window_ms
+    results = compute_window_results(windows, spec)
+    rows = [
+        window_row(cell, wm, result.TRS, result.Q_ctl)
+        for wm, result in zip(windows, results)
+    ]
+    rows, censored_windows = censor_after(rows, guard.truncated_at_ts_ms)
+    guard = guard.with_slo_windows(
+        count_slo_windows(rows, ttft_slo_ms=ttft_slo_ms, tpot_slo_ms=tpot_slo_ms)
+    )
+
+    artifact = guard.as_dict()
+    artifact.update({
+        "schedule": str(args.schedule),
+        "model": args.model,
+        "drain_start_s": drain_start_s,
+        "censored_windows": censored_windows,
+        "windows": len(rows),
+        "ttft_slo_ms": ttft_slo_ms,
+        "tpot_slo_ms": tpot_slo_ms,
+        "start_ms": start_ms,
+        "end_ms": end_ms,
+        "instant_sample_ms": args.instant_sample_ms,
+        # How the load was actually generated and routed. Recorded per cell because a
+        # capacity number is only comparable to another one made the same way.
+        "prompt_mode": args.prompt_mode,
+        "routing_strategy": args.routing_strategy,
+    })
+    if raw_dir is not None:
+        (raw_dir / f"{cell_id}.guard.json").write_text(
+            json.dumps(artifact, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+    print(f"cell {cell_id} guard: {json.dumps(artifact, sort_keys=True)}")
+    if guard.truncated:
+        print(
+            f"cell {cell_id} was TRUNCATED by a gateway shed at offset "
+            f"{guard.truncated_at_offset_s}s: {guard.censored} request(s) censored, "
+            f"{censored_windows} window(s) dropped, {guard.slo_windows} window(s) above "
+            f"the SLO kept"
+        )
+    if args.guard_mode == "fail":
+        openloop.raise_on_guard(guard)
+    elif not guard.ok:
+        print(f"WARNING: cell {cell_id} guard failed (continuing on --guard-mode warn)")
+    return rows, guard
+
+
+def _cell_id_from_schedule(path: Path, model: str, segments: list) -> str:
+    """Default scenario id for a schedule file: ``i<in>_o<out>_c<load-code>``.
+
+    The load code is 100x the primitive's characteristic rho, as written by
+    gen_calibration_schedules.py, and is recovered here from the file name so a schedule
+    run from the committed tree needs no extra flag. A mixture schedule (several token
+    shapes) records i0_o0, which r3_capacity then correctly declines to fit.
+    """
+    from scripts.gen_calibration_schedules import LOAD_CODE
+
+    stem = path.stem  # <shape>_<primitive>
+    primitive = stem.rsplit("_", 1)[-1]
+    if primitive not in LOAD_CODE:
+        raise SystemExit(
+            f"cannot derive a cell id from {path.name!r}; pass --cell-id explicitly"
+        )
+    shapes = {(s.input_tokens, s.max_output_tokens) for s in segments}
+    if len(shapes) == 1:
+        i, o = next(iter(shapes))
+    else:
+        i, o = 0, 0
+    return f"i{i or 0}_o{o or 0}_c{LOAD_CODE[primitive]}"
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
@@ -401,13 +640,21 @@ def main() -> int:
     ap.add_argument("--window-ms", type=int, default=30000)
     ap.add_argument("--redis-url", default="redis://tre-v2-redis:6379/0")
     ap.add_argument("--metrics-schema", default="v1")
-    # Instant sampler cadence + expected_samples divisor. MUST match the gateway scrape
-    # cadence (SCRAPE_INTERVAL_MS=10000): a smaller value doubles expected_samples and
-    # halves the offline queue average vs. the online path (r3 SMOKE_FINDINGS defect 2).
-    ap.add_argument("--instant-sample-ms", type=int, default=SCRAPE_INTERVAL_MS)
+    # Sidecar sampling cadence (how often WE sample the queue into the .instant.jsonl).
+    # This is NOT the divisor MetricsStore uses: the redis buckets it reads are written by
+    # the gateway on its own 10 s ticker, so that divisor is --store-instant-sample-ms and
+    # must stay at SCRAPE_INTERVAL_MS. An offline rewindow_from_raw of this capture must be
+    # passed --instant-sample-ms equal to the value used here.
+    # Closed-loop default stays the gateway cadence. Schedule mode defaults to 1 s: the
+    # gateway grid gives 3 samples per 30 s window, which aliases away the short-lived
+    # waiting queue the bursts primitive exists to produce (see scripts/openloop.py).
+    ap.add_argument("--instant-sample-ms", type=int, default=None)
+    # expected_samples divisor for the redis windows: the gateway's cadence, not ours.
+    ap.add_argument("--store-instant-sample-ms", type=int, default=SCRAPE_INTERVAL_MS)
     ap.add_argument("--percentile-mode", default="bucket_upper")
     ap.add_argument("--min-latency-samples", type=int, default=10)  # align with live TRE_MIN_LATENCY_SAMPLES
     ap.add_argument("--registry", default=None)
+    ap.add_argument("--namespace", default="default", help="namespace holding the model pods")
     ap.add_argument("--only-first-cell", action="store_true")
     # S4: raw per-request log lands on local disk (NOT NFS: doc15 §4.3). Default is 76's
     # local experiments dir; a subdir per output stem keeps concurrent runs separate.
@@ -419,11 +666,78 @@ def main() -> int:
     # Prompt synthesis. token_ids sends an explicit token-id list, so the realised
     # prompt length is exact; text is the fallback for an endpoint that only accepts a
     # string. Either way each request gets its own prompt (no prefix-cache freebies).
-    ap.add_argument("--prompt-mode", default=PROMPT_MODE_DEFAULT, choices=["token_ids", "text"])
+    ap.add_argument("--prompt-mode", default=PROMPT_MODE_DEFAULT, choices=list(PROMPT_MODES),
+                    help="natural: English prose cut to the exact token count with the "
+                         "model's own tokenizer (default). token_ids: uniformly random "
+                         "ids - exact, but not language. text: nominal length only.")
+    ap.add_argument("--routing-strategy", default=None,
+                    help="Route via the AIBrix gateway plugin with this strategy (e.g. "
+                         "least-request) instead of the per-model HTTPRoute. This is the "
+                         "only way the answers name a serving pod, so it is what makes "
+                         "the per-pod routing-balance check in the guard artifact "
+                         "non-empty - but it also changes who picks the pod, so runs made "
+                         "with and without it are not comparable.")
+    ap.add_argument("--max-routing-imbalance", type=float,
+                    default=openloop.DEFAULT_MAX_ROUTING_IMBALANCE,
+                    help="Fail a cell whose busiest pod served more than this multiple of "
+                         "its quietest pod's requests. Unset by default: the balance is "
+                         "reported in the guard artifact but never gates a cell.")
     # Seeds prompt content. Defaults to the output stem so two runs writing different
     # CSVs differ, and re-running the same output reproduces the same prompts.
     ap.add_argument("--run-key", default=None)
+    # ---- open-loop (schedule-driven) mode ----
+    ap.add_argument("--schedule", default=None,
+                    help="replayer trace file; switches this cell to the open-loop driver")
+    ap.add_argument("--cell-id", default=None,
+                    help="scenario id for the schedule cell (default: from the schedule INDEX "
+                         "convention i<in>_o<out>_c<load-code>); must parse as a GridCell or "
+                         "rewindow_from_raw will skip the raw file")
+    ap.add_argument("--schedule-seed", type=int, default=1234)
+    ap.add_argument("--max-in-flight", type=int, default=openloop.DEFAULT_MAX_IN_FLIGHT)
+    # Sidecar source. "pod" scrapes the model pods' /metrics directly at
+    # --instant-sample-ms (1 s for the campaign); "store" is the legacy redis read, which
+    # cannot resolve faster than the gateway's 10 s grid.
+    ap.add_argument("--instant-source", default="pod", choices=["pod", "store"])
+    ap.add_argument("--pod-metrics-port", type=int, default=8000)
+    ap.add_argument("--pod-endpoint", action="append", default=[],
+                    help="explicit http://ip:port/metrics endpoint; repeatable. Default: "
+                         "discovered from the routable pods of --model")
+    ap.add_argument("--max-p99-delay-ms", type=float, default=openloop.DEFAULT_MAX_P99_DELAY_MS)
+    ap.add_argument("--max-p99-pool-wait-ms", type=float,
+                    default=openloop.DEFAULT_MAX_P99_POOL_WAIT_MS)
+    # Only MODEL errors count against the budget. A gateway shed is the campaign hitting
+    # the admission ceiling, not the engine failing, and it truncates the cell instead.
+    ap.add_argument("--max-model-error-rate", type=float,
+                    default=openloop.DEFAULT_MAX_MODEL_ERROR_RATE)
+    ap.add_argument("--truncate-on-proxy-shed", action="store_true", default=True,
+                    help="on the first gateway shed, jump to the schedule drain segment "
+                         "and censor the windows after it (default: on)")
+    ap.add_argument("--no-truncate-on-proxy-shed", action="store_false",
+                    dest="truncate_on_proxy_shed",
+                    help="keep offering load after a gateway shed (the cell then measures "
+                         "the circuit breaker, not the engine)")
+    ap.add_argument("--drain-start-s", type=float, default=None,
+                    help="offset a truncated cell jumps to (default: the schedule's "
+                         "drain_start_s from its generated INDEX.json)")
+    ap.add_argument("--min-slo-windows", type=int, default=openloop.DEFAULT_MIN_SLO_WINDOWS,
+                    help="windows above the SLO a truncated cell must already have "
+                         "collected to still pass")
+    ap.add_argument("--ttft-slo-ms", type=float, default=None,
+                    help="p95 TTFT SLO for the window evidence count (default: registry)")
+    ap.add_argument("--tpot-slo-ms", type=float, default=None,
+                    help="p95 TPOT SLO for the window evidence count (default: registry)")
+    ap.add_argument("--guard-mode", default="fail", choices=["fail", "warn"],
+                    help="fail: a cell that did not deliver its load aborts the run")
     args = ap.parse_args()
+    if args.schedule is None and args.instant_source == "pod":
+        # The closed-loop path historically reads the store; keep that default intact.
+        args.instant_source = "store"
+    if args.instant_sample_ms is None:
+        args.instant_sample_ms = (
+            int(openloop.DEFAULT_SIDECAR_INTERVAL_S * 1000)
+            if args.schedule is not None
+            else SCRAPE_INTERVAL_MS
+        )
 
     cells = enumerate_cells(
         (int(x) for x in args.input_buckets.split(",")),
@@ -431,6 +745,10 @@ def main() -> int:
         (int(x) for x in args.concurrency.split(",")),
     )
     if args.only_first_cell:
+        cells = cells[:1]
+    if args.schedule is not None:
+        # The schedule replaces the grid entirely; keep one nominal cell only so the raw
+        # disk estimate below has something to size against.
         cells = cells[:1]
 
     out = Path(args.output)
@@ -459,7 +777,7 @@ def main() -> int:
     redis_client = redis.Redis.from_url(args.redis_url)
     store = MetricsStore(
         redis_client, registry,
-        instant_sample_interval_ms=args.instant_sample_ms,
+        instant_sample_interval_ms=args.store_instant_sample_ms,
         percentile_mode=args.percentile_mode,
         schema=args.metrics_schema,
         min_latency_samples=args.min_latency_samples,  # align p95 with the live N1 guard
@@ -468,6 +786,12 @@ def main() -> int:
     # range even with scrape/write lag (r3 SMOKE_FINDINGS defect 1); read_latest_instant
     # then takes the freshest bucket, not a lookback-wide average.
     instant_sampler = _make_live_instant_sampler(store, args.model, 2 * SCRAPE_INTERVAL_MS)
+
+    if args.schedule is not None:
+        rows, _guard = run_schedule_cell(args, store, spec)
+        write_csv(rows, out)
+        print(f"wrote {len(rows)} rows to {out}")
+        return 0
 
     # Resume-safe: seed rows from the rows already on disk for checkpoint-done cells, so the
     # per-cell full rewrite below appends instead of truncating away prior captures.
@@ -481,7 +805,8 @@ def main() -> int:
             args.gateway_url, args.model, cell, args.cell_seconds,
             raw_path=raw_path, instant_path=instant_path,
             instant_sampler=instant_sampler, instant_interval_s=args.instant_sample_ms / 1000.0,
-            prompt_mode=args.prompt_mode, run_key=run_key,
+            prompt_mode=args.prompt_mode, routing_strategy=args.routing_strategy,
+            run_key=run_key,
         )
         windows = []
         w = start_ms

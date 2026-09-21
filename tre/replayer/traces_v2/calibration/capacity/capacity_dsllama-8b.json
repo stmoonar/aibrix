@@ -1,0 +1,42 @@
+{
+  "model": "dsllama-8b",
+  "kv_cache_tokens": 147536,
+  "kv_cache_provenance": {
+    "source": "vllm startup log line GPU KV cache size",
+    "measured": "2026-09-20",
+    "pod": "dsllama-8b-nscc-ds-4a100-node10-gpu-0-6f456d8d99-m7vnv",
+    "note": "identical across replicas; per-engine total"
+  },
+  "capacity": [
+    {
+      "input_tokens": 128,
+      "output_tokens": 128,
+      "rps": 13.866666666666667
+    },
+    {
+      "input_tokens": 128,
+      "output_tokens": 512,
+      "rps": 4.266666666666667
+    },
+    {
+      "input_tokens": 512,
+      "output_tokens": 128,
+      "rps": 10.666666666666666
+    },
+    {
+      "input_tokens": 512,
+      "output_tokens": 512,
+      "rps": 3.2
+    },
+    {
+      "input_tokens": 1024,
+      "output_tokens": 128,
+      "rps": 5.333333333333333
+    },
+    {
+      "input_tokens": 1024,
+      "output_tokens": 512,
+      "rps": 3.2
+    }
+  ]
+}
