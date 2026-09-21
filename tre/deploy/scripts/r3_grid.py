@@ -531,6 +531,21 @@ def run_schedule_cell(args, store, spec) -> tuple[list, "openloop.CellGuard"]:
     raw_path = raw_dir / f"{cell_id}.jsonl" if raw_dir is not None else None
     instant_path = raw_dir / f"{cell_id}.instant.jsonl" if raw_dir is not None else None
     failures_path = raw_dir / f"{cell_id}.failures.jsonl" if raw_dir is not None else None
+    rps_path = raw_dir / f"{cell_id}.rps.csv" if raw_dir is not None else None
+
+    # Where this run's prompts are materialised. Never the committed schedule tree: the
+    # schedules are a few kB of segments and the prompt text of one cell is tens of MB.
+    # Defaults to the raw capture directory, which is already this run's own output
+    # directory; the campaign points it at <out-dir>/prompts instead.
+    prompt_dir = Path(args.prompt_dir) if args.prompt_dir else raw_dir
+    if prompt_dir is None:
+        print(
+            "WARNING: no --prompt-dir and raw logging is off, so prompts will be built "
+            "on the send path; the cell's on-wire delay will include a tokenizer fit per "
+            "request"
+        )
+    else:
+        prompt_dir.mkdir(parents=True, exist_ok=True)
 
     drain_start_s = args.drain_start_s
     if drain_start_s is None:
@@ -560,6 +575,9 @@ def run_schedule_cell(args, store, spec) -> tuple[list, "openloop.CellGuard"]:
         instant_sampler=sampler,
         instant_interval_s=args.instant_sample_ms / 1000.0,
         prompt_mode=args.prompt_mode,
+        prompt_dir=prompt_dir,
+        prompt_workers=args.prompt_workers,
+        rps_timeline_path=rps_path,
         routing_strategy=args.routing_strategy,
         max_in_flight=args.max_in_flight,
         truncate_on_proxy_shed=args.truncate_on_proxy_shed,
@@ -618,6 +636,12 @@ def run_schedule_cell(args, store, spec) -> tuple[list, "openloop.CellGuard"]:
         # capacity number is only comparable to another one made the same way.
         "prompt_mode": args.prompt_mode,
         "routing_strategy": args.routing_strategy,
+        "prompt_file": (
+            None
+            if prompt_dir is None
+            else str(openloop.prompt_file_path_for(prompt_dir, cell_id))
+        ),
+        "rps_timeline": None if rps_path is None else str(rps_path),
     })
     if raw_dir is not None:
         (raw_dir / f"{cell_id}.guard.json").write_text(
@@ -714,6 +738,13 @@ def main() -> int:
     # Prompt synthesis. token_ids sends an explicit token-id list, so the realised
     # prompt length is exact; text is the fallback for an endpoint that only accepts a
     # string. Either way each request gets its own prompt (no prefix-cache freebies).
+    ap.add_argument("--prompt-dir", default=None,
+                    help="directory this run materialises its prompts into, before the "
+                         "cell starts (default: alongside the raw capture). Never the "
+                         "committed schedule tree")
+    ap.add_argument("--prompt-workers", type=int, default=None,
+                    help="processes used to pre-build prompts (default: one per core, "
+                         "capped); the tokenizer holds the GIL, so threads do not help")
     ap.add_argument("--prompt-mode", default=PROMPT_MODE_DEFAULT, choices=list(PROMPT_MODES),
                     help="natural: English prose cut to the exact token count with the "
                          "model's own tokenizer (default). token_ids: uniformly random "

@@ -11,6 +11,29 @@ never touch the network. The default seam uses urllib + SSE parsing.
 Each record also carries ``target_pod``: the pod that served the request, when the
 serving path names one. See :class:`StreamingHttpSender` - it does not on the default
 path, and the field is then None rather than guessed.
+
+Timing a request's lateness
+---------------------------
+Every row carries the gap between "this request is due" and "its bytes are going out",
+broken into the three segments that make it up, so a late cell can be attributed rather
+than guessed at:
+
+* ``schedule_delay_ms`` - the dispatcher fired the send later than the schedule said.
+  The event loop was behind.
+* ``pool_wait_ms`` - the fired send then waited for a sender thread. The pool starved,
+  i.e. the open loop had degenerated into a closed loop bounded by the driver.
+* ``body_build_ms`` - the worker had the request but had not yet called the socket:
+  prompt lookup (or, without a materialised store, a full tokenizer fit) plus JSON
+  encoding.
+* ``on_wire_delay_ms`` - the sum of the three, and the only one of them that answers the
+  question the open loop actually asks: **how much later than its scheduled instant did
+  this request reach the wire?** It is measured immediately before the transport call,
+  so nothing between the schedule and the socket is outside it.
+
+``on_wire_delay_ms`` is what a calibration cell is held to (see
+``scripts.openloop.check_cell``). The other three stay because they decompose it, and a
+cell that misses its deadline is only actionable once it is known which of the three
+segments consumed the time.
 """
 from __future__ import annotations
 
@@ -21,6 +44,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from tre_replayer.engine.prompt_store import PromptStore, sender_seed_key
 from tre_replayer.engine.prompts import DEFAULT_MODE, build_prompt
 from tre_replayer.engine.schedule import ScheduledRequest
 
@@ -117,6 +141,7 @@ class StreamingHttpSender:
         output_tokens_default: int = 128,
         max_in_flight: int = 512,
         prompt_mode: str = DEFAULT_MODE,
+        prompt_store: PromptStore | None = None,
         routing_strategy: str | None = None,
         now_ms: Callable[[], int] = _now_ms,
         mono: Callable[[], float] = time.monotonic,
@@ -126,6 +151,10 @@ class StreamingHttpSender:
         self._in = input_tokens_default
         self._out = output_tokens_default
         self._prompt_mode = prompt_mode
+        # Prompts built before the run started (tre_replayer.engine.prompt_store). Without
+        # one the sender falls back to fitting each prompt inline, which costs milliseconds
+        # of GIL-held tokenizer work inside on_wire_delay_ms - see that module's docstring.
+        self._prompt_store = prompt_store
         self._routing_strategy = routing_strategy
         self._now = now_ms
         self._mono = mono
@@ -156,23 +185,50 @@ class StreamingHttpSender:
     def max_pool_wait_ms(self) -> float:
         return max((r.get("pool_wait_ms", 0.0) for r in self.records), default=0.0)
 
-    def _send_one(self, request: ScheduledRequest, scheduled_ts: float, actual_ts: float) -> dict[str, Any]:
-        # time from the dispatcher scheduling this send to a worker actually picking it up;
-        # a large p99 here means the pool starved and the replay under-drove the target (F5).
-        pool_wait_ms = max(0.0, (self._mono() - actual_ts) * 1000.0)
-        out_tokens = request.max_output_tokens or self._out
-        in_tokens = request.prompt_tokens or self._in
-        # A trace may carry its own prompt text; otherwise synthesise one that is unique
-        # to this request. A constant prompt would be served from the prefix cache on any
-        # engine that has it enabled, making prefill free and the measurement worthless
-        # (see tre_replayer.engine.prompts). Seed key = model + request_id, both
-        # deterministic per trace, so a replay sends byte-identical prompts.
-        prompt = request.prompt or build_prompt(
+    def max_on_wire_delay_ms(self) -> float:
+        return max((r.get("on_wire_delay_ms", 0.0) for r in self.records), default=0.0)
+
+    @property
+    def prompt_store_misses(self) -> int:
+        """Requests whose prompt was not materialised and had to be built on the send
+        path. Non-zero means part of this run paid the tokenizer fit inside its own
+        lateness; it is reported per cell so the regression cannot be silent."""
+        return 0 if self._prompt_store is None else self._prompt_store.misses
+
+    def _prompt_for(self, request: ScheduledRequest, in_tokens: int):
+        """This request's prompt: its own, the materialised one, or an inline fit.
+
+        The inline fit is the fallback, not the design. It uses the same builder and the
+        same seed key as the materialiser, so a run that falls back sends byte-identical
+        bytes to one that did not - it just pays for them at the wrong moment.
+        """
+        if request.prompt:
+            return request.prompt
+        if self._prompt_store is not None:
+            materialised = self._prompt_store.get(request.request_id)
+            if materialised is not None:
+                return materialised
+        return build_prompt(
             in_tokens,
-            f"{request.model}|{request.request_id}",
+            sender_seed_key(request.model, request.request_id),
             mode=self._prompt_mode,
             model=request.model,
         )
+
+    def _send_one(self, request: ScheduledRequest, scheduled_ts: float, actual_ts: float) -> dict[str, Any]:
+        # time from the dispatcher scheduling this send to a worker actually picking it up;
+        # a large p99 here means the pool starved and the replay under-drove the target (F5).
+        pickup_ts = self._mono()
+        pool_wait_ms = max(0.0, (pickup_ts - actual_ts) * 1000.0)
+        out_tokens = request.max_output_tokens or self._out
+        in_tokens = request.prompt_tokens or self._in
+        # A trace may carry its own prompt text; otherwise use the one materialised for
+        # this request before the run began. A constant prompt would be served from the
+        # prefix cache on any engine that has it enabled, making prefill free and the
+        # measurement worthless (see tre_replayer.engine.prompts); the materialiser keeps
+        # one distinct prompt per request and takes the cost of building it off this path
+        # (see tre_replayer.engine.prompt_store).
+        prompt = self._prompt_for(request, in_tokens)
         body = json.dumps(
             {
                 "model": request.model,
@@ -186,6 +242,9 @@ class StreamingHttpSender:
         ).encode("utf-8")
         headers = build_request_headers(request.model, self._routing_strategy)
         timeout_s = max(30.0, out_tokens / 4.0)
+        # Last instant before the transport call: everything the driver does between the
+        # scheduled instant and here is inside on_wire_delay_ms, prompt work included.
+        wire_ts = self._mono()
         send_ts_ms = self._now()
         with self._in_flight_lock:
             self._in_flight += 1
@@ -203,9 +262,17 @@ class StreamingHttpSender:
             "request_id": request.request_id,
             "model": request.model,
             "scheduled_offset_ms": int(scheduled_ts * 1000),  # dispatcher monotonic clock, NOT epoch
+            # The request's own place in the schedule, in the schedule's time base. Kept
+            # verbatim so the achieved arrival series can be binned on the same grid as
+            # the nominal one (tre_replayer.engine.rps_timeline).
+            "scheduled_offset_s": float(request.scheduled_offset_s),
             "actual_send_ts_ms": send_ts_ms,
             "schedule_delay_ms": max(0.0, (actual_ts - scheduled_ts) * 1000.0),
             "pool_wait_ms": round(pool_wait_ms, 3),
+            "body_build_ms": round(max(0.0, (wire_ts - pickup_ts) * 1000.0), 3),
+            # Scheduled instant -> socket call. The guard's deadline; see the module
+            # docstring for why the three segments above are not it.
+            "on_wire_delay_ms": round(max(0.0, (wire_ts - scheduled_ts) * 1000.0), 3),
             "ttft_ms": res.first_token_ms,
             "e2e_ms": res.done_ms,
             "input_tokens": in_tokens,

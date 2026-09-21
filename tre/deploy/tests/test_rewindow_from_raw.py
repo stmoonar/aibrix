@@ -582,3 +582,24 @@ def test_main_live_grid_records_gap_threshold(tmp_path: Path, monkeypatch: pytes
     assert gap["threshold"] == pytest.approx(5.0)
     assert gap["raw_crossings"] == 0  # waiting never exceeds 5 -> nothing to miss
     assert gap["observability_gap"] == 0.0
+
+
+def test_the_materialised_prompt_file_is_not_mistaken_for_a_cell(tmp_path) -> None:
+    """A cell writes its prompts next to its raw capture and they end in .jsonl too.
+    Re-windowing one as if it held per-request measurements would invent a cell out of
+    the load generator's own input."""
+    (tmp_path / "i256_o128_c60.jsonl").write_text("{}\n", encoding="utf-8")
+    (tmp_path / "i256_o128_c60.instant.jsonl").write_text("{}\n", encoding="utf-8")
+    (tmp_path / "i256_o128_c60.failures.jsonl").write_text("{}\n", encoding="utf-8")
+    (tmp_path / "i256_o128_c60.prompts.jsonl").write_text("{}\n", encoding="utf-8")
+
+    kept, _skipped = rewindow_from_raw.discover_cell_files(tmp_path)
+    assert [path.name for path in kept] == ["i256_o128_c60.jsonl"]
+
+
+def test_the_prompt_file_name_the_replayer_writes_is_the_one_excluded() -> None:
+    """The two ends of the exclusion are in different packages; a drift would put the
+    prompts back into the fit."""
+    from tre_replayer.engine import prompt_store
+
+    assert prompt_store.PROMPT_FILE_SUFFIX in rewindow_from_raw.SIDECAR_JSONL_SUFFIXES

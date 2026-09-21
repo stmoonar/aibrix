@@ -37,6 +37,15 @@ What is in here
 * :class:`PendingOverflowSentinel` - reads Envoy's own ``upstream_rq_pending_overflow``
   around a cell. A non-zero delta means the capture was shaped by the proxy and the run
   is invalid. It is a validity check only and never enters a control law.
+* the per-cell **prompt materialisation**: every prompt of a cell's schedule is built
+  in a process pool before the cell starts and written under the run's output directory,
+  so the send path does a dict lookup instead of a tokenizer fit. See
+  :mod:`tre_replayer.engine.prompt_store` for the measurements that forced it, and
+  :data:`VOID_DISPATCH_DELAY` for the deadline that now covers it.
+* the per-cell **arrival series** (``<cell>.rps.csv``): nominal against achieved requests
+  per second, binned on the schedule's own time base from the instants the requests
+  really went on the wire. It is the evidence that the cell offered the intensity its
+  schedule describes.
 * :func:`make_pod_metrics_sampler` - a 1 Hz sidecar that scrapes the model pods'
   ``/metrics`` directly instead of reading the gateway's redis buckets. The gateway
   writes instantaneous gauges on a 10 s boundary-aligned ticker
@@ -64,14 +73,25 @@ from tre_common.rediskeys import SCRAPE_INTERVAL_MS
 #: Sidecar cadence for the campaign. One sample per second; see the module docstring.
 DEFAULT_SIDECAR_INTERVAL_S = 1.0
 
+#: Bin width of the per-cell arrival series. Mirror of
+#: :data:`tre_replayer.engine.rps_timeline.DEFAULT_WINDOW_S`, repeated here so importing
+#: this module never requires the replayer package (guarded by a test), exactly as
+#: ``r3_grid`` mirrors the prompt mode.
+DEFAULT_RPS_WINDOW_S = 1.0
+
 #: The cadence the live control path actually observes. Samples are tagged against this
 #: grid so a capture can be replayed at either resolution.
 LIVE_GRID_MS = SCRAPE_INTERVAL_MS
 
-#: Guard defaults. ``p99_delay`` is how late the dispatcher fired a request relative to
-#: its scheduled time; ``pool_wait`` is how long a fired request then waited for a sender
-#: thread. Either one growing means the "open loop" has quietly become a closed loop
-#: bounded by the driver, which is the exact failure this whole module exists to avoid.
+#: Guard defaults. The deadline is on ``on_wire_delay`` - the gap between a request's
+#: scheduled instant and the instant its bytes actually went to the transport - because
+#: that, and only that, is what "offered at time t" means for an open loop. Its three
+#: parts (``schedule_delay``, ``pool_wait``, ``body_build``) are each recorded so a miss
+#: can be attributed, but none of them is the deadline: a driver that fires on time and
+#: then spends 7 ms fitting a prompt has still not offered the load on time. Either the
+#: pool starving or the body build growing means the "open loop" has quietly become a
+#: closed loop bounded by the driver, which is the exact failure this module exists to
+#: avoid.
 DEFAULT_MAX_P99_DELAY_MS = 250.0
 DEFAULT_MAX_P99_POOL_WAIT_MS = 250.0
 #: The ceiling a *calibration* cell is held to, ten times tighter than the replay
@@ -462,6 +482,19 @@ class CellGuard:
     proxy_errors: int
     p99_delay_ms: float
     p99_pool_wait_ms: float
+    #: Scheduled instant -> socket call, p99. The deadline this cell is held to; the two
+    #: fields above plus :attr:`p99_body_build_ms` are its parts, kept for attribution.
+    p99_on_wire_delay_ms: float = 0.0
+    #: Prompt lookup plus JSON encoding, p99. Large means prompts were not materialised
+    #: and each send paid a tokenizer fit inside its own lateness.
+    p99_body_build_ms: float = 0.0
+    #: Requests whose prompt was not materialised ahead of the run; None when the cell
+    #: ran without a prompt store at all.
+    prompt_store_misses: Optional[int] = None
+    #: Largest relative gap between nominal and achieved arrivals over any window, from
+    #: the on-wire instants. Diagnostic only, never a void reason: a truncated cell stops
+    #: offering on purpose, so its later windows are empty by design and this reads high.
+    rps_error_ratio: Optional[float] = None
     #: Set when a gateway shed cut the cell short and it jumped to its drain segment.
     truncated: bool = False
     truncated_at_offset_s: Optional[float] = None
@@ -528,6 +561,12 @@ class CellGuard:
             "proxy_error_rate": round(self.proxy_error_rate, 6),
             "p99_delay_ms": round(self.p99_delay_ms, 3),
             "p99_pool_wait_ms": round(self.p99_pool_wait_ms, 3),
+            "p99_body_build_ms": round(self.p99_body_build_ms, 3),
+            "p99_on_wire_delay_ms": round(self.p99_on_wire_delay_ms, 3),
+            "prompt_store_misses": self.prompt_store_misses,
+            "rps_error_ratio": (
+                None if self.rps_error_ratio is None else round(self.rps_error_ratio, 6)
+            ),
             "truncated": self.truncated,
             "truncated_at_offset_s": self.truncated_at_offset_s,
             "truncated_at_ts_ms": self.truncated_at_ts_ms,
@@ -602,6 +641,8 @@ def check_cell(
     pending_overflow_delta: Optional[int] = None,
     ttft_slo_ms: Optional[float] = None,
     tpot_slo_ms: Optional[float] = None,
+    prompt_store_misses: Optional[int] = None,
+    rps_error_ratio: Optional[float] = None,
 ) -> CellGuard:
     """Verdict on a dispatched cell. Pure - takes the sender's records, no network.
 
@@ -616,8 +657,14 @@ def check_cell(
       under ``SHED_POLICY_VOID`` the whole cell is void.
     * a **client timeout** is the driver's own deadline. Counted on its own and budgeted
       against nothing.
-    * a **dispatch delay** above ``max_p99_delay_ms`` means the schedule was not offered,
-      so the cell is void whatever it recorded.
+    * an **on-wire delay** above ``max_p99_delay_ms`` means the schedule was not
+      offered, so the cell is void whatever it recorded. This is measured from the
+      scheduled instant to the transport call, so it covers the dispatcher's lateness,
+      the sender pool's queueing *and* whatever the worker did before the socket -
+      notably the prompt. The ``p99_delay_ms`` the caller passes is the dispatcher's own
+      view; where a record carries no on-wire figure (a capture written before it
+      existed, or a synthetic record) it stands in as a lower bound, because a request
+      cannot reach the wire before it was fired.
     * a non-zero **pending-overflow delta** means Envoy was queueing and refusing behind
       the scenes; the capture is not of the engine and the run is void.
     """
@@ -628,6 +675,11 @@ def check_cell(
     served, model_errors, proxy_errors = outcomes.ok, outcomes.model_error, outcomes.shed
     pool_waits = [float(r.get("pool_wait_ms", 0.0) or 0.0) for r in records]
     p99_pool_wait_ms = _p99(pool_waits)
+    p99_body_build_ms = _p99([float(r.get("body_build_ms", 0.0) or 0.0) for r in records])
+    on_wire = [
+        float(r["on_wire_delay_ms"]) for r in records if r.get("on_wire_delay_ms") is not None
+    ]
+    p99_on_wire_delay_ms = max(_p99(on_wire), float(p99_delay_ms))
     expected_sent = max(0, scheduled - int(censored))
 
     issues: list[str] = []
@@ -657,11 +709,13 @@ def check_cell(
             "and bias theta towards health - the whole cell is void and must be re-run"
         )
         void_reasons.append(VOID_SHED)
-    if p99_delay_ms > max_p99_delay_ms:
+    if p99_on_wire_delay_ms > max_p99_delay_ms:
         issues.append(
-            f"{VOID_DISPATCH_DELAY} p99 {p99_delay_ms:.1f}ms > {max_p99_delay_ms:.1f}ms "
-            "(the driver could not keep the schedule: offered load was under-delivered, "
-            "so this is not an open loop)"
+            f"{VOID_DISPATCH_DELAY} p99 on-wire {p99_on_wire_delay_ms:.1f}ms > "
+            f"{max_p99_delay_ms:.1f}ms (dispatch {p99_delay_ms:.1f}ms + pool wait "
+            f"{p99_pool_wait_ms:.1f}ms + body build {p99_body_build_ms:.1f}ms; the driver "
+            "could not put the schedule on the wire on time, so offered load was "
+            "under-delivered and this is not an open loop)"
         )
         void_reasons.append(VOID_DISPATCH_DELAY)
     if pending_overflow_delta is not None and int(pending_overflow_delta) > 0:
@@ -704,6 +758,10 @@ def check_cell(
         proxy_errors=proxy_errors,
         p99_delay_ms=float(p99_delay_ms),
         p99_pool_wait_ms=p99_pool_wait_ms,
+        p99_body_build_ms=p99_body_build_ms,
+        p99_on_wire_delay_ms=p99_on_wire_delay_ms,
+        prompt_store_misses=(None if prompt_store_misses is None else int(prompt_store_misses)),
+        rps_error_ratio=(None if rps_error_ratio is None else float(rps_error_ratio)),
         truncated=bool(truncated),
         truncated_at_offset_s=truncated_at_offset_s,
         truncated_at_ts_ms=truncated_at_ts_ms,
@@ -1087,6 +1145,10 @@ def drive_cell_schedule(
     instant_sampler: Optional[Callable[[int], dict]] = None,
     instant_interval_s: float = DEFAULT_SIDECAR_INTERVAL_S,
     prompt_mode: Optional[str] = None,
+    prompt_dir: Optional[Path] = None,
+    prompt_workers: Optional[int] = None,
+    rps_timeline_path: Optional[Path] = None,
+    rps_window_s: float = DEFAULT_RPS_WINDOW_S,
     routing_strategy: Optional[str] = None,
     max_in_flight: int = DEFAULT_MAX_IN_FLIGHT,
     stream_call: Optional[Callable] = None,
@@ -1116,17 +1178,42 @@ def drive_cell_schedule(
     is the only path that reports a serving pod and is therefore the only way
     :func:`routing_balance` sees anything - at the cost of changing who picks the pod.
 
+    With ``prompt_dir`` every prompt of this cell's schedule is built in a process pool
+    and written to ``<prompt_dir>/<cell_id>.prompts.jsonl`` *before* the dispatch loop
+    starts, and the sender looks each one up instead of fitting it mid-send. This is the
+    same path for a committed schedule and for one generated at runtime (the boundary
+    search's hold schedules), because both arrive here as ``segments``. Without it the
+    sender falls back to fitting inline and the cost lands inside the cell's own
+    lateness; ``prompt_store_misses`` on the guard says whether that happened.
+
+    With ``rps_timeline_path`` the cell also writes its nominal-vs-achieved arrival
+    series, built from the instants the requests actually reached the wire.
+
     The per-request raw lines use ``r3_grid.RAW_COLUMNS`` and the instant sidecar uses the
     ``r3_grid`` sidecar schema plus ``on_live_grid``, so the offline re-windowing path is
     unchanged (pass ``--instant-sample-ms 1000`` to ``rewindow_from_raw`` to match this
     cadence).
     """
+    from tre_replayer.engine import rps_timeline as rps
     from tre_replayer.engine.dispatcher import dispatch_open_loop
     from tre_replayer.engine.http_sender import StreamingHttpSender
+    from tre_replayer.engine.prompt_store import materialize_prompts, prompt_file_path
+    from tre_replayer.engine.prompts import DEFAULT_MODE
     from tre_replayer.engine.schedule import build_poisson_schedule
 
     events = [e for e in build_poisson_schedule(segments, seed=seed) if e.model == model]
     scheduled = len(events)
+
+    # Before anything else, and before any thread or sidecar exists: the pool forks, and
+    # the whole point is that this cost is paid in setup rather than inside the loop.
+    prompt_store = None
+    if prompt_dir is not None:
+        prompt_store = materialize_prompts(
+            events,
+            path=prompt_file_path(prompt_dir, cell_id),
+            mode=prompt_mode or DEFAULT_MODE,
+            processes=prompt_workers,
+        )
 
     sender_kwargs = {} if prompt_mode is None else {"prompt_mode": prompt_mode}
     sender = StreamingHttpSender(
@@ -1135,6 +1222,7 @@ def drive_cell_schedule(
         max_in_flight=max_in_flight,
         routing_strategy=routing_strategy,
         now_ms=now_ms,
+        prompt_store=prompt_store,
         **sender_kwargs,
     )
     sidecar = None
@@ -1162,6 +1250,23 @@ def drive_cell_schedule(
     end_ms = now_ms()
     overflow_delta = overflow_sentinel.delta() if overflow_sentinel is not None else None
 
+    scheduled_offsets = [float(event.scheduled_offset_s) for event in events]
+    achieved_offsets = achieved_arrival_offsets(sender.records)
+    if rps_timeline_path is not None:
+        rps.write_rps_timeline_csv(
+            rps_timeline_path,
+            {
+                model: rps.build_rps_timeline(
+                    scheduled_offsets, achieved_offsets, window_s=rps_window_s
+                )
+            },
+        )
+    rps_error_ratio = rps.max_relative_rps_error(
+        rps.build_rps_timeline(
+            scheduled_offsets, achieved_offsets, window_s=rps.ERROR_WINDOW_S
+        )
+    )
+
     guard = check_cell(
         cell_id,
         scheduled=scheduled,
@@ -1172,6 +1277,8 @@ def drive_cell_schedule(
         truncated_at_ts_ms=truncator.truncated_at_ts_ms if truncator else None,
         censored=truncator.censored if truncator else 0,
         pending_overflow_delta=overflow_delta,
+        prompt_store_misses=(None if prompt_store is None else prompt_store.misses),
+        rps_error_ratio=rps_error_ratio,
         **(guard_kwargs or {}),
     )
     if failures_path is not None:
@@ -1195,6 +1302,34 @@ def drive_cell_schedule(
         # of what the driver did).
         records_out.extend(sender.records)
     return start_ms, end_ms, guard
+
+
+def prompt_file_path_for(prompt_dir: Path, cell_id: str) -> Path:
+    """Where :func:`drive_cell_schedule` materialises ``cell_id``'s prompts.
+
+    A thin forwarder so a caller can name the file (to record it in an artifact) without
+    importing the replayer package, which this module only imports lazily."""
+    from tre_replayer.engine.prompt_store import prompt_file_path
+
+    return prompt_file_path(prompt_dir, cell_id)
+
+
+def achieved_arrival_offsets(records: Sequence[dict]) -> list[float]:
+    """When each request really went on the wire, in the schedule's own time base.
+
+    ``scheduled_offset_s`` is where the schedule put the request and
+    ``on_wire_delay_ms`` is how much later than that its bytes left, so their sum is the
+    achieved arrival instant on the same axis as the nominal one - no clock conversion
+    and no dependence on when the process happened to start. Records without the pair
+    (a capture written before they existed) are skipped rather than guessed at.
+    """
+    offsets: list[float] = []
+    for record in records:
+        scheduled = record.get("scheduled_offset_s")
+        if scheduled is None:
+            continue
+        offsets.append(float(scheduled) + float(record.get("on_wire_delay_ms", 0.0) or 0.0) / 1000.0)
+    return offsets
 
 
 def _raw_from_sender_record(cell_id: str, record: dict) -> dict:

@@ -14,8 +14,10 @@ import asyncio
 import json
 from typing import Any
 
+from tre_replayer.engine import rps_timeline
 from tre_replayer.engine.dispatcher import dispatch_open_loop
 from tre_replayer.engine.http_sender import StreamResult, StreamingHttpSender
+from tre_replayer.engine.prompt_store import materialize_prompts
 from tre_replayer.engine.schedule import build_poisson_schedule
 from tre_replayer.scoring import compute_v_sys
 from tre_replayer.traces.loader import load_trace_segments
@@ -40,13 +42,27 @@ def run_trace(
     max_in_flight: int = 512,
     trim_ramp_windows: int = 1,
     sleep: Any = None,
+    prompt_path: str | None = None,
+    rps_timeline_path: str | None = None,
+    prompt_workers: int | None = None,
 ) -> dict[str, Any]:
     from tre_common.registry import load_registry
 
     segments = load_trace_segments(trace_path)
     schedule = build_poisson_schedule(segments, seed=seed)
+    # Prompts are built here, before the loop, not inside each send: see
+    # tre_replayer.engine.prompt_store. Without a path there is nowhere to put them and
+    # the sender falls back to fitting inline.
+    prompt_store = (
+        None
+        if prompt_path is None
+        else materialize_prompts(schedule, path=prompt_path, processes=prompt_workers)
+    )
     sender = StreamingHttpSender(
-        gateway_url, stream_call=_dry_stream_call if dry_run else None, max_in_flight=max_in_flight
+        gateway_url,
+        stream_call=_dry_stream_call if dry_run else None,
+        max_in_flight=max_in_flight,
+        prompt_store=prompt_store,
     )
     dispatch_kwargs = {"sleep": sleep} if sleep is not None else {}
     try:
@@ -82,15 +98,58 @@ def run_trace(
             trim_ramp_windows=trim_ramp_windows,
             trace_start_ms=trace_start_ms,
         )
+    # Achieved against nominal arrivals, per model, from the instants the requests
+    # really went on the wire. This is the evidence that the replay applied the intensity
+    # the trace describes; schedule_rps_error is its headline.
+    timelines = {
+        model: rps_timeline.build_rps_timeline(
+            [event.scheduled_offset_s for event in schedule if event.model == model],
+            _achieved_offsets(recs),
+            window_s=rps_timeline.DEFAULT_WINDOW_S,
+        )
+        for model, recs in by_model.items()
+    }
+    if rps_timeline_path:
+        rps_timeline.write_rps_timeline_csv(rps_timeline_path, timelines)
+    rps_error = {
+        model: round(
+            rps_timeline.max_relative_rps_error(
+                rps_timeline.build_rps_timeline(
+                    [event.scheduled_offset_s for event in schedule if event.model == model],
+                    _achieved_offsets(by_model[model]),
+                    window_s=rps_timeline.ERROR_WINDOW_S,
+                )
+            ),
+            4,
+        )
+        for model in sorted(by_model)
+    }
     return {
         "trace": trace_path,
         "requests": len(sender.records),
         "schedule_p99_delay_ms": round(report.p99_delay_ms, 2),
         "schedule_rps_error": round(report.actual_rps_error_ratio, 4),
+        "rps_error_by_model": rps_error,
+        "rps_timeline": rps_timeline_path,
         "max_pool_wait_ms": round(sender.max_pool_wait_ms(), 2),  # F5: high -> sender pool starved
+        # Scheduled instant -> socket call, the whole of it. Unlike the two above it
+        # includes whatever the worker did before the send, which is where an inline
+        # prompt fit used to hide.
+        "max_on_wire_delay_ms": round(sender.max_on_wire_delay_ms(), 2),
+        "prompt_store_misses": sender.prompt_store_misses,
         "trim_ramp_windows": trim_ramp_windows,
         "per_model": per_model,
     }
+
+
+def _achieved_offsets(records: list[dict]) -> list[float]:
+    """On-wire instants in the schedule's own time base (offset + on-wire lateness)."""
+    return [
+        float(record["scheduled_offset_s"])
+        + float(record.get("on_wire_delay_ms", 0.0) or 0.0) / 1000.0
+        for record in records
+        if record.get("scheduled_offset_s") is not None
+    ]
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -105,11 +164,19 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--step-ms", type=int, default=5_000)
     ap.add_argument("--max-in-flight", type=int, default=512)  # sender thread pool (F5)
     ap.add_argument("--trim-ramp-windows", type=int, default=1)
+    ap.add_argument("--prompt-file", default=None,
+                    help="materialise every prompt here before the replay starts, so no "
+                         "prompt is built on the send path")
+    ap.add_argument("--prompt-workers", type=int, default=None)
+    ap.add_argument("--rps-timeline", default=None,
+                    help="CSV of nominal vs achieved requests per second, per model")
     args = ap.parse_args(argv)
     summary = run_trace(
         args.trace, gateway_url=args.gateway_url, out_path=args.out, registry_path=args.registry,
         seed=args.seed, dry_run=args.dry_run, window_ms=args.window_ms, step_ms=args.step_ms,
         max_in_flight=args.max_in_flight, trim_ramp_windows=args.trim_ramp_windows,
+        prompt_path=args.prompt_file, prompt_workers=args.prompt_workers,
+        rps_timeline_path=args.rps_timeline,
     )
     print(json.dumps(summary, indent=2))
     return 0

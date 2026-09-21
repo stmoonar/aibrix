@@ -519,6 +519,12 @@ def held_out_cell_ids(index: Mapping) -> set[str]:
     }
 
 
+#: JSONL files a cell writes next to its raw capture that are NOT per-request rows.
+#: Everything else matching ``*.jsonl`` under the raw root is a cell, so a new sidecar
+#: that forgets to register here is silently re-windowed as if it were measurements.
+SIDECAR_JSONL_SUFFIXES = (".instant.jsonl", ".failures.jsonl", ".prompts.jsonl")
+
+
 def discover_cell_files(
     raw_dir: Path,
     *,
@@ -538,7 +544,7 @@ def discover_cell_files(
     kept: list[Path] = []
     skipped: list[str] = []
     for path in sorted(raw_dir.rglob("*.jsonl")):
-        if path.name.endswith(".instant.jsonl") or path.name.endswith(".failures.jsonl"):
+        if path.name.endswith(SIDECAR_JSONL_SUFFIXES):
             continue
         cell_id = path.stem
         if included:

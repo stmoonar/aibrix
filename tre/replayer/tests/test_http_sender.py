@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 
+import pytest
+
 from tre_replayer.engine.http_sender import StreamResult, StreamingHttpSender
 from tre_replayer.engine.prompts import MODE_TEXT, MODE_TOKEN_IDS
 from tre_replayer.engine.schedule import ScheduledRequest
@@ -164,3 +166,120 @@ def test_routing_strategy_swaps_the_model_header_for_the_strategy_header() -> No
 
     routed = build_request_headers("dsqwen-7b", "least-request")
     assert routed["routing-strategy"] == "least-request" and "model" not in routed
+
+
+# ------------------------------------------------ what "offered on time" actually means
+
+
+class _ScriptedMono:
+    """A monotonic clock the test moves by hand, so no assertion depends on a sleep."""
+
+    def __init__(self, start: float = 100.0) -> None:
+        self.t = start
+
+    def __call__(self) -> float:
+        return self.t
+
+
+def _wire_probe_sender(monkeypatch, mono, *, build_cost_s: float, **kwargs):
+    """A sender whose prompt build costs ``build_cost_s`` of the scripted clock."""
+    from tre_replayer.engine import http_sender as module
+
+    def slow_build(token_count, seed_key, **_kw):
+        mono.t += build_cost_s
+        return "prompt"
+
+    monkeypatch.setattr(module, "build_prompt", slow_build)
+    return StreamingHttpSender(
+        "http://gw",
+        stream_call=lambda *a: StreamResult(200, 10.0, 20.0, 1, 1),
+        mono=mono,
+        now_ms=lambda: 1000,
+        **kwargs,
+    )
+
+
+def test_the_old_delay_gauges_cannot_see_the_time_spent_before_the_socket(monkeypatch) -> None:
+    """The defect this metric exists for. The dispatcher fired this request exactly on
+    time and a worker picked it up immediately, so both of the pre-existing gauges read
+    zero - while 50 ms of tokenizer work happened before a single byte went out."""
+    mono = _ScriptedMono()
+    sender = _wire_probe_sender(monkeypatch, mono, build_cost_s=0.05)
+    asyncio.run(sender(_req(), scheduled_ts=mono.t, actual_ts=mono.t))
+    sender.close()
+
+    rec = sender.records[0]
+    assert rec["schedule_delay_ms"] == 0.0  # the dispatcher was not late
+    assert rec["pool_wait_ms"] == 0.0  # the pool did not starve
+    # ...and yet the request reached the wire 50 ms after it was due
+    assert rec["on_wire_delay_ms"] == pytest.approx(50.0)
+    assert rec["body_build_ms"] == pytest.approx(50.0)
+
+
+def test_the_three_segments_add_up_to_the_on_wire_delay(monkeypatch) -> None:
+    """Each segment is kept because it attributes the miss: event loop, then pool, then
+    everything before the socket. Their sum is the deadline itself."""
+    mono = _ScriptedMono(start=100.0)
+    sender = _wire_probe_sender(monkeypatch, mono, build_cost_s=0.02)
+    # due at 99.9, fired at 99.94 (loop late 40 ms), picked up at 100.0 (pool 60 ms)
+    asyncio.run(sender(_req(), scheduled_ts=99.9, actual_ts=99.94))
+    sender.close()
+
+    rec = sender.records[0]
+    assert rec["schedule_delay_ms"] == pytest.approx(40.0)
+    assert rec["pool_wait_ms"] == pytest.approx(60.0)
+    assert rec["body_build_ms"] == pytest.approx(20.0)
+    assert rec["on_wire_delay_ms"] == pytest.approx(120.0)
+    assert rec["on_wire_delay_ms"] == pytest.approx(
+        rec["schedule_delay_ms"] + rec["pool_wait_ms"] + rec["body_build_ms"]
+    )
+
+
+def test_a_materialised_prompt_takes_the_build_off_the_send_path(monkeypatch) -> None:
+    """The fix, measured by the same gauge: with the prompt already built, nothing
+    happens between the scheduled instant and the socket."""
+    from tre_replayer.engine.prompt_store import PromptStore
+
+    mono = _ScriptedMono()
+    sender = _wire_probe_sender(
+        monkeypatch, mono, build_cost_s=0.05, prompt_store=PromptStore({"m-0": "ready"})
+    )
+    asyncio.run(sender(_req(), scheduled_ts=mono.t, actual_ts=mono.t))
+    sender.close()
+
+    rec = sender.records[0]
+    assert rec["on_wire_delay_ms"] == 0.0
+    assert rec["body_build_ms"] == 0.0
+    assert sender.prompt_store_misses == 0
+
+
+def test_a_missing_materialised_prompt_is_counted_and_still_sent(monkeypatch) -> None:
+    """A miss must not drop the request - but it must not be silent either, because the
+    cell then paid the tokenizer fit inside its own lateness."""
+    from tre_replayer.engine.prompt_store import PromptStore
+
+    mono = _ScriptedMono()
+    sender = _wire_probe_sender(
+        monkeypatch, mono, build_cost_s=0.05, prompt_store=PromptStore({"other": "ready"})
+    )
+    asyncio.run(sender(_req(), scheduled_ts=mono.t, actual_ts=mono.t))
+    sender.close()
+
+    assert sender.prompt_store_misses == 1
+    assert sender.records[0]["on_wire_delay_ms"] == pytest.approx(50.0)
+
+
+def test_the_record_carries_its_place_in_the_schedule() -> None:
+    """Needed to bin the achieved arrivals on the schedule's own grid; without it the
+    achieved series can only be placed relative to whenever the process started."""
+    sender = StreamingHttpSender(
+        "http://gw",
+        stream_call=lambda *a: StreamResult(200, 10.0, 20.0, 1, 1),
+        prompt_mode=MODE_TOKEN_IDS,
+    )
+    request = ScheduledRequest(
+        request_id="m-7", model="m", scheduled_offset_s=12.5, prompt_tokens=8, max_output_tokens=4
+    )
+    asyncio.run(sender(request, 0.0, 0.0))
+    sender.close()
+    assert sender.records[0]["scheduled_offset_s"] == 12.5

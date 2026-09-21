@@ -782,3 +782,171 @@ def test_the_guard_carries_the_goodput_when_the_slo_is_supplied() -> None:
     assert guard.goodput["offered"] == 4
     assert guard.goodput["goodput"] == pytest.approx(0.75)
     assert guard.outcomes["shed"] == 1
+
+
+# ------------------------------------------- the deadline is on-wire, not dispatch-only
+
+
+def _on_wire_record(on_wire_ms: float, **kwargs):
+    record = _record(**kwargs)
+    record.update({
+        "scheduled_offset_s": 0.0,
+        "body_build_ms": max(0.0, on_wire_ms - record["pool_wait_ms"]),
+        "on_wire_delay_ms": on_wire_ms,
+    })
+    return record
+
+
+def test_a_cell_that_fired_on_time_but_reached_the_wire_late_is_void() -> None:
+    """The regression the on-wire gauge exists for: the dispatcher kept the schedule and
+    the pool never starved, so the pre-existing numbers are both tiny - and every request
+    still went out 200 ms after it was due because its prompt was built mid-send. Under
+    the old rule this cell passed and its windows reached the theta fit."""
+    records = [_on_wire_record(200.0, pool_wait=1.0) for _ in range(100)]
+    guard = openloop.check_cell(
+        "i256_o128_c60", scheduled=100, records=records,
+        p99_delay_ms=2.0,  # what the dispatcher saw, and all the old rule looked at
+        max_p99_delay_ms=openloop.CALIBRATION_MAX_P99_DELAY_MS,
+    )
+    assert guard.p99_on_wire_delay_ms == 200.0
+    assert openloop.VOID_DISPATCH_DELAY in guard.void_reasons
+    assert "on-wire" in " ".join(guard.issues)
+    # the decomposition is kept, so the miss is attributable
+    assert guard.p99_delay_ms == 2.0 and guard.p99_body_build_ms == 199.0
+
+
+def test_the_dispatch_delay_still_stands_in_where_no_on_wire_figure_exists() -> None:
+    """A request cannot reach the wire before it was fired, so on a capture that predates
+    the gauge the dispatcher's own number is a valid lower bound - never a free pass."""
+    guard = openloop.check_cell(
+        "i256_o128_c120", scheduled=10, records=[_record() for _ in range(10)],
+        p99_delay_ms=900.0,
+    )
+    assert guard.p99_on_wire_delay_ms == 900.0
+    assert openloop.VOID_DISPATCH_DELAY in guard.void_reasons
+
+
+def test_a_cell_inside_the_deadline_on_every_segment_passes() -> None:
+    records = [_on_wire_record(40.0, pool_wait=1.0) for _ in range(10)]
+    guard = openloop.check_cell(
+        "c", scheduled=10, records=records, p99_delay_ms=2.0,
+        max_p99_delay_ms=openloop.CALIBRATION_MAX_P99_DELAY_MS,
+    )
+    assert guard.ok and not guard.void_reasons
+
+
+def test_the_guard_artifact_reports_the_whole_decomposition() -> None:
+    guard = openloop.check_cell(
+        "c", scheduled=2, records=[_on_wire_record(12.0), _on_wire_record(9.0)],
+        p99_delay_ms=1.0, prompt_store_misses=0, rps_error_ratio=0.02,
+    )
+    artifact = guard.as_dict()
+    for key in (
+        "p99_delay_ms", "p99_pool_wait_ms", "p99_body_build_ms", "p99_on_wire_delay_ms",
+        "prompt_store_misses", "rps_error_ratio",
+    ):
+        assert key in artifact
+    assert artifact["prompt_store_misses"] == 0
+    assert artifact["rps_error_ratio"] == 0.02
+
+
+# -------------------------------------------------- prompts are materialised per cell
+
+
+def test_drive_cell_schedule_materialises_every_prompt_before_it_sends(tmp_path) -> None:
+    """The prompts land in the run's own output directory - never in the committed
+    schedule tree, which stays a few kB of segments - and every request finds its own."""
+    from tre_replayer.engine.schedule import RpsSegment
+
+    seg = RpsSegment("dsqwen-7b", 0.0, 0.3, 50.0, input_tokens=64, max_output_tokens=16)
+    stream = _FakeStream()
+    prompts_dir = tmp_path / "prompts"
+    _s, _e, guard = openloop.drive_cell_schedule(
+        "http://gw", "dsqwen-7b", "i64_o16_c60", [seg],
+        stream_call=stream, prompt_mode="token_ids", prompt_dir=prompts_dir,
+    )
+    path = openloop.prompt_file_path_for(prompts_dir, "i64_o16_c60")
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    assert len(rows) == guard.scheduled > 3
+    assert guard.prompt_store_misses == 0
+    # what was materialised is exactly what went out, request for request
+    materialised = {row["request_id"]: row["prompt"] for row in rows}
+    sent = [json.loads(body)["prompt"] for body in stream.calls]
+    assert sorted(map(tuple, sent)) == sorted(
+        tuple(prompt) for prompt in materialised.values()
+    )
+
+
+def test_a_runtime_generated_hold_schedule_takes_the_same_materialisation_path(tmp_path) -> None:
+    """The boundary search builds its hold schedules while the campaign runs, so they
+    never pass through the committed tree. If they skipped the materialisation they would
+    quietly fall back to fitting every prompt mid-send - the exact regression - so the
+    seam has to be the driver, not the schedule file."""
+    from dataclasses import replace
+
+    from scripts import gen_calibration_schedules as gen
+    from tre_replayer.traces.loader import load_trace_segments
+
+    body, _meta = gen.build_hold_schedule("dsqwen-7b", "S1", 10.0, 0.87, 120.0, stage="bisect")
+    schedule_path = tmp_path / "hold.json"
+    schedule_path.write_text(json.dumps(body), encoding="utf-8")
+    segments = [
+        # the probe holds 8.7 rps for two minutes; compress it into a fraction of a
+        # second at a higher rate. What is under test is the driver, not the clock.
+        replace(seg, start_s=seg.start_s / 300.0, end_s=seg.end_s / 300.0, rps=seg.rps * 20.0)
+        for seg in load_trace_segments(schedule_path)
+        if seg.model == "dsqwen-7b"
+    ]
+    prompts_dir = tmp_path / "prompts"
+    _s, _e, guard = openloop.drive_cell_schedule(
+        "http://gw", "dsqwen-7b", "hold_probe", segments,
+        stream_call=_FakeStream(), prompt_mode="token_ids", prompt_dir=prompts_dir,
+    )
+    assert guard.sent > 0
+    assert guard.prompt_store_misses == 0
+    assert openloop.prompt_file_path_for(prompts_dir, "hold_probe").exists()
+
+
+def test_without_a_prompt_directory_the_cell_still_runs(tmp_path) -> None:
+    """No store is not an error - it is the fallback, and it reports itself as absent
+    rather than as a clean zero."""
+    from tre_replayer.engine.schedule import RpsSegment
+
+    seg = RpsSegment("m", 0.0, 0.2, 30.0, input_tokens=32, max_output_tokens=8)
+    _s, _e, guard = openloop.drive_cell_schedule(
+        "http://gw", "m", "i32_o8_c60", [seg], stream_call=_FakeStream(), prompt_mode="token_ids"
+    )
+    assert guard.sent > 0 and guard.prompt_store_misses is None
+
+
+# ------------------------------------------------------- the achieved arrival series
+
+
+def test_drive_cell_schedule_writes_the_nominal_and_achieved_arrival_series(tmp_path) -> None:
+    """The evidence that a cell offered the intensity its schedule describes."""
+    import csv
+
+    from tre_replayer.engine.schedule import RpsSegment
+
+    seg = RpsSegment("m", 0.0, 0.4, 60.0, input_tokens=32, max_output_tokens=8)
+    path = tmp_path / "cell.rps.csv"
+    _s, _e, guard = openloop.drive_cell_schedule(
+        "http://gw", "m", "i32_o8_c60", [seg], stream_call=_FakeStream(),
+        prompt_mode="token_ids", rps_timeline_path=path, rps_window_s=0.1,
+    )
+    rows = list(csv.DictReader(path.open(encoding="utf-8")))
+    assert rows and {row["model"] for row in rows} == {"m"}
+    assert sum(int(row["scheduled_requests"]) for row in rows) == guard.scheduled
+    assert sum(int(row["achieved_requests"]) for row in rows) == guard.sent
+    assert guard.rps_error_ratio is not None
+
+
+def test_achieved_offsets_are_read_off_the_schedule_grid() -> None:
+    """Offset plus on-wire lateness, so the achieved series sits on the same axis as the
+    nominal one without any clock conversion."""
+    records = [
+        {"scheduled_offset_s": 4.0, "on_wire_delay_ms": 250.0},
+        {"scheduled_offset_s": 4.5, "on_wire_delay_ms": 0.0},
+        {"on_wire_delay_ms": 10.0},  # pre-dates the field: skipped, never guessed
+    ]
+    assert openloop.achieved_arrival_offsets(records) == [4.25, 4.5]

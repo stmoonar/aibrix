@@ -470,6 +470,11 @@ def cell_command(cell: Cell, args, schedule_path: Path, output: Path) -> list[st
       not offer the load the cell is indexed by.
     * ``--ttft-slo-ms`` / ``--tpot-slo-ms`` - pinned, so the goodput a cell reports and
       the SLO the boundary search reads are the same numbers.
+
+    ``--prompt-dir`` points every cell at this campaign's own ``<out-dir>/prompts``, so
+    the prompts are built before each cell starts rather than inside its sends, and the
+    bytes that went out are kept next to the measurement they produced. It is outside the
+    repository on purpose: the committed schedules stay a few kB of segments.
     """
     command = [
         sys.executable, "-m", "scripts.r3_grid",
@@ -484,6 +489,7 @@ def cell_command(cell: Cell, args, schedule_path: Path, output: Path) -> list[st
         "--namespace", args.model_namespace,
         "--guard-mode", args.guard_mode,
         "--min-slo-windows", str(args.min_slo_windows),
+        "--prompt-dir", str(Path(args.out_dir) / "prompts"),
         "--shed-policy", openloop.SHED_POLICY_VOID,
         "--max-p99-delay-ms", str(openloop.CALIBRATION_MAX_P99_DELAY_MS),
         "--max-model-error-rate", str(args.max_model_error_rate),

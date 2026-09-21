@@ -435,3 +435,21 @@ def test_drive_cell_routing_strategy_changes_the_request_headers() -> None:
     )
     assert seen and seen[0]["routing-strategy"] == "least-request"
     assert "model" not in seen[0]  # else the per-model HTTPRoute wins and no pod is named
+
+
+def test_openloop_mirrors_the_replayer_arrival_window() -> None:
+    """``openloop`` imports the replayer lazily, so its copy of the arrival-series bin
+    width is a mirror; a drift would file two runs' series on different grids."""
+    from scripts import openloop
+    from tre_replayer.engine import rps_timeline
+
+    assert openloop.DEFAULT_RPS_WINDOW_S == rps_timeline.DEFAULT_WINDOW_S
+
+
+def test_r3_grid_accepts_a_prompt_directory_and_worker_count() -> None:
+    """The campaign drives every cell through this CLI, so the materialisation has to be
+    reachable from it or the boundary search silently falls back to inline builds."""
+    import inspect
+
+    source = inspect.getsource(r3_grid.main)
+    assert "--prompt-dir" in source and "--prompt-workers" in source

@@ -181,6 +181,7 @@ def test_wall_clock_estimate_includes_the_cooldowns() -> None:
 
 
 class _Args:
+    out_dir = Path("/out")
     window_ms = 30000
     fit_step_ms = 5000
     instant_sample_ms = 1000
@@ -571,3 +572,25 @@ def test_the_boundary_plan_prices_the_search_honestly() -> None:
     assert campaign.estimate_boundary_wall_clock_s(cells, 45.0) == pytest.approx(
         2 * (720.0 + 45.0 * 6)
     )
+
+
+def test_every_cell_materialises_its_prompts_into_this_campaigns_output_dir() -> None:
+    """Prompts are built before a cell sends, not inside its sends, and they are kept
+    with the run that produced them rather than committed next to the schedules."""
+    runnable, _ = campaign.build_plan(_index(), ["dsqwen-7b"])
+
+    class Args(_Args):
+        out_dir = Path("/campaign/run7")
+        gateway_url = "http://gw/v1/completions"
+        raw_dir = Path("/raw")
+        model_namespace = "default"
+        guard_mode = "warn"
+        min_slo_windows = 3
+        registry = None
+        redis_url = None
+
+    for cell in runnable:
+        command = campaign.cell_command(cell, Args(), Path("/s/x.json"), Path("/o/out.csv"))
+        assert command[command.index("--prompt-dir") + 1] == str(
+            Path("/campaign/run7") / "prompts"
+        )
