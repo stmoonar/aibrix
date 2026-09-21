@@ -29,15 +29,6 @@ def signal_orientation(direction: str) -> float:
 
 
 @dataclass(frozen=True)
-class FittedTheta:
-    signal_name: str
-    theta: float
-    violation_max: float
-    healthy_min: float
-    sample_count: int
-
-
-@dataclass(frozen=True)
 class ReliabilityThetaFit:
     publish: bool
     theta: float | None
@@ -52,33 +43,6 @@ class ReliabilityThetaFit:
     #: :class:`BalancedAccuracyThetaFit`: a published threshold without its orientation
     #: is not a rule, and the ablation compares signals of both orientations.
     direction: str = DEFAULT_SIGNAL_DIRECTION
-
-
-def fit_theta_from_health(
-    windows: Iterable[CalibrationWindow],
-    *,
-    signal_name: str = "signal",
-) -> FittedTheta:
-    rows = list(windows)
-    healthy = [row.signal for row in rows if row.slo_met and math.isfinite(row.signal)]
-    violations = [row.signal for row in rows if not row.slo_met and math.isfinite(row.signal)]
-    if not healthy:
-        raise ValueError("cannot fit theta without healthy windows")
-    if not violations:
-        raise ValueError("cannot fit theta without violating windows")
-
-    healthy_min = min(healthy)
-    violation_max = max(violations)
-    if violation_max >= healthy_min:
-        raise ValueError("healthy and violating windows are not separable by a higher-is-healthier threshold")
-
-    return FittedTheta(
-        signal_name=signal_name,
-        theta=(violation_max + healthy_min) / 2.0,
-        violation_max=violation_max,
-        healthy_min=healthy_min,
-        sample_count=len(rows),
-    )
 
 
 def fit_theta_by_reliability(

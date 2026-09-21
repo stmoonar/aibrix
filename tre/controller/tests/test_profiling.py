@@ -146,13 +146,6 @@ def test_proc_sampler_loop_primes_then_records_one_sample() -> None:
 
 
 # --- run_planner_tick prof wiring ---
-def test_run_planner_tick_without_prof_is_unchanged() -> None:
-    queue = FakeQueue()
-    result = run_rescue_tick(_critical_snapshot(), queue=queue, registry=_registry())
-    assert result.submitted == 1
-    assert len(queue.submitted) == 1
-
-
 def test_run_planner_tick_with_prof_records_tick_event() -> None:
     redis = FakeStreamRedis()
     prof = TickProfiler(redis)

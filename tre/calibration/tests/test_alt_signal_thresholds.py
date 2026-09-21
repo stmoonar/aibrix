@@ -38,6 +38,7 @@ from tre_calibration.dataset import CalibrationWindow
 from tre_calibration.fit import (
     DEFAULT_THETA_CRITERION,
     fit_theta,
+    fit_theta_by_reliability,
     threshold_balanced_accuracy,
 )
 from tre_common.registry import EXPECTED_SIGNAL_DIRECTIONS
@@ -161,6 +162,17 @@ def test_the_two_orientations_are_one_criterion_on_a_reflected_axis() -> None:
 def test_threshold_balanced_accuracy_rejects_an_unknown_orientation() -> None:
     with pytest.raises(ValueError, match="direction"):
         threshold_balanced_accuracy(_windows(), theta=1.0, direction="sideways")
+
+
+def test_fit_by_reliability_rejects_an_unknown_orientation() -> None:
+    with pytest.raises(ValueError, match="direction"):
+        fit_theta_by_reliability(
+            [],
+            direction="sideways",
+            **_RELIABILITY_KNOBS,
+            min_scenario_families=2,
+            max_single_scenario_ratio=0.7,
+        )
 
 
 def test_fit_theta_rejects_an_unknown_criterion() -> None:

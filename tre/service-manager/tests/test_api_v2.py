@@ -1282,22 +1282,6 @@ def test_v2_put_target_shrink_sleeps_hidden_binding_first():
     ]
 
 
-def test_v2_put_target_shrink_without_hidden_keeps_tail_order():
-    store = StateStore(FakeRedis())
-    store.save(
-        [
-            Binding("serve-a", "m1", Slot("node-a", (0,)), awake=True),
-            Binding("serve-b", "m1", Slot("node-a", (1,)), awake=True),
-        ],
-        expected_version=0,
-    )
-    service = ServiceManagerV2(registry(), store)
-
-    result = service.put_model_target("m1", wake_replicas=1)
-
-    assert result["actions"] == [{"action": "sleep", "serve_id": "serve-b"}]
-
-
 def test_v2_put_binding_power_sleep_clears_desired_hidden():
     hidden = Binding("serve-a", "m1", Slot("node-a", (0,)), awake=True, hidden=True)
     store = StateStore(FakeRedis())

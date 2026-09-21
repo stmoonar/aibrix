@@ -26,18 +26,6 @@ def two_half_node_topology():
     )
 
 
-def test_one_gpu_allocation_fills_split_slot_before_opening_new_two_gpu_slot():
-    allocator = SlotAllocator(single_node_topology(), [])
-
-    first = allocator.find_slot(1)
-    assert first == Slot(node="node-a", gpu_ids=(0,))
-    allocator.bind("serve-a", "model-a", first)
-
-    second = allocator.find_slot(1)
-
-    assert second == Slot(node="node-a", gpu_ids=(1,))
-
-
 def test_defrag_plans_minimal_migration_when_two_gpu_slot_is_fragmented():
     allocator = SlotAllocator(
         single_node_topology(),

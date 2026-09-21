@@ -1,6 +1,8 @@
 """Utilisation-gated scale-down probe (TRE_UTIL_SCALE_DOWN)."""
 from __future__ import annotations
 
+import math
+
 import pytest
 
 from tre_common.metrics_schema import MetricsSnapshot, ModelWindowMetrics
@@ -113,12 +115,21 @@ def test_app_builds_tracker_from_config_only_when_enabled() -> None:
 
 
 def test_deploy_registry_carries_r3_derived_thresholds() -> None:
+    """Every model reaches the controller with a usable scale_down_q_per_replica.
+
+    Shape, not values: the numbers are re-derived by every R3 calibration, and the
+    live ones come from the console ``/api/params`` PUT into the registry ConfigMap --
+    ``deploy/registry.yaml`` is only the bootstrap copy. Pinning the numbers here would
+    turn the next recalibration into a false failure while proving nothing about the
+    pipeline this test exists to check: that the field survives load_registry at all.
+    """
     registry = load_registry(str(REGISTRY_PATH))
-    assert {spec.name: spec.scale_down_q_per_replica for spec in registry.models()} == {
-        "dsqwen-7b": 20.0,
-        "dsllama-8b": 12.0,
-        "dsqwen-14b": 64.0,
-    }
+    thresholds = {spec.name: spec.scale_down_q_per_replica for spec in registry.models()}
+
+    assert set(thresholds) == {"dsqwen-7b", "dsllama-8b", "dsqwen-14b"}
+    for name, value in thresholds.items():
+        assert isinstance(value, float), name
+        assert math.isfinite(value) and value > 0.0, (name, value)
 
 
 # ------------------------------------------------------------------ tick level

@@ -1,26 +1,13 @@
 import csv
 import json
 
-try:  # in-tree layout: deploy/scripts/analysis/e5_timeline_auroc.py
-    from deploy.scripts.analysis.e5_timeline_auroc import (
-        AlignedWindow,
-        analyze,
-        auroc,
-        lead_labels,
-        parse_float,
-    )
-except ModuleNotFoundError:  # /tmp/e5_dev dev layout (flat module beside tests/)
-    import os
-    import sys
-
-    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts_analysis"))
-    from e5_timeline_auroc import (
-        AlignedWindow,
-        analyze,
-        auroc,
-        lead_labels,
-        parse_float,
-    )
+from deploy.scripts.analysis.e5_timeline_auroc import (
+    AlignedWindow,
+    analyze,
+    auroc,
+    lead_labels,
+    parse_float,
+)
 
 TIMELINE_HEADER = ["ts", "model", "z_m", "queue_len", "decode_tps", "prefill_tps", "replicas_awake"]
 VIOL_HEADER = ["model", "window_end_ms", "n_requests", "violated"]

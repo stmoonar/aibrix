@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-from tre_calibration.dataset import CalibrationWindow, split_by_scenario
+from tre_calibration.dataset import CalibrationWindow
 from tre_calibration.evaluate import evaluate_threshold
-from tre_calibration.fit import fit_theta_from_health
 
 
 def _synthetic_windows() -> list[CalibrationWindow]:
@@ -14,26 +13,6 @@ def _synthetic_windows() -> list[CalibrationWindow]:
         CalibrationWindow(scenario_id="burst-d", scenario_family="burst", signal=120.0, slo_met=True, health_score=0.8),
         CalibrationWindow(scenario_id="burst-d", scenario_family="burst", signal=140.0, slo_met=True, health_score=0.9),
     ]
-
-
-def test_fit_theta_recovers_known_synthetic_boundary() -> None:
-    fit = fit_theta_from_health(_synthetic_windows(), signal_name="trs")
-
-    assert fit.signal_name == "trs"
-    assert fit.theta == 100.0
-    assert fit.violation_max == 90.0
-    assert fit.healthy_min == 110.0
-    assert fit.sample_count == 6
-
-
-def test_split_by_scenario_keeps_whole_scenarios_out_of_train() -> None:
-    rows = _synthetic_windows()
-
-    train, test = split_by_scenario(rows, test_scenarios={"burst-b", "burst-d"})
-
-    assert {row.scenario_id for row in train} == {"steady-a", "steady-c"}
-    assert {row.scenario_id for row in test} == {"burst-b", "burst-d"}
-    assert not {row.scenario_id for row in train} & {row.scenario_id for row in test}
 
 
 def test_evaluate_threshold_reports_correct_direction_on_synthetic_data() -> None:

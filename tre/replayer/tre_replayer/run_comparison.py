@@ -1,8 +1,8 @@
 """Experiment-3 comparison driver: for each arm (tre, apa) x each trace, switch the decision
 source, reset state, replay the trace, and score it into its own result directory.
 
-This is the real driver the offline behavior table in orchestrate.py describes (that module
-stays a documentation/behaviour table with its own tests; this one actuates). Cluster-mutating
+This is the real driver. It used to be described by a behaviour table in orchestrate.py,
+which was removed once every row it called "planned" had shipped. Cluster-mutating
 steps -- the arm switch (deploy/scripts/toggle_tre_apa.sh) and the per-trace reset
 (deploy/scripts/reset_between_traces.sh) -- are emitted into a plan.json and only executed
 when execute_cluster_ops=True; the replay + scoring step (run_trace) runs offline in --dry-run

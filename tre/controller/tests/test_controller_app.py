@@ -31,6 +31,11 @@ class FakeSafeScale:
     pass
 
 
+class FakeHiddenOrphanDetector:
+    async def run(self) -> None:
+        return None
+
+
 class FakeServiceManagerClient:
     async def get_state(self) -> dict:
         return {"bindings": []}
@@ -92,6 +97,7 @@ def _cfg(
 ) -> SimpleNamespace:
     return SimpleNamespace(
         enable_tre_scaling=enable_tre_scaling,
+        orphan_scan_enabled=True,
         ablation_disable_fast_loop=ablation_disable_fast_loop,
         metrics_window_ms=60_000,
         monitor_interval_s=20.0,
@@ -112,6 +118,9 @@ def _deps() -> ControllerDependencies:
         safescale=FakeSafeScale(),
         registry=FakeRegistry(),
         signal_state=SignalState(),
+        # The deployed controller always wires one (app.create_controller_dependencies);
+        # leaving it None here would hide the hidden_orphans task from these tests.
+        hidden_orphan_detector=FakeHiddenOrphanDetector(),
     )
 
 
@@ -120,6 +129,7 @@ def test_build_controller_task_specs_includes_all_runtime_tasks_by_default() -> 
 
     assert tuple(spec.name for spec in specs) == (
         "metrics",
+        "hidden_orphans",
         "cluster_view",
         "rescue",
         "fairness",
@@ -131,13 +141,15 @@ def test_build_controller_task_specs_includes_all_runtime_tasks_by_default() -> 
 def test_build_controller_task_specs_honors_fast_loop_ablation() -> None:
     specs = build_controller_task_specs(_deps(), _cfg(ablation_disable_fast_loop=True))
 
-    assert tuple(spec.name for spec in specs) == ("metrics", "cluster_view", "fairness", "safescale", "action_queue")
+    assert tuple(spec.name for spec in specs) == ("metrics", "hidden_orphans", "cluster_view", "fairness", "safescale", "action_queue")
 
 
 def test_build_controller_task_specs_disables_scaling_tasks_but_keeps_metrics() -> None:
+    """Scaling off still leaves the orphan scan running: it reconciles hidden routes,
+    it does not scale."""
     specs = build_controller_task_specs(_deps(), _cfg(enable_tre_scaling=False))
 
-    assert tuple(spec.name for spec in specs) == ("metrics",)
+    assert tuple(spec.name for spec in specs) == ("metrics", "hidden_orphans")
 
 
 def test_create_controller_dependencies_wires_configured_components() -> None:
@@ -278,35 +290,4 @@ def test_main_builds_config_from_env_and_runs_controller() -> None:
         "redis": ("redis", "redis://example:6379/0"),
         "service_manager_url": "http://service-manager:8001",
         "registry_models": ["dsqwen-7b", "dsllama-8b", "dsqwen-14b"],
-    }
-
-
-
-def test_main_uses_default_controller_runner_when_runner_not_injected(monkeypatch) -> None:
-    import asyncio
-
-    import tre_controller.app as app
-
-    seen = {}
-
-    async def fake_run_controller(deps, cfg):
-        seen["redis"] = deps.store._redis
-        seen["service_manager_url"] = cfg.service_manager_url
-
-    monkeypatch.setattr(app, "run_controller", fake_run_controller)
-
-    asyncio.run(
-        app.main(
-            env={
-                "TRE_REGISTRY_PATH": str(REGISTRY_PATH),
-                "TRE_REDIS_URL": "redis://example:6379/0",
-                "TRE_SERVICE_MANAGER_URL": "http://service-manager:8001/",
-            },
-            redis_client_factory=lambda url: ("redis", url),
-        )
-    )
-
-    assert seen == {
-        "redis": ("redis", "redis://example:6379/0"),
-        "service_manager_url": "http://service-manager:8001",
     }

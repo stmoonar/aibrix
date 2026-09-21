@@ -50,8 +50,22 @@ def test_apa_scale_anchor_deployments_publish_model_selector() -> None:
         assert anchor["metadata"]["namespace"] == "default"
         # anchor is inert: 0 replicas, never actuated by sleep mode.
         assert anchor["spec"]["replicas"] == 0
-        # selector matches all awake pods of the model for gpu_cache_usage_perc scraping.
-        assert anchor["spec"]["selector"]["matchLabels"]["model.aibrix.ai/name"] == model
+        # The selector must match only the ROUTABLE pods, and asserting the whole
+        # dict is the point of this test.
+        #
+        # Matching on the model name alone -- which is what this test used to
+        # check, and what the comment here used to claim was correct -- sweeps in
+        # every sleeping pod of the model. The APA autoscaler then reads a
+        # gpu_cache_usage_perc averaged over pods that serve nothing, which sits
+        # near zero and can never cross the scale-up target. Scaling up was
+        # arithmetically impossible, so every APA arm before the 2026-07-12 fix
+        # was really a static baseline, and those numbers are void.
+        #
+        # Drop tre.aibrix.io/routable here and the defect comes back silently.
+        assert anchor["spec"]["selector"]["matchLabels"] == {
+            "model.aibrix.ai/name": model,
+            "tre.aibrix.io/routable": "true",
+        }
 
 
 def test_toggle_script_enforces_stop_old_before_start_new() -> None:

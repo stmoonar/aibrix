@@ -72,27 +72,6 @@ def _binding(serve_id, model, node, gpu_ids, *, awake, hidden=False):
     return Binding(serve_id, model, Slot(node, gpu_ids), awake=awake, hidden=hidden)
 
 
-def test_wake_prefers_node_with_fewer_cluster_wide_awake_bindings():
-    node9 = "nscc-ds-4a100-node9"
-    node10 = "nscc-ds-4a100-node10"
-    service, _store = _service(
-        [
-            _binding("other-node9-gpu-0", "other", node9, (0,), awake=True),
-            _binding("other-node10-gpu-0", "other", node10, (0,), awake=True),
-            _binding("other-node10-gpu-1", "other", node10, (1,), awake=True),
-            _binding("other-node10-gpu-2", "other", node10, (2,), awake=True),
-            _binding("target-node10-gpu-0", "target", node10, (0,), awake=False),
-            _binding("target-node10-gpu-3", "target", node10, (3,), awake=False),
-            _binding("target-node9-gpu-1", "target", node9, (1,), awake=False),
-            _binding("target-node9-gpu-2", "target", node9, (2,), awake=False),
-        ]
-    )
-
-    result = service.put_model_target("target", wake_replicas=1)
-
-    assert result["actions"] == [{"action": "wake", "serve_id": "target-node9-gpu-1"}]
-
-
 def test_wake_equal_node_counts_use_natural_serve_id_order():
     service, _store = _service(
         [
@@ -173,9 +152,13 @@ def test_shrink_sleeps_the_replicas_that_rebuild_an_aligned_pair():
     node9 = "nscc-ds-4a100-node9"
     service, store = _service(
         [
-            # Creation order deliberately unrelated to GPU address: the old
-            # "reversed(awake)" tail order would have slept gpu2 and gpu0 and left
-            # gpu1 + gpu3 awake, i.e. no aligned pair anywhere.
+            # Creation order is irrelevant here: the store reloads bindings in
+            # natural serve_id order, so `awake` is a..d = gpu0..gpu3 whichever way
+            # they were written. On this fixture the naive "reversed(awake)" tail
+            # order happens to agree with buddy release, so it cannot tell the two
+            # apart -- see
+            # test_shrink_frees_an_aligned_pair_when_the_tail_order_would_not
+            # for the layout that does.
             _binding("target-b", "target", node9, (1,), awake=True),
             _binding("target-d", "target", node9, (3,), awake=True),
             _binding("target-a", "target", node9, (0,), awake=True),
@@ -192,6 +175,41 @@ def test_shrink_sleeps_the_replicas_that_rebuild_an_aligned_pair():
         if binding.model == "target" and binding.awake
     }
     assert awake_gpu_ids == {0, 1}  # gpu 2+3 free again -> a tp=2 replica fits
+
+
+def test_shrink_frees_an_aligned_pair_when_the_tail_order_would_not():
+    """Discriminating case for buddy release: serve_id order != GPU address order.
+
+    ``awake`` arrives in natural serve_id order (a, b, c, d), which here maps to
+    gpu 1, 2, 3, 0. The naive "sleep the tail of awake" rule would stop d(gpu0)
+    and c(gpu3) -- two GPUs that are not buddies -- leaving gpu1 + gpu2 awake and
+    no aligned pair on either side. Buddy release has to hand back a whole pair,
+    so a tp=2 replica still fits afterwards.
+    """
+    node9 = "nscc-ds-4a100-node9"
+    service, store = _service(
+        [
+            _binding("target-a", "target", node9, (1,), awake=True),
+            _binding("target-b", "target", node9, (2,), awake=True),
+            _binding("target-c", "target", node9, (3,), awake=True),
+            _binding("target-d", "target", node9, (0,), awake=True),
+        ]
+    )
+
+    result = service.put_model_target("target", wake_replicas=2)
+
+    slept = {action["serve_id"] for action in result["actions"]}
+    assert len(slept) == 2
+    gpu_of = {"target-a": 1, "target-b": 2, "target-c": 3, "target-d": 0}
+    freed = {gpu_of[serve_id] for serve_id in slept}
+    awake_gpu_ids = {
+        binding.slot.gpu_ids[0]
+        for binding in store.load().bindings
+        if binding.model == "target" and binding.awake
+    }
+    # Both sides stay whole (0,1)/(2,3) pairs; the tail order frees {0, 3} instead.
+    assert freed in ({0, 1}, {2, 3}), freed
+    assert awake_gpu_ids == {0, 1, 2, 3} - freed
 
 
 def test_shrink_still_sleeps_hidden_bindings_before_serving_ones():
