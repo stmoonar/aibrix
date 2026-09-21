@@ -21,7 +21,7 @@ SIGNAL_DIRECTIONS = ("higher_is_healthier", "lower_is_healthier")
 DEFAULT_SIGNAL_DIRECTION = "higher_is_healthier"
 
 
-def _orientation(direction: str) -> float:
+def signal_orientation(direction: str) -> float:
     """``+1`` / ``-1`` multiplier that turns ``direction`` into "larger is healthier"."""
     if direction not in SIGNAL_DIRECTIONS:
         raise ValueError(f"direction must be one of {SIGNAL_DIRECTIONS}")
@@ -192,8 +192,18 @@ DELTA_METHOD = "severity_quantile_balanced_accuracy"
 
 #: Accepted values of the explicit ``theta_criterion`` knob.
 THETA_CRITERIA = ("balanced_accuracy", "reliability")
-#: Default criterion for *new* fits.
+#: Criterion used by every fit that does not name one.
 DEFAULT_THETA_CRITERION = "balanced_accuracy"
+
+#: Acceptance-gate defaults shared by :func:`fit_theta` and :class:`ThetaFitConfig`.
+#: They are named constants rather than literals in a signature so that a threshold, its
+#: bootstrap confidence interval and its train/test acceptance cannot drift into three
+#: slightly different gates.
+DEFAULT_RELIABILITY_TARGET = 0.9
+DEFAULT_MIN_SUPPORT = 3
+DEFAULT_MIN_CONFIDENCE = 0.9
+DEFAULT_MIN_SCENARIO_FAMILIES = 2
+DEFAULT_MAX_SINGLE_SCENARIO_RATIO = 0.7
 
 #: Healthy-score quantiles searched by the balanced-accuracy fit.
 DEFAULT_HEALTHY_QUANTILE_CANDIDATES: tuple[float, ...] = (
@@ -349,7 +359,7 @@ def fit_theta_by_balanced_accuracy(
     comparison: candidates meeting it always beat candidates that do not. See
     :data:`DEFAULT_MIN_HEALTHY_RECALL` for why it defaults to off.
     """
-    orientation = _orientation(direction)
+    orientation = signal_orientation(direction)
     rows = [row for row in windows if math.isfinite(row.signal)]
     labels = [1 if row.slo_met else 0 for row in rows]
     # Oriented scores: "larger is healthier" holds for both orientations from here on.
@@ -456,7 +466,7 @@ def threshold_balanced_accuracy(
     that picked the threshold. ``direction`` selects which side of ``theta`` counts as
     the healthy prediction.
     """
-    orientation = _orientation(direction)
+    orientation = signal_orientation(direction)
     rows = [row for row in windows if math.isfinite(row.signal)]
     scores = [orientation * row.signal for row in rows]
     labels = [1 if row.slo_met else 0 for row in rows]
@@ -470,11 +480,11 @@ def fit_theta(
     direction: str = DEFAULT_SIGNAL_DIRECTION,
     healthy_quantile_candidates: Sequence[float] = DEFAULT_HEALTHY_QUANTILE_CANDIDATES,
     min_healthy_recall: float = DEFAULT_MIN_HEALTHY_RECALL,
-    reliability_target: float = 0.9,
-    min_support: int = 3,
-    min_confidence: float = 0.9,
-    min_scenario_families: int = 2,
-    max_single_scenario_ratio: float = 0.7,
+    reliability_target: float = DEFAULT_RELIABILITY_TARGET,
+    min_support: int = DEFAULT_MIN_SUPPORT,
+    min_confidence: float = DEFAULT_MIN_CONFIDENCE,
+    min_scenario_families: int = DEFAULT_MIN_SCENARIO_FAMILIES,
+    max_single_scenario_ratio: float = DEFAULT_MAX_SINGLE_SCENARIO_RATIO,
 ) -> ReliabilityThetaFit | BalancedAccuracyThetaFit:
     """Fit ``theta`` under the named criterion -- the entry point every fit goes through.
 
@@ -503,6 +513,75 @@ def fit_theta(
         max_single_scenario_ratio=max_single_scenario_ratio,
         direction=direction,
     )
+
+
+@dataclass(frozen=True)
+class ThetaFitConfig:
+    """Every knob :func:`fit_theta` takes, carried as one value.
+
+    A threshold only means something together with the criterion, orientation and
+    acceptance gates that produced it. Tools that fit ``theta`` more than once -- the
+    bootstrap CI (a point estimate plus one fit per resample) and the train/test ranking
+    separation report -- must use one configuration for every one of those fits, or the
+    interval they publish describes a different quantity than the threshold it is meant to
+    bracket. Passing this object instead of a bag of keyword arguments makes that sameness
+    structural: there is one configuration to thread through, and its defaults are
+    :func:`fit_theta`'s own defaults, which are the calibration CLI's defaults.
+
+    :meth:`as_dict` renders the configuration with the key names the calibration CLI writes
+    into an artifact's ``fit_config``, so a report and the artifact whose theta it describes
+    can be compared field by field.
+    """
+
+    criterion: str = DEFAULT_THETA_CRITERION
+    direction: str = DEFAULT_SIGNAL_DIRECTION
+    healthy_quantile_candidates: tuple[float, ...] = DEFAULT_HEALTHY_QUANTILE_CANDIDATES
+    min_healthy_recall: float = DEFAULT_MIN_HEALTHY_RECALL
+    reliability_target: float = DEFAULT_RELIABILITY_TARGET
+    min_support: int = DEFAULT_MIN_SUPPORT
+    min_confidence: float = DEFAULT_MIN_CONFIDENCE
+    min_scenario_families: int = DEFAULT_MIN_SCENARIO_FAMILIES
+    max_single_scenario_ratio: float = DEFAULT_MAX_SINGLE_SCENARIO_RATIO
+
+    def __post_init__(self) -> None:
+        if self.criterion not in THETA_CRITERIA:
+            raise ValueError(f"criterion must be one of {THETA_CRITERIA}")
+        if self.direction not in SIGNAL_DIRECTIONS:
+            raise ValueError(f"direction must be one of {SIGNAL_DIRECTIONS}")
+        object.__setattr__(
+            self, "healthy_quantile_candidates", tuple(self.healthy_quantile_candidates)
+        )
+
+    def fit(
+        self, windows: Iterable[CalibrationWindow]
+    ) -> ReliabilityThetaFit | BalancedAccuracyThetaFit:
+        """Run :func:`fit_theta` on ``windows`` under exactly this configuration."""
+        return fit_theta(
+            windows,
+            criterion=self.criterion,
+            direction=self.direction,
+            healthy_quantile_candidates=self.healthy_quantile_candidates,
+            min_healthy_recall=self.min_healthy_recall,
+            reliability_target=self.reliability_target,
+            min_support=self.min_support,
+            min_confidence=self.min_confidence,
+            min_scenario_families=self.min_scenario_families,
+            max_single_scenario_ratio=self.max_single_scenario_ratio,
+        )
+
+    def as_dict(self) -> dict[str, object]:
+        """JSON-ready record of the configuration, keyed as the CLI keys ``fit_config``."""
+        return {
+            "direction": self.direction,
+            "healthy_quantile_candidates": list(self.healthy_quantile_candidates),
+            "max_single_scenario_ratio": self.max_single_scenario_ratio,
+            "min_confidence": self.min_confidence,
+            "min_healthy_recall": self.min_healthy_recall,
+            "min_scenario_families": self.min_scenario_families,
+            "min_support": self.min_support,
+            "reliability_target": self.reliability_target,
+            "theta_criterion": self.criterion,
+        }
 
 
 def fit_delta_margins(

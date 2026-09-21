@@ -1,47 +1,67 @@
 #!/usr/bin/env python3
-"""Runner for the open-loop calibration campaign: steps, then ramp, then bursts.
+"""Runner for the open-loop calibration campaign.
+
+Per (model, shape), in order: **steps**, then an **adaptive boundary search**, then
+**ramp**, then **bursts**.
 
 The ordering is the point
 -------------------------
-Each (model, shape) runs its **steps** cell first, and the ramp for that shape is then
-**regenerated from the capacity the steps cell measured** rather than from the fitted
-prior. The prior comes from a two-parameter ``1/C = i/P + o/D`` surface with a 10-29 %
-rms relative error per model, and rho is defined against it: a 25 % error in ``C_s``
-moves the ramp's peak offered load by 25 %, which on its own is enough to double or
-halve the backlog the cell accumulates. Running the cheap, monotone, steady-state
-primitive first turns that guess into a measurement before the expensive one spends it.
+The **steps** cell runs first because everything downstream is expressed in rho, and rho
+is relative to a capacity prior fitted from a two-parameter ``1/C = i/P + o/D`` surface
+with a 10-29 % rms relative error. A 25 % error in ``C_s`` moves every later cell's
+offered load by 25 %. Running the cheap, monotone, steady-state primitive first turns
+that guess into a measurement before the expensive cells spend it.
 
-Bursts run last, and only on the shapes that can reach the queue at all - see
-:mod:`scripts.admission_cap`. A burst has to overshoot the *engine's* running limit,
-because ``vllm:num_requests_waiting`` only moves when the engine queues; if the requests
-needed to do that exceed what the gateway will admit, the spike is shed at the Envoy
-circuit breaker and the cell would record a flat zero at full cost.
+The **boundary search** (:mod:`scripts.adaptive_boundary`) then locates the offered load
+at which the shape actually starts violating its SLO, and dwells just under it. This
+replaces the fixed rho grid: theta is a threshold on the signal at the moment the SLO
+breaks, so windows taken far from that moment - on either side - barely constrain it,
+and a grid centred on a prior with a 25 % error is centred on a guess. Three stages,
+about 12 minutes of offered load per shape: coarse 3 x 60 s, bisect 2 x 120 s, dwell
+300 s at ``0.95 rho*``.
+
+The **ramp** is regenerated from the measured capacity rather than from the prior, and
+**bursts** run last because they are the only primitive that can be skipped outright, so
+a truncated campaign still has everything else.
 
 What the gateway does to a cell
 -------------------------------
-The deployed BackendTrafficPolicy admits ``maxParallelRequests: 256`` +
-``maxPendingRequests: 64`` **per Envoy cluster, shared across every replica**. A
-pre-check against the live gateway on 2026-09-20 opened requests until they were
-refused: the first 503 arrived at in-flight 321 and every one of them carried
+Since 2026-09-21 the BackendTrafficPolicy admits ``maxParallelRequests: 4096`` +
+``maxPendingRequests: 1024`` (identically on both experiment arms - see
+``deploy/gateway-hardening/README.md``), and every model passes ``--max-num-seqs 256``.
+The real admission ceiling is therefore the engine's ``max_num_seqs * replicas``, which
+**grows when TRE scales out**, and no campaign cell comes near the Envoy limits.
+
+*Superseded, kept because its evidence still matters.* Until 2026-09-21 the policy was
+``maxParallelRequests: 256`` + ``maxPendingRequests: 64`` per Envoy cluster, shared
+across every replica. A pre-check on 2026-09-20 opened requests until they were refused:
+the first 503 arrived at in-flight 321 and every one of them carried
 
     HTTP/1.1 503 Service Unavailable
     content-type: text/plain
     upstream connect error or disconnect/reset before headers. reset reason: overflow
 
-with no ``x-envoy-*`` header at all. That is why
-:func:`scripts.openloop.classify_failure` cannot key on the headers, and why a shed is
-not counted against the model's error budget: it never reached vLLM. The first shed
-instead truncates the cell to its drain segment, because everything after it measures
-the circuit breaker rather than the engine.
+with no ``x-envoy-*`` header at all. **That 320 ceiling is no longer deployed**, and any
+number fitted against it - including theta 1718 / 1494 / 1414 - is invalid by
+construction. What survives from the measurement is the classifier's constraint:
+:func:`scripts.openloop.classify_failure` cannot key on Envoy headers, because a shed
+carries none.
+
+What a shed now does to a calibration cell is **void it**. Truncating and keeping the
+earlier windows keeps exactly the healthy part of the cell and discards the overloaded
+part, which biases every theta fitted on it towards health - the same direction the
+superseded values were wrong in. See :data:`scripts.openloop.SHED_POLICY_VOID`.
 
 Artifacts
 ---------
 Per cell, under ``--raw-dir``: the per-request raw JSONL, the 1 Hz instant sidecar, the
-classified failures, and a guard JSON recording truncation and censoring. Per campaign,
-under ``--out-dir``: ``plan.json`` (every cell, in order, with its provenance),
-``capacity/<model>_<shape>.json`` (prior vs measured), the regenerated ramp schedules,
-and ``fit_plan.json`` - the re-windowing and refit invocations the capture is meant to
-be consumed by, including the cadence each one must use.
+classified failures, and a guard JSON recording outcomes, goodput, truncation, censoring
+and any void reason. Per campaign, under ``--out-dir``: ``plan.json`` (every cell, in
+order, with its provenance), ``capacity/<model>_<shape>.json`` (prior vs measured),
+``boundary/<model>_<shape>.json`` (the search's probes and located rho*), the schedules
+generated mid-campaign, and ``fit_plan.json`` - the re-windowing and refit invocations
+the capture is meant to be consumed by, including the cadence each one must use and the
+per-family control fits.
 """
 from __future__ import annotations
 
@@ -56,15 +76,23 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Sequence
 
+from scripts import adaptive_boundary as boundary
 from scripts import admission_cap as admission
 from scripts import gen_calibration_schedules as gen
+from scripts import openloop
 from scripts.openloop import LIVE_GRID_MS
 
+#: Stage a shape's boundary search occupies in the campaign order. It is not one of
+#: ``gen.PRIMITIVES``: its cells are generated at campaign time from what the previous
+#: probe measured, so there is nothing to commit and nothing in the schedule index.
+BOUNDARY_STAGE = "boundary"
+
 #: Primitives in the order a model runs them. Steps first because it measures the
-#: capacity the ramp is then defined against; bursts last because they are the only
-#: primitive that can be skipped outright, so a truncated campaign still has the two
-#: primitives every shape needs.
-STAGE_ORDER = ("steps", "ramp", "bursts")
+#: capacity everything else is defined against; the boundary search next because it is
+#: what produces the windows theta is actually fitted on; bursts last because they are
+#: the only primitive that can be skipped outright, so a truncated campaign still has
+#: everything a fit needs.
+STAGE_ORDER = ("steps", BOUNDARY_STAGE, "ramp", "bursts")
 
 #: Seconds of each step level treated as transient and excluded from the capacity
 #: measurement. A level has to reach steady state before its throughput means anything.
@@ -336,7 +364,7 @@ def build_plan(index: dict, models: Sequence[str]) -> tuple[list[Cell], list[Cel
     runnable: list[Cell] = []
     for model in models:
         for primitive in STAGE_ORDER:
-            for shape in list(gen.SHAPES) + [gen.MIXTURE_NAME]:
+            for shape in gen.ALL_SHAPES:
                 entry = by_key.get((model, shape, primitive))
                 if entry is None:
                     continue
@@ -364,6 +392,33 @@ def build_plan(index: dict, models: Sequence[str]) -> tuple[list[Cell], list[Cel
 
 def estimate_wall_clock_s(cells: Sequence[Cell], cooldown_s: float) -> float:
     return sum(cell.duration_s + cooldown_s for cell in cells)
+
+
+def boundary_plan(models: Sequence[str], shapes: Sequence[str]) -> list[dict]:
+    """The boundary-search cells a campaign will generate, for the estimate and the plan.
+
+    They carry no schedule path because they have none yet: each probe's rho comes from
+    what the previous probe measured. Listing them anyway is what keeps ``plan.json`` an
+    honest statement of how long the campaign takes.
+    """
+    return [
+        {
+            "model": model,
+            "shape": shape,
+            "stage": BOUNDARY_STAGE,
+            "probes": boundary.probe_count(),
+            "duration_s": boundary.shape_seconds(),
+            "stage_seconds": boundary.stage_seconds(),
+        }
+        for model in models
+        for shape in shapes
+    ]
+
+
+def estimate_boundary_wall_clock_s(plan: Sequence[dict], cooldown_s: float) -> float:
+    return sum(
+        float(entry["duration_s"]) + cooldown_s * int(entry["probes"]) for entry in plan
+    )
 
 
 def kv_cache_tokens_by_model(index: dict) -> dict:
@@ -403,6 +458,19 @@ def controller_mode(namespace: str = "tre-v2") -> str:
 
 
 def cell_command(cell: Cell, args, schedule_path: Path, output: Path) -> list[str]:
+    """The ``r3_grid`` invocation for one cell.
+
+    Three flags here are the campaign's own discipline rather than r3_grid's defaults,
+    and each one exists because its absence silently pollutes theta:
+
+    * ``--shed-policy void`` - a shed means the offered load never reached the engine.
+      Keeping the windows from before it keeps only the healthy ones.
+    * ``--max-p99-delay-ms`` at :data:`scripts.openloop.CALIBRATION_MAX_P99_DELAY_MS` -
+      ten times tighter than the replay default, because a generator that fires late did
+      not offer the load the cell is indexed by.
+    * ``--ttft-slo-ms`` / ``--tpot-slo-ms`` - pinned, so the goodput a cell reports and
+      the SLO the boundary search reads are the same numbers.
+    """
     command = [
         sys.executable, "-m", "scripts.r3_grid",
         "--model", cell.model,
@@ -416,9 +484,16 @@ def cell_command(cell: Cell, args, schedule_path: Path, output: Path) -> list[st
         "--namespace", args.model_namespace,
         "--guard-mode", args.guard_mode,
         "--min-slo-windows", str(args.min_slo_windows),
+        "--shed-policy", openloop.SHED_POLICY_VOID,
+        "--max-p99-delay-ms", str(openloop.CALIBRATION_MAX_P99_DELAY_MS),
+        "--max-model-error-rate", str(args.max_model_error_rate),
+        "--ttft-slo-ms", str(args.ttft_slo_ms),
+        "--tpot-slo-ms", str(args.tpot_slo_ms),
     ]
     if cell.drain_start_s is not None:
         command += ["--drain-start-s", str(cell.drain_start_s)]
+    if getattr(args, "envoy_stats_url", None):
+        command += ["--envoy-stats-url", args.envoy_stats_url]
     if args.registry:
         command += ["--registry", args.registry]
     if args.redis_url:
@@ -464,7 +539,190 @@ def regenerate_ramp(
     return path
 
 
-def fit_plan(models: Sequence[str], out_dir: Path, raw_dir: Path, args) -> dict:
+# ------------------------------------------------------------------ boundary search
+
+
+def read_window_rows(path: Path) -> list[dict]:
+    """Window rows back out of an ``r3_grid`` CSV, typed enough to judge a probe by.
+
+    A voided cell writes an empty CSV, which reads back as zero rows - which is exactly
+    what the boundary search must see: no evidence, not evidence of health.
+    """
+    import csv
+
+    path = Path(path)
+    if not path.exists():
+        return []
+    rows: list[dict] = []
+    with path.open("r", newline="", encoding="utf-8") as fh:
+        for raw in csv.DictReader(fh):
+            row = dict(raw)
+            for key in ("p95_ttft", "p95_tpot", "p95_e2e", "trs"):
+                value = row.get(key)
+                row[key] = None if value in (None, "") else float(value)
+            row["slo_violated"] = str(row.get("slo_violated", "")).lower() in ("true", "1")
+            row["model_errors"] = int(row.get("model_errors") or 0)
+            rows.append(row)
+    return rows
+
+
+def probe_result_from_cell(
+    probe: boundary.Probe,
+    cell_id: str,
+    rows: Sequence[dict],
+    guard: dict,
+    *,
+    ttft_slo_ms: float,
+    tpot_slo_ms: float,
+) -> boundary.ProbeResult:
+    """Turn one driven hold cell into the verdict the search consumes.
+
+    A cell the guard voided is reported ``valid=False`` and its (empty) rows are never
+    consulted. That is the difference between "this load did not violate" and "we did not
+    manage to offer this load", and conflating them walks the bracket upwards on every
+    infrastructure hiccup.
+    """
+    void_reasons = tuple(str(r) for r in (guard.get("void_reasons") or ()))
+    valid = not void_reasons and bool(rows)
+    violated, violating, total = boundary.probe_violated(
+        rows, ttft_slo_ms=ttft_slo_ms, tpot_slo_ms=tpot_slo_ms
+    )
+    if not valid and not void_reasons:
+        void_reasons = ("no windows",)
+    goodput_value = None
+    body = guard.get("goodput")
+    if isinstance(body, dict):
+        goodput_value = body.get("goodput")
+    return boundary.ProbeResult(
+        probe=probe,
+        violated=bool(violated) if valid else False,
+        valid=valid,
+        void_reasons=void_reasons,
+        windows=total,
+        violating_windows=violating,
+        goodput=goodput_value,
+        cell_id=cell_id,
+    )
+
+
+def run_boundary_search(
+    model: str,
+    shape: str,
+    capacity_rps: float,
+    *,
+    drive,
+    cap: admission.AdmissionCap,
+    ttft_slo_ms: float,
+    tpot_slo_ms: float,
+    capacity_source: str = "measured_steps",
+    search: Optional[boundary.BoundarySearch] = None,
+) -> boundary.BoundarySearch:
+    """Drive the three-stage search for one (model, shape).
+
+    ``drive(probe, cell_id, body, meta) -> (rows, guard)`` is the seam: the campaign
+    passes one that writes the schedule and shells out to ``r3_grid``, and the tests pass
+    one that answers from a table. Everything that decides *which* rho comes next lives
+    in :class:`scripts.adaptive_boundary.BoundarySearch`, so it is testable without a
+    cluster; everything here is bookkeeping around it.
+    """
+    search = search or boundary.BoundarySearch(model=model, shape=shape)
+    while True:
+        probe = search.next_probe()
+        if probe is None:
+            break
+        body, meta = gen.build_hold_schedule(
+            model, shape, capacity_rps, probe.rho, probe.duration_s,
+            stage=probe.stage, capacity_source=capacity_source, cap=cap,
+        )
+        rows, guard = drive(probe, meta["cell_id"], body, meta)
+        search.record(
+            probe_result_from_cell(
+                probe, meta["cell_id"], rows, guard,
+                ttft_slo_ms=ttft_slo_ms, tpot_slo_ms=tpot_slo_ms,
+            )
+        )
+    return search
+
+
+# ------------------------------------------------------------------- family diagnostic
+
+#: How far the per-family thetas may sit outside the merged fit's bootstrap CI before the
+#: merged number stops being publishable. Zero: the CI *is* the claim about how much the
+#: number can move, so a family sitting outside it is a statement that the number depends
+#: on which regime it was measured in.
+FAMILY_SPREAD_TOLERANCE = 0.0
+
+
+def family_theta_verdict(
+    merged_theta: float,
+    ci_half_width: float,
+    family_thetas: dict[str, float],
+    *,
+    tolerance: float = FAMILY_SPREAD_TOLERANCE,
+) -> dict:
+    """Publish the merged theta, or fall back to the smallest family theta.
+
+    The merged fit pools the prefill-heavy and decode-heavy shapes, which is only
+    legitimate if they are measuring the same threshold. Fitting each family separately
+    is the cheapest test of that: if every family theta lands inside the merged fit's own
+    bootstrap CI, the pooling is consistent with the data and the merged number is
+    published.
+
+    If a family lands outside it, theta depends on the regime, and there is no single
+    correct value. The published number is then the **smallest** family theta, because
+    theta is a health threshold that the controller must stay above: publishing the
+    larger one would declare healthy a regime that is not, whereas publishing the smaller
+    one is conservative in the direction that fails safe.
+    """
+    if not family_thetas:
+        return {
+            "publish": "merged",
+            "theta": merged_theta,
+            "reason": "no per-family fit was produced, so pooling could not be checked",
+            "family_thetas": {},
+            "ci_half_width": ci_half_width,
+            "outside": [],
+        }
+    bound = abs(ci_half_width) * (1.0 + tolerance)
+    outside = sorted(
+        name for name, value in family_thetas.items()
+        if abs(float(value) - float(merged_theta)) > bound
+    )
+    if not outside:
+        return {
+            "publish": "merged",
+            "theta": merged_theta,
+            "reason": (
+                f"every family theta is within the merged bootstrap CI (+/-{bound:.4g}), "
+                "so the pooled fit is consistent with both regimes"
+            ),
+            "family_thetas": dict(sorted(family_thetas.items())),
+            "ci_half_width": ci_half_width,
+            "outside": [],
+        }
+    smallest = min(family_thetas.items(), key=lambda kv: float(kv[1]))
+    return {
+        "publish": "min_family",
+        "theta": float(smallest[1]),
+        "family": smallest[0],
+        "reason": (
+            f"family theta(s) {outside} fall outside the merged bootstrap CI "
+            f"(+/-{bound:.4g}), so theta depends on the regime; the smallest family "
+            f"theta ({smallest[0]}) is published because under-claiming health fails safe"
+        ),
+        "family_thetas": dict(sorted(family_thetas.items())),
+        "ci_half_width": ci_half_width,
+        "outside": outside,
+    }
+
+
+def fit_plan(
+    models: Sequence[str],
+    out_dir: Path,
+    raw_dir: Path,
+    args,
+    index: Optional[dict] = None,
+) -> dict:
     """The re-windowing and refit invocations this capture is meant to be consumed by.
 
     Two things are pinned here rather than left to whoever runs the fit.
@@ -480,16 +738,31 @@ def fit_plan(models: Sequence[str], out_dir: Path, raw_dir: Path, args) -> dict:
 
     *lambda_wait.* The primary fit keeps the inherited 3.0. A secondary fit at 0.0 says
     whether the waiting term did anything: if theta and the ranking separation move by
-    less than 5 %, the term is inert in this deployment, and the reason is structural -
-    gateway admission caps in-flight below the engine's sequence limit, so the queue the
-    term multiplies is almost always zero. That is a finding to report, not a knob to
-    tune away.
+    less than 5 %, the term is inert in this deployment. Under the superseded gateway cap
+    the reason was structural - in-flight was capped below the engine's sequence limit,
+    so the queue the term multiplies was almost always zero. Under the deployed
+    engine-capped policy that excuse is gone and the control fit becomes a real question.
+
+    *Held-out data.* The fitting re-window explicitly excludes the held-out shape's
+    cells. The exclusion is by cell id, taken from the schedule index's ``held_out``
+    entries, because the raw tree is a flat pile of cell files and nothing in a file name
+    says which shape it came from - so a fit pointed at the raw directory would otherwise
+    silently train on the validation set.
+
+    *Families.* Besides the merged fit, each family gets its own. The spread between them
+    is the check that the merged theta is not an artefact of pooling two regimes; see
+    :func:`family_theta_verdict`.
     """
     fit_dir = out_dir / "fit"
+    held_out_cells = sorted(held_out_cell_ids(index or {}))
     plan = {
         "generated_at_utc": utc_iso(),
         "window_ms": args.window_ms,
         "step_ms": args.fit_step_ms,
+        "held_out_shapes": [s for s in gen.ALL_SHAPES if gen.is_held_out(s)],
+        "held_out_cell_ids": held_out_cells,
+        "training_shapes": list(gen.TRAINING_SHAPES),
+        "families": {name: list(members) for name, members in gen.FAMILIES.items()},
         "rewindow": [],
         "refit": [],
         "acceptance": {
@@ -499,18 +772,40 @@ def fit_plan(models: Sequence[str], out_dir: Path, raw_dir: Path, args) -> dict:
             "statement": (
                 "if theta and the ranking separation move by less than "
                 f"{SECONDARY_FIT_TOLERANCE:.0%} between the two fits, the waiting term is "
-                "inert in this deployment because gateway admission caps in-flight below "
-                "the engine's sequence limit"
+                "inert in this deployment"
             ),
+            "stop_rule": {
+                "min_publish_rate": boundary.MIN_PUBLISH_RATE,
+                "max_ci_half_width_fraction": boundary.MAX_CI_HALF_WIDTH_FRACTION,
+                "min_family_boundary_windows": boundary.MIN_FAMILY_BOUNDARY_WINDOWS,
+                "remedy": (
+                    "add hold cells at the boundary of the shapes already in the set; "
+                    "never add a shape, which would make the stopping rule a search over "
+                    "shape sets"
+                ),
+            },
+            "family_spread": {
+                "tolerance": FAMILY_SPREAD_TOLERANCE,
+                "statement": (
+                    "family thetas inside the merged bootstrap CI -> publish the merged "
+                    "theta; otherwise theta is regime-dependent and the smallest family "
+                    "theta is published, because under-claiming health fails safe"
+                ),
+            },
         },
     }
+    exclusions: list[str] = []
+    for cell_id in held_out_cells:
+        exclusions += ["--exclude-cell-id", cell_id]
     for model in models:
         fitting_csv = fit_dir / f"{model}_fitting.csv"
         aliasing_csv = fit_dir / f"{model}_aliasing.csv"
+        validation_csv = fit_dir / f"{model}_validation.csv"
         plan["rewindow"].append({
             "purpose": "fitting (the signal the controller consumes)",
             "model": model,
             "output": str(fitting_csv),
+            "excludes_held_out": True,
             "command": [
                 sys.executable, "-m", "scripts.rewindow_from_raw",
                 "--model", model, "--raw-dir", str(raw_dir),
@@ -518,12 +813,14 @@ def fit_plan(models: Sequence[str], out_dir: Path, raw_dir: Path, args) -> dict:
                 "--window-ms", str(args.window_ms), "--step-ms", str(args.fit_step_ms),
                 "--instant-grid", "live",
                 "--instant-sample-ms", str(LIVE_GRID_MS),
+                *exclusions,
             ],
         })
         plan["rewindow"].append({
             "purpose": "aliasing figure and observability gap (ground truth)",
             "model": model,
             "output": str(aliasing_csv),
+            "excludes_held_out": True,
             "command": [
                 sys.executable, "-m", "scripts.rewindow_from_raw",
                 "--model", model, "--raw-dir", str(raw_dir),
@@ -531,8 +828,25 @@ def fit_plan(models: Sequence[str], out_dir: Path, raw_dir: Path, args) -> dict:
                 "--window-ms", str(args.window_ms), "--step-ms", str(args.fit_step_ms),
                 "--instant-grid", "raw",
                 "--instant-sample-ms", str(args.instant_sample_ms),
+                *exclusions,
             ],
         })
+        if held_out_cells:
+            plan["rewindow"].append({
+                "purpose": "held-out validation set (never fitted on)",
+                "model": model,
+                "output": str(validation_csv),
+                "excludes_held_out": False,
+                "command": [
+                    sys.executable, "-m", "scripts.rewindow_from_raw",
+                    "--model", model, "--raw-dir", str(raw_dir),
+                    "--output", str(validation_csv),
+                    "--window-ms", str(args.window_ms), "--step-ms", str(args.fit_step_ms),
+                    "--instant-grid", "live",
+                    "--instant-sample-ms", str(LIVE_GRID_MS),
+                    *[a for cell_id in held_out_cells for a in ("--only-cell-id", cell_id)],
+                ],
+            })
         for label, lambda_wait in (
             ("primary", PRIMARY_LAMBDA_WAIT),
             ("secondary", SECONDARY_LAMBDA_WAIT),
@@ -540,17 +854,164 @@ def fit_plan(models: Sequence[str], out_dir: Path, raw_dir: Path, args) -> dict:
             plan["refit"].append({
                 "label": label,
                 "model": model,
+                "family": "",
                 "lambda_wait": lambda_wait,
                 "command": [
                     sys.executable, "-m", "scripts.refit_trs_params",
                     "--input", str(fitting_csv),
                     "--model-name", model,
                     "--output", str(fit_dir / f"{model}_refit_{label}.json"),
+                    # refit_trs_params requires both SLOs; omitting them made the plan's
+                    # commands unrunnable as written.
+                    "--ttft-p95-ms", str(args.ttft_slo_ms),
+                    "--tpot-p95-ms", str(args.tpot_slo_ms),
                     "--inherited-lambda-wait", str(lambda_wait),
                     "--lambda-wait-candidates", str(lambda_wait),
                 ],
             })
+        for family, shapes in sorted(gen.FAMILIES.items()):
+            cell_ids = sorted(family_cell_ids(index or {}, shapes))
+            if not cell_ids:
+                continue
+            family_csv = fit_dir / f"{model}_fitting_{family}.csv"
+            plan["rewindow"].append({
+                "purpose": f"per-family fit ({family}) - diagnostic",
+                "model": model,
+                "family": family,
+                "output": str(family_csv),
+                "excludes_held_out": True,
+                "command": [
+                    sys.executable, "-m", "scripts.rewindow_from_raw",
+                    "--model", model, "--raw-dir", str(raw_dir),
+                    "--output", str(family_csv),
+                    "--window-ms", str(args.window_ms), "--step-ms", str(args.fit_step_ms),
+                    "--instant-grid", "live",
+                    "--instant-sample-ms", str(LIVE_GRID_MS),
+                    *[a for cell_id in cell_ids for a in ("--only-cell-id", cell_id)],
+                ],
+            })
+            plan["refit"].append({
+                "label": f"family_{family}",
+                "model": model,
+                "family": family,
+                "shapes": list(shapes),
+                "lambda_wait": PRIMARY_LAMBDA_WAIT,
+                "purpose": (
+                    "diagnostic only - its theta is compared against the merged fit's "
+                    "bootstrap CI, never published on its own unless the families disagree"
+                ),
+                "command": [
+                    sys.executable, "-m", "scripts.refit_trs_params",
+                    "--input", str(family_csv),
+                    "--model-name", model,
+                    "--output", str(fit_dir / f"{model}_refit_family_{family}.json"),
+                    "--ttft-p95-ms", str(args.ttft_slo_ms),
+                    "--tpot-p95-ms", str(args.tpot_slo_ms),
+                    "--inherited-lambda-wait", str(PRIMARY_LAMBDA_WAIT),
+                    "--lambda-wait-candidates", str(PRIMARY_LAMBDA_WAIT),
+                ],
+            })
     return plan
+
+
+def held_out_cell_ids(index: dict) -> set[str]:
+    """Cell ids of every schedule entry marked held out.
+
+    Read from the index rather than from a shape-name pattern: the raw tree is keyed by
+    cell id, and a fit that could not name the held-out cells would train on them.
+    """
+    out: set[str] = set()
+    for entry in index.get("schedules", []) or []:
+        if entry.get("held_out") and entry.get("cell_id"):
+            out.add(str(entry["cell_id"]))
+    return out
+
+
+def family_cell_ids(index: dict, shapes: Sequence[str]) -> set[str]:
+    """Cell ids belonging to the shapes of one family, held-out shapes excluded.
+
+    The exclusion is belt and braces - no held-out shape is in a family today - but it is
+    the kind of thing that stops being true quietly.
+    """
+    wanted = set(shapes)
+    return {
+        str(entry["cell_id"])
+        for entry in (index.get("schedules", []) or [])
+        if entry.get("shape") in wanted
+        and entry.get("cell_id")
+        and not entry.get("held_out")
+    }
+
+
+def drive_boundary_search(
+    cell: Cell,
+    measured: MeasuredCapacity,
+    args,
+    *,
+    cap: admission.AdmissionCap,
+    schedule_dir: Path,
+    out_dir: Path,
+) -> boundary.BoundarySearch:
+    """Run one shape's boundary search, driving each probe through ``r3_grid``.
+
+    Each probe writes its schedule under ``<out-dir>/schedules`` and its window CSV under
+    ``<out-dir>``, both named after the probe's own cell id, so nothing overwrites
+    anything and a re-run of a voided probe is visibly a second attempt.
+    """
+    def drive(probe, cell_id, body, meta):
+        stem = f"{cell.shape}_{gen.HOLD_PRIMITIVE}{gen.hold_load_code(probe.rho)}"
+        schedule_path = schedule_dir / cell.model / f"{stem}.json"
+        schedule_path.parent.mkdir(parents=True, exist_ok=True)
+        schedule_path.write_text(json.dumps(body, indent=2) + "\n", encoding="utf-8")
+        (schedule_path.parent / f"{stem}.meta.json").write_text(
+            json.dumps(meta, indent=2) + "\n", encoding="utf-8"
+        )
+        probe_cell = Cell(
+            model=cell.model,
+            shape=cell.shape,
+            primitive=gen.HOLD_PRIMITIVE,
+            cell_id=cell_id,
+            schedule=str(schedule_path),
+            duration_s=probe.duration_s,
+            capacity_rps=measured.capacity_used_rps,
+            capacity_source=measured.capacity_source,
+            metadata=meta,
+        )
+        output = out_dir / f"{cell.model}_{cell.shape}_{stem}_a{probe.attempt}.csv"
+        command = cell_command(probe_cell, args, schedule_path, output)
+        print(
+            f"  boundary {cell.model}/{cell.shape} {probe.stage} rho={probe.rho:g} "
+            f"({probe.duration_s:.0f}s, attempt {probe.attempt}): {' '.join(command)}"
+        )
+        result = subprocess.run(command, check=False)
+        if result.returncode != 0:
+            print(f"  probe failed with exit {result.returncode}")
+        rows = read_window_rows(output)
+        guard_path = (
+            Path(args.raw_dir) / output.stem / f"{cell_id}.guard.json"
+        )
+        guard: dict = {}
+        if guard_path.exists():
+            try:
+                guard = json.loads(guard_path.read_text(encoding="utf-8"))
+            except ValueError:
+                guard = {}
+        if result.returncode != 0 and not guard.get("void_reasons"):
+            guard = dict(guard)
+            guard["void_reasons"] = [f"driver exited {result.returncode}"]
+        time.sleep(args.cooldown_s)
+        return rows, guard
+
+    return run_boundary_search(
+        cell.model,
+        cell.shape,
+        measured.capacity_used_rps,
+        drive=drive,
+        cap=cap,
+        ttft_slo_ms=args.ttft_slo_ms,
+        tpot_slo_ms=args.tpot_slo_ms,
+        capacity_source=measured.capacity_source,
+    )
 
 
 def run_campaign(args) -> int:
@@ -566,6 +1027,16 @@ def run_campaign(args) -> int:
     raw_dir = Path(args.raw_dir)
     schedule_root = index_path.parent
 
+    # The held-out shape gets no boundary search. Its cells are generated at campaign
+    # time, so their ids cannot be in the index that the fit's exclusion list is built
+    # from - they would be invisible to the held-out filter and would train the fit.
+    boundary_shapes = [
+        shape for shape in gen.ALL_SHAPES
+        if not gen.is_held_out(shape) and any(c.shape == shape for c in runnable)
+    ]
+    boundary_cells = boundary_plan(models, boundary_shapes)
+    schedule_seconds = estimate_wall_clock_s(runnable, args.cooldown_s)
+    boundary_seconds = estimate_boundary_wall_clock_s(boundary_cells, args.cooldown_s)
     plan_doc = {
         "generated_at_utc": utc_iso(),
         "admission_cap": cap.as_dict(),
@@ -574,22 +1045,28 @@ def run_campaign(args) -> int:
         "stage_order": list(STAGE_ORDER),
         "cooldown_s": args.cooldown_s,
         "cells": [cell.as_dict() for cell in runnable],
+        "boundary_cells": boundary_cells,
         "skipped": [
             {"model": c.model, "shape": c.shape, "primitive": c.primitive,
              "reason": c.skip_reason}
             for c in skipped
         ],
-        "estimated_wall_clock_s": round(estimate_wall_clock_s(runnable, args.cooldown_s), 1),
+        "estimated_schedule_wall_clock_s": round(schedule_seconds, 1),
+        "estimated_boundary_wall_clock_s": round(boundary_seconds, 1),
+        "estimated_wall_clock_s": round(schedule_seconds + boundary_seconds, 1),
     }
     (out_dir / "plan.json").write_text(json.dumps(plan_doc, indent=2) + "\n", encoding="utf-8")
     (out_dir / "fit_plan.json").write_text(
-        json.dumps(fit_plan(models, out_dir, raw_dir, args), indent=2) + "\n", encoding="utf-8"
+        json.dumps(fit_plan(models, out_dir, raw_dir, args, index), indent=2) + "\n",
+        encoding="utf-8",
     )
 
     hours = plan_doc["estimated_wall_clock_s"] / 3600.0
     print(f"admission cap: {cap.name} (shed ceiling {cap.shed_ceiling}, "
-          f"admission controller: {cap.admission_controller})")
-    print(f"{len(runnable)} cells to run, {len(skipped)} skipped, "
+          f"admission controller: {cap.admission_controller}, "
+          f"engine ceiling {cap.fleet_sequence_limit} = max_num_seqs x replicas)")
+    print(f"{len(runnable)} scheduled cells + {len(boundary_cells)} boundary searches "
+          f"({sum(c['probes'] for c in boundary_cells)} probe cells), {len(skipped)} skipped, "
           f"~{hours:.2f} h wall clock including {args.cooldown_s:.0f}s cooldowns")
     for cell in runnable:
         print(f"  {cell.model:12} {cell.shape:3} {cell.primitive:7} "
@@ -612,8 +1089,11 @@ def run_campaign(args) -> int:
 
     measured_dir = out_dir / "capacity"
     measured_dir.mkdir(parents=True, exist_ok=True)
+    boundary_dir = out_dir / "boundary"
+    boundary_dir.mkdir(parents=True, exist_ok=True)
     regenerated_dir = out_dir / "schedules"
     measurements: dict[tuple[str, str], MeasuredCapacity] = {}
+    searches: dict[tuple[str, str], boundary.BoundarySearch] = {}
     step_levels = [
         (float(level["rho"]), float(level["duration_s"]))
         for level in index["primitives"]["steps"]["levels"]
@@ -669,6 +1149,25 @@ def run_campaign(args) -> int:
                 print(f"measured C_s: prior {measurement.capacity_prior_rps} -> "
                       f"used {measurement.capacity_used_rps} rps "
                       f"({measurement.capacity_source}); {measurement.note}")
+                if not args.skip_boundary_search and not gen.is_held_out(cell.shape):
+                    time.sleep(args.cooldown_s)
+                    search = drive_boundary_search(
+                        cell, measurement, args,
+                        cap=cap,
+                        schedule_dir=regenerated_dir,
+                        out_dir=out_dir,
+                    )
+                    (boundary_dir / f"{cell.model}_{cell.shape}.json").write_text(
+                        json.dumps(search.as_dict(), indent=2) + "\n", encoding="utf-8"
+                    )
+                    searches[(cell.model, cell.shape)] = search
+                    print(
+                        f"boundary {cell.model}/{cell.shape}: rho* = {search.rho_star}, "
+                        f"dwelled at {search.dwell_rho}"
+                        + ("" if search.boundary_found else " (NO violation was observed - "
+                           "the boundary is above everything offered)")
+                        + (f"; STOPPED: {search.stopped_reason}" if search.stopped_reason else "")
+                    )
 
         if position < len(runnable):
             time.sleep(args.cooldown_s)
@@ -699,6 +1198,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--ttft-slo-ms", type=float, default=500.0)
     ap.add_argument("--tpot-slo-ms", type=float, default=75.0)
     ap.add_argument("--min-slo-windows", type=int, default=3)
+    ap.add_argument("--max-model-error-rate", type=float,
+                    default=openloop.DEFAULT_MAX_MODEL_ERROR_RATE,
+                    help="a cell whose MODEL error rate exceeds this is void and must be "
+                         "re-run; the individual error windows are kept and counted as "
+                         "violations either way")
+    ap.add_argument("--envoy-stats-url", default=None,
+                    help="Envoy admin /stats endpoint. Every cell then records the change "
+                         "in upstream_rq_pending_overflow across it and is voided if it "
+                         "moved. Validity sentinel only - never a control input.")
+    ap.add_argument("--skip-boundary-search", action="store_true",
+                    help="run only the committed primitives (steps/ramp/bursts) and skip "
+                         "the adaptive boundary search")
     ap.add_argument("--guard-mode", default="warn", choices=["fail", "warn"],
                     help="a failed cell should not abandon the campaign by default; the "
                          "guard verdict is recorded per cell either way")

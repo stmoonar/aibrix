@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Iterable, Sequence
 
 from tre_calibration.dataset import CalibrationWindow
+from tre_calibration.fit import DEFAULT_SIGNAL_DIRECTION, signal_orientation
 
 
 @dataclass(frozen=True)
@@ -18,9 +19,22 @@ class ThresholdEvaluation:
     false_violation: int
 
 
-def evaluate_threshold(windows: Iterable[CalibrationWindow], *, theta: float) -> ThresholdEvaluation:
+def evaluate_threshold(
+    windows: Iterable[CalibrationWindow],
+    *,
+    theta: float,
+    direction: str = DEFAULT_SIGNAL_DIRECTION,
+) -> ThresholdEvaluation:
+    """Confusion counts and ranking metrics of ``theta`` on ``windows``.
+
+    ``direction`` says which side of ``theta`` is the healthy prediction and which end of
+    the signal ranks as healthier; it must be the orientation the threshold was fitted
+    under, or the report scores a rule nobody applies. Scores are reflected by the
+    orientation multiplier so both orientations run through one code path.
+    """
+    orientation = signal_orientation(direction)
     rows = [row for row in windows if math.isfinite(row.signal)]
-    scores = [row.signal for row in rows]
+    scores = [orientation * row.signal for row in rows]
     healthy_labels = [1 if row.slo_met else 0 for row in rows]
     health_scores = [
         row.health_score if row.health_score is not None else (1.0 if row.slo_met else 0.0)
@@ -29,7 +43,7 @@ def evaluate_threshold(windows: Iterable[CalibrationWindow], *, theta: float) ->
 
     true_healthy = false_healthy = true_violation = false_violation = 0
     for row in rows:
-        pred_healthy = row.signal >= theta
+        pred_healthy = orientation * row.signal >= orientation * theta
         if row.slo_met and pred_healthy:
             true_healthy += 1
         elif row.slo_met:
@@ -59,9 +73,19 @@ class SignalDirectionEvaluation:
     spearman_health: float
 
 
-def evaluate_signal_direction(windows: Iterable[CalibrationWindow]) -> SignalDirectionEvaluation:
+def evaluate_signal_direction(
+    windows: Iterable[CalibrationWindow],
+    *,
+    direction: str = DEFAULT_SIGNAL_DIRECTION,
+) -> SignalDirectionEvaluation:
+    """Rank the raw signal against health, reading it in the given orientation.
+
+    Under ``lower_is_healthier`` a good signal is a *small* one, so the scores are
+    reflected before ranking; reporting the raw AUROC there would report ``1 - auroc``.
+    """
+    orientation = signal_orientation(direction)
     rows = [row for row in windows if math.isfinite(row.signal)]
-    scores = [row.signal for row in rows]
+    scores = [orientation * row.signal for row in rows]
     healthy_labels = [1 if row.slo_met else 0 for row in rows]
     health_scores = [
         row.health_score if row.health_score is not None else (1.0 if row.slo_met else 0.0)

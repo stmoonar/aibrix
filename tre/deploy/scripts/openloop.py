@@ -28,6 +28,15 @@ What is in here
   empty raw file and a silently-zero row rather than an error. Here a cell that sent
   nothing, completed nothing, errored too often, or could not keep its schedule is a
   hard failure.
+* :func:`count_outcomes` / :func:`goodput` - the per-cell accounting. Every request is
+  one of four outcomes (ok / shed / model_error / client_timeout) and every cell reports
+  offered / admitted / completed, because the campaign's headline metric is
+  ``G = #(admitted AND met every SLO) / #offered``: a denominator of *offered* makes a
+  rejection a loss instead of an absence, which is the only way a boundary search can
+  tell "served less" apart from "refused more".
+* :class:`PendingOverflowSentinel` - reads Envoy's own ``upstream_rq_pending_overflow``
+  around a cell. A non-zero delta means the capture was shaped by the proxy and the run
+  is invalid. It is a validity check only and never enters a control law.
 * :func:`make_pod_metrics_sampler` - a 1 Hz sidecar that scrapes the model pods'
   ``/metrics`` directly instead of reading the gateway's redis buckets. The gateway
   writes instantaneous gauges on a 10 s boundary-aligned ticker
@@ -65,9 +74,30 @@ LIVE_GRID_MS = SCRAPE_INTERVAL_MS
 #: bounded by the driver, which is the exact failure this whole module exists to avoid.
 DEFAULT_MAX_P99_DELAY_MS = 250.0
 DEFAULT_MAX_P99_POOL_WAIT_MS = 250.0
+#: The ceiling a *calibration* cell is held to, ten times tighter than the replay
+#: default. theta is fitted on the relationship between offered load and latency, so a
+#: generator that fires 250 ms late at the 99th percentile has not offered the load the
+#: schedule says it did - the cell is then measuring the driver, and a calibration point
+#: that measures the driver is worse than no point at all.
+CALIBRATION_MAX_P99_DELAY_MS = 50.0
 #: Only MODEL errors count against this. A gateway shed is not the model failing, it is
-#: the campaign hitting the admission ceiling, and it is handled by truncation instead.
+#: the campaign hitting the admission ceiling; a client timeout is the driver giving up.
 DEFAULT_MAX_MODEL_ERROR_RATE = 0.05
+
+#: What a cell does when the gateway sheds.
+#:
+#: ``truncate`` is the replay behaviour: stop offering, censor the windows after the
+#: shed, and keep the earlier ones as evidence.
+#:
+#: ``void`` is what a calibration cell must do. Keeping only the windows from before the
+#: shed keeps exactly the *healthy* part of the cell and throws away the overloaded part,
+#: which biases every theta fitted on it towards health - the same mechanism that
+#: produced the superseded 1718 / 1494 / 1414. A shed also means the cell never offered
+#: the load it was asked to, so there is nothing to salvage: it has to be re-run.
+SHED_POLICY_TRUNCATE = "truncate"
+SHED_POLICY_VOID = "void"
+SHED_POLICIES = (SHED_POLICY_TRUNCATE, SHED_POLICY_VOID)
+DEFAULT_SHED_POLICY = SHED_POLICY_TRUNCATE
 #: Windows above the SLO a truncated cell must already have collected for its evidence
 #: to be usable. Below that the cell was cut short before it had said anything.
 DEFAULT_MIN_SLO_WINDOWS = 3
@@ -92,9 +122,26 @@ FAILURE_NONE = "ok"
 #: The gateway rejected the request at its circuit breaker; it never reached vLLM. This
 #: says nothing about the model and everything about the admission policy.
 FAILURE_PROXY = "proxy"
-#: The model itself failed or was too slow. vLLM queues rather than shedding, so a
-#: non-2xx that carries an engine body, and any timeout, is a statement about the model.
+#: The model itself failed. vLLM queues rather than shedding, so a non-2xx that carries
+#: an engine body, and any transport failure that is not the client's own deadline, is a
+#: statement about the model.
 FAILURE_MODEL = "model"
+#: The *client* gave up before the upstream answered. Its own class: nothing is known
+#: about what the engine did with the request, so counting it against the model's error
+#: budget would read as an engine fault it may not be, and counting it as a shed would
+#: read as an admission decision nobody made. It is recorded, never budgeted.
+FAILURE_CLIENT_TIMEOUT = "client_timeout"
+
+#: The four outcomes one request can have, under the names the cell artifacts use.
+#: ``FAILURE_PROXY`` is spelled ``shed`` outward because that is what it is; the constant
+#: keeps its original value so captures written before this split still read back.
+FAILURE_CLASSES = (FAILURE_NONE, FAILURE_PROXY, FAILURE_MODEL, FAILURE_CLIENT_TIMEOUT)
+OUTCOME_NAMES = {
+    FAILURE_NONE: "ok",
+    FAILURE_PROXY: "shed",
+    FAILURE_MODEL: "model_error",
+    FAILURE_CLIENT_TIMEOUT: "client_timeout",
+}
 
 #: Statuses only the proxy can produce: they all mean "no usable answer from upstream",
 #: which an engine that queues its work never needs to say. A 503 is the circuit
@@ -147,6 +194,9 @@ def classify_failure(record: dict) -> str:
     Rules, in order:
 
     * 2xx with a measured end-to-end time -> served.
+    * the sender flagged ``client_timeout`` -> the client's own deadline fired. Checked
+      before everything else because it is the only class the *sender* can attest to;
+      every other rule is an inference from what came back, and nothing came back.
     * an explicit Envoy marker header -> proxy.
     * no status at all (transport failure, timeout) -> model. vLLM queues rather than
       shedding, so a request that hung was waiting on the engine.
@@ -160,6 +210,9 @@ def classify_failure(record: dict) -> str:
     status = record.get("http_status")
     if status is not None and 200 <= int(status) < 300 and record.get("e2e_ms") is not None:
         return FAILURE_NONE
+
+    if record.get("client_timeout"):
+        return FAILURE_CLIENT_TIMEOUT
 
     raw_headers = record.get("error_headers") or {}
     headers = {str(k).lower(): str(v) for k, v in raw_headers.items()}
@@ -181,7 +234,13 @@ def classify_failure(record: dict) -> str:
 
 def failure_signature(record: dict) -> dict:
     """The evidence behind one classification, for the cell artifact. Keeping the body
-    and headers verbatim is what lets a later reader re-judge a call this made."""
+    and headers verbatim is what lets a later reader re-judge a call this made.
+
+    ``in_flight_at_send`` travels with it: a failure is only interpretable next to how
+    loaded the path was when the request left, and it is the one quantity that cannot be
+    reconstructed from the raw log afterwards.
+    """
+    verdict = classify_failure(record)
     return {
         "request_id": record.get("request_id"),
         "send_ts_ms": record.get("actual_send_ts_ms"),
@@ -190,22 +249,148 @@ def failure_signature(record: dict) -> dict:
         "error_body": record.get("error_body"),
         "error_headers": record.get("error_headers"),
         "e2e_ms": record.get("e2e_ms"),
-        "failure_class": classify_failure(record),
+        "in_flight_at_send": record.get("in_flight_at_send"),
+        "request_timeout_s": record.get("request_timeout_s"),
+        "failure_class": verdict,
+        "outcome": OUTCOME_NAMES[verdict],
     }
 
 
-def count_failures(records: Sequence[dict]) -> tuple[int, int, int]:
-    """(served, model errors, proxy errors) over a cell's sender records."""
-    served = model_errors = proxy_errors = 0
+@dataclass(frozen=True)
+class CellOutcomes:
+    """Per-cell request accounting, in the three counts a calibration point needs.
+
+    * ``offered`` - requests the driver actually emitted. This is the denominator of
+      goodput: a request the gateway refused was still load this experiment asked the
+      system to carry, and dividing by ``admitted`` instead would let a system that
+      rejects half its traffic score the same as one that serves it.
+    * ``admitted`` - requests that reached vLLM, i.e. everything not shed at the proxy.
+    * ``completed`` - requests that came back 2xx with a measured end-to-end time.
+    """
+
+    offered: int
+    admitted: int
+    completed: int
+    ok: int
+    shed: int
+    model_error: int
+    client_timeout: int
+
+    def as_dict(self) -> dict:
+        return {
+            "offered": self.offered,
+            "admitted": self.admitted,
+            "completed": self.completed,
+            "ok": self.ok,
+            "shed": self.shed,
+            "model_error": self.model_error,
+            "client_timeout": self.client_timeout,
+        }
+
+
+def count_outcomes(records: Sequence[dict]) -> CellOutcomes:
+    """Four-way classification of a cell's sender records, plus offered/admitted/completed."""
+    counts = {name: 0 for name in OUTCOME_NAMES.values()}
     for record in records:
-        verdict = classify_failure(record)
-        if verdict == FAILURE_NONE:
-            served += 1
-        elif verdict == FAILURE_PROXY:
-            proxy_errors += 1
-        else:
-            model_errors += 1
-    return served, model_errors, proxy_errors
+        counts[OUTCOME_NAMES[classify_failure(record)]] += 1
+    offered = len(records)
+    return CellOutcomes(
+        offered=offered,
+        admitted=offered - counts["shed"],
+        completed=counts["ok"],
+        ok=counts["ok"],
+        shed=counts["shed"],
+        model_error=counts["model_error"],
+        client_timeout=counts["client_timeout"],
+    )
+
+
+def count_failures(records: Sequence[dict]) -> tuple[int, int, int]:
+    """(served, model errors, proxy errors) over a cell's sender records.
+
+    Client timeouts are in none of the three: they are counted on their own in
+    :func:`count_outcomes` and deliberately kept out of the model's error budget.
+    """
+    outcomes = count_outcomes(records)
+    return outcomes.ok, outcomes.model_error, outcomes.shed
+
+
+def request_meets_slo(record: dict, *, ttft_slo_ms: float, tpot_slo_ms: float) -> bool:
+    """True when one served request met every latency SLO.
+
+    A served request with no measurable TTFT or TPOT does not count as meeting the SLO:
+    the campaign is fitting a threshold on latency, and "no evidence" must never be
+    scored as "evidence of health".
+    """
+    if classify_failure(record) != FAILURE_NONE:
+        return False
+    ttft = record.get("ttft_ms")
+    tpot = record.get("tpot_ms")
+    if tpot is None:
+        e2e = record.get("e2e_ms")
+        completion = record.get("completion_tokens")
+        if ttft is not None and e2e is not None and completion is not None and completion > 1:
+            tpot = (float(e2e) - float(ttft)) / (float(completion) - 1.0)
+    if ttft is None or tpot is None:
+        return False
+    return float(ttft) <= ttft_slo_ms and float(tpot) <= tpot_slo_ms
+
+
+@dataclass(frozen=True)
+class Goodput:
+    """``G = #(admitted AND met every SLO) / #offered``.
+
+    The denominator is what was offered, not what was admitted, so a rejection is a loss
+    rather than an absence. That is the whole reason this replaces raw throughput as the
+    campaign's headline metric: at the boundary the two diverge, and it is exactly the
+    boundary the campaign is trying to locate.
+    """
+
+    offered: int
+    admitted: int
+    completed: int
+    good: int
+    ttft_slo_ms: float
+    tpot_slo_ms: float
+
+    @property
+    def goodput(self) -> float:
+        return 0.0 if self.offered == 0 else self.good / self.offered
+
+    @property
+    def admission_rate(self) -> float:
+        return 0.0 if self.offered == 0 else self.admitted / self.offered
+
+    def as_dict(self) -> dict:
+        return {
+            "offered": self.offered,
+            "admitted": self.admitted,
+            "completed": self.completed,
+            "good": self.good,
+            "goodput": round(self.goodput, 6),
+            "admission_rate": round(self.admission_rate, 6),
+            "ttft_slo_ms": self.ttft_slo_ms,
+            "tpot_slo_ms": self.tpot_slo_ms,
+        }
+
+
+def goodput(
+    records: Sequence[dict], *, ttft_slo_ms: float, tpot_slo_ms: float
+) -> Goodput:
+    outcomes = count_outcomes(records)
+    good = sum(
+        1
+        for record in records
+        if request_meets_slo(record, ttft_slo_ms=ttft_slo_ms, tpot_slo_ms=tpot_slo_ms)
+    )
+    return Goodput(
+        offered=outcomes.offered,
+        admitted=outcomes.admitted,
+        completed=outcomes.completed,
+        good=good,
+        ttft_slo_ms=float(ttft_slo_ms),
+        tpot_slo_ms=float(tpot_slo_ms),
+    )
 
 
 class CellGuardError(RuntimeError):
@@ -255,6 +440,15 @@ def routing_balance(records: Sequence[dict]) -> dict:
 #: find and replace exactly that issue without disturbing the dispatch-level ones.
 TRUNCATION_EVIDENCE_ISSUE = "truncated before collecting enough evidence"
 
+#: Why a cell's evidence was thrown away. Each one is a separate rule with a separate
+#: test, because a void rule that silently stops firing does not fail anything - it just
+#: lets a polluted cell into the fit, and theta moves without anyone seeing why.
+VOID_SHED = "gateway shed"
+VOID_DISPATCH_DELAY = "client dispatch delay"
+VOID_MODEL_ERRORS = "model error rate"
+VOID_PENDING_OVERFLOW = "envoy pending overflow"
+VOID_REASONS = (VOID_SHED, VOID_DISPATCH_DELAY, VOID_MODEL_ERRORS, VOID_PENDING_OVERFLOW)
+
 
 @dataclass(frozen=True)
 class CellGuard:
@@ -280,11 +474,31 @@ class CellGuard:
     #: :func:`routing_balance` over this cell's records; None only for a guard built
     #: before the balance was computed.
     routing: Optional[dict] = None
+    #: Requests the client abandoned at its own deadline. Recorded, never budgeted.
+    client_timeouts: int = 0
+    #: What this cell does about a shed; see :data:`SHED_POLICIES`.
+    shed_policy: str = DEFAULT_SHED_POLICY
+    #: :func:`count_outcomes` for this cell, as a dict.
+    outcomes: Optional[dict] = None
+    #: :func:`goodput` for this cell, as a dict; None when no SLO was supplied.
+    goodput: Optional[dict] = None
+    #: Increase in Envoy's ``upstream_rq_pending_overflow`` across the cell. A validity
+    #: sentinel only - it never enters a control law, it just says the capture is not
+    #: measuring the engine.
+    pending_overflow_delta: Optional[int] = None
+    #: Which :data:`VOID_REASONS` fired. Non-empty means the cell's evidence must not
+    #: reach the fit and the cell has to be re-run.
+    void_reasons: tuple[str, ...] = ()
     issues: tuple[str, ...] = ()
 
     @property
     def ok(self) -> bool:
         return not self.issues
+
+    @property
+    def voided(self) -> bool:
+        """The cell produced no usable evidence, whatever else it did produce."""
+        return bool(self.void_reasons)
 
     @property
     def errors(self) -> int:
@@ -321,6 +535,13 @@ class CellGuard:
             "slo_windows": self.slo_windows,
             "min_slo_windows": self.min_slo_windows,
             "routing_balance": self.routing,
+            "client_timeouts": self.client_timeouts,
+            "shed_policy": self.shed_policy,
+            "outcomes": self.outcomes,
+            "goodput": self.goodput,
+            "pending_overflow_delta": self.pending_overflow_delta,
+            "void_reasons": list(self.void_reasons),
+            "voided": self.voided,
             "issues": list(self.issues),
             "ok": self.ok,
         }
@@ -328,14 +549,18 @@ class CellGuard:
     def with_slo_windows(self, count: int, *, min_slo_windows: Optional[int] = None) -> "CellGuard":
         """Fold the window-level evidence count into the verdict.
 
-        A truncated cell still passes when it had already collected at least
-        ``min_slo_windows`` windows above the SLO before the gateway cut it off: the
-        violation boundary was crossed and observed, which is the whole point of the
-        cell. Below that it was cut off before saying anything and must be re-run.
+        Under :data:`SHED_POLICY_TRUNCATE` a truncated cell still passes when it had
+        already collected at least ``min_slo_windows`` windows above the SLO before the
+        gateway cut it off: the violation boundary was crossed and observed, which is the
+        whole point of the cell. Below that it was cut off before saying anything.
+
+        Under :data:`SHED_POLICY_VOID` this escape does not exist and this method cannot
+        create one: a voided cell stays voided however many windows it collected, because
+        the windows it collected are precisely the healthy ones.
         """
         floor_windows = self.min_slo_windows if min_slo_windows is None else int(min_slo_windows)
         issues = [issue for issue in self.issues if not issue.startswith(TRUNCATION_EVIDENCE_ISSUE)]
-        if self.truncated and int(count) < floor_windows:
+        if self.shed_policy == SHED_POLICY_TRUNCATE and self.truncated and int(count) < floor_windows:
             issues.append(
                 f"{TRUNCATION_EVIDENCE_ISSUE}: only {int(count)} window(s) above the SLO "
                 f"before the gateway shed at offset {self.truncated_at_offset_s}s, "
@@ -373,23 +598,40 @@ def check_cell(
     slo_windows: Optional[int] = None,
     min_slo_windows: int = DEFAULT_MIN_SLO_WINDOWS,
     max_routing_imbalance: Optional[float] = DEFAULT_MAX_ROUTING_IMBALANCE,
+    shed_policy: str = DEFAULT_SHED_POLICY,
+    pending_overflow_delta: Optional[int] = None,
+    ttft_slo_ms: Optional[float] = None,
+    tpot_slo_ms: Optional[float] = None,
 ) -> CellGuard:
     """Verdict on a dispatched cell. Pure - takes the sender's records, no network.
 
     ``records`` are :class:`tre_replayer.engine.http_sender.StreamingHttpSender` rows.
-    Failures are attributed by :func:`classify_failure` rather than counted together:
-    a model error is the engine failing under load and fails the cell past
-    ``max_model_error_rate``, while a proxy shed is the campaign hitting the admission
-    ceiling and is handled by truncation, because failing on it would throw away a cell
-    that had already measured everything it was built to measure.
+    Failures are attributed by :func:`classify_failure` rather than counted together, and
+    each verdict below is its own rule:
+
+    * a **model error** is the engine failing under load. The window it lands in is a
+      violation and is kept; past ``max_model_error_rate`` of the cell, the cell is void.
+    * a **gateway shed** means the load never reached the engine. Under
+      ``SHED_POLICY_TRUNCATE`` the cell is cut short and its earlier windows are kept;
+      under ``SHED_POLICY_VOID`` the whole cell is void.
+    * a **client timeout** is the driver's own deadline. Counted on its own and budgeted
+      against nothing.
+    * a **dispatch delay** above ``max_p99_delay_ms`` means the schedule was not offered,
+      so the cell is void whatever it recorded.
+    * a non-zero **pending-overflow delta** means Envoy was queueing and refusing behind
+      the scenes; the capture is not of the engine and the run is void.
     """
+    if shed_policy not in SHED_POLICIES:
+        raise ValueError(f"unknown shed policy {shed_policy!r} (expected {SHED_POLICIES})")
     sent = len(records)
-    served, model_errors, proxy_errors = count_failures(records)
+    outcomes = count_outcomes(records)
+    served, model_errors, proxy_errors = outcomes.ok, outcomes.model_error, outcomes.shed
     pool_waits = [float(r.get("pool_wait_ms", 0.0) or 0.0) for r in records]
     p99_pool_wait_ms = _p99(pool_waits)
     expected_sent = max(0, scheduled - int(censored))
 
     issues: list[str] = []
+    void_reasons: list[str] = []
     if scheduled <= 0:
         issues.append("schedule produced 0 requests (empty or mis-filtered segments)")
     if sent == 0:
@@ -403,14 +645,32 @@ def check_cell(
         issues.append(f"0/{sent} requests completed (every send failed)")
     if sent > 0 and model_errors / sent > max_model_error_rate:
         issues.append(
-            f"model error rate {model_errors / sent:.1%} > {max_model_error_rate:.1%} "
+            f"{VOID_MODEL_ERRORS} {model_errors / sent:.1%} > {max_model_error_rate:.1%} "
             f"({model_errors}/{sent}); these reached vLLM and failed there"
         )
+        void_reasons.append(VOID_MODEL_ERRORS)
+    if shed_policy == SHED_POLICY_VOID and proxy_errors > 0:
+        issues.append(
+            f"{VOID_SHED}: {proxy_errors}/{sent} request(s) were refused at the Envoy "
+            "circuit breaker, so the offered load never reached the engine. Keeping the "
+            "windows from before the shed would keep only the healthy part of the cell "
+            "and bias theta towards health - the whole cell is void and must be re-run"
+        )
+        void_reasons.append(VOID_SHED)
     if p99_delay_ms > max_p99_delay_ms:
         issues.append(
-            f"p99 dispatch delay {p99_delay_ms:.1f}ms > {max_p99_delay_ms:.1f}ms "
-            "(the driver could not keep the schedule: offered load was under-delivered)"
+            f"{VOID_DISPATCH_DELAY} p99 {p99_delay_ms:.1f}ms > {max_p99_delay_ms:.1f}ms "
+            "(the driver could not keep the schedule: offered load was under-delivered, "
+            "so this is not an open loop)"
         )
+        void_reasons.append(VOID_DISPATCH_DELAY)
+    if pending_overflow_delta is not None and int(pending_overflow_delta) > 0:
+        issues.append(
+            f"{VOID_PENDING_OVERFLOW}: Envoy's upstream_rq_pending_overflow rose by "
+            f"{int(pending_overflow_delta)} during this cell, so requests were queued and "
+            "dropped at the proxy; the capture is not of the engine"
+        )
+        void_reasons.append(VOID_PENDING_OVERFLOW)
     if p99_pool_wait_ms > max_p99_pool_wait_ms:
         issues.append(
             f"p99 sender pool wait {p99_pool_wait_ms:.1f}ms > {max_p99_pool_wait_ms:.1f}ms "
@@ -430,6 +690,11 @@ def check_cell(
             f"{routing['min_requests']}); the aggregate capacity signal averages over "
             "pods, so one overloaded pod's p95 hides inside a healthy-looking Z"
         )
+    cell_goodput = None
+    if ttft_slo_ms is not None and tpot_slo_ms is not None:
+        cell_goodput = goodput(
+            records, ttft_slo_ms=float(ttft_slo_ms), tpot_slo_ms=float(tpot_slo_ms)
+        ).as_dict()
     guard = CellGuard(
         cell_id=cell_id,
         scheduled=scheduled,
@@ -445,6 +710,14 @@ def check_cell(
         censored=int(censored),
         min_slo_windows=int(min_slo_windows),
         routing=routing,
+        client_timeouts=outcomes.client_timeout,
+        shed_policy=shed_policy,
+        outcomes=outcomes.as_dict(),
+        goodput=cell_goodput,
+        pending_overflow_delta=(
+            None if pending_overflow_delta is None else int(pending_overflow_delta)
+        ),
+        void_reasons=tuple(void_reasons),
         issues=tuple(issues),
     )
     if slo_windows is not None:
@@ -590,6 +863,125 @@ def windows_observing(
     return hits, total
 
 
+# ----------------------------------------------------------------- overflow sentinel
+
+#: Envoy's per-cluster counter of requests dropped because the pending queue was full.
+#: It is the proxy's own account of having refused work, independent of anything the
+#: client saw, which is why it is the sentinel: a cell can look clean from the client
+#: side and still have been shaped by the proxy.
+PENDING_OVERFLOW_COUNTER = "upstream_rq_pending_overflow"
+
+
+def parse_envoy_counters(text: str, counter: str, *, cluster_filter: str = "") -> int:
+    """Sum one Envoy admin counter over the clusters whose name contains ``cluster_filter``.
+
+    The admin ``/stats`` body is ``<name>: <value>`` per line. Summing rather than
+    picking one line is deliberate: a model is served by one cluster today, but a name
+    change or a second listener would otherwise make the sentinel silently read zero.
+    """
+    total = 0
+    for line in text.splitlines():
+        name, sep, value = line.partition(":")
+        if not sep:
+            continue
+        name = name.strip()
+        if not name.endswith("." + counter) and name != counter:
+            continue
+        if cluster_filter and cluster_filter not in name:
+            continue
+        try:
+            total += int(value.strip())
+        except ValueError:
+            continue
+    return total
+
+
+@dataclass
+class PendingOverflowSentinel:
+    """Reads :data:`PENDING_OVERFLOW_COUNTER` around a cell and reports the delta.
+
+    Strictly a validity check. It says "this capture was shaped by the proxy, throw it
+    away", and it is never fed to a controller or a fit: the counter is a property of the
+    admission policy, and a control law that reacted to it would be steering on the proxy
+    rather than on the model.
+
+    ``read`` is injected (``() -> str``, the admin ``/stats`` body) so tests and dry runs
+    never touch the network. A read that fails yields ``None``, which is reported as
+    "not measured" rather than as zero - an unread sentinel must not look like a clean one.
+    """
+
+    read: Callable[[], str]
+    cluster_filter: str = ""
+    counter: str = PENDING_OVERFLOW_COUNTER
+    baseline: Optional[int] = None
+
+    def sample(self) -> Optional[int]:
+        try:
+            body = self.read()
+        except Exception:  # noqa: BLE001 - an unreachable admin port is not a cell failure
+            return None
+        return parse_envoy_counters(body, self.counter, cluster_filter=self.cluster_filter)
+
+    def start(self) -> Optional[int]:
+        self.baseline = self.sample()
+        return self.baseline
+
+    def delta(self) -> Optional[int]:
+        """Increase since :meth:`start`, or None when either read was unavailable."""
+        if self.baseline is None:
+            return None
+        after = self.sample()
+        if after is None:
+            return None
+        return max(0, int(after) - int(self.baseline))
+
+
+def make_envoy_stats_reader(url: str, *, fetch: Callable[[str], str] = _default_fetch) -> Callable[[], str]:
+    """``() -> /stats body`` for an Envoy admin endpoint."""
+
+    def read() -> str:
+        return fetch(url)
+
+    return read
+
+
+# ------------------------------------------------------------- model-error windowing
+
+
+def mark_model_error_windows(
+    rows: Sequence[dict], records: Sequence[dict]
+) -> list[dict]:
+    """Label every window that contains a model error as an SLO violation, and keep it.
+
+    A request the engine failed is evidence about the engine at that operating point -
+    arguably the strongest evidence a window can carry - so dropping those windows would
+    remove exactly the overloaded ones and pull theta towards health. It must also not be
+    scored as healthy just because the failed request contributed no latency sample,
+    which is what happens if nothing marks it: a window whose slowest requests all
+    errored out can otherwise show a comfortable p95.
+
+    A request is attributed to a window by its send time, because that is the operating
+    point that produced the failure; a failed request often has no completion time at all.
+    """
+    errors: list[int] = []
+    for record in records:
+        if classify_failure(record) != FAILURE_MODEL:
+            continue
+        ts = record.get("actual_send_ts_ms", record.get("send_ts_ms"))
+        if ts is not None:
+            errors.append(int(ts))
+    marked: list[dict] = []
+    for row in rows:
+        out = dict(row)
+        start = int(row["window_start_ms"])
+        end = int(row["window_end_ms"])
+        count = sum(1 for ts in errors if start <= ts < end)
+        out["model_errors"] = count
+        out["slo_violated"] = bool(row.get("slo_violated")) or count > 0
+        marked.append(out)
+    return marked
+
+
 class TruncateOnProxyShed:
     """Sender wrapper that cuts a cell short at the first gateway shed.
 
@@ -703,6 +1095,8 @@ def drive_cell_schedule(
     truncate_on_proxy_shed: bool = False,
     drain_start_s: Optional[float] = None,
     failures_path: Optional[Path] = None,
+    overflow_sentinel: Optional["PendingOverflowSentinel"] = None,
+    records_out: Optional[list] = None,
 ) -> tuple:
     """Drive one open-loop cell from ``segments``; returns (start_ms, end_ms, guard).
 
@@ -757,6 +1151,8 @@ def drive_cell_schedule(
     instants: list = []
     if sidecar is not None:
         sidecar.start()
+    if overflow_sentinel is not None:
+        overflow_sentinel.start()
     try:
         report = asyncio.run(dispatch_open_loop(events, truncator or sender))
     finally:
@@ -764,6 +1160,7 @@ def drive_cell_schedule(
         if sidecar is not None:
             instants = sidecar.stop()
     end_ms = now_ms()
+    overflow_delta = overflow_sentinel.delta() if overflow_sentinel is not None else None
 
     guard = check_cell(
         cell_id,
@@ -774,6 +1171,7 @@ def drive_cell_schedule(
         truncated_at_offset_s=truncator.truncated_at_offset_s if truncator else None,
         truncated_at_ts_ms=truncator.truncated_at_ts_ms if truncator else None,
         censored=truncator.censored if truncator else 0,
+        pending_overflow_delta=overflow_delta,
         **(guard_kwargs or {}),
     )
     if failures_path is not None:
@@ -790,6 +1188,12 @@ def drive_cell_schedule(
         _append_jsonl(raw_path, raw)
     if instant_path is not None and instants:
         _append_jsonl(instant_path, instants)
+    if records_out is not None:
+        # The sender rows, for a caller that needs to attribute per-request outcomes to
+        # windows. The raw JSONL cannot serve that: it carries neither the failure class
+        # nor the send-side concurrency, by design (it is the metrics schema, not a log
+        # of what the driver did).
+        records_out.extend(sender.records)
     return start_ms, end_ms, guard
 
 

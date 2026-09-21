@@ -1,0 +1,49 @@
+{
+  "dsllama-8b": [
+    {
+      "start_time": 0,
+      "end_time": 90,
+      "rps": 2.229,
+      "input_tokens_dist": {
+        "kind": "log_uniform",
+        "low": 300,
+        "high": 2200
+      },
+      "max_tokens_dist": {
+        "kind": "log_uniform",
+        "low": 100,
+        "high": 580
+      }
+    },
+    {
+      "start_time": 90,
+      "end_time": 210,
+      "rps": 3.5664,
+      "input_tokens_dist": {
+        "kind": "log_uniform",
+        "low": 300,
+        "high": 2200
+      },
+      "max_tokens_dist": {
+        "kind": "log_uniform",
+        "low": 100,
+        "high": 580
+      }
+    },
+    {
+      "start_time": 210,
+      "end_time": 450,
+      "rps": 4.2351,
+      "input_tokens_dist": {
+        "kind": "log_uniform",
+        "low": 300,
+        "high": 2200
+      },
+      "max_tokens_dist": {
+        "kind": "log_uniform",
+        "low": 100,
+        "high": 580
+      }
+    }
+  ]
+}

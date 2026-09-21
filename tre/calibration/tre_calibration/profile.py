@@ -50,7 +50,7 @@ def build_profile_patch(
             "delta_method": DELTA_METHOD if delta_fit is not None else None,
         },
         "fit_config": dict(sorted((fit_config or {}).items())),
-        "fit": _theta_fit_block(theta_fit),
+        "fit": theta_fit_block(theta_fit),
         "metrics": {
             "auroc": parameter_score.auroc,
             "objective": parameter_score.objective,
@@ -85,9 +85,15 @@ def build_profile_patch(
     return patch
 
 
-def _theta_fit_block(
+def theta_fit_block(
     theta_fit: ReliabilityThetaFit | BalancedAccuracyThetaFit,
 ) -> dict[str, Any]:
+    """JSON-ready fields of a fit, whichever criterion produced it.
+
+    Public because the bootstrap-CI and ranking-separation reports describe the same fit
+    object this artifact does, and a report that hand-picked reliability-only fields would
+    quietly mislabel a balanced-accuracy fit.
+    """
     if isinstance(theta_fit, BalancedAccuracyThetaFit):
         return {
             "balanced_accuracy": theta_fit.balanced_accuracy,

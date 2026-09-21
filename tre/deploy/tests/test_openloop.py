@@ -515,3 +515,270 @@ def _ok_record(pod: str | None = None) -> dict:
         "http_status": 200, "e2e_ms": 120.0, "error": None, "pool_wait_ms": 0.0,
         "target_pod": pod,
     }
+
+
+# ==================================================================== failure handling
+#
+# One test per void rule. A void rule that silently stops firing fails nothing - it just
+# lets a polluted cell into the fit, and theta moves without anyone seeing why.
+
+
+def _served(**over):
+    record = {
+        "request_id": "r", "http_status": 200, "e2e_ms": 120.0, "ttft_ms": 100.0,
+        "tpot_ms": 10.0, "completion_tokens": 8, "actual_send_ts_ms": 1_000,
+        "pool_wait_ms": 0.0, "client_timeout": False, "in_flight_at_send": 3,
+    }
+    record.update(over)
+    return record
+
+
+def _shed(**over):
+    return _served(
+        http_status=503, e2e_ms=5.0, ttft_ms=None, tpot_ms=None,
+        error_body="upstream connect error or disconnect/reset before headers. "
+                   "reset reason: overflow",
+        error_headers={"content-type": "text/plain"},
+        **over,
+    )
+
+
+def _model_error(**over):
+    return _served(
+        http_status=500, e2e_ms=30.0, ttft_ms=None, tpot_ms=None,
+        error_body='{"error": "engine died"}', error_headers={"content-type": "application/json"},
+        **over,
+    )
+
+
+def _timeout(**over):
+    return _served(
+        http_status=0, e2e_ms=None, ttft_ms=None, tpot_ms=None,
+        error="TimeoutError", client_timeout=True, **over,
+    )
+
+
+# ------------------------------------------------------------------ classification
+
+
+def test_every_request_lands_in_exactly_one_of_the_four_outcomes() -> None:
+    records = [_served(), _served(), _shed(), _model_error(), _timeout()]
+    outcomes = openloop.count_outcomes(records)
+    assert (outcomes.ok, outcomes.shed, outcomes.model_error, outcomes.client_timeout) == (
+        2, 1, 1, 1
+    )
+    assert outcomes.ok + outcomes.shed + outcomes.model_error + outcomes.client_timeout == len(records)
+    # offered is everything the driver emitted; admitted is everything the gateway let through
+    assert outcomes.offered == 5
+    assert outcomes.admitted == 4
+    assert outcomes.completed == 2
+
+
+def test_a_client_timeout_is_its_own_class_and_no_ones_error_budget() -> None:
+    # Nothing is known about what the engine did with it, so charging it to the model
+    # would read as an engine fault and charging it to the gateway as a shed.
+    assert openloop.classify_failure(_timeout()) == openloop.FAILURE_CLIENT_TIMEOUT
+    served, model_errors, proxy_errors = openloop.count_failures([_timeout()] * 4)
+    assert (served, model_errors, proxy_errors) == (0, 0, 0)
+    guard = openloop.check_cell(
+        "c", scheduled=4, records=[_timeout()] * 3 + [_served()], p99_delay_ms=1.0,
+    )
+    assert guard.client_timeouts == 3
+    assert openloop.VOID_MODEL_ERRORS not in guard.void_reasons
+
+
+def test_the_sender_records_how_loaded_the_path_was_when_a_request_left() -> None:
+    # The one quantity nothing downstream can reconstruct: the raw log has send and done
+    # timestamps but not the driver's own view of concurrency at the instant of the send.
+    signature = openloop.failure_signature(_shed(in_flight_at_send=311))
+    assert signature["in_flight_at_send"] == 311
+    assert signature["outcome"] == "shed"
+
+
+# ------------------------------------------------------------------ void: shed
+
+
+def test_any_shed_voids_a_calibration_cell() -> None:
+    guard = openloop.check_cell(
+        "c", scheduled=100, records=[_served()] * 99 + [_shed()], p99_delay_ms=1.0,
+        shed_policy=openloop.SHED_POLICY_VOID,
+    )
+    assert guard.voided and openloop.VOID_SHED in guard.void_reasons
+    assert not guard.ok
+
+
+def test_a_voided_shed_cannot_be_rescued_by_collecting_enough_windows() -> None:
+    # The "keep it if it already had >= 3 SLO windows" escape is exactly wrong here: the
+    # windows before a shed are the HEALTHY ones, so keeping them biases theta upwards.
+    guard = openloop.check_cell(
+        "c", scheduled=10, records=[_served()] * 9 + [_shed()], p99_delay_ms=1.0,
+        shed_policy=openloop.SHED_POLICY_VOID, truncated=True, truncated_at_offset_s=12.0,
+    )
+    rescued = guard.with_slo_windows(99)
+    assert rescued.voided and openloop.VOID_SHED in rescued.void_reasons
+
+
+def test_the_replay_policy_still_truncates_instead_of_voiding() -> None:
+    guard = openloop.check_cell(
+        "c", scheduled=10, records=[_served()] * 9 + [_shed()], p99_delay_ms=1.0,
+        shed_policy=openloop.SHED_POLICY_TRUNCATE, truncated=True,
+    )
+    assert not guard.voided
+    assert guard.proxy_errors == 1
+
+
+def test_an_unknown_shed_policy_is_a_loud_failure() -> None:
+    with pytest.raises(ValueError, match="unknown shed policy"):
+        openloop.check_cell("c", scheduled=1, records=[_served()], p99_delay_ms=1.0,
+                            shed_policy="whatever")
+
+
+# ------------------------------------------------------------------ void: dispatch delay
+
+
+def test_a_dispatch_delay_over_50ms_voids_a_calibration_cell() -> None:
+    # Above this the generator is not keeping its schedule, so the cell did not offer the
+    # load it is indexed by and is not an open loop at all.
+    ok = openloop.check_cell(
+        "c", scheduled=10, records=[_served()] * 10, p99_delay_ms=49.0,
+        max_p99_delay_ms=openloop.CALIBRATION_MAX_P99_DELAY_MS,
+    )
+    assert not ok.voided and ok.ok
+
+    late = openloop.check_cell(
+        "c", scheduled=10, records=[_served()] * 10, p99_delay_ms=51.0,
+        max_p99_delay_ms=openloop.CALIBRATION_MAX_P99_DELAY_MS,
+    )
+    assert late.voided and openloop.VOID_DISPATCH_DELAY in late.void_reasons
+    assert openloop.CALIBRATION_MAX_P99_DELAY_MS == 50.0
+    assert openloop.CALIBRATION_MAX_P99_DELAY_MS < openloop.DEFAULT_MAX_P99_DELAY_MS
+
+
+# ------------------------------------------------------------------ void: model errors
+
+
+def test_a_model_error_rate_over_five_percent_voids_the_cell() -> None:
+    under = openloop.check_cell(
+        "c", scheduled=100, records=[_served()] * 96 + [_model_error()] * 4,
+        p99_delay_ms=1.0,
+    )
+    assert not under.voided
+
+    over = openloop.check_cell(
+        "c", scheduled=100, records=[_served()] * 93 + [_model_error()] * 7,
+        p99_delay_ms=1.0,
+    )
+    assert over.voided and openloop.VOID_MODEL_ERRORS in over.void_reasons
+
+
+def test_a_window_holding_a_model_error_is_marked_violating_and_kept() -> None:
+    # A failed request contributes no latency sample, so a window whose slowest work all
+    # errored out otherwise shows a comfortable p95 and is scored as healthy.
+    rows = [
+        {"window_start_ms": 0, "window_end_ms": 1000, "p95_ttft": 50.0},
+        {"window_start_ms": 1000, "window_end_ms": 2000, "p95_ttft": 50.0},
+    ]
+    records = [_model_error(actual_send_ts_ms=1500), _served(actual_send_ts_ms=10)]
+    marked = openloop.mark_model_error_windows(rows, records)
+    assert len(marked) == 2  # kept, not dropped
+    assert marked[0]["model_errors"] == 0 and marked[0]["slo_violated"] is False
+    assert marked[1]["model_errors"] == 1 and marked[1]["slo_violated"] is True
+
+
+def test_a_shed_does_not_mark_a_window_violating() -> None:
+    # It never reached the engine, so it says nothing about the engine's health.
+    rows = [{"window_start_ms": 0, "window_end_ms": 1000, "p95_ttft": 50.0}]
+    marked = openloop.mark_model_error_windows(rows, [_shed(actual_send_ts_ms=500)])
+    assert marked[0]["model_errors"] == 0 and marked[0]["slo_violated"] is False
+
+
+# ------------------------------------------------------------------ void: sentinel
+
+
+ENVOY_STATS = """
+cluster.tre-v2-dsqwen-7b.upstream_rq_pending_overflow: 12
+cluster.tre-v2-dsllama-8b.upstream_rq_pending_overflow: 4
+cluster.tre-v2-dsqwen-7b.upstream_rq_total: 99999
+"""
+
+
+def test_the_overflow_sentinel_reads_envoys_own_account_of_refusing_work() -> None:
+    assert openloop.parse_envoy_counters(ENVOY_STATS, openloop.PENDING_OVERFLOW_COUNTER) == 16
+    assert openloop.parse_envoy_counters(
+        ENVOY_STATS, openloop.PENDING_OVERFLOW_COUNTER, cluster_filter="dsqwen-7b"
+    ) == 12
+
+
+def test_a_moving_overflow_counter_voids_the_run() -> None:
+    bodies = iter([ENVOY_STATS, ENVOY_STATS.replace(": 12", ": 19")])
+    sentinel = openloop.PendingOverflowSentinel(read=lambda: next(bodies))
+    assert sentinel.start() == 16
+    delta = sentinel.delta()
+    assert delta == 7
+
+    guard = openloop.check_cell(
+        "c", scheduled=10, records=[_served()] * 10, p99_delay_ms=1.0,
+        pending_overflow_delta=delta,
+    )
+    assert guard.voided and openloop.VOID_PENDING_OVERFLOW in guard.void_reasons
+
+
+def test_a_still_overflow_counter_leaves_the_cell_alone() -> None:
+    sentinel = openloop.PendingOverflowSentinel(read=lambda: ENVOY_STATS)
+    sentinel.start()
+    assert sentinel.delta() == 0
+    guard = openloop.check_cell(
+        "c", scheduled=10, records=[_served()] * 10, p99_delay_ms=1.0,
+        pending_overflow_delta=0,
+    )
+    assert not guard.voided
+
+
+def test_an_unreadable_sentinel_reports_not_measured_rather_than_clean() -> None:
+    def boom() -> str:
+        raise OSError("admin port refused")
+
+    sentinel = openloop.PendingOverflowSentinel(read=boom)
+    assert sentinel.start() is None
+    assert sentinel.delta() is None
+    guard = openloop.check_cell(
+        "c", scheduled=1, records=[_served()], p99_delay_ms=1.0,
+        pending_overflow_delta=None,
+    )
+    assert guard.pending_overflow_delta is None
+    assert not guard.voided
+
+
+# ------------------------------------------------------------------ goodput
+
+
+def test_goodput_divides_by_offered_so_a_rejection_is_a_loss() -> None:
+    records = [_served()] * 6 + [_shed()] * 2 + [_model_error()] + [_timeout()]
+    result = openloop.goodput(records, ttft_slo_ms=500.0, tpot_slo_ms=75.0)
+    assert result.offered == 10 and result.admitted == 8 and result.completed == 6
+    assert result.good == 6
+    assert result.goodput == pytest.approx(0.6)
+    # dividing by admitted instead would flatter a system that refuses its way to health
+    assert result.good / result.admitted == pytest.approx(0.75)
+
+
+def test_a_served_request_that_missed_an_slo_is_not_good() -> None:
+    records = [_served(ttft_ms=900.0), _served(tpot_ms=200.0), _served()]
+    result = openloop.goodput(records, ttft_slo_ms=500.0, tpot_slo_ms=75.0)
+    assert result.completed == 3 and result.good == 1
+    assert result.goodput == pytest.approx(1 / 3)
+
+
+def test_a_served_request_with_no_latency_evidence_is_not_scored_as_healthy() -> None:
+    record = _served(ttft_ms=None, tpot_ms=None, completion_tokens=None)
+    assert not openloop.request_meets_slo(record, ttft_slo_ms=500.0, tpot_slo_ms=75.0)
+
+
+def test_the_guard_carries_the_goodput_when_the_slo_is_supplied() -> None:
+    guard = openloop.check_cell(
+        "c", scheduled=4, records=[_served()] * 3 + [_shed()], p99_delay_ms=1.0,
+        ttft_slo_ms=500.0, tpot_slo_ms=75.0, shed_policy=openloop.SHED_POLICY_TRUNCATE,
+    )
+    assert guard.goodput["offered"] == 4
+    assert guard.goodput["goodput"] == pytest.approx(0.75)
+    assert guard.outcomes["shed"] == 1

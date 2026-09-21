@@ -1,0 +1,25 @@
+{
+  "dsqwen-14b": [
+    {
+      "start_time": 0,
+      "end_time": 90,
+      "rps": 1.3716,
+      "input_tokens": 1600,
+      "max_tokens": 112
+    },
+    {
+      "start_time": 90,
+      "end_time": 210,
+      "rps": 2.1946,
+      "input_tokens": 1600,
+      "max_tokens": 112
+    },
+    {
+      "start_time": 210,
+      "end_time": 450,
+      "rps": 2.6061,
+      "input_tokens": 1600,
+      "max_tokens": 112
+    }
+  ]
+}

@@ -29,8 +29,25 @@ proposed ``engine-capped`` policy the binding limit moves into the engine and ev
 shape becomes observable. ``--cap`` selects the policy, and ``index["admission_cap"]``
 records which one a schedule set was generated for.
 
-The three primitives
---------------------
+The shape set
+-------------
+S1..S5 are the synthetic corners of the (input, output) plane. **T8** (1600 in / 112 out)
+is the working point of the real trace t8 - the Azure conversation inputs it replays have
+a median of 1628 tokens - so a theta fitted here is interpolating to the operating point
+the experiments run at instead of extrapolating to it. **T9** is the first shape whose
+lengths are *sampled per request* (log-uniform 300..2200 in, 100..580 out): every fixed
+shape produces a batch that turns over in lockstep, with no decode tail at all, and a
+tail is what distinguishes decode-bound from prefill-bound saturation. **M** stays the
+held-out mixture and is in :data:`ALL_SHAPES` but never in :data:`TRAINING_SHAPES`.
+
+Per-request lengths are drawn by ``tre_replayer.engine.schedule`` from a per-segment RNG
+seeded off the schedule seed, so a re-run sends the same lengths request for request; the
+prompt itself is still built by the same natural-language, exactly-fitted, unique-per-
+request path as every other shape, because the sender keys the prompt on the request id
+and fits it to whatever length that request drew.
+
+The primitives
+--------------
 ramp    rho 0.4 -> 1.2 linearly over ``T_r = cap.ramp_seconds(C_s, COEF)`` seconds in
         ~5 s segments, hold 1.2 for ``T_r / 4``, then 60 s at rho 0.5 to drain. ``COEF``
         is :data:`RAMP_BACKLOG_COEFFICIENT`, the backlog one ramp+hold accumulates per
@@ -52,7 +69,14 @@ bursts  base rho 0.6 for 360 s with a 2 s spike every 90 s carrying
         lambda_wait identifiable at all. When the overshoot needs more requests than the
         cap admits, the spike would be shed rather than queued, so ``reachable`` is False
         and no schedule is written - the index records the skip and the arithmetic behind
-        it instead of shipping a cell that can only measure the gateway.
+        it instead of shipping a cell that can only measure the gateway. Under the
+        deployed engine-capped policy the admission budget is 3840 requests and the
+        engine's running limit is ``max_num_seqs * replicas`` (256 at one replica), so
+        nothing is skipped any more - which is what makes ``lambda_wait`` identifiable
+        for every shape rather than only for the few that happened to fit under 240.
+hold    one constant rate ``rho * C_s`` for a stated duration, generated at campaign time
+        by the adaptive boundary search rather than committed. See
+        :func:`build_hold_schedule` and ``scripts.adaptive_boundary``.
 
 Capacity priors and the C_s model
 ---------------------------------
@@ -98,6 +122,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional, Sequence
 
+from tre_replayer.engine.schedule import TokenRange
+
 from scripts.admission_cap import (
     CAPS,
     DEFAULT_CAP_NAME,
@@ -106,17 +132,37 @@ from scripts.admission_cap import (
     ramp_backlog_coefficient,
 )
 
-#: Training shapes. (input_tokens, max_output_tokens).
+#: Fixed-length training shapes. (input_tokens, max_output_tokens).
+#:
+#: T8 is not a synthetic corner like S1..S5: it is the working point of the real trace
+#: t8, whose Azure conversation inputs have a median of 1628 tokens. A theta fitted only
+#: on the synthetic grid is being asked to extrapolate to the operating point the
+#: experiments are actually run at; T8 removes the extrapolation.
 SHAPES: dict[str, tuple[int, int]] = {
     "S1": (256, 128),
     "S2": (768, 192),
     "S3": (2048, 96),
     "S4": (256, 448),
     "S5": (768, 384),
+    "T8": (1600, 112),
+}
+
+#: Training shapes whose token lengths are drawn per request instead of fixed.
+#:
+#: Every fixed shape produces a *uniform* batch: each request generates exactly
+#: ``max_tokens`` tokens and finishes after the same number of decode steps, so the batch
+#: turns over in lockstep and there is no decode tail at all. Real traffic has one, and a
+#: tail is what makes decode-bound saturation look different from prefill-bound
+#: saturation. T9 draws both lengths log-uniformly over roughly the span the traces
+#: cover, so long generations hold batch slots while short ones churn past them.
+SAMPLED_SHAPES: dict[str, tuple[TokenRange, TokenRange]] = {
+    "T9": (TokenRange(300, 2200), TokenRange(100, 580)),
 }
 
 #: Held-out validation shape: a mixture of four token shapes running in parallel.
-#: NEVER used for fitting - it exists to test that a theta fit on S1..S5 generalises.
+#: NEVER used for fitting - it exists to test that a theta fit on the training shapes
+#: generalises. :data:`TRAINING_SHAPES` is the list every fit-facing caller must use, and
+#: :func:`is_held_out` is the single place that decides.
 MIXTURE_NAME = "M"
 MIXTURE: tuple[tuple[float, int, int], ...] = (
     (0.40, 256, 128),
@@ -125,7 +171,27 @@ MIXTURE: tuple[tuple[float, int, int], ...] = (
     (0.10, 3072, 64),
 )
 
+#: Shapes a theta may be fitted on, and the full set a campaign drives. The mixture is in
+#: the second and not the first, by construction rather than by convention.
+TRAINING_SHAPES: tuple[str, ...] = (*SHAPES, *SAMPLED_SHAPES)
+ALL_SHAPES: tuple[str, ...] = (*TRAINING_SHAPES, MIXTURE_NAME)
+
+#: Shape families, for the per-family theta diagnostic. A theta that differs between the
+#: most prefill-heavy and the most decode-heavy shapes is regime-dependent and must not
+#: be published as one number; see ``calibration_campaign.family_theta_verdict``.
+PREFILL_FAMILY: tuple[str, ...] = ("S3", "T8")
+DECODE_FAMILY: tuple[str, ...] = ("S4", "S5")
+FAMILIES: dict[str, tuple[str, ...]] = {
+    "prefill_heavy": PREFILL_FAMILY,
+    "decode_heavy": DECODE_FAMILY,
+}
+
 MODELS = ("dsqwen-7b", "dsllama-8b", "dsqwen-14b")
+
+
+def is_held_out(shape_name: str) -> bool:
+    """True for shapes that exist to validate a fit and must never enter one."""
+    return shape_name == MIXTURE_NAME
 
 # ---- primitive parameters (single source of truth; the index records them) ----
 RAMP_RHO_START = 0.4
@@ -157,12 +223,31 @@ BURST_REQUEST_FORMULA = (
     "cap.burst_request_cap"
 )
 
+#: A constant-rho cell, generated at campaign time rather than committed: the adaptive
+#: boundary search decides its rho from what the previous probes measured, so there is no
+#: fixed grid to commit. Everything else about it - prompts, sender, raw schema, guard -
+#: is the same as any other primitive.
+HOLD_PRIMITIVE = "hold"
+
 #: c<N> in the cell id is NOT a concurrency in schedule mode - it is an offered-load code,
 #: round(100 * the primitive's characteristic rho). The cell id must stay parseable by
 #: ``r3_grid.GridCell.from_scenario_id`` or ``rewindow_from_raw`` silently skips the file.
 LOAD_CODE = {"ramp": round(100 * RAMP_RHO_END), "steps": 95, "bursts": 60}
 
 PRIMITIVES = ("ramp", "steps", "bursts")
+
+
+#: Hold cells' load codes are offset by this. Without it a probe at rho 0.95 would get
+#: the same cell id as that shape's steps cell (code 95), 0.6 the same as its bursts cell
+#: (60) and 1.2 the same as its ramp (120) - and since the raw tree is keyed by cell id,
+#: the two captures would silently merge into one set of windows.
+HOLD_LOAD_CODE_BASE = 1000
+
+
+def hold_load_code(rho: float) -> int:
+    """Offered-load code for a hold cell: ``round(100 * rho)`` like the fixed primitives,
+    lifted clear of their codes so every probe is separately addressable."""
+    return HOLD_LOAD_CODE_BASE + max(1, int(round(100.0 * float(rho))))
 
 
 @dataclass(frozen=True)
@@ -257,21 +342,55 @@ def load_kv_cache_tokens(path: Path) -> int:
 # ------------------------------------------------------------------ shape helpers
 
 
-def shape_components(shape_name: str) -> tuple[tuple[float, int, int], ...]:
-    """(weight, input_tokens, max_output_tokens) streams that make up a shape."""
+def shape_components(
+    shape_name: str,
+) -> tuple[tuple[float, int | TokenRange, int | TokenRange], ...]:
+    """(weight, input length, output length) streams that make up a shape.
+
+    A length is an ``int`` for a fixed shape and a :class:`TokenRange` for a sampled one;
+    everything downstream funnels through :func:`_length_mean` and :func:`_segment_shape`
+    so the two never need a branch of their own again.
+    """
     if shape_name == MIXTURE_NAME:
         return MIXTURE
+    if shape_name in SAMPLED_SHAPES:
+        i, o = SAMPLED_SHAPES[shape_name]
+        return ((1.0, i, o),)
     i, o = SHAPES[shape_name]
     return ((1.0, i, o),)
 
 
+def _length_mean(length: int | TokenRange) -> float:
+    """E[length]. For a :class:`TokenRange` this is its distribution mean, not its
+    median: capacity and KV footprint are both linear in length, so the mean is what
+    sets them."""
+    return float(length.mean) if isinstance(length, TokenRange) else float(length)
+
+
+def _length_nominal(length: int | TokenRange) -> int:
+    """The single number that names this length in a cell id. Geometric midpoint for a
+    range, so the id is stable and parseable without claiming a length nothing sent."""
+    return int(length.median) if isinstance(length, TokenRange) else int(length)
+
+
+def _segment_shape(length: int | TokenRange) -> tuple[str, object]:
+    """(trace-schema key, value) for one length, fixed or sampled."""
+    if isinstance(length, TokenRange):
+        return "dist", length.as_dict()
+    return "fixed", int(length)
+
+
 def tokens_per_request(shape_name: str) -> float:
-    """i + o for a plain shape; the load-weighted mean sum(w * (i + o)) for the mixture.
+    """i + o for a plain shape; the load-weighted mean ``sum(w * (i + o))`` otherwise.
 
     This is the KV-cache footprint of one admitted request at its longest, which is what
-    sets how many of them the engine can run before the surplus has to wait.
+    sets how many of them the engine can run before the surplus has to wait. A sampled
+    length contributes its mean, because what fills the cache over a burst is the average
+    footprint of the requests in it, not any one draw.
     """
-    return sum(w * (i + o) for w, i, o in shape_components(shape_name))
+    return sum(
+        w * (_length_mean(i) + _length_mean(o)) for w, i, o in shape_components(shape_name)
+    )
 
 
 def ramp_duration_s(capacity_rps: float, cap: AdmissionCap) -> float:
@@ -339,6 +458,48 @@ def burst_segments(capacity_rps: float, requests_per_burst: float) -> list[dict]
     return segments
 
 
+def hold_segments(capacity_rps: float, rho: float, duration_s: float) -> list[dict]:
+    """One constant-rate segment: ``rho * C_s`` for ``duration_s``.
+
+    Deliberately the simplest primitive in the module. A boundary probe has to answer
+    "does this offered load violate the SLO in steady state", and any shaping - a ramp
+    in, a drain out - would put windows in the capture that were taken at a different
+    offered load than the one the probe is about.
+    """
+    if duration_s <= 0.0:
+        raise ValueError("a hold cell needs a positive duration")
+    return [_segment(0.0, duration_s, rho * capacity_rps)]
+
+
+def _segment_sort_key(segment: dict) -> tuple:
+    """Stable file ordering for segments whose lengths may be fixed or sampled."""
+    in_dist = segment.get("input_tokens_dist") or {}
+    out_dist = segment.get("max_tokens_dist") or {}
+    in_nominal = segment.get("input_tokens")
+    if in_nominal is None:
+        in_nominal = TokenRange.from_mapping(in_dist).median if in_dist else 0
+    out_nominal = segment.get("max_tokens")
+    if out_nominal is None:
+        out_nominal = TokenRange.from_mapping(out_dist).median if out_dist else 0
+    return (segment["start_time"], in_nominal, out_nominal)
+
+
+def _component_meta(weight: float, i: int | TokenRange, o: int | TokenRange) -> dict:
+    """One stream of a shape, as the index records it."""
+    meta: dict = {"weight": weight}
+    if isinstance(i, TokenRange):
+        meta["input_tokens_dist"] = i.as_dict()
+        meta["input_tokens_mean"] = round(i.mean, 3)
+    else:
+        meta["input_tokens"] = int(i)
+    if isinstance(o, TokenRange):
+        meta["max_tokens_dist"] = o.as_dict()
+        meta["max_tokens_mean"] = round(o.mean, 3)
+    else:
+        meta["max_tokens"] = int(o)
+    return meta
+
+
 def _segment(start_s: float, end_s: float, rps: float) -> dict:
     return {"start_time": _round(start_s), "end_time": _round(end_s), "rps": round(rps, 4)}
 
@@ -348,11 +509,16 @@ def _round(value: float) -> float:
 
 
 def capacity_rps_for_shape(capacity: CapacityModel, shape_name: str) -> float:
-    """The fitted single-pod capacity prior C_s for one shape."""
+    """The fitted single-pod capacity prior C_s for one shape.
+
+    For a sampled shape the model ``1/C = i/P + o/D`` is linear in both lengths, so
+    ``E[1/C]`` is the cost at the *mean* lengths - the prior is exact under the fit
+    rather than an approximation of it.
+    """
     if shape_name == MIXTURE_NAME:
         return capacity.mixture_rps(MIXTURE)
-    i, o = SHAPES[shape_name]
-    return capacity.rps(i, o)
+    (_w, i, o), = shape_components(shape_name)
+    return capacity.rps(_length_mean(i), _length_mean(o))
 
 
 def build_schedule(
@@ -389,6 +555,9 @@ def build_schedule_from_capacity_rps(
     kv_cache_tokens: Optional[int] = None,
     capacity_source: str = "prior_fit",
     cap: Optional[AdmissionCap] = None,
+    hold_rho: Optional[float] = None,
+    hold_duration_s: Optional[float] = None,
+    hold_stage: str = "",
 ) -> tuple[Optional[dict], dict]:
     """(trace.json body, index metadata) for one (model, shape, primitive) at an
     explicitly supplied single-pod capacity, so a campaign can regenerate a schedule from
@@ -414,7 +583,21 @@ def build_schedule_from_capacity_rps(
         # M is held-out validation, never a capacity or theta training point.
         cell_in, cell_out = 0, 0
     else:
-        cell_in, cell_out = SHAPES[shape_name]
+        # A sampled shape is named by the geometric midpoint of its ranges, so its cell
+        # id is stable, unique and parseable by GridCell.from_scenario_id. The id is a
+        # NAME, not a claim about what was sent: the distribution itself is in the index
+        # entry's components, and the realised lengths are in the raw log per request.
+        (_w, nominal_i, nominal_o), = shape_components(shape_name)
+        cell_in, cell_out = _length_nominal(nominal_i), _length_nominal(nominal_o)
+    if primitive == HOLD_PRIMITIVE:
+        if hold_rho is None or hold_duration_s is None:
+            raise ValueError(
+                f"{model} {shape_name}: the {HOLD_PRIMITIVE!r} primitive needs hold_rho "
+                "and hold_duration_s - it exists to sit at one explicitly chosen rho"
+            )
+        load_code = hold_load_code(hold_rho)
+    else:
+        load_code = LOAD_CODE[primitive]
     if primitive == "bursts" and kv_cache_tokens is None:
         raise ValueError(
             f"{model} {shape_name}: the bursts primitive needs kv_cache_tokens (the engine's "
@@ -426,15 +609,14 @@ def build_schedule_from_capacity_rps(
         "model": model,
         "shape": shape_name,
         "primitive": primitive,
-        "cell_id": f"i{cell_in}_o{cell_out}_c{LOAD_CODE[primitive]}",
-        "held_out": shape_name == MIXTURE_NAME,
+        "cell_id": f"i{cell_in}_o{cell_out}_c{load_code}",
+        "held_out": is_held_out(shape_name),
+        "sampled": shape_name in SAMPLED_SHAPES,
         "capacity_rps": round(c_s, 4),
         "capacity_source": capacity_source,
         "admission_cap": cap.name,
         "skipped": False,
-        "components": [
-            {"weight": w, "input_tokens": i, "max_tokens": o} for w, i, o in components
-        ],
+        "components": [_component_meta(w, i, o) for w, i, o in components],
     }
 
     extra: dict = {}
@@ -463,6 +645,19 @@ def build_schedule_from_capacity_rps(
         def build(weight: float) -> list[dict]:
             return step_segments(c_s * weight)
 
+    elif primitive == HOLD_PRIMITIVE:
+        rho = float(hold_rho)
+        duration = float(hold_duration_s)
+        extra = {
+            "rho": rho,
+            "hold_s": _round(duration),
+            "stage": hold_stage,
+            "offered_rps": round(rho * c_s, 4),
+        }
+
+        def build(weight: float) -> list[dict]:
+            return hold_segments(c_s * weight, rho, duration)
+
     elif primitive == "bursts":
         tokens_per_req = tokens_per_request(shape_name)
         kv_cache_tokens = int(kv_cache_tokens)
@@ -490,12 +685,16 @@ def build_schedule_from_capacity_rps(
 
     segments: list[dict] = []
     for weight, i, o in components:
+        in_kind, in_value = _segment_shape(i)
+        out_kind, out_value = _segment_shape(o)
         for seg in build(weight):
             entry = dict(seg)
-            entry["input_tokens"] = i
-            entry["max_tokens"] = o
+            entry["input_tokens" if in_kind == "fixed" else "input_tokens_dist"] = in_value
+            entry["max_tokens" if out_kind == "fixed" else "max_tokens_dist"] = out_value
             segments.append(entry)
-    segments.sort(key=lambda s: (s["start_time"], s["input_tokens"], s["max_tokens"]))
+    # Ordered by the nominal lengths so a sampled stream still has a stable position in
+    # the file. The key is for reproducible output only, never for semantics.
+    segments.sort(key=_segment_sort_key)
 
     duration = max(s["end_time"] for s in segments)
     planned = sum((s["end_time"] - s["start_time"]) * s["rps"] for s in segments)
@@ -511,6 +710,33 @@ def build_schedule_from_capacity_rps(
             t += duration_s
         meta["discard_after_s"] = boundaries
     return {model: segments}, meta
+
+
+def build_hold_schedule(
+    model: str,
+    shape_name: str,
+    capacity_rps: float,
+    rho: float,
+    duration_s: float,
+    *,
+    stage: str = "",
+    capacity_source: str = "measured_steps",
+    cap: Optional[AdmissionCap] = None,
+) -> tuple[dict, dict]:
+    """(trace.json body, index metadata) for one constant-rho probe of the boundary search."""
+    body, meta = build_schedule_from_capacity_rps(
+        model,
+        shape_name,
+        HOLD_PRIMITIVE,
+        capacity_rps,
+        capacity_source=capacity_source,
+        cap=cap,
+        hold_rho=rho,
+        hold_duration_s=duration_s,
+        hold_stage=stage,
+    )
+    assert body is not None  # a hold cell is never declined; only bursts can be
+    return body, meta
 
 
 def _offered_rps_at(segments: Sequence[dict]) -> list[float]:
@@ -543,14 +769,34 @@ def generate(
         "primitives": {},
     }
     index["shapes"] = {
-        **{name: {"input_tokens": i, "max_tokens": o} for name, (i, o) in SHAPES.items()},
+        **{
+            name: {"input_tokens": i, "max_tokens": o, "held_out": False, "sampled": False}
+            for name, (i, o) in SHAPES.items()
+        },
+        **{
+            name: {
+                "held_out": False,
+                "sampled": True,
+                "input_tokens_dist": i.as_dict(),
+                "max_tokens_dist": o.as_dict(),
+                "input_tokens_mean": round(i.mean, 3),
+                "max_tokens_mean": round(o.mean, 3),
+                "input_tokens_nominal": i.median,
+                "max_tokens_nominal": o.median,
+            }
+            for name, (i, o) in SAMPLED_SHAPES.items()
+        },
         MIXTURE_NAME: {
             "held_out": True,
+            "sampled": False,
             "components": [
                 {"weight": w, "input_tokens": i, "max_tokens": o} for w, i, o in MIXTURE
             ],
         },
     }
+    index["training_shapes"] = list(TRAINING_SHAPES)
+    index["held_out_shapes"] = [name for name in ALL_SHAPES if is_held_out(name)]
+    index["families"] = {name: list(members) for name, members in FAMILIES.items()}
     # Only shape-independent constants belong here: T_r and B depend on C_s, on the
     # shape's token count and on the admission cap, and are recorded per cell instead.
     index["primitives"] = {
@@ -598,7 +844,7 @@ def generate(
         }
         model_dir = output_dir / model
         model_dir.mkdir(parents=True, exist_ok=True)
-        for shape_name in [*SHAPES, MIXTURE_NAME]:
+        for shape_name in ALL_SHAPES:
             for primitive in PRIMITIVES:
                 body, meta = build_schedule(
                     model, shape_name, primitive, capacity, kv_cache_tokens, cap=cap

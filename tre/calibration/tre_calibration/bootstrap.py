@@ -1,8 +1,8 @@
-"""Scenario/cell-level bootstrap confidence interval for the reliability theta_m fit.
+"""Scenario/cell-level bootstrap confidence interval for the ``theta_m`` fit.
 
 This is a permanent QA tool for calibration rounds, not a one-off script. It quantifies how
-much the published ``theta_m`` (from :func:`tre_calibration.fit.fit_theta_by_reliability`)
-could have moved had the load-scan happened to sample a slightly different set of grid cells.
+much the published ``theta_m`` could have moved had the load scan happened to sample a
+slightly different set of grid cells.
 
 The resampling unit is the **distinct ``scenario_id``** (one load-scan grid point / "cell"),
 NOT the individual calibration window. Windows inside a cell are produced by a 30s window
@@ -13,9 +13,15 @@ each grid point atomic: a cell drawn twice contributes its whole (correlated) wi
 twice, so the CI reflects variability across grid points, which is the thing an operator
 actually re-rolls when they re-run a load scan.
 
-The fit itself is reused verbatim -- this module never reimplements the reliability logic; it
-only re-feeds resampled window lists into ``fit_theta_by_reliability`` with the exact same
-config the caller passes (which callers set to the production fit-config).
+The fit itself is reused verbatim: this module never reimplements a fitting criterion, it
+re-feeds resampled window lists into :meth:`tre_calibration.fit.ThetaFitConfig.fit`. The
+caller hands over one :class:`~tre_calibration.fit.ThetaFitConfig`, and that same object must
+also produce the point estimate the interval is reported around. Carrying the whole
+configuration rather than individual knobs is what keeps the interval and the threshold it
+brackets the same quantity: an interval fitted under a different criterion, orientation or
+acceptance gate than the published theta is an interval for something else, and a campaign
+stop rule reading ``publish_rate`` or the CI half-width off it would be measuring the wrong
+thing.
 """
 from __future__ import annotations
 
@@ -25,7 +31,7 @@ import statistics
 from dataclasses import dataclass
 
 from tre_calibration.dataset import CalibrationWindow
-from tre_calibration.fit import fit_theta_by_reliability
+from tre_calibration.fit import ThetaFitConfig
 
 
 @dataclass(frozen=True)
@@ -36,6 +42,9 @@ class BootstrapThetaResult:
     resamples whose fit was rejected (coverage/support/confidence gate) are still counted in
     ``n_resamples`` so ``publish_rate`` (= ``n_published / n_resamples``) is informative. When
     no resample published, the summary statistics are ``None``.
+
+    ``config`` is the configuration every resample was fitted under, kept on the result so a
+    reader never has to trust that the caller used the same one for the point estimate.
     """
 
     n_resamples: int
@@ -47,6 +56,7 @@ class BootstrapThetaResult:
     theta_mean: float | None
     theta_std: float | None
     publish_rate: float
+    config: ThetaFitConfig = ThetaFitConfig()
 
 
 def _percentile(sorted_vals: list[float], pct: float) -> float:
@@ -69,13 +79,9 @@ def bootstrap_theta(
     *,
     n_resamples: int,
     seed: int,
-    reliability_target: float,
-    min_support: int,
-    min_confidence: float,
-    min_scenario_families: int,
-    max_single_scenario_ratio: float,
+    config: ThetaFitConfig | None = None,
 ) -> BootstrapThetaResult:
-    """Cell-level bootstrap of the reliability ``theta_m`` fit.
+    """Cell-level bootstrap of the ``theta_m`` fit under ``config``.
 
     Algorithm: group ``windows`` by ``scenario_id`` (cells), let ``cells`` be the sorted set of
     cell ids and ``n_cells = len(cells)``. Seed a single ``random.Random(seed)`` ONCE and reuse
@@ -83,11 +89,16 @@ def bootstrap_theta(
     identical). For each of ``n_resamples`` iterations draw ``n_cells`` cell ids with
     replacement (``rng.choices(cells, k=n_cells)``), concatenate -- in order -- ALL of each drawn
     cell's original windows (a cell drawn twice contributes its windows twice), and run
-    ``fit_theta_by_reliability`` on that resampled list with the exact config passed here. Record
-    ``fit.theta`` iff ``fit.publish``. Deterministic given ``seed``.
+    ``config.fit`` on that resampled list. Record ``fit.theta`` iff ``fit.publish``.
+    Deterministic given ``seed``.
+
+    ``config`` defaults to :class:`~tre_calibration.fit.ThetaFitConfig`'s defaults, which are
+    the calibration CLI's defaults; pass the caller's own configuration -- the same object used
+    for the point estimate -- whenever the fit was not run at defaults.
     """
     if n_resamples <= 0:
         raise ValueError("n_resamples must be positive")
+    config = config or ThetaFitConfig()
 
     by_cell: dict[str, list[CalibrationWindow]] = {}
     for window in windows:
@@ -102,14 +113,7 @@ def bootstrap_theta(
         resampled: list[CalibrationWindow] = []
         for cell_id in drawn:
             resampled.extend(by_cell[cell_id])
-        fit = fit_theta_by_reliability(
-            resampled,
-            reliability_target=reliability_target,
-            min_support=min_support,
-            min_confidence=min_confidence,
-            min_scenario_families=min_scenario_families,
-            max_single_scenario_ratio=max_single_scenario_ratio,
-        )
+        fit = config.fit(resampled)
         if fit.publish and fit.theta is not None:
             published.append(fit.theta)
 
@@ -135,4 +139,5 @@ def bootstrap_theta(
         theta_mean=theta_mean,
         theta_std=theta_std,
         publish_rate=publish_rate,
+        config=config,
     )

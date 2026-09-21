@@ -9,23 +9,13 @@ import pytest
 from scripts import gen_calibration_schedules as gen
 from scripts.admission_cap import DEFAULT_CAP_NAME, get_cap
 from scripts.r3_grid import GridCell
+from tre_replayer.engine.schedule import TokenRange
 from tre_replayer.traces.loader import load_trace_segments
 
 ROOT = Path(__file__).resolve().parents[2]
 CALIB = ROOT / "replayer" / "traces_v2" / "calibration"
 INDEX = json.loads((CALIB / "INDEX.json").read_text(encoding="utf-8"))
 CAP = get_cap(DEFAULT_CAP_NAME)
-
-#: The bursts cells that survive under the DEPLOYED admission policy. Everything else is
-#: skipped because the spike needed to push the engine past its running limit is larger
-#: than the gateway will admit, so the cell could only ever record gateway shedding.
-SURVIVING_BURSTS = {
-    ("dsllama-8b", "S2"): 230,
-    ("dsllama-8b", "S3"): 102,
-    ("dsllama-8b", "S5"): 192,
-    ("dsllama-8b", "M"): 231,
-    ("dsqwen-14b", "S3"): 141,
-}
 
 
 def _written() -> list[dict]:
@@ -68,42 +58,42 @@ def test_frozen_experiment_priors_are_not_the_campaign_priors() -> None:
 
 def test_the_committed_set_is_generated_for_the_deployed_admission_policy() -> None:
     # A schedule set sized for a policy the cluster does not run would measure the proxy.
-    assert INDEX["admission_cap"]["name"] == DEFAULT_CAP_NAME == "gateway-capped"
-    assert INDEX["admission_cap"]["shed_ceiling"] == 320
-    assert INDEX["admission_cap"]["admission_controller"] == "gateway"
-    assert INDEX["admission_cap"]["burst_request_cap"] == 240
+    # Since 2026-09-21 the deployed BackendTrafficPolicy is 4096 + 1024 per cluster and
+    # every model runs --max-num-seqs 256, so the binding limit is the ENGINE's and it
+    # scales with replicas. The superseded 320 ceiling is in admission_cap.GATEWAY_CAPPED.
+    assert INDEX["admission_cap"]["name"] == DEFAULT_CAP_NAME == "engine-capped"
+    assert INDEX["admission_cap"]["max_parallel_requests"] == 4096
+    assert INDEX["admission_cap"]["max_pending_requests"] == 1024
+    assert INDEX["admission_cap"]["shed_ceiling"] == 5120
+    assert INDEX["admission_cap"]["admission_controller"] == "engine"
+    assert INDEX["admission_cap"]["sequence_limit"] == 256
+    assert INDEX["admission_cap"]["burst_request_cap"] == 3840
+
+
+def test_the_committed_cap_matches_what_the_registry_launches_the_pods_with() -> None:
+    # The admission ceiling is max_num_seqs * replicas, so hard-coding 256 anywhere would
+    # go silently wrong the moment the manifests changed.
+    import yaml
+
+    from scripts.admission_cap import max_num_seqs_from_registry
+
+    registry = yaml.safe_load((ROOT / "deploy" / "registry.yaml").read_text(encoding="utf-8"))
+    assert max_num_seqs_from_registry(registry, gen.MODELS) == CAP.sequence_limit == 256
 
 
 def test_index_covers_every_model_shape_and_primitive() -> None:
-    expected = len(gen.MODELS) * (len(gen.SHAPES) + 1) * len(gen.PRIMITIVES)
-    assert len(INDEX["schedules"]) == expected
+    expected = len(gen.MODELS) * len(gen.ALL_SHAPES) * len(gen.PRIMITIVES)
+    assert len(INDEX["schedules"]) == expected == 72
     combos = {(m["model"], m["shape"], m["primitive"]) for m in INDEX["schedules"]}
     assert len(combos) == expected
 
 
-def test_only_unreachable_bursts_are_skipped_and_each_says_why() -> None:
-    skipped = _skipped()
-    assert len(skipped) == 13
-    assert {m["primitive"] for m in skipped} == {"bursts"}
-    # all six dsqwen-7b shapes: its 349232-token KV cache is far too large to overcommit
-    # with 240 admitted requests at any of the campaign's token shapes
-    assert {m["shape"] for m in skipped if m["model"] == "dsqwen-7b"} == {
-        *gen.SHAPES, gen.MIXTURE_NAME
-    }
-    for meta in skipped:
-        assert meta["reachable"] is False
-        assert meta["burst_requests_needed"] > meta["burst_request_cap"]
-        assert "shed by the gateway" in meta["reason"]
-        assert meta["kv_cache_tokens"] > 0 and meta["tokens_per_request"] > 0
-        assert "path" not in meta
-
-
-def test_surviving_bursts_are_exactly_the_reachable_cells() -> None:
-    kept = {
-        (m["model"], m["shape"]): m["burst_requests"]
-        for m in _written() if m["primitive"] == "bursts"
-    }
-    assert kept == SURVIVING_BURSTS
+def test_nothing_is_skipped_under_the_deployed_policy() -> None:
+    # Under the superseded 320 ceiling 13 of 18 burst cells were unreachable, which left
+    # num_requests_waiting unobservable for almost every shape and lambda_wait
+    # unidentifiable. Raising the ceiling to the engine's own limit removes the skip list.
+    assert _skipped() == []
+    assert all("path" in m for m in INDEX["schedules"])
 
 
 def test_every_burst_size_reproduces_the_caps_sizing_rule() -> None:
@@ -116,21 +106,24 @@ def test_every_burst_size_reproduces_the_caps_sizing_rule() -> None:
         )
         assert meta["burst_requests_needed"] == sizing.requests_needed
         assert meta["engine_running_limit"] == sizing.engine_running_limit
+        assert meta["engine_running_limit"] <= CAP.sequence_limit
         assert meta["skipped"] is not sizing.reachable
-        if sizing.reachable:
-            assert meta["burst_requests"] == sizing.requests
-            assert meta["burst_segment_rps"] == pytest.approx(
-                sizing.requests / gen.BURST_WIDTH_S
-            )
-            # if the spike does not exceed C_s the primitive cannot create a transient
-            assert meta["peak_offered_rps"] > meta["capacity_rps"]
+        assert meta["burst_requests"] == sizing.requests
+        assert meta["burst_segment_rps"] == pytest.approx(
+            sizing.requests / gen.BURST_WIDTH_S
+        )
+        # if the spike does not exceed C_s the primitive cannot create a transient
+        assert meta["peak_offered_rps"] > meta["capacity_rps"]
 
 
 def test_every_ramp_reproduces_the_caps_duration_rule() -> None:
     ramps = [m for m in INDEX["schedules"] if m["primitive"] == "ramp"]
-    assert len(ramps) == len(gen.MODELS) * (len(gen.SHAPES) + 1)
+    assert len(ramps) == len(gen.MODELS) * len(gen.ALL_SHAPES)
     for meta in ramps:
         expected = CAP.ramp_seconds(meta["capacity_rps"], gen.RAMP_BACKLOG_COEFFICIENT)
+        # Under the deployed cap the admission headroom is 3980 requests, far more than
+        # any campaign ramp accumulates, so every ramp is pinned at the ramp_max_s clamp.
+        assert expected == CAP.ramp_max_s
         assert meta["ramp_s"] == pytest.approx(expected, abs=1e-2)
         assert meta["hold_s"] == pytest.approx(meta["ramp_s"] / 4.0, abs=1e-2)
         assert meta["drain_start_s"] == pytest.approx(
@@ -141,6 +134,27 @@ def test_every_ramp_reproduces_the_caps_duration_rule() -> None:
         assert meta["cell_id"].endswith("_c120")
 
 
+def test_the_held_out_shape_is_marked_on_every_one_of_its_cells() -> None:
+    # The fit excludes held-out cells BY ID, so an unmarked cell is one that reaches the
+    # training set.
+    assert INDEX["held_out_shapes"] == [gen.MIXTURE_NAME]
+    assert INDEX["training_shapes"] == list(gen.TRAINING_SHAPES)
+    held = {m["cell_id"] for m in INDEX["schedules"] if m["held_out"]}
+    shapes = {m["shape"] for m in INDEX["schedules"] if m["held_out"]}
+    assert shapes == {gen.MIXTURE_NAME}
+    assert held and all(cid.startswith("i0_o0_") for cid in held)
+    assert not any(
+        m["held_out"] for m in INDEX["schedules"] if m["shape"] in gen.TRAINING_SHAPES
+    )
+
+
+def test_the_families_name_real_committed_shapes() -> None:
+    covered = {m["shape"] for m in INDEX["schedules"]}
+    for family, members in INDEX["families"].items():
+        assert members, family
+        assert set(members) <= covered
+
+
 def test_every_committed_schedule_loads_and_matches_its_index_entry() -> None:
     for meta in _written():
         path = CALIB / meta["path"]
@@ -149,11 +163,42 @@ def test_every_committed_schedule_loads_and_matches_its_index_entry() -> None:
         assert {s.model for s in segments} == {meta["model"]}
         GridCell.from_scenario_id(meta["cell_id"])
         assert abs(max(s.end_s for s in segments) - meta["duration_s"]) < 1e-6
-        shapes = {(s.input_tokens, s.max_output_tokens) for s in segments}
         if meta["shape"] == gen.MIXTURE_NAME:
+            shapes = {(s.input_tokens, s.max_output_tokens) for s in segments}
             assert shapes == {(i, o) for _w, i, o in gen.MIXTURE}
+        elif meta["shape"] in gen.SAMPLED_SHAPES:
+            want_in, want_out = gen.SAMPLED_SHAPES[meta["shape"]]
+            for segment in segments:
+                assert segment.input_tokens is None and segment.max_output_tokens is None
+                assert segment.input_tokens_range == want_in
+                assert segment.max_output_tokens_range == want_out
         else:
+            shapes = {(s.input_tokens, s.max_output_tokens) for s in segments}
             assert shapes == {tuple(gen.SHAPES[meta["shape"]])}
+
+
+def test_a_sampled_schedule_produces_reproducible_per_request_lengths() -> None:
+    # The whole point of T9 is variance in the generation length. If the schedule builder
+    # collapsed it to one value the shape would be a duplicate of a fixed one, and if it
+    # were not reproducible the campaign could not be re-run.
+    from tre_replayer.engine.schedule import build_poisson_schedule
+
+    meta = next(
+        m for m in _written()
+        if m["shape"] in gen.SAMPLED_SHAPES and m["primitive"] == "steps"
+    )
+    segments = load_trace_segments(CALIB / meta["path"])
+    first = build_poisson_schedule(segments, seed=1234)
+    again = build_poisson_schedule(segments, seed=1234)
+    assert [(e.request_id, e.prompt_tokens, e.max_output_tokens) for e in first] == [
+        (e.request_id, e.prompt_tokens, e.max_output_tokens) for e in again
+    ]
+    want_in, want_out = gen.SAMPLED_SHAPES[meta["shape"]]
+    assert len({e.max_output_tokens for e in first}) > 5
+    assert all(want_in.low <= e.prompt_tokens <= want_in.high for e in first)
+    assert all(want_out.low <= e.max_output_tokens <= want_out.high for e in first)
+    # and every request has its own prompt seed key, so no two share a prefix
+    assert len({e.request_id for e in first}) == len(first)
 
 
 def test_the_index_and_the_tree_agree_on_which_files_exist() -> None:
@@ -166,6 +211,14 @@ def test_the_index_and_the_tree_agree_on_which_files_exist() -> None:
     }
     indexed = {m["path"] for m in _written()}
     assert on_disk == indexed
-    assert len(indexed) == 41
+    assert len(indexed) == 72
     for path in indexed:
         assert (CALIB / path).exists()
+
+
+def test_the_sampled_shape_declares_its_distribution_in_the_index() -> None:
+    entry = INDEX["shapes"]["T9"]
+    assert entry["sampled"] is True and entry["held_out"] is False
+    assert entry["input_tokens_dist"] == TokenRange(300, 2200).as_dict()
+    assert entry["max_tokens_dist"] == TokenRange(100, 580).as_dict()
+    assert entry["input_tokens_nominal"] == TokenRange(300, 2200).median

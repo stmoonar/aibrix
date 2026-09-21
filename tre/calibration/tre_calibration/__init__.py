@@ -13,7 +13,15 @@ from tre_calibration.alt_signals import (
     threshold_curve,
 )
 from tre_calibration.fit import (
+    DEFAULT_HEALTHY_QUANTILE_CANDIDATES,
+    DEFAULT_MAX_SINGLE_SCENARIO_RATIO,
+    DEFAULT_MIN_CONFIDENCE,
+    DEFAULT_MIN_HEALTHY_RECALL,
+    DEFAULT_MIN_SCENARIO_FAMILIES,
+    DEFAULT_MIN_SUPPORT,
+    DEFAULT_RELIABILITY_TARGET,
     DEFAULT_SIGNAL_DIRECTION,
+    DEFAULT_THETA_CRITERION,
     DELTA_METHOD,
     SIGNAL_DIRECTIONS,
     THETA_CRITERIA,
@@ -25,18 +33,31 @@ from tre_calibration.fit import (
     DeltaMarginsFit,
     FittedTheta,
     ReliabilityThetaFit,
+    ThetaFitConfig,
     fit_delta_margins,
     fit_theta,
     fit_theta_by_balanced_accuracy,
     fit_theta_by_reliability,
     fit_theta_from_health,
+    signal_orientation,
     threshold_balanced_accuracy,
 )
-from tre_calibration.profile import build_profile_patch, theta_method_of
+from tre_calibration.profile import build_profile_patch, theta_fit_block, theta_method_of
 from tre_calibration.signals import ParameterCandidateScore, ParameterSearchResult, SignalInputs, TrsBreakdown, compute_trs, grid_search_parameters, score_parameter_candidate
 
 __all__ = [
     "ALT_SIGNALS",
+    "DEFAULT_HEALTHY_QUANTILE_CANDIDATES",
+    "DEFAULT_MAX_SINGLE_SCENARIO_RATIO",
+    "DEFAULT_MIN_CONFIDENCE",
+    "DEFAULT_MIN_HEALTHY_RECALL",
+    "DEFAULT_MIN_SCENARIO_FAMILIES",
+    "DEFAULT_MIN_SUPPORT",
+    "DEFAULT_RELIABILITY_TARGET",
+    "DEFAULT_THETA_CRITERION",
+    "ThetaFitConfig",
+    "signal_orientation",
+    "theta_fit_block",
     "BalancedAccuracyThetaFit",
     "DEFAULT_SIGNAL_DIRECTION",
     "SIGNAL_DIRECTIONS",

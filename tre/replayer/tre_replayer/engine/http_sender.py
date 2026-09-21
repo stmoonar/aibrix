@@ -15,6 +15,7 @@ path, and the field is then None rather than guessed.
 from __future__ import annotations
 
 import json
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -72,6 +73,11 @@ class StreamResult:
     #: such header - which is the case on the per-model HTTPRoute the campaign uses, so
     #: a None here means "not attributable", never "no pod".
     target_pod: str | None = None
+    #: The client gave up before the upstream answered. Its own class, because nothing
+    #: is known about what the engine did with the request: folding it into the model's
+    #: error budget would read as an engine fault, and folding it into the gateway's
+    #: would read as a shed. See ``scripts.openloop.classify_failure``.
+    timed_out: bool = False
 
 
 # seam: (url, headers, body_bytes, timeout_s) -> StreamResult
@@ -128,6 +134,13 @@ class StreamingHttpSender:
         # into a closed-loop-32 and under-drive the system under saturation. Use a dedicated
         # pool sized for the peak in-flight, and record pool_wait_ms so starvation is visible.
         self._executor = ThreadPoolExecutor(max_workers=max(1, max_in_flight), thread_name_prefix="trepl-send")
+        # Requests on the wire right now, recorded on every row as ``in_flight_at_send``.
+        # A failure is only interpretable next to how loaded the path was when it was
+        # emitted, and this is the one quantity nothing downstream can reconstruct: the
+        # raw log keeps send and done timestamps, but not the driver's own view of
+        # concurrency at the instant of the send.
+        self._in_flight = 0
+        self._in_flight_lock = threading.Lock()
         self.records: list[dict[str, Any]] = []
 
     async def __call__(self, request: ScheduledRequest, scheduled_ts: float, actual_ts: float) -> None:
@@ -172,8 +185,20 @@ class StreamingHttpSender:
             }
         ).encode("utf-8")
         headers = build_request_headers(request.model, self._routing_strategy)
+        timeout_s = max(30.0, out_tokens / 4.0)
         send_ts_ms = self._now()
-        res = self._call(self._url, headers, body, max(30.0, out_tokens / 4.0))
+        with self._in_flight_lock:
+            self._in_flight += 1
+            in_flight_at_send = self._in_flight
+        # Exactly one call per request, and no retry on any outcome. A retried request
+        # would be counted once as offered and twice as sent, which biases goodput
+        # upwards, and it would re-offer load the schedule never planned - so the cell
+        # would no longer be the open loop it claims to be.
+        try:
+            res = self._call(self._url, headers, body, timeout_s)
+        finally:
+            with self._in_flight_lock:
+                self._in_flight -= 1
         return {
             "request_id": request.request_id,
             "model": request.model,
@@ -192,6 +217,9 @@ class StreamingHttpSender:
             "error_body": res.error_body,
             "error_headers": res.error_headers,
             "target_pod": res.target_pod,
+            "client_timeout": bool(getattr(res, "timed_out", False)),
+            "request_timeout_s": timeout_s,
+            "in_flight_at_send": in_flight_at_send,
         }
 
     def write_jsonl(self, path: str) -> int:
@@ -267,7 +295,30 @@ def _default_stream_call(url: str, headers: dict[str, str], body: bytes, timeout
             target_pod=pod_from_headers(error_headers),
         )
     except (URLError, TimeoutError, OSError) as exc:  # noqa: BLE001
-        return StreamResult(0, None, (time.perf_counter() - start) * 1000.0, error=type(exc).__name__)
+        return StreamResult(
+            0,
+            None,
+            (time.perf_counter() - start) * 1000.0,
+            error=type(exc).__name__,
+            timed_out=is_client_timeout(exc),
+        )
+
+
+def is_client_timeout(exc: BaseException) -> bool:
+    """True when this transport failure is the client giving up, not the peer refusing.
+
+    urllib surfaces a read timeout three ways depending on where it fires: as
+    :class:`TimeoutError` (``socket.timeout`` is an alias of it since 3.10), as a
+    :class:`urllib.error.URLError` wrapping one in ``reason``, or - on some stacks - as
+    an ``OSError`` whose text says so and nothing else does. Only the first two are
+    structural, so the text check comes last and is deliberately narrow.
+    """
+    if isinstance(exc, TimeoutError):
+        return True
+    reason = getattr(exc, "reason", None)
+    if isinstance(reason, TimeoutError):
+        return True
+    return "timed out" in str(exc).lower()
 
 
 

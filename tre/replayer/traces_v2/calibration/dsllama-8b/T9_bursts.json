@@ -1,0 +1,79 @@
+{
+  "dsllama-8b": [
+    {
+      "start_time": 0,
+      "end_time": 360,
+      "rps": 2.6748,
+      "input_tokens_dist": {
+        "kind": "log_uniform",
+        "low": 300,
+        "high": 2200
+      },
+      "max_tokens_dist": {
+        "kind": "log_uniform",
+        "low": 100,
+        "high": 580
+      }
+    },
+    {
+      "start_time": 60,
+      "end_time": 62,
+      "rps": 90.0,
+      "input_tokens_dist": {
+        "kind": "log_uniform",
+        "low": 300,
+        "high": 2200
+      },
+      "max_tokens_dist": {
+        "kind": "log_uniform",
+        "low": 100,
+        "high": 580
+      }
+    },
+    {
+      "start_time": 150,
+      "end_time": 152,
+      "rps": 90.0,
+      "input_tokens_dist": {
+        "kind": "log_uniform",
+        "low": 300,
+        "high": 2200
+      },
+      "max_tokens_dist": {
+        "kind": "log_uniform",
+        "low": 100,
+        "high": 580
+      }
+    },
+    {
+      "start_time": 240,
+      "end_time": 242,
+      "rps": 90.0,
+      "input_tokens_dist": {
+        "kind": "log_uniform",
+        "low": 300,
+        "high": 2200
+      },
+      "max_tokens_dist": {
+        "kind": "log_uniform",
+        "low": 100,
+        "high": 580
+      }
+    },
+    {
+      "start_time": 330,
+      "end_time": 332,
+      "rps": 90.0,
+      "input_tokens_dist": {
+        "kind": "log_uniform",
+        "low": 300,
+        "high": 2200
+      },
+      "max_tokens_dist": {
+        "kind": "log_uniform",
+        "low": 100,
+        "high": 580
+      }
+    }
+  ]
+}

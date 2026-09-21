@@ -1,0 +1,49 @@
+{
+  "dsqwen-14b": [
+    {
+      "start_time": 0,
+      "end_time": 90,
+      "rps": 1.2272,
+      "input_tokens_dist": {
+        "kind": "log_uniform",
+        "low": 300,
+        "high": 2200
+      },
+      "max_tokens_dist": {
+        "kind": "log_uniform",
+        "low": 100,
+        "high": 580
+      }
+    },
+    {
+      "start_time": 90,
+      "end_time": 210,
+      "rps": 1.9636,
+      "input_tokens_dist": {
+        "kind": "log_uniform",
+        "low": 300,
+        "high": 2200
+      },
+      "max_tokens_dist": {
+        "kind": "log_uniform",
+        "low": 100,
+        "high": 580
+      }
+    },
+    {
+      "start_time": 210,
+      "end_time": 450,
+      "rps": 2.3317,
+      "input_tokens_dist": {
+        "kind": "log_uniform",
+        "low": 300,
+        "high": 2200
+      },
+      "max_tokens_dist": {
+        "kind": "log_uniform",
+        "low": 100,
+        "high": 580
+      }
+    }
+  ]
+}

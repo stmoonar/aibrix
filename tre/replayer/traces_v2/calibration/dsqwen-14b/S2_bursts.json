@@ -1,0 +1,39 @@
+{
+  "dsqwen-14b": [
+    {
+      "start_time": 0,
+      "end_time": 360,
+      "rps": 1.9842,
+      "input_tokens": 768,
+      "max_tokens": 192
+    },
+    {
+      "start_time": 60,
+      "end_time": 62,
+      "rps": 157.5,
+      "input_tokens": 768,
+      "max_tokens": 192
+    },
+    {
+      "start_time": 150,
+      "end_time": 152,
+      "rps": 157.5,
+      "input_tokens": 768,
+      "max_tokens": 192
+    },
+    {
+      "start_time": 240,
+      "end_time": 242,
+      "rps": 157.5,
+      "input_tokens": 768,
+      "max_tokens": 192
+    },
+    {
+      "start_time": 330,
+      "end_time": 332,
+      "rps": 157.5,
+      "input_tokens": 768,
+      "max_tokens": 192
+    }
+  ]
+}

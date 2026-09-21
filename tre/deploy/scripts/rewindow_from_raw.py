@@ -502,13 +502,73 @@ def rewindow_cell(
 
 
 def _raw_size_bytes(raw_dir: Path) -> int:
-    return sum(p.stat().st_size for p in raw_dir.glob("*.jsonl"))
+    return sum(p.stat().st_size for p in raw_dir.rglob("*.jsonl"))
+
+
+def held_out_cell_ids(index: Mapping) -> set[str]:
+    """Cell ids the schedule index marks as held out.
+
+    Read from the index rather than guessed from a file name: the raw tree is keyed by
+    cell id and nothing in a file name says which shape produced it, so a fit pointed at
+    the raw directory would otherwise silently train on the validation set.
+    """
+    return {
+        str(entry["cell_id"])
+        for entry in (index.get("schedules", []) or [])
+        if entry.get("held_out") and entry.get("cell_id")
+    }
+
+
+def discover_cell_files(
+    raw_dir: Path,
+    *,
+    exclude: Iterable[str] = (),
+    only: Iterable[str] = (),
+) -> tuple[list[Path], list[str]]:
+    """(cell raw files to re-window, cell ids skipped).
+
+    Searched **recursively**, because a campaign writes one directory per cell under the
+    raw root; a flat glob finds nothing there and produces an empty CSV without saying so.
+
+    ``only`` wins over ``exclude`` when both are given: an explicit inclusion list is a
+    stronger statement than a default exclusion.
+    """
+    excluded = {str(c) for c in exclude}
+    included = {str(c) for c in only}
+    kept: list[Path] = []
+    skipped: list[str] = []
+    for path in sorted(raw_dir.rglob("*.jsonl")):
+        if path.name.endswith(".instant.jsonl") or path.name.endswith(".failures.jsonl"):
+            continue
+        cell_id = path.stem
+        if included:
+            if cell_id not in included:
+                skipped.append(cell_id)
+                continue
+        elif cell_id in excluded:
+            skipped.append(cell_id)
+            continue
+        kept.append(path)
+    return kept, skipped
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--model", required=True)
-    ap.add_argument("--raw-dir", required=True, help="dir holding <cell_id>.jsonl (+ .instant.jsonl)")
+    ap.add_argument("--raw-dir", required=True,
+                    help="dir holding <cell_id>.jsonl (+ .instant.jsonl), searched recursively")
+    ap.add_argument("--exclude-cell-id", action="append", default=[],
+                    help="skip this cell. Repeatable. The calibration fit uses it to keep "
+                         "the held-out shape out of training - nothing in a raw file name "
+                         "says which shape it came from, so without this a fit pointed at "
+                         "the raw tree trains on the validation set.")
+    ap.add_argument("--only-cell-id", action="append", default=[],
+                    help="re-window only these cells. Repeatable. Overrides "
+                         "--exclude-cell-id; used to build the held-out validation CSV "
+                         "and the per-family diagnostic CSVs.")
+    ap.add_argument("--held-out-index", default=None,
+                    help="schedule INDEX.json; every entry marked held_out is excluded, "
+                         "in addition to --exclude-cell-id")
     ap.add_argument("--output", required=True, help="re-windowed CSV path")
     ap.add_argument("--window-ms", type=int, required=True)
     ap.add_argument("--step-ms", type=int, default=None, help="slide step; default = window-ms (tumbling)")
@@ -560,16 +620,25 @@ def main() -> int:
     rows: list[dict] = []
     cells: list[str] = []
     gap_per_cell: dict[str, ObservabilityGap] = {}
-    cell_files = sorted(p for p in raw_dir.glob("*.jsonl") if not p.name.endswith(".instant.jsonl"))
+    exclude = set(args.exclude_cell_id or [])
+    if args.held_out_index:
+        index_doc = json.loads(Path(args.held_out_index).read_text(encoding="utf-8"))
+        exclude |= held_out_cell_ids(index_doc)
+    cell_files, skipped_cells = discover_cell_files(
+        raw_dir, exclude=exclude, only=args.only_cell_id or ()
+    )
+    if skipped_cells:
+        print(f"skipping {len(skipped_cells)} cell(s) by id: {', '.join(sorted(set(skipped_cells)))}")
     for raw_path in cell_files:
         cell_id = raw_path.stem
+        raw_dir_for_cell = raw_path.parent
         try:
             cell = r3_grid.GridCell.from_scenario_id(cell_id)
         except ValueError:
             print(f"skip {raw_path.name}: not a grid cell file")
             continue
         records = load_jsonl(raw_path)
-        instant_samples = load_jsonl(raw_dir / f"{cell_id}.instant.jsonl")
+        instant_samples = load_jsonl(raw_dir_for_cell / f"{cell_id}.instant.jsonl")
         cell_rows = rewindow_cell(
             records, instant_samples, cell, spec,
             window_ms=args.window_ms, step_ms=step_ms,

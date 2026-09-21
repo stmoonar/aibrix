@@ -1,0 +1,39 @@
+{
+  "dsllama-8b": [
+    {
+      "start_time": 0,
+      "end_time": 360,
+      "rps": 7.108,
+      "input_tokens": 256,
+      "max_tokens": 128
+    },
+    {
+      "start_time": 60,
+      "end_time": 62,
+      "rps": 192.0,
+      "input_tokens": 256,
+      "max_tokens": 128
+    },
+    {
+      "start_time": 150,
+      "end_time": 152,
+      "rps": 192.0,
+      "input_tokens": 256,
+      "max_tokens": 128
+    },
+    {
+      "start_time": 240,
+      "end_time": 242,
+      "rps": 192.0,
+      "input_tokens": 256,
+      "max_tokens": 128
+    },
+    {
+      "start_time": 330,
+      "end_time": 332,
+      "rps": 192.0,
+      "input_tokens": 256,
+      "max_tokens": 128
+    }
+  ]
+}

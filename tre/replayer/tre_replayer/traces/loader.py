@@ -5,7 +5,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from tre_replayer.engine.schedule import RpsSegment
+from tre_replayer.engine.schedule import RpsSegment, TokenRange
+
+#: Segment keys carrying a per-request length distribution instead of a fixed length.
+INPUT_DIST_KEY = "input_tokens_dist"
+OUTPUT_DIST_KEY = "max_tokens_dist"
 
 
 @dataclass(frozen=True)
@@ -84,7 +88,31 @@ def _segment_from_mapping(model: str, raw: dict[str, Any]) -> RpsSegment:
         rps=float(raw["rps"]),
         input_tokens=_optional_int(raw.get("input_tokens")),
         max_output_tokens=_optional_int(raw.get("max_tokens")),
+        input_tokens_range=_optional_range(model, raw, "input_tokens", INPUT_DIST_KEY),
+        max_output_tokens_range=_optional_range(model, raw, "max_tokens", OUTPUT_DIST_KEY),
     )
+
+
+def _optional_range(
+    model: str, raw: dict[str, Any], fixed_key: str, dist_key: str
+) -> TokenRange | None:
+    """The segment's length distribution, if it has one.
+
+    A segment may state a fixed length or a distribution, never both: with both present
+    there is no way for a reader to tell which one the run actually sent, and the two
+    would silently disagree in the index, the cell id and the raw log.
+    """
+    spec = raw.get(dist_key)
+    if spec is None:
+        return None
+    if raw.get(fixed_key) is not None:
+        raise ValueError(
+            f"trace model {model!r} has both {fixed_key!r} and {dist_key!r} on one "
+            "segment; a segment's length is either fixed or sampled, not both"
+        )
+    if not isinstance(spec, dict):
+        raise ValueError(f"trace model {model!r}: {dist_key!r} must be an object")
+    return TokenRange.from_mapping(spec)
 
 
 def _optional_int(value: Any) -> int | None:

@@ -23,16 +23,44 @@ regressor that makes ``lambda_wait`` identifiable - can only become non-zero whe
 limit, offered load is shed before a queue can form, and the only remaining route to a
 non-zero waiting count is KV-cache exhaustion.
 
-Measured on 2026-09-20 against the live deployment: with ``maxParallelRequests: 256`` +
-``maxPendingRequests: 64`` and no ``--max-num-seqs`` override, the first 503 arrived at
-in-flight 321 and every one of them carried Envoy's plain-text overflow body. So today
-the gateway is the admission controller and the engine's sequence limit is unreachable.
+Where the ceiling is today (2026-09-21)
+---------------------------------------
+``deploy/gateway-hardening`` now sets, identically on both experiment arms::
+
+    maxConnections: 4096   maxParallelRequests: 4096
+    maxPendingRequests: 1024   maxParallelRetries: 16
+
+and all three models pass ``--max-num-seqs 256`` in the registry's ``vllm_extra_args``.
+The shed ceiling is therefore 5120 per cluster - far above anything the campaign offers -
+and the real admission ceiling is the engine's::
+
+    admission ceiling = max_num_seqs * awake replicas
+
+which, unlike the Envoy cluster limits, **grows when TRE scales out**. That is the
+property an autoscaling experiment has to be measured under, and it is why
+:data:`ENGINE_CAPPED` is the policy the campaign now generates against. The sequence
+limit must be read from the registry rather than assumed - see
+:func:`max_num_seqs_from_registry` and :func:`cap_for_registry`.
+
+Superseded observation (2026-09-20) - kept, not deleted
+-------------------------------------------------------
+The diagnosis that produced this module measured the *previous* policy: with
+``maxParallelRequests: 256`` + ``maxPendingRequests: 64`` and no ``--max-num-seqs``
+override, a pre-check against the live gateway opened requests until they were refused
+and the first 503 arrived at in-flight 321, carrying Envoy's plain-text overflow body
+and no ``x-envoy-*`` header. That measurement is **no longer the deployed ceiling**, and
+every number derived from it is invalid by construction - including the theta values
+1718 / 1494 / 1414, which fitted the circuit breaker and mistook it for capacity. It is
+recorded here because it is still the evidence for two things that remain true: that the
+Envoy limits are per *cluster* and so do not scale with replicas, and that a shed carries
+no header the classifier can key on (see :func:`scripts.openloop.classify_failure`).
 
 Everything downstream (burst sizing, the ramp's backlog budget, the skip list) is
-therefore expressed against an :class:`AdmissionCap` rather than against a hard-coded
-320, so the campaign can be regenerated for a different policy without editing formulas.
-Two policies are named below: :data:`GATEWAY_CAPPED` (what is deployed) and
-:data:`ENGINE_CAPPED` (the proposal that moves the binding limit into the engine).
+expressed against an :class:`AdmissionCap` rather than against a hard-coded number, so
+the campaign can be regenerated for a different policy without editing formulas. Two
+policies are named below: :data:`ENGINE_CAPPED` (what is deployed) and
+:data:`GATEWAY_CAPPED` (the superseded one, kept so an older capture can be re-read
+against the rules it was actually taken under).
 
 This module describes limits; it never applies them. Changing the deployed policy is a
 shared-resource edit to the BackendTrafficPolicy and the model manifests.
@@ -41,11 +69,16 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, replace
-from typing import Optional
+from typing import Optional, Sequence
 
 #: vLLM's default running-set limit when ``--max-num-seqs`` is not passed. The deployed
-#: manifests do not override it, so this is the engine limit in force today.
+#: manifests DO override it now (registry ``vllm_extra_args``), so this is only the
+#: fallback for a policy that deliberately describes an engine with no override.
 VLLM_DEFAULT_MAX_NUM_SEQS = 1024
+
+#: The vLLM flag that sets the per-pod running-set limit, as it appears in the
+#: registry's ``vllm_extra_args`` list.
+MAX_NUM_SEQS_FLAG = "--max-num-seqs"
 
 #: The ramp's excess-request headroom is rounded down to a multiple of this, so a change
 #: in the ``typical_running`` estimate does not jitter every generated schedule.
@@ -170,6 +203,12 @@ class AdmissionCap:
         no margin left for the Poisson arrivals it is built from. The headroom is then
         rounded down to a whole :data:`RAMP_BUDGET_QUANTUM`, because ``typical_running``
         is an estimate and spending its last few slots buys nothing.
+
+        Under the deployed policy this is 3980 slots, which no campaign ramp comes near:
+        :meth:`ramp_seconds` is then pinned at :attr:`ramp_max_s` for every shape, i.e.
+        the ramp's length is bounded by "one cell must stay bounded" rather than by the
+        proxy. Under the superseded 256+64 policy it was 140 and it was the binding
+        constraint. Both are the same formula; only which term wins has changed.
         """
         headroom = self.max_parallel_requests - self.typical_running
         quantised = (headroom // RAMP_BUDGET_QUANTUM) * RAMP_BUDGET_QUANTUM
@@ -184,10 +223,18 @@ class AdmissionCap:
         return max(1, int(math.floor(kv_cache_tokens / tokens_per_request)))
 
     def engine_running_limit(self, kv_cache_tokens: int, tokens_per_request: float) -> int:
-        """Requests of this shape the engine can run at once: the tighter of its
-        sequence limit and what the KV cache holds. Beyond this the engine queues."""
-        return max(1, min(self.sequence_limit,
-                          self.kv_request_limit(kv_cache_tokens, tokens_per_request)))
+        """Requests of this shape the *fleet's engines* can run at once: the tighter of
+        the sequence limit and what the KV cache holds, times the awake replicas. Beyond
+        this the engine queues.
+
+        Both terms are per pod and both scale with :attr:`replicas`, which is the whole
+        reason this ceiling is the right one to size a burst against: it is the limit
+        that moves when the autoscaler acts, whereas the Envoy cluster limits do not.
+        Calibration drives one awake replica, so there ``replicas == 1``.
+        """
+        per_pod = min(self.sequence_limit,
+                      self.kv_request_limit(kv_cache_tokens, tokens_per_request))
+        return max(1, per_pod * max(1, self.replicas))
 
     def burst_sizing(self, kv_cache_tokens: int, tokens_per_request: float) -> BurstSizing:
         """Size one burst spike for a shape, and say whether it can reach the queue.
@@ -197,9 +244,16 @@ class AdmissionCap:
         the gateway will admit, the spike is shed instead of queued and the primitive
         cannot observe anything - the cell must be skipped rather than run to produce a
         flat zero.
+
+        The comparison is against the *engine* ceiling ``max_num_seqs * replicas`` (or
+        the KV cache, whichever binds first), never against a fixed in-flight number. Under
+        the superseded 256+64 policy the gateway budget was 240 requests and almost every
+        shape was declared unreachable; under the deployed one the budget is 3840 and the
+        overshoot needed is a few hundred, so the skip list is empty and
+        ``num_requests_waiting`` becomes identifiable for every shape.
         """
         kv_limit = self.kv_request_limit(kv_cache_tokens, tokens_per_request)
-        running_limit = max(1, min(self.sequence_limit, kv_limit))
+        running_limit = self.engine_running_limit(kv_cache_tokens, tokens_per_request)
         needed = int(math.ceil(self.burst_overshoot_factor * running_limit))
         cap = self.burst_request_cap
         reachable = needed <= cap
@@ -269,9 +323,11 @@ class AdmissionCap:
         }
 
 
-#: What is deployed today: Envoy admits 256 + 64 per model cluster shared across
-#: replicas, vLLM's sequence limit is the 1024 default and therefore unreachable. The
-#: 2026-09-20 pre-check measured the first shed at in-flight 321, confirming 320.
+#: SUPERSEDED on 2026-09-21, kept so a capture taken before that date can be re-read
+#: against the rules it was actually taken under. Envoy admitted 256 + 64 per model
+#: cluster shared across replicas and vLLM's sequence limit was the unreachable 1024
+#: default; the pre-check measured the first shed at in-flight 321, confirming 320.
+#: Nothing new should be generated against this policy.
 GATEWAY_CAPPED = AdmissionCap(
     name="gateway-capped",
     max_parallel_requests=256,
@@ -279,13 +335,13 @@ GATEWAY_CAPPED = AdmissionCap(
     max_num_seqs=None,
 )
 
-#: The proposed policy: raise the circuit breaker far above any load the campaign
-#: offers and set vLLM's sequence limit explicitly, so the binding limit moves into the
-#: engine. Two consequences matter. Requests past the limit queue instead of being shed,
-#: so ``num_requests_waiting`` becomes observable for every shape; and the ceiling is
-#: per pod, so it scales with replicas - which is what an autoscaler experiment needs to
-#: be measuring. NOT APPLIED: changing it edits the BackendTrafficPolicy and the model
-#: manifests, both shared resources.
+#: APPLIED 2026-09-21 and live on both experiment arms: the circuit breaker sits far
+#: above any load the campaign offers and vLLM's sequence limit is set explicitly, so the
+#: binding limit is the engine's. Two consequences matter. Requests past the limit queue
+#: instead of being shed, so ``num_requests_waiting`` becomes observable for every shape;
+#: and the ceiling is per pod, so it scales with replicas - which is what an autoscaler
+#: experiment needs to be measuring. ``max_num_seqs`` here is the value the registry
+#: carries today; :func:`cap_for_registry` re-reads it rather than trusting this copy.
 ENGINE_CAPPED = AdmissionCap(
     name="engine-capped",
     max_parallel_requests=4096,
@@ -297,7 +353,7 @@ CAPS = {cap.name: cap for cap in (GATEWAY_CAPPED, ENGINE_CAPPED)}
 
 #: The policy the campaign generates against unless told otherwise. It tracks what is
 #: deployed, so a campaign run from the committed tree matches the cluster it runs on.
-DEFAULT_CAP_NAME = GATEWAY_CAPPED.name
+DEFAULT_CAP_NAME = ENGINE_CAPPED.name
 
 
 def get_cap(name: str) -> AdmissionCap:
@@ -307,3 +363,77 @@ def get_cap(name: str) -> AdmissionCap:
         raise SystemExit(
             f"unknown admission cap {name!r}; known: {', '.join(sorted(CAPS))}"
         ) from None
+
+
+# ------------------------------------------------------------------ registry sourcing
+
+
+def max_num_seqs_from_args(extra_args: Sequence[str]) -> Optional[int]:
+    """``--max-num-seqs`` out of one model's ``vllm_extra_args``, or None.
+
+    Accepts both spellings the registry may carry: the flag and its value as two list
+    entries, and ``--max-num-seqs=256`` as one.
+    """
+    args = [str(a) for a in extra_args or ()]
+    for index, arg in enumerate(args):
+        if arg == MAX_NUM_SEQS_FLAG:
+            if index + 1 >= len(args):
+                raise ValueError(f"{MAX_NUM_SEQS_FLAG} is the last entry and has no value")
+            return int(args[index + 1])
+        if arg.startswith(MAX_NUM_SEQS_FLAG + "="):
+            return int(arg.split("=", 1)[1])
+    return None
+
+
+def max_num_seqs_from_registry(registry_doc: dict, models: Optional[Sequence[str]] = None) -> int:
+    """The per-pod sequence limit the fleet actually runs, read from the registry.
+
+    The admission ceiling is ``max_num_seqs * replicas``, so hard-coding 256 would make
+    every burst-reachability verdict silently wrong the moment the manifests changed -
+    which is exactly how the superseded 320 became load-bearing. The value is therefore
+    read from the same ``vllm_extra_args`` the pods are launched with.
+
+    Every named model must agree: a fleet whose models run different sequence limits has
+    no single admission ceiling, and quietly picking one of them would size bursts for a
+    model that is not the one being driven.
+    """
+    entries = [e for e in (registry_doc.get("models") or []) if isinstance(e, dict)]
+    if models is not None:
+        wanted = set(models)
+        entries = [e for e in entries if e.get("name") in wanted]
+    if not entries:
+        raise ValueError("registry names no models to read a sequence limit from")
+    found: dict[str, int] = {}
+    for entry in entries:
+        value = max_num_seqs_from_args(entry.get("vllm_extra_args") or ())
+        if value is None:
+            raise ValueError(
+                f"model {entry.get('name')!r} does not pass {MAX_NUM_SEQS_FLAG}; the "
+                "admission ceiling is then vLLM's 1024 default, which is not what the "
+                "deployed manifests carry - fix the registry rather than assuming"
+            )
+        found[str(entry.get("name"))] = value
+    distinct = set(found.values())
+    if len(distinct) != 1:
+        raise ValueError(
+            f"models disagree on {MAX_NUM_SEQS_FLAG}: {found}. The admission ceiling is "
+            "per model, so there is no single cap to size a campaign against"
+        )
+    return distinct.pop()
+
+
+def cap_for_registry(
+    registry_doc: dict,
+    *,
+    base: Optional[AdmissionCap] = None,
+    models: Optional[Sequence[str]] = None,
+    replicas: int = 1,
+) -> AdmissionCap:
+    """``base`` (default the deployed policy) with its sequence limit taken from the
+    registry and its replica count set explicitly."""
+    cap = base or get_cap(DEFAULT_CAP_NAME)
+    return replace(
+        cap,
+        max_num_seqs=max_num_seqs_from_registry(registry_doc, models),
+        replicas=int(replicas),
+    )

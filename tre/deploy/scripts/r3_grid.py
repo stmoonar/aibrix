@@ -140,6 +140,12 @@ def window_row(cell: GridCell, window_metrics, trs: float, queue_control: float)
         "p95_tpot": window_metrics.tpot_p95_ms,
         "p95_e2e": window_metrics.e2e_p95_ms,
         "trs": trs,
+        # Requests the ENGINE failed inside this window, and the resulting verdict. A
+        # failed request contributes no latency sample, so a window whose slowest work
+        # all errored out otherwise shows a comfortable p95 and is scored as healthy.
+        # Both default to "none seen"; openloop.mark_model_error_windows fills them in.
+        "model_errors": 0,
+        "slo_violated": False,
     }
 
 
@@ -148,6 +154,7 @@ CSV_COLUMNS = [
     "window_start_ms", "window_end_ms", "prompt_tokens_total", "generation_tokens_total",
     "avg_waiting", "avg_running", "avg_swapping", "queue_control",
     "p95_ttft", "p95_tpot", "p95_e2e", "trs",
+    "model_errors", "slo_violated",
 ]
 
 # S4 per-request raw JSONL schema (doc15 §4). Queue observables are NOT here (they are an
@@ -468,6 +475,11 @@ def count_slo_windows(rows: Sequence[dict], *, ttft_slo_ms: float, tpot_slo_ms: 
     """
     crossed = 0
     for row in rows:
+        if row.get("slo_violated"):
+            # Marked by openloop.mark_model_error_windows: the engine failed requests in
+            # this window, which is a violation even when the surviving p95 looks fine.
+            crossed += 1
+            continue
         ttft = row.get("p95_ttft")
         tpot = row.get("p95_tpot")
         if ttft is not None and float(ttft) > ttft_slo_ms:
@@ -530,8 +542,19 @@ def run_schedule_cell(args, store, spec) -> tuple[list, "openloop.CellGuard"]:
     ttft_slo_ms = args.ttft_slo_ms if args.ttft_slo_ms is not None else spec.slo.ttft_p95_ms
     tpot_slo_ms = args.tpot_slo_ms if args.tpot_slo_ms is not None else spec.slo.tpot_p95_ms
 
+    sentinel = None
+    if args.envoy_stats_url:
+        # Validity only. A non-zero delta says the capture was shaped by the proxy; it
+        # never feeds a controller or a fit.
+        sentinel = openloop.PendingOverflowSentinel(
+            read=openloop.make_envoy_stats_reader(args.envoy_stats_url),
+            cluster_filter=args.envoy_cluster_filter or "",
+        )
+
+    sender_records: list[dict] = []
     start_ms, end_ms, guard = openloop.drive_cell_schedule(
         args.gateway_url, args.model, cell_id, segments,
+        records_out=sender_records,
         seed=args.schedule_seed,
         raw_path=raw_path, instant_path=instant_path,
         instant_sampler=sampler,
@@ -542,12 +565,16 @@ def run_schedule_cell(args, store, spec) -> tuple[list, "openloop.CellGuard"]:
         truncate_on_proxy_shed=args.truncate_on_proxy_shed,
         drain_start_s=drain_start_s,
         failures_path=failures_path,
+        overflow_sentinel=sentinel,
         guard_kwargs={
             "max_p99_delay_ms": args.max_p99_delay_ms,
             "max_p99_pool_wait_ms": args.max_p99_pool_wait_ms,
             "max_model_error_rate": args.max_model_error_rate,
             "min_slo_windows": args.min_slo_windows,
             "max_routing_imbalance": args.max_routing_imbalance,
+            "shed_policy": args.shed_policy,
+            "ttft_slo_ms": ttft_slo_ms,
+            "tpot_slo_ms": tpot_slo_ms,
         },
     )
 
@@ -561,7 +588,16 @@ def run_schedule_cell(args, store, spec) -> tuple[list, "openloop.CellGuard"]:
         window_row(cell, wm, result.TRS, result.Q_ctl)
         for wm, result in zip(windows, results)
     ]
-    rows, censored_windows = censor_after(rows, guard.truncated_at_ts_ms)
+    # A window holding a model error is a violation and is KEPT. Dropping it would remove
+    # exactly the overloaded windows and pull theta towards health.
+    rows = openloop.mark_model_error_windows(rows, sender_records)
+    if guard.shed_policy == openloop.SHED_POLICY_VOID and guard.voided:
+        # Nothing from a voided cell may reach the fit - not even the windows taken
+        # before the shed, which are precisely the healthy ones.
+        censored_windows = len(rows)
+        rows = []
+    else:
+        rows, censored_windows = censor_after(rows, guard.truncated_at_ts_ms)
     guard = guard.with_slo_windows(
         count_slo_windows(rows, ttft_slo_ms=ttft_slo_ms, tpot_slo_ms=tpot_slo_ms)
     )
@@ -588,6 +624,12 @@ def run_schedule_cell(args, store, spec) -> tuple[list, "openloop.CellGuard"]:
             json.dumps(artifact, indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )
     print(f"cell {cell_id} guard: {json.dumps(artifact, sort_keys=True)}")
+    if guard.voided:
+        print(
+            f"cell {cell_id} is VOID ({', '.join(guard.void_reasons)}): "
+            f"{censored_windows} window(s) discarded, nothing from this cell may be fitted; "
+            "re-run it"
+        )
     if guard.truncated:
         print(
             f"cell {cell_id} was TRUNCATED by a gateway shed at offset "
@@ -610,11 +652,17 @@ def _cell_id_from_schedule(path: Path, model: str, segments: list) -> str:
     run from the committed tree needs no extra flag. A mixture schedule (several token
     shapes) records i0_o0, which r3_capacity then correctly declines to fit.
     """
-    from scripts.gen_calibration_schedules import LOAD_CODE
+    from scripts.gen_calibration_schedules import HOLD_PRIMITIVE, LOAD_CODE
 
-    stem = path.stem  # <shape>_<primitive>
+    stem = path.stem  # <shape>_<primitive>, or <shape>_hold<load-code>
     primitive = stem.rsplit("_", 1)[-1]
-    if primitive not in LOAD_CODE:
+    if primitive in LOAD_CODE:
+        code = LOAD_CODE[primitive]
+    elif primitive.startswith(HOLD_PRIMITIVE) and primitive[len(HOLD_PRIMITIVE):].isdigit():
+        # A boundary-search hold cell carries its own rho in the file name, because its
+        # rho is decided at campaign time and there is no fixed code to look up.
+        code = int(primitive[len(HOLD_PRIMITIVE):])
+    else:
         raise SystemExit(
             f"cannot derive a cell id from {path.name!r}; pass --cell-id explicitly"
         )
@@ -623,7 +671,7 @@ def _cell_id_from_schedule(path: Path, model: str, segments: list) -> str:
         i, o = next(iter(shapes))
     else:
         i, o = 0, 0
-    return f"i{i or 0}_o{o or 0}_c{LOAD_CODE[primitive]}"
+    return f"i{i or 0}_o{o or 0}_c{code}"
 
 
 def main() -> int:
@@ -719,6 +767,21 @@ def main() -> int:
     ap.add_argument("--drain-start-s", type=float, default=None,
                     help="offset a truncated cell jumps to (default: the schedule's "
                          "drain_start_s from its generated INDEX.json)")
+    ap.add_argument("--shed-policy", default=openloop.DEFAULT_SHED_POLICY,
+                    choices=list(openloop.SHED_POLICIES),
+                    help="what a gateway shed does to the cell. truncate: keep the "
+                         "windows from before it (replay default). void: discard the "
+                         "whole cell - the only correct choice for a calibration cell, "
+                         "because the windows before a shed are exactly the healthy ones "
+                         "and keeping them biases theta towards health.")
+    ap.add_argument("--envoy-stats-url", default=None,
+                    help="Envoy admin /stats endpoint. When set, the cell records the "
+                         "change in upstream_rq_pending_overflow across it and is voided "
+                         "if it moved. Validity sentinel only: it never enters a fit or a "
+                         "control law.")
+    ap.add_argument("--envoy-cluster-filter", default=None,
+                    help="only count overflow counters whose stat name contains this "
+                         "(e.g. the model's cluster name)")
     ap.add_argument("--min-slo-windows", type=int, default=openloop.DEFAULT_MIN_SLO_WINDOWS,
                     help="windows above the SLO a truncated cell must already have "
                          "collected to still pass")
