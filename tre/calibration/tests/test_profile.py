@@ -60,6 +60,7 @@ def test_build_profile_patch_is_deterministic_and_publishable() -> None:
             "candidate_count": 5,
             "confidence": 1.0,
             "coverage_pass": True,
+            "direction": "higher_is_healthier",
             "family_counts": {"burst": 1, "steady": 2},
             "reject_reason": None,
             "support": 3,
@@ -114,6 +115,9 @@ def test_build_profile_patch_records_the_balanced_accuracy_method_and_its_knobs(
     assert patch["fit_config"]["trim_ramp_windows"] == 0
     assert patch["fit"]["healthy_quantile"] == 0.20
     assert patch["fit"]["recall_good"] == 0.80
+    # The orientation the threshold was fitted under is part of the rule, not a detail:
+    # the same theta means the opposite thing on a lower-is-healthier signal.
+    assert patch["fit"]["direction"] == "higher_is_healthier"
     assert patch["trs"]["theta_m"] == 306.0
     assert patch["inputs"] == {"csv_path": "/tmp/scan.csv", "csv_sha256": "deadbeef"}
 

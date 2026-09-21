@@ -16,14 +16,15 @@ from tre_calibration.fit import (
     DEFAULT_MIN_CRITICAL_RECALL,
     DEFAULT_MIN_HEALTHY_RECALL,
     DEFAULT_MIN_SURPLUS_PRECISION,
+    DEFAULT_SIGNAL_DIRECTION,
     FLOOR_MODES,
     DEFAULT_SURPLUS_LATENCY_QUANTILE,
     DEFAULT_SURPLUS_QUEUE_QUANTILE,
     DEFAULT_THETA_CRITERION,
+    SIGNAL_DIRECTIONS,
     THETA_CRITERIA,
     fit_delta_margins,
-    fit_theta_by_balanced_accuracy,
-    fit_theta_by_reliability,
+    fit_theta,
 )
 from tre_calibration.profile import build_profile_patch
 from tre_calibration.signals import ParameterCandidateScore
@@ -51,23 +52,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         trim_ramp_windows=args.trim_ramp_windows,
         lambda_wait=args.lambda_wait,
     )
-    if args.theta_criterion == "balanced_accuracy":
-        theta_fit = fit_theta_by_balanced_accuracy(
-            windows,
-            healthy_quantile_candidates=healthy_quantiles,
-            min_healthy_recall=args.min_healthy_recall,
-            min_scenario_families=args.min_scenario_families,
-            max_single_scenario_ratio=args.max_single_scenario_ratio,
-        )
-    else:
-        theta_fit = fit_theta_by_reliability(
-            windows,
-            reliability_target=args.reliability_target,
-            min_support=args.min_support,
-            min_confidence=args.min_confidence,
-            min_scenario_families=args.min_scenario_families,
-            max_single_scenario_ratio=args.max_single_scenario_ratio,
-        )
+    theta_fit = fit_theta(
+        windows,
+        criterion=args.theta_criterion,
+        direction=args.direction,
+        healthy_quantile_candidates=healthy_quantiles,
+        min_healthy_recall=args.min_healthy_recall,
+        reliability_target=args.reliability_target,
+        min_support=args.min_support,
+        min_confidence=args.min_confidence,
+        min_scenario_families=args.min_scenario_families,
+        max_single_scenario_ratio=args.max_single_scenario_ratio,
+    )
 
     delta_fit = None
     if args.fit_delta and theta_fit.theta is not None and theta_fit.theta > 0.0:
@@ -94,6 +90,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     fit_config = {
         "critical_violation_quantile": args.critical_violation_quantile,
+        "direction": args.direction,
         "fit_delta": bool(args.fit_delta),
         "healthy_quantile_candidates": list(healthy_quantiles),
         "latency_slo_ms": dict(sorted(latency_slo_ms.items())),
@@ -168,6 +165,16 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
             "balanced_accuracy: theta maximises balanced accuracy of 'signal >= theta => SLO met' "
             "over healthy-score quantiles (default). reliability: the cumulative-attainment "
             "containment rule, kept as a comparison baseline."
+        ),
+    )
+    parser.add_argument(
+        "--direction",
+        choices=list(SIGNAL_DIRECTIONS),
+        default=DEFAULT_SIGNAL_DIRECTION,
+        help=(
+            "orientation of --signal-column. TSS/TRS is higher_is_healthier (the "
+            "default); the pressure signals it is compared against in the ablation "
+            "(queue length, per-replica token rates) are lower_is_healthier"
         ),
     )
     parser.add_argument(

@@ -1,11 +1,18 @@
 #!/usr/bin/env python3
 """Fit model-specific alternative-signal thresholds from existing R3 window CSVs.
 
-Queue length uses the native lower-is-healthier branch in
-``fit_theta_by_reliability``. The reported theta therefore stays in raw queue units; no
-reciprocal transform is written into the registry. Decode/prefill TPS are completed-token
-rates, so across an R3 load scan they are pressure signals (lower is healthier), not
-load-independent service-capacity estimates. The first ramp window of every R3 cell is
+The signal ablation compares TSS against queue length and the per-replica completed-token
+rates. For that comparison to be about the signals, every arm has to be thresholded by
+the same criterion, so this driver goes through :func:`tre_calibration.fit.fit_theta` --
+the same entry point ``tre_calibration.cli`` uses for TSS -- and defaults to the same
+criterion (``balanced_accuracy``) and the same knobs. ``--theta-criterion`` can select
+the cumulative-attainment containment rule instead, but then it applies to whichever
+signal is being fitted, never to one side of a comparison only.
+
+Orientation is the one thing the alternative signals do not share with TSS: they are
+pressure signals (``lower_is_healthier``), recorded per signal in
+``tre_calibration.alt_signals``. Thresholds stay in raw signal units; no reciprocal
+transform is written into the registry. The first ramp window of every R3 cell is
 trimmed by default, matching the experiment scorer.
 """
 from __future__ import annotations
@@ -15,7 +22,6 @@ import csv
 import shlex
 import subprocess
 import sys
-from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
@@ -23,14 +29,28 @@ from xml.etree import ElementTree as ET
 
 import yaml
 
-from tre_calibration.dataset import CalibrationWindow, load_windows_from_csv
-from tre_calibration.fit import fit_theta_by_reliability
+from tre_calibration.alt_signals import (
+    alt_signal_column,
+    alt_signal_direction,
+    alt_signal_names,
+    fit_report,
+    per_replica_token_rate_transform,
+    threshold_curve,
+)
+from tre_calibration.dataset import load_windows_from_csv
+from tre_calibration.fit import (
+    DEFAULT_HEALTHY_QUANTILE_CANDIDATES,
+    DEFAULT_MIN_HEALTHY_RECALL,
+    DEFAULT_THETA_CRITERION,
+    THETA_CRITERIA,
+    fit_theta,
+)
 from tre_common.registry import load_registry
 
-_SIGNAL_CONFIG = {
-    "queue_len": ("queue_control", "lower_is_healthier"),
-    "decode_tps": (None, "lower_is_healthier"),
-    "prefill_tps": (None, "lower_is_healthier"),
+#: Curve column plotted for each criterion, with the reference level drawn across it.
+_PLOT_METRIC = {
+    "balanced_accuracy": ("balanced_accuracy", 0.5),
+    "reliability": ("attainment", 0.9),
 }
 
 
@@ -41,63 +61,6 @@ def parse_model_input(raw: str) -> tuple[str, Path]:
     return model.strip(), Path(path.strip())
 
 
-def reliability_curve(
-    windows: Sequence[CalibrationWindow],
-    *,
-    direction: str,
-) -> list[dict[str, Any]]:
-    lower = direction == "lower_is_healthier"
-    rows: list[dict[str, Any]] = []
-    for theta in sorted({window.signal for window in windows}):
-        subset = [
-            window
-            for window in windows
-            if (window.signal <= theta if lower else window.signal >= theta)
-        ]
-        families = Counter(window.scenario_family for window in subset)
-        rows.append(
-            {
-                "theta": theta,
-                "support": len(subset),
-                "attainment": (
-                    sum(1 for window in subset if window.slo_met) / len(subset)
-                    if subset
-                    else 0.0
-                ),
-                "healthy": sum(1 for window in subset if window.slo_met),
-                "violations": sum(1 for window in subset if not window.slo_met),
-                "scenario_families": len(families),
-                "max_family_ratio": (
-                    max(families.values()) / len(subset) if subset else 0.0
-                ),
-            }
-        )
-    return rows
-
-
-def tps_transform(signal: str):
-    token_column = (
-        "generation_tokens_total" if signal == "decode_tps" else "prompt_tokens_total"
-    )
-
-    def transform(row) -> float | None:
-        try:
-            token_total = float(row[token_column])
-            start_ms = float(row["window_start_ms"])
-            end_ms = float(row["window_end_ms"])
-            replicas = float(
-                row.get("assigned_replicas") or row.get("routable_pods") or 1.0
-            )
-        except (KeyError, TypeError, ValueError):
-            return None
-        duration_s = (end_ms - start_ms) / 1000.0
-        if token_total < 0.0 or duration_s <= 0.0 or replicas <= 0.0:
-            return None
-        return token_total / duration_s / replicas
-
-    return transform
-
-
 def fit_model(
     model_name: str,
     input_path: Path,
@@ -105,13 +68,17 @@ def fit_model(
     registry_path: str,
     signal: str,
     trim_ramp_windows: int,
-    reliability_target: float,
-    min_support: int,
-    min_confidence: float,
-    min_scenario_families: int,
-    max_single_scenario_ratio: float,
+    criterion: str = DEFAULT_THETA_CRITERION,
+    healthy_quantile_candidates: Sequence[float] = DEFAULT_HEALTHY_QUANTILE_CANDIDATES,
+    min_healthy_recall: float = DEFAULT_MIN_HEALTHY_RECALL,
+    reliability_target: float = 0.9,
+    min_support: int = 3,
+    min_confidence: float = 0.9,
+    min_scenario_families: int = 2,
+    max_single_scenario_ratio: float = 0.7,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    signal_column, direction = _SIGNAL_CONFIG[signal]
+    direction = alt_signal_direction(signal)
+    signal_column = alt_signal_column(signal)
     spec = load_registry(registry_path).model(model_name)
     windows = load_windows_from_csv(
         input_path,
@@ -121,36 +88,34 @@ def fit_model(
             "e2e_p95": spec.slo.e2e_p95_ms,
         },
         signal_column=signal_column or signal,
-        signal_transform=tps_transform(signal) if signal_column is None else None,
+        signal_transform=(
+            per_replica_token_rate_transform(signal) if signal_column is None else None
+        ),
         trim_ramp_windows=trim_ramp_windows,
     )
-    fit = fit_theta_by_reliability(
-        windows,
-        reliability_target=reliability_target,
-        min_support=min_support,
-        min_confidence=min_confidence,
-        min_scenario_families=min_scenario_families,
-        max_single_scenario_ratio=max_single_scenario_ratio,
-        direction=direction,
-    )
+    knobs: dict[str, Any] = {
+        "criterion": criterion,
+        "healthy_quantile_candidates": healthy_quantile_candidates,
+        "min_healthy_recall": min_healthy_recall,
+        "reliability_target": reliability_target,
+        "min_support": min_support,
+        "min_confidence": min_confidence,
+        "min_scenario_families": min_scenario_families,
+        "max_single_scenario_ratio": max_single_scenario_ratio,
+    }
+    fit = fit_theta(windows, direction=direction, **knobs)
+    # Same criterion, orientation flipped: a signal whose wrong-way fit also publishes
+    # has not demonstrated a direction, and the artifact has to say so.
     opposite_direction = (
         "higher_is_healthier"
         if direction == "lower_is_healthier"
         else "lower_is_healthier"
     )
-    opposite_fit = fit_theta_by_reliability(
-        windows,
-        reliability_target=reliability_target,
-        min_support=min_support,
-        min_confidence=min_confidence,
-        min_scenario_families=min_scenario_families,
-        max_single_scenario_ratio=max_single_scenario_ratio,
-        direction=opposite_direction,
-    )
+    opposite_fit = fit_theta(windows, direction=opposite_direction, **knobs)
     if not fit.publish or fit.theta is None:
         raise RuntimeError(
-            f"{model_name}/{signal} did not publish: {fit.reject_reason} "
-            f"(support={fit.support}, attainment={fit.attainment})"
+            f"{model_name}/{signal} did not publish under criterion={criterion}: "
+            f"{fit.reject_reason}"
         )
     payload = {
         "input_csv": str(input_path),
@@ -162,35 +127,28 @@ def fit_model(
                 "direction": direction,
             }
         },
-        "fit": {
-            "support": fit.support,
-            "attainment": fit.attainment,
-            "confidence": fit.confidence,
-            "coverage_pass": fit.coverage_pass,
-            "family_counts": fit.family_counts,
-            "candidate_count": fit.candidate_count,
-        },
+        "theta_criterion": criterion,
+        "fit": fit_report(fit, windows, direction=direction),
         "opposite_direction_diagnostic": {
             "direction": opposite_direction,
             "publish": opposite_fit.publish,
             "theta": opposite_fit.theta,
-            "support": opposite_fit.support,
-            "attainment": opposite_fit.attainment,
-            "coverage_pass": opposite_fit.coverage_pass,
-            "reject_reason": opposite_fit.reject_reason,
+            **fit_report(opposite_fit, windows, direction=opposite_direction),
         },
     }
-    return payload, reliability_curve(windows, direction=direction)
+    return payload, threshold_curve(windows, direction=direction)
 
 
-def write_reliability_svg(
+def write_threshold_svg(
     path: str | Path,
     curves: dict[str, list[dict[str, Any]]],
     selected_thetas: dict[str, float],
     *,
     signal: str,
     direction: str,
+    criterion: str,
 ) -> None:
+    metric, reference = _PLOT_METRIC[criterion]
     width, height = 900, 520
     left, right, top, bottom = 72, 24, 32, 64
     plot_width = width - left - right
@@ -210,16 +168,16 @@ def write_reliability_svg(
             "xmlns": "http://www.w3.org/2000/svg",
             "viewBox": f"0 0 {width} {height}",
             "role": "img",
-            "aria-label": f"{signal} threshold reliability curves",
+            "aria-label": f"{signal} threshold {metric} curves",
         },
     )
     ET.SubElement(svg, "rect", {"width": str(width), "height": str(height), "fill": "white"})
     ET.SubElement(
         svg,
         "line",
-        {"x1": str(left), "y1": str(y(0.9)), "x2": str(width - right), "y2": str(y(0.9)), "stroke": "#777", "stroke-dasharray": "6 5"},
+        {"x1": str(left), "y1": str(y(reference)), "x2": str(width - right), "y2": str(y(reference)), "stroke": "#777", "stroke-dasharray": "6 5"},
     )
-    for tick in (0.0, 0.5, 0.9, 1.0):
+    for tick in sorted({0.0, 0.5, reference, 1.0}):
         ET.SubElement(
             svg,
             "text",
@@ -237,24 +195,23 @@ def write_reliability_svg(
 
     for index, (model, rows) in enumerate(sorted(curves.items())):
         color = colors[index % len(colors)]
-        points = " ".join(f"{x(row['theta']):.2f},{y(row['attainment']):.2f}" for row in rows)
+        points = " ".join(f"{x(row['theta']):.2f},{y(row[metric]):.2f}" for row in rows)
         ET.SubElement(svg, "polyline", {"points": points, "fill": "none", "stroke": color, "stroke-width": "2"})
         selected = selected_thetas[model]
         selected_row = min(rows, key=lambda row: abs(row["theta"] - selected))
         ET.SubElement(
             svg,
             "circle",
-            {"cx": f"{x(selected):.2f}", "cy": f"{y(selected_row['attainment']):.2f}", "r": "5", "fill": color, "stroke": "white", "stroke-width": "1.5"},
+            {"cx": f"{x(selected):.2f}", "cy": f"{y(selected_row[metric]):.2f}", "r": "5", "fill": color, "stroke": "white", "stroke-width": "1.5"},
         )
         legend_y = top + 18 * index
         ET.SubElement(svg, "line", {"x1": str(width - 260), "y1": str(legend_y), "x2": str(width - 230), "y2": str(legend_y), "stroke": color, "stroke-width": "3"})
         ET.SubElement(svg, "text", {"x": str(width - 220), "y": str(legend_y + 5), "font-size": "13", "fill": "#222"}).text = f"{model} theta={selected:.2f}"
 
     ET.SubElement(svg, "text", {"x": str(width / 2), "y": str(height - 12), "text-anchor": "middle", "font-size": "15", "fill": "#111"}).text = f"{signal} theta (raw per-replica units)"
+    healthy_side = "<= theta" if direction == "lower_is_healthier" else ">= theta"
     ET.SubElement(svg, "text", {"x": "18", "y": str(height / 2), "text-anchor": "middle", "font-size": "15", "fill": "#111", "transform": f"rotate(-90 18 {height / 2})"}).text = (
-        "healthy attainment for value <= theta"
-        if direction == "lower_is_healthier"
-        else "healthy attainment for value >= theta"
+        f"{metric} of 'value {healthy_side} => SLO met'"
     )
     output = Path(path)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -275,11 +232,32 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-input", action="append", type=parse_model_input, required=True)
     parser.add_argument("--registry", required=True)
-    parser.add_argument("--signal", choices=sorted(_SIGNAL_CONFIG), default="queue_len")
+    parser.add_argument("--signal", choices=alt_signal_names(), default="queue_len")
     parser.add_argument("--output", required=True)
     parser.add_argument("--curve-dir")
     parser.add_argument("--plot-output")
     parser.add_argument("--trim-ramp-windows", type=int, default=1)
+    parser.add_argument(
+        "--theta-criterion",
+        choices=THETA_CRITERIA,
+        default=DEFAULT_THETA_CRITERION,
+        help=(
+            "same knob, same default as tre_calibration.cli: balanced_accuracy maximises "
+            "balanced accuracy of 'healthy side of theta => SLO met' over healthy-score "
+            "quantiles; reliability is the cumulative-attainment containment rule"
+        ),
+    )
+    parser.add_argument(
+        "--min-healthy-recall",
+        type=float,
+        default=DEFAULT_MIN_HEALTHY_RECALL,
+        help="floor on recall of healthy windows for the balanced-accuracy criterion",
+    )
+    parser.add_argument(
+        "--healthy-quantiles",
+        default="",
+        help="comma-separated healthy-score quantiles to search (default 0.05..0.50 step 0.05)",
+    )
     parser.add_argument("--reliability-target", type=float, default=0.9)
     parser.add_argument("--min-support", type=int, default=3)
     parser.add_argument("--min-confidence", type=float, default=0.9)
@@ -291,6 +269,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     if len({model for model, _path in args.model_input}) != len(args.model_input):
         parser.error("each model may appear only once")
 
+    healthy_quantiles = (
+        tuple(float(part) for part in args.healthy_quantiles.split(","))
+        if args.healthy_quantiles
+        else DEFAULT_HEALTHY_QUANTILE_CANDIDATES
+    )
+
     models: dict[str, Any] = {}
     curves: dict[str, list[dict[str, Any]]] = {}
     for model, input_path in sorted(args.model_input):
@@ -300,6 +284,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             registry_path=args.registry,
             signal=args.signal,
             trim_ramp_windows=args.trim_ramp_windows,
+            criterion=args.theta_criterion,
+            healthy_quantile_candidates=healthy_quantiles,
+            min_healthy_recall=args.min_healthy_recall,
             reliability_target=args.reliability_target,
             min_support=args.min_support,
             min_confidence=args.min_confidence,
@@ -318,8 +305,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         "git_sha": _git_sha(),
         "command": shlex.join([sys.argv[0], *(argv if argv is not None else sys.argv[1:])]),
         "signal": args.signal,
+        "direction": alt_signal_direction(args.signal),
+        "theta_criterion": args.theta_criterion,
         "trim_ramp_windows": args.trim_ramp_windows,
         "fit_config": {
+            "healthy_quantile_candidates": list(healthy_quantiles),
+            "min_healthy_recall": args.min_healthy_recall,
             "reliability_target": args.reliability_target,
             "min_support": args.min_support,
             "min_confidence": args.min_confidence,
@@ -346,7 +337,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 writer.writerows(rows)
 
     if args.plot_output:
-        write_reliability_svg(
+        write_threshold_svg(
             args.plot_output,
             curves,
             {
@@ -354,14 +345,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 for model, payload in models.items()
             },
             signal=args.signal,
-            direction=_SIGNAL_CONFIG[args.signal][1],
+            direction=alt_signal_direction(args.signal),
+            criterion=args.theta_criterion,
         )
 
     for model, payload in models.items():
         threshold = payload["alt_thresholds"][args.signal]
         print(
             f"{model}: theta={threshold['theta']:.6f} "
-            f"direction={threshold['direction']} windows={payload['window_count']}"
+            f"direction={threshold['direction']} criterion={args.theta_criterion} "
+            f"windows={payload['window_count']}"
         )
     return 0
 

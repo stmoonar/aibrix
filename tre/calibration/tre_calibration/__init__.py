@@ -3,8 +3,19 @@
 from tre_calibration.capacity import CapacityPoint, CapacitySample, CapacitySurface, fit_capacity_surface
 from tre_calibration.dataset import CalibrationWindow, load_windows_from_csv, split_by_scenario
 from tre_calibration.evaluate import SignalDirectionEvaluation, ThresholdEvaluation, evaluate_signal_direction, evaluate_threshold
+from tre_calibration.alt_signals import (
+    ALT_SIGNALS,
+    alt_signal_column,
+    alt_signal_direction,
+    alt_signal_names,
+    fit_report,
+    per_replica_token_rate_transform,
+    threshold_curve,
+)
 from tre_calibration.fit import (
+    DEFAULT_SIGNAL_DIRECTION,
     DELTA_METHOD,
+    SIGNAL_DIRECTIONS,
     THETA_CRITERIA,
     THETA_METHOD_BALANCED_ACCURACY,
     THETA_METHOD_RELIABILITY,
@@ -15,15 +26,20 @@ from tre_calibration.fit import (
     FittedTheta,
     ReliabilityThetaFit,
     fit_delta_margins,
+    fit_theta,
     fit_theta_by_balanced_accuracy,
     fit_theta_by_reliability,
     fit_theta_from_health,
+    threshold_balanced_accuracy,
 )
 from tre_calibration.profile import build_profile_patch, theta_method_of
 from tre_calibration.signals import ParameterCandidateScore, ParameterSearchResult, SignalInputs, TrsBreakdown, compute_trs, grid_search_parameters, score_parameter_candidate
 
 __all__ = [
+    "ALT_SIGNALS",
     "BalancedAccuracyThetaFit",
+    "DEFAULT_SIGNAL_DIRECTION",
+    "SIGNAL_DIRECTIONS",
     "CalibrationWindow",
     "DELTA_METHOD",
     "DeltaLabelSummary",
@@ -46,15 +62,23 @@ __all__ = [
     "build_profile_patch",
     "compute_trs",
     "evaluate_signal_direction",
+    "alt_signal_column",
+    "alt_signal_direction",
+    "alt_signal_names",
     "evaluate_threshold",
     "fit_capacity_surface",
     "fit_delta_margins",
+    "fit_report",
+    "fit_theta",
     "fit_theta_by_balanced_accuracy",
     "fit_theta_by_reliability",
     "fit_theta_from_health",
     "grid_search_parameters",
     "load_windows_from_csv",
+    "per_replica_token_rate_transform",
     "score_parameter_candidate",
     "split_by_scenario",
     "theta_method_of",
+    "threshold_balanced_accuracy",
+    "threshold_curve",
 ]

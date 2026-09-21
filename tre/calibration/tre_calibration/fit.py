@@ -7,6 +7,26 @@ from typing import Iterable, Sequence
 
 from tre_calibration.dataset import CalibrationWindow
 
+#: Signal orientations understood by every theta fit in this module.
+#:
+#: ``higher_is_healthier`` is the TSS/TRS convention: a large score means headroom.
+#: ``lower_is_healthier`` is the convention of the pressure signals TSS is compared
+#: against in the signal ablation -- queue length and the per-replica token rates --
+#: where a large value means the replica is saturated. Every fit takes the orientation
+#: as an explicit argument, so a signal comparison can never come out of two different
+#: criteria merely because one of them could not express the direction.
+SIGNAL_DIRECTIONS = ("higher_is_healthier", "lower_is_healthier")
+
+#: Orientation assumed when a caller does not name one (the TSS/TRS convention).
+DEFAULT_SIGNAL_DIRECTION = "higher_is_healthier"
+
+
+def _orientation(direction: str) -> float:
+    """``+1`` / ``-1`` multiplier that turns ``direction`` into "larger is healthier"."""
+    if direction not in SIGNAL_DIRECTIONS:
+        raise ValueError(f"direction must be one of {SIGNAL_DIRECTIONS}")
+    return -1.0 if direction == "lower_is_healthier" else 1.0
+
 
 @dataclass(frozen=True)
 class FittedTheta:
@@ -28,6 +48,10 @@ class ReliabilityThetaFit:
     family_counts: dict[str, int]
     reject_reason: str | None
     candidate_count: int
+    #: Which orientation the fit ran under. Recorded for the same reason as on
+    #: :class:`BalancedAccuracyThetaFit`: a published threshold without its orientation
+    #: is not a rule, and the ablation compares signals of both orientations.
+    direction: str = DEFAULT_SIGNAL_DIRECTION
 
 
 def fit_theta_from_health(
@@ -65,10 +89,10 @@ def fit_theta_by_reliability(
     min_confidence: float,
     min_scenario_families: int,
     max_single_scenario_ratio: float,
-    direction: str = "higher_is_healthier",
+    direction: str = DEFAULT_SIGNAL_DIRECTION,
 ) -> ReliabilityThetaFit:
-    if direction not in {"higher_is_healthier", "lower_is_healthier"}:
-        raise ValueError("direction must be higher_is_healthier or lower_is_healthier")
+    if direction not in SIGNAL_DIRECTIONS:
+        raise ValueError(f"direction must be one of {SIGNAL_DIRECTIONS}")
     rows = [row for row in windows if math.isfinite(row.signal)]
     candidates = sorted(
         {row.signal for row in rows},
@@ -122,6 +146,7 @@ def fit_theta_by_reliability(
         family_counts=family_counts,
         reject_reason=reject_reason,
         candidate_count=len(candidates),
+        direction=direction,
     )
 
 
@@ -150,6 +175,12 @@ def _coverage_stats(
 # the rule "signal >= theta ==> SLO met". On the R3 load scans the containment rule
 # puts theta far below the empirical healthy/violating boundary (local attainment at
 # theta is 0.09-0.23), while the balanced-accuracy criterion lands on it.
+#
+# Both criteria accept both entries of `SIGNAL_DIRECTIONS`, and `fit_theta` dispatches
+# between them, so the main signal and the alternative signals it is compared against in
+# the ablation go through one criterion under one set of defaults. Fitting TSS by one
+# criterion and queue_len by another would make the ablation measure the criteria
+# rather than the signals.
 # ---------------------------------------------------------------------------
 
 #: Identifier written into calibration artifacts for the balanced-accuracy theta fit.
@@ -242,6 +273,10 @@ class BalancedAccuracyThetaFit:
     family_counts: dict[str, int]
     coverage_pass: bool
     reject_reason: str | None
+    #: Which orientation the fit ran under. ``healthy_quantile`` is always measured from
+    #: the *unhealthy* end of the healthy windows, so the same quantile means the same
+    #: thing under either orientation.
+    direction: str = DEFAULT_SIGNAL_DIRECTION
 
 
 @dataclass(frozen=True)
@@ -296,18 +331,29 @@ def fit_theta_by_balanced_accuracy(
     min_healthy_recall: float = DEFAULT_MIN_HEALTHY_RECALL,
     min_scenario_families: int = 2,
     max_single_scenario_ratio: float = 0.7,
+    direction: str = DEFAULT_SIGNAL_DIRECTION,
 ) -> BalancedAccuracyThetaFit:
-    """Pick ``theta`` maximising balanced accuracy of ``signal >= theta ==> slo_met``.
+    """Pick ``theta`` maximising balanced accuracy of "healthy side of theta => slo_met".
 
-    Candidates are quantiles of the *healthy* windows' signal distribution, which keeps
-    the search on the scale the data actually occupies. Ties break on specificity first,
-    then on the larger theta. ``min_healthy_recall`` is a hard filter applied before the
-    balanced-accuracy comparison: candidates meeting it always beat candidates that do
-    not. See :data:`DEFAULT_MIN_HEALTHY_RECALL` for why it defaults to off.
+    Under ``higher_is_healthier`` the rule scored is ``signal >= theta ==> slo_met``;
+    under ``lower_is_healthier`` it is ``signal <= theta ==> slo_met``. The two are the
+    same problem on a reflected axis, so the search runs on ``orientation * signal`` and
+    the winning threshold is reflected back into raw signal units before it is returned.
+    Criterion, candidate set, tie-breaks and acceptance gates are therefore identical for
+    both orientations by construction rather than by a parallel code path.
+
+    Candidates are quantiles of the *healthy* windows' signal distribution measured from
+    the unhealthy end, which keeps the search on the scale the data actually occupies.
+    Ties break on specificity first, then on the threshold that admits fewer windows as
+    healthy. ``min_healthy_recall`` is a hard filter applied before the balanced-accuracy
+    comparison: candidates meeting it always beat candidates that do not. See
+    :data:`DEFAULT_MIN_HEALTHY_RECALL` for why it defaults to off.
     """
+    orientation = _orientation(direction)
     rows = [row for row in windows if math.isfinite(row.signal)]
     labels = [1 if row.slo_met else 0 for row in rows]
-    scores = [row.signal for row in rows]
+    # Oriented scores: "larger is healthier" holds for both orientations from here on.
+    scores = [orientation * row.signal for row in rows]
     healthy_scores = [score for score, label in zip(scores, labels) if label == 1]
     violating_count = sum(1 for label in labels if label == 0)
 
@@ -361,10 +407,12 @@ def fit_theta_by_balanced_accuracy(
             family_counts={},
             coverage_pass=False,
             reject_reason=reject_reason,
+            direction=direction,
         )
 
-    theta = float(best["theta"])
-    selected = [row for row in rows if row.signal >= theta]
+    oriented_theta = float(best["theta"])
+    theta = orientation * oriented_theta
+    selected = [row for row in rows if orientation * row.signal >= oriented_theta]
     coverage_pass, family_counts = _coverage_stats(
         selected,
         min_scenario_families=min_scenario_families,
@@ -391,6 +439,69 @@ def fit_theta_by_balanced_accuracy(
         family_counts=family_counts,
         coverage_pass=coverage_pass,
         reject_reason=reject_reason,
+        direction=direction,
+    )
+
+
+def threshold_balanced_accuracy(
+    windows: Iterable[CalibrationWindow],
+    *,
+    theta: float,
+    direction: str = DEFAULT_SIGNAL_DIRECTION,
+) -> dict[str, float]:
+    """Confusion metrics of "healthy side of ``theta`` ==> SLO met" on ``windows``.
+
+    Exactly the scoring :func:`fit_theta_by_balanced_accuracy` optimises, exposed so that
+    a diagnostic curve or a cross-criterion comparison cannot drift from the criterion
+    that picked the threshold. ``direction`` selects which side of ``theta`` counts as
+    the healthy prediction.
+    """
+    orientation = _orientation(direction)
+    rows = [row for row in windows if math.isfinite(row.signal)]
+    scores = [orientation * row.signal for row in rows]
+    labels = [1 if row.slo_met else 0 for row in rows]
+    return _balanced_accuracy_at(scores, labels, orientation * theta)
+
+
+def fit_theta(
+    windows: Iterable[CalibrationWindow],
+    *,
+    criterion: str = DEFAULT_THETA_CRITERION,
+    direction: str = DEFAULT_SIGNAL_DIRECTION,
+    healthy_quantile_candidates: Sequence[float] = DEFAULT_HEALTHY_QUANTILE_CANDIDATES,
+    min_healthy_recall: float = DEFAULT_MIN_HEALTHY_RECALL,
+    reliability_target: float = 0.9,
+    min_support: int = 3,
+    min_confidence: float = 0.9,
+    min_scenario_families: int = 2,
+    max_single_scenario_ratio: float = 0.7,
+) -> ReliabilityThetaFit | BalancedAccuracyThetaFit:
+    """Fit ``theta`` under the named criterion -- the entry point every fit goes through.
+
+    Having a single dispatcher is the point. The signal ablation compares TSS against
+    queue length and the per-replica token rates, and that comparison is only about the
+    signals if every arm went through the same criterion with the same defaults. Callers
+    name the criterion and the orientation; they do not pick a fit function.
+    """
+    if criterion not in THETA_CRITERIA:
+        raise ValueError(f"criterion must be one of {THETA_CRITERIA}")
+    if criterion == "balanced_accuracy":
+        return fit_theta_by_balanced_accuracy(
+            windows,
+            healthy_quantile_candidates=healthy_quantile_candidates,
+            min_healthy_recall=min_healthy_recall,
+            min_scenario_families=min_scenario_families,
+            max_single_scenario_ratio=max_single_scenario_ratio,
+            direction=direction,
+        )
+    return fit_theta_by_reliability(
+        windows,
+        reliability_target=reliability_target,
+        min_support=min_support,
+        min_confidence=min_confidence,
+        min_scenario_families=min_scenario_families,
+        max_single_scenario_ratio=max_single_scenario_ratio,
+        direction=direction,
     )
 
 
