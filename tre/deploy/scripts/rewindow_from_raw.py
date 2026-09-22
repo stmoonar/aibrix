@@ -377,17 +377,38 @@ def _guarded_p95(samples: list[float], mode: str, min_latency_samples: int) -> O
     return sample_percentile(samples, 0.95, mode)
 
 
-def enumerate_windows(start_ms: int, end_ms: int, window_ms: int, step_ms: int) -> list[tuple[int, int]]:
+def enumerate_windows(
+    start_ms: int, end_ms: int, window_ms: int, step_ms: int, *, align_ms: Optional[int] = None
+) -> list[tuple[int, int]]:
     """Windows [w, w+window_ms) advancing by step_ms (step_ms==window_ms -> tumbling).
-    Mirrors the online driver's ``while w + window_ms <= end`` bound."""
+    Mirrors the online driver's ``while w + window_ms <= end`` bound.
+
+    ``align_ms`` (window-align ``grid``, plan §6.9g pitfall 2) puts every window end on
+    the ``align_ms`` grid - the gateway's instant-sample boundaries, where the
+    phase-aligned controller ends its windows - starting from the first grid point at or
+    before ``start_ms``; ``step_ms`` must then be a multiple of ``align_ms``."""
     if window_ms <= 0 or step_ms <= 0:
         raise ValueError("window_ms and step_ms must be positive")
+    if align_ms is not None:
+        if align_ms <= 0:
+            raise ValueError("align_ms must be positive")
+        if step_ms % align_ms:
+            raise ValueError(f"step_ms={step_ms} must be a multiple of align_ms={align_ms} for grid-aligned windows")
+        start_ms = start_ms // align_ms * align_ms
     windows: list[tuple[int, int]] = []
     w = start_ms
     while w + window_ms <= end_ms:
         windows.append((w, w + window_ms))
         w += step_ms
     return windows
+
+
+#: ``--window-align`` choices: ``none`` keeps the legacy free-phase windows (first window
+#: at the first stamp of the capture, any step); ``grid`` ends every window on the
+#: ``SCRAPE_INTERVAL_MS`` grid like the phase-aligned controller.
+WINDOW_ALIGN_NONE = "none"
+WINDOW_ALIGN_GRID = "grid"
+WINDOW_ALIGN_CHOICES = (WINDOW_ALIGN_NONE, WINDOW_ALIGN_GRID)
 
 
 def aggregate_window(
@@ -402,13 +423,29 @@ def aggregate_window(
     instant_sample_interval_ms: int,
     routable_pods: int = 1,
     assigned_replicas: int = 1,
+    half_open_start: bool = False,
+    instant_tick_ms: Optional[int] = None,
 ) -> ModelWindowMetrics:
     """Aggregate raw per-request + instant records into one ModelWindowMetrics, using the
-    same 口径 as MetricsStore._aggregate_model (see module docstring)."""
-    in_window = [
-        r for r in records
-        if r.get("done_ts_ms") is not None and window_start_ms <= r["done_ts_ms"] < window_end_ms
-    ]
+    same 口径 as MetricsStore._aggregate_model (see module docstring).
+
+    ``half_open_start`` (grid-aligned windows) mirrors the phase-aligned controller's
+    ``(start, end]`` read: completions with ``start < done <= end`` and instants on
+    ``(start, end]`` - exactly ``window_ms / interval`` of them. ``instant_tick_ms`` (live
+    grid) stamps each live-grid sidecar sample with the gateway tick it stands for,
+    ``floor(ts / tick) * tick`` (``openloop.mark_live_grid`` keeps the first 1 Hz sample of
+    each tick bucket, taken 0-1 s after the boundary the gateway stamps it with).
+    """
+    if half_open_start:
+        in_window = [
+            r for r in records
+            if r.get("done_ts_ms") is not None and window_start_ms < r["done_ts_ms"] <= window_end_ms
+        ]
+    else:
+        in_window = [
+            r for r in records
+            if r.get("done_ts_ms") is not None and window_start_ms <= r["done_ts_ms"] < window_end_ms
+        ]
     prompt_tokens = sum(r["input_tokens"] for r in in_window if r.get("input_tokens") is not None)
     generation_tokens = sum(r["output_tokens"] for r in in_window if r.get("output_tokens") is not None)
 
@@ -418,10 +455,20 @@ def aggregate_window(
 
     # queue: instant samples are inclusive [start, end] and divided by expected_samples,
     # exactly as MetricsStore._instant_avg does.
-    inst = [
-        s for s in instant_samples
-        if s.get("ts_ms") is not None and window_start_ms <= s["ts_ms"] <= window_end_ms
-    ]
+    def _stamp(sample: dict) -> int:
+        ts = int(sample["ts_ms"])
+        return ts // instant_tick_ms * instant_tick_ms if instant_tick_ms else ts
+
+    if half_open_start:
+        inst = [
+            s for s in instant_samples
+            if s.get("ts_ms") is not None and window_start_ms < _stamp(s) <= window_end_ms
+        ]
+    else:
+        inst = [
+            s for s in instant_samples
+            if s.get("ts_ms") is not None and window_start_ms <= _stamp(s) <= window_end_ms
+        ]
     expected_samples = max(1, int((window_end_ms - window_start_ms) / instant_sample_interval_ms))
     avg_waiting = sum(float(s.get("waiting", 0.0)) for s in inst) / expected_samples
     avg_running = sum(float(s.get("running", 0.0)) for s in inst) / expected_samples
@@ -473,9 +520,15 @@ def rewindow_cell(
     end_ms: Optional[int] = None,
     routable_pods: int = 1,
     assigned_replicas: int = 1,
+    window_align: str = WINDOW_ALIGN_NONE,
 ) -> list[dict]:
     """Re-window one cell's raw into calibration CSV rows (reusing r3_grid.window_row +
     compute_window_results for the trs column).
+
+    ``window_align="grid"`` ends every window on the ``SCRAPE_INTERVAL_MS`` grid and reads
+    it half-open ``(start, end]`` (instants stamped with their gateway tick on the live
+    grid), i.e. the window the phase-aligned controller reads; ``"none"`` is the legacy
+    free-phase windowing, kept for the 5 s / unaligned fits.
 
     ``failures`` are the cell's ``.failures.jsonl`` rows. They go through
     ``openloop.mark_unserved_request_windows`` exactly as the online path's sender records
@@ -490,13 +543,18 @@ def rewindow_cell(
         source=cell.scenario_id,
     )
     instant_samples = select_instant_samples(instant_samples, instant_grid)
+    if window_align not in WINDOW_ALIGN_CHOICES:
+        raise ValueError(f"unknown window_align {window_align!r}; expected one of {WINDOW_ALIGN_CHOICES}")
+    aligned = window_align == WINDOW_ALIGN_GRID
     if start_ms is None or end_ms is None:
         span = _time_span(records, instant_samples)
         if span is None:
             return []
         start_ms = span[0] if start_ms is None else start_ms
         end_ms = span[1] if end_ms is None else end_ms
-    windows_ms = enumerate_windows(start_ms, end_ms, window_ms, step_ms)
+    windows_ms = enumerate_windows(
+        start_ms, end_ms, window_ms, step_ms, align_ms=SCRAPE_INTERVAL_MS if aligned else None
+    )
     metrics = [
         aggregate_window(
             records, instant_samples, spec.name, ws, we,
@@ -504,6 +562,8 @@ def rewindow_cell(
             min_latency_samples=min_latency_samples,
             instant_sample_interval_ms=instant_sample_interval_ms,
             routable_pods=routable_pods, assigned_replicas=assigned_replicas,
+            half_open_start=aligned,
+            instant_tick_ms=SCRAPE_INTERVAL_MS if aligned and instant_grid == INSTANT_GRID_LIVE else None,
         )
         for ws, we in windows_ms
     ]
@@ -625,6 +685,14 @@ def main() -> int:
     ap.add_argument("--output", required=True, help="re-windowed CSV path")
     ap.add_argument("--window-ms", type=int, required=True)
     ap.add_argument("--step-ms", type=int, default=None, help="slide step; default = window-ms (tumbling)")
+    ap.add_argument(
+        "--window-align", default=WINDOW_ALIGN_NONE, choices=list(WINDOW_ALIGN_CHOICES),
+        help=(
+            f"grid: window ends on the {SCRAPE_INTERVAL_MS} ms gateway grid, read (start, end] - "
+            "the phase-aligned controller's window (use with --step-ms 10000; the calibration "
+            "fit plan does). none: legacy free-phase windows (e.g. the old 5 s step)."
+        ),
+    )
     ap.add_argument("--percentile-mode", default="bucket_upper", choices=["bucket_upper", "interpolated"])
     ap.add_argument("--min-latency-samples", type=int, default=10)
     # The divisor for the queue average. It MUST equal the spacing of the samples actually
@@ -704,6 +772,7 @@ def main() -> int:
             instant_sample_interval_ms=args.instant_sample_ms,
             instant_grid=args.instant_grid,
             routable_pods=args.routable_pods, assigned_replicas=args.assigned_replicas,
+            window_align=args.window_align,
         )
         rows.extend(cell_rows)
         cells.append(cell_id)
@@ -742,6 +811,7 @@ def main() -> int:
     )
     # What was actually selected on disk, so a family CSV's membership is auditable.
     meta["only_shapes"] = sorted(args.only_shape or [])
+    meta["window_align"] = args.window_align
     meta["cell_dirs"] = cell_dirs
     meta_path = write_meta(out, meta)
     print(f"wrote cadence metadata to {meta_path}")

@@ -930,6 +930,7 @@ def fit_plan(
         "generated_at_utc": utc_iso(),
         "window_ms": args.window_ms,
         "step_ms": args.fit_step_ms,
+        "window_align": getattr(args, "fit_window_align", "grid"),
         "held_out_shapes": [s for s in gen.ALL_SHAPES if gen.is_held_out(s)],
         "held_out_cell_ids": held_out_cells,
         "training_shapes": list(gen.training_shapes(static_grid=use_static)),
@@ -995,9 +996,14 @@ def fit_plan(
         exclusions += ["--exclude-cell-id", cell_id]
     slo = ["--ttft-p95-ms", str(args.ttft_slo_ms), "--tpot-p95-ms", str(args.tpot_slo_ms)]
     registry = _load_registry(getattr(args, "registry", None))
+    # Plan ��6.9g pitfall 2 / D8: by default every fitting window ends on the gateway's
+    # 10 s grid with a 10 s step, the window the phase-aligned controller reads.
+    # --fit-window-align none (+ --fit-step-ms 5000) reproduces the legacy windowing.
+    window_align = getattr(args, "fit_window_align", "grid")
+    align = ["--window-align", window_align]
     live = [
         "--window-ms", str(args.window_ms), "--step-ms", str(args.fit_step_ms),
-        "--instant-grid", "live", "--instant-sample-ms", str(LIVE_GRID_MS),
+        "--instant-grid", "live", "--instant-sample-ms", str(LIVE_GRID_MS), *align,
     ]
     fitting_by_model: dict[str, Path] = {}
     for model in models:
@@ -1026,7 +1032,7 @@ def fit_plan(
                 *rewindow_head, "--output", str(aliasing_csv),
                 "--window-ms", str(args.window_ms), "--step-ms", str(args.fit_step_ms),
                 "--instant-grid", "raw",
-                "--instant-sample-ms", str(args.instant_sample_ms),
+                "--instant-sample-ms", str(args.instant_sample_ms), *align,
                 *exclusions,
             ],
         })
@@ -1586,8 +1592,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     help="admission policy to plan against (default: the one the schedule "
                          "index was generated for)")
     ap.add_argument("--window-ms", type=int, default=30000)
-    ap.add_argument("--fit-step-ms", type=int, default=5000,
-                    help="slide step for the fitting re-window (the live refresh cadence)")
+    ap.add_argument("--fit-step-ms", type=int, default=10000,
+                    help="slide step for the fitting re-window (the live decision cadence: "
+                         "10 s with the phase-aligned sampler; a multiple of 10 s under "
+                         "--fit-window-align grid)")
+    ap.add_argument("--fit-window-align", default="grid", choices=["grid", "none"],
+                    help="grid (default): fitting windows end on the gateway's 10 s grid "
+                         "(rewindow_from_raw --window-align grid); none: legacy free-phase "
+                         "windows, e.g. with --fit-step-ms 5000")
     ap.add_argument("--instant-sample-ms", type=int, default=1000)
     ap.add_argument("--cooldown-s", type=float, default=DEFAULT_COOLDOWN_S)
     ap.add_argument("--step-transient-s", type=float, default=DEFAULT_STEP_TRANSIENT_S)
@@ -1656,6 +1668,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         ap.error(
             f"--cooldown-s ({args.cooldown_s:g}) must be >= the metrics window "
             f"(--window-ms {args.window_ms} = {args.window_ms / 1000.0:g} s)"
+        )
+    if args.fit_window_align == "grid" and args.fit_step_ms % LIVE_GRID_MS:
+        ap.error(
+            f"--fit-window-align grid needs --fit-step-ms to be a multiple of {LIVE_GRID_MS} "
+            f"(got {args.fit_step_ms}); use --fit-window-align none for a free-phase step"
         )
     return run_campaign(args)
 
