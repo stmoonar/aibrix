@@ -1,6 +1,18 @@
 #!/usr/bin/env python3
 """Runner for the open-loop calibration campaign.
 
+Two designs
+-----------
+``--design ladder`` (the default) is the preregistered second round
+(``docs/preregistration-20260923-calibration-run2.md``): prior-guided boundary search of
+every shape, an interleaved randomised hold ladder, ramps, supplementary cells and
+sentinels, with every cell independently seeded and the engine drained between cells.
+It lives in :mod:`scripts.calibration_ladder` / :mod:`scripts.calibration_design` and
+refuses to start without ``--rho-priors`` and ``--regime-groups``.
+
+``--design primitives`` is the first round's design, kept so that run can be reproduced;
+the rest of this docstring describes it.
+
 Per (model, shape), in order: **steps**, then an **adaptive boundary search**, then
 **ramp**, then **bursts**.
 
@@ -1507,8 +1519,30 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--model-namespace", default="default")
     ap.add_argument("--controller-namespace", default="tre-v2")
     ap.add_argument("--dry-run", action="store_true",
-                    help="write plan.json and fit_plan.json, drive nothing")
+                    help="write plan.json (and, for the primitives design, fit_plan.json), "
+                         "print the time estimate, drive nothing")
+    ap.add_argument("--design", choices=["ladder", "primitives"], default="ladder",
+                    help="ladder: the preregistered second round (scripts.calibration_ladder). "
+                         "primitives: the first round's steps / boundary / ramp / bursts")
+    ap.add_argument("--rho-priors", type=Path, default=None,
+                    help="ladder design: rho_priors.json - per (model, shape) the first "
+                         "round's client-side boundary, C_s and, where it never violated, the "
+                         "widened search range. Required; checked before anything runs")
+    ap.add_argument("--regime-groups", type=Path, default=None,
+                    help="ladder design: regime_groups.json - the 7 training shapes in 3 "
+                         "regime groups (LORO units). Required; checked before anything runs")
+    ap.add_argument("--design-seed", type=int, default=20260923,
+                    help="ladder design: seed of every order and every per-cell seed; "
+                         "recorded in the run manifest")
+    ap.add_argument("--preregistration", type=Path,
+                    default=here / "docs" / "preregistration-20260923-calibration-run2.md",
+                    help="ladder design: the preregistration the run implements; its commit "
+                         "is recorded in the run manifest")
     args = ap.parse_args(argv)
+    if args.design == "ladder":
+        from scripts import calibration_ladder
+
+        return calibration_ladder.run_ladder_campaign(args)
     return run_campaign(args)
 
 

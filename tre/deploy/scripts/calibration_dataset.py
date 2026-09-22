@@ -22,6 +22,12 @@ wrong latency column. This tool does the assembly once, in one place:
 * ``cells.csv`` - one row per attempt: status, verdicts, outcome counts, files.
 * ``DATASET.md`` - what every column means (a copy of ``tre/docs/DATASET.md``).
 
+A campaign of the preregistered ladder design (``plan.json`` says ``"design":
+"ladder"``) is read from its own ledger, ``cells.jsonl``: one line per driven attempt
+naming the cell's role, rho factor, replicate, seeds, warm-up and whether the engine had
+drained before it. Its cells are identified by that ledger, never by parsing directory
+names, and every window and request carries ``in_warmup``.
+
 It **only reads** the run: nothing under the run directory is written, renamed or
 removed except the ``dataset/`` directory it owns. A campaign calls :func:`build_dataset`
 when it ends; any run - including those made before this tool existed - converts with::
@@ -39,7 +45,7 @@ import hashlib
 import json
 import shutil
 import subprocess
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Optional, Sequence
@@ -73,11 +79,11 @@ SPLIT_HOLDOUT = "holdout"
 #: Columns every row of the window and request tables starts with.
 IDENTITY_COLUMNS = [
     "model", "shape", "primitive", "stage", "rho", "cell_id", "attempt", "split",
-    "cell_status",
+    "cell_status", "role", "rho_factor", "replicate", "possibly_contaminated",
 ]
-WINDOW_COLUMNS = IDENTITY_COLUMNS + list(r3_grid.CSV_COLUMNS)
+WINDOW_COLUMNS = IDENTITY_COLUMNS + ["in_warmup"] + list(r3_grid.CSV_COLUMNS)
 REQUEST_COLUMNS = IDENTITY_COLUMNS + [
-    "request_id", "scheduled_send_ts_ms", "send_ts_ms", "first_token_ts_ms", "done_ts_ms",
+    "in_warmup", "request_id", "scheduled_send_ts_ms", "send_ts_ms", "first_token_ts_ms", "done_ts_ms",
     "on_wire_delay_ms", "ttft_ms", "tpot_ms", "e2e_ms", "input_tokens", "output_tokens",
     "http_status", "outcome", "proxy_reason", "in_flight_at_send", "request_timeout_s",
     "target_pod",
@@ -90,7 +96,13 @@ CELL_COLUMNS = [
     "requests", "requests_ok", "requests_shed", "requests_model_error",
     "requests_proxy_transient", "requests_client_timeout", "goodput",
     "raw_path", "guard_path", "online_csv_path", "schedule_path",
+    "role", "rho_factor", "replicate", "warmup_s", "arrival_seed", "prompt_key",
+    "possibly_contaminated", "drained_before", "drain_waited_s", "backlog_stopped",
 ]
+
+#: The ladder design's per-attempt ledger (see ``scripts.calibration_ladder``).
+LEDGER = "cells.jsonl"
+LADDER_DESIGN = "ladder"
 
 
 # ----------------------------------------------------------------------- discovery
@@ -121,6 +133,9 @@ class Attempt:
     raw_path: Optional[Path] = None
     guard: dict = field(default_factory=dict)
     recorded_probe: Optional[dict] = None
+    #: The ladder design's ledger line for this attempt (or its planned cell, when it was
+    #: never driven); None for a campaign of the primitives design.
+    ledger: Optional[dict] = None
 
 
 def parse_stem(stem: str, model: str) -> Optional[tuple[str, str, int]]:
@@ -179,8 +194,94 @@ def _cell_capture(raw_dir: Path) -> tuple[Optional[Path], Optional[str]]:
     return None, None
 
 
+def _read_jsonl(path: Path) -> list[dict]:
+    rows = []
+    try:
+        with Path(path).open(encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if line:
+                    rows.append(json.loads(line))
+    except OSError:
+        return []
+    return rows
+
+
+def discover_ledger_attempts(campaign: Path, plan: dict, discrepancies: list[str]) -> list[Attempt]:
+    """Attempts of a ladder-design campaign, from its ledger.
+
+    Every directory under the raw root that no ledger line names is reported and ignored;
+    every planned cell that no ledger line drove is registered as missing.
+    """
+    models = plan.get("models") or []
+    if len(models) != 1:
+        discrepancies.append(
+            f"{campaign.name}: plan.json names {len(models)} model(s); expected one per campaign"
+        )
+    raw_root = _raw_root(campaign)
+    records = _read_jsonl(campaign / LEDGER)
+    if not records:
+        discrepancies.append(f"{campaign.name}: ladder design but no {LEDGER}")
+    attempts: list[Attempt] = []
+    stems: set[str] = set()
+    for record in records:
+        stem = str(record.get("stem", ""))
+        stems.add(stem)
+        raw_dir = raw_root / stem
+        raw_path, captured_id = (_cell_capture(raw_dir) if raw_dir.is_dir() else (None, None))
+        cell_id = str(record.get("cell_id", ""))
+        if captured_id and captured_id != cell_id:
+            discrepancies.append(
+                f"{stem}: the ledger says {cell_id}, the capture is {captured_id}")
+        attempt = Attempt(
+            campaign=campaign, model=str(record.get("model", "")),
+            shape=str(record.get("shape", "")), primitive=str(record.get("primitive", "")),
+            attempt=int(record.get("attempt", 1)), stem=stem,
+            raw_dir=raw_dir if raw_dir.is_dir() else None, cell_id=cell_id,
+            stage=str(record.get("stage") or ""),
+            rho=None if record.get("rho") is None else float(record["rho"]),
+            raw_path=raw_path, ledger=record,
+        )
+        attempt.guard = _read_json(raw_dir / f"{cell_id}.guard.json") if raw_dir.is_dir() else {}
+        if record.get("verdict") or record.get("void_reasons"):
+            attempt.recorded_probe = {
+                "verdict": (boundary.VERDICT_VOID if record.get("void_reasons")
+                            else record.get("verdict")),
+                "rho": record.get("rho"), "stage": record.get("stage"),
+                "attempt": attempt.attempt, "cell_id": cell_id,
+                "duration_s": record.get("duration_s"),
+            }
+        if raw_path is None:
+            discrepancies.append(f"{stem}: no per-request capture")
+        elif not attempt.guard:
+            discrepancies.append(f"{stem}: no guard artifact")
+        attempts.append(attempt)
+    if raw_root.is_dir():
+        for raw_dir in sorted(p for p in raw_root.iterdir() if p.is_dir()):
+            if raw_dir.name not in stems:
+                discrepancies.append(f"{raw_dir}: not in {LEDGER}; ignored")
+    driven = {str(r.get("cell_id")) for r in records}
+    for model, cells in (plan.get("static_cells") or {}).items():
+        for cell in cells:
+            if str(cell.get("cell_id")) in driven:
+                continue
+            attempts.append(Attempt(
+                campaign=campaign, model=model, shape=str(cell.get("shape", "")),
+                primitive=str(cell.get("primitive", "")), attempt=1, stem="",
+                raw_dir=None, cell_id=str(cell.get("cell_id", "")),
+                stage=str(cell.get("stage") or ""),
+                rho=None if cell.get("rho") is None else float(cell["rho"]), ledger=cell,
+            ))
+            discrepancies.append(
+                f"{model}/{cell.get('shape')}/{cell.get('role')} {cell.get('cell_id')}: "
+                "planned, never driven")
+    return attempts
+
+
 def discover_attempts(campaign: Path, discrepancies: list[str]) -> list[Attempt]:
     plan = _read_json(campaign / "plan.json")
+    if plan.get("design") == LADDER_DESIGN:
+        return discover_ledger_attempts(campaign, plan, discrepancies)
     models = plan.get("models") or []
     if len(models) != 1:
         discrepancies.append(
@@ -340,13 +441,26 @@ def _settings_for(campaigns: Sequence[Path], overrides: dict) -> tuple[Settings,
         plan = _read_json(campaign / "plan.json")
         fit = _read_json(campaign / "fit_plan.json")
         prov = plan.get("provenance") or {}
-        provenances.append({
+        entry = {
             "campaign": campaign.name,
             "code": prov.get("code"),
             "registry_path": prov.get("registry_path"),
             "registry_sha256": prov.get("registry_sha256"),
             "status": _read_json(campaign / "campaign_status.json") or None,
-        })
+        }
+        if plan.get("design") == LADDER_DESIGN:
+            manifest_path = campaign / str(plan.get("run_manifest") or "run_manifest.json")
+            actual = _sha256(manifest_path)
+            recorded = plan.get("run_manifest_sha256")
+            entry["design"] = LADDER_DESIGN
+            entry["run_manifest"] = {
+                "path": manifest_path.name,
+                "sha256": actual,
+                "sha256_at_start": recorded,
+                "unchanged_since_start": None if recorded is None else actual == recorded,
+            }
+            entry["design_result"] = _read_json(campaign / "design_result.json") or None
+        provenances.append(entry)
         window_ms = window_ms or prov.get("window_ms") or fit.get("window_ms")
         step_ms = step_ms or prov.get("step_ms") or fit.get("step_ms")
         slo = (prov.get("label") or {}).get("slo_ms") or {}
@@ -382,6 +496,15 @@ def _cell_metadata(attempt: Attempt, plan_cells: dict) -> dict:
     campaign = attempt.campaign
     out = {"capacity_rps": None, "offered_rps": None, "planned_duration_s": None,
            "schedule_path": None}
+    if attempt.ledger is not None:
+        ledger = attempt.ledger
+        out.update(
+            capacity_rps=ledger.get("capacity_rps"),
+            offered_rps=ledger.get("offered_rps"),
+            planned_duration_s=ledger.get("duration_s"),
+            schedule_path=ledger.get("schedule_path"),
+        )
+        return out
     if attempt.primitive == gen.HOLD_PRIMITIVE:
         code = attempt.cell_id.rsplit("_c", 1)[-1] if attempt.cell_id else ""
         stem = f"{attempt.shape}_{gen.HOLD_PRIMITIVE}{code}"
@@ -589,6 +712,7 @@ def _convert_attempt(attempt, run_dir, settings, registry, plan_cells, discrepan
     if attempt.raw_path is not None and not guard:
         void_reasons = void_reasons or ["no guard artifact"]
     meta = _cell_metadata(attempt, plan_cells)
+    ledger = attempt.ledger or {}
     identity = {
         "model": attempt.model,
         "shape": attempt.shape,
@@ -597,8 +721,21 @@ def _convert_attempt(attempt, run_dir, settings, registry, plan_cells, discrepan
         "rho": attempt.rho,
         "cell_id": attempt.cell_id,
         "attempt": attempt.attempt,
-        "split": _split(attempt.shape),
+        "split": ledger.get("split") or _split(attempt.shape),
+        "role": ledger.get("role"),
+        "rho_factor": ledger.get("rho_factor"),
+        "replicate": ledger.get("replicate"),
+        "possibly_contaminated": ledger.get("possibly_contaminated"),
     }
+    warmup_s = ledger.get("warmup_s") if attempt.ledger is not None else None
+    warmup_end_ms = None
+    if warmup_s is not None and guard.get("start_ms") is not None:
+        warmup_end_ms = int(guard["start_ms"]) + int(round(float(warmup_s) * 1000))
+
+    def in_warmup(ts_ms) -> Optional[bool]:
+        if warmup_end_ms is None or ts_ms is None:
+            return None
+        return int(ts_ms) < warmup_end_ms
     records: list[dict] = []
     instants: list[dict] = []
     windows: list[dict] = []
@@ -633,15 +770,28 @@ def _convert_attempt(attempt, run_dir, settings, registry, plan_cells, discrepan
                 end_ms=rewindow_from_raw._as_int(guard.get("end_ms")),
                 truncated_at_ts_ms=rewindow_from_raw._as_int(guard.get("truncated_at_ts_ms")),
             )
-            if attempt.primitive == gen.HOLD_PRIMITIVE:
+            if attempt.primitive == gen.HOLD_PRIMITIVE and attempt.ledger is None:
                 verdict = boundary.probe_verdict(
                     windows, ttft_slo_ms=settings.ttft_slo_ms, tpot_slo_ms=settings.tpot_slo_ms,
                 )
+            elif attempt.primitive == gen.HOLD_PRIMITIVE:
+                # The ladder design labels every hold cell on its post-warm-up windows,
+                # and a backlog stop is a violation (scripts.calibration_design).
+                kept = [w for w in windows if not in_warmup(w["window_start_ms"])]
+                verdict = boundary.probe_verdict(
+                    kept, ttft_slo_ms=settings.ttft_slo_ms, tpot_slo_ms=settings.tpot_slo_ms,
+                )
+                if (guard.get("truncated")
+                        and guard.get("truncation_cause") == openloop.TRUNCATION_BACKLOG):
+                    verdict = replace(verdict, verdict=boundary.VERDICT_VIOLATED)
     if attempt.raw_path is None:
         status = STATUS_MISSING
     elif void_reasons:
         status = STATUS_VOID
-    elif verdict is not None and verdict.verdict == boundary.VERDICT_INCONCLUSIVE:
+    elif (verdict is not None and verdict.verdict == boundary.VERDICT_INCONCLUSIVE
+          and ledger.get("role", "boundary") == "boundary"):
+        # A probe with too little evidence is inconclusive; a ladder, supplementary or
+        # sentinel cell short of labelled windows is still a valid measurement.
         status = STATUS_INCONCLUSIVE
     else:
         status = STATUS_VALID
@@ -671,6 +821,7 @@ def _convert_attempt(attempt, run_dir, settings, registry, plan_cells, discrepan
         outcomes[outcome] = outcomes.get(outcome, 0) + 1
         request_rows.append({
             **identity,
+            "in_warmup": in_warmup(record.get("send_ts_ms")),
             "request_id": record.get("request_id"),
             "scheduled_send_ts_ms": record.get("scheduled_send_ts_ms"),
             "send_ts_ms": record.get("send_ts_ms"),
@@ -689,7 +840,10 @@ def _convert_attempt(attempt, run_dir, settings, registry, plan_cells, discrepan
             "request_timeout_s": record.get("request_timeout_s"),
             "target_pod": record.get("target_pod"),
         })
-    window_rows = [{**identity, **row} for row in windows] if status != STATUS_VOID else []
+    window_rows = (
+        [{**identity, "in_warmup": in_warmup(row["window_start_ms"]), **row} for row in windows]
+        if status != STATUS_VOID else []
+    )
 
     goodput = (guard.get("goodput") or {}).get("goodput") if isinstance(guard.get("goodput"), dict) else None
     guard_path = (
@@ -737,6 +891,16 @@ def _convert_attempt(attempt, run_dir, settings, registry, plan_cells, discrepan
         "guard_path": _rel(guard_path, run_dir) if guard else None,
         "online_csv_path": _rel(online_csv, run_dir),
         "schedule_path": _rel(meta["schedule_path"], run_dir),
+        "role": ledger.get("role"),
+        "rho_factor": ledger.get("rho_factor"),
+        "replicate": ledger.get("replicate"),
+        "warmup_s": warmup_s,
+        "arrival_seed": ledger.get("arrival_seed"),
+        "prompt_key": ledger.get("prompt_key"),
+        "possibly_contaminated": ledger.get("possibly_contaminated"),
+        "drained_before": (ledger.get("drain_before") or {}).get("drained"),
+        "drain_waited_s": (ledger.get("drain_before") or {}).get("waited_s"),
+        "backlog_stopped": ledger.get("backlog_stopped"),
     }
     manifest_cell = {
         **{k: v for k, v in identity.items() if k != "cell_status"},

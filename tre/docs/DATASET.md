@@ -38,6 +38,22 @@
 
 `<stem>` 的命名：计划内的 cell 是 `<model>_<shape>_<primitive>`（重跑为 `..._a2`）；边界搜索 probe 是 `<model>_<shape>_<shape>_hold<code>_a<attempt>`，`code = 1000 + round(100·rho)`。
 
+**第二轮（预注册 ladder 设计，`plan.json` 里 `"design": "ladder"`）**的布局不同，数据集按它自己的台账读取，不再解析目录名：
+
+```
+<model>/
+  run_manifest.json   # 发车前写一次、只读：预注册全部固定参数、regime 分组与 ρ 先验（全文 + sha256）、
+                      # 设计种子、预注册文件 commit、静态计划（每个 cell 的 id 与种子）
+  plan.json           # 含 run_manifest_sha256（发车时的哈希；数据集会复核文件是否被改过）
+  cells.jsonl         # 台账：每个驱动过的 attempt 一行（role/stage/rho/rho_factor/replicate/种子/
+                      # 排空记录/possibly_contaminated/判定/文件路径）
+  design_result.json  # 各 shape 的 ρ* 锚点、补点决策、哨兵漂移、疑似污染 cell 列表
+  boundary/<model>_<shape>.json  schedules/<model>/<stem>.json  prompts/<stem>/
+  raw/<stem>/ ...     # 同上
+```
+
+此时 `<stem>` = `<model>_<shape>_<role>_c<code>_a<attempt>`，`cell_id` = `i<in>_o<out>_c<code>`，`code = 1000000 + 模型序号×100000 + 序号`（模型序号按 dsqwen-7b / dsllama-8b / dsqwen-14b）：**每个 cell 全局唯一**，同 shape 同 ρ 的两个重复也不同；每个 cell 还有自己的到达种子和 prompt key（`run_manifest.json → seed_derivation`）。
+
 **只读保证**：转换工具只读 run 目录，唯一写入的是它自己拥有的 `dataset/`（先写到同级临时目录 `.dataset.building`，完成后整体换入）。
 
 生成 / 重建：
@@ -95,12 +111,17 @@ train = w[(w.split == "train") & (w.slo_label != "unlabeled")]
 | `model` | – | 模型名 |
 | `shape` | – | token 形状（S1–S5、T8、T9、M；M 为混合形状，held-out） |
 | `primitive` | – | `steps` / `ramp` / `bursts` / `hold`（边界搜索 probe） |
-| `stage` | – | probe 所处阶段 `coarse` / `bisect` / `dwell`；非 probe 为空 |
-| `rho` | 无量纲 | probe 的相对负载（相对 steps 测得或先验容量）；非 probe 为空 |
+| `stage` | – | probe 所处阶段 `coarse` / `bisect` / `dwell`；第二轮另有 `ladder` / `adaptive` / `sentinel`（分析按它切训练集，见 `calibration_design.TRAINING_HOLD_STAGES`）；ramp 等为空 |
+| `rho` | 无量纲 | hold cell 的相对负载（相对 steps 测得或先验容量；第二轮相对 `rho_priors.json` 的 C_s）；ramp 为峰值；其余为空 |
 | `cell_id` | – | `i<输入tokens>_o<输出tokens>_c<负载码>` |
 | `attempt` | – | 第几次驱动（1 起）；void 或 inconclusive 后重跑会递增 |
-| `split` | – | `train` / `holdout`（held-out 形状 M，绝不进拟合） |
+| `split` | – | `train` / `holdout`（held-out 形状 M，绝不进拟合）；第二轮按预注册 §5：ladder + adaptive（M 除外）为 `train`，M 的全部 cell 与所有 ramp 为 `holdout`，训练 shape 的 probe 与哨兵为 `auxiliary` |
 | `cell_status` | – | `valid` / `inconclusive`（void 的 attempt 不在本表） |
+| `role` | – | 仅第二轮：`boundary`（阶段 0 probe）/ `ladder` / `adaptive`（阶段 3 补点）/ `ramp` / `sentinel`；第一轮为空 |
+| `rho_factor` | 无量纲 | 仅第二轮：相对该 shape 实测 ρ* 的负载倍数（ladder 0.70–1.30；ramp 记峰值 1.4）；probe 与哨兵为空 |
+| `replicate` | – | 仅第二轮：同 (shape, rho_factor) 的第几个重复（1 起）；哨兵为第几次 |
+| `possibly_contaminated` | – | 仅第二轮：True = 这个 cell 开始前引擎在 90 s 内没排空（前一个 cell 的积压可能还在） |
+| `in_warmup` | – | 仅第二轮：True = 窗口起点早于 cell `start_ms` + 60 s（hold cell 的队列建立期，预注册 §7.1 要求弃用；数据保留，由分析过滤——判定与 `calibration_decision.build_cells` 相同）。ramp 恒为 False；第一轮为空 |
 | `scenario_id` | – | 同 `cell_id`（窗口 CSV 原有列） |
 | `scenario_family` | – | `i<in>_o<out>` |
 | `input_tokens` | tokens | cell 名义输入长度（M 为 0） |
@@ -136,7 +157,9 @@ train = w[(w.split == "train") & (w.slo_label != "unlabeled")]
 |---|---|---|
 | `model` … `split` | – | 同 windows.csv |
 | `cell_status` | – | `valid` / `inconclusive` / `void` —— 过滤 void 请用它 |
-| `request_id` | – | 发送器请求 id（`<model>-<序号>`）。2026-09-23 之前的采集只有失败请求有 |
+| `role` … `possibly_contaminated` | – | 同 windows.csv |
+| `in_warmup` | – | 仅第二轮：发送时刻早于 cell `start_ms` + warm-up |
+| `request_id` | – | 发送器请求 id（`<model>-<序号>`；第二轮为 `<prompt key>-<model>-<序号>`，prompt 由它做种子）。2026-09-23 之前的采集只有失败请求有 |
 | `scheduled_send_ts_ms` | ms（epoch） | 调度表里这个请求**应该**发出的时刻 = `send_ts_ms − on_wire_delay_ms`。2026-09-23 之前的采集为空 |
 | `send_ts_ms` | ms（epoch） | 请求**真正上线**（写 socket 前一刻）的时刻 |
 | `first_token_ts_ms` | ms（epoch） | 第一个流式 token 到达时刻 |
@@ -177,6 +200,13 @@ train = w[(w.split == "train") & (w.slo_label != "unlabeled")]
 | `requests_ok` / `_shed` / `_model_error` / `_proxy_transient` / `_client_timeout` | 请求数 | 按 outcome 计数 |
 | `goodput` | 比例 | 守卫记录的 goodput = (已服务且满足 SLO) ÷ 发出 |
 | `raw_path` / `guard_path` / `online_csv_path` / `schedule_path` | – | 相对 run 根目录的路径 |
+| `role` / `rho_factor` / `replicate` | – | 仅第二轮，同 windows.csv |
+| `warmup_s` | s | 仅第二轮：该 cell 的 warm-up（hold 60，ramp 0） |
+| `arrival_seed` / `prompt_key` | – | 仅第二轮：该 cell 自己的到达种子与 prompt key |
+| `possibly_contaminated` / `drained_before` / `drain_waited_s` | – | 仅第二轮：开始前的排空结果与等待时长 |
+| `backlog_stopped` | – | 仅第二轮：probe 因客户端在途数达到上限（1024）被提前停发；这样的 probe 判为 violated |
+
+第二轮的 `probe_verdict` 对每个 hold cell（probe、ladder、adaptive、哨兵）都给出，在 **warm-up 之后**的窗口上计算；只有 probe 会因证据不足而 `status = inconclusive`，其余 cell 证据不足仍是 `valid`。
 
 ## 8. `manifest.json`
 
@@ -184,7 +214,7 @@ train = w[(w.split == "train") & (w.slo_label != "unlabeled")]
 |---|---|
 | `format_revision` | 本格式的修订号（整数） |
 | `builder` | 转换工具的代码 commit 和工作树是否有改动 |
-| `campaigns[]` | 每个 campaign 的采集 provenance：代码 commit、registry 路径与 sha256（2026-09-23 之前的 run 没记录，为 null）、`campaign_status.json` |
+| `campaigns[]` | 每个 campaign 的采集 provenance：代码 commit、registry 路径与 sha256（2026-09-23 之前的 run 没记录，为 null）、`campaign_status.json`；第二轮另有 `run_manifest`（当前 sha256、发车时 sha256、`unchanged_since_start`）与 `design_result` |
 | `registry_used_for_signal_columns` | 重算 `trs`/`queue_control` 所用的 registry 及其 sha256 |
 | `label` | 标签定义全文（口径 = 客户端每请求、SLO 值、N1、规则、实现函数） |
 | `windowing` | 窗口宽度 / 步长 / 类型 / 边界 / 队列来源 |

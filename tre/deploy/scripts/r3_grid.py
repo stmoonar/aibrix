@@ -630,6 +630,8 @@ def run_schedule_cell(args, store, spec) -> tuple[list, "openloop.CellGuard"]:
         drain_start_s=drain_start_s,
         failures_path=failures_path,
         overflow_sentinel=sentinel,
+        request_key=args.prompt_key,
+        max_backlog=args.max_backlog,
         guard_kwargs={
             "max_p99_delay_ms": args.max_p99_delay_ms,
             "max_p99_pool_wait_ms": args.max_p99_pool_wait_ms,
@@ -691,6 +693,9 @@ def run_schedule_cell(args, store, spec) -> tuple[list, "openloop.CellGuard"]:
         # capacity number is only comparable to another one made the same way.
         "prompt_mode": args.prompt_mode,
         "routing_strategy": args.routing_strategy,
+        # What made this cell's arrivals and prompts its own (see openloop).
+        "schedule_seed": args.schedule_seed,
+        "prompt_key": args.prompt_key,
         "prompt_file": (
             None
             if prompt_dir is None
@@ -943,7 +948,20 @@ def parse_args(argv: Optional[Sequence[str]] = None):
                     help="scenario id for the schedule cell (default: from the schedule INDEX "
                          "convention i<in>_o<out>_c<load-code>); must parse as a GridCell or "
                          "rewindow_from_raw will skip the raw file")
-    ap.add_argument("--schedule-seed", type=int, default=1234)
+    ap.add_argument("--schedule-seed", type=int, default=1234,
+                    help="seed of the Poisson arrivals (and sampled token lengths). The "
+                         "default is the same for every cell, so two cells with the same "
+                         "segments get the same arrival instants; a campaign whose cells "
+                         "must be independent passes one per cell")
+    ap.add_argument("--prompt-key", default=None,
+                    help="namespace for this cell's request ids, and therefore for its "
+                         "prompt seeds. Without it request k of every schedule of a model "
+                         "gets the same prompt; a campaign passes one per cell")
+    ap.add_argument("--max-backlog", type=int, default=None,
+                    help="stop offering load once this many requests are outstanding at "
+                         "the client (a safety valve for probes far above capacity); the "
+                         "guard records the stop as a truncation caused by the backlog "
+                         "limit and the windows after it are censored")
     ap.add_argument("--max-in-flight", type=int, default=openloop.DEFAULT_MAX_IN_FLIGHT)
     # Sidecar source. "pod" scrapes the model pods' /metrics directly at
     # --instant-sample-ms (1 s for the campaign); "store" is the legacy redis read, which

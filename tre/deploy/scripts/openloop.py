@@ -700,6 +700,10 @@ def routing_balance(records: Sequence[dict]) -> dict:
 #: find and replace exactly that issue without disturbing the dispatch-level ones.
 TRUNCATION_EVIDENCE_ISSUE = "truncated before collecting enough evidence"
 
+#: :attr:`CellGuard.truncation_cause` values.
+TRUNCATION_ADMISSION_OVERFLOW = "admission overflow"
+TRUNCATION_BACKLOG = "backlog limit"
+
 #: Why a cell's evidence was thrown away. Each one is a separate rule with a separate
 #: test, because a void rule that silently stops firing does not fail anything - it just
 #: lets a polluted cell into the fit, and theta moves without anyone seeing why.
@@ -748,6 +752,11 @@ class CellGuard:
     truncated_at_ts_ms: Optional[int] = None
     #: Scheduled requests deliberately not sent after truncation.
     censored: int = 0
+    #: What cut the cell short: :data:`TRUNCATION_ADMISSION_OVERFLOW` (a gateway shed) or
+    #: :data:`TRUNCATION_BACKLOG` (the client's own backlog ceiling); None when untruncated.
+    truncation_cause: Optional[str] = None
+    #: The in-flight ceiling the cell ran under (``max_backlog``); None when unarmed.
+    backlog_limit: Optional[int] = None
     #: Windows above the SLO collected before truncation; None when not yet counted.
     slo_windows: Optional[int] = None
     min_slo_windows: int = DEFAULT_MIN_SLO_WINDOWS
@@ -843,6 +852,8 @@ class CellGuard:
             "truncated_at_offset_s": self.truncated_at_offset_s,
             "truncated_at_ts_ms": self.truncated_at_ts_ms,
             "censored": self.censored,
+            "truncation_cause": self.truncation_cause,
+            "backlog_limit": self.backlog_limit,
             "slo_windows": self.slo_windows,
             "min_slo_windows": self.min_slo_windows,
             "routing_balance": self.routing,
@@ -908,6 +919,8 @@ def check_cell(
     truncated_at_offset_s: Optional[float] = None,
     truncated_at_ts_ms: Optional[int] = None,
     censored: int = 0,
+    truncation_cause: Optional[str] = None,
+    backlog_limit: Optional[int] = None,
     slo_windows: Optional[int] = None,
     min_slo_windows: int = DEFAULT_MIN_SLO_WINDOWS,
     max_routing_imbalance: Optional[float] = DEFAULT_MAX_ROUTING_IMBALANCE,
@@ -1081,6 +1094,8 @@ def check_cell(
         truncated_at_offset_s=truncated_at_offset_s,
         truncated_at_ts_ms=truncated_at_ts_ms,
         censored=int(censored),
+        truncation_cause=truncation_cause if truncated else None,
+        backlog_limit=None if backlog_limit is None else int(backlog_limit),
         min_slo_windows=int(min_slo_windows),
         routing=routing,
         client_timeouts=outcomes.client_timeout,
@@ -1502,6 +1517,72 @@ class TruncateOnProxyShed:
             self._cursor += 1
 
 
+class StopOnBacklog:
+    """Sender wrapper that stops offering load once the client's backlog passes a ceiling.
+
+    An open loop far above capacity queues without bound until the client's own request
+    deadline (30 s) starts abandoning requests. Nothing about the boundary is learnt past
+    that point - a cell with ``max_backlog`` requests outstanding against an engine that
+    runs at most ``max_num_seqs`` of them is violating its latency SLO by tens of seconds -
+    but the load keeps growing towards the gateway's admission ceiling, where a shed would
+    VOID the cell, and a second void stops the whole campaign. This wrapper is the safety
+    valve for the boundary search's high-rho probes: when the number of requests this
+    client has outstanding reaches ``max_backlog`` it stops sending (the remaining
+    requests are counted as censored), and the guard records the stop so the probe is
+    read as violated rather than as short of evidence.
+
+    The count is kept here rather than read from the sender, so it includes requests
+    waiting for a sender thread: those are outstanding too.
+    """
+
+    def __init__(self, sender, *, max_backlog: int) -> None:
+        if int(max_backlog) <= 0:
+            raise ValueError(f"max_backlog must be positive, got {max_backlog}")
+        self._sender = sender
+        self.max_backlog = int(max_backlog)
+        self.outstanding = 0
+        self.peak_outstanding = 0
+        self.truncated = False
+        self.truncated_at_offset_s: Optional[float] = None
+        self.truncated_at_ts_ms: Optional[int] = None
+        self.censored = 0
+
+    @property
+    def records(self) -> list:
+        return self._sender.records
+
+    async def __call__(self, request, scheduled_ts: float, actual_ts: float) -> None:
+        if self.truncated:
+            self.censored += 1
+            return
+        if self.outstanding >= self.max_backlog:
+            self.truncated = True
+            self.truncated_at_offset_s = float(getattr(request, "scheduled_offset_s", 0.0))
+            self.truncated_at_ts_ms = int(time.time() * 1000)
+            self.censored += 1
+            return
+        self.outstanding += 1
+        self.peak_outstanding = max(self.peak_outstanding, self.outstanding)
+        try:
+            await self._sender(request, scheduled_ts, actual_ts)
+        finally:
+            self.outstanding -= 1
+
+
+def namespace_request_ids(events: Sequence, request_key: Optional[str]) -> list:
+    """Give every scheduled request an id that is unique to this cell.
+
+    The replayer names a schedule's requests ``<model>-<index>`` and seeds each prompt
+    from ``<model>|<request id>``, so without a namespace request *k* of every schedule
+    of a model is built from the same seed: two cells of the same shape send the same
+    prompts, request for request. ``request_key`` (the campaign passes one per cell) is
+    prefixed onto the id, which makes the prompt seed - and therefore the prompt - a
+    function of the cell as well as of the index. ``None`` leaves the ids untouched.
+    """
+    if not request_key:
+        return list(events)
+    return [replace(e, request_id=f"{request_key}-{e.request_id}") for e in events]
+
 
 # ---------------------------------------------------------------------------- driver
 
@@ -1568,6 +1649,8 @@ def drive_cell_schedule(
     overflow_sentinel: Optional["PendingOverflowSentinel"] = None,
     records_out: Optional[list] = None,
     instants_out: Optional[list] = None,
+    request_key: Optional[str] = None,
+    max_backlog: Optional[int] = None,
 ) -> tuple:
     """Drive one open-loop cell from ``segments``; returns (start_ms, end_ms, guard).
 
@@ -1600,6 +1683,13 @@ def drive_cell_schedule(
     With ``rps_timeline_path`` the cell also writes its nominal-vs-achieved arrival
     series, built from the instants the requests actually reached the wire.
 
+    ``request_key`` namespaces the request ids, and with them the prompt seeds, so two
+    cells never send the same prompts (see :func:`namespace_request_ids`); ``seed``
+    decides the arrival instants (and sampled lengths). ``max_backlog`` arms
+    :class:`StopOnBacklog`; a stop is recorded on the guard as a truncation whose cause
+    is :data:`TRUNCATION_BACKLOG`, and the windows after it are censored like any
+    truncation's.
+
     The per-request raw lines use ``r3_grid.RAW_COLUMNS`` and the instant sidecar uses the
     ``r3_grid`` sidecar schema plus ``on_live_grid``, so the offline re-windowing path is
     unchanged (pass ``--instant-sample-ms 1000`` to ``rewindow_from_raw`` to match this
@@ -1612,7 +1702,10 @@ def drive_cell_schedule(
     from tre_replayer.engine.prompts import DEFAULT_MODE
     from tre_replayer.engine.schedule import build_poisson_schedule
 
-    events = [e for e in build_poisson_schedule(segments, seed=seed) if e.model == model]
+    events = namespace_request_ids(
+        [e for e in build_poisson_schedule(segments, seed=seed) if e.model == model],
+        request_key,
+    )
     scheduled = len(events)
 
     # Before anything else, and before any thread or sidecar exists: the pool forks, and
@@ -1644,9 +1737,11 @@ def drive_cell_schedule(
     # segment - whose only job is to capture a recovery tail as evidence - is dead time.
     # Truncation itself is kept: see TruncateOnProxyShed.
     shed_policy = (guard_kwargs or {}).get("shed_policy", DEFAULT_SHED_POLICY)
+    backlog = StopOnBacklog(sender, max_backlog=max_backlog) if max_backlog else None
+    inner = backlog or sender
     truncator = (
         TruncateOnProxyShed(
-            sender,
+            inner,
             drain_start_s=drain_start_s,
             keep_drain=shed_policy != SHED_POLICY_VOID,
         )
@@ -1661,7 +1756,7 @@ def drive_cell_schedule(
     if overflow_sentinel is not None:
         overflow_sentinel.start()
     try:
-        report = asyncio.run(dispatch_open_loop(events, truncator or sender))
+        report = asyncio.run(dispatch_open_loop(events, truncator or inner))
     finally:
         sender.close()
         if sidecar is not None:
@@ -1686,15 +1781,26 @@ def drive_cell_schedule(
         )
     )
 
+    # Whichever stop came first is the truncation; both count their censored requests.
+    stops = [
+        (int(w.truncated_at_ts_ms or 0), w.truncated_at_offset_s, cause)
+        for w, cause in (
+            (truncator, TRUNCATION_ADMISSION_OVERFLOW), (backlog, TRUNCATION_BACKLOG),
+        )
+        if w is not None and w.truncated
+    ]
+    first_stop = min(stops, key=lambda stop: stop[0]) if stops else None
     guard = check_cell(
         cell_id,
         scheduled=scheduled,
         records=sender.records,
         p99_delay_ms=report.p99_delay_ms,
-        truncated=bool(truncator and truncator.truncated),
-        truncated_at_offset_s=truncator.truncated_at_offset_s if truncator else None,
-        truncated_at_ts_ms=truncator.truncated_at_ts_ms if truncator else None,
-        censored=truncator.censored if truncator else 0,
+        truncated=first_stop is not None,
+        truncated_at_offset_s=None if first_stop is None else first_stop[1],
+        truncated_at_ts_ms=None if first_stop is None else (first_stop[0] or None),
+        censored=sum(w.censored for w in (truncator, backlog) if w is not None),
+        truncation_cause=None if first_stop is None else first_stop[2],
+        backlog_limit=int(max_backlog) if max_backlog else None,
         pending_overflow_delta=overflow_delta,
         prompt_store_misses=(None if prompt_store is None else prompt_store.misses),
         rps_error_ratio=rps_error_ratio,

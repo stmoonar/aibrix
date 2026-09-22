@@ -310,6 +310,7 @@ def test_dry_run_writes_the_plan_without_driving_anything(tmp_path, monkeypatch)
 
     monkeypatch.setattr(campaign.subprocess, "run", _no_subprocess)
     exit_code = campaign.main([
+        "--design", "primitives",
         "--index", str(index_path), "--models", "dsqwen-7b",
         "--out-dir", str(tmp_path / "out"), "--dry-run",
     ])
