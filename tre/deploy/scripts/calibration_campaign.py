@@ -148,8 +148,10 @@ PRIMARY_LAMBDA_WAIT = 3.0
 SECONDARY_LAMBDA_WAIT = 0.0
 SECONDARY_FIT_TOLERANCE = 0.05
 
-#: TTFT SLO of the fit label (tre_calibration.labels): the length-normalised slowdown SLO
-#: of plan 2026-09-21 6.9h / D6. ``--fit-ttft-slo-mode fixed`` restores the 500 ms label.
+#: TTFT SLO of the fit label (tre_calibration.labels): the primary label of plan
+#: 2026-09-21 6.11 D6', max(500 ms, 5 * idle TTFT(L)), TPOT 75 ms. ``--fit-ttft-slo-mode
+#: fixed`` gives the 500/75 ms comparison column, ``--fit-ttft-slowdown-k 3
+#: --fit-ttft-floor-ms 150`` the D6 ablation arm; k/floor default to the registry profile.
 DEFAULT_FIT_TTFT_SLO_MODE = "slowdown"
 
 
@@ -923,7 +925,7 @@ def fit_plan(
     """
     # Imported here, not at module level: the campaign driver itself must stay runnable
     # on a PYTHONPATH without the calibration package.
-    from tre_calibration.labels import label_cli_args, label_def_from_args
+    from tre_calibration.labels import label_arms, label_cli_args, label_def_from_args
     from tre_common.tss import DEFAULT_EMA_TAU_MS
 
     fit_dir = out_dir / "fit"
@@ -1005,21 +1007,29 @@ def fit_plan(
     # --fit-window-align none (+ --fit-step-ms 5000) reproduces the legacy windowing.
     window_align = getattr(args, "fit_window_align", "grid")
     align = ["--window-align", window_align]
-    # The fit label (tre_calibration.labels): slowdown TTFT SLO by default (plan 6.9h,
-    # D6) - each model's idle TTFT fit comes from the registry - or the fixed one.
+    # The fit label (tre_calibration.labels): the D6' slowdown TTFT SLO by default - each
+    # model's idle TTFT fit, k and floor come from the registry - or the fixed one.
     label_args = argparse.Namespace(
         ttft_p95_ms=args.ttft_slo_ms,
         tpot_p95_ms=args.tpot_slo_ms,
         ttft_slo_mode=getattr(args, "fit_ttft_slo_mode", DEFAULT_FIT_TTFT_SLO_MODE),
-        ttft_slowdown_k=getattr(args, "fit_ttft_slowdown_k", 3.0),
-        ttft_floor_ms=getattr(args, "fit_ttft_floor_ms", 150.0),
+        ttft_slowdown_k=getattr(args, "fit_ttft_slowdown_k", None),
+        ttft_floor_ms=getattr(args, "fit_ttft_floor_ms", None),
         ttft_idle_c_ms=None,
         ttft_idle_b_ms_per_token=None,
         min_completed_requests=getattr(args, "fit_min_completed_requests", 20),
         label_registry=getattr(args, "registry", None),
     )
+    plan["label_arms_by_model"] = {}
     for model in models:
-        plan["label_def_by_model"][model] = label_def_from_args(label_args, model).as_dict()
+        fit_label = label_def_from_args(label_args, model)
+        plan["label_def_by_model"][model] = fit_label.as_dict()
+        # D6': the primary label, the fixed comparison column and the k=3/150 ms ablation
+        # are all recorded so any fit can be re-run on another arm (--fit-ttft-slo-mode ...).
+        if fit_label.slowdown:
+            plan["label_arms_by_model"][model] = {
+                arm: label.as_dict() for arm, label in label_arms(fit_label).items()
+            }
     plan["label_def"] = plan["label_def_by_model"][models[0]] if models else None
     live = [
         "--window-ms", str(args.window_ms), "--step-ms", str(args.fit_step_ms),
@@ -1645,8 +1655,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--fit-ttft-slo-mode", choices=["fixed", "slowdown"], default=DEFAULT_FIT_TTFT_SLO_MODE,
                     help="TTFT SLO of the fit label: slowdown = max(floor, k*(c_m+b_m*L)) with the "
                          "registry's idle TTFT fit (plan 6.9h); fixed = --ttft-slo-ms")
-    ap.add_argument("--fit-ttft-slowdown-k", type=float, default=3.0)
-    ap.add_argument("--fit-ttft-floor-ms", type=float, default=150.0)
+    ap.add_argument("--fit-ttft-slowdown-k", type=float, default=None,
+                    help="default: registry slo.ttft_slowdown_k (5, D6'); 3 = the D6 ablation arm")
+    ap.add_argument("--fit-ttft-floor-ms", type=float, default=None,
+                    help="default: registry slo.ttft_floor_ms (500 ms, D6'); 150 = the D6 ablation arm")
     ap.add_argument("--fit-min-completed-requests", type=int, default=20)
     ap.add_argument("--min-slo-windows", type=int, default=3)
     ap.add_argument("--max-model-error-rate", type=float,

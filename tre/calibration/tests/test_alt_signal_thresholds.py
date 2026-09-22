@@ -374,7 +374,7 @@ def test_coinciding_thresholds_warn_and_record_the_windows_instead_of_failing(tm
     output = tmp_path / "alt.yaml"
     assert driver.main([
         "--model-input", f"a={csv_path}", "--model-input", f"b={csv_path}",
-        "--ttft-p95-ms", "500", "--tpot-p95-ms", "75", "--signal", "queue_len",
+        "--ttft-slo-mode", "fixed", "--ttft-p95-ms", "500", "--tpot-p95-ms", "75", "--signal", "queue_len",
         "--trim-ramp-windows", "0", "--output", str(output), "--n-resamples", "20",
         "--family-resamples", "10",
     ]) == 0

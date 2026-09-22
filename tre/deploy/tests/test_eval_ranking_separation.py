@@ -124,7 +124,7 @@ def test_cli_writes_report_from_csv(tmp_path) -> None:
             "--input", str(src),
             "--output", str(out),
             "--model-name", "dsqwen-7b",
-            "--ttft-p95-ms", "100",
+            "--ttft-slo-mode", "fixed", "--ttft-p95-ms", "100",
             "--tpot-p95-ms", "50",
             "--test-fraction", "0.25",
             "--generated-at", "2026-07-08T00:00:00+00:00",
@@ -199,7 +199,7 @@ def test_cli_defaults_match_the_calibration_cli_defaults() -> None:
         "--input", "x.csv",
         "--output", "y.json",
         "--model-name", "m",
-        "--ttft-p95-ms", "100",
+        "--ttft-slo-mode", "fixed", "--ttft-p95-ms", "100",
         "--tpot-p95-ms", "50",
     ]
     eval_args = eval_ranking_separation._parse_args(required)
@@ -229,7 +229,7 @@ def test_cli_report_records_the_criterion(tmp_path) -> None:
             "--input", str(src),
             "--output", str(out),
             "--model-name", "dsqwen-7b",
-            "--ttft-p95-ms", "100",
+            "--ttft-slo-mode", "fixed", "--ttft-p95-ms", "100",
             "--tpot-p95-ms", "50",
             "--test-fraction", "0.25",
             "--generated-at", "2026-09-21T00:00:00+00:00",
@@ -252,7 +252,7 @@ def test_cli_uses_the_shared_label_and_rejects_e2e(tmp_path) -> None:
     _write_windows_csv(src, _separable_windows())
     base = [
         "--input", str(src), "--output", str(out), "--model-name", "dsqwen-7b",
-        "--ttft-p95-ms", "100", "--tpot-p95-ms", "50", "--test-fraction", "0.25",
+        "--ttft-slo-mode", "fixed", "--ttft-p95-ms", "100", "--tpot-p95-ms", "50", "--test-fraction", "0.25",
     ]
     assert eval_ranking_separation.main(base) == 0
     report = json.loads(out.read_text(encoding="utf-8"))

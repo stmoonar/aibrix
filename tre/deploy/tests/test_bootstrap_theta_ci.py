@@ -71,7 +71,7 @@ def _run(tmp_path, name: str = "run", *extra: str) -> dict:
             "--input", str(src),
             "--output", str(out),
             "--model-name", "dsqwen-7b",
-            "--ttft-p95-ms", "100",
+            "--ttft-slo-mode", "fixed", "--ttft-p95-ms", "100",
             "--tpot-p95-ms", "50",
             "--trim-ramp-windows", "0",
             "--n-resamples", "120",
@@ -90,7 +90,7 @@ def test_cli_defaults_match_the_calibration_cli_defaults() -> None:
         "--input", "x.csv",
         "--output", "y.json",
         "--model-name", "m",
-        "--ttft-p95-ms", "100",
+        "--ttft-slo-mode", "fixed", "--ttft-p95-ms", "100",
         "--tpot-p95-ms", "50",
     ]
     ci_args = bootstrap_theta_ci._parse_args(required)

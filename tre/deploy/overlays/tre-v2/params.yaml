@@ -40,10 +40,13 @@ data:
         tpot_p95_ms: 75.0
         e2e_p95_ms: 12000.0
         # Idle TTFT(L) = c + b * prompt_tokens: the calibration label's slowdown TTFT SLO
-        # is max(150 ms, k * idle) (plan 2026-09-21 6.9h, D6). Offline label only; provenance
+        # is max(floor, k * idle); primary label k = 5, floor 500 ms (plan 2026-09-21 6.11 D6'). Offline label only; provenance
         # docs/refactor/p11_evidence/ttft_idle_fit_20260922.yaml
         ttft_idle_c_ms: 36.4
         ttft_idle_b_ms_per_token: 0.0527
+        ttft_slo_mode: slowdown
+        ttft_slowdown_k: 5.0
+        ttft_floor_ms: 500.0
       alt_thresholds:
         queue_len:
           theta: 78.33333333333333
@@ -91,10 +94,13 @@ data:
         tpot_p95_ms: 75.0
         e2e_p95_ms: 12000.0
         # Idle TTFT(L) = c + b * prompt_tokens: the calibration label's slowdown TTFT SLO
-        # is max(150 ms, k * idle) (plan 2026-09-21 6.9h, D6). Offline label only; provenance
+        # is max(floor, k * idle); primary label k = 5, floor 500 ms (plan 2026-09-21 6.11 D6'). Offline label only; provenance
         # docs/refactor/p11_evidence/ttft_idle_fit_20260922.yaml
         ttft_idle_c_ms: 39.3
         ttft_idle_b_ms_per_token: 0.0555
+        ttft_slo_mode: slowdown
+        ttft_slowdown_k: 5.0
+        ttft_floor_ms: 500.0
       alt_thresholds:
         queue_len:
           theta: 46.333333333333336
@@ -142,10 +148,13 @@ data:
         tpot_p95_ms: 75.0
         e2e_p95_ms: 15000.0
         # Idle TTFT(L) = c + b * prompt_tokens: the calibration label's slowdown TTFT SLO
-        # is max(150 ms, k * idle) (plan 2026-09-21 6.9h, D6). Offline label only; provenance
+        # is max(floor, k * idle); primary label k = 5, floor 500 ms (plan 2026-09-21 6.11 D6'). Offline label only; provenance
         # docs/refactor/p11_evidence/ttft_idle_fit_20260922.yaml
         ttft_idle_c_ms: 43.4
         ttft_idle_b_ms_per_token: 0.0683
+        ttft_slo_mode: slowdown
+        ttft_slowdown_k: 5.0
+        ttft_floor_ms: 500.0
       alt_thresholds:
         queue_len:
           theta: 191.66666666666666

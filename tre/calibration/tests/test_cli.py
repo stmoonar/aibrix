@@ -11,7 +11,7 @@ from tre_calibration.fit import (
 
 _BASE_ARGS = [
     "--trim-ramp-windows", "0",
-    "--ttft-p95-ms", "100",
+    "--ttft-slo-mode", "fixed", "--ttft-p95-ms", "100",
     "--tpot-p95-ms", "50",
     "--reliability-target", "0.9",
     "--min-support", "3",

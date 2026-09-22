@@ -19,6 +19,12 @@ class SloSpec:
     #: older registries, and nothing online reads it.
     ttft_idle_c_ms: float | None = None
     ttft_idle_b_ms_per_token: float | None = None
+    #: The calibration label built from it (plan 2026-09-21 6.11 D6'): mode, slowdown
+    #: factor k and floor. Offline only; ``tre_calibration.labels`` falls back to its
+    #: module defaults (slowdown, 5, 500 ms) when absent.
+    ttft_slo_mode: str | None = None
+    ttft_slowdown_k: float | None = None
+    ttft_floor_ms: float | None = None
 
 
 ALT_THRESHOLD_DIRECTIONS = {"higher_is_healthier", "lower_is_healthier"}
@@ -243,6 +249,9 @@ def _parse_model(raw: dict[str, Any]) -> ModelSpec:
                 if slo.get("ttft_idle_b_ms_per_token") is not None
                 else None
             ),
+            ttft_slo_mode=(str(slo["ttft_slo_mode"]) if slo.get("ttft_slo_mode") is not None else None),
+            ttft_slowdown_k=(float(slo["ttft_slowdown_k"]) if slo.get("ttft_slowdown_k") is not None else None),
+            ttft_floor_ms=(float(slo["ttft_floor_ms"]) if slo.get("ttft_floor_ms") is not None else None),
         ),
         trs=TrsParams(
             w_p=float(trs["w_p"]),

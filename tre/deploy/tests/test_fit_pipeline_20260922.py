@@ -143,7 +143,7 @@ def test_theta_verdict_and_holdout_run_end_to_end(tmp_path: Path) -> None:
     out = tmp_path / "verdict.json"
     assert theta_verdict.main([
         "verdict", "--model", MODEL, "--fitting-csv", str(fit), "--family", f"prefill_heavy={fam}",
-        "--w-p", "0.02", "--lambda-wait", "3", "--ttft-p95-ms", "500", "--tpot-p95-ms", "75",
+        "--w-p", "0.02", "--lambda-wait", "3", "--ttft-slo-mode", "fixed", "--ttft-p95-ms", "500", "--tpot-p95-ms", "75",
         "--n-resamples", "20", "--family-resamples", "10", "--output", str(out),
     ]) == 0
     verdict = json.loads(out.read_text())

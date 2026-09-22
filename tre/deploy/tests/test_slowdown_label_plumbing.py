@@ -33,7 +33,12 @@ def test_fit_plan_defaults_to_the_slowdown_label_with_the_registry_idle_fit() ->
     reg = load_registry()
     for model in models:
         d = plan["label_def_by_model"][model]
-        assert d["mode"] == "slowdown" and d["k"] == 3.0 and d["floor_ms"] == 150.0 and d["min_n"] == 20
+        assert d["mode"] == "slowdown" and d["k"] == 5.0 and d["floor_ms"] == 500.0 and d["min_n"] == 20
+        assert d["tpot_p95_ms"] == 75.0
+        arms = plan["label_arms_by_model"][model]
+        assert arms["primary"] == d
+        assert arms["fixed_comparison"]["mode"] == "fixed" and arms["fixed_comparison"]["ttft_p95_ms"] == 500.0
+        assert arms["ablation_k3_floor150"]["k"] == 3.0 and arms["ablation_k3_floor150"]["floor_ms"] == 150.0
         assert d["c_ms"] == reg.model(model).slo.ttft_idle_c_ms
         assert d["b_ms_per_token"] == reg.model(model).slo.ttft_idle_b_ms_per_token
         # every per-model fit rebuilds exactly that label
@@ -93,3 +98,15 @@ def test_holdout_rebuilds_the_label_from_the_verdict() -> None:
     label = LabelDefinition(500.0, 75.0, ttft_slo_mode="slowdown", ttft_idle_c_ms=36.4,
                             ttft_idle_b_ms_per_token=0.0527, ttft_slowdown_k=2.0)
     assert LabelDefinition.from_dict(label.as_dict()) == label
+
+
+def test_fit_plan_ablation_arm_is_selectable() -> None:
+    class Ablation(_Args):
+        fit_ttft_slowdown_k = 3.0
+        fit_ttft_floor_ms = 150.0
+
+    plan = campaign.fit_plan(["dsqwen-7b"], Path("/out"), Path("/raw"), Ablation())
+    assert plan["label_def"]["k"] == 3.0 and plan["label_def"]["floor_ms"] == 150.0
+    for entry in plan["theta"]:
+        assert _value(entry["command"], "--ttft-slowdown-k") == "3.0"
+        assert _value(entry["command"], "--ttft-floor-ms") == "150.0"

@@ -70,7 +70,7 @@ def _verdict(tmp_path: Path, signal: str, *extra: str) -> dict:
     out = tmp_path / f"verdict_{signal}.json"
     assert theta_verdict.main([
         "verdict", "--model", MODEL, "--fitting-csv", str(fit), "--family", f"prefill_heavy={fam}",
-        "--signal", signal, "--ttft-p95-ms", "500", "--tpot-p95-ms", "75",
+        "--signal", signal, "--ttft-slo-mode", "fixed", "--ttft-p95-ms", "500", "--tpot-p95-ms", "75",
         "--n-resamples", "20", "--family-resamples", "10", "--output", str(out), *extra,
     ]) == 0
     return json.loads(out.read_text())
@@ -159,7 +159,7 @@ def test_fit_alt_thresholds_is_a_driver_over_the_verdict(tmp_path: Path) -> None
     out = tmp_path / "alt.yaml"
     assert module.main([
         "--model-input", f"{MODEL}={fit}", "--family", f"{MODEL}:prefill_heavy={fam}",
-        "--ttft-p95-ms", "500", "--tpot-p95-ms", "75", "--signal", "decode_tps",
+        "--ttft-slo-mode", "fixed", "--ttft-p95-ms", "500", "--tpot-p95-ms", "75", "--signal", "decode_tps",
         "--n-resamples", "10", "--family-resamples", "5", "--verdict-dir", str(tmp_path),
         "--output", str(out),
     ]) == 0

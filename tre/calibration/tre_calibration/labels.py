@@ -51,9 +51,16 @@ TTFT_SLO_MODE_FIXED = "fixed"
 TTFT_SLO_MODE_SLOWDOWN = "slowdown"
 TTFT_SLO_MODES = (TTFT_SLO_MODE_FIXED, TTFT_SLO_MODE_SLOWDOWN)
 
-#: Plan §6.9h defaults: k = 3 (Splitwise P90 / SLOs-Serve tight), 150 ms floor.
-DEFAULT_TTFT_SLOWDOWN_K = 3.0
-DEFAULT_TTFT_FLOOR_MS = 150.0
+#: Primary label (plan §6.11 D6', supersedes D6): ``max(500 ms, 5 * idle TTFT(L))``
+#: (DynamoLLM / SLOs-Serve loose 5x; the 500 ms floor keeps short prompts on the fixed
+#: rule - a purely length-normalised SLO turns head-of-line blocking of short prompts
+#: into violations TSS cannot see).
+DEFAULT_TTFT_SLO_MODE = TTFT_SLO_MODE_SLOWDOWN
+DEFAULT_TTFT_SLOWDOWN_K = 5.0
+DEFAULT_TTFT_FLOOR_MS = 500.0
+#: The D6 arm (plan §6.9h: k = 3, 150 ms floor), kept as the "why not pure slowdown" ablation.
+ABLATION_TTFT_SLOWDOWN_K = 3.0
+ABLATION_TTFT_FLOOR_MS = 150.0
 #: Plan §6.9g/§6.11 note 6: a p95 over fewer requests is essentially the window maximum.
 DEFAULT_MIN_COMPLETED_REQUESTS = 20
 #: Same percentile mode ``rewindow_from_raw`` uses for the p95 columns.
@@ -383,11 +390,14 @@ def add_label_arguments(parser: argparse.ArgumentParser, *, require_fixed: bool 
     parser.add_argument("--ttft-p95-ms", type=float, required=require_fixed,
                         help="fixed-mode TTFT p95 SLO (ms); recorded but unused in slowdown mode")
     parser.add_argument("--tpot-p95-ms", type=float, required=require_fixed)
-    parser.add_argument("--ttft-slo-mode", choices=TTFT_SLO_MODES, default=TTFT_SLO_MODE_FIXED,
-                        help="fixed: one TTFT p95 threshold; slowdown: max(floor, k*(c_m+b_m*L)) "
-                             "per request (plan 6.9h)")
-    parser.add_argument("--ttft-slowdown-k", type=float, default=DEFAULT_TTFT_SLOWDOWN_K)
-    parser.add_argument("--ttft-floor-ms", type=float, default=DEFAULT_TTFT_FLOOR_MS)
+    parser.add_argument("--ttft-slo-mode", choices=TTFT_SLO_MODES, default=None,
+                        help="fixed: one TTFT p95 threshold (comparison column); slowdown: "
+                             "max(floor, k*(c_m+b_m*L)) per request (primary, plan 6.11 D6-prime). "
+                             "Default: the registry slo.ttft_slo_mode of the model, else slowdown")
+    parser.add_argument("--ttft-slowdown-k", type=float, default=None,
+                        help=f"default: registry slo.ttft_slowdown_k, else {DEFAULT_TTFT_SLOWDOWN_K}")
+    parser.add_argument("--ttft-floor-ms", type=float, default=None,
+                        help=f"default: registry slo.ttft_floor_ms, else {DEFAULT_TTFT_FLOOR_MS}")
     parser.add_argument("--ttft-idle-c-ms", type=float, default=None,
                         help="override the registry slo.ttft_idle_c_ms of the model")
     parser.add_argument("--ttft-idle-b-ms-per-token", type=float, default=None,
@@ -399,18 +409,38 @@ def add_label_arguments(parser: argparse.ArgumentParser, *, require_fixed: bool 
 
 
 def label_def_from_args(args: argparse.Namespace, model: Optional[str]) -> LabelDefinition:
-    """Build the label for one model from the shared CLI arguments + registry profile."""
-    mode = getattr(args, "ttft_slo_mode", TTFT_SLO_MODE_FIXED)
+    """Build the label for one model from the shared CLI arguments + registry profile.
+
+    Precedence per field: explicit CLI value > the model's registry ``slo`` block > the
+    module default (the D6' primary label: slowdown, k = 5, floor 500 ms, TPOT 75 ms)."""
+    mode = getattr(args, "ttft_slo_mode", None)
+    k = getattr(args, "ttft_slowdown_k", None)
+    floor = getattr(args, "ttft_floor_ms", None)
     c = getattr(args, "ttft_idle_c_ms", None)
     b = getattr(args, "ttft_idle_b_ms_per_token", None)
+    slo = None
+    if mode != TTFT_SLO_MODE_FIXED and model and None in (mode, k, floor, c, b):
+        from tre_common.registry import load_registry
+
+        registry = load_registry(getattr(args, "label_registry", None))
+        try:
+            slo = registry.model(model).slo
+        except KeyError:
+            slo = None
+    if mode is None:
+        mode = (slo.ttft_slo_mode if slo is not None else None) or DEFAULT_TTFT_SLO_MODE
+    if k is None:
+        k = slo.ttft_slowdown_k if slo is not None and slo.ttft_slowdown_k is not None else DEFAULT_TTFT_SLOWDOWN_K
+    if floor is None:
+        floor = slo.ttft_floor_ms if slo is not None and slo.ttft_floor_ms is not None else DEFAULT_TTFT_FLOOR_MS
     if mode == TTFT_SLO_MODE_SLOWDOWN and (c is None or b is None):
         if not model:
             raise SystemExit(
-                "--ttft-slo-mode slowdown needs a model name or --ttft-idle-c-ms/--ttft-idle-b-ms-per-token"
+                "--ttft-slo-mode slowdown (the default) needs a model name or --ttft-idle-c-ms/"
+                "--ttft-idle-b-ms-per-token; pass --ttft-slo-mode fixed for the 500 ms label"
             )
-        from tre_common.registry import load_registry
-
-        slo = load_registry(getattr(args, "label_registry", None)).model(model).slo
+        if slo is None:
+            raise SystemExit(f"registry has no model {model}: pass its idle TTFT fit or --ttft-slo-mode fixed")
         c = slo.ttft_idle_c_ms if c is None else c
         b = slo.ttft_idle_b_ms_per_token if b is None else b
         if c is None or b is None:
@@ -421,12 +451,26 @@ def label_def_from_args(args: argparse.Namespace, model: Optional[str]) -> Label
         ttft_p95_ms=500.0 if ttft is None else ttft,
         tpot_p95_ms=75.0 if tpot is None else tpot,
         ttft_slo_mode=mode,
-        ttft_slowdown_k=getattr(args, "ttft_slowdown_k", DEFAULT_TTFT_SLOWDOWN_K),
-        ttft_floor_ms=getattr(args, "ttft_floor_ms", DEFAULT_TTFT_FLOOR_MS),
+        ttft_slowdown_k=float(k),
+        ttft_floor_ms=float(floor),
         ttft_idle_c_ms=c if mode == TTFT_SLO_MODE_SLOWDOWN else None,
         ttft_idle_b_ms_per_token=b if mode == TTFT_SLO_MODE_SLOWDOWN else None,
         min_completed_requests=getattr(args, "min_completed_requests", DEFAULT_MIN_COMPLETED_REQUESTS),
     )
+
+
+def label_arms(primary: LabelDefinition) -> dict[str, LabelDefinition]:
+    """The labels every published fit reports (plan §6.11 D6'): the primary slowdown
+    label, the fixed 500/75 ms comparison column and the k = 3 / 150 ms-floor ablation."""
+    if not primary.slowdown:
+        raise ValueError("label arms are built from the slowdown primary label")
+    return {
+        "primary": primary,
+        "fixed_comparison": replace(primary, ttft_slo_mode=TTFT_SLO_MODE_FIXED,
+                                    ttft_idle_c_ms=None, ttft_idle_b_ms_per_token=None),
+        "ablation_k3_floor150": replace(primary, ttft_slowdown_k=ABLATION_TTFT_SLOWDOWN_K,
+                                        ttft_floor_ms=ABLATION_TTFT_FLOOR_MS),
+    }
 
 
 def label_cli_args(label: LabelDefinition) -> list[str]:

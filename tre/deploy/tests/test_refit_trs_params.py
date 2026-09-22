@@ -245,7 +245,7 @@ def test_cli_writes_report_from_csv(tmp_path) -> None:
             "--output", str(out),
             "--model-name", "dsqwen-7b",
             "--trim-ramp-windows", "0",
-            "--ttft-p95-ms", str(_TTFT_SLO),
+            "--ttft-slo-mode", "fixed", "--ttft-p95-ms", str(_TTFT_SLO),
             "--tpot-p95-ms", str(_TPOT_SLO),
             "--inherited-w-p", "0.08",
             "--inherited-lambda-wait", "1.875",

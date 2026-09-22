@@ -180,12 +180,14 @@ def test_per_model_idle_fit_comes_from_the_registry() -> None:
         slo = reg.model(model).slo
         label = label_def_from_args(args, model)
         assert (label.ttft_idle_c_ms, label.ttft_idle_b_ms_per_token) == (slo.ttft_idle_c_ms, slo.ttft_idle_b_ms_per_token)
-        assert label.ttft_slowdown_k == 3.0 and label.ttft_floor_ms == 150.0 and label.min_completed_requests == 20
+        assert label.ttft_slowdown_k == 5.0 and label.ttft_floor_ms == 500.0 and label.min_completed_requests == 20
+        assert (label.ttft_slowdown_k, label.ttft_floor_ms) == (slo.ttft_slowdown_k, slo.ttft_floor_ms)
         seen.add(label.ttft_slo_ms(2048))
     assert len(seen) == 3
     # an explicit override wins over the registry
     args = _parser().parse_args(["--ttft-p95-ms", "500", "--tpot-p95-ms", "75", "--ttft-slo-mode", "slowdown",
-                                 "--ttft-idle-c-ms", "30", "--ttft-idle-b-ms-per-token", "0.1"])
+                                 "--ttft-idle-c-ms", "30", "--ttft-idle-b-ms-per-token", "0.1",
+                                 "--ttft-slowdown-k", "3", "--ttft-floor-ms", "150"])
     assert label_def_from_args(args, "dsqwen-7b") == SLOW
 
 
@@ -212,3 +214,32 @@ def test_dataset_loader_uses_the_definition(tmp_path: Path) -> None:
     assert [w.violation_class for w in slow] == ["ttft_only", None]
     assert [w.slo_met for w in fixed] == [True, True]
     assert slow[0].latency_ratio_avg is None
+
+
+def test_d6_prime_primary_label_is_the_default() -> None:
+    """Plan 6.11 D6': no mode flag -> slowdown, k = 5, floor 500 ms, TPOT 75 ms."""
+    args = _parser().parse_args(["--ttft-p95-ms", "500", "--tpot-p95-ms", "75"])
+    label = label_def_from_args(args, "dsqwen-7b")
+    assert label.slowdown and label.ttft_slowdown_k == 5.0 and label.ttft_floor_ms == 500.0
+    assert label.tpot_p95_ms == 75.0
+    # 7b idle at 2048 tok: 36.4 + 0.0527 * 2048 = 144.3 ms -> 5x = 721.5 ms; short prompts sit on the floor
+    assert abs(label.ttft_slo_ms(2048) - 5 * (36.4 + 0.0527 * 2048)) < 1e-9
+    assert label.ttft_slo_ms(256) == 500.0
+    # the fixed comparison column stays selectable
+    fixed = label_def_from_args(_parser().parse_args(["--ttft-slo-mode", "fixed", "--ttft-p95-ms", "500", "--tpot-p95-ms", "75"]), "dsqwen-7b")
+    assert not fixed.slowdown and fixed.ttft_p95_ms == 500.0 and fixed.as_dict()["mode"] == "fixed"
+    # without a model the slowdown default cannot be built: refused, not silently fixed
+    with pytest.raises(SystemExit):
+        label_def_from_args(args, None)
+
+
+def test_label_arms_primary_comparison_ablation() -> None:
+    from tre_calibration.labels import label_arms
+
+    primary = label_def_from_args(_parser().parse_args(["--ttft-p95-ms", "500", "--tpot-p95-ms", "75"]), "dsllama-8b")
+    arms = label_arms(primary)
+    assert arms["primary"] == primary
+    assert arms["fixed_comparison"].as_dict()["mode"] == "fixed"
+    abl = arms["ablation_k3_floor150"]
+    assert abl.slowdown and (abl.ttft_slowdown_k, abl.ttft_floor_ms) == (3.0, 150.0)
+    assert (abl.ttft_idle_c_ms, abl.ttft_idle_b_ms_per_token) == (primary.ttft_idle_c_ms, primary.ttft_idle_b_ms_per_token)
