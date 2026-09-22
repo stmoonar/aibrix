@@ -193,6 +193,85 @@ def is_held_out(shape_name: str) -> bool:
     """True for shapes that exist to validate a fit and must never enter one."""
     return shape_name == MIXTURE_NAME
 
+
+# ---- static steady-state grid (opt-in: calibration_campaign --static-grid) ----
+#: v1's calibration (``/root/aibrix-main/python/tre/calibration_runs/20260530``) drove a
+#: wide *static* grid - prompt 300..800 x output 300..800 step 100 x RPS 4..7 (14b 3..7),
+#: 120 s per point - where v2 has seven shapes. The seven leave the (input, output) plane
+#: empty between their corners, and every shape's boundary is then located on one
+#: (input, output) point only; plan 2026-09-21 §6.9g keeps v1's grid as the one thing
+#: worth borrowing, subsampled to a few cells per family.
+#:
+#: These shapes are **opt-in** and deliberately in neither :data:`TRAINING_SHAPES` nor
+#: :data:`ALL_SHAPES`: the committed schedule set, the default campaign and the default
+#: fit plan do not change. When a campaign runs them they are training cells (never held
+#: out, never M) - :func:`training_shapes` / :func:`families` with ``static_grid=True``.
+STATIC_PRIMITIVE = "static"
+#: Lengths that fill the gaps between the seven shapes (S1/S4 at 256, S2/S5 at 768,
+#: T8 at 1600, S3 at 2048 in; 96..448 out).
+STATIC_GRID_INPUTS: tuple[int, ...] = (400, 1200)
+STATIC_GRID_OUTPUTS: tuple[int, ...] = (160, 320)
+#: Offered load of a static cell as a fraction of the shape's boundary load rho*
+#: (rho/rho*): just below, at, and just past the SLO boundary, where theta is decided.
+STATIC_GRID_RHO_FRACTIONS: tuple[float, ...] = (0.85, 1.0, 1.1)
+#: Hold per static cell. Longer than v1's 120 s so a cell yields independent windows
+#: after the EMA and the 30 s window have settled (plan §6.1: independent ~ windows / 6).
+STATIC_GRID_HOLD_S = 300.0
+#: Static cells' load codes: 2000 + round(100 * rho/rho*). Clear of the fixed primitives
+#: (60/95/120) and of the boundary holds (1000 + round(100 * rho)), so a static cell can
+#: never share a cell id - and therefore a raw directory - with any other cell.
+STATIC_LOAD_CODE_BASE = 2000
+
+
+def static_grid_shape_name(input_tokens: int, output_tokens: int) -> str:
+    """``G<in>x<out>``: one token with no underscore, because ``rewindow_from_raw``
+    reads the shape back from the cell directory name ``<model>_<shape>_<rest>``."""
+    return f"G{int(input_tokens)}x{int(output_tokens)}"
+
+
+STATIC_GRID_SHAPES: dict[str, tuple[int, int]] = {
+    static_grid_shape_name(i, o): (i, o)
+    for i in STATIC_GRID_INPUTS
+    for o in STATIC_GRID_OUTPUTS
+}
+
+#: Family of a static-grid shape, from its prompt/output ratio i/o. The thresholds are
+#: the ones the committed families already satisfy (prefill_heavy S3 21.3, T8 14.3;
+#: decode_heavy S4 0.57, S5 2.0). A shape between the two is in no family: it enters the
+#: merged fit only, like S1/S2/T9. The committed shapes keep their explicit membership.
+STATIC_FAMILY_PREFILL_MIN_RATIO = 6.0
+STATIC_FAMILY_DECODE_MAX_RATIO = 2.0
+
+
+def static_grid_family(input_tokens: int, output_tokens: int) -> Optional[str]:
+    ratio = float(input_tokens) / float(output_tokens)
+    if ratio >= STATIC_FAMILY_PREFILL_MIN_RATIO:
+        return "prefill_heavy"
+    if ratio <= STATIC_FAMILY_DECODE_MAX_RATIO:
+        return "decode_heavy"
+    return None
+
+
+def static_load_code(fraction: float) -> int:
+    """Offered-load code of a static cell: ``2000 + round(100 * rho/rho*)``."""
+    return STATIC_LOAD_CODE_BASE + max(1, int(round(100.0 * float(fraction))))
+
+
+def training_shapes(*, static_grid: bool = False) -> tuple[str, ...]:
+    """The shapes a theta may be fitted on; the static grid's only when it is enabled."""
+    return (*TRAINING_SHAPES, *STATIC_GRID_SHAPES) if static_grid else TRAINING_SHAPES
+
+
+def families(*, static_grid: bool = False) -> dict[str, tuple[str, ...]]:
+    """:data:`FAMILIES`, plus each static-grid shape in the family its ratio assigns."""
+    out = {name: tuple(members) for name, members in FAMILIES.items()}
+    if static_grid:
+        for shape, (i, o) in STATIC_GRID_SHAPES.items():
+            family = static_grid_family(i, o)
+            if family is not None:
+                out[family] = (*out[family], shape)
+    return out
+
 # ---- primitive parameters (single source of truth; the index records them) ----
 RAMP_RHO_START = 0.4
 RAMP_RHO_END = 1.2
@@ -355,6 +434,9 @@ def shape_components(
         return MIXTURE
     if shape_name in SAMPLED_SHAPES:
         i, o = SAMPLED_SHAPES[shape_name]
+        return ((1.0, i, o),)
+    if shape_name in STATIC_GRID_SHAPES:
+        i, o = STATIC_GRID_SHAPES[shape_name]
         return ((1.0, i, o),)
     i, o = SHAPES[shape_name]
     return ((1.0, i, o),)
@@ -558,6 +640,7 @@ def build_schedule_from_capacity_rps(
     hold_rho: Optional[float] = None,
     hold_duration_s: Optional[float] = None,
     hold_stage: str = "",
+    static_fraction: Optional[float] = None,
 ) -> tuple[Optional[dict], dict]:
     """(trace.json body, index metadata) for one (model, shape, primitive) at an
     explicitly supplied single-pod capacity, so a campaign can regenerate a schedule from
@@ -596,6 +679,13 @@ def build_schedule_from_capacity_rps(
                 "and hold_duration_s - it exists to sit at one explicitly chosen rho"
             )
         load_code = hold_load_code(hold_rho)
+    elif primitive == STATIC_PRIMITIVE:
+        if hold_rho is None or hold_duration_s is None or static_fraction is None:
+            raise ValueError(
+                f"{model} {shape_name}: the {STATIC_PRIMITIVE!r} primitive needs hold_rho, "
+                "hold_duration_s and static_fraction (its rho/rho*)"
+            )
+        load_code = static_load_code(static_fraction)
     else:
         load_code = LOAD_CODE[primitive]
     if primitive == "bursts" and kv_cache_tokens is None:
@@ -645,7 +735,9 @@ def build_schedule_from_capacity_rps(
         def build(weight: float) -> list[dict]:
             return step_segments(c_s * weight)
 
-    elif primitive == HOLD_PRIMITIVE:
+    elif primitive in (HOLD_PRIMITIVE, STATIC_PRIMITIVE):
+        # A static-grid cell is the same constant-rate open-loop hold as a boundary
+        # probe; only its rho comes from a plan instead of from the previous probe.
         rho = float(hold_rho)
         duration = float(hold_duration_s)
         extra = {
@@ -654,6 +746,8 @@ def build_schedule_from_capacity_rps(
             "stage": hold_stage,
             "offered_rps": round(rho * c_s, 4),
         }
+        if primitive == STATIC_PRIMITIVE:
+            extra["rho_over_rho_star"] = float(static_fraction)
 
         def build(weight: float) -> list[dict]:
             return hold_segments(c_s * weight, rho, duration)

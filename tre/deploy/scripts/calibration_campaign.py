@@ -70,6 +70,14 @@ void costs and two copies of it drift. Continuing instead - which is what
 ``--guard-mode warn`` did on its own - writes a zero-row CSV per cell and still prints
 ``campaign complete``: five hours of offered load and no rows anywhere.
 
+Static grid (opt-in)
+--------------------
+``--static-grid`` appends v1-style steady-state cells after the stages above: per model,
+2 inputs x 2 outputs x 3 offered loads (rho/rho* 0.85 / 1.0 / 1.1), 300 s each, placed
+from a previous campaign's measured boundaries (:mod:`scripts.static_grid`, default the
+2026-09-21 campaign). ``--static-grid-only`` drives just those cells; ``--static-grid-list``
+prints them with the GPU-minute estimate and exits. Without the flag nothing changes.
+
 Artifacts
 ---------
 Per cell, under ``--raw-dir``: the per-request raw JSONL, the 1 Hz instant sidecar, the
@@ -98,6 +106,7 @@ from scripts import adaptive_boundary as boundary
 from scripts import admission_cap as admission
 from scripts import gen_calibration_schedules as gen
 from scripts import openloop
+from scripts import static_grid
 from scripts.openloop import LIVE_GRID_MS
 
 #: Stage a shape's boundary search occupies in the campaign order. It is not one of
@@ -915,14 +924,33 @@ def fit_plan(
 
     fit_dir = out_dir / "fit"
     held_out_cells = sorted(held_out_cell_ids(index or {}))
+    use_static = static_grid_enabled(args)
+    families = gen.families(static_grid=use_static)
     plan = {
         "generated_at_utc": utc_iso(),
         "window_ms": args.window_ms,
         "step_ms": args.fit_step_ms,
         "held_out_shapes": [s for s in gen.ALL_SHAPES if gen.is_held_out(s)],
         "held_out_cell_ids": held_out_cells,
-        "training_shapes": list(gen.TRAINING_SHAPES),
-        "families": {name: list(members) for name, members in gen.FAMILIES.items()},
+        "training_shapes": list(gen.training_shapes(static_grid=use_static)),
+        "families": {name: list(members) for name, members in families.items()},
+        "static_grid": {
+            "enabled": use_static,
+            "shapes": {
+                shape: {
+                    "input_tokens": i,
+                    "output_tokens": o,
+                    "family": gen.static_grid_family(i, o),
+                    "held_out": gen.is_held_out(shape),
+                }
+                for shape, (i, o) in gen.STATIC_GRID_SHAPES.items()
+            } if use_static else {},
+            "family_rule": (
+                f"i/o >= {gen.STATIC_FAMILY_PREFILL_MIN_RATIO:g} -> prefill_heavy; "
+                f"i/o <= {gen.STATIC_FAMILY_DECODE_MAX_RATIO:g} -> decode_heavy; "
+                "otherwise merged fit only"
+            ),
+        },
         "order": ["rewindow", "theta", "verdict", "ablation", "alt", "holdout"],
         "label_def": LabelDefinition(args.ttft_slo_ms, args.tpot_slo_ms).as_dict(),
         "ema_tau_ms": DEFAULT_EMA_TAU_MS,
@@ -1015,7 +1043,7 @@ def fit_plan(
             })
 
         scopes: list[tuple[str, str, Path]] = [("", "", fitting_csv)]
-        for family, shapes in sorted(gen.FAMILIES.items()):
+        for family, shapes in sorted(families.items()):
             family_csv = fit_dir / f"{model}_fitting_{family}.csv"
             scopes.append((family, f"family_{family}", family_csv))
             plan["rewindow"].append({
@@ -1058,7 +1086,7 @@ def fit_plan(
                     ],
                 }
                 if family:
-                    entry["shapes"] = list(gen.FAMILIES[family])
+                    entry["shapes"] = list(families[family])
                     entry["purpose"] = (
                         "diagnostic only - its theta is compared against the merged fit's "
                         "bootstrap CI, never published on its own unless the families disagree"
@@ -1139,7 +1167,7 @@ def fit_plan(
                 *[
                     a
                     for m in fitting_by_model
-                    for family in sorted(gen.FAMILIES)
+                    for family in sorted(families)
                     for a in ("--family", f"{m}:{family}={fit_dir / f'{m}_fitting_{family}.csv'}")
                 ],
                 *slo,
@@ -1248,6 +1276,86 @@ def drive_boundary_search(
     )
 
 
+def static_grid_enabled(args) -> bool:
+    return bool(getattr(args, "static_grid", False) or getattr(args, "static_grid_only", False))
+
+
+def plan_static_cells(args, models: Sequence[str]) -> tuple[list, dict]:
+    """(static cells, surfaces) for ``--static-grid``, from ``--static-grid-source``."""
+    source = Path(args.static_grid_source)
+    surfaces = {m: static_grid.load_surface(source, m) for m in models}
+    cells = static_grid.plan_static_grid(
+        models,
+        surfaces,
+        gpus=static_grid.model_gpus(models, getattr(args, "registry", None)),
+        hold_s=args.static_grid_hold_s,
+    )
+    return cells, surfaces
+
+
+def drive_static_cell(
+    cell: "static_grid.StaticCell",
+    args,
+    *,
+    cap: admission.AdmissionCap,
+    schedule_dir: Path,
+    out_dir: Path,
+    raw_dir: Path,
+    position: str,
+) -> int:
+    """Generate one static cell's constant-rate schedule and drive it like any other cell
+    (void -> re-run once -> stop). Returns r3_grid's exit code; raises CellVoided."""
+    body, meta = gen.build_schedule_from_capacity_rps(
+        cell.model,
+        cell.shape,
+        gen.STATIC_PRIMITIVE,
+        cell.capacity_rps,
+        capacity_source=static_grid.CAPACITY_SOURCE,
+        cap=cap,
+        hold_rho=cell.rho,
+        hold_duration_s=cell.duration_s,
+        hold_stage="static_grid",
+        static_fraction=cell.rho_over_rho_star,
+    )
+    assert body is not None and meta["cell_id"] == cell.cell_id
+    schedule_path = schedule_dir / cell.model / f"{cell.stem}.json"
+    schedule_path.parent.mkdir(parents=True, exist_ok=True)
+    schedule_path.write_text(json.dumps(body, indent=2) + "\n", encoding="utf-8")
+    (schedule_path.parent / f"{cell.stem}.meta.json").write_text(
+        json.dumps({**meta, "static_grid": cell.as_dict()}, indent=2) + "\n", encoding="utf-8"
+    )
+    run_cell = Cell(
+        model=cell.model,
+        shape=cell.shape,
+        primitive=gen.STATIC_PRIMITIVE,
+        cell_id=cell.cell_id,
+        schedule=str(schedule_path),
+        duration_s=cell.duration_s,
+        capacity_rps=cell.capacity_rps,
+        capacity_source=static_grid.CAPACITY_SOURCE,
+        metadata=meta,
+    )
+    base_output = out_dir / f"{cell.model}_{cell.stem}.csv"
+    exit_code = 0
+
+    def drive(attempt: int) -> dict:
+        nonlocal exit_code
+        output = attempt_output_path(base_output, attempt)
+        if attempt > 1:
+            time.sleep(args.cooldown_s)
+        command = cell_command(run_cell, args, schedule_path, output)
+        print(f"[{position}] static {cell.model} {cell.shape} rho/rho*={cell.rho_over_rho_star:g} "
+              f"rho={cell.rho:g} ({cell.duration_s:.0f}s, attempt {attempt}): {' '.join(command)}")
+        result = subprocess.run(command, check=False)
+        exit_code = result.returncode
+        if result.returncode != 0:
+            print(f"cell failed with exit {result.returncode}")
+        return read_cell_guard(raw_dir, output, cell.cell_id, returncode=result.returncode)
+
+    drive_until_valid(cell.cell_id, drive)
+    return exit_code
+
+
 def run_campaign(args) -> int:
     index_path = Path(args.index)
     index = json.loads(index_path.read_text(encoding="utf-8"))
@@ -1255,6 +1363,12 @@ def run_campaign(args) -> int:
                             or admission.DEFAULT_CAP_NAME)
     models = [m for m in args.models.split(",") if m]
     runnable, skipped = build_plan(index, models)
+    static_cells: list = []
+    static_surfaces: dict = {}
+    if static_grid_enabled(args):
+        static_cells, static_surfaces = plan_static_cells(args, models)
+    if getattr(args, "static_grid_only", False):
+        runnable, skipped = [], []
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1271,6 +1385,7 @@ def run_campaign(args) -> int:
     boundary_cells = boundary_plan(models, boundary_shapes)
     schedule_seconds = estimate_wall_clock_s(runnable, args.cooldown_s)
     boundary_seconds = estimate_boundary_wall_clock_s(boundary_cells, args.cooldown_s)
+    static_seconds = sum(c.duration_s + args.cooldown_s for c in static_cells)
     plan_doc = {
         "generated_at_utc": utc_iso(),
         "admission_cap": cap.as_dict(),
@@ -1287,7 +1402,15 @@ def run_campaign(args) -> int:
         ],
         "estimated_schedule_wall_clock_s": round(schedule_seconds, 1),
         "estimated_boundary_wall_clock_s": round(boundary_seconds, 1),
-        "estimated_wall_clock_s": round(schedule_seconds + boundary_seconds, 1),
+        "estimated_static_grid_wall_clock_s": round(static_seconds, 1),
+        "estimated_wall_clock_s": round(schedule_seconds + boundary_seconds + static_seconds, 1),
+        "static_grid": {
+            "enabled": static_grid_enabled(args),
+            "only": bool(getattr(args, "static_grid_only", False)),
+            "cells": [c.as_dict() for c in static_cells],
+            "surfaces": {m: s.as_dict() for m, s in static_surfaces.items()},
+            "estimate": static_grid.estimate(static_cells, args.cooldown_s) if static_cells else {},
+        },
     }
     (out_dir / "plan.json").write_text(json.dumps(plan_doc, indent=2) + "\n", encoding="utf-8")
     (out_dir / "fit_plan.json").write_text(
@@ -1307,6 +1430,8 @@ def run_campaign(args) -> int:
               f"{cell.duration_s:6.0f}s  C_s={cell.capacity_rps:7.3f}")
     for cell in skipped:
         print(f"  SKIP {cell.model:12} {cell.shape:3} {cell.primitive:7}  {cell.skip_reason}")
+    if static_cells:
+        print(static_grid.format_listing(static_cells, args.cooldown_s))
 
     if args.dry_run:
         print(f"dry run: wrote {out_dir / 'plan.json'} and {out_dir / 'fit_plan.json'}")
@@ -1427,6 +1552,22 @@ def run_campaign(args) -> int:
         if position < len(runnable):
             time.sleep(args.cooldown_s)
 
+    # Static grid last: a campaign truncated here still has every default stage.
+    for number, static_cell in enumerate(static_cells, start=1):
+        if runnable or number > 1:
+            time.sleep(args.cooldown_s)
+        try:
+            exit_code = drive_static_cell(
+                static_cell, args, cap=cap, schedule_dir=regenerated_dir,
+                out_dir=out_dir, raw_dir=raw_dir,
+                position=f"static {number}/{len(static_cells)}",
+            )
+        except CellVoided as voided:
+            print(str(voided))
+            return 1
+        if exit_code != 0 and args.stop_on_failure:
+            return exit_code
+
     print(f"campaign complete; artifacts under {out_dir}")
     return 0
 
@@ -1488,7 +1629,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--controller-namespace", default="tre-v2")
     ap.add_argument("--dry-run", action="store_true",
                     help="write plan.json and fit_plan.json, drive nothing")
+    ap.add_argument("--static-grid", action="store_true",
+                    help="append the opt-in static steady-state grid (scripts.static_grid) "
+                         "after the default stages; its shapes join the training set and "
+                         "their families in fit_plan.json")
+    ap.add_argument("--static-grid-only", action="store_true",
+                    help="drive only the static grid (implies --static-grid)")
+    ap.add_argument("--static-grid-list", action="store_true",
+                    help="print the static-grid cells and the GPU-minute estimate, then "
+                         "exit (reads the source campaign's JSONs only; needs no index)")
+    ap.add_argument("--static-grid-source", type=Path,
+                    default=static_grid.DEFAULT_SOURCE_CAMPAIGN,
+                    help="campaign out-dir whose <model>/capacity and <model>/boundary "
+                         "JSONs place the grid")
+    ap.add_argument("--static-grid-hold-s", type=float, default=gen.STATIC_GRID_HOLD_S)
     args = ap.parse_args(argv)
+    if args.static_grid_list:
+        models = [m for m in args.models.split(",") if m]
+        cells, _surfaces = plan_static_cells(args, models)
+        print(static_grid.format_listing(cells, args.cooldown_s))
+        return 0
     if args.cooldown_s * 1000.0 < args.window_ms:
         # Quiet time must cover at least one metrics window: the offline fit resets the
         # EMA per cell, which matches the controller only when the online EMA saw an idle
