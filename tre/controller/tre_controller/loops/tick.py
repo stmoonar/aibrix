@@ -415,7 +415,9 @@ def _model_contexts(
                 theta_m=spec.trs.theta_m,
                 window_end_ms=metrics.window_end_ms,
             )
-            signal = get_signal(metrics, spec, signal_source, trs_z_m=result.Z_m)
+            signal = get_signal(
+                metrics, spec, signal_source, trs_z_m=result.Z_m, signal_state=signal_state
+            )
             # F-onset warmup guard: signal is trustworthy on the low side only once the
             # window lies fully inside the traffic period (see SignalState.observe_traffic).
             if signal_state is not None:

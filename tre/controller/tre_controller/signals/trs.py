@@ -6,7 +6,7 @@ from typing import Any
 
 from tre_common.metrics_schema import ModelWindowMetrics
 from tre_common.registry import TrsParams
-from tre_common.tss import ema_step, replica_factor, tss_terms
+from tre_common.tss import TssEma, ema_step, replica_factor, signal_ema, tss_terms
 
 
 @dataclass
@@ -269,6 +269,9 @@ class SignalState:
         # (pre-fix behaviour, for A/B ablation), >0 = explicit span since onset.
         self._warmup_ms = warmup_ms
         self._onset_ms: dict[str, int | None] = {}
+        # One EMA per (model, alternative signal), same tau/alpha as the TSS EMA
+        # (plan §6.9 item 4); see tre_controller.signals.sources._thresholded_signal.
+        self._signal_ema: dict[tuple[str, str], TssEma] = {}
 
     def computer_for(self, model: str, *, ema_alpha: float, ema_tau_ms: float | None) -> TRSComputer:
         computer = self._by_model.get(model)
@@ -276,6 +279,22 @@ class SignalState:
             computer = TRSComputer(ema_alpha=ema_alpha, ema_tau_ms=ema_tau_ms)
             self._by_model[model] = computer
         return computer
+
+    def smooth_signal(
+        self, model: str, source: str, raw: float | None, *, window_end_ms: int, tau_ms: float
+    ) -> float | None:
+        """EMA'd value of an alternative signal (``tre_common.tss.signal_ema``).
+
+        Advances at most once per distinct ``window_end_ms`` (``TssEma`` keeps its value
+        on a repeated window), so the rescue/fairness/safescale re-reads of one snapshot
+        do not over-smooth - the same dedup rule as the TSS EMA.
+        """
+        key = (model, source)
+        ema = self._signal_ema.get(key)
+        if ema is None or ema.tau_ms != float(tau_ms):
+            ema = signal_ema(tau_ms)
+            self._signal_ema[key] = ema
+        return ema.update(raw, window_end_ms)
 
     def observe_traffic(
         self, model: str, *, has_traffic: bool, window_start_ms: int, window_end_ms: int

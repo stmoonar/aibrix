@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from tre_calibration.labels import label_window
-from tre_common.tss import DEFAULT_EMA_TAU_MS, TssEma, replica_factor, tss_queue, tss_terms
+from tre_common.tss import DEFAULT_EMA_TAU_MS, TssEma, replica_factor, signal_ema, tss_queue, tss_terms
 
 
 _LATENCY_COLUMNS = {
@@ -63,31 +63,54 @@ class TssRecompute:
         }
 
 
-def recompute_tss_rows(
-    rows: Sequence[Mapping[str, Any]], params: TssRecompute
+def smooth_rows_by_cell(
+    rows: Sequence[Mapping[str, Any]],
+    raws: Sequence[float | None],
+    *,
+    make_ema: Callable[[], TssEma],
 ) -> list[float | None]:
-    """One TSS value per CSV row (``None`` = undefined or not computable).
+    """EMA ``raws`` cell by cell in CSV order - the one offline smoothing path.
 
     Cells are contiguous blocks of rows (a new block starts when ``scenario_id`` changes
     or ``window_end_ms`` goes backwards), which is how ``rewindow_from_raw`` writes them.
+    Every row of a cell advances the EMA, including rows a later filter drops, because
+    the online EMA saw them too. ``make_ema`` builds a fresh EMA per cell: ``TssEma`` for
+    TSS, :func:`tre_common.tss.signal_ema` for the alternative signals - the same class,
+    tau and alpha the controller uses.
     """
     values: list[float | None] = []
     ema: TssEma | None = None
     prev_cell: str | None = None
     prev_end: float | None = None
+    for row, raw in zip(rows, raws):
+        end = _as_float(row.get("window_end_ms"))
+        if end is None:
+            raise ValueError("EMA smoothing needs a window_end_ms column")
+        cell = str(row.get("scenario_id") or "")
+        if ema is None or cell != prev_cell or (prev_end is not None and end < prev_end):
+            ema = make_ema()
+        prev_cell, prev_end = cell, end
+        values.append(ema.update(raw, end))
+    return values
+
+
+def recompute_tss_rows(
+    rows: Sequence[Mapping[str, Any]], params: TssRecompute
+) -> list[float | None]:
+    """One TSS value per CSV row (``None`` = undefined or not computable).
+
+    Raw TSS per row, then :func:`smooth_rows_by_cell` when ``params.ema_tau_ms`` is set.
+    """
+    raws: list[float | None] = []
     for row in rows:
         start = _as_float(row.get("window_start_ms"))
         end = _as_float(row.get("window_end_ms"))
         if start is None or end is None:
             raise ValueError("TSS recompute needs window_start_ms and window_end_ms columns")
-        cell = str(row.get("scenario_id") or "")
-        if ema is None or cell != prev_cell or (prev_end is not None and end < prev_end):
-            ema = TssEma(params.ema_tau_ms) if params.ema_tau_ms is not None else None
-        prev_cell, prev_end = cell, end
         prompt = _as_float(row.get("prompt_tokens_total"))
         generation = _as_float(row.get("generation_tokens_total"))
         if prompt is None or generation is None:
-            values.append(None)  # tokens missing: the controller computes nothing either
+            raws.append(None)  # tokens missing: the controller computes nothing either
             continue
         terms = tss_terms(
             prompt_tokens=prompt,
@@ -105,11 +128,11 @@ def recompute_tss_rows(
                 _as_float(row.get("routable_pods"), 1.0) or 1.0,
             ),
         )
-        value = terms.raw
-        if ema is not None:
-            value = ema.update(value, end)
-        values.append(value)
-    return values
+        raws.append(terms.raw)
+    if params.ema_tau_ms is None:
+        return raws
+    tau = params.ema_tau_ms
+    return smooth_rows_by_cell(rows, raws, make_ema=lambda: TssEma(tau))
 
 
 def load_windows_from_csv(
@@ -121,6 +144,7 @@ def load_windows_from_csv(
     trim_ramp_windows: int = 0,
     lambda_wait: float | None = None,
     tss: TssRecompute | None = None,
+    ema_tau_ms: float | None = None,
 ) -> list[CalibrationWindow]:
     """Load per-window calibration rows from a load-scan CSV.
 
@@ -136,6 +160,10 @@ def load_windows_from_csv(
 
     ``tss`` recomputes the signal from the raw columns (see :class:`TssRecompute`) and
     takes precedence over ``signal_column`` / ``signal_transform``.
+
+    ``ema_tau_ms`` smooths a column / transform signal with the alternative-signal EMA
+    (:func:`tre_common.tss.signal_ema`) over every row of each cell, as the controller
+    does online (plan §6.9 item 4). It is ignored with ``tss``, which carries its own tau.
     """
     active_columns = _resolve_latency_columns(latency_slo_ms)
     if not active_columns:
@@ -144,7 +172,17 @@ def load_windows_from_csv(
     windows: list[CalibrationWindow] = []
     with Path(path).open("r", encoding="utf-8", newline="") as f:
         all_rows = list(csv.DictReader(f))
-    recomputed = recompute_tss_rows(all_rows, tss) if tss is not None else None
+    if tss is not None:
+        recomputed: list[float | None] | None = recompute_tss_rows(all_rows, tss)
+    elif ema_tau_ms is not None:
+        raws = [
+            _as_float(signal_transform(row) if signal_transform is not None else row.get(signal_column))
+            for row in all_rows
+        ]
+        tau = float(ema_tau_ms)
+        recomputed = smooth_rows_by_cell(all_rows, raws, make_ema=lambda: signal_ema(tau))
+    else:
+        recomputed = None
     for index, row in enumerate(all_rows):
         if _skip_row(row):
             continue

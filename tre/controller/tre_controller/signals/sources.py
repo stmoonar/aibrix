@@ -1,15 +1,35 @@
+"""Control signals the classifier can run on: TSS (``zm``) and the ablation arms.
+
+Every alternative signal goes through :func:`_thresholded_signal`: its raw value comes
+from :mod:`tre_common.alt_signals` (the same function the offline fit uses), is smoothed
+there by the shared wall-clock EMA (:func:`tre_common.tss.signal_ema`, the registry's
+``ema_tau_ms``, i.e. the TSS tau) when a :class:`~tre_controller.signals.trs.SignalState`
+is supplied, and is only then normalised to ``z``. TSS itself is smoothed by the same
+``ema_step`` inside ``TRSComputer`` before ``Z = TSS / theta`` (plan §6.9 item 4).
+"""
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
+from tre_common.alt_signals import (
+    EPS,
+    Z_MAX,
+    normalize_signal_value,
+    queue_len_per_replica,
+    token_rate_per_replica,
+)
 from tre_common.metrics_schema import ModelWindowMetrics
 from tre_common.registry import AltThreshold, ModelSpec
+from tre_common.tss import DEFAULT_EMA_TAU_MS
+
+if TYPE_CHECKING:  # pragma: no cover
+    from tre_controller.signals.trs import SignalState
 
 SignalSource = str
 
-EPS = 1e-6
-Z_MAX = 10.0
+__all__ = ["EPS", "Z_MAX", "SignalValue", "get_signal", "normalize_signal", "per_replica_token_rate"]
 
 
 @dataclass(frozen=True)
@@ -26,19 +46,31 @@ def get_signal(
     source: SignalSource,
     *,
     trs_z_m: float | None,
+    signal_state: "SignalState | None" = None,
 ) -> SignalValue:
+    """``source``'s value and ``z`` for this window.
+
+    ``signal_state`` carries the per-(model, signal) EMA across ticks; without it the
+    alternative signals are scored raw (a fresh EMA seeds at the raw value), exactly as
+    a fresh ``TRSComputer`` does for TSS.
+    """
     if source == "zm":
         return SignalValue(source=source, raw_value=trs_z_m, z_m=trs_z_m)
     if source == "latency_p95":
         return _latency_signal(metrics, spec)
     if source == "queue_len":
-        return _queue_signal(metrics, spec)
+        raw = queue_len_per_replica(metrics.avg_running, metrics.avg_waiting, metrics.routable_pods)
+        return _thresholded_signal(metrics, spec, source, raw, "queue_len_missing", "queue_threshold_missing", signal_state)
     if source == "decode_tps":
-        return _token_rate_signal(
-            metrics, spec, source, metrics.generation_tokens
+        return _thresholded_signal(
+            metrics, spec, source, per_replica_token_rate(metrics, metrics.generation_tokens),
+            f"{source}_counter_missing", f"{source}_threshold_missing", signal_state,
         )
     if source == "prefill_tps":
-        return _token_rate_signal(metrics, spec, source, metrics.prompt_tokens)
+        return _thresholded_signal(
+            metrics, spec, source, per_replica_token_rate(metrics, metrics.prompt_tokens),
+            f"{source}_counter_missing", f"{source}_threshold_missing", signal_state,
+        )
     if source == "kv_cache":
         return _kv_cache_signal(metrics)
     raise ValueError(f"unsupported signal source: {source}")
@@ -62,52 +94,32 @@ def _latency_signal(metrics: ModelWindowMetrics, spec: ModelSpec) -> SignalValue
     return SignalValue("latency_p95", raw_value=max(observed for observed, _slo in samples), z_m=health)
 
 
-def _queue_signal(metrics: ModelWindowMetrics, spec: ModelSpec) -> SignalValue:
-    control_queue = max(
-        0.0,
-        metrics.avg_running + metrics.avg_swapping + metrics.avg_waiting * spec.trs.lambda_wait,
-    )
-    threshold = spec.alt_thresholds.get("queue_len")
-    z_m = normalize_signal(control_queue, threshold)
-    if z_m is None:
-        return SignalValue(
-            "queue_len",
-            raw_value=control_queue,
-            z_m=None,
-            unavailable_reason="queue_threshold_missing",
-        )
-    return SignalValue("queue_len", raw_value=control_queue, z_m=z_m)
-
-
 def per_replica_token_rate(
     metrics: ModelWindowMetrics, token_total: float | int | None
 ) -> float | None:
-    if (
-        token_total is None
-        or metrics.routable_pods <= 0
-        or metrics.token_counter_reset
-    ):
+    if token_total is None or metrics.token_counter_reset:
         return None
-    total = float(token_total)
-    duration_s = (metrics.window_end_ms - metrics.window_start_ms) / 1000.0
-    if not math.isfinite(total) or total < 0.0 or duration_s <= 0.0:
-        return None
-    return total / duration_s / metrics.routable_pods
+    return token_rate_per_replica(
+        token_total, metrics.window_end_ms - metrics.window_start_ms, metrics.routable_pods
+    )
 
 
-def _token_rate_signal(
+def _thresholded_signal(
     metrics: ModelWindowMetrics,
     spec: ModelSpec,
     source: str,
-    token_total: float | int | None,
+    raw_value: float | None,
+    missing_reason: str,
+    threshold_missing_reason: str,
+    signal_state: "SignalState | None",
 ) -> SignalValue:
-    raw_value = per_replica_token_rate(metrics, token_total)
+    """The one place every alternative signal is smoothed and normalised."""
     if raw_value is None:
-        return SignalValue(
-            source,
-            raw_value=None,
-            z_m=None,
-            unavailable_reason=f"{source}_counter_missing",
+        return SignalValue(source, raw_value=None, z_m=None, unavailable_reason=missing_reason)
+    if signal_state is not None:
+        tau_ms = spec.trs.ema_tau_ms if spec.trs.ema_tau_ms else DEFAULT_EMA_TAU_MS
+        raw_value = signal_state.smooth_signal(
+            spec.name, source, raw_value, window_end_ms=metrics.window_end_ms, tau_ms=tau_ms
         )
     z_m = normalize_signal(raw_value, spec.alt_thresholds.get(source))
     if z_m is None:
@@ -115,24 +127,15 @@ def _token_rate_signal(
             source,
             raw_value=raw_value,
             z_m=None,
-            unavailable_reason=f"{source}_threshold_missing",
+            unavailable_reason=threshold_missing_reason,
         )
     return SignalValue(source, raw_value=raw_value, z_m=z_m)
 
 
 def normalize_signal(value: float | int | None, threshold: AltThreshold | None) -> float | None:
-    if threshold is None or threshold.theta <= 0.0 or value is None:
+    if threshold is None:
         return None
-    parsed = float(value)
-    if not math.isfinite(parsed) or parsed < 0.0:
-        return None
-    if threshold.direction == "higher_is_healthier":
-        normalized = parsed / threshold.theta
-    elif threshold.direction == "lower_is_healthier":
-        normalized = threshold.theta / max(parsed, EPS)
-    else:
-        return None
-    return min(Z_MAX, normalized)
+    return normalize_signal_value(value, threshold.theta, threshold.direction)
 
 
 def _kv_cache_signal(metrics: ModelWindowMetrics) -> SignalValue:

@@ -21,6 +21,7 @@ from collections import Counter
 from typing import Any, Callable, Mapping, Sequence
 
 from tre_calibration.dataset import CalibrationWindow
+from tre_common.alt_signals import queue_len_per_replica, token_rate_per_replica
 from tre_calibration.fit import (
     BalancedAccuracyThetaFit,
     ReliabilityThetaFit,
@@ -28,9 +29,11 @@ from tre_calibration.fit import (
 )
 
 #: Per signal: the CSV column it is read from (``None`` means it is derived by
-#: :func:`per_replica_token_rate_transform`) and its orientation.
+#: :func:`alt_signal_transform` through :mod:`tre_common.alt_signals`, the functions the
+#: controller uses online) and its orientation. The orientation is the prior one and stays
+#: hardcoded; the fit reports balanced accuracy in both directions (plan §6.9).
 ALT_SIGNALS: Mapping[str, tuple[str | None, str]] = {
-    "queue_len": ("queue_control", "lower_is_healthier"),
+    "queue_len": (None, "lower_is_healthier"),
     "decode_tps": (None, "lower_is_healthier"),
     "prefill_tps": (None, "lower_is_healthier"),
 }
@@ -40,6 +43,16 @@ _TOKEN_COLUMN = {
     "decode_tps": "generation_tokens_total",
     "prefill_tps": "prompt_tokens_total",
 }
+
+#: Theta candidate grid per signal (``ThetaFitConfig.candidate_grid``). queue_len is a
+#: small-integer-valued signal with a heavy mass at a few values, so fixed healthy
+#: quantiles collapse onto the same threshold; it searches the distinct observed values
+#: inside the same quantile range instead (plan §6.9).
+_CANDIDATE_GRID = {"queue_len": "unique"}
+
+#: A signal whose AUROC (in its prior direction) is below this does not rank windows by
+#: health well enough to be a baseline and is reported "inert" (plan §6.9).
+INERT_AUROC = 0.6
 
 
 def alt_signal_names() -> list[str]:
@@ -56,6 +69,11 @@ def alt_signal_column(signal: str) -> str | None:
     return _entry(signal)[0]
 
 
+def alt_signal_candidate_grid(signal: str) -> str:
+    _entry(signal)
+    return _CANDIDATE_GRID.get(signal, "quantile")
+
+
 def _entry(signal: str) -> tuple[str | None, str]:
     try:
         return ALT_SIGNALS[signal]
@@ -63,22 +81,47 @@ def _entry(signal: str) -> tuple[str | None, str]:
         raise KeyError(f"unknown alternative signal: {signal}") from exc
 
 
+def _row_float(row: Mapping[str, Any], column: str, default: float | None = None) -> float | None:
+    value = row.get(column)
+    if value is None or str(value).strip() == "":
+        return default
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return default
+    return out if math.isfinite(out) else default
+
+
+def alt_signal_transform(signal: str) -> Callable[[Mapping[str, Any]], float | None]:
+    """Row transform computing ``signal`` from a window CSV row exactly as the controller
+    computes it from a metrics window (:mod:`tre_common.alt_signals`). A CSV without a
+    ``routable_pods`` column is a single-replica capture (routable_pods = 1)."""
+    _entry(signal)
+    if signal == "queue_len":
+
+        def queue(row: Mapping[str, Any]) -> float | None:
+            return queue_len_per_replica(
+                _row_float(row, "avg_running"),
+                _row_float(row, "avg_waiting", 0.0),
+                _row_float(row, "routable_pods", 1.0),
+            )
+
+        return queue
+    return per_replica_token_rate_transform(signal)
+
+
 def per_replica_token_rate_transform(signal: str) -> Callable[[Mapping[str, Any]], float | None]:
     """Row transform turning a token counter into a per-replica completed-token rate."""
     token_column = _TOKEN_COLUMN[signal]
 
     def transform(row: Mapping[str, Any]) -> float | None:
-        try:
-            token_total = float(row[token_column])
-            start_ms = float(row["window_start_ms"])
-            end_ms = float(row["window_end_ms"])
-            replicas = float(row.get("assigned_replicas") or row.get("routable_pods") or 1.0)
-        except (KeyError, TypeError, ValueError):
+        start = _row_float(row, "window_start_ms")
+        end = _row_float(row, "window_end_ms")
+        if start is None or end is None:
             return None
-        duration_s = (end_ms - start_ms) / 1000.0
-        if token_total < 0.0 or duration_s <= 0.0 or replicas <= 0.0:
-            return None
-        return token_total / duration_s / replicas
+        return token_rate_per_replica(
+            _row_float(row, token_column), end - start, _row_float(row, "routable_pods", 1.0)
+        )
 
     return transform
 

@@ -39,8 +39,8 @@ from tre_calibration.alt_signals import (
     alt_signal_column,
     alt_signal_direction,
     alt_signal_names,
+    alt_signal_transform,
     fit_report,
-    per_replica_token_rate_transform,
     threshold_curve,
 )
 from tre_calibration.dataset import load_windows_from_csv
@@ -52,6 +52,7 @@ from tre_calibration.fit import (
     fit_theta,
 )
 from tre_calibration.labels import LabelDefinition
+from tre_common.tss import DEFAULT_EMA_TAU_MS
 
 #: Curve column plotted for each criterion, with the reference level drawn across it.
 _PLOT_METRIC = {
@@ -89,10 +90,9 @@ def fit_model(
         input_path,
         latency_slo_ms=label_def.latency_slo_ms(),
         signal_column=signal_column or signal,
-        signal_transform=(
-            per_replica_token_rate_transform(signal) if signal_column is None else None
-        ),
+        signal_transform=alt_signal_transform(signal) if signal_column is None else None,
         trim_ramp_windows=trim_ramp_windows,
+        ema_tau_ms=DEFAULT_EMA_TAU_MS,
     )
     knobs: dict[str, Any] = {
         "criterion": criterion,

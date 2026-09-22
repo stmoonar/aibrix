@@ -136,7 +136,7 @@ def _observation_from_metrics(
         theta_m=spec.trs.theta_m,
         window_end_ms=metrics.window_end_ms,
     )
-    signal = get_signal(metrics, spec, signal_source, trs_z_m=result.Z_m)
+    signal = get_signal(metrics, spec, signal_source, trs_z_m=result.Z_m, signal_state=signal_state)
     return ProbeObservation(
         ts_ms=ts_ms,
         ttft_p95_ms=metrics.ttft_p95_ms,

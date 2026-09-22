@@ -167,17 +167,26 @@ def ema_step(prev: float, raw: float, dt_ms: float, tau_ms: float) -> float:
 
 
 class TssEma:
-    """Streaming form of :func:`smooth_series` for one cell (same rules, same floats)."""
+    """Streaming form of :func:`smooth_series` for one cell (same rules, same floats).
 
-    def __init__(self, tau_ms: float) -> None:
+    The one wall-clock EMA every signal is smoothed with (plan §6.9 item 4): TSS inside
+    ``TRSComputer`` / the offline recompute, and every alternative signal of the ablation
+    through :func:`signal_ema`. ``zero_is_sample`` is the only knob. TSS keeps the legacy
+    rule that a zero raw is passed through without advancing the EMA (a zero TSS is the
+    controller's "undefined" placeholder); for a pressure signal such as queue length a
+    zero is an ordinary, frequent observation and must advance the EMA like any other.
+    """
+
+    def __init__(self, tau_ms: float, *, zero_is_sample: bool = False) -> None:
         if tau_ms is None or tau_ms <= 0:
             raise ValueError("tau_ms must be positive")
         self.tau_ms = float(tau_ms)
+        self.zero_is_sample = bool(zero_is_sample)
         self.value: Optional[float] = None
         self.last_ms: Optional[float] = None
 
     def update(self, raw: Optional[float], window_end_ms: float) -> Optional[float]:
-        if raw is None or not math.isfinite(raw) or raw == 0:
+        if raw is None or not math.isfinite(raw) or (raw == 0 and not self.zero_is_sample):
             return raw
         if self.value is None or self.last_ms is None:
             self.value, self.last_ms = raw, float(window_end_ms)
@@ -188,6 +197,12 @@ class TssEma:
         self.value = ema_step(self.value, raw, dt, self.tau_ms)
         self.last_ms = float(window_end_ms)
         return self.value
+
+
+def signal_ema(tau_ms: float) -> TssEma:
+    """The EMA an alternative (ablation) signal is smoothed with: the same class, the same
+    tau and the same alpha as TSS, with a zero counted as a sample."""
+    return TssEma(tau_ms, zero_is_sample=True)
 
 
 def smooth_series(
@@ -221,6 +236,7 @@ __all__: Iterable[str] = (
     "ema_alpha",
     "ema_step",
     "replica_factor",
+    "signal_ema",
     "smooth_series",
     "tss_queue",
     "tss_terms",

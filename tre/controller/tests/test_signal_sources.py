@@ -84,8 +84,10 @@ def test_queue_signal_uses_fitted_lower_is_healthier_threshold() -> None:
     signal = get_signal(_metrics(avg_waiting=3.0, avg_running=2.0), _spec(), "queue_len", trs_z_m=9.0)
 
     assert signal.source == "queue_len"
-    assert signal.raw_value == 8.0
-    assert signal.z_m == 0.5
+    # Raw running + waiting per routable replica: lambda_wait (2.0 here) no longer
+    # enters the ablation signal (plan 6.9 correction).
+    assert signal.raw_value == 5.0
+    assert signal.z_m == 0.8
 
 
 def test_queue_signal_direction_boundaries_and_idle_cap() -> None:
