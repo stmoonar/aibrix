@@ -117,6 +117,12 @@ class BootstrapDeltaResult:
     delta_p2_5: float | None
     delta_p50: float | None
     delta_p97_5: float | None
+    #: The same summary for delta_high, from the same resamples and the same margin fit.
+    high_n_fitted: int = 0
+    high_delta_values: tuple[float, ...] = ()
+    high_delta_p2_5: float | None = None
+    high_delta_p50: float | None = None
+    high_delta_p97_5: float | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -125,6 +131,12 @@ class BootstrapDeltaResult:
             "delta_p2_5": self.delta_p2_5,
             "delta_p50": self.delta_p50,
             "delta_p97_5": self.delta_p97_5,
+            "high": {
+                "n_fitted": self.high_n_fitted,
+                "delta_p2_5": self.high_delta_p2_5,
+                "delta_p50": self.high_delta_p50,
+                "delta_p97_5": self.high_delta_p97_5,
+            },
         }
 
 
@@ -136,28 +148,44 @@ def bootstrap_theta_and_delta_crit(
     config: ThetaFitConfig | None = None,
     delta_kwargs: Mapping[str, Any] | None = None,
 ) -> tuple[BootstrapThetaResult, BootstrapDeltaResult]:
-    """:func:`bootstrap_theta` plus a delta_crit fit per resample (plan §6.3 B6).
+    """:func:`bootstrap_theta` plus a delta_crit / delta_high fit per resample (plan §6.3 B6).
 
     The resample draws are exactly :func:`bootstrap_theta`'s for the same ``seed``, so the
-    theta interval it returns is identical to a plain theta bootstrap.
+    theta interval it returns is identical to a plain theta bootstrap. The margins are
+    fitted in the orientation of ``config`` unless ``delta_kwargs`` names another.
     """
+    kwargs = dict(delta_kwargs or {})
+    # The margins are normalised the way the fitted signal is: same orientation as theta.
+    kwargs.setdefault("direction", (config or ThetaFitConfig()).direction)
     result, deltas = _bootstrap(
         windows, n_resamples=n_resamples, seed=seed, config=config,
-        delta_kwargs=dict(delta_kwargs or {}),
+        delta_kwargs=kwargs,
     )
     assert deltas is not None
-    if deltas:
-        srt = sorted(deltas)
-        summary = BootstrapDeltaResult(
-            n_resamples=n_resamples,
-            n_fitted=len(deltas),
-            delta_values=tuple(deltas),
-            delta_p2_5=_percentile(srt, 2.5),
-            delta_p50=_percentile(srt, 50.0),
-            delta_p97_5=_percentile(srt, 97.5),
-        )
-    else:
-        summary = BootstrapDeltaResult(n_resamples, 0, (), None, None, None)
+    crit = [c for c, _h in deltas if c is not None]
+    high = [h for _c, h in deltas if h is not None]
+
+    def pct(values: list[float]) -> tuple[float | None, float | None, float | None]:
+        if not values:
+            return None, None, None
+        srt = sorted(values)
+        return _percentile(srt, 2.5), _percentile(srt, 50.0), _percentile(srt, 97.5)
+
+    c_lo, c_mid, c_hi = pct(crit)
+    h_lo, h_mid, h_hi = pct(high)
+    summary = BootstrapDeltaResult(
+        n_resamples=n_resamples,
+        n_fitted=len(crit),
+        delta_values=tuple(crit),
+        delta_p2_5=c_lo,
+        delta_p50=c_mid,
+        delta_p97_5=c_hi,
+        high_n_fitted=len(high),
+        high_delta_values=tuple(high),
+        high_delta_p2_5=h_lo,
+        high_delta_p50=h_mid,
+        high_delta_p97_5=h_hi,
+    )
     return result, summary
 
 
@@ -168,11 +196,11 @@ def _bootstrap(
     seed: int,
     config: ThetaFitConfig | None,
     delta_kwargs: dict[str, Any] | None = None,
-) -> tuple[BootstrapThetaResult, list[float] | None]:
+) -> tuple[BootstrapThetaResult, list[tuple[float | None, float | None]] | None]:
     if n_resamples <= 0:
         raise ValueError("n_resamples must be positive")
     config = config or ThetaFitConfig()
-    deltas: list[float] | None = [] if delta_kwargs is not None else None
+    deltas: list[tuple[float | None, float | None]] | None = [] if delta_kwargs is not None else None
 
     by_cell: dict[str, list[CalibrationWindow]] = {}
     for window in windows:
@@ -191,9 +219,11 @@ def _bootstrap(
         if fit.publish and fit.theta is not None:
             published.append(fit.theta)
             if deltas is not None and fit.theta > 0.0:
-                crit = fit_delta_margins(resampled, theta=fit.theta, **(delta_kwargs or {})).crit
-                if not crit.used_fallback:
-                    deltas.append(crit.delta)
+                margins = fit_delta_margins(resampled, theta=fit.theta, **(delta_kwargs or {}))
+                deltas.append((
+                    None if margins.crit.used_fallback else margins.crit.delta,
+                    None if margins.high.used_fallback else margins.high.delta,
+                ))
 
     n_published = len(published)
     publish_rate = n_published / n_resamples

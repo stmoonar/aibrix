@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Iterable, Sequence
 
 from tre_calibration.dataset import CalibrationWindow
+from tre_common.alt_signals import normalize_signal_value
 
 #: Signal orientations understood by every theta fit in this module.
 #:
@@ -19,6 +20,22 @@ SIGNAL_DIRECTIONS = ("higher_is_healthier", "lower_is_healthier")
 
 #: Orientation assumed when a caller does not name one (the TSS/TRS convention).
 DEFAULT_SIGNAL_DIRECTION = "higher_is_healthier"
+
+
+def signal_z(value: float, theta: float, direction: str = DEFAULT_SIGNAL_DIRECTION) -> float:
+    """``z`` of one window exactly as the controller computes it for this orientation.
+
+    ``higher_is_healthier`` (TSS): ``value / theta``. ``lower_is_healthier`` (queue length,
+    token rates): ``theta / max(value, EPS)`` capped at ``Z_MAX`` -
+    :func:`tre_common.alt_signals.normalize_signal_value`, the controller's function. A
+    value that cannot be normalised maps to NaN (dropped by every finite filter).
+    """
+    if direction == "higher_is_healthier":
+        return float(value) / float(theta)
+    if direction not in SIGNAL_DIRECTIONS:
+        raise ValueError(f"direction must be one of {SIGNAL_DIRECTIONS}")
+    z = normalize_signal_value(value, theta, direction)
+    return math.nan if z is None else z
 
 
 def signal_orientation(direction: str) -> float:
@@ -152,7 +169,7 @@ THETA_METHOD_BALANCED_ACCURACY = "healthy_quantile_balanced_accuracy"
 #: Identifier written into calibration artifacts for the cumulative attainment fit.
 THETA_METHOD_RELIABILITY = "cumulative_reliability_attainment"
 #: Identifier written into calibration artifacts for the delta margin fit.
-DELTA_METHOD = "crit:ba_grid_delta_0_0.5+high:severity_quantile_balanced_accuracy"
+DELTA_METHOD = "crit:ba_grid_delta_0_0.5+high:ba_grid_delta_0_2"
 
 #: How ``delta_crit`` is searched. ``ba_grid`` (default, plan §6.3 B6): tau_crit =
 #: tau_low - delta over :data:`DEFAULT_DELTA_CRIT_GRID`, maximising balanced accuracy of
@@ -166,6 +183,22 @@ CRIT_METHODS = (CRIT_METHOD_BA_GRID, CRIT_METHOD_QUANTILE)
 DEFAULT_CRIT_METHOD = CRIT_METHOD_BA_GRID
 #: delta_crit candidates: 0.00 .. 0.50 in 0.01 steps.
 DEFAULT_DELTA_CRIT_GRID: tuple[float, ...] = tuple(round(0.01 * i, 10) for i in range(51))
+#: How ``delta_high`` is searched: ``ba_grid`` (default since 2026-09-22, plan §6.10
+#: leftover) is the crit side's method mirrored - tau_high = tau_low + delta over
+#: :data:`DEFAULT_DELTA_HIGH_GRID`, maximising balanced accuracy of "Z > tau_high =>
+#: surplus", the predicate ``classify_model`` applies; ``quantile`` is the former rule.
+HIGH_METHODS = (CRIT_METHOD_BA_GRID, CRIT_METHOD_QUANTILE)
+DEFAULT_HIGH_METHOD = CRIT_METHOD_BA_GRID
+#: delta_high candidates: 0.00 .. 2.00 in 0.01 steps (the surplus side is wider; the
+#: 2026-09-21 dry run fitted 1.13 for 7b).
+DEFAULT_DELTA_HIGH_GRID: tuple[float, ...] = tuple(round(0.01 * i, 10) for i in range(201))
+
+#: Theta candidate grids of the balanced-accuracy fit. ``quantile``: the healthy-score
+#: quantiles in ``healthy_quantile_candidates``. ``unique``: every distinct healthy value
+#: whose healthy quantile lies inside the same range - for signals such as queue length
+#: whose mass sits on a few values, where fixed quantiles collapse onto one threshold.
+CANDIDATE_GRIDS = ("quantile", "unique")
+DEFAULT_CANDIDATE_GRID = "quantile"
 
 #: Accepted values of the explicit ``theta_criterion`` knob.
 THETA_CRITERIA = ("balanced_accuracy", "reliability")
@@ -326,6 +359,7 @@ def fit_theta_by_balanced_accuracy(
     min_scenario_families: int = 2,
     max_single_scenario_ratio: float = 0.7,
     direction: str = DEFAULT_SIGNAL_DIRECTION,
+    candidate_grid: str = DEFAULT_CANDIDATE_GRID,
 ) -> BalancedAccuracyThetaFit:
     """Pick ``theta`` maximising balanced accuracy of "healthy side of theta => slo_met".
 
@@ -351,14 +385,28 @@ def fit_theta_by_balanced_accuracy(
     healthy_scores = [score for score, label in zip(scores, labels) if label == 1]
     violating_count = sum(1 for label in labels if label == 0)
 
+    if candidate_grid not in CANDIDATE_GRIDS:
+        raise ValueError(f"candidate_grid must be one of {CANDIDATE_GRIDS}")
+    if candidate_grid == "unique":
+        candidates = _unique_candidates(healthy_scores, healthy_quantile_candidates, orientation)
+        sorted_healthy = sorted(healthy_scores)
+        sorted_violating = sorted(s for s, label in zip(scores, labels) if label == 0)
+
+        def score_at(theta: float) -> dict[str, float]:
+            return _balanced_accuracy_sorted(sorted_healthy, sorted_violating, theta)
+    else:
+        candidates = [(q, _quantile(healthy_scores, q)) for q in healthy_quantile_candidates]
+
+        def score_at(theta: float) -> dict[str, float]:
+            return _balanced_accuracy_at(scores, labels, theta)
+
     best: dict[str, float] | None = None
     best_quantile: float | None = None
     candidate_count = 0
-    for quantile in healthy_quantile_candidates:
-        theta = _quantile(healthy_scores, quantile)
+    for quantile, theta in candidates:
         if theta is None:
             continue
-        metrics = _balanced_accuracy_at(scores, labels, theta)
+        metrics = score_at(theta)
         candidate_count += 1
         candidate = {"theta": theta, **metrics}
         if best is None:
@@ -469,6 +517,7 @@ def fit_theta(
     min_confidence: float = DEFAULT_MIN_CONFIDENCE,
     min_scenario_families: int = DEFAULT_MIN_SCENARIO_FAMILIES,
     max_single_scenario_ratio: float = DEFAULT_MAX_SINGLE_SCENARIO_RATIO,
+    candidate_grid: str = DEFAULT_CANDIDATE_GRID,
 ) -> ReliabilityThetaFit | BalancedAccuracyThetaFit:
     """Fit ``theta`` under the named criterion -- the entry point every fit goes through.
 
@@ -487,6 +536,7 @@ def fit_theta(
             min_scenario_families=min_scenario_families,
             max_single_scenario_ratio=max_single_scenario_ratio,
             direction=direction,
+            candidate_grid=candidate_grid,
         )
     return fit_theta_by_reliability(
         windows,
@@ -526,8 +576,11 @@ class ThetaFitConfig:
     min_confidence: float = DEFAULT_MIN_CONFIDENCE
     min_scenario_families: int = DEFAULT_MIN_SCENARIO_FAMILIES
     max_single_scenario_ratio: float = DEFAULT_MAX_SINGLE_SCENARIO_RATIO
+    candidate_grid: str = DEFAULT_CANDIDATE_GRID
 
     def __post_init__(self) -> None:
+        if self.candidate_grid not in CANDIDATE_GRIDS:
+            raise ValueError(f"candidate_grid must be one of {CANDIDATE_GRIDS}")
         if self.criterion not in THETA_CRITERIA:
             raise ValueError(f"criterion must be one of {THETA_CRITERIA}")
         if self.direction not in SIGNAL_DIRECTIONS:
@@ -551,11 +604,21 @@ class ThetaFitConfig:
             min_confidence=self.min_confidence,
             min_scenario_families=self.min_scenario_families,
             max_single_scenario_ratio=self.max_single_scenario_ratio,
+            candidate_grid=self.candidate_grid,
         )
 
     def as_dict(self) -> dict[str, object]:
-        """JSON-ready record of the configuration, keyed as the CLI keys ``fit_config``."""
+        """JSON-ready record of the configuration, keyed as the CLI keys ``fit_config``.
+
+        ``candidate_grid`` is only written when it is not the default, so artifacts of
+        the default configuration keep their key set."""
+        extra: dict[str, object] = (
+            {"candidate_grid": self.candidate_grid}
+            if self.candidate_grid != DEFAULT_CANDIDATE_GRID
+            else {}
+        )
         return {
+            **extra,
             "direction": self.direction,
             "healthy_quantile_candidates": list(self.healthy_quantile_candidates),
             "max_single_scenario_ratio": self.max_single_scenario_ratio,
@@ -586,6 +649,9 @@ def fit_delta_margins(
     fallback_delta_high: float = FALLBACK_DELTA_HIGH,
     crit_method: str = DEFAULT_CRIT_METHOD,
     delta_crit_grid: Sequence[float] = DEFAULT_DELTA_CRIT_GRID,
+    direction: str = DEFAULT_SIGNAL_DIRECTION,
+    high_method: str = DEFAULT_HIGH_METHOD,
+    delta_high_grid: Sequence[float] = DEFAULT_DELTA_HIGH_GRID,
 ) -> DeltaMarginsFit:
     """Fit the per-model control margins ``tau_crit = tau_low - delta_crit`` and
     ``tau_high = tau_low + delta_high`` on ``z = signal / theta``.
@@ -602,8 +668,15 @@ def fit_delta_margins(
     side reports the mode it ran under and whether its ``tau`` ended up clamped to a bound.
 
     ``crit_method`` selects how the critical side is searched (:data:`CRIT_METHODS`); the
-    default is the balanced-accuracy grid over ``delta_crit_grid``.
+    default is the balanced-accuracy grid over ``delta_crit_grid``. ``high_method`` does
+    the same for the surplus side (:data:`HIGH_METHODS`, grid ``delta_high_grid``).
+
+    ``direction`` is the signal's orientation; ``z`` is computed by :func:`signal_z`, i.e.
+    the way the controller normalises that signal, so the same function fits the bands of
+    TSS and of every alternative signal (plan §6.9 items 3/5).
     """
+    if high_method not in HIGH_METHODS:
+        raise ValueError(f"high_method must be one of {HIGH_METHODS}, got {high_method!r}")
     if not math.isfinite(theta) or theta <= 0.0:
         raise ValueError("theta must be finite and positive")
     if crit_method not in CRIT_METHODS:
@@ -658,7 +731,7 @@ def fit_delta_margins(
             else 0
         )
 
-    z = [row.signal / theta for row in rows]
+    z = [signal_z(row.signal, theta, direction) for row in rows]
     if crit_method == CRIT_METHOD_BA_GRID:
         crit = _fit_delta_crit_grid(
             z,
@@ -680,16 +753,28 @@ def fit_delta_margins(
             floor_mode=floor_mode,
             fallback_delta=fallback_delta_crit,
         )
-    high = _fit_one_delta_margin(
-        z,
-        surplus_labels,
-        direction="high",
-        tau_low=tau_low,
-        candidate_quantiles=candidate_quantiles,
-        target_floor=min_surplus_precision,
-        floor_mode=floor_mode,
-        fallback_delta=fallback_delta_high,
-    )
+    if high_method == CRIT_METHOD_BA_GRID:
+        high = _fit_delta_grid(
+            z,
+            surplus_labels,
+            side="high",
+            tau_low=tau_low,
+            delta_grid=delta_high_grid,
+            target_floor=min_surplus_precision,
+            floor_mode=floor_mode,
+            fallback_delta=fallback_delta_high,
+        )
+    else:
+        high = _fit_one_delta_margin(
+            z,
+            surplus_labels,
+            direction="high",
+            tau_low=tau_low,
+            candidate_quantiles=candidate_quantiles,
+            target_floor=min_surplus_precision,
+            floor_mode=floor_mode,
+            fallback_delta=fallback_delta_high,
+        )
 
     return DeltaMarginsFit(
         theta=float(theta),
@@ -833,24 +918,50 @@ def _fit_delta_crit_grid(
     floor_mode: str = DEFAULT_DELTA_FLOOR_MODE,
     fallback_delta: float,
 ) -> DeltaMarginFit:
-    """delta_crit by balanced accuracy over an explicit grid (plan §6.3 B6).
+    """delta_crit by balanced accuracy over an explicit grid (plan §6.3 B6); see
+    :func:`_fit_delta_grid` with ``side="low"``."""
+    return _fit_delta_grid(
+        scores, labels, side="low", tau_low=tau_low, delta_grid=delta_grid,
+        target_floor=target_floor, floor_mode=floor_mode, fallback_delta=fallback_delta,
+    )
 
-    ``tau = tau_low - delta`` and the prediction is ``z < tau`` - strictly, exactly as
-    ``classify_model`` decides CRITICAL. The candidates no longer come from the critical
-    windows' own z quantiles, so a sharp boundary (every critical window just under
-    tau_low) is a legitimate small delta instead of a forced clamp. Ties break on the
-    acceptance floor, then on recall of the critical windows, then on the smaller delta
-    (the more sensitive band). A delta on either grid edge is reported ``clamped``.
+
+def _fit_delta_grid(
+    scores: Sequence[float],
+    labels: Sequence[int],
+    *,
+    side: str,
+    tau_low: float,
+    delta_grid: Sequence[float],
+    target_floor: float,
+    floor_mode: str = DEFAULT_DELTA_FLOOR_MODE,
+    fallback_delta: float,
+) -> DeltaMarginFit:
+    """One band margin by balanced accuracy over an explicit grid.
+
+    ``side="low"`` (delta_crit): ``tau = tau_low - delta``, positive prediction ``z < tau``
+    - strictly, exactly as ``classify_model`` decides CRITICAL. Ties break on the
+    acceptance floor (recall of the critical windows), then on recall, then on the smaller
+    delta (the more sensitive band).
+
+    ``side="high"`` (delta_high): ``tau = tau_low + delta``, positive prediction
+    ``z > tau`` - ``classify_model`` calls ``Z <= tau_high`` HEALTHY and above it HIGH.
+    Ties break on the floor (precision of the surplus prediction), then on precision,
+    then on the larger delta (the more cautious donor band).
+
+    A delta on either grid edge is reported ``clamped``.
     """
     if floor_mode not in FLOOR_MODES:
         raise ValueError(f"floor_mode must be one of {FLOOR_MODES}, got {floor_mode!r}")
+    if side not in {"low", "high"}:
+        raise ValueError("side must be low or high")
     grid = sorted({float(d) for d in delta_grid if math.isfinite(float(d)) and float(d) >= 0.0})
     finite = [(float(s), int(l)) for s, l in zip(scores, labels) if math.isfinite(s)]
     n_pos = sum(l for _s, l in finite)
     n_neg = len(finite) - n_pos
     if not grid or n_pos < 2 or n_neg == 0:
         fallback = _delta_fallback(
-            direction="low",
+            direction=side,
             tau_low=tau_low,
             fallback_delta=fallback_delta,
             reject_reason="insufficient_label_separation" if grid else "empty_delta_grid",
@@ -870,13 +981,21 @@ def _fit_delta_crit_grid(
 
     best: dict[str, float] | None = None
     for delta in grid:
-        tau = tau_low - delta
-        k = bisect.bisect_left(zs, tau)  # count of z < tau
-        tp = cum_pos[k]
-        fp = k - tp
+        if side == "low":
+            tau = tau_low - delta
+            k = bisect.bisect_left(zs, tau)  # count of z < tau
+            tp = cum_pos[k]
+            predicted = k
+        else:
+            tau = tau_low + delta
+            k = bisect.bisect_right(zs, tau)  # z <= tau are predicted negative
+            tp = cum_pos[-1] - cum_pos[k]
+            predicted = len(zs) - k
+        fp = predicted - tp
         recall = tp / n_pos
         specificity = (n_neg - fp) / n_neg
-        precision = tp / k if k else 0.0
+        precision = tp / predicted if predicted else 0.0
+        meets = recall >= target_floor if side == "low" else precision >= target_floor
         candidate = {
             "delta": delta,
             "tau": tau,
@@ -885,7 +1004,7 @@ def _fit_delta_crit_grid(
             "precision_pos": precision,
             "specificity_neg": specificity,
             "support_pos": float(n_pos),
-            "meets": 1.0 if recall >= target_floor else 0.0,
+            "meets": 1.0 if meets else 0.0,
         }
         if best is None:
             best = candidate
@@ -894,8 +1013,12 @@ def _fit_delta_crit_grid(
             if candidate["meets"] > best["meets"]:
                 best = candidate
             continue
-        key_c = (candidate["balanced_accuracy"], candidate["meets"], candidate["recall_pos"], -candidate["delta"])
-        key_b = (best["balanced_accuracy"], best["meets"], best["recall_pos"], -best["delta"])
+        if side == "low":
+            key_c = (candidate["balanced_accuracy"], candidate["meets"], candidate["recall_pos"], -candidate["delta"])
+            key_b = (best["balanced_accuracy"], best["meets"], best["recall_pos"], -best["delta"])
+        else:
+            key_c = (candidate["balanced_accuracy"], candidate["meets"], candidate["precision_pos"], candidate["delta"])
+            key_b = (best["balanced_accuracy"], best["meets"], best["precision_pos"], best["delta"])
         if _key_greater(key_c, key_b):
             best = candidate
 
@@ -1006,6 +1129,61 @@ def _balanced_accuracy_at(
         "specificity_bad": specificity_bad,
         "precision_good": precision_good,
     }
+
+
+def _balanced_accuracy_sorted(
+    sorted_healthy: Sequence[float], sorted_violating: Sequence[float], theta: float
+) -> dict[str, float]:
+    """:func:`_balanced_accuracy_at` (prediction ``score >= theta``) on pre-sorted
+    oriented scores, by bisection - the same numbers, O(log n) per candidate."""
+    import bisect
+
+    n_h = len(sorted_healthy)
+    n_v = len(sorted_violating)
+    tp = n_h - bisect.bisect_left(sorted_healthy, theta)
+    fp = n_v - bisect.bisect_left(sorted_violating, theta)
+    fn = n_h - tp
+    tn = n_v - fp
+    recall_good = tp / (tp + fn) if (tp + fn) else 0.0
+    specificity_bad = tn / (tn + fp) if (tn + fp) else 0.0
+    precision_good = tp / (tp + fp) if (tp + fp) else 0.0
+    return {
+        "balanced_accuracy": 0.5 * (recall_good + specificity_bad),
+        "recall_good": recall_good,
+        "specificity_bad": specificity_bad,
+        "precision_good": precision_good,
+    }
+
+
+def _unique_candidates(
+    healthy_scores: Sequence[float],
+    healthy_quantile_candidates: Sequence[float],
+    orientation: float,
+) -> list[tuple[float, float]]:
+    """(healthy quantile, oriented theta) for every distinct healthy value that a quantile
+    in ``[min, max]`` of the quantile grid could land on, i.e. whose quantile positions
+    (as :func:`_quantile` indexes them) overlap that range. The quantile reported is the
+    fraction of healthy windows strictly on its unhealthy side. A raw threshold <= 0 is
+    skipped: it cannot be normalised into a z."""
+    ordered = sorted(float(v) for v in healthy_scores if math.isfinite(float(v)))
+    if not ordered or not healthy_quantile_candidates:
+        return []
+    lo = min(healthy_quantile_candidates)
+    hi = max(healthy_quantile_candidates)
+    n = len(ordered)
+    span = max(1, n - 1)
+    out: list[tuple[float, float]] = []
+    index = 0
+    while index < n:
+        value = ordered[index]
+        last = index
+        while last + 1 < n and ordered[last + 1] == value:
+            last += 1
+        first_q, last_q = index / span, last / span
+        if last_q >= lo - 1e-12 and first_q <= hi + 1e-12 and orientation * value > 0.0:
+            out.append((index / n, value))
+        index = last + 1
+    return out
 
 
 def _threshold_metrics_at(
