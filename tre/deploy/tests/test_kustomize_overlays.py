@@ -98,7 +98,7 @@ def test_tre_v2_overlay_declares_components_and_independent_redis() -> None:
     assert _env(controller)["TRE_INCOMPLETE_POLICY"] == "drop_model"
     assert _env(controller)["TRE_HIST_BASELINE_LOOKBACK_MS"] == "90000"
     assert _env(controller)["TRE_PAPER_STALE_MAX_WINDOWS"] == "3"
-    assert _env(controller)["TRE_METRICS_SCHEMA"] == "v1"
+    assert _env(controller)["TRE_METRICS_SCHEMA"] == "v2"  # D7 (09-22): gateway zsets, no legacy SCAN
     assert _env(controller)["ENABLE_TRE_SCALING"] == "true"
     assert _env(sm)["TRE_ROUTE_NAMESPACE"] == "tre-v2"
     assert _env(sm)["TRE_GATEWAY_NAME"] == "tre-aibrix-eg"
