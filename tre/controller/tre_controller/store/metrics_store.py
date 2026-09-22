@@ -7,6 +7,7 @@ from typing import Any
 from tre_common.metrics_schema import MetricsSnapshot, ModelWindowMetrics, PodWindowMetrics
 from tre_common.percentile import histogram_percentile
 from tre_common.rediskeys import hist_key, inst_key, pods_key
+from tre_common.window_pods import aggregate_pods
 
 HISTOGRAM_METRICS = {
     "prompt_tokens": "request_prompt_tokens",
@@ -59,39 +60,78 @@ class MetricsStore:
         self._min_latency_samples = min_latency_samples
         self._window_cache: dict[tuple[str, str, int, int], ModelWindowMetrics] = {}
 
+    @property
+    def redis_client(self) -> Any:
+        """The metrics redis client (read-only use: the startup gateway-cadence check)."""
+        return self._redis
+
+    @property
+    def schema(self) -> str:
+        return self._schema
+
     def read_snapshot(
-        self, window_start_ms: int, window_end_ms: int, *, use_cache: bool = True
+        self,
+        window_start_ms: int,
+        window_end_ms: int,
+        *,
+        use_cache: bool = True,
+        start_exclusive: bool = False,
     ) -> MetricsSnapshot:
         models = {
-            spec.name: self.read_model_window(spec.name, window_start_ms, window_end_ms, use_cache=use_cache)
+            spec.name: self.read_model_window(
+                spec.name, window_start_ms, window_end_ms, use_cache=use_cache, start_exclusive=start_exclusive
+            )
             for spec in self._registry.models()
         }
         return MetricsSnapshot(ts_ms=int(window_end_ms), models=models, stale=False)
 
     def read_model_window(
-        self, model: str, window_start_ms: int, window_end_ms: int, *, use_cache: bool = True
+        self,
+        model: str,
+        window_start_ms: int,
+        window_end_ms: int,
+        *,
+        use_cache: bool = True,
+        start_exclusive: bool = False,
     ) -> ModelWindowMetrics:
-        cache_key = (self._schema, model, int(window_start_ms), int(window_end_ms))
+        """One model's window. ``start_exclusive`` reads the half-open ``(start, end]``.
+
+        The phase-aligned sampler ends every window exactly on a gateway write boundary,
+        and the gateway stamps its samples with that boundary, so a closed ``[start, end]``
+        window would hold 4 instant ticks (both ends) instead of 3 and the histogram
+        baseline would sit one tick before ``start`` (a 40 s token span). Half-open gives
+        exactly ``window_ms / SCRAPE_INTERVAL_MS`` ticks and a token delta between the
+        ticks at ``start`` and ``end``, i.e. exactly one window. ``window_start_ms`` in the
+        result and the instant-average divisor are unchanged.
+        """
+        cache_key = (self._schema, model, int(window_start_ms), int(window_end_ms), bool(start_exclusive))
         # Sliding windows (S1.1) pass use_cache=False: every window is unique, so the
         # per-window cache never hits and would grow without bound. Only tumbling reads
         # (repeated identical [start, end] within a block) benefit from caching.
         if use_cache and cache_key in self._window_cache:
             return self._window_cache[cache_key]
 
+        # Timestamps are integer ms, so (start, end] == [start + 1, end].
+        read_start_ms = int(window_start_ms) + 1 if start_exclusive else int(window_start_ms)
         if self._schema == "v1":
-            per_pod = self._read_v1_model_window(model, window_start_ms, window_end_ms)
+            per_pod = self._read_v1_model_window(
+                model, read_start_ms, window_end_ms, span_start_ms=window_start_ms
+            )
         else:
             pods = sorted(_decode_text(pod) for pod in self._redis.smembers(pods_key(model)))
             per_pod: dict[str, PodWindowMetrics] = {}
             for pod_key in pods:
                 hist_docs = self._read_zset_docs(
                     hist_key(pod_key),
-                    window_start_ms,
+                    read_start_ms,
                     window_end_ms,
                     lookback_ms=self._histogram_lookback_ms,
                 )
-                inst_docs = self._read_zset_docs(inst_key(pod_key), window_start_ms, window_end_ms)
-                pod_metrics = self._aggregate_pod(model, pod_key, hist_docs, inst_docs, window_start_ms, window_end_ms)
+                inst_docs = self._read_zset_docs(inst_key(pod_key), read_start_ms, window_end_ms)
+                pod_metrics = self._aggregate_pod(
+                    model, pod_key, hist_docs, inst_docs, read_start_ms, window_end_ms,
+                    span_start_ms=window_start_ms,
+                )
                 if pod_metrics is not None:
                     per_pod[pod_metrics.pod] = pod_metrics
 
@@ -162,6 +202,8 @@ class MetricsStore:
         model: str,
         window_start_ms: int,
         window_end_ms: int,
+        *,
+        span_start_ms: int | None = None,
     ) -> dict[str, PodWindowMetrics]:
         hist_by_pod = self._read_legacy_docs(
             LEGACY_HIST_PREFIX,
@@ -180,6 +222,7 @@ class MetricsStore:
                 inst_by_pod.get(pod_key, []),
                 window_start_ms,
                 window_end_ms,
+                span_start_ms=span_start_ms,
             )
             if pod_metrics is not None:
                 per_pod[pod_metrics.pod] = pod_metrics
@@ -234,10 +277,16 @@ class MetricsStore:
         inst_docs: list[dict[str, Any]],
         window_start_ms: int,
         window_end_ms: int,
+        *,
+        span_start_ms: int | None = None,
     ) -> PodWindowMetrics | None:
+        # window_start_ms is the first *readable* timestamp (start + 1 for a half-open
+        # read); span_start_ms is the nominal window start, which sets the instant-average
+        # divisor (expected samples = window_ms / SCRAPE_INTERVAL_MS).
         if not hist_docs and not inst_docs:
             return None
         pod_name = _pod_name(hist_docs, inst_docs, pod_key)
+        span_start = window_start_ms if span_start_ms is None else span_start_ms
 
         prompt_tokens = self._hist_sum_delta(model, HISTOGRAM_METRICS["prompt_tokens"], hist_docs, window_start_ms)
         generation_tokens = self._hist_sum_delta(model, HISTOGRAM_METRICS["generation_tokens"], hist_docs, window_start_ms)
@@ -253,10 +302,10 @@ class MetricsStore:
             pod=pod_name,
             prompt_tokens=prompt_tokens,
             generation_tokens=generation_tokens,
-            avg_waiting=self._instant_avg(model, INSTANT_METRICS["waiting"], inst_docs, window_start_ms, window_end_ms),
-            avg_running=self._instant_avg(model, INSTANT_METRICS["running"], inst_docs, window_start_ms, window_end_ms),
-            avg_swapping=self._instant_avg(model, INSTANT_METRICS["swapping"], inst_docs, window_start_ms, window_end_ms),
-            kv_cache_hit_rate=self._instant_avg(model, INSTANT_METRICS["kv_hit"], inst_docs, window_start_ms, window_end_ms),
+            avg_waiting=self._instant_avg(model, INSTANT_METRICS["waiting"], inst_docs, span_start, window_end_ms),
+            avg_running=self._instant_avg(model, INSTANT_METRICS["running"], inst_docs, span_start, window_end_ms),
+            avg_swapping=self._instant_avg(model, INSTANT_METRICS["swapping"], inst_docs, span_start, window_end_ms),
+            kv_cache_hit_rate=self._instant_avg(model, INSTANT_METRICS["kv_hit"], inst_docs, span_start, window_end_ms),
             ttft_p95_ms=_seconds_to_ms(ttft_p95_s),
             tpot_p95_ms=_seconds_to_ms(tpot_p95_s),
             e2e_p95_ms=_seconds_to_ms(e2e_p95_s),
@@ -271,6 +320,7 @@ class MetricsStore:
                     model, HISTOGRAM_METRICS["generation_tokens"], hist_docs
                 )
             ),
+            instant_ticks_ms=_doc_ticks(inst_docs),
         )
 
     def _aggregate_model(
@@ -280,28 +330,11 @@ class MetricsStore:
         window_end_ms: int,
         per_pod: dict[str, PodWindowMetrics],
     ) -> ModelWindowMetrics:
-        pods = list(per_pod.values())
-        routable_pods = len(pods)
-        kv_values = [pod.kv_cache_hit_rate for pod in pods if pod.kv_cache_hit_rate > 0.0]
-        return ModelWindowMetrics(
-            model=model,
-            window_start_ms=window_start_ms,
-            window_end_ms=window_end_ms,
-            prompt_tokens=_sum_optional([pod.prompt_tokens for pod in pods]),
-            generation_tokens=_sum_optional([pod.generation_tokens for pod in pods]),
-            avg_waiting=sum(pod.avg_waiting for pod in pods),
-            avg_running=sum(pod.avg_running for pod in pods),
-            avg_swapping=sum(pod.avg_swapping for pod in pods),
-            kv_cache_hit_rate=(sum(kv_values) / len(kv_values)) if kv_values else 0.0,
-            ttft_p95_ms=_max_optional([pod.ttft_p95_ms for pod in pods]),
-            tpot_p95_ms=_max_optional([pod.tpot_p95_ms for pod in pods]),
-            e2e_p95_ms=_max_optional([pod.e2e_p95_ms for pod in pods]),
-            routable_pods=routable_pods,
-            assigned_replicas=routable_pods,
-            per_pod=per_pod,
-            request_count=_sum_optional([pod.request_count for pod in pods]),
-            token_counter_reset=any(pod.token_counter_reset for pod in pods),
-        )
+        # One aggregation rule (tre_common.window_pods), shared with the controller's
+        # restriction to the awake pods. NOTE: per_pod / routable_pods here count every
+        # pod with a doc in the window, sleeping ones included (the gateway writes docs
+        # for them too); the decision path replaces them with the fleet state's view.
+        return aggregate_pods(model, window_start_ms, window_end_ms, per_pod)
 
     def _hist_sum_delta(self, model: str, metric: str, docs: list[dict[str, Any]], window_start_ms: int) -> float | None:
         if not _has_window_hist_doc(docs, window_start_ms):
@@ -381,6 +414,10 @@ class MetricsStore:
                 total += _number(metrics.get(metric_key), 0.0)
         expected_samples = max(1, int((window_end_ms - window_start_ms) / self._instant_sample_interval_ms))
         return total / expected_samples
+
+
+def _doc_ticks(docs: list[dict[str, Any]]) -> tuple[int, ...]:
+    return tuple(sorted({int(_number(doc.get("timestamp"), 0.0)) for doc in docs if doc.get("timestamp") is not None}))
 
 
 def _parse_legacy_key(prefix: str, key: str) -> tuple[str, int] | None:

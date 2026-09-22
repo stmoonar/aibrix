@@ -167,7 +167,10 @@ def build_plan(
     # ADR-0014: the former saturation bypass ("unless Q_ctl >= qsat") was removed. Warmup
     # suppression is now unconditional; a genuine flash crowd in the warmup window is
     # delayed at most one window (until the sliding window clears the traffic onset).
+    # Band dwell (D8, SignalState.apply_dwell): a receiver whose band has not held for
+    # the configured number of new metrics windows is suppressed the same way.
     warmup_suppressed: list[str] = []
+    dwell_suppressed: list[str] = []
     kept: list = []
     for item in classifications:
         if item.role == ModelRole.RECEIVER:
@@ -175,9 +178,13 @@ def build_plan(
             if not ctx.get("signal_warm", True):
                 warmup_suppressed.append(item.model_name)
                 continue
+            if ctx.get("dwell_confirmed", True) is False:
+                dwell_suppressed.append(item.model_name)
+                continue
         kept.append(item)
-    if warmup_suppressed:
+    if warmup_suppressed or dwell_suppressed:
         events.extend(f"receiver_suppressed_signal_warmup:{model}" for model in warmup_suppressed)
+        events.extend(f"receiver_suppressed_dwell:{model}" for model in dwell_suppressed)
         classifications = kept
 
     critical_receivers = [item for item in classifications if item.state == ModelState.CRITICAL]

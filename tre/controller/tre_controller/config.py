@@ -8,6 +8,8 @@ from typing import Mapping
 
 from tre_common.rediskeys import SCRAPE_INTERVAL_MS
 from tre_common.registry import EXPECTED_SIGNAL_DIRECTIONS, load_registry
+from tre_controller.loops.metrics_task import REFRESH_MODES
+from tre_controller.signals.trs import DWELL_STATES
 from tre_controller.planning.util_scale_down import DEFAULT_WINDOWS, parse_q_per_replica
 
 SIGNAL_SOURCES = {
@@ -22,6 +24,7 @@ PERCENTILE_MODES = {"bucket_upper", "interpolated"}
 WINDOW_MODES = {"tumbling", "sliding"}
 METRICS_SCHEMAS = {"v1", "v2"}
 INCOMPLETE_POLICIES = {"drop_model", "drop_all"}
+GATEWAY_INTERVAL_CHECKS = {"fail", "warn", "off"}
 _TRUE_VALUES = {"1", "true", "yes", "y", "on"}
 _FALSE_VALUES = {"0", "false", "no", "n", "off"}
 
@@ -81,7 +84,8 @@ class ControllerConfig:
     action_cooldown: bool
     # Utilisation-gated scale-down probe (planner util_scale_down_safescale).
     # TRE_UTIL_SCALE_DOWN (default on), TRE_UTIL_SCALE_DOWN_WINDOWS (distinct metrics
-    # windows, default 6 ~= 30s at the 5s refresh), TRE_UTIL_SCALE_DOWN_Q_PER_REPLICA
+    # windows, default 6 = 60 s at the phase-aligned 10 s cadence; it was ~30-45 s at the
+    # old free-running 5 s refresh), TRE_UTIL_SCALE_DOWN_Q_PER_REPLICA
     # ("2.5" or "model=v,..."; overrides the registry scale_down_q_per_replica).
     # Independent of TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE (which gates only the Z_m
     # high_proactive_safescale path); HIGH models are eligible here. Ablations must set
@@ -96,6 +100,25 @@ class ControllerConfig:
     profile_proc_sample_interval_s: float
     profile_flush_interval_s: float
     safescale: SafeScaleConfig
+    # --- D8 (plan §6.9i): phase-aligned sampler, band dwell, gateway cadence check ---
+    # Defaults keep direct constructions (tests) working; from_env sets them all.
+    # TRE_METRICS_REFRESH_MODE: phase_aligned (default) | free_running (old loop).
+    metrics_refresh_mode: str = "phase_aligned"
+    # TRE_METRICS_PHASE_OFFSET_MS: read at boundary + offset (a floor, see adapt).
+    metrics_phase_offset_ms: int = 2_000
+    # TRE_METRICS_PHASE_ADAPT: raise the offset to when the boundary tick actually
+    # appears (the gateway ticker phase), re-learned every 60 cycles.
+    metrics_phase_adapt: bool = True
+    # TRE_METRICS_PHASE_RETRY_MS: re-read period while the boundary tick is missing.
+    metrics_phase_retry_ms: int = 500
+    # TRE_METRICS_STALE_HOLD_WINDOWS: stale windows during which the previous snapshot
+    # keeps being served before it is marked stale (decision loops then hold).
+    metrics_stale_hold_windows: int = 2
+    # TRE_DWELL_WINDOWS (1 = off) / TRE_DWELL_STATES (subset of critical,low,high).
+    dwell_windows: int = 2
+    dwell_states: tuple[str, ...] = ("critical", "low", "high")
+    # TRE_GATEWAY_INTERVAL_CHECK: fail (default) | warn | off.
+    gateway_interval_check: str = "fail"
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "ControllerConfig":
@@ -133,6 +156,29 @@ class ControllerConfig:
 
         redis_url = _get_str(values, "TRE_REDIS_URL", "redis://aibrix-redis-master:6379/0")
 
+        metrics_refresh_mode = _get_str(values, "TRE_METRICS_REFRESH_MODE", "phase_aligned")
+        if metrics_refresh_mode not in REFRESH_MODES:
+            raise ValueError(f"TRE_METRICS_REFRESH_MODE must be one of {sorted(REFRESH_MODES)}")
+        gateway_interval_check = _get_str(values, "TRE_GATEWAY_INTERVAL_CHECK", "fail")
+        if gateway_interval_check not in GATEWAY_INTERVAL_CHECKS:
+            raise ValueError(
+                f"TRE_GATEWAY_INTERVAL_CHECK must be one of {sorted(GATEWAY_INTERVAL_CHECKS)}"
+            )
+        dwell_states = tuple(
+            state.strip().lower()
+            for state in _get_str(values, "TRE_DWELL_STATES", "critical,low,high").split(",")
+            if state.strip()
+        )
+        unknown_states = set(dwell_states) - set(DWELL_STATES)
+        if unknown_states:
+            raise ValueError(f"TRE_DWELL_STATES must be a subset of {list(DWELL_STATES)}")
+        instant_sample_interval_ms = _get_positive_int(
+            values, "TRE_INSTANT_SAMPLE_INTERVAL_MS", SCRAPE_INTERVAL_MS
+        )
+        metrics_phase_offset_ms = _get_nonneg_int(values, "TRE_METRICS_PHASE_OFFSET_MS", 2_000)
+        if metrics_phase_offset_ms >= instant_sample_interval_ms:
+            raise ValueError("TRE_METRICS_PHASE_OFFSET_MS must be below the gateway period")
+
         safescale = SafeScaleConfig(
             ttft_p95_slo_ms=_get_positive_float(values, "SAFE_SCALE_TTFT_P95_SLO_MS", 500.0),
             tpot_p95_slo_ms=_get_positive_float(values, "SAFE_SCALE_TPOT_P95_SLO_MS", 75.0),
@@ -150,6 +196,8 @@ class ControllerConfig:
             raise ValueError("SAFE_SCALE_MIN_WINDOW_MS must be <= SAFE_SCALE_MAX_WINDOW_MS")
 
         metrics_window_ms = _get_positive_int(values, "TRE_METRICS_WINDOW_MS", 30_000)
+        # phase_aligned needs metrics_window_ms to be a multiple of the gateway period;
+        # metrics_task falls back to free_running (with an error log) when it is not.
         # N2 invariant (plan 15 §6 N2, architect-ruled): the SafeScale commit gate only
         # inspects the tail (hq fraction) of probe observations. Those tail observations'
         # metrics windows must be fully post-hide, i.e. the probe must run at least one
@@ -196,9 +244,7 @@ class ControllerConfig:
             # window_ms / this. A smaller value inflates expected_samples and HALVES the
             # queue average the controller sees (r3 SMOKE_FINDINGS defect 2). Aligned to
             # the real 10s write cadence; do not re-introduce a 5s magic number.
-            instant_sample_interval_ms=_get_positive_int(
-                values, "TRE_INSTANT_SAMPLE_INTERVAL_MS", SCRAPE_INTERVAL_MS
-            ),
+            instant_sample_interval_ms=instant_sample_interval_ms,
             histogram_lookback_ms=_get_nonneg_int(values, "TRE_HIST_BASELINE_LOOKBACK_MS", 90_000),
             min_latency_samples=_get_nonneg_int(values, "TRE_MIN_LATENCY_SAMPLES", 10),
             percentile_mode=percentile_mode,
@@ -234,6 +280,14 @@ class ControllerConfig:
                 values, "TRE_PROFILE_FLUSH_INTERVAL_SECONDS", 1.0
             ),
             safescale=safescale,
+            metrics_refresh_mode=metrics_refresh_mode,
+            metrics_phase_offset_ms=metrics_phase_offset_ms,
+            metrics_phase_adapt=_get_bool(values, "TRE_METRICS_PHASE_ADAPT", True),
+            metrics_phase_retry_ms=_get_positive_int(values, "TRE_METRICS_PHASE_RETRY_MS", 500),
+            metrics_stale_hold_windows=_get_nonneg_int(values, "TRE_METRICS_STALE_HOLD_WINDOWS", 2),
+            dwell_windows=_get_positive_int(values, "TRE_DWELL_WINDOWS", 2),
+            dwell_states=dwell_states,
+            gateway_interval_check=gateway_interval_check,
         )
 
 

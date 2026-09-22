@@ -36,6 +36,10 @@ class DecisionWriter(Protocol):
 
 
 class RescueTaskConfig(Protocol):
+    # Wake period of the loop (TRE_RESCUE_INTERVAL_SECONDS, 5 s). The loop only reads the
+    # latest snapshot; with the phase-aligned sampler snapshots change every 10 s and a
+    # re-read of the same window_end_ms advances neither the EMA nor the band dwell, so
+    # the effective decision cadence is 10 s (acted on <= rescue_interval_s after publish).
     rescue_interval_s: float
 
 

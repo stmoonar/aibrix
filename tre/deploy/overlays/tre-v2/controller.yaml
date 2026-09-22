@@ -63,15 +63,33 @@ spec:
             # --- Loop cadence / windows (D2; S1.1/S1.2 signal-freshness) ---
             - name: TRE_MONITOR_INTERVAL_SECONDS
               value: "20"
-            # S1.2: metrics refresh decoupled from monitor_interval, set to the fastest
-            # decision loop (rescue 5s) so the shared snapshot is never staler than 5s.
+            # D8 (09-22): phase-aligned sampler. Sleeps to the next 10 s gateway write
+            # boundary + offset and reads (boundary-30s, boundary]: exactly 3 instant
+            # ticks and a full 30 s token span per window, one new snapshot per 10 s.
+            # The offset is a floor: the sampler re-reads until the boundary tick exists
+            # and adapts (the tre-gateway ticker is not boundary-aligned; its writes land
+            # ~5.3 s after the boundary as of 09-22). free_running = the old refresh loop
+            # (TRE_METRICS_REFRESH_INTERVAL_SECONDS + TRE_METRICS_WINDOW_MODE).
+            - name: TRE_METRICS_REFRESH_MODE
+              value: phase_aligned
+            - name: TRE_METRICS_PHASE_OFFSET_MS
+              value: "2000"
+            # Only used by TRE_METRICS_REFRESH_MODE=free_running.
             - name: TRE_METRICS_REFRESH_INTERVAL_SECONDS
               value: "5"
+            # The rescue loop still wakes every 5 s, but snapshots change every 10 s and a
+            # re-read of one window advances neither the EMA nor the dwell: the effective
+            # decision cadence is 10 s (acted on <= 5 s after the snapshot is published).
             - name: TRE_RESCUE_INTERVAL_SECONDS
               value: "5"
             - name: TRE_FAIRNESS_INTERVAL_SECONDS
               value: "10"
-            # S1.1: sliding window (no 60-120s tumbling staleness).
+            # D8: CRITICAL / LOW / HIGH act only after 2 consecutive new windows (20 s at
+            # the 10 s cadence), counted by window_end_ms.
+            - name: TRE_DWELL_WINDOWS
+              value: "2"
+            # S1.1: sliding window (no 60-120s tumbling staleness). free_running only;
+            # phase_aligned always reads the half-open window ending on the boundary.
             - name: TRE_METRICS_WINDOW_MODE
               value: "sliding"
             # S1.2: single shared window shortened 60s->30s (3x the 10s write period,

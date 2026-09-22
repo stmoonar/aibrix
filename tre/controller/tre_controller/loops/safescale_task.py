@@ -6,7 +6,8 @@ from typing import Awaitable, Callable, Protocol
 
 from tre_common.metrics_schema import MetricsSnapshot, ModelWindowMetrics
 from tre_common.registry import Registry
-from tre_controller.planning.planner import Action, ScaleAction, UnhideAction
+from tre_controller.loops.tick import serving_window
+from tre_controller.planning.planner import Action, ClusterView, ScaleAction, UnhideAction
 from tre_controller.planning.safescale import ProbeObservation, SafeScaleCommand, SafeScaleProbe
 from tre_controller.signals.sources import get_signal
 from tre_controller.signals.trs import SignalState, TRSComputer, TRSInput
@@ -14,6 +15,10 @@ from tre_controller.signals.trs import SignalState, TRSComputer, TRSInput
 
 class SnapshotReader(Protocol):
     def get(self) -> MetricsSnapshot | None: ...
+
+
+class ClusterViewReader(Protocol):
+    def get(self) -> ClusterView | None: ...
 
 
 class SafeScaleObserver(Protocol):
@@ -47,6 +52,7 @@ def run_safescale_observation_tick(
     safescale: SafeScaleObserver,
     signal_source: str = "zm",
     signal_state: SignalState | None = None,
+    cluster_view: ClusterView | None = None,
 ) -> SafeScaleObservationResult:
     if snapshot.stale:
         return SafeScaleObservationResult(submitted=0, events=("snapshot_stale",))
@@ -59,6 +65,8 @@ def run_safescale_observation_tick(
         if metrics is None:
             events.append(f"safescale_observation_missing:{probe.model}")
             continue
+        # Same serving-pod window as the planner tick (sleeping pods' docs and count out).
+        metrics = serving_window(metrics, cluster_view)
         observation = _observation_from_metrics(
             snapshot.ts_ms, metrics, registry.model(probe.model), signal_source, signal_state=signal_state
         )
@@ -102,6 +110,7 @@ async def safescale_task(
     cfg: SafeScaleTaskConfig,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     signal_state: SignalState | None = None,
+    cluster_view_box: ClusterViewReader | None = None,
 ) -> None:
     while True:
         snapshot = snapshot_box.get()
@@ -113,6 +122,7 @@ async def safescale_task(
                 safescale=safescale,
                 signal_source=getattr(cfg, "signal_source", "zm"),
                 signal_state=signal_state,
+                cluster_view=cluster_view_box.get() if cluster_view_box is not None else None,
             )
         interval = getattr(getattr(cfg, "safescale"), "probe_poll_seconds")
         await sleep(interval)

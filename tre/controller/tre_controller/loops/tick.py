@@ -10,6 +10,7 @@ if TYPE_CHECKING:
 from tre_common.metrics_schema import MetricsSnapshot, ModelWindowMetrics
 from tre_common.registry import Registry, ModelSpec
 from tre_common.tss import window_is_idle
+from tre_common.window_pods import restrict_to_serving
 from tre_controller.planning.classify import (
     classify_all_models,
     model_control_configs_from_registry,
@@ -150,6 +151,11 @@ def run_planner_tick(
         model_control_configs=model_control_configs_from_registry(registry, signal_source),
         signal_idle_rps_eps=signal_idle_rps_eps,
     )
+    dwell_events: tuple[str, ...] = ()
+    if signal_state is not None:
+        # Band dwell (D8): counted per distinct window_end_ms in the shared SignalState,
+        # so the rescue/fairness re-reads of one snapshot never advance it twice.
+        classifications, dwell_events = signal_state.apply_dwell(classifications, contexts, snapshot.models)
     if _prof_on:
         _signals_ns = time.perf_counter_ns() - _phase_t0
         _phase_t0 = time.perf_counter_ns()
@@ -219,7 +225,7 @@ def run_planner_tick(
     return LoopTickResult(
         submitted=len(actions),
         actions=actions,
-        events=paper_events + tuple(plan.events) + safescale_events,
+        events=paper_events + dwell_events + tuple(plan.events) + safescale_events,
         model_contexts=contexts,
         classifications={item.model_name: item for item in classifications},
     )
@@ -399,7 +405,9 @@ def _model_contexts(
         if counts is not None:
             awake_replicas, bound_replicas = counts
             assigned_replicas = bound_replicas
-            metrics = replace(metrics, routable_pods=awake_replicas, assigned_replicas=awake_replicas)
+            # Fleet state is the pod-count authority: sleeping pods also write gateway
+            # docs, so the raw window counts them (and would carry their docs).
+            metrics = serving_window(metrics, cluster_view, counts=counts)
         tokens_available = metrics.prompt_tokens is not None and metrics.generation_tokens is not None
         request_rate_rps = _request_rate_rps(metrics)
         decode_tps = per_replica_token_rate(metrics, metrics.generation_tokens)
@@ -501,6 +509,31 @@ def _request_rate_rps(metrics: ModelWindowMetrics) -> float | None:
     if duration_s <= 0.0:
         return None
     return max(0.0, float(metrics.request_count)) / duration_s
+
+
+def serving_window(
+    metrics: ModelWindowMetrics,
+    cluster_view: ClusterView | None,
+    *,
+    counts: tuple[int, int] | None = None,
+) -> ModelWindowMetrics:
+    """The model's window restricted to its serving pods (``restrict_to_serving``):
+    docs of pods the fleet state reports asleep are dropped and routable/assigned become
+    the awake-and-not-hidden count. Without a fleet view (or a model it does not list) the
+    raw window is returned unchanged. Used by the planner tick and the safescale
+    observation, so both decide on the same window."""
+    if cluster_view is None:
+        return metrics
+    if counts is None:
+        counts = _cluster_view_counts(cluster_view).get(metrics.model)
+        if counts is None:
+            return metrics
+    sleeping = {
+        binding.serve_id
+        for binding in cluster_view.bindings
+        if binding.model == metrics.model and not binding.awake
+    }
+    return restrict_to_serving(metrics, sleeping_pods=sleeping, routable_pods=counts[0])
 
 
 def _cluster_view_counts(cluster_view: ClusterView | None) -> dict[str, tuple[int, int]]:

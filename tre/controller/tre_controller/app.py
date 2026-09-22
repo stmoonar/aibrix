@@ -6,6 +6,7 @@ from typing import Any, Awaitable, Callable, Mapping
 
 from tre_common.registry import Registry, load_registry
 from tre_controller.config import ControllerConfig
+from tre_controller.gateway_cadence import check_gateway_cadence
 from tre_controller.loops.action_queue import ActionQueue
 from tre_controller.mode import ObserveModeGate
 from tre_controller.reconcile.hidden_orphans import HiddenOrphanDetector
@@ -122,6 +123,7 @@ def build_controller_task_specs(
                     safescale=deps.safescale,
                     cfg=cfg,
                     signal_state=deps.signal_state,
+                    cluster_view_box=deps.cluster_view_box,
                 ),
             )
         )
@@ -185,7 +187,11 @@ def create_controller_dependencies(
         decision_writer=DecisionSnapshotWriter(redis_client),
         safescale=safescale,
         registry=registry,
-        signal_state=SignalState(warmup_ms=cfg.signal_warmup_ms),
+        signal_state=SignalState(
+            warmup_ms=cfg.signal_warmup_ms,
+            dwell_windows=cfg.dwell_windows,
+            dwell_states=cfg.dwell_states,
+        ),
         profiler=profiler,
         hidden_orphan_detector=HiddenOrphanDetector(
             redis_client, grace_s=cfg.orphan_grace_s
@@ -214,7 +220,22 @@ async def main(
         redis_client_factory=redis_client_factory,
         sm_transport=sm_transport,
     )
+    verify_gateway_cadence(deps, cfg)
     await (runner or run_controller)(deps, cfg)
+
+
+def verify_gateway_cadence(deps: ControllerDependencies, cfg: ControllerConfig) -> None:
+    """Startup assertion (D8): gateway write period == SCRAPE_INTERVAL_MS. Raises
+    GatewayCadenceMismatch on a mismatch in ``fail`` mode; only warns without evidence."""
+    redis_client = getattr(deps.store, "redis_client", None)
+    if redis_client is None:
+        return
+    check_gateway_cadence(
+        redis_client,
+        [spec.name for spec in deps.registry.models()],
+        mode=getattr(cfg, "gateway_interval_check", "fail"),
+        expected_ms=cfg.instant_sample_interval_ms,
+    )
 
 
 def _create_redis_client(redis_url: str, redis_client_factory: RedisClientFactory | None) -> Any:

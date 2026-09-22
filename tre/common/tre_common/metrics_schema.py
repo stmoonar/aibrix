@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass(frozen=True)
@@ -17,6 +17,10 @@ class PodWindowMetrics:
     e2e_p95_ms: float | None
     request_count: float | None = None
     token_counter_reset: bool = False
+    #: Timestamps (ms) of the gateway instant samples read for this window. Provenance for
+    #: the phase-aligned sampler's freshness check (a window must hold every
+    #: SCRAPE_INTERVAL_MS tick, the newest one at window_end). Excluded from equality.
+    instant_ticks_ms: tuple[int, ...] = field(default=(), compare=False)
 
 
 @dataclass(frozen=True)
@@ -38,6 +42,8 @@ class ModelWindowMetrics:
     per_pod: dict[str, PodWindowMetrics]
     request_count: float | None = None
     token_counter_reset: bool = False
+    #: Union of the per-pod ``instant_ticks_ms`` (see :class:`PodWindowMetrics`).
+    instant_ticks_ms: tuple[int, ...] = field(default=(), compare=False)
 
 
 @dataclass(frozen=True)
