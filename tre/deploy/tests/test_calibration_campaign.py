@@ -500,15 +500,34 @@ def test_families_inside_the_ci_publish_the_merged_theta() -> None:
     assert verdict["outside"] == []
 
 
-def test_a_family_outside_the_ci_publishes_the_smallest_family_theta() -> None:
-    # theta is a health threshold the controller must stay above, so under-claiming
-    # health is the direction that fails safe.
+def test_a_family_outside_the_ci_publishes_the_largest_family_theta() -> None:
+    # B1 (plan 6.3): Z = TSS/theta and Z < tau_crit is CRITICAL, so the larger theta is
+    # the one that errs towards adding capacity - the conservative choice.
     verdict = campaign.family_theta_verdict(
         1000.0, 20.0, {"prefill_heavy": 1300.0, "decode_heavy": 700.0}
     )
-    assert verdict["publish"] == "min_family"
-    assert verdict["theta"] == 700.0 and verdict["family"] == "decode_heavy"
+    assert verdict["publish"] == "max_family"
+    assert verdict["theta"] == 1300.0 and verdict["family"] == "prefill_heavy"
     assert verdict["outside"] == ["decode_heavy", "prefill_heavy"]
+
+
+def test_the_published_family_theta_is_the_one_that_classifies_more_windows_critical() -> None:
+    # Check the direction claim against the controller's own classifier, not a comment.
+    from tre_controller.planning.classify import ModelState, TauThresholds, classify_model
+
+    tau = TauThresholds.from_control(0.2, 0.25)
+    verdict = campaign.family_theta_verdict(
+        1000.0, 20.0, {"prefill_heavy": 1300.0, "decode_heavy": 700.0}
+    )
+    tss = 900.0  # Z = 0.69 under 1300 (CRITICAL), 1.29 under 700 (HIGH)
+
+    def state(theta: float) -> ModelState:
+        return classify_model(
+            model_name="m", trs=tss, Z_m=tss / theta, eta_m=None, theta_m=theta, tau=tau
+        ).state
+
+    assert state(verdict["theta"]) == ModelState.CRITICAL
+    assert state(min(verdict["family_thetas"].values())) != ModelState.CRITICAL
 
 
 # ------------------------------------------------------------------ held-out data

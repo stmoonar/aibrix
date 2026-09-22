@@ -764,7 +764,7 @@ def family_theta_verdict(
     *,
     tolerance: float = FAMILY_SPREAD_TOLERANCE,
 ) -> dict:
-    """Publish the merged theta, or fall back to the smallest family theta.
+    """Publish the merged theta, or fall back to the LARGEST family theta.
 
     The merged fit pools the prefill-heavy and decode-heavy shapes, which is only
     legitimate if they are measuring the same threshold. Fitting each family separately
@@ -773,10 +773,14 @@ def family_theta_verdict(
     published.
 
     If a family lands outside it, theta depends on the regime, and there is no single
-    correct value. The published number is then the **smallest** family theta, because
-    theta is a health threshold that the controller must stay above: publishing the
-    larger one would declare healthy a regime that is not, whereas publishing the smaller
-    one is conservative in the direction that fails safe.
+    correct value. The published number is then the **largest** family theta. The
+    controller computes ``Z = TSS / theta`` and calls a model CRITICAL when
+    ``Z < tau_crit`` (``tre_controller.planning.classify.classify_model``), so a larger
+    theta makes CRITICAL easier to reach: it is the value that errs towards adding
+    capacity, i.e. the conservative one. (The smallest family theta, published before
+    2026-09-22, was the least conservative choice: it declares healthy the regime whose
+    own threshold is higher.) The real remedy is a w_p that removes the family gap
+    (plan §6.5); this rule only picks the safe side while it exists.
     """
     if not family_thetas:
         return {
@@ -804,15 +808,16 @@ def family_theta_verdict(
             "ci_half_width": ci_half_width,
             "outside": [],
         }
-    smallest = min(family_thetas.items(), key=lambda kv: float(kv[1]))
+    largest = max(family_thetas.items(), key=lambda kv: float(kv[1]))
     return {
-        "publish": "min_family",
-        "theta": float(smallest[1]),
-        "family": smallest[0],
+        "publish": "max_family",
+        "theta": float(largest[1]),
+        "family": largest[0],
         "reason": (
             f"family theta(s) {outside} fall outside the merged bootstrap CI "
-            f"(+/-{bound:.4g}), so theta depends on the regime; the smallest family "
-            f"theta ({smallest[0]}) is published because under-claiming health fails safe"
+            f"(+/-{bound:.4g}), so theta depends on the regime; the largest family "
+            f"theta ({largest[0]}) is published because Z = TSS/theta < tau_crit is "
+            "CRITICAL, so the larger theta errs towards adding capacity"
         ),
         "family_thetas": dict(sorted(family_thetas.items())),
         "ci_half_width": ci_half_width,
@@ -892,8 +897,9 @@ def fit_plan(
                 "tolerance": FAMILY_SPREAD_TOLERANCE,
                 "statement": (
                     "family thetas inside the merged bootstrap CI -> publish the merged "
-                    "theta; otherwise theta is regime-dependent and the smallest family "
-                    "theta is published, because under-claiming health fails safe"
+                    "theta; otherwise theta is regime-dependent and the largest family "
+                    "theta is published (Z = TSS/theta < tau_crit is CRITICAL, so the "
+                    "larger theta errs towards adding capacity)"
                 ),
             },
         },
