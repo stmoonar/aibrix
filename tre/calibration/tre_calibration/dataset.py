@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import logging
 import math
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,6 +11,8 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 from tre_calibration.labels import label_window
 from tre_common.tss import DEFAULT_EMA_TAU_MS, TssEma, replica_factor, signal_ema, tss_queue, tss_terms
 
+
+LOG = logging.getLogger(__name__)
 
 _LATENCY_COLUMNS = {
     "ttft_p95": "p95_ttft",
@@ -77,20 +80,46 @@ def smooth_rows_by_cell(
     the online EMA saw them too. ``make_ema`` builds a fresh EMA per cell: ``TssEma`` for
     TSS, :func:`tre_common.tss.signal_ema` for the alternative signals - the same class,
     tau and alpha the controller uses.
+
+    Within a cell, idle gaps are handled by ``TssEma``'s idle-gap rule with each row's own
+    window (``window_end_ms - window_start_ms``); without a ``window_start_ms`` column the
+    gap rule is off. The per-cell reset assumes the online EMA was reset between cells too,
+    which needs more than one window of quiet between them; a cell that starts less than
+    one window after the previous one ended is logged as a warning (the online EMA may
+    have carried over, so the offline value can differ from what the controller saw).
     """
     values: list[float | None] = []
     ema: TssEma | None = None
     prev_cell: str | None = None
     prev_end: float | None = None
+    close_cells: list[str] = []
     for row, raw in zip(rows, raws):
         end = _as_float(row.get("window_end_ms"))
         if end is None:
             raise ValueError("EMA smoothing needs a window_end_ms column")
+        start = _as_float(row.get("window_start_ms"))
+        window_ms = end - start if start is not None and end > start else None
         cell = str(row.get("scenario_id") or "")
         if ema is None or cell != prev_cell or (prev_end is not None and end < prev_end):
+            if (
+                ema is not None
+                and prev_end is not None
+                and end >= prev_end
+                and start is not None
+                and window_ms is not None
+                and start - prev_end < window_ms
+            ):
+                close_cells.append(f"{prev_cell}->{cell} ({start - prev_end:.0f} ms)")
             ema = make_ema()
         prev_cell, prev_end = cell, end
-        values.append(ema.update(raw, end))
+        values.append(ema.update(raw, end, window_ms))
+    if close_cells:
+        LOG.warning(
+            "%d cell(s) start less than one metrics window after the previous cell ended; "
+            "the offline per-cell EMA reset may not match the online EMA there: %s",
+            len(close_cells),
+            ", ".join(close_cells[:5]) + (" ..." if len(close_cells) > 5 else ""),
+        )
     return values
 
 

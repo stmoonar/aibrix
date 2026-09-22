@@ -28,6 +28,13 @@ The EMA is a wall-clock time-constant EMA, ``alpha_k = 1 - exp(-dt_k / tau)``
 (``tre_controller.signals.trs.TRSComputer``) and offline
 (``tre_calibration.dataset`` recompute, ``tre_calibration.signals``).
 
+**Idle-gap reset** (:class:`TssEma`): when a sample arrives more than one metrics window
+after the last sample that advanced the EMA (``window_end_ms - last_ms > window_ms``), the
+EMA is cleared first, so a traffic period never inherits the previous period's value
+(it would otherwise survive with weight ``exp(-gap/tau)``). ``window_ms`` is the sample's
+own window duration, i.e. the configured metrics window (``TRE_METRICS_WINDOW_MS``), not
+a separate constant. Offline, every cell additionally starts from a fresh EMA.
+
 Nothing here may import from the controller or calibration packages: both import it.
 """
 from __future__ import annotations
@@ -175,6 +182,22 @@ class TssEma:
     rule that a zero raw is passed through without advancing the EMA (a zero TSS is the
     controller's "undefined" placeholder); for a pressure signal such as queue length a
     zero is an ordinary, frequent observation and must advance the EMA like any other.
+
+    Rules of :meth:`update`, in order:
+
+    1. **idle-gap reset** - if ``window_ms`` is given and ``window_end_ms - last_ms >
+       window_ms``, clear ``value`` / ``last_ms``. Checked for *every* sample, including a
+       None / non-finite / (TSS) zero raw that is then passed through. Strictly greater:
+       back-to-back tumbling windows sit exactly one window apart and must not reset;
+       one fully idle window in between (or any longer gap) does.
+    2. a None / non-finite / (TSS) zero raw is passed through without advancing
+       ``value`` or ``last_ms``;
+    3. the first sample after construction or a reset seeds ``value = raw``;
+    4. a repeated or regressed ``window_end_ms`` keeps the current value;
+    5. otherwise one :func:`ema_step` with ``dt = window_end_ms - last_ms``.
+
+    A fresh instance and a reset instance are the same state, so a controller restart is
+    equivalent to an idle-gap reset (restart duality).
     """
 
     def __init__(self, tau_ms: float, *, zero_is_sample: bool = False) -> None:
@@ -185,7 +208,21 @@ class TssEma:
         self.value: Optional[float] = None
         self.last_ms: Optional[float] = None
 
-    def update(self, raw: Optional[float], window_end_ms: float) -> Optional[float]:
+    def reset(self) -> None:
+        """Forget the EMA: the next advancing sample seeds it (same as a fresh instance)."""
+        self.value = None
+        self.last_ms = None
+
+    def update(
+        self, raw: Optional[float], window_end_ms: float, window_ms: Optional[float] = None
+    ) -> Optional[float]:
+        if (
+            window_ms is not None
+            and window_ms > 0
+            and self.last_ms is not None
+            and float(window_end_ms) - self.last_ms > float(window_ms)
+        ):
+            self.reset()
         if raw is None or not math.isfinite(raw) or (raw == 0 and not self.zero_is_sample):
             return raw
         if self.value is None or self.last_ms is None:
@@ -210,15 +247,22 @@ def smooth_series(
     window_end_ms: Sequence[float],
     *,
     tau_ms: float,
+    window_ms: Optional[float | Sequence[Optional[float]]] = None,
 ) -> list[Optional[float]]:
     """EMA a single cell's raw series in data time, exactly as the controller would.
 
-    Mirrors ``TRSComputer._update_ema`` in its time-constant mode: an undefined / non-
-    positive raw is passed through without advancing the EMA or its timestamp; a repeated
-    or regressed ``window_end_ms`` keeps the current EMA. The first defined sample seeds it.
+    Mirrors ``TRSComputer._update_ema`` in its time-constant mode (:class:`TssEma` rules):
+    an undefined / zero raw is passed through without advancing the EMA or its timestamp;
+    a repeated or regressed ``window_end_ms`` keeps the current EMA; the first defined
+    sample seeds it; a gap of more than ``window_ms`` (a scalar or one value per sample)
+    since the last advancing sample resets it. ``window_ms=None`` disables the gap rule.
     """
     ema = TssEma(tau_ms)
-    return [ema.update(raw, end) for raw, end in zip(raws, window_end_ms)]
+    if window_ms is None or isinstance(window_ms, (int, float)):
+        windows: Sequence[Optional[float]] = [window_ms] * len(raws)
+    else:
+        windows = window_ms
+    return [ema.update(raw, end, win) for raw, end, win in zip(raws, window_end_ms, windows)]
 
 
 def convert_window_total_theta(theta_total: float, window_ms: float = V2_WINDOW_MS) -> float:

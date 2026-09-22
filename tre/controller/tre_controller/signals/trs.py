@@ -6,7 +6,7 @@ from typing import Any
 
 from tre_common.metrics_schema import ModelWindowMetrics
 from tre_common.registry import TrsParams
-from tre_common.tss import TssEma, ema_step, replica_factor, signal_ema, tss_terms
+from tre_common.tss import TssEma, replica_factor, signal_ema, tss_terms
 
 
 @dataclass
@@ -72,17 +72,42 @@ class TRSResult:
 
 
 class TRSComputer:
+    """Raw TSS of one window plus the per-model EMA.
+
+    With ``ema_tau_ms`` set (every deployed registry entry) the EMA *is* a
+    :class:`tre_common.tss.TssEma` - the same object and rules the offline paths use
+    (idle-gap reset after one metrics window, None/0 passthrough, per-window dedup), so
+    online and offline agree bitwise. ``ema_alpha`` feeds only the DEPRECATED fixed-alpha
+    branch (``ema_tau_ms`` unset), which is kept for the golden parity tests.
+    """
+
     def __init__(self, ema_alpha: float = 0.5, ema_tau_ms: float | None = None) -> None:
         self.ema_alpha = ema_alpha
         self.ema_tau_ms = ema_tau_ms
-        self._trs_ema: float | None = None
+        self._ema: TssEma | None = (
+            TssEma(ema_tau_ms) if ema_tau_ms is not None and ema_tau_ms > 0 else None
+        )
+        # DEPRECATED fixed-alpha branch state (only used when _ema is None).
+        self._legacy_ema: float | None = None
+        self._legacy_last_ms: int | None = None
         self._prev_Y: float | None = None
         self._prev_Q_ctl: float | None = None
-        self._last_update_ms: int | None = None
+
+    @property
+    def tss_ema(self) -> TssEma | None:
+        """The shared-definition EMA (None in the deprecated fixed-alpha mode)."""
+        return self._ema
 
     @property
     def current_ema(self) -> float | None:
-        return self._trs_ema
+        return self._ema.value if self._ema is not None else self._legacy_ema
+
+    def reset_ema(self) -> None:
+        """Forget the EMA (idle tick). Equivalent to a fresh computer / a restart."""
+        if self._ema is not None:
+            self._ema.reset()
+        self._legacy_ema = None
+        self._legacy_last_ms = None
 
     def restore(
         self,
@@ -93,16 +118,22 @@ class TRSComputer:
         last_update_ms: int | None = None,
     ) -> None:
         if ema is not None:
-            self._trs_ema = ema
+            if self._ema is not None:
+                self._ema.value = ema
+            else:
+                self._legacy_ema = ema
         if prev_Y is not None:
             self._prev_Y = prev_Y
         if prev_Q_ctl is not None:
             self._prev_Q_ctl = prev_Q_ctl
         if last_update_ms is not None:
-            self._last_update_ms = last_update_ms
+            if self._ema is not None:
+                self._ema.last_ms = float(last_update_ms)
+            else:
+                self._legacy_last_ms = last_update_ms
 
     def snapshot(self) -> dict[str, Any]:
-        return {"ema": self._trs_ema, "prev_Y": self._prev_Y, "prev_Q_ctl": self._prev_Q_ctl}
+        return {"ema": self.current_ema, "prev_Y": self._prev_Y, "prev_Q_ctl": self._prev_Q_ctl}
 
     def compute(
         self, inp: TRSInput, theta_m: float | None = None, *, window_end_ms: int | None = None
@@ -131,7 +162,7 @@ class TRSComputer:
         # Idle rule (plan 6.4): A + W == 0 -> TSS undefined. Reported as 0.0, which the
         # EMA passes through without advancing and compute_z_m maps to None.
         trs_raw = terms.raw if terms.raw is not None else 0.0
-        trs = self._update_ema(trs_raw, window_end_ms=window_end_ms)
+        trs = self._update_ema(trs_raw, window_end_ms=window_end_ms, window_ms=inp.window_ms)
         eta = compute_eta_m(trs, effective_pods)
         z_m = compute_z_m(trs, theta_m)
         saved_prev_y = self._prev_Y
@@ -153,57 +184,43 @@ class TRSComputer:
             defined=terms.defined,
         )
 
-    def _update_ema(self, raw: float, window_end_ms: int | None = None) -> float:
-        if not _is_finite_positive(raw):
-            # Non-finite/zero raw is a passthrough: never advance EMA or timestamp
-            # (mirrors legacy behaviour; keeps the window_end_ms cursor clean).
-            return raw
-        # Per-window dedup (both modes): a shared computer is re-read by
-        # rescue(5s)/fairness(10s)/safescale between metrics refreshes. The EMA
-        # must advance at most once per distinct window_end_ms, else it over-
-        # smooths on duplicate snapshots. When window_end_ms is None (offline /
-        # golden path) this guard is inert and behaviour is byte-identical.
-        if window_end_ms is not None and window_end_ms == self._last_update_ms and self._trs_ema is not None:
-            return self._trs_ema
-        tau = self.ema_tau_ms
-        if tau is not None and tau > 0:
-            # Wall-clock time-constant EMA (S1.3 / ADR-0011): smoothing strength is
-            # set by tau alone, decoupled from refresh frequency. dt is measured in
-            # data time (window_end_ms deltas), not scheduler wall-clock, so it only
-            # advances when the underlying window actually advances.
+    def _update_ema(
+        self, raw: float, window_end_ms: int | None = None, window_ms: float | None = None
+    ) -> float:
+        if self._ema is not None:
+            # Time-constant EMA (S1.3 / ADR-0011): delegated to tre_common.tss.TssEma, the
+            # one implementation the offline paths use as well (idle-gap reset after
+            # window_ms, None/0 passthrough that still takes part in the gap check,
+            # per-window dedup for the rescue/fairness/safescale re-reads, dt in data time).
             if window_end_ms is None:
                 # No time reference -> cannot advance a wall-clock EMA. Passthrough.
                 return raw
-            if self._trs_ema is None or self._last_update_ms is None:
-                self._trs_ema = raw
-                self._last_update_ms = window_end_ms
-                return raw
-            dt_ms = window_end_ms - self._last_update_ms
-            if dt_ms <= 0:
-                # Window regressed (clock/window rewind): keep EMA, don't advance.
-                return self._trs_ema
-            # alpha_k = 1 - exp(-dt/tau): the SAME function the offline fit uses
-            # (tre_common.tss.smooth_series), so online and offline agree bitwise.
-            self._trs_ema = ema_step(self._trs_ema, raw, dt_ms, tau)
-            self._last_update_ms = window_end_ms
-            return self._trs_ema
-        # LEGACY fixed-alpha branch (ema_tau_ms unset). Every deployed registry entry sets
-        # ema_tau_ms; this path is kept only for the golden parity tests and for a
-        # registry that predates S1.3. Byte-identical to pre-S1.3 behaviour when
-        # window_end_ms is None (golden). With a shared computer + window_end_ms it
-        # advances once per window (the dedup above) using the fixed alpha.
-        if self.ema_alpha <= 0:
-            self._trs_ema = raw
-            if window_end_ms is not None:
-                self._last_update_ms = window_end_ms
+            value = self._ema.update(raw, window_end_ms, window_ms)
+            return raw if value is None else value
+        # DEPRECATED legacy fixed-alpha branch (ema_tau_ms unset). Every deployed registry
+        # entry sets ema_tau_ms; this path is kept only for the golden parity tests
+        # (controller/tests/golden/legacy_trs.py, test_trs_signals.py) and has no idle-gap
+        # reset. Byte-identical to pre-S1.3 behaviour when window_end_ms is None (golden).
+        if not _is_finite_positive(raw):
             return raw
-        if self._trs_ema is None:
-            self._trs_ema = raw
+        if (
+            window_end_ms is not None
+            and window_end_ms == self._legacy_last_ms
+            and self._legacy_ema is not None
+        ):
+            return self._legacy_ema
+        if self.ema_alpha <= 0:
+            self._legacy_ema = raw
+            if window_end_ms is not None:
+                self._legacy_last_ms = window_end_ms
+            return raw
+        if self._legacy_ema is None:
+            self._legacy_ema = raw
         else:
-            self._trs_ema = self.ema_alpha * self._trs_ema + (1 - self.ema_alpha) * raw
+            self._legacy_ema = self.ema_alpha * self._legacy_ema + (1 - self.ema_alpha) * raw
         if window_end_ms is not None:
-            self._last_update_ms = window_end_ms
-        return self._trs_ema
+            self._legacy_last_ms = window_end_ms
+        return self._legacy_ema
 
 
 # ADR-0014: the SaturationResult / SaturationGuard classes (qsat/epsat/hsat -> is_saturated)
@@ -252,7 +269,16 @@ class SignalState:
     ticks. One shared computer per model means one EMA per model (rescue and
     fairness share it), per the "one window, one theta, one EMA" contract.
 
-    In-process only: on controller restart the EMA re-seeds from raw within ~tau.
+    In-process only: a controller restart starts every EMA from scratch, which is exactly
+    the state an idle reset leaves behind (restart duality): after a restart the next
+    defined sample seeds the EMA, as it would after an idle gap.
+
+    **Idle reset.** The EMA is cleared on the same idle condition as the warmup onset:
+    an idle tick (``observe_traffic(has_traffic=False)``) clears the onset AND every EMA of
+    the model (TSS and alternative signals). Independently, ``TssEma``'s idle-gap rule
+    clears an EMA when a sample arrives more than one metrics window after the last
+    advancing sample; with tumbling windows an idle window always implies such a gap (so
+    the offline recompute, which has no idle ticks, reproduces the online value bitwise).
 
     Also tracks a per-model **traffic-onset** cursor for the F-onset warmup guard
     (see ``observe_traffic``): at load onset the sliding window is still filling with
@@ -281,7 +307,14 @@ class SignalState:
         return computer
 
     def smooth_signal(
-        self, model: str, source: str, raw: float | None, *, window_end_ms: int, tau_ms: float
+        self,
+        model: str,
+        source: str,
+        raw: float | None,
+        *,
+        window_end_ms: int,
+        tau_ms: float,
+        window_ms: float | None = None,
     ) -> float | None:
         """EMA'd value of an alternative signal (``tre_common.tss.signal_ema``).
 
@@ -294,7 +327,16 @@ class SignalState:
         if ema is None or ema.tau_ms != float(tau_ms):
             ema = signal_ema(tau_ms)
             self._signal_ema[key] = ema
-        return ema.update(raw, window_end_ms)
+        return ema.update(raw, window_end_ms, window_ms)
+
+    def reset_ema(self, model: str) -> None:
+        """Clear every EMA of ``model`` (TSS and alternative signals) - the idle reset."""
+        computer = self._by_model.get(model)
+        if computer is not None:
+            computer.reset_ema()
+        for (owner, _source), ema in self._signal_ema.items():
+            if owner == model:
+                ema.reset()
 
     def observe_traffic(
         self, model: str, *, has_traffic: bool, window_start_ms: int, window_end_ms: int
@@ -304,12 +346,17 @@ class SignalState:
         Records the traffic-onset window_end on the first traffic-bearing tick; resets
         on an idle (no-traffic) tick. Warm iff the current sliding window no longer
         straddles the onset. Idempotent under the duplicate-window_end re-reads the
-        rescue/fairness/safescale loops do (mirrors the EMA per-window dedup)."""
-        if self._warmup_ms == 0:
-            return True  # disabled
+        rescue/fairness/safescale loops do (mirrors the EMA per-window dedup).
+
+        An idle tick also clears the model's EMAs (:meth:`reset_ema`), so the warmup onset
+        and the EMA restart on the same idle condition. The EMA reset is part of the EMA
+        semantics, so it happens even when the warmup guard is disabled."""
         if not has_traffic:
+            self.reset_ema(model)
             self._onset_ms[model] = None
             return True  # idle -> UNKNOWN, nothing to warm up for
+        if self._warmup_ms == 0:
+            return True  # disabled
         onset = self._onset_ms.get(model)
         if onset is None:
             onset = window_end_ms

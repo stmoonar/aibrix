@@ -57,6 +57,8 @@ class TrsParams:
     w_d: float
     lambda_wait: float
     qmin: float
+    #: DEPRECATED - only the legacy fixed-alpha EMA (ema_tau_ms unset) reads it; kept because
+    #: the golden parity tests and every registry/params payload still carry it.
     ema_alpha: float
     theta_m: float
     tau_crit: float

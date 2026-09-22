@@ -133,10 +133,10 @@ def tss_series(
         for earlier in item.preceding:
             if earlier.window_end_ms is None:
                 raise ValueError("EMA scoring needs window_end_ms on every window")
-            ema.update(raw_of(earlier), earlier.window_end_ms)
+            ema.update(raw_of(earlier), earlier.window_end_ms, earlier.window_ms)
         if item.window_end_ms is None:
             raise ValueError("EMA scoring needs window_end_ms on every window")
-        out.append(ema.update(raw_of(item), item.window_end_ms))
+        out.append(ema.update(raw_of(item), item.window_end_ms, item.window_ms))
     return out
 
 

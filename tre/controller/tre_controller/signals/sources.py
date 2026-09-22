@@ -119,7 +119,8 @@ def _thresholded_signal(
     if signal_state is not None:
         tau_ms = spec.trs.ema_tau_ms if spec.trs.ema_tau_ms else DEFAULT_EMA_TAU_MS
         raw_value = signal_state.smooth_signal(
-            spec.name, source, raw_value, window_end_ms=metrics.window_end_ms, tau_ms=tau_ms
+            spec.name, source, raw_value, window_end_ms=metrics.window_end_ms, tau_ms=tau_ms,
+            window_ms=float(metrics.window_end_ms - metrics.window_start_ms),
         )
     z_m = normalize_signal(raw_value, spec.alt_thresholds.get(source))
     if z_m is None:
