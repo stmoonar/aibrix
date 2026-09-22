@@ -231,6 +231,77 @@ def violation_class_breakdown(
     return out
 
 
+#: Plan 6.9f item B / D8: CRITICAL counts only after this many consecutive new windows.
+DEFAULT_HOLDOUT_DWELL_WINDOWS = 2
+#: Classes criterion B gates on (TSS-observable); TTFT-only is disclosure only (item C).
+CRITERION_B_CLASSES = ("both", "tpot_only")
+
+
+def critical_dwell_flags(
+    windows: Sequence[CalibrationWindow], *, theta: float, tau_crit: float, direction: str,
+    dwell_windows: int = DEFAULT_HOLDOUT_DWELL_WINDOWS, window_ms: float = 30_000.0,
+    max_gap_ms: float | None = None,
+) -> list[bool]:
+    """Per window, whether CRITICAL (Z < tau_crit) is *dwell-confirmed*, with the shared
+    ``tre_common.dwell`` counter the controller uses: each cell is run in window order and
+    a window confirms only after ``dwell_windows`` consecutive CRITICAL windows.
+
+    Windows the label dropped (thin / missing latency) are not in ``windows``; with
+    ``max_gap_ms=None`` their neighbours count as consecutive (the controller saw those
+    windows too, with their signal), a finite ``max_gap_ms`` makes the gap reset the run.
+    """
+    from tre_common.dwell import dwell_confirmed_series
+
+    z = _z(windows, theta, direction)
+    out: list[bool] = [False] * len(windows)
+    by_cell: dict[str, list[int]] = {}
+    for i, w in enumerate(windows):
+        by_cell.setdefault(w.scenario_id, []).append(i)
+    for idx in by_cell.values():
+        idx.sort(key=lambda i: (windows[i].window_start_ms if windows[i].window_start_ms is not None else i))
+        ends = [
+            int((windows[i].window_start_ms if windows[i].window_start_ms is not None else i * window_ms) + window_ms)
+            for i in idx
+        ]
+        flags = [math.isfinite(z[i]) and z[i] < tau_crit for i in idx]
+        for i, ok in zip(idx, dwell_confirmed_series(flags, ends, required=dwell_windows, max_gap_ms=max_gap_ms)):
+            out[i] = ok
+    return out
+
+
+def dwell_acceptance(
+    windows: Sequence[CalibrationWindow], *, theta: float, tau_crit: float, direction: str,
+    dwell_windows: int = DEFAULT_HOLDOUT_DWELL_WINDOWS, window_ms: float = 30_000.0,
+) -> dict[str, Any]:
+    """Plan 6.9f criterion B on the deployed form (tau-EMA already in the signal + dwell):
+    CRITICAL recall of both/TPOT-only violations, healthy false alarm, overall recall, and
+    the per-class recall (TTFT-only is reported for disclosure, criterion C)."""
+    crit = critical_dwell_flags(windows, theta=theta, tau_crit=tau_crit, direction=direction,
+                                dwell_windows=dwell_windows, window_ms=window_ms)
+
+    def rate(sel: list[int]) -> float | None:
+        return (sum(1 for i in sel if crit[i]) / len(sel)) if sel else None
+
+    viol = [i for i, w in enumerate(windows) if not w.slo_met]
+    ok = [i for i, w in enumerate(windows) if w.slo_met]
+    b_sel = [i for i in viol if windows[i].violation_class in CRITERION_B_CLASSES]
+    classes = {
+        cls: {"windows": len(sel), "critical_recall": rate(sel)}
+        for cls in VIOLATION_CLASSES
+        for sel in [[i for i in viol if windows[i].violation_class == cls]]
+    }
+    return {
+        "dwell_windows": int(dwell_windows),
+        "dwell_impl": "tre_common.dwell.dwell_confirmed_series (per cell, window order)",
+        "critical_recall_both_tpot": rate(b_sel),
+        "both_tpot_windows": len(b_sel),
+        "critical_recall_of_violating": rate(viol),
+        "critical_false_alarm_on_healthy": rate(ok),
+        "healthy_windows": len(ok),
+        "violation_classes": classes,
+    }
+
+
 def verdict_report(
     *,
     model: str,
@@ -408,7 +479,10 @@ def cmd_verdict(args: argparse.Namespace) -> dict[str, Any]:
         raise SystemExit(str(exc)) from exc
 
 
-def holdout_report(verdict: Mapping[str, Any], validation_csv: str | Path) -> dict[str, Any]:
+def holdout_report(
+    verdict: Mapping[str, Any], validation_csv: str | Path, *,
+    dwell_windows: int = DEFAULT_HOLDOUT_DWELL_WINDOWS,
+) -> dict[str, Any]:
     label = LabelDefinition.from_dict(verdict["label_def"])
     if "signal_spec" in verdict:
         spec = SignalSpec.from_dict(verdict["signal_spec"])
@@ -451,7 +525,14 @@ def holdout_report(verdict: Mapping[str, Any], validation_csv: str | Path) -> di
         "violation_classes": violation_class_breakdown(
             windows, theta=theta, tau_crit=tau_crit, direction=direction,
         ),
-        "note": "windows carry the fit's EMA (TSS recompute / signal_ema); no dwell - the plan's acceptance adds dwell on the live path",
+        "with_dwell": dwell_acceptance(
+            windows, theta=theta, tau_crit=tau_crit, direction=direction, dwell_windows=dwell_windows,
+        ),
+        "note": (
+            "windows carry the fit's EMA (TSS recompute / signal_ema); the top-level CRITICAL "
+            "numbers are per window without dwell, with_dwell applies the shared "
+            "tre_common.dwell counter (plan 6.9f item B)"
+        ),
     }
     opposite = (verdict.get("merged") or {}).get("opposite_direction") or {}
     if opposite.get("theta") is not None:
@@ -465,7 +546,7 @@ def holdout_report(verdict: Mapping[str, Any], validation_csv: str | Path) -> di
 
 def cmd_holdout(args: argparse.Namespace) -> dict[str, Any]:
     verdict = json.loads(Path(args.verdict).read_text(encoding="utf-8"))
-    return holdout_report(verdict, args.validation_csv)
+    return holdout_report(verdict, args.validation_csv, dwell_windows=args.dwell_windows)
 
 
 def _parse(argv: Sequence[str] | None) -> argparse.Namespace:
@@ -494,6 +575,8 @@ def _parse(argv: Sequence[str] | None) -> argparse.Namespace:
     h = sub.add_parser("holdout")
     h.add_argument("--verdict", required=True)
     h.add_argument("--validation-csv", required=True)
+    h.add_argument("--dwell-windows", type=int, default=DEFAULT_HOLDOUT_DWELL_WINDOWS,
+                   help="CRITICAL dwell for acceptance item B (1 = no dwell)")
     h.add_argument("--output", required=True)
     return parser.parse_args(argv)
 
