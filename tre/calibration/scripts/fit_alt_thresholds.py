@@ -48,7 +48,7 @@ from tre_calibration.fit import (
     THETA_CRITERIA,
     ThetaFitConfig,
 )
-from tre_calibration.labels import LabelDefinition
+from tre_calibration.labels import LabelDefinition, add_label_arguments, label_def_from_args
 from tre_common.tss import DEFAULT_EMA_TAU_MS
 
 from scripts.theta_verdict import build_signal_spec, verdict_report
@@ -69,6 +69,15 @@ def parse_model_input(raw: str) -> tuple[str, Path]:
     if not separator or not model.strip() or not path.strip():
         raise argparse.ArgumentTypeError("model input must be MODEL=CSV_PATH")
     return model.strip(), Path(path.strip())
+
+
+def _report_label_def(label_defs: dict[str, LabelDefinition]) -> dict[str, Any]:
+    """One label_def when every model shares it (fixed mode), else one per model."""
+    dicts = {model: label.as_dict() for model, label in sorted(label_defs.items())}
+    unique = {repr(sorted(d.items())) for d in dicts.values()}
+    if len(unique) == 1:
+        return next(iter(dicts.values()))
+    return {"mode": "per_model", "per_model": dicts}
 
 
 def fit_model(
@@ -236,8 +245,7 @@ def _git_sha() -> str:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-input", action="append", type=parse_model_input, required=True)
-    parser.add_argument("--ttft-p95-ms", type=float, required=True)
-    parser.add_argument("--tpot-p95-ms", type=float, required=True)
+    add_label_arguments(parser)
     parser.add_argument("--signal", choices=alt_signal_names(), default="queue_len")
     parser.add_argument("--output", required=True)
     parser.add_argument("--curve-dir")
@@ -303,14 +311,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         else DEFAULT_HEALTHY_QUANTILE_CANDIDATES
     )
 
-    label_def = LabelDefinition(args.ttft_p95_ms, args.tpot_p95_ms)
+    # One label per model: the slowdown TTFT SLO scales each model's own idle TTFT fit.
+    label_defs = {model: label_def_from_args(args, model) for model, _path in args.model_input}
     models: dict[str, Any] = {}
     curves: dict[str, list[dict[str, Any]]] = {}
     for model, input_path in sorted(args.model_input):
         models[model], curves[model] = fit_model(
             model,
             input_path,
-            label_def=label_def,
+            label_def=label_defs[model],
             signal=args.signal,
             trim_ramp_windows=args.trim_ramp_windows,
             criterion=args.theta_criterion,
@@ -364,7 +373,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "direction": alt_signal_direction(args.signal),
         "theta_criterion": args.theta_criterion,
         "trim_ramp_windows": args.trim_ramp_windows,
-        "label_def": label_def.as_dict(),
+        "label_def": _report_label_def(label_defs),
         "warnings": warnings,
         "fit_config": {
             "pipeline": "scripts.theta_verdict.verdict_report",

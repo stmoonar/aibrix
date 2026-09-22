@@ -50,7 +50,7 @@ from tre_calibration.fit import (
     THETA_CRITERIA,
     ThetaFitConfig,
 )
-from tre_calibration.labels import LabelDefinition
+from tre_calibration.labels import add_label_arguments, label_def_from_args
 from tre_calibration.profile import theta_fit_block, theta_method_of
 
 
@@ -177,12 +177,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             "--e2e-p95-ms is no longer accepted: the shared label (tre_calibration.labels) "
             "is p95 TTFT/TPOT + unserved; e2e is excluded (plan 6.3 B4)"
         )
-    label_def = LabelDefinition(args.ttft_p95_ms, args.tpot_p95_ms)
+    label_def = label_def_from_args(args, args.model_name)
     latency_slo_ms = label_def.latency_slo_ms()
 
     windows = load_windows_from_csv(
         args.input,
-        latency_slo_ms=latency_slo_ms,
+        latency_slo_ms=label_def,
         signal_column=args.signal_column,
         trim_ramp_windows=args.trim_ramp_windows,
     )
@@ -256,8 +256,7 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument("--model-name", required=True)
     parser.add_argument("--signal-column", default="trs")
     parser.add_argument("--trim-ramp-windows", type=int, default=1)
-    parser.add_argument("--ttft-p95-ms", type=float, required=True)
-    parser.add_argument("--tpot-p95-ms", type=float, required=True)
+    add_label_arguments(parser)
     parser.add_argument("--e2e-p95-ms", type=float, help="rejected: e2e is not part of the label")
     parser.add_argument("--test-fraction", type=float, default=0.2)
     parser.add_argument("--split-seed", default="tre-v2-ranking")

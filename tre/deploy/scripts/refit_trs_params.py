@@ -63,7 +63,7 @@ from tre_calibration.dataset import (
     _skip_row,
     trim_scenario_ramp_windows,
 )
-from tre_calibration.labels import LabelDefinition, label_window
+from tre_calibration.labels import LabelDefinition, LabelSpec, add_label_arguments, label_def_from_args, label_window
 from tre_common.tss import DEFAULT_EMA_TAU_MS
 from tre_calibration.signals import (
     ParameterCandidateScore,
@@ -85,7 +85,7 @@ _EPS = 1e-12
 def load_windows_and_inputs(
     path: str | Path,
     *,
-    latency_slo_ms: dict[str, float],
+    latency_slo_ms: LabelSpec,
     signal_column: str = "trs",
     trim_ramp_windows: int = 0,
 ) -> tuple[list[CalibrationWindow], list[SignalInputs]]:
@@ -103,6 +103,9 @@ def load_windows_and_inputs(
     dropped since the previous kept row, so the offline EMA advances over exactly the
     windows the online EMA saw.
     """
+    label_spec: LabelSpec = latency_slo_ms
+    if isinstance(label_spec, LabelDefinition):
+        latency_slo_ms = label_spec.latency_slo_ms()
     active_columns = _resolve_latency_columns(latency_slo_ms)
     if not active_columns:
         raise ValueError("latency_slo_ms must contain at least one active SLO")
@@ -154,7 +157,7 @@ def load_windows_and_inputs(
         if prompt_tokens + generation_tokens <= 0.0:
             continue
 
-        label = label_window(row, latency_slo_ms)
+        label = label_window(row, label_spec)
         if label is None:
             continue
         p95_ratio_max = label.ratio_max
@@ -166,6 +169,7 @@ def load_windows_and_inputs(
                 slo_met=label.slo_met,
                 health_score=1.0 / (1.0 + p95_ratio_max),
                 window_start_ms=_as_float(row.get("window_start_ms")),
+                violation_class=label.violation_class,
             )
         )
         kept_rows.append(index)
@@ -338,12 +342,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             "--e2e-p95-ms is no longer accepted: the shared label (tre_calibration.labels) "
             "is p95 TTFT/TPOT + unserved; e2e is excluded (plan 6.3 B4)"
         )
-    label_def = LabelDefinition(args.ttft_p95_ms, args.tpot_p95_ms)
+    label_def = label_def_from_args(args, args.model_name)
     latency_slo_ms = label_def.latency_slo_ms()
 
     windows, inputs = load_windows_and_inputs(
         args.input,
-        latency_slo_ms=latency_slo_ms,
+        latency_slo_ms=label_def,
         signal_column=args.signal_column,
         trim_ramp_windows=args.trim_ramp_windows,
     )
@@ -426,8 +430,7 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         default=DEFAULT_EMA_TAU_MS,
         help="EMA time constant candidates are smoothed with, as online (default 20000; 0 = raw)",
     )
-    parser.add_argument("--ttft-p95-ms", type=float, required=True)
-    parser.add_argument("--tpot-p95-ms", type=float, required=True)
+    add_label_arguments(parser)
     parser.add_argument("--e2e-p95-ms", type=float, help="rejected: e2e is not part of the label")
     parser.add_argument(
         "--inherited-w-p", type=float, help="Inherited w_p (default: registry value for the model)"

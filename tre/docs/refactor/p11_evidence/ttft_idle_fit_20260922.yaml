@@ -1,0 +1,192 @@
+artifact: idle TTFT(L) = c_m + b_m * prompt_tokens per model (slowdown TTFT SLO, plan 2026-09-21 6.9h
+  / 6.11 D6)
+generated: '2026-09-22'
+branch: fix/tss-slo-20260922
+source: /data/nfs_shared_data/xxy/calibration_20260921/<model>/raw (read-only); held-out M cells excluded
+length: raw input_tokens = vLLM usage.prompt_tokens
+selection: 'isolated request: no other request of the same cell in flight at its send time (in-flight
+  reconstructed exactly from send/done timestamps; 1 replica) and no other request sent during its prefill
+  [send, send+ttft]; http 200 with a TTFT'
+script: docs/refactor/p11_evidence/ttft_idle_fit_20260922.py (argument 0 = max other requests in flight)
+label: TTFT_slo,m(L) = max(150 ms, k * (c_m + b_m * L)), k = 3; window p95_i(TTFT_i / TTFT_slo(L_i)) >
+  1 violates
+note_vs_plan: 'plan 6.9g/6.9h quoted b = 0.098/0.075/0.086 ms/token, c ~30 ms. Truly isolated requests
+  give b ~0.053/0.056/0.068 (R^2 ~0.90-0.93); the plan numbers match low-load (rho~0.5) OLS slopes, which
+  include same-batch prefill contention (steps rho=0.5 first 60 s: OLS 0.092/0.087/0.104). The published
+  values are the idle ones, as the slowdown SLO is defined on idle TTFT; k-sensitivity (2/3/5) covers
+  the scale.'
+models:
+  dsqwen-7b:
+    published:
+      ttft_idle_c_ms: 36.4
+      ttft_idle_b_ms_per_token: 0.0527
+    fit:
+      estimator: Huber IRLS (k=1.345, MAD scale) on all isolated requests
+      n_requests: 94
+      n_cells: 41
+      c_ms: 36.36
+      b_ms_per_token: 0.0527
+      r2: 0.895
+      ols:
+        c_ms: 35.278
+        b_ms_per_token: 0.0555
+        r2: 0.9033
+      theil_sen_on_length_medians:
+        c_ms: 24.6605
+        b_ms_per_token: 0.0747
+    per_length_ms:
+      256:
+        n: 12
+        median: 43.8
+        p95: 51.6
+      745:
+        n: 5
+        median: 80.3
+        p95: 85.1
+      768:
+        n: 12
+        median: 82.0
+        p95: 87.6
+      1600:
+        n: 7
+        median: 144.9
+        p95: 154.8
+      2048:
+        n: 58
+        median: 142.5
+        p95: 179.2
+    sensitivity:
+      inflight_le_1:
+        n: 290
+        c_ms: 31.306
+        b_ms_per_token: 0.0606
+        r2: 0.6993
+      sidecar_running_le_2_waiting_0:
+        n: 514
+        c_ms: 49.5862
+        b_ms_per_token: 0.0557
+        r2: 0.1757
+      steps_rho0.5_first_60s_huber:
+        n: 1726
+        c_ms: 30.67
+        b_ms_per_token: 0.0679
+      steps_rho0.5_first_60s_ols:
+        c_ms: 21.6
+        b_ms_per_token: 0.0921
+        r2: 0.698
+  dsllama-8b:
+    published:
+      ttft_idle_c_ms: 39.3
+      ttft_idle_b_ms_per_token: 0.0555
+    fit:
+      estimator: Huber IRLS (k=1.345, MAD scale) on all isolated requests
+      n_requests: 77
+      n_cells: 47
+      c_ms: 39.31
+      b_ms_per_token: 0.0555
+      r2: 0.927
+      ols:
+        c_ms: 38.4294
+        b_ms_per_token: 0.0572
+        r2: 0.9291
+      theil_sen_on_length_medians:
+        c_ms: 49.6104
+        b_ms_per_token: 0.0493
+    per_length_ms:
+      256:
+        n: 14
+        median: 46.1
+        p95: 58.1
+      745:
+        n: 9
+        median: 87.4
+        p95: 93.3
+      768:
+        n: 15
+        median: 85.8
+        p95: 90.3
+      1600:
+        n: 14
+        median: 126.5
+        p95: 154.1
+      2048:
+        n: 25
+        median: 148.7
+        p95: 183.2
+    sensitivity:
+      inflight_le_1:
+        n: 194
+        c_ms: 32.2013
+        b_ms_per_token: 0.0638
+        r2: 0.8253
+      sidecar_running_le_2_waiting_0:
+        n: 348
+        c_ms: 51.8897
+        b_ms_per_token: 0.0591
+        r2: 0.444
+      steps_rho0.5_first_60s_huber:
+        n: 1278
+        c_ms: 33.63
+        b_ms_per_token: 0.0694
+      steps_rho0.5_first_60s_ols:
+        c_ms: 27.84
+        b_ms_per_token: 0.0866
+        r2: 0.728
+  dsqwen-14b:
+    published:
+      ttft_idle_c_ms: 43.4
+      ttft_idle_b_ms_per_token: 0.0683
+    fit:
+      estimator: Huber IRLS (k=1.345, MAD scale) on all isolated requests
+      n_requests: 161
+      n_cells: 58
+      c_ms: 43.38
+      b_ms_per_token: 0.0683
+      r2: 0.901
+      ols:
+        c_ms: 42.657
+        b_ms_per_token: 0.0706
+        r2: 0.9049
+      theil_sen_on_length_medians:
+        c_ms: 55.651
+        b_ms_per_token: 0.0656
+    per_length_ms:
+      256:
+        n: 20
+        median: 51.2
+        p95: 61.9
+      745:
+        n: 9
+        median: 104.0
+        p95: 110.5
+      768:
+        n: 21
+        median: 106.0
+        p95: 117.6
+      1600:
+        n: 37
+        median: 155.1
+        p95: 196.0
+      2048:
+        n: 73
+        median: 179.2
+        p95: 221.5
+    sensitivity:
+      inflight_le_1:
+        n: 431
+        c_ms: 34.6706
+        b_ms_per_token: 0.0787
+        r2: 0.8168
+      sidecar_running_le_2_waiting_0:
+        n: 855
+        c_ms: 46.0287
+        b_ms_per_token: 0.077
+        r2: 0.415
+      steps_rho0.5_first_60s_huber:
+        n: 745
+        c_ms: 34.1
+        b_ms_per_token: 0.0839
+      steps_rho0.5_first_60s_ols:
+        c_ms: 27.26
+        b_ms_per_token: 0.1037
+        r2: 0.77

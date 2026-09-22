@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
-from tre_calibration.labels import label_window
+from tre_calibration.labels import LabelDefinition, LabelSpec, label_window
 from tre_common.tss import (
     DEFAULT_EMA_TAU_MS,
     TssEma,
@@ -46,6 +46,9 @@ class CalibrationWindow:
     latency_ratio_p95: float | None = None
     latency_ratio_avg: float | None = None
     queue_raw: float | None = None
+    #: None for a healthy window, else unserved / both / ttft_only / tpot_only
+    #: (tre_calibration.labels.WindowLabel.violation_class) - for per-class recall.
+    violation_class: str | None = None
 
 
 @dataclass(frozen=True)
@@ -179,7 +182,7 @@ def recompute_tss_rows(
 def load_windows_from_csv(
     path: str | Path,
     *,
-    latency_slo_ms: Mapping[str, float],
+    latency_slo_ms: LabelSpec,
     signal_column: str = "trs",
     signal_transform: Callable[[Mapping[str, Any]], float | None] | None = None,
     trim_ramp_windows: int = 0,
@@ -206,6 +209,12 @@ def load_windows_from_csv(
     (:func:`tre_common.tss.signal_ema`) over every row of each cell, as the controller
     does online (plan §6.9 item 4). It is ignored with ``tss``, which carries its own tau.
     """
+    # The production callers pass the LabelDefinition itself (fixed or slowdown TTFT SLO,
+    # min-n guard); a plain mapping keeps the historical fixed label for ad-hoc CSVs.
+    label_spec: LabelSpec = latency_slo_ms
+    slowdown = isinstance(label_spec, LabelDefinition) and label_spec.slowdown
+    if isinstance(label_spec, LabelDefinition):
+        latency_slo_ms = label_spec.latency_slo_ms()
     active_columns = _resolve_latency_columns(latency_slo_ms)
     if not active_columns:
         raise ValueError("latency_slo_ms must contain at least one active SLO")
@@ -244,7 +253,7 @@ def load_windows_from_csv(
 
         # The shared label (tre_calibration.labels): p95 TTFT/TPOT against the SLOs, and a
         # window holding an unserved request is violated even without a latency sample.
-        label = label_window(row, latency_slo_ms)
+        label = label_window(row, label_spec)
         if label is None:
             continue
         p95_ratio_max = label.ratio_max
@@ -264,8 +273,10 @@ def load_windows_from_csv(
                 health_score=1.0 / (1.0 + p95_ratio_max),
                 window_start_ms=_as_float(row.get("window_start_ms")),
                 latency_ratio_p95=p95_ratio_max,
-                latency_ratio_avg=_avg_latency_ratio(row, latency_slo_ms),
+                # avg_* columns are fixed-threshold ratios; meaningless under slowdown.
+                latency_ratio_avg=None if slowdown else _avg_latency_ratio(row, latency_slo_ms),
                 queue_raw=queue_raw,
+                violation_class=label.violation_class,
             )
         )
     return trim_scenario_ramp_windows(windows, count=trim_ramp_windows)

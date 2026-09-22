@@ -153,6 +153,12 @@ def window_row(cell: GridCell, window_metrics, trs: float, queue_control: float)
         "proxy_transient_errors": 0,
         "client_timeouts": 0,
         "slo_violated": False,
+        # Per-request evidence the slowdown TTFT label needs (tre_calibration.labels):
+        # the completed-request count (min-n guard) and ``ttft_ms:prompt_tokens`` pairs.
+        # Only rewindow_from_raw fills them; blank means "not recorded" (fixed label and
+        # the re-windower's p95 guard only).
+        "completed_requests": "",
+        "ttft_len_samples": "",
     }
 
 
@@ -168,6 +174,7 @@ CSV_COLUMNS = [
     "avg_waiting", "avg_running", "avg_swapping", "queue_control",
     "p95_ttft", "p95_tpot", "p95_e2e", "trs",
     "model_errors", "proxy_transient_errors", "client_timeouts", "slo_violated",
+    "completed_requests", "ttft_len_samples",
 ]
 
 # S4 per-request raw JSONL schema (doc15 §4). Queue observables are NOT here (they are an
