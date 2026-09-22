@@ -905,6 +905,12 @@ def fit_plan(
 
     1. ``rewindow`` - fitting / aliasing / validation / per-family CSVs; unserved requests
        (``.failures.jsonl``) are marked violated;
+    1b. ``alpha`` - ``scripts.alpha_fit`` (plan 6.11 D4'): the EMA alpha / tau of the
+       deployed classifier (tau-EMA + dwell 2), chosen by same-window LOSO BA under a
+       healthy false-alarm cap, ties broken by spurious CRITICAL episodes on steady healthy
+       cells, then the larger alpha. Its ``registry_fields`` (``trs.ema_tau_ms`` /
+       ``trs.ema_alpha``) are what the later steps' ``--ema-tau-ms`` must be set to before
+       theta is published; the commands below carry the registry's current tau;
     2. ``theta`` - ``tre_calibration.cli --recompute-tss`` on the merged and every family
        CSV at lambda_wait 3 (primary) and 0 (control): theta and delta_crit;
     3. ``verdict`` - ``theta_verdict verdict``: bootstrap CI of theta and both band
@@ -927,6 +933,8 @@ def fit_plan(
     # on a PYTHONPATH without the calibration package.
     from tre_calibration.labels import label_arms, label_cli_args, label_def_from_args
     from tre_common.tss import DEFAULT_EMA_TAU_MS
+
+    from scripts import alpha_fit
 
     fit_dir = out_dir / "fit"
     held_out_cells = sorted(held_out_cell_ids(index or {}))
@@ -958,11 +966,29 @@ def fit_plan(
                 "otherwise merged fit only"
             ),
         },
-        "order": ["rewindow", "theta", "verdict", "ablation", "alt", "holdout"],
+        "order": ["rewindow", "alpha", "theta", "verdict", "ablation", "alt", "holdout"],
         "label_def": None,  # filled per model below
         "label_def_by_model": {},
         "ema_tau_ms": DEFAULT_EMA_TAU_MS,
         "rewindow": [],
+        "alpha": [],
+        "alpha_rule": {
+            "module": "scripts.alpha_fit",
+            "tau_grid_s": list(alpha_fit.TAU_GRID_S),
+            "alpha_grid": [round(alpha_fit.alpha_of_tau(t), 4) for t in alpha_fit.TAU_GRID_S],
+            "dt_ref_s": alpha_fit.DT_REF_S,
+            "dwell_windows": alpha_fit.DEFAULT_DWELL_WINDOWS,
+            "fa_max": alpha_fit.FA_MAX,
+            "label_horizon": "same window",
+            "bootstrap": alpha_fit.DEFAULT_BOOTSTRAP,
+            "statement": (
+                "per alpha refit theta/delta in each leave-one-shape-out fold; deployed "
+                "classifier tau-EMA + dwell; feasible iff healthy FA <= fa_max; score LOSO BA; "
+                "within 1 SE (cell bootstrap) fewest spurious CRITICAL episodes/h on steady "
+                "healthy cells, then larger alpha; the chosen tau feeds --ema-tau-ms of theta/"
+                "verdict/ablation/alt"
+            ),
+        },
         "theta": [],
         "verdict": [],
         "ablation": [],
@@ -1079,6 +1105,25 @@ def fit_plan(
                     *[a for cell_id in held_out_cells for a in ("--only-cell-id", cell_id)],
                 ],
             })
+
+        alpha_json = fit_dir / f"{model}_alpha.json"
+        plan["alpha"].append({
+            "model": model,
+            "input": str(fitting_csv),
+            "w_p": w_p,
+            "lambda_wait": PRIMARY_LAMBDA_WAIT,
+            "output": str(alpha_json),
+            "command": [
+                sys.executable, "-m", "scripts.alpha_fit",
+                "--model", model,
+                "--fitting-csv", str(fitting_csv),
+                "--w-p", str(w_p),
+                "--lambda-wait", str(PRIMARY_LAMBDA_WAIT),
+                *slo,
+                "--step-ms", str(args.fit_step_ms),
+                "--output", str(alpha_json),
+            ],
+        })
 
         scopes: list[tuple[str, str, Path]] = [("", "", fitting_csv)]
         for family, shapes in sorted(families.items()):

@@ -222,7 +222,7 @@ def test_fit_plan_pairs_the_primary_fit_with_a_lambda_wait_control() -> None:
 def test_fit_plan_runs_the_whole_pipeline_in_order_on_one_label() -> None:
     # B5: rewindow -> theta/delta (cli) -> bootstrap/stop-rule verdict -> alt -> hold-out.
     plan = campaign.fit_plan(["dsqwen-7b"], Path("/out"), Path("/raw"), _Args())
-    assert plan["order"] == ["rewindow", "theta", "verdict", "ablation", "alt", "holdout"]
+    assert plan["order"] == ["rewindow", "alpha", "theta", "verdict", "ablation", "alt", "holdout"]
     for entry in plan["theta"]:
         cmd = entry["command"]
         assert cmd[1:3] == ["-m", "tre_calibration.cli"]
