@@ -24,10 +24,31 @@ EXPECTED_SIGNAL_DIRECTIONS = {
 }
 
 
+#: Band margins an alternative signal falls back to when its registry entry carries none:
+#: the plan defaults, the same numbers classify_all_models uses for an unfitted TSS.
+ALT_DEFAULT_DELTA_CRIT = 0.2
+ALT_DEFAULT_DELTA_HIGH = 0.25
+
+
 @dataclass(frozen=True)
 class AltThreshold:
     theta: float
     direction: str
+    #: Per-signal band margins around tau_low = 1 (plan §6.9 item 3): the classifier runs
+    #: an alternative signal on its OWN fitted bands, not on the TSS tau_crit/tau_high.
+    #: ``None`` = not fitted; :meth:`bands` then falls back to the plan defaults.
+    delta_crit: float | None = None
+    delta_high: float | None = None
+
+    def bands(self) -> tuple[float, float, bool]:
+        """(delta_crit, delta_high, defaulted) - ``defaulted`` is True when either margin
+        is missing and the plan default was used."""
+        defaulted = self.delta_crit is None or self.delta_high is None
+        return (
+            float(self.delta_crit) if self.delta_crit is not None else ALT_DEFAULT_DELTA_CRIT,
+            float(self.delta_high) if self.delta_high is not None else ALT_DEFAULT_DELTA_HIGH,
+            defaulted,
+        )
 
 
 @dataclass(frozen=True)
@@ -133,6 +154,14 @@ class Registry:
                     errors.append(
                         f"model {model.name}: alt_thresholds.{signal}.direction must be {expected}"
                     )
+                if threshold.delta_crit is not None and not (
+                    math.isfinite(threshold.delta_crit) and 0.0 <= threshold.delta_crit < 1.0
+                ):
+                    errors.append(f"model {model.name}: alt_thresholds.{signal}.delta_crit must be in [0, 1)")
+                if threshold.delta_high is not None and not (
+                    math.isfinite(threshold.delta_high) and threshold.delta_high >= 0.0
+                ):
+                    errors.append(f"model {model.name}: alt_thresholds.{signal}.delta_high must be >= 0")
 
         seen_nodes: set[str] = set()
         for node in self._topology.nodes:
@@ -222,6 +251,8 @@ def _parse_model(raw: dict[str, Any]) -> ModelSpec:
             str(signal): AltThreshold(
                 theta=float(values["theta"]),
                 direction=str(values["direction"]),
+                delta_crit=(float(values["delta_crit"]) if values.get("delta_crit") is not None else None),
+                delta_high=(float(values["delta_high"]) if values.get("delta_high") is not None else None),
             )
             for signal, values in (raw.get("alt_thresholds") or {}).items()
         },

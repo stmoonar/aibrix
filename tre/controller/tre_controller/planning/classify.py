@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import logging
 import math
 import re
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
+
+LOG = logging.getLogger(__name__)
 
 
 class ModelState(str, Enum):
@@ -127,18 +130,38 @@ def classify_model(
     )
 
 
-def model_control_configs_from_registry(registry: Any) -> dict[str, dict[str, Any]]:
+_warned_default_bands: set[tuple[str, str]] = set()
+
+
+def model_control_configs_from_registry(
+    registry: Any, signal_source: str = "zm"
+) -> dict[str, dict[str, Any]]:
     """Per-model control knobs for :func:`classify_all_models`, read from the registry.
 
-    ``registry.yaml`` stores the fitted band edges as ``trs.tau_crit`` / ``trs.tau_high``
-    around ``trs.tau_low``; :class:`TauThresholds` is built from the *margins*, so they are
-    converted back here. Models missing from the registry simply get no entry, and
-    ``classify_all_models`` then applies its ``delta_crit`` / ``delta_high`` defaults --
-    the documented fallback, identical to the behaviour before per-model margins were
-    threaded through.
+    For TSS (``signal_source == "zm"``) ``registry.yaml`` stores the fitted band edges as
+    ``trs.tau_crit`` / ``trs.tau_high`` around ``trs.tau_low``; :class:`TauThresholds` is
+    built from the *margins*, so they are converted back here.
+
+    For an alternative signal (the ablation arms) the bands are that signal's own fitted
+    ``alt_thresholds.<signal>.delta_crit`` / ``delta_high`` (plan §6.9 item 3) - running
+    queue length on the TSS bands would compare the signals under TSS's margins. A
+    missing margin falls back to the plan default 0.2 / 0.25 with a warning (once per
+    model and signal). Models missing from the registry simply get no entry, and
+    ``classify_all_models`` then applies its ``delta_crit`` / ``delta_high`` defaults.
     """
     configs: dict[str, dict[str, Any]] = {}
     for spec in registry.models():
+        if signal_source != "zm" and signal_source in getattr(spec, "alt_thresholds", {}):
+            delta_crit, delta_high, defaulted = spec.alt_thresholds[signal_source].bands()
+            if defaulted and (spec.name, signal_source) not in _warned_default_bands:
+                _warned_default_bands.add((spec.name, signal_source))
+                LOG.warning(
+                    "model %s: alt_thresholds.%s has no fitted delta_crit/delta_high; using "
+                    "the plan defaults %.2f/%.2f",
+                    spec.name, signal_source, delta_crit, delta_high,
+                )
+            configs[spec.name] = {"delta_crit": delta_crit, "delta_high": delta_high}
+            continue
         trs = spec.trs
         tau_low = float(trs.tau_low)
         configs[spec.name] = {

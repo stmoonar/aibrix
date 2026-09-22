@@ -143,10 +143,10 @@ def run_planner_tick(
     )
     # Without model_control_configs every model silently falls back to the generic
     # delta_crit=0.2 / delta_high=0.25 and the fitted per-model bands in registry.yaml
-    # are dead keys.
+    # are dead keys. An alternative signal source runs on its own fitted bands.
     classifications = classify_all_models(
         contexts,
-        model_control_configs=model_control_configs_from_registry(registry),
+        model_control_configs=model_control_configs_from_registry(registry, signal_source),
         signal_idle_rps_eps=signal_idle_rps_eps,
     )
     if _prof_on:

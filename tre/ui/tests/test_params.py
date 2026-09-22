@@ -139,3 +139,20 @@ def test_cross_field_constraints() -> None:
     # min_replicas must be <= max_replicas
     with pytest.raises(ParamValidationError):
         apply_and_validate(_REGISTRY, {"m1": {"min_replicas": 4, "max_replicas": 1}})
+
+
+def test_alt_threshold_bands_are_editable_and_bounded() -> None:
+    view = build_view(_REGISTRY)["m1"]
+    assert view["editable"]["alt_thresholds.queue_len.delta_crit"]["value"] is None
+    new_yaml = apply_and_validate(
+        _REGISTRY,
+        {"m1": {"alt_thresholds": {"queue_len": {"delta_crit": 0.3, "delta_high": 0.5}}}},
+    )
+    m = yaml.safe_load(new_yaml)["models"][0]
+    assert m["alt_thresholds"]["queue_len"]["delta_crit"] == 0.3
+    assert m["alt_thresholds"]["queue_len"]["delta_high"] == 0.5
+    with pytest.raises(ParamValidationError) as exc_info:
+        apply_and_validate(
+            _REGISTRY, {"m1": {"alt_thresholds": {"queue_len": {"delta_crit": 1.0}}}}
+        )
+    assert exc_info.value.errors[0]["error"] == "out_of_bounds"

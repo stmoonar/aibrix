@@ -33,6 +33,10 @@ _TRS_BOUNDS: dict[str, tuple] = {
     "hsat": (1, 20, "int", False, False),
 }
 _ALT_THRESHOLD_BOUNDS = (0, 1_000_000_000, "float", True, False)
+_ALT_DELTA_BOUNDS = {
+    "delta_crit": (0.0, 1.0, "float", False, True),
+    "delta_high": (0.0, 5.0, "float", False, False),
+}
 
 _SLO_BOUNDS: dict[str, tuple] = {
     "ttft_p95_ms": (50, 5000, "float", False, False),
@@ -83,6 +87,8 @@ def build_view(registry_yaml: str) -> dict[str, Any]:
                 "type": "enum",
                 "choices": [EXPECTED_SIGNAL_DIRECTIONS.get(signal)],
             }
+            for field, spec in _ALT_DELTA_BOUNDS.items():
+                editable[f"alt_thresholds.{signal}.{field}"] = _field_view(threshold.get(field), spec)
         for field, spec in _SLO_BOUNDS.items():
             editable[f"slo.{field}"] = _field_view(slo.get(field), spec)
         for field, spec in _TOP_BOUNDS.items():
@@ -190,7 +196,7 @@ def _apply_alt_thresholds(target: dict, changes: dict, model: str, errors: list)
         if not isinstance(raw, dict):
             errors.append({"model": model, "field": key, "error": "not_an_object"})
             continue
-        unknown = sorted(set(raw) - {"theta", "direction"})
+        unknown = sorted(set(raw) - {"theta", "direction", *_ALT_DELTA_BOUNDS})
         for field in unknown:
             errors.append({"model": model, "field": f"{key}.{field}", "error": "unknown_field"})
         threshold = target.setdefault(signal, {})
@@ -198,6 +204,11 @@ def _apply_alt_thresholds(target: dict, changes: dict, model: str, errors: list)
             theta = _coerce(raw["theta"], _ALT_THRESHOLD_BOUNDS, model, f"{key}.theta", errors)
             if theta is not None:
                 threshold["theta"] = theta
+        for field, spec in _ALT_DELTA_BOUNDS.items():
+            if field in raw:
+                value = _coerce(raw[field], spec, model, f"{key}.{field}", errors)
+                if value is not None:
+                    threshold[field] = value
         if "direction" in raw:
             direction = str(raw["direction"])
             if direction != expected_direction:
