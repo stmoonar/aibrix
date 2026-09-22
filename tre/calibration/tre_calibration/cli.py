@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Sequence
 
 from tre_calibration.dataset import TssRecompute, load_windows_from_csv
+from tre_calibration.labels import LabelDefinition
 from tre_common.tss import DEFAULT_EMA_TAU_MS, TSS_UNITS
 from tre_calibration.evaluate import evaluate_signal_direction
 from tre_calibration.fit import (
@@ -33,12 +34,13 @@ from tre_calibration.signals import ParameterCandidateScore
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(argv)
-    latency_slo_ms = {
-        "ttft_p95": args.ttft_p95_ms,
-        "tpot_p95": args.tpot_p95_ms,
-    }
     if args.e2e_p95_ms is not None:
-        latency_slo_ms["e2e_p95"] = args.e2e_p95_ms
+        raise SystemExit(
+            "--e2e-p95-ms is no longer accepted: the shared label (tre_calibration.labels) "
+            "is p95 TTFT/TPOT + unserved; e2e is excluded (plan 6.3 B4)"
+        )
+    label_def = LabelDefinition(args.ttft_p95_ms, args.tpot_p95_ms)
+    latency_slo_ms = label_def.latency_slo_ms()
 
     healthy_quantiles = (
         tuple(float(part) for part in args.healthy_quantiles.split(","))
@@ -145,6 +147,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         inputs=inputs,
     )
 
+    patch["label_def"] = label_def.as_dict()
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(patch, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -176,7 +179,7 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     )
     parser.add_argument("--ttft-p95-ms", type=float, required=True)
     parser.add_argument("--tpot-p95-ms", type=float, required=True)
-    parser.add_argument("--e2e-p95-ms", type=float)
+    parser.add_argument("--e2e-p95-ms", type=float, help="rejected: e2e is not part of the label")
     parser.add_argument(
         "--theta-criterion",
         choices=THETA_CRITERIA,

@@ -860,8 +860,31 @@ def fit_plan(
 
     *Families.* Besides the merged fit, each family gets its own. The spread between them
     is the check that the merged theta is not an artefact of pooling two regimes; see
-    :func:`family_theta_verdict`.
+    :func:`family_theta_verdict`. A family CSV is selected with ``rewindow_from_raw
+    --only-shape``, i.e. from the cell directories on disk when the fit runs - boundary
+    hold cells included - not from a cell list frozen before the boundary search (B3).
+
+    *Steps* (plan §6.3 B5), in ``plan["order"]``:
+
+    1. ``rewindow`` - fitting / aliasing / validation / per-family CSVs; unserved requests
+       (``.failures.jsonl``) are marked violated;
+    2. ``theta`` - ``tre_calibration.cli --recompute-tss`` on the merged and every family
+       CSV at lambda_wait 3 (primary) and 0 (control): theta and delta_crit;
+    3. ``verdict`` - ``theta_verdict verdict``: bootstrap CI of theta and delta_crit, stop
+       rule, family rule -> the number that would be published;
+    4. ``alt`` - ``fit_alt_thresholds`` for queue_len / decode_tps / prefill_tps on the
+       same fitting CSVs and the same label;
+    5. ``holdout`` - ``theta_verdict holdout``: the published theta scored on the held-out
+       validation CSV, which no earlier step reads.
+
+    Every step uses the one label (``tre_calibration.labels``: p95 TTFT/TPOT + unserved)
+    at ``--ttft-slo-ms`` / ``--tpot-slo-ms``.
     """
+    # Imported here, not at module level: the campaign driver itself must stay runnable
+    # on a PYTHONPATH without the calibration package.
+    from tre_calibration.labels import LabelDefinition
+    from tre_common.tss import DEFAULT_EMA_TAU_MS
+
     fit_dir = out_dir / "fit"
     held_out_cells = sorted(held_out_cell_ids(index or {}))
     plan = {
@@ -872,8 +895,14 @@ def fit_plan(
         "held_out_cell_ids": held_out_cells,
         "training_shapes": list(gen.TRAINING_SHAPES),
         "families": {name: list(members) for name, members in gen.FAMILIES.items()},
+        "order": ["rewindow", "theta", "verdict", "alt", "holdout"],
+        "label_def": LabelDefinition(args.ttft_slo_ms, args.tpot_slo_ms).as_dict(),
+        "ema_tau_ms": DEFAULT_EMA_TAU_MS,
         "rewindow": [],
-        "refit": [],
+        "theta": [],
+        "verdict": [],
+        "alt": [],
+        "holdout": [],
         "acceptance": {
             "primary_lambda_wait": PRIMARY_LAMBDA_WAIT,
             "secondary_lambda_wait": SECONDARY_LAMBDA_WAIT,
@@ -907,24 +936,29 @@ def fit_plan(
     exclusions: list[str] = []
     for cell_id in held_out_cells:
         exclusions += ["--exclude-cell-id", cell_id]
+    slo = ["--ttft-p95-ms", str(args.ttft_slo_ms), "--tpot-p95-ms", str(args.tpot_slo_ms)]
+    registry = _load_registry(getattr(args, "registry", None))
+    live = [
+        "--window-ms", str(args.window_ms), "--step-ms", str(args.fit_step_ms),
+        "--instant-grid", "live", "--instant-sample-ms", str(LIVE_GRID_MS),
+    ]
+    fitting_by_model: dict[str, Path] = {}
     for model in models:
+        w_p = float(registry.model(model).trs.w_p)
         fitting_csv = fit_dir / f"{model}_fitting.csv"
         aliasing_csv = fit_dir / f"{model}_aliasing.csv"
         validation_csv = fit_dir / f"{model}_validation.csv"
+        fitting_by_model[model] = fitting_csv
+        rewindow_head = [
+            sys.executable, "-m", "scripts.rewindow_from_raw",
+            "--model", model, "--raw-dir", str(raw_dir),
+        ]
         plan["rewindow"].append({
             "purpose": "fitting (the signal the controller consumes)",
             "model": model,
             "output": str(fitting_csv),
             "excludes_held_out": True,
-            "command": [
-                sys.executable, "-m", "scripts.rewindow_from_raw",
-                "--model", model, "--raw-dir", str(raw_dir),
-                "--output", str(fitting_csv),
-                "--window-ms", str(args.window_ms), "--step-ms", str(args.fit_step_ms),
-                "--instant-grid", "live",
-                "--instant-sample-ms", str(LIVE_GRID_MS),
-                *exclusions,
-            ],
+            "command": [*rewindow_head, "--output", str(fitting_csv), *live, *exclusions],
         })
         plan["rewindow"].append({
             "purpose": "aliasing figure and observability gap (ground truth)",
@@ -932,9 +966,7 @@ def fit_plan(
             "output": str(aliasing_csv),
             "excludes_held_out": True,
             "command": [
-                sys.executable, "-m", "scripts.rewindow_from_raw",
-                "--model", model, "--raw-dir", str(raw_dir),
-                "--output", str(aliasing_csv),
+                *rewindow_head, "--output", str(aliasing_csv),
                 "--window-ms", str(args.window_ms), "--step-ms", str(args.fit_step_ms),
                 "--instant-grid", "raw",
                 "--instant-sample-ms", str(args.instant_sample_ms),
@@ -948,80 +980,113 @@ def fit_plan(
                 "output": str(validation_csv),
                 "excludes_held_out": False,
                 "command": [
-                    sys.executable, "-m", "scripts.rewindow_from_raw",
-                    "--model", model, "--raw-dir", str(raw_dir),
-                    "--output", str(validation_csv),
-                    "--window-ms", str(args.window_ms), "--step-ms", str(args.fit_step_ms),
-                    "--instant-grid", "live",
-                    "--instant-sample-ms", str(LIVE_GRID_MS),
+                    *rewindow_head, "--output", str(validation_csv), *live,
                     *[a for cell_id in held_out_cells for a in ("--only-cell-id", cell_id)],
                 ],
             })
-        for label, lambda_wait in (
-            ("primary", PRIMARY_LAMBDA_WAIT),
-            ("secondary", SECONDARY_LAMBDA_WAIT),
-        ):
-            plan["refit"].append({
-                "label": label,
-                "model": model,
-                "family": "",
-                "lambda_wait": lambda_wait,
-                "command": [
-                    sys.executable, "-m", "scripts.refit_trs_params",
-                    "--input", str(fitting_csv),
-                    "--model-name", model,
-                    "--output", str(fit_dir / f"{model}_refit_{label}.json"),
-                    # refit_trs_params requires both SLOs; omitting them made the plan's
-                    # commands unrunnable as written.
-                    "--ttft-p95-ms", str(args.ttft_slo_ms),
-                    "--tpot-p95-ms", str(args.tpot_slo_ms),
-                    "--inherited-lambda-wait", str(lambda_wait),
-                    "--lambda-wait-candidates", str(lambda_wait),
-                ],
-            })
+
+        scopes: list[tuple[str, str, Path]] = [("", "", fitting_csv)]
         for family, shapes in sorted(gen.FAMILIES.items()):
-            cell_ids = sorted(family_cell_ids(index or {}, shapes))
-            if not cell_ids:
-                continue
             family_csv = fit_dir / f"{model}_fitting_{family}.csv"
+            scopes.append((family, f"family_{family}", family_csv))
             plan["rewindow"].append({
                 "purpose": f"per-family fit ({family}) - diagnostic",
                 "model": model,
                 "family": family,
+                "shapes": list(shapes),
                 "output": str(family_csv),
                 "excludes_held_out": True,
                 "command": [
-                    sys.executable, "-m", "scripts.rewindow_from_raw",
-                    "--model", model, "--raw-dir", str(raw_dir),
-                    "--output", str(family_csv),
-                    "--window-ms", str(args.window_ms), "--step-ms", str(args.fit_step_ms),
-                    "--instant-grid", "live",
-                    "--instant-sample-ms", str(LIVE_GRID_MS),
-                    *[a for cell_id in cell_ids for a in ("--only-cell-id", cell_id)],
+                    *rewindow_head, "--output", str(family_csv), *live,
+                    *[a for shape in shapes for a in ("--only-shape", shape)],
+                    *exclusions,
                 ],
             })
-            plan["refit"].append({
-                "label": f"family_{family}",
+
+        for family, scope, csv_path in scopes:
+            for suffix, lambda_wait in (("", PRIMARY_LAMBDA_WAIT), ("_lw0", SECONDARY_LAMBDA_WAIT)):
+                if family:
+                    label = f"{scope}{suffix}"
+                else:
+                    label = "primary" if not suffix else "secondary"
+                entry = {
+                    "label": label,
+                    "model": model,
+                    "family": family,
+                    "lambda_wait": lambda_wait,
+                    "w_p": w_p,
+                    "input": str(csv_path),
+                    "command": [
+                        sys.executable, "-m", "tre_calibration.cli",
+                        "--input", str(csv_path),
+                        "--output", str(fit_dir / f"{model}_theta_{label}.json"),
+                        "--model-name", model,
+                        *slo,
+                        "--recompute-tss",
+                        "--w-p", str(w_p),
+                        "--lambda-wait", str(lambda_wait),
+                        "--ema-tau-ms", str(DEFAULT_EMA_TAU_MS),
+                    ],
+                }
+                if family:
+                    entry["shapes"] = list(gen.FAMILIES[family])
+                    entry["purpose"] = (
+                        "diagnostic only - its theta is compared against the merged fit's "
+                        "bootstrap CI, never published on its own unless the families disagree"
+                    )
+                plan["theta"].append(entry)
+
+        verdict_json = fit_dir / f"{model}_verdict.json"
+        plan["verdict"].append({
+            "model": model,
+            "lambda_wait": PRIMARY_LAMBDA_WAIT,
+            "output": str(verdict_json),
+            "command": [
+                sys.executable, "-m", "scripts.theta_verdict", "verdict",
+                "--model", model,
+                "--fitting-csv", str(fitting_csv),
+                *[a for family, _scope, path in scopes if family for a in ("--family", f"{family}={path}")],
+                "--w-p", str(w_p),
+                "--lambda-wait", str(PRIMARY_LAMBDA_WAIT),
+                "--ema-tau-ms", str(DEFAULT_EMA_TAU_MS),
+                *slo,
+                "--output", str(verdict_json),
+            ],
+        })
+        if held_out_cells:
+            plan["holdout"].append({
                 "model": model,
-                "family": family,
-                "shapes": list(shapes),
-                "lambda_wait": PRIMARY_LAMBDA_WAIT,
-                "purpose": (
-                    "diagnostic only - its theta is compared against the merged fit's "
-                    "bootstrap CI, never published on its own unless the families disagree"
-                ),
+                "input": str(validation_csv),
+                "output": str(fit_dir / f"{model}_holdout.json"),
                 "command": [
-                    sys.executable, "-m", "scripts.refit_trs_params",
-                    "--input", str(family_csv),
-                    "--model-name", model,
-                    "--output", str(fit_dir / f"{model}_refit_family_{family}.json"),
-                    "--ttft-p95-ms", str(args.ttft_slo_ms),
-                    "--tpot-p95-ms", str(args.tpot_slo_ms),
-                    "--inherited-lambda-wait", str(PRIMARY_LAMBDA_WAIT),
-                    "--lambda-wait-candidates", str(PRIMARY_LAMBDA_WAIT),
+                    sys.executable, "-m", "scripts.theta_verdict", "holdout",
+                    "--verdict", str(verdict_json),
+                    "--validation-csv", str(validation_csv),
+                    "--output", str(fit_dir / f"{model}_holdout.json"),
                 ],
             })
+
+    fit_alt = Path(__file__).resolve().parents[2] / "calibration" / "scripts" / "fit_alt_thresholds.py"
+    for signal in ("queue_len", "decode_tps", "prefill_tps"):
+        plan["alt"].append({
+            "signal": signal,
+            "output": str(fit_dir / f"alt_{signal}.yaml"),
+            "command": [
+                sys.executable, str(fit_alt),
+                *[a for m, path in fitting_by_model.items() for a in ("--model-input", f"{m}={path}")],
+                *slo,
+                "--signal", signal,
+                "--output", str(fit_dir / f"alt_{signal}.yaml"),
+                "--curve-dir", str(fit_dir / "alt_curves"),
+            ],
+        })
     return plan
+
+
+def _load_registry(path: Optional[str]):
+    from tre_common.registry import load_registry
+
+    return load_registry(path)
 
 
 def held_out_cell_ids(index: dict) -> set[str]:
@@ -1035,22 +1100,6 @@ def held_out_cell_ids(index: dict) -> set[str]:
         if entry.get("held_out") and entry.get("cell_id"):
             out.add(str(entry["cell_id"]))
     return out
-
-
-def family_cell_ids(index: dict, shapes: Sequence[str]) -> set[str]:
-    """Cell ids belonging to the shapes of one family, held-out shapes excluded.
-
-    The exclusion is belt and braces - no held-out shape is in a family today - but it is
-    the kind of thing that stops being true quietly.
-    """
-    wanted = set(shapes)
-    return {
-        str(entry["cell_id"])
-        for entry in (index.get("schedules", []) or [])
-        if entry.get("shape") in wanted
-        and entry.get("cell_id")
-        and not entry.get("held_out")
-    }
 
 
 def drive_boundary_search(

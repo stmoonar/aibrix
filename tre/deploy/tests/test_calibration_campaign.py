@@ -212,11 +212,33 @@ def test_fit_plan_fits_on_the_live_grid_and_keeps_the_raw_stream_separate() -> N
 
 def test_fit_plan_pairs_the_primary_fit_with_a_lambda_wait_control() -> None:
     plan = campaign.fit_plan(["dsqwen-7b"], Path("/out"), Path("/raw"), _Args())
-    by_label = {r["label"]: r for r in plan["refit"]}
+    by_label = {r["label"]: r for r in plan["theta"]}
     assert by_label["primary"]["lambda_wait"] == 3.0
     assert by_label["secondary"]["lambda_wait"] == 0.0
     assert plan["acceptance"]["tolerance"] == 0.05
     assert "inert" in plan["acceptance"]["statement"]
+
+
+def test_fit_plan_runs_the_whole_pipeline_in_order_on_one_label() -> None:
+    # B5: rewindow -> theta/delta (cli) -> bootstrap/stop-rule verdict -> alt -> hold-out.
+    plan = campaign.fit_plan(["dsqwen-7b"], Path("/out"), Path("/raw"), _Args())
+    assert plan["order"] == ["rewindow", "theta", "verdict", "alt", "holdout"]
+    for entry in plan["theta"]:
+        cmd = entry["command"]
+        assert cmd[1:3] == ["-m", "tre_calibration.cli"]
+        assert "--recompute-tss" in cmd and "--e2e-p95-ms" not in cmd
+        assert cmd[cmd.index("--ttft-p95-ms") + 1] == "500.0"
+        assert cmd[cmd.index("--tpot-p95-ms") + 1] == "75.0"
+    scopes = {(e["family"], e["lambda_wait"]) for e in plan["theta"]}
+    assert scopes == {(f, lw) for f in ("", "prefill_heavy", "decode_heavy") for lw in (3.0, 0.0)}
+    [verdict] = plan["verdict"]
+    assert "scripts.theta_verdict" in verdict["command"] and "verdict" in verdict["command"]
+    assert verdict["command"].count("--family") == 2
+    assert sorted(e["signal"] for e in plan["alt"]) == ["decode_tps", "prefill_tps", "queue_len"]
+    for entry in plan["alt"]:
+        assert "--registry" not in entry["command"]
+        assert "--ttft-p95-ms" in entry["command"] and "--tpot-p95-ms" in entry["command"]
+    assert plan["label_def"]["e2e"] == "excluded"
 
 
 # ------------------------------------------------------------------------- cell command
@@ -551,10 +573,15 @@ def test_the_fit_plan_keeps_the_held_out_shape_out_of_training() -> None:
     validation = next(r for r in plan["rewindow"] if "held-out" in r["purpose"])
     assert validation["command"].count("--only-cell-id") == 1
     assert validation["output"].endswith("_validation.csv")
-    # and no refit ever reads the validation CSV
-    assert not any(
-        str(validation["output"]) in entry["command"] for entry in plan["refit"]
-    )
+    # and no fitting step ever reads the validation CSV - only the hold-out step does
+    for step in ("theta", "verdict", "alt"):
+        assert not any(str(validation["output"]) in entry["command"] for entry in plan[step])
+    [holdout] = plan["holdout"]
+    assert str(validation["output"]) in holdout["command"]
+    # the family CSVs drop the held-out cells too
+    for entry in plan["rewindow"]:
+        if entry.get("family"):
+            assert "--exclude-cell-id" in entry["command"]
 
 
 def test_the_fit_plan_adds_a_diagnostic_fit_per_family() -> None:
@@ -563,11 +590,18 @@ def test_the_fit_plan_adds_a_diagnostic_fit_per_family() -> None:
         entry["shape"] = "S3" if entry["shape"] == "S1" else "S4"
         entry["held_out"] = False
     plan = campaign.fit_plan(["dsqwen-7b"], Path("/out"), Path("/raw"), _Args(), index)
-    families = {r["family"] for r in plan["refit"] if r["family"]}
+    families = {r["family"] for r in plan["theta"] if r["family"]}
     assert families == {"prefill_heavy", "decode_heavy"}
-    for entry in plan["refit"]:
+    for entry in plan["theta"]:
         if entry["family"]:
             assert "diagnostic only" in entry["purpose"]
+    # B3: family membership is resolved from the raw tree at fit time (--only-shape), so
+    # boundary hold cells created after the index was written are included.
+    for entry in plan["rewindow"]:
+        if entry.get("family"):
+            assert "--only-cell-id" not in entry["command"]
+            shapes = [entry["command"][i + 1] for i, a in enumerate(entry["command"]) if a == "--only-shape"]
+            assert shapes == list(gen.FAMILIES[entry["family"]])
     assert plan["acceptance"]["family_spread"]["tolerance"] == campaign.FAMILY_SPREAD_TOLERANCE
     assert plan["acceptance"]["stop_rule"]["min_publish_rate"] == boundary.MIN_PUBLISH_RATE
 

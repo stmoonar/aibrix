@@ -63,6 +63,7 @@ from tre_calibration.dataset import (
     _skip_row,
     trim_scenario_ramp_windows,
 )
+from tre_calibration.labels import LabelDefinition, label_window
 from tre_common.tss import DEFAULT_EMA_TAU_MS
 from tre_calibration.signals import (
     ParameterCandidateScore,
@@ -153,24 +154,16 @@ def load_windows_and_inputs(
         if prompt_tokens + generation_tokens <= 0.0:
             continue
 
-        ratios: list[float] = []
-        missing_latency = False
-        for slo_key, column in active_columns.items():
-            value = _as_float(row.get(column))
-            if value is None:
-                missing_latency = True
-                break
-            ratios.append(value / float(latency_slo_ms[slo_key]))
-        if missing_latency or not ratios:
+        label = label_window(row, latency_slo_ms)
+        if label is None:
             continue
-
-        p95_ratio_max = max(ratios)
+        p95_ratio_max = label.ratio_max
         windows.append(
             CalibrationWindow(
                 scenario_id=(row.get("scenario_id") or "unknown").strip() or "unknown",
                 scenario_family=(row.get("scenario_family") or "unknown").strip() or "unknown",
                 signal=signal,
-                slo_met=all(ratio <= 1.0 for ratio in ratios),
+                slo_met=label.slo_met,
                 health_score=1.0 / (1.0 + p95_ratio_max),
                 window_start_ms=_as_float(row.get("window_start_ms")),
             )
@@ -340,12 +333,13 @@ def build_report(
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(argv)
 
-    latency_slo_ms: dict[str, float] = {
-        "ttft_p95": args.ttft_p95_ms,
-        "tpot_p95": args.tpot_p95_ms,
-    }
     if args.e2e_p95_ms is not None:
-        latency_slo_ms["e2e_p95"] = args.e2e_p95_ms
+        raise SystemExit(
+            "--e2e-p95-ms is no longer accepted: the shared label (tre_calibration.labels) "
+            "is p95 TTFT/TPOT + unserved; e2e is excluded (plan 6.3 B4)"
+        )
+    label_def = LabelDefinition(args.ttft_p95_ms, args.tpot_p95_ms)
+    latency_slo_ms = label_def.latency_slo_ms()
 
     windows, inputs = load_windows_and_inputs(
         args.input,
@@ -381,6 +375,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         ema_tau_ms=(args.ema_tau_ms if args.ema_tau_ms > 0 else None),
     )
 
+    report["label_def"] = label_def.as_dict()
     out = Path(args.output)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -433,7 +428,7 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     )
     parser.add_argument("--ttft-p95-ms", type=float, required=True)
     parser.add_argument("--tpot-p95-ms", type=float, required=True)
-    parser.add_argument("--e2e-p95-ms", type=float)
+    parser.add_argument("--e2e-p95-ms", type=float, help="rejected: e2e is not part of the label")
     parser.add_argument(
         "--inherited-w-p", type=float, help="Inherited w_p (default: registry value for the model)"
     )

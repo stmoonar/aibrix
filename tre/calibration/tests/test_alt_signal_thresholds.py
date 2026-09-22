@@ -41,6 +41,7 @@ from tre_calibration.fit import (
     fit_theta_by_reliability,
     threshold_balanced_accuracy,
 )
+from tre_calibration.labels import LabelDefinition
 from tre_common.registry import EXPECTED_SIGNAL_DIRECTIONS
 
 BOUNDARY = 300.0
@@ -302,11 +303,12 @@ def test_every_alternative_signal_is_fitted_by_the_balanced_accuracy_criterion(
     payload, curve = driver.fit_model(
         _MODEL,
         csv_path,
-        registry_path=str(registry),
+        label_def=LabelDefinition(_SLO["ttft_p95_ms"], _SLO["tpot_p95_ms"]),
         signal=signal,
         trim_ramp_windows=0,
     )
 
+    assert payload["label_def"]["e2e"] == "excluded"
     assert payload["theta_criterion"] == DEFAULT_THETA_CRITERION == "balanced_accuracy"
     threshold = payload["alt_thresholds"][signal]
     assert threshold["direction"] == "lower_is_healthier"
@@ -331,7 +333,7 @@ def test_every_alternative_signal_moves_when_the_criterion_is_switched(
     payload, _curve = driver.fit_model(
         _MODEL,
         csv_path,
-        registry_path=str(registry),
+        label_def=LabelDefinition(_SLO["ttft_p95_ms"], _SLO["tpot_p95_ms"]),
         signal=signal,
         trim_ramp_windows=0,
         criterion="reliability",
@@ -349,3 +351,21 @@ def test_the_driver_and_the_registry_agree_on_every_signals_orientation() -> Non
     for signal in alt_signal_names():
         assert alt_signal_direction(signal) == EXPECTED_SIGNAL_DIRECTIONS[signal]
         assert ALT_SIGNALS[signal][1] == "lower_is_healthier"
+
+
+def test_coinciding_thresholds_warn_and_record_the_windows_instead_of_failing(tmp_path: Path) -> None:
+    # Plan 6.9: under ignore_eos token rates sit on a lattice, so two models can share a
+    # threshold. That used to abort the whole fit ("model-distinct" assert).
+    driver = _load_driver()
+    csv_path = _write_window_csv(tmp_path / "windows.csv")
+    output = tmp_path / "alt.yaml"
+    assert driver.main([
+        "--model-input", f"a={csv_path}", "--model-input", f"b={csv_path}",
+        "--ttft-p95-ms", "500", "--tpot-p95-ms", "75", "--signal", "queue_len",
+        "--trim-ramp-windows", "0", "--output", str(output),
+    ]) == 0
+    report = yaml.safe_load(output.read_text(encoding="utf-8"))
+    [warning] = report["warnings"]
+    assert warning["kind"] == "coinciding_threshold" and warning["models"] == ["a", "b"]
+    assert warning["cells_at_theta"]["a"] == warning["cells_at_theta"]["b"]
+    assert report["label_def"]["e2e"] == "excluded"

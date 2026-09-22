@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
+from tre_calibration.labels import label_window
 from tre_common.tss import DEFAULT_EMA_TAU_MS, TssEma, replica_factor, tss_queue, tss_terms
 
 
@@ -162,18 +163,12 @@ def load_windows_from_csv(
         if prompt_tokens + generation_tokens <= 0.0:
             continue
 
-        ratios: list[float] = []
-        missing_latency = False
-        for slo_key, column in active_columns.items():
-            value = _as_float(row.get(column))
-            if value is None:
-                missing_latency = True
-                break
-            ratios.append(value / float(latency_slo_ms[slo_key]))
-        if missing_latency or not ratios:
+        # The shared label (tre_calibration.labels): p95 TTFT/TPOT against the SLOs, and a
+        # window holding an unserved request is violated even without a latency sample.
+        label = label_window(row, latency_slo_ms)
+        if label is None:
             continue
-
-        p95_ratio_max = max(ratios)
+        p95_ratio_max = label.ratio_max
         queue_raw: float | None = None
         if lambda_wait is not None and _as_float(row.get("avg_running")) is not None:
             queue_raw = tss_queue(
@@ -186,7 +181,7 @@ def load_windows_from_csv(
                 scenario_id=(row.get("scenario_id") or "unknown").strip() or "unknown",
                 scenario_family=(row.get("scenario_family") or "unknown").strip() or "unknown",
                 signal=signal,
-                slo_met=all(ratio <= 1.0 for ratio in ratios),
+                slo_met=label.slo_met,
                 health_score=1.0 / (1.0 + p95_ratio_max),
                 window_start_ms=_as_float(row.get("window_start_ms")),
                 latency_ratio_p95=p95_ratio_max,

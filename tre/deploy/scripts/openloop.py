@@ -1383,13 +1383,29 @@ def mark_unserved_request_windows(
     An admission overflow is in neither: it is handled by the shed policy, which either
     truncates the cell or voids it outright.
 
+    A request the *client* gave up on (``client_timeout``) is a third class and is marked
+    for the same reason: it was not served within the client's deadline, which is far past
+    any latency SLO, and it contributed no latency sample. Leaving it unmarked is what let
+    the 655 timed-out 7b requests of the 2026-09-21 campaign read as healthy windows
+    (plan §6.3 B2). It gets its own column as well.
+
     A request is attributed to a window by its send time, because that is the operating
     point that produced the failure; a failed request often has no completion time at all.
+
+    ``records`` may be live sender records or the rows of a cell's ``.failures.jsonl``;
+    the latter carry the verdict made at capture time in ``failure_class``, which wins
+    over re-classifying a record whose sender-side flags were not persisted.
     """
+    def verdict(record: dict) -> str:
+        recorded = record.get("failure_class")
+        if recorded in FAILURE_CLASSES:
+            return str(recorded)
+        return classify_failure(record)
+
     def send_times(wanted: str) -> list[int]:
         out: list[int] = []
         for record in records:
-            if classify_failure(record) != wanted:
+            if verdict(record) != wanted:
                 continue
             ts = record.get("actual_send_ts_ms", record.get("send_ts_ms"))
             if ts is not None:
@@ -1398,6 +1414,7 @@ def mark_unserved_request_windows(
 
     model_errors = send_times(FAILURE_MODEL)
     transient = send_times(FAILURE_PROXY_TRANSIENT)
+    timeouts = send_times(FAILURE_CLIENT_TIMEOUT)
     marked: list[dict] = []
     for row in rows:
         out = dict(row)
@@ -1405,10 +1422,15 @@ def mark_unserved_request_windows(
         end = int(row["window_end_ms"])
         count = sum(1 for ts in model_errors if start <= ts < end)
         transient_count = sum(1 for ts in transient if start <= ts < end)
+        timeout_count = sum(1 for ts in timeouts if start <= ts < end)
         out["model_errors"] = count
         out["proxy_transient_errors"] = transient_count
+        out["client_timeouts"] = timeout_count
         out["slo_violated"] = (
-            bool(row.get("slo_violated")) or count > 0 or transient_count > 0
+            bool(row.get("slo_violated"))
+            or count > 0
+            or transient_count > 0
+            or timeout_count > 0
         )
         marked.append(out)
     return marked

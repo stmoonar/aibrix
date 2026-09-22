@@ -146,10 +146,12 @@ def window_row(cell: GridCell, window_metrics, trs: float, queue_control: float)
         # model_errors is the ENGINE failing; proxy_transient_errors is a connection
         # under the request dying, which is not evidence about the engine but is still a
         # request nobody served. They are separate columns so the second can never be
-        # read as an engine fault. All three default to "none seen";
+        # read as an engine fault; client_timeouts are requests the client's own deadline
+        # gave up on. All four default to "none seen";
         # openloop.mark_unserved_request_windows fills them in.
         "model_errors": 0,
         "proxy_transient_errors": 0,
+        "client_timeouts": 0,
         "slo_violated": False,
     }
 
@@ -165,7 +167,7 @@ CSV_COLUMNS = [
     "window_start_ms", "window_end_ms", "prompt_tokens_total", "generation_tokens_total",
     "avg_waiting", "avg_running", "avg_swapping", "queue_control",
     "p95_ttft", "p95_tpot", "p95_e2e", "trs",
-    "model_errors", "proxy_transient_errors", "slo_violated",
+    "model_errors", "proxy_transient_errors", "client_timeouts", "slo_violated",
 ]
 
 # S4 per-request raw JSONL schema (doc15 §4). Queue observables are NOT here (they are an

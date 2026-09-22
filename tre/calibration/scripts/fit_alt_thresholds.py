@@ -14,6 +14,12 @@ pressure signals (``lower_is_healthier``), recorded per signal in
 ``tre_calibration.alt_signals``. Thresholds stay in raw signal units; no reciprocal
 transform is written into the registry. The first ramp window of every R3 cell is
 trimmed by default, matching the experiment scorer.
+
+Labels come from :mod:`tre_calibration.labels` - the same p95 TTFT/TPOT + unserved label
+the TSS theta fit uses - with the SLOs given on the command line (``--ttft-p95-ms`` /
+``--tpot-p95-ms``), never read from a registry: the registry's e2e SLO made this driver
+fit a different label than the TSS fit (plan §6.3 B4). ``label_def`` is written into the
+report.
 """
 from __future__ import annotations
 
@@ -45,7 +51,7 @@ from tre_calibration.fit import (
     THETA_CRITERIA,
     fit_theta,
 )
-from tre_common.registry import load_registry
+from tre_calibration.labels import LabelDefinition
 
 #: Curve column plotted for each criterion, with the reference level drawn across it.
 _PLOT_METRIC = {
@@ -65,7 +71,7 @@ def fit_model(
     model_name: str,
     input_path: Path,
     *,
-    registry_path: str,
+    label_def: LabelDefinition,
     signal: str,
     trim_ramp_windows: int,
     criterion: str = DEFAULT_THETA_CRITERION,
@@ -79,14 +85,9 @@ def fit_model(
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     direction = alt_signal_direction(signal)
     signal_column = alt_signal_column(signal)
-    spec = load_registry(registry_path).model(model_name)
     windows = load_windows_from_csv(
         input_path,
-        latency_slo_ms={
-            "ttft_p95": spec.slo.ttft_p95_ms,
-            "tpot_p95": spec.slo.tpot_p95_ms,
-            "e2e_p95": spec.slo.e2e_p95_ms,
-        },
+        latency_slo_ms=label_def.latency_slo_ms(),
         signal_column=signal_column or signal,
         signal_transform=(
             per_replica_token_rate_transform(signal) if signal_column is None else None
@@ -117,8 +118,17 @@ def fit_model(
             f"{model_name}/{signal} did not publish under criterion={criterion}: "
             f"{fit.reject_reason}"
         )
+    # Windows sitting exactly on the threshold: with ignore_eos every request has the
+    # same token count, so rate signals live on a lattice and two models can land on the
+    # same lattice point. Recorded so a coincidence can be told apart from a bug.
+    on_theta = sorted(
+        {window.scenario_id for window in windows if window.signal == fit.theta}
+    )
     payload = {
         "input_csv": str(input_path),
+        "label_def": label_def.as_dict(),
+        "windows_at_theta": sum(1 for window in windows if window.signal == fit.theta),
+        "cells_at_theta": on_theta,
         "window_count": len(windows),
         "cell_count": len({window.scenario_id for window in windows}),
         "alt_thresholds": {
@@ -231,7 +241,8 @@ def _git_sha() -> str:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-input", action="append", type=parse_model_input, required=True)
-    parser.add_argument("--registry", required=True)
+    parser.add_argument("--ttft-p95-ms", type=float, required=True)
+    parser.add_argument("--tpot-p95-ms", type=float, required=True)
     parser.add_argument("--signal", choices=alt_signal_names(), default="queue_len")
     parser.add_argument("--output", required=True)
     parser.add_argument("--curve-dir")
@@ -275,13 +286,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         else DEFAULT_HEALTHY_QUANTILE_CANDIDATES
     )
 
+    label_def = LabelDefinition(args.ttft_p95_ms, args.tpot_p95_ms)
     models: dict[str, Any] = {}
     curves: dict[str, list[dict[str, Any]]] = {}
     for model, input_path in sorted(args.model_input):
         models[model], curves[model] = fit_model(
             model,
             input_path,
-            registry_path=args.registry,
+            label_def=label_def,
             signal=args.signal,
             trim_ramp_windows=args.trim_ramp_windows,
             criterion=args.theta_criterion,
@@ -294,11 +306,25 @@ def main(argv: Sequence[str] | None = None) -> int:
             max_single_scenario_ratio=args.max_single_scenario_ratio,
         )
 
-    theta_values = {
-        payload["alt_thresholds"][args.signal]["theta"] for payload in models.values()
-    }
-    if len(theta_values) != len(models):
-        raise RuntimeError("fitted thresholds must be model-distinct")
+    # Two models on the same threshold is not an error: token-rate signals sit on a
+    # lattice under ignore_eos (e.g. 1446.4 = 339 x 128 / 30), so coinciding thresholds
+    # happen. Warn and record which windows/cells carry the shared value (plan 6.9).
+    by_theta: dict[float, list[str]] = {}
+    for model, payload in models.items():
+        by_theta.setdefault(payload["alt_thresholds"][args.signal]["theta"], []).append(model)
+    warnings: list[dict[str, Any]] = []
+    for theta, same in sorted(by_theta.items()):
+        if len(same) < 2:
+            continue
+        entry = {
+            "kind": "coinciding_threshold",
+            "theta": theta,
+            "models": sorted(same),
+            "windows_at_theta": {m: models[m]["windows_at_theta"] for m in sorted(same)},
+            "cells_at_theta": {m: models[m]["cells_at_theta"] for m in sorted(same)},
+        }
+        warnings.append(entry)
+        print(f"WARNING: {args.signal} threshold {theta} is shared by {sorted(same)}", file=sys.stderr)
 
     report = {
         "generated_at": args.generated_at or datetime.now(timezone.utc).isoformat(),
@@ -308,6 +334,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         "direction": alt_signal_direction(args.signal),
         "theta_criterion": args.theta_criterion,
         "trim_ramp_windows": args.trim_ramp_windows,
+        "label_def": label_def.as_dict(),
+        "warnings": warnings,
         "fit_config": {
             "healthy_quantile_candidates": list(healthy_quantiles),
             "min_healthy_recall": args.min_healthy_recall,

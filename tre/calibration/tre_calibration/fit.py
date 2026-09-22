@@ -152,7 +152,20 @@ THETA_METHOD_BALANCED_ACCURACY = "healthy_quantile_balanced_accuracy"
 #: Identifier written into calibration artifacts for the cumulative attainment fit.
 THETA_METHOD_RELIABILITY = "cumulative_reliability_attainment"
 #: Identifier written into calibration artifacts for the delta margin fit.
-DELTA_METHOD = "severity_quantile_balanced_accuracy"
+DELTA_METHOD = "crit:ba_grid_delta_0_0.5+high:severity_quantile_balanced_accuracy"
+
+#: How ``delta_crit`` is searched. ``ba_grid`` (default, plan §6.3 B6): tau_crit =
+#: tau_low - delta over :data:`DEFAULT_DELTA_CRIT_GRID`, maximising balanced accuracy of
+#: "Z < tau_crit => critical" - the same predicate ``classify_model`` applies. ``quantile``
+#: is the former rule (candidates = quantiles of the critical windows' z, clipped to
+#: tau_low), kept only as a comparison baseline: on a sharp boundary every quantile lands
+#: on the wrong side of tau_low and the fit clamps (7b's delta_crit = 0 in the dry run).
+CRIT_METHOD_BA_GRID = "ba_grid"
+CRIT_METHOD_QUANTILE = "quantile"
+CRIT_METHODS = (CRIT_METHOD_BA_GRID, CRIT_METHOD_QUANTILE)
+DEFAULT_CRIT_METHOD = CRIT_METHOD_BA_GRID
+#: delta_crit candidates: 0.00 .. 0.50 in 0.01 steps.
+DEFAULT_DELTA_CRIT_GRID: tuple[float, ...] = tuple(round(0.01 * i, 10) for i in range(51))
 
 #: Accepted values of the explicit ``theta_criterion`` knob.
 THETA_CRITERIA = ("balanced_accuracy", "reliability")
@@ -169,8 +182,12 @@ DEFAULT_MIN_CONFIDENCE = 0.9
 DEFAULT_MIN_SCENARIO_FAMILIES = 2
 DEFAULT_MAX_SINGLE_SCENARIO_RATIO = 0.7
 
-#: Healthy-score quantiles searched by the balanced-accuracy fit.
+#: Healthy-score quantiles searched by the balanced-accuracy fit: 0.01 steps up to 0.05,
+#: then 0.05 steps to 0.50. The lower edge used to be 0.05, and the 2026-09-21 dry run put
+#: two of three models' theta on it (plan §6.3 B6) - a fit on the grid edge is a fit the
+#: grid chose, not the data.
 DEFAULT_HEALTHY_QUANTILE_CANDIDATES: tuple[float, ...] = (
+    0.01, 0.02, 0.03, 0.04,
     0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50,
 )
 
@@ -275,6 +292,9 @@ class DeltaMarginFit:
     #: than where the data put it. A clamped side opens a degenerate band.
     clamped: bool = False
     clamp_reason: str | None = None
+    #: How the candidates were generated (:data:`CRIT_METHODS` for the crit side;
+    #: ``quantile`` for the high side).
+    method: str = "quantile"
 
 
 @dataclass(frozen=True)
@@ -564,6 +584,8 @@ def fit_delta_margins(
     floor_mode: str = DEFAULT_DELTA_FLOOR_MODE,
     fallback_delta_crit: float = FALLBACK_DELTA_CRIT,
     fallback_delta_high: float = FALLBACK_DELTA_HIGH,
+    crit_method: str = DEFAULT_CRIT_METHOD,
+    delta_crit_grid: Sequence[float] = DEFAULT_DELTA_CRIT_GRID,
 ) -> DeltaMarginsFit:
     """Fit the per-model control margins ``tau_crit = tau_low - delta_crit`` and
     ``tau_high = tau_low + delta_high`` on ``z = signal / theta``.
@@ -578,9 +600,14 @@ def fit_delta_margins(
     is set by ``floor_mode``: ``soft`` (default) ranks candidates by balanced accuracy and
     only breaks ties with the floor, ``strict`` keeps the older lexicographic filter. Each
     side reports the mode it ran under and whether its ``tau`` ended up clamped to a bound.
+
+    ``crit_method`` selects how the critical side is searched (:data:`CRIT_METHODS`); the
+    default is the balanced-accuracy grid over ``delta_crit_grid``.
     """
     if not math.isfinite(theta) or theta <= 0.0:
         raise ValueError("theta must be finite and positive")
+    if crit_method not in CRIT_METHODS:
+        raise ValueError(f"crit_method must be one of {CRIT_METHODS}, got {crit_method!r}")
 
     rows = [row for row in windows if math.isfinite(row.signal)]
     severity: list[float] = []
@@ -632,16 +659,27 @@ def fit_delta_margins(
         )
 
     z = [row.signal / theta for row in rows]
-    crit = _fit_one_delta_margin(
-        z,
-        critical_labels,
-        direction="low",
-        tau_low=tau_low,
-        candidate_quantiles=candidate_quantiles,
-        target_floor=min_critical_recall,
-        floor_mode=floor_mode,
-        fallback_delta=fallback_delta_crit,
-    )
+    if crit_method == CRIT_METHOD_BA_GRID:
+        crit = _fit_delta_crit_grid(
+            z,
+            critical_labels,
+            tau_low=tau_low,
+            delta_grid=delta_crit_grid,
+            target_floor=min_critical_recall,
+            floor_mode=floor_mode,
+            fallback_delta=fallback_delta_crit,
+        )
+    else:
+        crit = _fit_one_delta_margin(
+            z,
+            critical_labels,
+            direction="low",
+            tau_low=tau_low,
+            candidate_quantiles=candidate_quantiles,
+            target_floor=min_critical_recall,
+            floor_mode=floor_mode,
+            fallback_delta=fallback_delta_crit,
+        )
     high = _fit_one_delta_margin(
         z,
         surplus_labels,
@@ -783,6 +821,118 @@ def _fit_one_delta_margin(
         clamped=clamped,
         clamp_reason=clamp_reason,
     )
+
+
+def _fit_delta_crit_grid(
+    scores: Sequence[float],
+    labels: Sequence[int],
+    *,
+    tau_low: float,
+    delta_grid: Sequence[float],
+    target_floor: float,
+    floor_mode: str = DEFAULT_DELTA_FLOOR_MODE,
+    fallback_delta: float,
+) -> DeltaMarginFit:
+    """delta_crit by balanced accuracy over an explicit grid (plan §6.3 B6).
+
+    ``tau = tau_low - delta`` and the prediction is ``z < tau`` - strictly, exactly as
+    ``classify_model`` decides CRITICAL. The candidates no longer come from the critical
+    windows' own z quantiles, so a sharp boundary (every critical window just under
+    tau_low) is a legitimate small delta instead of a forced clamp. Ties break on the
+    acceptance floor, then on recall of the critical windows, then on the smaller delta
+    (the more sensitive band). A delta on either grid edge is reported ``clamped``.
+    """
+    if floor_mode not in FLOOR_MODES:
+        raise ValueError(f"floor_mode must be one of {FLOOR_MODES}, got {floor_mode!r}")
+    grid = sorted({float(d) for d in delta_grid if math.isfinite(float(d)) and float(d) >= 0.0})
+    finite = [(float(s), int(l)) for s, l in zip(scores, labels) if math.isfinite(s)]
+    n_pos = sum(l for _s, l in finite)
+    n_neg = len(finite) - n_pos
+    if not grid or n_pos < 2 or n_neg == 0:
+        fallback = _delta_fallback(
+            direction="low",
+            tau_low=tau_low,
+            fallback_delta=fallback_delta,
+            reject_reason="insufficient_label_separation" if grid else "empty_delta_grid",
+            candidate_count=0,
+            floor_mode=floor_mode,
+        )
+        return DeltaMarginFit(**{**fallback.__dict__, "method": CRIT_METHOD_BA_GRID})
+
+    # Sorted z with cumulative positive counts: each candidate is one bisect.
+    import bisect
+
+    ordered = sorted(finite)
+    zs = [s for s, _l in ordered]
+    cum_pos = [0]
+    for _s, label in ordered:
+        cum_pos.append(cum_pos[-1] + label)
+
+    best: dict[str, float] | None = None
+    for delta in grid:
+        tau = tau_low - delta
+        k = bisect.bisect_left(zs, tau)  # count of z < tau
+        tp = cum_pos[k]
+        fp = k - tp
+        recall = tp / n_pos
+        specificity = (n_neg - fp) / n_neg
+        precision = tp / k if k else 0.0
+        candidate = {
+            "delta": delta,
+            "tau": tau,
+            "balanced_accuracy": 0.5 * (recall + specificity),
+            "recall_pos": recall,
+            "precision_pos": precision,
+            "specificity_neg": specificity,
+            "support_pos": float(n_pos),
+            "meets": 1.0 if recall >= target_floor else 0.0,
+        }
+        if best is None:
+            best = candidate
+            continue
+        if floor_mode == FLOOR_MODE_STRICT and candidate["meets"] != best["meets"]:
+            if candidate["meets"] > best["meets"]:
+                best = candidate
+            continue
+        key_c = (candidate["balanced_accuracy"], candidate["meets"], candidate["recall_pos"], -candidate["delta"])
+        key_b = (best["balanced_accuracy"], best["meets"], best["recall_pos"], -best["delta"])
+        if _key_greater(key_c, key_b):
+            best = candidate
+
+    assert best is not None
+    delta = float(best["delta"])
+    clamped = delta <= grid[0] + 1e-12 or delta >= grid[-1] - 1e-12
+    clamp_reason = None
+    if clamped:
+        clamp_reason = "delta_at_grid_lower_edge" if delta <= grid[0] + 1e-12 else "delta_at_grid_upper_edge"
+    return DeltaMarginFit(
+        delta=delta,
+        tau=float(best["tau"]),
+        balanced_accuracy=float(best["balanced_accuracy"]),
+        recall_pos=float(best["recall_pos"]),
+        precision_pos=float(best["precision_pos"]),
+        specificity_neg=float(best["specificity_neg"]),
+        support_pos=int(best["support_pos"]),
+        candidate_quantile=None,
+        candidate_count=len(grid),
+        meets_target_floor=bool(best["meets"]),
+        used_fallback=False,
+        reject_reason=None,
+        floor_mode=floor_mode,
+        clamped=clamped,
+        clamp_reason=clamp_reason,
+        method=CRIT_METHOD_BA_GRID,
+    )
+
+
+def _key_greater(a: tuple[float, ...], b: tuple[float, ...]) -> bool:
+    """Lexicographic ``a > b`` with a 1e-12 tolerance per component."""
+    for x, y in zip(a, b):
+        if x > y + 1e-12:
+            return True
+        if y > x + 1e-12:
+            return False
+    return False
 
 
 def _clamp_state(tau: float, tau_low: float, *, clipped: bool) -> tuple[bool, str | None]:

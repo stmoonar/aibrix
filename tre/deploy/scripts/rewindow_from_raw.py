@@ -462,6 +462,7 @@ def rewindow_cell(
     cell: r3_grid.GridCell,
     spec,
     *,
+    failures: Sequence[dict] = (),
     window_ms: int,
     step_ms: int,
     percentile_mode: str,
@@ -474,7 +475,14 @@ def rewindow_cell(
     assigned_replicas: int = 1,
 ) -> list[dict]:
     """Re-window one cell's raw into calibration CSV rows (reusing r3_grid.window_row +
-    compute_window_results for the trs column)."""
+    compute_window_results for the trs column).
+
+    ``failures`` are the cell's ``.failures.jsonl`` rows. They go through
+    ``openloop.mark_unserved_request_windows`` exactly as the online path's sender records
+    do, so a window holding a model error, a dropped connection or a client timeout is
+    labelled violated here too - without it every re-windowed row read
+    ``slo_violated=False`` (plan §6.3 B2).
+    """
     instant_sample_interval_ms = resolve_instant_cadence(
         instant_samples,
         instant_grid=instant_grid,
@@ -502,10 +510,11 @@ def rewindow_cell(
     results = r3_grid.compute_window_results(metrics, spec)
     # An undefined TSS (idle rule: nothing in flight, tre_common.tss) is written blank so
     # no fit ever reads it as a (tiny) signal value.
-    return [
+    rows = [
         r3_grid.window_row(cell, wm, result.TRS if result.defined else None, result.Q_ctl)
         for wm, result in zip(metrics, results)
     ]
+    return openloop.mark_unserved_request_windows(rows, list(failures))
 
 
 def _raw_size_bytes(raw_dir: Path) -> int:
@@ -532,11 +541,29 @@ def held_out_cell_ids(index: Mapping) -> set[str]:
 SIDECAR_JSONL_SUFFIXES = (".instant.jsonl", ".failures.jsonl", ".prompts.jsonl")
 
 
+def raw_dir_shape(dirname: str, model: str) -> Optional[str]:
+    """The shape a campaign cell directory belongs to, from its name, or None.
+
+    ``calibration_campaign`` names every cell directory ``<model>_<shape>_<rest>`` (a
+    stage cell: ``dsqwen-7b_S3_ramp``; a boundary hold: ``dsqwen-7b_S3_S3_hold1060_a1``),
+    so the shape is the token after the model prefix. This is what lets a family CSV be
+    built from what is on disk at fit time - hold cells included - instead of a cell list
+    frozen before the boundary search ran (plan §6.3 B3).
+    """
+    prefix = f"{model}_"
+    if not dirname.startswith(prefix):
+        return None
+    shape = dirname[len(prefix):].split("_", 1)[0]
+    return shape or None
+
+
 def discover_cell_files(
     raw_dir: Path,
     *,
     exclude: Iterable[str] = (),
     only: Iterable[str] = (),
+    only_shapes: Iterable[str] = (),
+    model: Optional[str] = None,
 ) -> tuple[list[Path], list[str]]:
     """(cell raw files to re-window, cell ids skipped).
 
@@ -544,16 +571,24 @@ def discover_cell_files(
     raw root; a flat glob finds nothing there and produces an empty CSV without saying so.
 
     ``only`` wins over ``exclude`` when both are given: an explicit inclusion list is a
-    stronger statement than a default exclusion.
+    stronger statement than a default exclusion. ``only_shapes`` (needs ``model``) keeps
+    only cells whose directory belongs to one of those shapes (:func:`raw_dir_shape`); it
+    composes with ``exclude``, so a family CSV still drops the held-out cells.
     """
     excluded = {str(c) for c in exclude}
     included = {str(c) for c in only}
+    shapes = {str(s) for s in only_shapes}
+    if shapes and not model:
+        raise ValueError("only_shapes needs the model name to parse cell directory names")
     kept: list[Path] = []
     skipped: list[str] = []
     for path in sorted(raw_dir.rglob("*.jsonl")):
         if path.name.endswith(SIDECAR_JSONL_SUFFIXES):
             continue
         cell_id = path.stem
+        if shapes and raw_dir_shape(path.parent.name, str(model)) not in shapes:
+            skipped.append(cell_id)
+            continue
         if included:
             if cell_id not in included:
                 skipped.append(cell_id)
@@ -579,6 +614,11 @@ def main() -> int:
                     help="re-window only these cells. Repeatable. Overrides "
                          "--exclude-cell-id; used to build the held-out validation CSV "
                          "and the per-family diagnostic CSVs.")
+    ap.add_argument("--only-shape", action="append", default=[],
+                    help="re-window only cells whose campaign directory belongs to this "
+                         "shape (<model>_<shape>_...). Repeatable. Resolved from the raw "
+                         "tree at run time, so boundary hold cells are included; combines "
+                         "with --exclude-cell-id / --held-out-index. Used for family CSVs.")
     ap.add_argument("--held-out-index", default=None,
                     help="schedule INDEX.json; every entry marked held_out is excluded, "
                          "in addition to --exclude-cell-id")
@@ -632,13 +672,15 @@ def main() -> int:
 
     rows: list[dict] = []
     cells: list[str] = []
+    cell_dirs: list[str] = []
     gap_per_cell: dict[str, ObservabilityGap] = {}
     exclude = set(args.exclude_cell_id or [])
     if args.held_out_index:
         index_doc = json.loads(Path(args.held_out_index).read_text(encoding="utf-8"))
         exclude |= held_out_cell_ids(index_doc)
     cell_files, skipped_cells = discover_cell_files(
-        raw_dir, exclude=exclude, only=args.only_cell_id or ()
+        raw_dir, exclude=exclude, only=args.only_cell_id or (),
+        only_shapes=args.only_shape or (), model=args.model,
     )
     if skipped_cells:
         print(f"skipping {len(skipped_cells)} cell(s) by id: {', '.join(sorted(set(skipped_cells)))}")
@@ -652,8 +694,10 @@ def main() -> int:
             continue
         records = load_jsonl(raw_path)
         instant_samples = load_jsonl(raw_dir_for_cell / f"{cell_id}.instant.jsonl")
+        failures = load_jsonl(raw_dir_for_cell / f"{cell_id}.failures.jsonl")
         cell_rows = rewindow_cell(
             records, instant_samples, cell, spec,
+            failures=failures,
             window_ms=args.window_ms, step_ms=step_ms,
             percentile_mode=args.percentile_mode,
             min_latency_samples=args.min_latency_samples,
@@ -663,6 +707,7 @@ def main() -> int:
         )
         rows.extend(cell_rows)
         cells.append(cell_id)
+        cell_dirs.append(f"{raw_dir_for_cell.name}/{cell_id}")
         # The gap is measured on the FULL sidecar: it is precisely the comparison between
         # the 1 Hz truth and its live-grid subsample, so it does not depend on --instant-grid.
         if sidecar_has_live_grid_tags(instant_samples):
@@ -695,6 +740,9 @@ def main() -> int:
         gap_overall=gap_overall,
         git_sha=git_short_sha(Path(__file__).resolve().parents[2]),
     )
+    # What was actually selected on disk, so a family CSV's membership is auditable.
+    meta["only_shapes"] = sorted(args.only_shape or [])
+    meta["cell_dirs"] = cell_dirs
     meta_path = write_meta(out, meta)
     print(f"wrote cadence metadata to {meta_path}")
     if gap_overall is not None:

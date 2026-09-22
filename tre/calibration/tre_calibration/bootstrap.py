@@ -30,8 +30,10 @@ import random
 import statistics
 from dataclasses import dataclass
 
+from typing import Any, Mapping
+
 from tre_calibration.dataset import CalibrationWindow
-from tre_calibration.fit import ThetaFitConfig
+from tre_calibration.fit import ThetaFitConfig, fit_delta_margins
 
 
 @dataclass(frozen=True)
@@ -96,9 +98,81 @@ def bootstrap_theta(
     the calibration CLI's defaults; pass the caller's own configuration -- the same object used
     for the point estimate -- whenever the fit was not run at defaults.
     """
+    result, _deltas = _bootstrap(windows, n_resamples=n_resamples, seed=seed, config=config)
+    return result
+
+
+@dataclass(frozen=True)
+class BootstrapDeltaResult:
+    """Distribution of ``delta_crit`` across the same cell-level resamples as theta.
+
+    Each resample refits theta under the theta configuration and, when it publishes,
+    fits ``delta_crit`` on that resample at that theta; ``n_fitted`` counts the resamples
+    whose delta fit did not fall back to the default margin.
+    """
+
+    n_resamples: int
+    n_fitted: int
+    delta_values: tuple[float, ...]
+    delta_p2_5: float | None
+    delta_p50: float | None
+    delta_p97_5: float | None
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "n_resamples": self.n_resamples,
+            "n_fitted": self.n_fitted,
+            "delta_p2_5": self.delta_p2_5,
+            "delta_p50": self.delta_p50,
+            "delta_p97_5": self.delta_p97_5,
+        }
+
+
+def bootstrap_theta_and_delta_crit(
+    windows: list[CalibrationWindow],
+    *,
+    n_resamples: int,
+    seed: int,
+    config: ThetaFitConfig | None = None,
+    delta_kwargs: Mapping[str, Any] | None = None,
+) -> tuple[BootstrapThetaResult, BootstrapDeltaResult]:
+    """:func:`bootstrap_theta` plus a delta_crit fit per resample (plan §6.3 B6).
+
+    The resample draws are exactly :func:`bootstrap_theta`'s for the same ``seed``, so the
+    theta interval it returns is identical to a plain theta bootstrap.
+    """
+    result, deltas = _bootstrap(
+        windows, n_resamples=n_resamples, seed=seed, config=config,
+        delta_kwargs=dict(delta_kwargs or {}),
+    )
+    assert deltas is not None
+    if deltas:
+        srt = sorted(deltas)
+        summary = BootstrapDeltaResult(
+            n_resamples=n_resamples,
+            n_fitted=len(deltas),
+            delta_values=tuple(deltas),
+            delta_p2_5=_percentile(srt, 2.5),
+            delta_p50=_percentile(srt, 50.0),
+            delta_p97_5=_percentile(srt, 97.5),
+        )
+    else:
+        summary = BootstrapDeltaResult(n_resamples, 0, (), None, None, None)
+    return result, summary
+
+
+def _bootstrap(
+    windows: list[CalibrationWindow],
+    *,
+    n_resamples: int,
+    seed: int,
+    config: ThetaFitConfig | None,
+    delta_kwargs: dict[str, Any] | None = None,
+) -> tuple[BootstrapThetaResult, list[float] | None]:
     if n_resamples <= 0:
         raise ValueError("n_resamples must be positive")
     config = config or ThetaFitConfig()
+    deltas: list[float] | None = [] if delta_kwargs is not None else None
 
     by_cell: dict[str, list[CalibrationWindow]] = {}
     for window in windows:
@@ -116,6 +190,10 @@ def bootstrap_theta(
         fit = config.fit(resampled)
         if fit.publish and fit.theta is not None:
             published.append(fit.theta)
+            if deltas is not None and fit.theta > 0.0:
+                crit = fit_delta_margins(resampled, theta=fit.theta, **(delta_kwargs or {})).crit
+                if not crit.used_fallback:
+                    deltas.append(crit.delta)
 
     n_published = len(published)
     publish_rate = n_published / n_resamples
@@ -140,4 +218,4 @@ def bootstrap_theta(
         theta_std=theta_std,
         publish_rate=publish_rate,
         config=config,
-    )
+    ), deltas
