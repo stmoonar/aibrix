@@ -17,11 +17,12 @@ from tre_controller.signals.trs import SignalState, TRSComputer, TRSInput
 
 def _inp(*, generation: float, running: float) -> TRSInput:
     # Y = generation * w_d (prompt=0); Q_ctl = max(running, qmin); trs_raw = Y/Q_ctl.
-    # ``generation`` is a per-second rate: the 60 s window is one window longer than
-    # the largest dt used below, so the idle-gap reset (dt > window_ms) never fires here.
+    # ``generation`` is the window total (the TSS numerator). The 60 s window_ms is one
+    # window longer than the largest dt used below, so the idle-gap reset (dt > window_ms)
+    # never fires here.
     return TRSInput(
         prompt_tokens_total=0.0,
-        generation_tokens_total=generation * 60.0,
+        generation_tokens_total=generation,
         avg_waiting=0.0,
         avg_running=running,
         avg_swapping=0.0,

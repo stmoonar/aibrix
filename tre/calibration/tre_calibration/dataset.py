@@ -157,7 +157,6 @@ def recompute_tss_rows(
         terms = tss_terms(
             prompt_tokens=prompt,
             generation_tokens=generation,
-            window_ms=end - start,
             avg_running=_as_float(row.get("avg_running"), 0.0) or 0.0,
             avg_waiting=_as_float(row.get("avg_waiting"), 0.0) or 0.0,
             w_p=params.w_p,

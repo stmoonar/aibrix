@@ -79,8 +79,7 @@ def test_compute_window_trs_uses_time_constant_ema() -> None:
             window_start_ms=end - 30000, window_end_ms=end,
         )
 
-    # TSS is a rate: 30 s windows carrying 6000 / 12000 tokens -> 200 / 400 tok/s.
-    windows = [win(6000.0, 2.0, 30000), win(12000.0, 2.0, 60000)]  # raw TRS 100 then 200
+    windows = [win(200.0, 2.0, 30000), win(400.0, 2.0, 60000)]  # raw TRS 100 then 200
     results = r3_grid.compute_window_results(windows, spec)
     vals = [r.TRS for r in results]
     assert vals[0] == 100.0  # first window seeds from raw

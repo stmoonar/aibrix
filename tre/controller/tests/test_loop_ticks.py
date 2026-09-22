@@ -68,7 +68,7 @@ def _metrics(
         window_start_ms=0,
         window_end_ms=60_000,
         prompt_tokens=0.0,
-        generation_tokens=None if generation is None else generation * 60.0,  # TSS is a rate: total = rate x 60 s window
+        generation_tokens=generation,
         avg_waiting=waiting,
         avg_running=running,
         avg_swapping=0.0,
@@ -148,7 +148,7 @@ def _metrics_with_pods(model: str, *, generation: float, waiting: float, running
         window_start_ms=0,
         window_end_ms=60_000,
         prompt_tokens=0.0,
-        generation_tokens=None if generation is None else generation * 60.0,  # TSS is a rate: total = rate x 60 s window
+        generation_tokens=generation,
         avg_waiting=waiting,
         avg_running=running,
         avg_swapping=0.0,
@@ -192,7 +192,7 @@ def test_rescue_tick_submits_critical_scale_action_from_snapshot_metrics() -> No
     assert action.source_loop == "rescue"
     assert result.model_contexts["critical"]["z_m"] is not None
     assert result.model_contexts["critical"]["signal_source"] == "zm"
-    assert result.model_contexts["critical"]["decode_tps"] == 50.0 * 60.0 / 60.0 / 2.0
+    assert result.model_contexts["critical"]["decode_tps"] == 50.0 / 60.0 / 2.0
     assert result.model_contexts["critical"]["prefill_tps"] == 0.0
 
 

@@ -98,7 +98,7 @@ def load_windows_and_inputs(
     ignores ``window.signal``; the ``signal_column`` is still required so the refit
     operates on exactly the same window set as the ``theta_m`` fit.
 
-    Every input carries its window duration (TSS is a rate), its end time and its cell,
+    Every input carries its window duration (EMA idle-gap rule), its end time and its cell,
     and - in ``preceding`` - the rows of the same cell that a filter or the ramp trim
     dropped since the previous kept row, so the offline EMA advances over exactly the
     windows the online EMA saw.

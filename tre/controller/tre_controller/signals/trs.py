@@ -13,10 +13,10 @@ from tre_common.tss import TssEma, replica_factor, signal_ema, tss_terms, window
 class TRSInput:
     """Inputs of one window's TSS (the unified definition, ``tre_common.tss``).
 
-    ``prompt_tokens_total`` / ``generation_tokens_total`` are window totals; ``window_ms``
-    is the duration they were accumulated over and turns them into rates. It has no
-    default that could silently keep the legacy window-total units: ``compute`` refuses a
-    missing one. ``avg_swapping`` and ``w_d`` are carried for schema compatibility and are
+    ``prompt_tokens_total`` / ``generation_tokens_total`` are window totals and the TSS
+    numerator is that total (tokens per window, window = TRE_METRICS_WINDOW_MS).
+    ``window_ms`` is the window duration; it only drives the EMA idle-gap reset (``None``
+    disables it). ``avg_swapping`` and ``w_d`` are carried for schema compatibility and are
     ignored by the formula (a non-zero swapping / a w_d != 1 is logged once).
     """
 
@@ -138,13 +138,10 @@ class TRSComputer:
     def compute(
         self, inp: TRSInput, theta_m: float | None = None, *, window_end_ms: int | None = None
     ) -> TRSResult:
-        if inp.window_ms is None:
-            raise ValueError("TRSInput.window_ms is required: TSS is a rate (tokens / window duration)")
         effective_pods = max(1, inp.routable_pods)
         terms = tss_terms(
             prompt_tokens=inp.prompt_tokens_total,
             generation_tokens=inp.generation_tokens_total,
-            window_ms=inp.window_ms,
             avg_running=inp.avg_running,
             avg_waiting=inp.avg_waiting,
             w_p=inp.w_p,
@@ -155,7 +152,7 @@ class TRSComputer:
             w_d=inp.w_d,
             factor=replica_factor(inp.assigned_replicas, effective_pods),
         )
-        y_total = terms.numerator_rate
+        y_total = terms.numerator
         y_per_pod = y_total / effective_pods
         q = terms.queue
         q_ctl = terms.queue_ctl

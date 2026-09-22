@@ -30,8 +30,8 @@ def _write_csv(path, rows) -> None:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         for row in rows:
-            # TSS is a rate: give every synthetic row a 1 s window so rate == total and
-            # the ranking arithmetic in the fixtures below is unchanged.
+            # Every synthetic row gets a window (start/end) for the EMA timeline; the TSS
+            # numerator is the window total, so the ranking arithmetic is unaffected.
             row = dict(row)
             row.setdefault("window_start_ms", 0)
             row.setdefault("window_end_ms", float(row["window_start_ms"]) + 1000.0)

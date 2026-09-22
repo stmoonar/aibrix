@@ -21,7 +21,8 @@ from tre_common.tss import TssEma, replica_factor, tss_terms, window_is_idle
 class SignalInputs:
     """One window's raw observables.
 
-    ``window_ms`` turns token totals into rates and is required by :func:`compute_trs`.
+    Token counts are window totals (the TSS numerator is tokens per window). ``window_ms``
+    is the window duration; it only drives the EMA idle-gap reset.
     ``window_end_ms`` + ``cell_id`` place the window on its cell's EMA timeline; they are
     needed only when scoring with ``ema_tau_ms``. ``preceding`` holds the cell's windows
     that sit between the previous scored window and this one but were filtered out of the
@@ -45,8 +46,8 @@ class SignalInputs:
 
 @dataclass(frozen=True)
 class TrsBreakdown:
-    #: ``w_p * r_p + r_d`` (tokens/s).
-    numerator_rate: float
+    #: ``w_p * r_p + r_d`` (tokens per window).
+    numerator: float
     queue_raw: float
     queue_floor: float
     #: The unified raw TSS (qmin-guarded, replica factor applied); NaN when undefined (idle).
@@ -74,12 +75,9 @@ class ParameterSearchResult:
 
 def compute_trs(inputs: SignalInputs, *, w_p: float, lambda_wait: float, qmin: float) -> TrsBreakdown:
     """Raw TSS of one window through the shared definition (``tre_common.tss``)."""
-    if inputs.window_ms is None:
-        raise ValueError("SignalInputs.window_ms is required: TSS is a rate (tokens / window duration)")
     terms = tss_terms(
         prompt_tokens=inputs.prompt_tokens_total,
         generation_tokens=inputs.generation_tokens_total,
-        window_ms=inputs.window_ms,
         avg_running=inputs.avg_running,
         avg_waiting=inputs.avg_waiting,
         w_p=w_p,
@@ -90,12 +88,12 @@ def compute_trs(inputs: SignalInputs, *, w_p: float, lambda_wait: float, qmin: f
         factor=replica_factor(inputs.assigned_replicas, inputs.routable_pods),
     )
     factor = replica_factor(inputs.assigned_replicas, inputs.routable_pods)
-    if terms.numerator_rate <= 0.0 or terms.raw is None:
-        no_floor = 0.0 if terms.numerator_rate <= 0.0 else float("nan")
+    if terms.numerator <= 0.0 or terms.raw is None:
+        no_floor = 0.0 if terms.numerator <= 0.0 else float("nan")
     else:
-        no_floor = (terms.numerator_rate / terms.queue) * factor if terms.queue > 0.0 else float("inf")
+        no_floor = (terms.numerator / terms.queue) * factor if terms.queue > 0.0 else float("inf")
     return TrsBreakdown(
-        numerator_rate=terms.numerator_rate,
+        numerator=terms.numerator,
         queue_raw=terms.queue,
         queue_floor=terms.queue_ctl,
         trs_floor=terms.raw if terms.raw is not None else float("nan"),

@@ -13,7 +13,6 @@ def _terms(**over):
     kw = dict(
         prompt_tokens=3000.0,
         generation_tokens=6000.0,
-        window_ms=30_000.0,
         avg_running=4.0,
         avg_waiting=1.0,
         w_p=0.02,
@@ -24,19 +23,31 @@ def _terms(**over):
     return tss.tss_terms(**kw)
 
 
-def test_numerator_is_a_rate_so_theta_does_not_scale_with_the_window() -> None:
+def test_numerator_is_the_window_token_total() -> None:
+    # Tokens per metrics window (TRE_METRICS_WINDOW_MS), the main / v1 convention.
     base = _terms()
-    # Same traffic over a window twice as long: totals double, the rate does not.
-    doubled = _terms(prompt_tokens=6000.0, generation_tokens=12000.0, window_ms=60_000.0)
-    assert base.numerator_rate == pytest.approx((0.02 * 3000.0 + 6000.0) / 30.0)
-    assert doubled.raw == pytest.approx(base.raw)
+    assert base.numerator == 0.02 * 3000.0 + 6000.0
     assert base.queue == 4.0 + 3.0 * 1.0
-    assert base.raw == pytest.approx(base.numerator_rate / 7.0)
+    assert base.raw == pytest.approx(base.numerator / 7.0)
+
+
+@pytest.mark.parametrize("window_ms", [30_000.0, 20_000.0, 1_000.0])
+def test_z_is_invariant_to_the_total_vs_rate_convention(window_ms) -> None:
+    # Window-total numerator with theta_total, or the same tokens divided by the window
+    # seconds (a rate) with theta_total / window_s: Z is the same number. Only theta's
+    # magnitude depends on the convention (x window seconds).
+    window_s = window_ms / 1000.0
+    theta_total = 1718.2369972339602
+    total = _terms()
+    rate = _terms(prompt_tokens=3000.0 / window_s, generation_tokens=6000.0 / window_s)
+    theta_rate = tss.convert_window_total_theta(theta_total, window_ms)
+    assert theta_rate == theta_total / window_s
+    assert rate.raw / theta_rate == pytest.approx(total.raw / theta_total, rel=1e-12)
 
 
 def test_prefill_counts_only_cache_miss_tokens() -> None:
     hit = _terms(kv_cache_hit_rate=0.5)
-    assert hit.numerator_rate == pytest.approx((0.02 * 1500.0 + 6000.0) / 30.0)
+    assert hit.numerator == pytest.approx(0.02 * 1500.0 + 6000.0)
 
 
 def test_swapping_and_w_d_are_ignored_with_a_warning(caplog) -> None:
@@ -51,20 +62,19 @@ def test_swapping_and_w_d_are_ignored_with_a_warning(caplog) -> None:
 def test_qmin_guards_a_small_queue() -> None:
     small = _terms(avg_running=0.25, avg_waiting=0.0)
     assert small.queue_ctl == 1.0
-    assert small.raw == pytest.approx(small.numerator_rate)
+    assert small.raw == pytest.approx(small.numerator)
 
 
 def test_idle_rule_nothing_in_flight_means_undefined() -> None:
     idle = _terms(avg_running=0.0, avg_waiting=0.0)
     assert idle.raw is None and not idle.defined
-    assert idle.numerator_rate > 0.0  # tokens completed, yet nothing was in flight
+    assert idle.numerator > 0.0  # tokens completed, yet nothing was in flight
 
 
-def test_window_must_be_positive() -> None:
-    with pytest.raises(ValueError):
-        _terms(window_ms=0.0)
-    with pytest.raises(ValueError):
-        _terms(window_ms=None)
+def test_the_formula_takes_no_window_duration() -> None:
+    # Totals need no duration; a stray window_ms must not silently turn them into rates.
+    with pytest.raises(TypeError):
+        _terms(window_ms=30_000.0)
 
 
 def test_replica_factor_keeps_the_controller_guards() -> None:
@@ -86,6 +96,6 @@ def test_smooth_series_seeds_passes_undefined_through_and_decays() -> None:
     assert out[3] == out[2]  # duplicate window end holds
 
 
-def test_theta_conversion_divides_by_the_window_seconds() -> None:
+def test_theta_rate_equivalent_divides_by_the_window_seconds() -> None:
     assert tss.convert_window_total_theta(1718.2369972339602) == 1718.2369972339602 / 30.0
     assert tss.convert_window_total_theta(739.0, 20_000) == 739.0 / 20.0

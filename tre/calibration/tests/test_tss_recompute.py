@@ -115,15 +115,13 @@ def test_lambda_zero_recompute_differs_only_through_the_queue(tmp_path) -> None:
         if running + waiting == 0.0:
             assert value is None
             continue
-        window_s = (float(row["window_end_ms"]) - float(row["window_start_ms"])) / 1000.0
-        rate = (0.02 * float(row["prompt_tokens_total"]) + float(row["generation_tokens_total"]) * 1.0)
-        assert abs(value - (0.02 * float(row["prompt_tokens_total"]) / window_s
-                            + float(row["generation_tokens_total"]) / window_s) / max(running, 1.0)) < 1e-9
-        assert rate >= 0.0
+        total = 0.02 * float(row["prompt_tokens_total"]) + float(row["generation_tokens_total"])
+        assert abs(value - total / max(running, 1.0)) < 1e-9  # window totals, not rates
+        assert total >= 0.0
 
 
-def test_signal_inputs_need_a_window() -> None:
-    import pytest
-
-    with pytest.raises(ValueError):
-        tss_series([SignalInputs(1.0, 1.0, 0.0, 1.0, 0.0)], w_p=0.02, lambda_wait=3.0, qmin=1.0)
+def test_signal_inputs_without_a_window_use_totals() -> None:
+    # The numerator is the window total, so no window duration is needed for the value
+    # (window_ms only drives the EMA idle-gap reset).
+    [value] = tss_series([SignalInputs(10.0, 5.0, 0.0, 1.0, 0.0)], w_p=0.02, lambda_wait=3.0, qmin=1.0)
+    assert value == 0.02 * 10.0 + 5.0

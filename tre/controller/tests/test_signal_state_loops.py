@@ -63,7 +63,7 @@ def _snapshot(*, window_end_ms: int, generation: float, running: float) -> Metri
         window_start_ms=window_end_ms - 30_000,
         window_end_ms=window_end_ms,
         prompt_tokens=0.0,
-        generation_tokens=generation * 30.0,  # TSS is a rate: total = rate x 30 s window
+        generation_tokens=generation,
         avg_waiting=0.0,
         avg_running=running,
         avg_swapping=0.0,

@@ -1,3 +1,9 @@
+# STATUS: REVERTED (2026-09-22, user decision). The TSS numerator is back to window
+# token totals (tokens per TRE_METRICS_WINDOW_MS = 30 s window), as on main and v1.
+# registry.yaml / params.yaml carry theta_m_old again; theta_m_new below is kept only
+# as the rate-unit equivalent (theta_old / 30). Z is identical under both conventions.
+status: reverted
+reverted_to: theta_m_old
 # TSS numerator became a rate (plan 2026-09-21 §6.4): theta_m moved from window-total
 # units (tokens per 30 s window per in-flight request) to rate units (tokens/s per
 # in-flight request). theta_new = theta_old / 30, the online window

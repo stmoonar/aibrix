@@ -20,7 +20,7 @@ those into the SAME window CSV the online path emits (r3_grid.CSV_COLUMNS), at a
                       MetricsStore uses — with the same bucket_upper / interpolated modes
                       and the same min_latency_samples N1 guard.
   * trs            -> r3_grid.compute_window_results (the shared time-constant TRSComputer,
-                      i.e. the unified rate-valued TSS of tre_common.tss), so the trs column
+                      i.e. the unified window-total TSS of tre_common.tss), so the trs column
                       is byte-identical to the online path; blank when TSS is undefined
                       (idle rule: running + waiting == 0).
   * row assembly   -> r3_grid.window_row / write_csv.

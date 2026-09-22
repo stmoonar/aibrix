@@ -81,7 +81,7 @@ def test_trs_computer_matches_legacy_sequence() -> None:
 
     for item in inputs:
         expected = legacy.compute(item, theta_m=750.0)
-        # Unified TSS == legacy formula at a 1 s window (rate == total), swapping 0.
+        # Unified TSS == legacy formula (window-total numerator) with swapping 0.
         actual = migrated.compute(TRSInput(**item.__dict__, window_ms=1000.0), theta_m=750.0)
         _assert_trs_result_equal(actual, expected)
         assert migrated.snapshot() == pytest.approx(legacy.snapshot())

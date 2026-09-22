@@ -131,11 +131,11 @@ def _traffic(start_end: int, n: int, step: int, seed: int) -> list[ModelWindowMe
 
 def test_online_ema_resets_after_an_idle_gap() -> None:
     computer = TRSComputer(ema_tau_ms=TAU)
-    _run(computer, [_window(30_000, gen=30_000.0, running=1.0)])  # raw 1000
+    _run(computer, [_window(30_000, gen=30_000.0, running=1.0)])  # raw 30000 (window total)
     # 40 s later, no idle tick seen: the old value must not survive
     r = computer.compute(TRSInput.from_metrics(_window(70_000, gen=3_000.0, running=1.0), _params()),
                          window_end_ms=70_000)
-    assert r.TRS == r.TRS_raw == 100.0
+    assert r.TRS == r.TRS_raw == 3_000.0
 
 
 def test_restart_duality_fresh_equals_post_reset() -> None:

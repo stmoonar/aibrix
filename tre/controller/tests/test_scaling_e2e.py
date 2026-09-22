@@ -28,7 +28,7 @@ TOPOLOGY = ClusterTopology(
     nodes=tuple(NodeSpec(name=name, gpus=4, two_gpu_slots=((0, 1), (2, 3))) for name in NODES)
 )
 SLOTS = [(node, gpu) for node in NODES for gpu in range(4)]
-THETA = 100.0  # Z_m = (generation_tokens / 60 s) / Q / theta with these params (TSS is a rate)
+THETA = 100.0  # Z_m = generation_tokens / Q / theta with these params
 CRITICAL, LOW, HIGH, HEALTHY = 50.0, 90.0, 200.0, 110.0  # generation tokens per unit Q
 
 
@@ -51,7 +51,7 @@ def _registry(*specs: tuple[str, int, int, int]) -> Registry:
 def _window(model: str, *, per_q: float, running: float) -> ModelWindowMetrics:
     return ModelWindowMetrics(
         model=model, window_start_ms=0, window_end_ms=60_000, prompt_tokens=0.0,
-        generation_tokens=per_q * running * 60.0, avg_waiting=0.0, avg_running=running, avg_swapping=0.0,
+        generation_tokens=per_q * running, avg_waiting=0.0, avg_running=running, avg_swapping=0.0,
         kv_cache_hit_rate=0.0, ttft_p95_ms=100.0, tpot_p95_ms=10.0, e2e_p95_ms=1000.0,
         routable_pods=0, assigned_replicas=0, per_pod={},
     )

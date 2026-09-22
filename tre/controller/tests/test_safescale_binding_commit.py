@@ -118,7 +118,7 @@ def _window(model: str, *, generation: float, waiting: float, running: float, po
         window_start_ms=0,
         window_end_ms=60_000,
         prompt_tokens=0.0,
-        generation_tokens=generation * 60.0,  # TSS is a rate: total = rate x 60 s window
+        generation_tokens=generation,
         avg_waiting=waiting,
         avg_running=running,
         avg_swapping=0.0,

@@ -55,7 +55,7 @@ data:
         lambda_wait: 3.0
         qmin: 1.0
         ema_alpha: 0.2485
-        theta_m: 57.27456657446534
+        theta_m: 1718.2369972339602
         tau_crit: 0.7912537770763468
         tau_low: 1.0
         tau_high: 1.2966928263995934
@@ -101,7 +101,7 @@ data:
         lambda_wait: 3.0
         qmin: 1.0
         ema_alpha: 0.2485
-        theta_m: 49.82207942812425
+        theta_m: 1494.6623828437275
         tau_crit: 0.7888102100713568
         tau_low: 1.0
         tau_high: 1.3976424286238496
@@ -147,7 +147,7 @@ data:
         lambda_wait: 3.0
         qmin: 1.0
         ema_alpha: 0.3935
-        theta_m: 47.13605001516635
+        theta_m: 1414.0815004549904
         tau_crit: 0.827267448358562
         tau_low: 1.0
         tau_high: 1.444767681340819

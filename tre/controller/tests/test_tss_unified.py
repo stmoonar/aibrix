@@ -35,11 +35,11 @@ def test_online_raw_is_the_shared_definition() -> None:
     wm = _window(60_000, prompt=3000.0, gen=6000.0, running=4.0, waiting=1.0)
     result = TRSComputer(ema_tau_ms=20_000).compute(TRSInput.from_metrics(wm, _params()), window_end_ms=60_000)
     expected = tss_terms(
-        prompt_tokens=3000.0, generation_tokens=6000.0, window_ms=30_000, avg_running=4.0,
+        prompt_tokens=3000.0, generation_tokens=6000.0, avg_running=4.0,
         avg_waiting=1.0, w_p=0.02, lambda_wait=3.0, qmin=1.0,
     )
     assert result.TRS_raw == expected.raw
-    assert result.Y_m == expected.numerator_rate  # a rate now, tokens/s
+    assert result.Y_m == expected.numerator  # window total (tokens per window)
 
 
 def test_offline_smoothing_is_bitwise_the_online_ema() -> None:
@@ -86,8 +86,8 @@ def test_idle_rule_tokens_but_nothing_in_flight_is_not_critical_and_not_dropped(
 
 
 def test_in_flight_work_still_classifies_on_z() -> None:
-    # 40 tok/s per in-flight request against theta 50 -> Z 0.8 - LOW, a real reading.
-    wm = _window(60_000, prompt=0.0, gen=40.0 * 30.0 * 2.0, running=2.0, waiting=0.0)
-    contexts, _ = _model_contexts(MetricsSnapshot(ts_ms=60_000, models={"m": wm}, stale=False), _registry(50.0))
+    # 1200 tokens per 30 s window per in-flight request against theta 1500 -> Z 0.8 - LOW.
+    wm = _window(60_000, prompt=0.0, gen=1200.0 * 2.0, running=2.0, waiting=0.0)
+    contexts, _ = _model_contexts(MetricsSnapshot(ts_ms=60_000, models={"m": wm}, stale=False), _registry(1500.0))
     assert contexts["m"]["tss_defined"] is True
     assert abs(contexts["m"]["z_m"] - 0.8) < 1e-12

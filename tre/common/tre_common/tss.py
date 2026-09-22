@@ -4,9 +4,11 @@ Plan 2026-09-21 §6.4 (unified definition)::
 
     TSS(t) = [ w_p * r_p(t) + r_d(t) ] / max( A(t) + w_q * W(t), qmin )
 
-* ``r_p`` - prefill tokens per second that MISSED the prefix cache
-  (``prompt_tokens * (1 - kv_cache_hit_rate) / window_s``);
-* ``r_d`` - generated tokens per second (``generation_tokens / window_s``);
+* ``r_p`` - prefill tokens per window that MISSED the prefix cache
+  (``prompt_tokens * (1 - kv_cache_hit_rate)``);
+* ``r_d`` - generated tokens per window (``generation_tokens``);
+* window = the metrics window ``TRE_METRICS_WINDOW_MS`` (30 s online and offline), so the
+  numerator is a **window token total**, the convention main and v1 always used;
 * ``A`` / ``W`` - running / waiting requests, the window mean of the instant samples;
 * ``w_q`` is the registry's ``lambda_wait``; ``qmin`` (1.0) is a numerical guard only;
 * the assigned/routable replica correction stays a multiplicative factor applied by the
@@ -14,8 +16,11 @@ Plan 2026-09-21 §6.4 (unified definition)::
 
 Changes against the v1/v2 code formula, all deliberate:
 
-* the numerator is a **rate**, not a window total, so theta no longer scales with the
-  window length (v2 theta values in window-total units are theta_old / 30 s here);
+* the numerator stays a **window total** (tokens per window, window =
+  ``TRE_METRICS_WINDOW_MS``), not a rate. The window is 30 s on every path, so Z is
+  identical under either convention; only theta's magnitude differs (x window seconds).
+  A rate-valued numerator was tried on 2026-09-22 (commit 22b59f96) and reverted by user
+  decision; :func:`convert_window_total_theta` remains to express a theta in rate units;
 * ``swapping`` is gone from the denominator (vLLM v1 never swaps; a non-zero value is
   logged and ignored);
 * ``w_d`` is gone (it is 1 by definition; a registry value != 1 is logged and ignored);
@@ -47,13 +52,13 @@ from typing import Iterable, Optional, Sequence
 LOG = logging.getLogger(__name__)
 
 #: Units the published theta is expressed in.
-TSS_UNITS = "decode-equivalent tokens/s per in-flight request"
+TSS_UNITS = "decode-equivalent tokens per metrics window (TRE_METRICS_WINDOW_MS) per in-flight request"
 
 #: EMA time constant the plan fixes (§6.5: tau is designed, not fitted).
 DEFAULT_EMA_TAU_MS = 20_000.0
 
-#: Online metrics window the v2 theta values were fitted at (TRE_METRICS_WINDOW_MS,
-#: deploy/overlays/tre-v2/controller.yaml). Used only to convert legacy theta values.
+#: Online metrics window the v2 theta values are expressed at (TRE_METRICS_WINDOW_MS,
+#: deploy/overlays/tre-v2/controller.yaml). Used only to express theta in rate units.
 V2_WINDOW_MS = 30_000.0
 
 _warned: set[str] = set()
@@ -70,8 +75,8 @@ def _warn_once(key: str, message: str) -> None:
 class TssTerms:
     """Every intermediate of one window's raw TSS, so callers never recompute a piece."""
 
-    #: ``w_p * r_p + r_d`` in tokens/s (fleet total).
-    numerator_rate: float
+    #: ``w_p * r_p + r_d`` in tokens per window (fleet total, window = TRE_METRICS_WINDOW_MS).
+    numerator: float
     #: ``A + w_q * W`` (unfloored).
     queue: float
     #: ``max(queue, qmin)``.
@@ -104,7 +109,6 @@ def tss_terms(
     *,
     prompt_tokens: float,
     generation_tokens: float,
-    window_ms: float,
     avg_running: float,
     avg_waiting: float,
     w_p: float,
@@ -117,11 +121,10 @@ def tss_terms(
 ) -> TssTerms:
     """Raw (un-smoothed) TSS of one window under the unified definition.
 
-    ``window_ms`` is the window duration the token totals were accumulated over; it must
-    be positive. ``avg_swapping`` and ``w_d`` are accepted for schema compatibility only.
+    ``prompt_tokens`` / ``generation_tokens`` are the totals over one metrics window
+    (``TRE_METRICS_WINDOW_MS``); the numerator is that window total, not a rate.
+    ``avg_swapping`` and ``w_d`` are accepted for schema compatibility only.
     """
-    if window_ms is None or not (float(window_ms) > 0.0):
-        raise ValueError(f"window_ms must be positive to turn token totals into rates, got {window_ms!r}")
     if avg_swapping:
         _warn_once(
             "swapping",
@@ -133,10 +136,9 @@ def tss_terms(
             f"w_d:{w_d}",
             f"w_d={w_d!r} != 1 in the registry; the unified TSS fixes w_d = 1 and ignores it",
         )
-    window_s = float(window_ms) / 1000.0
-    rate_p = float(prompt_tokens) * (1.0 - float(kv_cache_hit_rate)) / window_s
-    rate_d = float(generation_tokens) / window_s
-    numerator = float(w_p) * rate_p + rate_d
+    tokens_p = float(prompt_tokens) * (1.0 - float(kv_cache_hit_rate))
+    tokens_d = float(generation_tokens)
+    numerator = float(w_p) * tokens_p + tokens_d
     running = float(avg_running)
     waiting = float(avg_waiting)
     queue = tss_queue(running, waiting, lambda_wait)
@@ -149,7 +151,7 @@ def tss_terms(
     else:  # qmin <= 0 and an empty queue cannot happen with in_flight > 0; kept total.
         raw = math.inf if numerator > 0 else 0.0
     return TssTerms(
-        numerator_rate=numerator,
+        numerator=numerator,
         queue=queue,
         queue_ctl=queue_ctl,
         in_flight=in_flight,
@@ -294,7 +296,9 @@ def smooth_series(
 
 
 def convert_window_total_theta(theta_total: float, window_ms: float = V2_WINDOW_MS) -> float:
-    """theta in legacy window-total units -> theta in rate units (theta_old / window_s)."""
+    """theta in window-total units (the published convention) -> the same threshold in
+    rate units (theta / window_s). Z is identical under both conventions; this is only for
+    reporting / comparing against a rate-valued definition (e.g. the paper's r = tokens/s)."""
     return float(theta_total) / (float(window_ms) / 1000.0)
 
 
