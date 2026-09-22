@@ -7,7 +7,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Sequence
 
-from tre_calibration.dataset import load_windows_from_csv
+from tre_calibration.dataset import TssRecompute, load_windows_from_csv
+from tre_common.tss import DEFAULT_EMA_TAU_MS, TSS_UNITS
 from tre_calibration.evaluate import evaluate_signal_direction
 from tre_calibration.fit import (
     DEFAULT_CRITICAL_VIOLATION_QUANTILE,
@@ -45,12 +46,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         else DEFAULT_HEALTHY_QUANTILE_CANDIDATES
     )
 
+    tss = None
+    if args.recompute_tss:
+        if args.w_p is None or args.lambda_wait is None:
+            raise SystemExit("--recompute-tss needs an explicit --w-p and --lambda-wait")
+        tss = TssRecompute(
+            w_p=args.w_p,
+            lambda_wait=args.lambda_wait,
+            qmin=args.qmin,
+            ema_tau_ms=args.ema_tau_ms if args.ema_tau_ms > 0 else None,
+        )
+    # Recorded values keep the historical defaults when the caller named none.
+    args.w_p = 0.04 if args.w_p is None else args.w_p
+    args.lambda_wait = 2.625 if args.lambda_wait is None else args.lambda_wait
+
     windows = load_windows_from_csv(
         args.input,
         latency_slo_ms=latency_slo_ms,
         signal_column=args.signal_column,
         trim_ramp_windows=args.trim_ramp_windows,
         lambda_wait=args.lambda_wait,
+        tss=tss,
     )
     theta_fit = fit_theta(
         windows,
@@ -108,6 +124,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         "surplus_queue_quantile": args.surplus_queue_quantile,
         "theta_criterion": args.theta_criterion,
         "trim_ramp_windows": args.trim_ramp_windows,
+        # How the signal was obtained: read from --signal-column, or recomputed with the
+        # shared TSS definition (tre_common.tss) at these parameters.
+        "tss_recompute": tss.as_dict() if tss is not None else None,
+        "signal_units": TSS_UNITS if tss is not None else None,
     }
     inputs = {
         "csv_path": str(args.input),
@@ -219,8 +239,23 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
             "the older behaviour where a candidate missing the floor always loses"
         ),
     )
-    parser.add_argument("--w-p", type=float, default=0.04)
-    parser.add_argument("--lambda-wait", type=float, default=2.625)
+    parser.add_argument("--w-p", type=float, default=None, help="default 0.04 (recorded only)")
+    parser.add_argument("--lambda-wait", type=float, default=None, help="default 2.625 (recorded only)")
+    parser.add_argument(
+        "--recompute-tss",
+        action="store_true",
+        help=(
+            "recompute the signal from the CSV's raw columns with the shared TSS definition "
+            "(tre_common.tss) at --w-p/--lambda-wait/--qmin, smoothed by the online "
+            "tau-EMA (--ema-tau-ms), instead of reading --signal-column"
+        ),
+    )
+    parser.add_argument(
+        "--ema-tau-ms",
+        type=float,
+        default=DEFAULT_EMA_TAU_MS,
+        help="EMA time constant for --recompute-tss (default 20000, as online; 0 = raw)",
+    )
     parser.add_argument("--qmin", type=float, default=1.0)
     parser.add_argument("--generated-at")
     return parser.parse_args(argv)

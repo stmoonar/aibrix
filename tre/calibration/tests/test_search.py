@@ -12,10 +12,10 @@ def test_grid_search_parameters_selects_best_direction_candidate() -> None:
         CalibrationWindow("high-b", "burst", 0.0, True, health_score=0.9),
     ]
     inputs = [
-        SignalInputs(10.0, 120.0, 0.0, 1.0, 0.0),
-        SignalInputs(20.0, 100.0, 0.0, 1.0, 0.0),
-        SignalInputs(100.0, 20.0, 0.0, 1.0, 0.0),
-        SignalInputs(120.0, 10.0, 0.0, 1.0, 0.0),
+        SignalInputs(10.0, 120.0, 0.0, 1.0, 0.0, window_ms=1000.0),
+        SignalInputs(20.0, 100.0, 0.0, 1.0, 0.0, window_ms=1000.0),
+        SignalInputs(100.0, 20.0, 0.0, 1.0, 0.0, window_ms=1000.0),
+        SignalInputs(120.0, 10.0, 0.0, 1.0, 0.0, window_ms=1000.0),
     ]
 
     result = grid_search_parameters(

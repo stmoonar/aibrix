@@ -617,7 +617,8 @@ def run_schedule_cell(args, store, spec) -> tuple[list, "openloop.CellGuard"]:
         w += args.window_ms
     results = compute_window_results(windows, spec)
     rows = [
-        window_row(cell, wm, result.TRS, result.Q_ctl)
+        # An undefined TSS (idle rule, tre_common.tss) is written blank, never as 0.
+        window_row(cell, wm, result.TRS if result.defined else None, result.Q_ctl)
         for wm, result in zip(windows, results)
     ]
     # A window holding a model error is a violation and is KEPT. Dropping it would remove
@@ -963,7 +964,7 @@ def main() -> int:
             w += args.window_ms
         results = compute_window_results(windows, spec)  # shared time-constant EMA (S1.4)
         for wm, result in zip(windows, results):
-            rows.append(window_row(cell, wm, result.TRS, result.Q_ctl))
+            rows.append(window_row(cell, wm, result.TRS if result.defined else None, result.Q_ctl))
         cell_windows = len(windows)
         ckpt.mark(cell)
         write_csv(rows, out)

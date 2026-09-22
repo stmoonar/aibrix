@@ -15,13 +15,14 @@ def test_compute_trs_matches_archived_formula() -> None:
             assigned_replicas=2.0,
             routable_pods=1.0,
             kv_cache_hit_rate=0.25,
+            window_ms=1000.0,  # 1 s window: rate == total
         ),
         w_p=2.0,
         lambda_wait=0.5,
         qmin=10.0,
     )
 
-    assert breakdown.total_tokens == 200.0
+    assert breakdown.numerator_rate == 200.0
     assert breakdown.queue_raw == 9.0
     assert breakdown.queue_floor == 10.0
     assert breakdown.trs_floor == 40.0
@@ -36,10 +37,10 @@ def test_score_parameter_candidate_reports_direction_metrics() -> None:
         CalibrationWindow("high-b", "burst", 0.0, True, health_score=0.9),
     ]
     inputs = [
-        SignalInputs(0.0, 50.0, 0.0, 1.0, 0.0),
-        SignalInputs(0.0, 60.0, 0.0, 1.0, 0.0),
-        SignalInputs(0.0, 100.0, 0.0, 1.0, 0.0),
-        SignalInputs(0.0, 120.0, 0.0, 1.0, 0.0),
+        SignalInputs(0.0, 50.0, 0.0, 1.0, 0.0, window_ms=1000.0),
+        SignalInputs(0.0, 60.0, 0.0, 1.0, 0.0, window_ms=1000.0),
+        SignalInputs(0.0, 100.0, 0.0, 1.0, 0.0, window_ms=1000.0),
+        SignalInputs(0.0, 120.0, 0.0, 1.0, 0.0, window_ms=1000.0),
     ]
 
     score = score_parameter_candidate(windows, inputs, w_p=1.0, lambda_wait=1.0, qmin=1.0)

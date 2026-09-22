@@ -1044,7 +1044,8 @@ def _paper_state_incomplete_models(classifications: list[ModelClassification]) -
     return tuple(
         item.model_name
         for item in classifications
-        if item.state == ModelState.UNKNOWN or (item.Z_m is None and item.state != ModelState.IDLE)
+        if item.state == ModelState.UNKNOWN
+        or (item.Z_m is None and item.state != ModelState.IDLE and not getattr(item, "signal_idle", False))
     )
 
 

@@ -40,15 +40,18 @@ These bracket every model's inherited value (7b/8b w_p=0.08, lambda_wait=1.875;
 14b w_p=0.0575 sits between 0.04 and 0.06, lambda_wait=3.0) plus an order-of-magnitude
 sweep of w_p, and are overridable via CLI for ad-hoc sweeps.
 
-The ``signals.py`` scoring口径 is deliberate (no_floor / no EMA / no ``w_d``; it mirrors
-the old system's parameter-search objective -- see ``06_calibration_design.md``). This
-driver must NOT change that formula; it only assembles inputs and reports.
+Scoring口径 (plan 2026-09-21 §6.4): every candidate is scored on the unified TSS -
+``tre_common.tss`` (rate numerator, qmin guard, idle rule) smoothed by the same
+wall-clock tau-EMA the controller runs (``--ema-tau-ms``, default 20 s; 0 = raw). The
+former no-floor / no-EMA / window-total objective of the 0.4.0 search is retired, so a
+refit candidate and the live signal at the same parameters are the same number.
 """
 from __future__ import annotations
 
 import argparse
 import csv
 import json
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
@@ -60,6 +63,7 @@ from tre_calibration.dataset import (
     _skip_row,
     trim_scenario_ramp_windows,
 )
+from tre_common.tss import DEFAULT_EMA_TAU_MS
 from tre_calibration.signals import (
     ParameterCandidateScore,
     SignalInputs,
@@ -92,67 +96,103 @@ def load_windows_and_inputs(
     construction. ``grid_search_parameters`` recomputes the signal from ``inputs`` and
     ignores ``window.signal``; the ``signal_column`` is still required so the refit
     operates on exactly the same window set as the ``theta_m`` fit.
+
+    Every input carries its window duration (TSS is a rate), its end time and its cell,
+    and - in ``preceding`` - the rows of the same cell that a filter or the ramp trim
+    dropped since the previous kept row, so the offline EMA advances over exactly the
+    windows the online EMA saw.
     """
     active_columns = _resolve_latency_columns(latency_slo_ms)
     if not active_columns:
         raise ValueError("latency_slo_ms must contain at least one active SLO")
 
-    windows: list[CalibrationWindow] = []
-    inputs: list[SignalInputs] = []
     with Path(path).open("r", encoding="utf-8", newline="") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            if _skip_row(row):
-                continue
-            signal = _as_float(row.get(signal_column))
-            if signal is None:
-                continue
-            prompt_tokens = _as_float(row.get("prompt_tokens_total"), 0.0) or 0.0
-            generation_tokens = _as_float(row.get("generation_tokens_total"), 0.0) or 0.0
-            if prompt_tokens + generation_tokens <= 0.0:
-                continue
+        rows = list(csv.DictReader(f))
 
-            ratios: list[float] = []
-            missing_latency = False
-            for slo_key, column in active_columns.items():
-                value = _as_float(row.get(column))
-                if value is None:
-                    missing_latency = True
-                    break
-                ratios.append(value / float(latency_slo_ms[slo_key]))
-            if missing_latency or not ratios:
-                continue
+    # Pass 1: one SignalInputs per row, cells as contiguous blocks.
+    all_inputs: list[SignalInputs] = []
+    block = 0
+    prev_key: tuple[str, float | None] | None = None
+    for row in rows:
+        scenario = (row.get("scenario_id") or "unknown").strip() or "unknown"
+        start = _as_float(row.get("window_start_ms"))
+        end = _as_float(row.get("window_end_ms"))
+        if prev_key is not None and (
+            scenario != prev_key[0]
+            or (end is not None and prev_key[1] is not None and end < prev_key[1])
+        ):
+            block += 1
+        prev_key = (scenario, end)
+        all_inputs.append(
+            SignalInputs(
+                prompt_tokens_total=_as_float(row.get("prompt_tokens_total"), 0.0) or 0.0,
+                generation_tokens_total=_as_float(row.get("generation_tokens_total"), 0.0) or 0.0,
+                avg_waiting=_as_float(row.get("avg_waiting"), 0.0) or 0.0,
+                avg_running=_as_float(row.get("avg_running"), 0.0) or 0.0,
+                avg_swapping=_as_float(row.get("avg_swapping"), 0.0) or 0.0,
+                assigned_replicas=_as_float(row.get("assigned_replicas"), 1.0) or 1.0,
+                routable_pods=_as_float(row.get("routable_pods"), 1.0) or 1.0,
+                kv_cache_hit_rate=_as_float(row.get("kv_cache_hit_rate"), 0.0) or 0.0,
+                window_ms=(end - start) if (start is not None and end is not None) else None,
+                window_end_ms=end,
+                cell_id=f"{block}:{scenario}",
+            )
+        )
 
-            p95_ratio_max = max(ratios)
-            windows.append(
-                CalibrationWindow(
-                    scenario_id=(row.get("scenario_id") or "unknown").strip() or "unknown",
-                    scenario_family=(row.get("scenario_family") or "unknown").strip() or "unknown",
-                    signal=signal,
-                    slo_met=all(ratio <= 1.0 for ratio in ratios),
-                    health_score=1.0 / (1.0 + p95_ratio_max),
-                    window_start_ms=_as_float(row.get("window_start_ms")),
-                )
+    # Pass 2: the row filter, identical to the theta fit's.
+    windows: list[CalibrationWindow] = []
+    kept_rows: list[int] = []
+    for index, row in enumerate(rows):
+        if _skip_row(row):
+            continue
+        signal = _as_float(row.get(signal_column))
+        if signal is None:
+            continue
+        prompt_tokens = _as_float(row.get("prompt_tokens_total"), 0.0) or 0.0
+        generation_tokens = _as_float(row.get("generation_tokens_total"), 0.0) or 0.0
+        if prompt_tokens + generation_tokens <= 0.0:
+            continue
+
+        ratios: list[float] = []
+        missing_latency = False
+        for slo_key, column in active_columns.items():
+            value = _as_float(row.get(column))
+            if value is None:
+                missing_latency = True
+                break
+            ratios.append(value / float(latency_slo_ms[slo_key]))
+        if missing_latency or not ratios:
+            continue
+
+        p95_ratio_max = max(ratios)
+        windows.append(
+            CalibrationWindow(
+                scenario_id=(row.get("scenario_id") or "unknown").strip() or "unknown",
+                scenario_family=(row.get("scenario_family") or "unknown").strip() or "unknown",
+                signal=signal,
+                slo_met=all(ratio <= 1.0 for ratio in ratios),
+                health_score=1.0 / (1.0 + p95_ratio_max),
+                window_start_ms=_as_float(row.get("window_start_ms")),
             )
-            inputs.append(
-                SignalInputs(
-                    prompt_tokens_total=prompt_tokens,
-                    generation_tokens_total=generation_tokens,
-                    avg_waiting=_as_float(row.get("avg_waiting"), 0.0) or 0.0,
-                    avg_running=_as_float(row.get("avg_running"), 0.0) or 0.0,
-                    avg_swapping=_as_float(row.get("avg_swapping"), 0.0) or 0.0,
-                    assigned_replicas=_as_float(row.get("assigned_replicas"), 1.0) or 1.0,
-                    routable_pods=_as_float(row.get("routable_pods"), 1.0) or 1.0,
-                    kv_cache_hit_rate=_as_float(row.get("kv_cache_hit_rate"), 0.0) or 0.0,
-                )
-            )
+        )
+        kept_rows.append(index)
+
     kept_windows = trim_scenario_ramp_windows(windows, count=trim_ramp_windows)
     kept_ids = {id(window) for window in kept_windows}
-    kept_inputs = [
-        signal_input
-        for window, signal_input in zip(windows, inputs)
-        if id(window) in kept_ids
-    ]
+    final_rows = {row for window, row in zip(windows, kept_rows) if id(window) in kept_ids}
+
+    # Pass 3: attach each kept row's dropped predecessors (same cell) for the EMA.
+    kept_inputs: list[SignalInputs] = []
+    pending: list[SignalInputs] = []
+    pending_cell: str | None = None
+    for index, item in enumerate(all_inputs):
+        if item.cell_id != pending_cell:
+            pending, pending_cell = [], item.cell_id
+        if index in final_rows:
+            kept_inputs.append(replace(item, preceding=tuple(pending)))
+            pending = []
+        else:
+            pending.append(item)
     return kept_windows, kept_inputs
 
 
@@ -225,6 +265,7 @@ def build_report(
     slo: dict[str, float] | None = None,
     generated_at: str | None = None,
     trim_ramp_windows: int = 0,
+    ema_tau_ms: float | None = DEFAULT_EMA_TAU_MS,
 ) -> dict[str, Any]:
     """Score inherited vs grid-best and assemble the comparison report."""
     if not windows:
@@ -238,6 +279,7 @@ def build_report(
         w_p=inherited_w_p,
         lambda_wait=inherited_lambda_wait,
         qmin=inherited_qmin,
+        ema_tau_ms=ema_tau_ms,
     )
     search = grid_search_parameters(
         windows,
@@ -245,6 +287,7 @@ def build_report(
         w_p_candidates=list(w_p_candidates),
         lambda_wait_candidates=list(lambda_wait_candidates),
         qmin_candidates=list(qmin_candidates),
+        ema_tau_ms=ema_tau_ms,
     )
     best = search.best
 
@@ -263,6 +306,8 @@ def build_report(
         "generated_at": generated_at or datetime.now(timezone.utc).isoformat(),
         "model_name": model_name,
         "signal_column": signal_column,
+        "signal_definition": "unified TSS (tre_common.tss), rate numerator, tau-EMA",
+        "ema_tau_ms": ema_tau_ms,
         "trim_ramp_windows": trim_ramp_windows,
         "slo": dict(slo) if slo else None,
         "window": {
@@ -333,6 +378,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         slo=dict(latency_slo_ms),
         generated_at=args.generated_at,
         trim_ramp_windows=args.trim_ramp_windows,
+        ema_tau_ms=(args.ema_tau_ms if args.ema_tau_ms > 0 else None),
     )
 
     out = Path(args.output)
@@ -379,6 +425,12 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument("--model-name", required=True)
     parser.add_argument("--signal-column", default="trs")
     parser.add_argument("--trim-ramp-windows", type=int, default=1)
+    parser.add_argument(
+        "--ema-tau-ms",
+        type=float,
+        default=DEFAULT_EMA_TAU_MS,
+        help="EMA time constant candidates are smoothed with, as online (default 20000; 0 = raw)",
+    )
     parser.add_argument("--ttft-p95-ms", type=float, required=True)
     parser.add_argument("--tpot-p95-ms", type=float, required=True)
     parser.add_argument("--e2e-p95-ms", type=float)

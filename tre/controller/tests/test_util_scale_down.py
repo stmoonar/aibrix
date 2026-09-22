@@ -160,7 +160,7 @@ def _snapshot(index: int, *, running: float, pods: int) -> MetricsSnapshot:
                 window_start_ms=end - 30_000,
                 window_end_ms=end,
                 prompt_tokens=0.0,
-                generation_tokens=100_000.0,
+                generation_tokens=100_000.0 * 30.0,  # TSS is a rate: total = rate x 30 s window
                 avg_waiting=0.0,
                 avg_running=running,
                 avg_swapping=0.0,

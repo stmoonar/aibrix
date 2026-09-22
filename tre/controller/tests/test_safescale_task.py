@@ -55,7 +55,7 @@ def _metrics(*, ts_ms: int, generation: float = 120.0, ttft: float = 500.0, tpot
                 window_start_ms=0,
                 window_end_ms=60_000,
                 prompt_tokens=0.0,
-                generation_tokens=generation,
+                generation_tokens=generation * 60.0,  # TSS is a rate: total = rate x 60 s window
                 avg_waiting=0.0,
                 avg_running=1.0,
                 avg_swapping=0.0,

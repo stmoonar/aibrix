@@ -117,7 +117,7 @@ def _metrics(ts_ms: int) -> MetricsSnapshot:
                 window_start_ms=0,
                 window_end_ms=60_000,
                 prompt_tokens=0.0,
-                generation_tokens=120.0,
+                generation_tokens=120.0 * 60.0,  # TSS is a rate: total = rate x 60 s window
                 avg_waiting=0.0,
                 avg_running=1.0,
                 avg_swapping=0.0,

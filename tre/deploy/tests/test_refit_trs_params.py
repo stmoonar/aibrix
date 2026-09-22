@@ -16,6 +16,7 @@ def _write_csv(path, rows) -> None:
         "scenario_id",
         "scenario_family",
         "window_start_ms",
+        "window_end_ms",
         "trs",
         "prompt_tokens_total",
         "generation_tokens_total",
@@ -29,6 +30,11 @@ def _write_csv(path, rows) -> None:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         for row in rows:
+            # TSS is a rate: give every synthetic row a 1 s window so rate == total and
+            # the ranking arithmetic in the fixtures below is unchanged.
+            row = dict(row)
+            row.setdefault("window_start_ms", 0)
+            row.setdefault("window_end_ms", float(row["window_start_ms"]) + 1000.0)
             writer.writerow(row)
 
 
@@ -171,6 +177,8 @@ def test_report_schema_and_grid(tmp_path) -> None:
         "generated_at",
         "model_name",
         "signal_column",
+        "signal_definition",
+        "ema_tau_ms",
         "trim_ramp_windows",
         "slo",
         "window",

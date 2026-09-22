@@ -6,10 +6,20 @@ from typing import Any
 
 from tre_common.metrics_schema import ModelWindowMetrics
 from tre_common.registry import TrsParams
+from tre_common.tss import ema_step, replica_factor, tss_terms
 
 
 @dataclass
 class TRSInput:
+    """Inputs of one window's TSS (the unified definition, ``tre_common.tss``).
+
+    ``prompt_tokens_total`` / ``generation_tokens_total`` are window totals; ``window_ms``
+    is the duration they were accumulated over and turns them into rates. It has no
+    default that could silently keep the legacy window-total units: ``compute`` refuses a
+    missing one. ``avg_swapping`` and ``w_d`` are carried for schema compatibility and are
+    ignored by the formula (a non-zero swapping / a w_d != 1 is logged once).
+    """
+
     prompt_tokens_total: float
     generation_tokens_total: float
     avg_waiting: float
@@ -22,6 +32,7 @@ class TRSInput:
     lambda_wait: float = 2.625
     qmin: float = 1.0
     kv_cache_hit_rate: float = 0.0
+    window_ms: float | None = None
 
     @classmethod
     def from_metrics(cls, metrics: ModelWindowMetrics, params: TrsParams) -> "TRSInput":
@@ -38,6 +49,7 @@ class TRSInput:
             lambda_wait=params.lambda_wait,
             qmin=params.qmin,
             kv_cache_hit_rate=metrics.kv_cache_hit_rate,
+            window_ms=float(metrics.window_end_ms - metrics.window_start_ms),
         )
 
 
@@ -54,6 +66,9 @@ class TRSResult:
     ema_alpha: float
     prev_Y: float | None = None
     prev_Q_ctl: float | None = None
+    #: False when TSS is undefined for this window (idle: running + waiting == 0). TRS /
+    #: TRS_raw are then 0.0 and Z_m is None - never a small Z that would read CRITICAL.
+    defined: bool = True
 
 
 class TRSComputer:
@@ -92,20 +107,30 @@ class TRSComputer:
     def compute(
         self, inp: TRSInput, theta_m: float | None = None, *, window_end_ms: int | None = None
     ) -> TRSResult:
-        y_total = inp.prompt_tokens_total * (1 - inp.kv_cache_hit_rate) * inp.w_p + inp.generation_tokens_total * inp.w_d
+        if inp.window_ms is None:
+            raise ValueError("TRSInput.window_ms is required: TSS is a rate (tokens / window duration)")
         effective_pods = max(1, inp.routable_pods)
+        terms = tss_terms(
+            prompt_tokens=inp.prompt_tokens_total,
+            generation_tokens=inp.generation_tokens_total,
+            window_ms=inp.window_ms,
+            avg_running=inp.avg_running,
+            avg_waiting=inp.avg_waiting,
+            w_p=inp.w_p,
+            lambda_wait=inp.lambda_wait,
+            qmin=inp.qmin,
+            kv_cache_hit_rate=inp.kv_cache_hit_rate,
+            avg_swapping=inp.avg_swapping,
+            w_d=inp.w_d,
+            factor=replica_factor(inp.assigned_replicas, effective_pods),
+        )
+        y_total = terms.numerator_rate
         y_per_pod = y_total / effective_pods
-        q = inp.avg_waiting * inp.lambda_wait + inp.avg_running + inp.avg_swapping
-        q_ctl = max(q, inp.qmin)
-        if q_ctl > 0:
-            trs_raw = y_total / q_ctl
-        else:
-            trs_raw = float("inf") if y_total > 0 else 0.0
-        effective_assigned = inp.assigned_replicas
-        if effective_assigned <= 0:
-            effective_assigned = effective_pods
-        if effective_pods > 0:
-            trs_raw = trs_raw * effective_assigned / effective_pods
+        q = terms.queue
+        q_ctl = terms.queue_ctl
+        # Idle rule (plan 6.4): A + W == 0 -> TSS undefined. Reported as 0.0, which the
+        # EMA passes through without advancing and compute_z_m maps to None.
+        trs_raw = terms.raw if terms.raw is not None else 0.0
         trs = self._update_ema(trs_raw, window_end_ms=window_end_ms)
         eta = compute_eta_m(trs, effective_pods)
         z_m = compute_z_m(trs, theta_m)
@@ -125,6 +150,7 @@ class TRSComputer:
             ema_alpha=self.ema_alpha,
             prev_Y=saved_prev_y,
             prev_Q_ctl=saved_prev_q_ctl,
+            defined=terms.defined,
         )
 
     def _update_ema(self, raw: float, window_end_ms: int | None = None) -> float:
@@ -156,11 +182,14 @@ class TRSComputer:
             if dt_ms <= 0:
                 # Window regressed (clock/window rewind): keep EMA, don't advance.
                 return self._trs_ema
-            decay = math.exp(-dt_ms / tau)
-            self._trs_ema = decay * self._trs_ema + (1.0 - decay) * raw
+            # alpha_k = 1 - exp(-dt/tau): the SAME function the offline fit uses
+            # (tre_common.tss.smooth_series), so online and offline agree bitwise.
+            self._trs_ema = ema_step(self._trs_ema, raw, dt_ms, tau)
             self._last_update_ms = window_end_ms
             return self._trs_ema
-        # Legacy fixed-alpha branch: byte-identical to pre-S1.3 behaviour when
+        # LEGACY fixed-alpha branch (ema_tau_ms unset). Every deployed registry entry sets
+        # ema_tau_ms; this path is kept only for the golden parity tests and for a
+        # registry that predates S1.3. Byte-identical to pre-S1.3 behaviour when
         # window_end_ms is None (golden). With a shared computer + window_end_ms it
         # advances once per window (the dedup above) using the fixed alpha.
         if self.ema_alpha <= 0:

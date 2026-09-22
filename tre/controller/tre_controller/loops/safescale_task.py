@@ -143,7 +143,9 @@ def _observation_from_metrics(
         tpot_p95_ms=metrics.tpot_p95_ms,
         z_m=signal.z_m,
         q_ctl=result.Q_ctl,
-        has_traffic=(result.Y_m > 0.0 or result.Q > 0.0),
+        # Idle rule (plan 6.4): tokens with nothing in flight is surplus, not traffic
+        # that must prove a Z - otherwise a lightly used model could never commit a probe.
+        has_traffic=(result.Q > 0.0 or (result.Y_m > 0.0 and result.defined)),
         avg_gpu_cache_norm=None,
     )
 

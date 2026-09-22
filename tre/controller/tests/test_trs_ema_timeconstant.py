@@ -30,6 +30,7 @@ def _inp(*, generation: float, running: float) -> TRSInput:
         lambda_wait=2.625,
         qmin=1.0,
         kv_cache_hit_rate=0.0,
+        window_ms=1000.0,  # 1 s window: the rate equals the total
     )
 
 

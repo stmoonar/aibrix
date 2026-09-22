@@ -19,8 +19,10 @@ those into the SAME window CSV the online path emits (r3_grid.CSV_COLUMNS), at a
                       tre_common.percentile.histogram_percentile — the very function
                       MetricsStore uses — with the same bucket_upper / interpolated modes
                       and the same min_latency_samples N1 guard.
-  * trs            -> r3_grid.compute_window_results (the shared time-constant TRSComputer),
-                      so the trs column is byte-identical to the online path.
+  * trs            -> r3_grid.compute_window_results (the shared time-constant TRSComputer,
+                      i.e. the unified rate-valued TSS of tre_common.tss), so the trs column
+                      is byte-identical to the online path; blank when TSS is undefined
+                      (idle rule: running + waiting == 0).
   * row assembly   -> r3_grid.window_row / write_csv.
 
 Sidecar cadence (why `--instant-grid` exists)
@@ -498,7 +500,12 @@ def rewindow_cell(
         for ws, we in windows_ms
     ]
     results = r3_grid.compute_window_results(metrics, spec)
-    return [r3_grid.window_row(cell, wm, result.TRS, result.Q_ctl) for wm, result in zip(metrics, results)]
+    # An undefined TSS (idle rule: nothing in flight, tre_common.tss) is written blank so
+    # no fit ever reads it as a (tiny) signal value.
+    return [
+        r3_grid.window_row(cell, wm, result.TRS if result.defined else None, result.Q_ctl)
+        for wm, result in zip(metrics, results)
+    ]
 
 
 def _raw_size_bytes(raw_dir: Path) -> int:

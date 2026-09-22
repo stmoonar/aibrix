@@ -1,0 +1,19 @@
+# TSS numerator became a rate (plan 2026-09-21 §6.4): theta_m moved from window-total
+# units (tokens per 30 s window per in-flight request) to rate units (tokens/s per
+# in-flight request). theta_new = theta_old / 30, the online window
+# TRE_METRICS_WINDOW_MS=30000. w_p, lambda_wait, tau_crit/tau_high (dimensionless Z
+# bands) and alt_thresholds (queue_len counts; decode_tps/prefill_tps already per-second)
+# are unchanged. These are the pre-refit v2 values; they are superseded by the refit.
+window_ms: 30000
+units_old: window-total tokens per in-flight request (30 s window)
+units_new: tokens/s per in-flight request
+models:
+  dsllama-8b:
+    theta_m_old: 1494.6623828437275
+    theta_m_new: 49.82207942812425
+  dsqwen-14b:
+    theta_m_old: 1414.0815004549904
+    theta_m_new: 47.13605001516635
+  dsqwen-7b:
+    theta_m_old: 1718.2369972339602
+    theta_m_new: 57.27456657446534

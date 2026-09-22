@@ -46,6 +46,10 @@ class ModelClassification:
     tau: TauThresholds
     donor_tier: str | None = None
     eta_crit: float | None = None
+    #: TSS undefined because nothing was in flight (running + waiting == 0) while tokens
+    #: still completed. Classified HEALTHY/NEUTRAL (surplus side, never a receiver) and
+    #: exempt from the "Z missing -> incomplete" drop, see plan 6.4 idle rule.
+    signal_idle: bool = False
     eta_low: float | None = None
 
 
@@ -164,6 +168,28 @@ def classify_all_models(
         eta_crit = _float_or(control.get("receiver_thrashing_eff"), 200.0)
         eta_low = _float_or(control.get("donor_waste_eff"), 300.0)
         tau = TauThresholds.from_control(d_crit, d_high)
+
+        if _ctx_is_signal_idle(ctx):
+            # Plan 6.4 idle rule: A + W == 0 -> Z undefined. Not CRITICAL (a light model
+            # would otherwise read as starved), not UNKNOWN (it would be dropped from the
+            # plan); HEALTHY keeps it off the receiver list while util scale-down and the
+            # middle-zone donor path can still take surplus replicas from it.
+            results.append(
+                ModelClassification(
+                    model_name=model_name,
+                    state=ModelState.HEALTHY,
+                    role=ModelRole.NEUTRAL,
+                    Z_m=None,
+                    eta_m=ctx.get("eta_m"),
+                    trs=ctx.get("trs", 0.0),
+                    theta_m=ctx.get("theta_m"),
+                    tau=tau,
+                    eta_crit=eta_crit,
+                    eta_low=eta_low,
+                    signal_idle=True,
+                )
+            )
+            continue
 
         if _ctx_is_zero_load(ctx):
             results.append(
@@ -305,6 +331,15 @@ def _natural_text_key(value: str) -> tuple[tuple[int, Any], ...]:
 def _receiver_sort_key(classification: ModelClassification) -> tuple[int, float]:
     prio = 1 if classification.state == ModelState.CRITICAL else 2
     return (prio, classification.Z_m if classification.Z_m is not None else float("inf"))
+
+
+def _ctx_is_signal_idle(ctx: dict[str, Any] | None) -> bool:
+    """TSS was undefined (idle rule) while tokens still flowed, on the zm signal source."""
+    if not isinstance(ctx, dict) or ctx.get("tss_defined", True) is not False:
+        return False
+    if ctx.get("signal_source", "zm") != "zm":
+        return False
+    return not _ctx_is_zero_load(ctx)
 
 
 def _ctx_is_zero_load(ctx: dict[str, Any] | None) -> bool:

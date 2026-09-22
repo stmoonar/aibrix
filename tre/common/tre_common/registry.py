@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import logging
 import math
 from pathlib import Path
 from typing import Any
@@ -177,9 +178,18 @@ def _parse_node(raw: dict[str, Any]) -> NodeSpec:
     return NodeSpec(name=str(raw["name"]), gpus=int(raw["gpus"]), two_gpu_slots=slots, gpu_uuids=gpu_uuids)  # type: ignore[arg-type]
 
 
+LOG = logging.getLogger(__name__)
+
+
 def _parse_model(raw: dict[str, Any]) -> ModelSpec:
     slo = raw.get("slo") or {}
     trs = raw.get("trs") or {}
+    if float(trs.get("w_d", 1.0)) != 1.0:
+        # Schema-compatible, but the unified TSS (tre_common.tss) fixes w_d = 1.
+        LOG.warning(
+            "model %s: trs.w_d=%s is ignored; the unified TSS fixes w_d = 1",
+            raw.get("name"), trs.get("w_d"),
+        )
     return ModelSpec(
         name=str(raw["name"]),
         weights_path=str(raw["weights_path"]),

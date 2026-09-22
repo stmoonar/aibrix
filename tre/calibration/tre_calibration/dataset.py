@@ -5,7 +5,9 @@ import hashlib
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping, Sequence
+
+from tre_common.tss import DEFAULT_EMA_TAU_MS, TssEma, replica_factor, tss_queue, tss_terms
 
 
 _LATENCY_COLUMNS = {
@@ -27,11 +29,86 @@ class CalibrationWindow:
     # ``latency_ratio_p95`` is max(p95_metric / its SLO); ``latency_ratio_avg`` is the
     # same over average latencies and is None whenever the sweep did not record them
     # (the fit then falls back to the p95 ratio). ``queue_raw`` is the unfloored control
-    # queue lambda_wait*waiting + running + swapping, populated only when the loader is
-    # given ``lambda_wait``.
+    # TSS queue running + lambda_wait*waiting (tre_common.tss.tss_queue - no swapping
+    # term), populated only when the loader is given ``lambda_wait``.
     latency_ratio_p95: float | None = None
     latency_ratio_avg: float | None = None
     queue_raw: float | None = None
+
+
+@dataclass(frozen=True)
+class TssRecompute:
+    """Recompute the TSS signal from a window CSV's raw columns instead of reading the
+    ``trs`` column, under the given parameters and the shared definition
+    (:mod:`tre_common.tss`: rate numerator, qmin guard, idle rule, tau-EMA).
+
+    With ``ema_tau_ms`` set, each cell's windows are EMA'd in CSV order with the same
+    wall-clock time constant the controller uses, over *every* row of the cell (a row
+    later dropped by a filter still advanced the online EMA). ``ema_tau_ms=None`` scores
+    the raw signal.
+    """
+
+    w_p: float
+    lambda_wait: float
+    qmin: float = 1.0
+    ema_tau_ms: float | None = DEFAULT_EMA_TAU_MS
+
+    def as_dict(self) -> dict[str, float | None]:
+        return {
+            "w_p": self.w_p,
+            "lambda_wait": self.lambda_wait,
+            "qmin": self.qmin,
+            "ema_tau_ms": self.ema_tau_ms,
+        }
+
+
+def recompute_tss_rows(
+    rows: Sequence[Mapping[str, Any]], params: TssRecompute
+) -> list[float | None]:
+    """One TSS value per CSV row (``None`` = undefined or not computable).
+
+    Cells are contiguous blocks of rows (a new block starts when ``scenario_id`` changes
+    or ``window_end_ms`` goes backwards), which is how ``rewindow_from_raw`` writes them.
+    """
+    values: list[float | None] = []
+    ema: TssEma | None = None
+    prev_cell: str | None = None
+    prev_end: float | None = None
+    for row in rows:
+        start = _as_float(row.get("window_start_ms"))
+        end = _as_float(row.get("window_end_ms"))
+        if start is None or end is None:
+            raise ValueError("TSS recompute needs window_start_ms and window_end_ms columns")
+        cell = str(row.get("scenario_id") or "")
+        if ema is None or cell != prev_cell or (prev_end is not None and end < prev_end):
+            ema = TssEma(params.ema_tau_ms) if params.ema_tau_ms is not None else None
+        prev_cell, prev_end = cell, end
+        prompt = _as_float(row.get("prompt_tokens_total"))
+        generation = _as_float(row.get("generation_tokens_total"))
+        if prompt is None or generation is None:
+            values.append(None)  # tokens missing: the controller computes nothing either
+            continue
+        terms = tss_terms(
+            prompt_tokens=prompt,
+            generation_tokens=generation,
+            window_ms=end - start,
+            avg_running=_as_float(row.get("avg_running"), 0.0) or 0.0,
+            avg_waiting=_as_float(row.get("avg_waiting"), 0.0) or 0.0,
+            w_p=params.w_p,
+            lambda_wait=params.lambda_wait,
+            qmin=params.qmin,
+            kv_cache_hit_rate=_as_float(row.get("kv_cache_hit_rate"), 0.0) or 0.0,
+            avg_swapping=_as_float(row.get("avg_swapping"), 0.0) or 0.0,
+            factor=replica_factor(
+                _as_float(row.get("assigned_replicas"), 1.0) or 1.0,
+                _as_float(row.get("routable_pods"), 1.0) or 1.0,
+            ),
+        )
+        value = terms.raw
+        if ema is not None:
+            value = ema.update(value, end)
+        values.append(value)
+    return values
 
 
 def load_windows_from_csv(
@@ -42,6 +119,7 @@ def load_windows_from_csv(
     signal_transform: Callable[[Mapping[str, Any]], float | None] | None = None,
     trim_ramp_windows: int = 0,
     lambda_wait: float | None = None,
+    tss: TssRecompute | None = None,
 ) -> list[CalibrationWindow]:
     """Load per-window calibration rows from a load-scan CSV.
 
@@ -54,6 +132,9 @@ def load_windows_from_csv(
     registry value whenever the caller intends to run
     :func:`tre_calibration.fit.fit_delta_margins`, whose surplus labels need the
     queue depth; leave it None and the high-side margin falls back to its default.
+
+    ``tss`` recomputes the signal from the raw columns (see :class:`TssRecompute`) and
+    takes precedence over ``signal_column`` / ``signal_transform``.
     """
     active_columns = _resolve_latency_columns(latency_slo_ms)
     if not active_columns:
@@ -61,54 +142,58 @@ def load_windows_from_csv(
 
     windows: list[CalibrationWindow] = []
     with Path(path).open("r", encoding="utf-8", newline="") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            if _skip_row(row):
-                continue
+        all_rows = list(csv.DictReader(f))
+    recomputed = recompute_tss_rows(all_rows, tss) if tss is not None else None
+    for index, row in enumerate(all_rows):
+        if _skip_row(row):
+            continue
 
+        if recomputed is not None:
+            raw_signal: Any = recomputed[index]
+        else:
             raw_signal = (
                 signal_transform(row) if signal_transform is not None else row.get(signal_column)
             )
-            signal = _as_float(raw_signal)
-            if signal is None:
-                continue
-            prompt_tokens = _as_float(row.get("prompt_tokens_total"), 0.0) or 0.0
-            generation_tokens = _as_float(row.get("generation_tokens_total"), 0.0) or 0.0
-            if prompt_tokens + generation_tokens <= 0.0:
-                continue
+        signal = _as_float(raw_signal)
+        if signal is None:
+            continue
+        prompt_tokens = _as_float(row.get("prompt_tokens_total"), 0.0) or 0.0
+        generation_tokens = _as_float(row.get("generation_tokens_total"), 0.0) or 0.0
+        if prompt_tokens + generation_tokens <= 0.0:
+            continue
 
-            ratios: list[float] = []
-            missing_latency = False
-            for slo_key, column in active_columns.items():
-                value = _as_float(row.get(column))
-                if value is None:
-                    missing_latency = True
-                    break
-                ratios.append(value / float(latency_slo_ms[slo_key]))
-            if missing_latency or not ratios:
-                continue
+        ratios: list[float] = []
+        missing_latency = False
+        for slo_key, column in active_columns.items():
+            value = _as_float(row.get(column))
+            if value is None:
+                missing_latency = True
+                break
+            ratios.append(value / float(latency_slo_ms[slo_key]))
+        if missing_latency or not ratios:
+            continue
 
-            p95_ratio_max = max(ratios)
-            queue_raw: float | None = None
-            if lambda_wait is not None and _as_float(row.get("avg_running")) is not None:
-                queue_raw = (
-                    float(lambda_wait) * (_as_float(row.get("avg_waiting"), 0.0) or 0.0)
-                    + (_as_float(row.get("avg_running"), 0.0) or 0.0)
-                    + (_as_float(row.get("avg_swapping"), 0.0) or 0.0)
-                )
-            windows.append(
-                CalibrationWindow(
-                    scenario_id=(row.get("scenario_id") or "unknown").strip() or "unknown",
-                    scenario_family=(row.get("scenario_family") or "unknown").strip() or "unknown",
-                    signal=signal,
-                    slo_met=all(ratio <= 1.0 for ratio in ratios),
-                    health_score=1.0 / (1.0 + p95_ratio_max),
-                    window_start_ms=_as_float(row.get("window_start_ms")),
-                    latency_ratio_p95=p95_ratio_max,
-                    latency_ratio_avg=_avg_latency_ratio(row, latency_slo_ms),
-                    queue_raw=queue_raw,
-                )
+        p95_ratio_max = max(ratios)
+        queue_raw: float | None = None
+        if lambda_wait is not None and _as_float(row.get("avg_running")) is not None:
+            queue_raw = tss_queue(
+                _as_float(row.get("avg_running"), 0.0) or 0.0,
+                _as_float(row.get("avg_waiting"), 0.0) or 0.0,
+                float(lambda_wait),
             )
+        windows.append(
+            CalibrationWindow(
+                scenario_id=(row.get("scenario_id") or "unknown").strip() or "unknown",
+                scenario_family=(row.get("scenario_family") or "unknown").strip() or "unknown",
+                signal=signal,
+                slo_met=all(ratio <= 1.0 for ratio in ratios),
+                health_score=1.0 / (1.0 + p95_ratio_max),
+                window_start_ms=_as_float(row.get("window_start_ms")),
+                latency_ratio_p95=p95_ratio_max,
+                latency_ratio_avg=_avg_latency_ratio(row, latency_slo_ms),
+                queue_raw=queue_raw,
+            )
+        )
     return trim_scenario_ramp_windows(windows, count=trim_ramp_windows)
 
 

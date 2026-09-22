@@ -62,7 +62,7 @@ def test_trs_computer_matches_legacy_sequence() -> None:
             generation_tokens_total=2200.0,
             avg_waiting=2.0,
             avg_running=2.0,
-            avg_swapping=1.0,
+            avg_swapping=0.0,  # was 1.0: swapping left the TSS denominator (plan 6.4)
             routable_pods=3,
             assigned_replicas=3,
             kv_cache_hit_rate=0.5,
@@ -81,7 +81,8 @@ def test_trs_computer_matches_legacy_sequence() -> None:
 
     for item in inputs:
         expected = legacy.compute(item, theta_m=750.0)
-        actual = migrated.compute(TRSInput(**item.__dict__), theta_m=750.0)
+        # Unified TSS == legacy formula at a 1 s window (rate == total), swapping 0.
+        actual = migrated.compute(TRSInput(**item.__dict__, window_ms=1000.0), theta_m=750.0)
         _assert_trs_result_equal(actual, expected)
         assert migrated.snapshot() == pytest.approx(legacy.snapshot())
 
@@ -103,7 +104,7 @@ def test_trs_restore_matches_legacy_state() -> None:
     )
 
     _assert_trs_result_equal(
-        migrated.compute(TRSInput(**item.__dict__), theta_m=25.0),
+        migrated.compute(TRSInput(**item.__dict__, window_ms=1000.0), theta_m=25.0),
         legacy.compute(item, theta_m=25.0),
     )
 
