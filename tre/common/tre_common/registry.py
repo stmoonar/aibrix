@@ -14,6 +14,11 @@ class SloSpec:
     ttft_p95_ms: float
     tpot_p95_ms: float
     e2e_p95_ms: float
+    #: Idle (isolated-request) TTFT fit ``c + b * prompt_tokens`` that the calibration
+    #: label's slowdown TTFT SLO scales (plan 2026-09-21 6.9h, D6). Optional: absent in
+    #: older registries, and nothing online reads it.
+    ttft_idle_c_ms: float | None = None
+    ttft_idle_b_ms_per_token: float | None = None
 
 
 ALT_THRESHOLD_DIRECTIONS = {"higher_is_healthier", "lower_is_healthier"}
@@ -232,6 +237,12 @@ def _parse_model(raw: dict[str, Any]) -> ModelSpec:
             ttft_p95_ms=float(slo["ttft_p95_ms"]),
             tpot_p95_ms=float(slo["tpot_p95_ms"]),
             e2e_p95_ms=float(slo["e2e_p95_ms"]),
+            ttft_idle_c_ms=(float(slo["ttft_idle_c_ms"]) if slo.get("ttft_idle_c_ms") is not None else None),
+            ttft_idle_b_ms_per_token=(
+                float(slo["ttft_idle_b_ms_per_token"])
+                if slo.get("ttft_idle_b_ms_per_token") is not None
+                else None
+            ),
         ),
         trs=TrsParams(
             w_p=float(trs["w_p"]),

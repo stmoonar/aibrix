@@ -148,6 +148,10 @@ PRIMARY_LAMBDA_WAIT = 3.0
 SECONDARY_LAMBDA_WAIT = 0.0
 SECONDARY_FIT_TOLERANCE = 0.05
 
+#: TTFT SLO of the fit label (tre_calibration.labels): the length-normalised slowdown SLO
+#: of plan 2026-09-21 6.9h / D6. ``--fit-ttft-slo-mode fixed`` restores the 500 ms label.
+DEFAULT_FIT_TTFT_SLO_MODE = "slowdown"
+
 
 def utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -919,7 +923,7 @@ def fit_plan(
     """
     # Imported here, not at module level: the campaign driver itself must stay runnable
     # on a PYTHONPATH without the calibration package.
-    from tre_calibration.labels import LabelDefinition
+    from tre_calibration.labels import label_cli_args, label_def_from_args
     from tre_common.tss import DEFAULT_EMA_TAU_MS
 
     fit_dir = out_dir / "fit"
@@ -952,7 +956,8 @@ def fit_plan(
             ),
         },
         "order": ["rewindow", "theta", "verdict", "ablation", "alt", "holdout"],
-        "label_def": LabelDefinition(args.ttft_slo_ms, args.tpot_slo_ms).as_dict(),
+        "label_def": None,  # filled per model below
+        "label_def_by_model": {},
         "ema_tau_ms": DEFAULT_EMA_TAU_MS,
         "rewindow": [],
         "theta": [],
@@ -993,8 +998,23 @@ def fit_plan(
     exclusions: list[str] = []
     for cell_id in held_out_cells:
         exclusions += ["--exclude-cell-id", cell_id]
-    slo = ["--ttft-p95-ms", str(args.ttft_slo_ms), "--tpot-p95-ms", str(args.tpot_slo_ms)]
     registry = _load_registry(getattr(args, "registry", None))
+    # The fit label (tre_calibration.labels): slowdown TTFT SLO by default (plan 6.9h,
+    # D6) - each model's idle TTFT fit comes from the registry - or the fixed one.
+    label_args = argparse.Namespace(
+        ttft_p95_ms=args.ttft_slo_ms,
+        tpot_p95_ms=args.tpot_slo_ms,
+        ttft_slo_mode=getattr(args, "fit_ttft_slo_mode", DEFAULT_FIT_TTFT_SLO_MODE),
+        ttft_slowdown_k=getattr(args, "fit_ttft_slowdown_k", 3.0),
+        ttft_floor_ms=getattr(args, "fit_ttft_floor_ms", 150.0),
+        ttft_idle_c_ms=None,
+        ttft_idle_b_ms_per_token=None,
+        min_completed_requests=getattr(args, "fit_min_completed_requests", 20),
+        label_registry=getattr(args, "registry", None),
+    )
+    for model in models:
+        plan["label_def_by_model"][model] = label_def_from_args(label_args, model).as_dict()
+    plan["label_def"] = plan["label_def_by_model"][models[0]] if models else None
     live = [
         "--window-ms", str(args.window_ms), "--step-ms", str(args.fit_step_ms),
         "--instant-grid", "live", "--instant-sample-ms", str(LIVE_GRID_MS),
@@ -1002,6 +1022,7 @@ def fit_plan(
     fitting_by_model: dict[str, Path] = {}
     for model in models:
         w_p = float(registry.model(model).trs.w_p)
+        slo = label_cli_args(label_def_from_args(label_args, model))
         fitting_csv = fit_dir / f"{model}_fitting.csv"
         aliasing_csv = fit_dir / f"{model}_aliasing.csv"
         validation_csv = fit_dir / f"{model}_validation.csv"
@@ -1170,7 +1191,9 @@ def fit_plan(
                     for family in sorted(families)
                     for a in ("--family", f"{m}:{family}={fit_dir / f'{m}_fitting_{family}.csv'}")
                 ],
-                *slo,
+                # several models in one fit: each resolves its own idle TTFT fit from the
+                # registry, so the per-model c/b overrides are left out here.
+                *_without_idle_fit(slo),
                 "--signal", signal,
                 "--label-lambda-wait", str(PRIMARY_LAMBDA_WAIT),
                 "--ema-tau-ms", str(DEFAULT_EMA_TAU_MS),
@@ -1184,6 +1207,20 @@ def fit_plan(
 
 #: The alternative signals of the ablation (tre_calibration.alt_signals.ALT_SIGNALS).
 ALT_SIGNALS = ("queue_len", "decode_tps", "prefill_tps")
+
+
+def _without_idle_fit(label_args: Sequence[str]) -> list[str]:
+    out: list[str] = []
+    skip = False
+    for arg in label_args:
+        if skip:
+            skip = False
+            continue
+        if arg in ("--ttft-idle-c-ms", "--ttft-idle-b-ms-per-token"):
+            skip = True
+            continue
+        out.append(arg)
+    return out
 
 
 def ablation_arms(w_p: float) -> list[tuple[str, float, float]]:
@@ -1593,6 +1630,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--step-transient-s", type=float, default=DEFAULT_STEP_TRANSIENT_S)
     ap.add_argument("--ttft-slo-ms", type=float, default=500.0)
     ap.add_argument("--tpot-slo-ms", type=float, default=75.0)
+    ap.add_argument("--fit-ttft-slo-mode", choices=["fixed", "slowdown"], default=DEFAULT_FIT_TTFT_SLO_MODE,
+                    help="TTFT SLO of the fit label: slowdown = max(floor, k*(c_m+b_m*L)) with the "
+                         "registry's idle TTFT fit (plan 6.9h); fixed = --ttft-slo-ms")
+    ap.add_argument("--fit-ttft-slowdown-k", type=float, default=3.0)
+    ap.add_argument("--fit-ttft-floor-ms", type=float, default=150.0)
+    ap.add_argument("--fit-min-completed-requests", type=int, default=20)
     ap.add_argument("--min-slo-windows", type=int, default=3)
     ap.add_argument("--max-model-error-rate", type=float,
                     default=openloop.DEFAULT_MAX_MODEL_ERROR_RATE,

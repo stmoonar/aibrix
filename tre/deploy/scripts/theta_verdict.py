@@ -57,7 +57,7 @@ from tre_calibration.fit import (
     signal_z,
     threshold_balanced_accuracy,
 )
-from tre_calibration.labels import LabelDefinition
+from tre_calibration.labels import LabelDefinition, add_label_arguments, label_def_from_args
 from tre_calibration.profile import theta_fit_block
 from tre_common.tss import DEFAULT_EMA_TAU_MS, TSS_UNITS
 
@@ -100,11 +100,11 @@ class SignalSpec:
     def load(self, path: str | Path, label: LabelDefinition, trim: int) -> list[CalibrationWindow]:
         if self.signal == "tss":
             return load_windows_from_csv(
-                path, latency_slo_ms=label.latency_slo_ms(), trim_ramp_windows=trim,
+                path, latency_slo_ms=label, trim_ramp_windows=trim,
                 lambda_wait=self.label_lambda_wait, tss=self.tss,
             )
         return load_windows_from_csv(
-            path, latency_slo_ms=label.latency_slo_ms(), trim_ramp_windows=trim,
+            path, latency_slo_ms=label, trim_ramp_windows=trim,
             lambda_wait=self.label_lambda_wait,
             signal_transform=alt_signal_transform(self.signal),
             ema_tau_ms=self.ema_tau_ms,
@@ -181,7 +181,7 @@ def _waiting_stats(path: str | Path, label: LabelDefinition) -> dict[str, Any]:
     total = nonzero = viol = viol_nonzero = 0
     with Path(path).open(newline="", encoding="utf-8") as fh:
         for row in csv.DictReader(fh):
-            lab = label_window(row, label.latency_slo_ms())
+            lab = label_window(row, label)
             if lab is None:
                 continue
             waiting = float(row.get("avg_waiting") or 0.0)
@@ -210,6 +210,25 @@ def _ranking(windows: Sequence[CalibrationWindow], direction: str) -> dict[str, 
         "zero_value_fraction": (sum(1 for w in finite if w.signal == 0.0) / len(finite)) if finite else None,
         "distinct_values": len({w.signal for w in finite}),
     }
+
+
+VIOLATION_CLASSES = ("ttft_only", "tpot_only", "both", "unserved")
+
+
+def violation_class_breakdown(
+    windows: Sequence[CalibrationWindow], *, theta: float, tau_crit: float | None, direction: str,
+) -> dict[str, Any]:
+    """Violating windows per label class (TTFT-only / TPOT-only / both / unserved) and,
+    given tau_crit, the CRITICAL recall of each class - plan 6.9f criteria B/C."""
+    out: dict[str, Any] = {}
+    for cls in VIOLATION_CLASSES:
+        members = [w for w in windows if not w.slo_met and w.violation_class == cls]
+        entry: dict[str, Any] = {"windows": len(members)}
+        if tau_crit is not None:
+            z = _z(members, theta, direction)
+            entry["critical_recall"] = (sum(1 for v in z if v < tau_crit) / len(members)) if members else None
+        out[cls] = entry
+    return out
 
 
 def verdict_report(
@@ -318,6 +337,9 @@ def verdict_report(
                 "ci_half_width_fraction": half / theta,
             },
             "near_theta": {"band": BOUNDARY_BAND, "windows": band_n, "violating": band_viol},
+            "violation_classes": violation_class_breakdown(
+                windows, theta=theta, tau_crit=delta.crit.tau, direction=direction,
+            ),
             "delta_crit": {
                 "method": delta.crit.method,
                 "delta": delta.crit.delta,
@@ -364,7 +386,7 @@ def verdict_report(
 
 
 def cmd_verdict(args: argparse.Namespace) -> dict[str, Any]:
-    label = LabelDefinition(args.ttft_p95_ms, args.tpot_p95_ms)
+    label = label_def_from_args(args, args.model)
     try:
         spec = build_signal_spec(
             args.signal, w_p=args.w_p, lambda_wait=args.lambda_wait, qmin=args.qmin,
@@ -387,7 +409,7 @@ def cmd_verdict(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def holdout_report(verdict: Mapping[str, Any], validation_csv: str | Path) -> dict[str, Any]:
-    label = LabelDefinition(verdict["label_def"]["ttft_p95_ms"], verdict["label_def"]["tpot_p95_ms"])
+    label = LabelDefinition.from_dict(verdict["label_def"])
     if "signal_spec" in verdict:
         spec = SignalSpec.from_dict(verdict["signal_spec"])
     else:  # verdicts written before the signal parameter
@@ -426,6 +448,9 @@ def holdout_report(verdict: Mapping[str, Any], validation_csv: str | Path) -> di
         "ranking": _ranking(windows, direction) if windows else None,
         "critical_recall_of_violating": crit_recall,
         "critical_false_alarm_on_healthy": crit_false_alarm,
+        "violation_classes": violation_class_breakdown(
+            windows, theta=theta, tau_crit=tau_crit, direction=direction,
+        ),
         "note": "windows carry the fit's EMA (TSS recompute / signal_ema); no dwell - the plan's acceptance adds dwell on the live path",
     }
     opposite = (verdict.get("merged") or {}).get("opposite_direction") or {}
@@ -460,8 +485,7 @@ def _parse(argv: Sequence[str] | None) -> argparse.Namespace:
     )
     v.add_argument("--qmin", type=float, default=1.0)
     v.add_argument("--ema-tau-ms", type=float, default=DEFAULT_EMA_TAU_MS)
-    v.add_argument("--ttft-p95-ms", type=float, required=True)
-    v.add_argument("--tpot-p95-ms", type=float, required=True)
+    add_label_arguments(v)
     v.add_argument("--trim-ramp-windows", type=int, default=1)
     v.add_argument("--n-resamples", type=int, default=1000)
     v.add_argument("--family-resamples", type=int, default=200)

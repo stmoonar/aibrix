@@ -64,6 +64,7 @@ from statistics import median
 from typing import Iterable, Mapping, Optional, Sequence
 
 from tre_common.metrics_schema import ModelWindowMetrics
+from tre_calibration.labels import format_ttft_len_samples
 from tre_common.percentile import histogram_percentile
 from tre_common.rediskeys import SCRAPE_INTERVAL_MS
 
@@ -446,6 +447,25 @@ def aggregate_window(
     )
 
 
+def window_request_evidence(records: list[dict], window_start_ms: int, window_end_ms: int) -> dict:
+    """The per-request columns the slowdown TTFT label reads (tre_calibration.labels).
+
+    Same window membership as :func:`aggregate_window` (completion time, half-open).
+    ``completed_requests`` counts requests with a TTFT sample - the ones a TTFT percentile
+    is taken over; ``ttft_len_samples`` pairs each TTFT with the request's vLLM-reported
+    prompt length (raw ``input_tokens`` = ``usage.prompt_tokens``).
+    """
+    done = [
+        r for r in records
+        if r.get("done_ts_ms") is not None and window_start_ms <= r["done_ts_ms"] < window_end_ms
+        and r.get("ttft_ms") is not None
+    ]
+    return {
+        "completed_requests": len(done),
+        "ttft_len_samples": format_ttft_len_samples((r["ttft_ms"], r.get("input_tokens")) for r in done),
+    }
+
+
 def _time_span(records: list[dict], instant_samples: list[dict]) -> Optional[tuple[int, int]]:
     dones = [r["done_ts_ms"] for r in records if r.get("done_ts_ms") is not None]
     insts = [s["ts_ms"] for s in instant_samples if s.get("ts_ms") is not None]
@@ -514,6 +534,8 @@ def rewindow_cell(
         r3_grid.window_row(cell, wm, result.TRS if result.defined else None, result.Q_ctl)
         for wm, result in zip(metrics, results)
     ]
+    for row, (ws, we) in zip(rows, windows_ms):
+        row.update(window_request_evidence(records, ws, we))
     return openloop.mark_unserved_request_windows(rows, list(failures))
 
 

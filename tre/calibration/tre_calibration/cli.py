@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Sequence
 
 from tre_calibration.dataset import TssRecompute, load_windows_from_csv
-from tre_calibration.labels import LabelDefinition
+from tre_calibration.labels import add_label_arguments, count_label_exclusions, label_def_from_args
 from tre_common.tss import DEFAULT_EMA_TAU_MS, TSS_UNITS
 from tre_calibration.evaluate import evaluate_signal_direction
 from tre_calibration.fit import (
@@ -32,6 +32,13 @@ from tre_calibration.profile import build_profile_patch
 from tre_calibration.signals import ParameterCandidateScore
 
 
+def _label_exclusions(path: str, label_def) -> dict:
+    import csv
+
+    with Path(path).open("r", encoding="utf-8", newline="") as fh:
+        return count_label_exclusions(csv.DictReader(fh), label_def)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(argv)
     if args.e2e_p95_ms is not None:
@@ -39,7 +46,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "--e2e-p95-ms is no longer accepted: the shared label (tre_calibration.labels) "
             "is p95 TTFT/TPOT + unserved; e2e is excluded (plan 6.3 B4)"
         )
-    label_def = LabelDefinition(args.ttft_p95_ms, args.tpot_p95_ms)
+    label_def = label_def_from_args(args, args.model_name)
     latency_slo_ms = label_def.latency_slo_ms()
 
     healthy_quantiles = (
@@ -64,7 +71,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     windows = load_windows_from_csv(
         args.input,
-        latency_slo_ms=latency_slo_ms,
+        latency_slo_ms=label_def,
         signal_column=args.signal_column,
         trim_ramp_windows=args.trim_ramp_windows,
         lambda_wait=args.lambda_wait,
@@ -148,6 +155,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
 
     patch["label_def"] = label_def.as_dict()
+    patch["label_exclusions"] = _label_exclusions(args.input, label_def)
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(patch, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -177,8 +185,7 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
             "the value used is always recorded in the artifact's fit_config."
         ),
     )
-    parser.add_argument("--ttft-p95-ms", type=float, required=True)
-    parser.add_argument("--tpot-p95-ms", type=float, required=True)
+    add_label_arguments(parser)
     parser.add_argument("--e2e-p95-ms", type=float, help="rejected: e2e is not part of the label")
     parser.add_argument(
         "--theta-criterion",
