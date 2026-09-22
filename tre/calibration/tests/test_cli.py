@@ -98,13 +98,13 @@ def _write_csv(tmp_path):
     return src
 
 
-def _row(scenario_id: str, family: str, trs: float, p95_ttft: float, p95_tpot: float) -> dict[str, str]:
+def _row(scenario_id: str, family: str, trs: float, p95_ttft_client_ms: float, p95_tpot_client_ms: float) -> dict[str, str]:
     return {
         "scenario_id": scenario_id,
         "scenario_family": family,
         "trs": str(trs),
-        "p95_ttft": str(p95_ttft),
-        "p95_tpot": str(p95_tpot),
+        "p95_ttft_client_ms": str(p95_ttft_client_ms),
+        "p95_tpot_client_ms": str(p95_tpot_client_ms),
         "prompt_tokens_total": "100",
         "generation_tokens_total": "50",
     }

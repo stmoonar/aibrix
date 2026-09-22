@@ -265,9 +265,9 @@ def _write_window_csv(path: Path) -> Path:
         "queue_control",
         "prompt_tokens_total",
         "generation_tokens_total",
-        "p95_ttft",
-        "p95_tpot",
-        "p95_e2e",
+        "p95_ttft_client_ms",
+        "p95_tpot_client_ms",
+        "p95_e2e_client_ms",
     ]
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields, lineterminator="\n")
@@ -283,9 +283,9 @@ def _write_window_csv(path: Path) -> Path:
                     "queue_control": signal,
                     "prompt_tokens_total": signal,
                     "generation_tokens_total": signal,
-                    "p95_ttft": 400.0 if slo_met else 600.0,
-                    "p95_tpot": 50.0,
-                    "p95_e2e": 1000.0,
+                    "p95_ttft_client_ms": 400.0 if slo_met else 600.0,
+                    "p95_tpot_client_ms": 50.0,
+                    "p95_e2e_client_ms": 1000.0,
                 }
             )
     return path

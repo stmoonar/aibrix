@@ -17,8 +17,10 @@ at which the shape actually starts violating its SLO, and dwells just under it. 
 replaces the fixed rho grid: theta is a threshold on the signal at the moment the SLO
 breaks, so windows taken far from that moment - on either side - barely constrain it,
 and a grid centred on a prior with a 25 % error is centred on a guess. Three stages,
-about 12 minutes of offered load per shape: coarse 3 x 60 s, bisect 2 x 120 s, dwell
-300 s at ``0.95 rho*``.
+about 13.5 minutes of offered load per shape: coarse 3 x 90 s, bisect 2 x 120 s, dwell
+300 s at ``0.95 rho*``. A probe is judged on the fitting re-window's own windows and
+label (see :mod:`scripts.adaptive_boundary`), so the boundary is located with the ruler
+the fit then measures the evidence with.
 
 The **ramp** is regenerated from the measured capacity rather than from the prior, and
 **bursts** run last because they are the only primitive that can be skipped outright, so
@@ -80,10 +82,17 @@ order, with its provenance), ``capacity/<model>_<shape>.json`` (prior vs measure
 generated mid-campaign, and ``fit_plan.json`` - the re-windowing and refit invocations
 the capture is meant to be consumed by, including the cadence each one must use and the
 per-family control fits.
+
+When the campaign ends - complete, stopped or crashed - it writes
+``campaign_status.json`` and converts its own directory into the standard dataset
+(``<out-dir>/dataset/``, see :mod:`scripts.calibration_dataset`). When every sibling
+campaign under the same parent has finished too, the last one to finish also builds the
+merged dataset of the whole run at ``<parent>/dataset/``.
 """
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import subprocess
@@ -93,6 +102,8 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Sequence
+
+from tre_common import slo_labels
 
 from scripts import adaptive_boundary as boundary
 from scripts import admission_cap as admission
@@ -158,8 +169,9 @@ class StepLevel:
     offered_rps: float
     achieved_rps: float
     completions: int
-    p95_ttft_ms: Optional[float]
-    p95_tpot_ms: Optional[float]
+    #: Client per-request latency, nearest-rank p95 over the level's steady part.
+    p95_ttft_client_ms: Optional[float]
+    p95_tpot_client_ms: Optional[float]
     slo_met: bool
     saturated: bool
 
@@ -270,8 +282,8 @@ def measure_capacity_from_steps(
                 offered_rps=round(offered, 4),
                 achieved_rps=round(achieved, 4),
                 completions=len(window),
-                p95_ttft_ms=None if p95_ttft is None else round(p95_ttft, 3),
-                p95_tpot_ms=None if p95_tpot is None else round(p95_tpot, 3),
+                p95_ttft_client_ms=None if p95_ttft is None else round(p95_ttft, 3),
+                p95_tpot_client_ms=None if p95_tpot is None else round(p95_tpot, 3),
                 slo_met=slo_met,
                 saturated=saturated,
             )
@@ -502,8 +514,15 @@ def cell_command(cell: Cell, args, schedule_path: Path, output: Path) -> list[st
         "--cell-id", cell.cell_id,
         "--output", str(output),
         "--raw-dir", str(args.raw_dir),
+        # The fitting re-window's windows: the online rows a probe is judged on are then
+        # the rows the fit is built from, window for window.
         "--window-ms", str(args.window_ms),
+        "--step-ms", str(args.fit_step_ms),
         "--instant-sample-ms", str(args.instant_sample_ms),
+        # The server-side p95 columns (diagnostic only) are read once per sliding window;
+        # the gateway's zsets answer in ~6 ms a model where the legacy key SCAN takes
+        # ~650 ms, which over a 5 s step would add minutes to every cell.
+        "--metrics-schema", "v2",
         "--namespace", args.model_namespace,
         "--guard-mode", args.guard_mode,
         "--min-slo-windows", str(args.min_slo_windows),
@@ -646,11 +665,20 @@ def drive_until_valid(
 # ------------------------------------------------------------------ boundary search
 
 
+#: Float columns of the window CSV, parsed when it is read back.
+_FLOAT_COLUMNS = (
+    slo_labels.P95_TTFT_CLIENT, slo_labels.P95_TPOT_CLIENT, slo_labels.P95_E2E_CLIENT,
+    slo_labels.P95_TTFT_SERVER, slo_labels.P95_TPOT_SERVER, slo_labels.P95_E2E_SERVER,
+    "trs",
+)
+
+
 def read_window_rows(path: Path) -> list[dict]:
     """Window rows back out of an ``r3_grid`` CSV, typed enough to judge a probe by.
 
     A voided cell writes an empty CSV, which reads back as zero rows - which is exactly
     what the boundary search must see: no evidence, not evidence of health.
+    ``slo_violated`` reads back as True / False / None (unlabeled), never as a bare False.
     """
     import csv
 
@@ -661,11 +689,15 @@ def read_window_rows(path: Path) -> list[dict]:
     with path.open("r", newline="", encoding="utf-8") as fh:
         for raw in csv.DictReader(fh):
             row = dict(raw)
-            for key in ("p95_ttft", "p95_tpot", "p95_e2e", "trs"):
+            for key in _FLOAT_COLUMNS:
                 value = row.get(key)
-                row[key] = None if value in (None, "") else float(value)
-            row["slo_violated"] = str(row.get("slo_violated", "")).lower() in ("true", "1")
-            row["model_errors"] = int(row.get("model_errors") or 0)
+                row[key] = None if value in (None, "", "None") else float(value)
+            for key in slo_labels.UNSERVED_COLUMNS:
+                row[key] = int(float(row.get(key) or 0))
+            flag = str(row.get(slo_labels.VIOLATED_COLUMN, "")).strip().lower()
+            row[slo_labels.VIOLATED_COLUMN] = (
+                True if flag in ("true", "1") else False if flag in ("false", "0") else None
+            )
             rows.append(row)
     return rows
 
@@ -681,29 +713,36 @@ def probe_result_from_cell(
 ) -> boundary.ProbeResult:
     """Turn one driven hold cell into the verdict the search consumes.
 
-    A cell the guard voided is reported ``valid=False`` and its (empty) rows are never
-    consulted. That is the difference between "this load did not violate" and "we did not
-    manage to offer this load", and conflating them walks the bracket upwards on every
-    infrastructure hiccup.
+    A cell the guard voided is :data:`~scripts.adaptive_boundary.VERDICT_VOID` and its
+    (empty) rows are never consulted. That is the difference between "this load did not
+    violate" and "we did not manage to offer this load", and conflating them walks the
+    bracket upwards on every infrastructure hiccup. A cell that was not voided but gave
+    too little evidence - no rows at all included - is
+    :data:`~scripts.adaptive_boundary.VERDICT_INCONCLUSIVE`, which the search answers
+    with a longer re-drive, never with a healthy verdict.
     """
     void_reasons = tuple(str(r) for r in (guard.get("void_reasons") or ()))
-    valid = not void_reasons and bool(rows)
-    violated, violating, total = boundary.probe_violated(
-        rows, ttft_slo_ms=ttft_slo_ms, tpot_slo_ms=tpot_slo_ms
-    )
-    if not valid and not void_reasons:
-        void_reasons = ("no windows",)
     goodput_value = None
     body = guard.get("goodput")
     if isinstance(body, dict):
         goodput_value = body.get("goodput")
+    if void_reasons:
+        return boundary.ProbeResult(
+            probe=probe,
+            verdict=boundary.VERDICT_VOID,
+            void_reasons=void_reasons,
+            windows=len(rows),
+            goodput=goodput_value,
+            cell_id=cell_id,
+        )
+    verdict = boundary.probe_verdict(rows, ttft_slo_ms=ttft_slo_ms, tpot_slo_ms=tpot_slo_ms)
     return boundary.ProbeResult(
         probe=probe,
-        violated=bool(violated) if valid else False,
-        valid=valid,
-        void_reasons=void_reasons,
-        windows=total,
-        violating_windows=violating,
+        verdict=verdict.verdict,
+        windows=verdict.windows,
+        labeled_windows=verdict.labeled_windows,
+        independent_windows=verdict.independent_windows,
+        violating_windows=verdict.violating_windows,
         goodput=goodput_value,
         cell_id=cell_id,
     )
@@ -898,6 +937,9 @@ def fit_plan(
             },
         },
     }
+    # The slo_label column of every re-windowed CSV is computed against the SLO the
+    # campaign pinned, the same one its probes were judged against.
+    slo_args = ["--ttft-slo-ms", str(args.ttft_slo_ms), "--tpot-slo-ms", str(args.tpot_slo_ms)]
     exclusions: list[str] = []
     for cell_id in held_out_cells:
         exclusions += ["--exclude-cell-id", cell_id]
@@ -917,6 +959,7 @@ def fit_plan(
                 "--window-ms", str(args.window_ms), "--step-ms", str(args.fit_step_ms),
                 "--instant-grid", "live",
                 "--instant-sample-ms", str(LIVE_GRID_MS),
+                *slo_args,
                 *exclusions,
             ],
         })
@@ -932,6 +975,7 @@ def fit_plan(
                 "--window-ms", str(args.window_ms), "--step-ms", str(args.fit_step_ms),
                 "--instant-grid", "raw",
                 "--instant-sample-ms", str(args.instant_sample_ms),
+                *slo_args,
                 *exclusions,
             ],
         })
@@ -948,6 +992,7 @@ def fit_plan(
                     "--window-ms", str(args.window_ms), "--step-ms", str(args.fit_step_ms),
                     "--instant-grid", "live",
                     "--instant-sample-ms", str(LIVE_GRID_MS),
+                    *slo_args,
                     *[a for cell_id in held_out_cells for a in ("--only-cell-id", cell_id)],
                 ],
             })
@@ -991,6 +1036,7 @@ def fit_plan(
                     "--window-ms", str(args.window_ms), "--step-ms", str(args.fit_step_ms),
                     "--instant-grid", "live",
                     "--instant-sample-ms", str(LIVE_GRID_MS),
+                    *slo_args,
                     *[a for cell_id in cell_ids for a in ("--only-cell-id", cell_id)],
                 ],
             })
@@ -1064,10 +1110,13 @@ def drive_boundary_search(
     """
     def drive(probe, cell_id, body, meta):
         stem = f"{cell.shape}_{gen.HOLD_PRIMITIVE}{gen.hold_load_code(probe.rho)}"
-        schedule_path = schedule_dir / cell.model / f"{stem}.json"
+        # A re-drive gets its own schedule file: an inconclusive probe is re-driven for
+        # longer, and overwriting attempt 1's schedule would lose what attempt 1 ran.
+        schedule_stem = stem if probe.attempt <= 1 else f"{stem}_a{probe.attempt}"
+        schedule_path = schedule_dir / cell.model / f"{schedule_stem}.json"
         schedule_path.parent.mkdir(parents=True, exist_ok=True)
         schedule_path.write_text(json.dumps(body, indent=2) + "\n", encoding="utf-8")
-        (schedule_path.parent / f"{stem}.meta.json").write_text(
+        (schedule_path.parent / f"{schedule_stem}.meta.json").write_text(
             json.dumps(meta, indent=2) + "\n", encoding="utf-8"
         )
         probe_cell = Cell(
@@ -1109,7 +1158,102 @@ def drive_boundary_search(
     )
 
 
+def registry_path_for(args) -> Path:
+    """The registry file this campaign's cells load (the r3_grid default when unset)."""
+    if getattr(args, "registry", None):
+        return Path(args.registry)
+    return Path(__file__).resolve().parents[1] / "registry.yaml"
+
+
+def file_sha256(path: Path) -> Optional[str]:
+    try:
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def git_state(worktree: Path) -> dict:
+    """The code commit a run was made with, and whether the tree had local changes."""
+    def git(*argv: str) -> Optional[str]:
+        try:
+            proc = subprocess.run(
+                ["git", "-C", str(worktree), *argv],
+                capture_output=True, text=True, timeout=10, check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return proc.stdout.strip() if proc.returncode == 0 else None
+
+    status = git("status", "--porcelain", "--untracked-files=no")
+    return {
+        "commit": git("rev-parse", "HEAD"),
+        "dirty": None if status is None else bool(status),
+    }
+
+
+def run_provenance(args) -> dict:
+    """What a run was made with, recorded before it drives anything."""
+    registry = registry_path_for(args)
+    return {
+        "code": git_state(Path(__file__).resolve().parents[2]),
+        "registry_path": str(registry),
+        "registry_sha256": file_sha256(registry),
+        "window_ms": args.window_ms,
+        "step_ms": args.fit_step_ms,
+        "instant_sample_ms": args.instant_sample_ms,
+        "label": slo_labels.label_definition(
+            slo_labels.slo_targets(ttft_slo_ms=args.ttft_slo_ms, tpot_slo_ms=args.tpot_slo_ms),
+            min_latency_samples=getattr(args, "min_latency_samples", 10),
+        ),
+        "boundary": {
+            "coarse_seconds": boundary.COARSE_SECONDS,
+            "min_probe_windows": boundary.MIN_PROBE_WINDOWS,
+            "violation_window_fraction": boundary.VIOLATION_WINDOW_FRACTION,
+            "inconclusive_duration_factor": boundary.INCONCLUSIVE_DURATION_FACTOR,
+        },
+    }
+
+
+CAMPAIGN_STATUS_FILE = "campaign_status.json"
+
+
+def finalize_run(out_dir: Path, *, status: str, exit_code: int) -> None:
+    """Record how the campaign ended, then build the standard dataset.
+
+    Never raises: the dataset is a conversion of what is on disk and can always be
+    rebuilt by hand (``python -m scripts.calibration_dataset <run>``); a failure here
+    must not turn a finished campaign into a failed one.
+    """
+    out_dir = Path(out_dir)
+    (out_dir / CAMPAIGN_STATUS_FILE).write_text(
+        json.dumps(
+            {"status": status, "exit_code": exit_code, "finished_at_utc": utc_iso()},
+            indent=2,
+        ) + "\n",
+        encoding="utf-8",
+    )
+    try:
+        from scripts import calibration_dataset
+
+        built = calibration_dataset.build_dataset(out_dir)
+        print(f"standard dataset: {built}")
+        parent = out_dir.parent
+        siblings = calibration_dataset.campaign_dirs(parent)
+        if len(siblings) > 1 and all((d / CAMPAIGN_STATUS_FILE).exists() for d in siblings):
+            merged = calibration_dataset.build_dataset(parent)
+            print(f"every campaign under {parent} has finished; merged dataset: {merged}")
+    except Exception as exc:  # noqa: BLE001 - see docstring
+        print(f"WARNING: building the standard dataset failed ({exc!r}); rebuild it with "
+              f"python -m scripts.calibration_dataset {out_dir}")
+
+
 def run_campaign(args) -> int:
+    if boundary.COARSE_SECONDS < boundary.min_probe_seconds(args.window_ms):
+        raise SystemExit(
+            f"a {boundary.COARSE_SECONDS:g} s coarse probe cannot hold "
+            f"{boundary.MIN_PROBE_WINDOWS} disjoint {args.window_ms} ms windows, so every "
+            "coarse probe would be inconclusive by construction"
+        )
     index_path = Path(args.index)
     index = json.loads(index_path.read_text(encoding="utf-8"))
     cap = admission.get_cap(args.cap or index.get("admission_cap", {}).get("name")
@@ -1134,6 +1278,7 @@ def run_campaign(args) -> int:
     boundary_seconds = estimate_boundary_wall_clock_s(boundary_cells, args.cooldown_s)
     plan_doc = {
         "generated_at_utc": utc_iso(),
+        "provenance": run_provenance(args),
         "admission_cap": cap.as_dict(),
         "index": str(index_path),
         "models": models,
@@ -1182,6 +1327,20 @@ def run_campaign(args) -> int:
         )
     print(f"controller mode: {mode}")
 
+    status, code = "failed", 1
+    try:
+        code = _drive_campaign(args, index=index, cap=cap, runnable=runnable,
+                               out_dir=out_dir, raw_dir=raw_dir, schedule_root=schedule_root)
+        status = "complete" if code == 0 else "stopped"
+    except KeyboardInterrupt:
+        status = "interrupted"
+        raise
+    finally:
+        finalize_run(out_dir, status=status, exit_code=code)
+    return code
+
+
+def _drive_campaign(args, *, index, cap, runnable, out_dir, raw_dir, schedule_root) -> int:
     measured_dir = out_dir / "capacity"
     measured_dir.mkdir(parents=True, exist_ok=True)
     boundary_dir = out_dir / "boundary"

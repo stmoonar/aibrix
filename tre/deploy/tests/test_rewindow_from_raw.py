@@ -205,12 +205,12 @@ def test_rewindow_cell_matches_online_trs_column() -> None:
     store = _build_online_store(records, instant, "bucket_upper", we)
     wm = store.read_model_window(MODEL, ws, we)
     online_rows = [
-        r3_grid.window_row(cell, w, res.TRS, res.Q_ctl)
+        r3_grid.window_row(cell, w, res.TRS, res.Q_ctl, client=w)
         for w, res in zip([wm], r3_grid.compute_window_results([wm], spec))
     ]
     assert rows[0]["trs"] == pytest.approx(online_rows[0]["trs"])
     assert rows[0]["queue_control"] == pytest.approx(online_rows[0]["queue_control"])
-    assert rows[0]["p95_e2e"] == pytest.approx(online_rows[0]["p95_e2e"], abs=1e-6)
+    assert rows[0]["p95_e2e_client_ms"] == pytest.approx(online_rows[0]["p95_e2e_client_ms"], abs=1e-6)
 
 
 def test_same_raw_produces_20s_and_60s(tmp_path: Path) -> None:

@@ -7,12 +7,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
+from tre_common import slo_labels
 
-_LATENCY_COLUMNS = {
-    "ttft_p95": "p95_ttft",
-    "tpot_p95": "p95_tpot",
-    "e2e_p95": "p95_e2e",
-}
+#: SLO key -> the client-side p95 column it is judged on (tre_common.slo_labels).
+_LATENCY_COLUMNS = dict(slo_labels.SLO_COLUMNS)
 
 
 @dataclass(frozen=True)
@@ -45,6 +43,13 @@ def load_windows_from_csv(
 ) -> list[CalibrationWindow]:
     """Load per-window calibration rows from a load-scan CSV.
 
+    Each row's healthy/violated label is :func:`tre_common.slo_labels.window_slo_label` -
+    the function the boundary search judges its probes with - so the fit and the search
+    cannot disagree about a window. ``unlabeled`` rows (a p95 the SLO needs is missing)
+    are dropped: no evidence is not evidence of health. A row violated only through an
+    unserved request (no latency sample at all) is kept as a violation with no latency
+    ratio. See :func:`calibration_window_from_row`.
+
     ``trim_ramp_windows`` drops that many earliest windows per scenario; it shifts the
     fitted theta by a few percent, so callers record the value they used in the
     calibration artifact rather than relying on a default.
@@ -63,53 +68,63 @@ def load_windows_from_csv(
     with Path(path).open("r", encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
-            if _skip_row(row):
-                continue
-
             raw_signal = (
                 signal_transform(row) if signal_transform is not None else row.get(signal_column)
             )
-            signal = _as_float(raw_signal)
-            if signal is None:
-                continue
-            prompt_tokens = _as_float(row.get("prompt_tokens_total"), 0.0) or 0.0
-            generation_tokens = _as_float(row.get("generation_tokens_total"), 0.0) or 0.0
-            if prompt_tokens + generation_tokens <= 0.0:
-                continue
-
-            ratios: list[float] = []
-            missing_latency = False
-            for slo_key, column in active_columns.items():
-                value = _as_float(row.get(column))
-                if value is None:
-                    missing_latency = True
-                    break
-                ratios.append(value / float(latency_slo_ms[slo_key]))
-            if missing_latency or not ratios:
-                continue
-
-            p95_ratio_max = max(ratios)
-            queue_raw: float | None = None
-            if lambda_wait is not None and _as_float(row.get("avg_running")) is not None:
-                queue_raw = (
-                    float(lambda_wait) * (_as_float(row.get("avg_waiting"), 0.0) or 0.0)
-                    + (_as_float(row.get("avg_running"), 0.0) or 0.0)
-                    + (_as_float(row.get("avg_swapping"), 0.0) or 0.0)
-                )
-            windows.append(
-                CalibrationWindow(
-                    scenario_id=(row.get("scenario_id") or "unknown").strip() or "unknown",
-                    scenario_family=(row.get("scenario_family") or "unknown").strip() or "unknown",
-                    signal=signal,
-                    slo_met=all(ratio <= 1.0 for ratio in ratios),
-                    health_score=1.0 / (1.0 + p95_ratio_max),
-                    window_start_ms=_as_float(row.get("window_start_ms")),
-                    latency_ratio_p95=p95_ratio_max,
-                    latency_ratio_avg=_avg_latency_ratio(row, latency_slo_ms),
-                    queue_raw=queue_raw,
-                )
+            window = calibration_window_from_row(
+                row,
+                latency_slo_ms=latency_slo_ms,
+                signal=_as_float(raw_signal),
+                lambda_wait=lambda_wait,
             )
+            if window is not None:
+                windows.append(window)
     return trim_scenario_ramp_windows(windows, count=trim_ramp_windows)
+
+
+def calibration_window_from_row(
+    row: Mapping[str, Any],
+    *,
+    latency_slo_ms: Mapping[str, float],
+    signal: float | None,
+    lambda_wait: float | None = None,
+) -> CalibrationWindow | None:
+    """One window CSV row -> a :class:`CalibrationWindow`, or None when it is not used.
+
+    The single row-to-window rule: :func:`load_windows_from_csv` and
+    ``scripts.refit_trs_params`` both call it, so the refit sees exactly the windows (and
+    labels) the theta fit saw. A row is dropped when it is filtered (warm-up,
+    contaminated, out of scope), has no signal, carried no tokens, or is ``unlabeled``.
+    """
+    if _skip_row(row) or signal is None:
+        return None
+    prompt_tokens = _as_float(row.get("prompt_tokens_total"), 0.0) or 0.0
+    generation_tokens = _as_float(row.get("generation_tokens_total"), 0.0) or 0.0
+    if prompt_tokens + generation_tokens <= 0.0:
+        return None
+    label = slo_labels.window_slo_label(row, latency_slo_ms)
+    if label == slo_labels.LABEL_UNLABELED:
+        return None
+    ratios = slo_labels.latency_ratios(row, latency_slo_ms)
+    p95_ratio_max = max(ratios) if ratios else None
+    queue_raw: float | None = None
+    if lambda_wait is not None and _as_float(row.get("avg_running")) is not None:
+        queue_raw = (
+            float(lambda_wait) * (_as_float(row.get("avg_waiting"), 0.0) or 0.0)
+            + (_as_float(row.get("avg_running"), 0.0) or 0.0)
+            + (_as_float(row.get("avg_swapping"), 0.0) or 0.0)
+        )
+    return CalibrationWindow(
+        scenario_id=(row.get("scenario_id") or "unknown").strip() or "unknown",
+        scenario_family=(row.get("scenario_family") or "unknown").strip() or "unknown",
+        signal=signal,
+        slo_met=label == slo_labels.LABEL_HEALTHY,
+        health_score=None if p95_ratio_max is None else 1.0 / (1.0 + p95_ratio_max),
+        window_start_ms=_as_float(row.get("window_start_ms")),
+        latency_ratio_p95=p95_ratio_max,
+        latency_ratio_avg=_avg_latency_ratio(row, latency_slo_ms),
+        queue_raw=queue_raw,
+    )
 
 
 def trim_scenario_ramp_windows(
@@ -205,7 +220,11 @@ def _scenario_hash(scenario_id: str, seed: str) -> str:
 def _resolve_latency_columns(latency_slo_ms: Mapping[str, float]) -> dict[str, str]:
     out: dict[str, str] = {}
     for slo_key in latency_slo_ms:
-        out[slo_key] = _LATENCY_COLUMNS.get(slo_key, slo_key)
+        if slo_key not in _LATENCY_COLUMNS:
+            raise ValueError(
+                f"unknown SLO key {slo_key!r}; expected one of {sorted(_LATENCY_COLUMNS)}"
+            )
+        out[slo_key] = _LATENCY_COLUMNS[slo_key]
     return out
 
 

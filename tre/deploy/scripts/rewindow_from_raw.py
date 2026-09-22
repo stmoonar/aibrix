@@ -22,6 +22,15 @@ those into the SAME window CSV the online path emits (r3_grid.CSV_COLUMNS), at a
   * trs            -> r3_grid.compute_window_results (the shared time-constant TRSComputer),
                       so the trs column is byte-identical to the online path.
   * row assembly   -> r3_grid.window_row / write_csv.
+  * SLO label      -> :func:`label_cell` -> tre_common.slo_labels.window_slo_label, the
+                      one label every consumer uses. The online probe verdict of the
+                      boundary search is computed by calling :func:`label_cell` on the
+                      cell it just drove, so "what the search judged" and "what the fit
+                      is trained on" are the same function on the same bytes.
+
+Latency is client-side, per request: p95 columns are ``*_client_ms`` and are taken over
+the requests that were *served* (a failed request has no latency; it makes its window a
+violation through the unserved counts instead).
 
 Sidecar cadence (why `--instant-grid` exists)
 ---------------------------------------------
@@ -61,6 +70,7 @@ from pathlib import Path
 from statistics import median
 from typing import Iterable, Mapping, Optional, Sequence
 
+from tre_common import slo_labels
 from tre_common.metrics_schema import ModelWindowMetrics
 from tre_common.percentile import histogram_percentile
 from tre_common.rediskeys import SCRAPE_INTERVAL_MS
@@ -310,9 +320,11 @@ def build_meta(
     gap_overall: Optional[ObservabilityGap] = None,
     git_sha: Optional[str] = None,
     generated_at: Optional[str] = None,
+    label: Optional[dict] = None,
 ) -> dict:
     """The record that answers "which cadence did this fit use" (plus the gap metric)."""
     meta: dict = {
+        "label": label,
         "generated_at_utc": generated_at or datetime.now(timezone.utc).isoformat(),
         "git_short_sha": git_sha,
         "model": model,
@@ -388,6 +400,65 @@ def enumerate_windows(start_ms: int, end_ms: int, window_ms: int, step_ms: int) 
     return windows
 
 
+# --------------------------------------------------------------- request outcomes
+
+
+#: The outcome of a served request, as ``openloop.OUTCOME_NAMES`` spells it.
+OUTCOME_OK = openloop.OUTCOME_NAMES[openloop.FAILURE_NONE]
+
+
+def request_outcome(record: Mapping) -> str:
+    """``ok`` / ``shed`` / ``proxy_transient`` / ``model_error`` / ``client_timeout``.
+
+    Captures from 2026-09-23 on carry the classification in the raw record itself
+    (``outcome``); older raw records get it from :func:`attach_failure_details`, which
+    copies the failure sidecar's verdict onto them. See ``openloop.outcome_of``.
+    """
+    return openloop.outcome_of(record)
+
+
+def attach_failure_details(records: Sequence[dict], failures: Sequence[Mapping]) -> tuple[list[dict], int]:
+    """Copy the failure sidecar's per-request verdict onto the raw records it describes.
+
+    Needed only for captures whose raw records predate the ``outcome`` field: their
+    classification lives in ``<cell>.failures.jsonl``, keyed by send instant. Records are
+    matched on ``(send_ts_ms, http_status)`` in order, so two failures sent in the same
+    millisecond still pair one-to-one. Returns (records, failures that matched nothing).
+    """
+    pending: dict[tuple, list[Mapping]] = {}
+    for failure in failures:
+        key = (_as_int(failure.get("send_ts_ms")), _as_int(failure.get("http_status")))
+        pending.setdefault(key, []).append(failure)
+    out: list[dict] = []
+    for record in records:
+        rec = dict(record)
+        if not rec.get("outcome"):
+            key = (_as_int(rec.get("send_ts_ms")), _as_int(rec.get("http_status")))
+            queue = pending.get(key)
+            if queue:
+                failure = queue.pop(0)
+                for field_name in ("outcome", "proxy_reason", "request_id", "in_flight_at_send",
+                                   "request_timeout_s"):
+                    if rec.get(field_name) is None and failure.get(field_name) is not None:
+                        rec[field_name] = failure.get(field_name)
+        out.append(rec)
+    unmatched = sum(len(queue) for queue in pending.values())
+    return out, unmatched
+
+
+def _as_int(value) -> Optional[int]:
+    if value is None or value == "":
+        return None
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def is_served(record: Mapping) -> bool:
+    return request_outcome(record) == OUTCOME_OK
+
+
 def aggregate_window(
     records: list[dict],
     instant_samples: list[dict],
@@ -410,9 +481,13 @@ def aggregate_window(
     prompt_tokens = sum(r["input_tokens"] for r in in_window if r.get("input_tokens") is not None)
     generation_tokens = sum(r["output_tokens"] for r in in_window if r.get("output_tokens") is not None)
 
-    ttft_samples = [r["ttft_ms"] for r in in_window if r.get("ttft_ms") is not None]
-    tpot_samples = [r["tpot_ms"] for r in in_window if r.get("tpot_ms") is not None]
-    e2e_samples = [r["e2e_ms"] for r in in_window if r.get("e2e_ms") is not None]
+    # Latency is taken over SERVED requests only. A failed request's e2e is how long it
+    # took to fail (a 503 in 3 ms, a client timeout at 30 s), not a latency of the engine;
+    # it enters the label through the unserved counts instead.
+    served = [r for r in in_window if is_served(r)]
+    ttft_samples = [r["ttft_ms"] for r in served if r.get("ttft_ms") is not None]
+    tpot_samples = [r["tpot_ms"] for r in served if r.get("tpot_ms") is not None]
+    e2e_samples = [r["e2e_ms"] for r in served if r.get("e2e_ms") is not None]
 
     # queue: instant samples are inclusive [start, end] and divided by expected_samples,
     # exactly as MetricsStore._instant_avg does.
@@ -472,7 +547,8 @@ def rewindow_cell(
     assigned_replicas: int = 1,
 ) -> list[dict]:
     """Re-window one cell's raw into calibration CSV rows (reusing r3_grid.window_row +
-    compute_window_results for the trs column)."""
+    compute_window_results for the trs column). Latency columns are client-side; the
+    rows carry no SLO label yet - :func:`label_cell` adds it."""
     instant_sample_interval_ms = resolve_instant_cadence(
         instant_samples,
         instant_grid=instant_grid,
@@ -497,8 +573,109 @@ def rewindow_cell(
         )
         for ws, we in windows_ms
     ]
+    served_done = sorted(
+        int(r["done_ts_ms"]) for r in records
+        if r.get("done_ts_ms") is not None and is_served(r)
+    )
     results = r3_grid.compute_window_results(metrics, spec)
-    return [r3_grid.window_row(cell, wm, result.TRS, result.Q_ctl) for wm, result in zip(metrics, results)]
+    return [
+        r3_grid.window_row(
+            cell, wm, result.TRS, result.Q_ctl,
+            client=wm,
+            completed_requests=_count_in(served_done, wm.window_start_ms, wm.window_end_ms),
+        )
+        for wm, result in zip(metrics, results)
+    ]
+
+
+def _count_in(sorted_stamps: Sequence[int], start: int, end: int) -> int:
+    from bisect import bisect_left
+
+    return bisect_left(sorted_stamps, end) - bisect_left(sorted_stamps, start)
+
+
+def label_cell(
+    records: Sequence[dict],
+    instant_samples: Sequence[dict],
+    cell: r3_grid.GridCell,
+    spec,
+    *,
+    latency_slo_ms: Mapping[str, float],
+    window_ms: int,
+    step_ms: int,
+    percentile_mode: str,
+    min_latency_samples: int,
+    instant_sample_interval_ms: int,
+    instant_grid: str,
+    start_ms: Optional[int] = None,
+    end_ms: Optional[int] = None,
+    truncated_at_ts_ms: Optional[int] = None,
+    routable_pods: int = 1,
+    assigned_replicas: int = 1,
+) -> list[dict]:
+    """One cell's window rows, each with its SLO label. THE labelling path.
+
+    Called by the online driver (``r3_grid``) on the cell it has just driven - that is the
+    verdict the boundary search reads - and by :func:`main` offline. Both hand it the same
+    raw per-request records and sidecar samples, so a probe's windows and the windows a
+    fit is built from are labelled by construction with the same function on the same
+    data.
+
+    ``records`` are raw records (``r3_grid.RAW_COLUMNS``); their outcome is read from the
+    record (or classified, see :func:`request_outcome`). Steps, in order:
+
+    1. :func:`rewindow_cell` - client-side aggregation per window;
+    2. ``openloop.mark_unserved_request_windows`` - per-window counts of requests *sent*
+       in the window that went unserved;
+    3. ``r3_grid.censor_after`` - drop windows after an admission-overflow truncation;
+    4. :func:`tre_common.slo_labels.window_slo_label` - the label.
+    """
+    rows = rewindow_cell(
+        list(records), list(instant_samples), cell, spec,
+        window_ms=window_ms, step_ms=step_ms,
+        percentile_mode=percentile_mode,
+        min_latency_samples=min_latency_samples,
+        instant_sample_interval_ms=instant_sample_interval_ms,
+        instant_grid=instant_grid,
+        start_ms=start_ms, end_ms=end_ms,
+        routable_pods=routable_pods, assigned_replicas=assigned_replicas,
+    )
+    rows = openloop.mark_unserved_request_windows(rows, records)
+    rows, _dropped = r3_grid.censor_after(rows, truncated_at_ts_ms)
+    for row in rows:
+        slo_labels.apply_label(row, latency_slo_ms)
+    return rows
+
+
+def read_guard(raw_path: Path) -> dict:
+    """The ``<cell>.guard.json`` next to a raw capture, or {} when there is none.
+
+    It carries the drive's own [start_ms, end_ms] and any truncation instant, which the
+    offline path needs to lay down exactly the windows the online path did.
+    """
+    cell_id = raw_path.name.split(".", 1)[0]
+    path = raw_path.parent / f"{cell_id}.guard.json"
+    if not path.exists():
+        return {}
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except ValueError:
+        return {}
+    return doc if isinstance(doc, dict) else {}
+
+
+def load_cell_capture(raw_path: Path) -> tuple[list[dict], list[dict], dict, int]:
+    """(raw records with outcomes, instant samples, guard, unmatched failures) of one cell.
+
+    ``raw_path`` may be a quarantined ``.jsonl.void`` capture; its sidecars are found by
+    cell id either way.
+    """
+    cell_id = raw_path.name.split(".", 1)[0]
+    records = load_jsonl(raw_path)
+    instants = load_jsonl(raw_path.parent / f"{cell_id}.instant.jsonl")
+    failures = load_jsonl(raw_path.parent / f"{cell_id}.failures.jsonl")
+    records, unmatched = attach_failure_details(records, failures)
+    return records, instants, read_guard(raw_path), unmatched
 
 
 def _raw_size_bytes(raw_dir: Path) -> int:
@@ -600,6 +777,12 @@ def main() -> int:
         "--gap-key", default=DEFAULT_GAP_KEY,
         help=f"sidecar key the observability gap is measured on (default {DEFAULT_GAP_KEY})",
     )
+    ap.add_argument("--ttft-slo-ms", type=float, default=None,
+                    help="p95 TTFT SLO the slo_label column is computed against "
+                         "(default: registry)")
+    ap.add_argument("--tpot-slo-ms", type=float, default=None,
+                    help="p95 TPOT SLO the slo_label column is computed against "
+                         "(default: registry)")
     ap.add_argument("--registry", default=None)
     ap.add_argument("--routable-pods", type=int, default=1)
     ap.add_argument("--assigned-replicas", type=int, default=1)
@@ -622,6 +805,10 @@ def main() -> int:
 
     registry = load_registry(args.registry)
     spec = registry.model(args.model)
+    latency_slo_ms = slo_labels.slo_targets(
+        ttft_slo_ms=args.ttft_slo_ms if args.ttft_slo_ms is not None else spec.slo.ttft_p95_ms,
+        tpot_slo_ms=args.tpot_slo_ms if args.tpot_slo_ms is not None else spec.slo.tpot_p95_ms,
+    )
 
     rows: list[dict] = []
     cells: list[str] = []
@@ -637,21 +824,27 @@ def main() -> int:
         print(f"skipping {len(skipped_cells)} cell(s) by id: {', '.join(sorted(set(skipped_cells)))}")
     for raw_path in cell_files:
         cell_id = raw_path.stem
-        raw_dir_for_cell = raw_path.parent
         try:
             cell = r3_grid.GridCell.from_scenario_id(cell_id)
         except ValueError:
             print(f"skip {raw_path.name}: not a grid cell file")
             continue
-        records = load_jsonl(raw_path)
-        instant_samples = load_jsonl(raw_dir_for_cell / f"{cell_id}.instant.jsonl")
-        cell_rows = rewindow_cell(
+        records, instant_samples, guard, unmatched = load_cell_capture(raw_path)
+        if unmatched:
+            print(f"WARNING: cell {cell_id}: {unmatched} failure record(s) matched no raw request")
+        # The drive's own bounds when the guard recorded them, so offline windows sit
+        # exactly where the online driver put them; the data span otherwise.
+        cell_rows = label_cell(
             records, instant_samples, cell, spec,
+            latency_slo_ms=latency_slo_ms,
             window_ms=args.window_ms, step_ms=step_ms,
             percentile_mode=args.percentile_mode,
             min_latency_samples=args.min_latency_samples,
             instant_sample_interval_ms=args.instant_sample_ms,
             instant_grid=args.instant_grid,
+            start_ms=_as_int(guard.get("start_ms")),
+            end_ms=_as_int(guard.get("end_ms")),
+            truncated_at_ts_ms=_as_int(guard.get("truncated_at_ts_ms")),
             routable_pods=args.routable_pods, assigned_replicas=args.assigned_replicas,
         )
         rows.extend(cell_rows)
@@ -687,6 +880,9 @@ def main() -> int:
         gap_per_cell=gap_per_cell,
         gap_overall=gap_overall,
         git_sha=git_short_sha(Path(__file__).resolve().parents[2]),
+        label=slo_labels.label_definition(
+            latency_slo_ms, min_latency_samples=args.min_latency_samples
+        ),
     )
     meta_path = write_meta(out, meta)
     print(f"wrote cadence metadata to {meta_path}")

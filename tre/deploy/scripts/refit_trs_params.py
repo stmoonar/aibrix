@@ -14,10 +14,9 @@ This is a thin wrapper: it only assembles data and emits a report. It does NOT t
 What it does, per model (grid search is per-model, so run one model at a time):
 
   1. load the R3 window CSV into aligned ``(CalibrationWindow, SignalInputs)`` sequences
-     using the *same* row filtering as ``tre_calibration.dataset.load_windows_from_csv``
-     (warmup/contaminated/missing-latency/zero-token rows dropped, ``slo_met`` and
-     ``health_score`` computed identically), so the refit sees exactly the windows the
-     ``theta_m`` fit saw;
+     through ``tre_calibration.dataset.calibration_window_from_row`` - the function the
+     ``theta_m`` loader itself uses (same filters, same ``tre_common.slo_labels`` label) -
+     so the refit sees exactly the windows the ``theta_m`` fit saw;
   2. score the *inherited* triple (from ``registry.yaml`` for that model, or CLI
      overrides) with ``score_parameter_candidate``;
   3. run ``grid_search_parameters`` over the grid and take ``best``;
@@ -57,7 +56,7 @@ from tre_calibration.dataset import (
     CalibrationWindow,
     _as_float,
     _resolve_latency_columns,
-    _skip_row,
+    calibration_window_from_row,
     trim_scenario_ramp_windows,
 )
 from tre_calibration.signals import (
@@ -86,8 +85,8 @@ def load_windows_and_inputs(
 ) -> tuple[list[CalibrationWindow], list[SignalInputs]]:
     """Load aligned ``(windows, inputs)`` from an R3 window CSV.
 
-    Mirrors ``tre_calibration.dataset.load_windows_from_csv`` row-for-row (same filters,
-    same ``slo_met``/``health_score`` construction) but ALSO emits the ``SignalInputs``
+    Builds each window with ``tre_calibration.dataset.calibration_window_from_row`` - the
+    loader's own row rule, not a copy of it - and ALSO emits the ``SignalInputs``
     that ``grid_search_parameters`` needs, so the two lists are index-aligned by
     construction. ``grid_search_parameters`` recomputes the signal from ``inputs`` and
     ignores ``window.signal``; the ``signal_column`` is still required so the refit
@@ -102,38 +101,16 @@ def load_windows_and_inputs(
     with Path(path).open("r", encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
-            if _skip_row(row):
-                continue
-            signal = _as_float(row.get(signal_column))
-            if signal is None:
+            window = calibration_window_from_row(
+                row,
+                latency_slo_ms=latency_slo_ms,
+                signal=_as_float(row.get(signal_column)),
+            )
+            if window is None:
                 continue
             prompt_tokens = _as_float(row.get("prompt_tokens_total"), 0.0) or 0.0
             generation_tokens = _as_float(row.get("generation_tokens_total"), 0.0) or 0.0
-            if prompt_tokens + generation_tokens <= 0.0:
-                continue
-
-            ratios: list[float] = []
-            missing_latency = False
-            for slo_key, column in active_columns.items():
-                value = _as_float(row.get(column))
-                if value is None:
-                    missing_latency = True
-                    break
-                ratios.append(value / float(latency_slo_ms[slo_key]))
-            if missing_latency or not ratios:
-                continue
-
-            p95_ratio_max = max(ratios)
-            windows.append(
-                CalibrationWindow(
-                    scenario_id=(row.get("scenario_id") or "unknown").strip() or "unknown",
-                    scenario_family=(row.get("scenario_family") or "unknown").strip() or "unknown",
-                    signal=signal,
-                    slo_met=all(ratio <= 1.0 for ratio in ratios),
-                    health_score=1.0 / (1.0 + p95_ratio_max),
-                    window_start_ms=_as_float(row.get("window_start_ms")),
-                )
-            )
+            windows.append(window)
             inputs.append(
                 SignalInputs(
                     prompt_tokens_total=prompt_tokens,

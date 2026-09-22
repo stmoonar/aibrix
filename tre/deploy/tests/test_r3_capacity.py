@@ -7,7 +7,7 @@ def _row(**kw):
     base = {
         "scenario_id": "i128_o64_c4", "input_tokens": "128", "output_tokens": "64",
         "generation_tokens_total": "8192", "window_start_ms": "0", "window_end_ms": "60000",
-        "p95_ttft": "60.0", "p95_tpot": "25.0",
+        "p95_ttft_client_ms": "60.0", "p95_tpot_client_ms": "25.0",
     }
     base.update(kw)
     return base
@@ -22,12 +22,12 @@ def test_sample_rps_and_slo_met() -> None:
 
 
 def test_sample_slo_violation_marks_not_met() -> None:
-    s = r3_capacity.sample_from_row(_row(p95_ttft="900.0"), ttft_slo_ms=500, tpot_slo_ms=75)
+    s = r3_capacity.sample_from_row(_row(p95_ttft_client_ms="900.0"), ttft_slo_ms=500, tpot_slo_ms=75)
     assert s.slo_met is False
 
 
 def test_sample_none_latency_not_met() -> None:
-    s = r3_capacity.sample_from_row(_row(p95_ttft=""), ttft_slo_ms=500, tpot_slo_ms=75)
+    s = r3_capacity.sample_from_row(_row(p95_ttft_client_ms=""), ttft_slo_ms=500, tpot_slo_ms=75)
     assert s.slo_met is False
 
 

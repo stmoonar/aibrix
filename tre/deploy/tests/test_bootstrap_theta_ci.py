@@ -40,8 +40,8 @@ def _write_csv(path, windows: list[CalibrationWindow]) -> None:
         "scenario_id",
         "scenario_family",
         "trs",
-        "p95_ttft",
-        "p95_tpot",
+        "p95_ttft_client_ms",
+        "p95_tpot_client_ms",
         "prompt_tokens_total",
         "generation_tokens_total",
     ]
@@ -54,8 +54,8 @@ def _write_csv(path, windows: list[CalibrationWindow]) -> None:
                     "scenario_id": window.scenario_id,
                     "scenario_family": window.scenario_family,
                     "trs": window.signal,
-                    "p95_ttft": 80.0 if window.slo_met else 130.0,
-                    "p95_tpot": 40.0,
+                    "p95_ttft_client_ms": 80.0 if window.slo_met else 130.0,
+                    "p95_tpot_client_ms": 40.0,
                     "prompt_tokens_total": 100.0,
                     "generation_tokens_total": 50.0,
                 }

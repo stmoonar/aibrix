@@ -582,17 +582,25 @@ def fit_delta_margins(
     if not math.isfinite(theta) or theta <= 0.0:
         raise ValueError("theta must be finite and positive")
 
-    rows = [row for row in windows if math.isfinite(row.signal)]
+    rows = []
     severity: list[float] = []
-    for row in rows:
+    for row in windows:
+        if not math.isfinite(row.signal):
+            continue
         p95_ratio = row.latency_ratio_p95
         if p95_ratio is None and row.health_score:
             p95_ratio = (1.0 / row.health_score) - 1.0
         if p95_ratio is None:
+            if not row.slo_met:
+                # Violated through an unserved request, with no latency sample to grade:
+                # a violation for theta, but it has no severity, and the margins are a
+                # fit on severity. Left out here, and only here.
+                continue
             raise ValueError(
-                "delta fit needs latency_ratio_p95 (or health_score) on every window"
+                "delta fit needs latency_ratio_p95 (or health_score) on every healthy window"
             )
         avg_ratio = row.latency_ratio_avg if row.latency_ratio_avg is not None else p95_ratio
+        rows.append(row)
         severity.append(p95_weight * p95_ratio + avg_weight * avg_ratio)
 
     queue_raw = [row.queue_raw for row in rows]

@@ -494,6 +494,20 @@ def failure_signature(record: dict) -> dict:
     }
 
 
+def outcome_of(record: dict) -> str:
+    """One request's outcome under the artifact names (:data:`OUTCOME_NAMES` values).
+
+    A record that already carries its verdict - a failure signature, or a raw record from
+    a capture that stores it (``r3_grid.RAW_COLUMNS``) - is taken at its word: the sender
+    record it was classified from had fields (the error body, the client-timeout flag)
+    that the raw record does not keep. Anything else is classified now.
+    """
+    outcome = record.get("outcome")
+    if outcome:
+        return str(outcome)
+    return OUTCOME_NAMES[classify_failure(record)]
+
+
 @dataclass(frozen=True)
 class CellOutcomes:
     """Per-cell request accounting, in the three counts a calibration point needs.
@@ -1363,25 +1377,26 @@ def make_envoy_stats_reader(url: str, *, fetch: Callable[[str], str] = _default_
 def mark_unserved_request_windows(
     rows: Sequence[dict], records: Sequence[dict]
 ) -> list[dict]:
-    """Label every window holding a request that went unserved as an SLO violation, and
-    keep the window.
+    """Count, per window, the requests sent in it that went unserved - and keep the window.
 
-    Two classes qualify, counted separately in the row and for the same reason.
+    Three classes are counted, each in its own column, and each makes the window a
+    violation in :func:`tre_common.slo_labels.window_slo_label` (which reads these counts;
+    nothing here decides the label):
 
-    A request the engine failed is evidence about the engine at that operating point -
-    arguably the strongest evidence a window can carry - so dropping those windows would
-    remove exactly the overloaded ones and pull theta towards health. It must also not be
-    scored as healthy just because the failed request contributed no latency sample,
-    which is what happens if nothing marks it: a window whose slowest requests all
-    errored out can otherwise show a comfortable p95.
+    * ``model_errors`` - the engine failed the request. That is evidence about the engine
+      at this operating point - arguably the strongest a window can carry - so dropping
+      those windows would remove exactly the overloaded ones and pull theta towards
+      health. Nor may the window score healthy because the failed request left no latency
+      sample, which is what happens if nothing counts it.
+    * ``proxy_transient_errors`` - a connection under the request died. Not evidence about
+      the engine, but still a request nobody served, and goodput counts it as a loss.
+    * ``client_timeouts`` - the client gave up before an answer came. For every
+      calibration shape the timeout (>= 30 s) is far beyond TTFT SLO + (output-1) x TPOT
+      SLO, so such a request cannot have met its SLO; leaving it out would let the
+      slowest requests of an overloaded window vanish from its p95.
 
-    A request a transient proxy failure dropped is not evidence about the engine, but it
-    is still a request the system did not serve, and goodput counts it as a loss. Marking
-    its window keeps the window's verdict and the cell's goodput saying the same thing;
-    it is counted in its own column so it is never mistaken for an engine fault.
-
-    An admission overflow is in neither: it is handled by the shed policy, which either
-    truncates the cell or voids it outright.
+    An admission overflow is in none of them: it is handled by the shed policy, which
+    either truncates the cell or voids it outright.
 
     A request is attributed to a window by its send time, because that is the operating
     point that produced the failure; a failed request often has no completion time at all.
@@ -1389,27 +1404,25 @@ def mark_unserved_request_windows(
     def send_times(wanted: str) -> list[int]:
         out: list[int] = []
         for record in records:
-            if classify_failure(record) != wanted:
+            if outcome_of(record) != wanted:
                 continue
             ts = record.get("actual_send_ts_ms", record.get("send_ts_ms"))
             if ts is not None:
                 out.append(int(ts))
         return out
 
-    model_errors = send_times(FAILURE_MODEL)
-    transient = send_times(FAILURE_PROXY_TRANSIENT)
+    counted = {
+        "model_errors": send_times(OUTCOME_NAMES[FAILURE_MODEL]),
+        "proxy_transient_errors": send_times(OUTCOME_NAMES[FAILURE_PROXY_TRANSIENT]),
+        "client_timeouts": send_times(OUTCOME_NAMES[FAILURE_CLIENT_TIMEOUT]),
+    }
     marked: list[dict] = []
     for row in rows:
         out = dict(row)
         start = int(row["window_start_ms"])
         end = int(row["window_end_ms"])
-        count = sum(1 for ts in model_errors if start <= ts < end)
-        transient_count = sum(1 for ts in transient if start <= ts < end)
-        out["model_errors"] = count
-        out["proxy_transient_errors"] = transient_count
-        out["slo_violated"] = (
-            bool(row.get("slo_violated")) or count > 0 or transient_count > 0
-        )
+        for column, stamps in counted.items():
+            out[column] = sum(1 for ts in stamps if start <= ts < end)
         marked.append(out)
     return marked
 
@@ -1554,6 +1567,7 @@ def drive_cell_schedule(
     failures_path: Optional[Path] = None,
     overflow_sentinel: Optional["PendingOverflowSentinel"] = None,
     records_out: Optional[list] = None,
+    instants_out: Optional[list] = None,
 ) -> tuple:
     """Drive one open-loop cell from ``segments``; returns (start_ms, end_ms, guard).
 
@@ -1706,6 +1720,10 @@ def drive_cell_schedule(
         # nor the send-side concurrency, by design (it is the metrics schema, not a log
         # of what the driver did).
         records_out.extend(sender.records)
+    if instants_out is not None:
+        # The sidecar samples (live-grid tagged), for a caller that labels the cell's
+        # windows in-process - the same samples the .instant.jsonl receives.
+        instants_out.extend(instants)
     return start_ms, end_ms, guard
 
 
@@ -1752,7 +1770,27 @@ def _raw_from_sender_record(cell_id: str, record: dict) -> dict:
         completion_tokens=record.get("completion_tokens"),
         target_pod=record.get("target_pod"),
     )
-    return r3_grid.build_raw_record(cell_id, int(record["actual_send_ts_ms"]), res)
+    raw = r3_grid.build_raw_record(cell_id, int(record["actual_send_ts_ms"]), res)
+    # What the driver knew about the request and the raw log used to drop: without these
+    # the per-request table cannot say when a request was *meant* to go out, how loaded
+    # the path was when it did, or what became of it.
+    verdict = classify_failure(record)
+    on_wire = record.get("on_wire_delay_ms")
+    raw.update({
+        "request_id": record.get("request_id"),
+        "scheduled_send_ts_ms": (
+            None if on_wire is None
+            else round(float(record["actual_send_ts_ms"]) - float(on_wire), 3)
+        ),
+        "on_wire_delay_ms": on_wire,
+        "in_flight_at_send": record.get("in_flight_at_send"),
+        "request_timeout_s": record.get("request_timeout_s"),
+        "outcome": OUTCOME_NAMES[verdict],
+        "proxy_reason": (
+            proxy_failure_reason(record) if verdict in PROXY_FAILURE_CLASSES else None
+        ),
+    })
+    return raw
 
 
 def _append_jsonl(path: Path, records: Sequence[dict]) -> None:

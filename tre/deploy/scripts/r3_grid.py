@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """R3 load-grid driver (endgame plan 6.2): sweep input x output x concurrency
 against a model, emit a window-level CSV consumable by the calibration `fit` CLI
-(columns: scenario_id, scenario_family, prompt_tokens_total, generation_tokens_total,
-p95_ttft, p95_tpot, trs). Reuses the controller MetricsStore for window aggregation
+(``CSV_COLUMNS``; latency columns name their source: ``p95_*_client_ms`` from the
+per-request log, which every SLO label is computed on, and ``p95_*_server_ms`` from the
+vLLM histograms, diagnostic only). Reuses the controller MetricsStore for window aggregation
 and TRSComputer for the trs column, so metric parsing is not reimplemented.
 
 Checkpoints per cell (resumable). The full grid is a ~10h/model run (R3, wall-clock);
@@ -47,6 +48,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable, Optional, Sequence
 
+from tre_common import slo_labels
 from tre_common.rediskeys import SCRAPE_INTERVAL_MS
 
 from scripts import openloop
@@ -114,14 +116,34 @@ def compute_window_results(windows: list, spec) -> list:
     return results
 
 
-def window_row(cell: GridCell, window_metrics, trs: float, queue_control: float) -> dict:
+def window_row(
+    cell: GridCell,
+    window_metrics,
+    trs: float,
+    queue_control: float,
+    *,
+    client=None,
+    server=None,
+    completed_requests: Optional[int] = None,
+) -> dict:
     """Assemble one calibration CSV row from an aggregated window + its trs.
     Pure: window_metrics is a ModelWindowMetrics-like object.
 
     Includes the queue observables S2 (grid_search w_p/lambda/qmin) and S3 (qsat fit)
-    need — avg_waiting/running/swapping + queue_control (Q_ctl) + p95_e2e — so those
-    refits are recoverable from the R3 CSV without a re-run (B2).
+    need — avg_waiting/running/swapping + queue_control (Q_ctl) — so those refits are
+    recoverable from the R3 CSV without a re-run (B2).
+
+    Latency comes from two named sources and lands in columns that say which:
+    ``client`` (a ModelWindowMetrics aggregated from the per-request log, see
+    ``rewindow_from_raw.aggregate_window``) fills ``p95_*_client_ms`` - the only columns any
+    SLO label is computed on - and ``server`` (the vLLM-histogram window read back from
+    redis) fills ``p95_*_server_ms``, kept for diagnosis only. There is no default: a
+    caller that has only one of them passes None for the other and the columns stay empty
+    rather than being filled from the wrong source.
     """
+    def p95(source, attr):
+        return None if source is None else getattr(source, attr)
+
     return {
         "scenario_id": cell.scenario_id,
         "scenario_family": cell.scenario_family,
@@ -136,21 +158,28 @@ def window_row(cell: GridCell, window_metrics, trs: float, queue_control: float)
         "avg_running": window_metrics.avg_running,
         "avg_swapping": window_metrics.avg_swapping,
         "queue_control": queue_control,
-        "p95_ttft": window_metrics.ttft_p95_ms,
-        "p95_tpot": window_metrics.tpot_p95_ms,
-        "p95_e2e": window_metrics.e2e_p95_ms,
         "trs": trs,
-        # Requests that went unserved inside this window, and the resulting verdict. A
-        # failed request contributes no latency sample, so a window whose slowest work
-        # all errored out otherwise shows a comfortable p95 and is scored as healthy.
-        # model_errors is the ENGINE failing; proxy_transient_errors is a connection
-        # under the request dying, which is not evidence about the engine but is still a
-        # request nobody served. They are separate columns so the second can never be
-        # read as an engine fault. All three default to "none seen";
-        # openloop.mark_unserved_request_windows fills them in.
+        "completed_requests": completed_requests,
+        slo_labels.P95_TTFT_CLIENT: p95(client, "ttft_p95_ms"),
+        slo_labels.P95_TPOT_CLIENT: p95(client, "tpot_p95_ms"),
+        slo_labels.P95_E2E_CLIENT: p95(client, "e2e_p95_ms"),
+        # Requests sent inside this window that went unserved. A failed request
+        # contributes no latency sample, so a window whose slowest work all errored out
+        # otherwise shows a comfortable p95 and is scored as healthy. model_errors is the
+        # ENGINE failing; proxy_transient_errors is a connection under the request dying;
+        # client_timeouts is the client giving up. Separate columns so none is read as
+        # another; openloop.mark_unserved_request_windows fills them in.
         "model_errors": 0,
         "proxy_transient_errors": 0,
-        "slo_violated": False,
+        "client_timeouts": 0,
+        # tre_common.slo_labels.apply_label: slo_label is violated / healthy / unlabeled,
+        # slo_violated its boolean view (empty when unlabeled). Empty until a caller that
+        # knows the SLO labels the row (rewindow_from_raw.label_cell).
+        slo_labels.LABEL_COLUMN: None,
+        slo_labels.VIOLATED_COLUMN: None,
+        slo_labels.P95_TTFT_SERVER: p95(server, "ttft_p95_ms"),
+        slo_labels.P95_TPOT_SERVER: p95(server, "tpot_p95_ms"),
+        slo_labels.P95_E2E_SERVER: p95(server, "e2e_p95_ms"),
     }
 
 
@@ -160,12 +189,16 @@ def window_row(cell: GridCell, window_metrics, trs: float, queue_control: float)
 VOID_RAW_SUFFIX = ".void"
 
 
+#: The window CSV schema. Fixed order; latency columns name their source and unit.
 CSV_COLUMNS = [
     "scenario_id", "scenario_family", "input_tokens", "output_tokens", "concurrency",
     "window_start_ms", "window_end_ms", "prompt_tokens_total", "generation_tokens_total",
-    "avg_waiting", "avg_running", "avg_swapping", "queue_control",
-    "p95_ttft", "p95_tpot", "p95_e2e", "trs",
-    "model_errors", "proxy_transient_errors", "slo_violated",
+    "avg_waiting", "avg_running", "avg_swapping", "queue_control", "trs",
+    "completed_requests",
+    slo_labels.P95_TTFT_CLIENT, slo_labels.P95_TPOT_CLIENT, slo_labels.P95_E2E_CLIENT,
+    "model_errors", "proxy_transient_errors", "client_timeouts",
+    slo_labels.LABEL_COLUMN, slo_labels.VIOLATED_COLUMN,
+    slo_labels.P95_TTFT_SERVER, slo_labels.P95_TPOT_SERVER, slo_labels.P95_E2E_SERVER,
 ]
 
 # S4 per-request raw JSONL schema (doc15 §4). Queue observables are NOT here (they are an
@@ -177,6 +210,14 @@ RAW_COLUMNS = [
     # Pod that served the request, when the serving path names one. Per-pod attribution
     # has to be captured here or not at all: nothing downstream can reconstruct it.
     "target_pod",
+]
+
+#: Fields the open-loop driver adds to each raw record (captures from 2026-09-23 on;
+#: ``openloop._raw_from_sender_record``). Older captures lack them, and the standard
+#: dataset fills what it can from the failure sidecar.
+RAW_REQUEST_COLUMNS = [
+    "request_id", "scheduled_send_ts_ms", "on_wire_delay_ms", "in_flight_at_send",
+    "request_timeout_s", "outcome", "proxy_reason",
 ]
 
 # S4 disk estimate: each per-request line is ~200 bytes of JSON. Warn if a full run is
@@ -478,27 +519,18 @@ def drain_start_from_index(schedule_path: Path, model: str) -> Optional[float]:
 
 
 def count_slo_windows(rows: Sequence[dict], *, ttft_slo_ms: float, tpot_slo_ms: float) -> int:
-    """Windows whose p95 latency is above the SLO.
+    """Windows labelled ``violated`` by :func:`tre_common.slo_labels.window_slo_label`.
 
     This is the evidence a cell exists to produce: theta is a threshold on the signal at
     the moment the model stops meeting its SLO, so a cell that never crossed measured
-    nothing about it. A window with no p95 at all (too few samples) is not a crossing.
+    nothing about it. An ``unlabeled`` window (too few completions for a p95) is not a
+    crossing - and not a healthy window either.
     """
-    crossed = 0
-    for row in rows:
-        if row.get("slo_violated"):
-            # Marked by openloop.mark_unserved_request_windows: a request in this
-            # window went unserved, which is a violation even when the p95 of the
-            # requests that did survive looks fine.
-            crossed += 1
-            continue
-        ttft = row.get("p95_ttft")
-        tpot = row.get("p95_tpot")
-        if ttft is not None and float(ttft) > ttft_slo_ms:
-            crossed += 1
-        elif tpot is not None and float(tpot) > tpot_slo_ms:
-            crossed += 1
-    return crossed
+    targets = slo_labels.slo_targets(ttft_slo_ms=ttft_slo_ms, tpot_slo_ms=tpot_slo_ms)
+    return sum(
+        1 for row in rows
+        if slo_labels.window_slo_label(row, targets) == slo_labels.LABEL_VIOLATED
+    )
 
 
 def censor_after(rows: Sequence[dict], truncated_at_ts_ms: Optional[int]) -> tuple[list, int]:
@@ -579,9 +611,11 @@ def run_schedule_cell(args, store, spec) -> tuple[list, "openloop.CellGuard"]:
         )
 
     sender_records: list[dict] = []
+    sidecar_samples: list[dict] = []
     start_ms, end_ms, guard = openloop.drive_cell_schedule(
         args.gateway_url, args.model, cell_id, segments,
         records_out=sender_records,
+        instants_out=sidecar_samples,
         seed=args.schedule_seed,
         raw_path=raw_path, instant_path=instant_path,
         instant_sampler=sampler,
@@ -610,26 +644,26 @@ def run_schedule_cell(args, store, spec) -> tuple[list, "openloop.CellGuard"]:
         },
     )
 
-    windows = []
-    w = start_ms
-    while w + args.window_ms <= end_ms:
-        windows.append(store.read_model_window(args.model, w, w + args.window_ms))
-        w += args.window_ms
-    results = compute_window_results(windows, spec)
-    rows = [
-        window_row(cell, wm, result.TRS, result.Q_ctl)
-        for wm, result in zip(windows, results)
-    ]
-    # A window holding a model error is a violation and is KEPT. Dropping it would remove
-    # exactly the overloaded windows and pull theta towards health.
-    rows = openloop.mark_unserved_request_windows(rows, sender_records)
+    # The cell's windows, labelled by THE labelling path - rewindow_from_raw.label_cell -
+    # on the raw records and sidecar samples this very drive produced (the same bytes the
+    # .jsonl / .instant.jsonl receive). This is what the boundary search judges a probe
+    # on, and it is by construction what an offline re-window of this capture on the
+    # same grid produces: one function, one input, no second definition of "violated".
+    # A window holding an unserved request is a violation and is KEPT; dropping it would
+    # remove exactly the overloaded windows and pull theta towards health.
+    all_rows = label_schedule_cell_windows(
+        args, spec, cell, cell_id, sender_records, sidecar_samples,
+        start_ms=start_ms, end_ms=end_ms, truncated_at_ts_ms=None,
+        ttft_slo_ms=ttft_slo_ms, tpot_slo_ms=tpot_slo_ms,
+    )
     if guard.shed_policy == openloop.SHED_POLICY_VOID and guard.voided:
         # Nothing from a voided cell may reach the fit - not even the windows taken
         # before the shed, which are precisely the healthy ones.
-        censored_windows = len(rows)
+        censored_windows = len(all_rows)
         rows = []
     else:
-        rows, censored_windows = censor_after(rows, guard.truncated_at_ts_ms)
+        rows, censored_windows = censor_after(all_rows, guard.truncated_at_ts_ms)
+    add_server_latency(rows, store, args.model)
     guard = guard.with_slo_windows(
         count_slo_windows(rows, ttft_slo_ms=ttft_slo_ms, tpot_slo_ms=tpot_slo_ms)
     )
@@ -646,6 +680,13 @@ def run_schedule_cell(args, store, spec) -> tuple[list, "openloop.CellGuard"]:
         "start_ms": start_ms,
         "end_ms": end_ms,
         "instant_sample_ms": args.instant_sample_ms,
+        # The grid and the label the windows above were judged on.
+        "window_ms": args.window_ms,
+        "step_ms": args.step_ms,
+        "label": slo_labels.label_definition(
+            slo_labels.slo_targets(ttft_slo_ms=ttft_slo_ms, tpot_slo_ms=tpot_slo_ms),
+            min_latency_samples=args.min_latency_samples,
+        ),
         # How the load was actually generated and routed. Recorded per cell because a
         # capacity number is only comparable to another one made the same way.
         "prompt_mode": args.prompt_mode,
@@ -703,6 +744,57 @@ def run_schedule_cell(args, store, spec) -> tuple[list, "openloop.CellGuard"]:
     return rows, guard
 
 
+def label_schedule_cell_windows(
+    args, spec, cell: GridCell, cell_id: str,
+    sender_records: Sequence[dict], sidecar_samples: Sequence[dict],
+    *, start_ms: int, end_ms: int, truncated_at_ts_ms: Optional[int],
+    ttft_slo_ms: float, tpot_slo_ms: float,
+) -> list[dict]:
+    """The online window rows of one open-loop cell, via ``rewindow_from_raw.label_cell``.
+
+    The raw records are rebuilt from the sender rows with the function that writes the
+    raw JSONL (``openloop._raw_from_sender_record``), so what is labelled here is exactly
+    what lands on disk. The windowing is the fitting re-window's, parameter for parameter
+    (``--window-ms``/``--step-ms`` = the controller's 30 s / 5 s sliding window, queue
+    from the live-grid subsample at the gateway cadence, the drive's own [start, end]),
+    so ``rewindow_from_raw`` on this capture reproduces these rows window for window.
+    """
+    from scripts import rewindow_from_raw
+
+    raw = [openloop._raw_from_sender_record(cell_id, record) for record in sender_records]
+    return rewindow_from_raw.label_cell(
+        raw, list(sidecar_samples), cell, spec,
+        latency_slo_ms=slo_labels.slo_targets(ttft_slo_ms=ttft_slo_ms, tpot_slo_ms=tpot_slo_ms),
+        window_ms=args.window_ms, step_ms=args.step_ms,
+        percentile_mode=args.percentile_mode,
+        min_latency_samples=args.min_latency_samples,
+        instant_sample_interval_ms=SCRAPE_INTERVAL_MS,
+        instant_grid=rewindow_from_raw.INSTANT_GRID_LIVE,
+        start_ms=start_ms, end_ms=end_ms,
+        truncated_at_ts_ms=truncated_at_ts_ms,
+    )
+
+
+def add_server_latency(rows: list[dict], store, model: str) -> None:
+    """Fill the ``p95_*_server_ms`` columns from the vLLM histograms in redis, in place.
+
+    Diagnostic only - the label never reads them. Kept because the gap between the two
+    sources is itself a finding (the server p95 TPOT is bucketed and counts every
+    single-token stall; the client's is a per-request mean) and has to stay visible.
+    """
+    for row in rows:
+        try:
+            server = store.read_model_window(
+                model, int(row["window_start_ms"]), int(row["window_end_ms"])
+            )
+        except Exception as exc:  # noqa: BLE001 - diagnostic columns never fail a cell
+            print(f"WARNING: server latency read failed for {row['window_start_ms']}: {exc}")
+            continue
+        row[slo_labels.P95_TTFT_SERVER] = server.ttft_p95_ms
+        row[slo_labels.P95_TPOT_SERVER] = server.tpot_p95_ms
+        row[slo_labels.P95_E2E_SERVER] = server.e2e_p95_ms
+
+
 def _cell_id_from_schedule(path: Path, model: str, segments: list) -> str:
     """Default scenario id for a schedule file: ``i<in>_o<out>_c<load-code>``.
 
@@ -733,7 +825,46 @@ def _cell_id_from_schedule(path: Path, model: str, segments: list) -> str:
     return f"i{i or 0}_o{o or 0}_c{code}"
 
 
-def main() -> int:
+def _read_jsonl(path: Path) -> list[dict]:
+    from scripts import rewindow_from_raw
+
+    return rewindow_from_raw.load_jsonl(Path(path))
+
+
+def closed_loop_rows(
+    cell: GridCell, windows: Sequence, results: Sequence, *,
+    raw_records: Sequence[dict], percentile_mode: str, min_latency_samples: int,
+    ttft_slo_ms: float, tpot_slo_ms: float,
+) -> list[dict]:
+    """Window rows of a closed-loop cell: store signal, client + server latency, label."""
+    from scripts import rewindow_from_raw
+
+    targets = slo_labels.slo_targets(ttft_slo_ms=ttft_slo_ms, tpot_slo_ms=tpot_slo_ms)
+    rows: list[dict] = []
+    for wm, result in zip(windows, results):
+        client = rewindow_from_raw.aggregate_window(
+            list(raw_records), [], wm.model, wm.window_start_ms, wm.window_end_ms,
+            percentile_mode=percentile_mode, min_latency_samples=min_latency_samples,
+            instant_sample_interval_ms=SCRAPE_INTERVAL_MS,
+        )
+        completed = sum(
+            1 for r in raw_records
+            if r.get("done_ts_ms") is not None
+            and wm.window_start_ms <= int(r["done_ts_ms"]) < wm.window_end_ms
+            and rewindow_from_raw.is_served(r)
+        )
+        rows.append(window_row(
+            cell, wm, result.TRS, result.Q_ctl,
+            client=client, server=wm, completed_requests=completed,
+        ))
+    rows = openloop.mark_unserved_request_windows(rows, raw_records)
+    for row in rows:
+        slo_labels.apply_label(row, targets)
+    return rows
+
+
+def parse_args(argv: Optional[Sequence[str]] = None):
+    """The driver's arguments, with the mode-dependent defaults filled in."""
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
     ap.add_argument("--gateway-url", required=True)
@@ -745,6 +876,12 @@ def main() -> int:
     # MUST equal the frozen control window W (S1.2; provisional 30000). theta fit on a
     # different window is invalid (S1.4 hard gate).
     ap.add_argument("--window-ms", type=int, default=30000)
+    # Slide step. The controller runs a 30 s window refreshed every 5 s
+    # (TRE_METRICS_WINDOW_MODE=sliding, TRE_METRICS_REFRESH_INTERVAL_SECONDS=5); the
+    # campaign passes its --fit-step-ms so a --schedule cell's online windows - the ones a
+    # boundary probe is judged on - are the fitting re-window's windows. Default: tumbling.
+    ap.add_argument("--step-ms", type=int, default=None,
+                    help="slide step for the window CSV (default: --window-ms, tumbling)")
     ap.add_argument("--redis-url", default="redis://tre-v2-redis:6379/0")
     ap.add_argument("--metrics-schema", default="v1")
     # Sidecar sampling cadence (how often WE sample the queue into the .instant.jsonl).
@@ -876,7 +1013,9 @@ def main() -> int:
                     help="p95 TPOT SLO for the window evidence count (default: registry)")
     ap.add_argument("--guard-mode", default="fail", choices=["fail", "warn"],
                     help="fail: a cell that did not deliver its load aborts the run")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
+    if args.step_ms is None:
+        args.step_ms = args.window_ms
     if args.schedule is None and args.instant_source == "pod":
         # The closed-loop path historically reads the store; keep that default intact.
         args.instant_source = "store"
@@ -886,6 +1025,11 @@ def main() -> int:
             if args.schedule is not None
             else SCRAPE_INTERVAL_MS
         )
+    return args
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    args = parse_args(argv)
 
     cells = enumerate_cells(
         (int(x) for x in args.input_buckets.split(",")),
@@ -962,8 +1106,16 @@ def main() -> int:
             windows.append(store.read_model_window(args.model, w, w + args.window_ms))
             w += args.window_ms
         results = compute_window_results(windows, spec)  # shared time-constant EMA (S1.4)
-        for wm, result in zip(windows, results):
-            rows.append(window_row(cell, wm, result.TRS, result.Q_ctl))
+        # Closed-loop: signal columns from the store (as before); latency from BOTH named
+        # sources - the client's per-request log (label source) and the server histograms.
+        rows.extend(closed_loop_rows(
+            cell, windows, results,
+            raw_records=_read_jsonl(raw_path) if raw_path is not None else [],
+            percentile_mode=args.percentile_mode,
+            min_latency_samples=args.min_latency_samples,
+            ttft_slo_ms=args.ttft_slo_ms if args.ttft_slo_ms is not None else spec.slo.ttft_p95_ms,
+            tpot_slo_ms=args.tpot_slo_ms if args.tpot_slo_ms is not None else spec.slo.tpot_p95_ms,
+        ))
         cell_windows = len(windows)
         ckpt.mark(cell)
         write_csv(rows, out)
