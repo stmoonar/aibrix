@@ -379,8 +379,12 @@ class BoundarySearch:
 
 #: The fit must publish a theta from at least this fraction of bootstrap resamples.
 MIN_PUBLISH_RATE = 0.9
-#: ... and its confidence interval must be narrower than this fraction of theta.
-MAX_CI_HALF_WIDTH_FRACTION = 0.10
+#: ... and its confidence interval must be narrower than this fraction of theta. Plan
+#: 2026-09-21 6.11 D13: 15 % (half width ~ 1/sqrt(n): 10 % needs 2.25x the independent
+#: windows; v1 had no CI gate at all, so 15 % is not a relaxation).
+MAX_CI_HALF_WIDTH_FRACTION = 0.15
+#: The tighter target reported in the appendix - informational, never gates the stop.
+APPENDIX_CI_HALF_WIDTH_FRACTION = 0.10
 #: Windows each family needs *near the boundary* before the campaign can stop. Below this
 #: the family-wise diagnostic in ``calibration_campaign.family_theta_verdict`` is being
 #: computed on too little to say anything.
@@ -399,12 +403,26 @@ class StopVerdict:
     satisfied: bool
     reasons: tuple[str, ...]
     hold_cells: tuple[dict, ...]
+    #: CI half width / theta, the gate it was judged against, and the appendix target (D13).
+    ci_half_width_fraction: Optional[float] = None
+    max_ci_half_width_fraction: float = MAX_CI_HALF_WIDTH_FRACTION
+    appendix_ci_half_width_fraction: float = APPENDIX_CI_HALF_WIDTH_FRACTION
+
+    @property
+    def appendix_ci_target_met(self) -> Optional[bool]:
+        if self.ci_half_width_fraction is None:
+            return None
+        return self.ci_half_width_fraction < self.appendix_ci_half_width_fraction
 
     def as_dict(self) -> dict:
         return {
             "satisfied": self.satisfied,
             "reasons": list(self.reasons),
             "hold_cells": [dict(c) for c in self.hold_cells],
+            "ci_half_width_fraction": self.ci_half_width_fraction,
+            "max_ci_half_width_fraction": self.max_ci_half_width_fraction,
+            "appendix_ci_half_width_fraction": self.appendix_ci_half_width_fraction,
+            "appendix_ci_target_met": self.appendix_ci_target_met,
         }
 
 
@@ -490,4 +508,6 @@ def stop_rule(
         satisfied=not reasons,
         reasons=tuple(reasons),
         hold_cells=tuple(holds),
+        ci_half_width_fraction=(abs(ci_half_width) / abs(theta)) if theta else None,
+        max_ci_half_width_fraction=max_ci_fraction,
     )

@@ -501,11 +501,26 @@ def test_the_stopping_rule_needs_publish_rate_ci_and_both_families() -> None:
     assert not thin.satisfied and any("publish rate" in r for r in thin.reasons)
 
     wide = boundary.stop_rule(
-        publish_rate=0.95, theta=1000.0, ci_half_width=150.0,
+        publish_rate=0.95, theta=1000.0, ci_half_width=160.0,
         family_boundary_windows={"prefill_heavy": 60, "decode_heavy": 55},
         boundaries={"S3": 1.0},
     )
     assert not wide.satisfied and any("CI half width" in r for r in wide.reasons)
+
+
+def test_d13_stop_gate_is_15_percent_and_10_percent_is_only_reported() -> None:
+    assert boundary.MAX_CI_HALF_WIDTH_FRACTION == 0.15
+    assert boundary.APPENDIX_CI_HALF_WIDTH_FRACTION == 0.10
+    families = {"prefill_heavy": 60, "decode_heavy": 55}
+    mid = boundary.stop_rule(publish_rate=0.95, theta=1000.0, ci_half_width=120.0,
+                             family_boundary_windows=families)
+    assert mid.satisfied and mid.appendix_ci_target_met is False
+    d = mid.as_dict()
+    assert d["ci_half_width_fraction"] == 0.12 and d["max_ci_half_width_fraction"] == 0.15
+    assert d["appendix_ci_half_width_fraction"] == 0.10 and d["appendix_ci_target_met"] is False
+    tight = boundary.stop_rule(publish_rate=0.95, theta=1000.0, ci_half_width=80.0,
+                               family_boundary_windows=families)
+    assert tight.satisfied and tight.appendix_ci_target_met is True
 
 
 def test_a_short_family_is_topped_up_with_hold_cells_never_with_a_new_shape() -> None:
