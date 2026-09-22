@@ -100,7 +100,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Mapping, Optional, Sequence
 
 from scripts import adaptive_boundary as boundary
 from scripts import admission_cap as admission
@@ -427,7 +427,9 @@ def estimate_wall_clock_s(cells: Sequence[Cell], cooldown_s: float) -> float:
     return sum(cell.duration_s + cooldown_s for cell in cells)
 
 
-def boundary_plan(models: Sequence[str], shapes: Sequence[str]) -> list[dict]:
+def boundary_plan(
+    models: Sequence[str], shapes: Sequence[str], *, coarse_seconds: float = boundary.COARSE_SECONDS,
+) -> list[dict]:
     """The boundary-search cells a campaign will generate, for the estimate and the plan.
 
     They carry no schedule path because they have none yet: each probe's rho comes from
@@ -440,8 +442,11 @@ def boundary_plan(models: Sequence[str], shapes: Sequence[str]) -> list[dict]:
             "shape": shape,
             "stage": BOUNDARY_STAGE,
             "probes": boundary.probe_count(),
-            "duration_s": boundary.shape_seconds(),
-            "stage_seconds": boundary.stage_seconds(),
+            "duration_s": boundary.shape_seconds(coarse_seconds),
+            "stage_seconds": boundary.stage_seconds(coarse_seconds),
+            # not in duration_s: only a shape whose coarse stage misses the flip pays it
+            "max_extension_probes": boundary.max_extension_probes(),
+            "max_extension_s": boundary.max_extension_seconds(coarse_seconds),
         }
         for model in models
         for shape in shapes
@@ -721,6 +726,7 @@ def probe_result_from_cell(
         violating_windows=violating,
         goodput=goodput_value,
         cell_id=cell_id,
+        conclusive=total >= boundary.MIN_PROBE_WINDOWS,
     )
 
 
@@ -1372,7 +1378,155 @@ def drive_boundary_search(
         ttft_slo_ms=args.ttft_slo_ms,
         tpot_slo_ms=args.tpot_slo_ms,
         capacity_source=measured.capacity_source,
+        search=new_boundary_search(cell.model, cell.shape, args),
     )
+
+
+def new_boundary_search(model: str, shape: str, args) -> boundary.BoundarySearch:
+    """The search a campaign drives: coarse probe length from ``--boundary-coarse-s``."""
+    return boundary.BoundarySearch(
+        model=model, shape=shape,
+        coarse_seconds=float(getattr(args, "boundary_coarse_s", boundary.COARSE_SECONDS)),
+    )
+
+
+# ------------------------------------------------------------------ re-probe mode
+
+
+def parse_reprobe_shapes(items: Sequence[str]) -> dict[str, list[str]]:
+    """``MODEL:SHAPE[,SHAPE...]`` (repeatable) -> {model: [shapes]}. Only training shapes:
+    the held-out mixture never gets a boundary search (see run_campaign)."""
+    out: dict[str, list[str]] = {}
+    for item in items:
+        model, sep, shapes = str(item).partition(":")
+        if not sep or not model or not shapes:
+            raise ValueError(f"--reprobe-shapes {item!r}: expected MODEL:SHAPE[,SHAPE...]")
+        for shape in (x.strip() for x in shapes.split(",")):
+            if not shape:
+                continue
+            if shape not in gen.TRAINING_SHAPES or gen.is_held_out(shape):
+                raise ValueError(f"--reprobe-shapes {item!r}: {shape!r} is not a training shape "
+                                 f"({', '.join(gen.TRAINING_SHAPES)})")
+            if shape not in out.setdefault(model, []):
+                out[model].append(shape)
+    if not out:
+        raise ValueError("--reprobe-shapes: nothing to re-probe")
+    return out
+
+
+def check_new_output_root(out_root: Path, source: Path) -> None:
+    """A re-probe writes into a NEW root: never into the source campaign, never inside or
+    around it, never into a non-empty directory (a re-measured rho* must not overwrite or
+    mix with the numbers it replaces)."""
+    out_root = Path(out_root).resolve()
+    source = Path(source).resolve()
+    if out_root == source or source in out_root.parents or out_root in source.parents:
+        raise ValueError(f"re-probe output root {out_root} overlaps the source campaign {source}")
+    if out_root.exists() and any(out_root.iterdir()):
+        raise ValueError(f"re-probe output root {out_root} exists and is not empty - pick a new one")
+
+
+def load_source_capacity(source: Path, model: str, shape: str) -> MeasuredCapacity:
+    path = Path(source) / model / "capacity" / f"{model}_{shape}.json"
+    if not path.exists():
+        raise ValueError(f"no capacity measurement {path}: the re-probe reuses the source "
+                         "campaign's steps capacity, it does not re-run steps")
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    levels = tuple(StepLevel(**level) for level in raw.get("levels") or ())
+    return MeasuredCapacity(**{**raw, "levels": levels})
+
+
+def reprobe_plan(args, targets: Mapping[str, Sequence[str]]) -> dict:
+    coarse_s = float(getattr(args, "boundary_coarse_s", boundary.COARSE_SECONDS))
+    entries = []
+    for model, shapes in targets.items():
+        for shape in shapes:
+            measured = load_source_capacity(args.reprobe_source, model, shape)
+            entries.append({
+                "model": model,
+                "shape": shape,
+                "capacity_used_rps": measured.capacity_used_rps,
+                "capacity_source": measured.capacity_source,
+                "capacity_file": str(Path(args.reprobe_source) / model / "capacity" / f"{model}_{shape}.json"),
+                "output_dir": str(Path(args.out_dir) / model),
+                "boundary_json": str(Path(args.out_dir) / model / "boundary" / f"{model}_{shape}.json"),
+            })
+    per_shape = boundary.shape_seconds(coarse_s)
+    extra = boundary.max_extension_seconds(coarse_s)
+    probes = boundary.probe_count() + boundary.max_extension_probes()
+    return {
+        "generated_at_utc": utc_iso(),
+        "mode": "reprobe",
+        "source_campaign": str(args.reprobe_source),
+        "output_root": str(args.out_dir),
+        "coarse_seconds": coarse_s,
+        "coarse_rhos": list(boundary.COARSE_RHOS),
+        "extend_down_rhos": list(boundary.EXTEND_DOWN_RHOS),
+        "extend_up_rhos": list(boundary.EXTEND_UP_RHOS),
+        "targets": entries,
+        "estimated_wall_clock_s": round(len(entries) * (per_shape + args.cooldown_s * boundary.probe_count()), 1),
+        "estimated_max_wall_clock_s": round(len(entries) * (per_shape + extra + args.cooldown_s * probes), 1),
+    }
+
+
+def run_reprobe(args, targets: Mapping[str, Sequence[str]]) -> int:
+    """``--reprobe-shapes``: re-measure only the listed (model, shape) boundaries.
+
+    Capacity comes from the source campaign's steps measurement (steps is not re-run);
+    every probe, raw file and boundary JSON goes under ``<out-dir>/<model>/`` of a NEW
+    root laid out like a campaign out-dir (``boundary/``, ``capacity/``, ``schedules/``,
+    ``raw/``), so ``static_grid --static-grid-reprobe <out-dir>`` can overlay it on the
+    source campaign. The source campaign is only read."""
+    check_new_output_root(args.out_dir, args.reprobe_source)
+    plan = reprobe_plan(args, targets)
+    out_root = Path(args.out_dir)
+    out_root.mkdir(parents=True, exist_ok=True)
+    (out_root / "reprobe_plan.json").write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")
+    for entry in plan["targets"]:
+        print(f"  reprobe {entry['model']:12} {entry['shape']:3} C_s={entry['capacity_used_rps']:.3f} "
+              f"({entry['capacity_source']}) -> {entry['boundary_json']}")
+    print(f"{len(plan['targets'])} boundary re-probes, ~{plan['estimated_wall_clock_s'] / 3600.0:.2f} h "
+          f"(<= {plan['estimated_max_wall_clock_s'] / 3600.0:.2f} h with every extension probe)")
+    if args.dry_run:
+        print(f"dry run: wrote {out_root / 'reprobe_plan.json'}")
+        return 0
+
+    mode = controller_mode(args.controller_namespace)
+    if mode != REQUIRED_CONTROLLER_MODE:
+        raise SystemExit(f"controller mode is {mode!r}, refusing to run (need {REQUIRED_CONTROLLER_MODE!r})")
+    index_path = Path(args.index)
+    index = json.loads(index_path.read_text(encoding="utf-8")) if index_path.exists() else {}
+    cap = admission.get_cap(args.cap or index.get("admission_cap", {}).get("name")
+                            or admission.DEFAULT_CAP_NAME)
+    first = True
+    for model, shapes in targets.items():
+        model_dir = out_root / model
+        for sub in ("boundary", "capacity", "schedules", "raw"):
+            (model_dir / sub).mkdir(parents=True, exist_ok=True)
+        model_args = argparse.Namespace(**{**vars(args), "raw_dir": model_dir / "raw"})
+        for shape in shapes:
+            measured = load_source_capacity(args.reprobe_source, model, shape)
+            (model_dir / "capacity" / f"{model}_{shape}.json").write_text(
+                json.dumps({**measured.as_dict(), "copied_from": str(args.reprobe_source)}, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            if not first:
+                time.sleep(args.cooldown_s)
+            first = False
+            cell = Cell(model=model, shape=shape, primitive=gen.HOLD_PRIMITIVE, cell_id="",
+                        schedule="", duration_s=0.0, capacity_rps=measured.capacity_used_rps,
+                        capacity_source=measured.capacity_source)
+            search = drive_boundary_search(cell, measured, model_args, cap=cap,
+                                           schedule_dir=model_dir / "schedules", out_dir=model_dir)
+            body = {**search.as_dict(), "reprobe": {"source_campaign": str(args.reprobe_source)}}
+            (model_dir / "boundary" / f"{model}_{shape}.json").write_text(
+                json.dumps(body, indent=2) + "\n", encoding="utf-8"
+            )
+            print(f"reprobe {model}/{shape}: rho* = {search.rho_star} ({body['rho_star_status']})"
+                  + (f"; {search.unresolved_reason}" if search.unresolved_reason else "")
+                  + (f"; STOPPED: {search.stopped_reason}" if search.stopped_reason else ""))
+    print(f"re-probe complete; artifacts under {out_root}")
+    return 0
 
 
 def static_grid_enabled(args) -> bool:
@@ -1380,9 +1534,31 @@ def static_grid_enabled(args) -> bool:
 
 
 def plan_static_cells(args, models: Sequence[str]) -> tuple[list, dict]:
-    """(static cells, surfaces) for ``--static-grid``, from ``--static-grid-source``."""
+    """(static cells, surfaces) for ``--static-grid``, from ``--static-grid-source`` (with
+    ``--static-grid-reprobe`` boundary / capacity files overlaid on it).
+
+    Refuses when a source shape's rho* is not ``measured`` (a bound or a bisection grid
+    point would place the grid on a guess - plan 6.11); ``--static-grid-allow-unmeasured``
+    turns the refusal into a loud warning."""
+    import sys as _sys
+
     source = Path(args.static_grid_source)
-    surfaces = {m: static_grid.load_surface(source, m) for m in models}
+    overlay = getattr(args, "static_grid_reprobe", None)
+    surfaces = {m: static_grid.load_surface(source, m, overlay=overlay) for m in models}
+    bad = {m: static_grid.unmeasured_shapes(s) for m, s in surfaces.items()}
+    bad = {m: v for m, v in bad.items() if v}
+    if bad:
+        listing = "; ".join(
+            f"{m}: " + ", ".join(f"{shape}={status}" for shape, status in sorted(v.items()))
+            for m, v in sorted(bad.items())
+        )
+        message = (f"static grid source rho* not measured ({listing}) - re-probe these shapes "
+                   "(--reprobe-shapes) and pass --static-grid-reprobe")
+        if not getattr(args, "static_grid_allow_unmeasured", False):
+            raise SystemExit(f"refusing to plan the static grid: {message}")
+        banner = "!" * 78
+        print(f"{banner}\nWARNING: {message}\n(--static-grid-allow-unmeasured: planning anyway)\n{banner}",
+              file=_sys.stderr)
     cells = static_grid.plan_static_grid(
         models,
         surfaces,
@@ -1481,7 +1657,10 @@ def run_campaign(args) -> int:
         shape for shape in gen.ALL_SHAPES
         if not gen.is_held_out(shape) and any(c.shape == shape for c in runnable)
     ]
-    boundary_cells = boundary_plan(models, boundary_shapes)
+    boundary_cells = boundary_plan(
+        models, boundary_shapes,
+        coarse_seconds=float(getattr(args, "boundary_coarse_s", boundary.COARSE_SECONDS)),
+    )
     schedule_seconds = estimate_wall_clock_s(runnable, args.cooldown_s)
     boundary_seconds = estimate_boundary_wall_clock_s(boundary_cells, args.cooldown_s)
     static_seconds = sum(c.duration_s + args.cooldown_s for c in static_cells)
@@ -1641,8 +1820,8 @@ def run_campaign(args) -> int:
                     )
                     searches[(cell.model, cell.shape)] = search
                     print(
-                        f"boundary {cell.model}/{cell.shape}: rho* = {search.rho_star}, "
-                        f"dwelled at {search.dwell_rho}"
+                        f"boundary {cell.model}/{cell.shape}: rho* = {search.rho_star} "
+                        f"({search.status()['status']}), dwelled at {search.dwell_rho}"
                         + ("" if search.boundary_found else " (NO violation was observed - "
                            "the boundary is above everything offered)")
                         + (f"; STOPPED: {search.stopped_reason}" if search.stopped_reason else "")
@@ -1756,6 +1935,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     help="campaign out-dir whose <model>/capacity and <model>/boundary "
                          "JSONs place the grid")
     ap.add_argument("--static-grid-hold-s", type=float, default=gen.STATIC_GRID_HOLD_S)
+    ap.add_argument("--static-grid-reprobe", type=Path, default=None,
+                    help="a --reprobe-shapes output root whose <model>/boundary and "
+                         "<model>/capacity JSONs replace the source campaign's for those shapes")
+    ap.add_argument("--static-grid-allow-unmeasured", action="store_true",
+                    help="plan the static grid even when a source shape's rho* is a bound or "
+                         "a grid artifact (prints a loud warning instead of refusing)")
+    ap.add_argument("--boundary-coarse-s", type=float, default=boundary.COARSE_SECONDS,
+                    help=f"coarse boundary probe length (default {boundary.COARSE_SECONDS:g} s = 3 "
+                         f"windows; {boundary.LEGACY_COARSE_SECONDS:g} s reproduces the 2026-09-21 "
+                         "campaign, whose 2-window coarse probes were all inconclusive)")
+    ap.add_argument("--reprobe-shapes", action="append", default=[], metavar="MODEL:SHAPE[,SHAPE]",
+                    help="re-measure only these shapes' SLO boundaries (repeatable), reusing the "
+                         "source campaign's steps capacity, into the NEW root --out-dir; runs "
+                         "nothing else")
+    ap.add_argument("--reprobe-source", type=Path, default=static_grid.DEFAULT_SOURCE_CAMPAIGN,
+                    help="campaign root whose <model>/capacity JSONs the re-probe reuses")
     args = ap.parse_args(argv)
     if args.static_grid_list:
         models = [m for m in args.models.split(",") if m]
@@ -1775,6 +1970,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"--fit-window-align grid needs --fit-step-ms to be a multiple of {LIVE_GRID_MS} "
             f"(got {args.fit_step_ms}); use --fit-window-align none for a free-phase step"
         )
+    if args.reprobe_shapes:
+        try:
+            targets = parse_reprobe_shapes(args.reprobe_shapes)
+            return run_reprobe(args, targets)
+        except ValueError as exc:
+            ap.error(str(exc))
     return run_campaign(args)
 
 

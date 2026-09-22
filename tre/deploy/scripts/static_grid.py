@@ -32,6 +32,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Mapping, Optional, Sequence
 
+from scripts import adaptive_boundary as boundary
 from scripts import gen_calibration_schedules as gen
 
 #: The campaign whose measured capacities and boundaries place the grid.
@@ -53,6 +54,10 @@ class BoundarySurface:
     boundary_shapes: tuple[str, ...]
     #: shape -> why it did not enter the boundary fit
     excluded: dict = field(default_factory=dict)
+    #: shape -> rho* status of its boundary file (adaptive_boundary.rho_star_status)
+    rho_star_status: dict = field(default_factory=dict)
+    #: shape -> the file its boundary came from (the re-probe overlay or the source)
+    boundary_files: dict = field(default_factory=dict)
 
     def capacity_rps(self, i: float, o: float) -> float:
         return self.capacity.rps(i, o)
@@ -80,6 +85,8 @@ class BoundarySurface:
                 "shapes": list(self.boundary_shapes),
             },
             "excluded": dict(self.excluded),
+            "rho_star_status": dict(self.rho_star_status),
+            "boundary_files": dict(self.boundary_files),
         }
 
 
@@ -88,17 +95,30 @@ def _mean_lengths(shape: str) -> tuple[float, float]:
     return gen._length_mean(i), gen._length_mean(o)
 
 
-def load_surface(source_dir: Path, model: str) -> BoundarySurface:
-    """Fit ``C(i, o)`` and ``r*(i, o)`` from ``<source>/<model>/{capacity,boundary}/``."""
+def unmeasured_shapes(surface: BoundarySurface) -> dict:
+    """{shape: status} of every boundary file whose rho* is not ``measured``."""
+    return {s: st for s, st in surface.rho_star_status.items() if st != boundary.RHO_STAR_MEASURED}
+
+
+def load_surface(source_dir: Path, model: str, *, overlay: Optional[Path] = None) -> BoundarySurface:
+    """Fit ``C(i, o)`` and ``r*(i, o)`` from ``<source>/<model>/{capacity,boundary}/``; a
+    shape's files under ``<overlay>/<model>/`` (a ``--reprobe-shapes`` root) win."""
     root = Path(source_dir) / model
+    over = Path(overlay) / model if overlay is not None else None
     capacity_points: list[tuple[float, float, float]] = []
     boundary_points: list[tuple[float, float, float]] = []
     capacity_shapes: list[str] = []
     boundary_shapes: list[str] = []
     excluded: dict = {}
+    statuses: dict = {}
+    files: dict = {}
     for shape in gen.TRAINING_SHAPES:
         cap_path = root / "capacity" / f"{model}_{shape}.json"
         bnd_path = root / "boundary" / f"{model}_{shape}.json"
+        if over is not None and (over / "boundary" / f"{model}_{shape}.json").exists():
+            bnd_path = over / "boundary" / f"{model}_{shape}.json"
+            if (over / "capacity" / f"{model}_{shape}.json").exists():
+                cap_path = over / "capacity" / f"{model}_{shape}.json"
         if not cap_path.exists():
             excluded[shape] = "no capacity file"
             continue
@@ -110,6 +130,8 @@ def load_surface(source_dir: Path, model: str) -> BoundarySurface:
             excluded[shape] = "no boundary file"
             continue
         search = json.loads(bnd_path.read_text(encoding="utf-8"))
+        statuses[shape] = boundary.saved_rho_star_status(search)
+        files[shape] = str(bnd_path)
         if not search.get("boundary_found") or search.get("rho_star") is None:
             excluded[shape] = "boundary not found (rho* is only a lower bound)"
             continue
@@ -126,6 +148,8 @@ def load_surface(source_dir: Path, model: str) -> BoundarySurface:
         capacity_shapes=tuple(capacity_shapes),
         boundary_shapes=tuple(boundary_shapes),
         excluded=excluded,
+        rho_star_status=statuses,
+        boundary_files=files,
     )
 
 

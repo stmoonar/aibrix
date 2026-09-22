@@ -384,10 +384,10 @@ def test_the_search_brackets_the_flip_then_bisects_then_dwells_under_it() -> Non
 
 def test_the_three_stages_cost_what_the_plan_says_they_do() -> None:
     seconds = boundary.stage_seconds()
-    assert seconds["coarse"] == 3 * 60.0
+    assert seconds["coarse"] == 3 * 90.0
     assert seconds["bisect"] == 2 * 120.0
     assert seconds["dwell"] == 300.0
-    assert boundary.shape_seconds() == 720.0
+    assert boundary.shape_seconds() == 810.0
     assert boundary.probe_count() == 6
 
 
@@ -651,10 +651,10 @@ def test_the_held_out_shape_gets_no_boundary_search() -> None:
 def test_the_boundary_plan_prices_the_search_honestly() -> None:
     cells = campaign.boundary_plan(["dsqwen-7b"], ["S1", "S3"])
     assert [c["probes"] for c in cells] == [boundary.probe_count()] * 2
-    assert cells[0]["duration_s"] == boundary.shape_seconds() == 720.0
-    # 720 s of offered load plus one cooldown per probe cell
+    assert cells[0]["duration_s"] == boundary.shape_seconds() == 810.0
+    # 810 s of offered load plus one cooldown per probe cell
     assert campaign.estimate_boundary_wall_clock_s(cells, 45.0) == pytest.approx(
-        2 * (720.0 + 45.0 * 6)
+        2 * (810.0 + 45.0 * 6)
     )
 
 

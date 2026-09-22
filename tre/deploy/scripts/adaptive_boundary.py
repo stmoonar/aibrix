@@ -13,8 +13,15 @@ centred on a guess.
 
 The search here spends the same wall clock in three stages of increasing resolution:
 
-1. **coarse** - 60 s at each of rho in {0.6, 0.9, 1.1}. Three cheap probes, only enough
-   to find which interval the violation flip happens in.
+1. **coarse** - 90 s at each of rho in {0.6, 0.9, 1.1}. Three cheap probes, only enough
+   to find which interval the violation flip happens in. 90 s, not 60: a 60 s probe
+   yields 2 tumbling 30 s windows, fewer than :data:`MIN_PROBE_WINDOWS`, so every coarse
+   verdict of the 2026-09-21 campaign was inconclusive and was read as healthy.
+1b. **extend** - when the coarse stage did not bracket the flip, probe outward before
+   bisecting: DOWN at {0.45, 0.3} when even the lowest coarse probe violated, UP at
+   {1.5, 2.0, 2.6} when even the top one was healthy, stopping at the first probe that
+   closes the bracket. A search that still has no bracket after this does not bisect or
+   dwell on a guess; it reports rho* as a bound (:func:`rho_star_status`).
 2. **bisect** - 2 rounds of 120 s, each halving the bracket the coarse stage produced.
    Longer, because a probe near the boundary has to distinguish "violating" from "noisy",
    and that needs windows.
@@ -22,7 +29,18 @@ The search here spends the same wall clock in three stages of increasing resolut
    sitting just *under* the located boundary produces the densest possible supply of
    windows on both sides of it, which is exactly the regime a threshold is fitted on.
 
-About 12 minutes of offered load per shape, plus cooldowns.
+About 13.5 minutes of offered load per shape (plus up to 3 extension probes), plus
+cooldowns.
+
+What rho* is
+------------
+:func:`rho_star_status` labels every result instead of silently reporting a grid point:
+``measured`` (a conclusive healthy probe within :data:`MAX_BRACKET_REL_WIDTH` under the
+lowest conclusive violating one), ``grid_artifact`` (a bracket wider than that, or one
+whose healthy side exists only through inconclusive probes - the number is where the
+bisection happened to stop), ``upper_bound`` (violating everywhere probed) and
+``lower_bound`` (healthy everywhere probed). Only ``measured`` may place static-grid
+cells (``scripts.static_grid``).
 
 Why dwell sits below rho*, not on it
 ------------------------------------
@@ -51,7 +69,27 @@ from typing import Optional, Sequence
 #: Coarse probes. 1.1 is above the prior's capacity and 0.6 well under it, so the flip -
 #: if the prior is anywhere near right - is bracketed by the first three cells.
 COARSE_RHOS: tuple[float, ...] = (0.6, 0.9, 1.1)
-COARSE_SECONDS = 60.0
+#: 3 tumbling 30 s windows (>= MIN_PROBE_WINDOWS); ``calibration_campaign
+#: --boundary-coarse-s`` overrides it (60 reproduces the 2026-09-21 campaign).
+COARSE_SECONDS = 90.0
+LEGACY_COARSE_SECONDS = 60.0
+
+#: Outward probes when the coarse stage did not bracket the flip (rho, relative to the
+#: same capacity prior): down when the lowest coarse probe already violated, up past the
+#: top coarse probe (and past the old 1.1 * 1.3^2 = 1.859 reach) when it was healthy.
+EXTEND_DOWN_RHOS: tuple[float, ...] = (0.45, 0.3)
+EXTEND_UP_RHOS: tuple[float, ...] = (1.5, 2.0, 2.6)
+
+#: A bracket (healthy, violating) narrower than this fraction of its upper end is a
+#: measured boundary; a wider one is a grid point. Two bisection rounds bring the coarse
+#: brackets to 0.05-0.08.
+MAX_BRACKET_REL_WIDTH = 0.10
+
+RHO_STAR_MEASURED = "measured"
+RHO_STAR_LOWER_BOUND = "lower_bound"
+RHO_STAR_UPPER_BOUND = "upper_bound"
+RHO_STAR_GRID_ARTIFACT = "grid_artifact"
+RHO_STAR_STATUSES = (RHO_STAR_MEASURED, RHO_STAR_LOWER_BOUND, RHO_STAR_UPPER_BOUND, RHO_STAR_GRID_ARTIFACT)
 
 #: Bisection. Two rounds take a bracket of width 0.5 down to 0.125, which is finer than
 #: the capacity prior's own error, so a third round would be refining a number whose
@@ -102,27 +140,38 @@ def next_void_attempt(
     return int(attempt) + 1
 
 STAGE_COARSE = "coarse"
+STAGE_EXTEND = "extend"
 STAGE_BISECT = "bisect"
 STAGE_DWELL = "dwell"
-STAGES = (STAGE_COARSE, STAGE_BISECT, STAGE_DWELL)
+STAGES = (STAGE_COARSE, STAGE_EXTEND, STAGE_BISECT, STAGE_DWELL)
 
 
-def stage_seconds() -> dict[str, float]:
-    """Offered-load seconds each stage spends on one shape."""
+def stage_seconds(coarse_seconds: float = COARSE_SECONDS) -> dict[str, float]:
+    """Offered-load seconds each stage spends on one shape when the coarse stage brackets
+    the flip (the extension stage is then empty; see :func:`max_extension_seconds`)."""
     return {
-        STAGE_COARSE: len(COARSE_RHOS) * COARSE_SECONDS,
+        STAGE_COARSE: len(COARSE_RHOS) * coarse_seconds,
         STAGE_BISECT: BISECT_ROUNDS * BISECT_SECONDS,
         STAGE_DWELL: DWELL_SECONDS,
     }
 
 
-def shape_seconds() -> float:
+def shape_seconds(coarse_seconds: float = COARSE_SECONDS) -> float:
     """Offered-load seconds for one shape's whole search (excludes cooldowns)."""
-    return sum(stage_seconds().values())
+    return sum(stage_seconds(coarse_seconds).values())
 
 
 def probe_count() -> int:
     return len(COARSE_RHOS) + BISECT_ROUNDS + 1
+
+
+def max_extension_probes() -> int:
+    return max(len(EXTEND_DOWN_RHOS), len(EXTEND_UP_RHOS))
+
+
+def max_extension_seconds(coarse_seconds: float = COARSE_SECONDS) -> float:
+    """Worst-case extra offered load of the extension stage (it runs at coarse length)."""
+    return max_extension_probes() * coarse_seconds
 
 
 # --------------------------------------------------------------------------- verdicts
@@ -162,12 +211,16 @@ class ProbeResult:
     violating_windows: int = 0
     goodput: Optional[float] = None
     cell_id: str = ""
+    #: False when the probe produced fewer than MIN_PROBE_WINDOWS windows: its verdict
+    #: is then evidence in neither direction and moves neither end of the bracket.
+    conclusive: bool = True
 
     def as_dict(self) -> dict:
         body = self.probe.as_dict()
         body.update({
             "violated": self.violated,
             "valid": self.valid,
+            "conclusive": self.conclusive,
             "void_reasons": list(self.void_reasons),
             "windows": self.windows,
             "violating_windows": self.violating_windows,
@@ -192,8 +245,9 @@ def probe_violated(
     even though the failed request contributed no latency sample.
 
     With fewer than ``min_windows`` rows the probe is reported as not violating *and* the
-    caller is expected to look at the counts: the search treats a too-short probe as
-    inconclusive rather than as healthy (see :meth:`BoundarySearch.record`).
+    caller is expected to look at the counts: ``calibration_campaign.probe_result_from_cell``
+    marks it ``conclusive=False`` and :meth:`BoundarySearch.record` then moves neither end
+    of the bracket (a too-short probe is inconclusive, not healthy).
     """
     total = len(rows)
     violating = 0
@@ -212,6 +266,72 @@ def probe_violated(
     return violating >= window_fraction * total, violating, total
 
 
+# ------------------------------------------------------------------------ rho* status
+
+
+def _probe_conclusive(probe: dict, min_windows: int) -> bool:
+    if "conclusive" in probe:
+        return bool(probe["conclusive"])
+    return int(probe.get("windows") or 0) >= int(min_windows)
+
+
+def rho_star_status(
+    probes: Sequence[dict],
+    *,
+    min_windows: int = MIN_PROBE_WINDOWS,
+    max_rel_width: float = MAX_BRACKET_REL_WIDTH,
+) -> dict:
+    """What a search's rho* is, from its probe records (``ProbeResult.as_dict`` rows, as
+    saved in ``<campaign>/<model>/boundary/<model>_<shape>.json``).
+
+    Only valid, conclusive probes are evidence; a saved probe without a ``conclusive``
+    field (written before it existed) is conclusive iff it has ``min_windows`` windows -
+    which is exactly what the 60 s coarse probes of the 2026-09-21 campaign lacked.
+    Returns ``{"status", "rho_star", "healthy_rho", "violating_rho", "bracket_rel_width"}``;
+    ``status`` is None when no conclusive probe exists.
+    """
+    valid = [p for p in probes if p.get("valid", True)]
+    conclusive = [p for p in valid if _probe_conclusive(p, min_windows)]
+    viol = [float(p["rho"]) for p in conclusive if p.get("violated")]
+    hi = min(viol) if viol else None
+    healthy = [float(p["rho"]) for p in conclusive if not p.get("violated") and (hi is None or float(p["rho"]) < hi)]
+    lo = max(healthy) if healthy else None
+    width = None
+    if hi is None:
+        status = RHO_STAR_LOWER_BOUND if lo is not None else None
+        rho_star = lo
+    elif lo is None:
+        inconclusive_below = any(
+            not _probe_conclusive(p, min_windows) and float(p["rho"]) < hi for p in valid
+        )
+        status = RHO_STAR_GRID_ARTIFACT if inconclusive_below else RHO_STAR_UPPER_BOUND
+        rho_star = hi
+    else:
+        width = (hi - lo) / hi
+        status = RHO_STAR_MEASURED if width <= max_rel_width else RHO_STAR_GRID_ARTIFACT
+        rho_star = hi
+    return {
+        "status": status,
+        "rho_star": rho_star,
+        "healthy_rho": lo,
+        "violating_rho": hi,
+        "bracket_rel_width": width,
+        "max_bracket_rel_width": max_rel_width,
+        "min_probe_windows": int(min_windows),
+    }
+
+
+def saved_rho_star_status(search: dict) -> str:
+    """Status of a saved search JSON: its own ``rho_star_status`` when it recorded one,
+    else recomputed from its probes; a record with neither (hand-written fixtures) falls
+    back to ``boundary_found`` -> measured / lower_bound."""
+    if search.get("rho_star_status"):
+        return str(search["rho_star_status"])
+    if search.get("probes"):
+        return rho_star_status(search["probes"])["status"] or RHO_STAR_LOWER_BOUND
+    return RHO_STAR_MEASURED if search.get("boundary_found") else RHO_STAR_LOWER_BOUND
+
+
 # ---------------------------------------------------------------------------- search
 
 
@@ -228,6 +348,10 @@ class BoundarySearch:
     shape: str = ""
     coarse_rhos: tuple[float, ...] = COARSE_RHOS
     coarse_seconds: float = COARSE_SECONDS
+    #: Empty tuples switch the extension stage off (the pre-2026-09-22 search, which
+    #: bisects outward by BRACKET_EXTENSION instead).
+    extend_down_rhos: tuple[float, ...] = EXTEND_DOWN_RHOS
+    extend_up_rhos: tuple[float, ...] = EXTEND_UP_RHOS
     bisect_rounds: int = BISECT_ROUNDS
     bisect_seconds: float = BISECT_SECONDS
     dwell_fraction: float = DWELL_FRACTION
@@ -240,6 +364,10 @@ class BoundarySearch:
     violating_rho: Optional[float] = None
     stopped_reason: str = ""
 
+    #: Why the search ended without a bracket after the extension stage (not a failure:
+    #: rho* is then reported as a bound).
+    unresolved_reason: str = ""
+
     _coarse_index: int = 0
     _bisect_done: int = 0
     _dwell_done: bool = False
@@ -248,16 +376,40 @@ class BoundarySearch:
     # ------------------------------------------------------------------ progression
 
     @property
+    def extension_enabled(self) -> bool:
+        return bool(self.extend_down_rhos or self.extend_up_rhos)
+
+    @property
+    def bracketed(self) -> bool:
+        return self.healthy_rho is not None and self.violating_rho is not None
+
+    def _extension_rho(self) -> Optional[float]:
+        """Next outward probe, or None when the bracket is closed or the list is used up."""
+        if self.bracketed:
+            return None
+        tried = {r.probe.rho for r in self.results if r.probe.stage == STAGE_EXTEND and r.valid}
+        lo, hi = self.healthy_rho, self.violating_rho
+        if hi is not None:
+            below = [r for r in self.extend_down_rhos if r < hi and r not in tried]
+            return max(below) if below else None
+        if lo is not None:
+            above = [r for r in self.extend_up_rhos if r > lo and r not in tried]
+            return min(above) if above else None
+        return None
+
+    @property
     def stage(self) -> str:
         if self._coarse_index < len(self.coarse_rhos):
             return STAGE_COARSE
+        if self.extension_enabled and self._extension_rho() is not None:
+            return STAGE_EXTEND
         if self._bisect_done < self.bisect_rounds:
             return STAGE_BISECT
         return STAGE_DWELL
 
     @property
     def done(self) -> bool:
-        return bool(self.stopped_reason) or self._dwell_done
+        return bool(self.stopped_reason) or bool(self.unresolved_reason) or self._dwell_done
 
     @property
     def boundary_found(self) -> bool:
@@ -291,6 +443,22 @@ class BoundarySearch:
         stage = self.stage
         if stage == STAGE_COARSE:
             probe = Probe(self.coarse_rhos[self._coarse_index], self.coarse_seconds, stage)
+        elif stage == STAGE_EXTEND:
+            probe = Probe(self._extension_rho(), self.coarse_seconds, stage)
+        elif stage in (STAGE_BISECT, STAGE_DWELL) and self.extension_enabled and not self.bracketed \
+                and (self.healthy_rho is not None or self.violating_rho is not None):
+            # Extended both ways as far as allowed and still no flip: rho* is a bound.
+            # Bisecting or dwelling on a one-sided "bracket" would only manufacture a grid
+            # point (plan 6.11: 13/21 rho* of the 2026-09-21 campaign were such points).
+            if self.violating_rho is None:
+                self.unresolved_reason = (
+                    f"no violation up to rho={self.healthy_rho:g}: rho* is a lower bound"
+                )
+            else:
+                self.unresolved_reason = (
+                    f"violating down to rho={self.violating_rho:g}: rho* is an upper bound"
+                )
+            return None
         elif stage == STAGE_BISECT:
             rho = self._bisect_rho()
             if rho is None:
@@ -345,7 +513,9 @@ class BoundarySearch:
             )
             return
 
-        if result.violated:
+        if not result.conclusive:
+            pass  # too few windows: evidence in neither direction
+        elif result.violated:
             if self.violating_rho is None or result.probe.rho < self.violating_rho:
                 self.violating_rho = result.probe.rho
         else:
@@ -354,23 +524,37 @@ class BoundarySearch:
 
         if result.probe.stage == STAGE_COARSE:
             self._coarse_index += 1
+        elif result.probe.stage == STAGE_EXTEND:
+            pass  # the extension stage ends by itself (bracket closed or list used up)
         elif result.probe.stage == STAGE_BISECT:
             self._bisect_done += 1
         else:
             self._dwell_done = True
 
+    def status(self) -> dict:
+        """:func:`rho_star_status` of this search's probes."""
+        return rho_star_status([r.as_dict() for r in self.results])
+
     def as_dict(self) -> dict:
+        st = self.status()
         return {
             "model": self.model,
             "shape": self.shape,
-            "stage_seconds": stage_seconds(),
+            "stage_seconds": stage_seconds(self.coarse_seconds),
             "coarse_rhos": list(self.coarse_rhos),
+            "coarse_seconds": self.coarse_seconds,
+            "extend_down_rhos": list(self.extend_down_rhos),
+            "extend_up_rhos": list(self.extend_up_rhos),
             "healthy_rho": self.healthy_rho,
             "violating_rho": self.violating_rho,
             "rho_star": self.rho_star,
+            "rho_star_status": st["status"],
+            "rho_star_bracket": [st["healthy_rho"], st["violating_rho"]],
+            "bracket_rel_width": st["bracket_rel_width"],
             "dwell_rho": self.dwell_rho,
             "boundary_found": self.boundary_found,
             "stopped_reason": self.stopped_reason,
+            "unresolved_reason": self.unresolved_reason,
             "probes": [r.as_dict() for r in self.results],
         }
 
