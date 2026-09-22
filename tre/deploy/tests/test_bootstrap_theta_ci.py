@@ -143,3 +143,14 @@ def test_point_estimate_and_interval_move_together_when_the_criterion_changes(
     for report in (balanced, reliability):
         b = report["bootstrap"]
         assert b["theta_p2_5"] <= report["point_fit"]["theta"] <= b["theta_p97_5"]
+
+
+def test_the_report_carries_the_shared_label_and_e2e_is_rejected(tmp_path) -> None:
+    """Plan 6.10 leftover: the CI driver uses tre_calibration.labels, like every fit."""
+    import pytest
+
+    report = _run(tmp_path, "label")
+    assert report["label_def"]["name"] == "p95_ttft_tpot_plus_unserved_v1"
+    assert report["label_def"]["e2e"] == "excluded"
+    with pytest.raises(SystemExit, match="e2e"):
+        _run(tmp_path, "e2e", "--e2e-p95-ms", "1000")

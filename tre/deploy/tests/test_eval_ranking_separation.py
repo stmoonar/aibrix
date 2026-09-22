@@ -241,3 +241,21 @@ def test_cli_report_records_the_criterion(tmp_path) -> None:
     assert report["method"]["theta_m_method"] == THETA_METHOD_BALANCED_ACCURACY
     assert report["fit_config"]["theta_criterion"] == DEFAULT_THETA_CRITERION
     assert report["fit_config"]["direction"] == DEFAULT_SIGNAL_DIRECTION
+
+
+def test_cli_uses_the_shared_label_and_rejects_e2e(tmp_path) -> None:
+    """Plan 6.10 leftover: acceptance scores the same label the fit used."""
+    import pytest
+
+    src = tmp_path / "windows.csv"
+    out = tmp_path / "report.json"
+    _write_windows_csv(src, _separable_windows())
+    base = [
+        "--input", str(src), "--output", str(out), "--model-name", "dsqwen-7b",
+        "--ttft-p95-ms", "100", "--tpot-p95-ms", "50", "--test-fraction", "0.25",
+    ]
+    assert eval_ranking_separation.main(base) == 0
+    report = json.loads(out.read_text(encoding="utf-8"))
+    assert report["label_def"]["name"] == "p95_ttft_tpot_plus_unserved_v1"
+    with pytest.raises(SystemExit, match="e2e"):
+        eval_ranking_separation.main([*base, "--e2e-p95-ms", "1000"])

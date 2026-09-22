@@ -43,18 +43,20 @@ from tre_calibration.fit import (
     THETA_CRITERIA,
     ThetaFitConfig,
 )
+from tre_calibration.labels import LabelDefinition
 from tre_calibration.profile import theta_fit_block, theta_method_of
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(argv)
 
-    latency_slo_ms: dict[str, float] = {
-        "ttft_p95": args.ttft_p95_ms,
-        "tpot_p95": args.tpot_p95_ms,
-    }
     if args.e2e_p95_ms is not None:
-        latency_slo_ms["e2e_p95"] = args.e2e_p95_ms
+        raise SystemExit(
+            "--e2e-p95-ms is no longer accepted: the shared label (tre_calibration.labels) "
+            "is p95 TTFT/TPOT + unserved; e2e is excluded (plan 6.3 B4)"
+        )
+    label_def = LabelDefinition(args.ttft_p95_ms, args.tpot_p95_ms)
+    latency_slo_ms = label_def.latency_slo_ms()
 
     windows = load_windows_from_csv(
         args.input,
@@ -105,6 +107,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "signal_column": args.signal_column,
         "trim_ramp_windows": args.trim_ramp_windows,
         "slo": dict(latency_slo_ms),
+        "label_def": label_def.as_dict(),
         "method": {"theta_m_method": theta_method_of(point)},
         "fit_config": dict(sorted(fit_config.items())),
         "window": {"count": len(windows), "n_cells": n_cells},
@@ -167,7 +170,7 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument("--trim-ramp-windows", type=int, default=1)
     parser.add_argument("--ttft-p95-ms", type=float, required=True)
     parser.add_argument("--tpot-p95-ms", type=float, required=True)
-    parser.add_argument("--e2e-p95-ms", type=float)
+    parser.add_argument("--e2e-p95-ms", type=float, help="rejected: e2e is not part of the label")
     parser.add_argument(
         "--theta-criterion",
         choices=THETA_CRITERIA,
