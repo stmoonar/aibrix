@@ -763,8 +763,13 @@ def family_theta_verdict(
     family_thetas: dict[str, float],
     *,
     tolerance: float = FAMILY_SPREAD_TOLERANCE,
+    direction: str = "higher_is_healthier",
 ) -> dict:
     """Publish the merged theta, or fall back to the LARGEST family theta.
+
+    (For a ``lower_is_healthier`` signal - the ablation arms queue length and token rates,
+    ``z = theta / value`` - a SMALLER theta makes CRITICAL easier, so the conservative
+    fallback there is the SMALLEST family theta; ``direction`` selects it.)
 
     The merged fit pools the prefill-heavy and decode-heavy shapes, which is only
     legitimate if they are measuring the same threshold. Fitting each family separately
@@ -807,6 +812,23 @@ def family_theta_verdict(
             "family_thetas": dict(sorted(family_thetas.items())),
             "ci_half_width": ci_half_width,
             "outside": [],
+        }
+    if direction == "lower_is_healthier":
+        chosen = min(family_thetas.items(), key=lambda kv: float(kv[1]))
+        return {
+            "publish": "min_family",
+            "theta": float(chosen[1]),
+            "family": chosen[0],
+            "reason": (
+                f"family theta(s) {outside} fall outside the merged bootstrap CI "
+                f"(+/-{bound:.4g}), so theta depends on the regime; the smallest family "
+                f"theta ({chosen[0]}) is published because this signal is "
+                "lower_is_healthier (Z = theta/value), so the smaller theta errs towards "
+                "adding capacity"
+            ),
+            "family_thetas": dict(sorted(family_thetas.items())),
+            "ci_half_width": ci_half_width,
+            "outside": outside,
         }
     largest = max(family_thetas.items(), key=lambda kv: float(kv[1]))
     return {
@@ -870,12 +892,18 @@ def fit_plan(
        (``.failures.jsonl``) are marked violated;
     2. ``theta`` - ``tre_calibration.cli --recompute-tss`` on the merged and every family
        CSV at lambda_wait 3 (primary) and 0 (control): theta and delta_crit;
-    3. ``verdict`` - ``theta_verdict verdict``: bootstrap CI of theta and delta_crit, stop
-       rule, family rule -> the number that would be published;
-    4. ``alt`` - ``fit_alt_thresholds`` for queue_len / decode_tps / prefill_tps on the
-       same fitting CSVs and the same label;
-    5. ``holdout`` - ``theta_verdict holdout``: the published theta scored on the held-out
-       validation CSV, which no earlier step reads.
+    3. ``verdict`` - ``theta_verdict verdict``: bootstrap CI of theta and both band
+       margins, stop rule, family rule -> the number that would be published;
+    4. ``ablation`` - the same verdict for the two TSS ablation arms of plan §6.9,
+       TSS(lambda=0) and TSS(w_p=1), with the primary label (``--label-lambda-wait``), so
+       the paper can show that the weighting, not the signal, does the work;
+    5. ``alt`` - ``fit_alt_thresholds`` for queue_len / decode_tps / prefill_tps on the
+       same fitting and family CSVs and the same label; it runs the very same
+       ``theta_verdict.verdict_report`` per model and writes one verdict JSON per
+       model and signal;
+    6. ``holdout`` - ``theta_verdict holdout`` for every verdict above (TSS, both arms,
+       every alt signal): the published threshold scored on the held-out validation CSV,
+       which no earlier step reads.
 
     Every step uses the one label (``tre_calibration.labels``: p95 TTFT/TPOT + unserved)
     at ``--ttft-slo-ms`` / ``--tpot-slo-ms``.
@@ -895,12 +923,13 @@ def fit_plan(
         "held_out_cell_ids": held_out_cells,
         "training_shapes": list(gen.TRAINING_SHAPES),
         "families": {name: list(members) for name, members in gen.FAMILIES.items()},
-        "order": ["rewindow", "theta", "verdict", "alt", "holdout"],
+        "order": ["rewindow", "theta", "verdict", "ablation", "alt", "holdout"],
         "label_def": LabelDefinition(args.ttft_slo_ms, args.tpot_slo_ms).as_dict(),
         "ema_tau_ms": DEFAULT_EMA_TAU_MS,
         "rewindow": [],
         "theta": [],
         "verdict": [],
+        "ablation": [],
         "alt": [],
         "holdout": [],
         "acceptance": {
@@ -1053,34 +1082,89 @@ def fit_plan(
                 "--output", str(verdict_json),
             ],
         })
-        if held_out_cells:
-            plan["holdout"].append({
+        family_args = [a for family, _scope, path in scopes if family for a in ("--family", f"{family}={path}")]
+        arm_verdicts: list[tuple[str, Path]] = [("tss", verdict_json)]
+        for arm, arm_w_p, arm_lambda in ablation_arms(w_p):
+            arm_json = fit_dir / f"{model}_verdict_{arm}.json"
+            arm_verdicts.append((arm, arm_json))
+            plan["ablation"].append({
                 "model": model,
-                "input": str(validation_csv),
-                "output": str(fit_dir / f"{model}_holdout.json"),
+                "arm": arm,
+                "w_p": arm_w_p,
+                "lambda_wait": arm_lambda,
+                "label_lambda_wait": PRIMARY_LAMBDA_WAIT,
+                "output": str(arm_json),
                 "command": [
-                    sys.executable, "-m", "scripts.theta_verdict", "holdout",
-                    "--verdict", str(verdict_json),
-                    "--validation-csv", str(validation_csv),
-                    "--output", str(fit_dir / f"{model}_holdout.json"),
+                    sys.executable, "-m", "scripts.theta_verdict", "verdict",
+                    "--model", model,
+                    "--fitting-csv", str(fitting_csv),
+                    *family_args,
+                    "--signal", "tss",
+                    "--w-p", str(arm_w_p),
+                    "--lambda-wait", str(arm_lambda),
+                    "--label-lambda-wait", str(PRIMARY_LAMBDA_WAIT),
+                    "--ema-tau-ms", str(DEFAULT_EMA_TAU_MS),
+                    *slo,
+                    "--output", str(arm_json),
                 ],
             })
+        for signal in ALT_SIGNALS:
+            arm_verdicts.append((signal, fit_dir / f"{model}_verdict_{signal}.json"))
+        if held_out_cells:
+            for arm, arm_json in arm_verdicts:
+                out_json = fit_dir / (f"{model}_holdout.json" if arm == "tss" else f"{model}_holdout_{arm}.json")
+                plan["holdout"].append({
+                    "model": model,
+                    "arm": arm,
+                    "input": str(validation_csv),
+                    "verdict": str(arm_json),
+                    "output": str(out_json),
+                    "command": [
+                        sys.executable, "-m", "scripts.theta_verdict", "holdout",
+                        "--verdict", str(arm_json),
+                        "--validation-csv", str(validation_csv),
+                        "--output", str(out_json),
+                    ],
+                })
 
     fit_alt = Path(__file__).resolve().parents[2] / "calibration" / "scripts" / "fit_alt_thresholds.py"
-    for signal in ("queue_len", "decode_tps", "prefill_tps"):
+    for signal in ALT_SIGNALS:
         plan["alt"].append({
             "signal": signal,
             "output": str(fit_dir / f"alt_{signal}.yaml"),
+            "verdicts": {m: str(fit_dir / f"{m}_verdict_{signal}.json") for m in fitting_by_model},
             "command": [
                 sys.executable, str(fit_alt),
                 *[a for m, path in fitting_by_model.items() for a in ("--model-input", f"{m}={path}")],
+                *[
+                    a
+                    for m in fitting_by_model
+                    for family in sorted(gen.FAMILIES)
+                    for a in ("--family", f"{m}:{family}={fit_dir / f'{m}_fitting_{family}.csv'}")
+                ],
                 *slo,
                 "--signal", signal,
+                "--label-lambda-wait", str(PRIMARY_LAMBDA_WAIT),
+                "--ema-tau-ms", str(DEFAULT_EMA_TAU_MS),
+                "--verdict-dir", str(fit_dir),
                 "--output", str(fit_dir / f"alt_{signal}.yaml"),
                 "--curve-dir", str(fit_dir / "alt_curves"),
             ],
         })
     return plan
+
+
+#: The alternative signals of the ablation (tre_calibration.alt_signals.ALT_SIGNALS).
+ALT_SIGNALS = ("queue_len", "decode_tps", "prefill_tps")
+
+
+def ablation_arms(w_p: float) -> list[tuple[str, float, float]]:
+    """(arm, w_p, lambda_wait) of the TSS weighting ablation (plan §6.9): the waiting
+    weight switched off, and prefill tokens counted like decode tokens."""
+    return [
+        ("tss_lw0", float(w_p), 0.0),
+        ("tss_wp1", 1.0, PRIMARY_LAMBDA_WAIT),
+    ]
 
 
 def _load_registry(path: Optional[str]):

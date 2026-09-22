@@ -1,30 +1,31 @@
 #!/usr/bin/env python3
-"""Fit model-specific alternative-signal thresholds from existing R3 window CSVs.
+"""Fit model-specific alternative-signal thresholds and bands from R3 window CSVs.
 
 The signal ablation compares TSS against queue length and the per-replica completed-token
-rates. For that comparison to be about the signals, every arm has to be thresholded by
-the same criterion, so this driver goes through :func:`tre_calibration.fit.fit_theta` --
-the same entry point ``tre_calibration.cli`` uses for TSS -- and defaults to the same
-criterion (``balanced_accuracy``) and the same knobs. ``--theta-criterion`` can select
-the cumulative-attainment containment rule instead, but then it applies to whichever
-signal is being fitted, never to one side of a comparison only.
+rates. For that comparison to be about the signals, every arm has to go through the same
+fit, so this driver has no fitting code of its own (plan §6.9 item 5): each model is
+fitted by ``scripts.theta_verdict.verdict_report`` - the function the TSS verdict step
+runs - parameterised by the signal. That gives every alternative signal the same
+criterion and knobs (``ThetaFitConfig``), the same cell bootstrap of theta, delta_crit and
+delta_high, the same stop rule, the same family rule and a verdict JSON that
+``theta_verdict holdout`` scores on the held-out shape M.
 
-Orientation is the one thing the alternative signals do not share with TSS: they are
-pressure signals (``lower_is_healthier``), recorded per signal in
-``tre_calibration.alt_signals``. Thresholds stay in raw signal units; no reciprocal
-transform is written into the registry. The first ramp window of every R3 cell is
-trimmed by default, matching the experiment scorer.
+What differs per signal lives in ``tre_calibration.alt_signals`` and nowhere else: the
+value (``tre_common.alt_signals``, the controller's own functions, smoothed by the same
+tau-EMA), the prior orientation (``lower_is_healthier``, hardcoded; the balanced accuracy
+of the opposite orientation is reported next to it) and the candidate grid (distinct
+values for queue_len). A signal whose AUROC is below 0.6 is flagged ``inert``.
 
-Labels come from :mod:`tre_calibration.labels` - the same p95 TTFT/TPOT + unserved label
-the TSS theta fit uses - with the SLOs given on the command line (``--ttft-p95-ms`` /
-``--tpot-p95-ms``), never read from a registry: the registry's e2e SLO made this driver
-fit a different label than the TSS fit (plan §6.3 B4). ``label_def`` is written into the
-report.
+Labels come from :mod:`tre_calibration.labels` (p95 TTFT/TPOT + unserved) with the SLOs
+given on the command line; ``label_def`` is written into the report. Thresholds stay in raw
+signal units; the registry-shaped block per signal carries theta, direction, delta_crit
+and delta_high.
 """
 from __future__ import annotations
 
 import argparse
 import csv
+import json
 import shlex
 import subprocess
 import sys
@@ -36,23 +37,25 @@ from xml.etree import ElementTree as ET
 import yaml
 
 from tre_calibration.alt_signals import (
-    alt_signal_column,
     alt_signal_direction,
     alt_signal_names,
-    alt_signal_transform,
-    fit_report,
     threshold_curve,
 )
-from tre_calibration.dataset import load_windows_from_csv
 from tre_calibration.fit import (
     DEFAULT_HEALTHY_QUANTILE_CANDIDATES,
     DEFAULT_MIN_HEALTHY_RECALL,
     DEFAULT_THETA_CRITERION,
     THETA_CRITERIA,
-    fit_theta,
+    ThetaFitConfig,
 )
 from tre_calibration.labels import LabelDefinition
 from tre_common.tss import DEFAULT_EMA_TAU_MS
+
+from scripts.theta_verdict import build_signal_spec, verdict_report
+
+#: Queue weight of the delta_high surplus label when the caller names none: the primary
+#: TSS lambda_wait, so the alternative arms share the label of the TSS fit.
+DEFAULT_LABEL_LAMBDA_WAIT = 3.0
 
 #: Curve column plotted for each criterion, with the reference level drawn across it.
 _PLOT_METRIC = {
@@ -83,70 +86,62 @@ def fit_model(
     min_confidence: float = 0.9,
     min_scenario_families: int = 2,
     max_single_scenario_ratio: float = 0.7,
+    families: dict[str, Path] | None = None,
+    label_lambda_wait: float = DEFAULT_LABEL_LAMBDA_WAIT,
+    ema_tau_ms: float | None = DEFAULT_EMA_TAU_MS,
+    n_resamples: int = 200,
+    family_resamples: int = 100,
+    seed: int = 20260922,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    direction = alt_signal_direction(signal)
-    signal_column = alt_signal_column(signal)
-    windows = load_windows_from_csv(
-        input_path,
-        latency_slo_ms=label_def.latency_slo_ms(),
-        signal_column=signal_column or signal,
-        signal_transform=alt_signal_transform(signal) if signal_column is None else None,
-        trim_ramp_windows=trim_ramp_windows,
-        ema_tau_ms=DEFAULT_EMA_TAU_MS,
+    """One model's alt threshold through :func:`scripts.theta_verdict.verdict_report`."""
+    spec = build_signal_spec(signal, ema_tau_ms=ema_tau_ms, label_lambda_wait=label_lambda_wait)
+    config = ThetaFitConfig(
+        criterion=criterion,
+        direction=spec.direction,
+        healthy_quantile_candidates=tuple(healthy_quantile_candidates),
+        min_healthy_recall=min_healthy_recall,
+        reliability_target=reliability_target,
+        min_support=min_support,
+        min_confidence=min_confidence,
+        min_scenario_families=min_scenario_families,
+        max_single_scenario_ratio=max_single_scenario_ratio,
+        candidate_grid=spec.candidate_grid,
     )
-    knobs: dict[str, Any] = {
-        "criterion": criterion,
-        "healthy_quantile_candidates": healthy_quantile_candidates,
-        "min_healthy_recall": min_healthy_recall,
-        "reliability_target": reliability_target,
-        "min_support": min_support,
-        "min_confidence": min_confidence,
-        "min_scenario_families": min_scenario_families,
-        "max_single_scenario_ratio": max_single_scenario_ratio,
-    }
-    fit = fit_theta(windows, direction=direction, **knobs)
-    # Same criterion, orientation flipped: a signal whose wrong-way fit also publishes
-    # has not demonstrated a direction, and the artifact has to say so.
-    opposite_direction = (
-        "higher_is_healthier"
-        if direction == "lower_is_healthier"
-        else "lower_is_healthier"
+    verdict = verdict_report(
+        model=model_name, fitting_csv=input_path, families=dict(families or {}), spec=spec,
+        label=label_def, trim_ramp_windows=trim_ramp_windows, config=config,
+        n_resamples=n_resamples, family_resamples=family_resamples, seed=seed,
     )
-    opposite_fit = fit_theta(windows, direction=opposite_direction, **knobs)
-    if not fit.publish or fit.theta is None:
-        raise RuntimeError(
-            f"{model_name}/{signal} did not publish under criterion={criterion}: "
-            f"{fit.reject_reason}"
-        )
+    windows = spec.load(input_path, label_def, trim_ramp_windows)
+    published = verdict["published"]
+    theta = float(published["theta_m"])
     # Windows sitting exactly on the threshold: with ignore_eos every request has the
     # same token count, so rate signals live on a lattice and two models can land on the
     # same lattice point. Recorded so a coincidence can be told apart from a bug.
-    on_theta = sorted(
-        {window.scenario_id for window in windows if window.signal == fit.theta}
-    )
+    on_theta = sorted({window.scenario_id for window in windows if window.signal == theta})
+    merged = verdict["merged"]
     payload = {
         "input_csv": str(input_path),
         "label_def": label_def.as_dict(),
-        "windows_at_theta": sum(1 for window in windows if window.signal == fit.theta),
+        "windows_at_theta": sum(1 for window in windows if window.signal == theta),
         "cells_at_theta": on_theta,
         "window_count": len(windows),
         "cell_count": len({window.scenario_id for window in windows}),
         "alt_thresholds": {
             signal: {
-                "theta": fit.theta,
-                "direction": direction,
+                "theta": theta,
+                "direction": spec.direction,
+                "delta_crit": float(published["delta_crit"]),
+                "delta_high": float(published["delta_high"]),
             }
         },
         "theta_criterion": criterion,
-        "fit": fit_report(fit, windows, direction=direction),
-        "opposite_direction_diagnostic": {
-            "direction": opposite_direction,
-            "publish": opposite_fit.publish,
-            "theta": opposite_fit.theta,
-            **fit_report(opposite_fit, windows, direction=opposite_direction),
-        },
+        "fit": merged["fit"],
+        "ranking": merged["ranking"],
+        "opposite_direction_diagnostic": merged["opposite_direction"],
+        "verdict": verdict,
     }
-    return payload, threshold_curve(windows, direction=direction)
+    return payload, threshold_curve(windows, direction=spec.direction)
 
 
 def write_threshold_svg(
@@ -274,8 +269,30 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--min-confidence", type=float, default=0.9)
     parser.add_argument("--min-scenario-families", type=int, default=2)
     parser.add_argument("--max-single-scenario-ratio", type=float, default=0.7)
+    parser.add_argument(
+        "--family", action="append", default=[],
+        help="MODEL:NAME=CSV, repeatable - per-family CSVs for the family rule and stop rule",
+    )
+    parser.add_argument("--label-lambda-wait", type=float, default=DEFAULT_LABEL_LAMBDA_WAIT)
+    parser.add_argument("--ema-tau-ms", type=float, default=DEFAULT_EMA_TAU_MS)
+    parser.add_argument("--n-resamples", type=int, default=1000)
+    parser.add_argument("--family-resamples", type=int, default=200)
+    parser.add_argument("--seed", type=int, default=20260922)
+    parser.add_argument(
+        "--verdict-dir",
+        help="write each model's verdict JSON here as <model>_verdict_<signal>.json "
+             "(input of theta_verdict holdout)",
+    )
     parser.add_argument("--generated-at")
     args = parser.parse_args(argv)
+
+    families: dict[str, dict[str, Path]] = {}
+    for item in args.family:
+        head, sep, path = item.partition("=")
+        model, colon, name = head.partition(":")
+        if not sep or not colon or not model or not name or not path:
+            parser.error("--family must be MODEL:NAME=CSV")
+        families.setdefault(model, {})[name] = Path(path)
 
     if len({model for model, _path in args.model_input}) != len(args.model_input):
         parser.error("each model may appear only once")
@@ -304,7 +321,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             min_confidence=args.min_confidence,
             min_scenario_families=args.min_scenario_families,
             max_single_scenario_ratio=args.max_single_scenario_ratio,
+            families=families.get(model),
+            label_lambda_wait=args.label_lambda_wait,
+            ema_tau_ms=args.ema_tau_ms if args.ema_tau_ms > 0 else None,
+            n_resamples=args.n_resamples,
+            family_resamples=args.family_resamples,
+            seed=args.seed,
         )
+        if args.verdict_dir:
+            vdir = Path(args.verdict_dir)
+            vdir.mkdir(parents=True, exist_ok=True)
+            (vdir / f"{model}_verdict_{args.signal}.json").write_text(
+                json.dumps(models[model]["verdict"], indent=2, sort_keys=True, default=str) + "\n",
+                encoding="utf-8",
+            )
 
     # Two models on the same threshold is not an error: token-rate signals sit on a
     # lattice under ignore_eos (e.g. 1446.4 = 339 x 128 / 30), so coinciding thresholds
@@ -337,6 +367,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         "label_def": label_def.as_dict(),
         "warnings": warnings,
         "fit_config": {
+            "pipeline": "scripts.theta_verdict.verdict_report",
+            "label_lambda_wait": args.label_lambda_wait,
+            "ema_tau_ms": args.ema_tau_ms,
+            "n_resamples": args.n_resamples,
             "healthy_quantile_candidates": list(healthy_quantiles),
             "min_healthy_recall": args.min_healthy_recall,
             "reliability_target": args.reliability_target,
@@ -347,9 +381,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         },
         "models": models,
     }
+    report["models"] = {
+        model: {k: v for k, v in payload.items() if k != "verdict"}
+        | {"published": payload["verdict"]["published"], "stop_rule": payload["verdict"]["stop_rule"],
+           "family_verdict": payload["verdict"]["family_verdict"],
+           "bootstrap": payload["verdict"]["merged"]["bootstrap"]}
+        for model, payload in models.items()
+    }
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(yaml.safe_dump(report, sort_keys=False), encoding="utf-8")
+    output.write_text(yaml.safe_dump(json.loads(json.dumps(report, default=str)), sort_keys=False), encoding="utf-8")
 
     if args.curve_dir:
         curve_dir = Path(args.curve_dir)
@@ -380,9 +421,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     for model, payload in models.items():
         threshold = payload["alt_thresholds"][args.signal]
         print(
-            f"{model}: theta={threshold['theta']:.6f} "
-            f"direction={threshold['direction']} criterion={args.theta_criterion} "
-            f"windows={payload['window_count']}"
+            f"{model}: theta={threshold['theta']:.6f} delta_crit={threshold['delta_crit']:.3f} "
+            f"delta_high={threshold['delta_high']:.3f} direction={threshold['direction']} "
+            f"criterion={args.theta_criterion} auroc={payload['ranking']['auroc']:.3f} "
+            f"inert={payload['ranking']['inert']} windows={payload['window_count']}"
         )
     return 0
 

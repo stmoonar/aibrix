@@ -48,6 +48,9 @@ BOUNDARY = 300.0
 #: The 0.20 healthy quantile measured from the unhealthy (high) end straddles the
 #: boundary: 310 -> 290 interpolates to 294.
 EXPECTED_BALANCED_ACCURACY_THETA = 294.0
+#: The same criterion over the distinct healthy values (queue_len's grid): 290, the
+#: largest healthy value below the boundary, at the same balanced accuracy 0.90.
+EXPECTED_UNIQUE_GRID_THETA = 290.0
 #: The largest threshold whose cumulative lower set is still 90% healthy. It sits deep
 #: inside the violating range and admits ten violating windows as healthy.
 EXPECTED_RELIABILITY_THETA = 400.0
@@ -314,7 +317,15 @@ def test_every_alternative_signal_is_fitted_by_the_balanced_accuracy_criterion(
     assert payload["theta_criterion"] == DEFAULT_THETA_CRITERION == "balanced_accuracy"
     threshold = payload["alt_thresholds"][signal]
     assert threshold["direction"] == "lower_is_healthier"
-    assert threshold["theta"] == pytest.approx(EXPECTED_BALANCED_ACCURACY_THETA)
+    # queue_len searches the distinct observed values (plan 6.9), so it lands on the
+    # healthy value 290 itself instead of the interpolated 0.20 quantile 294.
+    expected = EXPECTED_UNIQUE_GRID_THETA if signal == "queue_len" else EXPECTED_BALANCED_ACCURACY_THETA
+    assert threshold["theta"] == pytest.approx(expected)
+    assert set(threshold) == {"theta", "direction", "delta_crit", "delta_high"}
+    assert payload["ranking"]["direction"] == "lower_is_healthier"
+    assert payload["ranking"]["inert"] is False
+    assert payload["opposite_direction_diagnostic"]["direction"] == "higher_is_healthier"
+    assert payload["verdict"]["signal"] == signal
     # The fit block is the balanced-accuracy one, not the containment one.
     assert payload["fit"]["balanced_accuracy"] == pytest.approx(0.90)
     assert payload["fit"]["healthy_quantile"] == 0.20
@@ -364,7 +375,8 @@ def test_coinciding_thresholds_warn_and_record_the_windows_instead_of_failing(tm
     assert driver.main([
         "--model-input", f"a={csv_path}", "--model-input", f"b={csv_path}",
         "--ttft-p95-ms", "500", "--tpot-p95-ms", "75", "--signal", "queue_len",
-        "--trim-ramp-windows", "0", "--output", str(output),
+        "--trim-ramp-windows", "0", "--output", str(output), "--n-resamples", "20",
+        "--family-resamples", "10",
     ]) == 0
     report = yaml.safe_load(output.read_text(encoding="utf-8"))
     [warning] = report["warnings"]

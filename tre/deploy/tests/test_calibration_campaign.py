@@ -222,7 +222,7 @@ def test_fit_plan_pairs_the_primary_fit_with_a_lambda_wait_control() -> None:
 def test_fit_plan_runs_the_whole_pipeline_in_order_on_one_label() -> None:
     # B5: rewindow -> theta/delta (cli) -> bootstrap/stop-rule verdict -> alt -> hold-out.
     plan = campaign.fit_plan(["dsqwen-7b"], Path("/out"), Path("/raw"), _Args())
-    assert plan["order"] == ["rewindow", "theta", "verdict", "alt", "holdout"]
+    assert plan["order"] == ["rewindow", "theta", "verdict", "ablation", "alt", "holdout"]
     for entry in plan["theta"]:
         cmd = entry["command"]
         assert cmd[1:3] == ["-m", "tre_calibration.cli"]
@@ -238,6 +238,18 @@ def test_fit_plan_runs_the_whole_pipeline_in_order_on_one_label() -> None:
     for entry in plan["alt"]:
         assert "--registry" not in entry["command"]
         assert "--ttft-p95-ms" in entry["command"] and "--tpot-p95-ms" in entry["command"]
+        # plan 6.9 item 5: the alt fit gets the families, the primary label and writes
+        # verdicts the hold-out step scores - the same pipeline as TSS.
+        assert entry["command"].count("--family") == 2
+        assert entry["command"][entry["command"].index("--label-lambda-wait") + 1] == "3.0"
+        assert "--verdict-dir" in entry["command"]
+    arms = {e["arm"]: e for e in plan["ablation"]}
+    assert set(arms) == {"tss_lw0", "tss_wp1"}
+    assert (arms["tss_lw0"]["lambda_wait"], arms["tss_wp1"]["w_p"]) == (0.0, 1.0)
+    for entry in plan["ablation"]:
+        cmd = entry["command"]
+        assert cmd[cmd.index("--label-lambda-wait") + 1] == "3.0"
+        assert cmd.count("--family") == 2
     assert plan["label_def"]["e2e"] == "excluded"
 
 
@@ -574,10 +586,14 @@ def test_the_fit_plan_keeps_the_held_out_shape_out_of_training() -> None:
     assert validation["command"].count("--only-cell-id") == 1
     assert validation["output"].endswith("_validation.csv")
     # and no fitting step ever reads the validation CSV - only the hold-out step does
-    for step in ("theta", "verdict", "alt"):
+    for step in ("theta", "verdict", "ablation", "alt"):
         assert not any(str(validation["output"]) in entry["command"] for entry in plan[step])
-    [holdout] = plan["holdout"]
-    assert str(validation["output"]) in holdout["command"]
+    # one hold-out per verdict: TSS, the two ablation arms and every alt signal
+    assert sorted(h["arm"] for h in plan["holdout"]) == sorted(
+        ["tss", "tss_lw0", "tss_wp1", "queue_len", "decode_tps", "prefill_tps"]
+    )
+    for holdout in plan["holdout"]:
+        assert str(validation["output"]) in holdout["command"]
     # the family CSVs drop the held-out cells too
     for entry in plan["rewindow"]:
         if entry.get("family"):
