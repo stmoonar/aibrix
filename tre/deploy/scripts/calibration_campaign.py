@@ -1489,6 +1489,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--dry-run", action="store_true",
                     help="write plan.json and fit_plan.json, drive nothing")
     args = ap.parse_args(argv)
+    if args.cooldown_s * 1000.0 < args.window_ms:
+        # Quiet time must cover at least one metrics window: the offline fit resets the
+        # EMA per cell, which matches the controller only when the online EMA saw an idle
+        # window between cells (tre_common.tss.TssEma idle rules).
+        ap.error(
+            f"--cooldown-s ({args.cooldown_s:g}) must be >= the metrics window "
+            f"(--window-ms {args.window_ms} = {args.window_ms / 1000.0:g} s)"
+        )
     return run_campaign(args)
 
 

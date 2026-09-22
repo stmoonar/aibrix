@@ -9,7 +9,15 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from tre_calibration.labels import label_window
-from tre_common.tss import DEFAULT_EMA_TAU_MS, TssEma, replica_factor, signal_ema, tss_queue, tss_terms
+from tre_common.tss import (
+    DEFAULT_EMA_TAU_MS,
+    TssEma,
+    replica_factor,
+    signal_ema,
+    tss_queue,
+    tss_terms,
+    window_is_idle,
+)
 
 
 LOG = logging.getLogger(__name__)
@@ -81,9 +89,11 @@ def smooth_rows_by_cell(
     TSS, :func:`tre_common.tss.signal_ema` for the alternative signals - the same class,
     tau and alpha the controller uses.
 
-    Within a cell, idle gaps are handled by ``TssEma``'s idle-gap rule with each row's own
-    window (``window_end_ms - window_start_ms``); without a ``window_start_ms`` column the
-    gap rule is off. The per-cell reset assumes the online EMA was reset between cells too,
+    Within a cell, idle periods are handled by the same ``TssEma`` rules the controller
+    applies: the idle-window reset with :func:`tre_common.tss.window_is_idle` of the row's
+    ``prompt_tokens_total`` / ``generation_tokens_total`` (missing columns -> not idle), and
+    the idle-gap rule with the row's own window (``window_end_ms - window_start_ms``;
+    without a ``window_start_ms`` column the gap rule is off). The per-cell reset assumes the online EMA was reset between cells too,
     which needs more than one window of quiet between them; a cell that starts less than
     one window after the previous one ended is logged as a warning (the online EMA may
     have carried over, so the offline value can differ from what the controller saw).
@@ -112,7 +122,10 @@ def smooth_rows_by_cell(
                 close_cells.append(f"{prev_cell}->{cell} ({start - prev_end:.0f} ms)")
             ema = make_ema()
         prev_cell, prev_end = cell, end
-        values.append(ema.update(raw, end, window_ms))
+        idle = window_is_idle(
+            _as_float(row.get("prompt_tokens_total")), _as_float(row.get("generation_tokens_total"))
+        )
+        values.append(ema.update(raw, end, window_ms, idle))
     if close_cells:
         LOG.warning(
             "%d cell(s) start less than one metrics window after the previous cell ended; "

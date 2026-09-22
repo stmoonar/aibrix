@@ -730,3 +730,13 @@ def test_the_guard_artifact_is_read_back_from_where_the_driver_wrote_it(tmp_path
     )
     guard = campaign.read_cell_guard(tmp_path, output, "i256_o128_c95")
     assert guard["void_reasons"] == ["model error rate"] and guard["sent"] == 10
+
+
+def test_cooldown_shorter_than_the_metrics_window_is_rejected(tmp_path) -> None:
+    with pytest.raises(SystemExit):
+        campaign.main([
+            "--index", str(tmp_path / "INDEX.json"), "--models", "dsqwen-7b",
+            "--out-dir", str(tmp_path / "out"), "--dry-run",
+            "--cooldown-s", "20", "--window-ms", "30000",
+        ])
+    assert not (tmp_path / "out").exists()

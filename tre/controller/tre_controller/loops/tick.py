@@ -9,6 +9,7 @@ if TYPE_CHECKING:
 
 from tre_common.metrics_schema import MetricsSnapshot, ModelWindowMetrics
 from tre_common.registry import Registry, ModelSpec
+from tre_common.tss import window_is_idle
 from tre_controller.planning.classify import (
     classify_all_models,
     model_control_configs_from_registry,
@@ -423,7 +424,7 @@ def _model_contexts(
             if signal_state is not None:
                 signal_warm = signal_state.observe_traffic(
                     model_name,
-                    has_traffic=result.Y_m > 1e-9,
+                    has_traffic=not window_is_idle(metrics.prompt_tokens, metrics.generation_tokens),
                     window_start_ms=metrics.window_start_ms,
                     window_end_ms=metrics.window_end_ms,
                 )

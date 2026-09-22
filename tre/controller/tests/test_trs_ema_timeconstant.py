@@ -84,7 +84,9 @@ def test_duplicate_window_does_not_advance() -> None:
 def test_non_finite_raw_passthrough_no_state_change() -> None:
     c = TRSComputer(ema_tau_ms=20_000)
     c.compute(_inp(generation=200.0, running=2.0), window_end_ms=0)  # seed 100, cursor=0
-    r = c.compute(_inp(generation=0.0, running=0.0), window_end_ms=5_000)  # raw 0 -> passthrough
+    # tokens but nothing in flight: TSS undefined (raw 0) yet not an idle window (an idle,
+    # token-free window would reset the EMA - see test_tss_idle_reset.py) -> passthrough
+    r = c.compute(_inp(generation=50.0, running=0.0), window_end_ms=5_000)
     assert r.TRS == 0.0
     # cursor/state untouched: the next real sample decays from the seed (dt from 0).
     r2 = c.compute(_inp(generation=400.0, running=2.0), window_end_ms=10_000)

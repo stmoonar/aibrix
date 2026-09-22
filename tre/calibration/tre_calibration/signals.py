@@ -14,7 +14,7 @@ from typing import Optional, Sequence
 
 from tre_calibration.dataset import CalibrationWindow
 from tre_calibration.evaluate import evaluate_signal_direction
-from tre_common.tss import TssEma, replica_factor, tss_terms
+from tre_common.tss import TssEma, replica_factor, tss_terms, window_is_idle
 
 
 @dataclass(frozen=True)
@@ -133,10 +133,16 @@ def tss_series(
         for earlier in item.preceding:
             if earlier.window_end_ms is None:
                 raise ValueError("EMA scoring needs window_end_ms on every window")
-            ema.update(raw_of(earlier), earlier.window_end_ms, earlier.window_ms)
+            ema.update(
+                raw_of(earlier), earlier.window_end_ms, earlier.window_ms,
+                window_is_idle(earlier.prompt_tokens_total, earlier.generation_tokens_total),
+            )
         if item.window_end_ms is None:
             raise ValueError("EMA scoring needs window_end_ms on every window")
-        out.append(ema.update(raw_of(item), item.window_end_ms, item.window_ms))
+        out.append(ema.update(
+            raw_of(item), item.window_end_ms, item.window_ms,
+            window_is_idle(item.prompt_tokens_total, item.generation_tokens_total),
+        ))
     return out
 
 

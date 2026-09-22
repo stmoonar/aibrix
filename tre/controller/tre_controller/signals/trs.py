@@ -6,7 +6,7 @@ from typing import Any
 
 from tre_common.metrics_schema import ModelWindowMetrics
 from tre_common.registry import TrsParams
-from tre_common.tss import TssEma, replica_factor, signal_ema, tss_terms
+from tre_common.tss import TssEma, replica_factor, signal_ema, tss_terms, window_is_idle
 
 
 @dataclass
@@ -162,7 +162,8 @@ class TRSComputer:
         # Idle rule (plan 6.4): A + W == 0 -> TSS undefined. Reported as 0.0, which the
         # EMA passes through without advancing and compute_z_m maps to None.
         trs_raw = terms.raw if terms.raw is not None else 0.0
-        trs = self._update_ema(trs_raw, window_end_ms=window_end_ms, window_ms=inp.window_ms)
+        idle = window_is_idle(inp.prompt_tokens_total, inp.generation_tokens_total)
+        trs = self._update_ema(trs_raw, window_end_ms=window_end_ms, window_ms=inp.window_ms, idle=idle)
         eta = compute_eta_m(trs, effective_pods)
         z_m = compute_z_m(trs, theta_m)
         saved_prev_y = self._prev_Y
@@ -185,7 +186,11 @@ class TRSComputer:
         )
 
     def _update_ema(
-        self, raw: float, window_end_ms: int | None = None, window_ms: float | None = None
+        self,
+        raw: float,
+        window_end_ms: int | None = None,
+        window_ms: float | None = None,
+        idle: bool = False,
     ) -> float:
         if self._ema is not None:
             # Time-constant EMA (S1.3 / ADR-0011): delegated to tre_common.tss.TssEma, the
@@ -195,7 +200,7 @@ class TRSComputer:
             if window_end_ms is None:
                 # No time reference -> cannot advance a wall-clock EMA. Passthrough.
                 return raw
-            value = self._ema.update(raw, window_end_ms, window_ms)
+            value = self._ema.update(raw, window_end_ms, window_ms, idle)
             return raw if value is None else value
         # DEPRECATED legacy fixed-alpha branch (ema_tau_ms unset). Every deployed registry
         # entry sets ema_tau_ms; this path is kept only for the golden parity tests
@@ -273,12 +278,13 @@ class SignalState:
     the state an idle reset leaves behind (restart duality): after a restart the next
     defined sample seeds the EMA, as it would after an idle gap.
 
-    **Idle reset.** The EMA is cleared on the same idle condition as the warmup onset:
-    an idle tick (``observe_traffic(has_traffic=False)``) clears the onset AND every EMA of
-    the model (TSS and alternative signals). Independently, ``TssEma``'s idle-gap rule
-    clears an EMA when a sample arrives more than one metrics window after the last
-    advancing sample; with tumbling windows an idle window always implies such a gap (so
-    the offline recompute, which has no idle ticks, reproduces the online value bitwise).
+    **Idle reset.** One predicate, :func:`tre_common.tss.window_is_idle` (no token in the
+    window), defines an idle window everywhere: every EMA update receives it
+    (``TssEma.update(idle=...)``: clear and pass through), the tick loop derives
+    ``has_traffic`` from it for ``observe_traffic`` (which clears the warmup onset and,
+    idempotently, the model's EMAs), and the offline smoothing computes it from each window
+    row. Independently, ``TssEma``'s idle-gap rule clears an EMA when a sample arrives more
+    than one metrics window after the last advancing sample.
 
     Also tracks a per-model **traffic-onset** cursor for the F-onset warmup guard
     (see ``observe_traffic``): at load onset the sliding window is still filling with
@@ -315,6 +321,7 @@ class SignalState:
         window_end_ms: int,
         tau_ms: float,
         window_ms: float | None = None,
+        idle: bool = False,
     ) -> float | None:
         """EMA'd value of an alternative signal (``tre_common.tss.signal_ema``).
 
@@ -327,7 +334,7 @@ class SignalState:
         if ema is None or ema.tau_ms != float(tau_ms):
             ema = signal_ema(tau_ms)
             self._signal_ema[key] = ema
-        return ema.update(raw, window_end_ms, window_ms)
+        return ema.update(raw, window_end_ms, window_ms, idle)
 
     def reset_ema(self, model: str) -> None:
         """Clear every EMA of ``model`` (TSS and alternative signals) - the idle reset."""
@@ -348,9 +355,11 @@ class SignalState:
         straddles the onset. Idempotent under the duplicate-window_end re-reads the
         rescue/fairness/safescale loops do (mirrors the EMA per-window dedup).
 
-        An idle tick also clears the model's EMAs (:meth:`reset_ema`), so the warmup onset
-        and the EMA restart on the same idle condition. The EMA reset is part of the EMA
-        semantics, so it happens even when the warmup guard is disabled."""
+        ``has_traffic`` must be ``not tre_common.tss.window_is_idle(...)`` of the window -
+        the predicate every EMA update receives - so the onset and the EMAs restart on the
+        same condition. The idle tick also clears the model's EMAs (:meth:`reset_ema`); that
+        is idempotent with the idle-window reset the EMA updates already applied, and it
+        happens even when the warmup guard is disabled."""
         if not has_traffic:
             self.reset_ema(model)
             self._onset_ms[model] = None

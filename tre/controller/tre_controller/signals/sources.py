@@ -22,7 +22,7 @@ from tre_common.alt_signals import (
 )
 from tre_common.metrics_schema import ModelWindowMetrics
 from tre_common.registry import AltThreshold, ModelSpec
-from tre_common.tss import DEFAULT_EMA_TAU_MS
+from tre_common.tss import DEFAULT_EMA_TAU_MS, window_is_idle
 
 if TYPE_CHECKING:  # pragma: no cover
     from tre_controller.signals.trs import SignalState
@@ -121,6 +121,7 @@ def _thresholded_signal(
         raw_value = signal_state.smooth_signal(
             spec.name, source, raw_value, window_end_ms=metrics.window_end_ms, tau_ms=tau_ms,
             window_ms=float(metrics.window_end_ms - metrics.window_start_ms),
+            idle=window_is_idle(metrics.prompt_tokens, metrics.generation_tokens),
         )
     z_m = normalize_signal(raw_value, spec.alt_thresholds.get(source))
     if z_m is None:

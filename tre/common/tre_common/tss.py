@@ -157,6 +157,17 @@ def tss_terms(
     )
 
 
+def window_is_idle(prompt_tokens: Optional[float], generation_tokens: Optional[float]) -> bool:
+    """THE idle-window predicate: the window carried no traffic (no prefill and no decode
+    token). Used by the online idle tick (warmup onset, ``SignalState.observe_traffic``) and
+    by every EMA - online and offline - through ``TssEma.update(idle=...)``. Unknown token
+    totals (``None``) are not idle: nothing is known about the window.
+    """
+    if prompt_tokens is None or generation_tokens is None:
+        return False
+    return not (float(prompt_tokens) + float(generation_tokens) > 0.0)
+
+
 def ema_alpha(dt_ms: float, tau_ms: float) -> float:
     """Weight of the NEW sample after ``dt_ms`` of data time: ``1 - exp(-dt/tau)``."""
     if tau_ms <= 0:
@@ -185,6 +196,10 @@ class TssEma:
 
     Rules of :meth:`update`, in order:
 
+    0. **idle-window reset** - ``idle=True`` (:func:`window_is_idle`: the window carried no
+       traffic) clears ``value`` / ``last_ms`` and passes the raw through without seeding.
+       This is the same condition as the controller's idle tick, so with sliding windows a
+       traffic gap shorter than ``window + step`` still resets, online and offline alike.
     1. **idle-gap reset** - if ``window_ms`` is given and ``window_end_ms - last_ms >
        window_ms``, clear ``value`` / ``last_ms``. Checked for *every* sample, including a
        None / non-finite / (TSS) zero raw that is then passed through. Strictly greater:
@@ -214,8 +229,15 @@ class TssEma:
         self.last_ms = None
 
     def update(
-        self, raw: Optional[float], window_end_ms: float, window_ms: Optional[float] = None
+        self,
+        raw: Optional[float],
+        window_end_ms: float,
+        window_ms: Optional[float] = None,
+        idle: bool = False,
     ) -> Optional[float]:
+        if idle:
+            self.reset()
+            return raw
         if (
             window_ms is not None
             and window_ms > 0
@@ -248,6 +270,7 @@ def smooth_series(
     *,
     tau_ms: float,
     window_ms: Optional[float | Sequence[Optional[float]]] = None,
+    idle: Optional[Sequence[bool]] = None,
 ) -> list[Optional[float]]:
     """EMA a single cell's raw series in data time, exactly as the controller would.
 
@@ -256,13 +279,18 @@ def smooth_series(
     a repeated or regressed ``window_end_ms`` keeps the current EMA; the first defined
     sample seeds it; a gap of more than ``window_ms`` (a scalar or one value per sample)
     since the last advancing sample resets it. ``window_ms=None`` disables the gap rule.
+    ``idle`` (one :func:`window_is_idle` flag per sample) applies the idle-window reset.
     """
     ema = TssEma(tau_ms)
     if window_ms is None or isinstance(window_ms, (int, float)):
         windows: Sequence[Optional[float]] = [window_ms] * len(raws)
     else:
         windows = window_ms
-    return [ema.update(raw, end, win) for raw, end, win in zip(raws, window_end_ms, windows)]
+    idles: Sequence[bool] = idle if idle is not None else [False] * len(raws)
+    return [
+        ema.update(raw, end, win, flag)
+        for raw, end, win, flag in zip(raws, window_end_ms, windows, idles)
+    ]
 
 
 def convert_window_total_theta(theta_total: float, window_ms: float = V2_WINDOW_MS) -> float:
@@ -284,4 +312,5 @@ __all__: Iterable[str] = (
     "smooth_series",
     "tss_queue",
     "tss_terms",
+    "window_is_idle",
 )

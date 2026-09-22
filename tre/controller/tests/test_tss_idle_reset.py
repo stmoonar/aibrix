@@ -14,10 +14,10 @@ import random
 from types import SimpleNamespace
 
 from scripts.r3_grid import compute_window_results
-from tre_calibration.dataset import smooth_rows_by_cell
+from tre_calibration.dataset import TssRecompute, recompute_tss_rows, smooth_rows_by_cell
 from tre_common.metrics_schema import ModelWindowMetrics
 from tre_common.registry import TrsParams
-from tre_common.tss import TssEma, signal_ema, smooth_series
+from tre_common.tss import TssEma, signal_ema, smooth_series, window_is_idle
 from tre_controller.signals.trs import SignalState, TRSComputer, TRSInput
 
 TAU = 20_000.0
@@ -240,3 +240,73 @@ def test_offline_warns_when_a_cell_starts_within_a_window_of_the_previous(caplog
     with caplog.at_level(logging.WARNING, logger="tre_calibration.dataset"):
         smooth_rows_by_cell(quiet, [1.0, 2.0, 3.0], make_ema=lambda: TssEma(TAU))
     assert "a->b" not in caplog.text
+
+
+# --- sliding windows: the idle-window rule (shared predicate) --------------------------------
+
+def _overlap_s(end_ms: int, periods) -> float:
+    lo, hi = end_ms - WIN, end_ms
+    return sum(max(0, min(hi, b) - max(lo, a)) for a, b in periods) / 1000.0
+
+
+def _sliding_with_gap() -> list[ModelWindowMetrics]:
+    # traffic [0, 200 s) and [240 s, 400 s): a 40 s gap, 30 s windows, 5 s step
+    periods = ((0, 200_000), (240_000, 400_000))
+    rng = random.Random(21)
+    windows = []
+    for end in range(WIN, 400_001, 5_000):
+        frac = _overlap_s(end, periods) / (WIN / 1000.0)
+        wm = _window(
+            end, gen=round(frac * rng.uniform(1e4, 3e4)), prompt=round(frac * rng.uniform(0, 5e4)),
+            running=frac * rng.uniform(1, 40), waiting=frac * rng.uniform(0, 10),
+        )
+        windows.append(wm)
+        if rng.random() < 0.2:
+            windows.append(wm)  # duplicate re-read
+    return windows
+
+
+def _row_of(wm: ModelWindowMetrics) -> dict:
+    return {
+        "scenario_id": "cell", "window_start_ms": wm.window_start_ms, "window_end_ms": wm.window_end_ms,
+        "prompt_tokens_total": wm.prompt_tokens, "generation_tokens_total": wm.generation_tokens,
+        "avg_running": wm.avg_running, "avg_waiting": wm.avg_waiting, "avg_swapping": 0.0,
+        "kv_cache_hit_rate": 0.0, "routable_pods": 1, "assigned_replicas": 1,
+    }
+
+
+def test_sliding_40s_gap_online_equals_offline_bitwise() -> None:
+    windows = _sliding_with_gap()
+    assert any(window_is_idle(w.prompt_tokens, w.generation_tokens) for w in windows)
+
+    state = SignalState(warmup_ms=-1)
+    online_tss, online_alt, results = [], [], []
+    for wm in windows:
+        computer = state.computer_for("m", ema_alpha=0.2485, ema_tau_ms=TAU)
+        result = computer.compute(TRSInput.from_metrics(wm, _params()), window_end_ms=wm.window_end_ms)
+        idle = window_is_idle(wm.prompt_tokens, wm.generation_tokens)
+        online_alt.append(state.smooth_signal(
+            "m", "queue_len", wm.avg_running + wm.avg_waiting, window_end_ms=wm.window_end_ms,
+            tau_ms=TAU, window_ms=float(WIN), idle=idle,
+        ))
+        state.observe_traffic("m", has_traffic=not idle, window_start_ms=wm.window_start_ms,
+                              window_end_ms=wm.window_end_ms)
+        online_tss.append(result.TRS if result.defined else None)
+        results.append(result)
+
+    rows = [_row_of(wm) for wm in windows]
+    offline_tss = recompute_tss_rows(rows, TssRecompute(w_p=0.02, lambda_wait=3.0, qmin=1.0, ema_tau_ms=TAU))
+    offline_alt = smooth_rows_by_cell(
+        rows, [wm.avg_running + wm.avg_waiting for wm in windows], make_ema=lambda: signal_ema(TAU)
+    )
+    assert offline_tss == online_tss  # bitwise
+    assert offline_alt == online_alt  # bitwise
+
+    # the traffic period after the gap starts fresh: first defined window after 240 s
+    first = next(i for i, wm in enumerate(windows) if wm.window_end_ms > 240_000 and results[i].defined)
+    assert results[first].TRS == results[first].TRS_raw
+    # ... which the idle-gap rule alone would not have done (dt <= one window here)
+    raws = [r.TRS_raw if r.defined else None for r in results]
+    ends = [wm.window_end_ms for wm in windows]
+    gap_only = smooth_series(raws, ends, tau_ms=TAU, window_ms=WIN)
+    assert gap_only[first] != results[first].TRS
