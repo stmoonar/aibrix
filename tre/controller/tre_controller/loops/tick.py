@@ -104,6 +104,7 @@ class PaperStateCache:
             {
                 "routable_pods": context.get("routable_pods", held.get("routable_pods", 0)),
                 "assigned_replicas": context.get("assigned_replicas", held.get("assigned_replicas", 0)),
+                "awake_replicas": context.get("awake_replicas", held.get("awake_replicas")),
             }
         )
         return held, (f"paper_state_stale_hold:{model_name}",)
@@ -269,6 +270,22 @@ def _apply_safescale(
     converted: list[Action] = []
     events: list[str] = []
     for action in actions:
+        if isinstance(action, ScaleAction) and action.delta > 0:
+            preempt = getattr(safescale, "request_preemption", None)
+            restored = preempt(action.model, reason="receiver_need_upscale") if callable(preempt) else 0
+            if restored > 0:
+                # v1 apply_safescale_to_deltas: rollback_probe(receiver_need_upscale), then
+                # up_needed = delta - probe_hidden. The rollback (unhide) is issued by the
+                # safescale loop's next observation, one-shot and observe-mode safe.
+                up_needed = action.delta - restored
+                events.append(
+                    f"safescale_probe_preempted:{action.model}:restored={restored}:up_needed={max(0, up_needed)}"
+                )
+                if up_needed > 0:
+                    converted.append(
+                        replace(action, delta=up_needed, pods=tuple(action.pods[:up_needed]) if action.pods else ())
+                    )
+                continue
         if not _requires_safescale_probe(action):
             converted.append(action)
             continue
@@ -419,6 +436,7 @@ def _model_contexts(
     contexts: dict[str, dict] = {}
     events: list[str] = []
     cluster_counts = _cluster_view_counts(cluster_view)
+    awake_counts = _awake_including_hidden(cluster_view)
     for model_name, metrics in snapshot.models.items():
         spec = registry.model(model_name)
         counts = cluster_counts.get(model_name)
@@ -509,6 +527,8 @@ def _model_contexts(
                 "decode_tps": decode_tps,
                 "prefill_tps": prefill_tps,
             }
+        # Scaling-cap count (A1/P1-2): awake bindings incl. hidden probe pods.
+        context["awake_replicas"] = awake_counts.get(model_name, metrics.routable_pods)
         if paper_state_cache is not None:
             context, model_events = paper_state_cache.apply(model_name, context, tokens_available=tokens_available)
             events.extend(model_events)
@@ -555,6 +575,17 @@ def serving_window(
         if binding.model == metrics.model and not binding.awake
     }
     return restrict_to_serving(metrics, sleeping_pods=sleeping, routable_pods=counts[0])
+
+
+def _awake_including_hidden(cluster_view: ClusterView | None) -> dict[str, int]:
+    if cluster_view is None:
+        return {}
+    counts: dict[str, int] = {}
+    for binding in cluster_view.bindings:
+        counts.setdefault(binding.model, 0)
+        if binding.awake:
+            counts[binding.model] += 1
+    return counts
 
 
 def _cluster_view_counts(cluster_view: ClusterView | None) -> dict[str, tuple[int, int]]:

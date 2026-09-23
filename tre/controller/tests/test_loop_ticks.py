@@ -818,3 +818,77 @@ def test_rescue_tick_holds_high_probe_of_a_model_in_rollback_backoff() -> None:
     held = run_rescue_tick(snapshot, queue=FakeQueue(), registry=registry, safescale=safescale)
     assert not any(isinstance(a, HideAction) for a in held.actions)
     assert "safescale_rollback_backoff:hot" in held.events
+
+
+
+def _hidden_probe_view(registry, *, awake: int, hidden: int, total: int = 4):
+    from tre_controller.planning.planner import ClusterView
+    from tre_sm.allocator.slots import Binding, Slot
+
+    return ClusterView(
+        registry.topology(),
+        tuple(
+            Binding(
+                f"critical-{i}",
+                "critical",
+                Slot("node-a", (i,)),
+                awake=i < awake,
+                hidden=i >= awake - hidden and i < awake,
+            )
+            for i in range(total)
+        ),
+    )
+
+
+def test_rescue_tick_does_not_ask_past_the_cap_when_a_probe_hides_a_pod() -> None:
+    # Review P1-2 end to end: 4 awake (1 hidden), cap 4, CRITICAL -> no scale-up request
+    # (the SM would 400 it, retried every 5 s), matching v1's assigned-count cap.
+    registry = _registry()  # "critical": max_replicas 4 (= cap)
+    snapshot = MetricsSnapshot(
+        ts_ms=1,
+        stale=False,
+        models={"critical": _metrics("critical", generation=50.0, waiting=10.0, running=1.0, assigned=4, routable=3)},
+    )
+    result = run_rescue_tick(
+        snapshot, queue=FakeQueue(), registry=registry, cluster_view=_hidden_probe_view(registry, awake=4, hidden=1)
+    )
+    assert result.model_contexts["critical"]["awake_replicas"] == 4
+    assert result.model_contexts["critical"]["routable_pods"] == 3
+    assert [a for a in result.actions if isinstance(a, ScaleAction)] == []
+
+
+def test_scale_up_of_a_probing_model_preempts_its_probe_like_v1() -> None:
+    # v1 apply_safescale_to_deltas: a model that must scale up while it has a probe first
+    # rolls the probe back (receiver_need_upscale) and only asks for delta - hidden.
+    from tre_controller.loops.safescale_task import run_safescale_observation_tick
+    from tre_controller.planning.planner import UnhideAction
+
+    registry = _registry()
+    safescale = SafeScaleStateMachine(config=SafeScaleConfig(default_window_ms=60_000.0))
+    safescale.start_probe(model="critical", pods=("critical-1",), now_ms=0)
+    snapshot = MetricsSnapshot(
+        ts_ms=1_000,
+        stale=False,
+        models={"critical": _metrics("critical", generation=50.0, waiting=10.0, running=1.0, assigned=4, routable=1)},
+    )
+    view = _hidden_probe_view(registry, awake=2, hidden=1)  # critical-0 serving, critical-1 hidden
+
+    result = run_rescue_tick(snapshot, queue=FakeQueue(), registry=registry, cluster_view=view, safescale=safescale)
+
+    assert any(e.startswith("safescale_probe_preempted:critical:restored=1") for e in result.events)
+    # The planner's +1 is fully covered by un-hiding the probe pod.
+    assert [a for a in result.actions if isinstance(a, ScaleAction)] == []
+    from tre_controller.loops.action_queue import SubmitResult
+
+    class AcceptingQueue(FakeQueue):
+        def submit(self, actions):
+            super().submit(actions)
+            return SubmitResult(accepted=len(tuple(actions)))
+
+    queue = AcceptingQueue()
+    observed = run_safescale_observation_tick(snapshot, queue=queue, registry=registry, safescale=safescale)
+    assert queue.submitted == [(UnhideAction("critical", ("critical-1",), "receiver_need_upscale", "safescale"),)]
+    assert observed.events[0] == "safescale_receiver_need_upscale:critical"
+    assert safescale.active_probe("critical") is None
+    # Preemption is not a failed probe: no rollback backoff.
+    assert safescale.rollback_backoff_models(1_000) == set()

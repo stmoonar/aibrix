@@ -463,3 +463,20 @@ def test_rollback_backoff_window_follows_the_last_rollback() -> None:
     off.start_probe(model="donor", pods=("pod-a",), now_ms=0)
     off.resolve("donor", status="rollback", reason="slo_violation", now_ms=1_000)
     assert off.rollback_backoff_models(1_000) == set()
+
+
+
+def test_preemption_request_is_idempotent_and_survives_restore() -> None:
+    store = FakeProbeStore()
+    machine = SafeScaleStateMachine(config=_cfg(), store=store)
+    assert machine.request_preemption("donor") == 0  # no probe
+    machine.start_probe(model="donor", pods=("pod-a", "pod-b"), now_ms=0)
+    assert machine.request_preemption("donor") == 2
+    assert machine.request_preemption("donor") == 2
+    record = store.records[machine.active_probe("donor").request_id]
+    assert record["preempt_reason"] == "receiver_need_upscale"
+
+    restored = SafeScaleStateMachine(config=_cfg(), store=FakeProbeStore(unresolved=[record]))
+    restored.restore()
+    decision = restored.observe("donor", _healthy_observation(ts_ms=1_000), now_ms=1_000)
+    assert (decision.status, decision.reason) == ("rollback", "receiver_need_upscale")

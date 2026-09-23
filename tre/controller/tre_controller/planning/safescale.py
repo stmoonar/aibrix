@@ -95,6 +95,9 @@ class SafeScaleProbe:
     terminal_details: dict[str, Any] = field(default_factory=dict)
     #: A13: the donor's gateway (requests, errors) counters at the first observation.
     gateway_baseline: tuple[float, float] | None = None
+    #: v1 receiver_need_upscale: the model itself now needs capacity; the next
+    #: observation rolls the probe back with this reason.
+    preempt_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -120,6 +123,19 @@ class SafeScaleStateMachine:
 
     def active_probes(self) -> tuple[SafeScaleProbe, ...]:
         return tuple(self._probes.values())
+
+    def request_preemption(self, model: str, *, reason: str = "receiver_need_upscale") -> int:
+        """v1 apply_safescale_to_deltas: a scale-up of a model that is itself probing rolls
+        its probe back first. Marks the probe; its next observation returns the rollback
+        (unhide, reason ``reason``). Returns how many pods that restores (0 = no probe)."""
+        probe = self._probes.get(model)
+        if probe is None:
+            return 0
+        if probe.preempt_reason is None:
+            probe = replace(probe, preempt_reason=reason)
+            self._probes[model] = probe
+            self._persist_probe(probe)
+        return len(probe.pods)
 
     def rollback_backoff_models(self, now_ms: int) -> set[str]:
         """Models whose last probe rolled back less than rollback_backoff_ms ago (A13):
@@ -181,6 +197,9 @@ class SafeScaleStateMachine:
         self._persist_observation(updated, observation)
 
         health = donor_health(updated, observation)
+        if updated.preempt_reason is not None:
+            self._probes[model] = replace(updated, terminal_details={"preempted": updated.preempt_reason})
+            return self._rollback(updated, reason=updated.preempt_reason)
         if self._violates_slo(observation):
             self._probes[model] = replace(
                 updated,
@@ -275,7 +294,8 @@ class SafeScaleStateMachine:
             resolved_ts=float(now_ms) / 1000.0,
         )
         self._probes.pop(model, None)
-        if status == "rollback":
+        # A preemption for the model's own scale-up is not a failed probe: no backoff.
+        if status == "rollback" and probe.preempt_reason is None:
             self._last_rollback_ms[model] = int(now_ms)
         return True
 
@@ -606,6 +626,7 @@ def _probe_record(
         "window_terms": dict(probe.window_terms),
         "terminal_details": dict(probe.terminal_details),
         "gateway_baseline": list(probe.gateway_baseline) if probe.gateway_baseline is not None else None,
+        "preempt_reason": probe.preempt_reason,
     }
     if resolution is not None:
         record["resolution"] = resolution
@@ -661,6 +682,7 @@ def _probe_from_record(row: dict[str, Any], store: ProbeStore) -> SafeScaleProbe
         window_ms=_optional_float(row.get("window_ms")),
         window_terms=dict(row["window_terms"]) if isinstance(row.get("window_terms"), dict) else {},
         gateway_baseline=_baseline_from_record(row.get("gateway_baseline")),
+        preempt_reason=str(row["preempt_reason"]) if row.get("preempt_reason") else None,
     )
 
 

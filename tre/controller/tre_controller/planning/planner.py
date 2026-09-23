@@ -214,9 +214,12 @@ def build_plan(
             recv_pods = _effective_routable_replicas(recv.model_name, model_contexts, model_replicas)
             recv_assigned = _effective_assigned_replicas(recv.model_name, model_contexts, model_replicas)
             recv_max = _max_replicas(cfg, recv.model_name)
-            if recv_pods >= recv_max:
+            # Cap on the awake count incl. hidden probe pods (v1 assigned = non-sleeping,
+            # draining included; the SM counts the same), not on the routable count.
+            recv_awake = _awake_replicas(recv.model_name, model_contexts, model_replicas)
+            if recv_awake >= recv_max:
                 continue
-            raw_need = min(_scale_step(recv_pods, cfg.scale_step_ratio), recv_max - recv_pods)
+            raw_need = min(_scale_step(recv_pods, cfg.scale_step_ratio), recv_max - recv_awake)
             if raw_need <= 0:
                 continue
 
@@ -484,7 +487,11 @@ def build_plan(
             continue
         recv_pods = _effective_routable_replicas(recv.model_name, model_contexts, model_replicas)
         recv_assigned = _effective_assigned_replicas(recv.model_name, model_contexts, model_replicas)
-        receiver_capacity = _max_replicas(cfg, recv.model_name) - recv_pods - max(0, deltas.get(recv.model_name, 0))
+        receiver_capacity = (
+            _max_replicas(cfg, recv.model_name)
+            - _awake_replicas(recv.model_name, model_contexts, model_replicas)
+            - max(0, deltas.get(recv.model_name, 0))
+        )
         if receiver_capacity <= 0:
             continue
         needed = min(_scale_step(recv_pods, cfg.scale_step_ratio), receiver_capacity)
@@ -1098,6 +1105,23 @@ def _effective_routable_replicas(
         return max(0, int(routable))
     except Exception:
         return 1
+
+
+def _awake_replicas(
+    model_name: str,
+    model_contexts: dict[str, dict[str, Any]],
+    model_replicas: dict[str, int],
+) -> int:
+    """Awake bindings incl. hidden probe pods: what the scaling cap (max_awake_replicas)
+    is checked against, matching v1 (assigned = non-sleeping, draining included) and the
+    service-manager. Falls back to the routable count without a fleet view."""
+    awake = model_contexts.get(model_name, {}).get("awake_replicas")
+    if awake is None:
+        return _effective_routable_replicas(model_name, model_contexts, model_replicas)
+    try:
+        return max(0, int(awake))
+    except Exception:
+        return _effective_routable_replicas(model_name, model_contexts, model_replicas)
 
 
 def _effective_assigned_replicas(

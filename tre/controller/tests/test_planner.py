@@ -707,3 +707,35 @@ def test_high_proactive_probe_is_held_during_rollback_backoff() -> None:
     assert ("hot", "high_proactive_safescale") not in reasons(held)
     assert "safescale_rollback_backoff:hot" in held.events
     assert reasons(held) == reasons(free) - {("hot", "high_proactive_safescale")}
+
+
+
+def test_receiver_cap_counts_hidden_probe_pods_like_v1_assigned() -> None:
+    # Review P1-2: 7b has 4 awake, 1 of them hidden by a HIGH probe (routable 3), cap 4.
+    # The planner used to compare the ROUTABLE count (3) with the cap and ask +1, which
+    # the SM (awake incl. hidden = 4) refused with 400 every 5 s. v1 caps on assigned
+    # (non-sleeping, draining included), and so does the planner now.
+    classifications = [_classification("7b", ModelState.CRITICAL, ModelRole.RECEIVER, 0.5)]
+    cfg = PlanConfig(min_replicas_per_model=1, max_replicas_per_model=4)
+
+    def plan(awake: int, routable: int):
+        return build_plan(
+            model_contexts={"7b": {"assigned_replicas": 8, "routable_pods": routable, "awake_replicas": awake}},
+            classifications=classifications,
+            model_replicas={"7b": 8},
+            idle_gpus=2,
+            cfg=cfg,
+        )
+
+    assert [a for a in plan(awake=4, routable=3).actions if isinstance(a, ScaleAction)] == []
+    assert _deltas([a for a in plan(awake=3, routable=3).actions if isinstance(a, ScaleAction)]) == {"7b": 1}
+
+    low = [_classification("7b", ModelState.LOW, ModelRole.RECEIVER, 0.9)]
+    fairness = build_plan(
+        model_contexts={"7b": {"assigned_replicas": 8, "routable_pods": 3, "awake_replicas": 4}},
+        classifications=low,
+        model_replicas={"7b": 8},
+        idle_gpus=2,
+        cfg=cfg,
+    )
+    assert [a for a in fairness.actions if isinstance(a, ScaleAction)] == []
