@@ -84,10 +84,11 @@ spec:
               value: "5"
             - name: TRE_FAIRNESS_INTERVAL_SECONDS
               value: "10"
-            # D8: CRITICAL / LOW / HIGH act only after 2 consecutive new windows (20 s at
-            # the 10 s cadence), counted by window_end_ms.
+            # D8 band dwell OFF (v1/paper alignment A5: neither the paper nor v1 has a
+            # dwell). "2" would make CRITICAL / LOW / HIGH act only after 2 consecutive new
+            # windows (20 s at the 10 s cadence), counted by window_end_ms.
             - name: TRE_DWELL_WINDOWS
-              value: "2"
+              value: "1"
             # S1.1: sliding window (no 60-120s tumbling staleness). free_running only;
             # phase_aligned always reads the half-open window ending on the boundary.
             - name: TRE_METRICS_WINDOW_MODE

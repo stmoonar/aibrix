@@ -99,10 +99,13 @@ def test_tre_v2_overlay_declares_components_and_independent_redis() -> None:
     assert _env(controller)["TRE_HIST_BASELINE_LOOKBACK_MS"] == "90000"
     assert _env(controller)["TRE_PAPER_STALE_MAX_WINDOWS"] == "3"
     assert _env(controller)["TRE_METRICS_SCHEMA"] == "v2"  # D7 (09-22): gateway zsets, no legacy SCAN
-    # D8 (09-22): phase-aligned 10 s sampler + 2-window band dwell, pinned explicitly.
+    # D8 (09-22): phase-aligned 10 s sampler, pinned explicitly. Band dwell OFF (v1/paper
+    # alignment A5), also pinned: "1" = act on the first window.
     assert _env(controller)["TRE_METRICS_REFRESH_MODE"] == "phase_aligned"
     assert _env(controller)["TRE_METRICS_PHASE_OFFSET_MS"] == "2000"
-    assert _env(controller)["TRE_DWELL_WINDOWS"] == "2"
+    assert _env(controller)["TRE_DWELL_WINDOWS"] == "1"
+    # A2 (v1/paper alignment): receiver-less HIGH proactive SafeScale shrink live.
+    assert _env(controller)["TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE"] == "0"
     assert _env(controller)["ENABLE_TRE_SCALING"] == "true"
     assert _env(sm)["TRE_ROUTE_NAMESPACE"] == "tre-v2"
     assert _env(sm)["TRE_GATEWAY_NAME"] == "tre-aibrix-eg"

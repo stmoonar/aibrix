@@ -104,7 +104,9 @@ class ControllerConfig:
     # keeps being served before it is marked stale (decision loops then hold).
     metrics_stale_hold_windows: int = 2
     # TRE_DWELL_WINDOWS (1 = off) / TRE_DWELL_STATES (subset of critical,low,high).
-    dwell_windows: int = 2
+    # Default 1 = off (v1/paper alignment A5: neither the paper nor v1 has a band dwell;
+    # a band acts on the first window that shows it). >= 2 re-enables the D8 dwell.
+    dwell_windows: int = 1
     dwell_states: tuple[str, ...] = ("critical", "low", "high")
     # TRE_GATEWAY_INTERVAL_CHECK: fail (default) | warn | off.
     gateway_interval_check: str = "fail"
@@ -271,7 +273,7 @@ class ControllerConfig:
             metrics_phase_adapt=_get_bool(values, "TRE_METRICS_PHASE_ADAPT", True),
             metrics_phase_retry_ms=_get_positive_int(values, "TRE_METRICS_PHASE_RETRY_MS", 500),
             metrics_stale_hold_windows=_get_nonneg_int(values, "TRE_METRICS_STALE_HOLD_WINDOWS", 2),
-            dwell_windows=_get_positive_int(values, "TRE_DWELL_WINDOWS", 2),
+            dwell_windows=_get_positive_int(values, "TRE_DWELL_WINDOWS", 1),
             dwell_states=dwell_states,
             gateway_interval_check=gateway_interval_check,
         )
