@@ -214,6 +214,20 @@ def test_a_capture_without_request_fields_is_labelled_the_same(tmp_path, monkeyp
     assert current == older
 
 
+def test_every_failure_line_pairs_with_its_raw_request_in_both_formats(tmp_path):
+    # A capture that records outcomes itself used to report every failure line as
+    # "matched no raw request" (the pairing skipped records that had an outcome).
+    for name, with_outcomes in (("current", True), ("older", False)):
+        raw_dir = tmp_path / name / "cell"
+        raw_dir.mkdir(parents=True)
+        _write_capture(raw_dir, _sender_records(), _sidecar(), with_outcomes=with_outcomes)
+        records, _instants, _guard, unmatched = rewindow_from_raw.load_cell_capture(
+            raw_dir / f"{CELL_ID}.jsonl")
+        assert unmatched == 0, name
+        assert sorted(r["outcome"] for r in records if r.get("outcome") not in (None, "ok")) == [
+            "client_timeout", "model_error", "proxy_transient"]
+
+
 def test_failed_requests_leave_no_latency_sample(spec):
     # A 503 in 3 ms or a 30 s client timeout is not a latency of the engine; it reaches
     # the label through the unserved counts, never through the p95.

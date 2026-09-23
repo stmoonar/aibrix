@@ -452,7 +452,11 @@ def attach_failure_details(records: Sequence[dict], failures: Sequence[Mapping])
     Needed only for captures whose raw records predate the ``outcome`` field: their
     classification lives in ``<cell>.failures.jsonl``, keyed by send instant. Records are
     matched on ``(send_ts_ms, http_status)`` in order, so two failures sent in the same
-    millisecond still pair one-to-one. Returns (records, failures that matched nothing).
+    millisecond still pair one-to-one. A record that already carries its ``outcome``
+    still consumes its failure line (and keeps its own fields), so the returned count -
+    failures that matched no raw request - means what it says for every capture format
+    (it used to count every failure of a capture that records outcomes itself).
+    Returns (records, failures that matched nothing).
     """
     pending: dict[tuple, list[Mapping]] = {}
     for failure in failures:
@@ -461,20 +465,19 @@ def attach_failure_details(records: Sequence[dict], failures: Sequence[Mapping])
     out: list[dict] = []
     for record in records:
         rec = dict(record)
-        if not rec.get("outcome"):
-            key = (_as_int(rec.get("send_ts_ms")), _as_int(rec.get("http_status")))
-            queue = pending.get(key)
-            if queue:
-                failure = queue.pop(0)
-                for field_name in ("outcome", "proxy_reason", "request_id", "in_flight_at_send",
-                                   "request_timeout_s"):
-                    if rec.get(field_name) is None and failure.get(field_name) is not None:
-                        rec[field_name] = failure.get(field_name)
-                if not rec.get("outcome"):
-                    # A sidecar older than the ``outcome`` field: its capture-time verdict
-                    # is ``failure_class`` (openloop.failure_signature).
-                    rec["outcome"] = openloop.outcome_of(
-                        {"failure_class": failure.get("failure_class"), **rec})
+        key = (_as_int(rec.get("send_ts_ms")), _as_int(rec.get("http_status")))
+        queue = pending.get(key)
+        if queue:
+            failure = queue.pop(0)
+            for field_name in ("outcome", "proxy_reason", "request_id", "in_flight_at_send",
+                               "request_timeout_s"):
+                if rec.get(field_name) is None and failure.get(field_name) is not None:
+                    rec[field_name] = failure.get(field_name)
+            if not rec.get("outcome"):
+                # A sidecar older than the ``outcome`` field: its capture-time verdict
+                # is ``failure_class`` (openloop.failure_signature).
+                rec["outcome"] = openloop.outcome_of(
+                    {"failure_class": failure.get("failure_class"), **rec})
         out.append(rec)
     unmatched = sum(len(queue) for queue in pending.values())
     return out, unmatched
