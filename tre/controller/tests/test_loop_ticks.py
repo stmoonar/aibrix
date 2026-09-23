@@ -310,6 +310,21 @@ def test_rescue_tick_converts_safescale_required_downscale_to_probe_hide() -> No
     assert result.actions == queue.submitted[0]
     assert safescale.active_probe("donor").pending_upscales == {"critical": 1}
     assert "safescale_probe_started:donor" in result.events
+    # A6: the adaptive window is computed from the donor's serving window and context and
+    # logged as an event. The donor runs at Z = 1 (TSS == theta), so v1's capacity model
+    # leaves no spare rate after hiding 1 of 2 pods -> the Q/rate_gap term takes the 60 s
+    # fallback, which dominates W1 = 2 * p95_e2e = 2 s.
+    probe = safescale.active_probe("donor")
+    assert probe.window_ms == 60_000.0 and probe.deadline_ms == 70_000
+    assert probe.window_terms["inputs"]["p95_e2e_ms"] == 1000.0
+    assert probe.window_terms["inputs"]["routable_pods"] == 2
+    assert probe.window_terms["inputs"]["interval_s"] == 60.0
+    assert probe.window_terms["W1"] == 2_000.0
+    assert (probe.window_terms["dominant"], probe.window_terms["cW2_fallback"]) == ("queue", True)
+    assert any(
+        event.startswith("safescale_probe_window:donor:W=60000:dominant=queue:clamped=none:e2e=2000")
+        for event in result.events
+    )
 
 
 def test_rescue_tick_honors_latency_signal_source_for_classification() -> None:

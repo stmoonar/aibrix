@@ -64,6 +64,8 @@ def test_config_reads_centralized_environment_values() -> None:
             "TRE_FAIRNESS_INTERVAL_SECONDS": "7.25",
             "TRE_METRICS_WINDOW_MS": "45000",
             "TRE_INSTANT_SAMPLE_INTERVAL_MS": "2500",
+            # W_lo*(1-hq) must cover 45000 + 2500 + 2000 (A6 post-hide tail guard).
+            "SAFE_SCALE_MIN_WINDOW_MS": "70000",
             "TRE_HIST_BASELINE_LOOKBACK_MS": "120000",
             "TRE_PERCENTILE_MODE": "interpolated",
             "TRE_SIGNAL_SOURCE": "latency_p95",
@@ -146,7 +148,7 @@ def test_config_centralizes_legacy_safescale_and_state_values() -> None:
             "SAFE_SCALE_TTFT_P95_SLO_MS": "1300",
             "SAFE_SCALE_TPOT_P95_SLO_MS": "120",
             "SAFE_SCALE_DEFAULT_WINDOW_MS": "70000",
-            "SAFE_SCALE_MIN_WINDOW_MS": "20000",
+            "SAFE_SCALE_MIN_WINDOW_MS": "90000",
             "SAFE_SCALE_MAX_WINDOW_MS": "320000",
             "SAFE_SCALE_CW2_FALLBACK_MS": "310000",
             "SAFE_SCALE_CDEC": "3",
@@ -162,7 +164,7 @@ def test_config_centralizes_legacy_safescale_and_state_values() -> None:
     assert config.safescale.ttft_p95_slo_ms == 1300.0
     assert config.safescale.tpot_p95_slo_ms == 120.0
     assert config.safescale.default_window_ms == 70_000.0
-    assert config.safescale.min_window_ms == 20_000.0
+    assert config.safescale.min_window_ms == 90_000.0
     assert config.safescale.max_window_ms == 320_000.0
     assert config.safescale.cw2_fallback_ms == 310_000.0
     assert config.safescale.cdec == 3.0
@@ -184,25 +186,42 @@ def test_metrics_window_mode_can_be_overridden_and_validated() -> None:
 
 
 def test_safescale_window_must_cover_metrics_window_post_hide_tail() -> None:
-    # N2 invariant: default_window_ms*(1-hq) >= metrics_window_ms so the commit-gate
-    # tail observations are fully post-hide. hq default 0.25.
-    # 15000*0.75 = 11250 < 30000 -> reject (the exact case the guard exists for).
+    # N2 invariant on the adaptive window floor (A6): W_lo*(1-hq) >= metrics window +
+    # refresh + read offset so every commit-gate tail observation reads a fully post-hide
+    # window. Phase-aligned defaults: 30000 + 10000 + 2000 = 42000; hq default 0.25.
+    # 15000*0.75 = 11250 < 42000 -> reject (the exact case the guard exists for).
+    with pytest.raises(ValueError, match="SAFE_SCALE_MIN_WINDOW_MS"):
+        ControllerConfig.from_env({"SAFE_SCALE_MIN_WINDOW_MS": "15000"})
+    # Just below the boundary: 55999*0.75 = 41999.25 < 42000 -> reject.
+    with pytest.raises(ValueError):
+        ControllerConfig.from_env({"SAFE_SCALE_MIN_WINDOW_MS": "55999"})
+    # Exact boundary: 56000*0.75 = 42000 -> loads.
+    assert ControllerConfig.from_env({"SAFE_SCALE_MIN_WINDOW_MS": "56000"}).safescale.min_window_ms == 56_000.0
+    # The read offset counts: offset 3000 -> 43000 needed, 56000 no longer enough.
+    with pytest.raises(ValueError):
+        ControllerConfig.from_env({"SAFE_SCALE_MIN_WINDOW_MS": "56000", "TRE_METRICS_PHASE_OFFSET_MS": "3000"})
+    # free_running: refresh = TRE_METRICS_REFRESH_INTERVAL_SECONDS, no read offset.
+    assert ControllerConfig.from_env(
+        {"SAFE_SCALE_MIN_WINDOW_MS": "46667", "TRE_METRICS_REFRESH_MODE": "free_running"}
+    ).metrics_refresh_mode == "free_running"
     with pytest.raises(ValueError):
         ControllerConfig.from_env(
-            {"SAFE_SCALE_DEFAULT_WINDOW_MS": "15000", "TRE_METRICS_WINDOW_MS": "30000"}
+            {"SAFE_SCALE_MIN_WINDOW_MS": "46666", "TRE_METRICS_REFRESH_MODE": "free_running"}
         )
-    # Just below the boundary: 39999*0.75 = 29999.25 < 30000 -> reject.
-    with pytest.raises(ValueError):
-        ControllerConfig.from_env(
-            {"SAFE_SCALE_DEFAULT_WINDOW_MS": "39999", "TRE_METRICS_WINDOW_MS": "30000"}
-        )
-    # Exact boundary: 40000*0.75 = 30000 >= 30000 -> loads.
-    cfg = ControllerConfig.from_env(
-        {"SAFE_SCALE_DEFAULT_WINDOW_MS": "40000", "TRE_METRICS_WINDOW_MS": "30000"}
-    )
-    assert cfg.metrics_window_ms == 30_000
-    # Defaults (60000 / hq 0.25 / 30000) load fine.
+    # The fixed default window no longer sets the deadline, so it is not what is checked.
+    assert ControllerConfig.from_env({"SAFE_SCALE_DEFAULT_WINDOW_MS": "15000"}).safescale.default_window_ms == 15_000.0
+    # Defaults (W_lo 60000 / hq 0.25 -> 45000 >= 42000) load fine.
     ControllerConfig.from_env({})
+
+
+def test_safescale_adaptive_window_defaults_match_v1_alignment() -> None:
+    # A6: W = clamp(60 s, 120 s, ...); cw2 fallback 60 s (was 300 s, which pinned every
+    # probe with an unknown rate gap at the ceiling); no-metrics default 60 s.
+    safescale = ControllerConfig.from_env({}).safescale
+    assert (safescale.min_window_ms, safescale.max_window_ms) == (60_000.0, 120_000.0)
+    assert safescale.cw2_fallback_ms == 60_000.0
+    assert safescale.default_window_ms == 60_000.0
+    assert (safescale.cdec, safescale.hq) == (2.0, 0.25)
 
 
 def test_config_rejects_inverted_safescale_window_bounds() -> None:

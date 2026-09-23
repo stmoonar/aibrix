@@ -106,6 +106,10 @@ def test_tre_v2_overlay_declares_components_and_independent_redis() -> None:
     assert _env(controller)["TRE_DWELL_WINDOWS"] == "1"
     # A2 (v1/paper alignment): receiver-less HIGH proactive SafeScale shrink live.
     assert _env(controller)["TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE"] == "0"
+    # A6: adaptive SafeScale probe window band + queue-term fallback, pinned.
+    assert _env(controller)["SAFE_SCALE_MIN_WINDOW_MS"] == "60000"
+    assert _env(controller)["SAFE_SCALE_MAX_WINDOW_MS"] == "120000"
+    assert _env(controller)["SAFE_SCALE_CW2_FALLBACK_MS"] == "60000"
     assert _env(controller)["ENABLE_TRE_SCALING"] == "true"
     assert _env(sm)["TRE_ROUTE_NAMESPACE"] == "tre-v2"
     assert _env(sm)["TRE_GATEWAY_NAME"] == "tre-aibrix-eg"

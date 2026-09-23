@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Literal, Protocol
 
 from tre_controller.config import SafeScaleConfig
@@ -34,6 +34,30 @@ class ProbeObservation:
 
 
 @dataclass(frozen=True)
+class ProbeWindowInputs:
+    """The donor's metrics at probe start, for the adaptive probe window (v1
+    ``start_hidden_probe`` -> ``_calc_probe_window_details``). Units as in v1:
+
+    * ``p95_e2e_ms`` / ``p95_tpot_ms``: window p95 latencies (ms) of the serving pods;
+    * ``q``: Q_ctl (in-flight requests, the TSS queue term);
+    * ``y_total``: Y_m, the TSS numerator = weighted tokens in the metrics window;
+      ``y_per_pod``: y_m = Y_m / routable pods (used only when Y_m is missing);
+    * ``z_m``: the donor's Z (spare-capacity multiplier, v1 ``max(1, z_m)``);
+    * ``routable_pods``: serving (awake, not hidden) pods BEFORE the hide;
+    * ``interval_s``: metrics window length (s) that Y_m was summed over.
+    """
+
+    p95_e2e_ms: float | None = None
+    p95_tpot_ms: float | None = None
+    q: float | None = None
+    y_total: float | None = None
+    y_per_pod: float | None = None
+    z_m: float | None = None
+    routable_pods: int | None = None
+    interval_s: float | None = None
+
+
+@dataclass(frozen=True)
 class SafeScaleCommand:
     kind: CommandKind
     model: str
@@ -47,6 +71,8 @@ class SafeScaleDecision:
     status: ProbeStatus
     reason: str
     commands: tuple[SafeScaleCommand, ...] = ()
+    #: probe_started: the adaptive window breakdown (calc_probe_window_details).
+    details: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -59,6 +85,9 @@ class SafeScaleProbe:
     status: Literal["probing"] = "probing"
     pending_upscales: dict[str, int] = field(default_factory=dict)
     observations: tuple[ProbeObservation, ...] = ()
+    #: Adaptive window W (ms) and its breakdown (calc_probe_window_details), for reports.
+    window_ms: float | None = None
+    window_terms: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -90,6 +119,7 @@ class SafeScaleStateMachine:
         pods: tuple[str, ...],
         now_ms: int,
         pending_upscales: dict[str, int] | None = None,
+        window_inputs: ProbeWindowInputs | None = None,
     ) -> SafeScaleDecision:
         if model in self._probes:
             return SafeScaleDecision(status="probing", reason="probe_already_active")
@@ -97,13 +127,21 @@ class SafeScaleStateMachine:
             return SafeScaleDecision(status="none", reason="no_pods_to_probe")
 
         normalized_pending = _normalize_pending_upscales(pending_upscales)
+        # A6 (v1 safescale.py start_hidden_probe): adaptive window
+        # W = clamp(W_lo, W_hi, max(2*p95_e2e, cdec*p95_tpot, Q/rate_gap)).
+        terms = calc_probe_window_details(
+            window_inputs or ProbeWindowInputs(), hidden_count=len(pods), config=self._config
+        )
+        window_ms = float(terms["W"])
         probe = SafeScaleProbe(
             model=model,
             pods=tuple(pods),
             start_ms=int(now_ms),
-            deadline_ms=int(now_ms + self._config.default_window_ms),
+            deadline_ms=int(now_ms + window_ms),
             request_id=f"{model}-{int(now_ms)}",
             pending_upscales=normalized_pending,
+            window_ms=window_ms,
+            window_terms=terms,
         )
         self._probes[model] = probe
         self._persist_probe(probe)
@@ -111,6 +149,7 @@ class SafeScaleStateMachine:
             status="probing",
             reason="probe_started",
             commands=(SafeScaleCommand(kind="hide", model=model, pods=probe.pods, reason="probe_started"),),
+            details=dict(terms),
         )
 
     def observe(self, model: str, observation: ProbeObservation, *, now_ms: int) -> SafeScaleDecision:
@@ -241,15 +280,156 @@ class SafeScaleStateMachine:
 
 
 def _replace_observations(probe: SafeScaleProbe, observations: tuple[ProbeObservation, ...]) -> SafeScaleProbe:
-    return SafeScaleProbe(
-        model=probe.model,
-        pods=probe.pods,
-        start_ms=probe.start_ms,
-        deadline_ms=probe.deadline_ms,
-        request_id=probe.request_id,
-        pending_upscales=dict(probe.pending_upscales),
-        observations=observations,
+    return replace(probe, pending_upscales=dict(probe.pending_upscales), observations=observations)
+
+
+def _estimate_post_drain_gap_per_second(
+    *,
+    y_total: float | None,
+    y_per_pod: float | None,
+    z_m: float | None,
+    routable_pods: int | None,
+    hidden_count: int,
+    interval_s: float | None,
+) -> float | None:
+    """v1 ``_estimate_post_drain_gap_per_second`` verbatim: the spare service rate left
+    after hiding ``hidden_count`` pods, in Y units (weighted tokens) per second.
+
+    arrival = Y_m / interval; capacity = arrival * max(1, Z_m) (Z_m = TSS / theta_m, used
+    by v1 as the spare-capacity multiplier); gap = per-pod capacity * remaining pods -
+    arrival, floored at 0.
+    """
+    interval = _positive(interval_s)
+    current_pods = max(1, int(routable_pods) if routable_pods is not None else 1)
+    remaining_pods = max(0, current_pods - max(0, int(hidden_count)))
+    if interval is None or remaining_pods <= 0:
+        return None
+    y_all = _nonneg(y_total)
+    y_pod = _nonneg(y_per_pod)
+    if y_all is None and y_pod is None:
+        return None
+    arrival_rate = (y_all / interval) if y_all is not None else (y_pod * current_pods) / interval
+    if arrival_rate <= 0:
+        return None
+    spare_multiplier = _positive(z_m) or 1.0
+    current_capacity = arrival_rate * max(1.0, spare_multiplier)
+    per_pod_capacity = current_capacity / current_pods
+    mu_post = per_pod_capacity * remaining_pods
+    return max(0.0, mu_post - arrival_rate)
+
+
+def calc_probe_window_details(
+    inputs: ProbeWindowInputs,
+    *,
+    hidden_count: int,
+    config: SafeScaleConfig,
+) -> dict[str, Any]:
+    """Port of v1 ``safescale._calc_probe_window_details`` (v1 safescale.py:302-359).
+
+    * W1 = 2 * p95_e2e (``default_window_ms`` when unavailable);
+    * queue term cW2 = Q / rate_gap (s -> ms) when Q > 0; ``cw2_fallback_ms`` when the
+      post-hide rate gap is unknown or <= epsilon_mu;
+    * decode term = cdec * p95_tpot;
+    * W2 = max(queue term, decode term) (``default_window_ms`` when neither exists);
+    * W = clamp(min_window_ms, max_window_ms, max(W1, W2)).
+
+    Returns every term plus ``dominant`` (which term set the unclamped max: e2e / queue /
+    decode / default) and ``clamped`` (lo / hi / None) for the probe record and events.
+    """
+    default_ms = float(config.default_window_ms)
+    lo_ms = float(config.min_window_ms)
+    hi_ms = float(config.max_window_ms)
+    p95_e2e = _positive(inputs.p95_e2e_ms)
+    p95_tpot = _positive(inputs.p95_tpot_ms)
+    w1 = 2.0 * p95_e2e if p95_e2e is not None else default_ms
+
+    gap = _estimate_post_drain_gap_per_second(
+        y_total=inputs.y_total,
+        y_per_pod=inputs.y_per_pod,
+        z_m=inputs.z_m,
+        routable_pods=inputs.routable_pods,
+        hidden_count=hidden_count,
+        interval_s=inputs.interval_s,
     )
+    cw2_fallback = min(hi_ms, _positive(config.cw2_fallback_ms) or hi_ms)
+    q = _nonneg(inputs.q)
+    queue_term: float | None = None
+    queue_fallback = False
+    if q is not None and q > 0:
+        if gap is None or gap <= config.epsilon_mu:
+            queue_term = cw2_fallback
+            queue_fallback = True
+        else:
+            queue_term = (q / max(gap, config.epsilon_mu)) * 1000.0
+    decode_term = max(0.0, config.cdec) * p95_tpot if p95_tpot is not None else None
+
+    w2_candidates = [value for value in (queue_term, decode_term) if value is not None]
+    w2 = max(w2_candidates) if w2_candidates else default_ms
+    raw = max(w1, w2)
+    window = max(lo_ms, min(hi_ms, raw))
+
+    if raw == w1 and p95_e2e is not None:
+        dominant = "e2e"
+    elif w2_candidates and raw == w2:
+        dominant = "queue" if queue_term is not None and w2 == queue_term else "decode"
+    else:
+        dominant = "default"
+    clamped = "lo" if raw < lo_ms else ("hi" if raw > hi_ms else None)
+    return {
+        "W": window,
+        "W_raw": raw,
+        "W1": w1,
+        "W2": w2,
+        "cW2": queue_term,
+        "cW2_fallback": queue_fallback,
+        "decode_term_ms": decode_term,
+        "rate_gap_per_second": gap,
+        "dominant": dominant,
+        "clamped": clamped,
+        "W_lo": lo_ms,
+        "W_hi": hi_ms,
+        "inputs": {
+            "p95_e2e_ms": p95_e2e,
+            "p95_tpot_ms": p95_tpot,
+            "q": q,
+            "y_total": _nonneg(inputs.y_total),
+            "y_per_pod": _nonneg(inputs.y_per_pod),
+            "z_m": _positive(inputs.z_m),
+            "routable_pods": inputs.routable_pods,
+            "hidden_count": int(hidden_count),
+            "interval_s": _positive(inputs.interval_s),
+        },
+    }
+
+
+def format_window_event(model: str, terms: dict[str, Any]) -> str:
+    """One-line decision event for a probe's adaptive window (reports grep these)."""
+
+    def fmt(value: Any) -> str:
+        if value is None:
+            return "na"
+        if isinstance(value, bool):
+            return "1" if value else "0"
+        number = float(value)
+        return f"{number:.0f}" if abs(number) >= 1 else f"{number:.3g}"
+
+    return (
+        f"safescale_probe_window:{model}:W={fmt(terms.get('W'))}"
+        f":dominant={terms.get('dominant')}:clamped={terms.get('clamped') or 'none'}"
+        f":e2e={fmt(terms.get('W1'))}:queue={fmt(terms.get('cW2'))}"
+        f":decode={fmt(terms.get('decode_term_ms'))}:gap={fmt(terms.get('rate_gap_per_second'))}"
+        f":fallback={fmt(terms.get('cW2_fallback'))}"
+    )
+
+
+def _positive(value: Any) -> float | None:
+    parsed = _optional_float(value)
+    return parsed if parsed is not None and parsed > 0 else None
+
+
+def _nonneg(value: Any) -> float | None:
+    parsed = _optional_float(value)
+    return parsed if parsed is not None and parsed >= 0 else None
 
 
 def _summarize_tail(
@@ -330,6 +510,8 @@ def _probe_record(
         "status": status,
         "pending_upscales": dict(probe.pending_upscales),
         "terminal_reason": terminal_reason,
+        "window_ms": probe.window_ms,
+        "window_terms": dict(probe.window_terms),
     }
     if resolution is not None:
         record["resolution"] = resolution
@@ -380,6 +562,8 @@ def _probe_from_record(row: dict[str, Any], store: ProbeStore) -> SafeScaleProbe
         request_id=request_id,
         pending_upscales=_normalize_pending_upscales(row.get("pending_upscales")),
         observations=tuple(observations),
+        window_ms=_optional_float(row.get("window_ms")),
+        window_terms=dict(row["window_terms"]) if isinstance(row.get("window_terms"), dict) else {},
     )
 
 

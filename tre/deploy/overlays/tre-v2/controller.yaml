@@ -109,6 +109,16 @@ spec:
               value: "500"
             - name: SAFE_SCALE_TPOT_P95_SLO_MS
               value: "75"
+            # A6 (v1/paper alignment): adaptive probe window
+            # W = clamp(MIN, MAX, max(2*p95_e2e, CDEC*p95_tpot, Q/rate_gap)); the queue
+            # term falls back to CW2_FALLBACK when the post-hide rate gap is ~0. Startup
+            # guard: MIN*(1-HQ) >= TRE_METRICS_WINDOW_MS + 10 s refresh + phase offset.
+            - name: SAFE_SCALE_MIN_WINDOW_MS
+              value: "60000"
+            - name: SAFE_SCALE_MAX_WINDOW_MS
+              value: "120000"
+            - name: SAFE_SCALE_CW2_FALLBACK_MS
+              value: "60000"
             # --- Ablation switches (D4); production defaults ---
             - name: ENABLE_TRE_SCALING
               value: "true"

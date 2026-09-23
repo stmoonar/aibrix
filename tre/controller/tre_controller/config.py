@@ -32,10 +32,15 @@ _FALSE_VALUES = {"0", "false", "no", "n", "off"}
 class SafeScaleConfig:
     ttft_p95_slo_ms: float = 500.0
     tpot_p95_slo_ms: float = 75.0
+    # A6 (v1 _calc_probe_window_details): probe window
+    # W = clamp(min_window_ms, max_window_ms, max(2*p95_e2e, cdec*p95_tpot, Q/rate_gap)).
+    # default_window_ms stands in for a missing latency term (no metrics -> W = 60 s);
+    # cw2_fallback_ms replaces Q/rate_gap when the post-hide rate gap is <= epsilon_mu
+    # (was 300 s, which pinned every such probe at the ceiling).
     default_window_ms: float = 60_000.0
-    min_window_ms: float = 15_000.0
-    max_window_ms: float = 300_000.0
-    cw2_fallback_ms: float = 300_000.0
+    min_window_ms: float = 60_000.0
+    max_window_ms: float = 120_000.0
+    cw2_fallback_ms: float = 60_000.0
     cdec: float = 2.0
     hq: float = 0.25
     tau_low: float = 1.0
@@ -174,9 +179,9 @@ class ControllerConfig:
             ttft_p95_slo_ms=_get_positive_float(values, "SAFE_SCALE_TTFT_P95_SLO_MS", 500.0),
             tpot_p95_slo_ms=_get_positive_float(values, "SAFE_SCALE_TPOT_P95_SLO_MS", 75.0),
             default_window_ms=_get_positive_float(values, "SAFE_SCALE_DEFAULT_WINDOW_MS", 60_000.0),
-            min_window_ms=_get_positive_float(values, "SAFE_SCALE_MIN_WINDOW_MS", 15_000.0),
-            max_window_ms=_get_positive_float(values, "SAFE_SCALE_MAX_WINDOW_MS", 300_000.0),
-            cw2_fallback_ms=_get_positive_float(values, "SAFE_SCALE_CW2_FALLBACK_MS", 300_000.0),
+            min_window_ms=_get_positive_float(values, "SAFE_SCALE_MIN_WINDOW_MS", 60_000.0),
+            max_window_ms=_get_positive_float(values, "SAFE_SCALE_MAX_WINDOW_MS", 120_000.0),
+            cw2_fallback_ms=_get_positive_float(values, "SAFE_SCALE_CW2_FALLBACK_MS", 60_000.0),
             cdec=_get_positive_float(values, "SAFE_SCALE_CDEC", 2.0),
             hq=_get_positive_float(values, "SAFE_SCALE_HQ", 0.25),
             tau_low=_get_positive_float(values, "SAFE_SCALE_TAU_LOW", 1.0),
@@ -189,24 +194,33 @@ class ControllerConfig:
         metrics_window_ms = _get_positive_int(values, "TRE_METRICS_WINDOW_MS", 30_000)
         # phase_aligned needs metrics_window_ms to be a multiple of the gateway period;
         # metrics_task falls back to free_running (with an error log) when it is not.
-        # N2 invariant (plan 15 §6 N2, architect-ruled): the SafeScale commit gate only
-        # inspects the tail (hq fraction) of probe observations. Those tail observations'
-        # metrics windows must be fully post-hide, i.e. the probe must run at least one
-        # metrics window past the tail start: default_window_ms - tail_span >= metrics_window_ms.
-        # Guards a future SAFE_SCALE_DEFAULT_WINDOW_MS being set too short for the metrics
-        # window (e.g. 15000 < 30000) from silently diluting the commit gate with pre-hide
-        # traffic. (SafeScaleConfig.min_window_ms=15000 is currently DEAD config — never wired
-        # to a probe deadline — so it is not guarded here; see 05_paper_vs_impl.md.)
+        # N2 invariant (plan 15 §6 N2, architect-ruled; re-based on the adaptive window A6):
+        # the SafeScale commit gate only inspects the tail (hq fraction) of the probe
+        # observations, and every tail observation must read a metrics window that lies
+        # fully after the hide. The tail starts at W*(1-hq) after the hide; an observation
+        # there reads a window ending up to one refresh period + the read offset earlier
+        # and spanning metrics_window_ms, so W_lo*(1-hq) >= metrics_window + refresh +
+        # offset (30 + 10 + 2 s today; W_lo = 60 s, hq = 0.25 -> 45 s). Checked on the
+        # FLOOR min_window_ms because W is clamped to it (the old check used the fixed
+        # default_window_ms, which no longer sets the deadline).
         if safescale.hq < 1.0:
-            tail_span_ms = safescale.hq * safescale.default_window_ms
+            tail_span_ms = safescale.hq * safescale.min_window_ms
         else:
             tail_span_ms = safescale.hq * safescale.probe_poll_seconds * 1000.0
-        if safescale.default_window_ms - tail_span_ms < metrics_window_ms:
+        if metrics_refresh_mode == "phase_aligned":
+            refresh_ms = float(instant_sample_interval_ms)
+            read_offset_ms = float(metrics_phase_offset_ms)
+        else:
+            refresh_ms = _get_positive_float(values, "TRE_METRICS_REFRESH_INTERVAL_SECONDS", 5.0) * 1000.0
+            read_offset_ms = 0.0
+        required_ms = metrics_window_ms + refresh_ms + read_offset_ms
+        if safescale.min_window_ms - tail_span_ms < required_ms:
             raise ValueError(
-                "SAFE_SCALE_DEFAULT_WINDOW_MS minus the commit-gate tail span must be >= "
-                "TRE_METRICS_WINDOW_MS so SafeScale probe tail observations are fully post-hide "
-                f"(default_window_ms={safescale.default_window_ms}, hq={safescale.hq}, "
-                f"metrics_window_ms={metrics_window_ms})"
+                "SAFE_SCALE_MIN_WINDOW_MS minus the commit-gate tail span must be >= "
+                "TRE_METRICS_WINDOW_MS + metrics refresh + read offset so SafeScale probe tail "
+                f"observations are fully post-hide (min_window_ms={safescale.min_window_ms}, "
+                f"hq={safescale.hq}, metrics_window_ms={metrics_window_ms}, refresh_ms={refresh_ms}, "
+                f"read_offset_ms={read_offset_ms})"
             )
 
         return cls(

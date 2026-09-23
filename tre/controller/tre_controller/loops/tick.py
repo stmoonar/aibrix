@@ -26,7 +26,12 @@ from tre_controller.planning.planner import (
     UnhideAction,
     build_plan,
 )
-from tre_controller.planning.safescale import SafeScaleCommand, SafeScaleDecision
+from tre_controller.planning.safescale import (
+    ProbeWindowInputs,
+    SafeScaleCommand,
+    SafeScaleDecision,
+    format_window_event,
+)
 from tre_controller.signals.sources import get_signal, per_replica_token_rate
 from tre_controller.signals.trs import SignalState, TRSComputer, TRSInput
 from tre_sm.allocator.slots import natural_key, release_order
@@ -46,6 +51,7 @@ class SafeScaleController(Protocol):
         pods: tuple[str, ...],
         now_ms: int,
         pending_upscales: dict[str, int] | None = None,
+        window_inputs: ProbeWindowInputs | None = None,
     ) -> SafeScaleDecision: ...
 
 
@@ -186,7 +192,12 @@ def run_planner_tick(
         _plan_ns = time.perf_counter_ns() - _phase_t0
         _phase_t0 = time.perf_counter_ns()
     actions, safescale_events = _apply_safescale(
-        snapshot, tuple(plan.actions), plan.probe_upscale_plans, safescale=safescale, cluster_view=cluster_view
+        snapshot,
+        tuple(plan.actions),
+        plan.probe_upscale_plans,
+        safescale=safescale,
+        cluster_view=cluster_view,
+        contexts=contexts,
     )
     if _prof_on:
         _safescale_ns = time.perf_counter_ns() - _phase_t0
@@ -244,6 +255,7 @@ def _apply_safescale(
     *,
     safescale: SafeScaleController | None,
     cluster_view: ClusterView | None = None,
+    contexts: dict[str, dict] | None = None,
 ) -> tuple[tuple[Action, ...], tuple[str, ...]]:
     if safescale is None:
         return actions, ()
@@ -262,13 +274,47 @@ def _apply_safescale(
             pods=pods,
             now_ms=snapshot.ts_ms,
             pending_upscales=_safescale_pending_upscales(action, probe_upscale_plans),
+            window_inputs=probe_window_inputs(snapshot, probe_model, contexts, cluster_view),
         )
         if decision.status == "none":
             events.append(f"safescale_probe_skipped:{probe_model}:{decision.reason}")
             continue
         events.append(f"safescale_{decision.reason}:{probe_model}")
+        if decision.reason == "probe_started" and getattr(decision, "details", None):
+            events.append(format_window_event(probe_model, decision.details))
         converted.extend(_commands_to_actions(decision.commands, source_loop=action.source_loop))
     return tuple(converted), tuple(events)
+
+
+def probe_window_inputs(
+    snapshot: MetricsSnapshot,
+    model: str,
+    contexts: dict[str, dict] | None,
+    cluster_view: ClusterView | None = None,
+) -> ProbeWindowInputs | None:
+    """The donor's adaptive-window inputs (A6) from this tick: latency p95s of its serving
+    window, and Q_ctl / Y_m / y_m / Z / routable pods from its planner context - the same
+    quantities v1 start_hidden_probe read from model_metrics and model_context."""
+    metrics = snapshot.models.get(model)
+    context = (contexts or {}).get(model) or {}
+    if metrics is None and not context:
+        return None
+    p95_e2e = p95_tpot = interval_s = None
+    if metrics is not None:
+        serving = serving_window(metrics, cluster_view)
+        p95_e2e = serving.e2e_p95_ms
+        p95_tpot = serving.tpot_p95_ms
+        interval_s = (serving.window_end_ms - serving.window_start_ms) / 1000.0
+    return ProbeWindowInputs(
+        p95_e2e_ms=p95_e2e,
+        p95_tpot_ms=p95_tpot,
+        q=context.get("Q_ctl"),
+        y_total=context.get("Y_m"),
+        y_per_pod=context.get("y_m"),
+        z_m=context.get("z_m"),
+        routable_pods=context.get("routable_pods"),
+        interval_s=interval_s,
+    )
 
 
 def _requires_safescale_probe(action: Action) -> bool:
