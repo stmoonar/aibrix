@@ -483,3 +483,40 @@ Revert the ADR-0014 commit. All state is code-level (no data migration): `is_sat
 re-enters the tick context, the fairness gate and warmup bypass return, and the deleted
 tests come back. `qsat/epsat/hsat` were never removed from the registry schema, so no
 `registry.yaml` change is needed either way.
+
+## ADR-0008 amendment (2026-09-24): least-gpu-cache ext_proc routing on tre-v2, both arms
+
+### Background
+v1 routed every request of both arms through one gateway: the client sent
+`routing-strategy: least-gpu-cache`, the AIBrix plugin (ext_proc) picked the pod with the
+lowest `vllm:gpu_cache_usage_perc`, and Envoy forwarded to it through an ORIGINAL_DST
+cluster. v2 had dropped that (ADR-0008 shipped tre-gateway-plugins as a metrics scraper
+only): TRE traffic went per-model HTTPRoute -> Service -> Envoy LEAST_REQUEST on 31094,
+while the APA arm went through aibrix-system (31592, 120 s timeout, its own plugin). The
+two arms were therefore routed differently from v1 and from each other.
+
+### Decision
+Rebuild the v1 serving path on tre-v2 only (`deploy/overlays/tre-v2/gateway-extproc.yaml`)
+and send both arms through it (`campaign_queue.py` GATEWAYS, replayer default
+`--routing-strategy least-gpu-cache`).
+- Plugin (TRE-PATCH P2-GW-004): `TRE_ROUTABLE_LABEL_FILTER=true` limits routing candidates to
+  `tre.aibrix.io/routable=true`. Required: ORIGINAL_DST bypasses the Service selector, and a
+  sleeping pod reports ~0 KV-cache usage, so least-gpu-cache would pick it first. Scraping is
+  not narrowed. least-gpu-cache `Route()` itself is unchanged from v1.
+- One ORIGINAL_DST cluster per model (v1 had one shared), named
+  `httproute/tre-v2/<model>-router/rule/original-dst`, carrying the per-model
+  4096/1024/4096/16 breaker; the running controller's donor-health guard (prefix match on
+  `httproute/tre-v2/<model>-router/rule/`) and the openloop sentinel count it unchanged.
+  P2-GW-005 (`TRE_ROUTE_MODEL_HEADER`) lets v1-style clients (no `model` header) reach it.
+- Route timeout 600 s (current TRE arm), not v1's 120/150 s. Response body not sent to
+  the plugin (v1: Streamed) to keep a per-chunk gRPC round trip off TPOT.
+- `HOT_SWITCH=0`: no gateway-initiated wake-ups (v1 had them), only the arm under test
+  changes the layout.
+- Nothing shared is touched: EnvoyPatchPolicy was already enabled in envoy-gateway-config;
+  all new objects are in tre-v2; aibrix-system is unchanged.
+
+### Rollback
+`kubectl delete -f deploy/overlays/tre-v2/gateway-extproc.yaml` restores the old route
+table (requests with `routing-strategy` then fall to the per-model routes, which match on
+the `model` header the replayer still sends). Re-apply the previous `gateway-plugins.yaml`
+image for a full revert; point `campaign_queue.py` APA back at 31592 only together with it.

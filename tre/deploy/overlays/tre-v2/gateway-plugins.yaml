@@ -1,9 +1,12 @@
-# Isolated TRE metrics scraper (ADR-0008). gateway-plugins runs a background pod
-# discovery + vLLM /metrics scrape loop (AIBRIX_POD_METRIC_REFRESH_INTERVAL_MS)
-# that writes zm keys to REDIS_HOST, independent of request routing / ext-proc.
-# Here it targets tre-v2-redis so the retargeted controller reads TRE-owned
-# metrics. No ext-proc (:50052) wiring, reserved-router, or ext-proc policy is
-# created -- those are serving-path concerns TRE does not use.
+# Isolated TRE gateway plugin (ADR-0008 + 2026-09-24 amendment). Two jobs:
+#  1. metrics scraper: background pod discovery + vLLM /metrics scrape loop
+#     (AIBRIX_POD_METRIC_REFRESH_INTERVAL_MS=50, as v1) writing zm keys to
+#     tre-v2-redis, which the controller reads;
+#  2. ext_proc router (:50052) for requests carrying `routing-strategy` on the
+#     tre-v2 gateway (gateway-extproc.yaml): least-gpu-cache picks the awake pod
+#     with the lowest vllm:gpu_cache_usage_perc, as v1 did.
+# Exactly ONE replica, as in v1: the scrape loop is not leader-elected, so a
+# second replica would double-write every tre:v2:inst/hist doc.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -76,8 +79,28 @@ spec:
               value: dual
       containers:
         - name: gateway-plugins
-          image: aibrix/gateway-plugins:20260704-0d869b49-nozmq2
+          # Built by deploy/scripts/build_gateway_plugins_nozmq.sh (same recipe as the
+          # previous 20260704-0d869b49-nozmq2; adds TRE-PATCH P2-GW-004/005).
+          image: aibrix/gateway-plugins:20260924-ee7122bf-nozmq2
           imagePullPolicy: IfNotPresent
+          # Same gRPC probes as the v1 aibrix-gateway-plugins (relaxed timings that
+          # stopped restarts under load): the Service only gets an endpoint, and
+          # ext_proc only gets a backend, once :50052 answers health checks.
+          readinessProbe:
+            grpc:
+              port: 50052
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 5
+            successThreshold: 1
+            failureThreshold: 5
+          livenessProbe:
+            grpc:
+              port: 50052
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 5
           ports:
             - containerPort: 50052
               name: gateway
@@ -104,8 +127,22 @@ spec:
               value: "0"
             - name: DEBUG_POD_LIST
               value: "1"
+            # Routing candidates = pods labelled tre.aibrix.io/routable=true (the
+            # label service-manager maintains for BOTH arms). Mandatory here: the
+            # ORIGINAL_DST route bypasses the per-model Service selector, and a
+            # sleeping pod reports ~0 KV-cache usage, so least-gpu-cache would pick it.
+            - name: TRE_ROUTABLE_LABEL_FILTER
+              value: "true"
+            # Stamp the body model onto the `model` header so v1-style clients that
+            # send only routing-strategy land on their per-model ORIGINAL_DST cluster.
+            - name: TRE_ROUTE_MODEL_HEADER
+              value: "true"
+            # Gateway-initiated wake-up stays OFF (it was "1" but inert: SERVEMENT_URL
+            # was never set). v1 set both, so a request to a model with zero awake pods
+            # made the gateway itself wake one; in v2 only the arm under test (TRE
+            # controller or APA) may change the layout, and such a request gets a 503.
             - name: HOT_SWITCH
-              value: "1"
+              value: "0"
             - name: QZ_KIND
               value: "0"
             - name: delay_time1
@@ -162,6 +199,10 @@ spec:
   selector:
     app: tre-gateway-plugins
   ports:
+    # ext_proc gRPC backend of tre-gateway-plugins-extension-policy (gateway-extproc.yaml).
+    - name: gateway
+      port: 50052
+      targetPort: 50052
     - name: profiling
       port: 6060
       targetPort: 6060

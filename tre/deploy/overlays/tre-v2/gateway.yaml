@@ -1,7 +1,11 @@
 # Isolated TRE serving gateway (ADR-0008). Dedicated Envoy proxy, own listener;
-# TRE model routers parent this gateway instead of the shared aibrix-eg. No
-# ext-proc: TRE serving is plain per-model HTTPRoute -> model Service -> routable
-# pods (Service selector tre.aibrix.io/routable=true).
+# TRE model routers parent this gateway instead of the shared aibrix-eg. Two
+# serving paths, both restricted to routable pods (tre.aibrix.io/routable=true):
+#   * no routing-strategy header: per-model HTTPRoute -> model Service (selector
+#     on the label) -> Envoy LEAST_REQUEST over its endpoints;
+#   * routing-strategy header (the experiment default, both arms, as in v1):
+#     ext_proc tre-gateway-plugins picks the pod, ORIGINAL_DST forwards to it
+#     (gateway-extproc.yaml; the plugin applies the label gate itself).
 apiVersion: gateway.networking.k8s.io/v1
 kind: Gateway
 metadata:

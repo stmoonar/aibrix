@@ -29,6 +29,7 @@ def test_tre_v2_overlay_declares_components_and_independent_redis() -> None:
         "gpu-truth.yaml",
         "gateway.yaml",
         "gateway-plugins.yaml",
+        "gateway-extproc.yaml",
         "gateway-stats.yaml",
     ]
 
@@ -88,6 +89,13 @@ def test_tre_v2_overlay_declares_components_and_independent_redis() -> None:
     }
     assert _image(ui) == "tre-v2-ui:20260725-1420d762"
     assert "latest" not in "\n".join([_image(controller), _image(sm), _image(ui)]).lower()
+    gateway_plugins = next(
+        d
+        for d in yaml.safe_load_all((overlay / "gateway-plugins.yaml").read_text(encoding="utf-8"))
+        if d and d["kind"] == "Deployment"
+    )
+    # Rebuilt by deploy/scripts/build_gateway_plugins_nozmq.sh (TRE-PATCH P2-GW-004/005).
+    assert _image(gateway_plugins) == "aibrix/gateway-plugins:20260924-ee7122bf-nozmq2"
 
     assert _env(controller)["TRE_REDIS_URL"] == "redis://tre-v2-redis:6379/0"
     assert _env(controller)["TRE_SERVICE_MANAGER_URL"] == "http://tre-v2-service-manager:8000"
