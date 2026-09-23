@@ -27,8 +27,11 @@ and `APA_SCALE_SLEEP_MODE != 0`, scaling is applied through service-manager inst
 
 In every one of those calls the model name is **`pa.Spec.ScaleTargetRef.Name`**. That is why
 each CR sets `scaleTargetRef.name` to the exact registry model name (`dsqwen-7b`,
-`dsllama-8b`, `dsqwen-14b`) — service-manager keys models by that name, and min/max replicas
-mirror `deploy/registry.yaml` (7b/8b `1..8`, 14b `0..4`).
+`dsllama-8b`, `dsqwen-14b`) — service-manager keys models by that name. minReplicas mirrors
+`deploy/registry.yaml` `min_replicas`; maxReplicas mirrors the registry scaling cap
+`max_awake_replicas` (4 for every model, same cap as TRE; v1/paper alignment A1), not the
+GPU layout size `max_replicas` (7b/8b 8 bindings, 14b 4). Service-manager enforces the same
+cap on `/scale_service`, so 7b/8b are `1..4`, 14b `0..4`.
 
 ### Why the anchor Deployment exists
 

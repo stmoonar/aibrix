@@ -46,6 +46,8 @@ _SLO_BOUNDS: dict[str, tuple] = {
 _TOP_BOUNDS: dict[str, tuple] = {
     "min_replicas": (0, 4, "int", False, False),
     "max_replicas": (1, 8, "int", False, False),
+    # Scaling cap (v1/paper alignment A1); max_replicas is the GPU layout size.
+    "max_awake_replicas": (1, 8, "int", False, False),
 }
 _LOCKED = {
     "name": "identity; change via git redeploy",
@@ -103,7 +105,7 @@ def build_view(registry_yaml: str) -> dict[str, Any]:
         out[name] = {
             "editable": editable,
             "locked": locked,
-            "constraints": ["tau_crit <= tau_low < tau_high", "qmin <= qsat", "min_replicas <= max_replicas", "w_p and w_d not both 0"],
+            "constraints": ["tau_crit <= tau_low < tau_high", "qmin <= qsat", "min_replicas <= max_replicas", "min_replicas <= max_awake_replicas <= max_replicas", "w_p and w_d not both 0"],
         }
     return out
 
@@ -121,7 +123,8 @@ def apply_and_validate(
 ) -> str:
     """Return a new registry.yaml with `edits` applied, or raise ParamValidationError.
 
-    edits: {model_name: {"trs": {f: v}, "slo": {f: v}, "min_replicas": v, "max_replicas": v}}
+    edits: {model_name: {"trs": {f: v}, "slo": {f: v}, "min_replicas": v, "max_replicas": v,
+            "max_awake_replicas": v}}
     """
     data = yaml.safe_load(registry_yaml) or {}
     models = {m.get("name"): m for m in (data.get("models") or [])}
@@ -265,6 +268,9 @@ def _cross_field(model: dict, name: str, errors: list) -> None:
     mn, mx = model.get("min_replicas"), model.get("max_replicas")
     if None not in (mn, mx) and mn > mx:
         add("min_replicas", "min_replicas must be <= max_replicas")
+    awake_cap = model.get("max_awake_replicas")
+    if awake_cap is not None and None not in (mn, mx) and not (mn <= awake_cap <= mx):
+        add("max_awake_replicas", "max_awake_replicas must be within [min_replicas, max_replicas]")
     if trs.get("w_p") == 0 and trs.get("w_d") == 0:
         add("trs.w_p", "w_p and w_d must not both be 0")
 

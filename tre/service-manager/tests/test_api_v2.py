@@ -387,9 +387,66 @@ def test_v2_put_target_rejects_target_above_model_max_replicas():
     try:
         service.put_model_target("m1", wake_replicas=3)
     except ValueError as exc:
-        assert "max_replicas" in str(exc)
+        assert "max_awake_replicas" in str(exc)
     else:
         raise AssertionError("expected target above max_replicas to fail")
+
+
+def _registry_with_awake_cap(cap: int) -> Registry:
+    from dataclasses import replace as dc_replace
+
+    base = registry()
+    return Registry(base.topology(), [dc_replace(base.model("m1"), max_awake_replicas=cap)])
+
+
+def test_v2_put_target_caps_at_max_awake_replicas_not_layout_size():
+    # v1/paper alignment A1: max_replicas (2) sizes the layout, max_awake_replicas (1)
+    # caps how many bindings may be awake - also for the APA (v1-compat) path.
+    store = StateStore(FakeRedis())
+    store.save(
+        [
+            Binding("serve-a", "m1", Slot("node-a", (0,)), awake=False),
+            Binding("serve-b", "m1", Slot("node-a", (1,)), awake=False),
+        ],
+        expected_version=0,
+    )
+    service = ServiceManagerV2(_registry_with_awake_cap(1), store)
+
+    service.put_model_target("m1", wake_replicas=1)
+    try:
+        service.put_model_target("m1", wake_replicas=2)
+    except ValueError as exc:
+        assert "max_awake_replicas (1)" in str(exc)
+    else:
+        raise AssertionError("expected target above max_awake_replicas to fail")
+
+
+def test_v2_put_binding_power_wake_respects_max_awake_replicas():
+    store = StateStore(FakeRedis())
+    store.save(
+        [
+            Binding("serve-a", "m1", Slot("node-a", (0,)), awake=True),
+            Binding("serve-b", "m1", Slot("node-a", (1,)), awake=False),
+        ],
+        expected_version=0,
+    )
+    service = ServiceManagerV2(_registry_with_awake_cap(1), store)
+
+    try:
+        service.put_binding_power("serve-b", awake=True)
+    except ValueError as exc:
+        assert "max_awake_replicas (1)" in str(exc)
+    else:
+        raise AssertionError("expected a wake above max_awake_replicas to fail")
+    assert [b.awake for b in store.load().bindings] == [True, False]
+    # Sleeping is never capped, and an already-awake binding is a no-op.
+    assert service.put_binding_power("serve-a", awake=True)["actions"] == []
+    assert service.put_binding_power("serve-a", awake=False)["actions"] == [
+        {"action": "sleep", "serve_id": "serve-a"}
+    ]
+    assert service.put_binding_power("serve-b", awake=True)["actions"] == [
+        {"action": "wake", "serve_id": "serve-b"}
+    ]
 
 
 def test_v2_put_target_allocates_new_binding_when_free_slot_exists():

@@ -51,6 +51,9 @@ def feasible_slots(registry: Registry, model: ModelSpec) -> list[tuple[str, tupl
             slots.extend((node.name, (gpu,)) for gpu in range(node.gpus))
         elif model.tp_size == 2:
             slots.extend((node.name, tuple(slot)) for slot in node.two_gpu_slots)
+    # max_replicas is the GPU layout size (how many bindings exist), not the scaling cap:
+    # that is models[].max_awake_replicas (v1/paper alignment A1), enforced by the
+    # controller planner and the service-manager, never here.
     return slots[: model.max_replicas]
 
 

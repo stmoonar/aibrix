@@ -160,12 +160,13 @@ def run_planner_tick(
     replicas = {model: int(ctx.get("assigned_replicas", 0)) for model, ctx in contexts.items()}
     cfg = PlanConfig(
         min_replicas_per_model=min((spec.min_replicas for spec in registry.models()), default=0),
-        max_replicas_per_model=max((spec.max_replicas for spec in registry.models()), default=0),
+        # Scaling cap (max_awake_replicas, v1/paper alignment A1), not the GPU layout size.
+        max_replicas_per_model=max((spec.scale_max_replicas for spec in registry.models()), default=0),
         rescue_due=rescue_due,
         fairness_due=fairness_due,
         model_tp_sizes={spec.name: spec.tp_size for spec in registry.models()},
         min_replicas_by_model={spec.name: spec.min_replicas for spec in registry.models()},
-        max_replicas_by_model={spec.name: spec.max_replicas for spec in registry.models()},
+        max_replicas_by_model={spec.name: spec.scale_max_replicas for spec in registry.models()},
         incomplete_policy=incomplete_policy,
         suppress_hot_proactive_probe=suppress_hot_proactive_probe,
         disable_eta_gate=disable_eta_gate,

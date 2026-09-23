@@ -196,6 +196,26 @@ def test_rescue_tick_submits_critical_scale_action_from_snapshot_metrics() -> No
     assert result.model_contexts["critical"]["prefill_tps"] == 0.0
 
 
+def test_rescue_tick_caps_receivers_at_max_awake_replicas_not_layout_size() -> None:
+    # v1/paper alignment A1: the planner's per-model ceiling is max_awake_replicas (the
+    # scaling cap), not max_replicas (the GPU layout size, 4 bindings here).
+    from dataclasses import replace
+
+    base = _registry()
+    capped = Registry(base.topology(), [replace(base.model("critical"), max_awake_replicas=2)])
+
+    def tick(assigned: int):
+        snapshot = MetricsSnapshot(
+            ts_ms=1,
+            stale=False,
+            models={"critical": _metrics("critical", generation=50.0, waiting=10.0, running=1.0, assigned=assigned)},
+        )
+        return run_rescue_tick(snapshot, queue=FakeQueue(), registry=capped)
+
+    assert [(a.model, a.delta) for a in tick(1).actions if isinstance(a, ScaleAction)] == [("critical", 1)]
+    assert [a for a in tick(2).actions if isinstance(a, ScaleAction)] == []
+
+
 def test_rescue_tick_holds_previous_paper_state_when_tokens_are_missing_for_one_window() -> None:
     queue = FakeQueue()
     cache = PaperStateCache(max_stale_windows=3)
