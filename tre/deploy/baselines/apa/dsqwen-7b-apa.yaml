@@ -21,7 +21,7 @@ metadata:
 spec:
   scalingStrategy: APA
   minReplicas: 1
-  maxReplicas: 8
+  maxReplicas: 4
   metricsSources:
     - metricSourceType: pod
       protocolType: http

@@ -6,7 +6,6 @@ from typing import Any, Literal, Mapping
 
 from tre_common.registry import ClusterTopology
 from tre_controller.planning.classify import ModelClassification, ModelRole, ModelState, donor_mock_cost_key
-from tre_controller.planning.util_scale_down import UtilWindow, util_scale_down_ready
 from tre_common.gpu_placement import plan_placements
 from tre_sm.allocator.slots import (
     Binding,
@@ -39,17 +38,16 @@ class PlanConfig:
     # NO demand-driven receiver. During a traffic spike a busy model is momentarily HIGH
     # (TSS = throughput/queue spikes up), so the probe hid a serving pod exactly as load
     # climbed, deepening saturation (routable 4->3, then CRITICAL->rescale oscillation).
-    # When enabled (default) this suppresses that receiver-less proactive probe on hot
+    # When enabled this suppresses that receiver-less proactive probe on hot
     # (HIGH/CRITICAL) donors. Demand-driven preemption (idle/HIGH immediate donors and the
     # TP critical_same_slot_high_shrink -> CRITICAL beneficiary) is a separate path and is
-    # intentionally NOT gated. Ablate via TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE=0.
-    suppress_hot_proactive_probe: bool = True
+    # intentionally NOT gated. Default OFF since the v1/paper alignment (A2): the path is
+    # v1's paper_high_proactive_shrink (rescue tick, HIGH, replicas > floor, no active
+    # probe, not moved by another path this tick -> SafeScale shrink by one step), now
+    # protected by the SafeScale KV-cache / donor-health guards and the rollback backoff.
+    # TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE=1 re-enables the guard.
+    suppress_hot_proactive_probe: bool = False
     disable_eta_gate: bool = False
-    # Utilisation-gated scale-down (TRE_UTIL_SCALE_DOWN). Off by default here; the
-    # controller enables it via run_planner_tick when a UtilScaleDown tracker is wired.
-    util_scale_down: bool = False
-    util_scale_down_windows: int = 6
-    scale_down_q_per_replica_by_model: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -129,9 +127,12 @@ def build_plan(
     inflight_models: set[str] | None = None,
     cluster_view: ClusterView | None = None,
     cooldowns: Mapping[str, str] | None = None,
-    util_windows: Mapping[str, tuple[UtilWindow, ...]] | None = None,
+    probe_backoff_models: set[str] | None = None,
 ) -> PlanResult:
     active_probe_models = active_probe_models or set()
+    # A13: models whose last SafeScale probe rolled back recently (no new HIGH proactive
+    # probe until TRE_SAFESCALE_ROLLBACK_BACKOFF_MS has passed).
+    probe_backoff_models = probe_backoff_models or set()
     inflight_models = inflight_models or set()
     actions: list[Action] = []
     deltas: dict[str, int] = {}
@@ -213,9 +214,12 @@ def build_plan(
             recv_pods = _effective_routable_replicas(recv.model_name, model_contexts, model_replicas)
             recv_assigned = _effective_assigned_replicas(recv.model_name, model_contexts, model_replicas)
             recv_max = _max_replicas(cfg, recv.model_name)
-            if recv_pods >= recv_max:
+            # Cap on the awake count incl. hidden probe pods (v1 assigned = non-sleeping,
+            # draining included; the SM counts the same), not on the routable count.
+            recv_awake = _awake_replicas(recv.model_name, model_contexts, model_replicas)
+            if recv_awake >= recv_max:
                 continue
-            raw_need = min(_scale_step(recv_pods, cfg.scale_step_ratio), recv_max - recv_pods)
+            raw_need = min(_scale_step(recv_pods, cfg.scale_step_ratio), recv_max - recv_awake)
             if raw_need <= 0:
                 continue
 
@@ -447,6 +451,11 @@ def build_plan(
             high_min = _serving_floor(cfg, high.model_name, model_contexts, model_replicas)
             if pods <= high_min:
                 continue
+            # A13 backoff, checked (and logged) only for a model that would otherwise be
+            # probed - a model already at its floor stays silent every tick.
+            if high.model_name in probe_backoff_models:
+                events.append(f"safescale_rollback_backoff:{high.model_name}")
+                continue
             shrink = min(_scale_step(pods, cfg.scale_step_ratio), pods - high_min)
             if shrink > 0:
                 # t1 guard: never launch a receiver-less proactive scale-down probe on a
@@ -480,7 +489,11 @@ def build_plan(
             continue
         recv_pods = _effective_routable_replicas(recv.model_name, model_contexts, model_replicas)
         recv_assigned = _effective_assigned_replicas(recv.model_name, model_contexts, model_replicas)
-        receiver_capacity = _max_replicas(cfg, recv.model_name) - recv_pods - max(0, deltas.get(recv.model_name, 0))
+        receiver_capacity = (
+            _max_replicas(cfg, recv.model_name)
+            - _awake_replicas(recv.model_name, model_contexts, model_replicas)
+            - max(0, deltas.get(recv.model_name, 0))
+        )
         if receiver_capacity <= 0:
             continue
         needed = min(_scale_step(recv_pods, cfg.scale_step_ratio), receiver_capacity)
@@ -660,39 +673,6 @@ def build_plan(
             pending = probe_upscale_plans.setdefault(middle.model_name, {})
             pending[recv.model_name] = pending.get(recv.model_name, 0) + transfer
             needed -= transfer
-
-    if cfg.util_scale_down and util_windows is not None:
-        # Receiver-less, utilisation-gated shrink: one replica, always via a safescale
-        # probe (hide -> observe -> commit/rollback), never an immediate sleep.
-        for item in sorted(classifications, key=lambda entry: entry.model_name):
-            model = item.model_name
-            if item.state not in (ModelState.HEALTHY, ModelState.HIGH):
-                continue  # CRITICAL/LOW need capacity; IDLE has its own immediate path
-            if model in active_probe_models or model in inflight_models or deltas.get(model, 0) != 0:
-                continue
-            pods = _effective_routable_replicas(model, model_contexts, model_replicas)
-            if pods - 1 < _serving_floor(cfg, model, model_contexts, model_replicas):
-                continue
-            q_after = util_scale_down_ready(
-                util_windows.get(model, ()),
-                routable=pods,
-                threshold=cfg.scale_down_q_per_replica_by_model.get(model, math.inf),
-                windows=cfg.util_scale_down_windows,
-            )
-            if q_after is None or cooldown.blocks(model, "down"):
-                continue
-            _add_scale_action(
-                actions,
-                deltas,
-                model=model,
-                delta=-1,
-                reason="util_scale_down_safescale",
-                source_loop="fairness",
-                requires_safescale=True,
-                donor=model,
-            )
-            delayed_down_models.add(model)
-            events.append(f"util_scale_down_proposed:{model}:q_after={q_after:.2f}")
 
     return PlanResult(actions, delayed_down_models, probe_upscale_plans, events=events)
 
@@ -1127,6 +1107,23 @@ def _effective_routable_replicas(
         return max(0, int(routable))
     except Exception:
         return 1
+
+
+def _awake_replicas(
+    model_name: str,
+    model_contexts: dict[str, dict[str, Any]],
+    model_replicas: dict[str, int],
+) -> int:
+    """Awake bindings incl. hidden probe pods: what the scaling cap (max_awake_replicas)
+    is checked against, matching v1 (assigned = non-sleeping, draining included) and the
+    service-manager. Falls back to the routable count without a fleet view."""
+    awake = model_contexts.get(model_name, {}).get("awake_replicas")
+    if awake is None:
+        return _effective_routable_replicas(model_name, model_contexts, model_replicas)
+    try:
+        return max(0, int(awake))
+    except Exception:
+        return _effective_routable_replicas(model_name, model_contexts, model_replicas)
 
 
 def _effective_assigned_replicas(

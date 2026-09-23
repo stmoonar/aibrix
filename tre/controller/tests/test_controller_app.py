@@ -186,6 +186,23 @@ def test_create_controller_dependencies_wires_configured_components() -> None:
     assert deps.decision_writer._redis is redis
     assert isinstance(deps.safescale, SafeScaleStateMachine)
     assert deps.registry.model("dsqwen-7b").tp_size == 1
+    assert deps.gateway_health is None  # TRE_GATEWAY_STATS_URL unset -> donor-health fail-open
+
+
+def test_create_controller_dependencies_wires_the_gateway_stats_source() -> None:
+    from tre_controller.app import create_controller_dependencies
+    from tre_controller.config import ControllerConfig
+    from tre_controller.gateway_health import EnvoyStatsSource
+
+    cfg = ControllerConfig.from_env(
+        {"TRE_REGISTRY_PATH": str(REGISTRY_PATH), "TRE_GATEWAY_STATS_URL": "http://envoy:19001/stats/prometheus"}
+    )
+    deps = create_controller_dependencies(cfg, redis_client=EmptyRedis())
+
+    assert isinstance(deps.gateway_health, EnvoyStatsSource)
+    assert deps.gateway_health.urls == ("http://envoy:19001/stats/prometheus",)
+    assert set(deps.gateway_health.models) == {"dsqwen-7b", "dsllama-8b", "dsqwen-14b"}
+    assert deps.gateway_health.route_namespace == "tre-v2"
 
 
 def test_create_controller_dependencies_can_split_metrics_redis_from_state_redis() -> None:

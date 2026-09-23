@@ -139,6 +139,7 @@ def _machine(store):
             ttft_p95_slo_ms=1000.0,
             tpot_p95_slo_ms=100.0,
             default_window_ms=1000.0,
+            min_window_ms=1000.0,
             hq=0.5,
             tau_low=1.0,
         ),

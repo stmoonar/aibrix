@@ -33,7 +33,7 @@ data:
       tp_size: 1
       min_replicas: 1
       max_replicas: 8
-      scale_down_q_per_replica: 20.0
+      max_awake_replicas: 4
       vllm_image: vllm/vllm-openai:0.10.1-sleep
       slo:
         ttft_p95_ms: 500.0
@@ -70,7 +70,7 @@ data:
         qsat: 4.0
         epsat: 0.05
         hsat: 3
-        ema_tau_ms: 20000
+        ema_tau_ms: 10000
       vllm_extra_args:
       - --no-enable-prefix-caching
       - --max-num-seqs
@@ -87,7 +87,7 @@ data:
       tp_size: 1
       min_replicas: 1
       max_replicas: 8
-      scale_down_q_per_replica: 12.0
+      max_awake_replicas: 4
       vllm_image: vllm/vllm-openai:0.10.1-sleep
       slo:
         ttft_p95_ms: 500.0
@@ -124,7 +124,7 @@ data:
         qsat: 4.0
         epsat: 0.05
         hsat: 3
-        ema_tau_ms: 20000
+        ema_tau_ms: 10000
       vllm_extra_args:
       - --no-enable-prefix-caching
       - --max-num-seqs
@@ -141,7 +141,7 @@ data:
       tp_size: 2
       min_replicas: 0
       max_replicas: 4
-      scale_down_q_per_replica: 64.0
+      max_awake_replicas: 4
       vllm_image: vllm/vllm-openai:0.10.1-sleep
       slo:
         ttft_p95_ms: 500.0
@@ -178,7 +178,7 @@ data:
         qsat: 4.0
         epsat: 0.05
         hsat: 3
-        ema_tau_ms: 20000
+        ema_tau_ms: 10000
       vllm_extra_args:
       - --no-enable-prefix-caching
       - --max-num-seqs

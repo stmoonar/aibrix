@@ -29,6 +29,7 @@ def test_tre_v2_overlay_declares_components_and_independent_redis() -> None:
         "gpu-truth.yaml",
         "gateway.yaml",
         "gateway-plugins.yaml",
+        "gateway-stats.yaml",
     ]
 
     redis = _load_yaml(overlay / "redis.yaml")
@@ -99,10 +100,36 @@ def test_tre_v2_overlay_declares_components_and_independent_redis() -> None:
     assert _env(controller)["TRE_HIST_BASELINE_LOOKBACK_MS"] == "90000"
     assert _env(controller)["TRE_PAPER_STALE_MAX_WINDOWS"] == "3"
     assert _env(controller)["TRE_METRICS_SCHEMA"] == "v2"  # D7 (09-22): gateway zsets, no legacy SCAN
-    # D8 (09-22): phase-aligned 10 s sampler + 2-window band dwell, pinned explicitly.
+    # D8 (09-22): phase-aligned 10 s sampler, pinned explicitly. Band dwell OFF (v1/paper
+    # alignment A5), also pinned: "1" = act on the first window.
     assert _env(controller)["TRE_METRICS_REFRESH_MODE"] == "phase_aligned"
     assert _env(controller)["TRE_METRICS_PHASE_OFFSET_MS"] == "2000"
-    assert _env(controller)["TRE_DWELL_WINDOWS"] == "2"
+    assert _env(controller)["TRE_DWELL_WINDOWS"] == "1"
+    # A2 (v1/paper alignment): receiver-less HIGH proactive SafeScale shrink live.
+    assert _env(controller)["TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE"] == "0"
+    # A6: adaptive SafeScale probe window band + queue-term fallback, pinned.
+    assert _env(controller)["SAFE_SCALE_MIN_WINDOW_MS"] == "60000"
+    assert _env(controller)["SAFE_SCALE_MAX_WINDOW_MS"] == "120000"
+    assert _env(controller)["SAFE_SCALE_CW2_FALLBACK_MS"] == "60000"
+    # A12 / A13: KV-cache commit ceiling, donor-health guard source + thresholds, backoff.
+    assert _env(controller)["SAFE_SCALE_KV_CACHE_MAX"] == "0.8"
+    assert _env(controller)["TRE_GATEWAY_STATS_URL"] == (
+        "http://tre-v2-envoy-stats.envoy-gateway-system.svc.cluster.local:19001/stats/prometheus"
+    )
+    assert _env(controller)["TRE_GATEWAY_ROUTE_NAMESPACE"] == _env(sm)["TRE_ROUTE_NAMESPACE"] == "tre-v2"
+    assert _env(controller)["TRE_SAFESCALE_DONOR_ERROR_RATE_MAX"] == "0.01"
+    assert _env(controller)["TRE_SAFESCALE_DONOR_MIN_REQUESTS"] == "20"
+    assert _env(controller)["TRE_SAFESCALE_ROLLBACK_BACKOFF_MS"] == "60000"
+    stats = _load_yaml(overlay / "gateway-stats.yaml")
+    assert (stats["kind"], stats["metadata"]["name"], stats["metadata"]["namespace"]) == (
+        "Service",
+        "tre-v2-envoy-stats",
+        "envoy-gateway-system",
+    )
+    # Selects only the tre-v2 Gateway's proxy, never the shared aibrix-system one.
+    assert stats["spec"]["selector"]["gateway.envoyproxy.io/owning-gateway-namespace"] == "tre-v2"
+    assert stats["spec"]["selector"]["gateway.envoyproxy.io/owning-gateway-name"] == "tre-aibrix-eg"
+    assert stats["spec"]["ports"] == [{"name": "metrics", "port": 19001, "targetPort": 19001, "protocol": "TCP"}]
     assert _env(controller)["ENABLE_TRE_SCALING"] == "true"
     assert _env(sm)["TRE_ROUTE_NAMESPACE"] == "tre-v2"
     assert _env(sm)["TRE_GATEWAY_NAME"] == "tre-aibrix-eg"

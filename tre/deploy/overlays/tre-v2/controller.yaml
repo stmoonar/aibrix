@@ -84,10 +84,11 @@ spec:
               value: "5"
             - name: TRE_FAIRNESS_INTERVAL_SECONDS
               value: "10"
-            # D8: CRITICAL / LOW / HIGH act only after 2 consecutive new windows (20 s at
-            # the 10 s cadence), counted by window_end_ms.
+            # D8 band dwell OFF (v1/paper alignment A5: neither the paper nor v1 has a
+            # dwell). "2" would make CRITICAL / LOW / HIGH act only after 2 consecutive new
+            # windows (20 s at the 10 s cadence), counted by window_end_ms.
             - name: TRE_DWELL_WINDOWS
-              value: "2"
+              value: "1"
             # S1.1: sliding window (no 60-120s tumbling staleness). free_running only;
             # phase_aligned always reads the half-open window ending on the boundary.
             - name: TRE_METRICS_WINDOW_MODE
@@ -108,6 +109,36 @@ spec:
               value: "500"
             - name: SAFE_SCALE_TPOT_P95_SLO_MS
               value: "75"
+            # A6: adaptive probe window W = clamp(MIN, MAX, max(2*p95_e2e, CDEC*p95_tpot,
+            # Q/rate_gap)) - v1's formula, NOT v1's band (v1: 15 s / 300 s / fallback 20 s).
+            # MIN 60 s is forced by the N2 startup guard MIN*(1-HQ) >= TRE_METRICS_WINDOW_MS
+            # + 10 s refresh + phase offset; MAX 120 s is new (2026-09 alignment); the queue
+            # term falls back to CW2_FALLBACK when the post-hide rate gap is ~0.
+            - name: SAFE_SCALE_MIN_WINDOW_MS
+              value: "60000"
+            - name: SAFE_SCALE_MAX_WINDOW_MS
+              value: "120000"
+            - name: SAFE_SCALE_CW2_FALLBACK_MS
+              value: "60000"
+            # A12: commit gate rejects when the remaining pods' KV-cache fill > 0.8 (v1).
+            - name: SAFE_SCALE_KV_CACHE_MAX
+              value: "0.8"
+            # A13 donor-health guard: roll back when the donor's gateway error ratio since
+            # the probe started (5xx + circuit-breaker overflow + no healthy upstream,
+            # Envoy per-model cluster stats via gateway-stats.yaml) exceeds the max after
+            # MIN_REQUESTS requests. Unreachable stats -> fail-open (logged).
+            - name: TRE_GATEWAY_STATS_URL
+              value: http://tre-v2-envoy-stats.envoy-gateway-system.svc.cluster.local:19001/stats/prometheus
+            - name: TRE_GATEWAY_ROUTE_NAMESPACE
+              value: tre-v2
+            - name: TRE_SAFESCALE_DONOR_ERROR_RATE_MAX
+              value: "0.01"
+            - name: TRE_SAFESCALE_DONOR_MIN_REQUESTS
+              value: "20"
+            # A13: no receiver-less HIGH proactive probe of a model for 60 s after one of
+            # its probes rolled back (stops hide/unhide flapping).
+            - name: TRE_SAFESCALE_ROLLBACK_BACKOFF_MS
+              value: "60000"
             # --- Ablation switches (D4); production defaults ---
             - name: ENABLE_TRE_SCALING
               value: "true"
@@ -115,6 +146,10 @@ spec:
               value: "false"
             - name: TRE_ABLATION_DISABLE_SAFESCALE
               value: "false"
+            # A2 (v1/paper alignment): the receiver-less HIGH proactive SafeScale shrink
+            # (v1 paper_high_proactive_shrink) is live; "1" re-enables the t1 guard.
+            - name: TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE
+              value: "0"
             # Opt-in control-loop profiling capability (measures TRE's own per-tick
             # latency + CPU for the paper). OFF by default; an operator flips this to
             # "true" and restarts the pod for a profiling run. See tre_controller.profiling.

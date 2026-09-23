@@ -81,7 +81,8 @@ def create_ui_app(
     k8s_client: Any | None = None,
 ) -> FastAPI:
     model_names = [m.name for m in registry.models()]
-    model_max = {m.name: m.max_replicas for m in registry.models()}
+    # Scaling cap (max_awake_replicas; falls back to the layout size max_replicas).
+    model_max = {m.name: m.scale_max_replicas for m in registry.models()}
     sampler = Sampler(redis_client, service_manager_client, model_names=model_names)
 
     @asynccontextmanager
@@ -440,6 +441,7 @@ def _model_payload(model: Any) -> dict[str, Any]:
         "tp_size": model.tp_size,
         "min_replicas": model.min_replicas,
         "max_replicas": model.max_replicas,
+        "max_awake_replicas": model.scale_max_replicas,
         "slo": {
             "ttft_p95_ms": model.slo.ttft_p95_ms,
             "tpot_p95_ms": model.slo.tpot_p95_ms,

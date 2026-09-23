@@ -133,7 +133,13 @@ def _plan(classifications, cooldowns, *, idle_gpus=0, rescue_due=True):
         classifications=classifications,
         model_replicas={item.model_name: 3 for item in classifications},
         idle_gpus=idle_gpus,
-        cfg=PlanConfig(min_replicas_per_model=1, max_replicas_per_model=4, rescue_due=rescue_due),
+        # HIGH proactive probes (default on since A2) are not what these cases exercise.
+        cfg=PlanConfig(
+            min_replicas_per_model=1,
+            max_replicas_per_model=4,
+            rescue_due=rescue_due,
+            suppress_hot_proactive_probe=True,
+        ),
         cooldowns=cooldowns,
     )
 

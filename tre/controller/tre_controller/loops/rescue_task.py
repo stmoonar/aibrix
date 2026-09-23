@@ -16,7 +16,6 @@ from tre_controller.loops.tick import (
     run_planner_tick,
 )
 from tre_controller.planning.planner import ClusterView, IncompletePolicy
-from tre_controller.planning.util_scale_down import UtilScaleDown
 from tre_controller.signals.trs import SignalState
 
 if False:  # TYPE_CHECKING guard without importing typing symbol here
@@ -56,11 +55,10 @@ def run_rescue_tick(
     paper_state_cache: PaperStateCache | None = None,
     incomplete_policy: IncompletePolicy = "drop_model",
     signal_state: SignalState | None = None,
-    suppress_hot_proactive_probe: bool = True,
+    suppress_hot_proactive_probe: bool = False,
     disable_eta_gate: bool = False,
     prof: "TickProfiler | None" = None,
     action_cooldown: bool = False,
-    util_scale_down: UtilScaleDown | None = None,
 ) -> LoopTickResult:
     return run_planner_tick(
         snapshot,
@@ -81,7 +79,6 @@ def run_rescue_tick(
         prof=prof,
         loop="rescue",
         action_cooldown=action_cooldown,
-        util_scale_down=util_scale_down,
     )
 
 
@@ -99,7 +96,6 @@ async def rescue_task(
     safescale: SafeScaleController | None = None,
     signal_state: SignalState | None = None,
     prof: "TickProfiler | None" = None,
-    util_scale_down: UtilScaleDown | None = None,
 ) -> None:
     paper_state_cache = PaperStateCache(max_stale_windows=getattr(cfg, "paper_stale_max_windows", 3))
     while True:
@@ -121,11 +117,10 @@ async def rescue_task(
                     paper_state_cache=paper_state_cache,
                     incomplete_policy=getattr(cfg, "incomplete_policy", "drop_model"),
                     signal_state=signal_state,
-                    suppress_hot_proactive_probe=getattr(cfg, "safescale_suppress_hot_proactive", True),
+                    suppress_hot_proactive_probe=getattr(cfg, "safescale_suppress_hot_proactive", False),
                     disable_eta_gate=getattr(cfg, "disable_eta_gate", False),
                     prof=prof,
                     action_cooldown=getattr(cfg, "action_cooldown", True),
-                    util_scale_down=util_scale_down,
                 )
             if decision_writer is not None:
                 if prof is not None:

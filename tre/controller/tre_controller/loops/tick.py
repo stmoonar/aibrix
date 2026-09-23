@@ -26,8 +26,12 @@ from tre_controller.planning.planner import (
     UnhideAction,
     build_plan,
 )
-from tre_controller.planning.safescale import SafeScaleCommand, SafeScaleDecision
-from tre_controller.planning.util_scale_down import UtilScaleDown
+from tre_controller.planning.safescale import (
+    ProbeWindowInputs,
+    SafeScaleCommand,
+    SafeScaleDecision,
+    format_window_event,
+)
 from tre_controller.signals.sources import get_signal, per_replica_token_rate
 from tre_controller.signals.trs import SignalState, TRSComputer, TRSInput
 from tre_sm.allocator.slots import natural_key, release_order
@@ -47,6 +51,7 @@ class SafeScaleController(Protocol):
         pods: tuple[str, ...],
         now_ms: int,
         pending_upscales: dict[str, int] | None = None,
+        window_inputs: ProbeWindowInputs | None = None,
     ) -> SafeScaleDecision: ...
 
 
@@ -99,6 +104,7 @@ class PaperStateCache:
             {
                 "routable_pods": context.get("routable_pods", held.get("routable_pods", 0)),
                 "assigned_replicas": context.get("assigned_replicas", held.get("assigned_replicas", 0)),
+                "awake_replicas": context.get("awake_replicas", held.get("awake_replicas")),
             }
         )
         return held, (f"paper_state_stale_hold:{model_name}",)
@@ -119,12 +125,11 @@ def run_planner_tick(
     paper_state_cache: PaperStateCache | None = None,
     incomplete_policy: IncompletePolicy = "drop_model",
     signal_state: SignalState | None = None,
-    suppress_hot_proactive_probe: bool = True,
+    suppress_hot_proactive_probe: bool = False,
     disable_eta_gate: bool = False,
     prof: "TickProfiler | None" = None,
     loop: str = "tick",
     action_cooldown: bool = False,
-    util_scale_down: UtilScaleDown | None = None,
 ) -> LoopTickResult:
     if snapshot.stale:
         return LoopTickResult(submitted=0, events=("snapshot_stale",))
@@ -160,23 +165,18 @@ def run_planner_tick(
         _signals_ns = time.perf_counter_ns() - _phase_t0
         _phase_t0 = time.perf_counter_ns()
     replicas = {model: int(ctx.get("assigned_replicas", 0)) for model, ctx in contexts.items()}
-    # The utilisation path only ever proposes safescale probes; without a safescale
-    # controller the shrink would be an immediate sleep, so it stays off.
-    util = util_scale_down if safescale is not None else None
-    if util is not None:
-        _observe_util_windows(util, snapshot, contexts)
     cfg = PlanConfig(
         min_replicas_per_model=min((spec.min_replicas for spec in registry.models()), default=0),
-        max_replicas_per_model=max((spec.max_replicas for spec in registry.models()), default=0),
+        # Scaling cap (max_awake_replicas, v1/paper alignment A1), not the GPU layout size.
+        max_replicas_per_model=max((spec.scale_max_replicas for spec in registry.models()), default=0),
         rescue_due=rescue_due,
         fairness_due=fairness_due,
         model_tp_sizes={spec.name: spec.tp_size for spec in registry.models()},
         min_replicas_by_model={spec.name: spec.min_replicas for spec in registry.models()},
-        max_replicas_by_model={spec.name: spec.max_replicas for spec in registry.models()},
+        max_replicas_by_model={spec.name: spec.scale_max_replicas for spec in registry.models()},
         incomplete_policy=incomplete_policy,
         suppress_hot_proactive_probe=suppress_hot_proactive_probe,
         disable_eta_gate=disable_eta_gate,
-        **_util_plan_config(util, registry),
     )
     plan = build_plan(
         model_contexts=contexts,
@@ -188,13 +188,18 @@ def run_planner_tick(
         inflight_models=queue.inflight_models(),
         cluster_view=cluster_view,
         cooldowns=_action_cooldowns(snapshot, queue) if action_cooldown else None,
-        util_windows=util.history() if util is not None else None,
+        probe_backoff_models=_probe_backoff_models(safescale, snapshot.ts_ms),
     )
     if _prof_on:
         _plan_ns = time.perf_counter_ns() - _phase_t0
         _phase_t0 = time.perf_counter_ns()
     actions, safescale_events = _apply_safescale(
-        snapshot, tuple(plan.actions), plan.probe_upscale_plans, safescale=safescale, cluster_view=cluster_view
+        snapshot,
+        tuple(plan.actions),
+        plan.probe_upscale_plans,
+        safescale=safescale,
+        cluster_view=cluster_view,
+        contexts=contexts,
     )
     if _prof_on:
         _safescale_ns = time.perf_counter_ns() - _phase_t0
@@ -231,27 +236,9 @@ def run_planner_tick(
     )
 
 
-def _observe_util_windows(util: UtilScaleDown, snapshot: MetricsSnapshot, contexts: dict[str, dict]) -> None:
-    for model_name, metrics in snapshot.models.items():
-        context = contexts.get(model_name)
-        if context is None:
-            continue
-        util.observe(
-            model_name,
-            window_end_ms=metrics.window_end_ms,
-            q_raw=metrics.avg_running + metrics.avg_waiting,
-            routable=int(context.get("routable_pods") or 0),
-        )
-
-
-def _util_plan_config(util: UtilScaleDown | None, registry: Registry) -> dict:
-    if util is None:
-        return {}
-    return {
-        "util_scale_down": True,
-        "util_scale_down_windows": util.windows,
-        "scale_down_q_per_replica_by_model": {spec.name: util.threshold_for(spec) for spec in registry.models()},
-    }
+def _probe_backoff_models(safescale: SafeScaleController | None, now_ms: int) -> set[str]:
+    backoff = getattr(safescale, "rollback_backoff_models", None)
+    return set(backoff(now_ms)) if callable(backoff) else set()
 
 
 def _action_cooldowns(snapshot: MetricsSnapshot, queue: PlannerQueue) -> dict[str, str]:
@@ -275,6 +262,7 @@ def _apply_safescale(
     *,
     safescale: SafeScaleController | None,
     cluster_view: ClusterView | None = None,
+    contexts: dict[str, dict] | None = None,
 ) -> tuple[tuple[Action, ...], tuple[str, ...]]:
     if safescale is None:
         return actions, ()
@@ -282,6 +270,22 @@ def _apply_safescale(
     converted: list[Action] = []
     events: list[str] = []
     for action in actions:
+        if isinstance(action, ScaleAction) and action.delta > 0:
+            preempt = getattr(safescale, "request_preemption", None)
+            restored = preempt(action.model, reason="receiver_need_upscale") if callable(preempt) else 0
+            if restored > 0:
+                # v1 apply_safescale_to_deltas: rollback_probe(receiver_need_upscale), then
+                # up_needed = delta - probe_hidden. The rollback (unhide) is issued by the
+                # safescale loop's next observation, one-shot and observe-mode safe.
+                up_needed = action.delta - restored
+                events.append(
+                    f"safescale_probe_preempted:{action.model}:restored={restored}:up_needed={max(0, up_needed)}"
+                )
+                if up_needed > 0:
+                    converted.append(
+                        replace(action, delta=up_needed, pods=tuple(action.pods[:up_needed]) if action.pods else ())
+                    )
+                continue
         if not _requires_safescale_probe(action):
             converted.append(action)
             continue
@@ -293,13 +297,65 @@ def _apply_safescale(
             pods=pods,
             now_ms=snapshot.ts_ms,
             pending_upscales=_safescale_pending_upscales(action, probe_upscale_plans),
+            window_inputs=probe_window_inputs(snapshot, probe_model, contexts, cluster_view),
         )
         if decision.status == "none":
             events.append(f"safescale_probe_skipped:{probe_model}:{decision.reason}")
             continue
         events.append(f"safescale_{decision.reason}:{probe_model}")
+        if decision.reason == "probe_started" and getattr(decision, "details", None):
+            events.append(format_window_event(probe_model, decision.details))
         converted.extend(_commands_to_actions(decision.commands, source_loop=action.source_loop))
     return tuple(converted), tuple(events)
+
+
+def probe_window_inputs(
+    snapshot: MetricsSnapshot,
+    model: str,
+    contexts: dict[str, dict] | None,
+    cluster_view: ClusterView | None = None,
+) -> ProbeWindowInputs | None:
+    """The donor's adaptive-window inputs (A6) from this tick: latency p95s of its serving
+    window, and Q_ctl / Y_m / y_m / Z / routable pods from its planner context - the same
+    quantities v1 start_hidden_probe read from model_metrics and model_context."""
+    metrics = snapshot.models.get(model)
+    context = (contexts or {}).get(model) or {}
+    if metrics is None and not context:
+        return None
+    p95_e2e = p95_tpot = interval_s = avg_ttft = avg_tpot = None
+    if metrics is not None:
+        serving = serving_window(metrics, cluster_view)
+        p95_e2e = serving.e2e_p95_ms
+        p95_tpot = serving.tpot_p95_ms
+        avg_ttft = _weighted_mean(serving, "ttft")
+        avg_tpot = _weighted_mean(serving, "tpot")
+        interval_s = (serving.window_end_ms - serving.window_start_ms) / 1000.0
+    return ProbeWindowInputs(
+        p95_e2e_ms=p95_e2e,
+        p95_tpot_ms=p95_tpot,
+        avg_ttft_ms=avg_ttft,
+        avg_tpot_ms=avg_tpot,
+        q=context.get("Q_ctl"),
+        y_total=context.get("Y_m"),
+        y_per_pod=context.get("y_m"),
+        z_m=context.get("z_m"),
+        routable_pods=context.get("routable_pods"),
+        interval_s=interval_s,
+    )
+
+
+def _weighted_mean(metrics: ModelWindowMetrics, which: str) -> float | None:
+    """Model-level window mean of ``ttft`` / ``tpot`` (ms) over its pods, weighted by each
+    pod's sample count = sum of sums / sum of counts (v1 get_avg_ttft_ms overall mean)."""
+    total = weight = 0.0
+    for pod in metrics.per_pod.values():
+        avg = getattr(pod, f"{which}_avg_ms", None)
+        count = getattr(pod, f"{which}_count", None)
+        if avg is None or not count or count <= 0:
+            continue
+        total += float(avg) * float(count)
+        weight += float(count)
+    return total / weight if weight > 0 else None
 
 
 def _requires_safescale_probe(action: Action) -> bool:
@@ -398,6 +454,7 @@ def _model_contexts(
     contexts: dict[str, dict] = {}
     events: list[str] = []
     cluster_counts = _cluster_view_counts(cluster_view)
+    awake_counts = _awake_including_hidden(cluster_view)
     for model_name, metrics in snapshot.models.items():
         spec = registry.model(model_name)
         counts = cluster_counts.get(model_name)
@@ -488,6 +545,8 @@ def _model_contexts(
                 "decode_tps": decode_tps,
                 "prefill_tps": prefill_tps,
             }
+        # Scaling-cap count (A1/P1-2): awake bindings incl. hidden probe pods.
+        context["awake_replicas"] = awake_counts.get(model_name, metrics.routable_pods)
         if paper_state_cache is not None:
             context, model_events = paper_state_cache.apply(model_name, context, tokens_available=tokens_available)
             events.extend(model_events)
@@ -534,6 +593,17 @@ def serving_window(
         if binding.model == metrics.model and not binding.awake
     }
     return restrict_to_serving(metrics, sleeping_pods=sleeping, routable_pods=counts[0])
+
+
+def _awake_including_hidden(cluster_view: ClusterView | None) -> dict[str, int]:
+    if cluster_view is None:
+        return {}
+    counts: dict[str, int] = {}
+    for binding in cluster_view.bindings:
+        counts.setdefault(binding.model, 0)
+        if binding.awake:
+            counts[binding.model] += 1
+    return counts
 
 
 def _cluster_view_counts(cluster_view: ClusterView | None) -> dict[str, tuple[int, int]]:

@@ -387,9 +387,66 @@ def test_v2_put_target_rejects_target_above_model_max_replicas():
     try:
         service.put_model_target("m1", wake_replicas=3)
     except ValueError as exc:
-        assert "max_replicas" in str(exc)
+        assert "max_awake_replicas" in str(exc)
     else:
         raise AssertionError("expected target above max_replicas to fail")
+
+
+def _registry_with_awake_cap(cap: int) -> Registry:
+    from dataclasses import replace as dc_replace
+
+    base = registry()
+    return Registry(base.topology(), [dc_replace(base.model("m1"), max_awake_replicas=cap)])
+
+
+def test_v2_put_target_caps_at_max_awake_replicas_not_layout_size():
+    # v1/paper alignment A1: max_replicas (2) sizes the layout, max_awake_replicas (1)
+    # caps how many bindings may be awake - also for the APA (v1-compat) path.
+    store = StateStore(FakeRedis())
+    store.save(
+        [
+            Binding("serve-a", "m1", Slot("node-a", (0,)), awake=False),
+            Binding("serve-b", "m1", Slot("node-a", (1,)), awake=False),
+        ],
+        expected_version=0,
+    )
+    service = ServiceManagerV2(_registry_with_awake_cap(1), store)
+
+    service.put_model_target("m1", wake_replicas=1)
+    try:
+        service.put_model_target("m1", wake_replicas=2)
+    except ValueError as exc:
+        assert "max_awake_replicas (1)" in str(exc)
+    else:
+        raise AssertionError("expected target above max_awake_replicas to fail")
+
+
+def test_v2_put_binding_power_wake_respects_max_awake_replicas():
+    store = StateStore(FakeRedis())
+    store.save(
+        [
+            Binding("serve-a", "m1", Slot("node-a", (0,)), awake=True),
+            Binding("serve-b", "m1", Slot("node-a", (1,)), awake=False),
+        ],
+        expected_version=0,
+    )
+    service = ServiceManagerV2(_registry_with_awake_cap(1), store)
+
+    try:
+        service.put_binding_power("serve-b", awake=True)
+    except ValueError as exc:
+        assert "max_awake_replicas (1)" in str(exc)
+    else:
+        raise AssertionError("expected a wake above max_awake_replicas to fail")
+    assert [b.awake for b in store.load().bindings] == [True, False]
+    # Sleeping is never capped, and an already-awake binding is a no-op.
+    assert service.put_binding_power("serve-a", awake=True)["actions"] == []
+    assert service.put_binding_power("serve-a", awake=False)["actions"] == [
+        {"action": "sleep", "serve_id": "serve-a"}
+    ]
+    assert service.put_binding_power("serve-b", awake=True)["actions"] == [
+        {"action": "wake", "serve_id": "serve-b"}
+    ]
 
 
 def test_v2_put_target_allocates_new_binding_when_free_slot_exists():
@@ -1306,3 +1363,68 @@ def test_v2_put_binding_power_sleep_clears_desired_hidden():
     assert store.load().bindings == [Binding("serve-a", "m1", Slot("node-a", (0,)), awake=False, hidden=False)]
     desired = fleet.load_desired().bindings[0]
     assert (desired.power, desired.hidden) == ("sleeping", False)
+
+
+
+def _six_awake_store():
+    store = StateStore(FakeRedis())
+    store.save(
+        [Binding(f"serve-{i}", "m1", Slot("node-a", (i % 4,)), awake=i < 6) for i in range(8)],
+        expected_version=0,
+    )
+    return store
+
+
+def _wide_registry(cap: int) -> Registry:
+    from dataclasses import replace as dc_replace
+
+    base = registry()
+    return Registry(base.topology(), [dc_replace(base.model("m1"), max_replicas=8, max_awake_replicas=cap)])
+
+
+def test_v2_put_target_above_cap_only_refuses_growth():
+    # Review P1-1: with 6 awake and cap 4 (cap lowered under a running fleet) the old
+    # check refused ANY target > 4, so controller idle shrinks (scale_model -1 -> target
+    # 5) and APA /scale_service down 1 were rejected. Only growth past the cap is refused.
+    store = _six_awake_store()
+    service = ServiceManagerV2(_wide_registry(4), store)
+
+    assert [a["action"] for a in service.put_model_target("m1", wake_replicas=6)["actions"]] == []  # hold
+    assert [a["action"] for a in service.put_model_target("m1", wake_replicas=5)["actions"]] == ["sleep"]
+    try:
+        service.put_model_target("m1", wake_replicas=6)  # 5 awake -> 6 grows past the cap
+    except ValueError as exc:
+        assert "max_awake_replicas (4)" in str(exc)
+    else:
+        raise AssertionError("growth past the cap must be refused")
+    assert sum(b.awake for b in store.load().bindings) == 5
+
+
+def test_v1_scale_service_down_passes_when_above_cap_and_up_is_refused():
+    from fastapi.testclient import TestClient
+
+    client = TestClient(create_app(ServiceManagerV2(_wide_registry(4), _six_awake_store())))
+
+    down = client.post("/scale_service", params={"model_name": "m1", "scale_type": "down", "scale_value": "1"})
+    assert down.status_code == 200 and down.json() == {"requested": 1, "actual": 1}
+    up = client.post("/scale_service", params={"model_name": "m1", "scale_type": "up", "scale_value": "1"})
+    assert up.status_code == 400 and "max_awake_replicas" in up.json()["detail"]
+
+
+def test_v2_binding_wake_cap_counts_hidden_probe_pods_as_awake():
+    store = StateStore(FakeRedis())
+    store.save(
+        [
+            Binding("serve-a", "m1", Slot("node-a", (0,)), awake=True),
+            Binding("serve-b", "m1", Slot("node-a", (1,)), awake=True, hidden=True),
+            Binding("serve-c", "m1", Slot("node-a", (2,)), awake=False),
+        ],
+        expected_version=0,
+    )
+    service = ServiceManagerV2(_registry_with_awake_cap(2), store)
+    try:
+        service.put_binding_power("serve-c", awake=True)
+    except ValueError as exc:
+        assert "max_awake_replicas (2)" in str(exc)
+    else:
+        raise AssertionError("a hidden (awake) probe pod counts toward the cap")

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Literal, Protocol
 
 from tre_controller.config import SafeScaleConfig
@@ -31,6 +31,37 @@ class ProbeObservation:
     q_ctl: float | None = None
     has_traffic: bool = False
     avg_gpu_cache_norm: float | None = None
+    #: Cumulative gateway counters of the donor model (A13 donor-health), None = unknown.
+    gateway_requests: float | None = None
+    gateway_errors: float | None = None
+
+
+@dataclass(frozen=True)
+class ProbeWindowInputs:
+    """The donor's metrics at probe start, for the adaptive probe window (v1
+    ``start_hidden_probe`` -> ``_calc_probe_window_details``). Units as in v1:
+
+    * ``p95_e2e_ms`` / ``p95_tpot_ms``: window p95 latencies (ms) of the serving pods;
+    * ``q``: Q_ctl (in-flight requests, the TSS queue term);
+    * ``y_total``: Y_m, the TSS numerator = weighted tokens in the metrics window;
+      ``y_per_pod``: y_m = Y_m / routable pods (used only when Y_m is missing);
+    * ``z_m``: the donor's Z (spare-capacity multiplier, v1 ``max(1, z_m)``);
+    * ``routable_pods``: serving (awake, not hidden) pods BEFORE the hide;
+    * ``interval_s``: metrics window length (s) that Y_m was summed over.
+    """
+
+    p95_e2e_ms: float | None = None
+    p95_tpot_ms: float | None = None
+    #: v1 fallbacks when a p95 is missing: overall window mean TTFT for the e2e term
+    #: (sic - v1 uses avg TTFT, not avg e2e) and mean TPOT for the decode term.
+    avg_ttft_ms: float | None = None
+    avg_tpot_ms: float | None = None
+    q: float | None = None
+    y_total: float | None = None
+    y_per_pod: float | None = None
+    z_m: float | None = None
+    routable_pods: int | None = None
+    interval_s: float | None = None
 
 
 @dataclass(frozen=True)
@@ -47,6 +78,8 @@ class SafeScaleDecision:
     status: ProbeStatus
     reason: str
     commands: tuple[SafeScaleCommand, ...] = ()
+    #: probe_started: the adaptive window breakdown (calc_probe_window_details).
+    details: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -59,6 +92,16 @@ class SafeScaleProbe:
     status: Literal["probing"] = "probing"
     pending_upscales: dict[str, int] = field(default_factory=dict)
     observations: tuple[ProbeObservation, ...] = ()
+    #: Adaptive window W (ms) and its breakdown (calc_probe_window_details), for reports.
+    window_ms: float | None = None
+    window_terms: dict[str, Any] = field(default_factory=dict)
+    #: Why the probe ended (gate failures, tail summary), persisted with the resolution.
+    terminal_details: dict[str, Any] = field(default_factory=dict)
+    #: A13: the donor's gateway (requests, errors) counters at the first observation.
+    gateway_baseline: tuple[float, float] | None = None
+    #: v1 receiver_need_upscale: the model itself now needs capacity; the next
+    #: observation rolls the probe back with this reason.
+    preempt_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -76,12 +119,38 @@ class SafeScaleStateMachine:
         self._config = config
         self._store = store
         self._probes: dict[str, SafeScaleProbe] = {}
+        # A13 rollback backoff: model -> time (ms, snapshot clock) of its last rollback.
+        # Deliberately in-memory only: a controller restart forgets it, i.e. at most one
+        # extra HIGH probe per model right after a restart (the probe itself is still
+        # guarded by SLO / donor-health / commit gate). Not worth a persisted schema.
+        self._last_rollback_ms: dict[str, int] = {}
 
     def active_probe(self, model: str) -> SafeScaleProbe | None:
         return self._probes.get(model)
 
     def active_probes(self) -> tuple[SafeScaleProbe, ...]:
         return tuple(self._probes.values())
+
+    def request_preemption(self, model: str, *, reason: str = "receiver_need_upscale") -> int:
+        """v1 apply_safescale_to_deltas: a scale-up of a model that is itself probing rolls
+        its probe back first. Marks the probe; its next observation returns the rollback
+        (unhide, reason ``reason``). Returns how many pods that restores (0 = no probe)."""
+        probe = self._probes.get(model)
+        if probe is None:
+            return 0
+        if probe.preempt_reason is None:
+            probe = replace(probe, preempt_reason=reason)
+            self._probes[model] = probe
+            self._persist_probe(probe)
+        return len(probe.pods)
+
+    def rollback_backoff_models(self, now_ms: int) -> set[str]:
+        """Models whose last probe rolled back less than rollback_backoff_ms ago (A13):
+        the planner holds their receiver-less HIGH proactive probe meanwhile."""
+        backoff = float(getattr(self._config, "rollback_backoff_ms", 0.0) or 0.0)
+        if backoff <= 0:
+            return set()
+        return {model for model, ts in self._last_rollback_ms.items() if 0 <= now_ms - ts < backoff}
 
     def start_probe(
         self,
@@ -90,6 +159,7 @@ class SafeScaleStateMachine:
         pods: tuple[str, ...],
         now_ms: int,
         pending_upscales: dict[str, int] | None = None,
+        window_inputs: ProbeWindowInputs | None = None,
     ) -> SafeScaleDecision:
         if model in self._probes:
             return SafeScaleDecision(status="probing", reason="probe_already_active")
@@ -97,13 +167,21 @@ class SafeScaleStateMachine:
             return SafeScaleDecision(status="none", reason="no_pods_to_probe")
 
         normalized_pending = _normalize_pending_upscales(pending_upscales)
+        # A6 (v1 safescale.py start_hidden_probe): adaptive window
+        # W = clamp(W_lo, W_hi, max(2*p95_e2e, cdec*p95_tpot, Q/rate_gap)).
+        terms = calc_probe_window_details(
+            window_inputs or ProbeWindowInputs(), hidden_count=len(pods), config=self._config
+        )
+        window_ms = float(terms["W"])
         probe = SafeScaleProbe(
             model=model,
             pods=tuple(pods),
             start_ms=int(now_ms),
-            deadline_ms=int(now_ms + self._config.default_window_ms),
+            deadline_ms=int(now_ms + window_ms),
             request_id=f"{model}-{int(now_ms)}",
             pending_upscales=normalized_pending,
+            window_ms=window_ms,
+            window_terms=terms,
         )
         self._probes[model] = probe
         self._persist_probe(probe)
@@ -111,6 +189,7 @@ class SafeScaleStateMachine:
             status="probing",
             reason="probe_started",
             commands=(SafeScaleCommand(kind="hide", model=model, pods=probe.pods, reason="probe_started"),),
+            details=dict(terms),
         )
 
     def observe(self, model: str, observation: ProbeObservation, *, now_ms: int) -> SafeScaleDecision:
@@ -118,12 +197,32 @@ class SafeScaleStateMachine:
         if probe is None:
             return SafeScaleDecision(status="none", reason="probe_not_found")
 
-        updated = _replace_observations(probe, probe.observations + (observation,))
+        updated = _with_gateway_baseline(
+            _replace_observations(probe, probe.observations + (observation,)), observation
+        )
         self._probes[model] = updated
         self._persist_observation(updated, observation)
 
+        health = donor_health(updated, observation)
+        if updated.preempt_reason is not None:
+            self._probes[model] = replace(updated, terminal_details={"preempted": updated.preempt_reason})
+            return self._rollback(updated, reason=updated.preempt_reason)
         if self._violates_slo(observation):
+            self._probes[model] = replace(
+                updated,
+                terminal_details={
+                    "slo": {"ttft_p95_ms": observation.ttft_p95_ms, "tpot_p95_ms": observation.tpot_p95_ms}
+                },
+            )
             return self._rollback(updated, reason="slo_violation")
+
+        if (
+            health is not None
+            and health["requests"] >= self._config.donor_min_requests
+            and health["error_rate"] > self._config.donor_error_rate_max
+        ):
+            self._probes[model] = replace(updated, terminal_details={"donor_health": health})
+            return self._rollback(updated, reason="donor_health")
 
         if now_ms < updated.deadline_ms:
             self._persist_probe(updated)
@@ -135,7 +234,20 @@ class SafeScaleStateMachine:
             ttft_p95_slo_ms=self._config.ttft_p95_slo_ms,
             tpot_p95_slo_ms=self._config.tpot_p95_slo_ms,
         )
-        if _tail_allows_commit(summary, tau_low=self._config.tau_low):
+        failures = tail_gate_failures(
+            summary, tau_low=self._config.tau_low, kv_cache_max=self._config.kv_cache_max
+        )
+        details: dict[str, Any] = {
+            "gate_failures": list(failures),
+            "tail": _tail_record(summary),
+            # A12/P2-a: no KV-cache sample in the tail (no pod reported the gauge) - the
+            # gate passes this check like v1, but the record says so explicitly.
+            "kv_cache": "unavailable" if summary.gpu_cache_max is None else summary.gpu_cache_max,
+        }
+        if health is not None:
+            details["donor_health"] = health
+        self._probes[model] = replace(updated, terminal_details=details)
+        if not failures:
             return self._commit(updated, reason="formal_commit_gate_passed")
         return self._rollback(updated, reason="formal_commit_gate_failed")
 
@@ -195,6 +307,9 @@ class SafeScaleStateMachine:
             resolved_ts=float(now_ms) / 1000.0,
         )
         self._probes.pop(model, None)
+        # A preemption for the model's own scale-up is not a failed probe: no backoff.
+        if status == "rollback" and probe.preempt_reason is None:
+            self._last_rollback_ms[model] = int(now_ms)
         return True
 
     def _violates_slo(self, observation: ProbeObservation) -> bool:
@@ -241,15 +356,193 @@ class SafeScaleStateMachine:
 
 
 def _replace_observations(probe: SafeScaleProbe, observations: tuple[ProbeObservation, ...]) -> SafeScaleProbe:
-    return SafeScaleProbe(
-        model=probe.model,
-        pods=probe.pods,
-        start_ms=probe.start_ms,
-        deadline_ms=probe.deadline_ms,
-        request_id=probe.request_id,
-        pending_upscales=dict(probe.pending_upscales),
-        observations=observations,
+    return replace(probe, pending_upscales=dict(probe.pending_upscales), observations=observations)
+
+
+def _with_gateway_baseline(probe: SafeScaleProbe, observation: ProbeObservation) -> SafeScaleProbe:
+    """Set the donor-health baseline at the first observation carrying gateway counters
+    (the hide is dispatched asynchronously, so nothing it causes precedes it); re-baseline
+    after a counter drop (Envoy restart)."""
+    if observation.gateway_requests is None or observation.gateway_errors is None:
+        return probe
+    current = (float(observation.gateway_requests), float(observation.gateway_errors))
+    baseline = probe.gateway_baseline
+    if baseline is None or current[0] < baseline[0] or current[1] < baseline[1]:
+        return replace(probe, gateway_baseline=current)
+    return probe
+
+
+def donor_health(probe: SafeScaleProbe, observation: ProbeObservation) -> dict[str, float] | None:
+    """Gateway requests / errors / error ratio of the donor model since the probe's
+    baseline (A13), or None without counters (guard fails open)."""
+    baseline = probe.gateway_baseline
+    if baseline is None or observation.gateway_requests is None or observation.gateway_errors is None:
+        return None
+    requests = max(0.0, float(observation.gateway_requests) - baseline[0])
+    errors = max(0.0, float(observation.gateway_errors) - baseline[1])
+    return {"requests": requests, "errors": errors, "error_rate": (errors / requests) if requests > 0 else 0.0}
+
+
+def _estimate_post_drain_gap_per_second(
+    *,
+    y_total: float | None,
+    y_per_pod: float | None,
+    z_m: float | None,
+    routable_pods: int | None,
+    hidden_count: int,
+    interval_s: float | None,
+) -> float | None:
+    """v1 ``_estimate_post_drain_gap_per_second`` verbatim: the spare service rate left
+    after hiding ``hidden_count`` pods, in Y units (weighted tokens) per second.
+
+    arrival = Y_m / interval; capacity = arrival * max(1, Z_m) (Z_m = TSS / theta_m, used
+    by v1 as the spare-capacity multiplier); gap = per-pod capacity * remaining pods -
+    arrival, floored at 0.
+    """
+    interval = _positive(interval_s)
+    current_pods = max(1, int(routable_pods) if routable_pods is not None else 1)
+    remaining_pods = max(0, current_pods - max(0, int(hidden_count)))
+    if interval is None or remaining_pods <= 0:
+        return None
+    y_all = _nonneg(y_total)
+    y_pod = _nonneg(y_per_pod)
+    if y_all is None and y_pod is None:
+        return None
+    arrival_rate = (y_all / interval) if y_all is not None else (y_pod * current_pods) / interval
+    if arrival_rate <= 0:
+        return None
+    spare_multiplier = _positive(z_m) or 1.0
+    current_capacity = arrival_rate * max(1.0, spare_multiplier)
+    per_pod_capacity = current_capacity / current_pods
+    mu_post = per_pod_capacity * remaining_pods
+    return max(0.0, mu_post - arrival_rate)
+
+
+def calc_probe_window_details(
+    inputs: ProbeWindowInputs,
+    *,
+    hidden_count: int,
+    config: SafeScaleConfig,
+) -> dict[str, Any]:
+    """Port of v1 ``safescale._calc_probe_window_details`` (v1 safescale.py:302-359).
+    The FORMULA is v1's; the band is not (see SafeScaleConfig: v1 ran 15 s / 300 s with a
+    20 s cW2 fallback).
+
+    * W1 = 2 * p95_e2e (``default_window_ms`` when unavailable);
+    * queue term cW2 = Q / rate_gap (s -> ms) when Q > 0; ``cw2_fallback_ms`` when the
+      post-hide rate gap is unknown or <= epsilon_mu;
+    * decode term = cdec * p95_tpot;
+    * W2 = max(queue term, decode term) (``default_window_ms`` when neither exists);
+    * W = clamp(min_window_ms, max_window_ms, max(W1, W2)).
+
+    Returns every term plus ``dominant`` (which term set the unclamped max: e2e / queue /
+    decode / default) and ``clamped`` (lo / hi / None) for the probe record and events.
+    """
+    default_ms = float(config.default_window_ms)
+    lo_ms = float(config.min_window_ms)
+    hi_ms = float(config.max_window_ms)
+    # v1 start_hidden_probe (safescale.py:504-509): p95_e2e or avg_ttft, p95_tpot or avg_tpot.
+    p95_e2e = _positive(inputs.p95_e2e_ms)
+    latency_source = "p95_e2e" if p95_e2e is not None else None
+    if p95_e2e is None:
+        p95_e2e = _positive(inputs.avg_ttft_ms)
+        latency_source = "avg_ttft" if p95_e2e is not None else None
+    p95_tpot = _positive(inputs.p95_tpot_ms)
+    decode_source = "p95_tpot" if p95_tpot is not None else None
+    if p95_tpot is None:
+        p95_tpot = _positive(inputs.avg_tpot_ms)
+        decode_source = "avg_tpot" if p95_tpot is not None else None
+    w1 = 2.0 * p95_e2e if p95_e2e is not None else default_ms
+
+    gap = _estimate_post_drain_gap_per_second(
+        y_total=inputs.y_total,
+        y_per_pod=inputs.y_per_pod,
+        z_m=inputs.z_m,
+        routable_pods=inputs.routable_pods,
+        hidden_count=hidden_count,
+        interval_s=inputs.interval_s,
     )
+    cw2_fallback = min(hi_ms, _positive(config.cw2_fallback_ms) or hi_ms)
+    q = _nonneg(inputs.q)
+    queue_term: float | None = None
+    queue_fallback = False
+    if q is not None and q > 0:
+        if gap is None or gap <= config.epsilon_mu:
+            queue_term = cw2_fallback
+            queue_fallback = True
+        else:
+            queue_term = (q / max(gap, config.epsilon_mu)) * 1000.0
+    decode_term = max(0.0, config.cdec) * p95_tpot if p95_tpot is not None else None
+
+    w2_candidates = [value for value in (queue_term, decode_term) if value is not None]
+    w2 = max(w2_candidates) if w2_candidates else default_ms
+    raw = max(w1, w2)
+    window = max(lo_ms, min(hi_ms, raw))
+
+    if raw == w1 and p95_e2e is not None:
+        dominant = "e2e"
+    elif w2_candidates and raw == w2:
+        dominant = "queue" if queue_term is not None and w2 == queue_term else "decode"
+    else:
+        dominant = "default"
+    clamped = "lo" if raw < lo_ms else ("hi" if raw > hi_ms else None)
+    return {
+        "W": window,
+        "W_raw": raw,
+        "W1": w1,
+        "W2": w2,
+        "cW2": queue_term,
+        "cW2_fallback": queue_fallback,
+        "decode_term_ms": decode_term,
+        "rate_gap_per_second": gap,
+        "dominant": dominant,
+        "clamped": clamped,
+        "W_lo": lo_ms,
+        "W_hi": hi_ms,
+        "inputs": {
+            "p95_e2e_ms": p95_e2e,
+            "p95_tpot_ms": p95_tpot,
+            "latency_source": latency_source,
+            "decode_source": decode_source,
+            "q": q,
+            "y_total": _nonneg(inputs.y_total),
+            "y_per_pod": _nonneg(inputs.y_per_pod),
+            "z_m": _positive(inputs.z_m),
+            "routable_pods": inputs.routable_pods,
+            "hidden_count": int(hidden_count),
+            "interval_s": _positive(inputs.interval_s),
+        },
+    }
+
+
+def format_window_event(model: str, terms: dict[str, Any]) -> str:
+    """One-line decision event for a probe's adaptive window (reports grep these)."""
+
+    def fmt(value: Any) -> str:
+        if value is None:
+            return "na"
+        if isinstance(value, bool):
+            return "1" if value else "0"
+        number = float(value)
+        return f"{number:.0f}" if abs(number) >= 1 else f"{number:.3g}"
+
+    return (
+        f"safescale_probe_window:{model}:W={fmt(terms.get('W'))}"
+        f":dominant={terms.get('dominant')}:clamped={terms.get('clamped') or 'none'}"
+        f":e2e={fmt(terms.get('W1'))}:queue={fmt(terms.get('cW2'))}"
+        f":decode={fmt(terms.get('decode_term_ms'))}:gap={fmt(terms.get('rate_gap_per_second'))}"
+        f":fallback={fmt(terms.get('cW2_fallback'))}"
+    )
+
+
+def _positive(value: Any) -> float | None:
+    parsed = _optional_float(value)
+    return parsed if parsed is not None and parsed > 0 else None
+
+
+def _nonneg(value: Any) -> float | None:
+    parsed = _optional_float(value)
+    return parsed if parsed is not None and parsed >= 0 else None
 
 
 def _summarize_tail(
@@ -300,16 +593,41 @@ def _summarize_tail(
     )
 
 
-def _tail_allows_commit(summary: ProbeTailSummary, *, tau_low: float) -> bool:
+def _tail_allows_commit(summary: ProbeTailSummary, *, tau_low: float, kv_cache_max: float = 0.8) -> bool:
+    return not tail_gate_failures(summary, tau_low=tau_low, kv_cache_max=kv_cache_max)
+
+
+def tail_gate_failures(
+    summary: ProbeTailSummary, *, tau_low: float, kv_cache_max: float = 0.8
+) -> tuple[str, ...]:
+    """The formal commit gate (v1 _tail_summary_allows_commit), returning which checks
+    failed instead of a bool (empty = commit). v1 short-circuits in this order: latency,
+    missing Z under traffic, Z < tau_low, KV-cache > 0.8; the same order decides here, and
+    every failing check is listed for the rollback-reason report."""
+    failures: list[str] = []
     if not summary.latency_ok:
-        return False
+        failures.append("latency")
     if summary.z_min is None:
-        return not summary.has_traffic
+        if summary.has_traffic:
+            failures.append("z_missing")
+        # v1: no Z and no traffic -> commit, whatever the KV cache says.
+        return tuple(failures)
     if summary.z_min < tau_low:
-        return False
-    if summary.gpu_cache_max is not None and summary.gpu_cache_max > 0.8:
-        return False
-    return True
+        failures.append("z_below_tau_low")
+    if summary.gpu_cache_max is not None and summary.gpu_cache_max > kv_cache_max:
+        failures.append("kv_cache")
+    return tuple(failures)
+
+
+def _tail_record(summary: ProbeTailSummary) -> dict[str, Any]:
+    return {
+        "latency_ok": summary.latency_ok,
+        "z_min": summary.z_min if summary.z_min is None or math.isfinite(summary.z_min) else "inf",
+        "has_traffic": summary.has_traffic,
+        "sample_count": summary.sample_count,
+        "tail_count": summary.tail_count,
+        "gpu_cache_max": summary.gpu_cache_max,
+    }
 
 
 def _probe_record(
@@ -330,6 +648,11 @@ def _probe_record(
         "status": status,
         "pending_upscales": dict(probe.pending_upscales),
         "terminal_reason": terminal_reason,
+        "window_ms": probe.window_ms,
+        "window_terms": dict(probe.window_terms),
+        "terminal_details": dict(probe.terminal_details),
+        "gateway_baseline": list(probe.gateway_baseline) if probe.gateway_baseline is not None else None,
+        "preempt_reason": probe.preempt_reason,
     }
     if resolution is not None:
         record["resolution"] = resolution
@@ -347,6 +670,8 @@ def _observation_record(observation: ProbeObservation) -> dict[str, Any]:
         "q_ctl": observation.q_ctl,
         "has_traffic": observation.has_traffic,
         "avg_gpu_cache_norm": observation.avg_gpu_cache_norm,
+        "gateway_requests": observation.gateway_requests,
+        "gateway_errors": observation.gateway_errors,
     }
 
 
@@ -380,7 +705,20 @@ def _probe_from_record(row: dict[str, Any], store: ProbeStore) -> SafeScaleProbe
         request_id=request_id,
         pending_upscales=_normalize_pending_upscales(row.get("pending_upscales")),
         observations=tuple(observations),
+        window_ms=_optional_float(row.get("window_ms")),
+        window_terms=dict(row["window_terms"]) if isinstance(row.get("window_terms"), dict) else {},
+        gateway_baseline=_baseline_from_record(row.get("gateway_baseline")),
+        preempt_reason=str(row["preempt_reason"]) if row.get("preempt_reason") else None,
     )
+
+
+def _baseline_from_record(raw: Any) -> tuple[float, float] | None:
+    if not isinstance(raw, (list, tuple)) or len(raw) != 2:
+        return None
+    requests, errors = _optional_float(raw[0]), _optional_float(raw[1])
+    if requests is None or errors is None:
+        return None
+    return (requests, errors)
 
 
 def _normalize_pods(row: dict[str, Any]) -> tuple[str, ...]:
@@ -429,6 +767,8 @@ def _observation_from_record(raw: dict[str, Any]) -> ProbeObservation | None:
         q_ctl=_optional_float(raw.get("q_ctl", raw.get("Q_ctl"))),
         has_traffic=bool(raw.get("has_traffic", False)),
         avg_gpu_cache_norm=_optional_float(raw.get("avg_gpu_cache_norm")),
+        gateway_requests=_optional_float(raw.get("gateway_requests")),
+        gateway_errors=_optional_float(raw.get("gateway_errors")),
     )
 
 

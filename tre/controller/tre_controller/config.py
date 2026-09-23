@@ -10,7 +10,6 @@ from tre_common.rediskeys import SCRAPE_INTERVAL_MS
 from tre_common.registry import EXPECTED_SIGNAL_DIRECTIONS, load_registry
 from tre_controller.loops.metrics_task import REFRESH_MODES
 from tre_controller.signals.trs import DWELL_STATES
-from tre_controller.planning.util_scale_down import DEFAULT_WINDOWS, parse_q_per_replica
 
 SIGNAL_SOURCES = {
     "zm",
@@ -33,15 +32,38 @@ _FALSE_VALUES = {"0", "false", "no", "n", "off"}
 class SafeScaleConfig:
     ttft_p95_slo_ms: float = 500.0
     tpot_p95_slo_ms: float = 75.0
+    # A6: probe window W = clamp(min_window_ms, max_window_ms,
+    # max(2*p95_e2e, cdec*p95_tpot, Q/rate_gap)) - the FORMULA is v1's
+    # (_calc_probe_window_details); the BAND IS NOT v1's. v1 ran 15 s / 300 s with a 20 s
+    # cW2 fallback and a 60 s default (configs/model_slo_profiles.json; its code defaults
+    # were 15 s / 300 s / fallback = max). Here:
+    # * min 60 s comes from the N2 invariant (from_env guard: min*(1-hq) >= metrics window
+    #   + refresh + read offset = 42 s today), not from v1;
+    # * max 120 s is a new decision of the 2026-09 v1/paper alignment (A6);
+    # * cw2_fallback 60 s = the floor (the v2 default had drifted to 300 s, pinning every
+    #   probe with an unknown rate gap at the ceiling); default 60 s (no metrics) as v1.
     default_window_ms: float = 60_000.0
-    min_window_ms: float = 15_000.0
-    max_window_ms: float = 300_000.0
-    cw2_fallback_ms: float = 300_000.0
+    min_window_ms: float = 60_000.0
+    max_window_ms: float = 120_000.0
+    cw2_fallback_ms: float = 60_000.0
     cdec: float = 2.0
     hq: float = 0.25
     tau_low: float = 1.0
     epsilon_mu: float = 1e-6
     probe_poll_seconds: float = 2.0
+    # A12 (v1 _tail_summary_allows_commit): the commit gate rejects when the tail's max
+    # avg KV-cache fill of the donor's remaining serving pods exceeds this (v1: 0.8).
+    kv_cache_max: float = 0.8
+    # A13 donor-health guard: roll a probe back as soon as the donor model's gateway error
+    # ratio since the probe started (Envoy 5xx + circuit-breaker overflow + no-healthy-
+    # upstream over all its requests) exceeds donor_error_rate_max, once at least
+    # donor_min_requests requests were seen. Needs TRE_GATEWAY_STATS_URL (else fail-open).
+    donor_error_rate_max: float = 0.01
+    donor_min_requests: float = 20.0
+    # A13 rollback backoff: after a probe of a model rolls back, no receiver-less HIGH
+    # proactive probe of that model for this long (v1 had no cooldown for demand-driven
+    # donor releases, so those are not held). 0 disables.
+    rollback_backoff_ms: float = 60_000.0
 
 
 @dataclass(frozen=True)
@@ -75,24 +97,14 @@ class ControllerConfig:
     orphan_scan_enabled: bool
     orphan_grace_s: float
     # t1: suppress the receiver-less proactive scale-down probe on hot (HIGH) donors
-    # (planner high_proactive_safescale). Default True (guard on); set env
-    # TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE=0 to restore the legacy proactive-release path.
+    # (planner high_proactive_safescale). Default False (v1/paper alignment A2: the v1
+    # paper_high_proactive_shrink path is live, HIGH models shrink through SafeScale);
+    # TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE=1 re-enables the t1 guard.
     safescale_suppress_hot_proactive: bool
     proactive_release_min_trs: float
     # Review F4: per-model action cooldown (hold a model's next action until a metrics
     # window starting after its last executed action). TRE_ACTION_COOLDOWN=0 disables.
     action_cooldown: bool
-    # Utilisation-gated scale-down probe (planner util_scale_down_safescale).
-    # TRE_UTIL_SCALE_DOWN (default on), TRE_UTIL_SCALE_DOWN_WINDOWS (distinct metrics
-    # windows, default 6 = 60 s at the phase-aligned 10 s cadence; it was ~30-45 s at the
-    # old free-running 5 s refresh), TRE_UTIL_SCALE_DOWN_Q_PER_REPLICA
-    # ("2.5" or "model=v,..."; overrides the registry scale_down_q_per_replica).
-    # Independent of TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE (which gates only the Z_m
-    # high_proactive_safescale path); HIGH models are eligible here. Ablations must set
-    # TRE_UTIL_SCALE_DOWN explicitly.
-    util_scale_down: bool
-    util_scale_down_windows: int
-    util_scale_down_q_per_replica: dict[str, float]
     # Opt-in control-loop profiling (research toggle, off by default). When
     # profile_enabled is False the profiler object is None everywhere (zero overhead).
     profile_enabled: bool
@@ -115,10 +127,19 @@ class ControllerConfig:
     # keeps being served before it is marked stale (decision loops then hold).
     metrics_stale_hold_windows: int = 2
     # TRE_DWELL_WINDOWS (1 = off) / TRE_DWELL_STATES (subset of critical,low,high).
-    dwell_windows: int = 2
+    # Default 1 = off (v1/paper alignment A5: neither the paper nor v1 has a band dwell;
+    # a band acts on the first window that shows it). >= 2 re-enables the D8 dwell.
+    dwell_windows: int = 1
     dwell_states: tuple[str, ...] = ("critical", "low", "high")
     # TRE_GATEWAY_INTERVAL_CHECK: fail (default) | warn | off.
     gateway_interval_check: str = "fail"
+    # A13 donor-health guard source: Envoy /stats/prometheus URL(s) of the tre-v2 gateway
+    # proxy (TRE_GATEWAY_STATS_URL, comma-separated; empty = guard off / fail-open),
+    # the HTTPRoute namespace naming its per-model clusters (TRE_GATEWAY_ROUTE_NAMESPACE)
+    # and the scrape timeout (TRE_GATEWAY_STATS_TIMEOUT_SECONDS).
+    gateway_stats_urls: tuple[str, ...] = ()
+    gateway_route_namespace: str = "tre-v2"
+    gateway_stats_timeout_s: float = 1.0
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "ControllerConfig":
@@ -183,14 +204,18 @@ class ControllerConfig:
             ttft_p95_slo_ms=_get_positive_float(values, "SAFE_SCALE_TTFT_P95_SLO_MS", 500.0),
             tpot_p95_slo_ms=_get_positive_float(values, "SAFE_SCALE_TPOT_P95_SLO_MS", 75.0),
             default_window_ms=_get_positive_float(values, "SAFE_SCALE_DEFAULT_WINDOW_MS", 60_000.0),
-            min_window_ms=_get_positive_float(values, "SAFE_SCALE_MIN_WINDOW_MS", 15_000.0),
-            max_window_ms=_get_positive_float(values, "SAFE_SCALE_MAX_WINDOW_MS", 300_000.0),
-            cw2_fallback_ms=_get_positive_float(values, "SAFE_SCALE_CW2_FALLBACK_MS", 300_000.0),
+            min_window_ms=_get_positive_float(values, "SAFE_SCALE_MIN_WINDOW_MS", 60_000.0),
+            max_window_ms=_get_positive_float(values, "SAFE_SCALE_MAX_WINDOW_MS", 120_000.0),
+            cw2_fallback_ms=_get_positive_float(values, "SAFE_SCALE_CW2_FALLBACK_MS", 60_000.0),
             cdec=_get_positive_float(values, "SAFE_SCALE_CDEC", 2.0),
             hq=_get_positive_float(values, "SAFE_SCALE_HQ", 0.25),
             tau_low=_get_positive_float(values, "SAFE_SCALE_TAU_LOW", 1.0),
             epsilon_mu=_get_positive_float(values, "SAFE_SCALE_EPSILON_MU", 1e-6),
             probe_poll_seconds=_get_positive_float(values, "SAFE_SCALE_PROBE_POLL_SECONDS", 2.0),
+            kv_cache_max=_get_positive_float(values, "SAFE_SCALE_KV_CACHE_MAX", 0.8),
+            donor_error_rate_max=_get_positive_float(values, "TRE_SAFESCALE_DONOR_ERROR_RATE_MAX", 0.01),
+            donor_min_requests=_get_positive_float(values, "TRE_SAFESCALE_DONOR_MIN_REQUESTS", 20.0),
+            rollback_backoff_ms=_get_nonneg_float(values, "TRE_SAFESCALE_ROLLBACK_BACKOFF_MS", 60_000.0),
         )
         if safescale.min_window_ms > safescale.max_window_ms:
             raise ValueError("SAFE_SCALE_MIN_WINDOW_MS must be <= SAFE_SCALE_MAX_WINDOW_MS")
@@ -198,24 +223,33 @@ class ControllerConfig:
         metrics_window_ms = _get_positive_int(values, "TRE_METRICS_WINDOW_MS", 30_000)
         # phase_aligned needs metrics_window_ms to be a multiple of the gateway period;
         # metrics_task falls back to free_running (with an error log) when it is not.
-        # N2 invariant (plan 15 §6 N2, architect-ruled): the SafeScale commit gate only
-        # inspects the tail (hq fraction) of probe observations. Those tail observations'
-        # metrics windows must be fully post-hide, i.e. the probe must run at least one
-        # metrics window past the tail start: default_window_ms - tail_span >= metrics_window_ms.
-        # Guards a future SAFE_SCALE_DEFAULT_WINDOW_MS being set too short for the metrics
-        # window (e.g. 15000 < 30000) from silently diluting the commit gate with pre-hide
-        # traffic. (SafeScaleConfig.min_window_ms=15000 is currently DEAD config — never wired
-        # to a probe deadline — so it is not guarded here; see 05_paper_vs_impl.md.)
+        # N2 invariant (plan 15 §6 N2, architect-ruled; re-based on the adaptive window A6):
+        # the SafeScale commit gate only inspects the tail (hq fraction) of the probe
+        # observations, and every tail observation must read a metrics window that lies
+        # fully after the hide. The tail starts at W*(1-hq) after the hide; an observation
+        # there reads a window ending up to one refresh period + the read offset earlier
+        # and spanning metrics_window_ms, so W_lo*(1-hq) >= metrics_window + refresh +
+        # offset (30 + 10 + 2 s today; W_lo = 60 s, hq = 0.25 -> 45 s). Checked on the
+        # FLOOR min_window_ms because W is clamped to it (the old check used the fixed
+        # default_window_ms, which no longer sets the deadline).
         if safescale.hq < 1.0:
-            tail_span_ms = safescale.hq * safescale.default_window_ms
+            tail_span_ms = safescale.hq * safescale.min_window_ms
         else:
             tail_span_ms = safescale.hq * safescale.probe_poll_seconds * 1000.0
-        if safescale.default_window_ms - tail_span_ms < metrics_window_ms:
+        if metrics_refresh_mode == "phase_aligned":
+            refresh_ms = float(instant_sample_interval_ms)
+            read_offset_ms = float(metrics_phase_offset_ms)
+        else:
+            refresh_ms = _get_positive_float(values, "TRE_METRICS_REFRESH_INTERVAL_SECONDS", 5.0) * 1000.0
+            read_offset_ms = 0.0
+        required_ms = metrics_window_ms + refresh_ms + read_offset_ms
+        if safescale.min_window_ms - tail_span_ms < required_ms:
             raise ValueError(
-                "SAFE_SCALE_DEFAULT_WINDOW_MS minus the commit-gate tail span must be >= "
-                "TRE_METRICS_WINDOW_MS so SafeScale probe tail observations are fully post-hide "
-                f"(default_window_ms={safescale.default_window_ms}, hq={safescale.hq}, "
-                f"metrics_window_ms={metrics_window_ms})"
+                "SAFE_SCALE_MIN_WINDOW_MS minus the commit-gate tail span must be >= "
+                "TRE_METRICS_WINDOW_MS + metrics refresh + read offset so SafeScale probe tail "
+                f"observations are fully post-hide (min_window_ms={safescale.min_window_ms}, "
+                f"hq={safescale.hq}, metrics_window_ms={metrics_window_ms}, refresh_ms={refresh_ms}, "
+                f"read_offset_ms={read_offset_ms})"
             )
 
         return cls(
@@ -264,13 +298,10 @@ class ControllerConfig:
             orphan_scan_enabled=_get_bool(values, "TRE_ORPHAN_SCAN_ENABLED", True),
             orphan_grace_s=_get_positive_float(values, "TRE_ORPHAN_GRACE_S", 600.0),
             safescale_suppress_hot_proactive=_get_bool(
-                values, "TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE", True
+                values, "TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE", False
             ),
             proactive_release_min_trs=_get_positive_float(values, "PROACTIVE_RELEASE_MIN_TRS", 2000.0),
             action_cooldown=_get_bool(values, "TRE_ACTION_COOLDOWN", True),
-            util_scale_down=_get_bool(values, "TRE_UTIL_SCALE_DOWN", True),
-            util_scale_down_windows=_get_positive_int(values, "TRE_UTIL_SCALE_DOWN_WINDOWS", DEFAULT_WINDOWS),
-            util_scale_down_q_per_replica=parse_q_per_replica(values.get("TRE_UTIL_SCALE_DOWN_Q_PER_REPLICA")),
             profile_enabled=_get_bool(values, "TRE_PROFILE", False),
             profile_stream_maxlen=_get_positive_int(values, "TRE_PROFILE_STREAM_MAXLEN", 200_000),
             profile_proc_sample_interval_s=_get_positive_float(
@@ -285,9 +316,14 @@ class ControllerConfig:
             metrics_phase_adapt=_get_bool(values, "TRE_METRICS_PHASE_ADAPT", True),
             metrics_phase_retry_ms=_get_positive_int(values, "TRE_METRICS_PHASE_RETRY_MS", 500),
             metrics_stale_hold_windows=_get_nonneg_int(values, "TRE_METRICS_STALE_HOLD_WINDOWS", 2),
-            dwell_windows=_get_positive_int(values, "TRE_DWELL_WINDOWS", 2),
+            dwell_windows=_get_positive_int(values, "TRE_DWELL_WINDOWS", 1),
             dwell_states=dwell_states,
             gateway_interval_check=gateway_interval_check,
+            gateway_stats_urls=tuple(
+                url.strip() for url in str(values.get("TRE_GATEWAY_STATS_URL", "")).split(",") if url.strip()
+            ),
+            gateway_route_namespace=_get_str(values, "TRE_GATEWAY_ROUTE_NAMESPACE", "tre-v2"),
+            gateway_stats_timeout_s=_get_positive_float(values, "TRE_GATEWAY_STATS_TIMEOUT_SECONDS", 1.0),
         )
 
 

@@ -196,6 +196,26 @@ def test_rescue_tick_submits_critical_scale_action_from_snapshot_metrics() -> No
     assert result.model_contexts["critical"]["prefill_tps"] == 0.0
 
 
+def test_rescue_tick_caps_receivers_at_max_awake_replicas_not_layout_size() -> None:
+    # v1/paper alignment A1: the planner's per-model ceiling is max_awake_replicas (the
+    # scaling cap), not max_replicas (the GPU layout size, 4 bindings here).
+    from dataclasses import replace
+
+    base = _registry()
+    capped = Registry(base.topology(), [replace(base.model("critical"), max_awake_replicas=2)])
+
+    def tick(assigned: int):
+        snapshot = MetricsSnapshot(
+            ts_ms=1,
+            stale=False,
+            models={"critical": _metrics("critical", generation=50.0, waiting=10.0, running=1.0, assigned=assigned)},
+        )
+        return run_rescue_tick(snapshot, queue=FakeQueue(), registry=capped)
+
+    assert [(a.model, a.delta) for a in tick(1).actions if isinstance(a, ScaleAction)] == [("critical", 1)]
+    assert [a for a in tick(2).actions if isinstance(a, ScaleAction)] == []
+
+
 def test_rescue_tick_holds_previous_paper_state_when_tokens_are_missing_for_one_window() -> None:
     queue = FakeQueue()
     cache = PaperStateCache(max_stale_windows=3)
@@ -290,6 +310,21 @@ def test_rescue_tick_converts_safescale_required_downscale_to_probe_hide() -> No
     assert result.actions == queue.submitted[0]
     assert safescale.active_probe("donor").pending_upscales == {"critical": 1}
     assert "safescale_probe_started:donor" in result.events
+    # A6: the adaptive window is computed from the donor's serving window and context and
+    # logged as an event. The donor runs at Z = 1 (TSS == theta), so v1's capacity model
+    # leaves no spare rate after hiding 1 of 2 pods -> the Q/rate_gap term takes the 60 s
+    # fallback, which dominates W1 = 2 * p95_e2e = 2 s.
+    probe = safescale.active_probe("donor")
+    assert probe.window_ms == 60_000.0 and probe.deadline_ms == 70_000
+    assert probe.window_terms["inputs"]["p95_e2e_ms"] == 1000.0
+    assert probe.window_terms["inputs"]["routable_pods"] == 2
+    assert probe.window_terms["inputs"]["interval_s"] == 60.0
+    assert probe.window_terms["W1"] == 2_000.0
+    assert (probe.window_terms["dominant"], probe.window_terms["cW2_fallback"]) == ("queue", True)
+    assert any(
+        event.startswith("safescale_probe_window:donor:W=60000:dominant=queue:clamped=none:e2e=2000")
+        for event in result.events
+    )
 
 
 def test_rescue_tick_honors_latency_signal_source_for_classification() -> None:
@@ -763,3 +798,117 @@ def test_rescue_tick_converts_same_slot_shrink_to_safescale_probe_hide() -> None
     assert queue.submitted == [(HideAction("high", ("high-0",), "probe_started", "rescue"),)]
     assert safescale.active_probe("high").pending_upscales == {"tp2": 1}
     assert "safescale_probe_started:high" in result.events
+
+
+
+def test_rescue_tick_holds_high_probe_of_a_model_in_rollback_backoff() -> None:
+    # A13 wiring: run_planner_tick reads the state machine's rollback backoff.
+    registry = _registry_with_models("hot")
+    snapshot = MetricsSnapshot(
+        ts_ms=100_000,
+        stale=False,
+        models={"hot": _metrics_with_pods("hot", generation=1000.0, waiting=0.0, running=1.0, pods=("hot-a", "hot-b"))},
+    )
+    safescale = SafeScaleStateMachine(config=SafeScaleConfig(default_window_ms=60_000.0))
+
+    probed = run_rescue_tick(snapshot, queue=FakeQueue(), registry=registry, safescale=safescale)
+    assert any(isinstance(a, HideAction) for a in probed.actions)
+    safescale.resolve("hot", status="rollback", reason="slo_violation", now_ms=90_000)
+
+    held = run_rescue_tick(snapshot, queue=FakeQueue(), registry=registry, safescale=safescale)
+    assert not any(isinstance(a, HideAction) for a in held.actions)
+    assert "safescale_rollback_backoff:hot" in held.events
+
+
+
+def _hidden_probe_view(registry, *, awake: int, hidden: int, total: int = 4):
+    from tre_controller.planning.planner import ClusterView
+    from tre_sm.allocator.slots import Binding, Slot
+
+    return ClusterView(
+        registry.topology(),
+        tuple(
+            Binding(
+                f"critical-{i}",
+                "critical",
+                Slot("node-a", (i,)),
+                awake=i < awake,
+                hidden=i >= awake - hidden and i < awake,
+            )
+            for i in range(total)
+        ),
+    )
+
+
+def test_rescue_tick_does_not_ask_past_the_cap_when_a_probe_hides_a_pod() -> None:
+    # Review P1-2 end to end: 4 awake (1 hidden), cap 4, CRITICAL -> no scale-up request
+    # (the SM would 400 it, retried every 5 s), matching v1's assigned-count cap.
+    registry = _registry()  # "critical": max_replicas 4 (= cap)
+    snapshot = MetricsSnapshot(
+        ts_ms=1,
+        stale=False,
+        models={"critical": _metrics("critical", generation=50.0, waiting=10.0, running=1.0, assigned=4, routable=3)},
+    )
+    result = run_rescue_tick(
+        snapshot, queue=FakeQueue(), registry=registry, cluster_view=_hidden_probe_view(registry, awake=4, hidden=1)
+    )
+    assert result.model_contexts["critical"]["awake_replicas"] == 4
+    assert result.model_contexts["critical"]["routable_pods"] == 3
+    assert [a for a in result.actions if isinstance(a, ScaleAction)] == []
+
+
+def test_scale_up_of_a_probing_model_preempts_its_probe_like_v1() -> None:
+    # v1 apply_safescale_to_deltas: a model that must scale up while it has a probe first
+    # rolls the probe back (receiver_need_upscale) and only asks for delta - hidden.
+    from tre_controller.loops.safescale_task import run_safescale_observation_tick
+    from tre_controller.planning.planner import UnhideAction
+
+    registry = _registry()
+    safescale = SafeScaleStateMachine(config=SafeScaleConfig(default_window_ms=60_000.0))
+    safescale.start_probe(model="critical", pods=("critical-1",), now_ms=0)
+    snapshot = MetricsSnapshot(
+        ts_ms=1_000,
+        stale=False,
+        models={"critical": _metrics("critical", generation=50.0, waiting=10.0, running=1.0, assigned=4, routable=1)},
+    )
+    view = _hidden_probe_view(registry, awake=2, hidden=1)  # critical-0 serving, critical-1 hidden
+
+    result = run_rescue_tick(snapshot, queue=FakeQueue(), registry=registry, cluster_view=view, safescale=safescale)
+
+    assert any(e.startswith("safescale_probe_preempted:critical:restored=1") for e in result.events)
+    # The planner's +1 is fully covered by un-hiding the probe pod.
+    assert [a for a in result.actions if isinstance(a, ScaleAction)] == []
+    from tre_controller.loops.action_queue import SubmitResult
+
+    class AcceptingQueue(FakeQueue):
+        def submit(self, actions):
+            super().submit(actions)
+            return SubmitResult(accepted=len(tuple(actions)))
+
+    queue = AcceptingQueue()
+    observed = run_safescale_observation_tick(snapshot, queue=queue, registry=registry, safescale=safescale)
+    assert queue.submitted == [(UnhideAction("critical", ("critical-1",), "receiver_need_upscale", "safescale"),)]
+    assert observed.events[0] == "safescale_receiver_need_upscale:critical"
+    assert safescale.active_probe("critical") is None
+    # Preemption is not a failed probe: no rollback backoff.
+    assert safescale.rollback_backoff_models(1_000) == set()
+
+
+
+def test_probe_window_inputs_carry_the_count_weighted_mean_latencies() -> None:
+    from dataclasses import replace
+
+    from tre_controller.loops.tick import probe_window_inputs
+
+    window = _metrics_with_pods("donor", generation=100.0, waiting=0.0, running=1.0, pods=("a", "b"))
+    per_pod = {
+        "a": replace(window.per_pod["a"], ttft_avg_ms=100.0, ttft_count=3.0, tpot_avg_ms=20.0, tpot_count=30.0),
+        "b": replace(window.per_pod["b"], ttft_avg_ms=500.0, ttft_count=1.0, tpot_avg_ms=None, tpot_count=0.0),
+    }
+    snapshot = MetricsSnapshot(ts_ms=1, stale=False, models={"donor": replace(window, per_pod=per_pod, e2e_p95_ms=None)})
+
+    inputs = probe_window_inputs(snapshot, "donor", {"donor": {"Q_ctl": 1.0, "routable_pods": 2}})
+
+    assert inputs.p95_e2e_ms is None
+    assert inputs.avg_ttft_ms == 200.0  # (100*3 + 500*1) / 4, v1's overall mean
+    assert inputs.avg_tpot_ms == 20.0

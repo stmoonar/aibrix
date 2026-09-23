@@ -144,7 +144,9 @@ def test_probe_hides_serving_pod_and_commit_sleeps_exactly_that_pod() -> None:
     sm = InProcessServiceManager(service)
     queue = ActionQueue(sm)
     machine = SafeScaleStateMachine(
-        config=SafeScaleConfig(ttft_p95_slo_ms=1000.0, tpot_p95_slo_ms=100.0, default_window_ms=1000.0, hq=0.5)
+        config=SafeScaleConfig(
+            ttft_p95_slo_ms=1000.0, tpot_p95_slo_ms=100.0, default_window_ms=1000.0, min_window_ms=1000.0, hq=0.5
+        )
     )
     snapshot = MetricsSnapshot(
         ts_ms=0,

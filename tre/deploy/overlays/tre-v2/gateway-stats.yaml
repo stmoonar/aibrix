@@ -1,0 +1,29 @@
+# Envoy stats of the isolated tre-v2 gateway proxy, for the controller's SafeScale
+# donor-health guard (v1/paper alignment A13): per-model clusters
+# httproute/tre-v2/<model>-router/rule/0 expose upstream_rq_xx / pending_overflow /
+# cx_none_healthy on the proxy's metrics port 19001 (/stats/prometheus). Envoy Gateway
+# only publishes the listener port, so this read-only ClusterIP gives the controller a
+# stable name for it. It lives next to the proxy (a Service can only select pods of its
+# own namespace) and selects ONLY the pods owned by Gateway tre-v2/tre-aibrix-eg -- the
+# shared aibrix-system proxy is untouched (ADR-0008).
+apiVersion: v1
+kind: Service
+metadata:
+  name: tre-v2-envoy-stats
+  namespace: envoy-gateway-system
+  labels:
+    app.kubernetes.io/name: tre-v2-envoy-stats
+    app.kubernetes.io/part-of: tre-v2
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/component: proxy
+    app.kubernetes.io/managed-by: envoy-gateway
+    app.kubernetes.io/name: envoy
+    gateway.envoyproxy.io/owning-gateway-name: tre-aibrix-eg
+    gateway.envoyproxy.io/owning-gateway-namespace: tre-v2
+  ports:
+    - name: metrics
+      port: 19001
+      targetPort: 19001
+      protocol: TCP

@@ -141,6 +141,16 @@ def test_cross_field_constraints() -> None:
         apply_and_validate(_REGISTRY, {"m1": {"min_replicas": 4, "max_replicas": 1}})
 
 
+def test_max_awake_replicas_is_editable_and_bounded_by_the_layout() -> None:
+    # v1/paper alignment A1: the scaling cap is its own field, within [min, max_replicas].
+    assert "max_awake_replicas" in build_view(_REGISTRY)["m1"]["editable"]
+    m = yaml.safe_load(apply_and_validate(_REGISTRY, {"m1": {"max_awake_replicas": 2}}))["models"][0]
+    assert (m["max_replicas"], m["max_awake_replicas"]) == (4, 2)
+    with pytest.raises(ParamValidationError) as ei:
+        apply_and_validate(_REGISTRY, {"m1": {"max_awake_replicas": 5}})
+    assert any(e["field"] == "max_awake_replicas" for e in ei.value.errors)
+
+
 def test_alt_threshold_bands_are_editable_and_bounded() -> None:
     view = build_view(_REGISTRY)["m1"]
     assert view["editable"]["alt_thresholds.queue_len.delta_crit"]["value"] is None

@@ -123,18 +123,47 @@ def test_registry_validates_alt_threshold_direction_and_theta(tmp_path):
     errors = load_registry(str(path)).validate()
     assert any("alt_thresholds.queue_len.theta must be positive" in error for error in errors)
 
-def test_registry_parses_and_validates_scale_down_q_per_replica(tmp_path):
+def test_registry_ignores_removed_scale_down_q_per_replica_key(tmp_path):
+    # The utilisation-gated scale-down (TRE_UTIL_SCALE_DOWN) was removed (v1/paper
+    # alignment A3). A live ConfigMap may still carry the key: it must parse and be ignored.
     path = tmp_path / "registry.yaml"
-    path.write_text(textwrap.dedent(REGISTRY_YAML), encoding="utf-8")
-    assert load_registry(str(path)).model("dsqwen-7b").scale_down_q_per_replica is None
-
     with_key = textwrap.dedent(REGISTRY_YAML).replace(
         "    max_replicas: 4\n", "    max_replicas: 4\n    scale_down_q_per_replica: 20\n"
     )
     path.write_text(with_key, encoding="utf-8")
     registry = load_registry(str(path))
-    assert registry.model("dsqwen-7b").scale_down_q_per_replica == 20.0
     assert registry.validate() == []
+    assert not hasattr(registry.model("dsqwen-7b"), "scale_down_q_per_replica")
 
-    path.write_text(with_key.replace("scale_down_q_per_replica: 20", "scale_down_q_per_replica: 0"), encoding="utf-8")
-    assert any("scale_down_q_per_replica must be positive" in e for e in load_registry(str(path)).validate())
+
+def test_registry_max_awake_replicas_is_the_scale_cap_and_max_replicas_the_layout(tmp_path):
+    # v1/paper alignment A1: max_replicas keeps sizing the GPU layout (make manifests),
+    # max_awake_replicas caps how many bindings may be awake; unset -> max_replicas.
+    path = tmp_path / "registry.yaml"
+    path.write_text(textwrap.dedent(REGISTRY_YAML), encoding="utf-8")
+    spec = load_registry(str(path)).model("dsqwen-7b")
+    assert spec.max_awake_replicas is None
+    assert spec.scale_max_replicas == spec.max_replicas == 4
+
+    capped = textwrap.dedent(REGISTRY_YAML).replace(
+        "    max_replicas: 4\n", "    max_replicas: 4\n    max_awake_replicas: 2\n"
+    )
+    path.write_text(capped, encoding="utf-8")
+    registry = load_registry(str(path))
+    assert registry.validate() == []
+    assert (registry.model("dsqwen-7b").max_replicas, registry.model("dsqwen-7b").scale_max_replicas) == (4, 2)
+
+    path.write_text(capped.replace("max_awake_replicas: 2", "max_awake_replicas: 5"), encoding="utf-8")
+    assert any("max_awake_replicas must be within" in e for e in load_registry(str(path)).validate())
+
+
+def test_deployed_registry_caps_every_model_at_four_awake_without_changing_the_layout():
+    from pathlib import Path
+
+    registry = load_registry(str(Path(__file__).resolve().parents[2] / "deploy" / "registry.yaml"))
+    assert registry.validate() == []
+    assert {m.name: (m.max_replicas, m.scale_max_replicas) for m in registry.models()} == {
+        "dsqwen-7b": (8, 4),
+        "dsllama-8b": (8, 4),
+        "dsqwen-14b": (4, 4),
+    }

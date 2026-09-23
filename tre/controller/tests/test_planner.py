@@ -41,7 +41,8 @@ def test_build_plan_rescue_serves_critical_from_idle_and_probes_the_high_donor()
     LOW-receiver test below now covers the path this pair used to avoid.
 
     ``suppress_hot_proactive_probe=False`` is what keeps the HIGH surplus donor in the
-    plan at all; the guarded default is asserted at the end of this test.
+    plan at all (the default since the v1/paper alignment A2); the opt-in t1 guard is
+    asserted at the end of this test.
     """
     classifications = [
         _classification("critical", ModelState.CRITICAL, ModelRole.RECEIVER, 0.5),
@@ -82,14 +83,14 @@ def test_build_plan_rescue_serves_critical_from_idle_and_probes_the_high_donor()
         ("high", "high", None),
     }
 
-    # The t1 guard is on by default: the high donor's probe is dropped and recorded,
+    # The opt-in t1 guard: the high donor's probe is dropped and recorded,
     # while the idle -> critical transfer is untouched.
     guarded = build_plan(
         model_contexts=contexts,
         classifications=classifications,
         model_replicas=replicas,
         idle_gpus=0,
-        cfg=PlanConfig(min_replicas_per_model=1, max_replicas_per_model=4),
+        cfg=PlanConfig(min_replicas_per_model=1, max_replicas_per_model=4, suppress_hot_proactive_probe=True),
     )
     assert _deltas([a for a in guarded.actions if isinstance(a, ScaleAction)]) == {"idle": -1, "critical": 1}
     assert guarded.delayed_down_models == set()
@@ -164,7 +165,7 @@ def test_build_plan_serves_a_low_and_a_critical_receiver_in_one_tick() -> None:
         classifications=classifications,
         model_replicas=replicas,
         idle_gpus=0,
-        cfg=PlanConfig(min_replicas_per_model=1, max_replicas_per_model=4),
+        cfg=PlanConfig(min_replicas_per_model=1, max_replicas_per_model=4, suppress_hot_proactive_probe=True),
     )
 
     scale_actions = [action for action in plan.actions if isinstance(action, ScaleAction)]
@@ -495,11 +496,11 @@ def test_tp_aware_critical_receiver_prefers_high_same_slot_shrink_before_defrag(
 # Diagnosis (TRE vs APA, timeline.csv): during a 7b/8b traffic spike the model is momentarily
 # classified HIGH (TSS = throughput/queue spikes up), and the rescue-loop high_proactive
 # block hid one of its in-service pods (routable 4->3) as a speculative surplus-reclaim probe
-# with NO beneficiary -- deepening saturation right as load climbed. The guard (default on)
+# with NO beneficiary -- deepening saturation right as load climbed. The guard (opt-in since A2)
 # must reject that probe while leaving demand-driven preemption and idle shrink untouched.
 
 
-def test_high_proactive_probe_suppressed_for_hot_model_by_default() -> None:
+def test_high_proactive_probe_suppressed_for_hot_model_when_guard_enabled() -> None:
     # A lone HIGH (hot, z_m far above tau_high) model with no receiver needing capacity.
     classifications = [_classification("hot", ModelState.HIGH, ModelRole.DONOR, 1.6, "surplus")]
     contexts = {"hot": {"assigned_replicas": 4, "routable_pods": 4}}
@@ -509,7 +510,7 @@ def test_high_proactive_probe_suppressed_for_hot_model_by_default() -> None:
         classifications=classifications,
         model_replicas={"hot": 4},
         idle_gpus=0,
-        cfg=PlanConfig(min_replicas_per_model=1, max_replicas_per_model=4),  # guard default ON
+        cfg=PlanConfig(min_replicas_per_model=1, max_replicas_per_model=4, suppress_hot_proactive_probe=True),  # guard ON (opt-in)
     )
 
     assert [a for a in plan.actions if isinstance(a, ScaleAction) and a.requires_safescale] == []
@@ -520,7 +521,7 @@ def test_high_proactive_probe_suppressed_for_hot_model_by_default() -> None:
 
 
 def test_high_proactive_probe_emitted_when_guard_disabled() -> None:
-    # Ablation path (TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE=0): legacy proactive release fires.
+    # Default path (A2 = v1 paper_high_proactive_shrink): the proactive release fires.
     classifications = [_classification("hot", ModelState.HIGH, ModelRole.DONOR, 1.6, "surplus")]
     contexts = {"hot": {"assigned_replicas": 4, "routable_pods": 4}}
 
@@ -542,8 +543,8 @@ def test_high_proactive_probe_emitted_when_guard_disabled() -> None:
 
 def test_critical_preemption_of_hot_donor_survives_guard() -> None:
     # Demand-driven preemption: a TP=2 CRITICAL receiver blocked on a fragmented slot with no
-    # idle capacity legitimately shrinks a HIGH donor sharing its two-GPU slot. The guard is ON
-    # (default) yet this MUST still fire, tagged with an explicit preemption reason.
+    # idle capacity legitimately shrinks a HIGH donor sharing its two-GPU slot. With the guard
+    # ON this MUST still fire, tagged with an explicit preemption reason.
     classifications = [
         _classification("tp2", ModelState.CRITICAL, ModelRole.RECEIVER, 0.5),
         _classification("high", ModelState.HIGH, ModelRole.DONOR, 1.4, "surplus"),
@@ -571,7 +572,8 @@ def test_critical_preemption_of_hot_donor_survives_guard() -> None:
             min_replicas_per_model=0,
             max_replicas_per_model=2,
             model_tp_sizes={"tp2": 2, "high": 1, "other": 1},
-        ),  # guard default ON
+            suppress_hot_proactive_probe=True,
+        ),  # guard ON (opt-in)
         cluster_view=cluster_view,
     )
 
@@ -606,7 +608,7 @@ def test_middle_zone_safescale_donor_not_suppressed_by_hot_guard() -> None:
         classifications=classifications,
         model_replicas={"critical": 2, "healthy": 3},
         idle_gpus=0,
-        cfg=PlanConfig(min_replicas_per_model=1, max_replicas_per_model=4),  # guard default ON
+        cfg=PlanConfig(min_replicas_per_model=1, max_replicas_per_model=4, suppress_hot_proactive_probe=True),  # guard ON (opt-in)
     )
 
     shrink = next(a for a in plan.actions if isinstance(a, ScaleAction) and a.model == "healthy")
@@ -618,7 +620,7 @@ def test_middle_zone_safescale_donor_not_suppressed_by_hot_guard() -> None:
 
 def test_idle_proactive_immediate_shrink_not_affected_by_hot_guard() -> None:
     # Genuine idle over-provisioning is reclaimed by idle_proactive_immediate (no SafeScale
-    # probe). The hot guard (default ON) must not touch it.
+    # probe). The hot guard (when ON) must not touch it.
     classifications = [_classification("idle", ModelState.IDLE, ModelRole.DONOR, 10.0, "idle")]
     contexts = {"idle": {"assigned_replicas": 4, "routable_pods": 4, "Y_m": 0.0, "Q": 0.0}}
 
@@ -627,7 +629,7 @@ def test_idle_proactive_immediate_shrink_not_affected_by_hot_guard() -> None:
         classifications=classifications,
         model_replicas={"idle": 4},
         idle_gpus=0,
-        cfg=PlanConfig(min_replicas_per_model=1, max_replicas_per_model=4),  # guard default ON
+        cfg=PlanConfig(min_replicas_per_model=1, max_replicas_per_model=4, suppress_hot_proactive_probe=True),  # guard ON (opt-in)
     )
 
     shrink = next(a for a in plan.actions if isinstance(a, ScaleAction) and a.model == "idle")
@@ -668,3 +670,93 @@ def test_disable_eta_gate_uses_signal_independent_natural_donor_order() -> None:
     ]
     assert donor_shrinks
     assert donor_shrinks[0].model == "model-2"
+
+
+def test_high_proactive_probe_is_held_during_rollback_backoff() -> None:
+    # A13: a HIGH model whose last SafeScale probe rolled back is not probed again until
+    # the backoff expires; demand-driven releases (v1 has no cooldown for them) are not held.
+    classifications = [
+        _classification("critical", ModelState.CRITICAL, ModelRole.RECEIVER, 0.5),
+        _classification("idle", ModelState.IDLE, ModelRole.DONOR, 10.0, "idle"),
+        _classification("hot", ModelState.HIGH, ModelRole.DONOR, 1.6, "surplus"),
+    ]
+    contexts = {
+        "critical": {"assigned_replicas": 2, "routable_pods": 2},
+        "idle": {"assigned_replicas": 3, "routable_pods": 3},
+        "hot": {"assigned_replicas": 4, "routable_pods": 4},
+    }
+    replicas = {"critical": 2, "idle": 3, "hot": 4}
+    cfg = PlanConfig(min_replicas_per_model=1, max_replicas_per_model=4)
+
+    free = build_plan(
+        model_contexts=contexts, classifications=classifications, model_replicas=replicas, idle_gpus=0, cfg=cfg
+    )
+    held = build_plan(
+        model_contexts=contexts,
+        classifications=classifications,
+        model_replicas=replicas,
+        idle_gpus=0,
+        cfg=cfg,
+        probe_backoff_models={"hot"},
+    )
+
+    def reasons(plan):
+        return {(a.model, a.reason) for a in plan.actions if isinstance(a, ScaleAction)}
+
+    assert ("hot", "high_proactive_safescale") in reasons(free)
+    assert ("hot", "high_proactive_safescale") not in reasons(held)
+    assert "safescale_rollback_backoff:hot" in held.events
+    assert reasons(held) == reasons(free) - {("hot", "high_proactive_safescale")}
+
+
+
+def test_receiver_cap_counts_hidden_probe_pods_like_v1_assigned() -> None:
+    # Review P1-2: 7b has 4 awake, 1 of them hidden by a HIGH probe (routable 3), cap 4.
+    # The planner used to compare the ROUTABLE count (3) with the cap and ask +1, which
+    # the SM (awake incl. hidden = 4) refused with 400 every 5 s. v1 caps on assigned
+    # (non-sleeping, draining included), and so does the planner now.
+    classifications = [_classification("7b", ModelState.CRITICAL, ModelRole.RECEIVER, 0.5)]
+    cfg = PlanConfig(min_replicas_per_model=1, max_replicas_per_model=4)
+
+    def plan(awake: int, routable: int):
+        return build_plan(
+            model_contexts={"7b": {"assigned_replicas": 8, "routable_pods": routable, "awake_replicas": awake}},
+            classifications=classifications,
+            model_replicas={"7b": 8},
+            idle_gpus=2,
+            cfg=cfg,
+        )
+
+    assert [a for a in plan(awake=4, routable=3).actions if isinstance(a, ScaleAction)] == []
+    assert _deltas([a for a in plan(awake=3, routable=3).actions if isinstance(a, ScaleAction)]) == {"7b": 1}
+
+    low = [_classification("7b", ModelState.LOW, ModelRole.RECEIVER, 0.9)]
+    fairness = build_plan(
+        model_contexts={"7b": {"assigned_replicas": 8, "routable_pods": 3, "awake_replicas": 4}},
+        classifications=low,
+        model_replicas={"7b": 8},
+        idle_gpus=2,
+        cfg=cfg,
+    )
+    assert [a for a in fairness.actions if isinstance(a, ScaleAction)] == []
+
+
+
+def test_rollback_backoff_event_only_for_models_that_would_be_probed() -> None:
+    # Review P3: a HIGH model at its serving floor is never probed, so it must not log a
+    # backoff event every tick while its backoff runs.
+    classifications = [_classification("hot", ModelState.HIGH, ModelRole.DONOR, 1.6, "surplus")]
+    cfg = PlanConfig(min_replicas_per_model=1, max_replicas_per_model=4)
+
+    def events(pods: int):
+        return build_plan(
+            model_contexts={"hot": {"assigned_replicas": pods, "routable_pods": pods}},
+            classifications=classifications,
+            model_replicas={"hot": pods},
+            idle_gpus=0,
+            cfg=cfg,
+            probe_backoff_models={"hot"},
+        ).events
+
+    assert "safescale_rollback_backoff:hot" not in events(1)
+    assert "safescale_rollback_backoff:hot" in events(3)

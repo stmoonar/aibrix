@@ -7,6 +7,7 @@ from typing import Any, Awaitable, Callable, Mapping
 from tre_common.registry import Registry, load_registry
 from tre_controller.config import ControllerConfig
 from tre_controller.gateway_cadence import check_gateway_cadence
+from tre_controller.gateway_health import EnvoyStatsSource
 from tre_controller.loops.action_queue import ActionQueue
 from tre_controller.mode import ObserveModeGate
 from tre_controller.reconcile.hidden_orphans import HiddenOrphanDetector
@@ -18,7 +19,6 @@ from tre_controller.loops.metrics_task import MetricsTaskConfig, SnapshotBox, Sn
 from tre_controller.loops.rescue_task import rescue_task
 from tre_controller.loops.safescale_task import safescale_task
 from tre_controller.planning.safescale import SafeScaleStateMachine
-from tre_controller.planning.util_scale_down import UtilScaleDown
 from tre_controller.signals.trs import SignalState
 from tre_controller.sm_client import AsyncTransport, ServiceManagerClient
 from tre_controller.store.metrics_store import MetricsStore
@@ -42,9 +42,8 @@ class ControllerDependencies:
     signal_state: SignalState
     profiler: "TickProfiler | None" = None
     hidden_orphan_detector: "HiddenOrphanDetector | None" = None
-    # Shared by rescue + fairness (one entry per distinct metrics window); None when
-    # TRE_UTIL_SCALE_DOWN is off.
-    util_scale_down: "UtilScaleDown | None" = None
+    # A13 donor-health guard source (None when TRE_GATEWAY_STATS_URL is unset).
+    gateway_health: "EnvoyStatsSource | None" = None
 
 
 @dataclass(frozen=True)
@@ -90,7 +89,6 @@ def build_controller_task_specs(
                     safescale=deps.safescale,
                     signal_state=deps.signal_state,
                     prof=deps.profiler,
-                    util_scale_down=deps.util_scale_down,
                 ),
             )
         )
@@ -108,7 +106,6 @@ def build_controller_task_specs(
                 safescale=deps.safescale,
                 signal_state=deps.signal_state,
                 prof=deps.profiler,
-                util_scale_down=deps.util_scale_down,
             ),
         )
     )
@@ -124,6 +121,7 @@ def build_controller_task_specs(
                     cfg=cfg,
                     signal_state=deps.signal_state,
                     cluster_view_box=deps.cluster_view_box,
+                    gateway_source=deps.gateway_health,
                 ),
             )
         )
@@ -196,12 +194,14 @@ def create_controller_dependencies(
         hidden_orphan_detector=HiddenOrphanDetector(
             redis_client, grace_s=cfg.orphan_grace_s
         ),
-        util_scale_down=(
-            UtilScaleDown(
-                windows=cfg.util_scale_down_windows,
-                q_overrides=cfg.util_scale_down_q_per_replica,
+        gateway_health=(
+            EnvoyStatsSource(
+                cfg.gateway_stats_urls,
+                [spec.name for spec in registry.models()],
+                route_namespace=cfg.gateway_route_namespace,
+                timeout_s=cfg.gateway_stats_timeout_s,
             )
-            if cfg.util_scale_down
+            if getattr(cfg, "gateway_stats_urls", ())
             else None
         ),
     )

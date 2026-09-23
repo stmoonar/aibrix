@@ -123,3 +123,18 @@ def test_tau_zero_is_no_smoothing_whatever_ema_alpha_says() -> None:
         r3 = c.compute(_inp(generation=100.0, running=2.0), window_end_ms=20_000)
         assert (r1.TRS, r2.TRS, r3.TRS) == pytest.approx((100.0, 200.0, 50.0))
         assert c.tss_ema is None
+
+
+def test_deployed_registry_uses_the_fixed_10s_tau_for_every_model() -> None:
+    # v1/paper alignment A9 (D18): one designed tau = 10 s for all three models, not a
+    # per-model fit. The params.yaml ConfigMap mirrors registry.yaml (kustomize guard test).
+    from pathlib import Path
+
+    from tre_common.registry import load_registry
+
+    registry = load_registry(str(Path(__file__).resolve().parents[2] / "deploy" / "registry.yaml"))
+    assert {spec.name: spec.trs.ema_tau_ms for spec in registry.models()} == {
+        "dsqwen-7b": 10_000.0,
+        "dsllama-8b": 10_000.0,
+        "dsqwen-14b": 10_000.0,
+    }

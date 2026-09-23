@@ -11,7 +11,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from tre_common.registry import Registry
+from tre_common.registry import Registry, scale_max_replicas
 from tre_common.registry import NodeSpec
 from tre_common.gpu_placement import choose_placement
 from tre_sm.allocator.slots import (
@@ -190,10 +190,13 @@ class ServiceManagerV2:
         spec = self._registry.model(model)
         if wake_replicas < 0:
             raise ValueError("wake_replicas must be non-negative")
-        if wake_replicas > spec.max_replicas:
-            raise ValueError(f"wake_replicas exceeds max_replicas for {model}")
 
         snapshot = self._store.load()
+        # Scaling cap (registry max_awake_replicas, v1/paper alignment A1); max_replicas
+        # is the GPU layout size (bindings), not how many may be awake. Only GROWTH past
+        # the cap is refused: shrinking (or holding) a model that is above the cap - e.g.
+        # after the cap was lowered - must go through.
+        self._ensure_target_within_cap(model, spec, wake_replicas, snapshot.bindings)
         model_bindings = [binding for binding in snapshot.bindings if binding.model == model]
         if self._runtime_ops is not None and wake_replicas > len(model_bindings) and not self._has_deployment_ops():
             raise ValueError("runtime create is not implemented for target growth beyond existing bindings")
@@ -351,6 +354,14 @@ class ServiceManagerV2:
 
     @serialized_operation("put_binding_power")
     def put_binding_power(self, serve_id: str, *, awake: bool) -> dict:
+        if awake:
+            # Controller-requested wake: same scaling cap as put_model_target. Fleet
+            # repair (_set_binding_power_by_id_unlocked) restores recorded desired state
+            # and is deliberately not capped here.
+            snapshot = self._store.load()
+            binding = next((item for item in snapshot.bindings if item.serve_id == serve_id), None)
+            if binding is not None and not binding.awake:
+                self._ensure_wake_within_cap(binding, snapshot.bindings)
         return self._put_binding_power_unlocked(serve_id, awake=awake)
 
     def _put_binding_power_unlocked(self, serve_id: str, *, awake: bool) -> dict:
@@ -1410,6 +1421,29 @@ class ServiceManagerV2:
     def _ensure_feasible_wake(self, binding: Binding, bindings: list[Binding]) -> None:
         if not self._feasible_wake(binding, bindings):
             raise WakeConflict(f"{binding.serve_id}: slot already has awake binding")
+
+    def _ensure_target_within_cap(
+        self, model: str, spec, target: int, bindings: list[Binding]
+    ) -> None:
+        """The one scaling-cap rule: refuse a target that GROWS the model's awake count
+        (hidden probe pods included - they are awake, v1 assigned) past
+        max_awake_replicas. Shrinks and unchanged targets always pass, even above the cap."""
+        cap = scale_max_replicas(spec)
+        awake = sum(1 for item in bindings if item.model == model and item.awake)
+        if target > awake and target > cap:
+            raise ValueError(
+                f"wake_replicas {target} exceeds max_awake_replicas ({cap}) for {model} (awake {awake})"
+            )
+
+    def _ensure_wake_within_cap(self, binding: Binding, bindings: list[Binding]) -> None:
+        """Binding-level wakes obey the same rule as put_model_target (a wake is the
+        target awake + 1)."""
+        try:
+            spec = self._registry.model(binding.model)
+        except KeyError:
+            return
+        awake = sum(1 for item in bindings if item.model == binding.model and item.awake)
+        self._ensure_target_within_cap(binding.model, spec, awake + 1, bindings)
 
     def _ensure_model_route(self, model: str) -> None:
         if self._runtime_ops is not None and hasattr(self._runtime_ops, "ensure_model_httproute"):

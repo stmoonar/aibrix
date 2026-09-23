@@ -37,9 +37,11 @@ def test_apa_podautoscaler_crs_match_seam_and_registry() -> None:
         src = spec["metricsSources"][0]
         assert src["targetMetric"] == "gpu_cache_usage_perc"
         assert src["metricSourceType"] == "pod"
-        # min/max mirror the registry.
+        # min mirrors the registry; max mirrors the registry SCALING cap
+        # (max_awake_replicas, v1/paper alignment A1: 4 for TRE and APA alike), not the
+        # GPU layout size max_replicas.
         assert spec["minReplicas"] == registry[model]["min_replicas"]
-        assert spec["maxReplicas"] == registry[model]["max_replicas"]
+        assert spec["maxReplicas"] == registry[model]["max_awake_replicas"] == 4
 
 
 def test_apa_scale_anchor_deployments_publish_model_selector() -> None:

@@ -105,16 +105,29 @@ class ModelSpec:
     weights_path: str
     tp_size: int
     min_replicas: int
+    #: GPU layout: how many bindings (pods / slots) the model gets. ``make manifests``
+    #: renders ``feasible_slots[:max_replicas]`` deployments; NOT the scaling cap.
     max_replicas: int
     vllm_image: str
     slo: SloSpec
     trs: TrsParams
     vllm_extra_args: tuple[str, ...] = ()
     alt_thresholds: dict[str, AltThreshold] = field(default_factory=dict)
-    # Utilisation-gated scale-down (TRE_UTIL_SCALE_DOWN): max per-replica in-flight load
-    # (avg_running + avg_waiting) after removing one replica. Optional; None -> controller
-    # default. Registry key: models[].scale_down_q_per_replica.
-    scale_down_q_per_replica: float | None = None
+    #: Scaling cap: the most bindings that may be awake at once (controller planner,
+    #: service-manager target / binding wake, console). ``None`` = ``max_replicas``.
+    #: Registry key models[].max_awake_replicas (v1/paper alignment A1: 4 for TRE and APA).
+    max_awake_replicas: int | None = None
+
+    @property
+    def scale_max_replicas(self) -> int:
+        return scale_max_replicas(self)
+
+
+def scale_max_replicas(spec: Any) -> int:
+    """The scaling cap of a model spec: ``max_awake_replicas`` when set, else the layout
+    size ``max_replicas`` (duck-typed so lightweight test specs without the field work)."""
+    cap = getattr(spec, "max_awake_replicas", None)
+    return int(spec.max_replicas) if cap is None else int(cap)
 
 
 class Registry:
@@ -150,10 +163,12 @@ class Registry:
                 errors.append(f"model {model.name}: min_replicas must be non-negative")
             if model.max_replicas < model.min_replicas:
                 errors.append(f"model {model.name}: max_replicas below min_replicas")
-            if model.scale_down_q_per_replica is not None and not (
-                math.isfinite(model.scale_down_q_per_replica) and model.scale_down_q_per_replica > 0.0
+            if model.max_awake_replicas is not None and not (
+                model.min_replicas <= model.max_awake_replicas <= model.max_replicas
             ):
-                errors.append(f"model {model.name}: scale_down_q_per_replica must be positive")
+                errors.append(
+                    f"model {model.name}: max_awake_replicas must be within [min_replicas, max_replicas]"
+                )
             for signal, threshold in model.alt_thresholds.items():
                 if not math.isfinite(threshold.theta) or threshold.theta <= 0.0:
                     errors.append(f"model {model.name}: alt_thresholds.{signal}.theta must be positive")
@@ -238,6 +253,9 @@ def _parse_model(raw: dict[str, Any]) -> ModelSpec:
         tp_size=int(raw["tp_size"]),
         min_replicas=int(raw["min_replicas"]),
         max_replicas=int(raw["max_replicas"]),
+        max_awake_replicas=(
+            int(raw["max_awake_replicas"]) if raw.get("max_awake_replicas") is not None else None
+        ),
         vllm_image=str(raw["vllm_image"]),
         slo=SloSpec(
             ttft_p95_ms=float(slo["ttft_p95_ms"]),
@@ -278,9 +296,4 @@ def _parse_model(raw: dict[str, Any]) -> ModelSpec:
             )
             for signal, values in (raw.get("alt_thresholds") or {}).items()
         },
-        scale_down_q_per_replica=(
-            float(raw["scale_down_q_per_replica"])
-            if raw.get("scale_down_q_per_replica") is not None
-            else None
-        ),
     )

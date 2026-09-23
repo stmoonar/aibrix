@@ -126,15 +126,17 @@ def test_tick_replay_records_high_model_safescale_probe_once_across_60_ticks() -
             )
         },
     )
-    # t1 (default guard ON): a hot HIGH model with no receiver must NEVER get a proactive
-    # scale-down probe -- across all 60 ticks there is no hide and the model stays intact.
+    # t1 (guard ON, opt-in since A2): a hot HIGH model with no receiver must NEVER get a
+    # proactive scale-down probe -- across all 60 ticks there is no hide and the model stays intact.
     guarded = SafeScaleStateMachine(config=SafeScaleConfig(default_window_ms=60_000.0))
-    result = run_tick_replay(_steps(snapshot), registry=registry, safescale=guarded)
+    result = run_tick_replay(
+        _steps(snapshot), registry=registry, safescale=guarded, suppress_hot_proactive_probe=True
+    )
     assert [action for action in result.actions if isinstance(action, HideAction)] == []
     assert guarded.active_probe("donor") is None
     assert result.events.count("safescale_probe_suppressed_hot:donor") == 60
 
-    # Ablation path (guard OFF): the legacy proactive probe fires exactly once and is not
+    # Default path (guard OFF, A2): the v1 proactive probe fires exactly once and is not
     # re-issued while it stays active (active_probe_models idempotency across 60 ticks).
     legacy = SafeScaleStateMachine(config=SafeScaleConfig(default_window_ms=60_000.0))
     result = run_tick_replay(

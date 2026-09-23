@@ -1,16 +1,26 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 from dataclasses import dataclass
-from typing import Awaitable, Callable, Protocol
+from typing import Awaitable, Callable, Mapping, Protocol
 
 from tre_common.metrics_schema import MetricsSnapshot, ModelWindowMetrics
 from tre_common.registry import Registry
+from tre_controller.gateway_health import GatewayCounters
 from tre_controller.loops.tick import serving_window
 from tre_controller.planning.planner import Action, ClusterView, ScaleAction, UnhideAction
 from tre_controller.planning.safescale import ProbeObservation, SafeScaleCommand, SafeScaleProbe
 from tre_controller.signals.sources import get_signal
 from tre_controller.signals.trs import SignalState, TRSComputer, TRSInput
+
+
+LOG = logging.getLogger("tre_controller.safescale")
+
+
+class GatewayCounterSource(Protocol):
+    def read(self) -> Mapping[str, GatewayCounters] | None: ...
 
 
 class SnapshotReader(Protocol):
@@ -53,6 +63,7 @@ def run_safescale_observation_tick(
     signal_source: str = "zm",
     signal_state: SignalState | None = None,
     cluster_view: ClusterView | None = None,
+    gateway_counters: Mapping[str, GatewayCounters] | None = None,
 ) -> SafeScaleObservationResult:
     if snapshot.stale:
         return SafeScaleObservationResult(submitted=0, events=("snapshot_stale",))
@@ -68,10 +79,30 @@ def run_safescale_observation_tick(
         # Same serving-pod window as the planner tick (sleeping pods' docs and count out).
         metrics = serving_window(metrics, cluster_view)
         observation = _observation_from_metrics(
-            snapshot.ts_ms, metrics, registry.model(probe.model), signal_source, signal_state=signal_state
+            snapshot.ts_ms,
+            metrics,
+            registry.model(probe.model),
+            signal_source,
+            signal_state=signal_state,
+            hidden_pods=tuple(getattr(probe, "pods", ())),
+            gateway=(gateway_counters or {}).get(probe.model),
         )
         decision = safescale.observe(probe.model, observation, now_ms=snapshot.ts_ms)
         events.append(f"safescale_{decision.reason}:{probe.model}")
+        gate_failures = _gate_failures(safescale, probe.model, decision)
+        if gate_failures:
+            events.append(f"safescale_gate_failures:{probe.model}:{','.join(gate_failures)}")
+        if getattr(decision, "reason", "") in ("formal_commit_gate_passed", "formal_commit_gate_failed") and (
+            _terminal_details(safescale, probe.model).get("kv_cache") == "unavailable"
+        ):
+            # P2-a: the KV-cache check could not be evaluated (fail-open, as v1) - say so.
+            events.append(f"safescale_kv_cache_unavailable:{probe.model}")
+        if getattr(decision, "reason", "") == "donor_health":
+            health = _terminal_details(safescale, probe.model).get("donor_health") or {}
+            events.append(
+                f"safescale_donor_health:{probe.model}:errors={health.get('errors', 0):.0f}"
+                f":requests={health.get('requests', 0):.0f}:rate={health.get('error_rate', 0.0):.4f}"
+            )
         actions = _commands_to_actions(decision.commands)
         if not actions:
             continue
@@ -111,11 +142,16 @@ async def safescale_task(
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     signal_state: SignalState | None = None,
     cluster_view_box: ClusterViewReader | None = None,
+    gateway_source: GatewayCounterSource | None = None,
 ) -> None:
     while True:
         snapshot = snapshot_box.get()
         if snapshot is not None:
-            run_safescale_observation_tick(
+            counters = None
+            if gateway_source is not None and safescale.active_probes():
+                # A13: the donor's gateway counters, read off the event loop (HTTP).
+                counters = await asyncio.to_thread(gateway_source.read)
+            result = run_safescale_observation_tick(
                 snapshot,
                 queue=queue,
                 registry=registry,
@@ -123,9 +159,55 @@ async def safescale_task(
                 signal_source=getattr(cfg, "signal_source", "zm"),
                 signal_state=signal_state,
                 cluster_view=cluster_view_box.get() if cluster_view_box is not None else None,
+                gateway_counters=counters,
             )
+            _log_resolutions(snapshot.ts_ms, result, gateway_available=counters is not None)
         interval = getattr(getattr(cfg, "safescale"), "probe_poll_seconds")
         await sleep(interval)
+
+
+def _log_resolutions(ts_ms: int, result: SafeScaleObservationResult, *, gateway_available: bool) -> None:
+    """One JSON log line per tick that did more than wait (commit / rollback / errors)."""
+    notable = [event for event in result.events if not event.startswith("safescale_probe_pending:")]
+    if not notable:
+        return
+    LOG.info(
+        json.dumps(
+            {
+                "event": "safescale_observation",
+                "ts_ms": ts_ms,
+                "events": notable,
+                "submitted": result.submitted,
+                "gateway_counters": gateway_available,
+            },
+            separators=(",", ":"),
+        )
+    )
+
+
+def _terminal_details(safescale: SafeScaleObserver, model: str) -> dict:
+    active = getattr(safescale, "active_probe", None)
+    probe = active(model) if callable(active) else None
+    return getattr(probe, "terminal_details", None) or {}
+
+
+def _gate_failures(safescale: SafeScaleObserver, model: str, decision) -> tuple[str, ...]:
+    if getattr(decision, "reason", "") != "formal_commit_gate_failed":
+        return ()
+    return tuple(_terminal_details(safescale, model).get("gate_failures") or ())
+
+
+def remaining_pods_kv_cache(metrics: ModelWindowMetrics, hidden_pods: tuple[str, ...] = ()) -> float | None:
+    """A12: mean KV-cache fill (0..1) over the donor's pods that still serve - the
+    window's pods (sleeping ones already dropped by serving_window) minus the probe's
+    hidden pods. v1 avg_gpu_cache_norm = sum of per-pod averages / routable pods."""
+    hidden = set(hidden_pods)
+    values = [
+        float(pod.gpu_cache_usage)
+        for key, pod in metrics.per_pod.items()
+        if key not in hidden and pod.pod not in hidden and getattr(pod, "gpu_cache_usage", None) is not None
+    ]
+    return sum(values) / len(values) if values else None
 
 
 def _observation_from_metrics(
@@ -134,6 +216,8 @@ def _observation_from_metrics(
     spec,
     signal_source: str,
     signal_state: SignalState | None = None,
+    hidden_pods: tuple[str, ...] = (),
+    gateway: GatewayCounters | None = None,
 ) -> ProbeObservation:
     if signal_state is not None:
         computer = signal_state.computer_for(
@@ -156,7 +240,10 @@ def _observation_from_metrics(
         # Idle rule (plan 6.4): tokens with nothing in flight is surplus, not traffic
         # that must prove a Z - otherwise a lightly used model could never commit a probe.
         has_traffic=(result.Q > 0.0 or (result.Y_m > 0.0 and result.defined)),
-        avg_gpu_cache_norm=None,
+        # A12: was hard-wired None, which disabled the KV-cache commit guard.
+        avg_gpu_cache_norm=remaining_pods_kv_cache(metrics, hidden_pods),
+        gateway_requests=gateway.requests if gateway is not None else None,
+        gateway_errors=gateway.errors if gateway is not None else None,
     )
 
 
