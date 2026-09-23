@@ -1,12 +1,35 @@
 #!/usr/bin/env python3
-"""The pre-registered analysis of a calibration run (preregistration-20260923 §3-§5).
+"""Cell-clustered, hold-out-sealed comparison of TRS against its alternatives on a
+calibration run.
 
 Input is one standard dataset directory (``windows.csv`` / ``cells.csv`` /
 ``manifest.json``, see ``docs/DATASET.md``) plus the regime grouping fixed before the run
 (``regime_groups.json``, from :mod:`scripts.analysis.calibration_priors`). Output is one
-structured JSON and one human-readable markdown report.
+structured JSON and one human-readable markdown report. ``--rule`` picks what is run:
 
-What it decides, and by which rule (all fixed in the preregistration, none tuned here):
+``dline`` (default) - a *comparison*, not a decision
+    The D-line (plan 2026-09-21 §6.11, D2-D14) won the 2026-09-23 merge; its w_p and
+    theta are decided by its own refit rule (``dline_refit``), not here. This rule takes
+    that w_p as given (``--w-p MODEL=VALUE``, else ``--dline-dir DIR`` reading
+    ``DIR/<model>/<arm>/wp.json`` key ``w_p_used``, else the registry's ``trs.w_p``, which
+    the report says) and measures it with the machinery below at the D-line's
+    lambda_wait = :data:`DLINE_LAMBDA`, on the **primary** (D6') label the dataset wrote
+    to ``slo_label``: TRS at the given w_p against w_p = 0, queue-per-replica and two
+    signals - LORO-min, the paired cell-clustered bootstrap interval of each difference,
+    and the sealed hold-out paired comparisons. Nothing is adopted or vetoed. A format
+    revision 1 dataset has no primary label and is refused (rebuild it with
+    ``python -m scripts.calibration_dataset``).
+
+``preregistered`` - the 2026-09-23 rule, superseded
+    Superseded by the D-line (:data:`SUPERSEDED_BY`); kept, unchanged, as an optional
+    comparison. It labels with the **fixed** 500 / 75 ms rule and no min-n guard, exactly
+    as the 09-23 dataset did. On a revision 2 dataset that arm's column
+    (``slo_label_fixed``) was written with the >= 20 completed-requests guard, so the
+    column is checked with the definition that wrote it (the manifest's
+    ``fixed_comparison`` arm) and the analysis then also scores the low-n windows the
+    column left unlabeled.
+
+What the preregistered rule decides (all fixed in the preregistration, none tuned here):
 
 * **w_p** per model, over the grid :data:`W_P_GRID`. The baseline is w_p = 0, one shared
   theta, lambda_wait = 3. A candidate replaces the baseline only if *all three* hold:
@@ -37,10 +60,11 @@ does. What is returned for it is a :class:`HoldoutSet`, which exposes no windows
 the only way to read them is :meth:`HoldoutSet.evaluate`, which demands a
 :class:`FrozenSelection` - the object the selection stage returns once every fit is
 done. Every selection-stage function takes a :class:`TrainingSet` and refuses anything
-else. The hold-out therefore cannot reach a fit or the choice among candidates; it enters
-the decision only as preregistered condition (3), a veto on the single candidate the
-training data already chose (a vetoed candidate is not replaced by the runner-up, which
-would let the hold-out pick).
+else. The hold-out therefore cannot reach a fit or the choice among candidates; under
+the preregistered rule it enters the decision only as condition (3), a veto on the single
+candidate the training data already chose (a vetoed candidate is not replaced by the
+runner-up, which would let the hold-out pick). Under the D-line rule the same seal holds
+and the hold-out is only reported.
 
 Signals are never re-implemented here. TRS (with the controller's time-constant EMA,
 one ``TRSComputer`` per cell, windows in time order - exactly
@@ -48,13 +72,16 @@ one ``TRSComputer`` per cell, windows in time order - exactly
 value is cross-checked against ``tre_calibration.signals.compute_trs``. Thresholds come
 from ``tre_calibration.fit.ThetaFitConfig`` (``fit_theta``, balanced accuracy) and are
 scored with ``tre_calibration.fit.threshold_balanced_accuracy``. Window rows become
-``CalibrationWindow`` through ``tre_calibration.dataset.calibration_window_from_row``, so
-the label is ``tre_common.slo_labels.window_slo_label``.
+``CalibrationWindow`` through ``tre_calibration.dataset.calibration_window_from_row``, and
+every label is a ``tre_common.slo_labels.LabelDefinition`` rebuilt from the manifest and
+checked, window by window, against the column the dataset recorded.
 
 Usage::
 
     python3 -m scripts.analysis.calibration_decision <dataset_dir> \\
-        --regime-groups <regime_groups.json> --out-dir <dir> [--profile preregistered]
+        --regime-groups <regime_groups.json> --out-dir <dir> \\
+        [--rule dline|preregistered] [--w-p MODEL=VALUE ... | --dline-dir DIR] \\
+        [--profile preregistered]
 """
 from __future__ import annotations
 
@@ -83,6 +110,20 @@ from tre_controller.signals.trs import TRSComputer, TRSInput
 # ------------------------------------------------------------ preregistered constants
 
 PREREGISTRATION = "docs/preregistration-20260923-calibration-run2.md"
+#: Why the preregistered rule is no longer the decision. Referenced by path only: this
+#: module never reads either document.
+SUPERSEDED_BY = "docs/preregistration-20260923-superseded.md"
+RULE_DLINE = "dline"
+RULE_PREREGISTERED = "preregistered"
+RULES = (RULE_DLINE, RULE_PREREGISTERED)
+#: The D-line's lambda_wait (plan 2026-09-21 §6.11): every D-line comparison is at it.
+DLINE_LAMBDA = 1.0
+#: ``--dline-dir`` layout of the D-line refit driver: ``<dir>/<model>/<arm>/wp.json``.
+DLINE_WP_FILE = "wp.json"
+DLINE_WP_KEY = "w_p_used"
+DLINE_DEFAULT_ARM = slo_labels.ARM_PRIMARY
+#: Dataset format revision that first carries the primary label (``calibration_dataset``).
+PRIMARY_LABEL_REVISION = 2
 W_P_GRID: tuple[float, ...] = (0.0, 0.0025, 0.005, 0.01, 0.02, 0.04, 0.08)
 BASELINE_W_P = 0.0
 MAIN_LAMBDA = 3.0
@@ -109,6 +150,10 @@ ROLE_TRAIN = "train"
 ROLE_HOLDOUT = "holdout"
 ROLE_EXCLUDED = "excluded"
 KNOWN_PRIMITIVES = frozenset({"hold", "steps", "ramp", "bursts"})
+
+
+class InputError(ValueError):
+    """A dataset or argument the analysis refuses; the CLI reports it as a usage error."""
 
 
 def points(x: float | None) -> float | None:
@@ -325,10 +370,38 @@ def prefill_share_series(rows: Sequence[Mapping[str, Any]], params: Any) -> list
     return out
 
 
+@dataclass(frozen=True)
+class ModelLabel:
+    """The label one model's windows are scored with, and how it is proven to be the
+    dataset's: ``checked`` is the definition that wrote ``column``; every window's
+    recorded ``column`` must equal ``checked`` recomputed. ``analysis`` differs from
+    ``checked`` only in a lower evidence floor (the preregistered rule on a revision 2
+    dataset: no min-n guard vs the column's 20), so wherever ``checked`` labels a window
+    the two must agree - also asserted."""
+
+    analysis: slo_labels.LabelDefinition
+    checked: slo_labels.LabelDefinition
+    column: str
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"analysis": self.analysis.as_dict(), "checked_column": self.column,
+                "checked_with": self.checked.as_dict()}
+
+
+def component_labels(lab: slo_labels.WindowLabel | None) -> tuple[bool, bool]:
+    """(TTFT term met, TPOT met) of one window, for the two-signal fits. An unserved
+    request fails both; a missing component is not met (the window is kept only because
+    it is unserved, so it is a violation either way)."""
+    if lab is None or lab.unserved:
+        return False, False
+    return (lab.ttft_ratio is not None and lab.ttft_ratio <= 1.0,
+            lab.tpot_ratio is not None and lab.tpot_ratio <= 1.0)
+
+
 def build_cells(
     rows: Iterable[Mapping[str, Any]],
     *,
-    slo_ms: Mapping[str, float],
+    labels: Mapping[str, ModelLabel],
     registry: Any,
     groups: Mapping[str, Mapping[str, str]],
     cell_start_ms: Mapping[tuple, float],
@@ -340,26 +413,30 @@ def build_cells(
         key = (row["model"], row["shape"], row["primitive"], row.get("stage") or "",
                row["cell_id"], str(row["attempt"]))
         by_cell[key].append(dict(row))
-    ttft_only = {"ttft_p95": slo_ms["ttft_p95"]}
-    tpot_only = {"tpot_p95": slo_ms["tpot_p95"]}
     cells: dict[str, Cell] = {}
     for key, cell_rows in sorted(by_cell.items()):
         model, shape, primitive, stage, cell_id, attempt = key
+        spec = labels[model]
         cell_rows.sort(key=lambda r: _f(r["window_end_ms"]))
         uid = f"{model}|{shape}|{primitive}|{stage}|{cell_id}|a{attempt}"
         start = cell_start_ms.get((model, shape, primitive, cell_id, attempt))
         warmup_ms = hold_warmup_s * 1000.0 if primitive == "hold" else 0.0
-        kept, labels, lt, lp, base = [], [], [], [], []
+        kept, labels_ok, lt, lp, base = [], [], [], [], []
         for i, r in enumerate(cell_rows):
             if warmup_ms and start is not None and _f(r["window_start_ms"]) - start < warmup_ms:
                 continue
-            label = slo_labels.window_slo_label(r, slo_ms)
-            recorded = (r.get(slo_labels.LABEL_COLUMN) or "").strip()
-            if recorded and recorded != label:
-                raise AssertionError(f"{uid}: label {label} disagrees with dataset {recorded}")
+            checked = spec.checked.window_label(r)
+            recorded = (r.get(spec.column) or "").strip()
+            if recorded and recorded != checked:
+                raise AssertionError(f"{uid}: {spec.column} {checked} (recomputed) disagrees "
+                                     f"with dataset {recorded}")
+            lab = spec.analysis.label(r)
+            label = slo_labels.LABEL_UNLABELED if lab is None else lab.label
+            if checked != slo_labels.LABEL_UNLABELED and checked != label:
+                raise AssertionError(f"{uid}: analysis label {label} disagrees with {spec.column} {checked}")
             if label == slo_labels.LABEL_UNLABELED:
                 continue
-            w = calibration_window_from_row(r, latency_slo_ms=slo_ms, signal=0.0)
+            w = calibration_window_from_row(r, latency_slo_ms=spec.analysis, signal=0.0)
             if w is None:
                 # Only a zero-token window gets here with a label; it is a violation
                 # (nothing was served) and must stay one (preregistration §6).
@@ -370,14 +447,15 @@ def build_cells(
                     signal=0.0, slo_met=False, window_start_ms=_f(r["window_start_ms"]),
                 )
             kept.append(i)
-            labels.append(w.slo_met)
-            lt.append(slo_labels.window_slo_label(r, ttft_only) == slo_labels.LABEL_HEALTHY)
-            lp.append(slo_labels.window_slo_label(r, tpot_only) == slo_labels.LABEL_HEALTHY)
+            labels_ok.append(w.slo_met)
+            ttft_ok, tpot_ok = component_labels(lab)
+            lt.append(ttft_ok)
+            lp.append(tpot_ok)
             base.append(dataclasses.replace(w, scenario_id=uid))
         group = groups.get(model, {}).get(shape)
         cells[uid] = Cell(
             uid=uid, model=model, shape=shape, primitive=primitive, stage=stage, group=group,
-            rows=cell_rows, kept=kept, labels=labels, labels_ttft=lt, labels_tpot=lp, base=base,
+            rows=cell_rows, kept=kept, labels=labels_ok, labels_ttft=lt, labels_tpot=lp, base=base,
             params=registry.model(model).trs,
         )
     return cells
@@ -859,22 +937,7 @@ def select(data: TrainingSet, *, n_boot: int, seed: int, processes: int) -> Froz
             methods["lambda10_selected"] = TrsSingle(sens["selection_winner"], SENSITIVITY_LAMBDA)
         fits[model] = {name: {"method": m, "params": m.fit(cells)} for name, m in methods.items()}
         out["models"][model] = {
-            "training": {
-                "cells": len(cells),
-                "windows": sum(len(c.kept) for c in cells),
-                "violating_windows": sum(c.n_violating for c in cells),
-                "independent_violating_windows": sum(c.independent_violating for c in cells),
-                "cells_with_violation": sum(1 for c in cells if c.n_violating),
-                "by_group": {
-                    g: {"shapes": sorted({c.shape for c in cells if c.group == g}),
-                        "cells": sum(1 for c in cells if c.group == g),
-                        "windows": sum(len(c.kept) for c in cells if c.group == g),
-                        "violating_windows": sum(c.n_violating for c in cells if c.group == g),
-                        "independent_violating_windows": sum(c.independent_violating for c in cells if c.group == g),
-                        "cells_with_violation": sum(1 for c in cells if c.group == g and c.n_violating)}
-                    for g in sorted({c.group for c in cells})
-                },
-            },
+            "training": _training_counts(cells),
             "w_p": main,
             "lambda_sensitivity": sens,
             "regime_aware": regime,
@@ -885,8 +948,130 @@ def select(data: TrainingSet, *, n_boot: int, seed: int, processes: int) -> Froz
     return FrozenSelection(out, fits)
 
 
+def _counts(cells: Sequence[Cell]) -> dict[str, int]:
+    return {
+        "cells": len(cells),
+        "windows": sum(len(c.kept) for c in cells),
+        "violating_windows": sum(c.n_violating for c in cells),
+        "independent_violating_windows": sum(c.independent_violating for c in cells),
+        "cells_with_violation": sum(1 for c in cells if c.n_violating),
+    }
+
+
+def _training_counts(cells: Sequence[Cell]) -> dict[str, Any]:
+    out: dict[str, Any] = _counts(cells)
+    out["by_group"] = {
+        g: {"shapes": sorted({c.shape for c in cells if c.group == g})}
+        | _counts([c for c in cells if c.group == g])
+        for g in sorted({c.group for c in cells})
+    }
+    return out
+
+
+def _holdout_counts(cells: Sequence[Cell]) -> dict[str, Any]:
+    out: dict[str, Any] = _counts(cells)
+    out["by_source"] = {
+        src: _counts(cs)
+        for src, cs in (("M", [c for c in cells if c.shape == "M"]),
+                        ("ramp", [c for c in cells if c.shape != "M"]))
+    }
+    return out
+
+
 def _jsonable(x: Any) -> Any:
     return json.loads(json.dumps(x, default=str))
+
+
+# ------------------------------------------------------------ the D-line comparison
+
+#: What TRS at the given w_p is compared against (all at :data:`DLINE_LAMBDA`).
+DLINE_TRS = "trs_at_given_w_p"
+DLINE_REFERENCES = ("baseline", "queue_per_replica", "two_signal")
+
+
+def dline_methods(w_p: float) -> dict[str, Any]:
+    return {
+        DLINE_TRS: TrsSingle(w_p, DLINE_LAMBDA),
+        "baseline": TrsSingle(BASELINE_W_P, DLINE_LAMBDA),
+        "queue_per_replica": QueueSingle(DLINE_LAMBDA),
+        "two_signal": TwoSignal(DLINE_LAMBDA),
+    }
+
+
+def compare_dline(
+    data: TrainingSet, w_p: Mapping[str, float], *, n_boot: int, seed: int, processes: int
+) -> FrozenSelection:
+    """Training half of the D-line comparison. w_p is an input (the D-line refit chose
+    it), so nothing is selected here: LORO-min of TRS at that w_p and of each reference,
+    and the 90 % interval of each difference from paired replicates (one cell draw for
+    every method). The fits on the full training set are frozen for the hold-out."""
+    _require_training(data)
+    out: dict[str, Any] = {"models": {}}
+    fits: dict[str, dict[str, Any]] = {}
+    for model in data.models():
+        cells = data.cells(model)
+        methods = dline_methods(w_p[model])
+        names = list(methods)
+        point = {n: loro(cells, m) for n, m in methods.items()}
+        boot = bootstrap_loro(data, model, list(methods.values()), n=n_boot,
+                              seed=f"{seed}:{model}:dline:{w_p[model]:g}", processes=processes)
+        loro_out = {}
+        for j, n in enumerate(names):
+            defined = [r[j] for r in boot if r[j] is not None]
+            loro_out[n] = {
+                "method": methods[n].name,
+                "min": point[n]["min"], "mean": point[n]["mean"],
+                "folds": {g: f["ba"] for g, f in point[n]["folds"].items()},
+                "undefined_folds": point[n]["undefined_folds"],
+                "boot_min_p05": percentile(defined, 0.05),
+                "boot_min_p50": percentile(defined, 0.5),
+                "boot_min_p95": percentile(defined, 0.95),
+            }
+        t = names.index(DLINE_TRS)
+        diffs_out = {}
+        for ref in DLINE_REFERENCES:
+            j = names.index(ref)
+            diffs = [100.0 * (r[t] - r[j]) for r in boot if r[t] is not None and r[j] is not None]
+            lo, hi = interval(diffs)
+            a, b = point[DLINE_TRS]["min"], point[ref]["min"]
+            diffs_out[ref] = {"diff_points": None if a is None or b is None else 100.0 * (a - b),
+                              "boot_diff_ci90_points": [lo, hi], "boot_replicates_used": len(diffs)}
+        fits[model] = {n: {"method": m, "params": m.fit(cells)} for n, m in methods.items()}
+        out["models"][model] = {
+            "training": _training_counts(cells),
+            "w_p": w_p[model],
+            "lambda_wait": DLINE_LAMBDA,
+            "folds": sorted({c.group for c in cells}),
+            "loro": loro_out,
+            "trs_minus": diffs_out,
+            "fitted_on_full_training": {n: _jsonable(f["params"]) for n, f in fits[model].items()},
+        }
+    return FrozenSelection(out, fits)
+
+
+def evaluate_holdout_dline(
+    by_model: Mapping[str, list[Cell]], frozen: FrozenSelection, *, n_boot: int, seed: int
+) -> dict[str, Any]:
+    """Hold-out half: TRS at the given w_p against each reference, paired, with the
+    frozen full-training fits. Reported, never used to change anything."""
+    out: dict[str, Any] = {}
+    for model, cells in sorted(by_model.items()):
+        fits = frozen.fits.get(model)
+        if fits is None:
+            continue
+        res = _holdout_counts(cells)
+        for ref in DLINE_REFERENCES:
+            res[f"trs_vs_{ref}"] = paired_compare(
+                cells, (fits[DLINE_TRS]["method"], fits[DLINE_TRS]["params"]),
+                (fits[ref]["method"], fits[ref]["params"]), n_boot=n_boot,
+                seed=f"{seed}:{model}:holdout:{DLINE_TRS}:{ref}")
+        m_cells = [c for c in cells if c.shape == "M"]
+        res["m_only_ba"] = {
+            name: balanced_accuracy(f["method"].margins(m_cells, f["params"])) for name, f in fits.items()
+        } if m_cells else None
+        res["ba"] = {name: balanced_accuracy(f["method"].margins(cells, f["params"])) for name, f in fits.items()}
+        out[model] = res
+    return out
 
 
 # ------------------------------------------------------------ hold-out evaluation
@@ -972,21 +1157,7 @@ def evaluate_holdout(by_model: Mapping[str, list[Cell]], frozen: FrozenSelection
                                   seed=f"{seed}:{model}:holdout:{an}:{bn}")
 
         chosen = "trs_at_selected_w_p"
-        res: dict[str, Any] = {
-            "cells": len(cells),
-            "windows": sum(len(c.kept) for c in cells),
-            "violating_windows": sum(c.n_violating for c in cells),
-            "independent_violating_windows": sum(c.independent_violating for c in cells),
-            "cells_with_violation": sum(1 for c in cells if c.n_violating),
-            "by_source": {
-                src: {"cells": len(cs), "windows": sum(len(c.kept) for c in cs),
-                      "violating_windows": sum(c.n_violating for c in cs),
-                      "independent_violating_windows": sum(c.independent_violating for c in cs),
-                      "cells_with_violation": sum(1 for c in cs if c.n_violating)}
-                for src, cs in (("M", [c for c in cells if c.shape == "M"]),
-                                ("ramp", [c for c in cells if c.shape != "M"]))
-            },
-        }
+        res: dict[str, Any] = _holdout_counts(cells)
         winner = sel["w_p"]["selection_winner"]
         res["condition3_w_p"] = None if winner is None else pair(chosen, "baseline")
         res["condition3_regime_aware"] = pair("regime_aware", chosen)
@@ -1084,6 +1255,110 @@ def slo_from_manifest(manifest: Mapping[str, Any]) -> dict[str, float]:
     return {inv[col]: float(v) for col, v in by_col.items()}
 
 
+def dataset_revision(manifest: Mapping[str, Any]) -> int:
+    """``calibration_dataset.FORMAT_REVISION`` the dataset was built with (1 if unrecorded)."""
+    return int(manifest.get("format_revision") or 1)
+
+
+def label_plan(manifest: Mapping[str, Any], models: Iterable[str], rule: str) -> dict[str, ModelLabel]:
+    """The label each model is scored with under ``rule``, rebuilt from the manifest.
+
+    * dline: the primary (D6') definition of ``label_by_model``, checked against
+      ``slo_label``. A revision 1 dataset's ``slo_label`` is the fixed label, and it has
+      no per-request TTFT evidence to rebuild the primary one: refused.
+    * preregistered: the fixed thresholds of ``label.slo_ms`` with no min-n guard (the
+      09-23 label). Revision 1 recorded exactly that in ``slo_label``; revision 2 records
+      the fixed arm, with the min-n guard, in ``slo_label_fixed`` - checked with the arm's
+      own definition so the check is exact.
+    """
+    rev = dataset_revision(manifest)
+    by_model = manifest.get("label_by_model") or {}
+    out: dict[str, ModelLabel] = {}
+    if rule == RULE_DLINE:
+        if rev < PRIMARY_LABEL_REVISION or not by_model:
+            raise InputError(
+                f"--rule {RULE_DLINE} scores the primary (D6') label, which a format revision {rev} "
+                "dataset does not carry (its slo_label is the fixed 500/75 ms label). Rebuild the "
+                "dataset from the run with `python -m scripts.calibration_dataset <run_dir>`, or "
+                f"pass --rule {RULE_PREREGISTERED}."
+            )
+        for m in models:
+            if m not in by_model:
+                raise InputError(f"manifest label_by_model has no entry for {m}; rebuild the dataset")
+            primary = slo_labels.LabelDefinition.from_dict(by_model[m])
+            out[m] = ModelLabel(analysis=primary, checked=primary, column=slo_labels.LABEL_COLUMN)
+        return out
+    if rule != RULE_PREREGISTERED:
+        raise InputError(f"unknown rule {rule!r}; expected one of {RULES}")
+    fixed = slo_labels.LabelDefinition.from_targets(slo_from_manifest(manifest), min_completed_requests=0)
+    for m in models:
+        if rev < PRIMARY_LABEL_REVISION:
+            out[m] = ModelLabel(analysis=fixed, checked=fixed, column=slo_labels.LABEL_COLUMN)
+            continue
+        arms = (by_model.get(m) or {}).get("arms") or {}
+        if slo_labels.ARM_FIXED not in arms:
+            raise InputError(f"revision {rev} manifest has no {slo_labels.ARM_FIXED!r} label arm for {m}")
+        writer = slo_labels.LabelDefinition.from_dict(arms[slo_labels.ARM_FIXED])
+        if writer.slowdown or writer.latency_slo_ms() != fixed.latency_slo_ms():
+            raise InputError(f"{m}: the dataset's fixed arm {writer.as_dict()} is not the preregistered "
+                             f"fixed label {fixed.latency_slo_ms()}")
+        out[m] = ModelLabel(analysis=fixed, checked=writer, column=slo_labels.LABEL_COLUMN_FIXED)
+    return out
+
+
+def parse_w_p_args(values: Iterable[str]) -> dict[str, float]:
+    """``["MODEL=VALUE", ...]`` -> ``{model: w_p}``."""
+    out: dict[str, float] = {}
+    for item in values:
+        model, sep, value = item.partition("=")
+        model = model.strip()
+        try:
+            v = float(value)
+        except ValueError:
+            v = float("nan")
+        if not sep or not model or not math.isfinite(v) or v < 0:
+            raise InputError(f"--w-p expects MODEL=VALUE with a finite VALUE >= 0, got {item!r}")
+        if model in out:
+            raise InputError(f"--w-p given twice for {model}")
+        out[model] = v
+    return out
+
+
+def resolve_w_p(
+    models: Iterable[str], registry: Any, *, given: Mapping[str, float] | None = None,
+    dline_dir: Path | None = None, arm: str = DLINE_DEFAULT_ARM,
+) -> dict[str, dict[str, Any]]:
+    """The w_p each model is compared at, and where it came from: ``--w-p``, else
+    ``<dline_dir>/<model>/<arm>/wp.json`` (a missing file is an error - a directory was
+    named, so a silent fallback would compare the wrong w_p), else the registry's
+    ``trs.w_p`` (said so in the source)."""
+    models = list(models)
+    given = dict(given or {})
+    unknown = sorted(set(given) - set(models))
+    if unknown:
+        raise InputError(f"--w-p names model(s) not in the dataset: {unknown}")
+    out: dict[str, dict[str, Any]] = {}
+    for m in models:
+        if m in given:
+            out[m] = {"value": float(given[m]), "source": "--w-p"}
+        elif dline_dir is not None:
+            path = Path(dline_dir) / m / arm / DLINE_WP_FILE
+            if not path.is_file():
+                raise InputError(f"{path}: no D-line w_p for {m} (or pass --w-p {m}=VALUE)")
+            doc = json.loads(path.read_text())
+            if DLINE_WP_KEY not in doc:
+                raise InputError(f"{path} has no {DLINE_WP_KEY!r}")
+            out[m] = {"value": float(doc[DLINE_WP_KEY]), "source": str(path), "sha256": _sha256(path)}
+            # Recorded, not applied: this comparison is at DLINE_LAMBDA and the registry
+            # EMA; a refit that moved either is flagged in the report.
+            out[m]["refit_lambda_star"] = doc.get("lambda_star")
+            out[m]["refit_tau_s"] = doc.get("tau_s")
+        else:
+            out[m] = {"value": float(registry.model(m).trs.w_p),
+                      "source": "registry trs.w_p (neither --w-p nor --dline-dir given)"}
+    return out
+
+
 def verify_signal_column(cells: Mapping[str, Cell], manifest: Mapping[str, Any], registry_path: Path) -> dict[str, Any]:
     """Recompute the dataset's own ``trs`` column with its registry's weights. Proves the
     re-signalling path is the path that wrote the column (only when the registry matches)."""
@@ -1108,26 +1383,43 @@ def verify_signal_column(cells: Mapping[str, Cell], manifest: Mapping[str, Any],
 
 def analyse(
     dataset_dir: Path, groups_path: Path, *, policy: CellPolicy, registry_path: Path,
+    rule: str = RULE_DLINE, w_p: Mapping[str, float] | None = None, dline_dir: Path | None = None,
+    dline_arm: str = DLINE_DEFAULT_ARM,
     n_boot: int = DEFAULT_BOOTSTRAP, seed: int = DEFAULT_SEED, processes: int = 1,
 ) -> dict[str, Any]:
+    if rule not in RULES:
+        raise InputError(f"unknown rule {rule!r}; expected one of {RULES}")
+    if rule == RULE_PREREGISTERED and (w_p or dline_dir is not None):
+        raise InputError("--w-p / --dline-dir apply to --rule dline only (the preregistered rule selects w_p)")
     windows, cell_rows, manifest = load_dataset(dataset_dir)
     registry = load_registry(str(registry_path))
     models = sorted({r["model"] for r in windows})
+    labels = label_plan(manifest, models, rule)
+    w_p_used = resolve_w_p(models, registry, given=w_p, dline_dir=dline_dir, arm=dline_arm) \
+        if rule == RULE_DLINE else None
     groups = load_groups(groups_path, models)
     starts = {(c["model"], c["shape"], c["primitive"], c["cell_id"], str(c["attempt"])): _f(c["start_ms"])
               for c in cell_rows if c.get("start_ms")}
-    cells = build_cells(windows, slo_ms=slo_from_manifest(manifest), registry=registry, groups=groups,
+    cells = build_cells(windows, labels=labels, registry=registry, groups=groups,
                         cell_start_ms=starts, hold_warmup_s=policy.hold_warmup_s)
     # The split comes first: nothing below this line sees a hold-out window except
     # HoldoutSet.evaluate, which only opens for the frozen selection.
     training, holdout, counts = split_dataset(cells, policy)
     signal_check = verify_signal_column(cells, manifest, registry_path)
-    frozen = select(training, n_boot=n_boot, seed=seed, processes=processes)
-    holdout_result = holdout.evaluate(
-        frozen, lambda by_model, fz: evaluate_holdout(by_model, fz, n_boot=n_boot, seed=seed)
-    )
-    decision = decide(frozen, holdout_result)
-    return {
+    settings: dict[str, Any] = {
+        "rule": rule,
+        "format_revision": dataset_revision(manifest),
+        "labels": {m: spec.as_dict() for m, spec in labels.items()},
+        "policy": dataclasses.asdict(policy) | {k: sorted(v) for k, v in dataclasses.asdict(policy).items()
+                                                if isinstance(v, (set, frozenset))},
+        "baseline_w_p": BASELINE_W_P, "ci_level": CI_LEVEL, "decisive_points": DECISIVE_POINTS,
+        "bootstrap": n_boot, "seed": seed, "theta_fit": THETA_CONFIG.as_dict(),
+        "queue_fit": QUEUE_CONFIG.as_dict(), "regime_groups": groups,
+    }
+    head = {
+        "rule": rule,
+        "superseded": {"rule": RULE_PREREGISTERED, "by": "the D-line (plan 2026-09-21 §6.11)",
+                       "document": SUPERSEDED_BY},
         "preregistration": PREREGISTRATION,
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "inputs": {
@@ -1136,24 +1428,32 @@ def analyse(
             "regime_groups": str(groups_path), "regime_groups_sha256": _sha256(groups_path),
             "registry": str(registry_path), "registry_sha256": _sha256(registry_path),
         },
-        "settings": {
-            "policy": dataclasses.asdict(policy) | {k: sorted(v) for k, v in dataclasses.asdict(policy).items()
-                                                    if isinstance(v, (set, frozenset))},
-            "w_p_grid": list(W_P_GRID), "baseline_w_p": BASELINE_W_P, "main_lambda": MAIN_LAMBDA,
-            "sensitivity_lambda": SENSITIVITY_LAMBDA, "min_gain_points": MIN_GAIN_POINTS,
-            "ci_level": CI_LEVEL, "share_loss_points": SHARE_LOSS_POINTS,
-            "regime_aware_min_models": REGIME_AWARE_MIN_MODELS, "decisive_points": DECISIVE_POINTS,
-            "bootstrap": n_boot, "seed": seed, "theta_fit": THETA_CONFIG.as_dict(),
-            "queue_fit": QUEUE_CONFIG.as_dict(), "slo_ms": slo_from_manifest(manifest),
-            "regime_groups": groups,
-        },
+        "settings": settings,
         "cell_counts": counts,
         "holdout_summary_before_opening": holdout.summary(),
         "signal_column_check": signal_check,
-        "selection": frozen.selection,
-        "holdout": holdout_result,
-        "decision": decision,
     }
+    if rule == RULE_DLINE:
+        settings.update({"lambda": DLINE_LAMBDA, "w_p": w_p_used, "dline_arm": dline_arm,
+                         "references": list(DLINE_REFERENCES)})
+        frozen = compare_dline(training, {m: v["value"] for m, v in w_p_used.items()},
+                               n_boot=n_boot, seed=seed, processes=processes)
+        holdout_result = holdout.evaluate(
+            frozen, lambda by_model, fz: evaluate_holdout_dline(by_model, fz, n_boot=n_boot, seed=seed)
+        )
+        return head | {"training": frozen.selection, "holdout": holdout_result}
+    settings.update({
+        "lambda": MAIN_LAMBDA, "w_p_grid": list(W_P_GRID), "main_lambda": MAIN_LAMBDA,
+        "sensitivity_lambda": SENSITIVITY_LAMBDA, "min_gain_points": MIN_GAIN_POINTS,
+        "share_loss_points": SHARE_LOSS_POINTS, "regime_aware_min_models": REGIME_AWARE_MIN_MODELS,
+        "slo_ms": slo_from_manifest(manifest),
+    })
+    frozen = select(training, n_boot=n_boot, seed=seed, processes=processes)
+    holdout_result = holdout.evaluate(
+        frozen, lambda by_model, fz: evaluate_holdout(by_model, fz, n_boot=n_boot, seed=seed)
+    )
+    decision = decide(frozen, holdout_result)
+    return head | {"selection": frozen.selection, "holdout": holdout_result, "decision": decision}
 
 
 # ------------------------------------------------------------------------- report
@@ -1172,14 +1472,103 @@ def _frac(x: float | None) -> str:
 
 
 def render_markdown(result: Mapping[str, Any]) -> str:
+    # A decision.json written before --rule existed is a preregistered one.
+    if result.get("settings", {}).get("rule", RULE_PREREGISTERED) == RULE_DLINE:
+        return _render_dline(result)
+    return _render_preregistered(result)
+
+
+def _label_lines(result: Mapping[str, Any]) -> list[str]:
+    s = result["settings"]
+    out = [f"- Dataset format revision {s.get('format_revision', 1)}; labels (checked window by "
+           "window against the recorded column):"]
+    for m, spec in s.get("labels", {}).items():
+        a = spec["analysis"]
+        desc = (f"slowdown k={a['k']:g} floor {a['floor_ms']:g} ms, TPOT {a['tpot_p95_ms']:g} ms"
+                if a.get("mode") == slo_labels.TTFT_SLO_MODE_SLOWDOWN
+                else f"fixed TTFT {a['ttft_p95_ms']:g} / TPOT {a['tpot_p95_ms']:g} ms")
+        out.append(f"  - {m}: {desc}, min_n {a['min_n']}; checked against `{spec['checked_column']}` "
+                   f"(min_n {spec['checked_with']['min_n']})")
+    return out
+
+
+def _render_dline(result: Mapping[str, Any]) -> str:
+    s = result["settings"]
+    tr = result["training"]["models"]
+    hold = result["holdout"]
+    lines = [
+        "# Calibration comparison (D-line rule)",
+        "",
+        f"- Rule `{RULE_DLINE}`: a comparison at λ = {s['lambda']:g}, no adopt/veto decision - w_p and θ "
+        "are decided by the D-line's own rule (plan 2026-09-21 §6.11). The preregistered rule is "
+        f"superseded (`{result['superseded']['document']}`); run it with `--rule {RULE_PREREGISTERED}`.",
+        f"- Policy `{s['policy']['name']}`; bootstrap {s['bootstrap']} (seed {s['seed']}).",
+        f"- Dataset: `{result['inputs']['dataset_dir']}`; cells train/hold-out/excluded = "
+        f"{result['cell_counts']['train']}/{result['cell_counts']['holdout']}/{result['cell_counts']['excluded']}.",
+        *_label_lines(result),
+        f"- Signal column check: {result['signal_column_check']}",
+        "- w_p compared: " + "; ".join(f"{m} {v['value']:g} ({v['source']})" for m, v in s["w_p"].items()),
+        *[f"- NOTE {m}: the D-line refit chose λ* = {v['refit_lambda_star']:g}; this comparison is at "
+          f"λ = {s['lambda']:g}." for m, v in s["w_p"].items()
+          if v.get("refit_lambda_star") is not None and float(v["refit_lambda_star"]) != s["lambda"]],
+        "",
+        "## Training: LORO-min BA points",
+        "",
+        "Differences are TRS at the given w_p minus the reference, in BA points, with the 90 % "
+        "cell-clustered paired bootstrap interval.",
+        "",
+        "| model | w_p | TRS | w_p=0 | q/replica | two-signal | TRS−(w_p=0) | TRS−q/replica | TRS−two-signal |",
+        "|---|---|---|---|---|---|---|---|---|",
+    ]
+    for m, t in tr.items():
+        lo = t["loro"]
+        diffs = []
+        for ref in DLINE_REFERENCES:
+            d = t["trs_minus"][ref]
+            ci = d["boot_diff_ci90_points"]
+            diffs.append(f"{_num(d['diff_points'])} [{_num(ci[0])}, {_num(ci[1])}]")
+        lines.append(f"| {m} | {t['w_p']:g} | {_pt(lo[DLINE_TRS]['min'])} | {_pt(lo['baseline']['min'])} | "
+                     f"{_pt(lo['queue_per_replica']['min'])} | {_pt(lo['two_signal']['min'])} | "
+                     + " | ".join(diffs) + " |")
+    lines += ["", "Training evidence (windows/violating/non-overlapping violating):", ""]
+    for m, t in tr.items():
+        c = t["training"]
+        lines.append(f"- {m}: {c['cells']} cells, {c['windows']}/{c['violating_windows']}/"
+                     f"{c['independent_violating_windows']}; " +
+                     "; ".join(f"{g} {v['shapes']} {v['windows']}/{v['violating_windows']}/"
+                               f"{v['independent_violating_windows']}" for g, v in c["by_group"].items()))
+    lines += ["", "## Merged hold-out set (paired, cell-clustered bootstrap; descriptive only)", "",
+              "| model | windows (viol) | cells w/ viol | comparison | A BA | B BA | A−B | 90% CI | discordant | reading |",
+              "|---|---|---|---|---|---|---|---|---|---|"]
+    for m, h in hold.items():
+        for ref, label in (("baseline", "TRS vs w_p=0"), ("queue_per_replica", "TRS vs q/replica"),
+                           ("two_signal", "TRS vs two-signal")):
+            p = h.get(f"trs_vs_{ref}")
+            if not p:
+                continue
+            dsum = sum(p["discordant_windows"].values())
+            lines.append(
+                f"| {m} | {p['windows']} ({p['violating_windows']}) | {p['cells_with_violation']} | {label} | "
+                f"{_pt(p['ba_a'])} | {_pt(p['ba_b'])} | {_num(p['diff_points'])} | "
+                f"[{_num(p['ci90_points'][0])}, {_num(p['ci90_points'][1])}] | {dsum} in {p['discordant_cells']} cells | "
+                f"{p['verdict']} |")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _render_preregistered(result: Mapping[str, Any]) -> str:
     dec = result["decision"]
     sel = result["selection"]["models"]
     hold = result["holdout"]
+    sup = result.get("superseded", {}).get("document", SUPERSEDED_BY)
     lines = [
-        "# Calibration analysis (pre-registered rules)",
+        "# Calibration analysis (pre-registered rules, superseded)",
         "",
+        f"- Rule `{RULE_PREREGISTERED}`: superseded by the D-line (`{sup}`); reported as a comparison "
+        "only - its verdicts below are what the 09-23 rule would say, not decisions.",
         f"- Rules: `{result['preregistration']}`; policy `{result['settings']['policy']['name']}`; "
         f"bootstrap {result['settings']['bootstrap']} (seed {result['settings']['seed']}).",
+        *(_label_lines(result) if "labels" in result["settings"] else []),
         f"- Dataset: `{result['inputs']['dataset_dir']}`; cells train/hold-out/excluded = "
         f"{result['cell_counts']['train']}/{result['cell_counts']['holdout']}/{result['cell_counts']['excluded']}.",
         f"- Signal column check: {result['signal_column_check']}",
@@ -1282,7 +1671,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     ap.add_argument("dataset_dir", type=Path)
     ap.add_argument("--regime-groups", type=Path, required=True)
     ap.add_argument("--out-dir", type=Path, required=True)
-    ap.add_argument("--profile", choices=sorted(POLICIES), default=PREREGISTERED.name)
+    ap.add_argument("--rule", choices=RULES, default=RULE_DLINE,
+                    help=f"{RULE_DLINE}: compare TRS at the D-line's w_p (lambda {DLINE_LAMBDA:g}, primary "
+                         f"label), no decision; {RULE_PREREGISTERED}: the superseded 09-23 rule "
+                         f"({SUPERSEDED_BY})")
+    ap.add_argument("--w-p", action="append", default=[], metavar="MODEL=VALUE",
+                    help="dline: the w_p to compare for MODEL (repeatable; overrides --dline-dir)")
+    ap.add_argument("--dline-dir", type=Path, default=None,
+                    help=f"dline: read w_p from DIR/<model>/<arm>/{DLINE_WP_FILE} key {DLINE_WP_KEY!r} "
+                         "(D-line refit output); without it or --w-p the registry trs.w_p is used")
+    ap.add_argument("--dline-arm", default=DLINE_DEFAULT_ARM, help="label arm directory under --dline-dir")
+    ap.add_argument("--profile", choices=sorted(POLICIES), default=PREREGISTERED.name,
+                    help="cell policy (which cells train / are held out), independent of --rule")
     ap.add_argument("--train-hold-stages", default=None,
                     help="comma list overriding the policy's training hold stages")
     ap.add_argument("--hold-warmup-s", type=float, default=None)
@@ -1291,6 +1691,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     ap.add_argument("--seed", type=int, default=DEFAULT_SEED)
     ap.add_argument("--processes", type=int, default=max(1, (multiprocessing.cpu_count() or 2) // 2))
     args = ap.parse_args(argv)
+    try:
+        w_p = parse_w_p_args(args.w_p)
+    except InputError as exc:
+        ap.error(str(exc))
+    if args.rule == RULE_PREREGISTERED and (w_p or args.dline_dir is not None):
+        ap.error("--w-p / --dline-dir apply to --rule dline only (the preregistered rule selects w_p)")
     policy = POLICIES[args.profile]
     if args.train_hold_stages is not None:
         stages = frozenset(s.strip() for s in args.train_hold_stages.split(",") if s.strip())
@@ -1298,8 +1704,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                                      excluded_hold_stages=policy.excluded_hold_stages - stages)
     if args.hold_warmup_s is not None:
         policy = dataclasses.replace(policy, hold_warmup_s=args.hold_warmup_s)
-    result = analyse(args.dataset_dir, args.regime_groups, policy=policy, registry_path=args.registry,
-                     n_boot=args.bootstrap, seed=args.seed, processes=args.processes)
+    try:
+        result = analyse(args.dataset_dir, args.regime_groups, policy=policy, registry_path=args.registry,
+                         rule=args.rule, w_p=w_p, dline_dir=args.dline_dir, dline_arm=args.dline_arm,
+                         n_boot=args.bootstrap, seed=args.seed, processes=args.processes)
+    except InputError as exc:
+        ap.error(str(exc))
     args.out_dir.mkdir(parents=True, exist_ok=True)
     (args.out_dir / "decision.json").write_text(json.dumps(result, indent=1, default=str) + "\n")
     (args.out_dir / "decision.md").write_text(render_markdown(result))

@@ -4,7 +4,10 @@
 Every branch of the preregistration's decision rule (docs/preregistration-20260923-
 calibration-run2.md §4) has a test here, because each one is a place where a quiet bug
 would flip a published verdict: a candidate that should have lost wins, or the hold-out
-set leaks into the choice it is meant to check.
+set leaks into the choice it is meant to check. The preregistered rule is superseded by
+the D-line and runs only with ``--rule preregistered``; the default ``--rule dline``
+reuses the same sealed machinery as a comparison at the D-line's lambda, on the primary
+label, at a given w_p - its label, lambda and w_p plumbing are tested at the end.
 """
 from __future__ import annotations
 
@@ -17,6 +20,7 @@ from pathlib import Path
 import pytest
 
 from scripts.analysis import calibration_decision as cd
+from tre_common import slo_labels
 from tre_common.registry import load_registry
 
 REGISTRY = Path(__file__).resolve().parents[1] / "registry.yaml"
@@ -225,7 +229,26 @@ def _window_rows(shape, primitive, stage, cell_id, load, start_ms, n, rng, flip=
     return rows
 
 
-def _synthetic(tmp_path: Path, *, flip_holdout: bool = False, seed: int = 7) -> tuple[Path, Path]:
+def _primary_label() -> slo_labels.LabelDefinition:
+    return slo_labels.label_def_for_model(MODEL, ttft_p95_ms=500, tpot_p95_ms=75, registry=str(REGISTRY))
+
+
+def _as_revision_2(windows: list[dict]) -> dict:
+    """Turn revision 1 rows into revision 2 ones the way ``calibration_dataset`` writes
+    them: per-request TTFT evidence, every 7th window under the 20-request floor, the
+    three label arms. Returns the manifest's ``label_by_model`` record."""
+    arms = slo_labels.label_arms(_primary_label())
+    for k, row in enumerate(windows):
+        row["completed_requests"] = 12 if k % 7 == 3 else 40
+        ttft = float(row["p95_ttft_client_ms"])
+        row["ttft_len_samples"] = slo_labels.format_ttft_len_samples(
+            (ttft * (0.8 + 0.01 * j), row["input_tokens"]) for j in range(20))
+        slo_labels.apply_label_arms(row, arms)
+    return slo_labels.label_definition(arms)
+
+
+def _synthetic(tmp_path: Path, *, flip_holdout: bool = False, seed: int = 7,
+               revision: int = 1) -> tuple[Path, Path]:
     rng = random.Random(seed)
     windows, cells = [], []
     t = 1_000_000
@@ -253,27 +276,33 @@ def _synthetic(tmp_path: Path, *, flip_holdout: bool = False, seed: int = 7) -> 
         cells.append({"model": MODEL, "shape": shape, "primitive": "hold", "cell_id": cid,
                       "attempt": 1, "start_ms": t})
         t += 200_000
-    ds = tmp_path / ("dataset_flip" if flip_holdout else "dataset")
+    ds = tmp_path / (("dataset_flip" if flip_holdout else "dataset") + f"_r{revision}")
     ds.mkdir()
+    manifest = {
+        "label": {"slo_ms": {"p95_ttft_client_ms": 500.0, "p95_tpot_client_ms": 75.0}},
+        "registry_used_for_signal_columns": {"sha256": "not-this-registry"},
+    }
+    if revision == 2:
+        record = _as_revision_2(windows)
+        manifest.update({"format_revision": 2, "label": record, "label_by_model": {MODEL: record},
+                         "windowing": {"window_ms": 30_000, "step_ms": 10_000, "window_align": "grid"}})
     for name, rows in (("windows.csv", windows), ("cells.csv", cells)):
         with (ds / name).open("w", newline="") as f:
             w = csv.DictWriter(f, fieldnames=list(rows[0]))
             w.writeheader()
             w.writerows(rows)
-    (ds / "manifest.json").write_text(json.dumps({
-        "label": {"slo_ms": {"p95_ttft_client_ms": 500.0, "p95_tpot_client_ms": 75.0}},
-        "registry_used_for_signal_columns": {"sha256": "not-this-registry"},
-    }))
+    (ds / "manifest.json").write_text(json.dumps(manifest))
     groups = tmp_path / "regime_groups.json"
     groups.write_text(json.dumps({"consistent_across_models": True, "groups": GROUPS}))
     return ds, groups
 
 
-def _cells(ds: Path, groups: Path, policy=cd.PREREGISTERED):
+def _cells(ds: Path, groups: Path, policy=cd.PREREGISTERED, rule=cd.RULE_PREREGISTERED):
     windows, cell_rows, manifest = cd.load_dataset(ds)
     starts = {(c["model"], c["shape"], c["primitive"], c["cell_id"], str(c["attempt"])): float(c["start_ms"])
               for c in cell_rows}
-    return cd.build_cells(windows, slo_ms=cd.slo_from_manifest(manifest), registry=load_registry(str(REGISTRY)),
+    return cd.build_cells(windows, labels=cd.label_plan(manifest, [MODEL], rule),
+                          registry=load_registry(str(REGISTRY)),
                           groups=cd.load_groups(groups, [MODEL]), cell_start_ms=starts,
                           hold_warmup_s=policy.hold_warmup_s)
 
@@ -307,7 +336,8 @@ def test_the_selection_stage_refuses_the_holdout_set(tmp_path) -> None:
     _, holdout, _ = cd.split_dataset(_cells(ds, groups), cd.PREREGISTERED)
     for call in (lambda: cd.select(holdout, n_boot=2, seed=1, processes=1),
                  lambda: cd.select_model(holdout, MODEL, lambda_wait=3.0, n_boot=2, seed=1, processes=1),
-                 lambda: cd.bootstrap_loro(holdout, MODEL, [], n=1, seed="x")):
+                 lambda: cd.bootstrap_loro(holdout, MODEL, [], n=1, seed="x"),
+                 lambda: cd.compare_dline(holdout, {MODEL: 0.01}, n_boot=2, seed=1, processes=1)):
         with pytest.raises(TypeError, match="TrainingSet"):
             call()
 
@@ -327,7 +357,11 @@ def test_changing_the_holdout_cannot_change_the_selection(tmp_path) -> None:
 
 def test_the_full_analysis_runs_and_writes_a_verdict(tmp_path) -> None:
     ds, groups = _synthetic(tmp_path)
-    result = cd.analyse(ds, groups, policy=cd.PREREGISTERED, registry_path=REGISTRY, n_boot=4, seed=3)
+    result = cd.analyse(ds, groups, policy=cd.PREREGISTERED, registry_path=REGISTRY, n_boot=4, seed=3,
+                        rule=cd.RULE_PREREGISTERED)
+    assert result["settings"]["rule"] == cd.RULE_PREREGISTERED and result["settings"]["lambda"] == 3.0
+    assert result["settings"]["format_revision"] == 1
+    assert result["settings"]["labels"][MODEL]["checked_column"] == "slo_label"
     per = result["decision"]["per_model"][MODEL]
     assert per["w_p"] in cd.W_P_GRID
     assert per["w_p_verdict"]
@@ -335,7 +369,7 @@ def test_the_full_analysis_runs_and_writes_a_verdict(tmp_path) -> None:
     hold = result["holdout"][MODEL]
     assert hold["cells"] == 9 and hold["trs_vs_queue_per_replica"]["windows"] == hold["windows"]
     text = cd.render_markdown(result)
-    assert "## Decision" in text and MODEL in text
+    assert "## Decision" in text and MODEL in text and cd.SUPERSEDED_BY in text
 
 
 def test_trs_comes_from_the_controller_computer_with_its_ema(tmp_path) -> None:
@@ -372,3 +406,144 @@ def test_a_fold_without_violations_has_no_ba_rather_than_a_wrong_one() -> None:
 
     healthy = [CalibrationWindow("c", "f", 2.0, True) for _ in range(5)]
     assert cd.balanced_accuracy(healthy) is None
+
+
+# ------------------------------------------------------------------- --rule dline
+
+
+def _registry_w_p() -> float:
+    return load_registry(str(REGISTRY)).model(MODEL).trs.w_p
+
+
+def _rewrite_column(ds: Path, column: str, fn) -> None:
+    with (ds / "windows.csv").open(newline="") as f:
+        rows = list(csv.DictReader(f))
+    for row in rows:
+        row[column] = fn(row[column])
+    with (ds / "windows.csv").open("w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0]))
+        w.writeheader()
+        w.writerows(rows)
+
+
+def test_the_default_rule_is_dline_at_lambda_1_on_the_primary_label(tmp_path) -> None:
+    ds, groups = _synthetic(tmp_path, revision=2)
+    result = cd.analyse(ds, groups, policy=cd.PREREGISTERED, registry_path=REGISTRY, n_boot=4, seed=3)
+    s = result["settings"]
+    assert s["rule"] == cd.RULE_DLINE and s["lambda"] == cd.DLINE_LAMBDA == 1.0
+    assert s["format_revision"] == 2
+    label = s["labels"][MODEL]
+    assert label["checked_column"] == "slo_label"
+    assert label["analysis"] == _primary_label().as_dict() and label["analysis"]["mode"] == "slowdown"
+    # no w_p given: the registry's, and the report says so
+    assert s["w_p"][MODEL]["value"] == _registry_w_p() and "registry" in s["w_p"][MODEL]["source"]
+    assert "decision" not in result and "selection" not in result
+    t = result["training"]["models"][MODEL]
+    assert t["loro"][cd.DLINE_TRS]["method"] == f"trs_single(w_p={_registry_w_p():g},lambda=1)"
+    assert t["loro"]["baseline"]["method"] == "trs_single(w_p=0,lambda=1)"
+    assert t["loro"]["queue_per_replica"]["method"] == "queue_per_replica(lambda=1)"
+    assert set(t["trs_minus"]) == set(cd.DLINE_REFERENCES)
+    hold = result["holdout"][MODEL]
+    for ref in cd.DLINE_REFERENCES:
+        assert hold[f"trs_vs_{ref}"]["windows"] == hold["windows"]
+    text = cd.render_markdown(result)
+    assert "D-line rule" in text and cd.SUPERSEDED_BY in text and "## Decision" not in text
+
+
+def test_dline_scores_only_windows_the_primary_label_labelled(tmp_path) -> None:
+    # windows under the 20-request floor: out under the primary label, in under the
+    # preregistered one (which had no floor)
+    ds, groups = _synthetic(tmp_path, revision=2)
+    for rule, low_n_kept in ((cd.RULE_DLINE, False), (cd.RULE_PREREGISTERED, True)):
+        kept = [c.rows[i] for c in _cells(ds, groups, rule=rule).values() for i in c.kept]
+        low = [r for r in kept if int(r["completed_requests"]) < 20]
+        assert bool(low) is low_n_kept, rule
+
+
+def test_dline_checks_the_recorded_primary_label(tmp_path) -> None:
+    ds, groups = _synthetic(tmp_path, revision=2)
+    _rewrite_column(ds, "slo_label", lambda v: {"healthy": "violated", "violated": "healthy"}.get(v, v))
+    with pytest.raises(AssertionError, match="slo_label"):
+        _cells(ds, groups, rule=cd.RULE_DLINE)
+
+
+def test_preregistered_on_a_revision_2_dataset_checks_the_fixed_column(tmp_path) -> None:
+    ds, groups = _synthetic(tmp_path, revision=2)
+    result = cd.analyse(ds, groups, policy=cd.PREREGISTERED, registry_path=REGISTRY, n_boot=4, seed=3,
+                        rule=cd.RULE_PREREGISTERED)
+    label = result["settings"]["labels"][MODEL]
+    assert label["checked_column"] == "slo_label_fixed"
+    # the analysis keeps the 09-23 label (no min-n guard); the column was written with it
+    assert label["analysis"]["mode"] == "fixed" and label["analysis"]["min_n"] == 0
+    assert label["checked_with"]["min_n"] == 20
+    assert result["settings"]["lambda"] == 3.0 and result["decision"]["per_model"][MODEL]["w_p_verdict"]
+    # and the check is real: a corrupted fixed column is caught
+    _rewrite_column(ds, "slo_label_fixed", lambda v: {"healthy": "violated", "violated": "healthy"}.get(v, v))
+    with pytest.raises(AssertionError, match="slo_label_fixed"):
+        _cells(ds, groups, rule=cd.RULE_PREREGISTERED)
+
+
+def test_dline_refuses_a_revision_1_dataset_with_the_rebuild_command(tmp_path) -> None:
+    ds, groups = _synthetic(tmp_path)
+    with pytest.raises(ValueError, match=r"python -m scripts\.calibration_dataset"):
+        cd.analyse(ds, groups, policy=cd.PREREGISTERED, registry_path=REGISTRY, n_boot=2, seed=3)
+    with pytest.raises(SystemExit):
+        cd.main([str(ds), "--regime-groups", str(groups), "--out-dir", str(tmp_path / "out"),
+                 "--bootstrap", "2", "--processes", "1"])
+
+
+def test_w_p_precedence_cli_then_dline_dir_then_registry(tmp_path) -> None:
+    registry = load_registry(str(REGISTRY))
+    wp = tmp_path / "dline" / MODEL / "primary" / "wp.json"
+    wp.parent.mkdir(parents=True)
+    wp.write_text(json.dumps({"w_p_used": 0.005, "other": 1}))
+    from_dir = cd.resolve_w_p([MODEL], registry, dline_dir=tmp_path / "dline")
+    assert from_dir[MODEL]["value"] == 0.005 and from_dir[MODEL]["source"] == str(wp)
+    given = cd.resolve_w_p([MODEL], registry, given={MODEL: 0.04}, dline_dir=tmp_path / "dline")
+    assert given[MODEL] == {"value": 0.04, "source": "--w-p"}
+    fallback = cd.resolve_w_p([MODEL], registry)
+    assert fallback[MODEL]["value"] == _registry_w_p() and "registry" in fallback[MODEL]["source"]
+    with pytest.raises(cd.InputError, match="wp.json"):
+        cd.resolve_w_p([MODEL], registry, dline_dir=tmp_path / "dline", arm="fixed")
+    with pytest.raises(cd.InputError, match="not in the dataset"):
+        cd.resolve_w_p([MODEL], registry, given={"other-model": 0.01})
+
+
+@pytest.mark.parametrize("bad", ["dsqwen-7b", "=0.01", "dsqwen-7b=x", "dsqwen-7b=-1", "dsqwen-7b=nan"])
+def test_a_malformed_w_p_argument_is_refused(bad) -> None:
+    with pytest.raises(cd.InputError):
+        cd.parse_w_p_args([bad])
+
+
+def test_the_cli_threads_rule_and_w_p_into_the_result(tmp_path) -> None:
+    ds, groups = _synthetic(tmp_path, revision=2)
+    base = [str(ds), "--regime-groups", str(groups), "--bootstrap", "2", "--processes", "1"]
+    assert cd.main(base + ["--out-dir", str(tmp_path / "a"), "--w-p", f"{MODEL}=0.01"]) == 0
+    doc = json.loads((tmp_path / "a" / "decision.json").read_text())
+    assert doc["settings"]["rule"] == "dline" and doc["settings"]["w_p"][MODEL] == {"value": 0.01, "source": "--w-p"}
+    assert doc["training"]["models"][MODEL]["w_p"] == 0.01
+    wp = tmp_path / "dline" / MODEL / "primary" / "wp.json"
+    wp.parent.mkdir(parents=True)
+    wp.write_text(json.dumps({"w_p_used": 0.005, "lambda_star": 2.0, "tau_s": 20.0}))
+    assert cd.main(base + ["--out-dir", str(tmp_path / "b"), "--dline-dir", str(tmp_path / "dline")]) == 0
+    doc = json.loads((tmp_path / "b" / "decision.json").read_text())
+    assert doc["settings"]["w_p"][MODEL]["value"] == 0.005
+    assert doc["settings"]["w_p"][MODEL]["refit_lambda_star"] == 2.0 and doc["settings"]["lambda"] == 1.0
+    md = (tmp_path / "b" / "decision.md").read_text()
+    assert "D-line rule" in md and "λ* = 2" in md  # a refit that moved lambda is flagged
+    with pytest.raises(SystemExit):  # the preregistered rule selects its own w_p
+        cd.main(base + ["--out-dir", str(tmp_path / "c"), "--rule", "preregistered", "--w-p", f"{MODEL}=0.01"])
+    assert cd.main(base + ["--out-dir", str(tmp_path / "d"), "--rule", "preregistered"]) == 0
+    doc = json.loads((tmp_path / "d" / "decision.json").read_text())
+    assert doc["settings"]["rule"] == "preregistered" and "decision" in doc
+
+
+def test_dline_changing_the_holdout_cannot_change_the_training_comparison(tmp_path) -> None:
+    ds, groups = _synthetic(tmp_path, revision=2)
+    ds_flip, _ = _synthetic(tmp_path, flip_holdout=True, revision=2)
+    results = []
+    for d in (ds, ds_flip):
+        training, _, _ = cd.split_dataset(_cells(d, groups, rule=cd.RULE_DLINE), cd.PREREGISTERED)
+        frozen = cd.compare_dline(training, {MODEL: 0.01}, n_boot=4, seed=11, processes=1)
+        results.append(json.dumps(frozen.selection, sort_keys=True, default=str))
+    assert results[0] == results[1]
