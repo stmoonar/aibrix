@@ -29,6 +29,7 @@ from tre_replayer.traces.loader import load_trace_segments
 from scripts import adaptive_boundary as boundary
 from scripts import calibration_campaign as campaign
 from scripts import calibration_dataset as dataset
+from tre_common import slo_labels
 from scripts import calibration_design as design
 from scripts import calibration_ladder as ladder
 from scripts import gen_calibration_schedules as gen
@@ -358,9 +359,12 @@ def test_an_inconclusive_probe_is_re_driven_longer_then_stops(tmp_path) -> None:
 def _windows(start_ms, seconds, *, tpot=10.0, ttft=100.0, step_ms=5000):
     rows, w = [], start_ms
     while w + 30000 <= start_ms + int(seconds * 1000):
+        # the per-request evidence the primary (slowdown) label reads: 50 requests of
+        # 256 prompt tokens at this TTFT (SLO max(500, 5 * idle(256)) = 500 ms)
         rows.append({"window_start_ms": w, "window_end_ms": w + 30000,
                      "p95_ttft_client_ms": ttft, "p95_tpot_client_ms": tpot,
-                     "completed_requests": 50})
+                     "completed_requests": 50,
+                     "ttft_len_samples": slo_labels.format_ttft_len_samples([(ttft, 256)] * 50)})
         w += step_ms
     return rows
 
