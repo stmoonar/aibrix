@@ -434,6 +434,10 @@ class Settings:
     min_latency_samples: int
     percentile_mode: str
     registry_path: Path
+    #: The registry the label's idle TTFT fits come from. Not the run's recorded registry:
+    #: a run made before the D6' fits existed has none, and the label is this code's, not
+    #: the capture's. Default: the repository's registry.yaml.
+    label_registry_path: Path = Path(__file__).resolve().parents[1] / "registry.yaml"
     window_align: str = DEFAULT_WINDOW_ALIGN
     min_completed_requests: int = slo_labels.DEFAULT_MIN_COMPLETED_REQUESTS
     #: How the run's own online CSVs were windowed and labelled (what it recorded), for
@@ -449,7 +453,8 @@ class Settings:
         return slo_labels.slo_targets(ttft_slo_ms=self.ttft_slo_ms, tpot_slo_ms=self.tpot_slo_ms)
 
     def primary_label(self, model: str, registry) -> slo_labels.LabelDefinition:
-        """The primary (D6') label of ``model``: its idle TTFT fit from ``registry``."""
+        """The primary (D6') label of ``model``: its idle TTFT fit from ``registry`` (the
+        label registry, :attr:`label_registry_path`)."""
         return slo_labels.label_def_for_model(
             model, ttft_p95_ms=self.ttft_slo_ms, tpot_p95_ms=self.tpot_slo_ms,
             min_completed_requests=self.min_completed_requests, registry=registry,
@@ -528,6 +533,10 @@ def _settings_for(campaigns: Sequence[Path], overrides: dict) -> tuple[Settings,
             or registry
             or Path(__file__).resolve().parents[1] / "registry.yaml"
         ),
+        label_registry_path=Path(
+            overrides.get("label_registry")
+            or Path(__file__).resolve().parents[1] / "registry.yaml"
+        ),
     )
     return settings, provenances
 
@@ -604,6 +613,7 @@ def build_dataset(
     discrepancies: list[str] = []
     settings, provenances = _settings_for(campaigns, overrides or {})
     registry = load_registry(str(settings.registry_path))
+    label_registry = load_registry(str(settings.label_registry_path))
 
     staging = out_dir.with_name(f".{out_dir.name}.building")
     if staging.exists():
@@ -634,13 +644,13 @@ def build_dataset(
                 if attempt.model and attempt.model not in labels_by_model:
                     models_seen.append(attempt.model)
                     labels_by_model[attempt.model] = slo_labels.label_definition(
-                        settings.primary_label(attempt.model, registry),
+                        settings.primary_label(attempt.model, label_registry),
                         min_latency_samples=settings.min_latency_samples,
                         window_membership=settings.membership(),
                     )
                 converted = _convert_attempt(
                     attempt, run_dir, settings, registry, plan_cells, discrepancies,
-                    fixed_min_n_diffs,
+                    fixed_min_n_diffs, label_registry=label_registry,
                 )
                 cell_rows.append(converted["cell"])
                 manifest_cells.append(converted["manifest"])
@@ -693,6 +703,11 @@ def build_dataset(
         },
         "run_root": str(run_dir),
         "campaigns": provenances,
+        "registry_used_for_labels": {
+            "path": str(settings.label_registry_path),
+            "sha256": _sha256(settings.label_registry_path),
+            "note": "the idle TTFT fit (slo.ttft_idle_c_ms / b) of every model's D6' label",
+        },
         "registry_used_for_signal_columns": {
             "path": str(settings.registry_path),
             "sha256": _sha256(settings.registry_path),
@@ -770,7 +785,7 @@ def _probe_summary(probe: dict, manifest_cells: Sequence[dict], search: dict) ->
 
 
 def _convert_attempt(attempt, run_dir, settings, registry, plan_cells, discrepancies,
-                     fixed_min_n_diffs: Optional[dict] = None) -> dict:
+                     fixed_min_n_diffs: Optional[dict] = None, *, label_registry=None) -> dict:
     guard = attempt.guard
     void_reasons = [str(r) for r in (guard.get("void_reasons") or [])]
     if attempt.raw_path is not None and attempt.raw_path.name.endswith(r3_grid.VOID_RAW_SUFFIX):
@@ -824,7 +839,7 @@ def _convert_attempt(attempt, run_dir, settings, registry, plan_cells, discrepan
             cell = None
             discrepancies.append(f"{attempt.stem}: cell id {attempt.cell_id!r} does not parse")
         if cell is not None:
-            primary = settings.primary_label(attempt.model, registry)
+            primary = settings.primary_label(attempt.model, label_registry or registry)
             windows = rewindow_from_raw.label_cell(
                 records, instants, cell, registry.model(attempt.model),
                 label=primary,
@@ -1091,6 +1106,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("run_dir", type=Path, help="a campaign --out-dir, or a directory of them")
     ap.add_argument("--out-dir", type=Path, default=None,
                     help=f"where to write (default: <run_dir>/{DATASET_DIR})")
+    ap.add_argument("--label-registry", default=None,
+                    help="registry the D6' labels' idle TTFT fits come from (default: the "
+                         "repository's)")
     ap.add_argument("--registry", default=None,
                     help="registry whose trs parameters fill the signal columns (default: "
                          "the one the run recorded, else the repository's)")
@@ -1104,7 +1122,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--min-completed-requests", type=int, default=None)
     args = ap.parse_args(argv)
     out = build_dataset(args.run_dir, out_dir=args.out_dir, overrides={
-        "registry": args.registry, "window_ms": args.window_ms, "step_ms": args.step_ms,
+        "registry": args.registry, "label_registry": args.label_registry,
+        "window_ms": args.window_ms, "step_ms": args.step_ms,
         "ttft_slo_ms": args.ttft_slo_ms, "tpot_slo_ms": args.tpot_slo_ms,
         "min_latency_samples": args.min_latency_samples,
         "window_align": args.window_align, "min_completed_requests": args.min_completed_requests,
