@@ -662,9 +662,42 @@ def stage_aggregate(out: Path, registry: str) -> None:
                                         for m, s in summary["per_model"].items()}}, indent=1))
 
 
+def stage_mdecomp(out: Path) -> None:
+    """Post-hoc disclosure (added after the pre-registration, selects nothing): the freeze
+    parameters on the accept stage's own M validation CSVs, split by primitive (hold vs
+    steps / ramp / bursts) - where the M acceptance failure came from."""
+    acc = json.loads(ACCEPT.read_text())
+    freeze = json.loads(FREEZE.read_text())
+    res = {}
+    for m in MODELS:
+        csvp = Path(acc["models"][m]["validation_csv"])
+        prim = {}
+        with open(csvp, newline="", encoding="utf-8") as fh:
+            for r in csv.DictReader(fh):
+                prim[r["scenario_id"]] = r["primitive"]
+        s = Scored(freeze["models"][m]["verdict_for_holdout"], csvp)
+        idx_all = list(range(len(s.windows)))
+        groups = {"all": idx_all,
+                  "hold": [i for i in idx_all if prim[s.windows[i].scenario_id] == "hold"],
+                  "dynamic": [i for i in idx_all if prim[s.windows[i].scenario_id] != "hold"]}
+        for p in sorted(set(prim.values())):
+            groups[p] = [i for i in idx_all if prim[s.windows[i].scenario_id] == p]
+        res[m] = {g: point_metrics(s, ii) for g, ii in groups.items() if ii}
+    (out / "M_decomposition_freeze.json").write_text(json.dumps(
+        {"what": stage_mdecomp.__doc__, "generated_at_utc": now(), "accept_sha256": sha(ACCEPT), "models": res},
+        indent=1, default=str))
+    for m, g in res.items():
+        for k, p in g.items():
+            print(m, k, p["cells"], p["windows"], p["violating"], p["both_tpot_windows"],
+                  "BA", None if p["ba"] is None else round(p["ba"], 3), "AUC", None if p["auroc"] is None else round(p["auroc"], 3),
+                  "rec0", None if p["nodwell"]["recall_both_tpot"] is None else round(p["nodwell"]["recall_both_tpot"], 3),
+                  "fa0", None if p["nodwell"]["false_alarm"] is None else round(p["nodwell"]["false_alarm"], 3),
+                  "ceilZ1", None if p["recall_ceiling_z_lt_1_both_tpot"] is None else round(p["recall_ceiling_z_lt_1_both_tpot"], 3))
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("stage", choices=["prereg", "run", "aggregate"])
+    ap.add_argument("stage", choices=["prereg", "run", "aggregate", "mdecomp"])
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--seed", type=int, default=PRIMARY_SEED)
     ap.add_argument("--model", default=None)
@@ -674,6 +707,8 @@ def main(argv=None) -> int:
         stage_prereg(a.out, a.registry)
     elif a.stage == "run":
         stage_run(a.out, a.seed, a.model, a.registry)
+    elif a.stage == "mdecomp":
+        stage_mdecomp(a.out)
     else:
         stage_aggregate(a.out, a.registry)
     return 0
