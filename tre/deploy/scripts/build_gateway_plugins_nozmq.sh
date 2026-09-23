@@ -41,7 +41,9 @@ trap 'rm -rf "$CTX"' EXIT
 export PATH="$PATH:/usr/local/go/bin"
 echo "[build] go build ($GO_TOOLCHAIN, -tags=nozmq, CGO_ENABLED=0, -trimpath) at $SHA"
 GOTOOLCHAIN="$GO_TOOLCHAIN" GOPROXY="${GOPROXY:-off}" CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
-  go build -tags=nozmq -trimpath -o "$CTX/gateway-plugins" cmd/plugins/main.go
+  go build -tags=nozmq -trimpath -o "$CTX/gateway-plugins" ./cmd/plugins
+# Package path (not cmd/plugins/main.go) so the binary is stamped with vcs.revision /
+# vcs.modified, as the 0d869b49 build was; verify with: go version -m <binary>.
 
 cat > "$CTX/Dockerfile" <<EOF
 FROM ${BASE_IMAGE}
