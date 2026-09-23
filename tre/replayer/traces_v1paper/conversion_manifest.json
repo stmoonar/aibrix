@@ -1,0 +1,128 @@
+[
+  {
+    "trace_name": "Alternating_hot_model_periodic_A",
+    "source_path": "/data/nfs_shared_data/xxy/trace_output/output_traces_v14/tre/Alternating_hot_model_periodic_A/traces.json",
+    "source_sha256": "b1b52560fe1b37541e037ae71b11460670975a70b5176ceddc3ad9b6e1aa7c4e",
+    "source_arm": "tre",
+    "request_count": 12330,
+    "model_request_counts": {
+      "dsllama-8b": 4764,
+      "dsqwen-7b": 5044,
+      "dsqwen-14b": 2522
+    },
+    "duration_s": 720.8233507540598,
+    "bin_width_s": 1,
+    "token_rule": "fixed_bin_mean",
+    "output_path": "replayer/traces_v1paper/Alternating_hot_model_periodic_A/trace.json",
+    "output_sha256": "8e261b8a8126efb76adc9d07bceb5bcf6d848dfe78d6e992725e07823ecd0e9b",
+    "segment_count": 2163
+  },
+  {
+    "trace_name": "Decode_heavy_burst",
+    "source_path": "/data/nfs_shared_data/xxy/trace_output/output_traces_v14/tre/Decode_heavy_burst/traces.json",
+    "source_sha256": "7fdf5023c3091c7f420b64e843d3afc7af8962e2120319cc9ef2cde088488ec0",
+    "source_arm": "tre",
+    "request_count": 21742,
+    "model_request_counts": {
+      "dsllama-8b": 7728,
+      "dsqwen-7b": 7728,
+      "dsqwen-14b": 6286
+    },
+    "duration_s": 720.8645674182206,
+    "bin_width_s": 1,
+    "token_rule": "fixed_bin_mean",
+    "output_path": "replayer/traces_v1paper/Decode_heavy_burst/trace.json",
+    "output_sha256": "b181a87d0ea061b6cd1bdabd47bd4bf921fe494b73cf6a42b254c1a3ecee097c",
+    "segment_count": 2163
+  },
+  {
+    "trace_name": "Prefill_mixed_corner_decode_mix",
+    "source_path": "/data/nfs_shared_data/xxy/trace_output/output_traces_v14/tre/Prefill_mixed_corner_decode_mix/traces.json",
+    "source_sha256": "3fcd036afd0e5a2ea1b35e4cb30a46d021152eb3e6edf7aa75a368cc7c4a0338",
+    "source_arm": "tre",
+    "request_count": 10430,
+    "model_request_counts": {
+      "dsllama-8b": 3732,
+      "dsqwen-7b": 4494,
+      "dsqwen-14b": 2204
+    },
+    "duration_s": 720.7975477987117,
+    "bin_width_s": 1,
+    "token_rule": "fixed_bin_mean",
+    "output_path": "replayer/traces_v1paper/Prefill_mixed_corner_decode_mix/trace.json",
+    "output_sha256": "d2154645f62c585e453619d4924f5b0fb5614fbee295a7462e18c779ea10a39d",
+    "segment_count": 2163
+  },
+  {
+    "trace_name": "Simultaneous_spike_ramp_twice_tps1o2",
+    "source_path": "/data/nfs_shared_data/xxy/trace_output/output_traces_v14/tre/Simultaneous_spike_ramp_twice_tps1o2/traces.json",
+    "source_sha256": "f2422a51eaa0ac15f930d3a6641c6ce6bda7f38c6f03452a51e8ae25cabf60c2",
+    "source_arm": "tre",
+    "request_count": 5120,
+    "model_request_counts": {
+      "dsllama-8b": 2005,
+      "dsqwen-7b": 1964,
+      "dsqwen-14b": 1151
+    },
+    "duration_s": 720.8435071413929,
+    "bin_width_s": 1,
+    "token_rule": "fixed_bin_mean",
+    "output_path": "replayer/traces_v1paper/Simultaneous_spike_ramp_twice_tps1o2/trace.json",
+    "output_sha256": "0dabbdfd9e615e73b5008e339ad3a8e9762e1772317ec27f68f4a448a6ff0659",
+    "segment_count": 2163
+  },
+  {
+    "trace_name": "Sinusoidal_demand",
+    "source_path": "/data/nfs_shared_data/xxy/trace_output/output_traces_v14/tre/Sinusoidal_demand/traces.json",
+    "source_sha256": "731947f54fe2d0e7de7e7970d25ca444aa1ba9409e02c665f2ad4245f2fa0e6f",
+    "source_arm": "tre",
+    "request_count": 21632,
+    "model_request_counts": {
+      "dsllama-8b": 8652,
+      "dsqwen-7b": 7212,
+      "dsqwen-14b": 5768
+    },
+    "duration_s": 720.815872793497,
+    "bin_width_s": 1,
+    "token_rule": "fixed_bin_mean",
+    "output_path": "replayer/traces_v1paper/Sinusoidal_demand/trace.json",
+    "output_sha256": "7511eea4c52c81f2bf46662540c6cec43ccfb15fa2d279c1d10027b8131726d7",
+    "segment_count": 2163
+  },
+  {
+    "trace_name": "Real_code_2024_slice_a_tok70",
+    "source_path": "/data/nfs_shared_data/xxy/trace_output/output_traces_v14/tre/Real_code_2024_slice_a_tok70/traces.json",
+    "source_sha256": "2e7075bacb22a4df98a7c835f851ab8209f37200979b029523d92205bf69626b",
+    "source_arm": "tre",
+    "request_count": 43083,
+    "model_request_counts": {
+      "dsllama-8b": 18295,
+      "dsqwen-7b": 18780,
+      "dsqwen-14b": 6008
+    },
+    "duration_s": 719.9728918089666,
+    "bin_width_s": 1,
+    "token_rule": "sampled_log_uniform",
+    "output_path": "replayer/traces_v1paper/Real_code_2024_slice_a_tok70/trace.json",
+    "output_sha256": "872b2492eb52a9b752ccd26abae643321ff0b392ef9c7c82a99f7fe3b2f1968f",
+    "segment_count": 2160
+  },
+  {
+    "trace_name": "Real_conv_2023_slice_a_tok70",
+    "source_path": "/data/nfs_shared_data/xxy/trace_output/output_traces_v14/tre/Real_conv_2023_slice_a_tok70/traces.json",
+    "source_sha256": "4f8ce83471ea39034b3b2d2aa677a56ea99e036854a734b936f30ecd20de8ca7",
+    "source_arm": "tre",
+    "request_count": 45244,
+    "model_request_counts": {
+      "dsllama-8b": 17360,
+      "dsqwen-7b": 16944,
+      "dsqwen-14b": 10940
+    },
+    "duration_s": 719.9571453269187,
+    "bin_width_s": 1,
+    "token_rule": "sampled_log_uniform",
+    "output_path": "replayer/traces_v1paper/Real_conv_2023_slice_a_tok70/trace.json",
+    "output_sha256": "5b2793609431f944413bbdac5b64549e5735c30b078ca4f903a585d107aa6504",
+    "segment_count": 2160
+  }
+]

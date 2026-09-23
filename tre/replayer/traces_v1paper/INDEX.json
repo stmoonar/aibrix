@@ -1,0 +1,16 @@
+{
+  "version": "traceset-v1paper",
+  "notes": [
+    "7 traces converted from the ICSE-submission traces_v14 realised per-request plans (/data/nfs_shared_data/xxy/trace_output/output_traces_v14/tre/<trace>/traces.json), preserving exact per-model request counts and per-second arrival rate.",
+    "Token shapes are binned to v2's segment schema (fixed value or log-uniform range per 1s bin); see scripts/convert_v1_paper_traces.py module docstring and README.md for the exact rule and its documented approximation."
+  ],
+  "workloads": [
+    "Alternating_hot_model_periodic_A",
+    "Decode_heavy_burst",
+    "Prefill_mixed_corner_decode_mix",
+    "Simultaneous_spike_ramp_twice_tps1o2",
+    "Sinusoidal_demand",
+    "Real_code_2024_slice_a_tok70",
+    "Real_conv_2023_slice_a_tok70"
+  ]
+}
