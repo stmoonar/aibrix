@@ -356,13 +356,14 @@ def test_an_inconclusive_probe_is_re_driven_longer_then_stops(tmp_path) -> None:
     assert stuck.anchor_rho is None
 
 
-def _windows(start_ms, seconds, *, tpot=10.0, ttft=100.0, step_ms=5000):
+def _windows(start_ms, seconds, *, tpot=10.0, ttft=100.0, step_ms=5000, running=6.0):
     rows, w = [], start_ms
     while w + 30000 <= start_ms + int(seconds * 1000):
         # the per-request evidence the primary (slowdown) label reads: 50 requests of
         # 256 prompt tokens at this TTFT (SLO max(500, 5 * idle(256)) = 500 ms)
         rows.append({"window_start_ms": w, "window_end_ms": w + 30000,
                      "p95_ttft_client_ms": ttft, "p95_tpot_client_ms": tpot,
+                     "avg_running": running,
                      "completed_requests": 50,
                      "ttft_len_samples": slo_labels.format_ttft_len_samples([(ttft, 256)] * 50)})
         w += step_ms
@@ -414,6 +415,44 @@ def test_sentinel_drift_is_judged_against_the_first_sentinel() -> None:
     assert drift["flagged"] is True and drift["checks"][1]["median_p95_tpot_relative"] == 0.3
     unmeasured = design.sentinel_summary([], {"void_reasons": ["x"]}, warmup_s=60.0)
     assert design.sentinel_drift([same, unmeasured, same])["flagged"] is None
+    assert same["median_running"] == 6.0
+
+
+def test_sentinel_drift_flags_on_tpot_and_running_not_on_ttft_or_violations() -> None:
+    # The run-2 diagnosis: at the knee TTFT and the violating fraction swing on noise, so
+    # they are reported, never judged; TPOT p95 and the running median are the criteria.
+    assert set(design.SENTINEL_DRIFT_THRESHOLDS) == {
+        "median_p95_tpot_relative", "median_running_relative"}
+    start = 1_790_000_000_000
+    guard = {"start_ms": start, "void_reasons": []}
+    ref = design.sentinel_summary(_windows(start, 240), guard, warmup_s=60.0)
+    fuller = design.sentinel_summary(_windows(start, 240, running=8.0), guard, warmup_s=60.0)
+    drift = design.sentinel_drift([ref, fuller])
+    assert drift["flagged"] is True
+    assert drift["checks"][0]["median_running_relative"] == pytest.approx(1 / 3, abs=1e-3)
+    # every window over the TTFT SLO: violating fraction 0 -> 1, TTFT x 20 - not flagged
+    late = design.sentinel_summary(_windows(start, 240, ttft=2000.0), guard, warmup_s=60.0)
+    assert late["violating_fraction"] == 1.0
+    quiet = design.sentinel_drift([ref, late])
+    assert quiet["flagged"] is False
+    assert quiet["checks"][0]["violating_fraction_absolute"] == 1.0
+    assert quiet["checks"][0]["median_p95_ttft_relative"] == 19.0
+    assert set(quiet["informational"]) == set(design.SENTINEL_INFORMATIONAL)
+    # a sentinel without the running column cannot be judged on it: undetermined
+    blind = [{k: v for k, v in r.items() if k != "avg_running"} for r in _windows(start, 240)]
+    no_running = design.sentinel_summary(blind, guard, warmup_s=60.0)
+    assert design.sentinel_drift([ref, no_running])["flagged"] is None
+
+
+def test_sentinels_sit_on_the_measured_rho_star_not_the_prior(tmp_path) -> None:
+    assert 0.70 <= design.SENTINEL_RHO_FACTOR <= 0.75
+    _factory, plan = _plan(tmp_path)
+    assert [c.position for c in plan.sentinels] == list(design.SENTINEL_POSITIONS)
+    for cell in plan.sentinels:
+        assert cell.shape == design.SENTINEL_SHAPE and cell.rho is None
+        assert cell.rho_factor == design.SENTINEL_RHO_FACTOR
+    design.anchor_cells(plan.sentinels, {design.SENTINEL_SHAPE: 1.4})
+    assert [c.rho for c in plan.sentinels] == [pytest.approx(design.SENTINEL_RHO_FACTOR * 1.4)] * 3
 
 
 # --------------------------------------------------------------------------- drain
@@ -546,11 +585,14 @@ def test_the_run_follows_the_preregistered_order(tmp_path) -> None:
     code, fake = _run(tmp_path)
     assert code == 0
     roles = [r for r, *_ in fake.driven]
-    assert roles[0] == "sentinel" and roles[-1] == "sentinel"
+    # stage 0 first: the first sentinel is placed on the rho* it measures
+    assert roles[0] == "boundary" and roles[-1] == "sentinel"
+    first_sentinel = roles.index("sentinel")
     first_ladder = roles.index("ladder")
-    assert set(roles[1:first_ladder]) == {"boundary"}  # every search done before the ladder
+    assert set(roles[:first_sentinel]) == {"boundary"}  # every search done before it
+    assert first_ladder == first_sentinel + 1
     assert "boundary" not in roles[first_ladder:]
-    middle = roles.index("sentinel", 1)
+    middle = roles.index("sentinel", first_sentinel + 1)
     assert roles[first_ladder:middle].count("ladder") == 48  # half of the rounds
     last_ladder = max(i for i, r in enumerate(roles) if r == "ladder")
     ramps = [i for i, r in enumerate(roles) if r == "ramp"]
@@ -558,6 +600,11 @@ def test_the_run_follows_the_preregistered_order(tmp_path) -> None:
     supplement = [i for i, r in enumerate(roles) if r == "adaptive"]
     assert supplement and min(supplement) > max(ramps)
     assert roles.count("ladder") == 96 and roles.count("sentinel") == 3
+    # every sentinel at SENTINEL_RHO_FACTOR x the rho* stage 0 found for its shape
+    result = json.loads((tmp_path / "out" / ladder.DESIGN_RESULT).read_text())["models"][0]
+    anchor = result["anchors"][design.SENTINEL_SHAPE]
+    sentinel_rhos = [rho for r, _s, _c, _a, rho in fake.driven if r == "sentinel"]
+    assert sentinel_rhos == [pytest.approx(design.SENTINEL_RHO_FACTOR * anchor, abs=1e-6)] * 3
     # every shape searched, and stage 0 interleaves them rather than finishing one first
     boundary_shapes = [s for r, s, *_ in fake.driven if r == "boundary"]
     assert set(boundary_shapes) == set(gen.ALL_SHAPES)
@@ -654,6 +701,8 @@ def test_the_run_manifest_freezes_every_preregistered_parameter(tmp_path) -> Non
     assert pre["label"]["supersedes"]["preregistered"]["min_window_requests"] == 10
     assert pre["label"]["supersedes"]["preregistered"]["step_ms"] == 5000
     assert pre["sentinel"]["drift_thresholds"] == design.SENTINEL_DRIFT_THRESHOLDS
+    assert pre["sentinel"]["rho_factor_of_measured_anchor"] == design.SENTINEL_RHO_FACTOR
+    assert "stage 0" in manifest["sentinel_rule"][MODEL]
     assert manifest["design_seed"] == 20260923
     assert manifest["regime_groups"]["groups"][MODEL]["decode"] == ["S4", "S5"]
     assert manifest["rho_priors"]["parsed"][f"{MODEL}/S1"]["search_max"] == 2.6

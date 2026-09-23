@@ -9,9 +9,10 @@ preregistration fixes.
 
 Order of one model's run
 ------------------------
-1. sentinel 1 (fixed shape and rho, see ``calibration_design.SENTINEL_*``)
-2. stage 0 - the prior-guided boundary search of **every** shape, round-robin over the
+1. stage 0 - the prior-guided boundary search of **every** shape, round-robin over the
    shapes, so every shape has its rho* before the first ladder cell
+2. sentinel 1 (fixed shape, ``calibration_design.SENTINEL_RHO_FACTOR`` x the rho* stage 0
+   measured for it - which is why it no longer runs first)
 3. stage 1 - the ladder, in its interleaved rounds; sentinel 2 after half of the rounds
 4. stage 2 - one ramp per shape, in random order
 5. stage 3 - supplementary cells, decided from the ladder's measured labels
@@ -82,9 +83,10 @@ class CampaignStopped(RuntimeError):
 # --------------------------------------------------------------------------- checks
 
 
-def check_args_against_preregistration(args) -> None:
+def check_label_args(args) -> None:
     """The label parameters are fixed by the design (the D-line's since 2026-09-23, see
-    ``calibration_design``), not by the command line."""
+    ``calibration_design``), not by the command line - for every collection that is
+    judged on, or pooled with, the ladder's cells."""
     fixed = (
         ("--window-ms", args.window_ms, design.WINDOW_MS),
         ("--fit-step-ms", args.fit_step_ms, design.STEP_MS),
@@ -101,6 +103,11 @@ def check_args_against_preregistration(args) -> None:
         wrong.append(f"--fit-window-align={align} (fixed by the design at {design.WINDOW_ALIGN})")
     if wrong:
         raise SystemExit("refusing to start: " + "; ".join(wrong))
+
+
+def check_args_against_preregistration(args) -> None:
+    """:func:`check_label_args`, and the ladder's own inputs."""
+    check_label_args(args)
     if not getattr(args, "rho_priors", None):
         raise SystemExit("refusing to start: the ladder design needs --rho-priors")
     if not getattr(args, "regime_groups", None):
@@ -387,7 +394,7 @@ class LadderRun:
     def run_sentinel(self, index: int) -> None:
         cell = self.plan.sentinels[index]
         print(f"[{self.model}] sentinel {index + 1} ({cell.position}): "
-              f"{cell.shape} rho={cell.rho}", flush=True)
+              f"{cell.shape} rho={cell.rho} ({cell.rho_factor} x rho*)", flush=True)
         rows, guard, _record = self.drive_cell(cell)
         summary = design.sentinel_summary(
             rows, guard, warmup_s=cell.warmup_s, label=self.label,
@@ -403,40 +410,7 @@ class LadderRun:
         for shape in order:
             self.searches[shape] = design.PriorGuidedSearch.from_prior(
                 self.priors.get(self.model, shape))
-        current: dict[str, design.DesignCell] = {}
-        while True:
-            progressed = False
-            for shape in order:
-                search = self.searches[shape]
-                probe = search.next_probe()
-                if probe is None:
-                    continue
-                progressed = True
-                if probe.attempt > 1 and shape in current:
-                    cell = current[shape]  # a re-drive is another attempt of the same cell
-                    cell.duration_s = probe.duration_s
-                else:
-                    cell = self.factory.new(shape, design.ROLE_BOUNDARY, probe.duration_s,
-                                            rho=probe.rho, stage=probe.stage)
-                    current[shape] = cell
-                print(f"[{self.model}] boundary {shape} {probe.stage} rho={probe.rho:g} "
-                      f"attempt {probe.attempt}", flush=True)
-                rows, guard, record = self.drive_attempt(cell, probe.attempt)
-                if record["void_reasons"]:
-                    result = boundary.ProbeResult(
-                        probe=probe, verdict=boundary.VERDICT_VOID,
-                        void_reasons=tuple(record["void_reasons"]), windows=len(rows),
-                        cell_id=cell.cell_id)
-                else:
-                    result = boundary.ProbeResult(
-                        probe=probe, verdict=record["verdict"], windows=len(rows),
-                        labeled_windows=record["labeled_windows"] or 0,
-                        independent_windows=record["independent_windows"] or 0,
-                        violating_windows=record["violating_windows"] or 0,
-                        cell_id=cell.cell_id)
-                search.record(result)
-            if not progressed:
-                break
+        self.drive_searches(order)
         for shape in order:
             search = self.searches[shape]
             if search.stopped_reason and search.last_verdict == boundary.VERDICT_VOID:
@@ -455,6 +429,50 @@ class LadderRun:
             print(f"[{self.model}] {shape}: rho* anchor {anchor:g} "
                   f"({self.anchor_sources[shape]}; boundary_found={search.boundary_found})",
                   flush=True)
+
+    def drive_searches(self, order: Sequence[str]) -> None:
+        """Round-robin over ``order``: every shape's next probe in turn until every
+        search in ``self.searches`` is done."""
+        current: dict[str, design.DesignCell] = {}
+        while True:
+            progressed = False
+            for shape in order:
+                search = self.searches[shape]
+                probe = search.next_probe()
+                if probe is None:
+                    continue
+                progressed = True
+                self.drive_probe(shape, search, probe, current)
+            if not progressed:
+                break
+
+    def drive_probe(self, shape: str, search, probe: boundary.Probe,
+                    current: dict) -> None:
+        """Drive one probe of ``search`` and record its verdict - the post-warm-up
+        windows under the run's primary label (:func:`design.hold_cell_verdict`)."""
+        if probe.attempt > 1 and shape in current:
+            cell = current[shape]  # a re-drive is another attempt of the same cell
+            cell.duration_s = probe.duration_s
+        else:
+            cell = self.factory.new(shape, design.ROLE_BOUNDARY, probe.duration_s,
+                                    rho=probe.rho, stage=probe.stage)
+            current[shape] = cell
+        print(f"[{self.model}] boundary {shape} {probe.stage} rho={probe.rho:g} "
+              f"attempt {probe.attempt}", flush=True)
+        rows, _guard, record = self.drive_attempt(cell, probe.attempt)
+        if record["void_reasons"]:
+            result = boundary.ProbeResult(
+                probe=probe, verdict=boundary.VERDICT_VOID,
+                void_reasons=tuple(record["void_reasons"]), windows=len(rows),
+                cell_id=cell.cell_id)
+        else:
+            result = boundary.ProbeResult(
+                probe=probe, verdict=record["verdict"], windows=len(rows),
+                labeled_windows=record["labeled_windows"] or 0,
+                independent_windows=record["independent_windows"] or 0,
+                violating_windows=record["violating_windows"] or 0,
+                cell_id=cell.cell_id)
+        search.record(result)
 
     def _write_search(self, shape: str) -> None:
         body = self.searches[shape].as_dict()
@@ -500,9 +518,12 @@ class LadderRun:
             self.drive_cell(cell)
 
     def run(self, shapes: Sequence[str] = gen.ALL_SHAPES) -> None:
-        self.run_sentinel(0)
         self.run_boundary_stage(shapes)
-        design.anchor_cells(self.plan.ladder + self.plan.ramps, self.anchors)
+        # The sentinels sit on the measured rho* (calibration_design.SENTINEL_RHO_FACTOR),
+        # so the first one runs after stage 0, not before it.
+        design.anchor_cells(self.plan.sentinels + self.plan.ladder + self.plan.ramps,
+                            self.anchors)
+        self.run_sentinel(0)
         half = len(self.plan.ladder_rounds) // 2
         self.run_ladder_rounds(self.plan.ladder_rounds[:half])
         self.run_sentinel(1)
@@ -566,7 +587,7 @@ def build_plan_documents(args, models: Sequence[str], priors: design.RhoPriors,
         "models": list(models),
         "cooldown_floor_s": args.cooldown_s,
         "static_plan": static_cells,
-        "sentinel_rho": {m: p.sentinel_rho for m, (_f, p) in plans.items()},
+        "sentinel_rule": {m: p.sentinel_rule for m, (_f, p) in plans.items()},
         "provenance": campaign.run_provenance(args),
         "admission_cap": cap.as_dict(),
     }

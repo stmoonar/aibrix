@@ -33,8 +33,14 @@ What the preregistration fixes (section numbers are the document's)
 * **§7.3 stage 3** - :func:`supplement_plan`: from the ladder's *measured* labels (not
   its rho), a shape with fewer than four violating or fewer than four healthy cells in
   [0.85, 1.15] rho* gets two more cells next to its empirical boundary.
-* **§7.3 sentinels** - one fixed (shape, rho) cell at the start, the middle and the end;
-  :func:`sentinel_drift` compares them against :data:`SENTINEL_DRIFT_THRESHOLDS`.
+* **§7.3 sentinels** - one fixed (shape, rho) cell after stage 0, in the middle and at the
+  end; :func:`sentinel_drift` compares them against :data:`SENTINEL_DRIFT_THRESHOLDS`.
+  *Revised 2026-09-23 after the run-2 drift diagnosis* (``run2_drift_analysis/``): the
+  sentinel sits at :data:`SENTINEL_RHO_FACTOR` x the rho* stage 0 **measured**, not at
+  0.9 x the first-round prior - which put 7b / 8b on or above their knee, where TTFT has
+  20-40x the elasticity it has at 0.7 rho* and a repeat of one cell is bistable - so the
+  first sentinel runs after stage 0, and drift is judged on TPOT p95 and the running
+  median, not on the violating fraction.
 * **§2-§6 analysis parameters** - :func:`preregistered_parameters` is the block the
   campaign writes into its frozen run manifest before the first cell.
 
@@ -136,19 +142,39 @@ SUPPLEMENT_FACTORS = {
     "both": (0.94, 1.06),       # short of both: one on each side
 }
 
-#: The sentinel: fixed shape, fixed absolute rho (``SENTINEL_RHO_FACTOR`` x the shape's
-#: *prior* anchor, so it is known before any cell of this run has been driven and all
-#: three repeats run the same load whatever stage 0 finds).
+#: The sentinel: fixed shape, one absolute rho for all three repeats -
+#: ``SENTINEL_RHO_FACTOR`` x the rho* stage 0 *measured* for the shape (the ladder's
+#: anchor), so the first sentinel runs after stage 0.
+#:
+#: Why not the first-round prior (0.9 x, the preregistered placement): run 2 put the
+#: prior-anchored sentinel at 1.03 / 0.97 / 0.56 x the measured rho* for 7b / 8b / 14b.
+#: At the knee TTFT has 20-40x the elasticity it has at 0.7 rho*, and the knee is bistable
+#: (running reaches max-num-seqs and the queue grows without bound: one repeat 346 ms,
+#: the next 1303 ms), so the 7b / 8b sentinels amplified noise into "drift"; the 14b one,
+#: on the plateau, read the same three times. 0.72 is inside the 0.70-0.75 plateau band
+#: the diagnosis names.
 SENTINEL_SHAPE = "S2"
-SENTINEL_RHO_FACTOR = 0.90
+SENTINEL_RHO_FACTOR = 0.72
 SENTINEL_SECONDS = 240.0
-SENTINEL_POSITIONS = ("start", "middle", "end")
-#: A later sentinel drifted when it differs from the first by more than this.
+SENTINEL_POSITIONS = ("after_boundary", "middle", "end")
+#: A later sentinel drifted when it differs from the first by more than this. The
+#: criteria are TPOT p95 and the running median: both are smooth in rho on the plateau,
+#: where the violating fraction is ~0 by construction and TTFT p95 is dominated by
+#: prefill batching, so neither of those can see a slowdown there.
 SENTINEL_DRIFT_THRESHOLDS = {
     "median_p95_tpot_relative": 0.20,
-    "median_p95_ttft_relative": 0.50,
-    "violating_fraction_absolute": 0.35,
+    "median_running_relative": 0.25,
 }
+#: Reported for every later sentinel, never flagged on (see above).
+SENTINEL_INFORMATIONAL = ("median_p95_ttft_relative", "violating_fraction_absolute")
+
+#: The smoke cell of the boundary supplement (``scripts.calibration_supplement``): one
+#: hold at the located rho* (the ladder's anchor rule, the midpoint of the final
+#: bracket), judged on the same post-warm-up windows and label as every probe. Its
+#: violating-window fraction must land in this band; outside it the anchor the next
+#: stage would build on is off, and the run says so instead of carrying on.
+SMOKE_SECONDS = 300.0
+SMOKE_VIOLATING_BAND: tuple[float, float] = (0.20, 0.70)
 
 # ------------------------------------------------------------------- stage 0 (search)
 
@@ -174,7 +200,9 @@ ROLE_BOUNDARY = "boundary"
 ROLE_LADDER = "ladder"
 ROLE_RAMP = "ramp"
 ROLE_SUPPLEMENT = "adaptive"
-ROLES = (ROLE_SENTINEL, ROLE_BOUNDARY, ROLE_LADDER, ROLE_RAMP, ROLE_SUPPLEMENT)
+#: The boundary supplement's check hold at the located rho* (see SMOKE_SECONDS).
+ROLE_SMOKE = "smoke"
+ROLES = (ROLE_SENTINEL, ROLE_BOUNDARY, ROLE_LADDER, ROLE_RAMP, ROLE_SUPPLEMENT, ROLE_SMOKE)
 
 #: The ``stage`` values this design writes - the names the analysis
 #: (``scripts.analysis.calibration_decision.PREREGISTERED``) partitions on. A hold cell
@@ -191,11 +219,15 @@ STAGE_RAMP = ""
 TRAINING_HOLD_STAGES = frozenset({STAGE_LADDER, STAGE_ADAPTIVE})
 EXCLUDED_HOLD_STAGES = frozenset({STAGE_COARSE, STAGE_BISECT, STAGE_DWELL, STAGE_SENTINEL})
 #: Stage of every non-probe role (a probe's is coarse or bisect, set by the search).
+#: The smoke hold is a hold at the located boundary after the search - what the first
+#: round called a dwell - and like the dwell it is excluded from training: whether it
+#: trains is decided after the user has seen it, not by the collector.
 ROLE_STAGE = {
     ROLE_LADDER: STAGE_LADDER,
     ROLE_SUPPLEMENT: STAGE_ADAPTIVE,
     ROLE_SENTINEL: STAGE_SENTINEL,
     ROLE_RAMP: STAGE_RAMP,
+    ROLE_SMOKE: STAGE_DWELL,
 }
 
 SPLIT_TRAIN = "train"
@@ -210,10 +242,11 @@ PROFILE_RAMP = "ramp"
 def split_for(role: str, shape: str) -> str:
     """§5.2 / §5.3: every cell of M (its probes included - "M shape 的全部 cell") and every
     ramp are the pooled held-out set; ladder and adaptive cells of the seven training
-    shapes train; the training shapes' probes and the sentinels are neither."""
+    shapes train; the training shapes' probes, the sentinels and the smoke holds are
+    neither."""
     if gen.is_held_out(shape) or role == ROLE_RAMP:
         return SPLIT_HOLDOUT
-    if role in (ROLE_BOUNDARY, ROLE_SENTINEL):
+    if role in (ROLE_BOUNDARY, ROLE_SENTINEL, ROLE_SMOKE):
         return SPLIT_AUXILIARY
     return SPLIT_TRAIN
 
@@ -270,9 +303,15 @@ def preregistered_parameters() -> dict:
                        "factors_of_empirical_boundary": {
                            k: list(v) for k, v in SUPPLEMENT_FACTORS.items()},
                        "label": "measured cell verdict, not rho"},
-        "sentinel": {"shape": SENTINEL_SHAPE, "rho_factor_of_prior_anchor": SENTINEL_RHO_FACTOR,
+        "sentinel": {"shape": SENTINEL_SHAPE,
+                     "rho_factor_of_measured_anchor": SENTINEL_RHO_FACTOR,
                      "seconds": SENTINEL_SECONDS, "positions": list(SENTINEL_POSITIONS),
-                     "drift_thresholds": dict(SENTINEL_DRIFT_THRESHOLDS)},
+                     "first_after": "stage 0 (it is placed on the rho* stage 0 measured)",
+                     "drift_thresholds": dict(SENTINEL_DRIFT_THRESHOLDS),
+                     "informational": list(SENTINEL_INFORMATIONAL),
+                     "supersedes": "0.9 x the first-round prior anchor, first sentinel "
+                                   "before stage 0, violating fraction as a drift "
+                                   "criterion (run-2 drift diagnosis, 2026-09-23)"},
         "boundary_search": {
             "bracket_seconds": BRACKET_SECONDS, "bisect_seconds": BISECT_SECONDS,
             "bisect_rounds": BISECT_ROUNDS, "max_bracket_probes": MAX_BRACKET_PROBES,
@@ -706,12 +745,20 @@ class DesignCell:
 
 
 class CellFactory:
-    """Hands out cells with a fresh serial - and so a fresh id and fresh seeds - each."""
+    """Hands out cells with a fresh serial - and so a fresh id and fresh seeds - each.
 
-    def __init__(self, model: str, design_seed: int) -> None:
+    ``serial_base`` starts the serials of a later collection above an earlier one's, so
+    the two never share a cell id (and so never share seeds or prompts) when their data
+    is pooled; see ``calibration_supplement.SUPPLEMENT_SERIAL_BASE``.
+    """
+
+    def __init__(self, model: str, design_seed: int, *, serial_base: int = 0) -> None:
+        if not 0 <= int(serial_base) < MODEL_CODE_BLOCK:
+            raise ValueError(f"serial base {serial_base} out of range")
         self.model = model
         self.design_seed = int(design_seed)
-        self.serial = 0
+        self.serial_base = int(serial_base)
+        self.serial = int(serial_base)
 
     def new(self, shape: str, role: str, duration_s: float, **fields) -> DesignCell:
         if role not in ROLES:
@@ -844,7 +891,8 @@ class StaticPlan:
     sentinels: list[DesignCell]
     ladder_rounds: list[list[DesignCell]]
     ramps: list[DesignCell]
-    sentinel_rho: float
+    #: What the sentinels are placed on (their rho is known only after stage 0).
+    sentinel_rule: str = ""
 
     @property
     def ladder(self) -> list[DesignCell]:
@@ -863,17 +911,16 @@ def build_static_plan(
 ) -> StaticPlan:
     """Sentinels, the interleaved ladder and the ramps of one model, ids and seeds fixed.
 
-    Ladder and ramp loads are relative to rho*, which stage 0 has not measured yet; their
-    ``rho`` is filled in by :func:`anchor_cells` once it has.
+    Sentinel, ladder and ramp loads are relative to rho*, which stage 0 has not measured
+    yet; their ``rho`` is filled in by :func:`anchor_cells` once it has.
     """
     rng = random.Random(derived_seed(factory.design_seed, model, "ladder-order"))
-    prior = priors.get(model, SENTINEL_SHAPE)
-    sentinel_rho = round(SENTINEL_RHO_FACTOR * prior.anchor_rho, 6)
+    priors.get(model, SENTINEL_SHAPE)  # the sentinel shape must be searched in stage 0
+    rule = f"{SENTINEL_RHO_FACTOR} x the rho* stage 0 measures for {SENTINEL_SHAPE}"
     sentinels = [
-        factory.new(SENTINEL_SHAPE, ROLE_SENTINEL, SENTINEL_SECONDS, rho=sentinel_rho,
-                    replicate=i + 1, position=position,
-                    note=f"{SENTINEL_RHO_FACTOR} x the prior anchor "
-                         f"{prior.anchor_rho:g} of {SENTINEL_SHAPE}")
+        factory.new(SENTINEL_SHAPE, ROLE_SENTINEL, SENTINEL_SECONDS,
+                    rho_factor=SENTINEL_RHO_FACTOR, replicate=i + 1, position=position,
+                    note=rule)
         for i, position in enumerate(SENTINEL_POSITIONS)
     ]
     ladder_rounds = []
@@ -891,7 +938,7 @@ def build_static_plan(
         for shape in ramp_order
     ]
     return StaticPlan(sentinels=sentinels, ladder_rounds=ladder_rounds, ramps=ramps,
-                      sentinel_rho=sentinel_rho)
+                      sentinel_rule=rule)
 
 
 def anchor_cells(cells: Iterable[DesignCell], anchors: Mapping[str, float]) -> None:
@@ -916,6 +963,12 @@ class PriorGuidedSearch:
     the (healthy, violated) bracket ``bisect_rounds`` times. Void and inconclusive probes
     follow :mod:`scripts.adaptive_boundary`: re-driven once (an inconclusive one for twice
     as long), then the search stops.
+
+    ``grid`` (ascending, in the same rho units) replaces the multiplicative walk where it
+    reaches: the first probe is its lowest point, a healthy verdict moves to the next
+    grid point above, and the bracket stage ends at the first violation (then bisects).
+    Below the lowest grid point it steps down by ``step`` as usual; ``search_max`` is
+    the ceiling as usual (the boundary supplement sets it to the highest grid point).
     """
 
     model: str
@@ -930,6 +983,7 @@ class PriorGuidedSearch:
     max_bracket_probes: int = MAX_BRACKET_PROBES
     floor: float = RHO_FLOOR
     max_retries: int = boundary.MAX_VOID_RETRIES
+    grid: tuple[float, ...] = ()
 
     results: list = field(default_factory=list)
     healthy_rho: Optional[float] = None
@@ -997,7 +1051,7 @@ class PriorGuidedSearch:
                 )
                 return None
             if self.healthy_rho is None and self.violating_rho is None:
-                rho = self.start_rho
+                rho = self.grid[0] if self.grid else self.start_rho
             elif self.violating_rho is None:
                 if self.healthy_rho >= self.search_max * (1 - 1e-9):
                     self.exhausted = (
@@ -1005,7 +1059,9 @@ class PriorGuidedSearch:
                         "is above everything offered"
                     )
                     return None
-                rho = min(self.healthy_rho * self.step, self.search_max)
+                above = [g for g in self.grid if g > self.healthy_rho * (1 + 1e-9)]
+                rho = (min(above[0], self.search_max) if above
+                       else min(self.healthy_rho * self.step, self.search_max))
             else:
                 rho = self.violating_rho / self.step
                 if rho < self.floor:
@@ -1048,6 +1104,12 @@ class PriorGuidedSearch:
         else:
             self._bisect_done += 1
 
+    def status(self) -> dict:
+        """:func:`scripts.adaptive_boundary.rho_star_status` of this search's probes:
+        measured / lower_bound / upper_bound / grid_artifact, with the bracket. (Its
+        ``rho_star`` is the lowest violated load; :attr:`anchor_rho` is the midpoint.)"""
+        return boundary.rho_star_status([r.as_dict() for r in self.results])
+
     def as_dict(self) -> dict:
         return {
             "model": self.model,
@@ -1056,6 +1118,7 @@ class PriorGuidedSearch:
             "start_rho": self.start_rho,
             "search_max": self.search_max,
             "step": self.step,
+            "grid": list(self.grid),
             "prior_boundary_found": self.prior_found,
             "healthy_rho": self.healthy_rho,
             "violating_rho": self.violating_rho,
@@ -1223,8 +1286,10 @@ def sentinel_summary(
     ttft_slo_ms: float = TTFT_SLO_MS,
     tpot_slo_ms: float = TPOT_SLO_MS,
 ) -> dict:
-    """Median window p95s and violating fraction of one sentinel after its warm-up
-    (violating by ``label``, the run's primary label; the fixed pair without it)."""
+    """One sentinel after its warm-up: the median window TPOT p95 and the median of the
+    windows' mean ``running`` (the drift criteria), plus the median TTFT p95 and the
+    violating fraction by ``label`` (the run's primary label; the fixed pair without it),
+    which are reported but not judged on (see :data:`SENTINEL_DRIFT_THRESHOLDS`)."""
     if guard.get("void_reasons"):
         return {"measured": False, "why": "void"}
     targets = label if label is not None else slo_labels.slo_targets(
@@ -1235,53 +1300,102 @@ def sentinel_summary(
     if not labeled:
         return {"measured": False, "why": "no labelled window after the warm-up"}
 
-    def median(column: str) -> Optional[float]:
-        values = [float(r[column]) for r in labeled if r.get(column) not in (None, "")]
+    def median(column: str, over: Sequence[Mapping]) -> Optional[float]:
+        values = [float(r[column]) for r in over if r.get(column) not in (None, "")]
         return round(statistics.median(values), 3) if values else None
 
     violating = sum(1 for _r, label in labels if label == slo_labels.LABEL_VIOLATED)
     return {
         "measured": True,
         "labeled_windows": len(labeled),
-        "median_p95_tpot_client_ms": median(slo_labels.P95_TPOT_CLIENT),
-        "median_p95_ttft_client_ms": median(slo_labels.P95_TTFT_CLIENT),
+        "median_p95_tpot_client_ms": median(slo_labels.P95_TPOT_CLIENT, labeled),
+        # every post-warm-up window: the engine's occupancy does not need completions
+        "median_running": median(SENTINEL_RUNNING_COLUMN, kept),
+        "median_p95_ttft_client_ms": median(slo_labels.P95_TTFT_CLIENT, labeled),
         "violating_fraction": round(violating / len(labeled), 4),
     }
 
 
+#: The window CSV column the running median is taken over (``r3_grid``: the mean of the
+#: engine's ``num_requests_running`` samples inside the window).
+SENTINEL_RUNNING_COLUMN = "avg_running"
+
+
+def _relative(a, b) -> Optional[float]:
+    return None if not a or b is None else abs(float(b) / float(a) - 1.0)
+
+
 def sentinel_drift(summaries: Sequence[Mapping]) -> dict:
-    """Compare every later sentinel with the first against the thresholds."""
+    """Compare every later sentinel with the first: flagged on the TPOT p95 and running
+    medians (:data:`SENTINEL_DRIFT_THRESHOLDS`); the TTFT p95 and the violating fraction
+    are reported alongside (:data:`SENTINEL_INFORMATIONAL`) and never flag."""
     thresholds = SENTINEL_DRIFT_THRESHOLDS
     if not summaries or not summaries[0].get("measured"):
-        return {"flagged": None, "thresholds": dict(thresholds), "checks": [],
+        return {"flagged": None, "thresholds": dict(thresholds),
+                "informational": list(SENTINEL_INFORMATIONAL), "checks": [],
                 "verdict": "undetermined: the first sentinel measured nothing"}
     ref = summaries[0]
     checks = []
     flagged = False
     undetermined = False
+    judged = (("median_p95_tpot_client_ms", "median_p95_tpot_relative"),
+              ("median_running", "median_running_relative"))
     for i, later in enumerate(summaries[1:], start=2):
         if not later.get("measured"):
             undetermined = True
             checks.append({"sentinel": i, "measured": False})
             continue
         check = {"sentinel": i, "measured": True}
-        for column, key in (("median_p95_tpot_client_ms", "median_p95_tpot_relative"),
-                            ("median_p95_ttft_client_ms", "median_p95_ttft_relative")):
-            a, b = ref.get(column), later.get(column)
-            rel = None if not a or b is None else abs(b / a - 1.0)
+        for column, key in judged:
+            rel = _relative(ref.get(column), later.get(column))
             check[key] = None if rel is None else round(rel, 4)
-            if rel is not None and rel > thresholds[key]:
+            if rel is None:
+                undetermined = True
+            elif rel > thresholds[key]:
                 flagged = True
-        diff = abs(later["violating_fraction"] - ref["violating_fraction"])
-        check["violating_fraction_absolute"] = round(diff, 4)
-        if diff > thresholds["violating_fraction_absolute"]:
-            flagged = True
+        rel = _relative(ref.get("median_p95_ttft_client_ms"),
+                        later.get("median_p95_ttft_client_ms"))
+        check["median_p95_ttft_relative"] = None if rel is None else round(rel, 4)
+        check["violating_fraction_absolute"] = round(
+            abs(later["violating_fraction"] - ref["violating_fraction"]), 4)
         checks.append(check)
     verdict = ("drift: the run is flagged" if flagged
                else "undetermined: a sentinel measured nothing" if undetermined
                else "no drift above the thresholds")
     return {"flagged": flagged if (flagged or not undetermined) else None,
-            "thresholds": dict(thresholds), "checks": checks, "verdict": verdict}
+            "thresholds": dict(thresholds), "informational": list(SENTINEL_INFORMATIONAL),
+            "checks": checks, "verdict": verdict}
+
+
+# ------------------------------------------------------------------------- smoke
+
+
+def smoke_verdict(
+    rows: Sequence[Mapping],
+    guard: Mapping,
+    *,
+    warmup_s: float = WARMUP_S,
+    label: Optional["slo_labels.LabelSpec"] = None,
+    band: tuple[float, float] = SMOKE_VIOLATING_BAND,
+) -> dict:
+    """The smoke hold's check: its violating-window fraction, on exactly the windows and
+    label a probe is judged on (:func:`hold_cell_verdict`), against ``band``.
+
+    ``in_band`` is None when the cell measured nothing (void, or no labelled window):
+    that is not a pass, and the caller reports it as loudly as a miss.
+    """
+    verdict = hold_cell_verdict(rows, guard, warmup_s=warmup_s, label=label)
+    lo, hi = band
+    labeled = int(verdict.get("labeled_windows") or 0)
+    body = {**verdict, "band": [lo, hi], "violating_fraction": None, "in_band": None}
+    if verdict["verdict"] == boundary.VERDICT_VOID or not labeled:
+        body["why"] = "void" if verdict["verdict"] == boundary.VERDICT_VOID \
+            else "no labelled window after the warm-up"
+        return body
+    fraction = int(verdict["violating_windows"]) / labeled
+    body["violating_fraction"] = round(fraction, 4)
+    body["in_band"] = bool(lo <= fraction <= hi)
+    return body
 
 
 # ------------------------------------------------------------------------ the estimate

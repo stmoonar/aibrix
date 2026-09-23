@@ -10,6 +10,11 @@ sentinels, with every cell independently seeded and the engine drained between c
 It lives in :mod:`scripts.calibration_ladder` / :mod:`scripts.calibration_design` and
 refuses to start without ``--rho-priors`` and ``--regime-groups``.
 
+``--reprobe-shapes`` with ``--reprobe-base <ladder run>`` is the boundary supplement
+(:mod:`scripts.calibration_supplement`): named shapes re-probed above that run's rho* on
+a per-model grid, on the ladder's per-cell machinery, optionally followed by one smoke
+hold at the located rho*.
+
 ``--design primitives`` is the first round's design, kept so that run can be reproduced;
 the rest of this docstring describes it.
 
@@ -2240,10 +2245,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                          "nothing else")
     ap.add_argument("--reprobe-source", type=Path, default=static_grid.DEFAULT_SOURCE_CAMPAIGN,
                     help="campaign root whose <model>/capacity JSONs the re-probe reuses")
+    ap.add_argument("--reprobe-base", type=Path, default=None,
+                    help="a finished --design ladder run root: re-probe --reprobe-shapes above "
+                         "ITS anchors (rho*_base) with the ladder's per-cell machinery - "
+                         "post-warm-up D6' verdicts, ledger, drain, backlog valve - instead "
+                         "of the first round's primitives re-probe (scripts.calibration_"
+                         "supplement). One model per run; --out-dir is that model's directory")
+    ap.add_argument("--reprobe-grid", action="append", default=[], metavar="MODEL:F1,F2,...",
+                    help="with --reprobe-base: ascending multiples of rho*_base the search "
+                         "walks upwards from its lowest point until the first violation, then "
+                         "bisects; the highest is the ceiling")
+    ap.add_argument("--smoke-at-rho-star", action="store_true",
+                    help="with --reprobe-base: after a measured rho*, one 300 s hold at it; its "
+                         "violating-window fraction must be 20-70%% or the run exits 3")
     ap.add_argument("--design", choices=["ladder", "primitives"], default=None,
                     help="ladder (default): the second round's design (scripts.calibration_ladder). "
                          "primitives: the first round's steps / boundary / ramp / bursts - "
-                         "implied by --static-grid* and --reprobe-shapes, which only it has")
+                         "implied by --static-grid* and --reprobe-shapes (without "
+                         "--reprobe-base), which only it has")
     ap.add_argument("--rho-priors", type=Path, default=None,
                     help="ladder design: rho_priors.json - per (model, shape) the first "
                          "round's client-side boundary, C_s and, where it never violated, the "
@@ -2259,10 +2278,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     help="ladder design: the preregistration the run implements; its commit "
                          "is recorded in the run manifest")
     args = ap.parse_args(argv)
+    supplement = args.reprobe_base is not None
+    if (args.reprobe_grid or args.smoke_at_rho_star) and not supplement:
+        ap.error("--reprobe-grid / --smoke-at-rho-star belong to --reprobe-base")
+    if supplement and not args.reprobe_shapes:
+        ap.error("--reprobe-base needs --reprobe-shapes")
     primitives_only = bool(
         args.static_grid or args.static_grid_only or args.static_grid_list
-        or args.reprobe_shapes or args.skip_boundary_search
+        or (args.reprobe_shapes and not supplement) or args.skip_boundary_search
     )
+    if supplement and (primitives_only or args.design == "primitives"):
+        ap.error("--reprobe-base re-probes on the ladder design; it does not combine with "
+                 "--design primitives / --static-grid* / --skip-boundary-search")
     if args.design is None:
         args.design = "primitives" if primitives_only else "ladder"
     elif args.design == "ladder" and primitives_only:
@@ -2286,6 +2313,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"--fit-window-align grid needs --fit-step-ms to be a multiple of {LIVE_GRID_MS} "
             f"(got {args.fit_step_ms}); use --fit-window-align none for a free-phase step"
         )
+    if supplement:
+        from scripts import calibration_supplement
+
+        try:
+            targets = parse_reprobe_shapes(args.reprobe_shapes)
+            return calibration_supplement.run_boundary_supplement(args, targets)
+        except ValueError as exc:
+            ap.error(str(exc))
     if args.reprobe_shapes:
         try:
             targets = parse_reprobe_shapes(args.reprobe_shapes)
