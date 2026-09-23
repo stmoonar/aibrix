@@ -43,7 +43,9 @@ echo "[build] go build ($GO_TOOLCHAIN, -tags=nozmq, CGO_ENABLED=0, -trimpath) at
 GOTOOLCHAIN="$GO_TOOLCHAIN" GOPROXY="${GOPROXY:-off}" CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
   go build -tags=nozmq -trimpath -o "$CTX/gateway-plugins" ./cmd/plugins
 # Package path (not cmd/plugins/main.go) so the binary is stamped with vcs.revision /
-# vcs.modified, as the 0d869b49 build was; verify with: go version -m <binary>.
+# vcs.modified, as the 0d869b49 build was; verify with: go version -m <binary>. Go only
+# stamps from a primary checkout: in a git worktree (.git is a file) it silently records
+# no vcs.* at all, and the image tag sha is then the only provenance.
 
 cat > "$CTX/Dockerfile" <<EOF
 FROM ${BASE_IMAGE}

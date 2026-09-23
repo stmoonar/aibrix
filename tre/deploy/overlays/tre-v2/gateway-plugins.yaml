@@ -81,7 +81,7 @@ spec:
         - name: gateway-plugins
           # Built by deploy/scripts/build_gateway_plugins_nozmq.sh (same recipe as the
           # previous 20260704-0d869b49-nozmq2; adds TRE-PATCH P2-GW-004/005).
-          image: aibrix/gateway-plugins:20260924-ee7122bf-nozmq2
+          image: aibrix/gateway-plugins:20260924-a83a2c73-nozmq2
           imagePullPolicy: IfNotPresent
           # Same gRPC probes as the v1 aibrix-gateway-plugins (relaxed timings that
           # stopped restarts under load): the Service only gets an endpoint, and
