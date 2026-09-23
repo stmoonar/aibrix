@@ -470,6 +470,32 @@ def test_the_sealed_split_of_a_dataset_is_m_and_is_skipped_unread(tmp_path) -> N
         [v["sha256"] for v in man["models"][MODEL]["files"].values()]
 
 
+def test_d21_a_smoke_hold_trains_by_its_role(tmp_path) -> None:
+    """The boundary supplement's smoke hold (role smoke, stage dwell, split auxiliary,
+    primitive hold) is a training cell - keyed on the role, as in calibration_decision."""
+    from scripts import calibration_design as design
+
+    assert design.TRAINING_HOLD_ROLES == {design.ROLE_SMOKE}
+    row = {"model": MODEL, "cell_id": "i2048_o96_c2000001", "attempt": "1", "shape": "S3",
+           "primitive": "hold", "role": design.ROLE_SMOKE, "stage": design.STAGE_DWELL,
+           "split": design.SPLIT_AUXILIARY}
+    assert dl.cell_kind(row["primitive"], row["role"], row["split"], row["shape"]) == dl.KIND_CONSTANT
+    for sentinels in (True, False):
+        assert dl.assign_set(row, sealed_to_h2=True, sentinels=sentinels) == dl.SET_TRAINING
+    # the role does not unseal anything, nor make a dynamic primitive train
+    assert dl.assign_set({**row, "split": "holdout"}, sealed_to_h2=False, sentinels=True) == dl.SET_M
+    assert dl.assign_set({**row, "primitive": "steps"}, sealed_to_h2=False, sentinels=True) == dl.SET_H2
+    # end to end: the smoke hold of a supplement run lands in the fitting CSV and its family
+    _dataset(tmp_path, "sup", [("S3", "hold", "smoke", "dwell", "auxiliary", 2000001, 1.0),
+                               ("S3", "hold", "boundary", "bisect", "auxiliary", 2000002, 1.1)])
+    fit = tmp_path / "fit"
+    assert dl.main(["trainset", "--fit-dir", str(fit), "--h2-dataset", str(tmp_path / "sup")]) == 0
+    assert _ids(fit / f"{MODEL}_fitting.csv") == ["i2048_o96_c2000001", "i2048_o96_c2000002"]
+    assert _ids(fit / f"{MODEL}_fitting_prefill_heavy.csv") == ["i2048_o96_c2000001", "i2048_o96_c2000002"]
+    by_role = json.loads((fit / dl.TRAINSET_MANIFEST).read_text())["models"][MODEL]["by_run_role"]
+    assert by_role == {"sup|smoke": 12, "sup|boundary": 12}
+
+
 def test_trainset_never_guesses_what_a_cell_was(tmp_path) -> None:
     _dataset(tmp_path, "run1", [("S1", "", "", "", "train", 1001, 0.6)])
     with pytest.raises(SystemExit, match="no primitive"):

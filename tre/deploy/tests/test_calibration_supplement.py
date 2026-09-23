@@ -282,12 +282,14 @@ def test_every_cell_is_a_ladder_ledger_line_above_the_base_run_s_ids(tmp_path) -
     smoke = [r for r in records if r["role"] == design.ROLE_SMOKE]
     assert len(smoke) == 1 and smoke[0]["stage"] == design.STAGE_DWELL
     assert smoke[0]["duration_s"] == design.SMOKE_SECONDS
-    # the analysis knows every stage written and trains on none of these cells
+    # the analysis knows every stage written: the probes are not analysed, the smoke hold
+    # trains by its role (D21), as it does in dline_refit
     policy = decision.PREREGISTERED
     for r in records:
         row = {"shape": r["shape"], "primitive": r["primitive"], "stage": r["stage"],
-               "cell_id": r["cell_id"], "model": r["model"]}
-        assert policy.role(row) == decision.ROLE_EXCLUDED
+               "role": r["role"], "cell_id": r["cell_id"], "model": r["model"]}
+        want = decision.ROLE_TRAIN if r["role"] == design.ROLE_SMOKE else decision.ROLE_EXCLUDED
+        assert policy.role(row) == want
     plan = json.loads((tmp_path / "out" / "plan.json").read_text())
     assert plan["design"] == ladder.DESIGN_NAME and plan["mode"] == supplement.MODE
     manifest = json.loads((tmp_path / "out" / ladder.RUN_MANIFEST).read_text())

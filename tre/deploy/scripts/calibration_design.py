@@ -203,11 +203,17 @@ ROLE_SUPPLEMENT = "adaptive"
 #: The boundary supplement's check hold at the located rho* (see SMOKE_SECONDS).
 ROLE_SMOKE = "smoke"
 ROLES = (ROLE_SENTINEL, ROLE_BOUNDARY, ROLE_LADDER, ROLE_RAMP, ROLE_SUPPLEMENT, ROLE_SMOKE)
+#: D21 (plan §6.11): hold roles that train whatever their stage / split say. The smoke
+#: hold is a constant-load hold at the located boundary - the windows D13 is short of -
+#: written with stage ``dwell`` and split ``auxiliary``; both sides key on this role:
+#: ``dline_refit`` (the D16 training set) and ``calibration_decision``'s cell policy.
+TRAINING_HOLD_ROLES = frozenset({ROLE_SMOKE})
 
 #: The ``stage`` values this design writes - the names the analysis
 #: (``scripts.analysis.calibration_decision.PREREGISTERED``) partitions on. A hold cell
-#: trains when its stage is in :data:`TRAINING_HOLD_STAGES` and is not analysed when it
-#: is in :data:`EXCLUDED_HOLD_STAGES`; any other name is an error there, on purpose.
+#: trains when its role is in :data:`TRAINING_HOLD_ROLES` or its stage is in
+#: :data:`TRAINING_HOLD_STAGES`, and is otherwise not analysed when its stage is in
+#: :data:`EXCLUDED_HOLD_STAGES`; any other name is an error there, on purpose.
 #: A ramp is identified by its primitive (``ramp``) and carries no stage.
 STAGE_COARSE = boundary.STAGE_COARSE      # stage-0 probes that bracket the flip
 STAGE_BISECT = boundary.STAGE_BISECT      # stage-0 probes that halve the bracket
@@ -220,8 +226,9 @@ TRAINING_HOLD_STAGES = frozenset({STAGE_LADDER, STAGE_ADAPTIVE})
 EXCLUDED_HOLD_STAGES = frozenset({STAGE_COARSE, STAGE_BISECT, STAGE_DWELL, STAGE_SENTINEL})
 #: Stage of every non-probe role (a probe's is coarse or bisect, set by the search).
 #: The smoke hold is a hold at the located boundary after the search - what the first
-#: round called a dwell - and like the dwell it is excluded from training: whether it
-#: trains is decided after the user has seen it, not by the collector.
+#: round called a dwell - so its stage is ``dwell``. It trains all the same: D21 (plan
+#: §6.11) put it in the training set by its role (:data:`TRAINING_HOLD_ROLES`), which the
+#: analysis checks before the stage.
 ROLE_STAGE = {
     ROLE_LADDER: STAGE_LADDER,
     ROLE_SUPPLEMENT: STAGE_ADAPTIVE,
