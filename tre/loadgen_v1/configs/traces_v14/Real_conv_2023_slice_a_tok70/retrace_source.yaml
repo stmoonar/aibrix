@@ -1,0 +1,36 @@
+trace_name: "Real_conv_2023_slice_a_tok70"
+mode: "CustomTraceGenerator real_trace"
+duration_seconds: 720
+note: >
+  720-second windows sliced from ReTrace real trace artifacts.
+  RPS & TPS scaled 4x via RPS values in real_trace data. RPS RPS values scaled 2.5x directly. Effective max ~25/25/17..
+  Token ranges (same as v9, scaled 4x via RPS values in real_trace data). Code→input 250-700/output 80-400, Conv→input 250-700/output 80-500.
+
+models:
+  dsllama-8b:
+    real_trace_file: "real_traces/dsllama-8b.json"
+    rps_min: 2
+    rps_max: 10
+    token_scaling:
+      input_tokens_min: 250
+      input_tokens_max: 700
+      output_tokens_min: 80
+      output_tokens_max: 500
+  dsqwen-7b:
+    real_trace_file: "real_traces/dsqwen-7b.json"
+    rps_min: 3
+    rps_max: 10
+    token_scaling:
+      input_tokens_min: 261
+      input_tokens_max: 707
+      output_tokens_min: 78
+      output_tokens_max: 495
+  dsqwen-14b:
+    real_trace_file: "real_traces/dsqwen-14b.json"
+    rps_min: 1
+    rps_max: 7
+    token_scaling:
+      input_tokens_min: 245
+      input_tokens_max: 695
+      output_tokens_min: 85
+      output_tokens_max: 510

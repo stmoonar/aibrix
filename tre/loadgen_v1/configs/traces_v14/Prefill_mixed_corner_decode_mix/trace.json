@@ -1,0 +1,169 @@
+{
+  "dsllama-8b": [
+    {
+      "start_time": 0,
+      "end_time": 42,
+      "rps": 5.0,
+      "input_tokens": 500,
+      "max_tokens": 400
+    },
+    {
+      "start_time": 45,
+      "end_time": 85,
+      "rps": 6.1,
+      "input_tokens": 1050,
+      "max_tokens": 320
+    },
+    {
+      "start_time": 88,
+      "end_time": 330,
+      "rps": 5.0,
+      "input_tokens": 500,
+      "max_tokens": 400
+    },
+    {
+      "start_time": 333,
+      "end_time": 373,
+      "rps": 5.6,
+      "input_tokens": 420,
+      "max_tokens": 700
+    },
+    {
+      "start_time": 376,
+      "end_time": 474,
+      "rps": 5.0,
+      "input_tokens": 500,
+      "max_tokens": 400
+    },
+    {
+      "start_time": 477,
+      "end_time": 517,
+      "rps": 6.1,
+      "input_tokens": 1050,
+      "max_tokens": 320
+    },
+    {
+      "start_time": 520,
+      "end_time": 720,
+      "rps": 5.0,
+      "input_tokens": 500,
+      "max_tokens": 400
+    }
+  ],
+  "dsqwen-7b": [
+    {
+      "start_time": 0,
+      "end_time": 42,
+      "rps": 6.0,
+      "input_tokens": 500,
+      "max_tokens": 400
+    },
+    {
+      "start_time": 45,
+      "end_time": 85,
+      "rps": 6.72,
+      "input_tokens": 420,
+      "max_tokens": 700
+    },
+    {
+      "start_time": 88,
+      "end_time": 186,
+      "rps": 6.0,
+      "input_tokens": 500,
+      "max_tokens": 400
+    },
+    {
+      "start_time": 189,
+      "end_time": 229,
+      "rps": 7.32,
+      "input_tokens": 1050,
+      "max_tokens": 320
+    },
+    {
+      "start_time": 232,
+      "end_time": 474,
+      "rps": 6.0,
+      "input_tokens": 500,
+      "max_tokens": 400
+    },
+    {
+      "start_time": 477,
+      "end_time": 517,
+      "rps": 6.72,
+      "input_tokens": 420,
+      "max_tokens": 700
+    },
+    {
+      "start_time": 520,
+      "end_time": 618,
+      "rps": 6.0,
+      "input_tokens": 500,
+      "max_tokens": 400
+    },
+    {
+      "start_time": 621,
+      "end_time": 661,
+      "rps": 7.32,
+      "input_tokens": 1050,
+      "max_tokens": 320
+    },
+    {
+      "start_time": 664,
+      "end_time": 720,
+      "rps": 6.0,
+      "input_tokens": 500,
+      "max_tokens": 400
+    }
+  ],
+  "dsqwen-14b": [
+    {
+      "start_time": 0,
+      "end_time": 186,
+      "rps": 3.0,
+      "input_tokens": 500,
+      "max_tokens": 400
+    },
+    {
+      "start_time": 189,
+      "end_time": 229,
+      "rps": 3.36,
+      "input_tokens": 420,
+      "max_tokens": 700
+    },
+    {
+      "start_time": 232,
+      "end_time": 330,
+      "rps": 3.0,
+      "input_tokens": 500,
+      "max_tokens": 400
+    },
+    {
+      "start_time": 333,
+      "end_time": 373,
+      "rps": 3.66,
+      "input_tokens": 1050,
+      "max_tokens": 320
+    },
+    {
+      "start_time": 376,
+      "end_time": 618,
+      "rps": 3.0,
+      "input_tokens": 500,
+      "max_tokens": 400
+    },
+    {
+      "start_time": 621,
+      "end_time": 661,
+      "rps": 3.36,
+      "input_tokens": 420,
+      "max_tokens": 700
+    },
+    {
+      "start_time": 664,
+      "end_time": 720,
+      "rps": 3.0,
+      "input_tokens": 500,
+      "max_tokens": 400
+    }
+  ]
+}
