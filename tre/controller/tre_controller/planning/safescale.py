@@ -88,6 +88,8 @@ class SafeScaleProbe:
     #: Adaptive window W (ms) and its breakdown (calc_probe_window_details), for reports.
     window_ms: float | None = None
     window_terms: dict[str, Any] = field(default_factory=dict)
+    #: Why the probe ended (gate failures, tail summary), persisted with the resolution.
+    terminal_details: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -162,6 +164,12 @@ class SafeScaleStateMachine:
         self._persist_observation(updated, observation)
 
         if self._violates_slo(observation):
+            self._probes[model] = replace(
+                updated,
+                terminal_details={
+                    "slo": {"ttft_p95_ms": observation.ttft_p95_ms, "tpot_p95_ms": observation.tpot_p95_ms}
+                },
+            )
             return self._rollback(updated, reason="slo_violation")
 
         if now_ms < updated.deadline_ms:
@@ -174,7 +182,13 @@ class SafeScaleStateMachine:
             ttft_p95_slo_ms=self._config.ttft_p95_slo_ms,
             tpot_p95_slo_ms=self._config.tpot_p95_slo_ms,
         )
-        if _tail_allows_commit(summary, tau_low=self._config.tau_low):
+        failures = tail_gate_failures(
+            summary, tau_low=self._config.tau_low, kv_cache_max=self._config.kv_cache_max
+        )
+        self._probes[model] = replace(
+            updated, terminal_details={"gate_failures": list(failures), "tail": _tail_record(summary)}
+        )
+        if not failures:
             return self._commit(updated, reason="formal_commit_gate_passed")
         return self._rollback(updated, reason="formal_commit_gate_failed")
 
@@ -480,16 +494,41 @@ def _summarize_tail(
     )
 
 
-def _tail_allows_commit(summary: ProbeTailSummary, *, tau_low: float) -> bool:
+def _tail_allows_commit(summary: ProbeTailSummary, *, tau_low: float, kv_cache_max: float = 0.8) -> bool:
+    return not tail_gate_failures(summary, tau_low=tau_low, kv_cache_max=kv_cache_max)
+
+
+def tail_gate_failures(
+    summary: ProbeTailSummary, *, tau_low: float, kv_cache_max: float = 0.8
+) -> tuple[str, ...]:
+    """The formal commit gate (v1 _tail_summary_allows_commit), returning which checks
+    failed instead of a bool (empty = commit). v1 short-circuits in this order: latency,
+    missing Z under traffic, Z < tau_low, KV-cache > 0.8; the same order decides here, and
+    every failing check is listed for the rollback-reason report."""
+    failures: list[str] = []
     if not summary.latency_ok:
-        return False
+        failures.append("latency")
     if summary.z_min is None:
-        return not summary.has_traffic
+        if summary.has_traffic:
+            failures.append("z_missing")
+        # v1: no Z and no traffic -> commit, whatever the KV cache says.
+        return tuple(failures)
     if summary.z_min < tau_low:
-        return False
-    if summary.gpu_cache_max is not None and summary.gpu_cache_max > 0.8:
-        return False
-    return True
+        failures.append("z_below_tau_low")
+    if summary.gpu_cache_max is not None and summary.gpu_cache_max > kv_cache_max:
+        failures.append("kv_cache")
+    return tuple(failures)
+
+
+def _tail_record(summary: ProbeTailSummary) -> dict[str, Any]:
+    return {
+        "latency_ok": summary.latency_ok,
+        "z_min": summary.z_min if summary.z_min is None or math.isfinite(summary.z_min) else "inf",
+        "has_traffic": summary.has_traffic,
+        "sample_count": summary.sample_count,
+        "tail_count": summary.tail_count,
+        "gpu_cache_max": summary.gpu_cache_max,
+    }
 
 
 def _probe_record(
@@ -512,6 +551,7 @@ def _probe_record(
         "terminal_reason": terminal_reason,
         "window_ms": probe.window_ms,
         "window_terms": dict(probe.window_terms),
+        "terminal_details": dict(probe.terminal_details),
     }
     if resolution is not None:
         record["resolution"] = resolution

@@ -21,6 +21,11 @@ class PodWindowMetrics:
     #: the phase-aligned sampler's freshness check (a window must hold every
     #: SCRAPE_INTERVAL_MS tick, the newest one at window_end). Excluded from equality.
     instant_ticks_ms: tuple[int, ...] = field(default=(), compare=False)
+    #: Window average of vLLM ``gpu_cache_usage_perc`` (KV-cache fill, 0..1) from the
+    #: gateway instant docs; None when no doc carries it. Read only by the SafeScale
+    #: KV-cache guard (v1 avg_gpu_cache_norm); excluded from equality so the existing
+    #: window/golden comparisons are unaffected.
+    gpu_cache_usage: float | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True)

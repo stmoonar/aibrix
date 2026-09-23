@@ -379,3 +379,24 @@ def test_read_latest_instant_sums_pods_and_handles_v1():
     # pod-a latest running 9 + pod-b latest running 2 = 11
     assert snap["running"] == 11.0
     assert snap["waiting"] == 6.0
+
+
+def test_metrics_store_reads_per_pod_kv_cache_usage_for_the_safescale_guard():
+    # A12: gpu_cache_usage_perc (the gateway instant gauge, 0..1) is averaged per pod over
+    # the window like the queue gauges; a pod whose docs lack it reports None (not 0).
+    redis = FakeRedis()
+    pod_a = "default/pod-a"
+    pod_b = "default/pod-b"
+    redis.sadd("tre:v2:pods:dsqwen-7b", pod_a, pod_b)
+    for ts, fill in ((6_000, 0.4), (11_000, 0.8)):
+        doc = inst_doc("pod-a", waiting=0, running=1, kv_hit=0.0)
+        doc["model_metrics"]["dsqwen-7b/gpu_cache_usage_perc"] = fill
+        add_doc(redis, "tre:v2:inst:" + pod_a, ts, doc)
+    add_doc(redis, "tre:v2:inst:" + pod_b, 6_000, inst_doc("pod-b", waiting=0, running=1, kv_hit=0.0))
+
+    registry = load_registry(str(REGISTRY_PATH))
+    store = MetricsStore(redis, registry, instant_sample_interval_ms=5_000, percentile_mode="bucket_upper")
+    metrics = store.read_model_window("dsqwen-7b", 1_000, 11_000)
+
+    assert abs(metrics.per_pod["pod-a"].gpu_cache_usage - 0.6) < 1e-9  # (0.4 + 0.8) / 2 samples
+    assert metrics.per_pod["pod-b"].gpu_cache_usage is None

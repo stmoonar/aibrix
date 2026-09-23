@@ -22,6 +22,8 @@ INSTANT_METRICS = {
     "running": "num_requests_running",
     "swapping": "num_requests_swapped",
     "kv_hit": "kv_cache_hit_rate",
+    # KV-cache fill (0..1) for the SafeScale KV-cache guard (A12); optional per pod.
+    "gpu_cache": "gpu_cache_usage_perc",
 }
 
 LEGACY_HIST_PREFIX = "aibrix:pod_histogram_metrics_"
@@ -321,6 +323,9 @@ class MetricsStore:
                 )
             ),
             instant_ticks_ms=_doc_ticks(inst_docs),
+            gpu_cache_usage=self._instant_avg_optional(
+                model, INSTANT_METRICS["gpu_cache"], inst_docs, span_start, window_end_ms
+            ),
         )
 
     def _aggregate_model(
@@ -414,6 +419,24 @@ class MetricsStore:
                 total += _number(metrics.get(metric_key), 0.0)
         expected_samples = max(1, int((window_end_ms - window_start_ms) / self._instant_sample_interval_ms))
         return total / expected_samples
+
+
+    def _instant_avg_optional(
+        self,
+        model: str,
+        metric: str,
+        docs: list[dict[str, Any]],
+        window_start_ms: int,
+        window_end_ms: int,
+    ) -> float | None:
+        """``_instant_avg`` (same expected-samples divisor), but None when no doc in the
+        window carries the gauge at all (an absent metric is not a zero)."""
+        metric_key = f"{model}/{metric}"
+        if not any(
+            isinstance(doc.get("model_metrics"), dict) and metric_key in doc["model_metrics"] for doc in docs
+        ):
+            return None
+        return self._instant_avg(model, metric, docs, window_start_ms, window_end_ms)
 
 
 def _doc_ticks(docs: list[dict[str, Any]]) -> tuple[int, ...]:

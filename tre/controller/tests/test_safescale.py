@@ -355,3 +355,26 @@ def test_start_probe_uses_the_adaptive_window_and_persists_its_terms() -> None:
     assert restored.restore() == 1
     assert restored.active_probe("donor").window_ms == 90_000.0
     assert restored.active_probe("donor").window_terms["dominant"] == "e2e"
+
+
+
+def test_tail_gate_failures_lists_every_failing_check_in_v1_order() -> None:
+    from tre_controller.planning.safescale import ProbeTailSummary, tail_gate_failures
+
+    def summary(**kw) -> ProbeTailSummary:
+        values = dict(latency_ok=True, z_min=1.2, has_traffic=True, sample_count=4, tail_count=2, gpu_cache_max=0.5)
+        values.update(kw)
+        return ProbeTailSummary(**values)
+
+    assert tail_gate_failures(summary(), tau_low=1.0) == ()
+    assert tail_gate_failures(summary(gpu_cache_max=0.81), tau_low=1.0) == ("kv_cache",)
+    assert tail_gate_failures(summary(gpu_cache_max=0.8), tau_low=1.0) == ()  # v1: > 0.8 fails
+    assert tail_gate_failures(summary(gpu_cache_max=0.7), tau_low=1.0, kv_cache_max=0.6) == ("kv_cache",)
+    assert tail_gate_failures(summary(latency_ok=False, z_min=0.9, gpu_cache_max=0.9), tau_low=1.0) == (
+        "latency",
+        "z_below_tau_low",
+        "kv_cache",
+    )
+    assert tail_gate_failures(summary(z_min=None), tau_low=1.0) == ("z_missing",)
+    # No Z and no traffic commits (v1), whatever the cache says.
+    assert tail_gate_failures(summary(z_min=None, has_traffic=False, gpu_cache_max=0.99), tau_low=1.0) == ()

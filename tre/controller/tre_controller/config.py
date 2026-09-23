@@ -46,6 +46,9 @@ class SafeScaleConfig:
     tau_low: float = 1.0
     epsilon_mu: float = 1e-6
     probe_poll_seconds: float = 2.0
+    # A12 (v1 _tail_summary_allows_commit): the commit gate rejects when the tail's max
+    # avg KV-cache fill of the donor's remaining serving pods exceeds this (v1: 0.8).
+    kv_cache_max: float = 0.8
 
 
 @dataclass(frozen=True)
@@ -187,6 +190,7 @@ class ControllerConfig:
             tau_low=_get_positive_float(values, "SAFE_SCALE_TAU_LOW", 1.0),
             epsilon_mu=_get_positive_float(values, "SAFE_SCALE_EPSILON_MU", 1e-6),
             probe_poll_seconds=_get_positive_float(values, "SAFE_SCALE_PROBE_POLL_SECONDS", 2.0),
+            kv_cache_max=_get_positive_float(values, "SAFE_SCALE_KV_CACHE_MAX", 0.8),
         )
         if safescale.min_window_ms > safescale.max_window_ms:
             raise ValueError("SAFE_SCALE_MIN_WINDOW_MS must be <= SAFE_SCALE_MAX_WINDOW_MS")

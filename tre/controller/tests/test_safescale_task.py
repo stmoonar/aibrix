@@ -119,3 +119,114 @@ def test_safescale_observation_tick_submits_rollback_unhide_on_slo_violation() -
     assert result.submitted == 1
     assert queue.submitted == [(UnhideAction("donor", ("pod-a",), "slo_violation", "safescale"),)]
     assert result.events == ("safescale_slo_violation:donor",)
+
+
+def _with_pod_kv(snapshot: MetricsSnapshot, fills: dict[str, float | None]) -> MetricsSnapshot:
+    from dataclasses import replace
+
+    from tre_common.metrics_schema import PodWindowMetrics
+
+    window = snapshot.models["donor"]
+    per_pod = {
+        pod: PodWindowMetrics(
+            pod=pod,
+            prompt_tokens=0.0,
+            generation_tokens=0.0,
+            avg_waiting=0.0,
+            avg_running=0.0,
+            avg_swapping=0.0,
+            kv_cache_hit_rate=0.0,
+            ttft_p95_ms=None,
+            tpot_p95_ms=None,
+            e2e_p95_ms=None,
+            gpu_cache_usage=fill,
+        )
+        for pod, fill in fills.items()
+    }
+    return replace(snapshot, models={"donor": replace(window, per_pod=per_pod)})
+
+
+def test_remaining_pods_kv_cache_averages_the_serving_pods_only() -> None:
+    from tre_controller.loops.safescale_task import remaining_pods_kv_cache
+
+    window = _with_pod_kv(_metrics(ts_ms=0), {"pod-a": 0.99, "pod-b": 0.5, "pod-c": 0.7, "pod-d": None}).models["donor"]
+    assert abs(remaining_pods_kv_cache(window, ("pod-a",)) - 0.6) < 1e-9  # hidden pod-a excluded
+    assert remaining_pods_kv_cache(window, ("pod-a", "pod-b", "pod-c")) is None
+
+
+def test_safescale_kv_cache_guard_blocks_commit_like_v1() -> None:
+    # A12: avg_gpu_cache_norm was hard-wired None, so the commit gate's KV-cache check
+    # (v1: tail max <= 0.8) never fired. The hidden pod's own fill does not count.
+    queue = FakeQueue()
+    machine = _machine()
+    machine.start_probe(model="donor", pods=("pod-a",), now_ms=0)
+    hot = {"pod-a": 0.1, "pod-b": 0.95}
+
+    pending = run_safescale_observation_tick(
+        _with_pod_kv(_metrics(ts_ms=500), hot), queue=queue, registry=_registry(), safescale=machine
+    )
+    assert pending.events == ("safescale_probe_pending:donor",)  # no immediate KV rollback (v1)
+    result = run_safescale_observation_tick(
+        _with_pod_kv(_metrics(ts_ms=1000), hot), queue=queue, registry=_registry(), safescale=machine
+    )
+
+    assert queue.submitted == [(UnhideAction("donor", ("pod-a",), "formal_commit_gate_failed", "safescale"),)]
+    assert result.events == (
+        "safescale_formal_commit_gate_failed:donor",
+        "safescale_gate_failures:donor:kv_cache",
+    )
+
+    cool_queue = FakeQueue()
+    cool = _machine()
+    cool.start_probe(model="donor", pods=("pod-a",), now_ms=0)
+    for ts in (500, 1000):
+        run_safescale_observation_tick(
+            _with_pod_kv(_metrics(ts_ms=ts), {"pod-a": 0.99, "pod-b": 0.8}),
+            queue=cool_queue,
+            registry=_registry(),
+            safescale=cool,
+        )
+    assert cool_queue.submitted[0][0].reason == "formal_commit_gate_passed"
+
+
+def test_safescale_resolution_record_carries_the_gate_failures() -> None:
+    class Store:
+        def __init__(self) -> None:
+            self.records: dict[str, dict] = {}
+
+        def save_probe(self, request_id, record):
+            self.records[request_id] = dict(record)
+
+        def delete_probe(self, request_id):
+            self.records.pop(request_id, None)
+
+        def list_unresolved_probes(self):
+            return []
+
+        def append_probe_journal(self, request_id, record):
+            pass
+
+        def load_probe_journal(self, request_id):
+            return []
+
+    store = Store()
+    machine = SafeScaleStateMachine(
+        config=SafeScaleConfig(
+            ttft_p95_slo_ms=1000.0, tpot_p95_slo_ms=100.0, default_window_ms=1000.0, min_window_ms=1000.0, hq=0.5
+        ),
+        store=store,
+    )
+    machine.start_probe(model="donor", pods=("pod-a",), now_ms=0)
+    for ts in (500, 1000):
+        run_safescale_observation_tick(
+            _with_pod_kv(_metrics(ts_ms=ts), {"pod-b": 0.9}), queue=FakeQueue(), registry=_registry(), safescale=machine
+        )
+
+    (record,) = store.records.values()
+    assert (record["status"], record["resolution"], record["terminal_reason"]) == (
+        "resolved",
+        "rollback",
+        "formal_commit_gate_failed",
+    )
+    assert record["terminal_details"]["gate_failures"] == ["kv_cache"]
+    assert record["terminal_details"]["tail"]["gpu_cache_max"] == 0.9
