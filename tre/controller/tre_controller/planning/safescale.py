@@ -52,6 +52,10 @@ class ProbeWindowInputs:
 
     p95_e2e_ms: float | None = None
     p95_tpot_ms: float | None = None
+    #: v1 fallbacks when a p95 is missing: overall window mean TTFT for the e2e term
+    #: (sic - v1 uses avg TTFT, not avg e2e) and mean TPOT for the decode term.
+    avg_ttft_ms: float | None = None
+    avg_tpot_ms: float | None = None
     q: float | None = None
     y_total: float | None = None
     y_per_pod: float | None = None
@@ -116,6 +120,9 @@ class SafeScaleStateMachine:
         self._store = store
         self._probes: dict[str, SafeScaleProbe] = {}
         # A13 rollback backoff: model -> time (ms, snapshot clock) of its last rollback.
+        # Deliberately in-memory only: a controller restart forgets it, i.e. at most one
+        # extra HIGH probe per model right after a restart (the probe itself is still
+        # guarded by SLO / donor-health / commit gate). Not worth a persisted schema.
         self._last_rollback_ms: dict[str, int] = {}
 
     def active_probe(self, model: str) -> SafeScaleProbe | None:
@@ -230,7 +237,13 @@ class SafeScaleStateMachine:
         failures = tail_gate_failures(
             summary, tau_low=self._config.tau_low, kv_cache_max=self._config.kv_cache_max
         )
-        details: dict[str, Any] = {"gate_failures": list(failures), "tail": _tail_record(summary)}
+        details: dict[str, Any] = {
+            "gate_failures": list(failures),
+            "tail": _tail_record(summary),
+            # A12/P2-a: no KV-cache sample in the tail (no pod reported the gauge) - the
+            # gate passes this check like v1, but the record says so explicitly.
+            "kv_cache": "unavailable" if summary.gpu_cache_max is None else summary.gpu_cache_max,
+        }
         if health is not None:
             details["donor_health"] = health
         self._probes[model] = replace(updated, terminal_details=details)
@@ -412,6 +425,8 @@ def calc_probe_window_details(
     config: SafeScaleConfig,
 ) -> dict[str, Any]:
     """Port of v1 ``safescale._calc_probe_window_details`` (v1 safescale.py:302-359).
+    The FORMULA is v1's; the band is not (see SafeScaleConfig: v1 ran 15 s / 300 s with a
+    20 s cW2 fallback).
 
     * W1 = 2 * p95_e2e (``default_window_ms`` when unavailable);
     * queue term cW2 = Q / rate_gap (s -> ms) when Q > 0; ``cw2_fallback_ms`` when the
@@ -426,8 +441,17 @@ def calc_probe_window_details(
     default_ms = float(config.default_window_ms)
     lo_ms = float(config.min_window_ms)
     hi_ms = float(config.max_window_ms)
+    # v1 start_hidden_probe (safescale.py:504-509): p95_e2e or avg_ttft, p95_tpot or avg_tpot.
     p95_e2e = _positive(inputs.p95_e2e_ms)
+    latency_source = "p95_e2e" if p95_e2e is not None else None
+    if p95_e2e is None:
+        p95_e2e = _positive(inputs.avg_ttft_ms)
+        latency_source = "avg_ttft" if p95_e2e is not None else None
     p95_tpot = _positive(inputs.p95_tpot_ms)
+    decode_source = "p95_tpot" if p95_tpot is not None else None
+    if p95_tpot is None:
+        p95_tpot = _positive(inputs.avg_tpot_ms)
+        decode_source = "avg_tpot" if p95_tpot is not None else None
     w1 = 2.0 * p95_e2e if p95_e2e is not None else default_ms
 
     gap = _estimate_post_drain_gap_per_second(
@@ -478,6 +502,8 @@ def calc_probe_window_details(
         "inputs": {
             "p95_e2e_ms": p95_e2e,
             "p95_tpot_ms": p95_tpot,
+            "latency_source": latency_source,
+            "decode_source": decode_source,
             "q": q,
             "y_total": _nonneg(inputs.y_total),
             "y_per_pod": _nonneg(inputs.y_per_pod),

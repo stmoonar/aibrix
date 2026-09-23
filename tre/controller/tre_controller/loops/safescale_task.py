@@ -92,6 +92,11 @@ def run_safescale_observation_tick(
         gate_failures = _gate_failures(safescale, probe.model, decision)
         if gate_failures:
             events.append(f"safescale_gate_failures:{probe.model}:{','.join(gate_failures)}")
+        if getattr(decision, "reason", "") in ("formal_commit_gate_passed", "formal_commit_gate_failed") and (
+            _terminal_details(safescale, probe.model).get("kv_cache") == "unavailable"
+        ):
+            # P2-a: the KV-cache check could not be evaluated (fail-open, as v1) - say so.
+            events.append(f"safescale_kv_cache_unavailable:{probe.model}")
         if getattr(decision, "reason", "") == "donor_health":
             health = _terminal_details(safescale, probe.model).get("donor_health") or {}
             events.append(

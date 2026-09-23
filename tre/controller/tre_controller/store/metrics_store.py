@@ -326,6 +326,10 @@ class MetricsStore:
             gpu_cache_usage=self._instant_avg_optional(
                 model, INSTANT_METRICS["gpu_cache"], inst_docs, span_start, window_end_ms
             ),
+            ttft_avg_ms=_seconds_to_ms(ttft_avg_s),
+            ttft_count=self._hist_count_delta(model, HISTOGRAM_METRICS["ttft"], hist_docs, window_start_ms),
+            tpot_avg_ms=_seconds_to_ms(tpot_avg_s),
+            tpot_count=self._hist_count_delta(model, HISTOGRAM_METRICS["tpot"], hist_docs, window_start_ms),
         )
 
     def _aggregate_model(
@@ -429,14 +433,20 @@ class MetricsStore:
         window_start_ms: int,
         window_end_ms: int,
     ) -> float | None:
-        """``_instant_avg`` (same expected-samples divisor), but None when no doc in the
-        window carries the gauge at all (an absent metric is not a zero)."""
+        """Mean of the gauge over the samples that actually carry it; None when none
+        does (an absent metric is not a zero). Unlike ``_instant_avg`` (queue gauges, whose
+        expected-samples divisor the calibration contract fixes) the divisor is the real
+        sample count, so a pod that woke mid-window is not read low. window_start_ms /
+        window_end_ms are unused and kept for the call-site symmetry."""
         metric_key = f"{model}/{metric}"
-        if not any(
-            isinstance(doc.get("model_metrics"), dict) and metric_key in doc["model_metrics"] for doc in docs
-        ):
+        values = [
+            _number(doc["model_metrics"].get(metric_key), 0.0)
+            for doc in docs
+            if isinstance(doc.get("model_metrics"), dict) and metric_key in doc["model_metrics"]
+        ]
+        if not values:
             return None
-        return self._instant_avg(model, metric, docs, window_start_ms, window_end_ms)
+        return sum(values) / len(values)
 
 
 def _doc_ticks(docs: list[dict[str, Any]]) -> tuple[int, ...]:

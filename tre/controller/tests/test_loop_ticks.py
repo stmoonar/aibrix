@@ -892,3 +892,23 @@ def test_scale_up_of_a_probing_model_preempts_its_probe_like_v1() -> None:
     assert safescale.active_probe("critical") is None
     # Preemption is not a failed probe: no rollback backoff.
     assert safescale.rollback_backoff_models(1_000) == set()
+
+
+
+def test_probe_window_inputs_carry_the_count_weighted_mean_latencies() -> None:
+    from dataclasses import replace
+
+    from tre_controller.loops.tick import probe_window_inputs
+
+    window = _metrics_with_pods("donor", generation=100.0, waiting=0.0, running=1.0, pods=("a", "b"))
+    per_pod = {
+        "a": replace(window.per_pod["a"], ttft_avg_ms=100.0, ttft_count=3.0, tpot_avg_ms=20.0, tpot_count=30.0),
+        "b": replace(window.per_pod["b"], ttft_avg_ms=500.0, ttft_count=1.0, tpot_avg_ms=None, tpot_count=0.0),
+    }
+    snapshot = MetricsSnapshot(ts_ms=1, stale=False, models={"donor": replace(window, per_pod=per_pod, e2e_p95_ms=None)})
+
+    inputs = probe_window_inputs(snapshot, "donor", {"donor": {"Q_ctl": 1.0, "routable_pods": 2}})
+
+    assert inputs.p95_e2e_ms is None
+    assert inputs.avg_ttft_ms == 200.0  # (100*3 + 500*1) / 4, v1's overall mean
+    assert inputs.avg_tpot_ms == 20.0

@@ -480,3 +480,22 @@ def test_preemption_request_is_idempotent_and_survives_restore() -> None:
     restored.restore()
     decision = restored.observe("donor", _healthy_observation(ts_ms=1_000), now_ms=1_000)
     assert (decision.status, decision.reason) == ("rollback", "receiver_need_upscale")
+
+
+
+def test_window_falls_back_to_mean_ttft_and_tpot_when_p95_is_missing_like_v1() -> None:
+    # Review P2-b: v1 start_hidden_probe uses p95_e2e or avg_ttft, p95_tpot or avg_tpot.
+    terms = calc_probe_window_details(
+        _inputs(p95_e2e_ms=None, avg_ttft_ms=45_000.0, p95_tpot_ms=None, avg_tpot_ms=80.0),
+        hidden_count=1,
+        config=_V1_CFG,
+    )
+    assert terms["W1"] == 90_000.0 and terms["W"] == 90_000.0
+    assert terms["decode_term_ms"] == 160.0
+    assert (terms["inputs"]["latency_source"], terms["inputs"]["decode_source"]) == ("avg_ttft", "avg_tpot")
+    # p95 present -> the mean is ignored.
+    primary = calc_probe_window_details(_inputs(avg_ttft_ms=45_000.0), hidden_count=1, config=_V1_CFG)
+    assert primary["W1"] == 10_000.0 and primary["inputs"]["latency_source"] == "p95_e2e"
+    # Neither -> default window, as before.
+    none = calc_probe_window_details(_inputs(p95_e2e_ms=None), hidden_count=1, config=_V1_CFG)
+    assert none["W1"] == 60_000.0 and none["inputs"]["latency_source"] is None

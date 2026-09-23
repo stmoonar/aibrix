@@ -32,11 +32,16 @@ _FALSE_VALUES = {"0", "false", "no", "n", "off"}
 class SafeScaleConfig:
     ttft_p95_slo_ms: float = 500.0
     tpot_p95_slo_ms: float = 75.0
-    # A6 (v1 _calc_probe_window_details): probe window
-    # W = clamp(min_window_ms, max_window_ms, max(2*p95_e2e, cdec*p95_tpot, Q/rate_gap)).
-    # default_window_ms stands in for a missing latency term (no metrics -> W = 60 s);
-    # cw2_fallback_ms replaces Q/rate_gap when the post-hide rate gap is <= epsilon_mu
-    # (was 300 s, which pinned every such probe at the ceiling).
+    # A6: probe window W = clamp(min_window_ms, max_window_ms,
+    # max(2*p95_e2e, cdec*p95_tpot, Q/rate_gap)) - the FORMULA is v1's
+    # (_calc_probe_window_details); the BAND IS NOT v1's. v1 ran 15 s / 300 s with a 20 s
+    # cW2 fallback and a 60 s default (configs/model_slo_profiles.json; its code defaults
+    # were 15 s / 300 s / fallback = max). Here:
+    # * min 60 s comes from the N2 invariant (from_env guard: min*(1-hq) >= metrics window
+    #   + refresh + read offset = 42 s today), not from v1;
+    # * max 120 s is a new decision of the 2026-09 v1/paper alignment (A6);
+    # * cw2_fallback 60 s = the floor (the v2 default had drifted to 300 s, pinning every
+    #   probe with an unknown rate gap at the ceiling); default 60 s (no metrics) as v1.
     default_window_ms: float = 60_000.0
     min_window_ms: float = 60_000.0
     max_window_ms: float = 120_000.0

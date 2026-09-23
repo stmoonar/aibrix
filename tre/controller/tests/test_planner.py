@@ -739,3 +739,24 @@ def test_receiver_cap_counts_hidden_probe_pods_like_v1_assigned() -> None:
         cfg=cfg,
     )
     assert [a for a in fairness.actions if isinstance(a, ScaleAction)] == []
+
+
+
+def test_rollback_backoff_event_only_for_models_that_would_be_probed() -> None:
+    # Review P3: a HIGH model at its serving floor is never probed, so it must not log a
+    # backoff event every tick while its backoff runs.
+    classifications = [_classification("hot", ModelState.HIGH, ModelRole.DONOR, 1.6, "surplus")]
+    cfg = PlanConfig(min_replicas_per_model=1, max_replicas_per_model=4)
+
+    def events(pods: int):
+        return build_plan(
+            model_contexts={"hot": {"assigned_replicas": pods, "routable_pods": pods}},
+            classifications=classifications,
+            model_replicas={"hot": pods},
+            idle_gpus=0,
+            cfg=cfg,
+            probe_backoff_models={"hot"},
+        ).events
+
+    assert "safescale_rollback_backoff:hot" not in events(1)
+    assert "safescale_rollback_backoff:hot" in events(3)

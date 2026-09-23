@@ -101,7 +101,11 @@ def test_safescale_observation_tick_submits_commit_actions_after_deadline() -> N
             ScaleAction("receiver", 1, "safescale_followup_upscale", "safescale"),
         )
     ]
-    assert committed.events == ("safescale_formal_commit_gate_passed:donor",)
+    # No per-pod KV-cache data in this window: the gate passes, and says so (P2-a).
+    assert committed.events == (
+        "safescale_formal_commit_gate_passed:donor",
+        "safescale_kv_cache_unavailable:donor",
+    )
 
 
 def test_safescale_observation_tick_submits_rollback_unhide_on_slo_violation() -> None:
@@ -264,3 +268,33 @@ def test_observation_tick_feeds_gateway_counters_to_the_donor_health_guard() -> 
     )
     assert machine.active_probe("donor") is None
     assert machine.rollback_backoff_models(2_500) == {"donor"}
+
+
+
+def test_kv_cache_unavailable_passes_the_gate_but_is_reported() -> None:
+    # Review P2-a: no pod reports gpu_cache_usage -> the KV check cannot run. Still
+    # fail-open like v1, but no longer silent: event + kv_cache=unavailable in the record.
+    queue = FakeQueue()
+    machine = _machine()
+    machine.start_probe(model="donor", pods=("pod-a",), now_ms=0)
+    run_safescale_observation_tick(
+        _with_pod_kv(_metrics(ts_ms=500), {"pod-b": None}), queue=queue, registry=_registry(), safescale=machine
+    )
+    probe_holder = {}
+    original_resolve = machine.resolve
+
+    def capture(model, **kw):
+        probe_holder["details"] = dict(machine.active_probe(model).terminal_details)
+        return original_resolve(model, **kw)
+
+    machine.resolve = capture
+    result = run_safescale_observation_tick(
+        _with_pod_kv(_metrics(ts_ms=1000), {"pod-b": None}), queue=queue, registry=_registry(), safescale=machine
+    )
+
+    assert result.events == (
+        "safescale_formal_commit_gate_passed:donor",
+        "safescale_kv_cache_unavailable:donor",
+    )
+    assert probe_holder["details"]["kv_cache"] == "unavailable"
+    assert queue.submitted[-1][0].reason == "formal_commit_gate_passed"

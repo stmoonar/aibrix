@@ -13,14 +13,24 @@ deploy/gen_model_manifests.py), and exposes Prometheus stats on its admin/metric
 * ``envoy_cluster_upstream_cx_none_healthy`` - requests with no healthy endpoint.
 
 ``errors`` = 5xx + overflow + none-healthy, ``requests`` = all classes + overflow +
-none-healthy. The guard compares the deltas since the probe started. Rejections the
-gateway plugin (ext_proc) answers itself never reach a cluster and are not counted here
-(Envoy only has them per listener, not per model).
+none-healthy. The guard compares the deltas since the probe started.
+
+Counting rule and blind spots (review P2-c):
+
+* Requests WITHOUT a response code are in neither the numerator nor the denominator:
+  ``upstream_rq_total - sum(upstream_rq_xx)`` (about 1 % on the live proxy) is mostly
+  requests still in flight - long streaming generations - plus streams reset before any
+  header. Counting that gap as errors would turn in-flight load into false errors, so
+  it is left out; the cost is that a stream reset before headers is invisible here.
+* Rejections the gateway plugin (ext_proc) answers itself never reach a cluster and are
+  not counted (Envoy only has them per listener, not per model).
+* A 200 whose stream later breaks (mid-body reset) counts as a success.
 """
 from __future__ import annotations
 
 import logging
 import re
+import time
 import urllib.request
 from dataclasses import dataclass
 from typing import Callable, Iterable, Mapping
@@ -104,12 +114,20 @@ class EnvoyStatsSource:
         route_namespace: str = "tre-v2",
         timeout_s: float = 1.0,
         fetch: Callable[[str, float], str] | None = None,
+        clock: Callable[[], float] | None = None,
+        warn_interval_s: float = 60.0,
     ) -> None:
         self.urls = tuple(url for url in urls if url)
         self.models = tuple(models)
         self.route_namespace = route_namespace
         self.timeout_s = timeout_s
         self._fetch = fetch or _http_get
+        self._clock = clock or time.monotonic
+        # P3: one "unavailable" warning per endpoint per warn_interval_s (the source is
+        # polled every 2 s while probes run; an outage must not flood the log).
+        self.warn_interval_s = warn_interval_s
+        self._last_warn: dict[str, float] = {}
+        self.suppressed_warnings = 0
 
     def read(self) -> dict[str, GatewayCounters] | None:
         totals: dict[str, list[float]] = {}
@@ -117,7 +135,7 @@ class EnvoyStatsSource:
             try:
                 text = self._fetch(url, self.timeout_s)
             except Exception as exc:  # noqa: BLE001 - any transport error fails open
-                LOG.warning("gateway_stats_unavailable: %s: %s", url, exc)
+                self._warn_unavailable(url, exc)
                 return None
             for model, counters in parse_envoy_cluster_counters(
                 text, self.models, route_namespace=self.route_namespace
@@ -126,6 +144,21 @@ class EnvoyStatsSource:
                 bucket[0] += counters.requests
                 bucket[1] += counters.errors
         return {model: GatewayCounters(requests=value[0], errors=value[1]) for model, value in totals.items()}
+
+    def _warn_unavailable(self, url: str, exc: Exception) -> None:
+        now = self._clock()
+        last = self._last_warn.get(url)
+        if last is not None and now - last < self.warn_interval_s:
+            self.suppressed_warnings += 1
+            return
+        self._last_warn[url] = now
+        LOG.warning(
+            "gateway_stats_unavailable (donor-health guard fails open): %s: %s (%d repeats suppressed)",
+            url,
+            exc,
+            self.suppressed_warnings,
+        )
+        self.suppressed_warnings = 0
 
 
 def counters_for(counters: Mapping[str, GatewayCounters] | None, model: str) -> GatewayCounters | None:

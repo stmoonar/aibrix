@@ -322,15 +322,19 @@ def probe_window_inputs(
     context = (contexts or {}).get(model) or {}
     if metrics is None and not context:
         return None
-    p95_e2e = p95_tpot = interval_s = None
+    p95_e2e = p95_tpot = interval_s = avg_ttft = avg_tpot = None
     if metrics is not None:
         serving = serving_window(metrics, cluster_view)
         p95_e2e = serving.e2e_p95_ms
         p95_tpot = serving.tpot_p95_ms
+        avg_ttft = _weighted_mean(serving, "ttft")
+        avg_tpot = _weighted_mean(serving, "tpot")
         interval_s = (serving.window_end_ms - serving.window_start_ms) / 1000.0
     return ProbeWindowInputs(
         p95_e2e_ms=p95_e2e,
         p95_tpot_ms=p95_tpot,
+        avg_ttft_ms=avg_ttft,
+        avg_tpot_ms=avg_tpot,
         q=context.get("Q_ctl"),
         y_total=context.get("Y_m"),
         y_per_pod=context.get("y_m"),
@@ -338,6 +342,20 @@ def probe_window_inputs(
         routable_pods=context.get("routable_pods"),
         interval_s=interval_s,
     )
+
+
+def _weighted_mean(metrics: ModelWindowMetrics, which: str) -> float | None:
+    """Model-level window mean of ``ttft`` / ``tpot`` (ms) over its pods, weighted by each
+    pod's sample count = sum of sums / sum of counts (v1 get_avg_ttft_ms overall mean)."""
+    total = weight = 0.0
+    for pod in metrics.per_pod.values():
+        avg = getattr(pod, f"{which}_avg_ms", None)
+        count = getattr(pod, f"{which}_count", None)
+        if avg is None or not count or count <= 0:
+            continue
+        total += float(avg) * float(count)
+        weight += float(count)
+    return total / weight if weight > 0 else None
 
 
 def _requires_safescale_probe(action: Action) -> bool:

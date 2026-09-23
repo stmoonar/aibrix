@@ -26,6 +26,13 @@ class PodWindowMetrics:
     #: KV-cache guard (v1 avg_gpu_cache_norm); excluded from equality so the existing
     #: window/golden comparisons are unaffected.
     gpu_cache_usage: float | None = field(default=None, compare=False)
+    #: Window means (ms) and sample counts of TTFT / TPOT from the histogram sum/count
+    #: deltas; the SafeScale window falls back to them when a p95 is missing (v1
+    #: start_hidden_probe). Excluded from equality like the fields above.
+    ttft_avg_ms: float | None = field(default=None, compare=False)
+    ttft_count: float | None = field(default=None, compare=False)
+    tpot_avg_ms: float | None = field(default=None, compare=False)
+    tpot_count: float | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True)

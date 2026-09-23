@@ -109,10 +109,11 @@ spec:
               value: "500"
             - name: SAFE_SCALE_TPOT_P95_SLO_MS
               value: "75"
-            # A6 (v1/paper alignment): adaptive probe window
-            # W = clamp(MIN, MAX, max(2*p95_e2e, CDEC*p95_tpot, Q/rate_gap)); the queue
-            # term falls back to CW2_FALLBACK when the post-hide rate gap is ~0. Startup
-            # guard: MIN*(1-HQ) >= TRE_METRICS_WINDOW_MS + 10 s refresh + phase offset.
+            # A6: adaptive probe window W = clamp(MIN, MAX, max(2*p95_e2e, CDEC*p95_tpot,
+            # Q/rate_gap)) - v1's formula, NOT v1's band (v1: 15 s / 300 s / fallback 20 s).
+            # MIN 60 s is forced by the N2 startup guard MIN*(1-HQ) >= TRE_METRICS_WINDOW_MS
+            # + 10 s refresh + phase offset; MAX 120 s is new (2026-09 alignment); the queue
+            # term falls back to CW2_FALLBACK when the post-hide rate gap is ~0.
             - name: SAFE_SCALE_MIN_WINDOW_MS
               value: "60000"
             - name: SAFE_SCALE_MAX_WINDOW_MS

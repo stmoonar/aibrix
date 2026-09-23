@@ -443,9 +443,6 @@ def build_plan(
                 continue
             if high.model_name in active_probe_models or high.model_name in inflight_models:
                 continue
-            if high.model_name in probe_backoff_models:
-                events.append(f"safescale_rollback_backoff:{high.model_name}")
-                continue
             if deltas.get(high.model_name, 0) != 0:
                 continue
             if cooldown.blocks(high.model_name, "down"):
@@ -453,6 +450,11 @@ def build_plan(
             pods = _effective_routable_replicas(high.model_name, model_contexts, model_replicas)
             high_min = _serving_floor(cfg, high.model_name, model_contexts, model_replicas)
             if pods <= high_min:
+                continue
+            # A13 backoff, checked (and logged) only for a model that would otherwise be
+            # probed - a model already at its floor stays silent every tick.
+            if high.model_name in probe_backoff_models:
+                events.append(f"safescale_rollback_backoff:{high.model_name}")
                 continue
             shrink = min(_scale_step(pods, cfg.scale_step_ratio), pods - high_min)
             if shrink > 0:
