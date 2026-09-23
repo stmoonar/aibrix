@@ -137,6 +137,9 @@ func (s *Server) HandleRequestBody(ctx context.Context, routingCtx *types.Routin
 			HeaderTargetPod, targetPodIP,
 			"content-length", strconv.Itoa(len(routingCtx.ReqBody)),
 			"X-Request-Id", routingCtx.RequestID)
+		if treRouteModelHeader.Load() {
+			headers = buildEnvoyProxyHeaders(headers, HeaderModel, model)
+		}
 
 		var targetPodName, targetNamespace string
 		var request_count float64

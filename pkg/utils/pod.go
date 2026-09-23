@@ -22,6 +22,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync/atomic"
 
 	"github.com/vllm-project/aibrix/pkg/constants"
 	"k8s.io/klog/v2"
@@ -197,11 +198,60 @@ func FilterReadyPod(pod *v1.Pod) bool {
 	return pod.Status.PodIP != "" && !IsPodTerminating(pod) && IsPodReady(pod)
 }
 
+// TRE-PATCH(P2-GW-004): routing-candidate gate on the tre.aibrix.io/routable label.
+//
+// TRE hot-switching keeps sleeping (weights offloaded) and route-hidden (SafeScale probe)
+// pods Running+Ready, so FilterReadyPod alone would hand them requests. The TRE
+// service-manager is the single writer of TRERoutableLabel ("true" only for awake,
+// visible pods); the per-model Service selects on it, but an ext_proc route to an
+// ORIGINAL_DST cluster bypasses the Service, so the gateway must apply the same gate.
+// A sleeping pod also reports ~0 gpu_cache_usage_perc, which least-gpu-cache would
+// otherwise rank first.
+//
+// The gate only narrows ROUTING candidates (CountRoutablePods / FilterRoutablePods /
+// FilterRoutablePodsInPlace / SelectRandomPod). Metric scraping and the TRE redis writer
+// keep using FilterReadyPod, so sleeping pods stay observable. Off unless
+// TRE_ROUTABLE_LABEL_FILTER=true, which only the tre-v2 gateway-plugins Deployment sets.
+const (
+	TRERoutableLabel          = "tre.aibrix.io/routable"
+	TRERoutableLabelFilterEnv = "TRE_ROUTABLE_LABEL_FILTER"
+)
+
+var treRoutableLabelFilter atomic.Bool
+
+func init() {
+	treRoutableLabelFilter.Store(LoadEnvBool(TRERoutableLabelFilterEnv, false))
+}
+
+// TRERoutableLabelFilterEnabled reports whether the routable-label gate is active.
+func TRERoutableLabelFilterEnabled() bool {
+	return treRoutableLabelFilter.Load()
+}
+
+// SetTRERoutableLabelFilter overrides the gate (tests) and returns the previous value.
+func SetTRERoutableLabelFilter(enabled bool) bool {
+	return treRoutableLabelFilter.Swap(enabled)
+}
+
+// IsTRERoutablePod is true when the gate is off, or when the pod carries routable=true.
+func IsTRERoutablePod(pod *v1.Pod) bool {
+	if !treRoutableLabelFilter.Load() {
+		return true
+	}
+	return pod.Labels[TRERoutableLabel] == "true"
+}
+
+// FilterRoutingCandidatePod is FilterReadyPod plus the TRE routable-label gate.
+func FilterRoutingCandidatePod(pod *v1.Pod) bool {
+	return FilterReadyPod(pod) && IsTRERoutablePod(pod)
+}
+
 // CountRoutablePods filters and returns the number of pods that are routable.
-// A pod is routable if it have a valid PodIP and not in terminating state.
+// A pod is routable if it have a valid PodIP, is Ready and not terminating, and (when
+// TRE_ROUTABLE_LABEL_FILTER is on) carries tre.aibrix.io/routable=true.
 func CountRoutablePods(pods []*v1.Pod) (cnt int) {
 	for _, pod := range pods {
-		if !FilterReadyPod(pod) {
+		if !FilterRoutingCandidatePod(pod) {
 			continue
 		}
 		cnt++
@@ -210,11 +260,12 @@ func CountRoutablePods(pods []*v1.Pod) (cnt int) {
 }
 
 // FilterRoutablePods filters and returns a list of pods that are routable.
-// A pod is routable if it have a valid PodIP and not in terminating state.
+// A pod is routable if it have a valid PodIP, is Ready and not terminating, and (when
+// TRE_ROUTABLE_LABEL_FILTER is on) carries tre.aibrix.io/routable=true.
 func FilterRoutablePods(pods []*v1.Pod) []*v1.Pod {
 	readyPods := make([]*v1.Pod, 0, len(pods))
 	for _, pod := range pods {
-		if !FilterReadyPod(pod) {
+		if !FilterRoutingCandidatePod(pod) {
 			continue
 		}
 		readyPods = append(readyPods, pod)
@@ -223,11 +274,12 @@ func FilterRoutablePods(pods []*v1.Pod) []*v1.Pod {
 }
 
 // FilterRoutablePodsInPlace filters a list of pods that are routable.
-// A pod is routable if it have a valid PodIP and not in terminating state.
+// A pod is routable if it have a valid PodIP, is Ready and not terminating, and (when
+// TRE_ROUTABLE_LABEL_FILTER is on) carries tre.aibrix.io/routable=true.
 func FilterRoutablePodsInPlace(pods []*v1.Pod) []*v1.Pod {
 	readyCnt := 0
 	for i, pod := range pods {
-		if !FilterReadyPod(pod) {
+		if !FilterRoutingCandidatePod(pod) {
 			continue
 		} else if readyCnt != i {
 			pods[readyCnt] = pod
