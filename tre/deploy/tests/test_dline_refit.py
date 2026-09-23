@@ -129,12 +129,53 @@ def test_the_three_stages_run_end_to_end_and_chain_through_their_outputs(tmp_pat
     assert "error" not in final, final
     assert final["w_p"] == wp["w_p_used"] and final["theta_published"] == final["theta_merged"]  # D5
     assert (out / MODEL / "fixed" / "holdout_final.json").exists()
+    assert final["holdout_evaluated"] is True and "M_ba" in final
     assert dl.main(["summary", "--model", MODEL, "--fit-dir", str(fit), "--out-dir", str(out),
                     "--registry", str(REGISTRY)]) == 0
     summary = json.loads((out / "summary.json").read_text())
     rec = summary["models"][MODEL]["fixed"]
     assert rec["wp_rule"]["w_p_used"] == wp["w_p_used"]
     assert set(rec["band_by_family"]) <= {"prefill_heavy", "decode_heavy"}
+
+
+def test_no_holdout_never_opens_the_validation_csv(tmp_path, monkeypatch) -> None:
+    """Plan §6.11 note 9: M is read once, after it is frozen. ``--no-holdout`` must fit and
+    publish without the validation CSV existing, and never call the hold-out report."""
+    from scripts import theta_verdict as tv
+
+    fit = tmp_path / "fit"
+    fit.mkdir()
+    _fit_csv(fit / f"{MODEL}_fitting.csv", seed=1)
+    _fit_csv(fit / f"{MODEL}_fitting_decode_heavy.csv", seed=3, shapes=("i256_o448",))
+    _fit_csv(fit / f"{MODEL}_fitting_prefill_heavy.csv", seed=4, shapes=("i2048_o96",))
+    assert not (fit / f"{MODEL}_validation.csv").exists()
+    monkeypatch.setattr(dl, "TAUS_S", (0, 10))
+    monkeypatch.setattr(dl, "WP_GRID", (0.0, 0.02))
+    monkeypatch.setattr(dl, "LAMBDAS", (0.0, 1.0))
+    for name in ("WP_RESAMPLES", "LAMBDA_RESAMPLES", "FINAL_RESAMPLES"):
+        monkeypatch.setattr(dl, name, (20, 10))
+    monkeypatch.setattr(dl, "BA_SE_RESAMPLES", 20)
+
+    def _no_m(*_a, **_k):
+        raise AssertionError("the hold-out report ran under --no-holdout")
+
+    monkeypatch.setattr(tv, "holdout_report", _no_m)
+    out = tmp_path / "out"
+    common = ["--model", MODEL, "--arm", "fixed", "--fit-dir", str(fit), "--out-dir", str(out),
+              "--registry", str(REGISTRY)]
+    assert dl.main(["alpha", *common, "--alpha-rule", "refit0922", "--alpha-w-p", "0.01"]) == 0
+    assert dl.main(["wp", *common]) == 0
+    assert dl.main(["final", *common, "--no-holdout"]) == 0
+    final = json.loads((out / MODEL / "fixed" / "final.json").read_text())
+    assert "error" not in final, final
+    assert final["holdout_evaluated"] is False and final["holdout"] == dl.HOLDOUT_SKIPPED
+    assert not any(k.startswith("M_") for k in final)
+    assert final["inputs"]["validation"] == dl.HOLDOUT_SKIPPED
+    assert final["theta_published"] == final["theta_merged"]  # D5 still applies
+    assert not (out / MODEL / "fixed" / "holdout_final.json").exists()
+    assert (out / MODEL / "fixed" / "verdict_final.json").exists()
+    assert dl.main(["summary", "--model", MODEL, "--fit-dir", str(fit), "--out-dir", str(out),
+                    "--registry", str(REGISTRY)]) == 0
 
 
 def test_a_stage_refuses_to_run_before_its_predecessor(tmp_path) -> None:

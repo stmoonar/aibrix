@@ -42,7 +42,10 @@ Stages (``python -m scripts.dline_refit STAGE --model M --arm primary|fixed|k3 .
     published whatever the family rule says (the family theta is kept as diagnostic);
     then the hold-out report on the validation CSV (``theta_verdict.holdout_report``,
     dwell 2), the M balanced-accuracy CI (cell bootstrap) and the per-prompt-length
-    attainment of the TTFT SLO on non-overlapping 30 s tiles.
+    attainment of the TTFT SLO on non-overlapping 30 s tiles. ``--no-holdout`` stops
+    after the verdict and never opens the validation CSV: M is evaluated exactly once,
+    after it is frozen and hashed (plan §6.11 note 9), so every refit before that runs
+    without it.
 ``summary``
     the table of every model and arm under ``--out-dir`` plus the boundary-band window
     counts per shape / family and what hold cells a family short of
@@ -421,7 +424,16 @@ def bucket(length: float) -> str:
             else "1025-2048" if length <= 2048 else ">2048")
 
 
-def stage_final(model: str, label, p: Mapping[str, Any], wp_doc: Mapping[str, Any], out_dir: Path) -> dict:
+#: What ``final.json`` says instead of the M numbers when the stage ran with ``--no-holdout``.
+HOLDOUT_SKIPPED = ("not evaluated (--no-holdout): M is read once, after it is frozen and "
+                   "hashed (plan 2026-09-21 §6.11 note 9)")
+
+
+def stage_final(model: str, label, p: Mapping[str, Any], wp_doc: Mapping[str, Any], out_dir: Path,
+                *, holdout: bool = True) -> dict:
+    """D5 verdict at (tau, w_p*, lambda*); then, unless ``holdout`` is False, the M report.
+
+    With ``holdout=False`` the validation CSV is never opened (not even for its size)."""
     from tre_calibration.fit import threshold_balanced_accuracy
 
     from scripts import theta_verdict as tv
@@ -437,6 +449,19 @@ def stage_final(model: str, label, p: Mapping[str, Any], wp_doc: Mapping[str, An
     v["published"]["theta_m"] = v["merged"]["theta"]
     v["published"]["d5_merged_published"] = True
     (out_dir / "verdict_final.json").write_text(json.dumps(v, indent=1, default=str))
+    if not holdout:
+        spec = spec_for(tau, wp, lam)
+        s = summarize(v)
+        s["theta_family_rule"] = v["published"]["family_rule_theta"]
+        return {
+            "model": model, "tau_s": tau, "alpha": alpha_of(tau), "w_p": wp, "lambda_wait": lam,
+            **s, "stop_rule_15": v["stop_rule"]["satisfied"],
+            "appendix_10_met": v["stop_rule"].get("appendix_ci_target_met"),
+            "train_ba_at_published": threshold_balanced_accuracy(
+                spec.load(p["fitting"], label, TRIM_RAMP_WINDOWS), theta=v["published"]["theta_m"],
+                direction="higher_is_healthier")["balanced_accuracy"],
+            "holdout_evaluated": False, "holdout": HOLDOUT_SKIPPED,
+        }
     h = tv.holdout_report(v, p["validation"], dwell_windows=DWELL_WINDOWS)
     (out_dir / "holdout_final.json").write_text(json.dumps(h, indent=1, default=str))
     # M BA CI (cell bootstrap; few M cells -> wide, reported as such)
@@ -479,6 +504,7 @@ def stage_final(model: str, label, p: Mapping[str, Any], wp_doc: Mapping[str, An
         "train_ba_at_published": threshold_balanced_accuracy(
             spec.load(p["fitting"], label, TRIM_RAMP_WINDOWS), theta=theta,
             direction="higher_is_healthier")["balanced_accuracy"],
+        "holdout_evaluated": True,
         "M_windows": h["windows"], "M_cells": h["cells"], "M_violating": h["violating"],
         "M_ba": h["at_published_theta"]["balanced_accuracy"], "M_ba_ci95": ci,
         "M_recall_both_tpot_dwell2": wd["critical_recall_both_tpot"], "M_both_tpot_n": wd["both_tpot_windows"],
@@ -600,6 +626,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--ledger", action="append", default=[],
                     help="cells.jsonl of a ladder-design run (steady cells for D4' and the summary)")
     ap.add_argument("--registry", default=None, help="registry the label's idle TTFT fit is read from")
+    ap.add_argument("--no-holdout", action="store_true",
+                    help="final: stop after the verdict; never open <model>_validation.csv (M is "
+                         "evaluated once, after it is frozen - plan §6.11 note 9)")
     args = ap.parse_args(argv)
 
     def fit_dir(model: str) -> Path:
@@ -636,10 +665,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     elif args.stage == "wp":
         doc = stage_wp(model, label, p, _read_json(out / "alpha.json"))
     else:
-        doc = stage_final(model, label, p, _read_json(out / "wp.json"), out)
+        doc = stage_final(model, label, p, _read_json(out / "wp.json"), out, holdout=not args.no_holdout)
+    inputs = {k: str(v) for k, v in p.items() if k != "families"}
+    if args.stage == "final" and args.no_holdout:
+        inputs["validation"] = HOLDOUT_SKIPPED
     doc.update({"model": model, "arm": args.arm, "label_def": label.as_dict(),
-                "inputs": {k: str(v) for k, v in p.items() if k != "families"}
-                | {f"family_{k}": str(v) for k, v in p["families"].items()}})
+                "inputs": inputs | {f"family_{k}": str(v) for k, v in p["families"].items()}})
     (out / f"{args.stage}.json").write_text(json.dumps(doc, indent=1, default=str))
     print(f"wrote {out / (args.stage + '.json')}")
     return 0
