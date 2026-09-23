@@ -40,8 +40,8 @@ def _write_csv(path, windows: list[CalibrationWindow]) -> None:
         "scenario_id",
         "scenario_family",
         "trs",
-        "p95_ttft",
-        "p95_tpot",
+        "p95_ttft_client_ms",
+        "p95_tpot_client_ms",
         "prompt_tokens_total",
         "generation_tokens_total",
     ]
@@ -54,8 +54,8 @@ def _write_csv(path, windows: list[CalibrationWindow]) -> None:
                     "scenario_id": window.scenario_id,
                     "scenario_family": window.scenario_family,
                     "trs": window.signal,
-                    "p95_ttft": 80.0 if window.slo_met else 130.0,
-                    "p95_tpot": 40.0,
+                    "p95_ttft_client_ms": 80.0 if window.slo_met else 130.0,
+                    "p95_tpot_client_ms": 40.0,
                     "prompt_tokens_total": 100.0,
                     "generation_tokens_total": 50.0,
                 }
@@ -146,7 +146,7 @@ def test_point_estimate_and_interval_move_together_when_the_criterion_changes(
 
 
 def test_the_report_carries_the_shared_label_and_e2e_is_rejected(tmp_path) -> None:
-    """Plan 6.10 leftover: the CI driver uses tre_calibration.labels, like every fit."""
+    """Plan 6.10 leftover: the CI driver uses tre_common.slo_labels, like every fit."""
     import pytest
 
     report = _run(tmp_path, "label")

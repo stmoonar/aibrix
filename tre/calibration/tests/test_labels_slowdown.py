@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from tre_calibration.dataset import load_windows_from_csv
-from tre_calibration.labels import (
+from tre_common.slo_labels import (
     LABEL_DEF_NAME,
     LabelDefinition,
     LabelInputError,
@@ -35,7 +35,9 @@ def _row(pairs, *, tpot=20.0, n=None, unserved=False, p95_ttft=None):
         "completed_requests": len(pairs) if n is None else n,
         "p95_tpot": tpot,
         "p95_ttft": p95_ttft if p95_ttft is not None else max((t for t, _ in pairs), default=""),
-        "slo_violated": "True" if unserved else "False",
+        # unserved evidence is the count columns; slo_violated is never read
+        "client_timeouts": 1 if unserved else 0,
+        "slo_violated": "False",
     }
 
 
@@ -115,7 +117,9 @@ def test_fixed_mode_is_unchanged_on_legacy_rows() -> None:
         {"p95_ttft": 600, "p95_tpot": 20},
         {"p95_ttft": 100, "p95_tpot": 80},
         {"p95_ttft": "", "p95_tpot": 20},
-        {"p95_ttft": "", "p95_tpot": "", "slo_violated": True},
+        {"p95_ttft": "", "p95_tpot": "", "model_errors": 1},
+        {"p95_ttft": 100, "p95_tpot": 20, "proxy_transient_errors": "1"},
+        # slo_violated alone is the label column, not unserved evidence
         {"p95_ttft": 100, "p95_tpot": 20, "slo_violated": "True"},
     ]
     for row in rows:
@@ -126,7 +130,9 @@ def test_fixed_mode_is_unchanged_on_legacy_rows() -> None:
             assert (new.slo_met, new.ratio_max, new.unserved) == (old.slo_met, old.ratio_max, old.unserved)
     d = FIXED.as_dict()
     assert d["name"] == LABEL_DEF_NAME and d["mode"] == "fixed"
-    assert d["violated_if"] == "p95_ttft > ttft_p95_ms or p95_tpot > tpot_p95_ms or slo_violated"
+    assert d["violated_if"] == (
+        "p95_ttft_client_ms > ttft_p95_ms or p95_tpot_client_ms > tpot_p95_ms or unserved"
+    )
 
 
 def test_slowdown_refuses_a_csv_without_per_request_samples() -> None:
@@ -195,7 +201,7 @@ def test_dataset_loader_uses_the_definition(tmp_path: Path) -> None:
     path = tmp_path / "w.csv"
     fields = ["scenario_id", "scenario_family", "window_start_ms", "window_end_ms",
               "prompt_tokens_total", "generation_tokens_total", "p95_ttft", "p95_tpot",
-              "trs", "slo_violated", "completed_requests", "ttft_len_samples"]
+              "trs", "client_timeouts", "slo_violated", "completed_requests", "ttft_len_samples"]
     rows = [
         _row([(400.0, 256)] * 20),   # slowdown-violated, fixed-healthy
         _row([(400.0, 2048)] * 20),  # healthy either way
@@ -234,7 +240,7 @@ def test_d6_prime_primary_label_is_the_default() -> None:
 
 
 def test_label_arms_primary_comparison_ablation() -> None:
-    from tre_calibration.labels import label_arms
+    from tre_common.slo_labels import label_arms
 
     primary = label_def_from_args(_parser().parse_args(["--ttft-p95-ms", "500", "--tpot-p95-ms", "75"]), "dsllama-8b")
     arms = label_arms(primary)

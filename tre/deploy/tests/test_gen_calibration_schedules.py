@@ -328,7 +328,7 @@ def test_mixture_schedule_is_held_out_and_runs_shapes_in_parallel(
     row = {
         "scenario_id": meta["cell_id"], "input_tokens": 0, "output_tokens": 0,
         "generation_tokens_total": "100", "window_start_ms": "0", "window_end_ms": "30000",
-        "p95_ttft": "100", "p95_tpot": "10",
+        "p95_ttft_client_ms": "100", "p95_tpot_client_ms": "10",
     }
     assert sample_from_row(row, ttft_slo_ms=500.0, tpot_slo_ms=75.0) is None
 

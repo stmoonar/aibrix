@@ -56,9 +56,9 @@ def _csv(path: Path, seed: int) -> Path:
                     "window_start_ms": start, "window_end_ms": start + 30_000,
                     "prompt_tokens_total": gen, "generation_tokens_total": gen,
                     "avg_waiting": waiting, "avg_running": running, "avg_swapping": 0.0,
-                    "queue_control": running, "p95_ttft": 400.0 * ratio, "p95_tpot": 30.0,
-                    "p95_e2e": 1.0, "trs": "", "model_errors": 0, "proxy_transient_errors": 0,
-                    "client_timeouts": 0, "slo_violated": False,
+                    "queue_control": running, "p95_ttft_client_ms": 400.0 * ratio,
+                    "p95_tpot_client_ms": 30.0, "p95_e2e_client_ms": 1.0, "trs": "",
+                    "model_errors": 0, "proxy_transient_errors": 0, "client_timeouts": 0,
                 })
                 start += 5_000
     return path

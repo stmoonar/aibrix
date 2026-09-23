@@ -13,6 +13,7 @@ import json
 from pathlib import Path
 
 from tre_calibration.capacity import CapacitySample, fit_capacity_surface
+from tre_common import slo_labels
 
 
 def _f(value: str) -> float | None:
@@ -22,7 +23,10 @@ def _f(value: str) -> float | None:
 
 
 def sample_from_row(row: dict, *, ttft_slo_ms: float, tpot_slo_ms: float) -> CapacitySample | None:
-    """Pure: one grid window row -> a CapacitySample (or None if unusable)."""
+    """Pure: one grid window row -> a CapacitySample (or None if unusable).
+
+    SLO-met is :func:`tre_common.slo_labels.window_slo_label` == healthy on the client
+    columns; an unlabeled window (no p95) is not SLO-met, as before."""
     output_tokens = int(row["output_tokens"])
     gen = _f(row.get("generation_tokens_total"))
     ws = _f(row.get("window_start_ms"))
@@ -31,9 +35,9 @@ def sample_from_row(row: dict, *, ttft_slo_ms: float, tpot_slo_ms: float) -> Cap
         return None
     window_s = (we - ws) / 1000.0
     rps = (gen / output_tokens) / window_s
-    ttft = _f(row.get("p95_ttft"))
-    tpot = _f(row.get("p95_tpot"))
-    slo_met = ttft is not None and tpot is not None and ttft <= ttft_slo_ms and tpot <= tpot_slo_ms
+    slo_met = slo_labels.window_slo_label(
+        row, slo_labels.slo_targets(ttft_slo_ms=ttft_slo_ms, tpot_slo_ms=tpot_slo_ms)
+    ) == slo_labels.LABEL_HEALTHY
     return CapacitySample(
         model=row["scenario_id"].split("_")[0] if "model" not in row else row["model"],
         input_tokens=int(row["input_tokens"]),

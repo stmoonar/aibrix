@@ -8,7 +8,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
-from tre_calibration.labels import LabelDefinition, LabelSpec, label_window
+from tre_common import slo_labels
+from tre_common.slo_labels import LabelDefinition, LabelSpec, label_window
 from tre_common.tss import (
     DEFAULT_EMA_TAU_MS,
     TssEma,
@@ -22,11 +23,8 @@ from tre_common.tss import (
 
 LOG = logging.getLogger(__name__)
 
-_LATENCY_COLUMNS = {
-    "ttft_p95": "p95_ttft",
-    "tpot_p95": "p95_tpot",
-    "e2e_p95": "p95_e2e",
-}
+#: SLO key -> the client-side p95 column it is judged on (tre_common.slo_labels).
+_LATENCY_COLUMNS = dict(slo_labels.SLO_COLUMNS)
 
 
 @dataclass(frozen=True)
@@ -47,7 +45,7 @@ class CalibrationWindow:
     latency_ratio_avg: float | None = None
     queue_raw: float | None = None
     #: None for a healthy window, else unserved / both / ttft_only / tpot_only
-    #: (tre_calibration.labels.WindowLabel.violation_class) - for per-class recall.
+    #: (tre_common.slo_labels.WindowLabel.violation_class) - for per-class recall.
     violation_class: str | None = None
 
 
@@ -192,6 +190,13 @@ def load_windows_from_csv(
 ) -> list[CalibrationWindow]:
     """Load per-window calibration rows from a load-scan CSV.
 
+    Each row's healthy/violated label is :func:`tre_common.slo_labels.window_slo_label` -
+    the function the boundary search judges its probes with - so the fit and the search
+    cannot disagree about a window. ``unlabeled`` rows (a p95 the SLO needs is missing)
+    are dropped: no evidence is not evidence of health. A row violated only through an
+    unserved request (no latency sample at all) is kept as a violation with no latency
+    ratio. See :func:`calibration_window_from_row`.
+
     ``trim_ramp_windows`` drops that many earliest windows per scenario; it shifts the
     fitted theta by a few percent, so callers record the value they used in the
     calibration artifact rather than relying on a default.
@@ -209,19 +214,15 @@ def load_windows_from_csv(
     (:func:`tre_common.tss.signal_ema`) over every row of each cell, as the controller
     does online (plan §6.9 item 4). It is ignored with ``tss``, which carries its own tau.
     """
-    # The production callers pass the LabelDefinition itself (fixed or slowdown TTFT SLO,
-    # min-n guard); a plain mapping keeps the historical fixed label for ad-hoc CSVs.
-    label_spec: LabelSpec = latency_slo_ms
-    slowdown = isinstance(label_spec, LabelDefinition) and label_spec.slowdown
-    if isinstance(label_spec, LabelDefinition):
-        latency_slo_ms = label_spec.latency_slo_ms()
-    active_columns = _resolve_latency_columns(latency_slo_ms)
-    if not active_columns:
+    # Validated once up front: an unknown SLO key is a caller error, not a skipped row.
+    if not _resolve_latency_columns(_fixed_thresholds(latency_slo_ms)):
         raise ValueError("latency_slo_ms must contain at least one active SLO")
 
     windows: list[CalibrationWindow] = []
     with Path(path).open("r", encoding="utf-8", newline="") as f:
         all_rows = list(csv.DictReader(f))
+    # The signal of every row first: an EMA advances over every row of a cell, including
+    # rows the filter below drops, because the online EMA saw them too.
     if tss is not None:
         recomputed: list[float | None] | None = recompute_tss_rows(all_rows, tss)
     elif ema_tau_ms is not None:
@@ -234,52 +235,84 @@ def load_windows_from_csv(
     else:
         recomputed = None
     for index, row in enumerate(all_rows):
-        if _skip_row(row):
-            continue
-
         if recomputed is not None:
             raw_signal: Any = recomputed[index]
         else:
             raw_signal = (
                 signal_transform(row) if signal_transform is not None else row.get(signal_column)
             )
-        signal = _as_float(raw_signal)
-        if signal is None:
-            continue
-        prompt_tokens = _as_float(row.get("prompt_tokens_total"), 0.0) or 0.0
-        generation_tokens = _as_float(row.get("generation_tokens_total"), 0.0) or 0.0
-        if prompt_tokens + generation_tokens <= 0.0:
-            continue
-
-        # The shared label (tre_calibration.labels): p95 TTFT/TPOT against the SLOs, and a
-        # window holding an unserved request is violated even without a latency sample.
-        label = label_window(row, label_spec)
-        if label is None:
-            continue
-        p95_ratio_max = label.ratio_max
-        queue_raw: float | None = None
-        if lambda_wait is not None and _as_float(row.get("avg_running")) is not None:
-            queue_raw = tss_queue(
-                _as_float(row.get("avg_running"), 0.0) or 0.0,
-                _as_float(row.get("avg_waiting"), 0.0) or 0.0,
-                float(lambda_wait),
-            )
-        windows.append(
-            CalibrationWindow(
-                scenario_id=(row.get("scenario_id") or "unknown").strip() or "unknown",
-                scenario_family=(row.get("scenario_family") or "unknown").strip() or "unknown",
-                signal=signal,
-                slo_met=label.slo_met,
-                health_score=1.0 / (1.0 + p95_ratio_max),
-                window_start_ms=_as_float(row.get("window_start_ms")),
-                latency_ratio_p95=p95_ratio_max,
-                # avg_* columns are fixed-threshold ratios; meaningless under slowdown.
-                latency_ratio_avg=None if slowdown else _avg_latency_ratio(row, latency_slo_ms),
-                queue_raw=queue_raw,
-                violation_class=label.violation_class,
-            )
+        window = calibration_window_from_row(
+            row,
+            latency_slo_ms=latency_slo_ms,
+            signal=_as_float(raw_signal),
+            lambda_wait=lambda_wait,
         )
+        if window is not None:
+            windows.append(window)
     return trim_scenario_ramp_windows(windows, count=trim_ramp_windows)
+
+
+def calibration_window_from_row(
+    row: Mapping[str, Any],
+    *,
+    latency_slo_ms: LabelSpec,
+    signal: float | None,
+    lambda_wait: float | None = None,
+) -> CalibrationWindow | None:
+    """One window CSV row -> a :class:`CalibrationWindow`, or None when it is not used.
+
+    The single row-to-window rule: :func:`load_windows_from_csv`,
+    ``scripts.refit_trs_params``, ``scripts.theta_verdict`` / ``scripts.alpha_fit`` /
+    ``scripts.dline_refit`` (through the loader) all call it, so every fit sees exactly
+    the same windows and labels. A row is dropped when it is filtered (warm-up - either
+    ``is_warmup`` or the standard dataset's ``in_warmup`` -, contaminated, out of scope),
+    has no signal, carried no tokens, or is ``unlabeled`` under ``latency_slo_ms``.
+
+    ``latency_slo_ms`` is the label: production callers pass the
+    :class:`~tre_common.slo_labels.LabelDefinition` itself (fixed or slowdown TTFT, the
+    min-n guard); a plain ``{"ttft_p95", "tpot_p95"}`` mapping is the historical fixed
+    label without the min-n guard. A row violated only through an unserved request (no
+    latency sample at all) is kept as a violation with ratio ``UNSERVED_MIN_RATIO``.
+    """
+    if _skip_row(row) or signal is None:
+        return None
+    prompt_tokens = _as_float(row.get("prompt_tokens_total"), 0.0) or 0.0
+    generation_tokens = _as_float(row.get("generation_tokens_total"), 0.0) or 0.0
+    if prompt_tokens + generation_tokens <= 0.0:
+        return None
+    label = label_window(row, latency_slo_ms)
+    if label is None:
+        return None
+    slowdown = isinstance(latency_slo_ms, LabelDefinition) and latency_slo_ms.slowdown
+    queue_raw: float | None = None
+    if lambda_wait is not None and _as_float(row.get("avg_running")) is not None:
+        queue_raw = tss_queue(
+            _as_float(row.get("avg_running"), 0.0) or 0.0,
+            _as_float(row.get("avg_waiting"), 0.0) or 0.0,
+            float(lambda_wait),
+        )
+    return CalibrationWindow(
+        scenario_id=(row.get("scenario_id") or "unknown").strip() or "unknown",
+        scenario_family=(row.get("scenario_family") or "unknown").strip() or "unknown",
+        signal=signal,
+        slo_met=label.slo_met,
+        health_score=1.0 / (1.0 + label.ratio_max),
+        window_start_ms=_as_float(row.get("window_start_ms")),
+        latency_ratio_p95=label.ratio_max,
+        # avg_* columns are fixed-threshold ratios; meaningless under slowdown.
+        latency_ratio_avg=(
+            None if slowdown else _avg_latency_ratio(row, _fixed_thresholds(latency_slo_ms))
+        ),
+        queue_raw=queue_raw,
+        violation_class=label.violation_class,
+    )
+
+
+def _fixed_thresholds(spec: LabelSpec) -> Mapping[str, float]:
+    """The fixed thresholds of a label (the mapping itself, or the definition's)."""
+    if isinstance(spec, LabelDefinition):
+        return spec.latency_slo_ms()
+    return spec
 
 
 def trim_scenario_ramp_windows(
@@ -375,14 +408,22 @@ def _scenario_hash(scenario_id: str, seed: str) -> str:
 def _resolve_latency_columns(latency_slo_ms: Mapping[str, float]) -> dict[str, str]:
     out: dict[str, str] = {}
     for slo_key in latency_slo_ms:
-        out[slo_key] = _LATENCY_COLUMNS.get(slo_key, slo_key)
+        if slo_key not in _LATENCY_COLUMNS:
+            raise ValueError(
+                f"unknown SLO key {slo_key!r}; expected one of {sorted(_LATENCY_COLUMNS)}"
+            )
+        out[slo_key] = _LATENCY_COLUMNS[slo_key]
     return out
 
 
 def _skip_row(row: Mapping[str, Any]) -> bool:
     if row.get("metric_scope") and str(row.get("metric_scope")).strip() != "model":
         return True
-    if _as_bool(row.get("is_warmup")) or _as_bool(row.get("is_contaminated")):
+    # ``is_warmup`` (older sweeps) and ``in_warmup`` (the standard dataset, and
+    # ``rewindow_from_raw --ledger``) are the same flag under two names.
+    if _as_bool(row.get("is_warmup")) or _as_bool(row.get("in_warmup")):
+        return True
+    if _as_bool(row.get("is_contaminated")):
         return True
     return bool(str(row.get("filter_reason") or "").strip())
 

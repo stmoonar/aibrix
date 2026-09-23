@@ -23,8 +23,8 @@ def _write_csv(path, rows) -> None:
         "avg_waiting",
         "avg_running",
         "avg_swapping",
-        "p95_ttft",
-        "p95_tpot",
+        "p95_ttft_client_ms",
+        "p95_tpot_client_ms",
     ]
     with open(path, "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -62,8 +62,8 @@ def _adopt_rows() -> list[dict]:
                 "avg_waiting": 0.0,
                 "avg_running": 1.0,
                 "avg_swapping": 0.0,
-                "p95_ttft": ttft,
-                "p95_tpot": 10.0,  # ratio 0.2, never gates slo_met/health
+                "p95_ttft_client_ms": ttft,
+                "p95_tpot_client_ms": 10.0,  # ratio 0.2, never gates slo_met/health
             }
         )
     return rows
@@ -89,8 +89,8 @@ def _keep_rows() -> list[dict]:
                 "avg_waiting": 0.0,
                 "avg_running": 1.0,
                 "avg_swapping": 0.0,
-                "p95_ttft": ttft,
-                "p95_tpot": 10.0,
+                "p95_ttft_client_ms": ttft,
+                "p95_tpot_client_ms": 10.0,
             }
         )
     return rows

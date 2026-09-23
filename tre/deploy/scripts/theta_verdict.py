@@ -57,7 +57,7 @@ from tre_calibration.fit import (
     signal_z,
     threshold_balanced_accuracy,
 )
-from tre_calibration.labels import LabelDefinition, add_label_arguments, label_def_from_args
+from tre_common.slo_labels import LabelDefinition, add_label_arguments, label_def_from_args
 from tre_calibration.profile import theta_fit_block
 from tre_common.tss import DEFAULT_EMA_TAU_MS, TSS_UNITS
 
@@ -176,7 +176,7 @@ def _band(windows: Sequence[CalibrationWindow], theta: float, direction: str) ->
 def _waiting_stats(path: str | Path, label: LabelDefinition) -> dict[str, Any]:
     """Share of windows with a non-zero waiting queue, overall and among violated ones -
     how identifiable lambda_wait is on this data."""
-    from tre_calibration.labels import label_window
+    from tre_common.slo_labels import label_window
 
     total = nonzero = viol = viol_nonzero = 0
     with Path(path).open(newline="", encoding="utf-8") as fh:

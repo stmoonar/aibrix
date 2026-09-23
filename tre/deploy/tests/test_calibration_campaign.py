@@ -275,6 +275,28 @@ def test_cell_command_passes_the_drain_offset_so_truncation_can_jump_to_it() -> 
     assert command[command.index("--min-slo-windows") + 1] == "3"
 
 
+def test_a_cell_is_windowed_like_the_fit_so_its_probe_verdict_is_the_fit_s_label() -> None:
+    class Args(_Args):
+        gateway_url = "http://gw/v1/completions"
+        raw_dir = Path("/raw")
+        model_namespace = "default"
+        guard_mode = "warn"
+        min_slo_windows = 3
+        registry = None
+        redis_url = None
+
+    args = Args()
+    cell = campaign.Cell("dsqwen-7b", "S1", "hold", "i256_o128_c1090", "s.json", 90.0, 10.0)
+    command = campaign.cell_command(cell, args, Path("s.json"), Path("out.csv"))
+    assert command[command.index("--window-ms") + 1] == str(args.window_ms)
+    assert command[command.index("--step-ms") + 1] == str(args.fit_step_ms)
+    plan = campaign.fit_plan(["dsqwen-7b"], Path("/out"), Path("/raw"), args, {})
+    fitting = plan["rewindow"][0]["command"]
+    assert fitting[fitting.index("--window-ms") + 1] == str(args.window_ms)
+    assert fitting[fitting.index("--step-ms") + 1] == str(args.fit_step_ms)
+    assert fitting[fitting.index("--tpot-slo-ms") + 1] == str(args.tpot_slo_ms)
+
+
 def test_every_calibration_cell_is_driven_with_the_strict_failure_rules() -> None:
     # These three flags are the campaign's discipline, not r3_grid's defaults. Each one
     # silently pollutes theta by its absence, so each is asserted here by name.
@@ -312,11 +334,17 @@ def test_dry_run_writes_the_plan_without_driving_anything(tmp_path, monkeypatch)
     index_path = tmp_path / "INDEX.json"
     index_path.write_text(json.dumps(_index()), encoding="utf-8")
 
-    def _no_subprocess(*args, **kwargs):  # pragma: no cover - must never be reached
-        raise AssertionError("a dry run must not drive a cell")
+    real_run = campaign.subprocess.run
+
+    def _no_subprocess(argv, *args, **kwargs):
+        # Reading the code commit for the plan's provenance is fine; driving is not.
+        if argv and argv[0] == "git":
+            return real_run(argv, *args, **kwargs)
+        raise AssertionError("a dry run must not drive a cell")  # pragma: no cover
 
     monkeypatch.setattr(campaign.subprocess, "run", _no_subprocess)
     exit_code = campaign.main([
+        "--design", "primitives",
         "--index", str(index_path), "--models", "dsqwen-7b",
         "--out-dir", str(tmp_path / "out"), "--dry-run",
     ])
@@ -326,23 +354,46 @@ def test_dry_run_writes_the_plan_without_driving_anything(tmp_path, monkeypatch)
     assert plan["admission_cap"]["name"] == admission.GATEWAY_CAPPED.name
     assert len(plan["skipped"]) == 1
     assert (tmp_path / "out" / "fit_plan.json").exists()
+    # the plan says what it was made with and which ruler it labels with
+    provenance = plan["provenance"]
+    assert provenance["label"]["latency_source"] == "client per-request"
+    assert provenance["registry_sha256"] and len(provenance["registry_sha256"]) == 64
+    # D8: 30 s windows ending on the 10 s gateway grid; D6': the primary label is the
+    # slowdown TTFT label, recorded per model
+    assert (provenance["window_ms"], provenance["step_ms"]) == (30000, 10000)
+    assert provenance["window_align"] == "grid"
+    assert provenance["label"]["mode"] == "slowdown"
+    assert set(provenance["label_by_model"]) == {"dsqwen-7b"}
 
 
 # ------------------------------------------------------------------ boundary search
 
 
-def _rows(count: int, *, ttft: float = 100.0, tpot: float = 10.0, violated: bool = False):
+def _rows(count: int, *, ttft: float = 100.0, tpot: float = 10.0, model_errors: int = 0):
     return [
         {
             "window_start_ms": 1000 * i,
             "window_end_ms": 1000 * (i + 1),
-            "p95_ttft": ttft,
-            "p95_tpot": tpot,
-            "slo_violated": violated,
-            "model_errors": 0,
+            "p95_ttft_client_ms": ttft,
+            "p95_tpot_client_ms": tpot,
+            "model_errors": model_errors,
         }
         for i in range(count)
     ]
+
+
+def _sliding_rows(duration_s: float, *, tpot: float, window_ms: int = 30000, step_ms: int = 5000,
+                  start_ms: int = 1_790_011_888_589):
+    """What rewindow_from_raw lays over a probe: 30 s windows sliding by 5 s."""
+    rows = []
+    w = start_ms
+    while w + window_ms <= start_ms + int(duration_s * 1000):
+        rows.append({
+            "window_start_ms": w, "window_end_ms": w + window_ms,
+            "p95_ttft_client_ms": 200.0, "p95_tpot_client_ms": tpot,
+        })
+        w += step_ms
+    return rows
 
 
 def _fake_drive(violating_at: float, log=None):
@@ -389,6 +440,12 @@ def test_the_three_stages_cost_what_the_plan_says_they_do() -> None:
     assert seconds["dwell"] == 300.0
     assert boundary.shape_seconds() == 810.0
     assert boundary.probe_count() == 6
+
+
+def test_a_coarse_probe_is_long_enough_to_be_conclusive_on_the_fitting_window() -> None:
+    # Three disjoint 30 s windows need 90 s; the 60 s this started at could never be.
+    assert boundary.COARSE_SECONDS >= boundary.min_probe_seconds(30000)
+    assert boundary.min_probe_seconds(30000) == 90.0
 
 
 def test_a_voided_probe_is_re_driven_and_never_counted_as_healthy() -> None:
@@ -443,35 +500,126 @@ def test_a_shape_that_never_violates_says_so_instead_of_inventing_a_boundary() -
 
 def test_a_probe_is_judged_on_the_fraction_of_its_windows_not_on_any_one() -> None:
     rows = _rows(9, ttft=100.0)
-    rows[0]["p95_ttft"] = 900.0
-    violated, violating, total = boundary.probe_violated(
-        rows, ttft_slo_ms=500.0, tpot_slo_ms=75.0
-    )
-    assert (violating, total) == (1, 9) and not violated
+    rows[0]["p95_ttft_client_ms"] = 900.0
+    verdict = boundary.probe_verdict(rows, ttft_slo_ms=500.0, tpot_slo_ms=75.0)
+    assert (verdict.violating_windows, verdict.labeled_windows) == (1, 9)
+    assert verdict.verdict == boundary.VERDICT_HEALTHY
     for row in rows[:5]:
-        row["p95_ttft"] = 900.0
-    violated, violating, _ = boundary.probe_violated(
-        rows, ttft_slo_ms=500.0, tpot_slo_ms=75.0
-    )
-    assert violated and violating == 5
+        row["p95_ttft_client_ms"] = 900.0
+    verdict = boundary.probe_verdict(rows, ttft_slo_ms=500.0, tpot_slo_ms=75.0)
+    assert verdict.verdict == boundary.VERDICT_VIOLATED and verdict.violating_windows == 5
 
 
 def test_a_window_holding_a_model_error_counts_as_a_violation() -> None:
     rows = _rows(4, ttft=100.0)
     for row in rows[:3]:
-        row["slo_violated"] = True
-    violated, violating, _ = boundary.probe_violated(
-        rows, ttft_slo_ms=500.0, tpot_slo_ms=75.0
-    )
-    assert violated and violating == 3
+        row["model_errors"] = 1
+    verdict = boundary.probe_verdict(rows, ttft_slo_ms=500.0, tpot_slo_ms=75.0)
+    assert verdict.verdict == boundary.VERDICT_VIOLATED and verdict.violating_windows == 3
 
 
-def test_a_probe_with_too_few_windows_is_not_scored_as_healthy() -> None:
+def test_a_probe_with_no_windows_is_inconclusive_not_healthy_and_not_void() -> None:
     result = campaign.probe_result_from_cell(
-        boundary.Probe(1.0, 60.0, "coarse"), "i256_o128_c100", [], {},
+        boundary.Probe(1.0, 90.0, "coarse"), "i256_o128_c100", [], {},
         ttft_slo_ms=500.0, tpot_slo_ms=75.0,
     )
-    assert not result.valid and result.void_reasons == ("no windows",)
+    assert result.verdict == boundary.VERDICT_INCONCLUSIVE
+    assert result.valid and not result.void_reasons
+
+
+# --------------------------------------------- the 2026-09-21 coarse-probe regression
+
+
+def test_the_2026_09_21_coarse_probe_that_violated_everywhere_is_not_recorded_healthy() -> None:
+    # What every coarse probe of that campaign looked like: 60 s driven, judged on two
+    # 30 s windows. dsqwen-7b T8 at rho 0.6 had BOTH windows violating (2/2) and the old
+    # rule - "fewer than 3 rows -> not violated" - booked it as healthy, walking rho*
+    # upwards. It must not be healthy now.
+    rows = [
+        {"window_start_ms": 1_790_011_888_589, "window_end_ms": 1_790_011_918_589,
+         "p95_ttft_client_ms": 480.0, "p95_tpot_client_ms": 150.0},
+        {"window_start_ms": 1_790_011_918_589, "window_end_ms": 1_790_011_948_589,
+         "p95_ttft_client_ms": 480.0, "p95_tpot_client_ms": 150.0},
+    ]
+    verdict = boundary.probe_verdict(rows, ttft_slo_ms=500.0, tpot_slo_ms=75.0)
+    assert verdict.violating_windows == 2
+    assert verdict.verdict == boundary.VERDICT_INCONCLUSIVE
+
+    search = boundary.BoundarySearch(model="dsqwen-7b", shape="T8")
+    probe = search.next_probe()
+    search.record(campaign.probe_result_from_cell(
+        probe, "i1600_o112_c1060", rows, {}, ttft_slo_ms=500.0, tpot_slo_ms=75.0,
+    ))
+    assert search.healthy_rho is None and search.violating_rho is None
+    redrive = search.next_probe()
+    assert redrive.rho == probe.rho and redrive.attempt == 2
+    assert redrive.duration_s == probe.duration_s * boundary.INCONCLUSIVE_DURATION_FACTOR
+
+
+def test_sliding_rows_do_not_count_as_independent_evidence() -> None:
+    # The same 60 s probe on the fitting windows (30 s sliding by 5 s) has 7 rows - more
+    # than the 3-window floor - but only 2 disjoint 30 s spans. Counting rows would let it
+    # through on two windows' worth of information.
+    rows = _sliding_rows(60, tpot=150.0)
+    assert len(rows) == 7
+    verdict = boundary.probe_verdict(rows, ttft_slo_ms=500.0, tpot_slo_ms=75.0)
+    assert verdict.independent_windows == 2
+    assert verdict.verdict == boundary.VERDICT_INCONCLUSIVE
+    # the 90 s coarse probe has three, and is decided
+    verdict = boundary.probe_verdict(
+        _sliding_rows(boundary.COARSE_SECONDS, tpot=150.0), ttft_slo_ms=500.0, tpot_slo_ms=75.0
+    )
+    assert verdict.independent_windows == 3 and verdict.verdict == boundary.VERDICT_VIOLATED
+
+
+# ------------------------------------------------------------------ three-state verdict
+
+
+def test_verdict_violated_moves_the_upper_end_of_the_bracket() -> None:
+    search = boundary.BoundarySearch()
+    probe = search.next_probe()
+    search.record(campaign.probe_result_from_cell(
+        probe, "c", _sliding_rows(90, tpot=150.0), {}, ttft_slo_ms=500.0, tpot_slo_ms=75.0,
+    ))
+    assert search.results[-1].verdict == boundary.VERDICT_VIOLATED
+    assert search.violating_rho == probe.rho and search.healthy_rho is None
+    assert search.next_probe().rho == search.coarse_rhos[1]
+
+
+def test_verdict_healthy_moves_the_lower_end_of_the_bracket() -> None:
+    search = boundary.BoundarySearch()
+    probe = search.next_probe()
+    search.record(campaign.probe_result_from_cell(
+        probe, "c", _sliding_rows(90, tpot=20.0), {}, ttft_slo_ms=500.0, tpot_slo_ms=75.0,
+    ))
+    assert search.results[-1].verdict == boundary.VERDICT_HEALTHY
+    assert search.healthy_rho == probe.rho and search.violating_rho is None
+
+
+def test_verdict_inconclusive_moves_nothing_and_stops_when_it_repeats() -> None:
+    search = boundary.BoundarySearch()
+    for _ in range(2):
+        probe = search.next_probe()
+        # every window unlabeled: too few completions for a p95
+        rows = [dict(r, p95_tpot_client_ms=None) for r in _sliding_rows(probe.duration_s, tpot=0.0)]
+        search.record(campaign.probe_result_from_cell(
+            probe, "c", rows, {}, ttft_slo_ms=500.0, tpot_slo_ms=75.0,
+        ))
+        assert search.results[-1].verdict == boundary.VERDICT_INCONCLUSIVE
+        assert search.healthy_rho is None and search.violating_rho is None
+    assert search.done and "inconclusive" in search.stopped_reason
+    assert search.rho_star is None
+
+
+def test_a_probe_result_cannot_claim_a_verdict_it_does_not_have() -> None:
+    probe = boundary.Probe(1.0, 90.0, "coarse")
+    with pytest.raises(ValueError):
+        boundary.ProbeResult(probe=probe, verdict="false")
+    with pytest.raises(ValueError):
+        boundary.ProbeResult(probe=probe, verdict=boundary.VERDICT_VOID)  # no reasons
+    with pytest.raises(ValueError):
+        boundary.ProbeResult(probe=probe, verdict=boundary.VERDICT_HEALTHY,
+                             void_reasons=("gateway shed",))
 
 
 def test_read_window_rows_of_a_voided_cell_is_empty_not_healthy(tmp_path) -> None:

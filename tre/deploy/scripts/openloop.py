@@ -494,6 +494,26 @@ def failure_signature(record: dict) -> dict:
     }
 
 
+def outcome_of(record: dict) -> str:
+    """One request's outcome under the artifact names (:data:`OUTCOME_NAMES` values).
+
+    A record that already carries its verdict - a failure signature, or a raw record from
+    a capture that stores it (``r3_grid.RAW_COLUMNS``) - is taken at its word: the sender
+    record it was classified from had fields (the error body, the client-timeout flag)
+    that the raw record does not keep. Anything else is classified now.
+    """
+    outcome = record.get("outcome")
+    if outcome:
+        return str(outcome)
+    # A ``.failures.jsonl`` row (failure_signature) keeps the capture-time verdict under
+    # its internal class name; that wins over re-classifying a record whose sender-side
+    # flags were not persisted.
+    recorded = record.get("failure_class")
+    if recorded in FAILURE_CLASSES:
+        return OUTCOME_NAMES[str(recorded)]
+    return OUTCOME_NAMES[classify_failure(record)]
+
+
 @dataclass(frozen=True)
 class CellOutcomes:
     """Per-cell request accounting, in the three counts a calibration point needs.
@@ -686,6 +706,10 @@ def routing_balance(records: Sequence[dict]) -> dict:
 #: find and replace exactly that issue without disturbing the dispatch-level ones.
 TRUNCATION_EVIDENCE_ISSUE = "truncated before collecting enough evidence"
 
+#: :attr:`CellGuard.truncation_cause` values.
+TRUNCATION_ADMISSION_OVERFLOW = "admission overflow"
+TRUNCATION_BACKLOG = "backlog limit"
+
 #: Why a cell's evidence was thrown away. Each one is a separate rule with a separate
 #: test, because a void rule that silently stops firing does not fail anything - it just
 #: lets a polluted cell into the fit, and theta moves without anyone seeing why.
@@ -734,6 +758,11 @@ class CellGuard:
     truncated_at_ts_ms: Optional[int] = None
     #: Scheduled requests deliberately not sent after truncation.
     censored: int = 0
+    #: What cut the cell short: :data:`TRUNCATION_ADMISSION_OVERFLOW` (a gateway shed) or
+    #: :data:`TRUNCATION_BACKLOG` (the client's own backlog ceiling); None when untruncated.
+    truncation_cause: Optional[str] = None
+    #: The in-flight ceiling the cell ran under (``max_backlog``); None when unarmed.
+    backlog_limit: Optional[int] = None
     #: Windows above the SLO collected before truncation; None when not yet counted.
     slo_windows: Optional[int] = None
     min_slo_windows: int = DEFAULT_MIN_SLO_WINDOWS
@@ -829,6 +858,8 @@ class CellGuard:
             "truncated_at_offset_s": self.truncated_at_offset_s,
             "truncated_at_ts_ms": self.truncated_at_ts_ms,
             "censored": self.censored,
+            "truncation_cause": self.truncation_cause,
+            "backlog_limit": self.backlog_limit,
             "slo_windows": self.slo_windows,
             "min_slo_windows": self.min_slo_windows,
             "routing_balance": self.routing,
@@ -894,6 +925,8 @@ def check_cell(
     truncated_at_offset_s: Optional[float] = None,
     truncated_at_ts_ms: Optional[int] = None,
     censored: int = 0,
+    truncation_cause: Optional[str] = None,
+    backlog_limit: Optional[int] = None,
     slo_windows: Optional[int] = None,
     min_slo_windows: int = DEFAULT_MIN_SLO_WINDOWS,
     max_routing_imbalance: Optional[float] = DEFAULT_MAX_ROUTING_IMBALANCE,
@@ -1067,6 +1100,8 @@ def check_cell(
         truncated_at_offset_s=truncated_at_offset_s,
         truncated_at_ts_ms=truncated_at_ts_ms,
         censored=int(censored),
+        truncation_cause=truncation_cause if truncated else None,
+        backlog_limit=None if backlog_limit is None else int(backlog_limit),
         min_slo_windows=int(min_slo_windows),
         routing=routing,
         client_timeouts=outcomes.client_timeout,
@@ -1361,77 +1396,66 @@ def make_envoy_stats_reader(url: str, *, fetch: Callable[[str], str] = _default_
 
 
 def mark_unserved_request_windows(
-    rows: Sequence[dict], records: Sequence[dict]
+    rows: Sequence[dict], records: Sequence[dict], *, closed_right: bool = False
 ) -> list[dict]:
-    """Label every window holding a request that went unserved as an SLO violation, and
-    keep the window.
+    """Count, per window, the requests sent in it that went unserved - and keep the window.
 
-    Two classes qualify, counted separately in the row and for the same reason.
+    Three classes are counted, each in its own column, and each makes the window a
+    violation in :func:`tre_common.slo_labels.window_slo_label` (which reads these counts;
+    nothing here decides the label):
 
-    A request the engine failed is evidence about the engine at that operating point -
-    arguably the strongest evidence a window can carry - so dropping those windows would
-    remove exactly the overloaded ones and pull theta towards health. It must also not be
-    scored as healthy just because the failed request contributed no latency sample,
-    which is what happens if nothing marks it: a window whose slowest requests all
-    errored out can otherwise show a comfortable p95.
+    * ``model_errors`` - the engine failed the request. That is evidence about the engine
+      at this operating point - arguably the strongest a window can carry - so dropping
+      those windows would remove exactly the overloaded ones and pull theta towards
+      health. Nor may the window score healthy because the failed request left no latency
+      sample, which is what happens if nothing counts it.
+    * ``proxy_transient_errors`` - a connection under the request died. Not evidence about
+      the engine, but still a request nobody served, and goodput counts it as a loss.
+    * ``client_timeouts`` - the client gave up before an answer came. For every
+      calibration shape the timeout (>= 30 s) is far beyond TTFT SLO + (output-1) x TPOT
+      SLO, so such a request cannot have met its SLO; leaving it out would let the
+      slowest requests of an overloaded window vanish from its p95.
 
-    A request a transient proxy failure dropped is not evidence about the engine, but it
-    is still a request the system did not serve, and goodput counts it as a loss. Marking
-    its window keeps the window's verdict and the cell's goodput saying the same thing;
-    it is counted in its own column so it is never mistaken for an engine fault.
-
-    An admission overflow is in neither: it is handled by the shed policy, which either
-    truncates the cell or voids it outright.
-
-    A request the *client* gave up on (``client_timeout``) is a third class and is marked
-    for the same reason: it was not served within the client's deadline, which is far past
-    any latency SLO, and it contributed no latency sample. Leaving it unmarked is what let
-    the 655 timed-out 7b requests of the 2026-09-21 campaign read as healthy windows
-    (plan §6.3 B2). It gets its own column as well.
+    An admission overflow is in none of them: it is handled by the shed policy, which
+    either truncates the cell or voids it outright.
 
     A request is attributed to a window by its send time, because that is the operating
     point that produced the failure; a failed request often has no completion time at all.
+    ``closed_right`` picks the window interval: ``[start, end)`` (the live grid, the
+    default) or ``(start, end]`` (the phase-aligned grid of ``rewindow_from_raw
+    --window-align grid``, whose windows are stamped at their end tick) - the interval the
+    window's latency samples use as well, so a request never counts as unserved in one
+    window while its neighbour is labelled on the same instant.
 
-    ``records`` may be live sender records or the rows of a cell's ``.failures.jsonl``;
-    the latter carry the verdict made at capture time in ``failure_class``, which wins
-    over re-classifying a record whose sender-side flags were not persisted.
+    ``records`` may be live sender records, raw records carrying ``outcome``, or the rows
+    of a cell's ``.failures.jsonl`` whose capture-time verdict is ``failure_class`` (see
+    :func:`outcome_of`).
     """
-    def verdict(record: dict) -> str:
-        recorded = record.get("failure_class")
-        if recorded in FAILURE_CLASSES:
-            return str(recorded)
-        return classify_failure(record)
-
     def send_times(wanted: str) -> list[int]:
         out: list[int] = []
         for record in records:
-            if verdict(record) != wanted:
+            if outcome_of(record) != wanted:
                 continue
             ts = record.get("actual_send_ts_ms", record.get("send_ts_ms"))
             if ts is not None:
                 out.append(int(ts))
         return out
 
-    model_errors = send_times(FAILURE_MODEL)
-    transient = send_times(FAILURE_PROXY_TRANSIENT)
-    timeouts = send_times(FAILURE_CLIENT_TIMEOUT)
+    counted = {
+        "model_errors": send_times(OUTCOME_NAMES[FAILURE_MODEL]),
+        "proxy_transient_errors": send_times(OUTCOME_NAMES[FAILURE_PROXY_TRANSIENT]),
+        "client_timeouts": send_times(OUTCOME_NAMES[FAILURE_CLIENT_TIMEOUT]),
+    }
     marked: list[dict] = []
     for row in rows:
         out = dict(row)
         start = int(row["window_start_ms"])
         end = int(row["window_end_ms"])
-        count = sum(1 for ts in model_errors if start <= ts < end)
-        transient_count = sum(1 for ts in transient if start <= ts < end)
-        timeout_count = sum(1 for ts in timeouts if start <= ts < end)
-        out["model_errors"] = count
-        out["proxy_transient_errors"] = transient_count
-        out["client_timeouts"] = timeout_count
-        out["slo_violated"] = (
-            bool(row.get("slo_violated"))
-            or count > 0
-            or transient_count > 0
-            or timeout_count > 0
-        )
+        for column, stamps in counted.items():
+            if closed_right:
+                out[column] = sum(1 for ts in stamps if start < ts <= end)
+            else:
+                out[column] = sum(1 for ts in stamps if start <= ts < end)
         marked.append(out)
     return marked
 
@@ -1511,6 +1535,72 @@ class TruncateOnProxyShed:
             self._cursor += 1
 
 
+class StopOnBacklog:
+    """Sender wrapper that stops offering load once the client's backlog passes a ceiling.
+
+    An open loop far above capacity queues without bound until the client's own request
+    deadline (30 s) starts abandoning requests. Nothing about the boundary is learnt past
+    that point - a cell with ``max_backlog`` requests outstanding against an engine that
+    runs at most ``max_num_seqs`` of them is violating its latency SLO by tens of seconds -
+    but the load keeps growing towards the gateway's admission ceiling, where a shed would
+    VOID the cell, and a second void stops the whole campaign. This wrapper is the safety
+    valve for the boundary search's high-rho probes: when the number of requests this
+    client has outstanding reaches ``max_backlog`` it stops sending (the remaining
+    requests are counted as censored), and the guard records the stop so the probe is
+    read as violated rather than as short of evidence.
+
+    The count is kept here rather than read from the sender, so it includes requests
+    waiting for a sender thread: those are outstanding too.
+    """
+
+    def __init__(self, sender, *, max_backlog: int) -> None:
+        if int(max_backlog) <= 0:
+            raise ValueError(f"max_backlog must be positive, got {max_backlog}")
+        self._sender = sender
+        self.max_backlog = int(max_backlog)
+        self.outstanding = 0
+        self.peak_outstanding = 0
+        self.truncated = False
+        self.truncated_at_offset_s: Optional[float] = None
+        self.truncated_at_ts_ms: Optional[int] = None
+        self.censored = 0
+
+    @property
+    def records(self) -> list:
+        return self._sender.records
+
+    async def __call__(self, request, scheduled_ts: float, actual_ts: float) -> None:
+        if self.truncated:
+            self.censored += 1
+            return
+        if self.outstanding >= self.max_backlog:
+            self.truncated = True
+            self.truncated_at_offset_s = float(getattr(request, "scheduled_offset_s", 0.0))
+            self.truncated_at_ts_ms = int(time.time() * 1000)
+            self.censored += 1
+            return
+        self.outstanding += 1
+        self.peak_outstanding = max(self.peak_outstanding, self.outstanding)
+        try:
+            await self._sender(request, scheduled_ts, actual_ts)
+        finally:
+            self.outstanding -= 1
+
+
+def namespace_request_ids(events: Sequence, request_key: Optional[str]) -> list:
+    """Give every scheduled request an id that is unique to this cell.
+
+    The replayer names a schedule's requests ``<model>-<index>`` and seeds each prompt
+    from ``<model>|<request id>``, so without a namespace request *k* of every schedule
+    of a model is built from the same seed: two cells of the same shape send the same
+    prompts, request for request. ``request_key`` (the campaign passes one per cell) is
+    prefixed onto the id, which makes the prompt seed - and therefore the prompt - a
+    function of the cell as well as of the index. ``None`` leaves the ids untouched.
+    """
+    if not request_key:
+        return list(events)
+    return [replace(e, request_id=f"{request_key}-{e.request_id}") for e in events]
+
 
 # ---------------------------------------------------------------------------- driver
 
@@ -1576,6 +1666,9 @@ def drive_cell_schedule(
     failures_path: Optional[Path] = None,
     overflow_sentinel: Optional["PendingOverflowSentinel"] = None,
     records_out: Optional[list] = None,
+    instants_out: Optional[list] = None,
+    request_key: Optional[str] = None,
+    max_backlog: Optional[int] = None,
 ) -> tuple:
     """Drive one open-loop cell from ``segments``; returns (start_ms, end_ms, guard).
 
@@ -1608,6 +1701,13 @@ def drive_cell_schedule(
     With ``rps_timeline_path`` the cell also writes its nominal-vs-achieved arrival
     series, built from the instants the requests actually reached the wire.
 
+    ``request_key`` namespaces the request ids, and with them the prompt seeds, so two
+    cells never send the same prompts (see :func:`namespace_request_ids`); ``seed``
+    decides the arrival instants (and sampled lengths). ``max_backlog`` arms
+    :class:`StopOnBacklog`; a stop is recorded on the guard as a truncation whose cause
+    is :data:`TRUNCATION_BACKLOG`, and the windows after it are censored like any
+    truncation's.
+
     The per-request raw lines use ``r3_grid.RAW_COLUMNS`` and the instant sidecar uses the
     ``r3_grid`` sidecar schema plus ``on_live_grid``, so the offline re-windowing path is
     unchanged (pass ``--instant-sample-ms 1000`` to ``rewindow_from_raw`` to match this
@@ -1620,7 +1720,10 @@ def drive_cell_schedule(
     from tre_replayer.engine.prompts import DEFAULT_MODE
     from tre_replayer.engine.schedule import build_poisson_schedule
 
-    events = [e for e in build_poisson_schedule(segments, seed=seed) if e.model == model]
+    events = namespace_request_ids(
+        [e for e in build_poisson_schedule(segments, seed=seed) if e.model == model],
+        request_key,
+    )
     scheduled = len(events)
 
     # Before anything else, and before any thread or sidecar exists: the pool forks, and
@@ -1652,9 +1755,11 @@ def drive_cell_schedule(
     # segment - whose only job is to capture a recovery tail as evidence - is dead time.
     # Truncation itself is kept: see TruncateOnProxyShed.
     shed_policy = (guard_kwargs or {}).get("shed_policy", DEFAULT_SHED_POLICY)
+    backlog = StopOnBacklog(sender, max_backlog=max_backlog) if max_backlog else None
+    inner = backlog or sender
     truncator = (
         TruncateOnProxyShed(
-            sender,
+            inner,
             drain_start_s=drain_start_s,
             keep_drain=shed_policy != SHED_POLICY_VOID,
         )
@@ -1669,7 +1774,7 @@ def drive_cell_schedule(
     if overflow_sentinel is not None:
         overflow_sentinel.start()
     try:
-        report = asyncio.run(dispatch_open_loop(events, truncator or sender))
+        report = asyncio.run(dispatch_open_loop(events, truncator or inner))
     finally:
         sender.close()
         if sidecar is not None:
@@ -1694,15 +1799,26 @@ def drive_cell_schedule(
         )
     )
 
+    # Whichever stop came first is the truncation; both count their censored requests.
+    stops = [
+        (int(w.truncated_at_ts_ms or 0), w.truncated_at_offset_s, cause)
+        for w, cause in (
+            (truncator, TRUNCATION_ADMISSION_OVERFLOW), (backlog, TRUNCATION_BACKLOG),
+        )
+        if w is not None and w.truncated
+    ]
+    first_stop = min(stops, key=lambda stop: stop[0]) if stops else None
     guard = check_cell(
         cell_id,
         scheduled=scheduled,
         records=sender.records,
         p99_delay_ms=report.p99_delay_ms,
-        truncated=bool(truncator and truncator.truncated),
-        truncated_at_offset_s=truncator.truncated_at_offset_s if truncator else None,
-        truncated_at_ts_ms=truncator.truncated_at_ts_ms if truncator else None,
-        censored=truncator.censored if truncator else 0,
+        truncated=first_stop is not None,
+        truncated_at_offset_s=None if first_stop is None else first_stop[1],
+        truncated_at_ts_ms=None if first_stop is None else (first_stop[0] or None),
+        censored=sum(w.censored for w in (truncator, backlog) if w is not None),
+        truncation_cause=None if first_stop is None else first_stop[2],
+        backlog_limit=int(max_backlog) if max_backlog else None,
         pending_overflow_delta=overflow_delta,
         prompt_store_misses=(None if prompt_store is None else prompt_store.misses),
         rps_error_ratio=rps_error_ratio,
@@ -1728,6 +1844,10 @@ def drive_cell_schedule(
         # nor the send-side concurrency, by design (it is the metrics schema, not a log
         # of what the driver did).
         records_out.extend(sender.records)
+    if instants_out is not None:
+        # The sidecar samples (live-grid tagged), for a caller that labels the cell's
+        # windows in-process - the same samples the .instant.jsonl receives.
+        instants_out.extend(instants)
     return start_ms, end_ms, guard
 
 
@@ -1774,7 +1894,27 @@ def _raw_from_sender_record(cell_id: str, record: dict) -> dict:
         completion_tokens=record.get("completion_tokens"),
         target_pod=record.get("target_pod"),
     )
-    return r3_grid.build_raw_record(cell_id, int(record["actual_send_ts_ms"]), res)
+    raw = r3_grid.build_raw_record(cell_id, int(record["actual_send_ts_ms"]), res)
+    # What the driver knew about the request and the raw log used to drop: without these
+    # the per-request table cannot say when a request was *meant* to go out, how loaded
+    # the path was when it did, or what became of it.
+    verdict = classify_failure(record)
+    on_wire = record.get("on_wire_delay_ms")
+    raw.update({
+        "request_id": record.get("request_id"),
+        "scheduled_send_ts_ms": (
+            None if on_wire is None
+            else round(float(record["actual_send_ts_ms"]) - float(on_wire), 3)
+        ),
+        "on_wire_delay_ms": on_wire,
+        "in_flight_at_send": record.get("in_flight_at_send"),
+        "request_timeout_s": record.get("request_timeout_s"),
+        "outcome": OUTCOME_NAMES[verdict],
+        "proxy_reason": (
+            proxy_failure_reason(record) if verdict in PROXY_FAILURE_CLASSES else None
+        ),
+    })
+    return raw
 
 
 def _append_jsonl(path: Path, records: Sequence[dict]) -> None:

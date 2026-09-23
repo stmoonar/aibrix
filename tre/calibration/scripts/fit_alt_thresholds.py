@@ -16,7 +16,7 @@ tau-EMA), the prior orientation (``lower_is_healthier``, hardcoded; the balanced
 of the opposite orientation is reported next to it) and the candidate grid (distinct
 values for queue_len). A signal whose AUROC is below 0.6 is flagged ``inert``.
 
-Labels come from :mod:`tre_calibration.labels` (p95 TTFT/TPOT + unserved) with the SLOs
+Labels come from :mod:`tre_common.slo_labels` (p95 TTFT/TPOT + unserved) with the SLOs
 given on the command line; ``label_def`` is written into the report. Thresholds stay in raw
 signal units; the registry-shaped block per signal carries theta, direction, delta_crit
 and delta_high.
@@ -48,7 +48,7 @@ from tre_calibration.fit import (
     THETA_CRITERIA,
     ThetaFitConfig,
 )
-from tre_calibration.labels import LabelDefinition, add_label_arguments, label_def_from_args
+from tre_common.slo_labels import LabelDefinition, add_label_arguments, label_def_from_args
 from tre_common.tss import DEFAULT_EMA_TAU_MS
 
 from scripts.theta_verdict import build_signal_spec, verdict_report

@@ -20,7 +20,7 @@ class SloSpec:
     ttft_idle_c_ms: float | None = None
     ttft_idle_b_ms_per_token: float | None = None
     #: The calibration label built from it (plan 2026-09-21 6.11 D6'): mode, slowdown
-    #: factor k and floor. Offline only; ``tre_calibration.labels`` falls back to its
+    #: factor k and floor. Offline only; ``tre_common.slo_labels`` falls back to its
     #: module defaults (slowdown, 5, 500 ms) when absent.
     ttft_slo_mode: str | None = None
     ttft_slowdown_k: float | None = None

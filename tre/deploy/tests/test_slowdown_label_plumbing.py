@@ -8,7 +8,7 @@ from scripts import r3_grid
 from scripts.rewindow_from_raw import window_request_evidence
 from scripts.theta_verdict import violation_class_breakdown
 from tre_calibration.dataset import CalibrationWindow
-from tre_calibration.labels import LabelDefinition, parse_ttft_len_samples
+from tre_common.slo_labels import LabelDefinition, parse_ttft_len_samples
 from tre_common.registry import load_registry
 
 
@@ -72,15 +72,24 @@ def test_fit_plan_keeps_the_fixed_label_as_an_option() -> None:
 
 def test_rewindow_writes_the_per_request_evidence() -> None:
     records = [
-        {"done_ts_ms": 1000, "ttft_ms": 50.0, "input_tokens": 256},
-        {"done_ts_ms": 2000, "ttft_ms": 150.0, "input_tokens": 2048},
-        {"done_ts_ms": 2500, "ttft_ms": None, "input_tokens": 2048},  # no TTFT: not counted
-        {"done_ts_ms": 40000, "ttft_ms": 70.0, "input_tokens": 256},  # outside the window
+        {"done_ts_ms": 1000, "ttft_ms": 50.0, "input_tokens": 256, "http_status": 200, "e2e_ms": 900.0},
+        {"done_ts_ms": 2000, "ttft_ms": 150.0, "input_tokens": 2048, "http_status": 200, "e2e_ms": 900.0},
+        # served but no TTFT: completed, no sample
+        {"done_ts_ms": 2500, "ttft_ms": None, "input_tokens": 2048, "http_status": 200, "e2e_ms": 900.0},
+        # not served (a client timeout that had started streaming): neither - it is
+        # counted by the unserved columns instead, like every latency p95 of the window
+        {"done_ts_ms": 3000, "ttft_ms": 900.0, "input_tokens": 256, "http_status": 0,
+         "e2e_ms": 30000.0, "outcome": "client_timeout"},
+        {"done_ts_ms": 40000, "ttft_ms": 70.0, "input_tokens": 256, "http_status": 200, "e2e_ms": 900.0},  # outside
     ]
     ev = window_request_evidence(records, 0, 30000)
-    assert ev["completed_requests"] == 2
+    assert ev["completed_requests"] == 3
     assert parse_ttft_len_samples(ev["ttft_len_samples"]) == [(50.0, 256.0), (150.0, 2048.0)]
     assert {"completed_requests", "ttft_len_samples"} <= set(r3_grid.CSV_COLUMNS)
+    # grid windows read (start, end]: a completion on the end tick belongs to the window
+    edge = [{"done_ts_ms": 30000, "ttft_ms": 60.0, "input_tokens": 256, "http_status": 200, "e2e_ms": 900.0}]
+    assert window_request_evidence(edge, 0, 30000)["completed_requests"] == 0
+    assert window_request_evidence(edge, 0, 30000, closed_right=True)["completed_requests"] == 1
 
 
 def test_violation_class_breakdown_reports_critical_recall_per_class() -> None:

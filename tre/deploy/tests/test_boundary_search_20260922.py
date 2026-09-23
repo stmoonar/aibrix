@@ -16,8 +16,10 @@ from scripts import static_grid
 
 
 def _rows(count: int, *, violated: bool):
-    return [{"window_start_ms": 30_000 * i, "p95_ttft": 900.0 if violated else 100.0,
-             "p95_tpot": 10.0, "slo_violated": False, "model_errors": 0} for i in range(count)]
+    # disjoint 30 s windows; the probe verdict counts independent windows
+    return [{"window_start_ms": 30_000 * i, "window_end_ms": 30_000 * (i + 1),
+             "p95_ttft_client_ms": 900.0 if violated else 100.0,
+             "p95_tpot_client_ms": 10.0, "model_errors": 0} for i in range(count)]
 
 
 def _drive(pred, log=None, windows=lambda probe: 6):
@@ -48,11 +50,16 @@ def test_a_too_short_probe_moves_neither_end_of_the_bracket() -> None:
     # 60 s probes (2 windows) were read as healthy even at 2/2 violating (7b T8 @ 0.6)
     s = boundary.BoundarySearch(extend_down_rhos=(), extend_up_rhos=())
     p = s.next_probe()
-    s.record(boundary.ProbeResult(p, violated=False, windows=2, violating_windows=2, conclusive=False))
+    s.record(boundary.ProbeResult(p, verdict=boundary.VERDICT_INCONCLUSIVE, windows=2,
+                                  violating_windows=2))
     assert s.healthy_rho is None and s.violating_rho is None
+    # ... and it is re-driven at the same rho, for longer (INCONCLUSIVE_DURATION_FACTOR)
+    again = s.next_probe()
+    assert again.rho == p.rho and again.attempt == 2
+    assert again.duration_s == p.duration_s * boundary.INCONCLUSIVE_DURATION_FACTOR
     r = campaign.probe_result_from_cell(p, "i256_o128_c1060", _rows(2, violated=True), {},
                                         ttft_slo_ms=500.0, tpot_slo_ms=75.0)
-    assert r.valid and not r.conclusive
+    assert r.valid and not r.conclusive and r.verdict == boundary.VERDICT_INCONCLUSIVE
 
 
 def test_search_extends_downward_when_the_lowest_coarse_probe_violates() -> None:

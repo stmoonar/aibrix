@@ -1,6 +1,18 @@
 #!/usr/bin/env python3
 """Runner for the open-loop calibration campaign.
 
+Two designs
+-----------
+``--design ladder`` (the default) is the preregistered second round
+(``docs/preregistration-20260923-calibration-run2.md``): prior-guided boundary search of
+every shape, an interleaved randomised hold ladder, ramps, supplementary cells and
+sentinels, with every cell independently seeded and the engine drained between cells.
+It lives in :mod:`scripts.calibration_ladder` / :mod:`scripts.calibration_design` and
+refuses to start without ``--rho-priors`` and ``--regime-groups``.
+
+``--design primitives`` is the first round's design, kept so that run can be reproduced;
+the rest of this docstring describes it.
+
 Per (model, shape), in order: **steps**, then an **adaptive boundary search**, then
 **ramp**, then **bursts**.
 
@@ -17,8 +29,10 @@ at which the shape actually starts violating its SLO, and dwells just under it. 
 replaces the fixed rho grid: theta is a threshold on the signal at the moment the SLO
 breaks, so windows taken far from that moment - on either side - barely constrain it,
 and a grid centred on a prior with a 25 % error is centred on a guess. Three stages,
-about 12 minutes of offered load per shape: coarse 3 x 60 s, bisect 2 x 120 s, dwell
-300 s at ``0.95 rho*``.
+about 13.5 minutes of offered load per shape: coarse 3 x 90 s, bisect 2 x 120 s, dwell
+300 s at ``0.95 rho*``. A probe is judged on the fitting re-window's own windows and
+label (see :mod:`scripts.adaptive_boundary`), so the boundary is located with the ruler
+the fit then measures the evidence with.
 
 The **ramp** is regenerated from the measured capacity rather than from the prior, and
 **bursts** run last because they are the only primitive that can be skipped outright, so
@@ -88,10 +102,17 @@ order, with its provenance), ``capacity/<model>_<shape>.json`` (prior vs measure
 generated mid-campaign, and ``fit_plan.json`` - the re-windowing and refit invocations
 the capture is meant to be consumed by, including the cadence each one must use and the
 per-family control fits.
+
+When the campaign ends - complete, stopped or crashed - it writes
+``campaign_status.json`` and converts its own directory into the standard dataset
+(``<out-dir>/dataset/``, see :mod:`scripts.calibration_dataset`). When every sibling
+campaign under the same parent has finished too, the last one to finish also builds the
+merged dataset of the whole run at ``<parent>/dataset/``.
 """
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import subprocess
@@ -101,6 +122,8 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Mapping, Optional, Sequence
+
+from tre_common import slo_labels
 
 from scripts import adaptive_boundary as boundary
 from scripts import admission_cap as admission
@@ -148,7 +171,7 @@ PRIMARY_LAMBDA_WAIT = 3.0
 SECONDARY_LAMBDA_WAIT = 0.0
 SECONDARY_FIT_TOLERANCE = 0.05
 
-#: TTFT SLO of the fit label (tre_calibration.labels): the primary label of plan
+#: TTFT SLO of the fit label (tre_common.slo_labels): the primary label of plan
 #: 2026-09-21 6.11 D6', max(500 ms, 5 * idle TTFT(L)), TPOT 75 ms. ``--fit-ttft-slo-mode
 #: fixed`` gives the 500/75 ms comparison column, ``--fit-ttft-slowdown-k 3
 #: --fit-ttft-floor-ms 150`` the D6 ablation arm; k/floor default to the registry profile.
@@ -173,8 +196,9 @@ class StepLevel:
     offered_rps: float
     achieved_rps: float
     completions: int
-    p95_ttft_ms: Optional[float]
-    p95_tpot_ms: Optional[float]
+    #: Client per-request latency, nearest-rank p95 over the level's steady part.
+    p95_ttft_client_ms: Optional[float]
+    p95_tpot_client_ms: Optional[float]
     slo_met: bool
     saturated: bool
 
@@ -285,8 +309,8 @@ def measure_capacity_from_steps(
                 offered_rps=round(offered, 4),
                 achieved_rps=round(achieved, 4),
                 completions=len(window),
-                p95_ttft_ms=None if p95_ttft is None else round(p95_ttft, 3),
-                p95_tpot_ms=None if p95_tpot is None else round(p95_tpot, 3),
+                p95_ttft_client_ms=None if p95_ttft is None else round(p95_ttft, 3),
+                p95_tpot_client_ms=None if p95_tpot is None else round(p95_tpot, 3),
                 slo_met=slo_met,
                 saturated=saturated,
             )
@@ -495,6 +519,25 @@ def controller_mode(namespace: str = "tre-v2") -> str:
     return result.stdout.strip()
 
 
+def primary_label(args, model: str) -> slo_labels.LabelDefinition:
+    """The campaign's primary window label for ``model`` (plan 2026-09-21 §6.11 D6'): the
+    TTFT mode / k / floor of ``--fit-ttft-*`` (default: the registry profile, slowdown),
+    the model's idle TTFT fit from the registry, ``--ttft-slo-ms`` / ``--tpot-slo-ms`` as
+    the fixed thresholds, ``--fit-min-completed-requests``. The probes of the boundary
+    search are judged on it and every fit trains on it - one ruler for both."""
+    return slo_labels.label_def_for_model(
+        model,
+        ttft_p95_ms=args.ttft_slo_ms,
+        tpot_p95_ms=args.tpot_slo_ms,
+        mode=getattr(args, "fit_ttft_slo_mode", None),
+        k=getattr(args, "fit_ttft_slowdown_k", None),
+        floor=getattr(args, "fit_ttft_floor_ms", None),
+        min_completed_requests=getattr(
+            args, "fit_min_completed_requests", slo_labels.DEFAULT_MIN_COMPLETED_REQUESTS),
+        registry=getattr(args, "registry", None),
+    )
+
+
 def cell_command(cell: Cell, args, schedule_path: Path, output: Path) -> list[str]:
     """The ``r3_grid`` invocation for one cell.
 
@@ -506,8 +549,10 @@ def cell_command(cell: Cell, args, schedule_path: Path, output: Path) -> list[st
     * ``--max-p99-delay-ms`` at :data:`scripts.openloop.CALIBRATION_MAX_P99_DELAY_MS` -
       ten times tighter than the replay default, because a generator that fires late did
       not offer the load the cell is indexed by.
-    * ``--ttft-slo-ms`` / ``--tpot-slo-ms`` - pinned, so the goodput a cell reports and
-      the SLO the boundary search reads are the same numbers.
+    * ``--ttft-slo-ms`` / ``--tpot-slo-ms`` and the primary label's TTFT mode - pinned,
+      so the goodput a cell reports, the label the boundary search reads and the label
+      the fit trains on are the same (``--window-align`` / ``--step-ms`` likewise put the
+      online windows on the fitting re-window's 10 s grid, D8).
 
     ``--prompt-dir`` points every cell at this campaign's own ``<out-dir>/prompts``, so
     the prompts are built before each cell starts rather than inside its sends, and the
@@ -522,8 +567,16 @@ def cell_command(cell: Cell, args, schedule_path: Path, output: Path) -> list[st
         "--cell-id", cell.cell_id,
         "--output", str(output),
         "--raw-dir", str(args.raw_dir),
+        # The fitting re-window's windows: the online rows a probe is judged on are then
+        # the rows the fit is built from, window for window.
         "--window-ms", str(args.window_ms),
+        "--step-ms", str(args.fit_step_ms),
+        "--window-align", str(getattr(args, "fit_window_align", "grid")),
         "--instant-sample-ms", str(args.instant_sample_ms),
+        # The server-side p95 columns (diagnostic only) are read once per sliding window;
+        # the gateway's zsets answer in ~6 ms a model where the legacy key SCAN takes
+        # ~650 ms, which over a 5 s step would add minutes to every cell.
+        "--metrics-schema", "v2",
         "--namespace", args.model_namespace,
         "--guard-mode", args.guard_mode,
         "--min-slo-windows", str(args.min_slo_windows),
@@ -533,6 +586,9 @@ def cell_command(cell: Cell, args, schedule_path: Path, output: Path) -> list[st
         "--max-model-error-rate", str(args.max_model_error_rate),
         "--ttft-slo-ms", str(args.ttft_slo_ms),
         "--tpot-slo-ms", str(args.tpot_slo_ms),
+        # The primary window label (D6' by default): the one the probe is judged on and
+        # the fit trains on.
+        *slo_labels.label_mode_cli_args(primary_label(args, cell.model)),
     ]
     if cell.drain_start_s is not None:
         command += ["--drain-start-s", str(cell.drain_start_s)]
@@ -666,11 +722,20 @@ def drive_until_valid(
 # ------------------------------------------------------------------ boundary search
 
 
+#: Float columns of the window CSV, parsed when it is read back.
+_FLOAT_COLUMNS = (
+    slo_labels.P95_TTFT_CLIENT, slo_labels.P95_TPOT_CLIENT, slo_labels.P95_E2E_CLIENT,
+    slo_labels.P95_TTFT_SERVER, slo_labels.P95_TPOT_SERVER, slo_labels.P95_E2E_SERVER,
+    "trs",
+)
+
+
 def read_window_rows(path: Path) -> list[dict]:
     """Window rows back out of an ``r3_grid`` CSV, typed enough to judge a probe by.
 
     A voided cell writes an empty CSV, which reads back as zero rows - which is exactly
     what the boundary search must see: no evidence, not evidence of health.
+    ``slo_violated`` reads back as True / False / None (unlabeled), never as a bare False.
     """
     import csv
 
@@ -681,11 +746,15 @@ def read_window_rows(path: Path) -> list[dict]:
     with path.open("r", newline="", encoding="utf-8") as fh:
         for raw in csv.DictReader(fh):
             row = dict(raw)
-            for key in ("p95_ttft", "p95_tpot", "p95_e2e", "trs"):
+            for key in _FLOAT_COLUMNS:
                 value = row.get(key)
-                row[key] = None if value in (None, "") else float(value)
-            row["slo_violated"] = str(row.get("slo_violated", "")).lower() in ("true", "1")
-            row["model_errors"] = int(row.get("model_errors") or 0)
+                row[key] = None if value in (None, "", "None") else float(value)
+            for key in slo_labels.UNSERVED_COLUMNS:
+                row[key] = int(float(row.get(key) or 0))
+            flag = str(row.get(slo_labels.VIOLATED_COLUMN, "")).strip().lower()
+            row[slo_labels.VIOLATED_COLUMN] = (
+                True if flag in ("true", "1") else False if flag in ("false", "0") else None
+            )
             rows.append(row)
     return rows
 
@@ -696,37 +765,50 @@ def probe_result_from_cell(
     rows: Sequence[dict],
     guard: dict,
     *,
-    ttft_slo_ms: float,
-    tpot_slo_ms: float,
+    label=None,
+    ttft_slo_ms: Optional[float] = None,
+    tpot_slo_ms: Optional[float] = None,
 ) -> boundary.ProbeResult:
     """Turn one driven hold cell into the verdict the search consumes.
 
-    A cell the guard voided is reported ``valid=False`` and its (empty) rows are never
-    consulted. That is the difference between "this load did not violate" and "we did not
-    manage to offer this load", and conflating them walks the bracket upwards on every
-    infrastructure hiccup.
+    ``label`` is the campaign's primary window label (:func:`primary_label`, D6') - the
+    label the fit is trained on; the fixed ``ttft_slo_ms`` / ``tpot_slo_ms`` pair is the
+    09-23 interface.
+
+    A cell the guard voided is :data:`~scripts.adaptive_boundary.VERDICT_VOID` and its
+    (empty) rows are never consulted. That is the difference between "this load did not
+    violate" and "we did not manage to offer this load", and conflating them walks the
+    bracket upwards on every infrastructure hiccup. A cell that was not voided but gave
+    too little evidence - no rows at all included - is
+    :data:`~scripts.adaptive_boundary.VERDICT_INCONCLUSIVE`, which the search answers
+    with a longer re-drive, never with a healthy verdict.
     """
     void_reasons = tuple(str(r) for r in (guard.get("void_reasons") or ()))
-    valid = not void_reasons and bool(rows)
-    violated, violating, total = boundary.probe_violated(
-        rows, ttft_slo_ms=ttft_slo_ms, tpot_slo_ms=tpot_slo_ms
-    )
-    if not valid and not void_reasons:
-        void_reasons = ("no windows",)
     goodput_value = None
     body = guard.get("goodput")
     if isinstance(body, dict):
         goodput_value = body.get("goodput")
+    if void_reasons:
+        return boundary.ProbeResult(
+            probe=probe,
+            verdict=boundary.VERDICT_VOID,
+            void_reasons=void_reasons,
+            windows=len(rows),
+            goodput=goodput_value,
+            cell_id=cell_id,
+        )
+    verdict = boundary.probe_verdict(
+        rows, label=label, ttft_slo_ms=ttft_slo_ms, tpot_slo_ms=tpot_slo_ms,
+    )
     return boundary.ProbeResult(
         probe=probe,
-        violated=bool(violated) if valid else False,
-        valid=valid,
-        void_reasons=void_reasons,
-        windows=total,
-        violating_windows=violating,
+        verdict=verdict.verdict,
+        windows=verdict.windows,
+        labeled_windows=verdict.labeled_windows,
+        independent_windows=verdict.independent_windows,
+        violating_windows=verdict.violating_windows,
         goodput=goodput_value,
         cell_id=cell_id,
-        conclusive=total >= boundary.MIN_PROBE_WINDOWS,
     )
 
 
@@ -737,8 +819,9 @@ def run_boundary_search(
     *,
     drive,
     cap: admission.AdmissionCap,
-    ttft_slo_ms: float,
-    tpot_slo_ms: float,
+    label=None,
+    ttft_slo_ms: Optional[float] = None,
+    tpot_slo_ms: Optional[float] = None,
     capacity_source: str = "measured_steps",
     search: Optional[boundary.BoundarySearch] = None,
 ) -> boundary.BoundarySearch:
@@ -763,7 +846,7 @@ def run_boundary_search(
         search.record(
             probe_result_from_cell(
                 probe, meta["cell_id"], rows, guard,
-                ttft_slo_ms=ttft_slo_ms, tpot_slo_ms=tpot_slo_ms,
+                label=label, ttft_slo_ms=ttft_slo_ms, tpot_slo_ms=tpot_slo_ms,
             )
         )
     return search
@@ -874,6 +957,8 @@ def fit_plan(
     raw_dir: Path,
     args,
     index: Optional[dict] = None,
+    *,
+    ledgers: Sequence[Path] = (),
 ) -> dict:
     """The re-windowing and refit invocations this capture is meant to be consumed by.
 
@@ -900,6 +985,13 @@ def fit_plan(
     entries, because the raw tree is a flat pile of cell files and nothing in a file name
     says which shape it came from - so a fit pointed at the raw directory would otherwise
     silently train on the validation set.
+
+    *Ladder campaigns* (``ledgers``: the ``cells.jsonl`` of a ``--design ladder`` run) are
+    selected from the ledger instead, when the fit runs: ``rewindow_from_raw --ledger
+    ... --only-split train`` for the fitting and family CSVs, ``--only-split holdout`` for
+    the validation CSV, and every row carries the ledger's role / split / primitive and
+    ``in_warmup`` (the first ``warmup_s`` of a hold cell), which the fit loaders drop.
+    ``alpha_fit`` reads the same ledger to tell constant-load cells from ramps.
 
     *Families.* Besides the merged fit, each family gets its own. The spread between them
     is the check that the merged theta is not an artefact of pooling two regimes; see
@@ -932,12 +1024,14 @@ def fit_plan(
        every alt signal): the published threshold scored on the held-out validation CSV,
        which no earlier step reads.
 
-    Every step uses the one label (``tre_calibration.labels``: p95 TTFT/TPOT + unserved)
+    Every step uses the one label (``tre_common.slo_labels``: p95 TTFT/TPOT + unserved)
     at ``--ttft-slo-ms`` / ``--tpot-slo-ms``.
     """
     # Imported here, not at module level: the campaign driver itself must stay runnable
     # on a PYTHONPATH without the calibration package.
-    from tre_calibration.labels import label_arms, label_cli_args, label_def_from_args
+    from tre_common.slo_labels import (
+        label_arms, label_cli_args, label_def_from_args, label_mode_cli_args,
+    )
     from tre_common.tss import DEFAULT_EMA_TAU_MS
 
     from scripts import alpha_fit
@@ -1031,16 +1125,33 @@ def fit_plan(
             },
         },
     }
+    # The slo_label column of every re-windowed CSV is computed against the SLO the
+    # campaign pinned, the same one its probes were judged against.
+    slo_args = ["--ttft-slo-ms", str(args.ttft_slo_ms), "--tpot-slo-ms", str(args.tpot_slo_ms)]
     exclusions: list[str] = []
     for cell_id in held_out_cells:
         exclusions += ["--exclude-cell-id", cell_id]
+    ledger_args = [a for path in ledgers for a in ("--ledger", str(path))]
+    if ledger_args:
+        # Split and role come from the run's own ledger, read when the fit runs.
+        train_sel = [*ledger_args, "--only-split", "train"]
+        holdout_sel = [*ledger_args, "--only-split", "holdout"]
+    else:
+        train_sel = list(exclusions)
+        holdout_sel = [a for cell_id in held_out_cells for a in ("--only-cell-id", cell_id)]
+    plan["selection"] = {
+        "source": "ledger" if ledger_args else "schedule index",
+        "ledgers": [str(p) for p in ledgers],
+        "train": train_sel,
+        "holdout": holdout_sel,
+    }
     registry = _load_registry(getattr(args, "registry", None))
     # Plan ��6.9g pitfall 2 / D8: by default every fitting window ends on the gateway's
     # 10 s grid with a 10 s step, the window the phase-aligned controller reads.
     # --fit-window-align none (+ --fit-step-ms 5000) reproduces the legacy windowing.
     window_align = getattr(args, "fit_window_align", "grid")
     align = ["--window-align", window_align]
-    # The fit label (tre_calibration.labels): the D6' slowdown TTFT SLO by default - each
+    # The fit label (tre_common.slo_labels): the D6' slowdown TTFT SLO by default - each
     # model's idle TTFT fit, k and floor come from the registry - or the fixed one.
     label_args = argparse.Namespace(
         ttft_p95_ms=args.ttft_slo_ms,
@@ -1071,7 +1182,14 @@ def fit_plan(
     fitting_by_model: dict[str, Path] = {}
     for model in models:
         w_p = float(registry.model(model).trs.w_p)
-        slo = label_cli_args(label_def_from_args(label_args, model))
+        fit_label = label_def_from_args(label_args, model)
+        slo = label_cli_args(fit_label)
+        # The re-windower labels every row with the three arms of this primary label.
+        rw_label = [
+            "--ttft-slo-ms", str(args.ttft_slo_ms), "--tpot-slo-ms", str(args.tpot_slo_ms),
+            *label_mode_cli_args(fit_label),
+            *(["--registry", str(args.registry)] if getattr(args, "registry", None) else []),
+        ]
         fitting_csv = fit_dir / f"{model}_fitting.csv"
         aliasing_csv = fit_dir / f"{model}_aliasing.csv"
         validation_csv = fit_dir / f"{model}_validation.csv"
@@ -1085,7 +1203,7 @@ def fit_plan(
             "model": model,
             "output": str(fitting_csv),
             "excludes_held_out": True,
-            "command": [*rewindow_head, "--output", str(fitting_csv), *live, *exclusions],
+            "command": [*rewindow_head, "--output", str(fitting_csv), *live, *rw_label, *train_sel],
         })
         plan["rewindow"].append({
             "purpose": "aliasing figure and observability gap (ground truth)",
@@ -1096,19 +1214,19 @@ def fit_plan(
                 *rewindow_head, "--output", str(aliasing_csv),
                 "--window-ms", str(args.window_ms), "--step-ms", str(args.fit_step_ms),
                 "--instant-grid", "raw",
-                "--instant-sample-ms", str(args.instant_sample_ms), *align,
-                *exclusions,
+                "--instant-sample-ms", str(args.instant_sample_ms), *align, *rw_label,
+                *train_sel,
             ],
         })
-        if held_out_cells:
+        if holdout_sel:
             plan["rewindow"].append({
                 "purpose": "held-out validation set (never fitted on)",
                 "model": model,
                 "output": str(validation_csv),
                 "excludes_held_out": False,
                 "command": [
-                    *rewindow_head, "--output", str(validation_csv), *live,
-                    *[a for cell_id in held_out_cells for a in ("--only-cell-id", cell_id)],
+                    *rewindow_head, "--output", str(validation_csv), *live, *rw_label,
+                    *holdout_sel,
                 ],
             })
 
@@ -1127,6 +1245,7 @@ def fit_plan(
                 "--lambda-wait", str(PRIMARY_LAMBDA_WAIT),
                 *slo,
                 "--step-ms", str(args.fit_step_ms),
+                *ledger_args,
                 "--output", str(alpha_json),
             ],
         })
@@ -1143,9 +1262,9 @@ def fit_plan(
                 "output": str(family_csv),
                 "excludes_held_out": True,
                 "command": [
-                    *rewindow_head, "--output", str(family_csv), *live,
+                    *rewindow_head, "--output", str(family_csv), *live, *rw_label,
                     *[a for shape in shapes for a in ("--only-shape", shape)],
-                    *exclusions,
+                    *train_sel,
                 ],
             })
 
@@ -1227,7 +1346,7 @@ def fit_plan(
             })
         for signal in ALT_SIGNALS:
             arm_verdicts.append((signal, fit_dir / f"{model}_verdict_{signal}.json"))
-        if held_out_cells:
+        if holdout_sel:
             for arm, arm_json in arm_verdicts:
                 out_json = fit_dir / (f"{model}_holdout.json" if arm == "tss" else f"{model}_holdout_{arm}.json")
                 plan["holdout"].append({
@@ -1336,10 +1455,13 @@ def drive_boundary_search(
     """
     def drive(probe, cell_id, body, meta):
         stem = f"{cell.shape}_{gen.HOLD_PRIMITIVE}{gen.hold_load_code(probe.rho)}"
-        schedule_path = schedule_dir / cell.model / f"{stem}.json"
+        # A re-drive gets its own schedule file: an inconclusive probe is re-driven for
+        # longer, and overwriting attempt 1's schedule would lose what attempt 1 ran.
+        schedule_stem = stem if probe.attempt <= 1 else f"{stem}_a{probe.attempt}"
+        schedule_path = schedule_dir / cell.model / f"{schedule_stem}.json"
         schedule_path.parent.mkdir(parents=True, exist_ok=True)
         schedule_path.write_text(json.dumps(body, indent=2) + "\n", encoding="utf-8")
-        (schedule_path.parent / f"{stem}.meta.json").write_text(
+        (schedule_path.parent / f"{schedule_stem}.meta.json").write_text(
             json.dumps(meta, indent=2) + "\n", encoding="utf-8"
         )
         probe_cell = Cell(
@@ -1375,8 +1497,7 @@ def drive_boundary_search(
         measured.capacity_used_rps,
         drive=drive,
         cap=cap,
-        ttft_slo_ms=args.ttft_slo_ms,
-        tpot_slo_ms=args.tpot_slo_ms,
+        label=primary_label(args, cell.model),
         capacity_source=measured.capacity_source,
         search=new_boundary_search(cell.model, cell.shape, args),
     )
@@ -1631,7 +1752,114 @@ def drive_static_cell(
     return exit_code
 
 
+def registry_path_for(args) -> Path:
+    """The registry file this campaign's cells load (the r3_grid default when unset)."""
+    if getattr(args, "registry", None):
+        return Path(args.registry)
+    return Path(__file__).resolve().parents[1] / "registry.yaml"
+
+
+def file_sha256(path: Path) -> Optional[str]:
+    try:
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def git_state(worktree: Path) -> dict:
+    """The code commit a run was made with, and whether the tree had local changes."""
+    def git(*argv: str) -> Optional[str]:
+        try:
+            proc = subprocess.run(
+                ["git", "-C", str(worktree), *argv],
+                capture_output=True, text=True, timeout=10, check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return proc.stdout.strip() if proc.returncode == 0 else None
+
+    status = git("status", "--porcelain", "--untracked-files=no")
+    return {
+        "commit": git("rev-parse", "HEAD"),
+        "dirty": None if status is None else bool(status),
+    }
+
+
+def run_provenance(args) -> dict:
+    """What a run was made with, recorded before it drives anything."""
+    registry = registry_path_for(args)
+    models = [m for m in str(getattr(args, "models", "") or "").split(",") if m]
+    membership = "(start, end]" if getattr(args, "fit_window_align", "grid") == "grid" else "[start, end)"
+    labels = {
+        m: slo_labels.label_definition(
+            primary_label(args, m),
+            min_latency_samples=getattr(args, "min_latency_samples", slo_labels.DEFAULT_MIN_LATENCY_SAMPLES),
+            window_membership=membership,
+        )
+        for m in models
+    }
+    return {
+        "code": git_state(Path(__file__).resolve().parents[2]),
+        "registry_path": str(registry),
+        "registry_sha256": file_sha256(registry),
+        "window_ms": args.window_ms,
+        "step_ms": args.fit_step_ms,
+        "instant_sample_ms": args.instant_sample_ms,
+        "window_align": getattr(args, "fit_window_align", "grid"),
+        "label": labels[models[0]] if models else None,
+        "label_by_model": labels,
+        "boundary": {
+            "coarse_seconds": float(getattr(args, "boundary_coarse_s", boundary.COARSE_SECONDS)),
+            "min_probe_windows": boundary.MIN_PROBE_WINDOWS,
+            "violation_window_fraction": boundary.VIOLATION_WINDOW_FRACTION,
+            "inconclusive_duration_factor": boundary.INCONCLUSIVE_DURATION_FACTOR,
+        },
+    }
+
+
+CAMPAIGN_STATUS_FILE = "campaign_status.json"
+
+
+def finalize_run(out_dir: Path, *, status: str, exit_code: int) -> None:
+    """Record how the campaign ended, then build the standard dataset.
+
+    Never raises: the dataset is a conversion of what is on disk and can always be
+    rebuilt by hand (``python -m scripts.calibration_dataset <run>``); a failure here
+    must not turn a finished campaign into a failed one.
+    """
+    out_dir = Path(out_dir)
+    (out_dir / CAMPAIGN_STATUS_FILE).write_text(
+        json.dumps(
+            {"status": status, "exit_code": exit_code, "finished_at_utc": utc_iso()},
+            indent=2,
+        ) + "\n",
+        encoding="utf-8",
+    )
+    try:
+        from scripts import calibration_dataset
+
+        built = calibration_dataset.build_dataset(out_dir)
+        print(f"standard dataset: {built}")
+        parent = out_dir.parent
+        siblings = calibration_dataset.campaign_dirs(parent)
+        if len(siblings) > 1 and all((d / CAMPAIGN_STATUS_FILE).exists() for d in siblings):
+            merged = calibration_dataset.build_dataset(parent)
+            print(f"every campaign under {parent} has finished; merged dataset: {merged}")
+    except Exception as exc:  # noqa: BLE001 - see docstring
+        print(f"WARNING: building the standard dataset failed ({exc!r}); rebuild it with "
+              f"python -m scripts.calibration_dataset {out_dir}")
+
+
 def run_campaign(args) -> int:
+    coarse_s = float(getattr(args, "boundary_coarse_s", boundary.COARSE_SECONDS))
+    if coarse_s < boundary.min_probe_seconds(args.window_ms):
+        # --boundary-coarse-s 60 reproduces the 2026-09-21 campaign on purpose; say what
+        # it costs instead of refusing.
+        print(
+            f"WARNING: a {coarse_s:g} s coarse probe cannot hold "
+            f"{boundary.MIN_PROBE_WINDOWS} disjoint {args.window_ms} ms windows, so every "
+            "coarse probe is inconclusive and re-driven at twice its length"
+        )
     index_path = Path(args.index)
     index = json.loads(index_path.read_text(encoding="utf-8"))
     cap = admission.get_cap(args.cap or index.get("admission_cap", {}).get("name")
@@ -1666,6 +1894,7 @@ def run_campaign(args) -> int:
     static_seconds = sum(c.duration_s + args.cooldown_s for c in static_cells)
     plan_doc = {
         "generated_at_utc": utc_iso(),
+        "provenance": run_provenance(args),
         "admission_cap": cap.as_dict(),
         "index": str(index_path),
         "models": models,
@@ -1724,6 +1953,20 @@ def run_campaign(args) -> int:
         )
     print(f"controller mode: {mode}")
 
+    status, code = "failed", 1
+    try:
+        code = _drive_campaign(args, index=index, cap=cap, runnable=runnable,
+                               out_dir=out_dir, raw_dir=raw_dir, schedule_root=schedule_root)
+        status = "complete" if code == 0 else "stopped"
+    except KeyboardInterrupt:
+        status = "interrupted"
+        raise
+    finally:
+        finalize_run(out_dir, status=status, exit_code=code)
+    return code
+
+
+def _drive_campaign(args, *, index, cap, runnable, out_dir, raw_dir, schedule_root) -> int:
     measured_dir = out_dir / "capacity"
     measured_dir.mkdir(parents=True, exist_ok=True)
     boundary_dir = out_dir / "boundary"
@@ -1920,7 +2163,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--model-namespace", default="default")
     ap.add_argument("--controller-namespace", default="tre-v2")
     ap.add_argument("--dry-run", action="store_true",
-                    help="write plan.json and fit_plan.json, drive nothing")
+                    help="write plan.json and fit_plan.json, print the time estimate, "
+                         "drive nothing")
     ap.add_argument("--static-grid", action="store_true",
                     help="append the opt-in static steady-state grid (scripts.static_grid) "
                          "after the default stages; its shapes join the training set and "
@@ -1951,7 +2195,34 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                          "nothing else")
     ap.add_argument("--reprobe-source", type=Path, default=static_grid.DEFAULT_SOURCE_CAMPAIGN,
                     help="campaign root whose <model>/capacity JSONs the re-probe reuses")
+    ap.add_argument("--design", choices=["ladder", "primitives"], default=None,
+                    help="ladder (default): the second round's design (scripts.calibration_ladder). "
+                         "primitives: the first round's steps / boundary / ramp / bursts - "
+                         "implied by --static-grid* and --reprobe-shapes, which only it has")
+    ap.add_argument("--rho-priors", type=Path, default=None,
+                    help="ladder design: rho_priors.json - per (model, shape) the first "
+                         "round's client-side boundary, C_s and, where it never violated, the "
+                         "widened search range. Required; checked before anything runs")
+    ap.add_argument("--regime-groups", type=Path, default=None,
+                    help="ladder design: regime_groups.json - the 7 training shapes in 3 "
+                         "regime groups (LORO units). Required; checked before anything runs")
+    ap.add_argument("--design-seed", type=int, default=20260923,
+                    help="ladder design: seed of every order and every per-cell seed; "
+                         "recorded in the run manifest")
+    ap.add_argument("--preregistration", type=Path,
+                    default=here / "docs" / "preregistration-20260923-calibration-run2.md",
+                    help="ladder design: the preregistration the run implements; its commit "
+                         "is recorded in the run manifest")
     args = ap.parse_args(argv)
+    primitives_only = bool(
+        args.static_grid or args.static_grid_only or args.static_grid_list
+        or args.reprobe_shapes or args.skip_boundary_search
+    )
+    if args.design is None:
+        args.design = "primitives" if primitives_only else "ladder"
+    elif args.design == "ladder" and primitives_only:
+        ap.error("--static-grid* / --reprobe-shapes / --skip-boundary-search belong to "
+                 "--design primitives")
     if args.static_grid_list:
         models = [m for m in args.models.split(",") if m]
         cells, _surfaces = plan_static_cells(args, models)
@@ -1976,6 +2247,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return run_reprobe(args, targets)
         except ValueError as exc:
             ap.error(str(exc))
+    if args.design == "ladder":
+        from scripts import calibration_ladder
+
+        return calibration_ladder.run_ladder_campaign(args)
     return run_campaign(args)
 
 

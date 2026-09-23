@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 from scripts import openloop, r3_grid, rewindow_from_raw as rw
+from tre_common import slo_labels
 from tre_common.registry import load_registry
 
 TRE_ROOT = Path(__file__).resolve().parents[2]
@@ -23,9 +24,17 @@ def test_a_client_timeout_marks_its_window_violated_in_its_own_column() -> None:
     ]
     live = {"http_status": 0, "error": "TimeoutError", "client_timeout": True, "actual_send_ts_ms": 1500}
     marked = openloop.mark_unserved_request_windows(rows, [live])
-    assert [r["slo_violated"] for r in marked] == [False, True]
     assert [r["client_timeouts"] for r in marked] == [0, 1]
     assert [r["model_errors"] for r in marked] == [0, 0]
+    # the counts are what makes the window violated (the label reads nothing else)
+    assert [slo_labels.row_unserved(r) for r in marked] == [False, True]
+    assert "slo_violated" not in marked[1]
+    # (start, end] on the phase-aligned grid: an instant on a boundary belongs to the
+    # window that ENDS there
+    edge = dict(live, actual_send_ts_ms=1000)
+    assert [r["client_timeouts"] for r in openloop.mark_unserved_request_windows(rows, [edge])] == [0, 1]
+    assert [r["client_timeouts"] for r in openloop.mark_unserved_request_windows(
+        rows, [edge], closed_right=True)] == [1, 0]
 
 
 def test_a_persisted_failure_record_is_judged_by_its_recorded_class() -> None:
@@ -35,7 +44,11 @@ def test_a_persisted_failure_record_is_judged_by_its_recorded_class() -> None:
     persisted = {"send_ts_ms": 500, "http_status": 0, "error": "TimeoutError",
                  "failure_class": "client_timeout", "outcome": "client_timeout"}
     [row] = openloop.mark_unserved_request_windows(rows, [persisted])
-    assert row["client_timeouts"] == 1 and row["model_errors"] == 0 and row["slo_violated"]
+    assert row["client_timeouts"] == 1 and row["model_errors"] == 0 and slo_labels.row_unserved(row)
+    # a failures.jsonl row without the outcome field: failure_class decides
+    legacy = {k: v for k, v in persisted.items() if k != "outcome"}
+    [row] = openloop.mark_unserved_request_windows(rows, [legacy])
+    assert row["client_timeouts"] == 1 and row["model_errors"] == 0
 
 
 def test_csv_has_a_client_timeouts_column() -> None:
@@ -58,6 +71,16 @@ def _write_cell(dirpath: Path, cell_id: str, *, with_failure: bool) -> None:
             fh.write(json.dumps({"ts_ms": t0 + i * 1000, "waiting": 0.0, "running": 2.0,
                                  "swapping": 0.0, "on_live_grid": True}) + "\n")
     if with_failure:
+        # The raw log holds every request, the failed one included (http_status 0, no
+        # latency); its verdict lives in the failure sidecar and is attached by
+        # rewindow_from_raw.attach_failure_details (the capture predates ``outcome``).
+        with (dirpath / f"{cell_id}.jsonl").open("a") as fh:
+            fh.write(json.dumps({
+                "send_ts_ms": t0 + 45_000, "recv_first_token_ts_ms": None,
+                "done_ts_ms": t0 + 75_000, "input_tokens": None, "output_tokens": None,
+                "ttft_ms": None, "tpot_ms": None, "e2e_ms": 30_000.0, "http_status": 0,
+                "cell_id": cell_id, "target_pod": None,
+            }) + "\n")
         with (dirpath / f"{cell_id}.failures.jsonl").open("w") as fh:
             fh.write(json.dumps({"send_ts_ms": t0 + 45_000, "http_status": 0,
                                  "failure_class": "client_timeout"}) + "\n")
@@ -78,6 +101,9 @@ def test_rewindow_reads_the_failures_sidecar_and_marks_the_windows(tmp_path: Pat
     rows = list(csv.DictReader(out.open()))
     violated = [r for r in rows if r["slo_violated"] == "True"]
     assert violated, "the timed-out request's windows must be violated"
+    # every arm says so: an unserved window is violated whatever the TTFT rule
+    assert all(r["slo_label"] == r["slo_label_fixed"] == r["slo_label_k3"] == "violated"
+               for r in violated)
     assert all(int(r["client_timeouts"]) == 1 for r in violated)
     starts = {int(r["window_start_ms"]) for r in violated}
     assert all(s <= 1_045_000 < s + 30_000 for s in starts)
@@ -125,9 +151,9 @@ def _fit_csv(path: Path, *, seed: int) -> Path:
                     "window_start_ms": start, "window_end_ms": start + 30_000,
                     "prompt_tokens_total": gen, "generation_tokens_total": gen,
                     "avg_waiting": 0.0, "avg_running": running, "avg_swapping": 0.0,
-                    "queue_control": running, "p95_ttft": 400.0 * ratio, "p95_tpot": 30.0,
-                    "p95_e2e": 1.0, "trs": "", "model_errors": 0, "proxy_transient_errors": 0,
-                    "client_timeouts": 0, "slo_violated": False,
+                    "queue_control": running, "p95_ttft_client_ms": 400.0 * ratio,
+                    "p95_tpot_client_ms": 30.0, "p95_e2e_client_ms": 1.0, "trs": "",
+                    "model_errors": 0, "proxy_transient_errors": 0, "client_timeouts": 0,
                 })
                 start += 5_000
     assert spec.trs.w_p > 0

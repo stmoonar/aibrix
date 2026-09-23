@@ -39,18 +39,25 @@ def test_a_window_row_defaults_to_no_errors_seen() -> None:
         tpot_p95_ms = 10.0
         e2e_p95_ms = 200.0
 
-    row = r3_grid.window_row(r3_grid.GridCell(256, 128, 95), _WM(), 1.0, 1.0)
-    assert row["model_errors"] == 0 and row["slo_violated"] is False
+    row = r3_grid.window_row(
+        r3_grid.GridCell(256, 128, 95), _WM(), 1.0, 1.0, client=_WM(), server=None
+    )
+    assert row["model_errors"] == 0 and row["client_timeouts"] == 0
+    # No label until a caller that knows the SLO applies one - never a default False.
+    assert row["slo_label"] is None and row["slo_violated"] is None
     assert set(row) == set(r3_grid.CSV_COLUMNS)
 
 
 def test_a_marked_window_counts_as_an_slo_crossing() -> None:
     rows = [
-        {"p95_ttft": 50.0, "p95_tpot": 5.0, "slo_violated": True},
-        {"p95_ttft": 50.0, "p95_tpot": 5.0, "slo_violated": False},
-        {"p95_ttft": 900.0, "p95_tpot": 5.0, "slo_violated": False},
+        {"p95_ttft_client_ms": 50.0, "p95_tpot_client_ms": 5.0, "model_errors": 1},
+        {"p95_ttft_client_ms": 50.0, "p95_tpot_client_ms": 5.0, "client_timeouts": 2},
+        {"p95_ttft_client_ms": 50.0, "p95_tpot_client_ms": 5.0},
+        {"p95_ttft_client_ms": 900.0, "p95_tpot_client_ms": 5.0},
+        # unlabeled: neither a crossing nor healthy
+        {"p95_ttft_client_ms": None, "p95_tpot_client_ms": None},
     ]
-    assert r3_grid.count_slo_windows(rows, ttft_slo_ms=500.0, tpot_slo_ms=75.0) == 2
+    assert r3_grid.count_slo_windows(rows, ttft_slo_ms=500.0, tpot_slo_ms=75.0) == 3
 
 
 # ------------------------------------------------------------------ hold cell ids

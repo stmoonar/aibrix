@@ -214,8 +214,11 @@ def test_drive_cell_schedule_writes_the_r3_raw_schema(tmp_path: Path) -> None:
 
     rows = [json.loads(line) for line in raw.read_text().splitlines()]
     assert len(rows) == guard.sent
-    # identical schema to the closed-loop path -> rewindow_from_raw needs no change
-    assert set(rows[0]) == set(r3_grid.RAW_COLUMNS)
+    # the closed-loop schema plus what the open-loop driver knows about each request
+    assert set(rows[0]) == set(r3_grid.RAW_COLUMNS) | set(r3_grid.RAW_REQUEST_COLUMNS)
+    assert rows[0]["outcome"] == "ok" and rows[0]["proxy_reason"] is None
+    assert rows[0]["scheduled_send_ts_ms"] <= rows[0]["send_ts_ms"]
+    assert rows[0]["in_flight_at_send"] >= 1
     assert rows[0]["cell_id"] == "i256_o128_c60"
     assert rows[0]["input_tokens"] == 256 and rows[0]["output_tokens"] == 128
 
@@ -677,22 +680,38 @@ def test_a_window_holding_a_model_error_is_marked_violating_and_kept() -> None:
     # A failed request contributes no latency sample, so a window whose slowest work all
     # errored out otherwise shows a comfortable p95 and is scored as healthy.
     rows = [
-        {"window_start_ms": 0, "window_end_ms": 1000, "p95_ttft": 50.0},
-        {"window_start_ms": 1000, "window_end_ms": 2000, "p95_ttft": 50.0},
+        {"window_start_ms": 0, "window_end_ms": 1000, "p95_ttft_client_ms": 50.0},
+        {"window_start_ms": 1000, "window_end_ms": 2000, "p95_ttft_client_ms": 50.0},
     ]
     records = [_model_error(actual_send_ts_ms=1500), _served(actual_send_ts_ms=10)]
     marked = openloop.mark_unserved_request_windows(rows, records)
     assert len(marked) == 2  # kept, not dropped
-    assert marked[0]["model_errors"] == 0 and marked[0]["slo_violated"] is False
-    assert marked[1]["model_errors"] == 1 and marked[1]["slo_violated"] is True
+    assert marked[0]["model_errors"] == 0 and _label(marked[0]) == "healthy"
+    assert marked[1]["model_errors"] == 1 and _label(marked[1]) == "violated"
+
+
+def _label(row: dict) -> str:
+    from tre_common import slo_labels
+
+    return slo_labels.window_slo_label(row, {"ttft_p95": 500.0})
+
+
+def test_a_window_holding_a_client_timeout_is_marked_violating_and_kept() -> None:
+    # The client gave up (>= 30 s): far beyond TTFT + (n-1) x TPOT SLO for every shape,
+    # and without the count the slowest requests of the window vanish from its p95.
+    rows = [{"window_start_ms": 0, "window_end_ms": 1000, "p95_ttft_client_ms": 50.0}]
+    timed_out = {"actual_send_ts_ms": 500, "http_status": 0, "client_timeout": True,
+                 "e2e_ms": 30100.0}
+    marked = openloop.mark_unserved_request_windows(rows, [timed_out])
+    assert marked[0]["client_timeouts"] == 1 and _label(marked[0]) == "violated"
 
 
 def test_an_admission_overflow_does_not_mark_a_window_violating() -> None:
     # It never reached the engine, so it says nothing about the engine's health - and
     # the shed policy has already decided what happens to the cell as a whole.
-    rows = [{"window_start_ms": 0, "window_end_ms": 1000, "p95_ttft": 50.0}]
+    rows = [{"window_start_ms": 0, "window_end_ms": 1000, "p95_ttft_client_ms": 50.0}]
     marked = openloop.mark_unserved_request_windows(rows, [_shed(actual_send_ts_ms=500)])
-    assert marked[0]["model_errors"] == 0 and marked[0]["slo_violated"] is False
+    assert marked[0]["model_errors"] == 0 and _label(marked[0]) == "healthy"
 
 
 # ------------------------------------------------------------------ void: sentinel
@@ -1121,13 +1140,13 @@ def test_a_window_holding_a_transient_proxy_error_is_marked_violating_and_kept()
     # The request went unserved, so the window is a loss; but it is counted in its own
     # column, because it is not evidence that the ENGINE failed.
     rows = [
-        {"window_start_ms": 0, "window_end_ms": 1000, "p95_ttft": 50.0},
-        {"window_start_ms": 1000, "window_end_ms": 2000, "p95_ttft": 50.0},
+        {"window_start_ms": 0, "window_end_ms": 1000, "p95_ttft_client_ms": 50.0},
+        {"window_start_ms": 1000, "window_end_ms": 2000, "p95_ttft_client_ms": 50.0},
     ]
     marked = openloop.mark_unserved_request_windows(
         rows, [_terminated(actual_send_ts_ms=1500)]
     )
-    assert [r["slo_violated"] for r in marked] == [False, True]
+    assert [_label(r) for r in marked] == ["healthy", "violated"]
     assert [r["proxy_transient_errors"] for r in marked] == [0, 1]
     assert [r["model_errors"] for r in marked] == [0, 0]
 

@@ -682,6 +682,9 @@ def fit_delta_margins(
     if crit_method not in CRIT_METHODS:
         raise ValueError(f"crit_method must be one of {CRIT_METHODS}, got {crit_method!r}")
 
+    # An unserved window with no latency sample carries latency_ratio_p95 =
+    # tre_common.slo_labels.UNSERVED_MIN_RATIO (2.0) from the loader: it is graded as
+    # "clearly over SLO", never skipped.
     rows = [row for row in windows if math.isfinite(row.signal)]
     severity: list[float] = []
     for row in rows:

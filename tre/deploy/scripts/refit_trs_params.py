@@ -14,10 +14,9 @@ This is a thin wrapper: it only assembles data and emits a report. It does NOT t
 What it does, per model (grid search is per-model, so run one model at a time):
 
   1. load the R3 window CSV into aligned ``(CalibrationWindow, SignalInputs)`` sequences
-     using the *same* row filtering as ``tre_calibration.dataset.load_windows_from_csv``
-     (warmup/contaminated/missing-latency/zero-token rows dropped, ``slo_met`` and
-     ``health_score`` computed identically), so the refit sees exactly the windows the
-     ``theta_m`` fit saw;
+     through ``tre_calibration.dataset.calibration_window_from_row`` - the function the
+     ``theta_m`` loader itself uses (same filters, same ``tre_common.slo_labels`` label) -
+     so the refit sees exactly the windows the ``theta_m`` fit saw;
   2. score the *inherited* triple (from ``registry.yaml`` for that model, or CLI
      overrides) with ``score_parameter_candidate``;
   3. run ``grid_search_parameters`` over the grid and take ``best``;
@@ -60,10 +59,10 @@ from tre_calibration.dataset import (
     CalibrationWindow,
     _as_float,
     _resolve_latency_columns,
-    _skip_row,
+    calibration_window_from_row,
     trim_scenario_ramp_windows,
 )
-from tre_calibration.labels import LabelDefinition, LabelSpec, add_label_arguments, label_def_from_args, label_window
+from tre_common.slo_labels import LabelDefinition, LabelSpec, add_label_arguments, label_def_from_args
 from tre_common.tss import DEFAULT_EMA_TAU_MS
 from tre_calibration.signals import (
     ParameterCandidateScore,
@@ -91,8 +90,8 @@ def load_windows_and_inputs(
 ) -> tuple[list[CalibrationWindow], list[SignalInputs]]:
     """Load aligned ``(windows, inputs)`` from an R3 window CSV.
 
-    Mirrors ``tre_calibration.dataset.load_windows_from_csv`` row-for-row (same filters,
-    same ``slo_met``/``health_score`` construction) but ALSO emits the ``SignalInputs``
+    Builds each window with ``tre_calibration.dataset.calibration_window_from_row`` - the
+    loader's own row rule, not a copy of it - and ALSO emits the ``SignalInputs``
     that ``grid_search_parameters`` needs, so the two lists are index-aligned by
     construction. ``grid_search_parameters`` recomputes the signal from ``inputs`` and
     ignores ``window.signal``; the ``signal_column`` is still required so the refit
@@ -143,35 +142,17 @@ def load_windows_and_inputs(
             )
         )
 
-    # Pass 2: the row filter, identical to the theta fit's.
+    # Pass 2: the loader's own row rule (tre_calibration.dataset.calibration_window_from_row)
+    # - same filters, same label - so the refit sees exactly the windows the theta fit saw.
     windows: list[CalibrationWindow] = []
     kept_rows: list[int] = []
     for index, row in enumerate(rows):
-        if _skip_row(row):
-            continue
-        signal = _as_float(row.get(signal_column))
-        if signal is None:
-            continue
-        prompt_tokens = _as_float(row.get("prompt_tokens_total"), 0.0) or 0.0
-        generation_tokens = _as_float(row.get("generation_tokens_total"), 0.0) or 0.0
-        if prompt_tokens + generation_tokens <= 0.0:
-            continue
-
-        label = label_window(row, label_spec)
-        if label is None:
-            continue
-        p95_ratio_max = label.ratio_max
-        windows.append(
-            CalibrationWindow(
-                scenario_id=(row.get("scenario_id") or "unknown").strip() or "unknown",
-                scenario_family=(row.get("scenario_family") or "unknown").strip() or "unknown",
-                signal=signal,
-                slo_met=label.slo_met,
-                health_score=1.0 / (1.0 + p95_ratio_max),
-                window_start_ms=_as_float(row.get("window_start_ms")),
-                violation_class=label.violation_class,
-            )
+        window = calibration_window_from_row(
+            row, latency_slo_ms=label_spec, signal=_as_float(row.get(signal_column)),
         )
+        if window is None:
+            continue
+        windows.append(window)
         kept_rows.append(index)
 
     kept_windows = trim_scenario_ramp_windows(windows, count=trim_ramp_windows)
@@ -339,7 +320,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.e2e_p95_ms is not None:
         raise SystemExit(
-            "--e2e-p95-ms is no longer accepted: the shared label (tre_calibration.labels) "
+            "--e2e-p95-ms is no longer accepted: the shared label (tre_common.slo_labels) "
             "is p95 TTFT/TPOT + unserved; e2e is excluded (plan 6.3 B4)"
         )
     label_def = label_def_from_args(args, args.model_name)

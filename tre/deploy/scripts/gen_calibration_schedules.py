@@ -833,6 +833,81 @@ def build_hold_schedule(
     return body, meta
 
 
+def build_rho_profile_schedule(
+    model: str,
+    shape_name: str,
+    capacity_rps: float,
+    profile: Sequence[tuple[float, float, float]],
+    *,
+    primitive: str,
+    load_code: int,
+    capacity_source: str,
+    cap: Optional[AdmissionCap] = None,
+    extra: Optional[dict] = None,
+) -> tuple[dict, dict]:
+    """(trace.json body, metadata) for an explicit ``[(start_s, end_s, rho), ...]`` profile.
+
+    The preregistered second-round design (``scripts.calibration_design``) decides every
+    cell's offered load itself - a constant-rho hold or a linear ramp in rho* units - and
+    gives every cell its own load code so that no two cells share a cell id. This is the
+    same component/segment construction as :func:`build_schedule_from_capacity_rps` (a
+    mixture shape still runs one stream per component at its share of ``C_s``); only the
+    rho profile and the load code are the caller's.
+    """
+    cap = cap or get_cap(DEFAULT_CAP_NAME)
+    c_s = float(capacity_rps)
+    if c_s <= 0.0:
+        raise ValueError(f"{model} {shape_name}: capacity_rps must be positive, got {c_s}")
+    if not profile:
+        raise ValueError(f"{model} {shape_name}: an empty rho profile offers nothing")
+    for start_s, end_s, rho in profile:
+        if not (float(end_s) > float(start_s) >= 0.0) or float(rho) <= 0.0:
+            raise ValueError(
+                f"{model} {shape_name}: bad profile segment ({start_s}, {end_s}, {rho})"
+            )
+    if int(load_code) <= 0:
+        raise ValueError(f"load code must be positive, got {load_code}")
+    components = shape_components(shape_name)
+    if shape_name == MIXTURE_NAME:
+        cell_in, cell_out = 0, 0
+    else:
+        (_w, nominal_i, nominal_o), = components
+        cell_in, cell_out = _length_nominal(nominal_i), _length_nominal(nominal_o)
+    segments: list[dict] = []
+    for weight, i, o in components:
+        in_kind, in_value = _segment_shape(i)
+        out_kind, out_value = _segment_shape(o)
+        for start_s, end_s, rho in profile:
+            entry = _segment(float(start_s), float(end_s), float(rho) * c_s * weight)
+            entry["input_tokens" if in_kind == "fixed" else "input_tokens_dist"] = in_value
+            entry["max_tokens" if out_kind == "fixed" else "max_tokens_dist"] = out_value
+            segments.append(entry)
+    segments.sort(key=_segment_sort_key)
+    duration = max(s["end_time"] for s in segments)
+    planned = sum((s["end_time"] - s["start_time"]) * s["rps"] for s in segments)
+    meta: dict = {
+        "model": model,
+        "shape": shape_name,
+        "primitive": primitive,
+        "cell_id": f"i{cell_in}_o{cell_out}_c{int(load_code)}",
+        "held_out": is_held_out(shape_name),
+        "sampled": shape_name in SAMPLED_SHAPES,
+        "capacity_rps": round(c_s, 4),
+        "capacity_source": capacity_source,
+        "admission_cap": cap.name,
+        "skipped": False,
+        "components": [_component_meta(w, i, o) for w, i, o in components],
+        "rho_profile": [[_round(a), _round(b), round(float(r), 6)] for a, b, r in profile],
+        **(extra or {}),
+        "duration_s": duration,
+        "planned_requests": int(round(planned)),
+        "peak_offered_rps": round(max(_offered_rps_at(segments)), 4),
+    }
+    if len(profile) == 1:
+        meta["offered_rps"] = round(float(profile[0][2]) * c_s, 4)
+    return {model: segments}, meta
+
+
 def _offered_rps_at(segments: Sequence[dict]) -> list[float]:
     """Total offered rps at each segment boundary (superposed overlapping segments)."""
     edges = sorted({s["start_time"] for s in segments} | {s["end_time"] for s in segments})

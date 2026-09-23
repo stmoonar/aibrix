@@ -32,7 +32,9 @@ def test_window_row_maps_calibration_columns() -> None:
     cell = r3_grid.GridCell(512, 128, 8)
     wm = _FakeWindow(1000, 61000, 4096.0, 1024.0, 480.0, 55.0,
                      avg_waiting=1.5, avg_running=3.0, avg_swapping=0.5, e2e_p95_ms=9000.0)
-    row = r3_grid.window_row(cell, wm, trs=734.5, queue_control=7.4375)
+    server = _FakeWindow(1000, 61000, 0.0, 0.0, 500.0, 150.0, e2e_p95_ms=10000.0)
+    row = r3_grid.window_row(cell, wm, trs=734.5, queue_control=7.4375,
+                             client=wm, server=server, completed_requests=12)
     assert row["scenario_id"] == "i512_o128_c8"
     assert row["scenario_family"] == "i512_o128"
     assert row["prompt_tokens_total"] == 4096.0
@@ -41,9 +43,12 @@ def test_window_row_maps_calibration_columns() -> None:
     assert row["avg_running"] == 3.0
     assert row["avg_swapping"] == 0.5
     assert row["queue_control"] == 7.4375
-    assert row["p95_ttft"] == 480.0
-    assert row["p95_tpot"] == 55.0
-    assert row["p95_e2e"] == 9000.0
+    assert row["p95_ttft_client_ms"] == 480.0
+    assert row["p95_tpot_client_ms"] == 55.0
+    assert row["p95_e2e_client_ms"] == 9000.0
+    # each source lands in the column that names it, never in the other's
+    assert row["p95_ttft_server_ms"] == 500.0 and row["p95_tpot_server_ms"] == 150.0
+    assert row["completed_requests"] == 12
     assert row["trs"] == 734.5
     assert set(row.keys()) == set(r3_grid.CSV_COLUMNS)
 
@@ -449,7 +454,8 @@ def test_openloop_mirrors_the_replayer_arrival_window() -> None:
 def test_r3_grid_accepts_a_prompt_directory_and_worker_count() -> None:
     """The campaign drives every cell through this CLI, so the materialisation has to be
     reachable from it or the boundary search silently falls back to inline builds."""
-    import inspect
-
-    source = inspect.getsource(r3_grid.main)
-    assert "--prompt-dir" in source and "--prompt-workers" in source
+    args = r3_grid.parse_args([
+        "--model", "m", "--gateway-url", "http://gw", "--output", "o.csv",
+        "--prompt-dir", "/p", "--prompt-workers", "3",
+    ])
+    assert args.prompt_dir == "/p" and args.prompt_workers == 3

@@ -1,4 +1,7 @@
-"""The shared SLO label (plan 2026-09-21 §6.3 B2/B4)."""
+"""The shared SLO label (plan 2026-09-21 §6.3 B2/B4), now ``tre_common.slo_labels``.
+
+Unserved evidence is the three count columns; ``slo_violated`` is the label's output and
+is never read back as "unserved" (the merge guard below)."""
 from __future__ import annotations
 
 import csv
@@ -10,7 +13,7 @@ import pytest
 from tre_calibration.bootstrap import bootstrap_theta, bootstrap_theta_and_delta_crit
 from tre_calibration.dataset import CalibrationWindow, load_windows_from_csv
 from tre_calibration.fit import DEFAULT_HEALTHY_QUANTILE_CANDIDATES, ThetaFitConfig
-from tre_calibration.labels import UNSERVED_MIN_RATIO, LabelDefinition, label_window
+from tre_common.slo_labels import UNSERVED_MIN_RATIO, LabelDefinition, label_window
 
 LABEL = LabelDefinition(500.0, 75.0)
 
@@ -23,14 +26,17 @@ def test_label_is_ttft_and_tpot_only() -> None:
     assert lab is not None and lab.slo_met
 
 
-def test_unserved_forces_violation_even_with_good_latency() -> None:
-    lab = label_window({"p95_ttft": 100, "p95_tpot": 20, "slo_violated": "True"}, LABEL.latency_slo_ms())
+@pytest.mark.parametrize("column", ["model_errors", "proxy_transient_errors", "client_timeouts"])
+def test_unserved_forces_violation_even_with_good_latency(column) -> None:
+    lab = label_window({"p95_ttft": 100, "p95_tpot": 20, column: "1"}, LABEL.latency_slo_ms())
+    assert lab is not None and not lab.slo_met and lab.unserved
+    lab = label_window({"p95_ttft": 100, "p95_tpot": 20, column: "1"}, LABEL)
     assert lab is not None and not lab.slo_met and lab.unserved
 
 
 def test_missing_latency_is_dropped_unless_unserved() -> None:
     assert label_window({"p95_ttft": "", "p95_tpot": 20}, LABEL.latency_slo_ms()) is None
-    lab = label_window({"p95_ttft": "", "p95_tpot": "", "slo_violated": True}, LABEL.latency_slo_ms())
+    lab = label_window({"p95_ttft": "", "p95_tpot": "", "client_timeouts": 2}, LABEL.latency_slo_ms())
     assert lab is not None and not lab.slo_met and lab.ratio_max == UNSERVED_MIN_RATIO
 
 
@@ -39,25 +45,64 @@ def test_label_rejects_non_positive_slo() -> None:
         LabelDefinition(0.0, 75.0)
 
 
-def test_dataset_loader_honours_slo_violated(tmp_path: Path) -> None:
+def test_dataset_loader_reads_the_unserved_counts(tmp_path: Path) -> None:
     path = tmp_path / "w.csv"
     fields = ["scenario_id", "scenario_family", "window_start_ms", "window_end_ms",
-              "prompt_tokens_total", "generation_tokens_total", "p95_ttft", "p95_tpot",
-              "trs", "slo_violated"]
+              "prompt_tokens_total", "generation_tokens_total", "p95_ttft_client_ms",
+              "p95_tpot_client_ms", "trs", "model_errors", "proxy_transient_errors",
+              "client_timeouts", "slo_violated"]
     with path.open("w", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=fields)
         w.writeheader()
         w.writerow(dict(scenario_id="a", scenario_family="f", window_start_ms=0, window_end_ms=30000,
-                        prompt_tokens_total=100, generation_tokens_total=100, p95_ttft=100,
-                        p95_tpot=20, trs=50, slo_violated="True"))
+                        prompt_tokens_total=100, generation_tokens_total=100, p95_ttft_client_ms=100,
+                        p95_tpot_client_ms=20, trs=50, model_errors=0, proxy_transient_errors=0,
+                        client_timeouts=1, slo_violated="True"))
         w.writerow(dict(scenario_id="a", scenario_family="f", window_start_ms=5000, window_end_ms=35000,
-                        prompt_tokens_total=100, generation_tokens_total=100, p95_ttft="",
-                        p95_tpot="", trs=40, slo_violated="True"))
+                        prompt_tokens_total=100, generation_tokens_total=100, p95_ttft_client_ms="",
+                        p95_tpot_client_ms="", trs=40, model_errors=2, proxy_transient_errors=0,
+                        client_timeouts=0, slo_violated="True"))
         w.writerow(dict(scenario_id="a", scenario_family="f", window_start_ms=10000, window_end_ms=40000,
-                        prompt_tokens_total=100, generation_tokens_total=100, p95_ttft=100,
-                        p95_tpot=20, trs=60, slo_violated="False"))
+                        prompt_tokens_total=100, generation_tokens_total=100, p95_ttft_client_ms=100,
+                        p95_tpot_client_ms=20, trs=60, model_errors=0, proxy_transient_errors=0,
+                        client_timeouts=0, slo_violated="False"))
     windows = load_windows_from_csv(path, latency_slo_ms=LABEL.latency_slo_ms())
     assert [w.slo_met for w in windows] == [False, False, True]
+    assert [w.violation_class for w in windows] == ["unserved", "unserved", None]
+
+
+def test_a_main_format_violation_is_not_read_as_unserved(tmp_path: Path) -> None:
+    """Merge guard (2026-09-23): in a 09-23 window CSV ``slo_violated`` is the LABEL, so a
+    latency-violated window carries slo_violated=True with all three counts 0. Read as
+    "unserved" (the 09-22 meaning of the column) it would make every violation unserved,
+    grade it UNSERVED_MIN_RATIO, and - on a CSV whose windows all violate - report 100 %
+    violations without one error. It must be read from the counts only."""
+    path = tmp_path / "main.csv"
+    fields = ["scenario_id", "scenario_family", "window_start_ms", "window_end_ms",
+              "prompt_tokens_total", "generation_tokens_total", "p95_ttft_client_ms",
+              "p95_tpot_client_ms", "trs", "model_errors", "proxy_transient_errors",
+              "client_timeouts", "slo_label", "slo_violated"]
+    rows = [
+        # violated through TPOT only: stays violated, but NOT unserved, graded by latency
+        dict(p95_ttft_client_ms=100, p95_tpot_client_ms=150, slo_label="violated", slo_violated="True"),
+        # a stale / foreign slo_violated=True on healthy latency: healthy, not unserved
+        dict(p95_ttft_client_ms=100, p95_tpot_client_ms=20, slo_label="violated", slo_violated="True"),
+        dict(p95_ttft_client_ms=100, p95_tpot_client_ms=20, slo_label="healthy", slo_violated="False"),
+    ]
+    with path.open("w", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=fields)
+        w.writeheader()
+        for i, extra in enumerate(rows):
+            w.writerow(dict(scenario_id="a", scenario_family="f", window_start_ms=i * 10000,
+                            window_end_ms=i * 10000 + 30000, prompt_tokens_total=100,
+                            generation_tokens_total=100, trs=50 + i, model_errors=0,
+                            proxy_transient_errors=0, client_timeouts=0, **extra))
+    for spec in (LABEL, LABEL.latency_slo_ms()):
+        windows = load_windows_from_csv(path, latency_slo_ms=spec)
+        assert [w.slo_met for w in windows] == [False, True, True]
+        assert [w.violation_class for w in windows] == ["tpot_only", None, None]
+        assert windows[0].latency_ratio_p95 == pytest.approx(2.0)  # 150/75, not the 2.0 stand-in
+        assert not any(label_window(r, LABEL).unserved for r in csv.DictReader(path.open()))
 
 
 def test_healthy_quantile_grid_reaches_down_to_one_percent() -> None:

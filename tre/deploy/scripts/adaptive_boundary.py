@@ -14,9 +14,9 @@ centred on a guess.
 The search here spends the same wall clock in three stages of increasing resolution:
 
 1. **coarse** - 90 s at each of rho in {0.6, 0.9, 1.1}. Three cheap probes, only enough
-   to find which interval the violation flip happens in. 90 s, not 60: a 60 s probe
-   yields 2 tumbling 30 s windows, fewer than :data:`MIN_PROBE_WINDOWS`, so every coarse
-   verdict of the 2026-09-21 campaign was inconclusive and was read as healthy.
+   to find which interval the violation flip happens in. 90 s, not the 60 s this started
+   at, because a probe is judged on the controller's own 30 s sliding windows and needs
+   three *disjoint* 30 s spans of evidence (see "How a probe is judged").
 1b. **extend** - when the coarse stage did not bracket the flip, probe outward before
    bisecting: DOWN at {0.45, 0.3} when even the lowest coarse probe violated, UP at
    {1.5, 2.0, 2.6} when even the top one was healthy, stopping at the first probe that
@@ -42,6 +42,30 @@ bisection happened to stop), ``upper_bound`` (violating everywhere probed) and
 ``lower_bound`` (healthy everywhere probed). Only ``measured`` may place static-grid
 cells (``scripts.static_grid``).
 
+How a probe is judged
+---------------------
+With exactly the windows and the label the fit uses: the probe's rows are built by
+``rewindow_from_raw.label_cell`` (client per-request latency, 30 s windows sliding by 5 s,
+the controller's view; 30 s ending on the 10 s grid under D8) and each row is judged by
+the **primary** label - ``tre_common.slo_labels``, D6' slowdown TTFT - which the fit
+trains on, so the search and the fit use one ruler (:func:`probe_verdict` takes the
+campaign's :class:`~tre_common.slo_labels.LabelDefinition`).
+The verdict is three-valued and explicit - :data:`VERDICT_VIOLATED`,
+:data:`VERDICT_HEALTHY`, :data:`VERDICT_INCONCLUSIVE` - never "False, and the caller
+should look at the counts". The earlier implicit version is how every 60 s coarse probe
+of the 2026-09-21 campaign (two 30 s windows, below the three-window floor) was recorded
+as healthy, including probes whose every window violated.
+
+*Enough evidence* is counted in **disjoint** window spans, not rows: sliding windows
+overlap six-fold, so a 60 s probe yields 7 rows but only 2 independent 30 s spans, and a
+row count would let it pass a three-window floor on two windows' worth of information.
+Unlabeled windows (too few completions for a p95) count for neither side.
+
+An *inconclusive* probe says the probe was too short to measure anything, which re-running
+it unchanged cannot fix. It is re-driven once at the same rho with its duration multiplied
+by :data:`INCONCLUSIVE_DURATION_FACTOR`, on the same retry budget as a void
+(:func:`next_void_attempt`); inconclusive again and the search stops and says so.
+
 Why dwell sits below rho*, not on it
 ------------------------------------
 ``rho*`` is the lowest offered load that was *observed* to violate. Dwelling there would
@@ -64,12 +88,15 @@ campaign's scheduled cells obey the same one.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional, Sequence
+from typing import Mapping, Optional, Sequence
+
+from tre_common import slo_labels
 
 #: Coarse probes. 1.1 is above the prior's capacity and 0.6 well under it, so the flip -
 #: if the prior is anywhere near right - is bracketed by the first three cells.
 COARSE_RHOS: tuple[float, ...] = (0.6, 0.9, 1.1)
-#: 3 tumbling 30 s windows (>= MIN_PROBE_WINDOWS); ``calibration_campaign
+#: MIN_PROBE_WINDOWS disjoint spans of the 30 s control window: the shortest probe that
+#: can be conclusive at all (see :func:`min_probe_seconds`); ``calibration_campaign
 #: --boundary-coarse-s`` overrides it (60 reproduces the 2026-09-21 campaign).
 COARSE_SECONDS = 90.0
 LEGACY_COARSE_SECONDS = 60.0
@@ -111,9 +138,13 @@ DWELL_SECONDS = 300.0
 #: the model serves perfectly well.
 VIOLATION_WINDOW_FRACTION = 0.5
 
-#: Windows a probe must have produced for its verdict to count at all. Below this the
-#: fraction above is being computed on a handful of samples.
+#: Disjoint (non-overlapping) labelled windows a probe must have produced for its
+#: verdict to count at all. Below this the fraction above is being computed on a handful
+#: of samples, and the probe is :data:`VERDICT_INCONCLUSIVE`.
 MIN_PROBE_WINDOWS = 3
+
+#: An inconclusive probe is re-driven at the same rho for this multiple of its duration.
+INCONCLUSIVE_DURATION_FACTOR = 2.0
 
 #: A voided cell is re-driven this many times before whoever asked for it gives up.
 #:
@@ -138,6 +169,11 @@ def next_void_attempt(
     if int(attempt) > int(max_retries):
         return None
     return int(attempt) + 1
+
+def min_probe_seconds(window_ms: int, *, min_windows: int = MIN_PROBE_WINDOWS) -> float:
+    """The shortest probe that can hold ``min_windows`` disjoint windows of ``window_ms``."""
+    return float(min_windows) * float(window_ms) / 1000.0
+
 
 STAGE_COARSE = "coarse"
 STAGE_EXTEND = "extend"
@@ -195,34 +231,71 @@ class Probe:
         }
 
 
+#: A probe's verdict. Exactly one of these; nothing is inferred from a count.
+VERDICT_VIOLATED = "violated"
+VERDICT_HEALTHY = "healthy"
+VERDICT_INCONCLUSIVE = "inconclusive"
+#: The guard voided the cell: it measured nothing, and no verdict was computed.
+VERDICT_VOID = "void"
+VERDICTS = (VERDICT_VIOLATED, VERDICT_HEALTHY, VERDICT_INCONCLUSIVE, VERDICT_VOID)
+
+
+@dataclass(frozen=True)
+class ProbeVerdict:
+    """What one probe's window rows say, with the counts the verdict was decided on."""
+
+    verdict: str
+    windows: int
+    labeled_windows: int
+    independent_windows: int
+    violating_windows: int
+
+    def __post_init__(self) -> None:
+        if self.verdict not in (VERDICT_VIOLATED, VERDICT_HEALTHY, VERDICT_INCONCLUSIVE):
+            raise ValueError(f"not a probe verdict: {self.verdict!r}")
+
+
 @dataclass(frozen=True)
 class ProbeResult:
     """What driving a :class:`Probe` said.
 
-    ``valid`` is False for a cell the guard voided; ``violated`` is then meaningless and
-    is ignored rather than trusted.
+    ``verdict`` is one of :data:`VERDICTS`. A voided cell is :data:`VERDICT_VOID` and has
+    no other verdict: whatever its rows would have said is never computed.
     """
 
     probe: Probe
-    violated: bool
-    valid: bool = True
+    verdict: str
     void_reasons: tuple[str, ...] = ()
     windows: int = 0
+    labeled_windows: int = 0
+    independent_windows: int = 0
     violating_windows: int = 0
     goodput: Optional[float] = None
     cell_id: str = ""
-    #: False when the probe produced fewer than MIN_PROBE_WINDOWS windows: its verdict
-    #: is then evidence in neither direction and moves neither end of the bracket.
-    conclusive: bool = True
+
+    def __post_init__(self) -> None:
+        if self.verdict not in VERDICTS:
+            raise ValueError(f"not a probe verdict: {self.verdict!r}")
+        if (self.verdict == VERDICT_VOID) != bool(self.void_reasons):
+            raise ValueError("a void probe needs void reasons, and only a void probe has them")
+
+    @property
+    def valid(self) -> bool:
+        return self.verdict != VERDICT_VOID
+
+    @property
+    def conclusive(self) -> bool:
+        """A verdict that moves the bracket: violated or healthy."""
+        return self.verdict in (VERDICT_VIOLATED, VERDICT_HEALTHY)
 
     def as_dict(self) -> dict:
         body = self.probe.as_dict()
         body.update({
-            "violated": self.violated,
-            "valid": self.valid,
-            "conclusive": self.conclusive,
+            "verdict": self.verdict,
             "void_reasons": list(self.void_reasons),
             "windows": self.windows,
+            "labeled_windows": self.labeled_windows,
+            "independent_windows": self.independent_windows,
             "violating_windows": self.violating_windows,
             "goodput": self.goodput,
             "cell_id": self.cell_id,
@@ -230,49 +303,93 @@ class ProbeResult:
         return body
 
 
-def probe_violated(
-    rows: Sequence[dict],
+def independent_windows(rows: Sequence[Mapping]) -> list[Mapping]:
+    """The largest set of mutually non-overlapping windows, taken earliest-first.
+
+    Sliding windows (30 s wide, 5 s apart - the controller's own view) overlap six-fold:
+    a 60 s cell yields 7 rows but only 2 disjoint 30 s spans of evidence. Anything that
+    asks "is there enough evidence here" counts these, not rows.
+    """
+    chosen: list[Mapping] = []
+    last_end: Optional[int] = None
+    for row in sorted(rows, key=lambda r: (int(r["window_start_ms"]), int(r["window_end_ms"]))):
+        if last_end is None or int(row["window_start_ms"]) >= last_end:
+            chosen.append(row)
+            last_end = int(row["window_end_ms"])
+    return chosen
+
+
+def probe_verdict(
+    rows: Sequence[Mapping],
     *,
-    ttft_slo_ms: float,
-    tpot_slo_ms: float,
+    label: Optional["slo_labels.LabelSpec"] = None,
+    ttft_slo_ms: Optional[float] = None,
+    tpot_slo_ms: Optional[float] = None,
     window_fraction: float = VIOLATION_WINDOW_FRACTION,
     min_windows: int = MIN_PROBE_WINDOWS,
-) -> tuple[bool, int, int]:
-    """(violated, violating windows, total windows) for one probe's window rows.
+) -> ProbeVerdict:
+    """Three-valued verdict of one probe's window rows.
 
-    A window counts as violating when either p95 is over its SLO, or when the row was
-    marked ``slo_violated`` - which is how a window containing a model error gets counted
-    even though the failed request contributed no latency sample.
+    Each row is labelled by ``label`` - the campaign's primary
+    :class:`~tre_common.slo_labels.LabelDefinition` (D6'), the label the fit is trained
+    on - through :func:`tre_common.slo_labels.window_slo_label`. The fixed
+    ``ttft_slo_ms`` / ``tpot_slo_ms`` pair is the 09-23 interface (a fixed-threshold
+    label, no min-n guard), kept for replaying artifacts made with it. ``unlabeled`` rows
+    count for neither side. Then:
 
-    With fewer than ``min_windows`` rows the probe is reported as not violating *and* the
-    caller is expected to look at the counts: ``calibration_campaign.probe_result_from_cell``
-    marks it ``conclusive=False`` and :meth:`BoundarySearch.record` then moves neither end
-    of the bracket (a too-short probe is inconclusive, not healthy).
+    * fewer than ``min_windows`` **disjoint** labelled windows -> inconclusive;
+    * at least ``window_fraction`` of the labelled windows violated -> violated;
+    * otherwise healthy.
     """
-    total = len(rows)
+    if label is None:
+        if ttft_slo_ms is None or tpot_slo_ms is None:
+            raise ValueError("probe_verdict needs label (or ttft_slo_ms and tpot_slo_ms)")
+        label = slo_labels.slo_targets(ttft_slo_ms=ttft_slo_ms, tpot_slo_ms=tpot_slo_ms)
+    labeled: list[Mapping] = []
     violating = 0
     for row in rows:
-        if row.get("slo_violated"):
-            violating += 1
+        verdict_of_row = slo_labels.window_slo_label(row, label)
+        if verdict_of_row == slo_labels.LABEL_UNLABELED:
             continue
-        ttft = row.get("p95_ttft")
-        tpot = row.get("p95_tpot")
-        if ttft is not None and float(ttft) > ttft_slo_ms:
+        labeled.append(row)
+        if verdict_of_row == slo_labels.LABEL_VIOLATED:
             violating += 1
-        elif tpot is not None and float(tpot) > tpot_slo_ms:
-            violating += 1
-    if total < int(min_windows):
-        return False, violating, total
-    return violating >= window_fraction * total, violating, total
+    independent = len(independent_windows(labeled))
+    if independent < int(min_windows):
+        verdict = VERDICT_INCONCLUSIVE
+    elif violating >= window_fraction * len(labeled):
+        verdict = VERDICT_VIOLATED
+    else:
+        verdict = VERDICT_HEALTHY
+    return ProbeVerdict(
+        verdict=verdict,
+        windows=len(rows),
+        labeled_windows=len(labeled),
+        independent_windows=independent,
+        violating_windows=violating,
+    )
 
 
 # ------------------------------------------------------------------------ rho* status
 
 
-def _probe_conclusive(probe: dict, min_windows: int) -> bool:
+def _probe_verdict_of(probe: Mapping, min_windows: int) -> str:
+    """The verdict of a saved probe record, in either artifact format: the three-state
+    ``verdict`` (09-23 on), or the 09-22 ``valid`` / ``conclusive`` / ``violated`` flags -
+    a saved probe without ``conclusive`` (written before it existed) is conclusive iff it
+    has ``min_windows`` windows, which is exactly what the 60 s coarse probes of the
+    2026-09-21 campaign lacked."""
+    if probe.get("verdict"):
+        return str(probe["verdict"])
+    if not probe.get("valid", True):
+        return VERDICT_VOID
     if "conclusive" in probe:
-        return bool(probe["conclusive"])
-    return int(probe.get("windows") or 0) >= int(min_windows)
+        conclusive = bool(probe["conclusive"])
+    else:
+        conclusive = int(probe.get("windows") or 0) >= int(min_windows)
+    if not conclusive:
+        return VERDICT_INCONCLUSIVE
+    return VERDICT_VIOLATED if probe.get("violated") else VERDICT_HEALTHY
 
 
 def rho_star_status(
@@ -284,17 +401,17 @@ def rho_star_status(
     """What a search's rho* is, from its probe records (``ProbeResult.as_dict`` rows, as
     saved in ``<campaign>/<model>/boundary/<model>_<shape>.json``).
 
-    Only valid, conclusive probes are evidence; a saved probe without a ``conclusive``
-    field (written before it existed) is conclusive iff it has ``min_windows`` windows -
-    which is exactly what the 60 s coarse probes of the 2026-09-21 campaign lacked.
+    Only violated / healthy probes are evidence (:func:`_probe_verdict_of` reads either
+    artifact format).
     Returns ``{"status", "rho_star", "healthy_rho", "violating_rho", "bracket_rel_width"}``;
     ``status`` is None when no conclusive probe exists.
     """
-    valid = [p for p in probes if p.get("valid", True)]
-    conclusive = [p for p in valid if _probe_conclusive(p, min_windows)]
-    viol = [float(p["rho"]) for p in conclusive if p.get("violated")]
+    verdicts = [(p, _probe_verdict_of(p, min_windows)) for p in probes]
+    valid = [(p, v) for p, v in verdicts if v != VERDICT_VOID]
+    viol = [float(p["rho"]) for p, v in valid if v == VERDICT_VIOLATED]
     hi = min(viol) if viol else None
-    healthy = [float(p["rho"]) for p in conclusive if not p.get("violated") and (hi is None or float(p["rho"]) < hi)]
+    healthy = [float(p["rho"]) for p, v in valid
+               if v == VERDICT_HEALTHY and (hi is None or float(p["rho"]) < hi)]
     lo = max(healthy) if healthy else None
     width = None
     if hi is None:
@@ -302,7 +419,7 @@ def rho_star_status(
         rho_star = lo
     elif lo is None:
         inconclusive_below = any(
-            not _probe_conclusive(p, min_windows) and float(p["rho"]) < hi for p in valid
+            v == VERDICT_INCONCLUSIVE and float(p["rho"]) < hi for p, v in valid
         )
         status = RHO_STAR_GRID_ARTIFACT if inconclusive_below else RHO_STAR_UPPER_BOUND
         rho_star = hi
@@ -387,7 +504,7 @@ class BoundarySearch:
         """Next outward probe, or None when the bracket is closed or the list is used up."""
         if self.bracketed:
             return None
-        tried = {r.probe.rho for r in self.results if r.probe.stage == STAGE_EXTEND and r.valid}
+        tried = {r.probe.rho for r in self.results if r.probe.stage == STAGE_EXTEND and r.conclusive}
         lo, hi = self.healthy_rho, self.violating_rho
         if hi is not None:
             below = [r for r in self.extend_down_rhos if r < hi and r not in tried]
@@ -426,7 +543,10 @@ class BoundarySearch:
         """
         if self.violating_rho is not None:
             return self.violating_rho
-        driven = [r.probe.rho for r in self.results if r.valid]
+        driven = [
+            r.probe.rho for r in self.results
+            if r.verdict in (VERDICT_VIOLATED, VERDICT_HEALTHY)
+        ]
         return max(driven) if driven else None
 
     @property
@@ -476,6 +596,18 @@ class BoundarySearch:
         self._pending = probe
         return probe
 
+    def _redrive(self, result: "ProbeResult", why: str, duration_s: float) -> None:
+        """Re-drive the same rho as the next attempt, or stop when the budget is spent."""
+        attempt = int(result.probe.attempt)
+        nxt = next_void_attempt(attempt, max_retries=self.max_retries)
+        if nxt is None:
+            self.stopped_reason = (
+                f"probe at rho={result.probe.rho:g} was {why} on attempt {attempt}; "
+                "the search will not bisect on a cell that measured nothing"
+            )
+            return
+        self._pending = Probe(result.probe.rho, duration_s, result.probe.stage, attempt=nxt)
+
     def _bisect_rho(self) -> Optional[float]:
         lo, hi = self.healthy_rho, self.violating_rho
         if lo is not None and hi is not None:
@@ -494,33 +626,34 @@ class BoundarySearch:
         """Fold one driven probe into the state, and advance (or retry, or stop)."""
         self.results.append(result)
         self._pending = None
-        if not result.valid:
-            attempt = int(result.probe.attempt)
-            nxt = next_void_attempt(attempt, max_retries=self.max_retries)
-            if nxt is None:
-                self.stopped_reason = (
-                    f"probe at rho={result.probe.rho:g} was voided "
-                    f"{attempt} time(s) ({', '.join(result.void_reasons) or 'no reason recorded'}); "
-                    "the search will not bisect on a cell that measured nothing"
-                )
-                return
-            # Re-drive the same rho: a voided cell is not evidence in either direction.
-            self._pending = Probe(
-                result.probe.rho,
+        if result.verdict == VERDICT_VOID:
+            # Re-drive the same rho unchanged: a voided cell is not evidence in either
+            # direction, and the cause (a shed, a late generator) is not its length.
+            self._redrive(
+                result,
+                f"voided ({', '.join(result.void_reasons) or 'no reason recorded'})",
                 result.probe.duration_s,
-                result.probe.stage,
-                attempt=nxt,
+            )
+            return
+        if result.verdict == VERDICT_INCONCLUSIVE:
+            # Neither side of the bracket moves. The cause IS its length - too few
+            # disjoint labelled windows - so the re-drive is longer, not a repeat.
+            self._redrive(
+                result,
+                f"inconclusive ({result.independent_windows} disjoint labelled window(s), "
+                f"needs {MIN_PROBE_WINDOWS})",
+                result.probe.duration_s * INCONCLUSIVE_DURATION_FACTOR,
             )
             return
 
-        if not result.conclusive:
-            pass  # too few windows: evidence in neither direction
-        elif result.violated:
+        if result.verdict == VERDICT_VIOLATED:
             if self.violating_rho is None or result.probe.rho < self.violating_rho:
                 self.violating_rho = result.probe.rho
-        else:
+        elif result.verdict == VERDICT_HEALTHY:
             if self.healthy_rho is None or result.probe.rho > self.healthy_rho:
                 self.healthy_rho = result.probe.rho
+        else:  # pragma: no cover - ProbeResult validates its verdict
+            raise ValueError(f"unhandled probe verdict {result.verdict!r}")
 
         if result.probe.stage == STAGE_COARSE:
             self._coarse_index += 1
@@ -545,6 +678,9 @@ class BoundarySearch:
             "coarse_seconds": self.coarse_seconds,
             "extend_down_rhos": list(self.extend_down_rhos),
             "extend_up_rhos": list(self.extend_up_rhos),
+            "min_probe_windows": MIN_PROBE_WINDOWS,
+            "violation_window_fraction": VIOLATION_WINDOW_FRACTION,
+            "inconclusive_duration_factor": INCONCLUSIVE_DURATION_FACTOR,
             "healthy_rho": self.healthy_rho,
             "violating_rho": self.violating_rho,
             "rho_star": self.rho_star,

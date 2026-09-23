@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Sequence
 
 from tre_calibration.dataset import TssRecompute, load_windows_from_csv
-from tre_calibration.labels import add_label_arguments, count_label_exclusions, label_def_from_args
+from tre_common.slo_labels import add_label_arguments, count_label_exclusions, label_def_from_args
 from tre_common.tss import DEFAULT_EMA_TAU_MS, TSS_UNITS
 from tre_calibration.evaluate import evaluate_signal_direction
 from tre_calibration.fit import (
@@ -43,7 +43,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(argv)
     if args.e2e_p95_ms is not None:
         raise SystemExit(
-            "--e2e-p95-ms is no longer accepted: the shared label (tre_calibration.labels) "
+            "--e2e-p95-ms is no longer accepted: the shared label (tre_common.slo_labels) "
             "is p95 TTFT/TPOT + unserved; e2e is excluded (plan 6.3 B4)"
         )
     label_def = label_def_from_args(args, args.model_name)

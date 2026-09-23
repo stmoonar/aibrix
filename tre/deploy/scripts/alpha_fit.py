@@ -463,7 +463,7 @@ def registry_fields(tau_s: float, dt_ref_s: float = DT_REF_S) -> dict[str, Any]:
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
     from tre_calibration.fit import fit_delta_margins
-    from tre_calibration.labels import label_def_from_args
+    from tre_common.slo_labels import label_def_from_args
 
     from scripts import theta_verdict as tv
 
@@ -519,7 +519,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _parse(argv: Optional[Sequence[str]]) -> argparse.Namespace:
-    from tre_calibration.labels import add_label_arguments
+    from tre_common.slo_labels import add_label_arguments
 
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--model", required=True)

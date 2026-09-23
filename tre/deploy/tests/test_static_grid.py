@@ -177,7 +177,16 @@ def test_dry_run_with_static_grid_records_cells_and_estimate(tmp_path, monkeypat
     }
     index_path = tmp_path / "INDEX.json"
     index_path.write_text(json.dumps(index), encoding="utf-8")
-    monkeypatch.setattr(campaign.subprocess, "run", lambda *a, **k: (_ for _ in ()).throw(AssertionError))
+    real_run = campaign.subprocess.run
+
+    def _no_subprocess(argv, *args, **kwargs):
+        # Reading the code commit for the plan's provenance is fine; driving is not.
+        if argv and argv[0] == "git":
+            return real_run(argv, *args, **kwargs)
+        raise AssertionError("a dry run must not drive a cell")
+
+    monkeypatch.setattr(campaign.subprocess, "run", _no_subprocess)
+    # --static-grid implies --design primitives (the ladder has no static grid)
     assert campaign.main([
         "--index", str(index_path), "--models", "dsqwen-7b",
         "--out-dir", str(tmp_path / "out"), "--dry-run",
