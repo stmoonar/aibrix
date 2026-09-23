@@ -190,14 +190,13 @@ class ServiceManagerV2:
         spec = self._registry.model(model)
         if wake_replicas < 0:
             raise ValueError("wake_replicas must be non-negative")
-        # Scaling cap (registry max_awake_replicas, v1/paper alignment A1); max_replicas
-        # is the GPU layout size (bindings), not how many may be awake.
-        if wake_replicas > scale_max_replicas(spec):
-            raise ValueError(
-                f"wake_replicas exceeds max_awake_replicas ({scale_max_replicas(spec)}) for {model}"
-            )
 
         snapshot = self._store.load()
+        # Scaling cap (registry max_awake_replicas, v1/paper alignment A1); max_replicas
+        # is the GPU layout size (bindings), not how many may be awake. Only GROWTH past
+        # the cap is refused: shrinking (or holding) a model that is above the cap - e.g.
+        # after the cap was lowered - must go through.
+        self._ensure_target_within_cap(model, spec, wake_replicas, snapshot.bindings)
         model_bindings = [binding for binding in snapshot.bindings if binding.model == model]
         if self._runtime_ops is not None and wake_replicas > len(model_bindings) and not self._has_deployment_ops():
             raise ValueError("runtime create is not implemented for target growth beyond existing bindings")
@@ -1423,19 +1422,28 @@ class ServiceManagerV2:
         if not self._feasible_wake(binding, bindings):
             raise WakeConflict(f"{binding.serve_id}: slot already has awake binding")
 
+    def _ensure_target_within_cap(
+        self, model: str, spec, target: int, bindings: list[Binding]
+    ) -> None:
+        """The one scaling-cap rule: refuse a target that GROWS the model's awake count
+        (hidden probe pods included - they are awake, v1 assigned) past
+        max_awake_replicas. Shrinks and unchanged targets always pass, even above the cap."""
+        cap = scale_max_replicas(spec)
+        awake = sum(1 for item in bindings if item.model == model and item.awake)
+        if target > awake and target > cap:
+            raise ValueError(
+                f"wake_replicas {target} exceeds max_awake_replicas ({cap}) for {model} (awake {awake})"
+            )
+
     def _ensure_wake_within_cap(self, binding: Binding, bindings: list[Binding]) -> None:
-        """Binding-level wakes obey the same scaling cap as put_model_target
-        (awake bindings of the model, hidden probe pods included, stay <= the cap)."""
+        """Binding-level wakes obey the same rule as put_model_target (a wake is the
+        target awake + 1)."""
         try:
             spec = self._registry.model(binding.model)
         except KeyError:
             return
-        cap = scale_max_replicas(spec)
         awake = sum(1 for item in bindings if item.model == binding.model and item.awake)
-        if awake + 1 > cap:
-            raise ValueError(
-                f"wake of {binding.serve_id} exceeds max_awake_replicas ({cap}) for {binding.model}"
-            )
+        self._ensure_target_within_cap(binding.model, spec, awake + 1, bindings)
 
     def _ensure_model_route(self, model: str) -> None:
         if self._runtime_ops is not None and hasattr(self._runtime_ops, "ensure_model_httproute"):
