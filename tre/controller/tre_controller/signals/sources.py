@@ -104,6 +104,22 @@ def per_replica_token_rate(
     )
 
 
+def alt_signal_tau_ms(spec: ModelSpec) -> float | None:
+    """The time constant an alternative signal is smoothed with: the registry's TSS tau.
+
+    ``ema_tau_ms`` unset (None) keeps :data:`DEFAULT_EMA_TAU_MS`. ``ema_tau_ms <= 0`` is
+    tau = 0, i.e. alpha = 1: no smoothing, the raw value is used - as offline
+    (``theta_verdict.build_signal_spec`` maps tau <= 0 to no EMA). It used to be read as
+    "unset" and fall back to the 20 s default, so a registry publishing tau = 0 smoothed
+    the ablation signals online with a tau the fit never saw.
+    """
+    tau = spec.trs.ema_tau_ms
+    if tau is None:
+        return DEFAULT_EMA_TAU_MS
+    tau = float(tau)
+    return tau if tau > 0 else None
+
+
 def _thresholded_signal(
     metrics: ModelWindowMetrics,
     spec: ModelSpec,
@@ -116,8 +132,8 @@ def _thresholded_signal(
     """The one place every alternative signal is smoothed and normalised."""
     if raw_value is None:
         return SignalValue(source, raw_value=None, z_m=None, unavailable_reason=missing_reason)
-    if signal_state is not None:
-        tau_ms = spec.trs.ema_tau_ms if spec.trs.ema_tau_ms else DEFAULT_EMA_TAU_MS
+    tau_ms = alt_signal_tau_ms(spec)
+    if signal_state is not None and tau_ms is not None:
         raw_value = signal_state.smooth_signal(
             spec.name, source, raw_value, window_end_ms=metrics.window_end_ms, tau_ms=tau_ms,
             window_ms=float(metrics.window_end_ms - metrics.window_start_ms),

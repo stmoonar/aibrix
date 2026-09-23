@@ -159,3 +159,48 @@ def test_latency_signal_is_unavailable_when_no_latency_samples_exist() -> None:
 
     assert signal.z_m is None
     assert signal.unavailable_reason == "latency_p95_missing"
+
+
+def _spec_with_tau(ema_tau_ms) -> ModelSpec:
+    import dataclasses
+
+    spec = _spec()
+    return dataclasses.replace(spec, trs=dataclasses.replace(spec.trs, ema_tau_ms=ema_tau_ms))
+
+
+def _queue_series(spec: ModelSpec) -> list[float]:
+    """queue_len raw values of three consecutive 10 s windows through one SignalState."""
+    from tre_controller.signals.trs import SignalState
+
+    state = SignalState()
+    out = []
+    for k, running in enumerate((2.0, 8.0, 8.0)):
+        end = 60_000 + 10_000 * k
+        sig = get_signal(_metrics(window_start_ms=end - 30_000, window_end_ms=end, avg_running=running),
+                         spec, "queue_len", trs_z_m=9.0, signal_state=state)
+        out.append(sig.raw_value)
+    return out
+
+
+def test_alt_signal_tau_zero_means_no_smoothing_not_the_default() -> None:
+    """ema_tau_ms = 0 is tau = 0 (alpha = 1): the raw value, as offline - it used to be read
+    as unset and smoothed with DEFAULT_EMA_TAU_MS (20 s)."""
+    from tre_controller.signals.sources import alt_signal_tau_ms
+    from tre_common.tss import DEFAULT_EMA_TAU_MS
+
+    assert alt_signal_tau_ms(_spec_with_tau(0.0)) is None
+    assert alt_signal_tau_ms(_spec_with_tau(None)) == DEFAULT_EMA_TAU_MS
+    assert alt_signal_tau_ms(_spec_with_tau(10_000.0)) == 10_000.0
+    assert _queue_series(_spec_with_tau(0.0)) == [2.0, 8.0, 8.0]
+
+
+def test_alt_signal_tau_follows_the_registry_tau() -> None:
+    import math
+
+    smoothed = _queue_series(_spec_with_tau(10_000.0))
+    alpha = 1.0 - math.exp(-1.0)          # dt 10 s, tau 10 s
+    assert smoothed[0] == 2.0
+    assert math.isclose(smoothed[1], 2.0 + alpha * 6.0)
+    # the default tau smooths more slowly than tau = 10 s
+    default = _queue_series(_spec_with_tau(None))
+    assert default[1] < smoothed[1]

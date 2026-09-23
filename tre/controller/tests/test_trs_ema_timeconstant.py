@@ -110,3 +110,16 @@ def test_signal_state_shares_one_computer_per_model() -> None:
     assert a is b
     other = state.computer_for("other", ema_alpha=0.5, ema_tau_ms=20_000)
     assert other is not a
+
+
+def test_tau_zero_is_no_smoothing_whatever_ema_alpha_says() -> None:
+    # tau = 0 is alpha = 1: TSS = raw, as the offline fit scores it. alpha_fit writes
+    # ema_alpha 1.0 next to ema_tau_ms 0; the fixed-alpha branch reads ema_alpha as the
+    # weight of the OLD value, so falling into it froze TSS at the first sample.
+    for ema_alpha in (1.0, 0.2485, 0.0):
+        c = TRSComputer(ema_alpha=ema_alpha, ema_tau_ms=0.0)
+        r1 = c.compute(_inp(generation=200.0, running=2.0), window_end_ms=0)
+        r2 = c.compute(_inp(generation=400.0, running=2.0), window_end_ms=10_000)
+        r3 = c.compute(_inp(generation=100.0, running=2.0), window_end_ms=20_000)
+        assert (r1.TRS, r2.TRS, r3.TRS) == pytest.approx((100.0, 200.0, 50.0))
+        assert c.tss_ema is None
