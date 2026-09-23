@@ -2258,6 +2258,29 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--smoke-at-rho-star", action="store_true",
                     help="with --reprobe-base: after a measured rho*, one 300 s hold at it; its "
                          "violating-window fraction must be 20-70%% or the run exits 3")
+    ap.add_argument("--training-supplement", action="store_true",
+                    help="step ③ of plan §6.11 (scripts.calibration_training_supplement): the "
+                         "constant-load training cells on the D6' boundaries of one model "
+                         "(--models MODEL), placed from --base-run and --boundary-supplement-run")
+    ap.add_argument("--acceptance-set", action="store_true",
+                    help="step ④ of plan §6.11 (scripts.calibration_acceptance): the acceptance "
+                         "set M of one model - D6' probes of its new shapes, its ten cells, then "
+                         "sealed (M_manifest.json). A real run needs --freeze-file")
+    ap.add_argument("--base-run", type=Path, default=None,
+                    help="--training-supplement / --acceptance-set: the second round's ladder "
+                         "run root (rho*_run2 and C_s per shape)")
+    ap.add_argument("--boundary-supplement-run", type=Path, default=None,
+                    help="--training-supplement / --acceptance-set: the D19 boundary supplement "
+                         "root (S3's rho* under D6')")
+    ap.add_argument("--boundary-table", type=Path, default=None,
+                    help="--acceptance-set: the D6' b50 table of the second round's ladder "
+                         "(boundary_d6prime_run2.csv), the prior of the new shapes' probes")
+    ap.add_argument("--retained-dataset", type=Path, default=None,
+                    help="--acceptance-set: the standard dataset holding the three first-round "
+                         "M cells M keeps (the revision-2 reprocessing of the first round)")
+    ap.add_argument("--freeze-file", type=Path, default=None,
+                    help="--acceptance-set: the frozen parameters (dline_refit freeze); M is "
+                         "collected only after it exists (D22)")
     ap.add_argument("--design", choices=["ladder", "primitives"], default=None,
                     help="ladder (default): the second round's design (scripts.calibration_ladder). "
                          "primitives: the first round's steps / boundary / ramp / bursts - "
@@ -2278,6 +2301,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     help="ladder design: the preregistration the run implements; its commit "
                          "is recorded in the run manifest")
     args = ap.parse_args(argv)
+    collection = bool(args.training_supplement or args.acceptance_set)
+    if args.training_supplement and args.acceptance_set:
+        ap.error("--training-supplement and --acceptance-set are two runs")
+    if collection and (args.reprobe_base is not None or args.reprobe_shapes or args.static_grid
+                       or args.static_grid_only or args.static_grid_list
+                       or args.skip_boundary_search or args.design == "primitives"):
+        ap.error("--training-supplement / --acceptance-set run on the ladder design alone; "
+                 "they do not combine with --reprobe-* / --static-grid* / --design primitives")
+    if not collection and (args.base_run or args.boundary_supplement_run or args.boundary_table
+                           or args.retained_dataset or args.freeze_file):
+        ap.error("--base-run / --boundary-supplement-run / --boundary-table / --retained-dataset "
+                 "/ --freeze-file belong to --training-supplement / --acceptance-set")
     supplement = args.reprobe_base is not None
     if (args.reprobe_grid or args.smoke_at_rho_star) and not supplement:
         ap.error("--reprobe-grid / --smoke-at-rho-star belong to --reprobe-base")
@@ -2313,6 +2348,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"--fit-window-align grid needs --fit-step-ms to be a multiple of {LIVE_GRID_MS} "
             f"(got {args.fit_step_ms}); use --fit-window-align none for a free-phase step"
         )
+    if collection:
+        try:
+            if args.training_supplement:
+                from scripts import calibration_training_supplement
+
+                return calibration_training_supplement.run_training_supplement(args)
+            from scripts import calibration_acceptance
+
+            return calibration_acceptance.run_acceptance_set(args)
+        except ValueError as exc:
+            ap.error(str(exc))
     if supplement:
         from scripts import calibration_supplement
 
