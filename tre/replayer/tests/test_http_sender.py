@@ -155,17 +155,20 @@ def test_pod_header_extraction_prefers_the_pod_name_over_its_address() -> None:
     assert pod_from_headers(None) is None
 
 
-def test_routing_strategy_swaps_the_model_header_for_the_strategy_header() -> None:
-    """The per-model HTTPRoute matches on the ``model`` header, so sending it wins over
-    the catch-all route and the request never reaches the plugin that names a pod.
-    Asking for a routing strategy therefore has to drop that header."""
-    from tre_replayer.engine.http_sender import build_request_headers
+def test_routing_strategy_adds_the_strategy_header_and_keeps_the_model_header() -> None:
+    """The plugin-routed route is patched in ahead of the per-model routes, so the
+    ``model`` header no longer has to be dropped to reach the plugin - and the tre-v2
+    gateway needs it to pick the model's own ORIGINAL_DST cluster."""
+    from tre_replayer.engine.http_sender import DEFAULT_ROUTING_STRATEGY, build_request_headers
 
     default = build_request_headers("dsqwen-7b")
     assert default["model"] == "dsqwen-7b" and "routing-strategy" not in default
 
     routed = build_request_headers("dsqwen-7b", "least-request")
-    assert routed["routing-strategy"] == "least-request" and "model" not in routed
+    assert routed["routing-strategy"] == "least-request" and routed["model"] == "dsqwen-7b"
+
+    # What every v1 client request carried.
+    assert DEFAULT_ROUTING_STRATEGY == "least-gpu-cache"
 
 
 # ------------------------------------------------ what "offered on time" actually means

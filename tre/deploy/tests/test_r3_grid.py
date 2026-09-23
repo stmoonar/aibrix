@@ -439,7 +439,9 @@ def test_drive_cell_routing_strategy_changes_the_request_headers() -> None:
         routing_strategy="least-request",
     )
     assert seen and seen[0]["routing-strategy"] == "least-request"
-    assert "model" not in seen[0]  # else the per-model HTTPRoute wins and no pod is named
+    # Kept: the routed route is patched in ahead of the per-model routes, and the tre-v2
+    # gateway keys its per-model ORIGINAL_DST cluster on this header.
+    assert seen[0]["model"] == "dsqwen-7b"
 
 
 def test_openloop_mirrors_the_replayer_arrival_window() -> None:

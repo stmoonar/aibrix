@@ -27,10 +27,18 @@ DEFAULT_BASELINE = {
     "dsqwen-7b": "dsqwen-7b-nscc-ds-4a100-node9-gpu-0-546d5d9f88-f94nf",
     "dsqwen-14b": "dsqwen-14b-nscc-ds-4a100-node9-gpu-2-3-69c86d8db7-vnxtl",
 }
+# Both arms go through the SAME tre-v2 gateway (NodePort 31094): same routes, same 600 s
+# timeout, same per-model admission limits, same least-gpu-cache pod choice (ext_proc,
+# tre-v2/tre-gateway-plugins), exactly as v1 ran both arms through one gateway. The APA
+# arm used to go through aibrix-system (31592, 120 s timeout, its own plugin); the pod
+# set is the same either way - APA scales through service-manager, which maintains the
+# tre.aibrix.io/routable label the tre-v2 plugin routes on.
 GATEWAYS = {
     "tre": "http://192.168.223.76:31094/v1/completions",
-    "apa": "http://192.168.223.76:31592/v1/completions",
+    "apa": "http://192.168.223.76:31094/v1/completions",
 }
+#: routing-strategy header every replayed request carries (the v1 client's value).
+ROUTING_STRATEGY = "least-gpu-cache"
 SIGNAL_ARMS = {"zm", "queue_len", "decode_tps", "prefill_tps"}
 ALLOWED_ARMS = {"tre", "apa", *SIGNAL_ARMS}
 ORPHAN_KEY = "tre:v2:controller:alerts:hidden_orphans"
@@ -720,6 +728,7 @@ class CampaignRunner:
             sys.executable, "-m", "tre_replayer.run_trace",
             "--trace", str(trace_path),
             "--gateway-url", config.gateway,
+            "--routing-strategy", ROUTING_STRATEGY,
             "--out", str(requests_path),
             "--registry", str(self.repo / "deploy/registry.yaml"),
             "--seed", str(spec.seed),
@@ -733,6 +742,7 @@ class CampaignRunner:
             "trace": str(trace_path.relative_to(self.repo)),
             "trace_sha256": sha256_file(trace_path),
             "gateway": config.gateway,
+            "routing_strategy": ROUTING_STRATEGY,
             "command": command,
             "operator": "root via Codex",
             "controller_pod": controller_pod,

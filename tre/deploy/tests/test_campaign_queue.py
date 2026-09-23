@@ -81,14 +81,16 @@ def test_manifest_pins_freeze_baseline_and_unique_runs(tmp_path):
         load_manifest(path)
 
 
-def test_arm_configs_separate_gateways_and_keep_apa_counterfactual_logging():
+def test_arm_configs_share_the_tre_gateway_and_keep_apa_counterfactual_logging():
     tre = arm_config("tre")
     apa = arm_config("apa")
     queue = arm_config("queue_len")
 
     assert tre.gateway.endswith(":31094/v1/completions")
     assert tre.mode == "active" and not tre.disable_eta_gate
-    assert apa.gateway.endswith(":31592/v1/completions")
+    # Same gateway for both arms (v1 parity): same routes, timeout, admission limits and
+    # least-gpu-cache pod choice; only the scaler differs.
+    assert apa.gateway == tre.gateway
     assert apa.mode == "observe" and apa.apa_enabled
     assert apa.signal_source == "zm"
     assert queue.gateway == tre.gateway
