@@ -48,7 +48,7 @@ def run_tick_replay(
     registry: Registry,
     safescale: SafeScaleController | None = None,
     signal_source: str = "zm",
-    suppress_hot_proactive_probe: bool = True,
+    suppress_hot_proactive_probe: bool = False,
 ) -> TickReplayResult:
     queue = ReplayQueue()
     results: list[LoopTickResult] = []

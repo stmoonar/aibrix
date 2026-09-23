@@ -74,8 +74,9 @@ class ControllerConfig:
     orphan_scan_enabled: bool
     orphan_grace_s: float
     # t1: suppress the receiver-less proactive scale-down probe on hot (HIGH) donors
-    # (planner high_proactive_safescale). Default True (guard on); set env
-    # TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE=0 to restore the legacy proactive-release path.
+    # (planner high_proactive_safescale). Default False (v1/paper alignment A2: the v1
+    # paper_high_proactive_shrink path is live, HIGH models shrink through SafeScale);
+    # TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE=1 re-enables the t1 guard.
     safescale_suppress_hot_proactive: bool
     proactive_release_min_trs: float
     # Review F4: per-model action cooldown (hold a model's next action until a metrics
@@ -252,7 +253,7 @@ class ControllerConfig:
             orphan_scan_enabled=_get_bool(values, "TRE_ORPHAN_SCAN_ENABLED", True),
             orphan_grace_s=_get_positive_float(values, "TRE_ORPHAN_GRACE_S", 600.0),
             safescale_suppress_hot_proactive=_get_bool(
-                values, "TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE", True
+                values, "TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE", False
             ),
             proactive_release_min_trs=_get_positive_float(values, "PROACTIVE_RELEASE_MIN_TRS", 2000.0),
             action_cooldown=_get_bool(values, "TRE_ACTION_COOLDOWN", True),

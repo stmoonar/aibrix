@@ -38,11 +38,15 @@ class PlanConfig:
     # NO demand-driven receiver. During a traffic spike a busy model is momentarily HIGH
     # (TSS = throughput/queue spikes up), so the probe hid a serving pod exactly as load
     # climbed, deepening saturation (routable 4->3, then CRITICAL->rescale oscillation).
-    # When enabled (default) this suppresses that receiver-less proactive probe on hot
+    # When enabled this suppresses that receiver-less proactive probe on hot
     # (HIGH/CRITICAL) donors. Demand-driven preemption (idle/HIGH immediate donors and the
     # TP critical_same_slot_high_shrink -> CRITICAL beneficiary) is a separate path and is
-    # intentionally NOT gated. Ablate via TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE=0.
-    suppress_hot_proactive_probe: bool = True
+    # intentionally NOT gated. Default OFF since the v1/paper alignment (A2): the path is
+    # v1's paper_high_proactive_shrink (rescue tick, HIGH, replicas > floor, no active
+    # probe, not moved by another path this tick -> SafeScale shrink by one step), now
+    # protected by the SafeScale KV-cache / donor-health guards and the rollback backoff.
+    # TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE=1 re-enables the guard.
+    suppress_hot_proactive_probe: bool = False
     disable_eta_gate: bool = False
 
 

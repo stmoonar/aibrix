@@ -118,7 +118,7 @@ def run_planner_tick(
     paper_state_cache: PaperStateCache | None = None,
     incomplete_policy: IncompletePolicy = "drop_model",
     signal_state: SignalState | None = None,
-    suppress_hot_proactive_probe: bool = True,
+    suppress_hot_proactive_probe: bool = False,
     disable_eta_gate: bool = False,
     prof: "TickProfiler | None" = None,
     loop: str = "tick",

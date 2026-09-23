@@ -39,6 +39,13 @@ def test_config_defaults_are_plan_aligned() -> None:
     assert config.ablation_disable_fast_loop is False
     assert config.ablation_disable_safescale is False
     assert config.disable_eta_gate is False
+    # v1/paper alignment A2: the receiver-less HIGH proactive SafeScale shrink is live.
+    assert config.safescale_suppress_hot_proactive is False
+
+
+def test_config_hot_proactive_guard_is_opt_in() -> None:
+    assert ControllerConfig.from_env({"TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE": "1"}).safescale_suppress_hot_proactive is True
+    assert ControllerConfig.from_env({"TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE": "0"}).safescale_suppress_hot_proactive is False
 
 
 def test_config_reads_centralized_environment_values() -> None:

@@ -115,6 +115,10 @@ spec:
               value: "false"
             - name: TRE_ABLATION_DISABLE_SAFESCALE
               value: "false"
+            # A2 (v1/paper alignment): the receiver-less HIGH proactive SafeScale shrink
+            # (v1 paper_high_proactive_shrink) is live; "1" re-enables the t1 guard.
+            - name: TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE
+              value: "0"
             # Opt-in control-loop profiling capability (measures TRE's own per-tick
             # latency + CPU for the paper). OFF by default; an operator flips this to
             # "true" and restarts the pod for a profiling run. See tre_controller.profiling.

@@ -70,7 +70,9 @@ def _run(registry: Registry, bindings: list[Binding], load: dict[str, tuple[floa
     sm = InProcessServiceManager(service)
     queue = ActionQueue(sm)
     tick = run_rescue_tick if loop == "rescue" else run_fairness_tick
-    result = tick(snapshot, queue=queue, registry=registry, cluster_view=view)
+    # No safescale controller here, so the receiver-less HIGH proactive probe (default on
+    # since A2) would dispatch as an immediate sleep; these cases exercise slot planning.
+    result = tick(snapshot, queue=queue, registry=registry, cluster_view=view, suppress_hot_proactive_probe=True)
     dispatched = asyncio.run(queue.drain_once())  # raises on WakeConflict / no free slot
     assert all(item.ok for item in dispatched), dispatched
     awake = {b.serve_id for b in store.load().bindings if b.awake}

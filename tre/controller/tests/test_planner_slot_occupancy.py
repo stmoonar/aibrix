@@ -57,7 +57,8 @@ def _e1_bindings(*, free_slot: tuple[str, int] | None = None) -> tuple[Binding, 
 
 
 def _cfg() -> PlanConfig:
-    return PlanConfig(min_replicas_per_model=1, max_replicas_per_model=8)
+    # Slot-occupancy cases, not the receiver-less HIGH proactive probe (default on since A2).
+    return PlanConfig(min_replicas_per_model=1, max_replicas_per_model=8, suppress_hot_proactive_probe=True)
 
 
 def _plan(bindings: tuple[Binding, ...], donor_state: ModelState, *, idle_gpus: int = 0):
