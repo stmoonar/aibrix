@@ -69,7 +69,7 @@ data:
         qsat: 4.0
         epsat: 0.05
         hsat: 3
-        ema_tau_ms: 20000
+        ema_tau_ms: 10000
       vllm_extra_args:
       - --no-enable-prefix-caching
       - --max-num-seqs
@@ -122,7 +122,7 @@ data:
         qsat: 4.0
         epsat: 0.05
         hsat: 3
-        ema_tau_ms: 20000
+        ema_tau_ms: 10000
       vllm_extra_args:
       - --no-enable-prefix-caching
       - --max-num-seqs
@@ -175,7 +175,7 @@ data:
         qsat: 4.0
         epsat: 0.05
         hsat: 3
-        ema_tau_ms: 20000
+        ema_tau_ms: 10000
       vllm_extra_args:
       - --no-enable-prefix-caching
       - --max-num-seqs
