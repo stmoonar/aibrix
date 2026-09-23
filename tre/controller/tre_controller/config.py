@@ -10,7 +10,6 @@ from tre_common.rediskeys import SCRAPE_INTERVAL_MS
 from tre_common.registry import EXPECTED_SIGNAL_DIRECTIONS, load_registry
 from tre_controller.loops.metrics_task import REFRESH_MODES
 from tre_controller.signals.trs import DWELL_STATES
-from tre_controller.planning.util_scale_down import DEFAULT_WINDOWS, parse_q_per_replica
 
 SIGNAL_SOURCES = {
     "zm",
@@ -82,17 +81,6 @@ class ControllerConfig:
     # Review F4: per-model action cooldown (hold a model's next action until a metrics
     # window starting after its last executed action). TRE_ACTION_COOLDOWN=0 disables.
     action_cooldown: bool
-    # Utilisation-gated scale-down probe (planner util_scale_down_safescale).
-    # TRE_UTIL_SCALE_DOWN (default on), TRE_UTIL_SCALE_DOWN_WINDOWS (distinct metrics
-    # windows, default 6 = 60 s at the phase-aligned 10 s cadence; it was ~30-45 s at the
-    # old free-running 5 s refresh), TRE_UTIL_SCALE_DOWN_Q_PER_REPLICA
-    # ("2.5" or "model=v,..."; overrides the registry scale_down_q_per_replica).
-    # Independent of TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE (which gates only the Z_m
-    # high_proactive_safescale path); HIGH models are eligible here. Ablations must set
-    # TRE_UTIL_SCALE_DOWN explicitly.
-    util_scale_down: bool
-    util_scale_down_windows: int
-    util_scale_down_q_per_replica: dict[str, float]
     # Opt-in control-loop profiling (research toggle, off by default). When
     # profile_enabled is False the profiler object is None everywhere (zero overhead).
     profile_enabled: bool
@@ -268,9 +256,6 @@ class ControllerConfig:
             ),
             proactive_release_min_trs=_get_positive_float(values, "PROACTIVE_RELEASE_MIN_TRS", 2000.0),
             action_cooldown=_get_bool(values, "TRE_ACTION_COOLDOWN", True),
-            util_scale_down=_get_bool(values, "TRE_UTIL_SCALE_DOWN", True),
-            util_scale_down_windows=_get_positive_int(values, "TRE_UTIL_SCALE_DOWN_WINDOWS", DEFAULT_WINDOWS),
-            util_scale_down_q_per_replica=parse_q_per_replica(values.get("TRE_UTIL_SCALE_DOWN_Q_PER_REPLICA")),
             profile_enabled=_get_bool(values, "TRE_PROFILE", False),
             profile_stream_maxlen=_get_positive_int(values, "TRE_PROFILE_STREAM_MAXLEN", 200_000),
             profile_proc_sample_interval_s=_get_positive_float(

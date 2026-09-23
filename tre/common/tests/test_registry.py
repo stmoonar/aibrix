@@ -123,18 +123,14 @@ def test_registry_validates_alt_threshold_direction_and_theta(tmp_path):
     errors = load_registry(str(path)).validate()
     assert any("alt_thresholds.queue_len.theta must be positive" in error for error in errors)
 
-def test_registry_parses_and_validates_scale_down_q_per_replica(tmp_path):
+def test_registry_ignores_removed_scale_down_q_per_replica_key(tmp_path):
+    # The utilisation-gated scale-down (TRE_UTIL_SCALE_DOWN) was removed (v1/paper
+    # alignment A3). A live ConfigMap may still carry the key: it must parse and be ignored.
     path = tmp_path / "registry.yaml"
-    path.write_text(textwrap.dedent(REGISTRY_YAML), encoding="utf-8")
-    assert load_registry(str(path)).model("dsqwen-7b").scale_down_q_per_replica is None
-
     with_key = textwrap.dedent(REGISTRY_YAML).replace(
         "    max_replicas: 4\n", "    max_replicas: 4\n    scale_down_q_per_replica: 20\n"
     )
     path.write_text(with_key, encoding="utf-8")
     registry = load_registry(str(path))
-    assert registry.model("dsqwen-7b").scale_down_q_per_replica == 20.0
     assert registry.validate() == []
-
-    path.write_text(with_key.replace("scale_down_q_per_replica: 20", "scale_down_q_per_replica: 0"), encoding="utf-8")
-    assert any("scale_down_q_per_replica must be positive" in e for e in load_registry(str(path)).validate())
+    assert not hasattr(registry.model("dsqwen-7b"), "scale_down_q_per_replica")

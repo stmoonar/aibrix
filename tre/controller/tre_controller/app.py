@@ -18,7 +18,6 @@ from tre_controller.loops.metrics_task import MetricsTaskConfig, SnapshotBox, Sn
 from tre_controller.loops.rescue_task import rescue_task
 from tre_controller.loops.safescale_task import safescale_task
 from tre_controller.planning.safescale import SafeScaleStateMachine
-from tre_controller.planning.util_scale_down import UtilScaleDown
 from tre_controller.signals.trs import SignalState
 from tre_controller.sm_client import AsyncTransport, ServiceManagerClient
 from tre_controller.store.metrics_store import MetricsStore
@@ -42,9 +41,6 @@ class ControllerDependencies:
     signal_state: SignalState
     profiler: "TickProfiler | None" = None
     hidden_orphan_detector: "HiddenOrphanDetector | None" = None
-    # Shared by rescue + fairness (one entry per distinct metrics window); None when
-    # TRE_UTIL_SCALE_DOWN is off.
-    util_scale_down: "UtilScaleDown | None" = None
 
 
 @dataclass(frozen=True)
@@ -90,7 +86,6 @@ def build_controller_task_specs(
                     safescale=deps.safescale,
                     signal_state=deps.signal_state,
                     prof=deps.profiler,
-                    util_scale_down=deps.util_scale_down,
                 ),
             )
         )
@@ -108,7 +103,6 @@ def build_controller_task_specs(
                 safescale=deps.safescale,
                 signal_state=deps.signal_state,
                 prof=deps.profiler,
-                util_scale_down=deps.util_scale_down,
             ),
         )
     )
@@ -195,14 +189,6 @@ def create_controller_dependencies(
         profiler=profiler,
         hidden_orphan_detector=HiddenOrphanDetector(
             redis_client, grace_s=cfg.orphan_grace_s
-        ),
-        util_scale_down=(
-            UtilScaleDown(
-                windows=cfg.util_scale_down_windows,
-                q_overrides=cfg.util_scale_down_q_per_replica,
-            )
-            if cfg.util_scale_down
-            else None
         ),
     )
 

@@ -27,7 +27,6 @@ from tre_controller.planning.planner import (
     build_plan,
 )
 from tre_controller.planning.safescale import SafeScaleCommand, SafeScaleDecision
-from tre_controller.planning.util_scale_down import UtilScaleDown
 from tre_controller.signals.sources import get_signal, per_replica_token_rate
 from tre_controller.signals.trs import SignalState, TRSComputer, TRSInput
 from tre_sm.allocator.slots import natural_key, release_order
@@ -124,7 +123,6 @@ def run_planner_tick(
     prof: "TickProfiler | None" = None,
     loop: str = "tick",
     action_cooldown: bool = False,
-    util_scale_down: UtilScaleDown | None = None,
 ) -> LoopTickResult:
     if snapshot.stale:
         return LoopTickResult(submitted=0, events=("snapshot_stale",))
@@ -160,11 +158,6 @@ def run_planner_tick(
         _signals_ns = time.perf_counter_ns() - _phase_t0
         _phase_t0 = time.perf_counter_ns()
     replicas = {model: int(ctx.get("assigned_replicas", 0)) for model, ctx in contexts.items()}
-    # The utilisation path only ever proposes safescale probes; without a safescale
-    # controller the shrink would be an immediate sleep, so it stays off.
-    util = util_scale_down if safescale is not None else None
-    if util is not None:
-        _observe_util_windows(util, snapshot, contexts)
     cfg = PlanConfig(
         min_replicas_per_model=min((spec.min_replicas for spec in registry.models()), default=0),
         max_replicas_per_model=max((spec.max_replicas for spec in registry.models()), default=0),
@@ -176,7 +169,6 @@ def run_planner_tick(
         incomplete_policy=incomplete_policy,
         suppress_hot_proactive_probe=suppress_hot_proactive_probe,
         disable_eta_gate=disable_eta_gate,
-        **_util_plan_config(util, registry),
     )
     plan = build_plan(
         model_contexts=contexts,
@@ -188,7 +180,6 @@ def run_planner_tick(
         inflight_models=queue.inflight_models(),
         cluster_view=cluster_view,
         cooldowns=_action_cooldowns(snapshot, queue) if action_cooldown else None,
-        util_windows=util.history() if util is not None else None,
     )
     if _prof_on:
         _plan_ns = time.perf_counter_ns() - _phase_t0
@@ -229,29 +220,6 @@ def run_planner_tick(
         model_contexts=contexts,
         classifications={item.model_name: item for item in classifications},
     )
-
-
-def _observe_util_windows(util: UtilScaleDown, snapshot: MetricsSnapshot, contexts: dict[str, dict]) -> None:
-    for model_name, metrics in snapshot.models.items():
-        context = contexts.get(model_name)
-        if context is None:
-            continue
-        util.observe(
-            model_name,
-            window_end_ms=metrics.window_end_ms,
-            q_raw=metrics.avg_running + metrics.avg_waiting,
-            routable=int(context.get("routable_pods") or 0),
-        )
-
-
-def _util_plan_config(util: UtilScaleDown | None, registry: Registry) -> dict:
-    if util is None:
-        return {}
-    return {
-        "util_scale_down": True,
-        "util_scale_down_windows": util.windows,
-        "scale_down_q_per_replica_by_model": {spec.name: util.threshold_for(spec) for spec in registry.models()},
-    }
 
 
 def _action_cooldowns(snapshot: MetricsSnapshot, queue: PlannerQueue) -> dict[str, str]:

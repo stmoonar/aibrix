@@ -6,7 +6,6 @@ from typing import Any, Literal, Mapping
 
 from tre_common.registry import ClusterTopology
 from tre_controller.planning.classify import ModelClassification, ModelRole, ModelState, donor_mock_cost_key
-from tre_controller.planning.util_scale_down import UtilWindow, util_scale_down_ready
 from tre_common.gpu_placement import plan_placements
 from tre_sm.allocator.slots import (
     Binding,
@@ -45,11 +44,6 @@ class PlanConfig:
     # intentionally NOT gated. Ablate via TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE=0.
     suppress_hot_proactive_probe: bool = True
     disable_eta_gate: bool = False
-    # Utilisation-gated scale-down (TRE_UTIL_SCALE_DOWN). Off by default here; the
-    # controller enables it via run_planner_tick when a UtilScaleDown tracker is wired.
-    util_scale_down: bool = False
-    util_scale_down_windows: int = 6
-    scale_down_q_per_replica_by_model: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -129,7 +123,6 @@ def build_plan(
     inflight_models: set[str] | None = None,
     cluster_view: ClusterView | None = None,
     cooldowns: Mapping[str, str] | None = None,
-    util_windows: Mapping[str, tuple[UtilWindow, ...]] | None = None,
 ) -> PlanResult:
     active_probe_models = active_probe_models or set()
     inflight_models = inflight_models or set()
@@ -660,39 +653,6 @@ def build_plan(
             pending = probe_upscale_plans.setdefault(middle.model_name, {})
             pending[recv.model_name] = pending.get(recv.model_name, 0) + transfer
             needed -= transfer
-
-    if cfg.util_scale_down and util_windows is not None:
-        # Receiver-less, utilisation-gated shrink: one replica, always via a safescale
-        # probe (hide -> observe -> commit/rollback), never an immediate sleep.
-        for item in sorted(classifications, key=lambda entry: entry.model_name):
-            model = item.model_name
-            if item.state not in (ModelState.HEALTHY, ModelState.HIGH):
-                continue  # CRITICAL/LOW need capacity; IDLE has its own immediate path
-            if model in active_probe_models or model in inflight_models or deltas.get(model, 0) != 0:
-                continue
-            pods = _effective_routable_replicas(model, model_contexts, model_replicas)
-            if pods - 1 < _serving_floor(cfg, model, model_contexts, model_replicas):
-                continue
-            q_after = util_scale_down_ready(
-                util_windows.get(model, ()),
-                routable=pods,
-                threshold=cfg.scale_down_q_per_replica_by_model.get(model, math.inf),
-                windows=cfg.util_scale_down_windows,
-            )
-            if q_after is None or cooldown.blocks(model, "down"):
-                continue
-            _add_scale_action(
-                actions,
-                deltas,
-                model=model,
-                delta=-1,
-                reason="util_scale_down_safescale",
-                source_loop="fairness",
-                requires_safescale=True,
-                donor=model,
-            )
-            delayed_down_models.add(model)
-            events.append(f"util_scale_down_proposed:{model}:q_after={q_after:.2f}")
 
     return PlanResult(actions, delayed_down_models, probe_upscale_plans, events=events)
 

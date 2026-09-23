@@ -16,7 +16,6 @@ from tre_controller.loops.tick import (
     run_planner_tick,
 )
 from tre_controller.planning.planner import ClusterView, IncompletePolicy
-from tre_controller.planning.util_scale_down import UtilScaleDown
 from tre_controller.signals.trs import SignalState
 
 if False:  # TYPE_CHECKING guard without importing typing symbol here
@@ -56,7 +55,6 @@ def run_fairness_tick(
     disable_eta_gate: bool = False,
     prof: "TickProfiler | None" = None,
     action_cooldown: bool = False,
-    util_scale_down: UtilScaleDown | None = None,
 ) -> LoopTickResult:
     return run_planner_tick(
         snapshot,
@@ -77,7 +75,6 @@ def run_fairness_tick(
         prof=prof,
         loop="fairness",
         action_cooldown=action_cooldown,
-        util_scale_down=util_scale_down,
     )
 
 
@@ -95,7 +92,6 @@ async def fairness_task(
     safescale: SafeScaleController | None = None,
     signal_state: SignalState | None = None,
     prof: "TickProfiler | None" = None,
-    util_scale_down: UtilScaleDown | None = None,
 ) -> None:
     paper_state_cache = PaperStateCache(max_stale_windows=getattr(cfg, "paper_stale_max_windows", 3))
     while True:
@@ -121,7 +117,6 @@ async def fairness_task(
                     disable_eta_gate=getattr(cfg, "disable_eta_gate", False),
                     prof=prof,
                     action_cooldown=getattr(cfg, "action_cooldown", True),
-                    util_scale_down=util_scale_down,
                 )
             if decision_writer is not None:
                 if prof is not None:
