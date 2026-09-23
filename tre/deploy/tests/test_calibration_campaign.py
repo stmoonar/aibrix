@@ -213,7 +213,7 @@ def test_fit_plan_fits_on_the_live_grid_and_keeps_the_raw_stream_separate() -> N
 def test_fit_plan_pairs_the_primary_fit_with_a_lambda_wait_control() -> None:
     plan = campaign.fit_plan(["dsqwen-7b"], Path("/out"), Path("/raw"), _Args())
     by_label = {r["label"]: r for r in plan["theta"]}
-    assert by_label["primary"]["lambda_wait"] == 3.0
+    assert by_label["primary"]["lambda_wait"] == 1.0  # the D-line's lambda_wait
     assert by_label["secondary"]["lambda_wait"] == 0.0
     assert plan["acceptance"]["tolerance"] == 0.05
     assert "inert" in plan["acceptance"]["statement"]
@@ -230,7 +230,7 @@ def test_fit_plan_runs_the_whole_pipeline_in_order_on_one_label() -> None:
         assert cmd[cmd.index("--ttft-p95-ms") + 1] == "500.0"
         assert cmd[cmd.index("--tpot-p95-ms") + 1] == "75.0"
     scopes = {(e["family"], e["lambda_wait"]) for e in plan["theta"]}
-    assert scopes == {(f, lw) for f in ("", "prefill_heavy", "decode_heavy") for lw in (3.0, 0.0)}
+    assert scopes == {(f, lw) for f in ("", "prefill_heavy", "decode_heavy") for lw in (1.0, 0.0)}
     [verdict] = plan["verdict"]
     assert "scripts.theta_verdict" in verdict["command"] and "verdict" in verdict["command"]
     assert verdict["command"].count("--family") == 2
@@ -241,14 +241,14 @@ def test_fit_plan_runs_the_whole_pipeline_in_order_on_one_label() -> None:
         # plan 6.9 item 5: the alt fit gets the families, the primary label and writes
         # verdicts the hold-out step scores - the same pipeline as TSS.
         assert entry["command"].count("--family") == 2
-        assert entry["command"][entry["command"].index("--label-lambda-wait") + 1] == "3.0"
+        assert entry["command"][entry["command"].index("--label-lambda-wait") + 1] == "1.0"
         assert "--verdict-dir" in entry["command"]
     arms = {e["arm"]: e for e in plan["ablation"]}
     assert set(arms) == {"tss_lw0", "tss_wp1"}
     assert (arms["tss_lw0"]["lambda_wait"], arms["tss_wp1"]["w_p"]) == (0.0, 1.0)
     for entry in plan["ablation"]:
         cmd = entry["command"]
-        assert cmd[cmd.index("--label-lambda-wait") + 1] == "3.0"
+        assert cmd[cmd.index("--label-lambda-wait") + 1] == "1.0"
         assert cmd.count("--family") == 2
     assert plan["label_def"]["e2e"] == "excluded"
 

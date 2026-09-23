@@ -161,8 +161,11 @@ DEFAULT_COOLDOWN_S = 45.0
 REQUIRED_CONTROLLER_MODE = "observe"
 CONTROLLER_MODE_KEY = "tre:v2:controller:mode"
 
-#: lambda_wait for the primary fit, inherited from the registry.
-PRIMARY_LAMBDA_WAIT = 3.0
+#: lambda_wait for the primary fit: the D-line's (plan 2026-09-21 §6.11; the lambda check
+#: of ``scripts.dline_refit`` keeps 1 unless another value gains >= 0.02 BA, and it kept 1
+#: for every model and arm on the 09-21 data). It used to be the registry's 3.0, which the
+#: D-line's own fits never ran at - the archived alpha fit passed --lambda-wait 1.0.
+PRIMARY_LAMBDA_WAIT = 1.0
 #: The control fit. If theta and the ranking separation move by less than
 #: SECONDARY_FIT_TOLERANCE between the two, the waiting term contributed nothing and the
 #: honest statement is that it is inert in this deployment - because gateway admission
@@ -973,7 +976,8 @@ def fit_plan(
     ``--instant-sample-ms`` scales every queue average by 10x, which is why
     ``rewindow_from_raw`` now refuses a mismatch instead of rescaling silently.
 
-    *lambda_wait.* The primary fit keeps the inherited 3.0. A secondary fit at 0.0 says
+    *lambda_wait.* The primary fit runs at the D-line's 1.0 (the registry still deploys
+    3.0; the ``dline`` step's lambda check is what may move it). A secondary fit at 0.0 says
     whether the waiting term did anything: if theta and the ranking separation move by
     less than 5 %, the term is inert in this deployment. Under the superseded gateway cap
     the reason was structural - in-flight was capped below the engine's sequence limit,
