@@ -18,8 +18,9 @@ Rule, per model, over the grid ``tau in {0,5,10,15,20,30,40,60} s`` (alpha 1 .. 
 5. score: LOSO balanced accuracy (BA); every feasible alpha within 1 SE (cell bootstrap)
    of the best BA is a candidate;
 6. tie 1: fewest spurious CRITICAL episodes per hour on steady healthy cells (hold /
-   static cells with no violating window; an episode is a dwell-confirmed CRITICAL run
-   with no violating window within +-30 s of it);
+   static cells with no violating window - "steady" from the run's ``cells.jsonl`` with
+   ``--ledger``, else from a first-round cell id; an episode is a dwell-confirmed CRITICAL
+   run with no violating window within +-30 s of it);
    tie 2: the larger alpha (the more responsive EMA).
 
 Detection lag (per violation episode: first confirmed CRITICAL from 30 s before its first
@@ -60,8 +61,21 @@ DEFAULT_BOOTSTRAP = 1000
 DEFAULT_SE_RESAMPLES = 1000
 DEFAULT_SEED = 20260922
 #: load codes of the fixed dynamic primitives; any code >= HOLD_CODE_MIN is a constant-rho
-#: cell (boundary hold 1000+, static grid 2000+, gen_calibration_schedules).
+#: cell (boundary hold 1000+, static grid 2000+, gen_calibration_schedules). First-round
+#: (primitives design) cell ids only.
 HOLD_CODE_MIN = 1000
+#: Cell codes of the ladder design (``calibration_design.CELL_CODE_BASE``): a serial, not a
+#: load code - ramps and holds alike are >= 1e6, so the code says nothing about whether the
+#: cell held its load. Such a cell is steady only by its ledger line.
+DESIGN_CODE_MIN = 1_000_000
+#: Ledger primitives whose offered load is constant for the whole cell.
+STEADY_PRIMITIVES = frozenset({"hold", "static"})
+#: Ledger roles that are never steady whatever their primitive.
+UNSTEADY_ROLES = frozenset({"ramp"})
+
+
+class LedgerMissing(ValueError):
+    """A ladder-design cell id with no ledger line to say what the cell was."""
 
 
 def alpha_of_tau(tau_s: float, dt_ref_s: float = DT_REF_S) -> float:
@@ -101,9 +115,29 @@ def cell_load_code(scenario_id: str) -> Optional[int]:
         return None
 
 
-def is_steady_cell(scenario_id: str) -> bool:
-    """Constant-rho cell (boundary hold / probe, static grid), not a steps/ramp/bursts cell."""
+def is_steady_cell(scenario_id: str, ledger: Optional[Mapping[str, Mapping[str, Any]]] = None) -> bool:
+    """Constant-rho cell (boundary hold / probe, ladder / supplement / sentinel hold, static
+    grid), not a steps / ramp / bursts cell.
+
+    With a ``ledger`` (cell id -> ``cells.jsonl`` line, ``rewindow_from_raw.load_ledgers``)
+    the cell's own ``primitive`` / ``role`` decide. Without one the first-round cell-id
+    rule applies (load code >= :data:`HOLD_CODE_MIN`) - but only to first-round ids: a
+    ladder-design id (code >= :data:`DESIGN_CODE_MIN`) is a serial number that ramps carry
+    too, and reading it as a load code is how every second-round ramp became "steady" and
+    fed D4-prime's spurious-CRITICAL tie-break. Such an id without a ledger line is an error,
+    not a guess.
+    """
+    base = base_cell(scenario_id)
+    if ledger is not None and base in ledger:
+        entry = ledger[base]
+        return (str(entry.get("primitive") or "") in STEADY_PRIMITIVES
+                and str(entry.get("role") or "") not in UNSTEADY_ROLES)
     code = cell_load_code(scenario_id)
+    if code is not None and code >= DESIGN_CODE_MIN:
+        raise LedgerMissing(
+            f"{base}: a ladder-design cell id - its code is a serial, not a load code; pass the "
+            "campaign's cells.jsonl (--ledger) so steady cells are read from their primitive/role"
+        )
     return code is not None and code >= HOLD_CODE_MIN
 
 
@@ -173,10 +207,11 @@ class CellStats:
 def cell_stats(
     cell: str, starts_ms: Sequence[float], crit: Sequence[bool], violated: Sequence[bool], *,
     step_ms: float = DEFAULT_STEP_MS, margin_ms: float = EPISODE_MARGIN_MS,
+    steady: Optional[bool] = None,
 ) -> CellStats:
     """Same-window confusion counts, spurious CRITICAL episodes and detection lags of one
-    cell (rows in window order)."""
-    st = CellStats(cell=cell, steady=is_steady_cell(cell))
+    cell (rows in window order). ``steady`` defaults to :func:`is_steady_cell` (no ledger)."""
+    st = CellStats(cell=cell, steady=is_steady_cell(cell) if steady is None else bool(steady))
     for c, v in zip(crit, violated):
         if v:
             st.tp += bool(c)
@@ -302,6 +337,7 @@ CritFn = Callable[[Sequence[Any], float, float], list[bool]]
 def loso_stats(
     windows: Sequence[Any], fit: FitFn, crit_fn: CritFn, *,
     shape_fn: Callable[[str], str], step_ms: float = DEFAULT_STEP_MS,
+    steady_fn: Callable[[str], bool] = is_steady_cell,
 ) -> tuple[dict[str, CellStats], dict[str, Any]]:
     """Per-cell stats of the LOSO classifier under one alpha, and the per-fold fits."""
     shapes = sorted({shape_fn(w.scenario_id) for w in windows})
@@ -324,7 +360,7 @@ def loso_stats(
             idx.sort(key=lambda i: test[i].window_start_ms or 0.0)
             out[cell] = cell_stats(
                 cell, [float(test[i].window_start_ms or 0.0) for i in idx], [crit[i] for i in idx],
-                [not test[i].slo_met for i in idx], step_ms=step_ms,
+                [not test[i].slo_met for i in idx], step_ms=step_ms, steady=steady_fn(cell),
             )
     return out, folds
 
@@ -350,10 +386,13 @@ def alpha_rule(
     seed: int = DEFAULT_SEED,
     full_fit: Optional[Callable[[Sequence[Any]], Optional[Mapping[str, Any]]]] = None,
     bootstrap_refit: bool = False,
+    steady_fn: Callable[[str], bool] = is_steady_cell,
     log: Callable[[str], None] = lambda _m: None,
 ) -> dict[str, Any]:
     """Apply the D4' rule. ``load(tau_s)`` returns the fitting windows with the tau-EMA
-    applied; ``fit`` / ``crit_fn`` are the theta/delta fit and the deployed classifier."""
+    applied; ``fit`` / ``crit_fn`` are the theta/delta fit and the deployed classifier;
+    ``steady_fn`` says which cells held a constant load (``is_steady_cell`` with the run's
+    ledger for a ladder run)."""
     if shape_fn is None:
         table = shape_table()
         shape_fn = lambda sid: shape_of(sid, table)  # noqa: E731
@@ -364,7 +403,8 @@ def alpha_rule(
         windows = load(tau)
         if bootstrap_refit:
             loaded[tau] = windows
-        stats, folds = loso_stats(windows, fit, crit_fn, shape_fn=shape_fn, step_ms=step_ms)
+        stats, folds = loso_stats(windows, fit, crit_fn, shape_fn=shape_fn, step_ms=step_ms,
+                                  steady_fn=steady_fn)
         per_alpha[tau] = stats
         agg = aggregate(list(stats.values()))
         se = ba_se(stats, n=se_resamples, seed=seed)
@@ -411,7 +451,8 @@ def alpha_rule(
             if bootstrap_refit:
                 ws = [replace(w, scenario_id=f"{c}{COPY_SEP}{k}")
                       for k, c in enumerate(smp) for w in by_cell[tau].get(c, ())]
-                st, _ = loso_stats(ws, fit, crit_fn, shape_fn=shape_fn, step_ms=step_ms)
+                st, _ = loso_stats(ws, fit, crit_fn, shape_fn=shape_fn, step_ms=step_ms,
+                                   steady_fn=steady_fn)
                 agg = aggregate(list(st.values()))
             else:
                 st = per_alpha[tau]
@@ -468,6 +509,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     from scripts import theta_verdict as tv
 
     label = label_def_from_args(args, args.model)
+    ledger = None
+    if getattr(args, "ledger", None):
+        from scripts.rewindow_from_raw import load_ledgers
+
+        ledger = load_ledgers(args.ledger)
 
     def spec(tau_s: float):
         return tv.build_signal_spec("tss", w_p=args.w_p, lambda_wait=args.lambda_wait, qmin=args.qmin,
@@ -501,6 +547,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         load, fit, crit, tau_grid_s=grid, dt_ref_s=args.dt_ref_s, dwell_windows=args.dwell_windows,
         fa_max=args.fa_max, step_ms=args.step_ms, se_resamples=args.se_resamples,
         bootstrap=args.bootstrap, seed=args.seed, full_fit=fit_full, bootstrap_refit=args.bootstrap_refit,
+        steady_fn=lambda sid: is_steady_cell(sid, ledger),
         log=lambda m: print(f"[{args.model}] {m}", flush=True),
     )
     chosen = rep.get("chosen")
@@ -514,6 +561,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "label_def": label.as_dict(),
         "signal": {"signal": "tss", "w_p": args.w_p, "lambda_wait": args.lambda_wait, "qmin": args.qmin},
         "trim_ramp_windows": args.trim_ramp_windows,
+        "steady_cells_from": ("ledger: " + ", ".join(map(str, args.ledger))) if ledger is not None
+        else "cell-id load code (first-round ids only)",
         **rep,
     }
 
@@ -540,6 +589,9 @@ def _parse(argv: Optional[Sequence[str]]) -> argparse.Namespace:
     p.add_argument("--bootstrap-refit", action="store_true",
                    help="refit the LOSO folds on every bootstrap resample (slow)")
     p.add_argument("--seed", type=int, default=DEFAULT_SEED)
+    p.add_argument("--ledger", action="append", default=[],
+                   help="cells.jsonl of a ladder-design run (repeatable): steady cells are read "
+                        "from their primitive / role; required for ladder cell ids")
     p.add_argument("--output", required=True)
     return p.parse_args(argv)
 

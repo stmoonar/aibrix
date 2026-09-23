@@ -944,6 +944,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                          "ledger's role / split / primitive / stage to every row and marks "
                          "in_warmup (window start < cell start + warmup_s), which the fit "
                          "loaders drop")
+    ap.add_argument("--only-split", action="append", default=[],
+                    help="with --ledger: re-window only cells whose ledger split is this "
+                         "(train / holdout / auxiliary). Repeatable. Resolved at run time from "
+                         "the ledger, so a ladder fit plan never lists cell ids")
+    ap.add_argument("--only-role", action="append", default=[],
+                    help="with --ledger: re-window only cells of this ledger role. Repeatable")
     ap.add_argument("--output", required=True, help="re-windowed CSV path")
     ap.add_argument("--window-ms", type=int, required=True)
     ap.add_argument("--step-ms", type=int, default=None, help="slide step; default = window-ms (tumbling)")
@@ -1015,6 +1021,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     arms = slo_labels.resolve_arms(primary)
     print(f"labels: primary {primary.ttft_slo_mode} ({', '.join(sorted(arms))})")
     ledger = load_ledgers(args.ledger) if args.ledger else {}
+    if (args.only_split or args.only_role) and not ledger:
+        ap.error("--only-split / --only-role select from the ledger: pass --ledger")
 
     rows: list[dict] = []
     cells: list[str] = []
@@ -1028,6 +1036,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         raw_dir, exclude=exclude, only=args.only_cell_id or (),
         only_shapes=args.only_shape or (), model=args.model,
     )
+    if args.only_split or args.only_role:
+        splits, roles = set(args.only_split), set(args.only_role)
+        selected, unselected = [], []
+        for path in cell_files:
+            entry = ledger.get(path.stem) or {}
+            if (not splits or entry.get("split") in splits) and (not roles or entry.get("role") in roles):
+                selected.append(path)
+            else:
+                unselected.append(path.stem)
+        cell_files = selected
+        skipped_cells += unselected
+        print(f"ledger selection split={sorted(splits) or 'any'} role={sorted(roles) or 'any'}: "
+              f"{len(selected)} cell file(s) kept, {len(unselected)} not selected")
     if skipped_cells:
         print(f"skipping {len(skipped_cells)} cell(s) by id: {', '.join(sorted(set(skipped_cells)))}")
     low_n = 0
@@ -1115,6 +1136,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     meta["window_align"] = args.window_align
     meta["cell_dirs"] = cell_dirs
     meta["ledgers"] = list(args.ledger or [])
+    meta["only_splits"] = sorted(args.only_split or [])
+    meta["only_roles"] = sorted(args.only_role or [])
     meta["windows_below_min_n"] = low_n
     meta_path = write_meta(out, meta)
     print(f"wrote cadence metadata to {meta_path}")

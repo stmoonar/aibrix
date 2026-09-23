@@ -1009,6 +1009,9 @@ def fit_plan(
        cells, then the larger alpha. Its ``registry_fields`` (``trs.ema_tau_ms`` /
        ``trs.ema_alpha``) are what the later steps' ``--ema-tau-ms`` must be set to before
        theta is published; the commands below carry the registry's current tau;
+    1c. ``dline`` - ``scripts.dline_refit`` alpha / wp / final per model and label arm
+       (primary, fixed), then ``summary``: the D-line decision pipeline (D4', D3, D5 and
+       the hold-out report) that the 2026-09-22 numbers came from;
     2. ``theta`` - ``tre_calibration.cli --recompute-tss`` on the merged and every family
        CSV at lambda_wait 3 (primary) and 0 (control): theta and delta_crit;
     3. ``verdict`` - ``theta_verdict verdict``: bootstrap CI of theta and both band
@@ -1066,7 +1069,7 @@ def fit_plan(
                 "otherwise merged fit only"
             ),
         },
-        "order": ["rewindow", "alpha", "theta", "verdict", "ablation", "alt", "holdout"],
+        "order": ["rewindow", "alpha", "dline", "theta", "verdict", "ablation", "alt", "holdout"],
         "label_def": None,  # filled per model below
         "label_def_by_model": {},
         "ema_tau_ms": DEFAULT_EMA_TAU_MS,
@@ -1087,6 +1090,18 @@ def fit_plan(
                 "within 1 SE (cell bootstrap) fewest spurious CRITICAL episodes/h on steady "
                 "healthy cells, then larger alpha; the chosen tau feeds --ema-tau-ms of theta/"
                 "verdict/ablation/alt"
+            ),
+        },
+        "dline": [],
+        "dline_rule": {
+            "module": "scripts.dline_refit",
+            "stages": ["alpha", "wp", "final", "summary"],
+            "arms": ["primary", "fixed"],
+            "statement": (
+                "the D-line decision pipeline (plan 6.11 step 4): alpha (D4', scripts.alpha_fit), "
+                "w_p by the constrained 1-SE rule (D3) at lambda_wait 1 with the lambda check, "
+                "the final verdict publishing the merged theta (D5) and the hold-out report; "
+                "per label arm, outputs under fit/dline/<model>/<arm>/"
             ),
         },
         "theta": [],
@@ -1250,6 +1265,21 @@ def fit_plan(
             ],
         })
 
+        dline_out = fit_dir / "dline"
+        for arm in ("primary", "fixed"):
+            for stage in ("alpha", "wp", "final"):
+                plan["dline"].append({
+                    "model": model, "arm": arm, "stage": stage,
+                    "output": str(dline_out / model / arm / f"{stage}.json"),
+                    "command": [
+                        sys.executable, "-m", "scripts.dline_refit", stage,
+                        "--model", model, "--arm", arm,
+                        "--fit-dir", str(fit_dir), "--out-dir", str(dline_out),
+                        *ledger_args,
+                        *(["--registry", str(args.registry)] if getattr(args, "registry", None) else []),
+                    ],
+                })
+
         scopes: list[tuple[str, str, Path]] = [("", "", fitting_csv)]
         for family, shapes in sorted(families.items()):
             family_csv = fit_dir / f"{model}_fitting_{family}.csv"
@@ -1362,6 +1392,17 @@ def fit_plan(
                         "--output", str(out_json),
                     ],
                 })
+
+    if models:
+        plan["dline"].append({
+            "stage": "summary",
+            "output": str(fit_dir / "dline" / "summary.json"),
+            "command": [
+                sys.executable, "-m", "scripts.dline_refit", "summary",
+                *[a for m in models for a in ("--model", m)],
+                "--fit-dir", str(fit_dir), "--out-dir", str(fit_dir / "dline"), *ledger_args,
+            ],
+        })
 
     fit_alt = Path(__file__).resolve().parents[2] / "calibration" / "scripts" / "fit_alt_thresholds.py"
     for signal in ALT_SIGNALS:
