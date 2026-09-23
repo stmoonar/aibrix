@@ -1,0 +1,13 @@
+# Line endings for the TRE tree: source and docs are LF everywhere.
+# Evidence data (csv / jsonl.gz under docs/refactor/p11_evidence) is left as recorded.
+*.py    text eol=lf
+*.md    text eol=lf
+*.yaml  text eol=lf
+*.yml   text eol=lf
+*.sh    text eol=lf
+*.toml  text eol=lf
+*.cfg   text eol=lf
+*.ini   text eol=lf
+Makefile text eol=lf
+Dockerfile text eol=lf
+*.gz    binary
