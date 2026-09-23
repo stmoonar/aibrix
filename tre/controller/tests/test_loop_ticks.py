@@ -798,3 +798,23 @@ def test_rescue_tick_converts_same_slot_shrink_to_safescale_probe_hide() -> None
     assert queue.submitted == [(HideAction("high", ("high-0",), "probe_started", "rescue"),)]
     assert safescale.active_probe("high").pending_upscales == {"tp2": 1}
     assert "safescale_probe_started:high" in result.events
+
+
+
+def test_rescue_tick_holds_high_probe_of_a_model_in_rollback_backoff() -> None:
+    # A13 wiring: run_planner_tick reads the state machine's rollback backoff.
+    registry = _registry_with_models("hot")
+    snapshot = MetricsSnapshot(
+        ts_ms=100_000,
+        stale=False,
+        models={"hot": _metrics_with_pods("hot", generation=1000.0, waiting=0.0, running=1.0, pods=("hot-a", "hot-b"))},
+    )
+    safescale = SafeScaleStateMachine(config=SafeScaleConfig(default_window_ms=60_000.0))
+
+    probed = run_rescue_tick(snapshot, queue=FakeQueue(), registry=registry, safescale=safescale)
+    assert any(isinstance(a, HideAction) for a in probed.actions)
+    safescale.resolve("hot", status="rollback", reason="slo_violation", now_ms=90_000)
+
+    held = run_rescue_tick(snapshot, queue=FakeQueue(), registry=registry, safescale=safescale)
+    assert not any(isinstance(a, HideAction) for a in held.actions)
+    assert "safescale_rollback_backoff:hot" in held.events

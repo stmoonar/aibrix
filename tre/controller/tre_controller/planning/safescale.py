@@ -31,6 +31,9 @@ class ProbeObservation:
     q_ctl: float | None = None
     has_traffic: bool = False
     avg_gpu_cache_norm: float | None = None
+    #: Cumulative gateway counters of the donor model (A13 donor-health), None = unknown.
+    gateway_requests: float | None = None
+    gateway_errors: float | None = None
 
 
 @dataclass(frozen=True)
@@ -90,6 +93,8 @@ class SafeScaleProbe:
     window_terms: dict[str, Any] = field(default_factory=dict)
     #: Why the probe ended (gate failures, tail summary), persisted with the resolution.
     terminal_details: dict[str, Any] = field(default_factory=dict)
+    #: A13: the donor's gateway (requests, errors) counters at the first observation.
+    gateway_baseline: tuple[float, float] | None = None
 
 
 @dataclass(frozen=True)
@@ -107,12 +112,22 @@ class SafeScaleStateMachine:
         self._config = config
         self._store = store
         self._probes: dict[str, SafeScaleProbe] = {}
+        # A13 rollback backoff: model -> time (ms, snapshot clock) of its last rollback.
+        self._last_rollback_ms: dict[str, int] = {}
 
     def active_probe(self, model: str) -> SafeScaleProbe | None:
         return self._probes.get(model)
 
     def active_probes(self) -> tuple[SafeScaleProbe, ...]:
         return tuple(self._probes.values())
+
+    def rollback_backoff_models(self, now_ms: int) -> set[str]:
+        """Models whose last probe rolled back less than rollback_backoff_ms ago (A13):
+        the planner holds their receiver-less HIGH proactive probe meanwhile."""
+        backoff = float(getattr(self._config, "rollback_backoff_ms", 0.0) or 0.0)
+        if backoff <= 0:
+            return set()
+        return {model for model, ts in self._last_rollback_ms.items() if 0 <= now_ms - ts < backoff}
 
     def start_probe(
         self,
@@ -159,10 +174,13 @@ class SafeScaleStateMachine:
         if probe is None:
             return SafeScaleDecision(status="none", reason="probe_not_found")
 
-        updated = _replace_observations(probe, probe.observations + (observation,))
+        updated = _with_gateway_baseline(
+            _replace_observations(probe, probe.observations + (observation,)), observation
+        )
         self._probes[model] = updated
         self._persist_observation(updated, observation)
 
+        health = donor_health(updated, observation)
         if self._violates_slo(observation):
             self._probes[model] = replace(
                 updated,
@@ -171,6 +189,14 @@ class SafeScaleStateMachine:
                 },
             )
             return self._rollback(updated, reason="slo_violation")
+
+        if (
+            health is not None
+            and health["requests"] >= self._config.donor_min_requests
+            and health["error_rate"] > self._config.donor_error_rate_max
+        ):
+            self._probes[model] = replace(updated, terminal_details={"donor_health": health})
+            return self._rollback(updated, reason="donor_health")
 
         if now_ms < updated.deadline_ms:
             self._persist_probe(updated)
@@ -185,9 +211,10 @@ class SafeScaleStateMachine:
         failures = tail_gate_failures(
             summary, tau_low=self._config.tau_low, kv_cache_max=self._config.kv_cache_max
         )
-        self._probes[model] = replace(
-            updated, terminal_details={"gate_failures": list(failures), "tail": _tail_record(summary)}
-        )
+        details: dict[str, Any] = {"gate_failures": list(failures), "tail": _tail_record(summary)}
+        if health is not None:
+            details["donor_health"] = health
+        self._probes[model] = replace(updated, terminal_details=details)
         if not failures:
             return self._commit(updated, reason="formal_commit_gate_passed")
         return self._rollback(updated, reason="formal_commit_gate_failed")
@@ -248,6 +275,8 @@ class SafeScaleStateMachine:
             resolved_ts=float(now_ms) / 1000.0,
         )
         self._probes.pop(model, None)
+        if status == "rollback":
+            self._last_rollback_ms[model] = int(now_ms)
         return True
 
     def _violates_slo(self, observation: ProbeObservation) -> bool:
@@ -295,6 +324,30 @@ class SafeScaleStateMachine:
 
 def _replace_observations(probe: SafeScaleProbe, observations: tuple[ProbeObservation, ...]) -> SafeScaleProbe:
     return replace(probe, pending_upscales=dict(probe.pending_upscales), observations=observations)
+
+
+def _with_gateway_baseline(probe: SafeScaleProbe, observation: ProbeObservation) -> SafeScaleProbe:
+    """Set the donor-health baseline at the first observation carrying gateway counters
+    (the hide is dispatched asynchronously, so nothing it causes precedes it); re-baseline
+    after a counter drop (Envoy restart)."""
+    if observation.gateway_requests is None or observation.gateway_errors is None:
+        return probe
+    current = (float(observation.gateway_requests), float(observation.gateway_errors))
+    baseline = probe.gateway_baseline
+    if baseline is None or current[0] < baseline[0] or current[1] < baseline[1]:
+        return replace(probe, gateway_baseline=current)
+    return probe
+
+
+def donor_health(probe: SafeScaleProbe, observation: ProbeObservation) -> dict[str, float] | None:
+    """Gateway requests / errors / error ratio of the donor model since the probe's
+    baseline (A13), or None without counters (guard fails open)."""
+    baseline = probe.gateway_baseline
+    if baseline is None or observation.gateway_requests is None or observation.gateway_errors is None:
+        return None
+    requests = max(0.0, float(observation.gateway_requests) - baseline[0])
+    errors = max(0.0, float(observation.gateway_errors) - baseline[1])
+    return {"requests": requests, "errors": errors, "error_rate": (errors / requests) if requests > 0 else 0.0}
 
 
 def _estimate_post_drain_gap_per_second(
@@ -552,6 +605,7 @@ def _probe_record(
         "window_ms": probe.window_ms,
         "window_terms": dict(probe.window_terms),
         "terminal_details": dict(probe.terminal_details),
+        "gateway_baseline": list(probe.gateway_baseline) if probe.gateway_baseline is not None else None,
     }
     if resolution is not None:
         record["resolution"] = resolution
@@ -569,6 +623,8 @@ def _observation_record(observation: ProbeObservation) -> dict[str, Any]:
         "q_ctl": observation.q_ctl,
         "has_traffic": observation.has_traffic,
         "avg_gpu_cache_norm": observation.avg_gpu_cache_norm,
+        "gateway_requests": observation.gateway_requests,
+        "gateway_errors": observation.gateway_errors,
     }
 
 
@@ -604,7 +660,17 @@ def _probe_from_record(row: dict[str, Any], store: ProbeStore) -> SafeScaleProbe
         observations=tuple(observations),
         window_ms=_optional_float(row.get("window_ms")),
         window_terms=dict(row["window_terms"]) if isinstance(row.get("window_terms"), dict) else {},
+        gateway_baseline=_baseline_from_record(row.get("gateway_baseline")),
     )
+
+
+def _baseline_from_record(raw: Any) -> tuple[float, float] | None:
+    if not isinstance(raw, (list, tuple)) or len(raw) != 2:
+        return None
+    requests, errors = _optional_float(raw[0]), _optional_float(raw[1])
+    if requests is None or errors is None:
+        return None
+    return (requests, errors)
 
 
 def _normalize_pods(row: dict[str, Any]) -> tuple[str, ...]:
@@ -653,6 +719,8 @@ def _observation_from_record(raw: dict[str, Any]) -> ProbeObservation | None:
         q_ctl=_optional_float(raw.get("q_ctl", raw.get("Q_ctl"))),
         has_traffic=bool(raw.get("has_traffic", False)),
         avg_gpu_cache_norm=_optional_float(raw.get("avg_gpu_cache_norm")),
+        gateway_requests=_optional_float(raw.get("gateway_requests")),
+        gateway_errors=_optional_float(raw.get("gateway_errors")),
     )
 
 

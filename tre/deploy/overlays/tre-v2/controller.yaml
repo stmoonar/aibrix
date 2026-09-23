@@ -119,6 +119,25 @@ spec:
               value: "120000"
             - name: SAFE_SCALE_CW2_FALLBACK_MS
               value: "60000"
+            # A12: commit gate rejects when the remaining pods' KV-cache fill > 0.8 (v1).
+            - name: SAFE_SCALE_KV_CACHE_MAX
+              value: "0.8"
+            # A13 donor-health guard: roll back when the donor's gateway error ratio since
+            # the probe started (5xx + circuit-breaker overflow + no healthy upstream,
+            # Envoy per-model cluster stats via gateway-stats.yaml) exceeds the max after
+            # MIN_REQUESTS requests. Unreachable stats -> fail-open (logged).
+            - name: TRE_GATEWAY_STATS_URL
+              value: http://tre-v2-envoy-stats.envoy-gateway-system.svc.cluster.local:19001/stats/prometheus
+            - name: TRE_GATEWAY_ROUTE_NAMESPACE
+              value: tre-v2
+            - name: TRE_SAFESCALE_DONOR_ERROR_RATE_MAX
+              value: "0.01"
+            - name: TRE_SAFESCALE_DONOR_MIN_REQUESTS
+              value: "20"
+            # A13: no receiver-less HIGH proactive probe of a model for 60 s after one of
+            # its probes rolled back (stops hide/unhide flapping).
+            - name: TRE_SAFESCALE_ROLLBACK_BACKOFF_MS
+              value: "60000"
             # --- Ablation switches (D4); production defaults ---
             - name: ENABLE_TRE_SCALING
               value: "true"

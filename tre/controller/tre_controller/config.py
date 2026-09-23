@@ -49,6 +49,16 @@ class SafeScaleConfig:
     # A12 (v1 _tail_summary_allows_commit): the commit gate rejects when the tail's max
     # avg KV-cache fill of the donor's remaining serving pods exceeds this (v1: 0.8).
     kv_cache_max: float = 0.8
+    # A13 donor-health guard: roll a probe back as soon as the donor model's gateway error
+    # ratio since the probe started (Envoy 5xx + circuit-breaker overflow + no-healthy-
+    # upstream over all its requests) exceeds donor_error_rate_max, once at least
+    # donor_min_requests requests were seen. Needs TRE_GATEWAY_STATS_URL (else fail-open).
+    donor_error_rate_max: float = 0.01
+    donor_min_requests: float = 20.0
+    # A13 rollback backoff: after a probe of a model rolls back, no receiver-less HIGH
+    # proactive probe of that model for this long (v1 had no cooldown for demand-driven
+    # donor releases, so those are not held). 0 disables.
+    rollback_backoff_ms: float = 60_000.0
 
 
 @dataclass(frozen=True)
@@ -118,6 +128,13 @@ class ControllerConfig:
     dwell_states: tuple[str, ...] = ("critical", "low", "high")
     # TRE_GATEWAY_INTERVAL_CHECK: fail (default) | warn | off.
     gateway_interval_check: str = "fail"
+    # A13 donor-health guard source: Envoy /stats/prometheus URL(s) of the tre-v2 gateway
+    # proxy (TRE_GATEWAY_STATS_URL, comma-separated; empty = guard off / fail-open),
+    # the HTTPRoute namespace naming its per-model clusters (TRE_GATEWAY_ROUTE_NAMESPACE)
+    # and the scrape timeout (TRE_GATEWAY_STATS_TIMEOUT_SECONDS).
+    gateway_stats_urls: tuple[str, ...] = ()
+    gateway_route_namespace: str = "tre-v2"
+    gateway_stats_timeout_s: float = 1.0
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "ControllerConfig":
@@ -191,6 +208,9 @@ class ControllerConfig:
             epsilon_mu=_get_positive_float(values, "SAFE_SCALE_EPSILON_MU", 1e-6),
             probe_poll_seconds=_get_positive_float(values, "SAFE_SCALE_PROBE_POLL_SECONDS", 2.0),
             kv_cache_max=_get_positive_float(values, "SAFE_SCALE_KV_CACHE_MAX", 0.8),
+            donor_error_rate_max=_get_positive_float(values, "TRE_SAFESCALE_DONOR_ERROR_RATE_MAX", 0.01),
+            donor_min_requests=_get_positive_float(values, "TRE_SAFESCALE_DONOR_MIN_REQUESTS", 20.0),
+            rollback_backoff_ms=_get_nonneg_float(values, "TRE_SAFESCALE_ROLLBACK_BACKOFF_MS", 60_000.0),
         )
         if safescale.min_window_ms > safescale.max_window_ms:
             raise ValueError("SAFE_SCALE_MIN_WINDOW_MS must be <= SAFE_SCALE_MAX_WINDOW_MS")
@@ -294,6 +314,11 @@ class ControllerConfig:
             dwell_windows=_get_positive_int(values, "TRE_DWELL_WINDOWS", 1),
             dwell_states=dwell_states,
             gateway_interval_check=gateway_interval_check,
+            gateway_stats_urls=tuple(
+                url.strip() for url in str(values.get("TRE_GATEWAY_STATS_URL", "")).split(",") if url.strip()
+            ),
+            gateway_route_namespace=_get_str(values, "TRE_GATEWAY_ROUTE_NAMESPACE", "tre-v2"),
+            gateway_stats_timeout_s=_get_positive_float(values, "TRE_GATEWAY_STATS_TIMEOUT_SECONDS", 1.0),
         )
 
 

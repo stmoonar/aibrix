@@ -670,3 +670,40 @@ def test_disable_eta_gate_uses_signal_independent_natural_donor_order() -> None:
     ]
     assert donor_shrinks
     assert donor_shrinks[0].model == "model-2"
+
+
+def test_high_proactive_probe_is_held_during_rollback_backoff() -> None:
+    # A13: a HIGH model whose last SafeScale probe rolled back is not probed again until
+    # the backoff expires; demand-driven releases (v1 has no cooldown for them) are not held.
+    classifications = [
+        _classification("critical", ModelState.CRITICAL, ModelRole.RECEIVER, 0.5),
+        _classification("idle", ModelState.IDLE, ModelRole.DONOR, 10.0, "idle"),
+        _classification("hot", ModelState.HIGH, ModelRole.DONOR, 1.6, "surplus"),
+    ]
+    contexts = {
+        "critical": {"assigned_replicas": 2, "routable_pods": 2},
+        "idle": {"assigned_replicas": 3, "routable_pods": 3},
+        "hot": {"assigned_replicas": 4, "routable_pods": 4},
+    }
+    replicas = {"critical": 2, "idle": 3, "hot": 4}
+    cfg = PlanConfig(min_replicas_per_model=1, max_replicas_per_model=4)
+
+    free = build_plan(
+        model_contexts=contexts, classifications=classifications, model_replicas=replicas, idle_gpus=0, cfg=cfg
+    )
+    held = build_plan(
+        model_contexts=contexts,
+        classifications=classifications,
+        model_replicas=replicas,
+        idle_gpus=0,
+        cfg=cfg,
+        probe_backoff_models={"hot"},
+    )
+
+    def reasons(plan):
+        return {(a.model, a.reason) for a in plan.actions if isinstance(a, ScaleAction)}
+
+    assert ("hot", "high_proactive_safescale") in reasons(free)
+    assert ("hot", "high_proactive_safescale") not in reasons(held)
+    assert "safescale_rollback_backoff:hot" in held.events
+    assert reasons(held) == reasons(free) - {("hot", "high_proactive_safescale")}

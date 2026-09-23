@@ -187,6 +187,7 @@ def run_planner_tick(
         inflight_models=queue.inflight_models(),
         cluster_view=cluster_view,
         cooldowns=_action_cooldowns(snapshot, queue) if action_cooldown else None,
+        probe_backoff_models=_probe_backoff_models(safescale, snapshot.ts_ms),
     )
     if _prof_on:
         _plan_ns = time.perf_counter_ns() - _phase_t0
@@ -232,6 +233,11 @@ def run_planner_tick(
         model_contexts=contexts,
         classifications={item.model_name: item for item in classifications},
     )
+
+
+def _probe_backoff_models(safescale: SafeScaleController | None, now_ms: int) -> set[str]:
+    backoff = getattr(safescale, "rollback_backoff_models", None)
+    return set(backoff(now_ms)) if callable(backoff) else set()
 
 
 def _action_cooldowns(snapshot: MetricsSnapshot, queue: PlannerQueue) -> dict[str, str]:

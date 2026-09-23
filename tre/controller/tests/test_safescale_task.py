@@ -230,3 +230,37 @@ def test_safescale_resolution_record_carries_the_gate_failures() -> None:
     )
     assert record["terminal_details"]["gate_failures"] == ["kv_cache"]
     assert record["terminal_details"]["tail"]["gpu_cache_max"] == 0.9
+
+
+
+def test_observation_tick_feeds_gateway_counters_to_the_donor_health_guard() -> None:
+    from tre_controller.gateway_health import GatewayCounters
+
+    queue = FakeQueue()
+    machine = SafeScaleStateMachine(
+        config=SafeScaleConfig(ttft_p95_slo_ms=1000.0, tpot_p95_slo_ms=100.0, default_window_ms=60_000.0)
+    )
+    machine.start_probe(model="donor", pods=("pod-a",), now_ms=0)
+
+    run_safescale_observation_tick(
+        _metrics(ts_ms=500),
+        queue=queue,
+        registry=_registry(),
+        safescale=machine,
+        gateway_counters={"donor": GatewayCounters(requests=1_000, errors=0)},
+    )
+    result = run_safescale_observation_tick(
+        _metrics(ts_ms=2_500),
+        queue=queue,
+        registry=_registry(),
+        safescale=machine,
+        gateway_counters={"donor": GatewayCounters(requests=1_050, errors=5)},
+    )
+
+    assert queue.submitted == [(UnhideAction("donor", ("pod-a",), "donor_health", "safescale"),)]
+    assert result.events == (
+        "safescale_donor_health:donor",
+        "safescale_donor_health:donor:errors=5:requests=50:rate=0.1000",
+    )
+    assert machine.active_probe("donor") is None
+    assert machine.rollback_backoff_models(2_500) == {"donor"}

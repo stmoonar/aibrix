@@ -7,6 +7,7 @@ from typing import Any, Awaitable, Callable, Mapping
 from tre_common.registry import Registry, load_registry
 from tre_controller.config import ControllerConfig
 from tre_controller.gateway_cadence import check_gateway_cadence
+from tre_controller.gateway_health import EnvoyStatsSource
 from tre_controller.loops.action_queue import ActionQueue
 from tre_controller.mode import ObserveModeGate
 from tre_controller.reconcile.hidden_orphans import HiddenOrphanDetector
@@ -41,6 +42,8 @@ class ControllerDependencies:
     signal_state: SignalState
     profiler: "TickProfiler | None" = None
     hidden_orphan_detector: "HiddenOrphanDetector | None" = None
+    # A13 donor-health guard source (None when TRE_GATEWAY_STATS_URL is unset).
+    gateway_health: "EnvoyStatsSource | None" = None
 
 
 @dataclass(frozen=True)
@@ -118,6 +121,7 @@ def build_controller_task_specs(
                     cfg=cfg,
                     signal_state=deps.signal_state,
                     cluster_view_box=deps.cluster_view_box,
+                    gateway_source=deps.gateway_health,
                 ),
             )
         )
@@ -189,6 +193,16 @@ def create_controller_dependencies(
         profiler=profiler,
         hidden_orphan_detector=HiddenOrphanDetector(
             redis_client, grace_s=cfg.orphan_grace_s
+        ),
+        gateway_health=(
+            EnvoyStatsSource(
+                cfg.gateway_stats_urls,
+                [spec.name for spec in registry.models()],
+                route_namespace=cfg.gateway_route_namespace,
+                timeout_s=cfg.gateway_stats_timeout_s,
+            )
+            if getattr(cfg, "gateway_stats_urls", ())
+            else None
         ),
     )
 

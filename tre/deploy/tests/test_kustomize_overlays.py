@@ -29,6 +29,7 @@ def test_tre_v2_overlay_declares_components_and_independent_redis() -> None:
         "gpu-truth.yaml",
         "gateway.yaml",
         "gateway-plugins.yaml",
+        "gateway-stats.yaml",
     ]
 
     redis = _load_yaml(overlay / "redis.yaml")
@@ -110,6 +111,25 @@ def test_tre_v2_overlay_declares_components_and_independent_redis() -> None:
     assert _env(controller)["SAFE_SCALE_MIN_WINDOW_MS"] == "60000"
     assert _env(controller)["SAFE_SCALE_MAX_WINDOW_MS"] == "120000"
     assert _env(controller)["SAFE_SCALE_CW2_FALLBACK_MS"] == "60000"
+    # A12 / A13: KV-cache commit ceiling, donor-health guard source + thresholds, backoff.
+    assert _env(controller)["SAFE_SCALE_KV_CACHE_MAX"] == "0.8"
+    assert _env(controller)["TRE_GATEWAY_STATS_URL"] == (
+        "http://tre-v2-envoy-stats.envoy-gateway-system.svc.cluster.local:19001/stats/prometheus"
+    )
+    assert _env(controller)["TRE_GATEWAY_ROUTE_NAMESPACE"] == _env(sm)["TRE_ROUTE_NAMESPACE"] == "tre-v2"
+    assert _env(controller)["TRE_SAFESCALE_DONOR_ERROR_RATE_MAX"] == "0.01"
+    assert _env(controller)["TRE_SAFESCALE_DONOR_MIN_REQUESTS"] == "20"
+    assert _env(controller)["TRE_SAFESCALE_ROLLBACK_BACKOFF_MS"] == "60000"
+    stats = _load_yaml(overlay / "gateway-stats.yaml")
+    assert (stats["kind"], stats["metadata"]["name"], stats["metadata"]["namespace"]) == (
+        "Service",
+        "tre-v2-envoy-stats",
+        "envoy-gateway-system",
+    )
+    # Selects only the tre-v2 Gateway's proxy, never the shared aibrix-system one.
+    assert stats["spec"]["selector"]["gateway.envoyproxy.io/owning-gateway-namespace"] == "tre-v2"
+    assert stats["spec"]["selector"]["gateway.envoyproxy.io/owning-gateway-name"] == "tre-aibrix-eg"
+    assert stats["spec"]["ports"] == [{"name": "metrics", "port": 19001, "targetPort": 19001, "protocol": "TCP"}]
     assert _env(controller)["ENABLE_TRE_SCALING"] == "true"
     assert _env(sm)["TRE_ROUTE_NAMESPACE"] == "tre-v2"
     assert _env(sm)["TRE_GATEWAY_NAME"] == "tre-aibrix-eg"

@@ -127,8 +127,12 @@ def build_plan(
     inflight_models: set[str] | None = None,
     cluster_view: ClusterView | None = None,
     cooldowns: Mapping[str, str] | None = None,
+    probe_backoff_models: set[str] | None = None,
 ) -> PlanResult:
     active_probe_models = active_probe_models or set()
+    # A13: models whose last SafeScale probe rolled back recently (no new HIGH proactive
+    # probe until TRE_SAFESCALE_ROLLBACK_BACKOFF_MS has passed).
+    probe_backoff_models = probe_backoff_models or set()
     inflight_models = inflight_models or set()
     actions: list[Action] = []
     deltas: dict[str, int] = {}
@@ -435,6 +439,9 @@ def build_plan(
             if high.model_name in slot_shrink_donors:
                 continue
             if high.model_name in active_probe_models or high.model_name in inflight_models:
+                continue
+            if high.model_name in probe_backoff_models:
+                events.append(f"safescale_rollback_backoff:{high.model_name}")
                 continue
             if deltas.get(high.model_name, 0) != 0:
                 continue

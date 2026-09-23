@@ -46,6 +46,31 @@ def test_config_defaults_are_plan_aligned() -> None:
     assert ControllerConfig.from_env({"TRE_DWELL_WINDOWS": "2"}).dwell_windows == 2
 
 
+def test_config_donor_health_and_backoff_defaults_and_env() -> None:
+    cfg = ControllerConfig.from_env({})
+    assert cfg.safescale.donor_error_rate_max == 0.01
+    assert cfg.safescale.donor_min_requests == 20.0
+    assert cfg.safescale.rollback_backoff_ms == 60_000.0
+    assert cfg.safescale.kv_cache_max == 0.8
+    assert cfg.gateway_stats_urls == ()  # guard source off unless configured
+    assert cfg.gateway_route_namespace == "tre-v2"
+    cfg = ControllerConfig.from_env(
+        {
+            "TRE_SAFESCALE_DONOR_ERROR_RATE_MAX": "0.05",
+            "TRE_SAFESCALE_DONOR_MIN_REQUESTS": "50",
+            "TRE_SAFESCALE_ROLLBACK_BACKOFF_MS": "0",
+            "SAFE_SCALE_KV_CACHE_MAX": "0.9",
+            "TRE_GATEWAY_STATS_URL": "http://a:19001/stats/prometheus, http://b:19001/stats/prometheus",
+            "TRE_GATEWAY_ROUTE_NAMESPACE": "other",
+        }
+    )
+    assert (cfg.safescale.donor_error_rate_max, cfg.safescale.donor_min_requests) == (0.05, 50.0)
+    assert cfg.safescale.rollback_backoff_ms == 0.0
+    assert cfg.safescale.kv_cache_max == 0.9
+    assert cfg.gateway_stats_urls == ("http://a:19001/stats/prometheus", "http://b:19001/stats/prometheus")
+    assert cfg.gateway_route_namespace == "other"
+
+
 def test_config_hot_proactive_guard_is_opt_in() -> None:
     assert ControllerConfig.from_env({"TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE": "1"}).safescale_suppress_hot_proactive is True
     assert ControllerConfig.from_env({"TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE": "0"}).safescale_suppress_hot_proactive is False

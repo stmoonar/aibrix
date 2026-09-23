@@ -378,3 +378,88 @@ def test_tail_gate_failures_lists_every_failing_check_in_v1_order() -> None:
     assert tail_gate_failures(summary(z_min=None), tau_low=1.0) == ("z_missing",)
     # No Z and no traffic commits (v1), whatever the cache says.
     assert tail_gate_failures(summary(z_min=None, has_traffic=False, gpu_cache_max=0.99), tau_low=1.0) == ()
+
+
+
+# --- A13: donor-health guard + rollback backoff ------------------------------------------
+
+
+def _gw(ts_ms: int, requests: float, errors: float, **kw) -> ProbeObservation:
+    values = dict(
+        ts_ms=ts_ms,
+        ttft_p95_ms=500.0,
+        tpot_p95_ms=50.0,
+        z_m=1.2,
+        q_ctl=0.0,
+        has_traffic=True,
+        gateway_requests=requests,
+        gateway_errors=errors,
+    )
+    values.update(kw)
+    return ProbeObservation(**values)
+
+
+def test_donor_health_rolls_back_on_gateway_error_ratio_since_probe_start() -> None:
+    store = FakeProbeStore()
+    machine = SafeScaleStateMachine(config=_cfg(), store=store)
+    machine.start_probe(model="donor", pods=("pod-a",), now_ms=0)
+
+    # Baseline taken at the first observation: errors before the probe never count.
+    assert machine.observe("donor", _gw(2_000, 10_000, 500), now_ms=2_000).reason == "probe_pending"
+    # 19 new requests, 5 errors: below the 20-request minimum -> keep probing.
+    assert machine.observe("donor", _gw(4_000, 10_019, 505), now_ms=4_000).reason == "probe_pending"
+    # 100 requests, 1 error = 1 % -> not above the 1 % ceiling.
+    assert machine.observe("donor", _gw(6_000, 10_100, 501), now_ms=6_000).reason == "probe_pending"
+    decision = machine.observe("donor", _gw(8_000, 10_200, 503), now_ms=8_000)
+
+    assert (decision.status, decision.reason) == ("rollback", "donor_health")
+    assert decision.commands == (SafeScaleCommand(kind="unhide", model="donor", pods=("pod-a",), reason="donor_health"),)
+    probe = machine.active_probe("donor")
+    assert probe.terminal_details["donor_health"] == {"requests": 200.0, "errors": 3.0, "error_rate": 0.015}
+    assert machine.resolve("donor", status="rollback", reason="donor_health", now_ms=8_000)
+    (record,) = store.records.values()
+    assert record["terminal_reason"] == "donor_health"
+    assert record["gateway_baseline"] == [10_000.0, 500.0]
+    assert record["terminal_details"]["donor_health"]["errors"] == 3.0
+
+
+def test_donor_health_fails_open_without_counters_and_rebaselines_after_reset() -> None:
+    machine = SafeScaleStateMachine(config=_cfg())
+    machine.start_probe(model="donor", pods=("pod-a",), now_ms=0)
+    assert machine.observe("donor", _gw(2_000, None, None), now_ms=2_000).reason == "probe_pending"
+    assert machine.active_probe("donor").gateway_baseline is None
+    machine.observe("donor", _gw(4_000, 5_000, 10), now_ms=4_000)
+    # Envoy restarted: counters dropped -> new baseline, no bogus negative / huge delta.
+    assert machine.observe("donor", _gw(6_000, 40, 0), now_ms=6_000).reason == "probe_pending"
+    assert machine.active_probe("donor").gateway_baseline == (40.0, 0.0)
+
+
+def test_commit_gate_records_donor_health_alongside_gate_failures() -> None:
+    machine = SafeScaleStateMachine(config=_cfg())
+    machine.start_probe(model="donor", pods=("pod-a",), now_ms=0)
+    machine.observe("donor", _gw(2_000, 1_000, 0), now_ms=2_000)
+    decision = machine.observe("donor", _gw(61_000, 1_500, 1), now_ms=61_000)
+
+    assert decision.reason == "formal_commit_gate_passed"
+    details = machine.active_probe("donor").terminal_details
+    assert details["gate_failures"] == []
+    assert details["donor_health"] == {"requests": 500.0, "errors": 1.0, "error_rate": 0.002}
+
+
+def test_rollback_backoff_window_follows_the_last_rollback() -> None:
+    machine = SafeScaleStateMachine(config=SafeScaleConfig(rollback_backoff_ms=60_000.0))
+    machine.start_probe(model="donor", pods=("pod-a",), now_ms=0)
+    machine.observe("donor", _gw(1_000, 0, 0, ttft_p95_ms=5_000.0), now_ms=1_000)
+    machine.resolve("donor", status="rollback", reason="slo_violation", now_ms=1_000)
+
+    assert machine.rollback_backoff_models(1_000) == {"donor"}
+    assert machine.rollback_backoff_models(60_999) == {"donor"}
+    assert machine.rollback_backoff_models(61_000) == set()
+    # A commit does not start a backoff; 0 disables it.
+    machine.start_probe(model="other", pods=("pod-o",), now_ms=0)
+    machine.resolve("other", status="commit", reason="formal_commit_gate_passed", now_ms=2_000)
+    assert "other" not in machine.rollback_backoff_models(2_000)
+    off = SafeScaleStateMachine(config=SafeScaleConfig(rollback_backoff_ms=0.0))
+    off.start_probe(model="donor", pods=("pod-a",), now_ms=0)
+    off.resolve("donor", status="rollback", reason="slo_violation", now_ms=1_000)
+    assert off.rollback_backoff_models(1_000) == set()
