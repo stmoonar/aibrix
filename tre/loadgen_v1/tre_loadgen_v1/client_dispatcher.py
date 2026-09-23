@@ -15,7 +15,8 @@ import os
 import multiprocessing as mp
 from multiprocessing import Queue, Manager, Process, Event
 from typing import List, Dict, Optional, Any, Tuple
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
+import contextvars
 import matplotlib.pyplot as plt
 import matplotlib
 import numpy as np
@@ -39,7 +40,51 @@ matplotlib.rcParams['ytick.labelsize'] = 9
 matplotlib.rcParams['legend.fontsize'] = 9
 
 from .config_manager import ConfigManager
-from .trace_generator import RequestTrace
+# [v2 port] v1: from trace_generator import RequestTrace（同一个 dataclass，拆到 trace_types 以免分发路径 import transformers）
+from .trace_types import RequestTrace
+
+
+# ---------------------------------------------------------------------------
+# [v2 port] 审计字段：逐次尝试（含 SDK 内部重试）记录
+#
+# OpenAI SDK 的重试循环在调用 create() 的同一个协程里执行，每次尝试都会经过
+# httpx.AsyncClient.send()，从而触发 client 级 event hook（request / response）。
+# 我们在每个请求协程里把一个 AttemptTracker 放进 ContextVar，hook 读取当前协程
+# 上下文里的 tracker 记账。不改动线上请求（不加任何 header），也不依赖 SDK 私有 API。
+#   - request hook: 追加一条 {"t": 发出时刻, "status": None}
+#   - response hook: 把最近一条的 status 填为 HTTP 状态码（流式时在收到响应头时触发）
+# status 仍为 None 的条目 = 该次尝试没有拿到响应头（连接错误/超时）。
+# ---------------------------------------------------------------------------
+class AttemptTracker:
+    """单个请求的逐次尝试记录"""
+
+    def __init__(self):
+        self.attempts: List[Dict[str, Any]] = []
+
+    @property
+    def count(self) -> int:
+        return len(self.attempts)
+
+    @property
+    def last_status(self) -> Optional[int]:
+        return self.attempts[-1]["status"] if self.attempts else None
+
+
+_ATTEMPT_TRACKER: "contextvars.ContextVar[Optional[AttemptTracker]]" = contextvars.ContextVar(
+    "tre_loadgen_v1_attempt_tracker", default=None
+)
+
+
+async def _on_request_hook(request):
+    tracker = _ATTEMPT_TRACKER.get()
+    if tracker is not None:
+        tracker.attempts.append({"t": time.time(), "status": None})
+
+
+async def _on_response_hook(response):
+    tracker = _ATTEMPT_TRACKER.get()
+    if tracker is not None and tracker.attempts:
+        tracker.attempts[-1]["status"] = response.status_code
 
 
 @dataclass
@@ -75,6 +120,12 @@ class ResponseRecord:
     phase_type: str = "unknown"
     target_pod: Optional[str] = None
     process_id: int = 0  # 添加进程ID字段
+    # ---- [v2 port] 以下为新增审计字段（追加在 v1 字段之后，不改变 v1 字段及其语义）----
+    attempts: int = 0                      # 实际 HTTP 尝试次数（1 + SDK 重试次数）
+    stream_interrupted: bool = False       # 流式读取中途抛异常（v1 仍记 success=True）
+    stream_error: Optional[str] = None     # 流中途异常文本 "<类型>: <消息>"
+    finish_reason: Optional[str] = None    # 最后一个非空 finish_reason（stop/length/...）
+    attempt_log: List[Dict[str, Any]] = field(default_factory=list)  # 每次尝试 {"t", "status"}
 
 
 @dataclass
@@ -141,14 +192,26 @@ class WorkerProcess:
         timeout_val = getattr(self.config.client, 'timeout', 300.0)
         routing_strategy = getattr(self.config.client, 'routing_algorithm', 'random')
         
+        # [v2 port] v1 硬编码 max_retries=2；现从配置/CLI 读取，默认仍为 2
+        max_retries = getattr(self.config.client, 'max_retries', 2)
+
         if not api_key or api_key == "dummy":
             api_key = "dummy-key-for-local-gateway"
-        
+
+        # [v2 port] 传入自建 httpx client 仅为挂 event hook 统计逐次尝试。
+        # DefaultAsyncHttpxClient 的 limits / follow_redirects 与 SDK 自建 client 的默认值相同，
+        # timeout 同样取 timeout_val（v1 中 SDK 以 timeout=timeout_val 自建 client），因此线上行为不变。
+        http_client = openai.DefaultAsyncHttpxClient(
+            timeout=timeout_val,
+            event_hooks={"request": [_on_request_hook], "response": [_on_response_hook]},
+        )
+
         client = openai.AsyncOpenAI(
             api_key=api_key,  # OpenAI API密钥，用于身份验证
             base_url=f"{self.config.gateway_endpoint}/v1",  # API网关的基础URL
-            max_retries=2,  # 最大重试次数，当请求失败时自动重试
+            max_retries=max_retries,  # 最大重试次数，当请求失败时自动重试
             timeout=timeout_val,  # 单个HTTP请求的超时时间（秒），包括连接建立、发送请求和接收响应的总时间
+            http_client=http_client,
         )
         
         if routing_strategy:
@@ -178,7 +241,13 @@ class WorkerProcess:
         first_response_time = None
         target_pod = ""
         response_stream = None  # 初始化为 None，以便在 finally 中检查
-        
+        # [v2 port] 审计：本协程专属的尝试记录器（见 AttemptTracker）
+        tracker = AttemptTracker()
+        tracker_token = _ATTEMPT_TRACKER.set(tracker)
+        stream_interrupted = False
+        stream_error_text = None
+        finish_reason = None
+
         try:
             # 等待到目标时间
             sleep_time = target_time - task_start_time
@@ -231,7 +300,11 @@ class WorkerProcess:
                                 first_response_time = time.time()
                             output_text = chunk.choices[0].delta.content
                             text_chunks.append(output_text)
-                    
+                        # [v2 port] 审计：记录 finish_reason（不参与任何判定）
+                        chunk_finish_reason = getattr(chunk.choices[0], 'finish_reason', None)
+                        if chunk_finish_reason is not None:
+                            finish_reason = chunk_finish_reason
+
                     if hasattr(chunk, 'usage') and chunk.usage is not None:
                         if chunk.usage.prompt_tokens is not None:
                             prompt_tokens = chunk.usage.prompt_tokens
@@ -239,10 +312,13 @@ class WorkerProcess:
                             output_tokens = chunk.usage.completion_tokens
                         if chunk.usage.total_tokens is not None:
                             total_tokens = chunk.usage.total_tokens
-                            
+
             except Exception as stream_error:
                 self.logger.error(f"请求 {request.request_id} 流式处理中断: {stream_error}")
-            
+                # [v2 port] 审计：v1 在此吞掉异常并继续记 success=True；我们保持该行为，只额外记录
+                stream_interrupted = True
+                stream_error_text = f"{type(stream_error).__name__}: {stream_error}"
+
             response_end_time = time.time()
             
             # 计算性能指标
@@ -264,11 +340,17 @@ class WorkerProcess:
                 output_tokens=output_tokens,
                 total_tokens=total_tokens,
                 success=True,
+                http_status=tracker.last_status,  # [v2 port] v1 恒为 None
                 phase_type=request.phase_type,
                 target_pod=target_pod,
-                process_id=self.process_id
+                process_id=self.process_id,
+                attempts=tracker.count,
+                stream_interrupted=stream_interrupted,
+                stream_error=stream_error_text,
+                finish_reason=finish_reason,
+                attempt_log=list(tracker.attempts),
             )
-            
+
             self.logger.debug(f"请求 {request.request_id} 完成 - E2E: {e2e_latency:.3f}s")
             
             # 直接提交结果到队列
@@ -280,6 +362,10 @@ class WorkerProcess:
         except Exception as e:
             error_time = time.time()
             self.logger.error(f"请求 {request.request_id} 失败: {e}")
+            # [v2 port] 审计：失败时的 HTTP 状态（APIStatusError 带 status_code；超时/连接错误为 None）
+            fail_status = getattr(e, 'status_code', None)
+            if fail_status is None:
+                fail_status = tracker.last_status
             # put失败结果
             fail_result = ResponseRecord(
                 request_id=request.request_id,
@@ -295,9 +381,15 @@ class WorkerProcess:
                 total_tokens=0,
                 success=False,
                 error_message=str(e),
+                http_status=fail_status,
                 phase_type=request.phase_type,
                 target_pod=target_pod,
-                process_id=self.process_id
+                process_id=self.process_id,
+                attempts=tracker.count,
+                stream_interrupted=stream_interrupted,
+                stream_error=stream_error_text,
+                finish_reason=finish_reason,
+                attempt_log=list(tracker.attempts),
             )
             try:
                 self.result_queue.put(fail_result)
@@ -305,6 +397,7 @@ class WorkerProcess:
                 self.logger.error(f"put失败结果到result_queue异常: {put_e}")
             return fail_result
         finally:
+            _ATTEMPT_TRACKER.reset(tracker_token)  # [v2 port]
             # 确保在所有情况下都关闭流式连接
             if response_stream is not None:
                 try:
@@ -325,7 +418,10 @@ class WorkerProcess:
         prompt = self.prepare_prompt(request.prompt)
         task_start_time = time.time()
         target_pod = ""
-        
+        # [v2 port] 审计：本协程专属的尝试记录器
+        tracker = AttemptTracker()
+        tracker_token = _ATTEMPT_TRACKER.set(tracker)
+
         try:
             # 等待到目标时间
             sleep_time = target_time - task_start_time
@@ -384,11 +480,15 @@ class WorkerProcess:
                 output_tokens=output_tokens,
                 total_tokens=total_tokens,
                 success=True,
+                http_status=tracker.last_status,  # [v2 port] v1 恒为 None
                 phase_type=request.phase_type,
                 target_pod=target_pod,
-                process_id=self.process_id
+                process_id=self.process_id,
+                attempts=tracker.count,
+                finish_reason=(response.choices[0].finish_reason if getattr(response, 'choices', None) else None),
+                attempt_log=list(tracker.attempts),
             )
-            
+
             self.logger.debug(f"批量请求 {request.request_id} 完成 - E2E: {e2e_latency:.3f}s")
             
             # 直接提交结果到队列
@@ -400,6 +500,9 @@ class WorkerProcess:
         except Exception as e:
             error_time = time.time()
             self.logger.error(f"批量请求 {request.request_id} 失败: {e}")
+            fail_status = getattr(e, 'status_code', None)  # [v2 port] 审计
+            if fail_status is None:
+                fail_status = tracker.last_status
             fail_result = ResponseRecord(
                 request_id=request.request_id,
                 model_name=request.model_name,
@@ -414,15 +517,20 @@ class WorkerProcess:
                 total_tokens=0,
                 success=False,
                 error_message=str(e),
+                http_status=fail_status,
                 phase_type=request.phase_type,
                 target_pod=target_pod,
-                process_id=self.process_id
+                process_id=self.process_id,
+                attempts=tracker.count,
+                attempt_log=list(tracker.attempts),
             )
             try:
                 self.result_queue.put(fail_result)
             except Exception as put_e:
                 self.logger.error(f"put失败结果到result_queue异常: {put_e}")
             return fail_result
+        finally:
+            _ATTEMPT_TRACKER.reset(tracker_token)  # [v2 port]
 
     async def process_task_batch(self, batch: TaskBatch, base_time: float):
         """处理任务批次 - 不等待任务完成，让协程自然运行

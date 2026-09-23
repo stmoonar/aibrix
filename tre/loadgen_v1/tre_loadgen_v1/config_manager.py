@@ -63,7 +63,9 @@ class ClientConfig:
     task_batch_window: float = 5.0
     load_monitor_interval: float = 1.0
     oracle_trace_upload_url: str = None
-    
+    # [v2 port] v1 在 client_dispatcher 里硬编码 max_retries=2；这里做成参数，默认值不变
+    max_retries: int = 2
+
     def validate_routing_algorithm(self):
         """验证路由算法配置"""
         valid_algorithms = [
@@ -94,6 +96,8 @@ class ClientConfig:
             raise ConfigError("task_batch_window 必须大于 0")
         if self.load_monitor_interval <= 0:
             raise ConfigError("load_monitor_interval 必须大于 0")
+        if self.max_retries < 0:
+            raise ConfigError("max_retries 不能为负数")
         
 
 
@@ -295,7 +299,8 @@ class ConfigManager:
             max_coroutines_per_process=client_dict.get('max_coroutines_per_process', 500),
             task_batch_window=client_dict.get('task_batch_window', 5.0),
             load_monitor_interval=client_dict.get('load_monitor_interval', 1.0),
-            oracle_trace_upload_url=client_dict.get('oracle_trace_upload_url', None)
+            oracle_trace_upload_url=client_dict.get('oracle_trace_upload_url', None),
+            max_retries=client_dict.get('max_retries', 2)
         )
 
     def _parse_models_config(self, models_list: List[Dict[str, Any]]) -> List[ModelConfig]:
