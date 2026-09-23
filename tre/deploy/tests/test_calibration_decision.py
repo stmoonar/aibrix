@@ -189,6 +189,46 @@ def test_an_unknown_primitive_is_an_error() -> None:
         cd.PREREGISTERED.role({"shape": "S1", "primitive": "sweep", "stage": ""})
 
 
+def test_d21_a_smoke_hold_trains_by_its_role_whatever_its_stage() -> None:
+    from scripts import calibration_design as design
+
+    smoke = {"shape": "S3", "primitive": "hold", "stage": design.STAGE_DWELL,
+             "role": design.ROLE_SMOKE, "split": design.SPLIT_AUXILIARY}
+    assert cd.PREREGISTERED.train_hold_roles == design.TRAINING_HOLD_ROLES == {"smoke"}
+    assert cd.PREREGISTERED.role(smoke) == cd.ROLE_TRAIN
+    # a dwell-stage hold of any other role is still not analysed
+    for role in ("", design.ROLE_BOUNDARY, design.ROLE_SENTINEL, design.ROLE_LADDER):
+        assert cd.PREREGISTERED.role({**smoke, "role": role}) == cd.ROLE_EXCLUDED
+    assert cd.PREREGISTERED.role({k: v for k, v in smoke.items() if k != "role"}) == cd.ROLE_EXCLUDED
+    # a held-out shape stays held out whatever the role; FIRST_RUN is unchanged
+    assert cd.PREREGISTERED.role({**smoke, "shape": "M"}) == cd.ROLE_HOLDOUT
+    assert cd.FIRST_RUN.train_hold_roles == frozenset()
+    assert cd.FIRST_RUN.role({**smoke, "stage": "dwell"}) == cd.ROLE_TRAIN
+
+
+def test_d21_the_split_reads_the_role_of_the_dataset_rows(tmp_path) -> None:
+    ds, groups = _synthetic(tmp_path)
+    _, _, before = cd.split_dataset(_cells(ds, groups), cd.PREREGISTERED)
+    path = ds / "windows.csv"
+    with path.open(newline="") as fh:
+        rows = list(csv.DictReader(fh))
+    probe = "i2048_o96_c1143"   # S3's boundary probe, re-labelled as a smoke hold
+    for r in rows:
+        r["role"] = "ladder" if r["stage"] == "ladder" else ""
+        if r["cell_id"] == probe:
+            r["role"], r["stage"] = "smoke", "dwell"
+    with path.open("w", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=list(rows[0]))
+        w.writeheader()
+        w.writerows(rows)
+    cells = _cells(ds, groups)
+    smoke = [c for c in cells.values() if c.role == "smoke"]
+    assert len(smoke) == 1 and smoke[0].stage == "dwell" and smoke[0].shape == "S3"
+    assert {c.role for c in cells.values() if c.stage == "ladder"} == {"ladder"}
+    _, _, counts = cd.split_dataset(cells, cd.PREREGISTERED)
+    assert counts == {**before, "train": before["train"] + 1, "excluded": before["excluded"] - 1}
+
+
 # --------------------------------------------------------------- synthetic dataset
 
 

@@ -143,6 +143,9 @@ def paths(fit_dir: Path, model: str) -> dict[str, Any]:
 # * the training set - the constant-load cells (a dataset row's ``primitive`` in
 #   alpha_fit.STEADY_PRIMITIVES, ``role`` not in alpha_fit.UNSTEADY_ROLES) of the train /
 #   auxiliary splits; sentinels are constant-load and train unless ``--no-sentinels``;
+#   D21: so do the boundary supplement's smoke holds (role smoke, stage dwell, split
+#   auxiliary, primitive hold) - by their role, calibration_design.TRAINING_HOLD_ROLES,
+#   the key calibration_decision's cell policy trains them by too (the stage is not read);
 # * H2, the disclosure set - the dynamic cells (steps / ramp / bursts) and the sealed split
 #   (``split == holdout``: the held-out shape and the ramps) of the runs given with
 #   ``--h2-dataset``. It is reported after M, never read by a selection: its rows are
@@ -177,23 +180,32 @@ def cell_kind(primitive: str, role: str, split: str, shape: str = "") -> str:
     """D16: ``constant_load`` / ``dynamic`` / ``sealed`` from a row's own fields.
 
     ``sealed`` - the held-out split, or the held-out shape wherever it appears;
-    ``constant_load`` - a steady primitive (hold / static) that is not a ramp role;
+    ``constant_load`` - a steady primitive (hold / static) that is not a ramp role; D21:
+    explicitly, a steady hold whose role is in ``calibration_design.TRAINING_HOLD_ROLES``
+    (the smoke hold: stage dwell, split auxiliary - neither is read here);
     ``dynamic`` - anything else with a primitive (steps / ramp / bursts);
     ``unknown`` - no primitive: nothing says what the cell was, and a cell id is not read."""
     from scripts import alpha_fit
+    from scripts import calibration_design as design
     from scripts import gen_calibration_schedules as gen
 
     if split == SPLIT_HOLDOUT or (shape and gen.is_held_out(shape)):
         return KIND_SEALED
     if not primitive:
         return KIND_UNKNOWN
+    if primitive in alpha_fit.STEADY_PRIMITIVES and role in design.TRAINING_HOLD_ROLES:
+        return KIND_CONSTANT  # D21: the smoke hold trains (same key as calibration_decision)
     if primitive in alpha_fit.STEADY_PRIMITIVES and role not in alpha_fit.UNSTEADY_ROLES:
         return KIND_CONSTANT
     return KIND_DYNAMIC
 
 
 def assign_set(row: Mapping[str, str], *, sealed_to_h2: bool, sentinels: bool) -> str:
-    """The set one standard-dataset row belongs to (training / h2 / m / sentinel_excluded)."""
+    """The set one standard-dataset row belongs to (training / h2 / m / sentinel_excluded).
+
+    Read from the row's own ``split`` / ``shape`` / ``primitive`` / ``role`` (never its
+    stage or cell id): a smoke hold (role smoke, stage dwell, split auxiliary) trains - D21,
+    :func:`cell_kind`."""
     from scripts import gen_calibration_schedules as gen
 
     split, shape = row.get("split") or "", row.get("shape") or ""

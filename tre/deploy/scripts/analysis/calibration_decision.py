@@ -107,6 +107,9 @@ from tre_common import slo_labels
 from tre_common.registry import load_registry
 from tre_controller.signals.trs import TRSComputer, TRSInput
 
+from scripts import calibration_design as design
+from scripts import gen_calibration_schedules as gen
+
 # ------------------------------------------------------------ preregistered constants
 
 PREREGISTRATION = "docs/preregistration-20260923-calibration-run2.md"
@@ -168,11 +171,13 @@ def points(x: float | None) -> float | None:
 class CellPolicy:
     """Which cells train, which are held out, which are not analysed.
 
-    Held out (preregistration §5.3): every cell of a ``holdout_shapes`` shape and every
-    ``ramp`` cell. Trained on (§5.2): ``hold`` cells whose stage is in
-    ``train_hold_stages`` plus any other primitive in ``train_primitives``. A ``hold``
-    stage or a primitive this policy does not name is an error, never a silent drop -
-    a renamed stage must not quietly empty the training set.
+    Held out (preregistration §5.3): every cell of a ``holdout_shapes`` shape or of a
+    shape ``gen_calibration_schedules.is_held_out`` names, and every ``ramp`` cell.
+    Trained on (§5.2): ``hold`` cells whose role is in ``train_hold_roles`` (D21: the
+    smoke hold, whatever its stage says - the role is checked first) or whose stage is
+    in ``train_hold_stages``, plus any other primitive in ``train_primitives``. A
+    ``hold`` stage or a primitive this policy does not name is an error, never a silent
+    drop - a renamed stage must not quietly empty the training set.
     """
 
     name: str
@@ -183,12 +188,15 @@ class CellPolicy:
     holdout_shapes: frozenset[str] = frozenset({"M"})
     holdout_primitives: frozenset[str] = frozenset({"ramp"})
     hold_warmup_s: float = DEFAULT_HOLD_WARMUP_S
+    train_hold_roles: frozenset[str] = frozenset()
 
     def role(self, row: Mapping[str, Any]) -> str:
         shape, primitive = row["shape"], row["primitive"]
-        if shape in self.holdout_shapes or primitive in self.holdout_primitives:
+        if shape in self.holdout_shapes or gen.is_held_out(shape) or primitive in self.holdout_primitives:
             return ROLE_HOLDOUT
         if primitive == "hold":
+            if (row.get("role") or "").strip() in self.train_hold_roles:
+                return ROLE_TRAIN
             stage = (row.get("stage") or "").strip()
             if stage in self.train_hold_stages:
                 return ROLE_TRAIN
@@ -208,12 +216,16 @@ class CellPolicy:
 
 #: The second run as pre-registered: hold ladder + adaptive supplement cells train;
 #: boundary-search probes and sentinels are not analysed; M and ramps are held out.
+#: D21 (plan §6.11): the boundary supplement's smoke holds (role smoke, stage dwell)
+#: train too, as they do in ``dline_refit`` - by their role, which is checked first; a
+#: dwell-stage hold of any other role stays excluded.
 PREREGISTERED = CellPolicy(
     name="preregistered",
     train_primitives=frozenset({"hold"}),
     train_hold_stages=frozenset({"ladder", "adaptive"}),
     excluded_hold_stages=frozenset({"coarse", "bisect", "dwell", "sentinel"}),
     excluded_primitives=frozenset({"steps", "bursts"}),
+    train_hold_roles=design.TRAINING_HOLD_ROLES,
 )
 #: The first run had no ladder: its training cells were the boundary probes, the
 #: capacity steps and the bursts. Used only to dry-run the pipeline on that data.
@@ -259,6 +271,7 @@ class Cell:
     labels_tpot: list[bool]
     base: list[CalibrationWindow]  # kept windows, signal placeholder
     params: Any  # TrsParams of the model
+    role: str = ""  # the dataset's ``role`` column (D21: the policy trains some holds by it)
     _series: dict[tuple, list[float]] = field(default_factory=dict, repr=False)
     _windows: dict[tuple, list[CalibrationWindow]] = field(default_factory=dict, repr=False)
 
@@ -453,10 +466,13 @@ def build_cells(
             lp.append(tpot_ok)
             base.append(dataclasses.replace(w, scenario_id=uid))
         group = groups.get(model, {}).get(shape)
+        roles = {(r.get("role") or "").strip() for r in cell_rows}
+        if len(roles) > 1:
+            raise AssertionError(f"{uid}: rows of one cell carry roles {sorted(roles)}")
         cells[uid] = Cell(
             uid=uid, model=model, shape=shape, primitive=primitive, stage=stage, group=group,
             rows=cell_rows, kept=kept, labels=labels_ok, labels_ttft=lt, labels_tpot=lp, base=base,
-            params=registry.model(model).trs,
+            params=registry.model(model).trs, role=roles.pop(),
         )
     return cells
 
@@ -525,7 +541,7 @@ def split_dataset(cells: Mapping[str, Cell], policy: CellPolicy) -> tuple[Traini
     train, holdout, excluded = {}, {}, {}
     for uid, cell in cells.items():
         role = policy.role({"shape": cell.shape, "primitive": cell.primitive, "stage": cell.stage,
-                            "cell_id": uid, "model": cell.model})
+                            "role": cell.role, "cell_id": uid, "model": cell.model})
         {ROLE_TRAIN: train, ROLE_HOLDOUT: holdout, ROLE_EXCLUDED: excluded}[role][uid] = cell
     counts = {"train": len(train), "holdout": len(holdout), "excluded": len(excluded)}
     return TrainingSet(train), HoldoutSet(holdout), counts
