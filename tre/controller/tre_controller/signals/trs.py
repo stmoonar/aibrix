@@ -91,6 +91,12 @@ class TRSComputer:
         self._ema: TssEma | None = (
             TssEma(ema_tau_ms) if ema_tau_ms is not None and ema_tau_ms > 0 else None
         )
+        # ema_tau_ms <= 0 is tau = 0, i.e. alpha = 1: no smoothing, TSS = raw - what the
+        # offline fit scores (theta_verdict.build_signal_spec maps tau <= 0 to no EMA). It
+        # used to fall through to the fixed-alpha branch below, whose ema_alpha weighs the
+        # OLD value: with the ema_alpha: 1.0 that alpha_fit.registry_fields writes for
+        # tau = 0 the TSS would freeze at its first sample. Only an unset tau (None) is legacy.
+        self._raw_passthrough = ema_tau_ms is not None and ema_tau_ms <= 0
         # DEPRECATED fixed-alpha branch state (only used when _ema is None).
         self._legacy_ema: float | None = None
         self._legacy_last_ms: int | None = None
@@ -193,6 +199,8 @@ class TRSComputer:
         window_ms: float | None = None,
         idle: bool = False,
     ) -> float:
+        if self._raw_passthrough:
+            return raw
         if self._ema is not None:
             # Time-constant EMA (S1.3 / ADR-0011): delegated to tre_common.tss.TssEma, the
             # one implementation the offline paths use as well (idle-gap reset after
