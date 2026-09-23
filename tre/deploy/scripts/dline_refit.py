@@ -67,6 +67,27 @@ Stages (``python -m scripts.dline_refit STAGE --model M --arm primary|fixed|k3 .
     the table of every model and arm under ``--out-dir`` plus the boundary-band window
     counts per shape / family and what hold cells a family short of
     ``MIN_FAMILY_WINDOWS`` band windows would need (``summary.json``).
+``freeze`` (D22: refit -> freeze -> collect M -> A-D once)
+    ``--model`` repeated, ``--freeze-file PATH``: one JSON of every model's published
+    parameters (theta, w_p, tau / alpha, lambda_wait, delta_crit / delta_high, the registry
+    EMA fields), the D13 stop rule, what ``holdout_report`` needs (``verdict_for_holdout``),
+    sha256 of the stage outputs and of every training input, the H2 hashes and the code
+    commit; self-hashed (``freeze_sha256``, :func:`canonical_sha256`), a sha256sum sidecar
+    ``PATH.sha256``, mode 0444. Refuses - listing every reason, writing nothing - unless
+    each model's final ran with ``--no-holdout``, meets the stop rule and still sits on
+    the training inputs it was fitted on, and the freeze file is new.
+``verify-freeze``
+    checks the sidecar and the self hash (:func:`verify_freeze`); exit 0 = intact.
+``accept`` (plan §6.9f A-D, once)
+    ``--freeze-file``, ``--dataset [RUN=]DIR`` (repeatable) and one ``--m-manifest`` per
+    frozen model; reads nothing but those. Refuses on a broken freeze, a training input
+    changed since the freeze, an M manifest sealed under another freeze or label or whose
+    raw-data sums moved, a manifest cell missing / duplicated / not ``holdout`` / not
+    ``valid`` in the datasets. Scores the manifest cells with ``holdout_report`` (dwell 2)
+    plus a cell bootstrap for the CIs; writes ``<stem>.accept.json`` (0444), the
+    validation CSVs under ``<stem>.accept.d/`` and the marker ``PATH.accepted``. Exit 0 =
+    A, B and D pass for every model, 3 = evaluated and failed, other = refused. Runs once;
+    ``--recheck`` recomputes in a temp dir and compares, writing nothing.
 
 Labels are ``tre_common.slo_labels``: ``primary`` is the D6' slowdown label of the
 registry profile (``max(500 ms, 5 * idle TTFT(L))``, TPOT 75 ms, >= 20 completions),
@@ -79,7 +100,9 @@ import csv
 import hashlib
 import json
 import math
+import os
 import random
+import sys
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -1167,6 +1190,884 @@ def stage_summary(out_root: Path, fit_dirs: Mapping[str, Path], *, registry: Opt
     return out
 
 
+# ------------------------------------------------------- freeze (D22) and accept (A-D)
+#
+# Plan §6.11 D22: refit -> FREEZE theta / w_p / alpha / delta -> collect M -> evaluate the
+# acceptance criteria A-D of plan §6.9f ONCE, on the frozen parameters and M only.
+#
+# ``freeze`` refuses unless every model's refit is final, never read M, meets the D13 stop
+# rule and still sits on the training inputs it was fitted on; it writes one JSON for all
+# models, self-hashed (``freeze_sha256``, :func:`canonical_sha256`), with a sha256sum
+# sidecar, read-only. ``accept`` reads only that file and M (standard datasets + one M
+# manifest per model, written by the collection side), refuses on any provenance break,
+# and writes its result and a marker once; ``--recheck`` recomputes in a temp dir and
+# compares, never writing next to the freeze.
+
+FREEZE_FORMAT_REVISION = 1
+M_MANIFEST_FORMAT_REVISION = 1
+#: The refit stage outputs a freeze reads (``<out>/<model>/<arm>/<name>.json``).
+FREEZE_STAGE_FILES = ("alpha", "wp", "final", "verdict_final")
+M_MANIFEST_KEYS = ("model", "format_revision", "freeze", "label_def", "label_def_sha256", "cells",
+                   "sealed_probes", "sha256sums_file", "sha256sums_sha256")
+M_CELL_KEYS = ("model", "cell_id", "attempt", "shape", "primitive", "role", "origin", "seen_before", "note")
+M_CELL_ORIGINS = ("collected", "retained")
+M_REQUIRED_COLUMNS = ("model", "cell_id", "attempt", "split", "cell_status", "scenario_id", "shape",
+                      "primitive", "role")
+CELL_STATUS_VALID = "valid"
+#: Plan §6.9f: the thresholds of criteria A and B, the non-gating target of all-violating
+#: recall, and windows per independent window (30 s windows on a 10 s step) for C.
+A_BA_MIN = 0.80
+A_BA_CI_LOW_MIN = 0.75
+A_MAX_DROP_FROM_TRAINING = 0.08
+B_RECALL_MIN = 0.85
+B_RECALL_CI_LOW_MIN = 0.75
+B_FALSE_ALARM_MAX = 0.05
+B_FALSE_ALARM_CI_HIGH_MAX = 0.08
+ALL_VIOLATING_RECALL_TARGET = 0.70
+WINDOWS_PER_INDEPENDENT = 3
+ACCEPT_RESAMPLES = 1000
+ACCEPT_DWELL_WINDOWS = DWELL_WINDOWS
+EXIT_REFUSED = 1
+EXIT_ACCEPT_FAILED = 3
+EXIT_RECHECK_DIFFERS = 4
+#: Keys a ``--recheck`` does not compare: timestamps, work paths, the command line, and the
+#: code state of the run (provenance of the run, printed when it differs, not a result).
+ACCEPT_VOLATILE_KEYS = frozenset({"generated_at", "evaluated_at_utc", "validation_csv", "work_dir",
+                                  "command", "code"})
+
+
+class FreezeError(RuntimeError):
+    """``freeze`` / ``verify-freeze`` / ``accept`` refused; ``problems`` lists every reason."""
+
+    def __init__(self, problems: Sequence[str]):
+        self.problems = list(problems)
+        super().__init__("; ".join(self.problems))
+
+
+def canonical_json(obj: Any) -> bytes:
+    """The bytes :func:`canonical_sha256` hashes: sorted keys, no whitespace, UTF-8."""
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def canonical_sha256(obj: Any) -> str:
+    """sha256 of the canonical JSON of ``obj`` (the freeze self hash; label definitions)."""
+    return hashlib.sha256(canonical_json(obj)).hexdigest()
+
+
+def _utc_now() -> str:
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).isoformat()
+
+
+def code_state() -> dict:
+    """Commit of the tre tree this module runs from, and whether tracked files are dirty."""
+    import subprocess
+
+    root = Path(__file__).resolve().parents[2]
+    try:
+        commit = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"], capture_output=True,
+                                text=True, check=True).stdout.strip()
+        dirty = bool(subprocess.run(["git", "-C", str(root), "status", "--porcelain", "--untracked-files=no"],
+                                    capture_output=True, text=True, check=True).stdout.strip())
+    except (OSError, subprocess.CalledProcessError):
+        commit, dirty = None, None
+    return {"commit": commit, "dirty": dirty, "tre_root": str(root)}
+
+
+def freeze_paths(freeze_file: Path) -> dict[str, Path]:
+    """The files that go with a freeze file: its sha256 sidecar, the accept result, the
+    accept marker and the accept work dir (the per-model validation CSVs)."""
+    f = Path(freeze_file)
+    return {"freeze": f, "sidecar": Path(f"{f}.sha256"), "result": f.with_name(f"{f.stem}.accept.json"),
+            "marker": Path(f"{f}.accepted"), "work": f.with_name(f"{f.stem}.accept.d")}
+
+
+def _write_once(path: Path, data: bytes, mode: int = 0o444) -> None:
+    with open(path, "xb") as fh:
+        fh.write(data)
+    os.chmod(path, mode)
+
+
+def _json_bytes(doc: Any) -> bytes:
+    return (json.dumps(doc, indent=1, sort_keys=True, ensure_ascii=False) + "\n").encode("utf-8")
+
+
+def training_input_files(fit_dir: Path, model: str) -> dict[str, Path]:
+    """Every training input of ``model`` in a fit dir that exists: the fitting and family
+    CSVs, the training ledger, trainset.json and h2.json."""
+    p = paths(fit_dir, model)
+    files = {"fitting": p["fitting"], **{f"family_{k}": v for k, v in p["families"].items()},
+             "training_ledger": Path(fit_dir) / TRAINING_LEDGER,
+             "trainset_manifest": Path(fit_dir) / TRAINSET_MANIFEST, "h2_manifest": Path(fit_dir) / H2_MANIFEST}
+    return {k: v for k, v in files.items() if v.exists()}
+
+
+def verdict_for_holdout(verdict_doc: Mapping[str, Any]) -> dict:
+    """Exactly what ``theta_verdict.holdout_report`` reads from a verdict."""
+    merged: dict[str, Any] = {"theta": verdict_doc["merged"]["theta"]}
+    opp = verdict_doc["merged"].get("opposite_direction")
+    if opp is not None:
+        merged["opposite_direction"] = {k: opp.get(k) for k in ("direction", "theta", "publish")}
+    return {
+        "model": verdict_doc["model"], "signal": verdict_doc.get("signal"),
+        "label_def": verdict_doc["label_def"], "signal_spec": verdict_doc["signal_spec"],
+        "trim_ramp_windows": verdict_doc["trim_ramp_windows"],
+        "fit_config": {"direction": verdict_doc["fit_config"]["direction"]},
+        "published": dict(verdict_doc["published"]), "merged": merged,
+    }
+
+
+def _same(a: Any, b: Any) -> bool:
+    if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+        return a == b or math.isclose(float(a), float(b), rel_tol=1e-12, abs_tol=0.0)
+    return a == b
+
+
+def freeze_model(out_root: Path, fit_dir: Path, model: str, arm: str) -> tuple[Optional[dict], list[str]]:
+    """One model's freeze entry, or the reasons it cannot be frozen (every one found)."""
+    from scripts.rewindow_from_raw import load_ledgers
+
+    d = Path(out_root) / model / arm
+    problems: list[str] = []
+    docs: dict[str, dict] = {}
+    for name in FREEZE_STAGE_FILES:
+        f = d / f"{name}.json"
+        if not f.exists():
+            problems.append(f"{f} is missing")
+            continue
+        try:
+            docs[name] = json.loads(f.read_text(encoding="utf-8"))
+        except ValueError as exc:
+            problems.append(f"{f}: not JSON ({exc})")
+    if problems:
+        return None, problems
+    alpha, wp, fin, ver = docs["alpha"], docs["wp"], docs["final"], docs["verdict_final"]
+    for name, doc in (("final", fin), ("verdict_final", ver)):
+        if "error" in doc:
+            problems.append(f"{name}: the fit failed ({doc['error']})")
+    if problems:
+        return None, problems
+
+    # M must not have been read before the freeze (plan §6.11 note 9)
+    if fin.get("holdout_evaluated") is not False:
+        problems.append(f"final ran with the hold-out (holdout_evaluated = {fin.get('holdout_evaluated')!r}): "
+                        "M was read before the freeze - rerun final with --no-holdout")
+    # D13
+    stop = fin.get("stop_rule") or {}
+    if stop.get("satisfied") is not True:
+        reasons = stop.get("reasons") or ["final records no stop rule"]
+        problems.append("D13 stop rule not satisfied: " + "; ".join(str(r) for r in reasons))
+    # the four stage outputs are one refit
+    if fin.get("arm") not in (None, arm):
+        problems.append(f"final.json is arm {fin.get('arm')!r}, not {arm!r}")
+    if ver.get("model") != model or fin.get("model") not in (None, model):
+        problems.append(f"the stage outputs name model {fin.get('model')!r} / {ver.get('model')!r}, not {model!r}")
+    if "signal_spec" not in ver:
+        problems.append("verdict_final.json has no signal_spec")
+    pub = ver.get("published") or {}
+    spec_tss = (ver.get("signal_spec") or {}).get("tss") or {}
+    tau_s = fin.get("tau_s")
+    tau_ms = None if tau_s is None or tau_s <= 0 else tau_s * 1000.0
+    for what, a, b in (
+        ("published theta (final / verdict_final)", fin.get("theta_published"), pub.get("theta_m")),
+        ("label_def (final / verdict_final)", fin.get("label_def"), ver.get("label_def")),
+        ("w_p (final / wp.w_p_used)", fin.get("w_p"), wp.get("w_p_used")),
+        ("lambda_wait (final / wp.lambda_star)", fin.get("lambda_wait"), wp.get("lambda_star")),
+        ("tau_s (final / alpha published)", tau_s, published_tau(alpha)),
+        ("w_p (final / verdict signal_spec)", fin.get("w_p"), spec_tss.get("w_p")),
+        ("lambda_wait (final / verdict signal_spec)", fin.get("lambda_wait"), spec_tss.get("lambda_wait")),
+        ("EMA tau ms (final / verdict signal_spec)", tau_ms, spec_tss.get("ema_tau_ms")),
+        ("tau_crit (final / verdict_final)", fin.get("tau_crit"), pub.get("tau_crit")),
+    ):
+        if not _same(a, b):
+            problems.append(f"stage outputs disagree on {what}: {a!r} != {b!r}")
+    if not alpha.get("published_registry_fields"):
+        problems.append("alpha.json publishes no registry fields (ema_tau_ms / ema_alpha)")
+
+    # training inputs: unchanged since final ran (D16 provenance)
+    fit_dir = Path(fit_dir)
+    ts = fin.get("training_set") or {}
+    man = fit_dir / TRAINSET_MANIFEST
+    man_doc: dict = {}
+    p = paths(fit_dir, model)
+    required = {"fitting": p["fitting"], **{f"family_{k}": v for k, v in p["families"].items()}}
+    for key, path in required.items():
+        if not path.exists():
+            problems.append(f"training input {key} {path} does not exist")
+    if not ts.get("trainset_manifest"):
+        problems.append("final records no trainset manifest: a freeze needs a training set built by "
+                        "the trainset stage (D16)")
+    elif not man.exists():
+        problems.append(f"{man} does not exist (final ran on {ts['trainset_manifest']})")
+    else:
+        have = sha256_file(man)
+        if have != ts.get("trainset_manifest_sha256"):
+            problems.append(f"{man} (sha256 {have}) is not the trainset manifest final ran on "
+                            f"({ts['trainset_manifest']}, sha256 {ts.get('trainset_manifest_sha256')}): the fit "
+                            "dir does not match this refit, or its training inputs changed since")
+        else:
+            man_doc = json.loads(man.read_text(encoding="utf-8"))
+            lp = fit_dir / TRAINING_LEDGER
+            try:
+                check_training_inputs(model, p, ledger=load_ledgers([str(lp)]) if lp.exists() else None)
+            except SystemExit as exc:
+                problems.append(f"training inputs: {exc}")
+    if problems:
+        return None, problems
+
+    h2_path = fit_dir / H2_MANIFEST
+    stage_files = {name: d / f"{name}.json" for name in FREEZE_STAGE_FILES}
+    entry = {
+        "fit_dir": str(fit_dir), "refit_dir": str(d),
+        "published": {
+            "signal": ver.get("signal"), "direction": ver["fit_config"]["direction"],
+            "theta": fin["theta_published"], "w_p": fin["w_p"], "tau_s": fin["tau_s"], "alpha": fin["alpha"],
+            "lambda_wait": fin["lambda_wait"], "delta_crit": fin["delta_crit"], "delta_high": fin["delta_high"],
+            "tau_crit": fin["tau_crit"], "tau_high": pub.get("tau_high"),
+        },
+        "registry": dict(alpha["published_registry_fields"]),
+        "train_ba_at_published": fin.get("train_ba_at_published"),
+        "stop_rule": stop,
+        "ci_half_frac": fin.get("ci_half_frac"), "publish_rate": fin.get("publish_rate"),
+        "family_gap_frac": fin.get("family_gap_frac"), "theta_P": fin.get("theta_P"), "theta_D": fin.get("theta_D"),
+        "family_rule": {"source": fin.get("source"), "theta": fin.get("theta_family_rule")},
+        "label_def_sha256": canonical_sha256(ver["label_def"]),
+        "verdict_for_holdout": verdict_for_holdout(ver),
+        "stage_files": {k: {"path": str(v), "sha256": sha256_file(v)} for k, v in stage_files.items()},
+        "training_inputs": {k: {"path": str(v), "sha256": sha256_file(v)}
+                            for k, v in training_input_files(fit_dir, model).items()},
+        "h2": {"rows_sha256": (man_doc.get("h2") or {}).get("rows_sha256"),
+               "cells_sha256": (man_doc.get("h2") or {}).get("cells_sha256"),
+               "manifest_sha256": sha256_file(h2_path) if h2_path.exists() else None},
+        "trainset": {"manifest_sha256": ts.get("trainset_manifest_sha256"), "sentinels": ts.get("sentinels")},
+    }
+    return entry, []
+
+
+def stage_freeze(out_root: Path, fit_dir_of: Callable[[str], Path], models: Sequence[str], arm: str,
+                 freeze_file: Path, *, command: Sequence[str] = ()) -> dict:
+    """D22: freeze every model's published parameters into ``freeze_file`` (or refuse,
+    raising :class:`FreezeError` with every reason, before anything is written)."""
+    fp = freeze_paths(freeze_file)
+    problems: list[str] = []
+    for key in ("freeze", "sidecar", "result", "marker"):
+        if fp[key].exists():
+            problems.append(f"{fp[key]} already exists: a freeze is never overwritten")
+    if len(set(models)) != len(models):
+        problems.append(f"a model is given twice: {list(models)}")
+    entries: dict[str, dict] = {}
+    for model in models:
+        entry, pr = freeze_model(out_root, fit_dir_of(model), model, arm)
+        problems += [f"{model}: {x}" for x in pr]
+        if entry is not None:
+            entries[model] = entry
+    if problems:
+        raise FreezeError(problems)
+    doc = {
+        "what": ("D22 parameter freeze (plan §6.11): the published theta / w_p / alpha / delta of every "
+                 "model, frozen before M is collected; `dline_refit accept` evaluates A-D on M once, "
+                 "from this file only"),
+        "format_revision": FREEZE_FORMAT_REVISION,
+        "created_at_utc": _utc_now(),
+        "arm": arm,
+        "command": list(command),
+        "code": code_state(),
+        "refit_out_dir": str(out_root),
+        "models": entries,
+        "self_hash_rule": ("freeze_sha256 = sha256 of json.dumps(doc without freeze_sha256, sort_keys=True, "
+                           "separators=(',', ':'), ensure_ascii=False) in UTF-8"),
+    }
+    doc["freeze_sha256"] = canonical_sha256(doc)
+    data = _json_bytes(doc)
+    fp["freeze"].parent.mkdir(parents=True, exist_ok=True)
+    _write_once(fp["freeze"], data)
+    _write_once(fp["sidecar"], f"{hashlib.sha256(data).hexdigest()}  {fp['freeze'].name}\n".encode())
+    return doc
+
+
+def verify_freeze(path: Path | str) -> dict:
+    """The freeze document, after checking its sidecar and its embedded self hash; raises
+    :class:`FreezeError` on any mismatch."""
+    f = Path(path)
+    side = freeze_paths(f)["sidecar"]
+    if not f.exists():
+        raise FreezeError([f"{f} does not exist"])
+    if not side.exists():
+        raise FreezeError([f"{side} is missing: the freeze file has no sha256 sidecar"])
+    data = f.read_bytes()
+    parts = side.read_text(encoding="utf-8").split()
+    if len(parts) != 2 or len(parts[0]) != 64:
+        raise FreezeError([f"{side}: not a sha256sum line ('<hex>  <name>')"])
+    want, name = parts[0], parts[1].lstrip("*")
+    got = hashlib.sha256(data).hexdigest()
+    if name != f.name:
+        raise FreezeError([f"{side} names {name!r}, not {f.name!r}"])
+    if got != want:
+        raise FreezeError([f"{f}: sha256 {got} != {want} in {side.name}: the freeze file changed after it "
+                           "was written"])
+    try:
+        doc = json.loads(data.decode("utf-8"))
+    except ValueError as exc:
+        raise FreezeError([f"{f}: not JSON ({exc})"])
+    if not isinstance(doc, dict):
+        raise FreezeError([f"{f}: not a freeze document"])
+    body = {k: v for k, v in doc.items() if k != "freeze_sha256"}
+    if doc.get("freeze_sha256") != canonical_sha256(body):
+        raise FreezeError([f"{f}: embedded freeze_sha256 {doc.get('freeze_sha256')} does not match its content "
+                           f"({canonical_sha256(body)})"])
+    if doc.get("format_revision") != FREEZE_FORMAT_REVISION or not isinstance(doc.get("models"), dict):
+        raise FreezeError([f"{f}: not a format revision {FREEZE_FORMAT_REVISION} freeze"])
+    return doc
+
+
+# ------------------------------------------------------------------------- accept
+
+
+def _attempt(value: Any) -> Any:
+    try:
+        return int(str(value).strip())
+    except ValueError:
+        return str(value)
+
+
+def _parse_sums_line(line: str) -> tuple[str, str]:
+    """``<hex>  <path>`` (text) or ``<hex> *<path>`` (binary), sha256sum format."""
+    digest, _, rest = line.partition(" ")
+    rest = rest[1:] if rest.startswith((" ", "*")) else rest
+    if len(digest) != 64 or not rest:
+        raise ValueError(line)
+    return digest, rest
+
+
+def check_m_manifest(path: Path, freeze_doc: Mapping[str, Any],
+                     freeze_file_sha256: str) -> tuple[Optional[dict], list[str]]:
+    """An M manifest (the collection side's ``<M root>/<model>/M_manifest.json``) and every
+    reason it cannot be accepted against this freeze."""
+    path = Path(path)
+    try:
+        man = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return None, [f"{path}: unreadable ({exc})"]
+    if not isinstance(man, dict):
+        return None, [f"{path}: not a manifest"]
+    missing = [k for k in M_MANIFEST_KEYS if k not in man]
+    if missing:
+        return None, [f"{path}: missing keys {missing}"]
+    problems: list[str] = []
+    model = man["model"]
+    if man["format_revision"] != M_MANIFEST_FORMAT_REVISION:
+        problems.append(f"format_revision {man['format_revision']!r} != {M_MANIFEST_FORMAT_REVISION}")
+    entry = freeze_doc["models"].get(model)
+    if entry is None:
+        return None, [f"{path}: model {model!r} is not in the freeze ({sorted(freeze_doc['models'])})"]
+    fr = man["freeze"] if isinstance(man["freeze"], dict) else {}
+    if fr.get("sha256") != freeze_file_sha256:
+        problems.append(f"sealed under another freeze: manifest freeze sha256 {fr.get('sha256')} != "
+                        f"{freeze_file_sha256} (this freeze file)")
+    want_label = canonical_sha256(entry["verdict_for_holdout"]["label_def"])
+    if man["label_def_sha256"] != want_label:
+        problems.append(f"M was sealed under another label: label_def_sha256 {man['label_def_sha256']} != "
+                        f"{want_label} (the frozen label)")
+    if canonical_sha256(man["label_def"]) != man["label_def_sha256"]:
+        problems.append("label_def does not hash to label_def_sha256")
+    sums = path.parent / str(man["sha256sums_file"])
+    if not sums.exists():
+        problems.append(f"{sums} (sha256sums_file) does not exist")
+    elif sha256_file(sums) != man["sha256sums_sha256"]:
+        problems.append(f"{sums}: sha256 {sha256_file(sums)} != sha256sums_sha256 {man['sha256sums_sha256']}")
+    else:
+        n = 0
+        for k, line in enumerate(sums.read_text(encoding="utf-8").splitlines(), 1):
+            if not line.strip():
+                continue
+            try:
+                digest, name = _parse_sums_line(line)
+            except ValueError:
+                problems.append(f"{sums}:{k}: not a sha256sum line")
+                continue
+            target = Path(name) if Path(name).is_absolute() else path.parent / name
+            n += 1
+            if not target.exists():
+                problems.append(f"{target} (listed in {sums.name}) does not exist")
+            elif sha256_file(target) != digest:
+                problems.append(f"{target}: sha256 differs from {sums.name} - M data changed after it was sealed")
+        if not n:
+            problems.append(f"{sums} lists no file")
+    cells = man["cells"]
+    if not isinstance(cells, list) or not cells:
+        problems.append("no cells to evaluate")
+        cells = []
+    seen: set = set()
+    for i, c in enumerate(cells):
+        miss = [k for k in M_CELL_KEYS if k not in c]
+        if miss:
+            problems.append(f"cells[{i}]: missing keys {miss}")
+            continue
+        key = (str(c["cell_id"]), _attempt(c["attempt"]))
+        if c["model"] != model:
+            problems.append(f"cells[{i}] {key}: model {c['model']!r} != {model!r}")
+        if key in seen:
+            problems.append(f"cells[{i}] {key}: listed twice")
+        seen.add(key)
+        if c["origin"] not in M_CELL_ORIGINS:
+            problems.append(f"cells[{i}] {key}: origin {c['origin']!r} not in {M_CELL_ORIGINS}")
+        if not isinstance(c["seen_before"], bool):
+            problems.append(f"cells[{i}] {key}: seen_before is not a bool")
+    probes = man["sealed_probes"] if isinstance(man["sealed_probes"], list) else []
+    probe_keys = {(str(q.get("cell_id")), _attempt(q.get("attempt"))) for q in probes if isinstance(q, Mapping)}
+    both = sorted(str(k) for k in seen & probe_keys)
+    if both:
+        problems.append(f"cells also listed as sealed probes: {both}")
+    return man, [f"{path}: {x}" for x in problems]
+
+
+def collect_m_rows(sources: Sequence[DatasetSource],
+                   manifests: Mapping[str, Mapping[str, Any]]) -> tuple[dict, list[str]]:
+    """The dataset rows of every manifest cell (matched on model, cell_id, attempt), in
+    dataset order, per model; plus every reason they cannot be evaluated."""
+    problems: list[str] = []
+    wanted: dict[tuple, Mapping[str, Any]] = {}
+    for model, man in manifests.items():
+        for c in man["cells"]:
+            wanted[(model, str(c["cell_id"]), _attempt(c["attempt"]))] = c
+    header: dict[str, list[str]] = {}
+    rows: dict[str, list[dict]] = defaultdict(list)
+    where: dict[tuple, dict[str, list[dict]]] = defaultdict(lambda: defaultdict(list))
+    for src in sources:
+        with open(src.windows, newline="", encoding="utf-8") as fh:
+            reader = csv.reader(fh)
+            head = next(reader, None) or []
+            miss = [c for c in M_REQUIRED_COLUMNS if c not in head]
+            if miss:
+                problems.append(f"{src.windows}: missing columns {miss}")
+                continue
+            for values in reader:
+                row = dict(zip(head, values))
+                key = (row["model"], row["cell_id"], _attempt(row["attempt"]))
+                if key not in wanted:
+                    continue
+                h = header.setdefault(key[0], [])
+                h += [c for c in head if c not in h]
+                rows[key[0]].append(row)
+                where[key][src.name].append(row)
+    placed: dict[tuple, dict] = {}
+    scenario_of: dict[tuple[str, str], tuple] = {}
+    for key, cell in wanted.items():
+        tag = f"{key[0]}/{key[1]} a{key[2]}"
+        found = where.get(key) or {}
+        if not found:
+            problems.append(f"{tag}: not found in any dataset")
+            continue
+        if len(found) > 1:
+            problems.append(f"{tag}: found in {len(found)} datasets ({sorted(found)})")
+            continue
+        (name, cell_rows), = found.items()
+        bad_split = sorted({r["split"] for r in cell_rows} - {SPLIT_HOLDOUT})
+        if bad_split:
+            problems.append(f"{tag}: rows of split {bad_split} - M is the {SPLIT_HOLDOUT} split only")
+        bad_status = sorted({r["cell_status"] for r in cell_rows} - {CELL_STATUS_VALID})
+        if bad_status:
+            problems.append(f"{tag}: cell_status {bad_status}, not {CELL_STATUS_VALID!r}")
+        for col in ("shape", "primitive", "role"):
+            have = sorted({r[col] for r in cell_rows})
+            if have != [str(cell[col])]:
+                problems.append(f"{tag}: dataset {col} {have} != manifest {cell[col]!r}")
+        sids = sorted({r["scenario_id"] for r in cell_rows})
+        if len(sids) != 1:
+            problems.append(f"{tag}: rows carry scenario ids {sids} (one cell, one scenario id)")
+        else:
+            other = scenario_of.setdefault((key[0], sids[0]), key)
+            if other != key:
+                problems.append(f"{tag}: shares scenario id {sids[0]} with {other} (dwell and the cell "
+                                "bootstrap group by scenario id)")
+        placed[key] = {"dataset": name, "rows": len(cell_rows), "scenario_id": sids[0] if sids else None}
+    return {"header": header, "rows": dict(rows), "placed": placed}, problems
+
+
+def _ci95(values: Sequence[float]) -> list[Optional[float]]:
+    """95 % percentile interval, the index rule of ``stage_final``'s M BA CI."""
+    v = sorted(values)
+    if not v:
+        return [None, None]
+    return [v[int(0.025 * len(v))], v[int(0.975 * len(v)) - 1]]
+
+
+def _finite_or_none(x: Any) -> Optional[float]:
+    return float(x) if isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x) else None
+
+
+def _rate_metrics() -> dict[str, Callable[[Any], bool]]:
+    """The rate metrics of the cell bootstrap and the windows each is a rate over - the
+    selections of ``theta_verdict.dwell_acceptance``."""
+    from scripts import theta_verdict as tv
+
+    b = frozenset(tv.CRITERION_B_CLASSES)
+    return {
+        "critical_recall_both_tpot": lambda w: not w.slo_met and w.violation_class in b,
+        "critical_false_alarm_on_healthy": lambda w: w.slo_met,
+        "critical_recall_of_violating": lambda w: not w.slo_met,
+        "critical_recall_ttft_only": lambda w: not w.slo_met and w.violation_class == "ttft_only",
+    }
+
+
+def acceptance_bootstrap(windows: Sequence[Any], crit: Sequence[bool], *, theta: float, direction: str,
+                         n_resamples: int = ACCEPT_RESAMPLES, seed: int = SEED) -> dict:
+    """Cell bootstrap (cells = scenario ids, drawn with replacement) of the A-C metrics.
+
+    The dwell flags ``crit`` are computed once per cell on the full data
+    (``theta_verdict.critical_dwell_flags``) and scored on the resampled cells; BA at
+    ``theta`` is ``threshold_balanced_accuracy`` on the resampled windows, and a resample
+    holding only one class has no BA and is skipped (``resamples_used`` counts the rest)."""
+    from tre_calibration.fit import threshold_balanced_accuracy
+
+    metrics = _rate_metrics()
+    by: dict[str, list[int]] = defaultdict(list)
+    for i, w in enumerate(windows):
+        by[w.scenario_id].append(i)
+    cells = sorted(by)
+    counts = {c: {k: (sum(1 for i in by[c] if f(windows[i]) and crit[i]), sum(1 for i in by[c] if f(windows[i])))
+                  for k, f in metrics.items()} for c in cells}
+    values: dict[str, list[float]] = {"balanced_accuracy": [], **{k: [] for k in metrics}}
+    rng = random.Random(seed)
+    for _ in range(n_resamples if cells else 0):
+        pick = [rng.choice(cells) for _ in cells]
+        smp = [windows[i] for c in pick for i in by[c]]
+        if any(w.slo_met for w in smp) and any(not w.slo_met for w in smp):
+            values["balanced_accuracy"].append(
+                threshold_balanced_accuracy(smp, theta=theta, direction=direction)["balanced_accuracy"])
+        for k in metrics:
+            den = sum(counts[c][k][1] for c in pick)
+            if den:
+                values[k].append(sum(counts[c][k][0] for c in pick) / den)
+    return {
+        "n_resamples": n_resamples, "seed": seed, "unit": "cell (scenario_id), drawn with replacement",
+        "interval": "95 % percentile", "cells": len(cells),
+        "metrics": {k: {"ci95": _ci95(v), "resamples_used": len(v)} for k, v in values.items()},
+    }
+
+
+def _criterion(name: str, value: Any, op: str, threshold: Any) -> dict:
+    v, t = _finite_or_none(value), _finite_or_none(threshold)
+    met = v is not None and t is not None and (v >= t if op == ">=" else v <= t)
+    return {"name": name, "value": v, "op": op, "threshold": t, "met": met}
+
+
+def acceptance_criteria(entry: Mapping[str, Any], h: Mapping[str, Any], boot: Mapping[str, Any]) -> dict:
+    """Plan §6.9f A-D for one model from its freeze entry, hold-out report ``h`` and
+    bootstrap ``boot``. A is not evaluable (and fails) when M lacks one of the classes."""
+    ci = {k: v["ci95"] for k, v in boot["metrics"].items()}
+    wd = h["with_dwell"]
+    two_classes = 0 < h["violating"] < h["windows"]
+    ba = h["at_published_theta"]["balanced_accuracy"] if two_classes else None
+    train = _finite_or_none(entry.get("train_ba_at_published"))
+    a = [_criterion("BA at the published theta", ba, ">=", A_BA_MIN),
+         _criterion("BA CI95 lower bound", ci["balanced_accuracy"][0], ">=", A_BA_CI_LOW_MIN),
+         _criterion(f"BA >= training BA at the published theta - {A_MAX_DROP_FROM_TRAINING}", ba, ">=",
+                    None if train is None else train - A_MAX_DROP_FROM_TRAINING)]
+    rec, fa = wd["critical_recall_both_tpot"], wd["critical_false_alarm_on_healthy"]
+    b = [_criterion("CRITICAL recall of both/TPOT-only violations (dwell)", rec, ">=", B_RECALL_MIN),
+         _criterion("its CI95 lower bound", ci["critical_recall_both_tpot"][0], ">=", B_RECALL_CI_LOW_MIN),
+         _criterion("CRITICAL false alarm on healthy windows (dwell)", fa, "<=", B_FALSE_ALARM_MAX),
+         _criterion("its CI95 upper bound", ci["critical_false_alarm_on_healthy"][1], "<=",
+                    B_FALSE_ALARM_CI_HIGH_MAX)]
+    b_eval = bool(wd["both_tpot_windows"]) and bool(wd["healthy_windows"])
+    all_rec = _finite_or_none(wd["critical_recall_of_violating"])
+    ttft = wd["violation_classes"]["ttft_only"]
+    stop = entry.get("stop_rule") or {}
+    gap, half = _finite_or_none(entry.get("family_gap_frac")), _finite_or_none(entry.get("ci_half_frac"))
+    return {
+        "A": {"criteria": a, "evaluable": ba is not None, "passed": all(c["met"] for c in a),
+              "train_ba_at_published": train},
+        "B": {"criteria": b, "evaluable": b_eval, "passed": b_eval and all(c["met"] for c in b),
+              "both_tpot_windows": wd["both_tpot_windows"], "healthy_windows": wd["healthy_windows"],
+              "dwell_windows": wd["dwell_windows"],
+              "all_violating_recall": {"value": all_rec, "target": ALL_VIOLATING_RECALL_TARGET,
+                                       "met": all_rec is not None and all_rec >= ALL_VIOLATING_RECALL_TARGET,
+                                       "ci95": ci["critical_recall_of_violating"], "gating": False}},
+        "C": {"gating": False, "critical_recall_ttft_only": ttft["critical_recall"], "windows": ttft["windows"],
+              "independent_windows": ttft["windows"] / WINDOWS_PER_INDEPENDENT,
+              "ci95": ci["critical_recall_ttft_only"]},
+        "D": {"passed": stop.get("satisfied") is True, "stop_rule_satisfied": stop.get("satisfied"),
+              "reasons": stop.get("reasons"), "ci_half_frac": half, "publish_rate": entry.get("publish_rate"),
+              "family_gap_frac": gap, "theta_P": entry.get("theta_P"), "theta_D": entry.get("theta_D"),
+              "family_gap_within_ci_half_width": (gap <= half) if gap is not None and half is not None else None,
+              "source": "the training stop rule (D13) as recorded at freeze time"},
+    }
+
+
+def _write_validation_csv(path: Path, header: Sequence[str], rows: Sequence[Mapping[str, str]]) -> None:
+    with open(path, "w", newline="", encoding="utf-8") as fh:
+        w = csv.writer(fh, lineterminator="\n")
+        w.writerow(list(header))
+        for r in rows:
+            w.writerow([r.get(c, "") for c in header])
+
+
+def evaluate_model(entry: Mapping[str, Any], csv_path: Path, *, n_resamples: int, seed: int) -> dict:
+    """``theta_verdict.holdout_report`` for the point estimates (dwell 2), the cell
+    bootstrap for the CIs, then A-D."""
+    from scripts import theta_verdict as tv
+
+    vh = entry["verdict_for_holdout"]
+    h = tv.holdout_report(vh, csv_path, dwell_windows=ACCEPT_DWELL_WINDOWS)
+    spec = tv.SignalSpec.from_dict(vh["signal_spec"])
+    label = slo_labels.LabelDefinition.from_dict(vh["label_def"])
+    windows = spec.load(csv_path, label, int(vh["trim_ramp_windows"]))
+    theta, tau_crit = float(vh["published"]["theta_m"]), float(vh["published"]["tau_crit"])
+    direction = vh["fit_config"]["direction"]
+    crit = tv.critical_dwell_flags(windows, theta=theta, tau_crit=tau_crit, direction=direction,
+                                   dwell_windows=ACCEPT_DWELL_WINDOWS)
+    boot = acceptance_bootstrap(windows, crit, theta=theta, direction=direction,
+                                n_resamples=n_resamples, seed=seed)
+    per_cell: dict[str, int] = defaultdict(int)
+    for w in windows:
+        per_cell[w.scenario_id] += 1
+    criteria = acceptance_criteria(entry, h, boot)
+    return {"holdout_report": h, "bootstrap": boot, "criteria": criteria,
+            "passed": criteria["A"]["passed"] and criteria["B"]["passed"] and criteria["D"]["passed"],
+            "M": {"windows": h["windows"], "cells": h["cells"], "violating": h["violating"],
+                  "violating_fraction": (h["violating"] / h["windows"]) if h["windows"] else None,
+                  "cell_windows": dict(sorted(per_cell.items()))}}
+
+
+def _accept_inputs(freeze_file: Path, datasets: Sequence[str],
+                   m_manifests: Sequence[str]) -> tuple[dict, list[str]]:
+    """Every refusal check of ``accept`` but the once-only one; the inputs when none fails."""
+    problems: list[str] = []
+    try:
+        doc = verify_freeze(freeze_file)
+    except FreezeError as exc:
+        return {}, exc.problems
+    freeze_sha = sha256_file(Path(freeze_file))
+    for model, entry in sorted(doc["models"].items()):
+        for key, rec in sorted(entry["training_inputs"].items()):
+            p = Path(rec["path"])
+            if not p.exists():
+                problems.append(f"{model}: training input {key} {p} is missing")
+            elif sha256_file(p) != rec["sha256"]:
+                problems.append(f"{model}: training input {key} {p} changed after the freeze")
+    manifests: dict[str, dict] = {}
+    manifest_paths: dict[str, Path] = {}
+    unreadable = False
+    for text in m_manifests:
+        man, pr = check_m_manifest(Path(text), doc, freeze_sha)
+        problems += pr
+        if man is None:
+            unreadable = True
+            continue
+        if man["model"] in manifests:
+            problems.append(f"{man['model']}: two M manifests ({manifest_paths[man['model']]}, {text})")
+            continue
+        manifests[man["model"]] = man
+        manifest_paths[man["model"]] = Path(text)
+    if not unreadable:
+        problems += [f"{m}: no M manifest (--m-manifest)" for m in sorted(doc["models"]) if m not in manifests]
+    sources: list[DatasetSource] = []
+    for text in datasets:
+        try:
+            sources.append(DatasetSource.parse(text, sealed_to_h2=False))
+        except TrainingSetError as exc:
+            problems.append(f"dataset {text}: {exc}")
+    if not datasets:
+        problems.append("no --dataset given")
+    if len({s.name for s in sources}) != len(sources):
+        problems.append(f"two datasets share a run name: {[s.name for s in sources]}")
+    m: dict = {"header": {}, "rows": {}, "placed": {}}
+    if not problems:
+        m, pr = collect_m_rows(sources, manifests)
+        problems += pr
+    return {"doc": doc, "freeze_sha256": freeze_sha, "manifests": manifests, "manifest_paths": manifest_paths,
+            "sources": sources, "m": m}, problems
+
+
+def _accept_result(freeze_file: Path, inp: Mapping[str, Any], work: Path, *, n_resamples: int, seed: int,
+                   command: Sequence[str]) -> dict:
+    doc, m = inp["doc"], inp["m"]
+    sums_cover: set[str] = set()
+    for model, man in inp["manifests"].items():
+        mdir = inp["manifest_paths"][model].parent
+        for line in (mdir / str(man["sha256sums_file"])).read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                name = _parse_sums_line(line)[1]
+                sums_cover.add(str(Path(name) if Path(name).is_absolute() else mdir / name))
+    datasets = [{"name": s.name, "directory": str(s.directory), "windows_csv": str(s.windows),
+                 "windows_csv_sha256": sha256_file(s.windows),
+                 "covered_by_m_sha256sums": str(s.windows) in sums_cover}
+                for s in inp["sources"]]
+    models: dict[str, Any] = {}
+    for model in sorted(doc["models"]):
+        entry, man = doc["models"][model], inp["manifests"][model]
+        mpath = inp["manifest_paths"][model]
+        csv_path = work / f"{model}_validation.csv"
+        _write_validation_csv(csv_path, m["header"][model], m["rows"][model])
+        ev = evaluate_model(entry, csv_path, n_resamples=n_resamples, seed=seed)
+        cells = []
+        for c in man["cells"]:
+            placed = m["placed"][(model, str(c["cell_id"]), _attempt(c["attempt"]))]
+            cells.append({**{k: c[k] for k in M_CELL_KEYS}, **placed})
+        ev["M"].update({
+            "manifest_cells": cells, "sealed_probes_not_evaluated": len(man["sealed_probes"]),
+            "seen_before": [{k: c[k] for k in ("cell_id", "attempt", "origin", "seen_before", "note")}
+                            for c in cells if c["seen_before"] or c["origin"] == "retained"],
+        })
+        models[model] = {
+            "m_manifest": {"path": str(mpath), "sha256": sha256_file(mpath),
+                           "sha256sums_file": str(mpath.parent / str(man["sha256sums_file"])),
+                           "sha256sums_sha256": man["sha256sums_sha256"],
+                           "label_def_sha256": man["label_def_sha256"]},
+            "validation_csv": str(csv_path), "validation_csv_sha256": sha256_file(csv_path),
+            "validation_rows": len(m["rows"][model]),
+            "published": entry["published"],
+            **ev,
+        }
+    failed = []
+    for model, r in models.items():
+        for g in ("A", "B", "D"):
+            crit = r["criteria"][g]
+            if crit["passed"]:
+                continue
+            if g == "D":
+                why = [str(x) for x in (crit["reasons"] or ["stop rule not satisfied"])]
+            else:
+                why = [f"{c['name']} {c['value']} {c['op']} {c['threshold']} not met"
+                       for c in crit["criteria"] if not c["met"]]
+                if not crit["evaluable"]:
+                    why.insert(0, "not evaluable on this M")
+            failed.append(f"{model}: {g} failed - " + "; ".join(why))
+    return {
+        "what": ("plan §6.9f acceptance A-D on M, evaluated once on the frozen parameters "
+                 "(A, B, D gate; C and the all-violating recall are disclosed)"),
+        "format_revision": 1,
+        "evaluated_at_utc": _utc_now(),
+        "command": list(command),
+        "code": code_state(),
+        "freeze": {"path": str(freeze_file), "sha256": inp["freeze_sha256"],
+                   "freeze_sha256": doc["freeze_sha256"], "arm": doc.get("arm")},
+        "thresholds": {"A": {"ba_min": A_BA_MIN, "ba_ci_low_min": A_BA_CI_LOW_MIN,
+                             "max_drop_from_training": A_MAX_DROP_FROM_TRAINING},
+                       "B": {"recall_min": B_RECALL_MIN, "recall_ci_low_min": B_RECALL_CI_LOW_MIN,
+                             "false_alarm_max": B_FALSE_ALARM_MAX,
+                             "false_alarm_ci_high_max": B_FALSE_ALARM_CI_HIGH_MAX,
+                             "all_violating_recall_target": ALL_VIOLATING_RECALL_TARGET},
+                       "C": {"windows_per_independent": WINDOWS_PER_INDEPENDENT},
+                       "dwell_windows": ACCEPT_DWELL_WINDOWS},
+        "bootstrap": {"n_resamples": n_resamples, "seed": seed},
+        "datasets": datasets,
+        "work_dir": str(work),
+        "models": models,
+        "passed": not failed,
+        "failed": failed,
+    }
+
+
+def result_differences(stored: Any, recomputed: Any, *, ignore: frozenset = ACCEPT_VOLATILE_KEYS,
+                       where: str = "") -> list[str]:
+    """Every difference between two accept results, keys in ``ignore`` skipped at any depth."""
+    if isinstance(stored, dict) and isinstance(recomputed, dict):
+        out = []
+        for k in sorted(set(stored) | set(recomputed), key=str):
+            if k in ignore:
+                continue
+            at = f"{where}.{k}" if where else str(k)
+            if k not in stored:
+                out.append(f"{at}: only in the recomputed result")
+            elif k not in recomputed:
+                out.append(f"{at}: only in the stored result")
+            else:
+                out += result_differences(stored[k], recomputed[k], ignore=ignore, where=at)
+        return out
+    if isinstance(stored, list) and isinstance(recomputed, list):
+        if len(stored) != len(recomputed):
+            return [f"{where}: {len(stored)} items stored, {len(recomputed)} recomputed"]
+        out = []
+        for i, (a, b) in enumerate(zip(stored, recomputed)):
+            out += result_differences(a, b, ignore=ignore, where=f"{where}[{i}]")
+        return out
+    both_nan = (isinstance(stored, float) and isinstance(recomputed, float)
+                and math.isnan(stored) and math.isnan(recomputed))
+    if (stored == recomputed and type(stored) is type(recomputed)) or both_nan:
+        return []
+    return [f"{where}: stored {stored!r} != recomputed {recomputed!r}"]
+
+
+def stage_accept(freeze_file: Path, datasets: Sequence[str], m_manifests: Sequence[str], *,
+                 recheck: bool = False, n_resamples: int = ACCEPT_RESAMPLES,
+                 command: Sequence[str] = ()) -> int:
+    """Plan §6.9f A-D, once. Returns 0 = evaluated and passed, :data:`EXIT_ACCEPT_FAILED`
+    = evaluated and failed, :data:`EXIT_REFUSED` = refused (nothing written); with
+    ``recheck``: 0 = the stored result reproduces, :data:`EXIT_RECHECK_DIFFERS` = not."""
+    import shutil
+    import tempfile
+
+    freeze_file = Path(freeze_file)
+    fp = freeze_paths(freeze_file)
+    problems: list[str] = []
+    if recheck:
+        if not fp["result"].exists():
+            problems.append(f"{fp['result']} does not exist: nothing to recheck")
+    else:
+        problems += [f"{fp[k]} already exists: M is evaluated once (--recheck reproduces it)"
+                     for k in ("result", "marker", "work") if fp[k].exists()]
+    inp, pr = _accept_inputs(freeze_file, datasets, m_manifests)
+    problems += pr
+    if problems:
+        print("accept REFUSED - nothing was written:")
+        for x in problems:
+            print(f"  - {x}")
+        return EXIT_REFUSED
+    if recheck:
+        stored_bytes = fp["result"].read_bytes()
+        stored = json.loads(stored_bytes.decode("utf-8"))
+        n_resamples, seed = int(stored["bootstrap"]["n_resamples"]), int(stored["bootstrap"]["seed"])
+        with tempfile.TemporaryDirectory(prefix="dline_accept_recheck_") as tmp:
+            new = _accept_result(freeze_file, inp, Path(tmp), n_resamples=n_resamples, seed=seed, command=command)
+        new = json.loads(_json_bytes(new).decode("utf-8"))
+        diffs = result_differences(stored, new)
+        try:
+            marker = json.loads(fp["marker"].read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            marker = {}
+        if marker.get("result_sha256") != hashlib.sha256(stored_bytes).hexdigest():
+            diffs.insert(0, f"{fp['marker']}: missing, or not the marker of the stored result's bytes")
+        if stored.get("code") != new.get("code"):
+            print(f"note: code state differs (stored {stored.get('code')}, now {new.get('code')}) - not compared")
+        if diffs:
+            print(f"recheck: {len(diffs)} difference(s) from {fp['result']}:")
+            for d in diffs:
+                print(f"  - {d}")
+            return EXIT_RECHECK_DIFFERS
+        print(f"recheck: identical to {fp['result']} (not compared: {sorted(ACCEPT_VOLATILE_KEYS)})")
+        return 0
+    fp["work"].mkdir()
+    try:
+        result = _accept_result(freeze_file, inp, fp["work"], n_resamples=n_resamples, seed=SEED, command=command)
+        for f in fp["work"].iterdir():
+            os.chmod(f, 0o444)
+        data = _json_bytes(result)
+        _write_once(fp["result"], data)
+    except BaseException:
+        shutil.rmtree(fp["work"], ignore_errors=True)
+        raise
+    _write_once(fp["marker"], _json_bytes({"result": str(fp["result"]),
+                                           "result_sha256": hashlib.sha256(data).hexdigest(),
+                                           "accepted_at_utc": _utc_now()}))
+    for model, r in result["models"].items():
+        c = r["criteria"]
+        print(f"[{model}] M {r['M']['windows']} windows / {r['M']['cells']} cells: "
+              + " ".join(f"{g}={'pass' if c[g]['passed'] else 'FAIL'}" for g in ("A", "B", "D"))
+              + f" (C, disclosed: TTFT-only recall {c['C']['critical_recall_ttft_only']} "
+                f"on {c['C']['windows']} windows)")
+    print(f"wrote {fp['result']} and {fp['marker']}")
+    if not result["passed"]:
+        print("acceptance FAILED:")
+        for x in result["failed"]:
+            print(f"  - {x}")
+        return EXIT_ACCEPT_FAILED
+    print("acceptance passed")
+    return 0
+
+
 # ---------------------------------------------------------------------------- CLI
 
 
@@ -1178,17 +2079,18 @@ def _read_json(path: Path) -> dict:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("stage", choices=["trainset", "alpha", "wp", "final", "summary"])
+    ap.add_argument("stage", choices=["trainset", "alpha", "wp", "final", "summary", "freeze", "verify-freeze",
+                                      "accept"])
     ap.add_argument("--model", action="append", default=[],
                     help="model (repeatable for summary; trainset: restrict the training CSVs written)")
     ap.add_argument("--arm", choices=ARMS, default="primary")
-    ap.add_argument("--fit-dir", type=Path, required=True,
+    ap.add_argument("--fit-dir", type=Path, default=None,
                     help="directory of the training CSVs (<model>_fitting.csv ...; the trainset stage "
                          "writes them); for several models a template with {model}, e.g. /r/{model}/fit/fit")
     ap.add_argument("--out-dir", type=Path, default=None)
     ap.add_argument("--dataset", action="append", default=[], metavar="[RUN=]DIR",
                     help="trainset: a standard dataset (calibration_dataset) to cut the training set "
-                         "from; its sealed split is M and is skipped unread")
+                         "from; its sealed split is M and is skipped unread. accept: a dataset holding M")
     ap.add_argument("--h2-dataset", action="append", default=[], metavar="[RUN=]DIR",
                     help="trainset: a standard dataset whose sealed split joins H2 (D16: run 1 and run 2); "
                          "its constant-load train / auxiliary cells still train")
@@ -1209,7 +2111,33 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--no-holdout", action="store_true",
                     help="final: stop after the verdict; never open <model>_validation.csv (M is "
                          "evaluated once, after it is frozen - plan §6.11 note 9)")
+    ap.add_argument("--freeze-file", type=Path, default=None,
+                    help="freeze: the parameter freeze to write; verify-freeze / accept: the one to read")
+    ap.add_argument("--m-manifest", action="append", default=[],
+                    help="accept: an M manifest (<M root>/<model>/M_manifest.json), one per frozen model")
+    ap.add_argument("--recheck", action="store_true",
+                    help="accept: recompute in a temp dir and compare with the stored result; writes nothing")
+    ap.add_argument("--accept-resamples", type=int, default=ACCEPT_RESAMPLES,
+                    help="accept: cell-bootstrap resamples of the A-C intervals")
     args = ap.parse_args(argv)
+    command = ["python", "-m", "scripts.dline_refit", *(sys.argv[1:] if argv is None else argv)]
+
+    if args.stage in ("verify-freeze", "accept"):
+        if args.freeze_file is None:
+            ap.error(f"{args.stage} needs --freeze-file")
+        if args.stage == "accept":
+            return stage_accept(args.freeze_file, args.dataset, args.m_manifest, recheck=args.recheck,
+                                n_resamples=args.accept_resamples, command=command)
+        try:
+            doc = verify_freeze(args.freeze_file)
+        except FreezeError as exc:
+            print(f"verify-freeze REFUSED: {exc}")
+            return EXIT_REFUSED
+        print(f"OK {sha256_file(args.freeze_file)}  {args.freeze_file} (freeze_sha256 {doc['freeze_sha256']}, "
+              f"models {sorted(doc['models'])})")
+        return 0
+    if args.fit_dir is None:
+        ap.error(f"stage {args.stage} needs --fit-dir")
 
     def fit_dir(model: str) -> Path:
         text = str(args.fit_dir)
@@ -1248,6 +2176,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         own = {fit_dir(m) / TRAINING_LEDGER for m in models}
         return [str(q) for q in sorted(own) if q.exists()]
 
+    if args.stage == "freeze":
+        if args.freeze_file is None:
+            ap.error("freeze needs --freeze-file")
+        try:
+            doc = stage_freeze(args.out_dir, fit_dir, args.model, args.arm, args.freeze_file, command=command)
+        except FreezeError as exc:
+            print(f"freeze REFUSED - nothing was written ({len(exc.problems)} problem(s)):")
+            for x in exc.problems:
+                print(f"  - {x}")
+            return EXIT_REFUSED
+        for model, e in doc["models"].items():
+            q = e["published"]
+            print(f"[{model}] theta={q['theta']:.6g} w_p={q['w_p']:g} tau_s={q['tau_s']:g} "
+                  f"lambda_wait={q['lambda_wait']:g} delta_crit={q['delta_crit']:g} delta_high={q['delta_high']:g}")
+        print(f"wrote {args.freeze_file} (freeze_sha256 {doc['freeze_sha256']}) and "
+              f"{freeze_paths(args.freeze_file)['sidecar']}")
+        return 0
     if args.stage == "summary":
         lp = ledger_paths(args.model)
         doc = stage_summary(args.out_dir, {m: fit_dir(m) for m in args.model},
