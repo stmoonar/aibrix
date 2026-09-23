@@ -188,10 +188,40 @@ FAMILIES: dict[str, tuple[str, ...]] = {
 
 MODELS = ("dsqwen-7b", "dsllama-8b", "dsqwen-14b")
 
+#: The acceptance set M's new shapes (plan 2026-09-21 §6.11 / §6.9f, composition fixed by
+#: the user): held out like ``M``, driven only by ``scripts.calibration_acceptance``, and
+#: deliberately in neither :data:`TRAINING_SHAPES` nor :data:`ALL_SHAPES`, so no default
+#: campaign, schedule set or fit ever sees them.
+#:
+#: * ``MP`` - prefill-leaning mixture 70/30: 0.7 x {2048-3072 in, 64-96 out} + 0.3 x
+#:   {256 in, 128 out} (load shares). The TTFT-only violations M must contain come from
+#:   its long prompts queueing behind each other.
+#: * ``MD`` - decode-leaning mixture 30/70: 0.3 x {256 in, 128 out} + 0.7 x {128-384 in,
+#:   384-576 out}. The plan names only "30/70"; the decode-heavy component is the mirror
+#:   of MP's prefill-heavy one (short prompt, long generation, sampled so that no training
+#:   shape is reproduced).
+#: * ``G800x240`` - the static grid's held-out slice (between S2/S5 and T8 in the
+#:   (input, output) plane; the committed grid is 400/1200 x 160/320).
+#: * ``U512x512`` - a shape no training cell ever used (i512_o512).
+#:
+#: Names carry no underscore: ``rewindow_from_raw`` reads the shape back from the cell
+#: directory name ``<model>_<shape>_<rest>``.
+ACCEPTANCE_SHAPES: dict[str, tuple[tuple[float, "int | TokenRange", "int | TokenRange"], ...]] = {
+    "MP": ((0.70, TokenRange(2048, 3072), TokenRange(64, 96)), (0.30, 256, 128)),
+    "MD": ((0.30, 256, 128), (0.70, TokenRange(128, 384), TokenRange(384, 576))),
+    "G800x240": ((1.0, 800, 240),),
+    "U512x512": ((1.0, 512, 512),),
+}
+
 
 def is_held_out(shape_name: str) -> bool:
     """True for shapes that exist to validate a fit and must never enter one."""
-    return shape_name == MIXTURE_NAME
+    return shape_name == MIXTURE_NAME or shape_name in ACCEPTANCE_SHAPES
+
+
+def is_mixture(shape_name: str) -> bool:
+    """A shape of several streams (``M``, ``MP``, ``MD``): its cell id records 0/0."""
+    return len(shape_components(shape_name)) > 1
 
 
 # ---- static steady-state grid (opt-in: calibration_campaign --static-grid) ----
@@ -432,6 +462,8 @@ def shape_components(
     """
     if shape_name == MIXTURE_NAME:
         return MIXTURE
+    if shape_name in ACCEPTANCE_SHAPES:
+        return ACCEPTANCE_SHAPES[shape_name]
     if shape_name in SAMPLED_SHAPES:
         i, o = SAMPLED_SHAPES[shape_name]
         return ((1.0, i, o),)
@@ -868,7 +900,7 @@ def build_rho_profile_schedule(
     if int(load_code) <= 0:
         raise ValueError(f"load code must be positive, got {load_code}")
     components = shape_components(shape_name)
-    if shape_name == MIXTURE_NAME:
+    if len(components) > 1:
         cell_in, cell_out = 0, 0
     else:
         (_w, nominal_i, nominal_o), = components

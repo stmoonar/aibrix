@@ -307,7 +307,7 @@ class LadderRun:
         drain = self.gap()
         body, meta = design.cell_schedule(
             cell, self.capacity(cell.shape), anchor_rho=self.anchors.get(cell.shape),
-            cap=self.cap,
+            cap=self.cap, capacity_source=getattr(self, "capacity_source", "rho_priors"),
         )
         stem = cell.stem(attempt)
         schedule_path = self.schedule_dir / f"{stem}.json"

@@ -230,6 +230,14 @@ ROLE_STAGE = {
     ROLE_SMOKE: STAGE_DWELL,
 }
 
+#: The acceptance set M (``scripts.calibration_acceptance``): every cell it drives besides
+#: the boundary probes of its new shapes. Its shapes are held out (``gen.is_held_out``),
+#: so its split is always the holdout one - the role only names what the cell is.
+ROLE_ACCEPTANCE = "acceptance"
+STAGE_ACCEPTANCE = "acceptance"
+ROLES = (*ROLES, ROLE_ACCEPTANCE)
+ROLE_STAGE[ROLE_ACCEPTANCE] = STAGE_ACCEPTANCE
+
 SPLIT_TRAIN = "train"
 SPLIT_HOLDOUT = "holdout"
 #: Cells that are neither: boundary probes and sentinels.
@@ -237,6 +245,11 @@ SPLIT_AUXILIARY = "auxiliary"
 
 PROFILE_HOLD = "hold"
 PROFILE_RAMP = "ramp"
+#: The first round's time-varying primitives, driven by M on an explicit ``rho_profile``
+#: (``DesignCell.rho_profile``); the profile name is then also the cell's primitive.
+PROFILE_STEPS = "steps"
+PROFILE_BURSTS = "bursts"
+PROFILES_WITH_OWN_PRIMITIVE = frozenset({PROFILE_RAMP, PROFILE_STEPS, PROFILE_BURSTS})
 
 
 def split_for(role: str, shape: str) -> str:
@@ -692,7 +705,7 @@ def derived_seed(design_seed: int, *parts) -> int:
 
 
 def _nominal_cell_id(shape: str, code: int) -> str:
-    if gen.is_held_out(shape):
+    if gen.is_mixture(shape):
         return f"i0_o0_c{code}"
     (_w, i, o), = gen.shape_components(shape)
     return f"i{gen._length_nominal(i)}_o{gen._length_nominal(o)}_c{code}"
@@ -725,10 +738,15 @@ class DesignCell:
     warmup_s: float = WARMUP_S
     split: str = ""
     note: str = ""
+    #: An explicit ``[(start_s, end_s, rho), ...]`` load profile (rho of the capacity the
+    #: cell is scheduled against; overlapping segments add up). When set it is the cell's
+    #: load, whatever ``rho`` / ``profile`` say; the acceptance set's steps / bursts / ramp
+    #: cells use it.
+    rho_profile: Optional[list] = None
 
     @property
     def primitive(self) -> str:
-        return PROFILE_RAMP if self.profile == PROFILE_RAMP else gen.HOLD_PRIMITIVE
+        return self.profile if self.profile in PROFILES_WITH_OWN_PRIMITIVE else gen.HOLD_PRIMITIVE
 
     def stem(self, attempt: int = 1) -> str:
         """Output CSV / raw directory stem of one attempt - unique per cell and attempt."""
@@ -763,7 +781,7 @@ class CellFactory:
     def new(self, shape: str, role: str, duration_s: float, **fields) -> DesignCell:
         if role not in ROLES:
             raise ValueError(f"unknown role {role!r}")
-        if shape not in gen.ALL_SHAPES:
+        if shape not in gen.ALL_SHAPES and shape not in gen.ACCEPTANCE_SHAPES:
             raise ValueError(f"unknown shape {shape!r}")
         if role == ROLE_BOUNDARY:
             if fields.get("stage") not in (STAGE_COARSE, STAGE_BISECT):
@@ -819,7 +837,9 @@ def ramp_profile(
 def cell_schedule(cell: DesignCell, capacity_rps: float, *, anchor_rho: Optional[float],
                   cap=None, capacity_source: str = "rho_priors") -> tuple[dict, dict]:
     """(trace body, metadata) for a cell whose load is known."""
-    if cell.profile == PROFILE_RAMP:
+    if cell.rho_profile:
+        profile = [(float(a), float(b), float(r)) for a, b, r in cell.rho_profile]
+    elif cell.profile == PROFILE_RAMP:
         if anchor_rho is None:
             raise ValueError(f"{cell.cell_id}: a ramp needs its shape's rho*")
         profile = ramp_profile(anchor_rho, seconds=cell.duration_s)
