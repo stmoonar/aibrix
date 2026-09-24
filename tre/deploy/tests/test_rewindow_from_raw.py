@@ -183,6 +183,25 @@ def test_aggregate_window_matches_online_metrics_store(mode: str) -> None:
     assert offline.e2e_p95_ms == pytest.approx(online.e2e_p95_ms, abs=1e-6)
 
 
+def test_a_kv_cache_usage_key_on_the_instants_changes_no_rewindowed_row() -> None:
+    # kv_cache_usage (openloop.make_pod_metrics_sampler) is a diagnostic field of the
+    # instant sidecar: the fitting re-window must ignore it, None or a number.
+    records = _make_requests()
+    registry = load_registry(str(REGISTRY_PATH))
+    spec = registry.model(MODEL)
+    cell = r3_grid.GridCell.from_scenario_id("i512_o128_c8")
+    plain = _make_instant()
+    with_kv = [{**s, "kv_cache_usage": (None if k == 1 else 0.3 + 0.1 * k)}
+               for k, s in enumerate(plain)]
+    kw = dict(window_ms=10_000, step_ms=5_000, percentile_mode="bucket_upper",
+              min_latency_samples=0, instant_sample_interval_ms=5_000,
+              start_ms=1_000, end_ms=61_000)
+    base = rewindow_from_raw.rewindow_cell(records, plain, cell, spec, **kw)
+    extra = rewindow_from_raw.rewindow_cell(records, with_kv, cell, spec, **kw)
+    assert base and extra == base
+    assert all("kv_cache_usage" not in row for row in extra)
+
+
 def test_rewindow_cell_matches_online_trs_column() -> None:
     # The whole row (incl. the trs column) reuses r3_grid.compute_window_results, so an
     # offline 60s single-window row equals what the online driver would emit for that

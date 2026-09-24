@@ -140,6 +140,61 @@ def test_pod_sampler_requires_at_least_one_endpoint() -> None:
         openloop.make_pod_metrics_sampler([])
 
 
+def test_kv_cache_usage_prefers_the_current_name_and_falls_back_to_the_deprecated_one() -> None:
+    both = ('vllm:kv_cache_usage_perc{model_name="m"} 0.42\n'
+            'vllm:gpu_cache_usage_perc{model_name="m"} 0.99\n')
+    assert openloop.parse_pod_kv_cache_usage(both) == pytest.approx(0.42)
+    # only the deprecated name (VLLM_METRICS): the fallback
+    assert openloop.parse_pod_kv_cache_usage(VLLM_METRICS) == pytest.approx(0.61)
+    # several label sets of one pod are averaged, not summed
+    engines = ('vllm:kv_cache_usage_perc{model_name="m",engine="0"} 0.2\n'
+               'vllm:kv_cache_usage_perc{model_name="m",engine="1"} 0.4\n')
+    assert openloop.parse_pod_kv_cache_usage(engines) == pytest.approx(0.3)
+    assert openloop.parse_pod_kv_cache_usage('vllm:num_requests_running{m="m"} 1\n') is None
+    assert openloop.parse_pod_kv_cache_usage("# vllm:kv_cache_usage_perc 0.5\n") is None
+    # the queue gauges are unchanged by it
+    assert openloop.parse_pod_gauges(both) == {"waiting": 0.0, "running": 0.0, "swapping": 0.0}
+
+
+def test_pod_sampler_reports_the_mean_kv_cache_usage_over_the_pods_that_have_it() -> None:
+    bodies = {
+        "a": VLLM_METRICS,                                                   # 0.61 (fallback)
+        "b": VLLM_METRICS.replace("vllm:gpu_cache_usage_perc", "vllm:kv_cache_usage_perc")
+                         .replace("0.61", "0.21"),                            # 0.21 (current)
+        "c": 'vllm:num_requests_waiting{model_name="m"} 5.0\n',             # no KV gauge
+    }
+
+    def fetch(url: str) -> str:
+        if "dead" in url:
+            raise OSError("connection refused")
+        return bodies[url.split("//")[1].split(":")[0]]
+
+    urls = ["http://a:8000/metrics", "http://b:8000/metrics", "http://c:8000/metrics",
+            "http://dead:8000/metrics"]
+    snap = openloop.make_pod_metrics_sampler(urls, fetch=fetch)(0)
+    assert snap["kv_cache_usage"] == pytest.approx((0.61 + 0.21) / 2)   # mean, not sum
+    assert snap["waiting"] == 37.0 + 37.0 + 5.0 and snap["running"] == 24.0   # still summed
+    assert snap["pods_scraped"] == 3.0 and snap["scrape_errors"] == 1.0
+    none = openloop.make_pod_metrics_sampler(["http://c:8000/metrics"], fetch=fetch)(0)
+    assert none["kv_cache_usage"] is None and none["waiting"] == 5.0
+
+
+def test_the_sidecar_keeps_a_missing_kv_cache_usage_as_none() -> None:
+    import time as _time
+
+    snaps = iter([{"waiting": 1, "running": 2, "swapping": 0, "kv_cache_usage": None,
+                   "pods_scraped": 1, "scrape_errors": 0}])
+    sidecar = openloop._Sidecar(sampler=lambda _ts: next(snaps, None), interval_s=0.01,
+                                now_ms=lambda: 10_000)
+    sidecar.start()
+    deadline = _time.time() + 2.0
+    while not sidecar.samples and _time.time() < deadline:
+        _time.sleep(0.01)
+    rows = sidecar.stop()
+    assert rows[0]["kv_cache_usage"] is None and rows[0]["waiting"] == 1.0
+    assert rows[0]["running"] == 2.0 and rows[0]["on_live_grid"] is True
+
+
 # ------------------------------------------------------------- grid alignment
 
 
