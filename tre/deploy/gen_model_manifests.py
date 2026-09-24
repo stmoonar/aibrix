@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import os
 import re
 from pathlib import Path
@@ -8,7 +9,7 @@ from typing import Iterable
 
 import yaml
 
-from tre_common.registry import ModelSpec, NodeSpec, Registry, load_registry
+from tre_common.registry import ModelSpec, NodeSpec, Registry, ReissueSidecarSpec, load_registry
 
 ROUTABLE_LABEL = "tre.aibrix.io/routable"
 GPU_UUIDS_ANNOTATION = "tre.aibrix.io/gpu-uuids"
@@ -26,6 +27,14 @@ HTTPROUTE_PATHS = (
     "/generate",
     "/generatevideo",
 )
+
+#: Pod port every client uses (Service targetPort, model.aibrix.ai/port, gateway
+#: target-pod, SM, probes). vLLM listens here unless the reissue sidecar owns it.
+POD_PORT = 8000
+REISSUE_SCRIPT_PATH = Path(__file__).resolve().parents[1] / "reissue" / "tre_reissue" / "sidecar.py"
+REISSUE_MOUNT_DIR = "/opt/tre-reissue"
+REISSUE_SCRIPT_KEY = "sidecar.py"
+REISSUE_CONTAINER = "tre-reissue-sidecar"
 
 STARTUP_GATE_CLIENT = """\
 import json, os, time, urllib.request
@@ -57,15 +66,37 @@ def feasible_slots(registry: Registry, model: ModelSpec) -> list[tuple[str, tupl
     return slots[: model.max_replicas]
 
 
-def build_deployments(registry: Registry) -> list[dict]:
+def build_deployments(registry: Registry, *, reissue: ReissueSidecarSpec | None = None) -> list[dict]:
+    reissue = _reissue_spec(registry, reissue)
     deployments: list[dict] = []
     nodes = {node.name: node for node in registry.topology().nodes}
     bound_counts: dict[tuple[str, int], int] = {}
     for model in registry.models():
         for node_name, gpu_ids in feasible_slots(registry, model):
             _record_bound_budget(bound_counts, node_name, gpu_ids)
-            deployments.append(_deployment(model, nodes[node_name], gpu_ids))
+            deployments.append(_deployment(model, nodes[node_name], gpu_ids, reissue=reissue))
     return deployments
+
+
+def _reissue_spec(registry: Registry, override: ReissueSidecarSpec | None) -> ReissueSidecarSpec | None:
+    """The sidecar spec to render, or None when disabled (the default). An explicit
+    ``override`` (CLI) wins over the registry key ``reissue_sidecar``."""
+    spec = override if override is not None else getattr(registry, "reissue_sidecar", None)
+    return spec if spec is not None and spec.enabled else None
+
+
+def build_reissue_configmap(spec: ReissueSidecarSpec, *, script_path: Path = REISSUE_SCRIPT_PATH) -> dict:
+    """The ConfigMap shipping the sidecar script (the vLLM image already has aiohttp)."""
+    return {
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {
+            "name": spec.configmap,
+            "namespace": "default",
+            "labels": {"tre.aibrix.io/managed": "true", "app.kubernetes.io/name": REISSUE_CONTAINER},
+        },
+        "data": {REISSUE_SCRIPT_KEY: script_path.read_text(encoding="utf-8")},
+    }
 
 
 def deployment_name(model_name: str, node_name: str, gpu_ids: tuple[int, ...]) -> str:
@@ -74,8 +105,12 @@ def deployment_name(model_name: str, node_name: str, gpu_ids: tuple[int, ...]) -
 
 
 def build_model_deployment(registry: Registry, model_name: str, node_name: str, gpu_ids: tuple[int, ...]) -> dict:
+    # Used by the service-manager for runtime creates: the registry's reissue_sidecar
+    # setting applies, so a relocated binding looks exactly like a rendered one.
     nodes = {node.name: node for node in registry.topology().nodes}
-    return _deployment(registry.model(model_name), nodes[node_name], gpu_ids)
+    return _deployment(
+        registry.model(model_name), nodes[node_name], gpu_ids, reissue=_reissue_spec(registry, None)
+    )
 
 
 def build_services(registry: Registry) -> list[dict]:
@@ -176,13 +211,19 @@ def build_resources(
     *,
     gateway_namespace: str = GATEWAY_NAMESPACE,
     gateway_name: str = GATEWAY_NAME,
+    reissue: ReissueSidecarSpec | None = None,
 ) -> list[dict]:
+    spec = _reissue_spec(registry, reissue)
     return (
         [build_referencegrant(gateway_namespace=gateway_namespace)]
+        + ([build_reissue_configmap(spec)] if spec is not None else [])
         + build_services(registry)
         + build_httproutes(registry, gateway_namespace=gateway_namespace, gateway_name=gateway_name)
-        + build_deployments(registry)
+        + build_deployments(registry, reissue=spec if spec is not None else _DISABLED)
     )
+
+
+_DISABLED = ReissueSidecarSpec(enabled=False)
 
 
 def write_manifests(
@@ -191,12 +232,15 @@ def write_manifests(
     *,
     gateway_namespace: str = GATEWAY_NAMESPACE,
     gateway_name: str = GATEWAY_NAME,
+    reissue: ReissueSidecarSpec | None = None,
 ) -> list[Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
     for old in output_dir.glob("*.yaml"):
         old.unlink()
     written: list[Path] = []
-    for resource in build_resources(registry, gateway_namespace=gateway_namespace, gateway_name=gateway_name):
+    for resource in build_resources(
+        registry, gateway_namespace=gateway_namespace, gateway_name=gateway_name, reissue=reissue
+    ):
         path = output_dir / f"{resource['metadata']['name']}.yaml"
         path.write_text(yaml.safe_dump(resource, sort_keys=False), encoding="utf-8")
         written.append(path)
@@ -228,7 +272,9 @@ def _service(model: ModelSpec) -> dict:
     }
 
 
-def _deployment(model: ModelSpec, node: NodeSpec, gpu_ids: tuple[int, ...]) -> dict:
+def _deployment(
+    model: ModelSpec, node: NodeSpec, gpu_ids: tuple[int, ...], *, reissue: ReissueSidecarSpec | None = None
+) -> dict:
     gpu_value = ",".join(str(gpu) for gpu in gpu_ids)
     gpu_label_value = "-".join(str(gpu) for gpu in gpu_ids)
     cuda_value = ",".join(str(index) for index in range(model.tp_size))
@@ -268,7 +314,7 @@ def _deployment(model: ModelSpec, node: NodeSpec, gpu_ids: tuple[int, ...]) -> d
         GPU_UUIDS_ANNOTATION: gpu_uuid_value,
         "tre.aibrix.io/state": "hidden",
     }
-    return {
+    deployment = {
         "apiVersion": "apps/v1",
         "kind": "Deployment",
         "metadata": {"name": name, "namespace": "default", "labels": labels, "annotations": annotations},
@@ -336,6 +382,53 @@ def _deployment(model: ModelSpec, node: NodeSpec, gpu_ids: tuple[int, ...]) -> d
             },
         },
     }
+    if reissue is not None:
+        _add_reissue_sidecar(deployment, model, reissue)
+    return deployment
+
+
+def _add_reissue_sidecar(deployment: dict, model: ModelSpec, spec: ReissueSidecarSpec) -> None:
+    """vLLM -> 127.0.0.1:<vllm_port>; the sidecar takes the pod port and the readiness
+    probe (its /health is vLLM's /health, proxied), so everything that talks to the pod -
+    Service, gateway target-pod, service-manager, scrapers - is unchanged."""
+    pod = deployment["spec"]["template"]["spec"]
+    vllm = pod["containers"][0]
+    command = list(vllm["command"])
+    command[command.index("--host") + 1] = "127.0.0.1"
+    command[command.index("--port") + 1] = str(spec.vllm_port)
+    vllm["command"] = command
+    readiness = vllm.pop("readinessProbe")
+    vllm.pop("ports", None)
+    pod["volumes"].append(
+        {"name": REISSUE_CONTAINER, "configMap": {"name": spec.configmap, "defaultMode": 0o444}}
+    )
+    pod["containers"].append(
+        {
+            "name": REISSUE_CONTAINER,
+            "image": spec.image or model.vllm_image,
+            "imagePullPolicy": "IfNotPresent",
+            "command": ["python3", f"{REISSUE_MOUNT_DIR}/{REISSUE_SCRIPT_KEY}"],
+            "env": [
+                {"name": "TRE_REISSUE_LISTEN_PORT", "value": str(POD_PORT)},
+                {"name": "TRE_REISSUE_UPSTREAM", "value": f"http://127.0.0.1:{spec.vllm_port}"},
+                {"name": "TRE_REISSUE_GATEWAY_URL", "value": spec.gateway_url},
+                {"name": "TRE_REISSUE_MODEL", "value": model.name},
+                {"name": "TRE_REISSUE_MAX_DEPTH", "value": str(spec.max_depth)},
+                {"name": "TRE_REISSUE_CHAT_MODE", "value": spec.chat_mode},
+                {"name": "POD_NAME", "valueFrom": {"fieldRef": {"fieldPath": "metadata.name"}}},
+                # Same image as vLLM, but this container must not get the GPUs.
+                {"name": "NVIDIA_VISIBLE_DEVICES", "value": "void"},
+                {"name": "PYTHONUNBUFFERED", "value": "1"},
+            ],
+            "ports": [{"containerPort": POD_PORT, "protocol": "TCP"}],
+            "readinessProbe": readiness,
+            "resources": {
+                "requests": {"cpu": spec.cpu_request, "memory": spec.memory_request},
+                "limits": {"cpu": spec.cpu_limit, "memory": spec.memory_limit},
+            },
+            "volumeMounts": [{"name": REISSUE_CONTAINER, "mountPath": REISSUE_MOUNT_DIR, "readOnly": True}],
+        }
+    )
 
 
 def _dns_name(value: str) -> str:
@@ -364,16 +457,31 @@ def main(argv: Iterable[str] | None = None) -> None:
     parser.add_argument("--output-dir", default="tre/deploy/models")
     parser.add_argument("--gateway-namespace", default=os.environ.get("TRE_GATEWAY_NAMESPACE", GATEWAY_NAMESPACE))
     parser.add_argument("--gateway-name", default=os.environ.get("TRE_GATEWAY_NAME", GATEWAY_NAME))
+    parser.add_argument(
+        "--reissue-sidecar",
+        action="store_true",
+        help="render the reissue sidecar even if the registry does not enable it (canary/testing; "
+        "enable reissue_sidecar in the registry for a real rollout so service-manager creates match)",
+    )
+    parser.add_argument("--reissue-gateway-url", default=None, help="override reissue_sidecar.gateway_url")
     args = parser.parse_args(list(argv) if argv is not None else None)
     registry = load_registry(args.registry)
     errors = registry.validate()
     if errors:
         raise SystemExit("registry validation failed:" + chr(10) + chr(10).join(errors))
+    reissue = None
+    if args.reissue_sidecar or args.reissue_gateway_url:
+        reissue = registry.reissue_sidecar
+        if args.reissue_sidecar:
+            reissue = dataclasses.replace(reissue, enabled=True)
+        if args.reissue_gateway_url:
+            reissue = dataclasses.replace(reissue, gateway_url=args.reissue_gateway_url.rstrip("/"))
     written = write_manifests(
         registry,
         Path(args.output_dir),
         gateway_namespace=args.gateway_namespace,
         gateway_name=args.gateway_name,
+        reissue=reissue,
     )
     print(f"wrote {len(written)} resources to {args.output_dir}")
 

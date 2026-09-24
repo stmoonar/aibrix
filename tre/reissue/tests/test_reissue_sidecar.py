@@ -597,3 +597,19 @@ async def test_disabled_sidecar_is_a_pure_proxy():
         assert finishes(objs) == ["abort"]
         assert h.b.generation_requests() == []
         assert h.a.generation_requests()[0]["body"] == completion_body(20)
+
+
+def test_sidecar_script_only_needs_stdlib_and_aiohttp():
+    """The script ships via ConfigMap into the vLLM image (python3.12 + aiohttp)."""
+    import ast
+    import sys
+
+    tree = ast.parse(open(sc.__file__, encoding="utf-8").read())
+    roots = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            roots.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+            roots.add(node.module.split(".")[0])
+    stdlib = set(sys.stdlib_module_names)
+    assert {r for r in roots if r not in stdlib} <= {"aiohttp"}

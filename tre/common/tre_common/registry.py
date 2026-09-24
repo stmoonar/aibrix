@@ -130,10 +130,48 @@ def scale_max_replicas(spec: Any) -> int:
     return int(spec.max_replicas) if cap is None else int(cap)
 
 
+#: In-cluster address of the tre-v2 Envoy (Gateway tre-v2/tre-aibrix-eg; NodePort 31094).
+#: Envoy Gateway names the proxy Service envoy-<gw-namespace>-<gw-name>-<hash>, where the
+#: hash is derived from namespace/name only, so it is stable for this Gateway.
+DEFAULT_REISSUE_GATEWAY_URL = (
+    "http://envoy-tre-v2-tre-aibrix-eg-161007f9.envoy-gateway-system.svc.cluster.local:80"
+)
+REISSUE_CHAT_MODES = frozenset({"render", "continue_final_message"})
+
+
+@dataclass(frozen=True)
+class ReissueSidecarSpec:
+    """Registry key ``reissue_sidecar`` (tre/docs/design/20260924-reissue-sidecar.md).
+
+    Absent or ``enabled: false`` (the default) renders the model Deployments exactly as
+    before. Enabled, every model pod gets the reissue sidecar on :8000 and vLLM moves to
+    127.0.0.1:``vllm_port``. Read by ``make manifests`` AND by the service-manager when it
+    creates a Deployment at runtime (defrag/create), so the two never diverge."""
+
+    enabled: bool = False
+    gateway_url: str = DEFAULT_REISSUE_GATEWAY_URL
+    max_depth: int = 3
+    vllm_port: int = 8001
+    chat_mode: str = "render"
+    #: None = the model's vllm_image (it already ships python3 + aiohttp).
+    image: str | None = None
+    configmap: str = "tre-reissue-sidecar"
+    cpu_request: str = "50m"
+    cpu_limit: str = "250m"
+    memory_request: str = "64Mi"
+    memory_limit: str = "256Mi"
+
+
 class Registry:
-    def __init__(self, topology: ClusterTopology, models: list[ModelSpec]) -> None:
+    def __init__(
+        self,
+        topology: ClusterTopology,
+        models: list[ModelSpec],
+        reissue_sidecar: ReissueSidecarSpec | None = None,
+    ) -> None:
         self._topology = topology
         self._models = tuple(models)
+        self._reissue_sidecar = reissue_sidecar or ReissueSidecarSpec()
         self._model_index: dict[str, ModelSpec] = {}
         for model in models:
             self._model_index.setdefault(model.name, model)
@@ -149,6 +187,10 @@ class Registry:
 
     def topology(self) -> ClusterTopology:
         return self._topology
+
+    @property
+    def reissue_sidecar(self) -> ReissueSidecarSpec:
+        return self._reissue_sidecar
 
     def validate(self) -> list[str]:
         errors: list[str] = []
@@ -191,6 +233,17 @@ class Registry:
                 ):
                     errors.append(f"model {model.name}: alt_thresholds.{signal}.delta_high must be >= 0")
 
+        reissue = self._reissue_sidecar
+        if reissue.enabled:
+            if not reissue.gateway_url.startswith(("http://", "https://")):
+                errors.append("reissue_sidecar.gateway_url must be an http(s) URL")
+            if reissue.max_depth < 0:
+                errors.append("reissue_sidecar.max_depth must be non-negative")
+            if reissue.vllm_port in (8000,) or not (1 <= reissue.vllm_port <= 65535):
+                errors.append("reissue_sidecar.vllm_port must be a valid port other than 8000")
+            if reissue.chat_mode not in REISSUE_CHAT_MODES:
+                errors.append(f"reissue_sidecar.chat_mode must be one of {sorted(REISSUE_CHAT_MODES)}")
+
         seen_nodes: set[str] = set()
         for node in self._topology.nodes:
             if node.name in seen_nodes:
@@ -226,7 +279,32 @@ def _parse_registry(raw: dict[str, Any]) -> Registry:
     cluster = raw.get("cluster") or {}
     nodes = tuple(_parse_node(item) for item in cluster.get("nodes", []))
     models = [_parse_model(item) for item in raw.get("models", [])]
-    return Registry(ClusterTopology(nodes=nodes), models)
+    return Registry(ClusterTopology(nodes=nodes), models, _parse_reissue_sidecar(raw.get("reissue_sidecar")))
+
+
+def _parse_reissue_sidecar(raw: Any) -> ReissueSidecarSpec:
+    if not raw:
+        return ReissueSidecarSpec()
+    if not isinstance(raw, dict):
+        raise ValueError("reissue_sidecar must be a mapping")
+    defaults = ReissueSidecarSpec()
+    known = {name for name in ReissueSidecarSpec.__dataclass_fields__}
+    unknown = sorted(set(raw) - known)
+    if unknown:
+        raise ValueError(f"reissue_sidecar: unknown keys {unknown}")
+    return ReissueSidecarSpec(
+        enabled=bool(raw.get("enabled", defaults.enabled)),
+        gateway_url=str(raw.get("gateway_url", defaults.gateway_url)).rstrip("/"),
+        max_depth=int(raw.get("max_depth", defaults.max_depth)),
+        vllm_port=int(raw.get("vllm_port", defaults.vllm_port)),
+        chat_mode=str(raw.get("chat_mode", defaults.chat_mode)),
+        image=(str(raw["image"]) if raw.get("image") else None),
+        configmap=str(raw.get("configmap", defaults.configmap)),
+        cpu_request=str(raw.get("cpu_request", defaults.cpu_request)),
+        cpu_limit=str(raw.get("cpu_limit", defaults.cpu_limit)),
+        memory_request=str(raw.get("memory_request", defaults.memory_request)),
+        memory_limit=str(raw.get("memory_limit", defaults.memory_limit)),
+    )
 
 
 def _parse_node(raw: dict[str, Any]) -> NodeSpec:
