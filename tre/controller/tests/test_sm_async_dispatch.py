@@ -63,11 +63,11 @@ class FakeClient:
         self.calls.append(("defrag",))
         return {"ok": True}
 
-    async def scale_model_v2(self, model, delta, *, drain_s=None, async_op=False):
+    async def scale_model_v2(self, model, delta, *, drain_s=None, async_op=False, meta=None):
         self.calls.append(("scale_v2", model, delta, drain_s, async_op))
         return self._accept("scale")
 
-    async def set_binding_power_v2(self, serve_id, *, awake, drain_s=None, async_op=False):
+    async def set_binding_power_v2(self, serve_id, *, awake, drain_s=None, async_op=False, meta=None):
         self.calls.append(("power_v2", serve_id, awake, drain_s, async_op))
         return self._accept("power")
 

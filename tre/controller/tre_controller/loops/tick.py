@@ -181,6 +181,7 @@ def run_planner_tick(
     # TRE_SM_ASYNC: SM operations still running count as capacity in transit (a
     # pending wake claims its GPUs). Without pending operations this is cluster_view.
     plan_view, pending_events = with_pending_ops(cluster_view, queue, registry)
+    supersedable = getattr(queue, "supersedable_models", None)
     plan = build_plan(
         model_contexts=contexts,
         classifications=classifications,
@@ -192,6 +193,7 @@ def run_planner_tick(
         cluster_view=plan_view,
         cooldowns=_action_cooldowns(snapshot, queue) if action_cooldown else None,
         probe_backoff_models=_probe_backoff_models(safescale, snapshot.ts_ms),
+        supersedable_models=set(supersedable()) if callable(supersedable) else None,
     )
     if _prof_on:
         _plan_ns = time.perf_counter_ns() - _phase_t0
@@ -308,7 +310,14 @@ def with_pending_ops(
                     allocator.bind(serve_id, op.model, slot, awake=True)
                     bindings.append(Binding(serve_id, op.model, slot, awake=True))
         events.append(f"pending_op_incoming:{op.model}:+{op.delta}")
-    return ClusterView(topology=cluster_view.topology, bindings=tuple(bindings)), tuple(events)
+    return (
+        ClusterView(
+            topology=cluster_view.topology,
+            bindings=tuple(bindings),
+            draining=cluster_view.draining,
+        ),
+        tuple(events),
+    )
 
 
 def _probe_backoff_models(safescale: SafeScaleController | None, now_ms: int) -> set[str]:
@@ -676,7 +685,9 @@ def _awake_including_hidden(cluster_view: ClusterView | None) -> dict[str, int]:
     counts: dict[str, int] = {}
     for binding in cluster_view.bindings:
         counts.setdefault(binding.model, 0)
-        if binding.awake:
+        # A draining binding (SM staged sleep) is leaving: not part of the scaling-cap
+        # count, same as the SM (review M4). Empty draining set = main.
+        if binding.awake and binding.serve_id not in cluster_view.draining:
             counts[binding.model] += 1
     return counts
 

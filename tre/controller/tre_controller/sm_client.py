@@ -105,7 +105,13 @@ class ServiceManagerClient:
     # ------------------------------------------------------------------
 
     async def scale_model_v2(
-        self, model: str, delta: int, *, drain_s: float | None = None, async_op: bool = False
+        self,
+        model: str,
+        delta: int,
+        *,
+        drain_s: float | None = None,
+        async_op: bool = False,
+        meta: dict | None = None,
     ) -> dict:
         try:
             state = await self.get_state()
@@ -117,6 +123,8 @@ class ServiceManagerClient:
             body: dict[str, Any] = {"wake_replicas": target}
             if drain_s is not None:
                 body["drain_s"] = float(drain_s)
+            if meta is not None:
+                body["meta"] = meta
             response = await self._request(
                 "PUT",
                 f"/v2/models/{model}/target" + ("?async=1" if async_op else ""),
@@ -128,18 +136,49 @@ class ServiceManagerClient:
             return {"ok": False, "error": str(exc)}
 
     async def set_binding_power_v2(
-        self, serve_id: str, *, awake: bool, drain_s: float | None = None, async_op: bool = False
+        self,
+        serve_id: str,
+        *,
+        awake: bool,
+        drain_s: float | None = None,
+        async_op: bool = False,
+        meta: dict | None = None,
     ) -> dict:
         try:
             body: dict[str, Any] = {"awake": bool(awake)}
             if drain_s is not None:
                 body["drain_s"] = float(drain_s)
+            if meta is not None:
+                body["meta"] = meta
             response = await self._request(
                 "PUT",
                 f"/v2/bindings/{serve_id}/power" + ("?async=1" if async_op else ""),
                 json=body,
                 timeout_s=self._slow_timeout_s,
             )
+            return {"ok": True, "response": response}
+        except ServiceManagerError as exc:
+            return {"ok": False, "error": str(exc)}
+
+    async def set_routable_v2(
+        self, model: str, hidden_pods: tuple[str, ...], *, timeout_s: float
+    ) -> dict:
+        """Like set_routable, with a timeout covering the SM's bounded lock wait
+        (TRE_SM_SYNC_LOCK_WAIT_S) - review H2."""
+        try:
+            response = await self._request(
+                "PUT",
+                f"/v2/models/{model}/routable",
+                json={"hidden_pods": list(hidden_pods)},
+                timeout_s=timeout_s,
+            )
+            return {"ok": True, "response": response}
+        except ServiceManagerError as exc:
+            return {"ok": False, "error": str(exc)}
+
+    async def list_active_operations(self) -> dict:
+        try:
+            response = await self._request("GET", "/v2/async-operations?active=1&limit=1000")
             return {"ok": True, "response": response}
         except ServiceManagerError as exc:
             return {"ok": False, "error": str(exc)}

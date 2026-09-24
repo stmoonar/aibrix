@@ -160,6 +160,11 @@ class ControllerConfig:
     sm_async_op_timeout_s: float = 600.0
     sm_async_max_polls: int = 8
     sm_async_audit_on_failure: bool = True
+    # Review H2 (flags-on paths only): one-shot hide/unhide/SafeScale actions are
+    # retried with backoff for this long on 409/5xx/timeouts; routable calls get a
+    # timeout above the SM's TRE_SM_SYNC_LOCK_WAIT_S (30 s).
+    sm_oneshot_retry_s: float = 120.0
+    sm_routable_timeout_s: float = 45.0
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "ControllerConfig":
@@ -362,6 +367,8 @@ class ControllerConfig:
             sm_async_op_timeout_s=_get_positive_float(values, "TRE_SM_ASYNC_OP_TIMEOUT_S", 600.0),
             sm_async_max_polls=_get_positive_int(values, "TRE_SM_ASYNC_MAX_POLLS_PER_TICK", 8),
             sm_async_audit_on_failure=_get_bool(values, "TRE_SM_ASYNC_AUDIT_ON_FAILURE", True),
+            sm_oneshot_retry_s=_get_positive_float(values, "TRE_SM_ONESHOT_RETRY_S", 120.0),
+            sm_routable_timeout_s=_get_positive_float(values, "TRE_SM_ROUTABLE_TIMEOUT_S", 45.0),
         )
 
 

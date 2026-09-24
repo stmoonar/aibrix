@@ -190,6 +190,8 @@ def create_controller_dependencies(
             op_timeout_s=float(getattr(cfg, "sm_async_op_timeout_s", 600.0)),
             max_polls=int(getattr(cfg, "sm_async_max_polls", 8)),
             audit_on_failure=bool(getattr(cfg, "sm_async_audit_on_failure", True)),
+            oneshot_retry_s=float(getattr(cfg, "sm_oneshot_retry_s", 120.0)),
+            routable_timeout_s=float(getattr(cfg, "sm_routable_timeout_s", 45.0)),
         ),
         sm_client=sm_client,
         cluster_view_box=ClusterViewBox(),

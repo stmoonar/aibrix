@@ -54,6 +54,10 @@ class PlanConfig:
 class ClusterView:
     topology: ClusterTopology
     bindings: tuple[Binding, ...]
+    # serve_ids the SM reports as draining (staged sleep in flight, TRE_SM_HIDE_BEFORE_SLEEP):
+    # still awake + hidden, holding their GPUs, but LEAVING - not a replica of the model
+    # any more (review M4). Empty unless the SM exposes the flag.
+    draining: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -132,12 +136,16 @@ def build_plan(
     cluster_view: ClusterView | None = None,
     cooldowns: Mapping[str, str] | None = None,
     probe_backoff_models: set[str] | None = None,
+    supersedable_models: set[str] | None = None,
 ) -> PlanResult:
     active_probe_models = active_probe_models or set()
     # A13: models whose last SafeScale probe rolled back recently (no new HIGH proactive
     # probe until TRE_SAFESCALE_ROLLBACK_BACKOFF_MS has passed).
     probe_backoff_models = probe_backoff_models or set()
     inflight_models = inflight_models or set()
+    # TRE_SM_ASYNC review M3: models whose in-flight SM operation is a scale-down that a
+    # CRITICAL rescue scale-up may supersede (None/empty = main's rule).
+    supersedable_models = supersedable_models or set()
     actions: list[Action] = []
     deltas: dict[str, int] = {}
     delayed_down_models: set[str] = set()
@@ -211,7 +219,7 @@ def build_plan(
 
     if cfg.rescue_due:
         for recv in critical_receivers:
-            if recv.model_name in inflight_models:
+            if recv.model_name in inflight_models and recv.model_name not in supersedable_models:
                 continue
             if cooldown.blocks(recv.model_name, "up", critical=True):
                 continue

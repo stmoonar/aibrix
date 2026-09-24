@@ -37,7 +37,10 @@ class ClusterViewRefreshResult:
 
 def cluster_view_from_state(state: dict, topology: ClusterTopology) -> ClusterView:
     bindings = []
+    draining: set[str] = set()
     for item in state.get("bindings", []):
+        if item.get("draining"):
+            draining.add(str(item["serve_id"]))
         bindings.append(
             Binding(
                 serve_id=str(item["serve_id"]),
@@ -50,7 +53,7 @@ def cluster_view_from_state(state: dict, topology: ClusterTopology) -> ClusterVi
                 hidden=bool(item.get("hidden", False)),
             )
         )
-    return ClusterView(topology=topology, bindings=tuple(bindings))
+    return ClusterView(topology=topology, bindings=tuple(bindings), draining=frozenset(draining))
 
 
 async def refresh_cluster_view_once(
