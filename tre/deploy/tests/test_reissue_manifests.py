@@ -95,7 +95,7 @@ def test_registry_flag_adds_sidecar_configmap_and_moves_vllm(tmp_path):
         assert sidecar["ports"] == [{"containerPort": 8000, "protocol": "TCP"}]
         assert sidecar["readinessProbe"]["httpGet"] == {"path": "/health", "port": 8000}
         assert sidecar["readinessProbe"]["failureThreshold"] == 300
-        assert sidecar["resources"]["limits"]["cpu"] == "250m"
+        assert sidecar["resources"]["limits"]["cpu"] == "500m"
         env = {item["name"]: item.get("value") for item in sidecar["env"]}
         assert env["TRE_REISSUE_GATEWAY_URL"] == "http://gw.example:80"
         assert env["TRE_REISSUE_UPSTREAM"] == "http://127.0.0.1:8001"
@@ -103,6 +103,7 @@ def test_registry_flag_adds_sidecar_configmap_and_moves_vllm(tmp_path):
         assert env["TRE_REISSUE_MODEL"] == "m1"
         assert env["TRE_REISSUE_MAX_DEPTH"] == "3"
         assert env["NVIDIA_VISIBLE_DEVICES"] == "void"
+        assert env["TRE_REISSUE_REQUIRE_HIDDEN"] == "true"
         assert "CUDA_VISIBLE_DEVICES" not in env
         assert {"name": "tre-reissue-sidecar", "configMap": {"name": "tre-reissue-sidecar", "defaultMode": 0o444}} in pod["volumes"]
 
@@ -151,3 +152,9 @@ def test_disabled_deployment_is_not_mutated_by_sidecar_helper(tmp_path):
     gen.build_deployments(registry)
     assert plain == snapshot
     assert all(len(d["spec"]["template"]["spec"]["containers"]) == 1 for d in plain)
+
+
+def test_registry_cpu_limit_is_configurable(tmp_path):
+    registry = _registry(tmp_path, "reissue_sidecar: {enabled: true, cpu_limit: '1'}\n")
+    (deployment, *_) = gen.build_deployments(registry)
+    assert deployment["spec"]["template"]["spec"]["containers"][1]["resources"]["limits"]["cpu"] == "1"

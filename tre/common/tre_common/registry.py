@@ -157,7 +157,8 @@ class ReissueSidecarSpec:
     image: str | None = None
     configmap: str = "tre-reissue-sidecar"
     cpu_request: str = "50m"
-    cpu_limit: str = "250m"
+    #: 0.5 core (review M6): ~70 us CPU per streamed chunk measured off-pod -> ~7k chunks/s.
+    cpu_limit: str = "500m"
     memory_request: str = "64Mi"
     memory_limit: str = "256Mi"
 

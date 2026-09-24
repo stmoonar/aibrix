@@ -415,6 +415,9 @@ def _add_reissue_sidecar(deployment: dict, model: ModelSpec, spec: ReissueSideca
                 {"name": "TRE_REISSUE_MODEL", "value": model.name},
                 {"name": "TRE_REISSUE_MAX_DEPTH", "value": str(spec.max_depth)},
                 {"name": "TRE_REISSUE_CHAT_MODE", "value": spec.chat_mode},
+                # Fail closed (review H3): /sleep without X-TRE-Hidden: 1 is refused (409),
+                # so a service-manager without TRE_SM_HIDE_BEFORE_SLEEP cannot sleep the pod.
+                {"name": "TRE_REISSUE_REQUIRE_HIDDEN", "value": "true"},
                 {"name": "POD_NAME", "valueFrom": {"fieldRef": {"fieldPath": "metadata.name"}}},
                 # Same image as vLLM, but this container must not get the GPUs.
                 {"name": "NVIDIA_VISIBLE_DEVICES", "value": "void"},

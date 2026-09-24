@@ -220,7 +220,9 @@ def main() -> int:
         )
         pod_ip = pod["status"]["podIP"]
         _wait_vllm_ready(pod_ip, timeout_s=args.timeout_s)
-        _http_json(f"http://{pod_ip}:8000/sleep", method="POST")
+        # Bring-up pods are unroutable (tre.aibrix.io/routable=false until startup
+        # admission), so the reissue sidecar's hide-before-sleep check is satisfied.
+        _http_json(f"http://{pod_ip}:8000/sleep", method="POST", headers={"X-TRE-Hidden": "1"})
         _wait_until(
             lambda: _is_sleeping(pod_ip) is True,
             timeout_s=120.0,
@@ -414,13 +416,14 @@ def _http_json(
     method: str = "GET",
     payload: dict | None = None,
     timeout_s: float = 30.0,
+    headers: dict[str, str] | None = None,
 ):
     data = None if payload is None else json.dumps(payload).encode("utf-8")
     request = Request(
         url,
         data=data,
         method=method,
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json", **(headers or {})},
     )
     with urlopen(request, timeout=timeout_s) as response:
         text = response.read().decode("utf-8").strip()
