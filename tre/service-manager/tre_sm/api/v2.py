@@ -5,6 +5,7 @@ import json
 import logging
 import threading
 import time
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from dataclasses import replace
 from dataclasses import asdict
@@ -42,6 +43,7 @@ from tre_sm.ops.drain import (
     normalize_drain_s,
 )
 from tre_sm.ops.k8s_ops import StartupPodRecord
+from tre_sm.state.async_ops import AsyncOperationManager, AsyncOpJournal, AsyncOpsConfig
 from tre_sm.state.drain_markers import DrainMarker, DrainMarkerStore
 from tre_sm.state.reconcile import K8sPodClient, POD_STATE_AWAKE, POD_STATE_HIDDEN, POD_STATE_SLEEPING, audit_state, reconcile_state
 from tre_sm.state.operations import OperationBusy, OperationCoordinator, current_operation
@@ -89,6 +91,44 @@ class _StagedCall:
     result: dict
     sleeps: list[_StagedSleep] = field(default_factory=list)
     operation_id: str | None = None
+
+
+@dataclass
+class _AsyncOpContext:
+    """Set while an async operation's worker runs the (staged) call."""
+
+    operation_id: str
+    progress: Callable[[str, dict | None], None]
+    # Phase 1 (plan + hide + wakes) is persisted: a busy writer lock after this
+    # point must NOT restart the call (the drain recovery owns the markers).
+    phase1_done: bool = False
+
+
+_ASYNC_OP: ContextVar[_AsyncOpContext | None] = ContextVar(
+    "tre_sm_async_op", default=None
+)
+
+
+def _async_progress(stage: str, details: dict | None = None) -> None:
+    context = _ASYNC_OP.get()
+    if context is not None:
+        context.progress(stage, details)
+
+
+def _async_phase1_done(staged: "_StagedCall") -> None:
+    context = _ASYNC_OP.get()
+    if context is None:
+        return
+    context.phase1_done = True
+    if staged.sleeps:
+        # Lock-free stage: the next operation of this model may start now.
+        context.progress(
+            "draining",
+            {
+                "bindings": [item.binding.serve_id for item in staged.sleeps],
+                "drain_s": staged.sleeps[0].drain_s,
+            },
+        )
 
 
 class RuntimePodOps(Protocol):
@@ -169,6 +209,8 @@ class ServiceManagerV2:
         sleep_drainer: SleepDrainer | None = None,
         drain_markers: DrainMarkerStore | None = None,
         wall_clock: Callable[[], float] = time.time,
+        async_config: AsyncOpsConfig | None = None,
+        async_journal: AsyncOpJournal | None = None,
     ) -> None:
         self._registry = registry
         self._store = store
@@ -221,6 +263,18 @@ class ServiceManagerV2:
         self._instance_id = uuid4().hex
         self._inflight_tokens: set[str] = set()
         self._inflight_lock = threading.Lock()
+        # TRE_SM_ASYNC_OPS (default off): 202 + operation id for target/power.
+        self._async_config = async_config or AsyncOpsConfig()
+        self._async_ops: AsyncOperationManager | None = None
+        self._orphaned_async_ops: set[str] = set()
+        if self._async_config.enabled:
+            self._async_ops = AsyncOperationManager(
+                async_journal or AsyncOpJournal(getattr(store, "_redis", None)),
+                self._execute_async_op,
+                config=self._async_config,
+                instance=self._instance_id,
+                wall_clock=wall_clock,
+            )
         if (
             runtime_ops is not None
             and vllm_ops is not None
@@ -429,6 +483,7 @@ class ServiceManagerV2:
             "put_model_target",
             lambda: self._target_phase1(model, wake_replicas, deadline, drain_s),
         )
+        _async_phase1_done(staged)
         if not staged.sleeps:
             return staged.result
         outcomes, version = self._complete_staged(
@@ -536,6 +591,7 @@ class ServiceManagerV2:
             "put_binding_power",
             lambda: self._binding_power_phase1(serve_id, awake, deadline, drain_s),
         )
+        _async_phase1_done(staged)
         if not staged.sleeps:
             return staged.result
         outcomes, version = self._complete_staged(
@@ -693,6 +749,7 @@ class ServiceManagerV2:
         remaining = max(0.0, deadline - self._drainer.now())
         operation = current_operation()
         operation_id = getattr(operation, "operation_id", None)
+        async_context = _ASYNC_OP.get()
         tokens: list[tuple[Binding, str]] = []
         for binding in bindings:
             token = uuid4().hex
@@ -707,6 +764,9 @@ class ServiceManagerV2:
                 reason=reason,
                 operation_id=str(operation_id) if operation_id else None,
                 prior_hidden=binding.hidden,
+                async_op_id=(
+                    async_context.operation_id if async_context is not None else None
+                ),
             )
             tokens.append((binding, token))
         with self._inflight_lock:
@@ -781,6 +841,7 @@ class ServiceManagerV2:
         cfg = self._drain_config
         try:
             records = self._drain_staged(staged.sleeps, deadline - cfg.commit_reserve_s)
+            _async_progress("committing")
             try:
                 return self._run_locked(
                     kind,
@@ -1050,6 +1111,9 @@ class ServiceManagerV2:
         if marker.instance == self._instance_id:
             with self._inflight_lock:
                 return marker.token not in self._inflight_tokens
+        if marker.async_op_id is not None and marker.async_op_id in self._orphaned_async_ops:
+            # Its async operation was found orphaned (owner SM gone): recover now.
+            return True
         return self._wall_clock() > marker.deadline_at + self._drain_config.stale_grace_s
 
     def _recover_stale_drains_locked(self) -> list[dict]:
@@ -1124,6 +1188,10 @@ class ServiceManagerV2:
         if new_bindings != snapshot.bindings:
             self._store.save(new_bindings, expected_version=snapshot.version)
         self._drain_markers.save(markers)
+        if self._orphaned_async_ops:
+            self._orphaned_async_ops.intersection_update(
+                marker.async_op_id for marker in markers.values() if marker.async_op_id
+            )
         if desired_updates:
             self._update_desired(
                 desired_updates, updated_by="service-manager-api", reason="drain_recovery"
@@ -1508,6 +1576,8 @@ class ServiceManagerV2:
 
     @serialized_operation("reconcile")
     def reconcile(self, *, drop_missing: bool = False) -> dict:
+        if self._async_ops is not None:
+            self._mark_orphaned_async_ops()
         if self._hide_enabled:
             self._recover_stale_drains_locked()
         return self._reconcile_unlocked(drop_missing=drop_missing)
@@ -1992,7 +2062,203 @@ class ServiceManagerV2:
             return []
         return self._operation_coordinator.list_operations(limit=limit)
 
+    # ------------------------------------------------------------------
+    # Async operations (TRE_SM_ASYNC_OPS): validate + persist the request,
+    # answer 202 {operation_id, plan}, run the (staged) call in a worker.
+    # ------------------------------------------------------------------
+
+    @property
+    def async_enabled(self) -> bool:
+        return self._async_ops is not None
+
+    def list_async_operations(self, *, limit: int = 100) -> list[dict]:
+        if self._async_ops is None:
+            return []
+        return self._async_ops.list(limit=limit)
+
+    def wait_async_operation(self, operation_id: str, *, timeout_s: float | None = None) -> bool:
+        if self._async_ops is None:
+            return True
+        return self._async_ops.wait(operation_id, timeout_s=timeout_s)
+
+    def submit_model_target(
+        self, model: str, *, wake_replicas: int, drain_s: float | None = None
+    ) -> dict:
+        if self._async_ops is None:
+            raise ValueError("async operations are disabled (TRE_SM_ASYNC_OPS)")
+        drain_s = self._normalize_call_drain(drain_s)
+        spec = self._registry.model(model)
+        if wake_replicas < 0:
+            raise ValueError("wake_replicas must be non-negative")
+        plan = self._preview_model_target(model, spec, wake_replicas)
+        record = self._async_ops.submit(
+            kind="model_target",
+            model=model,
+            target_key=f"model:{model}",
+            request={"wake_replicas": int(wake_replicas), "drain_s": drain_s},
+            plan=plan,
+        )
+        return _accepted_view(record)
+
+    def submit_binding_power(
+        self, serve_id: str, *, awake: bool, drain_s: float | None = None
+    ) -> dict:
+        if self._async_ops is None:
+            raise ValueError("async operations are disabled (TRE_SM_ASYNC_OPS)")
+        drain_s = self._normalize_call_drain(drain_s)
+        snapshot = self._store.load()
+        binding = next(
+            (item for item in snapshot.bindings if item.serve_id == serve_id), None
+        )
+        if binding is None:
+            raise ValueError(f"unknown binding: {serve_id}")
+        draining_ids = self._draining_binding_ids(snapshot.bindings)
+        is_draining = binding.binding_id in draining_ids
+        if awake and (is_draining or not binding.awake):
+            self._ensure_wake_within_cap(
+                binding, snapshot.bindings, draining_ids=draining_ids
+            )
+            if not binding.awake:
+                self._ensure_feasible_wake(binding, snapshot.bindings)
+        if awake:
+            action = "reclaim" if is_draining else ("none" if binding.awake else "wake")
+        else:
+            action = "none" if (is_draining or not binding.awake) else "sleep"
+        record = self._async_ops.submit(
+            kind="binding_power",
+            model=binding.model,
+            target_key=f"binding:{serve_id}",
+            request={"serve_id": serve_id, "awake": bool(awake), "drain_s": drain_s},
+            plan={
+                "preview": True,
+                "serve_id": serve_id,
+                "model": binding.model,
+                "awake": bool(awake),
+                "currently_awake": bool(binding.awake and not is_draining),
+                "draining": is_draining,
+                "action": action,
+            },
+        )
+        return _accepted_view(record)
+
+    def _preview_model_target(self, model: str, spec, wake_replicas: int) -> dict:
+        """Read-only plan at accept time (no lock): the worker re-plans for real.
+        Raises like the synchronous call would (cap -> 400, WakeConflict -> 409)."""
+        snapshot = self._store.load()
+        draining_ids = self._draining_binding_ids(snapshot.bindings)
+        self._ensure_target_within_cap(
+            model, spec, wake_replicas, snapshot.bindings, draining_ids=draining_ids
+        )
+        model_bindings = [binding for binding in snapshot.bindings if binding.model == model]
+        if self._runtime_ops is not None and wake_replicas > len(model_bindings) and not self._has_deployment_ops():
+            raise ValueError("runtime create is not implemented for target growth beyond existing bindings")
+        plan = self._plan_model_target(
+            model=model,
+            wake_replicas=wake_replicas,
+            bindings=snapshot.bindings,
+            tp_size=spec.tp_size,
+            draining_ids=draining_ids,
+        )
+        serving = sum(
+            1
+            for binding in model_bindings
+            if binding.awake and binding.binding_id not in draining_ids
+        )
+        return {
+            "preview": True,
+            "model": model,
+            "target": int(wake_replicas),
+            "serving": serving,
+            "draining": sum(1 for binding in model_bindings if binding.binding_id in draining_ids),
+            "direction": (
+                "up" if wake_replicas > serving else "down" if wake_replicas < serving else "none"
+            ),
+            "wake": [binding.serve_id for binding in plan["wake"]],
+            "reclaim": [binding.serve_id for binding in plan["reclaim"]],
+            "sleep": [binding.serve_id for binding in plan["sleep"]],
+            "create": len(plan["create"]),
+        }
+
+    def _execute_async_op(self, record: dict, progress) -> tuple[str, dict]:
+        """Worker body: run the same call the synchronous endpoint runs."""
+        context = _AsyncOpContext(str(record["operation_id"]), progress)
+        token = _ASYNC_OP.set(context)
+        cfg = self._async_config
+        request = record.get("request") or {}
+        started = time.monotonic()
+        waiting_reported = False
+        try:
+            while True:
+                try:
+                    if record["kind"] == "model_target":
+                        result = self.put_model_target(
+                            str(record["model"]),
+                            wake_replicas=int(request["wake_replicas"]),
+                            drain_s=request.get("drain_s"),
+                        )
+                    else:
+                        result = self.put_binding_power(
+                            str(request["serve_id"]),
+                            awake=bool(request["awake"]),
+                            drain_s=request.get("drain_s"),
+                        )
+                    break
+                except OperationBusy:
+                    # Only a lock that was busy BEFORE phase 1 persisted anything
+                    # is retried; later the drain recovery owns the outcome.
+                    if context.phase1_done or time.monotonic() - started >= cfg.lock_wait_s:
+                        raise
+                    if not waiting_reported:
+                        progress("waiting_lock", None)
+                        waiting_reported = True
+                    time.sleep(cfg.lock_retry_s)
+        except SleepCommitFailed as exc:
+            view = _async_result_view({"sleep_outcomes": exc.outcomes, "version": exc.version})
+            return "failed", {**view, "error": str(exc), "error_code": "sleep_commit_failed"}
+        except WakeConflict as exc:
+            return "failed", {"error": f"WakeConflict: {exc}", "error_code": "wake_conflict"}
+        except OperationBusy as exc:
+            return "failed", {
+                "error": f"OperationBusy: {exc}",
+                "error_code": "writer_busy",
+                "phase1_done": context.phase1_done,
+            }
+        except Exception as exc:
+            return "failed", {"error": f"{type(exc).__name__}: {exc}", "error_code": "error"}
+        finally:
+            _ASYNC_OP.reset(token)
+        view = _async_result_view(result)
+        status = "superseded" if view["summary"]["abandoned"] else "succeeded"
+        return status, view
+
+    def _mark_orphaned_async_ops(self) -> list[dict]:
+        if self._async_ops is None:
+            return []
+        orphaned = self._async_ops.recover_orphans()
+        self._orphaned_async_ops.update(str(item["operation_id"]) for item in orphaned)
+        return orphaned
+
+    def recover_orphaned_async_ops(self) -> dict | None:
+        """Supervisor tick: fail the async operations of a dead SM instance and
+        let the drain recovery finish (desired state wins) the sleeps they staged."""
+        if self._async_ops is None:
+            return None
+        orphaned = self._mark_orphaned_async_ops()
+        recovered = None
+        if self._orphaned_async_ops and self._hide_enabled:
+            recovered = self.recover_stale_drains()
+        if not orphaned and recovered is None:
+            return None
+        return {
+            "orphaned": [str(item["operation_id"]) for item in orphaned],
+            "drain_recovery": recovered,
+        }
+
     def get_operation(self, operation_id: str) -> dict:
+        if self._async_ops is not None:
+            record = self._async_ops.get(operation_id)
+            if record is not None:
+                return record
         if self._operation_coordinator is None:
             raise KeyError(operation_id)
         operation = self._operation_coordinator.get_operation(operation_id)
@@ -2697,6 +2963,13 @@ class StartupAdmissionRequest(BaseModel):
     pod_name: str
     pod_uid: str
 
+def _wants_async(http_request: Request) -> bool:
+    raw = str(http_request.query_params.get("async", "")).strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    return "respond-async" in http_request.headers.get("prefer", "").lower()
+
+
 def create_app(service: ServiceManagerV2) -> FastAPI:
     app = FastAPI()
     app.include_router(create_v1_compat_router(service))
@@ -2796,6 +3069,15 @@ def create_app(service: ServiceManagerV2) -> FastAPI:
         return {"operations": service.list_operations(limit=limit)}
 
 
+    @app.get("/v2/async-operations")
+    def list_async_operations(limit: int = 100) -> dict:
+        if limit < 1 or limit > 1000:
+            raise HTTPException(status_code=400, detail="limit must be between 1 and 1000")
+        return {
+            "enabled": service.async_enabled,
+            "operations": service.list_async_operations(limit=limit),
+        }
+
     @app.get("/v2/operations/{operation_id}")
     def get_operation(operation_id: str) -> dict:
         try:
@@ -2834,8 +3116,15 @@ def create_app(service: ServiceManagerV2) -> FastAPI:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.put("/v2/models/{model}/target")
-    def put_model_target(model: str, request: TargetRequest) -> dict:
+    def put_model_target(model: str, request: TargetRequest, http_request: Request) -> dict:
         try:
+            if service.async_enabled and _wants_async(http_request):
+                return JSONResponse(
+                    status_code=202,
+                    content=service.submit_model_target(
+                        model, wake_replicas=request.wake_replicas, drain_s=request.drain_s
+                    ),
+                )
             return service.put_model_target(
                 model, wake_replicas=request.wake_replicas, drain_s=request.drain_s
             )
@@ -2845,8 +3134,17 @@ def create_app(service: ServiceManagerV2) -> FastAPI:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.put("/v2/bindings/{serve_id}/power")
-    def put_binding_power(serve_id: str, request: BindingPowerRequest) -> dict:
+    def put_binding_power(
+        serve_id: str, request: BindingPowerRequest, http_request: Request
+    ) -> dict:
         try:
+            if service.async_enabled and _wants_async(http_request):
+                return JSONResponse(
+                    status_code=202,
+                    content=service.submit_binding_power(
+                        serve_id, awake=request.awake, drain_s=request.drain_s
+                    ),
+                )
             return service.put_binding_power(
                 serve_id, awake=request.awake, drain_s=request.drain_s
             )
@@ -2856,6 +3154,77 @@ def create_app(service: ServiceManagerV2) -> FastAPI:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     return app
+
+def _accepted_view(record: dict) -> dict:
+    return {
+        "async_operation": True,
+        "operation_id": record["operation_id"],
+        "status": record["status"],
+        "kind": record["kind"],
+        "model": record["model"],
+        "plan": record.get("plan") or {},
+        "supersedes": list(record.get("supersedes") or []),
+        "status_url": f"/v2/operations/{record['operation_id']}",
+    }
+
+
+def _async_result_view(result: dict) -> dict:
+    """Per-binding results of one (staged or legacy) target/power call."""
+    outcomes = result.get("sleep_outcomes")
+    bindings: list[dict] = []
+    summary: dict = {
+        "woken": [],
+        "created": [],
+        "reclaimed": [],
+        "slept": [],
+        "abandoned": [],
+        "errors": [],
+        "drained_s": {},
+        "interrupted": None,
+    }
+    for action in result.get("actions", []):
+        kind = action.get("action")
+        serve_id = action.get("serve_id")
+        if kind in ("wake", "create", "reclaim"):
+            outcome = {"wake": "woken", "create": "created", "reclaim": "reclaimed"}[kind]
+            bindings.append({"serve_id": serve_id, "action": kind, "outcome": outcome})
+            summary[outcome].append(serve_id)
+        elif kind == "sleep" and outcomes is None:
+            # Legacy (hide off) sleep: immediate, no drain information.
+            bindings.append(
+                {"serve_id": serve_id, "action": "sleep", "outcome": "slept", "drained_s": None}
+            )
+            summary["slept"].append(serve_id)
+    interrupted: int | None = None
+    for item in outcomes or []:
+        serve_id = item.get("serve_id")
+        entry = {
+            "serve_id": serve_id,
+            "action": "sleep",
+            "outcome": item.get("outcome"),
+            "drained": item.get("drained"),
+            "drained_s": item.get("drained_s"),
+            "drain_budget_s": item.get("drain_budget_s"),
+            "interrupted": item.get("interrupted"),
+        }
+        if item.get("error"):
+            entry["error"] = item["error"]
+        bindings.append(entry)
+        outcome = str(item.get("outcome") or "")
+        if outcome == "slept":
+            summary["slept"].append(serve_id)
+            summary["drained_s"][serve_id] = item.get("drained_s")
+            if item.get("interrupted") is not None:
+                interrupted = (interrupted or 0) + int(item["interrupted"])
+        elif outcome.startswith("abandoned"):
+            summary["abandoned"].append(serve_id)
+        elif outcome in ("rolled_back", "sleep_unverified"):
+            summary["errors"].append(
+                {"serve_id": serve_id, "outcome": outcome, "error": item.get("error")}
+            )
+    summary["interrupted"] = interrupted
+    return {"result": result, "bindings": bindings, "summary": summary}
+
 
 def _drain_summary(record: dict | None) -> dict:
     """Per-binding drain facts for sleep outcomes / async operation results."""

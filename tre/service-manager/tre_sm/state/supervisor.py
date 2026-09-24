@@ -83,6 +83,15 @@ class FleetSupervisor:
 
     def run_once(self) -> None:
         self._service.converge_startups()
+        # Async operations (TRE_SM_ASYNC_OPS): fail the ones a dead SM instance
+        # left running; their draining markers become stale at once and the
+        # drain recovery below finishes them. Absent on older services.
+        recover_async = getattr(self._service, "recover_orphaned_async_ops", None)
+        if callable(recover_async):
+            try:
+                recover_async()
+            except OperationBusy:
+                pass
         # Staged sleeps (TRE_SM_HIDE_BEFORE_SLEEP): resolve draining markers
         # whose owner died or ran out of time. Absent on older services.
         recover_drains = getattr(self._service, "recover_stale_drains", None)

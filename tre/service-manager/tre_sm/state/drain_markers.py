@@ -55,9 +55,18 @@ class DrainMarker:
     reason: str
     operation_id: str | None = None
     prior_hidden: bool = False
+    # The async operation (TRE_SM_ASYNC_OPS) that staged this sleep, if any: when
+    # that operation is found orphaned (its SM died) the marker is recovered at
+    # once instead of waiting for deadline + grace.
+    async_op_id: str | None = None
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        record = asdict(self)
+        if record.get("async_op_id") is None:
+            # Keep the stored document identical to the pre-async format so an
+            # older SM (DrainMarker(**item)) can still read it after a rollback.
+            record.pop("async_op_id", None)
+        return record
 
 
 class DrainMarkerStore:

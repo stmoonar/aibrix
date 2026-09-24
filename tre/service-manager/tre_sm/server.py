@@ -14,6 +14,7 @@ from tre_sm.gpu_truth import RedisGpuTruth
 from tre_sm.ops.drain import DrainConfig, check_reissue_coupling
 from tre_sm.ops.k8s_ops import K8sOps
 from tre_sm.ops.vllm_ops import VllmOps
+from tre_sm.state.async_ops import AsyncOpsConfig
 from tre_sm.state.drain_markers import DrainMarkerStore
 from tre_sm.state.reconcile import PodRecord
 from tre_sm.state.operations import OperationCoordinator
@@ -47,6 +48,8 @@ def create_app() -> FastAPI:
     # the reissue sidecar without HIDE, is a startup error.
     drain_config = DrainConfig.from_env(os.environ)
     check_reissue_coupling(registry, drain_config)
+    # TRE_SM_ASYNC_OPS (default off): 202 + operation id for target/power calls.
+    async_config = AsyncOpsConfig.from_env(os.environ)
     redis_url = os.environ.get("TRE_REDIS_URL", "redis://aibrix-redis-master:6379/0")
     redis_client = redis.Redis.from_url(redis_url)
     k8s_ops = _create_k8s_ops(registry)
@@ -106,6 +109,7 @@ def create_app() -> FastAPI:
         ),
         drain_config=drain_config,
         drain_markers=DrainMarkerStore(redis_client, require_fence=True),
+        async_config=async_config,
     )
 
 
