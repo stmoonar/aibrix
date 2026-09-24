@@ -463,9 +463,73 @@ def _shapes_match(value) -> bool:
     return isinstance(value, list) and value == list(SHAPES)
 
 
+#: The keys an amendment may override (``overrides``, dotted): only what binds the second
+#: parameter set. The design (``t14.*``: shapes, factors, seeds, capacity prior) is never
+#: amendable - a different design is a new preregistration, not an amendment.
+AMENDABLE_KEYS = ("parameter_sets.v1lambda.sha256", "parameter_sets.v1lambda.path",
+                  "parameter_sets.v1lambda.freeze_sha256")
+
+
+def _read_sidecar_checked(path: Path, what: str) -> tuple[dict, str]:
+    """(JSON document, sha256) of ``path`` after checking its sha256sum sidecar."""
+    side = Path(f"{path}.sha256")
+    if not path.is_file():
+        raise ValueError(f"no {what} at {path}")
+    if not side.is_file():
+        raise ValueError(f"{side} is missing: the {what} has no sha256 sidecar")
+    parts = side.read_text(encoding="utf-8").split()
+    if len(parts) != 2 or len(parts[0]) != 64:
+        raise ValueError(f"{side}: not a sha256sum line ('<hex>  <name>')")
+    want, name = parts[0].lower(), parts[1].lstrip("*")
+    got = _file_sha256(path)
+    if Path(name).name != path.name:
+        raise ValueError(f"{side} names {name!r}, not {path.name!r}")
+    if got != want:
+        raise ValueError(f"{path}: sha256 {got} != {want} in {side.name}: the {what} changed "
+                         "after its sidecar was written")
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except ValueError as exc:
+        raise ValueError(f"{path}: not JSON ({exc})")
+    if not isinstance(doc, dict):
+        raise ValueError(f"{path}: not a {what} document")
+    return doc, got
+
+
+def check_amendment(path, *, prereg_path, prereg_sha256: str) -> tuple[dict, dict]:
+    """(amendment summary, overrides) of an amendment to the preregistration: its own
+    sha256 sidecar must match, ``amends.sha256`` must be the preregistration's sha256 (and
+    ``amends.file`` its file name), and every ``overrides`` key must be in
+    :data:`AMENDABLE_KEYS`. The frozen preregistration itself is never rewritten."""
+    path = Path(path)
+    doc, got = _read_sidecar_checked(path, "preregistration amendment")
+    amends = doc.get("amends") or {}
+    if str(amends.get("sha256", "")).lower() != prereg_sha256:
+        raise ValueError(f"{path}: amends sha256 {amends.get('sha256')!r}, the preregistration "
+                         f"has {prereg_sha256}")
+    if amends.get("file") and Path(str(amends["file"])).name != Path(prereg_path).name:
+        raise ValueError(f"{path}: amends {amends.get('file')!r}, not {Path(prereg_path).name!r}")
+    overrides = doc.get("overrides") or {}
+    if not isinstance(overrides, Mapping):
+        raise ValueError(f"{path}: overrides is not a mapping")
+    bad = sorted(k for k in overrides if k not in AMENDABLE_KEYS)
+    if bad:
+        raise ValueError(f"{path}: overrides {bad} are not amendable (only {list(AMENDABLE_KEYS)})")
+    return ({"path": str(path.resolve()), "sha256": got, "overrides": dict(overrides)},
+            dict(overrides))
+
+
+def _set(doc: dict, dotted: str, value) -> None:
+    cur = doc
+    parts = dotted.split(".")
+    for part in parts[:-1]:
+        cur = cur.setdefault(part, {})
+    cur[parts[-1]] = value
+
+
 def check_preregistration(path, *, capacity_sha256: str, design_seed: int,
                           freeze: Optional[Mapping], refit: Optional[Mapping],
-                          model: str = MODEL) -> dict:
+                          model: str = MODEL, amendment=None) -> dict:
     """The preregistration JSON, bound to this run (ValueError on any mismatch).
 
     Its sidecar ``<path>.sha256`` (sha256sum format, naming the file) must match. Then the
@@ -500,6 +564,12 @@ def check_preregistration(path, *, capacity_sha256: str, design_seed: int,
         raise ValueError(f"{path}: not JSON ({exc})")
     if not isinstance(doc, dict):
         raise ValueError(f"{path}: not a preregistration document")
+    amended = None
+    if amendment is not None:
+        amended, overrides = check_amendment(amendment, prereg_path=path, prereg_sha256=got)
+        doc = json.loads(json.dumps(doc))
+        for key, value in overrides.items():
+            _set(doc, key, value)
     expected = {
         "t14.capacity_prior.sha256": (lambda v: isinstance(v, str) and v.lower() == capacity_sha256,
                                       capacity_sha256),
@@ -536,7 +606,7 @@ def check_preregistration(path, *, capacity_sha256: str, design_seed: int,
     if problems:
         raise ValueError(f"{path}: the preregistration does not bind this run: " + "; ".join(problems))
     return {"path": str(path.resolve()), "sha256": got, "checked_keys": checked,
-            "unchecked": unchecked}
+            "unchecked": unchecked, "amendment": amended}
 
 
 def _overlaps(path: Path, root: Path) -> bool:
@@ -693,6 +763,10 @@ def print_plan(plan: Mapping, model: str) -> None:
         extra = f" (unchecked: {pr['unchecked']})" if pr.get("unchecked") else ""
         print(f"  preregistration: {pr['path']} sha256 {pr['sha256']}; checked "
               f"{pr['checked_keys']}{extra}")
+        am = pr.get("amendment")
+        if am:
+            print(f"  preregistration amendment: {am['path']} sha256 {am['sha256']}; overrides "
+                  f"{sorted(am['overrides'])}")
     else:
         print("  preregistration: NOT CHECKED (no --preregistration-json; dry run)")
     print(f"  routing strategy: {plan['routing_strategy']} via {plan['gateway_url']}")
@@ -765,7 +839,8 @@ def seal(out_dir: Path, raw_dir: Path, model: str, run: "T14Run", labels: Mappin
                            "predicted_rps": prior["predicted_rps"]},
         "preregistration": {"path": plan["preregistration"]["path"],
                             "sha256": plan["preregistration"]["sha256"],
-                            "checked_keys": plan["preregistration"]["checked_keys"]},
+                            "checked_keys": plan["preregistration"]["checked_keys"],
+                            "amendment": plan["preregistration"].get("amendment")},
         "label_def": labels["label_def"],
         "label_def_sha256": labels["label_def_sha256"],
         "composition": plan["composition"],
@@ -866,7 +941,10 @@ def run_t14_set(args, *, drive: Optional[Callable] = None,
                  "the preregistration", dry):
         prereg = check_preregistration(Path(args.preregistration_json),
                                        capacity_sha256=prior["sha256"], design_seed=seed,
-                                       freeze=freeze, refit=refit, model=model)
+                                       freeze=freeze, refit=refit, model=model,
+                                       amendment=getattr(args, "preregistration_amendment_json", None))
+    elif getattr(args, "preregistration_amendment_json", None):
+        raise ValueError("--preregistration-amendment-json needs --preregistration-json")
     routing = getattr(args, "routing_strategy", None)
     if routing != ROUTING_STRATEGY:
         if not dry:

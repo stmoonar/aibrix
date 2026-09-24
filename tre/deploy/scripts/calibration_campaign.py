@@ -2301,6 +2301,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--preregistration-json", type=Path, default=None,
                     help="--t14-set: the T14 preregistration JSON (sidecar <file>.sha256); its "
                          "t14.* / parameter_sets.* hashes and constants must match the run")
+    ap.add_argument("--preregistration-amendment-json", type=Path, default=None,
+                    help="--t14-set: an amendment of --preregistration-json (sidecar <file>.sha256, "
+                         "amends.sha256 = the preregistration's); its overrides (the v1-lambda "
+                         "parameter file binding only) apply before the binding check")
     ap.add_argument("--routing-strategy", default=None,
                     help="pass --routing-strategy to every r3_grid cell (route through the "
                          "gateway plugin with this strategy, e.g. least-gpu-cache); default: "
@@ -2347,7 +2351,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                  "--training-supplement / --acceptance-set (and to calibration_t14 "
                  "capacity-prior)")
     if not args.t14_set and (args.capacity_prior_file or args.refit_params_file
-                             or args.preregistration_json):
+                             or args.preregistration_json or args.preregistration_amendment_json):
         ap.error("--capacity-prior-file / --refit-params-file / --preregistration-json belong "
                  "to --t14-set")
     if args.t14_set and not args.capacity_prior_file:

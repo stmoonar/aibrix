@@ -395,6 +395,44 @@ def test_the_preregistration_binds_the_run(tmp_path, frozen) -> None:
     assert part["unchecked"] == ["parameter_sets.v1lambda.sha256 (no --refit-params-file)"]
 
 
+def _amendment(tmp_path, prereg: Path, overrides: dict, *, name="amend.json", amends_sha=None) -> Path:
+    doc = {"amends": {"file": prereg.name, "sha256": amends_sha or _sha(prereg)}, "overrides": overrides}
+    path = tmp_path / name
+    path.write_text(json.dumps(doc), encoding="utf-8")
+    Path(f"{path}.sha256").write_text(f"{_sha(path)}  {path.name}\n", encoding="utf-8")
+    return path
+
+
+def test_an_amendment_rebinds_the_second_parameter_set_only(tmp_path, frozen) -> None:
+    """The frozen preregistration is never rewritten: an amendment (own sha256 sidecar,
+    naming the preregistration's sha256) may only re-bind the v1-lambda parameter file."""
+    prior = _prior(tmp_path)
+    fr = t14.check_param_file(frozen["freeze"], MODEL, None, "--freeze-file")
+    new_refit = tmp_path / "refit_r2.json"
+    new_refit.write_text(frozen["refit"].read_text() + " ", encoding="utf-8")
+    rf2 = t14.check_param_file(new_refit, MODEL, None, "--refit-params-file")
+    kw = dict(capacity_sha256=_sha(prior), design_seed=20260924, freeze=fr, refit=rf2)
+    prereg = _prereg(tmp_path, prior, freeze=frozen["freeze"], refit=frozen["refit"])
+    # without the amendment the new file does not bind
+    with pytest.raises(ValueError, match="parameter_sets.v1lambda.sha256"):
+        t14.check_preregistration(prereg, **kw)
+    am = _amendment(tmp_path, prereg, {"parameter_sets.v1lambda.sha256": _sha(new_refit)})
+    body = t14.check_preregistration(prereg, **kw, amendment=am)
+    assert body["sha256"] == _sha(prereg) and body["amendment"]["sha256"] == _sha(am)
+    assert body["amendment"]["overrides"] == {"parameter_sets.v1lambda.sha256": _sha(new_refit)}
+    # an amendment of another preregistration, a design override, a stale sidecar
+    other = _amendment(tmp_path, prereg, {"parameter_sets.v1lambda.sha256": _sha(new_refit)},
+                       name="other.json", amends_sha="ab" * 32)
+    with pytest.raises(ValueError, match="amends sha256"):
+        t14.check_preregistration(prereg, **kw, amendment=other)
+    design = _amendment(tmp_path, prereg, {"t14.hold_s": 300}, name="design.json")
+    with pytest.raises(ValueError, match="not amendable"):
+        t14.check_preregistration(prereg, **kw, amendment=design)
+    am.write_text(am.read_text() + " ")
+    with pytest.raises(ValueError, match="changed after its sidecar"):
+        t14.check_preregistration(prereg, **kw, amendment=am)
+
+
 def test_a_parameter_file_frozen_under_another_label_is_refused(tmp_path, frozen) -> None:
     other = dl.label_for(MODEL, "fixed", None).as_dict()
     frozen["refit"].write_text(json.dumps({"models": {MODEL: {"verdict_for_holdout": {
