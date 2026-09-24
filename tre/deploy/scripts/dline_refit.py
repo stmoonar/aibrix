@@ -54,6 +54,11 @@ Stages (``python -m scripts.dline_refit STAGE --model M --arm primary|fixed|k3 .
     LARGEST admissible w_p (:func:`d3_select`), 0 when none is. Then the
     lambda check: lambda_wait in :data:`LAMBDAS` at w_p*; lambda moves off 1 only if the
     best BA beats lambda = 1 by >= 0.02.
+    ``--lambda-method v1`` (user 2026-09-24) replaces both rules: lambda_wait AND w_p are
+    v1's selection (:mod:`scripts.v1_lambda_fit` - v1's rank-correlation objective, lambda
+    1..4 / 0.25, w_p 0.01..0.08 / 0.005, the joint refinement), ported onto the same
+    training windows; the D17 w_p rule is not applied (when the two disagree, v1's joint
+    refinement wins and wp.json says so). tau, theta, delta and the labels stay v2.
 ``final`` (D5 + hold-out)
     the verdict at (tau, w_p*, lambda*) with 1000 / 200 resamples; D5: the merged theta is
     published whatever the family rule says (the family theta is kept as diagnostic);
@@ -136,6 +141,9 @@ M_CI_RESAMPLES = 1000
 MIN_FAMILY_WINDOWS = 30
 
 ARMS = ("primary", "fixed", "k3")
+#: How the wp stage picks lambda_wait (and, for v1, w_p): ``v2`` = D17 + the BA lambda
+#: check (the default, what the D22 freeze used); ``v1`` = v1's selection (user 2026-09-24).
+LAMBDA_METHODS = ("v2", "v1")
 ALPHA_RULES = ("d4prime", "refit0922")
 FAMILY_FILES = ("decode_heavy", "prefill_heavy")
 #: D18: the tau every model publishes (= the refresh period DT_REF_S, alpha = .63). The
@@ -995,6 +1003,31 @@ def stage_wp(model: str, label, p: Mapping[str, Any], alpha_doc: Mapping[str, An
             "admissible_with_c3": [r["w_p"] for r in rows if r.get("admissible") and r.get("c3_merged")],
             "w_p_star": wp_star, "w_p_used": wp_l, "lambda_rows": lam_rows,
             "lambda_star": lambda_select(lam_rows)}
+
+
+def stage_wp_v1(model: str, label, p: Mapping[str, Any], alpha_doc: Mapping[str, Any],
+                sources: Mapping[str, Path]) -> dict:
+    """``wp --lambda-method v1``: lambda_wait and w_p from v1's selection (stages A-C of
+    ``fit_tre_parameters_from_runs.py``, :mod:`scripts.v1_lambda_fit`) on the D16 fitting
+    windows; ``sources`` (run -> standard dataset dir) are where the average TPOT of v1's
+    average-health term is rebuilt from. The D17 w_p rule is NOT applied: user 2026-09-24,
+    v1's joint refinement is taken as is and a disagreement with D17 is reported."""
+    from scripts import v1_lambda_fit
+
+    tau = published_tau(alpha_doc)
+    if tau is None:
+        raise SystemExit(f"{model}: the alpha stage published no tau ({alpha_doc.get('rule')})")
+    sel = v1_lambda_fit.fit_model(model, label, p["fitting"], trim=TRIM_RAMP_WINDOWS, sources=sources)
+    lam, wp = sel["lambda_wait"], sel["w_p"]
+    print(model, "v1 selection", {"lambda_wait": lam, "w_p": wp,
+                                  "objective_adjusted": sel["best_c"]["objective_adjusted"]}, flush=True)
+    return {"model": model, "tau_s": tau, "lambda_method": "v1", "ba0_se": None, "grid": [],
+            "d3_rule": {"conditions": [], "diagnostic": [],
+                        "statement": ("not applied: --lambda-method v1 takes w_p from v1's joint "
+                                      "lambda x w_p refinement (user 2026-09-24)")},
+            "admissible": [], "admissible_with_c3": [],
+            "w_p_star": wp, "w_p_used": wp, "lambda_rows": [], "lambda_star": lam,
+            "v1_selection": sel}
 
 
 # -------------------------------------------------------------------------- final
@@ -2097,6 +2130,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--no-sentinels", action="store_true",
                     help="trainset: leave the sentinel cells out of the training set (default: they train)")
     ap.add_argument("--alpha-rule", choices=ALPHA_RULES, default="d4prime")
+    ap.add_argument("--lambda-method", choices=LAMBDA_METHODS, default="v2",
+                    help="wp: v2 (default) = D17 w_p + the BA lambda check; v1 = lambda_wait and w_p "
+                         "from v1's selection (scripts.v1_lambda_fit, user 2026-09-24)")
+    ap.add_argument("--requests-dataset", action="append", default=[], metavar="RUN=DIR",
+                    help="wp --lambda-method v1: a standard dataset whose requests.csv rebuilds the "
+                         "average TPOT of rows whose run column is RUN (default: the fit dir's "
+                         f"{TRAINSET_MANIFEST} sources; repeatable, overrides)")
     ap.add_argument("--alpha-w-p", type=float, default=None,
                     help=f"w_p of the alpha stage (default: {ALPHA_STAGE_W_P})")
     ap.add_argument("--alpha-bootstrap", type=int, default=1000,
@@ -2220,6 +2260,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             doc = stage_alpha_d4prime(model, label, p, w_p=w_p, ledgers=lp,
                                       bootstrap=args.alpha_bootstrap, registry=args.registry)
         doc = publish_alpha(doc, args.publish_tau_s)
+    elif args.stage == "wp" and args.lambda_method == "v1":
+        from scripts import v1_lambda_fit
+
+        sources = v1_lambda_fit.sources_from_trainset(fit_dir(model))
+        for text in args.requests_dataset:
+            run, sep, d = text.partition("=")
+            if not sep or not run or not d:
+                ap.error(f"--requests-dataset {text!r}: expected RUN=DIR")
+            sources[run] = Path(d)
+        doc = stage_wp_v1(model, label, p, _read_json(out / "alpha.json"), sources)
     elif args.stage == "wp":
         doc = stage_wp(model, label, p, _read_json(out / "alpha.json"))
     else:
