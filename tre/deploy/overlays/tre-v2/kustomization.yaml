@@ -12,4 +12,5 @@ resources:
   - gpu-truth.yaml
   - gateway.yaml
   - gateway-plugins.yaml
+  - gateway-extproc.yaml
   - gateway-stats.yaml

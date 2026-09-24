@@ -9,8 +9,8 @@ The actual network call is an injectable seam (`stream_call`) so tests run with 
 never touch the network. The default seam uses urllib + SSE parsing.
 
 Each record also carries ``target_pod``: the pod that served the request, when the
-serving path names one. See :class:`StreamingHttpSender` - it does not on the default
-path, and the field is then None rather than guessed.
+serving path names one. See :class:`StreamingHttpSender` - only the plugin-routed path
+(a ``routing-strategy`` header) does; otherwise the field is None rather than guessed.
 
 Timing a request's lateness
 ---------------------------
@@ -56,9 +56,15 @@ from tre_replayer.engine.schedule import ScheduledRequest
 #: preferred over its address because it survives a pod IP being reused.
 POD_HEADER_KEYS = ("target-pod", "x-target-pod", "x-upstream-pod", "target-pod-ip")
 
-#: Request header that makes the AIBrix gateway route (and therefore report the pod it
-#: routed to). See :class:`StreamingHttpSender` for why it is off by default.
+#: Request header that makes the AIBrix gateway plugin route (and therefore report the
+#: pod it routed to). See :class:`StreamingHttpSender`.
 ROUTING_STRATEGY_HEADER = "routing-strategy"
+
+#: What the v1 client sent on every request (OpenAI SDK ``default_headers``, all v1
+#: configs: ``client.routing_algorithm: least-gpu-cache``): the plugin picks the awake pod
+#: with the lowest ``vllm:gpu_cache_usage_perc``. The trace replayer (``run_trace``) and
+#: the campaign default to it so both arms are routed the way v1 routed them.
+DEFAULT_ROUTING_STRATEGY = "least-gpu-cache"
 
 
 def pod_from_headers(headers: dict[str, str] | None) -> str | None:
@@ -118,18 +124,21 @@ class StreamingHttpSender:
     ``routing_strategy`` selects *which serving path* the request takes, and with it
     whether per-pod attribution is possible at all:
 
-    * ``None`` (the default, and what the campaign uses): the ``model`` request header is
-      sent, so the per-model HTTPRoute matches and Envoy load-balances straight across
-      the model Service's endpoints. The AIBrix gateway plugin is not in this path, so no
-      answer carries a pod header and ``target_pod`` is None on every row.
-    * a strategy name (e.g. ``"least-request"``): the ``model`` header is *omitted* so the
-      catch-all ``aibrix-reserved-router`` matches instead, the ext_proc plugin routes the
-      request itself, and the answer carries ``target-pod`` / ``target-pod-ip``.
+    * ``None`` (the class default, used by the calibration drivers): only the ``model``
+      request header is sent, so the per-model HTTPRoute matches and Envoy
+      load-balances (LEAST_REQUEST) across the model Service's endpoints. The gateway
+      plugin is not in this path, so no answer carries a pod header and ``target_pod``
+      is None on every row.
+    * a strategy name (e.g. :data:`DEFAULT_ROUTING_STRATEGY`, which ``run_trace`` and the
+      campaign send, as the v1 client did): the ``routing-strategy`` header is added. On
+      either gateway a route patched in ahead of the per-model routes matches it, the
+      ext_proc plugin picks the pod, Envoy forwards to it (ORIGINAL_DST), and the answer
+      carries ``target-pod`` / ``target-pod-ip``. The ``model`` header is still sent:
+      the tre-v2 gateway keys its per-model ORIGINAL_DST cluster (admission limits, Envoy
+      stats) on it, and the aibrix-system gateway ignores it on that route.
 
-    The second option changes who chooses the pod, which changes the measurement. It is
-    therefore opt-in and never the default: turning it on to get attribution and then
-    comparing the numbers against a run that did not is a mistake this docstring exists
-    to prevent.
+    The two options differ in who chooses the pod, which changes the measurement: never
+    compare a run made one way against a run made the other.
     """
 
     def __init__(
@@ -299,18 +308,20 @@ class StreamingHttpSender:
 def build_request_headers(model: str, routing_strategy: str | None = None) -> dict[str, str]:
     """Request headers for one completion, and with them the serving path.
 
-    Without a routing strategy the ``model`` header is sent and the per-model HTTPRoute
-    matches, which is the path the campaign measures. With one, the ``model`` header is
-    deliberately left out: the per-model route matches on exactly that header, so sending
-    it would win over the catch-all reserved route and the ext_proc plugin - the only
-    thing that reports a pod - would never see the request. The model still travels in
-    the JSON body, which is where the plugin reads it from.
+    The ``model`` header is always sent. Without a routing strategy it is what the
+    per-model HTTPRoute matches (Service path). With one, the ``routing-strategy`` header
+    is added and the plugin-routed route - patched in AHEAD of the per-model routes on
+    both gateways, so it wins regardless of the ``model`` header - takes the request; on
+    tre-v2 that route is per model and matches the ``model`` header too (per-model
+    ORIGINAL_DST cluster). The plugin itself reads the model from the JSON body.
+
+    (Until 2026-09-24 the ``model`` header was dropped on the routed path, on the belief
+    that it would make the per-model HTTPRoute win; the patched route sits at index 0 of
+    the route table, so it never did.)
     """
-    headers = {"Content-Type": "application/json", "Accept": "text/event-stream"}
+    headers = {"Content-Type": "application/json", "Accept": "text/event-stream", "model": model}
     if routing_strategy:
         headers[ROUTING_STRATEGY_HEADER] = routing_strategy
-    else:
-        headers["model"] = model
     return headers
 
 

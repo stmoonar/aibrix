@@ -159,6 +159,9 @@ func (s *Server) Process(srv extProcPb.ExternalProcessor_ProcessServer) error {
 	}
 
 	defer func() {
+		// TRE-PATCH(P2-GW-006): the stream may end (completed, cancelled, error) with a
+		// partial SSE line still held for this request.
+		clearSSECarry(st.requestID)
 		if st.span != nil {
 			st.span.End()
 		}

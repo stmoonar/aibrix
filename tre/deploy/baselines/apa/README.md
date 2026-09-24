@@ -31,7 +31,7 @@ each CR sets `scaleTargetRef.name` to the exact registry model name (`dsqwen-7b`
 `deploy/registry.yaml` `min_replicas`; maxReplicas mirrors the registry scaling cap
 `max_awake_replicas` (4 for every model, same cap as TRE; v1/paper alignment A1), not the
 GPU layout size `max_replicas` (7b/8b 8 bindings, 14b 4). Service-manager enforces the same
-cap on `/scale_service`, so 7b/8b are `1..4`, 14b `0..4`.
+cap on `/scale_service`, so every model is `1..4` (14b raised from 0 to 1 on 2026-09-24, as in v1).
 
 ### Why the anchor Deployment exists
 

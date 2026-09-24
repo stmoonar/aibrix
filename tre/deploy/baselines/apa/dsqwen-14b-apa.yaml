@@ -20,7 +20,7 @@ metadata:
     apa.autoscaling.aibrix.ai/window: 30s
 spec:
   scalingStrategy: APA
-  minReplicas: 0
+  minReplicas: 1
   maxReplicas: 4
   metricsSources:
     - metricSourceType: pod

@@ -82,6 +82,7 @@ func (s *Server) HandleResponseBody(ctx context.Context, routerCtx *types.Routin
 	defer func() {
 		// Wrapped in a function to delay the evaluation of parameters. Using complete to make sure DoneRequestTrace only call once for a request.
 		if !hasCompleted && complete {
+			clearSSECarry(requestID)
 			s.cache.DoneRequestTrace(routerCtx, requestID, model, promptTokens, completionTokens, traceTerm)
 			if routerCtx != nil {
 				routerCtx.Delete()
@@ -90,7 +91,8 @@ func (s *Server) HandleResponseBody(ctx context.Context, routerCtx *types.Routin
 	}()
 
 	if stream {
-		bodyBytes := b.ResponseBody.GetBody()
+		// TRE-PATCH(P2-GW-006): scan only complete SSE lines; see tre_sse_carry.go.
+		bodyBytes := sseCompleteLines(requestID, b.ResponseBody.GetBody(), b.ResponseBody.EndOfStream)
 
 		// The previous implementation unmarshalled every single SSE chunk into a struct (openai.ChatCompletionChunk).
 		// This caused significant CPU overhead and high GC pressure under heavy concurrency.

@@ -140,7 +140,9 @@ models:
 - name: dsqwen-14b
   weights_path: /data/nfs_shared_data/Models/DeepSeek-R1-Distill-Qwen-14B
   tp_size: 2
-  min_replicas: 0
+  # 1 as in v1 (every v1 model had >=1 replica): with the gateway HOT_SWITCH=0 a model
+  # never sits at zero awake pods, so no request path depends on a wake-from-zero.
+  min_replicas: 1
   # max_replicas = GPU layout (bindings rendered by make manifests);
   # max_awake_replicas = scaling cap (TRE planner + SM + APA maxReplicas).
   max_replicas: 4

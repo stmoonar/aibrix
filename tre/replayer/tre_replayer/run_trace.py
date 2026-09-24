@@ -16,7 +16,7 @@ from typing import Any
 
 from tre_replayer.engine import rps_timeline
 from tre_replayer.engine.dispatcher import dispatch_open_loop
-from tre_replayer.engine.http_sender import StreamResult, StreamingHttpSender
+from tre_replayer.engine.http_sender import DEFAULT_ROUTING_STRATEGY, StreamResult, StreamingHttpSender
 from tre_replayer.engine.prompt_store import materialize_prompts
 from tre_replayer.engine.schedule import build_poisson_schedule
 from tre_replayer.scoring import compute_v_sys
@@ -45,6 +45,7 @@ def run_trace(
     prompt_path: str | None = None,
     rps_timeline_path: str | None = None,
     prompt_workers: int | None = None,
+    routing_strategy: str | None = DEFAULT_ROUTING_STRATEGY,
 ) -> dict[str, Any]:
     from tre_common.registry import load_registry
 
@@ -63,6 +64,7 @@ def run_trace(
         stream_call=_dry_stream_call if dry_run else None,
         max_in_flight=max_in_flight,
         prompt_store=prompt_store,
+        routing_strategy=routing_strategy or None,
     )
     dispatch_kwargs = {"sleep": sleep} if sleep is not None else {}
     try:
@@ -124,8 +126,19 @@ def run_trace(
         )
         for model in sorted(by_model)
     }
+    # Which pod served each request, per model, as the plugin reported it (routed path
+    # only; None rows are the Service path or failures that never reached a pod). The
+    # quickest check that least-gpu-cache spreads load and never lands on a sleeping pod.
+    target_pods: dict[str, dict[str, int]] = {}
+    for rec in sender.records:
+        pod = rec.get("target_pod")
+        if pod:
+            by_pod = target_pods.setdefault(rec["model"], {})
+            by_pod[pod] = by_pod.get(pod, 0) + 1
     return {
         "trace": trace_path,
+        "routing_strategy": routing_strategy or None,
+        "target_pods": target_pods,
         "requests": len(sender.records),
         "schedule_p99_delay_ms": round(report.p99_delay_ms, 2),
         "schedule_rps_error": round(report.actual_rps_error_ratio, 4),
@@ -155,7 +168,8 @@ def _achieved_offsets(records: list[dict]) -> list[float]:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--trace", required=True)
-    ap.add_argument("--gateway-url", default="http://192.168.223.76:31592/v1/completions")
+    # Both arms go through the tre-v2 gateway (NodePort 31094) since 2026-09-24.
+    ap.add_argument("--gateway-url", default="http://192.168.223.76:31094/v1/completions")
     ap.add_argument("--out", default=None)
     ap.add_argument("--registry", default=None)
     ap.add_argument("--seed", type=int, default=0)
@@ -170,13 +184,19 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--prompt-workers", type=int, default=None)
     ap.add_argument("--rps-timeline", default=None,
                     help="CSV of nominal vs achieved requests per second, per model")
+    ap.add_argument("--routing-strategy", default=DEFAULT_ROUTING_STRATEGY,
+                    help="routing-strategy request header (default %(default)s, what the v1 "
+                         "client sent); '' or 'none' sends none and uses the per-model "
+                         "Service path instead")
     args = ap.parse_args(argv)
+    routing_strategy = None if args.routing_strategy.strip().lower() in ("", "none") else args.routing_strategy.strip()
     summary = run_trace(
         args.trace, gateway_url=args.gateway_url, out_path=args.out, registry_path=args.registry,
         seed=args.seed, dry_run=args.dry_run, window_ms=args.window_ms, step_ms=args.step_ms,
         max_in_flight=args.max_in_flight, trim_ramp_windows=args.trim_ramp_windows,
         prompt_path=args.prompt_file, prompt_workers=args.prompt_workers,
         rps_timeline_path=args.rps_timeline,
+        routing_strategy=routing_strategy,
     )
     print(json.dumps(summary, indent=2))
     return 0

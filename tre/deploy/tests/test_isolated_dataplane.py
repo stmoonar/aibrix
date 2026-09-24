@@ -46,22 +46,38 @@ def test_gateway_plugins_scrapes_to_tre_v2_redis_with_podlist_rbac() -> None:
     assert "tre-v2-redis" in init_cmd
     assert "aibrix-redis-master" not in init_cmd
     svc = _by_kind(path, "Service", "tre-gateway-plugins")
-    assert 50052 not in [p["port"] for p in svc["spec"]["ports"]]
+    # 2026-09-24 amendment: the plugin is also the ext_proc router of the tre-v2 gateway.
+    assert 50052 in [p["port"] for p in svc["spec"]["ports"]]
     role = _by_kind(path, "ClusterRole", "tre-gateway-plugins-role")
     pod_rule = next(r for r in role["rules"] if r["resources"] == ["pods"])
     assert "list" in pod_rule["verbs"]
 
 
-def test_no_extproc_reserved_router_or_policy_shipped() -> None:
-    # ADR-0008: isolated plane deliberately omits ext-proc / reserved-router.
-    kinds: list[str] = []
-    names: list[str] = []
+def test_extproc_objects_are_confined_to_tre_v2() -> None:
+    # ADR-0008 as amended 2026-09-24: ext_proc is back (least-gpu-cache, as in v1), but
+    # every ext_proc object lives in tre-v2 and targets only tre-v2 objects. No shared
+    # (class-level) Envoy config, nothing in aibrix-system.
+    docs = _docs(OVERLAY / "gateway-extproc.yaml")
+    assert sorted(d["kind"] for d in docs) == [
+        "ClientTrafficPolicy",
+        "EnvoyExtensionPolicy",
+        "EnvoyPatchPolicy",
+        "EnvoyPatchPolicy",
+        "HTTPRoute",
+    ]
+    for d in docs:
+        assert d["metadata"]["namespace"] == "tre-v2", d["metadata"]["name"]
+        spec = d["spec"]
+        refs = list(spec.get("targetRefs", [])) + ([spec["targetRef"]] if "targetRef" in spec else [])
+        refs += list(spec.get("parentRefs", []))
+        for ref in refs:
+            assert ref.get("namespace", "tre-v2") == "tre-v2"
+            assert ref["name"] in {"tre-aibrix-eg", "tre-reserved-router"}
     for path in OVERLAY.glob("*.yaml"):
         for d in _docs(path):
-            kinds.append(d["kind"])
-            names.append(d.get("metadata", {}).get("name", ""))
-    assert "EnvoyExtensionPolicy" not in kinds
-    assert not any("reserved-router" in n for n in names)
+            assert d["kind"] not in {"EnvoyProxy", "EnvoyGateway", "GatewayClass"}, path.name
+    for d in _docs(OVERLAY / "gateway-plugins.yaml"):
+        assert d.get("metadata", {}).get("namespace") in {None, "tre-v2"}, d["metadata"]
 
 
 def test_generator_gateway_target_is_parameterizable() -> None:
