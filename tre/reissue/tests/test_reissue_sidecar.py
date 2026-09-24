@@ -23,10 +23,11 @@ GW_POD = "10.9.9.9:8000"
 class Harness:
     def __init__(self, **cfg_overrides) -> None:
         self.cfg_overrides = cfg_overrides
-        self.a = FakeVllm("a", token_delay_s=cfg_overrides.pop("a_delay", 0.01),
-                          abort_after=cfg_overrides.pop("a_abort_after", None))
-        self.b = FakeVllm("b", token_delay_s=0.002, target_pod=GW_POD,
-                          abort_after=cfg_overrides.pop("b_abort_after", None))
+        a_opts = {k[2:]: cfg_overrides.pop(k) for k in list(cfg_overrides) if k.startswith("a_")}
+        b_opts = {k[2:]: cfg_overrides.pop(k) for k in list(cfg_overrides) if k.startswith("b_")}
+        a_opts.setdefault("token_delay_s", a_opts.pop("delay", 0.01))
+        self.a = FakeVllm("a", **a_opts)
+        self.b = FakeVllm("b", token_delay_s=0.002, target_pod=GW_POD, **b_opts)
 
     async def __aenter__(self) -> "Harness":
         self.a_srv = TestServer(self.a.app())
@@ -55,9 +56,10 @@ class Harness:
     def url(self, path: str) -> str:
         return str(self.s_srv.make_url(path))
 
-    async def sleep(self) -> dict:
-        async with self.http.post(self.url("/sleep")) as resp:
-            assert resp.status == 200
+    async def sleep(self, *, expect: int = 200, hidden: bool = True) -> dict:
+        headers = {"X-TRE-Hidden": "1"} if hidden else {}
+        async with self.http.post(self.url("/sleep"), headers=headers) as resp:
+            assert resp.status == expect
             return {"status": resp.status, "body": await resp.text()}
 
     async def wake(self) -> None:
@@ -541,7 +543,8 @@ async def test_metrics_and_state_endpoints():
         async with h.http.get(h.url("/tre-reissue/state")) as resp:
             state = await resp.json()
         assert state["sleeping"] is True
-        assert isinstance(state["last_sleep"]["aborted"], list) and len(state["last_sleep"]["aborted"]) == 1
+        # the real image's /sleep snapshot is [] and flagged unreliable (review M1)
+        assert state["last_sleep"]["aborted"] == [] and state["last_sleep"]["aborted_reliable"] is False
 
 
 # ------------------------------------------------------------- pure helpers
@@ -568,7 +571,8 @@ def test_budget_and_usage_merge():
 def test_chat_render_continuation_defaults_budget_from_context():
     cont = sc.chat_render_continuation({"model": "m", "messages": [], "stream": True, "tools": [1], "seed": 7},
                                        "<p>", "ab", 2, max_model_len=100, prompt_len=10)
-    assert cont == {"model": "m", "prompt": "<p>ab", "add_special_tokens": False, "seed": 7, "stream": True,
+    # seed -> seed + depth: the continuation must not replay the first segment's stream (L3)
+    assert cont == {"model": "m", "prompt": "<p>ab", "add_special_tokens": False, "seed": 8, "stream": True,
                     "stream_options": {"include_usage": True}, "max_tokens": 88}
 
 
@@ -628,3 +632,298 @@ async def test_bounced_request_backs_off_before_forwarding_again():
         assert loop.time() - start >= 0.4  # 0.1 * 2 ** (3 - 1)
         (fwd,) = h.b.generation_requests()
         assert fwd["headers"]["X-TRE-Forward-Hops"] == "4"
+
+
+# =================================================================== review fixes (09-24)
+
+
+async def _wait_for(predicate, timeout_s: float = 3.0, what: str = "condition") -> None:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_s
+    while loop.time() < deadline:
+        if predicate():
+            return
+        await asyncio.sleep(0.005)
+    raise AssertionError(f"timed out waiting for {what}")
+
+
+# ---------------------------------------------------------------- H3: fail closed
+
+
+@pytest.mark.asyncio
+async def test_sleep_without_hidden_header_is_refused():
+    async with Harness() as h:
+        await h.sleep(expect=409, hidden=False)
+        assert h.a.sleep_calls == 0 and not h.sidecar.state.active
+        assert h.sidecar.metrics.events["sleep_rejected_not_hidden"] == 1
+    async with Harness(require_hidden_header=False) as h:
+        await h.sleep(hidden=False)
+        assert h.sidecar.state.sleeping
+
+
+# ---------------------------------------------------------------- L4 / rollback
+
+
+@pytest.mark.asyncio
+async def test_repeated_sleep_is_idempotent():
+    async with Harness() as h:
+        await h.sleep()
+        epoch, slept_at = h.sidecar.state.epoch, h.sidecar.state.slept_at
+        await h.sleep()
+        assert h.sidecar.state.epoch == epoch and h.sidecar.state.slept_at == slept_at
+        assert h.sidecar.metrics.events["sleep_repeated"] == 1
+
+
+@pytest.mark.asyncio
+async def test_sleep_failure_rolls_back():
+    async with Harness() as h:
+        h.a.sleep_status = 500
+        await h.sleep(expect=500)
+        assert not h.sidecar.state.active
+        h.a.sleep_status = 200
+        _, _, _, objs = await h.stream("/v1/completions", completion_body(4))
+        assert content_text(objs, chat=False) == tokens("a", 4)  # served locally again
+        assert h.b.generation_requests() == []
+
+
+@pytest.mark.asyncio
+async def test_sleep_timeout_rolls_back():
+    async with Harness(control_timeout_s=0.2, probe_interval_s=3600) as h:
+        h.a.sleep_hang = True
+        await h.sleep(expect=504)
+        assert not h.sidecar.state.active and h.sidecar.state.pending == 0
+        assert h.sidecar.metrics.events["sleep_failed"] == 1
+
+
+# ---------------------------------------------------------------- H2: state sync
+
+
+@pytest.mark.asyncio
+async def test_vllm_restart_resyncs_sleeping_mark_via_probe():
+    async with Harness(probe_interval_s=0.05) as h:
+        await h.sleep()
+        assert h.sidecar.state.sleeping
+        h.a.restart()  # the engine came back awake without any /wake_up
+        await _wait_for(lambda: not h.sidecar.state.active, what="probe correction")
+        assert h.sidecar.metrics.events["state_corrected_to_awake"] == 1
+        _, _, _, objs = await h.stream("/v1/completions", completion_body(3))
+        assert content_text(objs, chat=False) == tokens("a", 3)
+
+
+@pytest.mark.asyncio
+async def test_proxied_is_sleeping_answer_resyncs_state():
+    async with Harness(probe_interval_s=3600) as h:
+        await asyncio.sleep(0.05)  # let the startup probe run once
+        h.a.pause_silently()
+        async with h.http.get(h.url("/is_sleeping")) as resp:
+            assert (await resp.json()) == {"is_sleeping": True}
+        assert h.sidecar.state.sleeping
+        assert h.sidecar.metrics.events["state_corrected_to_sleeping"] == 1
+
+
+# ---------------------------------------------------------------- M1 / L1: stuck detection
+
+
+@pytest.mark.asyncio
+async def test_empty_snapshot_late_abort_response_is_not_misjudged_as_stuck():
+    # Real image: /sleep answers [] and a non-stream abort response may trail /sleep.
+    async with Harness(a_abort_response_delay_s=0.15, stuck_grace_s=0.5) as h:
+        body = completion_body(15, stream=False)
+        del body["stream_options"]
+
+        async def trigger():
+            await h.wait_generated(4)
+            await h.sleep()
+
+        sleeper = asyncio.ensure_future(trigger())
+        async with h.http.post(h.url("/v1/completions"), json=body) as resp:
+            obj = await resp.json()
+        await sleeper
+        assert obj["tre_reissue"]["kind"] == "abort" and obj["tre_reissue"]["outcome"] == "ok"
+        text = obj["choices"][0]["text"]
+        k = len([t for t in text.split() if t.startswith("a")])
+        assert k >= 4 and text == tokens("a", k) + tokens("b", 15 - k)
+        assert "stuck_detected" not in h.sidecar.metrics.events
+
+
+@pytest.mark.asyncio
+async def test_periodic_stuck_scan_after_probe_detected_sleep():
+    # The engine went to sleep behind the sidecar's back (e.g. sidecar restarted): no
+    # /sleep passes through, only the periodic probe + scan can free the hung request.
+    async with Harness(probe_interval_s=0.05, stuck_grace_s=0.1) as h:
+        await asyncio.sleep(0.05)
+        h.a.pause_silently()
+        body = completion_body(5)
+        async with h.http.post(h.url("/v1/completions"), json=body) as resp:
+            objs = parse_sse((await resp.read()).decode())
+        assert content_text(objs, chat=False) == tokens("b", 5)
+        assert usage_chunks(objs)[0]["tre_reissue"]["kind"] == "stuck"
+        assert h.sidecar.metrics.events["stuck_detected"] == 1
+
+
+# ---------------------------------------------------------------- transport
+
+
+@pytest.mark.asyncio
+async def test_sse_split_across_tcp_reads_is_spliced_correctly():
+    async with Harness(a_fragment=True, b_fragment=True, a_hold_at=6) as h:
+        _, _, raw, objs = await h.stream("/v1/completions", completion_body(20), sleep_after=6)
+        assert content_text(objs, chat=False) == tokens("a", 6) + tokens("b", 14)
+        assert finishes(objs) == ["length"]
+        assert usage_chunks(objs)[0]["usage"]["completion_tokens"] == 20
+
+
+@pytest.mark.asyncio
+async def test_large_batch_simultaneous_abort():
+    async with Harness(a_hold_at=5) as h:
+        n = 40
+        requests = [asyncio.ensure_future(h.http.post(h.url("/v1/completions"), json=completion_body(12)))
+                    for _ in range(n)]
+        await _wait_for(lambda: len(h.a.active) == n and all(c.generated == 5 for c in h.a.active.values()),
+                        what="all streams parked")
+        await h.sleep()
+        texts = []
+        for fut in requests:
+            resp = await asyncio.wait_for(fut, 10)
+            async with resp:
+                objs = parse_sse((await resp.read()).decode())
+            texts.append(content_text(objs, chat=False))
+            assert usage_chunks(objs)[0]["usage"]["completion_tokens"] == 12
+        assert all(t == tokens("a", 5) + tokens("b", 7) for t in texts)
+        assert h.sidecar.metrics.reissue == {("abort", "ok"): n}
+        assert len(h.b.generation_requests()) == n
+
+
+@pytest.mark.asyncio
+async def test_sidecar_to_sidecar_multi_level_splice():
+    a = FakeVllm("a", token_delay_s=0.003, hold_at=5)
+    b = FakeVllm("b", token_delay_s=0.003, hold_at=3, target_pod="pod-b:8000")
+    c = FakeVllm("c", token_delay_s=0.002, target_pod="pod-c:8000")
+    servers = [TestServer(x.app()) for x in (a, b, c)]
+    for srv in servers:
+        await srv.start_server()
+    a_srv, b_srv, c_srv = servers
+    side_b = ReissueSidecar(Config(upstream_url=str(b_srv.make_url("")).rstrip("/"),
+                                   gateway_url=str(c_srv.make_url("")).rstrip("/"), model=MODEL, pod_name="pod-b"))
+    sb_srv = TestServer(side_b.build_app())
+    await sb_srv.start_server()
+    side_a = ReissueSidecar(Config(upstream_url=str(a_srv.make_url("")).rstrip("/"),
+                                   gateway_url=str(sb_srv.make_url("")).rstrip("/"), model=MODEL, pod_name="pod-a"))
+    sa_srv = TestServer(side_a.build_app())
+    await sa_srv.start_server()
+    http = aiohttp.ClientSession()
+    try:
+        async def orchestrate():
+            await _wait_for(lambda: any(x.generated == 5 for x in a.active.values()), what="a parked")
+            async with http.post(str(sa_srv.make_url("/sleep")), headers={"X-TRE-Hidden": "1"}) as r:
+                assert r.status == 200
+            await _wait_for(lambda: any(x.generated == 3 for x in b.active.values()), what="b parked")
+            async with http.post(str(sb_srv.make_url("/sleep")), headers={"X-TRE-Hidden": "1"}) as r:
+                assert r.status == 200
+
+        orch = asyncio.ensure_future(orchestrate())
+        async with http.post(str(sa_srv.make_url("/v1/completions")), json=completion_body(20),
+                             headers=GEN_HEADERS) as resp:
+            objs = parse_sse((await resp.read()).decode())
+        await orch
+        assert content_text(objs, chat=False) == tokens("a", 5) + tokens("b", 3) + tokens("c", 12)
+        assert finishes(objs) == ["length"]
+        (usage,) = usage_chunks(objs)
+        assert usage["usage"] == {"prompt_tokens": 4, "completion_tokens": 20, "total_tokens": 24}
+        assert usage["tre_reissue"]["n"] == 2 and usage["tre_reissue"]["target"] == "pod-c:8000"
+        assert {o["id"] for o in objs if o != "[DONE]"} == {"cmpl-orig-req-1-0"}
+        (to_b,) = b.generation_requests()
+        (to_c,) = c.generation_requests()
+        assert to_b["headers"]["X-TRE-Reissue-Depth"] == "1" and to_c["headers"]["X-TRE-Reissue-Depth"] == "2"
+        assert to_b["body"]["max_tokens"] == 15 and to_c["body"]["max_tokens"] == 12
+        assert to_c["body"]["prompt"] == PROMPT + tokens("a", 5) + tokens("b", 3)
+    finally:
+        await http.close()
+        for srv in (sa_srv, sb_srv, *servers):
+            await srv.close()
+
+
+# ---------------------------------------------------------------- M2: stop across the seam
+
+
+@pytest.mark.asyncio
+async def test_stop_string_spanning_the_seam_is_honoured_stream():
+    async with Harness(a_hold_at=5) as h:
+        body = completion_body(20, stop=["a4 b0"])
+        _, _, _, objs = await h.stream("/v1/completions", body, sleep_after=5)
+        assert content_text(objs, chat=False) == "a0 a1 a2 a3 "
+        assert finishes(objs) == ["stop"]
+        (usage,) = usage_chunks(objs)
+        assert usage["tre_reissue"]["stop_at_seam"] is True and usage["tre_reissue"]["outcome"] == "ok"
+        assert usage["usage"]["completion_tokens"] >= 6
+        assert h.b.generation_requests()[0]["body"]["stop"] == ["a4 b0"]
+
+
+@pytest.mark.asyncio
+async def test_stop_string_spanning_the_seam_is_honoured_non_stream():
+    async with Harness(a_hold_at=5) as h:
+        body = completion_body(20, stop=["a4 b0"], stream=False)
+        del body["stream_options"]
+
+        async def trigger():
+            await h.wait_generated(5)
+            await h.sleep()
+
+        sleeper = asyncio.ensure_future(trigger())
+        async with h.http.post(h.url("/v1/completions"), json=body) as resp:
+            obj = await resp.json()
+        await sleeper
+        assert obj["choices"][0]["text"] == "a0 a1 a2 a3 "
+        assert obj["choices"][0]["finish_reason"] == "stop"
+        assert obj["tre_reissue"]["stop_at_seam"] is True
+
+
+@pytest.mark.asyncio
+async def test_stop_inside_the_continuation_is_left_to_the_engine():
+    async with Harness(a_hold_at=5) as h:
+        _, _, _, objs = await h.stream("/v1/completions", completion_body(20, stop=["b3"]), sleep_after=5)
+        assert content_text(objs, chat=False) == tokens("a", 5) + "b0 b1 b2 "
+        assert finishes(objs) == ["stop"]
+        assert "stop_at_seam" not in usage_chunks(objs)[0]["tre_reissue"]
+
+
+# ---------------------------------------------------------------- M3 / L3: budget and params
+
+
+@pytest.mark.asyncio
+async def test_missing_max_tokens_uses_vllm_default_budget():
+    async with Harness(a_hold_at=5) as h:
+        body = completion_body(20)
+        del body["max_tokens"]
+        _, _, _, objs = await h.stream("/v1/completions", body, sleep_after=5)
+        assert h.b.generation_requests()[0]["body"]["max_tokens"] == 11  # 16 - 5
+        assert usage_chunks(objs)[0]["usage"]["completion_tokens"] == 16
+    async with Harness(a_hold_at=4, b_abort_after=1) as h:
+        body = chat_body(20)
+        del body["max_tokens"]
+        await h.stream("/v1/chat/completions", body, sleep_after=4)
+        cont = h.b.generation_requests()[0]["body"]
+        rendered = render_chat(body["messages"], True)
+        assert cont["max_tokens"] == 100000 - len(rendered) - 4
+
+
+@pytest.mark.asyncio
+async def test_logprobs_dropped_and_seed_bumped_in_continuation():
+    async with Harness(a_hold_at=3) as h:
+        body = completion_body(10, logprobs=1, seed=5, response_format={"type": "text"})
+        _, _, _, objs = await h.stream("/v1/completions", body, sleep_after=3)
+        cont = h.b.generation_requests()[0]["body"]
+        assert "logprobs" not in cont and cont["seed"] == 6
+        assert cont["response_format"] == {"type": "text"}
+        assert usage_chunks(objs)[0]["tre_reissue"]["dropped"] == ["logprobs"]
+
+
+@pytest.mark.asyncio
+async def test_render_round_trip_mismatch_falls_back_to_continue_final_message():
+    async with Harness(a_hold_at=3) as h:
+        h.a.detok_suffix = "!"  # the text form no longer re-tokenizes to the same count
+        _, _, _, objs = await h.stream("/v1/chat/completions", chat_body(8), sleep_after=3)
+        (cont,) = h.b.generation_requests()
+        assert cont["path"] == "/v1/chat/completions" and cont["body"]["continue_final_message"] is True
+        assert h.sidecar.metrics.events["render_fallback_roundtrip"] == 1
+        assert content_text(objs, chat=True) == tokens("a", 3) + tokens("b", 5)

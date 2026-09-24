@@ -6,11 +6,16 @@ Mimics exactly the behaviour the sidecar depends on:
   chunk, ``"usage": null`` on every chunk, the finish_reason on the last token chunk, a
   usage-only chunk when ``stream_options.include_usage``, then ``[DONE]``; non-streaming
   JSON responses; ``X-Request-Id`` becomes the engine request id.
+* Stop strings like vLLM: the last ``max_stop_len - 1`` characters are withheld while
+  streaming and flushed with the final chunk (including the abort chunk); output is cut
+  before the stop string (after it with include_stop_str_in_output).
 * ``POST /sleep``: pause (new requests hang until wake), abort every in-flight request
   (the stream gets a final chunk with ``finish_reason: "abort"`` + usage + [DONE]) and
-  answer with the aborted-request snapshot (ids + lengths only). A second /sleep while
+  answer with the engine snapshot - ``[]`` by default, which is what the real image
+  returns (it frees aborted requests before snapshotting them). A second /sleep while
   paused answers ``[]``.
-* ``/wake_up``, ``/is_sleeping``, ``/metrics``, ``/health``, ``/tokenize``, ``/detokenize``.
+* ``/wake_up``, ``/is_sleeping``, ``/metrics``, ``/health``, ``/tokenize`` (chat and
+  prompt forms), ``/detokenize``.
 
 Tokens are ``"<name><i> "`` so the tests can tell which engine produced which part of a
 spliced answer. The prompt length in tokens is the whitespace word count.
@@ -31,6 +36,11 @@ class _Ctl:
         self.prompt_len = prompt_len
         self.generated = 0
         self.abort = False
+        self.aborted = asyncio.Event()
+
+    def do_abort(self) -> None:
+        self.abort = True
+        self.aborted.set()
 
 
 def render_chat(messages: list[dict], add_generation_prompt: bool) -> str:
@@ -48,12 +58,26 @@ class FakeVllm:
         token_delay_s: float = 0.01,
         target_pod: str | None = None,
         abort_after: int | None = None,
+        hold_at: int | None = None,
+        fragment: bool = False,
+        empty_snapshot: bool = True,
+        abort_response_delay_s: float = 0.0,
     ) -> None:
         self.name = name
         self.token_delay_s = token_delay_s
         self.target_pod = target_pod
         #: abort (without any sleep) after this many tokens: an engine-side abort.
         self.abort_after = abort_after
+        #: generation parks before token ``hold_at`` until the request is aborted.
+        self.hold_at = hold_at
+        #: write every SSE event in two TCP pieces, split in the middle.
+        self.fragment = fragment
+        self.empty_snapshot = empty_snapshot
+        self.abort_response_delay_s = abort_response_delay_s
+        self.sleep_status = 200
+        #: appended to /detokenize output (to simulate a non-faithful text round trip)
+        self.detok_suffix = ""
+        self.sleep_hang = False
         self.requests: list[dict[str, Any]] = []
         self.active: dict[str, _Ctl] = {}
         self.paused = False
@@ -83,6 +107,13 @@ class FakeVllm:
         self.paused = True
         self._wake.clear()
 
+    def restart(self) -> None:
+        """A vLLM process restart: awake, nothing in flight."""
+        self.paused = False
+        self._wake.set()
+        for ctl in list(self.active.values()):
+            ctl.do_abort()
+
     def generation_requests(self) -> list[dict[str, Any]]:
         return [r for r in self.requests if r["path"].startswith("/v1/")]
 
@@ -91,6 +122,15 @@ class FakeVllm:
 
     def _token(self, index: int) -> str:
         return f"{self.name}{index} "
+
+    async def _write(self, resp: web.StreamResponse, data: bytes) -> None:
+        if self.fragment and len(data) > 4:
+            mid = len(data) // 2
+            await resp.write(data[:mid])
+            await asyncio.sleep(0.003)
+            await resp.write(data[mid:])
+        else:
+            await resp.write(data)
 
     # ------------------------------------------------------------- endpoints
 
@@ -120,6 +160,10 @@ class FakeVllm:
         max_tokens = body.get("max_completion_tokens") or body.get("max_tokens") or 16
         stream = bool(body.get("stream"))
         include_usage = bool((body.get("stream_options") or {}).get("include_usage"))
+        stop = body.get("stop") or []
+        stops = [stop] if isinstance(stop, str) else list(stop)
+        include_stop = bool(body.get("include_stop_str_in_output"))
+        withhold = 0 if include_stop or not stops else max(len(s) for s in stops) - 1
         ctl = _Ctl(rid, prompt_len)
         self.active[rid] = ctl
         obj_type = "chat.completion.chunk" if chat else "text_completion"
@@ -142,22 +186,43 @@ class FakeVllm:
             return {"prompt_tokens": prompt_len, "completion_tokens": ctl.generated,
                     "total_tokens": prompt_len + ctl.generated}
 
+        def stop_cut(text: str) -> int | None:
+            hits = [(text.find(s), s) for s in stops if s and text.find(s) != -1]
+            if not hits:
+                return None
+            pos, s = min(hits)
+            return pos + len(s) if include_stop else pos
+
+        async def next_token(index: int) -> bool:
+            """False when the request must end with abort before this token."""
+            if self.hold_at is not None and index == self.hold_at:
+                await ctl.aborted.wait()
+            await asyncio.sleep(self.token_delay_s)
+            if ctl.abort or (self.abort_after is not None and index >= self.abort_after):
+                return False
+            return True
+
         try:
             if not stream:
-                text = []
+                text = ""
                 finish = "length"
                 for index in range(max_tokens):
-                    await asyncio.sleep(self.token_delay_s)
-                    if ctl.abort or (self.abort_after is not None and index >= self.abort_after):
+                    if not await next_token(index):
                         finish = "abort"
+                        if self.abort_response_delay_s:
+                            await asyncio.sleep(self.abort_response_delay_s)
                         break
-                    text.append(self._token(index))
+                    text += self._token(index)
                     ctl.generated += 1
+                    cut = stop_cut(text)
+                    if cut is not None:
+                        text, finish = text[:cut], "stop"
+                        break
                 if chat:
-                    choice = {"index": 0, "message": {"role": "assistant", "content": "".join(text)},
+                    choice = {"index": 0, "message": {"role": "assistant", "content": text},
                               "logprobs": None, "finish_reason": finish}
                 else:
-                    choice = {"index": 0, "text": "".join(text), "logprobs": None, "finish_reason": finish,
+                    choice = {"index": 0, "text": text, "logprobs": None, "finish_reason": finish,
                               "stop_reason": None}
                 obj = dict(base, object="chat.completion" if chat else "text_completion", choices=[choice],
                            usage=usage())
@@ -171,20 +236,29 @@ class FakeVllm:
                 if chat:
                     # vLLM sends the role chunk with the first engine output.
                     await asyncio.sleep(self.token_delay_s)
-                    await resp.write(_sse(chunk("", None, role=True)))
-                finish = None
+                    await self._write(resp, _sse(chunk("", None, role=True)))
+                full, sent = "", 0
                 for index in range(max_tokens):
-                    await asyncio.sleep(self.token_delay_s)
-                    if ctl.abort or (self.abort_after is not None and index >= self.abort_after):
-                        await resp.write(_sse(chunk("", "abort")))
-                        finish = "abort"
+                    if not await next_token(index):
+                        # the final (abort) output flushes the withheld text
+                        await self._write(resp, _sse(chunk(full[sent:], "abort")))
                         break
                     ctl.generated += 1
+                    full += self._token(index)
+                    cut = stop_cut(full)
+                    if cut is not None:
+                        await self._write(resp, _sse(chunk(full[sent:cut], "stop")))
+                        break
                     last = index == max_tokens - 1
-                    await resp.write(_sse(chunk(self._token(index), "length" if last else None)))
+                    if last:
+                        await self._write(resp, _sse(chunk(full[sent:], "length")))
+                        break
+                    upto = max(sent, len(full) - withhold)
+                    await self._write(resp, _sse(chunk(full[sent:upto], None)))
+                    sent = upto
                 if include_usage:
-                    await resp.write(_sse(dict(base, choices=[], usage=usage())))
-                await resp.write(b"data: [DONE]\n\n")
+                    await self._write(resp, _sse(dict(base, choices=[], usage=usage())))
+                await self._write(resp, b"data: [DONE]\n\n")
                 await resp.write_eof()
             except (ConnectionResetError, ConnectionError):
                 self.disconnects += 1
@@ -195,22 +269,22 @@ class FakeVllm:
     async def _sleep(self, request: web.Request) -> web.Response:
         self.requests.append({"path": "/sleep", "headers": dict(request.headers), "body": None})
         self.sleep_calls += 1
+        if self.sleep_hang:
+            await asyncio.sleep(3600)
+        if self.sleep_status != 200:
+            return web.Response(status=self.sleep_status, text="engine refused")
         if self.paused:
             return web.Response(text="[]")
         self.paused = True
         self._wake.clear()
         snapshot = []
         for ctl in list(self.active.values()):
-            ctl.abort = True
+            ctl.do_abort()
             snapshot.append({"request_id": ctl.request_id, "priority": 0, "status": 9, "stop_reason": None,
                              "all_token_len": ctl.prompt_len + ctl.generated,
                              "original_prompt_len": ctl.prompt_len, "generated_len": ctl.generated})
-        for _ in range(500):
-            if not any(ctl.abort for ctl in self.active.values()):
-                break
-            await asyncio.sleep(0.005)
         await asyncio.sleep(0.02)  # the engine offload itself
-        return web.Response(text=json.dumps(snapshot))
+        return web.Response(text=json.dumps([] if self.empty_snapshot else snapshot))
 
     async def _wake_up(self, request: web.Request) -> web.Response:
         self.requests.append({"path": "/wake_up", "headers": dict(request.headers), "body": None})
@@ -233,13 +307,16 @@ class FakeVllm:
 
     async def _tokenize(self, request: web.Request) -> web.Response:
         body = await self._record(request)
-        rendered = render_chat(body["messages"], body.get("add_generation_prompt", True))
-        tokens = [ord(c) for c in rendered]
+        if "messages" in body:
+            text = render_chat(body["messages"], body.get("add_generation_prompt", True))
+        else:
+            text = body["prompt"]
+        tokens = [ord(c) for c in text]
         return web.json_response({"count": len(tokens), "max_model_len": 100000, "tokens": tokens})
 
     async def _detokenize(self, request: web.Request) -> web.Response:
         body = await self._record(request)
-        return web.json_response({"prompt": "".join(chr(t) for t in body["tokens"])})
+        return web.json_response({"prompt": "".join(chr(t) for t in body["tokens"]) + self.detok_suffix})
 
 
 def _sse(obj: dict) -> bytes:
