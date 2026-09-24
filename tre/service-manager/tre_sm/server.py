@@ -11,6 +11,7 @@ from tre_sm.allocator.topology import K8sPodSnapshot, pod_records_from_snapshots
 from tre_sm.allocator.slots import Binding, Slot
 from tre_sm.app import create_service_app
 from tre_sm.gpu_truth import RedisGpuTruth
+from tre_sm.ops.drain import DrainConfig
 from tre_sm.ops.k8s_ops import K8sOps
 from tre_sm.ops.vllm_ops import VllmOps
 from tre_sm.state.reconcile import PodRecord
@@ -98,6 +99,7 @@ def create_app() -> FastAPI:
         supervisor_interval_s=float(
             os.environ.get("TRE_SM_SUPERVISOR_INTERVAL_S", "5")
         ),
+        drain_config=DrainConfig.from_env(os.environ),
     )
 
 

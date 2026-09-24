@@ -5,6 +5,7 @@ from fastapi import FastAPI
 from tre_common.registry import Registry
 from tre_sm.api.v2 import RuntimePodOps, ServiceManagerV2, VllmRuntimeOps, create_app
 from tre_sm.gpu_truth import GpuTruthProvider
+from tre_sm.ops.drain import DrainConfig
 from tre_sm.state.reconcile import K8sPodClient
 from tre_sm.state.operations import OperationCoordinator
 from tre_sm.state.safety import ClusterSafetyGate
@@ -31,6 +32,7 @@ def create_service_app(
     gpu_leases: GpuLeaseStore | None = None,
     supervisor_enabled: bool = False,
     supervisor_interval_s: float = 5.0,
+    drain_config: DrainConfig | None = None,
 ) -> FastAPI:
     service = ServiceManagerV2(
             registry,
@@ -46,6 +48,7 @@ def create_service_app(
             safety_gate=safety_gate,
             fleet_store=fleet_store,
             gpu_leases=gpu_leases,
+            drain_config=drain_config,
         )
     app = create_app(service)
     if supervisor_enabled:

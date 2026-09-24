@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import time
-from typing import Callable, Protocol
+from typing import TYPE_CHECKING, Callable, Protocol
 
 from tre_sm.allocator.slots import Binding, Slot
 from tre_sm.allocator.topology import GPU_IDS_ANNOTATION, K8sPodSnapshot
@@ -14,6 +14,9 @@ from tre_sm.state.reconcile import (
 )
 from tre_sm.state.safety import ClusterSafetyGate
 from tre_sm.state.gpu_leases import GpuLeaseStore
+
+if TYPE_CHECKING:  # pragma: no cover - typing only, avoids an import cycle.
+    from tre_sm.ops.drain import SleepAuditLog, SleepDrainer
 
 
 class FleetRuntimeOps(Protocol):
@@ -43,6 +46,8 @@ class FleetRepairExecutor:
         poll_interval_s: float = 2.0,
         monotonic: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
+        drainer: "SleepDrainer | None" = None,
+        sleep_audit: "SleepAuditLog | None" = None,
     ) -> None:
         self._runtime = runtime_ops
         self._vllm = vllm_ops
@@ -52,6 +57,8 @@ class FleetRepairExecutor:
         self._poll_interval_s = poll_interval_s
         self._monotonic = monotonic
         self._sleep = sleep
+        self._drainer = drainer
+        self._sleep_audit = sleep_audit
 
     def run(
         self,
@@ -201,7 +208,14 @@ class FleetRepairExecutor:
         return repair_ids
 
     def _sleep_binding(self, binding: Binding, pod_ip: str) -> None:
+        # Both call sites write the HIDDEN annotation right before this, so
+        # the drainer only has to wait for unroutable + empty queues.
+        drain_record = None
+        if self._drainer is not None:
+            drain_record = self._drainer.drain(binding, pod_ip)
         result = self._vllm.sleep(pod_ip, port=8000)
+        if self._sleep_audit is not None:
+            self._sleep_audit.record_sleep(binding, pod_ip, result, drain_record)
         if not bool(getattr(result, "success", False)):
             raise RuntimeError(
                 f"vLLM sleep failed for {binding.binding_id}: "

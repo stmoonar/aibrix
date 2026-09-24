@@ -61,6 +61,19 @@ class VllmOps:
             return None
         return _parse_is_sleeping(response)
 
+    def metrics(self, pod_ip: str, *, port: int | None = None) -> str | None:
+        """Prometheus text from GET /metrics, or None on any failure/non-2xx."""
+        url = f"http://{pod_ip}:{port or self._default_port}/metrics"
+        try:
+            response = self._http.get(url, timeout=self._timeout_s)
+            status = int(response.status_code)
+        except Exception:
+            return None
+        if not (200 <= status < 300):
+            return None
+        text = getattr(response, "text", None)
+        return text if isinstance(text, str) else None
+
     def wait_until_ready(
         self,
         pod_ip: str,

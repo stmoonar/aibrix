@@ -27,6 +27,7 @@ from tre_sm.allocator.slots import (
 )
 from tre_sm.allocator.topology import K8sPodSnapshot
 from tre_sm.gpu_truth import GpuTruthProvider
+from tre_sm.ops.drain import DrainConfig, SleepAuditLog, SleepDrainer
 from tre_sm.ops.k8s_ops import StartupPodRecord
 from tre_sm.state.reconcile import K8sPodClient, POD_STATE_AWAKE, POD_STATE_HIDDEN, POD_STATE_SLEEPING, audit_state, reconcile_state
 from tre_sm.state.operations import OperationBusy, OperationCoordinator
@@ -130,6 +131,8 @@ class ServiceManagerV2:
         safety_gate: ClusterSafetyGate | None = None,
         fleet_store: FleetStateStore | None = None,
         gpu_leases: GpuLeaseStore | None = None,
+        drain_config: DrainConfig | None = None,
+        sleep_drainer: SleepDrainer | None = None,
     ) -> None:
         self._registry = registry
         self._store = store
@@ -146,6 +149,20 @@ class ServiceManagerV2:
         self._gpu_leases = gpu_leases
         self._supervisor = None
         self._fleet_repair = None
+        self._drain_config = drain_config
+        # /sleep responses are always kept in memory (no I/O); hide, drain,
+        # journal and log only happen when the drain flag is on.
+        self._sleep_audit = SleepAuditLog()
+        # ``sleep_drainer`` is a test seam (fake clock); it implies enabled.
+        self._drainer: SleepDrainer | None = sleep_drainer
+        if (
+            self._drainer is None
+            and drain_config is not None
+            and drain_config.enabled
+            and runtime_ops is not None
+            and vllm_ops is not None
+        ):
+            self._drainer = SleepDrainer(runtime_ops, vllm_ops, drain_config)
         if (
             runtime_ops is not None
             and vllm_ops is not None
@@ -164,6 +181,8 @@ class ServiceManagerV2:
                 vllm_ops=vllm_ops,
                 safety_gate=safety_gate,
                 gpu_leases=gpu_leases,
+                drainer=self._drainer,
+                sleep_audit=self._sleep_audit,
             )
 
     def set_supervisor(self, supervisor) -> None:
@@ -173,6 +192,12 @@ class ServiceManagerV2:
         if self._supervisor is None:
             return {"running": False, "enabled": False}
         return {"enabled": True, **asdict(self._supervisor.snapshot())}
+
+    def get_sleep_audit(self, *, limit: int = 100) -> dict:
+        return {
+            "enabled": self._drainer is not None,
+            "records": self._sleep_audit.records(limit),
+        }
 
     def get_state(self) -> dict:
         snapshot = self._store.load()
@@ -214,8 +239,16 @@ class ServiceManagerV2:
         actions: list[dict] = []
         updated_by_serve = {binding.serve_id: binding for binding in snapshot.bindings}
 
+        hidden_at: dict[str, float] = {}
+        if self._drainer is not None:
+            # Hide every binding about to sleep up front so their drain
+            # windows overlap instead of adding up.
+            for binding in plan["sleep"]:
+                hidden_at[binding.serve_id] = self._drainer.hide(binding)
         for binding in plan["sleep"]:
-            self._apply_runtime_power_action(binding, action="sleep")
+            self._apply_runtime_power_action(
+                binding, action="sleep", hidden_at=hidden_at.get(binding.serve_id)
+            )
             updated_by_serve[binding.serve_id] = replace(
                 binding, awake=False, hidden=False
             )
@@ -1292,7 +1325,20 @@ class ServiceManagerV2:
                     )
         return issues
 
-    def _apply_runtime_power_action(self, binding: Binding, *, action: str) -> None:
+    def _apply_runtime_power_action(
+        self,
+        binding: Binding,
+        *,
+        action: str,
+        hidden_at: float | None = None,
+        unroutable_confirmed: bool = False,
+    ) -> None:
+        """Run one vLLM power transition.
+
+        ``hidden_at``/``unroutable_confirmed`` only matter when the drain flag
+        is on: they tell the drainer the caller already hid the pod (and
+        when), or already confirmed it unroutable.
+        """
         if self._runtime_ops is None or self._vllm_ops is None:
             return
         snapshot = self._snapshot_for_binding(binding)
@@ -1300,7 +1346,20 @@ class ServiceManagerV2:
             raise ValueError(f"pod {binding.serve_id} has no pod IP for {action}")
 
         if action == "sleep":
+            drain_record = None
+            if self._drainer is not None:
+                if hidden_at is None:
+                    hidden_at = self._drainer.hide(binding)
+                drain_record = self._drainer.drain(
+                    binding,
+                    snapshot.pod_ip,
+                    hidden_at=hidden_at,
+                    unroutable_confirmed=unroutable_confirmed,
+                )
             result = self._vllm_ops.sleep(snapshot.pod_ip, port=8000)
+            self._sleep_audit.record_sleep(
+                binding, snapshot.pod_ip, result, drain_record
+            )
             state = POD_STATE_SLEEPING
         elif action == "wake":
             if self._gpu_leases is not None:
@@ -1371,10 +1430,16 @@ class ServiceManagerV2:
 
         actions: list[dict] = []
         self._runtime_ops.write_binding_annotations(binding, state=POD_STATE_HIDDEN)
+        hidden_at = self._drainer.now() if self._drainer is not None else None
         actions.append({"action": "hide", "serve_id": binding.serve_id})
         self._runtime_ops.wait_pod_unroutable(binding)
 
-        self._apply_runtime_power_action(binding, action="sleep")
+        self._apply_runtime_power_action(
+            binding,
+            action="sleep",
+            hidden_at=hidden_at,
+            unroutable_confirmed=True,
+        )
         actions.append({"action": "sleep", "serve_id": binding.serve_id})
 
         self._runtime_ops.delete_model_deployment(binding)
@@ -1675,6 +1740,12 @@ def create_app(service: ServiceManagerV2) -> FastAPI:
     @app.get("/v2/supervisor")
     def get_supervisor() -> dict:
         return service.get_supervisor_state()
+
+    @app.get("/v2/sleep-audit")
+    def get_sleep_audit(limit: int = 100) -> dict:
+        if limit < 1 or limit > 1000:
+            raise HTTPException(status_code=400, detail="limit must be between 1 and 1000")
+        return service.get_sleep_audit(limit=limit)
 
 
     @app.post("/v2/defrag")
