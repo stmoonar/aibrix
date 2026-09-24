@@ -788,7 +788,8 @@ class CellFactory:
     def new(self, shape: str, role: str, duration_s: float, **fields) -> DesignCell:
         if role not in ROLES:
             raise ValueError(f"unknown role {role!r}")
-        if shape not in gen.ALL_SHAPES and shape not in gen.ACCEPTANCE_SHAPES:
+        if (shape not in gen.ALL_SHAPES and shape not in gen.ACCEPTANCE_SHAPES
+                and shape not in gen.T14_SHAPES):
             raise ValueError(f"unknown shape {shape!r}")
         if role == ROLE_BOUNDARY:
             if fields.get("stage") not in (STAGE_COARSE, STAGE_BISECT):
