@@ -121,6 +121,10 @@ DT_REF_S = 10.0
 WP_GRID: tuple[float, ...] = (0.0, 0.0025, 0.005, 0.01, 0.02, 0.03, 0.05, 0.1, 0.2)
 LAMBDAS: tuple[float, ...] = (0.0, 1.0, 2.0, 3.0)
 LAMBDA_WAIT = 1.0
+#: The D13 CI gate every verdict is judged against (``--max-ci-half-width-fraction``;
+#: None = adaptive_boundary.MAX_CI_HALF_WIDTH_FRACTION, 20 % since 2026-09-24, the old
+#: 15 % is reported as ``stop_rule_15``).
+D13_MAX_CI_FRACTION: Optional[float] = None
 #: lambda moves off LAMBDA_WAIT only when the best lambda beats it by this much BA.
 LAMBDA_MIN_GAIN = 0.02
 #: w_p the alpha stage runs at: the D3 values current on 2026-09-22 (plan 6.11 D3,
@@ -885,7 +889,7 @@ def verdict(model: str, label, p: Mapping[str, Any], tau: float, w_p: float, lam
     try:
         return tv.verdict_report(model=model, fitting_csv=p["fitting"], families=p["families"], spec=spec,
                                  label=label, trim_ramp_windows=TRIM_RAMP_WINDOWS, n_resamples=n_res,
-                                 family_resamples=fam_res, seed=SEED)
+                                 family_resamples=fam_res, seed=SEED, max_ci_fraction=D13_MAX_CI_FRACTION)
     except tv.VerdictError as exc:
         return {"error": str(exc)}
 
@@ -1006,7 +1010,7 @@ def stage_wp(model: str, label, p: Mapping[str, Any], alpha_doc: Mapping[str, An
 
 
 def stage_wp_v1(model: str, label, p: Mapping[str, Any], alpha_doc: Mapping[str, Any],
-                sources: Mapping[str, Path]) -> dict:
+                sources: Mapping[str, Path], *, wp_grid: str = "with_zero") -> dict:
     """``wp --lambda-method v1``: lambda_wait and w_p from v1's selection (stages A-C of
     ``fit_tre_parameters_from_runs.py``, :mod:`scripts.v1_lambda_fit`) on the D16 fitting
     windows; ``sources`` (run -> standard dataset dir) are where the average TPOT of v1's
@@ -1017,7 +1021,8 @@ def stage_wp_v1(model: str, label, p: Mapping[str, Any], alpha_doc: Mapping[str,
     tau = published_tau(alpha_doc)
     if tau is None:
         raise SystemExit(f"{model}: the alpha stage published no tau ({alpha_doc.get('rule')})")
-    sel = v1_lambda_fit.fit_model(model, label, p["fitting"], trim=TRIM_RAMP_WINDOWS, sources=sources)
+    sel = v1_lambda_fit.fit_model(model, label, p["fitting"], trim=TRIM_RAMP_WINDOWS, sources=sources,
+                                  wp_grid=wp_grid)
     lam, wp = sel["lambda_wait"], sel["w_p"]
     print(model, "v1 selection", {"lambda_wait": lam, "w_p": wp,
                                   "objective_adjusted": sel["best_c"]["objective_adjusted"]}, flush=True)
@@ -1036,6 +1041,18 @@ def stage_wp_v1(model: str, label, p: Mapping[str, Any], alpha_doc: Mapping[str,
 def bucket(length: float) -> str:
     return ("<=256" if length <= 256 else "257-1024" if length <= 1024
             else "1025-2048" if length <= 2048 else ">2048")
+
+
+def _legacy_stop(stop: Mapping[str, Any]) -> Optional[bool]:
+    """The D13 verdict at the pre-2026-09-24 CI gate (15 %): every other condition as
+    judged, the CI half width below 15 % (reported, never gating)."""
+    from scripts import adaptive_boundary as boundary
+
+    frac = stop.get("ci_half_width_fraction")
+    if frac is None:
+        return None
+    others = [r for r in stop.get("reasons") or [] if not str(r).startswith("CI half width")]
+    return bool(not others and frac < boundary.LEGACY_CI_HALF_WIDTH_FRACTION)
 
 
 #: What ``final.json`` says instead of the M numbers when the stage ran with ``--no-holdout``.
@@ -1069,7 +1086,9 @@ def stage_final(model: str, label, p: Mapping[str, Any], wp_doc: Mapping[str, An
         s["theta_family_rule"] = v["published"]["family_rule_theta"]
         return {
             "model": model, "tau_s": tau, "alpha": alpha_of(tau), "w_p": wp, "lambda_wait": lam,
-            **s, "stop_rule_15": v["stop_rule"]["satisfied"],
+            **s, "stop_rule_d13": v["stop_rule"]["satisfied"],
+            "d13_max_ci_half_width_fraction": v["stop_rule"].get("max_ci_half_width_fraction"),
+            "stop_rule_15": _legacy_stop(v["stop_rule"]),
             "appendix_10_met": v["stop_rule"].get("appendix_ci_target_met"),
             "train_ba_at_published": threshold_balanced_accuracy(
                 spec.load(p["fitting"], label, TRIM_RAMP_WINDOWS), theta=v["published"]["theta_m"],
@@ -1116,7 +1135,9 @@ def stage_final(model: str, label, p: Mapping[str, Any], wp_doc: Mapping[str, An
     s["theta_family_rule"] = v["published"]["family_rule_theta"]
     return {
         "model": model, "tau_s": tau, "alpha": alpha_of(tau), "w_p": wp, "lambda_wait": lam,
-        **s, "stop_rule_15": v["stop_rule"]["satisfied"],
+        **s, "stop_rule_d13": v["stop_rule"]["satisfied"],
+        "d13_max_ci_half_width_fraction": v["stop_rule"].get("max_ci_half_width_fraction"),
+        "stop_rule_15": _legacy_stop(v["stop_rule"]),
         "appendix_10_met": v["stop_rule"].get("appendix_ci_target_met"),
         "train_ba_at_published": threshold_balanced_accuracy(
             spec.load(p["fitting"], label, TRIM_RAMP_WINDOWS), theta=theta,
@@ -2130,6 +2151,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--no-sentinels", action="store_true",
                     help="trainset: leave the sentinel cells out of the training set (default: they train)")
     ap.add_argument("--alpha-rule", choices=ALPHA_RULES, default="d4prime")
+    ap.add_argument("--max-ci-half-width-fraction", type=float, default=None,
+                    help="the D13 stop rule's CI gate (fraction of theta; default "
+                         "adaptive_boundary.MAX_CI_HALF_WIDTH_FRACTION = 0.20 since 2026-09-24; "
+                         "0.15 reproduces the rule before that)")
+    ap.add_argument("--v1-wp-grid", choices=("with_zero", "v1"), default="with_zero",
+                    help="wp --lambda-method v1: w_p grid of stages B / C - with_zero (default, user "
+                         "2026-09-24): v1's 0.01..0.08 / 0.005 plus 0; v1: v1's grid as is")
     ap.add_argument("--lambda-method", choices=LAMBDA_METHODS, default="v2",
                     help="wp: v2 (default) = D17 w_p + the BA lambda check; v1 = lambda_wait and w_p "
                          "from v1's selection (scripts.v1_lambda_fit, user 2026-09-24)")
@@ -2161,6 +2189,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     help="accept: cell-bootstrap resamples of the A-C intervals")
     args = ap.parse_args(argv)
     command = ["python", "-m", "scripts.dline_refit", *(sys.argv[1:] if argv is None else argv)]
+    global D13_MAX_CI_FRACTION
+    D13_MAX_CI_FRACTION = args.max_ci_half_width_fraction
 
     if args.stage in ("verify-freeze", "accept"):
         if args.freeze_file is None:
@@ -2269,7 +2299,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if not sep or not run or not d:
                 ap.error(f"--requests-dataset {text!r}: expected RUN=DIR")
             sources[run] = Path(d)
-        doc = stage_wp_v1(model, label, p, _read_json(out / "alpha.json"), sources)
+        doc = stage_wp_v1(model, label, p, _read_json(out / "alpha.json"), sources, wp_grid=args.v1_wp_grid)
     elif args.stage == "wp":
         doc = stage_wp(model, label, p, _read_json(out / "alpha.json"))
     else:

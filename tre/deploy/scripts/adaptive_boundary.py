@@ -700,9 +700,14 @@ class BoundarySearch:
 #: The fit must publish a theta from at least this fraction of bootstrap resamples.
 MIN_PUBLISH_RATE = 0.9
 #: ... and its confidence interval must be narrower than this fraction of theta. Plan
-#: 2026-09-21 6.11 D13: 15 % (half width ~ 1/sqrt(n): 10 % needs 2.25x the independent
-#: windows; v1 had no CI gate at all, so 15 % is not a relaxation).
-MAX_CI_HALF_WIDTH_FRACTION = 0.15
+#: 2026-09-21 6.11 D13 set 15 % (half width ~ 1/sqrt(n): 10 % needs 2.25x the independent
+#: windows; v1 had no CI gate at all); the user relaxed it to 20 % on 2026-09-24 (the v1
+#: lambda refit of 7b / 8b sat at 17-19 %). The gate is a parameter (``max_ci_fraction``,
+#: ``dline_refit --max-ci-half-width-fraction``); the old 15 % is still reported
+#: (:data:`LEGACY_CI_HALF_WIDTH_FRACTION`, ``legacy_ci_target_met``), never gating.
+MAX_CI_HALF_WIDTH_FRACTION = 0.20
+#: D13 as it stood until 2026-09-24 - an appendix field, never gates the stop.
+LEGACY_CI_HALF_WIDTH_FRACTION = 0.15
 #: The tighter target reported in the appendix - informational, never gates the stop.
 APPENDIX_CI_HALF_WIDTH_FRACTION = 0.10
 #: Windows each family needs *near the boundary* before the campaign can stop. Below this
@@ -727,12 +732,29 @@ class StopVerdict:
     ci_half_width_fraction: Optional[float] = None
     max_ci_half_width_fraction: float = MAX_CI_HALF_WIDTH_FRACTION
     appendix_ci_half_width_fraction: float = APPENDIX_CI_HALF_WIDTH_FRACTION
+    legacy_ci_half_width_fraction: float = LEGACY_CI_HALF_WIDTH_FRACTION
 
     @property
     def appendix_ci_target_met(self) -> Optional[bool]:
         if self.ci_half_width_fraction is None:
             return None
         return self.ci_half_width_fraction < self.appendix_ci_half_width_fraction
+
+    @property
+    def legacy_ci_target_met(self) -> Optional[bool]:
+        """The CI condition of D13 at its pre-2026-09-24 gate (15 %), reported only."""
+        if self.ci_half_width_fraction is None:
+            return None
+        return self.ci_half_width_fraction < self.legacy_ci_half_width_fraction
+
+    @property
+    def satisfied_at_legacy_gate(self) -> Optional[bool]:
+        """The whole rule as it was judged before 2026-09-24: every other condition as
+        judged here, the CI gate at 15 % (reported, never gating)."""
+        if self.ci_half_width_fraction is None:
+            return None
+        others = [r for r in self.reasons if not r.startswith("CI half width")]
+        return not others and self.ci_half_width_fraction < self.legacy_ci_half_width_fraction
 
     def as_dict(self) -> dict:
         return {
@@ -743,6 +765,9 @@ class StopVerdict:
             "max_ci_half_width_fraction": self.max_ci_half_width_fraction,
             "appendix_ci_half_width_fraction": self.appendix_ci_half_width_fraction,
             "appendix_ci_target_met": self.appendix_ci_target_met,
+            "legacy_ci_half_width_fraction": self.legacy_ci_half_width_fraction,
+            "legacy_ci_target_met": self.legacy_ci_target_met,
+            "satisfied_at_legacy_gate": self.satisfied_at_legacy_gate,
         }
 
 

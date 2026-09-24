@@ -102,7 +102,7 @@ def test_the_three_stages_find_a_planted_lambda_and_refine_jointly() -> None:
     wps = sorted({c["w_p"] for c in res["stage_c"]})
     assert lams == [lam_a - 0.25, lam_a - 0.125, lam_a, lam_a + 0.125, lam_a + 0.25]
     assert wps == [0.035, 0.0375, 0.04, 0.0425, 0.045]
-    assert len(res["stage_c"]) == 25 and len(res["stage_a"]) == 13 and len(res["stage_b"]) == 15
+    assert len(res["stage_c"]) == 25 and len(res["stage_a"]) == 13 and len(res["stage_b"]) == 16
     assert (res["lambda_wait"], res["w_p"]) == (res["best_c"]["lambda_wait"], res["best_c"]["w_p"])
     assert 2.5 <= res["lambda_wait"] <= 3.25
 
@@ -121,8 +121,27 @@ def _synthetic_wp(w_p: float, n: int = 240, seed: int = 5) -> list[v1.V1Window]:
     return out
 
 
+def test_the_w_p_grids() -> None:
+    v1_grid = v1.w_p_grid("v1")
+    assert v1_grid == v1.frange(0.01, 0.08, 0.005) and len(v1_grid) == 15
+    assert v1.w_p_grid("with_zero") == [0.0, *v1_grid] and v1.w_p_grid() == v1.w_p_grid("with_zero")
+    with pytest.raises(ValueError):
+        v1.w_p_grid("nope")
+
+
+def test_with_zero_reaches_w_p_zero_and_refines_down_to_it() -> None:
+    res = v1.search(_synthetic_wp(0.0))           # default grid: with_zero
+    assert res["best_b"]["w_p"] == 0.0 and res["w_p_grid"]["name"] == "with_zero"
+    assert res["w_p_grid"]["stage_b"][0] == 0.0 and len(res["w_p_grid"]["stage_b"]) == 16
+    assert sorted({c["w_p"] for c in res["stage_c"]}) == [0.0, 0.0025, 0.005]
+    assert res["w_p"] in (0.0, 0.0025, 0.005)
+    # the prior penalty still applies at 0: 0.002 * ((0 - 0.04) / 0.04)^2
+    c0 = next(c for c in res["stage_b"] if c["w_p"] == 0.0)
+    assert c0["w_p_penalty"] == pytest.approx(0.002)
+
+
 def test_stage_c_is_clamped_to_the_grid() -> None:
-    res = v1.search(_synthetic_wp(0.0))
+    res = v1.search(_synthetic_wp(0.0), wp_grid="v1")
     assert res["best_a"]["lambda_wait"] == 1.0 and res["best_b"]["w_p"] == 0.01
     assert sorted({c["lambda_wait"] for c in res["stage_c"]}) == [1.0, 1.125, 1.25]
     assert sorted({c["w_p"] for c in res["stage_c"]}) == [0.01, 0.0125, 0.015]

@@ -63,6 +63,22 @@ W_P_MIN, W_P_MAX, W_P_STEP = 0.01, 0.08, 0.005
 W_P_PRIOR_CENTER = 0.04
 W_P_PRIOR_STRENGTH = 0.002
 LAMBDA_PENALTY_STRENGTH = 0.0005
+#: w_p grids of stages B / C. ``v1``: v1's arithmetic grid as is. ``with_zero`` (the
+#: default, user 2026-09-24): the same grid plus 0 as one extra point (v1's grid never
+#: reached 0 and the joint refinement pinned w_p to its lower end 0.01 on every model);
+#: stage C then refines over [max(0, w_p_B - 0.005), w_p_B + 0.005] at 0.0025.
+WP_GRIDS = ("with_zero", "v1")
+
+
+def w_p_grid(name: str = "with_zero") -> list[float]:
+    base = frange(W_P_MIN, W_P_MAX, W_P_STEP)
+    if name == "v1":
+        return base
+    if name == "with_zero":
+        return [0.0, *base]
+    raise ValueError(f"unknown w_p grid {name!r} (one of {WP_GRIDS})")
+
+
 #: v1 scores the unfloored signal (``trs_no_floor``).
 SCORE_QMIN = 0.0
 V1_CONSTANTS = {
@@ -317,22 +333,24 @@ def evaluate(windows: Sequence[V1Window], *, w_p: float, lambda_wait: float) -> 
             "avg_pairs": len(pairs)}
 
 
-def search(windows: Sequence[V1Window]) -> dict:
-    """v1 stages A, B, C (:1280-1344)."""
+def search(windows: Sequence[V1Window], *, wp_grid: str = "with_zero") -> dict:
+    """v1 stages A, B, C (:1280-1344); ``wp_grid`` is the w_p grid of stages B / C
+    (:func:`w_p_grid`; the refinement is clamped to that grid's ends)."""
+    grid = w_p_grid(wp_grid)
     stage_a, best_a = [], None
     for lam in frange(LAMBDA_MIN, LAMBDA_MAX, LAMBDA_STEP):
         c = evaluate(windows, w_p=W_P_PRIOR_CENTER, lambda_wait=lam)
         stage_a.append(c)
         best_a = pick_better(best_a, c)
     stage_b, best_b = [], None
-    for wp in frange(W_P_MIN, W_P_MAX, W_P_STEP):
+    for wp in grid:
         c = evaluate(windows, w_p=wp, lambda_wait=float(best_a["lambda_wait"]))
         stage_b.append(c)
         best_b = pick_better(best_b, c)
     lam_lo = max(LAMBDA_MIN, float(best_a["lambda_wait"]) - LAMBDA_STEP)
     lam_hi = min(LAMBDA_MAX, float(best_a["lambda_wait"]) + LAMBDA_STEP)
-    wp_lo = max(W_P_MIN, float(best_b["w_p"]) - W_P_STEP)
-    wp_hi = min(W_P_MAX, float(best_b["w_p"]) + W_P_STEP)
+    wp_lo = max(min(grid), float(best_b["w_p"]) - W_P_STEP)
+    wp_hi = min(max(grid), float(best_b["w_p"]) + W_P_STEP)
     stage_c, best_c = [], None
     for lam in frange(lam_lo, lam_hi, LAMBDA_STEP / 2.0):
         for wp in frange(wp_lo, wp_hi, W_P_STEP / 2.0):
@@ -345,6 +363,8 @@ def search(windows: Sequence[V1Window]) -> dict:
         "stage_a": stage_a, "best_a": best_a, "stage_b": stage_b, "best_b": best_b,
         "stage_c": stage_c, "best_c": best_c,
         "lambda_wait": float(best["lambda_wait"]), "w_p": float(best["w_p"]),
+        "w_p_grid": {"name": wp_grid, "stage_b": grid,
+                     "stage_c": sorted({c["w_p"] for c in stage_c})},
         "flatness": {
             "stage_a_objective_range": max(a_obj) - min(a_obj),
             "stage_a_penalty_at_lambda_4": LAMBDA_PENALTY_STRENGTH * 9.0,
@@ -355,7 +375,7 @@ def search(windows: Sequence[V1Window]) -> dict:
 
 
 def fit_model(model: str, label, fitting_csv: Path, *, trim: int,
-              sources: Mapping[str, Path]) -> dict:
+              sources: Mapping[str, Path], wp_grid: str = "with_zero") -> dict:
     """The v1 selection on one model's D16 fitting CSV; ``sources`` run -> dataset dir
     (the requests.csv the average TPOT is rebuilt from)."""
     req = RequestIndex()
@@ -363,7 +383,7 @@ def fit_model(model: str, label, fitting_csv: Path, *, trim: int,
         if (Path(d) / "requests.csv").exists():
             req.add_dataset(run, Path(d), model)
     windows, stats = load_windows(model, Path(fitting_csv), label, trim=trim, requests=req)
-    res = search(windows)
+    res = search(windows, wp_grid=wp_grid)
     mem = stats["tpot_membership"]
     if mem["checked"] and mem["closed_right_match"] < 0.99 * mem["checked"]:
         raise AssertionError(f"{model}: average-TPOT window membership disagrees with "
@@ -473,6 +493,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--arm", default="primary")
     ap.add_argument("--requests-dataset", action="append", default=[], metavar="RUN=DIR")
     ap.add_argument("--out", type=Path, required=True)
+    ap.add_argument("--wp-grid", choices=WP_GRIDS, default="with_zero")
     args = ap.parse_args(argv)
     label = dr.label_for(args.model, args.arm, args.registry)
     sources = sources_from_trainset(args.fit_dir)
@@ -480,7 +501,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         run, _, d = t.partition("=")
         sources[run] = Path(d)
     doc = fit_model(args.model, label, dr.paths(args.fit_dir, args.model)["fitting"],
-                    trim=dr.TRIM_RAMP_WINDOWS, sources=sources)
+                    trim=dr.TRIM_RAMP_WINDOWS, sources=sources, wp_grid=args.wp_grid)
     args.out.write_text(json.dumps(doc, indent=1, default=str))
     print(f"{args.model}: v1 lambda_wait={doc['lambda_wait']:g} w_p={doc['w_p']:g} -> {args.out}")
     return 0

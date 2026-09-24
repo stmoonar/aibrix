@@ -1135,6 +1135,7 @@ def fit_plan(
                 "min_publish_rate": boundary.MIN_PUBLISH_RATE,
                 "max_ci_half_width_fraction": boundary.MAX_CI_HALF_WIDTH_FRACTION,
                 "appendix_ci_half_width_fraction": boundary.APPENDIX_CI_HALF_WIDTH_FRACTION,
+                "legacy_ci_half_width_fraction": boundary.LEGACY_CI_HALF_WIDTH_FRACTION,
                 "min_family_boundary_windows": boundary.MIN_FAMILY_BOUNDARY_WINDOWS,
                 "remedy": (
                     "add hold cells at the boundary of the shapes already in the set; "

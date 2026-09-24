@@ -272,7 +272,8 @@ def stage_prereg(out: Path, registry: str) -> None:
                       "recall_min": dr.B_RECALL_MIN, "recall_ci_low_min": dr.B_RECALL_CI_LOW_MIN,
                       "false_alarm_max": dr.B_FALSE_ALARM_MAX, "false_alarm_ci_high_max": dr.B_FALSE_ALARM_CI_HIGH_MAX},
                 "C": "TTFT-only recall disclosed, no gate",
-                "D": "training stop rule (D13): CI half width <= 15 %, publish_rate >= 0.9; family gap reported",
+                "D": "training stop rule (D13): CI half width <= 15 % at the time of this pre-registration "
+                     "(2026-09-24: gate relaxed to 20 %, 15 % reported), publish_rate >= 0.9; family gap reported",
             },
             "comparison": ("freeze vs refit on the identical test cells, plus a paired cell bootstrap of "
                            "delta BA / delta recall (refit - freeze). Caveat fixed in advance: test cells of origin "
