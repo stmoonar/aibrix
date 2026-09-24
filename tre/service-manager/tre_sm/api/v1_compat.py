@@ -30,8 +30,15 @@ def create_v1_compat_router(service) -> APIRouter:
             target = max(0, current - scale_value)
         else:
             raise HTTPException(status_code=400, detail="scale_type must be up or down")
+        # APA baseline path (TRE-PATCH P2-APA-001): stays SYNCHRONOUS and never
+        # drains (drain_s=0: hide -> unroutable -> /sleep; the reissue sidecar
+        # continues whatever was aborted). The Go controller reads
+        # /models_replicas right after this returns, so the call must only
+        # return once the change is applied - and with drain 0 it is fast.
         try:
-            response = service.put_model_target(model_name, wake_replicas=target)
+            response = service.put_model_target(
+                model_name, wake_replicas=target, drain_s=0
+            )
         except (KeyError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return {"requested": scale_value, "actual": len(response["actions"])}

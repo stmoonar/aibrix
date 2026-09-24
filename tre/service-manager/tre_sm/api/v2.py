@@ -39,6 +39,7 @@ from tre_sm.ops.drain import (
     SleepDrainer,
     accepts_kwarg,
     check_reissue_coupling,
+    normalize_drain_s,
 )
 from tre_sm.ops.k8s_ops import StartupPodRecord
 from tre_sm.state.drain_markers import DrainMarker, DrainMarkerStore
@@ -79,6 +80,8 @@ class _StagedSleep:
     token: str
     pod_ip: str
     hidden_at: float
+    # Per-call drain budget (None = TRE_SM_DRAIN_BEFORE_SLEEP default, 0 = none).
+    drain_s: float | None = None
 
 
 @dataclass
@@ -252,11 +255,25 @@ class ServiceManagerV2:
         return {
             "enabled": self._drainer is not None,
             "hide_before_sleep": self._hide_enabled,
+            # The DEFAULT drain for calls without drain_s (per-call design).
             "drain_before_sleep": bool(
                 self._hide_enabled and self._drain_config.enabled
             ),
             "records": self._sleep_audit.records(limit),
         }
+
+    def _normalize_call_drain(self, drain_s) -> float | None:
+        """Per-call drain budget: None = the TRE_SM_DRAIN_BEFORE_SLEEP default,
+        0 = sleep right after the pod is unroutable, > 0 = wait (bounded) for
+        in-flight requests. Draining a pod that still receives traffic never
+        converges, so any drain needs TRE_SM_HIDE_BEFORE_SLEEP (fail closed)."""
+        seconds = normalize_drain_s(drain_s)
+        if seconds is not None and seconds > 0 and not self._hide_enabled:
+            raise ValueError(
+                "drain_s > 0 requires TRE_SM_HIDE_BEFORE_SLEEP=true (a pod that "
+                "still receives traffic never drains)"
+            )
+        return seconds
 
     def get_state(self) -> dict:
         snapshot = self._store.load()
@@ -303,10 +320,15 @@ class ServiceManagerV2:
             state["fleet"] = self.get_fleet_state()
         return state
 
-    def put_model_target(self, model: str, *, wake_replicas: int) -> dict:
+    def put_model_target(
+        self, model: str, *, wake_replicas: int, drain_s: float | None = None
+    ) -> dict:
+        drain_s = self._normalize_call_drain(drain_s)
         if not self._hide_enabled:
             return self._put_model_target_legacy(model, wake_replicas=wake_replicas)
-        return self._put_model_target_staged(model, wake_replicas=wake_replicas)
+        return self._put_model_target_staged(
+            model, wake_replicas=wake_replicas, drain_s=drain_s
+        )
 
     @serialized_operation("put_model_target")
     def _put_model_target_legacy(self, model: str, *, wake_replicas: int) -> dict:
@@ -399,11 +421,13 @@ class ServiceManagerV2:
     #                   roll back to awake+routable, persisted.
     # ------------------------------------------------------------------
 
-    def _put_model_target_staged(self, model: str, *, wake_replicas: int) -> dict:
+    def _put_model_target_staged(
+        self, model: str, *, wake_replicas: int, drain_s: float | None = None
+    ) -> dict:
         deadline = self._drainer.now() + self._drain_config.sleep_deadline_s
         staged = self._run_locked(
             "put_model_target",
-            lambda: self._target_phase1(model, wake_replicas, deadline),
+            lambda: self._target_phase1(model, wake_replicas, deadline, drain_s),
         )
         if not staged.sleeps:
             return staged.result
@@ -421,7 +445,11 @@ class ServiceManagerV2:
         return result
 
     def _target_phase1(
-        self, model: str, wake_replicas: int, deadline: float
+        self,
+        model: str,
+        wake_replicas: int,
+        deadline: float,
+        drain_s: float | None = None,
     ) -> _StagedCall:
         spec = self._registry.model(model)
         if wake_replicas < 0:
@@ -477,7 +505,7 @@ class ServiceManagerV2:
 
         staged = self._stage_sleeps(
             plan["sleep"], markers, updated_by_serve, actions, deadline,
-            reason="model_target",
+            reason="model_target", drain_s=drain_s,
         )
         version = snapshot.version
         try:
@@ -500,11 +528,13 @@ class ServiceManagerV2:
             operation_id=operation_id,
         )
 
-    def _put_binding_power_staged(self, serve_id: str, *, awake: bool) -> dict:
+    def _put_binding_power_staged(
+        self, serve_id: str, *, awake: bool, drain_s: float | None = None
+    ) -> dict:
         deadline = self._drainer.now() + self._drain_config.sleep_deadline_s
         staged = self._run_locked(
             "put_binding_power",
-            lambda: self._binding_power_phase1(serve_id, awake, deadline),
+            lambda: self._binding_power_phase1(serve_id, awake, deadline, drain_s),
         )
         if not staged.sleeps:
             return staged.result
@@ -527,7 +557,11 @@ class ServiceManagerV2:
         return result
 
     def _binding_power_phase1(
-        self, serve_id: str, awake: bool, deadline: float
+        self,
+        serve_id: str,
+        awake: bool,
+        deadline: float,
+        drain_s: float | None = None,
     ) -> _StagedCall:
         self._recover_stale_drains_locked()
         snapshot = self._store.load()
@@ -596,7 +630,7 @@ class ServiceManagerV2:
         updated_by_serve = {item.serve_id: item for item in snapshot.bindings}
         staged = self._stage_sleeps(
             [binding], markers, updated_by_serve, actions, deadline,
-            reason="binding_power",
+            reason="binding_power", drain_s=drain_s,
         )
         try:
             version = self._store.save(
@@ -645,6 +679,7 @@ class ServiceManagerV2:
         deadline: float,
         *,
         reason: str,
+        drain_s: float | None = None,
     ) -> list[_StagedSleep]:
         if not bindings:
             return []
@@ -684,7 +719,9 @@ class ServiceManagerV2:
             for binding, token in tokens:
                 hidden_at = self._drainer.hide(binding)
                 staged.append(
-                    _StagedSleep(binding, token, pod_ips[binding.serve_id], hidden_at)
+                    _StagedSleep(
+                        binding, token, pod_ips[binding.serve_id], hidden_at, drain_s
+                    )
                 )
                 updated_by_serve[binding.serve_id] = replace(binding, hidden=True)
                 actions.append({"action": "hide", "serve_id": binding.serve_id})
@@ -776,6 +813,7 @@ class ServiceManagerV2:
                     hidden_at=item.hidden_at,
                     deadline=drain_end,
                     should_continue=lambda: self._marker_token_live(item),
+                    budget_s=item.drain_s,
                 )
             except Exception as exc:
                 results[item.token] = {"error": f"{type(exc).__name__}: {exc}"}
@@ -865,7 +903,12 @@ class ServiceManagerV2:
                     item.binding, item.pod_ip, result, record or None
                 )
             if physical is True:
-                outcome = {**base, "outcome": "slept", "drained": record.get("drained")}
+                outcome = {
+                    **base,
+                    "outcome": "slept",
+                    "drained": record.get("drained"),
+                    **_drain_summary(record),
+                }
                 try:
                     self._runtime_ops.write_binding_annotations(
                         current, state=POD_STATE_SLEEPING
@@ -1264,10 +1307,15 @@ class ServiceManagerV2:
             "target_bindings": target + creates,
         }
 
-    def put_binding_power(self, serve_id: str, *, awake: bool) -> dict:
+    def put_binding_power(
+        self, serve_id: str, *, awake: bool, drain_s: float | None = None
+    ) -> dict:
+        drain_s = self._normalize_call_drain(drain_s)
         if not self._hide_enabled:
             return self._put_binding_power_legacy(serve_id, awake=awake)
-        return self._put_binding_power_staged(serve_id, awake=awake)
+        return self._put_binding_power_staged(
+            serve_id, awake=awake, drain_s=drain_s
+        )
 
     @serialized_operation("put_binding_power")
     def _put_binding_power_legacy(self, serve_id: str, *, awake: bool) -> dict:
@@ -2307,12 +2355,15 @@ class ServiceManagerV2:
         if hidden_at is None:
             hidden_at = self._drainer.hide(binding)
         try:
+            # Direct sleep (defrag / startup admission+converge): never drains
+            # (budget 0); the reissue sidecar continues whatever /sleep aborts.
             record = self._drainer.drain(
                 binding,
                 pod_ip,
                 hidden_at=hidden_at,
                 unroutable_confirmed=unroutable_confirmed,
                 deadline=hidden_at + cfg.sleep_deadline_s - cfg.commit_reserve_s,
+                budget_s=0.0,
             )
             self._sleep_now(binding, pod_ip, record)
         except Exception:
@@ -2614,10 +2665,14 @@ class SleepCommitFailed(ValueError):
 
 class TargetRequest(BaseModel):
     wake_replicas: int
+    # Per-call drain budget in seconds (None = TRE_SM_DRAIN_BEFORE_SLEEP default,
+    # 0 = sleep as soon as the pod is unroutable). > 0 needs the hide flag.
+    drain_s: float | None = None
 
 
 class BindingPowerRequest(BaseModel):
     awake: bool
+    drain_s: float | None = None
 
 
 class DefragRequest(BaseModel):
@@ -2781,7 +2836,9 @@ def create_app(service: ServiceManagerV2) -> FastAPI:
     @app.put("/v2/models/{model}/target")
     def put_model_target(model: str, request: TargetRequest) -> dict:
         try:
-            return service.put_model_target(model, wake_replicas=request.wake_replicas)
+            return service.put_model_target(
+                model, wake_replicas=request.wake_replicas, drain_s=request.drain_s
+            )
         except WakeConflict as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except (KeyError, ValueError) as exc:
@@ -2790,13 +2847,33 @@ def create_app(service: ServiceManagerV2) -> FastAPI:
     @app.put("/v2/bindings/{serve_id}/power")
     def put_binding_power(serve_id: str, request: BindingPowerRequest) -> dict:
         try:
-            return service.put_binding_power(serve_id, awake=request.awake)
+            return service.put_binding_power(
+                serve_id, awake=request.awake, drain_s=request.drain_s
+            )
         except WakeConflict as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except (KeyError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     return app
+
+def _drain_summary(record: dict | None) -> dict:
+    """Per-binding drain facts for sleep outcomes / async operation results."""
+    record = record or {}
+    running = record.get("interrupted_running")
+    waiting = record.get("interrupted_waiting")
+    interrupted = None
+    if running is not None or waiting is not None:
+        interrupted = int(running or 0) + int(waiting or 0)
+    return {
+        "drained_s": record.get("waited_s"),
+        "drain_budget_s": record.get("drain_timeout_s"),
+        "drain_budget_source": record.get("drain_budget_source"),
+        # Last observed running+waiting before /sleep (SM-side estimate; the
+        # authoritative count is the reissue sidecar's tre_reissue_total).
+        "interrupted": interrupted,
+    }
+
 
 def _natural_key(value: str) -> tuple[object, ...]:
     return tuple(int(part) if part.isdigit() else part for part in _NAT_SPLIT.split(value))

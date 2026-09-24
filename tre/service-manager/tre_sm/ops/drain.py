@@ -6,8 +6,14 @@ Sleeping a vLLM engine aborts every in-flight request. Two opt-in flags:
   hides the pod (routable=false + hidden annotation), waits until it is out
   of the routable selector, and sends ``X-TRE-Hidden: 1`` on the ``/sleep``
   call (the reissue sidecar refuses a ``/sleep`` without it).
-* ``TRE_SM_DRAIN_BEFORE_SLEEP`` (requires the hide flag): additionally waits,
-  bounded, for the engine's running + waiting queues to empty.
+* Draining (waiting, bounded, for the engine's running + waiting queues to
+  empty) is chosen PER CALL: the sleep-capable SM endpoints take an optional
+  ``drain_s`` budget (0 = no drain). ``TRE_SM_DRAIN_BEFORE_SLEEP`` is only the
+  default for calls that do not pass one: unset/false/0 = no drain (default),
+  true = auto budget ``clamp(2*p95_e2e, min, max)``, a number = that many
+  seconds. Any drain requires the hide flag (fail closed at startup for the
+  default, HTTP 400 for a call). Inline sleeps (defrag, startup
+  admission/converge, fleet repair, drain recovery) never drain.
 
 Everything in this module is dependency-free: the metric parsers are pure
 functions over the Prometheus text exposition, and ``SleepDrainer`` takes its
@@ -54,8 +60,10 @@ class SleepConfigError(ValueError):
 
 @dataclass(frozen=True)
 class DrainConfig:
-    # ``enabled`` is the drain flag (TRE_SM_DRAIN_BEFORE_SLEEP); it requires
-    # ``hide_before_sleep`` (TRE_SM_HIDE_BEFORE_SLEEP).
+    # ``enabled`` is the DEFAULT drain for calls that pass no ``drain_s``
+    # (TRE_SM_DRAIN_BEFORE_SLEEP); it requires ``hide_before_sleep``
+    # (TRE_SM_HIDE_BEFORE_SLEEP). ``default_budget_s`` None = auto budget
+    # (clamp(2*p95_e2e, min, max)); a number = that fixed budget.
     enabled: bool = False
     default_timeout_s: float = 60.0
     min_timeout_s: float = 30.0
@@ -74,6 +82,7 @@ class DrainConfig:
     # A draining marker older than its deadline + this grace (SM crashed or
     # lost the lock mid-drain) is recovered by the drain recovery.
     stale_grace_s: float = 30.0
+    default_budget_s: float | None = None
 
     def __post_init__(self) -> None:
         for name in (
@@ -99,6 +108,8 @@ class DrainConfig:
                 "DrainConfig.commit_reserve_s must be below sleep_deadline_s "
                 f"({self.commit_reserve_s} >= {self.sleep_deadline_s})"
             )
+        if self.default_budget_s is not None and not float(self.default_budget_s) > 0:
+            raise ValueError("DrainConfig.default_budget_s must be positive (or None = auto)")
         if self.enabled and not self.hide_before_sleep:
             # Draining a pod that still receives traffic never converges and
             # only delays the sleep: fail closed at startup.
@@ -113,14 +124,15 @@ class DrainConfig:
     @classmethod
     def from_env(cls, env: Mapping[str, str]) -> "DrainConfig":
         defaults = cls()
-        enabled = (
-            str(env.get("TRE_SM_DRAIN_BEFORE_SLEEP", "")).strip().lower() in _TRUTHY
+        enabled, default_budget_s = _parse_default_drain(
+            env.get("TRE_SM_DRAIN_BEFORE_SLEEP", "")
         )
         hide = (
             str(env.get("TRE_SM_HIDE_BEFORE_SLEEP", "")).strip().lower() in _TRUTHY
         )
         return cls(
             enabled=enabled,
+            default_budget_s=default_budget_s,
             hide_before_sleep=hide,
             default_timeout_s=_env_float(
                 env, "TRE_SM_DRAIN_DEFAULT_S", defaults.default_timeout_s
@@ -143,6 +155,51 @@ class DrainConfig:
                 env, "TRE_SM_DRAIN_STALE_GRACE_S", defaults.stale_grace_s
             ),
         )
+
+
+def _parse_default_drain(raw: object) -> tuple[bool, float | None]:
+    """TRE_SM_DRAIN_BEFORE_SLEEP -> (default drain on, fixed budget or None=auto).
+
+    Migration: it used to switch draining on for EVERY sleep. Draining is now a
+    per-call choice (``drain_s``); this env var is only the default for calls
+    that do not pass one. unset/false/0 -> no drain; true -> auto budget
+    clamp(2*p95_e2e, TRE_SM_DRAIN_MIN_S, TRE_SM_DRAIN_MAX_S); a positive number
+    -> that many seconds.
+    """
+    text = str(raw if raw is not None else "").strip().lower()
+    if not text or text in {"0", "false", "no", "off"}:
+        return False, None
+    if text in _TRUTHY:
+        return True, None
+    try:
+        value = float(text)
+    except ValueError as exc:
+        raise ValueError(
+            "TRE_SM_DRAIN_BEFORE_SLEEP must be a boolean or a number of seconds, "
+            f"got {raw!r}"
+        ) from exc
+    if value != value or value < 0 or value == float("inf"):
+        raise ValueError(
+            f"TRE_SM_DRAIN_BEFORE_SLEEP must be a finite number >= 0, got {raw!r}"
+        )
+    if value == 0:
+        return False, None
+    return True, value
+
+
+def normalize_drain_s(value: object) -> float | None:
+    """Validate a per-call drain budget: None (use the default) or >= 0 s."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ValueError(f"drain_s must be a number of seconds, got {value!r}")
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"drain_s must be a number of seconds, got {value!r}") from exc
+    if seconds != seconds or seconds in (float("inf"), float("-inf")) or seconds < 0:
+        raise ValueError(f"drain_s must be a finite number >= 0, got {value!r}")
+    return seconds
 
 
 def check_reissue_coupling(registry, cfg: DrainConfig) -> None:
@@ -313,8 +370,13 @@ class SleepDrainer:
         unroutable_confirmed: bool = False,
         deadline: float | None = None,
         should_continue: Callable[[], bool] | None = None,
+        budget_s: float | None = None,
     ) -> dict:
-        """Wait for unroutable, then (drain flag) for empty queues; bounded.
+        """Wait for unroutable, then (drain budget) for empty queues; bounded.
+
+        ``budget_s`` is the caller's per-call drain budget: None = the config
+        default (TRE_SM_DRAIN_BEFORE_SLEEP), 0 = no drain, > 0 = drain for at
+        most that long (capped by ``max_timeout_s`` and ``deadline``).
 
         Never raises on timeout. The drain window is anchored at
         ``hidden_at`` (the hide time) when given, so several bindings hidden
@@ -331,13 +393,23 @@ class SleepDrainer:
                 self.wait_unroutable(binding, timeout_s=timeout) if timeout > 0 else False
             )
 
+        if budget_s is None:
+            drain_on = bool(self._cfg.enabled)
+            fixed_budget = self._cfg.default_budget_s
+            budget_source = "default"
+        else:
+            budget = float(normalize_drain_s(budget_s))
+            drain_on = budget > 0
+            fixed_budget = min(budget, self._cfg.max_timeout_s) if drain_on else None
+            budget_source = "call"
         record: dict = {
             "serve_id": binding.serve_id,
             "binding_id": binding.binding_id,
             "model": binding.model,
             "pod_ip": pod_ip,
             "hide_enabled": True,
-            "drain_enabled": bool(self._cfg.enabled),
+            "drain_enabled": drain_on,
+            "drain_budget_source": budget_source,
             "drain_timeout_s": None,
             "p95_e2e_s": None,
             "waited_s": 0.0,
@@ -349,15 +421,19 @@ class SleepDrainer:
             "deadline_capped": False,
             "cancelled": False,
         }
-        if not self._cfg.enabled:
-            # Hide-only mode: unroutable is all we wait for.
+        if not drain_on:
+            # No drain for this call: unroutable is all we wait for.
             record["waited_s"] = max(0.0, self._monotonic() - started)
             return record
 
         text = self._scrape(pod_ip)
         load = parse_vllm_load(text) if text is not None else None
         p95 = parse_e2e_p95_s(text) if text is not None else None
-        timeout = drain_timeout_s(p95, self._cfg)
+        timeout = (
+            float(fixed_budget)
+            if fixed_budget is not None
+            else drain_timeout_s(p95, self._cfg)
+        )
         record["drain_timeout_s"] = timeout
         record["p95_e2e_s"] = p95
         if load is None:

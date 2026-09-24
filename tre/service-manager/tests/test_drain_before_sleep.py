@@ -588,9 +588,13 @@ def test_defrag_path_does_not_wait_unroutable_twice():
     service.defrag(tp_size=2)
 
     assert events.count(("wait_unroutable", "serve-b")) == 1
-    assert events.index(("wait_unroutable", "serve-b")) < events.index(("metrics", "10.0.0.2")) < events.index(("sleep", "10.0.0.2"))
+    # Per-call drain: defrag is a direct sleep and never drains, even with the
+    # TRE_SM_DRAIN_BEFORE_SLEEP default on (no /metrics scrape before /sleep).
+    assert ("metrics", "10.0.0.2") not in events
+    assert events.index(("wait_unroutable", "serve-b")) < events.index(("sleep", "10.0.0.2"))
     (record,) = service.get_sleep_audit()["records"]
     assert record["unroutable_confirmed"] is True
+    assert record["drain_enabled"] is False and record["drain_budget_source"] == "call"
     assert vllm.sleep_kwargs == [{"hidden": True}]
 
 
@@ -627,7 +631,7 @@ class FakeSafety:
         return None
 
 
-def test_fleet_repair_sleep_path_drains_after_hide():
+def test_fleet_repair_sleep_path_hides_then_sleeps_without_draining():
     events: list = []
     deployment = ModelDeploymentRecord("m1-node-a-gpu-0", "m1", "node-a", (0,), replicas=1)
     pod = K8sPodSnapshot(
@@ -664,16 +668,17 @@ def test_fleet_repair_sleep_path_drains_after_hide():
     )
 
     serve = pod.name
-    assert events[:6] == [
+    # Per-call drain: fleet repair is a direct sleep (budget 0) even with the
+    # TRE_SM_DRAIN_BEFORE_SLEEP default on - hide, wait unroutable, sleep.
+    assert events[:4] == [
         ("annotate", serve, "hidden"),
         ("wait_unroutable", serve),
-        ("metrics", "10.0.0.9"),
-        ("metrics", "10.0.0.9"),
         ("sleep", "10.0.0.9"),
         ("annotate", serve, "sleeping"),
     ]
     (record,) = audit_log.records()
-    assert record["drained"] is True and record["drain_enabled"] is True
+    assert record["drained"] is False and record["drain_enabled"] is False
+    assert record["drain_budget_source"] == "call"
     assert vllm.sleep_kwargs == [{"hidden": True}]
 
 
