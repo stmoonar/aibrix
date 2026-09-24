@@ -750,7 +750,11 @@ async def test_empty_snapshot_late_abort_response_is_not_misjudged_as_stuck():
 async def test_periodic_stuck_scan_after_probe_detected_sleep():
     # The engine went to sleep behind the sidecar's back (e.g. sidecar restarted): no
     # /sleep passes through, only the periodic probe + scan can free the hung request.
-    async with Harness(probe_interval_s=0.05, stuck_grace_s=0.1) as h:
+    # The monitor probes once at start, then every probe_interval_s: pausing 50 ms in
+    # leaves ~250 ms for the request to reach the engine before the next probe marks
+    # the pod sleeping. With a 50 ms interval the probe raced the request, which was
+    # then forwarded as a new request while sleeping (flaky on a loaded host).
+    async with Harness(probe_interval_s=0.3, stuck_grace_s=0.1) as h:
         await asyncio.sleep(0.05)
         h.a.pause_silently()
         body = completion_body(5)
