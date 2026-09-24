@@ -26,8 +26,8 @@ collateral 503s. Two compounding root causes:
 
 | File | What | Layer |
 | --- | --- | --- |
-| `backendtrafficpolicy-aibrix-system.yaml` | per-model circuit breakers on the APA / experiment-3 control path (Gateway aibrix-system/aibrix-eg, NodePort 31592) | additive, aibrix-system ns |
-| `backendtrafficpolicy-tre-v2.yaml` | per-model circuit breakers on the TRE serving path (Gateway tre-v2/tre-aibrix-eg, NodePort 31094) | additive, tre-v2 ns |
+| `backendtrafficpolicy-aibrix-system.yaml` | per-model circuit breakers on the shared gateway (Gateway aibrix-system/aibrix-eg, NodePort 31592) - the APA arm's path until 2026-09-24, no longer used by either arm | additive, aibrix-system ns |
+| `backendtrafficpolicy-tre-v2.yaml` | per-model circuit breakers on the serving path of BOTH arms, TRE and APA (Gateway tre-v2/tre-aibrix-eg, NodePort 31094); the per-model ORIGINAL_DST clusters of `overlays/tre-v2/gateway-extproc.yaml` carry the same values | additive, tre-v2 ns |
 | `envoyproxy-nofile-patch.yaml` | raise envoy RLIMIT_NOFILE 1024→65536 | **modifies shared aibrix-system EnvoyProxy** (class-level → both envoys) |
 
 Circuit-breaker values (per model, per gateway): maxConnections 4096,
@@ -39,12 +39,20 @@ ceiling, not a steady target; it only stops the runaway pile-up.
 
 ### The two arms must carry identical values
 
-`backendtrafficpolicy-aibrix-system.yaml` governs the **APA / control arm**
-(NodePort 31592) and `backendtrafficpolicy-tre-v2.yaml` governs the **TRE arm**
-(NodePort 31094). An A/B result is only interpretable if both arms admit traffic
-under the same rules: otherwise "TRE served more requests" is indistinguishable
-from "APA was shed sooner". **Change the two files together or not at all** —
-`deploy/tests/test_gateway_arm_symmetry.py` fails if they drift.
+Since 2026-09-24 both arms, TRE and APA, are served by the **same** tre-v2 gateway
+(NodePort 31094; `deploy/scripts/campaign_queue.py` GATEWAYS), routed as in v1
+(`routing-strategy: least-gpu-cache`, ext_proc, per-model ORIGINAL_DST clusters
+whose limits `deploy/tests/test_gateway_extproc.py` pins to
+`backendtrafficpolicy-tre-v2.yaml`). The arms therefore admit traffic under
+identical rules by construction. An A/B result is only interpretable that way:
+otherwise "TRE served more requests" is indistinguishable from "APA was shed
+sooner".
+
+Before that date the APA arm went through aibrix-system (NodePort 31592,
+`backendtrafficpolicy-aibrix-system.yaml`). That file is kept identical to the
+tre-v2 one (**change the two files together or not at all** -
+`deploy/tests/test_gateway_arm_symmetry.py` fails if they drift) so the legacy
+path stays comparable for re-analysis of older runs.
 
 This is not hypothetical. On 2026-09-20 the TRE arm was raised to 4096/1024 while
 the APA arm was left at 256/64; the asymmetry was caught before the re-run, but a

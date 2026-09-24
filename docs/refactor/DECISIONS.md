@@ -508,10 +508,18 @@ and send both arms through it (`campaign_queue.py` GATEWAYS, replayer default
   4096/1024/4096/16 breaker; the running controller's donor-health guard (prefix match on
   `httproute/tre-v2/<model>-router/rule/`) and the openloop sentinel count it unchanged.
   P2-GW-005 (`TRE_ROUTE_MODEL_HEADER`) lets v1-style clients (no `model` header) reach it.
-- Route timeout 600 s (current TRE arm), not v1's 120/150 s. Response body not sent to
-  the plugin (v1: Streamed) to keep a per-chunk gRPC round trip off TPOT.
-- `HOT_SWITCH=0`: no gateway-initiated wake-ups (v1 had them), only the arm under test
-  changes the layout.
+- v1 values throughout (user decision 2026-09-24, config_tre as the reference): route
+  timeout 120 s raised to 150 s by a separate patch (v1 envoy-gateway-route-timeouts),
+  no route idle_timeout, ORIGINAL_DST connect_timeout 6 s, response body Streamed through
+  the plugin, ext_proc breaker 8000/80000/80000/5, ext_proc H2 512 streams + windows
+  64 KiB / 1 MiB + preconnect 1.0/1.0, client buffer 4 MiB. Streamed exposed a v2-only
+  bug (SSE line split across body chunks -> 500 mid-stream), fixed by P2-GW-006.
+- The one v1 difference: `HOT_SWITCH=0`. In v1 (least-gpu-cache) HOT_SWITCH=1 only kept
+  a zero-pod model in the cache; in v2 it makes the plugin submit a wake-up on the request
+  path for any model with zero routable pods (P2-GW-002), i.e. a third scaler. v1 never
+  reached zero because every model had >= 1 replica, so dsqwen-14b min_replicas went
+  0 -> 1 (registry, params ConfigMap copy, APA minReplicas) and HOT_SWITCH=0 is then
+  equivalent to v1.
 - Nothing shared is touched: EnvoyPatchPolicy was already enabled in envoy-gateway-config;
   all new objects are in tre-v2; aibrix-system is unchanged.
 

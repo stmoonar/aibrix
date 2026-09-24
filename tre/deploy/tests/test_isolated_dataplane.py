@@ -62,6 +62,7 @@ def test_extproc_objects_are_confined_to_tre_v2() -> None:
         "ClientTrafficPolicy",
         "EnvoyExtensionPolicy",
         "EnvoyPatchPolicy",
+        "EnvoyPatchPolicy",
         "HTTPRoute",
     ]
     for d in docs:

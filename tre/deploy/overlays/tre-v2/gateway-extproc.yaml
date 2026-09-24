@@ -4,8 +4,11 @@
 # v1 routed every request through the AIBrix gateway plugin (ext_proc), which picked the
 # pod with the lowest vllm:gpu_cache_usage_perc (routing-strategy: least-gpu-cache) and
 # Envoy forwarded to that IP through an ORIGINAL_DST cluster. This file rebuilds that path
-# on tre-v2/tre-aibrix-eg (NodePort 31094) only. Every object is namespace-local to tre-v2;
-# nothing in aibrix-system or the class-level EnvoyProxy/EnvoyGateway config is touched
+# on tre-v2/tre-aibrix-eg (NodePort 31094) only, value for value from v1's
+# /root/aibrix-main/config_tre (EnvoyGateway.yaml aibrix-epp + extension policy + client
+# buffer, envoy-gateway-route-timeouts.yaml, envoy-gateway-extproc-circuit-breaker.yaml,
+# envoy-gateway-http2-options.yaml). Every object is namespace-local to tre-v2; nothing
+# in aibrix-system or the class-level EnvoyProxy/EnvoyGateway config is touched
 # (EnvoyPatchPolicy is already enabled cluster-wide: envoy-gateway-config
 # extensionApis.enableEnvoyPatchPolicy=true).
 #
@@ -16,12 +19,13 @@
 #   -> cluster httproute/tre-v2/<model>-router/rule/original-dst (ORIGINAL_DST on the
 #   target-pod header).
 # Without the header nothing changes: the generated per-model HTTPRoutes still send the
-# request to the model Service (EDS, LEAST_REQUEST), exactly as before.
+# request to the model Service (EDS, LEAST_REQUEST, 600s), which no experiment uses.
 #
-# One ORIGINAL_DST cluster PER MODEL, not v1's single shared one, so that
+# The two deliberate structural differences from v1 (values are v1's):
+# One ORIGINAL_DST cluster PER MODEL instead of v1's single shared one, so that
 #   * each model keeps its own 4096/1024/4096/16 circuit breaker - the same numbers as
 #     gateway-hardening/backendtrafficpolicy-tre-v2.yaml - instead of Envoy's default
-#     1024 shared by all models (the t1 collateral-503 failure mode);
+#     1024 shared by all models (the t1 collateral-503 failure mode; v1 had exactly that);
 #   * the controller's SafeScale donor-health guard and the openloop pending-overflow
 #     sentinel still see per-model cluster counters. The cluster is deliberately named
 #     under the model HTTPRoute's cluster prefix (httproute/tre-v2/<model>-router/rule/),
@@ -35,9 +39,10 @@
 # unattributed cluster exists so such a request is still served if that re-pick ever does
 # not happen; its upstream_rq_total should stay 0 (deploy verification checks it).
 #
-# Timeouts follow the current TRE arm (HTTPRoute request timeout 600s, route idle_timeout
-# 3600s, cluster connect_timeout 10s). v1 used route timeout 120s (a later patch made the
-# /v1 routes 150s) and ORIGINAL_DST connect_timeout 6s.
+# Timeouts are v1's: the original routes are added with route timeout 120s (aibrix-epp),
+# then raised to 150s by the separate tre-route-timeouts policy (v1's
+# envoy-gateway-route-timeouts.yaml, "150s gives scale-out time"); no route idle_timeout;
+# ORIGINAL_DST connect_timeout 6s.
 apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute
 metadata:
@@ -84,41 +89,39 @@ spec:
     - backendRefs:
         - name: tre-gateway-plugins
           port: 50052
-      # Every in-flight request holds one ext_proc gRPC stream for its whole life, so the
-      # ext_proc cluster must never be the binding cap. Envoy's default is 1024 streams
-      # SHARED by all models (v1 had to patch it up to 80000). Sized at the worst case the
-      # per-model breakers can admit: 3 models x (4096 active + 1024 pending) = 15360.
       backendSettings:
+        # v1 envoy-gateway-extproc-circuit-breaker.yaml (8000/80000/80000/5), set through
+        # the native field instead of a JSON patch. Every in-flight request holds one
+        # ext_proc stream, so Envoy's default (1024 shared) would be the binding cap.
         circuitBreaker:
-          maxConnections: 16384
-          maxPendingRequests: 16384
-          maxParallelRequests: 16384
-          maxParallelRetries: 16
-      # Same as v1: per-message timeout 60s, fail closed. failOpen would not help here -
-      # without the plugin's target-pod header the ORIGINAL_DST cluster has no host - so a
-      # plugin outage is a visible 5xx rather than a silent reroute.
+          maxConnections: 8000
+          maxPendingRequests: 80000
+          maxParallelRequests: 80000
+          maxParallelRetries: 5
+        # v1 envoy-gateway-http2-options.yaml: 512 streams per H2 connection with the
+        # same windows, so load spreads over several connections (plus the preconnect
+        # policy patched in tre-original-dst below; EG has no native field for it).
+        http2:
+          maxConcurrentStreams: 512
+          initialStreamWindowSize: 65536
+          initialConnectionWindowSize: 1048576
+      # v1: per-message timeout 60s, fail closed (no failure_mode_allow).
       messageTimeout: 60s
       failOpen: false
       processingMode:
         request:
           body: Buffered
-        # Response headers only (they carry target-pod / target-pod-ip back to the client
-        # for per-request attribution). v1 also streamed the response BODY
-        # (response.body: Streamed), which puts every SSE chunk through a synchronous gRPC
-        # round trip to the plugin - added per-token latency on exactly the TPOT the SLO
-        # scores. The body was only needed for plugin-internal token accounting (TPM rate
-        # limit - disabled, TRE_CHECK_RPM=0 -; request_end logs; token counts in the
-        # plugin's request traces); least-gpu-cache reads the scraped vLLM metric and the
-        # TRE controller reads only scraped vLLM metrics plus trace metadata, none of
-        # which depend on it. To reproduce v1 exactly, add `body: Streamed` here.
-        response: {}
+        # v1: every response chunk goes through the plugin (usage/token accounting,
+        # request_end, request-trace token counts). SSE lines split across chunks are
+        # reassembled by the plugin (TRE-PATCH P2-GW-006).
+        response:
+          body: Streamed
 ---
 apiVersion: gateway.envoyproxy.io/v1alpha1
 kind: ClientTrafficPolicy
 metadata:
-  # Buffered request-body processing holds the whole body in the listener buffer; Envoy
-  # Gateway's default per-connection limit is 32 KiB, which long prompts exceed (413).
-  # Same 4 MiB as v1's aibrix-client-connection-buffersize, scoped to the tre-v2 gateway.
+  # v1 aibrix-client-connection-buffersize: 4 MiB so Buffered request bodies fit (Envoy
+  # Gateway's default per-connection limit is 32 KiB), scoped to the tre-v2 gateway.
   name: tre-client-connection-buffersize
   namespace: tre-v2
   labels:
@@ -135,6 +138,7 @@ spec:
 apiVersion: gateway.envoyproxy.io/v1alpha1
 kind: EnvoyPatchPolicy
 metadata:
+  # v1 aibrix-epp (+ the preconnect half of envoy-gateway-http2-options.yaml).
   name: tre-original-dst
   namespace: tre-v2
   labels:
@@ -146,8 +150,21 @@ spec:
     kind: Gateway
     name: tre-aibrix-eg
   type: JSONPatch
+  # Applied before tre-route-timeouts (priority 1): EG applies ascending priority.
+  priority: 0
   jsonPatches:
+    # ---- ext_proc cluster: v1 preconnect policy -----------------------------------------
+    - type: type.googleapis.com/envoy.config.cluster.v3.Cluster
+      name: envoyextensionpolicy/tre-v2/tre-gateway-plugins-extension-policy/extproc/0
+      operation:
+        op: add
+        path: /preconnect_policy
+        value:
+          preconnect_ratio: 1.0
+          predictive_preconnect_ratio: 1.0
     # ---- clusters: one ORIGINAL_DST per model (+ unattributed safety net) --------------
+    # v1 original_destination_cluster values (connect 6s, V4_ONLY, CLUSTER_PROVIDED,
+    # target-pod header) plus the per-model breaker.
     - type: type.googleapis.com/envoy.config.cluster.v3.Cluster
       name: tre-v2/original-dst/unattributed
       operation:
@@ -157,9 +174,8 @@ spec:
           name: tre-v2/original-dst/unattributed
           type: ORIGINAL_DST
           lb_policy: CLUSTER_PROVIDED
-          connect_timeout: 10s
+          connect_timeout: 6s
           dns_lookup_family: V4_ONLY
-          per_connection_buffer_limit_bytes: 32768
           original_dst_lb_config:
             use_http_header: true
             http_header_name: target-pod
@@ -179,9 +195,8 @@ spec:
           name: httproute/tre-v2/dsqwen-7b-router/rule/original-dst
           type: ORIGINAL_DST
           lb_policy: CLUSTER_PROVIDED
-          connect_timeout: 10s
+          connect_timeout: 6s
           dns_lookup_family: V4_ONLY
-          per_connection_buffer_limit_bytes: 32768
           original_dst_lb_config:
             use_http_header: true
             http_header_name: target-pod
@@ -201,9 +216,8 @@ spec:
           name: httproute/tre-v2/dsllama-8b-router/rule/original-dst
           type: ORIGINAL_DST
           lb_policy: CLUSTER_PROVIDED
-          connect_timeout: 10s
+          connect_timeout: 6s
           dns_lookup_family: V4_ONLY
-          per_connection_buffer_limit_bytes: 32768
           original_dst_lb_config:
             use_http_header: true
             http_header_name: target-pod
@@ -223,9 +237,8 @@ spec:
           name: httproute/tre-v2/dsqwen-14b-router/rule/original-dst
           type: ORIGINAL_DST
           lb_policy: CLUSTER_PROVIDED
-          connect_timeout: 10s
+          connect_timeout: 6s
           dns_lookup_family: V4_ONLY
-          per_connection_buffer_limit_bytes: 32768
           original_dst_lb_config:
             use_http_header: true
             http_header_name: target-pod
@@ -237,7 +250,9 @@ spec:
                 max_requests: 4096
                 max_retries: 16
     # ---- routes: each add at index 0 prepends, so the unattributed catch-all goes in
-    # first and ends up BELOW the per-model routes (Envoy takes the first match). --------
+    # first and ends up BELOW the per-model routes (Envoy takes the first match). Final
+    # order: routes 0-2 = 14b, 8b, 7b; route 3 = unattributed. v1 route values: prefix
+    # /v1, routing-strategy header regex .*, timeout 120s, ext_proc enabled per route.
     - type: type.googleapis.com/envoy.config.route.v3.RouteConfiguration
       name: tre-v2/tre-aibrix-eg/http
       operation:
@@ -254,8 +269,7 @@ spec:
                     regex: .*
           route:
             cluster: tre-v2/original-dst/unattributed
-            timeout: 600s
-            idle_timeout: 3600s
+            timeout: 120s
           typed_per_filter_config:
             envoy.filters.http.ext_proc/envoyextensionpolicy/tre-v2/tre-gateway-plugins-extension-policy/extproc/0:
               "@type": type.googleapis.com/envoy.config.route.v3.FilterConfig
@@ -279,8 +293,7 @@ spec:
                   exact: dsqwen-7b
           route:
             cluster: httproute/tre-v2/dsqwen-7b-router/rule/original-dst
-            timeout: 600s
-            idle_timeout: 3600s
+            timeout: 120s
           typed_per_filter_config:
             envoy.filters.http.ext_proc/envoyextensionpolicy/tre-v2/tre-gateway-plugins-extension-policy/extproc/0:
               "@type": type.googleapis.com/envoy.config.route.v3.FilterConfig
@@ -304,8 +317,7 @@ spec:
                   exact: dsllama-8b
           route:
             cluster: httproute/tre-v2/dsllama-8b-router/rule/original-dst
-            timeout: 600s
-            idle_timeout: 3600s
+            timeout: 120s
           typed_per_filter_config:
             envoy.filters.http.ext_proc/envoyextensionpolicy/tre-v2/tre-gateway-plugins-extension-policy/extproc/0:
               "@type": type.googleapis.com/envoy.config.route.v3.FilterConfig
@@ -329,9 +341,55 @@ spec:
                   exact: dsqwen-14b
           route:
             cluster: httproute/tre-v2/dsqwen-14b-router/rule/original-dst
-            timeout: 600s
-            idle_timeout: 3600s
+            timeout: 120s
           typed_per_filter_config:
             envoy.filters.http.ext_proc/envoyextensionpolicy/tre-v2/tre-gateway-plugins-extension-policy/extproc/0:
               "@type": type.googleapis.com/envoy.config.route.v3.FilterConfig
               config: {}
+---
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: EnvoyPatchPolicy
+metadata:
+  # v1 envoy-gateway-route-timeouts.yaml: raise the routing-strategy routes to 150s
+  # ("gives scale-out time"). v1 replaced routes/0 and routes/1 by index, i.e. its one
+  # original_route plus whatever EG route followed it; here the routing-strategy routes
+  # are routes/0..3 (tre-original-route/*), so exactly those four are raised and no
+  # Service-path route is touched.
+  name: tre-route-timeouts
+  namespace: tre-v2
+  labels:
+    app.kubernetes.io/name: tre-gateway-plugins
+    tre.aibrix.io/managed: "true"
+spec:
+  targetRef:
+    group: gateway.networking.k8s.io
+    kind: Gateway
+    name: tre-aibrix-eg
+  type: JSONPatch
+  # After tre-original-dst (priority 0), whose routes it edits.
+  priority: 1
+  jsonPatches:
+    - type: type.googleapis.com/envoy.config.route.v3.RouteConfiguration
+      name: tre-v2/tre-aibrix-eg/http
+      operation:
+        op: replace
+        path: /virtual_hosts/0/routes/0/route/timeout
+        value: 150s
+    - type: type.googleapis.com/envoy.config.route.v3.RouteConfiguration
+      name: tre-v2/tre-aibrix-eg/http
+      operation:
+        op: replace
+        path: /virtual_hosts/0/routes/1/route/timeout
+        value: 150s
+    - type: type.googleapis.com/envoy.config.route.v3.RouteConfiguration
+      name: tre-v2/tre-aibrix-eg/http
+      operation:
+        op: replace
+        path: /virtual_hosts/0/routes/2/route/timeout
+        value: 150s
+    - type: type.googleapis.com/envoy.config.route.v3.RouteConfiguration
+      name: tre-v2/tre-aibrix-eg/http
+      operation:
+        op: replace
+        path: /virtual_hosts/0/routes/3/route/timeout
+        value: 150s

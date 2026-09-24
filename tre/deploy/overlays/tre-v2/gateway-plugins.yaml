@@ -80,8 +80,8 @@ spec:
       containers:
         - name: gateway-plugins
           # Built by deploy/scripts/build_gateway_plugins_nozmq.sh (same recipe as the
-          # previous 20260704-0d869b49-nozmq2; adds TRE-PATCH P2-GW-004/005).
-          image: aibrix/gateway-plugins:20260924-a83a2c73-nozmq2
+          # previous 20260704-0d869b49-nozmq2; adds TRE-PATCH P2-GW-004/005/006).
+          image: aibrix/gateway-plugins:20260924-43aa0c31-nozmq2
           imagePullPolicy: IfNotPresent
           # Same gRPC probes as the v1 aibrix-gateway-plugins (relaxed timings that
           # stopped restarts under load): the Service only gets an endpoint, and
@@ -137,10 +137,14 @@ spec:
             # send only routing-strategy land on their per-model ORIGINAL_DST cluster.
             - name: TRE_ROUTE_MODEL_HEADER
               value: "true"
-            # Gateway-initiated wake-up stays OFF (it was "1" but inert: SERVEMENT_URL
-            # was never set). v1 set both, so a request to a model with zero awake pods
-            # made the gateway itself wake one; in v2 only the arm under test (TRE
-            # controller or APA) may change the layout, and such a request gets a 503.
+            # The one deliberate difference from v1 (which had HOT_SWITCH=1 plus
+            # SERVEMENT_URL). In v1, under least-gpu-cache, HOT_SWITCH=1 only kept a
+            # zero-pod model in the plugin cache; its wake-ups were confined to the
+            # SLO/queue router. In v2 (TRE-PATCH P2-GW-002) HOT_SWITCH=1 submits a
+            # wake-up on the request path whenever a model has zero routable pods,
+            # whatever the algorithm - a third scaler in both arms. v1 never reached
+            # that case because every model kept >= 1 replica; registry min_replicas is
+            # 1 for every model (14b raised 2026-09-24), so 0 is equivalent to v1 here.
             - name: HOT_SWITCH
               value: "0"
             - name: QZ_KIND

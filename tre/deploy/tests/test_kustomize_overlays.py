@@ -95,7 +95,7 @@ def test_tre_v2_overlay_declares_components_and_independent_redis() -> None:
         if d and d["kind"] == "Deployment"
     )
     # Rebuilt by deploy/scripts/build_gateway_plugins_nozmq.sh (TRE-PATCH P2-GW-004/005).
-    assert _image(gateway_plugins) == "aibrix/gateway-plugins:20260924-a83a2c73-nozmq2"
+    assert _image(gateway_plugins) == "aibrix/gateway-plugins:20260924-43aa0c31-nozmq2"
 
     assert _env(controller)["TRE_REDIS_URL"] == "redis://tre-v2-redis:6379/0"
     assert _env(controller)["TRE_SERVICE_MANAGER_URL"] == "http://tre-v2-service-manager:8000"
