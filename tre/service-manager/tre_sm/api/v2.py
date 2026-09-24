@@ -59,12 +59,26 @@ _NAT_SPLIT = re.compile(r"(\d+)")
 _LOGGER = logging.getLogger("tre_sm.api.v2")
 
 
+# Set while a background caller (supervisor: startup converge, drain recovery)
+# runs: those retry on their next tick and must never block on the lock.
+_NO_LOCK_WAIT: ContextVar[bool] = ContextVar("tre_sm_no_lock_wait", default=False)
+
+
 def serialized_operation(kind: str):
     def decorate(method):
         @wraps(method)
         def wrapped(self, *args, **kwargs):
             if self._operation_coordinator is None:
                 return method(self, *args, **kwargs)
+            # Review H2: with staged sleeps / async operations a lock-free drain
+            # (or a background worker) can hold the writer lock for a moment; a
+            # synchronous call then waits (bounded) instead of an instant 409.
+            # All flags off -> 0 -> exactly main's single attempt.
+            wait_s = self._sync_lock_wait_s()
+            if wait_s > 0:
+                return self._run_with_lock_wait(
+                    kind, lambda: method(self, *args, **kwargs), wait_s
+                )
             with self._operation_coordinator.operation(kind) as operation:
                 operation.advance("executing")
                 return method(self, *args, **kwargs)
@@ -111,8 +125,12 @@ _ASYNC_OP: ContextVar[_AsyncOpContext | None] = ContextVar(
 
 def _async_progress(stage: str, details: dict | None = None) -> None:
     context = _ASYNC_OP.get()
-    if context is not None:
+    if context is None:
+        return
+    try:
         context.progress(stage, details)
+    except Exception:  # review H3: bookkeeping must never break the staged call
+        _LOGGER.exception("async op %s: progress %s failed", context.operation_id, stage)
 
 
 def _async_phase1_done(staged: "_StagedCall") -> None:
@@ -122,7 +140,7 @@ def _async_phase1_done(staged: "_StagedCall") -> None:
     context.phase1_done = True
     if staged.sleeps:
         # Lock-free stage: the next operation of this model may start now.
-        context.progress(
+        _async_progress(
             "draining",
             {
                 "bindings": [item.binding.serve_id for item in staged.sleeps],
@@ -267,6 +285,10 @@ class ServiceManagerV2:
         self._async_config = async_config or AsyncOpsConfig()
         self._async_ops: AsyncOperationManager | None = None
         self._orphaned_async_ops: set[str] = set()
+        self._orphaned_lock = threading.Lock()  # review L2
+        # Real clock for the synchronous lock wait (tests replace these).
+        self._lock_clock: Callable[[], float] = time.monotonic
+        self._lock_sleep: Callable[[float], None] = time.sleep
         if self._async_config.enabled:
             self._async_ops = AsyncOperationManager(
                 async_journal or AsyncOpJournal(getattr(store, "_redis", None)),
@@ -483,8 +505,8 @@ class ServiceManagerV2:
             "put_model_target",
             lambda: self._target_phase1(model, wake_replicas, deadline, drain_s),
         )
-        _async_phase1_done(staged)
         if not staged.sleeps:
+            _async_phase1_done(staged)
             return staged.result
         outcomes, version = self._complete_staged(
             staged, deadline, kind="put_model_target_commit"
@@ -591,8 +613,8 @@ class ServiceManagerV2:
             "put_binding_power",
             lambda: self._binding_power_phase1(serve_id, awake, deadline, drain_s),
         )
-        _async_phase1_done(staged)
         if not staged.sleeps:
+            _async_phase1_done(staged)
             return staged.result
         outcomes, version = self._complete_staged(
             staged, deadline, kind="put_binding_power_commit"
@@ -840,6 +862,9 @@ class ServiceManagerV2:
     ) -> tuple[list[dict], int]:
         cfg = self._drain_config
         try:
+            # Inside the try (review H3): whatever the async bookkeeping does, the
+            # finally below releases this call's tokens so its markers can recover.
+            _async_phase1_done(staged)
             records = self._drain_staged(staged.sleeps, deadline - cfg.commit_reserve_s)
             _async_progress("committing")
             try:
@@ -1104,17 +1129,26 @@ class ServiceManagerV2:
         markers = self._load_markers()
         if not any(self._marker_is_stale(marker) for marker in markers.values()):
             return None
-        outcomes = self._run_locked("drain_recovery", self._recover_stale_drains_locked)
+        token = _NO_LOCK_WAIT.set(True)  # background: retried next tick
+        try:
+            outcomes = self._run_locked("drain_recovery", self._recover_stale_drains_locked)
+        finally:
+            _NO_LOCK_WAIT.reset(token)
         return {"recovered": outcomes}
 
     def _marker_is_stale(self, marker: DrainMarker) -> bool:
+        expired = self._wall_clock() > marker.deadline_at + self._drain_config.stale_grace_s
         if marker.instance == self._instance_id:
             with self._inflight_lock:
-                return marker.token not in self._inflight_tokens
-        if marker.async_op_id is not None and marker.async_op_id in self._orphaned_async_ops:
+                if marker.token not in self._inflight_tokens:
+                    return True
+            # Review H3: a token of ours that is still "in flight" long after its
+            # deadline was leaked by some path; do not keep it forever.
+            return expired
+        if marker.async_op_id is not None and self._is_orphaned_async_op(marker.async_op_id):
             # Its async operation was found orphaned (owner SM gone): recover now.
             return True
-        return self._wall_clock() > marker.deadline_at + self._drain_config.stale_grace_s
+        return expired
 
     def _recover_stale_drains_locked(self) -> list[dict]:
         if not self._hide_enabled:
@@ -1188,10 +1222,11 @@ class ServiceManagerV2:
         if new_bindings != snapshot.bindings:
             self._store.save(new_bindings, expected_version=snapshot.version)
         self._drain_markers.save(markers)
-        if self._orphaned_async_ops:
-            self._orphaned_async_ops.intersection_update(
-                marker.async_op_id for marker in markers.values() if marker.async_op_id
-            )
+        with self._orphaned_lock:
+            if self._orphaned_async_ops:
+                self._orphaned_async_ops.intersection_update(
+                    marker.async_op_id for marker in markers.values() if marker.async_op_id
+                )
         if desired_updates:
             self._update_desired(
                 desired_updates, updated_by="service-manager-api", reason="drain_recovery"
@@ -1214,9 +1249,15 @@ class ServiceManagerV2:
 
     def _run_locked(self, kind: str, fn, *, retry_until: float | None = None):
         """Run ``fn`` under the writer lock; retry OperationBusy until
-        ``retry_until`` (drainer clock). Without a coordinator just run it."""
+        ``retry_until`` (drainer clock). Without a coordinator just run it.
+        Without ``retry_until`` a synchronous call waits for the lock like the
+        serialized operations do (review H2)."""
         if self._operation_coordinator is None:
             return fn()
+        if retry_until is None:
+            wait_s = self._sync_lock_wait_s()
+            if wait_s > 0:
+                return self._run_with_lock_wait(kind, fn, wait_s)
         while True:
             entered = False
             try:
@@ -1233,6 +1274,41 @@ class ServiceManagerV2:
             self._drainer.sleep_for(
                 min(self._drain_config.lock_retry_interval_s, remaining)
             )
+
+    def _sync_lock_wait_s(self) -> float:
+        """Bounded writer-lock wait for synchronous calls (review H2).
+
+        Only with staged sleeps (HIDE) or async operations on - the two features
+        that add lock-free background work contending for the lock; flags off ->
+        0 (main: one attempt, OperationBusy -> 409). Not for async workers (they
+        have their own phase-aware retry) nor background supervisor calls."""
+        if _NO_LOCK_WAIT.get() or _ASYNC_OP.get() is not None:
+            return 0.0
+        config = getattr(self, "_async_config", None)
+        if config is None:
+            return 0.0
+        if not (getattr(self, "_hide_enabled", False) or getattr(self, "_async_ops", None) is not None):
+            return 0.0
+        return float(config.sync_lock_wait_s)
+
+    def _run_with_lock_wait(self, kind: str, fn, wait_s: float):
+        deadline = self._lock_clock() + wait_s
+        while True:
+            entered = False
+            try:
+                with self._operation_coordinator.operation(kind) as operation:
+                    entered = True
+                    operation.advance("executing")
+                    return fn()
+            except OperationBusy:
+                remaining = deadline - self._lock_clock()
+                if entered or remaining <= 0:
+                    raise
+            self._lock_sleep(min(self._async_config.sync_lock_poll_s, max(0.0, remaining)))
+
+    def _is_orphaned_async_op(self, operation_id: str) -> bool:
+        with self._orphaned_lock:
+            return operation_id in self._orphaned_async_ops
 
     def _load_markers(self) -> dict[str, DrainMarker]:
         if self._drain_markers is None:
@@ -1895,6 +1971,14 @@ class ServiceManagerV2:
             return {"converged": [], "pending": []}
         converged: list[str] = []
         pending: list[str] = []
+        no_wait = _NO_LOCK_WAIT.set(True)  # supervisor tick: busy -> pending
+        try:
+            self._converge_startups_into(converged, pending)
+        finally:
+            _NO_LOCK_WAIT.reset(no_wait)
+        return {"converged": converged, "pending": pending}
+
+    def _converge_startups_into(self, converged: list[str], pending: list[str]) -> None:
         for snapshot in self._runtime_ops.list_startup_resident_snapshots():
             admitted_uid = snapshot.annotations.get(
                 "tre.aibrix.io/startup-admitted-uid"
@@ -1916,7 +2000,6 @@ class ServiceManagerV2:
                 pending.append(snapshot.name)
                 continue
             converged.append(snapshot.name)
-        return {"converged": converged, "pending": pending}
 
     @serialized_operation("startup_converge")
     def _converge_startup(
@@ -2071,10 +2154,10 @@ class ServiceManagerV2:
     def async_enabled(self) -> bool:
         return self._async_ops is not None
 
-    def list_async_operations(self, *, limit: int = 100) -> list[dict]:
+    def list_async_operations(self, *, limit: int = 100, active: bool = False) -> list[dict]:
         if self._async_ops is None:
             return []
-        return self._async_ops.list(limit=limit)
+        return self._async_ops.list(limit=limit, active=active)
 
     def wait_async_operation(self, operation_id: str, *, timeout_s: float | None = None) -> bool:
         if self._async_ops is None:
@@ -2082,7 +2165,12 @@ class ServiceManagerV2:
         return self._async_ops.wait(operation_id, timeout_s=timeout_s)
 
     def submit_model_target(
-        self, model: str, *, wake_replicas: int, drain_s: float | None = None
+        self,
+        model: str,
+        *,
+        wake_replicas: int,
+        drain_s: float | None = None,
+        meta: dict | None = None,
     ) -> dict:
         if self._async_ops is None:
             raise ValueError("async operations are disabled (TRE_SM_ASYNC_OPS)")
@@ -2097,11 +2185,17 @@ class ServiceManagerV2:
             target_key=f"model:{model}",
             request={"wake_replicas": int(wake_replicas), "drain_s": drain_s},
             plan=plan,
+            meta=_checked_meta(meta),
         )
         return _accepted_view(record)
 
     def submit_binding_power(
-        self, serve_id: str, *, awake: bool, drain_s: float | None = None
+        self,
+        serve_id: str,
+        *,
+        awake: bool,
+        drain_s: float | None = None,
+        meta: dict | None = None,
     ) -> dict:
         if self._async_ops is None:
             raise ValueError("async operations are disabled (TRE_SM_ASYNC_OPS)")
@@ -2138,6 +2232,7 @@ class ServiceManagerV2:
                 "draining": is_draining,
                 "action": action,
             },
+            meta=_checked_meta(meta),
         )
         return _accepted_view(record)
 
@@ -2235,7 +2330,8 @@ class ServiceManagerV2:
         if self._async_ops is None:
             return []
         orphaned = self._async_ops.recover_orphans()
-        self._orphaned_async_ops.update(str(item["operation_id"]) for item in orphaned)
+        with self._orphaned_lock:
+            self._orphaned_async_ops.update(str(item["operation_id"]) for item in orphaned)
         return orphaned
 
     def recover_orphaned_async_ops(self) -> dict | None:
@@ -2245,7 +2341,9 @@ class ServiceManagerV2:
             return None
         orphaned = self._mark_orphaned_async_ops()
         recovered = None
-        if self._orphaned_async_ops and self._hide_enabled:
+        with self._orphaned_lock:
+            any_orphaned = bool(self._orphaned_async_ops)
+        if any_orphaned and self._hide_enabled:
             recovered = self.recover_stale_drains()
         if not orphaned and recovered is None:
             return None
@@ -2934,11 +3032,15 @@ class TargetRequest(BaseModel):
     # Per-call drain budget in seconds (None = TRE_SM_DRAIN_BEFORE_SLEEP default,
     # 0 = sleep as soon as the pod is unroutable). > 0 needs the hide flag.
     drain_s: float | None = None
+    # Caller context stored with an ASYNC operation (e.g. the controller's
+    # rollback intent) so a restarted caller can take it over; ignored when sync.
+    meta: dict | None = None
 
 
 class BindingPowerRequest(BaseModel):
     awake: bool
     drain_s: float | None = None
+    meta: dict | None = None
 
 
 class DefragRequest(BaseModel):
@@ -3070,12 +3172,12 @@ def create_app(service: ServiceManagerV2) -> FastAPI:
 
 
     @app.get("/v2/async-operations")
-    def list_async_operations(limit: int = 100) -> dict:
+    def list_async_operations(limit: int = 100, active: int = 0) -> dict:
         if limit < 1 or limit > 1000:
             raise HTTPException(status_code=400, detail="limit must be between 1 and 1000")
         return {
             "enabled": service.async_enabled,
-            "operations": service.list_async_operations(limit=limit),
+            "operations": service.list_async_operations(limit=limit, active=bool(active)),
         }
 
     @app.get("/v2/operations/{operation_id}")
@@ -3122,7 +3224,10 @@ def create_app(service: ServiceManagerV2) -> FastAPI:
                 return JSONResponse(
                     status_code=202,
                     content=service.submit_model_target(
-                        model, wake_replicas=request.wake_replicas, drain_s=request.drain_s
+                        model,
+                        wake_replicas=request.wake_replicas,
+                        drain_s=request.drain_s,
+                        meta=request.meta,
                     ),
                 )
             return service.put_model_target(
@@ -3142,7 +3247,7 @@ def create_app(service: ServiceManagerV2) -> FastAPI:
                 return JSONResponse(
                     status_code=202,
                     content=service.submit_binding_power(
-                        serve_id, awake=request.awake, drain_s=request.drain_s
+                        serve_id, awake=request.awake, drain_s=request.drain_s, meta=request.meta
                     ),
                 )
             return service.put_binding_power(
@@ -3154,6 +3259,20 @@ def create_app(service: ServiceManagerV2) -> FastAPI:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     return app
+
+def _checked_meta(meta: dict | None) -> dict | None:
+    if meta is None:
+        return None
+    if not isinstance(meta, dict):
+        raise ValueError("meta must be a JSON object")
+    try:
+        encoded = json.dumps(meta, sort_keys=True)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"meta must be JSON serialisable: {exc}") from exc
+    if len(encoded) > 4096:
+        raise ValueError("meta must be at most 4096 bytes of JSON")
+    return json.loads(encoded)
+
 
 def _accepted_view(record: dict) -> dict:
     return {

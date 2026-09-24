@@ -31,7 +31,7 @@ through the drain recovery (desired state wins).
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import json
 import logging
@@ -61,15 +61,32 @@ class AsyncOpsConfig:
     # orphaned (that instance died or was replaced mid-operation).
     orphan_after_s: float = 60.0
     max_records: int = 500
+    # Review H2: a SYNCHRONOUS call (routable, defrag, sync target/power) that finds
+    # the writer lock busy waits up to this long instead of an instant 409. Only
+    # applied with TRE_SM_HIDE_BEFORE_SLEEP or TRE_SM_ASYNC_OPS on (flags off = main).
+    sync_lock_wait_s: float = 30.0
+    sync_lock_poll_s: float = 0.2
+    # Review L3: refuse async operations when this host's clock and Redis TIME
+    # disagree by more than this (heartbeats / orphan detection use wall clocks).
+    max_clock_skew_s: float = 5.0
 
     def __post_init__(self) -> None:
-        for name in ("lock_wait_s", "lock_retry_s", "heartbeat_s", "orphan_after_s"):
+        for name in (
+            "lock_wait_s",
+            "lock_retry_s",
+            "heartbeat_s",
+            "orphan_after_s",
+            "sync_lock_poll_s",
+            "max_clock_skew_s",
+        ):
             if not float(getattr(self, name)) > 0:
                 raise ValueError(f"AsyncOpsConfig.{name} must be positive")
         if self.orphan_after_s <= self.heartbeat_s:
             raise ValueError("AsyncOpsConfig.orphan_after_s must exceed heartbeat_s")
         if int(self.max_records) < 10:
             raise ValueError("AsyncOpsConfig.max_records must be at least 10")
+        if float(self.sync_lock_wait_s) < 0:
+            raise ValueError("AsyncOpsConfig.sync_lock_wait_s must not be negative")
 
     @classmethod
     def from_env(cls, env: Mapping[str, str]) -> "AsyncOpsConfig":
@@ -84,7 +101,42 @@ class AsyncOpsConfig:
             max_records=int(
                 _env_float(env, "TRE_SM_ASYNC_MAX_RECORDS", float(defaults.max_records))
             ),
+            sync_lock_wait_s=_env_float(
+                env, "TRE_SM_SYNC_LOCK_WAIT_S", defaults.sync_lock_wait_s
+            ),
+            max_clock_skew_s=_env_float(
+                env, "TRE_SM_ASYNC_MAX_CLOCK_SKEW_S", defaults.max_clock_skew_s
+            ),
         )
+
+
+def enforce_clock_skew(
+    config: AsyncOpsConfig,
+    redis_client,
+    *,
+    wall_clock: Callable[[], float] = time.time,
+) -> AsyncOpsConfig:
+    """Review L3 (fail closed): async operations rely on wall-clock heartbeats that
+    other SM instances compare with THEIR clock. If this host disagrees with Redis
+    TIME (the shared reference) by more than ``max_clock_skew_s`` - or TIME cannot
+    be read - async operations stay disabled (the SM serves synchronously)."""
+    if not config.enabled:
+        return config
+    try:
+        seconds, micros = redis_client.time()
+        skew = abs(wall_clock() - (float(seconds) + float(micros) / 1e6))
+    except Exception as exc:  # noqa: BLE001 - unknown skew = unsafe
+        _LOGGER.error("TRE_SM_ASYNC_OPS disabled: cannot read Redis TIME (%s)", exc)
+        return replace(config, enabled=False)
+    if skew > config.max_clock_skew_s:
+        _LOGGER.error(
+            "TRE_SM_ASYNC_OPS disabled: host clock differs from Redis TIME by %.1fs "
+            "(> %.1fs); pin the service-manager and fix NTP",
+            skew,
+            config.max_clock_skew_s,
+        )
+        return replace(config, enabled=False)
+    return config
 
 
 def _env_float(env: Mapping[str, str], name: str, default: float) -> float:
@@ -190,6 +242,9 @@ class AsyncOperationManager:
         self._threads: dict[str, threading.Thread] = {}
         self._done: dict[str, threading.Event] = {}
         self._heartbeat: threading.Thread | None = None
+        # Review L1: terminal records whose final save failed; re-written by the
+        # heartbeat loop (they are no longer "ours and alive", so no heartbeat).
+        self._unsaved: dict[str, dict] = {}
 
     @property
     def config(self) -> AsyncOpsConfig:
@@ -205,6 +260,7 @@ class AsyncOperationManager:
         target_key: str,
         request: dict,
         plan: dict | None = None,
+        meta: dict | None = None,
     ) -> dict:
         now = self._wall_clock()
         record = {
@@ -224,22 +280,29 @@ class AsyncOperationManager:
             "heartbeat_ts": now,
             "supersedes": [],
         }
+        if meta is not None:
+            record["meta"] = dict(meta)
         with self._lock:
             queue = self._queues.setdefault(model, deque())
-            for older_id in list(queue):
-                older = self._records.get(older_id)
-                if older is not None and older.get("target_key") == target_key:
-                    queue.remove(older_id)
-                    record["supersedes"].append(older_id)
-                    self._finish_locked(
-                        older,
-                        status="superseded",
-                        payload={"superseded_by": record["operation_id"]},
-                    )
+            superseded = [
+                older_id
+                for older_id in queue
+                if (self._records.get(older_id) or {}).get("target_key") == target_key
+            ]
+            record["supersedes"] = list(superseded)
+            # Persist first: if the journal is down the request fails (HTTP 500)
+            # and nothing is queued, instead of running an unrecorded operation.
+            self._journal.save(record)
+            for older_id in superseded:
+                queue.remove(older_id)
+                self._finish_locked(
+                    self._records[older_id],
+                    status="superseded",
+                    payload={"superseded_by": record["operation_id"]},
+                )
             self._records[record["operation_id"]] = record
             self._done[record["operation_id"]] = threading.Event()
             queue.append(record["operation_id"])
-            self._journal.save(record)
             self._pump_locked(model)
             self._ensure_heartbeat_locked()
         self._prune()
@@ -247,13 +310,16 @@ class AsyncOperationManager:
 
     def get(self, operation_id: str) -> dict | None:
         with self._lock:
-            local = self._records.get(operation_id)
+            local = self._records.get(operation_id) or self._unsaved.get(operation_id)
             if local is not None:
                 return dict(local)
         return self._journal.get(operation_id)
 
-    def list(self, *, limit: int = 100) -> list[dict]:
-        return self._journal.list()[:limit]
+    def list(self, *, limit: int = 100, active: bool = False) -> list[dict]:
+        records = self._journal.list()
+        if active:
+            records = [item for item in records if item.get("status") in ACTIVE_STATUSES]
+        return records[:limit]
 
     def wait(self, operation_id: str, *, timeout_s: float | None = None) -> bool:
         event = self._done.get(operation_id)
@@ -270,48 +336,60 @@ class AsyncOperationManager:
             }
 
     def recover_orphans(self) -> list[dict]:
-        """Mark active records of dead SM instances ``failed`` (returns them)."""
-        now = self._wall_clock()
+        """Mark active records of dead SM instances ``failed`` (returns them).
+
+        Review M1: records of THIS instance are never touched (they are either alive
+        in ``_records`` or already finished locally); each candidate is re-read under
+        the lock right before it is overwritten, so a record that its live owner
+        finished or heart-beat meanwhile is left alone.
+        """
         orphaned: list[dict] = []
-        for record in self._journal.list():
-            if record.get("status") not in ACTIVE_STATUSES:
+        for candidate in self._journal.list():
+            if not self._orphan_candidate(candidate):
                 continue
-            operation_id = str(record.get("operation_id"))
+            operation_id = str(candidate.get("operation_id"))
             with self._lock:
-                if operation_id in self._records:
-                    continue  # ours and alive
-            heartbeat = float(record.get("heartbeat_ts") or record.get("updated_ts") or 0.0)
-            if (
-                record.get("instance") != self._instance
-                and now - heartbeat < self._config.orphan_after_s
-            ):
-                continue  # another live instance (e.g. mid rolling update)
-            phase = record.get("phase")
-            record.update(
-                {
-                    "status": "failed",
-                    "phase": "orphaned",
-                    "orphaned_in_phase": phase,
-                    "recovered_by": self._instance,
-                    "error": (
-                        "service-manager instance "
-                        f"{record.get('instance')} stopped during phase {phase!r}; "
-                        + (
-                            "never started, nothing was changed"
-                            if phase == "queued"
-                            else "the desired state it persisted is finished by the "
-                            "drain recovery / reconcile"
-                        )
-                    ),
-                    "updated_ts": now,
-                    "finished_ts": now,
-                    "finished_at": _iso(now),
-                }
-            )
-            self._journal.save(record)
-            _LOGGER.warning("async op orphaned: %s", json.dumps(record, default=str))
+                record = self._journal.get(operation_id)
+                if record is None or not self._orphan_candidate(record):
+                    continue
+                self._mark_orphaned(record)
             orphaned.append(record)
         return orphaned
+
+    def _orphan_candidate(self, record: dict) -> bool:
+        if record.get("status") not in ACTIVE_STATUSES:
+            return False
+        if record.get("instance") == self._instance:
+            return False
+        heartbeat = float(record.get("heartbeat_ts") or record.get("updated_ts") or 0.0)
+        return self._wall_clock() - heartbeat >= self._config.orphan_after_s
+
+    def _mark_orphaned(self, record: dict) -> None:
+        now = self._wall_clock()
+        phase = record.get("phase")
+        record.update(
+            {
+                "status": "failed",
+                "phase": "orphaned",
+                "orphaned_in_phase": phase,
+                "recovered_by": self._instance,
+                "error": (
+                    "service-manager instance "
+                    f"{record.get('instance')} stopped during phase {phase!r}; "
+                    + (
+                        "never started, nothing was changed"
+                        if phase == "queued"
+                        else "the desired state it persisted is finished by the "
+                        "drain recovery / reconcile"
+                    )
+                ),
+                "updated_ts": now,
+                "finished_ts": now,
+                "finished_at": _iso(now),
+            }
+        )
+        self._journal.save(record)
+        _LOGGER.warning("async op orphaned: %s", json.dumps(record, default=str))
 
     # ------------------------------------------------------------ internals
 
@@ -350,7 +428,10 @@ class AsyncOperationManager:
             record["heartbeat_ts"] = now
             if details:
                 record.setdefault("progress", []).append({"phase": stage, **details})
-            self._journal.save(record)
+            try:
+                self._journal.save(record)
+            except Exception:  # noqa: BLE001 - the next save/heartbeat re-writes it
+                _LOGGER.exception("async op %s: progress save failed", operation_id)
             if stage == DRAINING_STAGE:
                 self._pump_locked(model)
 
@@ -368,7 +449,10 @@ class AsyncOperationManager:
                     "heartbeat_ts": now,
                 }
             )
-            self._journal.save(record)
+            try:
+                self._journal.save(record)
+            except Exception:  # noqa: BLE001 - the heartbeat re-writes it
+                _LOGGER.exception("async op %s: start save failed", operation_id)
             snapshot = dict(record)
         status = "failed"
         payload: dict = {}
@@ -397,8 +481,12 @@ class AsyncOperationManager:
         if record.get("started_ts") is not None:
             record["duration_s"] = round(now - float(record["started_ts"]), 3)
         record["latency_s"] = round(now - float(record["created_ts"]), 3)
-        self._journal.save(record)
         operation_id = record["operation_id"]
+        if not self._save_with_retry(record):
+            # Review L1: never leave it "running" in the journal while nobody owns
+            # it - keep re-writing the terminal record from the heartbeat loop.
+            self._unsaved[operation_id] = dict(record)
+            self._ensure_heartbeat_locked()
         self._records.pop(operation_id, None)
         self._threads.pop(operation_id, None)
         event = self._done.pop(operation_id, None)
@@ -421,6 +509,19 @@ class AsyncOperationManager:
             )
         )
 
+    def _save_with_retry(self, record: dict, attempts: int = 3) -> bool:
+        for attempt in range(attempts):
+            try:
+                self._journal.save(record)
+                return True
+            except Exception:  # noqa: BLE001 - Redis hiccup
+                _LOGGER.exception(
+                    "async op %s: journal save failed (attempt %d)",
+                    record.get("operation_id"),
+                    attempt + 1,
+                )
+        return False
+
     def _ensure_heartbeat_locked(self) -> None:
         if self._heartbeat is not None and self._heartbeat.is_alive():
             return
@@ -433,13 +534,25 @@ class AsyncOperationManager:
         while True:
             time.sleep(self._config.heartbeat_s)
             with self._lock:
-                if not self._records:
+                self._flush_unsaved_locked()
+                if not self._records and not self._unsaved:
                     self._heartbeat = None
                     return
                 now = self._wall_clock()
                 for record in self._records.values():
                     record["heartbeat_ts"] = now
-                    self._journal.save(record)
+                    try:
+                        self._journal.save(record)
+                    except Exception:  # noqa: BLE001 - next beat retries
+                        _LOGGER.exception("async op heartbeat save failed")
+
+    def _flush_unsaved_locked(self) -> None:
+        for operation_id, record in list(self._unsaved.items()):
+            try:
+                self._journal.save(record)
+            except Exception:  # noqa: BLE001 - next beat retries
+                continue
+            self._unsaved.pop(operation_id, None)
 
     def _prune(self) -> None:
         try:

@@ -14,7 +14,7 @@ from tre_sm.gpu_truth import RedisGpuTruth
 from tre_sm.ops.drain import DrainConfig, check_reissue_coupling
 from tre_sm.ops.k8s_ops import K8sOps
 from tre_sm.ops.vllm_ops import VllmOps
-from tre_sm.state.async_ops import AsyncOpsConfig
+from tre_sm.state.async_ops import AsyncOpsConfig, enforce_clock_skew
 from tre_sm.state.drain_markers import DrainMarkerStore
 from tre_sm.state.reconcile import PodRecord
 from tre_sm.state.operations import OperationCoordinator
@@ -52,6 +52,9 @@ def create_app() -> FastAPI:
     async_config = AsyncOpsConfig.from_env(os.environ)
     redis_url = os.environ.get("TRE_REDIS_URL", "redis://aibrix-redis-master:6379/0")
     redis_client = redis.Redis.from_url(redis_url)
+    # Review L3: async operations compare wall-clock heartbeats across instances;
+    # with a skewed host clock they stay off (fail closed, SM serves synchronously).
+    async_config = enforce_clock_skew(async_config, redis_client)
     k8s_ops = _create_k8s_ops(registry)
     operation_coordinator = OperationCoordinator(
         redis_client,
