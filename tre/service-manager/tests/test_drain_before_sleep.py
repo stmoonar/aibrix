@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from dataclasses import replace
 
 import pytest
@@ -62,13 +63,25 @@ class FakeClock:
     def __init__(self):
         self.now = 1000.0
         self.sleeps: list[float] = []
+        self._lock = threading.Lock()
 
     def monotonic(self) -> float:
-        return self.now
+        with self._lock:
+            return self.now
 
     def sleep(self, seconds: float) -> None:
-        self.sleeps.append(seconds)
-        self.now += seconds
+        with self._lock:
+            self.sleeps.append(seconds)
+            self.now += seconds
+
+
+def cfg_on(**overrides) -> DrainConfig:
+    """Hide + drain on (drain requires hide)."""
+    return DrainConfig(enabled=True, hide_before_sleep=True, **overrides)
+
+
+def cfg_hide_only(**overrides) -> DrainConfig:
+    return DrainConfig(enabled=False, hide_before_sleep=True, **overrides)
 
 
 class Result:
@@ -109,6 +122,7 @@ class FakeVllmOps:
         self.pages = {ip: list(items) for ip, items in (pages or {}).items()}
         self.sleep_message = sleep_message
         self.sleeping: dict[str, bool] = {}
+        self.sleep_kwargs: list[dict] = []
 
     def metrics(self, pod_ip, *, port=None):
         self.events.append(("metrics", pod_ip))
@@ -117,8 +131,10 @@ class FakeVllmOps:
             return None
         return items.pop(0) if len(items) > 1 else items[0]
 
-    def sleep(self, pod_ip, *, port=None):
+    def sleep(self, pod_ip, *, port=None, **kwargs):
+        # kwargs is how the header travels: hidden=True <=> X-TRE-Hidden: 1.
         self.events.append(("sleep", pod_ip))
+        self.sleep_kwargs.append(kwargs)
         self.sleeping[pod_ip] = True
         return Result(self.sleep_message)
 
@@ -240,7 +256,7 @@ def _service(events, *, pages=None, enabled=True, clock=None, vllm_cls=FakeVllmO
         unroutable_timeout=unroutable_timeout,
     )
     vllm = vllm_cls(events, pages=pages, sleep_message=sleep_message)
-    cfg = cfg or DrainConfig(enabled=enabled)
+    cfg = cfg or (cfg_on() if enabled else DrainConfig())
     drainer = None
     if enabled:
         clock = clock or FakeClock()
@@ -274,10 +290,14 @@ def test_flag_off_put_target_call_order_is_unchanged():
 
     (slept,) = result["actions"]
     ip = {"serve-a": "10.0.0.1", "serve-b": "10.0.0.2"}[slept["serve_id"]]
-    # Exactly the legacy sequence: no hide, no unroutable wait, no scrape.
+    # Exactly the legacy sequence: no hide, no unroutable wait, no scrape,
+    # and the legacy sleep(pod_ip, port=8000) call without a header.
     assert events == [("sleep", ip), ("annotate", slept["serve_id"], "sleeping")]
+    assert _vllm.sleep_kwargs == [{}]
+    assert "sleep_outcomes" not in result
     audit = service.get_sleep_audit()
     assert audit["enabled"] is False
+    assert audit["hide_before_sleep"] is False
     (record,) = audit["records"]
     assert record["drain_enabled"] is False
     assert record["aborted_count"] == 2
@@ -309,7 +329,14 @@ def test_disabled_config_builds_no_drainer():
         vllm_ops=vllm,
         drain_config=DrainConfig(enabled=False),
     )
-    assert service.get_sleep_audit() == {"enabled": False, "records": []}
+    assert service.get_sleep_audit() == {
+        "enabled": False,
+        "hide_before_sleep": False,
+        "drain_before_sleep": False,
+        "records": [],
+    }
+    assert service._drain_markers is None
+    assert "draining" not in service.get_state()
 
 
 # ---------------------------------------------------------------- flag on
@@ -325,7 +352,10 @@ def test_flag_on_put_target_hides_all_first_then_drains_each_before_sleep():
 
     result = service.put_model_target("m1", wake_replicas=0)
 
-    assert sorted(action["serve_id"] for action in result["actions"]) == ["serve-a", "serve-b"]
+    assert sorted(
+        action["serve_id"] for action in result["actions"] if action["action"] == "sleep"
+    ) == ["serve-a", "serve-b"]
+    assert [a["action"] for a in result["actions"]].count("hide") == 2
     hides = [i for i, event in enumerate(events) if event[0] == "annotate" and event[2] == "hidden"]
     waits = [i for i, event in enumerate(events) if event[0] == "wait_unroutable"]
     assert len(hides) == 2 and len(waits) == 2
@@ -337,8 +367,10 @@ def test_flag_on_put_target_hides_all_first_then_drains_each_before_sleep():
         annotate = events.index(("annotate", serve_id, "sleeping"))
         assert wait < scrape < sleep < annotate
     assert runtime.unroutable_kwargs == [30.0, 30.0]
+    assert _vllm.sleep_kwargs == [{"hidden": True}, {"hidden": True}]
     records = service.get_sleep_audit()["records"]
     assert [record["drained"] for record in records] == [True, True]
+    assert [item["outcome"] for item in result["sleep_outcomes"]] == ["slept", "slept"]
 
 
 def test_drain_completes_early_when_queue_empties():
@@ -394,7 +426,7 @@ def test_drain_timeout_uses_twice_p95_from_histogram():
 
 
 def test_timeout_clamp():
-    cfg = DrainConfig(enabled=True)
+    cfg = cfg_on()
     assert drain_timeout_s(10.0, cfg) == 30.0
     assert drain_timeout_s(200.0, cfg) == 300.0
     assert drain_timeout_s(40.0, cfg) == 80.0
@@ -436,7 +468,7 @@ def test_metrics_lost_mid_drain_stops_polling():
             return self.pages_left.pop(0)
 
     drainer = SleepDrainer(
-        runtime, Flaky(events), DrainConfig(enabled=True),
+        runtime, Flaky(events), cfg_on(),
         monotonic=clock.monotonic, sleep=clock.sleep,
     )
     record = drainer.drain(Binding("serve-a", "m1", Slot("node-a", (0,)), awake=True), "10.0.0.1")
@@ -476,8 +508,9 @@ def test_sleep_snapshot_goes_into_audit_and_operation_journal():
     assert record["sleep_snapshot"][0]["generated_len"] == 298
     assert record["binding_id"] == "m1/node-a/0"
     assert record["ts"]
-    assert [phase for phase, _details in operation.phases] == ["sleep_drained"]
-    assert operation.phases[0][1] == record
+    phases = [phase for phase, _details in operation.phases]
+    assert phases == ["sleep_draining", "sleep_drained", "sleep_committed"]
+    assert operation.phases[1][1] == record
 
 
 def test_non_json_sleep_response_is_kept_truncated():
@@ -506,6 +539,7 @@ def test_binding_power_sleep_path_hides_and_drains():
         ("sleep", "10.0.0.1"),
         ("annotate", "serve-a", "sleeping"),
     ]
+    assert _vllm.sleep_kwargs == [{"hidden": True}]
 
 
 def test_defrag_path_does_not_wait_unroutable_twice():
@@ -545,7 +579,7 @@ def test_defrag_path_does_not_wait_unroutable_twice():
     runtime = DefragRuntime(events, [_pod("serve-a", 0, "10.0.0.1"), _pod("serve-b", 2, "10.0.0.2")])
     vllm = FakeVllmOps(events, pages=pages)
     clock = FakeClock()
-    cfg = DrainConfig(enabled=True)
+    cfg = cfg_on()
     service = ServiceManagerV2(
         registry(), store, runtime_ops=runtime, vllm_ops=vllm, drain_config=cfg,
         sleep_drainer=SleepDrainer(runtime, vllm, cfg, monotonic=clock.monotonic, sleep=clock.sleep),
@@ -557,6 +591,7 @@ def test_defrag_path_does_not_wait_unroutable_twice():
     assert events.index(("wait_unroutable", "serve-b")) < events.index(("metrics", "10.0.0.2")) < events.index(("sleep", "10.0.0.2"))
     (record,) = service.get_sleep_audit()["records"]
     assert record["unroutable_confirmed"] is True
+    assert vllm.sleep_kwargs == [{"hidden": True}]
 
 
 # ---------------------------------------------------------------- fleet repair
@@ -617,7 +652,7 @@ def test_fleet_repair_sleep_path_drains_after_hide():
         safety_gate=FakeSafety(),
         poll_interval_s=0,
         sleep=lambda _seconds: None,
-        drainer=SleepDrainer(runtime, vllm, DrainConfig(enabled=True), monotonic=clock.monotonic, sleep=clock.sleep),
+        drainer=SleepDrainer(runtime, vllm, cfg_on(), monotonic=clock.monotonic, sleep=clock.sleep),
         sleep_audit=audit_log,
     )
     executor.run(
@@ -639,6 +674,7 @@ def test_fleet_repair_sleep_path_drains_after_hide():
     ]
     (record,) = audit_log.records()
     assert record["drained"] is True and record["drain_enabled"] is True
+    assert vllm.sleep_kwargs == [{"hidden": True}]
 
 
 def test_service_passes_drainer_to_fleet_repair():
@@ -650,7 +686,7 @@ def test_service_passes_drainer_to_fleet_repair():
     vllm = FakeVllmOps(events)
     service = ServiceManagerV2(
         registry(), _two_awake_store(), runtime_ops=runtime, vllm_ops=vllm,
-        safety_gate=FakeSafety(), drain_config=DrainConfig(enabled=True),
+        safety_gate=FakeSafety(), drain_config=cfg_on(),
     )
     assert service._fleet_repair is not None
     assert service._fleet_repair._drainer is service._drainer
@@ -668,25 +704,35 @@ def test_service_passes_drainer_to_fleet_repair():
 def test_from_env_parsing():
     assert DrainConfig.from_env({}) == DrainConfig()
     assert DrainConfig.from_env({}).enabled is False
+    assert DrainConfig.from_env({}).hide_before_sleep is False
+    assert DrainConfig().sleep_deadline_s == 240.0
+    hide = {"TRE_SM_HIDE_BEFORE_SLEEP": "1"}
     for truthy in ("1", "true", "YES", " on "):
-        assert DrainConfig.from_env({"TRE_SM_DRAIN_BEFORE_SLEEP": truthy}).enabled is True
+        assert DrainConfig.from_env({**hide, "TRE_SM_DRAIN_BEFORE_SLEEP": truthy}).enabled is True
+        assert DrainConfig.from_env({"TRE_SM_HIDE_BEFORE_SLEEP": truthy}).hide_before_sleep is True
     for falsy in ("0", "false", "off", ""):
-        assert DrainConfig.from_env({"TRE_SM_DRAIN_BEFORE_SLEEP": falsy}).enabled is False
+        assert DrainConfig.from_env({**hide, "TRE_SM_DRAIN_BEFORE_SLEEP": falsy}).enabled is False
     cfg = DrainConfig.from_env(
         {
+            **hide,
             "TRE_SM_DRAIN_BEFORE_SLEEP": "true",
             "TRE_SM_DRAIN_DEFAULT_S": "45",
             "TRE_SM_DRAIN_MIN_S": "10",
             "TRE_SM_DRAIN_MAX_S": "120.5",
             "TRE_SM_DRAIN_POLL_S": "0.5",
+            "TRE_SM_SLEEP_DEADLINE_S": "200",
+            "TRE_SM_UNROUTABLE_TIMEOUT_S": "20",
         }
     )
     assert cfg == DrainConfig(
         enabled=True,
+        hide_before_sleep=True,
         default_timeout_s=45.0,
         min_timeout_s=10.0,
         max_timeout_s=120.5,
         poll_interval_s=0.5,
+        sleep_deadline_s=200.0,
+        unroutable_timeout_s=20.0,
     )
     with pytest.raises(ValueError):
         DrainConfig.from_env({"TRE_SM_DRAIN_MIN_S": "400"})
@@ -776,7 +822,12 @@ def test_sleep_audit_endpoint_reports_records_newest_last():
     service, _runtime, _vllm = _service(events, pages=pages, sleep_message="[]")
     client = TestClient(create_app(service))
 
-    assert client.get("/v2/sleep-audit").json() == {"enabled": True, "records": []}
+    assert client.get("/v2/sleep-audit").json() == {
+        "enabled": True,
+        "hide_before_sleep": True,
+        "drain_before_sleep": True,
+        "records": [],
+    }
     service.put_binding_power("serve-a", awake=False)
     service.put_binding_power("serve-b", awake=False)
 
@@ -797,13 +848,15 @@ def test_create_service_app_threads_drain_config():
         _two_awake_store(),
         runtime_ops=runtime,
         vllm_ops=vllm,
-        drain_config=DrainConfig(enabled=True),
+        drain_config=cfg_on(),
     )
-    assert TestClient(app).get("/v2/sleep-audit").json() == {"enabled": True, "records": []}
+    assert TestClient(app).get("/v2/sleep-audit").json()["enabled"] is True
     default_app = create_service_app(
         registry(), _two_awake_store(), runtime_ops=runtime, vllm_ops=vllm
     )
     assert TestClient(default_app).get("/v2/sleep-audit").json() == {
         "enabled": False,
+        "hide_before_sleep": False,
+        "drain_before_sleep": False,
         "records": [],
     }

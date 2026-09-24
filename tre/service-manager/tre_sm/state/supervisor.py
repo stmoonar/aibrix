@@ -83,6 +83,14 @@ class FleetSupervisor:
 
     def run_once(self) -> None:
         self._service.converge_startups()
+        # Staged sleeps (TRE_SM_HIDE_BEFORE_SLEEP): resolve draining markers
+        # whose owner died or ran out of time. Absent on older services.
+        recover_drains = getattr(self._service, "recover_stale_drains", None)
+        if callable(recover_drains):
+            try:
+                recover_drains()
+            except OperationBusy:
+                pass
         recovered = self._service.recover_stale_fleet_repairs()
         if recovered is not None:
             self._last_recovery_operation_id = str(recovered["operation_id"])

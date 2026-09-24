@@ -11,9 +11,10 @@ from tre_sm.allocator.topology import K8sPodSnapshot, pod_records_from_snapshots
 from tre_sm.allocator.slots import Binding, Slot
 from tre_sm.app import create_service_app
 from tre_sm.gpu_truth import RedisGpuTruth
-from tre_sm.ops.drain import DrainConfig
+from tre_sm.ops.drain import DrainConfig, check_reissue_coupling
 from tre_sm.ops.k8s_ops import K8sOps
 from tre_sm.ops.vllm_ops import VllmOps
+from tre_sm.state.drain_markers import DrainMarkerStore
 from tre_sm.state.reconcile import PodRecord
 from tre_sm.state.operations import OperationCoordinator
 from tre_sm.state.safety import ClusterSafetyGate
@@ -42,6 +43,10 @@ def create_app() -> FastAPI:
         raise RuntimeError("redis package is required for the service-manager server") from exc
 
     registry = load_registry(os.environ.get("TRE_REGISTRY_PATH"))
+    # Fail closed before touching Redis/Kubernetes: DRAIN without HIDE, or
+    # the reissue sidecar without HIDE, is a startup error.
+    drain_config = DrainConfig.from_env(os.environ)
+    check_reissue_coupling(registry, drain_config)
     redis_url = os.environ.get("TRE_REDIS_URL", "redis://aibrix-redis-master:6379/0")
     redis_client = redis.Redis.from_url(redis_url)
     k8s_ops = _create_k8s_ops(registry)
@@ -99,7 +104,8 @@ def create_app() -> FastAPI:
         supervisor_interval_s=float(
             os.environ.get("TRE_SM_SUPERVISOR_INTERVAL_S", "5")
         ),
-        drain_config=DrainConfig.from_env(os.environ),
+        drain_config=drain_config,
+        drain_markers=DrainMarkerStore(redis_client, require_fence=True),
     )
 
 

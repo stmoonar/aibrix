@@ -36,8 +36,14 @@ class VllmOps:
         self._max_attempts = max_attempts
         self._default_port = default_port
 
-    def sleep(self, pod_ip: str, *, port: int | None = None) -> VllmOpResult:
-        return self._post(pod_ip, "sleep", port=port)
+    def sleep(
+        self, pod_ip: str, *, port: int | None = None, hidden: bool = False
+    ) -> VllmOpResult:
+        """POST /sleep. ``hidden=True`` adds ``X-TRE-Hidden: 1``: the caller
+        hid the pod first (TRE_SM_HIDE_BEFORE_SLEEP); the reissue sidecar
+        refuses a /sleep without it."""
+        headers = {"X-TRE-Hidden": "1"} if hidden else None
+        return self._post(pod_ip, "sleep", port=port, headers=headers)
 
     def wake_up(self, pod_ip: str, *, port: int | None = None) -> VllmOpResult:
         return self._post(pod_ip, "wake_up", port=port)
@@ -118,13 +124,25 @@ class VllmOps:
             message=last_message or "timed out waiting for vLLM HTTP readiness",
         )
 
-    def _post(self, pod_ip: str, action: str, *, port: int | None) -> VllmOpResult:
+    def _post(
+        self,
+        pod_ip: str,
+        action: str,
+        *,
+        port: int | None,
+        headers: dict[str, str] | None = None,
+    ) -> VllmOpResult:
         url = f"http://{pod_ip}:{port or self._default_port}/{action}"
         last_status: int | None = None
         last_message = ""
         for attempt in range(1, self._max_attempts + 1):
             try:
-                response = self._http.post(url, timeout=self._timeout_s)
+                if headers:
+                    response = self._http.post(
+                        url, timeout=self._timeout_s, headers=headers
+                    )
+                else:
+                    response = self._http.post(url, timeout=self._timeout_s)
             except Exception as exc:  # pragma: no cover - exact transport exceptions vary.
                 last_message = str(exc)
                 continue
@@ -192,7 +210,7 @@ class _RequestsTransport:
 
         return requests.get(url, timeout=timeout)
 
-    def post(self, url: str, *, timeout: float):
+    def post(self, url: str, *, timeout: float, headers: dict[str, str] | None = None):
         import requests
 
-        return requests.post(url, timeout=timeout)
+        return requests.post(url, timeout=timeout, headers=headers)

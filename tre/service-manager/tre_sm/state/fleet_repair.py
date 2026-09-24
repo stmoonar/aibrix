@@ -209,11 +209,23 @@ class FleetRepairExecutor:
 
     def _sleep_binding(self, binding: Binding, pod_ip: str) -> None:
         # Both call sites write the HIDDEN annotation right before this, so
-        # the drainer only has to wait for unroutable + empty queues.
+        # with TRE_SM_HIDE_BEFORE_SLEEP on (drainer present) only the
+        # unroutable wait (+ empty queues with the drain flag) is left. Fleet
+        # repair runs in observe mode under its own writer lease, so this
+        # stays inline, bounded by the per-call sleep deadline.
         drain_record = None
         if self._drainer is not None:
-            drain_record = self._drainer.drain(binding, pod_ip)
-        result = self._vllm.sleep(pod_ip, port=8000)
+            cfg = self._drainer.config
+            drain_record = self._drainer.drain(
+                binding,
+                pod_ip,
+                deadline=self._drainer.now()
+                + cfg.sleep_deadline_s
+                - cfg.commit_reserve_s,
+            )
+            result = self._vllm.sleep(pod_ip, port=8000, hidden=True)
+        else:
+            result = self._vllm.sleep(pod_ip, port=8000)
         if self._sleep_audit is not None:
             self._sleep_audit.record_sleep(binding, pod_ip, result, drain_record)
         if not bool(getattr(result, "success", False)):

@@ -2,10 +2,15 @@ from __future__ import annotations
 
 import re
 import json
+import logging
+import threading
+import time
+from dataclasses import dataclass, field
 from dataclasses import replace
 from dataclasses import asdict
 from functools import wraps
-from typing import Protocol
+from typing import Callable, Protocol
+from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -27,10 +32,18 @@ from tre_sm.allocator.slots import (
 )
 from tre_sm.allocator.topology import K8sPodSnapshot
 from tre_sm.gpu_truth import GpuTruthProvider
-from tre_sm.ops.drain import DrainConfig, SleepAuditLog, SleepDrainer
+from tre_sm.ops.drain import (
+    DrainConfig,
+    SleepAuditLog,
+    SleepConfigError,
+    SleepDrainer,
+    accepts_kwarg,
+    check_reissue_coupling,
+)
 from tre_sm.ops.k8s_ops import StartupPodRecord
+from tre_sm.state.drain_markers import DrainMarker, DrainMarkerStore
 from tre_sm.state.reconcile import K8sPodClient, POD_STATE_AWAKE, POD_STATE_HIDDEN, POD_STATE_SLEEPING, audit_state, reconcile_state
-from tre_sm.state.operations import OperationBusy, OperationCoordinator
+from tre_sm.state.operations import OperationBusy, OperationCoordinator, current_operation
 from tre_sm.state.fleet_repair import FleetRepairExecutor
 from tre_sm.state.fleet_store import DesiredBinding, FleetStateStore, ObservedBinding
 from tre_sm.state.safety import ClusterSafetyGate, ControllerNotPaused, NodePressureActive
@@ -40,6 +53,7 @@ from tre_sm.api.v1_compat import create_v1_compat_router
 
 
 _NAT_SPLIT = re.compile(r"(\d+)")
+_LOGGER = logging.getLogger("tre_sm.api.v2")
 
 
 def serialized_operation(kind: str):
@@ -55,6 +69,23 @@ def serialized_operation(kind: str):
         return wrapped
 
     return decorate
+
+
+@dataclass
+class _StagedSleep:
+    """One binding hidden + marked draining in phase 1 of a staged sleep."""
+
+    binding: Binding  # as loaded before hiding (awake=True)
+    token: str
+    pod_ip: str
+    hidden_at: float
+
+
+@dataclass
+class _StagedCall:
+    result: dict
+    sleeps: list[_StagedSleep] = field(default_factory=list)
+    operation_id: str | None = None
 
 
 class RuntimePodOps(Protocol):
@@ -133,6 +164,8 @@ class ServiceManagerV2:
         gpu_leases: GpuLeaseStore | None = None,
         drain_config: DrainConfig | None = None,
         sleep_drainer: SleepDrainer | None = None,
+        drain_markers: DrainMarkerStore | None = None,
+        wall_clock: Callable[[], float] = time.time,
     ) -> None:
         self._registry = registry
         self._store = store
@@ -149,20 +182,42 @@ class ServiceManagerV2:
         self._gpu_leases = gpu_leases
         self._supervisor = None
         self._fleet_repair = None
-        self._drain_config = drain_config
+        # ``sleep_drainer`` is a test seam (fake clock); its config wins.
+        sleep_cfg = (
+            sleep_drainer.config
+            if sleep_drainer is not None
+            else (drain_config or DrainConfig())
+        )
+        self._drain_config = sleep_cfg
+        check_reissue_coupling(registry, sleep_cfg)
         # /sleep responses are always kept in memory (no I/O); hide, drain,
-        # journal and log only happen when the drain flag is on.
+        # journal and log only happen when TRE_SM_HIDE_BEFORE_SLEEP is on.
         self._sleep_audit = SleepAuditLog()
-        # ``sleep_drainer`` is a test seam (fake clock); it implies enabled.
         self._drainer: SleepDrainer | None = sleep_drainer
         if (
             self._drainer is None
-            and drain_config is not None
-            and drain_config.enabled
+            and sleep_cfg.hide_before_sleep
             and runtime_ops is not None
             and vllm_ops is not None
         ):
-            self._drainer = SleepDrainer(runtime_ops, vllm_ops, drain_config)
+            self._drainer = SleepDrainer(runtime_ops, vllm_ops, sleep_cfg)
+        if self._drainer is not None and not sleep_cfg.hide_before_sleep:
+            raise SleepConfigError("a sleep drainer requires hide_before_sleep=True")
+        self._hide_enabled = self._drainer is not None
+        if self._hide_enabled and not accepts_kwarg(vllm_ops.sleep, "hidden"):
+            raise SleepConfigError(
+                "TRE_SM_HIDE_BEFORE_SLEEP needs a vLLM client whose sleep() "
+                "accepts hidden= (to send X-TRE-Hidden)"
+            )
+        self._drain_markers: DrainMarkerStore | None = None
+        if self._hide_enabled:
+            self._drain_markers = drain_markers or DrainMarkerStore(
+                getattr(store, "_redis", None)
+            )
+        self._wall_clock = wall_clock
+        self._instance_id = uuid4().hex
+        self._inflight_tokens: set[str] = set()
+        self._inflight_lock = threading.Lock()
         if (
             runtime_ops is not None
             and vllm_ops is not None
@@ -196,22 +251,65 @@ class ServiceManagerV2:
     def get_sleep_audit(self, *, limit: int = 100) -> dict:
         return {
             "enabled": self._drainer is not None,
+            "hide_before_sleep": self._hide_enabled,
+            "drain_before_sleep": bool(
+                self._hide_enabled and self._drain_config.enabled
+            ),
             "records": self._sleep_audit.records(limit),
         }
 
     def get_state(self) -> dict:
         snapshot = self._store.load()
-        state = {
-            "version": snapshot.version,
-            "models": self._model_counts(snapshot.bindings),
-            "bindings": [self._binding_dict(binding) for binding in snapshot.bindings],
-        }
+        if not self._hide_enabled:
+            state = {
+                "version": snapshot.version,
+                "models": self._model_counts(snapshot.bindings),
+                "bindings": [self._binding_dict(binding) for binding in snapshot.bindings],
+            }
+        else:
+            # A draining binding is still physically awake and holds its GPU:
+            # per binding it stays awake=True/hidden=True (the controller's
+            # planner then never plans a wake onto that GPU), plus
+            # draining=True. Per model, "awake" counts only non-draining
+            # replicas: sm_client.scale_model computes the next target as
+            # counts["awake"] + delta, and the SM's target means serving
+            # (non-draining) replicas, so a +1 during a drain reclaims the
+            # draining binding instead of overshooting, and a repeated -1 is
+            # not re-issued against a replica that is already going away.
+            markers = self._load_markers()
+            draining = {
+                binding.binding_id
+                for binding in snapshot.bindings
+                if binding.awake and binding.binding_id in markers
+            }
+            state = {
+                "version": snapshot.version,
+                "models": self._model_counts(
+                    snapshot.bindings, draining_ids=draining
+                ),
+                "bindings": [
+                    {
+                        **self._binding_dict(binding),
+                        "draining": binding.binding_id in draining,
+                    }
+                    for binding in snapshot.bindings
+                ],
+                "draining": [
+                    marker.to_dict()
+                    for binding_id, marker in sorted(markers.items())
+                ],
+            }
         if self._fleet_store is not None:
             state["fleet"] = self.get_fleet_state()
         return state
 
-    @serialized_operation("put_model_target")
     def put_model_target(self, model: str, *, wake_replicas: int) -> dict:
+        if not self._hide_enabled:
+            return self._put_model_target_legacy(model, wake_replicas=wake_replicas)
+        return self._put_model_target_staged(model, wake_replicas=wake_replicas)
+
+    @serialized_operation("put_model_target")
+    def _put_model_target_legacy(self, model: str, *, wake_replicas: int) -> dict:
         spec = self._registry.model(model)
         if wake_replicas < 0:
             raise ValueError("wake_replicas must be non-negative")
@@ -239,16 +337,8 @@ class ServiceManagerV2:
         actions: list[dict] = []
         updated_by_serve = {binding.serve_id: binding for binding in snapshot.bindings}
 
-        hidden_at: dict[str, float] = {}
-        if self._drainer is not None:
-            # Hide every binding about to sleep up front so their drain
-            # windows overlap instead of adding up.
-            for binding in plan["sleep"]:
-                hidden_at[binding.serve_id] = self._drainer.hide(binding)
         for binding in plan["sleep"]:
-            self._apply_runtime_power_action(
-                binding, action="sleep", hidden_at=hidden_at.get(binding.serve_id)
-            )
+            self._apply_runtime_power_action(binding, action="sleep")
             updated_by_serve[binding.serve_id] = replace(
                 binding, awake=False, hidden=False
             )
@@ -296,6 +386,771 @@ class ServiceManagerV2:
             "actions": actions,
         }
 
+    # ------------------------------------------------------------------
+    # Staged sleep (TRE_SM_HIDE_BEFORE_SLEEP): the writer lock is NOT held
+    # while waiting for a pod to become unroutable / drain.
+    #   phase 1 (lock): hide + persist a draining marker (fencing token);
+    #                   wakes/creates/reclaims of the same call finish here.
+    #   phase 2 (no lock): wait unroutable + bounded drain, all bindings of
+    #                   the call in parallel, one deadline for the call.
+    #   phase 3 (lock, retried until the deadline): marker token unchanged
+    #                   and desired still "sleeping" -> /sleep + persist;
+    #                   otherwise abandon (the newer intent wins); failures
+    #                   roll back to awake+routable, persisted.
+    # ------------------------------------------------------------------
+
+    def _put_model_target_staged(self, model: str, *, wake_replicas: int) -> dict:
+        deadline = self._drainer.now() + self._drain_config.sleep_deadline_s
+        staged = self._run_locked(
+            "put_model_target",
+            lambda: self._target_phase1(model, wake_replicas, deadline),
+        )
+        if not staged.sleeps:
+            return staged.result
+        outcomes, version = self._complete_staged(
+            staged, deadline, kind="put_model_target_commit"
+        )
+        result = dict(staged.result)
+        result["version"] = version
+        result["actions"] = list(staged.result["actions"]) + [
+            {"action": "sleep", "serve_id": item["serve_id"]}
+            for item in outcomes
+            if item["outcome"] == "slept"
+        ]
+        result["sleep_outcomes"] = outcomes
+        return result
+
+    def _target_phase1(
+        self, model: str, wake_replicas: int, deadline: float
+    ) -> _StagedCall:
+        spec = self._registry.model(model)
+        if wake_replicas < 0:
+            raise ValueError("wake_replicas must be non-negative")
+        self._recover_stale_drains_locked()
+        snapshot = self._store.load()
+        markers = self._load_markers()
+        draining_ids = self._draining_binding_ids(snapshot.bindings, markers)
+        self._ensure_target_within_cap(
+            model, spec, wake_replicas, snapshot.bindings, draining_ids=draining_ids
+        )
+        model_bindings = [binding for binding in snapshot.bindings if binding.model == model]
+        if self._runtime_ops is not None and wake_replicas > len(model_bindings) and not self._has_deployment_ops():
+            raise ValueError("runtime create is not implemented for target growth beyond existing bindings")
+        plan = self._plan_model_target(
+            model=model,
+            wake_replicas=wake_replicas,
+            bindings=snapshot.bindings,
+            tp_size=spec.tp_size,
+            draining_ids=draining_ids,
+        )
+        self._set_model_desired_target(
+            model=model,
+            target_bindings=plan["target_bindings"],
+            reason="model_target_request",
+        )
+        actions: list[dict] = []
+        updated_by_serve = {binding.serve_id: binding for binding in snapshot.bindings}
+
+        if plan["reclaim"]:
+            self._reclaim_draining(plan["reclaim"], markers, updated_by_serve, actions)
+
+        for binding in plan["wake"]:
+            self._apply_runtime_power_action(binding, action="wake")
+            updated_by_serve[binding.serve_id] = replace(
+                binding, awake=True, hidden=False
+            )
+            actions.append({"action": "wake", "serve_id": binding.serve_id})
+
+        for planned in plan["create"]:
+            binding = planned
+            if self._has_deployment_ops():
+                binding = self._create_and_wake_runtime_binding(model, planned.slot)
+            updated_by_serve[binding.serve_id] = binding
+            actions.append(
+                {
+                    "action": "create",
+                    "serve_id": binding.serve_id,
+                    "node": binding.slot.node,
+                    "gpu_ids": list(binding.slot.gpu_ids),
+                }
+            )
+
+        staged = self._stage_sleeps(
+            plan["sleep"], markers, updated_by_serve, actions, deadline,
+            reason="model_target",
+        )
+        version = snapshot.version
+        try:
+            if actions:
+                version = self._store.save(
+                    list(updated_by_serve.values()), expected_version=snapshot.version
+                )
+        except BaseException:
+            self._rollback_unstarted(staged)
+            raise
+        operation_id = self._journal_draining(staged, deadline)
+        return _StagedCall(
+            result={
+                "model": model,
+                "wake_replicas": wake_replicas,
+                "version": version,
+                "actions": actions,
+            },
+            sleeps=staged,
+            operation_id=operation_id,
+        )
+
+    def _put_binding_power_staged(self, serve_id: str, *, awake: bool) -> dict:
+        deadline = self._drainer.now() + self._drain_config.sleep_deadline_s
+        staged = self._run_locked(
+            "put_binding_power",
+            lambda: self._binding_power_phase1(serve_id, awake, deadline),
+        )
+        if not staged.sleeps:
+            return staged.result
+        outcomes, version = self._complete_staged(
+            staged, deadline, kind="put_binding_power_commit"
+        )
+        result = dict(staged.result)
+        result["version"] = version
+        if any(item["outcome"] == "slept" for item in outcomes):
+            result["actions"] = list(result["actions"]) + [
+                {"action": "sleep", "serve_id": serve_id}
+            ]
+        final = next(
+            (item for item in self._store.load().bindings if item.serve_id == serve_id),
+            None,
+        )
+        if final is not None:
+            result["binding"] = self._binding_dict(final)
+        result["sleep_outcomes"] = outcomes
+        return result
+
+    def _binding_power_phase1(
+        self, serve_id: str, awake: bool, deadline: float
+    ) -> _StagedCall:
+        self._recover_stale_drains_locked()
+        snapshot = self._store.load()
+        binding = next(
+            (item for item in snapshot.bindings if item.serve_id == serve_id), None
+        )
+        if binding is None:
+            raise ValueError(f"unknown binding: {serve_id}")
+        markers = self._load_markers()
+        draining_ids = self._draining_binding_ids(snapshot.bindings, markers)
+        is_draining = binding.binding_id in draining_ids
+
+        if awake:
+            if not is_draining:
+                if not binding.awake:
+                    self._ensure_wake_within_cap(
+                        binding, snapshot.bindings, draining_ids=draining_ids
+                    )
+                return _StagedCall(
+                    result=self._put_binding_power_unlocked(serve_id, awake=True)
+                )
+            # Wake of a draining binding = cancel its drain (reclaim).
+            self._ensure_wake_within_cap(
+                binding, snapshot.bindings, draining_ids=draining_ids
+            )
+            self._update_desired(
+                {binding.binding_id: {"power": "awake", "hidden": False}},
+                updated_by="service-manager-api",
+                reason="binding_power_request",
+            )
+            actions: list[dict] = []
+            updated_by_serve = {item.serve_id: item for item in snapshot.bindings}
+            self._reclaim_draining([binding], markers, updated_by_serve, actions)
+            version = self._store.save(
+                [updated_by_serve[item.serve_id] for item in snapshot.bindings],
+                expected_version=snapshot.version,
+            )
+            return _StagedCall(
+                result={
+                    "serve_id": serve_id,
+                    "awake": True,
+                    "version": version,
+                    "actions": actions,
+                    "binding": self._binding_dict(updated_by_serve[serve_id]),
+                }
+            )
+
+        self._update_desired(
+            {binding.binding_id: {"power": "sleeping", "hidden": False}},
+            updated_by="service-manager-api",
+            reason="binding_power_request",
+        )
+        if is_draining or not binding.awake:
+            # Already asleep, or a sleep of this binding is already in flight.
+            result = {
+                "serve_id": serve_id,
+                "awake": False,
+                "version": snapshot.version,
+                "actions": [],
+                "binding": self._binding_dict(binding),
+            }
+            if is_draining:
+                result["draining"] = True
+            return _StagedCall(result=result)
+        actions = []
+        updated_by_serve = {item.serve_id: item for item in snapshot.bindings}
+        staged = self._stage_sleeps(
+            [binding], markers, updated_by_serve, actions, deadline,
+            reason="binding_power",
+        )
+        try:
+            version = self._store.save(
+                [updated_by_serve[item.serve_id] for item in snapshot.bindings],
+                expected_version=snapshot.version,
+            )
+        except BaseException:
+            self._rollback_unstarted(staged)
+            raise
+        operation_id = self._journal_draining(staged, deadline)
+        return _StagedCall(
+            result={
+                "serve_id": serve_id,
+                "awake": False,
+                "version": version,
+                "actions": actions,
+                "binding": self._binding_dict(updated_by_serve[serve_id]),
+            },
+            sleeps=staged,
+            operation_id=operation_id,
+        )
+
+    def _reclaim_draining(
+        self,
+        bindings: list[Binding],
+        markers: dict[str, DrainMarker],
+        updated_by_serve: dict[str, Binding],
+        actions: list[dict],
+    ) -> None:
+        """Cancel in-flight drains (under the lock): drop the marker first so
+        the owning call's phase 3 sees the token gone, then unhide."""
+        for binding in bindings:
+            markers.pop(binding.binding_id, None)
+        self._drain_markers.save(markers)
+        for binding in bindings:
+            self._runtime_ops.write_binding_annotations(binding, state=POD_STATE_AWAKE)
+            updated_by_serve[binding.serve_id] = replace(binding, hidden=False)
+            actions.append({"action": "reclaim", "serve_id": binding.serve_id})
+
+    def _stage_sleeps(
+        self,
+        bindings: list[Binding],
+        markers: dict[str, DrainMarker],
+        updated_by_serve: dict[str, Binding],
+        actions: list[dict],
+        deadline: float,
+        *,
+        reason: str,
+    ) -> list[_StagedSleep]:
+        if not bindings:
+            return []
+        pod_ips: dict[str, str] = {}
+        for binding in bindings:
+            snapshot = self._snapshot_for_binding(binding)
+            if not snapshot.pod_ip:
+                raise ValueError(f"pod {binding.serve_id} has no pod IP for sleep")
+            pod_ips[binding.serve_id] = snapshot.pod_ip
+        now_wall = self._wall_clock()
+        remaining = max(0.0, deadline - self._drainer.now())
+        operation = current_operation()
+        operation_id = getattr(operation, "operation_id", None)
+        tokens: list[tuple[Binding, str]] = []
+        for binding in bindings:
+            token = uuid4().hex
+            markers[binding.binding_id] = DrainMarker(
+                binding_id=binding.binding_id,
+                serve_id=binding.serve_id,
+                model=binding.model,
+                token=token,
+                instance=self._instance_id,
+                started_at=now_wall,
+                deadline_at=now_wall + remaining,
+                reason=reason,
+                operation_id=str(operation_id) if operation_id else None,
+                prior_hidden=binding.hidden,
+            )
+            tokens.append((binding, token))
+        with self._inflight_lock:
+            self._inflight_tokens.update(token for _binding, token in tokens)
+        staged: list[_StagedSleep] = []
+        try:
+            # Marker before the hide annotation: a crash in between leaves a
+            # marker the drain recovery resolves, never an unexplained hidden pod.
+            self._drain_markers.save(markers)
+            for binding, token in tokens:
+                hidden_at = self._drainer.hide(binding)
+                staged.append(
+                    _StagedSleep(binding, token, pod_ips[binding.serve_id], hidden_at)
+                )
+                updated_by_serve[binding.serve_id] = replace(binding, hidden=True)
+                actions.append({"action": "hide", "serve_id": binding.serve_id})
+        except BaseException:
+            self._rollback_unstarted(
+                [
+                    _StagedSleep(binding, token, pod_ips[binding.serve_id], 0.0)
+                    for binding, token in tokens
+                ]
+            )
+            raise
+        return staged
+
+    def _rollback_unstarted(self, staged: list[_StagedSleep]) -> None:
+        """Phase 1 failed after hiding: restore annotations, drop markers."""
+        if not staged:
+            return
+        for item in staged:
+            self._write_annotation_best_effort(
+                item.binding,
+                POD_STATE_HIDDEN if item.binding.hidden else POD_STATE_AWAKE,
+            )
+        try:
+            markers = self._load_markers()
+            for item in staged:
+                marker = markers.get(item.binding.binding_id)
+                if marker is not None and marker.token == item.token:
+                    markers.pop(item.binding.binding_id)
+            self._drain_markers.save(markers)
+        except Exception:  # pragma: no cover - stale recovery cleans up.
+            _LOGGER.exception("staged sleep: dropping draining markers failed")
+        self._discard_tokens(staged)
+
+    def _discard_tokens(self, staged: list[_StagedSleep]) -> None:
+        with self._inflight_lock:
+            for item in staged:
+                self._inflight_tokens.discard(item.token)
+
+    def _journal_draining(self, staged: list[_StagedSleep], deadline: float) -> str | None:
+        operation = current_operation()
+        if operation is None:
+            return None
+        if staged:
+            operation.advance(
+                "sleep_draining",
+                details={
+                    "bindings": [item.binding.binding_id for item in staged],
+                    "tokens": [item.token for item in staged],
+                    "deadline_in_s": round(max(0.0, deadline - self._drainer.now()), 3),
+                },
+            )
+        return getattr(operation, "operation_id", None)
+
+    def _complete_staged(
+        self, staged: _StagedCall, deadline: float, *, kind: str
+    ) -> tuple[list[dict], int]:
+        cfg = self._drain_config
+        try:
+            records = self._drain_staged(staged.sleeps, deadline - cfg.commit_reserve_s)
+            try:
+                return self._run_locked(
+                    kind,
+                    lambda: self._commit_staged(staged, records),
+                    retry_until=deadline - cfg.commit_reserve_s / 2.0,
+                )
+            except OperationBusy:
+                # Markers stay: the drain recovery finishes (or undoes) these
+                # sleeps once the marker is stale.
+                _LOGGER.warning(
+                    "staged sleep: writer lock busy until the deadline; %s stay "
+                    "hidden+draining for the drain recovery",
+                    [item.binding.serve_id for item in staged.sleeps],
+                )
+                raise
+        finally:
+            self._discard_tokens(staged.sleeps)
+
+    def _drain_staged(
+        self, items: list[_StagedSleep], drain_end: float
+    ) -> dict[str, dict]:
+        """Phase 2, no lock: wait unroutable (+ drain) for all items in parallel."""
+        results: dict[str, dict] = {}
+
+        def work(item: _StagedSleep) -> None:
+            try:
+                results[item.token] = self._drainer.drain(
+                    item.binding,
+                    item.pod_ip,
+                    hidden_at=item.hidden_at,
+                    deadline=drain_end,
+                    should_continue=lambda: self._marker_token_live(item),
+                )
+            except Exception as exc:
+                results[item.token] = {"error": f"{type(exc).__name__}: {exc}"}
+
+        if len(items) == 1:
+            work(items[0])
+            return dict(results)
+        threads = [
+            threading.Thread(
+                target=work,
+                args=(item,),
+                name=f"tre-sm-drain-{item.binding.serve_id}",
+                daemon=True,
+            )
+            for item in items
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=max(0.0, drain_end - self._drainer.now()) + 1.0)
+        snapshot = dict(results)
+        for item in items:
+            snapshot.setdefault(
+                item.token, {"error": "drain did not finish before the deadline"}
+            )
+        return snapshot
+
+    def _marker_token_live(self, item: _StagedSleep) -> bool:
+        marker = self._load_markers().get(item.binding.binding_id)
+        return marker is not None and marker.token == item.token
+
+    def _commit_staged(
+        self, staged: _StagedCall, records: dict[str, dict]
+    ) -> tuple[list[dict], int]:
+        """Phase 3, under the lock."""
+        markers = self._load_markers()
+        snapshot = self._store.load()
+        by_id = {binding.binding_id: binding for binding in snapshot.bindings}
+        desired = self._desired_by_id()
+        updated = {binding.serve_id: binding for binding in snapshot.bindings}
+        desired_updates: dict[str, dict[str, object]] = {}
+        outcomes: list[dict] = []
+        to_sleep: list[tuple[_StagedSleep, Binding, dict, DrainMarker]] = []
+        for item in staged.sleeps:
+            binding_id = item.binding.binding_id
+            base = {"serve_id": item.binding.serve_id, "binding_id": binding_id}
+            marker = markers.get(binding_id)
+            if marker is None or marker.token != item.token:
+                # Reclaimed or recovered meanwhile; whoever did it owns it now.
+                outcomes.append({**base, "outcome": "abandoned_reclaimed"})
+                continue
+            markers.pop(binding_id)
+            current = by_id.get(binding_id)
+            if current is None or current.serve_id != item.binding.serve_id:
+                outcomes.append({**base, "outcome": "binding_gone"})
+                continue
+            if not current.awake:
+                outcomes.append({**base, "outcome": "already_sleeping"})
+                continue
+            wanted = desired.get(binding_id)
+            if wanted is not None and wanted.power != "sleeping":
+                self._write_annotation_best_effort(
+                    current, POD_STATE_HIDDEN if wanted.hidden else POD_STATE_AWAKE
+                )
+                updated[current.serve_id] = replace(current, hidden=wanted.hidden)
+                outcomes.append({**base, "outcome": "abandoned_target_changed"})
+                continue
+            record = records.get(item.token) or {}
+            if "error" in record:
+                self._rollback_to_awake(
+                    current, marker.prior_hidden, updated, desired_updates, desired
+                )
+                outcomes.append(
+                    {**base, "outcome": "rolled_back", "error": record["error"]}
+                )
+                continue
+            to_sleep.append((item, current, record, marker))
+
+        results = self._parallel_sleep_calls(
+            [(item.token, item.pod_ip) for item, *_rest in to_sleep]
+        )
+        for item, current, record, marker in to_sleep:
+            base = {"serve_id": item.binding.serve_id, "binding_id": current.binding_id}
+            result, physical, error = results[item.token]
+            if result is not None:
+                self._sleep_audit.record_sleep(
+                    item.binding, item.pod_ip, result, record or None
+                )
+            if physical is True:
+                outcome = {**base, "outcome": "slept", "drained": record.get("drained")}
+                try:
+                    self._runtime_ops.write_binding_annotations(
+                        current, state=POD_STATE_SLEEPING
+                    )
+                    if self._gpu_leases is not None:
+                        self._gpu_leases.release(current)
+                except Exception as exc:
+                    outcome["bookkeeping_error"] = f"{type(exc).__name__}: {exc}"
+                updated[current.serve_id] = replace(current, awake=False, hidden=False)
+                outcomes.append(outcome)
+            elif physical is False:
+                self._rollback_to_awake(
+                    current, marker.prior_hidden, updated, desired_updates, desired
+                )
+                outcomes.append(
+                    {
+                        **base,
+                        "outcome": "rolled_back",
+                        "error": error or "vLLM sleep did not physically converge",
+                    }
+                )
+            else:
+                # Physical state unknown: stay hidden (fail closed); reconcile's
+                # prober records the real power state later.
+                outcomes.append(
+                    {
+                        **base,
+                        "outcome": "sleep_unverified",
+                        "error": error or "physical sleep state unknown after /sleep",
+                    }
+                )
+
+        version = snapshot.version
+        new_bindings = [updated[binding.serve_id] for binding in snapshot.bindings]
+        if new_bindings != snapshot.bindings:
+            version = self._store.save(new_bindings, expected_version=snapshot.version)
+        self._drain_markers.save(markers)
+        if desired_updates:
+            self._update_desired(
+                desired_updates, updated_by="service-manager-api", reason="sleep_rollback"
+            )
+        operation = current_operation()
+        if operation is not None:
+            operation.advance(
+                "sleep_committed",
+                details={"staged_by": staged.operation_id, "outcomes": outcomes},
+            )
+        if any(
+            item["outcome"] in {"rolled_back", "sleep_unverified"} for item in outcomes
+        ):
+            raise SleepCommitFailed(outcomes, version)
+        return outcomes, version
+
+    def _parallel_sleep_calls(
+        self, items: list[tuple[str, str]]
+    ) -> dict[str, tuple[object | None, bool | None, str | None]]:
+        """POST /sleep (X-TRE-Hidden) + physical probe; HTTP only, no writes."""
+        results: dict[str, tuple[object | None, bool | None, str | None]] = {}
+
+        def call(token: str, pod_ip: str) -> None:
+            result = None
+            error = None
+            try:
+                result = self._vllm_ops.sleep(pod_ip, port=8000, hidden=True)
+                if not bool(getattr(result, "success", False)):
+                    message = getattr(result, "message", "") or "operation failed"
+                    error = f"vLLM sleep failed: {message}"
+            except Exception as exc:
+                error = f"vLLM sleep raised {type(exc).__name__}: {exc}"
+            if hasattr(self._vllm_ops, "is_sleeping"):
+                physical = self._probe_physical(pod_ip)
+            else:
+                physical = error is None
+            results[token] = (result, physical, error)
+
+        if not items:
+            return {}
+        if len(items) == 1:
+            call(*items[0])
+            return dict(results)
+        threads = [
+            threading.Thread(
+                target=call, args=item, name=f"tre-sm-sleep-{item[1]}", daemon=True
+            )
+            for item in items
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60.0)
+        snapshot = dict(results)
+        for token, _pod_ip in items:
+            snapshot.setdefault(token, (None, None, "sleep call did not return"))
+        return snapshot
+
+    def _rollback_to_awake(
+        self,
+        current: Binding,
+        prior_hidden: bool,
+        updated: dict[str, Binding],
+        desired_updates: dict[str, dict[str, object]],
+        desired: dict[str, DesiredBinding],
+    ) -> None:
+        """The pod is known awake and did not sleep: make it serve again."""
+        self._write_annotation_best_effort(
+            current, POD_STATE_HIDDEN if prior_hidden else POD_STATE_AWAKE
+        )
+        updated[current.serve_id] = replace(current, awake=True, hidden=prior_hidden)
+        if current.binding_id in desired:
+            desired_updates[current.binding_id] = {
+                "power": "awake",
+                "hidden": prior_hidden,
+            }
+
+    def _write_annotation_best_effort(self, binding: Binding, state: str) -> None:
+        try:
+            self._runtime_ops.write_binding_annotations(binding, state=state)
+        except Exception:
+            _LOGGER.exception("annotating %s as %s failed", binding.serve_id, state)
+
+    def recover_stale_drains(self) -> dict | None:
+        """Resolve draining markers whose owner died or ran out of time.
+
+        Policy: follow the desired state. Desired power still "sleeping" (or
+        no desired store) -> finish the sleep now (the drain window is over);
+        desired "awake" (a later request won) -> unhide. Called by the fleet
+        supervisor every tick, by reconcile, and at the start of every staged
+        target/power call.
+        """
+        if not self._hide_enabled:
+            return None
+        markers = self._load_markers()
+        if not any(self._marker_is_stale(marker) for marker in markers.values()):
+            return None
+        outcomes = self._run_locked("drain_recovery", self._recover_stale_drains_locked)
+        return {"recovered": outcomes}
+
+    def _marker_is_stale(self, marker: DrainMarker) -> bool:
+        if marker.instance == self._instance_id:
+            with self._inflight_lock:
+                return marker.token not in self._inflight_tokens
+        return self._wall_clock() > marker.deadline_at + self._drain_config.stale_grace_s
+
+    def _recover_stale_drains_locked(self) -> list[dict]:
+        if not self._hide_enabled:
+            return []
+        markers = self._load_markers()
+        stale = {
+            binding_id: marker
+            for binding_id, marker in markers.items()
+            if self._marker_is_stale(marker)
+        }
+        if not stale:
+            return []
+        snapshot = self._store.load()
+        by_id = {binding.binding_id: binding for binding in snapshot.bindings}
+        desired = self._desired_by_id()
+        updated = {binding.serve_id: binding for binding in snapshot.bindings}
+        desired_updates: dict[str, dict[str, object]] = {}
+        outcomes: list[dict] = []
+        for binding_id, marker in sorted(stale.items()):
+            markers.pop(binding_id)
+            base = {"serve_id": marker.serve_id, "binding_id": binding_id}
+            current = by_id.get(binding_id)
+            if current is None or current.serve_id != marker.serve_id:
+                outcomes.append({**base, "outcome": "binding_gone"})
+                continue
+            if not current.awake:
+                outcomes.append({**base, "outcome": "already_sleeping"})
+                continue
+            wanted = desired.get(binding_id)
+            if wanted is not None and wanted.power == "awake":
+                self._write_annotation_best_effort(
+                    current, POD_STATE_HIDDEN if wanted.hidden else POD_STATE_AWAKE
+                )
+                updated[current.serve_id] = replace(current, hidden=wanted.hidden)
+                outcomes.append({**base, "outcome": "unhidden"})
+                continue
+            pod_ip = None
+            try:
+                pod_ip = self._snapshot_for_binding(current).pod_ip
+                if not pod_ip:
+                    raise ValueError(f"pod {current.serve_id} has no pod IP for sleep")
+                self._drainer.hide(current)
+                self._sleep_now(
+                    current,
+                    pod_ip,
+                    {
+                        "serve_id": current.serve_id,
+                        "binding_id": binding_id,
+                        "model": current.model,
+                        "pod_ip": pod_ip,
+                        "hide_enabled": True,
+                        "drain_enabled": False,
+                        "stale_recovery": True,
+                        "interrupted_running": None,
+                        "interrupted_waiting": None,
+                    },
+                )
+                updated[current.serve_id] = replace(current, awake=False, hidden=False)
+                outcomes.append({**base, "outcome": "slept"})
+            except Exception as exc:
+                if self._probe_physical(pod_ip) is False:
+                    self._rollback_to_awake(
+                        current, marker.prior_hidden, updated, desired_updates, desired
+                    )
+                    outcomes.append({**base, "outcome": "rolled_back", "error": str(exc)})
+                else:
+                    outcomes.append(
+                        {**base, "outcome": "sleep_unverified", "error": str(exc)}
+                    )
+        new_bindings = [updated[binding.serve_id] for binding in snapshot.bindings]
+        if new_bindings != snapshot.bindings:
+            self._store.save(new_bindings, expected_version=snapshot.version)
+        self._drain_markers.save(markers)
+        if desired_updates:
+            self._update_desired(
+                desired_updates, updated_by="service-manager-api", reason="drain_recovery"
+            )
+        operation = current_operation()
+        if operation is not None:
+            operation.advance("drain_recovery", details={"outcomes": outcomes})
+        _LOGGER.warning("drain recovery: %s", outcomes)
+        return outcomes
+
+    def _probe_physical(self, pod_ip: str | None) -> bool | None:
+        """True = asleep, False = known awake, None = unknown."""
+        if not pod_ip or not hasattr(self._vllm_ops, "is_sleeping"):
+            return None
+        try:
+            sleeping = self._vllm_ops.is_sleeping(pod_ip, port=8000)
+        except Exception:
+            return None
+        return None if sleeping is None else bool(sleeping)
+
+    def _run_locked(self, kind: str, fn, *, retry_until: float | None = None):
+        """Run ``fn`` under the writer lock; retry OperationBusy until
+        ``retry_until`` (drainer clock). Without a coordinator just run it."""
+        if self._operation_coordinator is None:
+            return fn()
+        while True:
+            entered = False
+            try:
+                with self._operation_coordinator.operation(kind) as operation:
+                    entered = True
+                    operation.advance("executing")
+                    return fn()
+            except OperationBusy:
+                if entered or retry_until is None:
+                    raise
+                remaining = retry_until - self._drainer.now()
+                if remaining <= 0:
+                    raise
+            self._drainer.sleep_for(
+                min(self._drain_config.lock_retry_interval_s, remaining)
+            )
+
+    def _load_markers(self) -> dict[str, DrainMarker]:
+        if self._drain_markers is None:
+            return {}
+        return self._drain_markers.load()
+
+    def _draining_binding_ids(
+        self,
+        bindings: list[Binding],
+        markers: dict[str, DrainMarker] | None = None,
+    ) -> set[str]:
+        if not self._hide_enabled:
+            return set()
+        if markers is None:
+            markers = self._load_markers()
+        return {
+            binding.binding_id
+            for binding in bindings
+            if binding.awake and binding.binding_id in markers
+        }
+
+    def _desired_by_id(self) -> dict[str, DesiredBinding]:
+        if self._fleet_store is None:
+            return {}
+        return {
+            binding.binding_id: binding
+            for binding in self._fleet_store.load_desired().bindings
+        }
+
     def _plan_model_target(
         self,
         *,
@@ -303,9 +1158,23 @@ class ServiceManagerV2:
         wake_replicas: int,
         bindings: list[Binding],
         tp_size: int,
+        draining_ids: frozenset[str] | set[str] = frozenset(),
     ) -> dict[str, list[Binding]]:
+        # ``draining_ids`` (staged sleep only): bindings already hidden and on
+        # their way to sleep. They are not serving replicas, but they stay
+        # awake=True in ``bindings`` so their GPUs remain occupied for every
+        # wake/create decision below. Empty -> exactly the legacy plan.
         model_bindings = [binding for binding in bindings if binding.model == model]
-        awake = [binding for binding in model_bindings if binding.awake]
+        draining = [
+            binding
+            for binding in model_bindings
+            if binding.awake and binding.binding_id in draining_ids
+        ]
+        awake = [
+            binding
+            for binding in model_bindings
+            if binding.awake and binding.binding_id not in draining_ids
+        ]
         planning = {binding.serve_id: binding for binding in bindings}
         if len(awake) >= wake_replicas:
             # Review F2: when shrinking, sleep hidden (safescale-probed, unroutable)
@@ -324,7 +1193,7 @@ class ServiceManagerV2:
                 [binding for binding in awake if not binding.hidden],
                 bindings=bindings,
                 topology=self._registry.topology(),
-                already_released=hidden[:shrink],
+                already_released=hidden[:shrink] + draining,
             )
             candidates = hidden + serving
             sleeping = candidates[:shrink]
@@ -336,10 +1205,19 @@ class ServiceManagerV2:
                 "sleep": sleeping,
                 "wake": [],
                 "create": [],
+                "reclaim": [],
                 "target_bindings": target,
             }
 
         target = list(awake)
+        # Growing while a replica of this model drains: cancel that drain
+        # (it is still loaded and holds its GPU) before waking anything else.
+        reclaim = sorted(draining, key=lambda item: _natural_key(item.serve_id))[
+            : max(0, wake_replicas - len(awake))
+        ]
+        for binding in reclaim:
+            planning[binding.serve_id] = replace(binding, hidden=False)
+            target.append(planning[binding.serve_id])
         sleeping = [binding for binding in model_bindings if not binding.awake]
         topology = self._registry.topology()
         wakes: list[Binding] = []
@@ -382,11 +1260,17 @@ class ServiceManagerV2:
             "sleep": [],
             "wake": wakes,
             "create": creates,
+            "reclaim": reclaim,
             "target_bindings": target + creates,
         }
 
-    @serialized_operation("put_binding_power")
     def put_binding_power(self, serve_id: str, *, awake: bool) -> dict:
+        if not self._hide_enabled:
+            return self._put_binding_power_legacy(serve_id, awake=awake)
+        return self._put_binding_power_staged(serve_id, awake=awake)
+
+    @serialized_operation("put_binding_power")
+    def _put_binding_power_legacy(self, serve_id: str, *, awake: bool) -> dict:
         if awake:
             # Controller-requested wake: same scaling cap as put_model_target. Fleet
             # repair (_set_binding_power_by_id_unlocked) restores recorded desired state
@@ -453,12 +1337,18 @@ class ServiceManagerV2:
         if unknown:
             raise ValueError(f"unknown pods for {model}: {sorted(unknown)}")
 
+        # A draining binding (staged sleep in flight) is owned by that sleep:
+        # the controller's safescale unhide sends the full hidden list and
+        # must not make a pod that is about to /sleep routable again. Raising
+        # the model target is how a drain is cancelled.
+        draining_ids = self._draining_binding_ids(snapshot.bindings)
         self._update_desired(
             {
                 binding.binding_id: {
                     "hidden": binding.serve_id in requested_hidden
                 }
                 for binding in model_bindings
+                if binding.binding_id not in draining_ids
             },
             updated_by="service-manager-api",
             reason="model_routable_request",
@@ -467,6 +1357,8 @@ class ServiceManagerV2:
         actions: list[dict] = []
         updated_by_serve = {binding.serve_id: binding for binding in snapshot.bindings}
         for binding in model_bindings:
+            if binding.binding_id in draining_ids:
+                continue
             should_hide = binding.serve_id in requested_hidden
             if binding.hidden == should_hide:
                 continue
@@ -500,6 +1392,15 @@ class ServiceManagerV2:
         migrations = allocator.plan_defrag(tp_size)
         if migrations is None:
             raise DefragUnavailable("no_feasible_defrag")
+        draining_ids = self._draining_binding_ids(snapshot.bindings)
+        if draining_ids and any(
+            binding.binding_id in draining_ids
+            for migration in migrations
+            for binding in snapshot.bindings
+            if binding.serve_id == migration.serve_id
+        ):
+            # Moving a replica that is being slept would undo the scale-down.
+            raise DefragUnavailable("binding_draining")
         self._set_defrag_desired(snapshot.bindings, migrations)
         if migrations:
             self._ensure_all_model_routes()
@@ -559,6 +1460,8 @@ class ServiceManagerV2:
 
     @serialized_operation("reconcile")
     def reconcile(self, *, drop_missing: bool = False) -> dict:
+        if self._hide_enabled:
+            self._recover_stale_drains_locked()
         return self._reconcile_unlocked(drop_missing=drop_missing)
 
     def _reconcile_unlocked(self, *, drop_missing: bool = False) -> dict:
@@ -1271,6 +2174,9 @@ class ServiceManagerV2:
         )
         desired = {binding.binding_id: binding for binding in desired_bindings}
         observed = {binding.binding_id: binding for binding in observed_bindings}
+        # Staged sleep in flight: desired already says sleeping while the pod
+        # is still awake + hidden. That is a legitimate transient, not drift.
+        draining_ids = set(self._load_markers()) if self._hide_enabled else set()
         issues: list[dict] = []
         for binding_id in sorted(set(desired) | set(observed)):
             wanted = desired.get(binding_id)
@@ -1284,6 +2190,8 @@ class ServiceManagerV2:
                 continue
             if wanted.lifecycle == "absent":
                 issues.append({"code": "desired_absent_but_observed", "binding_id": binding_id})
+                continue
+            if binding_id in draining_ids:
                 continue
             if actual.physical_power != wanted.power:
                 issues.append(
@@ -1335,9 +2243,11 @@ class ServiceManagerV2:
     ) -> None:
         """Run one vLLM power transition.
 
-        ``hidden_at``/``unroutable_confirmed`` only matter when the drain flag
-        is on: they tell the drainer the caller already hid the pod (and
-        when), or already confirmed it unroutable.
+        ``hidden_at``/``unroutable_confirmed`` only matter with
+        TRE_SM_HIDE_BEFORE_SLEEP on: they tell the drainer the caller already
+        hid the pod (and when), or already confirmed it unroutable. That
+        inline path (defrag, startup admission/convergence) runs under the
+        caller's writer lock, bounded by the per-call sleep deadline.
         """
         if self._runtime_ops is None or self._vllm_ops is None:
             return
@@ -1345,21 +2255,17 @@ class ServiceManagerV2:
         if not snapshot.pod_ip:
             raise ValueError(f"pod {binding.serve_id} has no pod IP for {action}")
 
-        if action == "sleep":
-            drain_record = None
-            if self._drainer is not None:
-                if hidden_at is None:
-                    hidden_at = self._drainer.hide(binding)
-                drain_record = self._drainer.drain(
-                    binding,
-                    snapshot.pod_ip,
-                    hidden_at=hidden_at,
-                    unroutable_confirmed=unroutable_confirmed,
-                )
-            result = self._vllm_ops.sleep(snapshot.pod_ip, port=8000)
-            self._sleep_audit.record_sleep(
-                binding, snapshot.pod_ip, result, drain_record
+        if action == "sleep" and self._drainer is not None:
+            self._sleep_inline_hidden(
+                binding,
+                snapshot.pod_ip,
+                hidden_at=hidden_at,
+                unroutable_confirmed=unroutable_confirmed,
             )
+            return
+        if action == "sleep":
+            result = self._vllm_ops.sleep(snapshot.pod_ip, port=8000)
+            self._sleep_audit.record_sleep(binding, snapshot.pod_ip, result, None)
             state = POD_STATE_SLEEPING
         elif action == "wake":
             if self._gpu_leases is not None:
@@ -1385,6 +2291,50 @@ class ServiceManagerV2:
                 self._gpu_leases.release(binding)
             else:
                 self._gpu_leases.acquire(binding, phase="awake")
+
+    def _sleep_inline_hidden(
+        self,
+        binding: Binding,
+        pod_ip: str,
+        *,
+        hidden_at: float | None,
+        unroutable_confirmed: bool,
+    ) -> None:
+        """hide -> wait unroutable (-> drain) -> /sleep, all under the
+        caller's lock; on failure restore the pre-hide annotation."""
+        cfg = self._drain_config
+        prior_state = POD_STATE_HIDDEN if binding.hidden else POD_STATE_AWAKE
+        if hidden_at is None:
+            hidden_at = self._drainer.hide(binding)
+        try:
+            record = self._drainer.drain(
+                binding,
+                pod_ip,
+                hidden_at=hidden_at,
+                unroutable_confirmed=unroutable_confirmed,
+                deadline=hidden_at + cfg.sleep_deadline_s - cfg.commit_reserve_s,
+            )
+            self._sleep_now(binding, pod_ip, record)
+        except Exception:
+            if self._probe_physical(pod_ip) is False:
+                self._write_annotation_best_effort(binding, prior_state)
+            raise
+
+    def _sleep_now(self, binding: Binding, pod_ip: str, drain_record: dict | None) -> None:
+        """/sleep with X-TRE-Hidden, audit, verify, annotate, release lease."""
+        result = self._vllm_ops.sleep(pod_ip, port=8000, hidden=True)
+        self._sleep_audit.record_sleep(binding, pod_ip, result, drain_record)
+        if not bool(getattr(result, "success", False)):
+            message = getattr(result, "message", "") or "operation failed"
+            raise ValueError(f"vLLM sleep failed for {binding.serve_id}: {message}")
+        if hasattr(self._vllm_ops, "is_sleeping"):
+            if self._vllm_ops.is_sleeping(pod_ip, port=8000) is not True:
+                raise ValueError(
+                    f"vLLM sleep did not physically converge for {binding.serve_id}"
+                )
+        self._runtime_ops.write_binding_annotations(binding, state=POD_STATE_SLEEPING)
+        if self._gpu_leases is not None:
+            self._gpu_leases.release(binding)
 
     def _has_deployment_ops(self) -> bool:
         return self._runtime_ops is not None and all(
@@ -1488,27 +2438,52 @@ class ServiceManagerV2:
             raise WakeConflict(f"{binding.serve_id}: slot already has awake binding")
 
     def _ensure_target_within_cap(
-        self, model: str, spec, target: int, bindings: list[Binding]
+        self,
+        model: str,
+        spec,
+        target: int,
+        bindings: list[Binding],
+        *,
+        draining_ids: set[str] | frozenset[str] = frozenset(),
     ) -> None:
         """The one scaling-cap rule: refuse a target that GROWS the model's awake count
         (hidden probe pods included - they are awake, v1 assigned) past
-        max_awake_replicas. Shrinks and unchanged targets always pass, even above the cap."""
+        max_awake_replicas. Shrinks and unchanged targets always pass, even above the cap.
+        Draining replicas (staged sleep) are not counted: they are going away."""
         cap = scale_max_replicas(spec)
-        awake = sum(1 for item in bindings if item.model == model and item.awake)
+        awake = sum(
+            1
+            for item in bindings
+            if item.model == model and item.awake and item.binding_id not in draining_ids
+        )
         if target > awake and target > cap:
             raise ValueError(
                 f"wake_replicas {target} exceeds max_awake_replicas ({cap}) for {model} (awake {awake})"
             )
 
-    def _ensure_wake_within_cap(self, binding: Binding, bindings: list[Binding]) -> None:
+    def _ensure_wake_within_cap(
+        self,
+        binding: Binding,
+        bindings: list[Binding],
+        *,
+        draining_ids: set[str] | frozenset[str] = frozenset(),
+    ) -> None:
         """Binding-level wakes obey the same rule as put_model_target (a wake is the
         target awake + 1)."""
         try:
             spec = self._registry.model(binding.model)
         except KeyError:
             return
-        awake = sum(1 for item in bindings if item.model == binding.model and item.awake)
-        self._ensure_target_within_cap(binding.model, spec, awake + 1, bindings)
+        awake = sum(
+            1
+            for item in bindings
+            if item.model == binding.model
+            and item.awake
+            and item.binding_id not in draining_ids
+        )
+        self._ensure_target_within_cap(
+            binding.model, spec, awake + 1, bindings, draining_ids=draining_ids
+        )
 
     def _ensure_model_route(self, model: str) -> None:
         if self._runtime_ops is not None and hasattr(self._runtime_ops, "ensure_model_httproute"):
@@ -1570,12 +2545,29 @@ class ServiceManagerV2:
                 return snapshot
         raise ValueError(f"pod {binding.serve_id} not found for runtime operation")
 
-    def _model_counts(self, bindings: list[Binding]) -> dict[str, dict[str, int]]:
-        counts = {model.name: {"awake": 0, "bound": 0} for model in self._registry.models()}
+    def _model_counts(
+        self, bindings: list[Binding], *, draining_ids: set[str] | None = None
+    ) -> dict[str, dict[str, int]]:
+        if draining_ids is None:
+            counts = {model.name: {"awake": 0, "bound": 0} for model in self._registry.models()}
+            for binding in bindings:
+                bucket = counts.setdefault(binding.model, {"awake": 0, "bound": 0})
+                bucket["bound"] += 1
+                if binding.awake:
+                    bucket["awake"] += 1
+            return counts
+        counts = {
+            model.name: {"awake": 0, "bound": 0, "draining": 0}
+            for model in self._registry.models()
+        }
         for binding in bindings:
-            bucket = counts.setdefault(binding.model, {"awake": 0, "bound": 0})
+            bucket = counts.setdefault(
+                binding.model, {"awake": 0, "bound": 0, "draining": 0}
+            )
             bucket["bound"] += 1
-            if binding.awake:
+            if binding.awake and binding.binding_id in draining_ids:
+                bucket["draining"] += 1
+            elif binding.awake:
                 bucket["awake"] += 1
         return counts
 
@@ -1599,6 +2591,25 @@ class DefragUnavailable(ValueError):
 
 class WakeConflict(ValueError):
     pass
+
+
+class SleepCommitFailed(ValueError):
+    """A staged sleep did not complete; the outcome is already persisted
+    (rolled back to awake+routable, or left hidden when unverifiable)."""
+
+    def __init__(self, outcomes: list[dict], version: int) -> None:
+        failed = [
+            f"{item['serve_id']}={item['outcome']}"
+            + (f" ({item['error']})" if item.get("error") else "")
+            for item in outcomes
+            if item["outcome"] in {"rolled_back", "sleep_unverified"}
+        ]
+        super().__init__(
+            f"staged sleep did not complete: {', '.join(failed)}; "
+            f"state persisted at version {version}"
+        )
+        self.outcomes = outcomes
+        self.version = version
 
 
 class TargetRequest(BaseModel):
