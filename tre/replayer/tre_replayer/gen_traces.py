@@ -49,7 +49,7 @@ is measured for dsqwen-7b.
 Cluster shape (slot widths, total slots) comes from deploy/registry.yaml: dsqwen-7b and
 dsllama-8b are tp_size=1 (1 slot), dsqwen-14b is tp_size=2 (2 slots); the cluster is two
 4xA100 nodes = 8 GPU slots. Baseline min/max replicas are 1..8 for the 1-slot models and
-0..4 for dsqwen-14b.
+1..4 for dsqwen-14b (min raised from 0 to 1 on 2026-09-24, as in v1).
 """
 from __future__ import annotations
 
