@@ -512,7 +512,9 @@ and send both arms through it (`campaign_queue.py` GATEWAYS, replayer default
   timeout 120 s raised to 150 s by a separate patch (v1 envoy-gateway-route-timeouts),
   no route idle_timeout, ORIGINAL_DST connect_timeout 6 s, response body Streamed through
   the plugin, ext_proc breaker 8000/80000/80000/5, ext_proc H2 512 streams + windows
-  64 KiB / 1 MiB + preconnect 1.0/1.0, client buffer 4 MiB. Streamed exposed a v2-only
+  64 KiB / 1 MiB, client buffer 4 MiB (v1 preconnect patch NOT ported: its field name
+  `preconnect_ratio` is not an Envoy field, so it never took effect in v1; see
+  docs/note-20260924-preconnect-removed.md in the local workspace). Streamed exposed a v2-only
   bug (SSE line split across body chunks -> 500 mid-stream), fixed by P2-GW-006.
 - The one v1 difference: `HOT_SWITCH=0`. In v1 (least-gpu-cache) HOT_SWITCH=1 only kept
   a zero-pod model in the cache; in v2 it makes the plugin submit a wake-up on the request

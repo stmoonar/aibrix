@@ -99,8 +99,9 @@ spec:
           maxParallelRequests: 80000
           maxParallelRetries: 5
         # v1 envoy-gateway-http2-options.yaml: 512 streams per H2 connection with the
-        # same windows, so load spreads over several connections (plus the preconnect
-        # policy patched in tre-original-dst below; EG has no native field for it).
+        # same windows, so load spreads over several connections. (v1's other half of that
+        # file, a preconnect patch, never took effect and is deliberately not ported; see
+        # tre-original-dst below.)
         http2:
           maxConcurrentStreams: 512
           initialStreamWindowSize: 65536
@@ -138,7 +139,7 @@ spec:
 apiVersion: gateway.envoyproxy.io/v1alpha1
 kind: EnvoyPatchPolicy
 metadata:
-  # v1 aibrix-epp (+ the preconnect half of envoy-gateway-http2-options.yaml).
+  # v1 aibrix-epp (v1's preconnect patch is intentionally absent, see below).
   name: tre-original-dst
   namespace: tre-v2
   labels:
@@ -153,15 +154,11 @@ spec:
   # Applied before tre-route-timeouts (priority 1): EG applies ascending priority.
   priority: 0
   jsonPatches:
-    # ---- ext_proc cluster: v1 preconnect policy -----------------------------------------
-    - type: type.googleapis.com/envoy.config.cluster.v3.Cluster
-      name: envoyextensionpolicy/tre-v2/tre-gateway-plugins-extension-policy/extproc/0
-      operation:
-        op: add
-        path: /preconnect_policy
-        value:
-          preconnect_ratio: 1.0
-          predictive_preconnect_ratio: 1.0
+    # No patch on the ext_proc cluster: v1's envoy-gateway-http2-options.yaml set
+    # /preconnect_policy with the misspelt field `preconnect_ratio` (Envoy only has
+    # `per_upstream_preconnect_ratio`), so EG rejected it and it never took effect in v1.
+    # Matching v1's *effective* config means leaving it out (2026-09-24, user decision;
+    # docs/note-20260924-preconnect-removed.md).
     # ---- clusters: one ORIGINAL_DST per model (+ unattributed safety net) --------------
     # v1 original_destination_cluster values (connect 6s, V4_ONLY, CLUSTER_PROVIDED,
     # target-pod header) plus the per-model breaker.

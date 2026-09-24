@@ -7,7 +7,6 @@ from pathlib import Path
 
 from scripts import openloop, r3_grid, rewindow_from_raw as rw
 from tre_common import slo_labels
-from tre_common.registry import load_registry
 
 TRE_ROOT = Path(__file__).resolve().parents[2]
 REGISTRY = TRE_ROOT / "deploy" / "registry.yaml"
@@ -132,7 +131,6 @@ def _fit_csv(path: Path, *, seed: int) -> Path:
     import random
 
     rng = random.Random(seed)
-    spec = load_registry(str(REGISTRY)).model(MODEL)
     fields = r3_grid.CSV_COLUMNS
     with path.open("w", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=fields)
@@ -156,7 +154,8 @@ def _fit_csv(path: Path, *, seed: int) -> Path:
                     "model_errors": 0, "proxy_transient_errors": 0, "client_timeouts": 0,
                 })
                 start += 5_000
-    assert spec.trs.w_p > 0
+    # The verdict run passes --w-p explicitly, so the fixture no longer depends on the
+    # registry w_p (v1-lambda round 2 set it to 0 for every model, 2026-09-24).
     return path
 
 

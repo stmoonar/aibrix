@@ -52,7 +52,11 @@ V1_EXTPROC_HTTP2 = {  # envoy-gateway-http2-options.yaml
     "initialStreamWindowSize": 65536,
     "initialConnectionWindowSize": 1048576,
 }
-V1_PRECONNECT = {"preconnect_ratio": 1.0, "predictive_preconnect_ratio": 1.0}
+# v1's preconnect patch (envoy-gateway-http2-options.yaml, /preconnect_policy) used the
+# misspelt field `preconnect_ratio` (Envoy: `per_upstream_preconnect_ratio`), so Envoy
+# Gateway rejected it (EnvoyPatchPolicy Programmed=False, "unknown field") and it never
+# took effect in v1. It is deliberately NOT ported: see
+# docs/note-20260924-preconnect-removed.md (2026-09-24, user decision).
 
 
 def _docs(path: Path) -> list[dict]:
@@ -203,8 +207,10 @@ def test_extension_policy_is_v1s() -> None:
     cb = _per_model_limits()
     worst_case_streams = len(_models()) * (cb["maxParallelRequests"] + cb["maxPendingRequests"])
     assert V1_EXTPROC_BREAKER["maxParallelRequests"] >= worst_case_streams  # never the binding cap
-    (preconnect,) = [p for p in _patches() if p["name"] == EXTPROC_CLUSTER]
-    assert preconnect["operation"] == {"op": "add", "path": "/preconnect_policy", "value": V1_PRECONNECT}
+    # No preconnect: v1's patch never took effect (misspelt field); see the note above
+    # (docs/note-20260924-preconnect-removed.md). Nothing may patch the ext_proc cluster.
+    assert [p for p in _patches() if p["name"] == EXTPROC_CLUSTER] == []
+    assert "preconnect" not in yaml.safe_dump(_gateway_policy("tre-original-dst"))
 
 
 def test_reserved_route_serves_no_real_traffic() -> None:
