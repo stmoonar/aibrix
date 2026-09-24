@@ -608,6 +608,10 @@ def cell_command(cell: Cell, args, schedule_path: Path, output: Path) -> list[st
         command += ["--registry", args.registry]
     if args.redis_url:
         command += ["--redis-url", args.redis_url]
+    if getattr(args, "routing_strategy", None):
+        # Through the gateway plugin with this strategy (r3_grid --routing-strategy); unset,
+        # the per-model HTTPRoute as before. T14 requires least-gpu-cache.
+        command += ["--routing-strategy", str(args.routing_strategy)]
     return command
 
 
@@ -2279,8 +2283,27 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     help="--acceptance-set: the standard dataset holding the three first-round "
                          "M cells M keeps (the revision-2 reprocessing of the first round)")
     ap.add_argument("--freeze-file", type=Path, default=None,
-                    help="--acceptance-set: the frozen parameters (dline_refit freeze); M is "
-                         "collected only after it exists (D22)")
+                    help="--acceptance-set / --t14-set: the frozen parameters (dline_refit "
+                         "freeze); M is collected only after it exists (D22)")
+    ap.add_argument("--t14-set", action="store_true",
+                    help="T14 (scripts.calibration_t14): the held-out 14b test set - 8 new shapes "
+                         "x {0.9, 1.0, 1.1} x C^_s of --capacity-prior-file, 240 s holds, no "
+                         "probes, then sealed (T14_manifest.json). A real run needs "
+                         "--freeze-file, --refit-params-file, --preregistration-json and "
+                         "--routing-strategy least-gpu-cache")
+    ap.add_argument("--capacity-prior-file", type=Path, default=None,
+                    help="--t14-set: the pre-registered capacity prior "
+                         "(python -m scripts.calibration_t14 capacity-prior)")
+    ap.add_argument("--refit-params-file", type=Path, default=None,
+                    help="--t14-set: the second parameter set (the v1-lambda refit, frozen with "
+                         "dline_refit freeze); bound, not used, by the collection")
+    ap.add_argument("--preregistration-json", type=Path, default=None,
+                    help="--t14-set: the T14 preregistration JSON (sidecar <file>.sha256); its "
+                         "t14.* / parameter_sets.* hashes and constants must match the run")
+    ap.add_argument("--routing-strategy", default=None,
+                    help="pass --routing-strategy to every r3_grid cell (route through the "
+                         "gateway plugin with this strategy, e.g. least-gpu-cache); default: "
+                         "the per-model HTTPRoute. --t14-set requires least-gpu-cache")
     ap.add_argument("--design", choices=["ladder", "primitives"], default=None,
                     help="ladder (default): the second round's design (scripts.calibration_ladder). "
                          "primitives: the first round's steps / boundary / ramp / bursts - "
@@ -2293,26 +2316,41 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--regime-groups", type=Path, default=None,
                     help="ladder design: regime_groups.json - the 7 training shapes in 3 "
                          "regime groups (LORO units). Required; checked before anything runs")
-    ap.add_argument("--design-seed", type=int, default=20260923,
+    ap.add_argument("--design-seed", type=int, default=None,
                     help="ladder design: seed of every order and every per-cell seed; "
-                         "recorded in the run manifest")
+                         "recorded in the run manifest (default 20260923; --t14-set: 20260924)")
     ap.add_argument("--preregistration", type=Path,
                     default=here / "docs" / "preregistration-20260923-calibration-run2.md",
                     help="ladder design: the preregistration the run implements; its commit "
                          "is recorded in the run manifest")
     args = ap.parse_args(argv)
-    collection = bool(args.training_supplement or args.acceptance_set)
-    if args.training_supplement and args.acceptance_set:
-        ap.error("--training-supplement and --acceptance-set are two runs")
+    if args.design_seed is None:
+        args.design_seed = 20260924 if args.t14_set else 20260923
+    collection = bool(args.training_supplement or args.acceptance_set or args.t14_set)
+    if sum(map(bool, (args.training_supplement, args.acceptance_set, args.t14_set))) > 1:
+        ap.error("--training-supplement, --acceptance-set and --t14-set are separate runs")
     if collection and (args.reprobe_base is not None or args.reprobe_shapes or args.static_grid
                        or args.static_grid_only or args.static_grid_list
                        or args.skip_boundary_search or args.design == "primitives"):
-        ap.error("--training-supplement / --acceptance-set run on the ladder design alone; "
-                 "they do not combine with --reprobe-* / --static-grid* / --design primitives")
+        ap.error("--training-supplement / --acceptance-set / --t14-set run on the ladder design "
+                 "alone; they do not combine with --reprobe-* / --static-grid* / --design "
+                 "primitives")
     if not collection and (args.base_run or args.boundary_supplement_run or args.boundary_table
                            or args.retained_dataset or args.freeze_file):
         ap.error("--base-run / --boundary-supplement-run / --boundary-table / --retained-dataset "
-                 "/ --freeze-file belong to --training-supplement / --acceptance-set")
+                 "/ --freeze-file belong to --training-supplement / --acceptance-set / --t14-set")
+    if args.t14_set and (args.base_run or args.boundary_supplement_run or args.boundary_table
+                         or args.retained_dataset):
+        ap.error("--t14-set places its cells from --capacity-prior-file; --base-run / "
+                 "--boundary-supplement-run / --boundary-table / --retained-dataset belong to "
+                 "--training-supplement / --acceptance-set (and to calibration_t14 "
+                 "capacity-prior)")
+    if not args.t14_set and (args.capacity_prior_file or args.refit_params_file
+                             or args.preregistration_json):
+        ap.error("--capacity-prior-file / --refit-params-file / --preregistration-json belong "
+                 "to --t14-set")
+    if args.t14_set and not args.capacity_prior_file:
+        ap.error("--t14-set needs --capacity-prior-file")
     supplement = args.reprobe_base is not None
     if (args.reprobe_grid or args.smoke_at_rho_star) and not supplement:
         ap.error("--reprobe-grid / --smoke-at-rho-star belong to --reprobe-base")
@@ -2350,6 +2388,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
     if collection:
         try:
+            if args.t14_set:
+                from scripts import calibration_t14
+
+                return calibration_t14.run_t14_set(args)
             if args.training_supplement:
                 from scripts import calibration_training_supplement
 

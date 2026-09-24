@@ -430,13 +430,18 @@ def drive_cell(
             except Exception:  # noqa: BLE001
                 snap = None
             if snap is not None:
+                row = {
+                    "ts_ms": int(now_ms()),
+                    "waiting": snap.get("waiting", 0.0),
+                    "running": snap.get("running", 0.0),
+                    "swapping": snap.get("swapping", 0.0),
+                }
+                if openloop.KV_CACHE_USAGE_KEY in snap:
+                    # diagnostic (the pod sampler's mean over pods; None when no pod
+                    # reported it); absent when the sampler does not read it
+                    row[openloop.KV_CACHE_USAGE_KEY] = snap[openloop.KV_CACHE_USAGE_KEY]
                 with lock:
-                    instants.append({
-                        "ts_ms": int(now_ms()),
-                        "waiting": snap.get("waiting", 0.0),
-                        "running": snap.get("running", 0.0),
-                        "swapping": snap.get("swapping", 0.0),
-                    })
+                    instants.append(row)
             stop.wait(instant_interval_s)
 
     start_ms = now_ms()

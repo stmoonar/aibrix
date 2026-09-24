@@ -216,7 +216,8 @@ ACCEPTANCE_SHAPES: dict[str, tuple[tuple[float, "int | TokenRange", "int | Token
 
 def is_held_out(shape_name: str) -> bool:
     """True for shapes that exist to validate a fit and must never enter one."""
-    return shape_name == MIXTURE_NAME or shape_name in ACCEPTANCE_SHAPES
+    return (shape_name == MIXTURE_NAME or shape_name in ACCEPTANCE_SHAPES
+            or shape_name in T14_SHAPES)
 
 
 def is_mixture(shape_name: str) -> bool:
@@ -264,6 +265,32 @@ STATIC_GRID_SHAPES: dict[str, tuple[int, int]] = {
     for i in STATIC_GRID_INPUTS
     for o in STATIC_GRID_OUTPUTS
 }
+
+#: T14, the held-out 14b test set (``scripts.calibration_t14``, 2026-09-24): eight
+#: fixed-length shapes in the static-grid naming ``G<in>x<out>``, driven only as constant
+#: holds at {0.9, 1.0, 1.1} x a pre-registered linear capacity prior - never probed, never
+#: trained on. Held out (:func:`is_held_out`) like ``M`` and :data:`ACCEPTANCE_SHAPES`, and
+#: like them in neither :data:`TRAINING_SHAPES` nor :data:`ALL_SHAPES`. Four lie inside the
+#: training shapes' (input, output) range (interpolation), four outside it (extrapolation:
+#: longer prompts than S3, or longer generations than S4).
+T14_INTERPOLATION_SHAPES: tuple[str, ...] = ("G512x256", "G1200x240", "G640x400", "G1800x160")
+T14_EXTRAPOLATION_SHAPES: tuple[str, ...] = ("G3072x96", "G4096x64", "G256x768", "G512x1024")
+
+
+def _t14_components(name: str) -> tuple[tuple[float, int, int], ...]:
+    i, o = name[1:].split("x")
+    return ((1.0, int(i), int(o)),)
+
+
+T14_SHAPES: dict[str, tuple[tuple[float, int, int], ...]] = {
+    name: _t14_components(name)
+    for name in (*T14_INTERPOLATION_SHAPES, *T14_EXTRAPOLATION_SHAPES)
+}
+assert all(static_grid_shape_name(i, o) == name
+           for name, ((_w, i, o),) in T14_SHAPES.items()), "T14 names are G<in>x<out>"
+_T14_COLLISIONS = set(T14_SHAPES) & (set(ACCEPTANCE_SHAPES) | set(STATIC_GRID_SHAPES) | set(SHAPES)
+                                     | set(SAMPLED_SHAPES) | {MIXTURE_NAME})
+assert not _T14_COLLISIONS, f"T14 shape names collide with existing shapes: {_T14_COLLISIONS}"
 
 #: Family of a static-grid shape, from its prompt/output ratio i/o. The thresholds are
 #: the ones the committed families already satisfy (prefill_heavy S3 21.3, T8 14.3;
@@ -464,6 +491,8 @@ def shape_components(
         return MIXTURE
     if shape_name in ACCEPTANCE_SHAPES:
         return ACCEPTANCE_SHAPES[shape_name]
+    if shape_name in T14_SHAPES:
+        return T14_SHAPES[shape_name]
     if shape_name in SAMPLED_SHAPES:
         i, o = SAMPLED_SHAPES[shape_name]
         return ((1.0, i, o),)

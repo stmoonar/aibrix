@@ -156,6 +156,14 @@ POD_INSTANT_GAUGES = {
     "swapping": "vllm:num_requests_swapped",
 }
 
+#: KV-cache fill (0..1) of one pod: vLLM's current name first, then the deprecated one it
+#: replaced (0.10 exports both; an older build only the second). Diagnostic only - the
+#: instant record's ``kv_cache_usage`` (the MEAN over the pods scraped in that tick, not a
+#: sum); no window column, label or signal reads it.
+POD_KV_CACHE_USAGE_GAUGES: tuple[str, ...] = ("vllm:kv_cache_usage_perc",
+                                              "vllm:gpu_cache_usage_perc")
+KV_CACHE_USAGE_KEY = "kv_cache_usage"
+
 
 # ------------------------------------------------------------------------- classifier
 
@@ -1166,6 +1174,30 @@ def parse_pod_gauges(text: str, gauges: dict[str, str] | None = None) -> dict[st
     return totals
 
 
+def parse_pod_kv_cache_usage(text: str) -> Optional[float]:
+    """One pod's KV-cache usage (0..1) from its ``/metrics`` body, or None if it exports
+    neither name of :data:`POD_KV_CACHE_USAGE_GAUGES`. The first name present wins (the
+    deprecated one is only a fallback); several label sets of it are averaged."""
+    found: dict[str, list[float]] = {name: [] for name in POD_KV_CACHE_USAGE_GAUGES}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        head, _, value = line.rpartition(" ")
+        if not head:
+            continue
+        metric = head.split("{", 1)[0].strip()
+        if metric in found:
+            try:
+                found[metric].append(float(value))
+            except ValueError:
+                continue
+    for name in POD_KV_CACHE_USAGE_GAUGES:
+        if found[name]:
+            return sum(found[name]) / len(found[name])
+    return None
+
+
 def _default_fetch(url: str, timeout_s: float = 2.0) -> str:
     from urllib.request import urlopen
 
@@ -1185,6 +1217,9 @@ def make_pod_metrics_sampler(
     ``MetricsStore._aggregate_model`` (per-pod sum for the queue observables). A pod that
     fails to answer contributes nothing for that tick and is counted in ``scrape_errors``
     so a silently half-observed queue is visible in the capture.
+
+    Plus ``kv_cache_usage`` (diagnostic): the MEAN KV-cache usage over the pods that
+    reported it this tick (:func:`parse_pod_kv_cache_usage`), None when none did.
     """
     if not endpoints:
         raise ValueError("make_pod_metrics_sampler needs at least one /metrics endpoint")
@@ -1192,6 +1227,7 @@ def make_pod_metrics_sampler(
     def sample(_now_ms: int) -> dict:
         totals = {key: 0.0 for key in (gauges or POD_INSTANT_GAUGES)}
         errors = 0
+        kv: list[float] = []
         for url in endpoints:
             try:
                 body = fetch(url)
@@ -1200,8 +1236,12 @@ def make_pod_metrics_sampler(
                 continue
             for key, value in parse_pod_gauges(body, gauges).items():
                 totals[key] += value
+            usage = parse_pod_kv_cache_usage(body)
+            if usage is not None:
+                kv.append(usage)
         totals["scrape_errors"] = float(errors)
         totals["pods_scraped"] = float(len(endpoints) - errors)
+        totals[KV_CACHE_USAGE_KEY] = (sum(kv) / len(kv)) if kv else None
         return totals
 
     return sample
@@ -1629,7 +1669,8 @@ class _Sidecar:
                 snap = None
             if snap is not None:
                 row = {"ts_ms": int(ts)}
-                row.update({k: float(v) for k, v in snap.items()})
+                # None stays None (kv_cache_usage when no pod reported it)
+                row.update({k: (None if v is None else float(v)) for k, v in snap.items()})
                 self.samples.append(row)
             self._stop.wait(self.interval_s)
 
