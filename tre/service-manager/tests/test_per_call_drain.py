@@ -9,7 +9,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from tre_sm.api.v2 import create_app
-from tre_sm.ops.drain import DrainConfig, normalize_drain_s
+from tre_sm.ops.drain import DrainConfig, SleepConfigError, normalize_drain_s
 
 _HERE = Path(__file__).resolve().parent
 
@@ -79,13 +79,24 @@ def test_calls_without_drain_s_use_the_env_default(default_on, scrapes):
     assert _scrapes(events) == scrapes
 
 
+def test_default_drain_requires_explicit_opt_in():
+    """Review L4: a non-zero default drain without TRE_SM_ALLOW_DEFAULT_DRAIN=1 fails
+    at startup (TRE callers without drain_s would drain, APA never does)."""
+    for value in ("true", "45"):
+        with pytest.raises(SleepConfigError, match="TRE_SM_ALLOW_DEFAULT_DRAIN"):
+            DrainConfig.from_env({"TRE_SM_HIDE_BEFORE_SLEEP": "1", "TRE_SM_DRAIN_BEFORE_SLEEP": value})
+    # 0 / unset needs no opt-in
+    assert DrainConfig.from_env({"TRE_SM_HIDE_BEFORE_SLEEP": "1", "TRE_SM_DRAIN_BEFORE_SLEEP": "0"}).enabled is False
+
+
 def test_fixed_default_budget_from_env_number():
-    cfg = DrainConfig.from_env({"TRE_SM_HIDE_BEFORE_SLEEP": "1", "TRE_SM_DRAIN_BEFORE_SLEEP": "45"})
+    allow = {"TRE_SM_HIDE_BEFORE_SLEEP": "1", "TRE_SM_ALLOW_DEFAULT_DRAIN": "1"}
+    cfg = DrainConfig.from_env({**allow, "TRE_SM_DRAIN_BEFORE_SLEEP": "45"})
     assert cfg.enabled is True and cfg.default_budget_s == 45.0
     for off in ("", "0", "false", "no"):
         cfg = DrainConfig.from_env({"TRE_SM_HIDE_BEFORE_SLEEP": "1", "TRE_SM_DRAIN_BEFORE_SLEEP": off})
         assert cfg.enabled is False and cfg.default_budget_s is None
-    auto = DrainConfig.from_env({"TRE_SM_HIDE_BEFORE_SLEEP": "1", "TRE_SM_DRAIN_BEFORE_SLEEP": "true"})
+    auto = DrainConfig.from_env({**allow, "TRE_SM_DRAIN_BEFORE_SLEEP": "true"})
     assert auto.enabled is True and auto.default_budget_s is None
     with pytest.raises(ValueError):
         DrainConfig.from_env({"TRE_SM_HIDE_BEFORE_SLEEP": "1", "TRE_SM_DRAIN_BEFORE_SLEEP": "soon"})

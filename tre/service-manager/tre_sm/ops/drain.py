@@ -127,6 +127,18 @@ class DrainConfig:
         enabled, default_budget_s = _parse_default_drain(
             env.get("TRE_SM_DRAIN_BEFORE_SLEEP", "")
         )
+        allow_default = (
+            str(env.get("TRE_SM_ALLOW_DEFAULT_DRAIN", "")).strip().lower() in _TRUTHY
+        )
+        if enabled and not allow_default:
+            # Review L4: a default drain applies to every caller that passes no
+            # drain_s - e.g. TRE's sleeps when TRE_SM_CALL_DRAIN is off, while the
+            # APA path always passes 0: an arm asymmetry. Opt in explicitly.
+            raise SleepConfigError(
+                "TRE_SM_DRAIN_BEFORE_SLEEP != 0 also requires "
+                "TRE_SM_ALLOW_DEFAULT_DRAIN=1 (a default drain makes callers that "
+                "do not pass drain_s drain while /scale_service (APA) never does)"
+            )
         hide = (
             str(env.get("TRE_SM_HIDE_BEFORE_SLEEP", "")).strip().lower() in _TRUTHY
         )

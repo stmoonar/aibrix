@@ -711,7 +711,7 @@ def test_from_env_parsing():
     assert DrainConfig.from_env({}).enabled is False
     assert DrainConfig.from_env({}).hide_before_sleep is False
     assert DrainConfig().sleep_deadline_s == 240.0
-    hide = {"TRE_SM_HIDE_BEFORE_SLEEP": "1"}
+    hide = {"TRE_SM_HIDE_BEFORE_SLEEP": "1", "TRE_SM_ALLOW_DEFAULT_DRAIN": "1"}
     for truthy in ("1", "true", "YES", " on "):
         assert DrainConfig.from_env({**hide, "TRE_SM_DRAIN_BEFORE_SLEEP": truthy}).enabled is True
         assert DrainConfig.from_env({"TRE_SM_HIDE_BEFORE_SLEEP": truthy}).hide_before_sleep is True
