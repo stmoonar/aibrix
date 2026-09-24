@@ -649,23 +649,39 @@ def test_the_stopping_rule_needs_publish_rate_ci_and_both_families() -> None:
     assert not thin.satisfied and any("publish rate" in r for r in thin.reasons)
 
     wide = boundary.stop_rule(
-        publish_rate=0.95, theta=1000.0, ci_half_width=160.0,
+        publish_rate=0.95, theta=1000.0, ci_half_width=210.0,
         family_boundary_windows={"prefill_heavy": 60, "decode_heavy": 55},
         boundaries={"S3": 1.0},
     )
     assert not wide.satisfied and any("CI half width" in r for r in wide.reasons)
 
 
-def test_d13_stop_gate_is_15_percent_and_10_percent_is_only_reported() -> None:
-    assert boundary.MAX_CI_HALF_WIDTH_FRACTION == 0.15
+def test_d13_stop_gate_is_20_percent_15_and_10_percent_are_only_reported() -> None:
+    """User 2026-09-24: the D13 CI gate is 20 % (was 15 %); 15 % and 10 % are reported."""
+    assert boundary.MAX_CI_HALF_WIDTH_FRACTION == 0.20
+    assert boundary.LEGACY_CI_HALF_WIDTH_FRACTION == 0.15
     assert boundary.APPENDIX_CI_HALF_WIDTH_FRACTION == 0.10
     families = {"prefill_heavy": 60, "decode_heavy": 55}
     mid = boundary.stop_rule(publish_rate=0.95, theta=1000.0, ci_half_width=120.0,
                              family_boundary_windows=families)
     assert mid.satisfied and mid.appendix_ci_target_met is False
     d = mid.as_dict()
-    assert d["ci_half_width_fraction"] == 0.12 and d["max_ci_half_width_fraction"] == 0.15
+    assert d["ci_half_width_fraction"] == 0.12 and d["max_ci_half_width_fraction"] == 0.20
     assert d["appendix_ci_half_width_fraction"] == 0.10 and d["appendix_ci_target_met"] is False
+    assert d["legacy_ci_target_met"] is True and d["satisfied_at_legacy_gate"] is True
+    # 17 %: passes the 20 % gate, would have failed the old 15 % one
+    between = boundary.stop_rule(publish_rate=0.95, theta=1000.0, ci_half_width=170.0,
+                                 family_boundary_windows=families)
+    assert between.satisfied and between.legacy_ci_target_met is False
+    assert between.satisfied_at_legacy_gate is False
+    # the gate is a parameter: 15 % reproduces the rule before 2026-09-24
+    old = boundary.stop_rule(publish_rate=0.95, theta=1000.0, ci_half_width=170.0,
+                             family_boundary_windows=families, max_ci_fraction=0.15)
+    assert not old.satisfied and old.as_dict()["max_ci_half_width_fraction"] == 0.15
+    # a failure other than the CI fails the legacy view too
+    thin = boundary.stop_rule(publish_rate=0.5, theta=1000.0, ci_half_width=100.0,
+                              family_boundary_windows=families)
+    assert not thin.satisfied and thin.satisfied_at_legacy_gate is False
     tight = boundary.stop_rule(publish_rate=0.95, theta=1000.0, ci_half_width=80.0,
                                family_boundary_windows=families)
     assert tight.satisfied and tight.appendix_ci_target_met is True

@@ -273,6 +273,32 @@ def test_drive_cell_writes_instant_sidecar(tmp_path) -> None:
     assert snap["running"] == 5.0
 
 
+def test_drive_cell_instant_sidecar_carries_the_pod_kv_cache_usage(tmp_path) -> None:
+    import json as _json
+
+    def fake_stream_call(url, headers, body, timeout):
+        return _stream_result()
+
+    samples = iter([0.25, None])
+
+    def fake_sampler(now):
+        return {"waiting": 2.0, "running": 5.0, "swapping": 1.0,
+                "kv_cache_usage": next(samples, None)}
+
+    raw_path = tmp_path / "i128_o128_c1.jsonl"
+    instant_path = tmp_path / "i128_o128_c1.instant.jsonl"
+    r3_grid.drive_cell(
+        "http://gw", "dsqwen-7b", r3_grid.GridCell(128, 128, 1), duration_s=0.2,
+        raw_path=raw_path, instant_path=instant_path,
+        instant_sampler=fake_sampler, instant_interval_s=0.02, stream_call=fake_stream_call,
+    )
+    snaps = [_json.loads(l) for l in instant_path.read_text().splitlines() if l.strip()]
+    assert len(snaps) >= 2
+    assert set(snaps[0]) == {"ts_ms", "waiting", "running", "swapping", "kv_cache_usage"}
+    assert snaps[0]["kv_cache_usage"] == 0.25 and snaps[1]["kv_cache_usage"] is None
+    assert snaps[0]["running"] == 5.0
+
+
 def test_make_live_instant_sampler_reads_latest_not_window_average() -> None:
     # The sidecar sampler must delegate to store.read_latest_instant (freshest bucket),
     # NOT read_model_window (which would zero-out on the freshness gap or halve the value).

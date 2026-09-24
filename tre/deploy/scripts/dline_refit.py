@@ -54,6 +54,11 @@ Stages (``python -m scripts.dline_refit STAGE --model M --arm primary|fixed|k3 .
     LARGEST admissible w_p (:func:`d3_select`), 0 when none is. Then the
     lambda check: lambda_wait in :data:`LAMBDAS` at w_p*; lambda moves off 1 only if the
     best BA beats lambda = 1 by >= 0.02.
+    ``--lambda-method v1`` (user 2026-09-24) replaces both rules: lambda_wait AND w_p are
+    v1's selection (:mod:`scripts.v1_lambda_fit` - v1's rank-correlation objective, lambda
+    1..4 / 0.25, w_p 0.01..0.08 / 0.005, the joint refinement), ported onto the same
+    training windows; the D17 w_p rule is not applied (when the two disagree, v1's joint
+    refinement wins and wp.json says so). tau, theta, delta and the labels stay v2.
 ``final`` (D5 + hold-out)
     the verdict at (tau, w_p*, lambda*) with 1000 / 200 resamples; D5: the merged theta is
     published whatever the family rule says (the family theta is kept as diagnostic);
@@ -116,6 +121,10 @@ DT_REF_S = 10.0
 WP_GRID: tuple[float, ...] = (0.0, 0.0025, 0.005, 0.01, 0.02, 0.03, 0.05, 0.1, 0.2)
 LAMBDAS: tuple[float, ...] = (0.0, 1.0, 2.0, 3.0)
 LAMBDA_WAIT = 1.0
+#: The D13 CI gate every verdict is judged against (``--max-ci-half-width-fraction``;
+#: None = adaptive_boundary.MAX_CI_HALF_WIDTH_FRACTION, 20 % since 2026-09-24, the old
+#: 15 % is reported as ``stop_rule_15``).
+D13_MAX_CI_FRACTION: Optional[float] = None
 #: lambda moves off LAMBDA_WAIT only when the best lambda beats it by this much BA.
 LAMBDA_MIN_GAIN = 0.02
 #: w_p the alpha stage runs at: the D3 values current on 2026-09-22 (plan 6.11 D3,
@@ -136,6 +145,9 @@ M_CI_RESAMPLES = 1000
 MIN_FAMILY_WINDOWS = 30
 
 ARMS = ("primary", "fixed", "k3")
+#: How the wp stage picks lambda_wait (and, for v1, w_p): ``v2`` = D17 + the BA lambda
+#: check (the default, what the D22 freeze used); ``v1`` = v1's selection (user 2026-09-24).
+LAMBDA_METHODS = ("v2", "v1")
 ALPHA_RULES = ("d4prime", "refit0922")
 FAMILY_FILES = ("decode_heavy", "prefill_heavy")
 #: D18: the tau every model publishes (= the refresh period DT_REF_S, alpha = .63). The
@@ -877,7 +889,7 @@ def verdict(model: str, label, p: Mapping[str, Any], tau: float, w_p: float, lam
     try:
         return tv.verdict_report(model=model, fitting_csv=p["fitting"], families=p["families"], spec=spec,
                                  label=label, trim_ramp_windows=TRIM_RAMP_WINDOWS, n_resamples=n_res,
-                                 family_resamples=fam_res, seed=SEED)
+                                 family_resamples=fam_res, seed=SEED, max_ci_fraction=D13_MAX_CI_FRACTION)
     except tv.VerdictError as exc:
         return {"error": str(exc)}
 
@@ -997,12 +1009,50 @@ def stage_wp(model: str, label, p: Mapping[str, Any], alpha_doc: Mapping[str, An
             "lambda_star": lambda_select(lam_rows)}
 
 
+def stage_wp_v1(model: str, label, p: Mapping[str, Any], alpha_doc: Mapping[str, Any],
+                sources: Mapping[str, Path], *, wp_grid: str = "with_zero") -> dict:
+    """``wp --lambda-method v1``: lambda_wait and w_p from v1's selection (stages A-C of
+    ``fit_tre_parameters_from_runs.py``, :mod:`scripts.v1_lambda_fit`) on the D16 fitting
+    windows; ``sources`` (run -> standard dataset dir) are where the average TPOT of v1's
+    average-health term is rebuilt from. The D17 w_p rule is NOT applied: user 2026-09-24,
+    v1's joint refinement is taken as is and a disagreement with D17 is reported."""
+    from scripts import v1_lambda_fit
+
+    tau = published_tau(alpha_doc)
+    if tau is None:
+        raise SystemExit(f"{model}: the alpha stage published no tau ({alpha_doc.get('rule')})")
+    sel = v1_lambda_fit.fit_model(model, label, p["fitting"], trim=TRIM_RAMP_WINDOWS, sources=sources,
+                                  wp_grid=wp_grid)
+    lam, wp = sel["lambda_wait"], sel["w_p"]
+    print(model, "v1 selection", {"lambda_wait": lam, "w_p": wp,
+                                  "objective_adjusted": sel["best_c"]["objective_adjusted"]}, flush=True)
+    return {"model": model, "tau_s": tau, "lambda_method": "v1", "ba0_se": None, "grid": [],
+            "d3_rule": {"conditions": [], "diagnostic": [],
+                        "statement": ("not applied: --lambda-method v1 takes w_p from v1's joint "
+                                      "lambda x w_p refinement (user 2026-09-24)")},
+            "admissible": [], "admissible_with_c3": [],
+            "w_p_star": wp, "w_p_used": wp, "lambda_rows": [], "lambda_star": lam,
+            "v1_selection": sel}
+
+
 # -------------------------------------------------------------------------- final
 
 
 def bucket(length: float) -> str:
     return ("<=256" if length <= 256 else "257-1024" if length <= 1024
             else "1025-2048" if length <= 2048 else ">2048")
+
+
+def _legacy_stop(stop: Mapping[str, Any]) -> Optional[bool]:
+    """The D13 verdict at the pre-2026-09-24 CI gate (15 %): every other condition as
+    judged, the CI half width below 15 % (reported, never gating)."""
+    from scripts import adaptive_boundary as boundary
+
+    frac = stop.get("ci_half_width_fraction")
+    if frac is None:
+        return None
+    others = [r for r in stop.get("reasons") or [] if not str(r).startswith("CI half width")]
+    return bool(not others and frac < boundary.LEGACY_CI_HALF_WIDTH_FRACTION)
 
 
 #: What ``final.json`` says instead of the M numbers when the stage ran with ``--no-holdout``.
@@ -1036,7 +1086,9 @@ def stage_final(model: str, label, p: Mapping[str, Any], wp_doc: Mapping[str, An
         s["theta_family_rule"] = v["published"]["family_rule_theta"]
         return {
             "model": model, "tau_s": tau, "alpha": alpha_of(tau), "w_p": wp, "lambda_wait": lam,
-            **s, "stop_rule_15": v["stop_rule"]["satisfied"],
+            **s, "stop_rule_d13": v["stop_rule"]["satisfied"],
+            "d13_max_ci_half_width_fraction": v["stop_rule"].get("max_ci_half_width_fraction"),
+            "stop_rule_15": _legacy_stop(v["stop_rule"]),
             "appendix_10_met": v["stop_rule"].get("appendix_ci_target_met"),
             "train_ba_at_published": threshold_balanced_accuracy(
                 spec.load(p["fitting"], label, TRIM_RAMP_WINDOWS), theta=v["published"]["theta_m"],
@@ -1083,7 +1135,9 @@ def stage_final(model: str, label, p: Mapping[str, Any], wp_doc: Mapping[str, An
     s["theta_family_rule"] = v["published"]["family_rule_theta"]
     return {
         "model": model, "tau_s": tau, "alpha": alpha_of(tau), "w_p": wp, "lambda_wait": lam,
-        **s, "stop_rule_15": v["stop_rule"]["satisfied"],
+        **s, "stop_rule_d13": v["stop_rule"]["satisfied"],
+        "d13_max_ci_half_width_fraction": v["stop_rule"].get("max_ci_half_width_fraction"),
+        "stop_rule_15": _legacy_stop(v["stop_rule"]),
         "appendix_10_met": v["stop_rule"].get("appendix_ci_target_met"),
         "train_ba_at_published": threshold_balanced_accuracy(
             spec.load(p["fitting"], label, TRIM_RAMP_WINDOWS), theta=theta,
@@ -2097,6 +2151,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--no-sentinels", action="store_true",
                     help="trainset: leave the sentinel cells out of the training set (default: they train)")
     ap.add_argument("--alpha-rule", choices=ALPHA_RULES, default="d4prime")
+    ap.add_argument("--max-ci-half-width-fraction", type=float, default=None,
+                    help="the D13 stop rule's CI gate (fraction of theta; default "
+                         "adaptive_boundary.MAX_CI_HALF_WIDTH_FRACTION = 0.20 since 2026-09-24; "
+                         "0.15 reproduces the rule before that)")
+    ap.add_argument("--v1-wp-grid", choices=("with_zero", "v1"), default="with_zero",
+                    help="wp --lambda-method v1: w_p grid of stages B / C - with_zero (default, user "
+                         "2026-09-24): v1's 0.01..0.08 / 0.005 plus 0; v1: v1's grid as is")
+    ap.add_argument("--lambda-method", choices=LAMBDA_METHODS, default="v2",
+                    help="wp: v2 (default) = D17 w_p + the BA lambda check; v1 = lambda_wait and w_p "
+                         "from v1's selection (scripts.v1_lambda_fit, user 2026-09-24)")
+    ap.add_argument("--requests-dataset", action="append", default=[], metavar="RUN=DIR",
+                    help="wp --lambda-method v1: a standard dataset whose requests.csv rebuilds the "
+                         "average TPOT of rows whose run column is RUN (default: the fit dir's "
+                         f"{TRAINSET_MANIFEST} sources; repeatable, overrides)")
     ap.add_argument("--alpha-w-p", type=float, default=None,
                     help=f"w_p of the alpha stage (default: {ALPHA_STAGE_W_P})")
     ap.add_argument("--alpha-bootstrap", type=int, default=1000,
@@ -2121,6 +2189,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     help="accept: cell-bootstrap resamples of the A-C intervals")
     args = ap.parse_args(argv)
     command = ["python", "-m", "scripts.dline_refit", *(sys.argv[1:] if argv is None else argv)]
+    global D13_MAX_CI_FRACTION
+    D13_MAX_CI_FRACTION = args.max_ci_half_width_fraction
 
     if args.stage in ("verify-freeze", "accept"):
         if args.freeze_file is None:
@@ -2220,6 +2290,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             doc = stage_alpha_d4prime(model, label, p, w_p=w_p, ledgers=lp,
                                       bootstrap=args.alpha_bootstrap, registry=args.registry)
         doc = publish_alpha(doc, args.publish_tau_s)
+    elif args.stage == "wp" and args.lambda_method == "v1":
+        from scripts import v1_lambda_fit
+
+        sources = v1_lambda_fit.sources_from_trainset(fit_dir(model))
+        for text in args.requests_dataset:
+            run, sep, d = text.partition("=")
+            if not sep or not run or not d:
+                ap.error(f"--requests-dataset {text!r}: expected RUN=DIR")
+            sources[run] = Path(d)
+        doc = stage_wp_v1(model, label, p, _read_json(out / "alpha.json"), sources, wp_grid=args.v1_wp_grid)
     elif args.stage == "wp":
         doc = stage_wp(model, label, p, _read_json(out / "alpha.json"))
     else:

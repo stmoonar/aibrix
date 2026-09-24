@@ -55,6 +55,31 @@ def test_d17_c3_alone_no_longer_forces_w_p_to_zero() -> None:
     assert not any(r["c3_merged"] for r in rows)
 
 
+def test_stop_rule_15_is_the_legacy_d13_verdict() -> None:
+    """final.json's ``stop_rule_15``: the D13 verdict at the pre-2026-09-24 15 % gate."""
+    ok = {"satisfied": True, "reasons": [], "ci_half_width_fraction": 0.12}
+    between = {"satisfied": True, "reasons": [], "ci_half_width_fraction": 0.17}
+    thin = {"satisfied": False, "reasons": ["bootstrap publish rate 0.50 < 0.90"],
+            "ci_half_width_fraction": 0.05}
+    assert dl._legacy_stop(ok) is True and dl._legacy_stop(between) is False
+    assert dl._legacy_stop(thin) is False and dl._legacy_stop({"reasons": []}) is None
+
+
+def test_the_d13_gate_is_a_cli_parameter(tmp_path, monkeypatch) -> None:
+    seen = {}
+
+    def fake_verdict_report(**kw):
+        seen["max_ci_fraction"] = kw.get("max_ci_fraction")
+        raise RuntimeError("stop here")
+
+    from scripts import theta_verdict as tv
+    monkeypatch.setattr(tv, "verdict_report", fake_verdict_report)
+    monkeypatch.setattr(dl, "D13_MAX_CI_FRACTION", 0.15)
+    with pytest.raises(RuntimeError):
+        dl.verdict(MODEL, None, {"fitting": "x", "families": {}}, 10.0, 0.0, 1.0)
+    assert seen["max_ci_fraction"] == 0.15
+
+
 def test_d3_admits_nothing_without_a_baseline_fit() -> None:
     rows = [{"w_p": 0.0, "error": "no theta"}, _row(0.01, 0.9, 0.0, 0.2)]
     assert dl.d3_select(rows, se=None) is None

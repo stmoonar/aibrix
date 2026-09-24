@@ -314,8 +314,12 @@ def verdict_report(
     n_resamples: int = 1000,
     family_resamples: int = 200,
     seed: int = 20260922,
+    max_ci_fraction: float | None = None,
 ) -> dict[str, Any]:
-    """The verdict for ``spec``'s signal on one model - the one fit path of every arm."""
+    """The verdict for ``spec``'s signal on one model - the one fit path of every arm.
+
+    ``max_ci_fraction`` is the D13 CI gate of the stop rule (default
+    ``adaptive_boundary.MAX_CI_HALF_WIDTH_FRACTION``, 20 % since 2026-09-24)."""
     from scripts.calibration_campaign import family_theta_verdict
 
     config = config or spec.default_config()
@@ -373,6 +377,8 @@ def verdict_report(
         theta=theta,
         ci_half_width=half,
         family_boundary_windows=family_windows_near,
+        max_ci_fraction=(boundary.MAX_CI_HALF_WIDTH_FRACTION if max_ci_fraction is None
+                         else float(max_ci_fraction)),
     )
     published_theta = float(fam["theta"])
     report: dict[str, Any] = {
