@@ -179,7 +179,18 @@ def create_controller_dependencies(
     return ControllerDependencies(
         store=store,
         snapshot_box=SnapshotBox(),
-        queue=ActionQueue(sm_client, is_observe=observe_gate.is_observe, prof=profiler),
+        queue=ActionQueue(
+            sm_client,
+            is_observe=observe_gate.is_observe,
+            prof=profiler,
+            # TRE_SM_ASYNC / TRE_SM_CALL_DRAIN (both default off -> main's paths).
+            async_ops=bool(getattr(cfg, "sm_async", False)),
+            call_drain=bool(getattr(cfg, "sm_call_drain", False)),
+            poll_interval_s=float(getattr(cfg, "sm_async_poll_s", 1.0)),
+            op_timeout_s=float(getattr(cfg, "sm_async_op_timeout_s", 600.0)),
+            max_polls=int(getattr(cfg, "sm_async_max_polls", 8)),
+            audit_on_failure=bool(getattr(cfg, "sm_async_audit_on_failure", True)),
+        ),
         sm_client=sm_client,
         cluster_view_box=ClusterViewBox(),
         decision_writer=DecisionSnapshotWriter(redis_client),

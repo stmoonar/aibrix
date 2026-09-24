@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Awaitable, Callable, Mapping, Protocol
 
 from tre_common.metrics_schema import MetricsSnapshot, ModelWindowMetrics
@@ -11,7 +11,12 @@ from tre_common.registry import Registry
 from tre_controller.gateway_health import GatewayCounters
 from tre_controller.loops.tick import serving_window
 from tre_controller.planning.planner import Action, ClusterView, ScaleAction, UnhideAction
-from tre_controller.planning.safescale import ProbeObservation, SafeScaleCommand, SafeScaleProbe
+from tre_controller.planning.safescale import (
+    CommitDrainPolicy,
+    ProbeObservation,
+    SafeScaleCommand,
+    SafeScaleProbe,
+)
 from tre_controller.signals.sources import get_signal
 from tre_controller.signals.trs import SignalState, TRSComputer, TRSInput
 
@@ -64,6 +69,7 @@ def run_safescale_observation_tick(
     signal_state: SignalState | None = None,
     cluster_view: ClusterView | None = None,
     gateway_counters: Mapping[str, GatewayCounters] | None = None,
+    commit_drain: CommitDrainPolicy | None = None,
 ) -> SafeScaleObservationResult:
     if snapshot.stale:
         return SafeScaleObservationResult(submitted=0, events=("snapshot_stale",))
@@ -106,6 +112,17 @@ def run_safescale_observation_tick(
         actions = _commands_to_actions(decision.commands)
         if not actions:
             continue
+        if commit_drain is not None and decision.status == "commit":
+            # TRE_SM_CALL_DRAIN: the commit sleep of the (already hidden) probe pods
+            # waits for their residual in-flight requests; follow-ups are wakes.
+            budget = commit_drain.budget_s(getattr(metrics, "e2e_p95_ms", None))
+            actions = tuple(
+                replace(action, drain_s=budget)
+                if isinstance(action, ScaleAction) and action.delta < 0 and action.model == probe.model
+                else action
+                for action in actions
+            )
+            events.append(f"safescale_commit_drain:{probe.model}:{budget:.1f}s")
         try:
             submit_result = queue.submit(actions)
         except Exception as exc:
@@ -160,6 +177,7 @@ async def safescale_task(
                 signal_state=signal_state,
                 cluster_view=cluster_view_box.get() if cluster_view_box is not None else None,
                 gateway_counters=counters,
+                commit_drain=CommitDrainPolicy.from_config(cfg),
             )
             _log_resolutions(snapshot.ts_ms, result, gateway_available=counters is not None)
         interval = getattr(getattr(cfg, "safescale"), "probe_poll_seconds")

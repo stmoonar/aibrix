@@ -34,7 +34,7 @@ from tre_controller.planning.safescale import (
 )
 from tre_controller.signals.sources import get_signal, per_replica_token_rate
 from tre_controller.signals.trs import SignalState, TRSComputer, TRSInput
-from tre_sm.allocator.slots import natural_key, release_order
+from tre_sm.allocator.slots import Binding, SlotAllocator, natural_key, release_order
 
 
 class PlannerQueue(Protocol):
@@ -178,15 +178,18 @@ def run_planner_tick(
         suppress_hot_proactive_probe=suppress_hot_proactive_probe,
         disable_eta_gate=disable_eta_gate,
     )
+    # TRE_SM_ASYNC: SM operations still running count as capacity in transit (a
+    # pending wake claims its GPUs). Without pending operations this is cluster_view.
+    plan_view, pending_events = with_pending_ops(cluster_view, queue, registry)
     plan = build_plan(
         model_contexts=contexts,
         classifications=classifications,
         model_replicas=replicas,
-        idle_gpus=_idle_gpus(snapshot, registry, cluster_view),
+        idle_gpus=_idle_gpus(snapshot, registry, plan_view),
         cfg=cfg,
         active_probe_models=active_probe_models or set(),
         inflight_models=queue.inflight_models(),
-        cluster_view=cluster_view,
+        cluster_view=plan_view,
         cooldowns=_action_cooldowns(snapshot, queue) if action_cooldown else None,
         probe_backoff_models=_probe_backoff_models(safescale, snapshot.ts_ms),
     )
@@ -230,10 +233,82 @@ def run_planner_tick(
     return LoopTickResult(
         submitted=len(actions),
         actions=actions,
-        events=paper_events + dwell_events + tuple(plan.events) + safescale_events,
+        events=paper_events + dwell_events + pending_events + tuple(plan.events) + safescale_events,
         model_contexts=contexts,
         classifications={item.model_name: item for item in classifications},
     )
+
+
+def with_pending_ops(
+    cluster_view: ClusterView | None,
+    queue: PlannerQueue,
+    registry: Registry,
+) -> tuple[ClusterView | None, tuple[str, ...]]:
+    """Planner view with the controller's in-flight SM operations (TRE_SM_ASYNC).
+
+    * pending wake (delta > 0) = incoming capacity: its named bindings count as awake;
+      a model-level growth first claims that model's sleeping bindings on free GPUs
+      (the SM wakes those before it creates), then free slots via the SM allocator
+      (placeholder bindings). So no other model plans onto those GPUs meanwhile.
+    * pending sleep (delta < 0) = leaving capacity: the binding is still awake (the SM
+      keeps a draining binding awake + hidden), so its GPUs stay occupied until the
+      SM confirms the sleep - nothing to change.
+    The model itself is in queue.inflight_models() for the whole operation, so no
+    duplicate action is planned for it. No pending operations -> ``cluster_view``.
+    """
+    view_fn = getattr(queue, "pending_ops_view", None)
+    if cluster_view is None or not callable(view_fn):
+        return cluster_view, ()
+    pending = tuple(view_fn())
+    if not pending:
+        return cluster_view, ()
+    bindings = list(cluster_view.bindings)
+    events: list[str] = []
+    for op in pending:
+        if op.delta <= 0:
+            events.append(f"pending_op_leaving:{op.model}:{op.delta}")
+            continue
+        index = {binding.serve_id: position for position, binding in enumerate(bindings)}
+        need = int(op.delta)
+        if op.pods:
+            for pod in op.pods:
+                position = index.get(pod)
+                if position is not None and not bindings[position].awake:
+                    bindings[position] = replace(bindings[position], awake=True, hidden=False)
+        else:
+            occupied = {
+                (binding.slot.node, gpu)
+                for binding in bindings
+                if binding.awake
+                for gpu in binding.slot.gpu_ids
+            }
+            for binding in sorted(
+                (item for item in bindings if item.model == op.model and not item.awake),
+                key=lambda item: natural_key(item.serve_id),
+            ):
+                if need <= 0:
+                    break
+                gpus = {(binding.slot.node, gpu) for gpu in binding.slot.gpu_ids}
+                if gpus & occupied:
+                    continue
+                bindings[index[binding.serve_id]] = replace(binding, awake=True, hidden=False)
+                occupied |= gpus
+                need -= 1
+            if need > 0:
+                try:
+                    tp_size = registry.model(op.model).tp_size
+                    allocator = SlotAllocator(cluster_view.topology, bindings)
+                except (KeyError, ValueError):
+                    allocator = None
+                for number in range(need):
+                    slot = allocator.find_slot(tp_size) if allocator is not None else None
+                    if slot is None:
+                        break
+                    serve_id = f"pending-{op.model}-{number}"
+                    allocator.bind(serve_id, op.model, slot, awake=True)
+                    bindings.append(Binding(serve_id, op.model, slot, awake=True))
+        events.append(f"pending_op_incoming:{op.model}:+{op.delta}")
+    return ClusterView(topology=cluster_view.topology, bindings=tuple(bindings)), tuple(events)
 
 
 def _probe_backoff_models(safescale: SafeScaleController | None, now_ms: int) -> set[str]:

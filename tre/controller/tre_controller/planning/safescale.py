@@ -65,6 +65,43 @@ class ProbeWindowInputs:
 
 
 @dataclass(frozen=True)
+class CommitDrainPolicy:
+    """SM drain budget for a SafeScale commit (TRE_SM_CALL_DRAIN): the probe pod has
+    been hidden for the whole probe window, so at commit the SM only waits for its
+    residual in-flight requests: clamp(factor * p95_e2e, min_s, max_s), default_s
+    when the donor has no e2e p95. Every other sleep is a direct one (drain 0)."""
+
+    factor: float = 2.0
+    min_s: float = 10.0
+    max_s: float = 120.0
+    default_s: float = 30.0
+
+    def __post_init__(self) -> None:
+        for name in ("factor", "min_s", "max_s", "default_s"):
+            if not float(getattr(self, name)) > 0:
+                raise ValueError(f"CommitDrainPolicy.{name} must be positive")
+        if self.min_s > self.max_s:
+            raise ValueError("TRE_SAFESCALE_COMMIT_DRAIN_MIN_S must not exceed _MAX_S")
+
+    def budget_s(self, p95_e2e_ms: float | None) -> float:
+        p95 = _positive(p95_e2e_ms)
+        raw = self.default_s if p95 is None else self.factor * p95 / 1000.0
+        return min(max(raw, self.min_s), self.max_s)
+
+    @classmethod
+    def from_config(cls, cfg: Any) -> "CommitDrainPolicy | None":
+        """None unless TRE_SM_CALL_DRAIN is on (then nothing changes vs main)."""
+        if not bool(getattr(cfg, "sm_call_drain", False)):
+            return None
+        return cls(
+            factor=float(getattr(cfg, "safescale_commit_drain_factor", 2.0)),
+            min_s=float(getattr(cfg, "safescale_commit_drain_min_s", 10.0)),
+            max_s=float(getattr(cfg, "safescale_commit_drain_max_s", 120.0)),
+            default_s=float(getattr(cfg, "safescale_commit_drain_default_s", 30.0)),
+        )
+
+
+@dataclass(frozen=True)
 class SafeScaleCommand:
     kind: CommandKind
     model: str

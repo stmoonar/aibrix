@@ -69,6 +69,10 @@ class ScaleAction:
     # dispatcher sleeps exactly these bindings (binding-level power) instead of letting
     # the SM pick the tail of the model; for a safescale probe they are the pods to hide.
     pods: tuple[str, ...] = ()
+    # Per-call SM drain budget (s) for a scale-down, only sent with TRE_SM_CALL_DRAIN on:
+    # the SafeScale commit sets it (the pod was already hidden for the probe window, so
+    # the SM waits for its residual in-flight requests); None = direct sleep (drain 0).
+    drain_s: float | None = None
 
 
 @dataclass(frozen=True)

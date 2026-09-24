@@ -140,6 +140,26 @@ class ControllerConfig:
     gateway_stats_urls: tuple[str, ...] = ()
     gateway_route_namespace: str = "tre-v2"
     gateway_stats_timeout_s: float = 1.0
+    # --- SM per-call drain + async operations (design 20260924-reissue-sidecar §3.3/§3.5)
+    # TRE_SM_CALL_DRAIN: every sleep the controller requests carries drain_s - the
+    # SafeScale commit its budget below, every other (direct) sleep 0. Off (default):
+    # nothing is sent, the SM uses its TRE_SM_DRAIN_BEFORE_SLEEP default, as in main.
+    sm_call_drain: bool = False
+    # SafeScale commit drain budget: clamp(factor * p95_e2e, min, max); default when
+    # the donor has no e2e p95 in the window.
+    safescale_commit_drain_factor: float = 2.0
+    safescale_commit_drain_min_s: float = 10.0
+    safescale_commit_drain_max_s: float = 120.0
+    safescale_commit_drain_default_s: float = 30.0
+    # TRE_SM_ASYNC: target/power calls ask the SM for a 202 operation; the ActionQueue
+    # tracks it (poll every TRE_SM_ASYNC_POLL_S, at most TRE_SM_ASYNC_MAX_POLLS_PER_TICK
+    # models per drain, give up after TRE_SM_ASYNC_OP_TIMEOUT_S). Needs the SM's
+    # TRE_SM_ASYNC_OPS; without it the SM answers synchronously and nothing changes.
+    sm_async: bool = False
+    sm_async_poll_s: float = 1.0
+    sm_async_op_timeout_s: float = 600.0
+    sm_async_max_polls: int = 8
+    sm_async_audit_on_failure: bool = True
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "ControllerConfig":
@@ -324,6 +344,24 @@ class ControllerConfig:
             ),
             gateway_route_namespace=_get_str(values, "TRE_GATEWAY_ROUTE_NAMESPACE", "tre-v2"),
             gateway_stats_timeout_s=_get_positive_float(values, "TRE_GATEWAY_STATS_TIMEOUT_SECONDS", 1.0),
+            sm_call_drain=_get_bool(values, "TRE_SM_CALL_DRAIN", False),
+            safescale_commit_drain_factor=_get_positive_float(
+                values, "TRE_SAFESCALE_COMMIT_DRAIN_FACTOR", 2.0
+            ),
+            safescale_commit_drain_min_s=_get_positive_float(
+                values, "TRE_SAFESCALE_COMMIT_DRAIN_MIN_S", 10.0
+            ),
+            safescale_commit_drain_max_s=_get_positive_float(
+                values, "TRE_SAFESCALE_COMMIT_DRAIN_MAX_S", 120.0
+            ),
+            safescale_commit_drain_default_s=_get_positive_float(
+                values, "TRE_SAFESCALE_COMMIT_DRAIN_DEFAULT_S", 30.0
+            ),
+            sm_async=_get_bool(values, "TRE_SM_ASYNC", False),
+            sm_async_poll_s=_get_positive_float(values, "TRE_SM_ASYNC_POLL_S", 1.0),
+            sm_async_op_timeout_s=_get_positive_float(values, "TRE_SM_ASYNC_OP_TIMEOUT_S", 600.0),
+            sm_async_max_polls=_get_positive_int(values, "TRE_SM_ASYNC_MAX_POLLS_PER_TICK", 8),
+            sm_async_audit_on_failure=_get_bool(values, "TRE_SM_ASYNC_AUDIT_ON_FAILURE", True),
         )
 
 

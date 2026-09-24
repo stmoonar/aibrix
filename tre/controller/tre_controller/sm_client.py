@@ -98,6 +98,65 @@ class ServiceManagerClient:
                 return {"ok": False, "error": "defrag endpoint is not implemented in service-manager v2"}
             return {"ok": False, "error": str(exc)}
 
+    # ------------------------------------------------------------------
+    # TRE_SM_CALL_DRAIN / TRE_SM_ASYNC (both default off). The methods above are
+    # main's and stay byte-for-byte what the flag-off ActionQueue calls; these send
+    # the optional per-call drain budget and/or ask for an async (202) operation.
+    # ------------------------------------------------------------------
+
+    async def scale_model_v2(
+        self, model: str, delta: int, *, drain_s: float | None = None, async_op: bool = False
+    ) -> dict:
+        try:
+            state = await self.get_state()
+            counts = state.get("models", {}).get(model, {})
+            current = int(counts.get("awake", 0))
+            bound = int(counts.get("bound", 0))
+            serving_floor = 1 if bound > 0 and current > 0 and int(delta) < 0 else 0
+            target = max(serving_floor, current + int(delta))
+            body: dict[str, Any] = {"wake_replicas": target}
+            if drain_s is not None:
+                body["drain_s"] = float(drain_s)
+            response = await self._request(
+                "PUT",
+                f"/v2/models/{model}/target" + ("?async=1" if async_op else ""),
+                json=body,
+                timeout_s=self._slow_timeout_s,
+            )
+            return {"ok": True, "response": response}
+        except ServiceManagerError as exc:
+            return {"ok": False, "error": str(exc)}
+
+    async def set_binding_power_v2(
+        self, serve_id: str, *, awake: bool, drain_s: float | None = None, async_op: bool = False
+    ) -> dict:
+        try:
+            body: dict[str, Any] = {"awake": bool(awake)}
+            if drain_s is not None:
+                body["drain_s"] = float(drain_s)
+            response = await self._request(
+                "PUT",
+                f"/v2/bindings/{serve_id}/power" + ("?async=1" if async_op else ""),
+                json=body,
+                timeout_s=self._slow_timeout_s,
+            )
+            return {"ok": True, "response": response}
+        except ServiceManagerError as exc:
+            return {"ok": False, "error": str(exc)}
+
+    async def get_operation(self, operation_id: str) -> dict:
+        try:
+            response = await self._request("GET", f"/v2/operations/{operation_id}")
+            return {"ok": True, "response": response}
+        except ServiceManagerError as exc:
+            return {"ok": False, "error": str(exc), "not_found": "HTTP 404" in str(exc)}
+
+    async def get_audit(self) -> dict:
+        try:
+            return {"ok": True, "response": await self._request("GET", "/v2/audit")}
+        except ServiceManagerError as exc:
+            return {"ok": False, "error": str(exc)}
+
     async def _request(self, method: str, path: str, *, json: dict | None = None, timeout_s: float | None = None) -> dict:
         url = f"{self._base_url}{path}"
         try:
