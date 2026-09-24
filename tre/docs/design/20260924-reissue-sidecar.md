@@ -93,6 +93,7 @@ v2 replayer 不看 `finish_reason`，所以这类请求目前被记成成功（p
 - **SM 内部的直接睡永不排空**（固定 `drain_s=0`）：defrag 迁移、startup admission / converge、fleet repair、过期标记恢复。APA 的 `/scale_service` 也显式传 0（见 §3.4）。
 - **启动即失败（fail-closed）**：
   - 默认排空（`TRE_SM_DRAIN_BEFORE_SLEEP` 为 true 或正数）却没开 HIDE。
+  - 默认排空非 0 却没设 `TRE_SM_ALLOW_DEFAULT_DRAIN=1`（评审 L4：不传 `drain_s` 的调用方会排空，而 APA 永远传 0，两臂不对称；必须显式确认）。
   - registry 里 `reissue_sidecar.enabled=true` 却没开 HIDE（`check_reissue_coupling`，在 `server.create_app` 连 Redis 和 k8s 之前检查，`ServiceManagerV2.__init__` 里再查一次）。
   - 开了 HIDE，但 vLLM 客户端的 `sleep()` 不支持 `hidden=`。
 - 与 sidecar 的 409 一起，形成双保险：配置错了，要么 SM 起不来，要么 sidecar 拒绝 `/sleep`。
@@ -123,6 +124,12 @@ v2 replayer 不看 `finish_reason`，所以这类请求目前被记成成功（p
 - 异步接口（`TRE_SM_ASYNC_OPS` + controller `TRE_SM_ASYNC`）：见 §3.4 / §3.5，排空不再推迟 controller 的任何动作。
 - 只有开了 HIDE 时，`/v2/state` 才有以下变化：每个 binding 多一个 `draining` 字段，顶层列出 draining 标记；`models[m].awake` **不含** draining，另给 `draining` 计数。原因是 `sm_client.scale_model` 用 `awake + delta` 算下一个目标，这样算，+1 会回收正在 draining 的 binding，−1 也不会重复下发。
 
+**同步调用等锁（评审 H2）**：
+- 开了 HIDE 或 `TRE_SM_ASYNC_OPS` 后，排空阶段不持锁、异步 worker 在后台加锁，同步调用可能撞上正被短暂持有的 writer lock。
+- 此时所有 `serialized_operation`（`put_model_routable`、defrag、reconcile、legacy target/power）以及三段式的第一段，锁忙时**有界等待** `TRE_SM_SYNC_LOCK_WAIT_S`（30 s，每 0.2 s 重试），不再立即 409；超时仍 409。
+- 例外：异步 worker（有自己分阶段的重试）和 supervisor 发起的调用（startup converge、过期标记恢复）不等，下个 tick 再试。
+- 开关全关时等待时长为 0，与 main 一样只试一次。
+
 **其他路径**：
 - `put_model_routable` 跳过 draining 的 binding，controller 的 UnhideAction 不会把它们放回路由。
 - defrag 遇到 draining 的 binding 时拒绝，原因 `binding_draining`。
@@ -131,7 +138,8 @@ v2 replayer 不看 `finish_reason`，所以这类请求目前被记成成功（p
 
 **过期标记恢复**：
 - 由 supervisor 每个 tick、`reconcile()`、以及每次三段式调用开头触发。
-- 满足任一条件即视为过期：超过截止时间 + `TRE_SM_DRAIN_STALE_GRACE_S`（30 s）；或者是本实例写的标记，但已没有调用在处理它；或者标记的 `async_op_id` 所属异步操作已被判为孤儿（§3.4）。
+- 满足任一条件即视为过期：超过截止时间 + `TRE_SM_DRAIN_STALE_GRACE_S`（30 s）——**本实例的标记也适用**，即使 token 仍登记为进行中（评审 H3：防任何泄漏路径）；或者是本实例写的标记，但已没有调用在处理它；或者标记的 `async_op_id` 所属异步操作已被判为孤儿（§3.4）。
+- 评审 H3：异步操作的阶段通知放在 `_complete_staged` 的 try/finally 内，簿记（Redis 写）出错只记日志，不会让 token 泄漏。
 - 处理原则：desired 仍为 sleeping，就补做 sleep；已是 awake，就取消 hide。
 
 **审计（评审 M1）**：
@@ -153,7 +161,9 @@ v2 replayer 不看 `finish_reason`，所以这类请求目前被记成成功（p
   - 通过后写一条操作记录（Redis hash `tre:v2:sm:async_ops`，SM 私有簿记，不走 writer fence），返回 `202 {async_operation: true, operation_id, status: "pending", plan, supersedes, status_url}`。
   - 后台 worker 执行与同步接口**同一段代码**（staged 或 legacy）。
 - `GET /v2/operations/{id}`：先查异步记录，再查原来的 coordinator journal。字段：`status`（pending / running / succeeded / failed / superseded）、`phase`（queued / running / waiting_lock / draining / committing / 终态）、`bindings[]`（每个 binding 的 action、outcome、drained、drained_s、drain_budget_s、interrupted、error）、`summary`（woken / created / reclaimed / slept / abandoned / errors / drained_s / interrupted）、`error` + `error_code`、`latency_s`、`duration_s`、`supersedes` / `superseded_by`。
-- `GET /v2/async-operations`：列出记录（最多保留 `TRE_SM_ASYNC_MAX_RECORDS` 条，超出时删最老的终态记录）。
+- `GET /v2/async-operations`：列出记录（最多保留 `TRE_SM_ASYNC_MAX_RECORDS` 条，超出时删最老的终态记录）；`?active=1` 只列 pending / running（controller 重启接管用）。
+- 请求 body 可带 `meta`（JSON 对象，≤ 4 KB），原样存进异步记录；同步调用忽略。controller 用它存动作上下文和回滚意图（§3.5 M4）。
+- 记录先落盘再入队：Redis 写失败时请求返回 500，不会跑一个没有记录的操作。终态记录写失败会重试 3 次，仍失败就留在内存、由心跳循环重写，不会一直显示 running（评审 L1）。
 - 开关关着时 `?async=1` 被忽略，照常同步返回 200；controller 据响应里有没有 `async_operation` 区分。
 
 **每模型规则（latest wins）**：
@@ -167,10 +177,11 @@ v2 replayer 不看 `finish_reason`，所以这类请求目前被记成成功（p
 
 **SM 重启**：
 - 活跃记录带 `instance` 和心跳（`TRE_SM_ASYNC_HEARTBEAT_S`）。
-- supervisor 每个 tick（先于过期标记恢复）和 `POST /v2/reconcile` 会把**别的实例**留下、心跳超过 `TRE_SM_ASYNC_ORPHAN_AFTER_S` 的活跃记录标为 `failed`（`phase=orphaned`，记下 `orphaned_in_phase`）：
+- supervisor 每个 tick（先于过期标记恢复）和 `POST /v2/reconcile` 会把**别的实例**留下、心跳超过 `TRE_SM_ASYNC_ORPHAN_AFTER_S` 的活跃记录标为 `failed`（`phase=orphaned`，记下 `orphaned_in_phase`）。评审 M1：本实例的记录一律跳过；每条候选在锁内重读一次再判定，期间被原主人更新过心跳或结束的不动：
   - 还在排队的：从未执行，什么都没改。
   - 已开始的：第一段已把期望状态落盘；它 staged 的 draining 标记带 `async_op_id`，所属操作被判孤儿后标记**立即**视为过期，由过期标记恢复按期望状态收尾（仍要睡就补睡，已改成醒就取消 hide）。wake / create 的物理状态由 reconcile 收敛。
-- 心跳新鲜的别的实例（滚动更新期间新旧 pod 并存）不会被误判。
+- 心跳新鲜的别的实例（滚动更新期间新旧 pod 并存）不会被误判（有测试：两个实例共享 Redis，一个在排空中，另一个跑恢复不动它；它死后才被判孤儿）。
+- **时钟（评审 L3）**：心跳和孤儿判定都用 wall clock，且由另一个实例比较。SM 应与 controller 同节点（pin node10，NTP 正常）。启动时比较本机时间与 Redis `TIME`，偏差 > `TRE_SM_ASYNC_MAX_CLOCK_SKEW_S`（5 s）或读不到 TIME，就**不启用** async ops（fail-closed，SM 照常同步服务，controller 自动退化为同步）。
 - `DrainMarker.async_op_id` 为空时不写进文档，旧版 SM 回滚后仍能读标记。
 
 **`/scale_service`（APA）保持同步**：Go controller-manager（TRE-PATCH P2-APA-001）调完 `/scale_service` 马上读 `/models_replicas`，只有同步返回才能看到结果；而它固定 `drain_s=0`，hide → 不可路由 → sleep 很快，同步不会拖住 APA。
@@ -188,9 +199,25 @@ v2 replayer 不看 `finish_reason`，所以这类请求目前被记成成功（p
 **异步派发（`TRE_SM_ASYNC`）**：
 - ScaleAction（model 级与 binding 级）带 `?async=1` 派发，拿到 202 就记下 operation id，模型**留在 inflight**，队列继续派发其他模型的动作；hide / unhide / defrag 仍同步。
 - 每次 `drain_once` 先轮询已派发的操作：每个操作间隔 `TRE_SM_ASYNC_POLL_S`（1 s），每轮最多 `TRE_SM_ASYNC_MAX_POLLS_PER_TICK`（8）个，并发请求。404 连续 3 次记为 `operation_unknown`；网络错误下轮再试；超过 `TRE_SM_ASYNC_OP_TIMEOUT_S`（600 s）记 `op_timeout`。
-- **完成时**才：写 F4 cooldown 的完成时间（冷却从操作完成算起，而不是派发）、放开 inflight、结算依赖。`succeeded` / `superseded` 算成功。
-- **依赖**：同一批里 donor-immediate 的接收方 wake 要等 donor 那次 sleep 成功才派发（它要用 donor 腾出的卡）；SafeScale commit 的 follow-up 扩容要等 commit 的 sleep 成功。被依赖的失败 / 超时 / 在 observe 下被跳过 → 依赖方 `dependency_failed`，不派发。
-- **防重复**：有活跃操作的模型在 `inflight_models()` 里，planner 不会给它规划；`submit` 按 main 的规则丢弃（`inflight`），main 原本放行的 rescue 动作在该模型有活跃操作时丢弃为 `active_op`；SafeScale 批次整批拒绝（`atomic_batch_conflict`），probe 不 resolve，下个 tick 重试（不丢一次性动作）。controller 自己不主动 supersede 活跃操作。
+- **完成时**才：写 F4 cooldown 的完成时间（冷却从操作完成算起，而不是派发）、放开 inflight、结算依赖。
+- **按 binding 结算（评审 M2）**：
+  - 扩容：`succeeded` / `superseded` 算成功（被 reclaim 的新操作就是要扩容）。
+  - 缩容（"释放容量"：donor sleep、SafeScale commit）：只有目标 binding **全部** slept（或本来就已睡）才算成功。
+  - 有 `abandoned_target_changed` / `abandoned_reclaimed`（含部分）→ 不算成功：不记 cooldown、不派 follow-up、**不回滚**（目标已被别人改了）。
+  - `failed`、`rolled_back`、`sleep_unverified`、超时 → 失败，SafeScale commit 回滚 unhide。
+- **依赖**：同一批里 donor-immediate 的接收方 wake 要等 donor 那次 sleep 成功才派发（它要用 donor 腾出的卡）；SafeScale commit 的 follow-up 扩容要等 commit 的 sleep 成功。被依赖的失败 / 超时 / 在 observe 下被跳过 → 依赖方 `dependency_failed`，不派发。评审 H1：被依赖的动作被 main 的 rescue 规则从队列里替换掉时也结算为失败；被依赖的 seq 既不在队列也不在跟踪中、又没有结果时立即判失败，接收方不会永远挂着。
+- **防重复**：有活跃操作的模型在 `inflight_models()` 里，planner 不会给它规划；`submit` 按 main 的规则丢弃（`inflight`），main 原本放行的 rescue 动作在该模型有活跃操作时丢弃为 `active_op`；SafeScale 批次整批拒绝（`atomic_batch_conflict`），probe 不 resolve，下个 tick 重试（不丢一次性动作）。
+- **supersede（评审 M3，已定）**：唯一例外是同模型的 **CRITICAL rescue 扩容**遇上该模型的活跃**缩容**操作（典型是 commit 排空中）：
+  - planner 通过 `queue.supersedable_models()` 放行这个 receiver；
+  - 动作改成 model 级 target 派发，SM 的 latest-wins 把正在排空、仍 awake 的 binding 回收，作为即时容量；
+  - 旧操作不再跟踪，按"被 controller 取代"结算（不算成功、无 cooldown、无 follow-up、不回滚）。
+  - 其他缩容类动作仍被 `active_op` / `inflight` 挡住。
+- **一次性动作不丢（评审 H2）**：hide / unhide / SafeScale 来源的动作遇到 409、502/503/504 或超时，按 1→2→4→8→10 s 退避重试，最长 `TRE_SM_ONESHOT_RETRY_S`（120 s），observe 下保留；仍失败则打结构化告警 `sm_oneshot_action_failed`，交给 SM reconcile / controller HiddenOrphanDetector。routable 调用的超时 `TRE_SM_ROUTABLE_TIMEOUT_S`（45 s）大于 SM 等锁时间（30 s）。planner 动作不重试（下个 tick 重新规划）。
+- **重启接管（评审 M4）**：
+  - 异步派发时附带 `meta`（action_id、model、delta、pods、reason、source_loop；SafeScale commit 还有 `rollback_unhide`）。
+  - 队列启动后第一次 drain 调 `GET /v2/async-operations?active=1`，把活跃操作按 action_id 分组，重新纳入跟踪直到终态（模型保持 inflight）；失败的 commit 照样回滚 unhide。没有 meta 的操作按 plan 方向重建为 ±1 动作，只保证 inflight 和跟踪。SM 不可达时每 5 s 重试。
+  - planner 把 SM `/v2/state` 里 `draining=true` 的 binding 计为"正在离开"：不计入扩容上限的 awake 数，也不是可再缩容的副本（它是 hidden，本来就不在 routable 计数里）。
+- **同步 + CALL_DRAIN 的多 pod commit（评审 L4）**：各 pod 的 power 调用并行发出，共用一个排空截止时间，而不是 N 倍预算。
 - **planner 容量核算**（`tick.with_pending_ops`）：进行中的 wake = 即将到来的容量，其 binding 视为醒着（占卡）；model 级扩容先占该模型空闲卡上的 sleeping binding，再按 SM 分配器占空槽（占位 binding）；进行中的 sleep = 即将离开的容量，binding 在 SM 视图里本来就是 awake+hidden，卡保持占用，直到 SM 确认睡下。没有进行中的操作时视图原样不变。
 - **失败 / 超时**：按同步失败处理（DispatchResult ok=False，不写 cooldown）；并限频（60 s）调一次只读的 `GET /v2/audit` 打日志。SafeScale commit 失败或超时时补发 unhide（等同 probe rollback；safescale 来源，observe 下保留不丢；SM 对已确认醒着的 pod 已经恢复可路由，unhide 幂等，且跳过仍在 draining 的 binding）。
 - **observe / pause**：已派发的操作照常轮询到终态并记账，不会被遗忘；待派发的 planner 动作照旧丢弃，safescale 来源的一次性动作（含 commit follow-up 与 rollback unhide）保留到恢复 active 再派发。
@@ -333,18 +360,21 @@ v2 replayer 不看 `finish_reason`，所以这类请求目前被记成成功（p
 | `TRE_REISSUE_PROBE_INTERVAL_S` / `_PROXY_TIMEOUT_S` / `_CONTROL_TIMEOUT_S` | sidecar env | 2 / 60 / 300 |
 | `TRE_SM_HIDE_BEFORE_SLEEP` | SM Deployment env，**全局**（开 reissue sidecar 时必须开，否则 SM 启动失败；任何 `drain_s>0` 也需要它） | 关 |
 | `drain_s`（请求 body） | `PUT /v2/models/{m}/target`、`/v2/bindings/{id}/power`，逐次调用 | 不传 = 用下一行的默认值 |
-| `TRE_SM_DRAIN_BEFORE_SLEEP` | SM env：**仅是不传 `drain_s` 的调用的默认预算**（false/0 = 不排空，true = 自动 clamp(2·p95)，数字 = 秒）；非零需要 HIDE，否则启动失败 | 关（0） |
+| `TRE_SM_DRAIN_BEFORE_SLEEP` | SM env：**仅是不传 `drain_s` 的调用的默认预算**（false/0 = 不排空，true = 自动 clamp(2·p95)，数字 = 秒）；非零需要 HIDE **且** `TRE_SM_ALLOW_DEFAULT_DRAIN=1`，否则启动失败 | 关（0） |
+| `TRE_SM_ALLOW_DEFAULT_DRAIN` | SM env：显式允许非零默认排空（评审 L4） | 关 |
+| `TRE_SM_SYNC_LOCK_WAIT_S` | SM env：同步调用等 writer lock 的上限（只在 HIDE 或 ASYNC_OPS 开时生效） | 30 |
 | `TRE_SM_DRAIN_{DEFAULT,MIN,MAX,POLL}_S` | SM env（MAX 也截断逐次预算） | 60 / 30 / 300 / 1 |
 | `TRE_SM_SLEEP_DEADLINE_S` / `TRE_SM_SLEEP_COMMIT_RESERVE_S` | SM env（截止时间必须小于 controller 的 `TRE_SM_SLOW_TIMEOUT_SECONDS`） | 240 / 30 |
 | `TRE_SM_UNROUTABLE_TIMEOUT_S` / `TRE_SM_DRAIN_STALE_GRACE_S` | SM env | 30 / 30 |
 | `TRE_SM_ASYNC_OPS` | SM env：target / power 接受 `?async=1`，返回 202 + operation id（§3.4）；关时 `?async=1` 被忽略 | 关 |
-| `TRE_SM_ASYNC_LOCK_WAIT_S` / `_HEARTBEAT_S` / `_ORPHAN_AFTER_S` / `_MAX_RECORDS` | SM env | 120 / 5 / 60 / 500 |
+| `TRE_SM_ASYNC_LOCK_WAIT_S` / `_HEARTBEAT_S` / `_ORPHAN_AFTER_S` / `_MAX_RECORDS` / `_MAX_CLOCK_SKEW_S` | SM env | 120 / 5 / 60 / 500 / 5 |
 | `TRE_SM_CALL_DRAIN` | controller env：每个 sleep 带 `drain_s`（commit 带预算，其余 0）；需要 SM 开 HIDE | 关 |
 | `TRE_SAFESCALE_COMMIT_DRAIN_{FACTOR,MIN_S,MAX_S,DEFAULT_S}` | controller env（commit 预算 = clamp(FACTOR·p95_e2e, MIN, MAX)，无 p95 用 DEFAULT） | 2 / 10 / 120 / 30 |
 | `TRE_SM_ASYNC` | controller env：异步派发 + 轮询（§3.5）；SM 没开 `TRE_SM_ASYNC_OPS` 时自动退化为同步 | 关 |
 | `TRE_SM_ASYNC_POLL_S` / `_OP_TIMEOUT_S` / `_MAX_POLLS_PER_TICK` / `_AUDIT_ON_FAILURE` | controller env | 1 / 600 / 8 / true |
+| `TRE_SM_ONESHOT_RETRY_S` / `TRE_SM_ROUTABLE_TIMEOUT_S` | controller env（只在 ASYNC 或 CALL_DRAIN 开时的派发路径上用） | 120 / 45 |
 
-**组合约束**：sidecar ⇒ HIDE；`drain_s>0`（含 controller `TRE_SM_CALL_DRAIN` 的 commit 预算、SM 默认排空）⇒ HIDE；controller `TRE_SM_ASYNC` 只有配 SM `TRE_SM_ASYNC_OPS` 才真正异步；`TRE_SM_ASYNC_OPS` 不依赖 HIDE（HIDE 关时 worker 跑 legacy 路径，没有 draining 阶段，同模型操作纯排队）。
+**组合约束**：非零默认排空 ⇒ HIDE + `TRE_SM_ALLOW_DEFAULT_DRAIN=1`；`TRE_SM_ASYNC_OPS` ⇒ SM 与 Redis 时钟偏差 ≤ 5 s（否则自动不启用），建议 SM pin 到 node10 与 controller 同节点；sidecar ⇒ HIDE；`drain_s>0`（含 controller `TRE_SM_CALL_DRAIN` 的 commit 预算、SM 默认排空）⇒ HIDE；controller `TRE_SM_ASYNC` 只有配 SM `TRE_SM_ASYNC_OPS` 才真正异步；`TRE_SM_ASYNC_OPS` 不依赖 HIDE（HIDE 关时 worker 跑 legacy 路径，没有 draining 阶段，同模型操作纯排队）。
 
 ## 9. 上线步骤（需用户确认，且须在标定 M 收口之后，plan §13）
 
@@ -353,6 +383,9 @@ v2 replayer 不看 `finish_reason`，所以这类请求目前被记成成功（p
    - **controller 逐次排空**：滚 controller 镜像，加 `TRE_SM_CALL_DRAIN=true`。观察 SafeScale commit 的 `drain_budget_s` / `drained_s` / `interrupted`，以及其余 sleep 的 `drain_budget_source=call`、`drained=false`。
    - **异步**：SM 加 `TRE_SM_ASYNC_OPS=true`（此时 controller 不开也无影响），手工 `curl -X PUT ...?async=1` 验一次 202 + `GET /v2/operations/{id}`；再给 controller 加 `TRE_SM_ASYNC=true`，观察 `sm_async_op_done` 日志的延迟分布、`op_stats()`、有没有 `op_timeout` / `dependency_failed`，并确认 commit 排空期间其他模型的动作照常派发。
    - 回滚顺序反过来：先关 controller 的 `TRE_SM_ASYNC`，再关 SM 的 `TRE_SM_ASYNC_OPS`（SM 先关的话 controller 只是退化为同步，也安全）。
+   - 开 `TRE_SM_ASYNC_OPS` 前：确认 SM 调度在 node10（与 controller 同节点）、NTP 正常；SM 启动日志没有 "TRE_SM_ASYNC_OPS disabled"。
+   - **supersede（M3）验收**：制造一次 commit 排空（commit 预算调大到 60 s）期间让同模型进入 CRITICAL，确认日志出现 `sm_async_op_superseded`、SM 记录里旧操作 `abandoned_reclaimed`、新操作 `reclaimed=[该 binding]`，且没有多余的 wake / create。
+   - **重启接管（M4）验收**：commit 排空中重启 controller pod，确认日志 `sm_async_op_adopted`，该模型在操作结束前不被重复规划。
 3. **canary（单 pod）**：
    - 用 `--reissue-sidecar` 渲染到 /tmp。只对 1 个空闲的 7b binding 应用它的 Deployment，同时 apply ConfigMap，并确认 SM 不会在 canary 期间迁移这个 binding。
    - 在该 pod 上确认 `/health`、`/metrics`、`/is_sleeping` 经代理正常，`/tre-reissue/state` 正常。
@@ -376,7 +409,10 @@ v2 replayer 不看 `finish_reason`，所以这类请求目前被记成成功（p
   - SM 重启恢复只用构造的孤儿记录测过，没真杀过 SM pod；孤儿判定依赖 wall clock（心跳 60 s）。
   - controller 的 planner 容量核算（`with_pending_ops`）对 model 级扩容的占位槽是近似（SM 可能选别的槽），最多让一个 poll 周期内的规划偏保守。
   - 同步模式开 `TRE_SM_CALL_DRAIN` 时 profiler 不记 `dispatch` 事件（只影响 profiling 数据）。
-  - controller 不主动 supersede 自己的活跃操作：模型在操作结束前一直 inflight；一次 commit 排空（≤120 s）期间该模型本身不会被重新规划。SM 的 latest-wins 是给其他调用方的安全网。
+  - 只有 CRITICAL rescue 扩容能 supersede 同模型的活跃缩容（M3）；其他情况模型在操作结束前一直 inflight。
+  - 评审修复（H1–H3、M1–M4、L1–L4）都有先红后绿的单元测试，但同样只在 fake 上跑过：同步等锁对真实 Redis 锁租约的影响、重启接管时 SM 记录的 meta 能否完整还原、时钟偏差检查在真实 Redis 上的读数，都没验证。
+  - M4 接管只能还原 meta 里有的上下文：旧版 controller 派发的、或非 controller 调用方的操作只按 ±1 跟踪，不会派 follow-up。
+  - 同步等锁（H2）让 routable / defrag 等请求最长多挂 30 s。**组合风险**：SM 开了 HIDE 而 controller 两个开关都关时，controller 走 main 的旧路径，routable 超时仍是 5 s，SM 却可能等锁 30 s，controller 会先报超时、SM 随后照样执行（操作幂等，但 controller 记成失败）。这种组合下应把 `TRE_SM_SYNC_LOCK_WAIT_S` 设到 4 s 以下，或同时打开 controller 的 `TRE_SM_CALL_DRAIN`。
   - `op_timeout`（600 s）后 controller 放开该模型，但 SM 那边的操作可能还在跑；此时新的动作由 SM 的每模型规则排队 / 取代。
 
 - 集群内调 `/tokenize` + `/detokenize` 渲染 DeepSeek-R1 prompt 的往返一致性（特殊 token 文本回解析成单个 token、没有重复 BOS）只在 fake 上测过，canary 时需在真 pod 上核对一次：比较 `/tokenize` 前后的 token 数。
