@@ -376,7 +376,7 @@ async def test_new_request_while_sleeping_is_forwarded_to_gateway():
         assert fwd["body"] == completion_body(6)
         assert h.a.generation_requests() == []
         async with h.http.post(h.url("/v1/completions"), json=completion_body(6),
-                               headers={"X-TRE-Forward-Hops": "3"}) as resp:
+                               headers={"X-TRE-Forward-Hops": "5"}) as resp:
             assert resp.status == 503
         assert h.sidecar.metrics.forward == {"ok": 1, "hop_limit": 1}
 
@@ -612,4 +612,19 @@ def test_sidecar_script_only_needs_stdlib_and_aiohttp():
         elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
             roots.add(node.module.split(".")[0])
     stdlib = set(sys.stdlib_module_names)
-    assert {r for r in roots if r not in stdlib} <= {"aiohttp"}
+    assert {r for r in roots if r not in stdlib} <= {"aiohttp", "uvloop"}  # uvloop: optional
+
+
+@pytest.mark.asyncio
+async def test_bounced_request_backs_off_before_forwarding_again():
+    async with Harness(forward_backoff_s=0.1) as h:
+        await h.sleep()
+        loop = asyncio.get_running_loop()
+        start = loop.time()
+        async with h.http.post(h.url("/v1/completions"), json=completion_body(2),
+                               headers={"X-TRE-Forward-Hops": "3"}) as resp:
+            assert resp.status == 200
+            await resp.read()
+        assert loop.time() - start >= 0.4  # 0.1 * 2 ** (3 - 1)
+        (fwd,) = h.b.generation_requests()
+        assert fwd["headers"]["X-TRE-Forward-Hops"] == "4"

@@ -142,6 +142,11 @@ class Config:
     enabled: bool = True
     forward_while_sleeping: bool = True
     max_depth: int = 3
+    #: A request that keeps landing on sleeping pods (the gateway still routes to a pod
+    #: that is being put to sleep without drain) is bounced at most this many times, with
+    #: exponential backoff starting at forward_backoff_s from the second hop on.
+    max_forward_hops: int = 5
+    forward_backoff_s: float = 0.25
     #: "render": chat continued as a completion over vLLM's own rendering of the chat
     #: prompt (exact context); "continue_final_message": chat continued as a chat request
     #: with the partial answer as the final assistant message.
@@ -171,6 +176,8 @@ class Config:
             enabled=_truthy(env.get("TRE_REISSUE_ENABLED"), True),
             forward_while_sleeping=_truthy(env.get("TRE_REISSUE_FORWARD_WHILE_SLEEPING"), True),
             max_depth=max_depth,
+            max_forward_hops=int(env.get("TRE_REISSUE_MAX_FORWARD_HOPS", "5")),
+            forward_backoff_s=float(env.get("TRE_REISSUE_FORWARD_BACKOFF_S", "0.25")),
             chat_mode=chat_mode,
             connect_timeout_s=float(env.get("TRE_REISSUE_CONNECT_TIMEOUT_S", "6")),
             stuck_grace_s=float(env.get("TRE_REISSUE_STUCK_GRACE_S", "0.2")),
@@ -290,6 +297,9 @@ def split_events(buffer: bytes) -> tuple[list[bytes], bytes]:
 
 def event_data(event: bytes) -> bytes | None:
     """The joined ``data:`` payload of one event, or None for a comment-only event."""
+    # Fast path: vLLM writes exactly one "data: <json>" line per event.
+    if event.startswith(b"data: ") and event.count(b"\n") == 2 and b"\r" not in event:
+        return event[6:-2]
     parts = []
     for line in event.split(b"\n"):
         line = line.rstrip(b"\r")
@@ -694,6 +704,7 @@ class ReissueSidecar:
             "local_inflight": len(self.state.inflight),
             "gateway_url": self.cfg.gateway_url,
             "max_depth": self.cfg.max_depth,
+            "max_forward_hops": self.cfg.max_forward_hops,
         }
 
     # -------------------------------------------------------------- plain proxy
@@ -845,13 +856,17 @@ class ReissueSidecar:
 
     async def _forward_while_sleeping(self, request: web.Request, body: bytes) -> web.StreamResponse:
         hops = _int_header(request.headers.get(HOPS_HEADER))
-        if hops >= self.cfg.max_depth:
+        if hops >= self.cfg.max_forward_hops:
             self.metrics.count_forward("hop_limit")
             return web.json_response(
                 {"error": {"message": "tre-reissue sidecar: engine sleeping and forward hop limit reached",
                            "type": "ServiceUnavailable", "code": 503}},
                 status=503,
             )
+        if hops > 0:
+            # Bounced back to a sleeping pod: give the routable label / gateway pod cache
+            # time to catch up before trying again.
+            await asyncio.sleep(min(self.cfg.forward_backoff_s * 2 ** (hops - 1), 5.0))
         headers = self._gateway_headers(request, body_model=_body_model(body))
         headers[HOPS_HEADER] = str(hops + 1)
         depth = request.headers.get(DEPTH_HEADER)
@@ -1581,6 +1596,12 @@ def build_app(cfg: Config) -> web.Application:
 
 
 def main() -> None:
+    try:  # present in the vLLM image; optional
+        import uvloop
+
+        uvloop.install()
+    except ImportError:
+        pass
     cfg = Config.from_env()
     _log({"event": "tre_reissue_start", "model": cfg.model, "pod": cfg.pod_name, "listen": cfg.listen_port,
           "upstream": cfg.upstream_url, "gateway": cfg.gateway_url, "enabled": cfg.enabled,
