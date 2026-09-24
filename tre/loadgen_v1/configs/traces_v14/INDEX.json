@@ -1,0 +1,17 @@
+{
+  "version": "trace_v14",
+  "parent_version": "trace_v13",
+  "notes": [
+    "Final validated configs: TRE wins on ALL 3 models for each trace.",
+    "Real_code: dsllama-8b/7b@5x, dsqwen-14b@2.5x (43k reqs, ~60 RPS mean)",
+    "Real_conv: all models@4x (45k reqs, ~63 RPS mean)",
+    "Spike: input=1000/output=600, total_load=56 (5k reqs, spike pattern)",
+    "All experiments include 10s pod warmup after scale-to-1.",
+    "TRE advantage: Real_code -75% E2E p95, Real_conv -48%, Spike -24%."
+  ],
+  "workloads": [
+    "Real_code_2024_slice_a_tok70",
+    "Real_conv_2023_slice_a_tok70",
+    "Simultaneous_spike_ramp_twice_tps1o2"
+  ]
+}

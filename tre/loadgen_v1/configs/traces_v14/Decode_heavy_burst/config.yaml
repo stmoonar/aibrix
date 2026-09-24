@@ -1,0 +1,58 @@
+custom_load_test:
+  duration_seconds: 720
+  gateway_endpoint: "http://localhost:8888"
+  generate_mode: "custom"
+  output:
+    base_dir: "./output/6traces"
+    sub_dir_name: "Decode_heavy_burst"
+    files:
+      load_timeline_rps: "load_timeline_rps.json"
+      load_timeline_token_rate: "load_timeline_token_rate.json"
+      trace_data: "traces.json"
+      trace_plots: "traces.png"
+      performance_metrics: "performance_metrics.json"
+      performance_plots: "plot_analysis/"
+  random_seed: 6105
+  client:
+    api_key: "dummy"
+    timeout: 300.0
+    enable_streaming: true
+    log_level: "INFO"
+    routing_algorithm: "least-gpu-cache"
+    process_count: 8
+    max_coroutines_per_process: 100
+    task_batch_window: 5.0
+    load_monitor_interval: 1.0
+  models:
+    - name: "dsllama-8b"
+      modelscope_url: "deepseek-ai/DeepSeek-R1-Distill-Llama-8B"
+      max_tokens: 300
+    - name: "dsqwen-7b"
+      modelscope_url: "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
+      max_tokens: 300
+    - name: "dsqwen-14b"
+      modelscope_url: "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B"
+      max_tokens: 300
+  load_mode: "rps"
+  total_load: 36
+  stable_period:
+    min_duration: 30
+    max_duration: 60
+  transition_period:
+    min_duration: 5
+    max_duration: 15
+  noise:
+    enabled: false
+    amplitude: 0.0
+    frequency: 0.3
+    time_offset_range: 0.0
+    noise_factor: 0.0
+  custom_trace_json: "trace.json"
+  input_token_config:
+    min_length: 450
+    max_length: 450
+    distribution: "normal"
+    mean: 450
+    std: 0
+  analysis:
+    percentiles: [50, 70, 90, 99]
