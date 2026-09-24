@@ -80,14 +80,14 @@ def test_tre_v2_overlay_declares_components_and_independent_redis() -> None:
     sm = _load_yaml(overlay / "service-manager.yaml")
     ui = _load_yaml(overlay / "ui.yaml")
 
-    assert _image(controller) == "tre-v2-controller:20260710-ca61e485"
-    assert _image(sm) == "tre-v2-service-manager:20260725-777aca37"
+    assert _image(controller) == "tre-v2-controller:20260924-2caa0514"
+    assert _image(sm) == "tre-v2-service-manager:20260924-2caa0514"
     sm_container = sm["spec"]["template"]["spec"]["containers"][0]
     assert sm_container["readinessProbe"]["httpGet"] == {
         "path": "/healthz",
         "port": "http",
     }
-    assert _image(ui) == "tre-v2-ui:20260725-1420d762"
+    assert _image(ui) == "tre-v2-ui:20260924-2caa0514"
     assert "latest" not in "\n".join([_image(controller), _image(sm), _image(ui)]).lower()
     gateway_plugins = next(
         d
