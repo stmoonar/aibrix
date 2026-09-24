@@ -76,25 +76,63 @@ v2 replayer 不看 `finish_reason`，所以这类请求目前被记成成功（p
 - SM 运行时创建 Deployment（defrag、create）走的是 `build_model_deployment`，读的是**同一个** registry key，所以迁移出来的 binding 和渲染出来的完全一致（有测试保证）。
 - CLI 参数 `--reissue-sidecar` / `--reissue-gateway-url` 只用于 canary 渲染。正式上线必须改 registry，否则 SM 迁移出来的 pod 不会带 sidecar。
 
-### 3.3 SM 统一排空（`TRE_SM_DRAIN_BEFORE_SLEEP`，默认关）
+### 3.3 SM 统一 hide / 排空（`TRE_SM_HIDE_BEFORE_SLEEP`、`TRE_SM_DRAIN_BEFORE_SLEEP`，默认都关）
 
-- 打开后，**所有** sleep 路径都走同一流程：
-  - hide：`routable=false` 并写 hidden 注解。
-  - `wait_pod_unroutable`：超时不致命，会记下来。
-  - 有界排空：轮询 vLLM `/metrics`，直到 `running+waiting==0`。
-    - 上限 `T = clamp(2·p95_e2e, 30 s, 300 s)`。
-    - p95 来自 vLLM 的 e2e 累计直方图；拿不到时用 `TRE_SM_DRAIN_DEFAULT_S`，默认 60。
-    - 指标不可用时不盲等，直接 sleep。
-  - 然后调 `/sleep`。
-- 覆盖的路径：
-  - `put_model_target`：先把要睡的 binding 全部 hide，让排空窗口重叠。
-  - binding power，即 safescale commit。
-  - defrag：保留原有的 hide + wait，不重复等待。
-  - startup admission。
-  - fleet repair。
-- 截止时仍在运行的请求数记为 interrupted，写入 operation journal（phase `sleep_drained`），并打一行 JSON 日志 `tre_sm.drain`。
-- `/sleep` 响应的 abort 快照**始终**记入内存 ring：容量 256 条，接口 `GET /v2/sleep-audit`。开关关闭时不写 redis、不写 journal、不增加任何网络调用。
-- 其他参数：`TRE_SM_DRAIN_MIN_S`、`TRE_SM_DRAIN_MAX_S`、`TRE_SM_DRAIN_POLL_S`。
+**开关（评审 H3）**：
+- `TRE_SM_HIDE_BEFORE_SLEEP=true`：每次 `/sleep` 前先 hide pod（routable=false 加 hidden 注解），等它退出可路由集合，`/sleep` 请求带 `X-TRE-Hidden: 1`。
+- `TRE_SM_DRAIN_BEFORE_SLEEP=true`：在 HIDE 之上，再等 vLLM 的 running+waiting 归零，上限 `clamp(2·p95_e2e 或 TRE_SM_DRAIN_DEFAULT_S, 30 s, 300 s)`。
+- **启动即失败（fail-closed）**：
+  - 开了 DRAIN 却没开 HIDE。
+  - registry 里 `reissue_sidecar.enabled=true` 却没开 HIDE（`check_reissue_coupling`，在 `server.create_app` 连 Redis 和 k8s 之前检查，`ServiceManagerV2.__init__` 里再查一次）。
+  - 开了 HIDE，但 vLLM 客户端的 `sleep()` 不支持 `hidden=`。
+- 与 sidecar 的 409 一起，形成双保险：配置错了，要么 SM 起不来，要么 sidecar 拒绝 `/sleep`。
+
+**三段式，排空期间不持全局写锁（评审 H1）**，适用于 `put_model_target` 和 `put_binding_power`：
+1. **第一段，持锁**：
+   - 先收尾过期标记。
+   - 规划时，draining 的 binding 不算“在服务”的副本。扩容时优先**回收** draining 的 binding：删掉标记、取消 hide，不另外唤醒别的。
+   - 本次调用里的 wake/create 都在这一段做完。实际上同一次调用不会既有 sleep 又有 wake，所以 wake 不会排在排空后面。
+   - 对每个要睡的 binding：先写 draining 标记到 `tre:v2:sm:draining`（fencing token、instance、截止时间、`prior_hidden`；写入受 writer fence 校验），再写 hide 注解，并记 journal（phase `sleep_draining`）。
+   - 这些 binding 在 legacy 状态里保持 `awake=True, hidden=True`，GPU lease 也不释放，因此 SlotAllocator、feasible-wake、create headroom、controller planner 都把这块 GPU 当作被占用（**draining 不算空闲容量**）。
+2. **第二段，释放锁**：本次调用要睡的所有 binding **并行**（每个一个线程）等待不可路由，开了 DRAIN 再等排空。如果标记的 token 消失（被回收或被恢复），就提前结束。
+3. **第三段，重新取锁**：`OperationBusy` 时重试，直到截止时间减去 reserve/2。
+   - token 不见了：记为 `abandoned_reclaimed`，由新的所有者负责。
+   - 期望状态已不是 sleeping：恢复可路由，记为 `abandoned_target_changed`。
+   - 第二段出错：回滚为 awake 并可路由。
+   - 其余情况：并行调 `/sleep`（带头），再用 `/is_sleeping` 核实物理状态。确认已睡 → 标为 sleeping 并释放 lease；确认仍醒着 → **回滚**为 awake、可路由，desired 也改回 awake；状态未知 → 保持 hidden（记为 `sleep_unverified`，fail-closed），交给 reconcile 处理。
+   - 所有结果先落库（legacy 状态、标记、desired、journal phase `sleep_committed`），再对失败的情况抛出 `SleepCommitFailed`（HTTP 400）。评审 M5：不会再出现“hidden 又醒着”而无人处理的状态。
+
+**单一截止时间（评审 M4）**：
+- 每次调用只有一个截止时间 `TRE_SM_SLEEP_DEADLINE_S=240`，小于 controller 的 `TRE_SM_SLOW_TIMEOUT_SECONDS=300`。
+- 第二段的窗口到截止时间减 `TRE_SM_SLEEP_COMMIT_RESERVE_S`（30 s）为止，所有 binding 的 unroutable 等待和排空都在这个窗口内。
+- 到期仍没排空的，照常 sleep，并记下最后一次观测到的 running/waiting。
+
+**controller 语义**：
+- 接口保持同步，controller 不用改。代价是 controller 的 action_queue 串行派发，一次最长约 240 s 的排空仍会推迟它的其他动作，但不再阻塞其他 SM 操作（不再返回 409）。
+- 另一种做法是返回 202 + operation id，需要改 controller：轮询 `/v2/operations/{id}`，在完成前把该模型保持为 inflight，并去掉 slow timeout。这留作后续。
+- 只有开了 HIDE 时，`/v2/state` 才有以下变化：每个 binding 多一个 `draining` 字段，顶层列出 draining 标记；`models[m].awake` **不含** draining，另给 `draining` 计数。原因是 `sm_client.scale_model` 用 `awake + delta` 算下一个目标，这样算，+1 会回收正在 draining 的 binding，−1 也不会重复下发。
+
+**其他路径**：
+- `put_model_routable` 跳过 draining 的 binding，controller 的 UnhideAction 不会把它们放回路由。
+- defrag 遇到 draining 的 binding 时拒绝，原因 `binding_draining`。
+- fleet 漂移检测跳过 draining。
+- **内联路径**（defrag 迁移、startup admission/converge、fleet repair）也做 hide → 等待 → 排空 → 带头 sleep，但仍在各自的锁里执行，受同一截止时间约束。这些路径很少触发，而且 admission/converge 睡的是刚启动、没有流量的 pod；失败时，只要确认 pod 仍醒着，就恢复 hide 之前的注解。
+
+**过期标记恢复**：
+- 由 supervisor 每个 tick、`reconcile()`、以及每次三段式调用开头触发。
+- 满足任一条件即视为过期：超过截止时间 + `TRE_SM_DRAIN_STALE_GRACE_S`（30 s）；或者是本实例写的标记，但已没有调用在处理它。
+- 处理原则：desired 仍为 sleeping，就补做 sleep；已是 awake，就取消 hide。
+
+**审计（评审 M1）**：
+- `/sleep` 响应的快照**始终**记入内存 ring（256 条，`GET /v2/sleep-audit`）。
+- `[]` 记为 `aborted_count=None`；原始长度写在 `aborted_count_reported`，并标 `aborted_count_source=vllm_sleep_response_unreliable`。
+- SM 侧的估计是 `interrupted_estimate`（排空最后一次观测到的 running+waiting）。
+- 权威计数是 sidecar 的 `tre_reissue_*` 指标。
+- 开关全关时，只做内存 append，不写 redis、不写 journal、不增加网络调用。
+
+**开关全关时与 main 等价**：
+- `put_model_target` 和 `put_binding_power` 分派到 `_legacy` 方法，方法体与 main 的 AST 完全一致（已核对）。
+- 不写标记，不带请求头，`/v2/state` 的结构不变（有测试）。
 
 ## 4. 语义
 
@@ -226,13 +264,16 @@ v2 replayer 不看 `finish_reason`，所以这类请求目前被记成成功（p
 | `TRE_REISSUE_MAX_FORWARD_HOPS` / `_FORWARD_BACKOFF_S` / `_STUCK_GRACE_S` | sidecar env | 5 / 0.25 / 0.5 |
 | `TRE_REISSUE_REQUIRE_HIDDEN` | sidecar env（manifest 固定 true） | true |
 | `TRE_REISSUE_PROBE_INTERVAL_S` / `_PROXY_TIMEOUT_S` / `_CONTROL_TIMEOUT_S` | sidecar env | 2 / 60 / 300 |
-| `TRE_SM_DRAIN_BEFORE_SLEEP` | SM Deployment env | 关 |
+| `TRE_SM_HIDE_BEFORE_SLEEP` | SM Deployment env（开 reissue sidecar 时必须开，否则 SM 启动失败） | 关 |
+| `TRE_SM_DRAIN_BEFORE_SLEEP` | SM Deployment env（需要先开 HIDE） | 关 |
 | `TRE_SM_DRAIN_{DEFAULT,MIN,MAX,POLL}_S` | SM env | 60 / 30 / 300 / 1 |
+| `TRE_SM_SLEEP_DEADLINE_S` / `TRE_SM_SLEEP_COMMIT_RESERVE_S` | SM env（截止时间必须小于 controller 的 `TRE_SM_SLOW_TIMEOUT_SECONDS`） | 240 / 30 |
+| `TRE_SM_UNROUTABLE_TIMEOUT_S` / `TRE_SM_DRAIN_STALE_GRACE_S` | SM env | 30 / 30 |
 
 ## 9. 上线步骤（需用户确认，且须在标定 M 收口之后，plan §13）
 
 1. **合并**：本分支与 scaling 分支合成一个变更集。`make check` 必须通过；`make manifests` 在未打开开关时应无 diff。
-2. **SM**：按 CLAUDE.md 流程 build 并滚动 SM 镜像（两处 tag 都要改），env 里加 `TRE_SM_DRAIN_BEFORE_SLEEP=true` 和 `TRE_SM_DRAIN_MAX_S=240`。先不开 sidecar，单独观察排空：`/v2/sleep-audit` 里 `drained=true` 的比例、`waited_s` 的分布。
+2. **SM**：按 CLAUDE.md 流程 build 并滚动 SM 镜像（两处 tag 都要改）。env 先只加 `TRE_SM_HIDE_BEFORE_SLEEP=true`，观察 `/v2/sleep-audit` 与 `/v2/state` 的 draining 字段；再加 `TRE_SM_DRAIN_BEFORE_SLEEP=true`，观察 `drained=true` 的比例和 `waited_s` 的分布，并确认排空期间 controller 的其他 SM 调用不再出现 409。先不开 sidecar。
 3. **canary（单 pod）**：
    - 用 `--reissue-sidecar` 渲染到 /tmp。只对 1 个空闲的 7b binding 应用它的 Deployment，同时 apply ConfigMap，并确认 SM 不会在 canary 期间迁移这个 binding。
    - 在该 pod 上确认 `/health`、`/metrics`、`/is_sleeping` 经代理正常，`/tre-reissue/state` 正常。
@@ -247,6 +288,10 @@ v2 replayer 不看 `finish_reason`，所以这类请求目前被记成成功（p
 6. **回滚**：registry 改回 `enabled: false`，`make manifests`，同步 ConfigMap，`--staggered` 重滚。SM 排空通过 env 关闭即可。
 
 ## 10. 未决 / 未核实
+
+- draining 标记的 Lua 写脚本只在 fake redis 上测过，没在真实 Redis 上跑过。
+- controller 的 HiddenOrphanDetector 直接读 SM 状态哈希：draining 的 binding（awake 且 hidden）要满 600 s 才会告警，而排空截止时间是 240 s，按设计不会触发，但没实测。
+- 同步 target 调用最长约 240 s，会推迟 controller action_queue 里的其他动作；要彻底解决需要改成 202 + operation id，同时改 controller（见 §3.3）。
 
 - 集群内调 `/tokenize` + `/detokenize` 渲染 DeepSeek-R1 prompt 的往返一致性（特殊 token 文本回解析成单个 token、没有重复 BOS）只在 fake 上测过，canary 时需在真 pod 上核对一次：比较 `/tokenize` 前后的 token 数。
 - 续发请求不带原 `X-Request-Id`（sidecar 已丢弃），由 Envoy 或插件重新生成（未在集群核实）。续发 chunk 的 id 由 sidecar 改写回原值，所以客户端看不到差异。
