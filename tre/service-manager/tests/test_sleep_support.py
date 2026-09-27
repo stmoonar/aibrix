@@ -101,18 +101,23 @@ def test_clock_skew_check_survives_redis_errors():
 
 
 class Truth:
-    def __init__(self, used, *, missing=False):
+    def __init__(self, used, *, missing=False, total=None):
         self.used = list(used)  # successive payloads for GPU-0
         self.missing = missing
+        self.total = total
 
     def node_truth(self, *, node):
         if self.missing:
             return None
         value = self.used.pop(0) if len(self.used) > 1 else self.used[0]
-        return NodeGpuTruth(node=node, used_by_uuid={"GPU-0": value, "GPU-1": 500})
+        totals = {} if self.total is None else {"GPU-0": self.total, "GPU-1": self.total}
+        return NodeGpuTruth(
+            node=node, used_by_uuid={"GPU-0": value, "GPU-1": 500}, total_by_uuid=totals
+        )
 
 
-def _wake_service(truth, *, require=True):
+def _wake_service(truth, *, require=True, **config):
+    config = config or {"wake_max_used_mib": 8192}
     sleeping = pod("pod-a", "m1", (0,), ip="10.0.0.1", state="sleeping")
     runtime = FakeRuntime([sleeping])
     vllm = FakeVllm()
@@ -120,7 +125,7 @@ def _wake_service(truth, *, require=True):
     store = StateStore(LegacyRedis())
     store.save([binding_of(sleeping)], expected_version=0)
     service = ServiceManagerV2(
-        registry(wake_max_used_mib=8192, wake_truth_wait_s=5.0),
+        registry(wake_truth_wait_s=5.0, **config),
         store,
         runtime_ops=runtime,
         vllm_ops=vllm,
@@ -163,6 +168,45 @@ def test_wake_fails_closed_without_gpu_truth_unless_explicitly_permissive():
     permissive, vllm2 = _wake_service(Truth([0], missing=True), require=False)
     permissive.put_binding_power("pod-a", awake=True)
     assert ("wake_up", "10.0.0.1") in vllm2.calls
+
+
+def test_wake_threshold_is_a_fraction_of_the_gpu_total_by_default():
+    # 40 GiB GPU, default fraction 0.2 -> limit 8192 MiB.
+    ok, vllm = _wake_service(Truth([8000], total=40960), wake_max_used_fraction=0.2)
+    ok.put_binding_power("pod-a", awake=True)
+    assert ("wake_up", "10.0.0.1") in vllm.calls
+
+    busy, vllm2 = _wake_service(Truth([8500], total=40960), wake_max_used_fraction=0.2)
+    with pytest.raises(WakeConflict, match="wake limit 8192 MiB"):
+        busy.put_binding_power("pod-a", awake=True)
+
+    # An 80 GiB GPU gets a proportionally larger limit (16384 MiB).
+    big, vllm3 = _wake_service(Truth([12000], total=81920), wake_max_used_fraction=0.2)
+    big.put_binding_power("pod-a", awake=True)
+    assert ("wake_up", "10.0.0.1") in vllm3.calls
+
+
+def test_relative_wake_threshold_fails_closed_without_a_total():
+    service, vllm = _wake_service(Truth([100]), wake_max_used_fraction=0.2)
+    with pytest.raises(WakeConflict, match="reports no total memory"):
+        service.put_binding_power("pod-a", awake=True)
+    assert not any(call[0] == "wake_up" for call in vllm.calls)
+
+
+def test_redis_gpu_truth_parses_total_memory():
+    import json as _json
+
+    from tre_sm.gpu_truth import RedisGpuTruth
+
+    class R:
+        def get(self, key):
+            return _json.dumps(
+                {"gpus": [{"uuid": "GPU-0", "used_mib": 10, "total_mib": 40960}, {"uuid": "GPU-1", "used_mib": 5}]}
+            )
+
+    truth = RedisGpuTruth(R()).node_truth(node="n")
+    assert truth.total_mib("GPU-0") == 40960 and truth.total_mib("GPU-1") is None
+    assert truth.used_mib("GPU-1") == 5
 
 
 class PodApi:

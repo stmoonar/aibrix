@@ -9,7 +9,7 @@ from typing import Iterable
 import yaml
 
 from tre_common.bindings import MAX_BOUND_PER_GPU, feasible_slots, render_binding_set  # noqa: F401 (re-exported)
-from tre_common.registry import ModelSpec, NodeSpec, Registry, load_registry
+from tre_common.registry import DEFAULT_ROUTE_TIMEOUT_S, ModelSpec, NodeSpec, Registry, load_registry
 
 ROUTABLE_LABEL = "tre.aibrix.io/routable"
 GPU_UUIDS_ANNOTATION = "tre.aibrix.io/gpu-uuids"
@@ -75,7 +75,12 @@ def build_httproutes(
     gateway_name: str = GATEWAY_NAME,
 ) -> list[dict]:
     return [
-        build_model_httproute(model.name, gateway_namespace=gateway_namespace, gateway_name=gateway_name)
+        build_model_httproute(
+            model.name,
+            gateway_namespace=gateway_namespace,
+            gateway_name=gateway_name,
+            request_timeout_s=registry.gateway().route_timeout_s,
+        )
         for model in registry.models()
     ]
 
@@ -86,7 +91,10 @@ def build_model_httproute(
     model_namespace: str = "default",
     gateway_namespace: str = GATEWAY_NAMESPACE,
     gateway_name: str = GATEWAY_NAME,
+    request_timeout_s: float = DEFAULT_ROUTE_TIMEOUT_S,
 ) -> dict:
+    """The model's HTTPRoute; ``request_timeout_s`` = registry gateway.route_timeout_s
+    (the same value caps the service-manager drain)."""
     service_name = _dns_name(model_name)
     labels = {MODEL_LABEL: model_name, "tre.aibrix.io/managed": "true"}
     return {
@@ -125,11 +133,19 @@ def build_model_httproute(
                         }
                         for path in HTTPROUTE_PATHS
                     ],
-                    "timeouts": {"request": "600s"},
+                    "timeouts": {"request": route_timeout_text(request_timeout_s)},
                 }
             ],
         },
     }
+
+
+def route_timeout_text(seconds: float) -> str:
+    """Gateway API duration of a route timeout in seconds (``150`` -> ``"150s"``)."""
+    value = float(seconds)
+    if value <= 0:
+        raise ValueError(f"route timeout must be positive, got {seconds!r}")
+    return f"{int(value)}s" if value.is_integer() else f"{int(round(value * 1000))}ms"
 
 
 def build_referencegrant(

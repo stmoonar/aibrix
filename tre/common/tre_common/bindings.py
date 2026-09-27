@@ -11,10 +11,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from tre_common.registry import ModelSpec, Registry
+from tre_common.registry import DEFAULT_MAX_BOUND_PER_GPU, ModelSpec, Registry
 
-#: At most this many bindings (sleeping or awake) may share one physical GPU.
-MAX_BOUND_PER_GPU = 3
+#: Default per-GPU binding budget; the live value is the registry's
+#: ``cluster.max_bound_per_gpu`` (``registry.topology().max_bound_per_gpu``).
+MAX_BOUND_PER_GPU = DEFAULT_MAX_BOUND_PER_GPU
 
 
 @dataclass(frozen=True)
@@ -48,8 +49,10 @@ def feasible_slots(registry: Registry, model: ModelSpec) -> list[tuple[str, tupl
 def render_binding_set(registry: Registry) -> list[BindingSpec]:
     """Every binding the registry declares, in manifest order.
 
-    Raises ValueError when a GPU would carry more than MAX_BOUND_PER_GPU bindings.
+    Raises ValueError when a GPU would carry more than ``cluster.max_bound_per_gpu``
+    bindings.
     """
+    budget = int(getattr(registry.topology(), "max_bound_per_gpu", MAX_BOUND_PER_GPU))
     bindings: list[BindingSpec] = []
     bound_counts: dict[tuple[str, int], int] = {}
     for model in registry.models():
@@ -57,10 +60,10 @@ def render_binding_set(registry: Registry) -> list[BindingSpec]:
             for gpu in gpu_ids:
                 key = (node_name, gpu)
                 bound_counts[key] = bound_counts.get(key, 0) + 1
-                if bound_counts[key] > MAX_BOUND_PER_GPU:
+                if bound_counts[key] > budget:
                     raise ValueError(
                         f"gpu bound budget exceeded for {node_name}/{gpu}: "
-                        f"{bound_counts[key]} > {MAX_BOUND_PER_GPU}"
+                        f"{bound_counts[key]} > {budget} (cluster.max_bound_per_gpu)"
                     )
             bindings.append(BindingSpec(model.name, node_name, tuple(gpu_ids)))
     return bindings

@@ -30,7 +30,10 @@ def test_absent_section_means_builtin_defaults():
     assert config.sleep.hard_cap_s == 150.0
     assert config.sleep.budgets_s == DEFAULT_SLEEP_BUDGETS_S
     assert set(DEFAULT_SLEEP_BUDGETS_S) == set(SLEEP_PATHS)
-    assert config.sleep.vllm_sleep_mode_param is True
+    assert config.sleep.vllm_sleep_mode_param == "auto"
+    assert config.sleep.fallback_no_plugin is False
+    assert config.sleep.gateway_min_instances == 1
+    assert config.wake_max_used_mib is None and config.wake_max_used_fraction == 0.2
 
 
 def test_hard_cap_defaults_to_the_gateway_route_timeout():
@@ -54,7 +57,7 @@ def test_overrides_and_soft_budget_resolution():
         }
     )
     sleep = config.sleep
-    assert sleep.vllm_sleep_mode_param is False
+    assert sleep.vllm_sleep_mode_param == "false"
     assert sleep.plugin_namespace == "gw" and sleep.plugin_label_selector is None
     assert sleep.soft_budget_s("urgent") == 12.0
     assert sleep.soft_budget_s("scale_down") == sleep.hard_cap_s  # null = hard cap only
@@ -79,7 +82,7 @@ def test_validate_flags_bad_service_manager_values():
     errors = Registry(ClusterTopology(nodes=()), [], service_manager=config).validate()
     assert "service_manager.sleep.ack_timeout_s must be positive" in errors
     assert "service_manager.sleep.budgets_s.urgent must be >= 0 or null" in errors
-    assert "service_manager.wake.max_used_mib must be positive" in errors
+    assert "service_manager.wake.max_used_mib must be positive or null" in errors
 
 
 def test_repo_registry_parses_and_documents_every_default():
@@ -107,3 +110,65 @@ def test_binding_set_is_registry_order_and_enforces_the_per_gpu_budget():
     crowded = Registry(topology, [_spec(f"m{i}", 1, 1) for i in range(MAX_BOUND_PER_GPU + 1)])
     with pytest.raises(ValueError, match="gpu bound budget exceeded"):
         render_binding_set(crowded)
+
+
+def test_sleep_mode_param_accepts_auto_and_booleans():
+    from tre_common.registry import parse_sleep_mode_param
+
+    assert parse_sleep_mode_param("auto") == "auto"
+    assert parse_sleep_mode_param(True) == "true"
+    assert parse_sleep_mode_param("no") == "false"
+    with pytest.raises(ValueError):
+        parse_sleep_mode_param("sometimes")
+
+
+def test_worst_case_sleep_call_must_fit_the_api_call_timeout():
+    config = ServiceManagerConfig()
+    assert config.worst_case_sleep_call_s() == 2 * 10 + 10 + 150 + 2 * 45 + 15
+    assert config.worst_case_sleep_call_s() < config.api_call_timeout_s
+
+    slow = parse_service_manager_config({"sleep": {"sleep_call_timeout_s": 90}})
+    errors = Registry(ClusterTopology(nodes=()), [], service_manager=slow).validate()
+    assert any("worst-case sleeping service-manager call is 375s" in e for e in errors)
+
+    from tre_common.registry import sleep_call_timeout_errors
+
+    assert sleep_call_timeout_errors(config, 300.0) == []
+    assert sleep_call_timeout_errors(config, 200.0, name="TRE_SM_SLOW_TIMEOUT_SECONDS")[0].endswith(
+        "the caller would time out mid-drain"
+    )
+
+
+def test_hard_cap_may_not_exceed_the_gateway_route_timeout():
+    from tre_common.registry import GatewayConfig, parse_gateway_config
+
+    config = parse_service_manager_config({"sleep": {"hard_cap_s": 200}})
+    errors = Registry(
+        ClusterTopology(nodes=()), [], service_manager=config, gateway=GatewayConfig(150)
+    ).validate()
+    assert any("must not exceed gateway.route_timeout_s" in e for e in errors)
+    assert parse_gateway_config(None).route_timeout_s == 150.0
+    assert parse_gateway_config({"route_timeout_s": 60}).route_timeout_s == 60.0
+
+
+def test_wake_limit_is_relative_with_an_optional_absolute_override():
+    relative = parse_service_manager_config({"wake": {"max_used_fraction": 0.25}})
+    assert relative.wake_limit_mib(40960) == 10240
+    assert relative.wake_limit_mib(None) is None  # total unknown: caller fails closed
+    absolute = parse_service_manager_config({"wake": {"max_used_mib": 4096}})
+    assert absolute.wake_limit_mib(81920) == 4096 and absolute.wake_limit_mib(None) == 4096
+    bad = parse_service_manager_config({"wake": {"max_used_fraction": 1.5}})
+    errors = Registry(ClusterTopology(nodes=()), [], service_manager=bad).validate()
+    assert "service_manager.wake.max_used_fraction must be in (0, 1]" in errors
+
+
+def test_max_bound_per_gpu_comes_from_the_registry(tmp_path):
+    from tre_common.registry import _parse_registry
+
+    topology = ClusterTopology(nodes=(NodeSpec("n", 1, (), ("a",)),), max_bound_per_gpu=1)
+    one = Registry(topology, [_spec("x", 1, 1), _spec("y", 1, 1)])
+    with pytest.raises(ValueError, match=r"1 \(cluster\.max_bound_per_gpu\)"):
+        render_binding_set(one)
+    raw = {"cluster": {"max_bound_per_gpu": 5, "nodes": []}, "models": []}
+    assert _parse_registry(raw).topology().max_bound_per_gpu == 5
+    assert _parse_registry({"cluster": {"nodes": []}}).topology().max_bound_per_gpu == MAX_BOUND_PER_GPU

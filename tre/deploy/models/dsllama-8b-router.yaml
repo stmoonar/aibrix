@@ -57,4 +57,4 @@ spec:
         type: PathPrefix
         value: /generatevideo
     timeouts:
-      request: 600s
+      request: 150s

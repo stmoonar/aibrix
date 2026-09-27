@@ -471,6 +471,7 @@ class K8sOps:
             model_namespace=self._namespace,
             gateway_namespace=self._route_namespace,
             gateway_name=self._gateway_name,
+            **self._route_timeout_kwargs(),
         )
         name = str(body["metadata"]["name"])
         try:
@@ -501,6 +502,13 @@ class K8sOps:
                 body={"metadata": {"labels": body["metadata"].get("labels", {})}, "spec": body["spec"]},
             )
         self._wait_httproute_accepted(name, timeout_s=timeout_s, interval_s=interval_s)
+
+    def _route_timeout_kwargs(self) -> dict:
+        """Registry gateway.route_timeout_s (the manifests use the same value)."""
+        gateway = getattr(self._registry, "gateway", None)
+        if not callable(gateway):
+            return {}
+        return {"request_timeout_s": gateway().route_timeout_s}
 
     def _wait_httproute_accepted(self, name: str, *, timeout_s: float, interval_s: float) -> None:
         deadline = time.monotonic() + timeout_s

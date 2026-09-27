@@ -1563,27 +1563,28 @@ class ServiceManagerV2:
         """Fail closed unless gpu-truth shows the binding's GPUs free enough to wake.
 
         Sleeping residents keep only a small footprint; an awake resident on the
-        same GPU (or a sleep leak) is far above ``wake_max_used_mib`` and would
-        make the wake OOM or double-book the GPU (the sleeping-capacity
-        deadlock). gpu-truth lags a sleep that just finished, so it is re-read
-        for up to ``wake_truth_wait_s`` before refusing.
+        same GPU (or a sleep leak) is far above the wake threshold (registry
+        ``service_manager.wake.max_used_fraction`` of the GPU's total memory, or
+        the absolute ``max_used_mib`` override) and would make the wake OOM or
+        double-book the GPU (the sleeping-capacity deadlock). gpu-truth lags a
+        sleep that just finished, so it is re-read for up to
+        ``wake_truth_wait_s`` before refusing.
         """
         if self._gpu_truth is None:
             return
-        limit = self._sm_config.wake_max_used_mib
         clock = self._sleep_clock or _default_sleep_clock()
         deadline = clock.monotonic() + self._sm_config.wake_truth_wait_s
         nodes = {node.name: node for node in self._registry.topology().nodes}
         node = nodes.get(binding.slot.node)
         while True:
-            problem = self._wake_headroom_problem(binding, node, limit)
+            problem = self._wake_headroom_problem(binding, node)
             if problem is None:
                 return
             if clock.monotonic() >= deadline:
                 raise WakeConflict(f"insufficient wake headroom: {problem}")
             clock.sleep(min(1.0, max(0.0, deadline - clock.monotonic())))
 
-    def _wake_headroom_problem(self, binding: Binding, node, limit: int) -> str | None:
+    def _wake_headroom_problem(self, binding: Binding, node) -> str | None:
         node_truth = self._gpu_truth.node_truth(node=binding.slot.node)
         if node_truth is None:
             if not self._require_gpu_truth:
@@ -1603,10 +1604,19 @@ class ServiceManagerV2:
                 if not self._require_gpu_truth:
                     continue
                 return f"gpu truth for {binding.slot.node}/{gpu_uuid} missing"
+            total = getattr(node_truth, "total_mib", None)
+            limit = self._sm_config.wake_limit_mib(total(gpu_uuid) if callable(total) else None)
+            if limit is None:
+                if not self._require_gpu_truth:
+                    continue
+                return (
+                    f"gpu truth for {binding.slot.node}/{gpu_uuid} reports no total memory "
+                    "(set service_manager.wake.max_used_mib to use an absolute threshold)"
+                )
             if used_mib > limit:
                 return (
                     f"{binding.binding_id}: {binding.slot.node}/{gpu_uuid} "
-                    f"used_mib={used_mib} > max_used_mib={limit}"
+                    f"used_mib={used_mib} > wake limit {limit} MiB"
                 )
         return None
 

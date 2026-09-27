@@ -512,7 +512,7 @@ class SleepPrimitive:
         in_flight = max(load.get("gateway_inflight") or 0, load.get("engine_load") or 0)
         forced = not drained
         forced_count = in_flight if forced else 0
-        if policy.vllm_sleep_mode_param:
+        if str(policy.vllm_sleep_mode_param).lower() != "false":
             mode: str | None = "wait" if drained else "abort"
         else:
             mode = None
