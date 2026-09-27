@@ -172,6 +172,24 @@ func (r *RoutingContext) PromptTokens() ([]int, error) {
 	return r.tokens, nil
 }
 
+// SetPromptTokens pre-populates the prompt token cache, e.g. for completions requests
+// whose prompt is already an array of token ids (TRE-PATCH P3-GW-010): PromptTokens and
+// PromptLength then report the ids as-is instead of tokenizing Message.
+func (r *RoutingContext) SetPromptTokens(tokens []int) {
+	r.tokens = tokens
+}
+
+// ResetTargetPod clears a target chosen by a synchronous router so the request can be
+// routed again (TRE-PATCH P3-GW-009: the chosen pod turned unroutable between candidate
+// listing and commit). Only safe after Route has returned, when no goroutine waits on
+// TargetPod().
+func (r *RoutingContext) ResetTargetPod() {
+	r.targetPodSet = make(chan struct{})
+	r.targetPod.Store(nilPod)
+	r.targetPort.Store(0)
+	r.lastError.Store(nil)
+}
+
 // PromptLength returns the length of the prompt of the request.
 func (r *RoutingContext) PromptLength() (int, error) {
 	tokens, err := r.PromptTokens()

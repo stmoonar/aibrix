@@ -18,6 +18,7 @@ package gateway
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"time"
@@ -35,8 +36,24 @@ import (
 	"github.com/vllm-project/aibrix/pkg/utils"
 )
 
+// HandleRequestBody routes one request body. It is the stream-less entry point (tests,
+// benchmarks): the inflight slot taken on the target pod is released before returning,
+// because without an ext_proc stream there is no request end to wait for. Process uses
+// handleRequestBody and holds the slot until the stream ends.
 func (s *Server) HandleRequestBody(ctx context.Context, routingCtx *types.RoutingContext, requestID string, req *extProcPb.ProcessingRequest, user utils.User) (*extProcPb.ProcessingResponse, string, bool, int64) {
+	resp, model, stream, term, ticket := s.handleRequestBody(ctx, routingCtx, requestID, req, user)
+	ticket.Release()
+	return resp, model, stream, term
+}
+
+// handleRequestBody is HandleRequestBody plus the inflight ticket (TRE-PATCH P3-GW-009) of
+// the routed request; the caller must Release it when the request ends. The ticket is nil
+// whenever no pod was committed (errors, HTTPRoute path).
+//
+//nolint:gocyclo
+func (s *Server) handleRequestBody(ctx context.Context, routingCtx *types.RoutingContext, requestID string, req *extProcPb.ProcessingRequest, user utils.User) (*extProcPb.ProcessingResponse, string, bool, int64, *treInflightTicket) {
 	var term int64 // Identify the trace window
+	var ticket *treInflightTicket
 
 	requestPath := routingCtx.ReqPath
 
@@ -56,14 +73,19 @@ func (s *Server) HandleRequestBody(ctx context.Context, routingCtx *types.Routin
 		// Parse multipart form data for audio endpoints
 		model, stream, errRes = parseMultipartFormData(requestID, contentType, body.RequestBody.GetBody())
 		if errRes != nil {
-			return errRes, model, stream, term
+			return errRes, model, stream, term, nil
 		}
 		message = "" // Audio requests don't have a text message for token counting
 	} else {
 		// Use existing JSON validation for other endpoints
-		model, message, stream, errRes = validateRequestBody(requestID, requestPath, body.RequestBody.GetBody(), user)
+		var promptTokenIDs []int
+		model, message, stream, promptTokenIDs, errRes = validateRequestBodyWithTokens(requestID, requestPath, body.RequestBody.GetBody(), user)
 		if errRes != nil {
-			return errRes, model, stream, term
+			return errRes, model, stream, term, nil
+		}
+		// TRE-PATCH(P3-GW-010, D6): a token-id prompt counts as its ids, not as text.
+		if promptTokenIDs != nil {
+			routingCtx.SetPromptTokens(promptTokenIDs)
 		}
 	}
 
@@ -75,7 +97,7 @@ func (s *Server) HandleRequestBody(ctx context.Context, routingCtx *types.Routin
 	var podsArr types.PodList
 	podsArr, errRes = s.validateModelAvailability(requestID, model)
 	if errRes != nil {
-		return errRes, model, stream, term
+		return errRes, model, stream, term, nil
 	}
 
 	// Read engine label from pods and assign to routing context
@@ -94,8 +116,17 @@ func (s *Server) HandleRequestBody(ctx context.Context, routingCtx *types.Routin
 		var ok bool
 		if routingAlgorithm, ok = routing.Validate(strategy); !ok {
 			klog.ErrorS(nil, "incorrect routing strategy", "requestID", requestID, "routing-strategy", strategy)
-			return buildErrorResponse(envoyTypePb.StatusCode_BadRequest, fmt.Sprintf("incorrect routing strategy %s", strategy), "", "", HeaderErrorRouting, "true"), model, stream, term
+			return buildErrorResponse(envoyTypePb.StatusCode_BadRequest, fmt.Sprintf("incorrect routing strategy %s", strategy), "", "", HeaderErrorRouting, "true"), model, stream, term, nil
 		}
+		routingCtx.Algorithm = routingAlgorithm
+	}
+
+	// TRE-PATCH(P3-GW-010, D5): exclusion needs pod-level routing. If no strategy resolved
+	// (TRE default disabled), fall back to the random router rather than the Service path,
+	// which could hand the request back to an excluded pod.
+	excludedPods := treExcludedPods(routingCtx.ReqHeaders)
+	if routingAlgorithm == routing.RouterNotSet && len(excludedPods) > 0 {
+		routingAlgorithm = routing.RouterRandom
 		routingCtx.Algorithm = routingAlgorithm
 	}
 
@@ -110,7 +141,7 @@ func (s *Server) HandleRequestBody(ctx context.Context, routingCtx *types.Routin
 	}
 
 	if errRes = s.enforceModelRPS(ctx, model, routingCtx); errRes != nil {
-		return errRes, model, stream, term
+		return errRes, model, stream, term, nil
 	}
 	needsRollback := true
 	defer func() {
@@ -121,16 +152,51 @@ func (s *Server) HandleRequestBody(ctx context.Context, routingCtx *types.Routin
 
 	if routingAlgorithm == routing.RouterNotSet {
 		if err := s.validateHTTPRouteStatus(ctx, model); err != nil {
-			return buildErrorResponse(envoyTypePb.StatusCode_ServiceUnavailable, err.Error(), ErrorCodeServiceUnavailable, "", HeaderErrorRouting, "true"), model, stream, term
+			return buildErrorResponse(envoyTypePb.StatusCode_ServiceUnavailable, err.Error(), ErrorCodeServiceUnavailable, "", HeaderErrorRouting, "true"), model, stream, term, nil
 		}
 		headers = buildEnvoyProxyHeaders(headers, HeaderModel, model)
 		klog.InfoS("request_start", "request_id", requestID, "request_path", requestPath, "model", model, "stream", stream)
 	} else {
 		externalFilter := routingCtx.ReqHeaders[HeaderExternalFilter]
-		targetPodIP, err := s.selectTargetPod(ctx, routingCtx, podsArr, externalFilter)
+		nonContinuable := treNonContinuable(requestPath, routingCtx.ReqBody)
+		var targetPodIP string
+		var err error
+		// TRE-PATCH(P3-GW-009, D3/D4): commit the chosen pod (inflight +1) atomically with
+		// a re-check against the acked route table; if a hide won the race, route again.
+		for attempt := 1; ; attempt++ {
+			targetPodIP, err = s.selectTargetPod(ctx, routingCtx, podsArr, externalFilter)
+			if targetPodIP == "" || err != nil {
+				break
+			}
+			var committed bool
+			var target *v1.Pod
+			if routingCtx.HasRouted() {
+				target = routingCtx.TargetPod()
+			}
+			if ticket, committed = treGW.commit(target, nonContinuable); committed {
+				break
+			}
+			if attempt >= treCommitAttempts {
+				targetPodIP, err = "", errTRECommitRace
+				break
+			}
+			klog.V(4).InfoS("target pod became unroutable before commit; re-routing", "requestID", requestID, "pod", target.Name, "attempt", attempt)
+			routingCtx.ResetTargetPod()
+			if podsArr, err = s.cache.ListPodsByModel(model); err != nil {
+				targetPodIP = ""
+				break
+			}
+		}
 		if targetPodIP == "" || err != nil {
 			klog.ErrorS(err, "failed to select target pod", "requestID", requestID, "routingStrategy", routingAlgorithm, "model", model, "routingDuration", routingCtx.GetRoutingDelay())
-			return buildErrorResponse(envoyTypePb.StatusCode_ServiceUnavailable, "error on selecting target pod", ErrorCodeServiceUnavailable, "", HeaderErrorRouting, "true"), model, stream, term
+			msg := "error on selecting target pod"
+			if errors.Is(err, errTREAllCandidatesExcluded) || errors.Is(err, errTRECommitRace) {
+				msg = err.Error()
+			}
+			// Retry-After: the sidecar (and well-behaved clients) retry shortly; a hidden or
+			// excluded pod set is transient during a sleep/wake transition.
+			return buildErrorResponse(envoyTypePb.StatusCode_ServiceUnavailable, msg, ErrorCodeServiceUnavailable, "", HeaderErrorRouting, "true",
+				"Retry-After", strconv.Itoa(treRetryAfterSeconds)), model, stream, term, nil
 		}
 		headers = buildEnvoyProxyHeaders(headers,
 			HeaderRoutingStrategy, string(routingAlgorithm),
@@ -161,12 +227,18 @@ func (s *Server) HandleRequestBody(ctx context.Context, routingCtx *types.Routin
 	routingCtx.RequestEndTime = time.Now()
 	term = s.cache.AddRequestCount(routingCtx, requestID, model)
 
+	var removeHeaders []string
+	if _, ok := routingCtx.ReqHeaders[HeaderTREExcludePod]; ok {
+		removeHeaders = []string{HeaderTREExcludePod} // gateway-internal, not for the engine
+	}
+
 	return &extProcPb.ProcessingResponse{
 		Response: &extProcPb.ProcessingResponse_RequestBody{
 			RequestBody: &extProcPb.BodyResponse{
 				Response: &extProcPb.CommonResponse{
 					HeaderMutation: &extProcPb.HeaderMutation{
-						SetHeaders: headers,
+						SetHeaders:    headers,
+						RemoveHeaders: removeHeaders,
 					},
 					BodyMutation: &extProcPb.BodyMutation{
 						Mutation: &extProcPb.BodyMutation_Body{
@@ -176,7 +248,7 @@ func (s *Server) HandleRequestBody(ctx context.Context, routingCtx *types.Routin
 				},
 			},
 		},
-	}, model, stream, term
+	}, model, stream, term, ticket
 }
 
 // getEngineBasedPathRewrite returns the rewritten path for image/video generation endpoints

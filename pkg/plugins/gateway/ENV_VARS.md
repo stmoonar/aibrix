@@ -13,6 +13,28 @@ This document covers all environment variables used in the `pkg/plugins/gateway`
 
 ---
 
+## TRE transparent sleep (`tre_transparent_sleep.go`)
+
+Gateway side of the TRE sleep/wake handshake with the service-manager. Redis keys
+(`tre:v2:gw:instances`, `tre:v2:gw:seen:<pod>`, `tre:v2:gw:inflight:<pod>`), the pod
+annotation `tre.aibrix.io/route-gen` and the request header `x-tre-exclude-pod` are fixed
+by the cross-component contract and are not configurable.
+
+| Variable | Type | Default | Description | Source |
+|---|---|---|---|---|
+| `TRE_DEFAULT_ROUTING_STRATEGY` | string | `least-gpu-cache` | Strategy for requests that name none (no `routing-strategy` header, no config profile, no `ROUTING_ALGORITHM`), so every request goes through ext_proc pod selection. `""`, `none` or `off` disables it (upstream HTTPRoute/Service path). | [tre_transparent_sleep.go](tre_transparent_sleep.go), [util.go](util.go) |
+| `TRE_GW_COORDINATION` | bool | value of `TRE_ROUTABLE_LABEL_FILTER` | Enable the instance heartbeat, route-gen acks and inflight mirror in Redis. Refuses to start without `TRE_ROUTABLE_LABEL_FILTER=true`. | [tre_transparent_sleep.go](tre_transparent_sleep.go) |
+| `TRE_GW_INSTANCE_ID` | string | `POD_NAME`, then hostname | Instance id used as ZSET member / hash field. | [tre_transparent_sleep.go](tre_transparent_sleep.go) |
+| `TRE_GW_HEARTBEAT_INTERVAL` | duration | `2s` | Heartbeat period of `tre:v2:gw:instances`. | [tre_transparent_sleep.go](tre_transparent_sleep.go) |
+| `TRE_GW_INSTANCE_RETENTION` | duration | `10m` | Heartbeat entries older than this are pruned from the ZSET. | [tre_transparent_sleep.go](tre_transparent_sleep.go) |
+| `TRE_GW_KEY_TTL` | duration | `300s` | TTL of the seen and inflight hashes, renewed on every write. | [tre_transparent_sleep.go](tre_transparent_sleep.go) |
+| `TRE_GW_REFRESH_INTERVAL` | duration | `30s` | Period of the full re-ack / inflight rewrite (a restarted instance re-acks at startup). | [tre_transparent_sleep.go](tre_transparent_sleep.go) |
+| `TRE_GW_RETRY_AFTER_SECONDS` | int | `1` | `Retry-After` on 503s from pod selection (no routable pod, all candidates excluded). | [tre_transparent_sleep.go](tre_transparent_sleep.go) |
+| `TRE_ROUTABLE_LABEL_FILTER` | bool | `false` | Only pods labelled `tre.aibrix.io/routable=true` are routing candidates. | [pkg/utils/pod.go](../../utils/pod.go) |
+| `TRE_ROUTE_MODEL_HEADER` | bool | `false` | Stamp the body model onto the `model` request header. | [tre_route_model_header.go](tre_route_model_header.go) |
+
+---
+
 ## Response Processing
 
 | Variable | Type | Default | Description | Source |

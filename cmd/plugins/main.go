@@ -167,6 +167,10 @@ func main() {
 	}
 
 	gatewayServer := gateway.NewServer(redisClient, k8sClient, gatewayK8sClient)
+	// TRE-PATCH(P3-GW-007): instance heartbeat, route-gen acks and inflight mirror
+	// (no-op unless TRE coordination is enabled). Before Serve, so the first ack/inflight
+	// refresh precedes any routed request.
+	gatewayServer.StartTRECoordination()
 
 	stateSyncEnabled := utils.LoadEnvBool("AIBRIX_STATESYNC_ENABLED", false)
 	var syncManager *statesync.RedisSync

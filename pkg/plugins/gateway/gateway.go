@@ -86,6 +86,8 @@ type Server struct {
 	shutdownCh   <-chan struct{}
 	shutdown     chan struct{}
 	shutdownOnce sync.Once
+	// TRE-PATCH(P3-GW-007): heartbeat / seen-gen / inflight writer (nil when disabled).
+	treWriter *treRedisWriter
 }
 
 type processState struct {
@@ -105,6 +107,8 @@ type processState struct {
 	completed        bool
 	span             trace.Span
 	ttftSpan         trace.Span
+	// TRE-PATCH(P3-GW-009): the inflight slot this request holds on its target pod.
+	treTicket *treInflightTicket
 }
 
 var podName = os.Getenv("POD_NAME")
@@ -159,6 +163,10 @@ func (s *Server) Process(srv extProcPb.ExternalProcessor_ProcessServer) error {
 	}
 
 	defer func() {
+		// TRE-PATCH(P3-GW-009): every exit of the ext_proc stream (completion, upstream or
+		// Envoy error, client disconnect, stream close, shutdown) ends the request, so
+		// the inflight slot is released here, exactly once.
+		st.treTicket.Release()
 		// TRE-PATCH(P2-GW-006): the stream may end (completed, cancelled, error) with a
 		// partial SSE line still held for this request.
 		clearSSECarry(st.requestID)
@@ -333,7 +341,12 @@ func (s *Server) handleProcessingRequest(st *processState, req *extProcPb.Proces
 		st.metricLabel = "gateway_req_headers"
 
 	case *extProcPb.ProcessingRequest_RequestBody:
-		resp, st.model, st.stream, st.traceTerm = s.HandleRequestBody(st.ctx, st.routerCtx, st.requestID, req, st.user)
+		var ticket *treInflightTicket
+		resp, st.model, st.stream, st.traceTerm, ticket = s.handleRequestBody(st.ctx, st.routerCtx, st.requestID, req, st.user)
+		if ticket != nil {
+			st.treTicket.Release() // defensive: one body phase per stream
+			st.treTicket = ticket
+		}
 		st.metricLabel = gatewayReqBody
 		// create a ttftSpan to collect time from reqBody to first respBody
 		_, st.ttftSpan = tracer.Start(st.ctx, "Wait_For_LLM_First_Token")
@@ -433,6 +446,8 @@ func (s *Server) selectTargetPod(ctx context.Context, routeCtx *types.RoutingCon
 		return "", fmt.Errorf("no pods for routing")
 	}
 	readyPods := utils.FilterRoutablePods(pods.All())
+	// TRE-PATCH(P3-GW-009): with coordination on, the acked route table is authoritative.
+	readyPods = treGW.filterCandidates(readyPods)
 
 	// filter pod by header 'external-filter'
 	var err error
@@ -443,6 +458,21 @@ func (s *Server) selectTargetPod(ctx context.Context, routeCtx *types.RoutingCon
 
 	if len(readyPods) == 0 {
 		return "", fmt.Errorf("no ready pods for routing")
+	}
+
+	// TRE-PATCH(P3-GW-010, D5): drop pods named in x-tre-exclude-pod; never fall back to
+	// an excluded pod.
+	if excluded := treExcludedPods(routeCtx.ReqHeaders); len(excluded) > 0 {
+		kept := readyPods[:0:0]
+		for _, p := range readyPods {
+			if _, drop := excluded[p.Name]; !drop {
+				kept = append(kept, p)
+			}
+		}
+		if len(kept) == 0 {
+			return "", errTREAllCandidatesExcluded
+		}
+		readyPods = kept
 	}
 
 	if routeCtx.Algorithm == routing.RouterPD {
@@ -608,6 +638,8 @@ func (s *Server) Shutdown() {
 	if s.shutdown != nil {
 		s.shutdownOnce.Do(func() { close(s.shutdown) })
 	}
+	// TRE-PATCH(P3-GW-007): leave the live-instance set and clear own inflight fields.
+	s.stopTRECoordination()
 	if s.httpServer != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
