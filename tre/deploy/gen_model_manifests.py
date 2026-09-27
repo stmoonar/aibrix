@@ -12,6 +12,7 @@ import yaml
 from tre_common.bindings import MAX_BOUND_PER_GPU, feasible_slots, render_binding_set  # noqa: F401 (re-exported)
 from tre_common.registry import (
     DEFAULT_ROUTE_TIMEOUT_S,
+    DEFAULT_VLLM_ENV,
     POD_SERVING_PORT,
     VLLM_FEATURE_FLAGS,
     ModelSpec,
@@ -67,7 +68,13 @@ def build_deployments(registry: Registry) -> list[dict]:
     nodes = {node.name: node for node in registry.topology().nodes}
     reissue = reissue_spec(registry)
     return [
-        _deployment(registry.model(spec.model), nodes[spec.node], spec.gpu_ids, reissue=reissue)
+        _deployment(
+            registry.model(spec.model),
+            nodes[spec.node],
+            spec.gpu_ids,
+            reissue=reissue,
+            vllm_env=registry.vllm_env_for(registry.model(spec.model)),
+        )
         for spec in render_binding_set(registry)
     ]
 
@@ -104,7 +111,10 @@ def build_model_deployment(registry: Registry, model_name: str, node_name: str, 
     # Used by the service-manager for runtime creates: the registry's reissue section
     # applies, so a relocated binding looks exactly like a rendered one.
     nodes = {node.name: node for node in registry.topology().nodes}
-    return _deployment(registry.model(model_name), nodes[node_name], gpu_ids, reissue=reissue_spec(registry))
+    model = registry.model(model_name)
+    return _deployment(
+        model, nodes[node_name], gpu_ids, reissue=reissue_spec(registry), vllm_env=registry.vllm_env_for(model)
+    )
 
 
 def build_services(registry: Registry) -> list[dict]:
@@ -276,8 +286,15 @@ def _service(model: ModelSpec) -> dict:
 
 
 def _deployment(
-    model: ModelSpec, node: NodeSpec, gpu_ids: tuple[int, ...], *, reissue: ReissueConfig | None = None
+    model: ModelSpec,
+    node: NodeSpec,
+    gpu_ids: tuple[int, ...],
+    *,
+    reissue: ReissueConfig | None = None,
+    vllm_env: dict[str, str] | None = None,
 ) -> dict:
+    """``vllm_env``: the vLLM container environment besides the per-binding GPU variables
+    (``Registry.vllm_env_for``); None = ``DEFAULT_VLLM_ENV``."""
     gpu_value = ",".join(str(gpu) for gpu in gpu_ids)
     gpu_label_value = "-".join(str(gpu) for gpu in gpu_ids)
     cuda_value = ",".join(str(index) for index in range(model.tp_size))
@@ -301,7 +318,7 @@ def _deployment(
     ]
     if model.tp_size > 1:
         command.extend(["--tensor-parallel-size", str(model.tp_size)])
-    command.extend(model.vllm_extra_args)
+    command.extend(model.vllm_args)
     if reissue is not None:
         # Fork features the sidecar builds on, only where the image declares them.
         for feature in model.vllm_features:
@@ -367,9 +384,10 @@ def _deployment(
                             "env": [
                                 {"name": "NVIDIA_VISIBLE_DEVICES", "value": gpu_uuid_value},
                                 {"name": "CUDA_VISIBLE_DEVICES", "value": cuda_value},
-                                {"name": "VLLM_SERVER_DEV_MODE", "value": "1"},
-                                {"name": "VLLM_WORKER_MULTIPROC_METHOD", "value": "spawn"},
-                                {"name": "VLLM_USE_MODELSCOPE", "value": "True"},
+                            ]
+                            + [
+                                {"name": key, "value": value}
+                                for key, value in (DEFAULT_VLLM_ENV if vllm_env is None else vllm_env).items()
                             ],
                             "ports": [{"containerPort": 8000, "protocol": "TCP"}],
                             "readinessProbe": {

@@ -38,7 +38,17 @@ data:
       # max_awake_replicas = scaling cap (TRE planner + SM + APA maxReplicas).
       max_replicas: 8
       max_awake_replicas: 4
-      vllm_image: vllm/vllm-openai:0.10.1-sleep
+      # vLLM 0.30 fork image (plan 2026-09-27 D9): upstream ced6857af + pinned_weights
+      # sleep backend + sleep rollback fix + --sleep-reject-new / --abort-return-token-ids.
+      # A new image invalidates the calibrated theta (D9: recalibrate after migrating).
+      vllm_image: vllm-openai-tre:0.30.0-ts-02ad6c9e
+      # Fork features of that image; their engine flags are rendered while reissue.enabled.
+      vllm_features:
+      - sleep_reject_new
+      - abort_return_token_ids
+      # null = vLLM default (cumem). Option: pinned_weights (fork backend: pinned host copy
+      # kept for the process lifetime, sleep ~0.07 s but wake ~0.4 s slower, level 1 only).
+      sleep_mode_backend: null
       slo:
         ttft_p95_ms: 500.0
         tpot_p95_ms: 75.0
@@ -83,10 +93,10 @@ data:
       - --enable-chunked-prefill
       - --max-num-batched-tokens
       - '2048'
-      - --swap-space
-      - '16'
       - --gpu-memory-utilization
       - '0.85'
+      # --max-model-len; null = the model's maximum.
+      max_model_len: null
     - name: dsllama-8b
       weights_path: /data/nfs_shared_data/DeepSeek-R1-Distill-Llama-8B
       tp_size: 1
@@ -95,7 +105,17 @@ data:
       # max_awake_replicas = scaling cap (TRE planner + SM + APA maxReplicas).
       max_replicas: 8
       max_awake_replicas: 4
-      vllm_image: vllm/vllm-openai:0.10.1-sleep
+      # vLLM 0.30 fork image (plan 2026-09-27 D9): upstream ced6857af + pinned_weights
+      # sleep backend + sleep rollback fix + --sleep-reject-new / --abort-return-token-ids.
+      # A new image invalidates the calibrated theta (D9: recalibrate after migrating).
+      vllm_image: vllm-openai-tre:0.30.0-ts-02ad6c9e
+      # Fork features of that image; their engine flags are rendered while reissue.enabled.
+      vllm_features:
+      - sleep_reject_new
+      - abort_return_token_ids
+      # null = vLLM default (cumem). Option: pinned_weights (fork backend: pinned host copy
+      # kept for the process lifetime, sleep ~0.07 s but wake ~0.4 s slower, level 1 only).
+      sleep_mode_backend: null
       slo:
         ttft_p95_ms: 500.0
         tpot_p95_ms: 75.0
@@ -140,10 +160,11 @@ data:
       - --enable-chunked-prefill
       - --max-num-batched-tokens
       - '2048'
-      - --swap-space
-      - '20'
       - --gpu-memory-utilization
       - '0.85'
+      # --max-model-len: at util 0.85 vLLM 0.30 leaves ~15.8 GiB of KV cache, below the
+      # 16 GiB of the model's full 131072-token context, and refuses to start without it.
+      max_model_len: 32768
     - name: dsqwen-14b
       weights_path: /data/nfs_shared_data/Models/DeepSeek-R1-Distill-Qwen-14B
       tp_size: 2
@@ -154,7 +175,17 @@ data:
       # max_awake_replicas = scaling cap (TRE planner + SM + APA maxReplicas).
       max_replicas: 4
       max_awake_replicas: 4
-      vllm_image: vllm/vllm-openai:0.10.1-sleep
+      # vLLM 0.30 fork image (plan 2026-09-27 D9): upstream ced6857af + pinned_weights
+      # sleep backend + sleep rollback fix + --sleep-reject-new / --abort-return-token-ids.
+      # A new image invalidates the calibrated theta (D9: recalibrate after migrating).
+      vllm_image: vllm-openai-tre:0.30.0-ts-02ad6c9e
+      # Fork features of that image; their engine flags are rendered while reissue.enabled.
+      vllm_features:
+      - sleep_reject_new
+      - abort_return_token_ids
+      # null = vLLM default (cumem). Option: pinned_weights (fork backend: pinned host copy
+      # kept for the process lifetime, sleep ~0.07 s but wake ~0.4 s slower, level 1 only).
+      sleep_mode_backend: null
       slo:
         ttft_p95_ms: 500.0
         tpot_p95_ms: 75.0
@@ -196,10 +227,25 @@ data:
       - --no-enable-prefix-caching
       - --max-num-seqs
       - '256'
-      - --max-model-len
-      - '12288'
       - --gpu-memory-utilization
       - '0.85'
+      # --max-model-len (was in vllm_extra_args).
+      max_model_len: 12288
+    # vLLM container settings shared by every model pod (make manifests and the
+    # service-manager's runtime creates). env merges over the built-in
+    # VLLM_SERVER_DEV_MODE=1 (vLLM >= 0.2x mounts /sleep, /wake_up, /is_sleeping only in dev
+    # mode); a model's vllm_env merges over it. NVIDIA_VISIBLE_DEVICES / CUDA_VISIBLE_DEVICES
+    # are set per binding and may not appear here.
+    vllm:
+      env:
+        VLLM_SERVER_DEV_MODE: '1'
+        VLLM_WORKER_MULTIPROC_METHOD: spawn
+        # Weights are local paths; never reach out to a model hub.
+        HF_HUB_OFFLINE: '1'
+        # torch rounds every pinned host block up to a power of two by default (~1.9x the
+        # weights in host RAM once a pod has slept); 1 MiB threshold = exact sizes
+        # (7b: 30.2 -> 17.6 GiB per pod, first sleep 9.3 -> 5.9 s; wake unchanged).
+        PYTORCH_ALLOC_CONF: pinned_max_round_threshold_mb:1
     # Gateway behaviour shared by the manifests and the service-manager.
     gateway:
       # Request timeout of every model route: the single source for the model

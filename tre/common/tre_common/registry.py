@@ -128,10 +128,29 @@ class ModelSpec:
     #: Optional vLLM fork features the model's image supports (``VLLM_FEATURE_FLAGS``);
     #: their flags are rendered only while the reissue sidecar is enabled.
     vllm_features: tuple[str, ...] = ()
+    #: ``--max-model-len`` (models[].max_model_len); None = the model's own maximum.
+    max_model_len: int | None = None
+    #: ``--sleep-mode-backend`` (models[].sleep_mode_backend, ``SLEEP_MODE_BACKENDS``);
+    #: None = no flag, i.e. vLLM's default (cumem).
+    sleep_mode_backend: str | None = None
+    #: Per-model vLLM container environment (models[].vllm_env), merged over the
+    #: registry-wide ``vllm.env`` (see ``Registry.vllm_env_for``).
+    vllm_env: dict[str, str] = field(default_factory=dict)
 
     @property
     def scale_max_replicas(self) -> int:
         return scale_max_replicas(self)
+
+    @property
+    def vllm_args(self) -> tuple[str, ...]:
+        """Every engine argument the registry gives this model beyond the fixed serve
+        arguments: ``vllm_extra_args`` + ``--max-model-len`` + ``--sleep-mode-backend``."""
+        args = list(self.vllm_extra_args)
+        if self.max_model_len is not None:
+            args.extend(["--max-model-len", str(int(self.max_model_len))])
+        if self.sleep_mode_backend is not None:
+            args.extend(["--sleep-mode-backend", self.sleep_mode_backend])
+        return tuple(args)
 
 
 def scale_max_replicas(spec: Any) -> int:
@@ -189,6 +208,29 @@ VLLM_FEATURE_FLAGS: dict[str, tuple[str, ...]] = {
     # abort outputs carry prompt_token_ids + generated_token_ids (token-exact continuation).
     "abort_return_token_ids": ("--abort-return-token-ids",),
 }
+
+#: ``models[].sleep_mode_backend`` values (vLLM fork, ``--sleep-mode-backend``). Unset =
+#: no flag = vLLM's default ``cumem``; ``pinned_weights`` keeps a pinned host copy of the
+#: weights for the process lifetime (fast sleep, level 1 only).
+SLEEP_MODE_BACKENDS = ("cumem", "pinned_weights")
+
+#: vLLM container environment every model pod gets unless the registry overrides it
+#: (``vllm.env`` / ``models[].vllm_env`` merge over it). vLLM >= 0.2x mounts /sleep,
+#: /wake_up and /is_sleeping only in dev mode, and the service-manager needs them, so it
+#: is a default and may not be switched off.
+DEFAULT_VLLM_ENV: dict[str, str] = {"VLLM_SERVER_DEV_MODE": "1"}
+#: Set per binding by the manifest generator; the registry may not set them.
+RESERVED_VLLM_ENV = frozenset({"NVIDIA_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES"})
+
+
+@dataclass(frozen=True)
+class VllmConfig:
+    """Registry ``vllm:`` section: settings shared by every model pod."""
+
+    #: Extra vLLM container environment (merged over ``DEFAULT_VLLM_ENV``; a model's
+    #: ``vllm_env`` merges over this).
+    env: dict[str, str] = field(default_factory=dict)
+
 
 #: Stable in-cluster Service of the tre-v2 Envoy proxy (overlays/tre-v2/gateway-service.yaml).
 #: Envoy Gateway's own proxy Service carries a generated hash suffix, so nothing in TRE
@@ -434,12 +476,14 @@ class Registry:
         service_manager: ServiceManagerConfig | None = None,
         gateway: GatewayConfig | None = None,
         reissue: ReissueConfig | None = None,
+        vllm: VllmConfig | None = None,
     ) -> None:
         self._topology = topology
         self._models = tuple(models)
         self._service_manager = service_manager or ServiceManagerConfig()
         self._gateway = gateway or GatewayConfig()
         self._reissue = reissue or ReissueConfig()
+        self._vllm = vllm or VllmConfig()
         self._model_index: dict[str, ModelSpec] = {}
         for model in models:
             self._model_index.setdefault(model.name, model)
@@ -452,6 +496,15 @@ class Registry:
 
     def reissue(self) -> ReissueConfig:
         return self._reissue
+
+    def vllm(self) -> VllmConfig:
+        return self._vllm
+
+    def vllm_env_for(self, model: ModelSpec) -> dict[str, str]:
+        """The vLLM container environment of ``model``'s pods (besides the per-binding
+        GPU variables): ``DEFAULT_VLLM_ENV``, then ``vllm.env``, then the model's
+        ``vllm_env``; later keys win."""
+        return {**DEFAULT_VLLM_ENV, **self._vllm.env, **getattr(model, "vllm_env", {})}
 
     def model(self, name: str) -> ModelSpec:
         try:
@@ -489,6 +542,7 @@ class Registry:
                     f"model {model.name}: unknown vllm_features {unknown} "
                     f"(known: {', '.join(sorted(VLLM_FEATURE_FLAGS))})"
                 )
+            errors.extend(_validate_model_vllm(model))
             if model.max_awake_replicas is not None and not (
                 model.min_replicas <= model.max_awake_replicas <= model.max_replicas
             ):
@@ -542,8 +596,42 @@ class Registry:
         if self._topology.max_bound_per_gpu < 1:
             errors.append("cluster.max_bound_per_gpu must be >= 1")
         errors.extend(_validate_reissue(self._reissue))
+        errors.extend(_validate_vllm_env("vllm.env", self._vllm.env))
         errors.extend(_validate_service_manager(self._service_manager, self._gateway))
         return errors
+
+
+def _arg_present(args: tuple[str, ...], flag: str) -> bool:
+    return any(arg == flag or arg.startswith(flag + "=") for arg in args)
+
+
+def _validate_model_vllm(model: ModelSpec) -> list[str]:
+    errors: list[str] = []
+    prefix = f"model {model.name}"
+    if model.max_model_len is not None:
+        if model.max_model_len <= 0:
+            errors.append(f"{prefix}: max_model_len must be positive")
+        if _arg_present(model.vllm_extra_args, "--max-model-len"):
+            errors.append(f"{prefix}: set max_model_len OR --max-model-len in vllm_extra_args, not both")
+    if model.sleep_mode_backend is not None:
+        if model.sleep_mode_backend not in SLEEP_MODE_BACKENDS:
+            errors.append(
+                f"{prefix}: sleep_mode_backend must be one of {list(SLEEP_MODE_BACKENDS)} or null"
+            )
+        if _arg_present(model.vllm_extra_args, "--sleep-mode-backend"):
+            errors.append(f"{prefix}: set sleep_mode_backend OR --sleep-mode-backend in vllm_extra_args, not both")
+    errors.extend(_validate_vllm_env(f"{prefix}: vllm_env", getattr(model, "vllm_env", {})))
+    return errors
+
+
+def _validate_vllm_env(where: str, env: dict[str, str]) -> list[str]:
+    errors: list[str] = []
+    for key, value in env.items():
+        if key in RESERVED_VLLM_ENV:
+            errors.append(f"{where}: {key} is set per binding by the manifest generator")
+        elif key in DEFAULT_VLLM_ENV and value != DEFAULT_VLLM_ENV[key]:
+            errors.append(f"{where}: {key} must be {DEFAULT_VLLM_ENV[key]!r} (TRE needs it)")
+    return errors
 
 
 def load_registry(path: str | None = None) -> Registry:
@@ -570,7 +658,35 @@ def _parse_registry(raw: dict[str, Any]) -> Registry:
         ),
         gateway=parse_gateway_config(raw.get("gateway")),
         reissue=parse_reissue_config(raw.get("reissue")),
+        vllm=parse_vllm_config(raw.get("vllm")),
     )
+
+
+def _parse_env(raw: Any, where: str) -> dict[str, str]:
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError(f"{where} must be a mapping")
+    env: dict[str, str] = {}
+    for key, value in raw.items():
+        if value is None or isinstance(value, (dict, list)):
+            raise ValueError(f"{where}.{key} must be a scalar")
+        # YAML turns 1 / true into int / bool; the container env wants the text.
+        env[str(key)] = str(value).lower() if isinstance(value, bool) else str(value)
+    return env
+
+
+def parse_vllm_config(raw: Any) -> VllmConfig:
+    """Parse the optional ``vllm:`` registry section (absent = defaults)."""
+    if raw is None:
+        return VllmConfig()
+    if not isinstance(raw, dict):
+        raise ValueError("vllm must be a mapping")
+    known = {f for f in VllmConfig.__dataclass_fields__}
+    unknown = sorted(set(raw) - known)
+    if unknown:
+        raise ValueError(f"vllm: unknown keys {unknown} (known: {', '.join(sorted(known))})")
+    return VllmConfig(env=_parse_env(raw.get("env"), "vllm.env"))
 
 
 def parse_reissue_config(raw: Any) -> ReissueConfig:
@@ -893,6 +1009,11 @@ def _parse_model(raw: dict[str, Any]) -> ModelSpec:
         ),
         vllm_extra_args=tuple(str(arg) for arg in raw.get("vllm_extra_args", [])),
         vllm_features=tuple(str(feature) for feature in raw.get("vllm_features") or ()),
+        max_model_len=(int(raw["max_model_len"]) if raw.get("max_model_len") is not None else None),
+        sleep_mode_backend=(
+            str(raw["sleep_mode_backend"]) if raw.get("sleep_mode_backend") is not None else None
+        ),
+        vllm_env=_parse_env(raw.get("vllm_env"), f"model {raw.get('name')}: vllm_env"),
         alt_thresholds={
             str(signal): AltThreshold(
                 theta=float(values["theta"]),

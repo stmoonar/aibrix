@@ -368,11 +368,11 @@ def check_held_out(cells: Sequence[design.DesignCell]) -> None:
 
 
 def registry_max_model_len(model: str, registry: Optional[str] = None) -> Optional[int]:
-    """``--max-model-len`` of ``model`` in the registry's ``vllm_extra_args`` (None if not
-    pinned)."""
+    """``--max-model-len`` of ``model`` in the registry (``max_model_len`` or
+    ``vllm_extra_args``, i.e. the rendered ``vllm_args``; None if not pinned)."""
     from tre_common import registry as tre_registry
 
-    args = list(tre_registry.load_registry(registry).model(model).vllm_extra_args)
+    args = list(tre_registry.load_registry(registry).model(model).vllm_args)
     for k, arg in enumerate(args):
         if arg == "--max-model-len" and k + 1 < len(args):
             return int(args[k + 1])
