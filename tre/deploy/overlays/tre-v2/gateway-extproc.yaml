@@ -12,14 +12,18 @@
 # (EnvoyPatchPolicy is already enabled cluster-wide: envoy-gateway-config
 # extensionApis.enableEnvoyPatchPolicy=true).
 #
-# Request flow with a `routing-strategy` header:
-#   route tre-original-route/<model> (routing-strategy + model header, patched in at the
-#   top of the route table) -> ext_proc tre-gateway-plugins:50052 picks a
-#   tre.aibrix.io/routable=true pod (TRE_ROUTABLE_LABEL_FILTER) and sets `target-pod`
-#   -> cluster httproute/tre-v2/<model>-router/rule/original-dst (ORIGINAL_DST on the
-#   target-pod header).
-# Without the header nothing changes: the generated per-model HTTPRoutes still send the
-# request to the model Service (EDS, LEAST_REQUEST, 600s), which no experiment uses.
+# Request flow (every POST under /v1, with or without a `routing-strategy` header):
+#   route tre-original-route/<model> (POST + model header, patched in at the top of the
+#   route table) -> ext_proc tre-gateway-plugins:50052 picks a tre.aibrix.io/routable=true
+#   pod (TRE_ROUTABLE_LABEL_FILTER) and sets `target-pod` -> cluster
+#   httproute/tre-v2/<model>-router/rule/original-dst (ORIGINAL_DST on the target-pod
+#   header). A request without the header is routed with the plugin's
+#   TRE_DEFAULT_ROUTING_STRATEGY (least-gpu-cache), so there is exactly one sleep-aware
+#   routing path (plan 2026-09-27 D10). Before D10 such requests bypassed ext_proc via the
+#   generated per-model HTTPRoutes (model Service, EDS LEAST_REQUEST); those routes now
+#   only serve non-POST requests (e.g. GET /v1/models with a model header).
+# D10 needs a gateway-plugins image with TRE-PATCH P3-GW-011 (default strategy): an older
+# plugin sends a header-less request down its HTTPRoute path, which has no target-pod.
 #
 # The two deliberate structural differences from v1 (values are v1's):
 # One ORIGINAL_DST cluster PER MODEL instead of v1's single shared one, so that
@@ -249,7 +253,9 @@ spec:
     # ---- routes: each add at index 0 prepends, so the unattributed catch-all goes in
     # first and ends up BELOW the per-model routes (Envoy takes the first match). Final
     # order: routes 0-2 = 14b, 8b, 7b; route 3 = unattributed. v1 route values: prefix
-    # /v1, routing-strategy header regex .*, timeout 120s, ext_proc enabled per route.
+    # /v1, timeout 120s, ext_proc enabled per route. v1 also required a routing-strategy
+    # header (regex .*); D10 replaces that with `:method: POST`, so header-less
+    # inference requests are ext_proc-routed too while GETs keep their old routes.
     - type: type.googleapis.com/envoy.config.route.v3.RouteConfiguration
       name: tre-v2/tre-aibrix-eg/http
       operation:
@@ -260,10 +266,9 @@ spec:
           match:
             prefix: /v1
             headers:
-              - name: routing-strategy
+              - name: ":method"
                 string_match:
-                  safe_regex:
-                    regex: .*
+                  exact: POST
           route:
             cluster: tre-v2/original-dst/unattributed
             timeout: 120s
@@ -281,10 +286,9 @@ spec:
           match:
             prefix: /v1
             headers:
-              - name: routing-strategy
+              - name: ":method"
                 string_match:
-                  safe_regex:
-                    regex: .*
+                  exact: POST
               - name: model
                 string_match:
                   exact: dsqwen-7b
@@ -305,10 +309,9 @@ spec:
           match:
             prefix: /v1
             headers:
-              - name: routing-strategy
+              - name: ":method"
                 string_match:
-                  safe_regex:
-                    regex: .*
+                  exact: POST
               - name: model
                 string_match:
                   exact: dsllama-8b
@@ -329,10 +332,9 @@ spec:
           match:
             prefix: /v1
             headers:
-              - name: routing-strategy
+              - name: ":method"
                 string_match:
-                  safe_regex:
-                    regex: .*
+                  exact: POST
               - name: model
                 string_match:
                   exact: dsqwen-14b

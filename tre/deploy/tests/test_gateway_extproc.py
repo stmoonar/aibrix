@@ -11,7 +11,11 @@ rely on:
   already parse, so the running controller keeps working without a rebuild;
 * the routable-label gate switched on in the plugin, because ORIGINAL_DST bypasses the
   Service selector that otherwise hides sleeping / probe-hidden pods;
-* HOT_SWITCH=0 together with min_replicas >= 1 for every model, which is how v1 behaved.
+* HOT_SWITCH=0 together with min_replicas >= 1 for every model, which is how v1 behaved;
+* (plan 2026-09-27 D10) every inference request goes through ext_proc, with or without a
+  routing-strategy header: the routes match POST instead of the header, and the plugin
+  routes header-less requests with TRE_DEFAULT_ROUTING_STRATEGY. It also runs the
+  transparent-sleep coordination (TRE_GW_COORDINATION).
 """
 from __future__ import annotations
 
@@ -151,22 +155,36 @@ def test_original_dst_clusters_are_v1_clusters_with_the_per_model_admission_limi
         }, name
 
 
-def test_per_model_routes_match_strategy_and_model_and_enable_extproc() -> None:
+def test_per_model_routes_match_post_and_model_and_enable_extproc() -> None:
     routes = _route_patches()
     by_name = {r["name"]: r for r in routes}
     assert set(by_name) == {f"tre-original-route/{m}" for m in _models()} | {"tre-original-route/unattributed"}
     for model in _models():
         route = by_name[f"tre-original-route/{model}"]
         headers = {h["name"]: h["string_match"] for h in route["match"]["headers"]}
-        assert headers == {"routing-strategy": {"safe_regex": {"regex": ".*"}}, "model": {"exact": model}}
+        assert headers == {":method": {"exact": "POST"}, "model": {"exact": model}}
         assert route["route"]["cluster"] == original_dst_cluster(model)
     for route in routes:
         assert route["match"]["prefix"] == "/v1"  # v1 config_tre aibrix-epp
         assert list(route["typed_per_filter_config"]) == [EXTPROC_FILTER]
         assert route["typed_per_filter_config"][EXTPROC_FILTER]["config"] == {}
     unattributed = by_name["tre-original-route/unattributed"]
-    assert [h["name"] for h in unattributed["match"]["headers"]] == ["routing-strategy"]
+    assert {h["name"]: h["string_match"] for h in unattributed["match"]["headers"]} == {
+        ":method": {"exact": "POST"}
+    }
     assert unattributed["route"]["cluster"] == UNATTRIBUTED
+
+
+def test_headerless_requests_go_through_extproc() -> None:
+    """D10: no ext_proc route may depend on the routing-strategy header (otherwise a
+    header-less request would fall through to the Service path and bypass the plugin's
+    sleep awareness), and the plugin must have a default strategy for such requests."""
+    for route in _route_patches():
+        names = {h["name"] for h in route["match"].get("headers", [])}
+        assert "routing-strategy" not in names, route["name"]
+    dep = next(d for d in _docs(PLUGINS) if d["kind"] == "Deployment")
+    env = {e["name"]: e.get("value") for e in dep["spec"]["template"]["spec"]["containers"][0]["env"]}
+    assert env["TRE_DEFAULT_ROUTING_STRATEGY"] == "least-gpu-cache"
 
 
 def test_catch_all_is_inserted_first_so_it_ends_below_the_model_routes() -> None:
@@ -188,7 +206,7 @@ def test_route_timeouts_are_v1_120s_then_the_v1_150s_patch() -> None:
         assert patch["operation"]["op"] == "replace"
         assert patch["operation"]["value"] == V1_ROUTE_TIMEOUT_PATCHED
         replaced.append(patch["operation"]["path"])
-    # Exactly the routing-strategy routes, which the add patches put at the table head.
+    # Exactly the ext_proc routes, which the add patches put at the table head.
     assert replaced == [f"/virtual_hosts/0/routes/{i}/route/timeout" for i in range(len(routes))]
 
 
@@ -234,6 +252,9 @@ def test_plugin_deployment_gates_routing_on_the_routable_label() -> None:
     env = {e["name"]: e.get("value") for e in container["env"]}
     assert env["TRE_ROUTABLE_LABEL_FILTER"] == "true"
     assert env["TRE_ROUTE_MODEL_HEADER"] == "true"
+    # D3/D4 coordination (heartbeat, route-gen acks, inflight) needs the label gate above.
+    assert env["TRE_GW_COORDINATION"] == "true"
+    assert env["POD_NAME"] is None  # instance id comes from the downward API (valueFrom)
     assert env["AIBRIX_POD_METRIC_REFRESH_INTERVAL_MS"] == "50"  # v1 refresh cadence
     assert container["readinessProbe"]["grpc"]["port"] == 50052
     assert container["resources"]["limits"] == {"cpu": "2", "memory": "8Gi"}  # v1 sizing
