@@ -195,3 +195,58 @@ models:
   - '12288'
   - --gpu-memory-utilization
   - '0.85'
+# Service-manager behaviour (plan 2026-09-27). Every key is optional; the values
+# below are the built-in defaults.
+service_manager:
+  sleep:
+    # Every sleep runs hide (routable=false + route-gen bump) -> gateway plugin ack
+    # -> drain -> /sleep (D1/D2); no caller can skip a step.
+    # Max wait for every live gateway plugin instance to report the new route-gen.
+    ack_timeout_s: 10
+    # A plugin instance whose heartbeat (tre:v2:gw:instances) is older is not live.
+    instance_staleness_s: 10
+    # No live plugin instance (plugin absent / fallback routing): wait for the k8s
+    # label plus this grace delay instead of an ack, and log a warning.
+    no_plugin_grace_s: 5
+    poll_interval_s: 0.5
+    # HTTP timeout of the /sleep call itself (weight offload), on top of the drain.
+    sleep_call_timeout_s: 60
+    # Send mode=wait|abort on /sleep (vLLM >= 0.30). false for older images.
+    vllm_sleep_mode_param: true
+    # Absolute drain cap. null = gateway.route_timeout_s if set, else 150 s.
+    hard_cap_s: null
+    # Plugin instances that must ack = fresh heartbeats (tre:v2:gw:instances) UNION
+    # Ready pods matching this selector: a plugin with Redis trouble may still route
+    # while its heartbeat goes stale. label_selector: null = heartbeats only. Acks
+    # exist only for model pods labelled model.aibrix.ai/name (all TRE model pods are).
+    gateway_plugin_pods:
+      namespace: tre-v2
+      label_selector: app=tre-gateway-plugins
+    # Soft drain budget per sleep path (s); null = only the hard cap. Past the soft
+    # budget the SM aborts the remaining requests (counted as forced aborts),
+    # except requests the gateway marks non-continuable: those are waited for up
+    # to the hard cap. A caller may pass its own budget (drain_budget_s), e.g.
+    # the SafeScale commit passes its probe window.
+    budgets_s:
+      safescale_commit: null
+      urgent: 30
+      scale_down: null
+      defrag: 30
+      repair: 30
+      startup: 30
+      default: 30
+  wake:
+    # A wake fails closed unless gpu-truth shows every target GPU at or below
+    # this used memory (MiB): sleeping residents stay far below it, an awake
+    # resident or a sleep leak far above.
+    max_used_mib: 8192
+    # gpu-truth lags a sleep that just finished: re-read it for up to this long.
+    truth_wait_s: 5
+  clock_skew:
+    # Startup check of the local clock against Redis TIME.
+    warn_s: 1.0
+    # Refuse to start above this skew; null = warn only.
+    fail_s: null
+  node_pressure:
+    # Only registry nodes (cluster.nodes) can block a cold start.
+    registry_nodes_only: true

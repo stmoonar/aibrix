@@ -8,11 +8,11 @@ from typing import Iterable
 
 import yaml
 
+from tre_common.bindings import MAX_BOUND_PER_GPU, feasible_slots, render_binding_set  # noqa: F401 (re-exported)
 from tre_common.registry import ModelSpec, NodeSpec, Registry, load_registry
 
 ROUTABLE_LABEL = "tre.aibrix.io/routable"
 GPU_UUIDS_ANNOTATION = "tre.aibrix.io/gpu-uuids"
-MAX_BOUND_PER_GPU = 3
 MODEL_LABEL = "model.aibrix.ai/name"
 GATEWAY_NAMESPACE = "tre-v2"
 GATEWAY_NAME = "tre-aibrix-eg"
@@ -44,28 +44,14 @@ while True:
 """
 
 
-def feasible_slots(registry: Registry, model: ModelSpec) -> list[tuple[str, tuple[int, ...]]]:
-    slots: list[tuple[str, tuple[int, ...]]] = []
-    for node in registry.topology().nodes:
-        if model.tp_size == 1:
-            slots.extend((node.name, (gpu,)) for gpu in range(node.gpus))
-        elif model.tp_size == 2:
-            slots.extend((node.name, tuple(slot)) for slot in node.two_gpu_slots)
-    # max_replicas is the GPU layout size (how many bindings exist), not the scaling cap:
-    # that is models[].max_awake_replicas (v1/paper alignment A1), enforced by the
-    # controller planner and the service-manager, never here.
-    return slots[: model.max_replicas]
-
-
 def build_deployments(registry: Registry) -> list[dict]:
-    deployments: list[dict] = []
+    # One Deployment per binding of the shared binding set (tre_common.bindings), the
+    # same set the service-manager seeds its desired state from (plan D7).
     nodes = {node.name: node for node in registry.topology().nodes}
-    bound_counts: dict[tuple[str, int], int] = {}
-    for model in registry.models():
-        for node_name, gpu_ids in feasible_slots(registry, model):
-            _record_bound_budget(bound_counts, node_name, gpu_ids)
-            deployments.append(_deployment(model, nodes[node_name], gpu_ids))
-    return deployments
+    return [
+        _deployment(registry.model(spec.model), nodes[spec.node], spec.gpu_ids)
+        for spec in render_binding_set(registry)
+    ]
 
 
 def deployment_name(model_name: str, node_name: str, gpu_ids: tuple[int, ...]) -> str:
@@ -346,16 +332,6 @@ def _gpu_uuids_for(node: NodeSpec, gpu_ids: tuple[int, ...]) -> tuple[str, ...]:
     if len(node.gpu_uuids) != node.gpus:
         raise ValueError(f"node {node.name}: gpu_uuids length does not match gpus")
     return tuple(node.gpu_uuids[gpu] for gpu in gpu_ids)
-
-
-def _record_bound_budget(bound_counts: dict[tuple[str, int], int], node_name: str, gpu_ids: tuple[int, ...]) -> None:
-    for gpu in gpu_ids:
-        key = (node_name, gpu)
-        bound_counts[key] = bound_counts.get(key, 0) + 1
-        if bound_counts[key] > MAX_BOUND_PER_GPU:
-            raise ValueError(
-                f"gpu bound budget exceeded for {node_name}/{gpu}: {bound_counts[key]} > {MAX_BOUND_PER_GPU}"
-            )
 
 
 def main(argv: Iterable[str] | None = None) -> None:
