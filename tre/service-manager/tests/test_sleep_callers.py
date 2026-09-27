@@ -1,6 +1,7 @@
 """Every sleep path goes through the sleep primitive (plan 2026-09-27 D1/D2)."""
 
 import ast
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -34,22 +35,129 @@ TRE_SM = Path(__file__).resolve().parents[1] / "tre_sm"
 PRIMITIVE = TRE_SM / "ops" / "sleep_primitive.py"
 
 
-def test_only_the_sleep_primitive_calls_vllm_sleep():
-    """Static guard: no module but the primitive may POST /sleep (plan D2)."""
+TRE_ROOT = TRE_SM.parents[1]
+#: Every production Python tree of TRE (tests excluded).
+GUARDED_TREES = [
+    TRE_ROOT / "service-manager" / "tre_sm",
+    TRE_ROOT / "controller" / "tre_controller",
+    TRE_ROOT / "deploy",
+    TRE_ROOT / "calibration",
+    TRE_ROOT / "replayer",
+    TRE_ROOT / "loadgen_v1",
+    TRE_ROOT / "ui",
+]
+#: The only code allowed to put a vLLM engine to sleep directly (plan D2):
+#: (file relative to tre/, enclosing function or None for the whole file, reason).
+SLEEP_CALLER_ALLOWLIST = {
+    ("service-manager/tre_sm/ops/sleep_primitive.py", None): "the sleep primitive itself",
+    ("service-manager/tre_sm/ops/vllm_ops.py", "sleep"): "the HTTP client method the primitive calls",
+    # Offline bootstrap of an empty, controller-paused fleet: each binding is cold
+    # started on an idle GPU with no routes and no traffic (it is never routable
+    # before it sleeps), so there is nothing to hide or drain. Kept as an explicit
+    # exception; the online path is the service-manager fleet repair.
+    ("deploy/scripts/staggered_model_fleet.py", "main"): "offline fleet bootstrap without traffic",
+}
+#: vLLM's /sleep; the service-manager's own read-only GET /v2/sleep is not it.
+_SLEEP_URL = re.compile(r"(?<!/v2)/sleep(?![A-Za-z0-9_])")
+
+
+def _python_files():
+    for tree in GUARDED_TREES:
+        for path in sorted(tree.rglob("*.py")):
+            if "tests" in path.relative_to(tree).parts or path.name.startswith("test_"):
+                continue
+            yield path
+
+
+def _docstring_nodes(tree):
+    nodes = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            body = getattr(node, "body", [])
+            if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant):
+                nodes.add(id(body[0].value))
+    return nodes
+
+
+def _enclosing_functions(tree):
+    owner = {}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for child in ast.walk(node):
+                owner.setdefault(id(child), node.name)
+    return owner
+
+
+def _vllm_ish(node) -> bool:
+    return "vllm" in ast.unparse(node).lower()
+
+
+def _sleep_call_sites(path):
+    """(lineno, function, what) of every way to reach vLLM /sleep in a file."""
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    docstrings = _docstring_nodes(tree)
+    owner = _enclosing_functions(tree)
+    sites = []
+    for node in ast.walk(tree):
+        what = None
+        if isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in docstrings:
+            if _SLEEP_URL.search(node.value):
+                what = f"/sleep URL literal {node.value!r}"
+        elif isinstance(node, ast.Attribute) and node.attr == "sleep" and _vllm_ish(node.value):
+            what = f"vLLM ops .sleep ({ast.unparse(node)})"  # call or alias
+        elif isinstance(node, ast.Call):
+            func = ast.unparse(node.func)
+            string_args = [a.value for a in node.args if isinstance(a, ast.Constant) and isinstance(a.value, str)]
+            if func == "getattr" and "sleep" in string_args and node.args and _vllm_ish(node.args[0]):
+                what = f"getattr alias of vLLM sleep ({ast.unparse(node)})"
+            elif "post" in func.lower() and "sleep" in string_args:
+                what = f"POST of the sleep action ({ast.unparse(node)})"
+        if what is not None:
+            sites.append((node.lineno, owner.get(id(node)), what))
+    return sites
+
+
+def test_only_the_sleep_primitive_reaches_vllm_sleep():
+    """Static guard (plan D2): no code but the primitive may POST /sleep, in any
+    TRE tree (service-manager, controller, deploy scripts, ...)."""
     offenders = []
-    for path in sorted(TRE_SM.rglob("*.py")):
-        if path == PRIMITIVE:
-            continue
-        tree = ast.parse(path.read_text(encoding="utf-8"))
-        for node in ast.walk(tree):
-            if (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
-                and node.func.attr == "sleep"
-                and "vllm" in ast.unparse(node.func.value).lower()
-            ):
-                offenders.append(f"{path.relative_to(TRE_SM)}:{node.lineno}")
+    used = set()
+    for path in _python_files():
+        rel = path.relative_to(TRE_ROOT).as_posix()
+        for lineno, function, what in _sleep_call_sites(path):
+            if (rel, None) in SLEEP_CALLER_ALLOWLIST:
+                used.add((rel, None))
+                continue
+            if (rel, function) in SLEEP_CALLER_ALLOWLIST:
+                used.add((rel, function))
+                continue
+            offenders.append(f"{rel}:{lineno} in {function}: {what}")
     assert offenders == []
+    assert used == set(SLEEP_CALLER_ALLOWLIST), "stale allow-list entries"
+
+
+def test_the_guard_detects_every_known_bypass(tmp_path):
+    sample = tmp_path / "bypass.py"
+    sample.write_text(
+        "def a(vllm_ops):\n"
+        "    vllm_ops.sleep('10.0.0.1')\n"
+        "def b(self):\n"
+        "    fn = self._vllm.sleep\n"
+        "def c(ops):\n"
+        "    return getattr(ops.vllm, 'sleep')\n"
+        "def d(self, ip):\n"
+        "    self._post(ip, 'sleep')\n"
+        "def e(http, ip):\n"
+        "    http.post(f'http://{ip}:8000/sleep?mode=abort')\n"
+        "def f(time):\n"
+        "    '''a docstring mentioning POST /sleep is fine'''\n"
+        "    time.sleep(1)\n",
+        encoding="utf-8",
+    )
+    kinds = [what.split(" ")[0] for _line, _fn, what in _sleep_call_sites(sample)]
+    lines = sorted(line for line, _fn, _what in _sleep_call_sites(sample))
+    assert lines == [2, 4, 6, 8, 10]
+    assert kinds.count("/sleep") == 1
 
 
 def test_primitive_does_call_vllm_sleep():

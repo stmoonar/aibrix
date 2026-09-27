@@ -220,6 +220,11 @@ def main() -> int:
         )
         pod_ip = pod["status"]["podIP"]
         _wait_vllm_ready(pod_ip, timeout_s=args.timeout_s)
+        # Explicit exception to "only the service-manager sleep primitive calls
+        # /sleep" (allow-listed in service-manager/tests/test_sleep_callers.py):
+        # offline bootstrap of an empty, controller-paused fleet - this pod was just
+        # cold started with no route and no traffic, so there is nothing to hide or
+        # drain. The online equivalent is the service-manager fleet repair.
         _http_json(f"http://{pod_ip}:8000/sleep", method="POST")
         _wait_until(
             lambda: _is_sleeping(pod_ip) is True,
