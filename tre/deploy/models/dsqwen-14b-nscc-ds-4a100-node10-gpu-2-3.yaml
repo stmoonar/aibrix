@@ -40,6 +40,10 @@ spec:
       - name: models-volume
         hostPath:
           path: /data
+      - name: tre-reissue-sidecar
+        configMap:
+          name: tre-reissue-sidecar
+          defaultMode: 292
       initContainers:
       - name: tre-startup-gate
         image: vllm/vllm-openai:0.10.1-sleep
@@ -74,9 +78,9 @@ spec:
         - -m
         - vllm.entrypoints.openai.api_server
         - --host
-        - 0.0.0.0
+        - 127.0.0.1
         - --port
-        - '8000'
+        - '8001'
         - --uvicorn-log-level
         - warning
         - --model
@@ -104,6 +108,41 @@ spec:
           value: spawn
         - name: VLLM_USE_MODELSCOPE
           value: 'True'
+        resources: {}
+        volumeMounts:
+        - name: shm
+          mountPath: /dev/shm
+        - name: models-volume
+          mountPath: /data
+      - name: tre-reissue-sidecar
+        image: vllm/vllm-openai:0.10.1-sleep
+        imagePullPolicy: IfNotPresent
+        command:
+        - python3
+        - /opt/tre-reissue/sidecar.py
+        env:
+        - name: TRE_REISSUE_LISTEN_PORT
+          value: '8000'
+        - name: TRE_REISSUE_UPSTREAM_URL
+          value: http://127.0.0.1:8001
+        - name: TRE_GATEWAY_URL
+          value: http://envoy-tre-v2-tre-aibrix-eg-161007f9.envoy-gateway-system.svc.cluster.local:80
+        - name: TRE_REISSUE_MODEL
+          value: dsqwen-14b
+        - name: TRE_REISSUE_MAX_DEPTH
+          value: '3'
+        - name: TRE_REISSUE_RETRY_ATTEMPTS
+          value: '4'
+        - name: TRE_REISSUE_REQUIRE_HIDDEN_HEADER
+          value: 'true'
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: NVIDIA_VISIBLE_DEVICES
+          value: void
+        - name: PYTHONUNBUFFERED
+          value: '1'
         ports:
         - containerPort: 8000
           protocol: TCP
@@ -114,9 +153,14 @@ spec:
           periodSeconds: 2
           timeoutSeconds: 2
           failureThreshold: 300
-        resources: {}
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            cpu: 500m
+            memory: 256Mi
         volumeMounts:
-        - name: shm
-          mountPath: /dev/shm
-        - name: models-volume
-          mountPath: /data
+        - name: tre-reissue-sidecar
+          mountPath: /opt/tre-reissue
+          readOnly: true

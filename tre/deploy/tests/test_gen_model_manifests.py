@@ -91,7 +91,10 @@ def test_build_deployments_encodes_node_gpu_binding_and_vllm_args(tmp_path):
     [gate] = rendered["spec"]["template"]["spec"]["initContainers"]
     assert gate["name"] == "tre-startup-gate"
     assert "/v2/startup/admit" in gate["command"][2]
-    assert container["readinessProbe"]["httpGet"] == {"path": "/health", "port": 8000}
+    # The pod is ready when the serving port answers /health (the reissue sidecar owns the
+    # port and proxies vLLM's /health; without the sidecar vLLM itself does).
+    probes = [c["readinessProbe"] for c in rendered["spec"]["template"]["spec"]["containers"] if "readinessProbe" in c]
+    assert [p["httpGet"] for p in probes] == [{"path": "/health", "port": 8000}]
 
 
 def test_cuda_visible_devices_uses_container_local_ordinals(tmp_path):
@@ -324,12 +327,13 @@ def test_write_manifests_includes_services_and_deployments(tmp_path):
 
     written = write_manifests(registry, tmp_path / "models")
 
-    assert len(build_resources(registry)) == 8
+    assert len(build_resources(registry)) == 9
     assert sorted(item.name for item in written) == [
         "one-gpu-node-75-gpu-0.yaml",
         "one-gpu-node-75-gpu-1.yaml",
         "one-gpu-router.yaml",
         "one-gpu.yaml",
+        "tre-reissue-sidecar.yaml",
         "tre-v2-model-referencegrant-in-default.yaml",
         "two-gpu-node-75-gpu-0-1.yaml",
         "two-gpu-router.yaml",

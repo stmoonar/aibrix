@@ -125,6 +125,9 @@ class ModelSpec:
     #: service-manager target / binding wake, console). ``None`` = ``max_replicas``.
     #: Registry key models[].max_awake_replicas (v1/paper alignment A1: 4 for TRE and APA).
     max_awake_replicas: int | None = None
+    #: Optional vLLM fork features the model's image supports (``VLLM_FEATURE_FLAGS``);
+    #: their flags are rendered only while the reissue sidecar is enabled.
+    vllm_features: tuple[str, ...] = ()
 
     @property
     def scale_max_replicas(self) -> int:
@@ -174,6 +177,59 @@ DEFAULT_ROUTE_TIMEOUT_S = 150.0
 
 #: ``service_manager.sleep.vllm_sleep_mode_param`` values.
 SLEEP_MODE_PARAM_CHOICES = ("auto", "true", "false")
+
+
+#: vLLM fork features a model image may declare (``models[].vllm_features``) and the
+#: engine flags they enable (fork branch tre/transparent-sleep). Both only matter to the
+#: reissue sidecar, so the flags are rendered only while ``reissue.enabled``.
+VLLM_FEATURE_FLAGS: dict[str, tuple[str, ...]] = {
+    # 503 + Retry-After + {"error": {"type": "EngineSleeping"}} for new requests while
+    # the engine sleeps / is paused (the sidecar retries them elsewhere).
+    "sleep_reject_new": ("--sleep-reject-new",),
+    # abort outputs carry prompt_token_ids + generated_token_ids (token-exact continuation).
+    "abort_return_token_ids": ("--abort-return-token-ids",),
+}
+
+#: In-cluster Service of the tre-v2 Envoy (Gateway tre-v2/tre-aibrix-eg). Envoy Gateway
+#: names it envoy-<gateway-namespace>-<gateway-name>-<hash of namespace/name>, so the
+#: name is the same in every cluster that deploys this Gateway.
+DEFAULT_REISSUE_GATEWAY_URL = (
+    "http://envoy-tre-v2-tre-aibrix-eg-161007f9.envoy-gateway-system.svc.cluster.local:80"
+)
+#: The pod's serving port (Service targetPort, model.aibrix.ai/port, gateway target-pod,
+#: service-manager, probes). With the sidecar enabled the sidecar listens here.
+POD_SERVING_PORT = 8000
+
+
+@dataclass(frozen=True)
+class ReissueConfig:
+    """Registry ``reissue:`` section: the retry / continuation sidecar in every model pod
+    (tre/docs/design/20260927-reissue-sidecar-v2.md). Read by ``make manifests`` AND by
+    the service-manager when it creates a Deployment at runtime, so both render the same
+    pod. Disabled, the model pods are rendered exactly as without the sidecar (vLLM on
+    the serving port, no fork flags)."""
+
+    enabled: bool = True
+    #: TRE gateway reached from inside the cluster (DNS name, never an IP / NodePort).
+    gateway_url: str = DEFAULT_REISSUE_GATEWAY_URL
+    #: vLLM's internal port (127.0.0.1) behind the sidecar.
+    vllm_port: int = 8001
+    #: Max retry / continuation hops of one request.
+    max_depth: int = 3
+    #: Gateway attempts per retry / continuation.
+    retry_attempts: int = 4
+    #: None = the model's vllm_image (it ships python3 + aiohttp; the script comes from
+    #: a ConfigMap, so no image build is needed).
+    image: str | None = None
+    configmap: str = "tre-reissue-sidecar"
+    #: Namespace of the model Deployments (and of the script ConfigMap).
+    namespace: str = "default"
+    cpu_request: str = "50m"
+    cpu_limit: str = "500m"
+    memory_request: str = "64Mi"
+    memory_limit: str = "256Mi"
+    #: Extra TRE_REISSUE_* environment for the sidecar (field / header / path names).
+    extra_env: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -355,11 +411,13 @@ class Registry:
         models: list[ModelSpec],
         service_manager: ServiceManagerConfig | None = None,
         gateway: GatewayConfig | None = None,
+        reissue: ReissueConfig | None = None,
     ) -> None:
         self._topology = topology
         self._models = tuple(models)
         self._service_manager = service_manager or ServiceManagerConfig()
         self._gateway = gateway or GatewayConfig()
+        self._reissue = reissue or ReissueConfig()
         self._model_index: dict[str, ModelSpec] = {}
         for model in models:
             self._model_index.setdefault(model.name, model)
@@ -369,6 +427,9 @@ class Registry:
 
     def gateway(self) -> GatewayConfig:
         return self._gateway
+
+    def reissue(self) -> ReissueConfig:
+        return self._reissue
 
     def model(self, name: str) -> ModelSpec:
         try:
@@ -400,6 +461,12 @@ class Registry:
                 errors.append(f"model {model.name}: min_replicas must be non-negative")
             if model.max_replicas < model.min_replicas:
                 errors.append(f"model {model.name}: max_replicas below min_replicas")
+            unknown = sorted(set(model.vllm_features) - set(VLLM_FEATURE_FLAGS))
+            if unknown:
+                errors.append(
+                    f"model {model.name}: unknown vllm_features {unknown} "
+                    f"(known: {', '.join(sorted(VLLM_FEATURE_FLAGS))})"
+                )
             if model.max_awake_replicas is not None and not (
                 model.min_replicas <= model.max_awake_replicas <= model.max_replicas
             ):
@@ -452,6 +519,7 @@ class Registry:
                         errors.append(f"node {node.name}: gpu {gpu} outside gpu range 0..{node.gpus - 1}")
         if self._topology.max_bound_per_gpu < 1:
             errors.append("cluster.max_bound_per_gpu must be >= 1")
+        errors.extend(_validate_reissue(self._reissue))
         errors.extend(_validate_service_manager(self._service_manager, self._gateway))
         return errors
 
@@ -479,7 +547,57 @@ def _parse_registry(raw: dict[str, Any]) -> Registry:
             raw.get("service_manager"), gateway=raw.get("gateway")
         ),
         gateway=parse_gateway_config(raw.get("gateway")),
+        reissue=parse_reissue_config(raw.get("reissue")),
     )
+
+
+def parse_reissue_config(raw: Any) -> ReissueConfig:
+    """Parse the optional ``reissue:`` registry section (absent = defaults, enabled)."""
+    if raw is None:
+        return ReissueConfig()
+    if not isinstance(raw, dict):
+        raise ValueError("reissue must be a mapping")
+    known = {f for f in ReissueConfig.__dataclass_fields__}
+    unknown = sorted(set(raw) - known)
+    if unknown:
+        raise ValueError(f"reissue: unknown keys {unknown} (known: {', '.join(sorted(known))})")
+    defaults = ReissueConfig()
+    extra_env = raw.get("extra_env") or {}
+    if not isinstance(extra_env, dict):
+        raise ValueError("reissue.extra_env must be a mapping")
+    return ReissueConfig(
+        enabled=_parse_bool(raw.get("enabled", defaults.enabled)),
+        gateway_url=str(raw.get("gateway_url") or defaults.gateway_url).rstrip("/"),
+        vllm_port=int(raw.get("vllm_port", defaults.vllm_port)),
+        max_depth=int(raw.get("max_depth", defaults.max_depth)),
+        retry_attempts=int(raw.get("retry_attempts", defaults.retry_attempts)),
+        image=(str(raw["image"]) if raw.get("image") else None),
+        configmap=str(raw.get("configmap", defaults.configmap)),
+        namespace=str(raw.get("namespace", defaults.namespace)),
+        cpu_request=str(raw.get("cpu_request", defaults.cpu_request)),
+        cpu_limit=str(raw.get("cpu_limit", defaults.cpu_limit)),
+        memory_request=str(raw.get("memory_request", defaults.memory_request)),
+        memory_limit=str(raw.get("memory_limit", defaults.memory_limit)),
+        extra_env={str(k): str(v) for k, v in extra_env.items()},
+    )
+
+
+def _validate_reissue(reissue: ReissueConfig) -> list[str]:
+    errors: list[str] = []
+    if not reissue.enabled:
+        return errors
+    if not reissue.gateway_url.startswith(("http://", "https://")):
+        errors.append("reissue.gateway_url must be an http(s) URL (in-cluster DNS name)")
+    if not 1 <= reissue.vllm_port <= 65535 or reissue.vllm_port == POD_SERVING_PORT:
+        errors.append(f"reissue.vllm_port must be a valid port other than {POD_SERVING_PORT}")
+    if reissue.max_depth < 0:
+        errors.append("reissue.max_depth must be non-negative")
+    if reissue.retry_attempts < 1:
+        errors.append("reissue.retry_attempts must be >= 1")
+    for key in reissue.extra_env:
+        if not key.startswith("TRE_"):
+            errors.append(f"reissue.extra_env: {key} is not a TRE_* variable")
+    return errors
 
 
 def parse_gateway_config(raw: dict[str, Any] | None) -> GatewayConfig:
@@ -749,6 +867,7 @@ def _parse_model(raw: dict[str, Any]) -> ModelSpec:
             ema_tau_ms=(float(trs["ema_tau_ms"]) if trs.get("ema_tau_ms") is not None else None),
         ),
         vllm_extra_args=tuple(str(arg) for arg in raw.get("vllm_extra_args", [])),
+        vllm_features=tuple(str(feature) for feature in raw.get("vllm_features") or ()),
         alt_thresholds={
             str(signal): AltThreshold(
                 theta=float(values["theta"]),

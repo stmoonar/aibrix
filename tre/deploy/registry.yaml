@@ -205,6 +205,28 @@ gateway:
   # route timeout (overlays/tre-v2/gateway-extproc.yaml) equal; a guard test
   # enforces it.
   route_timeout_s: 150
+# Retry / continuation sidecar in every model pod (plan 2026-09-27 D5/D6; design
+# tre/docs/design/20260927-reissue-sidecar-v2.md). Every key is optional; the values
+# below are the built-in defaults. The sidecar takes the serving port 8000 and vLLM
+# moves to 127.0.0.1:vllm_port; enabled: false renders the model pods exactly as
+# without it. Aborted requests are continued only on images that declare the vLLM
+# fork features (models[].vllm_features: [sleep_reject_new, abort_return_token_ids],
+# which also add the engine flags); without them the sidecar still retries requests
+# that reach a sleeping pod. Read by make manifests and by the service-manager
+# (runtime creates), so keep the tre-v2-registry ConfigMap copy equal.
+reissue:
+  enabled: true
+  # In-cluster DNS name of the tre-v2 Envoy Service (never an IP / NodePort).
+  gateway_url: http://envoy-tre-v2-tre-aibrix-eg-161007f9.envoy-gateway-system.svc.cluster.local:80
+  vllm_port: 8001
+  max_depth: 3
+  retry_attempts: 4
+  # null = the model's vllm_image (python3 + aiohttp; the script comes from a ConfigMap).
+  image: null
+  cpu_request: 50m
+  cpu_limit: 500m
+  memory_request: 64Mi
+  memory_limit: 256Mi
 # Service-manager behaviour (plan 2026-09-27). Every key is optional; the values
 # below are the built-in defaults. Changes to the LIVE registry (ConfigMap
 # tre-v2-registry) go through the console (PUT /api/params), never a kubectl apply
