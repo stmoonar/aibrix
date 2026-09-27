@@ -5,7 +5,11 @@ from tre_common.registry import ClusterTopology, ModelSpec, NodeSpec, Registry, 
 from tre_controller.config import SafeScaleConfig
 from tre_controller.loops.action_queue import SubmitResult
 from tre_controller.loops.safescale_task import run_safescale_observation_tick
-from tre_controller.planning.planner import ScaleAction, UnhideAction
+from tre_controller.planning.planner import (
+    ReceiverTarget,
+    SafeScaleCommitAction,
+    UnhideAction,
+)
 from tre_controller.planning.safescale import SafeScaleStateMachine
 
 
@@ -94,14 +98,19 @@ def test_safescale_observation_tick_submits_commit_actions_after_deadline() -> N
 
     assert pending.submitted == 0
     assert pending.events == ("safescale_probe_pending:donor",)
-    assert committed.submitted == 2
+    # Review 3 P2-1/P2-2: one ordered commit action; without a cluster view the
+    # receiver's absolute target is resolved once at the first dispatch.
+    assert committed.submitted == 1
     assert queue.submitted == [
         (
-            ScaleAction(
-                "donor", -1, "formal_commit_gate_passed", "safescale", pods=("pod-a",),
-                sleep_path="safescale_commit", drain_budget_s=1.0,
+            SafeScaleCommitAction(
+                donor="donor",
+                pods=("pod-a",),
+                reason="formal_commit_gate_passed",
+                upscales=(ReceiverTarget("receiver", 1, None),),
+                drain_budget_s=1.0,
+                request_id="donor-0",
             ),
-            ScaleAction("receiver", 1, "safescale_followup_upscale", "safescale"),
         )
     ]
     # No per-pod KV-cache data in this window: the gate passes, and says so (P2-a).

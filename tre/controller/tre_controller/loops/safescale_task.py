@@ -10,7 +10,13 @@ from tre_common.metrics_schema import MetricsSnapshot, ModelWindowMetrics
 from tre_common.registry import Registry
 from tre_controller.gateway_health import GatewayCounters
 from tre_controller.loops.tick import serving_window
-from tre_controller.planning.planner import Action, ClusterView, ScaleAction, UnhideAction
+from tre_controller.planning.planner import (
+    Action,
+    ClusterView,
+    ReceiverTarget,
+    SafeScaleCommitAction,
+    UnhideAction,
+)
 from tre_controller.planning.safescale import ProbeObservation, SafeScaleCommand, SafeScaleProbe
 from tre_controller.signals.sources import get_signal
 from tre_controller.signals.trs import SignalState, TRSComputer, TRSInput
@@ -103,7 +109,12 @@ def run_safescale_observation_tick(
                 f"safescale_donor_health:{probe.model}:errors={health.get('errors', 0):.0f}"
                 f":requests={health.get('requests', 0):.0f}:rate={health.get('error_rate', 0.0):.4f}"
             )
-        actions = _commands_to_actions(decision.commands)
+        actions = _commands_to_actions(
+            decision.commands,
+            cluster_view=cluster_view,
+            registry=registry,
+            request_id=_probe_request_id(safescale, probe.model),
+        )
         if not actions:
             continue
         try:
@@ -247,24 +258,77 @@ def _observation_from_metrics(
     )
 
 
-def _commands_to_actions(commands: tuple[SafeScaleCommand, ...]) -> tuple[Action, ...]:
+def _probe_request_id(safescale: SafeScaleObserver, model: str) -> str | None:
+    active = getattr(safescale, "active_probe", None)
+    probe = active(model) if callable(active) else None
+    return getattr(probe, "request_id", None)
+
+
+def _commands_to_actions(
+    commands: tuple[SafeScaleCommand, ...],
+    *,
+    cluster_view: ClusterView | None = None,
+    registry: Registry | None = None,
+    request_id: str | None = None,
+) -> tuple[Action, ...]:
+    """A rollback is one unhide; a commit batch is ONE :class:`SafeScaleCommitAction`
+    (review 3 P2-2): the hidden donor pods sleep first, then the receivers are
+    brought up to ABSOLUTE targets computed here, at planning time, from the
+    cluster view (review 3 P2-1) - never ``current + delta`` at dispatch."""
     actions: list[Action] = []
+    donor = next((command for command in commands if command.kind == "scale_down"), None)
+    upscales = tuple(
+        ReceiverTarget(
+            command.model,
+            int(command.delta),
+            _absolute_target(command.model, int(command.delta), cluster_view, registry),
+        )
+        for command in commands
+        if command.kind == "scale_up" and command.delta > 0
+    )
     for command in commands:
         if command.kind == "unhide":
             actions.append(UnhideAction(command.model, command.pods, command.reason, "safescale"))
-        elif command.kind in {"scale_down", "scale_up"}:
-            if command.kind == "scale_down":
-                actions.append(
-                    ScaleAction(
-                        command.model,
-                        command.delta,
-                        command.reason,
-                        "safescale",
-                        pods=command.pods,
-                        sleep_path="safescale_commit",
-                        drain_budget_s=command.drain_budget_s,
-                    )
-                )
-            else:
-                actions.append(ScaleAction(command.model, command.delta, command.reason, "safescale"))
+    if donor is not None:
+        actions.append(
+            SafeScaleCommitAction(
+                donor=donor.model,
+                pods=donor.pods,
+                reason=donor.reason,
+                upscales=upscales,
+                drain_budget_s=donor.drain_budget_s,
+                request_id=request_id,
+            )
+        )
+    elif upscales:
+        actions.append(
+            SafeScaleCommitAction(
+                donor=upscales[0].model,
+                pods=(),
+                reason="safescale_followup_upscale",
+                upscales=upscales,
+                request_id=request_id,
+                donor_done=True,
+            )
+        )
     return tuple(actions)
+
+
+def _absolute_target(
+    model: str, delta: int, cluster_view: ClusterView | None, registry: Registry | None
+) -> int | None:
+    """Receiver's awake count (hidden probe pods included, as the SM counts) plus
+    the planned upscale, capped at its scaling cap. None without a cluster view:
+    the queue then resolves it once from the SM state at the first dispatch."""
+    if cluster_view is None:
+        return None
+    awake = sum(1 for binding in cluster_view.bindings if binding.model == model and binding.awake)
+    target = awake + max(0, int(delta))
+    if registry is not None:
+        try:
+            cap = int(registry.model(model).scale_max_replicas)
+        except (KeyError, ValueError, AttributeError):
+            cap = None
+        if cap is not None:
+            target = min(target, max(cap, awake))
+    return target

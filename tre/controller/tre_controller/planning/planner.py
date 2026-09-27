@@ -132,6 +132,67 @@ class TransferAction:
         return self.receiver.model
 
 
+@dataclass(frozen=True)
+class ReceiverTarget:
+    """A SafeScale follow-up upscale as an ABSOLUTE target: the receiver's desired
+    awake count, computed when the commit was planned (review 3 P2-1). A retry
+    re-sends the same target, so an SM call that succeeded but timed out on the
+    client is never applied twice. ``target`` None = resolve it once from the SM
+    state at the first dispatch (no cluster view at planning time), then frozen."""
+
+    model: str
+    delta: int
+    target: int | None = None
+
+
+@dataclass(frozen=True)
+class SafeScaleCommitAction:
+    """One SafeScale commit batch (review 3 P2-1..P2-3), executed by the
+    ActionQueue as an ordered one-shot unit - the SafeScale analogue of
+    :class:`TransferAction`:
+
+    1. revalidate against the CURRENT signal state (before every (re)try): the
+       donor now needing capacity abandons the commit (its hidden pods are
+       unhidden instead); a receiver that no longer needs capacity loses its
+       upscale;
+    2. sleep exactly the hidden probe pods of the donor;
+    3. only then wake the receivers, each to its absolute ``target`` (dropped
+       if the donor sleep failed).
+
+    ``donor_done`` records progress across retries (a retry never re-sleeps a
+    donor that already slept, and only re-sends the upscales still pending)."""
+
+    donor: str
+    pods: tuple[str, ...]
+    reason: str
+    upscales: tuple[ReceiverTarget, ...] = ()
+    drain_budget_s: float | None = None
+    request_id: str | None = None
+    source_loop: SourceLoop = "safescale"
+    donor_done: bool = False
+
+    @property
+    def model(self) -> str:
+        return self.donor
+
+    @property
+    def touched_models(self) -> tuple[str, ...]:
+        """Models this commit still changes (the donor until it slept)."""
+        models = () if self.donor_done else (self.donor,)
+        return tuple(dict.fromkeys(models + tuple(item.model for item in self.upscales)))
+
+    def donor_sleep(self) -> ScaleAction:
+        return ScaleAction(
+            self.donor,
+            -len(self.pods),
+            self.reason,
+            self.source_loop,
+            pods=self.pods,
+            sleep_path="safescale_commit",
+            drain_budget_s=self.drain_budget_s,
+        )
+
+
 def fuse_transfers(actions) -> list:
     """Replace each donor/receiver ScaleAction pair sharing a ``transfer_id`` by one
     :class:`TransferAction` (at the donor's position). A half whose partner is
@@ -178,8 +239,13 @@ def build_plan(
     cluster_view: ClusterView | None = None,
     cooldowns: Mapping[str, str] | None = None,
     probe_backoff_models: set[str] | None = None,
+    preemptible_models: set[str] | None = None,
 ) -> PlanResult:
     active_probe_models = active_probe_models or set()
+    # Review 3 P2-3: models whose only in-flight work is a SafeScale commit waiting
+    # out a retry backoff. A CRITICAL receiver among them is still planned: the
+    # queue preempts that retry when the rescue action is submitted.
+    preemptible_models = preemptible_models or set()
     # A13: models whose last SafeScale probe rolled back recently (no new HIGH proactive
     # probe until TRE_SAFESCALE_ROLLBACK_BACKOFF_MS has passed).
     probe_backoff_models = probe_backoff_models or set()
@@ -257,7 +323,7 @@ def build_plan(
 
     if cfg.rescue_due:
         for recv in critical_receivers:
-            if recv.model_name in inflight_models:
+            if recv.model_name in inflight_models and recv.model_name not in preemptible_models:
                 continue
             if cooldown.blocks(recv.model_name, "up", critical=True):
                 continue

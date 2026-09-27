@@ -86,12 +86,13 @@ class ServiceManagerClient:
         sleep_path: str | None = None,
         drain_budget_s: float | None = None,
     ) -> dict:
+        """RELATIVE scale (current awake + ``delta``, read at dispatch). Not
+        idempotent: callers never retry it (review 3 P2-1) - a retried upscale
+        uses :meth:`scale_model_to` with an absolute target."""
         try:
-            state = await self.get_state()
-            counts = state.get("models", {}).get(model, {})
-            current = int(counts.get("awake", 0))
-            bound = int(counts.get("bound", 0))
-            serving_floor = 1 if bound > 0 and current > 0 and int(delta) < 0 else 0
+            counts = await self._model_counts(model)
+            current = counts["awake"]
+            serving_floor = 1 if counts["bound"] > 0 and current > 0 and int(delta) < 0 else 0
             target = max(serving_floor, current + int(delta))
             payload: dict = {"wake_replicas": target}
             payload.update(_sleep_fields(sleep_path, drain_budget_s))
@@ -101,6 +102,48 @@ class ServiceManagerClient:
             return {"ok": True, "response": response}
         except ServiceManagerError as exc:
             return exc.result()
+
+    async def scale_model_to(self, model: str, target: int) -> dict:
+        """Grow ``model`` to at least ``target`` awake replicas (absolute and
+        grow-only, review 3 P2-1): re-sending it after a success that timed out
+        on the client is a no-op, and it never shrinks a model that meanwhile grew
+        past the target. The SM applies ``at_least`` under its writer lock; the
+        pre-check also keeps a service-manager without ``at_least`` from shrinking."""
+        try:
+            target = int(target)
+            counts = await self._model_counts(model)
+            if counts["awake"] >= target:
+                return {"ok": True, "response": {"model": model, "wake_replicas": target, "actions": [], "noop": True}}
+            response = await self._request(
+                "PUT",
+                f"/v2/models/{model}/target",
+                json={"wake_replicas": target, "at_least": True},
+                timeout_s=self._slow_timeout_s,
+            )
+            return {"ok": True, "response": response}
+        except ServiceManagerError as exc:
+            return exc.result()
+
+    async def model_awake(self, model: str) -> dict:
+        """{"ok": True, "awake": n} from the SM state, or a failed result."""
+        try:
+            counts = await self._model_counts(model)
+            return {"ok": True, "awake": counts["awake"]}
+        except ServiceManagerError as exc:
+            return exc.result()
+
+    async def _model_counts(self, model: str) -> dict[str, int]:
+        """Awake / bound counts of ``model`` from GET /v2/state. A malformed
+        answer is a (permanent) ServiceManagerError, never a raw exception."""
+        state = await self.get_state()
+        models = state.get("models", {})
+        counts = models.get(model, {}) if isinstance(models, dict) else None
+        if not isinstance(counts, dict):
+            raise ServiceManagerError(f"malformed /v2/state for {model}: models entry is not an object")
+        try:
+            return {"awake": int(counts.get("awake", 0)), "bound": int(counts.get("bound", 0))}
+        except (TypeError, ValueError) as exc:
+            raise ServiceManagerError(f"malformed /v2/state counts for {model}: {counts!r}") from exc
 
     async def set_binding_power(
         self,

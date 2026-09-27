@@ -11,6 +11,7 @@ from tre_controller.gateway_health import EnvoyStatsSource
 from tre_controller.loops.action_queue import (
     ActionQueue,
     RetryPolicy,
+    revalidate_commit_from_signals,
     revalidate_from_cluster_view,
     slot_lookup_from_cluster_view,
 )
@@ -20,6 +21,7 @@ from tre_controller.profiling import TickProfiler, build_profiler
 from tre_controller.loops.cluster_view_task import ClusterViewBox, cluster_view_task
 from tre_controller.loops.decision_snapshot import DecisionSnapshotWriter
 from tre_controller.loops.fairness_task import fairness_task
+from tre_controller.loops.model_state_box import ModelStateBox
 from tre_controller.loops.metrics_task import MetricsTaskConfig, SnapshotBox, SnapshotStore, metrics_task
 from tre_controller.loops.rescue_task import rescue_task
 from tre_controller.loops.safescale_task import safescale_task
@@ -49,6 +51,8 @@ class ControllerDependencies:
     hidden_orphan_detector: "HiddenOrphanDetector | None" = None
     # A13 donor-health guard source (None when TRE_GATEWAY_STATS_URL is unset).
     gateway_health: "EnvoyStatsSource | None" = None
+    # Review 3: latest per-model signal state (planner ticks -> commit revalidation).
+    model_state_box: "ModelStateBox | None" = None
 
 
 @dataclass(frozen=True)
@@ -94,6 +98,7 @@ def build_controller_task_specs(
                     safescale=deps.safescale,
                     signal_state=deps.signal_state,
                     prof=deps.profiler,
+                    model_state_box=deps.model_state_box,
                 ),
             )
         )
@@ -111,6 +116,7 @@ def build_controller_task_specs(
                 safescale=deps.safescale,
                 signal_state=deps.signal_state,
                 prof=deps.profiler,
+                model_state_box=deps.model_state_box,
             ),
         )
     )
@@ -204,6 +210,7 @@ def create_controller_dependencies(
     observe_gate = ObserveModeGate(redis_client)
     profiler = build_profiler(cfg, redis_client)
     cluster_view_box = ClusterViewBox()
+    model_state_box = ModelStateBox()
     return ControllerDependencies(
         store=store,
         snapshot_box=SnapshotBox(),
@@ -219,8 +226,13 @@ def create_controller_dependencies(
             # One-shot retries re-check the latest cluster view; actions on a shared
             # GPU are serialized (review 2 P1-1 / P1-2).
             revalidate=revalidate_from_cluster_view(cluster_view_box.get),
+            # Review 3: a SafeScale commit is revalidated on the current signal state
+            # (donor needing capacity -> unhide instead; receiver no longer needing it
+            # -> upscale dropped) before every (re)try.
+            revalidate_commit=revalidate_commit_from_signals(model_state_box.get, cluster_view_box.get),
             slot_of=slot_lookup_from_cluster_view(cluster_view_box.get),
         ),
+        model_state_box=model_state_box,
         sm_client=sm_client,
         cluster_view_box=cluster_view_box,
         decision_writer=DecisionSnapshotWriter(redis_client),

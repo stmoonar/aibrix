@@ -176,13 +176,15 @@ def test_commit_enqueue_success_marks_probe_resolved_without_deleting_it():
     store = ControllerStateStore(redis)
     machine = _machine(store)
     _start_and_prime(machine)
-    queue = OutcomeQueue(2)
+    # Review 3 P2-2: the commit batch (donor sleep + follow-up upscales) is ONE
+    # ordered queue action.
+    queue = OutcomeQueue(1)
 
     result = run_safescale_observation_tick(
         _metrics(1000), queue=queue, registry=_registry(), safescale=machine
     )
 
-    assert result.submitted == 2
+    assert result.submitted == 1
     assert len(queue.submitted) == 1
     record = next(iter(_probe_records(redis).values()))
     assert record["status"] == "resolved"
@@ -246,11 +248,11 @@ def test_observe_mode_holds_commit_and_orphan_detector_stays_quiet():
     result = run_safescale_observation_tick(
         _metrics(1000), queue=queue, registry=_registry(), safescale=machine
     )
-    assert result.submitted == 2
+    assert result.submitted == 1
     assert next(iter(_probe_records(redis).values()))["status"] == "resolved"
 
     assert asyncio.run(queue.drain_once()) == ()
-    assert len(queue.pending_actions()) == 2
+    assert len(queue.pending_actions()) == 1
     redis.hset(
         rediskeys.SM_STATE_KEY,
         mapping={
