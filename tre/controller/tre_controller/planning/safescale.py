@@ -71,6 +71,8 @@ class SafeScaleCommand:
     pods: tuple[str, ...] = ()
     delta: int = 0
     reason: str = ""
+    #: scale_down (commit) only: the SM drain budget (s) for the hidden probe pods.
+    drain_budget_s: float | None = None
 
 
 @dataclass(frozen=True)
@@ -274,6 +276,11 @@ class SafeScaleStateMachine:
                 pods=probe.pods,
                 delta=-len(probe.pods),
                 reason=reason,
+                # Plan D1: the commit drains the (already hidden) probe pods for
+                # up to one probe window before /sleep; SM caps it at the route timeout.
+                drain_budget_s=(
+                    float(probe.window_ms) / 1000.0 if probe.window_ms else None
+                ),
             )
         ]
         for model, delta in sorted(probe.pending_upscales.items()):

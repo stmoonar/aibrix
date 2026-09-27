@@ -175,7 +175,9 @@ class ActionQueue:
         if isinstance(action, ScaleAction):
             if action.delta != 0 and action.pods:
                 return await self._dispatch_binding_power(action)
-            response = await self._client.scale_model(action.model, action.delta)
+            response = await self._client.scale_model(
+                action.model, action.delta, **_sleep_kwargs(action)
+            )
             return _dispatch_result(model=action.model, action_kind="scale", response=response)
         if isinstance(action, HideAction):
             response = await self._client.set_routable(action.model, action.pods)
@@ -193,7 +195,9 @@ class ActionQueue:
         # commit of the hidden pod, slot-targeted donor, or a planned slot-aware wake.
         # Stops at the first failure.
         for pod in action.pods:
-            response = await self._client.set_binding_power(pod, awake=action.delta > 0)
+            response = await self._client.set_binding_power(
+                pod, awake=action.delta > 0, **_sleep_kwargs(action)
+            )
             if not bool(response.get("ok", False)):
                 return _dispatch_result(model=action.model, action_kind="scale", response=response)
         return DispatchResult(model=action.model, action_kind="scale", ok=True)
@@ -216,6 +220,25 @@ class ActionQueue:
             retained.append(item)
         self._pending = retained
         return tuple(removed)
+
+
+def _sleep_kwargs(action: ScaleAction) -> dict:
+    """SM sleep path + drain budget of a scale-down (plan 2026-09-27 D1).
+
+    Only non-default values are sent: the SM default path is "scale_down".
+    "*_immediate" planner reasons are the fast-loop donor paths ("urgent").
+    """
+    if action.delta >= 0:
+        return {}
+    path = action.sleep_path or (
+        "urgent" if str(action.reason).endswith("_immediate") else "scale_down"
+    )
+    kwargs: dict = {}
+    if path != "scale_down":
+        kwargs["sleep_path"] = path
+    if action.drain_budget_s is not None:
+        kwargs["drain_budget_s"] = float(action.drain_budget_s)
+    return kwargs
 
 
 def _action_kind(action: Action) -> str:

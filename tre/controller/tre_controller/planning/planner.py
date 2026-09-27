@@ -69,6 +69,11 @@ class ScaleAction:
     # dispatcher sleeps exactly these bindings (binding-level power) instead of letting
     # the SM pick the tail of the model; for a safescale probe they are the pods to hide.
     pods: tuple[str, ...] = ()
+    # Sleep path for a negative delta (SM registry service_manager.sleep.budgets_s key):
+    # None = derived at dispatch ("urgent" for *_immediate reasons, else "scale_down").
+    sleep_path: str | None = None
+    # Soft drain budget (s) for the SM's hide -> ack -> drain -> /sleep; None = SM default.
+    drain_budget_s: float | None = None
 
 
 @dataclass(frozen=True)

@@ -26,14 +26,14 @@ class _OkClient:
     def __init__(self) -> None:
         self.calls = []
 
-    async def scale_model(self, model, delta):
+    async def scale_model(self, model, delta, **_kwargs):
         self.calls.append((model, delta))
         return {"ok": True}
 
     async def set_routable(self, model, hidden_pods):
         return {"ok": True}
 
-    async def set_binding_power(self, serve_id, *, awake):
+    async def set_binding_power(self, serve_id, *, awake, **_kwargs):
         return {"ok": True}
 
     async def defrag(self, migrations):
@@ -109,7 +109,7 @@ def test_cooldown_disabled_keeps_legacy_repeat_behaviour() -> None:
 
 def test_failed_dispatch_does_not_start_a_cooldown() -> None:
     class _FailClient(_OkClient):
-        async def scale_model(self, model, delta):
+        async def scale_model(self, model, delta, **_kwargs):
             return {"ok": False, "error": "HTTP 409: WakeConflict"}
 
     queue = ActionQueue(_FailClient(), now_ms=_Clock(65_000))
