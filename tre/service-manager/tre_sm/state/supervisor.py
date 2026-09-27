@@ -100,6 +100,12 @@ class FleetSupervisor:
             except OperationBusy:
                 pass  # another writer; next pass
         self._service.converge_startups()
+        reap = getattr(self._service, "reap_rejected_deployments", None)
+        if callable(reap):
+            try:
+                reap()
+            except OperationBusy:
+                pass  # a writer (possibly starting a Pod) is active; next pass
         recovered = self._service.recover_stale_fleet_repairs()
         if recovered is not None:
             self._last_recovery_operation_id = str(recovered["operation_id"])

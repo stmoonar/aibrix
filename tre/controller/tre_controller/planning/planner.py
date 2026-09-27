@@ -94,6 +94,13 @@ class UnhideAction:
     pods: tuple[str, ...]
     reason: str
     source_loop: SourceLoop
+    #: Pods that stay hidden (review 4 P2-2): a donor pod whose /sleep was sent
+    #: but never confirmed may be asleep - routing is not reopened on it (the
+    #: service-manager's crash recovery resolves it).
+    keep_hidden: tuple[str, ...] = ()
+    #: The SafeScale probe this unhide resolves (review 4 P2-4), if any
+    #: (bookkeeping only: not part of the action's identity).
+    request_id: str | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True)
@@ -134,15 +141,17 @@ class TransferAction:
 
 @dataclass(frozen=True)
 class ReceiverTarget:
-    """A SafeScale follow-up upscale as an ABSOLUTE target: the receiver's desired
-    awake count, computed when the commit was planned (review 3 P2-1). A retry
-    re-sends the same target, so an SM call that succeeded but timed out on the
-    client is never applied twice. ``target`` None = resolve it once from the SM
-    state at the first dispatch (no cluster view at planning time), then frozen."""
+    """A SafeScale follow-up upscale as an ABSOLUTE target (review 3 P2-1). A
+    retry re-sends the same target, so an SM call that succeeded but timed out
+    on the client is never applied twice. ``target`` None (the planned form,
+    review 4 P2-1): resolved ONCE at the first dispatch from the SM's current
+    awake count (never from a possibly stale cluster view) plus ``delta``,
+    capped at ``cap`` (the scaling cap), then frozen."""
 
     model: str
     delta: int
     target: int | None = None
+    cap: int | None = None
 
 
 @dataclass(frozen=True)
@@ -170,6 +179,9 @@ class SafeScaleCommitAction:
     request_id: str | None = None
     source_loop: SourceLoop = "safescale"
     donor_done: bool = False
+    #: Donor pods whose /sleep was sent but never confirmed (from the SM's
+    #: failure outcomes, review 4 P2-2): never unhidden by an abandon / preempt.
+    unconfirmed_pods: tuple[str, ...] = ()
 
     @property
     def model(self) -> str:

@@ -885,6 +885,8 @@ class ServiceManagerV2:
                 self._assert_not_reserved(
                     binding=binding, gpus=False, what=f"hide/unhide of {binding.serve_id}"
                 )
+            if binding.hidden and binding.serve_id not in requested_hidden and binding.awake:
+                self._assert_confirmed_awake_for_unhide(binding)
         actions: list[dict] = []
         updated_by_serve = {binding.serve_id: binding for binding in snapshot.bindings}
         with self._desired_guard(
@@ -926,6 +928,32 @@ class ServiceManagerV2:
             "actions": actions,
         }
 
+
+    def _assert_confirmed_awake_for_unhide(self, binding: Binding) -> None:
+        """Routing is reopened only on a pod confirmed awake (review 4 P2-2): a
+        pod with a sleep journal entry (a sleep in progress, ``sleep_unconfirmed``
+        or a failed rollback) or whose ``/is_sleeping`` is not a clear "awake"
+        stays hidden - crash recovery resolves it - and the unhide is refused
+        (409, retriable)."""
+        if self._sleep_primitive is not None:
+            entry = self._sleep_primitive.journal.get(binding.serve_id)
+            if entry is not None:
+                raise RetryLater(
+                    f"unhide of {binding.serve_id} refused: sleep journal phase "
+                    f"{entry.get('phase')!r} (not confirmed awake)"
+                )
+        if self._runtime_ops is None or self._vllm_ops is None:
+            return
+        probe = getattr(self._vllm_ops, "is_sleeping", None)
+        if not callable(probe):
+            return
+        snapshot = self._snapshot_for_binding(binding)
+        physical = probe(snapshot.pod_ip, port=8000) if snapshot.pod_ip else None
+        if physical is not False:
+            raise RetryLater(
+                f"unhide of {binding.serve_id} refused: /is_sleeping answered "
+                f"{physical!r} (not confirmed awake)"
+            )
 
     @serialized_operation("defrag")
     def defrag(self, *, tp_size: int) -> dict:
@@ -1547,30 +1575,29 @@ class ServiceManagerV2:
                 "idempotent": True,
             }
 
-        # A fleet repair already owns the global writer fence and has acquired
-        # the target lease before scaling the Deployment. Reuse that prepared
-        # phase instead of deadlocking the init gate on a second writer.
-        active = self._operation_coordinator.active_operation(kind="fleet_repair")
-        if active is not None:
+        # Pre-authorized admission (review 4 P1): a writer that creates a gated
+        # Pod itself (fleet repair, a defrag migration, a cold start) holds the
+        # writer lock until that Pod is ready, so the admission below could never
+        # get the lock - the init gate and the creator would wait on each other
+        # until the creator timed out. The creator records the operation phase
+        # ``starting_binding`` (binding id, later the Pod UID) and holds the
+        # binding's ``starting`` GPU lease BEFORE it creates the Pod; exactly that
+        # binding is admitted here without the writer lock.
+        active = self._operation_coordinator.active_operation()
+        if active is not None and active.get("phase") == STARTING_BINDING_PHASE:
             details = active.get("details") or {}
+            expected_uid = details.get("pod_uid")
             if (
-                active.get("phase") == "starting_binding"
-                and details.get("binding_id") == pod.binding_id
+                details.get("binding_id") == pod.binding_id
+                and (not expected_uid or expected_uid == pod.uid)
                 and self._lease_matches(pod.binding_id, phase="starting")
             ):
-                self._assert_startup_overlaps_sleeping(pod)
-                self._runtime_ops.admit_startup_pod(
-                    pod.name,
-                    pod_uid=pod.uid,
-                    suspended_binding_ids=[],
-                    operation_id=str(active["operation_id"]),
-                )
-                return {
-                    "status": "admitted",
-                    "binding_id": pod.binding_id,
-                    "operation_id": active["operation_id"],
-                    "prepared_by_fleet_repair": True,
-                }
+                return self._admit_pre_authorized(pod, active)
+            raise OperationBusy(
+                f"{active.get('owner')}:{active.get('fencing_token')}"
+            )
+        if active is not None and active.get("kind") == "fleet_repair":
+            # A repair converging the fleet: no other startup until it is done.
             raise OperationBusy(
                 f"{active.get('owner')}:{active.get('fencing_token')}"
             )
@@ -1605,6 +1632,141 @@ class ServiceManagerV2:
                 # instead of leaving them asleep for a Pod that did not start.
                 self._restore_failed_admission_residents(pod, slept)
             raise
+
+    def _admit_pre_authorized(self, pod: StartupPodRecord, active: dict) -> dict:
+        """Admit the Pod a writer-lock holder is starting (review 4 P1), without
+        the writer lock: the holder already owns the binding's ``starting``
+        lease and fences every other writer. The checks that need no lock still
+        run: node pressure, the desired lifecycle, sleep reservations / other
+        transient leases on the Pod's GPUs, and overlapping residents must be
+        physically asleep. Nothing is slept here."""
+        self._safety_gate.assert_no_pressure()
+        if pod.binding_id in self._desired_binding_ids():
+            if self._desired_binding(pod.binding_id).lifecycle != "resident":
+                raise ValueError(
+                    f"startup denied for non-resident desired binding {pod.binding_id}"
+                )
+        self._assert_startup_slot_free(pod)
+        self._assert_startup_overlaps_sleeping(pod)
+        self._runtime_ops.admit_startup_pod(
+            pod.name,
+            pod_uid=pod.uid,
+            suspended_binding_ids=[],
+            operation_id=str(active["operation_id"]),
+        )
+        result = {
+            "status": "admitted",
+            "binding_id": pod.binding_id,
+            "operation_id": active["operation_id"],
+            "pre_authorized": True,
+        }
+        if active.get("kind") == "fleet_repair":
+            result["prepared_by_fleet_repair"] = True
+        return result
+
+    @contextmanager
+    def _starting_binding(self, planned: Binding):
+        """Pre-authorize the gated Pod of ``planned`` (review 4 P1): the current
+        writer operation enters phase ``starting_binding`` (the caller holds the
+        binding's ``starting`` lease) so the Pod's init gate is admitted without
+        the writer lock; left again when the start finished or failed. Yields a
+        callable that records the Pod UID once known (then only that Pod is
+        admitted)."""
+        operation = current_operation()
+        details = {"binding_id": planned.binding_id}
+
+        def note_pod(pod_uid: str | None) -> None:
+            if operation is not None and pod_uid:
+                operation.advance(
+                    STARTING_BINDING_PHASE, details={**details, "pod_uid": pod_uid}
+                )
+
+        if operation is not None:
+            operation.advance(STARTING_BINDING_PHASE, details=details)
+        try:
+            yield note_pod
+        finally:
+            if operation is not None:
+                try:
+                    operation.advance("executing", details={"started_binding_id": planned.binding_id})
+                except Exception:  # a lost fence surfaces at the operation's end
+                    LOG.warning("leaving phase starting_binding of %s failed", planned.binding_id)
+
+    def _discard_failed_start(self, planned: Binding, deployment_created: bool) -> None:
+        """A cold start / defrag destination failed after its Deployment was
+        created (review 4 P1): its desired record is rolled back (absent), so a
+        Deployment left behind would only make its Pod's init gate loop on 400
+        "non-resident desired binding". Delete it and release the ``starting``
+        lease (best effort; the supervisor reaps what is left)."""
+        if deployment_created and hasattr(self._runtime_ops, "delete_model_deployment"):
+            try:
+                self._runtime_ops.delete_model_deployment(planned)
+            except Exception:
+                LOG.exception(
+                    "deleting the Deployment of the failed start %s failed; "
+                    "the supervisor reaps it", planned.binding_id,
+                )
+        if self._gpu_leases is not None:
+            try:
+                self._gpu_leases.release(planned)
+            except Exception:
+                LOG.exception("releasing the starting lease of %s failed", planned.binding_id)
+
+    def _finish_admitted_start(self, pod_name: str) -> None:
+        """The creator converged its own Pod (awake, annotated, leased): clear
+        the startup admission so the supervisor does not converge it again."""
+        clear = getattr(self._runtime_ops, "clear_startup_admission", None)
+        if not callable(clear):
+            return
+        try:
+            clear(pod_name)
+        except Exception:  # the supervisor's convergence clears it later
+            LOG.warning("clearing the startup admission of %s failed", pod_name)
+
+    def reap_rejected_deployments(self) -> list[str]:
+        """Supervisor pass (review 4 P1): delete model Deployments whose binding
+        is desired ``absent`` and that have no Running Pod - e.g. left by a
+        failed cold start / defrag whose cleanup did not go through. Their Pods
+        sit in the init gate, refused forever. Under the writer lock (no start
+        is in progress then); a busy lock skips the pass."""
+        if (
+            self._runtime_ops is None
+            or self._fleet_store is None
+            or not hasattr(self._runtime_ops, "list_model_deployments")
+            or not hasattr(self._runtime_ops, "delete_model_deployment")
+        ):
+            return []
+        desired = {item.binding_id: item for item in self._fleet_store.load_desired().bindings}
+        candidates = [
+            item
+            for item in self._runtime_ops.list_model_deployments()
+            if int(getattr(item, "replicas", 1) or 0) > 0
+            and item.binding_id in desired
+            and desired[item.binding_id].lifecycle == "absent"
+        ]
+        if not candidates:
+            return []
+        reaped: list[str] = []
+        with self._writer("reap_rejected_deployments", wait_s=0.0):
+            desired = {item.binding_id: item for item in self._fleet_store.load_desired().bindings}
+            running = set()
+            for snapshot in self._runtime_ops.list_pod_snapshots():
+                try:
+                    running.add(_binding_from_snapshot(snapshot).binding_id)
+                except ValueError:
+                    continue
+            for item in candidates:
+                wanted = desired.get(item.binding_id)
+                if wanted is None or wanted.lifecycle != "absent" or item.binding_id in running:
+                    continue
+                binding = Binding(item.name, item.model, Slot(item.node, tuple(item.gpu_ids)), awake=False)
+                self._runtime_ops.delete_model_deployment(binding)
+                LOG.warning(
+                    "reaped Deployment %s: binding %s is desired absent and has no Running Pod",
+                    item.name, item.binding_id,
+                )
+                reaped.append(item.name)
+        return reaped
 
     def _assert_startup_slot_free(self, pod: StartupPodRecord) -> None:
         """Refuse a startup whose GPUs are reserved by a sleep or leased by a
@@ -1774,9 +1936,14 @@ class ServiceManagerV2:
                     self._admission_jobs.pop(stale_key, None)
             entry = self._admission_jobs.get(key)
             if entry is None:
-                job = self._admission_executor.submit(
-                    self.admit_startup, pod_name=pod_name, pod_uid=pod_uid
-                )
+                try:
+                    job = self._admission_executor.submit(
+                        self.admit_startup, pod_name=pod_name, pod_uid=pod_uid
+                    )
+                except RuntimeError as exc:  # executor shut down (SIGTERM)
+                    raise ServiceShuttingDown(
+                        "service-manager is shutting down; retry the startup admission"
+                    ) from exc
                 self._admission_jobs[key] = (job, now)
             else:
                 job = entry[0]
@@ -1786,6 +1953,10 @@ class ServiceManagerV2:
             return 202, {"status": "in_progress", "pod_name": pod_name, "pod_uid": pod_uid}
         with self._admission_lock:
             self._admission_jobs.pop(key, None)
+        if job.cancelled():  # cancelled by the shutdown: retriable (503), not a 500
+            raise ServiceShuttingDown(
+                "service-manager is shutting down; retry the startup admission"
+            )
         return 200, job.result()  # raises the admission's error (409 / 503 / 400)
 
     def converge_startups(self) -> dict:
@@ -2549,23 +2720,40 @@ class ServiceManagerV2:
         if self._gpu_leases is not None:
             self._gpu_leases.acquire(planned, phase="starting")
         self._ensure_model_route(model)
-        deployment_id = self._runtime_ops.create_model_deployment(model, slot)
-        self._ensure_model_route(model)
-        ready = self._runtime_ops.wait_pod_ready(deployment_id)
-        if not ready.pod_ip:
-            raise ValueError(f"pod {ready.name} has no pod IP for wake")
-        ready_result = self._vllm_ops.wait_until_ready(ready.pod_ip, port=8000)
-        if not bool(getattr(ready_result, "success", False)):
-            message = getattr(ready_result, "message", "") or "operation failed"
-            raise ValueError(f"vLLM readiness failed for {ready.name}: {message}")
-        result = self._vllm_ops.wake_up(ready.pod_ip, port=8000)
-        if not bool(getattr(result, "success", False)):
-            message = getattr(result, "message", "") or "operation failed"
-            raise ValueError(f"vLLM wake failed for {ready.name}: {message}")
-        binding = Binding(ready.name, model, slot, awake=True, hidden=False)
-        self._runtime_ops.write_binding_annotations(binding, state=POD_STATE_AWAKE)
-        if self._gpu_leases is not None:
-            self._gpu_leases.acquire(binding, phase="awake")
+        return self._start_gated_binding(planned)
+
+    def _start_gated_binding(self, planned: Binding) -> Binding:
+        """Create the Deployment of ``planned`` (its ``starting`` lease held) and
+        bring its Pod up awake, with the Pod pre-authorized at the startup gate
+        (review 4 P1: the writer lock is held throughout). On any failure the
+        created Deployment is deleted again."""
+        model, slot = planned.model, planned.slot
+        created = False
+        try:
+            with self._starting_binding(planned) as note_pod:
+                deployment_id = self._runtime_ops.create_model_deployment(model, slot)
+                created = True
+                self._ensure_model_route(model)
+                ready = self._runtime_ops.wait_pod_ready(deployment_id)
+                note_pod(getattr(ready, "pod_uid", None))
+                if not ready.pod_ip:
+                    raise ValueError(f"pod {ready.name} has no pod IP for wake")
+                ready_result = self._vllm_ops.wait_until_ready(ready.pod_ip, port=8000)
+                if not bool(getattr(ready_result, "success", False)):
+                    message = getattr(ready_result, "message", "") or "operation failed"
+                    raise ValueError(f"vLLM readiness failed for {ready.name}: {message}")
+                result = self._vllm_ops.wake_up(ready.pod_ip, port=8000)
+                if not bool(getattr(result, "success", False)):
+                    message = getattr(result, "message", "") or "operation failed"
+                    raise ValueError(f"vLLM wake failed for {ready.name}: {message}")
+                binding = Binding(ready.name, model, slot, awake=True, hidden=False)
+                self._runtime_ops.write_binding_annotations(binding, state=POD_STATE_AWAKE)
+                if self._gpu_leases is not None:
+                    self._gpu_leases.acquire(binding, phase="awake")
+        except BaseException:
+            self._discard_failed_start(planned, created)
+            raise
+        self._finish_admitted_start(ready.name)
         return binding
 
     def _execute_runtime_defrag_migration(self, binding: Binding, migration: Migration) -> tuple[list[dict], Binding]:
@@ -2588,10 +2776,8 @@ class ServiceManagerV2:
         )
         if self._gpu_leases is not None:
             self._gpu_leases.acquire(planned, phase="starting")
-        deployment_id = self._runtime_ops.create_model_deployment(binding.model, migration.to_slot)
-        self._ensure_model_route(binding.model)
-        ready = self._runtime_ops.wait_pod_ready(deployment_id)
-        new_serve_id = ready.name
+        moved = self._start_gated_binding(planned)
+        new_serve_id = moved.serve_id
         actions.append(
             {
                 "action": "create_deployment",
@@ -2600,21 +2786,6 @@ class ServiceManagerV2:
                 "gpu_ids": list(migration.to_slot.gpu_ids),
             }
         )
-        if not ready.pod_ip:
-            raise ValueError(f"pod {new_serve_id} has no pod IP for wake")
-        ready_result = self._vllm_ops.wait_until_ready(ready.pod_ip, port=8000)
-        if not bool(getattr(ready_result, "success", False)):
-            message = getattr(ready_result, "message", "") or "operation failed"
-            raise ValueError(f"vLLM readiness failed for {new_serve_id}: {message}")
-        result = self._vllm_ops.wake_up(ready.pod_ip, port=8000)
-        if not bool(getattr(result, "success", False)):
-            message = getattr(result, "message", "") or "operation failed"
-            raise ValueError(f"vLLM wake failed for {new_serve_id}: {message}")
-
-        moved = Binding(new_serve_id, binding.model, migration.to_slot, awake=True, hidden=False)
-        self._runtime_ops.write_binding_annotations(moved, state=POD_STATE_AWAKE)
-        if self._gpu_leases is not None:
-            self._gpu_leases.acquire(moved, phase="awake")
         actions.append({"action": "wake", "serve_id": new_serve_id})
         actions.append({"action": "unhide", "serve_id": new_serve_id})
         return actions, moved
@@ -2734,6 +2905,11 @@ class ServiceManagerV2:
 ADMISSION_WORKERS = 4
 ADMISSION_SYNC_WAIT_S = 5.0
 ADMISSION_RESULT_TTL_S = 600.0
+
+#: Operation phase of a writer that creates a gated Pod itself (fleet repair,
+#: defrag, cold start): the Pod of ``details.binding_id`` is admitted without
+#: the writer lock (review 4 P1).
+STARTING_BINDING_PHASE = "starting_binding"
 
 
 def _binding_from_outcome(outcome: dict, pod: StartupPodRecord) -> Binding:

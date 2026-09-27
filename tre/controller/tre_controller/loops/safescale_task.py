@@ -77,6 +77,9 @@ def run_safescale_observation_tick(
     accepted_actions: list[Action] = []
     events: list[str] = []
     submitted = 0
+    recovered = _recover_committing(queue, safescale, now_ms=snapshot.ts_ms, events=events)
+    accepted_actions.extend(recovered)
+    submitted += len(recovered)
     for probe in safescale.active_probes():
         metrics = snapshot.models.get(probe.model)
         if metrics is None:
@@ -126,12 +129,20 @@ def run_safescale_observation_tick(
         if accepted != len(actions):
             events.append(f"safescale_enqueue_rejected:{probe.model}")
             continue
-        if not safescale.resolve(
-            probe.model,
-            status=decision.status,
-            reason=decision.reason,
-            now_ms=snapshot.ts_ms,
-        ):
+        # Durable lifecycle (review 4 P2-4): with a queue that reports when it
+        # finished the probe's one-shot action, the probe is only marked
+        # ``committing`` here and resolved by the queue; a restart re-submits it.
+        mark = getattr(safescale, "mark_committing", None)
+        if callable(mark) and callable(getattr(queue, "has_request", None)):
+            marked = mark(probe.model, status=decision.status, reason=decision.reason, now_ms=snapshot.ts_ms)
+        else:
+            marked = safescale.resolve(
+                probe.model,
+                status=decision.status,
+                reason=decision.reason,
+                now_ms=snapshot.ts_ms,
+            )
+        if not marked:
             events.append(f"safescale_resolve_missing:{probe.model}")
             continue
         accepted_actions.extend(actions)
@@ -175,6 +186,39 @@ async def safescale_task(
             _log_resolutions(snapshot.ts_ms, result, gateway_available=counters is not None)
         interval = getattr(getattr(cfg, "safescale"), "probe_poll_seconds")
         await sleep(interval)
+
+
+def _recover_committing(queue, safescale, *, now_ms: int, events: list[str]) -> list[Action]:
+    """Re-submit the decision of every ``committing`` probe the queue does not
+    hold (review 4 P2-4): after a controller restart, or when its action was
+    lost to an unexpected error. Bounded: after a few recoveries the probe is
+    resolved as a rollback (its pods are then left to the orphan detector)."""
+    committing = getattr(safescale, "committing_probes", None)
+    has_request = getattr(queue, "has_request", None)
+    if not callable(committing) or not callable(has_request):
+        return []
+    submitted: list[Action] = []
+    for probe in committing():
+        if has_request(probe.request_id):
+            continue
+        if not safescale.note_recovery(probe.request_id):
+            safescale.resolve_request(
+                probe.request_id, status="rollback", reason="recovery_exhausted", now_ms=now_ms
+            )
+            events.append(f"safescale_recovery_exhausted:{probe.model}")
+            continue
+        actions = recovered_actions(probe)
+        try:
+            result = queue.submit(actions)
+        except Exception as exc:  # noqa: BLE001 - retried next tick
+            events.append(f"safescale_recovery_enqueue_failed:{probe.model}:{type(exc).__name__}")
+            continue
+        if int(getattr(result, "accepted", 0)) == len(actions):
+            events.append(f"safescale_committing_recovered:{probe.model}:{probe.resolution}")
+            submitted.extend(actions)
+        else:
+            events.append(f"safescale_recovery_deferred:{probe.model}")
+    return submitted
 
 
 def _log_resolutions(ts_ms: int, result: SafeScaleObservationResult, *, gateway_available: bool) -> None:
@@ -273,22 +317,24 @@ def _commands_to_actions(
 ) -> tuple[Action, ...]:
     """A rollback is one unhide; a commit batch is ONE :class:`SafeScaleCommitAction`
     (review 3 P2-2): the hidden donor pods sleep first, then the receivers are
-    brought up to ABSOLUTE targets computed here, at planning time, from the
-    cluster view (review 3 P2-1) - never ``current + delta`` at dispatch."""
+    brought up to ABSOLUTE targets. The target is NOT computed here from the
+    cluster view (refreshed every ~10 s, so possibly stale - review 4 P2-1): the
+    queue resolves it once from the SM's awake count at the first dispatch
+    (current + delta, capped at the scaling cap carried here) and freezes it, so
+    a retry is still idempotent. ``cluster_view`` is kept for callers."""
+    del cluster_view
     actions: list[Action] = []
     donor = next((command for command in commands if command.kind == "scale_down"), None)
     upscales = tuple(
-        ReceiverTarget(
-            command.model,
-            int(command.delta),
-            _absolute_target(command.model, int(command.delta), cluster_view, registry),
-        )
+        ReceiverTarget(command.model, int(command.delta), None, _scaling_cap(command.model, registry))
         for command in commands
         if command.kind == "scale_up" and command.delta > 0
     )
     for command in commands:
         if command.kind == "unhide":
-            actions.append(UnhideAction(command.model, command.pods, command.reason, "safescale"))
+            actions.append(
+                UnhideAction(command.model, command.pods, command.reason, "safescale", request_id=request_id)
+            )
     if donor is not None:
         actions.append(
             SafeScaleCommitAction(
@@ -314,21 +360,40 @@ def _commands_to_actions(
     return tuple(actions)
 
 
-def _absolute_target(
-    model: str, delta: int, cluster_view: ClusterView | None, registry: Registry | None
-) -> int | None:
-    """Receiver's awake count (hidden probe pods included, as the SM counts) plus
-    the planned upscale, capped at its scaling cap. None without a cluster view:
-    the queue then resolves it once from the SM state at the first dispatch."""
-    if cluster_view is None:
+def _scaling_cap(model: str, registry: Registry | None) -> int | None:
+    """The receiver's scaling cap (registry max_awake_replicas), or None."""
+    if registry is None:
         return None
-    awake = sum(1 for binding in cluster_view.bindings if binding.model == model and binding.awake)
-    target = awake + max(0, int(delta))
-    if registry is not None:
-        try:
-            cap = int(registry.model(model).scale_max_replicas)
-        except (KeyError, ValueError, AttributeError):
-            cap = None
-        if cap is not None:
-            target = min(target, max(cap, awake))
-    return target
+    try:
+        return int(registry.model(model).scale_max_replicas)
+    except (KeyError, ValueError, AttributeError, TypeError):
+        return None
+
+
+def recovered_actions(probe) -> tuple[Action, ...]:
+    """Actions that finish a probe found ``committing`` after a controller
+    restart (review 4 P2-4): its recorded resolution is submitted again and
+    revalidated at dispatch like the original - a rollback is the unhide, a
+    commit sleeps the hidden donor pods (a fresh cluster view showing them
+    asleep makes it a no-op). The follow-up upscales are not re-sent (their
+    frozen targets died with the old process; the planner re-plans receivers
+    every tick)."""
+    if getattr(probe, "resolution", None) == "commit":
+        return (
+            SafeScaleCommitAction(
+                donor=probe.model,
+                pods=tuple(probe.pods),
+                reason=f"recovered:{probe.resolution_reason or 'commit'}",
+                drain_budget_s=(float(probe.window_ms) / 1000.0 if probe.window_ms else None),
+                request_id=probe.request_id,
+            ),
+        )
+    return (
+        UnhideAction(
+            probe.model,
+            tuple(probe.pods),
+            f"recovered:{probe.resolution_reason or 'rollback'}",
+            "safescale",
+            request_id=probe.request_id,
+        ),
+    )

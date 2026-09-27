@@ -91,25 +91,61 @@ runs it as a background job per (pod, UID):
   are still desired awake are woken again.
 
 The gate script needs no change for this (it already retries anything that is
-not a 200).
+not a 200). During a service-manager shutdown the answer is a retriable 503.
+
+Pods the service-manager creates itself - a defrag destination, a cold start
+(`PUT /v2/models/<m>/target` growing past the existing bindings), a fleet
+repair - start while that writer still holds the writer lock (until the pod is
+ready). The writer first takes the binding's `starting` GPU lease and records
+its operation phase `starting_binding` (binding id, then the pod UID); the
+gate of exactly that pod is then admitted without the writer lock (pressure,
+desired lifecycle, reservations / other leases and "overlapping residents
+asleep" are still checked). Any other pod keeps waiting. If such a start
+fails, its Deployment is deleted again (its desired record is rolled back to
+`absent`); the supervisor reaps any model Deployment whose binding is desired
+`absent` and that has no Running pod.
+
+`PUT /v2/models/<m>/routable` refuses (409) to reopen routing on a pod with a
+sleep journal entry (a sleep in progress, `sleep_unconfirmed`, a failed
+rollback) or whose `/is_sleeping` is not a clear "awake".
 
 ### Controller action queue
 
 - A SafeScale commit is one queued action: the hidden donor pods sleep first,
-  then each receiver is brought up to an absolute, grow-only target computed
-  when the commit was planned (`PUT /v2/models/<m>/target` with
-  `at_least: true`). A retry re-sends the same target, so an SM call that
-  succeeded but timed out on the controller is never applied twice.
+  then each receiver is brought up to an absolute, grow-only target
+  (`PUT /v2/models/<m>/target` with `at_least: true`). The target is resolved
+  once at the first dispatch from the service-manager's current awake count
+  (+ the planned delta, capped at `max_awake_replicas`) and then frozen: a
+  retry re-sends the same target, so an SM call that succeeded but timed out
+  on the controller is never applied twice.
 - Before every (re)try the commit is re-checked on the models' latest signal
   state: a donor that is CRITICAL / LOW again abandons the commit (its hidden
   pods are unhidden instead); a receiver that is HEALTHY / HIGH / IDLE loses
-  its upscale.
+  its upscale. This re-check (the planner's whole-model state) is a different
+  criterion from the SafeScale commit gate (the probe window's tail of the
+  donor's serving pods); an abandon on the first dispatch is counted as
+  `commit_abandoned_after_gate_total` and logged
+  (`safescale_commit_abandoned_after_gate`).
+- Donor pods the service-manager reports `unconfirmed` (sleep sent, never
+  confirmed) are never unhidden by the controller; its crash recovery
+  resolves them.
+- A commit whose donor sleep fails for good unhides the donor's hidden pods
+  that are still awake.
+- A SafeScale probe is `committing` from the moment its commit / rollback is
+  queued until the queue finished it; only then is it resolved. After a
+  controller restart a `committing` probe is re-submitted (the commit's
+  follow-up upscales are left to the planner).
 - A rescue scale-up of a model whose commit is waiting out a retry backoff
-  preempts that retry instead of waiting behind it.
-- A defrag runs alone: it conflicts with every other queued action.
-- The service-manager and the controller of this change must be rolled out
-  together (the controller sends `at_least`; an older service-manager would
-  ignore it).
+  preempts that retry instead of waiting behind it; it shrinks by the donor
+  pods a fresh cluster view shows awake and hidden.
+- Consumers for which a stale cluster view matters (retry / commit
+  revalidation, preemption, failed-commit unhides) only use it while it is
+  younger than 2.5 refresh periods (`TRE_FAIRNESS_INTERVAL_SECONDS`).
+- A defrag runs alone: it conflicts with every other queued action. A rescue
+  scale-up planned meanwhile waits for it; the decision snapshot then carries
+  the event `rescue_waits_for_defrag:<models>`.
+- The service-manager, the controller and the gateway plugin of this change
+  must be rolled out together.
 
 ### Tests
 

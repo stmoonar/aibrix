@@ -439,3 +439,25 @@ def test_giving_up_leaves_the_queue(make):
     assert holder._finish(held.fence, {"operation_id": held.operation_id, "status": "succeeded"})
     handle = holder._acquire_once("z")  # nobody queued any more
     assert holder._finish(handle.fence, {"operation_id": handle.operation_id, "status": "succeeded"})
+
+
+@pytest.mark.parametrize("make", _redis_backends())
+def test_a_starting_binding_phase_is_visible_to_the_startup_gate(make):
+    """Review 4 P1: the startup gate recognizes a Pod pre-authorized by the
+    writer-lock holder from the holder's journal record (phase + details), read
+    by ANOTHER process's coordinator while the lock is held."""
+    redis, _real = make()
+    holder = OperationCoordinator(redis, owner="holder", poll_interval_s=0.05, waiter_ttl_ms=300)
+    gate = OperationCoordinator(redis, owner="gate", poll_interval_s=0.05, waiter_ttl_ms=300)
+    with holder.operation("defrag", wait_s=0.0) as operation:
+        operation.advance("starting_binding", details={"binding_id": "m1/node-a/1"})
+        active = gate.active_operation()
+        assert (active["kind"], active["phase"]) == ("defrag", "starting_binding")
+        assert active["details"] == {"binding_id": "m1/node-a/1"}
+        operation.advance("starting_binding", details={"binding_id": "m1/node-a/1", "pod_uid": "uid-1"})
+        assert gate.active_operation()["details"]["pod_uid"] == "uid-1"
+        with pytest.raises(OperationBusy):
+            gate._acquire_once("startup_admit")
+        operation.advance("executing")
+        assert gate.active_operation()["phase"] == "executing"
+    assert gate.active_operation() is None

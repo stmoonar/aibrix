@@ -750,8 +750,10 @@ class SleepPrimitive:
                 if not pod.done and pod.outcome is None and pod.decision is not None
             ]
             if self._shutdown.is_set():
-                for pod in ready:
-                    self._rollback_pod(batch, pod, reason="service-manager is shutting down")
+                _parallel(
+                    lambda pod: self._rollback_pod(batch, pod, reason="service-manager is shutting down"),
+                    ready,
+                )
                 ready = []
             if ready:
                 self._send_all(batch, ready, clock)
@@ -1093,11 +1095,15 @@ class SleepPrimitive:
                 answers = _parallel(lambda pod: self._physical(pod.target), pending)
             else:
                 answers = {id(pod): True for pod in pending}
+            confirmed = []
             for pod in list(pending):
                 last[id(pod)] = answers[id(pod)]
                 if answers[id(pod)] is True:
                     pending.remove(pod)
-                    self._finalize_slept(batch, pod, **pod.commit)
+                    confirmed.append(pod)
+            # One k8s annotation write per confirmed pod, in parallel (review 4
+            # P3): the phase stays bounded whatever the number of targets.
+            _parallel(lambda pod: self._finalize_slept(batch, pod, **pod.commit), confirmed)
             if not pending:
                 return
             if clock.monotonic() >= deadline:
@@ -1189,9 +1195,12 @@ class SleepPrimitive:
             return None
 
     def _rollback_all(self, batch: SleepBatch, *, reason: str) -> None:
-        for pod in batch.pods:
-            if pod.outcome is None:
-                self._rollback_pod(batch, pod, reason=reason)
+        # In parallel (review 4 P3): each rollback may re-probe the pod and write
+        # its annotations; _rollback_pod never raises.
+        _parallel(
+            lambda pod: self._rollback_pod(batch, pod, reason=reason),
+            [pod for pod in batch.pods if pod.outcome is None],
+        )
 
     def _rollback_pod(self, batch: SleepBatch, pod: _PodSleep, *, reason: str) -> None:
         if pod.done or pod.outcome is not None:
