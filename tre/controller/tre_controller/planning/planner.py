@@ -74,6 +74,10 @@ class ScaleAction:
     sleep_path: str | None = None
     # Soft drain budget (s) for the SM's hide -> ack -> drain -> /sleep; None = SM default.
     drain_budget_s: float | None = None
+    # Donor -> receiver pair (review 2 P1-1): the donor sleep and the receiver wake of
+    # one rescue transfer carry the same id; the ActionQueue executes them as ONE
+    # compound action (sleep the donor, and only on success wake the receiver).
+    transfer_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -110,6 +114,47 @@ class ShrinkForSlotAction:
 
 
 Action = ScaleAction | HideAction | UnhideAction | DefragAction | ShrinkForSlotAction
+
+
+@dataclass(frozen=True)
+class TransferAction:
+    """A donor-sleep -> receiver-wake pair executed in order by one dispatch worker
+    (review 2 P1-1). Built by :func:`fuse_transfers` from two ScaleActions that share
+    a ``transfer_id``; never produced by the planner itself (its output stays two
+    ScaleActions, which the decision log / tests inspect)."""
+
+    donor: ScaleAction
+    receiver: ScaleAction
+    source_loop: SourceLoop = "rescue"
+
+    @property
+    def model(self) -> str:
+        return self.receiver.model
+
+
+def fuse_transfers(actions) -> list:
+    """Replace each donor/receiver ScaleAction pair sharing a ``transfer_id`` by one
+    :class:`TransferAction` (at the donor's position). A half whose partner is
+    missing (e.g. dropped by a probe preemption) stays a plain ScaleAction."""
+    fused: list = []
+    donors: dict[str, int] = {}
+    for action in actions:
+        transfer_id = action.transfer_id if isinstance(action, ScaleAction) else None
+        if transfer_id is None:
+            fused.append(action)
+            continue
+        if action.delta < 0:
+            donors[transfer_id] = len(fused)
+            fused.append(action)
+            continue
+        index = donors.pop(transfer_id, None)
+        if index is None:
+            fused.append(action)
+            continue
+        fused[index] = TransferAction(
+            donor=fused[index], receiver=action, source_loop=action.source_loop
+        )
+    return fused
 
 
 @dataclass(frozen=True)
@@ -351,6 +396,9 @@ def build_plan(
                 )
                 if transfer <= 0:
                     continue
+                # One transfer: the receiver's wake needs the GPU the donor's sleep
+                # frees, so the queue runs the pair in order as one compound action.
+                transfer_id = f"{donor.model_name}->{recv.model_name}#{len(actions)}"
                 _add_scale_action(
                     actions,
                     deltas,
@@ -361,6 +409,7 @@ def build_plan(
                     donor=donor.model_name,
                     receiver=recv.model_name,
                     pods=donor_slot_pods,
+                    transfer_id=transfer_id,
                 )
                 _add_scale_action(
                     actions,
@@ -372,6 +421,7 @@ def build_plan(
                     donor=donor.model_name,
                     receiver=recv.model_name,
                     pods=receiver_slot_pods,
+                    transfer_id=transfer_id,
                 )
                 still_needed -= transfer
 
@@ -1053,6 +1103,7 @@ def _add_scale_action(
     receiver: str | None = None,
     donor: str | None = None,
     pods: tuple[str, ...] = (),
+    transfer_id: str | None = None,
 ) -> None:
     if delta == 0:
         return
@@ -1067,6 +1118,7 @@ def _add_scale_action(
             receiver=receiver,
             donor=donor,
             pods=tuple(pods),
+            transfer_id=transfer_id,
         )
     )
 

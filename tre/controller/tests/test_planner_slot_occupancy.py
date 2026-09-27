@@ -97,6 +97,8 @@ def test_e1_deadlock_high_donor_frees_a_slot_where_receiver_sleeps() -> None:
     assert (receiver.delta, receiver.reason) == (1, "critical_donor_immediate")
     # Serial FIFO queue: the donor sleep is dispatched (and awaited) before the wake.
     assert scale.index(donor) < scale.index(receiver)
+    # Review 2 P1-1: the pair is one transfer (the queue runs it as one compound action).
+    assert donor.transfer_id is not None and donor.transfer_id == receiver.transfer_id
 
 
 def test_e1_deadlock_healthy_donor_probe_is_pinned_to_receiver_slot() -> None:
