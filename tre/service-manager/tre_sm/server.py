@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 from typing import Protocol
 
@@ -10,15 +11,21 @@ from tre_common.registry import load_registry
 from tre_sm.allocator.topology import K8sPodSnapshot, pod_records_from_snapshots
 from tre_sm.allocator.slots import Binding, Slot
 from tre_sm.app import create_service_app
+from tre_sm.clock_check import check_clock_skew
 from tre_sm.gpu_truth import RedisGpuTruth
 from tre_sm.ops.k8s_ops import K8sOps
+from tre_sm.ops.sleep_primitive import GatewayState, SleepJournal
 from tre_sm.ops.vllm_ops import VllmOps
 from tre_sm.state.reconcile import PodRecord
 from tre_sm.state.operations import OperationCoordinator
 from tre_sm.state.safety import ClusterSafetyGate
+from tre_sm.state.fleet_seed import seed_desired
 from tre_sm.state.fleet_store import FleetStateStore
 from tre_sm.state.gpu_leases import GpuLeaseStore
 from tre_sm.state.store import StateStore
+
+
+LOG = logging.getLogger(__name__)
 
 
 class PodSnapshotOps(Protocol):
@@ -41,14 +48,22 @@ def create_app() -> FastAPI:
         raise RuntimeError("redis package is required for the service-manager server") from exc
 
     registry = load_registry(os.environ.get("TRE_REGISTRY_PATH"))
+    check_service_manager_config(registry)
     redis_url = os.environ.get("TRE_REDIS_URL", "redis://aibrix-redis-master:6379/0")
     redis_client = redis.Redis.from_url(redis_url)
+    sm_config = registry.service_manager()
+    check_clock_skew(
+        redis_client,
+        warn_s=sm_config.clock_skew_warn_s,
+        fail_s=sm_config.clock_skew_fail_s,
+    )
     k8s_ops = _create_k8s_ops(registry)
     operation_coordinator = OperationCoordinator(
         redis_client,
         owner=os.environ.get("HOSTNAME", "tre-v2-service-manager"),
         lease_ttl_ms=int(os.environ.get("TRE_SM_WRITER_LEASE_TTL_MS", "30000")),
     )
+    vllm_ops = VllmOps()
     legacy_store = StateStore(redis_client, require_fence=True)
     fleet_store = FleetStateStore(redis_client)
     gpu_leases = GpuLeaseStore(redis_client)
@@ -64,6 +79,13 @@ def create_app() -> FastAPI:
     ]
     with operation_coordinator.operation("bootstrap_fleet_state"):
         fleet_store.bootstrap(legacy_store.load().bindings)
+        # D7: every registry binding (and TRE-managed Deployment) gets a desired
+        # record (append-only), so the startup gate admits the Pods of a fresh
+        # deployment on an empty Redis; existing pods are seeded with their
+        # actual power (review P2-8).
+        seeded = seed_desired(registry, fleet_store, runtime_ops=k8s_ops, vllm_ops=vllm_ops)
+        if seeded["added"]:
+            LOG.info("seeded desired state from registry: %s", seeded)
         gpu_leases.rebuild_awake(
             legacy_store.load().bindings,
             starting_bindings=starting_bindings,
@@ -83,7 +105,7 @@ def create_app() -> FastAPI:
         legacy_store,
         k8s_client=K8sPodClientFromOps(registry.topology(), k8s_ops),
         runtime_ops=k8s_ops,
-        vllm_ops=VllmOps(),
+        vllm_ops=vllm_ops,
         gpu_truth=RedisGpuTruth(redis_client),
         create_max_used_mib=int(os.environ.get("TRE_CREATE_MAX_USED_MIB", "2500")),
         sleep_leak_used_mib=int(os.environ.get("TRE_SLEEP_LEAK_USED_MIB", "8192")),
@@ -92,12 +114,36 @@ def create_app() -> FastAPI:
         safety_gate=safety_gate,
         fleet_store=fleet_store,
         gpu_leases=gpu_leases,
+        gateway_state=GatewayState(
+            redis_client,
+            plugin_pods=_plugin_pod_lister(k8s_ops, sm_config.sleep),
+        ),
+        sleep_journal=SleepJournal(redis_client),
         supervisor_enabled=os.environ.get(
             "TRE_SM_SUPERVISOR_ENABLED", "true"
         ).lower() in {"1", "true", "yes"},
         supervisor_interval_s=float(
             os.environ.get("TRE_SM_SUPERVISOR_INTERVAL_S", "5")
         ),
+    )
+
+
+def check_service_manager_config(registry) -> None:
+    """Refuse to start on an invalid service_manager: / gateway: section, e.g. a
+    worst-case sleeping call that outlasts the controller's call timeout."""
+    errors = registry.validate_service_manager()
+    if errors:
+        raise RuntimeError(
+            "invalid registry service_manager/gateway configuration: " + "; ".join(errors)
+        )
+
+
+def _plugin_pod_lister(k8s_ops: K8sOps, policy):
+    selector = policy.plugin_label_selector
+    if not selector:
+        return None
+    return lambda: k8s_ops.list_ready_pod_names(
+        namespace=policy.plugin_namespace, label_selector=selector
     )
 
 

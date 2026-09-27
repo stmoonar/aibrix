@@ -1,4 +1,6 @@
 cluster:
+  # At most this many bindings (sleeping or awake) may share one physical GPU.
+  max_bound_per_gpu: 3
   nodes:
   - name: nscc-ds-4a100-node9
     gpus: 4
@@ -195,3 +197,101 @@ models:
   - '12288'
   - --gpu-memory-utilization
   - '0.85'
+# Gateway behaviour shared by the manifests and the service-manager.
+gateway:
+  # Request timeout of every model route: the single source for the model
+  # HTTPRoute timeout (make manifests) and the service-manager drain hard cap
+  # (service_manager.sleep.hard_cap_s may not exceed it). Keep the tre-v2 ext_proc
+  # route timeout (overlays/tre-v2/gateway-extproc.yaml) equal; a guard test
+  # enforces it.
+  route_timeout_s: 150
+# Service-manager behaviour (plan 2026-09-27). Every key is optional; the values
+# below are the built-in defaults. Changes to the LIVE registry (ConfigMap
+# tre-v2-registry) go through the console (PUT /api/params), never a kubectl apply
+# of overlays/tre-v2/params.yaml; the service-manager reads this section at start,
+# so restart it afterwards (kubectl -n tre-v2 rollout restart
+# deploy/tre-v2-service-manager).
+service_manager:
+  # A request that needs the SM writer lock waits up to this long for it. The lock
+  # is held only for short phases (hide, commit); a drain runs outside it.
+  writer_lock_wait_s: 10
+  # Timeout clients (the controller) use for slow SM calls. Must exceed the
+  # worst-case sleeping call = 2 x writer_lock_wait_s + sleep.ack_timeout_s +
+  # sleep.hard_cap_s + 2 x sleep.sleep_call_timeout_s +
+  # sleep.physical_confirm_timeout_s (285 s with these defaults); validated at
+  # SM and controller start. The controller uses it unless
+  # TRE_SM_SLOW_TIMEOUT_SECONDS overrides it.
+  api_call_timeout_s: 300
+  sleep:
+    # Every sleep runs hide (routable=false + route-gen bump) -> gateway plugin ack
+    # -> drain -> /sleep (D1/D2); no caller can skip a step.
+    # Max wait for every live gateway plugin instance to report the new route-gen.
+    ack_timeout_s: 10
+    # A plugin instance is live while its heartbeat score (tre:v2:gw:instances)
+    # keeps advancing: the SM saw it change within this many seconds of its own
+    # monotonic clock (never compared with a wall clock).
+    instance_staleness_s: 10
+    # The hide converges only with at least this many live plugin instances: an
+    # empty live set never counts as "all acked".
+    gateway_min_instances: 1
+    # Opt-in: with no live plugin instance at all, wait for the k8s label plus
+    # no_plugin_grace_s instead of an ack (no in-flight view from the gateway).
+    # false: no live instance = ack timeout = rollback.
+    fallback_no_plugin: false
+    no_plugin_grace_s: 5
+    poll_interval_s: 0.5
+    # HTTP timeout of one /sleep call (weight offload); a failed mode=wait is
+    # retried once with mode=abort.
+    sleep_call_timeout_s: 45
+    # After /sleep, wait this long for /is_sleeping to report true. Still unknown
+    # then: the pod stays hidden, the journal entry stays, the audit reports it.
+    physical_confirm_timeout_s: 15
+    # auto: probe GET /version per pod and send mode=wait|abort only to vLLM
+    # versions that accept it (>= 0.18); true/false force it. Without it the SM
+    # drains fully before a plain /sleep.
+    vllm_sleep_mode_param: auto
+    # Absolute drain cap. null = gateway.route_timeout_s (may not exceed it).
+    hard_cap_s: null
+    # TTL of the per-binding reservation that fences a draining binding and its
+    # GPUs while the drain runs outside the writer lock (renewed every poll).
+    reservation_ttl_s: 30
+    # Plugin instances that must ack = advancing heartbeats UNION Ready pods
+    # matching this selector: a plugin with Redis trouble may still route while
+    # its heartbeat stalls. label_selector: null = heartbeats only. Contract keys
+    # are keyed by pod NAME only: TRE model pods need unique names across
+    # namespaces (the generated Deployments guarantee it).
+    gateway_plugin_pods:
+      namespace: tre-v2
+      label_selector: app=tre-gateway-plugins
+    # Soft drain budget per sleep path (s); null = only the hard cap. Past the soft
+    # budget the SM aborts requests the gateway knows are continuable (counted as
+    # forced aborts). It never aborts while the drain state is unknown (read
+    # errors, metrics unavailable) or while non-continuable requests remain: it
+    # keeps waiting up to the hard cap and then rolls the hide back. A caller may
+    # pass its own budget (drain_budget_s), e.g. the SafeScale commit passes its
+    # probe window.
+    budgets_s:
+      safescale_commit: null
+      urgent: 30
+      scale_down: null
+      defrag: 30
+      repair: 30
+      startup: 30
+      default: 30
+  wake:
+    # A wake fails closed unless gpu-truth shows every target GPU at or below this
+    # fraction of its total memory: sleeping residents stay far below it, an awake
+    # resident or a sleep leak far above.
+    max_used_fraction: 0.2
+    # Optional absolute override in MiB; null = use max_used_fraction.
+    max_used_mib: null
+    # gpu-truth lags a sleep that just finished: re-read it for up to this long.
+    truth_wait_s: 5
+  clock_skew:
+    # Startup check of the local clock against Redis TIME.
+    warn_s: 1.0
+    # Refuse to start above this skew; null = warn only.
+    fail_s: null
+  node_pressure:
+    # Only registry nodes (cluster.nodes) can block a cold start.
+    registry_nodes_only: true

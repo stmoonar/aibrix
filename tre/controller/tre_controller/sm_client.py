@@ -46,7 +46,14 @@ class ServiceManagerClient:
         except ServiceManagerError as exc:
             return {"ok": False, "error": str(exc)}
 
-    async def scale_model(self, model: str, delta: int) -> dict:
+    async def scale_model(
+        self,
+        model: str,
+        delta: int,
+        *,
+        sleep_path: str | None = None,
+        drain_budget_s: float | None = None,
+    ) -> dict:
         try:
             state = await self.get_state()
             counts = state.get("models", {}).get(model, {})
@@ -54,21 +61,30 @@ class ServiceManagerClient:
             bound = int(counts.get("bound", 0))
             serving_floor = 1 if bound > 0 and current > 0 and int(delta) < 0 else 0
             target = max(serving_floor, current + int(delta))
+            payload: dict = {"wake_replicas": target}
+            payload.update(_sleep_fields(sleep_path, drain_budget_s))
             response = await self._request(
-                "PUT", f"/v2/models/{model}/target", json={"wake_replicas": target}, timeout_s=self._slow_timeout_s
+                "PUT", f"/v2/models/{model}/target", json=payload, timeout_s=self._slow_timeout_s
             )
             return {"ok": True, "response": response}
         except ServiceManagerError as exc:
             return {"ok": False, "error": str(exc)}
 
-    async def set_binding_power(self, serve_id: str, *, awake: bool) -> dict:
+    async def set_binding_power(
+        self,
+        serve_id: str,
+        *,
+        awake: bool,
+        sleep_path: str | None = None,
+        drain_budget_s: float | None = None,
+    ) -> dict:
         # Binding-level power (PUT /v2/bindings/{serve_id}/power): used to sleep exactly
         # one chosen binding (safescale commit of the hidden pod, slot-targeted donor).
         try:
             response = await self._request(
                 "PUT",
                 f"/v2/bindings/{serve_id}/power",
-                json={"awake": bool(awake)},
+                json={"awake": bool(awake), **_sleep_fields(sleep_path, drain_budget_s)},
                 timeout_s=self._slow_timeout_s,
             )
             return {"ok": True, "response": response}
@@ -111,6 +127,15 @@ class ServiceManagerClient:
         if not isinstance(response, dict):
             raise ServiceManagerError("service-manager response must be a JSON object")
         return response
+
+
+def _sleep_fields(sleep_path: str | None, drain_budget_s: float | None) -> dict:
+    fields: dict = {}
+    if sleep_path is not None:
+        fields["sleep_path"] = sleep_path
+    if drain_budget_s is not None:
+        fields["drain_budget_s"] = float(drain_budget_s)
+    return fields
 
 
 def _request_json(method: str, url: str, payload: dict | None, timeout_s: float) -> dict[str, Any]:

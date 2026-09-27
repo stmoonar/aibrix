@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 import json
 import time
@@ -15,6 +16,7 @@ from gen_model_manifests import (
     build_model_httproute,
     deployment_name,
 )
+from tre_common.rediskeys import ROUTE_GEN_ANNOTATION
 from tre_common.registry import Registry
 from tre_sm.allocator.slots import Binding
 from tre_sm.allocator.topology import (
@@ -30,6 +32,7 @@ MODEL_LABEL = "model.aibrix.ai/name"
 ROUTABLE_LABEL = "tre.aibrix.io/routable"
 MANAGED_LABEL = "tre.aibrix.io/managed"
 _VALID_STATES = {POD_STATE_AWAKE, POD_STATE_SLEEPING, POD_STATE_HIDDEN}
+_ROUTE_GEN_PATCH_ATTEMPTS = 5
 
 
 class K8sApi(Protocol):
@@ -236,10 +239,9 @@ class K8sOps:
         suspended_binding_ids: list[str],
         operation_id: str,
     ) -> None:
-        self._api.patch_namespaced_pod(
-            name=name,
-            namespace=self._namespace,
-            body={
+        self._patch_routable(
+            name,
+            {
                 "metadata": {
                     "labels": {ROUTABLE_LABEL: "false"},
                     "annotations": {
@@ -268,6 +270,17 @@ class K8sOps:
                 }
             },
         )
+
+    def list_ready_pod_names(self, *, namespace: str, label_selector: str) -> set[str]:
+        """Names of Running + Ready Pods (e.g. the gateway plugin instances)."""
+        pods = _items(
+            self._api.list_namespaced_pod(namespace=namespace, label_selector=label_selector)
+        )
+        return {
+            str(_metadata(pod)["name"])
+            for pod in pods
+            if _status(pod).get("phase") == "Running" and _pod_ready(pod)
+        }
 
     def scale_model_deployment(self, name: str, *, replicas: int) -> None:
         if replicas not in (0, 1):
@@ -308,9 +321,25 @@ class K8sOps:
         )
 
     def node_pressure_reasons(self) -> dict[str, list[str]]:
+        """DiskPressure / MemoryPressure / PIDPressure of the registry's nodes.
+
+        Only nodes in ``cluster.nodes`` can block a TRE cold start: a pressured
+        node elsewhere in a shared cluster says nothing about our GPUs
+        (registry ``service_manager.node_pressure.registry_nodes_only``).
+        """
+        scope: set[str] | None = None
+        if self._registry is not None:
+            config = getattr(self._registry, "service_manager", None)
+            only_registry = (
+                config().pressure_registry_nodes_only if callable(config) else True
+            )
+            if only_registry:
+                scope = {node.name for node in self._registry.topology().nodes}
         pressured: dict[str, list[str]] = {}
         for node in _items(self._api.list_node()):
             metadata = _metadata(node)
+            if scope is not None and str(metadata.get("name")) not in scope:
+                continue
             conditions = _status(node).get("conditions") or []
             reasons = [
                 str(_field(condition, "type", "type"))
@@ -362,7 +391,8 @@ class K8sOps:
             )
         return sorted(snapshots, key=lambda item: item.name)
 
-    def write_binding_annotations(self, binding: Binding, *, state: str) -> None:
+    def write_binding_annotations(self, binding: Binding, *, state: str) -> int:
+        """Write state + routable label; returns the new route generation."""
         if state not in _VALID_STATES:
             raise ValueError(f"unknown pod state: {state}")
         body = {
@@ -374,11 +404,41 @@ class K8sOps:
                 "labels": {ROUTABLE_LABEL: "true" if state == POD_STATE_AWAKE else "false"},
             }
         }
-        self._api.patch_namespaced_pod(name=binding.serve_id, namespace=self._namespace, body=body)
+        return self._patch_routable(binding.serve_id, body)
 
-    def set_pod_routable(self, serve_id: str, *, routable: bool) -> None:
+    def set_pod_routable(self, serve_id: str, *, routable: bool) -> int:
         body = {"metadata": {"labels": {ROUTABLE_LABEL: "true" if routable else "false"}}}
-        self._api.patch_namespaced_pod(name=serve_id, namespace=self._namespace, body=body)
+        return self._patch_routable(serve_id, body)
+
+    def _patch_routable(self, name: str, body: dict) -> int:
+        """Patch a Pod's routable label and bump its route generation atomically.
+
+        Contract with the gateway plugin (plan D3): every patch that writes the
+        ``tre.aibrix.io/routable`` label increments the integer annotation
+        ``tre.aibrix.io/route-gen`` in the SAME patch, so a plugin that reports
+        ``gen >= N`` has applied this label change (or a later one). The
+        read-increment-patch is guarded by the Pod's resourceVersion and retried
+        on a 409, so concurrent writers never reuse a generation.
+        """
+        for attempt in range(1, _ROUTE_GEN_PATCH_ATTEMPTS + 1):
+            pod = self._api.read_namespaced_pod(name=name, namespace=self._namespace)
+            metadata = _metadata(pod)
+            annotations = metadata.get("annotations") or {}
+            generation = _route_gen(annotations.get(ROUTE_GEN_ANNOTATION)) + 1
+            patch = copy.deepcopy(body)
+            patch_metadata = patch.setdefault("metadata", {})
+            patch_metadata.setdefault("annotations", {})[ROUTE_GEN_ANNOTATION] = str(generation)
+            resource_version = _optional_field(metadata, "resourceVersion", "resource_version")
+            if resource_version:
+                patch_metadata["resourceVersion"] = str(resource_version)
+            try:
+                self._api.patch_namespaced_pod(name=name, namespace=self._namespace, body=patch)
+            except Exception as exc:
+                if getattr(exc, "status", None) == 409 and attempt < _ROUTE_GEN_PATCH_ATTEMPTS:
+                    continue
+                raise
+            return generation
+        raise RuntimeError(f"route-gen patch of {name} did not converge")  # pragma: no cover
 
     def wait_pod_unroutable(self, binding: Binding, *, timeout_s: float = 30.0, interval_s: float = 0.5) -> None:
         deadline = time.monotonic() + timeout_s
@@ -411,6 +471,7 @@ class K8sOps:
             model_namespace=self._namespace,
             gateway_namespace=self._route_namespace,
             gateway_name=self._gateway_name,
+            **self._route_timeout_kwargs(),
         )
         name = str(body["metadata"]["name"])
         try:
@@ -441,6 +502,13 @@ class K8sOps:
                 body={"metadata": {"labels": body["metadata"].get("labels", {})}, "spec": body["spec"]},
             )
         self._wait_httproute_accepted(name, timeout_s=timeout_s, interval_s=interval_s)
+
+    def _route_timeout_kwargs(self) -> dict:
+        """Registry gateway.route_timeout_s (the manifests use the same value)."""
+        gateway = getattr(self._registry, "gateway", None)
+        if not callable(gateway):
+            return {}
+        return {"request_timeout_s": gateway().route_timeout_s}
 
     def _wait_httproute_accepted(self, name: str, *, timeout_s: float, interval_s: float) -> None:
         deadline = time.monotonic() + timeout_s
@@ -530,6 +598,13 @@ def _items(value):
     if items is not None:
         return list(items)
     return list(value)
+
+
+def _route_gen(value) -> int:
+    try:
+        return max(0, int(str(value).strip()))
+    except (TypeError, ValueError):
+        return 0
 
 
 def _parse_routable(value) -> bool | None:

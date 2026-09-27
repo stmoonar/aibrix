@@ -4,6 +4,8 @@ from pathlib import Path
 
 import yaml
 
+from tre_common.registry import load_registry
+
 
 DEPLOY_ROOT = Path(__file__).resolve().parents[1]
 
@@ -83,6 +85,12 @@ def test_tre_v2_overlay_declares_components_and_independent_redis() -> None:
     assert _image(controller) == "tre-v2-controller:20260924-2caa0514"
     assert _image(sm) == "tre-v2-service-manager:20260924-4e9ab85c"
     sm_container = sm["spec"]["template"]["spec"]["containers"][0]
+    # Review P1-2: single writer across rollouts, and a grace period derived from
+    # the registry sleep policy (a sleep past /sleep finishes; drains roll back).
+    assert sm["spec"]["strategy"] == {"type": "Recreate"}
+    sleep = load_registry(str(DEPLOY_ROOT / "registry.yaml")).service_manager().sleep
+    grace = sm["spec"]["template"]["spec"]["terminationGracePeriodSeconds"]
+    assert grace >= sleep.hard_cap_s + 2 * sleep.sleep_call_timeout_s + sleep.physical_confirm_timeout_s
     assert sm_container["readinessProbe"]["httpGet"] == {
         "path": "/healthz",
         "port": "http",
@@ -159,6 +167,14 @@ def test_tre_v2_overlay_declares_components_and_independent_redis() -> None:
     assert {"name": "registry", "mountPath": "/etc/tre", "readOnly": True} in mounts
     volumes = controller["spec"]["template"]["spec"]["volumes"]
     assert any(v["name"] == "registry" and v["configMap"]["name"] == "tre-v2-registry" for v in volumes)
+
+    # Plan 2026-09-27 D7: the service-manager seeds desired state from the SAME live
+    # registry (and reads its service_manager: sleep policy) - not a baked copy.
+    assert _env(sm)["TRE_REGISTRY_PATH"] == "/etc/tre/registry.yaml"
+    sm_mounts = sm["spec"]["template"]["spec"]["containers"][0]["volumeMounts"]
+    assert {"name": "registry", "mountPath": "/etc/tre", "readOnly": True} in sm_mounts
+    sm_volumes = sm["spec"]["template"]["spec"]["volumes"]
+    assert any(v["name"] == "registry" and v["configMap"]["name"] == "tre-v2-registry" for v in sm_volumes)
 
     params = _load_yaml(overlay / "params.yaml")
     assert params["kind"] == "ConfigMap" and params["metadata"]["name"] == "tre-v2-registry"

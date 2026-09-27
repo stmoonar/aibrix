@@ -65,13 +65,17 @@ class FakeVllmOps:
         self.calls.append(("wait_until_ready", pod_ip, port))
         return type("Result", (), {"success": True, "message": ""})()
 
-    def sleep(self, pod_ip, *, port=None):
+    def sleep(self, pod_ip, *, port=None, **_kwargs):
         self.calls.append(("sleep", pod_ip, port))
         return type("Result", (), {"success": True, "message": ""})()
 
     def wake_up(self, pod_ip, *, port=None):
         self.calls.append(("wake_up", pod_ip, port))
         return type("Result", (), {"success": True, "message": ""})()
+
+    def metrics(self, pod_ip, *, port=None):
+        # Idle engine: the sleep primitive needs readable gauges to call it drained.
+        return "vllm:num_requests_running 0.0\nvllm:num_requests_waiting 0.0\n"
 
 
 class FakeGpuTruth:
@@ -291,6 +295,7 @@ def test_v2_put_binding_power_uses_runtime_path_and_is_idempotent():
         ("wake_up", "10.0.0.1", 8000),
     ]
     assert runtime.annotations == [
+        ("serve-a", "hidden"),  # sleep primitive: hide first
         ("serve-a", "sleeping"),
         ("serve-a", "awake"),
     ]
@@ -1017,7 +1022,7 @@ def test_startup_admission_sleeps_overlap_and_records_restore_intent():
         def is_sleeping(self, *_args, **_kwargs):
             return self.sleeping
 
-        def sleep(self, pod_ip, *, port=None):
+        def sleep(self, pod_ip, *, port=None, **_kwargs):
             self.sleeping = True
             return super().sleep(pod_ip, port=port)
 
@@ -1137,6 +1142,7 @@ def test_v2_put_target_calls_vllm_and_pod_annotations_for_existing_bindings():
         ("wake_up", "10.0.0.2", 8000),
     ]
     assert runtime_ops.annotations == [
+        ("serve-a", "hidden"),  # sleep primitive: hide first
         ("serve-a", "sleeping"),
         ("serve-a", "awake"),
         ("serve-b", "awake"),
@@ -1217,7 +1223,7 @@ def test_v2_put_target_treats_matching_state_conflict_after_runtime_action_as_su
         "actions": [{"action": "sleep", "serve_id": "serve-a"}],
     }
     assert vllm_ops.calls == [("sleep", "10.0.0.1", 8000)]
-    assert runtime_ops.annotations == [("serve-a", "sleeping")]
+    assert runtime_ops.annotations == [("serve-a", "hidden"), ("serve-a", "sleeping")]
 
 
 class _HeadroomProbeRuntime(FakeRuntimeOps):

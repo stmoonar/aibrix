@@ -32,7 +32,7 @@ def test_config_defaults_are_plan_aligned() -> None:
     assert config.signal_source == "zm"
     assert config.signal_idle_rps_eps == 0.05
     assert config.signal_warmup_ms == -1
-    assert config.sm_slow_timeout_s == 300.0
+    assert config.sm_slow_timeout_s is None  # -> registry service_manager.api_call_timeout_s
     assert config.paper_stale_max_windows == 3
     assert config.incomplete_policy == "drop_model"
     assert config.enable_tre_scaling is True
@@ -290,3 +290,26 @@ def test_config_rejects_invalid_paper_stale_window_limit() -> None:
 def test_config_rejects_invalid_incomplete_policy() -> None:
     with pytest.raises(ValueError, match="TRE_INCOMPLETE_POLICY"):
         ControllerConfig.from_env({"TRE_INCOMPLETE_POLICY": "drop_cluster"})
+
+
+
+def test_sm_call_timeout_defaults_to_the_registry_and_must_outlast_a_sleep() -> None:
+    from types import SimpleNamespace
+
+    import pytest
+
+    from tre_common.registry import ClusterTopology, Registry, parse_service_manager_config
+    from tre_controller.app import resolve_sm_call_timeout_s
+
+    registry = Registry(ClusterTopology(nodes=()), [], service_manager=parse_service_manager_config(None))
+    assert resolve_sm_call_timeout_s(SimpleNamespace(sm_slow_timeout_s=None), registry) == 300.0
+    assert resolve_sm_call_timeout_s(SimpleNamespace(sm_slow_timeout_s=400.0), registry) == 400.0
+    with pytest.raises(ValueError, match="TRE_SM_SLOW_TIMEOUT_SECONDS = 120s"):
+        resolve_sm_call_timeout_s(SimpleNamespace(sm_slow_timeout_s=120.0), registry)
+    slow = Registry(
+        ClusterTopology(nodes=()),
+        [],
+        service_manager=parse_service_manager_config({"sleep": {"sleep_call_timeout_s": 120}}),
+    )
+    with pytest.raises(ValueError, match="api_call_timeout_s = 300s"):
+        resolve_sm_call_timeout_s(SimpleNamespace(sm_slow_timeout_s=None), slow)

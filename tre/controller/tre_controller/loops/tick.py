@@ -437,8 +437,20 @@ def _commands_to_actions(commands: tuple[SafeScaleCommand, ...], *, source_loop:
         elif command.kind == "unhide":
             actions.append(UnhideAction(command.model, command.pods, command.reason, source_loop))
         elif command.kind in {"scale_down", "scale_up"}:
-            pods = command.pods if command.kind == "scale_down" else ()
-            actions.append(ScaleAction(command.model, command.delta, command.reason, source_loop, pods=pods))
+            if command.kind == "scale_down":
+                actions.append(
+                    ScaleAction(
+                        command.model,
+                        command.delta,
+                        command.reason,
+                        source_loop,
+                        pods=command.pods,
+                        sleep_path="safescale_commit",
+                        drain_budget_s=command.drain_budget_s,
+                    )
+                )
+            else:
+                actions.append(ScaleAction(command.model, command.delta, command.reason, source_loop))
     return tuple(actions)
 
 

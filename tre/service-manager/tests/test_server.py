@@ -46,3 +46,16 @@ def test_gpu_truth_required_from_env_can_be_disabled_for_emergencies() -> None:
     assert gpu_truth_required_from_env({"TRE_GPU_TRUTH_REQUIRED": "false"}) is False
     assert gpu_truth_required_from_env({"TRE_GPU_TRUTH_REQUIRED": "0"}) is False
     assert gpu_truth_required_from_env({"TRE_GPU_TRUTH_REQUIRED": "true"}) is True
+
+
+
+def test_service_manager_refuses_an_invalid_sleep_configuration():
+    import pytest
+
+    from tre_common.registry import ClusterTopology, Registry, parse_service_manager_config
+    from tre_sm.server import check_service_manager_config
+
+    check_service_manager_config(Registry(ClusterTopology(nodes=()), []))
+    slow = parse_service_manager_config({"sleep": {"sleep_call_timeout_s": 200}})
+    with pytest.raises(RuntimeError, match="worst-case sleeping service-manager call"):
+        check_service_manager_config(Registry(ClusterTopology(nodes=()), [], service_manager=slow))

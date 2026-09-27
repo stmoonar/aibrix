@@ -1,6 +1,7 @@
 from tre_common.registry import ClusterTopology, ModelSpec, NodeSpec, Registry, SloSpec, TrsParams
 from tre_sm.allocator.slots import Binding, Slot
 from tre_sm.allocator.topology import GPU_IDS_ANNOTATION, STATE_ANNOTATION, K8sPodSnapshot
+from tre_common.rediskeys import ROUTE_GEN_ANNOTATION
 from tre_sm.ops.k8s_ops import MODEL_LABEL, K8sOps
 
 
@@ -20,6 +21,13 @@ class FakeK8sApi:
         self.deployments = []
         self.nodes = []
         self.scale_patches = []
+        # Pod metadata served by read_namespaced_pod (route-gen read-modify-write).
+        self.pod_metadata = {}
+        self.patch_conflicts = 0
+
+    def read_namespaced_pod(self, *, name, namespace):
+        metadata = self.pod_metadata.setdefault(name, {"name": name, "annotations": {}})
+        return {"metadata": {**metadata, "annotations": dict(metadata.get("annotations") or {})}}
 
     def list_namespaced_pod(self, *, namespace, label_selector=None):
         self.last_list = (namespace, label_selector)
@@ -29,7 +37,15 @@ class FakeK8sApi:
         return self.pods
 
     def patch_namespaced_pod(self, *, name, namespace, body):
+        if self.patch_conflicts:
+            self.patch_conflicts -= 1
+            # Someone else wrote the Pod: its resourceVersion moved on.
+            metadata = self.pod_metadata.setdefault(name, {"name": name, "annotations": {}})
+            metadata["resourceVersion"] = str(int(metadata.get("resourceVersion", "0")) + 1)
+            raise ApiError(409)
         self.patches.append((name, namespace, body))
+        metadata = self.pod_metadata.setdefault(name, {"name": name, "annotations": {}})
+        metadata["annotations"].update(body.get("metadata", {}).get("annotations") or {})
 
     def delete_namespaced_deployment(self, *, name, namespace):
         self.deleted_deployments.append((name, namespace))
@@ -364,6 +380,7 @@ def test_k8s_ops_writes_binding_annotations():
                     "annotations": {
                         GPU_IDS_ANNOTATION: "0,1",
                         STATE_ANNOTATION: "hidden",
+                        ROUTE_GEN_ANNOTATION: "1",
                     },
                     "labels": {"tre.aibrix.io/routable": "false"},
                 }
@@ -565,5 +582,83 @@ def test_k8s_ops_set_pod_routable_patches_only_the_label():
     ops.set_pod_routable("serve-a", routable=False)
 
     assert api.patches == [
-        ("serve-a", "tre-v2", {"metadata": {"labels": {"tre.aibrix.io/routable": "false"}}})
+        (
+            "serve-a",
+            "tre-v2",
+            {
+                "metadata": {
+                    "labels": {"tre.aibrix.io/routable": "false"},
+                    "annotations": {ROUTE_GEN_ANNOTATION: "1"},
+                }
+            },
+        )
     ]
+
+
+def test_every_routable_write_bumps_route_gen_in_the_same_patch():
+    api = FakeK8sApi([])
+    api.pod_metadata["serve-a"] = {
+        "name": "serve-a",
+        "annotations": {ROUTE_GEN_ANNOTATION: "41"},
+        "resourceVersion": "900",
+    }
+    ops = K8sOps(api=api, namespace="tre-v2")
+    binding = Binding("serve-a", "m", Slot("node-a", (0,)), awake=True)
+
+    first = ops.write_binding_annotations(binding, state="hidden")
+    second = ops.set_pod_routable("serve-a", routable=True)
+    third = ops.write_binding_annotations(binding, state="sleeping")
+
+    assert (first, second, third) == (42, 43, 44)
+    for (_name, _ns, body), gen in zip(api.patches, ("42", "43", "44")):
+        assert body["metadata"]["annotations"][ROUTE_GEN_ANNOTATION] == gen
+        assert "tre.aibrix.io/routable" in body["metadata"]["labels"]
+    # The read-modify-write is guarded by the Pod's resourceVersion.
+    assert api.patches[0][2]["metadata"]["resourceVersion"] == "900"
+
+
+def test_route_gen_patch_retries_on_resource_version_conflict():
+    api = FakeK8sApi([])
+    api.pod_metadata["serve-a"] = {
+        "name": "serve-a",
+        "annotations": {ROUTE_GEN_ANNOTATION: "3"},
+        "resourceVersion": "10",
+    }
+    api.patch_conflicts = 2
+    ops = K8sOps(api=api, namespace="tre-v2")
+
+    gen = ops.set_pod_routable("serve-a", routable=False)
+
+    assert gen == 4
+    assert len(api.patches) == 1
+    assert api.patches[0][2]["metadata"]["resourceVersion"] == "12"
+
+
+def test_admission_patch_bumps_route_gen():
+    api = FakeK8sApi([])
+    ops = K8sOps(api=api, namespace="tre-v2")
+
+    ops.admit_startup_pod(
+        "pod-a", pod_uid="uid-a", suspended_binding_ids=[], operation_id="op"
+    )
+
+    body = api.patches[0][2]
+    assert body["metadata"]["labels"] == {"tre.aibrix.io/routable": "false"}
+    assert body["metadata"]["annotations"][ROUTE_GEN_ANNOTATION] == "1"
+
+
+def test_node_pressure_only_considers_registry_nodes():
+    api = FakeK8sApi([])
+    api.nodes = [
+        {
+            "metadata": {"name": name},
+            "status": {"conditions": [{"type": "DiskPressure", "status": "True"}]},
+        }
+        for name in ("node-a", "someone-elses-node")
+    ]
+    registry = Registry(
+        ClusterTopology(nodes=(NodeSpec("node-a", 1, (), ("GPU-a",)),)), []
+    )
+    ops = K8sOps(api=api, namespace="tre-v2", registry=registry)
+
+    assert ops.node_pressure_reasons() == {"node-a": ["DiskPressure"]}

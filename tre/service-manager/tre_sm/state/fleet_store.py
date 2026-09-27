@@ -231,6 +231,40 @@ class FleetStateStore:
             "observed_version": observed_version,
         }
 
+    def append_missing_desired(
+        self,
+        records: Iterable[DesiredBinding],
+        *,
+        max_attempts: int = 5,
+    ) -> dict:
+        """Append-only desired seeding (plan D7).
+
+        Adds each record whose binding_id has no desired record yet; existing
+        records are never modified (whatever their power/lifecycle). CAS on the
+        desired version plus the writer fence, retried on a version conflict.
+        """
+        wanted = list(records)
+        for _attempt in range(max_attempts):
+            snapshot = self.load_desired()
+            existing = {binding.binding_id for binding in snapshot.bindings}
+            missing = [record for record in wanted if record.binding_id not in existing]
+            if not missing:
+                return {"added": [], "desired_version": snapshot.version}
+            try:
+                version = self.save_desired(
+                    list(snapshot.bindings) + missing,
+                    expected_version=snapshot.version,
+                )
+            except FleetStateConflict:
+                continue
+            return {
+                "added": sorted(record.binding_id for record in missing),
+                "desired_version": version,
+            }
+        raise FleetStateConflict(
+            expected_version=snapshot.version, current_version=self.load_desired().version
+        )
+
     def _save(
         self,
         *,

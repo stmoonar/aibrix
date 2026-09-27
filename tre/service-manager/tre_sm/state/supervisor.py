@@ -7,6 +7,7 @@ from typing import Protocol
 
 from tre_sm.state.operations import OperationBusy
 from tre_sm.state.safety import ControllerNotPaused, NodePressureActive
+from tre_sm.state.sleep_reservations import ReservationConflict
 
 
 class SupervisedService(Protocol):
@@ -67,6 +68,10 @@ class FleetSupervisor:
         )
         self._thread.start()
 
+    def request_stop(self) -> None:
+        """Signal-safe: stop after the current pass (no join)."""
+        self._stop.set()
+
     def stop(self) -> None:
         self._stop.set()
         if self._thread is not None:
@@ -82,6 +87,18 @@ class FleetSupervisor:
         )
 
     def run_once(self) -> None:
+        recover = getattr(self._service, "recover_sleep_journal", None)
+        if callable(recover):
+            try:
+                recover()
+            except OperationBusy:
+                pass  # another writer; next pass
+        ensure_seeded = getattr(self._service, "ensure_desired_seeded", None)
+        if callable(ensure_seeded):
+            try:
+                ensure_seeded()
+            except OperationBusy:
+                pass  # another writer; next pass
         self._service.converge_startups()
         recovered = self._service.recover_stale_fleet_repairs()
         if recovered is not None:
@@ -124,9 +141,10 @@ class FleetSupervisor:
             try:
                 self.run_once()
                 self._last_error = None
-            except (OperationBusy, ControllerNotPaused, NodePressureActive):
+            except (OperationBusy, ControllerNotPaused, NodePressureActive, ReservationConflict):
                 # Expected gates: another writer is converging, controller is
-                # active, or pressure remains. Retry without mutating intent.
+                # active, pressure remains, or a sleep is draining. Retry without
+                # mutating intent.
                 pass
             except Exception as exc:  # keep supervision alive and observable.
                 self._last_error = f"{type(exc).__name__}: {exc}"

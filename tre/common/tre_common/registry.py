@@ -94,9 +94,17 @@ class NodeSpec:
     gpu_uuids: tuple[str, ...] = ()
 
 
+#: Default for ``cluster.max_bound_per_gpu``: at most this many bindings (sleeping
+#: or awake) may share one physical GPU (each sleeping resident keeps a small
+#: CUDA context on the GPU).
+DEFAULT_MAX_BOUND_PER_GPU = 3
+
+
 @dataclass(frozen=True)
 class ClusterTopology:
     nodes: tuple[NodeSpec, ...]
+    #: Registry ``cluster.max_bound_per_gpu``.
+    max_bound_per_gpu: int = DEFAULT_MAX_BOUND_PER_GPU
 
 
 @dataclass(frozen=True)
@@ -130,13 +138,183 @@ def scale_max_replicas(spec: Any) -> int:
     return int(spec.max_replicas) if cap is None else int(cap)
 
 
+#: Sleep paths (plan 2026-09-27 D1): every caller that puts a binding to sleep names
+#: one; the service-manager looks up its soft drain budget in
+#: ``service_manager.sleep.budgets_s``.
+SLEEP_PATHS = (
+    "safescale_commit",  # SafeScale commit of a hidden probe pod
+    "urgent",  # controller *_immediate donor paths (fast loop)
+    "scale_down",  # ordinary scale-down (TRE slow loop and APA alike)
+    "defrag",  # buddy defragmentation migration
+    "repair",  # fleet repair quarantine / resident pool rebuild
+    "startup",  # startup admission / startup convergence
+    "default",  # any caller that names no path
+)
+
+#: Soft drain budgets (s). ``None`` = only the hard cap. Every drain is additionally
+#: capped by ``hard_cap_s``; requests the gateway marks non-continuable are always
+#: waited for up to the hard cap (never aborted at the soft budget).
+DEFAULT_SLEEP_BUDGETS_S: dict[str, float | None] = {
+    # The caller passes the probe window as drain_budget_s; without one, hard cap.
+    "safescale_commit": None,
+    "urgent": 30.0,
+    # No deadline pressure: wait for in-flight requests up to the hard cap. The same
+    # budget applies to TRE and APA scale-downs (both arms drain identically).
+    "scale_down": None,
+    "defrag": 30.0,
+    "repair": 30.0,
+    "startup": 30.0,
+    "default": 30.0,
+}
+
+#: Default ``gateway.route_timeout_s``: the gateway's per-request route timeout. The
+#: single source for the model HTTPRoute timeout (deploy/gen_model_manifests.py) and
+#: the service-manager drain hard cap (no request can outlive it anyway).
+DEFAULT_ROUTE_TIMEOUT_S = 150.0
+
+#: ``service_manager.sleep.vllm_sleep_mode_param`` values.
+SLEEP_MODE_PARAM_CHOICES = ("auto", "true", "false")
+
+
+@dataclass(frozen=True)
+class GatewayConfig:
+    """Registry ``gateway:`` section."""
+
+    #: Request timeout of every model route (HTTPRoute ``timeouts.request``).
+    route_timeout_s: float = DEFAULT_ROUTE_TIMEOUT_S
+
+
+@dataclass(frozen=True)
+class SleepPolicy:
+    """How the service-manager puts a vLLM pod to sleep (plan D1-D4).
+
+    hide (routable=false + route-gen bump) -> gateway ack -> drain -> /sleep.
+    """
+
+    #: Max wait for every live gateway plugin instance to ack the hide.
+    ack_timeout_s: float = 10.0
+    #: A plugin instance is live while its heartbeat score keeps ADVANCING: the SM
+    #: saw the score change within this many seconds of its own monotonic clock.
+    #: The score is never compared with any wall clock (clock-skew proof).
+    instance_staleness_s: float = 10.0
+    #: The hide converges only with at least this many live plugin instances. An
+    #: empty live set never passes: an old plugin image (or a misconfigured
+    #: coordination Redis) routes traffic without ever heartbeating, and "every
+    #: live instance acked" would then be vacuously true.
+    gateway_min_instances: int = 1
+    #: Opt-in: with NO live plugin instance at all, fall back to waiting for the
+    #: k8s label plus ``no_plugin_grace_s`` (no in-flight view from the gateway).
+    #: Default off: no live instance = not converged = ack timeout = rollback.
+    fallback_no_plugin: bool = False
+    #: Grace delay of the opt-in no-plugin fallback, for informers to catch up.
+    no_plugin_grace_s: float = 5.0
+    poll_interval_s: float = 0.5
+    #: HTTP timeout of one /sleep call (weight offload). A mode=wait call that
+    #: fails is retried once with mode=abort, so a sleep spends up to 2x this.
+    sleep_call_timeout_s: float = 45.0
+    #: After /sleep returned, wait this long for /is_sleeping to report true.
+    physical_confirm_timeout_s: float = 15.0
+    #: ``auto``: probe the pod's ``GET /version`` (cached per pod) and send
+    #: ``mode=wait|abort`` on /sleep only to vLLM versions that accept it;
+    #: ``true`` / ``false`` force it. Without the mode parameter the SM drains
+    #: fully before a plain /sleep.
+    vllm_sleep_mode_param: str = "auto"
+    #: Absolute drain cap; defaults to (and may not exceed) gateway.route_timeout_s.
+    hard_cap_s: float = DEFAULT_ROUTE_TIMEOUT_S
+    #: TTL of the per-binding sleep reservation that fences a draining binding
+    #: (and its GPUs) while the drain runs outside the writer lock. Renewed every
+    #: poll; the reservation of a dead owner expires after this long.
+    reservation_ttl_s: float = 30.0
+    #: Gateway plugin pods that must ack, besides advancing heartbeats: a plugin
+    #: with Redis trouble may still route while its heartbeat stalls, so Ready pods
+    #: matching this selector count as live too. None = heartbeats only.
+    plugin_namespace: str = "tre-v2"
+    plugin_label_selector: str | None = "app=tre-gateway-plugins"
+    budgets_s: dict[str, float | None] = field(
+        default_factory=lambda: dict(DEFAULT_SLEEP_BUDGETS_S)
+    )
+
+    def soft_budget_s(self, path: str, requested_s: float | None = None) -> float:
+        """Soft drain budget of one sleep: the caller's budget, else the path's."""
+        if requested_s is not None:
+            budget = float(requested_s)
+            if not math.isfinite(budget) or budget < 0:
+                raise ValueError(f"drain budget must be a finite number >= 0, got {requested_s!r}")
+        else:
+            key = path if path in self.budgets_s else "default"
+            raw = self.budgets_s.get(key)
+            budget = self.hard_cap_s if raw is None else float(raw)
+        return min(budget, self.hard_cap_s)
+
+
+@dataclass(frozen=True)
+class ServiceManagerConfig:
+    sleep: SleepPolicy = field(default_factory=SleepPolicy)
+    #: Wake fails closed unless every target GPU's used memory (gpu-truth) is at
+    #: most this fraction of the GPU's total memory: sleeping residents keep only
+    #: a small footprint; an awake resident (or a leak) is far above it.
+    wake_max_used_fraction: float = 0.2
+    #: Optional absolute override (MiB) of the wake threshold; None = the fraction.
+    wake_max_used_mib: int | None = None
+    #: gpu-truth lags a just-finished sleep; re-read it for up to this long.
+    wake_truth_wait_s: float = 5.0
+    #: Startup check of the local clock against Redis TIME.
+    clock_skew_warn_s: float = 1.0
+    #: Refuse to start above this skew (None = warn only).
+    clock_skew_fail_s: float | None = None
+    #: Only nodes in cluster.nodes can block a cold start with node pressure.
+    pressure_registry_nodes_only: bool = True
+    #: A request that needs the SM writer lock waits up to this long for it (the
+    #: lock is held only for short phases; a drain runs outside it).
+    writer_lock_wait_s: float = 10.0
+    #: Timeout clients (the controller) use for slow SM calls (scale / binding
+    #: power / defrag). Must exceed :meth:`worst_case_sleep_call_s`; the controller
+    #: uses it unless TRE_SM_SLOW_TIMEOUT_SECONDS overrides it (validated too).
+    api_call_timeout_s: float = 300.0
+
+    def worst_case_sleep_call_s(self) -> float:
+        """Upper bound of one sleeping SM call: writer-lock wait (hide phase and
+        commit phase) + gateway ack + drain hard cap + /sleep (mode=wait, then a
+        mode=abort retry) + physical confirmation."""
+        sleep = self.sleep
+        return (
+            2 * self.writer_lock_wait_s
+            + sleep.ack_timeout_s
+            + sleep.hard_cap_s
+            + 2 * sleep.sleep_call_timeout_s
+            + sleep.physical_confirm_timeout_s
+        )
+
+    def wake_limit_mib(self, total_mib: int | None) -> int | None:
+        """Max used MiB for a wake on a GPU of ``total_mib`` (None = unknown)."""
+        if self.wake_max_used_mib is not None:
+            return int(self.wake_max_used_mib)
+        if total_mib is None or total_mib <= 0:
+            return None
+        return int(total_mib * self.wake_max_used_fraction)
+
+
 class Registry:
-    def __init__(self, topology: ClusterTopology, models: list[ModelSpec]) -> None:
+    def __init__(
+        self,
+        topology: ClusterTopology,
+        models: list[ModelSpec],
+        service_manager: ServiceManagerConfig | None = None,
+        gateway: GatewayConfig | None = None,
+    ) -> None:
         self._topology = topology
         self._models = tuple(models)
+        self._service_manager = service_manager or ServiceManagerConfig()
+        self._gateway = gateway or GatewayConfig()
         self._model_index: dict[str, ModelSpec] = {}
         for model in models:
             self._model_index.setdefault(model.name, model)
+
+    def service_manager(self) -> ServiceManagerConfig:
+        return self._service_manager
+
+    def gateway(self) -> GatewayConfig:
+        return self._gateway
 
     def model(self, name: str) -> ModelSpec:
         try:
@@ -149,6 +327,11 @@ class Registry:
 
     def topology(self) -> ClusterTopology:
         return self._topology
+
+    def validate_service_manager(self) -> list[str]:
+        """Only the service_manager: / gateway: checks (the SM refuses to start on
+        these; model / topology errors are the manifest generator's concern)."""
+        return _validate_service_manager(self._service_manager, self._gateway)
 
     def validate(self) -> list[str]:
         errors: list[str] = []
@@ -213,6 +396,9 @@ class Registry:
                 for gpu in slot:
                     if gpu < 0 or gpu >= node.gpus:
                         errors.append(f"node {node.name}: gpu {gpu} outside gpu range 0..{node.gpus - 1}")
+        if self._topology.max_bound_per_gpu < 1:
+            errors.append("cluster.max_bound_per_gpu must be >= 1")
+        errors.extend(_validate_service_manager(self._service_manager, self._gateway))
         return errors
 
 
@@ -226,7 +412,204 @@ def _parse_registry(raw: dict[str, Any]) -> Registry:
     cluster = raw.get("cluster") or {}
     nodes = tuple(_parse_node(item) for item in cluster.get("nodes", []))
     models = [_parse_model(item) for item in raw.get("models", [])]
-    return Registry(ClusterTopology(nodes=nodes), models)
+    max_bound = cluster.get("max_bound_per_gpu")
+    return Registry(
+        ClusterTopology(
+            nodes=nodes,
+            max_bound_per_gpu=(
+                DEFAULT_MAX_BOUND_PER_GPU if max_bound is None else int(max_bound)
+            ),
+        ),
+        models,
+        service_manager=parse_service_manager_config(
+            raw.get("service_manager"), gateway=raw.get("gateway")
+        ),
+        gateway=parse_gateway_config(raw.get("gateway")),
+    )
+
+
+def parse_gateway_config(raw: dict[str, Any] | None) -> GatewayConfig:
+    """Parse the optional ``gateway:`` registry section."""
+    raw = raw or {}
+    timeout = raw.get("route_timeout_s")
+    return GatewayConfig(
+        route_timeout_s=float(DEFAULT_ROUTE_TIMEOUT_S if timeout is None else timeout)
+    )
+
+
+def parse_service_manager_config(
+    raw: dict[str, Any] | None, *, gateway: dict[str, Any] | None = None
+) -> ServiceManagerConfig:
+    """Parse the optional ``service_manager:`` registry section (all keys optional).
+
+    ``sleep.hard_cap_s`` defaults to ``gateway.route_timeout_s`` (the gateway's
+    request timeout: no request can outlive it anyway), else 150 s.
+    """
+    raw = raw or {}
+    sleep_raw = raw.get("sleep") or {}
+    wake_raw = raw.get("wake") or {}
+    skew_raw = raw.get("clock_skew") or {}
+    pressure_raw = raw.get("node_pressure") or {}
+    defaults = SleepPolicy()
+    plugin_pods_raw = sleep_raw.get("gateway_plugin_pods") or {}
+    hard_cap = sleep_raw.get("hard_cap_s")
+    if hard_cap is None:
+        hard_cap = (gateway or {}).get("route_timeout_s")
+    budgets = dict(DEFAULT_SLEEP_BUDGETS_S)
+    for path, value in (sleep_raw.get("budgets_s") or {}).items():
+        if str(path) not in SLEEP_PATHS:
+            raise ValueError(
+                f"service_manager.sleep.budgets_s: unknown sleep path {path!r} "
+                f"(known: {', '.join(SLEEP_PATHS)})"
+            )
+        budgets[str(path)] = None if value is None else float(value)
+    sleep = SleepPolicy(
+        ack_timeout_s=_num(sleep_raw, "ack_timeout_s", defaults.ack_timeout_s),
+        instance_staleness_s=_num(sleep_raw, "instance_staleness_s", defaults.instance_staleness_s),
+        gateway_min_instances=int(
+            _num(sleep_raw, "gateway_min_instances", defaults.gateway_min_instances)
+        ),
+        fallback_no_plugin=_parse_bool(
+            sleep_raw.get("fallback_no_plugin", defaults.fallback_no_plugin)
+        ),
+        no_plugin_grace_s=_num(sleep_raw, "no_plugin_grace_s", defaults.no_plugin_grace_s),
+        poll_interval_s=_num(sleep_raw, "poll_interval_s", defaults.poll_interval_s),
+        sleep_call_timeout_s=_num(
+            sleep_raw, "sleep_call_timeout_s", defaults.sleep_call_timeout_s
+        ),
+        physical_confirm_timeout_s=_num(
+            sleep_raw, "physical_confirm_timeout_s", defaults.physical_confirm_timeout_s
+        ),
+        vllm_sleep_mode_param=parse_sleep_mode_param(
+            sleep_raw.get("vllm_sleep_mode_param", defaults.vllm_sleep_mode_param)
+        ),
+        hard_cap_s=float(DEFAULT_ROUTE_TIMEOUT_S if hard_cap is None else hard_cap),
+        reservation_ttl_s=_num(sleep_raw, "reservation_ttl_s", defaults.reservation_ttl_s),
+        budgets_s=budgets,
+        plugin_namespace=str(plugin_pods_raw.get("namespace", defaults.plugin_namespace)),
+        plugin_label_selector=plugin_pods_raw.get(
+            "label_selector", defaults.plugin_label_selector
+        ),
+    )
+    base = ServiceManagerConfig()
+    fail_s = skew_raw.get("fail_s", base.clock_skew_fail_s)
+    max_used_mib = wake_raw.get("max_used_mib", base.wake_max_used_mib)
+    return ServiceManagerConfig(
+        sleep=sleep,
+        wake_max_used_fraction=_num(wake_raw, "max_used_fraction", base.wake_max_used_fraction),
+        wake_max_used_mib=None if max_used_mib is None else int(max_used_mib),
+        wake_truth_wait_s=_num(wake_raw, "truth_wait_s", base.wake_truth_wait_s),
+        clock_skew_warn_s=_num(skew_raw, "warn_s", base.clock_skew_warn_s),
+        clock_skew_fail_s=None if fail_s is None else float(fail_s),
+        pressure_registry_nodes_only=_parse_bool(
+            pressure_raw.get("registry_nodes_only", base.pressure_registry_nodes_only)
+        ),
+        writer_lock_wait_s=_num(raw, "writer_lock_wait_s", base.writer_lock_wait_s),
+        api_call_timeout_s=_num(raw, "api_call_timeout_s", base.api_call_timeout_s),
+    )
+
+
+def parse_sleep_mode_param(value: Any) -> str:
+    """``auto`` | ``true`` | ``false`` (YAML booleans accepted)."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    text = str(value).strip().lower()
+    if text == "auto":
+        return "auto"
+    return "true" if _parse_bool(text) else "false"
+
+
+def _num(section: dict[str, Any], key: str, default: float) -> float:
+    value = section.get(key)
+    return float(default if value is None else value)
+
+
+def _parse_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"expected a boolean, got {value!r}")
+
+
+def _validate_service_manager(
+    config: ServiceManagerConfig, gateway: GatewayConfig | None = None
+) -> list[str]:
+    errors: list[str] = []
+    sleep = config.sleep
+    for name in (
+        "ack_timeout_s",
+        "instance_staleness_s",
+        "poll_interval_s",
+        "sleep_call_timeout_s",
+        "physical_confirm_timeout_s",
+        "hard_cap_s",
+        "reservation_ttl_s",
+    ):
+        value = float(getattr(sleep, name))
+        if not math.isfinite(value) or value <= 0:
+            errors.append(f"service_manager.sleep.{name} must be positive")
+    if not math.isfinite(sleep.no_plugin_grace_s) or sleep.no_plugin_grace_s < 0:
+        errors.append("service_manager.sleep.no_plugin_grace_s must be >= 0")
+    if sleep.gateway_min_instances < 1:
+        errors.append("service_manager.sleep.gateway_min_instances must be >= 1")
+    if sleep.vllm_sleep_mode_param not in SLEEP_MODE_PARAM_CHOICES:
+        errors.append(
+            "service_manager.sleep.vllm_sleep_mode_param must be one of "
+            f"{', '.join(SLEEP_MODE_PARAM_CHOICES)}"
+        )
+    if sleep.reservation_ttl_s <= 2 * sleep.poll_interval_s:
+        errors.append(
+            "service_manager.sleep.reservation_ttl_s must exceed 2 x poll_interval_s "
+            "(the reservation is renewed once per poll)"
+        )
+    for path, value in sleep.budgets_s.items():
+        if path not in SLEEP_PATHS:
+            errors.append(f"service_manager.sleep.budgets_s: unknown sleep path {path}")
+        elif value is not None and (not math.isfinite(value) or value < 0):
+            errors.append(f"service_manager.sleep.budgets_s.{path} must be >= 0 or null")
+    if gateway is not None:
+        if not math.isfinite(gateway.route_timeout_s) or gateway.route_timeout_s <= 0:
+            errors.append("gateway.route_timeout_s must be positive")
+        elif sleep.hard_cap_s > gateway.route_timeout_s:
+            errors.append(
+                f"service_manager.sleep.hard_cap_s ({sleep.hard_cap_s:g}) must not exceed "
+                f"gateway.route_timeout_s ({gateway.route_timeout_s:g}): no request "
+                "outlives the route timeout"
+            )
+    if not (0.0 < config.wake_max_used_fraction <= 1.0):
+        errors.append("service_manager.wake.max_used_fraction must be in (0, 1]")
+    if config.wake_max_used_mib is not None and config.wake_max_used_mib <= 0:
+        errors.append("service_manager.wake.max_used_mib must be positive or null")
+    if config.wake_truth_wait_s < 0:
+        errors.append("service_manager.wake.truth_wait_s must be >= 0")
+    if config.clock_skew_warn_s <= 0:
+        errors.append("service_manager.clock_skew.warn_s must be positive")
+    if config.clock_skew_fail_s is not None and config.clock_skew_fail_s <= 0:
+        errors.append("service_manager.clock_skew.fail_s must be positive or null")
+    if config.writer_lock_wait_s < 0:
+        errors.append("service_manager.writer_lock_wait_s must be >= 0")
+    errors.extend(sleep_call_timeout_errors(config, config.api_call_timeout_s))
+    return errors
+
+
+def sleep_call_timeout_errors(
+    config: ServiceManagerConfig, call_timeout_s: float, *, name: str = "api_call_timeout_s"
+) -> list[str]:
+    """Empty when a client timeout of ``call_timeout_s`` outlasts the worst-case
+    sleeping SM call; used by the registry validation and the controller."""
+    worst = config.worst_case_sleep_call_s()
+    if worst < call_timeout_s:
+        return []
+    return [
+        f"worst-case sleeping service-manager call is {worst:g}s (2 x "
+        "service_manager.writer_lock_wait_s + sleep.ack_timeout_s + sleep.hard_cap_s + "
+        "2 x sleep.sleep_call_timeout_s + sleep.physical_confirm_timeout_s), not below "
+        f"{name} = {call_timeout_s:g}s: the caller would time out mid-drain"
+    ]
 
 
 def _parse_node(raw: dict[str, Any]) -> NodeSpec:

@@ -64,3 +64,25 @@ def test_supervisor_prioritizes_stale_operation_recovery():
 
     assert service.repairs == []
     assert supervisor.snapshot().last_recovery_operation_id == "replacement"
+
+
+def test_supervisor_runs_sleep_journal_recovery_every_pass_and_tolerates_a_busy_writer():
+    from tre_sm.state.operations import OperationBusy
+
+    service = FakeService()
+    calls = []
+
+    def recover():
+        calls.append(True)
+        if len(calls) == 1:
+            raise OperationBusy("other-writer:1")
+        return {"resolved": [], "kept": []}
+
+    service.recover_sleep_journal = recover
+    supervisor = FleetSupervisor(service, interval_s=0.01)
+
+    supervisor.run_once()
+    supervisor.run_once()
+
+    assert calls == [True, True]
+    assert service.converges == 2  # a busy writer did not skip the rest of the pass

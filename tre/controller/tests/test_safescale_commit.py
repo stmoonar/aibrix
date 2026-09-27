@@ -63,7 +63,7 @@ class OutcomeQueue:
 
 
 class FakeServiceManager:
-    async def scale_model(self, model, delta):
+    async def scale_model(self, model, delta, **_kwargs):
         return {"ok": True}
 
     async def set_routable(self, model, hidden_pods):

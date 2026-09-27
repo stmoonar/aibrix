@@ -270,3 +270,14 @@ def test_existing_stats_consumers_attribute_original_dst_traffic_per_model() -> 
         assert counters[model].errors == 1
     for model in _models():
         assert parse_envoy_counters(body, "upstream_rq_pending_overflow", cluster_filter=f"{model}-router") == 1
+
+
+def test_extproc_route_timeout_equals_the_registry_route_timeout() -> None:
+    """gateway.route_timeout_s is the single source: the hand-written ext_proc route
+    timeout patch must carry the same value (it also caps the SM drain)."""
+    from gen_model_manifests import route_timeout_text
+
+    expected = route_timeout_text(load_registry(str(DEPLOY_ROOT / "registry.yaml")).gateway().route_timeout_s)
+    raise_ = _gateway_policy("tre-route-timeouts")
+    values = {patch["operation"]["value"] for patch in raise_["spec"]["jsonPatches"]}
+    assert values == {expected}

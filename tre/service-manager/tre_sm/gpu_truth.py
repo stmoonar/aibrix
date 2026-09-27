@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Mapping, Protocol
 
 
@@ -23,9 +23,14 @@ class NodeGpuTruth:
     node: str
     used_by_uuid: Mapping[str, int]
     timestamp: float | None = None
+    #: Total memory per GPU (gpu-truth agent ``total_mib``); empty when not reported.
+    total_by_uuid: Mapping[str, int] = field(default_factory=dict)
 
     def used_mib(self, gpu_uuid: str) -> int | None:
         return self.used_by_uuid.get(gpu_uuid)
+
+    def total_mib(self, gpu_uuid: str) -> int | None:
+        return self.total_by_uuid.get(gpu_uuid)
 
 
 class GpuTruthProvider(Protocol):
@@ -60,6 +65,7 @@ class RedisGpuTruth:
         if not isinstance(payload, dict):
             return None
         used_by_uuid: dict[str, int] = {}
+        total_by_uuid: dict[str, int] = {}
         for item in payload.get("gpus", []):
             if not isinstance(item, dict):
                 continue
@@ -67,10 +73,15 @@ class RedisGpuTruth:
                 used_by_uuid[str(item["uuid"])] = int(item["used_mib"])
             except (KeyError, TypeError, ValueError):
                 continue
+            try:
+                total_by_uuid[str(item["uuid"])] = int(item["total_mib"])
+            except (KeyError, TypeError, ValueError):
+                pass
         timestamp = payload.get("timestamp")
         return NodeGpuTruth(
             node=node,
             used_by_uuid=used_by_uuid,
+            total_by_uuid=total_by_uuid,
             timestamp=float(timestamp) if isinstance(timestamp, (int, float)) else None,
         )
 
