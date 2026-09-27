@@ -68,6 +68,10 @@ class FleetSupervisor:
         )
         self._thread.start()
 
+    def request_stop(self) -> None:
+        """Signal-safe: stop after the current pass (no join)."""
+        self._stop.set()
+
     def stop(self) -> None:
         self._stop.set()
         if self._thread is not None:
@@ -83,6 +87,12 @@ class FleetSupervisor:
         )
 
     def run_once(self) -> None:
+        recover = getattr(self._service, "recover_sleep_journal", None)
+        if callable(recover):
+            try:
+                recover()
+            except OperationBusy:
+                pass  # another writer; next pass
         self._service.converge_startups()
         recovered = self._service.recover_stale_fleet_repairs()
         if recovered is not None:

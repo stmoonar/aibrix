@@ -852,39 +852,53 @@ class ServiceManagerV2:
     def _sleep_journal_issues(self) -> list[dict]:
         """Crash evidence of the sleep primitive (plan D2).
 
-        * ``sleep_operation_orphaned``: a sleep journal entry whose owning SM
-          operation is no longer the live writer (the SM died mid-sleep).
-        * ``hidden_without_operation``: a Pod in the ``hidden`` state that no
-          sleep in progress, no SafeScale probe (desired/legacy hidden) and no
-          startup admission accounts for - hidden and then abandoned.
+        * ``sleep_unconfirmed``: /sleep was sent but the pod was never confirmed
+          asleep; it stays hidden until :meth:`recover_sleep_journal` resolves it.
+        * ``sleep_operation_orphaned``: a sleep journal entry whose owner is gone
+          (no live sleep reservation and not the live writer operation).
+        * ``hidden_without_operation``: a TRE pod in the ``hidden`` state that no
+          sleep in progress, no SafeScale probe (desired hidden) and no startup
+          admission accounts for - hidden and then abandoned. A hidden flag in the
+          legacy store alone does not justify it (it is only a cache).
+
+        One consistent snapshot: the journal is read before and after the
+        reservations / active operation, and only entries present in both reads
+        are judged (a sleep finishing between the reads is not an orphan).
         """
         if self._sleep_primitive is None or self._runtime_ops is None:
             return []
-        journal = self._sleep_primitive.journal.entries()
+        primitive = self._sleep_primitive
+        first = primitive.journal.entries()
+        live_tokens = {item.token for item in primitive.reservations.active().values()}
         active_id = None
         if self._operation_coordinator is not None and hasattr(
             self._operation_coordinator, "active_operation"
         ):
             active = self._operation_coordinator.active_operation()
             active_id = None if active is None else active.get("operation_id")
-        live_tokens = {
-            reservation.token for reservation in self._sleep_primitive.reservations.active().values()
+        journal = primitive.journal.entries()
+        stable = {
+            pod_name: record
+            for pod_name, record in journal.items()
+            if pod_name in first
+            and first[pod_name].get("reservation_token") == record.get("reservation_token")
         }
         issues: list[dict] = []
-        for pod_name, record in sorted(journal.items()):
-            owner_op = record.get("operation_id")
+        for pod_name, record in sorted(stable.items()):
+            base = {
+                "serve_id": pod_name,
+                "binding_id": record.get("binding_id"),
+                "phase": record.get("phase"),
+                "operation_id": record.get("operation_id"),
+            }
+            if record.get("phase") == "sleep_unconfirmed":
+                issues.append({"code": "sleep_unconfirmed", **base, "reason": record.get("reason")})
+                continue
             if record.get("reservation_token") in live_tokens:
                 continue  # a drain in progress (outside the writer lock)
+            owner_op = record.get("operation_id")
             if owner_op is None or owner_op != active_id:
-                issues.append(
-                    {
-                        "code": "sleep_operation_orphaned",
-                        "serve_id": pod_name,
-                        "binding_id": record.get("binding_id"),
-                        "phase": record.get("phase"),
-                        "operation_id": owner_op,
-                    }
-                )
+                issues.append({"code": "sleep_operation_orphaned", **base})
         desired_hidden: set[str] = set()
         if self._fleet_store is not None:
             desired_hidden = {
@@ -892,13 +906,24 @@ class ServiceManagerV2:
                 for item in self._fleet_store.load_desired().bindings
                 if item.hidden
             }
-        legacy_hidden = {
-            binding.serve_id for binding in self._store.load().bindings if binding.hidden
+            legacy_hidden: set[str] = set()
+        else:
+            # Without desired state the legacy store is the only record of intent.
+            legacy_hidden = {
+                binding.serve_id for binding in self._store.load().bindings if binding.hidden
+            }
+        reserved_serve_ids = {
+            item.serve_id for item in primitive.reservations.active().values()
         }
         for snapshot in self._runtime_ops.list_pod_snapshots():
             if snapshot.annotations.get("tre.aibrix.io/state") != POD_STATE_HIDDEN:
                 continue
-            if snapshot.name in journal or snapshot.name in legacy_hidden:
+            if (
+                snapshot.name in journal
+                or snapshot.name in first
+                or snapshot.name in legacy_hidden
+                or snapshot.name in reserved_serve_ids
+            ):
                 continue
             if snapshot.annotations.get("tre.aibrix.io/startup-admitted-uid"):
                 continue
@@ -916,6 +941,132 @@ class ServiceManagerV2:
                 }
             )
         return issues
+
+    def recover_sleep_journal(self) -> dict:
+        """Resolve sleep journal entries left by a dead or failed sleep (review P1-2).
+
+        Runs at SM start and on every supervisor pass (under the writer lock). An
+        entry whose sleep reservation is still live belongs to a drain in progress
+        (possibly another SM replica) and is left alone; the reservation expires
+        by itself when its owner died. For every other entry the physical state
+        decides:
+
+        * pod gone -> nothing to undo, entry removed;
+        * asleep -> ``sleeping`` annotation, GPU lease released, store updated;
+        * awake -> routing restored per the entry's ``previous_state`` under a new
+          route-gen (a SafeScale probe pod stays hidden), desired power restored;
+        * unknown / unreachable -> the pod stays hidden and the entry stays
+          (audit ``sleep_operation_orphaned`` / ``sleep_unconfirmed``).
+        """
+        if self._sleep_primitive is None or self._runtime_ops is None:
+            return {"resolved": [], "kept": []}
+        primitive = self._sleep_primitive
+        if not primitive.journal.entries():
+            return {"resolved": [], "kept": []}
+        with self._writer("sleep_recovery"):
+            return self._recover_sleep_journal_locked()
+
+    def _recover_sleep_journal_locked(self) -> dict:
+        primitive = self._sleep_primitive
+        live_tokens = {item.token for item in primitive.reservations.active().values()}
+        snapshots = {item.name: item for item in self._runtime_ops.list_pod_snapshots()}
+        resolved: list[dict] = []
+        kept: list[dict] = []
+        for pod_name, record in sorted(primitive.journal.entries().items()):
+            if record.get("reservation_token") in live_tokens:
+                continue
+            snapshot = snapshots.get(pod_name)
+            if snapshot is None:
+                primitive.journal.end(pod_name)
+                primitive.journal.incr("recovery_pod_gone_total")
+                resolved.append({"serve_id": pod_name, "result": "pod_gone"})
+                continue
+            try:
+                binding = _binding_from_snapshot(snapshot)
+            except ValueError:
+                kept.append({"serve_id": pod_name, "result": "no_binding_annotation"})
+                continue
+            pod_ip = snapshot.pod_ip or record.get("pod_ip")
+            physical = None
+            if pod_ip and self._vllm_ops is not None and hasattr(self._vllm_ops, "is_sleeping"):
+                try:
+                    physical = self._vllm_ops.is_sleeping(pod_ip, port=8000)
+                except Exception:
+                    physical = None
+            if physical is True:
+                self._runtime_ops.write_binding_annotations(binding, state=POD_STATE_SLEEPING)
+                if self._gpu_leases is not None:
+                    self._gpu_leases.release(binding)
+                self._set_store_power(binding.binding_id, awake=False, hidden=False)
+                primitive.journal.end(pod_name)
+                primitive.journal.incr("recovery_slept_total")
+                resolved.append({"serve_id": pod_name, "result": "slept"})
+            elif physical is False:
+                previous = record.get("previous_state") or POD_STATE_AWAKE
+                if previous not in (POD_STATE_AWAKE, POD_STATE_HIDDEN):
+                    previous = POD_STATE_HIDDEN
+                hidden = previous == POD_STATE_HIDDEN
+                self._runtime_ops.write_binding_annotations(binding, state=previous)
+                self._set_store_power(binding.binding_id, awake=True, hidden=hidden)
+                if self._fleet_store is not None and binding.binding_id in self._desired_binding_ids():
+                    self._update_desired(
+                        {binding.binding_id: {"power": "awake", "hidden": hidden}},
+                        updated_by="service-manager-recovery",
+                        reason="sleep_recovered_awake",
+                    )
+                primitive.journal.end(pod_name)
+                primitive.journal.incr("recovery_rolled_back_total")
+                resolved.append({"serve_id": pod_name, "result": f"rolled_back_to_{previous}"})
+            else:
+                primitive.journal.update(
+                    pod_name,
+                    recovery="physical_state_unknown",
+                    recovery_attempts=int(record.get("recovery_attempts") or 0) + 1,
+                )
+                kept.append({"serve_id": pod_name, "result": "physical_state_unknown"})
+        if resolved or kept:
+            LOG.warning("sleep journal recovery: resolved=%s kept=%s", resolved, kept)
+        return {"resolved": resolved, "kept": kept}
+
+    def _set_store_power(self, binding_id: str, *, awake: bool, hidden: bool) -> None:
+        for attempt in range(3):
+            snapshot = self._store.load()
+            updated = [
+                replace(item, awake=awake, hidden=hidden) if item.binding_id == binding_id else item
+                for item in snapshot.bindings
+            ]
+            if updated == snapshot.bindings:
+                return
+            try:
+                self._store.save(updated, expected_version=snapshot.version)
+                return
+            except StateConflict:
+                if attempt == 2:
+                    raise
+
+    def begin_shutdown(self) -> None:
+        """SIGTERM: accept no new sleep; drains in progress (not yet /sleep'ed)
+        roll back at their next poll. Safe to call from a signal handler."""
+        if self._sleep_primitive is not None:
+            self._sleep_primitive.begin_shutdown()
+        supervisor = self._supervisor
+        stop_flag = getattr(supervisor, "request_stop", None)
+        if callable(stop_flag):
+            stop_flag()
+
+    def shutdown_timeout_s(self) -> float:
+        """Bound of the shutdown wait: a commit already past /sleep finishes
+        (/sleep with the mode=abort retry + physical confirmation)."""
+        sleep = self._sm_config.sleep
+        return 2 * sleep.sleep_call_timeout_s + sleep.physical_confirm_timeout_s + sleep.ack_timeout_s
+
+    def shutdown(self, *, timeout_s: float) -> bool:
+        """begin_shutdown, then wait (bounded) until every sleep has finished or
+        rolled back. True when idle."""
+        self.begin_shutdown()
+        if self._sleep_primitive is None:
+            return True
+        return self._sleep_primitive.wait_idle(timeout_s)
 
     def start_fleet_repair(
         self,

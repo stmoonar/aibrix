@@ -7,6 +7,10 @@ metadata:
     app.kubernetes.io/name: tre-v2-service-manager
 spec:
   replicas: 1
+  # One writer at a time: a surge replica would run its startup sleep-journal
+  # recovery while the old one may still be draining.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app.kubernetes.io/name: tre-v2-service-manager
@@ -16,6 +20,14 @@ spec:
         app.kubernetes.io/name: tre-v2-service-manager
     spec:
       serviceAccountName: tre-v2-service-manager
+      # SIGTERM stops new sleeps and rolls back every drain that has not reached
+      # /sleep; a sleep already past /sleep finishes (2 x sleep_call_timeout_s +
+      # physical_confirm_timeout_s). Grace >= sleep.hard_cap_s + 2 x
+      # sleep.sleep_call_timeout_s + sleep.physical_confirm_timeout_s (registry,
+      # 255 s with the defaults) also covers a monolithic repair / defrag sleep;
+      # set to service_manager.api_call_timeout_s. Guard test:
+      # deploy/tests/test_kustomize_overlays.py.
+      terminationGracePeriodSeconds: 300
       nodeSelector:
         kubernetes.io/hostname: nscc-ds-4a100-node10
       containers:
