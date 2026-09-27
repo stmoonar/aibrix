@@ -1,10 +1,10 @@
 PYTHON ?= python3
-TRE_PYTHONPATH := $(CURDIR)/common:$(CURDIR)/deploy:$(CURDIR)/controller:$(CURDIR)/controller/tests:$(CURDIR)/service-manager:$(CURDIR)/calibration:$(CURDIR)/replayer:$(CURDIR)/loadgen_v1:$(CURDIR)/ui:$(PYTHONPATH)
+TRE_PYTHONPATH := $(CURDIR)/common:$(CURDIR)/deploy:$(CURDIR)/controller:$(CURDIR)/controller/tests:$(CURDIR)/service-manager:$(CURDIR)/calibration:$(CURDIR)/replayer:$(CURDIR)/loadgen_v1:$(CURDIR)/reissue:$(CURDIR)/ui:$(PYTHONPATH)
 
 .PHONY: check check-redis smoke manifests
 
 check:
-	PYTHONPATH=$(TRE_PYTHONPATH) $(PYTHON) -m pytest -q common/tests deploy/tests controller/tests service-manager/tests calibration/tests replayer/tests loadgen_v1/tests ui/tests
+	PYTHONPATH=$(TRE_PYTHONPATH) $(PYTHON) -m pytest -q common/tests deploy/tests controller/tests service-manager/tests calibration/tests replayer/tests loadgen_v1/tests reissue/tests ui/tests
 
 # Real-Redis Lua tests (sleep reservations, fair writer lock) against a throwaway
 # Redis container that is removed afterwards. `make check` stays hermetic: it runs
