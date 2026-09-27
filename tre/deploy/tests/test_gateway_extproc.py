@@ -13,12 +13,14 @@ rely on:
   Service selector that otherwise hides sleeping / probe-hidden pods;
 * HOT_SWITCH=0 together with min_replicas >= 1 for every model, which is how v1 behaved;
 * (plan 2026-09-27 D10) every inference request goes through ext_proc, with or without a
-  routing-strategy header: the routes match POST instead of the header, and the plugin
-  routes header-less requests with TRE_DEFAULT_ROUTING_STRATEGY. It also runs the
-  transparent-sleep coordination (TRE_GW_COORDINATION).
+  routing-strategy header: the routes match POST on the inference paths the plugin parses
+  instead of the header, and the plugin routes header-less requests with the upstream
+  ROUTING_ALGORITHM (honoured by every plugin image). Other POST paths keep their Service
+  route. The plugin also runs the transparent-sleep coordination (TRE_GW_COORDINATION).
 """
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import yaml
@@ -40,6 +42,35 @@ ROUTE_CONFIG = "tre-v2/tre-aibrix-eg/http"
 UNATTRIBUTED = "tre-v2/original-dst/unattributed"
 CLUSTER_TYPE = "type.googleapis.com/envoy.config.cluster.v3.Cluster"
 ROUTE_TYPE = "type.googleapis.com/envoy.config.route.v3.RouteConfiguration"
+
+# D10: the POST paths routed through ext_proc = the request paths the plugin parses
+# (pkg/plugins/gateway/util.go validateRequestBody + multipart audio); any other POST
+# would get a plugin 501, so it keeps its Service route instead.
+PLUGIN_INFERENCE_PATHS = (
+    "/v1/completions",
+    "/v1/chat/completions",
+    "/v1/responses",
+    "/v1/messages",
+    "/v1/embeddings",
+    "/v1/rerank",
+    "/v1/classify",
+    "/v1/images/generations",
+    "/v1/video/generations",
+    "/v1/audio/transcriptions",
+    "/v1/audio/translations",
+)
+NON_PLUGIN_POST_PATHS = (
+    "/v1/load_lora_adapter",
+    "/v1/unload_lora_adapter",
+    "/v1/score",
+    "/score",
+    "/pooling",
+    "/tokenize",
+    "/v1/models",
+    "/v1/completions/extra",
+    "/v1/chat/completions2",
+    "/v2/completions",
+)
 
 # v1 (config_tre) values this file must reproduce.
 V1_ROUTE_TIMEOUT = "120s"  # EnvoyGateway.yaml aibrix-epp original_route
@@ -165,7 +196,8 @@ def test_per_model_routes_match_post_and_model_and_enable_extproc() -> None:
         assert headers == {":method": {"exact": "POST"}, "model": {"exact": model}}
         assert route["route"]["cluster"] == original_dst_cluster(model)
     for route in routes:
-        assert route["match"]["prefix"] == "/v1"  # v1 config_tre aibrix-epp
+        assert "prefix" not in route["match"], route["name"]  # D10: inference paths only
+        assert set(route["match"]["safe_regex"]) == {"regex"}, route["name"]
         assert list(route["typed_per_filter_config"]) == [EXTPROC_FILTER]
         assert route["typed_per_filter_config"][EXTPROC_FILTER]["config"] == {}
     unattributed = by_name["tre-original-route/unattributed"]
@@ -173,6 +205,33 @@ def test_per_model_routes_match_post_and_model_and_enable_extproc() -> None:
         ":method": {"exact": "POST"}
     }
     assert unattributed["route"]["cluster"] == UNATTRIBUTED
+
+
+def test_extproc_routes_match_exactly_the_plugin_inference_paths() -> None:
+    """D10: the ext_proc routes take every path the plugin parses and nothing else, so
+    POSTs such as load_lora_adapter / score / pooling keep their previous Service route
+    instead of a plugin 501. (Envoy matches safe_regex against the path without query.)"""
+    regexes = {r["match"]["safe_regex"]["regex"] for r in _route_patches()}
+    assert len(regexes) == 1, regexes
+    (regex,) = regexes
+    for path in PLUGIN_INFERENCE_PATHS:
+        assert re.fullmatch(regex, path), path
+    for path in NON_PLUGIN_POST_PATHS:
+        assert not re.fullmatch(regex, path), path
+
+
+def test_plugin_path_list_matches_the_plugin_source() -> None:
+    """Guard the list above against the plugin: every path constant the request-body
+    validator dispatches on must be routed through ext_proc."""
+    go = DEPLOY_ROOT.parents[1] / "pkg" / "plugins" / "gateway"
+    if not go.is_dir():  # tre/ checked out without the Go tree
+        return
+    consts = dict(re.findall(r'^\s*(Path\w+)\s*=\s*"([^"]+)"', (go / "types.go").read_text(encoding="utf-8"), re.M))
+    util = (go / "util.go").read_text(encoding="utf-8")
+    body = util[util.index("func validateRequestBodyWithTokens"):]
+    body = body[: body.index("\n}\n")]
+    handled = {consts[name] for name in re.findall(r"\b(Path\w+)\b", body) if name in consts}
+    assert handled == set(PLUGIN_INFERENCE_PATHS)
 
 
 def test_headerless_requests_go_through_extproc() -> None:
@@ -184,7 +243,9 @@ def test_headerless_requests_go_through_extproc() -> None:
         assert "routing-strategy" not in names, route["name"]
     dep = next(d for d in _docs(PLUGINS) if d["kind"] == "Deployment")
     env = {e["name"]: e.get("value") for e in dep["spec"]["template"]["spec"]["containers"][0]["env"]}
-    assert env["TRE_DEFAULT_ROUTING_STRATEGY"] == "least-gpu-cache"
+    # The upstream variable (older plugin images honour it too), not a TRE-only default.
+    assert env["ROUTING_ALGORITHM"] == "least-gpu-cache"
+    assert "TRE_DEFAULT_ROUTING_STRATEGY" not in env
 
 
 def test_catch_all_is_inserted_first_so_it_ends_below_the_model_routes() -> None:
