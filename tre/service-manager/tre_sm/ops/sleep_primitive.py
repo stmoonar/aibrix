@@ -33,14 +33,23 @@ the same ordered protocol, and callers cannot skip a step:
         /sleep ``mode=abort``, counted as a forced abort (the sidecar continues
         those requests).
       Every poll renews the reservation and checks shutdown / the writer fence;
-      losing either rolls back.
-3. **commit** (writer lock held again): /sleep (``mode`` only for vLLM
-   versions that accept it, detected via ``GET /version``), then confirm
-   ``/is_sleeping``. Confirmed -> ``sleeping`` annotation, journal entry and
+      shutdown or a lost writer fence rolls back. A LOST reservation is never
+      re-acquired: another sleep may own the binding by now, so the drain
+      stops and the caller resolves it under the writer lock (rollback unless
+      another live reservation covers the binding).
+      Each poll round reads the engine metrics of all targets in parallel and
+      decides with the time measured after the reads, so the drain ends within
+      the hard cap plus one round.
+3. **commit** (writer lock held again): the reservation is renewed (lost ->
+   roll back), then every target is committed IN PARALLEL: /sleep (``mode``
+   only for vLLM versions that accept it, detected via ``GET /version``), then
+   ``/is_sleeping`` is polled for all of them; the reservation keeps being
+   renewed meanwhile. Confirmed -> ``sleeping`` annotation, journal entry and
    reservation released. /sleep returned but the physical state stays unknown
    -> the pod stays hidden, the journal entry stays (audit
    ``sleep_unconfirmed``); routing is never re-opened on a pod that may be
-   asleep.
+   asleep. The duration of a call is bounded by
+   ``ServiceManagerConfig.worst_case_sleep_call_s`` whatever the target count.
 
 Rollback restores the pod's previous routing state under a new route-gen
 (SafeScale probe pods stay hidden). Results are per target: a multi-target
@@ -52,6 +61,8 @@ reservation_lost), so callers account for exactly the pods that slept.
 from __future__ import annotations
 
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor, wait
+import contextvars
 from dataclasses import dataclass, field
 import json
 import logging
@@ -86,6 +97,9 @@ STATUS_ROLLED_BACK = "rolled_back"
 STATUS_UNCONFIRMED = "unconfirmed"
 STATUS_ROLLBACK_FAILED = "rollback_failed"
 STATUS_RESERVATION_LOST = "reservation_lost"
+
+#: "not given" marker of :meth:`SleepPrimitive._load`'s ``engine_load``.
+_UNSET = object()
 
 _RUNNING_METRIC = "vllm:num_requests_running"
 _WAITING_METRIC = "vllm:num_requests_waiting"
@@ -329,7 +343,21 @@ class SleepJournal:
             self._redis.hdel(rediskeys.SM_SLEEP_OPS_KEY, pod)
 
     def get(self, pod: str) -> dict | None:
-        return self.entries().get(pod)
+        if self._redis is None:
+            return self.cached(pod)
+        raw = self._redis.hget(rediskeys.SM_SLEEP_OPS_KEY, pod)
+        if raw is None:
+            return None
+        try:
+            return json.loads(_text(raw))
+        except (TypeError, ValueError):
+            return {"corrupt": True}
+
+    def cached(self, pod: str) -> dict | None:
+        """This process's last write of the pod's entry (no Redis read)."""
+        with self._lock:
+            record = self._ops.get(pod)
+        return None if record is None else dict(record)
 
     def entries(self) -> dict[str, dict]:
         if self._redis is None:
@@ -398,6 +426,9 @@ class _PodSleep:
     last_load: dict = field(default_factory=dict)
     waited_s: float = 0.0
     outcome: dict | None = None
+    #: Set once /sleep was sent and the pod awaits physical confirmation:
+    #: {"mode", "forced", "forced_count"}.
+    commit: dict | None = None
 
     @property
     def pod(self) -> str:
@@ -420,6 +451,12 @@ class SleepBatch:
     token: str | None = None
     ack: dict | None = None
     operation_id: str | None = None
+    #: Extra fields of every target's journal entry.
+    journal_extra: dict = field(default_factory=dict)
+    #: The drain found the reservation lost (resolve under the writer lock).
+    reservation_lost: bool = False
+    #: Serializes reservation renewals with per-target releases (commit threads).
+    lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
     def reserved_ids(self) -> list[str]:
         return [pod.binding_id for pod in self.pods if pod.reserved]
@@ -502,6 +539,7 @@ class SleepPrimitive:
         *,
         path: str,
         drain_budget_s: float | None = None,
+        journal_extra: Mapping | None = None,
     ) -> list[dict]:
         """prepare -> drain -> commit in one call (caller holds the writer lock).
 
@@ -511,8 +549,15 @@ class SleepPrimitive:
         """
         if not targets:
             return []
-        batch = self.prepare(targets, path=path, drain_budget_s=drain_budget_s)
-        self.drain(batch)
+        batch = self.prepare(
+            targets, path=path, drain_budget_s=drain_budget_s, journal_extra=journal_extra
+        )
+        try:
+            self.drain(batch)
+        except ReservationLost as exc:
+            # The caller holds the writer lock: resolve the lost reservation now.
+            exc.outcomes = self.resolve_lost(batch)
+            raise
         return self.commit(batch)
 
     def prepare(
@@ -521,8 +566,13 @@ class SleepPrimitive:
         *,
         path: str,
         drain_budget_s: float | None = None,
+        journal_extra: Mapping | None = None,
     ) -> SleepBatch:
-        """Reserve the bindings, journal and hide every target (writer lock held)."""
+        """Reserve the bindings, journal and hide every target (writer lock held).
+
+        ``journal_extra`` is recorded in each target's journal entry (e.g. the
+        desired power to record once the pod is confirmed asleep, which crash
+        recovery applies when it finds the pod asleep)."""
         if self._shutdown.is_set():
             raise ServiceShuttingDown("service-manager is shutting down; no new sleep")
         clock = self._clock or DEFAULT_CLOCK
@@ -534,6 +584,7 @@ class SleepPrimitive:
             hard_s=self._policy.hard_cap_s,
             started=clock.monotonic(),
             operation_id=self._operation_id(),
+            journal_extra=dict(journal_extra or {}),
         )
         batch.token = self._reservations.acquire(
             [target.binding for target in targets],
@@ -558,8 +609,16 @@ class SleepPrimitive:
         """Gateway ack + drain; decides wait / abort / rollback per pod.
 
         Needs no writer lock (the reservation fences the bindings). Raises after
-        rolling back every target on a batch-wide failure (ack timeout,
-        shutdown, lost reservation or writer fence).
+        rolling back every target on a batch-wide failure (ack timeout, shutdown,
+        writer fence). A LOST reservation is different (review 2 P2-1): another
+        sleep may own the binding by now, so the drain touches nothing and raises
+        :class:`ReservationLost`; the caller resolves it under the writer lock
+        (:meth:`resolve_lost`), else crash recovery does.
+
+        Every round reads the engine metrics of all pending targets in parallel
+        and decides with the time measured AFTER the reads, so a target still
+        pending at the hard cap is decided in the round that crosses it: the
+        drain ends within the hard cap plus one round.
         """
         clock = self._clock or DEFAULT_CLOCK
         try:
@@ -573,9 +632,10 @@ class SleepPrimitive:
             ]
             while pending:
                 self._check_alive(batch)
+                loads = self._loads(pending, batch.ack)
                 now = clock.monotonic()
                 for pod in list(pending):
-                    load = self._load(pod, batch.ack)
+                    load = loads[id(pod)]
                     pod.last_load = load
                     verdict = _decide(pod, load, now, soft_deadline, hard_deadline)
                     if verdict is None:
@@ -599,6 +659,9 @@ class SleepPrimitive:
                         max(0.0, min(self._policy.poll_interval_s, next_deadline - now))
                         or min(self._policy.poll_interval_s, 0.01)
                     )
+        except ReservationLost:
+            batch.reservation_lost = True
+            raise
         except BaseException as exc:
             self._rollback_all(batch, reason=f"{type(exc).__name__}: {exc}")
             self._unregister(batch)
@@ -606,21 +669,67 @@ class SleepPrimitive:
                 exc.outcomes = batch.outcomes()
             raise
 
+    def resolve_lost(self, batch: SleepBatch) -> list[dict]:
+        """Resolve a batch whose reservation was lost (caller holds the writer
+        lock, so no other sleep can start meanwhile). Never re-acquires: a
+        binding now reserved by another sleep is left to it (outcome
+        ``reservation_lost``); every other unfinished target is rolled back."""
+        try:
+            live = self._reservations.active()
+            for pod in batch.pods:
+                if pod.done or pod.outcome is not None:
+                    continue
+                other = live.get(pod.binding_id)
+                if other is not None and other.token != batch.token:
+                    pod.reserved = False
+                    self._end_journal_if_ours(pod, batch)
+                    pod.outcome = self._outcome(
+                        batch,
+                        pod,
+                        STATUS_RESERVATION_LOST,
+                        reason=f"reservation lost; binding now reserved by {other.owner}",
+                    )
+                    continue
+                self._rollback_pod(batch, pod, reason="sleep reservation lost (expired)")
+        finally:
+            self._unregister(batch)
+        return batch.outcomes()
+
     def commit(self, batch: SleepBatch) -> list[dict]:
-        """/sleep + physical confirmation for every drained pod (writer lock held)."""
+        """/sleep + physical confirmation for every drained pod (writer lock held).
+
+        The reservation is renewed first - a lost one rolls the batch back
+        (never re-acquired, review 2 P2-1) - and then on every wait round while
+        the targets are committed IN PARALLEL (review 2 P2-2): one thread per
+        target sends /sleep (and its fallbacks), then one loop confirms
+        ``/is_sleeping`` for all of them."""
         clock = self._clock or DEFAULT_CLOCK
         try:
-            self._reconfirm_reservation(batch)
-            for pod in batch.pods:
-                if pod.done or pod.outcome is not None or pod.decision is None:
-                    continue
-                if self._shutdown.is_set():
+            try:
+                owned = self._renew(batch)
+            except Exception as exc:  # Redis error: ownership unknown, nothing slept yet
+                self._journal.incr("reservation_lost_total")
+                self._rollback_all(
+                    batch, reason=f"reservation renewal failed before commit: {type(exc).__name__}: {exc}"
+                )
+                owned = True
+            if not owned:
+                self._journal.incr("reservation_lost_total")
+                self.resolve_lost(batch)
+            ready = [
+                pod
+                for pod in batch.pods
+                if not pod.done and pod.outcome is None and pod.decision is not None
+            ]
+            if self._shutdown.is_set():
+                for pod in ready:
                     self._rollback_pod(batch, pod, reason="service-manager is shutting down")
-                    continue
-                try:
-                    self._commit_one(batch, pod, clock)
-                except Exception as exc:
-                    self._rollback_pod(batch, pod, reason=f"{type(exc).__name__}: {exc}")
+                ready = []
+            if ready:
+                self._send_all(batch, ready, clock)
+                self._confirm_all(
+                    batch, [pod for pod in ready if pod.outcome is None and not pod.done], clock
+                )
         finally:
             self._unregister(batch)
         outcomes = batch.outcomes()
@@ -645,30 +754,34 @@ class SleepPrimitive:
             self._unregister(batch)
         return batch.outcomes()
 
+    def release_unresolved(self, batch: SleepBatch) -> None:
+        """Give up a batch without touching its pods (its reservation was lost and
+        the writer lock is unavailable): crash recovery resolves the journal."""
+        self._unregister(batch)
+
     # ------------------------------------------------------------------- steps
     def _hide(self, batch: SleepBatch) -> None:
         for pod in batch.pods:
             binding = pod.target.binding
-            self._journal.begin(
-                pod.pod,
-                {
-                    "binding_id": binding.binding_id,
-                    "serve_id": binding.serve_id,
-                    "model": binding.model,
-                    "node": binding.slot.node,
-                    "gpu_ids": list(binding.slot.gpu_ids),
-                    "pod_ip": pod.target.pod_ip,
-                    "path": batch.path,
-                    "soft_budget_s": batch.soft_s,
-                    "hard_cap_s": batch.hard_s,
-                    "phase": "hiding",
-                    "previous_state": pod.previous_state,
-                    "owner": self._owner,
-                    "operation_id": batch.operation_id,
-                    "reservation_token": batch.token,
-                    "started_at_ms": int(time.time() * 1000),
-                },
-            )
+            record = {
+                "binding_id": binding.binding_id,
+                "serve_id": binding.serve_id,
+                "model": binding.model,
+                "node": binding.slot.node,
+                "gpu_ids": list(binding.slot.gpu_ids),
+                "pod_ip": pod.target.pod_ip,
+                "path": batch.path,
+                "soft_budget_s": batch.soft_s,
+                "hard_cap_s": batch.hard_s,
+                "phase": "hiding",
+                "previous_state": pod.previous_state,
+                "owner": self._owner,
+                "operation_id": batch.operation_id,
+                "reservation_token": batch.token,
+                "started_at_ms": int(time.time() * 1000),
+            }
+            record.update(batch.journal_extra)
+            self._journal.begin(pod.pod, record)
             gen = self._runtime.write_binding_annotations(binding, state=POD_STATE_HIDDEN)
             pod.hidden = True
             pod.gen = gen if isinstance(gen, int) and not isinstance(gen, bool) else None
@@ -678,49 +791,26 @@ class SleepPrimitive:
         """Every poll: shutdown, reservation ownership, writer fence (if held)."""
         if self._shutdown.is_set():
             raise SleepCancelled("service-manager is shutting down: rolling the drain back")
-        reserved = [
-            pod.binding_id
-            for pod in batch.pods
-            if pod.reserved and pod.outcome is None
-        ]
-        if batch.token is not None and reserved:
-            if not self._reservations.renew(
-                reserved, batch.token, ttl_s=self._policy.reservation_ttl_s
-            ):
-                self._journal.incr("reservation_lost_total")
-                raise ReservationLost(f"sleep reservation of {reserved} was lost")
+        if not self._renew(batch):
+            self._journal.incr("reservation_lost_total")
+            raise ReservationLost(
+                f"sleep reservation of {[pod.binding_id for pod in batch.pods if pod.reserved]} was lost"
+            )
         operation = current_operation()
         if operation is not None:
             operation.assert_active()
 
-    def _reconfirm_reservation(self, batch: SleepBatch) -> None:
-        """Commit phase: the reservation must still be ours; re-take it if it
-        merely expired, else leave the pods to whoever holds it now."""
-        reserved = [
-            pod.binding_id for pod in batch.pods if pod.reserved and pod.outcome is None
-        ]
-        if batch.token is None or not reserved:
-            return
-        if self._reservations.renew(reserved, batch.token, ttl_s=self._policy.reservation_ttl_s):
-            return
-        bindings = [pod.target.binding for pod in batch.pods if pod.reserved and pod.outcome is None]
-        try:
-            batch.token = self._reservations.acquire(
-                bindings,
-                owner=self._owner,
-                operation_id=batch.operation_id,
-                ttl_s=self._policy.reservation_ttl_s,
+    def _renew(self, batch: SleepBatch) -> bool:
+        """Renew the batch's reservation (False = lost). Redis errors propagate."""
+        with batch.lock:  # a commit thread may be releasing one of them right now
+            reserved = [
+                pod.binding_id for pod in batch.pods if pod.reserved and pod.outcome is None
+            ]
+            if batch.token is None or not reserved:
+                return True
+            return self._reservations.renew(
+                reserved, batch.token, ttl_s=self._policy.reservation_ttl_s
             )
-            LOG.warning("sleep reservation of %s had expired; re-acquired before commit", reserved)
-        except ReservationConflict as exc:
-            self._journal.incr("reservation_lost_total")
-            for pod in batch.pods:
-                if pod.reserved and pod.outcome is None:
-                    pod.reserved = False
-                    self._end_journal_if_ours(pod, batch)
-                    pod.outcome = self._outcome(
-                        batch, pod, STATUS_RESERVATION_LOST, reason=f"reservation lost: {exc}"
-                    )
 
     def _await_ack(self, batch: SleepBatch, clock: Clock) -> dict:
         policy = self._policy
@@ -798,7 +888,23 @@ class SleepPrimitive:
             self._journal.update(pod.pod, phase="draining", ack="fallback_no_plugin")
         return {"mode": "fallback_no_plugin", "instances": [], "latency_ms": None}
 
-    def _load(self, pod: _PodSleep, ack: dict | None) -> dict:
+    def _loads(self, pods: list[_PodSleep], ack: dict | None) -> dict[int, dict]:
+        """One drain round: engine metrics of every pod read in parallel (one
+        probe timeout per round, whatever the number of targets), then the
+        gateway side per pod."""
+        engine = _parallel(self._engine_load, pods)
+        return {id(pod): self._load(pod, ack, engine_load=engine[id(pod)]) for pod in pods}
+
+    def _engine_load(self, pod: _PodSleep) -> int | None:
+        metrics = getattr(self._vllm, "metrics", None)
+        if not callable(metrics):
+            return None
+        try:
+            return parse_vllm_load(metrics(pod.target.pod_ip, port=VLLM_PORT))
+        except Exception:  # an unreachable engine reports nothing
+            return None
+
+    def _load(self, pod: _PodSleep, ack: dict | None, *, engine_load=_UNSET) -> dict:
         """One read of the drain state. ``known`` is False on any read error or
         unavailable engine metrics; ``non_continuable`` is the sticky value."""
         gateway_known = True
@@ -830,13 +936,8 @@ class SleepPrimitive:
                     gateway_known = False
             if gateway_known:
                 pod.non_continuable = non_continuable
-        engine_load: int | None = None
-        metrics = getattr(self._vllm, "metrics", None)
-        if callable(metrics):
-            try:
-                engine_load = parse_vllm_load(metrics(pod.target.pod_ip, port=VLLM_PORT))
-            except Exception:  # an unreachable engine reports nothing
-                engine_load = None
+        if engine_load is _UNSET:
+            engine_load = self._engine_load(pod)
         known = gateway_known and engine_load is not None
         in_flight = max(gateway_total, engine_load or 0)
         return {
@@ -874,7 +975,31 @@ class SleepPrimitive:
         self._mode_cache[key] = supported
         return supported
 
-    def _commit_one(self, batch: SleepBatch, pod: _PodSleep, clock: Clock) -> None:
+    def _send_all(self, batch: SleepBatch, pods: list[_PodSleep], clock: Clock) -> None:
+        """Phase 1 of the commit: /sleep (with its fallbacks) for every pod in
+        parallel; the reservation is renewed while the calls run."""
+        context = contextvars.copy_context()
+        with ThreadPoolExecutor(max_workers=max(1, len(pods))) as pool:
+            futures = [
+                pool.submit(context.copy().run, self._send_guarded, batch, pod) for pod in pods
+            ]
+            while True:
+                done, not_done = wait(futures, timeout=self._policy.poll_interval_s)
+                if not not_done:
+                    break
+                self._renew_during_commit(batch)
+        for future in futures:
+            future.result()  # _send_guarded never raises; surfaces programming errors
+
+    def _send_guarded(self, batch: SleepBatch, pod: _PodSleep) -> None:
+        try:
+            self._send_one(batch, pod)
+        except Exception as exc:
+            self._rollback_pod(batch, pod, reason=f"{type(exc).__name__}: {exc}")
+
+    def _send_one(self, batch: SleepBatch, pod: _PodSleep) -> None:
+        """/sleep one drained pod. Leaves ``pod.commit`` set when the pod must be
+        confirmed physically; an outcome when it was decided here."""
         target = pod.target
         policy = self._policy
         load = pod.last_load
@@ -922,17 +1047,62 @@ class SleepPrimitive:
             if not _success(result) and self._physical(target) is not True:
                 message = getattr(result, "message", "") or "operation failed"
                 raise SleepFailed(f"vLLM sleep failed for {target.binding.serve_id}: {message}")
-        physical = self._await_physical(target, clock)
-        if physical is None:
-            self._mark_unconfirmed(
-                batch, pod, reason="/sleep returned but /is_sleeping stayed unknown"
-            )
+        pod.commit = {"mode": mode, "forced": forced, "forced_count": forced_count}
+
+    def _confirm_all(self, batch: SleepBatch, pods: list[_PodSleep], clock: Clock) -> None:
+        """Phase 2 of the commit: poll ``/is_sleeping`` of every sent pod (in
+        parallel) until each is asleep or ``physical_confirm_timeout_s`` passed.
+        Asleep -> slept; still unknown -> unconfirmed (stays hidden); awake ->
+        rolled back. (vLLM ops without the probe: the /sleep result is trusted.)"""
+        pending = [pod for pod in pods if pod.commit is not None]
+        if not pending:
             return
-        if physical is False:
-            raise SleepFailed(
-                f"vLLM sleep did not physically converge for {target.binding.serve_id}"
+        probe_available = callable(getattr(self._vllm, "is_sleeping", None))
+        deadline = clock.monotonic() + self._policy.physical_confirm_timeout_s
+        last: dict[int, bool | None] = {}
+        while pending:
+            if probe_available:
+                answers = _parallel(lambda pod: self._physical(pod.target), pending)
+            else:
+                answers = {id(pod): True for pod in pending}
+            for pod in list(pending):
+                last[id(pod)] = answers[id(pod)]
+                if answers[id(pod)] is True:
+                    pending.remove(pod)
+                    self._finalize_slept(batch, pod, **pod.commit)
+            if not pending:
+                return
+            if clock.monotonic() >= deadline:
+                break
+            self._renew_during_commit(batch)
+            clock.sleep(self._policy.poll_interval_s)
+        for pod in pending:
+            if last.get(id(pod)) is None:
+                self._mark_unconfirmed(
+                    batch, pod, reason="/sleep returned but /is_sleeping stayed unknown"
+                )
+            else:
+                self._rollback_pod(
+                    batch,
+                    pod,
+                    reason=f"vLLM sleep did not physically converge for {pod.pod}",
+                )
+
+    def _renew_during_commit(self, batch: SleepBatch) -> None:
+        """Keep the reservation alive during a long commit (the writer lock fences
+        new sleeps meanwhile; /sleep calls already sent cannot be undone, so a
+        lost renewal is only counted and logged)."""
+        try:
+            owned = self._renew(batch)
+        except Exception as exc:
+            LOG.warning("renewing the sleep reservation during commit failed: %s", exc)
+            return
+        if not owned:
+            self._journal.incr("reservation_lost_during_commit_total")
+            LOG.error(
+                "sleep reservation of %s lost during the commit phase (writer lock held)",
+                [pod.binding_id for pod in batch.pods if pod.reserved],
             )
-        self._finalize_slept(batch, pod, mode=mode, forced=forced, forced_count=forced_count)
 
     def _finalize_slept(
         self,
@@ -946,7 +1116,7 @@ class SleepPrimitive:
     ) -> None:
         self._runtime.write_binding_annotations(pod.target.binding, state=POD_STATE_SLEEPING)
         pod.done = True
-        self._journal.end(pod.pod)
+        self._end_journal_if_ours(pod, batch)
         self._release(batch, [pod])
         self._journal.incr("sleeps_total")
         self._journal.incr(f"sleeps_path_{batch.path}")
@@ -982,20 +1152,6 @@ class SleepPrimitive:
         except Exception:
             return None
 
-    def _await_physical(self, target: SleepTarget, clock: Clock) -> bool | None:
-        """True once /is_sleeping says so; else the last answer at the deadline.
-        (vLLM ops without an /is_sleeping probe: the /sleep result is trusted.)"""
-        if not callable(getattr(self._vllm, "is_sleeping", None)):
-            return True
-        deadline = clock.monotonic() + self._policy.physical_confirm_timeout_s
-        while True:
-            physical = self._physical(target)
-            if physical is True:
-                return True
-            if clock.monotonic() >= deadline:
-                return physical
-            clock.sleep(self._policy.poll_interval_s)
-
     def _rollback_all(self, batch: SleepBatch, *, reason: str) -> None:
         for pod in batch.pods:
             if pod.outcome is None:
@@ -1006,7 +1162,7 @@ class SleepPrimitive:
             return
         try:
             if not pod.hidden:
-                self._journal.end(pod.pod)
+                self._end_journal_if_ours(pod, batch)
                 self._release(batch, [pod])
                 pod.outcome = self._outcome(batch, pod, STATUS_ROLLED_BACK, reason=reason)
                 return
@@ -1030,7 +1186,7 @@ class SleepPrimitive:
             self._runtime.write_binding_annotations(
                 pod.target.binding, state=pod.previous_state
             )
-            self._journal.end(pod.pod)
+            self._end_journal_if_ours(pod, batch)
             self._release(batch, [pod])
             self._journal.incr("rollback_total")
             pod.outcome = self._outcome(batch, pod, STATUS_ROLLED_BACK, reason=reason)
@@ -1046,17 +1202,23 @@ class SleepPrimitive:
             )
 
     def _release(self, batch: SleepBatch, pods: list[_PodSleep]) -> None:
-        ids = [pod.binding_id for pod in pods if pod.reserved]
-        for pod in pods:
-            pod.reserved = False
-        if ids and batch.token is not None:
-            try:
-                self._reservations.release(ids, batch.token)
-            except Exception:  # expires by itself
-                LOG.exception("releasing sleep reservation of %s failed", ids)
+        with batch.lock:
+            ids = [pod.binding_id for pod in pods if pod.reserved]
+            for pod in pods:
+                pod.reserved = False
+            if ids and batch.token is not None:
+                try:
+                    self._reservations.release(ids, batch.token)
+                except Exception:  # expires by itself
+                    LOG.exception("releasing sleep reservation of %s failed", ids)
 
     def _end_journal_if_ours(self, pod: _PodSleep, batch: SleepBatch) -> None:
-        entry = self._journal.get(pod.pod) or {}
+        """End the pod's journal entry unless another sleep has written its own
+        since (the journal is keyed by pod)."""
+        try:
+            entry = self._journal.get(pod.pod) or {}
+        except Exception:  # Redis read error: trust this process's own last write
+            entry = self._journal.cached(pod.pod) or {}
         if entry.get("reservation_token") in (None, batch.token):
             self._journal.end(pod.pod)
 
@@ -1103,6 +1265,17 @@ _ROLLBACK_REASONS = {
         "non-continuable requests still in flight at the hard cap: rolled back, never aborted"
     ),
 }
+
+
+def _parallel(fn, items: list) -> dict[int, object]:
+    """``fn`` over ``items`` (by ``id``): inline for one item, else one thread
+    per item, so a round costs one call duration whatever the target count."""
+    if len(items) <= 1:
+        return {id(item): fn(item) for item in items}
+    context = contextvars.copy_context()
+    with ThreadPoolExecutor(max_workers=len(items)) as pool:
+        futures = {id(item): pool.submit(context.copy().run, fn, item) for item in items}
+        return {key: future.result() for key, future in futures.items()}
 
 
 def _decide(

@@ -31,10 +31,10 @@ from tre_sm.allocator.topology import K8sPodSnapshot
 from tre_sm.gpu_truth import GpuTruthProvider
 from tre_sm.ops.k8s_ops import StartupPodRecord
 from tre_sm.ops.sleep_primitive import (
-    STATUS_ROLLED_BACK,
     STATUS_SLEPT,
     Clock,
     GatewayState,
+    ReservationLost,
     ServiceShuttingDown,
     SleepFailed,
     SleepJournal,
@@ -55,6 +55,11 @@ from tre_sm.api.v1_compat import create_v1_compat_router
 
 _NAT_SPLIT = re.compile(r"(\d+)")
 LOG = logging.getLogger(__name__)
+
+#: Journal field of a request-initiated sleep: record desired power "sleeping"
+#: once the pod is confirmed asleep (also by crash recovery), never before
+#: (review 2 P2-3).
+DESIRED_ON_SLEEP = {"desired_on_sleep": "sleeping"}
 
 
 def serialized_operation(kind: str):
@@ -249,6 +254,10 @@ class ServiceManagerV2:
         lock, gateway ack + drain WITHOUT it (the bindings are fenced by sleep
         reservations), then /sleep + store update under the writer lock again.
         Growth (wake / create) runs under the writer lock.
+
+        Desired state follows the outcome (review 2 P2-3): a shrink records it in
+        its commit phase (only the bindings that slept go "sleeping"); growth
+        restores the previous desired records if anything fails.
         """
         with self._writer("put_model_target"):
             response, batch, targets = self._put_model_target_locked(
@@ -259,7 +268,22 @@ class ServiceManagerV2:
             )
         if batch is None:
             return response
-        outcomes, version = self._finish_split_sleep("put_model_target", batch, targets)
+
+        def retarget(_outcomes: list[dict]) -> None:
+            # Every target slept: the model's desired target is what is awake now.
+            self._set_model_desired_target(
+                model=model,
+                target_bindings=[
+                    binding
+                    for binding in self._store.load().bindings
+                    if binding.model == model and binding.awake
+                ],
+                reason="model_target_request",
+            )
+
+        outcomes, version = self._finish_split_sleep(
+            "put_model_target", batch, targets, desired_sleeping=True, on_commit=retarget
+        )
         response["version"] = version
         response["actions"] = [
             {"action": "sleep", "serve_id": item["serve_id"]} for item in outcomes
@@ -296,11 +320,6 @@ class ServiceManagerV2:
             bindings=snapshot.bindings,
             tp_size=spec.tp_size,
         )
-        self._set_model_desired_target(
-            model=model,
-            target_bindings=plan["target_bindings"],
-            reason="model_target_request",
-        )
         response = {
             "model": model,
             "wake_replicas": wake_replicas,
@@ -310,12 +329,26 @@ class ServiceManagerV2:
         if plan["sleep"] and self._sleep_primitive is not None and self._runtime_ops is not None:
             # All bindings of one scale-down are hidden together and drain
             # concurrently under one budget (the sleep primitive, plan D1/D2).
+            # Desired state is written by the commit phase (review 2 P2-3).
             targets = self._sleep_targets_for(plan["sleep"])
             batch = self._sleep_primitive.prepare(
-                targets, path=sleep_path, drain_budget_s=drain_budget_s
+                targets,
+                path=sleep_path,
+                drain_budget_s=drain_budget_s,
+                journal_extra=DESIRED_ON_SLEEP,
             )
             return response, batch, targets
+        with self._desired_guard(reason="model_target_request"):
+            self._set_model_desired_target(
+                model=model,
+                target_bindings=plan["target_bindings"],
+                reason="model_target_request",
+            )
+            return self._apply_model_target_plan(model, wake_replicas, snapshot, plan, response)
 
+    def _apply_model_target_plan(
+        self, model: str, wake_replicas: int, snapshot, plan: dict, response: dict
+    ) -> tuple[dict, object, list[SleepTarget]]:
         actions: list[dict] = []
         updated_by_serve = {binding.serve_id: binding for binding in snapshot.bindings}
         for binding in plan["sleep"]:  # no runtime: record the intent only
@@ -480,12 +513,12 @@ class ServiceManagerV2:
             if binding is None:
                 raise ValueError(f"unknown binding: {serve_id}")
             self._assert_not_reserved(binding=binding, gpus=False, what=f"power change of {serve_id}")
-            self._update_desired(
-                {binding.binding_id: {"power": "sleeping", "hidden": False}},
-                updated_by="service-manager-api",
-                reason="binding_power_request",
-            )
             if not binding.awake:
+                self._update_desired(
+                    {binding.binding_id: {"power": "sleeping", "hidden": False}},
+                    updated_by="service-manager-api",
+                    reason="binding_power_request",
+                )
                 return {
                     "serve_id": serve_id,
                     "awake": False,
@@ -493,11 +526,18 @@ class ServiceManagerV2:
                     "actions": [],
                     "binding": self._binding_dict(binding),
                 }
+            # Desired power "sleeping" is recorded by the commit phase once the pod
+            # is confirmed asleep (review 2 P2-3), never before.
             targets = self._sleep_targets_for([binding])
             batch = self._sleep_primitive.prepare(
-                targets, path=sleep_path, drain_budget_s=drain_budget_s
+                targets,
+                path=sleep_path,
+                drain_budget_s=drain_budget_s,
+                journal_extra=DESIRED_ON_SLEEP,
             )
-        _outcomes, version = self._finish_split_sleep("put_binding_power", batch, targets)
+        _outcomes, version = self._finish_split_sleep(
+            "put_binding_power", batch, targets, desired_sleeping=True
+        )
         return {
             "serve_id": serve_id,
             "awake": False,
@@ -507,43 +547,147 @@ class ServiceManagerV2:
         }
 
     @contextmanager
-    def _writer(self, kind: str, *, request: dict | None = None):
-        """Hold the SM writer lock for one phase, waiting up to
-        ``service_manager.writer_lock_wait_s`` for it."""
+    def _writer(self, kind: str, *, request: dict | None = None, wait_s: float | None = None):
+        """Hold the SM writer lock for one phase, waiting up to ``wait_s``
+        (default ``service_manager.writer_lock_wait_s``) for it."""
         if self._operation_coordinator is None:
             yield None
             return
         with self._operation_coordinator.operation(
-            kind, request=request, wait_s=self._sm_config.writer_lock_wait_s
+            kind,
+            request=request,
+            wait_s=self._sm_config.writer_lock_wait_s if wait_s is None else wait_s,
         ) as operation:
             operation.advance("executing")
             yield operation
 
+    @contextmanager
+    def _desired_guard(self, binding_ids=None, *, reason: str):
+        """Desired state changes only stick when the body succeeds (review 2
+        P2-3): on ANY exception the desired records of ``binding_ids`` (None =
+        all) are put back to what they were on entry; a record the body added is
+        marked ``absent``. Needs the writer fence (like every desired write)."""
+        if self._fleet_store is None:
+            yield
+            return
+        try:
+            before = {item.binding_id: item for item in self._fleet_store.load_desired().bindings}
+        except Exception:
+            before = None
+        try:
+            yield
+        except BaseException:
+            if before is not None:
+                self._restore_desired(before, binding_ids, reason=reason)
+            raise
+
+    def _restore_desired(self, before: dict, binding_ids, *, reason: str) -> None:
+        try:
+            snapshot = self._fleet_store.load_desired()
+            by_id = {item.binding_id: item for item in snapshot.bindings}
+            ids = set(by_id) if binding_ids is None else set(binding_ids) & set(by_id)
+            changed = False
+            for binding_id in ids:
+                current = by_id[binding_id]
+                previous = before.get(binding_id)
+                if previous is None:
+                    restored = current.with_intent(
+                        lifecycle="absent",
+                        power="sleeping",
+                        hidden=False,
+                        updated_by="service-manager-rollback",
+                        reason=f"{reason}_failed",
+                    )
+                else:
+                    restored = current.with_intent(
+                        lifecycle=previous.lifecycle,
+                        power=previous.power,
+                        hidden=previous.hidden,
+                        updated_by="service-manager-rollback",
+                        reason=f"{reason}_failed",
+                    )
+                by_id[binding_id] = restored
+                changed = changed or restored is not current
+            if changed:
+                self._fleet_store.save_desired(
+                    list(by_id.values()), expected_version=snapshot.version
+                )
+        except Exception:  # the audit reports the desired/observed mismatch
+            LOG.exception("restoring desired state after a failed %s failed", reason)
+
+    def _split_sleep(
+        self,
+        bindings: list[Binding],
+        *,
+        sleep_path: str,
+        kind: str,
+        desired_sleeping: bool = False,
+    ) -> list[dict]:
+        """Sleep ``bindings`` with the drain OUTSIDE the writer lock (prepare and
+        commit take it briefly), e.g. for startup admission / convergence
+        (review 2 P2-4). The desired state is not touched unless
+        ``desired_sleeping``."""
+        with self._writer(kind):
+            for binding in bindings:
+                self._assert_not_reserved(
+                    binding=binding, gpus=False, what=f"{kind} sleep of {binding.serve_id}"
+                )
+            targets = self._sleep_targets_for(bindings)
+            batch = self._sleep_primitive.prepare(
+                targets,
+                path=sleep_path,
+                journal_extra=DESIRED_ON_SLEEP if desired_sleeping else None,
+            )
+        outcomes, _version = self._finish_split_sleep(
+            kind, batch, targets, desired_sleeping=desired_sleeping
+        )
+        return outcomes
+
     def _finish_split_sleep(
-        self, kind: str, batch, targets: list[SleepTarget]
+        self,
+        kind: str,
+        batch,
+        targets: list[SleepTarget],
+        *,
+        desired_sleeping: bool = False,
+        on_commit=None,
     ) -> tuple[list[dict], int]:
         """Phase 2 (drain, no writer lock) and phase 3 (commit, writer lock) of a
-        sleep prepared under the lock. Returns (outcomes, legacy store version)."""
+        sleep prepared under the lock. Returns (outcomes, legacy store version).
+
+        ``desired_sleeping``: record desired power "sleeping" for exactly the
+        targets that slept (in the commit phase). ``on_commit(outcomes)`` runs
+        under the commit lock when every target slept."""
         primitive = self._sleep_primitive
         try:
             primitive.drain(batch)
-        except SleepFailed as exc:
-            # Every target was rolled back by the primitive; give them their
-            # desired power back (needs the writer lock; best effort).
-            self._record_after_unlocked_failure(kind, targets, exc.outcomes)
+        except ReservationLost as exc:
+            # Never re-acquired (review 2 P2-1): resolve under the writer lock.
+            exc.outcomes = self._resolve_lost_split(kind, batch, targets)
+            raise
+        except BaseException:
+            # Every target was rolled back by the primitive (routing restored);
+            # record the store side (needs the writer lock; best effort).
+            self._record_after_unlocked_failure(kind, targets, batch.outcomes())
             raise
         entered = False
         try:
-            with self._writer(f"{kind}_commit") as operation:
+            with self._writer(f"{kind}_commit", wait_s=self._sm_config.commit_wait_s) as operation:
                 entered = True
                 if operation is not None:
                     operation.advance("committing_sleep", details={"pods": [t.binding.serve_id for t in targets]})
                 try:
                     outcomes = primitive.commit(batch)
                 except SleepFailed as exc:
-                    self._record_sleep_outcomes(targets, exc.outcomes, update_store=True)
+                    self._record_sleep_outcomes(
+                        targets, exc.outcomes, update_store=True, desired_sleeping=desired_sleeping
+                    )
                     raise
-                self._record_sleep_outcomes(targets, outcomes, update_store=True)
+                self._record_sleep_outcomes(
+                    targets, outcomes, update_store=True, desired_sleeping=desired_sleeping
+                )
+                if on_commit is not None:
+                    on_commit(outcomes)
                 return outcomes, self._store.load().version
         except OperationBusy:
             if entered:
@@ -555,6 +699,23 @@ class ServiceManagerV2:
             )
             self._record_after_unlocked_failure(kind, targets, outcomes)
             raise
+
+    def _resolve_lost_split(self, kind: str, batch, targets: list[SleepTarget]) -> list[dict]:
+        """A drain lost its reservation: under the writer lock, roll back what no
+        other sleep owns now; without the lock, leave it to crash recovery."""
+        primitive = self._sleep_primitive
+        try:
+            with self._writer(f"{kind}_reservation_lost", wait_s=self._sm_config.commit_wait_s):
+                outcomes = primitive.resolve_lost(batch)
+                self._record_sleep_outcomes(targets, outcomes, update_store=True)
+                return outcomes
+        except Exception:
+            primitive.release_unresolved(batch)
+            LOG.exception(
+                "resolving the lost sleep reservation of %s failed; crash recovery resolves it",
+                [t.binding.serve_id for t in targets],
+            )
+            return batch.outcomes()
 
     def _record_after_unlocked_failure(
         self, kind: str, targets: list[SleepTarget], outcomes: list[dict]
@@ -617,32 +778,35 @@ class ServiceManagerV2:
             # Sleeping clears the hidden flag in the legacy store below; keep the
             # desired state consistent (a safescale commit sleeps a hidden binding).
             intent["hidden"] = False
-        self._update_desired(
-            {binding.binding_id: intent},
-            updated_by="service-manager-api",
-            reason="binding_power_request",
-        )
 
         actions: list[dict] = []
         version = snapshot.version
         updated_binding = binding
-        if binding.awake != awake:
-            action = "wake" if awake else "sleep"
-            if awake:
+        # A failed wake / sleep must not leave the new desired power behind
+        # (review 2 P1-1 / P2-3): the guard restores it on any exception.
+        with self._desired_guard([binding.binding_id], reason="binding_power_request"):
+            if awake and binding.awake != awake:
                 self._ensure_feasible_wake(binding, snapshot.bindings)
-            self._apply_runtime_power_action(
-                binding,
-                action=action,
-                sleep_path=sleep_path,
-                drain_budget_s=drain_budget_s,
+            self._update_desired(
+                {binding.binding_id: intent},
+                updated_by="service-manager-api",
+                reason="binding_power_request",
             )
-            updated_binding = replace(binding, awake=awake, hidden=False)
-            updated = [
-                updated_binding if item.serve_id == serve_id else item
-                for item in snapshot.bindings
-            ]
-            version = self._store.save(updated, expected_version=snapshot.version)
-            actions.append({"action": action, "serve_id": serve_id})
+            if binding.awake != awake:
+                action = "wake" if awake else "sleep"
+                self._apply_runtime_power_action(
+                    binding,
+                    action=action,
+                    sleep_path=sleep_path,
+                    drain_budget_s=drain_budget_s,
+                )
+                updated_binding = replace(binding, awake=awake, hidden=False)
+                updated = [
+                    updated_binding if item.serve_id == serve_id else item
+                    for item in snapshot.bindings
+                ]
+                version = self._store.save(updated, expected_version=snapshot.version)
+                actions.append({"action": action, "serve_id": serve_id})
 
         return {
             "serve_id": serve_id,
@@ -664,42 +828,45 @@ class ServiceManagerV2:
         if unknown:
             raise ValueError(f"unknown pods for {model}: {sorted(unknown)}")
 
-        self._update_desired(
-            {
-                binding.binding_id: {
-                    "hidden": binding.serve_id in requested_hidden
-                }
-                for binding in model_bindings
-            },
-            updated_by="service-manager-api",
-            reason="model_routable_request",
-        )
-
-        actions: list[dict] = []
-        updated_by_serve = {binding.serve_id: binding for binding in snapshot.bindings}
+        # Validate first, then write desired (restored on any failure, review 2 P2-3).
         for binding in model_bindings:
             if binding.hidden != (binding.serve_id in requested_hidden):
                 self._assert_not_reserved(
                     binding=binding, gpus=False, what=f"hide/unhide of {binding.serve_id}"
                 )
-        for binding in model_bindings:
-            should_hide = binding.serve_id in requested_hidden
-            if binding.hidden == should_hide:
-                continue
-            if not should_hide and binding.awake:
-                self._ensure_feasible_wake(binding, list(updated_by_serve.values()))
-            if self._runtime_ops is not None:
-                state = POD_STATE_HIDDEN if should_hide else (
-                    POD_STATE_AWAKE if binding.awake else POD_STATE_SLEEPING
-                )
-                self._runtime_ops.write_binding_annotations(binding, state=state)
-            updated_by_serve[binding.serve_id] = replace(binding, hidden=should_hide)
-            actions.append({"action": "hide" if should_hide else "unhide", "serve_id": binding.serve_id})
+        actions: list[dict] = []
+        updated_by_serve = {binding.serve_id: binding for binding in snapshot.bindings}
+        with self._desired_guard(
+            [binding.binding_id for binding in model_bindings], reason="model_routable_request"
+        ):
+            self._update_desired(
+                {
+                    binding.binding_id: {
+                        "hidden": binding.serve_id in requested_hidden
+                    }
+                    for binding in model_bindings
+                },
+                updated_by="service-manager-api",
+                reason="model_routable_request",
+            )
+            for binding in model_bindings:
+                should_hide = binding.serve_id in requested_hidden
+                if binding.hidden == should_hide:
+                    continue
+                if not should_hide and binding.awake:
+                    self._ensure_feasible_wake(binding, list(updated_by_serve.values()))
+                if self._runtime_ops is not None:
+                    state = POD_STATE_HIDDEN if should_hide else (
+                        POD_STATE_AWAKE if binding.awake else POD_STATE_SLEEPING
+                    )
+                    self._runtime_ops.write_binding_annotations(binding, state=state)
+                updated_by_serve[binding.serve_id] = replace(binding, hidden=should_hide)
+                actions.append({"action": "hide" if should_hide else "unhide", "serve_id": binding.serve_id})
 
-        version = snapshot.version
-        if actions:
-            updated = [updated_by_serve[binding.serve_id] for binding in snapshot.bindings]
-            version = self._store.save(updated, expected_version=snapshot.version)
+            version = snapshot.version
+            if actions:
+                updated = [updated_by_serve[binding.serve_id] for binding in snapshot.bindings]
+                version = self._store.save(updated, expected_version=snapshot.version)
 
         return {
             "model": model,
@@ -722,6 +889,14 @@ class ServiceManagerV2:
             if source is not None:
                 self._assert_not_reserved(binding=source, what=f"defrag of {source.serve_id}")
             self._assert_not_reserved(slot=migration.to_slot, what="defrag destination")
+        # The source sleeps with the writer lock held for the whole migration: the
+        # create + readiness wait that follows holds it for minutes anyway, so a
+        # lock-free drain would not shorten the hold (review 2 P2-4). Desired state
+        # is restored if the defrag fails (review 2 P2-3).
+        with self._desired_guard(reason="defrag"):
+            return self._defrag_locked(snapshot, migrations)
+
+    def _defrag_locked(self, snapshot, migrations) -> dict:
         self._set_defrag_desired(snapshot.bindings, migrations)
         if migrations:
             self._ensure_all_model_routes()
@@ -1024,9 +1199,24 @@ class ServiceManagerV2:
                 if self._gpu_leases is not None:
                     self._gpu_leases.release(binding)
                 self._set_store_power(binding.binding_id, awake=False, hidden=False)
+                if (
+                    record.get("desired_on_sleep") == "sleeping"
+                    and self._fleet_store is not None
+                    and binding.binding_id in self._desired_binding_ids()
+                ):
+                    # The request's intent, recorded now that the pod IS asleep.
+                    self._update_desired(
+                        {binding.binding_id: {"power": "sleeping", "hidden": False}},
+                        updated_by="service-manager-recovery",
+                        reason="sleep_recovered_asleep",
+                    )
                 primitive.journal.end(pod_name)
                 primitive.journal.incr("recovery_slept_total")
                 resolved.append({"serve_id": pod_name, "result": "slept"})
+            elif physical is False and not self._awake_long_enough(pod_name, record):
+                # /sleep may still be running (mode=wait waits for stragglers):
+                # one awake read is not enough to re-open routing (review 2 P3).
+                kept.append({"serve_id": pod_name, "result": "awake_but_sleep_may_be_running"})
             elif physical is False:
                 previous = record.get("previous_state") or POD_STATE_AWAKE
                 if previous not in (POD_STATE_AWAKE, POD_STATE_HIDDEN):
@@ -1053,6 +1243,23 @@ class ServiceManagerV2:
         if resolved or kept:
             LOG.warning("sleep journal recovery: resolved=%s kept=%s", resolved, kept)
         return {"resolved": resolved, "kept": kept}
+
+    def _awake_long_enough(self, pod_name: str, record: dict) -> bool:
+        """True when rolling back an awake pod is safe: /sleep was never sent
+        (phase before "sleeping"), or the pod has read awake twice, more than
+        ``sleep.sleep_call_timeout_s`` apart (a /sleep still running then has
+        timed out). The first awake read is recorded in the journal entry."""
+        if record.get("phase") not in ("sleeping", "sleep_unconfirmed"):
+            return True
+        primitive = self._sleep_primitive
+        now_ms = primitive.reservations.now_ms()
+        first = record.get("awake_seen_at_ms")
+        if first is None:
+            primitive.journal.update(
+                pod_name, awake_seen_at_ms=now_ms, recovery="awake_once_waiting"
+            )
+            return False
+        return now_ms - int(first) > primitive.policy.sleep_call_timeout_s * 1000
 
     def _set_store_power(self, binding_id: str, *, awake: bool, hidden: bool) -> None:
         for attempt in range(3):
@@ -1081,10 +1288,10 @@ class ServiceManagerV2:
             stop_flag()
 
     def shutdown_timeout_s(self) -> float:
-        """Bound of the shutdown wait: a commit already past /sleep finishes
-        (/sleep with the mode=abort retry + physical confirmation)."""
-        sleep = self._sm_config.sleep
-        return 2 * sleep.sleep_call_timeout_s + sleep.physical_confirm_timeout_s + sleep.ack_timeout_s
+        """Bound of the shutdown wait, from the same time budget as the call
+        timeout (review 2 P2-2): a drain rolls back at its next poll, a commit
+        already past /sleep finishes."""
+        return self._sm_config.shutdown_timeout_s()
 
     def shutdown(self, *, timeout_s: float) -> bool:
         """begin_shutdown, then wait (bounded) until every sleep has finished or
@@ -1309,21 +1516,34 @@ class ServiceManagerV2:
                 f"{active.get('owner')}:{active.get('fencing_token')}"
             )
 
-        self._assert_not_reserved(
-            slot=Slot(pod.node, pod.gpu_ids), what=f"startup admission of {pod_name}"
-        )
-        conflict = self._conflicting_transient_lease(pod)
-        if conflict is not None:
-            gpu_id, occupant = conflict
-            raise GpuLeaseConflict(
-                gpu=f"{pod.node}/{gpu_id}", occupant=occupant
-            )
+        # Awake residents on the Pod's GPUs are put to sleep first, with their
+        # drain OUTSIDE the writer lock (review 2 P2-4); the admission below only
+        # verifies that they are asleep. Checks that would refuse the admission
+        # anyway run first, so nothing is slept for a Pod that cannot start.
+        self._safety_gate.assert_no_pressure()
+        if pod.binding_id in self._desired_binding_ids():
+            if self._desired_binding(pod.binding_id).lifecycle != "resident":
+                raise ValueError(
+                    f"startup denied for non-resident desired binding {pod.binding_id}"
+                )
+        self._sleep_overlapping_residents(pod)
 
         request = {"pod_name": pod_name, "pod_uid": pod_uid}
         with self._operation_coordinator.operation(
             "startup_admit", request=request
         ) as operation:
             operation.advance("validating_startup", details={"binding_id": pod.binding_id})
+            # Checked under the writer lock (review 2 P3): no sleep can start and
+            # no transient lease can appear between the check and the admission.
+            self._assert_not_reserved(
+                slot=Slot(pod.node, pod.gpu_ids), what=f"startup admission of {pod_name}"
+            )
+            conflict = self._conflicting_transient_lease(pod)
+            if conflict is not None:
+                gpu_id, occupant = conflict
+                raise GpuLeaseConflict(
+                    gpu=f"{pod.node}/{gpu_id}", occupant=occupant
+                )
             self._safety_gate.assert_no_pressure()
             if pod.binding_id not in self._desired_binding_ids():
                 # Redis lost desired state while the SM kept running: re-seed
@@ -1359,12 +1579,13 @@ class ServiceManagerV2:
                     )
                 wanted = self._desired_binding(binding.binding_id)
                 if not physical_sleeping:
-                    self._apply_runtime_power_action(
-                        binding, action="sleep", sleep_path="startup"
+                    raise RetryLater(
+                        f"overlapping resident {binding.binding_id} is awake again; "
+                        "retry the admission"
                     )
-                    updated[binding.binding_id] = replace(
-                        binding, awake=False, hidden=False
-                    )
+                current = updated.get(binding.binding_id)
+                if current is not None and current.awake:
+                    updated[binding.binding_id] = replace(current, awake=False, hidden=False)
                 if wanted.power == "awake" and binding.binding_id != pod.binding_id:
                     suspended.append(binding.binding_id)
 
@@ -1400,8 +1621,34 @@ class ServiceManagerV2:
                 "suspended_binding_ids": suspended,
             }
 
+    def _sleep_overlapping_residents(self, pod: StartupPodRecord) -> None:
+        """Split-sleep (drain outside the writer lock) every awake resident on the
+        startup Pod's GPUs. Desired power is untouched: a resident desired awake
+        is recorded as suspended by the admission and woken after convergence."""
+        if self._sleep_primitive is None:
+            return
+        awake: list[Binding] = []
+        target_gpus = set(pod.gpu_ids)
+        for snapshot in self._runtime_ops.list_startup_resident_snapshots():
+            if snapshot.name == pod.name or snapshot.node != pod.node:
+                continue
+            binding = _binding_from_snapshot(snapshot)
+            if not target_gpus.intersection(binding.slot.gpu_ids):
+                continue
+            if not snapshot.pod_ip or not snapshot.ready:
+                continue  # the admission refuses it under the lock
+            if self._vllm_ops.is_sleeping(snapshot.pod_ip, port=8000) is False:
+                awake.append(binding)
+        if awake:
+            self._split_sleep(awake, sleep_path="startup", kind="startup_admit_sleep")
+
     def converge_startups(self) -> dict:
-        """Converge admitted Pods after vLLM becomes reachable."""
+        """Converge admitted Pods after vLLM becomes reachable.
+
+        A Pod desired asleep is split-slept first (drain outside the writer lock,
+        review 2 P2-4). A Pod that cannot be converged right now (writer busy,
+        a sleep reservation, a failed sleep) stays pending for the next pass; it
+        never aborts the other Pods of this pass (review 2 P3)."""
         if self._runtime_ops is None or self._vllm_ops is None:
             return {"converged": [], "pending": []}
         converged: list[str] = []
@@ -1422,12 +1669,33 @@ class ServiceManagerV2:
                 pending.append(snapshot.name)
                 continue
             try:
+                if physical_sleeping is False and self._startup_wants_sleep(snapshot):
+                    self._split_sleep(
+                        [_binding_from_snapshot(snapshot)],
+                        sleep_path="startup",
+                        kind="startup_converge_sleep",
+                    )
+                    physical_sleeping = self._vllm_ops.is_sleeping(
+                        snapshot.pod_ip, port=8000
+                    )
+                    if physical_sleeping is not True:
+                        pending.append(snapshot.name)
+                        continue
                 self._converge_startup(snapshot, physical_sleeping)
-            except OperationBusy:
+            except (OperationBusy, ReservationConflict, RetryLater, SleepFailed, ServiceShuttingDown):
+                pending.append(snapshot.name)
+                continue
+            except ValueError as exc:  # e.g. no desired record: report, keep going
+                LOG.warning("startup convergence of %s deferred: %s", snapshot.name, exc)
                 pending.append(snapshot.name)
                 continue
             converged.append(snapshot.name)
         return {"converged": converged, "pending": pending}
+
+    def _startup_wants_sleep(self, snapshot: K8sPodSnapshot) -> bool:
+        if self._fleet_store is None:
+            return False
+        return self._desired_binding(_binding_from_snapshot(snapshot).binding_id).power == "sleeping"
 
     @serialized_operation("startup_converge")
     def _converge_startup(
@@ -1439,9 +1707,8 @@ class ServiceManagerV2:
         desired = self._desired_binding(binding.binding_id)
         if desired.power == "sleeping":
             if not physical_sleeping:
-                self._apply_runtime_power_action(
-                    binding, action="sleep", sleep_path="startup"
-                )
+                # converge_startups sleeps it first (drain outside the lock).
+                raise RetryLater(f"startup {binding.binding_id} is still awake")
             else:
                 self._runtime_ops.write_binding_annotations(
                     binding, state=POD_STATE_SLEEPING
@@ -1945,11 +2212,18 @@ class ServiceManagerV2:
         return outcomes
 
     def _record_sleep_outcomes(
-        self, targets: list[SleepTarget], outcomes: list[dict], *, update_store: bool
+        self,
+        targets: list[SleepTarget],
+        outcomes: list[dict],
+        *,
+        update_store: bool,
+        desired_sleeping: bool = False,
     ) -> None:
         """Per-target bookkeeping (review P2-7): release the GPU lease of every
         target that slept; with ``update_store`` also mark exactly those asleep in
-        the legacy store, and give rolled-back targets their desired power back."""
+        the legacy store (and restore the hidden flag of rolled-back ones); with
+        ``desired_sleeping`` record desired power "sleeping" for exactly the
+        targets that slept (review 2 P2-3: desired changes follow the outcome)."""
         by_id = {target.binding.binding_id: target.binding for target in targets}
         slept = [
             by_id[item["binding_id"]]
@@ -1965,7 +2239,7 @@ class ServiceManagerV2:
         rolled_hidden = {
             item["binding_id"]: item.get("previous_state") == POD_STATE_HIDDEN
             for item in outcomes
-            if item.get("status") == STATUS_ROLLED_BACK
+            if item.get("status") == "rolled_back"
         }
         for attempt in range(3 if (slept_ids or rolled_hidden) else 0):
             snapshot = self._store.load()
@@ -1985,23 +2259,25 @@ class ServiceManagerV2:
             except StateConflict:
                 if attempt == 2:
                     raise
-        restore = {
-            item["binding_id"]: {
-                "power": "awake",
-                "hidden": item.get("previous_state") == POD_STATE_HIDDEN,
-            }
-            for item in outcomes
-            if item.get("status") == STATUS_ROLLED_BACK and item.get("binding_id") in by_id
-        }
-        if restore and self._fleet_store is not None:
+        if desired_sleeping and slept_ids and self._fleet_store is not None:
             known = {item.binding_id for item in self._fleet_store.load_desired().bindings}
-            restore = {key: value for key, value in restore.items() if key in known}
             self._update_desired(
-                restore, updated_by="service-manager-sleep", reason="sleep_rolled_back"
+                {
+                    binding_id: {"power": "sleeping", "hidden": False}
+                    for binding_id in slept_ids
+                    if binding_id in known
+                },
+                updated_by="service-manager-sleep",
+                reason="sleep_committed",
             )
 
     def _repair_sleep_binding(self, binding: Binding, pod_ip: str) -> None:
-        """Fleet repair's sleep: the same primitive (plan D1), path ``repair``."""
+        """Fleet repair's sleep: the same primitive (plan D1), path ``repair``.
+
+        It keeps the writer lock through the drain (review 2 P2-4: not split):
+        a repair is one fenced operation that runs only in observe mode, and
+        releasing the lock mid-repair would let other writers interleave with a
+        fleet the repair has not finished converging."""
         self._sleep_targets([SleepTarget(binding, pod_ip)], sleep_path="repair")
 
     def _ensure_wake_headroom(self, binding: Binding) -> None:
@@ -2084,6 +2360,9 @@ class ServiceManagerV2:
                 "sleep_call_timeout_s": policy.sleep_call_timeout_s,
                 "physical_confirm_timeout_s": policy.physical_confirm_timeout_s,
                 "reservation_ttl_s": policy.reservation_ttl_s,
+                "probe_timeout_s": policy.probe_timeout_s,
+                "commit_lock_wait_s": self._sm_config.commit_wait_s,
+                "shutdown_timeout_s": self._sm_config.shutdown_timeout_s(),
                 "vllm_sleep_mode_param": policy.vllm_sleep_mode_param,
                 "budgets_s": dict(policy.budgets_s),
                 "worst_case_call_s": self._sm_config.worst_case_sleep_call_s(),
@@ -2312,6 +2591,11 @@ class WakeConflict(ValueError):
     pass
 
 
+class RetryLater(RuntimeError):
+    """The request cannot proceed right now but may succeed when retried (HTTP
+    409), e.g. a resident on a startup Pod's GPUs woke up again."""
+
+
 class TargetRequest(BaseModel):
     wake_replicas: int
     #: Which sleep path this is (registry service_manager.sleep.budgets_s key).
@@ -2395,6 +2679,10 @@ def create_app(service: ServiceManagerV2) -> FastAPI:
         return JSONResponse(
             status_code=409, content={"detail": str(exc), "binding_id": exc.binding_id}
         )
+
+    @app.exception_handler(RetryLater)
+    async def retry_later_handler(_request: Request, exc: RetryLater) -> JSONResponse:
+        return JSONResponse(status_code=409, content={"detail": str(exc)})
 
     @app.exception_handler(ServiceShuttingDown)
     async def shutting_down_handler(

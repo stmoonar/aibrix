@@ -3,7 +3,8 @@
 The in-process backend and the FakeRedis re-implementation of the Lua scripts
 run always; set TRE_TEST_REDIS_URL (a throwaway Redis, e.g.
 ``docker run --rm -p 127.0.0.1:16399:6379 redis:7.2-alpine``) to also run the
-real Lua scripts.
+real Lua scripts - ``make check-redis`` does exactly that (and removes the
+container afterwards).
 """
 
 import os
@@ -53,16 +54,21 @@ def test_acquire_is_all_or_nothing_and_fences_binding_and_gpus(make):
     with pytest.raises(ReservationConflict) as same_binding:
         store.acquire([_b("a", "m1", (0,))], owner="sm", operation_id="op2", ttl_s=30)
     assert same_binding.value.binding_id == "m1/node-a/0"
-    with pytest.raises(ReservationConflict):  # overlapping GPU 3 of the tp2 binding
-        store.acquire([_b("x", "m9", (3,))], owner="sm", operation_id="op3", ttl_s=30)
-    # all-or-nothing: the free GPU 1 was not reserved by the failed call
+    # all-or-nothing: the free binding m1/node-a/1 was not reserved by the failed call
     with pytest.raises(ReservationConflict):
         store.acquire([_b("y", "m1", (1,)), _b("z", "m1", (0,))], owner="sm", operation_id="op4", ttl_s=30)
     assert set(store.active()) == {"m1/node-a/0", "tp2/node-a/2,3"}
+    # GPU overlap is enforced for operations that NEED the GPU (assert_free) ...
+    with pytest.raises(ReservationConflict):
+        store.assert_free(node="node-a", gpu_ids=(3,), what="wake of x")
     # another node's GPU 0 is free
     store.acquire([_b("o", "m1", (0,), node="node-b")], owner="sm", operation_id="op5", ttl_s=30)
 
     assert store.conflict(node="node-a", gpu_ids=(2,)).binding_id == "tp2/node-a/2,3"
+    # ... but not between two sleeps (review 2 P1-2): another binding on GPU 3 may
+    # drain for sleep while the tp2 binding does.
+    other = store.acquire([_b("x", "m9", (3,))], owner="sm", operation_id="op3", ttl_s=30)
+    store.release(["m9/node-a/3"], other)
     assert store.conflict(node="node-a", gpu_ids=(1,)) is None
     assert store.conflict(node="node-a", gpu_ids=(), model="m1").binding_id in {"m1/node-a/0", "m1/node-b/0"}
     assert store.conflict(node="node-a", gpu_ids=(), model="m7") is None

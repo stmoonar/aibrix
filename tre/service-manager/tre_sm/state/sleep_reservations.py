@@ -9,13 +9,15 @@ fenced by a reservation instead:
 * one record per binding in ``tre:v2:sm:sleep_reservations`` (field =
   binding_id) with the binding's node / GPUs, a random token, the owner and an
   expiry computed from Redis ``TIME`` (one clock for every SM replica);
-* acquired all-or-nothing for the bindings of one sleep; refused when any live
-  reservation covers the same binding or overlaps its GPUs;
+* acquired all-or-nothing for the bindings of one sleep; refused only when a
+  live reservation covers the SAME binding (review 2 P1-2: two bindings sharing
+  a GPU may sleep concurrently - sleeping frees the GPU, it never needs it);
 * renewed on every drain poll (TTL ``service_manager.sleep.reservation_ttl_s``);
   a failed renewal means ownership was lost and the drain rolls back;
-* checked by every conflicting operation: a wake on an overlapping GPU, another
-  sleep / wake / hide / unhide of the binding, a defrag touching it, a model
-  target of its model, startup admission on its GPUs, a fleet repair.
+* checked by every conflicting operation (:meth:`SleepReservations.assert_free`,
+  GPU overlap included): a wake on an overlapping GPU, a wake / hide / unhide of
+  the binding, a defrag touching it or its GPUs, a cold start or a startup
+  admission on its GPUs, a model target of its model, a fleet repair.
 
 A reservation whose owner died expires by itself after the TTL.
 """
@@ -50,18 +52,8 @@ for j = 1, #all, 2 do
     redis.call('HDEL', KEYS[1], all[j])
   elseif rec.token ~= ARGV[1] then
     for i = 1, count do
-      local w = wanted[i]
-      if rec.binding_id == w.id then
+      if rec.binding_id == wanted[i].id then
         return {0, rec.binding_id}
-      end
-      if rec.node == w.node then
-        for _, a in ipairs(rec.gpu_ids) do
-          for _, b in ipairs(w.gpus) do
-            if tonumber(a) == tonumber(b) then
-              return {0, rec.binding_id}
-            end
-          end
-        end
       end
     end
   end
@@ -160,7 +152,10 @@ class SleepReservations:
         operation_id: str | None,
         ttl_s: float,
     ) -> str:
-        """All-or-nothing reservation of ``bindings``; returns the token."""
+        """All-or-nothing reservation of ``bindings`` for a sleep; returns the
+        token. Conflicts only with a live reservation of the same binding: sleeps
+        of different bindings on one GPU run concurrently (GPU exclusivity is for
+        operations that need the GPU, see :meth:`assert_free`)."""
         token = uuid4().hex
         ttl_ms = max(1, int(ttl_s * 1000))
         if self._redis is None:
@@ -295,6 +290,12 @@ class SleepReservations:
             )
 
     # -------------------------------------------------------------- helpers
+    def now_ms(self) -> int:
+        """The reservation clock (Redis TIME, else the local wall clock)."""
+        if self._redis is None:
+            return self._wall_ms()
+        return self._redis_now_ms()
+
     def _redis_now_ms(self) -> int:
         redis_time = getattr(self._redis, "time", None)
         if callable(redis_time):
@@ -314,10 +315,7 @@ class SleepReservations:
         if record["token"] == token:
             return
         for binding in bindings:
-            if record["binding_id"] == binding.binding_id or (
-                record["node"] == binding.slot.node
-                and set(record["gpu_ids"]).intersection(binding.slot.gpu_ids)
-            ):
+            if record["binding_id"] == binding.binding_id:
                 raise ReservationConflict(
                     f"binding {record['binding_id']} is reserved by a sleep in progress",
                     binding_id=record["binding_id"],

@@ -24,10 +24,14 @@ by the controller and the service-manager).
 ### Checked at start
 
 - The service-manager refuses to start when `service_manager:` / `gateway:` is
-  invalid. One check is the worst-case duration of one sleeping call:
-  `2 x writer_lock_wait_s + sleep.ack_timeout_s + sleep.hard_cap_s +
-  2 x sleep.sleep_call_timeout_s + sleep.physical_confirm_timeout_s` must be
-  below `service_manager.api_call_timeout_s`.
+  invalid. One check is the worst-case duration of one sleeping call, for any
+  number of targets (they drain and commit in parallel):
+  `writer_lock_wait_s + sleep.ack_timeout_s + sleep.hard_cap_s +
+  commit-lock wait + 2 x sleep.sleep_call_timeout_s + 6 x sleep.probe_timeout_s +
+  sleep.physical_confirm_timeout_s + sleep.io_margin_s` must be below
+  `service_manager.api_call_timeout_s`. Another: `sleep.reservation_ttl_s` must
+  exceed `commit-lock wait + sleep.poll_interval_s + sleep.probe_timeout_s +
+  sleep.io_margin_s` (the longest gap between two reservation renewals).
 - The controller uses `service_manager.api_call_timeout_s` as its timeout for
   slow service-manager calls, unless `TRE_SM_SLOW_TIMEOUT_SECONDS` overrides it.
   It refuses to start when that timeout does not exceed the same worst case.
@@ -52,14 +56,23 @@ Deployments put model, node and GPUs in the name, which guarantees this.
 ### Service-manager rollout
 
 The service-manager Deployment uses `strategy: Recreate`, so only one writer
-runs at a time. `terminationGracePeriodSeconds` must be at least
-`sleep.hard_cap_s + 2 x sleep.sleep_call_timeout_s +
-sleep.physical_confirm_timeout_s`; a guard test enforces it. On SIGTERM the
-service-manager:
+runs at a time. `terminationGracePeriodSeconds` must exceed the SIGTERM wait
+`ServiceManagerConfig.shutdown_timeout_s()` (commit-lock wait + a parallel
+commit + one poll round, computed from the same values as the call timeout); a
+guard test enforces it. On SIGTERM the service-manager:
 
 1. stops accepting new sleeps;
 2. rolls back every drain that has not reached `/sleep`;
 3. lets a sleep that is already past `/sleep` finish.
 
-On start it resolves any sleep journal entries that a dead instance left
-behind.
+On start (and on every supervisor pass) it resolves any sleep journal entries
+that a dead instance left behind. A pod whose `/sleep` may still be running is
+re-opened for routing only after it read awake twice, more than
+`sleep.sleep_call_timeout_s` apart.
+
+### Tests
+
+`make check` is hermetic: the Lua scripts (sleep reservations, the fair writer
+lock) run against Python models of them. `make check-redis` runs the same tests
+against a real throwaway Redis container (`REDIS_TEST_IMAGE`, default
+`redis:7.2-alpine`) and removes it afterwards.

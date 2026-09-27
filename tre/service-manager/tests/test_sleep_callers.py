@@ -174,9 +174,9 @@ def spy_on(primitive, paths):
     """Record (path, budget, pods) of every sleep: every sleep starts with prepare()."""
     original = SleepPrimitive.prepare
 
-    def spy(self, targets, *, path, drain_budget_s=None):
+    def spy(self, targets, *, path, drain_budget_s=None, **kwargs):
         paths.append((path, drain_budget_s, [t.binding.serve_id for t in targets]))
-        return original(self, targets, path=path, drain_budget_s=drain_budget_s)
+        return original(self, targets, path=path, drain_budget_s=drain_budget_s, **kwargs)
 
     primitive.prepare = spy.__get__(primitive)
 

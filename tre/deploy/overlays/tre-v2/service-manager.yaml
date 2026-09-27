@@ -21,11 +21,10 @@ spec:
     spec:
       serviceAccountName: tre-v2-service-manager
       # SIGTERM stops new sleeps and rolls back every drain that has not reached
-      # /sleep; a sleep already past /sleep finishes (2 x sleep_call_timeout_s +
-      # physical_confirm_timeout_s). Grace >= sleep.hard_cap_s + 2 x
-      # sleep.sleep_call_timeout_s + sleep.physical_confirm_timeout_s (registry,
-      # 255 s with the defaults) also covers a monolithic repair / defrag sleep;
-      # set to service_manager.api_call_timeout_s. Guard test:
+      # /sleep (also the drain of a repair / defrag sleep); a commit already past
+      # /sleep finishes. The SM waits ServiceManagerConfig.shutdown_timeout_s()
+      # for that (commit-lock wait + parallel commit + one poll round, 150.5 s
+      # with the registry defaults); the grace period must exceed it. Guard test:
       # deploy/tests/test_kustomize_overlays.py.
       terminationGracePeriodSeconds: 300
       nodeSelector:

@@ -347,7 +347,10 @@ def test_seeding_observes_each_pods_actual_power():
     }
 
 
-def test_seeding_falls_back_to_the_annotation_when_the_probe_is_unknown():
+def test_seeding_never_trusts_the_annotation_when_the_probe_is_unknown():
+    """Review 2 P1-3: an unknown physical state seeds "sleeping", whatever the
+    annotation says (a pod waiting at the startup gate carries the template's
+    ``hidden`` annotation although vLLM never ran)."""
     from tre_sm.state.fleet_seed import seed_desired
 
     redis, fleet = _empty_redis_fleet()
@@ -364,7 +367,7 @@ def test_seeding_falls_back_to_the_annotation_when_the_probe_is_unknown():
         seed_desired(registry(), fleet, runtime_ops=runtime, vllm_ops=vllm)
 
     by_id = {d.binding_id: d.power for d in fleet.load_desired().bindings}
-    assert by_id["m1/node-a/0"] == "awake" and by_id["m1/node-a/1"] == "sleeping"
+    assert by_id["m1/node-a/0"] == "sleeping" and by_id["m1/node-a/1"] == "sleeping"
 
 
 def test_redis_loss_with_an_awake_fleet_reseeds_awake_and_never_mass_sleeps():

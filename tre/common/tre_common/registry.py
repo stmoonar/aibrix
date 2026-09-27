@@ -212,6 +212,12 @@ class SleepPolicy:
     #: HTTP timeout of one /sleep call (weight offload). A mode=wait call that
     #: fails is retried once with mode=abort, so a sleep spends up to 2x this.
     sleep_call_timeout_s: float = 45.0
+    #: HTTP timeout of every other vLLM probe of a sleep (``GET /metrics``,
+    #: ``/version``, ``/is_sleeping``); part of the worst-case call duration.
+    probe_timeout_s: float = 5.0
+    #: Allowance for the Redis / Kubernetes calls of one sleep (patches, journal,
+    #: reservation renewals) in the worst-case call duration.
+    io_margin_s: float = 5.0
     #: After /sleep returned, wait this long for /is_sleeping to report true.
     physical_confirm_timeout_s: float = 15.0
     #: ``auto``: probe the pod's ``GET /version`` (cached per pod) and send
@@ -265,24 +271,64 @@ class ServiceManagerConfig:
     #: Only nodes in cluster.nodes can block a cold start with node pressure.
     pressure_registry_nodes_only: bool = True
     #: A request that needs the SM writer lock waits up to this long for it (the
-    #: lock is held only for short phases; a drain runs outside it).
+    #: lock is held only for short phases; a drain runs outside it). Waiters are
+    #: served first-come first-served.
     writer_lock_wait_s: float = 10.0
+    #: How long the commit phase of a drained sleep waits for the writer lock
+    #: (None = writer_lock_wait_s). The sleep reservation must outlive it.
+    commit_lock_wait_s: float | None = None
     #: Timeout clients (the controller) use for slow SM calls (scale / binding
     #: power / defrag). Must exceed :meth:`worst_case_sleep_call_s`; the controller
     #: uses it unless TRE_SM_SLOW_TIMEOUT_SECONDS overrides it (validated too).
-    api_call_timeout_s: float = 300.0
+    api_call_timeout_s: float = 360.0
 
-    def worst_case_sleep_call_s(self) -> float:
-        """Upper bound of one sleeping SM call: writer-lock wait (hide phase and
-        commit phase) + gateway ack + drain hard cap + /sleep (mode=wait, then a
-        mode=abort retry) + physical confirmation."""
+    @property
+    def commit_wait_s(self) -> float:
+        return self.writer_lock_wait_s if self.commit_lock_wait_s is None else self.commit_lock_wait_s
+
+    def worst_case_commit_s(self) -> float:
+        """The commit phase once it holds the lock (targets are committed in
+        parallel, so this does not grow with the number of targets): per target
+        ``/version`` probe + /sleep mode=wait + ``/is_sleeping`` + ``/metrics``
+        re-read + /sleep mode=abort + ``/is_sleeping``; then the physical
+        confirmation plus one overshooting probe round."""
         sleep = self.sleep
         return (
-            2 * self.writer_lock_wait_s
-            + sleep.ack_timeout_s
-            + sleep.hard_cap_s
+            4 * sleep.probe_timeout_s
             + 2 * sleep.sleep_call_timeout_s
             + sleep.physical_confirm_timeout_s
+            + sleep.probe_timeout_s
+        )
+
+    def worst_case_drain_s(self) -> float:
+        """Gateway ack + drain up to the hard cap + the last poll round (engine
+        metrics of every target read in parallel, so one probe timeout)."""
+        sleep = self.sleep
+        return sleep.ack_timeout_s + sleep.hard_cap_s + sleep.probe_timeout_s
+
+    def worst_case_sleep_call_s(self) -> float:
+        """Upper bound of one sleeping SM call, for any number of targets:
+        writer-lock wait (hide phase) + drain + commit-lock wait + commit +
+        the Redis / Kubernetes allowance."""
+        return (
+            self.writer_lock_wait_s
+            + self.worst_case_drain_s()
+            + self.commit_wait_s
+            + self.worst_case_commit_s()
+            + self.sleep.io_margin_s
+        )
+
+    def shutdown_timeout_s(self) -> float:
+        """How long SIGTERM waits for sleeps in progress: a drain rolls back at its
+        next poll (after at most one poll round, or once its commit-lock wait
+        ends), a commit already past /sleep finishes."""
+        sleep = self.sleep
+        return (
+            self.commit_wait_s
+            + self.worst_case_commit_s()
+            + sleep.poll_interval_s
+            + sleep.probe_timeout_s
+            + sleep.io_margin_s
         )
 
     def wake_limit_mib(self, total_mib: int | None) -> int | None:
@@ -480,6 +526,8 @@ def parse_service_manager_config(
         physical_confirm_timeout_s=_num(
             sleep_raw, "physical_confirm_timeout_s", defaults.physical_confirm_timeout_s
         ),
+        probe_timeout_s=_num(sleep_raw, "probe_timeout_s", defaults.probe_timeout_s),
+        io_margin_s=_num(sleep_raw, "io_margin_s", defaults.io_margin_s),
         vllm_sleep_mode_param=parse_sleep_mode_param(
             sleep_raw.get("vllm_sleep_mode_param", defaults.vllm_sleep_mode_param)
         ),
@@ -505,6 +553,9 @@ def parse_service_manager_config(
             pressure_raw.get("registry_nodes_only", base.pressure_registry_nodes_only)
         ),
         writer_lock_wait_s=_num(raw, "writer_lock_wait_s", base.writer_lock_wait_s),
+        commit_lock_wait_s=(
+            None if raw.get("commit_lock_wait_s") is None else float(raw["commit_lock_wait_s"])
+        ),
         api_call_timeout_s=_num(raw, "api_call_timeout_s", base.api_call_timeout_s),
     )
 
@@ -548,10 +599,13 @@ def _validate_service_manager(
         "physical_confirm_timeout_s",
         "hard_cap_s",
         "reservation_ttl_s",
+        "probe_timeout_s",
     ):
         value = float(getattr(sleep, name))
         if not math.isfinite(value) or value <= 0:
             errors.append(f"service_manager.sleep.{name} must be positive")
+    if not math.isfinite(sleep.io_margin_s) or sleep.io_margin_s < 0:
+        errors.append("service_manager.sleep.io_margin_s must be >= 0")
     if not math.isfinite(sleep.no_plugin_grace_s) or sleep.no_plugin_grace_s < 0:
         errors.append("service_manager.sleep.no_plugin_grace_s must be >= 0")
     if sleep.gateway_min_instances < 1:
@@ -565,6 +619,19 @@ def _validate_service_manager(
         errors.append(
             "service_manager.sleep.reservation_ttl_s must exceed 2 x poll_interval_s "
             "(the reservation is renewed once per poll)"
+        )
+    # Review 2 P2-1: the longest gap between two renewals is the last drain poll
+    # round (every target's engine metrics, read in parallel) followed by the wait
+    # for the commit-phase writer lock; the reservation must survive it, or the
+    # commit finds it lost and rolls back.
+    renew_gap = (
+        config.commit_wait_s + sleep.poll_interval_s + sleep.probe_timeout_s + sleep.io_margin_s
+    )
+    if sleep.reservation_ttl_s <= renew_gap:
+        errors.append(
+            f"service_manager.sleep.reservation_ttl_s ({sleep.reservation_ttl_s:g}) must "
+            f"exceed the longest renewal gap {renew_gap:g}s (commit-lock wait + "
+            "poll_interval_s + probe_timeout_s + io_margin_s)"
         )
     for path, value in sleep.budgets_s.items():
         if path not in SLEEP_PATHS:
@@ -592,6 +659,8 @@ def _validate_service_manager(
         errors.append("service_manager.clock_skew.fail_s must be positive or null")
     if config.writer_lock_wait_s < 0:
         errors.append("service_manager.writer_lock_wait_s must be >= 0")
+    if config.commit_lock_wait_s is not None and config.commit_lock_wait_s < 0:
+        errors.append("service_manager.commit_lock_wait_s must be >= 0 or null")
     errors.extend(sleep_call_timeout_errors(config, config.api_call_timeout_s))
     return errors
 
@@ -605,9 +674,10 @@ def sleep_call_timeout_errors(
     if worst < call_timeout_s:
         return []
     return [
-        f"worst-case sleeping service-manager call is {worst:g}s (2 x "
-        "service_manager.writer_lock_wait_s + sleep.ack_timeout_s + sleep.hard_cap_s + "
-        "2 x sleep.sleep_call_timeout_s + sleep.physical_confirm_timeout_s), not below "
+        f"worst-case sleeping service-manager call is {worst:g}s (writer_lock_wait_s + "
+        "sleep.ack_timeout_s + sleep.hard_cap_s + commit-lock wait + 2 x "
+        "sleep.sleep_call_timeout_s + 6 x sleep.probe_timeout_s + "
+        "sleep.physical_confirm_timeout_s + sleep.io_margin_s), not below "
         f"{name} = {call_timeout_s:g}s: the caller would time out mid-drain"
     ]
 

@@ -13,12 +13,44 @@ from uuid import uuid4
 from tre_common import rediskeys
 
 
+# Fair (first-come first-served) writer lock (review 2 P2-4). A caller that is
+# willing to wait passes a ticket (ARGV[7]); it joins the waiter queue KEYS[4]
+# (sorted by arrival) and keeps its place while it polls within ARGV[8] ms
+# (KEYS[5]: ticket -> deadline, Redis TIME). The lock is granted only to the
+# head of the queue - or, with no live waiter, to a caller without a ticket - so
+# a drained sleep's commit phase is not starved by other writers polling faster.
 _ACQUIRE_SCRIPT = r"""
+local t = redis.call('TIME')
+local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+local ticket = ARGV[7]
+local waiters = redis.call('ZRANGE', KEYS[4], 0, -1)
+for _, waiter in ipairs(waiters) do
+  local deadline = tonumber(redis.call('HGET', KEYS[5], waiter) or '0')
+  if deadline <= now then
+    redis.call('ZREM', KEYS[4], waiter)
+    redis.call('HDEL', KEYS[5], waiter)
+  end
+end
+if ticket ~= '' then
+  if not redis.call('ZSCORE', KEYS[4], ticket) then
+    redis.call('ZADD', KEYS[4], redis.call('INCR', KEYS[6]), ticket)
+  end
+  redis.call('HSET', KEYS[5], ticket, now + tonumber(ARGV[8]))
+end
+local holder = redis.call('GET', KEYS[1])
+if holder then
+  return {0, holder}
+end
+local head = redis.call('ZRANGE', KEYS[4], 0, 0)[1]
+if head and head ~= ticket then
+  return {0, 'queued:' .. head}
+end
 local token = redis.call('INCR', KEYS[2])
 local value = ARGV[1] .. ':' .. tostring(token)
-local acquired = redis.call('SET', KEYS[1], value, 'NX', 'PX', ARGV[2])
-if not acquired then
-  return {0, redis.call('GET', KEYS[1]) or ''}
+redis.call('SET', KEYS[1], value, 'PX', ARGV[2])
+if ticket ~= '' then
+  redis.call('ZREM', KEYS[4], ticket)
+  redis.call('HDEL', KEYS[5], ticket)
 end
 local record = cjson.encode({
   operation_id=ARGV[3], kind=ARGV[4], owner=ARGV[1],
@@ -27,6 +59,12 @@ local record = cjson.encode({
 })
 redis.call('HSET', KEYS[3], ARGV[3], record)
 return {token, value}
+"""
+
+_LEAVE_QUEUE_SCRIPT = r"""
+redis.call('ZREM', KEYS[1], ARGV[1])
+redis.call('HDEL', KEYS[2], ARGV[1])
+return 1
 """
 
 _RENEW_SCRIPT = r"""
@@ -204,12 +242,20 @@ class OperationCoordinator:
         *,
         owner: str,
         lease_ttl_ms: int = 30_000,
+        poll_interval_s: float = 0.1,
+        waiter_ttl_ms: int = 2_000,
     ) -> None:
         if lease_ttl_ms < 3_000:
             raise ValueError("lease_ttl_ms must be at least 3000")
+        if waiter_ttl_ms <= poll_interval_s * 1000:
+            raise ValueError("waiter_ttl_ms must exceed the poll interval")
         self._redis = redis_client
         self.owner = owner
         self.lease_ttl_ms = lease_ttl_ms
+        #: A waiting caller re-polls this often ...
+        self.poll_interval_s = float(poll_interval_s)
+        #: ... and loses its queue place when it stops polling for this long.
+        self.waiter_ttl_ms = int(waiter_ttl_ms)
         self.renew_interval_s = lease_ttl_ms / 3000.0
         self._submitted: dict[str, threading.Thread] = {}
         self._submitted_lock = threading.Lock()
@@ -271,35 +317,62 @@ class OperationCoordinator:
     def acquire(
         self, kind: str, *, request: dict | None = None, wait_s: float = 0.0
     ) -> OperationHandle:
-        """Take the writer lock; retry for up to ``wait_s`` while another writer
-        holds it (phases hold it briefly), then raise OperationBusy."""
-        deadline = time.monotonic() + max(0.0, float(wait_s))
-        while True:
-            try:
-                return self._acquire_once(kind, request=request)
-            except OperationBusy:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise
-                time.sleep(min(0.1, remaining))
+        """Take the writer lock; wait up to ``wait_s`` while another writer holds
+        it (phases hold it briefly), then raise OperationBusy. Waiters are served
+        first-come first-served (a ticket in the Redis waiter queue); a caller
+        that does not wait never jumps a queued waiter."""
+        wait_s = max(0.0, float(wait_s))
+        deadline = time.monotonic() + wait_s
+        ticket = uuid4().hex if wait_s > 0 else ""
+        try:
+            while True:
+                try:
+                    handle = self._acquire_once(kind, request=request, ticket=ticket)
+                    ticket = ""  # dequeued by the script
+                    return handle
+                except OperationBusy:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise
+                    time.sleep(min(self.poll_interval_s, remaining))
+        finally:
+            if ticket:
+                self._leave_queue(ticket)
+
+    def _leave_queue(self, ticket: str) -> None:
+        try:
+            self._redis.eval(
+                _LEAVE_QUEUE_SCRIPT,
+                2,
+                rediskeys.SM_WRITER_QUEUE_KEY,
+                rediskeys.SM_WRITER_QUEUE_DEADLINES_KEY,
+                ticket,
+            )
+        except Exception:  # its deadline expires by itself
+            pass
 
     def _acquire_once(
-        self, kind: str, *, request: dict | None = None
+        self, kind: str, *, request: dict | None = None, ticket: str = ""
     ) -> OperationHandle:
         operation_id = str(uuid4())
         started_at = _utc_now()
         result = self._redis.eval(
             _ACQUIRE_SCRIPT,
-            3,
+            6,
             rediskeys.SM_WRITER_LOCK_KEY,
             rediskeys.SM_FENCE_COUNTER_KEY,
             rediskeys.SM_OPERATIONS_KEY,
+            rediskeys.SM_WRITER_QUEUE_KEY,
+            rediskeys.SM_WRITER_QUEUE_DEADLINES_KEY,
+            rediskeys.SM_WRITER_QUEUE_SEQ_KEY,
             self.owner,
             str(self.lease_ttl_ms),
             operation_id,
             kind,
             started_at,
             json.dumps(request or {}, sort_keys=True, separators=(",", ":")),
+            ticket,
+            str(self.waiter_ttl_ms),
         )
         token = int(result[0])
         lock_value = _text(result[1])
