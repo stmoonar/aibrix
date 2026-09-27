@@ -302,3 +302,129 @@ def test_fleet_seed_endpoint():
 
     assert response.status_code == 200
     assert response.json()["added"] == REGISTRY_IDS
+
+
+# ------------------------------------------------------------------ review P2-8
+def _three_m1_registry():
+    """node-a: m1 tp1 on GPUs 0,1,2 (max_replicas 3): three distinct bindings."""
+    from tre_common.registry import ClusterTopology, ModelSpec, NodeSpec, Registry, ServiceManagerConfig, SloSpec
+
+    from sm_test_fakes import policy, trs
+
+    topology = ClusterTopology(nodes=(NodeSpec("node-a", 4, ((0, 1), (2, 3)), ("G0", "G1", "G2", "G3")),))
+    slo = SloSpec(ttft_p95_ms=1200, tpot_p95_ms=100, e2e_p95_ms=10000)
+    return Registry(
+        topology,
+        [ModelSpec("m1", "/m1", 1, 0, 3, "image", slo, trs())],
+        service_manager=ServiceManagerConfig(sleep=policy()),
+    )
+
+
+def test_seeding_observes_each_pods_actual_power():
+    from tre_sm.state.fleet_seed import seed_desired
+
+    redis, fleet = _empty_redis_fleet()
+    runtime = FakeRuntime(
+        [
+            pod("awake-pod", "m1", (0,), ip="10.0.0.1"),  # awake by probe
+            pod("probe-pod", "tp2", (0, 1), ip="10.0.0.5", state="hidden"),  # awake, SafeScale-hidden
+        ],
+        [deployment("m1", (3,))],  # a defrag-migrated binding the registry does not render
+    )
+    vllm = FakeVllm()
+    vllm.sleeping.update({"10.0.0.1": False, "10.0.0.5": False})
+
+    with fence(redis):
+        result = seed_desired(registry(), fleet, runtime_ops=runtime, vllm_ops=vllm)
+
+    assert result["added"] == ["m1/node-a/0", "m1/node-a/1", "m1/node-a/3", "tp2/node-a/0,1"]
+    by_id = {d.binding_id: (d.power, d.hidden) for d in fleet.load_desired().bindings}
+    assert by_id == {
+        "m1/node-a/0": ("awake", False),
+        "m1/node-a/1": ("sleeping", False),  # no pod
+        "m1/node-a/3": ("sleeping", False),  # Deployment only (union), no pod
+        "tp2/node-a/0,1": ("awake", True),
+    }
+
+
+def test_seeding_falls_back_to_the_annotation_when_the_probe_is_unknown():
+    from tre_sm.state.fleet_seed import seed_desired
+
+    redis, fleet = _empty_redis_fleet()
+    runtime = FakeRuntime(
+        [
+            pod("a", "m1", (0,), ip="10.0.0.1"),
+            pod("b", "m1", (1,), ip="10.0.0.2", state="sleeping"),
+        ]
+    )
+    vllm = FakeVllm()
+    vllm.physical_override.update({"10.0.0.1": None, "10.0.0.2": None})
+
+    with fence(redis):
+        seed_desired(registry(), fleet, runtime_ops=runtime, vllm_ops=vllm)
+
+    by_id = {d.binding_id: d.power for d in fleet.load_desired().bindings}
+    assert by_id["m1/node-a/0"] == "awake" and by_id["m1/node-a/1"] == "sleeping"
+
+
+def test_redis_loss_with_an_awake_fleet_reseeds_awake_and_never_mass_sleeps():
+    """Redis wiped while 3 bindings serve: the supervisor re-seeds desired from the
+    pods' actual state; no drift, no fleet repair, not a single /sleep."""
+    from tre_sm.state.supervisor import FleetSupervisor
+
+    reg = _three_m1_registry()
+    redis, fleet = _empty_redis_fleet()  # the wipe: empty desired / observed state
+    snapshots = [pod(f"m1-{g}", "m1", (g,), ip=f"10.0.0.{g + 1}") for g in range(3)]
+    runtime = FakeRuntime(snapshots, [deployment("m1", (g,)) for g in range(3)])
+    vllm = FakeVllm()
+    vllm.sleeping.update({s.pod_ip: False for s in snapshots})
+    coordinator = FakeCoordinator(redis)
+    service = ServiceManagerV2(
+        reg,
+        StateStore(LegacyRedis()),
+        runtime_ops=runtime,
+        vllm_ops=vllm,
+        operation_coordinator=coordinator,
+        safety_gate=FakeSafety(),
+        fleet_store=fleet,
+        gpu_leases=FakeLeases(),
+    )
+    runtime.list_admitted_startup_pods = lambda: []
+    runtime.list_startup_resident_snapshots = lambda: []
+    supervisor = FleetSupervisor(service, drift_observations_required=1)
+
+    for _ in range(3):
+        supervisor.run_once()
+
+    desired = {d.binding_id: d.power for d in fleet.load_desired().bindings}
+    assert desired == {f"m1/node-a/{g}": "awake" for g in range(3)}
+    assert service.detect_fleet_drift() == []
+    assert not any(call[0] == "sleep" for call in vllm.calls)
+    assert not any(kind.startswith("fleet_repair") for kind in coordinator.submitted)
+    assert service._desired_awake_binding_ids([]) == [f"m1/node-a/{g}" for g in range(3)]
+
+
+def test_fleet_repair_precheck_covers_registry_and_deployments():
+    redis, fleet = _empty_redis_fleet()
+    vllm = FakeVllm()
+    runtime = RepairRuntime(
+        vllm,
+        [deployment("m1", (0,)), deployment("m1", (1,)), deployment("tp2", (0, 1)), deployment("m1", (3,))],
+    )
+    service = ServiceManagerV2(
+        registry(),
+        StateStore(LegacyRedis()),
+        k8s_client=K8sPodClientFromOps(registry().topology(), runtime),
+        runtime_ops=runtime,
+        vllm_ops=vllm,
+        operation_coordinator=FakeCoordinator(redis),
+        safety_gate=FakeSafety(),
+        fleet_store=fleet,
+        gpu_leases=FakeLeases(),
+        sleep_journal=SleepJournal(redis),
+    )
+
+    service.start_fleet_repair()
+
+    ids = {d.binding_id for d in fleet.load_desired().bindings}
+    assert ids == set(REGISTRY_IDS) | {"m1/node-a/3"}

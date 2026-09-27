@@ -19,7 +19,7 @@ from tre_sm.ops.vllm_ops import VllmOps
 from tre_sm.state.reconcile import PodRecord
 from tre_sm.state.operations import OperationCoordinator
 from tre_sm.state.safety import ClusterSafetyGate
-from tre_sm.state.fleet_seed import seed_desired_from_registry
+from tre_sm.state.fleet_seed import seed_desired
 from tre_sm.state.fleet_store import FleetStateStore
 from tre_sm.state.gpu_leases import GpuLeaseStore
 from tre_sm.state.store import StateStore
@@ -63,6 +63,7 @@ def create_app() -> FastAPI:
         owner=os.environ.get("HOSTNAME", "tre-v2-service-manager"),
         lease_ttl_ms=int(os.environ.get("TRE_SM_WRITER_LEASE_TTL_MS", "30000")),
     )
+    vllm_ops = VllmOps()
     legacy_store = StateStore(redis_client, require_fence=True)
     fleet_store = FleetStateStore(redis_client)
     gpu_leases = GpuLeaseStore(redis_client)
@@ -78,9 +79,11 @@ def create_app() -> FastAPI:
     ]
     with operation_coordinator.operation("bootstrap_fleet_state"):
         fleet_store.bootstrap(legacy_store.load().bindings)
-        # D7: every registry binding gets a desired record (append-only), so the
-        # startup gate admits the Pods of a fresh deployment on an empty Redis.
-        seeded = seed_desired_from_registry(registry, fleet_store)
+        # D7: every registry binding (and TRE-managed Deployment) gets a desired
+        # record (append-only), so the startup gate admits the Pods of a fresh
+        # deployment on an empty Redis; existing pods are seeded with their
+        # actual power (review P2-8).
+        seeded = seed_desired(registry, fleet_store, runtime_ops=k8s_ops, vllm_ops=vllm_ops)
         if seeded["added"]:
             LOG.info("seeded desired state from registry: %s", seeded)
         gpu_leases.rebuild_awake(
@@ -102,7 +105,7 @@ def create_app() -> FastAPI:
         legacy_store,
         k8s_client=K8sPodClientFromOps(registry.topology(), k8s_ops),
         runtime_ops=k8s_ops,
-        vllm_ops=VllmOps(),
+        vllm_ops=vllm_ops,
         gpu_truth=RedisGpuTruth(redis_client),
         create_max_used_mib=int(os.environ.get("TRE_CREATE_MAX_USED_MIB", "2500")),
         sleep_leak_used_mib=int(os.environ.get("TRE_SLEEP_LEAK_USED_MIB", "8192")),

@@ -45,7 +45,7 @@ from tre_sm.state.sleep_reservations import ReservationConflict, SleepReservatio
 from tre_sm.state.reconcile import K8sPodClient, POD_STATE_AWAKE, POD_STATE_HIDDEN, POD_STATE_SLEEPING, audit_state, reconcile_state
 from tre_sm.state.operations import OperationBusy, OperationCoordinator, current_operation
 from tre_sm.state.fleet_repair import FleetRepairExecutor
-from tre_sm.state.fleet_seed import registry_binding_ids, seed_desired_from_registry
+from tre_sm.state.fleet_seed import registry_binding_ids, seed_binding_ids, seed_desired
 from tre_sm.state.fleet_store import DesiredBinding, FleetStateStore, ObservedBinding
 from tre_sm.state.safety import ClusterSafetyGate, ControllerNotPaused, NodePressureActive
 from tre_sm.state.gpu_leases import GpuLeaseConflict, GpuLeaseStore
@@ -817,9 +817,35 @@ class ServiceManagerV2:
         return self._seed_desired_unlocked()
 
     def _seed_desired_unlocked(self) -> dict:
+        """Append-only seeding (plan D7, review P2-8): registry bindings UNION
+        TRE-managed Deployments, power observed from each binding's pod."""
         if self._fleet_store is None:
             raise ValueError("desired fleet state is not configured")
-        return seed_desired_from_registry(self._registry, self._fleet_store)
+        return seed_desired(
+            self._registry,
+            self._fleet_store,
+            runtime_ops=self._runtime_ops,
+            vllm_ops=self._vllm_ops,
+        )
+
+    def _seed_binding_ids(self) -> set[str]:
+        return seed_binding_ids(self._registry, self._runtime_ops)
+
+    def ensure_desired_seeded(self) -> dict | None:
+        """Supervisor pass: re-seed desired state when bindings lack a record
+        (e.g. the Redis holding it was wiped while the SM kept running). Seeds
+        each binding from its pod's actual power, so an awake fleet stays desired
+        awake and no repair starts to put it to sleep."""
+        if self._fleet_store is None:
+            return None
+        missing = self._seed_binding_ids() - self._desired_binding_ids()
+        if not missing:
+            return None
+        with self._writer("seed_desired"):
+            result = self._seed_desired_unlocked()
+        if result.get("added"):
+            LOG.warning("desired state re-seeded (missing records): %s", result)
+        return result
 
     def _desired_binding_ids(self) -> set[str]:
         if self._fleet_store is None:
@@ -1106,6 +1132,9 @@ class ServiceManagerV2:
                 awake_binding_ids=targets,
                 desired_binding_ids=(
                     self._desired_binding_ids if self._fleet_store is not None else None
+                ),
+                required_binding_ids=(
+                    self._seed_binding_ids if self._fleet_store is not None else None
                 ),
                 reconcile=lambda strict: self._reconcile_unlocked(
                     drop_missing=strict

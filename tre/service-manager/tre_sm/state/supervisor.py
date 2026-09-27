@@ -93,6 +93,12 @@ class FleetSupervisor:
                 recover()
             except OperationBusy:
                 pass  # another writer; next pass
+        ensure_seeded = getattr(self._service, "ensure_desired_seeded", None)
+        if callable(ensure_seeded):
+            try:
+                ensure_seeded()
+            except OperationBusy:
+                pass  # another writer; next pass
         self._service.converge_startups()
         recovered = self._service.recover_stale_fleet_repairs()
         if recovered is not None:

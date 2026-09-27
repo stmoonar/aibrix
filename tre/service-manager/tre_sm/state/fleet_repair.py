@@ -65,6 +65,7 @@ class FleetRepairExecutor:
         set_binding_power: Callable[[str, bool], dict],
         audit: Callable[[], dict],
         desired_binding_ids: Callable[[], set[str]] | None = None,
+        required_binding_ids: Callable[[], set[str]] | None = None,
     ) -> None:
         deployments = self._runtime.list_model_deployments()
         if not deployments:
@@ -73,14 +74,15 @@ class FleetRepairExecutor:
         if len(by_id) != len(deployments):
             raise RuntimeError("duplicate stable binding_id in managed Deployments")
         if desired_binding_ids is not None:
-            # D7 pre-check (after seeding): every inventoried Deployment needs a
-            # desired record, or its restarted Pod is refused by the startup
-            # gate and the repair can never converge. Fail fast instead.
-            missing = sorted(set(by_id) - set(desired_binding_ids()))
+            # D7 pre-check (after seeding): every inventoried Deployment - and every
+            # binding the seeding covers (registry UNION Deployments) - needs a
+            # desired record, or its restarted Pod is refused by the startup gate
+            # and the repair can never converge. Fail fast instead.
+            required = set(by_id) | (set(required_binding_ids()) if required_binding_ids else set())
+            missing = sorted(required - set(desired_binding_ids()))
             if missing:
                 raise RuntimeError(
-                    f"desired state lacks inventory binding(s) {missing}: "
-                    "not in the registry either (seed_desired added nothing)"
+                    f"desired state lacks binding(s) {missing} after seeding"
                 )
         unknown = sorted(set(awake_binding_ids) - set(by_id))
         if unknown:

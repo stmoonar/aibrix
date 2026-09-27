@@ -264,7 +264,7 @@ def test_repair_fails_fast_when_desired_lacks_inventory_binding():
         sleep_binding=_primitive(runtime, vllm),
     )
 
-    with pytest.raises(RuntimeError, match="desired state lacks inventory"):
+    with pytest.raises(RuntimeError, match="desired state lacks binding"):
         executor.run(
             FakeOperation(),
             awake_binding_ids=[],
