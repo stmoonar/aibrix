@@ -44,7 +44,8 @@ the same ordered protocol, and callers cannot skip a step:
    roll back), then every target is committed IN PARALLEL: /sleep (``mode``
    only for vLLM versions that accept it, detected via ``GET /version``), then
    ``/is_sleeping`` is polled for all of them; the reservation keeps being
-   renewed meanwhile. Confirmed -> ``sleeping`` annotation, journal entry and
+   renewed meanwhile (a target failing either step is re-probed once by its
+   rollback, also in parallel). Confirmed -> ``sleeping`` annotation, journal entry and
    reservation released. /sleep returned but the physical state stays unknown
    -> the pod stays hidden, the journal entry stays (audit
    ``sleep_unconfirmed``); routing is never re-opened on a pod that may be
@@ -673,9 +674,14 @@ class SleepPrimitive:
         """Resolve a batch whose reservation was lost (caller holds the writer
         lock, so no other sleep can start meanwhile). Never re-acquires: a
         binding now reserved by another sleep is left to it (outcome
-        ``reservation_lost``); every other unfinished target is rolled back."""
+        ``reservation_lost``). Every other unfinished target is probed first
+        (review 3 P3): once the reservation expired another sleep may have taken
+        the binding, slept it and finished - a pod found ASLEEP is recorded
+        asleep (routing is never re-opened on it), one whose state cannot be
+        read stays hidden (``unconfirmed``), only an awake one is rolled back."""
         try:
             live = self._reservations.active()
+            unresolved: list[_PodSleep] = []
             for pod in batch.pods:
                 if pod.done or pod.outcome is not None:
                     continue
@@ -690,7 +696,29 @@ class SleepPrimitive:
                         reason=f"reservation lost; binding now reserved by {other.owner}",
                     )
                     continue
-                self._rollback_pod(batch, pod, reason="sleep reservation lost (expired)")
+                unresolved.append(pod)
+            physical = _parallel(
+                lambda pod: self._physical(pod.target) if pod.hidden and not pod.sleep_called else None,
+                unresolved,
+            )
+            for pod in unresolved:
+                reason = "sleep reservation lost (expired)"
+                if pod.hidden and not pod.sleep_called:
+                    state = physical[id(pod)]
+                    if state is True:
+                        self._finalize_slept(
+                            batch, pod, mode=None, forced=False, forced_count=0,
+                            reason=f"{reason}; found asleep (slept by another owner)",
+                            count=False,
+                        )
+                        continue
+                    if state is None:
+                        self._mark_unconfirmed(
+                            batch, pod, reason=f"{reason}; physical state unknown, left hidden"
+                        )
+                        self._release(batch, [pod])
+                        continue
+                self._rollback_pod(batch, pod, reason=reason)
         finally:
             self._unregister(batch)
         return batch.outcomes()
@@ -1076,7 +1104,9 @@ class SleepPrimitive:
                 break
             self._renew_during_commit(batch)
             clock.sleep(self._policy.poll_interval_s)
-        for pod in pending:
+        # The rollbacks re-probe each pod (_rollback_pod): run them in parallel so
+        # the phase stays bounded whatever the number of targets.
+        def resolve(pod: _PodSleep) -> None:
             if last.get(id(pod)) is None:
                 self._mark_unconfirmed(
                     batch, pod, reason="/sleep returned but /is_sleeping stayed unknown"
@@ -1087,6 +1117,8 @@ class SleepPrimitive:
                     pod,
                     reason=f"vLLM sleep did not physically converge for {pod.pod}",
                 )
+
+        _parallel(resolve, pending)
 
     def _renew_during_commit(self, batch: SleepBatch) -> None:
         """Keep the reservation alive during a long commit (the writer lock fences
@@ -1113,13 +1145,15 @@ class SleepPrimitive:
         forced: bool,
         forced_count: int,
         reason: str | None = None,
+        count: bool = True,
     ) -> None:
         self._runtime.write_binding_annotations(pod.target.binding, state=POD_STATE_SLEEPING)
         pod.done = True
         self._end_journal_if_ours(pod, batch)
         self._release(batch, [pod])
-        self._journal.incr("sleeps_total")
-        self._journal.incr(f"sleeps_path_{batch.path}")
+        if count:  # not a sleep of this batch (found asleep): no sleep counters
+            self._journal.incr("sleeps_total")
+            self._journal.incr(f"sleeps_path_{batch.path}")
         if forced:
             self._journal.incr("forced_abort_total")
             self._journal.incr("forced_abort_requests_total", forced_count)
@@ -1137,8 +1171,10 @@ class SleepPrimitive:
 
     def _mark_unconfirmed(self, batch: SleepBatch, pod: _PodSleep, *, reason: str) -> None:
         """/sleep was sent but the pod is not confirmed asleep: keep it hidden and
-        keep the journal entry (audit ``sleep_unconfirmed``; recovery resolves it)."""
-        self._journal.update(pod.pod, phase="sleep_unconfirmed", reason=reason)
+        keep the journal entry (audit ``sleep_unconfirmed``; recovery resolves it).
+        Another sleep's journal entry of the pod is never overwritten."""
+        if self._journal_is_ours(pod, batch):
+            self._journal.update(pod.pod, phase="sleep_unconfirmed", reason=reason)
         self._journal.incr("sleep_unconfirmed_total")
         pod.outcome = self._outcome(batch, pod, STATUS_UNCONFIRMED, reason=reason)
         LOG.error("sleep of %s unconfirmed, pod stays hidden: %s", pod.pod, reason)
@@ -1212,14 +1248,17 @@ class SleepPrimitive:
                 except Exception:  # expires by itself
                     LOG.exception("releasing sleep reservation of %s failed", ids)
 
-    def _end_journal_if_ours(self, pod: _PodSleep, batch: SleepBatch) -> None:
-        """End the pod's journal entry unless another sleep has written its own
-        since (the journal is keyed by pod)."""
+    def _journal_is_ours(self, pod: _PodSleep, batch: SleepBatch) -> bool:
+        """The pod's journal entry is this batch's (or there is none): another
+        sleep may have written its own since (the journal is keyed by pod)."""
         try:
             entry = self._journal.get(pod.pod) or {}
         except Exception:  # Redis read error: trust this process's own last write
             entry = self._journal.cached(pod.pod) or {}
-        if entry.get("reservation_token") in (None, batch.token):
+        return entry.get("reservation_token") in (None, batch.token)
+
+    def _end_journal_if_ours(self, pod: _PodSleep, batch: SleepBatch) -> None:
+        if self._journal_is_ours(pod, batch):
             self._journal.end(pod.pod)
 
     def _outcome(

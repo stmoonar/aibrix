@@ -288,17 +288,25 @@ class ServiceManagerConfig:
 
     def worst_case_commit_s(self) -> float:
         """The commit phase once it holds the lock (targets are committed in
-        parallel, so this does not grow with the number of targets): per target
-        ``/version`` probe + /sleep mode=wait + ``/is_sleeping`` + ``/metrics``
-        re-read + /sleep mode=abort + ``/is_sleeping``; then the physical
-        confirmation plus one overshooting probe round."""
+        parallel - sends, confirmation rounds and rollback probes alike - so this
+        does not grow with the number of targets):
+
+        * send, per target: ``/version`` probe + /sleep mode=wait +
+          ``/is_sleeping`` + ``/metrics`` re-read + /sleep mode=abort +
+          ``/is_sleeping``, and a failed send's rollback re-probes
+          ``/is_sleeping`` once (5 probes + 2 sleeps);
+        * confirmation: ``physical_confirm_timeout_s``, overshot by one poll
+          interval and one probe round, then the rollback of a pod that never
+          converged re-probes it once (review 3 P3: the rollback probe and the
+          final-round overshoot were not counted before)."""
         sleep = self.sleep
-        return (
-            4 * sleep.probe_timeout_s
-            + 2 * sleep.sleep_call_timeout_s
-            + sleep.physical_confirm_timeout_s
-            + sleep.probe_timeout_s
+        send = 5 * sleep.probe_timeout_s + 2 * sleep.sleep_call_timeout_s
+        confirm = (
+            sleep.physical_confirm_timeout_s
+            + sleep.poll_interval_s
+            + 2 * sleep.probe_timeout_s
         )
+        return send + confirm
 
     def worst_case_drain_s(self) -> float:
         """Gateway ack + drain up to the hard cap + the last poll round (engine
@@ -676,8 +684,9 @@ def sleep_call_timeout_errors(
     return [
         f"worst-case sleeping service-manager call is {worst:g}s (writer_lock_wait_s + "
         "sleep.ack_timeout_s + sleep.hard_cap_s + commit-lock wait + 2 x "
-        "sleep.sleep_call_timeout_s + 6 x sleep.probe_timeout_s + "
-        "sleep.physical_confirm_timeout_s + sleep.io_margin_s), not below "
+        "sleep.sleep_call_timeout_s + 8 x sleep.probe_timeout_s + "
+        "sleep.physical_confirm_timeout_s + sleep.poll_interval_s + "
+        "sleep.io_margin_s), not below "
         f"{name} = {call_timeout_s:g}s: the caller would time out mid-drain"
     ]
 

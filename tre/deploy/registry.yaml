@@ -222,8 +222,9 @@ service_manager:
   # Timeout clients (the controller) use for slow SM calls. Must exceed the
   # worst-case sleeping call, for any number of targets = writer_lock_wait_s +
   # sleep.ack_timeout_s + sleep.hard_cap_s + commit-lock wait + 2 x
-  # sleep.sleep_call_timeout_s + 6 x sleep.probe_timeout_s +
-  # sleep.physical_confirm_timeout_s + sleep.io_margin_s (320 s with these
+  # sleep.sleep_call_timeout_s + 8 x sleep.probe_timeout_s +
+  # sleep.physical_confirm_timeout_s + sleep.poll_interval_s +
+  # sleep.io_margin_s (330.5 s with these
   # values); validated at SM and controller start. The controller uses it
   # unless TRE_SM_SLOW_TIMEOUT_SECONDS overrides it.
   api_call_timeout_s: 360
