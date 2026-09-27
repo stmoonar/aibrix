@@ -21,6 +21,12 @@ SM_STATE_KEY = "tre:v2:sm:state"
 SM_VERSION_KEY = "tre:v2:sm:version"
 SM_WRITER_LOCK_KEY = "tre:v2:sm:writer_lock"
 SM_FENCE_COUNTER_KEY = "tre:v2:sm:fence_counter"
+# Fair writer lock (review 2 P2-4): FIFO waiter queue (zset ticket -> arrival
+# sequence), each waiter's poll deadline (hash ticket -> Redis-TIME ms) and the
+# arrival sequence counter.
+SM_WRITER_QUEUE_KEY = "tre:v2:sm:writer_queue"
+SM_WRITER_QUEUE_DEADLINES_KEY = "tre:v2:sm:writer_queue_deadlines"
+SM_WRITER_QUEUE_SEQ_KEY = "tre:v2:sm:writer_queue_seq"
 SM_OPERATIONS_KEY = "tre:v2:sm:operations"
 SM_DESIRED_KEY = "tre:v2:sm:desired"
 SM_DESIRED_VERSION_KEY = "tre:v2:sm:desired_version"

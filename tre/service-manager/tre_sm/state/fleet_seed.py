@@ -11,12 +11,17 @@ cannot undo an operator's or the controller's intent.
   the model Deployments) UNION the TRE-managed Deployments that exist (a
   defrag-migrated binding lives on a slot the registry rendering does not
   list).
-* **Power** comes from the pod's actual state when a pod exists: the physical
-  ``/is_sleeping`` probe, else the ``tre.aibrix.io/state`` annotation. An awake
-  pod is seeded ``awake`` (hidden if its annotation says hidden), so re-seeding
-  after a Redis loss never turns a serving fleet into "desired asleep" (which a
-  fleet repair would then act on). Only a binding with no pod, or an asleep
-  pod, is seeded ``sleeping``.
+* **Power** comes from the pod's actual state only when that state can be
+  trusted (review 2 P1-3): the pod passed the startup gate and its admission
+  converged (no pending ``startup-admitted-uid``), it is Ready, and the physical
+  ``/is_sleeping`` probe answers. Then an awake pod is seeded ``awake`` (hidden
+  if its annotation says hidden), so re-seeding after a Redis loss never turns
+  a serving fleet into "desired asleep" (which a fleet repair would then act
+  on). Everything else - no pod, a pod waiting at the gate (its template
+  annotation says ``hidden`` although vLLM never ran), not Ready, an admission
+  still converging, or a probe that does not answer - is seeded ``sleeping``
+  (resident), the safe default: it never claims a GPU for a pod nobody saw
+  awake.
 """
 
 from __future__ import annotations
@@ -28,7 +33,10 @@ from tre_common.bindings import BindingSpec, render_binding_set
 from tre_common.registry import Registry
 from tre_sm.allocator.topology import GPU_IDS_ANNOTATION, STATE_ANNOTATION
 from tre_sm.state.fleet_store import DesiredBinding, FleetStateStore
-from tre_sm.state.reconcile import POD_STATE_HIDDEN, POD_STATE_SLEEPING
+from tre_sm.state.reconcile import POD_STATE_HIDDEN
+
+#: Set by the startup gate's admission, cleared once the admission converged.
+STARTUP_ADMITTED_ANNOTATION = "tre.aibrix.io/startup-admitted-uid"
 
 SEED_UPDATED_BY = "registry-seed"
 SEED_REASON = "registry_seed"
@@ -79,7 +87,10 @@ def seed_binding_ids(registry: Registry, runtime_ops=None) -> set[str]:
 
 
 def pod_state_observer(runtime_ops, vllm_ops=None, *, port: int = 8000) -> Observer | None:
-    """Observer from the pods' annotations plus the physical /is_sleeping probe."""
+    """Observer of the pods' trusted power: ("awake", hidden) only for a Pod past
+    the startup gate (admission converged), Ready, whose /is_sleeping probe
+    answers False; ("sleeping", False) for a Pod that exists but is not trusted
+    or is asleep; None when the binding has no Pod."""
     lister = getattr(runtime_ops, "list_pod_snapshots", None)
     if not callable(lister):
         return None
@@ -96,18 +107,22 @@ def pod_state_observer(runtime_ops, vllm_ops=None, *, port: int = 8000) -> Obser
         snapshot = by_binding.get(binding_id)
         if snapshot is None:
             return None
-        state = snapshot.annotations.get(STATE_ANNOTATION)
+        if snapshot.annotations.get(STARTUP_ADMITTED_ANNOTATION):
+            # Still inside the startup protocol: convergence decides its power.
+            return ("sleeping", False)
+        if not getattr(snapshot, "ready", False) or not getattr(snapshot, "pod_ip", None):
+            # Waiting at the gate (or not serving): vLLM never ran / is not up.
+            return ("sleeping", False)
         physical = None
-        if callable(probe) and getattr(snapshot, "pod_ip", None):
+        if callable(probe):
             try:
                 physical = probe(snapshot.pod_ip, port=port)
             except Exception:
                 physical = None
-        if physical is None:
-            physical = state == POD_STATE_SLEEPING if state is not None else None
-        if physical is None or physical:
-            return ("sleeping", False) if physical else None
-        return ("awake", state == POD_STATE_HIDDEN)
+        if physical is not False:
+            # Asleep, or unknown (the annotation is never trusted on its own).
+            return ("sleeping", False)
+        return ("awake", snapshot.annotations.get(STATE_ANNOTATION) == POD_STATE_HIDDEN)
 
     return observe
 

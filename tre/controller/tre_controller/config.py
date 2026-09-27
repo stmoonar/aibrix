@@ -142,6 +142,13 @@ class ControllerConfig:
     gateway_stats_urls: tuple[str, ...] = ()
     gateway_route_namespace: str = "tre-v2"
     gateway_stats_timeout_s: float = 1.0
+    # Review 2 P1-2 / P2-5: a one-shot action (SafeScale commit / rollback) that fails
+    # retriably (SM 409 / 503 / timeout) is retried with exponential backoff
+    # TRE_ONESHOT_RETRY_BASE_SECONDS * 2^n capped at TRE_ONESHOT_RETRY_MAX_SECONDS, at
+    # most TRE_ONESHOT_RETRY_MAX_ATTEMPTS attempts in total, then abandoned (logged).
+    oneshot_retry_max_attempts: int = 6
+    oneshot_retry_base_s: float = 2.0
+    oneshot_retry_max_s: float = 30.0
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "ControllerConfig":
@@ -330,6 +337,9 @@ class ControllerConfig:
             ),
             gateway_route_namespace=_get_str(values, "TRE_GATEWAY_ROUTE_NAMESPACE", "tre-v2"),
             gateway_stats_timeout_s=_get_positive_float(values, "TRE_GATEWAY_STATS_TIMEOUT_SECONDS", 1.0),
+            oneshot_retry_max_attempts=_get_positive_int(values, "TRE_ONESHOT_RETRY_MAX_ATTEMPTS", 6),
+            oneshot_retry_base_s=_get_positive_float(values, "TRE_ONESHOT_RETRY_BASE_SECONDS", 2.0),
+            oneshot_retry_max_s=_get_positive_float(values, "TRE_ONESHOT_RETRY_MAX_SECONDS", 30.0),
         )
 
 

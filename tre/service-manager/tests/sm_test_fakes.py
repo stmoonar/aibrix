@@ -160,9 +160,7 @@ class FakeRedis:
                 bucket.pop(field_name)
             elif record["token"] != token:
                 for w in wanted:
-                    if record["binding_id"] == w["id"] or (
-                        record["node"] == w["node"] and set(record["gpu_ids"]) & set(w["gpus"])
-                    ):
+                    if record["binding_id"] == w["id"]:
                         return [0, record["binding_id"]]
         expires = self.now_ms + ttl_ms
         for w in wanted:

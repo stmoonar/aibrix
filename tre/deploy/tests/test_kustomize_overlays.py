@@ -88,9 +88,10 @@ def test_tre_v2_overlay_declares_components_and_independent_redis() -> None:
     # Review P1-2: single writer across rollouts, and a grace period derived from
     # the registry sleep policy (a sleep past /sleep finishes; drains roll back).
     assert sm["spec"]["strategy"] == {"type": "Recreate"}
-    sleep = load_registry(str(DEPLOY_ROOT / "registry.yaml")).service_manager().sleep
+    sm_config = load_registry(str(DEPLOY_ROOT / "registry.yaml")).service_manager()
     grace = sm["spec"]["template"]["spec"]["terminationGracePeriodSeconds"]
-    assert grace >= sleep.hard_cap_s + 2 * sleep.sleep_call_timeout_s + sleep.physical_confirm_timeout_s
+    # Review 2 P2-2: the SIGTERM wait is computed from the same time budget.
+    assert grace > sm_config.shutdown_timeout_s()
     assert sm_container["readinessProbe"]["httpGet"] == {
         "path": "/healthz",
         "port": "http",

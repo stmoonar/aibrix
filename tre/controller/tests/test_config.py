@@ -302,7 +302,7 @@ def test_sm_call_timeout_defaults_to_the_registry_and_must_outlast_a_sleep() -> 
     from tre_controller.app import resolve_sm_call_timeout_s
 
     registry = Registry(ClusterTopology(nodes=()), [], service_manager=parse_service_manager_config(None))
-    assert resolve_sm_call_timeout_s(SimpleNamespace(sm_slow_timeout_s=None), registry) == 300.0
+    assert resolve_sm_call_timeout_s(SimpleNamespace(sm_slow_timeout_s=None), registry) == 360.0
     assert resolve_sm_call_timeout_s(SimpleNamespace(sm_slow_timeout_s=400.0), registry) == 400.0
     with pytest.raises(ValueError, match="TRE_SM_SLOW_TIMEOUT_SECONDS = 120s"):
         resolve_sm_call_timeout_s(SimpleNamespace(sm_slow_timeout_s=120.0), registry)
@@ -311,5 +311,5 @@ def test_sm_call_timeout_defaults_to_the_registry_and_must_outlast_a_sleep() -> 
         [],
         service_manager=parse_service_manager_config({"sleep": {"sleep_call_timeout_s": 120}}),
     )
-    with pytest.raises(ValueError, match="api_call_timeout_s = 300s"):
+    with pytest.raises(ValueError, match="api_call_timeout_s = 360s"):
         resolve_sm_call_timeout_s(SimpleNamespace(sm_slow_timeout_s=None), slow)

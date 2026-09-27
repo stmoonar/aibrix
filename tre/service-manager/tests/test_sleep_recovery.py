@@ -89,8 +89,8 @@ class World:
         return self.runtime.snapshots[name].annotations["tre.aibrix.io/state"]
 
 
-@pytest.mark.parametrize("phase", ["hiding", "awaiting_ack", "draining", "drained", "drain_budget_spent", "sleeping"])
-def test_bootstrap_rolls_back_an_awake_pod_from_any_phase(phase):
+@pytest.mark.parametrize("phase", ["hiding", "awaiting_ack", "draining", "drained", "drain_budget_spent"])
+def test_bootstrap_rolls_back_an_awake_pod_from_any_phase_before_sleep(phase):
     hidden = pod("pod-a", "m1", (0,), ip="10.0.0.1", state="hidden")
     world = World([hidden], [_desired("m1/node-a/0", "m1", (0,), "sleeping")], physical={"10.0.0.1": False})
     world.left_over("pod-a", "m1/node-a/0", phase=phase)
@@ -251,3 +251,37 @@ def test_audit_ignores_journal_entries_that_change_between_its_reads():
 
     assert "sleep_operation_orphaned" not in codes
     assert "hidden_without_operation" not in codes
+
+
+@pytest.mark.parametrize("phase", ["sleeping", "sleep_unconfirmed"])
+def test_after_sleep_was_sent_one_awake_read_does_not_reopen_routing(phase):
+    """Review 2 P3: a mode=wait /sleep may still be running; routing is restored
+    only after two awake reads more than sleep_call_timeout_s apart."""
+    hidden = pod("pod-a", "m1", (0,), ip="10.0.0.1", state="hidden")
+    world = World([hidden], [_desired("m1/node-a/0", "m1", (0,), "awake")], physical={"10.0.0.1": False})
+    world.left_over("pod-a", "m1/node-a/0", phase=phase)
+
+    first = world.service.recover_sleep_journal()
+    assert first == {"resolved": [], "kept": [{"serve_id": "pod-a", "result": "awake_but_sleep_may_be_running"}]}
+    assert world.state("pod-a") == "hidden"
+
+    world.redis.now_ms += 30_000  # < sleep_call_timeout_s (60 s in the test policy)
+    assert world.service.recover_sleep_journal()["resolved"] == []
+    assert world.state("pod-a") == "hidden"
+
+    world.redis.now_ms += 31_000
+    assert world.service.recover_sleep_journal()["resolved"] == [
+        {"serve_id": "pod-a", "result": "rolled_back_to_awake"}
+    ]
+    assert world.state("pod-a") == "awake"
+
+
+def test_a_pod_found_asleep_records_the_requests_desired_power():
+    hidden = pod("pod-a", "m1", (0,), ip="10.0.0.1", state="hidden")
+    world = World([hidden], [_desired("m1/node-a/0", "m1", (0,), "awake")], physical={"10.0.0.1": True})
+    world.left_over("pod-a", "m1/node-a/0", phase="sleep_unconfirmed")
+    world.journal.update("pod-a", desired_on_sleep="sleeping")
+
+    world.service.recover_sleep_journal()
+
+    assert {d.binding_id: d.power for d in world.fleet.load_desired().bindings} == {"m1/node-a/0": "sleeping"}

@@ -189,6 +189,7 @@ def run_planner_tick(
         cluster_view=cluster_view,
         cooldowns=_action_cooldowns(snapshot, queue) if action_cooldown else None,
         probe_backoff_models=_probe_backoff_models(safescale, snapshot.ts_ms),
+        preemptible_models=_preemptible_models(queue) if rescue_due else None,
     )
     if _prof_on:
         _plan_ns = time.perf_counter_ns() - _phase_t0
@@ -234,6 +235,12 @@ def run_planner_tick(
         model_contexts=contexts,
         classifications={item.model_name: item for item in classifications},
     )
+
+
+def _preemptible_models(queue: PlannerQueue) -> set[str]:
+    """Models a rescue action may preempt in the queue (review 3 P2-3)."""
+    preemptible = getattr(queue, "preemptible_models", None)
+    return set(preemptible()) if callable(preemptible) else set()
 
 
 def _probe_backoff_models(safescale: SafeScaleController | None, now_ms: int) -> set[str]:

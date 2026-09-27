@@ -2,13 +2,45 @@ from __future__ import annotations
 
 import asyncio
 import json
+import socket
 from typing import Any, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+#: HTTP statuses of the SM that mean "try again later" (review 2 P2-5): 409 = writer
+#: lock busy / sleep reservation / drain rolled back, 503 = shutting down.
+RETRIABLE_STATUSES = frozenset({409, 503})
+
 
 class ServiceManagerError(Exception):
-    pass
+    """An SM call failed. ``retriable``: a conflict / busy (409), shutting down
+    (503), a timeout or a connection error - the same call may succeed later.
+    Anything else (400 invalid request, 404, 5xx, a malformed answer) is permanent."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status: int | None = None,
+        timeout: bool = False,
+        transport: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.status = status
+        self.timeout = timeout
+        self.transport = transport
+
+    @property
+    def retriable(self) -> bool:
+        return self.timeout or self.transport or self.status in RETRIABLE_STATUSES
+
+    def result(self) -> dict:
+        return {
+            "ok": False,
+            "error": str(self),
+            "status": self.status,
+            "retriable": self.retriable,
+        }
 
 
 class AsyncTransport(Protocol):
@@ -44,7 +76,7 @@ class ServiceManagerClient:
         try:
             return {"ok": True, "response": await self.get_state()}
         except ServiceManagerError as exc:
-            return {"ok": False, "error": str(exc)}
+            return exc.result()
 
     async def scale_model(
         self,
@@ -54,12 +86,13 @@ class ServiceManagerClient:
         sleep_path: str | None = None,
         drain_budget_s: float | None = None,
     ) -> dict:
+        """RELATIVE scale (current awake + ``delta``, read at dispatch). Not
+        idempotent: callers never retry it (review 3 P2-1) - a retried upscale
+        uses :meth:`scale_model_to` with an absolute target."""
         try:
-            state = await self.get_state()
-            counts = state.get("models", {}).get(model, {})
-            current = int(counts.get("awake", 0))
-            bound = int(counts.get("bound", 0))
-            serving_floor = 1 if bound > 0 and current > 0 and int(delta) < 0 else 0
+            counts = await self._model_counts(model)
+            current = counts["awake"]
+            serving_floor = 1 if counts["bound"] > 0 and current > 0 and int(delta) < 0 else 0
             target = max(serving_floor, current + int(delta))
             payload: dict = {"wake_replicas": target}
             payload.update(_sleep_fields(sleep_path, drain_budget_s))
@@ -68,7 +101,49 @@ class ServiceManagerClient:
             )
             return {"ok": True, "response": response}
         except ServiceManagerError as exc:
-            return {"ok": False, "error": str(exc)}
+            return exc.result()
+
+    async def scale_model_to(self, model: str, target: int) -> dict:
+        """Grow ``model`` to at least ``target`` awake replicas (absolute and
+        grow-only, review 3 P2-1): re-sending it after a success that timed out
+        on the client is a no-op, and it never shrinks a model that meanwhile grew
+        past the target. The SM applies ``at_least`` under its writer lock; the
+        pre-check also keeps a service-manager without ``at_least`` from shrinking."""
+        try:
+            target = int(target)
+            counts = await self._model_counts(model)
+            if counts["awake"] >= target:
+                return {"ok": True, "response": {"model": model, "wake_replicas": target, "actions": [], "noop": True}}
+            response = await self._request(
+                "PUT",
+                f"/v2/models/{model}/target",
+                json={"wake_replicas": target, "at_least": True},
+                timeout_s=self._slow_timeout_s,
+            )
+            return {"ok": True, "response": response}
+        except ServiceManagerError as exc:
+            return exc.result()
+
+    async def model_awake(self, model: str) -> dict:
+        """{"ok": True, "awake": n} from the SM state, or a failed result."""
+        try:
+            counts = await self._model_counts(model)
+            return {"ok": True, "awake": counts["awake"]}
+        except ServiceManagerError as exc:
+            return exc.result()
+
+    async def _model_counts(self, model: str) -> dict[str, int]:
+        """Awake / bound counts of ``model`` from GET /v2/state. A malformed
+        answer is a (permanent) ServiceManagerError, never a raw exception."""
+        state = await self.get_state()
+        models = state.get("models", {})
+        counts = models.get(model, {}) if isinstance(models, dict) else None
+        if not isinstance(counts, dict):
+            raise ServiceManagerError(f"malformed /v2/state for {model}: models entry is not an object")
+        try:
+            return {"awake": int(counts.get("awake", 0)), "bound": int(counts.get("bound", 0))}
+        except (TypeError, ValueError) as exc:
+            raise ServiceManagerError(f"malformed /v2/state counts for {model}: {counts!r}") from exc
 
     async def set_binding_power(
         self,
@@ -89,7 +164,7 @@ class ServiceManagerClient:
             )
             return {"ok": True, "response": response}
         except ServiceManagerError as exc:
-            return {"ok": False, "error": str(exc)}
+            return exc.result()
 
     async def set_routable(self, model: str, hidden_pods: tuple[str, ...]) -> dict:
         try:
@@ -100,7 +175,7 @@ class ServiceManagerClient:
             )
             return {"ok": True, "response": response}
         except ServiceManagerError as exc:
-            return {"ok": False, "error": str(exc)}
+            return exc.result()
 
     async def defrag(self, migrations: tuple) -> dict:
         del migrations
@@ -110,9 +185,14 @@ class ServiceManagerClient:
             )
             return {"ok": True, "response": response}
         except ServiceManagerError as exc:
-            if "HTTP 404" in str(exc):
-                return {"ok": False, "error": "defrag endpoint is not implemented in service-manager v2"}
-            return {"ok": False, "error": str(exc)}
+            if exc.status == 404 or "HTTP 404" in str(exc):
+                return {
+                    "ok": False,
+                    "error": "defrag endpoint is not implemented in service-manager v2",
+                    "status": 404,
+                    "retriable": False,
+                }
+            return exc.result()
 
     async def _request(self, method: str, path: str, *, json: dict | None = None, timeout_s: float | None = None) -> dict:
         url = f"{self._base_url}{path}"
@@ -122,8 +202,11 @@ class ServiceManagerClient:
             )
         except ServiceManagerError:
             raise
+        except (TimeoutError, asyncio.TimeoutError, socket.timeout) as exc:
+            raise ServiceManagerError(f"request timed out: {exc}", timeout=True) from exc
         except Exception as exc:
-            raise ServiceManagerError(str(exc)) from exc
+            # A transport failure (connection refused / reset while the SM restarts).
+            raise ServiceManagerError(str(exc), transport=True) from exc
         if not isinstance(response, dict):
             raise ServiceManagerError("service-manager response must be a JSON object")
         return response
@@ -150,11 +233,14 @@ def _request_json(method: str, url: str, payload: dict | None, timeout_s: float)
             data = response.read()
     except HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
-        raise ServiceManagerError(f"HTTP {exc.code}: {detail}") from exc
+        raise ServiceManagerError(f"HTTP {exc.code}: {detail}", status=int(exc.code)) from exc
     except URLError as exc:
-        raise ServiceManagerError(str(exc.reason)) from exc
-    except TimeoutError as exc:
-        raise ServiceManagerError("request timed out") from exc
+        timed_out = isinstance(exc.reason, (TimeoutError, socket.timeout))
+        raise ServiceManagerError(
+            str(exc.reason), timeout=timed_out, transport=not timed_out
+        ) from exc
+    except (TimeoutError, socket.timeout) as exc:
+        raise ServiceManagerError("request timed out", timeout=True) from exc
 
     if not data:
         return {}

@@ -16,6 +16,7 @@ from tre_controller.loops.tick import (
     run_planner_tick,
 )
 from tre_controller.planning.planner import ClusterView, IncompletePolicy
+from tre_controller.loops.model_state_box import ModelStateBox
 from tre_controller.signals.trs import SignalState
 
 if False:  # TYPE_CHECKING guard without importing typing symbol here
@@ -96,6 +97,7 @@ async def rescue_task(
     safescale: SafeScaleController | None = None,
     signal_state: SignalState | None = None,
     prof: "TickProfiler | None" = None,
+    model_state_box: "ModelStateBox | None" = None,
 ) -> None:
     paper_state_cache = PaperStateCache(max_stale_windows=getattr(cfg, "paper_stale_max_windows", 3))
     while True:
@@ -122,6 +124,9 @@ async def rescue_task(
                     prof=prof,
                     action_cooldown=getattr(cfg, "action_cooldown", True),
                 )
+            if model_state_box is not None and result.classifications:
+                # Review 3: the latest signal state, for the queue's commit revalidation.
+                model_state_box.update(result.classifications, result.model_contexts, ts_ms=snapshot.ts_ms)
             if decision_writer is not None:
                 if prof is not None:
                     _dw_t0 = time.perf_counter_ns()

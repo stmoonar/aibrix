@@ -215,16 +215,22 @@ data:
     # so restart it afterwards (kubectl -n tre-v2 rollout restart
     # deploy/tre-v2-service-manager).
     service_manager:
-      # A request that needs the SM writer lock waits up to this long for it. The lock
-      # is held only for short phases (hide, commit); a drain runs outside it.
+      # A request that needs the SM writer lock waits up to this long for it (waiters
+      # are served first-come first-served). The lock is held only for short phases
+      # (hide, commit); a drain runs outside it.
       writer_lock_wait_s: 10
+      # How long the commit phase of a drained sleep waits for the writer lock
+      # (null = writer_lock_wait_s); the sleep reservation must outlive it.
+      commit_lock_wait_s: null
       # Timeout clients (the controller) use for slow SM calls. Must exceed the
-      # worst-case sleeping call = 2 x writer_lock_wait_s + sleep.ack_timeout_s +
-      # sleep.hard_cap_s + 2 x sleep.sleep_call_timeout_s +
-      # sleep.physical_confirm_timeout_s (285 s with these defaults); validated at
-      # SM and controller start. The controller uses it unless
-      # TRE_SM_SLOW_TIMEOUT_SECONDS overrides it.
-      api_call_timeout_s: 300
+      # worst-case sleeping call, for any number of targets = writer_lock_wait_s +
+      # sleep.ack_timeout_s + sleep.hard_cap_s + commit-lock wait + 2 x
+      # sleep.sleep_call_timeout_s + 8 x sleep.probe_timeout_s +
+      # sleep.physical_confirm_timeout_s + sleep.poll_interval_s +
+      # sleep.io_margin_s (330.5 s with these
+      # values); validated at SM and controller start. The controller uses it
+      # unless TRE_SM_SLOW_TIMEOUT_SECONDS overrides it.
+      api_call_timeout_s: 360
       sleep:
         # Every sleep runs hide (routable=false + route-gen bump) -> gateway plugin ack
         # -> drain -> /sleep (D1/D2); no caller can skip a step.
@@ -246,6 +252,11 @@ data:
         # HTTP timeout of one /sleep call (weight offload); a failed mode=wait is
         # retried once with mode=abort.
         sleep_call_timeout_s: 45
+        # HTTP timeout of the other vLLM probes of a sleep (/metrics, /version,
+        # /is_sleeping). Targets are probed and committed in parallel.
+        probe_timeout_s: 5
+        # Allowance for Redis / Kubernetes calls in the worst-case call duration.
+        io_margin_s: 5
         # After /sleep, wait this long for /is_sleeping to report true. Still unknown
         # then: the pod stays hidden, the journal entry stays, the audit reports it.
         physical_confirm_timeout_s: 15
@@ -255,8 +266,10 @@ data:
         vllm_sleep_mode_param: auto
         # Absolute drain cap. null = gateway.route_timeout_s (may not exceed it).
         hard_cap_s: null
-        # TTL of the per-binding reservation that fences a draining binding and its
-        # GPUs while the drain runs outside the writer lock (renewed every poll).
+        # TTL of the per-binding reservation that fences a draining binding while the
+        # drain runs outside the writer lock (renewed every poll and during the
+        # commit). Must exceed commit-lock wait + poll_interval_s + probe_timeout_s +
+        # io_margin_s (validated); a lost reservation rolls the sleep back.
         reservation_ttl_s: 30
         # Plugin instances that must ack = advancing heartbeats UNION Ready pods
         # matching this selector: a plugin with Redis trouble may still route while

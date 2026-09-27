@@ -63,7 +63,9 @@ def create_app() -> FastAPI:
         owner=os.environ.get("HOSTNAME", "tre-v2-service-manager"),
         lease_ttl_ms=int(os.environ.get("TRE_SM_WRITER_LEASE_TTL_MS", "30000")),
     )
-    vllm_ops = VllmOps()
+    # Every vLLM probe of a sleep uses the registry's probe timeout: it is part of
+    # the worst-case call duration the SM and the controller validate.
+    vllm_ops = VllmOps(timeout_s=sm_config.sleep.probe_timeout_s)
     legacy_store = StateStore(redis_client, require_fence=True)
     fleet_store = FleetStateStore(redis_client)
     gpu_leases = GpuLeaseStore(redis_client)

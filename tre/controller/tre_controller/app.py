@@ -8,13 +8,20 @@ from tre_common.registry import Registry, load_registry, sleep_call_timeout_erro
 from tre_controller.config import ControllerConfig
 from tre_controller.gateway_cadence import check_gateway_cadence
 from tre_controller.gateway_health import EnvoyStatsSource
-from tre_controller.loops.action_queue import ActionQueue
+from tre_controller.loops.action_queue import (
+    ActionQueue,
+    RetryPolicy,
+    revalidate_commit_from_signals,
+    revalidate_from_cluster_view,
+    slot_lookup_from_cluster_view,
+)
 from tre_controller.mode import ObserveModeGate
 from tre_controller.reconcile.hidden_orphans import HiddenOrphanDetector
 from tre_controller.profiling import TickProfiler, build_profiler
 from tre_controller.loops.cluster_view_task import ClusterViewBox, cluster_view_task
 from tre_controller.loops.decision_snapshot import DecisionSnapshotWriter
 from tre_controller.loops.fairness_task import fairness_task
+from tre_controller.loops.model_state_box import ModelStateBox
 from tre_controller.loops.metrics_task import MetricsTaskConfig, SnapshotBox, SnapshotStore, metrics_task
 from tre_controller.loops.rescue_task import rescue_task
 from tre_controller.loops.safescale_task import safescale_task
@@ -44,6 +51,8 @@ class ControllerDependencies:
     hidden_orphan_detector: "HiddenOrphanDetector | None" = None
     # A13 donor-health guard source (None when TRE_GATEWAY_STATS_URL is unset).
     gateway_health: "EnvoyStatsSource | None" = None
+    # Review 3: latest per-model signal state (planner ticks -> commit revalidation).
+    model_state_box: "ModelStateBox | None" = None
 
 
 @dataclass(frozen=True)
@@ -89,6 +98,7 @@ def build_controller_task_specs(
                     safescale=deps.safescale,
                     signal_state=deps.signal_state,
                     prof=deps.profiler,
+                    model_state_box=deps.model_state_box,
                 ),
             )
         )
@@ -106,6 +116,7 @@ def build_controller_task_specs(
                 safescale=deps.safescale,
                 signal_state=deps.signal_state,
                 prof=deps.profiler,
+                model_state_box=deps.model_state_box,
             ),
         )
     )
@@ -198,12 +209,32 @@ def create_controller_dependencies(
     safescale.restore()
     observe_gate = ObserveModeGate(redis_client)
     profiler = build_profiler(cfg, redis_client)
+    cluster_view_box = ClusterViewBox()
+    model_state_box = ModelStateBox()
     return ControllerDependencies(
         store=store,
         snapshot_box=SnapshotBox(),
-        queue=ActionQueue(sm_client, is_observe=observe_gate.is_observe, prof=profiler),
+        queue=ActionQueue(
+            sm_client,
+            is_observe=observe_gate.is_observe,
+            prof=profiler,
+            retry=RetryPolicy(
+                max_attempts=int(getattr(cfg, "oneshot_retry_max_attempts", 6)),
+                base_backoff_s=float(getattr(cfg, "oneshot_retry_base_s", 2.0)),
+                max_backoff_s=float(getattr(cfg, "oneshot_retry_max_s", 30.0)),
+            ),
+            # One-shot retries re-check the latest cluster view; actions on a shared
+            # GPU are serialized (review 2 P1-1 / P1-2).
+            revalidate=revalidate_from_cluster_view(cluster_view_box.get),
+            # Review 3: a SafeScale commit is revalidated on the current signal state
+            # (donor needing capacity -> unhide instead; receiver no longer needing it
+            # -> upscale dropped) before every (re)try.
+            revalidate_commit=revalidate_commit_from_signals(model_state_box.get, cluster_view_box.get),
+            slot_of=slot_lookup_from_cluster_view(cluster_view_box.get),
+        ),
+        model_state_box=model_state_box,
         sm_client=sm_client,
-        cluster_view_box=ClusterViewBox(),
+        cluster_view_box=cluster_view_box,
         decision_writer=DecisionSnapshotWriter(redis_client),
         safescale=safescale,
         registry=registry,
@@ -271,4 +302,11 @@ def _create_redis_client(redis_url: str, redis_client_factory: RedisClientFactor
 
 
 async def run_controller(deps: ControllerDependencies, cfg: MetricsTaskConfig) -> None:
-    await asyncio.gather(*(spec.factory() for spec in build_controller_task_specs(deps, cfg)))
+    try:
+        await asyncio.gather(*(spec.factory() for spec in build_controller_task_specs(deps, cfg)))
+    finally:
+        # Shutdown (or a crashed loop): cancel SM dispatches still in flight
+        # instead of leaving orphaned tasks behind (review 2 P3).
+        shutdown = getattr(deps.queue, "shutdown", None)
+        if callable(shutdown):
+            await shutdown()
