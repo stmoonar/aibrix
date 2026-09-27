@@ -1,0 +1,261 @@
+"""Every sleep path goes through the sleep primitive (plan 2026-09-27 D1/D2)."""
+
+import ast
+from datetime import datetime, timezone
+from pathlib import Path
+
+import pytest
+from fastapi.testclient import TestClient
+
+from tre_sm.allocator.slots import Binding, Migration, Slot
+from tre_sm.api.v2 import ServiceManagerV2, create_app
+from tre_sm.ops.sleep_primitive import SleepPrimitive
+from tre_sm.state.fleet_repair import FleetRepairExecutor
+from tre_sm.state.fleet_store import DesiredBinding, FleetStateStore
+from tre_sm.state.store import StateStore
+
+from sm_test_fakes import (
+    FakeCoordinator,
+    FakeLeases,
+    FakeRedis,
+    FakeRuntime,
+    FakeSafety,
+    FakeVllm,
+    LegacyRedis,
+    binding_of,
+    deployment,
+    fence,
+    pod,
+    registry,
+    startup_pod,
+)
+
+TRE_SM = Path(__file__).resolve().parents[1] / "tre_sm"
+PRIMITIVE = TRE_SM / "ops" / "sleep_primitive.py"
+
+
+def test_only_the_sleep_primitive_calls_vllm_sleep():
+    """Static guard: no module but the primitive may POST /sleep (plan D2)."""
+    offenders = []
+    for path in sorted(TRE_SM.rglob("*.py")):
+        if path == PRIMITIVE:
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "sleep"
+                and "vllm" in ast.unparse(node.func.value).lower()
+            ):
+                offenders.append(f"{path.relative_to(TRE_SM)}:{node.lineno}")
+    assert offenders == []
+
+
+def test_primitive_does_call_vllm_sleep():
+    source = PRIMITIVE.read_text(encoding="utf-8")
+    assert "self._vllm.sleep(" in source
+
+
+def test_fleet_repair_cannot_be_built_without_the_sleep_primitive():
+    with pytest.raises(TypeError, match="sleep_binding"):
+        FleetRepairExecutor(runtime_ops=object(), vllm_ops=object(), safety_gate=object())
+
+
+class Harness:
+    def __init__(self, snapshots, *, desired=None, deployments=()):
+        self.redis = FakeRedis()
+        self.runtime = FakeRuntime(snapshots, deployments)
+        self.events = []
+        self.runtime.events = self.events
+        self.vllm = FakeVllm()
+        self.vllm.events = self.events
+        for snapshot in snapshots:
+            self.vllm.sleeping[snapshot.pod_ip] = snapshot.annotations["tre.aibrix.io/state"] == "sleeping"
+        self.store = StateStore(LegacyRedis())
+        self.store.save([binding_of(s) for s in snapshots], expected_version=0)
+        self.fleet = FleetStateStore(self.redis)
+        if desired is not None:
+            with fence(self.redis):
+                self.fleet.save_desired(desired, expected_version=0)
+        self.coordinator = FakeCoordinator(self.redis)
+        self.leases = FakeLeases()
+        self.service = ServiceManagerV2(
+            registry(),
+            self.store,
+            runtime_ops=self.runtime,
+            vllm_ops=self.vllm,
+            operation_coordinator=self.coordinator,
+            safety_gate=FakeSafety(),
+            fleet_store=self.fleet,
+            gpu_leases=self.leases,
+        )
+        self.paths = []
+        original = SleepPrimitive.sleep
+        paths = self.paths
+
+        def spy(primitive, targets, *, path, drain_budget_s=None):
+            paths.append((path, drain_budget_s, [t.binding.serve_id for t in targets]))
+            return original(primitive, targets, path=path, drain_budget_s=drain_budget_s)
+
+        self.service._sleep_primitive.sleep = spy.__get__(self.service._sleep_primitive)
+
+    def assert_hidden_before_every_sleep(self):
+        hidden = set()
+        sleeps = 0
+        for event in self.events:
+            if event[0] == "patch" and event[2] == "hidden":
+                hidden.add(event[1])
+            if event[:2] == ("vllm", "sleep"):
+                sleeps += 1
+                ip = event[2]
+                owner = next(s.name for s in self.runtime.snapshots.values() if s.pod_ip == ip)
+                assert owner in hidden, f"{owner} slept without a prior hide"
+                assert event[4] is True  # X-TRE-Hidden
+        assert sleeps > 0
+
+
+def _desired(binding_id, model, gpus, power, *, hidden=False):
+    now = datetime.now(timezone.utc).isoformat()
+    return DesiredBinding(binding_id, model, "node-a", tuple(gpus), "resident", power, hidden, 1, now, "t", "t")
+
+
+def _two_awake():
+    return [pod("pod-a", "m1", (0,), ip="10.0.0.1"), pod("pod-b", "m1", (1,), ip="10.0.0.2")]
+
+
+def _desired_two_awake():
+    return [_desired("m1/node-a/0", "m1", (0,), "awake"), _desired("m1/node-a/1", "m1", (1,), "awake")]
+
+
+def test_model_target_shrink_goes_through_primitive_with_request_path():
+    h = Harness(_two_awake(), desired=_desired_two_awake())
+    client = TestClient(create_app(h.service))
+
+    response = client.put(
+        "/v2/models/m1/target",
+        json={"wake_replicas": 1, "sleep_path": "urgent", "drain_budget_s": 12.5},
+    )
+
+    assert response.status_code == 200, response.text
+    assert h.paths == [("urgent", 12.5, ["pod-b"])]
+    h.assert_hidden_before_every_sleep()
+
+
+def test_model_target_default_path_is_scale_down_and_bad_path_is_rejected():
+    h = Harness(_two_awake(), desired=_desired_two_awake())
+    client = TestClient(create_app(h.service))
+
+    assert client.put("/v2/models/m1/target", json={"wake_replicas": 1, "sleep_path": "yolo"}).status_code == 400
+    assert client.put("/v2/models/m1/target", json={"wake_replicas": 1}).status_code == 200
+    assert [p[0] for p in h.paths] == ["scale_down"]
+
+
+def test_binding_power_sleep_goes_through_primitive():
+    h = Harness(_two_awake(), desired=_desired_two_awake())
+    client = TestClient(create_app(h.service))
+
+    response = client.put(
+        "/v2/bindings/pod-a/power",
+        json={"awake": False, "sleep_path": "safescale_commit", "drain_budget_s": 40},
+    )
+
+    assert response.status_code == 200, response.text
+    assert h.paths == [("safescale_commit", 40.0, ["pod-a"])]
+    h.assert_hidden_before_every_sleep()
+    assert ("release", "m1/node-a/0") in h.leases.calls
+
+
+def test_v1_compat_scale_down_goes_through_primitive():
+    h = Harness(_two_awake(), desired=_desired_two_awake())
+    client = TestClient(create_app(h.service))
+
+    response = client.post("/scale_service", params={"model_name": "m1", "scale_type": "down", "scale_value": 1})
+
+    assert response.status_code == 200, response.text
+    assert [p[0] for p in h.paths] == ["scale_down"]  # APA drains exactly like TRE
+    h.assert_hidden_before_every_sleep()
+
+
+def test_defrag_migration_goes_through_primitive():
+    h = Harness([pod("pod-a", "m1", (0,), ip="10.0.0.1")])
+    new_pod = pod("pod-a-new", "m1", (1,), ip="10.0.0.9")
+
+    def create(model, slot):
+        h.runtime.snapshots[new_pod.name] = new_pod
+        h.vllm.sleeping[new_pod.pod_ip] = False
+        return new_pod.name
+
+    h.runtime.delete_model_deployment = lambda binding: binding.serve_id
+    h.runtime.create_model_deployment = create
+    h.runtime.wait_pod_deleted = lambda serve_id: None
+    h.runtime.wait_pod_ready = lambda serve_id: h.runtime.snapshots[serve_id]
+    binding = binding_of(h.runtime.snapshots["pod-a"])
+
+    actions, moved = h.service._execute_runtime_defrag_migration(
+        binding, Migration("pod-a", binding.slot, Slot("node-a", (1,)))
+    )
+
+    assert h.paths == [("defrag", None, ["pod-a"])]
+    assert [a["action"] for a in actions][:2] == ["hide", "sleep"]
+    h.assert_hidden_before_every_sleep()
+
+
+def test_startup_admission_sleeps_overlapping_resident_through_primitive():
+    resident = pod("pod-tp2", "tp2", (0, 1), ip="10.0.0.5")
+    h = Harness(
+        [resident],
+        desired=[
+            _desired("tp2/node-a/0,1", "tp2", (0, 1), "awake"),
+            _desired("m1/node-a/0", "m1", (0,), "sleeping"),
+        ],
+    )
+    h.runtime.get_startup_pod = lambda name: startup_pod(name, "m1", (0,), uid="new-uid")
+    h.runtime.list_startup_resident_snapshots = lambda: h.runtime.list_pod_snapshots()
+    h.runtime.admit_startup_pod = lambda name, **kwargs: None
+
+    result = h.service.admit_startup(pod_name="m1-new", pod_uid="new-uid")
+
+    assert result["suspended_binding_ids"] == ["tp2/node-a/0,1"]
+    assert h.paths == [("startup", None, ["pod-tp2"])]
+    h.assert_hidden_before_every_sleep()
+
+
+def test_startup_convergence_sleeps_through_primitive():
+    fresh = pod("pod-a", "m1", (0,), ip="10.0.0.1", state="hidden", admitted=True)
+    h = Harness([fresh], desired=[_desired("m1/node-a/0", "m1", (0,), "sleeping")])
+    h.runtime.list_startup_resident_snapshots = lambda: h.runtime.list_pod_snapshots()
+    h.runtime.clear_startup_admission = lambda name: None
+    h.service._k8s_client = None
+    h.service._reconcile_unlocked = lambda drop_missing=False: {}
+
+    result = h.service.converge_startups()
+
+    assert result["converged"] == ["pod-a"]
+    assert h.paths == [("startup", None, ["pod-a"])]
+    h.assert_hidden_before_every_sleep()
+
+
+def test_fleet_repair_quarantine_sleeps_through_primitive():
+    awake = pod("pod-a", "m1", (0,), ip="10.0.0.1")
+    h = Harness([awake], deployments=[deployment("m1", (0,))])
+    h.runtime.scale_model_deployment = lambda name, *, replicas: None
+    h.runtime.wait_deployment_pods_deleted = lambda name: None
+    h.runtime.wait_pod_ready = lambda name: h.runtime.snapshots["pod-a"]
+    service = ServiceManagerV2(
+        registry(),
+        h.store,
+        runtime_ops=h.runtime,
+        vllm_ops=h.vllm,
+        safety_gate=FakeSafety(),
+    )
+    assert service._fleet_repair is not None
+    service._sleep_primitive.sleep = h.service._sleep_primitive.sleep
+
+    service._fleet_repair._quarantine_and_sleep_residents(
+        type("Op", (), {"assert_active": lambda self: None})(),
+        {"m1/node-a/0": deployment("m1", (0,))},
+    )
+
+    assert h.paths == [("repair", None, ["pod-a"])]
+    h.assert_hidden_before_every_sleep()

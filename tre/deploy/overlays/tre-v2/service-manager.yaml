@@ -35,8 +35,11 @@ spec:
           env:
             - name: TRE_REDIS_URL
               value: redis://tre-v2-redis:6379/0
+            # The live registry is the tre-v2-registry ConfigMap (mounted below), the
+            # same one the controller reads: model bindings for desired-state seeding
+            # (plan D7) and the service_manager: section (sleep/drain policy).
             - name: TRE_REGISTRY_PATH
-              value: /app/tre/deploy/registry.yaml
+              value: /etc/tre/registry.yaml
             # Model Deployments + their HTTPRoutes live in these namespaces.
             - name: TRE_MODEL_NAMESPACE
               value: default
@@ -62,6 +65,16 @@ spec:
             limits:
               cpu: "1"
               memory: 1Gi
+          volumeMounts:
+            - name: registry
+              mountPath: /etc/tre
+              readOnly: true
+      volumes:
+        # Non-optional: a missing ConfigMap blocks the pod instead of booting on
+        # stale or absent bindings.
+        - name: registry
+          configMap:
+            name: tre-v2-registry
 ---
 apiVersion: v1
 kind: Service

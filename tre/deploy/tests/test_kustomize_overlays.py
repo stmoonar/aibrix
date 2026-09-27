@@ -160,6 +160,14 @@ def test_tre_v2_overlay_declares_components_and_independent_redis() -> None:
     volumes = controller["spec"]["template"]["spec"]["volumes"]
     assert any(v["name"] == "registry" and v["configMap"]["name"] == "tre-v2-registry" for v in volumes)
 
+    # Plan 2026-09-27 D7: the service-manager seeds desired state from the SAME live
+    # registry (and reads its service_manager: sleep policy) - not a baked copy.
+    assert _env(sm)["TRE_REGISTRY_PATH"] == "/etc/tre/registry.yaml"
+    sm_mounts = sm["spec"]["template"]["spec"]["containers"][0]["volumeMounts"]
+    assert {"name": "registry", "mountPath": "/etc/tre", "readOnly": True} in sm_mounts
+    sm_volumes = sm["spec"]["template"]["spec"]["volumes"]
+    assert any(v["name"] == "registry" and v["configMap"]["name"] == "tre-v2-registry" for v in sm_volumes)
+
     params = _load_yaml(overlay / "params.yaml")
     assert params["kind"] == "ConfigMap" and params["metadata"]["name"] == "tre-v2-registry"
     assert params["metadata"]["namespace"] == "tre-v2"

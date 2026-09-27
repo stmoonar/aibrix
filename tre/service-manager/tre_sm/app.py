@@ -5,6 +5,7 @@ from fastapi import FastAPI
 from tre_common.registry import Registry
 from tre_sm.api.v2 import RuntimePodOps, ServiceManagerV2, VllmRuntimeOps, create_app
 from tre_sm.gpu_truth import GpuTruthProvider
+from tre_sm.ops.sleep_primitive import GatewayState, SleepJournal
 from tre_sm.state.reconcile import K8sPodClient
 from tre_sm.state.operations import OperationCoordinator
 from tre_sm.state.safety import ClusterSafetyGate
@@ -29,6 +30,8 @@ def create_service_app(
     safety_gate: ClusterSafetyGate | None = None,
     fleet_store: FleetStateStore | None = None,
     gpu_leases: GpuLeaseStore | None = None,
+    gateway_state: GatewayState | None = None,
+    sleep_journal: SleepJournal | None = None,
     supervisor_enabled: bool = False,
     supervisor_interval_s: float = 5.0,
 ) -> FastAPI:
@@ -46,6 +49,8 @@ def create_service_app(
             safety_gate=safety_gate,
             fleet_store=fleet_store,
             gpu_leases=gpu_leases,
+            gateway_state=gateway_state,
+            sleep_journal=sleep_journal,
         )
     app = create_app(service)
     if supervisor_enabled:

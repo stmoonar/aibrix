@@ -58,7 +58,7 @@ class FakeRuntimeOps:
     def write_binding_annotations(self, binding, *, state):
         self.calls.append(("annotate", binding.serve_id, state))
 
-    def wait_pod_unroutable(self, binding):
+    def wait_pod_unroutable(self, binding, **_kwargs):
         self.calls.append(("wait_unroutable", binding.serve_id))
 
     def ensure_model_httproute(self, model):
@@ -89,7 +89,7 @@ class FakeVllmOps:
         self.calls.append(("wait_until_ready", pod_ip, port))
         return type("Result", (), {"success": True, "message": ""})()
 
-    def sleep(self, pod_ip, *, port=None):
+    def sleep(self, pod_ip, *, port=None, **_kwargs):
         self.calls.append(("sleep", pod_ip, port))
         return type("Result", (), {"success": True, "message": ""})()
 
