@@ -15,8 +15,11 @@
 #
 # APPLY:
 #   kubectl patch envoyproxy aibrix-custom-proxy-config -n aibrix-system #     --type merge --patch-file envoyproxy-nofile-patch.yaml
-#   kubectl -n envoy-gateway-system rollout status deploy/envoy-aibrix-system-aibrix-eg-903790dc
-#   kubectl -n envoy-gateway-system rollout status deploy/envoy-tre-v2-tre-aibrix-eg-161007f9
+#   then wait for both proxy Deployments (named with a generated hash suffix, so
+#   select them by label), e.g. for tre-v2:
+#   kubectl -n envoy-gateway-system get deploy -o name \
+#     -l gateway.envoyproxy.io/owning-gateway-name=tre-aibrix-eg,gateway.envoyproxy.io/owning-gateway-namespace=tre-v2 \
+#     | xargs -n1 kubectl -n envoy-gateway-system rollout status
 # VERIFY:  kubectl -n envoy-gateway-system exec <envoy-pod> -c envoy -- cat /proc/1/limits | grep 'open files'
 # ROLLBACK: re-apply the same patch with the 'command:' line removed from the
 #   envoy container (reverts to EG's default entrypoint / soft=1024).

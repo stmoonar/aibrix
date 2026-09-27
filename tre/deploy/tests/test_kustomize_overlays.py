@@ -33,6 +33,8 @@ def test_tre_v2_overlay_declares_components_and_independent_redis() -> None:
         "gateway-plugins.yaml",
         "gateway-extproc.yaml",
         "gateway-stats.yaml",
+        "gateway-service.yaml",
+        "gateway-service-params.yaml",
     ]
 
     redis = _load_yaml(overlay / "redis.yaml")

@@ -207,3 +207,84 @@ def test_sidecar_headers_and_continuability_match_the_gateway_plugin() -> None:
     # the plugin's EngineSleeping fixture is the fork's error body the sidecar retries
     tests = (GATEWAY_GO / "tre_transparent_sleep_test.go").read_text(encoding="utf-8")
     assert '"type":"EngineSleeping"' in tests
+
+
+# --- stable gateway Service (no Envoy-Gateway hash names) ----------------------------
+
+#: Envoy Gateway's generated resource names: envoy-<namespace>-<gateway>-<8 hex digits>.
+EG_HASHED_NAME = re.compile(r"envoy-[a-z0-9-]+-[0-9a-f]{8}\b")
+TEXT_SUFFIXES = {".py", ".yaml", ".yml", ".sh", ".md", ".txt", ".toml", ".cfg", ".ini", ".json", ".go", ".j2"}
+
+
+def test_gateway_service_is_the_registry_gateway_service(tmp_path: Path) -> None:
+    """The overlay's stable ClusterIP (and its kustomize params) = registry gateway
+    service_name / service_namespace; it selects exactly the tre-v2 proxy pods, like the
+    stats Service; the sidecar default URL is that Service's DNS name."""
+    from tre_common.registry import DEFAULT_REISSUE_GATEWAY_URL, GatewayConfig
+
+    service = _docs(OVERLAY / "gateway-service.yaml")[0]
+    params = _docs(OVERLAY / "gateway-service-params.yaml")[0]
+    stats = _docs(OVERLAY / "gateway-stats.yaml")[0]
+    assert params["metadata"]["annotations"]["config.kubernetes.io/local-config"] == "true"
+    assert (service["metadata"]["name"], service["metadata"]["namespace"]) == (
+        params["data"]["name"], params["data"]["namespace"],
+    )
+    for name, registry in _registries(tmp_path).items():
+        gateway = registry.gateway()
+        assert (gateway.service_name, gateway.service_namespace) == (
+            params["data"]["name"], params["data"]["namespace"],
+        ), name
+        assert gateway.service_port == service["spec"]["ports"][0]["port"], name
+    assert service["spec"]["type"] == "ClusterIP"
+    assert service["spec"]["selector"] == stats["spec"]["selector"]
+    assert service["spec"]["selector"]["gateway.envoyproxy.io/owning-gateway-namespace"] == "tre-v2"
+    assert service["spec"]["selector"]["gateway.envoyproxy.io/owning-gateway-name"] == "tre-aibrix-eg"
+    assert service["spec"]["ports"] == [{"name": "http", "port": 80, "targetPort": 10080, "protocol": "TCP"}]
+    assert GatewayConfig().internal_url == DEFAULT_REISSUE_GATEWAY_URL == _sidecar_module().DEFAULT_GATEWAY_URL
+    assert DEFAULT_REISSUE_GATEWAY_URL == "http://tre-gateway.envoy-gateway-system.svc.cluster.local:80"
+    kustomization = yaml.safe_load((OVERLAY / "kustomization.yaml").read_text(encoding="utf-8"))
+    targets = {
+        (r["source"]["fieldPath"], tuple(r["targets"][0]["fieldPaths"]))
+        for r in kustomization["replacements"]
+        if r["source"]["name"] == "tre-gateway-service-params"
+    }
+    assert targets == {("data.name", ("metadata.name",)), ("data.namespace", ("metadata.namespace",))}
+
+
+def test_gateway_service_params_apply_through_kustomize(tmp_path: Path) -> None:
+    import shutil
+    import subprocess
+
+    kubectl = shutil.which("kubectl")
+    kustomize = shutil.which("kustomize")
+    if not (kubectl or kustomize):
+        pytest.skip("no kubectl / kustomize binary")
+    overlay = tmp_path / "tre-v2"
+    shutil.copytree(OVERLAY, overlay)
+    params = overlay / "gateway-service-params.yaml"
+    params.write_text(params.read_text(encoding="utf-8").replace("namespace: envoy-gateway-system",
+                                                                  "namespace: my-proxies"), encoding="utf-8")
+    cmd = [kubectl, "kustomize", str(overlay)] if kubectl else [kustomize, "build", str(overlay)]
+    rendered = [d for d in yaml.safe_load_all(subprocess.run(cmd, check=True, capture_output=True,
+                                                             text=True).stdout) if d]
+    names = {(d["kind"], d["metadata"]["name"]): d for d in rendered}
+    assert names[("Service", "tre-gateway")]["metadata"]["namespace"] == "my-proxies"
+    assert ("ConfigMap", "tre-gateway-service-params") not in names  # local-config only
+
+
+def test_no_envoy_gateway_hashed_names_in_tre() -> None:
+    """Envoy Gateway's generated names (envoy-<ns>-<gateway>-<hash>) are not portable;
+    TRE reaches the proxy through its own Services (tre-gateway, tre-v2-envoy-stats) and
+    selects proxy Deployments by label. Only docs describing the problem may mention them."""
+    tre_root = DEPLOY_ROOT.parent
+    offenders = []
+    for path in tre_root.rglob("*"):
+        rel = path.relative_to(tre_root)
+        if not path.is_file() or path.suffix not in TEXT_SUFFIXES or rel.parts[0] == "docs":
+            continue
+        if "__pycache__" in rel.parts or path.stat().st_size > 2_000_000:
+            continue
+        for number, line in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+            if EG_HASHED_NAME.search(line):
+                offenders.append(f"{rel}:{number}: {line.strip()[:120]}")
+    assert not offenders, "\n".join(offenders)

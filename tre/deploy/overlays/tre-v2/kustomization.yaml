@@ -14,3 +14,15 @@ resources:
   - gateway-plugins.yaml
   - gateway-extproc.yaml
   - gateway-stats.yaml
+  - gateway-service.yaml
+  - gateway-service-params.yaml
+# Params of the stable gateway Service (gateway-service-params.yaml, local-config).
+replacements:
+  - source: {kind: ConfigMap, name: tre-gateway-service-params, fieldPath: data.name}
+    targets:
+      - select: {kind: Service, name: tre-gateway}
+        fieldPaths: [metadata.name]
+  - source: {kind: ConfigMap, name: tre-gateway-service-params, fieldPath: data.namespace}
+    targets:
+      - select: {kind: Service, name: tre-gateway}
+        fieldPaths: [metadata.namespace]

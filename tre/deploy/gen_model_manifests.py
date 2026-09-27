@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
+from dataclasses import replace
 import re
 from pathlib import Path
 from typing import Iterable
@@ -72,9 +73,12 @@ def build_deployments(registry: Registry) -> list[dict]:
 
 
 def reissue_spec(registry: Registry) -> ReissueConfig | None:
-    """The registry's reissue sidecar settings, or None when it is disabled."""
+    """The registry's reissue sidecar settings, or None when it is disabled. The gateway
+    URL is resolved: reissue.gateway_url, else the gateway: section's stable Service."""
     spec = registry.reissue()
-    return spec if spec.enabled else None
+    if not spec.enabled:
+        return None
+    return replace(spec, gateway_url=spec.gateway_url or registry.gateway().internal_url)
 
 
 def build_reissue_configmap(spec: ReissueConfig, *, script_path: Path = REISSUE_SCRIPT_PATH) -> dict:

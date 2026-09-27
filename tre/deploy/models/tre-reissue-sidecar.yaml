@@ -47,12 +47,11 @@ data:
     \ annotations\n\nimport asyncio\nimport dataclasses\nimport json\nimport os\n\
     import sys\nimport time\nfrom collections import deque\nfrom dataclasses import\
     \ dataclass\nfrom typing import Any\n\nimport aiohttp\nfrom aiohttp import web\n\
-    \n#: In-cluster Service of the tre-v2 Envoy (Gateway tre-v2/tre-aibrix-eg). Envoy\
-    \ Gateway\n#: names it envoy-<gateway-namespace>-<gateway-name>-<hash of namespace/name>,\
-    \ so it is\n#: the same in every cluster that deploys this Gateway. Override with\
-    \ TRE_GATEWAY_URL\n#: (the registry key reissue.gateway_url renders it into the\
-    \ pod).\nDEFAULT_GATEWAY_URL = \"http://envoy-tre-v2-tre-aibrix-eg-161007f9.envoy-gateway-system.svc.cluster.local:80\"\
-    \n\n#: vLLM's /v1/completions default when max_tokens is absent or null.\nCOMPLETIONS_DEFAULT_MAX_TOKENS\
+    \n#: The stable ClusterIP Service in front of the tre-v2 Envoy proxy (tre-v2 overlay\n\
+    #: gateway-service.yaml; registry gateway.service_name / service_namespace). Override\
+    \ with\n#: TRE_GATEWAY_URL, which the manifests render from the registry.\nDEFAULT_GATEWAY_URL\
+    \ = \"http://tre-gateway.envoy-gateway-system.svc.cluster.local:80\"\n\n#: vLLM's\
+    \ /v1/completions default when max_tokens is absent or null.\nCOMPLETIONS_DEFAULT_MAX_TOKENS\
     \ = 16\n\n#: Never copied between hops (RFC 7230 hop-by-hop plus what aiohttp\
     \ recomputes).\nHOP_BY_HOP = frozenset(\n    {\n        \"connection\",\n    \
     \    \"keep-alive\",\n        \"proxy-authenticate\",\n        \"proxy-authorization\"\

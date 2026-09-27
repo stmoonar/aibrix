@@ -127,7 +127,7 @@ spec:
         - name: TRE_REISSUE_UPSTREAM_URL
           value: http://127.0.0.1:8001
         - name: TRE_GATEWAY_URL
-          value: http://envoy-tre-v2-tre-aibrix-eg-161007f9.envoy-gateway-system.svc.cluster.local:80
+          value: http://tre-gateway.envoy-gateway-system.svc.cluster.local:80
         - name: TRE_REISSUE_MODEL
           value: dsqwen-7b
         - name: TRE_REISSUE_MAX_DEPTH

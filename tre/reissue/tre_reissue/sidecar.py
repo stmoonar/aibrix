@@ -54,11 +54,10 @@ from typing import Any
 import aiohttp
 from aiohttp import web
 
-#: In-cluster Service of the tre-v2 Envoy (Gateway tre-v2/tre-aibrix-eg). Envoy Gateway
-#: names it envoy-<gateway-namespace>-<gateway-name>-<hash of namespace/name>, so it is
-#: the same in every cluster that deploys this Gateway. Override with TRE_GATEWAY_URL
-#: (the registry key reissue.gateway_url renders it into the pod).
-DEFAULT_GATEWAY_URL = "http://envoy-tre-v2-tre-aibrix-eg-161007f9.envoy-gateway-system.svc.cluster.local:80"
+#: The stable ClusterIP Service in front of the tre-v2 Envoy proxy (tre-v2 overlay
+#: gateway-service.yaml; registry gateway.service_name / service_namespace). Override with
+#: TRE_GATEWAY_URL, which the manifests render from the registry.
+DEFAULT_GATEWAY_URL = "http://tre-gateway.envoy-gateway-system.svc.cluster.local:80"
 
 #: vLLM's /v1/completions default when max_tokens is absent or null.
 COMPLETIONS_DEFAULT_MAX_TOKENS = 16

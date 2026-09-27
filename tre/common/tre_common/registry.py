@@ -190,11 +190,22 @@ VLLM_FEATURE_FLAGS: dict[str, tuple[str, ...]] = {
     "abort_return_token_ids": ("--abort-return-token-ids",),
 }
 
-#: In-cluster Service of the tre-v2 Envoy (Gateway tre-v2/tre-aibrix-eg). Envoy Gateway
-#: names it envoy-<gateway-namespace>-<gateway-name>-<hash of namespace/name>, so the
-#: name is the same in every cluster that deploys this Gateway.
-DEFAULT_REISSUE_GATEWAY_URL = (
-    "http://envoy-tre-v2-tre-aibrix-eg-161007f9.envoy-gateway-system.svc.cluster.local:80"
+#: Stable in-cluster Service of the tre-v2 Envoy proxy (overlays/tre-v2/gateway-service.yaml).
+#: Envoy Gateway's own proxy Service carries a generated hash suffix, so nothing in TRE
+#: may name it; this ClusterIP selects the same proxy pods by their owning-gateway labels.
+DEFAULT_GATEWAY_SERVICE_NAME = "tre-gateway"
+#: Namespace of the Envoy proxy pods (Envoy Gateway's controller namespace by default); a
+#: Service can only select pods of its own namespace.
+DEFAULT_GATEWAY_SERVICE_NAMESPACE = "envoy-gateway-system"
+DEFAULT_GATEWAY_SERVICE_PORT = 80
+
+
+def gateway_service_url(name: str, namespace: str, port: int) -> str:
+    return f"http://{name}.{namespace}.svc.cluster.local:{int(port)}"
+
+
+DEFAULT_REISSUE_GATEWAY_URL = gateway_service_url(
+    DEFAULT_GATEWAY_SERVICE_NAME, DEFAULT_GATEWAY_SERVICE_NAMESPACE, DEFAULT_GATEWAY_SERVICE_PORT
 )
 #: The pod's serving port (Service targetPort, model.aibrix.ai/port, gateway target-pod,
 #: service-manager, probes). With the sidecar enabled the sidecar listens here.
@@ -211,7 +222,8 @@ class ReissueConfig:
 
     enabled: bool = True
     #: TRE gateway reached from inside the cluster (DNS name, never an IP / NodePort).
-    gateway_url: str = DEFAULT_REISSUE_GATEWAY_URL
+    #: None = the gateway: section's stable Service (``GatewayConfig.internal_url``).
+    gateway_url: str | None = None
     #: vLLM's internal port (127.0.0.1) behind the sidecar.
     vllm_port: int = 8001
     #: Max retry / continuation hops of one request.
@@ -238,6 +250,16 @@ class GatewayConfig:
 
     #: Request timeout of every model route (HTTPRoute ``timeouts.request``).
     route_timeout_s: float = DEFAULT_ROUTE_TIMEOUT_S
+    #: Stable ClusterIP Service in front of the tre-v2 Envoy proxy pods (rendered by the
+    #: tre-v2 overlay, kustomize param ``tre-gateway-service-params``): how in-cluster
+    #: clients (the reissue sidecar) reach the gateway.
+    service_name: str = DEFAULT_GATEWAY_SERVICE_NAME
+    service_namespace: str = DEFAULT_GATEWAY_SERVICE_NAMESPACE
+    service_port: int = DEFAULT_GATEWAY_SERVICE_PORT
+
+    @property
+    def internal_url(self) -> str:
+        return gateway_service_url(self.service_name, self.service_namespace, self.service_port)
 
 
 @dataclass(frozen=True)
@@ -567,7 +589,7 @@ def parse_reissue_config(raw: Any) -> ReissueConfig:
         raise ValueError("reissue.extra_env must be a mapping")
     return ReissueConfig(
         enabled=_parse_bool(raw.get("enabled", defaults.enabled)),
-        gateway_url=str(raw.get("gateway_url") or defaults.gateway_url).rstrip("/"),
+        gateway_url=(str(raw["gateway_url"]).rstrip("/") if raw.get("gateway_url") else None),
         vllm_port=int(raw.get("vllm_port", defaults.vllm_port)),
         max_depth=int(raw.get("max_depth", defaults.max_depth)),
         retry_attempts=int(raw.get("retry_attempts", defaults.retry_attempts)),
@@ -586,7 +608,7 @@ def _validate_reissue(reissue: ReissueConfig) -> list[str]:
     errors: list[str] = []
     if not reissue.enabled:
         return errors
-    if not reissue.gateway_url.startswith(("http://", "https://")):
+    if reissue.gateway_url is not None and not reissue.gateway_url.startswith(("http://", "https://")):
         errors.append("reissue.gateway_url must be an http(s) URL (in-cluster DNS name)")
     if not 1 <= reissue.vllm_port <= 65535 or reissue.vllm_port == POD_SERVING_PORT:
         errors.append(f"reissue.vllm_port must be a valid port other than {POD_SERVING_PORT}")
@@ -605,7 +627,10 @@ def parse_gateway_config(raw: dict[str, Any] | None) -> GatewayConfig:
     raw = raw or {}
     timeout = raw.get("route_timeout_s")
     return GatewayConfig(
-        route_timeout_s=float(DEFAULT_ROUTE_TIMEOUT_S if timeout is None else timeout)
+        route_timeout_s=float(DEFAULT_ROUTE_TIMEOUT_S if timeout is None else timeout),
+        service_name=str(raw.get("service_name") or DEFAULT_GATEWAY_SERVICE_NAME),
+        service_namespace=str(raw.get("service_namespace") or DEFAULT_GATEWAY_SERVICE_NAMESPACE),
+        service_port=int(raw.get("service_port") or DEFAULT_GATEWAY_SERVICE_PORT),
     )
 
 

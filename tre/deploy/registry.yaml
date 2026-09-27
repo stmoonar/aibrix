@@ -205,6 +205,14 @@ gateway:
   # route timeout (overlays/tre-v2/gateway-extproc.yaml) equal; a guard test
   # enforces it.
   route_timeout_s: 150
+  # Stable ClusterIP Service in front of the tre-v2 Envoy proxy pods, for
+  # in-cluster clients (the reissue sidecar). Rendered by the tre-v2 overlay
+  # (gateway-service.yaml; keep its kustomize param tre-gateway-service-params
+  # equal, a guard test enforces it). The namespace is where the Envoy proxy
+  # pods run (a Service selects only pods of its own namespace).
+  service_name: tre-gateway
+  service_namespace: envoy-gateway-system
+  service_port: 80
 # Retry / continuation sidecar in every model pod (plan 2026-09-27 D5/D6; design
 # tre/docs/design/20260927-reissue-sidecar-v2.md). Every key is optional; the values
 # below are the built-in defaults. The sidecar takes the serving port 8000 and vLLM
@@ -216,8 +224,9 @@ gateway:
 # (runtime creates), so keep the tre-v2-registry ConfigMap copy equal.
 reissue:
   enabled: true
-  # In-cluster DNS name of the tre-v2 Envoy Service (never an IP / NodePort).
-  gateway_url: http://envoy-tre-v2-tre-aibrix-eg-161007f9.envoy-gateway-system.svc.cluster.local:80
+  # null = the gateway: section's stable Service (http://<service_name>.
+  # <service_namespace>.svc.cluster.local:<service_port>); never an IP / NodePort.
+  gateway_url: null
   vllm_port: 8001
   max_depth: 3
   retry_attempts: 4

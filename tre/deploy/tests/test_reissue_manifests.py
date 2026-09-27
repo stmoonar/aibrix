@@ -77,7 +77,8 @@ def test_sidecar_is_on_by_default_and_owns_the_serving_port(tmp_path):
     env = _env(sidecar)
     assert env["TRE_REISSUE_LISTEN_PORT"] == "8000"
     assert env["TRE_REISSUE_UPSTREAM_URL"] == "http://127.0.0.1:8001"
-    assert env["TRE_GATEWAY_URL"].endswith(".svc.cluster.local:80")  # in-cluster DNS, no IP
+    # the stable gateway Service (registry gateway: section), in-cluster DNS, no IP
+    assert env["TRE_GATEWAY_URL"] == "http://tre-gateway.envoy-gateway-system.svc.cluster.local:80"
     assert env["TRE_REISSUE_REQUIRE_HIDDEN_HEADER"] == "true"
     assert env["POD_NAME"] == {"fieldRef": {"fieldPath": "metadata.name"}}
     assert env["NVIDIA_VISIBLE_DEVICES"] == "void"
@@ -206,3 +207,10 @@ def test_repo_registry_and_committed_manifests_carry_the_sidecar():
 
     live = _parse_registry(yaml.safe_load(params["data"]["registry.yaml"]))
     assert live.reissue() == replace(spec)
+
+
+def test_gateway_url_follows_the_gateway_service_settings(tmp_path):
+    registry = _registry(tmp_path, "gateway: {service_name: gw, service_namespace: proxies, service_port: 8080}\n")
+    env = _env(_containers(build_deployments(registry)[0])[REISSUE_CONTAINER])
+    assert env["TRE_GATEWAY_URL"] == "http://gw.proxies.svc.cluster.local:8080"
+    assert registry.reissue().gateway_url is None  # derived, not stored
