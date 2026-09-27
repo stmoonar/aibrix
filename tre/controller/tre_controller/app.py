@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Mapping
 
@@ -152,7 +153,10 @@ def build_controller_task_specs(
 
 def _active_probe_models(safescale: SafeScaleStateMachine) -> set[str]:
     # Live read each tick: models with an unresolved safescale probe (hidden pod) must
-    # not be picked as planner donors (review F3).
+    # not be picked as planner donors (review F3) - committing ones included (review 4).
+    busy = getattr(safescale, "busy_models", None)
+    if callable(busy):
+        return set(busy())
     return {probe.model for probe in safescale.active_probes()}
 
 
@@ -209,7 +213,8 @@ def create_controller_dependencies(
     safescale.restore()
     observe_gate = ObserveModeGate(redis_client)
     profiler = build_profiler(cfg, redis_client)
-    cluster_view_box = ClusterViewBox()
+    # A view older than two refresh periods is not "fresh" (review 4 P2-1).
+    cluster_view_box = ClusterViewBox(max_age_s=max(5.0, 2.5 * float(getattr(cfg, "fairness_interval_s", 10.0))))
     model_state_box = ModelStateBox()
     return ControllerDependencies(
         store=store,
@@ -225,12 +230,20 @@ def create_controller_dependencies(
             ),
             # One-shot retries re-check the latest cluster view; actions on a shared
             # GPU are serialized (review 2 P1-1 / P1-2).
-            revalidate=revalidate_from_cluster_view(cluster_view_box.get),
+            # Only a FRESH view may skip a retry (review 4 P2-1).
+            revalidate=revalidate_from_cluster_view(cluster_view_box.fresh),
             # Review 3: a SafeScale commit is revalidated on the current signal state
             # (donor needing capacity -> unhide instead; receiver no longer needing it
             # -> upscale dropped) before every (re)try.
-            revalidate_commit=revalidate_commit_from_signals(model_state_box.get, cluster_view_box.get),
+            revalidate_commit=revalidate_commit_from_signals(model_state_box.get, cluster_view_box.fresh),
             slot_of=slot_lookup_from_cluster_view(cluster_view_box.get),
+            # Review 4 P2-3 / P2-4: preemption compensation and failed-commit
+            # unhides use the view only while fresh; a SafeScale probe is resolved
+            # when its one-shot action is finished (durable lifecycle).
+            fresh_view=cluster_view_box.fresh,
+            on_oneshot_done=lambda request_id, status, reason: safescale.resolve_request(
+                request_id, status=status, reason=reason, now_ms=int(time.time() * 1000)
+            ),
         ),
         model_state_box=model_state_box,
         sm_client=sm_client,

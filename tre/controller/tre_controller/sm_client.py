@@ -24,23 +24,32 @@ class ServiceManagerError(Exception):
         status: int | None = None,
         timeout: bool = False,
         transport: bool = False,
+        body: dict | None = None,
     ) -> None:
         super().__init__(message)
         self.status = status
         self.timeout = timeout
         self.transport = transport
+        #: The SM's JSON error body, when it sent one (e.g. sleep ``outcomes``).
+        self.body = body if isinstance(body, dict) else None
 
     @property
     def retriable(self) -> bool:
         return self.timeout or self.transport or self.status in RETRIABLE_STATUSES
 
     def result(self) -> dict:
-        return {
+        result = {
             "ok": False,
             "error": str(self),
             "status": self.status,
             "retriable": self.retriable,
         }
+        outcomes = (self.body or {}).get("outcomes")
+        if isinstance(outcomes, list):
+            # Per-pod sleep outcomes of a failed sleep (review 4 P2-2): which pods
+            # slept, rolled back, or stay hidden unconfirmed.
+            result["outcomes"] = outcomes
+        return result
 
 
 class AsyncTransport(Protocol):
@@ -233,7 +242,13 @@ def _request_json(method: str, url: str, payload: dict | None, timeout_s: float)
             data = response.read()
     except HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
-        raise ServiceManagerError(f"HTTP {exc.code}: {detail}", status=int(exc.code)) from exc
+        try:
+            body = json.loads(detail)
+        except ValueError:
+            body = None
+        raise ServiceManagerError(
+            f"HTTP {exc.code}: {detail}", status=int(exc.code), body=body if isinstance(body, dict) else None
+        ) from exc
     except URLError as exc:
         timed_out = isinstance(exc.reason, (TimeoutError, socket.timeout))
         raise ServiceManagerError(

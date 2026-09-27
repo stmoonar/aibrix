@@ -162,7 +162,7 @@ def test_pod_less_relative_scale_is_never_retried() -> None:
     asyncio.run(scenario())
 
 
-def test_commit_targets_are_absolute_and_capped_at_planning_time() -> None:
+def test_commit_targets_are_resolved_at_first_dispatch_and_capped() -> None:
     topology = ClusterTopology(nodes=(NodeSpec(name="n", gpus=4, two_gpu_slots=((0, 1), (2, 3))),))
     view = ClusterView(
         topology,
@@ -191,9 +191,25 @@ def test_commit_targets_are_absolute_and_capped_at_planning_time() -> None:
         request_id="7b-1",
     )
     assert isinstance(commit, SafeScaleCommitAction)
-    # 2 awake (hidden counts, as on the SM) + 2 = 4, capped at max_awake 3
-    assert commit.upscales == (ReceiverTarget("8b", 2, 3),)
+    # Review 4 P2-1: never from the (possibly stale) view - resolved from the SM
+    # at the first dispatch, capped at max_awake 3, then frozen.
+    assert commit.upscales == (ReceiverTarget("8b", 2, None, 3),)
     assert commit.pods == ("7b-0",) and commit.request_id == "7b-1"
+
+    async def scenario():
+        sm = ScriptedSM()
+
+        async def awake(model):
+            return {"ok": True, "awake": 2}  # hidden counts, as on the SM
+
+        sm.model_awake = awake
+        queue = ActionQueue(sm, sleep=lambda _s: asyncio.sleep(0))
+        queue.submit((commit,))
+        await queue.drain_once()
+        # 2 awake + 2 = 4, capped at 3
+        assert _calls(sm) == [("7b-0", "sleep"), ("8b", "target", 3)]
+
+    asyncio.run(scenario())
 
 
 # ------------------------------------------------------------------ P2-2 ordering
@@ -228,11 +244,15 @@ def test_commit_donor_failure_drops_every_receiver_wake() -> None:
         queue = ActionQueue(sm)
         queue.submit((_commit(),))
         results = await queue.drain_once()
-        assert _calls(sm) == [("7b-1", "sleep")]
-        by_model = {r.model: r for r in results}
-        assert not by_model["7b"].ok
-        assert by_model["8b"].error.startswith("donor_sleep_failed: HTTP 400")
+        # Review 4 P2-4: the donor's hidden probe pod gets its routing back
+        assert _calls(sm) == [("7b-1", "sleep"), ("7b", "routable", ())]
+        by_model = {}
+        for result in results:
+            by_model.setdefault(result.model, []).append(result)
+        assert not by_model["7b"][0].ok and by_model["7b"][-1].action_kind == "unhide"
+        assert by_model["8b"][0].error.startswith("donor_sleep_failed: HTTP 400")
         assert queue.stats()["commit_receiver_dropped_total"] == 1
+        assert queue.stats()["commit_failed_unhide_total"] == 1
 
     asyncio.run(scenario())
 
@@ -337,6 +357,21 @@ def test_model_state_box_marks_unconfirmed_receivers_and_expires() -> None:
 # ------------------------------------------------------------------ P2-3 preemption
 
 
+def _fresh_view(*bindings):
+    """A fresh cluster view (review 4 P2-3: the preemption compensation counts
+    the donor pods it shows awake and hidden)."""
+
+    class View:
+        pass
+
+    view = View()
+    view.bindings = tuple(bindings)
+    return lambda: view
+
+
+_HIDDEN_7B = Binding("7b-1", "7b", Slot("n", (0,)), awake=True, hidden=True)
+
+
 def _blocking_sleep():
     forever = asyncio.Event()
 
@@ -349,7 +384,7 @@ def _blocking_sleep():
 def test_rescue_for_the_donor_preempts_a_backing_off_commit() -> None:
     async def scenario():
         sm = ScriptedSM(results={"7b-1": [{"ok": False, "error": "HTTP 409: reserved", "retriable": True}]})
-        queue = ActionQueue(sm, sleep=_blocking_sleep())
+        queue = ActionQueue(sm, sleep=_blocking_sleep(), fresh_view=_fresh_view(_HIDDEN_7B))
         runner = asyncio.ensure_future(queue.run(poll_interval_s=0.001))
         queue.submit((_commit(),))
         assert await _until(lambda: queue.preemptible_models() == {"7b", "8b"})
@@ -371,7 +406,7 @@ def test_rescue_for_the_donor_preempts_a_backing_off_commit() -> None:
 def test_rescue_covered_by_the_unhide_is_dropped() -> None:
     async def scenario():
         sm = ScriptedSM(results={"7b-1": [{"ok": False, "error": "HTTP 409", "retriable": True}]})
-        queue = ActionQueue(sm, sleep=_blocking_sleep())
+        queue = ActionQueue(sm, sleep=_blocking_sleep(), fresh_view=_fresh_view(_HIDDEN_7B))
         runner = asyncio.ensure_future(queue.run(poll_interval_s=0.001))
         queue.submit((_commit(),))
         assert await _until(lambda: "7b" in queue.preemptible_models())
@@ -402,13 +437,19 @@ def test_rescue_for_a_receiver_cancels_its_pending_upscale_only() -> None:
         assert await _until(lambda: queue.preemptible_models() == {"8b", "14b"})
         assert queue.submit((ScaleAction("8b", 1, "critical_idle_capacity", "rescue"),)).accepted == 1
         assert await _until(lambda: ("end", "8b", "scale", 1) in sm.events)
-        assert await _until(lambda: ("end", "14b", "target", 2) in sm.events)
+        # Review 4 P3: a receiver preemption does not cut the commit's backoff
+        # short (nor count as a preemption): 14b is not retried early ...
+        await asyncio.sleep(0.01)
+        assert _calls(sm).count(("14b", "target", 2)) == 1
+        assert queue.stats()["oneshot_preempted_total"] == 0
+        assert queue.stats()["commit_upscale_preempted_total"] == 1
+        gate.set()  # ... only when its backoff is over
+        assert await _until(lambda: _calls(sm).count(("14b", "target", 2)) == 2)
         runner.cancel()
         await asyncio.gather(runner, return_exceptions=True)
-        # the commit's 8b upscale was not re-sent; 14b retried at once (backoff cut)
+        # the commit's 8b upscale was not re-sent
         calls = _calls(sm)
         assert calls.count(("8b", "target", 3)) == 1
-        assert calls.count(("14b", "target", 2)) == 2
         assert ("8b", "scale", 1) in calls
 
     asyncio.run(scenario())

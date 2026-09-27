@@ -75,7 +75,9 @@ class ControllerStateStore:
             record = _decode_mapping(raw_payload)
             if record is None:
                 continue
-            if str(record.get("status", "probing")) != "probing":
+            # "committing" probes too (review 4 P2-4): their decision was handed
+            # to the action queue of a controller that may have died since.
+            if str(record.get("status", "probing")) not in ("probing", "committing"):
                 continue
             record.setdefault("request_id", request_id)
             records.append((request_id, record))

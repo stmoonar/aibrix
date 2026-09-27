@@ -205,6 +205,7 @@ def run_planner_tick(
     if _prof_on:
         _safescale_ns = time.perf_counter_ns() - _phase_t0
         _phase_t0 = time.perf_counter_ns()
+    queue_events = _defrag_blocking_events(queue, actions) if rescue_due else ()
     if actions:
         queue.submit(actions)
     if _prof_on:
@@ -231,10 +232,27 @@ def run_planner_tick(
     return LoopTickResult(
         submitted=len(actions),
         actions=actions,
-        events=paper_events + dwell_events + tuple(plan.events) + safescale_events,
+        events=paper_events + dwell_events + tuple(plan.events) + safescale_events + queue_events,
         model_contexts=contexts,
         classifications={item.model_name: item for item in classifications},
     )
+
+
+def _defrag_blocking_events(queue: PlannerQueue, actions) -> tuple[str, ...]:
+    """Review 4 P3: a defrag in the queue conflicts with every other action, so
+    a rescue scale-up planned now waits until it finished (minutes). Not
+    re-planned around - made visible in the decision snapshot."""
+    active = getattr(queue, "cluster_action_active", None)
+    if not callable(active) or not active():
+        return ()
+    models = sorted(
+        {
+            getattr(action, "model", "")
+            for action in actions
+            if isinstance(action, ScaleAction) and action.delta > 0
+        }
+    )
+    return (f"rescue_waits_for_defrag:{','.join(models)}",) if models else ()
 
 
 def _preemptible_models(queue: PlannerQueue) -> set[str]:

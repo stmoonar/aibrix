@@ -249,7 +249,10 @@ def test_observe_mode_holds_commit_and_orphan_detector_stays_quiet():
         _metrics(1000), queue=queue, registry=_registry(), safescale=machine
     )
     assert result.submitted == 1
-    assert next(iter(_probe_records(redis).values()))["status"] == "resolved"
+    # Review 4 P2-4: resolved only when the queue finished it - held in observe
+    # mode, it stays "committing" (restorable after a restart).
+    assert next(iter(_probe_records(redis).values()))["status"] == "committing"
+    assert [probe.model for probe in machine.committing_probes()] == ["donor"]
 
     assert asyncio.run(queue.drain_once()) == ()
     assert len(queue.pending_actions()) == 1
