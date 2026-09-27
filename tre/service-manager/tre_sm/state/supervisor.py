@@ -7,6 +7,7 @@ from typing import Protocol
 
 from tre_sm.state.operations import OperationBusy
 from tre_sm.state.safety import ControllerNotPaused, NodePressureActive
+from tre_sm.state.sleep_reservations import ReservationConflict
 
 
 class SupervisedService(Protocol):
@@ -124,9 +125,10 @@ class FleetSupervisor:
             try:
                 self.run_once()
                 self._last_error = None
-            except (OperationBusy, ControllerNotPaused, NodePressureActive):
+            except (OperationBusy, ControllerNotPaused, NodePressureActive, ReservationConflict):
                 # Expected gates: another writer is converging, controller is
-                # active, or pressure remains. Retry without mutating intent.
+                # active, pressure remains, or a sleep is draining. Retry without
+                # mutating intent.
                 pass
             except Exception as exc:  # keep supervision alive and observable.
                 self._last_error = f"{type(exc).__name__}: {exc}"

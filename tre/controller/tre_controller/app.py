@@ -4,7 +4,7 @@ import asyncio
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Mapping
 
-from tre_common.registry import Registry, load_registry
+from tre_common.registry import Registry, load_registry, sleep_call_timeout_errors
 from tre_controller.config import ControllerConfig
 from tre_controller.gateway_cadence import check_gateway_cadence
 from tre_controller.gateway_health import EnvoyStatsSource
@@ -145,6 +145,26 @@ def _active_probe_models(safescale: SafeScaleStateMachine) -> set[str]:
     return {probe.model for probe in safescale.active_probes()}
 
 
+def resolve_sm_call_timeout_s(cfg: ControllerConfig, registry: Registry) -> float:
+    """The controller's timeout for slow SM calls (scale / binding power / defrag).
+
+    TRE_SM_SLOW_TIMEOUT_SECONDS if set, else the registry's
+    ``service_manager.api_call_timeout_s``. Refuses to start when it does not
+    exceed the worst-case sleeping SM call (the SM would still be draining when
+    the controller gives up and re-plans against a stale view)."""
+    sm_config = registry.service_manager()
+    explicit = getattr(cfg, "sm_slow_timeout_s", None)
+    timeout = float(explicit) if explicit is not None else float(sm_config.api_call_timeout_s)
+    errors = sleep_call_timeout_errors(
+        sm_config,
+        timeout,
+        name="TRE_SM_SLOW_TIMEOUT_SECONDS" if explicit is not None else "service_manager.api_call_timeout_s",
+    )
+    if errors:
+        raise ValueError("controller configuration: " + "; ".join(errors))
+    return timeout
+
+
 def create_controller_dependencies(
     cfg: ControllerConfig,
     *,
@@ -170,7 +190,9 @@ def create_controller_dependencies(
         min_latency_samples=cfg.min_latency_samples,
     )
     sm_client = ServiceManagerClient(
-        cfg.service_manager_url, transport=sm_transport, slow_timeout_s=cfg.sm_slow_timeout_s
+        cfg.service_manager_url,
+        transport=sm_transport,
+        slow_timeout_s=resolve_sm_call_timeout_s(cfg, registry),
     )
     safescale = SafeScaleStateMachine(config=cfg.safescale, store=ControllerStateStore(redis_client))
     safescale.restore()

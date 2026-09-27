@@ -48,6 +48,7 @@ def create_app() -> FastAPI:
         raise RuntimeError("redis package is required for the service-manager server") from exc
 
     registry = load_registry(os.environ.get("TRE_REGISTRY_PATH"))
+    check_service_manager_config(registry)
     redis_url = os.environ.get("TRE_REDIS_URL", "redis://aibrix-redis-master:6379/0")
     redis_client = redis.Redis.from_url(redis_url)
     sm_config = registry.service_manager()
@@ -122,6 +123,16 @@ def create_app() -> FastAPI:
             os.environ.get("TRE_SM_SUPERVISOR_INTERVAL_S", "5")
         ),
     )
+
+
+def check_service_manager_config(registry) -> None:
+    """Refuse to start on an invalid service_manager: / gateway: section, e.g. a
+    worst-case sleeping call that outlasts the controller's call timeout."""
+    errors = registry.validate_service_manager()
+    if errors:
+        raise RuntimeError(
+            "invalid registry service_manager/gateway configuration: " + "; ".join(errors)
+        )
 
 
 def _plugin_pod_lister(k8s_ops: K8sOps, policy):

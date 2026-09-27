@@ -62,6 +62,17 @@ def test_fleet_repair_cannot_be_built_without_the_sleep_primitive():
         FleetRepairExecutor(runtime_ops=object(), vllm_ops=object(), safety_gate=object())
 
 
+def spy_on(primitive, paths):
+    """Record (path, budget, pods) of every sleep: every sleep starts with prepare()."""
+    original = SleepPrimitive.prepare
+
+    def spy(self, targets, *, path, drain_budget_s=None):
+        paths.append((path, drain_budget_s, [t.binding.serve_id for t in targets]))
+        return original(self, targets, path=path, drain_budget_s=drain_budget_s)
+
+    primitive.prepare = spy.__get__(primitive)
+
+
 class Harness:
     def __init__(self, snapshots, *, desired=None, deployments=()):
         self.redis = FakeRedis()
@@ -91,14 +102,7 @@ class Harness:
             gpu_leases=self.leases,
         )
         self.paths = []
-        original = SleepPrimitive.sleep
-        paths = self.paths
-
-        def spy(primitive, targets, *, path, drain_budget_s=None):
-            paths.append((path, drain_budget_s, [t.binding.serve_id for t in targets]))
-            return original(primitive, targets, path=path, drain_budget_s=drain_budget_s)
-
-        self.service._sleep_primitive.sleep = spy.__get__(self.service._sleep_primitive)
+        spy_on(self.service._sleep_primitive, self.paths)
 
     def assert_hidden_before_every_sleep(self):
         hidden = set()
@@ -250,7 +254,7 @@ def test_fleet_repair_quarantine_sleeps_through_primitive():
         safety_gate=FakeSafety(),
     )
     assert service._fleet_repair is not None
-    service._sleep_primitive.sleep = h.service._sleep_primitive.sleep
+    spy_on(service._sleep_primitive, h.paths)
 
     service._fleet_repair._quarantine_and_sleep_residents(
         type("Op", (), {"assert_active": lambda self: None})(),

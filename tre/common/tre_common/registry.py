@@ -328,6 +328,11 @@ class Registry:
     def topology(self) -> ClusterTopology:
         return self._topology
 
+    def validate_service_manager(self) -> list[str]:
+        """Only the service_manager: / gateway: checks (the SM refuses to start on
+        these; model / topology errors are the manifest generator's concern)."""
+        return _validate_service_manager(self._service_manager, self._gateway)
+
     def validate(self) -> list[str]:
         errors: list[str] = []
         seen_models: set[str] = set()

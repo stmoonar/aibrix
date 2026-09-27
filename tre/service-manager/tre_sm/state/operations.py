@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
 import threading
+import time
 from typing import Callable, Iterator, Mapping, Protocol
 from uuid import uuid4
 
@@ -215,9 +216,9 @@ class OperationCoordinator:
 
     @contextmanager
     def operation(
-        self, kind: str, *, request: dict | None = None
+        self, kind: str, *, request: dict | None = None, wait_s: float = 0.0
     ) -> Iterator[OperationHandle]:
-        handle = self.acquire(kind, request=request)
+        handle = self.acquire(kind, request=request, wait_s=wait_s)
         fence_token = _CURRENT_FENCE.set(handle.fence)
         operation_token = _CURRENT_OPERATION.set(handle)
         handle.start()
@@ -268,6 +269,21 @@ class OperationCoordinator:
         return not thread.is_alive()
 
     def acquire(
+        self, kind: str, *, request: dict | None = None, wait_s: float = 0.0
+    ) -> OperationHandle:
+        """Take the writer lock; retry for up to ``wait_s`` while another writer
+        holds it (phases hold it briefly), then raise OperationBusy."""
+        deadline = time.monotonic() + max(0.0, float(wait_s))
+        while True:
+            try:
+                return self._acquire_once(kind, request=request)
+            except OperationBusy:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise
+                time.sleep(min(0.1, remaining))
+
+    def _acquire_once(
         self, kind: str, *, request: dict | None = None
     ) -> OperationHandle:
         operation_id = str(uuid4())

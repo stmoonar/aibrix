@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -12,6 +13,8 @@ if False:  # annotations are strings (from __future__); avoids an import cycle
     from tre_controller.profiling import TickProfiler
 
 CLUSTER_MODEL = "__cluster__"
+
+LOG = logging.getLogger(__name__)
 
 
 class ServiceManagerClient(Protocol):
@@ -66,6 +69,9 @@ class ActionQueue:
         # Review F4: model -> (epoch ms the last successful dispatch completed, "up"/"down").
         self._now_ms = now_ms or (lambda: int(time.time() * 1000))
         self._last_done: dict[str, tuple[int, str]] = {}
+        # One dispatch worker per model (CLUSTER_MODEL for defrag): models proceed
+        # concurrently, a model's own actions stay serialized (review P1-3).
+        self._workers: dict[str, asyncio.Future] = {}
 
     def submit(self, actions: tuple[Action, ...] | list[Action]) -> SubmitResult:
         queued_actions = tuple(_queued_action(action) for action in actions)
@@ -125,51 +131,114 @@ class ActionQueue:
         poll_interval_s: float = 0.1,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
+        """Start per-model dispatch workers without waiting for them: a slow SM call
+        for one model (a scale-down that drains for minutes) never delays another
+        model's actions. Within a model, actions stay serialized and in order."""
         while True:
-            await self.drain_once()
+            self._dispatch_pending([])
+            self._reap_workers()
             await sleep(poll_interval_s)
 
     async def drain_once(self) -> tuple[DispatchResult, ...]:
-        observe = self._is_observe()
+        """Dispatch everything pending - concurrently across models, in order within
+        a model - and wait until it is done (tests / offline integration)."""
         results: list[DispatchResult] = []
-        # Safescale resolution commands are one-shot (they are never re-emitted by the
-        # SafeScaleStateMachine, which deletes the probe on resolve). If we are paused in
-        # observe mode we must NOT drop them like idempotent planner actions -- hold them
-        # in _pending (keeping the model inflight so no conflicting action is queued) so
-        # they dispatch for real once mode returns to non-observe.
-        held: deque[QueuedAction] = deque()
-        _prof_on = self._prof is not None
-        _dispatched = 0
-        _http_ns = 0
-        while self._pending:
-            queued = self._pending.popleft()
-            if observe and queued.source_loop == "safescale":
-                held.append(queued)
-                continue
-            if observe:
-                results.append(DispatchResult(model=queued.model, action_kind=_action_kind(queued.action),
-                                              ok=True, error="observe_skipped"))
-            else:
-                if _prof_on:
-                    _d0 = time.perf_counter_ns()
-                    results.append(await self._dispatch(queued.action, queued.model))
-                    _http_ns += time.perf_counter_ns() - _d0
-                    _dispatched += 1
-                else:
-                    results.append(await self._dispatch(queued.action, queued.model))
-                self._record_done(queued, results[-1])
-            self._inflight.discard(queued.model)
-        self._pending = held
-        if _prof_on and _dispatched:
-            self._prof.record(
-                {
-                    "kind": "dispatch",
-                    "ts_ms": self._prof.now_ms(),
-                    "n_actions": _dispatched,
-                    "http_ns": _http_ns,
-                }
-            )
+        self._dispatch_pending(results)
+        tasks = list(self._workers.values())
+        if tasks:
+            outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+            self._reap_workers()
+            for outcome in outcomes:
+                if isinstance(outcome, BaseException):
+                    raise outcome
         return tuple(results)
+
+    def _dispatch_pending(self, results: list[DispatchResult]) -> None:
+        observe = self._is_observe()
+        if observe:
+            # Safescale resolution commands are one-shot (they are never re-emitted by
+            # the SafeScaleStateMachine, which deletes the probe on resolve). If we are
+            # paused in observe mode we must NOT drop them like idempotent planner
+            # actions -- hold them in _pending (keeping the model inflight so no
+            # conflicting action is queued) so they dispatch for real once mode
+            # returns to non-observe.
+            retained: deque[QueuedAction] = deque()
+            for queued in self._pending:
+                if queued.source_loop == "safescale" or queued.model in self._workers:
+                    retained.append(queued)
+                    continue
+                results.append(
+                    DispatchResult(
+                        model=queued.model,
+                        action_kind=_action_kind(queued.action),
+                        ok=True,
+                        error="observe_skipped",
+                    )
+                )
+            self._pending = retained
+            self._release_idle_models()
+            return
+        for model in dict.fromkeys(item.model for item in self._pending):
+            if model in self._workers:
+                continue
+            self._workers[model] = asyncio.ensure_future(self._model_worker(model, results))
+
+    async def _model_worker(self, model: str, results: list[DispatchResult]) -> None:
+        try:
+            while True:
+                queued = self._next_pending(model)
+                if queued is None:
+                    return
+                if self._is_observe():
+                    if queued.source_loop == "safescale":
+                        self._pending.appendleft(queued)  # held until non-observe
+                        return
+                    results.append(
+                        DispatchResult(
+                            model=queued.model,
+                            action_kind=_action_kind(queued.action),
+                            ok=True,
+                            error="observe_skipped",
+                        )
+                    )
+                    continue
+                started_ns = time.perf_counter_ns()
+                result = await self._dispatch(queued.action, queued.model)
+                if self._prof is not None:
+                    self._prof.record(
+                        {
+                            "kind": "dispatch",
+                            "ts_ms": self._prof.now_ms(),
+                            "n_actions": 1,
+                            "http_ns": time.perf_counter_ns() - started_ns,
+                        }
+                    )
+                self._record_done(queued, result)
+                results.append(result)
+        finally:
+            self._workers.pop(model, None)
+            if not self._has_pending_model(model):
+                self._inflight.discard(model)
+
+    def _next_pending(self, model: str) -> QueuedAction | None:
+        for index, item in enumerate(self._pending):
+            if item.model == model:
+                del self._pending[index]
+                return item
+        return None
+
+    def _release_idle_models(self) -> None:
+        for model in list(self._inflight):
+            if model not in self._workers and not self._has_pending_model(model):
+                self._inflight.discard(model)
+
+    def _reap_workers(self) -> None:
+        """Log (and drop) workers that died with an exception."""
+        for model, task in list(self._workers.items()):
+            if task.done():
+                self._workers.pop(model, None)
+                if not task.cancelled() and task.exception() is not None:
+                    LOG.error("action dispatch for %s failed: %r", model, task.exception())
 
     async def _dispatch(self, action: Action, model: str) -> DispatchResult:
         if isinstance(action, ScaleAction):

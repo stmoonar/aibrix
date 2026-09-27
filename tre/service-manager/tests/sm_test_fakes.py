@@ -267,7 +267,7 @@ class FakeCoordinator:
         self.submitted: list[str] = []
 
     @contextmanager
-    def operation(self, kind, *, request=None):
+    def operation(self, kind, *, request=None, wait_s=0.0):
         operation_id = f"{kind}-{len(self.submitted) + 1}"
         self.submitted.append(operation_id)
         handle = FakeHandle(operation_id)

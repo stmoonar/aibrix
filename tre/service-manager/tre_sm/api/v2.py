@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
+import logging
 import re
 import json
 from dataclasses import replace
@@ -52,6 +54,7 @@ from tre_sm.api.v1_compat import create_v1_compat_router
 
 
 _NAT_SPLIT = re.compile(r"(\d+)")
+LOG = logging.getLogger(__name__)
 
 
 def serialized_operation(kind: str):
@@ -60,7 +63,9 @@ def serialized_operation(kind: str):
         def wrapped(self, *args, **kwargs):
             if self._operation_coordinator is None:
                 return method(self, *args, **kwargs)
-            with self._operation_coordinator.operation(kind) as operation:
+            with self._operation_coordinator.operation(
+                kind, wait_s=self._sm_config.writer_lock_wait_s
+            ) as operation:
                 operation.advance("executing")
                 return method(self, *args, **kwargs)
 
@@ -230,7 +235,6 @@ class ServiceManagerV2:
             state["fleet"] = self.get_fleet_state()
         return state
 
-    @serialized_operation("put_model_target")
     def put_model_target(
         self,
         model: str,
@@ -239,9 +243,43 @@ class ServiceManagerV2:
         sleep_path: str = "scale_down",
         drain_budget_s: float | None = None,
     ) -> dict:
+        """Scale a model to ``wake_replicas`` awake bindings.
+
+        A shrink runs in three lock phases (review P1-3): hide under the writer
+        lock, gateway ack + drain WITHOUT it (the bindings are fenced by sleep
+        reservations), then /sleep + store update under the writer lock again.
+        Growth (wake / create) runs under the writer lock.
+        """
+        with self._writer("put_model_target"):
+            response, batch, targets = self._put_model_target_locked(
+                model,
+                wake_replicas=wake_replicas,
+                sleep_path=sleep_path,
+                drain_budget_s=drain_budget_s,
+            )
+        if batch is None:
+            return response
+        outcomes, version = self._finish_split_sleep("put_model_target", batch, targets)
+        response["version"] = version
+        response["actions"] = [
+            {"action": "sleep", "serve_id": item["serve_id"]} for item in outcomes
+        ]
+        return response
+
+    def _put_model_target_locked(
+        self,
+        model: str,
+        *,
+        wake_replicas: int,
+        sleep_path: str,
+        drain_budget_s: float | None,
+    ) -> tuple[dict, object, list[SleepTarget]]:
         spec = self._registry.model(model)
         if wake_replicas < 0:
             raise ValueError("wake_replicas must be non-negative")
+        # A model with a binding still draining for sleep has an in-flight target
+        # change; the controller serializes per model, so this only fences races.
+        self._assert_not_reserved(model=model, what=f"model target of {model}")
 
         snapshot = self._store.load()
         # Scaling cap (registry max_awake_replicas, v1/paper alignment A1); max_replicas
@@ -263,18 +301,25 @@ class ServiceManagerV2:
             target_bindings=plan["target_bindings"],
             reason="model_target_request",
         )
+        response = {
+            "model": model,
+            "wake_replicas": wake_replicas,
+            "version": snapshot.version,
+            "actions": [],
+        }
+        if plan["sleep"] and self._sleep_primitive is not None and self._runtime_ops is not None:
+            # All bindings of one scale-down are hidden together and drain
+            # concurrently under one budget (the sleep primitive, plan D1/D2).
+            targets = self._sleep_targets_for(plan["sleep"])
+            batch = self._sleep_primitive.prepare(
+                targets, path=sleep_path, drain_budget_s=drain_budget_s
+            )
+            return response, batch, targets
+
         actions: list[dict] = []
         updated_by_serve = {binding.serve_id: binding for binding in snapshot.bindings}
-
-        # All bindings of one scale-down are hidden together and drain
-        # concurrently under one budget (the sleep primitive, plan D1/D2).
-        self._sleep_bindings(
-            plan["sleep"], sleep_path=sleep_path, drain_budget_s=drain_budget_s
-        )
-        for binding in plan["sleep"]:
-            updated_by_serve[binding.serve_id] = replace(
-                binding, awake=False, hidden=False
-            )
+        for binding in plan["sleep"]:  # no runtime: record the intent only
+            updated_by_serve[binding.serve_id] = replace(binding, awake=False, hidden=False)
             actions.append({"action": "sleep", "serve_id": binding.serve_id})
 
         for binding in plan["wake"]:
@@ -311,13 +356,9 @@ class ServiceManagerV2:
                 if current_counts["awake"] != wake_replicas:
                     raise
                 version = current.version
-
-        return {
-            "model": model,
-            "wake_replicas": wake_replicas,
-            "version": version,
-            "actions": actions,
-        }
+        response["version"] = version
+        response["actions"] = actions
+        return response, None, []
 
     def _plan_model_target(
         self,
@@ -408,7 +449,6 @@ class ServiceManagerV2:
             "target_bindings": target + creates,
         }
 
-    @serialized_operation("put_binding_power")
     def put_binding_power(
         self,
         serve_id: str,
@@ -417,17 +457,142 @@ class ServiceManagerV2:
         sleep_path: str = "scale_down",
         drain_budget_s: float | None = None,
     ) -> dict:
-        if awake:
-            # Controller-requested wake: same scaling cap as put_model_target. Fleet
-            # repair (_set_binding_power_by_id_unlocked) restores recorded desired state
-            # and is deliberately not capped here.
+        """Wake or sleep one binding. A sleep runs in the three lock phases of
+        :meth:`put_model_target` (drain outside the writer lock)."""
+        with self._writer("put_binding_power"):
+            if awake:
+                # Controller-requested wake: same scaling cap as put_model_target. Fleet
+                # repair (_set_binding_power_by_id_unlocked) restores recorded desired
+                # state and is deliberately not capped here.
+                snapshot = self._store.load()
+                binding = next((item for item in snapshot.bindings if item.serve_id == serve_id), None)
+                if binding is not None and not binding.awake:
+                    self._ensure_wake_within_cap(binding, snapshot.bindings)
+                return self._put_binding_power_unlocked(
+                    serve_id, awake=True, sleep_path=sleep_path, drain_budget_s=drain_budget_s
+                )
+            if self._sleep_primitive is None or self._runtime_ops is None:
+                return self._put_binding_power_unlocked(
+                    serve_id, awake=False, sleep_path=sleep_path, drain_budget_s=drain_budget_s
+                )
             snapshot = self._store.load()
             binding = next((item for item in snapshot.bindings if item.serve_id == serve_id), None)
-            if binding is not None and not binding.awake:
-                self._ensure_wake_within_cap(binding, snapshot.bindings)
-        return self._put_binding_power_unlocked(
-            serve_id, awake=awake, sleep_path=sleep_path, drain_budget_s=drain_budget_s
-        )
+            if binding is None:
+                raise ValueError(f"unknown binding: {serve_id}")
+            self._assert_not_reserved(binding=binding, gpus=False, what=f"power change of {serve_id}")
+            self._update_desired(
+                {binding.binding_id: {"power": "sleeping", "hidden": False}},
+                updated_by="service-manager-api",
+                reason="binding_power_request",
+            )
+            if not binding.awake:
+                return {
+                    "serve_id": serve_id,
+                    "awake": False,
+                    "version": snapshot.version,
+                    "actions": [],
+                    "binding": self._binding_dict(binding),
+                }
+            targets = self._sleep_targets_for([binding])
+            batch = self._sleep_primitive.prepare(
+                targets, path=sleep_path, drain_budget_s=drain_budget_s
+            )
+        _outcomes, version = self._finish_split_sleep("put_binding_power", batch, targets)
+        return {
+            "serve_id": serve_id,
+            "awake": False,
+            "version": version,
+            "actions": [{"action": "sleep", "serve_id": serve_id}],
+            "binding": self._binding_dict(replace(binding, awake=False, hidden=False)),
+        }
+
+    @contextmanager
+    def _writer(self, kind: str, *, request: dict | None = None):
+        """Hold the SM writer lock for one phase, waiting up to
+        ``service_manager.writer_lock_wait_s`` for it."""
+        if self._operation_coordinator is None:
+            yield None
+            return
+        with self._operation_coordinator.operation(
+            kind, request=request, wait_s=self._sm_config.writer_lock_wait_s
+        ) as operation:
+            operation.advance("executing")
+            yield operation
+
+    def _finish_split_sleep(
+        self, kind: str, batch, targets: list[SleepTarget]
+    ) -> tuple[list[dict], int]:
+        """Phase 2 (drain, no writer lock) and phase 3 (commit, writer lock) of a
+        sleep prepared under the lock. Returns (outcomes, legacy store version)."""
+        primitive = self._sleep_primitive
+        try:
+            primitive.drain(batch)
+        except SleepFailed as exc:
+            # Every target was rolled back by the primitive; give them their
+            # desired power back (needs the writer lock; best effort).
+            self._record_after_unlocked_failure(kind, targets, exc.outcomes)
+            raise
+        entered = False
+        try:
+            with self._writer(f"{kind}_commit") as operation:
+                entered = True
+                if operation is not None:
+                    operation.advance("committing_sleep", details={"pods": [t.binding.serve_id for t in targets]})
+                try:
+                    outcomes = primitive.commit(batch)
+                except SleepFailed as exc:
+                    self._record_sleep_outcomes(targets, exc.outcomes, update_store=True)
+                    raise
+                self._record_sleep_outcomes(targets, outcomes, update_store=True)
+                return outcomes, self._store.load().version
+        except OperationBusy:
+            if entered:
+                raise
+            # The commit phase could not get the writer lock: nothing was slept,
+            # roll the hide back (routing restored under a new route-gen).
+            outcomes = primitive.abandon(
+                batch, reason="writer lock unavailable for the sleep commit phase"
+            )
+            self._record_after_unlocked_failure(kind, targets, outcomes)
+            raise
+
+    def _record_after_unlocked_failure(
+        self, kind: str, targets: list[SleepTarget], outcomes: list[dict]
+    ) -> None:
+        try:
+            with self._writer(f"{kind}_rollback"):
+                self._record_sleep_outcomes(targets, outcomes, update_store=True)
+        except Exception:  # the audit reports the desired/observed mismatch
+            LOG.exception("recording the rolled-back sleep of %s failed", [t.binding.serve_id for t in targets])
+
+    def _reservations(self) -> SleepReservations | None:
+        return None if self._sleep_primitive is None else self._sleep_primitive.reservations
+
+    def _assert_not_reserved(
+        self,
+        *,
+        what: str,
+        binding: Binding | None = None,
+        slot: Slot | None = None,
+        model: str | None = None,
+        gpus: bool = True,
+    ) -> None:
+        """Refuse an operation that conflicts with a binding draining for sleep:
+        same binding, overlapping GPUs, or (``model``) any binding of the model."""
+        reservations = self._reservations()
+        if reservations is None:
+            return
+        if binding is not None:
+            reservations.assert_free(
+                node=binding.slot.node,
+                gpu_ids=binding.slot.gpu_ids if gpus else (),
+                binding_id=binding.binding_id,
+                what=what,
+            )
+        if slot is not None:
+            reservations.assert_free(node=slot.node, gpu_ids=slot.gpu_ids, what=what)
+        if model is not None:
+            reservations.assert_free(node="", gpu_ids=(), model=model, what=what)
 
     def _put_binding_power_unlocked(
         self,
@@ -444,6 +609,8 @@ class ServiceManagerV2:
         )
         if binding is None:
             raise ValueError(f"unknown binding: {serve_id}")
+        # A binding draining for sleep takes no other power / intent change.
+        self._assert_not_reserved(binding=binding, gpus=False, what=f"power change of {serve_id}")
 
         intent: dict[str, object] = {"power": "awake" if awake else "sleeping"}
         if not awake:
@@ -511,6 +678,11 @@ class ServiceManagerV2:
         actions: list[dict] = []
         updated_by_serve = {binding.serve_id: binding for binding in snapshot.bindings}
         for binding in model_bindings:
+            if binding.hidden != (binding.serve_id in requested_hidden):
+                self._assert_not_reserved(
+                    binding=binding, gpus=False, what=f"hide/unhide of {binding.serve_id}"
+                )
+        for binding in model_bindings:
             should_hide = binding.serve_id in requested_hidden
             if binding.hidden == should_hide:
                 continue
@@ -544,6 +716,12 @@ class ServiceManagerV2:
         migrations = allocator.plan_defrag(tp_size)
         if migrations is None:
             raise DefragUnavailable("no_feasible_defrag")
+        by_serve = {binding.serve_id: binding for binding in snapshot.bindings}
+        for migration in migrations:
+            source = by_serve.get(migration.serve_id)
+            if source is not None:
+                self._assert_not_reserved(binding=source, what=f"defrag of {source.serve_id}")
+            self._assert_not_reserved(slot=migration.to_slot, what="defrag destination")
         self._set_defrag_desired(snapshot.bindings, migrations)
         if migrations:
             self._ensure_all_model_routes()
@@ -689,9 +867,14 @@ class ServiceManagerV2:
         ):
             active = self._operation_coordinator.active_operation()
             active_id = None if active is None else active.get("operation_id")
+        live_tokens = {
+            reservation.token for reservation in self._sleep_primitive.reservations.active().values()
+        }
         issues: list[dict] = []
         for pod_name, record in sorted(journal.items()):
             owner_op = record.get("operation_id")
+            if record.get("reservation_token") in live_tokens:
+                continue  # a drain in progress (outside the writer lock)
             if owner_op is None or owner_op != active_id:
                 issues.append(
                     {
@@ -745,6 +928,13 @@ class ServiceManagerV2:
         if self._safety_gate is None:
             raise ValueError("fleet repair safety gate is not configured")
         self._safety_gate.assert_controller_observe()
+        reservations = self._reservations()
+        active = reservations.active() if reservations is not None else {}
+        if active:
+            raise ReservationConflict(
+                f"fleet repair waits for sleeps in progress: {sorted(active)}",
+                binding_id=sorted(active)[0],
+            )
         snapshot = self._store.load()
         targets = (
             sorted(set(awake_binding_ids))
@@ -939,6 +1129,9 @@ class ServiceManagerV2:
                 f"{active.get('owner')}:{active.get('fencing_token')}"
             )
 
+        self._assert_not_reserved(
+            slot=Slot(pod.node, pod.gpu_ids), what=f"startup admission of {pod_name}"
+        )
         conflict = self._conflicting_transient_lease(pod)
         if conflict is not None:
             gpu_id, occupant = conflict
@@ -1505,6 +1698,7 @@ class ServiceManagerV2:
             return
         if action != "wake":
             raise ValueError(f"unknown runtime action: {action}")
+        self._assert_not_reserved(binding=binding, what=f"wake of {binding.serve_id}")
         snapshot = self._snapshot_for_binding(binding)
         if not snapshot.pod_ip:
             raise ValueError(f"pod {binding.serve_id} has no pod IP for {action}")
@@ -1587,17 +1781,30 @@ class ServiceManagerV2:
                 self._gpu_leases.release(binding)
         if not update_store:
             return
-        if slept:
-            slept_ids = {binding.binding_id for binding in slept}
+        slept_ids = {binding.binding_id for binding in slept}
+        rolled_hidden = {
+            item["binding_id"]: item.get("previous_state") == POD_STATE_HIDDEN
+            for item in outcomes
+            if item.get("status") == STATUS_ROLLED_BACK
+        }
+        for attempt in range(3 if (slept_ids or rolled_hidden) else 0):
             snapshot = self._store.load()
-            updated = [
-                replace(binding, awake=False, hidden=False)
-                if binding.binding_id in slept_ids
-                else binding
-                for binding in snapshot.bindings
-            ]
-            if updated != snapshot.bindings:
+            updated = []
+            for binding in snapshot.bindings:
+                if binding.binding_id in slept_ids:
+                    binding = replace(binding, awake=False, hidden=False)
+                elif binding.binding_id in rolled_hidden and binding.awake:
+                    # A reconcile during the drain may have recorded the hide.
+                    binding = replace(binding, hidden=rolled_hidden[binding.binding_id])
+                updated.append(binding)
+            if updated == snapshot.bindings:
+                break
+            try:
                 self._store.save(updated, expected_version=snapshot.version)
+                break
+            except StateConflict:
+                if attempt == 2:
+                    raise
         restore = {
             item["binding_id"]: {
                 "power": "awake",
@@ -1731,6 +1938,7 @@ class ServiceManagerV2:
     def _create_and_wake_runtime_binding(self, model: str, slot: Slot) -> Binding:
         if self._runtime_ops is None or self._vllm_ops is None:
             raise ValueError("runtime_ops and vllm_ops are required for runtime create")
+        self._assert_not_reserved(slot=slot, what=f"cold start of {model}")
         self._ensure_create_headroom(slot)
         planned = Binding("startup", model, slot, awake=False)
         if self._gpu_leases is not None:
