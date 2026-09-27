@@ -289,10 +289,36 @@ func (ef *EngineMetricsFetcher) getAvailableMetricsForEngine(engineType string) 
 	return availableMetrics
 }
 
+// TRE-PATCH(P2-GW-006): engine metrics renamed upstream. vLLM >= 0.11 no longer exports
+// vllm:gpu_cache_usage_perc (now vllm:kv_cache_usage_perc, the same 0..1 KV-cache fill)
+// or vllm:time_per_output_token_seconds (now vllm:inter_token_latency_seconds, the same
+// per-token histogram). The mapped (old) name is read first, so older engines are
+// unchanged; a newer engine is read under the new name. Without this, least-gpu-cache
+// routing falls back to random and the TRE Redis TPOT histogram (SafeScale SLO check)
+// stays empty on vLLM 0.30.
+var engineMetricAliases = map[string][]string{
+	"vllm:gpu_cache_usage_perc":          {"vllm:kv_cache_usage_perc"},
+	"vllm:time_per_output_token_seconds": {"vllm:inter_token_latency_seconds"},
+}
+
+// lookupMetricFamily returns the family of rawMetricName, else of its first present
+// alias, and the name it was found under.
+func lookupMetricFamily(allMetrics map[string]*dto.MetricFamily, rawMetricName string) (*dto.MetricFamily, string, bool) {
+	if family, ok := allMetrics[rawMetricName]; ok {
+		return family, rawMetricName, true
+	}
+	for _, alias := range engineMetricAliases[rawMetricName] {
+		if family, ok := allMetrics[alias]; ok {
+			return family, alias, true
+		}
+	}
+	return nil, rawMetricName, false
+}
+
 // parseMetricFromFamily parses the first instance of a metric family. It is used for
 // pod-scoped metrics, which are not differentiated by model_name.
 func (ef *EngineMetricsFetcher) parseMetricFromFamily(allMetrics map[string]*dto.MetricFamily, rawMetricName string, metric Metric) (MetricValue, error) {
-	metricFamily, exists := allMetrics[rawMetricName]
+	metricFamily, rawMetricName, exists := lookupMetricFamily(allMetrics, rawMetricName)
 	if !exists {
 		return nil, fmt.Errorf("raw metric %s not found", rawMetricName)
 	}
@@ -308,7 +334,7 @@ func (ef *EngineMetricsFetcher) parseMetricFromFamily(allMetrics map[string]*dto
 // multi-model pod no longer share a single instance. Instances that repeat a model_name (differing
 // only by a non-model label) are folded together by aggregateModelMetric.
 func (ef *EngineMetricsFetcher) parseModelMetricsFromFamily(allMetrics map[string]*dto.MetricFamily, rawMetricName string, metric Metric) (map[string]MetricValue, error) {
-	metricFamily, exists := allMetrics[rawMetricName]
+	metricFamily, rawMetricName, exists := lookupMetricFamily(allMetrics, rawMetricName)
 	if !exists {
 		return nil, fmt.Errorf("raw metric %s not found", rawMetricName)
 	}
