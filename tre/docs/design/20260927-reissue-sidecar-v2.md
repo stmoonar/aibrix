@@ -60,7 +60,10 @@
 tools/functions（除非 `tool_choice: none`）、结构化输出 / guided decoding（`response_format` 非 text、`guided_*`、`structural_tag`、`structured_outputs`）、
 批量 prompt / `prompt_embeds` / `suffix`、completions 与 chat 以外的端点。SM 对这些请求一律等排空；若仍被 abort：
 - 流式且已向客户端发过内容：abort 透传，计 `passthrough_abort{reason=non_continuable_*}`；
-- 非流式（客户端还什么都没收到）：原请求纯重试（精确），计 `retry{reason=abort_non_continuable_*}`。
+- 非流式（客户端还什么都没收到）：原请求**从头纯重试**（精确），计 `retry{reason=abort_non_continuable_*}`。
+  这是对任务原规则（“不可续发一律透传 abort 并计数”）的有意偏离，已被协调方接受（2026-09-27）：非流式响应在 sidecar 里缓冲，
+  客户端没有收到任何字节，重发原请求的结果与不中断时语义相同，只多花一次计算；透传 abort 反而会让客户端看到截断，违反要求 3。
+  同理，非流式、可续发但 abort 输出缺 token id 时也走纯重试，而不是 `failed{no_token_ids}`。
 
 ## 5. 拼接
 
@@ -111,7 +114,7 @@ registry（`deploy/registry.yaml` 与 `overlays/tre-v2/params.yaml` 中的 `tre-
 ```yaml
 reissue:
   enabled: true            # false = 模型 pod 与无 sidecar 时逐字节相同
-  gateway_url: http://envoy-tre-v2-tre-aibrix-eg-161007f9.envoy-gateway-system.svc.cluster.local:80
+  gateway_url: null        # null = gateway: 段的稳定 Service（见下）
   vllm_port: 8001
   max_depth: 3
   retry_attempts: 4
@@ -130,7 +133,22 @@ models:
 
 - `vllm_features` 映射为 vLLM 参数 `--sleep-reject-new`、`--abort-return-token-ids`，**只在 `reissue.enabled` 时**渲染（两者只对 sidecar 有意义）。
   当前仓库 registry 的模型仍是 `0.10.1-sleep` 镜像，未声明特性：sidecar 照样部署，能做“已知在睡时转发”和 409 保护，但续发会因缺 token id 计 `failed{no_token_ids}` 并透传 abort，直到换 0.30 fork 镜像（D9）并声明特性。
-- `gateway_url` 默认是 Envoy Gateway 为 `tre-v2/tre-aibrix-eg` 生成的 Service（名字由 namespace/name 哈希决定，跨集群相同）；P4 固定 Service 名后改这里即可。
+- **网关地址（2026-09-27 修正）**：Envoy Gateway 自己生成的代理 Service 名带哈希后缀（`envoy-<ns>-<gateway>-<hash>`），不可移植，
+  TRE 不再引用它（守卫测试 `test_no_envoy_gateway_hashed_names_in_tre`：`tre/` 下除 `tre/docs/` 外不得出现这类名字）。
+  tre-v2 overlay 新增稳定的 ClusterIP `gateway-service.yaml`：`tre-gateway`，位于代理 pod 所在的 namespace（默认 `envoy-gateway-system`，
+  Service 只能选同 namespace 的 pod），按 `gateway.envoyproxy.io/owning-gateway-name: tre-aibrix-eg` /
+  `owning-gateway-namespace: tre-v2` 选择代理 pod（与 `gateway-stats.yaml` 相同），端口 80 → 10080（EG 把 80 端口监听器映射到容器端口 10080）。
+  名字与 namespace 是 kustomize 参数（`gateway-service-params.yaml`，local-config，经 `replacements` 写入 Service）。
+  registry `gateway.service_name` / `service_namespace` / `service_port`（默认 `tre-gateway` / `envoy-gateway-system` / 80）渲染出
+  sidecar 的 `TRE_GATEWAY_URL = http://tre-gateway.envoy-gateway-system.svc.cluster.local:80`；`reissue.gateway_url` 非空时覆盖。
+  外部 NodePort / LoadBalancer 的固定仍是 P4。
+```yaml
+gateway:
+  route_timeout_s: 150
+  service_name: tre-gateway
+  service_namespace: envoy-gateway-system
+  service_port: 80
+```
 
 ## 9. 清单（`make manifests`）
 
@@ -166,5 +184,6 @@ models:
 - 未做“卡在 pause 后面”的请求检测（旧分支的 stuck scan）：依赖 `--sleep-reject-new`；没有该特性的镜像上，与 /sleep 竞速到达引擎的极少数请求会等到 wake。
 - 在途占用翻倍：续发期间原连接（客户端 → Envoy → pod A sidecar）与续发请求（sidecar A → Envoy → pod B）同时占网关配额，gateway_health 的分母被抬高（同旧设计 §5）。
 - 续发在 B 上重新 prefill（部署关闭了 prefix caching），gap 计入 TPOT / E2E，TTFT 保持第一段。
-- replayer 尚未记录 `tre_continued` / `x-tre-retried`（P3 验收项“x-tre-continued 进 replayer 日志”待做）。
+- replayer 已记录每请求 `finish_reason` / `tre_continued`（finish chunk 字段、结尾注释或 `x-tre-continued` 头）/ `tre_retried`（`x-tre-retried` 头），run 摘要有 `reissue{abort,retry,continue,continued_segments,by_model}` 与 `reissue_contaminated`（continue>0）。loadgen_v1 未改。
+- `tre-gateway` Service 尚未 apply 到集群；在它存在之前，按新清单起的 sidecar 无法重试 / 续发（请求照常透传，只是兜底失效）。
 - 端到端验收（`mode=abort` 强制睡眠 + 32 路在途 → 100% 完整响应、接缝 0）需要 GPU 与 fork 镜像，未做。
