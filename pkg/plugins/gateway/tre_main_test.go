@@ -21,9 +21,10 @@ import (
 	"testing"
 )
 
-// TestMain runs the package with the TRE default routing strategy (D10) switched off, so
-// the upstream tests keep exercising the "no strategy -> HTTPRoute" path they were written
-// for. TRE tests that need the default set it explicitly via setTREDefaultRoutingStrategy.
+// TestMain pins the optional TRE default routing strategy off (its code default), even if
+// TRE_DEFAULT_ROUTING_STRATEGY is set in the environment, so the upstream tests keep
+// exercising the "no strategy -> HTTPRoute" path they were written for. TRE tests that
+// need it set it explicitly via setTREDefaultRoutingStrategy.
 func TestMain(m *testing.M) {
 	setTREDefaultRoutingStrategy("")
 	os.Exit(m.Run())

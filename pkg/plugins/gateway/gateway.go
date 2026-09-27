@@ -109,6 +109,8 @@ type processState struct {
 	ttftSpan         trace.Span
 	// TRE-PATCH(P3-GW-009): the inflight slot this request holds on its target pod.
 	treTicket *treInflightTicket
+	// TRE-PATCH(P3-GW-012): the response body reached end_of_stream.
+	respBodyEOS bool
 }
 
 var podName = os.Getenv("POD_NAME")
@@ -188,7 +190,11 @@ func (s *Server) Process(srv extProcPb.ExternalProcessor_ProcessServer) error {
 		}
 		// Proactively break the loop if the response is fully processed.
 		// This allows Envoy to gracefully close the stream and send 0\r\n\r\n.
-		if st.completed {
+		// TRE-PATCH(P3-GW-012): with coordination on, "completed" (usage seen) is only
+		// accounting: the stream, and with it the inflight slot, ends at the response
+		// body's end_of_stream. A stream with stream_options.continuous_usage_stats carries
+		// usage in every chunk and must stay counted until its last byte.
+		if st.completed && (st.respBodyEOS || !treGW.enabled.Load()) {
 			klog.V(4).InfoS("request actively finished, breaking ext_proc stream", "requestID", st.requestID)
 			if st.model != "" {
 				s.emitMetricsCounterHelper(metrics.GatewayRequestModelSuccessTotal, st.model, "gateway_request_success", "200")
@@ -360,6 +366,9 @@ func (s *Server) handleProcessingRequest(st *processState, req *extProcPb.Proces
 		st.metricLabel = gatewayRespHeaders
 
 	case *extProcPb.ProcessingRequest_ResponseBody:
+		if req.GetResponseBody().GetEndOfStream() {
+			st.respBodyEOS = true // TRE-PATCH(P3-GW-012)
+		}
 		// stop collecting on first resp only
 		if st.ttftSpan != nil {
 			st.ttftSpan.End()
@@ -475,6 +484,12 @@ func (s *Server) selectTargetPod(ctx context.Context, routeCtx *types.RoutingCon
 		readyPods = kept
 	}
 
+	// TRE-PATCH(P3-GW-013): routers that cannot honour this request's candidate list, or
+	// that reach a pod which is not counted, are refused while coordination is on.
+	if err := treCheckRouterSupported(routeCtx.Algorithm, nil); err != nil {
+		return "", err
+	}
+
 	if routeCtx.Algorithm == routing.RouterPD {
 		engine, err := routing.ValidateAndGetLLMEngine(readyPods)
 		if err != nil {
@@ -485,6 +500,9 @@ func (s *Server) selectTargetPod(ctx context.Context, routeCtx *types.RoutingCon
 
 	router, err := routing.Select(routeCtx)
 	if err != nil {
+		return "", err
+	}
+	if err := treCheckRouterSupported(routeCtx.Algorithm, router); err != nil {
 		return "", err
 	}
 
@@ -635,6 +653,11 @@ func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) Shutdown() {
+	// TRE-PATCH(P3-GW-013): refuse new commits (503 + Retry-After) first, so that no
+	// request is counted after the inflight fields are cleared below.
+	if s.treWriter != nil {
+		treGW.beginShutdown()
+	}
 	if s.shutdown != nil {
 		s.shutdownOnce.Do(func() { close(s.shutdown) })
 	}

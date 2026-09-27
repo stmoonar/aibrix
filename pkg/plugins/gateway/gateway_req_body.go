@@ -121,11 +121,13 @@ func (s *Server) handleRequestBody(ctx context.Context, routingCtx *types.Routin
 		routingCtx.Algorithm = routingAlgorithm
 	}
 
-	// TRE-PATCH(P3-GW-010, D5): exclusion needs pod-level routing. If no strategy resolved
-	// (TRE default disabled), fall back to the random router rather than the Service path,
-	// which could hand the request back to an excluded pod.
+	// TRE-PATCH(P3-GW-010/013, D5/D10): exclusion and coordination need pod-level routing.
+	// If no strategy resolved (no header, profile, ROUTING_ALGORITHM or
+	// TRE_DEFAULT_ROUTING_STRATEGY), use the random router rather than the Service path:
+	// the Service path could hand the request back to an excluded pod, and a request it
+	// carries is neither counted in inflight nor bound to the acked route table.
 	excludedPods := treExcludedPods(routingCtx.ReqHeaders)
-	if routingAlgorithm == routing.RouterNotSet && len(excludedPods) > 0 {
+	if routingAlgorithm == routing.RouterNotSet && (len(excludedPods) > 0 || treGW.enabled.Load()) {
 		routingAlgorithm = routing.RouterRandom
 		routingCtx.Algorithm = routingAlgorithm
 	}
@@ -168,12 +170,16 @@ func (s *Server) handleRequestBody(ctx context.Context, routingCtx *types.Routin
 			if targetPodIP == "" || err != nil {
 				break
 			}
-			var committed bool
 			var target *v1.Pod
 			if routingCtx.HasRouted() {
 				target = routingCtx.TargetPod()
 			}
-			if ticket, committed = treGW.commit(target, nonContinuable); committed {
+			var cerr error
+			if ticket, cerr = treGW.commit(target, nonContinuable); cerr == nil {
+				break
+			}
+			if !errors.Is(cerr, errTRENotRoutable) {
+				targetPodIP, err = "", cerr // shutting down / no target: fail closed
 				break
 			}
 			if attempt >= treCommitAttempts {
@@ -189,8 +195,12 @@ func (s *Server) handleRequestBody(ctx context.Context, routingCtx *types.Routin
 		}
 		if targetPodIP == "" || err != nil {
 			klog.ErrorS(err, "failed to select target pod", "requestID", requestID, "routingStrategy", routingAlgorithm, "model", model, "routingDuration", routingCtx.GetRoutingDelay())
+			if errors.Is(err, errTREUnsupportedRouter) {
+				return buildErrorResponse(envoyTypePb.StatusCode_BadRequest, err.Error(), "", "", HeaderErrorRouting, "true"), model, stream, term, nil
+			}
 			msg := "error on selecting target pod"
-			if errors.Is(err, errTREAllCandidatesExcluded) || errors.Is(err, errTRECommitRace) {
+			if errors.Is(err, errTREAllCandidatesExcluded) || errors.Is(err, errTRECommitRace) ||
+				errors.Is(err, errTREShuttingDown) || errors.Is(err, errTRENoTarget) {
 				msg = err.Error()
 			}
 			// Retry-After: the sidecar (and well-behaved clients) retry shortly; a hidden or

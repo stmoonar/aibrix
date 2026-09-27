@@ -148,7 +148,10 @@ func (s *Server) HandleResponseBody(ctx context.Context, routerCtx *types.Routin
 						// Hence the usage path there is "response.usage".
 						usageResult = gjson.GetBytes(jsonBytes, "response.usage")
 					}
-					if usageResult.Exists() && usageResult.IsObject() {
+					// TRE-PATCH(P3-GW-012): with stream_options.continuous_usage_stats every
+					// chunk carries a running usage; only the chunk that ends the generation
+					// (no choices, or a finish_reason) carries the final totals.
+					if usageResult.Exists() && usageResult.IsObject() && treFinalStreamUsage(jsonBytes) {
 						// Assumption: The upstream sends the usage object only in the final chunk
 						// (standard vLLM/OpenAI behavior). We overwrite/set the values here.
 						// The Responses API uses input_tokens/output_tokens instead of
@@ -183,7 +186,8 @@ func (s *Server) HandleResponseBody(ctx context.Context, routerCtx *types.Routin
 		}
 	}
 
-	if totalTokens != 0 {
+	// TRE-PATCH(P3-GW-012): account a request once, even if a later chunk repeats usage.
+	if totalTokens != 0 && !hasCompleted {
 		complete = true
 
 		// Count token per user.
@@ -221,6 +225,26 @@ func (s *Server) HandleResponseBody(ctx context.Context, routerCtx *types.Routin
 			},
 		},
 	}, complete
+}
+
+// treFinalStreamUsage reports whether an SSE event's usage is the request's final usage:
+// events without choices (the include_usage chunk, Responses API events) or with a
+// finished choice. Intermediate continuous_usage_stats chunks return false.
+func treFinalStreamUsage(event []byte) bool {
+	choices := gjson.GetBytes(event, "choices")
+	if !choices.Exists() || !choices.IsArray() {
+		return true
+	}
+	arr := choices.Array()
+	if len(arr) == 0 {
+		return true
+	}
+	for _, c := range arr {
+		if fr := c.Get("finish_reason"); fr.Exists() && fr.Type != gjson.Null && fr.String() != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func isLanguageRequest(requestPath string) bool {

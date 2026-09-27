@@ -227,8 +227,8 @@ func TestTREAck_WaitsForInProgressCommitAndCarriesItsInflight(t *testing.T) {
 	assert.Equal(t, int64(1), in.NonContinuable)
 
 	// After the ack no request can be committed to p.
-	_, committed := g.commit(pod, false)
-	assert.False(t, committed)
+	_, cerr := g.commit(pod, false)
+	assert.ErrorIs(t, cerr, errTRENotRoutable)
 
 	ticket.Release()
 	require.Eventually(t, func() bool {
@@ -527,9 +527,10 @@ func TestTREInflight_MirroredToRedis(t *testing.T) {
 	require.NoError(t, err)
 	defer w.shutdown()
 
-	k1, ok := g.commit(treGenPod("p", "10.0.0.1", "true", 1), false)
-	require.True(t, ok)
-	k2, _ := g.commit(treGenPod("p", "10.0.0.1", "true", 1), true)
+	k1, err := g.commit(treGenPod("p", "10.0.0.1", "true", 1), false)
+	require.NoError(t, err)
+	k2, err := g.commit(treGenPod("p", "10.0.0.1", "true", 1), true)
+	require.NoError(t, err)
 	require.Eventually(t, func() bool {
 		v, ok := readInflight(t, client, "p", "gw-test-0")
 		return ok && v.Total == 2 && v.NonContinuable == 1
@@ -596,7 +597,24 @@ func TestTRENonContinuable(t *testing.T) {
 		{PathChatCompletions, `{"messages":[],"logprobs":false,"top_logprobs":0}`, false},
 		{PathChatCompletions, `{"messages":[],"logprobs":true}`, true},
 		{PathChatCompletions, `{"messages":[],"top_logprobs":2}`, true},
-		{PathChatCompletions, `{"messages":[],"tools":[{"type":"function"}]}`, false},
+		{PathChatCompletions, `{"messages":[],"tools":[{"type":"function"}]}`, true}, // non-streaming tool calls too
+		{PathChatCompletions, `{"messages":[],"tools":[{"type":"function"}],"tool_choice":"none"}`, false},
+		{PathChatCompletions, `{"messages":[],"tool_choice":"auto"}`, false},
+		{PathChatCompletions, `{"messages":[],"tool_choice":{"type":"function","function":{"name":"f"}}}`, true},
+		{PathChatCompletions, `{"messages":[],"functions":[{"name":"f"}],"function_call":"none"}`, false},
+		{PathChatCompletions, `{"messages":[],"response_format":{"type":"text"}}`, false},
+		{PathChatCompletions, `{"messages":[],"response_format":{"type":"json_object"}}`, true},
+		{PathChatCompletions, `{"messages":[],"response_format":{"type":"json_schema","json_schema":{"name":"x","schema":{}}}}`, true},
+		{PathChatCompletions, `{"messages":[],"response_format":"weird"}`, true},
+		{PathCompletions, `{"prompt":"x","guided_json":{"type":"object"}}`, true},
+		{PathCompletions, `{"prompt":"x","guided_regex":"a+"}`, true},
+		{PathCompletions, `{"prompt":"x","guided_choice":["a","b"]}`, true},
+		{PathCompletions, `{"prompt":"x","guided_grammar":"root ::= \"a\""}`, true},
+		{PathCompletions, `{"prompt":"x","guided_json_object":true}`, true},
+		{PathCompletions, `{"prompt":"x","guided_json_object":false,"guided_regex":null}`, false},
+		{PathChatCompletions, `{"messages":[],"structured_outputs":{"json":{"type":"object"}}}`, true},
+		{PathChatCompletions, `{"messages":[],"structural_tag":"{}"}`, true},
+		{PathCompletions, `{"prompt":"x","seed":1,"presence_penalty":0.5,"repetition_penalty":1.1}`, false}, // documented drift, not drained
 		{PathChatCompletions, `{"messages":[],"stream":true,"tools":[{"type":"function"}]}`, true},
 		{PathChatCompletions, `{"messages":[],"stream":true,"tools":[]}`, false},
 		{PathChatCompletions, `{"messages":[],"stream":true,"tool_choice":"none"}`, false},
@@ -794,6 +812,8 @@ func TestTREDefaultRoutingStrategy(t *testing.T) {
 }
 
 func TestTREDefaultRoutingStrategyEnv(t *testing.T) {
+	t.Setenv(envTREDefaultRoutingStrategy, "")
+	assert.Equal(t, "", loadTREDefaultRoutingStrategy(), "off by default")
 	t.Setenv(envTREDefaultRoutingStrategy, "none")
 	assert.Equal(t, "", loadTREDefaultRoutingStrategy())
 	t.Setenv(envTREDefaultRoutingStrategy, "random")
