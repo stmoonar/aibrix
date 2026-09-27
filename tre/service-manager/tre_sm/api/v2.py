@@ -29,12 +29,17 @@ from tre_sm.allocator.topology import K8sPodSnapshot
 from tre_sm.gpu_truth import GpuTruthProvider
 from tre_sm.ops.k8s_ops import StartupPodRecord
 from tre_sm.ops.sleep_primitive import (
+    STATUS_ROLLED_BACK,
+    STATUS_SLEPT,
     Clock,
     GatewayState,
+    ServiceShuttingDown,
+    SleepFailed,
     SleepJournal,
     SleepPrimitive,
     SleepTarget,
 )
+from tre_sm.state.sleep_reservations import ReservationConflict, SleepReservations
 from tre_sm.state.reconcile import K8sPodClient, POD_STATE_AWAKE, POD_STATE_HIDDEN, POD_STATE_SLEEPING, audit_state, reconcile_state
 from tre_sm.state.operations import OperationBusy, OperationCoordinator, current_operation
 from tre_sm.state.fleet_repair import FleetRepairExecutor
@@ -150,6 +155,7 @@ class ServiceManagerV2:
         gateway_state: GatewayState | None = None,
         sleep_journal: SleepJournal | None = None,
         sleep_clock: Clock | None = None,
+        sleep_reservations: SleepReservations | None = None,
     ) -> None:
         self._registry = registry
         config = getattr(registry, "service_manager", None)
@@ -165,6 +171,7 @@ class ServiceManagerV2:
                 policy=self._sm_config.sleep,
                 gateway=gateway_state,
                 journal=sleep_journal or SleepJournal(),
+                reservations=sleep_reservations or SleepReservations(),
                 clock=sleep_clock,
                 owner=getattr(operation_coordinator, "owner", "service-manager"),
                 operation_id=_current_operation_id,
@@ -1528,15 +1535,18 @@ class ServiceManagerV2:
         """Every sleep of the service-manager goes through here (plan D1/D2)."""
         if not bindings or self._sleep_primitive is None:
             return []
+        return self._sleep_targets(
+            self._sleep_targets_for(bindings), sleep_path=sleep_path, drain_budget_s=drain_budget_s
+        )
+
+    def _sleep_targets_for(self, bindings: list[Binding]) -> list[SleepTarget]:
         targets: list[SleepTarget] = []
         for binding in bindings:
             snapshot = self._snapshot_for_binding(binding)
             if not snapshot.pod_ip:
                 raise ValueError(f"pod {binding.serve_id} has no pod IP for sleep")
-            targets.append(SleepTarget(binding, snapshot.pod_ip))
-        return self._sleep_targets(
-            targets, sleep_path=sleep_path, drain_budget_s=drain_budget_s
-        )
+            targets.append(SleepTarget(binding, snapshot.pod_ip, snapshot.pod_uid))
+        return targets
 
     def _sleep_targets(
         self,
@@ -1545,15 +1555,63 @@ class ServiceManagerV2:
         sleep_path: str,
         drain_budget_s: float | None = None,
     ) -> list[dict]:
+        """One sleep call (writer lock held throughout). On a partial failure the
+        targets that did sleep are recorded (lease released, store updated) and the
+        rolled-back ones get their desired power back before the error propagates."""
         if self._sleep_primitive is None:
             raise ValueError("runtime_ops and vllm_ops are required to sleep a pod")
-        outcomes = self._sleep_primitive.sleep(
-            targets, path=sleep_path, drain_budget_s=drain_budget_s
-        )
-        if self._gpu_leases is not None:
-            for target in targets:
-                self._gpu_leases.release(target.binding)
+        try:
+            outcomes = self._sleep_primitive.sleep(
+                targets, path=sleep_path, drain_budget_s=drain_budget_s
+            )
+        except SleepFailed as exc:
+            self._record_sleep_outcomes(targets, exc.outcomes, update_store=True)
+            raise
+        self._record_sleep_outcomes(targets, outcomes, update_store=False)
         return outcomes
+
+    def _record_sleep_outcomes(
+        self, targets: list[SleepTarget], outcomes: list[dict], *, update_store: bool
+    ) -> None:
+        """Per-target bookkeeping (review P2-7): release the GPU lease of every
+        target that slept; with ``update_store`` also mark exactly those asleep in
+        the legacy store, and give rolled-back targets their desired power back."""
+        by_id = {target.binding.binding_id: target.binding for target in targets}
+        slept = [
+            by_id[item["binding_id"]]
+            for item in outcomes
+            if item.get("status") == STATUS_SLEPT and item.get("binding_id") in by_id
+        ]
+        if self._gpu_leases is not None:
+            for binding in slept:
+                self._gpu_leases.release(binding)
+        if not update_store:
+            return
+        if slept:
+            slept_ids = {binding.binding_id for binding in slept}
+            snapshot = self._store.load()
+            updated = [
+                replace(binding, awake=False, hidden=False)
+                if binding.binding_id in slept_ids
+                else binding
+                for binding in snapshot.bindings
+            ]
+            if updated != snapshot.bindings:
+                self._store.save(updated, expected_version=snapshot.version)
+        restore = {
+            item["binding_id"]: {
+                "power": "awake",
+                "hidden": item.get("previous_state") == POD_STATE_HIDDEN,
+            }
+            for item in outcomes
+            if item.get("status") == STATUS_ROLLED_BACK and item.get("binding_id") in by_id
+        }
+        if restore and self._fleet_store is not None:
+            known = {item.binding_id for item in self._fleet_store.load_desired().bindings}
+            restore = {key: value for key, value in restore.items() if key in known}
+            self._update_desired(
+                restore, updated_by="service-manager-sleep", reason="sleep_rolled_back"
+            )
 
     def _repair_sleep_binding(self, binding: Binding, pod_ip: str) -> None:
         """Fleet repair's sleep: the same primitive (plan D1), path ``repair``."""
@@ -1632,11 +1690,22 @@ class ServiceManagerV2:
             "policy": {
                 "ack_timeout_s": policy.ack_timeout_s,
                 "instance_staleness_s": policy.instance_staleness_s,
+                "gateway_min_instances": policy.gateway_min_instances,
+                "fallback_no_plugin": policy.fallback_no_plugin,
                 "no_plugin_grace_s": policy.no_plugin_grace_s,
                 "hard_cap_s": policy.hard_cap_s,
+                "sleep_call_timeout_s": policy.sleep_call_timeout_s,
+                "physical_confirm_timeout_s": policy.physical_confirm_timeout_s,
+                "reservation_ttl_s": policy.reservation_ttl_s,
                 "vllm_sleep_mode_param": policy.vllm_sleep_mode_param,
                 "budgets_s": dict(policy.budgets_s),
+                "worst_case_call_s": self._sm_config.worst_case_sleep_call_s(),
             },
+            "reservations": {
+                binding_id: asdict(reservation)
+                for binding_id, reservation in primitive.reservations.active().items()
+            },
+            "shutting_down": primitive.shutting_down,
             "stats": primitive.journal.stats(),
             "in_progress": primitive.journal.entries(),
             "ack_latency_ms": {
@@ -1919,6 +1988,29 @@ def create_app(service: ServiceManagerV2) -> FastAPI:
     @app.exception_handler(NodePressureActive)
     async def node_pressure_handler(
         _request: Request, exc: NodePressureActive
+    ) -> JSONResponse:
+        return JSONResponse(status_code=503, content={"detail": str(exc)})
+
+    @app.exception_handler(SleepFailed)
+    async def sleep_failed_handler(_request: Request, exc: SleepFailed) -> JSONResponse:
+        # The primitive already rolled back (or kept hidden) every target; the
+        # outcomes say which pods slept.
+        return JSONResponse(
+            status_code=409,
+            content={"detail": str(exc), "error": type(exc).__name__, "outcomes": exc.outcomes},
+        )
+
+    @app.exception_handler(ReservationConflict)
+    async def reservation_conflict_handler(
+        _request: Request, exc: ReservationConflict
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=409, content={"detail": str(exc), "binding_id": exc.binding_id}
+        )
+
+    @app.exception_handler(ServiceShuttingDown)
+    async def shutting_down_handler(
+        _request: Request, exc: ServiceShuttingDown
     ) -> JSONResponse:
         return JSONResponse(status_code=503, content={"detail": str(exc)})
 

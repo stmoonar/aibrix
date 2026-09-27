@@ -131,6 +131,10 @@ class FakeVllmOps:
         self.calls.append(("wake_up", pod_ip, port))
         return type("Result", (), {"success": True, "message": ""})()
 
+    def metrics(self, pod_ip, *, port=None):
+        # Idle engine: the sleep primitive needs readable gauges to call it drained.
+        return "vllm:num_requests_running 0.0\nvllm:num_requests_waiting 0.0\n"
+
 
 def _registry() -> Registry:
     trs = TrsParams(

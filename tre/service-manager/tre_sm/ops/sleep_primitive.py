@@ -6,29 +6,47 @@ clients, every sleep - SafeScale commit, controller scale-downs (fast and
 slow loop), APA scale-downs, defrag, fleet repair, startup admission - runs
 the same ordered protocol, and callers cannot skip a step:
 
-1. **hide**: one Pod patch sets ``tre.aibrix.io/routable=false``, the
+1. **prepare** (writer lock held): reserve the bindings (per-binding
+   reservation, :mod:`tre_sm.state.sleep_reservations`), write a journal entry
+   per pod, and hide: one Pod patch sets ``tre.aibrix.io/routable=false``, the
    ``hidden`` state annotation and bumps ``tre.aibrix.io/route-gen``.
-2. **gateway ack**: wait until every *live* gateway plugin instance
-   (heartbeat in ``tre:v2:gw:instances`` newer than ``instance_staleness_s``)
-   reports ``gen >= target`` and ``routable=false`` for the pod in
-   ``tre:v2:gw:seen:<pod>``. Timeout -> roll back. With no live instance at all
-   (plugin not deployed / fallback routing) wait for the k8s label plus a
-   grace delay instead, and log a warning.
-3. **drain**: wait until the plugin's in-flight count for the pod (summed over
-   live instances, ``tre:v2:gw:inflight:<pod>``) and vLLM's running + waiting
-   gauges are both zero, up to the caller's soft budget. Requests the plugin
-   marks ``non_continuable`` are waited for up to the hard cap (the gateway
-   route timeout) even past the soft budget.
-4. **/sleep**: ``mode=wait`` when drained; ``mode=abort`` only once the budget
-   is exhausted, counted as a forced abort (``forced_abort_total``,
-   ``forced_abort_requests_total``) and logged. vLLM's ``mode=wait`` takes no
-   timeout of its own (0.30), so the drain is bounded here and the HTTP
-   timeout bounds the call.
+2. **drain** (no writer lock needed; the reservation fences the binding):
+   a. gateway ack: at least ``gateway_min_instances`` plugin instances must be
+      live (heartbeat score advancing, or a Ready plugin pod) and every live
+      instance must report ``gen >= target`` / ``routable=false`` for the pod.
+      An empty live set never converges (unless the opt-in
+      ``fallback_no_plugin``). Timeout -> roll back.
+   b. drain: poll the plugin in-flight counts of live instances
+      (``tre:v2:gw:inflight:<pod>``; fields of non-live instances are ignored)
+      AND vLLM's running + waiting gauges - always both: a plugin instance that
+      shuts down zeroes its counts and leaves the live set while Envoy may
+      still stream to the pod. Metrics unavailable or a read error
+      = drain state UNKNOWN (never "drained"). ``non_continuable`` is sticky: a
+      read error keeps the last known value.
+      * drained (state known, nothing in flight) -> /sleep ``mode=wait``;
+      * before the soft budget -> keep waiting;
+      * state unknown -> keep waiting; still unknown at the hard cap -> ROLL
+        BACK (never abort blind);
+      * non-continuable requests in flight -> keep waiting; still there at the
+        hard cap -> roll back;
+      * state known, only continuable requests left past the soft budget ->
+        /sleep ``mode=abort``, counted as a forced abort (the sidecar continues
+        those requests).
+      Every poll renews the reservation and checks shutdown / the writer fence;
+      losing either rolls back.
+3. **commit** (writer lock held again): /sleep (``mode`` only for vLLM
+   versions that accept it, detected via ``GET /version``), then confirm
+   ``/is_sleeping``. Confirmed -> ``sleeping`` annotation, journal entry and
+   reservation released. /sleep returned but the physical state stays unknown
+   -> the pod stays hidden, the journal entry stays (audit
+   ``sleep_unconfirmed``); routing is never re-opened on a pod that may be
+   asleep.
 
-Any failure rolls the pod back to its previous routing state (a new
-route-gen). A journal entry per pod (``tre:v2:sm:sleep_ops``) lives from the
-hide to the end, so a crash in between is visible to the audit
-(``hidden_without_operation`` / ``sleep_operation_orphaned``).
+Rollback restores the pod's previous routing state under a new route-gen
+(SafeScale probe pods stay hidden). Results are per target: a multi-target
+sleep that partly fails raises :class:`SleepIncomplete` carrying one outcome
+per target (``status`` slept / rolled_back / unconfirmed / rollback_failed /
+reservation_lost), so callers account for exactly the pods that slept.
 """
 
 from __future__ import annotations
@@ -38,13 +56,16 @@ from dataclasses import dataclass, field
 import json
 import logging
 import re
+import threading
 import time
 from typing import Callable, Mapping
 
 from tre_common import rediskeys
 from tre_common.registry import SleepPolicy
 from tre_sm.allocator.slots import Binding
+from tre_sm.state.operations import current_operation
 from tre_sm.state.reconcile import POD_STATE_AWAKE, POD_STATE_HIDDEN, POD_STATE_SLEEPING
+from tre_sm.state.sleep_reservations import ReservationConflict, SleepReservations
 
 LOG = logging.getLogger("tre_sm.sleep")
 
@@ -52,11 +73,26 @@ VLLM_PORT = 8000
 HIDDEN_SLEEP_HEADER = "X-TRE-Hidden"
 RECENT_OUTCOMES = 256
 
+#: First vLLM release whose ``POST /sleep`` accepts ``mode=wait|abort|keep``
+#: (upstream PR #34528, "Cleanup engine pause/sleep logic", 2026-02-24; the
+#: v0.18.0 release branch is the earliest verified to contain it; 0.10.1 reads
+#: only ``level`` and ignores ``mode``). A version that does not parse (e.g. a
+#: ``0.1.devN`` source build without tags) is treated as not supporting it: the
+#: primitive then drains fully and sends a plain /sleep.
+SLEEP_MODE_MIN_VERSION = (0, 18, 0)
+
+STATUS_SLEPT = "slept"
+STATUS_ROLLED_BACK = "rolled_back"
+STATUS_UNCONFIRMED = "unconfirmed"
+STATUS_ROLLBACK_FAILED = "rollback_failed"
+STATUS_RESERVATION_LOST = "reservation_lost"
+
 _RUNNING_METRIC = "vllm:num_requests_running"
 _WAITING_METRIC = "vllm:num_requests_waiting"
 _SAMPLE = re.compile(
     r"^(?P<name>[A-Za-z_:][A-Za-z0-9_:]*)(?:\{(?P<labels>[^}]*)\})?\s+(?P<value>\S+)"
 )
+_VERSION = re.compile(r"^\s*v?(\d+)\.(\d+)(?:\.(\d+))?")
 
 
 class Clock:
@@ -74,18 +110,41 @@ class Clock:
 DEFAULT_CLOCK: Clock = Clock()
 
 
-class GatewayAckTimeout(RuntimeError):
-    pass
-
-
 class SleepFailed(RuntimeError):
+    """A sleep did not complete; ``outcomes`` has one entry per target handled."""
+
+    def __init__(self, message: str, *, outcomes: list[dict] | None = None) -> None:
+        super().__init__(message)
+        self.outcomes: list[dict] = list(outcomes or [])
+
+
+class GatewayAckTimeout(SleepFailed):
     pass
+
+
+class SleepCancelled(SleepFailed):
+    """The service-manager is shutting down: in-progress drains roll back."""
+
+
+class ReservationLost(SleepFailed):
+    pass
+
+
+class SleepIncomplete(SleepFailed):
+    """Some targets did not sleep; see ``outcomes`` (per-target ``status``)."""
+
+
+class ServiceShuttingDown(RuntimeError):
+    """No new sleep is accepted while the service-manager shuts down (HTTP 503)."""
 
 
 @dataclass(frozen=True)
 class SleepTarget:
     binding: Binding
     pod_ip: str
+    #: The Pod object's UID: a same-name recreated Pod is a different engine (the
+    #: vLLM version cache is keyed by it).
+    pod_uid: str | None = None
 
 
 def parse_vllm_load(metrics_text: str | None) -> int | None:
@@ -109,6 +168,21 @@ def parse_vllm_load(metrics_text: str | None) -> int | None:
     return int(round(total)) if seen else None
 
 
+def parse_vllm_version(text: str | None) -> tuple[int, int, int] | None:
+    """``"0.30.0"`` -> (0, 30, 0); None when it does not look like a release."""
+    if not text:
+        return None
+    match = _VERSION.match(str(text))
+    if match is None:
+        return None
+    return (int(match.group(1)), int(match.group(2)), int(match.group(3) or 0))
+
+
+def sleep_mode_supported(version: str | None) -> bool:
+    parsed = parse_vllm_version(version)
+    return parsed is not None and parsed >= SLEEP_MODE_MIN_VERSION
+
+
 def _text(value: object) -> str:
     if isinstance(value, bytes):
         return value.decode("utf-8")
@@ -118,10 +192,14 @@ def _text(value: object) -> str:
 class GatewayState:
     """Read side of the gateway-plugin contract (keys in tre_common.rediskeys).
 
-    Live plugin instances = fresh heartbeats UNION Ready plugin pods from k8s
-    (plugin_pods): an instance with Redis trouble may keep routing while its
-    heartbeat goes stale, so it must still ack. Errors propagate; the
-    primitive treats them as "not converged" (fail closed).
+    Liveness is clock-independent: an instance is live while its heartbeat score
+    in ``tre:v2:gw:instances`` keeps CHANGING between reads of this SM, within
+    ``staleness_s`` of the SM's own monotonic clock. The score is never compared
+    with a wall clock (a plugin may write local time or Redis TIME). A score
+    that is first seen, or that stopped changing, is not live. Ready plugin pods
+    from k8s (``plugin_pods``) count as live too: an instance with Redis trouble
+    may keep routing while its heartbeat stalls, so it must still ack. Errors
+    propagate; the primitive treats them as "not converged" (fail closed).
     """
 
     def __init__(
@@ -129,32 +207,82 @@ class GatewayState:
         redis_client,
         *,
         plugin_pods: Callable[[], set[str]] | None = None,
-        wall_ms: Callable[[], int] | None = None,
+        monotonic: Callable[[], float] | None = None,
+        future_warn_ms: int = 1000,
     ) -> None:
         self._redis = redis_client
         self._plugin_pods = plugin_pods
-        self._wall_ms = wall_ms
+        self._monotonic = monotonic or time.monotonic
+        self._future_warn_ms = int(future_warn_ms)
+        #: instance -> [last score, SM monotonic of the last change (None = never),
+        #:              SM monotonic of the first sighting]
+        self._scores: dict[str, list] = {}
+        self._warned_future: set[str] = set()
+        self._lock = threading.Lock()
 
-    def now_ms(self) -> int:
-        """Redis server time: one clock for SM and every plugin instance."""
-        if self._wall_ms is not None:
-            return int(self._wall_ms())
+    def now_ms(self) -> int | None:
+        """Redis server time (only used to warn about clocks ahead of it)."""
         redis_time = getattr(self._redis, "time", None)
-        if callable(redis_time):
-            try:
-                seconds, micros = redis_time()
-                return int(seconds) * 1000 + int(micros) // 1000
-            except Exception:  # pragma: no cover - fall back to the local clock
-                pass
-        return int(time.time() * 1000)
+        if not callable(redis_time):
+            return None
+        try:
+            seconds, micros = redis_time()
+        except Exception:
+            return None
+        return int(seconds) * 1000 + int(micros) // 1000
+
+    def _observe(self, staleness_s: float) -> tuple[list[str], list[str]]:
+        raw = self._redis.zrange(rediskeys.GW_INSTANCES_KEY, 0, -1, withscores=True) or []
+        now = self._monotonic()
+        redis_now = self.now_ms()
+        live: set[str] = set()
+        pending: set[str] = set()
+        with self._lock:
+            present: set[str] = set()
+            for member, score in raw:
+                instance = _text(member)
+                score = float(score)
+                present.add(instance)
+                state = self._scores.get(instance)
+                if state is None:
+                    self._scores[instance] = [score, None, now]
+                elif score != state[0]:
+                    # A changed score is a new heartbeat write (even if the writer's
+                    # clock stepped back).
+                    state[0] = score
+                    state[1] = now
+                state = self._scores[instance]
+                if state[1] is not None and now - state[1] <= staleness_s:
+                    live.add(instance)
+                elif state[1] is None and now - state[2] <= staleness_s:
+                    pending.add(instance)
+                if (
+                    redis_now is not None
+                    and score - redis_now > self._future_warn_ms
+                    and instance not in self._warned_future
+                ):
+                    self._warned_future.add(instance)
+                    LOG.warning(
+                        "gateway plugin %s heartbeat is %.1fs ahead of Redis TIME: its "
+                        "clock is skewed (liveness does not depend on it; fix NTP/chrony)",
+                        instance,
+                        (score - redis_now) / 1000.0,
+                    )
+            for gone in set(self._scores) - present:
+                self._scores.pop(gone, None)
+        return sorted(live), sorted(pending)
 
     def live_instances(self, staleness_s: float) -> list[str]:
-        cutoff = self.now_ms() - int(staleness_s * 1000)
-        raw = self._redis.zrangebyscore(rediskeys.GW_INSTANCES_KEY, cutoff, "+inf")
-        live = {_text(item) for item in raw or []}
+        live, _pending = self.instances(staleness_s)
+        return live
+
+    def instances(self, staleness_s: float) -> tuple[list[str], list[str]]:
+        """(live, pending): pending = first seen, not yet seen advancing."""
+        live, pending = self._observe(staleness_s)
+        result = set(live)
         if self._plugin_pods is not None:
-            live |= {str(name) for name in self._plugin_pods()}
-        return sorted(live)
+            result |= {str(name) for name in self._plugin_pods()}
+        return sorted(result), sorted(set(pending) - result)
 
     def seen(self, pod: str) -> dict[str, dict | None]:
         return self._json_hash(rediskeys.gw_seen_key(pod))
@@ -181,18 +309,22 @@ class SleepJournal:
         self._ops: dict[str, dict] = {}
         self._stats: dict[str, int] = {}
         self._ack_latencies: deque[int] = deque(maxlen=rediskeys.SM_SLEEP_ACK_LATENCY_MAX)
+        self._lock = threading.Lock()
 
     def begin(self, pod: str, record: dict) -> None:
         self._write(pod, dict(record))
 
     def update(self, pod: str, **fields) -> None:
         # This process is the only writer of its own entries: update from memory.
-        record = dict(self._ops.get(pod) or self.get(pod) or {})
+        with self._lock:
+            cached = self._ops.get(pod)
+        record = dict(cached or self.get(pod) or {})
         record.update(fields)
         self._write(pod, record)
 
     def end(self, pod: str) -> None:
-        self._ops.pop(pod, None)
+        with self._lock:
+            self._ops.pop(pod, None)
         if self._redis is not None:
             self._redis.hdel(rediskeys.SM_SLEEP_OPS_KEY, pod)
 
@@ -201,7 +333,8 @@ class SleepJournal:
 
     def entries(self) -> dict[str, dict]:
         if self._redis is None:
-            return {pod: dict(record) for pod, record in self._ops.items()}
+            with self._lock:
+                return {pod: dict(record) for pod, record in self._ops.items()}
         result: dict[str, dict] = {}
         for field_name, raw in (self._redis.hgetall(rediskeys.SM_SLEEP_OPS_KEY) or {}).items():
             try:
@@ -211,7 +344,8 @@ class SleepJournal:
         return result
 
     def incr(self, name: str, amount: int = 1) -> None:
-        self._stats[name] = self._stats.get(name, 0) + int(amount)
+        with self._lock:
+            self._stats[name] = self._stats.get(name, 0) + int(amount)
         if self._redis is not None:
             self._redis.hincrby(rediskeys.SM_SLEEP_STATS_KEY, name, int(amount))
 
@@ -225,7 +359,8 @@ class SleepJournal:
 
     def stats(self) -> dict[str, int]:
         if self._redis is None:
-            return dict(self._stats)
+            with self._lock:
+                return dict(self._stats)
         raw = self._redis.hgetall(rediskeys.SM_SLEEP_STATS_KEY) or {}
         return {_text(key): int(_text(value)) for key, value in raw.items()}
 
@@ -238,7 +373,8 @@ class SleepJournal:
         return [int(_text(item)) for item in raw or []]
 
     def _write(self, pod: str, record: dict) -> None:
-        self._ops[pod] = record
+        with self._lock:
+            self._ops[pod] = record
         if self._redis is not None:
             self._redis.hset(
                 rediskeys.SM_SLEEP_OPS_KEY,
@@ -252,12 +388,44 @@ class _PodSleep:
     previous_state: str
     gen: int | None = None
     hidden: bool = False
+    reserved: bool = False
+    #: "wait" (drained) | "abort" (forced) once the drain decided; None = pending.
+    decision: str | None = None
+    sleep_called: bool = False
     done: bool = False
+    #: Sticky non-continuable count: last value from a SUCCESSFUL gateway read.
+    non_continuable: int | None = None
     last_load: dict = field(default_factory=dict)
+    waited_s: float = 0.0
+    outcome: dict | None = None
 
     @property
     def pod(self) -> str:
         return self.target.binding.serve_id
+
+    @property
+    def binding_id(self) -> str:
+        return self.target.binding.binding_id
+
+
+@dataclass
+class SleepBatch:
+    """One sleep call's targets across the prepare / drain / commit phases."""
+
+    pods: list[_PodSleep]
+    path: str
+    soft_s: float
+    hard_s: float
+    started: float
+    token: str | None = None
+    ack: dict | None = None
+    operation_id: str | None = None
+
+    def reserved_ids(self) -> list[str]:
+        return [pod.binding_id for pod in self.pods if pod.reserved]
+
+    def outcomes(self) -> list[dict]:
+        return [pod.outcome for pod in self.pods if pod.outcome is not None]
 
 
 class SleepPrimitive:
@@ -269,6 +437,7 @@ class SleepPrimitive:
         policy: SleepPolicy,
         gateway: GatewayState | None = None,
         journal: SleepJournal | None = None,
+        reservations: SleepReservations | None = None,
         clock: Clock | None = None,
         owner: str = "service-manager",
         operation_id: Callable[[], str | None] | None = None,
@@ -278,10 +447,15 @@ class SleepPrimitive:
         self._policy = policy
         self._gateway = gateway
         self._journal = journal or SleepJournal()
+        self._reservations = reservations or SleepReservations()
         self._clock = clock
         self._owner = owner
         self._operation_id = operation_id or (lambda: None)
         self._recent: deque[dict] = deque(maxlen=RECENT_OUTCOMES)
+        self._shutdown = threading.Event()
+        self._active: set[int] = set()
+        self._active_lock = threading.Condition()
+        self._mode_cache: dict[tuple[str, str, str | None], bool] = {}
 
     @property
     def policy(self) -> SleepPolicy:
@@ -291,8 +465,35 @@ class SleepPrimitive:
     def journal(self) -> SleepJournal:
         return self._journal
 
+    @property
+    def reservations(self) -> SleepReservations:
+        return self._reservations
+
     def recent(self) -> list[dict]:
         return list(self._recent)
+
+    # ---------------------------------------------------------------- shutdown
+    def begin_shutdown(self) -> None:
+        """Refuse new sleeps; drains in progress roll back at their next poll."""
+        self._shutdown.set()
+
+    @property
+    def shutting_down(self) -> bool:
+        return self._shutdown.is_set()
+
+    def active_count(self) -> int:
+        with self._active_lock:
+            return len(self._active)
+
+    def wait_idle(self, timeout_s: float) -> bool:
+        deadline = time.monotonic() + timeout_s
+        with self._active_lock:
+            while self._active:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._active_lock.wait(remaining)
+        return True
 
     # ------------------------------------------------------------------ public
     def sleep(
@@ -302,87 +503,169 @@ class SleepPrimitive:
         path: str,
         drain_budget_s: float | None = None,
     ) -> list[dict]:
-        """hide -> ack -> drain -> /sleep for every target; see module docstring.
+        """prepare -> drain -> commit in one call (caller holds the writer lock).
 
         Several targets are hidden together and drain concurrently (one soft
-        budget for the call). Raises after rolling back every target that did
-        not reach sleep.
+        budget for the call). Returns one outcome per target, or raises a
+        :class:`SleepFailed` whose ``outcomes`` says what happened to each.
         """
         if not targets:
             return []
+        batch = self.prepare(targets, path=path, drain_budget_s=drain_budget_s)
+        self.drain(batch)
+        return self.commit(batch)
+
+    def prepare(
+        self,
+        targets: list[SleepTarget],
+        *,
+        path: str,
+        drain_budget_s: float | None = None,
+    ) -> SleepBatch:
+        """Reserve the bindings, journal and hide every target (writer lock held)."""
+        if self._shutdown.is_set():
+            raise ServiceShuttingDown("service-manager is shutting down; no new sleep")
         clock = self._clock or DEFAULT_CLOCK
         soft_s = self._policy.soft_budget_s(path, drain_budget_s)
-        hard_s = self._policy.hard_cap_s
-        pods = [_PodSleep(target, _previous_state(target.binding)) for target in targets]
-        started = clock.monotonic()
+        batch = SleepBatch(
+            pods=[_PodSleep(target, _previous_state(target.binding)) for target in targets],
+            path=path,
+            soft_s=soft_s,
+            hard_s=self._policy.hard_cap_s,
+            started=clock.monotonic(),
+            operation_id=self._operation_id(),
+        )
+        batch.token = self._reservations.acquire(
+            [target.binding for target in targets],
+            owner=self._owner,
+            operation_id=batch.operation_id,
+            ttl_s=self._policy.reservation_ttl_s,
+        )
+        for pod in batch.pods:
+            pod.reserved = True
+        self._register(batch)
         try:
-            self._hide(pods, path=path, soft_s=soft_s)
-            ack = self._await_ack(pods, clock)
+            self._hide(batch)
         except BaseException as exc:
-            self._rollback(pods, reason=f"{type(exc).__name__}: {exc}")
+            self._rollback_all(batch, reason=f"hide failed: {type(exc).__name__}: {exc}")
+            self._unregister(batch)
+            if isinstance(exc, SleepFailed):
+                exc.outcomes = batch.outcomes()
             raise
-        soft_deadline = started + soft_s
-        hard_deadline = started + max(hard_s, soft_s)
-        outcomes: list[dict] = []
-        failure: BaseException | None = None
-        pending = list(pods)
+        return batch
+
+    def drain(self, batch: SleepBatch) -> None:
+        """Gateway ack + drain; decides wait / abort / rollback per pod.
+
+        Needs no writer lock (the reservation fences the bindings). Raises after
+        rolling back every target on a batch-wide failure (ack timeout,
+        shutdown, lost reservation or writer fence).
+        """
+        clock = self._clock or DEFAULT_CLOCK
         try:
+            batch.ack = self._await_ack(batch, clock)
+            soft_deadline = batch.started + batch.soft_s
+            hard_deadline = batch.started + max(batch.hard_s, batch.soft_s)
+            pending = [
+                pod
+                for pod in batch.pods
+                if pod.decision is None and not pod.done and pod.outcome is None
+            ]
             while pending:
+                self._check_alive(batch)
                 now = clock.monotonic()
                 for pod in list(pending):
-                    load = self._load(pod, ack)
+                    load = self._load(pod, batch.ack)
                     pod.last_load = load
-                    must_wait_nc = load["non_continuable"] > 0 and now < hard_deadline
-                    budget_left = now < soft_deadline or must_wait_nc
-                    if load["drained"] or not budget_left:
-                        pending.remove(pod)
-                        outcomes.append(
-                            self._sleep_one(
-                                pod,
-                                load=load,
-                                drained=load["drained"],
-                                path=path,
-                                ack=ack,
-                                waited_s=now - started,
-                                hard_deadline=hard_deadline,
-                                clock=clock,
-                            )
+                    verdict = _decide(pod, load, now, soft_deadline, hard_deadline)
+                    if verdict is None:
+                        continue
+                    pending.remove(pod)
+                    pod.waited_s = now - batch.started
+                    if verdict in ("wait", "abort"):
+                        pod.decision = verdict
+                        self._journal.update(
+                            pod.pod,
+                            phase="drained" if verdict == "wait" else "drain_budget_spent",
+                            in_flight=load.get("in_flight"),
                         )
+                    else:
+                        self._journal.incr(verdict)
+                        self._rollback_pod(batch, pod, reason=_ROLLBACK_REASONS[verdict])
                 if pending:
                     now = clock.monotonic()
-                    next_deadline = min(
-                        hard_deadline
-                        if pod.last_load.get("non_continuable", 0) > 0
-                        else soft_deadline
-                        for pod in pending
-                    )
+                    next_deadline = soft_deadline if now < soft_deadline else hard_deadline
                     clock.sleep(
                         max(0.0, min(self._policy.poll_interval_s, next_deadline - now))
                         or min(self._policy.poll_interval_s, 0.01)
                     )
         except BaseException as exc:
-            failure = exc
-        if failure is not None:
-            self._rollback([pod for pod in pods if not pod.done], reason=str(failure))
-            raise failure
+            self._rollback_all(batch, reason=f"{type(exc).__name__}: {exc}")
+            self._unregister(batch)
+            if isinstance(exc, SleepFailed):
+                exc.outcomes = batch.outcomes()
+            raise
+
+    def commit(self, batch: SleepBatch) -> list[dict]:
+        """/sleep + physical confirmation for every drained pod (writer lock held)."""
+        clock = self._clock or DEFAULT_CLOCK
+        try:
+            self._reconfirm_reservation(batch)
+            for pod in batch.pods:
+                if pod.done or pod.outcome is not None or pod.decision is None:
+                    continue
+                if self._shutdown.is_set():
+                    self._rollback_pod(batch, pod, reason="service-manager is shutting down")
+                    continue
+                try:
+                    self._commit_one(batch, pod, clock)
+                except Exception as exc:
+                    self._rollback_pod(batch, pod, reason=f"{type(exc).__name__}: {exc}")
+        finally:
+            self._unregister(batch)
+        outcomes = batch.outcomes()
+        failed = [item for item in outcomes if item.get("status") != STATUS_SLEPT]
+        if failed:
+            raise SleepIncomplete(
+                "sleep incomplete for "
+                + ", ".join(
+                    f"{item['serve_id']} ({item['status']}: {item.get('reason')})"
+                    for item in failed
+                ),
+                outcomes=outcomes,
+            )
         return outcomes
 
+    def abandon(self, batch: SleepBatch, *, reason: str) -> list[dict]:
+        """Roll back every target not yet slept (e.g. the commit phase could not
+        take the writer lock)."""
+        try:
+            self._rollback_all(batch, reason=reason)
+        finally:
+            self._unregister(batch)
+        return batch.outcomes()
+
     # ------------------------------------------------------------------- steps
-    def _hide(self, pods: list[_PodSleep], *, path: str, soft_s: float) -> None:
-        for pod in pods:
+    def _hide(self, batch: SleepBatch) -> None:
+        for pod in batch.pods:
             binding = pod.target.binding
             self._journal.begin(
                 pod.pod,
                 {
                     "binding_id": binding.binding_id,
                     "serve_id": binding.serve_id,
-                    "path": path,
-                    "soft_budget_s": soft_s,
-                    "hard_cap_s": self._policy.hard_cap_s,
+                    "model": binding.model,
+                    "node": binding.slot.node,
+                    "gpu_ids": list(binding.slot.gpu_ids),
+                    "pod_ip": pod.target.pod_ip,
+                    "path": batch.path,
+                    "soft_budget_s": batch.soft_s,
+                    "hard_cap_s": batch.hard_s,
                     "phase": "hiding",
                     "previous_state": pod.previous_state,
                     "owner": self._owner,
-                    "operation_id": self._operation_id(),
+                    "operation_id": batch.operation_id,
+                    "reservation_token": batch.token,
                     "started_at_ms": int(time.time() * 1000),
                 },
             )
@@ -391,21 +674,77 @@ class SleepPrimitive:
             pod.gen = gen if isinstance(gen, int) and not isinstance(gen, bool) else None
             self._journal.update(pod.pod, phase="awaiting_ack", target_gen=pod.gen)
 
-    def _await_ack(self, pods: list[_PodSleep], clock: Clock) -> dict:
+    def _check_alive(self, batch: SleepBatch) -> None:
+        """Every poll: shutdown, reservation ownership, writer fence (if held)."""
+        if self._shutdown.is_set():
+            raise SleepCancelled("service-manager is shutting down: rolling the drain back")
+        reserved = [
+            pod.binding_id
+            for pod in batch.pods
+            if pod.reserved and pod.outcome is None
+        ]
+        if batch.token is not None and reserved:
+            if not self._reservations.renew(
+                reserved, batch.token, ttl_s=self._policy.reservation_ttl_s
+            ):
+                self._journal.incr("reservation_lost_total")
+                raise ReservationLost(f"sleep reservation of {reserved} was lost")
+        operation = current_operation()
+        if operation is not None:
+            operation.assert_active()
+
+    def _reconfirm_reservation(self, batch: SleepBatch) -> None:
+        """Commit phase: the reservation must still be ours; re-take it if it
+        merely expired, else leave the pods to whoever holds it now."""
+        reserved = [
+            pod.binding_id for pod in batch.pods if pod.reserved and pod.outcome is None
+        ]
+        if batch.token is None or not reserved:
+            return
+        if self._reservations.renew(reserved, batch.token, ttl_s=self._policy.reservation_ttl_s):
+            return
+        bindings = [pod.target.binding for pod in batch.pods if pod.reserved and pod.outcome is None]
+        try:
+            batch.token = self._reservations.acquire(
+                bindings,
+                owner=self._owner,
+                operation_id=batch.operation_id,
+                ttl_s=self._policy.reservation_ttl_s,
+            )
+            LOG.warning("sleep reservation of %s had expired; re-acquired before commit", reserved)
+        except ReservationConflict as exc:
+            self._journal.incr("reservation_lost_total")
+            for pod in batch.pods:
+                if pod.reserved and pod.outcome is None:
+                    pod.reserved = False
+                    self._end_journal_if_ours(pod, batch)
+                    pod.outcome = self._outcome(
+                        batch, pod, STATUS_RESERVATION_LOST, reason=f"reservation lost: {exc}"
+                    )
+
+    def _await_ack(self, batch: SleepBatch, clock: Clock) -> dict:
         policy = self._policy
+        pods = [pod for pod in batch.pods if pod.outcome is None]
         started = clock.monotonic()
         deadline = started + policy.ack_timeout_s
-        live: list[str] = []
         while True:
+            self._check_alive(batch)
             error: str | None = None
             unacked: list[tuple[str, str]] = []
+            live: list[str] = []
+            pending: list[str] = []
             try:
-                live = (
-                    self._gateway.live_instances(policy.instance_staleness_s)
-                    if self._gateway is not None
-                    else []
-                )
-                if live:
+                if self._gateway is not None:
+                    live, pending = self._gateway.instances(policy.instance_staleness_s)
+                if len(live) < policy.gateway_min_instances:
+                    unacked = [
+                        (
+                            "*",
+                            f"{len(live)} live plugin instance(s) < gateway_min_instances "
+                            f"{policy.gateway_min_instances}",
+                        )
+                    ]
+                else:
                     unacked = [
                         (pod.pod, instance)
                         for pod in pods
@@ -415,9 +754,12 @@ class SleepPrimitive:
             except Exception as exc:  # Redis / k8s read error: not converged
                 error = f"{type(exc).__name__}: {exc}"
                 unacked = [(pod.pod, "<read error>") for pod in pods]
-            if error is None and not live:
-                # Neither a fresh heartbeat nor a Ready plugin pod: no plugin at all.
-                return self._fallback_ack(pods, clock)
+            if self._gateway is None:
+                # This primitive is not wired to any gateway state at all (embedded /
+                # unit-test use; the server always wires one): nothing can ack.
+                return self._fallback_ack(batch, pods, clock, wired=False)
+            if error is None and not live and not pending and policy.fallback_no_plugin:
+                return self._fallback_ack(batch, pods, clock)
             now = clock.monotonic()
             if not unacked:
                 latency_ms = int(round((now - started) * 1000))
@@ -431,17 +773,22 @@ class SleepPrimitive:
                     f"gateway plugin did not ack hide within {policy.ack_timeout_s}s: "
                     f"{sorted(unacked)}" + (f" (last error: {error})" if error else "")
                 )
-            clock.sleep(min(policy.poll_interval_s, max(0.0, deadline - now)))
+            clock.sleep(min(policy.poll_interval_s, max(0.0, deadline - now)) or 0.01)
 
-    def _fallback_ack(self, pods: list[_PodSleep], clock: Clock) -> dict:
+    def _fallback_ack(
+        self, batch: SleepBatch, pods: list[_PodSleep], clock: Clock, *, wired: bool = True
+    ) -> dict:
         policy = self._policy
         LOG.warning(
-            "no live gateway plugin instance: hiding %s on the k8s label and a %.1fs grace "
-            "delay (no in-flight view from the gateway)",
+            "%s: hiding %s on the k8s label and a %.1fs grace delay (no in-flight view "
+            "from the gateway)",
+            "no live gateway plugin instance and fallback_no_plugin is enabled"
+            if wired
+            else "no gateway state wired into this service-manager",
             [pod.pod for pod in pods],
             policy.no_plugin_grace_s,
         )
-        self._journal.incr("ack_fallback_total")
+        self._journal.incr("ack_fallback_total" if wired else "ack_no_gateway_total")
         wait_unroutable = getattr(self._runtime, "wait_pod_unroutable", None)
         if callable(wait_unroutable):
             for pod in pods:
@@ -451,31 +798,38 @@ class SleepPrimitive:
             self._journal.update(pod.pod, phase="draining", ack="fallback_no_plugin")
         return {"mode": "fallback_no_plugin", "instances": [], "latency_ms": None}
 
-    def _load(self, pod: _PodSleep, ack: dict) -> dict:
-        gateway_total: int | None = None
-        gateway_error = False
-        non_continuable = 0
-        if ack["mode"] == "plugin" and self._gateway is not None:
+    def _load(self, pod: _PodSleep, ack: dict | None) -> dict:
+        """One read of the drain state. ``known`` is False on any read error or
+        unavailable engine metrics; ``non_continuable`` is the sticky value."""
+        gateway_known = True
+        gateway_total = 0
+        if ack is not None and ack.get("mode") == "plugin" and self._gateway is not None:
             # Read only after the ack: the plugin writes a pod's inflight before its
             # seen field in one pipeline, so this value is at least as new as the ack.
-            # A live instance without a field has nothing in flight (0).
+            # A live instance without a field has nothing in flight (0); fields of
+            # instances that are not live are ignored entirely (a crashed instance's
+            # fields never expire while other instances refresh the hash TTL).
             try:
                 live = set(self._gateway.live_instances(self._policy.instance_staleness_s))
                 entries = self._gateway.inflight(pod.pod)
-            except Exception:  # unreadable: not drained (fail closed)
-                gateway_error = True
+            except Exception:
+                gateway_known = False
                 entries = {}
                 live = set()
-            gateway_total = 0
+            non_continuable = 0
             for instance, entry in entries.items():
                 if instance not in live:
                     continue
                 if entry is None:
-                    # Unreadable entry of a live instance: assume one request.
-                    gateway_total += 1
+                    gateway_known = False  # unreadable entry of a live instance
                     continue
-                gateway_total += max(0, int(entry.get("total", 0) or 0))
-                non_continuable += max(0, int(entry.get("non_continuable", 0) or 0))
+                try:
+                    gateway_total += max(0, int(entry.get("total", 0) or 0))
+                    non_continuable += max(0, int(entry.get("non_continuable", 0) or 0))
+                except (TypeError, ValueError):
+                    gateway_known = False
+            if gateway_known:
+                pod.non_continuable = non_continuable
         engine_load: int | None = None
         metrics = getattr(self._vllm, "metrics", None)
         if callable(metrics):
@@ -483,49 +837,80 @@ class SleepPrimitive:
                 engine_load = parse_vllm_load(metrics(pod.target.pod_ip, port=VLLM_PORT))
             except Exception:  # an unreachable engine reports nothing
                 engine_load = None
-        drained = (
-            not gateway_error and (gateway_total or 0) == 0 and (engine_load or 0) == 0
-        )
+        known = gateway_known and engine_load is not None
+        in_flight = max(gateway_total, engine_load or 0)
         return {
-            "gateway_read_error": gateway_error,
-            "gateway_inflight": gateway_total,
-            "non_continuable": non_continuable,
+            "known": known,
+            "gateway_read_error": not gateway_known,
+            "gateway_inflight": gateway_total if gateway_known else None,
+            "non_continuable": pod.non_continuable,
             "engine_load": engine_load,
-            "drained": drained,
+            "in_flight": in_flight,
+            "drained": known and in_flight == 0,
         }
 
-    def _sleep_one(
-        self,
-        pod: _PodSleep,
-        *,
-        load: dict,
-        drained: bool,
-        path: str,
-        ack: dict,
-        waited_s: float,
-        hard_deadline: float,
-        clock: Clock,
-    ) -> dict:
+    def _mode_supported(self, target: SleepTarget) -> bool:
+        setting = str(self._policy.vllm_sleep_mode_param).lower()
+        if setting == "true":
+            return True
+        if setting == "false":
+            return False
+        key = (target.binding.serve_id, target.pod_ip, target.pod_uid)
+        cached = self._mode_cache.get(key)
+        if cached is not None:
+            return cached
+        version_fn = getattr(self._vllm, "version", None)
+        if not callable(version_fn):
+            return False
+        try:
+            version = version_fn(target.pod_ip, port=VLLM_PORT)
+        except Exception:
+            version = None
+        if parse_vllm_version(version) is None:
+            # Unknown / unparseable: no mode parameter this time (the drain makes a
+            # plain /sleep safe); not cached, so a later sleep asks again.
+            return False
+        supported = sleep_mode_supported(version)
+        self._mode_cache[key] = supported
+        return supported
+
+    def _commit_one(self, batch: SleepBatch, pod: _PodSleep, clock: Clock) -> None:
         target = pod.target
         policy = self._policy
-        self._journal.update(pod.pod, phase="sleeping", drained=drained)
-        in_flight = max(load.get("gateway_inflight") or 0, load.get("engine_load") or 0)
+        load = pod.last_load
+        drained = pod.decision == "wait"
+        supports_mode = self._mode_supported(target)
+        mode: str | None = ("wait" if drained else "abort") if supports_mode else None
         forced = not drained
-        forced_count = in_flight if forced else 0
-        if str(policy.vllm_sleep_mode_param).lower() != "false":
-            mode: str | None = "wait" if drained else "abort"
-        else:
-            mode = None
-        timeout = policy.sleep_call_timeout_s
-        if mode == "wait":
-            timeout += max(0.0, hard_deadline - clock.monotonic())
+        forced_count = int(load.get("in_flight") or 0) if forced else 0
+        self._journal.update(pod.pod, phase="sleeping", drained=drained, sleep_mode=mode)
+        pod.sleep_called = True
         result = self._vllm.sleep(
-            target.pod_ip, port=VLLM_PORT, mode=mode, timeout_s=timeout, hidden=True
+            target.pod_ip,
+            port=VLLM_PORT,
+            mode=mode,
+            timeout_s=policy.sleep_call_timeout_s,
+            hidden=True,
         )
-        if not _success(result) and mode == "wait" and self._physical(target) is not True:
-            # A straggler kept mode=wait from finishing: the budget is spent.
+        if not _success(result) and self._physical(target) is not True:
+            if mode != "wait":
+                message = getattr(result, "message", "") or "operation failed"
+                raise SleepFailed(f"vLLM sleep failed for {target.binding.serve_id}: {message}")
+            # A straggler kept mode=wait from finishing within the call timeout.
+            # Abort only when the drain state is KNOWN and nothing non-continuable
+            # is in flight; otherwise leave the pod hidden for the audit/recovery.
+            again = self._load(pod, batch.ack)
+            pod.last_load = again
+            if not again["known"] or (pod.non_continuable or 0) > 0:
+                self._mark_unconfirmed(
+                    batch,
+                    pod,
+                    reason="mode=wait did not finish and the drain state is unknown "
+                    "or non-continuable",
+                )
+                return
             forced = True
-            forced_count = max(1, self._current_in_flight(pod))
+            forced_count = max(1, int(again.get("in_flight") or 0))
             mode = "abort"
             result = self._vllm.sleep(
                 target.pod_ip,
@@ -534,91 +919,205 @@ class SleepPrimitive:
                 timeout_s=policy.sleep_call_timeout_s,
                 hidden=True,
             )
-        if not _success(result):
-            message = getattr(result, "message", "") or "operation failed"
-            raise SleepFailed(f"vLLM sleep failed for {target.binding.serve_id}: {message}")
-        self._await_physical_sleep(target, clock)
-        self._runtime.write_binding_annotations(target.binding, state=POD_STATE_SLEEPING)
+            if not _success(result) and self._physical(target) is not True:
+                message = getattr(result, "message", "") or "operation failed"
+                raise SleepFailed(f"vLLM sleep failed for {target.binding.serve_id}: {message}")
+        physical = self._await_physical(target, clock)
+        if physical is None:
+            self._mark_unconfirmed(
+                batch, pod, reason="/sleep returned but /is_sleeping stayed unknown"
+            )
+            return
+        if physical is False:
+            raise SleepFailed(
+                f"vLLM sleep did not physically converge for {target.binding.serve_id}"
+            )
+        self._finalize_slept(batch, pod, mode=mode, forced=forced, forced_count=forced_count)
+
+    def _finalize_slept(
+        self,
+        batch: SleepBatch,
+        pod: _PodSleep,
+        *,
+        mode: str | None,
+        forced: bool,
+        forced_count: int,
+        reason: str | None = None,
+    ) -> None:
+        self._runtime.write_binding_annotations(pod.target.binding, state=POD_STATE_SLEEPING)
         pod.done = True
         self._journal.end(pod.pod)
+        self._release(batch, [pod])
         self._journal.incr("sleeps_total")
-        self._journal.incr(f"sleeps_path_{path}")
+        self._journal.incr(f"sleeps_path_{batch.path}")
         if forced:
             self._journal.incr("forced_abort_total")
             self._journal.incr("forced_abort_requests_total", forced_count)
-        outcome = {
-            "serve_id": target.binding.serve_id,
-            "binding_id": target.binding.binding_id,
-            "path": path,
-            "ack_mode": ack["mode"],
-            "ack_latency_ms": ack.get("latency_ms"),
-            "drained": drained,
-            "sleep_mode": mode,
-            "forced_abort": forced,
-            "forced_abort_requests": forced_count,
-            "non_continuable_at_sleep": load.get("non_continuable", 0),
-            "waited_s": round(waited_s, 3),
-        }
-        self._recent.append(outcome)
+        pod.outcome = self._outcome(
+            batch,
+            pod,
+            STATUS_SLEPT,
+            reason=reason,
+            sleep_mode=mode,
+            forced_abort=forced,
+            forced_abort_requests=forced_count,
+        )
         log = LOG.warning if forced else LOG.info
-        log("sleep %s", json.dumps(outcome, sort_keys=True))
-        return outcome
+        log("sleep %s", json.dumps(pod.outcome, sort_keys=True))
 
-    def _current_in_flight(self, pod: _PodSleep) -> int:
-        metrics = getattr(self._vllm, "metrics", None)
-        if not callable(metrics):
-            return 0
-        try:
-            return parse_vllm_load(metrics(pod.target.pod_ip, port=VLLM_PORT)) or 0
-        except Exception:
-            return 0
+    def _mark_unconfirmed(self, batch: SleepBatch, pod: _PodSleep, *, reason: str) -> None:
+        """/sleep was sent but the pod is not confirmed asleep: keep it hidden and
+        keep the journal entry (audit ``sleep_unconfirmed``; recovery resolves it)."""
+        self._journal.update(pod.pod, phase="sleep_unconfirmed", reason=reason)
+        self._journal.incr("sleep_unconfirmed_total")
+        pod.outcome = self._outcome(batch, pod, STATUS_UNCONFIRMED, reason=reason)
+        LOG.error("sleep of %s unconfirmed, pod stays hidden: %s", pod.pod, reason)
 
     def _physical(self, target: SleepTarget) -> bool | None:
         probe = getattr(self._vllm, "is_sleeping", None)
         if not callable(probe):
             return None
-        return probe(target.pod_ip, port=VLLM_PORT)
+        try:
+            return probe(target.pod_ip, port=VLLM_PORT)
+        except Exception:
+            return None
 
-    def _await_physical_sleep(self, target: SleepTarget, clock: Clock) -> None:
+    def _await_physical(self, target: SleepTarget, clock: Clock) -> bool | None:
+        """True once /is_sleeping says so; else the last answer at the deadline.
+        (vLLM ops without an /is_sleeping probe: the /sleep result is trusted.)"""
         if not callable(getattr(self._vllm, "is_sleeping", None)):
-            return
-        deadline = clock.monotonic() + self._policy.sleep_call_timeout_s
+            return True
+        deadline = clock.monotonic() + self._policy.physical_confirm_timeout_s
         while True:
-            if self._physical(target) is True:
-                return
+            physical = self._physical(target)
+            if physical is True:
+                return True
             if clock.monotonic() >= deadline:
-                raise SleepFailed(
-                    f"vLLM sleep did not physically converge for {target.binding.serve_id}"
-                )
+                return physical
             clock.sleep(self._policy.poll_interval_s)
 
-    def _rollback(self, pods: list[_PodSleep], *, reason: str) -> None:
-        for pod in pods:
-            if pod.done or not pod.hidden:
-                if not pod.done:
-                    self._journal.end(pod.pod)
-                continue
-            try:
+    def _rollback_all(self, batch: SleepBatch, *, reason: str) -> None:
+        for pod in batch.pods:
+            if pod.outcome is None:
+                self._rollback_pod(batch, pod, reason=reason)
+
+    def _rollback_pod(self, batch: SleepBatch, pod: _PodSleep, *, reason: str) -> None:
+        if pod.done or pod.outcome is not None:
+            return
+        try:
+            if not pod.hidden:
+                self._journal.end(pod.pod)
+                self._release(batch, [pod])
+                pod.outcome = self._outcome(batch, pod, STATUS_ROLLED_BACK, reason=reason)
+                return
+            if pod.sleep_called:
                 physical = self._physical(pod.target)
                 if physical is True:
                     # It did go to sleep; record the truth instead of re-routing.
-                    self._runtime.write_binding_annotations(
-                        pod.target.binding, state=POD_STATE_SLEEPING
+                    forced = pod.decision != "wait"
+                    self._finalize_slept(
+                        batch,
+                        pod,
+                        mode=None,
+                        forced=forced,
+                        forced_count=int(pod.last_load.get("in_flight") or 0) if forced else 0,
+                        reason=reason,
                     )
-                else:
-                    self._runtime.write_binding_annotations(
-                        pod.target.binding, state=pod.previous_state
-                    )
-                self._journal.end(pod.pod)
-                self._journal.incr("rollback_total")
-                LOG.warning(
-                    "sleep of %s rolled back to %s: %s",
-                    pod.pod,
-                    POD_STATE_SLEEPING if physical is True else pod.previous_state,
-                    reason,
-                )
-            except Exception:  # keep the original failure; the journal stays as evidence
-                LOG.exception("rollback of %s failed; journal entry kept", pod.pod)
+                    return
+                if physical is None:
+                    self._mark_unconfirmed(batch, pod, reason=f"{reason}; physical state unknown")
+                    return
+            self._runtime.write_binding_annotations(
+                pod.target.binding, state=pod.previous_state
+            )
+            self._journal.end(pod.pod)
+            self._release(batch, [pod])
+            self._journal.incr("rollback_total")
+            pod.outcome = self._outcome(batch, pod, STATUS_ROLLED_BACK, reason=reason)
+            LOG.warning("sleep of %s rolled back to %s: %s", pod.pod, pod.previous_state, reason)
+        except Exception as exc:  # keep the original failure; the journal stays as evidence
+            LOG.exception("rollback of %s failed; journal entry kept", pod.pod)
+            try:
+                self._journal.update(pod.pod, phase="rollback_failed", reason=f"{reason}; {exc}")
+            except Exception:
+                pass
+            pod.outcome = self._outcome(
+                batch, pod, STATUS_ROLLBACK_FAILED, reason=f"{reason}; rollback failed: {exc}"
+            )
+
+    def _release(self, batch: SleepBatch, pods: list[_PodSleep]) -> None:
+        ids = [pod.binding_id for pod in pods if pod.reserved]
+        for pod in pods:
+            pod.reserved = False
+        if ids and batch.token is not None:
+            try:
+                self._reservations.release(ids, batch.token)
+            except Exception:  # expires by itself
+                LOG.exception("releasing sleep reservation of %s failed", ids)
+
+    def _end_journal_if_ours(self, pod: _PodSleep, batch: SleepBatch) -> None:
+        entry = self._journal.get(pod.pod) or {}
+        if entry.get("reservation_token") in (None, batch.token):
+            self._journal.end(pod.pod)
+
+    def _outcome(
+        self, batch: SleepBatch, pod: _PodSleep, status: str, *, reason=None, **extra
+    ) -> dict:
+        ack = batch.ack or {}
+        outcome = {
+            "serve_id": pod.pod,
+            "binding_id": pod.binding_id,
+            "path": batch.path,
+            "status": status,
+            "reason": reason,
+            "previous_state": pod.previous_state,
+            "ack_mode": ack.get("mode"),
+            "ack_latency_ms": ack.get("latency_ms"),
+            "drained": pod.decision == "wait",
+            "sleep_mode": None,
+            "forced_abort": False,
+            "forced_abort_requests": 0,
+            "non_continuable_at_sleep": pod.last_load.get("non_continuable") or 0,
+            "waited_s": round(pod.waited_s, 3),
+        }
+        outcome.update(extra)
+        self._recent.append(outcome)
+        return outcome
+
+    def _register(self, batch: SleepBatch) -> None:
+        with self._active_lock:
+            self._active.add(id(batch))
+
+    def _unregister(self, batch: SleepBatch) -> None:
+        with self._active_lock:
+            self._active.discard(id(batch))
+            self._active_lock.notify_all()
+
+
+_ROLLBACK_REASONS = {
+    "drain_unknown_rollback_total": (
+        "drain state still unknown at the hard cap (read errors / metrics unavailable): "
+        "rolled back, never aborted blind"
+    ),
+    "non_continuable_rollback_total": (
+        "non-continuable requests still in flight at the hard cap: rolled back, never aborted"
+    ),
+}
+
+
+def _decide(
+    pod: _PodSleep, load: dict, now: float, soft_deadline: float, hard_deadline: float
+) -> str | None:
+    """None = keep waiting; "wait" / "abort" = go to /sleep; else a rollback counter."""
+    if load["known"] and load["in_flight"] == 0:
+        return "wait"
+    if now < soft_deadline:
+        return None
+    if not load["known"]:
+        return None if now < hard_deadline else "drain_unknown_rollback_total"
+    if (pod.non_continuable or 0) > 0:
+        return None if now < hard_deadline else "non_continuable_rollback_total"
+    return "abort"
 
 
 def _previous_state(binding: Binding) -> str:

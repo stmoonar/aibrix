@@ -56,7 +56,11 @@ def decision_hist_key(model: str) -> str:
 
 # --- Transparent sleep: gateway plugin <-> service-manager contract (plan 2026-09-27) ---
 # Written by the gateway plugin (Go constants must match), read by the service-manager.
+# Keys are per pod NAME (no namespace): TRE model pods must have unique names across
+# namespaces (the generated Deployments embed model, node and GPUs in the name).
 #: ZSET, member = plugin instance id (pod name), score = heartbeat epoch ms (every 2 s).
+#: The SM treats an instance as live while its score keeps CHANGING between SM reads
+#: (SM monotonic clock), so neither side's wall clock matters.
 GW_INSTANCES_KEY = "tre:v2:gw:instances"
 #: k8s Pod annotation (integer) bumped by the SM in the same patch that changes the
 #: tre.aibrix.io/routable label; plugins report the last generation they applied.
@@ -76,6 +80,9 @@ def gw_inflight_key(pod: str) -> str:
 # Written by the service-manager sleep primitive.
 #: HASH field=pod name, value JSON: the sleep in progress for that pod (crash evidence).
 SM_SLEEP_OPS_KEY = "tre:v2:sm:sleep_ops"
+#: HASH field=binding_id, value JSON: the sleep reservation fencing a draining binding
+#: and its GPUs while the drain runs outside the writer lock (expiry = Redis TIME).
+SM_SLEEP_RESERVATIONS_KEY = "tre:v2:sm:sleep_reservations"
 #: HASH of integer counters (sleeps, forced aborts, ack fallbacks, rollbacks, ...).
 SM_SLEEP_STATS_KEY = "tre:v2:sm:sleep_stats"
 #: LIST of recent gateway-ack latencies (ms), newest first, capped.

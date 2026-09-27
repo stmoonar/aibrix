@@ -47,8 +47,9 @@ class VllmOps:
     ) -> VllmOpResult:
         """POST /sleep.
 
-        ``mode`` (vLLM >= 0.30: ``wait`` | ``abort`` | ``keep``) is sent as a
-        query parameter only when given. ``timeout_s`` replaces the default
+        ``mode`` (vLLM >= 0.18: ``wait`` | ``abort`` | ``keep``; see
+        ``sleep_primitive.SLEEP_MODE_MIN_VERSION``) is sent as a query parameter
+        only when given. ``timeout_s`` replaces the default
         HTTP timeout and makes the call single-shot (a timed-out ``mode=wait``
         must not be blindly retried). ``hidden`` adds ``X-TRE-Hidden: 1``: the
         caller hid the pod first (plan D2: a sidecar refuses /sleep without it).
@@ -79,6 +80,27 @@ class VllmOps:
             return None
         text = getattr(response, "text", None)
         return text if isinstance(text, str) else None
+
+    def version(self, pod_ip: str, *, port: int | None = None) -> str | None:
+        """vLLM version string from ``GET /version`` (None on any failure)."""
+        url = f"http://{pod_ip}:{port or self._default_port}/version"
+        try:
+            response = self._http.get(url, timeout=self._timeout_s)
+            status = int(response.status_code)
+        except Exception:
+            return None
+        if not (200 <= status < 300):
+            return None
+        payload = None
+        json_method = getattr(response, "json", None)
+        if callable(json_method):
+            try:
+                payload = json_method()
+            except Exception:
+                payload = None
+        if isinstance(payload, dict) and payload.get("version") is not None:
+            return str(payload["version"])
+        return None
 
     def wake_up(self, pod_ip: str, *, port: int | None = None) -> VllmOpResult:
         return self._post(pod_ip, "wake_up", port=port)

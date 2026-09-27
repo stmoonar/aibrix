@@ -22,6 +22,7 @@ from tre_sm.allocator.topology import GPU_IDS_ANNOTATION, STATE_ANNOTATION, K8sP
 from tre_sm.ops.k8s_ops import ModelDeploymentRecord, StartupPodRecord
 from tre_sm.state.fleet_store import _SAVE_HASH_SCRIPT
 from tre_sm.state.operations import WriterFence, _CURRENT_FENCE
+from tre_sm.state import sleep_reservations as _res
 
 
 def _b(value) -> bytes:
@@ -94,6 +95,15 @@ class FakeRedis:
     def zadd(self, key, mapping):
         self.zsets.setdefault(key, {}).update({_s(k): float(v) for k, v in mapping.items()})
 
+    def zrange(self, key, start, stop, withscores=False):
+        self._check()
+        members = sorted(self.zsets.get(key, {}).items(), key=lambda kv: kv[1])
+        stop = len(members) - 1 if stop == -1 else stop
+        chosen = members[start : stop + 1]
+        if withscores:
+            return [(_b(m), float(score)) for m, score in chosen]
+        return [_b(m) for m, _score in chosen]
+
     def zrangebyscore(self, key, low, high):
         self._check()
         low = float("-inf") if low == "-inf" else float(low)
@@ -114,9 +124,15 @@ class FakeRedis:
     def lrange(self, key, start, stop):
         return [_b(v) for v in self.lists.get(key, [])[start : stop + 1]]
 
-    # fleet-state CAS script
+    # Lua scripts (Python re-implementations with the same argument layout)
     def eval(self, script, numkeys, *keys_and_args):
-        assert script == _SAVE_HASH_SCRIPT, "only the fleet-state save script is faked"
+        if script == _res._ACQUIRE_SCRIPT:
+            return self._reservation_acquire(keys_and_args[0], [_s(a) for a in keys_and_args[numkeys:]])
+        if script == _res._RENEW_SCRIPT:
+            return self._reservation_renew(keys_and_args[0], [_s(a) for a in keys_and_args[numkeys:]])
+        if script == _res._RELEASE_SCRIPT:
+            return self._reservation_release(keys_and_args[0], [_s(a) for a in keys_and_args[numkeys:]])
+        assert script == _SAVE_HASH_SCRIPT, "unknown Lua script"
         state_key, version_key, lock_key = keys_and_args[:numkeys]
         expected, next_version, lock_value, *pairs = keys_and_args[numkeys:]
         current = int(self.values.get(version_key, 0))
@@ -127,6 +143,64 @@ class FakeRedis:
         self.hashes[state_key] = dict(zip(pairs[::2], pairs[1::2]))
         self.values[version_key] = str(next_version)
         return [1, int(next_version)]
+
+
+    def _reservation_acquire(self, key, argv):
+        token, owner, operation_id, ttl_ms, count = argv[0], argv[1], argv[2], int(argv[3]), int(argv[4])
+        wanted = []
+        for i in range(count):
+            base = 5 + i * 4
+            wanted.append(
+                {"id": argv[base], "node": argv[base + 1], "gpus": json.loads(argv[base + 2]), "serve": argv[base + 3]}
+            )
+        bucket = self.hashes.setdefault(key, {})
+        for field_name, raw in list(bucket.items()):
+            record = json.loads(raw)
+            if int(record["expires_at_ms"]) <= self.now_ms:
+                bucket.pop(field_name)
+            elif record["token"] != token:
+                for w in wanted:
+                    if record["binding_id"] == w["id"] or (
+                        record["node"] == w["node"] and set(record["gpu_ids"]) & set(w["gpus"])
+                    ):
+                        return [0, record["binding_id"]]
+        expires = self.now_ms + ttl_ms
+        for w in wanted:
+            bucket[w["id"]] = json.dumps(
+                {
+                    "binding_id": w["id"], "serve_id": w["serve"], "node": w["node"],
+                    "gpu_ids": w["gpus"], "token": token, "owner": owner,
+                    "operation_id": operation_id, "expires_at_ms": expires,
+                }
+            )
+        return [1, str(expires)]
+
+    def _reservation_renew(self, key, argv):
+        token, ttl_ms, ids = argv[0], int(argv[1]), argv[2:]
+        bucket = self.hashes.setdefault(key, {})
+        for binding_id in ids:
+            raw = bucket.get(binding_id)
+            if raw is None:
+                return 0
+            record = json.loads(raw)
+            if record["token"] != token or int(record["expires_at_ms"]) <= self.now_ms:
+                return 0
+        for binding_id in ids:
+            record = json.loads(bucket[binding_id])
+            record["expires_at_ms"] = self.now_ms + ttl_ms
+            bucket[binding_id] = json.dumps(record)
+        return 1
+
+    def _reservation_release(self, key, argv):
+        token, ids = argv[0], argv[1:]
+        bucket = self.hashes.setdefault(key, {})
+        released = 0
+        for binding_id in ids:
+            raw = bucket.get(binding_id)
+            if raw is not None and json.loads(raw)["token"] == token:
+                bucket.pop(binding_id)
+                released += 1
+        return released
 
 
 class LegacyRedis:
@@ -271,6 +345,15 @@ class FakeVllm:
         self.calls: list[tuple] = []
         self.sleep_results: list[Result] = []
         self.events: list[tuple] | None = None
+        #: pod IPs whose /sleep always fails (engine stays awake)
+        self.fail_sleep_for: set[str] = set()
+        #: pod IPs whose /metrics is unavailable (None)
+        self.metrics_down: set[str] = set()
+        #: pod IP -> vLLM version string (default 0.30.0); None = /version fails
+        self.versions: dict[str, str | None] = {}
+        self.version_calls: list[str] = []
+        #: pod IP -> /is_sleeping answer override (e.g. None = unreachable)
+        self.physical_override: dict[str, bool | None] = {}
 
     def _log(self, *event):
         self.calls.append(event)
@@ -279,6 +362,8 @@ class FakeVllm:
 
     def sleep(self, pod_ip, *, port=None, mode=None, timeout_s=None, hidden=False):
         self._log("sleep", pod_ip, mode, hidden)
+        if pod_ip in self.fail_sleep_for:
+            return Result(False, "injected failure")
         if self.sleep_results:
             result = self.sleep_results.pop(0)
             if not result.success:
@@ -293,13 +378,21 @@ class FakeVllm:
         return Result()
 
     def is_sleeping(self, pod_ip, *, port=None):
+        if pod_ip in self.physical_override:
+            return self.physical_override[pod_ip]
         return self.sleeping.get(pod_ip)
+
+    def version(self, pod_ip, *, port=None):
+        self.version_calls.append(pod_ip)
+        return self.versions.get(pod_ip, "0.30.0")
 
     def wait_until_ready(self, pod_ip, *, port=None):
         self._log("wait_until_ready", pod_ip)
         return Result()
 
     def metrics(self, pod_ip, *, port=None):
+        if pod_ip in self.metrics_down:
+            return None
         load = self.load.get(pod_ip, 0)
         return (
             "# HELP vllm:num_requests_running x\n"
@@ -355,22 +448,36 @@ class FakeRuntime:
 class FakeGateway:
     """The gateway plugin's side of the contract, written into FakeRedis.
 
+    Instances in ``alive`` re-heartbeat on every tick (their score advances);
     ``auto_ack`` instances ack a route-gen change after ``ack_after_polls``
-    reads of the seen hash, like an informer with some watch latency.
+    ticks, like an informer with some watch latency.
     """
 
     def __init__(self, redis: FakeRedis, runtime: FakeRuntime | None = None) -> None:
         self.redis = redis
         self.runtime = runtime
         self.instances: list[str] = []
+        self.alive: set[str] = set()
         self.auto_ack: set[str] = set()
         self.ack_after_polls = 0
         self._polls = 0
+        self._beats = 0
 
-    def heartbeat(self, instance: str, *, age_ms: int = 0) -> None:
+    def heartbeat(self, instance: str, *, age_ms: int = 0, alive: bool | None = None) -> None:
+        """Write a heartbeat; ``alive`` (default: age_ms == 0) keeps it beating."""
         self.redis.zadd(rediskeys.GW_INSTANCES_KEY, {instance: self.redis.now_ms - age_ms})
         if instance not in self.instances:
             self.instances.append(instance)
+        if alive if alive is not None else age_ms == 0:
+            self.alive.add(instance)
+        else:
+            self.alive.discard(instance)
+
+    def beat(self) -> None:
+        """One heartbeat period for every alive instance (scores advance)."""
+        self._beats += 1
+        for instance in self.alive:
+            self.redis.zadd(rediskeys.GW_INSTANCES_KEY, {instance: self.redis.now_ms + self._beats * 1000})
 
     def seen(self, pod: str, instance: str, *, gen: int, routable: bool) -> None:
         self.redis.hset(
@@ -387,7 +494,8 @@ class FakeGateway:
         )
 
     def tick(self) -> None:
-        """Let auto-ack instances observe the runtime's current route state."""
+        """Heartbeat, then let auto-ack instances observe the route state."""
+        self.beat()
         if self.runtime is None:
             return
         self._polls += 1
@@ -425,7 +533,8 @@ def policy(**overrides) -> SleepPolicy:
         no_plugin_grace_s=5.0,
         poll_interval_s=0.5,
         sleep_call_timeout_s=60.0,
-        vllm_sleep_mode_param=True,
+        physical_confirm_timeout_s=15.0,
+        vllm_sleep_mode_param="true",
         hard_cap_s=150.0,
         plugin_label_selector=None,
     )

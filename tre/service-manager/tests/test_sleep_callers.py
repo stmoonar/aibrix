@@ -259,3 +259,28 @@ def test_fleet_repair_quarantine_sleeps_through_primitive():
 
     assert h.paths == [("repair", None, ["pod-a"])]
     h.assert_hidden_before_every_sleep()
+
+
+
+def test_partial_multi_target_failure_releases_leases_and_records_only_what_slept():
+    """Review P2-7: a scale-down of two pods where one /sleep fails."""
+    h = Harness(_two_awake(), desired=_desired_two_awake())
+    h.vllm.fail_sleep_for.add("10.0.0.2")  # pod-b's engine refuses to sleep
+    client = TestClient(create_app(h.service))
+
+    response = client.put("/v2/models/m1/target", json={"wake_replicas": 0})
+
+    assert response.status_code == 409, response.text
+    statuses = {o["serve_id"]: o["status"] for o in response.json()["outcomes"]}
+    assert statuses == {"pod-a": "slept", "pod-b": "rolled_back"}
+    # GPU lease released only for the pod that slept.
+    assert [c for c in h.leases.calls if c[0] == "release"] == [("release", "m1/node-a/0")]
+    # Legacy store: exactly the slept pod is asleep.
+    by_serve = {b.serve_id: b for b in h.store.load().bindings}
+    assert by_serve["pod-a"].awake is False and by_serve["pod-b"].awake is True
+    # Desired: the rolled-back pod is awake again; the slept one stays sleeping.
+    desired = {d.binding_id: d.power for d in h.fleet.load_desired().bindings}
+    assert desired == {"m1/node-a/0": "sleeping", "m1/node-a/1": "awake"}
+    # Routing: pod-b is routable again, pod-a sleeping.
+    assert h.runtime.snapshots["pod-b"].annotations["tre.aibrix.io/state"] == "awake"
+    assert h.runtime.snapshots["pod-a"].annotations["tre.aibrix.io/state"] == "sleeping"
