@@ -140,3 +140,70 @@ def test_every_route_timeout_equals_the_registry_route_timeout(tmp_path: Path) -
     # the SM drain can never outlast the route
     for name, registry in registries.items():
         assert registry.service_manager().sleep.hard_cap_s <= timeouts[name], name
+
+
+# --- retry / continuation sidecar (plan D2, D5, D6) ---------------------------------
+
+
+def _sidecar_module():
+    try:
+        from tre_reissue import sidecar
+    except ImportError:  # PYTHONPATH without tre/reissue
+        import sys
+
+        sys.path.insert(0, str(DEPLOY_ROOT.parent / "reissue"))
+        from tre_reissue import sidecar
+    return sidecar
+
+
+def test_sidecar_speaks_the_sm_hidden_header() -> None:
+    """SM -> sidecar: every SM /sleep carries X-TRE-Hidden: 1 after the hide; the
+    sidecar refuses a /sleep without it (fail closed, D2)."""
+    from tre_sm.ops import sleep_primitive, vllm_ops
+
+    cfg = _sidecar_module().Config()
+    assert cfg.hidden_header == sleep_primitive.HIDDEN_SLEEP_HEADER == "X-TRE-Hidden"
+    assert '{"X-TRE-Hidden": "1"}' in inspect.getsource(vllm_ops)
+    assert "/sleep" in cfg.sleep_paths and cfg.require_hidden_header is True
+    assert cfg.listen_port == sleep_primitive.VLLM_PORT  # the SM talks to the serving port
+
+
+def test_sidecar_plan_interface_names() -> None:
+    """Plan 2026-09-27 interface contract: x-tre-exclude-pod (sidecar -> plugin),
+    x-tre-continued (sidecar -> client), EngineSleeping (fork --sleep-reject-new), and
+    the fork's --abort-return-token-ids field names (branch tre/transparent-sleep)."""
+    from tre_common.registry import VLLM_FEATURE_FLAGS
+
+    sidecar = _sidecar_module()
+    cfg = sidecar.Config()
+    assert cfg.exclude_header == "x-tre-exclude-pod"
+    assert cfg.continued_header == "x-tre-continued"
+    assert cfg.sleeping_error_type == "EngineSleeping"
+    assert (cfg.generated_ids_field, cfg.prompt_ids_field, cfg.token_ids_field) == (
+        "generated_token_ids", "prompt_token_ids", "token_ids",
+    )
+    assert VLLM_FEATURE_FLAGS == {
+        "sleep_reject_new": ("--sleep-reject-new",),
+        "abort_return_token_ids": ("--abort-return-token-ids",),
+    }
+    # the SM's registry-driven runtime creates use the same default gateway as the sidecar
+    from tre_common.registry import DEFAULT_REISSUE_GATEWAY_URL
+
+    assert sidecar.DEFAULT_GATEWAY_URL == DEFAULT_REISSUE_GATEWAY_URL
+    assert ".svc.cluster.local" in DEFAULT_REISSUE_GATEWAY_URL
+
+
+@needs_go
+def test_sidecar_headers_and_continuability_match_the_gateway_plugin() -> None:
+    sidecar = _sidecar_module()
+    go = _go_string_consts(TRE_GO)
+    assert go["HeaderTREExcludePod"] == sidecar.Config().exclude_header
+    # The plugin marks non_continuable requests (the SM drains them); the sidecar must
+    # never try to continue one of them: every request field the plugin inspects is
+    # also inspected by the sidecar's classification.
+    source = inspect.getsource(sidecar.non_continuable_reason)
+    for tag in _go_struct_json_tags(TRE_GO, "treSamplingFields"):
+        assert f'"{tag}"' in source, tag
+    # the plugin's EngineSleeping fixture is the fork's error body the sidecar retries
+    tests = (GATEWAY_GO / "tre_transparent_sleep_test.go").read_text(encoding="utf-8")
+    assert '"type":"EngineSleeping"' in tests
