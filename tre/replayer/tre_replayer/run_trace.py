@@ -135,6 +135,7 @@ def run_trace(
         if pod:
             by_pod = target_pods.setdefault(rec["model"], {})
             by_pod[pod] = by_pod.get(pod, 0) + 1
+    reissue = reissue_summary(sender.records)
     return {
         "trace": trace_path,
         "routing_strategy": routing_strategy or None,
@@ -151,8 +152,34 @@ def run_trace(
         "max_on_wire_delay_ms": round(sender.max_on_wire_delay_ms(), 2),
         "prompt_store_misses": sender.prompt_store_misses,
         "trim_ramp_windows": trim_ramp_windows,
+        # Reissue sidecar outcomes (plan 2026-09-27 P5): a run with continue > 0 had
+        # requests stitched across pods and is flagged as contaminated.
+        "reissue": reissue,
+        "reissue_contaminated": reissue["continue"] > 0,
         "per_model": per_model,
     }
+
+
+def reissue_summary(records: list[dict]) -> dict[str, Any]:
+    """Counts of what the reissue sidecar did, from the per-request records: ``abort``
+    (the client got finish_reason=abort), ``retry`` (resent through the gateway before it
+    started), ``continue`` (stitched from several pods) and the segments stitched in;
+    the same per model."""
+
+    def count(recs: list[dict]) -> dict[str, int]:
+        return {
+            "abort": sum(1 for r in recs if r.get("finish_reason") == "abort"),
+            "retry": sum(1 for r in recs if (r.get("tre_retried") or 0) > 0),
+            "continue": sum(1 for r in recs if (r.get("tre_continued") or 0) > 0),
+            "continued_segments": sum(int(r.get("tre_continued") or 0) for r in recs),
+        }
+
+    by_model: dict[str, list[dict]] = {}
+    for record in records:
+        by_model.setdefault(record.get("model"), []).append(record)
+    out: dict[str, Any] = count(records)
+    out["by_model"] = {model: count(recs) for model, recs in sorted(by_model.items(), key=lambda kv: str(kv[0]))}
+    return out
 
 
 def _achieved_offsets(records: list[dict]) -> list[float]:
