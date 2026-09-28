@@ -1696,6 +1696,7 @@ class ServiceManagerV2:
                     f"startup denied for non-resident desired binding {pod.binding_id}"
                 )
         self._assert_startup_slot_free(pod)
+        self._assert_startup_owner_live(pod)
         slept: list[Binding] = []
         try:
             slept = self._sleep_overlapping_residents(pod)
@@ -1728,6 +1729,7 @@ class ServiceManagerV2:
                     f"startup denied for non-resident desired binding {pod.binding_id}"
                 )
         self._assert_startup_slot_free(pod)
+        self._assert_startup_owner_live(pod)
         self._assert_startup_overlaps_sleeping(pod)
         self._runtime_ops.admit_startup_pod(
             pod.name,
@@ -1860,6 +1862,64 @@ class ServiceManagerV2:
             gpu_id, occupant = conflict
             raise GpuLeaseConflict(gpu=f"{pod.node}/{gpu_id}", occupant=occupant)
 
+    def _assert_startup_owner_live(self, pod: StartupPodRecord) -> None:
+        """Refuse (retriable 409, the gate polls again) a Pod whose owner chain
+        is not live (B11): the Pod is being deleted, or its ReplicaSet /
+        Deployment is gone, being deleted or was replaced. A failed cold start
+        deletes its Deployment, but the ReplicaSet may already have created a
+        replacement Pod; admitting it would take a ``starting`` lease for a Pod
+        that dies with its Deployment. Fails closed when the owner chain cannot
+        be read."""
+        check = getattr(self._runtime_ops, "startup_owner_problem", None)
+        if not callable(check):
+            return
+        try:
+            problem = check(pod.name, pod.uid)
+        except Exception as exc:
+            raise RetryLater(
+                f"cannot verify the owning Deployment of {pod.name}: {exc}; "
+                "retry the admission"
+            ) from exc
+        if problem:
+            raise RetryLater(f"startup denied for {pod.name}: {problem}")
+
+    def reap_orphan_starting_leases(self) -> list[str]:
+        """Supervisor pass (B11): release every ``starting`` GPU lease whose
+        binding has no Pod object any more. Outside a writer operation a
+        ``starting`` lease belongs to an admitted Pod that has not converged
+        yet (a creator holds the writer lock from before its Deployment exists
+        until its Pod is converged); once that Pod is gone the lease is an
+        orphan - expired or not - that would keep refusing startups on its GPUs
+        (the admission checks do not look at the expiry). Under the writer lock
+        (no start in progress); a busy lock skips the pass."""
+        lister = getattr(self._runtime_ops, "list_live_model_pod_binding_ids", None)
+        if self._gpu_leases is None or not callable(lister):
+            return []
+        if not any(lease.phase == "starting" for lease in self._gpu_leases.load()):
+            return []
+        if not self._orphan_starting_leases(lister()):
+            return []
+        reaped: list[str] = []
+        with self._writer("reap_orphan_starting_leases", wait_s=0.0):
+            for lease in self._orphan_starting_leases(lister()):
+                model = lease.binding_id.rsplit("/", 2)[0]
+                self._gpu_leases.release(
+                    Binding("orphan-starting-lease", model, Slot(lease.node, tuple(lease.gpu_ids)), awake=False)
+                )
+                LOG.warning(
+                    "released orphan starting GPU lease of %s on %s/%s: no Pod of the binding exists",
+                    lease.binding_id, lease.node, list(lease.gpu_ids),
+                )
+                reaped.append(lease.binding_id)
+        return reaped
+
+    def _orphan_starting_leases(self, live_binding_ids: set[str]) -> list:
+        return [
+            lease
+            for lease in self._gpu_leases.load()
+            if lease.phase == "starting" and lease.binding_id not in live_binding_ids
+        ]
+
     def _restore_failed_admission_residents(
         self, pod: StartupPodRecord, slept: list[Binding]
     ) -> None:
@@ -1898,6 +1958,10 @@ class ServiceManagerV2:
             # and no transient lease can appear between the check and the admission.
             self._assert_startup_slot_free(pod)
             self._safety_gate.assert_no_pressure()
+            # B11: checked again under the lock - a writer that failed a cold
+            # start deletes the Deployment under this lock, so an admission that
+            # queued behind it sees the Deployment gone here, before any lease.
+            self._assert_startup_owner_live(pod)
             if pod.binding_id not in self._desired_binding_ids():
                 # Redis lost desired state while the SM kept running: re-seed
                 # from the registry (append-only). A Pod whose binding is not in
