@@ -2,7 +2,7 @@
 
 The console (PUT /api/params) edits only the per-model tunables: trs.*, slo.*,
 alt_thresholds.*, min_replicas / max_replicas / max_awake_replicas. Everything else
-(images, engine args, vllm / gateway / reissue / service_manager sections) changes only
+(images, engine args, vllm / gateway / reissue / service_manager / placement sections) changes only
 with a release and has no console path. This script takes the release registry and
 lays the live tunables over it, key by key, so a release never resets calibrated values
 (e.g. theta_m) and never drops a key the release added.

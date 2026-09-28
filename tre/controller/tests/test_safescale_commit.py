@@ -238,7 +238,7 @@ def test_gc_deletes_only_resolved_probes_older_than_one_hour():
     assert set(_probe_records(redis)) == {"fresh", "probing"}
 
 
-def test_observe_mode_holds_commit_and_orphan_detector_stays_quiet():
+def test_observe_mode_turns_the_commit_into_its_unhide_and_orphan_detector_stays_quiet():
     redis = FakeRedis()
     store = ControllerStateStore(redis)
     machine = _machine(store)
@@ -254,8 +254,11 @@ def test_observe_mode_holds_commit_and_orphan_detector_stays_quiet():
     assert next(iter(_probe_records(redis).values()))["status"] == "committing"
     assert [probe.model for probe in machine.committing_probes()] == ["donor"]
 
-    assert asyncio.run(queue.drain_once()) == ()
-    assert len(queue.pending_actions()) == 1
+    # 2026-09-28 (observe = record only): the commit is not held - it runs as
+    # the unhide of the donor's probe pods; its follow-up upscale is dropped.
+    results = asyncio.run(queue.drain_once())
+    assert [(r.action_kind, r.ok) for r in results if r.action_kind == "unhide"] == [("unhide", True)]
+    assert queue.pending_actions() == ()
     redis.hset(
         rediskeys.SM_STATE_KEY,
         mapping={

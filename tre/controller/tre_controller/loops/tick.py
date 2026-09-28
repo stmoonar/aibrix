@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Callable, Protocol, Union
 if TYPE_CHECKING:
     from tre_controller.profiling import TickProfiler
 
+from tre_common.gpu_placement import placement_policy_from_registry
 from tre_common.metrics_schema import MetricsSnapshot, ModelWindowMetrics
 from tre_common.registry import Registry, ModelSpec
 from tre_common.tss import window_is_idle
@@ -131,14 +132,25 @@ def run_planner_tick(
     loop: str = "tick",
     action_cooldown: bool = False,
     observe_mode: bool = False,
+    probe_block_reason: str | None = None,
 ) -> LoopTickResult:
     """One planner tick. ``observe_mode`` (controller mode ``observe``, B8): the
     plan is still computed and published, but no SafeScale probe is started or
     preempted - the probe's state would change (hide, window, commit) while its
     hide never reaches the cluster. Every other action is still submitted; the
-    ActionQueue drops it in observe mode (it never reaches the SM)."""
+    ActionQueue drops it in observe mode (it never reaches the SM).
+
+    ``probe_block_reason`` (P2-3): no SafeScale probe is started this tick
+    (``sm_maintenance``: the SM maintenance lock is held;
+    ``sm_maintenance_unreadable``: it could not be read - fail-closed). The
+    planned probe-only scale-downs are dropped with the event
+    ``safescale_probe_skipped:<model>:<reason>``; every other action is kept."""
     if snapshot.stale:
         return LoopTickResult(submitted=0, events=("snapshot_stale",))
+    if cluster_view is not None and cluster_view.placement is None:
+        # Every placement decision of this tick (wakes, creates, donor slots, probe /
+        # shrink order) ranks by the registry placement policy.
+        cluster_view = replace(cluster_view, placement=placement_policy_from_registry(registry))
 
     _prof_on = prof is not None
     if _prof_on:
@@ -183,6 +195,7 @@ def run_planner_tick(
         incomplete_policy=incomplete_policy,
         suppress_hot_proactive_probe=suppress_hot_proactive_probe,
         disable_eta_gate=disable_eta_gate,
+        defrag_enabled=_defrag_enabled(registry),
     )
     plan = build_plan(
         model_contexts=contexts,
@@ -208,6 +221,7 @@ def run_planner_tick(
         cluster_view=cluster_view,
         contexts=contexts,
         observe_mode=observe_mode,
+        probe_block_reason=probe_block_reason,
     )
     if _prof_on:
         _safescale_ns = time.perf_counter_ns() - _phase_t0
@@ -243,6 +257,11 @@ def run_planner_tick(
         model_contexts=contexts,
         classifications={item.model_name: item for item in classifications},
     )
+
+
+def _defrag_enabled(registry: Registry) -> bool:
+    placement = getattr(registry, "placement", None)
+    return bool(getattr(placement(), "defrag_enabled", False)) if callable(placement) else False
 
 
 def _defrag_blocking_events(queue: PlannerQueue, actions) -> tuple[str, ...]:
@@ -296,6 +315,7 @@ def _apply_safescale(
     cluster_view: ClusterView | None = None,
     contexts: dict[str, dict] | None = None,
     observe_mode: bool = False,
+    probe_block_reason: str | None = None,
 ) -> tuple[tuple[Action, ...], tuple[str, ...]]:
     if safescale is None:
         return actions, ()
@@ -330,6 +350,10 @@ def _apply_safescale(
                 continue
         if not _requires_safescale_probe(action):
             converted.append(action)
+            continue
+        if probe_block_reason is not None:
+            # P2-3: the SM maintenance lock (or an unreadable one) pauses SafeScale.
+            events.append(f"safescale_probe_skipped:{_safescale_probe_model(action)}:{probe_block_reason}")
             continue
 
         probe_model = _safescale_probe_model(action)
@@ -446,9 +470,10 @@ def _pods_to_probe(
         # Review F3: probe only serving bindings (awake and not already hidden). The
         # metrics per_pod map also lists sleeping pods, which must never be "hidden" as
         # a scale-down probe (it would remove no capacity and the commit would be a no-op).
-        # Among those, release_order puts the replica whose slot merges into the largest
-        # free block first, so a committed shrink hands back an aligned pair a tp=2 model
-        # can actually use instead of scattered single GPUs.
+        # Among those, release_order (registry placement policy) puts the replica whose
+        # slot merges into the largest free block first, then the one on the most loaded
+        # node, so a committed shrink hands back an aligned pair a tp=2 model can use and
+        # keeps the nodes balanced.
         serving = sorted(
             (
                 binding
@@ -458,7 +483,10 @@ def _pods_to_probe(
             key=lambda binding: natural_key(binding.serve_id),
         )
         ordered = release_order(
-            serving, bindings=list(cluster_view.bindings), topology=cluster_view.topology
+            serving,
+            bindings=list(cluster_view.bindings),
+            topology=cluster_view.topology,
+            policy=cluster_view.placement,
         )
         return tuple(binding.serve_id for binding in ordered[:count])
     metrics = snapshot.models.get(model)

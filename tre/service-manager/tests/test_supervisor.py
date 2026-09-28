@@ -47,7 +47,9 @@ def test_supervisor_debounces_batch_drift_before_repair():
     supervisor.run_once()
 
     assert service.repairs == [True]
-    assert service.observe_handoffs == 1
+    # 2026-09-28: the repair holds the SM maintenance lock; the supervisor no
+    # longer hands the controller to observe (it never touches its mode).
+    assert service.observe_handoffs == 0
     assert service.converges == 3
     assert supervisor.snapshot().last_recovery_operation_id == "repair-1"
 

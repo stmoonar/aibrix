@@ -72,8 +72,9 @@ ROUTING_STRATEGY_HEADER = "routing-strategy"
 
 #: What the v1 client sent on every request (OpenAI SDK ``default_headers``, all v1
 #: configs: ``client.routing_algorithm: least-gpu-cache``): the plugin picks the awake pod
-#: with the lowest ``vllm:gpu_cache_usage_perc``. The trace replayer (``run_trace``) and
-#: the campaign default to it so both arms are routed the way v1 routed them.
+#: with the lowest ``vllm:kv_cache_usage_perc`` (``gpu_cache_usage_perc`` before 0.11).
+#: The trace replayer (``run_trace``) and the campaign default to it so both arms are
+#: routed the way v1 routed them.
 DEFAULT_ROUTING_STRATEGY = "least-gpu-cache"
 
 

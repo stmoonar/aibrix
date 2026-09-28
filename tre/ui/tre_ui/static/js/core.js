@@ -11,7 +11,10 @@ export const S = {
   meta: null,
   colors: {},
   snap: null,
-  mode: 'active',
+  mode: 'observe',
+  /* Controller mode and SM actuation are independent switches (2026-09-28).
+     The live value comes from the snapshot (run_mode); this is the first paint. */
+  runMode: { controller: 'observe', sm_actuation: 'observe', raw: null, warnings: [] },
   view: 'overview',
   audit: { ran_at_ms: null, result: null },
 };
@@ -143,15 +146,52 @@ export function openStream() {
   es.onerror = () => setConn(false);  // EventSource reconnects on its own
 }
 
+/* The snapshot's run_mode (sampled every 1s) wins over the last API answer. */
+export function currentRunMode() {
+  const live = (S.snap || {}).run_mode;
+  if (live && live.controller) S.runMode = live;
+  S.mode = S.runMode.controller;
+  return S.runMode;
+}
+
+const ALERT_LABEL = {
+  capacity_blocked: '扩容被容量阻塞（无空闲 slot / defrag 不可用）',
+  defrag_disabled: 'TP defrag 被 registry placement 策略关闭',
+};
+
+function renderAlertStrip(rm) {
+  const strip = $('#alert-strip');
+  if (!strip) return;
+  strip.innerHTML = '';
+  const warnings = rm.warnings || [];
+  const alerts = (S.snap || {}).planner_alerts || [];
+  warnings.forEach((w) => strip.appendChild(el('div', 'alert warn', '⚠ run mode: ' + w)));
+  alerts.forEach((a) => {
+    const text = `${a.active ? '●' : '○'} ${a.kind}:${a.model} — ${ALERT_LABEL[a.kind] || a.kind}`
+      + ` · 15 分钟内 ${a.count} 次 · 最近 ${clockText(a.last_ts_ms)}${a.active ? ' · 当前决策中' : ''}`;
+    strip.appendChild(el('div', 'alert ' + (a.active ? 'bad' : 'warn'), text));
+  });
+  strip.hidden = !(warnings.length || alerts.length);
+}
+
 export function renderTopbar() {
   const snap = S.snap || {};
   $('#ver').textContent = 'v' + (snap.version || 0);
   $('#stamp').textContent = clockText(snap.sampled_at_ms);
 
+  const rm = currentRunMode();
+  const raw = rm.raw || {};
   const badge = $('#mode-badge');
-  badge.className = 'pill ' + (S.mode === 'observe' ? 'warn' : 'ok');
-  $('#mode-badge-txt').innerHTML = S.mode === 'observe'
-    ? 'controller <b>OBSERVE</b>' : 'controller <b>ACTIVE</b>';
+  badge.className = 'pill ' + (rm.controller === 'observe' ? 'warn' : 'ok');
+  $('#mode-badge-txt').innerHTML = 'controller <b>' + String(rm.controller).toUpperCase()
+    + (raw.controller == null ? ' (unset)' : '') + '</b>';
+  const smBadge = $('#sm-act-badge');
+  if (smBadge) {
+    smBadge.className = 'pill ' + (rm.sm_actuation === 'observe' ? 'warn' : 'ok');
+    $('#sm-act-badge-txt').innerHTML = 'SM actuation <b>' + String(rm.sm_actuation).toUpperCase()
+      + (raw.sm_actuation == null ? ' (unset)' : '') + '</b>';
+  }
+  renderAlertStrip(rm);
 
   const sup = (snap.fleet || {}).supervisor || {};
   const supOk = sup.running && !sup.last_error && !(sup.drift_observations > 0);

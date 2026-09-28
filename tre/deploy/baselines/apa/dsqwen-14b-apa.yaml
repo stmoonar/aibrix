@@ -1,5 +1,5 @@
 # APA (KVCache) baseline autoscaler for dsqwen-14b (experiment 3 control arm).
-# dsqwen-14b is tp_size=2 and scales 0..4 (registry). scaleTargetRef.Name MUST equal the
+# dsqwen-14b is tp_size=2 and scales 1..4 (registry). scaleTargetRef.Name MUST equal the
 # registry model name: the patched aibrix podautoscaler controller passes it verbatim as the
 # model to service-manager /models_replicas and /scale_service
 # (TRE-PATCH P2-APA-001, pkg/controller/podautoscaler/workload_scale.go:179,243,357,409).
@@ -27,7 +27,7 @@ spec:
       protocolType: http
       port: '8000'
       path: metrics
-      targetMetric: gpu_cache_usage_perc
+      targetMetric: kv_cache_usage_perc
       targetValue: '0.5'
   scaleTargetRef:
     apiVersion: apps/v1

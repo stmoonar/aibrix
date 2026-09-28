@@ -401,7 +401,9 @@ def test_tp_aware_critical_receiver_plans_defrag_for_fragmented_two_gpu_capacity
         classifications=classifications,
         model_replicas={"tp2": 0},
         idle_gpus=2,
-        cfg=PlanConfig(min_replicas_per_model=0, max_replicas_per_model=2, model_tp_sizes={"tp2": 2}),
+        cfg=PlanConfig(
+            min_replicas_per_model=0, max_replicas_per_model=2, model_tp_sizes={"tp2": 2}, defrag_enabled=True
+        ),
         cluster_view=cluster_view,
     )
 
@@ -438,7 +440,9 @@ def test_tp_aware_critical_receiver_records_capacity_blocked_when_no_slot_or_def
         classifications=classifications,
         model_replicas={"tp2": 0},
         idle_gpus=2,
-        cfg=PlanConfig(min_replicas_per_model=0, max_replicas_per_model=2, model_tp_sizes={"tp2": 2}),
+        cfg=PlanConfig(
+            min_replicas_per_model=0, max_replicas_per_model=2, model_tp_sizes={"tp2": 2}, defrag_enabled=True
+        ),
         cluster_view=cluster_view,
     )
 
@@ -760,3 +764,32 @@ def test_rollback_backoff_event_only_for_models_that_would_be_probed() -> None:
 
     assert "safescale_rollback_backoff:hot" not in events(1)
     assert "safescale_rollback_backoff:hot" in events(3)
+
+
+def test_tp_aware_critical_receiver_plans_no_defrag_while_disabled() -> None:
+    # Registry placement.defrag.enabled defaults to false (v1 parity): the same
+    # fragmented layout as above yields no migration, only the blocked events.
+    classifications = [_classification("tp2", ModelState.CRITICAL, ModelRole.RECEIVER, 0.5)]
+    contexts = {"tp2": {"assigned_replicas": 0, "routable_pods": 0}}
+    cluster_view = ClusterView(
+        topology=_tp2_topology(),
+        bindings=(
+            Binding("serve-0", "m1", Slot("node-a", (0,)), awake=True),
+            Binding("serve-2", "m1", Slot("node-a", (2,)), awake=True),
+        ),
+    )
+
+    plan = build_plan(
+        model_contexts=contexts,
+        classifications=classifications,
+        model_replicas={"tp2": 0},
+        idle_gpus=2,
+        cfg=PlanConfig(min_replicas_per_model=0, max_replicas_per_model=2, model_tp_sizes={"tp2": 2}),
+        cluster_view=cluster_view,
+    )
+
+    assert PlanConfig(min_replicas_per_model=0, max_replicas_per_model=2).defrag_enabled is False
+    assert [action for action in plan.actions if isinstance(action, DefragAction)] == []
+    assert [action for action in plan.actions if isinstance(action, ScaleAction)] == []
+    assert "defrag_disabled:tp2" in plan.events
+    assert "capacity_blocked:tp2" in plan.events

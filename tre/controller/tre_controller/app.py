@@ -16,6 +16,7 @@ from tre_controller.loops.action_queue import (
     revalidate_from_cluster_view,
     slot_lookup_from_cluster_view,
 )
+from tre_controller.maintenance import MaintenanceWatch
 from tre_controller.mode import ObserveModeGate
 from tre_controller.reconcile.hidden_orphans import HiddenOrphanDetector
 from tre_controller.profiling import TickProfiler, build_profiler
@@ -57,6 +58,10 @@ class ControllerDependencies:
     # B8: controller run mode (observe/active) - the planner loops read it too, so
     # no SafeScale probe is started while paused (the queue alone cannot stop that).
     observe_gate: "ObserveModeGate | None" = None
+    # P2-3: SM maintenance lock (tre:v2:sm:maintenance) = SafeScale pause; shared by
+    # the planner loops (no probe start) and the SafeScale loop (rollback), so a
+    # period any of them saw counts against every probe window it overlaps.
+    maintenance_watch: "MaintenanceWatch | None" = None
 
 
 @dataclass(frozen=True)
@@ -104,6 +109,7 @@ def build_controller_task_specs(
                     prof=deps.profiler,
                     model_state_box=deps.model_state_box,
                     is_observe=_observe_reader(deps),
+                    maintenance=deps.maintenance_watch,
                 ),
             )
         )
@@ -123,6 +129,7 @@ def build_controller_task_specs(
                 prof=deps.profiler,
                 model_state_box=deps.model_state_box,
                 is_observe=_observe_reader(deps),
+                maintenance=deps.maintenance_watch,
             ),
         )
     )
@@ -139,6 +146,9 @@ def build_controller_task_specs(
                     signal_state=deps.signal_state,
                     cluster_view_box=deps.cluster_view_box,
                     gateway_source=deps.gateway_health,
+                    # Observe (2026-09-28): open probes are rolled back (unhide).
+                    is_observe=_observe_reader(deps),
+                    maintenance=deps.maintenance_watch,
                 ),
             )
         )
@@ -232,6 +242,8 @@ def create_controller_dependencies(
         queue=ActionQueue(
             sm_client,
             is_observe=observe_gate.is_observe,
+            # Uncached re-check right before every capacity-changing SM call.
+            is_observe_fresh=observe_gate.is_observe_fresh,
             prof=profiler,
             retry=RetryPolicy(
                 max_attempts=int(getattr(cfg, "oneshot_retry_max_attempts", 6)),
@@ -257,8 +269,12 @@ def create_controller_dependencies(
             # B8: a commit held (observe mode) or recovered past this age is
             # turned into the donor unhide instead of acting on stale evidence.
             commit_max_age_ms=cfg.safescale.commit_max_age_ms,
+            # P3: a hide that did not take effect (failed / not sent in observe)
+            # marks its probe for rollback instead of leaving it judged as hidden.
+            on_hide_failed=lambda model, pods, reason: safescale.abort_probe(model, pods=pods, reason=reason),
         ),
         observe_gate=observe_gate,
+        maintenance_watch=MaintenanceWatch(redis_client),
         model_state_box=model_state_box,
         sm_client=sm_client,
         cluster_view_box=cluster_view_box,

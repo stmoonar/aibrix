@@ -10,7 +10,7 @@ import json
 from dataclasses import replace
 from dataclasses import asdict
 from functools import wraps
-from typing import Protocol
+from typing import Callable, Protocol
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -24,14 +24,20 @@ from tre_common.registry import (
     scale_max_replicas,
 )
 from tre_common.registry import NodeSpec
-from tre_common.gpu_placement import choose_placement
+from tre_common.gpu_placement import (
+    PlacementPolicy,
+    choose_placement,
+    placement_policy_from_registry,
+)
 from tre_sm.allocator.slots import (
     Binding,
     Migration,
     Slot,
     SlotAllocator,
     awake_gpus,
+    awake_model_counts,
     is_buddy_aligned,
+    model_awake_gpus,
     node_gpu_counts,
     release_order,
     slot_block,
@@ -52,11 +58,17 @@ from tre_sm.ops.sleep_primitive import (
 )
 from tre_sm.state.sleep_reservations import ReservationConflict, SleepReservations
 from tre_sm.state.reconcile import K8sPodClient, POD_STATE_AWAKE, POD_STATE_HIDDEN, POD_STATE_SLEEPING, audit_state, observe_bindings, reconcile_state
-from tre_sm.state.operations import OperationBusy, OperationCoordinator, current_operation
+from tre_sm.state.operations import (
+    OperationBusy,
+    OperationCoordinator,
+    current_operation,
+    reset_current_actor,
+    set_current_actor,
+)
 from tre_sm.state.fleet_repair import FleetRepairExecutor
 from tre_sm.state.fleet_seed import registry_binding_ids, seed_binding_ids, seed_desired
 from tre_sm.state.fleet_store import DesiredBinding, FleetStateConflict, FleetStateStore, ObservedBinding
-from tre_sm.state.safety import ClusterSafetyGate, ControllerNotPaused, NodePressureActive
+from tre_sm.state.safety import ClusterSafetyGate, MaintenanceLockLost, NodePressureActive
 from tre_sm.state.gpu_leases import GpuLeaseConflict, GpuLeaseStore
 from tre_sm.state.store import StateConflict, StateFenceError, StateStore
 from tre_sm.api.v1_compat import create_v1_compat_router
@@ -180,6 +192,10 @@ class ServiceManagerV2:
         sleep_reservations: SleepReservations | None = None,
     ) -> None:
         self._registry = registry
+        # Registry placement policy shared with the controller planner (design
+        # 20260928-placement-node-balance); None = plain buddy best-fit (registry
+        # stubs without models).
+        self._placement = _registry_placement_policy(registry)
         config = getattr(registry, "service_manager", None)
         self._sm_config: ServiceManagerConfig = (
             config() if callable(config) else ServiceManagerConfig()
@@ -246,8 +262,47 @@ class ServiceManagerV2:
 
     def get_supervisor_state(self) -> dict:
         if self._supervisor is None:
-            return {"running": False, "enabled": False}
-        return {"enabled": True, **asdict(self._supervisor.snapshot())}
+            state = {"running": False, "enabled": False}
+        else:
+            state = {"enabled": True, **asdict(self._supervisor.snapshot())}
+        return {**state, **self._actuation_payload()}
+
+    def _actuation_payload(self) -> dict:
+        """SM actuation switch + maintenance lock, for /v2/supervisor (console)."""
+        gate = self._safety_gate
+        payload: dict = {}
+        reader = getattr(gate, "actuation_state", None)
+        if callable(reader):
+            try:
+                payload["actuation"] = reader()
+            except Exception as exc:  # display only
+                payload["actuation"] = {"error": str(exc)}
+        maintenance = getattr(gate, "maintenance", None)
+        if callable(maintenance):
+            try:
+                payload["maintenance"] = maintenance()
+            except Exception as exc:  # display only
+                payload["maintenance"] = {"error": str(exc)}
+        return payload
+
+    # ------------------------------------------------------ actuation switch
+    def actuation_observe(self) -> bool:
+        """SM actuation observe (``tre:v2:sm:actuation``, user decision
+        2026-09-28): the supervisor takes no capacity-changing action and a
+        startup admission nobody requested sleeps no resident. Without a safety
+        gate (embedded / unit-test wiring) the SM is active."""
+        reader = getattr(self._safety_gate, "actuation_mode", None)
+        if not callable(reader):
+            return False
+        return reader() == "observe"
+
+    def record_suppressed(self, action: str, detail: dict) -> None:
+        record = getattr(self._safety_gate, "record_suppressed", None)
+        if callable(record):
+            record(action, detail)
+        else:
+            LOG.warning(json.dumps({"event": "sm_supervisor_action_suppressed", "action": action,
+                                    "detail": detail}, sort_keys=True, default=str))
 
     def get_state(self) -> dict:
         snapshot = self._store.load()
@@ -473,6 +528,7 @@ class ServiceManagerV2:
                 bindings=bindings,
                 topology=self._registry.topology(),
                 already_released=hidden[:shrink],
+                policy=self._placement,
             )
             candidates = hidden + serving
             sleeping = candidates[:shrink]
@@ -502,7 +558,7 @@ class ServiceManagerV2:
                 raise WakeConflict(
                     f"{sleeping[0].serve_id}: slot already has awake binding"
                 )
-            binding = _wake_pick(feasible, planning.values(), topology)
+            binding = _wake_pick(feasible, planning.values(), topology, self._placement)
             sleeping.remove(binding)
             planning[binding.serve_id] = replace(
                 binding, awake=True, hidden=False
@@ -513,10 +569,10 @@ class ServiceManagerV2:
         creates: list[Binding] = []
         existing_ids = set(planning)
         allocator = SlotAllocator(
-            self._registry.topology(), list(planning.values())
+            self._registry.topology(), list(planning.values()), policy=self._placement
         )
         while len(target) + len(creates) < wake_replicas:
-            slot = allocator.find_slot(tp_size)
+            slot = allocator.find_slot(tp_size, model)
             if slot is None:
                 raise ValueError(f"no free slot for {model} tp_size={tp_size}")
             serve_id = _next_serve_id(model, existing_ids)
@@ -681,16 +737,21 @@ class ServiceManagerV2:
         sleep_path: str,
         kind: str,
         desired_sleeping: bool = False,
+        before_prepare: Callable[[], None] | None = None,
     ) -> list[dict]:
         """Sleep ``bindings`` with the drain OUTSIDE the writer lock (prepare and
         commit take it briefly), e.g. for startup admission / convergence
         (review 2 P2-4). The desired state is not touched unless
-        ``desired_sleeping``."""
+        ``desired_sleeping``. ``before_prepare`` runs under the prepare
+        writer lock right before anything is hidden or slept; raising aborts
+        the sleep with nothing changed."""
         with self._writer(kind):
             for binding in bindings:
                 self._assert_not_reserved(
                     binding=binding, gpus=False, what=f"{kind} sleep of {binding.serve_id}"
                 )
+            if before_prepare is not None:
+                before_prepare()
             targets = self._sleep_targets_for(bindings)
             batch = self._sleep_primitive.prepare(
                 targets,
@@ -969,10 +1030,43 @@ class ServiceManagerV2:
                 f"{physical!r} (not confirmed awake)"
             )
 
+    def defrag_enabled(self) -> bool:
+        """Registry ``placement.defrag.enabled`` (default false, v1 parity)."""
+        placement = getattr(self._registry, "placement", None)
+        if not callable(placement):
+            return False
+        return bool(getattr(placement(), "defrag_enabled", False))
+
+    def defrag(self, *, tp_size: int, force: bool = False) -> dict:
+        """Manual defragmentation (``POST /v2/defrag``).
+
+        While registry ``placement.defrag.enabled`` is false (the default, as in v1)
+        this refuses with :class:`DefragDisabled` (HTTP 409, reason
+        ``defrag_disabled``) before taking the writer lock, unless the caller passes
+        ``force=True`` (an operator's explicit override; logged).  The controller
+        never plans a defrag while it is disabled.
+        """
+        enabled = self.defrag_enabled()
+        if not enabled and not force:
+            LOG.warning(
+                "defrag refused: registry placement.defrag.enabled is false "
+                "(tp_size=%s; pass force=true to override)",
+                tp_size,
+            )
+            raise DefragDisabled()
+        if not enabled:
+            LOG.warning(
+                "defrag forced while registry placement.defrag.enabled is false (tp_size=%s)",
+                tp_size,
+            )
+        return self._defrag_serialized(tp_size=tp_size)
+
     @serialized_operation("defrag")
-    def defrag(self, *, tp_size: int) -> dict:
+    def _defrag_serialized(self, *, tp_size: int) -> dict:
         snapshot = self._store.load()
-        allocator = SlotAllocator(self._registry.topology(), snapshot.bindings)
+        allocator = SlotAllocator(
+            self._registry.topology(), snapshot.bindings, policy=self._placement
+        )
         migrations = allocator.plan_defrag(tp_size)
         if migrations is None:
             raise DefragUnavailable("no_feasible_defrag")
@@ -1428,7 +1522,6 @@ class ServiceManagerV2:
             raise ValueError("fleet repair runtime is not configured")
         if self._safety_gate is None:
             raise ValueError("fleet repair safety gate is not configured")
-        self._safety_gate.assert_controller_observe()
         reservations = self._reservations()
         active = reservations.active() if reservations is not None else {}
         if active:
@@ -1443,7 +1536,7 @@ class ServiceManagerV2:
             else self._desired_awake_binding_ids(snapshot.bindings)
         )
 
-        def run(operation) -> None:
+        def repair(operation) -> None:
             for stale_operation_id in recovered_from or []:
                 operation.supersede(stale_operation_id)
             if self._fleet_store is not None:
@@ -1468,6 +1561,25 @@ class ServiceManagerV2:
                 audit=self.audit,
             )
 
+        def run(operation) -> None:
+            # The SM maintenance lock (not the controller mode) marks the repair
+            # for its whole run; clearing it aborts the repair (2026-09-28).
+            # A repair recovering the stale repairs of a dead SM takes over
+            # their lock (if it has not expired yet); any other live holder
+            # refuses it (MaintenanceLockBusy).
+            self._safety_gate.acquire_maintenance(
+                operation.operation_id, kind="fleet_repair",
+                owner=str(getattr(self._operation_coordinator, "owner", "")),
+                takeover_operation_ids=list(recovered_from or []),
+            )
+            try:
+                repair(operation)
+            finally:
+                try:
+                    self._safety_gate.release_maintenance(operation.operation_id)
+                except Exception:  # a stale lock is taken over by the next repair
+                    LOG.exception("releasing the SM maintenance lock of %s failed", operation.operation_id)
+
         operation_request = {"awake_binding_ids": targets}
         if recovered_from:
             operation_request["recovered_from"] = recovered_from
@@ -1485,7 +1597,9 @@ class ServiceManagerV2:
             response["recovered_from"] = recovered_from
         return response
 
-    def recover_stale_fleet_repairs(self) -> dict | None:
+    def recover_stale_fleet_repairs(self, *, actuate: bool = True) -> dict | None:
+        """Supervisor pass: resume a fleet repair a dead SM left running. With
+        ``actuate=False`` (SM actuation observe) it is only recorded."""
         if self._operation_coordinator is None:
             return None
         if self._operation_coordinator.active_operation() is not None:
@@ -1495,7 +1609,12 @@ class ServiceManagerV2:
         )
         if not stale:
             return None
-        self.enter_recovery_observe()
+        if not actuate:
+            self.record_suppressed(
+                "fleet_repair_recovery",
+                {"stale_operation_ids": [str(record.get("operation_id")) for record in stale]},
+            )
+            return None
         newest = stale[0]
         request = newest.get("request") or {}
         return self.start_fleet_repair(
@@ -1529,7 +1648,7 @@ class ServiceManagerV2:
             and item.binding_id not in deployed
         ]
 
-    def repair_missing_deployments(self, binding_ids) -> dict | None:
+    def repair_missing_deployments(self, binding_ids, *, actuate: bool = True) -> dict | None:
         """Supervisor pass (B7): drift that is ONLY ``deployment_missing`` of
         registry bindings desired resident + sleeping is repaired by creating
         just those Deployments again from the registry - no fleet-wide
@@ -1542,6 +1661,11 @@ class ServiceManagerV2:
             return None
         if not wanted <= {item.binding_id for item in self._missing_registry_deployments(power="sleeping")}:
             return None
+        if not actuate:
+            # SM actuation observe (2026-09-28): recreating a workload is not a
+            # state-consistency action - record what would have been done.
+            self.record_suppressed("recreate_missing_deployments", {"binding_ids": sorted(wanted)})
+            return {"binding_ids": sorted(wanted), "created": [], "suppressed": True}
         created: list[str] = []
         with self._writer("deployment_repair", wait_s=0.0):
             # Again under the lock: another writer may have changed them meanwhile.
@@ -1556,11 +1680,6 @@ class ServiceManagerV2:
                     planned.binding_id,
                 )
         return {"binding_ids": sorted(wanted), "created": created}
-
-    def enter_recovery_observe(self) -> str:
-        if self._safety_gate is None:
-            raise ValueError("fleet repair safety gate is not configured")
-        return self._safety_gate.enter_recovery_observe()
 
     def detect_fleet_drift(self) -> list[dict]:
         if self._runtime_ops is None or self._fleet_store is None:
@@ -1697,6 +1816,7 @@ class ServiceManagerV2:
                 )
         self._assert_startup_slot_free(pod)
         self._assert_startup_owner_live(pod)
+        self._assert_unrequested_startup_allowed(pod)
         slept: list[Binding] = []
         try:
             slept = self._sleep_overlapping_residents(pod)
@@ -1806,7 +1926,7 @@ class ServiceManagerV2:
         except Exception:  # the supervisor's convergence clears it later
             LOG.warning("clearing the startup admission of %s failed", pod_name)
 
-    def reap_rejected_deployments(self) -> list[str]:
+    def reap_rejected_deployments(self, *, actuate: bool = True) -> list[str]:
         """Supervisor pass (review 4 P1): delete model Deployments whose binding
         is desired ``absent`` and that have no Running Pod - e.g. left by a
         failed cold start / defrag whose cleanup did not go through. Their Pods
@@ -1828,6 +1948,13 @@ class ServiceManagerV2:
             and desired[item.binding_id].lifecycle == "absent"
         ]
         if not candidates:
+            return []
+        if not actuate:
+            # SM actuation observe (2026-09-28): deleting workloads only logged.
+            self.record_suppressed(
+                "reap_rejected_deployments",
+                {"deployments": sorted(item.name for item in candidates)},
+            )
             return []
         reaped: list[str] = []
         with self._writer("reap_rejected_deployments", wait_s=0.0):
@@ -2038,13 +2165,39 @@ class ServiceManagerV2:
                 "suspended_binding_ids": suspended,
             }
 
-    def _sleep_overlapping_residents(self, pod: StartupPodRecord) -> list[Binding]:
-        """Split-sleep (drain outside the writer lock) every awake resident on the
-        startup Pod's GPUs; returns the bindings put to sleep. Desired power is
-        untouched: a resident desired awake is recorded as suspended by the
-        admission and woken after convergence."""
-        if self._sleep_primitive is None:
-            return []
+    def _assert_unrequested_startup_allowed(self, pod: StartupPodRecord) -> None:
+        """Startup admission WITHOUT an owning operation (no SM operation or API
+        caller is starting this Pod - k8s restarted it, a Deployment was
+        applied or scaled by hand): with SM actuation observe (2026-09-28) it
+        must not sleep awake residents on the Pod's GPUs - that changes the
+        awake count nobody asked for. Refused (retriable 409; the init gate
+        polls again, so the Pod is admitted once the residents are asleep or
+        the actuation is active again) and recorded. Without an awake
+        overlapping resident the admission sleeps nothing and proceeds. The
+        admission of a Pod an operation creates itself (cold start, defrag
+        migration, fleet repair: phase ``starting_binding``) is pre-authorized
+        and never reaches this check."""
+        if not self.actuation_observe():
+            return
+        self._refuse_unrequested_startup_sleep(pod, self._awake_overlapping_residents(pod))
+
+    def _refuse_unrequested_startup_sleep(self, pod: StartupPodRecord, awake: list[Binding]) -> None:
+        """The observe refusal of :meth:`_assert_unrequested_startup_allowed`
+        for residents about to be slept (retriable 409, recorded)."""
+        if not awake or not self.actuation_observe():
+            return
+        ids = sorted(binding.binding_id for binding in awake)
+        self.record_suppressed(
+            "startup_admission_sleep",
+            {"pod": pod.name, "binding_id": pod.binding_id, "would_sleep": ids},
+        )
+        raise RetryLater(
+            f"startup of {pod.name} would sleep awake resident(s) {ids}: SM actuation is observe "
+            "and no operation requested this Pod; retry the admission"
+        )
+
+    def _awake_overlapping_residents(self, pod: StartupPodRecord) -> list[Binding]:
+        """Ready residents on the startup Pod's GPUs that vLLM reports awake."""
         awake: list[Binding] = []
         target_gpus = set(pod.gpu_ids)
         for snapshot in self._runtime_ops.list_startup_resident_snapshots():
@@ -2057,9 +2210,29 @@ class ServiceManagerV2:
                 continue  # the admission refuses it under the lock
             if self._vllm_ops.is_sleeping(snapshot.pod_ip, port=8000) is False:
                 awake.append(binding)
+        return awake
+
+    def _sleep_overlapping_residents(self, pod: StartupPodRecord) -> list[Binding]:
+        """Split-sleep (drain outside the writer lock) every awake resident on the
+        startup Pod's GPUs; returns the bindings put to sleep. Desired power is
+        untouched: a resident desired awake is recorded as suspended by the
+        admission and woken after convergence."""
+        if self._sleep_primitive is None:
+            return []
+        awake = self._awake_overlapping_residents(pod)
         if not awake:
             return []
-        outcomes = self._split_sleep(awake, sleep_path="startup", kind="startup_admit_sleep")
+        # The observe check is repeated under the prepare writer lock, right
+        # before the residents are hidden: the actuation may have been switched
+        # to observe since the unlocked pre-check in admit_startup (TOCTOU).
+        # Only unrequested admissions get here - an owned (pre-authorized)
+        # admission never sleeps residents through this path.
+        outcomes = self._split_sleep(
+            awake,
+            sleep_path="startup",
+            kind="startup_admit_sleep",
+            before_prepare=lambda: self._refuse_unrequested_startup_sleep(pod, awake),
+        )
         slept_ids = {item.get("binding_id") for item in outcomes if item.get("status") == STATUS_SLEPT}
         return [binding for binding in awake if binding.binding_id in slept_ids]
 
@@ -3312,6 +3485,18 @@ class DefragUnavailable(ValueError):
         self.reason = reason
 
 
+class DefragDisabled(DefragUnavailable):
+    """Registry ``placement.defrag.enabled`` is false and the request did not force."""
+
+    MESSAGE = (
+        "defrag is disabled (registry placement.defrag.enabled: false); "
+        "send force: true to run it anyway"
+    )
+
+    def __init__(self) -> None:
+        super().__init__("defrag_disabled")
+
+
 class WakeConflict(ValueError):
     pass
 
@@ -3339,6 +3524,8 @@ class BindingPowerRequest(BaseModel):
 
 class DefragRequest(BaseModel):
     tp_size: int
+    #: Run even while registry placement.defrag.enabled is false (operator override).
+    force: bool = False
 
 
 
@@ -3378,11 +3565,26 @@ def create_app(service: ServiceManagerV2) -> FastAPI:
     ) -> JSONResponse:
         return JSONResponse(status_code=409, content={"detail": str(exc)})
 
-    @app.exception_handler(ControllerNotPaused)
-    async def controller_not_paused_handler(
-        _request: Request, exc: ControllerNotPaused
+    @app.exception_handler(MaintenanceLockLost)
+    async def maintenance_lock_lost_handler(
+        _request: Request, exc: MaintenanceLockLost
     ) -> JSONResponse:
         return JSONResponse(status_code=409, content={"detail": str(exc)})
+
+    @app.middleware("http")
+    async def record_actor(request: Request, call_next):
+        # Who called a write API (controller, APA arm, console, operator): kept
+        # in the request of every SM operation it starts (2026-09-28). The
+        # X-TRE-Actor header when sent, else User-Agent + remote address.
+        actor = request.headers.get("x-tre-actor")
+        if not actor:
+            client = request.client.host if request.client is not None else "?"
+            actor = f"ua={request.headers.get('user-agent', '?')};addr={client}"
+        token = set_current_actor(actor[:200])
+        try:
+            return await call_next(request)
+        finally:
+            reset_current_actor(token)
 
     @app.exception_handler(NodePressureActive)
     async def node_pressure_handler(
@@ -3516,7 +3718,11 @@ def create_app(service: ServiceManagerV2) -> FastAPI:
     @app.post("/v2/defrag")
     def defrag(request: DefragRequest) -> dict:
         try:
-            return service.defrag(tp_size=request.tp_size)
+            return service.defrag(tp_size=request.tp_size, force=request.force)
+        except DefragDisabled as exc:
+            raise HTTPException(
+                status_code=409, detail={"reason": exc.reason, "message": exc.MESSAGE}
+            ) from exc
         except DefragUnavailable as exc:
             raise HTTPException(status_code=409, detail={"reason": exc.reason}) from exc
         except (KeyError, ValueError) as exc:
@@ -3595,14 +3801,23 @@ def _defrag_destination(binding: Binding, migration: Migration, bindings) -> Bin
     return None
 
 
-def _wake_pick(feasible, planned, topology) -> Binding:
-    """Which sleeping binding to wake: buddy best-fit, same rule as the planner.
+def _registry_placement_policy(registry) -> PlacementPolicy | None:
+    """The registry placement policy; None only for registry stubs without
+    models (embedded / unit-test wiring). An unsupported model tp_size raises
+    (ValueError) instead of silently falling back to plain best-fit."""
+    models = getattr(registry, "models", None)
+    if not callable(models):
+        return None
+    return placement_policy_from_registry(registry)
 
-    Packing beats spreading here: two single-GPU replicas on one aligned pair keep
-    the other pair whole for a tp=2 model, where one replica per node would leave
-    neither node able to host it.
+
+def _wake_pick(feasible, planned, topology, policy: PlacementPolicy | None = None) -> Binding:
+    """Which sleeping binding to wake: the registry placement policy, same rule as
+    the controller planner (tre_common.gpu_placement): keep a free aligned pair for
+    a tp=2 model, then balance node load, spread the model across nodes, best fit.
     """
     nodes = node_gpu_counts(topology)
+    planned = list(planned)
     scorable = [
         binding
         for binding in feasible
@@ -3615,6 +3830,8 @@ def _wake_pick(feasible, planned, topology) -> Binding:
             nodes=nodes,
             occupied=awake_gpus(planned),
             tp_size=len(scorable[0].slot.gpu_ids),
+            policy=policy.for_awake(awake_model_counts(planned)) if policy else None,
+            model_occupied=model_awake_gpus(planned, scorable[0].model),
         )
         if choice is not None:
             return scorable[choice.index]

@@ -165,6 +165,11 @@ DEFAULT_COOLDOWN_S = 45.0
 #: a scale action mid-cell changes the denominator of everything the cell records.
 REQUIRED_CONTROLLER_MODE = "observe"
 CONTROLLER_MODE_KEY = "tre:v2:controller:mode"
+#: Nor may the service-manager supervisor self-heal on its own (recreate / repair /
+#: reap / admit an unrequested pod) while a cell is measured. Independent of the
+#: controller mode (2026-09-28); calibration runs with both switches observe.
+REQUIRED_SM_ACTUATION = "observe"
+SM_ACTUATION_KEY = "tre:v2:sm:actuation"
 
 #: lambda_wait for the primary fit: the D-line's (plan 2026-09-21 §6.11; the lambda check
 #: of ``scripts.dline_refit`` keeps 1 unless another value gains >= 0.02 BA, and it kept 1
@@ -513,18 +518,43 @@ def kv_cache_tokens_by_model(index: dict) -> dict:
 # --------------------------------------------------------------------------- the run
 
 
-def controller_mode(namespace: str = "tre-v2") -> str:
-    """Read-only check that the controller is not acting on the fleet."""
+def _redis_get(key: str, namespace: str) -> str:
     result = subprocess.run(
         ["kubectl", "-n", namespace, "exec", "deploy/tre-v2-redis", "--",
-         "redis-cli", "get", CONTROLLER_MODE_KEY],
+         "redis-cli", "get", key],
         capture_output=True, text=True, check=False,
     )
     if result.returncode != 0:
-        raise SystemExit(
-            f"could not read {CONTROLLER_MODE_KEY}: {result.stderr.strip() or result.stdout.strip()}"
-        )
+        raise SystemExit(f"could not read {key}: {result.stderr.strip() or result.stdout.strip()}")
     return result.stdout.strip()
+
+
+def controller_mode(namespace: str = "tre-v2") -> str:
+    """Read-only check that the controller is not acting on the fleet."""
+    return _redis_get(CONTROLLER_MODE_KEY, namespace)
+
+
+def sm_actuation(namespace: str = "tre-v2") -> str:
+    """Read-only check that the SM supervisor is not self-healing on its own."""
+    return _redis_get(SM_ACTUATION_KEY, namespace)
+
+
+def require_calibration_run_mode(namespace: str = "tre-v2") -> dict[str, str]:
+    """Both switches must be set to observe explicitly (a missing key is observe
+    for its reader, but calibration requires a deliberate setting). Raises
+    SystemExit otherwise; returns the values read."""
+    modes = {"controller_mode": controller_mode(namespace), "sm_actuation": sm_actuation(namespace)}
+    wrong = []
+    if modes["controller_mode"] != REQUIRED_CONTROLLER_MODE:
+        wrong.append(f"controller mode ({CONTROLLER_MODE_KEY}) is {modes['controller_mode']!r}: a scale "
+                     "action mid-cell changes the denominator of everything the cell records")
+    if modes["sm_actuation"] != REQUIRED_SM_ACTUATION:
+        wrong.append(f"SM actuation ({SM_ACTUATION_KEY}) is {modes['sm_actuation']!r}: an SM self-heal "
+                     "mid-cell changes the fleet under measurement")
+    if wrong:
+        raise SystemExit("refusing to run: " + "; ".join(wrong)
+                         + " (need both 'observe': deploy/scripts/set_run_mode.sh observe observe)")
+    return modes
 
 
 def primary_label(args, model: str) -> slo_labels.LabelDefinition:
@@ -1667,9 +1697,7 @@ def run_reprobe(args, targets: Mapping[str, Sequence[str]]) -> int:
         print(f"dry run: wrote {out_root / 'reprobe_plan.json'}")
         return 0
 
-    mode = controller_mode(args.controller_namespace)
-    if mode != REQUIRED_CONTROLLER_MODE:
-        raise SystemExit(f"controller mode is {mode!r}, refusing to run (need {REQUIRED_CONTROLLER_MODE!r})")
+    require_calibration_run_mode(args.controller_namespace)
     index_path = Path(args.index)
     index = json.loads(index_path.read_text(encoding="utf-8")) if index_path.exists() else {}
     cap = admission.get_cap(args.cap or index.get("admission_cap", {}).get("name")
@@ -1999,14 +2027,8 @@ def run_campaign(args) -> int:
         print(f"dry run: wrote {out_dir / 'plan.json'} and {out_dir / 'fit_plan.json'}")
         return 0
 
-    mode = controller_mode(args.controller_namespace)
-    if mode != REQUIRED_CONTROLLER_MODE:
-        raise SystemExit(
-            f"controller mode is {mode!r}, refusing to run: a scale action mid-cell "
-            f"changes the denominator of everything the cell records (need "
-            f"{REQUIRED_CONTROLLER_MODE!r})"
-        )
-    print(f"controller mode: {mode}")
+    modes = require_calibration_run_mode(args.controller_namespace)
+    print(f"controller mode: {modes['controller_mode']}, SM actuation: {modes['sm_actuation']}")
 
     status, code = "failed", 1
     try:

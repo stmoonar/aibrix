@@ -1,6 +1,6 @@
 # Scale anchor for the dsllama-8b APA baseline. See dsqwen-7b-apa-anchor.yaml for rationale.
 # 0-replica Deployment named after the model; publishes the model.aibrix.ai/name selector so
-# APA scrapes gpu_cache_usage_perc across all awake dsllama-8b pods. Apply BEFORE the CR.
+# APA scrapes kv_cache_usage_perc across all awake dsllama-8b pods. Apply BEFORE the CR.
 apiVersion: apps/v1
 kind: Deployment
 metadata:

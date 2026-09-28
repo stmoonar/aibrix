@@ -7,8 +7,12 @@ from typing import Any
 from tre_common.metrics_schema import MetricsSnapshot, ModelWindowMetrics, PodWindowMetrics
 from tre_common.percentile import histogram_percentile
 from tre_common.rediskeys import hist_key, inst_key, pods_key
+from tre_common.vllm_metrics import doc_lookup
 from tre_common.window_pods import aggregate_pods
 
+# Gateway doc identifiers (what the gateway writes today). Every read resolves them through
+# tre_common.vllm_metrics.GATEWAY_DOC_KEYS, so the vLLM 0.30 identifiers
+# (inter_token_latency_seconds, kv_cache_usage_perc) are accepted as well, newest first.
 HISTOGRAM_METRICS = {
     "prompt_tokens": "request_prompt_tokens",
     "generation_tokens": "request_generation_tokens",
@@ -176,7 +180,7 @@ class MetricsStore:
                 ("running", INSTANT_METRICS["running"]),
                 ("swapping", INSTANT_METRICS["swapping"]),
             ):
-                totals[out_key] += _number(metrics.get(f"{model}/{metric}"), 0.0)
+                totals[out_key] += _number(doc_lookup(metrics, model, metric), 0.0)
         return totals
 
     def _read_zset_docs(
@@ -299,6 +303,11 @@ class MetricsStore:
         ttft_p95_s = self._hist_percentile(model, HISTOGRAM_METRICS["ttft"], hist_docs, window_start_ms)
         tpot_p95_s = self._hist_percentile(model, HISTOGRAM_METRICS["tpot"], hist_docs, window_start_ms)
         e2e_p95_s = self._hist_percentile(model, HISTOGRAM_METRICS["e2e"], hist_docs, window_start_ms)
+        # Ungated window histogram: the model e2e p95 merges the pods' histograms
+        # first and gates the merged count (tre_common.window_pods.aggregate_pods).
+        e2e_hist, e2e_hist_count = self._hist_window_buckets(
+            model, HISTOGRAM_METRICS["e2e"], hist_docs, window_start_ms
+        )
 
         return PodWindowMetrics(
             pod=pod_name,
@@ -330,6 +339,8 @@ class MetricsStore:
             ttft_count=self._hist_count_delta(model, HISTOGRAM_METRICS["ttft"], hist_docs, window_start_ms),
             tpot_avg_ms=_seconds_to_ms(tpot_avg_s),
             tpot_count=self._hist_count_delta(model, HISTOGRAM_METRICS["tpot"], hist_docs, window_start_ms),
+            e2e_hist=e2e_hist,
+            e2e_hist_count=e2e_hist_count,
         )
 
     def _aggregate_model(
@@ -343,7 +354,12 @@ class MetricsStore:
         # restriction to the awake pods. NOTE: per_pod / routable_pods here count every
         # pod with a doc in the window, sleeping ones included (the gateway writes docs
         # for them too); the decision path replaces them with the fleet state's view.
-        return aggregate_pods(model, window_start_ms, window_end_ms, per_pod)
+        # The e2e p95 is formed from the pods' merged histograms and gated on the
+        # merged count (not per pod: at low load each pod alone is below the gate).
+        return aggregate_pods(
+            model, window_start_ms, window_end_ms, per_pod,
+            p95_rule=(self._percentile_mode, int(self._min_latency_samples)),
+        )
 
     def _hist_sum_delta(self, model: str, metric: str, docs: list[dict[str, Any]], window_start_ms: int) -> float | None:
         if not _has_window_hist_doc(docs, window_start_ms):
@@ -407,6 +423,25 @@ class MetricsStore:
         delta = _bucket_delta(first_buckets, last_buckets)
         return histogram_percentile(delta.items(), 0.95, mode=self._percentile_mode)
 
+    def _hist_window_buckets(
+        self, model: str, metric: str, docs: list[dict[str, Any]], window_start_ms: int
+    ) -> tuple[tuple[tuple[float, float], ...] | None, float | None]:
+        """The window's cumulative bucket delta ``((upper_s, count), ...)`` and its
+        observation count, without the minimum-samples gate; (None, None) when the
+        window has no such histogram."""
+        if not _has_window_metric(model, metric, docs, window_start_ms):
+            return None, None
+        first, last = _first_last_metric(model, metric, docs)
+        if first is None or last is None:
+            return None, None
+        first_buckets = _normal_buckets(first.get("buckets"))
+        last_buckets = _normal_buckets(last.get("buckets"))
+        if not first_buckets or not last_buckets:
+            return None, None
+        count = max(0.0, _number(last.get("count"), 0.0) - _number(first.get("count"), 0.0))
+        delta = _bucket_delta(first_buckets, last_buckets)
+        return tuple(sorted(delta.items())), count
+
     def _instant_avg(
         self,
         model: str,
@@ -415,12 +450,11 @@ class MetricsStore:
         window_start_ms: int,
         window_end_ms: int,
     ) -> float:
-        metric_key = f"{model}/{metric}"
         total = 0.0
         for doc in docs:
             metrics = doc.get("model_metrics")
             if isinstance(metrics, dict):
-                total += _number(metrics.get(metric_key), 0.0)
+                total += _number(doc_lookup(metrics, model, metric), 0.0)
         expected_samples = max(1, int((window_end_ms - window_start_ms) / self._instant_sample_interval_ms))
         return total / expected_samples
 
@@ -438,11 +472,14 @@ class MetricsStore:
         expected-samples divisor the calibration contract fixes) the divisor is the real
         sample count, so a pod that woke mid-window is not read low. window_start_ms /
         window_end_ms are unused and kept for the call-site symmetry."""
-        metric_key = f"{model}/{metric}"
         values = [
-            _number(doc["model_metrics"].get(metric_key), 0.0)
-            for doc in docs
-            if isinstance(doc.get("model_metrics"), dict) and metric_key in doc["model_metrics"]
+            _number(value, 0.0)
+            for value in (
+                doc_lookup(doc["model_metrics"], model, metric)
+                for doc in docs
+                if isinstance(doc.get("model_metrics"), dict)
+            )
+            if value is not None
         ]
         if not values:
             return None
@@ -508,7 +545,7 @@ def _metric_entry(model: str, metric: str, doc: dict[str, Any]) -> dict[str, Any
     metrics = doc.get("model_histogram_metrics")
     if not isinstance(metrics, dict):
         return None
-    entry = metrics.get(f"{model}/{metric}")
+    entry = doc_lookup(metrics, model, metric)
     return entry if isinstance(entry, dict) else None
 
 

@@ -21,8 +21,9 @@ class PodWindowMetrics:
     #: the phase-aligned sampler's freshness check (a window must hold every
     #: SCRAPE_INTERVAL_MS tick, the newest one at window_end). Excluded from equality.
     instant_ticks_ms: tuple[int, ...] = field(default=(), compare=False)
-    #: Window average of vLLM ``gpu_cache_usage_perc`` (KV-cache fill, 0..1) from the
-    #: gateway instant docs; None when no doc carries it. Read only by the SafeScale
+    #: Window average of vLLM ``kv_cache_usage_perc`` (``gpu_cache_usage_perc`` before
+    #: vLLM 0.11; KV-cache fill, 0..1) from the gateway instant docs; None when no doc
+    #: carries it. Read only by the SafeScale
     #: KV-cache guard (v1 avg_gpu_cache_norm); excluded from equality so the existing
     #: window/golden comparisons are unaffected.
     gpu_cache_usage: float | None = field(default=None, compare=False)
@@ -33,6 +34,18 @@ class PodWindowMetrics:
     ttft_count: float | None = field(default=None, compare=False)
     tpot_avg_ms: float | None = field(default=None, compare=False)
     tpot_count: float | None = field(default=None, compare=False)
+    #: The window's e2e-latency histogram delta, UNGATED: cumulative buckets
+    #: ``((upper_s, count), ...)`` ascending, and its observation count. The model
+    #: e2e p95 is computed from the pods' histograms merged BEFORE the
+    #: minimum-samples gate (``tre_common.window_pods``), so a model whose pods each
+    #: see a few requests at low load still gets a p95. None = no histogram.
+    e2e_hist: tuple[tuple[float, float], ...] | None = field(default=None, compare=False)
+    e2e_hist_count: float | None = field(default=None, compare=False)
+
+
+#: How a model-level p95 is formed from the pods' merged histograms:
+#: (percentile mode, minimum observations; 0 = no gate). See ``aggregate_pods``.
+P95Rule = tuple[str, int]
 
 
 @dataclass(frozen=True)
@@ -56,6 +69,10 @@ class ModelWindowMetrics:
     token_counter_reset: bool = False
     #: Union of the per-pod ``instant_ticks_ms`` (see :class:`PodWindowMetrics`).
     instant_ticks_ms: tuple[int, ...] = field(default=(), compare=False)
+    #: The rule the model e2e p95 was formed with (merged pod histograms, gated at
+    #: the model level); carried so a re-aggregation (``restrict_to_serving``)
+    #: applies the same one. None = max of the per-pod p95s (no histograms).
+    p95_rule: P95Rule | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True)

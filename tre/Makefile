@@ -6,14 +6,14 @@ TRE_PYTHONPATH := $(CURDIR)/common:$(CURDIR)/deploy:$(CURDIR)/controller:$(CURDI
 check:
 	PYTHONPATH=$(TRE_PYTHONPATH) $(PYTHON) -m pytest -q common/tests deploy/tests controller/tests service-manager/tests calibration/tests replayer/tests loadgen_v1/tests reissue/tests ui/tests
 
-# Real-Redis Lua tests (sleep reservations, fair writer lock) against a throwaway
+# Real-Redis Lua tests (sleep reservations, fair writer lock, maintenance lock) against a throwaway
 # Redis container that is removed afterwards. `make check` stays hermetic: it runs
 # the same tests against Python models of the scripts. Needs docker; override
 # REDIS_TEST_IMAGE / REDIS_TEST_PORT / REDIS_TEST_CONTAINER if needed.
 REDIS_TEST_IMAGE ?= redis:7.2-alpine
 REDIS_TEST_PORT ?= 16399
 REDIS_TEST_CONTAINER ?= tre-check-redis
-REDIS_TESTS := service-manager/tests/test_sleep_reservations.py service-manager/tests/test_operations.py
+REDIS_TESTS := service-manager/tests/test_sleep_reservations.py service-manager/tests/test_operations.py service-manager/tests/test_maintenance_lock.py
 
 check-redis:
 	@docker rm -f $(REDIS_TEST_CONTAINER) >/dev/null 2>&1 || true

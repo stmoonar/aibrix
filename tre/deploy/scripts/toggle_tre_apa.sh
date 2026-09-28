@@ -9,7 +9,14 @@
 #            then TRE on -> set ENABLE_TRE_SCALING=true and restart the controller.
 #   apa    : TRE off  -> set ENABLE_TRE_SCALING=false, wait for the rollout, verify it is off,
 #            then APA on -> apply the APA PodAutoscaler CRs.
-#   status : print the active source (checks the controller env AND the live PA CRs).
+#   status : print the active source (checks the controller env AND the live PA CRs)
+#            and the run mode.
+#
+# Run mode (2026-09-28, set_run_mode.sh): the controller mode and the SM actuation are
+# independent switches, and BOTH arms run the SM actuation active (symmetric self-heal):
+#   tre -> controller active  + SM active   (set once TRE is the only decision source)
+#   apa -> controller observe + SM active   (set FIRST, before TRE scaling is switched off)
+# --keep-run-mode leaves both keys alone (campaign_queue.py sets them itself per arm).
 #
 # Both the TRE controller (tre-v2 ns) and the patched aibrix podautoscaler controller
 # (aibrix-system) route scaling through service-manager, so leaving both live would let them
@@ -25,7 +32,20 @@ APA_CRS=(dsqwen-7b-apa.yaml dsllama-8b-apa.yaml dsqwen-14b-apa.yaml)
 # to read the pod selector for KVCache scraping, so APA errors FailedGetScale without them.
 APA_ANCHORS=(dsqwen-7b-apa-anchor.yaml dsllama-8b-apa-anchor.yaml dsqwen-14b-apa-anchor.yaml)
 
+SET_RUN_MODE="${SET_RUN_MODE:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/set_run_mode.sh}"
+KEEP_RUN_MODE=0
+
 log() { echo "[toggle] $*"; }
+
+# set_run_mode <controller_mode> <sm_actuation>, unless --keep-run-mode.
+set_run_mode() {
+  if [[ "$KEEP_RUN_MODE" -eq 1 ]]; then
+    log "run mode left unchanged (--keep-run-mode)"
+    return
+  fi
+  log "run mode: controller=$1 sm_actuation=$2"
+  bash "$SET_RUN_MODE" "$1" "$2"
+}
 die() { echo "[toggle][ERROR] $*" >&2; exit 1; }
 
 tre_scaling_enabled() {
@@ -81,11 +101,15 @@ cmd_tre() {
   set_tre_scaling true
   kubectl -n "$TRE_NS" rollout restart "deploy/$CONTROLLER_DEPLOY"
   kubectl -n "$TRE_NS" rollout status "deploy/$CONTROLLER_DEPLOY" --timeout=120s
+  set_run_mode active active
   log "done: TRE is the active decision source"
 }
 
 cmd_apa() {
   log "switching to APA (KVCache baseline)"
+  # Controller observe first: the TRE controller stops acting before anything else
+  # changes. SM actuation active, as in the TRE arm.
+  set_run_mode observe active
   log "1/3 stopping TRE: ENABLE_TRE_SCALING=false"
   set_tre_scaling false
   if tre_scaling_enabled; then die "TRE scaling still enabled after set env; refusing to apply APA (would double-drive scaling)"; fi
@@ -111,14 +135,20 @@ cmd_status() {
   else
     echo "active decision source: CONFLICT (both TRE and APA are live -- run 'tre' or 'apa' to fix)"
   fi
+  bash "$SET_RUN_MODE" status || true
 }
 
 main() {
+  if [[ "${2:-}" == "--keep-run-mode" ]]; then
+    KEEP_RUN_MODE=1
+  elif [[ -n "${2:-}" ]]; then
+    echo "usage: $0 {tre|apa|status} [--keep-run-mode]" >&2; exit 2
+  fi
   case "${1:-}" in
     tre) cmd_tre ;;
     apa) cmd_apa ;;
     status) cmd_status ;;
-    *) echo "usage: $0 {tre|apa|status}" >&2; exit 2 ;;
+    *) echo "usage: $0 {tre|apa|status} [--keep-run-mode]" >&2; exit 2 ;;
   esac
 }
 

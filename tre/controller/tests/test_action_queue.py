@@ -155,41 +155,26 @@ def test_action_queue_observe_mode_drains_without_dispatching() -> None:
     assert client.calls == [("scale", "m", 1)]
 
 
-def test_action_queue_holds_safescale_action_through_observe_then_dispatches() -> None:
-    # Regression: a safescale probe resolution (one-shot, never re-emitted) must not be
-    # discarded if drain_once runs while the controller is paused in observe mode.
+def test_action_queue_runs_a_safescale_unhide_in_observe() -> None:
+    # Observe = record only (2026-09-28), with ONE exception: a SafeScale unhide
+    # (one-shot, never re-emitted) is the controller undoing its own hide - it is
+    # neither dropped nor held but runs, so no probe pod stays hidden.
     client = FakeServiceManagerClient()
-    observe = {"on": True}
-    queue = ActionQueue(client, is_observe=lambda: observe["on"])
+    queue = ActionQueue(client, is_observe=lambda: True)
     submitted = queue.submit((UnhideAction("dsllama-8b", ("pod-a",), "slo_violation", "safescale"),))
     assert submitted == SubmitResult(accepted=1, held=1)
 
-    # Observe mode: the safescale action is held, not dispatched and not lost.
     results = asyncio.run(queue.drain_once())
-    assert results == ()
-    assert client.calls == []
-    assert queue.inflight_models() == {"dsllama-8b"}
-    assert [item.action for item in queue.pending_actions()] == [
-        UnhideAction("dsllama-8b", ("pod-a",), "slo_violation", "safescale")
-    ]
 
-    # Draining again while still in observe keeps holding it (no drop, no loss).
-    assert asyncio.run(queue.drain_once()) == ()
-    assert client.calls == []
-    assert len(queue.pending_actions()) == 1
-
-    # Once mode returns to active, the held safescale action dispatches for real.
-    observe["on"] = False
-    results = asyncio.run(queue.drain_once())
     assert results == (DispatchResult(model="dsllama-8b", action_kind="unhide", ok=True),)
     assert client.calls == [("routable", "dsllama-8b", ())]
     assert queue.pending_actions() == ()
     assert queue.inflight_models() == set()
 
 
-def test_action_queue_observe_mode_still_drops_non_safescale_actions() -> None:
-    # Non-safescale (recurring/idempotent) actions are still skipped+dropped in observe
-    # mode, while a safescale action queued alongside them survives the same drain.
+def test_action_queue_observe_mode_drops_everything_but_the_safescale_unhide() -> None:
+    # Re-plannable actions (and a one-shot that is not an unhide / commit) are
+    # skipped + dropped in observe mode; the SafeScale unhide queued alongside runs.
     client = FakeServiceManagerClient()
     queue = ActionQueue(client, is_observe=lambda: True)
     queue.submit(
@@ -197,22 +182,21 @@ def test_action_queue_observe_mode_still_drops_non_safescale_actions() -> None:
             ScaleAction("m", 1, "critical", "rescue"),
             HideAction("d", ("pod-a",), "probe", "fairness"),
             UnhideAction("safe", ("pod-z",), "slo_violation", "safescale"),
+            ScaleAction("legacy", -1, "commit", "safescale"),
         )
     )
 
     results = asyncio.run(queue.drain_once())
 
-    assert client.calls == []
-    assert [(r.action_kind, r.error) for r in results] == [
-        ("scale", "observe_skipped"),
-        ("hide", "observe_skipped"),
+    assert client.calls == [("routable", "safe", ())]
+    assert sorted((r.model, r.action_kind, r.error) for r in results) == [
+        ("d", "hide", "observe_skipped"),
+        ("legacy", "scale", "observe_skipped"),
+        ("m", "scale", "observe_skipped"),
+        ("safe", "unhide", None),
     ]
-    # rescue/fairness dropped from pending and released from inflight...
-    assert queue.inflight_models() == {"safe"}
-    # ...but the safescale action is held for a later (non-observe) tick.
-    assert [item.action for item in queue.pending_actions()] == [
-        UnhideAction("safe", ("pod-z",), "slo_violation", "safescale")
-    ]
+    assert queue.inflight_models() == set()
+    assert queue.pending_actions() == ()
 
 
 def test_action_queue_rejects_conflicted_safescale_batch_atomically() -> None:

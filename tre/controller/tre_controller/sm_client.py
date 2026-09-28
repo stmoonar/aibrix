@@ -232,7 +232,9 @@ def _sleep_fields(sleep_path: str | None, drain_budget_s: float | None) -> dict:
 
 def _request_json(method: str, url: str, payload: dict | None, timeout_s: float) -> dict[str, Any]:
     body = None
-    headers = {"Accept": "application/json"}
+    # Caller identity for the SM operation log (2026-09-28): the SM HTTP write
+    # API is shared by the TRE controller, the APA arm and operators.
+    headers = {"Accept": "application/json", "X-TRE-Actor": "tre-controller"}
     if payload is not None:
         body = json.dumps(payload).encode("utf-8")
         headers["Content-Type"] = "application/json"

@@ -1,7 +1,8 @@
 # APA (KVCache) baseline for experiment 3
 
 The control arm of experiment 3 (TRE vs APA). APA is AIBrix's built-in Pod Autoscaling
-Algorithm driving on the vLLM pod metric `gpu_cache_usage_perc`. These manifests wire APA to
+Algorithm driving on the vLLM pod metric `kv_cache_usage_perc` (named `gpu_cache_usage_perc`
+before vLLM 0.11; the 0.30 fork exports only the new name). These manifests wire APA to
 the tre-v2 models through the same service-manager seam TRE uses, so the two arms move the
 exact same pods and the comparison is apples-to-apples.
 
@@ -40,7 +41,7 @@ selector for metric scraping (`getScaleResource` → `GetPodSelectorFromScale`,
 `workload_scale.go:497`). tre-v2 model pods are per-GPU Deployments
 (`dsqwen-7b-<node>-gpu-N`) with no aggregate Deployment, so each anchor is a **0-replica**
 Deployment named after the model whose `spec.selector` is `model.aibrix.ai/name: <model>`.
-That selector matches all awake pods of the model, so APA averages `gpu_cache_usage_perc`
+That selector matches all awake pods of the model, so APA averages `kv_cache_usage_perc`
 across them. Sleep mode never writes the anchor's replicas; real scaling goes to
 service-manager. Apply the anchor **before** the PodAutoscaler.
 
@@ -85,7 +86,9 @@ new one.
    label with real model pods. Real pods have their own controller owner refs, so the anchor
    cannot adopt them and (replicas 0) never deletes them, but confirm no selector-overlap
    surprises and that the anchor does not schedule a pause pod onto a GPU node.
-3. **Metric availability**: confirm `gpu_cache_usage_perc` is exposed on `:8000/metrics` for
-   the tre-v2 vLLM image and that `targetValue: 0.5` gives sane replica counts; tune if not.
+3. **Metric availability**: confirm `kv_cache_usage_perc` is exposed on `:8000/metrics` for
+   the tre-v2 vLLM image (vLLM 0.10.1 and the 0.30 fork both export it; 0.30 no longer
+   exports `gpu_cache_usage_perc`, and the AIBrix APA fetcher returns 0 for a missing
+   metric, i.e. never scales - `tre/docs/design/20260928-vllm-030-metric-names.md`) and that `targetValue: 0.5` gives sane replica counts; tune if not.
 4. The PA controller must be watching namespace `default` (where the models and these CRs
    live).

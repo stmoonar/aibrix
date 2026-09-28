@@ -220,13 +220,18 @@ def test_a_successful_commit_resolves_its_probe_as_commit():
     asyncio.run(scenario())
 
 
-def test_an_action_held_in_observe_mode_is_not_resolved():
+def test_a_commit_in_observe_mode_becomes_its_donor_unhide_and_is_resolved():
+    # 2026-09-28 (observe = record only): the commit is not held for later - it
+    # runs as the unhide of its donor pods and resolves the probe as a rollback.
     async def scenario():
         done = []
-        queue = ActionQueue(ScriptedSM(), is_observe=lambda: True, on_oneshot_done=lambda *args: done.append(args))
+        sm = ScriptedSM()
+        queue = ActionQueue(sm, is_observe=lambda: True, on_oneshot_done=lambda *args: done.append(args))
         queue.submit((_commit(),))
         await queue.drain_once()
-        assert done == [] and queue.has_request("7b-0")
+        assert _calls(sm) == [("7b", "routable", ())]
+        assert done == [("7b-0", "rollback", "observe_entered")]
+        assert not queue.has_request("7b-0")
 
     asyncio.run(scenario())
 

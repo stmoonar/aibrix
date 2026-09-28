@@ -99,6 +99,48 @@ class NodeSpec:
 #: CUDA context on the GPU).
 DEFAULT_MAX_BOUND_PER_GPU = 3
 
+#: Widest tensor-parallel size the binding layout can place: a model binds single
+#: GPUs (tp 1) or a node's declared ``two_gpu_slots`` (tp 2) - see
+#: ``tre_common.bindings.feasible_slots`` and the SM ``SlotAllocator``. The buddy
+#: placement (``tre_common.gpu_placement``) handles any power of two; widening this
+#: needs a wider slot declaration in the topology first.
+MAX_SUPPORTED_TP_SIZE = 2
+
+
+def tp_size_error(
+    tp_size: object,
+    *,
+    widest_node_gpus: int | None = None,
+    max_tp_size: int | None = MAX_SUPPORTED_TP_SIZE,
+) -> str | None:
+    """Why ``tp_size`` is not a valid model tp_size, or None. The single rule the
+    registry (load + validate), the SM allocator, the manifest generator and the
+    placement policy of the controller and the SM all apply: an int, a power of
+    two >= 1, not wider than the widest node (tensor parallelism cannot span
+    nodes) and at most :data:`MAX_SUPPORTED_TP_SIZE` (``max_tp_size=None``: the
+    generic buddy rule only, for the placement library that ranks wider blocks
+    too)."""
+    if isinstance(tp_size, bool) or not isinstance(tp_size, int):
+        return f"tp_size must be an int, got {tp_size!r}"
+    if tp_size < 1 or tp_size & (tp_size - 1):
+        return f"tp_size {tp_size} must be a power of two >= 1"
+    if widest_node_gpus is not None and tp_size > widest_node_gpus:
+        return (
+            f"tp_size {tp_size} exceeds the widest node ({widest_node_gpus} gpus); "
+            "tensor parallelism cannot span nodes"
+        )
+    if max_tp_size is not None and tp_size > max_tp_size:
+        return (
+            f"tp_size {tp_size} is not supported by the binding layout (max "
+            f"{max_tp_size}: single GPUs or cluster.nodes[].two_gpu_slots)"
+        )
+    return None
+
+
+def _widest_node_gpus(nodes) -> int | None:
+    widths = [int(node.gpus) for node in nodes]
+    return max(widths) if widths else None
+
 
 @dataclass(frozen=True)
 class ClusterTopology:
@@ -325,6 +367,23 @@ class ReissueConfig:
 
 
 @dataclass(frozen=True)
+class PlacementConfig:
+    """Registry ``placement:`` section (design note
+    tre/docs/design/20260928-placement-node-balance.md). The placement policy itself
+    (``tre_common.gpu_placement.placement_policy_from_registry``) is derived from
+    these keys plus the models' ``tp_size``."""
+
+    #: Keep this many fully free aligned blocks of the widest model's size (TP2 pairs
+    #: today) when placing narrower replicas. Soft: it ranks placements, never blocks
+    #: one; a no-op when every model is tp_size 1.
+    reserve_tp_pairs: int = 1
+    #: Automatic defragmentation (controller ``critical_tp_defrag``). Off by default,
+    #: as in v1. The manual service-manager ``POST /v2/defrag`` also refuses while it
+    #: is off unless the request carries ``force: true``.
+    defrag_enabled: bool = False
+
+
+@dataclass(frozen=True)
 class GatewayConfig:
     """Registry ``gateway:`` section."""
 
@@ -548,8 +607,10 @@ class Registry:
         gateway: GatewayConfig | None = None,
         reissue: ReissueConfig | None = None,
         vllm: VllmConfig | None = None,
+        placement: PlacementConfig | None = None,
     ) -> None:
         self._topology = topology
+        self._placement = placement or PlacementConfig()
         self._models = tuple(models)
         self._service_manager = service_manager or ServiceManagerConfig()
         self._gateway = gateway or GatewayConfig()
@@ -570,6 +631,9 @@ class Registry:
 
     def vllm(self) -> VllmConfig:
         return self._vllm
+
+    def placement(self) -> PlacementConfig:
+        return self._placement
 
     def vllm_env_for(self, model: ModelSpec) -> dict[str, str]:
         """The vLLM container environment of ``model``'s pods (besides the per-binding
@@ -601,8 +665,11 @@ class Registry:
             if model.name in seen_models:
                 errors.append(f"duplicate model: {model.name}")
             seen_models.add(model.name)
-            if model.tp_size not in (1, 2):
-                errors.append(f"model {model.name}: unsupported tp_size {model.tp_size}")
+            problem = tp_size_error(
+                model.tp_size, widest_node_gpus=_widest_node_gpus(self._topology.nodes)
+            )
+            if problem:
+                errors.append(f"model {model.name}: unsupported {problem}")
             if model.min_replicas < 0:
                 errors.append(f"model {model.name}: min_replicas must be non-negative")
             if model.max_replicas < model.min_replicas:
@@ -667,6 +734,8 @@ class Registry:
         if self._topology.max_bound_per_gpu < 1:
             errors.append("cluster.max_bound_per_gpu must be >= 1")
         errors.extend(_validate_reissue(self._reissue))
+        if self._placement.reserve_tp_pairs < 0:
+            errors.append("placement.reserve_tp_pairs must be >= 0")
         errors.extend(_validate_vllm_env("vllm.env", self._vllm.env))
         errors.extend(_validate_service_manager(self._service_manager, self._gateway))
         return errors
@@ -719,6 +788,17 @@ def _parse_registry(raw: dict[str, Any]) -> Registry:
     cluster = raw.get("cluster") or {}
     nodes = tuple(_parse_node(item) for item in cluster.get("nodes", []))
     models = [_parse_model(item) for item in raw.get("models", [])]
+    # Refused at load (not only by validate()): the SM, the controller and the
+    # UI all load through here, so none of them runs with a tp_size another
+    # component would reject or silently place differently.
+    widest = _widest_node_gpus(nodes)
+    tp_errors = [
+        f"model {model.name}: unsupported {problem}"
+        for model in models
+        if (problem := tp_size_error(model.tp_size, widest_node_gpus=widest))
+    ]
+    if tp_errors:
+        raise ValueError("invalid registry: " + "; ".join(tp_errors))
     max_bound = cluster.get("max_bound_per_gpu")
     return Registry(
         ClusterTopology(
@@ -734,6 +814,7 @@ def _parse_registry(raw: dict[str, Any]) -> Registry:
         gateway=parse_gateway_config(raw.get("gateway")),
         reissue=parse_reissue_config(raw.get("reissue")),
         vllm=parse_vllm_config(raw.get("vllm")),
+        placement=parse_placement_config(raw.get("placement")),
     )
 
 
@@ -762,6 +843,39 @@ def parse_vllm_config(raw: Any) -> VllmConfig:
     if unknown:
         raise ValueError(f"vllm: unknown keys {unknown} (known: {', '.join(sorted(known))})")
     return VllmConfig(env=_parse_env(raw.get("env"), "vllm.env"))
+
+
+def parse_placement_config(raw: Any) -> PlacementConfig:
+    """Parse the optional ``placement:`` registry section (absent = defaults:
+    reserve_tp_pairs 1, defrag disabled)."""
+    if raw is None:
+        return PlacementConfig()
+    if not isinstance(raw, dict):
+        raise ValueError("placement must be a mapping")
+    known = {"reserve_tp_pairs", "defrag"}
+    unknown = sorted(set(raw) - known)
+    if unknown:
+        raise ValueError(f"placement: unknown keys {unknown} (known: {', '.join(sorted(known))})")
+    defaults = PlacementConfig()
+    defrag = raw.get("defrag")
+    if defrag is None:
+        defrag = {}
+    if not isinstance(defrag, dict):
+        raise ValueError("placement.defrag must be a mapping")
+    unknown = sorted(set(defrag) - {"enabled"})
+    if unknown:
+        raise ValueError(f"placement.defrag: unknown keys {unknown} (known: enabled)")
+    reserve = raw.get("reserve_tp_pairs")
+    if isinstance(reserve, bool):
+        raise ValueError("placement.reserve_tp_pairs must be an integer")
+    return PlacementConfig(
+        reserve_tp_pairs=defaults.reserve_tp_pairs if reserve is None else int(reserve),
+        defrag_enabled=(
+            defaults.defrag_enabled
+            if defrag.get("enabled") is None
+            else _parse_bool(defrag["enabled"])
+        ),
+    )
 
 
 def parse_reissue_config(raw: Any) -> ReissueConfig:
@@ -1050,6 +1164,20 @@ def _parse_node(raw: dict[str, Any]) -> NodeSpec:
 LOG = logging.getLogger(__name__)
 
 
+def _parse_tp_size(value: Any, name: Any) -> int:
+    """An integral tp_size (1.5 or "two" is an error, never truncated)."""
+    if isinstance(value, bool):
+        raise ValueError(f"model {name}: tp_size must be an int, got {value!r}")
+    if isinstance(value, float):
+        if not value.is_integer():
+            raise ValueError(f"model {name}: tp_size must be an int, got {value!r}")
+        return int(value)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"model {name}: tp_size must be an int, got {value!r}") from None
+
+
 def _parse_model(raw: dict[str, Any]) -> ModelSpec:
     slo = raw.get("slo") or {}
     trs = raw.get("trs") or {}
@@ -1062,7 +1190,7 @@ def _parse_model(raw: dict[str, Any]) -> ModelSpec:
     return ModelSpec(
         name=str(raw["name"]),
         weights_path=str(raw["weights_path"]),
-        tp_size=int(raw["tp_size"]),
+        tp_size=_parse_tp_size(raw["tp_size"], raw.get("name")),
         min_replicas=int(raw["min_replicas"]),
         max_replicas=int(raw["max_replicas"]),
         max_awake_replicas=(

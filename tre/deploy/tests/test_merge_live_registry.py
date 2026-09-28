@@ -18,7 +18,7 @@ def _release() -> dict:
 def test_live_tunables_win_and_release_structure_stays():
     release = _release()
     live = copy.deepcopy(release)
-    for section in ("vllm", "gateway", "reissue", "service_manager"):
+    for section in ("vllm", "gateway", "reissue", "service_manager", "placement"):
         live.pop(section, None)
     model = live["models"][0]
     model["vllm_image"] = "old:image"
@@ -33,7 +33,7 @@ def test_live_tunables_win_and_release_structure_stays():
     assert out["alt_thresholds"]["queue_len"]["theta"] == 7.0
     assert out["slo"]["tpot_p95_ms"] == 60.0
     assert out["max_awake_replicas"] == 3
-    assert {"vllm", "gateway", "reissue", "service_manager"} <= set(merged)
+    assert {"vllm", "gateway", "reissue", "service_manager", "placement"} <= set(merged)
     # B9: a live registry without service_manager.create gets the release section.
     assert merged["service_manager"]["create"] == release["service_manager"]["create"]
     assert any("trs.theta_m" in line for line in report)

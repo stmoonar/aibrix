@@ -99,7 +99,7 @@ def test_defrag_commits_desired_per_migration_and_a_later_failure_keeps_the_firs
     service._run_defrag_migration = second_fails
 
     with pytest.raises(RuntimeError, match="create failed"):
-        service.defrag(tp_size=2)
+        service.defrag(tp_size=2, force=True)
 
     desired = {d.binding_id: (d.lifecycle, d.power) for d in fleet.load_desired().bindings}
     # the first migration completed: its desired state stays

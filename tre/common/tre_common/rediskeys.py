@@ -33,7 +33,24 @@ SM_DESIRED_VERSION_KEY = "tre:v2:sm:desired_version"
 SM_OBSERVED_KEY = "tre:v2:sm:observed"
 SM_OBSERVED_VERSION_KEY = "tre:v2:sm:observed_version"
 SM_GPU_LEASES_KEY = "tre:v2:sm:gpu_leases"
+#: Controller run mode, "active" | "observe" (observe = compute and record only).
+#: Absent, not a mode, or unreadable before the first successful read = observe
+#: (fail-closed). Independent of SM_ACTUATION_KEY (tre_common.run_mode).
 CONTROLLER_MODE_KEY = "tre:v2:controller:mode"
+#: Service-manager actuation switch, "active" | "observe": whether the SM
+#: SUPERVISOR may change capacity or recreate / delete workloads on its own. The
+#: SM HTTP write API is NOT gated by it (the APA arm and operators drive the SM
+#: directly). Independent of CONTROLLER_MODE_KEY: absent or not a mode =
+#: observe (fail-closed; never derived from the controller mode).
+SM_ACTUATION_KEY = "tre:v2:sm:actuation"
+#: SM maintenance lock (JSON {"operation_id", "kind", "owner", "since_ms"}) held
+#: by a running fleet repair for its whole run; deleting it aborts the repair at
+#: its next safety check. Replaces borrowing CONTROLLER_MODE_KEY as that lock.
+SM_MAINTENANCE_KEY = "tre:v2:sm:maintenance"
+#: LIST (newest first, capped) of supervisor actions the SM did NOT take because
+#: its actuation is observe: JSON {"ts_ms", "action", "detail"}.
+SM_SUPPRESSED_ACTIONS_KEY = "tre:v2:sm:actuation:suppressed"
+SM_SUPPRESSED_ACTIONS_MAX = 200
 CONTROLLER_SAFESCALE_PROBES_KEY = "tre:v2:controller:safescale:probes"
 CONTROLLER_ORPHAN_WATCH_KEY = "tre:v2:controller:orphan_watch"
 CONTROLLER_HIDDEN_ORPHAN_ALERTS_KEY = "tre:v2:controller:alerts:hidden_orphans"

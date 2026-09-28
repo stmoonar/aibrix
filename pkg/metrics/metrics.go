@@ -642,7 +642,9 @@ var (
 			MetricType: MetricType{
 				Query: PromQL,
 			},
-			PromQL:      `histogram_quantile(0.95, sum by(le) (rate(vllm:time_per_output_token_seconds_bucket{instance="${instance}", job="pods"}[5m])))`,
+			// TRE-PATCH(P2-GW-006): vLLM 0.11+ renamed the TPOT histogram to
+			// inter_token_latency_seconds; prefer it, fall back to the old name.
+			PromQL:      `histogram_quantile(0.95, sum by(le) (rate(vllm:inter_token_latency_seconds_bucket{instance="${instance}", job="pods"}[5m]) or rate(vllm:time_per_output_token_seconds_bucket{instance="${instance}", job="pods"}[5m])))`,
 			Description: "95th tpot in last 5 mins",
 		},
 		AvgTPOT5mPod: {
@@ -651,7 +653,9 @@ var (
 			MetricType: MetricType{
 				Query: PromQL,
 			},
-			PromQL:      `increase(vllm:time_per_output_token_seconds_sum{instance="${instance}", job="pods"}[5m]) / increase(vllm:time_per_output_token_seconds_sum{instance="${instance}", job="pods"}[5m])`,
+			// TRE-PATCH(P2-GW-006): renamed histogram as above; the divisor is _count (it read
+			// _sum / _sum, i.e. always 1).
+			PromQL:      `(increase(vllm:inter_token_latency_seconds_sum{instance="${instance}", job="pods"}[5m]) or increase(vllm:time_per_output_token_seconds_sum{instance="${instance}", job="pods"}[5m])) / (increase(vllm:inter_token_latency_seconds_count{instance="${instance}", job="pods"}[5m]) or increase(vllm:time_per_output_token_seconds_count{instance="${instance}", job="pods"}[5m]))`,
 			Description: "Average tpot in last 5 mins",
 		},
 		AvgPromptToksPerReq: {

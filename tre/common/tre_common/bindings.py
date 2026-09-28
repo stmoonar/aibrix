@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from tre_common.registry import DEFAULT_MAX_BOUND_PER_GPU, ModelSpec, Registry
+from tre_common.registry import DEFAULT_MAX_BOUND_PER_GPU, ModelSpec, Registry, tp_size_error
 
 #: Default per-GPU binding budget; the live value is the registry's
 #: ``cluster.max_bound_per_gpu`` (``registry.topology().max_bound_per_gpu``).
@@ -37,8 +37,14 @@ def feasible_slots(registry: Registry, model: ModelSpec) -> list[tuple[str, tupl
     scaling cap: that is ``models[].max_awake_replicas``, enforced by the
     controller planner and the service-manager, never here.
     """
+    nodes = registry.topology().nodes
+    problem = tp_size_error(
+        model.tp_size, widest_node_gpus=max((node.gpus for node in nodes), default=None)
+    )
+    if problem:  # never an empty slot list for a model the layout cannot bind
+        raise ValueError(f"model {model.name}: unsupported {problem}")
     slots: list[tuple[str, tuple[int, ...]]] = []
-    for node in registry.topology().nodes:
+    for node in nodes:
         if model.tp_size == 1:
             slots.extend((node.name, (gpu,)) for gpu in range(node.gpus))
         elif model.tp_size == 2:

@@ -454,3 +454,10 @@ table.params td:last-child { font-family: var(--mono); text-align: right; }
 }
 .kv .k { color: var(--muted); }
 .kv .v { font-family: var(--mono); font-size: .78rem; text-align: right; word-break: break-all; }
+
+/* Run-mode key warnings + planner alerts (capacity_blocked / defrag_disabled). */
+.alert-strip { padding: 8px 28px; border-bottom: 1px solid var(--line); background: var(--bg); display: grid; gap: 4px; }
+.alert-strip[hidden] { display: none; }
+.alert-strip .alert { font-size: 13px; padding: 5px 10px; border-radius: 6px; border-left: 4px solid var(--low); background: var(--low-bg); color: var(--ink); }
+.alert-strip .alert.bad { border-left-color: var(--crit); background: var(--crit-bg); }
+.mode-label { min-width: 120px; display: inline-block; }

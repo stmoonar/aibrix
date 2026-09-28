@@ -16,14 +16,17 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from tre_common.registry import Registry
+from tre_common.run_mode import RUN_MODES, run_mode_view, write_run_mode
 from tre_ui import params as params_mod
 from tre_ui.sampler import Sampler
 
 _AUDIT = logging.getLogger("tre_ui.audit")
 _STATIC = Path(__file__).parent / "static"
-_CONTROLLER_MODE_KEY = "tre:v2:controller:mode"
 _REGISTRY_CM = "tre-v2-registry"
 _CONTROLLER_DEPLOY = "tre-v2-controller"
+#: Restart-to-apply restarts the service-manager too: it reads the registry
+#: (placement, service_manager, gateway, models) only at start.
+_SM_DEPLOY = "tre-v2-service-manager"
 _HASH_ANNOTATION = "tre.dev/params-hash"
 _PARAMS_AUDIT_KEY = "tre:v2:audit:params"
 _PARAMS_APPLIED_KEY = "tre:v2:ui:params-applied-hash"
@@ -59,10 +62,19 @@ class _RoutableBody(BaseModel):
 
 class _DefragBody(BaseModel):
     tp_size: int = 2
+    #: Forwarded to the service-manager: run even while registry
+    #: placement.defrag.enabled is false (otherwise it refuses with 409).
+    force: bool = False
 
 
 class _ModeBody(BaseModel):
     mode: str  # "active" | "observe"
+
+
+class _RunModeBody(BaseModel):
+    """Convenience "set both": either may be omitted (= left unchanged)."""
+    controller: str | None = None
+    sm_actuation: str | None = None
 
 
 class _ParamsBody(BaseModel):
@@ -185,25 +197,56 @@ def create_ui_app(
         audit_cache["result"] = result
         return dict(audit_cache)
 
+    # ---- run mode: controller mode and SM actuation are INDEPENDENT switches ----
+    # (user decision 2026-09-28; tre/docs/design/20260928-observe-mode-semantics.md)
+
+    def _run_mode() -> dict[str, Any]:
+        """``mode`` / ``controller`` = what the controller acts on, ``sm_actuation``
+        = what the SM supervisor acts on (each: absent / unreadable = observe,
+        fail-closed; the SM never derives its switch from the controller mode);
+        ``raw`` = the stored values (None = absent); ``warnings`` names every
+        missing key."""
+        return run_mode_view(redis_client)
+
+    def _write_run_mode(controller: str | None, sm_actuation: str | None) -> dict[str, Any]:
+        for name, value in (("controller mode", controller), ("sm_actuation", sm_actuation)):
+            if value is not None and value not in RUN_MODES:
+                raise HTTPException(status_code=400, detail=f"{name} must be active or observe")
+        if controller is None and sm_actuation is None:
+            raise HTTPException(status_code=400, detail="set controller and/or sm_actuation")
+        _AUDIT.info(json.dumps({"op": "run_mode", "controller": controller, "sm_actuation": sm_actuation}))
+        try:
+            written = write_run_mode(redis_client, controller_mode=controller, sm_actuation=sm_actuation)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=502, detail=f"redis set failed: {exc}") from exc
+        return {"ok": True, "written": written, **_run_mode()}
+
     @app.get("/api/ops/controller/mode")
     def get_mode() -> dict[str, Any]:
-        try:
-            raw = redis_client.get(_CONTROLLER_MODE_KEY)
-        except Exception:  # noqa: BLE001
-            raw = None
-        mode = (raw.decode() if isinstance(raw, bytes) else raw) or "active"
-        return {"mode": mode}
+        return _run_mode()
 
     @app.post("/api/ops/controller/mode")
     def set_mode(body: _ModeBody) -> dict[str, Any]:
-        if body.mode not in ("active", "observe"):
-            raise HTTPException(status_code=400, detail="mode must be active or observe")
-        _AUDIT.info(json.dumps({"op": "controller_mode", "mode": body.mode}))
-        try:
-            redis_client.set(_CONTROLLER_MODE_KEY, body.mode)
-        except Exception as exc:  # noqa: BLE001
-            raise HTTPException(status_code=502, detail=f"redis set failed: {exc}") from exc
-        return {"ok": True, "mode": body.mode}
+        """Sets ONLY the controller mode (the SM actuation switch is unchanged)."""
+        return _write_run_mode(body.mode, None)
+
+    @app.get("/api/ops/sm/actuation")
+    def get_sm_actuation() -> dict[str, Any]:
+        return _run_mode()
+
+    @app.post("/api/ops/sm/actuation")
+    def set_sm_actuation(body: _ModeBody) -> dict[str, Any]:
+        """Sets ONLY the SM actuation switch (the controller mode is unchanged)."""
+        return _write_run_mode(None, body.mode)
+
+    @app.get("/api/ops/run-mode")
+    def get_run_mode() -> dict[str, Any]:
+        return _run_mode()
+
+    @app.post("/api/ops/run-mode")
+    def set_run_mode(body: _RunModeBody) -> dict[str, Any]:
+        """Convenience: set both switches (one MULTI) or either one."""
+        return _write_run_mode(body.controller, body.sm_actuation)
 
     # ---- params: edit per-model registry via ConfigMap, restart-to-apply ----
 
@@ -265,32 +308,52 @@ def create_ui_app(
 
     @app.post("/api/ops/controller/restart")
     def restart_controller(body: _RestartBody) -> dict[str, Any]:
+        """Restart-to-apply: rolls the controller AND the service-manager. Both
+        read the registry only at start (the SM: placement, service_manager,
+        gateway and the models), so a registry change is applied only once
+        both restarted."""
         client = _require_k8s()
         try:
             cm = client.get_configmap(_REGISTRY_CM)
-            registry_yaml = (cm.get("data") or {}).get("registry.yaml", "")
-            now = datetime.now(timezone.utc).isoformat()
-            patch = {"spec": {"template": {"metadata": {"annotations": {
-                "kubectl.kubernetes.io/restartedAt": now,
-                "tre.dev/restarted-by": "tre-v2-ui",
-                "tre.dev/restart-reason": body.reason[:200],
-                _HASH_ANNOTATION: _hash(registry_yaml),
-            }}}}}
-            _AUDIT.info(json.dumps({"op": "controller_restart", "reason": body.reason}))
-            deploy = client.patch_deployment(_CONTROLLER_DEPLOY, patch)
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(status_code=502, detail=f"restart failed: {exc}") from exc
+        registry_yaml = (cm.get("data") or {}).get("registry.yaml", "")
+        now = datetime.now(timezone.utc).isoformat()
+        patch = {"spec": {"template": {"metadata": {"annotations": {
+            "kubectl.kubernetes.io/restartedAt": now,
+            "tre.dev/restarted-by": "tre-v2-ui",
+            "tre.dev/restart-reason": body.reason[:200],
+            _HASH_ANNOTATION: _hash(registry_yaml),
+        }}}}}
+        _AUDIT.info(json.dumps({"op": "controller_restart", "reason": body.reason,
+                                "deployments": [_CONTROLLER_DEPLOY, _SM_DEPLOY]}))
+        generations: dict[str, Any] = {}
+        for name in (_CONTROLLER_DEPLOY, _SM_DEPLOY):
+            try:
+                deploy = client.patch_deployment(name, patch)
+            except Exception as exc:  # noqa: BLE001
+                done = ", ".join(generations) or "none"
+                raise HTTPException(
+                    status_code=502, detail=f"restart of {name} failed (already restarted: {done}): {exc}"
+                ) from exc
+            generations[name] = (deploy.get("metadata") or {}).get("generation")
         _set_applied_hash(redis_client, _hash(registry_yaml))
-        return {"ok": True, "generation": (deploy.get("metadata") or {}).get("generation"), "restarted_at": now}
+        return {"ok": True, "generation": generations[_CONTROLLER_DEPLOY], "generations": generations,
+                "restarted": list(generations), "restarted_at": now}
 
     @app.get("/api/ops/controller/rollout")
     def controller_rollout() -> dict[str, Any]:
+        """Rollout of the restart-to-apply: top-level fields are the controller's
+        (compatible), ``state`` is the combined state of both Deployments."""
         client = _require_k8s()
         try:
-            deploy = client.get_deployment(_CONTROLLER_DEPLOY)
+            controller = _rollout_state(client.get_deployment(_CONTROLLER_DEPLOY))
+            service_manager = _rollout_state(client.get_deployment(_SM_DEPLOY))
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(status_code=502, detail=f"kubernetes read failed: {exc}") from exc
-        return _rollout_state(deploy)
+        states = {controller["state"], service_manager["state"]}
+        combined = "failed" if "failed" in states else ("ready" if states == {"ready"} else "progressing")
+        return {**controller, "state": combined, "controller": controller, "service_manager": service_manager}
 
     # ---- observe (legacy per-request reads; superseded by /api/stream, kept for compatibility) ----
 
@@ -364,8 +427,10 @@ def create_ui_app(
 
     @app.post("/api/ops/defrag")
     def op_defrag(body: _DefragBody) -> dict[str, Any]:
-        _AUDIT.info(json.dumps({"op": "defrag", "tp_size": body.tp_size}))
-        return _proxy(service_manager_client, "POST", "/v2/defrag", {"tp_size": body.tp_size})
+        _AUDIT.info(json.dumps({"op": "defrag", "tp_size": body.tp_size, "force": body.force}))
+        return _proxy(
+            service_manager_client, "POST", "/v2/defrag", {"tp_size": body.tp_size, "force": body.force}
+        )
 
     return app
 

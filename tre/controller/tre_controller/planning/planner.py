@@ -4,13 +4,20 @@ import math
 from dataclasses import dataclass, field
 from typing import Any, Literal, Mapping
 
-from tre_common.registry import ClusterTopology
+from tre_common.registry import ClusterTopology, tp_size_error
 from tre_controller.planning.classify import ModelClassification, ModelRole, ModelState, donor_mock_cost_key
-from tre_common.gpu_placement import plan_placements
+from tre_common.gpu_placement import (
+    PlacementPolicy,
+    choose_placement,
+    choose_release,
+    plan_placements,
+)
 from tre_sm.allocator.slots import (
     Binding,
     Slot,
     SlotAllocator,
+    awake_gpus,
+    awake_model_counts,
     gpu_slot_candidates,
     is_buddy_aligned,
     natural_key,
@@ -48,12 +55,29 @@ class PlanConfig:
     # TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE=1 re-enables the guard.
     suppress_hot_proactive_probe: bool = False
     disable_eta_gate: bool = False
+    # Registry placement.defrag.enabled: gates the critical_tp_defrag migration plan.
+    # Off by default, as in v1 (design 20260928-placement-node-balance).
+    defrag_enabled: bool = False
+
+    def __post_init__(self) -> None:
+        # No silent fallback for a bad tp_size (the registry rejects it at load; this
+        # is the controller's own guard). The same single rule as the registry, the
+        # SM and the placement policy: tre_common.registry.tp_size_error (power of
+        # two >= 1, at most MAX_SUPPORTED_TP_SIZE; the widest-node bound is checked
+        # where the topology is known - registry load / placement policy).
+        for model, tp_size in self.model_tp_sizes.items():
+            problem = tp_size_error(tp_size)
+            if problem:
+                raise ValueError(f"PlanConfig.model_tp_sizes[{model!r}]: {problem}")
 
 
 @dataclass(frozen=True)
 class ClusterView:
     topology: ClusterTopology
     bindings: tuple[Binding, ...]
+    #: Registry placement policy (``placement_policy_from_registry``), attached by the
+    #: planner tick; None = plain buddy best-fit (tests without a registry).
+    placement: PlacementPolicy | None = None
 
 
 @dataclass(frozen=True)
@@ -339,11 +363,13 @@ def build_plan(
     middle_zone.sort(key=lambda item: (0 if item.state == ModelState.HEALTHY else 1, -(item.Z_m or 0.0)))
 
     if cfg.rescue_due:
-        for recv in critical_receivers:
+
+        def critical_need(recv: ModelClassification) -> tuple[int, int] | None:
+            """(replicas needed, of which wakeable from sleeping bindings), None = skip."""
             if recv.model_name in inflight_models and recv.model_name not in preemptible_models:
-                continue
+                return None
             if cooldown.blocks(recv.model_name, "up", critical=True):
-                continue
+                return None
             recv_pods = _effective_routable_replicas(recv.model_name, model_contexts, model_replicas)
             recv_assigned = _effective_assigned_replicas(recv.model_name, model_contexts, model_replicas)
             recv_max = _max_replicas(cfg, recv.model_name)
@@ -351,15 +377,32 @@ def build_plan(
             # draining included; the SM counts the same), not on the routable count.
             recv_awake = _awake_replicas(recv.model_name, model_contexts, model_replicas)
             if recv_awake >= recv_max:
-                continue
+                return None
             raw_need = min(_scale_step(recv_pods, cfg.scale_step_ratio), recv_max - recv_awake)
             if raw_need <= 0:
-                continue
+                return None
+            return raw_need, min(raw_need, max(0, recv_assigned - recv_pods))
 
-            gain_from_sleeping, wake_pods = _plan_sleeping_wakes(
+        critical_needs = {recv.model_name: critical_need(recv) for recv in critical_receivers}
+        # Every CRITICAL receiver's sleeping-binding wakes are assigned jointly up
+        # front, so an earlier receiver never takes the one free slot a later one
+        # can wake into while it had another (multi-receiver slot stealing).
+        reserved_wakes = _plan_joint_wakes(
+            occupancy,
+            [(model, need[1]) for model, need in critical_needs.items() if need is not None],
+            events=events,
+        )
+        for recv in critical_receivers:
+            need = critical_needs[recv.model_name]
+            if need is None:
+                continue
+            raw_need, wake_need = need
+
+            gain_from_sleeping, wake_pods = _take_reserved_wakes(
                 occupancy,
+                reserved_wakes,
                 receiver=recv.model_name,
-                need=min(raw_need, max(0, recv_assigned - recv_pods)),
+                need=wake_need,
                 events=events,
                 blocked_event="critical_sleeping_blocked",
             )
@@ -378,7 +421,7 @@ def build_plan(
                 if raw_need <= 0:
                     continue
 
-            tp_size = cfg.model_tp_sizes.get(recv.model_name, 1)
+            tp_size = _tp_size(cfg, recv.model_name)
             if tp_size > 1 and cluster_view is not None:
                 same_slot_shrink = _try_plan_same_slot_high_shrink(
                     classifications=classifications,
@@ -413,6 +456,7 @@ def build_plan(
                     events=events,
                     source_loop="rescue",
                     occupancy=occupancy,
+                    defrag_enabled=cfg.defrag_enabled,
                 )
                 if tp_planned:
                     _add_scale_action(
@@ -620,11 +664,12 @@ def build_plan(
         events.append("fairness_skipped_by_cadence")
         return PlanResult(actions, delayed_down_models, probe_upscale_plans, events=events)
 
-    for recv in low_receivers:
+    def low_need(recv: ModelClassification) -> tuple[int, int] | None:
+        """(replicas needed, of which wakeable from sleeping bindings), None = skip."""
         if recv.model_name in inflight_models:
-            continue
+            return None
         if cooldown.blocks(recv.model_name, "up"):
-            continue
+            return None
         recv_pods = _effective_routable_replicas(recv.model_name, model_contexts, model_replicas)
         recv_assigned = _effective_assigned_replicas(recv.model_name, model_contexts, model_replicas)
         receiver_capacity = (
@@ -633,13 +678,29 @@ def build_plan(
             - max(0, deltas.get(recv.model_name, 0))
         )
         if receiver_capacity <= 0:
-            continue
+            return None
         needed = min(_scale_step(recv_pods, cfg.scale_step_ratio), receiver_capacity)
+        return needed, min(needed, max(0, recv_assigned - recv_pods))
 
-        sleeping_gain, wake_pods = _plan_sleeping_wakes(
+    # A LOW receiver is never a donor, so its need does not change while earlier
+    # receivers are planned: computed (and its wakes assigned jointly) up front.
+    low_needs = {recv.model_name: low_need(recv) for recv in low_receivers}
+    reserved_low_wakes = _plan_joint_wakes(
+        occupancy,
+        [(model, need[1]) for model, need in low_needs.items() if need is not None],
+        events=events,
+    )
+    for recv in low_receivers:
+        need = low_needs[recv.model_name]
+        if need is None:
+            continue
+        needed, wake_need = need
+
+        sleeping_gain, wake_pods = _take_reserved_wakes(
             occupancy,
+            reserved_low_wakes,
             receiver=recv.model_name,
-            need=min(needed, max(0, recv_assigned - recv_pods)),
+            need=wake_need,
             events=events,
             blocked_event="low_fairness_sleeping_blocked",
         )
@@ -662,7 +723,7 @@ def build_plan(
             idle_gain = _plan_create_capacity(
                 occupancy,
                 receiver=recv.model_name,
-                tp_size=cfg.model_tp_sizes.get(recv.model_name, 1),
+                tp_size=_tp_size(cfg, recv.model_name),
                 need=needed,
                 events=events,
                 blocked_event="low_fairness_idle_unusable",
@@ -851,6 +912,7 @@ class _SlotOccupancy:
     def __init__(self, cluster_view: ClusterView) -> None:
         self._topology = cluster_view.topology
         self._nodes = node_gpu_counts(cluster_view.topology)
+        self._policy = cluster_view.placement
         self._planned_wakes: set[str] = set()
         self._bindings = tuple(cluster_view.bindings)
         self._awake: dict[tuple[str, int], Binding] = {}
@@ -859,6 +921,24 @@ class _SlotOccupancy:
                 for gpu in binding.slot.gpu_ids:
                     self._awake[(binding.slot.node, gpu)] = binding
         self._claimed: set[tuple[str, int]] = set()
+        # Per model: GPUs claimed by this tick's planned wakes / creates, and how many.
+        self._model_claimed: dict[str, set[tuple[str, int]]] = {}
+        self._planned_counts: dict[str, int] = {}
+
+    def policy(self) -> PlacementPolicy | None:
+        """The placement policy with the reserve bounded by the awake counts this
+        tick's plan leads to (bindings awake now + planned wakes / creates)."""
+        if self._policy is None:
+            return None
+        counts = awake_model_counts(self._bindings)
+        for model, planned in self._planned_counts.items():
+            counts[model] = counts.get(model, 0) + planned
+        return self._policy.for_awake(counts)
+
+    def model_gpus(self, model: str) -> set[tuple[str, int]]:
+        """GPUs ``model`` holds awake or has claimed this tick."""
+        held = {gpu for gpu, binding in self._awake.items() if binding.model == model}
+        return held | self._model_claimed.get(model, set())
 
     @staticmethod
     def _gpus(binding: Binding) -> set[tuple[str, int]]:
@@ -883,11 +963,11 @@ class _SlotOccupancy:
         return self.plan_wakes(model, len(self.sleeping(model)))
 
     def plan_wakes(self, model: str, need: int) -> list[Binding]:
-        """Up to ``need`` sleeping bindings to wake, in buddy best-fit order.
+        """Up to ``need`` sleeping bindings to wake, in placement-policy order.
 
-        Each pick is scored against the GPUs the earlier picks take, so waking
-        three single-GPU replicas fills one pair before it breaks the next one --
-        a first-fit order would strand a tp=2 model with no aligned pair left.
+        Each pick is scored against the GPUs the earlier picks take (buddy fit,
+        pair reservation, node balance; tre_common.gpu_placement), so waking three
+        single-GPU replicas fills a half-used pair before it breaks a free one.
         """
         need = max(0, need)
         sleeping = [
@@ -916,26 +996,47 @@ class _SlotOccupancy:
                 occupied=self.occupied(),
                 tp_size=len(scorable[0].slot.gpu_ids),
                 count=need,
+                policy=self.policy(),
+                model_occupied=self.model_gpus(model),
             )
             ranked = [scorable[pick.index] for pick in picks]
         # Slots the buddy model cannot score keep the old natural order, at the tail.
         rest = [binding for binding in sleeping if binding.serve_id not in scorable_ids]
         return (ranked + rest)[:need]
 
+    def save(self) -> tuple:
+        """The claims made so far (for a trial plan, see :meth:`restore`)."""
+        return (
+            set(self._claimed),
+            set(self._planned_wakes),
+            {model: set(gpus) for model, gpus in self._model_claimed.items()},
+            dict(self._planned_counts),
+        )
+
+    def restore(self, state: tuple) -> None:
+        claimed, planned_wakes, model_claimed, planned_counts = state
+        self._claimed = set(claimed)
+        self._planned_wakes = set(planned_wakes)
+        self._model_claimed = {model: set(gpus) for model, gpus in model_claimed.items()}
+        self._planned_counts = dict(planned_counts)
+
     def claim(self, binding: Binding) -> None:
-        self._claimed |= self._gpus(binding)
+        gpus = self._gpus(binding)
+        self._claimed |= gpus
         self._planned_wakes.add(binding.serve_id)
+        self._model_claimed.setdefault(binding.model, set()).update(gpus)
+        self._planned_counts[binding.model] = self._planned_counts.get(binding.model, 0) + 1
 
     def has_unplanned_sleeping(self, model: str) -> bool:
         # The SM model-level wake tries every sleeping binding of the model before it
         # creates a new one, and raises WakeConflict on the first infeasible one.
         return any(binding.serve_id not in self._planned_wakes for binding in self.sleeping(model))
 
-    def free_groups(self, tp_size: int) -> list[set[tuple[str, int]]]:
-        """Free ``tp_size``-GPU slots, least wasteful first (buddy best-fit).
+    def free_groups(self, tp_size: int, model: str | None = None) -> list[set[tuple[str, int]]]:
+        """Free ``tp_size``-GPU slots for ``model``, best first (placement policy).
 
         Ordered like :meth:`plan_wakes`, and sequentially: taking a prefix of the
-        result is the same packing a one-at-a-time loop would produce.
+        result is the same placement a one-at-a-time loop would produce.
         """
         candidates = gpu_slot_candidates(self._topology, tp_size)
         if not candidates:
@@ -946,17 +1047,25 @@ class _SlotOccupancy:
             occupied=self.occupied(),
             tp_size=tp_size,
             count=len(candidates),
+            policy=self.policy(),
+            model_occupied=self.model_gpus(model) if model else (),
         )
         return [set(pick.block.keys) for pick in picks]
 
-    def claim_gpus(self, gpus: set[tuple[str, int]]) -> None:
+    def claim_gpus(self, gpus: set[tuple[str, int]], model: str | None = None) -> None:
         self._claimed |= gpus
+        if model is not None:
+            self._model_claimed.setdefault(model, set()).update(gpus)
+            self._planned_counts[model] = self._planned_counts.get(model, 0) + 1
 
     def donor_slot_pods(self, donor: str, receiver: str) -> list[tuple[str, Binding]]:
         """(donor serve_id, receiver sleeping binding) pairs: sleeping that single awake
-        donor binding frees exactly a slot the receiver can wake into."""
-        pairs: list[tuple[str, Binding]] = []
-        used: set[str] = set()
+        donor binding frees exactly a slot the receiver can wake into.
+
+        Ranked by the placement policy (the receiver slot is scored as if its donor
+        had already slept), greedily, one receiver slot per donor binding; slots the
+        buddy model cannot score keep the natural order at the tail."""
+        matches: list[tuple[Binding, Binding]] = []
         for receiver_binding in self.sleeping(receiver):
             gpus = self._gpus(receiver_binding)
             if any(gpu in self._claimed for gpu in gpus):
@@ -965,11 +1074,39 @@ class _SlotOccupancy:
             if len(occupants) != 1:
                 continue
             occupant = next(iter(occupants))
-            if occupant.model != donor or occupant.hidden or occupant.serve_id in used:
+            if occupant.model != donor or occupant.hidden:
                 continue
+            matches.append((receiver_binding, occupant))
+        policy = self.policy()
+        occupied = self.occupied()
+        receiver_gpus = self.model_gpus(receiver)
+        pairs: list[tuple[str, Binding]] = []
+        used: set[str] = set()
+        while True:
+            best: tuple[tuple, int] | None = None
+            for index, (receiver_binding, occupant) in enumerate(matches):
+                if occupant.serve_id in used or any(
+                    binding.serve_id == receiver_binding.serve_id for _, binding in pairs
+                ):
+                    continue
+                choice = None
+                if is_buddy_aligned(receiver_binding.slot, self._nodes):
+                    choice = choose_placement(
+                        [slot_block(receiver_binding.slot)],
+                        nodes=self._nodes,
+                        occupied=occupied - self._gpus(occupant),
+                        policy=policy,
+                        model_occupied=receiver_gpus,
+                    )
+                key = ((0, choice.score) if choice is not None else (1, ()), index)
+                if best is None or key < best[0]:
+                    best = (key, index)
+            if best is None:
+                return pairs
+            receiver_binding, occupant = matches[best[1]]
             used.add(occupant.serve_id)
+            receiver_gpus = receiver_gpus | self._gpus(receiver_binding)
             pairs.append((occupant.serve_id, receiver_binding))
-        return pairs
 
 
 def _plan_sleeping_wakes(
@@ -996,6 +1133,119 @@ def _plan_sleeping_wakes(
     return len(wakeable), tuple(binding.serve_id for binding in wakeable)
 
 
+def _take_reserved_wakes(
+    occupancy: _SlotOccupancy | None,
+    reserved: Mapping[str, list[Binding]],
+    *,
+    receiver: str,
+    need: int,
+    events: list[str],
+    blocked_event: str,
+) -> tuple[int, tuple[str, ...]]:
+    """:func:`_plan_sleeping_wakes` for wakes already assigned (and claimed) by
+    :func:`_plan_joint_wakes`. Without a cluster view: the legacy count."""
+    need = max(0, need)
+    if occupancy is None or need <= 0:
+        return need, ()
+    wakes = list(reserved.get(receiver, ()))[:need]
+    if len(wakes) < need:
+        events.append(f"{blocked_event}:{receiver}")
+    return len(wakes), tuple(binding.serve_id for binding in wakes)
+
+
+def _plan_joint_wakes(
+    occupancy: _SlotOccupancy | None,
+    requests: list[tuple[str, int]],
+    *,
+    events: list[str],
+) -> dict[str, list[Binding]]:
+    """Assign the sleeping-binding wakes of several receivers jointly and claim them.
+
+    ``requests`` = (receiver, wakes wanted) in priority order. Under multi-model
+    residency two receivers can have sleeping bindings on the same free GPU; the
+    per-receiver greedy lets the first one take a slot the second needs although
+    the first had another. The greedy plan (placement-optimal, unchanged whenever
+    it satisfies everyone) is kept unless a maximum matching wakes strictly more
+    replicas; then the matching is used (event ``joint_wake_assignment``).
+    Deterministic: receivers most constrained first (fewest free candidate slots
+    minus need, then priority), candidates in placement order."""
+    if occupancy is None:
+        return {}
+    requests = [(model, int(need)) for model, need in requests if need > 0]
+    if not requests:
+        return {}
+    before = occupancy.save()
+    greedy: dict[str, list[Binding]] = {}
+    for model, need in requests:
+        picks = occupancy.plan_wakes(model, need)
+        for binding in picks:
+            occupancy.claim(binding)
+        greedy[model] = picks
+    if len(requests) == 1 or all(len(greedy[model]) >= need for model, need in requests):
+        return greedy
+    after_greedy = occupancy.save()
+    occupancy.restore(before)
+    joint = _match_wakes(occupancy, requests)
+    if sum(map(len, joint.values())) <= sum(map(len, greedy.values())):
+        occupancy.restore(after_greedy)
+        return greedy
+    for model, _ in requests:
+        for binding in joint.get(model, ()):
+            occupancy.claim(binding)
+    events.append(
+        "joint_wake_assignment:"
+        + ",".join(f"{model}={len(joint.get(model, ()))}" for model, _ in requests)
+    )
+    return joint
+
+
+def _match_wakes(
+    occupancy: _SlotOccupancy, requests: list[tuple[str, int]]
+) -> dict[str, list[Binding]]:
+    """Maximum matching (augmenting paths) of receiver wake units to free slots."""
+    ranked = {model: occupancy.plan_wakes(model, len(occupancy.sleeping(model))) for model, _ in requests}
+    order = sorted(
+        range(len(requests)),
+        key=lambda index: (len(ranked[requests[index][0]]) - requests[index][1], index),
+    )
+    units = [requests[index][0] for index in order for _ in range(requests[index][1])]
+    holder: dict[frozenset, int] = {}
+    pick: dict[int, Binding] = {}
+
+    def slot_key(binding: Binding) -> frozenset:
+        return frozenset((binding.slot.node, gpu) for gpu in binding.slot.gpu_ids)
+
+    def augment(unit: int, seen: set) -> bool:
+        for binding in ranked[units[unit]]:
+            key = slot_key(binding)
+            if key in seen:
+                continue
+            seen.add(key)
+            current = holder.get(key)
+            if current is None or augment(current, seen):
+                holder[key] = unit
+                pick[unit] = binding
+                return True
+        return False
+
+    for unit in range(len(units)):
+        augment(unit, set())
+    # Slots that overlap without being equal (mixed tp) are not modelled by the
+    # matching: keep the first of any overlapping pair, in unit order.
+    used: set = set()
+    chosen: dict[str, list[Binding]] = {}
+    for unit in range(len(units)):
+        binding = pick.get(unit)
+        if binding is None or slot_key(binding) & used:
+            continue
+        used |= slot_key(binding)
+        chosen.setdefault(units[unit], []).append(binding)
+    for model, bindings in chosen.items():
+        rank = {binding.serve_id: index for index, binding in enumerate(ranked[model])}
+        bindings.sort(key=lambda binding: rank[binding.serve_id])
+    return chosen
+
+
 def _plan_create_capacity(
     occupancy: _SlotOccupancy,
     *,
@@ -1011,7 +1261,7 @@ def _plan_create_capacity(
     sleeping binding makes idle GPUs unusable -- the model-level wake would WakeConflict."""
     if need <= 0:
         return 0
-    groups = occupancy.free_groups(tp_size)
+    groups = occupancy.free_groups(tp_size, receiver)
     if not groups:
         return 0
     if occupancy.has_unplanned_sleeping(receiver):
@@ -1019,7 +1269,7 @@ def _plan_create_capacity(
         return 0
     taken = groups[:need]
     for gpus in taken:
-        occupancy.claim_gpus(gpus)
+        occupancy.claim_gpus(gpus, receiver)
     return len(taken)
 
 
@@ -1079,9 +1329,13 @@ def _try_plan_same_slot_high_shrink(
 ) -> ShrinkForSlotAction | None:
     high_by_model = {item.model_name: item for item in classifications if item.state == ModelState.HIGH}
     candidates: list[tuple[float, Binding]] = []
-    occupied = {(binding.slot.node, gpu) for binding in cluster_view.bindings for gpu in binding.slot.gpu_ids}
+    # Only AWAKE bindings hold a GPU: a sleeping resident (multi-model residency)
+    # neither occupies the slot mate nor frees anything when "shrunk".
+    occupied = awake_gpus(cluster_view.bindings)
 
     for binding in cluster_view.bindings:
+        if not binding.awake or binding.hidden:
+            continue
         high = high_by_model.get(binding.model)
         if high is None or binding.model in active_probe_models or binding.model in inflight_models:
             continue
@@ -1097,7 +1351,10 @@ def _try_plan_same_slot_high_shrink(
     if not candidates:
         return None
 
-    _, donor_binding = min(candidates, key=lambda item: (item[0], item[1].serve_id))
+    best_z = min(z_m for z_m, _ in candidates)
+    donor_binding = _release_pick(
+        [binding for z_m, binding in candidates if z_m == best_z], cluster_view
+    )
     return ShrinkForSlotAction(
         donor=donor_binding.model,
         beneficiary=receiver,
@@ -1106,6 +1363,26 @@ def _try_plan_same_slot_high_shrink(
         reason="critical_same_slot_high_shrink",
         source_loop=source_loop,
     )
+
+
+def _release_pick(bindings: list[Binding], cluster_view: ClusterView) -> Binding:
+    """Among equally ranked donor bindings, the one the placement policy releases
+    first (merge gain, node load, same-model spread, address; never serve_id)."""
+    if len(bindings) == 1:
+        return bindings[0]
+    nodes = node_gpu_counts(cluster_view.topology)
+    aligned = [binding for binding in bindings if is_buddy_aligned(binding.slot, nodes)]
+    if aligned:
+        choice = choose_release(
+            [slot_block(binding.slot) for binding in aligned],
+            nodes=nodes,
+            occupied=awake_gpus(cluster_view.bindings)
+            | {key for binding in aligned for key in slot_block(binding.slot).keys},
+            policy=cluster_view.placement,
+        )
+        if choice is not None:
+            return aligned[choice.index]
+    return min(bindings, key=lambda binding: natural_key(binding.serve_id))
 
 
 def _slot_mate_is_free(
@@ -1135,21 +1412,30 @@ def _try_plan_tp_capacity(
     events: list[str],
     source_loop: SourceLoop,
     occupancy: _SlotOccupancy | None = None,
+    defrag_enabled: bool = False,
 ) -> str | None:
     if occupancy is not None and occupancy.has_unplanned_sleeping(model):
         # P1-a: the SM wakes existing sleeping bindings before any create/defrag target
         # is used; with a blocked one the +1 would WakeConflict every tick.
         events.append(f"capacity_blocked:{model}")
         return None
-    allocator = SlotAllocator(cluster_view.topology, list(cluster_view.bindings))
+    allocator = SlotAllocator(
+        cluster_view.topology, list(cluster_view.bindings), policy=cluster_view.placement
+    )
     if occupancy is not None:
-        groups = occupancy.free_groups(tp_size)
+        groups = occupancy.free_groups(tp_size, model)
         if groups:
-            occupancy.claim_gpus(groups[0])
+            occupancy.claim_gpus(groups[0], model)
             return "critical_empty_slot"
-    elif allocator.find_slot(tp_size) is not None:
+    elif allocator.find_slot(tp_size, model) is not None:
         return "critical_empty_slot"
 
+    if not defrag_enabled:
+        # Registry placement.defrag.enabled is false (default, v1 parity): no
+        # automatic migration is planned (design 20260928-placement-node-balance).
+        events.append(f"defrag_disabled:{model}")
+        events.append(f"capacity_blocked:{model}")
+        return None
     migrations = allocator.plan_defrag(tp_size)
     if migrations:
         actions.append(
@@ -1210,6 +1496,21 @@ def _scale_step(current_pods: int, ratio: float = 0.1) -> int:
     if current_pods <= 0:
         return 1
     return max(1, math.ceil(ratio * current_pods))
+
+
+def _tp_size(cfg: PlanConfig, model_name: str) -> int:
+    """The model's tp_size. An empty map (callers without a registry) means every
+    model is single-GPU; a model missing from a non-empty map is a wiring error and
+    raises - never a silent tp 1 (it would plan single-GPU slots for a TP model)."""
+    if not cfg.model_tp_sizes:
+        return 1
+    try:
+        return int(cfg.model_tp_sizes[model_name])
+    except KeyError:
+        raise ValueError(
+            f"planner: model {model_name!r} has no tp_size in PlanConfig.model_tp_sizes "
+            f"(known: {sorted(cfg.model_tp_sizes)})"
+        ) from None
 
 
 def _min_replicas(cfg: PlanConfig, model_name: str) -> int:

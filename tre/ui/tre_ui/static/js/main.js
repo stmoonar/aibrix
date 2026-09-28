@@ -20,7 +20,10 @@ async function init() {
   (S.meta.models || []).forEach((m, i) => {
     S.colors[m.name] = MODEL_HUES[i % MODEL_HUES.length];
   });
-  try { S.mode = (await api('/api/ops/controller/mode')).mode; } catch (_) { /* keep default */ }
+  try {
+    S.runMode = await api('/api/ops/run-mode');
+    S.mode = S.runMode.controller;
+  } catch (_) { /* keep the default (observe) */ }
 
   initOps();
   renderTopbar();

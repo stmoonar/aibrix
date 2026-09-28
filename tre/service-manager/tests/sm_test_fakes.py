@@ -23,6 +23,7 @@ from tre_sm.ops.k8s_ops import ModelDeploymentRecord, StartupPodRecord
 from tre_sm.state.fleet_store import _SAVE_HASH_SCRIPT
 from tre_sm.state.operations import WriterFence, _CURRENT_FENCE
 from tre_sm.state import sleep_reservations as _res
+from tre_sm.state import safety as _safety
 
 
 def _b(value) -> bytes:
@@ -31,6 +32,48 @@ def _b(value) -> bytes:
 
 def _s(value) -> str:
     return value.decode("utf-8") if isinstance(value, bytes) else str(value)
+
+
+_MAINTENANCE_SCRIPTS = (
+    _safety._MAINTENANCE_ACQUIRE_SCRIPT,
+    _safety._MAINTENANCE_RENEW_SCRIPT,
+    _safety._MAINTENANCE_RELEASE_SCRIPT,
+)
+
+
+def maintenance_lua(values: dict, ttls_ms: dict, script, keys_and_args):
+    """Python model of the maintenance-lock Lua scripts (same argument layout).
+
+    ``values`` holds the string keys, ``ttls_ms`` the PX of keys set with a
+    TTL (a key missing there has none, like a pre-TTL lock or a hand-set key).
+    Returns NotImplemented for any other script."""
+    if script not in _MAINTENANCE_SCRIPTS:
+        return NotImplemented
+    key, *args = [_s(item) for item in keys_and_args]
+    raw = values.get(key)
+    cur = None if raw is None else _s(raw)
+    try:
+        rec = json.loads(cur) if cur is not None else None
+    except ValueError:
+        rec = None
+    holder = rec.get("operation_id") if isinstance(rec, dict) else None
+    if script == _safety._MAINTENANCE_ACQUIRE_SCRIPT:
+        value, ttl_ms, *allowed = args
+        if cur is not None:
+            takeover = key not in ttls_ms or not isinstance(rec, dict) or holder in allowed
+            if not takeover:
+                return [0, _b(cur)]
+        values[key] = value
+        ttls_ms[key] = int(ttl_ms)
+        return [2, _b(cur)] if cur is not None else [1, b""]
+    if cur is None or not isinstance(rec, dict) or holder != args[0]:
+        return 0
+    if script == _safety._MAINTENANCE_RENEW_SCRIPT:
+        ttls_ms[key] = int(args[1])
+        return 1
+    values.pop(key, None)
+    ttls_ms.pop(key, None)
+    return 1
 
 
 class FakeRedis:
@@ -43,6 +86,8 @@ class FakeRedis:
         self.lists: dict[str, list[str]] = {}
         self.now_ms = now_ms
         self.fail_reads = False
+        #: PX of string keys set by a Lua model with a TTL (maintenance lock)
+        self.ttls_ms: dict[str, int] = {}
 
     def _check(self) -> None:
         if self.fail_reads:
@@ -56,10 +101,12 @@ class FakeRedis:
 
     def set(self, key, value):
         self.values[key] = _s(value)
+        self.ttls_ms.pop(key, None)
 
     def delete(self, key):
         self.values.pop(key, None)
         self.hashes.pop(key, None)
+        self.ttls_ms.pop(key, None)
 
     def time(self):
         self._check()
@@ -126,6 +173,9 @@ class FakeRedis:
 
     # Lua scripts (Python re-implementations with the same argument layout)
     def eval(self, script, numkeys, *keys_and_args):
+        modelled = maintenance_lua(self.values, self.ttls_ms, script, keys_and_args)
+        if modelled is not NotImplemented:
+            return modelled
         if script == _res._ACQUIRE_SCRIPT:
             return self._reservation_acquire(keys_and_args[0], [_s(a) for a in keys_and_args[numkeys:]])
         if script == _res._RENEW_SCRIPT:
@@ -301,8 +351,11 @@ class FakeCoordinator:
 
 
 class FakeSafety:
-    def assert_controller_observe(self):
-        return None
+    def __init__(self, actuation: str = "active") -> None:
+        #: SM actuation switch (tre:v2:sm:actuation) the service sees.
+        self.actuation = actuation
+        self.suppressed: list[tuple[str, dict]] = []
+        self.maintenance_calls: list[tuple] = []
 
     def assert_no_pressure(self):
         return None
@@ -310,8 +363,27 @@ class FakeSafety:
     def wait_until_healthy(self, operation):
         return None
 
-    def enter_recovery_observe(self):
-        return "observe"
+    def acquire_maintenance(self, operation_id, *, kind, owner="", takeover_operation_ids=()):
+        self.maintenance_calls.append(("acquire", operation_id, kind))
+
+    def release_maintenance(self, operation_id):
+        self.maintenance_calls.append(("release", operation_id))
+
+    def assert_maintenance_held(self, operation_id):
+        return None
+
+    def maintenance(self):
+        return None
+
+    def actuation_mode(self):
+        return self.actuation
+
+    def actuation_state(self):
+        return {"mode": self.actuation, "source": "sm", "suppressed": []}
+
+    def record_suppressed(self, action, detail):
+        self.suppressed.append((action, detail))
+        return True
 
 
 class FakeLeases:

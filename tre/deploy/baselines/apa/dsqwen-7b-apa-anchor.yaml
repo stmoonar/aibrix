@@ -5,7 +5,7 @@
 # deployments), so this 0-replica Deployment exists ONLY to (1) be that scalable object named
 # after the model and (2) publish the selector model.aibrix.ai/name=dsqwen-7b combined with the
 # SM-maintained pod label tre.aibrix.io/routable=true so APA scrapes
-# gpu_cache_usage_perc across only awake dsqwen-7b pods. APA sleep mode never changes its
+# kv_cache_usage_perc across only awake dsqwen-7b pods. APA sleep mode never changes its
 # replicas -- actual scaling goes through service-manager. Apply this BEFORE the PodAutoscaler.
 apiVersion: apps/v1
 kind: Deployment
