@@ -28,6 +28,11 @@ GPU_IDS_ANNOTATION = "tre.aibrix.io/gpu-ids"
 MODEL_LABEL = "model.aibrix.ai/name"
 MANAGED_LABEL = "tre.aibrix.io/managed"
 MODE_KEY = "tre:v2:controller:mode"
+#: Independent of MODE_KEY (2026-09-28). The bring-up scales the fleet to zero and
+#: starts one binding at a time; an SM self-heal (drift fleet repair, B7 recreate,
+#: reap, unrequested admission) running meanwhile would race it, so both must be
+#: observe (deploy_models.sh --staggered --execute sets them).
+SM_ACTUATION_KEY = "tre:v2:sm:actuation"
 
 
 @dataclass(frozen=True)
@@ -163,7 +168,7 @@ def main() -> int:
         raise SystemExit("--execute requires --confirm-reset-fleet")
 
     kubectl = Kubectl(args.kubectl)
-    _assert_controller_observe(kubectl, args.tre_namespace)
+    _assert_run_mode_observe(kubectl, args.tre_namespace)
     _assert_disk_healthy(kubectl)
     sm_url = args.sm_url or _discover_sm_url(kubectl, args.tre_namespace)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -205,7 +210,7 @@ def main() -> int:
     record("fleet_scaled_zero_and_ghosts_removed")
 
     for binding in bindings:
-        _assert_controller_observe(kubectl, args.tre_namespace)
+        _assert_run_mode_observe(kubectl, args.tre_namespace)
         _assert_disk_healthy(kubectl)
         _assert_residents_sleeping(kubectl, args.namespace, binding)
         kubectl.run(
@@ -290,13 +295,19 @@ def main() -> int:
     return 0
 
 
-def _assert_controller_observe(kubectl: Kubectl, namespace: str) -> None:
-    mode = kubectl.run(
-        "-n", namespace, "exec", "deploy/tre-v2-redis", "--",
-        "redis-cli", "--raw", "GET", MODE_KEY,
-    )
-    if mode.strip() != "observe":
-        raise RuntimeError(f"controller mode must be observe, got {mode!r}")
+def _assert_run_mode_observe(kubectl: Kubectl, namespace: str) -> None:
+    """Both switches must be set to observe explicitly (a missing key would be
+    observe for its reader, but the bring-up requires a deliberate setting)."""
+    for key, label in ((MODE_KEY, "controller mode"), (SM_ACTUATION_KEY, "SM actuation")):
+        value = kubectl.run(
+            "-n", namespace, "exec", "deploy/tre-v2-redis", "--",
+            "redis-cli", "--raw", "GET", key,
+        )
+        if value.strip() != "observe":
+            raise RuntimeError(
+                f"{label} ({key}) must be observe for the staggered bring-up, got {value!r} "
+                "(deploy/scripts/set_run_mode.sh observe observe)"
+            )
 
 
 def _assert_disk_healthy(kubectl: Kubectl) -> None:

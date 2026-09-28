@@ -167,21 +167,22 @@ def _actuation(redis, clock=None):
     return SmActuation(redis, ttl_s=0.0, monotonic=clock.monotonic, wall_ms=lambda: 1000)
 
 
-def test_sm_actuation_prefers_its_own_key_then_the_controller_mode():
+def test_sm_actuation_reads_only_its_own_key():
     redis = FakeRedis({rediskeys.SM_ACTUATION_KEY: "active", rediskeys.CONTROLLER_MODE_KEY: "observe"})
     actuation = _actuation(redis)
     assert actuation.resolve() == ("active", "sm")
-
-    del redis.kv[rediskeys.SM_ACTUATION_KEY]
-    assert actuation.resolve() == ("observe", "controller")
+    redis.kv[rediskeys.SM_ACTUATION_KEY] = "observe"
     redis.kv[rediskeys.CONTROLLER_MODE_KEY] = "active"
-    assert actuation.resolve() == ("active", "controller")
+    assert actuation.resolve() == ("observe", "sm")
 
 
-def test_sm_actuation_with_both_keys_absent_is_observe():
+def test_sm_actuation_missing_key_is_observe_not_derived_from_the_controller_mode():
+    # 2026-09-28: the two switches are independent; a missing SM key is observe
+    # even with the controller active (deployments must set it explicitly).
+    assert _actuation(FakeRedis({rediskeys.CONTROLLER_MODE_KEY: "active"})).resolve() == ("observe", "default")
     assert _actuation(FakeRedis()).resolve() == ("observe", "default")
-    garbage = FakeRedis({rediskeys.SM_ACTUATION_KEY: "bogus"})
-    assert _actuation(garbage).mode() == "observe"
+    garbage = FakeRedis({rediskeys.SM_ACTUATION_KEY: "bogus", rediskeys.CONTROLLER_MODE_KEY: "active"})
+    assert _actuation(garbage).resolve() == ("observe", "default")
 
 
 def test_sm_actuation_keeps_the_last_known_mode_on_a_read_error():
@@ -215,9 +216,9 @@ def test_suppressed_actions_are_recorded_once_per_detail():
 
 
 def test_the_safety_gate_exposes_the_actuation_state():
-    gate = ClusterSafetyGate(FakeRedis({rediskeys.CONTROLLER_MODE_KEY: "observe"}), FakePressure([{}]))
+    gate = ClusterSafetyGate(FakeRedis({rediskeys.CONTROLLER_MODE_KEY: "active"}), FakePressure([{}]))
     assert gate.actuation_mode() == "observe"
     gate.record_suppressed("reap_rejected_deployments", {"deployments": ["d1"]})
     state = gate.actuation_state()
-    assert state["mode"] == "observe" and state["source"] == "controller"
+    assert state["mode"] == "observe" and state["source"] == "default"
     assert state["suppressed"][0]["action"] == "reap_rejected_deployments"

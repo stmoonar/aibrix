@@ -179,6 +179,7 @@ def test_reprobe_writes_new_boundaries_under_the_new_root_only(tmp_path, monkeyp
     src = _source(tmp_path, {"dsllama-8b": {}})
     before = {p: p.read_text() for p in src.rglob("*.json")}
     monkeypatch.setattr(campaign, "controller_mode", lambda ns: campaign.REQUIRED_CONTROLLER_MODE)
+    monkeypatch.setattr(campaign, "sm_actuation", lambda ns: campaign.REQUIRED_SM_ACTUATION)
     monkeypatch.setattr(campaign.time, "sleep", lambda s: None)
     seen = []
 
