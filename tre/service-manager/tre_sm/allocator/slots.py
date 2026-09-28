@@ -12,7 +12,7 @@ from tre_common.gpu_placement import (
     enumerate_blocks,
     plan_releases,
 )
-from tre_common.registry import ClusterTopology
+from tre_common.registry import ClusterTopology, tp_size_error
 
 
 _NAT_SPLIT = re.compile(r"(\d+)")
@@ -309,8 +309,10 @@ class SlotAllocator:
         return (node, gpu) in self._awake_gpu_to_serve
 
     def _validate_tp_size(self, tp_size: int) -> None:
-        if tp_size not in (1, 2):
-            raise ValueError("tp_size must be 1 or 2")
+        widest = max((node.gpus for node in self._topology.nodes), default=None)
+        problem = tp_size_error(tp_size, widest_node_gpus=widest)
+        if problem:
+            raise ValueError(problem)
 
     def _validate_slot(self, slot: Slot) -> None:
         if len(slot.gpu_ids) not in (1, 2):

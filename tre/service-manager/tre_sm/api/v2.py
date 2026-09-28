@@ -3802,13 +3802,13 @@ def _defrag_destination(binding: Binding, migration: Migration, bindings) -> Bin
 
 
 def _registry_placement_policy(registry) -> PlacementPolicy | None:
+    """The registry placement policy; None only for registry stubs without
+    models (embedded / unit-test wiring). An unsupported model tp_size raises
+    (ValueError) instead of silently falling back to plain best-fit."""
     models = getattr(registry, "models", None)
     if not callable(models):
         return None
-    try:
-        return placement_policy_from_registry(registry)
-    except (AttributeError, TypeError, ValueError):
-        return None
+    return placement_policy_from_registry(registry)
 
 
 def _wake_pick(feasible, planned, topology, policy: PlacementPolicy | None = None) -> Binding:
