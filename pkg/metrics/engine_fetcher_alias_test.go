@@ -38,7 +38,8 @@ vllm:inter_token_latency_seconds_sum{engine="0",model_name="m"} 0.2
 vllm:inter_token_latency_seconds_count{engine="0",model_name="m"} 4.0
 `
 
-// An engine exporting both names (older vLLM): the mapped (old) name wins.
+// An engine exporting both names (vLLM 0.10.x): the newer name wins, whichever one the
+// metric definition maps (on a real engine both carry the same value).
 const mockVllmBothCacheMetrics = `# TYPE vllm:gpu_cache_usage_perc gauge
 vllm:gpu_cache_usage_perc{model_name="m"} 0.7
 # TYPE vllm:kv_cache_usage_perc gauge
@@ -67,17 +68,28 @@ func TestEngineMetricsFetcher_RenamedVllmMetricsAreRead(t *testing.T) {
 	assert.Equal(t, 0.2, hist.Sum)
 }
 
-func TestEngineMetricsFetcher_MappedNamePreferredOverAlias(t *testing.T) {
+func TestEngineMetricsFetcher_NewestNamePreferred(t *testing.T) {
 	server := setupMockServer(mockVllmBothCacheMetrics, 200, 0)
 	defer server.Close()
 	endpoint := strings.TrimPrefix(server.URL, "http://")
 
 	result, err := NewEngineMetricsFetcher().FetchAllTypedMetrics(
-		context.Background(), endpoint, "vllm", "pod-old", []string{GPUCacheUsagePerc})
+		context.Background(), endpoint, "vllm", "pod-old", []string{GPUCacheUsagePerc, KVCacheUsagePerc})
 	require.NoError(t, err)
-	cache, ok := result.ModelMetrics["m/"+GPUCacheUsagePerc]
-	require.True(t, ok)
-	assert.Equal(t, 0.7, cache.GetSimpleValue())
+	for _, name := range []string{GPUCacheUsagePerc, KVCacheUsagePerc} {
+		cache, ok := result.ModelMetrics["m/"+name]
+		require.True(t, ok, name)
+		assert.Equal(t, 0.1, cache.GetSimpleValue(), name)
+	}
+}
+
+func TestEngineMetricCandidates(t *testing.T) {
+	assert.Equal(t, []string{"vllm:kv_cache_usage_perc", "vllm:gpu_cache_usage_perc"},
+		EngineMetricCandidates("vllm:gpu_cache_usage_perc"))
+	assert.Equal(t, []string{"vllm:inter_token_latency_seconds", "vllm:time_per_output_token_seconds"},
+		EngineMetricCandidates("vllm:inter_token_latency_seconds"))
+	assert.Equal(t, []string{"vllm:e2e_request_latency_seconds"},
+		EngineMetricCandidates("vllm:e2e_request_latency_seconds"))
 }
 
 func TestLookupMetricFamily_MissingEverywhere(t *testing.T) {

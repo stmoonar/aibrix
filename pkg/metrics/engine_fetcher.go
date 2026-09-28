@@ -289,27 +289,51 @@ func (ef *EngineMetricsFetcher) getAvailableMetricsForEngine(engineType string) 
 	return availableMetrics
 }
 
-// TRE-PATCH(P2-GW-006): engine metrics renamed upstream. vLLM >= 0.11 no longer exports
-// vllm:gpu_cache_usage_perc (now vllm:kv_cache_usage_perc, the same 0..1 KV-cache fill)
-// or vllm:time_per_output_token_seconds (now vllm:inter_token_latency_seconds, the same
-// per-token histogram). The mapped (old) name is read first, so older engines are
-// unchanged; a newer engine is read under the new name. Without this, least-gpu-cache
-// routing falls back to random and the TRE Redis TPOT histogram (SafeScale SLO check)
-// stays empty on vLLM 0.30.
-var engineMetricAliases = map[string][]string{
-	"vllm:gpu_cache_usage_perc":          {"vllm:kv_cache_usage_perc"},
-	"vllm:time_per_output_token_seconds": {"vllm:inter_token_latency_seconds"},
+// TRE-PATCH(P2-GW-006): engine metrics renamed upstream. vLLM deprecated these families in
+// 0.10.x and dropped the old names in 0.11+ (and the 0.30 fork the TRE model pods run):
+// vllm:gpu_cache_usage_perc -> vllm:kv_cache_usage_perc (the same 0..1 KV-cache fill),
+// vllm:time_per_output_token_seconds -> vllm:inter_token_latency_seconds (the same
+// per-token histogram), vllm:gpu_prefix_cache_{queries,hits} -> vllm:prefix_cache_*.
+// Each group lists the raw names of one quantity, newest first; whichever member a metric
+// definition maps, the fetcher reads the first member the engine exports. vLLM 0.10.1
+// exports both cache gauges and both prefix-cache counter pairs (same values) and only the
+// old TPOT name; 0.30 only the new names. Without this, least-gpu-cache routing falls back
+// to random and the TRE Redis TPOT histogram (SafeScale SLO check) stays empty on 0.30.
+// The TRE Python readers keep the same table in tre/common/tre_common/vllm_metrics.py;
+// pkg/metrics/engine_fetcher_samples_test.go checks both against real 0.30 / 0.10.1 bodies.
+var engineMetricEquivalents = [][]string{
+	{"vllm:kv_cache_usage_perc", "vllm:gpu_cache_usage_perc"},
+	{"vllm:inter_token_latency_seconds", "vllm:time_per_output_token_seconds"},
+	{"vllm:prefix_cache_queries_total", "vllm:gpu_prefix_cache_queries_total"},
+	{"vllm:prefix_cache_hits_total", "vllm:gpu_prefix_cache_hits_total"},
 }
 
-// lookupMetricFamily returns the family of rawMetricName, else of its first present
-// alias, and the name it was found under.
-func lookupMetricFamily(allMetrics map[string]*dto.MetricFamily, rawMetricName string) (*dto.MetricFamily, string, bool) {
-	if family, ok := allMetrics[rawMetricName]; ok {
-		return family, rawMetricName, true
+var engineMetricCandidates = func() map[string][]string {
+	candidates := make(map[string][]string)
+	for _, group := range engineMetricEquivalents {
+		for _, name := range group {
+			candidates[name] = group
+		}
 	}
-	for _, alias := range engineMetricAliases[rawMetricName] {
-		if family, ok := allMetrics[alias]; ok {
-			return family, alias, true
+	return candidates
+}()
+
+// EngineMetricCandidates returns the raw names rawMetricName is read under, in
+// preference order (newest vLLM name first); a name without renames is its own only
+// candidate.
+func EngineMetricCandidates(rawMetricName string) []string {
+	if group, ok := engineMetricCandidates[rawMetricName]; ok {
+		return group
+	}
+	return []string{rawMetricName}
+}
+
+// lookupMetricFamily returns the family of the first present candidate of rawMetricName
+// and the name it was found under.
+func lookupMetricFamily(allMetrics map[string]*dto.MetricFamily, rawMetricName string) (*dto.MetricFamily, string, bool) {
+	for _, name := range EngineMetricCandidates(rawMetricName) {
+		if family, ok := allMetrics[name]; ok {
+			return family, name, true
 		}
 	}
 	return nil, rawMetricName, false
