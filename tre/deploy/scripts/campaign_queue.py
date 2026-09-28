@@ -46,6 +46,10 @@ ORPHAN_WATCH_KEY = "tre:v2:controller:orphan_watch"
 PROBES_KEY = "tre:v2:controller:safescale:probes"
 SIGNAL_KEY = "tre:v2:controller:signal_log"
 MODE_KEY = "tre:v2:controller:mode"
+# Written together with MODE_KEY (one MULTI): the SM supervisor's actuation
+# switch (tre_common.rediskeys.SM_ACTUATION_KEY; tre/docs/design/
+# 20260928-observe-mode-semantics.md).
+SM_ACTUATION_KEY = "tre:v2:sm:actuation"
 SM_STATE_KEY = "tre:v2:sm:state"
 SM_VERSION_KEY = "tre:v2:sm:version"
 FIXED_CLEAR_KEYS = {
@@ -389,9 +393,14 @@ class CampaignRunner:
     def set_mode(self, mode: str) -> None:
         if mode not in {"active", "observe"}:
             raise ValueError(mode)
-        self.redis.set(MODE_KEY, mode)
-        if self.redis.get(MODE_KEY).decode() != mode:
-            raise RuntimeError(f"failed to set controller mode {mode}")
+        pipe = self.redis.pipeline(transaction=True)
+        pipe.set(MODE_KEY, mode)
+        pipe.set(SM_ACTUATION_KEY, mode)
+        pipe.execute()
+        if (self.redis.get(MODE_KEY) or b"").decode() != mode or (
+            self.redis.get(SM_ACTUATION_KEY) or b""
+        ).decode() != mode:
+            raise RuntimeError(f"failed to set controller mode / SM actuation {mode}")
 
     def toggle(self, arm: str) -> None:
         self._command(["bash", "deploy/scripts/toggle_tre_apa.sh", arm])
@@ -623,7 +632,8 @@ class CampaignRunner:
         }
         if mismatched:
             raise RuntimeError(f"controller arm env mismatch: {mismatched}")
-        mode = (self.redis.get(MODE_KEY) or b"active").decode()
+        # Absent = observe (fail-closed, 2026-09-28).
+        mode = (self.redis.get(MODE_KEY) or b"observe").decode()
         if mode != config.mode:
             raise RuntimeError(f"controller mode {mode} != {config.mode}")
         apa_count = self.apa_count()

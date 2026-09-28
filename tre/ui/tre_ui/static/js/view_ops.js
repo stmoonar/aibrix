@@ -120,8 +120,8 @@ function syncModeButtons() {
 async function setMode(mode) {
   if (mode === S.mode) return;
   const msg = mode === 'observe'
-    ? '暂停 controller 执行？它会继续计算决策，但停止扩缩和 hide。'
-    : '恢复 controller 执行？';
+    ? '切到 observe？controller 只计算和记录决策（不扩缩、不 hide，进行中的 SafeScale 探针 unhide 回滚）；SM supervisor 也只记录不执行。SM HTTP API（APA/运维）不受影响。'
+    : '恢复执行（controller 与 SM supervisor 都切到 active）？';
   confirmOp(msg, async () => {
     const r = await api('/api/ops/controller/mode', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -130,7 +130,7 @@ async function setMode(mode) {
     S.mode = r.mode;
     syncModeButtons();
     return r;
-  }, `controller → ${mode}`);
+  }, `controller + SM actuation → ${mode}`);
 }
 
 /* ---------- params (carried over verbatim) ---------- */

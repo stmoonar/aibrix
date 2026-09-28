@@ -20,7 +20,8 @@ class ServiceManagerStateClient:
 
     def request(self, method: str, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         body = None
-        headers = {"Accept": "application/json"}
+        # Caller identity for the SM operation log (2026-09-28).
+        headers = {"Accept": "application/json", "X-TRE-Actor": "tre-console"}
         if payload is not None:
             body = json.dumps(payload).encode("utf-8")
             headers["Content-Type"] = "application/json"

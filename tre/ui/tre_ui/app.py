@@ -16,12 +16,12 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from tre_common.registry import Registry
+from tre_common.run_mode import RUN_MODES, effective_mode, read_run_modes, write_run_mode
 from tre_ui import params as params_mod
 from tre_ui.sampler import Sampler
 
 _AUDIT = logging.getLogger("tre_ui.audit")
 _STATIC = Path(__file__).parent / "static"
-_CONTROLLER_MODE_KEY = "tre:v2:controller:mode"
 _REGISTRY_CM = "tre-v2-registry"
 _CONTROLLER_DEPLOY = "tre-v2-controller"
 _HASH_ANNOTATION = "tre.dev/params-hash"
@@ -187,23 +187,28 @@ def create_ui_app(
 
     @app.get("/api/ops/controller/mode")
     def get_mode() -> dict[str, Any]:
+        """``mode`` = what the controller acts on (absent / unreadable = observe,
+        fail-closed); ``sm_actuation`` = the SM supervisor switch (absent =
+        derived from the controller mode)."""
         try:
-            raw = redis_client.get(_CONTROLLER_MODE_KEY)
+            raw = read_run_modes(redis_client)
         except Exception:  # noqa: BLE001
-            raw = None
-        mode = (raw.decode() if isinstance(raw, bytes) else raw) or "active"
-        return {"mode": mode}
+            return {"mode": "observe", "sm_actuation": "observe", "raw": None}
+        controller = effective_mode(raw["controller"])
+        sm_actuation = raw["sm_actuation"] or controller
+        return {"mode": controller, "sm_actuation": sm_actuation, "raw": raw}
 
     @app.post("/api/ops/controller/mode")
     def set_mode(body: _ModeBody) -> dict[str, Any]:
-        if body.mode not in ("active", "observe"):
+        if body.mode not in RUN_MODES:
             raise HTTPException(status_code=400, detail="mode must be active or observe")
-        _AUDIT.info(json.dumps({"op": "controller_mode", "mode": body.mode}))
+        _AUDIT.info(json.dumps({"op": "controller_mode", "mode": body.mode, "sm_actuation": body.mode}))
         try:
-            redis_client.set(_CONTROLLER_MODE_KEY, body.mode)
+            # Controller mode and SM actuation switch together, one MULTI.
+            write_run_mode(redis_client, body.mode)
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(status_code=502, detail=f"redis set failed: {exc}") from exc
-        return {"ok": True, "mode": body.mode}
+        return {"ok": True, "mode": body.mode, "sm_actuation": body.mode}
 
     # ---- params: edit per-model registry via ConfigMap, restart-to-apply ----
 
