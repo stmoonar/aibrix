@@ -969,10 +969,18 @@ class ServiceManagerV2:
         if migrations is None:
             raise DefragUnavailable("no_feasible_defrag")
         by_serve = {binding.serve_id: binding for binding in snapshot.bindings}
+        deployed = self._deployed_binding_ids() if migrations else set()
         for migration in migrations:
             source = by_serve.get(migration.serve_id)
             if source is not None:
                 self._assert_not_reserved(binding=source, what=f"defrag of {source.serve_id}")
+                if (
+                    _defrag_destination(source, migration, snapshot.bindings) is None
+                    and replace(source, slot=migration.to_slot).binding_id in deployed
+                ):
+                    # B6: the delete/create path would delete the source and then
+                    # fail with AlreadyExists; refuse before anything changes.
+                    raise DefragUnavailable("destination_deployment_without_binding")
             self._assert_not_reserved(slot=migration.to_slot, what="defrag destination")
         # The source sleeps with the writer lock held for the whole migration: the
         # create + readiness wait that follows holds it for minutes anyway, so a
@@ -1008,6 +1016,14 @@ class ServiceManagerV2:
         }
 
     def _run_defrag_migration(self, binding, migration, updated_by_serve: dict, actions: list) -> None:
+        destination = _defrag_destination(binding, migration, updated_by_serve.values())
+        if destination is not None:
+            # Full layout (B6): relocate by power only - no Deployment is
+            # deleted or created.
+            actions.extend(self._execute_power_defrag_migration(binding, destination))
+            updated_by_serve[binding.serve_id] = replace(binding, awake=False, hidden=False)
+            updated_by_serve[destination.serve_id] = replace(destination, awake=True, hidden=False)
+            return
         if self._has_deployment_ops():
             migration_actions, moved_binding = self._execute_runtime_defrag_migration(binding, migration)
             actions.extend(migration_actions)
@@ -1436,6 +1452,7 @@ class ServiceManagerV2:
                 required_binding_ids=(
                     self._seed_binding_ids if self._fleet_store is not None else None
                 ),
+                recreate_bindings=self._missing_registry_deployments,
                 reconcile=lambda strict: self._reconcile_unlocked(
                     drop_missing=strict
                 ),
@@ -1481,6 +1498,56 @@ class ServiceManagerV2:
                 str(record["operation_id"]) for record in stale
             ],
         )
+
+    def _missing_registry_deployments(self, *, power: str | None = None) -> list[Binding]:
+        """B7: registry bindings desired ``resident`` (and ``power``, if given)
+        whose Deployment is gone. Only the registry rendering can be recreated
+        faithfully; fleet repair creates these again instead of failing its
+        final audit with ``desired_without_deployment`` forever."""
+        if self._fleet_store is None or not callable(
+            getattr(self._runtime_ops, "create_model_deployment", None)
+        ):
+            return []
+        deployed = self._deployed_binding_ids()
+        registry_ids = registry_binding_ids(self._registry)
+        return [
+            Binding(item.binding_id, item.model, Slot(item.node, tuple(item.gpu_ids)), awake=False)
+            for item in sorted(
+                self._fleet_store.load_desired().bindings, key=lambda item: item.binding_id
+            )
+            if item.lifecycle == "resident"
+            and (power is None or item.power == power)
+            and item.binding_id in registry_ids
+            and item.binding_id not in deployed
+        ]
+
+    def repair_missing_deployments(self, binding_ids) -> dict | None:
+        """Supervisor pass (B7): drift that is ONLY ``deployment_missing`` of
+        registry bindings desired resident + sleeping is repaired by creating
+        just those Deployments again from the registry - no fleet-wide
+        quarantine. Their Pods go through the normal startup gate (which sleeps
+        the overlapping residents for the start, and wakes them again once the
+        new Pod converged asleep), like a Pod k8s restarted. Returns None when
+        the drift does not qualify: the caller then runs a full fleet repair."""
+        wanted = set(binding_ids)
+        if not wanted:
+            return None
+        if not wanted <= {item.binding_id for item in self._missing_registry_deployments(power="sleeping")}:
+            return None
+        created: list[str] = []
+        with self._writer("deployment_repair", wait_s=0.0):
+            # Again under the lock: another writer may have changed them meanwhile.
+            for planned in self._missing_registry_deployments(power="sleeping"):
+                if planned.binding_id not in wanted:
+                    continue
+                created.append(
+                    str(self._runtime_ops.create_model_deployment(planned.model, planned.slot))
+                )
+                LOG.warning(
+                    "recreated the missing Deployment of %s (desired resident, sleeping)",
+                    planned.binding_id,
+                )
+        return {"binding_ids": sorted(wanted), "created": created}
 
     def enter_recovery_observe(self) -> str:
         if self._safety_gate is None:
@@ -2302,13 +2369,25 @@ class ServiceManagerV2:
             old = by_id.get(old_id)
             if old is None:
                 raise ValueError(f"desired state missing stable binding: {old_id}")
-            by_id[old_id] = old.with_intent(
-                lifecycle="absent",
-                power="sleeping",
-                hidden=True,
-                updated_by="service-manager-api",
-                reason="defrag_source_removed",
-            )
+            if _defrag_destination(actual, migration, bindings) is not None:
+                # Full layout (B6): the destination binding (and its Deployment)
+                # already exists, the source only goes to sleep - it stays
+                # resident, so the registry layout does not shrink.
+                by_id[old_id] = old.with_intent(
+                    lifecycle="resident",
+                    power="sleeping",
+                    hidden=False,
+                    updated_by="service-manager-api",
+                    reason="defrag_source_slept",
+                )
+            else:
+                by_id[old_id] = old.with_intent(
+                    lifecycle="absent",
+                    power="sleeping",
+                    hidden=True,
+                    updated_by="service-manager-api",
+                    reason="defrag_source_removed",
+                )
             planned = Binding(
                 serve_id=actual.serve_id,
                 model=actual.model,
@@ -2852,6 +2931,49 @@ class ServiceManagerV2:
         self._refresh_observed([binding.binding_id])
         return binding
 
+    def _deployed_binding_ids(self) -> set[str]:
+        lister = getattr(self._runtime_ops, "list_model_deployments", None)
+        if not callable(lister):
+            return set()
+        return {item.binding_id for item in lister()}
+
+    def _execute_power_defrag_migration(self, binding: Binding, destination: Binding) -> list[dict]:
+        """Full layout (B6): the destination slot already hosts a sleeping
+        binding of the same model with its own Deployment. Sleep the source
+        through the sleep primitive (path ``defrag``; its Deployment stays),
+        then wake the destination through the normal wake path (reservation
+        check, wake headroom gate, GPU leases). A failed destination wake wakes
+        the source again (best effort) and re-raises: the caller's desired
+        guard restores both desired records."""
+        if destination.awake:
+            raise ValueError(f"defrag destination {destination.binding_id} is already awake")
+        if self._runtime_ops is not None and self._vllm_ops is not None:
+            # Refuse before the source is slept when the destination cannot wake.
+            if not self._snapshot_for_binding(destination).pod_ip:
+                raise ValueError(f"pod {destination.serve_id} has no pod IP for wake")
+            if self._gpu_truth is not None:
+                nodes = {node.name: node for node in self._registry.topology().nodes}
+                problem = self._wake_headroom_problem(destination, nodes.get(destination.slot.node))
+                if problem is not None:
+                    raise WakeConflict(f"insufficient wake headroom: {problem}")
+        self._apply_runtime_power_action(binding, action="sleep", sleep_path="defrag")
+        try:
+            self._apply_runtime_power_action(destination, action="wake")
+        except BaseException:
+            try:
+                self._apply_runtime_power_action(binding, action="wake")
+            except Exception:  # the audit reports desired awake / physically asleep
+                LOG.exception(
+                    "waking defrag source %s back after the failed wake of %s failed",
+                    binding.binding_id, destination.binding_id,
+                )
+            raise
+        return [
+            {"action": "hide", "serve_id": binding.serve_id},
+            {"action": "sleep", "serve_id": binding.serve_id},
+            {"action": "wake", "serve_id": destination.serve_id},
+        ]
+
     def _execute_runtime_defrag_migration(self, binding: Binding, migration: Migration) -> tuple[list[dict], Binding]:
         if self._runtime_ops is None or self._vllm_ops is None:
             raise ValueError("runtime_ops and vllm_ops are required for runtime defrag")
@@ -3349,6 +3471,16 @@ def _migration_dict(migration: Migration) -> dict:
 
 def _slot_dict(slot: Slot) -> dict:
     return {"node": slot.node, "gpu_ids": list(slot.gpu_ids)}
+
+
+def _defrag_destination(binding: Binding, migration: Migration, bindings) -> Binding | None:
+    """The existing binding of ``binding``'s model on the migration's destination
+    slot (full static layout, B6), or None (sparse layout: create one there)."""
+    destination_id = replace(binding, slot=migration.to_slot).binding_id
+    for item in bindings:
+        if item.binding_id == destination_id and item.serve_id != binding.serve_id:
+            return item
+    return None
 
 
 def _wake_pick(feasible, planned, topology) -> Binding:

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import time
 from typing import Callable, Protocol
 
+from gen_model_manifests import deployment_name
 from tre_sm.allocator.slots import Binding, Slot
 from tre_sm.allocator.topology import GPU_IDS_ANNOTATION, K8sPodSnapshot
 from tre_sm.ops.k8s_ops import ModelDeploymentRecord
@@ -23,6 +25,7 @@ class FleetRuntimeOps(Protocol):
     def scale_model_deployment(self, name: str, *, replicas: int) -> None: ...
     def wait_deployment_pods_deleted(self, deployment_name: str): ...
     def wait_pod_ready(self, serve_id: str) -> K8sPodSnapshot: ...
+    def create_model_deployment(self, model: str, slot: Slot) -> str: ...
 
 
 class FleetVllmOps(Protocol):
@@ -66,13 +69,30 @@ class FleetRepairExecutor:
         audit: Callable[[], dict],
         desired_binding_ids: Callable[[], set[str]] | None = None,
         required_binding_ids: Callable[[], set[str]] | None = None,
+        recreate_bindings: Callable[[], list[Binding]] | None = None,
     ) -> None:
         deployments = self._runtime.list_model_deployments()
-        if not deployments:
-            raise RuntimeError("fleet repair found no managed model Deployments")
         by_id = {deployment.binding_id: deployment for deployment in deployments}
         if len(by_id) != len(deployments):
             raise RuntimeError("duplicate stable binding_id in managed Deployments")
+        # B7: bindings desired resident whose Deployment is gone are created
+        # again from the registry (same name and body as the rendered one) when
+        # their turn to start comes; scaling alone could never bring them back.
+        recreate: dict[str, ModelDeploymentRecord] = {}
+        for planned in recreate_bindings() if recreate_bindings is not None else []:
+            if planned.binding_id in by_id:
+                continue
+            record = ModelDeploymentRecord(
+                deployment_name(planned.model, planned.slot.node, planned.slot.gpu_ids),
+                planned.model,
+                planned.slot.node,
+                tuple(planned.slot.gpu_ids),
+                replicas=0,
+            )
+            recreate[record.binding_id] = record
+        if not deployments and not recreate:
+            raise RuntimeError("fleet repair found no managed model Deployments")
+        by_id.update(recreate)
         if desired_binding_ids is not None:
             # D7 pre-check (after seeding): every inventoried Deployment - and every
             # binding the seeding covers (registry UNION Deployments) - needs a
@@ -93,11 +113,13 @@ class FleetRepairExecutor:
             details={
                 "deployments": len(deployments),
                 "awake_binding_ids": awake_binding_ids,
+                "recreate_binding_ids": sorted(recreate),
             },
         )
         self._safety.wait_until_healthy(operation)
 
         repair_ids = self._quarantine_and_sleep_residents(operation, by_id)
+        repair_ids |= set(recreate)
         operation.advance(
             "residents_quarantined",
             details={"repair_binding_ids": sorted(repair_ids)},
@@ -105,8 +127,12 @@ class FleetRepairExecutor:
 
         # Remove every unhealthy/unknown instance first. This guarantees that
         # sequential cold starts never encounter an overlapping unknown Pod.
+        # (A Deployment to recreate has nothing to scale; its leftover Pods, if
+        # any, are still waited for by their label.)
         for binding_id in sorted(repair_ids):
             operation.assert_active()
+            if binding_id in recreate:
+                continue
             deployment = by_id[binding_id]
             self._runtime.scale_model_deployment(deployment.name, replicas=0)
         for binding_id in sorted(repair_ids):
@@ -133,7 +159,14 @@ class FleetRepairExecutor:
             )
             if self._gpu_leases is not None:
                 self._gpu_leases.acquire(planned, phase="starting")
-            self._runtime.scale_model_deployment(deployment.name, replicas=1)
+            if binding_id in recreate:
+                # Rendered with replicas=1: its Pod is admitted at the startup
+                # gate like a scaled one (phase starting_binding + lease above).
+                name = self._runtime.create_model_deployment(deployment.model, planned.slot)
+                deployment = replace(deployment, name=str(name), replicas=1)
+                by_id[binding_id] = deployment
+            else:
+                self._runtime.scale_model_deployment(deployment.name, replicas=1)
             pod = self._runtime.wait_pod_ready(deployment.name)
             if not pod.pod_ip:
                 raise RuntimeError(f"new Pod for {binding_id} has no IP")
@@ -172,6 +205,7 @@ class FleetRepairExecutor:
             details={
                 "deployments": len(deployments),
                 "repaired": len(repair_ids),
+                "recreated_binding_ids": sorted(recreate),
                 "awake_binding_ids": awake_binding_ids,
                 "audit_version": result.get("version"),
             },

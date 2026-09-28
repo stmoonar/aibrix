@@ -136,6 +136,18 @@ class FleetSupervisor:
             and now - self._last_repair_at < self._repair_cooldown_s
         ):
             return
+        targeted = getattr(self._service, "repair_missing_deployments", None)
+        if callable(targeted) and all(
+            item.get("code") == "deployment_missing" for item in drift
+        ):
+            # B7: only Deployments of sleeping residents are gone - recreate
+            # just those (their Pods pass the startup gate) instead of a
+            # fleet-wide repair. None = not eligible: full repair below.
+            repaired = targeted([item.get("binding_id") for item in drift])
+            if repaired is not None:
+                self._last_repair_at = now
+                self._reset_drift()
+                return
         self._service.enter_recovery_observe()
         submitted = self._service.start_fleet_repair()
         self._last_repair_at = now
