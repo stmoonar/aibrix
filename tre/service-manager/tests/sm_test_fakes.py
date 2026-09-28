@@ -301,8 +301,11 @@ class FakeCoordinator:
 
 
 class FakeSafety:
-    def assert_controller_observe(self):
-        return None
+    def __init__(self, actuation: str = "active") -> None:
+        #: SM actuation switch (tre:v2:sm:actuation) the service sees.
+        self.actuation = actuation
+        self.suppressed: list[tuple[str, dict]] = []
+        self.maintenance_calls: list[tuple] = []
 
     def assert_no_pressure(self):
         return None
@@ -310,8 +313,27 @@ class FakeSafety:
     def wait_until_healthy(self, operation):
         return None
 
-    def enter_recovery_observe(self):
-        return "observe"
+    def acquire_maintenance(self, operation_id, *, kind, owner=""):
+        self.maintenance_calls.append(("acquire", operation_id, kind))
+
+    def release_maintenance(self, operation_id):
+        self.maintenance_calls.append(("release", operation_id))
+
+    def assert_maintenance_held(self, operation_id):
+        return None
+
+    def maintenance(self):
+        return None
+
+    def actuation_mode(self):
+        return self.actuation
+
+    def actuation_state(self):
+        return {"mode": self.actuation, "source": "sm", "suppressed": []}
+
+    def record_suppressed(self, action, detail):
+        self.suppressed.append((action, detail))
+        return True
 
 
 class FakeLeases:

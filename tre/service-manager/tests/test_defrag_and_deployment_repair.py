@@ -315,7 +315,8 @@ def test_supervisor_falls_back_to_the_fleet_repair_when_not_eligible():
     declined = TargetedService(None)
     _drive(declined, [{"code": "deployment_missing", "binding_id": "m1/node-a/0"}])
     assert declined.targeted == [["m1/node-a/0"]]
-    assert declined.repairs == [True] and declined.observe_handoffs == 1
+    # 2026-09-28: the supervisor no longer writes the controller mode
+    assert declined.repairs == [True] and declined.observe_handoffs == 0
 
     mixed = TargetedService({"created": ["x"]})
     _drive(

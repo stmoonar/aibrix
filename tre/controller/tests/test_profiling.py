@@ -200,14 +200,15 @@ def test_action_queue_observe_mode_records_no_dispatch() -> None:
     assert [e for e in prof._buffer if e["kind"] == "dispatch"] == []
 
 
-def test_action_queue_observe_held_safescale_records_no_dispatch() -> None:
+def test_action_queue_observe_safescale_scale_records_no_dispatch() -> None:
     prof = TickProfiler(FakeStreamRedis())
     queue = ActionQueue(FakeServiceManagerClient(), is_observe=lambda: True, prof=prof)
     queue.submit((ScaleAction("m", -1, "release", "safescale"),))
     results = asyncio.run(queue.drain_once())
-    # safescale action is held (not dispatched, not observe_skipped) so it stays pending
-    assert results == ()
-    assert len(queue.pending_actions()) == 1
+    # observe = record only (2026-09-28): a scale is dropped (only a SafeScale
+    # unhide / commit-turned-unhide runs), never dispatched
+    assert [r.error for r in results] == ["observe_skipped"]
+    assert queue.pending_actions() == ()
     assert [e for e in prof._buffer if e["kind"] == "dispatch"] == []
 
 

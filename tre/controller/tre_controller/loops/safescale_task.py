@@ -72,23 +72,35 @@ def run_safescale_observation_tick(
     gateway_counters: Mapping[str, GatewayCounters] | None = None,
     fresh_cluster_view: ClusterView | None = None,
     recovery_needs_fresh_view: bool = False,
+    observe_mode: bool = False,
 ) -> SafeScaleObservationResult:
     """One SafeScale observation tick. ``fresh_cluster_view`` is the SM view only
     while fresh (``ClusterViewBox.fresh``): with it, probes whose pods are all
     gone are resolved first, in any controller mode (B8). With
     ``recovery_needs_fresh_view`` (app wiring) a ``committing`` probe is only
     re-submitted once such a view exists, so a probe restored after a restart
-    is checked for gone pods before anything reaches the SM."""
+    is checked for gone pods before anything reaches the SM.
+
+    ``observe_mode`` (controller mode observe, 2026-09-28): no probe is observed
+    or judged; every ``probing`` probe is rolled back instead (its probe pods
+    unhidden, resolved ``observe_entered``). A ``committing`` probe's queued
+    action runs in the queue's observe-safe form (the donor unhide)."""
     events: list[str] = []
     # B8: before the stale-snapshot return - it needs only the cluster view.
     _resolve_probes_with_gone_pods(
         queue, safescale, fresh_cluster_view, now_ms=snapshot.ts_ms, events=events
     )
-    if snapshot.stale:
-        return SafeScaleObservationResult(submitted=0, events=tuple(events) + ("snapshot_stale",))
-
     accepted_actions: list[Action] = []
     submitted = 0
+    if observe_mode:
+        rolled_back = rollback_probes_for_observe(queue, safescale, now_ms=snapshot.ts_ms, events=events)
+        accepted_actions.extend(rolled_back)
+        submitted += len(rolled_back)
+    if snapshot.stale:
+        return SafeScaleObservationResult(
+            submitted=submitted, actions=tuple(accepted_actions), events=tuple(events) + ("snapshot_stale",)
+        )
+
     if recovery_needs_fresh_view and fresh_cluster_view is None:
         waiting = getattr(safescale, "committing_probes", None)
         has_request = getattr(queue, "has_request", None)
@@ -99,7 +111,7 @@ def run_safescale_observation_tick(
         recovered = _recover_committing(queue, safescale, now_ms=snapshot.ts_ms, events=events)
         accepted_actions.extend(recovered)
         submitted += len(recovered)
-    for probe in safescale.active_probes():
+    for probe in () if observe_mode else safescale.active_probes():
         metrics = snapshot.models.get(probe.model)
         if metrics is None:
             events.append(f"safescale_observation_missing:{probe.model}")
@@ -186,12 +198,14 @@ async def safescale_task(
     signal_state: SignalState | None = None,
     cluster_view_box: ClusterViewReader | None = None,
     gateway_source: GatewayCounterSource | None = None,
+    is_observe: Callable[[], bool] | None = None,
 ) -> None:
     while True:
         snapshot = snapshot_box.get()
         if snapshot is not None:
+            observe_mode = bool(is_observe()) if is_observe is not None else False
             counters = None
-            if gateway_source is not None and safescale.active_probes():
+            if gateway_source is not None and not observe_mode and safescale.active_probes():
                 # A13: the donor's gateway counters, read off the event loop (HTTP).
                 counters = await asyncio.to_thread(gateway_source.read)
             result = run_safescale_observation_tick(
@@ -205,6 +219,7 @@ async def safescale_task(
                 gateway_counters=counters,
                 fresh_cluster_view=_fresh_view(cluster_view_box),
                 recovery_needs_fresh_view=cluster_view_box is not None,
+                observe_mode=observe_mode,
             )
             _log_resolutions(snapshot.ts_ms, result, gateway_available=counters is not None)
         interval = getattr(getattr(cfg, "safescale"), "probe_poll_seconds")
@@ -259,6 +274,58 @@ def _resolve_probes_with_gone_pods(
                 sort_keys=True,
             )
         )
+
+
+def rollback_probes_for_observe(queue, safescale, *, now_ms: int, events: list[str]) -> list[Action]:
+    """Observe mode (user decision 2026-09-28): every ``probing`` probe is rolled
+    back. Its queued one-shot actions (if any) are dropped and the single action
+    allowed in observe is submitted: the unhide of its probe pods (undoing the
+    controller's own hide), which the queue runs in observe too. The probe is
+    marked ``committing`` (rollback ``observe_entered``) and resolved by the
+    queue once the unhide finished - durable across a restart like any other
+    resolution. Level-triggered: runs on every observe tick, so a probe started
+    in the race window around the switch (or restored at a restart in observe)
+    is rolled back as well. A probe whose action is running is left for the
+    next tick."""
+    probes = getattr(safescale, "active_probes", None)
+    if not callable(probes):
+        return []
+    cancel = getattr(queue, "cancel_request", None)
+    mark = getattr(safescale, "mark_committing", None)
+    durable = callable(mark) and callable(getattr(queue, "has_request", None))
+    submitted: list[Action] = []
+    for probe in probes():
+        if callable(cancel) and not cancel(probe.request_id):
+            events.append(f"safescale_observe_rollback_deferred:{probe.model}:{probe.request_id}")
+            continue
+        unhide = UnhideAction(
+            probe.model, tuple(probe.pods), "observe_entered", "safescale", request_id=probe.request_id
+        )
+        try:
+            result = queue.submit((unhide,))
+        except Exception as exc:  # noqa: BLE001 - retried next tick
+            events.append(f"safescale_observe_rollback_enqueue_failed:{probe.model}:{type(exc).__name__}")
+            continue
+        if int(getattr(result, "accepted", 0)) != 1:
+            events.append(f"safescale_observe_rollback_deferred:{probe.model}:{probe.request_id}")
+            continue
+        if durable:
+            marked = mark(probe.model, status="rollback", reason="observe_entered", now_ms=now_ms)
+        else:
+            marked = safescale.resolve(probe.model, status="rollback", reason="observe_entered", now_ms=now_ms)
+        if not marked:
+            events.append(f"safescale_resolve_missing:{probe.model}")
+            continue
+        submitted.append(unhide)
+        events.append(f"safescale_observe_rollback:{probe.model}:{probe.request_id}")
+        LOG.warning(
+            json.dumps(
+                {"event": "safescale_observe_rollback", "model": probe.model, "request_id": probe.request_id,
+                 "pods": list(probe.pods), "resolution": "rollback", "reason": "observe_entered"},
+                sort_keys=True,
+            )
+        )
+    return submitted
 
 
 def _recover_committing(queue, safescale, *, now_ms: int, events: list[str]) -> list[Action]:

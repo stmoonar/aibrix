@@ -192,7 +192,7 @@ def test_one_shot_permanent_failure_is_not_retried_and_retries_are_bounded() -> 
     asyncio.run(scenario())
 
 
-def test_one_shot_retry_is_revalidated_and_held_in_observe() -> None:
+def test_one_shot_retry_is_revalidated_and_not_sent_in_observe() -> None:
     async def scenario():
         async def fake_sleep(_seconds):
             return None
@@ -222,12 +222,12 @@ def test_one_shot_retry_is_revalidated_and_held_in_observe() -> None:
         client = GatedPowerClient(results={"m-1": [{"ok": False, "error": "HTTP 409", "retriable": True}]})
         queue = ActionQueue(client, sleep=pause_then_sleep, is_observe=lambda: observe["on"])
         queue.submit((_commit(),))
-        await queue.drain_once()
-        [held] = queue.pending_actions()  # held for later, not dropped
-        assert held.failures == 1 and queue.inflight_models() == {"m"}
-        observe["on"] = False
         [result] = await queue.drain_once()
-        assert result.ok and result.attempts == 2
+        # Observe entered during the backoff (2026-09-28: record only): the
+        # retry of the sleep is not sent, nothing is held for later.
+        assert result.error == "observe_skipped"
+        assert [e for e in client.events if e[0] == "start"] == [("start", "m-1", False)]
+        assert queue.pending_actions() == () and queue.inflight_models() == set()
 
     asyncio.run(scenario())
 

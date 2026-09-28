@@ -117,6 +117,8 @@ class QueuedAction:
 @dataclass(frozen=True)
 class SubmitResult:
     accepted: int
+    #: One-shot (SafeScale) actions accepted while in observe mode: they run
+    #: only in their observe-safe form (the unhide of the probe pods).
     held: int = 0
     dropped: tuple[tuple[str, str], ...] = ()
     replaced: tuple[tuple[str, SourceLoop], ...] = ()
@@ -161,6 +163,11 @@ class ActionQueue:
     requests (named bindings, absolute targets - review 3 P2-1). A rescue action
     for a model whose one-shot commit waits out a backoff preempts that retry
     (review 3 P2-3). Re-plannable actions are dropped on failure.
+
+    Observe mode (user decision 2026-09-28, record only): re-plannable actions
+    are dropped; a SafeScale one-shot action runs only as the unhide of its
+    probe pods; the mode is re-read (uncached) right before every
+    capacity-changing step, so a transfer / commit already running stops there.
     """
 
     def __init__(
@@ -178,6 +185,7 @@ class ActionQueue:
         fresh_view: Callable[[], object] | None = None,
         on_oneshot_done: Callable[[str, str, str], None] | None = None,
         commit_max_age_ms: float | None = None,
+        is_observe_fresh: Callable[[], bool] | None = None,
     ) -> None:
         self._client = client
         #: B8: a SafeScale commit whose decision (``decided_ms``) is older than this
@@ -187,9 +195,14 @@ class ActionQueue:
         )
         self._pending: deque[QueuedAction] = deque()
         self._inflight: set[str] = set()
-        # When this returns True the controller is paused: queued actions are drained
-        # (inflight cleared, so the next tick can re-plan) but NEVER dispatched.
+        # When this returns True the controller is in observe mode (record only):
+        # re-plannable actions are drained (inflight cleared, so the next tick can
+        # re-plan) but NEVER dispatched; SafeScale one-shot actions only run in
+        # their observe-safe form (the unhide of the probe pods, see _execute).
         self._is_observe = is_observe or (lambda: False)
+        #: Uncached mode read, right before every capacity-changing step (a hide,
+        #: a transfer's donor / receiver, a commit's donor / each receiver).
+        self._is_observe_fresh = is_observe_fresh or self._is_observe
         self._prof = prof
         # Review F4: model -> (epoch ms the last successful dispatch completed, "up"/"down").
         self._now_ms = now_ms or (lambda: int(time.time() * 1000))
@@ -225,6 +238,11 @@ class ActionQueue:
             "unconfirmed_kept_hidden_total": 0,
             "commit_evidence_stale_total": 0,
             "oneshot_cancelled_total": 0,
+            # Observe mode (2026-09-28): hides not sent, transfers / commits
+            # stopped between steps, commits turned into their donor unhide.
+            "observe_hide_skipped_total": 0,
+            "observe_transfer_stopped_total": 0,
+            "observe_commit_stopped_total": 0,
         }
 
     # ------------------------------------------------------------------ submit
@@ -317,7 +335,7 @@ class ActionQueue:
         return any(_request_id(item.action) == request_id for item in items)
 
     def cancel_request(self, request_id: str) -> bool:
-        """Drop the QUEUED (not yet started, e.g. held in observe mode) one-shot
+        """Drop the QUEUED (not yet started, e.g. blocked behind a running action) one-shot
         actions of SafeScale probe ``request_id`` without dispatching them - B8:
         the probe was resolved without an SM call (its pods are gone). Returns
         False when one of its actions is already running (or backing off): that
@@ -405,23 +423,14 @@ class ActionQueue:
         busy: set[str] = set()
         for queued in self._running.values():
             busy |= queued.resources
-        if self._is_observe():
-            # Safescale resolution commands are one-shot (they are never re-emitted by
-            # the SafeScaleStateMachine, which deletes the probe on resolve). If we are
-            # paused in observe mode we must NOT drop them like idempotent planner
-            # actions -- hold them in _pending (keeping the model inflight so no
-            # conflicting action is queued) so they dispatch for real once mode
-            # returns to non-observe.
-            retained: deque[QueuedAction] = deque()
-            for queued in self._pending:
-                if queued.source_loop in ONE_SHOT_LOOPS or _conflicts(queued.resources, busy):
-                    retained.append(queued)
-                    continue
-                results.extend(_observe_skipped(queued))
-            self._pending = retained
-            self._release_idle_models()
-            return
-        retained = deque()
+        # Observe mode (user decision 2026-09-28: record only): re-plannable
+        # actions are dropped. SafeScale one-shot actions are never re-emitted (the
+        # state machine deletes a probe on resolve), so they are neither dropped
+        # nor held: they are dispatched and _execute runs only their observe-safe
+        # form - the unhide of the probe pods (the controller undoing its own
+        # half-action); a commit's donor sleep / receiver wakes are dropped.
+        observe = self._is_observe()
+        retained: deque[QueuedAction] = deque()
         for queued in self._pending:
             if _conflicts(queued.resources, busy):
                 # Blocked behind a running or an earlier queued action on a shared
@@ -429,10 +438,15 @@ class ActionQueue:
                 busy |= queued.resources
                 retained.append(queued)
                 continue
+            if observe and not _runs_in_observe(queued):
+                results.extend(_observe_skipped(queued))
+                continue
             busy |= queued.resources
             task = asyncio.ensure_future(self._run_item(queued, results))
             self._running[task] = queued
         self._pending = retained
+        if observe:
+            self._release_idle_models()
 
     async def _run_item(self, queued: QueuedAction, results: list[DispatchResult]) -> None:
         task = asyncio.current_task()
@@ -474,12 +488,9 @@ class ActionQueue:
     ) -> tuple[str, str] | None:
         """Run one queued action to its end. Returns how a one-shot action
         finished - ("commit" | "rollback", reason) - or None when it is not
-        finished (held in observe mode, controller shutting down)."""
-        if self._is_observe():
-            if queued.source_loop in ONE_SHOT_LOOPS:
-                self._pending.appendleft(queued)  # held until non-observe
-            else:
-                results.extend(_observe_skipped(queued))
+        finished (dropped in observe mode, controller shutting down)."""
+        if not _runs_in_observe(queued) and self._is_observe_fresh():
+            results.extend(_observe_skipped(queued))
             return None
         if isinstance(queued.action, TransferAction):
             results.extend(await self._execute_transfer(queued.action))
@@ -493,6 +504,15 @@ class ActionQueue:
                 self._set_running(queued)
         while True:
             if isinstance(queued.action, SafeScaleCommitAction):
+                # Before every (re)try, i.e. right before the donor sleep: in
+                # observe the commit becomes the unhide of its donor pods.
+                if self._is_observe_fresh():
+                    converted, finished = self._observe_commit(queued, results)
+                    if finished is not None:
+                        return finished
+                    queued = converted
+                    self._set_running(queued)
+                    continue
                 revalidated, finished = self._revalidated_commit(queued, results)
                 if revalidated is None:
                     return finished
@@ -543,11 +563,13 @@ class ActionQueue:
             queued = await self._wait_backoff(queued, backoff, results)
             if self._closed:
                 return None
-            if self._is_observe():
-                self._pending.appendleft(queued)  # paused while backing off: hold it
-                return None
             if isinstance(queued.action, SafeScaleCommitAction):
-                continue  # revalidated at the top of the loop
+                # Revalidated at the top of the loop (observe: its donor unhide).
+                continue
+            if not _runs_in_observe(queued) and self._is_observe_fresh():
+                # Observe entered while backing off: no retry (record only).
+                results.extend(_observe_skipped(queued))
+                return None
             reason = self._still_wanted(queued.action)
             if reason is not None:
                 self._stats["oneshot_not_wanted_total"] += 1
@@ -618,6 +640,35 @@ class ActionQueue:
         unhide = self._donor_unhide(action, reason, filter_by_view=True, only_view_hidden=True)
         if unhide is None:
             return None, ("rollback", f"{detail}; no donor pod to unhide")
+        return self._queued(unhide), None
+
+    def _observe_commit(
+        self, queued: QueuedAction, results: list[DispatchResult]
+    ) -> tuple[QueuedAction | None, tuple[str, str] | None]:
+        """Observe mode (2026-09-28): a SafeScale commit is not carried out. The
+        donor not slept yet: its hidden probe pods get their routing back (the
+        only action allowed in observe; never an unconfirmed pod, never one a
+        fresh view shows asleep) and the probe resolves as a rollback
+        ``observe_entered``. The donor already slept: the pending receiver wakes
+        are dropped (recorded) and the probe resolves as the commit it was.
+        Returns (the unhide to run, None) or (None, how the commit finished)."""
+        action: SafeScaleCommitAction = queued.action
+        self._stats["observe_commit_stopped_total"] += 1
+        LOG.warning(
+            json.dumps(
+                {"event": "observe_entered_commit_stopped", "donor": action.donor,
+                 "request_id": action.request_id, "pods": list(action.pods),
+                 "donor_done": action.donor_done,
+                 "receivers_not_woken": [item.model for item in action.upscales]},
+                sort_keys=True,
+            )
+        )
+        results.extend(self._receivers_dropped(action, "observe_entered: receiver wake not issued"))
+        if action.donor_done or not action.pods:
+            return None, ("commit", f"{action.reason}; observe_entered: follow-up upscales not issued")
+        unhide = self._donor_unhide(action, "observe_entered", filter_by_view=True)
+        if unhide is None:
+            return None, ("rollback", "observe_entered; no donor pod to unhide")
         return self._queued(unhide), None
 
     def _donor_unhide(
@@ -715,7 +766,7 @@ class ActionQueue:
             self._set_running(queued)
         remaining: list[ReceiverTarget] = []
         failure: DispatchResult | None = None
-        for upscale in action.upscales:
+        for index, upscale in enumerate(action.upscales):
             if upscale.target is None:
                 upscale, resolve_failure = await self._resolve_target(upscale)
                 if resolve_failure is not None:
@@ -725,6 +776,27 @@ class ActionQueue:
                     else:
                         results.append(replace(resolve_failure, attempts=attempts))
                     continue
+            if self._is_observe_fresh():
+                # Observe entered mid-commit (2026-09-28): the donor slept, the
+                # receivers left are NOT woken - recorded, the probe resolves.
+                stopped = replace(
+                    action,
+                    upscales=tuple(remaining) + (upscale,) + tuple(action.upscales[index + 1:]),
+                    reason=f"{action.reason}; observe_entered: follow-up upscales not issued",
+                )
+                results.extend(self._receivers_dropped(stopped, "observe_entered: receiver wake not issued"))
+                self._stats["observe_commit_stopped_total"] += 1
+                LOG.warning(
+                    json.dumps(
+                        {"event": "observe_entered_mid_commit", "donor": action.donor,
+                         "request_id": action.request_id, "donor_slept": list(action.pods),
+                         "receivers_not_woken": [item.model for item in stopped.upscales]},
+                        sort_keys=True,
+                    )
+                )
+                queued = self._commit_queued(replace(stopped, upscales=()), failures=queued.failures)
+                self._set_running(queued)
+                return None, queued
             result = await self._timed_dispatch(upscale, upscale.model)
             if result.ok:
                 self._record_done(upscale.model, upscale, result)
@@ -968,6 +1040,26 @@ class ActionQueue:
                 donor_result,
                 DispatchResult(model=receiver.model, action_kind="scale", ok=False, error=reason),
             ]
+        if self._is_observe_fresh():
+            # Observe entered while the donor slept (2026-09-28): the donor sleep
+            # is done and stays done; the receiver is NOT woken - recorded.
+            self._stats["observe_transfer_stopped_total"] += 1
+            LOG.warning(
+                json.dumps(
+                    {"event": "observe_entered_mid_transfer", "donor": donor.model,
+                     "donor_pods": list(donor.pods), "donor_delta": donor.delta,
+                     "receiver": receiver.model, "receiver_delta": receiver.delta,
+                     "reason": getattr(receiver, "reason", None)},
+                    sort_keys=True,
+                )
+            )
+            return [
+                donor_result,
+                DispatchResult(
+                    model=receiver.model, action_kind="scale", ok=False,
+                    error="observe_entered: receiver wake not issued (donor already slept)",
+                ),
+            ]
         receiver_result = await self._timed_dispatch(receiver, receiver.model)
         self._record_done(receiver.model, receiver, receiver_result)
         return [donor_result, receiver_result]
@@ -1028,6 +1120,19 @@ class ActionQueue:
             )
             return _dispatch_result(model=action.model, action_kind="scale", response=response)
         if isinstance(action, HideAction):
+            if self._is_observe_fresh():
+                # B8 gap: a SafeScale probe start's hide queued just before the
+                # switch to observe is never sent (re-checked right before the SM
+                # call); the SafeScale loop rolls the probe back.
+                self._stats["observe_hide_skipped_total"] += 1
+                LOG.warning(
+                    json.dumps(
+                        {"event": "observe_hide_skipped_at_dispatch", "model": action.model,
+                         "pods": list(action.pods), "reason": action.reason},
+                        sort_keys=True,
+                    )
+                )
+                return DispatchResult(model=action.model, action_kind="hide", ok=True, error="observe_skipped")
             response = await self._client.set_routable(action.model, action.pods)
             return _dispatch_result(model=action.model, action_kind="hide", response=response)
         if isinstance(action, UnhideAction):
@@ -1136,6 +1241,16 @@ def _conflicts(resources: frozenset[str] | set[str], busy: set[str]) -> bool:
     if CLUSTER_RESOURCE in resources or CLUSTER_RESOURCE in busy:
         return True
     return bool(resources & busy)
+
+
+def _runs_in_observe(queued: QueuedAction) -> bool:
+    """Observe mode runs only SafeScale one-shot actions, in their observe-safe
+    form: an unhide (the controller undoing its own hide) or a commit (turned
+    into the unhide of its donor pods by _observe_commit). Everything else is
+    dropped."""
+    return queued.source_loop in ONE_SHOT_LOOPS and isinstance(
+        queued.action, (UnhideAction, SafeScaleCommitAction)
+    )
 
 
 def _retry_safe(action) -> bool:

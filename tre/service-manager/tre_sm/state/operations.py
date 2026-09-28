@@ -116,6 +116,20 @@ _CURRENT_OPERATION: ContextVar["OperationHandle | None"] = ContextVar(
 )
 
 
+#: Who called the SM HTTP API (X-TRE-Actor header, else User-Agent + remote
+#: address), set per request by the API middleware (2026-09-28). Recorded as
+#: ``request.actor`` of every operation the call starts.
+_CURRENT_ACTOR: ContextVar[str | None] = ContextVar("tre_sm_current_actor", default=None)
+
+
+def set_current_actor(actor: str | None):
+    return _CURRENT_ACTOR.set(actor)
+
+
+def reset_current_actor(token) -> None:
+    _CURRENT_ACTOR.reset(token)
+
+
 def current_fence() -> WriterFence | None:
     return _CURRENT_FENCE.get()
 
@@ -321,6 +335,9 @@ class OperationCoordinator:
         it (phases hold it briefly), then raise OperationBusy. Waiters are served
         first-come first-served (a ticket in the Redis waiter queue); a caller
         that does not wait never jumps a queued waiter."""
+        actor = _CURRENT_ACTOR.get()
+        if actor and "actor" not in (request or {}):
+            request = {**(request or {}), "actor": actor}
         wait_s = max(0.0, float(wait_s))
         deadline = time.monotonic() + wait_s
         ticket = uuid4().hex if wait_s > 0 else ""

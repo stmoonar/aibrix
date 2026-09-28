@@ -16,6 +16,7 @@ class FakeRedis:
         }
         self.gpu = {"tre:gpu_truth:node-a": b'{"node":"node-a","gpus":[{"uuid":"G0","used_mib":37000,"total_mib":40960}]}'}
         self.kv: dict[str, str] = {}
+        self.executed: list[tuple] = []
         self.stream = [(
             "1-0",
             {b"window_id": b"2000", b"model": b"m1", b"z_m": b"0.6", b"queue_len": b"4",
@@ -55,6 +56,9 @@ class FakeRedis:
         self.kv.setdefault(key, []).append(value)
         return len(self.kv[key])
 
+    def pipeline(self, transaction=True):
+        return FakePipeline(self, transaction)
+
     def xrevrange(self, key, max="+", min="-", count=None):
         return list(reversed(self.stream))[:count] if count else list(reversed(self.stream))
 
@@ -62,6 +66,23 @@ class FakeRedis:
         start = str(min).lstrip("(")
         out = [e for e in self.stream if e[0] > start]
         return out[:count] if count else out
+
+
+class FakePipeline:
+    """MULTI/EXEC: commands are buffered and applied together on execute()."""
+
+    def __init__(self, redis, transaction) -> None:
+        self.redis = redis
+        self.transaction = transaction
+        self.commands: list[tuple] = []
+
+    def set(self, key, value):
+        self.commands.append(("set", key, value))
+        return self
+
+    def execute(self):
+        self.redis.executed.append((self.transaction, list(self.commands)))
+        return [self.redis.set(key, value) for _op, key, value in self.commands]
 
 
 class FakeServiceManagerClient:
@@ -199,10 +220,26 @@ def test_ui_meta_exposes_registry_params() -> None:
 
 def test_ui_controller_mode_toggle() -> None:
     client, _ = _client()
-    assert client.get("/api/ops/controller/mode").json()["mode"] == "active"
+    # 2026-09-28: absent = observe (fail-closed), for the controller and the SM
+    assert client.get("/api/ops/controller/mode").json() == {
+        "mode": "observe", "sm_actuation": "observe", "raw": {"controller": None, "sm_actuation": None},
+    }
+    assert client.post("/api/ops/controller/mode", json={"mode": "active"}).json()["mode"] == "active"
+    body = client.get("/api/ops/controller/mode").json()
+    assert (body["mode"], body["sm_actuation"]) == ("active", "active")
     assert client.post("/api/ops/controller/mode", json={"mode": "observe"}).json()["mode"] == "observe"
     assert client.get("/api/ops/controller/mode").json()["mode"] == "observe"
     assert client.post("/api/ops/controller/mode", json={"mode": "bogus"}).status_code == 400
+
+
+def test_ui_mode_switch_sets_controller_and_sm_actuation_in_one_transaction() -> None:
+    redis = FakeRedis()
+    client = TestClient(create_ui_app(_registry(), redis, FakeServiceManagerClient(), None))
+    assert client.post("/api/ops/controller/mode", json={"mode": "active"}).status_code == 200
+    assert redis.executed == [
+        (True, [("set", "tre:v2:controller:mode", "active"), ("set", "tre:v2:sm:actuation", "active")])
+    ]
+    assert redis.kv["tre:v2:controller:mode"] == redis.kv["tre:v2:sm:actuation"] == "active"
 
 
 def test_ui_serves_local_single_page_app_without_runtime_cdn() -> None:
