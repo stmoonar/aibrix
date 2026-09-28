@@ -74,6 +74,7 @@ from typing import Callable, Mapping
 
 from tre_common import rediskeys
 from tre_common.registry import SleepPolicy
+from tre_common.vllm_metrics import vllm_candidates
 from tre_sm.allocator.slots import Binding
 from tre_sm.state.operations import current_operation
 from tre_sm.state.reconcile import POD_STATE_AWAKE, POD_STATE_HIDDEN, POD_STATE_SLEEPING
@@ -102,8 +103,11 @@ STATUS_RESERVATION_LOST = "reservation_lost"
 #: "not given" marker of :meth:`SleepPrimitive._load`'s ``engine_load``.
 _UNSET = object()
 
-_RUNNING_METRIC = "vllm:num_requests_running"
-_WAITING_METRIC = "vllm:num_requests_waiting"
+#: Engine load = running + waiting. Neither family was renamed in vLLM 0.30; the names
+#: come from tre_common.vllm_metrics like every other vLLM read. Only the first candidate
+#: of each is summed (an engine exporting an old and a new name would double count).
+_RUNNING_METRIC = vllm_candidates("num_requests_running")[0]
+_WAITING_METRIC = vllm_candidates("num_requests_waiting")[0]
 _SAMPLE = re.compile(
     r"^(?P<name>[A-Za-z_:][A-Za-z0-9_:]*)(?:\{(?P<labels>[^}]*)\})?\s+(?P<value>\S+)"
 )

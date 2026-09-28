@@ -33,9 +33,11 @@ def test_apa_podautoscaler_crs_match_seam_and_registry() -> None:
         # scaleTargetRef.name is sent verbatim to service-manager as the model name.
         assert spec["scaleTargetRef"]["name"] == model
         assert spec["scaleTargetRef"]["kind"] == "Deployment"
-        # KVCache baseline metric.
+        # KVCache baseline metric, under the name vLLM 0.30 still exports: the old
+        # gpu_cache_usage_perc is gone there, and the APA fetcher reads a missing metric
+        # as 0 (never scales). test_vllm_metrics checks the name against both samples.
         src = spec["metricsSources"][0]
-        assert src["targetMetric"] == "gpu_cache_usage_perc"
+        assert src["targetMetric"] == "kv_cache_usage_perc"
         assert src["metricSourceType"] == "pod"
         # min mirrors the registry; max mirrors the registry SCALING cap
         # (max_awake_replicas, v1/paper alignment A1: 4 for TRE and APA alike), not the
@@ -58,7 +60,7 @@ def test_apa_scale_anchor_deployments_publish_model_selector() -> None:
         # Matching on the model name alone -- which is what this test used to
         # check, and what the comment here used to claim was correct -- sweeps in
         # every sleeping pod of the model. The APA autoscaler then reads a
-        # gpu_cache_usage_perc averaged over pods that serve nothing, which sits
+        # KV-cache usage averaged over pods that serve nothing, which sits
         # near zero and can never cross the scale-up target. Scaling up was
         # arithmetically impossible, so every APA arm before the 2026-07-12 fix
         # was really a static baseline, and those numbers are void.

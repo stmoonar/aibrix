@@ -7,8 +7,12 @@ from typing import Any
 from tre_common.metrics_schema import MetricsSnapshot, ModelWindowMetrics, PodWindowMetrics
 from tre_common.percentile import histogram_percentile
 from tre_common.rediskeys import hist_key, inst_key, pods_key
+from tre_common.vllm_metrics import doc_lookup
 from tre_common.window_pods import aggregate_pods
 
+# Gateway doc identifiers (what the gateway writes today). Every read resolves them through
+# tre_common.vllm_metrics.GATEWAY_DOC_KEYS, so the vLLM 0.30 identifiers
+# (inter_token_latency_seconds, kv_cache_usage_perc) are accepted as well, newest first.
 HISTOGRAM_METRICS = {
     "prompt_tokens": "request_prompt_tokens",
     "generation_tokens": "request_generation_tokens",
@@ -176,7 +180,7 @@ class MetricsStore:
                 ("running", INSTANT_METRICS["running"]),
                 ("swapping", INSTANT_METRICS["swapping"]),
             ):
-                totals[out_key] += _number(metrics.get(f"{model}/{metric}"), 0.0)
+                totals[out_key] += _number(doc_lookup(metrics, model, metric), 0.0)
         return totals
 
     def _read_zset_docs(
@@ -415,12 +419,11 @@ class MetricsStore:
         window_start_ms: int,
         window_end_ms: int,
     ) -> float:
-        metric_key = f"{model}/{metric}"
         total = 0.0
         for doc in docs:
             metrics = doc.get("model_metrics")
             if isinstance(metrics, dict):
-                total += _number(metrics.get(metric_key), 0.0)
+                total += _number(doc_lookup(metrics, model, metric), 0.0)
         expected_samples = max(1, int((window_end_ms - window_start_ms) / self._instant_sample_interval_ms))
         return total / expected_samples
 
@@ -438,11 +441,14 @@ class MetricsStore:
         expected-samples divisor the calibration contract fixes) the divisor is the real
         sample count, so a pod that woke mid-window is not read low. window_start_ms /
         window_end_ms are unused and kept for the call-site symmetry."""
-        metric_key = f"{model}/{metric}"
         values = [
-            _number(doc["model_metrics"].get(metric_key), 0.0)
-            for doc in docs
-            if isinstance(doc.get("model_metrics"), dict) and metric_key in doc["model_metrics"]
+            _number(value, 0.0)
+            for value in (
+                doc_lookup(doc["model_metrics"], model, metric)
+                for doc in docs
+                if isinstance(doc.get("model_metrics"), dict)
+            )
+            if value is not None
         ]
         if not values:
             return None
@@ -508,7 +514,7 @@ def _metric_entry(model: str, metric: str, doc: dict[str, Any]) -> dict[str, Any
     metrics = doc.get("model_histogram_metrics")
     if not isinstance(metrics, dict):
         return None
-    entry = metrics.get(f"{model}/{metric}")
+    entry = doc_lookup(metrics, model, metric)
     return entry if isinstance(entry, dict) else None
 
 
