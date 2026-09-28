@@ -71,6 +71,7 @@ from pathlib import Path
 from typing import Callable, Iterable, Optional, Sequence
 
 from tre_common.rediskeys import SCRAPE_INTERVAL_MS
+from tre_common.vllm_metrics import vllm_candidates
 
 #: Sidecar cadence for the campaign. One sample per second; see the module docstring.
 DEFAULT_SIDECAR_INTERVAL_S = 1.0
@@ -151,17 +152,16 @@ DEFAULT_MAX_IN_FLIGHT = 4096
 #: Mirrors ``tre_controller.store.metrics_store.INSTANT_METRICS`` (which reads the same
 #: gauges out of redis after the gateway has scraped them).
 POD_INSTANT_GAUGES = {
-    "waiting": "vllm:num_requests_waiting",
-    "running": "vllm:num_requests_running",
-    "swapping": "vllm:num_requests_swapped",
+    "waiting": vllm_candidates("num_requests_waiting")[0],
+    "running": vllm_candidates("num_requests_running")[0],
+    "swapping": vllm_candidates("num_requests_swapped")[0],
 }
 
 #: KV-cache fill (0..1) of one pod: vLLM's current name first, then the deprecated one it
-#: replaced (0.10 exports both; an older build only the second). Diagnostic only - the
-#: instant record's ``kv_cache_usage`` (the MEAN over the pods scraped in that tick, not a
-#: sum); no window column, label or signal reads it.
-POD_KV_CACHE_USAGE_GAUGES: tuple[str, ...] = ("vllm:kv_cache_usage_perc",
-                                              "vllm:gpu_cache_usage_perc")
+#: replaced (0.10 exports both; 0.30 only the first) - tre_common.vllm_metrics. Diagnostic
+#: only - the instant record's ``kv_cache_usage`` (the MEAN over the pods scraped in that
+#: tick, not a sum); no window column, label or signal reads it.
+POD_KV_CACHE_USAGE_GAUGES: tuple[str, ...] = vllm_candidates("kv_cache_usage_perc")
 KV_CACHE_USAGE_KEY = "kv_cache_usage"
 
 
