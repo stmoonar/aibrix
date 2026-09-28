@@ -10,7 +10,7 @@ import json
 from dataclasses import replace
 from dataclasses import asdict
 from functools import wraps
-from typing import Protocol
+from typing import Callable, Protocol
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -737,16 +737,21 @@ class ServiceManagerV2:
         sleep_path: str,
         kind: str,
         desired_sleeping: bool = False,
+        before_prepare: Callable[[], None] | None = None,
     ) -> list[dict]:
         """Sleep ``bindings`` with the drain OUTSIDE the writer lock (prepare and
         commit take it briefly), e.g. for startup admission / convergence
         (review 2 P2-4). The desired state is not touched unless
-        ``desired_sleeping``."""
+        ``desired_sleeping``. ``before_prepare`` runs under the prepare
+        writer lock right before anything is hidden or slept; raising aborts
+        the sleep with nothing changed."""
         with self._writer(kind):
             for binding in bindings:
                 self._assert_not_reserved(
                     binding=binding, gpus=False, what=f"{kind} sleep of {binding.serve_id}"
                 )
+            if before_prepare is not None:
+                before_prepare()
             targets = self._sleep_targets_for(bindings)
             batch = self._sleep_primitive.prepare(
                 targets,
@@ -2174,8 +2179,12 @@ class ServiceManagerV2:
         and never reaches this check."""
         if not self.actuation_observe():
             return
-        awake = self._awake_overlapping_residents(pod)
-        if not awake:
+        self._refuse_unrequested_startup_sleep(pod, self._awake_overlapping_residents(pod))
+
+    def _refuse_unrequested_startup_sleep(self, pod: StartupPodRecord, awake: list[Binding]) -> None:
+        """The observe refusal of :meth:`_assert_unrequested_startup_allowed`
+        for residents about to be slept (retriable 409, recorded)."""
+        if not awake or not self.actuation_observe():
             return
         ids = sorted(binding.binding_id for binding in awake)
         self.record_suppressed(
@@ -2213,7 +2222,17 @@ class ServiceManagerV2:
         awake = self._awake_overlapping_residents(pod)
         if not awake:
             return []
-        outcomes = self._split_sleep(awake, sleep_path="startup", kind="startup_admit_sleep")
+        # The observe check is repeated under the prepare writer lock, right
+        # before the residents are hidden: the actuation may have been switched
+        # to observe since the unlocked pre-check in admit_startup (TOCTOU).
+        # Only unrequested admissions get here - an owned (pre-authorized)
+        # admission never sleeps residents through this path.
+        outcomes = self._split_sleep(
+            awake,
+            sleep_path="startup",
+            kind="startup_admit_sleep",
+            before_prepare=lambda: self._refuse_unrequested_startup_sleep(pod, awake),
+        )
         slept_ids = {item.get("binding_id") for item in outcomes if item.get("status") == STATUS_SLEPT}
         return [binding for binding in awake if binding.binding_id in slept_ids]
 
