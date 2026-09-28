@@ -74,6 +74,17 @@ class _RestartBody(BaseModel):
     reason: str = ""
 
 
+def _thresholds_payload(registry: Registry) -> dict[str, Any]:
+    """SM GPU thresholds for display. The cold-start limit is per GPU and model
+    (B9): an absolute override, else total x (1 - util) - margin."""
+    config = registry.service_manager() if callable(getattr(registry, "service_manager", None)) else None
+    return {
+        "create_max_used_mib": getattr(config, "create_max_used_mib", None),
+        "create_margin_mib": getattr(config, "create_margin_mib", None),
+        "sleep_leak_used_mib": 8192,
+    }
+
+
 def create_ui_app(
     registry: Registry,
     redis_client: RedisClient,
@@ -148,7 +159,7 @@ def create_ui_app(
         return {
             "models": [_model_payload(model) for model in registry.models()],
             "topology": _topology_payload(registry),
-            "thresholds": {"create_max_used_mib": 2500, "sleep_leak_used_mib": 8192},
+            "thresholds": _thresholds_payload(registry),
             "sampler_version": sampler.version(),
         }
 

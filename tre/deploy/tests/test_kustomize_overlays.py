@@ -153,7 +153,9 @@ def test_tre_v2_overlay_declares_components_and_independent_redis() -> None:
     assert _env(sm)["TRE_ROUTE_NAMESPACE"] == "tre-v2"
     assert _env(sm)["TRE_GATEWAY_NAME"] == "tre-aibrix-eg"
     assert _env(controller)["TRE_METRICS_REDIS_URL"] == "redis://tre-v2-redis:6379/0"
-    assert _env(sm)["TRE_CREATE_MAX_USED_MIB"] == "2500"
+    # B9: the cold-start limit is derived from the registry; the env var is an
+    # explicit override only and must not be baked into the overlay.
+    assert "TRE_CREATE_MAX_USED_MIB" not in _env(sm)
     assert _env(sm)["TRE_SLEEP_LEAK_USED_MIB"] == "8192"
     assert _env(sm)["TRE_SM_SUPERVISOR_ENABLED"] == "true"
     assert _env(sm)["TRE_SM_SUPERVISOR_INTERVAL_S"] == "5"

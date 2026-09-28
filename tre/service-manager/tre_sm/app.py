@@ -26,7 +26,7 @@ def create_service_app(
     runtime_ops: RuntimePodOps | None = None,
     vllm_ops: VllmRuntimeOps | None = None,
     gpu_truth: GpuTruthProvider | None = None,
-    create_max_used_mib: int = 2500,
+    create_max_used_mib: int | None = None,
     sleep_leak_used_mib: int = 8192,
     require_gpu_truth: bool = True,
     operation_coordinator: OperationCoordinator | None = None,

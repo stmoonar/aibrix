@@ -16,7 +16,13 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from tre_common.registry import SLEEP_PATHS, Registry, ServiceManagerConfig, scale_max_replicas
+from tre_common.registry import (
+    SLEEP_PATHS,
+    Registry,
+    ServiceManagerConfig,
+    gpu_memory_utilization,
+    scale_max_replicas,
+)
 from tre_common.registry import NodeSpec
 from tre_common.gpu_placement import choose_placement
 from tre_sm.allocator.slots import (
@@ -161,7 +167,7 @@ class ServiceManagerV2:
         runtime_ops: RuntimePodOps | None = None,
         vllm_ops: VllmRuntimeOps | None = None,
         gpu_truth: GpuTruthProvider | None = None,
-        create_max_used_mib: int = 2500,
+        create_max_used_mib: int | None = None,
         sleep_leak_used_mib: int = 8192,
         require_gpu_truth: bool = True,
         operation_coordinator: OperationCoordinator | None = None,
@@ -197,6 +203,8 @@ class ServiceManagerV2:
         self._runtime_ops = runtime_ops
         self._vllm_ops = vllm_ops
         self._gpu_truth = gpu_truth
+        # Explicit absolute cold-start limit (env TRE_CREATE_MAX_USED_MIB); None =
+        # service_manager.create.max_used_mib, else derived per GPU and model (B9).
         self._create_max_used_mib = create_max_used_mib
         self._sleep_leak_used_mib = sleep_leak_used_mib
         self._require_gpu_truth = require_gpu_truth
@@ -2888,7 +2896,7 @@ class ServiceManagerV2:
         if self._runtime_ops is None or self._vllm_ops is None:
             raise ValueError("runtime_ops and vllm_ops are required for runtime create")
         self._assert_not_reserved(slot=slot, what=f"cold start of {model}")
-        self._ensure_create_headroom(slot)
+        self._ensure_create_headroom(slot, model)
         planned = Binding("startup", model, slot, awake=False)
         if self._gpu_leases is not None:
             self._gpu_leases.acquire(planned, phase="starting")
@@ -2987,7 +2995,7 @@ class ServiceManagerV2:
 
         self._runtime_ops.wait_pod_deleted(binding.serve_id)
         self._refresh_observed([binding.binding_id])  # its pod is gone (B2)
-        self._ensure_create_headroom(migration.to_slot)
+        self._ensure_create_headroom(migration.to_slot, binding.model)
         planned = Binding(
             "defrag-startup", binding.model, migration.to_slot, awake=False
         )
@@ -3049,7 +3057,7 @@ class ServiceManagerV2:
             raise WakeConflict(str(exc)) from exc
         return allocator.feasible_wake(binding.serve_id)
 
-    def _ensure_create_headroom(self, slot: Slot) -> None:
+    def _ensure_create_headroom(self, slot: Slot, model: str) -> None:
         # Fail closed: a cold start writes model weights onto a GPU we believe
         # is free. When the gpu-truth DaemonSet is down its Redis key expires,
         # and absent truth used to silently skip this gate -- the one guard
@@ -3059,20 +3067,50 @@ class ServiceManagerV2:
         # The gate waits for a fresh gpu-truth sample (_gpu_truth_gate): a
         # defrag / scale path deletes a pod right before it and the periodic
         # sample would still show that pod's memory.
+        # The limit (B9): vLLM starts only with gpu_memory_utilization x total free,
+        # so used may reach total x (1 - util of ``model``) - margin; an absolute
+        # override (env TRE_CREATE_MAX_USED_MIB > service_manager.create.max_used_mib)
+        # replaces it.
         if self._gpu_truth is None:
             return
+        util = self._create_gpu_memory_utilization(model)
         nodes = {node.name: node for node in self._registry.topology().nodes}
         node = nodes.get(slot.node)
         problem = self._gpu_truth_gate(
             slot.node,
-            lambda node_truth: self._create_headroom_problem(slot, node, node_truth),
+            lambda node_truth: self._create_headroom_problem(slot, node, node_truth, util),
             retry_stale=False,
             what=f"cold start on {slot.node}/{','.join(str(g) for g in slot.gpu_ids)}",
         )
         if problem is not None:
             raise ValueError(problem)
 
-    def _create_headroom_problem(self, slot: Slot, node, node_truth) -> str | None:
+    def _create_gpu_memory_utilization(self, model: str) -> float | None:
+        """The ``--gpu-memory-utilization`` of ``model`` (None = an absolute limit is
+        configured, the utilization is not needed)."""
+        if self._create_max_used_mib is not None or self._sm_config.create_max_used_mib is not None:
+            return None
+        try:
+            return gpu_memory_utilization(self._registry.model(model))
+        except (KeyError, ValueError) as exc:
+            raise ValueError(
+                f"cold start of {model}: cannot derive the startup headroom limit: {exc}"
+            ) from exc
+
+    def _create_limit_mib(self, total_mib: int | None, util: float | None) -> tuple[int | None, str]:
+        """(limit, source) of the cold-start gate: env > registry absolute > derived."""
+        if self._create_max_used_mib is not None:
+            return int(self._create_max_used_mib), "TRE_CREATE_MAX_USED_MIB"
+        config = self._sm_config
+        if config.create_max_used_mib is not None:
+            return int(config.create_max_used_mib), "service_manager.create.max_used_mib"
+        limit = config.create_limit_mib(total_mib, float(util))
+        return limit, (
+            f"total_mib={total_mib} x (1 - gpu_memory_utilization {float(util):g}) "
+            f"- margin {config.create_margin_mib}"
+        )
+
+    def _create_headroom_problem(self, slot: Slot, node, node_truth, util: float | None) -> str | None:
         if node_truth is None:
             if not self._require_gpu_truth:
                 return None
@@ -3092,10 +3130,22 @@ class ServiceManagerV2:
                     f"gpu truth unavailable for {slot.node}/{gpu_uuid}: refusing cold start "
                     "(gpu missing from the node truth payload)"
                 )
-            if used_mib > self._create_max_used_mib:
+            total = getattr(node_truth, "total_mib", None)
+            limit, source = self._create_limit_mib(
+                total(gpu_uuid) if callable(total) else None, util
+            )
+            if limit is None:
+                if not self._require_gpu_truth:
+                    continue
+                return (
+                    f"gpu truth for {slot.node}/{gpu_uuid} reports no total memory: refusing "
+                    "cold start (set service_manager.create.max_used_mib to use an absolute "
+                    "threshold)"
+                )
+            if used_mib > limit:
                 return (
                     "insufficient startup headroom: "
-                    f"{slot.node}/{gpu_uuid} used_mib={used_mib} max_used_mib={self._create_max_used_mib}"
+                    f"{slot.node}/{gpu_uuid} used_mib={used_mib} max_used_mib={limit} ({source})"
                 )
         return None
 

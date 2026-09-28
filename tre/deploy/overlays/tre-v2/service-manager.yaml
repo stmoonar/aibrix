@@ -61,8 +61,8 @@ spec:
             # --- D8/D10 GPU-truth governance thresholds (Plan B: SM reads
             # tre:gpu_truth:<node> from the same TRE Redis, written by the
             # gpu-truth DaemonSet). ---
-            - name: TRE_CREATE_MAX_USED_MIB
-              value: "2500"
+            # Cold-start headroom comes from the registry (service_manager.create,
+            # B9); TRE_CREATE_MAX_USED_MIB is an explicit override only - unset.
             - name: TRE_SLEEP_LEAK_USED_MIB
               value: "8192"
             - name: TRE_SM_SUPERVISOR_ENABLED

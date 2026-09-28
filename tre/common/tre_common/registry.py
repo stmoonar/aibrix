@@ -142,6 +142,11 @@ class ModelSpec:
         return scale_max_replicas(self)
 
     @property
+    def gpu_memory_utilization(self) -> float:
+        """The engine's ``--gpu-memory-utilization`` (see :func:`gpu_memory_utilization`)."""
+        return gpu_memory_utilization(self)
+
+    @property
     def vllm_args(self) -> tuple[str, ...]:
         """Every engine argument the registry gives this model beyond the fixed serve
         arguments: ``vllm_extra_args`` + ``--max-model-len`` + ``--sleep-mode-backend``."""
@@ -158,6 +163,39 @@ def scale_max_replicas(spec: Any) -> int:
     size ``max_replicas`` (duck-typed so lightweight test specs without the field work)."""
     cap = getattr(spec, "max_awake_replicas", None)
     return int(spec.max_replicas) if cap is None else int(cap)
+
+
+#: vLLM's own ``--gpu-memory-utilization`` default (a model whose vllm_extra_args
+#: do not set the flag starts with it).
+VLLM_DEFAULT_GPU_MEMORY_UTILIZATION = 0.9
+_GPU_MEMORY_UTILIZATION_FLAG = "--gpu-memory-utilization"
+
+
+def gpu_memory_utilization(spec: Any) -> float:
+    """The ``--gpu-memory-utilization`` a model's engine starts with: the value in its
+    ``vllm_extra_args`` (``--gpu-memory-utilization X`` or ``--gpu-memory-utilization=X``;
+    the last one wins, as in vLLM's argparse), else vLLM's default 0.9. Duck-typed
+    (a spec without ``vllm_extra_args`` gets the default). A malformed value raises
+    ValueError; the registry validation reports it."""
+    flag = _GPU_MEMORY_UTILIZATION_FLAG
+    args = tuple(getattr(spec, "vllm_extra_args", ()) or ())
+    value: str | None = None
+    for index, arg in enumerate(args):
+        if arg == flag:
+            if index + 1 >= len(args):
+                raise ValueError(f"{flag} has no value")
+            value = str(args[index + 1])
+        elif str(arg).startswith(flag + "="):
+            value = str(arg)[len(flag) + 1:]
+    if value is None:
+        return VLLM_DEFAULT_GPU_MEMORY_UTILIZATION
+    try:
+        util = float(value)
+    except ValueError:
+        raise ValueError(f"{flag} {value!r} is not a number") from None
+    if not (math.isfinite(util) and 0.0 < util <= 1.0):
+        raise ValueError(f"{flag} {value!r} must be in (0, 1]")
+    return util
 
 
 #: Sleep paths (plan 2026-09-27 D1): every caller that puts a binding to sleep names
@@ -391,6 +429,17 @@ class ServiceManagerConfig:
     #: ``tre:gpu_truth_refresh:<node>``); with an agent that does not answer
     #: refreshes it re-reads the periodic sample for up to this long instead.
     wake_truth_wait_s: float = 10.0
+    #: Cold start (create) headroom (B9). vLLM refuses to start an engine unless the
+    #: GPU's free memory is at least gpu_memory_utilization x total, so a create is
+    #: allowed while every target GPU's used memory (gpu-truth) is at most
+    #: total x (1 - gpu_memory_utilization of the model being created) - this margin
+    #: (the new process' own CUDA context and allocator slack). Sleeping neighbours
+    #: of a full layout fit under it; an awake one does not.
+    create_margin_mib: int = 512
+    #: Optional absolute override (MiB) of the create limit; None = derived per GPU
+    #: and model. The TRE_CREATE_MAX_USED_MIB env var (set only on purpose)
+    #: overrides both: env > create.max_used_mib > derived.
+    create_max_used_mib: int | None = None
     #: Startup check of the local clock against Redis TIME.
     clock_skew_warn_s: float = 1.0
     #: Refuse to start above this skew (None = warn only).
@@ -476,6 +525,18 @@ class ServiceManagerConfig:
         if total_mib is None or total_mib <= 0:
             return None
         return int(total_mib * self.wake_max_used_fraction)
+
+    def create_limit_mib(self, total_mib: int | None, gpu_memory_utilization: float) -> int | None:
+        """Max used MiB for a cold start of a model with ``gpu_memory_utilization`` on
+        a GPU of ``total_mib`` (None = unknown total and no absolute override)."""
+        if self.create_max_used_mib is not None:
+            return int(self.create_max_used_mib)
+        if total_mib is None or total_mib <= 0:
+            return None
+        # vLLM needs util x total free; floor the rest (the epsilon absorbs float
+        # noise such as 40960 x 0.15 = 6143.999...).
+        startup_free = math.floor(total_mib * (1.0 - gpu_memory_utilization) + 1e-6)
+        return int(startup_free) - int(self.create_margin_mib)
 
 
 class Registry:
@@ -630,6 +691,10 @@ def _validate_model_vllm(model: ModelSpec) -> list[str]:
             )
         if _arg_present(model.vllm_extra_args, "--sleep-mode-backend"):
             errors.append(f"{prefix}: set sleep_mode_backend OR --sleep-mode-backend in vllm_extra_args, not both")
+    try:
+        gpu_memory_utilization(model)
+    except ValueError as exc:
+        errors.append(f"{prefix}: vllm_extra_args {exc}")
     errors.extend(_validate_vllm_env(f"{prefix}: vllm_env", getattr(model, "vllm_env", {})))
     return errors
 
@@ -771,6 +836,7 @@ def parse_service_manager_config(
     raw = raw or {}
     sleep_raw = raw.get("sleep") or {}
     wake_raw = raw.get("wake") or {}
+    create_raw = raw.get("create") or {}
     skew_raw = raw.get("clock_skew") or {}
     pressure_raw = raw.get("node_pressure") or {}
     defaults = SleepPolicy()
@@ -819,11 +885,14 @@ def parse_service_manager_config(
     base = ServiceManagerConfig()
     fail_s = skew_raw.get("fail_s", base.clock_skew_fail_s)
     max_used_mib = wake_raw.get("max_used_mib", base.wake_max_used_mib)
+    create_max_used_mib = create_raw.get("max_used_mib", base.create_max_used_mib)
     return ServiceManagerConfig(
         sleep=sleep,
         wake_max_used_fraction=_num(wake_raw, "max_used_fraction", base.wake_max_used_fraction),
         wake_max_used_mib=None if max_used_mib is None else int(max_used_mib),
         wake_truth_wait_s=_num(wake_raw, "truth_wait_s", base.wake_truth_wait_s),
+        create_margin_mib=int(_num(create_raw, "margin_mib", base.create_margin_mib)),
+        create_max_used_mib=None if create_max_used_mib is None else int(create_max_used_mib),
         clock_skew_warn_s=_num(skew_raw, "warn_s", base.clock_skew_warn_s),
         clock_skew_fail_s=None if fail_s is None else float(fail_s),
         pressure_registry_nodes_only=_parse_bool(
@@ -933,6 +1002,10 @@ def _validate_service_manager(
         errors.append("service_manager.wake.max_used_mib must be positive or null")
     if config.wake_truth_wait_s < 0:
         errors.append("service_manager.wake.truth_wait_s must be >= 0")
+    if config.create_margin_mib < 0:
+        errors.append("service_manager.create.margin_mib must be >= 0")
+    if config.create_max_used_mib is not None and config.create_max_used_mib <= 0:
+        errors.append("service_manager.create.max_used_mib must be positive or null")
     if config.clock_skew_warn_s <= 0:
         errors.append("service_manager.clock_skew.warn_s must be positive")
     if config.clock_skew_fail_s is not None and config.clock_skew_fail_s <= 0:

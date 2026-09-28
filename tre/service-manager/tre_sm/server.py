@@ -156,7 +156,14 @@ def create_app() -> FastAPI:
         runtime_ops=k8s_ops,
         vllm_ops=vllm_ops,
         gpu_truth=RedisGpuTruth(redis_client),
-        create_max_used_mib=int(os.environ.get("TRE_CREATE_MAX_USED_MIB", "2500")),
+        # Explicit override only (B9): unset = service_manager.create in the registry
+        # (absolute max_used_mib, else derived from each model's
+        # --gpu-memory-utilization and the GPU's total memory).
+        create_max_used_mib=(
+            int(os.environ["TRE_CREATE_MAX_USED_MIB"])
+            if os.environ.get("TRE_CREATE_MAX_USED_MIB", "").strip()
+            else None
+        ),
         sleep_leak_used_mib=int(os.environ.get("TRE_SLEEP_LEAK_USED_MIB", "8192")),
         require_gpu_truth=gpu_truth_required_from_env(os.environ),
         operation_coordinator=operation_coordinator,

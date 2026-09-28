@@ -388,6 +388,16 @@ data:
         # the request (an old agent without refresh support: re-read the periodic
         # sample for up to this long). Missing truth still fails closed.
         truth_wait_s: 10
+      create:
+        # A cold start (scale-up create, sparse defrag destination) fails closed unless
+        # gpu-truth shows every target GPU at or below total x (1 - the created
+        # model's --gpu-memory-utilization) - margin_mib: vLLM refuses to start with
+        # less than gpu_memory_utilization x total free. Sleeping neighbours fit, an
+        # awake one does not.
+        margin_mib: 512
+        # Optional absolute override in MiB; null = the derived limit. The env var
+        # TRE_CREATE_MAX_USED_MIB (unset by default) overrides both.
+        max_used_mib: null
       clock_skew:
         # Startup check of the local clock against Redis TIME.
         warn_s: 1.0

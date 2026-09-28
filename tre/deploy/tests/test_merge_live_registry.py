@@ -34,6 +34,8 @@ def test_live_tunables_win_and_release_structure_stays():
     assert out["slo"]["tpot_p95_ms"] == 60.0
     assert out["max_awake_replicas"] == 3
     assert {"vllm", "gateway", "reissue", "service_manager"} <= set(merged)
+    # B9: a live registry without service_manager.create gets the release section.
+    assert merged["service_manager"]["create"] == release["service_manager"]["create"]
     assert any("trs.theta_m" in line for line in report)
     assert mlr._validate(merged) == []
 

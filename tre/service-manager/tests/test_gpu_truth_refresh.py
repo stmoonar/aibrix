@@ -41,8 +41,9 @@ class AgentRedis:
     next periodic sample.
     """
 
-    def __init__(self, clock, *, physical, refresh=True, latency_s=0.3, publish=True):
+    def __init__(self, clock, *, physical, refresh=True, latency_s=0.3, publish=True, total_mib=40960):
         self.values = {}
+        self.total_mib = total_mib
         self.clock = clock
         self.physical = physical
         self.refresh = refresh
@@ -62,11 +63,13 @@ class AgentRedis:
             "node": "node-a",
             "timestamp": self.clock.now,
             "gpus": [
-                {"uuid": "GPU-0", "used_mib": self.physical, "total_mib": 40960},
+                {"uuid": "GPU-0", "used_mib": self.physical},
                 {"uuid": "GPU-1", "used_mib": 500, "total_mib": 40960},
             ],
             "seq": self.seq,
         }
+        if self.total_mib is not None:
+            payload["gpus"][0]["total_mib"] = self.total_mib
         if self.refresh:
             payload["refresh_seq"] = self.served
         self.values[NODE_KEY] = json.dumps(payload).encode()
@@ -260,7 +263,7 @@ def test_cold_start_gate_waits_for_a_fresh_sample_after_a_pod_deletion():
     service, agent, vllm, clock = _service(physical=30_000)
     agent.physical = 100  # the pod on GPU-0 was just deleted
 
-    service._ensure_create_headroom(Slot("node-a", (0,)))
+    service._ensure_create_headroom(Slot("node-a", (0,)), "m1")
 
     assert agent.incr_calls == 1
     assert agent.samples[-1][1] == 100
@@ -271,7 +274,7 @@ def test_cold_start_gate_with_an_old_agent_keeps_the_immediate_decision():
     start = clock.now
 
     with pytest.raises(ValueError, match="insufficient startup headroom"):
-        service._ensure_create_headroom(Slot("node-a", (0,)))
+        service._ensure_create_headroom(Slot("node-a", (0,)), "m1")
     assert clock.now == start  # no wait: the previous behaviour
 
 
@@ -279,4 +282,129 @@ def test_cold_start_gate_fails_closed_without_gpu_truth():
     service, agent, vllm, clock = _service(physical=100, publish=False, latency_s=1e9, wait_s=1.0)
 
     with pytest.raises(ValueError, match="gpu truth unavailable for node node-a"):
-        service._ensure_create_headroom(Slot("node-a", (0,)))
+        service._ensure_create_headroom(Slot("node-a", (0,)), "m1")
+
+
+# ------------------------------------------------- B9: derived cold-start limit
+# vLLM starts an engine only with gpu_memory_utilization x total free, so a
+# cold start may proceed while used <= total x (1 - util) - margin. A full layout
+# (three bindings per GPU, the others asleep) keeps ~4.2 GiB on a GPU.
+
+FULL_LAYOUT_SLEEPING_MIB = 4200
+
+
+def _create_service(*, physical, util=0.85, env_limit=None, total_mib=40960, **config):
+    import dataclasses
+
+    from tre_common.registry import Registry
+
+    clock = TickingClock()
+    agent = AgentRedis(clock, physical=physical, total_mib=total_mib)
+    clock.hooks.append(agent.tick)
+    base = registry(wake_truth_wait_s=10.0, **config)
+    args = ("--max-num-seqs", "256", "--gpu-memory-utilization", str(util))
+    models = [dataclasses.replace(spec, vllm_extra_args=args) for spec in base.models()]
+    reg = Registry(base.topology(), models, service_manager=base.service_manager())
+    service = ServiceManagerV2(
+        reg,
+        StateStore(LegacyRedis()),
+        runtime_ops=FakeRuntime([]),
+        vllm_ops=FakeVllm(),
+        gpu_truth=RedisGpuTruth(agent),
+        create_max_used_mib=env_limit,
+        sleep_clock=clock,
+    )
+    return service
+
+
+def test_derived_create_limit_admits_sleeping_neighbours_of_a_full_layout():
+    service = _create_service(physical=FULL_LAYOUT_SLEEPING_MIB)
+    # 40960 x (1 - 0.85) - 512 = 5632 >= 4200 (the old absolute 2500 refused it)
+    service._ensure_create_headroom(Slot("node-a", (0,)), "m1")
+
+
+def test_derived_create_limit_refuses_what_vllm_would_refuse():
+    service = _create_service(physical=6000)
+    with pytest.raises(ValueError, match=r"used_mib=6000 max_used_mib=5632 .*gpu_memory_utilization 0.85"):
+        service._ensure_create_headroom(Slot("node-a", (0,)), "m1")
+
+
+def test_derived_create_limit_follows_the_created_models_utilization():
+    # util 0.95: 40960 x 0.05 - 512 = 1536 < 4200
+    service = _create_service(physical=FULL_LAYOUT_SLEEPING_MIB, util=0.95)
+    with pytest.raises(ValueError, match="max_used_mib=1536"):
+        service._ensure_create_headroom(Slot("node-a", (0,)), "m1")
+
+
+def test_derived_create_limit_uses_the_registry_margin():
+    service = _create_service(physical=FULL_LAYOUT_SLEEPING_MIB, create_margin_mib=2000)
+    with pytest.raises(ValueError, match="max_used_mib=4144"):
+        service._ensure_create_headroom(Slot("node-a", (0,)), "m1")
+
+
+def test_registry_absolute_create_limit_replaces_the_derived_one():
+    service = _create_service(physical=FULL_LAYOUT_SLEEPING_MIB, create_max_used_mib=4000)
+    with pytest.raises(ValueError, match=r"max_used_mib=4000 \(service_manager.create.max_used_mib\)"):
+        service._ensure_create_headroom(Slot("node-a", (0,)), "m1")
+    _create_service(physical=3900, create_max_used_mib=4000)._ensure_create_headroom(
+        Slot("node-a", (0,)), "m1"
+    )
+
+
+def test_env_create_limit_overrides_the_registry():
+    service = _create_service(
+        physical=FULL_LAYOUT_SLEEPING_MIB, env_limit=2500, create_max_used_mib=8000
+    )
+    with pytest.raises(ValueError, match=r"max_used_mib=2500 \(TRE_CREATE_MAX_USED_MIB\)"):
+        service._ensure_create_headroom(Slot("node-a", (0,)), "m1")
+
+
+def test_derived_create_limit_fails_closed_without_the_gpu_total():
+    service = _create_service(physical=100, total_mib=None)
+    with pytest.raises(ValueError, match="reports no total memory: refusing cold start"):
+        service._ensure_create_headroom(Slot("node-a", (0,)), "m1")
+    # an absolute limit does not need the total
+    _create_service(physical=100, total_mib=None, create_max_used_mib=4000)._ensure_create_headroom(
+        Slot("node-a", (0,)), "m1"
+    )
+
+
+def test_create_limit_for_an_unknown_model_fails_closed():
+    service = _create_service(physical=100)
+    with pytest.raises(ValueError, match="cannot derive the startup headroom limit"):
+        service._ensure_create_headroom(Slot("node-a", (0,)), "no-such-model")
+
+
+class _Stop(Exception):
+    pass
+
+
+def test_cold_start_callers_pass_the_created_model(monkeypatch):
+    from types import SimpleNamespace
+
+    from tre_sm.allocator.slots import Binding, Migration
+
+    service = _create_service(physical=100)
+    seen = []
+
+    def spy(slot, model):
+        seen.append((slot, model))
+        raise _Stop()
+
+    monkeypatch.setattr(service, "_ensure_create_headroom", spy)
+    with pytest.raises(_Stop):
+        service._create_and_wake_runtime_binding("m1", Slot("node-a", (1,)))
+    assert seen[-1] == (Slot("node-a", (1,)), "m1")
+
+    monkeypatch.setattr(service, "_apply_runtime_power_action", lambda *a, **k: None)
+    monkeypatch.setattr(service, "_refresh_observed", lambda *a, **k: None)
+    service._runtime_ops = SimpleNamespace(
+        delete_model_deployment=lambda binding: None, wait_pod_deleted=lambda serve_id: None
+    )
+    source = Binding("pod-a", "tp2", Slot("node-a", (0, 1)), awake=True)
+    migration = Migration(
+        serve_id="pod-a", from_slot=source.slot, to_slot=Slot("node-a", (2, 3))
+    )
+    with pytest.raises(_Stop):
+        service._execute_runtime_defrag_migration(source, migration)
+    assert seen[-1] == (Slot("node-a", (2, 3)), "tp2")

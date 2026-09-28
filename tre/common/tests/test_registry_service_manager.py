@@ -194,3 +194,44 @@ def test_max_bound_per_gpu_comes_from_the_registry(tmp_path):
     raw = {"cluster": {"max_bound_per_gpu": 5, "nodes": []}, "models": []}
     assert _parse_registry(raw).topology().max_bound_per_gpu == 5
     assert _parse_registry({"cluster": {"nodes": []}}).topology().max_bound_per_gpu == MAX_BOUND_PER_GPU
+
+
+def test_create_limit_is_derived_from_the_models_utilization_with_overrides():
+    config = parse_service_manager_config(None)
+    assert config.create_margin_mib == 512 and config.create_max_used_mib is None
+    # vLLM needs 0.85 x 40960 = 34816 MiB free -> used <= 6144 - 512
+    assert config.create_limit_mib(40960, 0.85) == 5632
+    assert config.create_limit_mib(None, 0.85) is None  # total unknown: caller fails closed
+    tuned = parse_service_manager_config({"create": {"margin_mib": 1024}})
+    assert tuned.create_limit_mib(40960, 0.85) == 5120
+    absolute = parse_service_manager_config({"create": {"max_used_mib": 3000}})
+    assert absolute.create_limit_mib(81920, 0.5) == 3000 and absolute.create_limit_mib(None, 0.9) == 3000
+    bad = parse_service_manager_config({"create": {"margin_mib": -1, "max_used_mib": 0}})
+    errors = Registry(ClusterTopology(nodes=()), [], service_manager=bad).validate()
+    assert "service_manager.create.margin_mib must be >= 0" in errors
+    assert "service_manager.create.max_used_mib must be positive or null" in errors
+
+
+def test_gpu_memory_utilization_comes_from_the_engine_args():
+    from tre_common.registry import VLLM_DEFAULT_GPU_MEMORY_UTILIZATION, gpu_memory_utilization
+
+    spec = _spec("m", 1, 1)
+    assert spec.gpu_memory_utilization == VLLM_DEFAULT_GPU_MEMORY_UTILIZATION == 0.9
+    import dataclasses
+
+    spaced = dataclasses.replace(spec, vllm_extra_args=("--gpu-memory-utilization", "0.85"))
+    assert spaced.gpu_memory_utilization == 0.85
+    joined = dataclasses.replace(spec, vllm_extra_args=("--gpu-memory-utilization=0.7",))
+    assert gpu_memory_utilization(joined) == 0.7
+    for args in (("--gpu-memory-utilization",), ("--gpu-memory-utilization", "x"),
+                 ("--gpu-memory-utilization", "1.5")):
+        broken = dataclasses.replace(spec, vllm_extra_args=args)
+        errors = Registry(ClusterTopology(nodes=()), [broken]).validate()
+        assert any("vllm_extra_args --gpu-memory-utilization" in e for e in errors), args
+
+
+def test_repo_registry_models_declare_their_utilization():
+    registry = load_registry(str(REPO_REGISTRY))
+    assert {m.name: m.gpu_memory_utilization for m in registry.models()} == {
+        m.name: 0.85 for m in registry.models()
+    }
