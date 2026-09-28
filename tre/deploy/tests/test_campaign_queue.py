@@ -5,6 +5,8 @@ from pathlib import Path
 import pytest
 
 from scripts.campaign_queue import (
+    MAINTENANCE_RUN_MODE,
+    CampaignRunner,
     RunSpec,
     _parse_baseline_overrides,
     arm_config,
@@ -165,6 +167,76 @@ def test_arm_configs_share_the_tre_gateway_and_keep_apa_counterfactual_logging()
     assert apa.signal_source == "zm"
     assert queue.gateway == tre.gateway
     assert queue.signal_source == "queue_len" and queue.disable_eta_gate
+
+
+def test_every_experiment_arm_runs_the_sm_actuation_active():
+    # 2026-09-28: controller mode and SM actuation are independent; both arms
+    # get the same SM self-heal, only the controller mode differs.
+    assert (arm_config("tre").controller_mode, arm_config("tre").sm_actuation) == ("active", "active")
+    assert (arm_config("apa").controller_mode, arm_config("apa").sm_actuation) == ("observe", "active")
+    assert arm_config("queue_len").sm_actuation == "active"
+    assert MAINTENANCE_RUN_MODE == ("observe", "observe")
+
+
+class _ModeRedis:
+    def __init__(self, drop=None):
+        self.kv = {}
+        self.transactions = []
+        self.drop = drop
+
+    def get(self, key):
+        value = self.kv.get(key)
+        return value.encode() if isinstance(value, str) else value
+
+    def pipeline(self, transaction=True):
+        redis = self
+
+        class _Pipe:
+            def __init__(self):
+                self.commands = []
+
+            def set(self, key, value):
+                self.commands.append((key, value))
+
+            def execute(self):
+                redis.transactions.append((transaction, list(self.commands)))
+                for key, value in self.commands:
+                    if key != redis.drop:
+                        redis.kv[key] = value
+
+        return _Pipe()
+
+
+def _runner(redis):
+    runner = object.__new__(CampaignRunner)
+    runner.redis = redis
+    return runner
+
+
+def test_set_mode_writes_both_switches_in_one_multi_and_reads_them_back():
+    redis = _ModeRedis()
+    runner = _runner(redis)
+    assert runner.set_mode("observe", "active") == {"controller_mode": "observe", "sm_actuation": "active"}
+    assert redis.transactions == [
+        (True, [("tre:v2:controller:mode", "observe"), ("tre:v2:sm:actuation", "active")])
+    ]
+    assert runner.read_run_mode() == {"controller_mode": "observe", "sm_actuation": "active"}
+    with pytest.raises(ValueError):
+        runner.set_mode("active", "bogus")
+
+
+def test_set_mode_fails_when_the_read_back_differs():
+    runner = _runner(_ModeRedis(drop="tre:v2:sm:actuation"))
+    with pytest.raises(RuntimeError, match="read back"):
+        runner.set_mode("active", "active")
+
+
+def test_toggle_leaves_the_run_mode_to_the_queue(monkeypatch):
+    runner = _runner(_ModeRedis())
+    calls = []
+    monkeypatch.setattr(runner, "_command", lambda command, **kw: calls.append(command), raising=False)
+    runner.toggle("apa")
+    assert calls == [["bash", "deploy/scripts/toggle_tre_apa.sh", "apa", "--keep-run-mode"]]
 
 
 def test_baseline_gate_rejects_extra_awake_and_hidden_bindings():

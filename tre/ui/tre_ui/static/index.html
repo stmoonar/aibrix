@@ -22,11 +22,14 @@
       <span id="stamp" class="sub" style="margin:0"></span>
       <span class="spacer"></span>
       <span id="mode-badge" class="pill"><span class="dot"></span><span id="mode-badge-txt">controller <b>—</b></span></span>
+      <span id="sm-act-badge" class="pill"><span class="dot"></span><span id="sm-act-badge-txt">SM actuation <b>—</b></span></span>
       <span id="sup-badge" class="pill"><span class="dot"></span><span id="sup-badge-txt">supervisor <b>—</b></span></span>
       <span id="audit-badge" class="pill"><span class="dot"></span><span id="audit-badge-txt">audit <b>—</b></span></span>
       <span id="gpufresh" class="pill"><span class="dot"></span>GPU truth <b>—</b></span>
       <span id="conn" class="pill"><span id="conn-dot" class="dot"></span><span id="conn-txt">connecting</span></span>
     </header>
+    <!-- Run-mode key warnings and planner alerts (capacity_blocked / defrag_disabled). -->
+    <div id="alert-strip" class="alert-strip" hidden></div>
 
     <div class="content">
       <section id="view-overview" class="view active">
@@ -78,19 +81,34 @@
         </div>
         <div id="ops-audit" class="issues"></div>
 
-        <h2 class="section">Controller 模式</h2>
-        <p class="sub">observe 暂停执行（不扩缩、不 hide），决策照常计算——适合在不扰动租户的情况下观察行为。</p>
-        <div class="actions" style="margin:0 0 22px">
+        <h2 class="section">运行模式（两个独立开关）</h2>
+        <p class="sub">Controller observe = TRE controller 只计算和记录决策（不扩缩、不 hide）。SM actuation = service-manager supervisor 是否执行自愈（重建缺失 Deployment、drift 修复、reap、未请求 pod 的准入）。实验两臂 SM 都是 active；APA 臂 = controller observe + SM active；标定/维护 = 两个都 observe。key 缺失 = observe。</p>
+        <div id="run-mode-warn" class="issues"></div>
+        <div class="actions" style="margin:0 0 10px">
+          <span class="muted mode-label">Controller</span>
           <div class="mode-toggle">
             <button id="mode-active">Active</button>
             <button id="mode-observe">Observe</button>
           </div>
+        </div>
+        <div class="actions" style="margin:0 0 10px">
+          <span class="muted mode-label">SM actuation</span>
+          <div class="mode-toggle">
+            <button id="sm-active">Active</button>
+            <button id="sm-observe">Observe</button>
+          </div>
+        </div>
+        <div class="actions" style="margin:0 0 22px">
+          <span class="muted mode-label">同时设置</span>
+          <button class="btn" id="both-tre">TRE 臂 (active + active)</button>
+          <button class="btn" id="both-apa">APA 臂 (observe + active)</button>
+          <button class="btn" id="both-observe">标定/维护 (observe + observe)</button>
           <button class="btn" id="op-reconcile">Reconcile now</button>
           <button class="btn" id="op-defrag">Defrag (tp=2)</button>
         </div>
 
         <h2 class="section">参数</h2>
-        <p class="sub">编辑后需重启 controller 才生效。W（指标窗口）在 R3 前冻结；结构性字段（镜像、权重、tp_size）锁定。</p>
+        <p class="sub">编辑后需重启 controller 和 service-manager 才生效（SM 只在启动时读 registry，含 placement）。W（指标窗口）在 R3 前冻结；结构性字段（镜像、权重、tp_size）锁定。</p>
         <div id="params-bar" class="params-bar"></div>
         <div id="ctl-grid" class="ctl-grid"></div>
       </section>

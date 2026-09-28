@@ -22,10 +22,11 @@ from tre_common.rediskeys import (
     DECISION_LATEST_KEY,
     decision_hist_key,
 )
+from tre_common.run_mode import run_mode_view
 
 # per-source cadence (seconds) -- all far below the controller's own Redis load per tick.
 _RATES = {"decision": 1.0, "hist": 2.0, "sm": 2.0, "gpu": 5.0, "probes": 2.0,
-          "fleet": 2.0, "ops": 2.0, "timeline": 2.0}
+          "fleet": 2.0, "ops": 2.0, "timeline": 2.0, "run_mode": 1.0}
 _OPS_LIMIT = 50
 GPU_LEASES_KEY = "tre:v2:sm:gpu_leases"
 _TIMELINE_RING = 1200      # points per model (~1h at one 5s window per model)
@@ -36,6 +37,12 @@ _TIMELINE_NUMERIC = ("z_m", "tss", "queue_len", "decode_tps", "prefill_tps",
 _HIST_RING = 2000  # points kept per model in memory (~1h at 2s)
 _HIST_TAIL = 240   # points embedded in each snapshot (browser gets the rest via /api/signal/history)
 _EVENTS = 5000
+#: Planner events surfaced as console alerts (controller planner: a CRITICAL
+#: model that could not get capacity, or whose TP defrag is disabled by the
+#: registry placement policy). Event text is "<kind>:<model>".
+PLANNER_ALERT_KINDS = ("capacity_blocked", "defrag_disabled")
+#: An alert stays visible this long after its last occurrence.
+PLANNER_ALERT_WINDOW_MS = 15 * 60 * 1000
 _EVENT_MARKERS = ("critical", "suppress", "safescale", "leak", "defrag", "hide", "unhide",
                   "capacity", "incomplete", "stale", "warmup")
 
@@ -87,6 +94,52 @@ def diff_events(decision: dict[str, Any], seen_key: tuple | None) -> tuple[list[
         if any(marker in text for marker in _EVENT_MARKERS):
             out.append({"ts_ms": ts, "loop": loop, "kind": "event", "model": _event_model(text), "text": text})
     return out, key
+
+
+def planner_alert_events(decision: dict[str, Any]) -> list[tuple[str, str]]:
+    """(kind, model) of every planner alert event in one decision snapshot."""
+    out: list[tuple[str, str]] = []
+    for event in decision.get("events", []) or []:
+        if not isinstance(event, str) or ":" not in event:
+            continue
+        kind, model = event.split(":", 1)
+        if kind in PLANNER_ALERT_KINDS and model:
+            out.append((kind, model))
+    return out
+
+
+class PlannerAlerts:
+    """Recent occurrences of planner alert events per (kind, model): one
+    occurrence per published decision (ts_ms, loop) carrying the event."""
+
+    def __init__(self, window_ms: int = PLANNER_ALERT_WINDOW_MS) -> None:
+        self._window_ms = window_ms
+        self._hits: dict[tuple[str, str], deque[int]] = {}
+
+    def observe(self, decision: dict[str, Any]) -> None:
+        ts = decision.get("ts_ms")
+        if ts is None:
+            return
+        for key in planner_alert_events(decision):
+            self._hits.setdefault(key, deque(maxlen=10000)).append(int(ts))
+
+    def view(self, now_ms: int, active: set[tuple[str, str]] | None = None) -> list[dict[str, Any]]:
+        """Alerts whose last occurrence is inside the window, newest first.
+        ``active`` = the kind/model pairs in the latest decision."""
+        active = active or set()
+        horizon = now_ms - self._window_ms
+        out: list[dict[str, Any]] = []
+        for (kind, model), hits in list(self._hits.items()):
+            while hits and hits[0] < horizon:
+                hits.popleft()
+            if not hits:
+                del self._hits[(kind, model)]
+                continue
+            out.append({"kind": kind, "model": model, "count": len(hits),
+                        "first_ts_ms": hits[0], "last_ts_ms": hits[-1],
+                        "active": (kind, model) in active})
+        out.sort(key=lambda a: (-a["last_ts_ms"], a["kind"], a["model"]))
+        return out
 
 
 def _action_text(action: dict) -> str:
@@ -173,6 +226,7 @@ class Sampler:
         self._timeline_last_id: str | None = None
         self._events: deque[dict] = deque(maxlen=_EVENTS)
         self._seen_decision: tuple | None = None
+        self._alerts = PlannerAlerts()
         self._parts: dict[str, Any] = {}
         self._ages: dict[str, int] = {}
         self._next: dict[str, float] = {k: 0.0 for k in _RATES}
@@ -205,7 +259,7 @@ class Sampler:
             ("decision", self._read_decision), ("hist", self._read_hist), ("sm", self._read_sm),
             ("gpu", self._read_gpu), ("probes", self._read_probes),
             ("fleet", self._read_fleet), ("ops", self._read_ops),
-            ("timeline", self._read_timeline),
+            ("timeline", self._read_timeline), ("run_mode", self._read_run_mode),
         ):
             if now >= self._next[source]:
                 self._next[source] = now + _RATES[source]
@@ -220,9 +274,18 @@ class Sampler:
             return False
         self._parts["decision"] = decision
         self._ages["decision"] = self._now_ms()
+        seen_before = self._seen_decision
         new_events, self._seen_decision = diff_events(decision, self._seen_decision)
+        if self._seen_decision != seen_before:
+            self._alerts.observe(decision)
         for event in new_events:
             self._events.appendleft(event)
+        return True
+
+    def _read_run_mode(self) -> bool:
+        # Two GETs; never raises (an unreadable Redis shows observe + a warning).
+        self._parts["run_mode"] = run_mode_view(self._redis)
+        self._ages["run_mode"] = self._now_ms()
         return True
 
     def _read_hist(self) -> bool:
@@ -344,6 +407,8 @@ class Sampler:
                        "age_ms": self._age(now, "gpu")},
             "probes": self._parts.get("probes", []),
             "events_head": list(self._events)[:80],
+            "run_mode": {**(self._parts.get("run_mode") or {}), "age_ms": self._age(now, "run_mode")},
+            "planner_alerts": self._alerts.view(now, set(planner_alert_events(decision))),
         }
         with self._lock:
             self._version += 1

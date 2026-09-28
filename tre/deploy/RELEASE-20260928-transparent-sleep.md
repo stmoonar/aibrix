@@ -125,9 +125,12 @@ awake, so every binding counts:
 1. Confirm with the user that the cluster is free (no campaign / parallel session). On
    2026-09-28 00:00 the GPUs of 75 showed ~37 GiB used each outside the cluster pods
    (a validation run on 75?): all 8 GPUs must be free of foreign processes.
-2. Controller in observe mode (it is `observe` now):
-   `kubectl -n tre-v2 exec deploy/tre-v2-redis -- redis-cli GET tre:v2:controller:mode`
-   (set it through the console, `POST /api/ops/controller/mode {"mode":"observe"}`).
+2. Controller mode AND SM actuation (independent switches since 2026-09-28) both
+   `observe`: `bash deploy/scripts/set_run_mode.sh status`; set them with
+   `bash deploy/scripts/set_run_mode.sh observe observe` or the console
+   (`POST /api/ops/run-mode {"controller":"observe","sm_actuation":"observe"}`).
+   After the deploy set both for the next phase (TRE arm `active active`, APA arm
+   `observe active`).
 
 ### Backup
 

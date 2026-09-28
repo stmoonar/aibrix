@@ -919,3 +919,33 @@ def test_cooldown_shorter_than_the_metrics_window_is_rejected(tmp_path) -> None:
             "--cooldown-s", "20", "--window-ms", "30000",
         ])
     assert not (tmp_path / "out").exists()
+
+
+def test_calibration_requires_controller_and_sm_actuation_both_observe(monkeypatch) -> None:
+    """2026-09-28: the two switches are independent; calibration needs both observe."""
+    values = {campaign.CONTROLLER_MODE_KEY: "observe", campaign.SM_ACTUATION_KEY: "observe"}
+    seen = []
+
+    class _Result:
+        def __init__(self, out):
+            self.returncode, self.stdout, self.stderr = 0, out + "\n", ""
+
+    def fake_run(cmd, **kwargs):
+        seen.append(cmd[-1])
+        return _Result(values.get(cmd[-1], ""))
+
+    monkeypatch.setattr(campaign.subprocess, "run", fake_run)
+    assert campaign.require_calibration_run_mode("tre-v2") == {
+        "controller_mode": "observe", "sm_actuation": "observe"}
+    assert seen == [campaign.CONTROLLER_MODE_KEY, campaign.SM_ACTUATION_KEY]
+
+    values[campaign.SM_ACTUATION_KEY] = "active"  # APA-arm setting: refused
+    with pytest.raises(SystemExit, match="SM actuation"):
+        campaign.require_calibration_run_mode("tre-v2")
+    del values[campaign.SM_ACTUATION_KEY]  # missing: must be set explicitly
+    with pytest.raises(SystemExit, match="SM actuation"):
+        campaign.require_calibration_run_mode("tre-v2")
+    values[campaign.SM_ACTUATION_KEY] = "observe"
+    values[campaign.CONTROLLER_MODE_KEY] = "active"
+    with pytest.raises(SystemExit, match="controller mode"):
+        campaign.require_calibration_run_mode("tre-v2")

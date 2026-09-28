@@ -35,13 +35,13 @@ SM_OBSERVED_VERSION_KEY = "tre:v2:sm:observed_version"
 SM_GPU_LEASES_KEY = "tre:v2:sm:gpu_leases"
 #: Controller run mode, "active" | "observe" (observe = compute and record only).
 #: Absent, not a mode, or unreadable before the first successful read = observe
-#: (fail-closed). Written together with SM_ACTUATION_KEY in one transaction
-#: (tre_common.run_mode.write_run_mode).
+#: (fail-closed). Independent of SM_ACTUATION_KEY (tre_common.run_mode).
 CONTROLLER_MODE_KEY = "tre:v2:controller:mode"
 #: Service-manager actuation switch, "active" | "observe": whether the SM
 #: SUPERVISOR may change capacity or recreate / delete workloads on its own. The
 #: SM HTTP write API is NOT gated by it (the APA arm and operators drive the SM
-#: directly). Absent = derived from CONTROLLER_MODE_KEY; neither known = observe.
+#: directly). Independent of CONTROLLER_MODE_KEY: absent or not a mode =
+#: observe (fail-closed; never derived from the controller mode).
 SM_ACTUATION_KEY = "tre:v2:sm:actuation"
 #: SM maintenance lock (JSON {"operation_id", "kind", "owner", "since_ms"}) held
 #: by a running fleet repair for its whole run; deleting it aborts the repair at

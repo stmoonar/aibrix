@@ -7,7 +7,7 @@
 'use strict';
 
 import {
-  $, S, ageText, api, clockText, confirmOp, el, emptyState, fmt, fmtInt,
+  $, S, ageText, api, clockText, confirmOp, currentRunMode, el, emptyState, fmt, fmtInt,
   registerView, renderTopbar, toast,
 } from './core.js';
 
@@ -106,31 +106,62 @@ function renderAudit() {
   });
 }
 
-/* ---------- controller mode + fleet ops (carried over) ---------- */
+/* ---------- run mode: two independent switches + "set both" ----------
+   Controller mode (tre:v2:controller:mode) and SM actuation (tre:v2:sm:actuation)
+   are independent (2026-09-28): TRE arm = active + active, APA arm = observe +
+   active, calibration / maintenance = observe + observe. */
 
 function syncModeButtons() {
   const a = $('#mode-active');
-  const o = $('#mode-observe');
   if (!a) return;
-  a.className = S.mode === 'active' ? 'on-active' : '';
-  o.className = S.mode === 'observe' ? 'on-observe' : '';
+  const rm = currentRunMode();
+  a.className = rm.controller === 'active' ? 'on-active' : '';
+  $('#mode-observe').className = rm.controller === 'observe' ? 'on-observe' : '';
+  $('#sm-active').className = rm.sm_actuation === 'active' ? 'on-active' : '';
+  $('#sm-observe').className = rm.sm_actuation === 'observe' ? 'on-observe' : '';
+  const warn = $('#run-mode-warn');
+  if (warn) {
+    warn.innerHTML = '';
+    (rm.warnings || []).forEach((w) => warn.appendChild(el('div', 'issue bad', w)));
+  }
   renderTopbar();
 }
 
-async function setMode(mode) {
-  if (mode === S.mode) return;
+function applyRunMode(r) {
+  S.runMode = r;
+  S.mode = r.controller;
+  if (S.snap) S.snap.run_mode = r;  // until the next sampled snapshot arrives
+  syncModeButtons();
+  return r;
+}
+
+function postJson(path, body) {
+  return api(path, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+}
+
+function setControllerMode(mode) {
   const msg = mode === 'observe'
-    ? '切到 observe？controller 只计算和记录决策（不扩缩、不 hide，进行中的 SafeScale 探针 unhide 回滚）；SM supervisor 也只记录不执行。SM HTTP API（APA/运维）不受影响。'
-    : '恢复执行（controller 与 SM supervisor 都切到 active）？';
-  confirmOp(msg, async () => {
-    const r = await api('/api/ops/controller/mode', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ mode }),
-    });
-    S.mode = r.mode;
-    syncModeButtons();
-    return r;
-  }, `controller + SM actuation → ${mode}`);
+    ? '把 controller 切到 observe？controller 只计算和记录决策（不扩缩、不 hide，进行中的 SafeScale 探针 unhide 回滚）。SM actuation 不变。'
+    : '把 controller 切到 active（TRE 执行扩缩）？SM actuation 不变。';
+  confirmOp(msg, async () => applyRunMode(await postJson('/api/ops/controller/mode', { mode })),
+    `controller → ${mode}`);
+}
+
+function setSmActuation(mode) {
+  const msg = mode === 'observe'
+    ? '把 SM actuation 切到 observe？supervisor 只记录、不执行自愈（重建 Deployment / drift 修复 / reap / 未请求 pod 的准入）。controller 模式不变。SM HTTP API 不受影响。'
+    : '把 SM actuation 切到 active（supervisor 执行自愈）？controller 模式不变。';
+  confirmOp(msg, async () => applyRunMode(await postJson('/api/ops/sm/actuation', { mode })),
+    `SM actuation → ${mode}`);
+}
+
+function setBoth(controller, smActuation, label) {
+  confirmOp(`${label}：controller = ${controller}，SM actuation = ${smActuation}（一次事务写入）？`,
+    async () => applyRunMode(await postJson('/api/ops/run-mode', { controller, sm_actuation: smActuation })),
+    `controller → ${controller}, SM actuation → ${smActuation}`);
 }
 
 /* ---------- params (carried over verbatim) ---------- */
@@ -182,9 +213,9 @@ function renderParamsBar() {
   const pending = S.params && S.params.pending_restart;
   const wrap = el('div', 'restart-strip' + (pending ? ' pending' : ''));
   wrap.appendChild(el('span', null, pending
-    ? '⚠ 参数已保存但尚未生效 —— 需重启 controller 才会加载。'
-    : '参数与运行中的 controller 一致。'));
-  const btn = el('button', 'btn ' + (pending ? 'primary' : ''), '重启 controller');
+    ? '⚠ 参数已保存但尚未生效 —— 需重启 controller + service-manager 才会加载。'
+    : '参数与运行中的 controller / service-manager 一致。'));
+  const btn = el('button', 'btn ' + (pending ? 'primary' : ''), '重启 controller + SM');
   btn.onclick = restartController;
   wrap.appendChild(btn);
   const status = el('span', 'sub', '');
@@ -349,13 +380,13 @@ async function saveModelParams(name, panel) {
 }
 
 async function restartController() {
-  if (!window.confirm('重启 controller 以应用已保存的参数？控制会短暂（数秒）暂停，随后自动恢复。')) return;
+  if (!window.confirm('重启 controller 和 service-manager 以应用已保存的参数（SM 只在启动时读 registry，含 placement）？控制和 SM API 会短暂暂停，随后自动恢复。')) return;
   try {
     await api('/api/ops/controller/restart', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ reason: 'apply params from console' }),
     });
-    toast('已请求重启 controller');
+    toast('已请求重启 controller + service-manager');
     pollRollout(0);
   } catch (e) { toast('重启失败: ' + e.message, true); }
 }
@@ -365,8 +396,11 @@ async function pollRollout(n) {
   if (!status) return;
   try {
     const r = await api('/api/ops/controller/rollout');
-    status.textContent = `rollout: ${r.state} (${r.ready_replicas}/${r.desired})`;
-    if (r.state === 'ready') { toast('controller 已重启 —— 参数生效'); loadParams(); return; }
+    const ctl = r.controller || r;
+    const sm = r.service_manager || {};
+    status.textContent = `rollout: ${r.state} (controller ${ctl.ready_replicas}/${ctl.desired}, `
+      + `SM ${sm.ready_replicas ?? '—'}/${sm.desired ?? '—'})`;
+    if (r.state === 'ready') { toast('controller + SM 已重启 —— 参数生效'); loadParams(); return; }
     if (r.state === 'failed') {
       status.textContent = 'rollout FAILED: ' + (r.message || '');
       toast('rollout 失败', true);
@@ -386,8 +420,13 @@ function renderPanelsLive() {
 
 export function initOps() {
   $('#ops-audit-run').onclick = runAudit;
-  $('#mode-active').onclick = () => setMode('active');
-  $('#mode-observe').onclick = () => setMode('observe');
+  $('#mode-active').onclick = () => setControllerMode('active');
+  $('#mode-observe').onclick = () => setControllerMode('observe');
+  $('#sm-active').onclick = () => setSmActuation('active');
+  $('#sm-observe').onclick = () => setSmActuation('observe');
+  $('#both-tre').onclick = () => setBoth('active', 'active', 'TRE 臂');
+  $('#both-apa').onclick = () => setBoth('observe', 'active', 'APA 臂');
+  $('#both-observe').onclick = () => setBoth('observe', 'observe', '标定/维护');
   $('#op-reconcile').onclick = () => confirmOp('现在执行一次 reconcile？',
     () => api('/api/ops/reconcile', { method: 'POST' }), 'reconcile 已请求');
   $('#op-defrag').onclick = () => confirmOp('执行 defrag (tp_size=2)？可能迁移睡眠中的副本。',
@@ -406,5 +445,6 @@ registerView('ops', {
     renderJournal();
     renderSupervisor();
     renderPanelsLive();
+    syncModeButtons();
   },
 });

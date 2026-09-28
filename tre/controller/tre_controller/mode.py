@@ -1,6 +1,6 @@
 """Controller run-mode gate.
 
-The console (or an operator) sets ``tre:v2:controller:mode`` (together with the SM
+The console (or an operator) sets ``tre:v2:controller:mode`` (independent of the SM
 actuation switch ``tre:v2:sm:actuation``, see ``tre_common.run_mode``). ``observe``
 means the controller computes and records only - no scaling side effects
 (user decision 2026-09-28, tre/docs/design/20260928-observe-mode-semantics.md):

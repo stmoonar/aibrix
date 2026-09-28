@@ -2,6 +2,7 @@ import importlib.util
 from pathlib import Path
 import sys
 
+import pytest
 import yaml
 
 
@@ -76,3 +77,30 @@ def test_non_deployment_manifests_excludes_deployment_and_kustomization(tmp_path
     selected = MODULE.non_deployment_manifests(tmp_path)
 
     assert [path.name for path in selected] == ["service.yaml"]
+
+
+class _RedisKubectl:
+    def __init__(self, values):
+        self.values = values
+        self.calls = []
+
+    def run(self, *args, input_text=None):
+        self.calls.append(args)
+        return self.values.get(args[-1], "") + "\n"
+
+
+def test_bring_up_requires_both_run_mode_switches_observe():
+    ok = _RedisKubectl({MODULE.MODE_KEY: "observe", MODULE.SM_ACTUATION_KEY: "observe"})
+    MODULE._assert_run_mode_observe(ok, "tre-v2")
+    assert [call[-1] for call in ok.calls] == [MODULE.MODE_KEY, MODULE.SM_ACTUATION_KEY]
+
+    # the SM self-heal would race the bring-up: SM actuation active is refused
+    sm_active = _RedisKubectl({MODULE.MODE_KEY: "observe", MODULE.SM_ACTUATION_KEY: "active"})
+    with pytest.raises(RuntimeError, match="SM actuation"):
+        MODULE._assert_run_mode_observe(sm_active, "tre-v2")
+    # a missing key must be set explicitly
+    missing = _RedisKubectl({MODULE.MODE_KEY: "observe"})
+    with pytest.raises(RuntimeError, match="SM actuation"):
+        MODULE._assert_run_mode_observe(missing, "tre-v2")
+    with pytest.raises(RuntimeError, match="controller mode"):
+        MODULE._assert_run_mode_observe(_RedisKubectl({}), "tre-v2")

@@ -16,10 +16,18 @@ by the controller and the service-manager).
 - **Never** `kubectl apply` `overlays/tre-v2/params.yaml`: it is a bootstrap
   copy for a fresh install and would overwrite the live values (for example
   calibrated `theta_m`).
-- The service-manager reads `service_manager:` and `gateway:` once, at start.
-  After changing them, restart it:
-  `kubectl -n tre-v2 rollout restart deploy/tre-v2-service-manager`.
-  The controller restart is offered by the console.
+- The service-manager reads the registry (`placement:`, `service_manager:`,
+  `gateway:`, the models) once, at start. **A placement change (or any other
+  registry change) needs a service-manager restart**, not only a controller
+  restart. The console's restart-to-apply (`POST /api/ops/controller/restart`,
+  button "重启 controller + SM") restarts both Deployments;
+  `GET /api/ops/controller/rollout` reports both (`controller`,
+  `service_manager`, combined `state`). By hand:
+  `kubectl -n tre-v2 rollout restart deploy/tre-v2-controller deploy/tre-v2-service-manager`.
+- The console's ServiceAccount (`tre-v2-ui`) may `get` / `patch` exactly the
+  Deployments `tre-v2-controller` and `tre-v2-service-manager` (Role
+  `tre-v2-ui-params` in `overlays/tre-v2/rbac.yaml`, namespace `tre-v2` only);
+  apply `rbac.yaml` before a console that restarts the SM.
 
 ### Checked at start
 
@@ -75,20 +83,48 @@ re-opened for routing only after it read awake twice, more than
 ### Run mode: controller mode and SM actuation
 
 `tre:v2:controller:mode` and `tre:v2:sm:actuation` (`active` | `observe`) are
-set together by the console (`POST /api/ops/controller/mode`, one MULTI) and by
-`deploy/scripts/campaign_queue.py`. Observe = compute and record only: the
-controller takes no scaling action (open SafeScale probes are only unhidden),
-and the service-manager supervisor only records what it would have done
-(`tre:v2:sm:actuation:suppressed`) instead of recreating / reaping Deployments
-or starting a fleet repair. The SM HTTP write API works in both modes (APA arm,
-operators). Absent or unreadable keys mean observe (fail-closed), so set the
-mode explicitly after a deploy: `active` for TRE-arm runs, `observe` for APA
-runs and calibration. The staggered bring-up works in observe. Details:
+**independent** switches. Controller observe = the TRE controller computes and
+records only (open SafeScale probes are only unhidden). SM actuation observe =
+the service-manager supervisor only records what it would have done
+(`tre:v2:sm:actuation:suppressed`) instead of recreating / reaping Deployments,
+starting or resuming a fleet repair or sleeping residents for an unrequested
+pod. The SM HTTP write API works in both modes (APA arm, operators). A missing
+key is observe for its reader (the SM no longer derives its switch from the
+controller mode), so **every deploy sets both explicitly**:
+
+| Phase | controller mode | SM actuation |
+|---|---|---|
+| TRE arm | `active` | `active` |
+| APA arm (+ APA CRs) | `observe` | `active` |
+| calibration / maintenance | `observe` | `observe` |
+
+- Scripts: `deploy/scripts/set_run_mode.sh <controller> <sm>` (or `status`);
+  `deploy_models.sh --run-mode CONTROLLER:SM` (the staggered bring-up sets
+  `observe:observe` first); `toggle_tre_apa.sh tre|apa` sets the arm's values
+  (`--keep-run-mode` to skip); `campaign_queue.py` sets them per arm and records
+  the read-back values in each run's evidence.
+- Console: `POST /api/ops/controller/mode {"mode"}` (controller only),
+  `POST /api/ops/sm/actuation {"mode"}` (SM only),
+  `POST /api/ops/run-mode {"controller", "sm_actuation"}` (both, one MULTI);
+  `GET /api/ops/run-mode` returns both plus `warnings` for missing keys.
+- Redis directly:
+  `kubectl -n tre-v2 exec deploy/tre-v2-redis -- redis-cli MSET tre:v2:controller:mode observe tre:v2:sm:actuation active`.
+- Before a controller / SM rollout nothing needs to change (both read the keys
+  at every use); after a fresh install or a Redis reset, set both.
+
+`calibration_campaign.py` and `staggered_model_fleet.py` refuse to run unless
+both keys are explicitly `observe`. Details:
 `tre/docs/design/20260928-observe-mode-semantics.md`.
 
-In observe, a pod nobody requested (k8s restarted it, a Deployment applied or
-scaled by hand) is not admitted while an awake resident shares its GPUs (409,
-the gate retries; recorded as `startup_admission_sleep`).
+With the SM actuation in observe, a pod nobody requested (k8s restarted it, a
+Deployment applied or scaled by hand) is not admitted while an awake resident
+shares its GPUs (409, the gate retries; recorded as `startup_admission_sleep`).
+
+The console shows the planner events `capacity_blocked:<model>` and
+`defrag_disabled:<model>` (a CRITICAL model that got no capacity / whose TP
+defrag the placement policy disables) as an alert strip under the top bar
+(snapshot field `planner_alerts`: kind, model, occurrences in the last 15 min,
+last time, whether the latest decision still carries it).
 
 ### Startup admission
 

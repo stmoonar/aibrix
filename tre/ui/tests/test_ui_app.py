@@ -132,6 +132,7 @@ class FakeK8s:
                        "spec": {"replicas": 1, "template": {"metadata": {"annotations": {}}}},
                        "status": {"observedGeneration": 3, "updatedReplicas": 1, "readyReplicas": 1, "conditions": []}}
         self.patches: list = []
+        self.patched_names: list[str] = []
 
     def get_configmap(self, name):
         return self.cm
@@ -146,6 +147,7 @@ class FakeK8s:
 
     def patch_deployment(self, name, patch):
         self.patches.append(patch)
+        self.patched_names.append(name)
         anns = patch["spec"]["template"]["metadata"]["annotations"]
         self.deploy["spec"]["template"]["metadata"]["annotations"].update(anns)
         return self.deploy
@@ -218,28 +220,84 @@ def test_ui_meta_exposes_registry_params() -> None:
     assert meta["topology"]["nodes"][0]["name"] == "node-a"
 
 
-def test_ui_controller_mode_toggle() -> None:
+_CTRL = "tre:v2:controller:mode"
+_SM = "tre:v2:sm:actuation"
+_MISSING = [f"{_CTRL} missing -> controller treats as observe", f"{_SM} missing -> SM treats as observe"]
+
+
+def test_ui_mode_get_reports_both_switches_and_warns_on_missing_keys() -> None:
     client, _ = _client()
-    # 2026-09-28: absent = observe (fail-closed), for the controller and the SM
-    assert client.get("/api/ops/controller/mode").json() == {
-        "mode": "observe", "sm_actuation": "observe", "raw": {"controller": None, "sm_actuation": None},
-    }
-    assert client.post("/api/ops/controller/mode", json={"mode": "active"}).json()["mode"] == "active"
     body = client.get("/api/ops/controller/mode").json()
-    assert (body["mode"], body["sm_actuation"]) == ("active", "active")
-    assert client.post("/api/ops/controller/mode", json={"mode": "observe"}).json()["mode"] == "observe"
-    assert client.get("/api/ops/controller/mode").json()["mode"] == "observe"
+    assert body == {
+        "mode": "observe", "controller": "observe", "sm_actuation": "observe",
+        "raw": {"controller": None, "sm_actuation": None}, "warnings": _MISSING,
+    }
+    assert client.get("/api/ops/run-mode").json() == body
+    assert client.get("/api/ops/sm/actuation").json() == body
+
+
+def test_ui_controller_mode_post_sets_only_the_controller_mode() -> None:
+    redis = FakeRedis()
+    client = TestClient(create_ui_app(_registry(), redis, FakeServiceManagerClient(), None))
+    body = client.post("/api/ops/controller/mode", json={"mode": "active"}).json()
+    assert (body["mode"], body["controller"], body["sm_actuation"]) == ("active", "active", "observe")
+    assert body["written"] == {"controller": "active"}
+    assert body["warnings"] == [_MISSING[1]]  # SM key still missing: not derived
+    assert redis.kv == {_CTRL: "active"} and redis.executed == []
     assert client.post("/api/ops/controller/mode", json={"mode": "bogus"}).status_code == 400
 
 
-def test_ui_mode_switch_sets_controller_and_sm_actuation_in_one_transaction() -> None:
+def test_ui_sm_actuation_post_sets_only_the_sm_switch() -> None:
+    redis = FakeRedis()
+    redis.kv[_CTRL] = "observe"
+    client = TestClient(create_ui_app(_registry(), redis, FakeServiceManagerClient(), None))
+    body = client.post("/api/ops/sm/actuation", json={"mode": "active"}).json()
+    assert (body["controller"], body["sm_actuation"], body["warnings"]) == ("observe", "active", [])
+    assert redis.kv == {_CTRL: "observe", _SM: "active"}
+    assert client.post("/api/ops/sm/actuation", json={"mode": "on"}).status_code == 400
+
+
+def test_ui_run_mode_sets_both_in_one_transaction_or_either_one() -> None:
     redis = FakeRedis()
     client = TestClient(create_ui_app(_registry(), redis, FakeServiceManagerClient(), None))
-    assert client.post("/api/ops/controller/mode", json={"mode": "active"}).status_code == 200
-    assert redis.executed == [
-        (True, [("set", "tre:v2:controller:mode", "active"), ("set", "tre:v2:sm:actuation", "active")])
-    ]
-    assert redis.kv["tre:v2:controller:mode"] == redis.kv["tre:v2:sm:actuation"] == "active"
+    # APA arm: controller observe + SM active
+    body = client.post("/api/ops/run-mode", json={"controller": "observe", "sm_actuation": "active"}).json()
+    assert (body["controller"], body["sm_actuation"]) == ("observe", "active")
+    assert redis.executed == [(True, [("set", _CTRL, "observe"), ("set", _SM, "active")])]
+    assert client.post("/api/ops/run-mode", json={"controller": "active"}).json()["sm_actuation"] == "active"
+    assert redis.kv == {_CTRL: "active", _SM: "active"}
+    assert client.post("/api/ops/run-mode", json={}).status_code == 400
+    assert client.post("/api/ops/run-mode", json={"controller": "active", "sm_actuation": "x"}).status_code == 400
+    assert redis.kv == {_CTRL: "active", _SM: "active"}
+
+
+def test_ui_snapshot_carries_run_mode_with_warnings() -> None:
+    redis = FakeRedis()
+    redis.kv[_SM] = "active"
+    app = create_ui_app(_registry(), redis, FakeServiceManagerClient(), None)
+    app.state.sampler.sample_once()
+    snap = TestClient(app).get("/api/snapshot").json()
+    assert snap["run_mode"]["controller"] == "observe" and snap["run_mode"]["sm_actuation"] == "active"
+    assert snap["run_mode"]["warnings"] == [_MISSING[0]]
+
+
+def test_ui_snapshot_surfaces_planner_capacity_alerts() -> None:
+    class AlertRedis(FakeRedis):
+        def hgetall(self, key):
+            out = super().hgetall(key)
+            if key == "tre:v2:decision:latest":
+                out[b"events"] = b'["capacity_blocked:m1","defrag_disabled:m1","critical_sleeping_capacity"]'
+            return out
+
+    app = create_ui_app(_registry(), AlertRedis(), FakeServiceManagerClient(), None)
+    sampler = app.state.sampler
+    sampler._now_ms = lambda: 200  # decision ts_ms is 123: inside the alert window
+    sampler.sample_once()
+    alerts = TestClient(app).get("/api/snapshot").json()["planner_alerts"]
+    assert {(a["kind"], a["model"], a["count"], a["active"]) for a in alerts} == {
+        ("capacity_blocked", "m1", 1, True), ("defrag_disabled", "m1", 1, True),
+    }
+    assert all(a["last_ts_ms"] == 123 for a in alerts)
 
 
 def test_ui_serves_local_single_page_app_without_runtime_cdn() -> None:
@@ -305,12 +363,34 @@ def test_put_params_validates_writes_and_restart_flow() -> None:
     r = client.post("/api/ops/controller/restart", json={"reason": "apply theta"})
     assert r.status_code == 200 and r.json()["ok"] is True
     assert k8s.patches and "tre.dev/params-hash" in k8s.patches[0]["spec"]["template"]["metadata"]["annotations"]
+    # restart-to-apply rolls the service-manager too (it reads placement etc. only at start)
+    assert k8s.patched_names == ["tre-v2-controller", "tre-v2-service-manager"]
+    assert r.json()["restarted"] == ["tre-v2-controller", "tre-v2-service-manager"]
     assert client.get("/api/params").json()["pending_restart"] is False
 
 
 def test_rollout_state_reports_ready() -> None:
     client, _ = _client(FakeK8s())
-    assert client.get("/api/ops/controller/rollout").json()["state"] == "ready"
+    body = client.get("/api/ops/controller/rollout").json()
+    assert body["state"] == "ready"
+    assert body["controller"]["state"] == body["service_manager"]["state"] == "ready"
+
+
+def test_restart_reports_a_failed_service_manager_patch_and_keeps_pending() -> None:
+    class NoSmRbac(FakeK8s):
+        def patch_deployment(self, name, patch):
+            if name == "tre-v2-service-manager":
+                raise RuntimeError("403 forbidden")
+            return super().patch_deployment(name, patch)
+
+    k8s = NoSmRbac()
+    client, _ = _client(k8s)
+    client.get("/api/params")
+    client.put("/api/params", json={"expected_resource_version": "100", "models": {"m1": {"trs": {"theta_m": 800.0}}}})
+    r = client.post("/api/ops/controller/restart", json={"reason": "x"})
+    assert r.status_code == 502 and "tre-v2-service-manager" in r.json()["detail"]
+    assert k8s.patched_names == ["tre-v2-controller"]
+    assert client.get("/api/params").json()["pending_restart"] is True
 
 
 # ---- timeline endpoint (Task 2) ----

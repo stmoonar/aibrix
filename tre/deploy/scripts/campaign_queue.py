@@ -97,10 +97,14 @@ ORPHAN_WATCH_KEY = "tre:v2:controller:orphan_watch"
 PROBES_KEY = "tre:v2:controller:safescale:probes"
 SIGNAL_KEY = "tre:v2:controller:signal_log"
 MODE_KEY = "tre:v2:controller:mode"
-# Written together with MODE_KEY (one MULTI): the SM supervisor's actuation
-# switch (tre_common.rediskeys.SM_ACTUATION_KEY; tre/docs/design/
-# 20260928-observe-mode-semantics.md).
+# The SM supervisor's actuation switch (tre_common.rediskeys.SM_ACTUATION_KEY),
+# INDEPENDENT of MODE_KEY (user decision 2026-09-28; tre/docs/design/
+# 20260928-observe-mode-semantics.md): both experiment arms run the SM in
+# active (symmetric self-heal); resets / maintenance run both in observe.
 SM_ACTUATION_KEY = "tre:v2:sm:actuation"
+RUN_MODES = ("active", "observe")
+#: (controller mode, SM actuation) between runs, for resets and after a failure.
+MAINTENANCE_RUN_MODE = ("observe", "observe")
 SM_STATE_KEY = "tre:v2:sm:state"
 SM_VERSION_KEY = "tre:v2:sm:version"
 FIXED_CLEAR_KEYS = {
@@ -143,9 +147,18 @@ class ArmConfig:
     arm: str
     signal_source: str
     disable_eta_gate: bool
-    mode: str
+    #: tre:v2:controller:mode during the run.
+    controller_mode: str
     gateway: str
     apa_enabled: bool
+    #: tre:v2:sm:actuation during the run: active in every experiment arm, so
+    #: the SM self-heal is the same for TRE and APA.
+    sm_actuation: str = "active"
+
+    @property
+    def mode(self) -> str:
+        """Controller mode (pre-2026-09-28 name)."""
+        return self.controller_mode
 
 
 def utc_iso(epoch: float | None = None) -> str:
@@ -222,13 +235,14 @@ def load_manifest(
 
 def arm_config(arm: str) -> ArmConfig:
     if arm == "tre":
-        return ArmConfig(arm, "zm", False, "active", GATEWAYS["tre"], False)
+        return ArmConfig(arm, "zm", False, "active", GATEWAYS["tre"], False, "active")
     if arm == "apa":
         # APA actuates. TRE loops remain enabled for counterfactual logging, while
-        # observe mode makes TRE ActionQueue dispatch impossible.
-        return ArmConfig(arm, "zm", False, "observe", GATEWAYS["apa"], True)
+        # controller observe makes TRE ActionQueue dispatch impossible. The SM
+        # actuation stays active, as in the TRE arm (symmetric self-heal).
+        return ArmConfig(arm, "zm", False, "observe", GATEWAYS["apa"], True, "active")
     if arm in SIGNAL_ARMS:
-        return ArmConfig(arm, arm, True, "active", GATEWAYS["tre"], False)
+        return ArmConfig(arm, arm, True, "active", GATEWAYS["tre"], False, "active")
     raise ValueError(f"unsupported arm: {arm}")
 
 
@@ -464,20 +478,32 @@ class CampaignRunner:
     def state(self) -> dict[str, Any]:
         return self.http_json("GET", f"{self.sm_url}/v2/state")
 
-    def set_mode(self, mode: str) -> None:
-        if mode not in {"active", "observe"}:
-            raise ValueError(mode)
+    def read_run_mode(self) -> dict[str, str | None]:
+        """The stored values (None = absent), as recorded in the evidence."""
+        def _get(key: str) -> str | None:
+            raw = self.redis.get(key)
+            return raw.decode() if isinstance(raw, bytes) else raw
+        return {"controller_mode": _get(MODE_KEY), "sm_actuation": _get(SM_ACTUATION_KEY)}
+
+    def set_mode(self, controller_mode: str, sm_actuation: str) -> dict[str, str | None]:
+        """Set the controller mode and the SM actuation (independent switches)
+        in one MULTI, then read both back; returns the read-back values."""
+        if controller_mode not in RUN_MODES or sm_actuation not in RUN_MODES:
+            raise ValueError((controller_mode, sm_actuation))
         pipe = self.redis.pipeline(transaction=True)
-        pipe.set(MODE_KEY, mode)
-        pipe.set(SM_ACTUATION_KEY, mode)
+        pipe.set(MODE_KEY, controller_mode)
+        pipe.set(SM_ACTUATION_KEY, sm_actuation)
         pipe.execute()
-        if (self.redis.get(MODE_KEY) or b"").decode() != mode or (
-            self.redis.get(SM_ACTUATION_KEY) or b""
-        ).decode() != mode:
-            raise RuntimeError(f"failed to set controller mode / SM actuation {mode}")
+        observed = self.read_run_mode()
+        expected = {"controller_mode": controller_mode, "sm_actuation": sm_actuation}
+        if observed != expected:
+            raise RuntimeError(f"failed to set run mode {expected}: read back {observed}")
+        return observed
 
     def toggle(self, arm: str) -> None:
-        self._command(["bash", "deploy/scripts/toggle_tre_apa.sh", arm])
+        # The queue owns the run mode (set_mode per arm); the toggle only
+        # switches the decision source.
+        self._command(["bash", "deploy/scripts/toggle_tre_apa.sh", arm, "--keep-run-mode"])
 
     def kubectl_json(self, args: Sequence[str]) -> dict[str, Any]:
         output = subprocess.check_output(["kubectl", *args, "-o", "json"], text=True)
@@ -707,10 +733,14 @@ class CampaignRunner:
         }
         if mismatched:
             raise RuntimeError(f"controller arm env mismatch: {mismatched}")
-        # Absent = observe (fail-closed, 2026-09-28).
-        mode = (self.redis.get(MODE_KEY) or b"observe").decode()
-        if mode != config.mode:
-            raise RuntimeError(f"controller mode {mode} != {config.mode}")
+        # Both switches must be set explicitly to the arm's values (an absent
+        # key is observe for its reader, but the evidence records set values).
+        run_mode = self.read_run_mode()
+        mode = run_mode["controller_mode"]
+        if mode != config.controller_mode:
+            raise RuntimeError(f"controller mode {mode} != {config.controller_mode}")
+        if run_mode["sm_actuation"] != config.sm_actuation:
+            raise RuntimeError(f"SM actuation {run_mode['sm_actuation']} != {config.sm_actuation}")
         apa_count = self.apa_count()
         if apa_count != (3 if config.apa_enabled else 0):
             raise RuntimeError(f"APA CR count mismatch: {apa_count}")
@@ -724,11 +754,12 @@ class CampaignRunner:
             "applied_hash": params.get("applied_hash"),
             "controller_env": expected_env,
             "controller_mode": mode,
+            "sm_actuation": run_mode["sm_actuation"],
             "apa_cr_count": apa_count,
         }
 
     def deactivate_and_reset(self, run_dir: Path) -> None:
-        self.set_mode("observe")
+        self.set_mode(*MAINTENANCE_RUN_MODE)
         self.toggle("tre")
         baseline = self.ensure_baseline()
         self.guard_zero(include_probes=False)
@@ -757,15 +788,16 @@ class CampaignRunner:
     def configure_arm(self, config: ArmConfig) -> dict[str, Any]:
         if config.apa_enabled:
             self.toggle("apa")
-            # Re-enable TRE decision loops for counterfactual logging only. Mode remains
-            # observe, so APA stays the sole actuator.
+            # Re-enable TRE decision loops for counterfactual logging only. The
+            # controller mode remains observe, so APA stays the sole actuator; the
+            # SM actuation is active as in the TRE arm.
             self.configure_controller(config)
-            self.set_mode("observe")
+            self.set_mode(config.controller_mode, config.sm_actuation)
             self.wait_apa_ready()
         else:
             self.toggle("tre")
             self.configure_controller(config)
-            self.set_mode("active")
+            self.set_mode(config.controller_mode, config.sm_actuation)
         self.assert_ready()
         self.guard_zero()
         errors = baseline_errors(self.state(), self.manifest.baseline)
@@ -831,6 +863,10 @@ class CampaignRunner:
             "command": command,
             "operator": "root via Codex",
             "controller_pod": controller_pod,
+            # Read back from Redis after the arm was configured.
+            "run_mode": self.read_run_mode(),
+            "run_mode_expected": {"controller_mode": config.controller_mode,
+                                  "sm_actuation": config.sm_actuation},
         }
         atomic_json(run_dir / "command.json", metadata)
         start_epoch = time.time()
@@ -920,14 +956,14 @@ class CampaignRunner:
         }
         atomic_json(run_dir / "run.json", result)
         (run_dir / "STATUS").write_text("DONE\n", encoding="utf-8")
-        self.set_mode("observe")
+        self.set_mode(*MAINTENANCE_RUN_MODE)
         return result
 
     def restore_safe(self) -> None:
-        self.set_mode("observe")
+        self.set_mode(*MAINTENANCE_RUN_MODE)
         self.toggle("tre")
         self.configure_controller(arm_config("tre"))
-        self.set_mode("observe")
+        self.set_mode(*MAINTENANCE_RUN_MODE)
         self.ensure_baseline()
         self.clear_per_run_redis()
         self.guard_zero()

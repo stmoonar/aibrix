@@ -20,15 +20,63 @@
 # Plain apply is CORRECT ONLY for re-applying an already-present resident fleet.
 # Fresh bring-up and recovery must use --staggered, which scales the fleet to zero
 # and then starts/sleeps exactly one binding at a time with physical verification.
+#
+# RUN MODE (2026-09-28): the controller mode (tre:v2:controller:mode) and the SM
+# actuation (tre:v2:sm:actuation) are independent switches; a missing key is observe
+# for its reader, so a deploy sets both explicitly:
+#   --run-mode CONTROLLER:SM   e.g. active:active (TRE arm), observe:active (APA arm),
+#                              observe:observe (calibration / maintenance)
+# Plain apply: sets --run-mode after the apply; without it, prints the current values
+# and warns about missing keys. --staggered --execute: sets observe:observe BEFORE the
+# bring-up (it scales the fleet to zero and must not race the SM self-heal), then
+# --run-mode (if given) after it; otherwise both stay observe.
 set -euo pipefail
 
 DEPLOY_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MODELS_DIR="$DEPLOY_DIR/models"
+SET_RUN_MODE="$DEPLOY_DIR/scripts/set_run_mode.sh"
 
-if [[ "${1:-}" == "--staggered" ]]; then
+STAGGERED=0
+EXECUTE=0
+RUN_MODE=""
+PASS=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --staggered) STAGGERED=1 ;;
+    --run-mode)
+      [[ $# -ge 2 ]] || { echo "[deploy_models][ERROR] --run-mode needs CONTROLLER:SM" >&2; exit 2; }
+      RUN_MODE="$2"; shift ;;
+    --execute) EXECUTE=1; PASS+=("$1") ;;
+    *) PASS+=("$1") ;;
+  esac
   shift
-  exec python3 "$DEPLOY_DIR/scripts/staggered_model_fleet.py" \
-    --models-dir "$MODELS_DIR" "$@"
+done
+if [[ -n "$RUN_MODE" && ! "$RUN_MODE" =~ ^(active|observe):(active|observe)$ ]]; then
+  echo "[deploy_models][ERROR] --run-mode must be CONTROLLER:SM with active|observe, got '$RUN_MODE'" >&2
+  exit 2
+fi
+
+apply_run_mode() {
+  if [[ -n "$RUN_MODE" ]]; then
+    echo "[deploy_models] run mode -> controller=${RUN_MODE%%:*} sm_actuation=${RUN_MODE##*:}"
+    bash "$SET_RUN_MODE" "${RUN_MODE%%:*}" "${RUN_MODE##*:}"
+  else
+    echo "[deploy_models] run mode unchanged (pass --run-mode CONTROLLER:SM to set both):"
+    bash "$SET_RUN_MODE" status
+  fi
+}
+
+if [[ "$STAGGERED" -eq 1 ]]; then
+  if [[ "$EXECUTE" -eq 1 ]]; then
+    echo "[deploy_models] staggered bring-up: controller + SM actuation -> observe first"
+    bash "$SET_RUN_MODE" observe observe
+  fi
+  python3 "$DEPLOY_DIR/scripts/staggered_model_fleet.py" \
+    --models-dir "$MODELS_DIR" ${PASS[@]+"${PASS[@]}"}
+  if [[ "$EXECUTE" -eq 1 ]]; then
+    apply_run_mode
+  fi
+  exit 0
 fi
 
 echo "[deploy_models] applying $MODELS_DIR ..."
@@ -36,3 +84,4 @@ kubectl apply -k "$MODELS_DIR"
 
 echo "[deploy_models] applied. service-manager reconcile will discover the bindings."
 echo "[deploy_models] verify with: curl -s http://<sm>:8000/v2/state | python3 -m json.tool"
+apply_run_mode

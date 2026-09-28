@@ -8,9 +8,12 @@ those only log and record what they would have done. The SM HTTP write API is
 never gated by it: the APA arm (AIBrix's own autoscaler) and operators drive
 the SM directly.
 
-Resolution: the SM key; if absent, derived from ``tre:v2:controller:mode``;
-neither set (or not a mode) = observe. A Redis error keeps the last known mode;
-never known = observe (fail-closed). Reads are cached for a short TTL.
+The switch is INDEPENDENT of the controller mode ``tre:v2:controller:mode``:
+both experiment arms run the SM in active (symmetric self-heal) while the APA
+arm keeps the controller in observe. Resolution: the SM key; absent (or not a
+mode) = observe -- never derived from the controller mode, so deployments must
+set it explicitly. A Redis error keeps the last known mode; never known =
+observe (fail-closed). Reads are cached for a short TTL.
 """
 from __future__ import annotations
 
@@ -22,7 +25,7 @@ from collections import deque
 from typing import Any, Callable
 
 from tre_common import rediskeys
-from tre_common.run_mode import OBSERVE, effective_mode, parse_mode
+from tre_common.run_mode import OBSERVE, parse_mode
 
 LOG = logging.getLogger(__name__)
 
@@ -60,9 +63,9 @@ class SmActuation:
         return self.mode() == OBSERVE
 
     def resolve(self) -> tuple[str, str]:
-        """(mode, source): source is ``sm`` (the SM key), ``controller`` (derived
-        from the controller mode), ``default`` (neither set: observe),
-        ``last_known`` (Redis error) or ``fail_closed`` (never read)."""
+        """(mode, source): source is ``sm`` (the SM key), ``default`` (key absent
+        or not a mode: observe), ``last_known`` (Redis error) or ``fail_closed``
+        (never read)."""
         now = self._monotonic()
         with self._lock:
             if now < self._expires_at:
@@ -76,11 +79,7 @@ class SmActuation:
     def _read(self) -> tuple[str, str]:
         try:
             own = parse_mode(self._redis.get(rediskeys.SM_ACTUATION_KEY))
-            if own is not None:
-                resolved = (own, "sm")
-            else:
-                derived = parse_mode(self._redis.get(rediskeys.CONTROLLER_MODE_KEY))
-                resolved = (effective_mode(derived), "controller" if derived is not None else "default")
+            resolved = (own, "sm") if own is not None else (OBSERVE, "default")
         except Exception as exc:  # noqa: BLE001 - keep the last known mode, fail closed
             with self._lock:
                 last = self._last_known

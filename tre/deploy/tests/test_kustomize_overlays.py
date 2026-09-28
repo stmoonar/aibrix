@@ -195,7 +195,8 @@ def test_tre_v2_overlay_declares_components_and_independent_redis() -> None:
     assert cm_rule["resourceNames"] == ["tre-v2-registry"]
     assert sorted(cm_rule["verbs"]) == ["get", "patch", "update"]
     dep_rule = next(r for r in ui_role["rules"] if r["resources"] == ["deployments"])
-    assert dep_rule["resourceNames"] == ["tre-v2-controller"]
+    # restart-to-apply rolls the controller AND the service-manager (P3, 2026-09-28)
+    assert dep_rule["resourceNames"] == ["tre-v2-controller", "tre-v2-service-manager"]
     assert sorted(dep_rule["verbs"]) == ["get", "patch"]
     ui_binding = next(d for d in rbac_docs if d["kind"] == "RoleBinding" and d["metadata"]["name"] == "tre-v2-ui-params")
     assert ui_binding["subjects"] == [{"kind": "ServiceAccount", "name": "tre-v2-ui", "namespace": "tre-v2"}]
