@@ -53,6 +53,14 @@ class SafeScaleTaskConfig(Protocol):
     safescale: object
 
 
+class MaintenanceReader(Protocol):
+    """``tre_controller.maintenance.MaintenanceWatch``."""
+
+    def poll(self): ...
+
+    def overlapping(self, start_ms: int): ...
+
+
 @dataclass(frozen=True)
 class SafeScaleObservationResult:
     submitted: int
@@ -73,6 +81,7 @@ def run_safescale_observation_tick(
     fresh_cluster_view: ClusterView | None = None,
     recovery_needs_fresh_view: bool = False,
     observe_mode: bool = False,
+    maintenance: MaintenanceReader | None = None,
 ) -> SafeScaleObservationResult:
     """One SafeScale observation tick. ``fresh_cluster_view`` is the SM view only
     while fresh (``ClusterViewBox.fresh``): with it, probes whose pods are all
@@ -84,7 +93,14 @@ def run_safescale_observation_tick(
     ``observe_mode`` (controller mode observe, 2026-09-28): no probe is observed
     or judged; every ``probing`` probe is rolled back instead (its probe pods
     unhidden, resolved ``observe_entered``). A ``committing`` probe's queued
-    action runs in the queue's observe-safe form (the donor unhide)."""
+    action runs in the queue's observe-safe form (the donor unhide).
+
+    ``maintenance`` (P2-3, the shared ``MaintenanceWatch``): while the SM
+    maintenance lock is present every ``probing`` probe is rolled back
+    (``sm_maintenance``), as is one whose window overlaps a maintenance period
+    seen at any time. A probe whose hide did not take effect (P3,
+    ``abort_reason``) is rolled back as well. Both before the stale-snapshot
+    return: neither needs metrics."""
     events: list[str] = []
     # B8: before the stale-snapshot return - it needs only the cluster view.
     _resolve_probes_with_gone_pods(
@@ -94,6 +110,11 @@ def run_safescale_observation_tick(
     submitted = 0
     if observe_mode:
         rolled_back = rollback_probes_for_observe(queue, safescale, now_ms=snapshot.ts_ms, events=events)
+        accepted_actions.extend(rolled_back)
+        submitted += len(rolled_back)
+    else:
+        rolled_back = _rollback_for_maintenance(queue, safescale, maintenance, now_ms=snapshot.ts_ms, events=events)
+        rolled_back += _rollback_aborted(queue, safescale, now_ms=snapshot.ts_ms, events=events)
         accepted_actions.extend(rolled_back)
         submitted += len(rolled_back)
     if snapshot.stale:
@@ -199,6 +220,7 @@ async def safescale_task(
     cluster_view_box: ClusterViewReader | None = None,
     gateway_source: GatewayCounterSource | None = None,
     is_observe: Callable[[], bool] | None = None,
+    maintenance: MaintenanceReader | None = None,
 ) -> None:
     while True:
         snapshot = snapshot_box.get()
@@ -220,6 +242,7 @@ async def safescale_task(
                 fresh_cluster_view=_fresh_view(cluster_view_box),
                 recovery_needs_fresh_view=cluster_view_box is not None,
                 observe_mode=observe_mode,
+                maintenance=maintenance,
             )
             _log_resolutions(snapshot.ts_ms, result, gateway_available=counters is not None)
         interval = getattr(getattr(cfg, "safescale"), "probe_poll_seconds")
@@ -276,6 +299,61 @@ def _resolve_probes_with_gone_pods(
         )
 
 
+def _rollback_for_maintenance(
+    queue, safescale, maintenance: MaintenanceReader | None, *, now_ms: int, events: list[str]
+) -> list[Action]:
+    """P2-3: roll back every probing probe while the SM maintenance lock is held,
+    and any probe whose window overlaps a maintenance period seen earlier. A read
+    error rolls nothing back (it only blocks probe starts, in the planner)."""
+    if maintenance is None:
+        return []
+    status = maintenance.poll()
+    if getattr(status, "error", None) is not None:
+        events.append("sm_maintenance_unreadable")
+    probes = getattr(safescale, "active_probes", None)
+    if not callable(probes):
+        return []
+    targets = []
+    for probe in probes():
+        period = status.period if status.present else maintenance.overlapping(probe.start_ms)
+        if status.present or period is not None:
+            targets.append((probe, period))
+    if not targets:
+        return []
+    for probe, period in targets:
+        LOG.warning(
+            json.dumps(
+                {"event": "safescale_probe_overlaps_sm_maintenance", "model": probe.model,
+                 "request_id": probe.request_id, "probe_start_ms": probe.start_ms,
+                 "maintenance_present": bool(status.present),
+                 "operation_id": getattr(period, "operation_id", None),
+                 "maintenance_since_ms": getattr(period, "since_ms", None),
+                 "maintenance_last_seen_ms": getattr(period, "last_seen_ms", None)},
+                sort_keys=True,
+            )
+        )
+    return rollback_probes(
+        queue, safescale, [probe for probe, _ in targets],
+        reason="sm_maintenance", event="safescale_maintenance_rollback", now_ms=now_ms, events=events,
+    )
+
+
+def _rollback_aborted(queue, safescale, *, now_ms: int, events: list[str]) -> list[Action]:
+    """P3: probes whose hide did not take effect (``abort_reason``) are rolled
+    back (the unhide is idempotent) - never judged as if their pods were hidden."""
+    probes = getattr(safescale, "active_probes", None)
+    if not callable(probes):
+        return []
+    aborted = [probe for probe in probes() if getattr(probe, "abort_reason", None)]
+    if not aborted:
+        return []
+    return rollback_probes(
+        queue, safescale, aborted,
+        reason=lambda probe: probe.abort_reason, event="safescale_hide_failed_rollback",
+        now_ms=now_ms, events=events,
+    )
+
+
 def rollback_probes_for_observe(queue, safescale, *, now_ms: int, events: list[str]) -> list[Action]:
     """Observe mode (user decision 2026-09-28): every ``probing`` probe is rolled
     back. Its queued one-shot actions (if any) are dropped and the single action
@@ -290,38 +368,59 @@ def rollback_probes_for_observe(queue, safescale, *, now_ms: int, events: list[s
     probes = getattr(safescale, "active_probes", None)
     if not callable(probes):
         return []
+    return rollback_probes(
+        queue, safescale, probes(),
+        reason="observe_entered", event="safescale_observe_rollback", now_ms=now_ms, events=events,
+    )
+
+
+def rollback_probes(
+    queue,
+    safescale,
+    probes,
+    *,
+    reason: str | Callable[[SafeScaleProbe], str],
+    event: str,
+    now_ms: int,
+    events: list[str],
+) -> list[Action]:
+    """Roll ``probes`` back without judging them: drop their queued one-shot
+    actions, submit the unhide of their probe pods and mark them ``committing``
+    (rollback ``reason``), resolved by the queue once the unhide finished.
+    Events ``<event>:<model>:<request_id>``, ``<event>_deferred`` (an action of the
+    probe is running, or the unhide was not accepted: retried next tick) and
+    ``<event>_enqueue_failed``."""
     cancel = getattr(queue, "cancel_request", None)
     mark = getattr(safescale, "mark_committing", None)
     durable = callable(mark) and callable(getattr(queue, "has_request", None))
     submitted: list[Action] = []
-    for probe in probes():
+    for probe in probes:
+        why = reason(probe) if callable(reason) else reason
         if callable(cancel) and not cancel(probe.request_id):
-            events.append(f"safescale_observe_rollback_deferred:{probe.model}:{probe.request_id}")
+            events.append(f"{event}_deferred:{probe.model}:{probe.request_id}")
             continue
-        unhide = UnhideAction(
-            probe.model, tuple(probe.pods), "observe_entered", "safescale", request_id=probe.request_id
-        )
+        unhide = UnhideAction(probe.model, tuple(probe.pods), why, "safescale", request_id=probe.request_id)
         try:
             result = queue.submit((unhide,))
         except Exception as exc:  # noqa: BLE001 - retried next tick
-            events.append(f"safescale_observe_rollback_enqueue_failed:{probe.model}:{type(exc).__name__}")
+            events.append(f"{event}_enqueue_failed:{probe.model}:{type(exc).__name__}")
             continue
         if int(getattr(result, "accepted", 0)) != 1:
-            events.append(f"safescale_observe_rollback_deferred:{probe.model}:{probe.request_id}")
+            events.append(f"{event}_deferred:{probe.model}:{probe.request_id}")
             continue
         if durable:
-            marked = mark(probe.model, status="rollback", reason="observe_entered", now_ms=now_ms)
+            marked = mark(probe.model, status="rollback", reason=why, now_ms=now_ms)
         else:
-            marked = safescale.resolve(probe.model, status="rollback", reason="observe_entered", now_ms=now_ms)
+            marked = safescale.resolve(probe.model, status="rollback", reason=why, now_ms=now_ms)
         if not marked:
             events.append(f"safescale_resolve_missing:{probe.model}")
             continue
         submitted.append(unhide)
-        events.append(f"safescale_observe_rollback:{probe.model}:{probe.request_id}")
+        events.append(f"{event}:{probe.model}:{probe.request_id}")
         LOG.warning(
             json.dumps(
-                {"event": "safescale_observe_rollback", "model": probe.model, "request_id": probe.request_id,
-                 "pods": list(probe.pods), "resolution": "rollback", "reason": "observe_entered"},
+                {"event": event, "model": probe.model, "request_id": probe.request_id,
+                 "pods": list(probe.pods), "resolution": "rollback", "reason": why},
                 sort_keys=True,
             )
         )

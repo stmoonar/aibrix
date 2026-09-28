@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import Awaitable, Callable, Protocol
+from typing import TYPE_CHECKING, Awaitable, Callable, Protocol
 
 from tre_common.metrics_schema import MetricsSnapshot
 from tre_common.registry import Registry
@@ -18,6 +18,9 @@ from tre_controller.loops.tick import (
 from tre_controller.planning.planner import ClusterView, IncompletePolicy
 from tre_controller.loops.model_state_box import ModelStateBox
 from tre_controller.signals.trs import SignalState
+
+if TYPE_CHECKING:
+    from tre_controller.maintenance import MaintenanceWatch
 
 if False:  # TYPE_CHECKING guard without importing typing symbol here
     from tre_controller.profiling import TickProfiler
@@ -61,6 +64,7 @@ def run_rescue_tick(
     prof: "TickProfiler | None" = None,
     action_cooldown: bool = False,
     observe_mode: bool = False,
+    probe_block_reason: str | None = None,
 ) -> LoopTickResult:
     return run_planner_tick(
         snapshot,
@@ -82,6 +86,7 @@ def run_rescue_tick(
         loop="rescue",
         action_cooldown=action_cooldown,
         observe_mode=observe_mode,
+        probe_block_reason=probe_block_reason,
     )
 
 
@@ -101,6 +106,7 @@ async def rescue_task(
     prof: "TickProfiler | None" = None,
     model_state_box: "ModelStateBox | None" = None,
     is_observe: Callable[[], bool] | None = None,
+    maintenance: "MaintenanceWatch | None" = None,
 ) -> None:
     paper_state_cache = PaperStateCache(max_stale_windows=getattr(cfg, "paper_stale_max_windows", 3))
     while True:
@@ -128,6 +134,10 @@ async def rescue_task(
                     action_cooldown=getattr(cfg, "action_cooldown", True),
                     # B8: controller mode, read per tick (ObserveModeGate, cached).
                     observe_mode=bool(is_observe()) if is_observe is not None else False,
+                    # P2-3: no probe starts while the SM maintenance lock is held.
+                    probe_block_reason=(
+                        maintenance.probe_block_reason() if maintenance is not None else None
+                    ),
                 )
             if model_state_box is not None and result.classifications:
                 # Review 3: the latest signal state, for the queue's commit revalidation.
