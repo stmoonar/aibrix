@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
+import logging
 import threading
 import time
 from typing import Protocol
 
 from tre_sm.state.operations import OperationBusy
-from tre_sm.state.safety import ControllerNotPaused, NodePressureActive
+from tre_sm.state.safety import MaintenanceLockLost, NodePressureActive
 from tre_sm.state.sleep_reservations import ReservationConflict
+
+LOG = logging.getLogger(__name__)
 
 
 class SupervisedService(Protocol):
@@ -15,7 +19,6 @@ class SupervisedService(Protocol):
     def recover_stale_fleet_repairs(self) -> dict | None: ...
     def detect_fleet_drift(self) -> list[dict]: ...
     def start_fleet_repair(self, *, awake_binding_ids=None, recovered_from=None) -> dict: ...
-    def enter_recovery_observe(self) -> str: ...
 
 
 @dataclass(frozen=True)
@@ -32,8 +35,16 @@ class FleetSupervisor:
 
     Drift must be identical for several observations before a repair is
     submitted. This filters normal Pod transitions while still recognizing a
-    batch eviction/replacement event. Repairs remain fail-closed: controller
-    observe mode and the pressure hysteresis gate are enforced by the repair.
+    batch eviction/replacement event. Repairs remain fail-closed: the repair
+    holds the SM maintenance lock and the pressure hysteresis gate.
+
+    SM actuation ``observe`` (``tre:v2:sm:actuation``, user decision
+    2026-09-28): every supervisor action that changes capacity or recreates /
+    deletes workloads - B7 recreate, drift -> fleet repair, stale repair
+    recovery, reaping rejected Deployments - only logs and records what it
+    would have done. State-consistency passes that change no awake count keep
+    running: sleep journal recovery, desired seeding, startup convergence of
+    admitted Pods, orphan ``starting`` lease reaping.
     """
 
     def __init__(
@@ -86,7 +97,22 @@ class FleetSupervisor:
             last_recovery_operation_id=self._last_recovery_operation_id,
         )
 
+    def _actuation_observe(self) -> bool:
+        """SM actuation observe? A service without the switch (embedded / unit
+        tests without a safety gate) is treated as active."""
+        reader = getattr(self._service, "actuation_observe", None)
+        return bool(reader()) if callable(reader) else False
+
+    def _suppress(self, action: str, detail: dict) -> None:
+        record = getattr(self._service, "record_suppressed", None)
+        if callable(record):
+            record(action, detail)
+        else:
+            LOG.warning(json.dumps({"event": "sm_supervisor_action_suppressed", "action": action,
+                                    "detail": detail}, sort_keys=True, default=str))
+
     def run_once(self) -> None:
+        observe = self._actuation_observe()
         recover = getattr(self._service, "recover_sleep_journal", None)
         if callable(recover):
             try:
@@ -103,7 +129,7 @@ class FleetSupervisor:
         reap = getattr(self._service, "reap_rejected_deployments", None)
         if callable(reap):
             try:
-                reap()
+                reap(actuate=False) if observe else reap()
             except OperationBusy:
                 pass  # a writer (possibly starting a Pod) is active; next pass
         reap_leases = getattr(self._service, "reap_orphan_starting_leases", None)
@@ -112,7 +138,11 @@ class FleetSupervisor:
                 reap_leases()
             except OperationBusy:
                 pass  # a writer (possibly starting a Pod) is active; next pass
-        recovered = self._service.recover_stale_fleet_repairs()
+        recovered = (
+            self._service.recover_stale_fleet_repairs(actuate=False)
+            if observe
+            else self._service.recover_stale_fleet_repairs()
+        )
         if recovered is not None:
             self._last_recovery_operation_id = str(recovered["operation_id"])
             self._reset_drift()
@@ -149,12 +179,17 @@ class FleetSupervisor:
             # B7: only Deployments of sleeping residents are gone - recreate
             # just those (their Pods pass the startup gate) instead of a
             # fleet-wide repair. None = not eligible: full repair below.
-            repaired = targeted([item.get("binding_id") for item in drift])
+            ids = [item.get("binding_id") for item in drift]
+            repaired = targeted(ids, actuate=False) if observe else targeted(ids)
             if repaired is not None:
                 self._last_repair_at = now
                 self._reset_drift()
                 return
-        self._service.enter_recovery_observe()
+        if observe:
+            self._suppress("fleet_repair", {"drift": drift})
+            self._last_repair_at = now
+            self._reset_drift()
+            return
         submitted = self._service.start_fleet_repair()
         self._last_repair_at = now
         self._last_recovery_operation_id = str(submitted["operation_id"])
@@ -165,10 +200,10 @@ class FleetSupervisor:
             try:
                 self.run_once()
                 self._last_error = None
-            except (OperationBusy, ControllerNotPaused, NodePressureActive, ReservationConflict):
-                # Expected gates: another writer is converging, controller is
-                # active, pressure remains, or a sleep is draining. Retry without
-                # mutating intent.
+            except (OperationBusy, MaintenanceLockLost, NodePressureActive, ReservationConflict):
+                # Expected gates: another writer is converging, the maintenance
+                # lock was taken away, pressure remains, or a sleep is draining.
+                # Retry without mutating intent.
                 pass
             except Exception as exc:  # keep supervision alive and observable.
                 self._last_error = f"{type(exc).__name__}: {exc}"

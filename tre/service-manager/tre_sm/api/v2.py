@@ -52,11 +52,17 @@ from tre_sm.ops.sleep_primitive import (
 )
 from tre_sm.state.sleep_reservations import ReservationConflict, SleepReservations
 from tre_sm.state.reconcile import K8sPodClient, POD_STATE_AWAKE, POD_STATE_HIDDEN, POD_STATE_SLEEPING, audit_state, observe_bindings, reconcile_state
-from tre_sm.state.operations import OperationBusy, OperationCoordinator, current_operation
+from tre_sm.state.operations import (
+    OperationBusy,
+    OperationCoordinator,
+    current_operation,
+    reset_current_actor,
+    set_current_actor,
+)
 from tre_sm.state.fleet_repair import FleetRepairExecutor
 from tre_sm.state.fleet_seed import registry_binding_ids, seed_binding_ids, seed_desired
 from tre_sm.state.fleet_store import DesiredBinding, FleetStateConflict, FleetStateStore, ObservedBinding
-from tre_sm.state.safety import ClusterSafetyGate, ControllerNotPaused, NodePressureActive
+from tre_sm.state.safety import ClusterSafetyGate, MaintenanceLockLost, NodePressureActive
 from tre_sm.state.gpu_leases import GpuLeaseConflict, GpuLeaseStore
 from tre_sm.state.store import StateConflict, StateFenceError, StateStore
 from tre_sm.api.v1_compat import create_v1_compat_router
@@ -246,8 +252,47 @@ class ServiceManagerV2:
 
     def get_supervisor_state(self) -> dict:
         if self._supervisor is None:
-            return {"running": False, "enabled": False}
-        return {"enabled": True, **asdict(self._supervisor.snapshot())}
+            state = {"running": False, "enabled": False}
+        else:
+            state = {"enabled": True, **asdict(self._supervisor.snapshot())}
+        return {**state, **self._actuation_payload()}
+
+    def _actuation_payload(self) -> dict:
+        """SM actuation switch + maintenance lock, for /v2/supervisor (console)."""
+        gate = self._safety_gate
+        payload: dict = {}
+        reader = getattr(gate, "actuation_state", None)
+        if callable(reader):
+            try:
+                payload["actuation"] = reader()
+            except Exception as exc:  # display only
+                payload["actuation"] = {"error": str(exc)}
+        maintenance = getattr(gate, "maintenance", None)
+        if callable(maintenance):
+            try:
+                payload["maintenance"] = maintenance()
+            except Exception as exc:  # display only
+                payload["maintenance"] = {"error": str(exc)}
+        return payload
+
+    # ------------------------------------------------------ actuation switch
+    def actuation_observe(self) -> bool:
+        """SM actuation observe (``tre:v2:sm:actuation``, user decision
+        2026-09-28): the supervisor takes no capacity-changing action and a
+        startup admission nobody requested sleeps no resident. Without a safety
+        gate (embedded / unit-test wiring) the SM is active."""
+        reader = getattr(self._safety_gate, "actuation_mode", None)
+        if not callable(reader):
+            return False
+        return reader() == "observe"
+
+    def record_suppressed(self, action: str, detail: dict) -> None:
+        record = getattr(self._safety_gate, "record_suppressed", None)
+        if callable(record):
+            record(action, detail)
+        else:
+            LOG.warning(json.dumps({"event": "sm_supervisor_action_suppressed", "action": action,
+                                    "detail": detail}, sort_keys=True, default=str))
 
     def get_state(self) -> dict:
         snapshot = self._store.load()
@@ -1428,7 +1473,6 @@ class ServiceManagerV2:
             raise ValueError("fleet repair runtime is not configured")
         if self._safety_gate is None:
             raise ValueError("fleet repair safety gate is not configured")
-        self._safety_gate.assert_controller_observe()
         reservations = self._reservations()
         active = reservations.active() if reservations is not None else {}
         if active:
@@ -1443,7 +1487,7 @@ class ServiceManagerV2:
             else self._desired_awake_binding_ids(snapshot.bindings)
         )
 
-        def run(operation) -> None:
+        def repair(operation) -> None:
             for stale_operation_id in recovered_from or []:
                 operation.supersede(stale_operation_id)
             if self._fleet_store is not None:
@@ -1468,6 +1512,21 @@ class ServiceManagerV2:
                 audit=self.audit,
             )
 
+        def run(operation) -> None:
+            # The SM maintenance lock (not the controller mode) marks the repair
+            # for its whole run; clearing it aborts the repair (2026-09-28).
+            self._safety_gate.acquire_maintenance(
+                operation.operation_id, kind="fleet_repair",
+                owner=str(getattr(self._operation_coordinator, "owner", "")),
+            )
+            try:
+                repair(operation)
+            finally:
+                try:
+                    self._safety_gate.release_maintenance(operation.operation_id)
+                except Exception:  # a stale lock is taken over by the next repair
+                    LOG.exception("releasing the SM maintenance lock of %s failed", operation.operation_id)
+
         operation_request = {"awake_binding_ids": targets}
         if recovered_from:
             operation_request["recovered_from"] = recovered_from
@@ -1485,7 +1544,9 @@ class ServiceManagerV2:
             response["recovered_from"] = recovered_from
         return response
 
-    def recover_stale_fleet_repairs(self) -> dict | None:
+    def recover_stale_fleet_repairs(self, *, actuate: bool = True) -> dict | None:
+        """Supervisor pass: resume a fleet repair a dead SM left running. With
+        ``actuate=False`` (SM actuation observe) it is only recorded."""
         if self._operation_coordinator is None:
             return None
         if self._operation_coordinator.active_operation() is not None:
@@ -1495,7 +1556,12 @@ class ServiceManagerV2:
         )
         if not stale:
             return None
-        self.enter_recovery_observe()
+        if not actuate:
+            self.record_suppressed(
+                "fleet_repair_recovery",
+                {"stale_operation_ids": [str(record.get("operation_id")) for record in stale]},
+            )
+            return None
         newest = stale[0]
         request = newest.get("request") or {}
         return self.start_fleet_repair(
@@ -1529,7 +1595,7 @@ class ServiceManagerV2:
             and item.binding_id not in deployed
         ]
 
-    def repair_missing_deployments(self, binding_ids) -> dict | None:
+    def repair_missing_deployments(self, binding_ids, *, actuate: bool = True) -> dict | None:
         """Supervisor pass (B7): drift that is ONLY ``deployment_missing`` of
         registry bindings desired resident + sleeping is repaired by creating
         just those Deployments again from the registry - no fleet-wide
@@ -1542,6 +1608,11 @@ class ServiceManagerV2:
             return None
         if not wanted <= {item.binding_id for item in self._missing_registry_deployments(power="sleeping")}:
             return None
+        if not actuate:
+            # SM actuation observe (2026-09-28): recreating a workload is not a
+            # state-consistency action - record what would have been done.
+            self.record_suppressed("recreate_missing_deployments", {"binding_ids": sorted(wanted)})
+            return {"binding_ids": sorted(wanted), "created": [], "suppressed": True}
         created: list[str] = []
         with self._writer("deployment_repair", wait_s=0.0):
             # Again under the lock: another writer may have changed them meanwhile.
@@ -1556,11 +1627,6 @@ class ServiceManagerV2:
                     planned.binding_id,
                 )
         return {"binding_ids": sorted(wanted), "created": created}
-
-    def enter_recovery_observe(self) -> str:
-        if self._safety_gate is None:
-            raise ValueError("fleet repair safety gate is not configured")
-        return self._safety_gate.enter_recovery_observe()
 
     def detect_fleet_drift(self) -> list[dict]:
         if self._runtime_ops is None or self._fleet_store is None:
@@ -1697,6 +1763,7 @@ class ServiceManagerV2:
                 )
         self._assert_startup_slot_free(pod)
         self._assert_startup_owner_live(pod)
+        self._assert_unrequested_startup_allowed(pod)
         slept: list[Binding] = []
         try:
             slept = self._sleep_overlapping_residents(pod)
@@ -1806,7 +1873,7 @@ class ServiceManagerV2:
         except Exception:  # the supervisor's convergence clears it later
             LOG.warning("clearing the startup admission of %s failed", pod_name)
 
-    def reap_rejected_deployments(self) -> list[str]:
+    def reap_rejected_deployments(self, *, actuate: bool = True) -> list[str]:
         """Supervisor pass (review 4 P1): delete model Deployments whose binding
         is desired ``absent`` and that have no Running Pod - e.g. left by a
         failed cold start / defrag whose cleanup did not go through. Their Pods
@@ -1828,6 +1895,13 @@ class ServiceManagerV2:
             and desired[item.binding_id].lifecycle == "absent"
         ]
         if not candidates:
+            return []
+        if not actuate:
+            # SM actuation observe (2026-09-28): deleting workloads only logged.
+            self.record_suppressed(
+                "reap_rejected_deployments",
+                {"deployments": sorted(item.name for item in candidates)},
+            )
             return []
         reaped: list[str] = []
         with self._writer("reap_rejected_deployments", wait_s=0.0):
@@ -2038,13 +2112,35 @@ class ServiceManagerV2:
                 "suspended_binding_ids": suspended,
             }
 
-    def _sleep_overlapping_residents(self, pod: StartupPodRecord) -> list[Binding]:
-        """Split-sleep (drain outside the writer lock) every awake resident on the
-        startup Pod's GPUs; returns the bindings put to sleep. Desired power is
-        untouched: a resident desired awake is recorded as suspended by the
-        admission and woken after convergence."""
-        if self._sleep_primitive is None:
-            return []
+    def _assert_unrequested_startup_allowed(self, pod: StartupPodRecord) -> None:
+        """Startup admission WITHOUT an owning operation (no SM operation or API
+        caller is starting this Pod - k8s restarted it, a Deployment was
+        applied or scaled by hand): with SM actuation observe (2026-09-28) it
+        must not sleep awake residents on the Pod's GPUs - that changes the
+        awake count nobody asked for. Refused (retriable 409; the init gate
+        polls again, so the Pod is admitted once the residents are asleep or
+        the actuation is active again) and recorded. Without an awake
+        overlapping resident the admission sleeps nothing and proceeds. The
+        admission of a Pod an operation creates itself (cold start, defrag
+        migration, fleet repair: phase ``starting_binding``) is pre-authorized
+        and never reaches this check."""
+        if not self.actuation_observe():
+            return
+        awake = self._awake_overlapping_residents(pod)
+        if not awake:
+            return
+        ids = sorted(binding.binding_id for binding in awake)
+        self.record_suppressed(
+            "startup_admission_sleep",
+            {"pod": pod.name, "binding_id": pod.binding_id, "would_sleep": ids},
+        )
+        raise RetryLater(
+            f"startup of {pod.name} would sleep awake resident(s) {ids}: SM actuation is observe "
+            "and no operation requested this Pod; retry the admission"
+        )
+
+    def _awake_overlapping_residents(self, pod: StartupPodRecord) -> list[Binding]:
+        """Ready residents on the startup Pod's GPUs that vLLM reports awake."""
         awake: list[Binding] = []
         target_gpus = set(pod.gpu_ids)
         for snapshot in self._runtime_ops.list_startup_resident_snapshots():
@@ -2057,6 +2153,16 @@ class ServiceManagerV2:
                 continue  # the admission refuses it under the lock
             if self._vllm_ops.is_sleeping(snapshot.pod_ip, port=8000) is False:
                 awake.append(binding)
+        return awake
+
+    def _sleep_overlapping_residents(self, pod: StartupPodRecord) -> list[Binding]:
+        """Split-sleep (drain outside the writer lock) every awake resident on the
+        startup Pod's GPUs; returns the bindings put to sleep. Desired power is
+        untouched: a resident desired awake is recorded as suspended by the
+        admission and woken after convergence."""
+        if self._sleep_primitive is None:
+            return []
+        awake = self._awake_overlapping_residents(pod)
         if not awake:
             return []
         outcomes = self._split_sleep(awake, sleep_path="startup", kind="startup_admit_sleep")
@@ -3378,11 +3484,26 @@ def create_app(service: ServiceManagerV2) -> FastAPI:
     ) -> JSONResponse:
         return JSONResponse(status_code=409, content={"detail": str(exc)})
 
-    @app.exception_handler(ControllerNotPaused)
-    async def controller_not_paused_handler(
-        _request: Request, exc: ControllerNotPaused
+    @app.exception_handler(MaintenanceLockLost)
+    async def maintenance_lock_lost_handler(
+        _request: Request, exc: MaintenanceLockLost
     ) -> JSONResponse:
         return JSONResponse(status_code=409, content={"detail": str(exc)})
+
+    @app.middleware("http")
+    async def record_actor(request: Request, call_next):
+        # Who called a write API (controller, APA arm, console, operator): kept
+        # in the request of every SM operation it starts (2026-09-28). The
+        # X-TRE-Actor header when sent, else User-Agent + remote address.
+        actor = request.headers.get("x-tre-actor")
+        if not actor:
+            client = request.client.host if request.client is not None else "?"
+            actor = f"ua={request.headers.get('user-agent', '?')};addr={client}"
+        token = set_current_actor(actor[:200])
+        try:
+            return await call_next(request)
+        finally:
+            reset_current_actor(token)
 
     @app.exception_handler(NodePressureActive)
     async def node_pressure_handler(
