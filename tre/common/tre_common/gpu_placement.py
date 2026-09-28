@@ -66,6 +66,8 @@ from fractions import Fraction
 from typing import Any, Iterable, Mapping, Sequence
 import re
 
+from tre_common.registry import tp_size_error
+
 
 __all__ = [
     "BEST_FIT",
@@ -187,6 +189,16 @@ def placement_policy_from_registry(
     models' headroom (:meth:`PlacementPolicy.for_awake`).
     """
     models = list(registry.models())
+    topology = getattr(registry, "topology", None)
+    nodes = getattr(topology(), "nodes", ()) if callable(topology) else ()
+    widest = max((int(node.gpus) for node in nodes), default=None)
+    for model in models:
+        # The registry rule (power of two, fits a node; the binding-layout cap is
+        # enforced where the registry is loaded): an unsupported tp_size never
+        # falls back to another policy, nor is it ignored by the max below.
+        problem = tp_size_error(model.tp_size, widest_node_gpus=widest, max_tp_size=None)
+        if problem:
+            raise ValueError(f"placement policy: model {model.name}: unsupported {problem}")
     max_tp = max((int(model.tp_size) for model in models), default=1)
     placement = getattr(registry, "placement", None)
     config = placement() if callable(placement) else None
@@ -303,6 +315,12 @@ def _normalise_occupied(
 
 
 def _validate_tp_size(tp_size: int, nodes: Mapping[str, int]) -> int:
+    """Generic buddy-block check: any power of two that fits a node - the same
+    power-of-two / widest-node rule as ``tre_common.registry.tp_size_error``,
+    without the registry's binding-layout cap, so the library stays usable for
+    wider blocks."""
+    if isinstance(tp_size, bool) or not isinstance(tp_size, int) or tp_size < 1 or tp_size & (tp_size - 1):
+        raise ValueError(f"tp_size must be a power of two >= 1, got {tp_size!r}")
     order = block_order(tp_size)
     widest = max(nodes.values())
     if tp_size > widest:

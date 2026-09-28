@@ -76,3 +76,16 @@ binding 中放置，返回 `model -> binding_id`，运行时经 SM 状态解析�
 **警告：历史 campaign 的基线全部在 node9（7b gpu0、8b gpu1、14b gpu2-3），且历史运行期间放置策略是
 整节点打包。用新基线 / 新策略跑出的结果与历史实验在布局上不可比，不能直接并表对比；需要可比时用
 `--baseline` 显式指定历史基线，并注意运行中的扩缩放置仍按新策略。**
+
+## 6. registry 变更需重启 SM
+
+SM 只在启动时读一次 registry（`tre_sm/server.py` `load_registry` → `ServiceManagerV2.__init__` 派生
+placement policy 与 `SlotAllocator` 规则），没有热重载。placement 相关的 registry 修改（`placement.*`、
+`models[].tp_size`、`max_awake_replicas` 等缩放上限、`cluster.nodes`）必须
+`kubectl -n tre-v2 rollout restart deploy/tre-v2-service-manager` 才对 SM 生效；console 的
+controller restart 只重启 controller，两者都要重启，否则 controller 与 SM 按不同策略放置。
+
+`models[].tp_size` 的合法性只有一个来源：`tre_common.registry.tp_size_error`（2 的幂、>= 1、不超过最宽节点、
+不超过 binding 布局支持的 `MAX_SUPPORTED_TP_SIZE = 2`）。registry 加载时即拒绝（SM、controller、UI 都经它加载），
+`validate()`、SM `SlotAllocator`、`bindings.feasible_slots` 与 `placement_policy_from_registry`
+（后者只用 2 的幂 + 最宽节点这条通用规则）同规则报错；SM 不再对不支持的 tp_size 静默退回 best-fit。

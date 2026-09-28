@@ -18,7 +18,7 @@ from tre_sm.ops.sleep_primitive import GatewayState, SleepJournal
 from tre_sm.ops.vllm_ops import VllmOps
 from tre_sm.state.reconcile import PodRecord
 from tre_sm.state.operations import OperationCoordinator
-from tre_sm.state.safety import ClusterSafetyGate
+from tre_sm.state.safety import MAINTENANCE_RENEW_S, MAINTENANCE_TTL_S, ClusterSafetyGate
 from tre_sm.state.fleet_seed import seed_desired
 from tre_sm.state.fleet_store import FleetStateStore
 from tre_sm.state.gpu_leases import GpuLeaseStore
@@ -147,6 +147,12 @@ def create_app() -> FastAPI:
         ),
         pressure_timeout_s=float(
             os.environ.get("TRE_SM_PRESSURE_TIMEOUT_S", "3600")
+        ),
+        maintenance_ttl_s=float(
+            os.environ.get("TRE_SM_MAINTENANCE_TTL_S", str(MAINTENANCE_TTL_S))
+        ),
+        maintenance_renew_s=float(
+            os.environ.get("TRE_SM_MAINTENANCE_RENEW_S", str(MAINTENANCE_RENEW_S))
         ),
     )
     return create_service_app(

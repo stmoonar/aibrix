@@ -6,6 +6,8 @@ from tre_common import rediskeys
 from tre_sm.state.actuation import SmActuation
 from tre_sm.state.safety import ClusterSafetyGate, MaintenanceLockLost
 
+from sm_test_fakes import maintenance_lua
+
 
 class FakeRedis:
     """Plain key-value Redis; ``fail`` makes every read raise."""
@@ -14,6 +16,7 @@ class FakeRedis:
         self.kv = dict(values or {})
         self.lists: dict[str, list] = {}
         self.sets = []
+        self.ttls_ms: dict[str, int] = {}
         self.fail = False
 
     def get(self, key):
@@ -25,10 +28,19 @@ class FakeRedis:
     def set(self, key, value):
         self.kv[key] = value
         self.sets.append((key, value))
+        self.ttls_ms.pop(key, None)
 
     def delete(self, *keys):
         for key in keys:
             self.kv.pop(key, None)
+            self.ttls_ms.pop(key, None)
+
+    def eval(self, script, numkeys, *keys_and_args):
+        if self.fail:
+            raise ConnectionError("redis down")
+        result = maintenance_lua(self.kv, self.ttls_ms, script, keys_and_args)
+        assert result is not NotImplemented, "unknown Lua script"
+        return result
 
     def lpush(self, key, value):
         self.lists.setdefault(key, []).insert(0, value)
