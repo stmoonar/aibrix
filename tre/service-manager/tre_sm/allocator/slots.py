@@ -7,6 +7,7 @@ import re
 
 from tre_common.gpu_placement import (
     GpuBlock,
+    PlacementPolicy,
     choose_placement,
     enumerate_blocks,
     plan_releases,
@@ -116,21 +117,38 @@ def awake_gpus(bindings) -> set[tuple[str, int]]:
     }
 
 
+def awake_model_counts(bindings) -> dict[str, int]:
+    """``{model: awake bindings}`` (input of ``PlacementPolicy.for_awake``)."""
+    counts: dict[str, int] = {}
+    for binding in bindings:
+        if binding.awake:
+            counts[binding.model] = counts.get(binding.model, 0) + 1
+    return counts
+
+
+def model_awake_gpus(bindings, models) -> set[tuple[str, int]]:
+    """``(node, gpu)`` of every GPU an awake binding of one of ``models`` holds."""
+    models = {models} if isinstance(models, str) else set(models)
+    return awake_gpus(binding for binding in bindings if binding.model in models)
+
+
 def release_order(
     candidates: list["Binding"],
     *,
     bindings: list["Binding"],
     topology: ClusterTopology,
     already_released: "list[Binding] | tuple[Binding, ...]" = (),
+    policy: PlacementPolicy | None = None,
 ) -> list["Binding"]:
-    """Awake bindings ordered by how much free space stopping them gives back.
+    """Awake bindings ordered by :func:`tre_common.gpu_placement.plan_releases`.
 
-    Mirror image of :func:`gpu_slot_candidates` placement: the replica whose slot
-    merges into the largest free block goes first, so shrinking off four GPUs
-    hands back an aligned pair instead of two orphaned singles.  Shared by the
-    service-manager shrink and the controller's safescale probe order.
-    ``already_released`` are bindings the caller stops first (the hidden ones), so
-    their GPUs count as free while the rest are scored.
+    Mirror image of placement under the same ``policy`` (the registry placement
+    policy; None = plain buddy best-fit): the replica whose slot merges into the
+    largest free block goes first, then the one on the most loaded node / the node
+    holding most of the model, so shrinking hands back aligned pairs and the load
+    stays balanced.  Shared by the service-manager shrink and the controller's
+    safescale probe order.  ``already_released`` are bindings the caller stops
+    first (the hidden ones), so their GPUs count as free while the rest are scored.
     """
     if len(candidates) <= 1:
         return list(candidates)
@@ -143,13 +161,18 @@ def release_order(
     scorable_ids = {binding.serve_id for binding in scorable}
     rest = [binding for binding in candidates if binding.serve_id not in scorable_ids]
     occupied = awake_gpus(bindings)
+    model_occupied = model_awake_gpus(bindings, {binding.model for binding in candidates})
     for binding in already_released:
-        occupied -= {(binding.slot.node, gpu) for gpu in binding.slot.gpu_ids}
+        released = {(binding.slot.node, gpu) for gpu in binding.slot.gpu_ids}
+        occupied -= released
+        model_occupied -= released
     picks = plan_releases(
         [slot_block(binding.slot) for binding in scorable],
         nodes=nodes,
         occupied=occupied,
         count=len(scorable),
+        policy=policy,
+        model_occupied=model_occupied & occupied,
     )
     return [scorable[pick.index] for pick in picks] + rest
 
@@ -168,30 +191,37 @@ class SlotAllocator:
         bindings: list[Binding],
         *,
         allow_awake_conflicts: bool = False,
+        policy: PlacementPolicy | None = None,
     ) -> None:
         self._topology = topology
         self._allow_awake_conflicts = allow_awake_conflicts
+        #: Registry placement policy (None = plain buddy best-fit).
+        self._policy = policy
         self._bindings: dict[str, Binding] = {}
         self._awake_gpu_to_serve: dict[tuple[str, int], str] = {}
         for binding in bindings:
             self.bind(binding.serve_id, binding.model, binding.slot, awake=binding.awake)
 
-    def find_slot(self, tp_size: int) -> Slot | None:
-        """Least wasteful free slot of ``tp_size`` GPUs (buddy best-fit).
+    def find_slot(self, tp_size: int, model: str | None = None) -> Slot | None:
+        """Best free slot of ``tp_size`` GPUs for ``model`` under the placement policy.
 
         Shares :func:`tre_common.gpu_placement.choose_placement` with the
-        controller, so a cold create packs the same way a wake does: a single-GPU
-        replica lands beside an existing one before it splits an empty pair.
+        controller, so a cold create lands the same way a wake does.  ``model``
+        (optional) spreads the model's replicas across nodes.
         """
         self._validate_tp_size(tp_size)
         candidates = gpu_slot_candidates(self._topology, tp_size)
         if not candidates:
             return None
+        bindings = list(self._bindings.values())
+        policy = self._policy.for_awake(awake_model_counts(bindings)) if self._policy else None
         choice = choose_placement(
             [slot_block(slot) for slot in candidates],
             nodes=node_gpu_counts(self._topology),
             occupied=set(self._awake_gpu_to_serve),
             tp_size=tp_size,
+            policy=policy,
+            model_occupied=model_awake_gpus(bindings, model) if model else (),
         )
         return None if choice is None else block_slot(choice.block)
 

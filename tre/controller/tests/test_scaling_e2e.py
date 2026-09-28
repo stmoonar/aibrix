@@ -99,12 +99,14 @@ def test_e1_receiver_gets_the_slot_the_donor_frees() -> None:
     assert idle == 0
     assert result.classifications["dsllama-8b"].state == ModelState.CRITICAL
     assert result.classifications["dsqwen-7b"].state == ModelState.HIGH
+    # Placement policy: 8b already has a replica on node9, so the donor slot picked for
+    # the receiver is the first one on node10 (same-model spread).
     assert _scale(result) == [
-        ("dsqwen-7b", -1, "critical_donor_immediate", ("7b-1",)),
-        ("dsllama-8b", 1, "critical_donor_immediate", ("8b-1",)),
+        ("dsqwen-7b", -1, "critical_donor_immediate", ("7b-4",)),
+        ("dsllama-8b", 1, "critical_donor_immediate", ("8b-4",)),
     ]
-    assert calls == [("set_binding_power", "7b-1", False), ("set_binding_power", "8b-1", True)]
-    assert {"8b-0", "8b-1"} <= awake and "7b-1" not in awake
+    assert calls == [("set_binding_power", "7b-4", False), ("set_binding_power", "8b-4", True)]
+    assert {"8b-0", "8b-4"} <= awake and "7b-4" not in awake
 
 
 def test_repro_a_gpu_with_only_a_foreign_sleeping_binding_is_not_receiver_idle_capacity() -> None:
@@ -125,11 +127,12 @@ def test_repro_a_gpu_with_only_a_foreign_sleeping_binding_is_not_receiver_idle_c
 
     assert idle == 1  # the raw free-GPU count is still reported ...
     assert "critical_idle_unusable:dsllama-8b" in result.events  # ... but not usable by 8b
+    # Placement policy: node10 has the free GPU, so it is the less loaded node.
     assert _scale(result) == [
-        ("dsqwen-7b", -1, "critical_donor_immediate", ("7b-0",)),
-        ("dsllama-8b", 1, "critical_donor_immediate", ("8b-0",)),
+        ("dsqwen-7b", -1, "critical_donor_immediate", ("7b-4",)),
+        ("dsllama-8b", 1, "critical_donor_immediate", ("8b-4",)),
     ]
-    assert "8b-0" in awake and "7b-0" not in awake
+    assert "8b-4" in awake and "7b-4" not in awake
 
 
 def test_repro_a_fully_empty_gpu_is_not_receiver_idle_capacity_while_it_has_blocked_sleepers() -> None:
@@ -146,7 +149,7 @@ def test_repro_a_fully_empty_gpu_is_not_receiver_idle_capacity_while_it_has_bloc
 
     assert idle == 1
     assert not any(reason == "critical_idle_capacity" for _, _, reason, _ in _scale(result))
-    assert "8b-0" in awake
+    assert "8b-4" in awake  # the less loaded node10 (placement policy)
 
 
 def test_empty_gpu_is_used_by_create_when_receiver_has_no_sleeping_binding() -> None:
@@ -243,18 +246,19 @@ def test_tp2_critical_receiver_with_blocked_sleeping_binding_does_not_request_em
 
 
 def test_planned_sleeping_wakes_land_on_the_slot_the_planner_claimed() -> None:
-    # P2-3: the SM's own wake order is (awake bindings per node, natural key). R1 could
-    # wake r-a (node9/1) or r-b (node10/1); the SM alone would pick r-b (node10 is less
-    # loaded) and steal the only slot R2 can use. Binding-level wakes follow the plan.
+    # P2-3: R1 could wake r-a (node9/1) or r-b (node10/1); the planner picks r-a (R1
+    # already has a replica on node10, so the placement policy spreads it to node9) and
+    # leaves r-b's GPU to R2, whose only slot it is. Binding-level wakes make the SM
+    # wake exactly the planned slots instead of re-picking on its own.
     registry = _registry(("R1", 1, 1, 8), ("R2", 1, 1, 8), ("F", 1, 1, 8))
     bindings = [
-        Binding("r-0", "R1", Slot("node9", (0,)), awake=True),
+        Binding("r-0", "R1", Slot("node10", (0,)), awake=True),
         Binding("r-a", "R1", Slot("node9", (1,)), awake=False),
         Binding("r-b", "R1", Slot("node10", (1,)), awake=False),
         Binding("s-0", "R2", Slot("node9", (2,)), awake=True),
         Binding("s-1", "R2", Slot("node10", (1,)), awake=False),
         Binding("f-3", "F", Slot("node9", (3,)), awake=True),
-        Binding("f-5", "F", Slot("node10", (0,)), awake=True),
+        Binding("f-5", "F", Slot("node9", (0,)), awake=True),
         Binding("f-6", "F", Slot("node10", (2,)), awake=True),
         Binding("f-7", "F", Slot("node10", (3,)), awake=True),
     ]

@@ -59,6 +59,9 @@ class _RoutableBody(BaseModel):
 
 class _DefragBody(BaseModel):
     tp_size: int = 2
+    #: Forwarded to the service-manager: run even while registry
+    #: placement.defrag.enabled is false (otherwise it refuses with 409).
+    force: bool = False
 
 
 class _ModeBody(BaseModel):
@@ -364,8 +367,10 @@ def create_ui_app(
 
     @app.post("/api/ops/defrag")
     def op_defrag(body: _DefragBody) -> dict[str, Any]:
-        _AUDIT.info(json.dumps({"op": "defrag", "tp_size": body.tp_size}))
-        return _proxy(service_manager_client, "POST", "/v2/defrag", {"tp_size": body.tp_size})
+        _AUDIT.info(json.dumps({"op": "defrag", "tp_size": body.tp_size, "force": body.force}))
+        return _proxy(
+            service_manager_client, "POST", "/v2/defrag", {"tp_size": body.tp_size, "force": body.force}
+        )
 
     return app
 

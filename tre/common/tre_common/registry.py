@@ -325,6 +325,23 @@ class ReissueConfig:
 
 
 @dataclass(frozen=True)
+class PlacementConfig:
+    """Registry ``placement:`` section (design note
+    tre/docs/design/20260928-placement-node-balance.md). The placement policy itself
+    (``tre_common.gpu_placement.placement_policy_from_registry``) is derived from
+    these keys plus the models' ``tp_size``."""
+
+    #: Keep this many fully free aligned blocks of the widest model's size (TP2 pairs
+    #: today) when placing narrower replicas. Soft: it ranks placements, never blocks
+    #: one; a no-op when every model is tp_size 1.
+    reserve_tp_pairs: int = 1
+    #: Automatic defragmentation (controller ``critical_tp_defrag``). Off by default,
+    #: as in v1. The manual service-manager ``POST /v2/defrag`` also refuses while it
+    #: is off unless the request carries ``force: true``.
+    defrag_enabled: bool = False
+
+
+@dataclass(frozen=True)
 class GatewayConfig:
     """Registry ``gateway:`` section."""
 
@@ -548,8 +565,10 @@ class Registry:
         gateway: GatewayConfig | None = None,
         reissue: ReissueConfig | None = None,
         vllm: VllmConfig | None = None,
+        placement: PlacementConfig | None = None,
     ) -> None:
         self._topology = topology
+        self._placement = placement or PlacementConfig()
         self._models = tuple(models)
         self._service_manager = service_manager or ServiceManagerConfig()
         self._gateway = gateway or GatewayConfig()
@@ -570,6 +589,9 @@ class Registry:
 
     def vllm(self) -> VllmConfig:
         return self._vllm
+
+    def placement(self) -> PlacementConfig:
+        return self._placement
 
     def vllm_env_for(self, model: ModelSpec) -> dict[str, str]:
         """The vLLM container environment of ``model``'s pods (besides the per-binding
@@ -667,6 +689,8 @@ class Registry:
         if self._topology.max_bound_per_gpu < 1:
             errors.append("cluster.max_bound_per_gpu must be >= 1")
         errors.extend(_validate_reissue(self._reissue))
+        if self._placement.reserve_tp_pairs < 0:
+            errors.append("placement.reserve_tp_pairs must be >= 0")
         errors.extend(_validate_vllm_env("vllm.env", self._vllm.env))
         errors.extend(_validate_service_manager(self._service_manager, self._gateway))
         return errors
@@ -734,6 +758,7 @@ def _parse_registry(raw: dict[str, Any]) -> Registry:
         gateway=parse_gateway_config(raw.get("gateway")),
         reissue=parse_reissue_config(raw.get("reissue")),
         vllm=parse_vllm_config(raw.get("vllm")),
+        placement=parse_placement_config(raw.get("placement")),
     )
 
 
@@ -762,6 +787,39 @@ def parse_vllm_config(raw: Any) -> VllmConfig:
     if unknown:
         raise ValueError(f"vllm: unknown keys {unknown} (known: {', '.join(sorted(known))})")
     return VllmConfig(env=_parse_env(raw.get("env"), "vllm.env"))
+
+
+def parse_placement_config(raw: Any) -> PlacementConfig:
+    """Parse the optional ``placement:`` registry section (absent = defaults:
+    reserve_tp_pairs 1, defrag disabled)."""
+    if raw is None:
+        return PlacementConfig()
+    if not isinstance(raw, dict):
+        raise ValueError("placement must be a mapping")
+    known = {"reserve_tp_pairs", "defrag"}
+    unknown = sorted(set(raw) - known)
+    if unknown:
+        raise ValueError(f"placement: unknown keys {unknown} (known: {', '.join(sorted(known))})")
+    defaults = PlacementConfig()
+    defrag = raw.get("defrag")
+    if defrag is None:
+        defrag = {}
+    if not isinstance(defrag, dict):
+        raise ValueError("placement.defrag must be a mapping")
+    unknown = sorted(set(defrag) - {"enabled"})
+    if unknown:
+        raise ValueError(f"placement.defrag: unknown keys {unknown} (known: enabled)")
+    reserve = raw.get("reserve_tp_pairs")
+    if isinstance(reserve, bool):
+        raise ValueError("placement.reserve_tp_pairs must be an integer")
+    return PlacementConfig(
+        reserve_tp_pairs=defaults.reserve_tp_pairs if reserve is None else int(reserve),
+        defrag_enabled=(
+            defaults.defrag_enabled
+            if defrag.get("enabled") is None
+            else _parse_bool(defrag["enabled"])
+        ),
+    )
 
 
 def parse_reissue_config(raw: Any) -> ReissueConfig:

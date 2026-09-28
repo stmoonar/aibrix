@@ -147,7 +147,7 @@ def test_v2_defrag_moves_one_gpu_serve_and_frees_two_gpu_slot():
     )
     client = TestClient(create_app(ServiceManagerV2(registry(), store)))
 
-    response = client.post("/v2/defrag", json={"tp_size": 2})
+    response = client.post("/v2/defrag", json={"tp_size": 2, "force": True})
 
     assert response.status_code == 200
     assert response.json() == {
@@ -184,7 +184,7 @@ def test_v2_defrag_returns_409_without_partial_state_change_when_no_plan_exists(
     store.save(initial, expected_version=0)
     client = TestClient(create_app(ServiceManagerV2(registry(), store)))
 
-    response = client.post("/v2/defrag", json={"tp_size": 2})
+    response = client.post("/v2/defrag", json={"tp_size": 2, "force": True})
 
     assert response.status_code == 409
     assert response.json() == {"detail": {"reason": "no_feasible_defrag"}}
@@ -204,8 +204,8 @@ def test_v2_defrag_uses_runtime_delete_create_path_and_is_idempotent():
     vllm_ops = FakeVllmOps()
     service = ServiceManagerV2(registry(), store, runtime_ops=runtime_ops, vllm_ops=vllm_ops)
 
-    first = service.defrag(tp_size=2)
-    second = service.defrag(tp_size=2)
+    first = service.defrag(tp_size=2, force=True)
+    second = service.defrag(tp_size=2, force=True)
 
     assert first["actions"] == [
         {"action": "hide", "serve_id": "serve-b"},

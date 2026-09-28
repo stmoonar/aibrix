@@ -80,7 +80,7 @@ def main() -> None:
     time.sleep(2.0)
     try:
         defrag_started_at = time.time()
-        response = requests.post(SM_DEFRAG_URL, json={"tp_size": 2}, timeout=600)
+        response = requests.post(SM_DEFRAG_URL, json={"tp_size": 2, "force": True}, timeout=600)  # probe: override placement.defrag.enabled
         defrag_finished_at = time.time()
         defrag = {
             "status_code": response.status_code,

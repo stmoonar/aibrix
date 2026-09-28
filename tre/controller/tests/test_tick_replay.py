@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from tre_common.metrics_schema import MetricsSnapshot, ModelWindowMetrics, PodWindowMetrics
-from tre_common.registry import ClusterTopology, ModelSpec, NodeSpec, Registry, SloSpec, TrsParams
+from tre_common.registry import ClusterTopology, ModelSpec, NodeSpec, PlacementConfig, Registry, SloSpec, TrsParams
 from tre_controller.config import SafeScaleConfig
 from tre_controller.loops.replay import TickReplayStep, run_tick_replay
 from tre_controller.planning.planner import ClusterView, DefragAction, HideAction, ScaleAction
@@ -149,7 +149,8 @@ def test_tick_replay_records_high_model_safescale_probe_once_across_60_ticks() -
 
 
 def test_tick_replay_records_tp_defrag_sequence_for_60_ticks() -> None:
-    registry = _registry_with_specs(_spec("critical", tp_size=2))
+    base = _registry_with_specs(_spec("critical", tp_size=2))
+    registry = Registry(base.topology(), base.models(), placement=PlacementConfig(defrag_enabled=True))
     snapshot = MetricsSnapshot(
         ts_ms=1_000,
         stale=False,
