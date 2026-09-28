@@ -7,7 +7,8 @@ included (zero gauges, flat counters), and ``MetricsStore`` sees them all: the r
 the service manager's fleet state, which the controller already holds (``ClusterView``).
 
 :func:`aggregate_pods` is the one aggregation rule (sums for tokens / queue gauges, max for
-p95, mean of the non-zero kv hit rates); ``MetricsStore`` uses it for the raw window and
+the TTFT / TPOT p95, the merged-histogram e2e p95, mean of the non-zero kv hit rates);
+``MetricsStore`` uses it for the raw window and
 :func:`restrict_to_serving` re-applies it to the awake pods, so the decision path and the
 safescale observation see exactly the window of the pods that can serve - the same window
 the single-awake-pod calibration capture produced offline.
@@ -17,7 +18,8 @@ from __future__ import annotations
 from dataclasses import replace
 from typing import Collection, Mapping, Optional
 
-from tre_common.metrics_schema import ModelWindowMetrics, PodWindowMetrics
+from tre_common.metrics_schema import ModelWindowMetrics, P95Rule, PodWindowMetrics
+from tre_common.percentile import histogram_percentile
 
 
 def _sum_optional(values: list[Optional[float]]) -> Optional[float]:
@@ -30,13 +32,49 @@ def _max_optional(values: list[Optional[float]]) -> Optional[float]:
     return max(present) if present else None
 
 
+def merged_hist_p95_ms(pods: list[PodWindowMetrics], rule: P95Rule) -> Optional[float]:
+    """Model e2e p95 (ms) from the pods' window histograms merged FIRST, then gated.
+
+    ``rule`` = (percentile mode, minimum observations). The gate applies to the
+    merged count: at low load every pod sees fewer than the minimum, yet together
+    they may have enough (a per-pod gate dropped them all). Buckets are summed on
+    the union of the pods' bucket bounds (cumulative count at or below each)."""
+    mode, min_samples = rule
+    hists = [(pod.e2e_hist, float(pod.e2e_hist_count or 0.0)) for pod in pods if pod.e2e_hist]
+    if not hists:
+        return None
+    count = sum(item_count for _, item_count in hists)
+    if min_samples > 0 and count < min_samples:
+        return None
+    uppers = sorted({upper for buckets, _ in hists for upper, _ in buckets})
+    merged = [
+        (upper, sum(_cumulative_at(buckets, upper) for buckets, _ in hists)) for upper in uppers
+    ]
+    p95_s = histogram_percentile(merged, 0.95, mode=mode)
+    return None if p95_s is None else p95_s * 1000.0
+
+
+def _cumulative_at(buckets: tuple[tuple[float, float], ...], upper: float) -> float:
+    counts = [count for bucket_upper, count in buckets if bucket_upper <= upper]
+    return max(counts) if counts else 0.0
+
+
 def aggregate_pods(
     model: str,
     window_start_ms: int,
     window_end_ms: int,
     per_pod: Mapping[str, PodWindowMetrics],
+    *,
+    p95_rule: P95Rule | None = None,
 ) -> ModelWindowMetrics:
+    """``p95_rule`` set (the live MetricsStore): the e2e p95 comes from the pods'
+    merged histograms, gated on the merged count (:func:`merged_hist_p95_ms`); with no
+    pod histogram at all it is the max of the per-pod p95s. None: max of the per-pod
+    p95s (offline / synthetic windows)."""
     pods = list(per_pod.values())
+    e2e_p95_ms = _max_optional([pod.e2e_p95_ms for pod in pods])
+    if p95_rule is not None and any(pod.e2e_hist for pod in pods):
+        e2e_p95_ms = merged_hist_p95_ms(pods, p95_rule)
     routable_pods = len(pods)
     kv_values = [pod.kv_cache_hit_rate for pod in pods if pod.kv_cache_hit_rate > 0.0]
     return ModelWindowMetrics(
@@ -51,13 +89,14 @@ def aggregate_pods(
         kv_cache_hit_rate=(sum(kv_values) / len(kv_values)) if kv_values else 0.0,
         ttft_p95_ms=_max_optional([pod.ttft_p95_ms for pod in pods]),
         tpot_p95_ms=_max_optional([pod.tpot_p95_ms for pod in pods]),
-        e2e_p95_ms=_max_optional([pod.e2e_p95_ms for pod in pods]),
+        e2e_p95_ms=e2e_p95_ms,
         routable_pods=routable_pods,
         assigned_replicas=routable_pods,
         per_pod=dict(per_pod),
         request_count=_sum_optional([pod.request_count for pod in pods]),
         token_counter_reset=any(pod.token_counter_reset for pod in pods),
         instant_ticks_ms=tuple(sorted({tick for pod in pods for tick in pod.instant_ticks_ms})),
+        p95_rule=p95_rule,
     )
 
 
@@ -86,7 +125,10 @@ def restrict_to_serving(
         kept = {key: pod for key, pod in per_pod.items() if pod.pod not in asleep and key not in asleep}
         if len(kept) != len(per_pod):
             metrics = replace(
-                aggregate_pods(metrics.model, metrics.window_start_ms, metrics.window_end_ms, kept),
+                aggregate_pods(
+                    metrics.model, metrics.window_start_ms, metrics.window_end_ms, kept,
+                    p95_rule=metrics.p95_rule,
+                ),
                 # Ticks are gateway-wide provenance (freshness), not a per-pod quantity.
                 instant_ticks_ms=metrics.instant_ticks_ms,
             )

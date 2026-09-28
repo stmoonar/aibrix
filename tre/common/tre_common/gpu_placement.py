@@ -315,20 +315,14 @@ def _normalise_occupied(
 
 
 def _validate_tp_size(tp_size: int, nodes: Mapping[str, int]) -> int:
-    """Generic buddy-block check: any power of two that fits a node - the same
-    power-of-two / widest-node rule as ``tre_common.registry.tp_size_error``,
-    without the registry's binding-layout cap, so the library stays usable for
-    wider blocks."""
-    if isinstance(tp_size, bool) or not isinstance(tp_size, int) or tp_size < 1 or tp_size & (tp_size - 1):
-        raise ValueError(f"tp_size must be a power of two >= 1, got {tp_size!r}")
-    order = block_order(tp_size)
-    widest = max(nodes.values())
-    if tp_size > widest:
-        raise ValueError(
-            f"tp_size {tp_size} exceeds the widest node ({widest} gpus); "
-            "tensor parallelism cannot span nodes"
-        )
-    return order
+    """Generic buddy-block check: ``tre_common.registry.tp_size_error`` (the one
+    tp_size rule: power of two >= 1 that fits the widest node) without the
+    registry's binding-layout cap (``max_tp_size=None``), so the library stays
+    usable for wider blocks."""
+    problem = tp_size_error(tp_size, widest_node_gpus=max(nodes.values()), max_tp_size=None)
+    if problem:
+        raise ValueError(problem)
+    return block_order(tp_size)
 
 
 def _validate_block(block: GpuBlock, nodes: Mapping[str, int]) -> None:

@@ -132,12 +132,19 @@ def run_planner_tick(
     loop: str = "tick",
     action_cooldown: bool = False,
     observe_mode: bool = False,
+    probe_block_reason: str | None = None,
 ) -> LoopTickResult:
     """One planner tick. ``observe_mode`` (controller mode ``observe``, B8): the
     plan is still computed and published, but no SafeScale probe is started or
     preempted - the probe's state would change (hide, window, commit) while its
     hide never reaches the cluster. Every other action is still submitted; the
-    ActionQueue drops it in observe mode (it never reaches the SM)."""
+    ActionQueue drops it in observe mode (it never reaches the SM).
+
+    ``probe_block_reason`` (P2-3): no SafeScale probe is started this tick
+    (``sm_maintenance``: the SM maintenance lock is held;
+    ``sm_maintenance_unreadable``: it could not be read - fail-closed). The
+    planned probe-only scale-downs are dropped with the event
+    ``safescale_probe_skipped:<model>:<reason>``; every other action is kept."""
     if snapshot.stale:
         return LoopTickResult(submitted=0, events=("snapshot_stale",))
     if cluster_view is not None and cluster_view.placement is None:
@@ -214,6 +221,7 @@ def run_planner_tick(
         cluster_view=cluster_view,
         contexts=contexts,
         observe_mode=observe_mode,
+        probe_block_reason=probe_block_reason,
     )
     if _prof_on:
         _safescale_ns = time.perf_counter_ns() - _phase_t0
@@ -307,6 +315,7 @@ def _apply_safescale(
     cluster_view: ClusterView | None = None,
     contexts: dict[str, dict] | None = None,
     observe_mode: bool = False,
+    probe_block_reason: str | None = None,
 ) -> tuple[tuple[Action, ...], tuple[str, ...]]:
     if safescale is None:
         return actions, ()
@@ -341,6 +350,10 @@ def _apply_safescale(
                 continue
         if not _requires_safescale_probe(action):
             converted.append(action)
+            continue
+        if probe_block_reason is not None:
+            # P2-3: the SM maintenance lock (or an unreadable one) pauses SafeScale.
+            events.append(f"safescale_probe_skipped:{_safescale_probe_model(action)}:{probe_block_reason}")
             continue
 
         probe_model = _safescale_probe_model(action)

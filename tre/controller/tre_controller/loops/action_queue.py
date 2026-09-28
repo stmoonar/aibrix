@@ -186,8 +186,13 @@ class ActionQueue:
         on_oneshot_done: Callable[[str, str, str], None] | None = None,
         commit_max_age_ms: float | None = None,
         is_observe_fresh: Callable[[], bool] | None = None,
+        on_hide_failed: Callable[[str, tuple[str, ...], str], None] | None = None,
     ) -> None:
         self._client = client
+        #: P3: (model, pods, error) of a hide that did not take effect (failed, or
+        #: not sent because of observe mode): its SafeScale probe is rolled back
+        #: instead of being judged as if the pods were hidden.
+        self._on_hide_failed = on_hide_failed
         #: B8: a SafeScale commit whose decision (``decided_ms``) is older than this
         #: at its FIRST dispatch becomes the donor unhide (None / <= 0 = off).
         self._commit_max_age_ms = (
@@ -440,6 +445,7 @@ class ActionQueue:
                 continue
             if observe and not _runs_in_observe(queued):
                 results.extend(_observe_skipped(queued))
+                self._notify_hide_failed(queued.action, "observe_skipped")
                 continue
             busy |= queued.resources
             task = asyncio.ensure_future(self._run_item(queued, results))
@@ -475,6 +481,14 @@ class ActionQueue:
                 # Start whatever this action was blocking right away.
                 self._dispatch_pending(results)
 
+    def _notify_hide_failed(self, action, error: str | None) -> None:
+        if not isinstance(action, HideAction) or self._on_hide_failed is None:
+            return
+        try:
+            self._on_hide_failed(action.model, tuple(action.pods), f"hide_failed: {error or 'unknown'}")
+        except Exception:  # noqa: BLE001 - the probe is still bounded by its window
+            LOG.exception("marking the SafeScale probe of %s after a failed hide failed", action.model)
+
     def _notify_done(self, request_id: str, status: str, reason: str) -> None:
         if self._on_oneshot_done is None:
             return
@@ -491,6 +505,7 @@ class ActionQueue:
         finished (dropped in observe mode, controller shutting down)."""
         if not _runs_in_observe(queued) and self._is_observe_fresh():
             results.extend(_observe_skipped(queued))
+            self._notify_hide_failed(queued.action, "observe_skipped")
             return None
         if isinstance(queued.action, TransferAction):
             results.extend(await self._execute_transfer(queued.action))
@@ -542,6 +557,7 @@ class ActionQueue:
                         ),
                     )
                 results.extend(self._final_failures(queued, failure, attempts=attempts, prefix=prefix))
+                self._notify_hide_failed(queued.action, failure.error)
                 # A commit whose donor sleep failed for good leaves the donor's
                 # probe pods hidden but awake: give them their routing back
                 # (review 4 P2-4), never on an unconfirmed pod (P2-2).
@@ -1132,7 +1148,9 @@ class ActionQueue:
                         sort_keys=True,
                     )
                 )
-                return DispatchResult(model=action.model, action_kind="hide", ok=True, error="observe_skipped")
+                # P3: ok=False - the pods were NOT hidden; the queue's failure
+                # path marks the probe for rollback (on_hide_failed).
+                return DispatchResult(model=action.model, action_kind="hide", ok=False, error="observe_skipped")
             response = await self._client.set_routable(action.model, action.pods)
             return _dispatch_result(model=action.model, action_kind="hide", response=response)
         if isinstance(action, UnhideAction):
@@ -1278,7 +1296,8 @@ def _observe_skipped(queued: QueuedAction) -> list[DispatchResult]:
         DispatchResult(
             model=queued.model,
             action_kind=_action_kind(action),
-            ok=True,
+            # A hide not sent did not take effect (P3): never reported as done.
+            ok=not isinstance(action, HideAction),
             error="observe_skipped",
         )
     ]

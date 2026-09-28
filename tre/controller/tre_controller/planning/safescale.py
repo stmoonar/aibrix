@@ -114,6 +114,10 @@ class SafeScaleProbe:
     #: persisted as ``committing_ts`` in s). B8: the queue refuses to act on a commit
     #: whose decision is older than ``commit_max_age_ms`` at its first dispatch.
     committing_ms: int | None = None
+    #: P3: the probe's hide never took effect (failed, or skipped by the observe
+    #: re-check right before the SM call): the probe is rolled back with this
+    #: reason instead of being judged as if its pods were hidden.
+    abort_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -220,6 +224,19 @@ class SafeScaleStateMachine:
             self._persist_probe(probe)
         return len(probe.pods)
 
+    def abort_probe(self, model: str, *, pods: tuple[str, ...], reason: str) -> bool:
+        """P3: the hide of ``pods`` did not take effect - mark the ``probing`` probe
+        owning them for rollback (the SafeScale loop rolls it back, unhiding its
+        pods idempotently). False when no probing probe of ``model`` owns them."""
+        probe = self._probes.get(model)
+        if probe is None or probe.status != "probing" or not set(pods) & set(probe.pods):
+            return False
+        if probe.abort_reason is None:
+            probe = replace(probe, abort_reason=reason)
+            self._probes[model] = probe
+            self._persist_probe(probe)
+        return True
+
     def rollback_backoff_models(self, now_ms: int) -> set[str]:
         """Models whose last probe rolled back less than rollback_backoff_ms ago (A13):
         the planner holds their receiver-less HIGH proactive probe meanwhile."""
@@ -285,6 +302,9 @@ class SafeScaleStateMachine:
         if updated.preempt_reason is not None:
             self._probes[model] = replace(updated, terminal_details={"preempted": updated.preempt_reason})
             return self._rollback(updated, reason=updated.preempt_reason)
+        if updated.abort_reason is not None:
+            self._probes[model] = replace(updated, terminal_details={"aborted": updated.abort_reason})
+            return self._rollback(updated, reason=updated.abort_reason)
         if self._violates_slo(observation):
             self._probes[model] = replace(
                 updated,
@@ -740,6 +760,8 @@ def _probe_record(
         "gateway_baseline": list(probe.gateway_baseline) if probe.gateway_baseline is not None else None,
         "preempt_reason": probe.preempt_reason,
     }
+    if probe.abort_reason is not None:
+        record["abort_reason"] = probe.abort_reason
     if probe.resolution is not None and status == "committing":
         record["resolution"] = probe.resolution
         record["resolution_reason"] = probe.resolution_reason
@@ -800,6 +822,7 @@ def _probe_from_record(row: dict[str, Any], store: ProbeStore) -> SafeScaleProbe
         window_terms=dict(row["window_terms"]) if isinstance(row.get("window_terms"), dict) else {},
         gateway_baseline=_baseline_from_record(row.get("gateway_baseline")),
         preempt_reason=str(row["preempt_reason"]) if row.get("preempt_reason") else None,
+        abort_reason=str(row["abort_reason"]) if row.get("abort_reason") else None,
         **_committing_fields(row),
     )
 
