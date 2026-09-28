@@ -182,6 +182,11 @@ class SafeScaleCommitAction:
     #: Donor pods whose /sleep was sent but never confirmed (from the SM's
     #: failure outcomes, review 4 P2-2): never unhidden by an abandon / preempt.
     unconfirmed_pods: tuple[str, ...] = ()
+    #: Epoch ms of the SafeScale decision (the probe's ``committing_ts``), None =
+    #: unknown. B8: a commit first dispatched more than ``commit_max_age_ms`` after
+    #: it (held in observe mode, recovered after a restart) becomes the donor unhide.
+    #: Metadata, not part of the action's identity (not compared).
+    decided_ms: int | None = field(default=None, compare=False)
 
     @property
     def model(self) -> str:

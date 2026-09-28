@@ -56,6 +56,7 @@ def run_fairness_tick(
     disable_eta_gate: bool = False,
     prof: "TickProfiler | None" = None,
     action_cooldown: bool = False,
+    observe_mode: bool = False,
 ) -> LoopTickResult:
     return run_planner_tick(
         snapshot,
@@ -76,6 +77,7 @@ def run_fairness_tick(
         prof=prof,
         loop="fairness",
         action_cooldown=action_cooldown,
+        observe_mode=observe_mode,
     )
 
 
@@ -94,6 +96,7 @@ async def fairness_task(
     signal_state: SignalState | None = None,
     prof: "TickProfiler | None" = None,
     model_state_box: "ModelStateBox | None" = None,
+    is_observe: Callable[[], bool] | None = None,
 ) -> None:
     paper_state_cache = PaperStateCache(max_stale_windows=getattr(cfg, "paper_stale_max_windows", 3))
     while True:
@@ -119,6 +122,8 @@ async def fairness_task(
                     disable_eta_gate=getattr(cfg, "disable_eta_gate", False),
                     prof=prof,
                     action_cooldown=getattr(cfg, "action_cooldown", True),
+                    # B8: controller mode, read per tick (ObserveModeGate, cached).
+                    observe_mode=bool(is_observe()) if is_observe is not None else False,
                 )
             if model_state_box is not None and result.classifications:
                 # Review 3: the latest signal state, for the queue's commit revalidation.

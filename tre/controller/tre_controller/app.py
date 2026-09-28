@@ -54,6 +54,9 @@ class ControllerDependencies:
     gateway_health: "EnvoyStatsSource | None" = None
     # Review 3: latest per-model signal state (planner ticks -> commit revalidation).
     model_state_box: "ModelStateBox | None" = None
+    # B8: controller run mode (observe/active) - the planner loops read it too, so
+    # no SafeScale probe is started while paused (the queue alone cannot stop that).
+    observe_gate: "ObserveModeGate | None" = None
 
 
 @dataclass(frozen=True)
@@ -100,6 +103,7 @@ def build_controller_task_specs(
                     signal_state=deps.signal_state,
                     prof=deps.profiler,
                     model_state_box=deps.model_state_box,
+                    is_observe=_observe_reader(deps),
                 ),
             )
         )
@@ -118,6 +122,7 @@ def build_controller_task_specs(
                 signal_state=deps.signal_state,
                 prof=deps.profiler,
                 model_state_box=deps.model_state_box,
+                is_observe=_observe_reader(deps),
             ),
         )
     )
@@ -149,6 +154,11 @@ def build_controller_task_specs(
             )
         )
     return tuple(specs)
+
+
+def _observe_reader(deps: ControllerDependencies) -> Callable[[], bool] | None:
+    gate = deps.observe_gate
+    return gate.is_observe if gate is not None else None
 
 
 def _active_probe_models(safescale: SafeScaleStateMachine) -> set[str]:
@@ -244,7 +254,11 @@ def create_controller_dependencies(
             on_oneshot_done=lambda request_id, status, reason: safescale.resolve_request(
                 request_id, status=status, reason=reason, now_ms=int(time.time() * 1000)
             ),
+            # B8: a commit held (observe mode) or recovered past this age is
+            # turned into the donor unhide instead of acting on stale evidence.
+            commit_max_age_ms=cfg.safescale.commit_max_age_ms,
         ),
+        observe_gate=observe_gate,
         model_state_box=model_state_box,
         sm_client=sm_client,
         cluster_view_box=cluster_view_box,

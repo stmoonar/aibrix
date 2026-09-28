@@ -64,6 +64,15 @@ class SafeScaleConfig:
     # proactive probe of that model for this long (v1 had no cooldown for demand-driven
     # donor releases, so those are not held). 0 disables.
     rollback_backoff_ms: float = 60_000.0
+    # B8: max age (ms) of a probe's commit evidence at the commit's FIRST dispatch. A commit
+    # decided (probe marked ``committing``) longer ago than this - held in observe mode,
+    # queued behind a long action, or re-submitted after a controller restart - is not run
+    # on that stale evidence: the ActionQueue turns it into the donor unhide (rollback,
+    # reason ``commit_evidence_stale``). Retries of a commit that already started are
+    # exempt. 120 s = the probe window ceiling (max_window_ms): evidence older than one
+    # full probe window no longer describes the donor. TRE_SAFESCALE_COMMIT_MAX_AGE_MS
+    # (0 disables).
+    commit_max_age_ms: float = 120_000.0
 
 
 @dataclass(frozen=True)
@@ -225,6 +234,9 @@ class ControllerConfig:
             donor_error_rate_max=_get_positive_float(values, "TRE_SAFESCALE_DONOR_ERROR_RATE_MAX", 0.01),
             donor_min_requests=_get_positive_float(values, "TRE_SAFESCALE_DONOR_MIN_REQUESTS", 20.0),
             rollback_backoff_ms=_get_nonneg_float(values, "TRE_SAFESCALE_ROLLBACK_BACKOFF_MS", 60_000.0),
+            commit_max_age_ms=_get_nonneg_float(
+                values, "TRE_SAFESCALE_COMMIT_MAX_AGE_MS", SafeScaleConfig.commit_max_age_ms
+            ),
         )
         if safescale.min_window_ms > safescale.max_window_ms:
             raise ValueError("SAFE_SCALE_MIN_WINDOW_MS must be <= SAFE_SCALE_MAX_WINDOW_MS")

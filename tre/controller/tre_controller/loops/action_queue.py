@@ -177,8 +177,14 @@ class ActionQueue:
         sleep: Callable[[float], Awaitable[None]] | None = None,
         fresh_view: Callable[[], object] | None = None,
         on_oneshot_done: Callable[[str, str, str], None] | None = None,
+        commit_max_age_ms: float | None = None,
     ) -> None:
         self._client = client
+        #: B8: a SafeScale commit whose decision (``decided_ms``) is older than this
+        #: at its FIRST dispatch becomes the donor unhide (None / <= 0 = off).
+        self._commit_max_age_ms = (
+            float(commit_max_age_ms) if commit_max_age_ms is not None and commit_max_age_ms > 0 else None
+        )
         self._pending: deque[QueuedAction] = deque()
         self._inflight: set[str] = set()
         # When this returns True the controller is paused: queued actions are drained
@@ -217,6 +223,8 @@ class ActionQueue:
             "commit_upscale_preempted_total": 0,
             "commit_failed_unhide_total": 0,
             "unconfirmed_kept_hidden_total": 0,
+            "commit_evidence_stale_total": 0,
+            "oneshot_cancelled_total": 0,
         }
 
     # ------------------------------------------------------------------ submit
@@ -307,6 +315,29 @@ class ActionQueue:
             slot.queued for slot in self._backoff.values()
         ]
         return any(_request_id(item.action) == request_id for item in items)
+
+    def cancel_request(self, request_id: str) -> bool:
+        """Drop the QUEUED (not yet started, e.g. held in observe mode) one-shot
+        actions of SafeScale probe ``request_id`` without dispatching them - B8:
+        the probe was resolved without an SM call (its pods are gone). Returns
+        False when one of its actions is already running (or backing off): that
+        one finishes on its own and the caller retries later."""
+        running = list(self._running.values()) + [slot.queued for slot in self._backoff.values()]
+        if any(_request_id(item.action) == request_id for item in running):
+            return False
+        kept: deque[QueuedAction] = deque()
+        for item in self._pending:
+            if item.source_loop in ONE_SHOT_LOOPS and _request_id(item.action) == request_id:
+                self._stats["oneshot_cancelled_total"] += 1
+                LOG.warning(
+                    "one-shot %s of %s (%s) cancelled before dispatch: its probe was resolved",
+                    _action_kind(item.action), item.model, request_id,
+                )
+                continue
+            kept.append(item)
+        self._pending = kept
+        self._release_idle_models()
+        return True
 
     def cluster_action_active(self) -> bool:
         """A defrag (cluster-wide action) is queued or running: every other
@@ -453,6 +484,13 @@ class ActionQueue:
         if isinstance(queued.action, TransferAction):
             results.extend(await self._execute_transfer(queued.action))
             return ("done", "transfer")
+        if isinstance(queued.action, SafeScaleCommitAction):
+            converted, finished = self._stale_commit(queued, results)
+            if finished is not None:
+                return finished
+            if converted is not None:
+                queued = converted
+                self._set_running(queued)
         while True:
             if isinstance(queued.action, SafeScaleCommitAction):
                 revalidated, finished = self._revalidated_commit(queued, results)
@@ -544,13 +582,58 @@ class ActionQueue:
         )
         return self._queued(unhide)
 
+    def _stale_commit(
+        self, queued: QueuedAction, results: list[DispatchResult]
+    ) -> tuple[QueuedAction | None, tuple[str, str] | None]:
+        """B8: a commit about to be dispatched for the FIRST time (no attempt yet)
+        whose decision is older than ``commit_max_age_ms`` - it was held in
+        observe mode, or re-submitted after a restart - is not run on that stale
+        evidence. The donor's hidden pods get their routing back instead (only
+        those a fresh cluster view shows awake and hidden; never an unconfirmed
+        one) and the probe resolves as a rollback ``commit_evidence_stale``.
+        Retries of a commit that already made an attempt are not aged (their
+        evidence was acted on; the revalidation before every retry still runs).
+        Returns (the action to run instead, None), (None, how the commit
+        finished) or (None, None) = run the commit as planned."""
+        action: SafeScaleCommitAction = queued.action
+        if self._commit_max_age_ms is None or queued.failures > 0 or action.decided_ms is None:
+            return None, None
+        age_ms = float(self._now_ms()) - float(action.decided_ms)
+        if age_ms <= self._commit_max_age_ms:
+            return None, None
+        reason = "commit_evidence_stale"
+        self._stats["commit_evidence_stale_total"] += 1
+        LOG.warning(
+            json.dumps(
+                {"event": "safescale_commit_evidence_stale", "donor": action.donor,
+                 "request_id": action.request_id, "pods": list(action.pods),
+                 "age_s": round(age_ms / 1000.0, 1), "max_age_s": round(self._commit_max_age_ms / 1000.0, 1)},
+                sort_keys=True,
+            )
+        )
+        detail = f"{reason}: decided {age_ms / 1000.0:.0f}s ago > {self._commit_max_age_ms / 1000.0:.0f}s"
+        results.extend(self._receivers_dropped(action, detail))
+        if action.donor_done or not action.pods:
+            return None, ("rollback", f"{detail}; follow-up upscales dropped")
+        unhide = self._donor_unhide(action, reason, filter_by_view=True, only_view_hidden=True)
+        if unhide is None:
+            return None, ("rollback", f"{detail}; no donor pod to unhide")
+        return self._queued(unhide), None
+
     def _donor_unhide(
-        self, commit: SafeScaleCommitAction, reason: str, *, filter_by_view: bool = False
+        self,
+        commit: SafeScaleCommitAction,
+        reason: str,
+        *,
+        filter_by_view: bool = False,
+        only_view_hidden: bool = False,
     ) -> UnhideAction | None:
         """The unhide giving a commit's donor pods their routing back, keeping
         every pod whose sleep is unconfirmed hidden (review 4 P2-2). With
         ``filter_by_view`` and a fresh cluster view, pods it shows asleep are
-        left out (they need nothing). None = nothing to unhide."""
+        left out (they need nothing); with ``only_view_hidden`` too, so are pods
+        it does not list or shows already routable (B8: only pods the view shows
+        awake AND hidden). None = nothing to unhide."""
         unconfirmed = set(commit.unconfirmed_pods)
         keep = tuple(pod for pod in commit.pods if pod in unconfirmed)
         candidates = [pod for pod in commit.pods if pod not in unconfirmed]
@@ -558,9 +641,15 @@ class ActionQueue:
             view = self._view()
             if view is not None:
                 bindings = {binding.serve_id: binding for binding in getattr(view, "bindings", ())}
-                candidates = [
-                    pod for pod in candidates if pod not in bindings or bindings[pod].awake
-                ]
+                if only_view_hidden:
+                    candidates = [
+                        pod for pod in candidates
+                        if pod in bindings and bindings[pod].awake and bindings[pod].hidden
+                    ]
+                else:
+                    candidates = [
+                        pod for pod in candidates if pod not in bindings or bindings[pod].awake
+                    ]
         if keep:
             self._stats["unconfirmed_kept_hidden_total"] += len(keep)
             LOG.warning(

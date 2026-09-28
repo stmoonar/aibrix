@@ -70,16 +70,35 @@ def run_safescale_observation_tick(
     signal_state: SignalState | None = None,
     cluster_view: ClusterView | None = None,
     gateway_counters: Mapping[str, GatewayCounters] | None = None,
+    fresh_cluster_view: ClusterView | None = None,
+    recovery_needs_fresh_view: bool = False,
 ) -> SafeScaleObservationResult:
+    """One SafeScale observation tick. ``fresh_cluster_view`` is the SM view only
+    while fresh (``ClusterViewBox.fresh``): with it, probes whose pods are all
+    gone are resolved first, in any controller mode (B8). With
+    ``recovery_needs_fresh_view`` (app wiring) a ``committing`` probe is only
+    re-submitted once such a view exists, so a probe restored after a restart
+    is checked for gone pods before anything reaches the SM."""
+    events: list[str] = []
+    # B8: before the stale-snapshot return - it needs only the cluster view.
+    _resolve_probes_with_gone_pods(
+        queue, safescale, fresh_cluster_view, now_ms=snapshot.ts_ms, events=events
+    )
     if snapshot.stale:
-        return SafeScaleObservationResult(submitted=0, events=("snapshot_stale",))
+        return SafeScaleObservationResult(submitted=0, events=tuple(events) + ("snapshot_stale",))
 
     accepted_actions: list[Action] = []
-    events: list[str] = []
     submitted = 0
-    recovered = _recover_committing(queue, safescale, now_ms=snapshot.ts_ms, events=events)
-    accepted_actions.extend(recovered)
-    submitted += len(recovered)
+    if recovery_needs_fresh_view and fresh_cluster_view is None:
+        waiting = getattr(safescale, "committing_probes", None)
+        has_request = getattr(queue, "has_request", None)
+        for probe in waiting() if callable(waiting) else ():
+            if not (callable(has_request) and has_request(probe.request_id)):
+                events.append(f"safescale_recovery_waits_for_fresh_view:{probe.model}")
+    else:
+        recovered = _recover_committing(queue, safescale, now_ms=snapshot.ts_ms, events=events)
+        accepted_actions.extend(recovered)
+        submitted += len(recovered)
     for probe in safescale.active_probes():
         metrics = snapshot.models.get(probe.model)
         if metrics is None:
@@ -117,6 +136,8 @@ def run_safescale_observation_tick(
             cluster_view=cluster_view,
             registry=registry,
             request_id=_probe_request_id(safescale, probe.model),
+            # = the committing_ts mark_committing records below (B8 max age).
+            decided_ms=snapshot.ts_ms,
         )
         if not actions:
             continue
@@ -182,10 +203,62 @@ async def safescale_task(
                 signal_state=signal_state,
                 cluster_view=cluster_view_box.get() if cluster_view_box is not None else None,
                 gateway_counters=counters,
+                fresh_cluster_view=_fresh_view(cluster_view_box),
+                recovery_needs_fresh_view=cluster_view_box is not None,
             )
             _log_resolutions(snapshot.ts_ms, result, gateway_available=counters is not None)
         interval = getattr(getattr(cfg, "safescale"), "probe_poll_seconds")
         await sleep(interval)
+
+
+def _fresh_view(cluster_view_box) -> ClusterView | None:
+    fresh = getattr(cluster_view_box, "fresh", None)
+    if not callable(fresh):
+        return None
+    try:
+        return fresh()
+    except Exception:  # noqa: BLE001 - no view = nothing is judged gone
+        return None
+
+
+def _resolve_probes_with_gone_pods(
+    queue, safescale, view: ClusterView | None, *, now_ms: int, events: list[str]
+) -> None:
+    """B8: a probe (probing or committing) whose pods are ALL absent from a FRESH
+    cluster view - deleted / replaced, e.g. by a rolling restart - can never be
+    acted on: it is resolved as a rollback ``probe_pods_gone`` without any SM
+    call, in every controller mode, and its queued one-shot action (held in
+    observe mode, say) is dropped. Guarded: only with a fresh view (never a
+    missing or stale one), and only when that view lists at least one binding of
+    the probe's model (an empty / partial SM state never resolves a probe). A
+    probe whose one-shot action is already running is left to finish it."""
+    if view is None:
+        return
+    all_probes = getattr(safescale, "all_probes", None)
+    resolve_request = getattr(safescale, "resolve_request", None)
+    if not callable(all_probes) or not callable(resolve_request):
+        return
+    bindings = tuple(getattr(view, "bindings", ()) or ())
+    serve_ids = {binding.serve_id for binding in bindings}
+    models = {binding.model for binding in bindings}
+    for probe in all_probes():
+        pods = tuple(getattr(probe, "pods", ()) or ())
+        if not pods or probe.model not in models or any(pod in serve_ids for pod in pods):
+            continue
+        cancel = getattr(queue, "cancel_request", None)
+        if callable(cancel) and not cancel(probe.request_id):
+            events.append(f"safescale_probe_pods_gone_deferred:{probe.model}:{probe.request_id}")
+            continue
+        if not resolve_request(probe.request_id, status="rollback", reason="probe_pods_gone", now_ms=now_ms):
+            continue
+        events.append(f"safescale_probe_pods_gone:{probe.model}:{probe.request_id}")
+        LOG.warning(
+            json.dumps(
+                {"event": "safescale_probe_pods_gone", "model": probe.model, "request_id": probe.request_id,
+                 "status": probe.status, "pods": list(pods), "resolution": "rollback"},
+                sort_keys=True,
+            )
+        )
 
 
 def _recover_committing(queue, safescale, *, now_ms: int, events: list[str]) -> list[Action]:
@@ -314,6 +387,7 @@ def _commands_to_actions(
     cluster_view: ClusterView | None = None,
     registry: Registry | None = None,
     request_id: str | None = None,
+    decided_ms: int | None = None,
 ) -> tuple[Action, ...]:
     """A rollback is one unhide; a commit batch is ONE :class:`SafeScaleCommitAction`
     (review 3 P2-2): the hidden donor pods sleep first, then the receivers are
@@ -344,6 +418,7 @@ def _commands_to_actions(
                 upscales=upscales,
                 drain_budget_s=donor.drain_budget_s,
                 request_id=request_id,
+                decided_ms=decided_ms,
             )
         )
     elif upscales:
@@ -355,6 +430,7 @@ def _commands_to_actions(
                 upscales=upscales,
                 request_id=request_id,
                 donor_done=True,
+                decided_ms=decided_ms,
             )
         )
     return tuple(actions)
@@ -386,6 +462,8 @@ def recovered_actions(probe) -> tuple[Action, ...]:
                 reason=f"recovered:{probe.resolution_reason or 'commit'}",
                 drain_budget_s=(float(probe.window_ms) / 1000.0 if probe.window_ms else None),
                 request_id=probe.request_id,
+                # B8: aged from the original decision, not from the re-submission.
+                decided_ms=getattr(probe, "committing_ms", None),
             ),
         )
     return (

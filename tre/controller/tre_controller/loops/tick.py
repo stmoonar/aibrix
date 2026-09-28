@@ -130,7 +130,13 @@ def run_planner_tick(
     prof: "TickProfiler | None" = None,
     loop: str = "tick",
     action_cooldown: bool = False,
+    observe_mode: bool = False,
 ) -> LoopTickResult:
+    """One planner tick. ``observe_mode`` (controller mode ``observe``, B8): the
+    plan is still computed and published, but no SafeScale probe is started or
+    preempted - the probe's state would change (hide, window, commit) while its
+    hide never reaches the cluster. Every other action is still submitted; the
+    ActionQueue drops it in observe mode (it never reaches the SM)."""
     if snapshot.stale:
         return LoopTickResult(submitted=0, events=("snapshot_stale",))
 
@@ -201,6 +207,7 @@ def run_planner_tick(
         safescale=safescale,
         cluster_view=cluster_view,
         contexts=contexts,
+        observe_mode=observe_mode,
     )
     if _prof_on:
         _safescale_ns = time.perf_counter_ns() - _phase_t0
@@ -288,6 +295,7 @@ def _apply_safescale(
     safescale: SafeScaleController | None,
     cluster_view: ClusterView | None = None,
     contexts: dict[str, dict] | None = None,
+    observe_mode: bool = False,
 ) -> tuple[tuple[Action, ...], tuple[str, ...]]:
     if safescale is None:
         return actions, ()
@@ -295,6 +303,15 @@ def _apply_safescale(
     converted: list[Action] = []
     events: list[str] = []
     for action in actions:
+        if observe_mode:
+            # B8: never start (or preempt) a probe while paused. The planned
+            # scale-down is dropped here (it only runs as a probe); anything else
+            # goes to the queue, which drops it in observe mode.
+            if _requires_safescale_probe(action):
+                events.append(f"safescale_probe_skipped:{_safescale_probe_model(action)}:observe_mode")
+            else:
+                converted.append(action)
+            continue
         if isinstance(action, ScaleAction) and action.delta > 0:
             preempt = getattr(safescale, "request_preemption", None)
             restored = preempt(action.model, reason="receiver_need_upscale") if callable(preempt) else 0

@@ -110,6 +110,10 @@ class SafeScaleProbe:
     #: While committing: the decision handed to the queue ("commit" / "rollback").
     resolution: str | None = None
     resolution_reason: str | None = None
+    #: While committing: when the decision was made (ms, snapshot clock = epoch ms;
+    #: persisted as ``committing_ts`` in s). B8: the queue refuses to act on a commit
+    #: whose decision is older than ``commit_max_age_ms`` at its first dispatch.
+    committing_ms: int | None = None
 
 
 @dataclass(frozen=True)
@@ -146,6 +150,10 @@ class SafeScaleStateMachine:
         """Probes whose resolution the action queue has not finished yet."""
         return tuple(probe for probe in self._probes.values() if probe.status == "committing")
 
+    def all_probes(self) -> tuple[SafeScaleProbe, ...]:
+        """Every unresolved probe, probing or committing."""
+        return tuple(self._probes.values())
+
     def busy_models(self) -> set[str]:
         """Models with a probe in any state: their hidden pods are the probe's
         (never planner donors, no new probe) until it is resolved."""
@@ -166,12 +174,13 @@ class SafeScaleStateMachine:
         probe = self._probes.get(model)
         if probe is None:
             return False
-        probe = replace(probe, status="committing", resolution=status, resolution_reason=reason)
+        probe = replace(
+            probe, status="committing", resolution=status, resolution_reason=reason, committing_ms=int(now_ms)
+        )
         self._probes[model] = probe
         if self._store is not None:
-            record = _probe_record(probe, terminal_reason=reason, status="committing")
-            record["committing_ts"] = float(now_ms) / 1000.0
-            self._store.save_probe(probe.request_id, record)
+            # committing_ts is written by _probe_record (from committing_ms).
+            self._store.save_probe(probe.request_id, _probe_record(probe, terminal_reason=reason, status="committing"))
         return True
 
     def resolve_request(
@@ -734,6 +743,8 @@ def _probe_record(
     if probe.resolution is not None and status == "committing":
         record["resolution"] = probe.resolution
         record["resolution_reason"] = probe.resolution_reason
+        if probe.committing_ms is not None:
+            record["committing_ts"] = float(probe.committing_ms) / 1000.0
     if resolution is not None:
         record["resolution"] = resolution
     if resolved_ts is not None:
@@ -798,10 +809,13 @@ def _committing_fields(row: dict[str, Any]) -> dict[str, Any]:
     with the decision that was handed to the action queue."""
     if str(row.get("status", "probing")) != "committing" or row.get("resolution") not in ("commit", "rollback"):
         return {}
+    committing_ts = _optional_float(row.get("committing_ts"))
     return {
         "status": "committing",
         "resolution": str(row["resolution"]),
         "resolution_reason": str(row.get("resolution_reason") or row.get("terminal_reason") or ""),
+        # B8: the decision time survives a restart, so a recovered commit is aged.
+        "committing_ms": int(committing_ts * 1000.0) if committing_ts is not None else None,
     }
 
 
