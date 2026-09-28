@@ -31,7 +31,7 @@ spec:
         kubernetes.io/hostname: nscc-ds-4a100-node10
       containers:
         - name: service-manager
-          image: tre-v2-service-manager:20260928-cc2c64d2
+          image: tre-v2-service-manager:20260928-a6f1a59b
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8000
