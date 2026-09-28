@@ -1,6 +1,8 @@
-"""B8: observe mode must not start SafeScale probes; a commit held (observe) or
-recovered (restart) is aged before its first dispatch; a probe whose pods are all
-gone from a fresh cluster view is resolved without any SM call, in any mode."""
+"""B8: observe mode must not start SafeScale probes; a commit that waited
+(recovered after a restart, queued behind other work) is aged before its first
+dispatch; a probe whose pods are all gone from a fresh cluster view is resolved
+without any SM call, in any mode. Since 2026-09-28 (observe = record only) a
+commit decided in observe is not held for later: it runs as its donor unhide."""
 
 from __future__ import annotations
 
@@ -139,13 +141,13 @@ def test_the_rescue_loop_reads_the_mode_gate_every_tick():
 
 
 # ------------------------------------------------ 2. commit held, then aged on resume
-def _held_commit(*, fresh_view, clock):
-    """A probe started in active mode reaches its commit while the controller is
-    in observe mode: the commit is handed to the queue and held there."""
+def _held_commit(*, fresh_view, clock, observe=True):
+    """A probe started in active mode reaches its commit; the commit is handed
+    to the queue (in observe mode unless ``observe=False``) and not yet run."""
     redis = FakeRedis()
     machine = _machine(ControllerStateStore(redis))
     _start_and_prime(machine)
-    mode = {"observe": True}
+    mode = {"observe": observe}
     sm = RecordingSM()
     queue = ActionQueue(
         sm,
@@ -162,24 +164,28 @@ def _held_commit(*, fresh_view, clock):
     return redis, machine, queue, sm, mode
 
 
-def test_a_commit_decided_in_observe_mode_is_held_not_dispatched():
+def test_a_commit_decided_in_observe_mode_runs_only_as_its_donor_unhide():
     clock = {"now": DECIDED_MS}
     redis, machine, queue, sm, _mode = _held_commit(fresh_view=lambda: _view(POD_A_HIDDEN), clock=clock)
     [record] = _probe_records(redis).values()
     assert (record["status"], record["resolution"], record["committing_ts"]) == ("committing", "commit", 1.0)
     assert machine.committing_probes()[0].committing_ms == DECIDED_MS
-    clock["now"] = DECIDED_MS + 10 * MAX_AGE_MS  # however long it waits
     asyncio.run(queue.drain_once())
-    assert sm.calls == []
-    assert queue.has_request("donor-0") and machine.busy_models() == {"donor"}
+    # never slept, receiver never woken: the hidden pod only gets its routing back
+    assert sm.calls == [("donor", "routable", ())]
+    assert not queue.has_request("donor-0") and machine.busy_models() == set()
+    [record] = _probe_records(redis).values()
+    assert (record["status"], record["resolution"], record["terminal_reason"]) == (
+        "resolved", "rollback", "observe_entered",
+    )
 
 
-def test_back_to_active_after_the_max_age_the_commit_becomes_the_unhide():
+def test_after_the_max_age_the_commit_becomes_the_unhide():
     clock = {"now": DECIDED_MS}
-    redis, machine, queue, sm, mode = _held_commit(fresh_view=lambda: _view(POD_A_HIDDEN), clock=clock)
-    asyncio.run(queue.drain_once())
+    redis, machine, queue, sm, mode = _held_commit(
+        fresh_view=lambda: _view(POD_A_HIDDEN), clock=clock, observe=False
+    )
     clock["now"] = DECIDED_MS + MAX_AGE_MS + 1
-    mode["observe"] = False
     asyncio.run(queue.drain_once())
     # never slept: the hidden donor pod gets its routing back; the upscale is dropped
     assert sm.calls == [("donor", "routable", ())]
@@ -204,12 +210,12 @@ def test_a_stale_commit_unhides_nothing_a_fresh_view_does_not_show_awake_and_hid
     assert record["terminal_reason"].endswith("no donor pod to unhide")
 
 
-def test_back_to_active_within_the_max_age_the_commit_proceeds():
+def test_within_the_max_age_the_commit_proceeds():
     clock = {"now": DECIDED_MS}
-    redis, machine, queue, sm, mode = _held_commit(fresh_view=lambda: _view(POD_A_HIDDEN), clock=clock)
-    asyncio.run(queue.drain_once())
+    redis, machine, queue, sm, mode = _held_commit(
+        fresh_view=lambda: _view(POD_A_HIDDEN), clock=clock, observe=False
+    )
     clock["now"] = DECIDED_MS + MAX_AGE_MS  # exactly the max age is still fresh
-    mode["observe"] = False
     asyncio.run(queue.drain_once())
     assert sm.calls == [("pod-a", False), ("receiver", "target", 1)]
     assert queue.stats()["commit_evidence_stale_total"] == 0

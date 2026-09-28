@@ -139,6 +139,8 @@ def build_controller_task_specs(
                     signal_state=deps.signal_state,
                     cluster_view_box=deps.cluster_view_box,
                     gateway_source=deps.gateway_health,
+                    # Observe (2026-09-28): open probes are rolled back (unhide).
+                    is_observe=_observe_reader(deps),
                 ),
             )
         )
@@ -232,6 +234,8 @@ def create_controller_dependencies(
         queue=ActionQueue(
             sm_client,
             is_observe=observe_gate.is_observe,
+            # Uncached re-check right before every capacity-changing SM call.
+            is_observe_fresh=observe_gate.is_observe_fresh,
             prof=profiler,
             retry=RetryPolicy(
                 max_attempts=int(getattr(cfg, "oneshot_retry_max_attempts", 6)),
