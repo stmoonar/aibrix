@@ -239,10 +239,12 @@ vllm:
     VLLM_WORKER_MULTIPROC_METHOD: spawn
     # Weights are local paths; never reach out to a model hub.
     HF_HUB_OFFLINE: '1'
-    # torch rounds every pinned host block up to a power of two by default (~1.9x the
-    # weights in host RAM once a pod has slept); 1 MiB threshold = exact sizes
-    # (7b: 30.2 -> 17.6 GiB per pod, first sleep 9.3 -> 5.9 s; wake unchanged).
-    PYTORCH_ALLOC_CONF: pinned_max_round_threshold_mb:1
+    # PYTORCH_ALLOC_CONF=pinned_max_round_threshold_mb:1 (exact-size pinned host blocks,
+    # ~1.0x instead of ~1.9x the weights in host RAM) must NOT be set with the cumem
+    # backend: with it every sleep after the first wake fails in CuMemAllocator.sleep
+    # (cudaMemcpy -> CUDART error: invalid argument; reproduced 2026-09-28 on
+    # vllm-openai-tre:0.30.0-ts-02ad6c9e, 3/3 cycles fail; without it 3/3 pass).
+    # Host RAM without it: ~1.9x weights per pod once slept (7b ~30 GiB), ~360 GiB per node.
 # Gateway behaviour shared by the manifests and the service-manager.
 gateway:
   # Request timeout of every model route: the single source for the model

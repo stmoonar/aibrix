@@ -51,7 +51,10 @@ that no other session is using the cluster.
 - `vllm.env` (new, registry-wide) merges over the built-in `VLLM_SERVER_DEV_MODE=1`
   (0.30 mounts `/sleep`, `/wake_up`, `/is_sleeping` only in dev mode); `models[].vllm_env`
   merges over it. Shipped: `VLLM_SERVER_DEV_MODE=1`, `VLLM_WORKER_MULTIPROC_METHOD=spawn`,
-  `HF_HUB_OFFLINE=1`, `PYTORCH_ALLOC_CONF=pinned_max_round_threshold_mb:1`.
+  `HF_HUB_OFFLINE=1`. `PYTORCH_ALLOC_CONF=pinned_max_round_threshold_mb:1` was
+  shipped first and removed on 2026-09-28 (deploy test): with the cumem backend every
+  sleep after the first wake failed (`CUDART error: invalid argument` in
+  `CuMemAllocator.sleep`), see section 4.
   `VLLM_USE_MODELSCOPE=True` (hard-coded before) is dropped: the 0.30 image was
   GPU-validated with `HF_HUB_OFFLINE=1` and local weight paths.
 - `models[].max_model_len`: dsllama-8b 32768 (at util 0.85 0.30 leaves ~15.8 GiB of KV
@@ -109,10 +112,11 @@ GPU (A100 40 GiB = 40960 MiB):
 Host RAM per node (4 x 7b, 4 x 8b, 2 x 14b TP2 bindings). With cumem the pinned host
 copy stays after the first sleep (torch's CachingHostAllocator keeps it), also while
 awake, so every binding counts:
-- with `PYTORCH_ALLOC_CONF=pinned_max_round_threshold_mb:1` (shipped): ~1.0 x weights +
+- with `PYTORCH_ALLOC_CONF=pinned_max_round_threshold_mb:1` (NOT shipped: breaks every
+  cumem sleep after the first wake, reproduced 3/3 on 0.30.0-ts-02ad6c9e): ~1.0 x weights +
   process baseline: 7b 17.6 GiB (measured) x 4 + 8b ~18 GiB x 4 + 14b ~34 GiB x 2
   = ~210 GiB (weights only: 15 x 4 + 16 x 4 + 28 x 2 = 180 GB);
-- without it (power-of-two rounding, ~1.9 x): ~360 GiB;
+- without it (shipped; power-of-two rounding, ~1.9 x; 7b measured 30.1 GiB): ~360 GiB;
 - nodes: 1007 GiB total, ~660 GiB available now on each node (buff/cache is
   reclaimable; ~273 GiB `shared` already in use). Fits with either setting.
 

@@ -109,8 +109,6 @@ spec:
           value: spawn
         - name: HF_HUB_OFFLINE
           value: '1'
-        - name: PYTORCH_ALLOC_CONF
-          value: pinned_max_round_threshold_mb:1
         resources: {}
         volumeMounts:
         - name: shm

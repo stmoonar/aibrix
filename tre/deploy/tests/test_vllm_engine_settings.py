@@ -116,7 +116,8 @@ def test_shipped_registry_runs_the_030_fork_with_default_cumem():
         assert model.sleep_mode_backend is None  # cumem: no --sleep-mode-backend flag
         env = registry.vllm_env_for(model)
         assert env["VLLM_SERVER_DEV_MODE"] == "1"
-        assert env["PYTORCH_ALLOC_CONF"] == "pinned_max_round_threshold_mb:1"
+        # pinned_max_round_threshold_mb breaks the second cumem sleep (2026-09-28).
+        assert "PYTORCH_ALLOC_CONF" not in env
     assert registry.model("dsllama-8b").max_model_len == 32768
 
 
