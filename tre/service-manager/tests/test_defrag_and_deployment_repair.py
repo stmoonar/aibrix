@@ -327,3 +327,57 @@ def test_supervisor_falls_back_to_the_fleet_repair_when_not_eligible():
     )
     assert mixed.targeted == []
     assert mixed.repairs == [True]
+
+
+# ------------------------------------------- B6 x B3 (headroom) x B2 (observed)
+class _StaticTruth:
+    """gpu-truth without refresh support: fixed used MiB per GPU uuid."""
+
+    def __init__(self, used):
+        self.used = dict(used)
+
+    def used_mib(self, *, node, gpu_id, gpu_uuid):
+        return self.used.get(gpu_uuid)
+
+    def node_truth(self, *, node):
+        from tre_sm.gpu_truth import NodeGpuTruth
+
+        return NodeGpuTruth(
+            node=node,
+            used_by_uuid=dict(self.used),
+            total_by_uuid={uuid: 40960 for uuid in self.used},
+        )
+
+
+def _truth(gpu1_used):
+    return _StaticTruth({"GPU-0": 30000, "GPU-1": gpu1_used, "GPU-2": 30000, "GPU-3": 500})
+
+
+def test_full_layout_defrag_checks_the_destination_headroom_before_sleeping_the_source():
+    from tre_sm.api.v2 import WakeConflict
+
+    world = _full_layout_world()
+    world.service._gpu_truth = _truth(33000)  # an awake resident / leak on GPU 1
+
+    with pytest.raises(WakeConflict, match="insufficient wake headroom"):
+        world.service.defrag(tp_size=2)
+
+    assert world.vllm.sleeping["10.0.0.2"] is False  # the source was never slept
+    assert not any(call[0] == "sleep" for call in world.vllm.calls)
+
+
+def test_full_layout_defrag_refreshes_the_observed_state_of_both_bindings():
+    from tre_sm.server import K8sPodClientFromOps
+
+    world = _full_layout_world()
+    world.service._gpu_truth = _truth(900)
+    world.service._k8s_client = K8sPodClientFromOps(world.service._registry.topology(), world.runtime)
+    world.service.reconcile()
+
+    world.service.defrag(tp_size=2)
+
+    observed = {item.binding_id: item.physical_power for item in world.fleet.load_observed().bindings}
+    assert observed["m1/node-a/2"] == "sleeping"  # no reconcile needed (B2)
+    assert observed["m1/node-a/1"] == "awake"
+    codes = {issue["code"] for issue in world.service.audit()["issues"]}
+    assert not codes & {"desired_power_mismatch", "desired_hidden_mismatch"}

@@ -2951,11 +2951,9 @@ class ServiceManagerV2:
             # Refuse before the source is slept when the destination cannot wake.
             if not self._snapshot_for_binding(destination).pod_ip:
                 raise ValueError(f"pod {destination.serve_id} has no pod IP for wake")
-            if self._gpu_truth is not None:
-                nodes = {node.name: node for node in self._registry.topology().nodes}
-                problem = self._wake_headroom_problem(destination, nodes.get(destination.slot.node))
-                if problem is not None:
-                    raise WakeConflict(f"insufficient wake headroom: {problem}")
+            # The destination's wake headroom gate (fresh gpu-truth sample, B3),
+            # before anything changes; the wake below runs it again.
+            self._ensure_wake_headroom(destination)
         self._apply_runtime_power_action(binding, action="sleep", sleep_path="defrag")
         try:
             self._apply_runtime_power_action(destination, action="wake")
