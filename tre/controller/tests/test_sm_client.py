@@ -102,7 +102,7 @@ async def test_sm_client_normalizes_http_failure() -> None:
 
     result = await client.get_state_result()
 
-    assert result == {"ok": False, "error": "bad gateway"}
+    assert result == {"ok": False, "error": "bad gateway", "status": None, "retriable": False}
 
 
 @pytest.mark.asyncio
@@ -150,7 +150,12 @@ async def test_sm_client_defrag_keeps_unsupported_fallback_for_old_service_manag
 
     result = await client.defrag(())
 
-    assert result == {"ok": False, "error": "defrag endpoint is not implemented in service-manager v2"}
+    assert result == {
+        "ok": False,
+        "error": "defrag endpoint is not implemented in service-manager v2",
+        "status": 404,
+        "retriable": False,
+    }
 
 
 @pytest.mark.asyncio
@@ -163,3 +168,25 @@ async def test_sm_client_set_binding_power_puts_binding_power_endpoint() -> None
     assert result["ok"] is True
     assert transport.calls == [("PUT", "http://sm.local/v2/bindings/p1/power", {"awake": False})]
     assert transport.timeouts == [300.0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "retriable"),
+    [
+        (ServiceManagerError("HTTP 409: busy", status=409), True),
+        (ServiceManagerError("HTTP 503: shutting down", status=503), True),
+        (TimeoutError("timed out"), True),
+        (ConnectionRefusedError("refused"), True),
+        (ServiceManagerError("HTTP 400: unknown binding", status=400), False),
+        (ServiceManagerError("HTTP 500: boom", status=500), False),
+    ],
+)
+async def test_sm_client_classifies_retriable_failures_review2_p2_5(error, retriable) -> None:
+    transport = FakeTransport(responses=[error])
+    client = ServiceManagerClient("http://sm.local", transport=transport)
+
+    result = await client.set_binding_power("p1", awake=False)
+
+    assert result["ok"] is False
+    assert result["retriable"] is retriable

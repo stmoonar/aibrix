@@ -13,6 +13,76 @@ This document covers all environment variables used in the `pkg/plugins/gateway`
 
 ---
 
+## TRE transparent sleep (`tre_transparent_sleep.go`)
+
+Gateway side of the TRE sleep/wake handshake with the service-manager. Redis keys
+(`tre:v2:gw:instances`, `tre:v2:gw:seen:<pod>`, `tre:v2:gw:inflight:<pod>`, all keyed by pod
+name), the pod annotation `tre.aibrix.io/route-gen` and the request header
+`x-tre-exclude-pod` (comma separated; repeated headers are merged) are fixed by the
+cross-component contract and are not configurable.
+
+| Variable | Type | Default | Description | Source |
+|---|---|---|---|---|
+| `TRE_GW_COORDINATION` | bool | value of `TRE_ROUTABLE_LABEL_FILTER` | Enable the instance heartbeat, route-gen acks and inflight mirror in Redis. Fail-closed: when wanted but it cannot start (no `TRE_ROUTABLE_LABEL_FILTER=true`, no Redis, no Kubernetes API, or Redis/apiserver unreachable for `TRE_GW_STARTUP_TIMEOUT`) the plugin exits non-zero instead of routing without it. | [tre_transparent_sleep.go](tre_transparent_sleep.go) |
+| `TRE_GW_INSTANCE_ID` | string | `POD_NAME`, then hostname | Instance id used as ZSET member / hash field. | [tre_transparent_sleep.go](tre_transparent_sleep.go) |
+| `TRE_GW_HEARTBEAT_INTERVAL` | duration | `2s` | Heartbeat period of `tre:v2:gw:instances`. The score is the Redis server time (`TIME`), not the gateway host clock; the `ts` fields of seen/inflight use the same clock. | [tre_transparent_sleep.go](tre_transparent_sleep.go) |
+| `TRE_GW_INSTANCE_RETENTION` | duration | `10m` | Heartbeat entries older than this are pruned from the ZSET. | [tre_transparent_sleep.go](tre_transparent_sleep.go) |
+| `TRE_GW_KEY_TTL` | duration | `300s` | TTL of the seen and inflight hashes, renewed on every write. | [tre_transparent_sleep.go](tre_transparent_sleep.go) |
+| `TRE_GW_REFRESH_INTERVAL` | duration | `30s` | Period of the full re-ack / inflight rewrite (a restarted instance re-acks at startup). | [tre_transparent_sleep.go](tre_transparent_sleep.go) |
+| `TRE_GW_STARTUP_TIMEOUT` | duration | `60s` | Bound on the retries of each startup step (quorum pod LIST, reset of own inflight fields, first ack/inflight refresh, first heartbeat). | [tre_transparent_sleep.go](tre_transparent_sleep.go) |
+| `TRE_GW_REDIS_RETRY_MAX` | duration | `10s` | Cap of the exponential backoff (from 250ms) after failed Redis writes; failures are logged and counted in `tre_gateway_redis_errors_total{op}`. | [tre_transparent_sleep.go](tre_transparent_sleep.go) |
+| `TRE_GW_RETRY_AFTER_SECONDS` | int | `1` | `Retry-After` on 503s from pod selection (no routable pod, all candidates excluded, commit race, instance shutting down). | [tre_transparent_sleep.go](tre_transparent_sleep.go) |
+| `TRE_DEFAULT_ROUTING_STRATEGY` | string | off | Optional last-resort strategy when neither the `routing-strategy` header, the config profile nor `ROUTING_ALGORITHM` names one. Prefer the upstream `ROUTING_ALGORITHM` (older images honour it too). `""`, `none` or `off` disable it. | [tre_transparent_sleep.go](tre_transparent_sleep.go), [util.go](util.go) |
+| `TRE_ROUTABLE_LABEL_FILTER` | bool | `false` | Only pods labelled `tre.aibrix.io/routable=true` are routing candidates. | [pkg/utils/pod.go](../../utils/pod.go) |
+| `TRE_ROUTE_MODEL_HEADER` | bool | `false` | Stamp the body model onto the `model` request header. | [tre_route_model_header.go](tre_route_model_header.go) |
+
+Behaviour with coordination on:
+
+- Every counted request holds its inflight slot until its ext_proc stream ends (response
+  `end_of_stream`, error, client disconnect, shutdown). Usage in a stream chunk
+  (`stream_options.continuous_usage_stats`) does not end it.
+- A request that resolves to no routing strategy is routed per pod with `random` instead of
+  the HTTPRoute/Service path, so it is counted and bound to the acked route table.
+- Routers that do not select from this request's candidate list synchronously are refused
+  with 400: queue routers (`slo*`) and `pd` (its prefill pod would not be counted).
+- On startup the route table is seeded from a quorum pod LIST (ResourceVersion `""`,
+  label `tre.aibrix.io/routable`), and per pod object the route-gen never goes back, so a
+  restarted instance with the same id does not ack or route on a stale watch-cache state.
+  This needs `list` on pods cluster-wide, which the pod informer already requires.
+- On pod deletion this instance's fields in `seen:<pod>` / `inflight:<pod>` are deleted;
+  a same-name replacement starts from zero.
+- On graceful shutdown new commits get 503 + `Retry-After` before the instance leaves
+  `tre:v2:gw:instances` and clears its inflight fields.
+
+Continuation classification (`non_continuable` in the inflight value, D6): requests that
+cannot be resumed from their emitted tokens and must be drained rather than aborted are
+`n>1`, `best_of>1`, any logprobs output, `echo`, beam search, tool/function calling
+(streaming or not, unless `tool_choice`/`function_call` is `"none"`), structured output /
+guided decoding (`response_format` other than `text`, `guided_json`, `guided_regex`,
+`guided_choice`, `guided_grammar`, `guided_json_object`, `structural_tag`,
+`structured_outputs`) and every endpoint other than completions and chat completions.
+Known semantic drift that is *not* classified as non-continuable: in a continuation the
+tokens generated before the seam are part of the prompt, so `presence_penalty` and
+`frequency_penalty` (which count generated tokens only) no longer penalise them
+(`repetition_penalty` covers prompt and output and is unaffected), and a fixed `seed`
+restarts its random stream at the seam. A continued sampled output is therefore valid but
+not bit-identical to an uninterrupted one; greedy decoding without these penalties is
+unaffected. `max_tokens` / `min_tokens` are the continuation sender's responsibility.
+
+---|---|---|---|---|
+| `TRE_DEFAULT_ROUTING_STRATEGY` | string | `least-gpu-cache` | Strategy for requests that name none (no `routing-strategy` header, no config profile, no `ROUTING_ALGORITHM`), so every request goes through ext_proc pod selection. `""`, `none` or `off` disables it (upstream HTTPRoute/Service path). | [tre_transparent_sleep.go](tre_transparent_sleep.go), [util.go](util.go) |
+| `TRE_GW_COORDINATION` | bool | value of `TRE_ROUTABLE_LABEL_FILTER` | Enable the instance heartbeat, route-gen acks and inflight mirror in Redis. Refuses to start without `TRE_ROUTABLE_LABEL_FILTER=true`. | [tre_transparent_sleep.go](tre_transparent_sleep.go) |
+| `TRE_GW_INSTANCE_ID` | string | `POD_NAME`, then hostname | Instance id used as ZSET member / hash field. | [tre_transparent_sleep.go](tre_transparent_sleep.go) |
+| `TRE_GW_HEARTBEAT_INTERVAL` | duration | `2s` | Heartbeat period of `tre:v2:gw:instances`. | [tre_transparent_sleep.go](tre_transparent_sleep.go) |
+| `TRE_GW_INSTANCE_RETENTION` | duration | `10m` | Heartbeat entries older than this are pruned from the ZSET. | [tre_transparent_sleep.go](tre_transparent_sleep.go) |
+| `TRE_GW_KEY_TTL` | duration | `300s` | TTL of the seen and inflight hashes, renewed on every write. | [tre_transparent_sleep.go](tre_transparent_sleep.go) |
+| `TRE_GW_REFRESH_INTERVAL` | duration | `30s` | Period of the full re-ack / inflight rewrite (a restarted instance re-acks at startup). | [tre_transparent_sleep.go](tre_transparent_sleep.go) |
+| `TRE_GW_RETRY_AFTER_SECONDS` | int | `1` | `Retry-After` on 503s from pod selection (no routable pod, all candidates excluded). | [tre_transparent_sleep.go](tre_transparent_sleep.go) |
+| `TRE_ROUTABLE_LABEL_FILTER` | bool | `false` | Only pods labelled `tre.aibrix.io/routable=true` are routing candidates. | [pkg/utils/pod.go](../../utils/pod.go) |
+| `TRE_ROUTE_MODEL_HEADER` | bool | `false` | Stamp the body model onto the `model` request header. | [tre_route_model_header.go](tre_route_model_header.go) |
+
+---
+
 ## Response Processing
 
 | Variable | Type | Default | Description | Source |

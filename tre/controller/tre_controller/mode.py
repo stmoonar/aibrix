@@ -3,7 +3,11 @@
 The console (or an operator) can set ``tre:v2:controller:mode`` to ``observe`` to PAUSE
 actuation without stopping the controller: decisions keep computing and publishing (so the
 UI stays live), but the ActionQueue stops dispatching to the service-manager -- no scale,
-hide/unhide, defrag, or safescale probe reaches the cluster. Setting it back to ``active``
+hide/unhide, defrag, or safescale probe reaches the cluster -- and the planner loops start
+(or preempt) no SafeScale probe (B8: a probe started while paused would run its window with
+its hide dropped, then commit on that meaningless evidence at resume). SafeScale one-shot
+actions already decided are held, and a held commit older than
+``safescale.commit_max_age_ms`` at resume becomes the donor unhide. Setting it back to ``active``
 (or clearing it) resumes. Reads are cached for a short TTL so the 0.1s drain poll never
 hammers Redis, and any Redis error fails safe to ``active`` (never silently freezes control).
 """

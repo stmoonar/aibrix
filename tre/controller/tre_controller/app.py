@@ -1,20 +1,28 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Mapping
 
-from tre_common.registry import Registry, load_registry
+from tre_common.registry import Registry, load_registry, sleep_call_timeout_errors
 from tre_controller.config import ControllerConfig
 from tre_controller.gateway_cadence import check_gateway_cadence
 from tre_controller.gateway_health import EnvoyStatsSource
-from tre_controller.loops.action_queue import ActionQueue
+from tre_controller.loops.action_queue import (
+    ActionQueue,
+    RetryPolicy,
+    revalidate_commit_from_signals,
+    revalidate_from_cluster_view,
+    slot_lookup_from_cluster_view,
+)
 from tre_controller.mode import ObserveModeGate
 from tre_controller.reconcile.hidden_orphans import HiddenOrphanDetector
 from tre_controller.profiling import TickProfiler, build_profiler
 from tre_controller.loops.cluster_view_task import ClusterViewBox, cluster_view_task
 from tre_controller.loops.decision_snapshot import DecisionSnapshotWriter
 from tre_controller.loops.fairness_task import fairness_task
+from tre_controller.loops.model_state_box import ModelStateBox
 from tre_controller.loops.metrics_task import MetricsTaskConfig, SnapshotBox, SnapshotStore, metrics_task
 from tre_controller.loops.rescue_task import rescue_task
 from tre_controller.loops.safescale_task import safescale_task
@@ -44,6 +52,11 @@ class ControllerDependencies:
     hidden_orphan_detector: "HiddenOrphanDetector | None" = None
     # A13 donor-health guard source (None when TRE_GATEWAY_STATS_URL is unset).
     gateway_health: "EnvoyStatsSource | None" = None
+    # Review 3: latest per-model signal state (planner ticks -> commit revalidation).
+    model_state_box: "ModelStateBox | None" = None
+    # B8: controller run mode (observe/active) - the planner loops read it too, so
+    # no SafeScale probe is started while paused (the queue alone cannot stop that).
+    observe_gate: "ObserveModeGate | None" = None
 
 
 @dataclass(frozen=True)
@@ -89,6 +102,8 @@ def build_controller_task_specs(
                     safescale=deps.safescale,
                     signal_state=deps.signal_state,
                     prof=deps.profiler,
+                    model_state_box=deps.model_state_box,
+                    is_observe=_observe_reader(deps),
                 ),
             )
         )
@@ -106,6 +121,8 @@ def build_controller_task_specs(
                 safescale=deps.safescale,
                 signal_state=deps.signal_state,
                 prof=deps.profiler,
+                model_state_box=deps.model_state_box,
+                is_observe=_observe_reader(deps),
             ),
         )
     )
@@ -139,10 +156,38 @@ def build_controller_task_specs(
     return tuple(specs)
 
 
+def _observe_reader(deps: ControllerDependencies) -> Callable[[], bool] | None:
+    gate = deps.observe_gate
+    return gate.is_observe if gate is not None else None
+
+
 def _active_probe_models(safescale: SafeScaleStateMachine) -> set[str]:
     # Live read each tick: models with an unresolved safescale probe (hidden pod) must
-    # not be picked as planner donors (review F3).
+    # not be picked as planner donors (review F3) - committing ones included (review 4).
+    busy = getattr(safescale, "busy_models", None)
+    if callable(busy):
+        return set(busy())
     return {probe.model for probe in safescale.active_probes()}
+
+
+def resolve_sm_call_timeout_s(cfg: ControllerConfig, registry: Registry) -> float:
+    """The controller's timeout for slow SM calls (scale / binding power / defrag).
+
+    TRE_SM_SLOW_TIMEOUT_SECONDS if set, else the registry's
+    ``service_manager.api_call_timeout_s``. Refuses to start when it does not
+    exceed the worst-case sleeping SM call (the SM would still be draining when
+    the controller gives up and re-plans against a stale view)."""
+    sm_config = registry.service_manager()
+    explicit = getattr(cfg, "sm_slow_timeout_s", None)
+    timeout = float(explicit) if explicit is not None else float(sm_config.api_call_timeout_s)
+    errors = sleep_call_timeout_errors(
+        sm_config,
+        timeout,
+        name="TRE_SM_SLOW_TIMEOUT_SECONDS" if explicit is not None else "service_manager.api_call_timeout_s",
+    )
+    if errors:
+        raise ValueError("controller configuration: " + "; ".join(errors))
+    return timeout
 
 
 def create_controller_dependencies(
@@ -170,18 +215,53 @@ def create_controller_dependencies(
         min_latency_samples=cfg.min_latency_samples,
     )
     sm_client = ServiceManagerClient(
-        cfg.service_manager_url, transport=sm_transport, slow_timeout_s=cfg.sm_slow_timeout_s
+        cfg.service_manager_url,
+        transport=sm_transport,
+        slow_timeout_s=resolve_sm_call_timeout_s(cfg, registry),
     )
     safescale = SafeScaleStateMachine(config=cfg.safescale, store=ControllerStateStore(redis_client))
     safescale.restore()
     observe_gate = ObserveModeGate(redis_client)
     profiler = build_profiler(cfg, redis_client)
+    # A view older than two refresh periods is not "fresh" (review 4 P2-1).
+    cluster_view_box = ClusterViewBox(max_age_s=max(5.0, 2.5 * float(getattr(cfg, "fairness_interval_s", 10.0))))
+    model_state_box = ModelStateBox()
     return ControllerDependencies(
         store=store,
         snapshot_box=SnapshotBox(),
-        queue=ActionQueue(sm_client, is_observe=observe_gate.is_observe, prof=profiler),
+        queue=ActionQueue(
+            sm_client,
+            is_observe=observe_gate.is_observe,
+            prof=profiler,
+            retry=RetryPolicy(
+                max_attempts=int(getattr(cfg, "oneshot_retry_max_attempts", 6)),
+                base_backoff_s=float(getattr(cfg, "oneshot_retry_base_s", 2.0)),
+                max_backoff_s=float(getattr(cfg, "oneshot_retry_max_s", 30.0)),
+            ),
+            # One-shot retries re-check the latest cluster view; actions on a shared
+            # GPU are serialized (review 2 P1-1 / P1-2).
+            # Only a FRESH view may skip a retry (review 4 P2-1).
+            revalidate=revalidate_from_cluster_view(cluster_view_box.fresh),
+            # Review 3: a SafeScale commit is revalidated on the current signal state
+            # (donor needing capacity -> unhide instead; receiver no longer needing it
+            # -> upscale dropped) before every (re)try.
+            revalidate_commit=revalidate_commit_from_signals(model_state_box.get, cluster_view_box.fresh),
+            slot_of=slot_lookup_from_cluster_view(cluster_view_box.get),
+            # Review 4 P2-3 / P2-4: preemption compensation and failed-commit
+            # unhides use the view only while fresh; a SafeScale probe is resolved
+            # when its one-shot action is finished (durable lifecycle).
+            fresh_view=cluster_view_box.fresh,
+            on_oneshot_done=lambda request_id, status, reason: safescale.resolve_request(
+                request_id, status=status, reason=reason, now_ms=int(time.time() * 1000)
+            ),
+            # B8: a commit held (observe mode) or recovered past this age is
+            # turned into the donor unhide instead of acting on stale evidence.
+            commit_max_age_ms=cfg.safescale.commit_max_age_ms,
+        ),
+        observe_gate=observe_gate,
+        model_state_box=model_state_box,
         sm_client=sm_client,
-        cluster_view_box=ClusterViewBox(),
+        cluster_view_box=cluster_view_box,
         decision_writer=DecisionSnapshotWriter(redis_client),
         safescale=safescale,
         registry=registry,
@@ -249,4 +329,11 @@ def _create_redis_client(redis_url: str, redis_client_factory: RedisClientFactor
 
 
 async def run_controller(deps: ControllerDependencies, cfg: MetricsTaskConfig) -> None:
-    await asyncio.gather(*(spec.factory() for spec in build_controller_task_specs(deps, cfg)))
+    try:
+        await asyncio.gather(*(spec.factory() for spec in build_controller_task_specs(deps, cfg)))
+    finally:
+        # Shutdown (or a crashed loop): cancel SM dispatches still in flight
+        # instead of leaving orphaned tasks behind (review 2 P3).
+        shutdown = getattr(deps.queue, "shutdown", None)
+        if callable(shutdown):
+            await shutdown()

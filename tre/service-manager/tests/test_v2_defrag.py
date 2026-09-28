@@ -58,7 +58,7 @@ class FakeRuntimeOps:
     def write_binding_annotations(self, binding, *, state):
         self.calls.append(("annotate", binding.serve_id, state))
 
-    def wait_pod_unroutable(self, binding):
+    def wait_pod_unroutable(self, binding, **_kwargs):
         self.calls.append(("wait_unroutable", binding.serve_id))
 
     def ensure_model_httproute(self, model):
@@ -89,13 +89,17 @@ class FakeVllmOps:
         self.calls.append(("wait_until_ready", pod_ip, port))
         return type("Result", (), {"success": True, "message": ""})()
 
-    def sleep(self, pod_ip, *, port=None):
+    def sleep(self, pod_ip, *, port=None, **_kwargs):
         self.calls.append(("sleep", pod_ip, port))
         return type("Result", (), {"success": True, "message": ""})()
 
     def wake_up(self, pod_ip, *, port=None):
         self.calls.append(("wake_up", pod_ip, port))
         return type("Result", (), {"success": True, "message": ""})()
+
+    def metrics(self, pod_ip, *, port=None):
+        # Idle engine: the sleep primitive needs readable gauges to call it drained.
+        return "vllm:num_requests_running 0.0\nvllm:num_requests_waiting 0.0\n"
 
 
 def registry() -> Registry:

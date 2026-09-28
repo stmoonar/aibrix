@@ -5,7 +5,7 @@ from typing import Protocol
 
 
 class HttpTransport(Protocol):
-    def post(self, url: str, *, timeout: float): ...
+    def post(self, url: str, *, timeout: float, headers: dict[str, str] | None = None): ...
     def get(self, url: str, *, timeout: float): ...
 
 
@@ -36,8 +36,71 @@ class VllmOps:
         self._max_attempts = max_attempts
         self._default_port = default_port
 
-    def sleep(self, pod_ip: str, *, port: int | None = None) -> VllmOpResult:
-        return self._post(pod_ip, "sleep", port=port)
+    def sleep(
+        self,
+        pod_ip: str,
+        *,
+        port: int | None = None,
+        mode: str | None = None,
+        timeout_s: float | None = None,
+        hidden: bool = False,
+    ) -> VllmOpResult:
+        """POST /sleep.
+
+        ``mode`` (vLLM >= 0.18: ``wait`` | ``abort`` | ``keep``; see
+        ``sleep_primitive.SLEEP_MODE_MIN_VERSION``) is sent as a query parameter
+        only when given. ``timeout_s`` replaces the default
+        HTTP timeout and makes the call single-shot (a timed-out ``mode=wait``
+        must not be blindly retried). ``hidden`` adds ``X-TRE-Hidden: 1``: the
+        caller hid the pod first (plan D2: a sidecar refuses /sleep without it).
+        Only the service-manager sleep primitive may call this.
+        """
+        if mode is not None and mode not in {"wait", "abort", "keep"}:
+            raise ValueError(f"unknown vLLM sleep mode: {mode}")
+        headers = {"X-TRE-Hidden": "1"} if hidden else None
+        return self._post(
+            pod_ip,
+            "sleep",
+            port=port,
+            query=f"mode={mode}" if mode else None,
+            headers=headers,
+            timeout_s=timeout_s,
+            max_attempts=1 if (timeout_s is not None or mode == "wait") else None,
+        )
+
+    def metrics(self, pod_ip: str, *, port: int | None = None) -> str | None:
+        """Prometheus text from GET /metrics, or None on any failure / non-2xx."""
+        url = f"http://{pod_ip}:{port or self._default_port}/metrics"
+        try:
+            response = self._http.get(url, timeout=self._timeout_s)
+            status = int(response.status_code)
+        except Exception:
+            return None
+        if not (200 <= status < 300):
+            return None
+        text = getattr(response, "text", None)
+        return text if isinstance(text, str) else None
+
+    def version(self, pod_ip: str, *, port: int | None = None) -> str | None:
+        """vLLM version string from ``GET /version`` (None on any failure)."""
+        url = f"http://{pod_ip}:{port or self._default_port}/version"
+        try:
+            response = self._http.get(url, timeout=self._timeout_s)
+            status = int(response.status_code)
+        except Exception:
+            return None
+        if not (200 <= status < 300):
+            return None
+        payload = None
+        json_method = getattr(response, "json", None)
+        if callable(json_method):
+            try:
+                payload = json_method()
+            except Exception:
+                payload = None
+        if isinstance(payload, dict) and payload.get("version") is not None:
+            return str(payload["version"])
+        return None
 
     def wake_up(self, pod_ip: str, *, port: int | None = None) -> VllmOpResult:
         return self._post(pod_ip, "wake_up", port=port)
@@ -105,13 +168,30 @@ class VllmOps:
             message=last_message or "timed out waiting for vLLM HTTP readiness",
         )
 
-    def _post(self, pod_ip: str, action: str, *, port: int | None) -> VllmOpResult:
+    def _post(
+        self,
+        pod_ip: str,
+        action: str,
+        *,
+        port: int | None,
+        query: str | None = None,
+        headers: dict[str, str] | None = None,
+        timeout_s: float | None = None,
+        max_attempts: int | None = None,
+    ) -> VllmOpResult:
         url = f"http://{pod_ip}:{port or self._default_port}/{action}"
+        if query:
+            url = f"{url}?{query}"
+        timeout = self._timeout_s if timeout_s is None else float(timeout_s)
+        attempts = self._max_attempts if max_attempts is None else max_attempts
         last_status: int | None = None
         last_message = ""
-        for attempt in range(1, self._max_attempts + 1):
+        for attempt in range(1, attempts + 1):
             try:
-                response = self._http.post(url, timeout=self._timeout_s)
+                if headers:
+                    response = self._http.post(url, timeout=timeout, headers=headers)
+                else:
+                    response = self._http.post(url, timeout=timeout)
             except Exception as exc:  # pragma: no cover - exact transport exceptions vary.
                 last_message = str(exc)
                 continue
@@ -142,7 +222,7 @@ class VllmOps:
             success=False,
             action=action,
             url=url,
-            attempts=self._max_attempts,
+            attempts=attempts,
             status_code=last_status,
             message=last_message,
         )
@@ -179,7 +259,7 @@ class _RequestsTransport:
 
         return requests.get(url, timeout=timeout)
 
-    def post(self, url: str, *, timeout: float):
+    def post(self, url: str, *, timeout: float, headers: dict[str, str] | None = None):
         import requests
 
-        return requests.post(url, timeout=timeout)
+        return requests.post(url, timeout=timeout, headers=headers)

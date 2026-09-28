@@ -84,8 +84,13 @@ budget. Real admission control now lives where it belongs: vLLM
 kubectl apply -f backendtrafficpolicy-aibrix-system.yaml
 kubectl apply -f backendtrafficpolicy-tre-v2.yaml
 kubectl patch envoyproxy aibrix-custom-proxy-config -n aibrix-system   --type merge --patch-file envoyproxy-nofile-patch.yaml
-kubectl -n envoy-gateway-system rollout status deploy/envoy-aibrix-system-aibrix-eg-903790dc
-kubectl -n envoy-gateway-system rollout status deploy/envoy-tre-v2-tre-aibrix-eg-161007f9
+# Envoy Gateway names the proxy Deployments with a generated hash suffix: select them
+# by their owning-gateway labels instead of by name.
+for gw in aibrix-system/aibrix-eg tre-v2/tre-aibrix-eg; do
+  kubectl -n envoy-gateway-system get deploy -o name \
+    -l gateway.envoyproxy.io/owning-gateway-namespace=${gw%/*},gateway.envoyproxy.io/owning-gateway-name=${gw#*/} \
+    | xargs -n1 kubectl -n envoy-gateway-system rollout status
+done
 ```
 
 ## Verify / rollback

@@ -286,3 +286,76 @@ def test_the_record_carries_its_place_in_the_schedule() -> None:
     asyncio.run(sender(request, 0.0, 0.0))
     sender.close()
     assert sender.records[0]["scheduled_offset_s"] == 12.5
+
+
+# --- reissue sidecar outcomes (plan 2026-09-27 P3) -----------------------------------
+
+
+def _serve_once(status: int, headers: dict[str, str], body: bytes):
+    """A one-shot local HTTP server answering every POST with this response."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):  # noqa: N802
+            self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            self.send_response(status)
+            for key, value in headers.items():
+                self.send_header(key, value)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, f"http://127.0.0.1:{server.server_address[1]}/v1/completions"
+
+
+def _sse(*objs) -> bytes:
+    return b"".join(b"data: " + json.dumps(o).encode() + b"\n\n" for o in objs)
+
+
+def test_stream_parser_reads_the_continuation_marks_of_a_stitched_stream() -> None:
+    from tre_replayer.engine.http_sender import _default_stream_call
+
+    body = (
+        _sse({"id": "c", "choices": [{"index": 0, "text": " a", "finish_reason": None}]},
+             {"id": "c", "choices": [{"index": 0, "text": " b", "finish_reason": "length"}], "tre_continued": 2},
+             {"id": "c", "choices": [], "usage": {"prompt_tokens": 3, "completion_tokens": 2}})
+        + b": x-tre-continued: 2\n\ndata: [DONE]\n\n"
+    )
+    server, url = _serve_once(200, {"Content-Type": "text/event-stream", "target-pod": "pod-b"}, body)
+    try:
+        res = _default_stream_call(url, {"Content-Type": "application/json"}, b"{}", 5.0)
+    finally:
+        server.shutdown()
+    assert (res.status, res.finish_reason, res.tre_continued, res.tre_retried) == (200, "length", 2, None)
+    assert res.completion_tokens == 2 and res.target_pod == "pod-b"
+
+
+def test_stream_parser_reads_retry_header_and_abort() -> None:
+    from tre_replayer.engine.http_sender import _default_stream_call
+
+    body = _sse({"id": "c", "choices": [{"index": 0, "text": " a", "finish_reason": "abort"}]}) + b"data: [DONE]\n\n"
+    server, url = _serve_once(200, {"Content-Type": "text/event-stream", "x-tre-retried": "1"}, body)
+    try:
+        res = _default_stream_call(url, {"Content-Type": "application/json"}, b"{}", 5.0)
+    finally:
+        server.shutdown()
+    assert (res.finish_reason, res.tre_continued, res.tre_retried) == ("abort", None, 1)
+
+
+def test_sender_records_reissue_outcomes() -> None:
+    sender = StreamingHttpSender(
+        "http://gw",
+        stream_call=lambda *a: StreamResult(200, 1.0, 2.0, 32, 8, finish_reason="length", tre_continued=1,
+                                            tre_retried=None),
+        prompt_mode=MODE_TOKEN_IDS,
+    )
+    asyncio.run(sender(_req(), 0.0, 0.0))
+    sender.close()
+    record = sender.records[0]
+    assert (record["finish_reason"], record["tre_continued"], record["tre_retried"]) == ("length", 1, None)

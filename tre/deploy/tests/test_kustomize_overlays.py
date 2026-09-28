@@ -4,6 +4,8 @@ from pathlib import Path
 
 import yaml
 
+from tre_common.registry import load_registry
+
 
 DEPLOY_ROOT = Path(__file__).resolve().parents[1]
 
@@ -31,6 +33,8 @@ def test_tre_v2_overlay_declares_components_and_independent_redis() -> None:
         "gateway-plugins.yaml",
         "gateway-extproc.yaml",
         "gateway-stats.yaml",
+        "gateway-service.yaml",
+        "gateway-service-params.yaml",
     ]
 
     redis = _load_yaml(overlay / "redis.yaml")
@@ -57,7 +61,7 @@ def test_tre_v2_overlay_declares_components_and_independent_redis() -> None:
     assert any(
         item["kind"] == "Role"
         and item["metadata"]["name"] == "tre-v2-model-route-manager"
-        and item["metadata"]["namespace"] == "aibrix-system"
+        and item["metadata"]["namespace"] == "tre-v2"
         and any(
             rule["apiGroups"] == ["gateway.networking.k8s.io"]
             and rule["resources"] == ["httproutes"]
@@ -69,7 +73,7 @@ def test_tre_v2_overlay_declares_components_and_independent_redis() -> None:
     assert any(
         item["kind"] == "RoleBinding"
         and item["metadata"]["name"] == "tre-v2-model-route-manager"
-        and item["metadata"]["namespace"] == "aibrix-system"
+        and item["metadata"]["namespace"] == "tre-v2"
         and item["subjects"] == [
             {"kind": "ServiceAccount", "name": "tre-v2-service-manager", "namespace": "tre-v2"}
         ]
@@ -80,9 +84,16 @@ def test_tre_v2_overlay_declares_components_and_independent_redis() -> None:
     sm = _load_yaml(overlay / "service-manager.yaml")
     ui = _load_yaml(overlay / "ui.yaml")
 
-    assert _image(controller) == "tre-v2-controller:20260924-2caa0514"
-    assert _image(sm) == "tre-v2-service-manager:20260924-4e9ab85c"
+    assert _image(controller) == "tre-v2-controller:20260928-a6f1a59b"
+    assert _image(sm) == "tre-v2-service-manager:20260928-a6f1a59b"
     sm_container = sm["spec"]["template"]["spec"]["containers"][0]
+    # Review P1-2: single writer across rollouts, and a grace period derived from
+    # the registry sleep policy (a sleep past /sleep finishes; drains roll back).
+    assert sm["spec"]["strategy"] == {"type": "Recreate"}
+    sm_config = load_registry(str(DEPLOY_ROOT / "registry.yaml")).service_manager()
+    grace = sm["spec"]["template"]["spec"]["terminationGracePeriodSeconds"]
+    # Review 2 P2-2: the SIGTERM wait is computed from the same time budget.
+    assert grace > sm_config.shutdown_timeout_s()
     assert sm_container["readinessProbe"]["httpGet"] == {
         "path": "/healthz",
         "port": "http",
@@ -95,7 +106,7 @@ def test_tre_v2_overlay_declares_components_and_independent_redis() -> None:
         if d and d["kind"] == "Deployment"
     )
     # Rebuilt by deploy/scripts/build_gateway_plugins_nozmq.sh (TRE-PATCH P2-GW-004/005).
-    assert _image(gateway_plugins) == "aibrix/gateway-plugins:20260924-43aa0c31-nozmq2"
+    assert _image(gateway_plugins) == "aibrix/gateway-plugins:20260927-849bba24-nozmq2"
 
     assert _env(controller)["TRE_REDIS_URL"] == "redis://tre-v2-redis:6379/0"
     assert _env(controller)["TRE_SERVICE_MANAGER_URL"] == "http://tre-v2-service-manager:8000"
@@ -142,10 +153,13 @@ def test_tre_v2_overlay_declares_components_and_independent_redis() -> None:
     assert _env(sm)["TRE_ROUTE_NAMESPACE"] == "tre-v2"
     assert _env(sm)["TRE_GATEWAY_NAME"] == "tre-aibrix-eg"
     assert _env(controller)["TRE_METRICS_REDIS_URL"] == "redis://tre-v2-redis:6379/0"
-    assert _env(sm)["TRE_CREATE_MAX_USED_MIB"] == "2500"
+    # B9: the cold-start limit is derived from the registry; the env var is an
+    # explicit override only and must not be baked into the overlay.
+    assert "TRE_CREATE_MAX_USED_MIB" not in _env(sm)
     assert _env(sm)["TRE_SLEEP_LEAK_USED_MIB"] == "8192"
     assert _env(sm)["TRE_SM_SUPERVISOR_ENABLED"] == "true"
     assert _env(sm)["TRE_SM_SUPERVISOR_INTERVAL_S"] == "5"
+    assert _env(sm)["TRE_SM_LOG_LEVEL"] == "INFO"
     assert _node_selector(controller) == {"kubernetes.io/hostname": "nscc-ds-4a100-node10"}
     assert _node_selector(sm) == {"kubernetes.io/hostname": "nscc-ds-4a100-node10"}
     assert _node_selector(ui) == {"kubernetes.io/hostname": "nscc-ds-4a100-node10"}
@@ -159,6 +173,14 @@ def test_tre_v2_overlay_declares_components_and_independent_redis() -> None:
     assert {"name": "registry", "mountPath": "/etc/tre", "readOnly": True} in mounts
     volumes = controller["spec"]["template"]["spec"]["volumes"]
     assert any(v["name"] == "registry" and v["configMap"]["name"] == "tre-v2-registry" for v in volumes)
+
+    # Plan 2026-09-27 D7: the service-manager seeds desired state from the SAME live
+    # registry (and reads its service_manager: sleep policy) - not a baked copy.
+    assert _env(sm)["TRE_REGISTRY_PATH"] == "/etc/tre/registry.yaml"
+    sm_mounts = sm["spec"]["template"]["spec"]["containers"][0]["volumeMounts"]
+    assert {"name": "registry", "mountPath": "/etc/tre", "readOnly": True} in sm_mounts
+    sm_volumes = sm["spec"]["template"]["spec"]["volumes"]
+    assert any(v["name"] == "registry" and v["configMap"]["name"] == "tre-v2-registry" for v in sm_volumes)
 
     params = _load_yaml(overlay / "params.yaml")
     assert params["kind"] == "ConfigMap" and params["metadata"]["name"] == "tre-v2-registry"

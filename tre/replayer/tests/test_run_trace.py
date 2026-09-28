@@ -79,3 +79,43 @@ def test_run_trace_cli_defaults_to_tre_gateway_and_least_gpu_cache(tmp_path, mon
     assert calls[0]["gateway_url"] == "http://192.168.223.76:31094/v1/completions"
     assert calls[0]["routing_strategy"] == "least-gpu-cache"
     assert calls[1]["routing_strategy"] is None
+
+
+def test_run_trace_summarises_reissue_outcomes(tmp_path, monkeypatch) -> None:
+    import itertools
+
+    import tre_replayer.run_trace as rt
+    from tre_replayer.engine.http_sender import StreamResult
+
+    outcomes = itertools.cycle([
+        dict(finish_reason="length"),
+        dict(finish_reason="length", tre_continued=1),
+        dict(finish_reason="length", tre_retried=2),
+        dict(finish_reason="abort"),
+        dict(finish_reason="length", tre_continued=2),
+    ])
+
+    def fake(url, headers, body, timeout_s):
+        return StreamResult(status=200, first_token_ms=50.0, done_ms=80.0, prompt_tokens=16, completion_tokens=8,
+                            **next(outcomes))
+
+    monkeypatch.setattr(rt, "_dry_stream_call", fake)
+    summary = rt.run_trace(str(_one_model_trace(tmp_path)), gateway_url="http://x", seed=1, dry_run=True,
+                           window_ms=1000, step_ms=1000, trim_ramp_windows=0, sleep=_instant_sleep)
+    n = summary["requests"]
+    assert n >= 4
+    plan = [dict(finish_reason="length"), dict(finish_reason="length", tre_continued=1),
+            dict(finish_reason="length", tre_retried=2), dict(finish_reason="abort"),
+            dict(finish_reason="length", tre_continued=2)]
+    sent = [plan[i % 5] for i in range(n)]
+    reissue = summary["reissue"]
+    assert reissue["abort"] == sum(1 for o in sent if o["finish_reason"] == "abort")
+    assert reissue["retry"] == sum(1 for o in sent if o.get("tre_retried"))
+    assert reissue["continue"] == sum(1 for o in sent if o.get("tre_continued"))
+    assert reissue["continued_segments"] == sum(o.get("tre_continued", 0) for o in sent)
+    assert reissue["by_model"]["dsqwen-7b"] == {k: v for k, v in reissue.items() if k != "by_model"}
+    assert summary["reissue_contaminated"] is True
+    assert rt.reissue_summary([{"model": "m", "finish_reason": "stop"}]) == {
+        "abort": 0, "retry": 0, "continue": 0, "continued_segments": 0,
+        "by_model": {"m": {"abort": 0, "retry": 0, "continue": 0, "continued_segments": 0}},
+    }

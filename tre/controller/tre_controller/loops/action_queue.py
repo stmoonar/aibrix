@@ -1,21 +1,78 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 import time
 from collections import deque
-from dataclasses import dataclass
-from typing import Awaitable, Callable, Protocol
+from dataclasses import dataclass, field, replace
+from typing import Awaitable, Callable, Iterable, Mapping, Protocol
 
-from tre_controller.planning.planner import Action, DefragAction, HideAction, ScaleAction, SourceLoop, UnhideAction
+from tre_controller.planning.planner import (
+    Action,
+    DefragAction,
+    HideAction,
+    ReceiverTarget,
+    SafeScaleCommitAction,
+    ScaleAction,
+    SourceLoop,
+    TransferAction,
+    UnhideAction,
+    fuse_transfers,
+)
 
 if False:  # annotations are strings (from __future__); avoids an import cycle
     from tre_controller.profiling import TickProfiler
 
 CLUSTER_MODEL = "__cluster__"
+#: Resource key of a cluster-wide action (defrag): it conflicts with EVERY other
+#: action - a defrag migrates pods of any model across any GPU, so nothing that
+#: touches a pod, a GPU or a model runs next to it (review 3 P3).
+CLUSTER_RESOURCE = "cluster:*"
+
+#: Source loops whose actions are one-shot: the source never re-emits them (the
+#: SafeScale state machine deletes a probe when it resolves), so a transient SM
+#: failure must not drop them (review 2 P1-2 / P2-5). Actions of the other loops
+#: are re-planned every tick and may be dropped.
+ONE_SHOT_LOOPS = frozenset({"safescale"})
+
+LOG = logging.getLogger(__name__)
+
+QueueAction = Action | TransferAction | SafeScaleCommitAction
+
+#: Signal states in which a model needs capacity (rescue / fairness receivers),
+#: and those in which it clearly does not. Anything else (unknown, a receiver
+#: whose band is not yet confirmed) is neither: the planned commit proceeds.
+NEEDS_CAPACITY_STATES = frozenset({"critical", "low"})
+NO_NEED_STATES = frozenset({"healthy", "high", "idle"})
+
+#: (node, gpu ids) of a binding by serve_id, or None when unknown.
+SlotLookup = Callable[[str], "tuple[str, tuple[int, ...]] | None"]
+#: None = the action is still wanted; else the reason it no longer is.
+Revalidate = Callable[[QueueAction], "str | None"]
+
+
+@dataclass(frozen=True)
+class CommitVerdict:
+    """Revalidation of a SafeScale commit before a (re)try (review 3 P2-1..P2-3):
+    ``abandon_reason`` set = unhide the donor pods instead of sleeping them;
+    otherwise run ``action`` (upscales the receivers no longer need removed,
+    listed in ``dropped`` as (model, reason))."""
+
+    action: SafeScaleCommitAction
+    abandon_reason: str | None = None
+    dropped: tuple[tuple[str, str], ...] = ()
+
+
+CommitRevalidate = Callable[[SafeScaleCommitAction], CommitVerdict]
 
 
 class ServiceManagerClient(Protocol):
     async def scale_model(self, model: str, delta: int) -> dict: ...
+
+    async def scale_model_to(self, model: str, target: int) -> dict: ...
+
+    async def model_awake(self, model: str) -> dict: ...
 
     async def set_routable(self, model: str, hidden_pods: tuple[str, ...]) -> dict: ...
 
@@ -25,10 +82,36 @@ class ServiceManagerClient(Protocol):
 
 
 @dataclass(frozen=True)
+class RetryPolicy:
+    """Bounded exponential backoff for one-shot actions that failed retriably
+    (409 conflict / busy, 503 shutting down, timeouts, connection errors)."""
+
+    max_attempts: int = 6
+    base_backoff_s: float = 2.0
+    max_backoff_s: float = 30.0
+
+    def backoff_s(self, failures: int) -> float:
+        return min(self.max_backoff_s, self.base_backoff_s * (2 ** max(0, failures - 1)))
+
+
+@dataclass(frozen=True)
 class QueuedAction:
-    action: Action
+    action: QueueAction
     model: str
     source_loop: SourceLoop
+    #: Every model the action changes (inflight accounting); default (model,).
+    models: tuple[str, ...] = ()
+    #: Serialization keys: two queued actions sharing a key never run concurrently
+    #: and keep their submit order (models, pods, and GPUs when known).
+    resources: frozenset[str] = frozenset()
+    #: Failed retriable attempts so far (one-shot actions).
+    failures: int = 0
+
+    def __post_init__(self) -> None:
+        if not self.models:
+            object.__setattr__(self, "models", (self.model,))
+        if not self.resources:
+            object.__setattr__(self, "resources", frozenset(f"model:{m}" for m in self.models))
 
 
 @dataclass(frozen=True)
@@ -45,9 +128,41 @@ class DispatchResult:
     action_kind: str
     ok: bool
     error: str | None = None
+    retriable: bool = False
+    attempts: int = 1
+    #: Pods the SM reported ``unconfirmed`` (/sleep sent, never confirmed asleep)
+    #: or whose rollback failed (review 4 P2-2): they must stay hidden.
+    unconfirmed: tuple[str, ...] = ()
+
+
+@dataclass
+class _Backoff:
+    """A one-shot action of a running dispatch task waiting out its retry backoff.
+    A rescue action may preempt it (review 3 P2-3): ``queued`` is replaced, the
+    ``results`` of what the preemption removed are handed to the task, and
+    ``event`` wakes the task at once."""
+
+    queued: QueuedAction
+    event: asyncio.Event = field(default_factory=asyncio.Event)
+    results: list[DispatchResult] = field(default_factory=list)
 
 
 class ActionQueue:
+    """Dispatches controller actions to the service-manager.
+
+    Actions run concurrently unless they share a resource (a model, a pod, a GPU;
+    a defrag conflicts with everything): those run one at a time in submit order
+    (review P1-3 / review 2 P1-1). A donor -> receiver transfer is one compound
+    action touching both models: the receiver is woken only after the donor
+    slept; a SafeScale commit is the same for its hidden donor pods and its
+    follow-up receivers (review 3 P2-2). One-shot actions (SafeScale commit /
+    rollback) that fail retriably are retried with bounded backoff and
+    re-validated before every retry; a retry only ever re-sends idempotent
+    requests (named bindings, absolute targets - review 3 P2-1). A rescue action
+    for a model whose one-shot commit waits out a backoff preempts that retry
+    (review 3 P2-3). Re-plannable actions are dropped on failure.
+    """
+
     def __init__(
         self,
         client: ServiceManagerClient,
@@ -55,8 +170,21 @@ class ActionQueue:
         is_observe: Callable[[], bool] | None = None,
         prof: "TickProfiler | None" = None,
         now_ms: Callable[[], int] | None = None,
+        retry: RetryPolicy | None = None,
+        revalidate: Revalidate | None = None,
+        revalidate_commit: CommitRevalidate | None = None,
+        slot_of: SlotLookup | None = None,
+        sleep: Callable[[float], Awaitable[None]] | None = None,
+        fresh_view: Callable[[], object] | None = None,
+        on_oneshot_done: Callable[[str, str, str], None] | None = None,
+        commit_max_age_ms: float | None = None,
     ) -> None:
         self._client = client
+        #: B8: a SafeScale commit whose decision (``decided_ms``) is older than this
+        #: at its FIRST dispatch becomes the donor unhide (None / <= 0 = off).
+        self._commit_max_age_ms = (
+            float(commit_max_age_ms) if commit_max_age_ms is not None and commit_max_age_ms > 0 else None
+        )
         self._pending: deque[QueuedAction] = deque()
         self._inflight: set[str] = set()
         # When this returns True the controller is paused: queued actions are drained
@@ -66,9 +194,42 @@ class ActionQueue:
         # Review F4: model -> (epoch ms the last successful dispatch completed, "up"/"down").
         self._now_ms = now_ms or (lambda: int(time.time() * 1000))
         self._last_done: dict[str, tuple[int, str]] = {}
+        self._retry = retry or RetryPolicy()
+        self._revalidate = revalidate
+        self._revalidate_commit = revalidate_commit
+        self._slot_of = slot_of
+        self._sleep = sleep or asyncio.sleep
+        #: The cluster view only while fresh (review 4 P2-1), else None.
+        self._fresh_view = fresh_view
+        #: (request_id, "commit" | "rollback", reason) once a SafeScale one-shot
+        #: action is finished for good (review 4 P2-4): the probe is resolved then.
+        self._on_oneshot_done = on_oneshot_done
+        #: running dispatch task -> its queued action (updated as a commit progresses)
+        self._running: dict[asyncio.Future, QueuedAction] = {}
+        #: running dispatch task -> its one-shot action waiting out a retry backoff
+        self._backoff: dict[asyncio.Future, _Backoff] = {}
+        self._closed = False
+        self._stats: dict[str, int] = {
+            "oneshot_retries_total": 0,
+            "oneshot_abandoned_total": 0,
+            "oneshot_not_wanted_total": 0,
+            "transfer_receiver_dropped_total": 0,
+            "commit_abandoned_total": 0,
+            "commit_upscale_dropped_total": 0,
+            "commit_receiver_dropped_total": 0,
+            "oneshot_preempted_total": 0,
+            "dispatch_exceptions_total": 0,
+            "commit_abandoned_after_gate_total": 0,
+            "commit_upscale_preempted_total": 0,
+            "commit_failed_unhide_total": 0,
+            "unconfirmed_kept_hidden_total": 0,
+            "commit_evidence_stale_total": 0,
+            "oneshot_cancelled_total": 0,
+        }
 
+    # ------------------------------------------------------------------ submit
     def submit(self, actions: tuple[Action, ...] | list[Action]) -> SubmitResult:
-        queued_actions = tuple(_queued_action(action) for action in actions)
+        queued_actions = tuple(self._queued(action) for action in fuse_transfers(actions))
         if len(queued_actions) > 1 and all(
             queued.source_loop == "safescale" for queued in queued_actions
         ):
@@ -91,15 +252,23 @@ class ActionQueue:
 
         for queued in queued_actions:
             if queued.source_loop == "rescue":
-                removed = self._remove_pending_fairness_for_model(queued.model)
-                replaced.extend(removed)
-            elif queued.model in self._inflight or self._has_pending_model(queued.model):
+                for model in queued.models:
+                    replaced.extend(self._remove_pending_fairness_for_model(model))
+                preempted = self._preempt_for_rescue(queued)
+                if preempted is None:
+                    dropped.append((queued.model, "covered_by_preempted_commit"))
+                    continue
+                queued = preempted
+            elif any(
+                model in self._inflight or self._has_pending_model(model)
+                for model in queued.models
+            ):
                 dropped.append((queued.model, "inflight"))
                 continue
 
             self._pending.append(queued)
-            self._inflight.add(queued.model)
-            accepted += 1
+            self._inflight.update(queued.models)
+            accepted += 2 if isinstance(queued.action, TransferAction) else 1
             if observe and queued.source_loop == "safescale":
                 held += 1
 
@@ -116,72 +285,754 @@ class ActionQueue:
     def inflight_models(self) -> set[str]:
         return set(self._inflight)
 
+    def preemptible_models(self) -> set[str]:
+        """Models whose ONLY in-flight work is a SafeScale commit waiting out a
+        retry backoff (review 3 P2-3): a rescue scale-up of such a model is still
+        planned, and its submit preempts that retry."""
+        candidates: set[str] = set()
+        for slot in self._backoff.values():
+            if isinstance(slot.queued.action, SafeScaleCommitAction):
+                candidates.update(slot.queued.action.touched_models)
+        if not candidates:
+            return set()
+        busy = {
+            model
+            for task, queued in self._running.items()
+            if task not in self._backoff
+            for model in queued.models
+        }
+        busy.update(model for item in self._pending for model in item.models)
+        return candidates - busy
+
     def last_actions(self) -> dict[str, tuple[int, str]]:
         return dict(self._last_done)
 
+    def has_request(self, request_id: str) -> bool:
+        """A one-shot action of SafeScale probe ``request_id`` is queued, running
+        or backing off (review 4 P2-4: a ``committing`` probe without one is
+        recovered by the SafeScale loop)."""
+        items = list(self._pending) + list(self._running.values()) + [
+            slot.queued for slot in self._backoff.values()
+        ]
+        return any(_request_id(item.action) == request_id for item in items)
+
+    def cancel_request(self, request_id: str) -> bool:
+        """Drop the QUEUED (not yet started, e.g. held in observe mode) one-shot
+        actions of SafeScale probe ``request_id`` without dispatching them - B8:
+        the probe was resolved without an SM call (its pods are gone). Returns
+        False when one of its actions is already running (or backing off): that
+        one finishes on its own and the caller retries later."""
+        running = list(self._running.values()) + [slot.queued for slot in self._backoff.values()]
+        if any(_request_id(item.action) == request_id for item in running):
+            return False
+        kept: deque[QueuedAction] = deque()
+        for item in self._pending:
+            if item.source_loop in ONE_SHOT_LOOPS and _request_id(item.action) == request_id:
+                self._stats["oneshot_cancelled_total"] += 1
+                LOG.warning(
+                    "one-shot %s of %s (%s) cancelled before dispatch: its probe was resolved",
+                    _action_kind(item.action), item.model, request_id,
+                )
+                continue
+            kept.append(item)
+        self._pending = kept
+        self._release_idle_models()
+        return True
+
+    def cluster_action_active(self) -> bool:
+        """A defrag (cluster-wide action) is queued or running: every other
+        action - rescue included - waits behind it (review 4 P3)."""
+        items = list(self._pending) + list(self._running.values())
+        return any(CLUSTER_RESOURCE in item.resources for item in items)
+
+    def stats(self) -> dict[str, int]:
+        """Counters: one-shot retries / abandons / preemptions, SafeScale commits
+        abandoned or trimmed by revalidation, receiver wakes dropped after a failed
+        donor sleep, dispatch exceptions; gauges ``defrag_active`` and
+        ``pending_behind_defrag`` (actions waiting for a defrag, review 4 P3)."""
+        stats = dict(self._stats)
+        defrag = self.cluster_action_active()
+        stats["defrag_active"] = int(defrag)
+        stats["pending_behind_defrag"] = (
+            sum(1 for item in self._pending if CLUSTER_RESOURCE not in item.resources) if defrag else 0
+        )
+        return stats
+
+    # ------------------------------------------------------------------ running
     async def run(
         self,
         *,
         poll_interval_s: float = 0.1,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
-        while True:
-            await self.drain_once()
-            await sleep(poll_interval_s)
+        """Start dispatch tasks without waiting for them: a slow SM call (a
+        scale-down that drains for minutes) never delays an action on unrelated
+        resources. Cancelling ``run`` cancels every dispatch in progress."""
+        try:
+            while True:
+                self._dispatch_pending([])
+                await sleep(poll_interval_s)
+        except asyncio.CancelledError:
+            await self.shutdown()
+            raise
+
+    async def shutdown(self) -> None:
+        """Stop dispatching: cancel running dispatches and wait for them to end
+        (controller shutdown, review 2 P3)."""
+        self._closed = True
+        tasks = [task for task in self._running if not task.done()]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._running.clear()
+        self._backoff.clear()
 
     async def drain_once(self) -> tuple[DispatchResult, ...]:
-        observe = self._is_observe()
+        """Dispatch everything pending and wait until it is done - concurrently
+        where resources allow, in order where they overlap (tests / offline
+        integration)."""
         results: list[DispatchResult] = []
-        # Safescale resolution commands are one-shot (they are never re-emitted by the
-        # SafeScaleStateMachine, which deletes the probe on resolve). If we are paused in
-        # observe mode we must NOT drop them like idempotent planner actions -- hold them
-        # in _pending (keeping the model inflight so no conflicting action is queued) so
-        # they dispatch for real once mode returns to non-observe.
-        held: deque[QueuedAction] = deque()
-        _prof_on = self._prof is not None
-        _dispatched = 0
-        _http_ns = 0
-        while self._pending:
-            queued = self._pending.popleft()
-            if observe and queued.source_loop == "safescale":
-                held.append(queued)
+        self._dispatch_pending(results)
+        while self._running:
+            tasks = list(self._running)
+            await asyncio.gather(*tasks, return_exceptions=True)
+        return tuple(results)
+
+    def _dispatch_pending(self, results: list[DispatchResult]) -> None:
+        if self._closed:
+            return
+        busy: set[str] = set()
+        for queued in self._running.values():
+            busy |= queued.resources
+        if self._is_observe():
+            # Safescale resolution commands are one-shot (they are never re-emitted by
+            # the SafeScaleStateMachine, which deletes the probe on resolve). If we are
+            # paused in observe mode we must NOT drop them like idempotent planner
+            # actions -- hold them in _pending (keeping the model inflight so no
+            # conflicting action is queued) so they dispatch for real once mode
+            # returns to non-observe.
+            retained: deque[QueuedAction] = deque()
+            for queued in self._pending:
+                if queued.source_loop in ONE_SHOT_LOOPS or _conflicts(queued.resources, busy):
+                    retained.append(queued)
+                    continue
+                results.extend(_observe_skipped(queued))
+            self._pending = retained
+            self._release_idle_models()
+            return
+        retained = deque()
+        for queued in self._pending:
+            if _conflicts(queued.resources, busy):
+                # Blocked behind a running or an earlier queued action on a shared
+                # resource: keep the order.
+                busy |= queued.resources
+                retained.append(queued)
                 continue
-            if observe:
-                results.append(DispatchResult(model=queued.model, action_kind=_action_kind(queued.action),
-                                              ok=True, error="observe_skipped"))
+            busy |= queued.resources
+            task = asyncio.ensure_future(self._run_item(queued, results))
+            self._running[task] = queued
+        self._pending = retained
+
+    async def _run_item(self, queued: QueuedAction, results: list[DispatchResult]) -> None:
+        task = asyncio.current_task()
+        request_id = _request_id(queued.action) if queued.source_loop in ONE_SHOT_LOOPS else None
+        done: tuple[str, str] | None = None
+        try:
+            done = await self._execute(queued, results)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - surfaced as failed results (review 3 P3)
+            self._stats["dispatch_exceptions_total"] += 1
+            current = self._running.get(task, queued)
+            LOG.exception("action dispatch for %s failed", current.model)
+            error = f"dispatch_exception: {type(exc).__name__}: {exc}"
+            results.extend(
+                DispatchResult(model=model, action_kind=_action_kind(current.action), ok=False, error=error)
+                for model in current.models
+            )
+        finally:
+            self._running.pop(task, None)
+            self._backoff.pop(task, None)
+            self._release_idle_models()
+            if request_id is not None and done is not None:
+                self._notify_done(request_id, *done)
+            if not self._closed:
+                # Start whatever this action was blocking right away.
+                self._dispatch_pending(results)
+
+    def _notify_done(self, request_id: str, status: str, reason: str) -> None:
+        if self._on_oneshot_done is None:
+            return
+        try:
+            self._on_oneshot_done(request_id, status, reason)
+        except Exception:  # noqa: BLE001 - the probe is recovered on the next tick
+            LOG.exception("resolving SafeScale probe %s failed", request_id)
+
+    async def _execute(
+        self, queued: QueuedAction, results: list[DispatchResult]
+    ) -> tuple[str, str] | None:
+        """Run one queued action to its end. Returns how a one-shot action
+        finished - ("commit" | "rollback", reason) - or None when it is not
+        finished (held in observe mode, controller shutting down)."""
+        if self._is_observe():
+            if queued.source_loop in ONE_SHOT_LOOPS:
+                self._pending.appendleft(queued)  # held until non-observe
             else:
-                if _prof_on:
-                    _d0 = time.perf_counter_ns()
-                    results.append(await self._dispatch(queued.action, queued.model))
-                    _http_ns += time.perf_counter_ns() - _d0
-                    _dispatched += 1
+                results.extend(_observe_skipped(queued))
+            return None
+        if isinstance(queued.action, TransferAction):
+            results.extend(await self._execute_transfer(queued.action))
+            return ("done", "transfer")
+        if isinstance(queued.action, SafeScaleCommitAction):
+            converted, finished = self._stale_commit(queued, results)
+            if finished is not None:
+                return finished
+            if converted is not None:
+                queued = converted
+                self._set_running(queued)
+        while True:
+            if isinstance(queued.action, SafeScaleCommitAction):
+                revalidated, finished = self._revalidated_commit(queued, results)
+                if revalidated is None:
+                    return finished
+                queued = revalidated
+                self._set_running(queued)
+            failure, queued = await self._attempt(queued, results)
+            if failure is None:
+                return _resolution(queued.action)
+            attempts = queued.failures + 1
+            terminal = (
+                queued.source_loop not in ONE_SHOT_LOOPS
+                or not failure.retriable
+                or not _retry_safe(queued.action)
+            )
+            if terminal or attempts >= self._retry.max_attempts:
+                prefix = ""
+                if not terminal:
+                    prefix = f"abandoned after {attempts} attempts: "
+                    self._stats["oneshot_abandoned_total"] += 1
+                    LOG.error(
+                        "one-shot action abandoned after %d attempts: %s",
+                        attempts,
+                        json.dumps(
+                            {"model": queued.model, "action": _action_kind(queued.action),
+                             "reason": getattr(queued.action, "reason", None), "error": failure.error},
+                            sort_keys=True,
+                        ),
+                    )
+                results.extend(self._final_failures(queued, failure, attempts=attempts, prefix=prefix))
+                # A commit whose donor sleep failed for good leaves the donor's
+                # probe pods hidden but awake: give them their routing back
+                # (review 4 P2-4), never on an unconfirmed pod (P2-2).
+                unhide = self._unhide_after_failed_commit(queued, failure)
+                if unhide is not None:
+                    queued = unhide
+                    self._set_running(queued)
+                    continue
+                return _resolution(queued.action, failure)
+            backoff = self._retry.backoff_s(attempts)
+            self._stats["oneshot_retries_total"] += 1
+            LOG.warning(
+                "one-shot %s of %s failed retriably (%s); retry %d/%d in %.1fs",
+                _action_kind(queued.action), queued.model, failure.error,
+                attempts + 1, self._retry.max_attempts, backoff,
+            )
+            queued = replace(queued, failures=attempts)
+            self._set_running(queued)
+            queued = await self._wait_backoff(queued, backoff, results)
+            if self._closed:
+                return None
+            if self._is_observe():
+                self._pending.appendleft(queued)  # paused while backing off: hold it
+                return None
+            if isinstance(queued.action, SafeScaleCommitAction):
+                continue  # revalidated at the top of the loop
+            reason = self._still_wanted(queued.action)
+            if reason is not None:
+                self._stats["oneshot_not_wanted_total"] += 1
+                LOG.warning(
+                    "one-shot %s of %s not retried: no longer wanted (%s)",
+                    _action_kind(queued.action), queued.model, reason,
+                )
+                results.append(
+                    DispatchResult(
+                        model=queued.model,
+                        action_kind=_action_kind(queued.action),
+                        ok=False,
+                        error=f"not_retried: {reason}",
+                        attempts=queued.failures,
+                    )
+                )
+                return _resolution(queued.action, reason=f"not_retried: {reason}")
+
+    def _unhide_after_failed_commit(
+        self, queued: QueuedAction, failure: DispatchResult
+    ) -> QueuedAction | None:
+        action = queued.action
+        if not isinstance(action, SafeScaleCommitAction) or action.donor_done or not action.pods:
+            return None
+        unhide = self._donor_unhide(action, "safescale_commit_failed", filter_by_view=True)
+        if unhide is None:
+            return None
+        self._stats["commit_failed_unhide_total"] += 1
+        LOG.warning(
+            "SafeScale commit of %s (%s) failed for good (%s): unhiding %s, keeping %s hidden",
+            action.donor, action.request_id, failure.error, list(unhide.pods), list(unhide.keep_hidden),
+        )
+        return self._queued(unhide)
+
+    def _stale_commit(
+        self, queued: QueuedAction, results: list[DispatchResult]
+    ) -> tuple[QueuedAction | None, tuple[str, str] | None]:
+        """B8: a commit about to be dispatched for the FIRST time (no attempt yet)
+        whose decision is older than ``commit_max_age_ms`` - it was held in
+        observe mode, or re-submitted after a restart - is not run on that stale
+        evidence. The donor's hidden pods get their routing back instead (only
+        those a fresh cluster view shows awake and hidden; never an unconfirmed
+        one) and the probe resolves as a rollback ``commit_evidence_stale``.
+        Retries of a commit that already made an attempt are not aged (their
+        evidence was acted on; the revalidation before every retry still runs).
+        Returns (the action to run instead, None), (None, how the commit
+        finished) or (None, None) = run the commit as planned."""
+        action: SafeScaleCommitAction = queued.action
+        if self._commit_max_age_ms is None or queued.failures > 0 or action.decided_ms is None:
+            return None, None
+        age_ms = float(self._now_ms()) - float(action.decided_ms)
+        if age_ms <= self._commit_max_age_ms:
+            return None, None
+        reason = "commit_evidence_stale"
+        self._stats["commit_evidence_stale_total"] += 1
+        LOG.warning(
+            json.dumps(
+                {"event": "safescale_commit_evidence_stale", "donor": action.donor,
+                 "request_id": action.request_id, "pods": list(action.pods),
+                 "age_s": round(age_ms / 1000.0, 1), "max_age_s": round(self._commit_max_age_ms / 1000.0, 1)},
+                sort_keys=True,
+            )
+        )
+        detail = f"{reason}: decided {age_ms / 1000.0:.0f}s ago > {self._commit_max_age_ms / 1000.0:.0f}s"
+        results.extend(self._receivers_dropped(action, detail))
+        if action.donor_done or not action.pods:
+            return None, ("rollback", f"{detail}; follow-up upscales dropped")
+        unhide = self._donor_unhide(action, reason, filter_by_view=True, only_view_hidden=True)
+        if unhide is None:
+            return None, ("rollback", f"{detail}; no donor pod to unhide")
+        return self._queued(unhide), None
+
+    def _donor_unhide(
+        self,
+        commit: SafeScaleCommitAction,
+        reason: str,
+        *,
+        filter_by_view: bool = False,
+        only_view_hidden: bool = False,
+    ) -> UnhideAction | None:
+        """The unhide giving a commit's donor pods their routing back, keeping
+        every pod whose sleep is unconfirmed hidden (review 4 P2-2). With
+        ``filter_by_view`` and a fresh cluster view, pods it shows asleep are
+        left out (they need nothing); with ``only_view_hidden`` too, so are pods
+        it does not list or shows already routable (B8: only pods the view shows
+        awake AND hidden). None = nothing to unhide."""
+        unconfirmed = set(commit.unconfirmed_pods)
+        keep = tuple(pod for pod in commit.pods if pod in unconfirmed)
+        candidates = [pod for pod in commit.pods if pod not in unconfirmed]
+        if filter_by_view:
+            view = self._view()
+            if view is not None:
+                bindings = {binding.serve_id: binding for binding in getattr(view, "bindings", ())}
+                if only_view_hidden:
+                    candidates = [
+                        pod for pod in candidates
+                        if pod in bindings and bindings[pod].awake and bindings[pod].hidden
+                    ]
                 else:
-                    results.append(await self._dispatch(queued.action, queued.model))
-                self._record_done(queued, results[-1])
-            self._inflight.discard(queued.model)
-        self._pending = held
-        if _prof_on and _dispatched:
+                    candidates = [
+                        pod for pod in candidates if pod not in bindings or bindings[pod].awake
+                    ]
+        if keep:
+            self._stats["unconfirmed_kept_hidden_total"] += len(keep)
+            LOG.warning(
+                "SafeScale donor pods %s of %s stay hidden: their sleep is unconfirmed "
+                "(the service-manager's crash recovery resolves them)",
+                list(keep), commit.donor,
+            )
+        if not candidates:
+            return None
+        return UnhideAction(
+            commit.donor, tuple(candidates), reason, commit.source_loop,
+            keep_hidden=keep, request_id=commit.request_id,
+        )
+
+    def _view(self):
+        if self._fresh_view is None:
+            return None
+        try:
+            return self._fresh_view()
+        except Exception:  # noqa: BLE001 - no view = conservative behaviour
+            return None
+
+    async def _attempt(
+        self, queued: QueuedAction, results: list[DispatchResult]
+    ) -> tuple[DispatchResult | None, QueuedAction]:
+        """One try. Returns (the failure to retry or report, None = done; the
+        queued action with the progress made)."""
+        action = queued.action
+        attempts = queued.failures + 1
+        if isinstance(action, SafeScaleCommitAction):
+            return await self._attempt_commit(queued, results)
+        result = await self._timed_dispatch(action, queued.model)
+        if not result.ok:
+            return result, queued
+        self._record_done(queued.model, action, result)
+        results.append(replace(result, attempts=attempts))
+        return None, queued
+
+    async def _attempt_commit(
+        self, queued: QueuedAction, results: list[DispatchResult]
+    ) -> tuple[DispatchResult | None, QueuedAction]:
+        """Sleep the donor's hidden pods, then (only then) bring every receiver
+        up to its absolute target. Progress is kept on the action: a retry never
+        re-sleeps a donor that slept and re-sends only the pending upscales."""
+        action: SafeScaleCommitAction = queued.action
+        attempts = queued.failures + 1
+        if not action.donor_done:
+            donor = action.donor_sleep()
+            result = await self._timed_dispatch(donor, action.donor)
+            if not result.ok:
+                if result.unconfirmed:
+                    action = replace(
+                        action,
+                        unconfirmed_pods=tuple(dict.fromkeys(action.unconfirmed_pods + result.unconfirmed)),
+                    )
+                    queued = self._commit_queued(action, failures=queued.failures)
+                    self._set_running(queued)
+                return result, queued
+            self._record_done(action.donor, donor, result)
+            results.append(replace(result, attempts=attempts))
+            action = replace(action, donor_done=True)
+            queued = self._commit_queued(action, failures=queued.failures)
+            self._set_running(queued)
+        remaining: list[ReceiverTarget] = []
+        failure: DispatchResult | None = None
+        for upscale in action.upscales:
+            if upscale.target is None:
+                upscale, resolve_failure = await self._resolve_target(upscale)
+                if resolve_failure is not None:
+                    if resolve_failure.retriable:
+                        remaining.append(upscale)
+                        failure = failure or resolve_failure
+                    else:
+                        results.append(replace(resolve_failure, attempts=attempts))
+                    continue
+            result = await self._timed_dispatch(upscale, upscale.model)
+            if result.ok:
+                self._record_done(upscale.model, upscale, result)
+                results.append(replace(result, attempts=attempts))
+            elif result.retriable:
+                remaining.append(upscale)
+                failure = failure or result
+            else:
+                results.append(replace(result, attempts=attempts))
+        action = replace(action, upscales=tuple(remaining))
+        queued = self._commit_queued(action, failures=queued.failures)
+        self._set_running(queued)
+        return failure, queued
+
+    async def _resolve_target(
+        self, upscale: ReceiverTarget
+    ) -> tuple[ReceiverTarget, DispatchResult | None]:
+        """No absolute target at planning time: resolve it ONCE from the SM's
+        awake count; the retry then re-sends that same target."""
+        try:
+            response = await self._client.model_awake(upscale.model)
+        except Exception as exc:  # noqa: BLE001
+            return upscale, DispatchResult(
+                model=upscale.model, action_kind="scale", ok=False,
+                error=f"dispatch_exception: {type(exc).__name__}: {exc}",
+            )
+        if not bool(response.get("ok", False)):
+            return upscale, _dispatch_result(model=upscale.model, action_kind="scale", response=response)
+        awake = int(response["awake"])
+        target = awake + max(0, int(upscale.delta))
+        if upscale.cap is not None:
+            target = min(target, max(int(upscale.cap), awake))
+        return replace(upscale, target=target), None
+
+    def _revalidated_commit(
+        self, queued: QueuedAction, results: list[DispatchResult]
+    ) -> tuple[QueuedAction | None, tuple[str, str] | None]:
+        """Before every (re)try of a commit: the donor needing capacity again
+        abandons the commit (its hidden pods are unhidden instead, never an
+        unconfirmed one); receivers that no longer need capacity lose their
+        upscale. Returns (the action to run, None) or (None, how the commit
+        finished)."""
+        action: SafeScaleCommitAction = queued.action
+        verdict = CommitVerdict(action)
+        if self._revalidate_commit is not None:
+            try:
+                verdict = self._revalidate_commit(action)
+            except Exception as exc:  # noqa: BLE001 - keep the commit on a lookup error
+                LOG.warning("revalidating the SafeScale commit of %s failed (kept): %r", action.donor, exc)
+        if verdict.abandon_reason is not None:
+            self._stats["commit_abandoned_total"] += 1
+            if queued.failures == 0:
+                # Abandoned on its first dispatch, i.e. right after the probe
+                # passed its commit gate: the gate (probe-window tail of the
+                # donor's serving pods) and this revalidation (the planner's
+                # latest whole-model state) disagreed (review 4 P3).
+                self._stats["commit_abandoned_after_gate_total"] += 1
+                LOG.warning(
+                    json.dumps(
+                        {"event": "safescale_commit_abandoned_after_gate", "donor": action.donor,
+                         "request_id": action.request_id, "reason": verdict.abandon_reason},
+                        sort_keys=True,
+                    )
+                )
+            LOG.warning(
+                "SafeScale commit of %s (%s) abandoned, unhiding %s: %s",
+                action.donor, action.request_id, list(action.pods), verdict.abandon_reason,
+            )
+            results.extend(self._receivers_dropped(action, f"commit_abandoned: {verdict.abandon_reason}"))
+            unhide = self._donor_unhide(action, "safescale_commit_abandoned")
+            if unhide is None:
+                return None, ("rollback", f"commit_abandoned: {verdict.abandon_reason}; donor pods left hidden")
+            return self._queued(unhide), None
+        for model, reason in verdict.dropped:
+            self._stats["commit_upscale_dropped_total"] += 1
+            LOG.warning("SafeScale follow-up upscale of %s dropped: %s", model, reason)
+            results.append(
+                DispatchResult(model=model, action_kind="scale", ok=False, error=f"not_wanted: {reason}",
+                               attempts=queued.failures)
+            )
+        action = verdict.action
+        if action.donor_done and not action.upscales:
+            return None, ("commit", action.reason)
+        return self._commit_queued(action, failures=queued.failures), None
+
+    async def _wait_backoff(
+        self, queued: QueuedAction, backoff_s: float, results: list[DispatchResult]
+    ) -> QueuedAction:
+        """Wait out a retry backoff; a rescue preemption ends it early and may
+        replace the action. Returns the action to continue with."""
+        task = asyncio.current_task()
+        slot = _Backoff(queued)
+        self._backoff[task] = slot
+        sleeper = asyncio.ensure_future(self._sleep(backoff_s))
+        waker = asyncio.ensure_future(slot.event.wait())
+        try:
+            await asyncio.wait({sleeper, waker}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for pending in (sleeper, waker):
+                if not pending.done():
+                    pending.cancel()
+            await asyncio.gather(sleeper, waker, return_exceptions=True)
+            self._backoff.pop(task, None)
+        results.extend(slot.results)
+        return slot.queued
+
+    # -------------------------------------------------------------- preemption
+    def _preempt_for_rescue(self, queued: QueuedAction) -> QueuedAction | None:
+        """A rescue action scaling up a model whose SafeScale commit waits out a
+        retry backoff preempts that commit (review 3 P2-3). The donor itself
+        needing capacity: the commit becomes an unhide of its hidden pods; the
+        rescue scale-up shrinks by the pods that restores - those a fresh cluster
+        view shows awake and hidden (review 4 P2-3; v1 ``up_needed = delta -
+        probe_hidden``); a receiver: its pending upscale is cancelled (the rescue
+        action replaces it). None = the rescue action is fully covered by the
+        restored pods."""
+        if not self._backoff:
+            return queued
+        action = queued.action
+        if isinstance(action, TransferAction):
+            ups = {action.receiver.model: action.receiver.delta}
+        elif isinstance(action, ScaleAction) and action.delta > 0:
+            ups = {action.model: action.delta}
+        else:
+            return queued
+        restored = 0
+        for model in ups:
+            for task, slot in list(self._backoff.items()):
+                commit = slot.queued.action
+                if isinstance(commit, SafeScaleCommitAction) and model in commit.touched_models:
+                    restored += self._preempt_commit(task, slot, model)
+        if restored <= 0:
+            return queued
+        if isinstance(action, TransferAction):
+            return None if restored >= action.receiver.delta else queued
+        up_needed = action.delta - restored
+        if up_needed <= 0:
+            return None
+        return self._queued(
+            replace(action, delta=up_needed, pods=tuple(action.pods[:up_needed]) if action.pods else ())
+        )
+
+    def _preempt_commit(self, task: asyncio.Future, slot: _Backoff, model: str) -> int:
+        """Returns how many awake pods the preemption gives back to ``model``."""
+        commit: SafeScaleCommitAction = slot.queued.action
+        if model == commit.donor and not commit.donor_done:
+            unhide = self._donor_unhide(commit, "safescale_commit_preempted")
+            if unhide is None:
+                return 0  # every donor pod unconfirmed: nothing to give back
+            self._stats["oneshot_preempted_total"] += 1
+            LOG.warning(
+                "SafeScale commit of %s (%s) preempted by a rescue scale-up of %s: unhiding %s",
+                commit.donor, commit.request_id, model, list(unhide.pods),
+            )
+            restored = self._restored_capacity(unhide.pods)
+            slot.results.extend(self._receivers_dropped(commit, "commit_preempted_by_rescue"))
+            slot.queued = self._queued(unhide)
+            self._running[task] = slot.queued
+            slot.event.set()
+            self._release_idle_models()
+            return restored
+        if not any(item.model == model for item in commit.upscales):
+            return 0  # e.g. the donor of a commit that already slept: nothing to preempt
+        # A receiver: its pending upscale is cancelled (the rescue action replaces
+        # it). The commit's backoff continues for its other receivers - it is not
+        # cut short and not counted as a preemption (review 4 P3).
+        self._stats["commit_upscale_preempted_total"] += 1
+        LOG.warning("SafeScale follow-up upscale of %s preempted by a rescue action", model)
+        slot.results.append(
+            DispatchResult(model=model, action_kind="scale", ok=False, error="preempted_by_rescue")
+        )
+        trimmed = replace(
+            commit, upscales=tuple(item for item in commit.upscales if item.model != model)
+        )
+        slot.queued = self._commit_queued(trimmed, failures=slot.queued.failures)
+        self._running[task] = slot.queued
+        if trimmed.donor_done and not trimmed.upscales:
+            slot.event.set()  # nothing left to wait for
+        self._release_idle_models()
+        return 0
+
+    def _restored_capacity(self, pods: tuple[str, ...]) -> int:
+        """How many of ``pods`` the unhide gives back as serving capacity (review
+        4 P2-3): those a FRESH cluster view shows awake and hidden. Without one
+        nothing is assumed restored (the rescue scale-up is not shrunk)."""
+        view = self._view()
+        if view is None:
+            return 0
+        bindings = {binding.serve_id: binding for binding in getattr(view, "bindings", ())}
+        return sum(
+            1 for pod in pods if pod in bindings and bindings[pod].awake and bindings[pod].hidden
+        )
+
+    # ------------------------------------------------------------------ helpers
+    def _final_failures(
+        self, queued: QueuedAction, failure: DispatchResult, *, attempts: int, prefix: str = ""
+    ) -> list[DispatchResult]:
+        """The results of an action that is given up: its failure, plus one per
+        commit receiver that will not be woken."""
+        action = queued.action
+        error = f"{prefix}{failure.error}"
+        if isinstance(action, SafeScaleCommitAction):
+            if not action.donor_done:
+                out = [replace(failure, error=error, attempts=attempts)]
+                out.extend(self._receivers_dropped(action, f"donor_sleep_failed: {failure.error}"))
+                return out
+            return [
+                DispatchResult(model=item.model, action_kind="scale", ok=False, error=error,
+                               retriable=failure.retriable, attempts=attempts)
+                for item in action.upscales
+            ]
+        return [replace(failure, error=error, attempts=attempts)]
+
+    def _receivers_dropped(self, action: SafeScaleCommitAction, reason: str) -> list[DispatchResult]:
+        if action.upscales:
+            self._stats["commit_receiver_dropped_total"] += len(action.upscales)
+        return [
+            DispatchResult(model=item.model, action_kind="scale", ok=False, error=reason)
+            for item in action.upscales
+        ]
+
+    def _set_running(self, queued: QueuedAction) -> None:
+        task = asyncio.current_task()
+        if task in self._running:
+            self._running[task] = queued
+            self._release_idle_models()
+
+    async def _execute_transfer(self, action: TransferAction) -> list[DispatchResult]:
+        donor, receiver = action.donor, action.receiver
+        donor_result = await self._timed_dispatch(donor, donor.model)
+        self._record_done(donor.model, donor, donor_result)
+        if not donor_result.ok:
+            # The receiver's wake needs what the donor's sleep frees: never run it.
+            self._stats["transfer_receiver_dropped_total"] += 1
+            reason = f"donor_sleep_failed: {donor_result.error}"
+            LOG.warning(
+                "transfer %s -> %s: donor sleep failed, receiver wake dropped (%s)",
+                donor.model, receiver.model, donor_result.error,
+            )
+            return [
+                donor_result,
+                DispatchResult(model=receiver.model, action_kind="scale", ok=False, error=reason),
+            ]
+        receiver_result = await self._timed_dispatch(receiver, receiver.model)
+        self._record_done(receiver.model, receiver, receiver_result)
+        return [donor_result, receiver_result]
+
+    async def _timed_dispatch(self, action, model: str) -> DispatchResult:
+        """One SM call. An exception (a client bug, a malformed answer) becomes a
+        failed, non-retriable result instead of killing the dispatch task."""
+        started_ns = time.perf_counter_ns()
+        try:
+            result = await self._dispatch(action, model)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - review 3 P3
+            self._stats["dispatch_exceptions_total"] += 1
+            LOG.exception("SM call for %s (%s) raised", model, _action_kind(action))
+            result = DispatchResult(
+                model=model,
+                action_kind=_action_kind(action),
+                ok=False,
+                error=f"dispatch_exception: {type(exc).__name__}: {exc}",
+            )
+        if self._prof is not None:
             self._prof.record(
                 {
                     "kind": "dispatch",
                     "ts_ms": self._prof.now_ms(),
-                    "n_actions": _dispatched,
-                    "http_ns": _http_ns,
+                    "n_actions": 1,
+                    "http_ns": time.perf_counter_ns() - started_ns,
                 }
             )
-        return tuple(results)
+        return result
 
-    async def _dispatch(self, action: Action, model: str) -> DispatchResult:
+    def _still_wanted(self, action: QueueAction) -> str | None:
+        if self._revalidate is None:
+            return None
+        try:
+            return self._revalidate(action)
+        except Exception as exc:  # noqa: BLE001 - keep the action on a lookup error
+            LOG.warning("revalidating %s failed (kept): %r", _action_kind(action), exc)
+            return None
+
+    def _release_idle_models(self) -> None:
+        busy = {model for queued in self._running.values() for model in queued.models}
+        for model in list(self._inflight):
+            if model not in busy and not self._has_pending_model(model):
+                self._inflight.discard(model)
+
+    async def _dispatch(self, action, model: str) -> DispatchResult:
+        if isinstance(action, ReceiverTarget):
+            # Absolute, grow-only target: re-sending it is a no-op (review 3 P2-1).
+            response = await self._client.scale_model_to(action.model, int(action.target))
+            return _dispatch_result(model=action.model, action_kind="scale", response=response)
         if isinstance(action, ScaleAction):
             if action.delta != 0 and action.pods:
                 return await self._dispatch_binding_power(action)
-            response = await self._client.scale_model(action.model, action.delta)
+            response = await self._client.scale_model(
+                action.model, action.delta, **_sleep_kwargs(action)
+            )
             return _dispatch_result(model=action.model, action_kind="scale", response=response)
         if isinstance(action, HideAction):
             response = await self._client.set_routable(action.model, action.pods)
             return _dispatch_result(model=action.model, action_kind="hide", response=response)
         if isinstance(action, UnhideAction):
-            response = await self._client.set_routable(action.model, ())
+            # keep_hidden: unconfirmed donor pods stay hidden (review 4 P2-2).
+            response = await self._client.set_routable(action.model, tuple(action.keep_hidden))
             return _dispatch_result(model=action.model, action_kind="unhide", response=response)
         if isinstance(action, DefragAction):
             response = await self._client.defrag(tuple(action.migrations))
@@ -191,35 +1042,156 @@ class ActionQueue:
     async def _dispatch_binding_power(self, action: ScaleAction) -> DispatchResult:
         # Sleep (delta < 0) or wake (delta > 0) exactly the named bindings: safescale
         # commit of the hidden pod, slot-targeted donor, or a planned slot-aware wake.
-        # Stops at the first failure.
+        # Stops at the first failure (a retry re-sends every pod: the SM answers a
+        # binding already in the wanted power state with a no-op).
         for pod in action.pods:
-            response = await self._client.set_binding_power(pod, awake=action.delta > 0)
+            response = await self._client.set_binding_power(
+                pod, awake=action.delta > 0, **_sleep_kwargs(action)
+            )
             if not bool(response.get("ok", False)):
                 return _dispatch_result(model=action.model, action_kind="scale", response=response)
         return DispatchResult(model=action.model, action_kind="scale", ok=True)
 
-    def _record_done(self, queued: QueuedAction, result: DispatchResult) -> None:
-        direction = _action_direction(queued.action)
+    def _record_done(self, model: str, action, result: DispatchResult) -> None:
+        direction = _action_direction(action)
         if result.ok and direction is not None:
-            self._last_done[queued.model] = (int(self._now_ms()), direction)
+            self._last_done[model] = (int(self._now_ms()), direction)
 
     def _has_pending_model(self, model: str) -> bool:
-        return any(item.model == model for item in self._pending)
+        return any(model in item.models for item in self._pending)
 
     def _remove_pending_fairness_for_model(self, model: str) -> tuple[tuple[str, SourceLoop], ...]:
         removed: list[tuple[str, SourceLoop]] = []
         retained: deque[QueuedAction] = deque()
         for item in self._pending:
-            if item.model == model and item.source_loop == "fairness":
+            if model in item.models and item.source_loop == "fairness":
                 removed.append((model, item.source_loop))
                 continue
             retained.append(item)
         self._pending = retained
         return tuple(removed)
 
+    def _queued(self, action: QueueAction) -> QueuedAction:
+        if isinstance(action, DefragAction):
+            return QueuedAction(
+                action=action,
+                model=CLUSTER_MODEL,
+                source_loop=action.source_loop,
+                resources=frozenset({CLUSTER_RESOURCE}),
+            )
+        if isinstance(action, SafeScaleCommitAction):
+            return self._commit_queued(action)
+        if isinstance(action, TransferAction):
+            models = tuple(dict.fromkeys((action.donor.model, action.receiver.model)))
+            pods = action.donor.pods + action.receiver.pods
+        else:
+            models = (action.model,)
+            pods = tuple(getattr(action, "pods", ()) or ())
+        return QueuedAction(
+            action=action,
+            model=action.model,
+            source_loop=action.source_loop,
+            models=models,
+            resources=frozenset(self._resources(models, pods)),
+        )
 
-def _action_kind(action: Action) -> str:
+    def _commit_queued(self, action: SafeScaleCommitAction, *, failures: int = 0) -> QueuedAction:
+        """Queued form of a commit: it holds the donor (and its pods / GPUs) only
+        until the donor slept, then just the receivers still pending."""
+        models = action.touched_models or (action.donor,)
+        pods = () if action.donor_done else action.pods
+        return QueuedAction(
+            action=action,
+            model=action.donor,
+            source_loop=action.source_loop,
+            models=models,
+            resources=frozenset(self._resources(models, pods)),
+            failures=failures,
+        )
+
+    def _resources(self, models: Iterable[str], pods: Iterable[str]) -> set[str]:
+        """Models, pods and - when the cluster view knows the pod - its GPUs: two
+        actions on one GPU (e.g. a donor sleep and another model's wake there) are
+        serialized even when they come from different ticks."""
+        keys = {f"model:{model}" for model in models}
+        for pod in pods:
+            keys.add(f"pod:{pod}")
+            slot = None
+            if self._slot_of is not None:
+                try:
+                    slot = self._slot_of(pod)
+                except Exception:  # noqa: BLE001 - serialization hint only
+                    slot = None
+            if slot is not None:
+                node, gpus = slot
+                keys.update(f"gpu:{node}/{int(gpu)}" for gpu in gpus)
+        return keys
+
+
+def _conflicts(resources: frozenset[str] | set[str], busy: set[str]) -> bool:
+    """Two resource sets conflict when they share a key; a cluster-wide action
+    (defrag) conflicts with every other action."""
+    if not resources or not busy:
+        return False
+    if CLUSTER_RESOURCE in resources or CLUSTER_RESOURCE in busy:
+        return True
+    return bool(resources & busy)
+
+
+def _retry_safe(action) -> bool:
+    """Only idempotent requests are retried (review 3 P2-1): named bindings,
+    hide / unhide, absolute targets. A pod-less relative scale (current + delta
+    at dispatch) could be applied twice after a timed-out success: never retried."""
     if isinstance(action, ScaleAction):
+        return bool(action.pods)
+    return True
+
+
+def _observe_skipped(queued: QueuedAction) -> list[DispatchResult]:
+    action = queued.action
+    if isinstance(action, SafeScaleCommitAction):
+        return [
+            DispatchResult(model=model, action_kind="scale", ok=True, error="observe_skipped")
+            for model in queued.models
+        ]
+    if isinstance(action, TransferAction):
+        return [
+            DispatchResult(model=part.model, action_kind="scale", ok=True, error="observe_skipped")
+            for part in (action.donor, action.receiver)
+        ]
+    return [
+        DispatchResult(
+            model=queued.model,
+            action_kind=_action_kind(action),
+            ok=True,
+            error="observe_skipped",
+        )
+    ]
+
+
+def _sleep_kwargs(action: ScaleAction) -> dict:
+    """SM sleep path + drain budget of a scale-down (plan 2026-09-27 D1).
+
+    Only non-default values are sent: the SM default path is "scale_down".
+    "*_immediate" planner reasons are the fast-loop donor paths ("urgent").
+    """
+    if action.delta >= 0:
+        return {}
+    path = action.sleep_path or (
+        "urgent" if str(action.reason).endswith("_immediate") else "scale_down"
+    )
+    kwargs: dict = {}
+    if path != "scale_down":
+        kwargs["sleep_path"] = path
+    if action.drain_budget_s is not None:
+        kwargs["drain_budget_s"] = float(action.drain_budget_s)
+    return kwargs
+
+
+def _action_kind(action) -> str:
+    if isinstance(action, SafeScaleCommitAction):
+        return "safescale_commit"
+    if isinstance(action, (ScaleAction, TransferAction, ReceiverTarget)):
         return "scale"
     if isinstance(action, HideAction):
         return "hide"
@@ -230,7 +1202,9 @@ def _action_kind(action: Action) -> str:
     return "unknown"
 
 
-def _action_direction(action: Action) -> str | None:
+def _action_direction(action) -> str | None:
+    if isinstance(action, ReceiverTarget):
+        return "up"
     if isinstance(action, ScaleAction):
         return "up" if action.delta > 0 else "down" if action.delta < 0 else None
     if isinstance(action, HideAction):
@@ -240,13 +1214,146 @@ def _action_direction(action: Action) -> str | None:
     return None
 
 
-def _queued_action(action: Action) -> QueuedAction:
+def _queued_action(action: QueueAction) -> QueuedAction:
+    """Queued form of one action without GPU resources (kept for callers/tests)."""
     if isinstance(action, DefragAction):
         return QueuedAction(action=action, model=CLUSTER_MODEL, source_loop=action.source_loop)
     return QueuedAction(action=action, model=action.model, source_loop=action.source_loop)
 
 
+#: SM sleep outcome statuses of a pod that may be asleep (review 4 P2-2).
+UNCONFIRMED_OUTCOMES = frozenset({"unconfirmed", "rollback_failed"})
+
+
 def _dispatch_result(*, model: str, action_kind: str, response: dict) -> DispatchResult:
     ok = bool(response.get("ok", False))
     error = None if ok else str(response.get("error") or "dispatch_failed")
-    return DispatchResult(model=model, action_kind=action_kind, ok=ok, error=error)
+    retriable = (not ok) and bool(response.get("retriable", False))
+    unconfirmed = tuple(
+        str(item.get("serve_id"))
+        for item in (response.get("outcomes") or ())
+        if isinstance(item, dict) and item.get("status") in UNCONFIRMED_OUTCOMES and item.get("serve_id")
+    )
+    return DispatchResult(
+        model=model, action_kind=action_kind, ok=ok, error=error, retriable=retriable, unconfirmed=unconfirmed
+    )
+
+
+def _request_id(action) -> str | None:
+    """The SafeScale probe a one-shot action belongs to (commit or unhide)."""
+    if isinstance(action, (SafeScaleCommitAction, UnhideAction)):
+        return getattr(action, "request_id", None)
+    return None
+
+
+def _resolution(action, failure: DispatchResult | None = None, *, reason: str | None = None) -> tuple[str, str]:
+    """How a finished one-shot action resolves its SafeScale probe."""
+    if isinstance(action, SafeScaleCommitAction):
+        if failure is None:
+            return ("commit", action.reason)
+        if action.donor_done:
+            return ("commit", f"upscale_failed: {failure.error}")
+        return ("rollback", f"commit_failed: {failure.error}; donor pods left hidden")
+    if isinstance(action, UnhideAction):
+        if reason is not None:
+            return ("rollback", f"{action.reason}; {reason}")
+        if failure is not None:
+            return ("rollback", f"{action.reason}; unhide_failed: {failure.error}")
+        return ("rollback", action.reason)
+    return ("done", reason or (failure.error if failure is not None else "ok") or "")
+
+
+def revalidate_from_cluster_view(get_view: Callable[[], object]) -> Revalidate:
+    """Retry guard for one-shot actions: still wanted while the latest cluster view
+    shows at least one named pod not yet in the target state (no view = keep)."""
+
+    def still_wanted(action: QueueAction) -> str | None:
+        view = get_view()
+        if view is None:
+            return None
+        bindings = {binding.serve_id: binding for binding in getattr(view, "bindings", ())}
+        if isinstance(action, ScaleAction) and action.pods and action.delta != 0:
+            wanted_awake = action.delta > 0
+            if any(
+                pod not in bindings or bindings[pod].awake != wanted_awake for pod in action.pods
+            ):
+                return None
+            return f"pods {list(action.pods)} already {'awake' if wanted_awake else 'asleep'}"
+        if isinstance(action, UnhideAction) and action.pods:
+            keep = set(action.keep_hidden)
+            pods = [pod for pod in action.pods if pod not in keep]
+            if not pods or any(pod not in bindings or bindings[pod].hidden for pod in pods):
+                return None
+            return f"pods {pods} already routable"
+        if isinstance(action, HideAction) and action.pods:
+            if any(pod not in bindings or not bindings[pod].hidden for pod in action.pods):
+                return None
+            return f"pods {list(action.pods)} already hidden"
+        return None
+
+    return still_wanted
+
+
+def slot_lookup_from_cluster_view(get_view: Callable[[], object]) -> SlotLookup:
+    def slot_of(serve_id: str):
+        view = get_view()
+        if view is None:
+            return None
+        for binding in getattr(view, "bindings", ()):
+            if binding.serve_id == serve_id:
+                return binding.slot.node, tuple(binding.slot.gpu_ids)
+        return None
+
+    return slot_of
+
+
+def revalidate_commit_from_signals(
+    get_states: Callable[[], "Mapping[str, str] | None"],
+    get_view: Callable[[], object] | None = None,
+) -> CommitRevalidate:
+    """Retry guard of a SafeScale commit (review 3 P2-1..P2-3), evaluated before
+    every (re)try on the models' CURRENT signal state (``get_states``: model ->
+    ModelState value of the latest planner tick; missing / stale = unknown):
+
+    * donor pods already asleep in the cluster view (a timed-out first call
+      that succeeded) -> the donor part is done;
+    * else the donor needing capacity (critical / low) -> abandon: unhide;
+    * a receiver that clearly no longer needs capacity (healthy / high / idle)
+      -> its upscale is dropped. Unknown states keep the plan.
+
+    ``get_view`` must return the cluster view only while FRESH (review 4 P2-1).
+
+    Two different criteria decide a commit (review 4 P3): the SafeScale commit
+    GATE judges the probe window's tail of the donor's SERVING pods (latency
+    SLO, Z_m >= tau_low, KV cache, donor health) with the probe pods hidden;
+    this REVALIDATION judges the planner's latest whole-model ModelState (its
+    own window, dwell and warm-up rules). They can disagree right after the
+    gate passed - the queue then counts ``commit_abandoned_after_gate_total``
+    and logs ``safescale_commit_abandoned_after_gate``.
+    """
+
+    def check(action: SafeScaleCommitAction) -> CommitVerdict:
+        states = dict(get_states() or {})
+        view = get_view() if get_view is not None else None
+        if not action.donor_done:
+            if view is not None and action.pods:
+                bindings = {binding.serve_id: binding for binding in getattr(view, "bindings", ())}
+                if all(pod in bindings and not bindings[pod].awake for pod in action.pods):
+                    action = replace(action, donor_done=True)
+        if not action.donor_done:
+            donor_state = states.get(action.donor)
+            if donor_state in NEEDS_CAPACITY_STATES:
+                return CommitVerdict(
+                    action, abandon_reason=f"donor {action.donor} is {donor_state} (needs capacity)"
+                )
+        kept: list[ReceiverTarget] = []
+        dropped: list[tuple[str, str]] = []
+        for upscale in action.upscales:
+            state = states.get(upscale.model)
+            if state in NO_NEED_STATES:
+                dropped.append((upscale.model, f"receiver {upscale.model} is {state} (no longer needs capacity)"))
+                continue
+            kept.append(upscale)
+        return CommitVerdict(replace(action, upscales=tuple(kept)), dropped=tuple(dropped))
+
+    return check

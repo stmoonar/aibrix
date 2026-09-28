@@ -56,3 +56,25 @@ def test_daemonset_targets_gpu_nodes_and_writes_tre_v2_redis() -> None:
     assert env["NVIDIA_VISIBLE_DEVICES"]["value"] == "all"
     assert env["NODE_NAME"]["valueFrom"]["fieldRef"]["fieldPath"] == "spec.nodeName"
     assert container["volumeMounts"][0]["mountPath"] == "/agent"
+
+
+def test_daemonset_samples_every_10s_and_polls_refresh_requests() -> None:
+    command = _by_kind("DaemonSet")["spec"]["template"]["spec"]["containers"][0]["command"]
+    args = dict(zip(command[2::2], command[3::2]))
+    assert args["--interval-s"] == "10"
+    assert args["--refresh-poll-s"] == "0.25"
+    assert args["--ttl-s"] == "120"
+
+
+def test_generator_renders_a_custom_interval() -> None:
+    import pytest
+
+    script = AGENT_SCRIPT.read_text(encoding="utf-8")
+    custom = list(yaml.safe_load_all(gen.render(script, interval_s=5, refresh_poll_s=0.5, ttl_s=60)))
+    ds = next(doc for doc in custom if doc["kind"] == "DaemonSet")
+    command = ds["spec"]["template"]["spec"]["containers"][0]["command"]
+    assert command[command.index("--interval-s") + 1] == "5"
+    assert command[command.index("--refresh-poll-s") + 1] == "0.5"
+    assert command[command.index("--ttl-s") + 1] == "60"
+    with pytest.raises(ValueError):
+        gen.render(script, interval_s=120, ttl_s=120)

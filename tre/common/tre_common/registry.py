@@ -94,9 +94,17 @@ class NodeSpec:
     gpu_uuids: tuple[str, ...] = ()
 
 
+#: Default for ``cluster.max_bound_per_gpu``: at most this many bindings (sleeping
+#: or awake) may share one physical GPU (each sleeping resident keeps a small
+#: CUDA context on the GPU).
+DEFAULT_MAX_BOUND_PER_GPU = 3
+
+
 @dataclass(frozen=True)
 class ClusterTopology:
     nodes: tuple[NodeSpec, ...]
+    #: Registry ``cluster.max_bound_per_gpu``.
+    max_bound_per_gpu: int = DEFAULT_MAX_BOUND_PER_GPU
 
 
 @dataclass(frozen=True)
@@ -117,10 +125,37 @@ class ModelSpec:
     #: service-manager target / binding wake, console). ``None`` = ``max_replicas``.
     #: Registry key models[].max_awake_replicas (v1/paper alignment A1: 4 for TRE and APA).
     max_awake_replicas: int | None = None
+    #: Optional vLLM fork features the model's image supports (``VLLM_FEATURE_FLAGS``);
+    #: their flags are rendered only while the reissue sidecar is enabled.
+    vllm_features: tuple[str, ...] = ()
+    #: ``--max-model-len`` (models[].max_model_len); None = the model's own maximum.
+    max_model_len: int | None = None
+    #: ``--sleep-mode-backend`` (models[].sleep_mode_backend, ``SLEEP_MODE_BACKENDS``);
+    #: None = no flag, i.e. vLLM's default (cumem).
+    sleep_mode_backend: str | None = None
+    #: Per-model vLLM container environment (models[].vllm_env), merged over the
+    #: registry-wide ``vllm.env`` (see ``Registry.vllm_env_for``).
+    vllm_env: dict[str, str] = field(default_factory=dict)
 
     @property
     def scale_max_replicas(self) -> int:
         return scale_max_replicas(self)
+
+    @property
+    def gpu_memory_utilization(self) -> float:
+        """The engine's ``--gpu-memory-utilization`` (see :func:`gpu_memory_utilization`)."""
+        return gpu_memory_utilization(self)
+
+    @property
+    def vllm_args(self) -> tuple[str, ...]:
+        """Every engine argument the registry gives this model beyond the fixed serve
+        arguments: ``vllm_extra_args`` + ``--max-model-len`` + ``--sleep-mode-backend``."""
+        args = list(self.vllm_extra_args)
+        if self.max_model_len is not None:
+            args.extend(["--max-model-len", str(int(self.max_model_len))])
+        if self.sleep_mode_backend is not None:
+            args.extend(["--sleep-mode-backend", self.sleep_mode_backend])
+        return tuple(args)
 
 
 def scale_max_replicas(spec: Any) -> int:
@@ -130,13 +165,417 @@ def scale_max_replicas(spec: Any) -> int:
     return int(spec.max_replicas) if cap is None else int(cap)
 
 
+#: vLLM's own ``--gpu-memory-utilization`` default (a model whose vllm_extra_args
+#: do not set the flag starts with it).
+VLLM_DEFAULT_GPU_MEMORY_UTILIZATION = 0.9
+_GPU_MEMORY_UTILIZATION_FLAG = "--gpu-memory-utilization"
+
+
+def gpu_memory_utilization(spec: Any) -> float:
+    """The ``--gpu-memory-utilization`` a model's engine starts with: the value in its
+    ``vllm_extra_args`` (``--gpu-memory-utilization X`` or ``--gpu-memory-utilization=X``;
+    the last one wins, as in vLLM's argparse), else vLLM's default 0.9. Duck-typed
+    (a spec without ``vllm_extra_args`` gets the default). A malformed value raises
+    ValueError; the registry validation reports it."""
+    flag = _GPU_MEMORY_UTILIZATION_FLAG
+    args = tuple(getattr(spec, "vllm_extra_args", ()) or ())
+    value: str | None = None
+    for index, arg in enumerate(args):
+        if arg == flag:
+            if index + 1 >= len(args):
+                raise ValueError(f"{flag} has no value")
+            value = str(args[index + 1])
+        elif str(arg).startswith(flag + "="):
+            value = str(arg)[len(flag) + 1:]
+    if value is None:
+        return VLLM_DEFAULT_GPU_MEMORY_UTILIZATION
+    try:
+        util = float(value)
+    except ValueError:
+        raise ValueError(f"{flag} {value!r} is not a number") from None
+    if not (math.isfinite(util) and 0.0 < util <= 1.0):
+        raise ValueError(f"{flag} {value!r} must be in (0, 1]")
+    return util
+
+
+#: Sleep paths (plan 2026-09-27 D1): every caller that puts a binding to sleep names
+#: one; the service-manager looks up its soft drain budget in
+#: ``service_manager.sleep.budgets_s``.
+SLEEP_PATHS = (
+    "safescale_commit",  # SafeScale commit of a hidden probe pod
+    "urgent",  # controller *_immediate donor paths (fast loop)
+    "scale_down",  # ordinary scale-down (TRE slow loop and APA alike)
+    "defrag",  # buddy defragmentation migration
+    "repair",  # fleet repair quarantine / resident pool rebuild
+    "startup",  # startup admission / startup convergence
+    "default",  # any caller that names no path
+)
+
+#: Soft drain budgets (s). ``None`` = only the hard cap. Every drain is additionally
+#: capped by ``hard_cap_s``; requests the gateway marks non-continuable are always
+#: waited for up to the hard cap (never aborted at the soft budget).
+DEFAULT_SLEEP_BUDGETS_S: dict[str, float | None] = {
+    # The caller passes the probe window as drain_budget_s; without one, hard cap.
+    "safescale_commit": None,
+    "urgent": 30.0,
+    # No deadline pressure: wait for in-flight requests up to the hard cap. The same
+    # budget applies to TRE and APA scale-downs (both arms drain identically).
+    "scale_down": None,
+    "defrag": 30.0,
+    "repair": 30.0,
+    "startup": 30.0,
+    "default": 30.0,
+}
+
+#: Default ``gateway.route_timeout_s``: the gateway's per-request route timeout. The
+#: single source for the model HTTPRoute timeout (deploy/gen_model_manifests.py) and
+#: the service-manager drain hard cap (no request can outlive it anyway).
+DEFAULT_ROUTE_TIMEOUT_S = 150.0
+
+#: ``service_manager.sleep.vllm_sleep_mode_param`` values.
+SLEEP_MODE_PARAM_CHOICES = ("auto", "true", "false")
+
+
+#: vLLM fork features a model image may declare (``models[].vllm_features``) and the
+#: engine flags they enable (fork branch tre/transparent-sleep). Both only matter to the
+#: reissue sidecar, so the flags are rendered only while ``reissue.enabled``.
+VLLM_FEATURE_FLAGS: dict[str, tuple[str, ...]] = {
+    # 503 + Retry-After + {"error": {"type": "EngineSleeping"}} for new requests while
+    # the engine sleeps / is paused (the sidecar retries them elsewhere).
+    "sleep_reject_new": ("--sleep-reject-new",),
+    # abort outputs carry prompt_token_ids + generated_token_ids (token-exact continuation).
+    "abort_return_token_ids": ("--abort-return-token-ids",),
+}
+
+#: ``models[].sleep_mode_backend`` values (vLLM fork, ``--sleep-mode-backend``). Unset =
+#: no flag = vLLM's default ``cumem``; ``pinned_weights`` keeps a pinned host copy of the
+#: weights for the process lifetime (fast sleep, level 1 only).
+SLEEP_MODE_BACKENDS = ("cumem", "pinned_weights")
+
+#: vLLM container environment every model pod gets unless the registry overrides it
+#: (``vllm.env`` / ``models[].vllm_env`` merge over it). vLLM >= 0.2x mounts /sleep,
+#: /wake_up and /is_sleeping only in dev mode, and the service-manager needs them, so it
+#: is a default and may not be switched off.
+DEFAULT_VLLM_ENV: dict[str, str] = {"VLLM_SERVER_DEV_MODE": "1"}
+#: Set per binding by the manifest generator; the registry may not set them.
+RESERVED_VLLM_ENV = frozenset({"NVIDIA_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES"})
+
+
+@dataclass(frozen=True)
+class VllmConfig:
+    """Registry ``vllm:`` section: settings shared by every model pod."""
+
+    #: Extra vLLM container environment (merged over ``DEFAULT_VLLM_ENV``; a model's
+    #: ``vllm_env`` merges over this).
+    env: dict[str, str] = field(default_factory=dict)
+
+
+#: Stable in-cluster Service of the tre-v2 Envoy proxy (overlays/tre-v2/gateway-service.yaml).
+#: Envoy Gateway's own proxy Service carries a generated hash suffix, so nothing in TRE
+#: may name it; this ClusterIP selects the same proxy pods by their owning-gateway labels.
+DEFAULT_GATEWAY_SERVICE_NAME = "tre-gateway"
+#: Namespace of the Envoy proxy pods (Envoy Gateway's controller namespace by default); a
+#: Service can only select pods of its own namespace.
+DEFAULT_GATEWAY_SERVICE_NAMESPACE = "envoy-gateway-system"
+DEFAULT_GATEWAY_SERVICE_PORT = 80
+
+
+def gateway_service_url(name: str, namespace: str, port: int) -> str:
+    return f"http://{name}.{namespace}.svc.cluster.local:{int(port)}"
+
+
+DEFAULT_REISSUE_GATEWAY_URL = gateway_service_url(
+    DEFAULT_GATEWAY_SERVICE_NAME, DEFAULT_GATEWAY_SERVICE_NAMESPACE, DEFAULT_GATEWAY_SERVICE_PORT
+)
+#: The pod's serving port (Service targetPort, model.aibrix.ai/port, gateway target-pod,
+#: service-manager, probes). With the sidecar enabled the sidecar listens here.
+POD_SERVING_PORT = 8000
+
+
+@dataclass(frozen=True)
+class ReissueConfig:
+    """Registry ``reissue:`` section: the retry / continuation sidecar in every model pod
+    (tre/docs/design/20260927-reissue-sidecar-v2.md). Read by ``make manifests`` AND by
+    the service-manager when it creates a Deployment at runtime, so both render the same
+    pod. Disabled, the model pods are rendered exactly as without the sidecar (vLLM on
+    the serving port, no fork flags)."""
+
+    enabled: bool = True
+    #: TRE gateway reached from inside the cluster (DNS name, never an IP / NodePort).
+    #: None = the gateway: section's stable Service (``GatewayConfig.internal_url``).
+    gateway_url: str | None = None
+    #: vLLM's internal port (127.0.0.1) behind the sidecar.
+    vllm_port: int = 8001
+    #: Max retry / continuation hops of one request.
+    max_depth: int = 3
+    #: Gateway attempts per retry / continuation.
+    retry_attempts: int = 4
+    #: None = the model's vllm_image (it ships python3 + aiohttp; the script comes from
+    #: a ConfigMap, so no image build is needed).
+    image: str | None = None
+    configmap: str = "tre-reissue-sidecar"
+    #: Namespace of the model Deployments (and of the script ConfigMap).
+    namespace: str = "default"
+    cpu_request: str = "50m"
+    cpu_limit: str = "500m"
+    memory_request: str = "64Mi"
+    memory_limit: str = "256Mi"
+    #: Extra TRE_REISSUE_* environment for the sidecar (field / header / path names).
+    extra_env: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class GatewayConfig:
+    """Registry ``gateway:`` section."""
+
+    #: Request timeout of every model route (HTTPRoute ``timeouts.request``).
+    route_timeout_s: float = DEFAULT_ROUTE_TIMEOUT_S
+    #: Stable ClusterIP Service in front of the tre-v2 Envoy proxy pods (rendered by the
+    #: tre-v2 overlay, kustomize param ``tre-gateway-service-params``): how in-cluster
+    #: clients (the reissue sidecar) reach the gateway.
+    service_name: str = DEFAULT_GATEWAY_SERVICE_NAME
+    service_namespace: str = DEFAULT_GATEWAY_SERVICE_NAMESPACE
+    service_port: int = DEFAULT_GATEWAY_SERVICE_PORT
+
+    @property
+    def internal_url(self) -> str:
+        return gateway_service_url(self.service_name, self.service_namespace, self.service_port)
+
+
+@dataclass(frozen=True)
+class SleepPolicy:
+    """How the service-manager puts a vLLM pod to sleep (plan D1-D4).
+
+    hide (routable=false + route-gen bump) -> gateway ack -> drain -> /sleep.
+    """
+
+    #: Max wait for every live gateway plugin instance to ack the hide.
+    ack_timeout_s: float = 10.0
+    #: A plugin instance is live while its heartbeat score keeps ADVANCING: the SM
+    #: saw the score change within this many seconds of its own monotonic clock.
+    #: The score is never compared with any wall clock (clock-skew proof).
+    instance_staleness_s: float = 10.0
+    #: The hide converges only with at least this many live plugin instances. An
+    #: empty live set never passes: an old plugin image (or a misconfigured
+    #: coordination Redis) routes traffic without ever heartbeating, and "every
+    #: live instance acked" would then be vacuously true.
+    gateway_min_instances: int = 1
+    #: Opt-in: with NO live plugin instance at all, fall back to waiting for the
+    #: k8s label plus ``no_plugin_grace_s`` (no in-flight view from the gateway).
+    #: Default off: no live instance = not converged = ack timeout = rollback.
+    fallback_no_plugin: bool = False
+    #: Grace delay of the opt-in no-plugin fallback, for informers to catch up.
+    no_plugin_grace_s: float = 5.0
+    poll_interval_s: float = 0.5
+    #: HTTP timeout of one /sleep call (weight offload). A mode=wait call that
+    #: fails is retried once with mode=abort, so a sleep spends up to 2x this.
+    sleep_call_timeout_s: float = 45.0
+    #: HTTP timeout of every other vLLM probe of a sleep (``GET /metrics``,
+    #: ``/version``, ``/is_sleeping``); part of the worst-case call duration.
+    probe_timeout_s: float = 5.0
+    #: Allowance for the Redis / Kubernetes calls of one sleep (patches, journal,
+    #: reservation renewals) in the worst-case call duration.
+    io_margin_s: float = 5.0
+    #: After /sleep returned, wait this long for /is_sleeping to report true.
+    physical_confirm_timeout_s: float = 15.0
+    #: ``auto``: probe the pod's ``GET /version`` (cached per pod) and send
+    #: ``mode=wait|abort`` on /sleep only to vLLM versions that accept it;
+    #: ``true`` / ``false`` force it. Without the mode parameter the SM drains
+    #: fully before a plain /sleep.
+    vllm_sleep_mode_param: str = "auto"
+    #: Absolute drain cap; defaults to (and may not exceed) gateway.route_timeout_s.
+    hard_cap_s: float = DEFAULT_ROUTE_TIMEOUT_S
+    #: TTL of the per-binding sleep reservation that fences a draining binding
+    #: (and its GPUs) while the drain runs outside the writer lock. Renewed every
+    #: poll; the reservation of a dead owner expires after this long.
+    reservation_ttl_s: float = 30.0
+    #: Gateway plugin pods that must ack, besides advancing heartbeats: a plugin
+    #: with Redis trouble may still route while its heartbeat stalls, so Ready pods
+    #: matching this selector count as live too. None = heartbeats only.
+    plugin_namespace: str = "tre-v2"
+    plugin_label_selector: str | None = "app=tre-gateway-plugins"
+    budgets_s: dict[str, float | None] = field(
+        default_factory=lambda: dict(DEFAULT_SLEEP_BUDGETS_S)
+    )
+
+    def soft_budget_s(self, path: str, requested_s: float | None = None) -> float:
+        """Soft drain budget of one sleep: the caller's budget, else the path's."""
+        if requested_s is not None:
+            budget = float(requested_s)
+            if not math.isfinite(budget) or budget < 0:
+                raise ValueError(f"drain budget must be a finite number >= 0, got {requested_s!r}")
+        else:
+            key = path if path in self.budgets_s else "default"
+            raw = self.budgets_s.get(key)
+            budget = self.hard_cap_s if raw is None else float(raw)
+        return min(budget, self.hard_cap_s)
+
+
+#: Accepted values of ``service_manager.log_level`` (and TRE_SM_LOG_LEVEL).
+LOG_LEVEL_NAMES = ("CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG")
+
+
+@dataclass(frozen=True)
+class ServiceManagerConfig:
+    sleep: SleepPolicy = field(default_factory=SleepPolicy)
+    #: Wake fails closed unless every target GPU's used memory (gpu-truth) is at
+    #: most this fraction of the GPU's total memory: sleeping residents keep only
+    #: a small footprint; an awake resident (or a leak) is far above it.
+    wake_max_used_fraction: float = 0.2
+    #: Optional absolute override (MiB) of the wake threshold; None = the fraction.
+    wake_max_used_mib: int | None = None
+    #: How long a GPU headroom gate (wake, cold start) waits for a gpu-truth
+    #: sample taken AFTER it asked for one (the agent's on-demand refresh,
+    #: ``tre:gpu_truth_refresh:<node>``); with an agent that does not answer
+    #: refreshes it re-reads the periodic sample for up to this long instead.
+    wake_truth_wait_s: float = 10.0
+    #: Cold start (create) headroom (B9). vLLM refuses to start an engine unless the
+    #: GPU's free memory is at least gpu_memory_utilization x total, so a create is
+    #: allowed while every target GPU's used memory (gpu-truth) is at most
+    #: total x (1 - gpu_memory_utilization of the model being created) - this margin
+    #: (the new process' own CUDA context and allocator slack). Sleeping neighbours
+    #: of a full layout fit under it; an awake one does not.
+    create_margin_mib: int = 512
+    #: Optional absolute override (MiB) of the create limit; None = derived per GPU
+    #: and model. The TRE_CREATE_MAX_USED_MIB env var (set only on purpose)
+    #: overrides both: env > create.max_used_mib > derived.
+    create_max_used_mib: int | None = None
+    #: Startup check of the local clock against Redis TIME.
+    clock_skew_warn_s: float = 1.0
+    #: Refuse to start above this skew (None = warn only).
+    clock_skew_fail_s: float | None = None
+    #: Only nodes in cluster.nodes can block a cold start with node pressure.
+    pressure_registry_nodes_only: bool = True
+    #: A request that needs the SM writer lock waits up to this long for it (the
+    #: lock is held only for short phases; a drain runs outside it). Waiters are
+    #: served first-come first-served.
+    writer_lock_wait_s: float = 10.0
+    #: How long the commit phase of a drained sleep waits for the writer lock
+    #: (None = writer_lock_wait_s). The sleep reservation must outlive it.
+    commit_lock_wait_s: float | None = None
+    #: Timeout clients (the controller) use for slow SM calls (scale / binding
+    #: power / defrag). Must exceed :meth:`worst_case_sleep_call_s`; the controller
+    #: uses it unless TRE_SM_SLOW_TIMEOUT_SECONDS overrides it (validated too).
+    api_call_timeout_s: float = 360.0
+    #: Level of the tre_sm / tre_common loggers (a logging level name); the
+    #: TRE_SM_LOG_LEVEL environment variable overrides it.
+    log_level: str = "INFO"
+
+    @property
+    def commit_wait_s(self) -> float:
+        return self.writer_lock_wait_s if self.commit_lock_wait_s is None else self.commit_lock_wait_s
+
+    def worst_case_commit_s(self) -> float:
+        """The commit phase once it holds the lock (targets are committed in
+        parallel - sends, confirmation rounds and rollback probes alike - so this
+        does not grow with the number of targets):
+
+        * send, per target: ``/version`` probe + /sleep mode=wait +
+          ``/is_sleeping`` + ``/metrics`` re-read + /sleep mode=abort +
+          ``/is_sleeping``, and a failed send's rollback re-probes
+          ``/is_sleeping`` once (5 probes + 2 sleeps);
+        * confirmation: ``physical_confirm_timeout_s``, overshot by one poll
+          interval and one probe round, then the rollback of a pod that never
+          converged re-probes it once (review 3 P3: the rollback probe and the
+          final-round overshoot were not counted before)."""
+        sleep = self.sleep
+        send = 5 * sleep.probe_timeout_s + 2 * sleep.sleep_call_timeout_s
+        confirm = (
+            sleep.physical_confirm_timeout_s
+            + sleep.poll_interval_s
+            + 2 * sleep.probe_timeout_s
+        )
+        return send + confirm
+
+    def worst_case_drain_s(self) -> float:
+        """Gateway ack + drain up to the hard cap + the last poll round (engine
+        metrics of every target read in parallel, so one probe timeout)."""
+        sleep = self.sleep
+        return sleep.ack_timeout_s + sleep.hard_cap_s + sleep.probe_timeout_s
+
+    def worst_case_sleep_call_s(self) -> float:
+        """Upper bound of one sleeping SM call, for any number of targets:
+        writer-lock wait (hide phase) + drain + commit-lock wait + commit +
+        the Redis / Kubernetes allowance."""
+        return (
+            self.writer_lock_wait_s
+            + self.worst_case_drain_s()
+            + self.commit_wait_s
+            + self.worst_case_commit_s()
+            + self.sleep.io_margin_s
+        )
+
+    def shutdown_timeout_s(self) -> float:
+        """How long SIGTERM waits for sleeps in progress: a drain rolls back at its
+        next poll (after at most one poll round, or once its commit-lock wait
+        ends), a commit already past /sleep finishes."""
+        sleep = self.sleep
+        return (
+            self.commit_wait_s
+            + self.worst_case_commit_s()
+            + sleep.poll_interval_s
+            + sleep.probe_timeout_s
+            + sleep.io_margin_s
+        )
+
+    def wake_limit_mib(self, total_mib: int | None) -> int | None:
+        """Max used MiB for a wake on a GPU of ``total_mib`` (None = unknown)."""
+        if self.wake_max_used_mib is not None:
+            return int(self.wake_max_used_mib)
+        if total_mib is None or total_mib <= 0:
+            return None
+        return int(total_mib * self.wake_max_used_fraction)
+
+    def create_limit_mib(self, total_mib: int | None, gpu_memory_utilization: float) -> int | None:
+        """Max used MiB for a cold start of a model with ``gpu_memory_utilization`` on
+        a GPU of ``total_mib`` (None = unknown total and no absolute override)."""
+        if self.create_max_used_mib is not None:
+            return int(self.create_max_used_mib)
+        if total_mib is None or total_mib <= 0:
+            return None
+        # vLLM needs util x total free; floor the rest (the epsilon absorbs float
+        # noise such as 40960 x 0.15 = 6143.999...).
+        startup_free = math.floor(total_mib * (1.0 - gpu_memory_utilization) + 1e-6)
+        return int(startup_free) - int(self.create_margin_mib)
+
+
 class Registry:
-    def __init__(self, topology: ClusterTopology, models: list[ModelSpec]) -> None:
+    def __init__(
+        self,
+        topology: ClusterTopology,
+        models: list[ModelSpec],
+        service_manager: ServiceManagerConfig | None = None,
+        gateway: GatewayConfig | None = None,
+        reissue: ReissueConfig | None = None,
+        vllm: VllmConfig | None = None,
+    ) -> None:
         self._topology = topology
         self._models = tuple(models)
+        self._service_manager = service_manager or ServiceManagerConfig()
+        self._gateway = gateway or GatewayConfig()
+        self._reissue = reissue or ReissueConfig()
+        self._vllm = vllm or VllmConfig()
         self._model_index: dict[str, ModelSpec] = {}
         for model in models:
             self._model_index.setdefault(model.name, model)
+
+    def service_manager(self) -> ServiceManagerConfig:
+        return self._service_manager
+
+    def gateway(self) -> GatewayConfig:
+        return self._gateway
+
+    def reissue(self) -> ReissueConfig:
+        return self._reissue
+
+    def vllm(self) -> VllmConfig:
+        return self._vllm
+
+    def vllm_env_for(self, model: ModelSpec) -> dict[str, str]:
+        """The vLLM container environment of ``model``'s pods (besides the per-binding
+        GPU variables): ``DEFAULT_VLLM_ENV``, then ``vllm.env``, then the model's
+        ``vllm_env``; later keys win."""
+        return {**DEFAULT_VLLM_ENV, **self._vllm.env, **getattr(model, "vllm_env", {})}
 
     def model(self, name: str) -> ModelSpec:
         try:
@@ -149,6 +588,11 @@ class Registry:
 
     def topology(self) -> ClusterTopology:
         return self._topology
+
+    def validate_service_manager(self) -> list[str]:
+        """Only the service_manager: / gateway: checks (the SM refuses to start on
+        these; model / topology errors are the manifest generator's concern)."""
+        return _validate_service_manager(self._service_manager, self._gateway)
 
     def validate(self) -> list[str]:
         errors: list[str] = []
@@ -163,6 +607,13 @@ class Registry:
                 errors.append(f"model {model.name}: min_replicas must be non-negative")
             if model.max_replicas < model.min_replicas:
                 errors.append(f"model {model.name}: max_replicas below min_replicas")
+            unknown = sorted(set(model.vllm_features) - set(VLLM_FEATURE_FLAGS))
+            if unknown:
+                errors.append(
+                    f"model {model.name}: unknown vllm_features {unknown} "
+                    f"(known: {', '.join(sorted(VLLM_FEATURE_FLAGS))})"
+                )
+            errors.extend(_validate_model_vllm(model))
             if model.max_awake_replicas is not None and not (
                 model.min_replicas <= model.max_awake_replicas <= model.max_replicas
             ):
@@ -213,7 +664,49 @@ class Registry:
                 for gpu in slot:
                     if gpu < 0 or gpu >= node.gpus:
                         errors.append(f"node {node.name}: gpu {gpu} outside gpu range 0..{node.gpus - 1}")
+        if self._topology.max_bound_per_gpu < 1:
+            errors.append("cluster.max_bound_per_gpu must be >= 1")
+        errors.extend(_validate_reissue(self._reissue))
+        errors.extend(_validate_vllm_env("vllm.env", self._vllm.env))
+        errors.extend(_validate_service_manager(self._service_manager, self._gateway))
         return errors
+
+
+def _arg_present(args: tuple[str, ...], flag: str) -> bool:
+    return any(arg == flag or arg.startswith(flag + "=") for arg in args)
+
+
+def _validate_model_vllm(model: ModelSpec) -> list[str]:
+    errors: list[str] = []
+    prefix = f"model {model.name}"
+    if model.max_model_len is not None:
+        if model.max_model_len <= 0:
+            errors.append(f"{prefix}: max_model_len must be positive")
+        if _arg_present(model.vllm_extra_args, "--max-model-len"):
+            errors.append(f"{prefix}: set max_model_len OR --max-model-len in vllm_extra_args, not both")
+    if model.sleep_mode_backend is not None:
+        if model.sleep_mode_backend not in SLEEP_MODE_BACKENDS:
+            errors.append(
+                f"{prefix}: sleep_mode_backend must be one of {list(SLEEP_MODE_BACKENDS)} or null"
+            )
+        if _arg_present(model.vllm_extra_args, "--sleep-mode-backend"):
+            errors.append(f"{prefix}: set sleep_mode_backend OR --sleep-mode-backend in vllm_extra_args, not both")
+    try:
+        gpu_memory_utilization(model)
+    except ValueError as exc:
+        errors.append(f"{prefix}: vllm_extra_args {exc}")
+    errors.extend(_validate_vllm_env(f"{prefix}: vllm_env", getattr(model, "vllm_env", {})))
+    return errors
+
+
+def _validate_vllm_env(where: str, env: dict[str, str]) -> list[str]:
+    errors: list[str] = []
+    for key, value in env.items():
+        if key in RESERVED_VLLM_ENV:
+            errors.append(f"{where}: {key} is set per binding by the manifest generator")
+        elif key in DEFAULT_VLLM_ENV and value != DEFAULT_VLLM_ENV[key]:
+            errors.append(f"{where}: {key} must be {DEFAULT_VLLM_ENV[key]!r} (TRE needs it)")
+    return errors
 
 
 def load_registry(path: str | None = None) -> Registry:
@@ -226,7 +719,326 @@ def _parse_registry(raw: dict[str, Any]) -> Registry:
     cluster = raw.get("cluster") or {}
     nodes = tuple(_parse_node(item) for item in cluster.get("nodes", []))
     models = [_parse_model(item) for item in raw.get("models", [])]
-    return Registry(ClusterTopology(nodes=nodes), models)
+    max_bound = cluster.get("max_bound_per_gpu")
+    return Registry(
+        ClusterTopology(
+            nodes=nodes,
+            max_bound_per_gpu=(
+                DEFAULT_MAX_BOUND_PER_GPU if max_bound is None else int(max_bound)
+            ),
+        ),
+        models,
+        service_manager=parse_service_manager_config(
+            raw.get("service_manager"), gateway=raw.get("gateway")
+        ),
+        gateway=parse_gateway_config(raw.get("gateway")),
+        reissue=parse_reissue_config(raw.get("reissue")),
+        vllm=parse_vllm_config(raw.get("vllm")),
+    )
+
+
+def _parse_env(raw: Any, where: str) -> dict[str, str]:
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError(f"{where} must be a mapping")
+    env: dict[str, str] = {}
+    for key, value in raw.items():
+        if value is None or isinstance(value, (dict, list)):
+            raise ValueError(f"{where}.{key} must be a scalar")
+        # YAML turns 1 / true into int / bool; the container env wants the text.
+        env[str(key)] = str(value).lower() if isinstance(value, bool) else str(value)
+    return env
+
+
+def parse_vllm_config(raw: Any) -> VllmConfig:
+    """Parse the optional ``vllm:`` registry section (absent = defaults)."""
+    if raw is None:
+        return VllmConfig()
+    if not isinstance(raw, dict):
+        raise ValueError("vllm must be a mapping")
+    known = {f for f in VllmConfig.__dataclass_fields__}
+    unknown = sorted(set(raw) - known)
+    if unknown:
+        raise ValueError(f"vllm: unknown keys {unknown} (known: {', '.join(sorted(known))})")
+    return VllmConfig(env=_parse_env(raw.get("env"), "vllm.env"))
+
+
+def parse_reissue_config(raw: Any) -> ReissueConfig:
+    """Parse the optional ``reissue:`` registry section (absent = defaults, enabled)."""
+    if raw is None:
+        return ReissueConfig()
+    if not isinstance(raw, dict):
+        raise ValueError("reissue must be a mapping")
+    known = {f for f in ReissueConfig.__dataclass_fields__}
+    unknown = sorted(set(raw) - known)
+    if unknown:
+        raise ValueError(f"reissue: unknown keys {unknown} (known: {', '.join(sorted(known))})")
+    defaults = ReissueConfig()
+    extra_env = raw.get("extra_env") or {}
+    if not isinstance(extra_env, dict):
+        raise ValueError("reissue.extra_env must be a mapping")
+    return ReissueConfig(
+        enabled=_parse_bool(raw.get("enabled", defaults.enabled)),
+        gateway_url=(str(raw["gateway_url"]).rstrip("/") if raw.get("gateway_url") else None),
+        vllm_port=int(raw.get("vllm_port", defaults.vllm_port)),
+        max_depth=int(raw.get("max_depth", defaults.max_depth)),
+        retry_attempts=int(raw.get("retry_attempts", defaults.retry_attempts)),
+        image=(str(raw["image"]) if raw.get("image") else None),
+        configmap=str(raw.get("configmap", defaults.configmap)),
+        namespace=str(raw.get("namespace", defaults.namespace)),
+        cpu_request=str(raw.get("cpu_request", defaults.cpu_request)),
+        cpu_limit=str(raw.get("cpu_limit", defaults.cpu_limit)),
+        memory_request=str(raw.get("memory_request", defaults.memory_request)),
+        memory_limit=str(raw.get("memory_limit", defaults.memory_limit)),
+        extra_env={str(k): str(v) for k, v in extra_env.items()},
+    )
+
+
+def _validate_reissue(reissue: ReissueConfig) -> list[str]:
+    errors: list[str] = []
+    if not reissue.enabled:
+        return errors
+    if reissue.gateway_url is not None and not reissue.gateway_url.startswith(("http://", "https://")):
+        errors.append("reissue.gateway_url must be an http(s) URL (in-cluster DNS name)")
+    if not 1 <= reissue.vllm_port <= 65535 or reissue.vllm_port == POD_SERVING_PORT:
+        errors.append(f"reissue.vllm_port must be a valid port other than {POD_SERVING_PORT}")
+    if reissue.max_depth < 0:
+        errors.append("reissue.max_depth must be non-negative")
+    if reissue.retry_attempts < 1:
+        errors.append("reissue.retry_attempts must be >= 1")
+    for key in reissue.extra_env:
+        if not key.startswith("TRE_"):
+            errors.append(f"reissue.extra_env: {key} is not a TRE_* variable")
+    return errors
+
+
+def parse_gateway_config(raw: dict[str, Any] | None) -> GatewayConfig:
+    """Parse the optional ``gateway:`` registry section."""
+    raw = raw or {}
+    timeout = raw.get("route_timeout_s")
+    return GatewayConfig(
+        route_timeout_s=float(DEFAULT_ROUTE_TIMEOUT_S if timeout is None else timeout),
+        service_name=str(raw.get("service_name") or DEFAULT_GATEWAY_SERVICE_NAME),
+        service_namespace=str(raw.get("service_namespace") or DEFAULT_GATEWAY_SERVICE_NAMESPACE),
+        service_port=int(raw.get("service_port") or DEFAULT_GATEWAY_SERVICE_PORT),
+    )
+
+
+def parse_service_manager_config(
+    raw: dict[str, Any] | None, *, gateway: dict[str, Any] | None = None
+) -> ServiceManagerConfig:
+    """Parse the optional ``service_manager:`` registry section (all keys optional).
+
+    ``sleep.hard_cap_s`` defaults to ``gateway.route_timeout_s`` (the gateway's
+    request timeout: no request can outlive it anyway), else 150 s.
+    """
+    raw = raw or {}
+    sleep_raw = raw.get("sleep") or {}
+    wake_raw = raw.get("wake") or {}
+    create_raw = raw.get("create") or {}
+    skew_raw = raw.get("clock_skew") or {}
+    pressure_raw = raw.get("node_pressure") or {}
+    defaults = SleepPolicy()
+    plugin_pods_raw = sleep_raw.get("gateway_plugin_pods") or {}
+    hard_cap = sleep_raw.get("hard_cap_s")
+    if hard_cap is None:
+        hard_cap = (gateway or {}).get("route_timeout_s")
+    budgets = dict(DEFAULT_SLEEP_BUDGETS_S)
+    for path, value in (sleep_raw.get("budgets_s") or {}).items():
+        if str(path) not in SLEEP_PATHS:
+            raise ValueError(
+                f"service_manager.sleep.budgets_s: unknown sleep path {path!r} "
+                f"(known: {', '.join(SLEEP_PATHS)})"
+            )
+        budgets[str(path)] = None if value is None else float(value)
+    sleep = SleepPolicy(
+        ack_timeout_s=_num(sleep_raw, "ack_timeout_s", defaults.ack_timeout_s),
+        instance_staleness_s=_num(sleep_raw, "instance_staleness_s", defaults.instance_staleness_s),
+        gateway_min_instances=int(
+            _num(sleep_raw, "gateway_min_instances", defaults.gateway_min_instances)
+        ),
+        fallback_no_plugin=_parse_bool(
+            sleep_raw.get("fallback_no_plugin", defaults.fallback_no_plugin)
+        ),
+        no_plugin_grace_s=_num(sleep_raw, "no_plugin_grace_s", defaults.no_plugin_grace_s),
+        poll_interval_s=_num(sleep_raw, "poll_interval_s", defaults.poll_interval_s),
+        sleep_call_timeout_s=_num(
+            sleep_raw, "sleep_call_timeout_s", defaults.sleep_call_timeout_s
+        ),
+        physical_confirm_timeout_s=_num(
+            sleep_raw, "physical_confirm_timeout_s", defaults.physical_confirm_timeout_s
+        ),
+        probe_timeout_s=_num(sleep_raw, "probe_timeout_s", defaults.probe_timeout_s),
+        io_margin_s=_num(sleep_raw, "io_margin_s", defaults.io_margin_s),
+        vllm_sleep_mode_param=parse_sleep_mode_param(
+            sleep_raw.get("vllm_sleep_mode_param", defaults.vllm_sleep_mode_param)
+        ),
+        hard_cap_s=float(DEFAULT_ROUTE_TIMEOUT_S if hard_cap is None else hard_cap),
+        reservation_ttl_s=_num(sleep_raw, "reservation_ttl_s", defaults.reservation_ttl_s),
+        budgets_s=budgets,
+        plugin_namespace=str(plugin_pods_raw.get("namespace", defaults.plugin_namespace)),
+        plugin_label_selector=plugin_pods_raw.get(
+            "label_selector", defaults.plugin_label_selector
+        ),
+    )
+    base = ServiceManagerConfig()
+    fail_s = skew_raw.get("fail_s", base.clock_skew_fail_s)
+    max_used_mib = wake_raw.get("max_used_mib", base.wake_max_used_mib)
+    create_max_used_mib = create_raw.get("max_used_mib", base.create_max_used_mib)
+    return ServiceManagerConfig(
+        sleep=sleep,
+        wake_max_used_fraction=_num(wake_raw, "max_used_fraction", base.wake_max_used_fraction),
+        wake_max_used_mib=None if max_used_mib is None else int(max_used_mib),
+        wake_truth_wait_s=_num(wake_raw, "truth_wait_s", base.wake_truth_wait_s),
+        create_margin_mib=int(_num(create_raw, "margin_mib", base.create_margin_mib)),
+        create_max_used_mib=None if create_max_used_mib is None else int(create_max_used_mib),
+        clock_skew_warn_s=_num(skew_raw, "warn_s", base.clock_skew_warn_s),
+        clock_skew_fail_s=None if fail_s is None else float(fail_s),
+        pressure_registry_nodes_only=_parse_bool(
+            pressure_raw.get("registry_nodes_only", base.pressure_registry_nodes_only)
+        ),
+        writer_lock_wait_s=_num(raw, "writer_lock_wait_s", base.writer_lock_wait_s),
+        commit_lock_wait_s=(
+            None if raw.get("commit_lock_wait_s") is None else float(raw["commit_lock_wait_s"])
+        ),
+        api_call_timeout_s=_num(raw, "api_call_timeout_s", base.api_call_timeout_s),
+        log_level=(
+            base.log_level if raw.get("log_level") is None else str(raw["log_level"]).strip().upper()
+        ),
+    )
+
+
+def parse_sleep_mode_param(value: Any) -> str:
+    """``auto`` | ``true`` | ``false`` (YAML booleans accepted)."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    text = str(value).strip().lower()
+    if text == "auto":
+        return "auto"
+    return "true" if _parse_bool(text) else "false"
+
+
+def _num(section: dict[str, Any], key: str, default: float) -> float:
+    value = section.get(key)
+    return float(default if value is None else value)
+
+
+def _parse_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"expected a boolean, got {value!r}")
+
+
+def _validate_service_manager(
+    config: ServiceManagerConfig, gateway: GatewayConfig | None = None
+) -> list[str]:
+    errors: list[str] = []
+    sleep = config.sleep
+    for name in (
+        "ack_timeout_s",
+        "instance_staleness_s",
+        "poll_interval_s",
+        "sleep_call_timeout_s",
+        "physical_confirm_timeout_s",
+        "hard_cap_s",
+        "reservation_ttl_s",
+        "probe_timeout_s",
+    ):
+        value = float(getattr(sleep, name))
+        if not math.isfinite(value) or value <= 0:
+            errors.append(f"service_manager.sleep.{name} must be positive")
+    if not math.isfinite(sleep.io_margin_s) or sleep.io_margin_s < 0:
+        errors.append("service_manager.sleep.io_margin_s must be >= 0")
+    if not math.isfinite(sleep.no_plugin_grace_s) or sleep.no_plugin_grace_s < 0:
+        errors.append("service_manager.sleep.no_plugin_grace_s must be >= 0")
+    if sleep.gateway_min_instances < 1:
+        errors.append("service_manager.sleep.gateway_min_instances must be >= 1")
+    if sleep.vllm_sleep_mode_param not in SLEEP_MODE_PARAM_CHOICES:
+        errors.append(
+            "service_manager.sleep.vllm_sleep_mode_param must be one of "
+            f"{', '.join(SLEEP_MODE_PARAM_CHOICES)}"
+        )
+    if sleep.reservation_ttl_s <= 2 * sleep.poll_interval_s:
+        errors.append(
+            "service_manager.sleep.reservation_ttl_s must exceed 2 x poll_interval_s "
+            "(the reservation is renewed once per poll)"
+        )
+    # Review 2 P2-1: the longest gap between two renewals is the last drain poll
+    # round (every target's engine metrics, read in parallel) followed by the wait
+    # for the commit-phase writer lock; the reservation must survive it, or the
+    # commit finds it lost and rolls back.
+    renew_gap = (
+        config.commit_wait_s + sleep.poll_interval_s + sleep.probe_timeout_s + sleep.io_margin_s
+    )
+    if sleep.reservation_ttl_s <= renew_gap:
+        errors.append(
+            f"service_manager.sleep.reservation_ttl_s ({sleep.reservation_ttl_s:g}) must "
+            f"exceed the longest renewal gap {renew_gap:g}s (commit-lock wait + "
+            "poll_interval_s + probe_timeout_s + io_margin_s)"
+        )
+    for path, value in sleep.budgets_s.items():
+        if path not in SLEEP_PATHS:
+            errors.append(f"service_manager.sleep.budgets_s: unknown sleep path {path}")
+        elif value is not None and (not math.isfinite(value) or value < 0):
+            errors.append(f"service_manager.sleep.budgets_s.{path} must be >= 0 or null")
+    if gateway is not None:
+        if not math.isfinite(gateway.route_timeout_s) or gateway.route_timeout_s <= 0:
+            errors.append("gateway.route_timeout_s must be positive")
+        elif sleep.hard_cap_s > gateway.route_timeout_s:
+            errors.append(
+                f"service_manager.sleep.hard_cap_s ({sleep.hard_cap_s:g}) must not exceed "
+                f"gateway.route_timeout_s ({gateway.route_timeout_s:g}): no request "
+                "outlives the route timeout"
+            )
+    if not (0.0 < config.wake_max_used_fraction <= 1.0):
+        errors.append("service_manager.wake.max_used_fraction must be in (0, 1]")
+    if config.wake_max_used_mib is not None and config.wake_max_used_mib <= 0:
+        errors.append("service_manager.wake.max_used_mib must be positive or null")
+    if config.wake_truth_wait_s < 0:
+        errors.append("service_manager.wake.truth_wait_s must be >= 0")
+    if config.create_margin_mib < 0:
+        errors.append("service_manager.create.margin_mib must be >= 0")
+    if config.create_max_used_mib is not None and config.create_max_used_mib <= 0:
+        errors.append("service_manager.create.max_used_mib must be positive or null")
+    if config.clock_skew_warn_s <= 0:
+        errors.append("service_manager.clock_skew.warn_s must be positive")
+    if config.clock_skew_fail_s is not None and config.clock_skew_fail_s <= 0:
+        errors.append("service_manager.clock_skew.fail_s must be positive or null")
+    if config.writer_lock_wait_s < 0:
+        errors.append("service_manager.writer_lock_wait_s must be >= 0")
+    if config.commit_lock_wait_s is not None and config.commit_lock_wait_s < 0:
+        errors.append("service_manager.commit_lock_wait_s must be >= 0 or null")
+    if config.log_level not in LOG_LEVEL_NAMES:
+        errors.append(
+            f"service_manager.log_level must be one of {', '.join(LOG_LEVEL_NAMES)}, "
+            f"got {config.log_level!r}"
+        )
+    errors.extend(sleep_call_timeout_errors(config, config.api_call_timeout_s))
+    return errors
+
+
+def sleep_call_timeout_errors(
+    config: ServiceManagerConfig, call_timeout_s: float, *, name: str = "api_call_timeout_s"
+) -> list[str]:
+    """Empty when a client timeout of ``call_timeout_s`` outlasts the worst-case
+    sleeping SM call; used by the registry validation and the controller."""
+    worst = config.worst_case_sleep_call_s()
+    if worst < call_timeout_s:
+        return []
+    return [
+        f"worst-case sleeping service-manager call is {worst:g}s (writer_lock_wait_s + "
+        "sleep.ack_timeout_s + sleep.hard_cap_s + commit-lock wait + 2 x "
+        "sleep.sleep_call_timeout_s + 8 x sleep.probe_timeout_s + "
+        "sleep.physical_confirm_timeout_s + sleep.poll_interval_s + "
+        "sleep.io_margin_s), not below "
+        f"{name} = {call_timeout_s:g}s: the caller would time out mid-drain"
+    ]
 
 
 def _parse_node(raw: dict[str, Any]) -> NodeSpec:
@@ -287,6 +1099,12 @@ def _parse_model(raw: dict[str, Any]) -> ModelSpec:
             ema_tau_ms=(float(trs["ema_tau_ms"]) if trs.get("ema_tau_ms") is not None else None),
         ),
         vllm_extra_args=tuple(str(arg) for arg in raw.get("vllm_extra_args", [])),
+        vllm_features=tuple(str(feature) for feature in raw.get("vllm_features") or ()),
+        max_model_len=(int(raw["max_model_len"]) if raw.get("max_model_len") is not None else None),
+        sleep_mode_backend=(
+            str(raw["sleep_mode_backend"]) if raw.get("sleep_mode_backend") is not None else None
+        ),
+        vllm_env=_parse_env(raw.get("vllm_env"), f"model {raw.get('name')}: vllm_env"),
         alt_thresholds={
             str(signal): AltThreshold(
                 theta=float(values["theta"]),

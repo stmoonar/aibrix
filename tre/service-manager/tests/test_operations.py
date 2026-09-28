@@ -1,4 +1,6 @@
 import json
+import os
+import time
 
 import pytest
 from fastapi.testclient import TestClient
@@ -13,6 +15,7 @@ from tre_sm.state.operations import (
     OperationFenceLost,
     _ACQUIRE_SCRIPT,
     _FINISH_SCRIPT,
+    _LEAVE_QUEUE_SCRIPT,
     _RENEW_SCRIPT,
     _UPDATE_SCRIPT,
     current_fence,
@@ -33,7 +36,9 @@ class ScriptRedis:
     def __init__(self):
         self.values = {}
         self.hashes = {}
+        self.zsets = {}
         self.eval_calls = []
+        self.now_ms = 1_700_000_000_000
 
     def get(self, key):
         return self.values.get(key)
@@ -62,12 +67,30 @@ class ScriptRedis:
         keys = list(keys_and_args[:numkeys])
         args = list(keys_and_args[numkeys:])
         if script == _ACQUIRE_SCRIPT:
-            lock_key, counter_key, operations_key = keys
-            token = int(self.values.get(counter_key, 0)) + 1
-            self.values[counter_key] = str(token)
+            lock_key, counter_key, operations_key, queue_key, deadlines_key, seq_key = keys
+            owner, _ttl, operation_id, kind, started_at, request_json, ticket, waiter_ttl = args
+            queue = self.zsets.setdefault(queue_key, {})
+            deadlines = self.hashes.setdefault(deadlines_key, {})
+            for waiter in list(queue):
+                if int(deadlines.get(waiter, 0)) <= self.now_ms:
+                    queue.pop(waiter)
+                    deadlines.pop(waiter, None)
+            if ticket:
+                if ticket not in queue:
+                    seq = int(self.values.get(seq_key, 0)) + 1
+                    self.values[seq_key] = str(seq)
+                    queue[ticket] = seq
+                deadlines[ticket] = str(self.now_ms + int(waiter_ttl))
             if lock_key in self.values:
                 return [0, self.values[lock_key]]
-            owner, _ttl, operation_id, kind, started_at, request_json = args
+            head = min(queue, key=queue.get) if queue else None
+            if head is not None and head != ticket:
+                return [0, f"queued:{head}"]
+            token = int(self.values.get(counter_key, 0)) + 1
+            self.values[counter_key] = str(token)
+            if ticket:
+                queue.pop(ticket, None)
+                deadlines.pop(ticket, None)
             lock_value = f"{owner}:{token}"
             self.values[lock_key] = lock_value
             self.hashes.setdefault(operations_key, {})[operation_id] = json.dumps(
@@ -84,6 +107,10 @@ class ScriptRedis:
                 }
             )
             return [token, lock_value]
+        if script == _LEAVE_QUEUE_SCRIPT:
+            self.zsets.get(keys[0], {}).pop(args[0], None)
+            self.hashes.get(keys[1], {}).pop(args[0], None)
+            return 1
         if script == _RENEW_SCRIPT:
             return int(self.values.get(keys[0]) == args[0])
         if script == _UPDATE_SCRIPT:
@@ -323,3 +350,114 @@ def test_desired_intent_commits_before_observed_state_converges():
             "observed_power": "sleeping",
         }
     ]
+
+
+# ------------------------------------------------------------ review 2 P2-4
+def _redis_backends():
+    backends = [pytest.param(lambda: (ScriptRedis(), None), id="script-model")]
+    url = os.environ.get("TRE_TEST_REDIS_URL")
+    if url:
+        backends.append(pytest.param(lambda: _real_redis(url), id="real-redis-lua"))
+    return backends
+
+
+def _real_redis(url):
+    import redis as redis_lib
+
+    client = redis_lib.Redis.from_url(url)
+    for key in (
+        rediskeys.SM_WRITER_LOCK_KEY,
+        rediskeys.SM_FENCE_COUNTER_KEY,
+        rediskeys.SM_OPERATIONS_KEY,
+        rediskeys.SM_WRITER_QUEUE_KEY,
+        rediskeys.SM_WRITER_QUEUE_DEADLINES_KEY,
+        rediskeys.SM_WRITER_QUEUE_SEQ_KEY,
+    ):
+        client.delete(key)
+    return client, client
+
+
+def _expire_waiters(redis, real, ttl_ms):
+    if real is None:
+        redis.now_ms += ttl_ms + 1
+    else:
+        time.sleep(ttl_ms / 1000.0 + 0.1)
+
+
+@pytest.mark.parametrize("make", _redis_backends())
+def test_writer_lock_is_first_come_first_served(make):
+    redis, real = make()
+    holder = OperationCoordinator(redis, owner="holder", poll_interval_s=0.05, waiter_ttl_ms=300)
+    commit = OperationCoordinator(redis, owner="commit", poll_interval_s=0.05, waiter_ttl_ms=300)
+    poller = OperationCoordinator(redis, owner="poller", poll_interval_s=0.05, waiter_ttl_ms=300)
+    held = holder.acquire("put_model_routable")
+
+    # The drained commit starts waiting (joins the queue) while the lock is held.
+    with pytest.raises(OperationBusy):
+        commit._acquire_once("put_binding_power_commit", ticket="commit-ticket")
+    assert holder._finish(held.fence, {"operation_id": held.operation_id, "status": "succeeded"})
+
+    # A later caller - waiting (its own ticket) or not - does not jump the queue.
+    with pytest.raises(OperationBusy) as queued:
+        poller._acquire_once("reconcile", ticket="poller-ticket")
+    assert "queued:commit-ticket" in str(queued.value)
+    with pytest.raises(OperationBusy):
+        poller._acquire_once("reconcile")
+
+    granted = commit._acquire_once("put_binding_power_commit", ticket="commit-ticket")
+    assert granted.fence.owner == "commit"
+    assert commit._finish(granted.fence, {"operation_id": granted.operation_id, "status": "succeeded"})
+    # next in line
+    after = poller._acquire_once("reconcile", ticket="poller-ticket")
+    assert poller._finish(after.fence, {"operation_id": after.operation_id, "status": "succeeded"})
+
+
+@pytest.mark.parametrize("make", _redis_backends())
+def test_a_waiter_that_stops_polling_loses_its_place(make):
+    redis, real = make()
+    ghost = OperationCoordinator(redis, owner="ghost", poll_interval_s=0.05, waiter_ttl_ms=200)
+    other = OperationCoordinator(redis, owner="other", poll_interval_s=0.05, waiter_ttl_ms=200)
+    held = other.acquire("x")
+    with pytest.raises(OperationBusy):
+        ghost._acquire_once("y", ticket="ghost-ticket")  # queued, then the caller died
+    assert other._finish(held.fence, {"operation_id": held.operation_id, "status": "succeeded"})
+    with pytest.raises(OperationBusy):
+        other._acquire_once("z")
+    _expire_waiters(redis, real, 200)
+    handle = other._acquire_once("z")
+    assert other._finish(handle.fence, {"operation_id": handle.operation_id, "status": "succeeded"})
+
+
+@pytest.mark.parametrize("make", _redis_backends())
+def test_giving_up_leaves_the_queue(make):
+    redis, _real = make()
+    holder = OperationCoordinator(redis, owner="holder", poll_interval_s=0.02, waiter_ttl_ms=5_000)
+    waiter = OperationCoordinator(redis, owner="waiter", poll_interval_s=0.02, waiter_ttl_ms=5_000)
+    held = holder.acquire("x")
+    with pytest.raises(OperationBusy):
+        waiter.acquire("y", wait_s=0.1)  # times out and dequeues itself
+    assert holder._finish(held.fence, {"operation_id": held.operation_id, "status": "succeeded"})
+    handle = holder._acquire_once("z")  # nobody queued any more
+    assert holder._finish(handle.fence, {"operation_id": handle.operation_id, "status": "succeeded"})
+
+
+@pytest.mark.parametrize("make", _redis_backends())
+def test_a_starting_binding_phase_is_visible_to_the_startup_gate(make):
+    """Review 4 P1: the startup gate recognizes a Pod pre-authorized by the
+    writer-lock holder from the holder's journal record (phase + details), read
+    by ANOTHER process's coordinator while the lock is held."""
+    redis, _real = make()
+    holder = OperationCoordinator(redis, owner="holder", poll_interval_s=0.05, waiter_ttl_ms=300)
+    gate = OperationCoordinator(redis, owner="gate", poll_interval_s=0.05, waiter_ttl_ms=300)
+    with holder.operation("defrag", wait_s=0.0) as operation:
+        operation.advance("starting_binding", details={"binding_id": "m1/node-a/1"})
+        active = gate.active_operation()
+        assert (active["kind"], active["phase"]) == ("defrag", "starting_binding")
+        assert active["details"] == {"binding_id": "m1/node-a/1"}
+        operation.advance("starting_binding", details={"binding_id": "m1/node-a/1", "pod_uid": "uid-1"})
+        assert gate.active_operation()["details"]["pod_uid"] == "uid-1"
+        with pytest.raises(OperationBusy):
+            gate._acquire_once("startup_admit")
+        operation.advance("executing")
+        assert gate.active_operation()["phase"] == "executing"
+    assert gate.active_operation() is None

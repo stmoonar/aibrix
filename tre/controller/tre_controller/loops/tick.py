@@ -130,7 +130,13 @@ def run_planner_tick(
     prof: "TickProfiler | None" = None,
     loop: str = "tick",
     action_cooldown: bool = False,
+    observe_mode: bool = False,
 ) -> LoopTickResult:
+    """One planner tick. ``observe_mode`` (controller mode ``observe``, B8): the
+    plan is still computed and published, but no SafeScale probe is started or
+    preempted - the probe's state would change (hide, window, commit) while its
+    hide never reaches the cluster. Every other action is still submitted; the
+    ActionQueue drops it in observe mode (it never reaches the SM)."""
     if snapshot.stale:
         return LoopTickResult(submitted=0, events=("snapshot_stale",))
 
@@ -189,6 +195,7 @@ def run_planner_tick(
         cluster_view=cluster_view,
         cooldowns=_action_cooldowns(snapshot, queue) if action_cooldown else None,
         probe_backoff_models=_probe_backoff_models(safescale, snapshot.ts_ms),
+        preemptible_models=_preemptible_models(queue) if rescue_due else None,
     )
     if _prof_on:
         _plan_ns = time.perf_counter_ns() - _phase_t0
@@ -200,10 +207,12 @@ def run_planner_tick(
         safescale=safescale,
         cluster_view=cluster_view,
         contexts=contexts,
+        observe_mode=observe_mode,
     )
     if _prof_on:
         _safescale_ns = time.perf_counter_ns() - _phase_t0
         _phase_t0 = time.perf_counter_ns()
+    queue_events = _defrag_blocking_events(queue, actions) if rescue_due else ()
     if actions:
         queue.submit(actions)
     if _prof_on:
@@ -230,10 +239,33 @@ def run_planner_tick(
     return LoopTickResult(
         submitted=len(actions),
         actions=actions,
-        events=paper_events + dwell_events + tuple(plan.events) + safescale_events,
+        events=paper_events + dwell_events + tuple(plan.events) + safescale_events + queue_events,
         model_contexts=contexts,
         classifications={item.model_name: item for item in classifications},
     )
+
+
+def _defrag_blocking_events(queue: PlannerQueue, actions) -> tuple[str, ...]:
+    """Review 4 P3: a defrag in the queue conflicts with every other action, so
+    a rescue scale-up planned now waits until it finished (minutes). Not
+    re-planned around - made visible in the decision snapshot."""
+    active = getattr(queue, "cluster_action_active", None)
+    if not callable(active) or not active():
+        return ()
+    models = sorted(
+        {
+            getattr(action, "model", "")
+            for action in actions
+            if isinstance(action, ScaleAction) and action.delta > 0
+        }
+    )
+    return (f"rescue_waits_for_defrag:{','.join(models)}",) if models else ()
+
+
+def _preemptible_models(queue: PlannerQueue) -> set[str]:
+    """Models a rescue action may preempt in the queue (review 3 P2-3)."""
+    preemptible = getattr(queue, "preemptible_models", None)
+    return set(preemptible()) if callable(preemptible) else set()
 
 
 def _probe_backoff_models(safescale: SafeScaleController | None, now_ms: int) -> set[str]:
@@ -263,6 +295,7 @@ def _apply_safescale(
     safescale: SafeScaleController | None,
     cluster_view: ClusterView | None = None,
     contexts: dict[str, dict] | None = None,
+    observe_mode: bool = False,
 ) -> tuple[tuple[Action, ...], tuple[str, ...]]:
     if safescale is None:
         return actions, ()
@@ -270,6 +303,15 @@ def _apply_safescale(
     converted: list[Action] = []
     events: list[str] = []
     for action in actions:
+        if observe_mode:
+            # B8: never start (or preempt) a probe while paused. The planned
+            # scale-down is dropped here (it only runs as a probe); anything else
+            # goes to the queue, which drops it in observe mode.
+            if _requires_safescale_probe(action):
+                events.append(f"safescale_probe_skipped:{_safescale_probe_model(action)}:observe_mode")
+            else:
+                converted.append(action)
+            continue
         if isinstance(action, ScaleAction) and action.delta > 0:
             preempt = getattr(safescale, "request_preemption", None)
             restored = preempt(action.model, reason="receiver_need_upscale") if callable(preempt) else 0
@@ -437,8 +479,20 @@ def _commands_to_actions(commands: tuple[SafeScaleCommand, ...], *, source_loop:
         elif command.kind == "unhide":
             actions.append(UnhideAction(command.model, command.pods, command.reason, source_loop))
         elif command.kind in {"scale_down", "scale_up"}:
-            pods = command.pods if command.kind == "scale_down" else ()
-            actions.append(ScaleAction(command.model, command.delta, command.reason, source_loop, pods=pods))
+            if command.kind == "scale_down":
+                actions.append(
+                    ScaleAction(
+                        command.model,
+                        command.delta,
+                        command.reason,
+                        source_loop,
+                        pods=command.pods,
+                        sleep_path="safescale_commit",
+                        drain_budget_s=command.drain_budget_s,
+                    )
+                )
+            else:
+                actions.append(ScaleAction(command.model, command.delta, command.reason, source_loop))
     return tuple(actions)
 
 

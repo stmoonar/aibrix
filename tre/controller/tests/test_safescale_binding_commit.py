@@ -52,10 +52,11 @@ class InProcessServiceManager:
         self.service = service
         self.calls: list[tuple] = []
 
-    async def scale_model(self, model, delta):
+    async def scale_model(self, model, delta, **_kwargs):
         self.calls.append(("scale_model", model, delta))
         awake = self.service.get_state()["models"][model]["awake"]
-        self.service.put_model_target(model, wake_replicas=max(0, awake + int(delta)))
+        # Forward the sleep path / drain budget like the HTTP client does.
+        self.service.put_model_target(model, wake_replicas=max(0, awake + int(delta)), **_kwargs)
         return {"ok": True}
 
     async def set_routable(self, model, hidden_pods):
@@ -63,9 +64,9 @@ class InProcessServiceManager:
         self.service.put_model_routable(model, hidden_pods=list(hidden_pods))
         return {"ok": True}
 
-    async def set_binding_power(self, serve_id, *, awake):
+    async def set_binding_power(self, serve_id, *, awake, **_kwargs):
         self.calls.append(("set_binding_power", serve_id, awake))
-        self.service.put_binding_power(serve_id, awake=awake)
+        self.service.put_binding_power(serve_id, awake=awake, **_kwargs)
         return {"ok": True}
 
     async def defrag(self, migrations):

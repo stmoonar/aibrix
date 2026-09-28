@@ -69,6 +69,15 @@ class ScaleAction:
     # dispatcher sleeps exactly these bindings (binding-level power) instead of letting
     # the SM pick the tail of the model; for a safescale probe they are the pods to hide.
     pods: tuple[str, ...] = ()
+    # Sleep path for a negative delta (SM registry service_manager.sleep.budgets_s key):
+    # None = derived at dispatch ("urgent" for *_immediate reasons, else "scale_down").
+    sleep_path: str | None = None
+    # Soft drain budget (s) for the SM's hide -> ack -> drain -> /sleep; None = SM default.
+    drain_budget_s: float | None = None
+    # Donor -> receiver pair (review 2 P1-1): the donor sleep and the receiver wake of
+    # one rescue transfer carry the same id; the ActionQueue executes them as ONE
+    # compound action (sleep the donor, and only on success wake the receiver).
+    transfer_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -85,6 +94,13 @@ class UnhideAction:
     pods: tuple[str, ...]
     reason: str
     source_loop: SourceLoop
+    #: Pods that stay hidden (review 4 P2-2): a donor pod whose /sleep was sent
+    #: but never confirmed may be asleep - routing is not reopened on it (the
+    #: service-manager's crash recovery resolves it).
+    keep_hidden: tuple[str, ...] = ()
+    #: The SafeScale probe this unhide resolves (review 4 P2-4), if any
+    #: (bookkeeping only: not part of the action's identity).
+    request_id: str | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True)
@@ -108,6 +124,118 @@ Action = ScaleAction | HideAction | UnhideAction | DefragAction | ShrinkForSlotA
 
 
 @dataclass(frozen=True)
+class TransferAction:
+    """A donor-sleep -> receiver-wake pair executed in order by one dispatch worker
+    (review 2 P1-1). Built by :func:`fuse_transfers` from two ScaleActions that share
+    a ``transfer_id``; never produced by the planner itself (its output stays two
+    ScaleActions, which the decision log / tests inspect)."""
+
+    donor: ScaleAction
+    receiver: ScaleAction
+    source_loop: SourceLoop = "rescue"
+
+    @property
+    def model(self) -> str:
+        return self.receiver.model
+
+
+@dataclass(frozen=True)
+class ReceiverTarget:
+    """A SafeScale follow-up upscale as an ABSOLUTE target (review 3 P2-1). A
+    retry re-sends the same target, so an SM call that succeeded but timed out
+    on the client is never applied twice. ``target`` None (the planned form,
+    review 4 P2-1): resolved ONCE at the first dispatch from the SM's current
+    awake count (never from a possibly stale cluster view) plus ``delta``,
+    capped at ``cap`` (the scaling cap), then frozen."""
+
+    model: str
+    delta: int
+    target: int | None = None
+    cap: int | None = None
+
+
+@dataclass(frozen=True)
+class SafeScaleCommitAction:
+    """One SafeScale commit batch (review 3 P2-1..P2-3), executed by the
+    ActionQueue as an ordered one-shot unit - the SafeScale analogue of
+    :class:`TransferAction`:
+
+    1. revalidate against the CURRENT signal state (before every (re)try): the
+       donor now needing capacity abandons the commit (its hidden pods are
+       unhidden instead); a receiver that no longer needs capacity loses its
+       upscale;
+    2. sleep exactly the hidden probe pods of the donor;
+    3. only then wake the receivers, each to its absolute ``target`` (dropped
+       if the donor sleep failed).
+
+    ``donor_done`` records progress across retries (a retry never re-sleeps a
+    donor that already slept, and only re-sends the upscales still pending)."""
+
+    donor: str
+    pods: tuple[str, ...]
+    reason: str
+    upscales: tuple[ReceiverTarget, ...] = ()
+    drain_budget_s: float | None = None
+    request_id: str | None = None
+    source_loop: SourceLoop = "safescale"
+    donor_done: bool = False
+    #: Donor pods whose /sleep was sent but never confirmed (from the SM's
+    #: failure outcomes, review 4 P2-2): never unhidden by an abandon / preempt.
+    unconfirmed_pods: tuple[str, ...] = ()
+    #: Epoch ms of the SafeScale decision (the probe's ``committing_ts``), None =
+    #: unknown. B8: a commit first dispatched more than ``commit_max_age_ms`` after
+    #: it (held in observe mode, recovered after a restart) becomes the donor unhide.
+    #: Metadata, not part of the action's identity (not compared).
+    decided_ms: int | None = field(default=None, compare=False)
+
+    @property
+    def model(self) -> str:
+        return self.donor
+
+    @property
+    def touched_models(self) -> tuple[str, ...]:
+        """Models this commit still changes (the donor until it slept)."""
+        models = () if self.donor_done else (self.donor,)
+        return tuple(dict.fromkeys(models + tuple(item.model for item in self.upscales)))
+
+    def donor_sleep(self) -> ScaleAction:
+        return ScaleAction(
+            self.donor,
+            -len(self.pods),
+            self.reason,
+            self.source_loop,
+            pods=self.pods,
+            sleep_path="safescale_commit",
+            drain_budget_s=self.drain_budget_s,
+        )
+
+
+def fuse_transfers(actions) -> list:
+    """Replace each donor/receiver ScaleAction pair sharing a ``transfer_id`` by one
+    :class:`TransferAction` (at the donor's position). A half whose partner is
+    missing (e.g. dropped by a probe preemption) stays a plain ScaleAction."""
+    fused: list = []
+    donors: dict[str, int] = {}
+    for action in actions:
+        transfer_id = action.transfer_id if isinstance(action, ScaleAction) else None
+        if transfer_id is None:
+            fused.append(action)
+            continue
+        if action.delta < 0:
+            donors[transfer_id] = len(fused)
+            fused.append(action)
+            continue
+        index = donors.pop(transfer_id, None)
+        if index is None:
+            fused.append(action)
+            continue
+        fused[index] = TransferAction(
+            donor=fused[index], receiver=action, source_loop=action.source_loop
+        )
+    return fused
+
+
+@dataclass(frozen=True)
 class PlanResult:
     actions: list[Action]
     delayed_down_models: set[str] = field(default_factory=set)
@@ -128,8 +256,13 @@ def build_plan(
     cluster_view: ClusterView | None = None,
     cooldowns: Mapping[str, str] | None = None,
     probe_backoff_models: set[str] | None = None,
+    preemptible_models: set[str] | None = None,
 ) -> PlanResult:
     active_probe_models = active_probe_models or set()
+    # Review 3 P2-3: models whose only in-flight work is a SafeScale commit waiting
+    # out a retry backoff. A CRITICAL receiver among them is still planned: the
+    # queue preempts that retry when the rescue action is submitted.
+    preemptible_models = preemptible_models or set()
     # A13: models whose last SafeScale probe rolled back recently (no new HIGH proactive
     # probe until TRE_SAFESCALE_ROLLBACK_BACKOFF_MS has passed).
     probe_backoff_models = probe_backoff_models or set()
@@ -207,7 +340,7 @@ def build_plan(
 
     if cfg.rescue_due:
         for recv in critical_receivers:
-            if recv.model_name in inflight_models:
+            if recv.model_name in inflight_models and recv.model_name not in preemptible_models:
                 continue
             if cooldown.blocks(recv.model_name, "up", critical=True):
                 continue
@@ -346,6 +479,9 @@ def build_plan(
                 )
                 if transfer <= 0:
                     continue
+                # One transfer: the receiver's wake needs the GPU the donor's sleep
+                # frees, so the queue runs the pair in order as one compound action.
+                transfer_id = f"{donor.model_name}->{recv.model_name}#{len(actions)}"
                 _add_scale_action(
                     actions,
                     deltas,
@@ -356,6 +492,7 @@ def build_plan(
                     donor=donor.model_name,
                     receiver=recv.model_name,
                     pods=donor_slot_pods,
+                    transfer_id=transfer_id,
                 )
                 _add_scale_action(
                     actions,
@@ -367,6 +504,7 @@ def build_plan(
                     donor=donor.model_name,
                     receiver=recv.model_name,
                     pods=receiver_slot_pods,
+                    transfer_id=transfer_id,
                 )
                 still_needed -= transfer
 
@@ -1048,6 +1186,7 @@ def _add_scale_action(
     receiver: str | None = None,
     donor: str | None = None,
     pods: tuple[str, ...] = (),
+    transfer_id: str | None = None,
 ) -> None:
     if delta == 0:
         return
@@ -1062,6 +1201,7 @@ def _add_scale_action(
             receiver=receiver,
             donor=donor,
             pods=tuple(pods),
+            transfer_id=transfer_id,
         )
     )
 

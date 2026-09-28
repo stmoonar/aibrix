@@ -71,6 +71,8 @@ class SafeScaleCommand:
     pods: tuple[str, ...] = ()
     delta: int = 0
     reason: str = ""
+    #: scale_down (commit) only: the SM drain budget (s) for the hidden probe pods.
+    drain_budget_s: float | None = None
 
 
 @dataclass(frozen=True)
@@ -89,7 +91,10 @@ class SafeScaleProbe:
     start_ms: int
     deadline_ms: int
     request_id: str
-    status: Literal["probing"] = "probing"
+    #: "probing" (observed every tick) or "committing" (review 4 P2-4): its
+    #: commit / rollback was handed to the action queue; resolved only when the
+    #: queue finished it. A committing probe still owns its hidden pods.
+    status: Literal["probing", "committing"] = "probing"
     pending_upscales: dict[str, int] = field(default_factory=dict)
     observations: tuple[ProbeObservation, ...] = ()
     #: Adaptive window W (ms) and its breakdown (calc_probe_window_details), for reports.
@@ -102,6 +107,13 @@ class SafeScaleProbe:
     #: v1 receiver_need_upscale: the model itself now needs capacity; the next
     #: observation rolls the probe back with this reason.
     preempt_reason: str | None = None
+    #: While committing: the decision handed to the queue ("commit" / "rollback").
+    resolution: str | None = None
+    resolution_reason: str | None = None
+    #: While committing: when the decision was made (ms, snapshot clock = epoch ms;
+    #: persisted as ``committing_ts`` in s). B8: the queue refuses to act on a commit
+    #: whose decision is older than ``commit_max_age_ms`` at its first dispatch.
+    committing_ms: int | None = None
 
 
 @dataclass(frozen=True)
@@ -124,19 +136,83 @@ class SafeScaleStateMachine:
         # extra HIGH probe per model right after a restart (the probe itself is still
         # guarded by SLO / donor-health / commit gate). Not worth a persisted schema.
         self._last_rollback_ms: dict[str, int] = {}
+        #: request_id -> committing-probe recoveries submitted by this process.
+        self._recoveries: dict[str, int] = {}
 
     def active_probe(self, model: str) -> SafeScaleProbe | None:
         return self._probes.get(model)
 
     def active_probes(self) -> tuple[SafeScaleProbe, ...]:
+        """Probes still observed (status ``probing``)."""
+        return tuple(probe for probe in self._probes.values() if probe.status == "probing")
+
+    def committing_probes(self) -> tuple[SafeScaleProbe, ...]:
+        """Probes whose resolution the action queue has not finished yet."""
+        return tuple(probe for probe in self._probes.values() if probe.status == "committing")
+
+    def all_probes(self) -> tuple[SafeScaleProbe, ...]:
+        """Every unresolved probe, probing or committing."""
         return tuple(self._probes.values())
+
+    def busy_models(self) -> set[str]:
+        """Models with a probe in any state: their hidden pods are the probe's
+        (never planner donors, no new probe) until it is resolved."""
+        return set(self._probes)
+
+    def mark_committing(
+        self,
+        model: str,
+        *,
+        status: Literal["commit", "rollback"],
+        reason: str,
+        now_ms: int,
+    ) -> bool:
+        """The probe's commit / rollback was accepted by the action queue (review
+        4 P2-4): persist it as ``committing`` (with the decision) and stop
+        observing it; :meth:`resolve_request` resolves it once the queue is done.
+        A controller restart finds it in the store and re-submits the decision."""
+        probe = self._probes.get(model)
+        if probe is None:
+            return False
+        probe = replace(
+            probe, status="committing", resolution=status, resolution_reason=reason, committing_ms=int(now_ms)
+        )
+        self._probes[model] = probe
+        if self._store is not None:
+            # committing_ts is written by _probe_record (from committing_ms).
+            self._store.save_probe(probe.request_id, _probe_record(probe, terminal_reason=reason, status="committing"))
+        return True
+
+    def resolve_request(
+        self,
+        request_id: str,
+        *,
+        status: Literal["commit", "rollback"],
+        reason: str,
+        now_ms: int,
+    ) -> bool:
+        """Resolve the probe ``request_id`` (the action queue finished it)."""
+        for model, probe in list(self._probes.items()):
+            if probe.request_id == request_id:
+                self._recoveries.pop(request_id, None)
+                return self.resolve(model, status=status, reason=reason, now_ms=now_ms)
+        return False
+
+    def note_recovery(self, request_id: str, *, max_attempts: int = 5) -> bool:
+        """Count one re-submission of a committing probe; False once
+        ``max_attempts`` were made (the caller then resolves it)."""
+        attempts = self._recoveries.get(request_id, 0) + 1
+        self._recoveries[request_id] = attempts
+        return attempts <= max_attempts
 
     def request_preemption(self, model: str, *, reason: str = "receiver_need_upscale") -> int:
         """v1 apply_safescale_to_deltas: a scale-up of a model that is itself probing rolls
         its probe back first. Marks the probe; its next observation returns the rollback
         (unhide, reason ``reason``). Returns how many pods that restores (0 = no probe)."""
         probe = self._probes.get(model)
-        if probe is None:
+        if probe is None or probe.status != "probing":
+            # A committing probe is no longer observed: its rollback would never
+            # be issued. The action queue preempts a committing commit itself.
             return 0
         if probe.preempt_reason is None:
             probe = replace(probe, preempt_reason=reason)
@@ -196,6 +272,8 @@ class SafeScaleStateMachine:
         probe = self._probes.get(model)
         if probe is None:
             return SafeScaleDecision(status="none", reason="probe_not_found")
+        if probe.status != "probing":
+            return SafeScaleDecision(status="none", reason="probe_committing")
 
         updated = _with_gateway_baseline(
             _replace_observations(probe, probe.observations + (observation,)), observation
@@ -274,6 +352,11 @@ class SafeScaleStateMachine:
                 pods=probe.pods,
                 delta=-len(probe.pods),
                 reason=reason,
+                # Plan D1: the commit drains the (already hidden) probe pods for
+                # up to one probe window before /sleep; SM caps it at the route timeout.
+                drain_budget_s=(
+                    float(probe.window_ms) / 1000.0 if probe.window_ms else None
+                ),
             )
         ]
         for model, delta in sorted(probe.pending_upscales.items()):
@@ -324,7 +407,10 @@ class SafeScaleStateMachine:
     def _persist_probe(self, probe: SafeScaleProbe, *, terminal_reason: str | None = None) -> None:
         if self._store is None:
             return
-        self._store.save_probe(probe.request_id, _probe_record(probe, terminal_reason=terminal_reason))
+        self._store.save_probe(
+            probe.request_id,
+            _probe_record(probe, terminal_reason=terminal_reason, status=probe.status),
+        )
 
     def _persist_observation(self, probe: SafeScaleProbe, observation: ProbeObservation) -> None:
         if self._store is None:
@@ -654,6 +740,11 @@ def _probe_record(
         "gateway_baseline": list(probe.gateway_baseline) if probe.gateway_baseline is not None else None,
         "preempt_reason": probe.preempt_reason,
     }
+    if probe.resolution is not None and status == "committing":
+        record["resolution"] = probe.resolution
+        record["resolution_reason"] = probe.resolution_reason
+        if probe.committing_ms is not None:
+            record["committing_ts"] = float(probe.committing_ms) / 1000.0
     if resolution is not None:
         record["resolution"] = resolution
     if resolved_ts is not None:
@@ -709,7 +800,23 @@ def _probe_from_record(row: dict[str, Any], store: ProbeStore) -> SafeScaleProbe
         window_terms=dict(row["window_terms"]) if isinstance(row.get("window_terms"), dict) else {},
         gateway_baseline=_baseline_from_record(row.get("gateway_baseline")),
         preempt_reason=str(row["preempt_reason"]) if row.get("preempt_reason") else None,
+        **_committing_fields(row),
     )
+
+
+def _committing_fields(row: dict[str, Any]) -> dict[str, Any]:
+    """A probe persisted as ``committing`` (review 4 P2-4) is restored as such,
+    with the decision that was handed to the action queue."""
+    if str(row.get("status", "probing")) != "committing" or row.get("resolution") not in ("commit", "rollback"):
+        return {}
+    committing_ts = _optional_float(row.get("committing_ts"))
+    return {
+        "status": "committing",
+        "resolution": str(row["resolution"]),
+        "resolution_reason": str(row.get("resolution_reason") or row.get("terminal_reason") or ""),
+        # B8: the decision time survives a restart, so a recovered commit is aged.
+        "committing_ms": int(committing_ts * 1000.0) if committing_ts is not None else None,
+    }
 
 
 def _baseline_from_record(raw: Any) -> tuple[float, float] | None:

@@ -11,7 +11,7 @@ class FakeServiceManagerClient:
     def __init__(self) -> None:
         self.calls: list[tuple] = []
 
-    async def scale_model(self, model: str, delta: int) -> dict:
+    async def scale_model(self, model: str, delta: int, **_kwargs) -> dict:
         self.calls.append(("scale", model, delta))
         return {"ok": True}
 
@@ -84,7 +84,7 @@ def test_action_queue_dispatches_scale_hide_unhide_and_defrag_actions() -> None:
 
 def test_action_queue_releases_failed_model_after_dispatch_attempt() -> None:
     class FailingClient(FakeServiceManagerClient):
-        async def scale_model(self, model: str, delta: int) -> dict:
+        async def scale_model(self, model: str, delta: int, **_kwargs) -> dict:
             self.calls.append(("scale", model, delta))
             return {"ok": False, "error": "boom"}
 

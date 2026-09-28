@@ -2,9 +2,12 @@
 #  1. metrics scraper: background pod discovery + vLLM /metrics scrape loop
 #     (AIBRIX_POD_METRIC_REFRESH_INTERVAL_MS=50, as v1) writing zm keys to
 #     tre-v2-redis, which the controller reads;
-#  2. ext_proc router (:50052) for requests carrying `routing-strategy` on the
-#     tre-v2 gateway (gateway-extproc.yaml): least-gpu-cache picks the awake pod
-#     with the lowest vllm:gpu_cache_usage_perc, as v1 did.
+#  2. ext_proc router (:50052) for every inference request on the tre-v2 gateway
+#     (gateway-extproc.yaml): least-gpu-cache (header or ROUTING_ALGORITHM) picks the
+#     awake pod with the lowest vllm:gpu_cache_usage_perc, as v1 did;
+#  3. transparent-sleep coordination with the service-manager (plan 2026-09-27 D3/D4):
+#     heartbeat in tre:v2:gw:instances, route-gen acks in tre:v2:gw:seen:<pod>,
+#     per-pod in-flight counts in tre:v2:gw:inflight:<pod> (tre-v2-redis).
 # Exactly ONE replica, as in v1: the scrape loop is not leader-elected, so a
 # second replica would double-write every tre:v2:inst/hist doc.
 apiVersion: v1
@@ -81,7 +84,7 @@ spec:
         - name: gateway-plugins
           # Built by deploy/scripts/build_gateway_plugins_nozmq.sh (same recipe as the
           # previous 20260704-0d869b49-nozmq2; adds TRE-PATCH P2-GW-004/005/006).
-          image: aibrix/gateway-plugins:20260924-43aa0c31-nozmq2
+          image: aibrix/gateway-plugins:20260927-849bba24-nozmq2
           imagePullPolicy: IfNotPresent
           # Same gRPC probes as the v1 aibrix-gateway-plugins (relaxed timings that
           # stopped restarts under load): the Service only gets an endpoint, and
@@ -136,6 +139,18 @@ spec:
             # Stamp the body model onto the `model` header so v1-style clients that
             # send only routing-strategy land on their per-model ORIGINAL_DST cluster.
             - name: TRE_ROUTE_MODEL_HEADER
+              value: "true"
+            # D10: requests without a routing-strategy header are routed by ext_proc
+            # with this strategy instead of bypassing it (one sleep-aware path). The
+            # upstream variable, so older plugin images behave the same.
+            - name: ROUTING_ALGORITHM
+              value: least-gpu-cache
+            # D3/D4: heartbeat, route-gen acks and in-flight mirror for the
+            # service-manager's hide -> ack -> drain -> sleep sequence. Timings keep the
+            # contract defaults (heartbeat 2s, key TTL 300s, refresh 30s). Fail-closed:
+            # the plugin exits if coordination cannot start (Redis / apiserver
+            # unreachable for TRE_GW_STARTUP_TIMEOUT, default 60s).
+            - name: TRE_GW_COORDINATION
               value: "true"
             # The one deliberate difference from v1 (which had HOT_SWITCH=1 plus
             # SERVEMENT_URL). In v1, under least-gpu-cache, HOT_SWITCH=1 only kept a

@@ -25,6 +25,7 @@ import (
 	"mime"
 	"mime/multipart"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/bytedance/sonic"
@@ -156,13 +157,21 @@ func parseResponsesInput(requestID string, input json.RawMessage) (string, *extP
 // validateRequestBody validates input by unmarshaling request body into respective openai-golang struct based on requestpath.
 // The per-path parsing is delegated to dedicated validate* helpers to keep this dispatcher simple.
 func validateRequestBody(requestID, requestPath string, requestBody []byte, user utils.User) (model, message string, stream bool, errRes *extProcPb.ProcessingResponse) {
+	model, message, stream, _, errRes = validateRequestBodyWithTokens(requestID, requestPath, requestBody, user)
+	return
+}
+
+// validateRequestBodyWithTokens is validateRequestBody that also returns the prompt token
+// ids of a token-id completions prompt (nil otherwise).
+// nolint:nakedret
+func validateRequestBodyWithTokens(requestID, requestPath string, requestBody []byte, user utils.User) (model, message string, stream bool, tokenIDs []int, errRes *extProcPb.ProcessingResponse) {
 	switch requestPath {
 	case PathChatCompletions, PathMessages:
 		model, message, stream, errRes = validateChatRequest(requestID, requestPath, requestBody, user)
 	case PathResponses:
 		model, message, stream, errRes = validateResponsesRequest(requestID, requestBody)
 	case PathCompletions:
-		model, message, stream, errRes = validateCompletionRequest(requestID, requestBody)
+		model, message, stream, tokenIDs, errRes = validateCompletionRequestWithTokens(requestID, requestBody)
 	case PathEmbeddings:
 		model, errRes = validateEmbeddingRequest(requestID, requestBody)
 	case PathImagesGenerations, PathVideoGenerations:
@@ -246,12 +255,22 @@ func validateResponsesRequest(requestID string, requestBody []byte) (model, mess
 // validateCompletionRequest parses and validates a legacy completions request body.
 // nolint:nakedret
 func validateCompletionRequest(requestID string, requestBody []byte) (model, message string, stream bool, errRes *extProcPb.ProcessingResponse) {
-	// openai.CompletionsNewParams does not support json unmarshal for CompletionNewParamsPromptUnion in release v0.1.0-beta.10
-	// once supported, input request will be directly unmarshal into openai.CompletionsNewParams
+	model, message, stream, _, errRes = validateCompletionRequestWithTokens(requestID, requestBody)
+	return
+}
+
+// validateCompletionRequestWithTokens is validateCompletionRequest that also accepts the
+// OpenAI array prompt forms (TRE-PATCH P3-GW-010, D6: token-id continuation prompts):
+// a string, an array of strings, an array of token ids, or an array of token-id arrays.
+// For token-id prompts it returns the ids (concatenated for a batch) so routing counts
+// len(ids) tokens; message is then the ids rendered as space-separated decimals, which
+// keeps prefix-based routers deterministic.
+// nolint:nakedret
+func validateCompletionRequestWithTokens(requestID string, requestBody []byte) (model, message string, stream bool, tokenIDs []int, errRes *extProcPb.ProcessingResponse) {
 	type Completion struct {
-		Prompt string `json:"prompt"`
-		Model  string `json:"model"`
-		Stream bool   `json:"stream"`
+		Prompt json.RawMessage `json:"prompt"`
+		Model  string          `json:"model"`
+		Stream bool            `json:"stream"`
 	}
 	completionObj := Completion{}
 	if err := sonic.Unmarshal(requestBody, &completionObj); err != nil {
@@ -259,10 +278,89 @@ func validateCompletionRequest(requestID string, requestBody []byte) (model, mes
 		errRes = buildErrorResponse(envoyTypePb.StatusCode_BadRequest, "error processing request body", "", "", HeaderErrorRequestBodyProcessing, "true")
 		return
 	}
+	var err error
+	if message, tokenIDs, err = parseCompletionPrompt(completionObj.Prompt); err != nil {
+		klog.ErrorS(err, "invalid completions prompt", "requestID", requestID)
+		errRes = buildErrorResponse(envoyTypePb.StatusCode_BadRequest, err.Error(), "", "prompt", HeaderErrorRequestBodyProcessing, "true")
+		return
+	}
 	model = completionObj.Model
-	message = completionObj.Prompt
 	stream = completionObj.Stream
 	return
+}
+
+// parseCompletionPrompt decodes the completions "prompt" field. Absent/null yields "".
+func parseCompletionPrompt(raw json.RawMessage) (string, []int, error) {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || string(raw) == "null" {
+		return "", nil, nil
+	}
+	errShape := errors.New("'prompt' must be a string, an array of strings, an array of token ids or an array of token-id arrays")
+	switch raw[0] {
+	case '"':
+		var s string
+		if err := sonic.Unmarshal(raw, &s); err != nil {
+			return "", nil, errShape
+		}
+		return s, nil, nil
+	case '[':
+	default:
+		return "", nil, errShape
+	}
+	var items []json.RawMessage
+	if err := sonic.Unmarshal(raw, &items); err != nil {
+		return "", nil, errShape
+	}
+	if len(items) == 0 {
+		return "", nil, errors.New("'prompt' array cannot be empty")
+	}
+	first := bytes.TrimSpace(items[0])
+	if len(first) == 0 {
+		return "", nil, errShape
+	}
+	switch first[0] {
+	case '"':
+		var strs []string
+		if err := sonic.Unmarshal(raw, &strs); err != nil {
+			return "", nil, errShape
+		}
+		return strings.Join(strs, " "), nil, nil
+	case '[':
+		var batches [][]int
+		if err := sonic.Unmarshal(raw, &batches); err != nil {
+			return "", nil, errShape
+		}
+		ids := make([]int, 0)
+		var b strings.Builder
+		for i, batch := range batches {
+			if len(batch) == 0 {
+				return "", nil, errors.New("'prompt' token-id arrays cannot be empty")
+			}
+			if i > 0 {
+				b.WriteByte(' ')
+			}
+			writeTokenIDs(&b, batch)
+			ids = append(ids, batch...)
+		}
+		return b.String(), ids, nil
+	default:
+		var ids []int
+		if err := sonic.Unmarshal(raw, &ids); err != nil {
+			return "", nil, errShape
+		}
+		var b strings.Builder
+		writeTokenIDs(&b, ids)
+		return b.String(), ids, nil
+	}
+}
+
+func writeTokenIDs(b *strings.Builder, ids []int) {
+	for i, id := range ids {
+		if i > 0 {
+			b.WriteByte(' ')
+		}
+		b.WriteString(strconv.Itoa(id))
+	}
 }
 
 // validateEmbeddingRequest parses and validates an embeddings request body.
@@ -535,6 +633,14 @@ func deriveRoutingStrategyFromContext(routingCtx *types.RoutingContext) (string,
 		}
 	}
 	// Fallback to environment default
+	if defaultRoutingStrategyEnabled && strings.TrimSpace(defaultRoutingStrategy) != "" {
+		return defaultRoutingStrategy, true
+	}
+	// TRE-PATCH(P3-GW-011, D10): last resort, so that requests without a strategy still get
+	// ext_proc pod selection (TRE_DEFAULT_ROUTING_STRATEGY; empty/none keeps upstream).
+	if treDefaultRoutingStrategy != "" {
+		return treDefaultRoutingStrategy, true
+	}
 	return defaultRoutingStrategy, defaultRoutingStrategyEnabled
 }
 

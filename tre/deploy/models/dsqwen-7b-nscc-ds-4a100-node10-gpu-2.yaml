@@ -40,9 +40,13 @@ spec:
       - name: models-volume
         hostPath:
           path: /data
+      - name: tre-reissue-sidecar
+        configMap:
+          name: tre-reissue-sidecar
+          defaultMode: 292
       initContainers:
       - name: tre-startup-gate
-        image: vllm/vllm-openai:0.10.1-sleep
+        image: vllm-openai-tre:0.30.0-ts-02ad6c9e
         imagePullPolicy: IfNotPresent
         command:
         - python3
@@ -67,16 +71,16 @@ spec:
               fieldPath: metadata.uid
       containers:
       - name: vllm-openai
-        image: vllm/vllm-openai:0.10.1-sleep
+        image: vllm-openai-tre:0.30.0-ts-02ad6c9e
         imagePullPolicy: IfNotPresent
         command:
         - python3
         - -m
         - vllm.entrypoints.openai.api_server
         - --host
-        - 0.0.0.0
+        - 127.0.0.1
         - --port
-        - '8000'
+        - '8001'
         - --uvicorn-log-level
         - warning
         - --model
@@ -90,10 +94,10 @@ spec:
         - --enable-chunked-prefill
         - --max-num-batched-tokens
         - '2048'
-        - --swap-space
-        - '16'
         - --gpu-memory-utilization
         - '0.85'
+        - --sleep-reject-new
+        - --abort-return-token-ids
         env:
         - name: NVIDIA_VISIBLE_DEVICES
           value: GPU-28af749d-4081-d7b6-0c14-cf9c29aa213d
@@ -103,8 +107,43 @@ spec:
           value: '1'
         - name: VLLM_WORKER_MULTIPROC_METHOD
           value: spawn
-        - name: VLLM_USE_MODELSCOPE
-          value: 'True'
+        - name: HF_HUB_OFFLINE
+          value: '1'
+        resources: {}
+        volumeMounts:
+        - name: shm
+          mountPath: /dev/shm
+        - name: models-volume
+          mountPath: /data
+      - name: tre-reissue-sidecar
+        image: vllm-openai-tre:0.30.0-ts-02ad6c9e
+        imagePullPolicy: IfNotPresent
+        command:
+        - python3
+        - /opt/tre-reissue/sidecar.py
+        env:
+        - name: TRE_REISSUE_LISTEN_PORT
+          value: '8000'
+        - name: TRE_REISSUE_UPSTREAM_URL
+          value: http://127.0.0.1:8001
+        - name: TRE_GATEWAY_URL
+          value: http://tre-gateway.envoy-gateway-system.svc.cluster.local:80
+        - name: TRE_REISSUE_MODEL
+          value: dsqwen-7b
+        - name: TRE_REISSUE_MAX_DEPTH
+          value: '3'
+        - name: TRE_REISSUE_RETRY_ATTEMPTS
+          value: '4'
+        - name: TRE_REISSUE_REQUIRE_HIDDEN_HEADER
+          value: 'true'
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: NVIDIA_VISIBLE_DEVICES
+          value: void
+        - name: PYTHONUNBUFFERED
+          value: '1'
         ports:
         - containerPort: 8000
           protocol: TCP
@@ -115,9 +154,14 @@ spec:
           periodSeconds: 2
           timeoutSeconds: 2
           failureThreshold: 300
-        resources: {}
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            cpu: 500m
+            memory: 256Mi
         volumeMounts:
-        - name: shm
-          mountPath: /dev/shm
-        - name: models-volume
-          mountPath: /data
+        - name: tre-reissue-sidecar
+          mountPath: /opt/tre-reissue
+          readOnly: true

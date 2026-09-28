@@ -12,14 +12,19 @@
 # (EnvoyPatchPolicy is already enabled cluster-wide: envoy-gateway-config
 # extensionApis.enableEnvoyPatchPolicy=true).
 #
-# Request flow with a `routing-strategy` header:
-#   route tre-original-route/<model> (routing-strategy + model header, patched in at the
-#   top of the route table) -> ext_proc tre-gateway-plugins:50052 picks a
-#   tre.aibrix.io/routable=true pod (TRE_ROUTABLE_LABEL_FILTER) and sets `target-pod`
-#   -> cluster httproute/tre-v2/<model>-router/rule/original-dst (ORIGINAL_DST on the
-#   target-pod header).
-# Without the header nothing changes: the generated per-model HTTPRoutes still send the
-# request to the model Service (EDS, LEAST_REQUEST, 600s), which no experiment uses.
+# Request flow (every inference POST - the /v1 paths the plugin parses, see the route
+# regex below - with or without a `routing-strategy` header):
+#   route tre-original-route/<model> (POST + inference path + model header, patched in at
+#   the top of the route table) -> ext_proc tre-gateway-plugins:50052 picks a
+#   tre.aibrix.io/routable=true pod (TRE_ROUTABLE_LABEL_FILTER) and sets `target-pod` ->
+#   cluster httproute/tre-v2/<model>-router/rule/original-dst (ORIGINAL_DST on the
+#   target-pod header). A request without the header is routed with the plugin's
+#   upstream ROUTING_ALGORITHM default (least-gpu-cache, gateway-plugins.yaml), so there
+#   is exactly one sleep-aware routing path (plan 2026-09-27 D10); every gateway-plugins
+#   image honours ROUTING_ALGORITHM, so this also holds for images older than D10.
+#   Everything else (GETs such as /v1/models, and POSTs the plugin does not parse, e.g.
+#   /v1/load_lora_adapter, /score, /pooling) keeps the generated per-model HTTPRoutes
+#   (model Service, EDS LEAST_REQUEST) it used before D10, instead of a plugin 501.
 #
 # The two deliberate structural differences from v1 (values are v1's):
 # One ORIGINAL_DST cluster PER MODEL instead of v1's single shared one, so that
@@ -249,7 +254,10 @@ spec:
     # ---- routes: each add at index 0 prepends, so the unattributed catch-all goes in
     # first and ends up BELOW the per-model routes (Envoy takes the first match). Final
     # order: routes 0-2 = 14b, 8b, 7b; route 3 = unattributed. v1 route values: prefix
-    # /v1, routing-strategy header regex .*, timeout 120s, ext_proc enabled per route.
+    # /v1, timeout 120s, ext_proc enabled per route. v1 also required a routing-strategy
+    # header (regex .*); D10 replaces that with `:method: POST` plus the inference paths
+    # the plugin parses (pkg/plugins/gateway validateRequestBody), so header-less
+    # inference requests are ext_proc-routed too while everything else keeps its route.
     - type: type.googleapis.com/envoy.config.route.v3.RouteConfiguration
       name: tre-v2/tre-aibrix-eg/http
       operation:
@@ -258,12 +266,12 @@ spec:
         value:
           name: tre-original-route/unattributed
           match:
-            prefix: /v1
+            safe_regex:
+              regex: "^/v1/(completions|chat/completions|responses|messages|embeddings|rerank|classify|images/generations|video/generations|audio/transcriptions|audio/translations)$"
             headers:
-              - name: routing-strategy
+              - name: ":method"
                 string_match:
-                  safe_regex:
-                    regex: .*
+                  exact: POST
           route:
             cluster: tre-v2/original-dst/unattributed
             timeout: 120s
@@ -279,12 +287,12 @@ spec:
         value:
           name: tre-original-route/dsqwen-7b
           match:
-            prefix: /v1
+            safe_regex:
+              regex: "^/v1/(completions|chat/completions|responses|messages|embeddings|rerank|classify|images/generations|video/generations|audio/transcriptions|audio/translations)$"
             headers:
-              - name: routing-strategy
+              - name: ":method"
                 string_match:
-                  safe_regex:
-                    regex: .*
+                  exact: POST
               - name: model
                 string_match:
                   exact: dsqwen-7b
@@ -303,12 +311,12 @@ spec:
         value:
           name: tre-original-route/dsllama-8b
           match:
-            prefix: /v1
+            safe_regex:
+              regex: "^/v1/(completions|chat/completions|responses|messages|embeddings|rerank|classify|images/generations|video/generations|audio/transcriptions|audio/translations)$"
             headers:
-              - name: routing-strategy
+              - name: ":method"
                 string_match:
-                  safe_regex:
-                    regex: .*
+                  exact: POST
               - name: model
                 string_match:
                   exact: dsllama-8b
@@ -327,12 +335,12 @@ spec:
         value:
           name: tre-original-route/dsqwen-14b
           match:
-            prefix: /v1
+            safe_regex:
+              regex: "^/v1/(completions|chat/completions|responses|messages|embeddings|rerank|classify|images/generations|video/generations|audio/transcriptions|audio/translations)$"
             headers:
-              - name: routing-strategy
+              - name: ":method"
                 string_match:
-                  safe_regex:
-                    regex: .*
+                  exact: POST
               - name: model
                 string_match:
                   exact: dsqwen-14b

@@ -129,6 +129,10 @@ func (c *Store) addPod(obj interface{}) {
 		return
 	}
 
+	// TRE-PATCH(P3-GW-008): deferred before the lock so it runs after c.mu.Unlock (LIFO),
+	// i.e. only once the new pod object is visible to routing.
+	defer notifyTREPodObserver(nil, pod)
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -164,6 +168,18 @@ func (c *Store) updatePod(oldObj interface{}, newObj interface{}) {
 		return // No model information to track in either old or new pod
 	}
 
+	// TRE-PATCH(P3-GW-008): notify after c.mu.Unlock (deferred first, runs last), and only
+	// with what the cache now holds: the new pod if it was stored, else a removal.
+	stored, removed := false, false
+	defer func() {
+		switch {
+		case stored:
+			notifyTREPodObserver(oldPod, newPod)
+		case removed:
+			notifyTREPodObserver(oldPod, nil)
+		}
+	}()
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -173,6 +189,7 @@ func (c *Store) updatePod(oldObj interface{}, newObj interface{}) {
 	if oldOk || existed {
 		odlMetaPod := c.deletePodLocked(oldPod.Name, oldPod.Namespace)
 		if odlMetaPod != nil {
+			removed = true
 			for _, modelName := range odlMetaPod.Models.Array() {
 				c.deletePodAndModelMappingLocked(odlMetaPod.Name, odlMetaPod.Namespace, modelName, 1)
 			}
@@ -191,6 +208,7 @@ func (c *Store) updatePod(oldObj interface{}, newObj interface{}) {
 	if newOk && !newIsWorker {
 		metaPod := c.addPodLocked(newPod)
 		c.addPodAndModelMappingLocked(metaPod, newModelName)
+		stored = true
 	}
 
 	klog.V(4).Infof("POD UPDATED: %s/%s %s", newPod.Namespace, newPod.Name, newPod.Status.Phase)
@@ -238,6 +256,14 @@ func (c *Store) deletePod(obj interface{}) {
 	if c.kvEventManager != nil && pod != nil {
 		c.kvEventManager.OnPodDelete(pod)
 	}
+
+	// TRE-PATCH(P3-GW-008): removal notice after c.mu.Unlock.
+	removedPod := pod
+	if removedPod == nil {
+		removedPod = &v1.Pod{}
+		removedPod.Name, removedPod.Namespace = name, namespace
+	}
+	defer notifyTREPodObserver(removedPod, nil)
 
 	c.mu.Lock()
 	defer c.mu.Unlock()

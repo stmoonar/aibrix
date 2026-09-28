@@ -1,0 +1,31 @@
+# Stable in-cluster name of the isolated tre-v2 gateway (plan 2026-09-27 P3/P4).
+# Envoy Gateway names its own proxy Service envoy-<ns>-<gateway>-<generated hash>, which
+# nothing in TRE may depend on. This ClusterIP selects the same proxy pods by their
+# owning-gateway labels (like gateway-stats.yaml) and is what in-cluster clients use:
+# the reissue sidecar reaches http://tre-gateway.envoy-gateway-system.svc.cluster.local:80
+# (registry gateway.service_name / service_namespace / service_port). It lives next to
+# the proxy (a Service can only select pods of its own namespace); name and namespace
+# are kustomize params (gateway-service-params.yaml). Port 80 -> 10080, the container
+# port Envoy Gateway gives the listener on port 80 (privileged ports are shifted by
+# 10000). The external NodePort / LoadBalancer stays Envoy Gateway's (P4 pins it).
+apiVersion: v1
+kind: Service
+metadata:
+  name: tre-gateway
+  namespace: envoy-gateway-system
+  labels:
+    app.kubernetes.io/name: tre-gateway
+    app.kubernetes.io/part-of: tre-v2
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/component: proxy
+    app.kubernetes.io/managed-by: envoy-gateway
+    app.kubernetes.io/name: envoy
+    gateway.envoyproxy.io/owning-gateway-name: tre-aibrix-eg
+    gateway.envoyproxy.io/owning-gateway-namespace: tre-v2
+  ports:
+    - name: http
+      port: 80
+      targetPort: 10080
+      protocol: TCP

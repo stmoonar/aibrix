@@ -7,6 +7,7 @@ from typing import Protocol
 
 from tre_sm.state.operations import OperationBusy
 from tre_sm.state.safety import ControllerNotPaused, NodePressureActive
+from tre_sm.state.sleep_reservations import ReservationConflict
 
 
 class SupervisedService(Protocol):
@@ -67,6 +68,10 @@ class FleetSupervisor:
         )
         self._thread.start()
 
+    def request_stop(self) -> None:
+        """Signal-safe: stop after the current pass (no join)."""
+        self._stop.set()
+
     def stop(self) -> None:
         self._stop.set()
         if self._thread is not None:
@@ -82,7 +87,31 @@ class FleetSupervisor:
         )
 
     def run_once(self) -> None:
+        recover = getattr(self._service, "recover_sleep_journal", None)
+        if callable(recover):
+            try:
+                recover()
+            except OperationBusy:
+                pass  # another writer; next pass
+        ensure_seeded = getattr(self._service, "ensure_desired_seeded", None)
+        if callable(ensure_seeded):
+            try:
+                ensure_seeded()
+            except OperationBusy:
+                pass  # another writer; next pass
         self._service.converge_startups()
+        reap = getattr(self._service, "reap_rejected_deployments", None)
+        if callable(reap):
+            try:
+                reap()
+            except OperationBusy:
+                pass  # a writer (possibly starting a Pod) is active; next pass
+        reap_leases = getattr(self._service, "reap_orphan_starting_leases", None)
+        if callable(reap_leases):
+            try:
+                reap_leases()
+            except OperationBusy:
+                pass  # a writer (possibly starting a Pod) is active; next pass
         recovered = self._service.recover_stale_fleet_repairs()
         if recovered is not None:
             self._last_recovery_operation_id = str(recovered["operation_id"])
@@ -113,6 +142,18 @@ class FleetSupervisor:
             and now - self._last_repair_at < self._repair_cooldown_s
         ):
             return
+        targeted = getattr(self._service, "repair_missing_deployments", None)
+        if callable(targeted) and all(
+            item.get("code") == "deployment_missing" for item in drift
+        ):
+            # B7: only Deployments of sleeping residents are gone - recreate
+            # just those (their Pods pass the startup gate) instead of a
+            # fleet-wide repair. None = not eligible: full repair below.
+            repaired = targeted([item.get("binding_id") for item in drift])
+            if repaired is not None:
+                self._last_repair_at = now
+                self._reset_drift()
+                return
         self._service.enter_recovery_observe()
         submitted = self._service.start_fleet_repair()
         self._last_repair_at = now
@@ -124,9 +165,10 @@ class FleetSupervisor:
             try:
                 self.run_once()
                 self._last_error = None
-            except (OperationBusy, ControllerNotPaused, NodePressureActive):
+            except (OperationBusy, ControllerNotPaused, NodePressureActive, ReservationConflict):
                 # Expected gates: another writer is converging, controller is
-                # active, or pressure remains. Retry without mutating intent.
+                # active, pressure remains, or a sleep is draining. Retry without
+                # mutating intent.
                 pass
             except Exception as exc:  # keep supervision alive and observable.
                 self._last_error = f"{type(exc).__name__}: {exc}"

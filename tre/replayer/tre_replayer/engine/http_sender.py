@@ -56,6 +56,16 @@ from tre_replayer.engine.schedule import ScheduledRequest
 #: preferred over its address because it survives a pod IP being reused.
 POD_HEADER_KEYS = ("target-pod", "x-target-pod", "x-upstream-pod", "target-pod-ip")
 
+#: What the TRE reissue sidecar reports (tre/docs/design/20260927-reissue-sidecar-v2.md):
+#: ``x-tre-retried: <attempts>`` on a request that never started on the pod it was routed
+#: to and was resent through the gateway; ``x-tre-continued: <segments>`` on a
+#: non-streaming answer stitched from segments of several pods. A stream carries the
+#: segment count in the extension field ``tre_continued`` of its final (finish_reason)
+#: chunk and in a closing SSE comment ``: x-tre-continued: <segments>``.
+RETRIED_HEADER = "x-tre-retried"
+CONTINUED_HEADER = "x-tre-continued"
+CONTINUED_FIELD = "tre_continued"
+
 #: Request header that makes the AIBrix gateway plugin route (and therefore report the
 #: pod it routed to). See :class:`StreamingHttpSender`.
 ROUTING_STRATEGY_HEADER = "routing-strategy"
@@ -108,6 +118,28 @@ class StreamResult:
     #: error budget would read as an engine fault, and folding it into the gateway's
     #: would read as a shed. See ``scripts.openloop.classify_failure``.
     timed_out: bool = False
+    #: ``finish_reason`` of the final choice chunk (``abort`` = the client saw a
+    #: truncated answer, e.g. a sleep the sidecar could not hide).
+    finish_reason: str | None = None
+    #: Continuation segments the reissue sidecar stitched in (None = not continued).
+    tre_continued: int | None = None
+    #: Gateway attempts of a sidecar retry (None = not retried).
+    tre_retried: int | None = None
+
+
+def _positive_int(value: Any) -> int | None:
+    try:
+        number = int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
+def reissue_from_headers(headers: dict[str, str] | None) -> tuple[int | None, int | None]:
+    """(tre_continued, tre_retried) from lower-cased response headers."""
+    if not headers:
+        return None, None
+    return _positive_int(headers.get(CONTINUED_HEADER)), _positive_int(headers.get(RETRIED_HEADER))
 
 
 # seam: (url, headers, body_bytes, timeout_s) -> StreamResult
@@ -293,6 +325,10 @@ class StreamingHttpSender:
             "error_body": res.error_body,
             "error_headers": res.error_headers,
             "target_pod": res.target_pod,
+            "finish_reason": getattr(res, "finish_reason", None),
+            # Reissue sidecar: segments stitched in / gateway attempts of a retry.
+            "tre_continued": getattr(res, "tre_continued", None),
+            "tre_retried": getattr(res, "tre_retried", None),
             "client_timeout": bool(getattr(res, "timed_out", False)),
             "request_timeout_s": timeout_s,
             "in_flight_at_send": in_flight_at_send,
@@ -333,15 +369,26 @@ def _default_stream_call(url: str, headers: dict[str, str], body: bytes, timeout
     first_token_ms: float | None = None
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
+    finish_reason: str | None = None
+    continued: int | None = None
     try:
         req = Request(url, data=body, headers=headers, method="POST")
         with urlopen(req, timeout=timeout_s) as response:
             status = response.status
             # Read before the body: the headers arrive with the first SSE byte and this
             # is the only place the serving pod is ever named.
-            target_pod = pod_from_headers(lower_headers(response.headers))
+            response_headers = lower_headers(response.headers)
+            target_pod = pod_from_headers(response_headers)
+            continued, retried = reissue_from_headers(response_headers)
             for raw in response:
                 line = raw.decode("utf-8", errors="replace").strip()
+                if line.startswith(":"):
+                    # SSE comment; the reissue sidecar closes a stitched stream with
+                    # ": x-tre-continued: <segments>".
+                    name, _, value = line[1:].strip().partition(":")
+                    if name.strip().lower() == CONTINUED_HEADER:
+                        continued = _positive_int(value) or continued
+                    continue
                 if not line or not line.startswith("data:"):
                     continue
                 payload = line[len("data:") :].strip()
@@ -353,13 +400,18 @@ def _default_stream_call(url: str, headers: dict[str, str], body: bytes, timeout
                     continue
                 if first_token_ms is None and _chunk_has_content(chunk):
                     first_token_ms = (time.perf_counter() - start) * 1000.0
+                for choice in chunk.get("choices") or []:
+                    if isinstance(choice, dict) and choice.get("finish_reason"):
+                        finish_reason = choice["finish_reason"]
+                continued = _positive_int(chunk.get(CONTINUED_FIELD)) or continued
                 usage = chunk.get("usage")
                 if isinstance(usage, dict):
                     prompt_tokens = usage.get("prompt_tokens", prompt_tokens)
                     completion_tokens = usage.get("completion_tokens", completion_tokens)
         done_ms = (time.perf_counter() - start) * 1000.0
         return StreamResult(
-            status, first_token_ms, done_ms, prompt_tokens, completion_tokens, target_pod=target_pod
+            status, first_token_ms, done_ms, prompt_tokens, completion_tokens, target_pod=target_pod,
+            finish_reason=finish_reason, tre_continued=continued, tre_retried=retried,
         )
     except HTTPError as exc:
         error_headers = lower_headers(exc.headers)

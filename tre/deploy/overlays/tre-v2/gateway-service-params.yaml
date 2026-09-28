@@ -1,0 +1,13 @@
+# Kustomize params of the stable gateway Service (gateway-service.yaml); local-config:
+# never applied to the cluster. Keep equal to registry gateway.service_name /
+# service_namespace (guard test deploy/tests/test_transparent_sleep_contract.py).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tre-gateway-service-params
+  annotations:
+    config.kubernetes.io/local-config: "true"
+data:
+  name: tre-gateway
+  # Where the Envoy proxy pods of Gateway tre-v2/tre-aibrix-eg run.
+  namespace: envoy-gateway-system

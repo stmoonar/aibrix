@@ -84,7 +84,10 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
   name: tre-v2-model-route-manager
-  namespace: aibrix-system
+  # The model HTTPRoutes live in the route namespace (service-manager env
+  # TRE_ROUTE_NAMESPACE = tre-v2); runtime cold starts ensure them (ADR-0008:
+  # nothing in aibrix-system).
+  namespace: tre-v2
 rules:
   - apiGroups: ["gateway.networking.k8s.io"]
     resources: ["httproutes"]
@@ -94,7 +97,7 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
   name: tre-v2-model-route-manager
-  namespace: aibrix-system
+  namespace: tre-v2
 subjects:
   - kind: ServiceAccount
     name: tre-v2-service-manager

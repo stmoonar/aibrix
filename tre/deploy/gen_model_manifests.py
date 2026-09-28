@@ -2,17 +2,28 @@ from __future__ import annotations
 
 import argparse
 import os
+from dataclasses import replace
 import re
 from pathlib import Path
 from typing import Iterable
 
 import yaml
 
-from tre_common.registry import ModelSpec, NodeSpec, Registry, load_registry
+from tre_common.bindings import MAX_BOUND_PER_GPU, feasible_slots, render_binding_set  # noqa: F401 (re-exported)
+from tre_common.registry import (
+    DEFAULT_ROUTE_TIMEOUT_S,
+    DEFAULT_VLLM_ENV,
+    POD_SERVING_PORT,
+    VLLM_FEATURE_FLAGS,
+    ModelSpec,
+    NodeSpec,
+    Registry,
+    ReissueConfig,
+    load_registry,
+)
 
 ROUTABLE_LABEL = "tre.aibrix.io/routable"
 GPU_UUIDS_ANNOTATION = "tre.aibrix.io/gpu-uuids"
-MAX_BOUND_PER_GPU = 3
 MODEL_LABEL = "model.aibrix.ai/name"
 GATEWAY_NAMESPACE = "tre-v2"
 GATEWAY_NAME = "tre-aibrix-eg"
@@ -26,6 +37,13 @@ HTTPROUTE_PATHS = (
     "/generate",
     "/generatevideo",
 )
+
+#: The retry / continuation sidecar (tre/reissue, design 20260927-reissue-sidecar-v2):
+#: its script ships in a ConfigMap and runs with the model's vLLM image.
+REISSUE_SCRIPT_PATH = Path(__file__).resolve().parents[1] / "reissue" / "tre_reissue" / "sidecar.py"
+REISSUE_MOUNT_DIR = "/opt/tre-reissue"
+REISSUE_SCRIPT_KEY = "sidecar.py"
+REISSUE_CONTAINER = "tre-reissue-sidecar"
 
 STARTUP_GATE_CLIENT = """\
 import json, os, time, urllib.request
@@ -44,28 +62,44 @@ while True:
 """
 
 
-def feasible_slots(registry: Registry, model: ModelSpec) -> list[tuple[str, tuple[int, ...]]]:
-    slots: list[tuple[str, tuple[int, ...]]] = []
-    for node in registry.topology().nodes:
-        if model.tp_size == 1:
-            slots.extend((node.name, (gpu,)) for gpu in range(node.gpus))
-        elif model.tp_size == 2:
-            slots.extend((node.name, tuple(slot)) for slot in node.two_gpu_slots)
-    # max_replicas is the GPU layout size (how many bindings exist), not the scaling cap:
-    # that is models[].max_awake_replicas (v1/paper alignment A1), enforced by the
-    # controller planner and the service-manager, never here.
-    return slots[: model.max_replicas]
-
-
 def build_deployments(registry: Registry) -> list[dict]:
-    deployments: list[dict] = []
+    # One Deployment per binding of the shared binding set (tre_common.bindings), the
+    # same set the service-manager seeds its desired state from (plan D7).
     nodes = {node.name: node for node in registry.topology().nodes}
-    bound_counts: dict[tuple[str, int], int] = {}
-    for model in registry.models():
-        for node_name, gpu_ids in feasible_slots(registry, model):
-            _record_bound_budget(bound_counts, node_name, gpu_ids)
-            deployments.append(_deployment(model, nodes[node_name], gpu_ids))
-    return deployments
+    reissue = reissue_spec(registry)
+    return [
+        _deployment(
+            registry.model(spec.model),
+            nodes[spec.node],
+            spec.gpu_ids,
+            reissue=reissue,
+            vllm_env=registry.vllm_env_for(registry.model(spec.model)),
+        )
+        for spec in render_binding_set(registry)
+    ]
+
+
+def reissue_spec(registry: Registry) -> ReissueConfig | None:
+    """The registry's reissue sidecar settings, or None when it is disabled. The gateway
+    URL is resolved: reissue.gateway_url, else the gateway: section's stable Service."""
+    spec = registry.reissue()
+    if not spec.enabled:
+        return None
+    return replace(spec, gateway_url=spec.gateway_url or registry.gateway().internal_url)
+
+
+def build_reissue_configmap(spec: ReissueConfig, *, script_path: Path = REISSUE_SCRIPT_PATH) -> dict:
+    """The ConfigMap shipping the sidecar script (the vLLM image already has aiohttp)."""
+    return {
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {
+            "name": spec.configmap,
+            "namespace": spec.namespace,
+            "labels": {"tre.aibrix.io/managed": "true", "app.kubernetes.io/name": REISSUE_CONTAINER},
+        },
+        "data": {REISSUE_SCRIPT_KEY: script_path.read_text(encoding="utf-8")},
+    }
 
 
 def deployment_name(model_name: str, node_name: str, gpu_ids: tuple[int, ...]) -> str:
@@ -74,8 +108,13 @@ def deployment_name(model_name: str, node_name: str, gpu_ids: tuple[int, ...]) -
 
 
 def build_model_deployment(registry: Registry, model_name: str, node_name: str, gpu_ids: tuple[int, ...]) -> dict:
+    # Used by the service-manager for runtime creates: the registry's reissue section
+    # applies, so a relocated binding looks exactly like a rendered one.
     nodes = {node.name: node for node in registry.topology().nodes}
-    return _deployment(registry.model(model_name), nodes[node_name], gpu_ids)
+    model = registry.model(model_name)
+    return _deployment(
+        model, nodes[node_name], gpu_ids, reissue=reissue_spec(registry), vllm_env=registry.vllm_env_for(model)
+    )
 
 
 def build_services(registry: Registry) -> list[dict]:
@@ -89,7 +128,12 @@ def build_httproutes(
     gateway_name: str = GATEWAY_NAME,
 ) -> list[dict]:
     return [
-        build_model_httproute(model.name, gateway_namespace=gateway_namespace, gateway_name=gateway_name)
+        build_model_httproute(
+            model.name,
+            gateway_namespace=gateway_namespace,
+            gateway_name=gateway_name,
+            request_timeout_s=registry.gateway().route_timeout_s,
+        )
         for model in registry.models()
     ]
 
@@ -100,7 +144,10 @@ def build_model_httproute(
     model_namespace: str = "default",
     gateway_namespace: str = GATEWAY_NAMESPACE,
     gateway_name: str = GATEWAY_NAME,
+    request_timeout_s: float = DEFAULT_ROUTE_TIMEOUT_S,
 ) -> dict:
+    """The model's HTTPRoute; ``request_timeout_s`` = registry gateway.route_timeout_s
+    (the same value caps the service-manager drain)."""
     service_name = _dns_name(model_name)
     labels = {MODEL_LABEL: model_name, "tre.aibrix.io/managed": "true"}
     return {
@@ -139,11 +186,19 @@ def build_model_httproute(
                         }
                         for path in HTTPROUTE_PATHS
                     ],
-                    "timeouts": {"request": "600s"},
+                    "timeouts": {"request": route_timeout_text(request_timeout_s)},
                 }
             ],
         },
     }
+
+
+def route_timeout_text(seconds: float) -> str:
+    """Gateway API duration of a route timeout in seconds (``150`` -> ``"150s"``)."""
+    value = float(seconds)
+    if value <= 0:
+        raise ValueError(f"route timeout must be positive, got {seconds!r}")
+    return f"{int(value)}s" if value.is_integer() else f"{int(round(value * 1000))}ms"
 
 
 def build_referencegrant(
@@ -177,8 +232,10 @@ def build_resources(
     gateway_namespace: str = GATEWAY_NAMESPACE,
     gateway_name: str = GATEWAY_NAME,
 ) -> list[dict]:
+    reissue = reissue_spec(registry)
     return (
         [build_referencegrant(gateway_namespace=gateway_namespace)]
+        + ([build_reissue_configmap(reissue)] if reissue is not None else [])
         + build_services(registry)
         + build_httproutes(registry, gateway_namespace=gateway_namespace, gateway_name=gateway_name)
         + build_deployments(registry)
@@ -228,7 +285,16 @@ def _service(model: ModelSpec) -> dict:
     }
 
 
-def _deployment(model: ModelSpec, node: NodeSpec, gpu_ids: tuple[int, ...]) -> dict:
+def _deployment(
+    model: ModelSpec,
+    node: NodeSpec,
+    gpu_ids: tuple[int, ...],
+    *,
+    reissue: ReissueConfig | None = None,
+    vllm_env: dict[str, str] | None = None,
+) -> dict:
+    """``vllm_env``: the vLLM container environment besides the per-binding GPU variables
+    (``Registry.vllm_env_for``); None = ``DEFAULT_VLLM_ENV``."""
     gpu_value = ",".join(str(gpu) for gpu in gpu_ids)
     gpu_label_value = "-".join(str(gpu) for gpu in gpu_ids)
     cuda_value = ",".join(str(index) for index in range(model.tp_size))
@@ -252,7 +318,11 @@ def _deployment(model: ModelSpec, node: NodeSpec, gpu_ids: tuple[int, ...]) -> d
     ]
     if model.tp_size > 1:
         command.extend(["--tensor-parallel-size", str(model.tp_size)])
-    command.extend(model.vllm_extra_args)
+    command.extend(model.vllm_args)
+    if reissue is not None:
+        # Fork features the sidecar builds on, only where the image declares them.
+        for feature in model.vllm_features:
+            command.extend(flag for flag in VLLM_FEATURE_FLAGS.get(feature, ()) if flag not in command)
     labels = {
         "model.aibrix.ai/name": model.name,
         "model.aibrix.ai/port": "8000",
@@ -268,7 +338,7 @@ def _deployment(model: ModelSpec, node: NodeSpec, gpu_ids: tuple[int, ...]) -> d
         GPU_UUIDS_ANNOTATION: gpu_uuid_value,
         "tre.aibrix.io/state": "hidden",
     }
-    return {
+    deployment = {
         "apiVersion": "apps/v1",
         "kind": "Deployment",
         "metadata": {"name": name, "namespace": "default", "labels": labels, "annotations": annotations},
@@ -314,9 +384,10 @@ def _deployment(model: ModelSpec, node: NodeSpec, gpu_ids: tuple[int, ...]) -> d
                             "env": [
                                 {"name": "NVIDIA_VISIBLE_DEVICES", "value": gpu_uuid_value},
                                 {"name": "CUDA_VISIBLE_DEVICES", "value": cuda_value},
-                                {"name": "VLLM_SERVER_DEV_MODE", "value": "1"},
-                                {"name": "VLLM_WORKER_MULTIPROC_METHOD", "value": "spawn"},
-                                {"name": "VLLM_USE_MODELSCOPE", "value": "True"},
+                            ]
+                            + [
+                                {"name": key, "value": value}
+                                for key, value in (DEFAULT_VLLM_ENV if vllm_env is None else vllm_env).items()
                             ],
                             "ports": [{"containerPort": 8000, "protocol": "TCP"}],
                             "readinessProbe": {
@@ -336,6 +407,55 @@ def _deployment(model: ModelSpec, node: NodeSpec, gpu_ids: tuple[int, ...]) -> d
             },
         },
     }
+    if reissue is not None:
+        _add_reissue_sidecar(deployment, model, reissue)
+    return deployment
+
+
+def _add_reissue_sidecar(deployment: dict, model: ModelSpec, spec: ReissueConfig) -> None:
+    """vLLM -> 127.0.0.1:<vllm_port>; the sidecar takes the serving port and the
+    readiness probe (its /health is vLLM's /health, proxied), so everything that talks to
+    the pod - Service, gateway target-pod, service-manager, scrapers - is unchanged."""
+    pod = deployment["spec"]["template"]["spec"]
+    vllm = pod["containers"][0]
+    command = list(vllm["command"])
+    command[command.index("--host") + 1] = "127.0.0.1"
+    command[command.index("--port") + 1] = str(spec.vllm_port)
+    vllm["command"] = command
+    readiness = vllm.pop("readinessProbe")
+    vllm.pop("ports", None)
+    pod["volumes"].append({"name": REISSUE_CONTAINER, "configMap": {"name": spec.configmap, "defaultMode": 0o444}})
+    env = [
+        {"name": "TRE_REISSUE_LISTEN_PORT", "value": str(POD_SERVING_PORT)},
+        {"name": "TRE_REISSUE_UPSTREAM_URL", "value": f"http://127.0.0.1:{spec.vllm_port}"},
+        {"name": "TRE_GATEWAY_URL", "value": spec.gateway_url},
+        {"name": "TRE_REISSUE_MODEL", "value": model.name},
+        {"name": "TRE_REISSUE_MAX_DEPTH", "value": str(spec.max_depth)},
+        {"name": "TRE_REISSUE_RETRY_ATTEMPTS", "value": str(spec.retry_attempts)},
+        # Fail closed: /sleep without X-TRE-Hidden: 1 (the SM sends it after the hide) is 409.
+        {"name": "TRE_REISSUE_REQUIRE_HIDDEN_HEADER", "value": "true"},
+        {"name": "POD_NAME", "valueFrom": {"fieldRef": {"fieldPath": "metadata.name"}}},
+        # Same image as vLLM, but this container must not get the GPUs.
+        {"name": "NVIDIA_VISIBLE_DEVICES", "value": "void"},
+        {"name": "PYTHONUNBUFFERED", "value": "1"},
+    ]
+    env.extend({"name": key, "value": value} for key, value in sorted(spec.extra_env.items()))
+    pod["containers"].append(
+        {
+            "name": REISSUE_CONTAINER,
+            "image": spec.image or model.vllm_image,
+            "imagePullPolicy": "IfNotPresent",
+            "command": ["python3", f"{REISSUE_MOUNT_DIR}/{REISSUE_SCRIPT_KEY}"],
+            "env": env,
+            "ports": [{"containerPort": POD_SERVING_PORT, "protocol": "TCP"}],
+            "readinessProbe": readiness,
+            "resources": {
+                "requests": {"cpu": spec.cpu_request, "memory": spec.memory_request},
+                "limits": {"cpu": spec.cpu_limit, "memory": spec.memory_limit},
+            },
+            "volumeMounts": [{"name": REISSUE_CONTAINER, "mountPath": REISSUE_MOUNT_DIR, "readOnly": True}],
+        }
+    )
 
 
 def _dns_name(value: str) -> str:
@@ -346,16 +466,6 @@ def _gpu_uuids_for(node: NodeSpec, gpu_ids: tuple[int, ...]) -> tuple[str, ...]:
     if len(node.gpu_uuids) != node.gpus:
         raise ValueError(f"node {node.name}: gpu_uuids length does not match gpus")
     return tuple(node.gpu_uuids[gpu] for gpu in gpu_ids)
-
-
-def _record_bound_budget(bound_counts: dict[tuple[str, int], int], node_name: str, gpu_ids: tuple[int, ...]) -> None:
-    for gpu in gpu_ids:
-        key = (node_name, gpu)
-        bound_counts[key] = bound_counts.get(key, 0) + 1
-        if bound_counts[key] > MAX_BOUND_PER_GPU:
-            raise ValueError(
-                f"gpu bound budget exceeded for {node_name}/{gpu}: {bound_counts[key]} > {MAX_BOUND_PER_GPU}"
-            )
 
 
 def main(argv: Iterable[str] | None = None) -> None:

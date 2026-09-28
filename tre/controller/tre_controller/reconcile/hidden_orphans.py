@@ -118,7 +118,8 @@ def _probing_targets(
     serve_ids: set[str] = set()
     fallback_models: set[str] = set()
     for probe in probes:
-        if probe.get("status") != "probing":
+        # A committing probe (review 4 P2-4) still owns its hidden pods.
+        if probe.get("status") not in ("probing", "committing"):
             continue
         probe_ids: set[str] = set()
         raw_pods = probe.get("pods", ())

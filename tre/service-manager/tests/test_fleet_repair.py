@@ -42,7 +42,7 @@ class FakeVllm:
         self.calls.append(("is_sleeping", pod_ip, port))
         return self.sleeping.get(pod_ip)
 
-    def sleep(self, pod_ip, *, port=None):
+    def sleep(self, pod_ip, *, port=None, **_kwargs):
         self.calls.append(("sleep", pod_ip, port))
         self.sleeping[pod_ip] = True
         return Result()
@@ -120,6 +120,19 @@ class FakeRuntime:
         )
 
 
+def _primitive(runtime, vllm, calls=None):
+    """Stand-in for the SM sleep primitive the executor must use (plan D1)."""
+
+    def sleep_binding(binding, pod_ip):
+        if calls is not None:
+            calls.append((binding.binding_id, pod_ip))
+        runtime.write_binding_annotations(binding, state="hidden")
+        vllm.sleep(pod_ip, port=8000, mode="wait", hidden=True)
+        runtime.write_binding_annotations(binding, state="sleeping")
+
+    return sleep_binding
+
+
 def _deployment(name, model, node, gpu_ids):
     return ModelDeploymentRecord(name, model, node, tuple(gpu_ids), replicas=1)
 
@@ -174,10 +187,12 @@ def test_repair_sleeps_residents_before_rebuilding_missing_peer_then_restores_ta
         )
         return {"binding_id": binding_id, "awake": awake}
 
+    primitive_calls = []
     executor = FleetRepairExecutor(
         runtime_ops=runtime,
         vllm_ops=vllm,
         safety_gate=FakeSafety(),
+        sleep_binding=_primitive(runtime, vllm, primitive_calls),
         poll_interval_s=0,
         sleep=lambda _seconds: None,
     )
@@ -199,6 +214,12 @@ def test_repair_sleeps_residents_before_rebuilding_missing_peer_then_restores_ta
     assert vllm.sleeping[rebuilt.pod_ip] is True
     assert reconciles == [True, True]
     assert any(phase == "verified" for phase, _ in operation.phases)
+    # Every sleep of the repair (quarantine of the awake resident and the
+    # rebuilt peer) went through the injected sleep primitive.
+    assert [binding_id for binding_id, _ip in primitive_calls] == [
+        first.binding_id,
+        missing.binding_id,
+    ]
 
 
 def test_repair_rejects_overlapping_awake_targets_before_mutation():
@@ -210,6 +231,7 @@ def test_repair_rejects_overlapping_awake_targets_before_mutation():
         runtime_ops=runtime,
         vllm_ops=vllm,
         safety_gate=FakeSafety(),
+        sleep_binding=_primitive(runtime, vllm),
     )
 
     with pytest.raises(ValueError, match="awake targets overlap"):
@@ -228,3 +250,28 @@ def _binding_slot(snapshot):
     from tre_sm.allocator.slots import Slot
 
     return Slot(snapshot.node, _gpu_ids(snapshot))
+
+
+def test_repair_fails_fast_when_desired_lacks_inventory_binding():
+    first = _deployment("m1-node-a-gpu-0", "m1", "node-a", (0,))
+    stray = _deployment("m9-node-a-gpu-1", "m9", "node-a", (1,))
+    vllm = FakeVllm({})
+    runtime = FakeRuntime([first, stray], [], vllm)
+    executor = FleetRepairExecutor(
+        runtime_ops=runtime,
+        vllm_ops=vllm,
+        safety_gate=FakeSafety(),
+        sleep_binding=_primitive(runtime, vllm),
+    )
+
+    with pytest.raises(RuntimeError, match="desired state lacks binding"):
+        executor.run(
+            FakeOperation(),
+            awake_binding_ids=[],
+            reconcile=lambda _strict: {},
+            set_binding_power=lambda _binding_id, _awake: {},
+            audit=lambda: {"healthy": True},
+            desired_binding_ids=lambda: {first.binding_id},
+        )
+
+    assert runtime.scale_calls == []

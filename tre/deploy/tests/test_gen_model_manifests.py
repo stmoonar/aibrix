@@ -1,4 +1,5 @@
 import textwrap
+from pathlib import Path
 
 import yaml
 
@@ -90,7 +91,10 @@ def test_build_deployments_encodes_node_gpu_binding_and_vllm_args(tmp_path):
     [gate] = rendered["spec"]["template"]["spec"]["initContainers"]
     assert gate["name"] == "tre-startup-gate"
     assert "/v2/startup/admit" in gate["command"][2]
-    assert container["readinessProbe"]["httpGet"] == {"path": "/health", "port": 8000}
+    # The pod is ready when the serving port answers /health (the reissue sidecar owns the
+    # port and proxies vLLM's /health; without the sidecar vLLM itself does).
+    probes = [c["readinessProbe"] for c in rendered["spec"]["template"]["spec"]["containers"] if "readinessProbe" in c]
+    assert [p["httpGet"] for p in probes] == [{"path": "/health", "port": 8000}]
 
 
 def test_cuda_visible_devices_uses_container_local_ordinals(tmp_path):
@@ -285,7 +289,9 @@ def test_build_httproutes_creates_model_header_route_to_service(tmp_path):
         "/generatevideo",
     }
     assert all(match["headers"] == [{"name": "model", "type": "Exact", "value": "dsqwen-7b"}] for match in rule["matches"])
-    assert rule["timeouts"] == {"request": "600s"}
+    # Single source: registry gateway.route_timeout_s (default 150 s), which also caps
+    # the service-manager drain.
+    assert rule["timeouts"] == {"request": "150s"}
 
 
 def test_write_manifests_includes_services_and_deployments(tmp_path):
@@ -321,12 +327,13 @@ def test_write_manifests_includes_services_and_deployments(tmp_path):
 
     written = write_manifests(registry, tmp_path / "models")
 
-    assert len(build_resources(registry)) == 8
+    assert len(build_resources(registry)) == 9
     assert sorted(item.name for item in written) == [
         "one-gpu-node-75-gpu-0.yaml",
         "one-gpu-node-75-gpu-1.yaml",
         "one-gpu-router.yaml",
         "one-gpu.yaml",
+        "tre-reissue-sidecar.yaml",
         "tre-v2-model-referencegrant-in-default.yaml",
         "two-gpu-node-75-gpu-0-1.yaml",
         "two-gpu-router.yaml",
@@ -345,3 +352,33 @@ def test_build_referencegrant_allows_aibrix_httproute_to_default_service() -> No
         {"group": "gateway.networking.k8s.io", "kind": "HTTPRoute", "namespace": "tre-v2"}
     ]
     assert grant["spec"]["to"] == [{"group": "", "kind": "Service"}]
+
+
+def test_httproute_timeout_is_the_registry_route_timeout() -> None:
+    from dataclasses import replace as _replace
+
+    from gen_model_manifests import build_httproutes, route_timeout_text
+    from tre_common.registry import GatewayConfig, Registry, load_registry
+
+    repo = load_registry(str(Path(__file__).resolve().parents[1] / "registry.yaml"))
+    custom = Registry(repo.topology(), repo.models(), repo.service_manager(), GatewayConfig(route_timeout_s=90))
+    for route in build_httproutes(custom):
+        assert route["spec"]["rules"][0]["timeouts"] == {"request": "90s"}
+    for route in build_httproutes(repo):
+        assert route["spec"]["rules"][0]["timeouts"] == {
+            "request": route_timeout_text(repo.gateway().route_timeout_s)
+        }
+    assert route_timeout_text(150) == "150s" and route_timeout_text(2.5) == "2500ms"
+
+
+def test_committed_model_routes_match_the_registry_route_timeout() -> None:
+    from gen_model_manifests import route_timeout_text
+    from tre_common.registry import load_registry
+
+    deploy = Path(__file__).resolve().parents[1]
+    expected = route_timeout_text(load_registry(str(deploy / "registry.yaml")).gateway().route_timeout_s)
+    routers = sorted((deploy / "models").glob("*-router.yaml"))
+    assert routers
+    for path in routers:
+        route = yaml.safe_load(path.read_text(encoding="utf-8"))
+        assert route["spec"]["rules"][0]["timeouts"] == {"request": expected}, path.name

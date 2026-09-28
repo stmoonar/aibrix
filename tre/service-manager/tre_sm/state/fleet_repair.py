@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import time
 from typing import Callable, Protocol
 
+from gen_model_manifests import deployment_name
 from tre_sm.allocator.slots import Binding, Slot
 from tre_sm.allocator.topology import GPU_IDS_ANNOTATION, K8sPodSnapshot
 from tre_sm.ops.k8s_ops import ModelDeploymentRecord
@@ -23,10 +25,10 @@ class FleetRuntimeOps(Protocol):
     def scale_model_deployment(self, name: str, *, replicas: int) -> None: ...
     def wait_deployment_pods_deleted(self, deployment_name: str): ...
     def wait_pod_ready(self, serve_id: str) -> K8sPodSnapshot: ...
+    def create_model_deployment(self, model: str, slot: Slot) -> str: ...
 
 
 class FleetVllmOps(Protocol):
-    def sleep(self, pod_ip: str, *, port: int | None = None): ...
     def is_sleeping(self, pod_ip: str, *, port: int | None = None) -> bool | None: ...
     def wait_until_ready(self, pod_ip: str, *, port: int | None = None): ...
 
@@ -38,6 +40,7 @@ class FleetRepairExecutor:
         runtime_ops: FleetRuntimeOps,
         vllm_ops: FleetVllmOps,
         safety_gate: ClusterSafetyGate,
+        sleep_binding: Callable[[Binding, str], None],
         gpu_leases: GpuLeaseStore | None = None,
         physical_timeout_s: float = 120.0,
         poll_interval_s: float = 2.0,
@@ -48,6 +51,9 @@ class FleetRepairExecutor:
         self._vllm = vllm_ops
         self._safety = safety_gate
         self._gpu_leases = gpu_leases
+        # The service-manager sleep primitive (hide -> gateway ack -> drain ->
+        # /sleep, plan D1/D2); the repair never calls vLLM /sleep itself.
+        self._sleep_binding_fn = sleep_binding
         self._physical_timeout_s = physical_timeout_s
         self._poll_interval_s = poll_interval_s
         self._monotonic = monotonic
@@ -61,13 +67,43 @@ class FleetRepairExecutor:
         reconcile: Callable[[bool], dict],
         set_binding_power: Callable[[str, bool], dict],
         audit: Callable[[], dict],
+        desired_binding_ids: Callable[[], set[str]] | None = None,
+        required_binding_ids: Callable[[], set[str]] | None = None,
+        recreate_bindings: Callable[[], list[Binding]] | None = None,
     ) -> None:
         deployments = self._runtime.list_model_deployments()
-        if not deployments:
-            raise RuntimeError("fleet repair found no managed model Deployments")
         by_id = {deployment.binding_id: deployment for deployment in deployments}
         if len(by_id) != len(deployments):
             raise RuntimeError("duplicate stable binding_id in managed Deployments")
+        # B7: bindings desired resident whose Deployment is gone are created
+        # again from the registry (same name and body as the rendered one) when
+        # their turn to start comes; scaling alone could never bring them back.
+        recreate: dict[str, ModelDeploymentRecord] = {}
+        for planned in recreate_bindings() if recreate_bindings is not None else []:
+            if planned.binding_id in by_id:
+                continue
+            record = ModelDeploymentRecord(
+                deployment_name(planned.model, planned.slot.node, planned.slot.gpu_ids),
+                planned.model,
+                planned.slot.node,
+                tuple(planned.slot.gpu_ids),
+                replicas=0,
+            )
+            recreate[record.binding_id] = record
+        if not deployments and not recreate:
+            raise RuntimeError("fleet repair found no managed model Deployments")
+        by_id.update(recreate)
+        if desired_binding_ids is not None:
+            # D7 pre-check (after seeding): every inventoried Deployment - and every
+            # binding the seeding covers (registry UNION Deployments) - needs a
+            # desired record, or its restarted Pod is refused by the startup gate
+            # and the repair can never converge. Fail fast instead.
+            required = set(by_id) | (set(required_binding_ids()) if required_binding_ids else set())
+            missing = sorted(required - set(desired_binding_ids()))
+            if missing:
+                raise RuntimeError(
+                    f"desired state lacks binding(s) {missing} after seeding"
+                )
         unknown = sorted(set(awake_binding_ids) - set(by_id))
         if unknown:
             raise ValueError(f"unknown awake binding_id(s): {unknown}")
@@ -77,11 +113,13 @@ class FleetRepairExecutor:
             details={
                 "deployments": len(deployments),
                 "awake_binding_ids": awake_binding_ids,
+                "recreate_binding_ids": sorted(recreate),
             },
         )
         self._safety.wait_until_healthy(operation)
 
         repair_ids = self._quarantine_and_sleep_residents(operation, by_id)
+        repair_ids |= set(recreate)
         operation.advance(
             "residents_quarantined",
             details={"repair_binding_ids": sorted(repair_ids)},
@@ -89,8 +127,12 @@ class FleetRepairExecutor:
 
         # Remove every unhealthy/unknown instance first. This guarantees that
         # sequential cold starts never encounter an overlapping unknown Pod.
+        # (A Deployment to recreate has nothing to scale; its leftover Pods, if
+        # any, are still waited for by their label.)
         for binding_id in sorted(repair_ids):
             operation.assert_active()
+            if binding_id in recreate:
+                continue
             deployment = by_id[binding_id]
             self._runtime.scale_model_deployment(deployment.name, replicas=0)
         for binding_id in sorted(repair_ids):
@@ -117,7 +159,14 @@ class FleetRepairExecutor:
             )
             if self._gpu_leases is not None:
                 self._gpu_leases.acquire(planned, phase="starting")
-            self._runtime.scale_model_deployment(deployment.name, replicas=1)
+            if binding_id in recreate:
+                # Rendered with replicas=1: its Pod is admitted at the startup
+                # gate like a scaled one (phase starting_binding + lease above).
+                name = self._runtime.create_model_deployment(deployment.model, planned.slot)
+                deployment = replace(deployment, name=str(name), replicas=1)
+                by_id[binding_id] = deployment
+            else:
+                self._runtime.scale_model_deployment(deployment.name, replicas=1)
             pod = self._runtime.wait_pod_ready(deployment.name)
             if not pod.pod_ip:
                 raise RuntimeError(f"new Pod for {binding_id} has no IP")
@@ -128,7 +177,6 @@ class FleetRepairExecutor:
                     f"{getattr(ready, 'message', '')}"
                 )
             binding = _binding_from_snapshot(pod)
-            self._runtime.write_binding_annotations(binding, state=POD_STATE_HIDDEN)
             self._sleep_binding(binding, pod.pod_ip)
             completed.append(binding_id)
             operation.advance(
@@ -157,6 +205,7 @@ class FleetRepairExecutor:
             details={
                 "deployments": len(deployments),
                 "repaired": len(repair_ids),
+                "recreated_binding_ids": sorted(recreate),
                 "awake_binding_ids": awake_binding_ids,
                 "audit_version": result.get("version"),
             },
@@ -201,16 +250,10 @@ class FleetRepairExecutor:
         return repair_ids
 
     def _sleep_binding(self, binding: Binding, pod_ip: str) -> None:
-        result = self._vllm.sleep(pod_ip, port=8000)
-        if not bool(getattr(result, "success", False)):
-            raise RuntimeError(
-                f"vLLM sleep failed for {binding.binding_id}: "
-                f"{getattr(result, 'message', '')}"
-            )
+        # Hides, waits for the gateway ack, drains, sleeps, verifies, writes the
+        # sleeping state and releases the GPU lease (or rolls back and raises).
+        self._sleep_binding_fn(binding, pod_ip)
         self._wait_physical(pod_ip, sleeping=True)
-        self._runtime.write_binding_annotations(binding, state=POD_STATE_SLEEPING)
-        if self._gpu_leases is not None:
-            self._gpu_leases.release(binding)
 
     def _wait_physical(self, pod_ip: str, *, sleeping: bool) -> None:
         deadline = self._monotonic() + self._physical_timeout_s

@@ -64,6 +64,15 @@ class SafeScaleConfig:
     # proactive probe of that model for this long (v1 had no cooldown for demand-driven
     # donor releases, so those are not held). 0 disables.
     rollback_backoff_ms: float = 60_000.0
+    # B8: max age (ms) of a probe's commit evidence at the commit's FIRST dispatch. A commit
+    # decided (probe marked ``committing``) longer ago than this - held in observe mode,
+    # queued behind a long action, or re-submitted after a controller restart - is not run
+    # on that stale evidence: the ActionQueue turns it into the donor unhide (rollback,
+    # reason ``commit_evidence_stale``). Retries of a commit that already started are
+    # exempt. 120 s = the probe window ceiling (max_window_ms): evidence older than one
+    # full probe window no longer describes the donor. TRE_SAFESCALE_COMMIT_MAX_AGE_MS
+    # (0 disables).
+    commit_max_age_ms: float = 120_000.0
 
 
 @dataclass(frozen=True)
@@ -72,7 +81,9 @@ class ControllerConfig:
     metrics_redis_url: str
     metrics_schema: str
     service_manager_url: str
-    sm_slow_timeout_s: float
+    #: Timeout of slow SM calls; None = registry service_manager.api_call_timeout_s.
+    #: Either way it must exceed the worst-case sleeping SM call (checked at start).
+    sm_slow_timeout_s: float | None
     registry_path: str
     runtime_state_dir: str
     monitor_interval_s: float
@@ -140,6 +151,13 @@ class ControllerConfig:
     gateway_stats_urls: tuple[str, ...] = ()
     gateway_route_namespace: str = "tre-v2"
     gateway_stats_timeout_s: float = 1.0
+    # Review 2 P1-2 / P2-5: a one-shot action (SafeScale commit / rollback) that fails
+    # retriably (SM 409 / 503 / timeout) is retried with exponential backoff
+    # TRE_ONESHOT_RETRY_BASE_SECONDS * 2^n capped at TRE_ONESHOT_RETRY_MAX_SECONDS, at
+    # most TRE_ONESHOT_RETRY_MAX_ATTEMPTS attempts in total, then abandoned (logged).
+    oneshot_retry_max_attempts: int = 6
+    oneshot_retry_base_s: float = 2.0
+    oneshot_retry_max_s: float = 30.0
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "ControllerConfig":
@@ -216,6 +234,9 @@ class ControllerConfig:
             donor_error_rate_max=_get_positive_float(values, "TRE_SAFESCALE_DONOR_ERROR_RATE_MAX", 0.01),
             donor_min_requests=_get_positive_float(values, "TRE_SAFESCALE_DONOR_MIN_REQUESTS", 20.0),
             rollback_backoff_ms=_get_nonneg_float(values, "TRE_SAFESCALE_ROLLBACK_BACKOFF_MS", 60_000.0),
+            commit_max_age_ms=_get_nonneg_float(
+                values, "TRE_SAFESCALE_COMMIT_MAX_AGE_MS", SafeScaleConfig.commit_max_age_ms
+            ),
         )
         if safescale.min_window_ms > safescale.max_window_ms:
             raise ValueError("SAFE_SCALE_MIN_WINDOW_MS must be <= SAFE_SCALE_MAX_WINDOW_MS")
@@ -262,7 +283,11 @@ class ControllerConfig:
                 "http://aibrix-tre-service-manager:8000",
             ).rstrip("/"),
             # B1: wake/create + defrag run for minutes inside the SM handler.
-            sm_slow_timeout_s=_get_positive_float(values, "TRE_SM_SLOW_TIMEOUT_SECONDS", 300.0),
+            sm_slow_timeout_s=(
+                _get_positive_float(values, "TRE_SM_SLOW_TIMEOUT_SECONDS", 300.0)
+                if values.get("TRE_SM_SLOW_TIMEOUT_SECONDS") not in (None, "")
+                else None
+            ),
             registry_path=registry_path,
             runtime_state_dir=_get_str(values, "TRE_RUNTIME_STATE_DIR", str(default_state_dir)),
             monitor_interval_s=_get_positive_float(values, "TRE_MONITOR_INTERVAL_SECONDS", 20.0),
@@ -324,6 +349,9 @@ class ControllerConfig:
             ),
             gateway_route_namespace=_get_str(values, "TRE_GATEWAY_ROUTE_NAMESPACE", "tre-v2"),
             gateway_stats_timeout_s=_get_positive_float(values, "TRE_GATEWAY_STATS_TIMEOUT_SECONDS", 1.0),
+            oneshot_retry_max_attempts=_get_positive_int(values, "TRE_ONESHOT_RETRY_MAX_ATTEMPTS", 6),
+            oneshot_retry_base_s=_get_positive_float(values, "TRE_ONESHOT_RETRY_BASE_SECONDS", 2.0),
+            oneshot_retry_max_s=_get_positive_float(values, "TRE_ONESHOT_RETRY_MAX_SECONDS", 30.0),
         )
 
 
