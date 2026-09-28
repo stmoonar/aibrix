@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Callable, Protocol, Union
 if TYPE_CHECKING:
     from tre_controller.profiling import TickProfiler
 
+from tre_common.gpu_placement import placement_policy_from_registry
 from tre_common.metrics_schema import MetricsSnapshot, ModelWindowMetrics
 from tre_common.registry import Registry, ModelSpec
 from tre_common.tss import window_is_idle
@@ -139,6 +140,10 @@ def run_planner_tick(
     ActionQueue drops it in observe mode (it never reaches the SM)."""
     if snapshot.stale:
         return LoopTickResult(submitted=0, events=("snapshot_stale",))
+    if cluster_view is not None and cluster_view.placement is None:
+        # Every placement decision of this tick (wakes, creates, donor slots, probe /
+        # shrink order) ranks by the registry placement policy.
+        cluster_view = replace(cluster_view, placement=placement_policy_from_registry(registry))
 
     _prof_on = prof is not None
     if _prof_on:
@@ -183,6 +188,7 @@ def run_planner_tick(
         incomplete_policy=incomplete_policy,
         suppress_hot_proactive_probe=suppress_hot_proactive_probe,
         disable_eta_gate=disable_eta_gate,
+        defrag_enabled=_defrag_enabled(registry),
     )
     plan = build_plan(
         model_contexts=contexts,
@@ -243,6 +249,11 @@ def run_planner_tick(
         model_contexts=contexts,
         classifications={item.model_name: item for item in classifications},
     )
+
+
+def _defrag_enabled(registry: Registry) -> bool:
+    placement = getattr(registry, "placement", None)
+    return bool(getattr(placement(), "defrag_enabled", False)) if callable(placement) else False
 
 
 def _defrag_blocking_events(queue: PlannerQueue, actions) -> tuple[str, ...]:
@@ -446,9 +457,10 @@ def _pods_to_probe(
         # Review F3: probe only serving bindings (awake and not already hidden). The
         # metrics per_pod map also lists sleeping pods, which must never be "hidden" as
         # a scale-down probe (it would remove no capacity and the commit would be a no-op).
-        # Among those, release_order puts the replica whose slot merges into the largest
-        # free block first, so a committed shrink hands back an aligned pair a tp=2 model
-        # can actually use instead of scattered single GPUs.
+        # Among those, release_order (registry placement policy) puts the replica whose
+        # slot merges into the largest free block first, then the one on the most loaded
+        # node, so a committed shrink hands back an aligned pair a tp=2 model can use and
+        # keeps the nodes balanced.
         serving = sorted(
             (
                 binding
@@ -458,7 +470,10 @@ def _pods_to_probe(
             key=lambda binding: natural_key(binding.serve_id),
         )
         ordered = release_order(
-            serving, bindings=list(cluster_view.bindings), topology=cluster_view.topology
+            serving,
+            bindings=list(cluster_view.bindings),
+            topology=cluster_view.topology,
+            policy=cluster_view.placement,
         )
         return tuple(binding.serve_id for binding in ordered[:count])
     metrics = snapshot.models.get(model)

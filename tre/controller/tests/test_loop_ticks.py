@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from tre_common.metrics_schema import MetricsSnapshot, ModelWindowMetrics, PodWindowMetrics
 from tre_common.registry import ClusterTopology, ModelSpec, NodeSpec, Registry, SloSpec, TrsParams
+from tre_common.registry import PlacementConfig
 from tre_controller.loops.fairness_task import run_fairness_tick
 from tre_controller.loops.rescue_task import run_rescue_tick
 from tre_controller.loops.tick import PaperStateCache
@@ -616,7 +617,9 @@ def test_rescue_task_loop_uses_latest_cluster_view_from_box() -> None:
         slo=tp2_spec.slo,
         trs=tp2_spec.trs,
     )
-    registry = Registry(base.topology(), [tp2_spec])
+    registry = Registry(
+        base.topology(), [tp2_spec], placement=PlacementConfig(defrag_enabled=True)
+    )
     queue = FakeQueue()
     snapshot = MetricsSnapshot(
         ts_ms=1,

@@ -73,7 +73,7 @@ def test_full_layout_defrag_sleeps_the_source_and_wakes_the_existing_destination
     world = _full_layout_world()
     before = {d.binding_id: d for d in world.fleet.load_desired().bindings}
 
-    result = world.service.defrag(tp_size=2)
+    result = world.service.defrag(tp_size=2, force=True)
 
     assert result["migrations"] == [
         {
@@ -102,7 +102,7 @@ def test_full_layout_defrag_sleeps_the_source_and_wakes_the_existing_destination
     assert len(stored) == 5
     assert world.state("pod-c") == "awake" and world.state("pod-b") == "sleeping"
     # the TP2 pair (2, 3) is free now; a second defrag has nothing to do
-    assert world.service.defrag(tp_size=2)["actions"] == []
+    assert world.service.defrag(tp_size=2, force=True)["actions"] == []
 
 
 def test_full_layout_defrag_rolls_back_when_the_destination_wake_fails():
@@ -119,7 +119,7 @@ def test_full_layout_defrag_rolls_back_when_the_destination_wake_fails():
     before_store = world.store.load().bindings
 
     with pytest.raises(ValueError, match="injected wake failure"):
-        world.service.defrag(tp_size=2)
+        world.service.defrag(tp_size=2, force=True)
 
     assert world.runtime.deployment_calls == []
     assert world.vllm.sleeping["10.0.0.2"] is False  # the source was woken again
@@ -138,7 +138,7 @@ def test_sparse_defrag_refuses_a_destination_deployment_without_a_binding():
     world.runtime.deployments.append(ModelDeploymentRecord("m1-node-a-gpu-1", "m1", "node-a", (1,), 1))
 
     with pytest.raises(DefragUnavailable, match="destination_deployment_without_binding"):
-        world.service.defrag(tp_size=2)
+        world.service.defrag(tp_size=2, force=True)
 
     assert world.runtime.deleted == [] and world.runtime.created == []
     assert world.vllm.sleeping["10.0.0.2"] is False
@@ -360,7 +360,7 @@ def test_full_layout_defrag_checks_the_destination_headroom_before_sleeping_the_
     world.service._gpu_truth = _truth(33000)  # an awake resident / leak on GPU 1
 
     with pytest.raises(WakeConflict, match="insufficient wake headroom"):
-        world.service.defrag(tp_size=2)
+        world.service.defrag(tp_size=2, force=True)
 
     assert world.vllm.sleeping["10.0.0.2"] is False  # the source was never slept
     assert not any(call[0] == "sleep" for call in world.vllm.calls)
@@ -374,7 +374,7 @@ def test_full_layout_defrag_refreshes_the_observed_state_of_both_bindings():
     world.service._k8s_client = K8sPodClientFromOps(world.service._registry.topology(), world.runtime)
     world.service.reconcile()
 
-    world.service.defrag(tp_size=2)
+    world.service.defrag(tp_size=2, force=True)
 
     observed = {item.binding_id: item.physical_power for item in world.fleet.load_observed().bindings}
     assert observed["m1/node-a/2"] == "sleeping"  # no reconcile needed (B2)

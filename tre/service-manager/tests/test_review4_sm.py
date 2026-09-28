@@ -267,7 +267,7 @@ def test_a_cold_start_holding_the_writer_lock_admits_its_own_gated_pod():
 def test_a_defrag_migration_admits_its_destination_pod_under_the_lock():
     world = _defrag_world()
 
-    result = world.service.defrag(tp_size=2)
+    result = world.service.defrag(tp_size=2, force=True)
 
     assert result["migrations"][0]["to_slot"]["gpu_ids"] == [1]
     created = world.runtime.created

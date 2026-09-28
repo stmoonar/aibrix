@@ -5,32 +5,65 @@ from pathlib import Path
 import pytest
 
 from scripts.campaign_queue import (
-    DEFAULT_BASELINE,
     RunSpec,
+    _parse_baseline_overrides,
     arm_config,
     baseline_errors,
     derive_actual_actions,
     deterministic_gzip,
+    generate_baseline,
     load_manifest,
     parse_controller_decisions,
     pod_is_ready,
     redis_keys_to_clear,
     request_health,
+    resolve_baseline,
     select_runs,
 )
+from tre_common.registry import ClusterTopology, ModelSpec, NodeSpec, Registry, SloSpec, TrsParams
+
+
+def _registry() -> Registry:
+    """Synthetic 2 nodes x 4 GPUs, models A/B (tp1) and C (tp2)."""
+    trs = TrsParams(
+        w_p=0.0, w_d=1.0, lambda_wait=3.0, qmin=1.0, ema_alpha=0.2, theta_m=100.0,
+        tau_crit=0.5, tau_low=1.0, tau_high=2.0, qsat=4.0, epsat=0.05, hsat=3,
+    )
+    slo = SloSpec(ttft_p95_ms=500.0, tpot_p95_ms=75.0, e2e_p95_ms=12000.0)
+    nodes = tuple(
+        NodeSpec(name=name, gpus=4, two_gpu_slots=((0, 1), (2, 3)),
+                 gpu_uuids=tuple(f"{name}-{gpu}" for gpu in range(4)))
+        for name in ("n-a", "n-b")
+    )
+    return Registry(
+        ClusterTopology(nodes=nodes),
+        [
+            ModelSpec(name=name, weights_path="/w", tp_size=tp, min_replicas=1,
+                      max_replicas=hi, max_awake_replicas=4, vllm_image="image", slo=slo, trs=trs)
+            for name, tp, hi in (("A", 1, 8), ("B", 1, 8), ("C", 2, 4))
+        ],
+    )
+
+
+REGISTRY = _registry()
+#: An explicit (manifest) baseline: live serve_ids.
+BASELINE = {"A": "a-pod-0", "B": "b-pod-1", "C": "c-pod-4"}
+_SLOTS = {"A": ("n-a", [0]), "B": ("n-a", [1]), "C": ("n-b", [0, 1])}
 
 
 def _state(*, awake=None, hidden=()):
-    awake = set(DEFAULT_BASELINE.values()) if awake is None else set(awake)
+    awake = set(BASELINE.values()) if awake is None else set(awake)
     hidden = set(hidden)
     bindings = []
-    for index, (model, serve_id) in enumerate(DEFAULT_BASELINE.items()):
+    for model, serve_id in BASELINE.items():
+        node, gpu_ids = _SLOTS[model]
         bindings.append(
             {
+                "binding_id": f"{model}/{node}/{','.join(str(g) for g in gpu_ids)}",
                 "serve_id": serve_id,
                 "model": model,
-                "node": "node9",
-                "gpu_ids": [index],
+                "node": node,
+                "gpu_ids": gpu_ids,
                 "awake": serve_id in awake,
                 "hidden": serve_id in hidden,
             }
@@ -47,7 +80,7 @@ def _write_manifest(path: Path, **overrides):
             "service-manager": "sm:tag",
             "ui": "ui:tag",
         },
-        "baseline": DEFAULT_BASELINE,
+        "baseline": BASELINE,
         "cooldown_s": 600,
         "post_drain_s": 30,
         "runs": [
@@ -63,11 +96,12 @@ def test_manifest_pins_freeze_baseline_and_unique_runs(tmp_path):
     path = tmp_path / "manifest.json"
     _write_manifest(path)
 
-    manifest = load_manifest(path)
+    manifest = load_manifest(path, registry=REGISTRY)
 
     assert manifest.frozen_sha == "a" * 40
     assert manifest.cooldown_s == 600
-    assert manifest.baseline == DEFAULT_BASELINE
+    assert manifest.baseline == BASELINE
+    assert manifest.baseline_source == "manifest"
     assert [run.run_id for run in manifest.runs] == ["t1_tre_seed1", "t1_apa_seed1"]
 
     _write_manifest(
@@ -78,7 +112,43 @@ def test_manifest_pins_freeze_baseline_and_unique_runs(tmp_path):
         ],
     )
     with pytest.raises(ValueError, match="duplicate run IDs"):
-        load_manifest(path)
+        load_manifest(path, registry=REGISTRY)
+
+
+def test_generated_baseline_places_one_replica_per_model_by_the_placement_policy():
+    # Registry model order A, B, C on an empty cluster: A and B share one pair of the
+    # first node, C (tp2) takes a pair on the other node -- not all on one node.
+    assert generate_baseline(REGISTRY) == {"A": "A/n-a/0", "B": "B/n-a/1", "C": "C/n-b/0,1"}
+
+
+def test_manifest_without_baseline_uses_the_generated_one_and_cli_overrides(tmp_path):
+    path = tmp_path / "manifest.json"
+    _write_manifest(path, baseline=None)
+
+    manifest = load_manifest(path, registry=REGISTRY)
+    assert manifest.baseline == generate_baseline(REGISTRY)
+    assert manifest.baseline_source == "generated"
+
+    manifest = load_manifest(
+        path, registry=REGISTRY, baseline_override=_parse_baseline_overrides(["A=A/n-b/3"])
+    )
+    assert manifest.baseline["A"] == "A/n-b/3"
+    assert manifest.baseline_source == "cli"
+
+    _write_manifest(path, baseline={"A": "a", "B": "b"})
+    with pytest.raises(ValueError, match="exactly the registered models"):
+        load_manifest(path, registry=REGISTRY)
+    with pytest.raises(ValueError, match="MODEL="):
+        _parse_baseline_overrides(["A"])
+
+
+def test_binding_id_baseline_resolves_to_the_live_serve_ids():
+    by_binding = {model: f"{model}/{node}/{','.join(map(str, gpus))}" for model, (node, gpus) in _SLOTS.items()}
+    assert resolve_baseline(_state(), by_binding) == BASELINE
+    assert baseline_errors(_state(), by_binding) == []
+    assert "missing baseline binding A/n-b/3" in ";".join(
+        baseline_errors(_state(), {**by_binding, "A": "A/n-b/3"})
+    )
 
 
 def test_arm_configs_share_the_tre_gateway_and_keep_apa_counterfactual_logging():
@@ -98,24 +168,24 @@ def test_arm_configs_share_the_tre_gateway_and_keep_apa_counterfactual_logging()
 
 
 def test_baseline_gate_rejects_extra_awake_and_hidden_bindings():
-    assert baseline_errors(_state(), DEFAULT_BASELINE) == []
+    assert baseline_errors(_state(), BASELINE) == []
     extra = _state()
     extra["bindings"].append(
         {
             "serve_id": "extra",
-            "model": "dsqwen-7b",
-            "node": "node10",
+            "model": "A",
+            "node": "n-b",
             "gpu_ids": [0],
             "awake": True,
             "hidden": False,
         }
     )
     assert "unexpected awake bindings" in ";".join(
-        baseline_errors(extra, DEFAULT_BASELINE)
+        baseline_errors(extra, BASELINE)
     )
-    target = next(iter(DEFAULT_BASELINE.values()))
+    target = next(iter(BASELINE.values()))
     assert "not awake+routable" in ";".join(
-        baseline_errors(_state(hidden={target}), DEFAULT_BASELINE)
+        baseline_errors(_state(hidden={target}), BASELINE)
     )
 
 

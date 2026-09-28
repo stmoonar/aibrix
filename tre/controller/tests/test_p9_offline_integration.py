@@ -4,7 +4,7 @@ import pytest
 
 from tre_common.metrics_schema import MetricsSnapshot, ModelWindowMetrics
 from tre_common.rediskeys import DECISION_LATEST_KEY
-from tre_common.registry import ClusterTopology, ModelSpec, NodeSpec, Registry, SloSpec, TrsParams
+from tre_common.registry import ClusterTopology, ModelSpec, NodeSpec, PlacementConfig, Registry, SloSpec, TrsParams
 from tre_controller.loops.action_queue import ActionQueue
 from tre_controller.loops.decision_snapshot import DecisionSnapshotWriter
 from tre_controller.offline_integration import run_offline_integration_step
@@ -269,7 +269,9 @@ async def test_p9_offline_integration_step_closes_metrics_decision_dispatch_chai
 
 @pytest.mark.asyncio
 async def test_p9_offline_integration_defrags_fragmented_capacity_then_expands_tp2() -> None:
-    registry = _registry()
+    base = _registry()
+    # Automatic defrag is opt-in (registry placement.defrag.enabled, default false).
+    registry = Registry(base.topology(), base.models(), placement=PlacementConfig(defrag_enabled=True))
     redis = FakeRedis()
     sm_store = StateStore(redis)
     bindings = (

@@ -29,6 +29,21 @@ data:
           - 1
         - - 2
           - 3
+    # GPU placement policy shared by the controller planner and the service-manager
+    # (tre_common.gpu_placement; design tre/docs/design/20260928-placement-node-balance.md).
+    # The policy's block order cap is derived from the models: log2(max tp_size). Every
+    # key is optional; the values below are the built-in defaults.
+    placement:
+      # Keep this many fully free aligned blocks of the widest model's size (TP2 pairs
+      # with the current models) when waking / creating narrower replicas. Soft: it
+      # ranks placements and never blocks one; bounded by the widest models' remaining
+      # awake headroom; a no-op when every model is tp_size 1.
+      reserve_tp_pairs: 1
+      defrag:
+        # Automatic defragmentation (controller critical_tp_defrag migrations). Off by
+        # default, as in v1. While off, the service-manager POST /v2/defrag also refuses
+        # (409) unless the request body carries force: true.
+        enabled: false
     models:
     - name: dsqwen-7b
       weights_path: /data/nfs_shared_data/DeepSeek-R1-Distill-Qwen-7B
