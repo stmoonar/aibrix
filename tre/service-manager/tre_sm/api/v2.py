@@ -1559,9 +1559,13 @@ class ServiceManagerV2:
         def run(operation) -> None:
             # The SM maintenance lock (not the controller mode) marks the repair
             # for its whole run; clearing it aborts the repair (2026-09-28).
+            # A repair recovering the stale repairs of a dead SM takes over
+            # their lock (if it has not expired yet); any other live holder
+            # refuses it (MaintenanceLockBusy).
             self._safety_gate.acquire_maintenance(
                 operation.operation_id, kind="fleet_repair",
                 owner=str(getattr(self._operation_coordinator, "owner", "")),
+                takeover_operation_ids=list(recovered_from or []),
             )
             try:
                 repair(operation)

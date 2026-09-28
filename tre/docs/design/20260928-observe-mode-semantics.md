@@ -105,9 +105,8 @@ supervisor used to force the controller into observe and never gave it back).
 It holds `tre:v2:sm:maintenance` for its whole run (taken over from a dead SM),
 together with the SM writer lock, so any other SM write gets a retriable 409
 meanwhile. Deleting the key aborts the repair at its next safety check
-(`MaintenanceLockLost`, HTTP 409). A key left behind by a dead SM stays visible
-(`/v2/supervisor` → `maintenance`) until the next repair takes it over; it
-blocks nothing.
+(`MaintenanceLockLost`, HTTP 409). A key left behind by a dead SM expires
+after its TTL (see "Maintenance lock mechanics" below).
 
 ## Fresh deploy
 
@@ -122,3 +121,30 @@ or admitting a restarted Pod next to an awake resident — switch to active
 (console) or act through the SM API. Set the mode explicitly after a deploy:
 `active` for TRE-arm experiments, `observe` for APA-arm experiments and
 calibration (the campaign runners set both keys per arm).
+
+## Maintenance lock mechanics
+
+`tre:v2:sm:maintenance` keeps its JSON payload `{operation_id, kind, owner,
+since_ms}` (`since_ms` = acquire time; renewals do not change it). All three
+operations are Lua scripts on the key (`tre_sm/state/safety.py`), ownership =
+the stored `operation_id`:
+
+- **Acquire**: `SET ... PX <ttl>` when the key is free. A held key is taken
+  over only when its holder is one of the stale operations the new repair
+  recovers (`recovered_from`, i.e. the repairs of a dead SM), when it has no
+  TTL (left by a pre-TTL SM or set by hand) or is not a JSON object. Any other
+  live holder refuses the acquire (`MaintenanceLockBusy`; the repair operation
+  fails and nothing is touched).
+- **Renew**: compare-and-`PEXPIRE`, by a background thread every
+  `TRE_SM_MAINTENANCE_RENEW_S` (default 15 s) and at every safety check
+  (`assert_maintenance_held`, each pressure-wait poll). TTL
+  `TRE_SM_MAINTENANCE_TTL_S` (default 60 s; renew must be at most TTL/2). A
+  renewal that finds the key gone or owned by another operation marks the lock
+  lost; the repair aborts at its next safety check (`MaintenanceLockLost`). A
+  transient Redis error is retried; the TTL bounds it.
+- **Release**: compare-and-`DEL` (never deletes another operation's lock).
+
+A dead SM's lock disappears by itself within the TTL; the controller sees the
+key (presence, `since_ms`) only while a live repair renews it. Operators still
+abort a repair with `DEL tre:v2:sm:maintenance`. Real-Redis tests:
+`service-manager/tests/test_maintenance_lock.py` (`make check-redis`).
