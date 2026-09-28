@@ -129,7 +129,9 @@ COMPLETION_CONT_DROP = ("prompt", "prompt_embeds", "echo", "suffix", "truncate_p
 
 _ABORT_MARK = b'"abort"'
 
-OVERHEAD_BUCKETS_S = (0.00005, 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.05)
+OVERHEAD_BUCKETS_S = (
+    0.00005, 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.05, 0.1, 0.25, 1.0,
+)
 GAP_BUCKETS_S = (0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0)
 
 
@@ -261,6 +263,60 @@ class Histogram:
         return lines
 
 
+class AddedTime:
+    """Time the sidecar itself adds to one request (``tre_reissue_proxy_added_seconds``).
+
+    * ``forward``: from the full client request read to the moment the request is
+      handed to the upstream HTTP client (JSON parse, classification, headers);
+    * ``relay``: summed over the upstream response - from receiving the upstream
+      headers / each upstream chunk to finishing writing it (or the rewritten
+      events) to the client, including the sidecar's own SSE / abort processing.
+
+    Waiting on upstream is excluded: connection setup and body upload inside the
+    upstream client, the time to the response headers (for a non-streaming
+    request: the whole generation) and the gaps between chunks, and the
+    continuation request through the gateway. A chunk write returns once aiohttp
+    has buffered it; it only waits for the socket when the transport's write
+    buffer is above its high-water mark, so a slow client's backpressure can show
+    up in ``relay``. Only requests answered by the local engine are observed; a
+    retried request (sent on through the gateway) is not.
+    """
+
+    __slots__ = ("forward", "relay", "relayed", "_started", "_mark")
+
+    def __init__(self) -> None:
+        self.forward = 0.0
+        self.relay = 0.0
+        self.relayed = False
+        self._started = time.perf_counter()
+        self._mark: float | None = None
+
+    def forwarded(self) -> None:
+        """The request is handed to the upstream client now."""
+        self.forward = time.perf_counter() - self._started
+
+    def start(self) -> None:
+        """Upstream data (headers or a chunk) received: sidecar work starts."""
+        self.relayed = True
+        self._mark = time.perf_counter()
+
+    def stop(self) -> None:
+        """That data was written to the client (or the sidecar stopped to wait on
+        upstream again)."""
+        if self._mark is not None:
+            self.relay += time.perf_counter() - self._mark
+            self._mark = None
+
+    def discard(self) -> None:
+        """The request is retried elsewhere: not a locally answered request."""
+        self.relayed = False
+        self._mark = None
+
+    @property
+    def total(self) -> float:
+        return self.forward + self.relay
+
+
 class Metrics:
     KINDS = ("retry", "continue", "failed", "passthrough_abort")
 
@@ -268,8 +324,19 @@ class Metrics:
         self.model = model
         self.reissue: dict[tuple[str, str], int] = {}
         self.events: dict[str, int] = {}
+        #: forward + relay per request (see :class:`AddedTime`), and the two parts.
         self.overhead = Histogram(OVERHEAD_BUCKETS_S)
+        self.forward = Histogram(OVERHEAD_BUCKETS_S)
+        self.relay = Histogram(OVERHEAD_BUCKETS_S)
         self.gap = Histogram(GAP_BUCKETS_S)
+
+    def observe_added(self, added: "AddedTime") -> None:
+        added.stop()
+        if not added.relayed:
+            return
+        self.overhead.observe(added.total)
+        self.forward.observe(added.forward)
+        self.relay.observe(added.relay)
 
     def count(self, kind: str, reason: str) -> None:
         key = (kind, reason)
@@ -291,11 +358,27 @@ class Metrics:
         for (kind, reason), value in sorted(self.reissue.items()):
             lines.append(f'tre_reissue_total{{model="{model}",kind="{kind}",reason="{reason}"}} {value}')
         lines += [
-            "# HELP tre_reissue_proxy_added_seconds Sidecar time added before the upstream "
-            "request and before the first response byte.",
+            "# HELP tre_reissue_proxy_added_seconds Time the sidecar itself adds to a request "
+            "answered by the local engine: forward (full client request read -> request handed "
+            "to the upstream client) + relay (summed over the response: upstream headers / "
+            "chunk received -> written to the client). Excludes waiting on upstream (response "
+            "headers, i.e. the generation of a non-streaming request, and gaps between chunks); "
+            "a chunk write can include client backpressure.",
             "# TYPE tre_reissue_proxy_added_seconds histogram",
         ]
         lines += self.overhead.render("tre_reissue_proxy_added_seconds", f'model="{model}"')
+        lines += [
+            "# HELP tre_reissue_proxy_forward_seconds Forward part of "
+            "tre_reissue_proxy_added_seconds (client request read -> handed upstream).",
+            "# TYPE tre_reissue_proxy_forward_seconds histogram",
+        ]
+        lines += self.forward.render("tre_reissue_proxy_forward_seconds", f'model="{model}"')
+        lines += [
+            "# HELP tre_reissue_proxy_relay_seconds Relay part of tre_reissue_proxy_added_seconds "
+            "(upstream data received -> written to the client, summed per request).",
+            "# TYPE tre_reissue_proxy_relay_seconds histogram",
+        ]
+        lines += self.relay.render("tre_reissue_proxy_relay_seconds", f'model="{model}"')
         lines += [
             "# HELP tre_reissue_gap_seconds Abort to first continuation token.",
             "# TYPE tre_reissue_gap_seconds histogram",
@@ -851,8 +934,12 @@ class ReissueSidecar:
 
     async def _relay(
         self, request: web.Request, resp: aiohttp.ClientResponse, *, extra: dict[str, str] | None = None,
-        started: float | None = None,
+        added: AddedTime | None = None,
     ) -> web.StreamResponse:
+        """Relay ``resp`` unchanged. With ``added``: time the sidecar's part (headers
+        received -> client headers sent, each chunk received -> written)."""
+        if added is not None:
+            added.start()
         try:
             headers = response_headers(resp.headers)
             if extra:
@@ -865,11 +952,15 @@ class ReissueSidecar:
             except (ConnectionResetError, OSError):
                 resp.close()
                 return out
-            if started is not None:
-                self.metrics.overhead.observe(time.perf_counter() - started)
+            if added is not None:
+                added.stop()
             try:
                 async for data in resp.content.iter_any():
+                    if added is not None:
+                        added.start()
                     await out.write(data)
+                    if added is not None:
+                        added.stop()
             except ConnectionResetError:
                 # The client went away (aiohttp's ClientConnectionResetError is also a
                 # ClientError, so this clause comes first): drop the upstream.
@@ -1023,9 +1114,13 @@ class ReissueSidecar:
 
     # --------------------------------------------------------------- retry path
 
-    async def _retry(self, request: web.Request, raw: bytes, depth: int, reason: str) -> web.StreamResponse:
+    async def _retry(
+        self, request: web.Request, raw: bytes, depth: int, reason: str, added: AddedTime | None = None
+    ) -> web.StreamResponse:
         """Forward a request that has not started (nothing sent to the client) to the
         gateway, unchanged apart from the exclude / depth headers."""
+        if added is not None:
+            added.discard()  # answered elsewhere: not a locally relayed request
         cfg = self.cfg
         if depth + 1 > cfg.max_depth:
             self._account("failed", "depth_limit", request, depth, retry_of=reason)
@@ -1046,9 +1141,17 @@ class ReissueSidecar:
     # --------------------------------------------------------------- generation
 
     async def _handle_generation(self, request: web.Request, path: str) -> web.StreamResponse:
-        cfg = self.cfg
         raw = await request.read()
-        started = time.perf_counter()
+        added = AddedTime()  # the full client request is read: the sidecar's clock starts
+        try:
+            return await self._generation(request, path, raw, added)
+        finally:
+            self.metrics.observe_added(added)
+
+    async def _generation(
+        self, request: web.Request, path: str, raw: bytes, added: AddedTime
+    ) -> web.StreamResponse:
+        cfg = self.cfg
         depth = _int_header(request.headers.get(cfg.depth_header))
         if self.state.active:
             return await self._retry(request, raw, depth, "local_sleeping")
@@ -1061,16 +1164,16 @@ class ReissueSidecar:
                 body = None
         nc_reason = non_continuable_reason(path, body, cfg) if generation else "endpoint"
         epoch = self.state.epoch
+        headers = forward_headers(request.headers, self._local_drop)
+        added.forwarded()
         try:
             resp = await self.local.request(
-                "POST", cfg.upstream_url + request.path_qs, data=raw,
-                headers=forward_headers(request.headers, self._local_drop),
+                "POST", cfg.upstream_url + request.path_qs, data=raw, headers=headers,
             )
         except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
             if self.state.active:
                 return await self._retry(request, raw, depth, "local_unavailable_sleeping")
             return _error(502, f"upstream unavailable: {exc}", "BadGateway")
-        pre = time.perf_counter() - started
         if resp.status == 503:
             payload = await resp.read()
             resp.release()
@@ -1079,13 +1182,13 @@ class ReissueSidecar:
                 return await self._retry(request, raw, depth, "engine_sleeping")
             return web.Response(body=payload, status=503, headers=response_headers(resp.headers))
         if not generation or resp.status != 200 or not isinstance(body, dict):
-            return await self._relay(request, resp, started=time.perf_counter() - pre)
+            return await self._relay(request, resp, added=added)
         ctype = resp.headers.get("Content-Type", "")
         if "text/event-stream" in ctype:
-            return await self._stream(request, path, raw, body, resp, depth, nc_reason, pre)
+            return await self._stream(request, path, raw, body, resp, depth, nc_reason, added)
         if "json" in ctype:
-            return await self._non_stream(request, path, raw, body, resp, depth, nc_reason, pre)
-        return await self._relay(request, resp, started=time.perf_counter() - pre)
+            return await self._non_stream(request, path, raw, body, resp, depth, nc_reason, added)
+        return await self._relay(request, resp, added=added)
 
     def _abort_decision(self, request: web.Request, depth: int, nc_reason: str | None,
                         info: AbortInfo, sent_any: bool) -> tuple[str, str]:
@@ -1125,7 +1228,7 @@ class ReissueSidecar:
 
     async def _stream(
         self, request: web.Request, path: str, raw: bytes, body: dict, resp: aiohttp.ClientResponse,
-        depth: int, nc_reason: str | None, pre: float,
+        depth: int, nc_reason: str | None, added: AddedTime,
     ) -> web.StreamResponse:
         cfg = self.cfg
         chat = path == cfg.chat_path
@@ -1133,7 +1236,6 @@ class ReissueSidecar:
         window = max((len(s) for s in stops), default=1) - 1
         recent: deque[bytes] | None = deque(maxlen=window + 4) if window > 0 else None
         client: web.StreamResponse | None = None
-        t_first = 0.0
         buffer = b""
         abort: AbortInfo | None = None
         first_usage: dict | None = None
@@ -1143,21 +1245,22 @@ class ReissueSidecar:
         async def open_client() -> web.StreamResponse:
             out = web.StreamResponse(status=resp.status, reason=resp.reason, headers=response_headers(resp.headers))
             await out.prepare(request)
-            self.metrics.overhead.observe(pre + time.perf_counter() - t_first)
             return out
 
         try:
             try:
                 async for data in resp.content.iter_any():
+                    # Each chunk: received -> processed / written (sidecar-added time).
+                    added.start()
                     if abort is not None:
                         # The first segment's tail after its abort chunk: usage + [DONE].
                         buffer += data
+                        added.stop()
                         continue
-                    if client is None:
-                        t_first = time.perf_counter()
                     buffer += data
                     cut = buffer.rfind(b"\n\n")
                     if cut < 0:
+                        added.stop()  # a partial event: wait for upstream
                         continue
                     complete = buffer[: cut + 2]
                     buffer = buffer[cut + 2 :]
@@ -1168,6 +1271,7 @@ class ReissueSidecar:
                         if recent is not None:
                             recent.append(complete)
                         await client.write(complete)
+                        added.stop()
                         continue
                     out: list[bytes] = []
                     events = split_events(complete)[0]
@@ -1178,7 +1282,7 @@ class ReissueSidecar:
                         ):
                             resp.close()
                             self._apply_observed(True, self.state.epoch, source="engine_stream_error")
-                            return await self._retry(request, raw, depth, "engine_sleeping")
+                            return await self._retry(request, raw, depth, "engine_sleeping", added)
                         if obj is not None and has_abort(obj):
                             info = self._abort_info(obj, chat, stream=True)
                             action, reason = self._abort_decision(
@@ -1186,7 +1290,7 @@ class ReissueSidecar:
                             )
                             if action == "retry":
                                 resp.close()
-                                return await self._retry(request, raw, depth, reason)
+                                return await self._retry(request, raw, depth, reason, added)
                             if action == "continue":
                                 abort = info
                                 buffer = b"".join(events[index + 1 :]) + buffer
@@ -1200,10 +1304,14 @@ class ReissueSidecar:
                         if recent is not None:
                             recent.append(block)
                         await client.write(block)
+                    added.stop()
             except ConnectionResetError:
                 raise
             except (aiohttp.ClientError, asyncio.TimeoutError):
                 upstream_failed = True
+            # Waiting on upstream (the next chunk / end of stream) is not sidecar time;
+            # a chunk left mid-processing (break, abort tail) is closed here.
+            added.stop()
             if abort is not None:
                 for event in split_events(buffer)[0]:
                     obj = event_obj(event)
@@ -1211,8 +1319,9 @@ class ReissueSidecar:
                         first_usage = obj["usage"]
                 buffer = b""
             elif client is None and not upstream_failed:
-                t_first = t_first or time.perf_counter()
+                added.start()
                 client = await open_client()
+                added.stop()
         except ConnectionResetError:
             resp.close()
             return client if client is not None else web.Response(status=499)
@@ -1220,7 +1329,7 @@ class ReissueSidecar:
             resp.release()
         if abort is not None and client is not None:
             await self._continue_stream(request, client, path, body, depth, abort, first_usage, recent, stops,
-                                        window)
+                                        window, added)
             return client
         if client is None:
             return _error(502, "upstream stream failed before the first event", "BadGateway")
@@ -1229,19 +1338,26 @@ class ReissueSidecar:
                 if request.transport is not None:
                     request.transport.close()
                 return client
+            added.start()
             if buffer:
                 await client.write(buffer)
             await client.write_eof()
         except ConnectionResetError:
             pass
+        finally:
+            added.stop()
         return client
 
     async def _continue_stream(
         self, request: web.Request, client: web.StreamResponse, path: str, body: dict, depth: int,
         abort: AbortInfo, first_usage: dict | None, recent: deque[bytes] | None, stops: list[str], window: int,
+        added: AddedTime | None = None,
     ) -> None:
+        """``added``: each continuation chunk's processing / write counts as relay
+        time; the continuation request through the gateway is upstream time."""
         cfg = self.cfg
         chat = path == cfg.chat_path
+        added = added or AddedTime()
         t_abort = time.monotonic()
         generated = len(abort.generated_ids or ())
         prompt_tokens = (first_usage or {}).get("prompt_tokens")
@@ -1342,6 +1458,7 @@ class ReissueSidecar:
                 parts = []
             try:
                 async for data in cont_resp.content.iter_any():
+                    added.start()
                     buf += data
                     events, buf = split_events(buf)
                     out: list[bytes] = []
@@ -1407,6 +1524,7 @@ class ReissueSidecar:
                             pending, matching, held_sent = [], False, True
                     if out:
                         await client.write(b"".join(out))
+                    added.stop()
                     if stopped_at_seam:
                         cont_resp.close()  # the downstream engine aborts the rest
                         break
@@ -1414,6 +1532,7 @@ class ReissueSidecar:
                 raise
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
                 cont_failed, error = True, f"continuation stream: {type(exc).__name__}: {exc}"
+            added.stop()
             if matching and pending:
                 # The continuation ended inside the window without completing a seam stop.
                 await client.write(b"".join(flush_pending()))
@@ -1459,18 +1578,21 @@ class ReissueSidecar:
 
     async def _non_stream(
         self, request: web.Request, path: str, raw: bytes, body: dict, resp: aiohttp.ClientResponse,
-        depth: int, nc_reason: str | None, pre: float,
+        depth: int, nc_reason: str | None, added: AddedTime,
     ) -> web.StreamResponse:
+        """Relay time: the whole body received -> the response handed back to aiohttp
+        (which sends it after the handler returns; that socket write is not timed),
+        minus the wait for a continuation through the gateway."""
         cfg = self.cfg
         try:
             payload = await resp.read()
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
             if self.state.active:
-                return await self._retry(request, raw, depth, "local_broken_sleeping")
+                return await self._retry(request, raw, depth, "local_broken_sleeping", added)
             return _error(502, f"upstream failed: {exc}", "BadGateway")
         finally:
             resp.release()
-        t_done = time.perf_counter()
+        added.start()
         headers = response_headers(resp.headers)
         obj = None
         if _ABORT_MARK in payload:
@@ -1479,9 +1601,7 @@ class ReissueSidecar:
             except ValueError:
                 obj = None
         if not isinstance(obj, dict) or not has_abort(obj):
-            out = web.Response(body=payload, status=resp.status, headers=headers)
-            self.metrics.overhead.observe(pre + time.perf_counter() - t_done)
-            return out
+            return web.Response(body=payload, status=resp.status, headers=headers)
         chat = path == cfg.chat_path
         info = self._abort_info(obj, chat, stream=False)
         # Non-streaming: nothing reached the client yet, so resending the original request
@@ -1492,7 +1612,7 @@ class ReissueSidecar:
         if action == "retry" and nc_reason is not None:
             reason = f"abort_non_continuable_{nc_reason}"
         if action == "retry":
-            return await self._retry(request, raw, depth, reason)
+            return await self._retry(request, raw, depth, reason, added)
         if action != "continue":
             self._account(action, reason, request, depth)
             return web.Response(body=payload, status=resp.status, headers=headers)
@@ -1524,10 +1644,13 @@ class ReissueSidecar:
         if plan is not None:
             gw_headers = self._gateway_headers(request, model=body.get("model"), depth=depth + 1)
             gw_headers["Content-Type"] = "application/json"
+            added.stop()  # the continuation through the gateway is upstream time
             cont_resp, attempts, error = await self._gateway_request(
                 "POST", plan.path, json.dumps(plan.body).encode("utf-8"), gw_headers
             )
-            if cont_resp is not None:
+            if cont_resp is None:
+                added.start()
+            else:
                 try:
                     cont_payload = await cont_resp.read()
                     target = _target(cont_resp)
@@ -1540,6 +1663,7 @@ class ReissueSidecar:
                     error = f"continuation: {type(exc).__name__}: {exc}"
                 finally:
                     cont_resp.release()
+                    added.start()
         second_choice = ((second or {}).get("choices") or [{}])[0] if isinstance(second, dict) else {}
         finish = second_choice.get("finish_reason") if isinstance(second_choice, dict) else None
         if second is None or finish in (None, "abort"):

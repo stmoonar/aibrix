@@ -95,7 +95,7 @@ tools/functions（除非 `tool_choice: none`）、结构化输出 / guided decod
 | 指标 | 含义 |
 |---|---|
 | `tre_reissue_total{model,kind,reason}` | kind = `retry` / `continue` / `failed` / `passthrough_abort`；reason 细分（`engine_sleeping`、`local_sleeping`、`abort_before_output`、`abort_sleep`、`budget_spent`、`depth_limit`、`retry_exhausted`、`continuation_unavailable`、`continuation_aborted`、`continuation_broken`、`no_token_ids`、`not_sleeping`、`client_gone`、`non_continuable_*`、`abort_non_continuable_*`） |
-| `tre_reissue_proxy_added_seconds` | sidecar 在发上游请求前、以及首字节到达后到发给客户端前花的时间（直方图） |
+| `tre_reissue_proxy_added_seconds` | sidecar 自身给一个本地应答请求增加的时间（直方图）：forward（读完客户端请求 → 交给上游 HTTP 客户端）+ relay（每个上游响应头 / 数据块从收到到写给客户端，按请求累加）；不含等待上游的时间（响应头，即非流式请求的整个生成过程、块间间隔、经网关的续写请求）；块写入在发送缓冲超过高水位时会包含客户端背压；被转发重试的请求不计入。两部分另见 `tre_reissue_proxy_forward_seconds` / `tre_reissue_proxy_relay_seconds` |
 | `tre_reissue_gap_seconds` | abort 到续发首 token（直方图） |
 | `tre_reissue_events_total{event}` | sleep 拒绝 / 失败、状态纠偏、`stop_at_seam` 等 |
 | `tre_reissue_sleeping` | 本地 sleeping 标记 |

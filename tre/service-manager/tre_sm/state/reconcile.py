@@ -247,26 +247,13 @@ def reconcile_state(
     physical_by_serve: dict[str, bool | None] = {}
 
     for pod in sorted(observed, key=lambda item: binding_sort_key(item.to_binding())):
-        binding = pod.to_binding()
-        # Physical /is_sleeping is OBSERVED ground truth and wins over the
-        # tre.aibrix.io/state annotation, which is only a write-through cache.
-        if prober is not None:
-            sleeping = prober.is_sleeping(pod)
-            physical_by_serve[pod.serve_id] = (
-                None if sleeping is None else not sleeping
+        observation = observe_pod(pod, prober)
+        binding = observation.binding
+        physical_by_serve[pod.serve_id] = observation.physical_awake
+        if prober is not None and observation.physical_awake is None:
+            warnings.append(
+                f"{binding.serve_id}: physical power state unknown; quarantined unroutable"
             )
-            if sleeping is not None:
-                binding = replace(binding, awake=not sleeping)
-            else:
-                # Unknown physical state is never eligible for routing. Keeping
-                # awake as observed avoids claiming that a physical sleep was
-                # performed; hidden is the fail-closed quarantine bit.
-                binding = replace(binding, hidden=True)
-                warnings.append(
-                    f"{binding.serve_id}: physical power state unknown; quarantined unroutable"
-                )
-        else:
-            physical_by_serve[pod.serve_id] = binding.awake
         previous = persisted_by_serve.get(binding.serve_id)
         if previous is not None and previous != binding:
             warnings.append(f"{binding.serve_id}: pod reality overrides persisted binding")
@@ -336,6 +323,49 @@ def reconcile_state(
         allocator=allocator,
         observations=observations,
     )
+
+
+def observe_pod(pod: PodRecord, prober: PodPhysicalProber | None) -> BindingObservation:
+    """One pod's observation: the binding its annotations describe, with the
+    power the physical /is_sleeping probe reports (no probe: the annotation)."""
+    binding = pod.to_binding()
+    if prober is None:
+        return BindingObservation(binding=binding, pod=pod, physical_awake=binding.awake)
+    # Physical /is_sleeping is OBSERVED ground truth and wins over the
+    # tre.aibrix.io/state annotation, which is only a write-through cache.
+    sleeping = prober.is_sleeping(pod)
+    if sleeping is None:
+        # Unknown physical state is never eligible for routing. Keeping awake as
+        # observed avoids claiming that a physical sleep was performed; hidden is
+        # the fail-closed quarantine bit.
+        return BindingObservation(
+            binding=replace(binding, hidden=True), pod=pod, physical_awake=None
+        )
+    return BindingObservation(
+        binding=replace(binding, awake=not sleeping), pod=pod, physical_awake=not sleeping
+    )
+
+
+def observe_bindings(
+    k8s_client: K8sPodClient,
+    binding_ids,
+    *,
+    prober: PodPhysicalProber | None = None,
+) -> list[BindingObservation]:
+    """Observations of the live pods of ``binding_ids`` only (a targeted
+    reconcile read: no store / label writes). A binding without a live pod has
+    no observation. Pods whose annotations cannot be parsed are skipped (the
+    full reconcile reports them)."""
+    wanted = set(binding_ids)
+    observations: list[BindingObservation] = []
+    for pod in k8s_client.list_pods():
+        try:
+            binding_id = pod.to_binding().binding_id
+        except ValueError:
+            continue
+        if binding_id in wanted:
+            observations.append(observe_pod(pod, prober))
+    return observations
 
 
 def _enforce_routable_labels(

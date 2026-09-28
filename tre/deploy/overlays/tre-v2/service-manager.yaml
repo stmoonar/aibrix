@@ -69,6 +69,10 @@ spec:
               value: "true"
             - name: TRE_SM_SUPERVISOR_INTERVAL_S
               value: "5"
+            # Level of the SM's own loggers (tre_sm, tre_common); overrides the
+            # registry's service_manager.log_level. uvicorn keeps its own config.
+            - name: TRE_SM_LOG_LEVEL
+              value: INFO
           resources:
             requests:
               cpu: 250m

@@ -27,6 +27,50 @@ from tre_sm.state.store import StateStore
 
 LOG = logging.getLogger(__name__)
 
+#: Loggers of the service-manager's own code; set to the configured level.
+SM_LOGGERS = ("tre_sm", "tre_common")
+LOG_LEVEL_ENV = "TRE_SM_LOG_LEVEL"
+LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+_HANDLER_NAME = "tre-sm-log"
+
+
+def resolve_log_level(environ, registry_level: str | None = None) -> int:
+    """TRE_SM_LOG_LEVEL, else registry ``service_manager.log_level``, else INFO.
+    An unknown env value falls back to INFO (with a warning) rather than keep
+    the SM from starting; the registry value is validated at start."""
+    raw = environ.get(LOG_LEVEL_ENV)
+    source = LOG_LEVEL_ENV
+    if raw is None or not str(raw).strip():
+        raw, source = registry_level, "service_manager.log_level"
+    if raw is None or not str(raw).strip():
+        return logging.INFO
+    level = logging.getLevelName(str(raw).strip().upper())
+    if isinstance(level, int):
+        return level
+    LOG.warning("unknown log level %r from %s; using INFO", raw, source)
+    return logging.INFO
+
+
+def configure_logging(level: int) -> None:
+    """Make the SM's own log lines (seed, clock skew, sleep primitive, ...) visible.
+
+    uvicorn configures only its own loggers (``uvicorn``, ``uvicorn.error``,
+    ``uvicorn.access``: own handlers, no propagation), so records of other
+    loggers reach the root logger, which has no handler and WARNING level. This
+    adds ONE timestamped stderr handler to the root logger (idempotent) and sets
+    the ``tre_sm`` / ``tre_common`` loggers to ``level``; the root level stays
+    as it is, so third-party libraries (kubernetes, urllib3) keep logging at
+    WARNING and uvicorn's lines are not duplicated.
+    """
+    root = logging.getLogger()
+    if not any(handler.get_name() == _HANDLER_NAME for handler in root.handlers):
+        handler = logging.StreamHandler()
+        handler.set_name(_HANDLER_NAME)
+        handler.setFormatter(logging.Formatter(LOG_FORMAT))
+        root.addHandler(handler)
+    for name in SM_LOGGERS:
+        logging.getLogger(name).setLevel(level)
+
 
 class PodSnapshotOps(Protocol):
     def list_pod_snapshots(self) -> list[K8sPodSnapshot]: ...
@@ -47,8 +91,11 @@ def create_app() -> FastAPI:
     except ModuleNotFoundError as exc:
         raise RuntimeError("redis package is required for the service-manager server") from exc
 
+    # Env level first (registry errors are logged too), then the registry's.
+    configure_logging(resolve_log_level(os.environ))
     registry = load_registry(os.environ.get("TRE_REGISTRY_PATH"))
     check_service_manager_config(registry)
+    configure_logging(resolve_log_level(os.environ, registry.service_manager().log_level))
     redis_url = os.environ.get("TRE_REDIS_URL", "redis://aibrix-redis-master:6379/0")
     redis_client = redis.Redis.from_url(redis_url)
     sm_config = registry.service_manager()

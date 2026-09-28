@@ -310,6 +310,9 @@ data:
       # values); validated at SM and controller start. The controller uses it
       # unless TRE_SM_SLOW_TIMEOUT_SECONDS overrides it.
       api_call_timeout_s: 360
+      # Level of the service-manager's own loggers (tre_sm, tre_common): CRITICAL,
+      # ERROR, WARNING, INFO or DEBUG; the TRE_SM_LOG_LEVEL env var overrides it.
+      log_level: INFO
       sleep:
         # Every sleep runs hide (routable=false + route-gen bump) -> gateway plugin ack
         # -> drain -> /sleep (D1/D2); no caller can skip a step.
@@ -380,8 +383,11 @@ data:
         max_used_fraction: 0.2
         # Optional absolute override in MiB; null = use max_used_fraction.
         max_used_mib: null
-        # gpu-truth lags a sleep that just finished: re-read it for up to this long.
-        truth_wait_s: 5
+        # A wake / cold start asks the gpu-truth agent for a fresh sample
+        # (tre:gpu_truth_refresh:<node>) and waits up to this long for one taken after
+        # the request (an old agent without refresh support: re-read the periodic
+        # sample for up to this long). Missing truth still fails closed.
+        truth_wait_s: 10
       clock_skew:
         # Startup check of the local clock against Redis TIME.
         warn_s: 1.0

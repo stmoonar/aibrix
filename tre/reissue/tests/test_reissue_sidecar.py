@@ -641,3 +641,91 @@ def test_merge_exclude_and_config_from_env():
     assert Config.from_env({}).gateway_url == sc.DEFAULT_GATEWAY_URL
     with pytest.raises(ValueError):
         Config.from_env({"TRE_GATEWAY_URL": "10.0.0.1:80"})
+
+
+# ------------------------------------------- B4: tre_reissue_proxy_added_seconds
+
+
+def _hist(h, name: str = "overhead"):
+    return getattr(h.sidecar_a.metrics, name)
+
+
+@pytest.mark.asyncio
+async def test_proxy_added_time_excludes_the_generation_of_a_non_streaming_request():
+    # 30 tokens x 20 ms: the upstream answers after ~0.6 s; the sidecar adds ~ms.
+    async with Harness(a={"token_delay_s": 0.02}) as h:
+        loop = asyncio.get_running_loop()
+        t0 = loop.time()
+        status, _, raw = await h.post("/v1/completions", completion_body(30, stream=False))
+        elapsed = loop.time() - t0
+        assert status == 200 and json.loads(raw)["choices"][0]["finish_reason"] == "length"
+        added = _hist(h)
+        assert added.count == 1
+        assert elapsed > 0.5
+        assert added.sum < 0.1  # was ~elapsed: it included the wait for the response headers
+        assert _hist(h, "forward").count == 1 and _hist(h, "relay").count == 1
+        assert added.sum == pytest.approx(_hist(h, "forward").sum + _hist(h, "relay").sum)
+
+
+@pytest.mark.asyncio
+async def test_proxy_added_time_excludes_the_gaps_between_stream_chunks():
+    async with Harness(a={"token_delay_s": 0.02}) as h:
+        loop = asyncio.get_running_loop()
+        t0 = loop.time()
+        status, _, raw = await h.post("/v1/completions", completion_body(30))
+        elapsed = loop.time() - t0
+        assert status == 200 and finishes(parse_sse(raw)) == ["length"]
+        added = _hist(h)
+        assert added.count == 1  # one observation per request, at the end of the stream
+        assert elapsed > 0.5
+        assert added.sum < 0.1
+        assert _hist(h, "relay").sum > 0  # the per-chunk relay work is counted
+
+
+@pytest.mark.asyncio
+async def test_proxy_added_time_counts_only_locally_answered_requests():
+    async with Harness() as h:
+        assert await h.sleep_a() == 200
+        status, _, _ = await h.post("/v1/completions", completion_body(3, stream=False))
+        assert status == 200
+        assert counts(h)["retry"] == 1
+        assert _hist(h).count == 0  # retried through the gateway: not observed
+
+
+@pytest.mark.asyncio
+async def test_proxy_added_metrics_are_rendered_with_their_definition():
+    async with Harness() as h:
+        await h.post("/v1/completions", completion_body(3, stream=False))
+        async with h.http.get(h.url("/tre-reissue/metrics")) as resp:
+            text = await resp.text()
+        assert "tre_reissue_proxy_added_seconds_count{model=\"m\"} 1" in text
+        assert "tre_reissue_proxy_forward_seconds_count{model=\"m\"} 1" in text
+        assert "tre_reissue_proxy_relay_seconds_count{model=\"m\"} 1" in text
+        help_line = next(line for line in text.splitlines()
+                         if line.startswith("# HELP tre_reissue_proxy_added_seconds"))
+        assert "forward" in help_line and "relay" in help_line and "Excludes waiting on upstream" in help_line
+
+
+def test_added_time_accumulates_only_between_start_and_stop(monkeypatch):
+    now = [100.0]
+    monkeypatch.setattr(sc.time, "perf_counter", lambda: now[0])
+    added = sc.AddedTime()
+    now[0] += 0.002
+    added.forwarded()
+    now[0] += 5.0  # waiting on upstream
+    added.start()
+    now[0] += 0.001
+    added.stop()
+    added.stop()  # idempotent
+    now[0] += 3.0  # waiting for the next chunk
+    added.start()
+    now[0] += 0.0005
+    added.stop()
+    assert added.forward == pytest.approx(0.002)
+    assert added.relay == pytest.approx(0.0015)
+    assert added.total == pytest.approx(0.0035)
+    assert added.relayed is True
+    added.discard()
+    metrics = sc.Metrics("m")
+    metrics.observe_added(added)
+    assert metrics.overhead.count == 0  # discarded (retried) requests are not observed

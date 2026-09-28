@@ -373,6 +373,10 @@ class SleepPolicy:
         return min(budget, self.hard_cap_s)
 
 
+#: Accepted values of ``service_manager.log_level`` (and TRE_SM_LOG_LEVEL).
+LOG_LEVEL_NAMES = ("CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG")
+
+
 @dataclass(frozen=True)
 class ServiceManagerConfig:
     sleep: SleepPolicy = field(default_factory=SleepPolicy)
@@ -382,8 +386,11 @@ class ServiceManagerConfig:
     wake_max_used_fraction: float = 0.2
     #: Optional absolute override (MiB) of the wake threshold; None = the fraction.
     wake_max_used_mib: int | None = None
-    #: gpu-truth lags a just-finished sleep; re-read it for up to this long.
-    wake_truth_wait_s: float = 5.0
+    #: How long a GPU headroom gate (wake, cold start) waits for a gpu-truth
+    #: sample taken AFTER it asked for one (the agent's on-demand refresh,
+    #: ``tre:gpu_truth_refresh:<node>``); with an agent that does not answer
+    #: refreshes it re-reads the periodic sample for up to this long instead.
+    wake_truth_wait_s: float = 10.0
     #: Startup check of the local clock against Redis TIME.
     clock_skew_warn_s: float = 1.0
     #: Refuse to start above this skew (None = warn only).
@@ -401,6 +408,9 @@ class ServiceManagerConfig:
     #: power / defrag). Must exceed :meth:`worst_case_sleep_call_s`; the controller
     #: uses it unless TRE_SM_SLOW_TIMEOUT_SECONDS overrides it (validated too).
     api_call_timeout_s: float = 360.0
+    #: Level of the tre_sm / tre_common loggers (a logging level name); the
+    #: TRE_SM_LOG_LEVEL environment variable overrides it.
+    log_level: str = "INFO"
 
     @property
     def commit_wait_s(self) -> float:
@@ -824,6 +834,9 @@ def parse_service_manager_config(
             None if raw.get("commit_lock_wait_s") is None else float(raw["commit_lock_wait_s"])
         ),
         api_call_timeout_s=_num(raw, "api_call_timeout_s", base.api_call_timeout_s),
+        log_level=(
+            base.log_level if raw.get("log_level") is None else str(raw["log_level"]).strip().upper()
+        ),
     )
 
 
@@ -928,6 +941,11 @@ def _validate_service_manager(
         errors.append("service_manager.writer_lock_wait_s must be >= 0")
     if config.commit_lock_wait_s is not None and config.commit_lock_wait_s < 0:
         errors.append("service_manager.commit_lock_wait_s must be >= 0 or null")
+    if config.log_level not in LOG_LEVEL_NAMES:
+        errors.append(
+            f"service_manager.log_level must be one of {', '.join(LOG_LEVEL_NAMES)}, "
+            f"got {config.log_level!r}"
+        )
     errors.extend(sleep_call_timeout_errors(config, config.api_call_timeout_s))
     return errors
 

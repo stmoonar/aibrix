@@ -157,6 +157,7 @@ def test_tre_v2_overlay_declares_components_and_independent_redis() -> None:
     assert _env(sm)["TRE_SLEEP_LEAK_USED_MIB"] == "8192"
     assert _env(sm)["TRE_SM_SUPERVISOR_ENABLED"] == "true"
     assert _env(sm)["TRE_SM_SUPERVISOR_INTERVAL_S"] == "5"
+    assert _env(sm)["TRE_SM_LOG_LEVEL"] == "INFO"
     assert _node_selector(controller) == {"kubernetes.io/hostname": "nscc-ds-4a100-node10"}
     assert _node_selector(sm) == {"kubernetes.io/hostname": "nscc-ds-4a100-node10"}
     assert _node_selector(ui) == {"kubernetes.io/hostname": "nscc-ds-4a100-node10"}

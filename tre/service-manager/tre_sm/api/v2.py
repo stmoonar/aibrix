@@ -45,11 +45,11 @@ from tre_sm.ops.sleep_primitive import (
     SleepTarget,
 )
 from tre_sm.state.sleep_reservations import ReservationConflict, SleepReservations
-from tre_sm.state.reconcile import K8sPodClient, POD_STATE_AWAKE, POD_STATE_HIDDEN, POD_STATE_SLEEPING, audit_state, reconcile_state
+from tre_sm.state.reconcile import K8sPodClient, POD_STATE_AWAKE, POD_STATE_HIDDEN, POD_STATE_SLEEPING, audit_state, observe_bindings, reconcile_state
 from tre_sm.state.operations import OperationBusy, OperationCoordinator, current_operation
 from tre_sm.state.fleet_repair import FleetRepairExecutor
 from tre_sm.state.fleet_seed import registry_binding_ids, seed_binding_ids, seed_desired
-from tre_sm.state.fleet_store import DesiredBinding, FleetStateStore, ObservedBinding
+from tre_sm.state.fleet_store import DesiredBinding, FleetStateConflict, FleetStateStore, ObservedBinding
 from tre_sm.state.safety import ClusterSafetyGate, ControllerNotPaused, NodePressureActive
 from tre_sm.state.gpu_leases import GpuLeaseConflict, GpuLeaseStore
 from tre_sm.state.store import StateConflict, StateFenceError, StateStore
@@ -63,6 +63,9 @@ LOG = logging.getLogger(__name__)
 #: once the pod is confirmed asleep (also by crash recovery), never before
 #: (review 2 P2-3).
 DESIRED_ON_SLEEP = {"desired_on_sleep": "sleeping"}
+
+#: Poll interval of a GPU headroom gate waiting for a fresh gpu-truth sample.
+TRUTH_POLL_S = 0.2
 
 
 def serialized_operation(kind: str):
@@ -920,6 +923,9 @@ class ServiceManagerV2:
             if actions:
                 updated = [updated_by_serve[binding.serve_id] for binding in snapshot.bindings]
                 version = self._store.save(updated, expected_version=snapshot.version)
+                self._refresh_observed(
+                    updated_by_serve[item["serve_id"]].binding_id for item in actions
+                )
 
         return {
             "model": model,
@@ -1027,10 +1033,7 @@ class ServiceManagerV2:
     def audit(self) -> dict:
         if self._k8s_client is None:
             raise ValueError("k8s_client is required for audit")
-        prober = None
-        if self._vllm_ops is not None and hasattr(self._vllm_ops, "is_sleeping"):
-            prober = _VllmPodProber(self._vllm_ops)
-        result = audit_state(self._store, self._k8s_client, prober=prober)
+        result = audit_state(self._store, self._k8s_client, prober=self._pod_prober())
         issues = list(result.issues)
         if self._fleet_store is not None:
             issues.extend(self._fleet_mismatches())
@@ -1049,9 +1052,7 @@ class ServiceManagerV2:
     def _reconcile_unlocked(self, *, drop_missing: bool = False) -> dict:
         if self._k8s_client is None:
             raise ValueError("k8s_client is required for reconcile")
-        prober = None
-        if self._vllm_ops is not None and hasattr(self._vllm_ops, "is_sleeping"):
-            prober = _VllmPodProber(self._vllm_ops)
+        prober = self._pod_prober()
         label_writer = None
         if self._runtime_ops is not None and hasattr(self._runtime_ops, "set_pod_routable"):
             label_writer = self._runtime_ops
@@ -1259,9 +1260,12 @@ class ServiceManagerV2:
         snapshots = {item.name: item for item in self._runtime_ops.list_pod_snapshots()}
         resolved: list[dict] = []
         kept: list[dict] = []
+        touched: set[str] = set()
         for pod_name, record in sorted(primitive.journal.entries().items()):
             if record.get("reservation_token") in live_tokens:
                 continue
+            if record.get("binding_id"):
+                touched.add(str(record["binding_id"]))
             snapshot = snapshots.get(pod_name)
             if snapshot is None:
                 primitive.journal.end(pod_name)
@@ -1328,6 +1332,8 @@ class ServiceManagerV2:
                 kept.append({"serve_id": pod_name, "result": "physical_state_unknown"})
         if resolved or kept:
             LOG.warning("sleep journal recovery: resolved=%s kept=%s", resolved, kept)
+        if touched:
+            self._refresh_observed(touched)
         return {"resolved": resolved, "kept": kept}
 
     def _awake_long_enough(self, pod_name: str, record: dict) -> bool:
@@ -2328,46 +2334,55 @@ class ServiceManagerV2:
             list(by_id.values()), expected_version=desired_snapshot.version
         )
 
-    def _sync_observed(self, observations) -> None:
+    def _sync_observed(self, observations, *, only=None) -> None:
+        """Write the observed fleet state (read by the audit). ``only=None``
+        (reconcile): the observations replace the whole snapshot. ``only`` = a
+        set of binding ids (after a power operation): only those records are
+        replaced by ``observations`` - a binding without an observation (its
+        pod is gone) loses its record - and every other record is kept."""
         if self._fleet_store is None:
             return
-        snapshot = self._fleet_store.load_observed()
-        records = []
-        for observation in observations:
-            binding = observation.binding
-            pod = observation.pod
-            physical_power = (
-                "unknown"
-                if observation.physical_awake is None
-                else "awake" if observation.physical_awake else "sleeping"
+        fresh = [_observed_record(observation) for observation in observations]
+        for attempt in range(3):
+            snapshot = self._fleet_store.load_observed()
+            if only is None:
+                records = list(fresh)
+            else:
+                records = [item for item in snapshot.bindings if item.binding_id not in only]
+                records.extend(item for item in fresh if item.binding_id in only)
+            records.sort(key=lambda item: item.binding_id)
+            if records == snapshot.bindings:
+                return
+            try:
+                self._fleet_store.save_observed(records, expected_version=snapshot.version)
+                return
+            except FleetStateConflict:
+                if only is None or attempt == 2:
+                    raise
+
+    def _refresh_observed(self, binding_ids) -> None:
+        """Targeted observe after a power operation (B2): re-read the pods of
+        ``binding_ids`` (k8s + physical /is_sleeping, the reconcile's own
+        observation code) and replace only their observed records, so the
+        audit does not report the pre-operation power (desired_power_mismatch,
+        gpu_lease_*) until the next full reconcile. Best effort: a failure is
+        logged and left to the next reconcile; it never fails the operation."""
+        ids = {binding_id for binding_id in binding_ids if binding_id}
+        if not ids or self._fleet_store is None or self._k8s_client is None:
+            return
+        try:
+            observations = observe_bindings(self._k8s_client, ids, prober=self._pod_prober())
+            self._sync_observed(observations, only=ids)
+        except Exception:
+            LOG.warning(
+                "refreshing the observed state of %s failed; the next reconcile does it",
+                sorted(ids), exc_info=True,
             )
-            records.append(
-                ObservedBinding(
-                    binding_id=binding.binding_id,
-                    model=binding.model,
-                    node=binding.slot.node,
-                    gpu_ids=binding.slot.gpu_ids,
-                    pod_name=binding.serve_id,
-                    pod_uid=pod.pod_uid,
-                    pod_ip=pod.pod_ip,
-                    phase=pod.phase,
-                    ready=pod.ready,
-                    restart_count=pod.restart_count,
-                    physical_power=physical_power,
-                    routable=pod.routable,
-                    hidden=binding.hidden,
-                    error=(
-                        "physical_probe_unreachable"
-                        if observation.physical_awake is None
-                        else None
-                    ),
-                )
-            )
-        records.sort(key=lambda item: item.binding_id)
-        if records != snapshot.bindings:
-            self._fleet_store.save_observed(
-                records, expected_version=snapshot.version
-            )
+
+    def _pod_prober(self):
+        if self._vllm_ops is not None and hasattr(self._vllm_ops, "is_sleeping"):
+            return _VllmPodProber(self._vllm_ops)
+        return None
 
     def _fleet_mismatches(
         self,
@@ -2469,19 +2484,23 @@ class ServiceManagerV2:
         self._ensure_wake_headroom(binding)
         if self._gpu_leases is not None:
             self._gpu_leases.acquire(binding, phase="waking")
-        result = self._vllm_ops.wake_up(snapshot.pod_ip, port=8000)
-        if not bool(getattr(result, "success", False)):
-            message = getattr(result, "message", "") or "operation failed"
-            raise ValueError(f"vLLM {action} failed for {binding.serve_id}: {message}")
-        if hasattr(self._vllm_ops, "is_sleeping"):
-            physical = self._vllm_ops.is_sleeping(snapshot.pod_ip, port=8000)
-            if physical is not False:
-                raise ValueError(
-                    f"vLLM {action} did not physically converge for {binding.serve_id}"
-                )
-        self._runtime_ops.write_binding_annotations(binding, state=POD_STATE_AWAKE)
-        if self._gpu_leases is not None:
-            self._gpu_leases.acquire(binding, phase="awake")
+        try:
+            result = self._vllm_ops.wake_up(snapshot.pod_ip, port=8000)
+            if not bool(getattr(result, "success", False)):
+                message = getattr(result, "message", "") or "operation failed"
+                raise ValueError(f"vLLM {action} failed for {binding.serve_id}: {message}")
+            if hasattr(self._vllm_ops, "is_sleeping"):
+                physical = self._vllm_ops.is_sleeping(snapshot.pod_ip, port=8000)
+                if physical is not False:
+                    raise ValueError(
+                        f"vLLM {action} did not physically converge for {binding.serve_id}"
+                    )
+            self._runtime_ops.write_binding_annotations(binding, state=POD_STATE_AWAKE)
+            if self._gpu_leases is not None:
+                self._gpu_leases.acquire(binding, phase="awake")
+        finally:
+            # Woken (or a failed wake, whatever state it left): observed follows (B2).
+            self._refresh_observed([binding.binding_id])
 
     def _sleep_bindings(
         self,
@@ -2541,6 +2560,22 @@ class ServiceManagerV2:
         the legacy store (and restore the hidden flag of rolled-back ones); with
         ``desired_sleeping`` record desired power "sleeping" for exactly the
         targets that slept (review 2 P2-3: desired changes follow the outcome)."""
+        try:
+            self._record_sleep_bookkeeping(
+                targets, outcomes, update_store=update_store, desired_sleeping=desired_sleeping
+            )
+        finally:
+            # Slept or rolled back: the audit must see what the pods are now (B2).
+            self._refresh_observed(target.binding.binding_id for target in targets)
+
+    def _record_sleep_bookkeeping(
+        self,
+        targets: list[SleepTarget],
+        outcomes: list[dict],
+        *,
+        update_store: bool,
+        desired_sleeping: bool,
+    ) -> None:
         by_id = {target.binding.binding_id: target.binding for target in targets}
         slept = [
             by_id[item["binding_id"]]
@@ -2604,26 +2639,85 @@ class ServiceManagerV2:
         same GPU (or a sleep leak) is far above the wake threshold (registry
         ``service_manager.wake.max_used_fraction`` of the GPU's total memory, or
         the absolute ``max_used_mib`` override) and would make the wake OOM or
-        double-book the GPU (the sleeping-capacity deadlock). gpu-truth lags a
-        sleep that just finished, so it is re-read for up to
-        ``wake_truth_wait_s`` before refusing.
+        double-book the GPU (the sleeping-capacity deadlock). A sleep that just
+        finished is not in the periodic sample yet: the gate waits for a fresh
+        one (:meth:`_gpu_truth_gate`).
         """
         if self._gpu_truth is None:
             return
-        clock = self._sleep_clock or _default_sleep_clock()
-        deadline = clock.monotonic() + self._sm_config.wake_truth_wait_s
         nodes = {node.name: node for node in self._registry.topology().nodes}
         node = nodes.get(binding.slot.node)
-        while True:
-            problem = self._wake_headroom_problem(binding, node)
-            if problem is None:
-                return
-            if clock.monotonic() >= deadline:
-                raise WakeConflict(f"insufficient wake headroom: {problem}")
-            clock.sleep(min(1.0, max(0.0, deadline - clock.monotonic())))
+        problem = self._gpu_truth_gate(
+            binding.slot.node,
+            lambda node_truth: self._wake_headroom_problem(binding, node, node_truth),
+            retry_stale=True,
+            what=f"wake of {binding.serve_id}",
+        )
+        if problem is not None:
+            raise WakeConflict(f"insufficient wake headroom: {problem}")
 
-    def _wake_headroom_problem(self, binding: Binding, node) -> str | None:
-        node_truth = self._gpu_truth.node_truth(node=binding.slot.node)
+    def _gpu_truth_gate(self, node_name: str, problem, *, retry_stale: bool, what: str) -> str | None:
+        """Evaluate ``problem(node_truth)`` (None = pass, else the reason) on a
+        gpu-truth sample taken AFTER this call started; returns the reason to
+        refuse, or None.
+
+        The agent samples periodically, so right after a sleep (or a pod deletion)
+        on the same GPU the stored sample still shows the previous occupant. The
+        gate asks the node's agent for a sample (INCR
+        ``tre:gpu_truth_refresh:<node>`` -> N) and waits, up to
+        ``service_manager.wake.truth_wait_s``, for a payload with
+        ``refresh_seq >= N``:
+
+        * fresh and fine -> pass; fresh with a problem -> ask again (memory may
+          still be being released) until the deadline, then refuse;
+        * the agent does not serve refreshes (no ``refresh_seq`` in the payload,
+          e.g. an agent older than this protocol during a rollout) or the request
+          failed: the previous behaviour - a fine sample passes, a problem
+          refuses at once, or (``retry_stale``) after re-reading until the
+          deadline;
+        * no fresh sample by the deadline: a fine (older, TTL-valid) sample
+          passes with a warning, a problem refuses.
+
+        Missing truth is a problem unless ``require_gpu_truth`` is off: the gate
+        stays fail-closed.
+        """
+        clock = self._sleep_clock or _default_sleep_clock()
+        deadline = clock.monotonic() + self._sm_config.wake_truth_wait_s
+        requested = self._request_truth_refresh(node_name)
+        while True:
+            node_truth = self._gpu_truth.node_truth(node=node_name)
+            issue = problem(node_truth)
+            refresh_seq = getattr(node_truth, "refresh_seq", None)
+            serves_refresh = requested is not None and isinstance(refresh_seq, int)
+            fresh = serves_refresh and refresh_seq >= requested
+            if issue is None and (fresh or not serves_refresh):
+                return None
+            if not serves_refresh and not retry_stale:
+                return issue
+            if clock.monotonic() >= deadline:
+                if issue is None:
+                    LOG.warning(
+                        "%s: no gpu-truth sample of %s answered refresh %s within %.1fs; "
+                        "using the last sample (refresh_seq=%s)",
+                        what, node_name, requested, self._sm_config.wake_truth_wait_s, refresh_seq,
+                    )
+                return issue
+            if fresh:
+                requested = self._request_truth_refresh(node_name) or requested
+            clock.sleep(min(TRUTH_POLL_S, max(0.0, deadline - clock.monotonic())))
+
+    def _request_truth_refresh(self, node_name: str) -> int | None:
+        request = getattr(self._gpu_truth, "request_refresh", None)
+        if not callable(request):
+            return None
+        try:
+            value = request(node=node_name)
+        except Exception:
+            LOG.warning("gpu-truth refresh request for %s failed", node_name, exc_info=True)
+            return None
+        return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+    def _wake_headroom_problem(self, binding: Binding, node, node_truth) -> str | None:
         if node_truth is None:
             if not self._require_gpu_truth:
                 return None
@@ -2752,8 +2846,10 @@ class ServiceManagerV2:
                     self._gpu_leases.acquire(binding, phase="awake")
         except BaseException:
             self._discard_failed_start(planned, created)
+            self._refresh_observed([planned.binding_id])
             raise
         self._finish_admitted_start(ready.name)
+        self._refresh_observed([binding.binding_id])
         return binding
 
     def _execute_runtime_defrag_migration(self, binding: Binding, migration: Migration) -> tuple[list[dict], Binding]:
@@ -2770,6 +2866,7 @@ class ServiceManagerV2:
         actions.append({"action": "delete_deployment", "serve_id": binding.serve_id})
 
         self._runtime_ops.wait_pod_deleted(binding.serve_id)
+        self._refresh_observed([binding.binding_id])  # its pod is gone (B2)
         self._ensure_create_headroom(migration.to_slot)
         planned = Binding(
             "defrag-startup", binding.model, migration.to_slot, awake=False
@@ -2839,18 +2936,30 @@ class ServiceManagerV2:
         # standing between a stale view and two models on one GPU. Refuse
         # instead. Set TRE_GPU_TRUTH_REQUIRED=false to restore the old
         # permissive behaviour if truth is unavailable during an emergency.
+        # The gate waits for a fresh gpu-truth sample (_gpu_truth_gate): a
+        # defrag / scale path deletes a pod right before it and the periodic
+        # sample would still show that pod's memory.
         if self._gpu_truth is None:
             return
-        node_truth = self._gpu_truth.node_truth(node=slot.node)
+        nodes = {node.name: node for node in self._registry.topology().nodes}
+        node = nodes.get(slot.node)
+        problem = self._gpu_truth_gate(
+            slot.node,
+            lambda node_truth: self._create_headroom_problem(slot, node, node_truth),
+            retry_stale=False,
+            what=f"cold start on {slot.node}/{','.join(str(g) for g in slot.gpu_ids)}",
+        )
+        if problem is not None:
+            raise ValueError(problem)
+
+    def _create_headroom_problem(self, slot: Slot, node, node_truth) -> str | None:
         if node_truth is None:
             if not self._require_gpu_truth:
-                return
-            raise ValueError(
+                return None
+            return (
                 f"gpu truth unavailable for node {slot.node}: refusing cold start "
                 "(is the tre-v2-gpu-truth DaemonSet healthy?)"
             )
-        nodes = {node.name: node for node in self._registry.topology().nodes}
-        node = nodes.get(slot.node)
         for gpu_id in slot.gpu_ids:
             gpu_uuid = _gpu_uuid(node, gpu_id)
             if gpu_uuid is None:
@@ -2859,16 +2968,16 @@ class ServiceManagerV2:
             if used_mib is None:
                 if not self._require_gpu_truth:
                     continue
-                raise ValueError(
+                return (
                     f"gpu truth unavailable for {slot.node}/{gpu_uuid}: refusing cold start "
                     "(gpu missing from the node truth payload)"
                 )
-            if used_mib <= self._create_max_used_mib:
-                continue
-            raise ValueError(
-                "insufficient startup headroom: "
-                f"{slot.node}/{gpu_uuid} used_mib={used_mib} max_used_mib={self._create_max_used_mib}"
-            )
+            if used_mib > self._create_max_used_mib:
+                return (
+                    "insufficient startup headroom: "
+                    f"{slot.node}/{gpu_uuid} used_mib={used_mib} max_used_mib={self._create_max_used_mib}"
+                )
+        return None
 
     def _snapshot_for_binding(self, binding: Binding) -> K8sPodSnapshot:
         snapshots = self._runtime_ops.list_pod_snapshots(model=binding.model) if self._runtime_ops else []
@@ -2910,6 +3019,33 @@ ADMISSION_RESULT_TTL_S = 600.0
 #: defrag, cold start): the Pod of ``details.binding_id`` is admitted without
 #: the writer lock (review 4 P1).
 STARTING_BINDING_PHASE = "starting_binding"
+
+
+def _observed_record(observation) -> ObservedBinding:
+    """The observed-fleet record of one pod observation (reconcile / refresh)."""
+    binding = observation.binding
+    pod = observation.pod
+    physical_power = (
+        "unknown"
+        if observation.physical_awake is None
+        else "awake" if observation.physical_awake else "sleeping"
+    )
+    return ObservedBinding(
+        binding_id=binding.binding_id,
+        model=binding.model,
+        node=binding.slot.node,
+        gpu_ids=binding.slot.gpu_ids,
+        pod_name=binding.serve_id,
+        pod_uid=pod.pod_uid,
+        pod_ip=pod.pod_ip,
+        phase=pod.phase,
+        ready=pod.ready,
+        restart_count=pod.restart_count,
+        physical_power=physical_power,
+        routable=pod.routable,
+        hidden=binding.hidden,
+        error="physical_probe_unreachable" if observation.physical_awake is None else None,
+    )
 
 
 def _binding_from_outcome(outcome: dict, pod: StartupPodRecord) -> Binding:

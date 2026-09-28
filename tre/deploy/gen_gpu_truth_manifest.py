@@ -6,10 +6,13 @@ default load restrictor forbids a ``configMapGenerator`` that reads a file outsi
 the overlay directory, so the script is embedded inline here instead and kept in
 sync by ``deploy/tests/test_gpu_truth_daemonset.py``.
 
-Run ``python3 deploy/gen_gpu_truth_manifest.py`` after editing the agent script.
+Run ``python3 deploy/gen_gpu_truth_manifest.py`` after editing the agent script
+(``--interval-s`` / ``--refresh-poll-s`` / ``--ttl-s`` tune the agent's command line;
+the guard test expects the defaults).
 """
 from __future__ import annotations
 
+import argparse
 from pathlib import Path
 
 DEPLOY_ROOT = Path(__file__).resolve().parent
@@ -85,9 +88,11 @@ spec:
             - --node
             - $(NODE_NAME)
             - --interval-s
-            - "30"
+            - "{interval_s}"
+            - --refresh-poll-s
+            - "{refresh_poll_s}"
             - --ttl-s
-            - "120"
+            - "{ttl_s}"
           env:
             - name: NODE_NAME
               valueFrom:
@@ -115,14 +120,49 @@ def _indent_script(script: str) -> str:
     return "\n".join(lines) + "\n"
 
 
-def render(script_text: str) -> str:
-    return _HEADER + _indent_script(script_text) + _DAEMONSET
+#: Periodic sample interval (s). The service-manager also asks for a sample on
+#: demand before a wake / cold-start headroom gate (tre:gpu_truth_refresh:<node>).
+DEFAULT_INTERVAL_S = 10.0
+#: How often the agent polls its refresh counter (s); 0 disables refreshes.
+DEFAULT_REFRESH_POLL_S = 0.25
+#: TTL of tre:gpu_truth:<node>; expiry = truth unavailable (gates fail closed).
+DEFAULT_TTL_S = 120
 
 
-def main() -> int:
-    content = render(AGENT_SCRIPT.read_text(encoding="utf-8"))
-    MANIFEST.write_text(content, encoding="utf-8")
-    print(f"wrote {MANIFEST} ({len(content)} bytes)")
+def _num(value: float) -> str:
+    return f"{float(value):g}"
+
+
+def render(
+    script_text: str,
+    *,
+    interval_s: float = DEFAULT_INTERVAL_S,
+    refresh_poll_s: float = DEFAULT_REFRESH_POLL_S,
+    ttl_s: int = DEFAULT_TTL_S,
+) -> str:
+    if interval_s <= 0 or refresh_poll_s < 0 or ttl_s <= interval_s:
+        raise ValueError("need interval_s > 0, refresh_poll_s >= 0 and ttl_s > interval_s")
+    daemonset = _DAEMONSET.format(
+        interval_s=_num(interval_s), refresh_poll_s=_num(refresh_poll_s), ttl_s=int(ttl_s)
+    )
+    return _HEADER + _indent_script(script_text) + daemonset
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--interval-s", type=float, default=DEFAULT_INTERVAL_S)
+    parser.add_argument("--refresh-poll-s", type=float, default=DEFAULT_REFRESH_POLL_S)
+    parser.add_argument("--ttl-s", type=int, default=DEFAULT_TTL_S)
+    parser.add_argument("--output", type=Path, default=MANIFEST)
+    args = parser.parse_args(argv)
+    content = render(
+        AGENT_SCRIPT.read_text(encoding="utf-8"),
+        interval_s=args.interval_s,
+        refresh_poll_s=args.refresh_poll_s,
+        ttl_s=args.ttl_s,
+    )
+    args.output.write_text(content, encoding="utf-8")
+    print(f"wrote {args.output} ({len(content)} bytes)")
     return 0
 
 

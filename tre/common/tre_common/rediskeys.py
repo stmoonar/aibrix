@@ -94,3 +94,24 @@ SM_SLEEP_STATS_KEY = "tre:v2:sm:sleep_stats"
 #: LIST of recent gateway-ack latencies (ms), newest first, capped.
 SM_SLEEP_ACK_LATENCY_KEY = "tre:v2:sm:sleep_ack_latency_ms"
 SM_SLEEP_ACK_LATENCY_MAX = 5000
+
+
+# --- gpu-truth: DaemonSet agent <-> service-manager ---------------------------------
+# The agent (deploy/scripts/gpu_truth_agent.py) runs standalone from a ConfigMap and
+# repeats these literals; deploy/tests/test_gpu_truth_agent.py keeps them equal.
+#: STRING (JSON) per node, SETEX by the agent: {"node", "timestamp", "gpus": [{"uuid",
+#: "used_mib", "total_mib"}], "seq", "refresh_seq"}. Readers SCAN ``tre:gpu_truth:*``.
+GPU_TRUTH_KEY_PREFIX = "tre:gpu_truth:"
+#: STRING counter per node: the service-manager INCRs it to ask for a fresh sample
+#: (reply N); the agent polls it and publishes a sample with ``refresh_seq`` >= N
+#: taken after it read N. Deliberately NOT under ``tre:gpu_truth:`` (that prefix is
+#: scanned for node payloads).
+GPU_TRUTH_REFRESH_KEY_PREFIX = "tre:gpu_truth_refresh:"
+
+
+def gpu_truth_key(node: str) -> str:
+    return f"{GPU_TRUTH_KEY_PREFIX}{node}"
+
+
+def gpu_truth_refresh_key(node: str) -> str:
+    return f"{GPU_TRUTH_REFRESH_KEY_PREFIX}{node}"
