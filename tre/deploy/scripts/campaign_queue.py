@@ -20,13 +20,64 @@ from typing import Any, Iterable, Sequence
 import requests
 
 from scripts.analysis.harvest_signal_log import write_signal_csv
+from tre_common.bindings import render_binding_set
+from tre_common.gpu_placement import GpuBlock, choose_placement, placement_policy_from_registry
+from tre_common.registry import Registry, load_registry
 
 
-DEFAULT_BASELINE = {
-    "dsllama-8b": "dsllama-8b-nscc-ds-4a100-node9-gpu-1-5cb98fdbb6-mr5b7",
-    "dsqwen-7b": "dsqwen-7b-nscc-ds-4a100-node9-gpu-0-546d5d9f88-f94nf",
-    "dsqwen-14b": "dsqwen-14b-nscc-ds-4a100-node9-gpu-2-3-69c86d8db7-vnxtl",
-}
+def generate_baseline(registry: Registry) -> dict[str, str]:
+    """The baseline awake set: one replica per model, in registry model order,
+    placed by the registry placement policy (tre_common.gpu_placement) on an empty
+    cluster over the registry's rendered bindings (tre_common.bindings).
+
+    Returns ``{model: binding_id}`` (``model/node/gpus``); the runner resolves each
+    binding_id to the live serve_id through the service-manager state.  Derived
+    from the registry only, so the layout follows the topology and the policy.
+    NOTE: historical campaigns ran with an all-node9 baseline; runs with the
+    generated baseline are not layout-comparable to them (design
+    tre/docs/design/20260928-placement-node-balance.md).
+    """
+    nodes = {node.name: node.gpus for node in registry.topology().nodes}
+    specs = render_binding_set(registry)
+    occupied: set[tuple[str, int]] = set()
+    awake_counts: dict[str, int] = {}
+    baseline: dict[str, str] = {}
+    for model in registry.models():
+        candidates = [spec for spec in specs if spec.model == model.name]
+        choice = choose_placement(
+            [GpuBlock(spec.node, spec.gpu_ids) for spec in candidates],
+            nodes=nodes,
+            occupied=occupied,
+            tp_size=model.tp_size,
+            policy=placement_policy_from_registry(registry, awake_counts=awake_counts),
+        ) if candidates else None
+        if choice is None:
+            raise ValueError(f"no free binding for the baseline replica of {model.name}")
+        baseline[model.name] = candidates[choice.index].binding_id
+        occupied |= set(choice.block.keys)
+        awake_counts[model.name] = awake_counts.get(model.name, 0) + 1
+    return baseline
+
+
+def resolve_baseline(state: dict[str, Any], baseline: dict[str, str]) -> dict[str, str]:
+    """``{model: serve_id}``: a baseline entry is a serve_id or a binding_id
+    (``model/node/gpus``, as :func:`generate_baseline` returns); binding_ids are
+    mapped to the serve_id currently bound there.  Unknown entries are kept as they
+    are (the baseline gate reports them missing)."""
+    serve_ids = {item["serve_id"] for item in state["bindings"]}
+    by_binding = {_state_binding_id(item): item["serve_id"] for item in state["bindings"]}
+    return {
+        model: ref if ref in serve_ids else by_binding.get(ref, ref)
+        for model, ref in baseline.items()
+    }
+
+
+def _state_binding_id(item: dict[str, Any]) -> str:
+    if item.get("binding_id"):
+        return str(item["binding_id"])
+    gpu_ids = ",".join(str(gpu) for gpu in item.get("gpu_ids", ()))
+    return f"{item['model']}/{item['node']}/{gpu_ids}"
+
 # Both arms go through the SAME tre-v2 gateway (NodePort 31094): same routes, same 600 s
 # timeout, same per-model admission limits, same least-gpu-cache pod choice (ext_proc,
 # tre-v2/tre-gateway-plugins), exactly as v1 ran both arms through one gateway. The APA
@@ -79,6 +130,8 @@ class Manifest:
     cooldown_s: float
     post_drain_s: float
     runs: tuple[RunSpec, ...]
+    #: "manifest" (explicit baseline:), "generated" (generate_baseline) or "cli".
+    baseline_source: str = "manifest"
 
 
 @dataclass(frozen=True)
@@ -111,8 +164,18 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def load_manifest(path: str | Path) -> Manifest:
+def load_manifest(
+    path: str | Path,
+    *,
+    registry: Registry | None = None,
+    baseline_override: dict[str, str] | None = None,
+) -> Manifest:
+    """Load a campaign manifest.  ``baseline`` (model -> serve_id or binding_id) is
+    taken from the manifest's ``baseline:`` when present, else generated from the
+    registry (:func:`generate_baseline`); ``baseline_override`` (CLI ``--baseline``)
+    replaces single models.  It must name exactly the registry's models."""
     raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    registry = registry if registry is not None else load_registry()
     runs = tuple(
         RunSpec(str(item["id"]), str(item["trace"]), str(item["arm"]), int(item["seed"]))
         for item in raw["runs"]
@@ -123,9 +186,18 @@ def load_manifest(path: str | Path) -> Manifest:
     invalid_arms = sorted({run.arm for run in runs} - ALLOWED_ARMS)
     if invalid_arms:
         raise ValueError(f"unsupported campaign arms: {invalid_arms}")
-    baseline = {str(key): str(value) for key, value in raw.get("baseline", DEFAULT_BASELINE).items()}
-    if set(baseline) != set(DEFAULT_BASELINE):
-        raise ValueError("baseline must name exactly the three registered models")
+    if raw.get("baseline") is not None:
+        baseline = {str(key): str(value) for key, value in raw["baseline"].items()}
+        baseline_source = "manifest"
+    else:
+        baseline = generate_baseline(registry)
+        baseline_source = "generated"
+    if baseline_override:
+        baseline.update({str(key): str(value) for key, value in baseline_override.items()})
+        baseline_source = "cli"
+    models = [model.name for model in registry.models()]
+    if set(baseline) != set(models):
+        raise ValueError(f"baseline must name exactly the registered models {models}")
     images = {str(key): str(value) for key, value in raw["images"].items()}
     if set(images) != {"controller", "service-manager", "ui"}:
         raise ValueError("images must pin controller, service-manager, and ui")
@@ -137,6 +209,7 @@ def load_manifest(path: str | Path) -> Manifest:
         params_hash=str(raw["params_hash"]),
         images=images,
         baseline=baseline,
+        baseline_source=baseline_source,
         cooldown_s=float(raw.get("cooldown_s", 600.0)),
         post_drain_s=float(raw.get("post_drain_s", 30.0)),
         runs=runs,
@@ -156,6 +229,7 @@ def arm_config(arm: str) -> ArmConfig:
 
 
 def baseline_errors(state: dict[str, Any], baseline: dict[str, str]) -> list[str]:
+    baseline = resolve_baseline(state, baseline)
     by_id = {item["serve_id"]: item for item in state["bindings"]}
     errors = []
     for model, serve_id in baseline.items():
@@ -459,7 +533,8 @@ class CampaignRunner:
         hidden = [item["serve_id"] for item in state["bindings"] if item["hidden"]]
         if hidden:
             raise RuntimeError(f"refusing to mask hidden bindings during reset: {hidden}")
-        targets = set(self.manifest.baseline.values())
+        baseline = resolve_baseline(state, self.manifest.baseline)
+        targets = set(baseline.values())
         for binding in state["bindings"]:
             if binding["awake"] and binding["serve_id"] not in targets:
                 self.http_json(
@@ -468,7 +543,7 @@ class CampaignRunner:
                 )
         state = self.state()
         by_id = {item["serve_id"]: item for item in state["bindings"]}
-        for model, serve_id in self.manifest.baseline.items():
+        for model, serve_id in baseline.items():
             binding = by_id.get(serve_id)
             if binding is None or binding["model"] != model:
                 raise RuntimeError(f"missing exact baseline binding {model}={serve_id}")
@@ -875,12 +950,37 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--start-at")
     parser.add_argument("--limit", type=int)
     parser.add_argument("--execute", action="store_true")
+    parser.add_argument(
+        "--registry",
+        help="registry.yaml the generated baseline is derived from (default: deploy/registry.yaml)",
+    )
+    parser.add_argument(
+        "--baseline",
+        action="append",
+        default=[],
+        metavar="MODEL=BINDING_OR_SERVE_ID",
+        help="override one model's baseline replica (repeatable)",
+    )
     return parser.parse_args(argv)
+
+
+def _parse_baseline_overrides(values: Sequence[str]) -> dict[str, str]:
+    overrides: dict[str, str] = {}
+    for value in values:
+        model, sep, ref = value.partition("=")
+        if not sep or not model or not ref:
+            raise ValueError(f"--baseline expects MODEL=BINDING_OR_SERVE_ID, got {value!r}")
+        overrides[model] = ref
+    return overrides
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
-    manifest = load_manifest(args.manifest)
+    manifest = load_manifest(
+        args.manifest,
+        registry=load_registry(args.registry),
+        baseline_override=_parse_baseline_overrides(args.baseline),
+    )
     selected = select_runs(
         manifest.runs, start_at=args.start_at, limit=args.limit
     )
@@ -888,6 +988,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     plan = {
         "manifest": str(Path(args.manifest).resolve()),
         "frozen_sha": manifest.frozen_sha,
+        "baseline": manifest.baseline,
+        "baseline_source": manifest.baseline_source,
         "selected_runs": [asdict(run) for run in selected],
         "execute": args.execute,
     }
