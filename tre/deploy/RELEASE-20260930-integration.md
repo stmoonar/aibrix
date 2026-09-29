@@ -253,14 +253,32 @@ same object from the same registry (so the apply is a no-op). Gates stalled > 10
 SM logs, `GET /v2/operations`, then `POST /v2/fleet/repair` (controller in observe).
 Every pod: `image: vllm-openai-tre:0.30.0-ts-8dc0f2a7`, sidecar on :8000.
 
-**8b KV headroom (watch in both waves and on any SM cold create):** with
-`max_model_len: null` 8b needs 16 GiB of KV at util 0.85; a clean start gets 16.76 GiB,
-a start beside a sleeping co-resident got 15.79 GiB and was refused (2026-09-26). If an
-8b pod logs insufficient KV cache / `max_model_len` too large or CrashLoops: stop the
-wave, controller stays observe; first retry that binding alone after its GPU's
-co-residents are asleep (start order); if it still fails, pin 8b `max_model_len` (e.g.
-the previous 32768) in the registry, `make manifests`, registry merge + SM restart, and
-recreate only the 8b Deployments - record the deviation from v1 in `HANDOFF.md`.
+**8b KV headroom (watch in both waves and on any SM cold create):** measured 2026-09-29 on
+the current 0.30 fork image (record: `/data/nfs_shared_data/xxy/deploy-test-20260929-serve-args/RUNLOG.md`,
+`kv-summary.txt`): all 10 8b pods got the same KV, 16.76 GiB / 137,248 tokens, including
+the extra case of a GPU whose two sleeping neighbours (7b + 14b, 2646 MiB together) were
+present. So KV capacity does **not** depend on sleeping neighbours: vLLM budgets
+util x total device memory, and the startup check only requires free memory >= that
+budget (log: `Free memory on device (36.23/39.38 GiB) on startup. Desired GPU memory
+utilization is (0.85, 33.47 GiB)`). The 15.79 GiB refusal of 2026-09-26 came from another
+image (the pinned validation image) and does not apply to the current one.
+Real risks: (1) the margin over the 16 GiB needed for max_model_len 131072 is only
+~0.76 GiB (6,176 tokens), so a full-length 131072 request fits once at a time;
+(2) if a co-resident on the same GPU is **awake**, the startup check fails (free memory
+below the budget). If an 8b pod does not come up: stop the wave, controller stays
+observe, read the pod log and tell the two cases apart:
+- "not enough free memory" (neighbour awake): put the neighbour to sleep first or change
+  the start order, then retry that binding alone;
+- "KV cache too small for max_model_len": pin 8b `max_model_len` (e.g. the previous
+  32768) - see P3-A below.
+
+**P3-A (pinning 8b `max_model_len`).** Order matters so live equals the repo: set
+`max_model_len` in `registry.yaml` (and the `overlays/tre-v2/params.yaml` bootstrap copy),
+run `make manifests`, **commit to the integ branch first**; only then run
+`merge_live_registry.py` + `kubectl replace` + SM restart and recreate only the 8b
+Deployments. Changing 8b's context length changes the theta calibration basis (request
+length mix / KV pressure), so decide the value **before** recalibrating 8b, not after.
+Record the deviation from v1 in `HANDOFF.md`.
 
 ## 6. Smoke and acceptance (in order, stop at the first failure)
 
@@ -285,6 +303,26 @@ Keep `observe observe` through 6.1-6.3; switch to the TRE arm (`active active`) 
    inside the old image `ts-2be2d647` and inside `ts-8dc0f2a7`, per model; report the
    per-prompt token-count difference (expected: 8b differs, 7b / 14b identical). Any
    difference -> that model's theta must be recalibrated before a TRE-arm run.
+   **P3-B commands.** Sample source: the calibration prompt files
+   `<run>/<model>/prompts/<cell>/*.prompts.jsonl` (one JSON per line, field `prompt`;
+   written by `tre_replayer.engine.prompt_store.materialize_prompts`, see
+   `tre/deploy/scripts/openloop.py`), e.g.
+   `/data/nfs_shared_data/xxy/calibration_supp_20260923/<model>/prompts/*/*.prompts.jsonl`.
+   Take the first 200 lines and count tokens in both images, then diff:
+   ```bash
+   W=<weights_path of the model>; F=<one .prompts.jsonl of that model>
+   for IMG in ts-2be2d647 ts-8dc0f2a7; do
+     docker run --rm --entrypoint python3 -e CUDA_VISIBLE_DEVICES= -e HF_HUB_OFFLINE=1        -v $W:$W:ro -v $F:/p.jsonl:ro vllm-openai-tre:0.30.0-$IMG -c "
+   import json,sys
+   from vllm.tokenizers import get_tokenizer
+   t=get_tokenizer('$W')
+   ps=[json.loads(l)['prompt'] for l,_ in zip(open('/p.jsonl'),range(200))]
+   print(json.dumps([len(t.encode(p,add_special_tokens=False)) for p in ps]))" > /tmp/tok-$IMG.json
+   done
+   python3 -c "import json;a,b=[json.load(open('/tmp/tok-ts-%s.json'%x)) for x in ('2be2d647','8dc0f2a7')];d=[y-x for x,y in zip(a,b)];print('n',len(d),'differ',sum(1 for x in d if x),'max|d|',max(map(abs,d)))"
+   ```
+   (If the import path `vllm.tokenizers` differs in the image, use the same
+   `get_tokenizer` import as `check_tokenizer_consistency.py`.)
 2. **Fleet**: 20/20 Ready, no restarts; `GET /v2/audit` (one call) empty; each model
    answers `/v1/completions` and `/v1/chat/completions` through the gateway NodePort.
 3. **Serve args**: pod args show no `--max-model-len` (each model serves its maximum);

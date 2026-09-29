@@ -177,9 +177,12 @@ data:
       - '2048'
       - --gpu-memory-utilization
       - '0.85'
-      # --max-model-len; null = the model's maximum (131072), as in v1. Needs 16 GiB of KV:
-      # a clean start at util 0.85 gets 16.76 GiB, but a start beside a sleeping co-resident
-      # got 15.79 GiB and was refused (2026-09-26) - watch cold starts.
+      # --max-model-len; null = the model's maximum (131072), as in v1. Measured 2026-09-29 (current
+      # 0.30 image): KV is 16.76 GiB / 137,248 tok regardless of sleeping neighbours (vLLM budgets
+      # util x total memory). Real risks: margin only ~0.76 GiB (one full-length request at a time),
+      # and an AWAKE same-GPU neighbour fails the startup free-memory check. If 8b will not start,
+      # read the log: free memory short -> sleep neighbour / reorder; KV < max_model_len -> pin this
+      # (commit + make manifests first, then merge live; changes the theta calibration basis).
       max_model_len: null
     - name: dsqwen-14b
       weights_path: /data/nfs_shared_data/Models/DeepSeek-R1-Distill-Qwen-14B
