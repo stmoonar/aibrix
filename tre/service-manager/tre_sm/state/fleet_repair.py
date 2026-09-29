@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import logging
 import time
 from typing import Callable, Protocol
 
@@ -16,6 +17,8 @@ from tre_sm.state.reconcile import (
 )
 from tre_sm.state.safety import ClusterSafetyGate
 from tre_sm.state.gpu_leases import GpuLeaseStore
+
+LOG = logging.getLogger(__name__)
 
 
 class FleetRuntimeOps(Protocol):
@@ -42,6 +45,7 @@ class FleetRepairExecutor:
         safety_gate: ClusterSafetyGate,
         sleep_binding: Callable[[Binding, str], None],
         gpu_leases: GpuLeaseStore | None = None,
+        on_quarantine: Callable[[list[K8sPodSnapshot]], None] | None = None,
         physical_timeout_s: float = 120.0,
         poll_interval_s: float = 2.0,
         monotonic: Callable[[], float] = time.monotonic,
@@ -54,6 +58,9 @@ class FleetRepairExecutor:
         # The service-manager sleep primitive (hide -> gateway ack -> drain ->
         # /sleep, plan D1/D2); the repair never calls vLLM /sleep itself.
         self._sleep_binding_fn = sleep_binding
+        # Replica floor (2026-09-29): the quarantine hides every resident at once -
+        # exempt from the floor, but the SM records which models it takes below it.
+        self._on_quarantine = on_quarantine
         self._physical_timeout_s = physical_timeout_s
         self._poll_interval_s = poll_interval_s
         self._monotonic = monotonic
@@ -223,6 +230,17 @@ class FleetRepairExecutor:
             except (KeyError, ValueError):
                 continue
             snapshots_by_id.setdefault(binding_id, []).append(snapshot)
+
+        if self._on_quarantine is not None:
+            quarantined = [
+                snapshots_by_id[binding_id][0]
+                for binding_id in deployments
+                if len(snapshots_by_id.get(binding_id, [])) == 1
+            ]
+            try:
+                self._on_quarantine(quarantined)
+            except Exception:  # noqa: BLE001 - recording never blocks a repair
+                LOG.exception("recording the fleet repair floor exemptions failed")
 
         repair_ids: set[str] = set()
         for binding_id, deployment in deployments.items():

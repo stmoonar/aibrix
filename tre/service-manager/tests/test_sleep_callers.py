@@ -309,7 +309,10 @@ def test_defrag_migration_goes_through_primitive():
     )
 
     assert h.paths == [("defrag", None, ["pod-a"])]
-    assert [a["action"] for a in actions][:2] == ["hide", "sleep"]
+    # Make-before-break (replica floor): the new replica is up before the source sleeps.
+    assert [a["action"] for a in actions] == [
+        "create_deployment", "wake", "unhide", "hide", "sleep", "delete_deployment"
+    ]
     h.assert_hidden_before_every_sleep()
 
 

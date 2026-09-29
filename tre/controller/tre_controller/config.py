@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import math
 import os
 from dataclasses import dataclass
@@ -10,6 +11,8 @@ from tre_common.rediskeys import SCRAPE_INTERVAL_MS
 from tre_common.registry import EXPECTED_SIGNAL_DIRECTIONS, load_registry
 from tre_controller.loops.metrics_task import REFRESH_MODES
 from tre_controller.signals.trs import DWELL_STATES
+
+LOG = logging.getLogger(__name__)
 
 SIGNAL_SOURCES = {
     "zm",
@@ -32,24 +35,15 @@ _FALSE_VALUES = {"0", "false", "no", "n", "off"}
 class SafeScaleConfig:
     ttft_p95_slo_ms: float = 500.0
     tpot_p95_slo_ms: float = 75.0
-    # A6: probe window W = clamp(min_window_ms, max_window_ms,
-    # max(2*p95_e2e, cdec*p95_tpot, Q/rate_gap)) - the FORMULA is v1's
-    # (_calc_probe_window_details); the BAND IS NOT v1's. v1 ran 15 s / 300 s with a 20 s
-    # cW2 fallback and a 60 s default (configs/model_slo_profiles.json; its code defaults
-    # were 15 s / 300 s / fallback = max). Here:
-    # * min 60 s comes from the N2 invariant (from_env guard: min*(1-hq) >= metrics window
-    #   + refresh + read offset = 42 s today), not from v1;
-    # * max 120 s is a new decision of the 2026-09 v1/paper alignment (A6);
-    # * cw2_fallback 60 s = the floor (the v2 default had drifted to 300 s, pinning every
-    #   probe with an unknown rate gap at the ceiling); default 60 s (no metrics) as v1.
-    default_window_ms: float = 60_000.0
-    min_window_ms: float = 60_000.0
-    max_window_ms: float = 120_000.0
-    cw2_fallback_ms: float = 60_000.0
-    cdec: float = 2.0
+    # A6: probe window W = max(e2e_multiplier * p95_e2e, min_window_ms). No upper bound:
+    # p95_e2e is bounded by the gateway route timeout (150 s), so W <= ~300 s (v1 cap).
+    # When p95_e2e is missing W = min_window_ms (no avg_ttft fallback). The 20 s floor is
+    # short of the N2 invariant (see from_env): tail observations of a short probe read
+    # metrics windows that partly precede the hide, as in v1 (floor 15 s).
+    min_window_ms: float = 20_000.0
+    e2e_multiplier: float = 2.0
     hq: float = 0.25
     tau_low: float = 1.0
-    epsilon_mu: float = 1e-6
     probe_poll_seconds: float = 2.0
     # A12 (v1 _tail_summary_allows_commit): the commit gate rejects when the tail's max
     # avg KV-cache fill of the donor's remaining serving pods exceeds this (v1: 0.8).
@@ -69,8 +63,8 @@ class SafeScaleConfig:
     # queued behind a long action, or re-submitted after a controller restart - is not run
     # on that stale evidence: the ActionQueue turns it into the donor unhide (rollback,
     # reason ``commit_evidence_stale``). Retries of a commit that already started are
-    # exempt. 120 s = the probe window ceiling (max_window_ms): evidence older than one
-    # full probe window no longer describes the donor. TRE_SAFESCALE_COMMIT_MAX_AGE_MS
+    # exempt. 120 s is independent of the probe window W (which has no ceiling now): it
+    # bounds how stale the evidence a commit runs on may be. TRE_SAFESCALE_COMMIT_MAX_AGE_MS
     # (0 disables).
     commit_max_age_ms: float = 120_000.0
 
@@ -221,14 +215,10 @@ class ControllerConfig:
         safescale = SafeScaleConfig(
             ttft_p95_slo_ms=_get_positive_float(values, "SAFE_SCALE_TTFT_P95_SLO_MS", 500.0),
             tpot_p95_slo_ms=_get_positive_float(values, "SAFE_SCALE_TPOT_P95_SLO_MS", 75.0),
-            default_window_ms=_get_positive_float(values, "SAFE_SCALE_DEFAULT_WINDOW_MS", 60_000.0),
-            min_window_ms=_get_positive_float(values, "SAFE_SCALE_MIN_WINDOW_MS", 60_000.0),
-            max_window_ms=_get_positive_float(values, "SAFE_SCALE_MAX_WINDOW_MS", 120_000.0),
-            cw2_fallback_ms=_get_positive_float(values, "SAFE_SCALE_CW2_FALLBACK_MS", 60_000.0),
-            cdec=_get_positive_float(values, "SAFE_SCALE_CDEC", 2.0),
+            min_window_ms=_get_positive_float(values, "SAFE_SCALE_MIN_WINDOW_MS", 20_000.0),
+            e2e_multiplier=_get_positive_float(values, "SAFE_SCALE_E2E_MULTIPLIER", 2.0),
             hq=_get_positive_float(values, "SAFE_SCALE_HQ", 0.25),
             tau_low=_get_positive_float(values, "SAFE_SCALE_TAU_LOW", 1.0),
-            epsilon_mu=_get_positive_float(values, "SAFE_SCALE_EPSILON_MU", 1e-6),
             probe_poll_seconds=_get_positive_float(values, "SAFE_SCALE_PROBE_POLL_SECONDS", 2.0),
             kv_cache_max=_get_positive_float(values, "SAFE_SCALE_KV_CACHE_MAX", 0.8),
             donor_error_rate_max=_get_positive_float(values, "TRE_SAFESCALE_DONOR_ERROR_RATE_MAX", 0.01),
@@ -238,21 +228,18 @@ class ControllerConfig:
                 values, "TRE_SAFESCALE_COMMIT_MAX_AGE_MS", SafeScaleConfig.commit_max_age_ms
             ),
         )
-        if safescale.min_window_ms > safescale.max_window_ms:
-            raise ValueError("SAFE_SCALE_MIN_WINDOW_MS must be <= SAFE_SCALE_MAX_WINDOW_MS")
 
         metrics_window_ms = _get_positive_int(values, "TRE_METRICS_WINDOW_MS", 30_000)
         # phase_aligned needs metrics_window_ms to be a multiple of the gateway period;
         # metrics_task falls back to free_running (with an error log) when it is not.
-        # N2 invariant (plan 15 §6 N2, architect-ruled; re-based on the adaptive window A6):
-        # the SafeScale commit gate only inspects the tail (hq fraction) of the probe
-        # observations, and every tail observation must read a metrics window that lies
-        # fully after the hide. The tail starts at W*(1-hq) after the hide; an observation
-        # there reads a window ending up to one refresh period + the read offset earlier
-        # and spanning metrics_window_ms, so W_lo*(1-hq) >= metrics_window + refresh +
-        # offset (30 + 10 + 2 s today; W_lo = 60 s, hq = 0.25 -> 45 s). Checked on the
-        # FLOOR min_window_ms because W is clamped to it (the old check used the fixed
-        # default_window_ms, which no longer sets the deadline).
+        # N2 invariant (plan 15 §6 N2): the SafeScale commit gate only inspects the tail (hq
+        # fraction) of the probe observations; a tail observation starts at W*(1-hq) after
+        # the hide and reads a metrics window ending up to one refresh period + the read
+        # offset earlier and spanning metrics_window_ms. Fully post-hide tails would need
+        # W_floor*(1-hq) >= metrics_window + refresh + offset (30 + 10 + 2 s today). With
+        # the 20 s floor this does not hold for short probes, so it is only a warning
+        # (v1, floor 15 s, ran the same way): the tail observations of a short probe read
+        # windows that partly precede the hide. Checked on the FLOOR min_window_ms.
         if safescale.hq < 1.0:
             tail_span_ms = safescale.hq * safescale.min_window_ms
         else:
@@ -265,11 +252,13 @@ class ControllerConfig:
             read_offset_ms = 0.0
         required_ms = metrics_window_ms + refresh_ms + read_offset_ms
         if safescale.min_window_ms - tail_span_ms < required_ms:
-            raise ValueError(
-                "SAFE_SCALE_MIN_WINDOW_MS minus the commit-gate tail span must be >= "
-                "TRE_METRICS_WINDOW_MS + metrics refresh + read offset so SafeScale probe tail "
-                f"observations are fully post-hide (min_window_ms={safescale.min_window_ms}, "
-                f"hq={safescale.hq}, metrics_window_ms={metrics_window_ms}, refresh_ms={refresh_ms}, "
+            LOG.warning(
+                "SAFE_SCALE_MIN_WINDOW_MS minus the commit-gate tail span is below "
+                "TRE_METRICS_WINDOW_MS + metrics refresh + read offset: tail observations of "
+                "a probe as short as the floor read metrics windows that partly precede the "
+                "hide (as in v1, floor 15 s); longer probes (2 x p95_e2e above the floor) are "
+                f"unaffected (min_window_ms={safescale.min_window_ms}, hq={safescale.hq}, "
+                f"metrics_window_ms={metrics_window_ms}, refresh_ms={refresh_ms}, "
                 f"read_offset_ms={read_offset_ms})"
             )
 

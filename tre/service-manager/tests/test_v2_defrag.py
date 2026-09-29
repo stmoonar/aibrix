@@ -207,31 +207,33 @@ def test_v2_defrag_uses_runtime_delete_create_path_and_is_idempotent():
     first = service.defrag(tp_size=2, force=True)
     second = service.defrag(tp_size=2, force=True)
 
+    # Make-before-break (replica floor, 2026-09-29): the new replica is created and
+    # woken before the source is hidden, slept and deleted.
     assert first["actions"] == [
-        {"action": "hide", "serve_id": "serve-b"},
-        {"action": "sleep", "serve_id": "serve-b"},
-        {"action": "delete_deployment", "serve_id": "serve-b"},
         {"action": "create_deployment", "serve_id": "serve-b-new", "node": "node-a", "gpu_ids": [1]},
         {"action": "wake", "serve_id": "serve-b-new"},
         {"action": "unhide", "serve_id": "serve-b-new"},
+        {"action": "hide", "serve_id": "serve-b"},
+        {"action": "sleep", "serve_id": "serve-b"},
+        {"action": "delete_deployment", "serve_id": "serve-b"},
     ]
     assert second["actions"] == []
     assert runtime_ops.calls == [
         ("ensure_route", "m1"),
+        ("create_deployment", "m1", (1,)),
+        ("ensure_route", "m1"),
+        ("wait_ready", "serve-b-new"),
+        ("annotate", "serve-b-new", "awake"),
         ("annotate", "serve-b", "hidden"),
         ("wait_unroutable", "serve-b"),
         ("annotate", "serve-b", "sleeping"),
         ("delete_deployment", "serve-b", (2,)),
         ("wait_deleted", "serve-b"),
-        ("create_deployment", "m1", (1,)),
-        ("ensure_route", "m1"),
-        ("wait_ready", "serve-b-new"),
-        ("annotate", "serve-b-new", "awake"),
     ]
     assert vllm_ops.calls == [
-        ("sleep", "10.0.0.2", 8000),
         ("wait_until_ready", "10.0.0.3", 8000),
         ("wake_up", "10.0.0.3", 8000),
+        ("sleep", "10.0.0.2", 8000),
     ]
     assert store.load().bindings == [
         Binding("serve-a", "m1", Slot("node-a", (0,)), awake=True),

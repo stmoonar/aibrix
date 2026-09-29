@@ -34,7 +34,16 @@ class ServiceManagerError(Exception):
         self.body = body if isinstance(body, dict) else None
 
     @property
+    def floor_violation(self) -> bool:
+        """The SM refused because the call would take a model below its replica
+        floor (409 ``error: floor_violation``, 2026-09-29). Not retried: the planner
+        re-plans on its next tick from a fresh view."""
+        return (self.body or {}).get("error") == "floor_violation"
+
+    @property
     def retriable(self) -> bool:
+        if self.floor_violation:
+            return False
         return self.timeout or self.transport or self.status in RETRIABLE_STATUSES
 
     def result(self) -> dict:
@@ -44,6 +53,8 @@ class ServiceManagerError(Exception):
             "status": self.status,
             "retriable": self.retriable,
         }
+        if self.floor_violation:
+            result["floor_violation"] = (self.body or {}).get("floor")
         outcomes = (self.body or {}).get("outcomes")
         if isinstance(outcomes, list):
             # Per-pod sleep outcomes of a failed sleep (review 4 P2-2): which pods

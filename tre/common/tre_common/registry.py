@@ -544,6 +544,12 @@ class ServiceManagerConfig:
     #: Level of the tre_sm / tre_common loggers (a logging level name); the
     #: TRE_SM_LOG_LEVEL environment variable overrides it.
     log_level: str = "INFO"
+    #: Replica floor (``service_manager.replica_floor.enforce``, 2026-09-29): no hide
+    #: or sleep may leave a model with fewer routable replicas than its registry
+    #: ``min_replicas`` (hide / urgent / scale_down / defrag refused with 409
+    #: floor_violation, APA targets clamped, startup wakes another replica first,
+    #: fleet repair exempt but recorded). false = the previous behaviour.
+    replica_floor_enforce: bool = True
 
     @property
     def commit_wait_s(self) -> float:
@@ -978,6 +984,11 @@ def parse_service_manager_config(
     create_raw = raw.get("create") or {}
     skew_raw = raw.get("clock_skew") or {}
     pressure_raw = raw.get("node_pressure") or {}
+    floor_raw = raw.get("replica_floor") or {}
+    if not isinstance(floor_raw, dict):
+        raise ValueError(
+            f"service_manager.replica_floor must be a mapping (enforce: bool), got {floor_raw!r}"
+        )
     defaults = SleepPolicy()
     plugin_pods_raw = sleep_raw.get("gateway_plugin_pods") or {}
     hard_cap = sleep_raw.get("hard_cap_s")
@@ -1060,6 +1071,9 @@ def parse_service_manager_config(
         api_call_timeout_s=_num(raw, "api_call_timeout_s", base.api_call_timeout_s),
         log_level=(
             base.log_level if raw.get("log_level") is None else str(raw["log_level"]).strip().upper()
+        ),
+        replica_floor_enforce=_parse_bool(
+            floor_raw.get("enforce", base.replica_floor_enforce)
         ),
     )
 

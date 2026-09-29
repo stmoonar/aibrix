@@ -288,7 +288,7 @@ def test_rescue_tick_can_use_legacy_drop_all_for_incomplete_paper_state() -> Non
 
 def test_rescue_tick_converts_safescale_required_downscale_to_probe_hide() -> None:
     queue = FakeQueue()
-    safescale = SafeScaleStateMachine(config=SafeScaleConfig(default_window_ms=60_000.0))
+    safescale = SafeScaleStateMachine(config=SafeScaleConfig(min_window_ms=60_000.0))
     registry = _registry_with_models("critical", "donor")
     snapshot = MetricsSnapshot(
         ts_ms=10_000,
@@ -311,19 +311,16 @@ def test_rescue_tick_converts_safescale_required_downscale_to_probe_hide() -> No
     assert result.actions == queue.submitted[0]
     assert safescale.active_probe("donor").pending_upscales == {"critical": 1}
     assert "safescale_probe_started:donor" in result.events
-    # A6: the adaptive window is computed from the donor's serving window and context and
-    # logged as an event. The donor runs at Z = 1 (TSS == theta), so v1's capacity model
-    # leaves no spare rate after hiding 1 of 2 pods -> the Q/rate_gap term takes the 60 s
-    # fallback, which dominates W1 = 2 * p95_e2e = 2 s.
+    # A6: W = max(2 * p95_e2e, floor): the donor's p95_e2e is 1 s -> W1 = 2 s, so the
+    # 60 s floor of this config sets the window; the breakdown is logged as an event.
     probe = safescale.active_probe("donor")
     assert probe.window_ms == 60_000.0 and probe.deadline_ms == 70_000
     assert probe.window_terms["inputs"]["p95_e2e_ms"] == 1000.0
-    assert probe.window_terms["inputs"]["routable_pods"] == 2
-    assert probe.window_terms["inputs"]["interval_s"] == 60.0
+    assert probe.window_terms["inputs"]["hidden_count"] == 1
     assert probe.window_terms["W1"] == 2_000.0
-    assert (probe.window_terms["dominant"], probe.window_terms["cW2_fallback"]) == ("queue", True)
+    assert probe.window_terms["dominant"] == "floor"
     assert any(
-        event.startswith("safescale_probe_window:donor:W=60000:dominant=queue:clamped=none:e2e=2000")
+        event.startswith("safescale_probe_window:donor:W=60000:dominant=floor:e2e=2000:floor=60000")
         for event in result.events
     )
 
@@ -771,7 +768,7 @@ def test_rescue_tick_converts_same_slot_shrink_to_safescale_probe_hide() -> None
     from tre_sm.allocator.slots import Binding, Slot
 
     queue = FakeQueue()
-    safescale = SafeScaleStateMachine(config=SafeScaleConfig(default_window_ms=60_000.0))
+    safescale = SafeScaleStateMachine(config=SafeScaleConfig(min_window_ms=60_000.0))
     registry = _registry_for_same_slot_shrink()
     snapshot = MetricsSnapshot(
         ts_ms=20_000,
@@ -812,7 +809,7 @@ def test_rescue_tick_holds_high_probe_of_a_model_in_rollback_backoff() -> None:
         stale=False,
         models={"hot": _metrics_with_pods("hot", generation=1000.0, waiting=0.0, running=1.0, pods=("hot-a", "hot-b"))},
     )
-    safescale = SafeScaleStateMachine(config=SafeScaleConfig(default_window_ms=60_000.0))
+    safescale = SafeScaleStateMachine(config=SafeScaleConfig(min_window_ms=60_000.0))
 
     probed = run_rescue_tick(snapshot, queue=FakeQueue(), registry=registry, safescale=safescale)
     assert any(isinstance(a, HideAction) for a in probed.actions)
@@ -867,7 +864,7 @@ def test_scale_up_of_a_probing_model_preempts_its_probe_like_v1() -> None:
     from tre_controller.planning.planner import UnhideAction
 
     registry = _registry()
-    safescale = SafeScaleStateMachine(config=SafeScaleConfig(default_window_ms=60_000.0))
+    safescale = SafeScaleStateMachine(config=SafeScaleConfig(min_window_ms=60_000.0))
     safescale.start_probe(model="critical", pods=("critical-1",), now_ms=0)
     snapshot = MetricsSnapshot(
         ts_ms=1_000,

@@ -82,10 +82,11 @@ def test_full_layout_defrag_sleeps_the_source_and_wakes_the_existing_destination
             "to_slot": {"node": "node-a", "gpu_ids": [1]},
         }
     ]
+    # Make-before-break (replica floor, 2026-09-29): the destination wakes first.
     assert result["actions"] == [
+        {"action": "wake", "serve_id": "pod-c"},
         {"action": "hide", "serve_id": "pod-b"},
         {"action": "sleep", "serve_id": "pod-b"},
-        {"action": "wake", "serve_id": "pod-c"},
     ]
     assert world.runtime.deployment_calls == []  # no delete, no create
     assert world.vllm.sleeping["10.0.0.2"] is True

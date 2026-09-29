@@ -325,6 +325,15 @@ service_manager:
   # Level of the service-manager's own loggers (tre_sm, tre_common): CRITICAL,
   # ERROR, WARNING, INFO or DEBUG; the TRE_SM_LOG_LEVEL env var overrides it.
   log_level: INFO
+  # Replica floor (2026-09-29): no hide or sleep may leave a model with fewer
+  # ROUTABLE replicas (awake, not hidden, Ready, no sleep reservation, not being
+  # woken) than its models[].min_replicas - both arms (TRE and APA) use it.
+  # SafeScale hide / urgent / scale_down / defrag: refused (409 floor_violation;
+  # the controller re-plans next tick). APA (/scale_service): target clamped.
+  # Startup admission: another replica is woken first, else retry later. Fleet
+  # repair: exempt, recorded. Counters: GET /v2/sleep -> floor. false = off.
+  replica_floor:
+    enforce: true
   sleep:
     # Every sleep runs hide (routable=false + route-gen bump) -> gateway plugin ack
     # -> drain -> /sleep (D1/D2); no caller can skip a step.

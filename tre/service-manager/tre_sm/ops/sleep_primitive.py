@@ -71,6 +71,7 @@ reservation_lost), so callers account for exactly the pods that slept.
 from __future__ import annotations
 
 from collections import deque
+from contextlib import nullcontext
 from concurrent.futures import ThreadPoolExecutor, wait
 import contextvars
 from dataclasses import dataclass, field
@@ -494,8 +495,16 @@ class SleepPrimitive:
         clock: Clock | None = None,
         owner: str = "service-manager",
         operation_id: Callable[[], str | None] | None = None,
+        floor_guard: Callable[[list[SleepTarget], str], None] | None = None,
+        floor_lock=None,
     ) -> None:
         self._runtime = runtime_ops
+        # Replica floor (2026-09-29): ``floor_guard(targets, path)`` raises when the
+        # sleep would take a model below its floor; it runs right before the targets
+        # are reserved and hidden, under ``floor_lock`` together with the hide so no
+        # other hide / sleep of this process passes the check in between.
+        self._floor_guard = floor_guard
+        self._floor_lock = floor_lock
         self._vllm = vllm_ops
         self._policy = policy
         self._gateway = gateway
@@ -591,6 +600,21 @@ class SleepPrimitive:
         recovery applies when it finds the pod asleep)."""
         if self._shutdown.is_set():
             raise ServiceShuttingDown("service-manager is shutting down; no new sleep")
+        with self._floor_lock if self._floor_lock is not None else nullcontext():
+            if self._floor_guard is not None:
+                self._floor_guard(list(targets), path)
+            return self._prepare_unguarded(
+                targets, path=path, drain_budget_s=drain_budget_s, journal_extra=journal_extra
+            )
+
+    def _prepare_unguarded(
+        self,
+        targets: list[SleepTarget],
+        *,
+        path: str,
+        drain_budget_s: float | None,
+        journal_extra: Mapping | None,
+    ) -> SleepBatch:
         clock = self._clock or DEFAULT_CLOCK
         soft_s = self._policy.soft_budget_s(path, drain_budget_s)
         batch = SleepBatch(

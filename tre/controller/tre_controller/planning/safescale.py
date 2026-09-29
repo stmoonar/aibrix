@@ -260,8 +260,7 @@ class SafeScaleStateMachine:
             return SafeScaleDecision(status="none", reason="no_pods_to_probe")
 
         normalized_pending = _normalize_pending_upscales(pending_upscales)
-        # A6 (v1 safescale.py start_hidden_probe): adaptive window
-        # W = clamp(W_lo, W_hi, max(2*p95_e2e, cdec*p95_tpot, Q/rate_gap)).
+        # A6: adaptive window W = max(e2e_multiplier * p95_e2e, min_window_ms), no ceiling.
         terms = calc_probe_window_details(
             window_inputs or ProbeWindowInputs(), hidden_count=len(pods), config=self._config
         )
@@ -372,10 +371,11 @@ class SafeScaleStateMachine:
                 pods=probe.pods,
                 delta=-len(probe.pods),
                 reason=reason,
-                # Plan D1: drain budget of the commit = one probe window. Used only
-                # when the SM registry drains safescale_commit (no_drain_paths without
-                # it); by default the commit does not drain - the probe window, with
-                # the pods already hidden, was the drain (v1 / paper, 2026-09-29).
+                # Plan D1: drain_budget_s = W is still sent to the SM, but it is ignored
+                # while safescale_commit is in service_manager.sleep.no_drain_paths (the
+                # default): SleepPolicy.soft_budget_s (tre_common/registry.py) returns 0
+                # for no-drain paths whatever budget the caller passes. The probe window,
+                # with the pods already hidden, was the drain (v1 / paper, 2026-09-29).
                 drain_budget_s=(
                     float(probe.window_ms) / 1000.0 if probe.window_ms else None
                 ),
@@ -491,134 +491,34 @@ def donor_health(probe: SafeScaleProbe, observation: ProbeObservation) -> dict[s
     return {"requests": requests, "errors": errors, "error_rate": (errors / requests) if requests > 0 else 0.0}
 
 
-def _estimate_post_drain_gap_per_second(
-    *,
-    y_total: float | None,
-    y_per_pod: float | None,
-    z_m: float | None,
-    routable_pods: int | None,
-    hidden_count: int,
-    interval_s: float | None,
-) -> float | None:
-    """v1 ``_estimate_post_drain_gap_per_second`` verbatim: the spare service rate left
-    after hiding ``hidden_count`` pods, in Y units (weighted tokens) per second.
-
-    arrival = Y_m / interval; capacity = arrival * max(1, Z_m) (Z_m = TSS / theta_m, used
-    by v1 as the spare-capacity multiplier); gap = per-pod capacity * remaining pods -
-    arrival, floored at 0.
-    """
-    interval = _positive(interval_s)
-    current_pods = max(1, int(routable_pods) if routable_pods is not None else 1)
-    remaining_pods = max(0, current_pods - max(0, int(hidden_count)))
-    if interval is None or remaining_pods <= 0:
-        return None
-    y_all = _nonneg(y_total)
-    y_pod = _nonneg(y_per_pod)
-    if y_all is None and y_pod is None:
-        return None
-    arrival_rate = (y_all / interval) if y_all is not None else (y_pod * current_pods) / interval
-    if arrival_rate <= 0:
-        return None
-    spare_multiplier = _positive(z_m) or 1.0
-    current_capacity = arrival_rate * max(1.0, spare_multiplier)
-    per_pod_capacity = current_capacity / current_pods
-    mu_post = per_pod_capacity * remaining_pods
-    return max(0.0, mu_post - arrival_rate)
-
-
 def calc_probe_window_details(
     inputs: ProbeWindowInputs,
     *,
     hidden_count: int,
     config: SafeScaleConfig,
 ) -> dict[str, Any]:
-    """Port of v1 ``safescale._calc_probe_window_details`` (v1 safescale.py:302-359).
-    The FORMULA is v1's; the band is not (see SafeScaleConfig: v1 ran 15 s / 300 s with a
-    20 s cW2 fallback).
+    """Probe window W = max(e2e_multiplier * p95_e2e_ms, min_window_ms).
 
-    * W1 = 2 * p95_e2e (``default_window_ms`` when unavailable);
-    * queue term cW2 = Q / rate_gap (s -> ms) when Q > 0; ``cw2_fallback_ms`` when the
-      post-hide rate gap is unknown or <= epsilon_mu;
-    * decode term = cdec * p95_tpot;
-    * W2 = max(queue term, decode term) (``default_window_ms`` when neither exists);
-    * W = clamp(min_window_ms, max_window_ms, max(W1, W2)).
-
-    Returns every term plus ``dominant`` (which term set the unclamped max: e2e / queue /
-    decode / default) and ``clamped`` (lo / hi / None) for the probe record and events.
+    No upper bound (p95_e2e is bounded by the gateway route timeout, so W <= ~300 s, v1's
+    cap). A missing / non-positive p95_e2e gives W = min_window_ms (no avg_ttft fallback).
+    Returns W, W1 (multiplier * p95_e2e or None), W_floor, e2e_multiplier, ``dominant``
+    (e2e / floor) and the inputs, for the probe record and events.
     """
-    default_ms = float(config.default_window_ms)
-    lo_ms = float(config.min_window_ms)
-    hi_ms = float(config.max_window_ms)
-    # v1 start_hidden_probe (safescale.py:504-509): p95_e2e or avg_ttft, p95_tpot or avg_tpot.
+    floor_ms = float(config.min_window_ms)
+    multiplier = float(config.e2e_multiplier)
     p95_e2e = _positive(inputs.p95_e2e_ms)
-    latency_source = "p95_e2e" if p95_e2e is not None else None
-    if p95_e2e is None:
-        p95_e2e = _positive(inputs.avg_ttft_ms)
-        latency_source = "avg_ttft" if p95_e2e is not None else None
-    p95_tpot = _positive(inputs.p95_tpot_ms)
-    decode_source = "p95_tpot" if p95_tpot is not None else None
-    if p95_tpot is None:
-        p95_tpot = _positive(inputs.avg_tpot_ms)
-        decode_source = "avg_tpot" if p95_tpot is not None else None
-    w1 = 2.0 * p95_e2e if p95_e2e is not None else default_ms
-
-    gap = _estimate_post_drain_gap_per_second(
-        y_total=inputs.y_total,
-        y_per_pod=inputs.y_per_pod,
-        z_m=inputs.z_m,
-        routable_pods=inputs.routable_pods,
-        hidden_count=hidden_count,
-        interval_s=inputs.interval_s,
-    )
-    cw2_fallback = min(hi_ms, _positive(config.cw2_fallback_ms) or hi_ms)
-    q = _nonneg(inputs.q)
-    queue_term: float | None = None
-    queue_fallback = False
-    if q is not None and q > 0:
-        if gap is None or gap <= config.epsilon_mu:
-            queue_term = cw2_fallback
-            queue_fallback = True
-        else:
-            queue_term = (q / max(gap, config.epsilon_mu)) * 1000.0
-    decode_term = max(0.0, config.cdec) * p95_tpot if p95_tpot is not None else None
-
-    w2_candidates = [value for value in (queue_term, decode_term) if value is not None]
-    w2 = max(w2_candidates) if w2_candidates else default_ms
-    raw = max(w1, w2)
-    window = max(lo_ms, min(hi_ms, raw))
-
-    if raw == w1 and p95_e2e is not None:
-        dominant = "e2e"
-    elif w2_candidates and raw == w2:
-        dominant = "queue" if queue_term is not None and w2 == queue_term else "decode"
-    else:
-        dominant = "default"
-    clamped = "lo" if raw < lo_ms else ("hi" if raw > hi_ms else None)
+    w1 = multiplier * p95_e2e if p95_e2e is not None else None
+    window = max(w1, floor_ms) if w1 is not None else floor_ms
+    dominant = "e2e" if w1 is not None and w1 > floor_ms else "floor"
     return {
         "W": window,
-        "W_raw": raw,
         "W1": w1,
-        "W2": w2,
-        "cW2": queue_term,
-        "cW2_fallback": queue_fallback,
-        "decode_term_ms": decode_term,
-        "rate_gap_per_second": gap,
+        "W_floor": floor_ms,
+        "e2e_multiplier": multiplier,
         "dominant": dominant,
-        "clamped": clamped,
-        "W_lo": lo_ms,
-        "W_hi": hi_ms,
         "inputs": {
             "p95_e2e_ms": p95_e2e,
-            "p95_tpot_ms": p95_tpot,
-            "latency_source": latency_source,
-            "decode_source": decode_source,
-            "q": q,
-            "y_total": _nonneg(inputs.y_total),
-            "y_per_pod": _nonneg(inputs.y_per_pod),
-            "z_m": _positive(inputs.z_m),
-            "routable_pods": inputs.routable_pods,
             "hidden_count": int(hidden_count),
-            "interval_s": _positive(inputs.interval_s),
         },
     }
 
@@ -636,10 +536,8 @@ def format_window_event(model: str, terms: dict[str, Any]) -> str:
 
     return (
         f"safescale_probe_window:{model}:W={fmt(terms.get('W'))}"
-        f":dominant={terms.get('dominant')}:clamped={terms.get('clamped') or 'none'}"
-        f":e2e={fmt(terms.get('W1'))}:queue={fmt(terms.get('cW2'))}"
-        f":decode={fmt(terms.get('decode_term_ms'))}:gap={fmt(terms.get('rate_gap_per_second'))}"
-        f":fallback={fmt(terms.get('cW2_fallback'))}"
+        f":dominant={terms.get('dominant')}:e2e={fmt(terms.get('W1'))}"
+        f":floor={fmt(terms.get('W_floor'))}"
     )
 
 

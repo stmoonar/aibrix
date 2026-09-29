@@ -296,7 +296,9 @@ def build_plan(
     # A13: models whose last SafeScale probe rolled back recently (no new HIGH proactive
     # probe until TRE_SAFESCALE_ROLLBACK_BACKOFF_MS has passed).
     probe_backoff_models = probe_backoff_models or set()
-    inflight_models = inflight_models or set()
+    # A local copy: donors this plan claims (the same-slot shrink below) are added to it
+    # so later receivers of the same tick skip them; the caller's set is not mutated.
+    inflight_models = set(inflight_models or ())
     actions: list[Action] = []
     deltas: dict[str, int] = {}
     delayed_down_models: set[str] = set()
@@ -438,6 +440,7 @@ def build_plan(
                     receiver=recv.model_name,
                     active_probe_models=active_probe_models,
                     inflight_models=inflight_models | cooldown.down_blocked(),
+                    planned_deltas=deltas,
                     source_loop="rescue",
                 )
                 if same_slot_shrink is not None:
@@ -449,6 +452,13 @@ def build_plan(
                     actions.append(same_slot_shrink)
                     slot_shrink_donors.add(same_slot_shrink.donor)
                     delayed_down_models.add(same_slot_shrink.donor)
+                    # Replica floor (2026-09-29, fix C): the shrink takes one replica of
+                    # the donor. Record it in the plan's deltas and claim the donor for
+                    # this tick, so a later CRITICAL receiver (the donor loop below) or
+                    # another TP>1 receiver never takes the same donor again - two
+                    # takes from a 2-replica donor with min_replicas 1 would leave 0.
+                    deltas[same_slot_shrink.donor] = deltas.get(same_slot_shrink.donor, 0) - 1
+                    inflight_models.add(same_slot_shrink.donor)
                     events.append(
                         f"safescale_preemption:{same_slot_shrink.donor}->{recv.model_name}:{same_slot_shrink.reason}"
                     )
@@ -1335,6 +1345,7 @@ def _try_plan_same_slot_high_shrink(
     active_probe_models: set[str],
     inflight_models: set[str],
     source_loop: SourceLoop,
+    planned_deltas: Mapping[str, int] | None = None,
 ) -> ShrinkForSlotAction | None:
     high_by_model = {item.model_name: item for item in classifications if item.state == ModelState.HIGH}
     candidates: list[tuple[float, Binding]] = []
@@ -1351,7 +1362,10 @@ def _try_plan_same_slot_high_shrink(
         if binding.model == receiver or len(binding.slot.gpu_ids) != 1:
             continue
         donor_pods = _effective_routable_replicas(binding.model, model_contexts, model_replicas)
-        if donor_pods <= _min_replicas(cfg, binding.model):
+        # Takes already planned this tick (e.g. a critical_donor_immediate of an earlier
+        # receiver) count against the donor's floor too.
+        planned_take = abs(min((planned_deltas or {}).get(binding.model, 0), 0))
+        if donor_pods - planned_take <= _min_replicas(cfg, binding.model):
             continue
         if not _slot_mate_is_free(cluster_view, binding.slot, occupied):
             continue

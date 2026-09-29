@@ -109,17 +109,14 @@ spec:
               value: "500"
             - name: SAFE_SCALE_TPOT_P95_SLO_MS
               value: "75"
-            # A6: adaptive probe window W = clamp(MIN, MAX, max(2*p95_e2e, CDEC*p95_tpot,
-            # Q/rate_gap)) - v1's formula, NOT v1's band (v1: 15 s / 300 s / fallback 20 s).
-            # MIN 60 s is forced by the N2 startup guard MIN*(1-HQ) >= TRE_METRICS_WINDOW_MS
-            # + 10 s refresh + phase offset; MAX 120 s is new (2026-09 alignment); the queue
-            # term falls back to CW2_FALLBACK when the post-hide rate gap is ~0.
+            # A6: probe window W = max(E2E_MULTIPLIER * p95_e2e, MIN_WINDOW_MS), no ceiling
+            # (p95_e2e is bounded by the 150 s gateway route timeout, so W <= ~300 s, as v1).
+            # Missing p95_e2e -> W = MIN_WINDOW_MS. The 20 s floor is below the N2 tail
+            # guard (metrics window + refresh + offset), which is now only a startup warning.
             - name: SAFE_SCALE_MIN_WINDOW_MS
-              value: "60000"
-            - name: SAFE_SCALE_MAX_WINDOW_MS
-              value: "120000"
-            - name: SAFE_SCALE_CW2_FALLBACK_MS
-              value: "60000"
+              value: "20000"
+            - name: SAFE_SCALE_E2E_MULTIPLIER
+              value: "2"
             # A12: commit gate rejects when the remaining pods' KV-cache fill > 0.8 (v1).
             - name: SAFE_SCALE_KV_CACHE_MAX
               value: "0.8"

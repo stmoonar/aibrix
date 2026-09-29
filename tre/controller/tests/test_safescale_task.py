@@ -80,7 +80,6 @@ def _machine() -> SafeScaleStateMachine:
         config=SafeScaleConfig(
             ttft_p95_slo_ms=1000.0,
             tpot_p95_slo_ms=100.0,
-            default_window_ms=1000.0,
             min_window_ms=1000.0,
             hq=0.5,
             tau_low=1.0,
@@ -228,7 +227,7 @@ def test_safescale_resolution_record_carries_the_gate_failures() -> None:
     store = Store()
     machine = SafeScaleStateMachine(
         config=SafeScaleConfig(
-            ttft_p95_slo_ms=1000.0, tpot_p95_slo_ms=100.0, default_window_ms=1000.0, min_window_ms=1000.0, hq=0.5
+            ttft_p95_slo_ms=1000.0, tpot_p95_slo_ms=100.0, min_window_ms=1000.0, hq=0.5
         ),
         store=store,
     )
@@ -254,7 +253,7 @@ def test_observation_tick_feeds_gateway_counters_to_the_donor_health_guard() -> 
 
     queue = FakeQueue()
     machine = SafeScaleStateMachine(
-        config=SafeScaleConfig(ttft_p95_slo_ms=1000.0, tpot_p95_slo_ms=100.0, default_window_ms=60_000.0)
+        config=SafeScaleConfig(ttft_p95_slo_ms=1000.0, tpot_p95_slo_ms=100.0, min_window_ms=60_000.0)
     )
     machine.start_probe(model="donor", pods=("pod-a",), now_ms=0)
 

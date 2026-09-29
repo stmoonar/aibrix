@@ -57,6 +57,17 @@ from tre_sm.ops.sleep_primitive import (
     SleepTarget,
 )
 from tre_sm.state.sleep_reservations import ReservationConflict, SleepReservations
+from tre_sm.state.replica_floor import (
+    CLAMP_PATHS,
+    EXEMPT_PATHS,
+    HIDE_PATH,
+    MAKEUP_PATHS,
+    TRANSIENT_LEASE_PHASES,
+    FloorCheck,
+    FloorRecorder,
+    FloorViolation,
+    check_floor,
+)
 from tre_sm.state.reconcile import K8sPodClient, POD_STATE_AWAKE, POD_STATE_HIDDEN, POD_STATE_SLEEPING, audit_state, observe_bindings, reconcile_state
 from tre_sm.state.operations import (
     OperationBusy,
@@ -201,6 +212,11 @@ class ServiceManagerV2:
             config() if callable(config) else ServiceManagerConfig()
         )
         self._sleep_clock = sleep_clock
+        # Replica floor (2026-09-29): check + hide are atomic within this process
+        # (the Redis writer lock serializes them across processes); counters and
+        # recent events of refusals / clamps / exemptions / make-up wakes.
+        self._floor_lock = threading.RLock()
+        self._floor_recorder = FloorRecorder()
         self._sleep_primitive: SleepPrimitive | None = None
         if runtime_ops is not None and vllm_ops is not None:
             self._sleep_primitive = SleepPrimitive(
@@ -213,7 +229,10 @@ class ServiceManagerV2:
                 clock=sleep_clock,
                 owner=getattr(operation_coordinator, "owner", "service-manager"),
                 operation_id=_current_operation_id,
+                floor_guard=self._sleep_floor_guard,
+                floor_lock=self._floor_lock,
             )
+            self._floor_recorder.incr = self._sleep_primitive.journal.incr
         self._store = store
         self._k8s_client = k8s_client
         self._runtime_ops = runtime_ops
@@ -255,6 +274,7 @@ class ServiceManagerV2:
                 safety_gate=safety_gate,
                 gpu_leases=gpu_leases,
                 sleep_binding=self._repair_sleep_binding,
+                on_quarantine=self._record_repair_floor_exemptions,
             )
 
     def set_supervisor(self, supervisor) -> None:
@@ -426,6 +446,11 @@ class ServiceManagerV2:
             "version": snapshot.version,
             "actions": [],
         }
+        if plan["sleep"] and sleep_path in CLAMP_PATHS and self._floor_enforced():
+            # Replica floor, APA: clamp the target instead of refusing it.
+            plan = self._clamp_sleep_plan_to_floor(
+                model, plan, snapshot.bindings, response, path=sleep_path
+            )
         if plan["sleep"] and self._sleep_primitive is not None and self._runtime_ops is not None:
             # All bindings of one scale-down are hidden together and drain
             # concurrently under one budget (the sleep primitive, plan D1/D2).
@@ -942,6 +967,13 @@ class ServiceManagerV2:
 
     @serialized_operation("put_model_routable")
     def put_model_routable(self, model: str, *, hidden_pods: list[str]) -> dict:
+        # The floor check below and the store save share one snapshot and run
+        # under the writer lock (serialized_operation) and the process-local floor
+        # lock: two concurrent hides can never both pass the check.
+        with self._floor_lock:
+            return self._put_model_routable_locked(model, hidden_pods=hidden_pods)
+
+    def _put_model_routable_locked(self, model: str, *, hidden_pods: list[str]) -> dict:
         self._registry.model(model)
         snapshot = self._store.load()
         model_bindings = [binding for binding in snapshot.bindings if binding.model == model]
@@ -959,6 +991,17 @@ class ServiceManagerV2:
                 )
             if binding.hidden and binding.serve_id not in requested_hidden and binding.awake:
                 self._assert_confirmed_awake_for_unhide(binding)
+        newly_hidden = {
+            binding.serve_id
+            for binding in model_bindings
+            if not binding.hidden and binding.serve_id in requested_hidden
+        }
+        if newly_hidden and self._floor_enforced():
+            # Replica floor (SafeScale hide): pods this request unhides are not
+            # counted (they route again only once the gateway picks them up).
+            check = self._floor_check(model, newly_hidden, snapshot.bindings)
+            if not check.ok:
+                self._on_floor_violation(check, HIDE_PATH)
         actions: list[dict] = []
         updated_by_serve = {binding.serve_id: binding for binding in snapshot.bindings}
         with self._desired_guard(
@@ -2227,11 +2270,17 @@ class ServiceManagerV2:
         # to observe since the unlocked pre-check in admit_startup (TOCTOU).
         # Only unrequested admissions get here - an owned (pre-authorized)
         # admission never sleeps residents through this path.
+        def before_prepare() -> None:
+            self._refuse_unrequested_startup_sleep(pod, awake)
+            # Replica floor: wake another replica of a resident's model first
+            # (make-before-break); the prepare re-checks and refuses (RetryLater).
+            self._startup_floor_makeup(pod, awake)
+
         outcomes = self._split_sleep(
             awake,
             sleep_path="startup",
             kind="startup_admit_sleep",
-            before_prepare=lambda: self._refuse_unrequested_startup_sleep(pod, awake),
+            before_prepare=before_prepare,
         )
         slept_ids = {item.get("binding_id") for item in outcomes if item.get("status") == STATUS_SLEPT}
         return [binding for binding in awake if binding.binding_id in slept_ids]
@@ -3117,7 +3166,207 @@ class ServiceManagerV2:
                 "max": latencies[-1] if latencies else None,
             },
             "recent": primitive.recent(),
+            "floor": self.floor_state(),
         }
+
+    # ------------------------------------------------------------ replica floor
+    def floor_state(self) -> dict:
+        """Replica-floor switch, counters and recent events (``GET /v2/sleep``)."""
+        return {
+            "enforced": self._floor_enforced(),
+            "counts": self._floor_recorder.counts(),
+            "recent": self._floor_recorder.recent(),
+        }
+
+    def _floor_enforced(self) -> bool:
+        return bool(getattr(self._sm_config, "replica_floor_enforce", True))
+
+    def _model_floor(self, model: str) -> int:
+        """The registry ``min_replicas`` of ``model`` (TRE and APA use the same)."""
+        try:
+            return max(0, int(self._registry.model(model).min_replicas))
+        except (KeyError, AttributeError, TypeError, ValueError):
+            return 0
+
+    def _routable_serve_ids(self, model: str, bindings: list[Binding] | None = None) -> set[str]:
+        """Replicas of ``model`` that serve traffic right now: no sleep reservation,
+        no transient ``waking`` / ``starting`` GPU lease, and - with a Kubernetes
+        view - a Ready Pod carrying the routable label ``true`` (what the gateway
+        routes on; the legacy store lags behind a make-before-break defrag, whose
+        destination is recorded only when the migration is done). Without a
+        Kubernetes view (no runtime): awake and not hidden in the store."""
+        if bindings is None:
+            bindings = self._store.load().bindings
+        reservations = self._reservations()
+        reserved = set(reservations.active()) if reservations is not None else set()
+        transient: set[str] = set()
+        if self._gpu_leases is not None:
+            transient = {
+                lease.binding_id
+                for lease in self._gpu_leases.load()
+                if lease.phase in TRANSIENT_LEASE_PHASES
+            }
+        live = None
+        lister = getattr(self._runtime_ops, "list_pod_snapshots", None)
+        if self._runtime_ops is not None and callable(lister):
+            live = {snapshot.name: snapshot for snapshot in lister(model=model)}
+        routable: set[str] = set()
+        if live is None:
+            for binding in bindings:
+                if binding.model != model or not binding.awake or binding.hidden:
+                    continue
+                if binding.binding_id in reserved or binding.binding_id in transient:
+                    continue
+                routable.add(binding.serve_id)
+            return routable
+        for name, snapshot in live.items():
+            if snapshot.model != model or not snapshot.ready or snapshot.routable is not True:
+                continue
+            try:
+                binding_id = _binding_from_snapshot(snapshot).binding_id
+            except (KeyError, ValueError):
+                continue
+            if binding_id in reserved or binding_id in transient:
+                continue
+            routable.add(name)
+        return routable
+
+    def _floor_check(
+        self, model: str, removing, bindings: list[Binding] | None = None
+    ) -> FloorCheck:
+        return check_floor(
+            model, self._model_floor(model), self._routable_serve_ids(model, bindings), removing
+        )
+
+    def _on_floor_violation(self, check: FloorCheck, path: str, **extra) -> None:
+        """A path's answer to a floor violation: ``repair`` is exempt (recorded);
+        ``startup`` retries later; everything else is refused."""
+        if path in EXEMPT_PATHS:
+            self._floor_recorder.record("exempt", check, path=path, **extra)
+            return
+        self._floor_recorder.record("rejected", check, path=path, **extra)
+        violation = FloorViolation(check, path=path)
+        if path in MAKEUP_PATHS:
+            raise RetryLater(f"{violation}; retry once another replica of {check.model} is awake")
+        raise violation
+
+    def _sleep_floor_guard(self, targets: list[SleepTarget], path: str) -> None:
+        """The sleep primitive's floor check: under the writer lock, right before
+        the targets are reserved and hidden (SleepPrimitive.prepare)."""
+        if not self._floor_enforced():
+            return
+        by_model: dict[str, set[str]] = {}
+        for target in targets:
+            by_model.setdefault(target.binding.model, set()).add(target.binding.serve_id)
+        for model, serve_ids in sorted(by_model.items()):
+            check = self._floor_check(model, serve_ids)
+            if not check.ok:
+                self._on_floor_violation(check, path)
+
+    def _clamp_sleep_plan_to_floor(
+        self, model: str, plan: dict, bindings: list[Binding], response: dict, *, path: str
+    ) -> dict:
+        """APA: keep awake as many of the planned sleeps as the floor needs (routable
+        ones; hidden / not-yet-serving ones still sleep)."""
+        removing = {binding.serve_id for binding in plan["sleep"]}
+        check = self._floor_check(model, removing, bindings)
+        if check.ok:
+            return plan
+        allowed = max(0, len(check.routable) - check.floor)
+        routable = set(check.routable)
+        keep: list[Binding] = []
+        kept_awake: list[Binding] = []
+        taken = 0
+        for binding in plan["sleep"]:
+            if binding.serve_id in routable:
+                if taken < allowed:
+                    taken += 1
+                    keep.append(binding)
+                else:
+                    kept_awake.append(binding)
+                    continue
+            else:
+                keep.append(binding)
+        kept_ids = sorted(binding.serve_id for binding in kept_awake)
+        self._floor_recorder.record(
+            "clamped", check, path=path, requested_sleep=sorted(removing), kept_awake=kept_ids
+        )
+        response["floor"] = {"clamped": True, "kept_awake": kept_ids, **check.as_dict()}
+        return {
+            **plan,
+            "sleep": keep,
+            "target_bindings": list(plan["target_bindings"]) + kept_awake,
+        }
+
+    def _startup_floor_makeup(self, pod: StartupPodRecord, residents: list[Binding]) -> None:
+        """Before a startup admission sleeps awake residents: wake another replica
+        of every model the sleep would take below its floor (not on the startup
+        Pod's GPUs). What cannot be made up is refused by the prepare's floor
+        check (RetryLater, the init gate polls again)."""
+        if not self._floor_enforced():
+            return
+        by_model: dict[str, set[str]] = {}
+        for binding in residents:
+            by_model.setdefault(binding.model, set()).add(binding.serve_id)
+        for model, serve_ids in sorted(by_model.items()):
+            check = self._floor_check(model, serve_ids)
+            for _ in range(check.deficit):
+                if self._makeup_wake(model, pod, check) is None:
+                    break
+
+    def _makeup_wake(self, model: str, pod: StartupPodRecord, check: FloorCheck) -> Binding | None:
+        snapshot = self._store.load()
+        pod_gpus = set(pod.gpu_ids)
+        candidates: list[Binding] = []
+        for binding in snapshot.bindings:
+            if binding.model != model or binding.awake:
+                continue
+            if binding.slot.node == pod.node and pod_gpus.intersection(binding.slot.gpu_ids):
+                continue
+            try:
+                self._assert_not_reserved(binding=binding, what=f"floor make-up wake of {binding.serve_id}")
+                if not self._feasible_wake(binding, snapshot.bindings):
+                    continue
+            except (ReservationConflict, WakeConflict):
+                continue
+            candidates.append(binding)
+        while candidates:
+            binding = _wake_pick(candidates, snapshot.bindings, self._registry.topology(), self._placement)
+            candidates.remove(binding)
+            try:
+                self._apply_runtime_power_action(binding, action="wake")
+            except Exception as exc:  # noqa: BLE001 - try the next candidate
+                LOG.warning("floor make-up wake of %s failed: %s", binding.serve_id, exc)
+                continue
+            updated = [
+                replace(item, awake=True, hidden=False) if item.serve_id == binding.serve_id else item
+                for item in snapshot.bindings
+            ]
+            self._store.save(updated, expected_version=snapshot.version)
+            self._update_desired(
+                {binding.binding_id: {"power": "awake", "hidden": False}},
+                updated_by="service-manager-floor",
+                reason="replica_floor_makeup",
+            )
+            self._floor_recorder.record(
+                "makeup_wake", check, path="startup", woken=binding.serve_id, for_pod=pod.name
+            )
+            return binding
+        return None
+
+    def _record_repair_floor_exemptions(self, snapshots: list[K8sPodSnapshot]) -> None:
+        """Fleet repair quarantines (hides) every resident at once: exempt from the
+        floor, but recorded per model it takes below its floor."""
+        if not self._floor_enforced():
+            return
+        by_model: dict[str, set[str]] = {}
+        for snapshot in snapshots:
+            if snapshot.ready and snapshot.routable is True:
+                by_model.setdefault(snapshot.model, set()).add(snapshot.name)
+        for model, names in sorted(by_model.items()):
+            check = check_floor(model, self._model_floor(model), names, names)
+            if not check.ok:
+                self._on_floor_violation(check, "repair", reason="fleet_repair_quarantine")
 
     def _has_deployment_ops(self) -> bool:
         return self._runtime_ops is not None and all(
@@ -3200,22 +3449,46 @@ class ServiceManagerV2:
             # The destination's wake headroom gate (fresh gpu-truth sample, B3),
             # before anything changes; the wake below runs it again.
             self._ensure_wake_headroom(destination)
-        self._apply_runtime_power_action(binding, action="sleep", sleep_path="defrag")
-        try:
-            self._apply_runtime_power_action(destination, action="wake")
-        except BaseException:
+        if _slots_overlap(binding.slot, destination.slot):
+            # The destination shares a GPU with the source: it can only wake after
+            # the source slept (break-before-make; the replica floor may refuse it).
+            self._apply_runtime_power_action(binding, action="sleep", sleep_path="defrag")
             try:
-                self._apply_runtime_power_action(binding, action="wake")
-            except Exception:  # the audit reports desired awake / physically asleep
+                self._apply_runtime_power_action(destination, action="wake")
+            except BaseException:
+                try:
+                    self._apply_runtime_power_action(binding, action="wake")
+                except Exception:  # the audit reports desired awake / physically asleep
+                    LOG.exception(
+                        "waking defrag source %s back after the failed wake of %s failed",
+                        binding.binding_id, destination.binding_id,
+                    )
+                raise
+            return [
+                {"action": "hide", "serve_id": binding.serve_id},
+                {"action": "sleep", "serve_id": binding.serve_id},
+                {"action": "wake", "serve_id": destination.serve_id},
+            ]
+        # Make-before-break (replica floor, 2026-09-29): the destination wakes
+        # first, so the model never has one routable replica fewer while it moves.
+        self._apply_runtime_power_action(destination, action="wake")
+        try:
+            self._apply_runtime_power_action(binding, action="sleep", sleep_path="defrag")
+        except BaseException:
+            # The source stays awake (the primitive rolled its hide back): put the
+            # destination back to sleep so the layout is what it was.
+            try:
+                self._apply_runtime_power_action(destination, action="sleep", sleep_path="defrag")
+            except Exception:  # the audit reports desired sleeping / physically awake
                 LOG.exception(
-                    "waking defrag source %s back after the failed wake of %s failed",
-                    binding.binding_id, destination.binding_id,
+                    "sleeping defrag destination %s back after the failed sleep of %s failed",
+                    destination.binding_id, binding.binding_id,
                 )
             raise
         return [
+            {"action": "wake", "serve_id": destination.serve_id},
             {"action": "hide", "serve_id": binding.serve_id},
             {"action": "sleep", "serve_id": binding.serve_id},
-            {"action": "wake", "serve_id": destination.serve_id},
         ]
 
     def _execute_runtime_defrag_migration(self, binding: Binding, migration: Migration) -> tuple[list[dict], Binding]:
@@ -3223,6 +3496,36 @@ class ServiceManagerV2:
             raise ValueError("runtime_ops and vllm_ops are required for runtime defrag")
 
         actions: list[dict] = []
+        if _slots_overlap(binding.slot, migration.to_slot):
+            # The new slot shares a GPU with the source: break-before-make (the
+            # replica floor may refuse the source's sleep).
+            self._sleep_and_delete_defrag_source(binding, actions)
+            moved = self._start_defrag_destination(binding, migration, actions)
+            return actions, moved
+        # Make-before-break (replica floor, 2026-09-29): the new replica is up and
+        # routable before the source is hidden and slept.
+        moved = self._start_defrag_destination(binding, migration, actions)
+        try:
+            self._sleep_and_delete_defrag_source(binding, actions)
+        except BaseException:
+            if not any(item.get("action") == "delete_deployment" for item in actions):
+                # The source still serves: remove the new replica again (best effort).
+                try:
+                    self._runtime_ops.delete_model_deployment(moved)
+                    self._runtime_ops.wait_pod_deleted(moved.serve_id)
+                    if self._gpu_leases is not None:
+                        self._gpu_leases.release(moved)
+                except Exception:  # the audit reports the extra Deployment
+                    LOG.exception(
+                        "removing defrag destination %s after the failed sleep of %s failed",
+                        moved.binding_id, binding.binding_id,
+                    )
+                finally:
+                    self._refresh_observed([moved.binding_id])
+            raise
+        return actions, moved
+
+    def _sleep_and_delete_defrag_source(self, binding: Binding, actions: list[dict]) -> None:
         # The primitive hides, waits for the gateway ack and drains before /sleep.
         self._apply_runtime_power_action(binding, action="sleep", sleep_path="defrag")
         actions.append({"action": "hide", "serve_id": binding.serve_id})
@@ -3233,6 +3536,10 @@ class ServiceManagerV2:
 
         self._runtime_ops.wait_pod_deleted(binding.serve_id)
         self._refresh_observed([binding.binding_id])  # its pod is gone (B2)
+
+    def _start_defrag_destination(
+        self, binding: Binding, migration: Migration, actions: list[dict]
+    ) -> Binding:
         self._ensure_create_headroom(migration.to_slot, binding.model)
         planned = Binding(
             "defrag-startup", binding.model, migration.to_slot, awake=False
@@ -3251,7 +3558,7 @@ class ServiceManagerV2:
         )
         actions.append({"action": "wake", "serve_id": new_serve_id})
         actions.append({"action": "unhide", "serve_id": new_serve_id})
-        return actions, moved
+        return moved
 
     def _ensure_feasible_wake(self, binding: Binding, bindings: list[Binding]) -> None:
         if not self._feasible_wake(binding, bindings):
@@ -3610,6 +3917,12 @@ def create_app(service: ServiceManagerV2) -> FastAPI:
             status_code=409, content={"detail": str(exc), "binding_id": exc.binding_id}
         )
 
+    @app.exception_handler(FloorViolation)
+    async def floor_violation_handler(_request: Request, exc: FloorViolation) -> JSONResponse:
+        # 409 with ``error: floor_violation``: the controller does not retry it
+        # (it re-plans on its next tick).
+        return JSONResponse(status_code=409, content=exc.body())
+
     @app.exception_handler(RetryLater)
     async def retry_later_handler(_request: Request, exc: RetryLater) -> JSONResponse:
         return JSONResponse(status_code=409, content={"detail": str(exc)})
@@ -3837,6 +4150,10 @@ def _wake_pick(feasible, planned, topology, policy: PlacementPolicy | None = Non
         if choice is not None:
             return scorable[choice.index]
     return min(feasible, key=lambda item: _natural_key(item.serve_id))
+
+
+def _slots_overlap(first: Slot, second: Slot) -> bool:
+    return first.node == second.node and bool(set(first.gpu_ids) & set(second.gpu_ids))
 
 
 def _next_serve_id(model: str, existing_serve_ids: set[str]) -> str:

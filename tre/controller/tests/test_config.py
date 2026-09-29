@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import logging
+
 import pytest
 import yaml
 
@@ -89,7 +91,6 @@ def test_config_reads_centralized_environment_values() -> None:
             "TRE_FAIRNESS_INTERVAL_SECONDS": "7.25",
             "TRE_METRICS_WINDOW_MS": "45000",
             "TRE_INSTANT_SAMPLE_INTERVAL_MS": "2500",
-            # W_lo*(1-hq) must cover 45000 + 2500 + 2000 (A6 post-hide tail guard).
             "SAFE_SCALE_MIN_WINDOW_MS": "70000",
             "TRE_HIST_BASELINE_LOOKBACK_MS": "120000",
             "TRE_PERCENTILE_MODE": "interpolated",
@@ -172,14 +173,10 @@ def test_config_centralizes_legacy_safescale_and_state_values() -> None:
             "PROACTIVE_RELEASE_MIN_TRS": "3000",
             "SAFE_SCALE_TTFT_P95_SLO_MS": "1300",
             "SAFE_SCALE_TPOT_P95_SLO_MS": "120",
-            "SAFE_SCALE_DEFAULT_WINDOW_MS": "70000",
             "SAFE_SCALE_MIN_WINDOW_MS": "90000",
-            "SAFE_SCALE_MAX_WINDOW_MS": "320000",
-            "SAFE_SCALE_CW2_FALLBACK_MS": "310000",
-            "SAFE_SCALE_CDEC": "3",
+            "SAFE_SCALE_E2E_MULTIPLIER": "3.5",
             "SAFE_SCALE_HQ": "0.5",
             "SAFE_SCALE_TAU_LOW": "1.25",
-            "SAFE_SCALE_EPSILON_MU": "0.000001",
             "SAFE_SCALE_PROBE_POLL_SECONDS": "3",
         }
     )
@@ -188,14 +185,10 @@ def test_config_centralizes_legacy_safescale_and_state_values() -> None:
     assert config.proactive_release_min_trs == 3000.0
     assert config.safescale.ttft_p95_slo_ms == 1300.0
     assert config.safescale.tpot_p95_slo_ms == 120.0
-    assert config.safescale.default_window_ms == 70_000.0
     assert config.safescale.min_window_ms == 90_000.0
-    assert config.safescale.max_window_ms == 320_000.0
-    assert config.safescale.cw2_fallback_ms == 310_000.0
-    assert config.safescale.cdec == 3.0
+    assert config.safescale.e2e_multiplier == 3.5
     assert config.safescale.hq == 0.5
     assert config.safescale.tau_low == 1.25
-    assert config.safescale.epsilon_mu == 0.000001
     assert config.safescale.probe_poll_seconds == 3.0
 
 
@@ -210,53 +203,35 @@ def test_metrics_window_mode_can_be_overridden_and_validated() -> None:
         ControllerConfig.from_env({"TRE_METRICS_WINDOW_MODE": "rolling"})
 
 
-def test_safescale_window_must_cover_metrics_window_post_hide_tail() -> None:
-    # N2 invariant on the adaptive window floor (A6): W_lo*(1-hq) >= metrics window +
-    # refresh + read offset so every commit-gate tail observation reads a fully post-hide
-    # window. Phase-aligned defaults: 30000 + 10000 + 2000 = 42000; hq default 0.25.
-    # 15000*0.75 = 11250 < 42000 -> reject (the exact case the guard exists for).
-    with pytest.raises(ValueError, match="SAFE_SCALE_MIN_WINDOW_MS"):
-        ControllerConfig.from_env({"SAFE_SCALE_MIN_WINDOW_MS": "15000"})
-    # Just below the boundary: 55999*0.75 = 41999.25 < 42000 -> reject.
-    with pytest.raises(ValueError):
-        ControllerConfig.from_env({"SAFE_SCALE_MIN_WINDOW_MS": "55999"})
-    # Exact boundary: 56000*0.75 = 42000 -> loads.
-    assert ControllerConfig.from_env({"SAFE_SCALE_MIN_WINDOW_MS": "56000"}).safescale.min_window_ms == 56_000.0
-    # The read offset counts: offset 3000 -> 43000 needed, 56000 no longer enough.
-    with pytest.raises(ValueError):
-        ControllerConfig.from_env({"SAFE_SCALE_MIN_WINDOW_MS": "56000", "TRE_METRICS_PHASE_OFFSET_MS": "3000"})
-    # free_running: refresh = TRE_METRICS_REFRESH_INTERVAL_SECONDS, no read offset.
-    assert ControllerConfig.from_env(
-        {"SAFE_SCALE_MIN_WINDOW_MS": "46667", "TRE_METRICS_REFRESH_MODE": "free_running"}
-    ).metrics_refresh_mode == "free_running"
-    with pytest.raises(ValueError):
-        ControllerConfig.from_env(
-            {"SAFE_SCALE_MIN_WINDOW_MS": "46666", "TRE_METRICS_REFRESH_MODE": "free_running"}
-        )
-    # The fixed default window no longer sets the deadline, so it is not what is checked.
-    assert ControllerConfig.from_env({"SAFE_SCALE_DEFAULT_WINDOW_MS": "15000"}).safescale.default_window_ms == 15_000.0
-    # Defaults (W_lo 60000 / hq 0.25 -> 45000 >= 42000) load fine.
-    ControllerConfig.from_env({})
+def test_safescale_short_floor_warns_instead_of_refusing_to_start(caplog) -> None:
+    # N2 (tail observations fully post-hide) needs W_floor*(1-hq) >= metrics window +
+    # refresh + read offset = 42000 by default; the 20 s floor cannot satisfy it, so the
+    # guard only warns (v1 ran a 15 s floor the same way).
+    with caplog.at_level(logging.WARNING, logger="tre_controller.config"):
+        config = ControllerConfig.from_env({})
+    assert config.safescale.min_window_ms == 20_000.0
+    assert any("SAFE_SCALE_MIN_WINDOW_MS" in r.getMessage() and "min_window_ms=20000.0" in r.getMessage()
+               for r in caplog.records)
+    # A floor that satisfies the invariant (56000*0.75 = 42000) loads without the warning.
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="tre_controller.config"):
+        ControllerConfig.from_env({"SAFE_SCALE_MIN_WINDOW_MS": "56000"})
+    assert not [r for r in caplog.records if "SAFE_SCALE_MIN_WINDOW_MS" in r.getMessage()]
 
 
-def test_safescale_adaptive_window_defaults_match_v1_alignment() -> None:
-    # A6: W = clamp(60 s, 120 s, ...); cw2 fallback 60 s (was 300 s, which pinned every
-    # probe with an unknown rate gap at the ceiling); no-metrics default 60 s.
+def test_safescale_window_defaults_and_env_parsing() -> None:
+    # A6: W = max(2 * p95_e2e, 20 s), no ceiling, no default/fallback/decode terms.
     safescale = ControllerConfig.from_env({}).safescale
-    assert (safescale.min_window_ms, safescale.max_window_ms) == (60_000.0, 120_000.0)
-    assert safescale.cw2_fallback_ms == 60_000.0
-    assert safescale.default_window_ms == 60_000.0
-    assert (safescale.cdec, safescale.hq) == (2.0, 0.25)
-
-
-def test_config_rejects_inverted_safescale_window_bounds() -> None:
-    with pytest.raises(ValueError, match="SAFE_SCALE_MIN_WINDOW_MS"):
-        ControllerConfig.from_env(
-            {
-                "SAFE_SCALE_MIN_WINDOW_MS": "300000",
-                "SAFE_SCALE_MAX_WINDOW_MS": "15000",
-            }
-        )
+    assert (safescale.min_window_ms, safescale.e2e_multiplier, safescale.hq) == (20_000.0, 2.0, 0.25)
+    for gone in ("max_window_ms", "default_window_ms", "cw2_fallback_ms", "cdec"):
+        assert not hasattr(safescale, gone)
+    tuned = ControllerConfig.from_env(
+        {"SAFE_SCALE_MIN_WINDOW_MS": "30000", "SAFE_SCALE_E2E_MULTIPLIER": "1.5"}
+    ).safescale
+    assert (tuned.min_window_ms, tuned.e2e_multiplier) == (30_000.0, 1.5)
+    for bad in ("0", "-1", "abc"):
+        with pytest.raises(ValueError, match="SAFE_SCALE_E2E_MULTIPLIER"):
+            ControllerConfig.from_env({"SAFE_SCALE_E2E_MULTIPLIER": bad})
 
 
 def test_config_reads_and_validates_signal_idle_rps_epsilon() -> None:
