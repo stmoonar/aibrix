@@ -118,7 +118,8 @@ def test_shipped_registry_runs_the_030_fork_with_default_cumem():
         assert env["VLLM_SERVER_DEV_MODE"] == "1"
         # pinned_max_round_threshold_mb breaks the second cumem sleep (2026-09-28).
         assert "PYTORCH_ALLOC_CONF" not in env
-    assert registry.model("dsllama-8b").max_model_len == 32768
+    # v1 alignment (2026-09-29): no model pins --max-model-len; each serves its own maximum.
+    assert all(model.max_model_len is None for model in registry.models())
 
 
 def test_shipped_manifests_carry_no_removed_030_flags():
@@ -129,7 +130,11 @@ def test_shipped_manifests_carry_no_removed_030_flags():
         assert "--swap-space" not in command  # removed in vLLM 0.30
         assert "--sleep-reject-new" in command and "--abort-return-token-ids" in command
         assert "--sleep-mode-backend" not in command
-        assert command.count("--max-model-len") <= 1
+        assert "--max-model-len" not in command  # v1 alignment: the model's own maximum
+        # v1 alignment: max_num_seqs is v1's effective value (the 0.10.1 OpenAI-server default
+        # on a <70 GiB / A100 GPU), written out; prefix caching is off on every model.
+        assert command[command.index("--max-num-seqs") + 1] == "256"
+        assert "--no-enable-prefix-caching" in command
         env = _env(vllm)
         assert "VLLM_USE_MODELSCOPE" not in env
         assert env["HF_HUB_OFFLINE"] == "1"

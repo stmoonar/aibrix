@@ -330,16 +330,34 @@ def test_the_prior_loader_refuses_the_wrong_model(tmp_path) -> None:
 # ------------------------------------------------------------------------ checks
 
 
-def test_max_model_len_is_checked_against_the_longest_request() -> None:
-    assert t14.registry_max_model_len(MODEL) == 12288
+def test_max_model_len_is_checked_against_the_longest_request(monkeypatch) -> None:
+    # 14b no longer pins --max-model-len (v1 alignment 2026-09-29): the limit is the
+    # model's own maximum, read from its config.json.
+    assert t14.registry_max_model_len(MODEL) is None
+    seen = []
+    monkeypatch.setattr(t14, "native_max_model_len", lambda path: seen.append(path) or 131072)
     ok = t14.check_max_model_len(MODEL, t14.SHAPES)
-    assert ok["ok"] and ok["max_model_len"] == 12288
+    assert ok["ok"] and ok["max_model_len"] == 131072 and ok["source"] == "model config.json"
+    assert seen and seen[0].endswith("DeepSeek-R1-Distill-Qwen-14B")
     assert ok["longest_shape"] == "G4096x64" and ok["longest_request_tokens"] == 4160
     assert ok["needed"] == 4160 + t14.MAX_MODEL_LEN_MARGIN == 4224
     assert t14.check_max_model_len(MODEL, t14.SHAPES, max_model_len=12288)["ok"]
     t14.check_max_model_len(MODEL, t14.SHAPES, max_model_len=4224)
     with pytest.raises(ValueError, match="--max-model-len 4096 < 4224"):
         t14.check_max_model_len(MODEL, t14.SHAPES, max_model_len=4096)
+    monkeypatch.setattr(t14, "native_max_model_len", lambda path: None)
+    with pytest.raises(ValueError, match="does not pin --max-model-len"):
+        t14.check_max_model_len(MODEL, t14.SHAPES)
+
+
+def test_native_max_model_len_reads_max_position_embeddings(tmp_path) -> None:
+    assert t14.native_max_model_len(str(tmp_path)) is None  # no config.json
+    (tmp_path / "config.json").write_text(json.dumps({"max_position_embeddings": 131072}))
+    assert t14.native_max_model_len(str(tmp_path)) == 131072
+    (tmp_path / "config.json").write_text(json.dumps({"hidden_size": 5120}))
+    assert t14.native_max_model_len(str(tmp_path)) is None
+    (tmp_path / "config.json").write_text("{not json")
+    assert t14.native_max_model_len(str(tmp_path)) is None
 
 
 def test_the_preregistration_binds_the_run(tmp_path, frozen) -> None:
@@ -518,7 +536,8 @@ def test_t14_flags_belong_to_t14(tmp_path, argv) -> None:
         campaign.main(["--models", MODEL, "--out-dir", str(tmp_path / "o"), "--dry-run", *argv])
 
 
-def test_the_cli_dry_run_plans_24_cells_and_drives_nothing(tmp_path, capsys) -> None:
+def test_the_cli_dry_run_plans_24_cells_and_drives_nothing(tmp_path, capsys, monkeypatch) -> None:
+    monkeypatch.setattr(t14, "native_max_model_len", lambda path: 131072)
     prior = _prior(tmp_path)
     out = tmp_path / "dry"
     argv = ["--t14-set", "--models", MODEL, "--capacity-prior-file", str(prior),
@@ -528,7 +547,7 @@ def test_the_cli_dry_run_plans_24_cells_and_drives_nothing(tmp_path, capsys) -> 
     text = capsys.readouterr().out
     assert "no --freeze-file" in text and "no --refit-params-file" in text
     assert "no --preregistration-json" in text and "--routing-strategy is None" in text
-    assert "max-model-len check: 12288 >= 4224" in text and "wall clock" in text
+    assert "max-model-len check: 131072 >= 4224" in text and "wall clock" in text
     plan = json.loads((out / "plan.json").read_text())
     assert plan["mode"] == t14.MODE and plan["design_seed"] == 20260924
     assert plan["cell_serial_base"] == 80_500
