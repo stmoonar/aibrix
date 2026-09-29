@@ -15,16 +15,23 @@
   model p95 = max over the pods, ``n`` = TTFT count, mean prompt length ``L``, and the
   KV-cache fill = mean ``kv_cache_usage_perc`` of the pods of the latest scrape (the
   KV gate's aggregation, ``remaining_pods_kv_cache``);
-* **failures** - a pod whose scrape fails is left out of that tick (recorded); a tick
-  in which no remaining pod yields evidence switches the probe to the Redis evidence
-  path (``redis_fallback``, sticky);
-* **evidence gaps never commit** (2026-09-29 review) - a pod whose baseline is late
+* **failures** - a pod whose scrape fails is left out of that tick (recorded);
+* **evidence gaps never commit** (2026-09-29 reviews) - a pod whose baseline is late
   (pending at the baseline scrape, the whole probe's baseline later than the planned
-  time + one scrape timeout, or its counters went backwards = restarted: its baseline is
-  reset to zero, everything since is post-hide) has a hole in its evidence: it is
-  ``late`` for the rest of the probe. Its data still drives the immediate rollback; the
-  commit is judged on the Redis evidence instead. The deadline commit also needs every
-  live pod scraped successfully in that very poll.
+  time + one scrape timeout, a restart - counters backwards, a family gone or a new
+  ``process_start_time_seconds``: its baseline is reset to zero, everything since is
+  post-hide - or a remaining pod the cluster view lists that joined after the baseline)
+  has a hole in its evidence: it is ``late`` for the rest of the probe. Its data still
+  drives the immediate rollback; the probe can no longer commit. The Redis evidence is
+  never used for a commit on this path (the gateway re-writes cached docs with fresh
+  stamps, so their freshness cannot be trusted). The deadline commit needs every live
+  pod scraped successfully in that very poll, a fresh cluster view listing no pod
+  outside the evidence, and every pod's evidence reaching the deadline (see
+  ``SafeScaleStateMachine._direct_outcome``).
+* **coverage** - a scrape is stamped twice: when the read is sent (``started_ms``) and
+  when its answer is parsed (``ts_ms``). A baseline counts from ``ts_ms`` (the latest
+  moment the counters can have been read), a poll covers up to ``started_ms`` (the
+  earliest), so the evidence of every pod covers ``[its baseline, the poll]`` for sure.
 
 Scrapes run in a dedicated thread pool (stdlib ``urllib``, as the controller's other
 HTTP reads; no new dependency) and are awaited asynchronously: the event loop and the
@@ -69,6 +76,11 @@ _TPOT = "inter_token_latency_seconds"
 _PROMPT = "request_prompt_tokens"
 _KV = "kv_cache_usage_perc"
 _SLEEP_STATE = "vllm:engine_sleep_state"
+#: Process start time (restart detection next to the counter reset); vLLM 0.30 exposes
+#: the unprefixed prometheus_client gauge, the prefixed name is taken first if present.
+_PROCESS_START = ("vllm:process_start_time_seconds", "process_start_time_seconds")
+#: Requests in flight (running + waiting): "traffic" for the stalled check.
+_IN_FLIGHT = ("vllm:num_requests_running", "vllm:num_requests_waiting")
 #: Scrape timestamps kept in the probe record (audit), newest last.
 MAX_SCRAPE_TS = 64
 
@@ -101,13 +113,28 @@ class PodScrape:
     tpot_name: str | None = None
     #: ``model_name`` labels of evidence samples that were skipped (another model).
     other_models: tuple[str, ...] = ()
+    #: When the read was sent (controller clock); ``ts_ms`` = when its answer was
+    #: parsed. None = unknown (then ``ts_ms`` stands for both).
+    started_ms: int | None = None
+    #: process_start_time_seconds (None = not exposed): a change = the pod restarted.
+    process_start_s: float | None = None
+    #: num_requests_running + num_requests_waiting (None = not exposed).
+    in_flight: float | None = None
+
+    @property
+    def coverage_end_ms(self) -> int:
+        """The latest moment this read's counters surely include: the request start."""
+        return int(self.started_ms) if self.started_ms is not None else int(self.ts_ms)
 
 
-def parse_vllm_metrics(text: str, *, ts_ms: int, model_name: str | None = None) -> PodScrape:
+def parse_vllm_metrics(
+    text: str, *, ts_ms: int, model_name: str | None = None, started_ms: int | None = None
+) -> PodScrape:
     """The evidence families of a vLLM ``/metrics`` body (Prometheus text format).
     Label sets (engines) are summed; the KV gauge is averaged over engines. With
     ``model_name``, samples labelled with another ``model_name`` are skipped (a pod IP
-    reused by another model); unlabelled samples are kept."""
+    reused by another model); unlabelled samples are kept. ``started_ms`` = when the
+    read was sent (``ts_ms`` = when it was answered)."""
     wanted: dict[str, tuple[str, str]] = {}
     families: dict[str, tuple[str, ...]] = {}
     for canonical in (_TTFT, _TPOT, _PROMPT):
@@ -116,7 +143,7 @@ def parse_vllm_metrics(text: str, *, ts_ms: int, model_name: str | None = None) 
             for suffix in ("_bucket", "_count", "_sum"):
                 wanted[raw + suffix] = (raw, suffix)
     kv_names = vllm_candidates(_KV)
-    for raw in kv_names:
+    for raw in (*kv_names, *_PROCESS_START, *_IN_FLIGHT):
         wanted[raw] = (raw, "")
     wanted[_SLEEP_STATE] = (_SLEEP_STATE, "")
 
@@ -198,8 +225,16 @@ def parse_vllm_metrics(text: str, *, ts_ms: int, model_name: str | None = None) 
             kv = sum(values) / len(values)
             break
     awake = None if not awake_values else all(value >= 1.0 for value in awake_values)
+    process_start = None
+    for raw in _PROCESS_START:
+        if gauges.get(raw):
+            process_start = max(gauges[raw])
+            break
+    flight = [value for raw in _IN_FLIGHT for value in gauges.get(raw, ())]
     return PodScrape(ts_ms=int(ts_ms), ttft=ttft, tpot=tpot, prompt=prompt, kv_cache=kv, awake=awake,
-                     tpot_name=tpot_name, other_models=tuple(sorted(other_models)))
+                     tpot_name=tpot_name, other_models=tuple(sorted(other_models)),
+                     started_ms=int(started_ms) if started_ms is not None else None,
+                     process_start_s=process_start, in_flight=sum(flight) if flight else None)
 
 
 # ------------------------------------------------------------------ compact baseline
@@ -258,10 +293,13 @@ def hist_delta(base: Hist, current: Hist) -> tuple[float, tuple[tuple[float, flo
 # ------------------------------------------------------------------ probe state
 @dataclass(frozen=True)
 class PodBaseline:
+    #: When the baseline read was answered (the latest moment its counters were read).
     ts_ms: int
     ttft: Hist | None
     tpot: Hist | None
     prompt: tuple[float, float] | None
+    #: process_start_time_seconds at the baseline (None = not exposed).
+    process_start_s: float | None = None
 
     def as_record(self) -> dict[str, Any]:
         record: dict[str, Any] = {"ts_ms": self.ts_ms}
@@ -271,6 +309,8 @@ class PodBaseline:
             record["tpot"] = compact_hist(self.tpot)
         if self.prompt is not None:
             record["prompt"] = [self.prompt[0], self.prompt[1]]
+        if self.process_start_s is not None:
+            record["process_start_s"] = self.process_start_s
         return record
 
     @classmethod
@@ -287,16 +327,24 @@ class PodBaseline:
                 prompt = (float(raw["prompt"][0]), float(raw["prompt"][1]))
             except (TypeError, ValueError):
                 prompt = None
+        process_start = None
+        if raw.get("process_start_s") is not None:
+            try:
+                process_start = float(raw["process_start_s"])
+            except (TypeError, ValueError):
+                return None  # unreadable: the whole record is refused (retaken, late)
         return cls(
             ts_ms=ts_ms,
             ttft=expand_hist(raw["ttft"]) if raw.get("ttft") is not None else None,
             tpot=expand_hist(raw["tpot"]) if raw.get("tpot") is not None else None,
             prompt=prompt,
+            process_start_s=process_start,
         )
 
     @classmethod
     def from_scrape(cls, scrape: PodScrape) -> "PodBaseline":
-        return cls(ts_ms=scrape.ts_ms, ttft=scrape.ttft, tpot=scrape.tpot, prompt=scrape.prompt)
+        return cls(ts_ms=scrape.ts_ms, ttft=scrape.ttft, tpot=scrape.tpot, prompt=scrape.prompt,
+                   process_start_s=scrape.process_start_s)
 
     @classmethod
     def zero(cls, scrape: PodScrape, *, ts_ms: int) -> "PodBaseline":
@@ -309,6 +357,7 @@ class PodBaseline:
             ttft=empty if scrape.ttft is not None else None,
             tpot=empty if scrape.tpot is not None else None,
             prompt=(0.0, 0.0) if scrape.prompt is not None else None,
+            process_start_s=scrape.process_start_s,
         )
 
 
@@ -317,6 +366,7 @@ class PodDelta:
     """One pod's evidence since its own baseline, from its latest successful scrape
     (cumulative, so it stays valid when a later scrape of the pod fails)."""
 
+    #: Coverage end: when the read was sent (its counters include everything before).
     ts_ms: int
     n: float
     ttft_p95_ms: float | None
@@ -342,8 +392,8 @@ class DirectWindow:
     #: pod -> why it gave no data in this poll (scrape failure, counter reset, ...).
     excluded: dict[str, str]
     #: Live pods without complete evidence: pending baseline, late baseline
-    #: (``late_baseline``, for good: the commit goes to the Redis evidence), no
-    #: successful scrape yet, or the latest older than the freshness bound.
+    #: (``late_baseline``, for good: no commit), no successful scrape yet, or the latest
+    #: older than the freshness bound.
     missing: dict[str, str]
     ttft_p95_ms: float | None
     tpot_p95_ms: float | None
@@ -366,6 +416,19 @@ class DirectWindow:
     #: p95 of the pods' delta histograms pooled first (folded into the p95s above).
     pooled_ttft_p95_ms: float | None = None
     pooled_tpot_p95_ms: float | None = None
+    #: The remaining pods of a FRESH cluster view at this poll (awake, not hidden, not
+    #: the probe's); None = no fresh view (a commit then waits for one).
+    view_pods: tuple[str, ...] | None = None
+    #: Actual coverage of the evidence of EVERY live pod: from the latest baseline read
+    #: (answered) to the earliest latest read (sent). None = a live pod without either.
+    coverage_start_ms: int | None = None
+    coverage_end_ms: int | None = None
+    #: p95 without any minimum-samples rule (max of per pod and pooled): the ceiling's
+    #: low-sample evaluation.
+    low_ttft_p95_ms: float | None = None
+    low_tpot_p95_ms: float | None = None
+    #: num_requests_running + waiting over the pods of this poll (None = not exposed).
+    in_flight: float | None = None
 
     @property
     def mean_prompt_tokens(self) -> float | None:
@@ -385,12 +448,16 @@ class DirectWindow:
             "direct_excluded_pods": dict(sorted(self.excluded.items())),
             "direct_missing_pods": dict(sorted(self.missing.items())),
             "direct_unanswered_pods": dict(sorted(self.unanswered.items())),
+            "direct_view_pods": list(self.view_pods) if self.view_pods is not None else None,
+            "direct_in_flight": self.in_flight,
         }
 
     def latency_audit(self) -> dict[str, Any]:
         return {
             "evidence_start_ms": self.start_ms,
             "evidence_end_ms": self.end_ms,
+            "evidence_coverage_start_ms": self.coverage_start_ms,
+            "evidence_coverage_end_ms": self.coverage_end_ms,
             "latency_samples": self.ttft_count,
             "latency_samples_judged": self.judged_count,
             "mean_prompt_tokens": self.mean_prompt_tokens,
@@ -419,9 +486,11 @@ class DirectState:
     baseline_lag_ms: dict[str, int] = field(default_factory=dict)
     #: pod -> {"cause", "lag_ms", "ts_ms"}: its evidence has a hole after the hide (cause
     #: ``pending_baseline`` / ``probe_baseline`` = baseline later than planned + one scrape
-    #: timeout, ``counter_reset`` / ``family_vanished`` = restarted, baseline reset to
-    #: zero, ``asleep_before_baseline`` = pending, then asleep: dropped from the polls).
-    #: For good: its data still drives the immediate rollback, never a commit.
+    #: timeout, ``counter_reset`` / ``family_vanished`` / ``process_restarted`` =
+    #: restarted, baseline reset to zero, ``asleep_before_baseline`` = pending, then
+    #: asleep: dropped from the polls, ``joined_after_baseline`` = listed by the cluster
+    #: view but not in the evidence). For good: its data still drives the immediate
+    #: rollback, never a commit.
     late: dict[str, dict[str, Any]] = field(default_factory=dict)
     #: Wall-clock ms of every poll (newest last, capped at MAX_SCRAPE_TS).
     scrapes: tuple[int, ...] = ()
@@ -429,7 +498,9 @@ class DirectState:
     failed_polls: int = 0
     #: (poll ts, mean kv_cache_usage_perc of the pods of that poll), newest last.
     kv_history: tuple[tuple[int, float], ...] = ()
-    #: Sticky switch to the Redis path: {"reason", "ts_ms"}.
+    #: Legacy only: the Redis-fallback switch of the previous release's records
+    #: ({"reason", "ts_ms"}). Such a probe is rolled back (the Redis evidence never
+    #: decides a direct-mode commit); nothing sets it any more.
     fallback: dict[str, Any] | None = None
     #: pod -> latest delta (not persisted: the next poll recomputes it).
     latest: dict[str, PodDelta] = field(default_factory=dict)
@@ -507,7 +578,7 @@ class DirectState:
         if baseline is not None and isinstance(raw.get("baseline"), Mapping) \
                 and len(baseline) != len(raw["baseline"]):
             # A baseline entry that does not parse: that pod would silently leave the
-            # evidence. Refuse the record (the baseline is retaken, late -> Redis commit).
+            # evidence. Refuse the record (the baseline is retaken, late -> no commit).
             LOG.warning("safescale direct evidence: unreadable baseline entry, record ignored: %r", raw)
             return None
         return cls(baseline=baseline, baseline_ts_ms=baseline_ts, pending=pending, dropped=dropped,
@@ -528,6 +599,9 @@ class DirectPoll:
     request_id: str
     ts_ms: int
     results: Mapping[str, "PodScrape | str"]
+    #: The model's remaining pods in a FRESH cluster view at this poll (awake, not
+    #: hidden, not the probe's); None = no fresh view.
+    view_pods: tuple[str, ...] | None = None
 
 
 def _late_entry(cause: str, *, lag_ms: int | None, ts_ms: int) -> dict[str, Any]:
@@ -597,7 +671,14 @@ def _pod_delta(
 ) -> "PodDelta | str":
     """The pod's evidence since its baseline; a string = why it cannot be differenced
     (``counter_reset``: a counter went backwards; ``family_vanished``: a family of the
-    baseline is gone) - the pod restarted after its baseline."""
+    baseline is gone; ``process_restarted``: process_start_time_seconds changed - a
+    restart whose counters already passed the baseline's) - the pod restarted after its
+    baseline."""
+    if base.process_start_s is not None:
+        if result.process_start_s is None:
+            return "family_vanished"
+        if abs(float(result.process_start_s) - float(base.process_start_s)) > 1e-3:
+            return "process_restarted"
     if base.ttft is None or result.ttft is None:
         return "family_vanished"
     ttft = hist_delta(base.ttft, result.ttft)
@@ -619,7 +700,7 @@ def _pod_delta(
     elif base.prompt is not None:
         return "family_vanished"
     return PodDelta(
-        ts_ms=int(result.ts_ms),
+        ts_ms=result.coverage_end_ms,
         n=ttft[0],
         ttft_p95_ms=_p95_ms(ttft[1], ttft[0], percentile_mode, min_latency_samples),
         tpot_p95_ms=_p95_ms(tpot[1], tpot[0], percentile_mode, min_latency_samples),
@@ -660,6 +741,7 @@ def evaluate_poll(
     excluded: dict[str, str] = {}
     unanswered: dict[str, str] = {}
     kv_values: list[float] = []
+    flight: list[float] = []
     answered = False
     for pod in state.live_pods():
         result = poll.results.get(pod, "not_polled")
@@ -681,13 +763,16 @@ def evaluate_poll(
         answered = True
         if result.kv_cache is not None:
             kv_values.append(float(result.kv_cache))
+        if result.in_flight is not None:
+            flight.append(float(result.in_flight))
         if pod in pending:
             pending.remove(pod)
             baseline[pod] = PodBaseline.from_scrape(result)
             lag = int(result.ts_ms) - int(hide_confirm_ms) if hide_confirm_ms is not None else None
             if lag is not None:
                 lags[pod] = lag
-            late[pod] = _late_entry("pending_baseline", lag_ms=lag, ts_ms=result.ts_ms)
+            if pod not in late:  # a joined pod keeps its cause
+                late[pod] = _late_entry("pending_baseline", lag_ms=lag, ts_ms=result.ts_ms)
             excluded[pod] = "baseline_taken"
             continue
         delta = _pod_delta(baseline[pod], result, percentile_mode=percentile_mode,
@@ -708,6 +793,24 @@ def evaluate_poll(
                 continue
             delta = reset
         latest[pod] = delta
+    if poll.view_pods is not None:
+        # 2026-09-29 review P2-c: the remaining-pod set was fixed at the baseline. A pod
+        # the fresh cluster view lists now but the evidence does not know (a replica that
+        # joined, a dropped sleeper that woke up) served requests outside the evidence
+        # since the hide: it is polled from the next tick on (its own baseline) and late
+        # for good. A dropped pod that is already late is not re-added.
+        known = set(baseline) | set(pending)
+        for pod in sorted(set(poll.view_pods) - known):
+            if pod in dropped and pod in late:
+                continue
+            dropped.pop(pod, None)
+            pending.append(pod)
+            late[pod] = _late_entry(
+                "joined_after_baseline",
+                lag_ms=(now - int(hide_confirm_ms)) if hide_confirm_ms is not None else None, ts_ms=now,
+            )
+            excluded[pod] = "joined_after_baseline"
+            unanswered[pod] = "joined_after_baseline"
     kv_history = state.kv_history
     if kv_values:
         kv_history = (kv_history + ((now, sum(kv_values) / len(kv_values)),))[-MAX_SCRAPE_TS:]
@@ -752,6 +855,20 @@ def evaluate_poll(
     judged_n = float(sum(d.n for d in deltas.values() if d.ttft_p95_ms is not None or d.tpot_p95_ms is not None))
     if pooled_ttft is not None or pooled_tpot is not None:
         judged_n = total_n  # every request is in the pooled p95
+    # The ceiling's low-sample evaluation: the same max(per pod, pooled) without any
+    # minimum-samples rule (every request counts, however few).
+    rule0 = (percentile_mode, 0)
+    low_ttft = _max_present(
+        [_p95_ms(d.ttft_hist, d.n, percentile_mode, 0) for d in deltas.values()]
+        + [pooled_p95_ms(((d.ttft_hist, d.n) for d in deltas.values()), rule0)]
+    )
+    low_tpot = _max_present(
+        [_p95_ms(d.tpot_hist, d.tpot_n, percentile_mode, 0) for d in deltas.values()]
+        + [pooled_p95_ms(((d.tpot_hist, d.tpot_n) for d in deltas.values()), rule0)]
+    )
+    # Coverage of every live pod: [latest baseline, earliest coverage end].
+    coverage_start = max(baseline[pod].ts_ms for pod in live) if all(pod in baseline for pod in live) else None
+    coverage_end = min(deltas[pod].ts_ms for pod in live) if all(pod in deltas for pod in live) else None
     window = DirectWindow(
         start_ms=min(baseline[pod].ts_ms for pod in deltas),
         end_ms=now,
@@ -771,8 +888,19 @@ def evaluate_poll(
         late={pod: dict(value) for pod, value in late.items()},  # dropped ones included
         pooled_ttft_p95_ms=pooled_ttft,
         pooled_tpot_p95_ms=pooled_tpot,
+        view_pods=tuple(sorted(poll.view_pods)) if poll.view_pods is not None else None,
+        coverage_start_ms=int(coverage_start) if coverage_start is not None else None,
+        coverage_end_ms=int(coverage_end) if coverage_end is not None else None,
+        low_ttft_p95_ms=low_ttft,
+        low_tpot_p95_ms=low_tpot,
+        in_flight=sum(flight) if flight else None,
     )
     return replace(updated, last=window), window
+
+
+def _max_present(values) -> float | None:
+    present = [float(value) for value in values if value is not None]
+    return max(present) if present else None
 
 
 def _kv_tail_max(history: tuple[tuple[int, float], ...], hq: float) -> float | None:
@@ -873,8 +1001,11 @@ class PodMetricsScraper:
             self._occupied -= 1
 
     def _read(self, url: str, model_name: str | None) -> PodScrape:
+        # Stamped when the request is sent AND when it is answered: a poll's evidence
+        # surely covers up to the send time, a baseline counts from the answer time.
+        started = int(self._clock_ms())
         text = self._fetch(url, self._timeout_s)
-        return parse_vllm_metrics(text, ts_ms=int(self._clock_ms()), model_name=model_name)
+        return parse_vllm_metrics(text, ts_ms=int(self._clock_ms()), model_name=model_name, started_ms=started)
 
     def _check_busy(self, incoming: int) -> None:
         occupied = self.occupancy()
@@ -995,8 +1126,8 @@ class DirectEvidenceCollector:
     async def take_baselines(self, *, only_model: str | None = None) -> int:
         """Baseline scrape of every due probe (planned time reached), concurrently. A
         probe without targets (no fresh cluster view, no pod IPs) is retried at the next
-        tick - its pods are then ``late`` (commit on the Redis evidence); one that never
-        gets a baseline falls back at its deadline (``no_baseline``)."""
+        tick - its pods are then ``late`` (no commit); one that never gets a baseline is
+        rolled back at its deadline (``evidence_incomplete:no_baseline``)."""
         due = [
             probe for probe in self._safescale.direct_baseline_due(now_ms=int(self._clock_ms()))
             if (only_model is None or probe.model == only_model) and probe.request_id not in self._inflight
@@ -1035,7 +1166,8 @@ class DirectEvidenceCollector:
     async def poll(self) -> dict[str, DirectPoll]:
         """One tick: missing baselines first, then one scrape of every probe's live pods
         (baseline + pending) whose last poll (or baseline) is at least ~half a poll
-        period old."""
+        period old. Each poll carries the remaining pods of the fresh cluster view
+        (``view_pods``; None without a fresh view): a pod outside the evidence is late."""
         await self.take_baselines()
         polls: dict[str, DirectPoll] = {}
         now = int(self._clock_ms())
@@ -1051,15 +1183,21 @@ class DirectEvidenceCollector:
             except Exception:  # noqa: BLE001 - recorded per pod as no_endpoint
                 LOG.exception("safescale direct pod URLs of %s unavailable", probe.model)
                 urls = {}
-            jobs.append((probe, {pod: urls.get(pod) for pod in pods}))
+            try:
+                # {} = no fresh view (or no remaining pod): unknown, a commit waits.
+                view = tuple(sorted(self._targets(probe.model, tuple(probe.pods)))) or None
+            except Exception:  # noqa: BLE001 - no view this tick
+                LOG.exception("safescale direct remaining pods of %s unavailable", probe.model)
+                view = None
+            jobs.append((probe, {pod: urls.get(pod) for pod in pods}, view))
         if not jobs:
             return polls
         results = await asyncio.gather(
-            *(self._scraper.scrape(targets, model_name=probe.model) for probe, targets in jobs)
+            *(self._scraper.scrape(targets, model_name=probe.model) for probe, targets, _ in jobs)
         )
         ts_ms = int(self._clock_ms())
-        for (probe, _), result in zip(jobs, results):
-            polls[probe.model] = DirectPoll(request_id=probe.request_id, ts_ms=ts_ms, results=result)
+        for (probe, _, view), result in zip(jobs, results):
+            polls[probe.model] = DirectPoll(request_id=probe.request_id, ts_ms=ts_ms, results=result, view_pods=view)
         return polls
 
     def close(self) -> None:
@@ -1083,17 +1221,34 @@ def cluster_view_targets(view_getter: Callable[[], Any], *, port: int):
         if view is None:
             return {}
         ips = getattr(view, "pod_ips", None) or {}
-        skip = set(exclude)
         out: dict[str, str | None] = {}
-        for binding in getattr(view, "bindings", ()) or ():
-            if (binding.model != model or not binding.awake or getattr(binding, "hidden", False)
-                    or binding.serve_id in skip):
-                continue
-            ip = ips.get(binding.serve_id)
-            out[binding.serve_id] = metrics_url(ip, port) if ip else None
+        for pod in _remaining_of(view, model, exclude):
+            ip = ips.get(pod)
+            out[pod] = metrics_url(ip, port) if ip else None
         return out
 
     return targets
+
+
+def _remaining_of(view: Any, model: str, exclude: Iterable[str]) -> tuple[str, ...]:
+    skip = set(exclude)
+    return tuple(sorted(
+        binding.serve_id for binding in getattr(view, "bindings", ()) or ()
+        if binding.model == model and binding.awake and not getattr(binding, "hidden", False)
+        and binding.serve_id not in skip
+    ))
+
+
+def cluster_view_remaining(view_getter: Callable[[], Any]):
+    """``remaining(model, exclude)`` -> the model's awake, not hidden pods minus
+    ``exclude`` (the probe pods) of a FRESH view, None without one: the pods whose
+    evidence a Redis-mode commit needs (``view_getter`` = ``ClusterViewBox.fresh``)."""
+
+    def remaining(model: str, exclude: tuple[str, ...]) -> tuple[str, ...] | None:
+        view = view_getter()
+        return None if view is None else _remaining_of(view, model, exclude)
+
+    return remaining
 
 
 def cluster_view_urls(view_getter: Callable[[], Any], *, port: int):

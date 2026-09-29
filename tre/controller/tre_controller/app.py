@@ -33,6 +33,7 @@ from tre_controller.planning.safescale import SafeScaleStateMachine
 from tre_controller.planning.safescale_direct import (
     DirectEvidenceCollector,
     PodMetricsScraper,
+    cluster_view_remaining,
     cluster_view_targets,
     cluster_view_urls,
 )
@@ -282,6 +283,8 @@ def create_controller_dependencies(
             ttft_override_ms=cfg.safescale.ttft_p95_slo_ms,
             tpot_override_ms=cfg.safescale.tpot_p95_slo_ms,
         ),
+        # Redis mode: the remaining pods a commit needs evidence of (fresh view only).
+        remaining_pods=cluster_view_remaining(cluster_view_box.fresh),
     )
     safescale.restore()
     # 2026-09-29 B+D: the controller scrapes the probe's remaining pods itself

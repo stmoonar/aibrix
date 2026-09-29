@@ -100,8 +100,11 @@ def summarize(records: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
     pre_hide = []
     samples = []
     modes = Counter()
+    low_sample_commits = 0
     for record in decided:
         terms = record.get("window_terms") or {}
+        if terms.get("low_sample_commit") and _resolution(record) == "commit":
+            low_sample_commits += 1
         if terms.get("latency_gate"):
             gates[str(terms["latency_gate"]) + (
                 f":{terms['latency_skip_reason']}" if terms.get("latency_skip_reason") else ""
@@ -130,6 +133,9 @@ def summarize(records: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
         "by_evidence_source": _by_source(decided),
         "formal_gate_failures": dict(formal_gates.most_common()),
         "latency_gate": dict(gates.most_common()),
+        # Commits whose latency was judged on fewer than min_commit_samples requests at
+        # the ceiling (latency_gate = evaluated_low_samples), counted apart.
+        "low_sample_commits": low_sample_commits,
         "threshold_mode": dict(modes.most_common()),
         "extensions_total": sum(extensions),
         "extensions_max": max(extensions) if extensions else None,

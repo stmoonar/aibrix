@@ -100,7 +100,10 @@ class FakeEvidence:
     def read(self, model, *, start_ms, end_ms, exclude_pods):
         self.reads.append({"model": model, "start_ms": start_ms, "end_ms": end_ms, "exclude": tuple(exclude_pods)})
         window = self.windows.pop(0) if len(self.windows) > 1 else self.windows[0]
-        return EvidenceWindow(**{**window, "start_ms": start_ms, "end_ms": end_ms})
+        # The gateway writes a doc of every remaining pod every period: by default each
+        # pod's docs reach the window end (a fresh view's remaining pods must, to commit).
+        last = window.get("last_doc_ts_ms", {pod: end_ms for pod in window.get("pods", ())})
+        return EvidenceWindow(**{**window, "start_ms": start_ms, "end_ms": end_ms, "last_doc_ts_ms": last})
 
 
 def _window(n: float, *, ttft: float | None = 100.0, tpot: float | None = 10.0, first_doc: int = 110_000,
@@ -112,11 +115,17 @@ def _window(n: float, *, ttft: float | None = 100.0, tpot: float | None = 10.0, 
     )
 
 
-def _machine(evidence, *, store=None, thresholds=None, **cfg) -> SafeScaleStateMachine:
+def _remaining(*pods: str):
+    """A fresh cluster view's remaining pods (Redis mode: the pods a commit needs)."""
+    return lambda model, exclude: tuple(pod for pod in pods if pod not in exclude)
+
+
+def _machine(evidence, *, store=None, thresholds=None, remaining=("m-0",), **cfg) -> SafeScaleStateMachine:
     clock = iter(range(1_000_000, 10_000_000, 7_000))
     return SafeScaleStateMachine(
         config=_cfg(**cfg), store=store, evidence=evidence, thresholds=thresholds,
         wall_clock_ms=lambda: next(clock),
+        remaining_pods=_remaining(*remaining) if remaining is not None else None,
     )
 
 
@@ -246,16 +255,23 @@ def test_at_the_ceiling_an_idle_model_commits() -> None:
     assert decision.details["clamped"] is True
 
 
-def test_at_the_ceiling_with_traffic_latency_is_skipped_and_z_decides() -> None:
-    ok = _machine(FakeEvidence([_window(5, ttft=5_000.0)]))
+def test_at_the_ceiling_with_traffic_the_few_samples_are_judged_and_z_decides() -> None:
+    # 2026-09-29 review: the latency gate is no longer skipped at the ceiling - the few
+    # samples there are are judged (max of per pod and pooled, no minimum).
+    ok = _machine(FakeEvidence([_window(5, ttft=120.0)]))
     _started(ok)
     for ts in range(110_000, 170_000, 10_000):
         decision = ok.observe(MODEL, _obs(ts, z=1.5), now_ms=ts)
     assert decision.status == "commit"
-    assert (decision.details["latency_gate"], decision.details["latency_skip_reason"]) == (
-        "skipped", "insufficient_samples",
-    )
-    low = _machine(FakeEvidence([_window(5, ttft=5_000.0)]))
+    assert decision.details["latency_gate"] == "evaluated_low_samples"
+    assert (decision.details["low_sample_commit"], decision.details["latency_samples"]) == (True, 5)
+    slow = _machine(FakeEvidence([_window(5, ttft=5_000.0)]))
+    _started(slow)
+    for ts in range(110_000, 170_000, 10_000):
+        decision = slow.observe(MODEL, _obs(ts, z=1.5), now_ms=ts)
+    assert (decision.status, decision.reason) == ("rollback", "formal_commit_gate_failed")
+    assert decision.details["rollback_reason"]["gates"] == ["latency"]
+    low = _machine(FakeEvidence([_window(5, ttft=120.0)]))
     _started(low)
     for ts in range(110_000, 170_000, 10_000):
         decision = low.observe(MODEL, _obs(ts, z=0.6), now_ms=ts)
@@ -496,7 +512,7 @@ def test_hide_anchor_is_redis_time_with_the_newest_gateway_doc() -> None:
 def _real_machine(redis: DocRedis) -> SafeScaleStateMachine:
     machine = SafeScaleStateMachine(
         config=_cfg(), evidence=_reader(redis), thresholds=RegistryThresholds(_slo_registry()),
-        wall_clock_ms=lambda: 0,
+        wall_clock_ms=lambda: 0, remaining_pods=_remaining("m-0"),
     )
     machine.start_probe(model=MODEL, pods=("m-1",), now_ms=START)
     machine.mark_hidden(MODEL, pods=("m-1",), anchor=HideAnchor(HIDE, "redis_time", 100_000))
@@ -640,14 +656,13 @@ def test_a_restored_probe_keeps_its_late_window_base() -> None:
 
 # ============================================================ review follow-ups
 def test_idle_needs_no_requests_in_flight_either() -> None:
-    # n = 0 but the tail shows traffic (queue) and no Z: not idle -> z_missing rollback.
+    # n = 0 but the tail shows traffic (queue): not idle - stalled, rolled back.
     machine = _machine(FakeEvidence([_window(0, ttft=None, tpot=None)]))
     _started(machine)
     for ts in range(110_000, 170_000, 10_000):
         decision = machine.observe(MODEL, _obs(ts, z=None, traffic=True), now_ms=ts)
-    assert (decision.status, decision.reason) == ("rollback", "formal_commit_gate_failed")
-    assert decision.details["rollback_reason"]["gates"] == ["z_missing"]
-    assert decision.details["latency_skip_reason"] == "insufficient_samples"
+    assert (decision.status, decision.reason) == ("rollback", "insufficient_evidence:stalled")
+    assert decision.details["rollback_reason"]["code"] == "insufficient_evidence:stalled"
 
 
 def test_a_snapshot_clock_jump_does_not_burn_extensions_on_the_same_evidence() -> None:

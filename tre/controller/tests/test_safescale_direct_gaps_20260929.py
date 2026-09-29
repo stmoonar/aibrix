@@ -3,8 +3,9 @@
 Invariant: a direct commit needs evidence covering [baseline, deadline] of EVERY live
 remaining pod. A pod whose baseline came late (pending at the baseline scrape, the
 whole probe's baseline late, a counter reset) has a hole in [hide, its baseline]: its
-data still drives the immediate rollback, but the commit is judged on the Redis
-evidence. A pod not scraped successfully by the deadline poll defers the commit.
+data still drives the immediate rollback, but the probe cannot commit any more (the
+Redis evidence never decides: 2026-09-29 review 3). A pod not scraped successfully by
+the deadline poll defers the commit.
 
 The three ``test_repro_*`` cases reproduce the review's "SLO violation, still commits"
 scenarios; they fail on a9e7fa77.
@@ -65,11 +66,10 @@ def test_repro_p0_pending_pod_violating_before_its_late_baseline_never_commits_o
     h.sims["m-2"].serve(30, ttft_s=5.0)
     decisions = h.run_until(HIDE + W, serve=5)
     at, decision = decisions[-1]
-    assert decision.status != "commit" or decision.details["evidence_source_used"] != "direct"
     assert at == HIDE + W and decision.status == "rollback"
-    assert decision.details["evidence_source_used"] == "redis_fallback"
-    assert decision.details["direct_fallback"]["reason"] == "late_baseline"
-    assert decision.details["latency_source"] == "evidence"  # the gateway docs judged it
+    assert decision.details["evidence_source_used"] == "direct"
+    assert decision.details["rollback_reason"]["code"] == "evidence_incomplete:late_baseline"
+    assert h.evidence.reads == []  # never judged on the gateway docs
     probe_terms = decision.details
     assert probe_terms["direct_late_pods"]["m-2"]["cause"] == "pending_baseline"
     assert probe_terms["direct_late_pods"]["m-2"]["lag_ms"] >= 2_000
@@ -130,7 +130,7 @@ def test_a_controller_restart_between_hide_and_baseline_makes_the_whole_probe_la
                                                                         "m-2": "probe_baseline"}
     at, decision = h.run_until(HIDE + W, serve=5, first=HIDE + 8_000)[-1]
     assert at == HIDE + W and decision.status == "rollback"
-    assert decision.details["direct_fallback"]["reason"] == "late_baseline"
+    assert decision.details["rollback_reason"]["code"] == "evidence_incomplete:late_baseline"
     assert decision.details["direct_baseline_lag_ms"] == {"m-0": 6_000, "m-2": 6_000}
 
 
@@ -145,8 +145,8 @@ def test_a_first_baseline_failing_everywhere_then_succeeding_is_late() -> None:
     assert state.fallback is None and set(state.late) == {"m-0", "m-2"}
     at, decision = h.run_until(HIDE + W, serve=5, first=HIDE + 4_000)[-1]
     assert at == HIDE + W and decision.status == "rollback"
-    assert decision.details["evidence_source_used"] == "redis_fallback"
-    assert decision.details["direct_fallback"]["reason"] == "late_baseline"
+    assert decision.details["evidence_source_used"] == "direct"
+    assert decision.details["rollback_reason"]["code"] == "evidence_incomplete:late_baseline"
 
 
 def test_a_late_pod_still_drives_the_immediate_rollback() -> None:
@@ -171,16 +171,17 @@ def test_an_on_time_baseline_is_not_late_and_commits_on_direct() -> None:
 
 
 # ============================================================ P1-b: the deciding poll
-def test_a_pod_failing_the_deadline_poll_at_the_ceiling_hands_the_commit_to_redis() -> None:
+def test_repro_3_a_pod_unanswered_at_the_ceiling_rolls_back() -> None:
+    # 8d252108 handed this to the Redis evidence, which committed.
     h = Harness(window_ceiling_ms=float(W))  # cap = deadline: nothing to extend
     h.start()
     h.run_until(HIDE + W - 2_000, serve=5)
     h.failing["m-2"] = "timeout"
     decision = h.tick(HIDE + W, serve=5)
-    assert decision.status == "commit" and decision.details["evidence_source_used"] == "redis_fallback"
-    assert decision.details["direct_fallback"]["reason"] == "pods_unanswered"
-    assert decision.details["direct_fallback"]["detail"] == {"m-2": "timeout"}
-    assert decision.details["latency_source"] == "evidence"
+    assert decision.status == "rollback"
+    assert decision.details["rollback_reason"]["code"] == "evidence_incomplete:pods_unanswered"
+    assert decision.details["rollback_reason"]["detail"] == {"m-2": "timeout"}
+    assert decision.details["evidence_source_used"] == "direct" and h.evidence.reads == []
 
 
 def test_no_poll_at_the_deadline_tick_defers_the_commit() -> None:
@@ -389,8 +390,8 @@ def test_a_pending_pod_that_falls_asleep_is_late_not_silently_dropped() -> None:
     assert state.live_pods() == ("m-0",)
     at, decision = h.run_until(HIDE + W, serve=5, first=HIDE + 4_000)[-1]
     assert at == HIDE + W and decision.status == "rollback"
-    assert decision.details["direct_fallback"]["reason"] == "late_baseline"
-    assert decision.details["direct_fallback"]["detail"]["m-2"]["cause"] == "asleep_before_baseline"
+    assert decision.details["rollback_reason"]["code"] == "evidence_incomplete:late_baseline"
+    assert decision.details["rollback_reason"]["detail"]["m-2"]["cause"] == "asleep_before_baseline"
 
 
 # ============================================================ review 2, F1: pooled p95
@@ -434,45 +435,3 @@ def test_pooled_p95_rule() -> None:
     assert pooled_p95_ms([(None, 0.0)], ("bucket_upper", 0)) is None
     beyond = ((0.1, 0.0), (5.0, 0.0), (float("inf"), 20.0))
     assert pooled_p95_ms([(beyond, 20.0)], ("bucket_upper", 0)) == 5_000.0  # +Inf -> largest finite
-
-
-# ============================================================ review 2, F2: Redis completeness
-def test_a_ceiling_fallback_never_commits_on_redis_evidence_missing_a_remaining_pod() -> None:
-    partial = FullEvidence([_window(50)], anchor=_anchor(), pods=("m-0",))  # gateway docs of m-0 only
-    h = Harness(evidence=partial, window_ceiling_ms=float(W))
-    h.start()
-    h.run_until(HIDE + W - 2_000, serve=5)
-    h.failing["m-2"] = "timeout"
-    decision = h.tick(HIDE + W, serve=5)
-    assert decision.status == "rollback"
-    assert decision.details["rollback_reason"]["code"] == "evidence_incomplete"
-    assert decision.details["rollback_reason"]["pods"] == {"m-2": "no_docs"}
-    assert decision.details["direct_fallback"]["required_pods"] == ["m-0", "m-2"]
-
-
-def test_redis_docs_of_a_remaining_pod_ending_early_do_not_commit() -> None:
-    class EarlyEnd(FullEvidence):
-        def read(self, model, *, start_ms, end_ms, exclude_pods):
-            window = super().read(model, start_ms=start_ms, end_ms=end_ms, exclude_pods=exclude_pods)
-            return replace(window, last_doc_ts_ms={**window.last_doc_ts_ms, "m-2": end_ms - 10_000})
-
-    h = Harness(evidence=EarlyEnd([_window(50)], anchor=_anchor()), window_ceiling_ms=float(W))
-    h.start()
-    h.run_until(HIDE + W - 2_000, serve=5)
-    h.failing["m-2"] = "timeout"
-    decision = h.tick(HIDE + W, serve=5)
-    assert decision.status == "rollback"
-    assert decision.details["rollback_reason"]["pods"] == {"m-2": "docs_end:110000"}
-
-
-def test_a_late_fallback_below_the_ceiling_extends_while_the_redis_evidence_is_incomplete() -> None:
-    partial = FullEvidence([_window(50)], anchor=_anchor(), pods=("m-0",))
-    h = Harness(evidence=partial)
-    h.failing["m-2"] = "timeout"
-    h.start()
-    del h.failing["m-2"]
-    decisions = h.run_until(HIDE + W, serve=5)
-    at, decision = decisions[-1]
-    assert at == HIDE + W and decision.status == "probing"
-    assert decision.reason == "evidence_extended" and decision.details["extend_reason"] == "evidence_incomplete"
-    assert decision.details["evidence_incomplete_pods"] == {"m-2": "no_docs"}

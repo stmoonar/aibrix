@@ -24,6 +24,12 @@ part of the gate now reads ONE evidence window instead:
 the service-manager's clock-skew check uses too), else the controller clock. It is
 kept for the audit and the fallback above; the offsets of the gateway stamps and of the
 controller clock against it are recorded and alerted on (``safescale_clock_skew_alert``).
+
+Used only with ``safescale.evidence_source: redis`` (the rollback switch). Known
+limitation: the gateway writes a doc for every ready pod every period from its cached
+scrape (``pkg/cache/cache_tre_redis.go``), with a fresh stamp even when that scrape is
+stale, so a doc's stamp does not prove its counters are fresh. The direct path does
+not have this problem and never commits on this evidence.
 """
 from __future__ import annotations
 
@@ -146,6 +152,10 @@ class EvidenceWindow:
     #: per pod, but to the pooled count); already folded into ttft/tpot_p95_ms (max).
     pooled_ttft_p95_ms: float | None = None
     pooled_tpot_p95_ms: float | None = None
+    #: max(per pod, pooled) p95 WITHOUT any minimum-samples rule: the ceiling's
+    #: low-sample evaluation. None = not computed (then the p95s above stand in).
+    low_ttft_p95_ms: float | None = None
+    low_tpot_p95_ms: float | None = None
 
     @property
     def mean_prompt_tokens(self) -> float | None:
@@ -251,6 +261,13 @@ class MetricsEvidenceReader:
         total = float(sum(float(getattr(pod, "ttft_count", None) or 0.0) for pod in pods.values()))
         if pooled_ttft is not None or pooled_tpot is not None:
             judged = total  # every request is in the pooled p95
+        # The same max(per pod, pooled) without any minimum-samples rule (low-sample
+        # evaluation at the ceiling).
+        rule0 = (rule[0], 0)
+
+        def low(hist_attr: str, count_attr: str) -> float | None:
+            pairs = [(getattr(pod, hist_attr, None), getattr(pod, count_attr, None)) for pod in pods.values()]
+            return _max_present([*(pooled_p95_ms([pair], rule0) for pair in pairs), pooled_p95_ms(pairs, rule0)])
         return EvidenceWindow(
             start_ms=int(start_ms),
             end_ms=int(end_ms),
@@ -266,6 +283,8 @@ class MetricsEvidenceReader:
             last_doc_ts_ms=last_docs,
             pooled_ttft_p95_ms=pooled_ttft,
             pooled_tpot_p95_ms=pooled_tpot,
+            low_ttft_p95_ms=low("ttft_hist", "ttft_hist_count"),
+            low_tpot_p95_ms=low("tpot_hist", "tpot_hist_count"),
         )
 
     def _now(self) -> tuple[int, str]:

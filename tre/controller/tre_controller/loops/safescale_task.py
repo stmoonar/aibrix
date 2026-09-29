@@ -8,6 +8,7 @@ from typing import Awaitable, Callable, Mapping, Protocol
 
 from tre_common.metrics_schema import MetricsSnapshot, ModelWindowMetrics
 from tre_common.registry import Registry
+from tre_common.window_pods import pooled_p95_ms
 from tre_controller.gateway_health import GatewayCounters
 from tre_controller.loops.tick import serving_window
 from tre_controller.planning.planner import (
@@ -626,7 +627,22 @@ def _observation_from_metrics(
         window_end_ms=getattr(metrics, "window_end_ms", None),
         # L of the labels-mode TTFT threshold: prompt-token sum / count delta.
         mean_prompt_tokens=_mean_prompt_tokens(metrics),
+        # The immediate rollback judges max(per pod, pooled) like the deadline gate.
+        pooled_ttft_p95_ms=_pooled_p95(metrics, hidden_pods, "ttft_hist", "ttft_hist_count"),
+        pooled_tpot_p95_ms=_pooled_p95(metrics, hidden_pods, "tpot_hist", "tpot_hist_count"),
     )
+
+
+def _pooled_p95(metrics: ModelWindowMetrics, hidden_pods: tuple[str, ...], hist: str, count: str) -> float | None:
+    """p95 of the remaining pods' window histograms pooled first (the store's rule, its
+    minimum samples on the pooled count). None without a rule / histograms."""
+    rule = getattr(metrics, "p95_rule", None)
+    if rule is None:
+        return None
+    hidden = set(hidden_pods)
+    pods = [pod for key, pod in (getattr(metrics, "per_pod", None) or {}).items()
+            if key not in hidden and getattr(pod, "pod", key) not in hidden]
+    return pooled_p95_ms(((getattr(pod, hist, None), getattr(pod, count, None)) for pod in pods), rule)
 
 
 def _mean_prompt_tokens(metrics: ModelWindowMetrics) -> float | None:

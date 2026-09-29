@@ -3,8 +3,8 @@
 B: at the SM's hide confirmation the controller scrapes the remaining pods' vLLM
 /metrics (baseline), then every poll; the difference is the probe's latency / KV
 evidence. D: a judged SLO violation rolls back at once. Deadline = confirmation + W on
-the controller clock, extended one poll period while short, 60 s ceiling. Fallback to
-the Redis evidence path when every remaining pod fails; fail-closed without it.
+the controller clock, extended one poll period while short, 60 s ceiling. The Redis
+evidence never decides a commit here: any gap extends, then rolls back.
 """
 from __future__ import annotations
 
@@ -294,14 +294,13 @@ def test_short_evidence_extends_by_one_poll_period() -> None:
     assert final.details["latency_samples"] == 20
 
 
-def test_at_the_ceiling_traffic_skips_latency_and_idle_commits() -> None:
+def test_at_the_ceiling_a_stalled_model_rolls_back_and_an_idle_one_commits() -> None:
     h = Harness(pods=("m-0",))
     h.start()
-    decisions = h.run_until(HIDE + 60_000, serve=0)  # traffic in flight, never 20 samples
+    decisions = h.run_until(HIDE + 60_000, serve=0)  # traffic in flight, nothing completes
     at, decision = decisions[-1]
-    assert at == HIDE + 60_000 and decision.status == "commit"
-    assert (decision.details["latency_gate"], decision.details["latency_skip_reason"]) == (
-        "skipped", "insufficient_samples")
+    assert at == HIDE + 60_000 and decision.status == "rollback"
+    assert decision.details["rollback_reason"]["code"] == "insufficient_evidence:stalled"
     assert decision.details["clamped"] is True
     idle = Harness(pods=("m-0",))
     idle.obs_kwargs = {"traffic": False}
@@ -370,7 +369,7 @@ def test_a_pod_failing_only_at_the_baseline_gets_its_own_baseline_and_is_judged(
 
 def test_a_pod_whose_scrapes_keep_failing_never_lets_a_subset_commit() -> None:
     # Review P0 case B: m-2 never answers; m-0 looks healthy. No commit on m-0 alone:
-    # the deadline extends while m-2 is missing and the Redis evidence decides at the cap.
+    # the deadline extends while m-2 is missing, and the probe rolls back at the cap.
     h = Harness()
     h.start()
     h.failing["m-2"] = "timeout"
@@ -379,20 +378,18 @@ def test_a_pod_whose_scrapes_keep_failing_never_lets_a_subset_commit() -> None:
     reasons = {d.details.get("extend_reason") for _, d in decisions if d.reason == "evidence_extended"}
     assert reasons == {"pods_missing"}
     at, decision = decisions[-1]
-    assert at == HIDE + 60_000 and decision.status == "commit"
-    assert decision.details["evidence_source_used"] == "redis_fallback"
-    assert decision.details["direct_fallback"]["reason"] == "pods_missing"
-    assert decision.details["direct_fallback"]["detail"] == {"m-2": "no_data:timeout"}
-    assert decision.details["direct_fallback"]["required_pods"] == ["m-0", "m-2"]
-    assert decision.details["latency_source"] == "evidence"  # the gateway docs judged it
-    assert decision.details["evidence_pods"] == ["m-0", "m-2"]  # m-2 included
+    assert at == HIDE + 60_000 and decision.status == "rollback"
+    assert decision.details["rollback_reason"]["code"] == "evidence_incomplete:pods_missing"
+    assert decision.details["rollback_reason"]["detail"] == {"m-2": "no_data:timeout"}
+    assert decision.details["evidence_source_used"] == "direct"
+    assert h.evidence.reads == []  # the Redis evidence never decides
 
 
-def test_a_counter_reset_keeps_the_pod_from_zero_and_the_commit_goes_to_redis() -> None:
+def test_a_counter_reset_keeps_the_pod_from_zero_and_the_probe_never_commits() -> None:
     # Review P1-a: a restarted pod is NOT dropped (that let the others commit on a
     # subset): its baseline is reset to zero (the restart follows its baseline, so the
     # hide) and it stays polled and judged; its pre-restart requests are lost, so it is
-    # late for good and the commit is judged on the Redis evidence.
+    # late for good and the probe rolls back at its deadline.
     h = Harness()
     h.start(pre_hide=10, pre_hide_ttft=0.05)
     h.tick(HIDE + 2_000, serve=5)
@@ -407,11 +404,10 @@ def test_a_counter_reset_keeps_the_pod_from_zero_and_the_commit_goes_to_redis() 
     assert probe.direct.last.missing == {"m-2": "late_baseline"}
     at, decision = h.run_until(HIDE + W, serve=5, first=HIDE + 6_000)[-1]
     assert "m-2" in h.scraper.calls[-1][1]  # still polled
-    assert at == HIDE + W and decision.status == "commit"
-    assert decision.details["evidence_source_used"] == "redis_fallback"
-    assert decision.details["direct_fallback"]["reason"] == "late_baseline"
-    assert decision.details["direct_fallback"]["detail"]["m-2"]["cause"] == "counter_reset"
-    assert decision.details["latency_source"] == "evidence"
+    assert at == HIDE + W and decision.status == "rollback"
+    assert decision.details["rollback_reason"]["code"] == "evidence_incomplete:late_baseline"
+    assert decision.details["rollback_reason"]["detail"]["m-2"]["cause"] == "counter_reset"
+    assert decision.details["evidence_source_used"] == "direct" and h.evidence.reads == []
 
 
 def test_a_vanished_family_is_a_restart_too() -> None:
@@ -427,38 +423,34 @@ def test_a_vanished_family_is_a_restart_too() -> None:
     assert "m-2" in state.last.pods and state.last.missing == {"m-2": "late_baseline"}
 
 
-def test_every_pod_failing_twice_in_a_row_falls_back_to_the_redis_evidence() -> None:
+def test_every_pod_failing_defers_and_never_switches_to_the_redis_evidence() -> None:
     h = Harness()
     h.start()
     h.tick(HIDE + 2_000, serve=5)
     h.failing.update({"m-0": "timeout", "m-2": "error:URLError"})
-    assert h.tick(HIDE + 4_000).status == "probing"
-    assert h.machine.active_probe(MODEL).direct.fallback is None  # one bad tick is not enough
-    assert h.tick(HIDE + 6_000).status == "probing"
+    for at in (HIDE + 4_000, HIDE + 6_000, HIDE + 8_000):
+        assert h.tick(at, serve=5).status == "probing"
     probe = h.machine.active_probe(MODEL)
-    assert probe.direct.fallback["reason"] == "all_pods_failed"
+    assert probe.direct.fallback is None and probe.direct.failed_polls == 3
     polls_before = len(h.scraper.calls)
     h.failing.clear()
-    h.tick(HIDE + 8_000)
-    assert len(h.scraper.calls) == polls_before  # sticky: no more scraping
-    # The Redis path (687cbd9c logic) judges at the snapshot deadline.
-    decision = h.tick(130_000, obs=_obs(130_000))
-    assert decision.status == "commit"
-    assert decision.details["evidence_source_used"] == "redis_fallback"
-    assert decision.details["latency_source"] == "evidence"
-    assert h.evidence.reads and h.evidence.reads[-1]["start_ms"] == 110_000
+    at, decision = h.run_until(HIDE + W, serve=5, first=HIDE + 10_000)[-1]
+    assert len(h.scraper.calls) > polls_before  # still scraped
+    assert (at, decision.status) == (HIDE + W, "commit")
+    assert decision.details["evidence_source_used"] == "direct" and h.evidence.reads == []
 
 
-def test_a_failed_baseline_is_retried_then_falls_back() -> None:
+def test_a_failed_baseline_is_retried_and_a_probe_without_one_rolls_back() -> None:
     h = Harness()
     h.failing.update({"m-0": "timeout", "m-2": "no_endpoint"})
     probe = h.start()
     assert probe.direct.fallback is None and probe.direct.baseline is None
     assert probe.direct.pending == ("m-0", "m-2") and probe.direct.failed_polls == 1
-    h.tick(HIDE + 2_000)  # the tick retries the baseline: still nothing -> Redis
-    probe = h.machine.active_probe(MODEL)
-    assert probe.direct.fallback["reason"] == "baseline_failed"
-    assert probe.direct.fallback["detail"] == {"m-0": "timeout", "m-2": "no_endpoint"}
+    at, decision = h.run_until(HIDE + W, serve=5)[-1]
+    assert (at, decision.status) == (HIDE + W, "rollback")
+    assert decision.details["rollback_reason"]["code"] == "evidence_incomplete:no_baseline"
+    assert decision.details["rollback_reason"]["detail"]["failed_polls"] >= 2
+    assert h.evidence.reads == []
 
 
 def test_no_cluster_view_yet_is_retried_not_a_fallback() -> None:
@@ -481,23 +473,21 @@ def test_no_cluster_view_yet_is_retried_not_a_fallback() -> None:
     assert state.baseline_lag_ms == {"m-0": 2_000, "m-2": 2_000}
 
 
-def test_redis_evidence_failing_too_fails_closed() -> None:
+def test_direct_mode_never_reads_the_redis_evidence_and_works_without_a_reader() -> None:
     h = Harness(evidence=RaisingEvidence([_window(50)], anchor=_anchor()))
     h.failing.update({"m-0": "timeout", "m-2": "timeout"})
     h.start()
-    decision = h.tick(130_000, obs=_obs(130_000))
+    at, decision = h.run_until(HIDE + W, serve=5)[-1]
     assert decision.status == "rollback"
-    assert decision.details["rollback_reason"]["code"] == "evidence_unavailable"
-    assert decision.details["evidence_source_used"] == "redis_fallback"
-    # No Redis evidence reader at all: fail-closed as well.
+    assert decision.details["rollback_reason"]["code"] == "evidence_incomplete:no_baseline"
+    # No Redis evidence reader at all: the direct path decides the same way.
     bare = Harness()
     bare.machine = SafeScaleStateMachine(config=_cfg(), evidence=None, wall_clock_ms=bare.clock)
     bare.collector = bare._collector(bare.machine)
-    bare.failing.update({"m-0": "timeout", "m-2": "timeout"})
     bare.start()
-    decision = bare.tick(130_000, obs=_obs(130_000))
-    assert decision.details["rollback_reason"] == {"code": "evidence_unavailable",
-                                                   "detail": "no_redis_evidence_reader"}
+    at, decision = bare.run_until(HIDE + W, serve=5)[-1]
+    assert (at, decision.status) == (HIDE + W, "commit")
+    assert decision.details["evidence_source_used"] == "direct"
 
 
 # ============================================================ KV / Z gates
