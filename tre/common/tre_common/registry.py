@@ -434,6 +434,11 @@ class SafeScaleRegistryConfig:
     evidence_poll_s: float = 2.0
     #: Direct path: timeout (s) of one pod scrape (the scrapes of a tick run concurrently).
     scrape_timeout_s: float = 1.0
+    #: Direct path: the baseline scrape runs this long (ms) after the SM confirmed the
+    #: hide, so the gateway has applied it (pod watch) - a baseline taken while requests
+    #: still go to the hidden pods under-counts the remaining pods' load. The deadline
+    #: still counts from the confirmation.
+    baseline_delay_ms: float = 1000.0
     #: Direct path: the port of a model pod serving ``GET /metrics`` (the pod's serving
     #: port; with the reissue sidecar the sidecar forwards it to vLLM).
     metrics_port: int = POD_SERVING_PORT
@@ -441,7 +446,7 @@ class SafeScaleRegistryConfig:
 
 SAFESCALE_KEYS = frozenset({
     "slo_mode", "window_ceiling_s", "min_commit_samples", "evidence_clock_tolerance_s",
-    "evidence_source", "evidence_poll_s", "scrape_timeout_s", "metrics_port",
+    "evidence_source", "evidence_poll_s", "scrape_timeout_s", "metrics_port", "baseline_delay_ms",
 })
 SAFESCALE_EVIDENCE_SOURCES = ("direct", "redis")
 
@@ -484,6 +489,9 @@ def parse_safescale_config(raw: dict[str, Any] | None) -> SafeScaleRegistryConfi
             f"safescale.scrape_timeout_s ({scrape_timeout}) must be below evidence_poll_s ({poll}): "
             "a tick's scrapes must finish before the next one"
         )
+    baseline_delay = _safescale_num(raw, "baseline_delay_ms", defaults.baseline_delay_ms)
+    if not math.isfinite(baseline_delay) or baseline_delay < 0:
+        raise ValueError(f"safescale.baseline_delay_ms must be a non-negative number, got {baseline_delay!r}")
     port_raw = raw.get("metrics_port")
     port = defaults.metrics_port if port_raw is None else port_raw
     try:
@@ -502,6 +510,10 @@ def parse_safescale_config(raw: dict[str, Any] | None) -> SafeScaleRegistryConfi
     for name, value in (("window_ceiling_s", ceiling), ("evidence_clock_tolerance_s", tolerance)):
         if not math.isfinite(value) or value <= 0:
             raise ValueError(f"safescale.{name} must be a positive number, got {value!r}")
+    if baseline_delay >= 1000.0 * ceiling:
+        raise ValueError(
+            f"safescale.baseline_delay_ms ({baseline_delay}) must be below window_ceiling_s ({ceiling}) in ms"
+        )
     samples_raw = raw.get("min_commit_samples")
     samples = defaults.min_commit_samples if samples_raw is None else samples_raw
     if isinstance(samples, bool) or float(samples) != int(float(samples)) or int(float(samples)) < 0:
@@ -515,6 +527,7 @@ def parse_safescale_config(raw: dict[str, Any] | None) -> SafeScaleRegistryConfi
         evidence_poll_s=float(poll),
         scrape_timeout_s=float(scrape_timeout),
         metrics_port=int(float(port)),
+        baseline_delay_ms=float(baseline_delay),
     )
 
 

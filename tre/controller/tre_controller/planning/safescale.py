@@ -427,17 +427,50 @@ class SafeScaleStateMachine:
     def direct_mode(self) -> bool:
         return self._direct_mode
 
-    def direct_baseline_due(self) -> tuple[SafeScaleProbe, ...]:
+    def direct_baseline_delay_ms(self) -> int:
+        """Registry ``safescale.baseline_delay_ms``: the baseline is scraped this long
+        after the hide confirmation (the gateway applies the hide through its pod watch
+        meanwhile); the deadline still counts from the confirmation."""
+        return max(0, int(getattr(self._config, "baseline_delay_ms", 0.0) or 0))
+
+    def direct_baseline_planned_ms(self, model: str) -> int | None:
+        """When ``model``'s probe baseline is due (confirmation + delay); None = no
+        probe waiting for one."""
+        probe = self._probes.get(model)
+        if probe is None or all(due.request_id != probe.request_id for due in self.direct_baseline_due()):
+            return None
+        return self._baseline_planned_ms(probe)
+
+    def _baseline_planned_ms(self, probe: SafeScaleProbe) -> int | None:
+        confirm = _hide_confirm_ms(probe)
+        return None if confirm is None else confirm + self.direct_baseline_delay_ms()
+
+    def _late_after_ms(self) -> float:
+        """A baseline scraped later than confirmation + delay + one scrape timeout was
+        not the planned first attempt (retry, restarted controller): late."""
+        return float(self.direct_baseline_delay_ms()) + 1000.0 * float(
+            getattr(self._config, "scrape_timeout_s", 1.0) or 1.0
+        )
+
+    def direct_baseline_due(self, now_ms: int | None = None) -> tuple[SafeScaleProbe, ...]:
         """Probing probes on the direct path whose hide is confirmed and whose baseline
-        is not taken yet (normally taken at the confirmation; after a restart or a
-        failed first attempt, at the next tick - later is still post-hide)."""
+        is not taken yet (normally taken ``baseline_delay_ms`` after the confirmation;
+        after a restart or a failed first attempt, at a later tick - still post-hide, but
+        then late: see ``take_baseline``). With ``now_ms``, only probes whose planned
+        baseline time is reached."""
         if not self._direct_mode:
             return ()
-        return tuple(
+        due = tuple(
             probe for probe in self._probes.values()
             if probe.status == "probing" and probe.hide_anchor is not None
             and probe.abort_reason is None and probe.preempt_reason is None
             and (probe.direct is None or (probe.direct.baseline is None and probe.direct.fallback is None))
+        )
+        if now_ms is None:
+            return due
+        return tuple(
+            probe for probe in due
+            if (self._baseline_planned_ms(probe) or 0) <= int(now_ms)
         )
 
     def direct_poll_due(self) -> tuple[SafeScaleProbe, ...]:
@@ -466,9 +499,12 @@ class SafeScaleStateMachine:
             return False
         if not results:
             return False
-        state = take_baseline(results, ts_ms=int(ts_ms), previous=probe.direct)
+        state = take_baseline(
+            results, ts_ms=int(ts_ms), previous=probe.direct,
+            hide_confirm_ms=_hide_confirm_ms(probe), late_after_ms=self._late_after_ms(),
+        )
         audit = {
-            "direct_baseline_ts_ms": state.baseline_ts_ms,
+            **self._baseline_audit(probe, state),
             "direct_baseline_pods": sorted(state.baseline or {}),
             "direct_pending_pods": list(state.pending),
             "direct_excluded_pods": {pod: value.get("reason") for pod, value in sorted(state.dropped.items())},
@@ -535,6 +571,7 @@ class SafeScaleStateMachine:
             min_latency_samples=int(getattr(self._config, "min_latency_samples", 0) or 0),
             fresh_ms=_direct_fresh_ms(self._config),
             hq=float(getattr(self._config, "hq", 0.25)),
+            hide_confirm_ms=_hide_confirm_ms(probe),
         )
         probe = replace(probe, direct=state)
         self._probes[probe.model] = probe
@@ -588,12 +625,24 @@ class SafeScaleStateMachine:
             "evidence_end_ms": window.end_ms,
         }
 
+    def _baseline_audit(self, probe: SafeScaleProbe, state: DirectState) -> dict[str, Any]:
+        """Baseline timing: planned vs actual, per-pod lag after the hide confirmation,
+        and the pods whose evidence has a hole (late)."""
+        return {
+            "baseline_delay_ms": self.direct_baseline_delay_ms(),
+            "direct_baseline_planned_ms": self._baseline_planned_ms(probe),
+            "direct_baseline_ts_ms": state.baseline_ts_ms,
+            "direct_baseline_lag_ms": dict(sorted(state.baseline_lag_ms.items())),
+            "direct_late_after_ms": self._late_after_ms(),
+            "direct_late_pods": {pod: dict(value) for pod, value in sorted(state.late.items())},
+        }
+
     def _direct_audit(self, probe: SafeScaleProbe) -> dict[str, Any]:
         state = probe.direct or DirectState()
         audit: dict[str, Any] = {
             "evidence_source_used": SOURCE_DIRECT,
             "latency_source": "direct",
-            "direct_baseline_ts_ms": state.baseline_ts_ms,
+            **self._baseline_audit(probe, state),
             "direct_scrape_ts_ms": list(state.scrapes),
             "direct_excluded_pods": {pod: value.get("reason") for pod, value in sorted(state.dropped.items())},
         }
@@ -610,7 +659,8 @@ class SafeScaleStateMachine:
         if not self._direct_mode:
             return {"evidence_source_used": SOURCE_REDIS}
         if probe.direct is not None and probe.direct.fallback is not None:
-            return {"evidence_source_used": SOURCE_REDIS_FALLBACK, "direct_fallback": dict(probe.direct.fallback)}
+            return {"evidence_source_used": SOURCE_REDIS_FALLBACK, "direct_fallback": dict(probe.direct.fallback),
+                    **self._baseline_audit(probe, probe.direct)}
         return {"evidence_source_used": SOURCE_DIRECT}
 
     def observe(
@@ -763,7 +813,7 @@ class SafeScaleStateMachine:
                 # subset - the Redis evidence (every pod the gateway scrapes) decides.
                 probe = self._fall_back(
                     probe, reason=str(outcome.audit.get("fallback_reason")),
-                    ts_ms=int(wall_now_ms or now_ms), detail=outcome.audit.get("direct_missing_pods"),
+                    ts_ms=int(wall_now_ms or now_ms), detail=outcome.audit.get("fallback_detail"),
                 )
                 return self._judge(probe, health, now_ms=now_ms)
             if outcome.kind == "extend":
@@ -1030,7 +1080,8 @@ class SafeScaleStateMachine:
             why = "no_direct_window" if window is None else "direct_window_stale"
             if can_extend:
                 return _EvidenceOutcome("extend", audit={**audit, "extend_reason": why})
-            return _EvidenceOutcome("fallback", audit={**audit, "fallback_reason": why})
+            return _EvidenceOutcome("fallback", audit={**audit, "fallback_reason": why,
+                                                       "fallback_detail": {"window": why}})
         confirm = probe.window_base_ms if probe.window_base_ms is not None else probe.start_ms
         samples, judged = float(window.ttft_count), float(window.judged_count)
         thresholds = self._thresholds_for(probe.model, window.mean_prompt_tokens)
@@ -1060,12 +1111,33 @@ class SafeScaleStateMachine:
             # A violation is one whatever pods are missing.
             audit.update(latency_gate="evaluated", latency_violations=violations)
             return _EvidenceOutcome("judge", audit=audit, latency_ok=False)
+        # Invariant (2026-09-29 review): a direct commit needs evidence of EVERY live
+        # remaining pod over [its planned baseline, this poll] - no gap of any kind.
+        late = dict(window.late)  # live or dropped since (pending, then asleep)
+        if late:
+            # A pod's evidence has a hole after the hide (late / retried baseline,
+            # restart): waiting cannot fill it. The Redis evidence judges the commit now.
+            return _EvidenceOutcome("fallback", audit={
+                **audit, "fallback_reason": "late_baseline",
+                "fallback_detail": {pod: dict(value) for pod, value in sorted(late.items())},
+            })
         if window.missing:
             # A live pod has no fresh evidence (pending baseline, failing scrapes): its
             # requests are not in the window - never commit on the subset.
             if can_extend:
                 return _EvidenceOutcome("extend", audit={**audit, "extend_reason": "pods_missing"})
-            return _EvidenceOutcome("fallback", audit={**audit, "fallback_reason": "pods_missing"})
+            return _EvidenceOutcome("fallback", audit={**audit, "fallback_reason": "pods_missing",
+                                                       "fallback_detail": dict(sorted(window.missing.items()))})
+        if window.unanswered or int(window.end_ms) != int(wall_now_ms):
+            # The deciding poll must have read every live pod: a pod whose latest scrape
+            # failed (a timeout is often the overload itself) may hide the violation in
+            # the seconds its older delta does not cover. The 5 s freshness tolerance is
+            # for the intermediate ticks only. Defer (up to the ceiling, then Redis).
+            why = "pods_unanswered" if window.unanswered else "no_poll_this_tick"
+            detail = dict(sorted(window.unanswered.items())) or {"poll_ts_ms": window.end_ms}
+            if can_extend:
+                return _EvidenceOutcome("extend", audit={**audit, "extend_reason": why})
+            return _EvidenceOutcome("fallback", audit={**audit, "fallback_reason": why, "fallback_detail": detail})
         if enough:
             audit.update(latency_gate="evaluated", latency_violations=violations)
             return _EvidenceOutcome("judge", audit=audit, latency_ok=True)
@@ -1342,8 +1414,21 @@ ALL_FAILED_POLLS = 2
 
 def _direct_fresh_ms(config: SafeScaleConfig) -> float:
     """A pod's latest delta counts as fresh within two poll periods plus one scrape
-    timeout (one failed scrape in between is tolerated: its delta is cumulative)."""
+    timeout (one failed scrape in between is tolerated at the intermediate ticks: its
+    delta is cumulative). Not at the deadline: a commit needs every live pod answered in
+    the deciding poll (``_direct_outcome``)."""
     return 2.0 * _direct_poll_ms(config) + 1000.0 * float(getattr(config, "scrape_timeout_s", 1.0) or 1.0)
+
+
+def _hide_confirm_ms(probe: SafeScaleProbe) -> int | None:
+    """The hide confirmation (controller clock) of a direct-path probe: its window base
+    (set by ``mark_hidden``). None = hide not confirmed."""
+    if probe.hide_anchor is None:
+        return None
+    if probe.window_base_ms is not None:
+        return int(probe.window_base_ms)
+    anchor = probe.hide_anchor
+    return int(anchor.controller_ts_ms if anchor.controller_ts_ms is not None else anchor.ts_ms)
 
 
 def _latency_violations(ttft_p95_ms: float | None, tpot_p95_ms: float | None, thresholds: dict[str, Any]) -> list[str]:

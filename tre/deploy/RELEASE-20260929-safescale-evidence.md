@@ -22,23 +22,43 @@ is now `safescale.evidence_source: redis` and the per-probe fallback of `direct`
 | 4 | thresholds = env 500 / 75 ms | registry `safescale.slo_mode`: `labels` (default; TPOT 75, TTFT = max(floor, k(c + bL)), L = mean prompt length of the judged window) or `fixed` (`models[].slo`); env = optional override |
 | 5 | - | first evidence doc of every remaining pod stamped in `[S, N + 20 s]` (one missed gateway tick tolerated), else rollback `evidence_clock_skew` / `first_doc_outside` (ERROR log `safescale_evidence_clock_skew`); no gateway-stamp anchor (newest-doc read failed, Redis error, legacy v1 metric keys) -> rollback `evidence_clock_skew` / `anchor_unverified` at the next tick; no evidence by `W_max` (E <= S, or no doc of any remaining pod in `[S, E]`) -> rollback `evidence_empty` (ERROR log) - idle commits need docs too; clock offsets -> ERROR `safescale_clock_skew_alert` |
 | 6 | - | audit fields (below), events `safescale_evidence:` / `safescale_rollback_reason:`, summary script |
-| 7 | evidence = gateway docs on the 10 s grid: probe length 18-32 s by gateway phase (+10 s per extension), immediate rollback only 35-45 s after the hide | `safescale.evidence_source: direct` (default): baseline scrape of the remaining pods at the SM's hide confirmation, one poll per 2 s tick; immediate rollback `slo_violation_direct` as soon as `min_commit_samples` are judged; deadline = confirmation + W (controller clock), +2 s per extension, ceiling confirmation + 60 s; KV gate from the scrape; no commit while a remaining pod lacks fresh evidence; fallback to the `redis` path when every remaining pod fails twice in a row or pods are still missing at the ceiling |
+| 7 | evidence = gateway docs on the 10 s grid: probe length 18-32 s by gateway phase (+10 s per extension), immediate rollback only 35-45 s after the hide | `safescale.evidence_source: direct` (default): baseline scrape of the remaining pods `baseline_delay_ms` (1 s) after the SM's hide confirmation, one poll per 2 s tick; immediate rollback `slo_violation_direct` as soon as `min_commit_samples` are judged; deadline = confirmation + W (controller clock), +2 s per extension, ceiling confirmation + 60 s; KV gate from the scrape; a direct commit only on evidence of every remaining pod since its planned baseline, every one of them read in the deciding poll; any gap -> the `redis` path decides the commit (late baseline: at once; pods missing / unanswered: at the ceiling); fallback also when every remaining pod fails twice in a row |
 
 ## Direct evidence (default, 2026-09-29 B+D)
 
-- **Baseline.** When the SM confirms the hide (ActionQueue `on_hide_done`), the
-  controller scrapes `GET http://<pod IP>:<safescale.metrics_port>/metrics` of every
-  remaining pod of the model (awake in the SM view, probe pods excluded; pod IPs from
-  the SM `/v2/state` `fleet.observed`), concurrently, `scrape_timeout_s` (1 s) each, in
-  a dedicated thread pool awaited with `asyncio.wait_for` (the event loop, the fast loop
-  and the queue never wait on it). It keeps the cumulative TTFT and inter-token-latency
-  histograms (bucket steps only) and the prompt-token sum / count per pod in the probe
-  record (`direct_evidence`): a restarted controller continues from it. A baseline not
-  taken at the confirmation (restart, a probe restored from an older controller, no
-  cluster view / pod IPs yet) is taken at a later tick - later is still post-hide. A pod
-  that does not answer the baseline scrape stays `pending` and gets its own baseline at
-  its first successful scrape. Awake but hidden pods (not the probe's) are not remaining
-  pods.
+- **Baseline.** `safescale.baseline_delay_ms` (1000) after the SM confirms the hide
+  (ActionQueue `on_hide_done`; the gateway applies the hide through its pod watch
+  meanwhile - a baseline taken while requests still reach the hidden pods under-counts
+  the remaining pods' load), the controller scrapes
+  `GET http://<pod IP>:<safescale.metrics_port>/metrics` of every remaining pod of the
+  model (awake and not hidden in a FRESH SM view, probe pods excluded; pod IPs from the
+  SM `/v2/state` `fleet.observed`; only samples labelled with the probe's `model_name`,
+  so a pod IP reused by another model's pod reads as `model_mismatch`), concurrently,
+  in a dedicated thread pool (the event loop, the fast loop and the queue never wait on
+  it). `scrape_timeout_s` (1 s) counts from the moment a pool thread starts the read, not
+  from the submission: a read queued behind others is not a pod timeout; the queue wait
+  is bounded by one more `scrape_timeout_s` (`pool_saturated`, a failure like a timeout),
+  and a pool more than 75 % busy (queued + running reads, stuck ones included) logs a
+  WARNING `safescale_scrape_pool_busy` (at most once a minute). The baseline keeps the
+  cumulative TTFT and inter-token-latency histograms (bucket steps only) and the
+  prompt-token sum / count per pod in the probe record (`direct_evidence`): a restarted
+  controller continues from it. The deadline still counts from the confirmation.
+  Awake but hidden pods (not the probe's) are not remaining pods.
+- **Late baselines (evidence gaps).** Each pod's `baseline lag` = its baseline scrape -
+  the hide confirmation is recorded (`direct_baseline_lag_ms`). A pod is `late` for the
+  rest of the probe (`direct_late_pods`, pod -> `cause`, `lag_ms`, `ts_ms`) when its
+  requests of some part of [confirmation + delay, now] are not in its delta: `pending_baseline` (it
+  did not answer the baseline scrape; its baseline is its first later successful
+  scrape), `probe_baseline` (the baseline itself was scraped later than
+  confirmation + `baseline_delay_ms` + `scrape_timeout_s` = 2 s by default: a retried
+  baseline after every pod failed, a controller restarted between the hide and the
+  baseline, no fresh cluster view / pod IPs at the planned time), `counter_reset` /
+  `family_vanished` (the pod restarted after its baseline: its baseline is reset to zero -
+  the restart follows the hide, so everything it counted since is post-hide - and it
+  stays polled and judged; the requests before the restart are lost). A late pod's data
+  still drives the immediate rollback; the commit is never decided on the direct window:
+  at the deadline the probe switches to the Redis evidence at once
+  (`direct_fallback.reason = late_baseline`, `detail` = the late pods).
 - **Poll.** Every `evidence_poll_s` (2 s) the baseline pods are scraped again and
   differenced: per pod TTFT / TPOT p95 (`TRE_PERCENTILE_MODE`, per-pod minimum
   `TRE_MIN_LATENCY_SAMPLES`), model p95 = max over the pods, `n` = TTFT count,
@@ -50,12 +70,12 @@ is now `safescale.evidence_source: redis` and the per-probe fallback of `direct`
   with the p95s, thresholds, `n`, window), whatever pods are missing. The window is
   cumulative since the baseline: a violation present from the hide is caught by the
   first or second poll at 7b load (4-10 req/s per pod, 3 remaining pods) - 2-4 s after
-  the confirmation; one that starts later is diluted by the earlier requests and is caught
+  the baseline (3-5 s after the confirmation with the 1 s `baseline_delay_ms`); one that starts later is diluted by the earlier requests and is caught
   once the cumulative p95 crosses the threshold, or by the gate at the deadline.
 - **Deadline.** `hide confirmation + W` on the controller clock (not the 10 s grid), so a
   W = 20 s probe decides at the first tick at or after confirmation + 20 s: about 20-24 s
   (the loop period is 2 s plus the tick's own work, the scrape waiting up to
-  `scrape_timeout_s`; a stale metrics snapshot pauses the evaluation). Short evidence
+  queue wait + `scrape_timeout_s`; a stale metrics snapshot pauses the evaluation). Short evidence
   extends the deadline by one poll period, up to confirmation + `W_max` (60 s). At the
   ceiling the rules are unchanged: idle -> commit, traffic -> latency skipped (Z / KV
   judged).
@@ -67,21 +87,36 @@ is now `safescale.evidence_source: redis` and the per-probe fallback of `direct`
   reports the gauge. Z is unchanged: the tail minimum of the Redis snapshots (as v1),
   `z_source = redis_snapshot_tail`; with the earlier deadline that tail is mostly
   snapshots overlapping the hide (recorded in `tail_pre_hide_fraction_mean` / `_max`).
-- **Failures.** A pod whose scrape fails (timeout, HTTP error, no IP) is left out of that
-  poll and recorded (`direct_excluded_pods`); its latest delta (cumulative) still counts
-  for two poll periods plus one scrape timeout. Beyond that - or while its baseline is
-  pending - it is missing (`direct_missing_pods`): the probe does not commit on the
-  other pods; the deadline is extended, and at the ceiling the probe falls back to the
-  Redis evidence (`pods_missing`), which covers every pod the gateway scrapes. A pod
-  whose counters went backwards (restart) is dropped for good (`counter_reset`); a pod
-  reporting its engine asleep is left out. Two scrapes in a row without any answering
-  pod (baseline attempts included), or no remaining pod left, switch the probe to the
-  Redis evidence path for good (`evidence_source_used = redis_fallback`,
+- **Failures.** A pod whose scrape fails (timeout, HTTP error, no IP, `pool_saturated`,
+  `model_mismatch`) is left out of that poll and recorded (`direct_excluded_pods`,
+  `direct_unanswered_pods`); at the intermediate ticks its latest delta (cumulative)
+  still counts for two poll periods plus one scrape timeout. Beyond that - or while its
+  baseline is pending - it is missing (`direct_missing_pods`). The deadline commit is
+  stricter: every live remaining pod must have been read successfully in the deciding
+  poll itself (a timeout is often the overload itself, and the seconds after its last
+  successful read are not covered), and that poll must be this tick's. Otherwise the
+  deadline is extended (`extend_reason` `pods_missing` / `pods_unanswered` /
+  `no_poll_this_tick`), and at the ceiling the probe falls back to the Redis evidence
+  (same reasons), which covers every pod the gateway scrapes. A pod reporting its
+  engine asleep while its baseline is pending (or at the baseline) is left out; a
+  restarted pod is kept (see "Late baselines"). Two scrapes in a row without any
+  answering pod (baseline attempts included), or no remaining pod left, switch the probe
+  to the Redis evidence path for good (`evidence_source_used = redis_fallback`,
   `direct_fallback.reason` `baseline_failed` / `all_pods_failed` / `no_live_pods` /
-  `no_baseline` / `pods_missing` / `no_direct_window` / `direct_window_stale`): the
-  687cbd9c logic below, clock assertions included. Redis evidence unreadable too ->
-  rollback `evidence_unavailable` (fail-closed). A p95 in the `+Inf` bucket is reported
-  as the largest finite bucket bound (records stay strict JSON).
+  `no_baseline` / `late_baseline` / `pods_missing` / `pods_unanswered` /
+  `no_poll_this_tick` / `no_direct_window` / `direct_window_stale`): the 687cbd9c logic
+  below, clock assertions included. Redis evidence unreadable too -> rollback
+  `evidence_unavailable` (fail-closed). A p95 in the `+Inf` bucket is reported as the
+  largest finite bucket bound (records stay strict JSON).
+- **Redis path at the ceiling (unchanged semantics).** A probe that fell back is judged
+  by the 687cbd9c rules. In particular: when the fallback happens with the deadline
+  already at the ceiling (`W_max`) and the Redis evidence of the remaining pods has
+  fewer than `min_commit_samples` judged requests, the latency gate is skipped
+  (`latency_gate = skipped`, `latency_skip_reason` `insufficient_samples` /
+  `p95_unavailable`) and the probe commits if the Z and KV gates pass; with no traffic at
+  all (idle) it commits (`idle`). Only "no doc of any remaining pod in [S, E]" rolls back
+  (`evidence_empty`). The same rule applies on the direct path when every remaining pod
+  was read in the deciding poll but the evidence is still short at the ceiling.
 - **Network.** The controller must reach every model pod IP on `metrics_port` (8000, the
   serving port; the reissue sidecar forwards `GET /metrics` to vLLM), without a proxy
   (`HTTP(S)_PROXY` is ignored for these reads; bodies above 8 MB are refused). Pod-to-pod traffic
@@ -131,6 +166,7 @@ safescale:
   evidence_poll_s: 2
   scrape_timeout_s: 1         # must be below evidence_poll_s
   metrics_port: 8000          # the model pods' serving port
+  baseline_delay_ms: 1000     # baseline scrape after the hide confirmation (>= 0, < window_ceiling_s)
 ```
 
 Apply with `deploy/scripts/merge_live_registry.py` (the release adds the section, the
@@ -171,7 +207,10 @@ evidence cut by `W_max`; `window_clamped` = W only), `window_base_ms`,
 `hide_anchor_source`, and `tail_pre_hide_fraction` (share of the latency evidence before
 `S`: must be 0). Direct path (2026-09-29 B+D): `evidence_source_used` (`direct` /
 `redis_fallback` / `redis`), `direct_fallback` (`reason`, `ts_ms`, `detail`),
-`hide_confirm_ms`, `direct_baseline_ts_ms`, `direct_baseline_pods`, `direct_pending_pods`,
+`hide_confirm_ms`, `baseline_delay_ms`, `direct_baseline_planned_ms` (confirmation +
+delay), `direct_baseline_ts_ms` (the actual first baseline scrape), `direct_baseline_lag_ms`
+(per pod), `direct_late_after_ms`, `direct_late_pods`, `direct_unanswered_pods`,
+`direct_baseline_pods`, `direct_pending_pods`,
 `direct_scrape_ts_ms` (every poll), `direct_pods` (per pod `n`, `ttft_p95_ms`,
 `tpot_p95_ms`, `ts_ms`), `direct_excluded_pods` (pod -> reason), `direct_missing_pods`,
 `direct_window_start_ms` / `_end_ms`, `kv_source` (`direct` / `redis_snapshot_tail`),
@@ -193,7 +232,9 @@ records after one hour, so for longer runs the controller log is the complete re
 
 Direct path (default): a W = 20 s probe decides about 20-24 s after the hide
 confirmation (+2 s per extension, at most 60 s); a violation present from the hide rolls
-back 2-4 s after the confirmation at 7b load. The controller logs the effective settings
+back 3-5 s after the confirmation at 7b load (baseline 1 s after it). A probe whose
+evidence has a gap (late baseline, restarted pod, a pod unanswered at the deadline) is
+committed only on the Redis evidence. The controller logs the effective settings
 once at start (`safescale_config`): a misspelt key is only warned about. The bullets below describe the `redis` path (and a probe that fell back).
 
 - Short probes (W = 20 s) now usually need extensions: the first evidence read covers

@@ -291,7 +291,8 @@ def create_controller_dependencies(
         direct_evidence = DirectEvidenceCollector(
             safescale,
             PodMetricsScraper(timeout_s=cfg.safescale.scrape_timeout_s),
-            cluster_view_targets(cluster_view_box.get, port=cfg.safescale.metrics_port),
+            # Only a FRESH view names the remaining pods whose evidence a commit needs.
+            cluster_view_targets(cluster_view_box.fresh, port=cfg.safescale.metrics_port),
             poll_ms=cfg.safescale.evidence_poll_ms,
             urls=cluster_view_urls(cluster_view_box.get, port=cfg.safescale.metrics_port),
         )
@@ -301,6 +302,7 @@ def create_controller_dependencies(
         "evidence_source": cfg.safescale.evidence_source,
         "evidence_poll_ms": cfg.safescale.evidence_poll_ms,
         "scrape_timeout_s": cfg.safescale.scrape_timeout_s,
+        "baseline_delay_ms": cfg.safescale.baseline_delay_ms,
         "metrics_port": cfg.safescale.metrics_port,
         "min_commit_samples": cfg.safescale.min_commit_samples,
         "window_ceiling_ms": cfg.safescale.window_ceiling_ms,
@@ -438,3 +440,7 @@ async def run_controller(deps: ControllerDependencies, cfg: MetricsTaskConfig) -
         shutdown = getattr(deps.queue, "shutdown", None)
         if callable(shutdown):
             await shutdown()
+        # The direct-evidence scrape pool (and its scheduled baselines).
+        direct = getattr(deps, "direct_evidence", None)
+        if direct is not None:
+            direct.close()

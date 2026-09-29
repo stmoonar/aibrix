@@ -503,6 +503,10 @@ data:
       # Direct path: timeout (s) of one pod scrape (concurrent; must be below
       # evidence_poll_s).
       scrape_timeout_s: 1
+      # Direct path: the baseline scrape runs this long (ms) after the SM confirmed the
+      # hide (the gateway applies it through its pod watch meanwhile); the deadline
+      # still counts from the confirmation.
+      baseline_delay_ms: 1000
       # Direct path: the model pods' serving port (the reissue sidecar forwards
       # GET /metrics to vLLM).
       metrics_port: 8000

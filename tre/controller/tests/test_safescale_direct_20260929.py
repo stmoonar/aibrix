@@ -114,15 +114,17 @@ class SimScraper:
     def __init__(self, harness: "Harness") -> None:
         self.h = harness
         self.calls: list[tuple[int, tuple[str, ...]]] = []
+        self.model_names: list[str | None] = []
 
-    async def scrape(self, targets):
+    async def scrape(self, targets, *, model_name=None):
         self.calls.append((self.h.clock(), tuple(sorted(targets))))
+        self.model_names.append(model_name)
         out = {}
         for pod in targets:
             if pod in self.h.failing:
                 out[pod] = self.h.failing[pod]
             else:
-                out[pod] = parse_vllm_metrics(self.h.sims[pod].text(), ts_ms=self.h.clock())
+                out[pod] = parse_vllm_metrics(self.h.sims[pod].text(), ts_ms=self.h.clock(), model_name=model_name)
         return out
 
 
@@ -134,7 +136,7 @@ class RaisingEvidence(FakeEvidence):
 def _cfg(**overrides) -> SafeScaleConfig:
     values = dict(min_window_ms=float(W), window_ceiling_ms=60_000.0, hq=0.25, tau_low=1.0,
                   evidence_source="direct", evidence_poll_ms=2_000.0, min_latency_samples=10,
-                  min_commit_samples=20)
+                  min_commit_samples=20, baseline_delay_ms=0.0)  # the delay: test_..._gaps_...
     values.update(overrides)
     return SafeScaleConfig(**values)
 
@@ -339,7 +341,9 @@ def test_a_pod_failing_only_at_the_baseline_gets_its_own_baseline_and_is_judged(
     h.tick(HIDE + 2_000, serve=5)
     state = h.machine.active_probe(MODEL).direct
     assert state.pending == () and state.baseline["m-2"].ts_ms == HIDE + 2_000
-    assert state.last.missing == {"m-2": "no_data:baseline_taken"}
+    # Its own (late) baseline: it can roll back, never commit on the direct path.
+    assert state.last.missing == {"m-2": "late_baseline"}
+    assert state.late["m-2"] == {"cause": "pending_baseline", "lag_ms": 2_000, "ts_ms": HIDE + 2_000}
     decisions = h.run_until(HIDE + W, serve=5, ttft_s=5.0, first=HIDE + 4_000)
     at, decision = decisions[-1]
     assert decision.status == "rollback" and decision.details["rollback_reason"]["code"] == "slo_violation_direct"
@@ -363,18 +367,43 @@ def test_a_pod_whose_scrapes_keep_failing_never_lets_a_subset_commit() -> None:
     assert decision.details["latency_source"] == "evidence"  # the gateway docs judged it
 
 
-def test_a_counter_reset_drops_the_pod_for_good() -> None:
+def test_a_counter_reset_keeps_the_pod_from_zero_and_the_commit_goes_to_redis() -> None:
+    # Review P1-a: a restarted pod is NOT dropped (that let the others commit on a
+    # subset): its baseline is reset to zero (the restart follows its baseline, so the
+    # hide) and it stays polled and judged; its pre-restart requests are lost, so it is
+    # late for good and the commit is judged on the Redis evidence.
     h = Harness()
     h.start(pre_hide=10, pre_hide_ttft=0.05)
     h.tick(HIDE + 2_000, serve=5)
     h.sims["m-2"].restart()
     h.tick(HIDE + 4_000, serve=5)
     probe = h.machine.active_probe(MODEL)
-    assert probe.direct.dropped["m-2"]["reason"] == "counter_reset"
-    assert probe.direct.live_pods() == ("m-0",)
+    assert probe.direct.dropped == {}
+    assert probe.direct.live_pods() == ("m-0", "m-2")
+    assert probe.direct.late["m-2"] == {"cause": "counter_reset", "lag_ms": 4_000, "ts_ms": HIDE + 4_000}
+    assert probe.direct.baseline["m-2"].ttft.count == 0.0
+    assert probe.direct.last.per_pod["m-2"]["n"] == 5  # everything since the restart
+    assert probe.direct.last.missing == {"m-2": "late_baseline"}
     at, decision = h.run_until(HIDE + W, serve=5, first=HIDE + 6_000)[-1]
-    assert decision.status == "commit" and decision.details["direct_excluded_pods"]["m-2"] == "counter_reset"
-    assert "m-2" not in h.scraper.calls[-1][1]  # no longer polled
+    assert "m-2" in h.scraper.calls[-1][1]  # still polled
+    assert at == HIDE + W and decision.status == "commit"
+    assert decision.details["evidence_source_used"] == "redis_fallback"
+    assert decision.details["direct_fallback"]["reason"] == "late_baseline"
+    assert decision.details["direct_fallback"]["detail"]["m-2"]["cause"] == "counter_reset"
+    assert decision.details["latency_source"] == "evidence"
+
+
+def test_a_vanished_family_is_a_restart_too() -> None:
+    h = Harness()
+    h.start(pre_hide=10, pre_hide_ttft=0.05)
+    h.tick(HIDE + 2_000, serve=5)
+    original = h.sims["m-2"].text
+    h.sims["m-2"].text = lambda **kw: "\n".join(
+        line for line in original(**kw).splitlines() if "request_prompt_tokens" not in line) + "\n"
+    h.tick(HIDE + 4_000, serve=5)
+    state = h.machine.active_probe(MODEL).direct
+    assert state.late["m-2"]["cause"] == "family_vanished" and state.baseline["m-2"].prompt is None
+    assert "m-2" in state.last.pods and state.last.missing == {"m-2": "late_baseline"}
 
 
 def test_every_pod_failing_twice_in_a_row_falls_back_to_the_redis_evidence() -> None:
@@ -423,7 +452,12 @@ def test_no_cluster_view_yet_is_retried_not_a_fallback() -> None:
     assert probe.direct.baseline is None and probe.direct.failed_polls == 0 and probe.direct.fallback is None
     known["ready"] = True
     h.tick(HIDE + 2_000)
-    assert h.machine.active_probe(MODEL).direct.baseline_ts_ms == HIDE + 2_000
+    state = h.machine.active_probe(MODEL).direct
+    assert state.baseline_ts_ms == HIDE + 2_000
+    # 2 s after the confirmation (delay 0 + timeout 1 s exceeded): the whole baseline is late.
+    assert {pod: value["cause"] for pod, value in state.late.items()} == {"m-0": "probe_baseline",
+                                                                        "m-2": "probe_baseline"}
+    assert state.baseline_lag_ms == {"m-0": 2_000, "m-2": 2_000}
 
 
 def test_redis_evidence_failing_too_fails_closed() -> None:

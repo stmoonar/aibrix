@@ -71,6 +71,9 @@ class SafeScaleConfig:
     evidence_poll_ms: float = 2_000.0
     scrape_timeout_s: float = 1.0
     metrics_port: int = POD_SERVING_PORT
+    # Registry safescale.baseline_delay_ms: baseline scrape this long after the hide
+    # confirmation (the deadline still counts from the confirmation).
+    baseline_delay_ms: float = 1_000.0
     percentile_mode: str = "bucket_upper"
     min_latency_samples: int = 0
     hq: float = 0.25
@@ -264,6 +267,7 @@ class ControllerConfig:
             evidence_poll_ms=float(safescale_registry.evidence_poll_s) * 1000.0,
             scrape_timeout_s=float(safescale_registry.scrape_timeout_s),
             metrics_port=int(safescale_registry.metrics_port),
+            baseline_delay_ms=float(safescale_registry.baseline_delay_ms),
             percentile_mode=percentile_mode,
             min_latency_samples=_get_nonneg_int(values, "TRE_MIN_LATENCY_SAMPLES", 10),
             hq=_get_positive_float(values, "SAFE_SCALE_HQ", 0.25),
