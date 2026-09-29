@@ -78,8 +78,9 @@ back in the reverse order.
 * A Pod whose startup gate is polling is reported as `startup_admission_pending`
   (informational; `GET /v2/supervisor` lists it under `informational`) and does not
   trigger a fleet repair for up to `drift_grace_s`; longer waits are drift again.
-* Make-before-break (defrag, startup make-up) can exceed `max_awake_replicas` by one
-  replica for the duration of one move.
+* A defrag move (make-before-break) can exceed `max_awake_replicas` by one replica for
+  the duration of the move. The startup make-up never exceeds it: at the cap there is
+  no make-up and the start is exempt (`makeup_failed: max_awake_replicas`).
 * Floor counters (`GET /v2/sleep` -> `floor.counts`) are read from the persistent sleep
   stats (Redis), so they match `stats` and survive an SM restart.
 * HTTP callers may only name the sleep paths `scale_down`, `urgent`,

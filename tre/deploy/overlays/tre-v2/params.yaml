@@ -338,8 +338,9 @@ data:
       # suspended resident stays asleep - a swap); if none can be woken the start
       # is exempt (recorded, never retried on the floor). Fleet repair: exempt,
       # recorded. Counters (persistent, Redis): GET /v2/sleep -> floor. false = off.
-      # Defrag / make-up wakes are make-before-break: max_awake_replicas may be
-      # exceeded by one for the duration of one move.
+      # A defrag move is make-before-break: max_awake_replicas may be exceeded by
+      # one for the duration of one move. The startup make-up never exceeds it (at
+      # the cap there is no make-up: the start is exempt).
       replica_floor:
         enforce: true
         # WARNING log of a floor event at most once per (outcome, path, model) per
