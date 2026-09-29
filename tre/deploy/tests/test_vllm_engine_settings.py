@@ -111,7 +111,8 @@ def test_shipped_registry_runs_the_030_fork_with_default_cumem():
     assert registry.validate() == []
     assert registry.reissue().enabled
     for model in registry.models():
-        assert model.vllm_image.startswith("vllm-openai-tre:0.30.0-ts-"), model.name
+        # Tokenizer-consistency fix (fork 8dc0f2a7, 2026-09-30); image ID a96754e185b1.
+        assert model.vllm_image == "vllm-openai-tre:0.30.0-ts-8dc0f2a7", model.name
         assert set(model.vllm_features) == {"sleep_reject_new", "abort_return_token_ids"}
         assert model.sleep_mode_backend is None  # cumem: no --sleep-mode-backend flag
         env = registry.vllm_env_for(model)

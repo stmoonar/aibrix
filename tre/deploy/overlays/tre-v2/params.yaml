@@ -56,7 +56,7 @@ data:
       # vLLM 0.30 fork image (plan 2026-09-27 D9): upstream ced6857af + pinned_weights
       # sleep backend + sleep rollback fix + --sleep-reject-new / --abort-return-token-ids.
       # A new image invalidates the calibrated theta (D9: recalibrate after migrating).
-      vllm_image: vllm-openai-tre:0.30.0-ts-2be2d647
+      vllm_image: vllm-openai-tre:0.30.0-ts-8dc0f2a7
       # Fork features of that image; their engine flags are rendered while reissue.enabled.
       vllm_features:
       - sleep_reject_new
@@ -123,7 +123,7 @@ data:
       # vLLM 0.30 fork image (plan 2026-09-27 D9): upstream ced6857af + pinned_weights
       # sleep backend + sleep rollback fix + --sleep-reject-new / --abort-return-token-ids.
       # A new image invalidates the calibrated theta (D9: recalibrate after migrating).
-      vllm_image: vllm-openai-tre:0.30.0-ts-2be2d647
+      vllm_image: vllm-openai-tre:0.30.0-ts-8dc0f2a7
       # Fork features of that image; their engine flags are rendered while reissue.enabled.
       vllm_features:
       - sleep_reject_new
@@ -194,7 +194,7 @@ data:
       # vLLM 0.30 fork image (plan 2026-09-27 D9): upstream ced6857af + pinned_weights
       # sleep backend + sleep rollback fix + --sleep-reject-new / --abort-return-token-ids.
       # A new image invalidates the calibrated theta (D9: recalibrate after migrating).
-      vllm_image: vllm-openai-tre:0.30.0-ts-2be2d647
+      vllm_image: vllm-openai-tre:0.30.0-ts-8dc0f2a7
       # Fork features of that image; their engine flags are rendered while reissue.enabled.
       vllm_features:
       - sleep_reject_new
