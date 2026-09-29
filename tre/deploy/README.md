@@ -237,7 +237,18 @@ Commit evidence (2026-09-29, `planning/safescale_evidence.py`, release note
   stamps and the controller clock are alerted (`safescale_clock_skew_alert`), not
   acted on.
 
-Z and the KV-cache fill still come from the tail of the snapshots, which may partly
+The items above are the `redis` evidence path. The default is
+`safescale.evidence_source: direct` (`planning/safescale_direct.py`): the controller
+scrapes the remaining pods' vLLM `/metrics` (pod IP from the SM fleet state, port
+`safescale.metrics_port`) at the hide confirmation (baseline) and every
+`safescale.evidence_poll_s`; the difference gives the latency evidence (same p95 / sample
+rules and thresholds) and the KV-cache fill; a judged violation rolls back at once
+(`slo_violation_direct`); the deadline is confirmation + W on the controller clock,
+extended one poll period while short. A probe whose remaining pods all fail falls back to
+the `redis` path (`evidence_source_used: redis_fallback`). Z still comes from the snapshot
+tail. Needs controller -> pod IP:`metrics_port` reachability.
+
+On the redis path Z and the KV-cache fill come from the tail of the snapshots, which may partly
 precede the hide: `tail_pre_hide_fraction_mean` / `_max` record how much. The
 latency evidence's own pre-hide share is `tail_pre_hide_fraction` (0 by construction,
 a regression assertion). Summary of a run: `python3 -m scripts.analysis.safescale_summary

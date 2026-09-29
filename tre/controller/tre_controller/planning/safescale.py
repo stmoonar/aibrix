@@ -8,6 +8,16 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Literal, Protocol
 
 from tre_controller.config import SafeScaleConfig
+from tre_controller.planning.safescale_direct import (
+    SOURCE_DIRECT,
+    SOURCE_REDIS,
+    SOURCE_REDIS_FALLBACK,
+    DirectPoll,
+    DirectState,
+    DirectWindow,
+    evaluate_poll,
+    take_baseline,
+)
 from tre_controller.planning.safescale_evidence import (
     EvidenceSource,
     EvidenceWindow,
@@ -152,7 +162,11 @@ class SafeScaleProbe:
     extensions: int = 0
     #: Where the window W counts from: the last gateway boundary before the confirmed
     #: hide (= start_ms unless the hide was confirmed late). None = start_ms.
+    #: Direct evidence: the confirmation itself (controller clock, not grid-aligned).
     window_base_ms: int | None = None
+    #: Direct evidence path (``safescale.evidence_source: direct``): baseline, drops,
+    #: scrape log, fallback (planning.safescale_direct). None = not started / redis.
+    direct: DirectState | None = None
 
 
 @dataclass(frozen=True)
@@ -184,11 +198,20 @@ class SafeScaleStateMachine:
         without it (direct constructions / offline replays) the gate reads the tail of
         the snapshot observations as before. ``thresholds`` resolves the per-model
         latency thresholds from the registry (``RegistryThresholds``); without it the
-        config values (or 500 / 75 ms) apply."""
+        config values (or 500 / 75 ms) apply.
+
+        ``config.evidence_source == "direct"`` (registry default; 2026-09-29 B+D): the
+        latency / KV evidence comes from the controller's own scrapes of the remaining
+        pods (``safescale_direct``; baseline at the hide confirmation, one poll per
+        tick, immediate rollback as soon as ``min_commit_samples`` are judged, deadline
+        = confirmation + W on the controller clock, extended by one poll period while
+        short). ``evidence`` is then the per-probe fallback when every remaining pod
+        fails."""
         self._config = config
         self._store = store
         self._evidence = evidence
         self._thresholds = thresholds
+        self._direct_mode = str(getattr(config, "evidence_source", SOURCE_REDIS) or SOURCE_REDIS) == SOURCE_DIRECT
         self._wall_clock_ms = wall_clock_ms or (lambda: int(time.time() * 1000))
         self._probes: dict[str, SafeScaleProbe] = {}
         # A13 rollback backoff: model -> time (ms, snapshot clock) of its last rollback.
@@ -375,20 +398,204 @@ class SafeScaleStateMachine:
         # the planning period) is unchanged. On the controller clock, like the deadline
         # it is compared with (snapshot boundaries), never on the gateway stamps.
         confirmed = anchor.controller_ts_ms if anchor.controller_ts_ms is not None else anchor.ts_ms
-        base = max(int(probe.start_ms), int(confirmed) // step * step)
-        deadline = max(int(probe.deadline_ms), base + int(probe.window_ms or 0))
+        direct: DirectState | None = None
+        if self._direct_mode:
+            # Direct evidence: W counts from the confirmation itself (controller clock,
+            # the clock the scrapes are stamped with), not from a gateway boundary.
+            base = int(confirmed)
+            deadline = base + int(probe.window_ms or 0)
+            direct = probe.direct or DirectState()
+        else:
+            base = max(int(probe.start_ms), int(confirmed) // step * step)
+            deadline = max(int(probe.deadline_ms), base + int(probe.window_ms or 0))
         probe = replace(
             probe,
             hide_anchor=anchor,
             window_base_ms=base,
             deadline_ms=deadline,
-            window_terms={**probe.window_terms, **_anchor_terms(anchor, step), **offsets, "window_base_ms": base},
+            direct=direct,
+            window_terms={
+                **probe.window_terms, **_anchor_terms(anchor, step), **offsets, "window_base_ms": base,
+                "hide_confirm_ms": int(confirmed), "deadline_ms": deadline,
+            },
         )
         self._probes[model] = probe
         self._persist_probe(probe)
         return True
 
-    def observe(self, model: str, observation: ProbeObservation, *, now_ms: int) -> SafeScaleDecision:
+    # ------------------------------------------------------------ direct evidence
+    def direct_mode(self) -> bool:
+        return self._direct_mode
+
+    def direct_baseline_due(self) -> tuple[SafeScaleProbe, ...]:
+        """Probing probes on the direct path whose hide is confirmed and whose baseline
+        is not taken yet (normally taken at the confirmation; after a restart or a
+        failed first attempt, at the next tick - later is still post-hide)."""
+        if not self._direct_mode:
+            return ()
+        return tuple(
+            probe for probe in self._probes.values()
+            if probe.status == "probing" and probe.hide_anchor is not None
+            and probe.abort_reason is None and probe.preempt_reason is None
+            and (probe.direct is None or (probe.direct.baseline is None and probe.direct.fallback is None))
+        )
+
+    def direct_poll_due(self) -> tuple[SafeScaleProbe, ...]:
+        """Probing probes on the direct path with a baseline to difference against."""
+        if not self._direct_mode:
+            return ()
+        return tuple(
+            probe for probe in self._probes.values()
+            if probe.status == "probing" and probe.direct is not None and probe.direct.baseline
+            and probe.direct.fallback is None and probe.direct.live_pods()
+        )
+
+    def set_direct_baseline(self, model: str, *, request_id: str, results, ts_ms: int) -> bool:
+        """Store the baseline scrape of ``request_id``'s remaining pods (only once). No
+        usable pod -> the probe falls back to the Redis evidence path (sticky)."""
+        probe = self._probes.get(model)
+        if (
+            not self._direct_mode or probe is None or probe.request_id != request_id
+            or probe.status != "probing" or probe.hide_anchor is None
+        ):
+            return False
+        if probe.direct is not None and (probe.direct.baseline is not None or probe.direct.fallback is not None):
+            return False
+        state = take_baseline(results, ts_ms=int(ts_ms))
+        audit = {
+            "direct_baseline_ts_ms": state.baseline_ts_ms,
+            "direct_baseline_pods": sorted(state.baseline or {}),
+            "direct_excluded_pods": {pod: value.get("reason") for pod, value in sorted(state.dropped.items())},
+        }
+        probe = replace(probe, direct=state, window_terms={**probe.window_terms, **audit})
+        if not state.baseline:
+            probe = self._fall_back(probe, reason="baseline_failed", ts_ms=int(ts_ms))
+        self._probes[model] = probe
+        self._persist_probe(probe)
+        return True
+
+    def _direct_live(self, probe: SafeScaleProbe) -> bool:
+        """The probe's evidence is the direct scrape (confirmed hide, no fallback)."""
+        return (
+            self._direct_mode and probe.hide_anchor is not None
+            and not (probe.direct is not None and probe.direct.fallback is not None)
+        )
+
+    def _fall_back(self, probe: SafeScaleProbe, *, reason: str, ts_ms: int, detail: Any = None) -> SafeScaleProbe:
+        """Switch ``probe`` to the Redis evidence path for good (687cbd9c logic, clock
+        assertions included); without a Redis evidence reader it fails closed there."""
+        state = probe.direct or DirectState()
+        fallback: dict[str, Any] = {"reason": reason, "ts_ms": int(ts_ms)}
+        if detail:
+            fallback["detail"] = detail
+        LOG.warning(
+            json.dumps(
+                {"event": "safescale_direct_fallback", "model": probe.model, "request_id": probe.request_id,
+                 **fallback, "dropped": state.dropped},
+                sort_keys=True, default=str,
+            )
+        )
+        updated = replace(
+            probe,
+            direct=replace(state, fallback=fallback, last=None),
+            window_terms={**probe.window_terms, "evidence_source_used": SOURCE_REDIS_FALLBACK,
+                          "direct_fallback": fallback},
+        )
+        self._probes[probe.model] = updated
+        return updated
+
+    def _direct_tick(
+        self, probe: SafeScaleProbe, poll: DirectPoll | None
+    ) -> tuple[SafeScaleProbe, int, SafeScaleDecision | None]:
+        """One tick of a direct-evidence probe: difference the poll against the baseline
+        and roll back at once on a judged SLO violation (``slo_violation_direct``).
+        Returns (probe, the tick's wall clock, an immediate decision or None)."""
+        wall_now = int(poll.ts_ms) if poll is not None else int(self._wall_ms() or 0)
+        state = probe.direct or DirectState()
+        if state.baseline is None:
+            if wall_now >= int(probe.deadline_ms):
+                # Nothing took a baseline by the deadline (no collector wired).
+                return self._fall_back(probe, reason="no_baseline", ts_ms=wall_now), wall_now, None
+            if probe.direct is None:
+                probe = replace(probe, direct=state)
+                self._probes[probe.model] = probe
+            return probe, wall_now, None
+        if poll is None or poll.request_id != probe.request_id:
+            return probe, wall_now, None
+        state, window = evaluate_poll(
+            state, poll,
+            percentile_mode=str(getattr(self._config, "percentile_mode", "bucket_upper")),
+            min_latency_samples=int(getattr(self._config, "min_latency_samples", 0) or 0),
+        )
+        probe = replace(probe, direct=state)
+        self._probes[probe.model] = probe
+        if window is None:
+            excluded = {pod: (result if isinstance(result, str) else "unusable")
+                        for pod, result in sorted(poll.results.items())}
+            return self._fall_back(probe, reason="all_pods_failed", ts_ms=wall_now, detail=excluded), wall_now, None
+        violation = self._direct_violation(probe, window)
+        if violation is not None:
+            return probe, wall_now, self._rollback_now(
+                probe,
+                reason="slo_violation_direct",
+                details={"slo": {"ttft_p95_ms": window.ttft_p95_ms, "tpot_p95_ms": window.tpot_p95_ms}},
+                rollback_reason=violation,
+                audit=self._direct_audit(probe),
+            )
+        return probe, wall_now, None
+
+    def _direct_violation(self, probe: SafeScaleProbe, window: DirectWindow) -> dict[str, Any] | None:
+        """Immediate rollback on the direct window once ``min_commit_samples`` requests
+        of pods with a p95 are in it (the commit gate's own sample rule)."""
+        min_samples = int(getattr(self._config, "min_commit_samples", 20))
+        if not window.p95_available or (min_samples > 0 and window.judged_count < min_samples):
+            return None
+        thresholds = self._thresholds_for(probe.model, window.mean_prompt_tokens)
+        metrics = _latency_violations(window.ttft_p95_ms, window.tpot_p95_ms, thresholds)
+        if not metrics:
+            return None
+        return {
+            "code": "slo_violation_direct",
+            "metrics": metrics,
+            "ttft_p95_ms": window.ttft_p95_ms,
+            "tpot_p95_ms": window.tpot_p95_ms,
+            "ttft_threshold_ms": thresholds["ttft_ms"],
+            "tpot_threshold_ms": thresholds["tpot_ms"],
+            "threshold_mode": thresholds["mode"],
+            "latency_samples": window.ttft_count,
+            "latency_samples_judged": window.judged_count,
+            "mean_prompt_tokens": window.mean_prompt_tokens,
+            "evidence_start_ms": window.start_ms,
+            "evidence_end_ms": window.end_ms,
+        }
+
+    def _direct_audit(self, probe: SafeScaleProbe) -> dict[str, Any]:
+        state = probe.direct or DirectState()
+        audit: dict[str, Any] = {
+            "evidence_source_used": SOURCE_DIRECT,
+            "latency_source": "direct",
+            "direct_baseline_ts_ms": state.baseline_ts_ms,
+            "direct_scrape_ts_ms": list(state.scrapes),
+            "direct_excluded_pods": {pod: value.get("reason") for pod, value in sorted(state.dropped.items())},
+        }
+        if state.last is not None:
+            audit.update(state.last.audit())
+            audit["direct_excluded_pods"] = dict(sorted(state.last.excluded.items()))
+            audit["kv_source"] = "direct" if state.last.kv_cache is not None else "redis_snapshot_tail"
+            audit["kv_direct"] = state.last.kv_cache
+            audit["kv_ts_ms"] = state.last.end_ms if state.last.kv_cache is not None else None
+        return audit
+
+    def _source_audit(self, probe: SafeScaleProbe) -> dict[str, Any]:
+        if not self._direct_mode:
+            return {"evidence_source_used": SOURCE_REDIS}
+        if probe.direct is not None and probe.direct.fallback is not None:
+            return {"evidence_source_used": SOURCE_REDIS_FALLBACK, "direct_fallback": dict(probe.direct.fallback)}
+        return {"evidence_source_used": SOURCE_DIRECT}
+
+    def observe(
+        self, model: str, observation: ProbeObservation, *, now_ms: int, direct_poll: DirectPoll | None = None
+    ) -> SafeScaleDecision:
         """One SafeScale tick (every ``probe_poll_seconds``) for ``model``'s probe.
 
         Snapshots are published once per gateway period and re-read every tick, so an
@@ -397,7 +604,13 @@ class SafeScaleStateMachine:
         guard run on every tick (the gateway counters are fresh each time). The
         immediate SLO rollback judges each snapshot once, and only a snapshot whose
         whole window follows the hide (``window_start_ms >= hide``); earlier ones are
-        recorded, not judged. At the deadline the commit gate runs (:meth:`_judge`)."""
+        recorded, not judged. At the deadline the commit gate runs (:meth:`_judge`).
+
+        Direct evidence (``direct_poll`` = this tick's scrape of the remaining pods):
+        the poll is differenced against the baseline and judged at once; the snapshot
+        immediate rollback is not used; the deadline is compared with the poll's wall
+        clock (the controller's own). A tick without usable pods falls back to the
+        Redis path for the rest of the probe."""
         probe = self._probes.get(model)
         if probe is None:
             return SafeScaleDecision(status="none", reason="probe_not_found")
@@ -427,7 +640,16 @@ class SafeScaleStateMachine:
                 details={"aborted": updated.abort_reason},
                 rollback_reason={"code": "hide_failed", "detail": updated.abort_reason},
             )
-        if self._evidence is not None and updated.hide_anchor is not None and updated.hide_anchor.newest_doc_error:
+        wall_now: int | None = None
+        if self._direct_live(updated):
+            updated, wall_now, immediate = self._direct_tick(updated, direct_poll)
+            if immediate is not None:
+                return immediate
+        direct_live = self._direct_live(updated)
+        if (
+            not direct_live and self._evidence is not None and updated.hide_anchor is not None
+            and updated.hide_anchor.newest_doc_error
+        ):
             # The evidence start cannot be anchored on the gateway stamps: fail closed
             # now instead of keeping the pods hidden until the deadline.
             return self._rollback_now(
@@ -439,7 +661,7 @@ class SafeScaleStateMachine:
                     "hide_ts_ms": int(updated.hide_anchor.ts_ms),
                 },
             )
-        violation = self._instant_violation(updated, observation) if is_new else None
+        violation = self._instant_violation(updated, observation) if is_new and not direct_live else None
         if violation is not None:
             return self._rollback_now(
                 updated,
@@ -460,35 +682,78 @@ class SafeScaleStateMachine:
                 rollback_reason={"code": "donor_health", **health},
             )
 
+        if direct_live:
+            # Deadline on the controller clock (hide confirmation + W), checked every tick.
+            clock = int(wall_now if wall_now is not None else (self._wall_ms() or 0))
+            if clock < updated.deadline_ms:
+                if updated is not probe:
+                    self._persist_probe(updated)
+                return SafeScaleDecision(status="probing", reason="probe_pending")
+            return self._judge(updated, health, now_ms=now_ms, wall_now_ms=clock)
         if now_ms < updated.deadline_ms:
             if updated is not probe:
                 self._persist_probe(updated)
             return SafeScaleDecision(status="probing", reason="probe_pending")
         return self._judge(updated, health, now_ms=now_ms)
 
-    def _judge(self, probe: SafeScaleProbe, health: dict[str, float] | None, *, now_ms: int) -> SafeScaleDecision:
+    def _judge(
+        self, probe: SafeScaleProbe, health: dict[str, float] | None, *, now_ms: int, wall_now_ms: int | None = None
+    ) -> SafeScaleDecision:
         """The formal commit gate (v1 _tail_summary_allows_commit) at the deadline.
 
-        Z (tail min) and the KV-cache fill come from the hq tail of the snapshot
-        observations, as before. The latency check reads the post-hide evidence window
-        (:meth:`_evidence_outcome`) when an evidence source is wired; without one (direct
-        constructions) it reads the tail snapshots, as before 2026-09-29."""
+        Z (tail min) comes from the hq tail of the snapshot observations, as before. The
+        latency check (and, on the direct path, the KV-cache fill) reads the direct
+        scrape window (:meth:`_direct_outcome`), else the post-hide Redis evidence window
+        (:meth:`_evidence_outcome`) when an evidence source is wired; without either
+        (direct constructions) it reads the tail snapshots, as before 2026-09-29."""
         model = probe.model
+        direct_live = self._direct_live(probe)
         evidence_mode = self._evidence is not None
         summary = _summarize_tail(
             probe,
             hq=self._config.hq,
             thresholds=lambda observation: self._thresholds_for(model, observation.mean_prompt_tokens),
-            judge_latency=not evidence_mode,
+            judge_latency=not (evidence_mode or direct_live),
             hide_ts_ms=self._post_hide_start(probe),
         )
         tail_audit = {
+            **self._source_audit(probe),
             "tail_pre_hide_fraction_mean": summary.pre_hide_fraction_mean,
             "tail_pre_hide_fraction_max": summary.pre_hide_fraction_max,
             "tail_observation_count": summary.tail_count,
+            "z_source": "redis_snapshot_tail",
+            "z_ts_ms": _latest_window_end(probe),
+            # Both KV sources are recorded; the gate uses kv_source.
+            "kv_redis_tail_max": summary.gpu_cache_max,
+            "kv_source": "redis_snapshot_tail",
         }
         idle = False
-        if evidence_mode:
+        if not direct_live and self._direct_mode and not evidence_mode and probe.direct is not None \
+                and probe.direct.fallback is not None:
+            # Direct evidence failed and there is no Redis evidence reader: fail closed.
+            return self._rollback_now(
+                probe, reason="evidence_unavailable", details={"direct_fallback": dict(probe.direct.fallback)},
+                rollback_reason={"code": "evidence_unavailable", "detail": "no_redis_evidence_reader"},
+                audit=tail_audit,
+            )
+        if direct_live:
+            outcome = self._direct_outcome(probe, summary, wall_now_ms=int(wall_now_ms or now_ms))
+            if outcome.kind == "extend":
+                return self._extend(probe, outcome.audit, direct_now_ms=int(wall_now_ms or now_ms))
+            if outcome.kind == "rollback":
+                return self._rollback_now(
+                    probe,
+                    reason=str(outcome.rollback_reason.get("code")),
+                    details={"evidence": outcome.audit},
+                    rollback_reason=outcome.rollback_reason,
+                    audit={**tail_audit, **outcome.audit},
+                )
+            kv = probe.direct.last.kv_cache if probe.direct is not None and probe.direct.last is not None else None
+            summary = replace(summary, latency_ok=outcome.latency_ok,
+                              gpu_cache_max=kv if kv is not None else summary.gpu_cache_max)
+            latency_audit = outcome.audit
+            idle = outcome.idle
+        elif evidence_mode:
             outcome = self._evidence_outcome(probe, summary, now_ms=now_ms)
             if outcome.kind == "extend":
                 return self._extend(probe, outcome.audit)
@@ -710,8 +975,88 @@ class SafeScaleStateMachine:
         audit.update(latency_gate="skipped", latency_skip_reason=short)
         return _EvidenceOutcome("judge", audit=audit, latency_ok=True)
 
-    def _extend(self, probe: SafeScaleProbe, audit: dict[str, Any]) -> SafeScaleDecision:
+    def _direct_outcome(
+        self, probe: SafeScaleProbe, summary: "ProbeTailSummary", *, wall_now_ms: int
+    ) -> "_EvidenceOutcome":
+        """The latency verdict of the direct window at the deadline (same sample rule,
+        thresholds and ceiling outcomes as :meth:`_evidence_outcome`), or "extend" (one
+        poll period, up to the W ceiling) while it is short, or "rollback"."""
+        cfg = self._config
+        cap = _deadline_cap(probe, cfg)
+        can_extend = probe.deadline_ms < cap
+        window_clamped = bool(probe.window_terms.get("window_clamped", probe.window_terms.get("clamped")))
+        audit: dict[str, Any] = {
+            **self._direct_audit(probe),
+            "extensions": probe.extensions,
+            "window_clamped": window_clamped,
+            "clamped": window_clamped,
+            "deadline_cap_ms": cap,
+        }
+        anchor = probe.hide_anchor
+        if anchor is not None:
+            audit.update(hide_ts_ms=int(anchor.ts_ms), hide_anchor_source=anchor.source)
+        window = probe.direct.last if probe.direct is not None else None
+        if window is None:
+            # Baseline taken but no poll differenced yet (restart / first tick).
+            if can_extend:
+                return _EvidenceOutcome("extend", audit={**audit, "extend_reason": "no_direct_window"})
+            return _EvidenceOutcome(
+                "rollback", audit=audit,
+                rollback_reason={"code": "evidence_empty", "check": "no_direct_window",
+                                 "evidence_start_ms": (probe.direct.baseline_ts_ms if probe.direct else None)},
+            )
+        confirm = probe.window_base_ms if probe.window_base_ms is not None else probe.start_ms
+        samples, judged = float(window.ttft_count), float(window.judged_count)
+        thresholds = self._thresholds_for(probe.model, window.mean_prompt_tokens)
+        min_samples = int(getattr(cfg, "min_commit_samples", 20))
+        audit.update(
+            evidence_start_ms=window.start_ms,
+            evidence_end_ms=window.end_ms,
+            evidence_pods=list(window.pods),
+            # Share of the evidence before the hide confirmation (the baseline follows it).
+            tail_pre_hide_fraction=_pre_hide_fraction(int(confirm), window.start_ms, window.end_ms),
+            latency_samples=samples,
+            latency_samples_judged=judged,
+            min_commit_samples=min_samples,
+            mean_prompt_tokens=window.mean_prompt_tokens,
+            evidence_ttft_p95_ms=window.ttft_p95_ms,
+            evidence_tpot_p95_ms=window.tpot_p95_ms,
+            threshold_mode=thresholds["mode"],
+            threshold_source=thresholds.get("source"),
+            ttft_threshold_ms=thresholds["ttft_ms"],
+            tpot_threshold_ms=thresholds["tpot_ms"],
+        )
+        if "fallback" in thresholds:
+            audit["threshold_fallback"] = thresholds["fallback"]
+        if min_samples <= 0 or (judged >= min_samples and window.p95_available):
+            violations = _latency_violations(window.ttft_p95_ms, window.tpot_p95_ms, thresholds)
+            audit.update(latency_gate="evaluated", latency_violations=violations)
+            return _EvidenceOutcome("judge", audit=audit, latency_ok=not violations)
+        short = "insufficient_samples" if samples < min_samples else "p95_unavailable"
+        if can_extend:
+            return _EvidenceOutcome("extend", audit={**audit, "extend_reason": short})
+        audit["clamped"] = True
+        if samples <= 0 and not summary.has_traffic:
+            audit.update(latency_gate="skipped", latency_skip_reason="idle")
+            return _EvidenceOutcome("judge", audit=audit, latency_ok=True, idle=True)
+        audit.update(latency_gate="skipped", latency_skip_reason=short)
+        return _EvidenceOutcome("judge", audit=audit, latency_ok=True)
+
+    def _extend(
+        self, probe: SafeScaleProbe, audit: dict[str, Any], *, direct_now_ms: int | None = None
+    ) -> SafeScaleDecision:
         cap = _deadline_cap(probe, self._config)
+        if direct_now_ms is not None:
+            # Direct path: one poll period past now (the next tick brings a new scrape).
+            deadline = min(max(int(probe.deadline_ms), int(direct_now_ms)) + _direct_poll_ms(self._config), cap)
+            extensions = probe.extensions + 1
+            audit = {**audit, "extensions": extensions, "deadline_ms": deadline}
+            updated = replace(
+                probe, deadline_ms=deadline, extensions=extensions, window_terms={**probe.window_terms, **audit}
+            )
+            self._probes[probe.model] = updated
+            self._persist_probe(updated)
+            return SafeScaleDecision(status="probing", reason="evidence_extended", details=audit)
         # One period past the newest evidence, so a jump of the snapshot clock (after a
         # stale hold) needs a NEW snapshot before the next evaluation - no extension
         # is burnt on the same data.
@@ -738,6 +1083,7 @@ class SafeScaleStateMachine:
         """A rollback decided before / instead of the formal gate, with its structured
         reason in terminal_details, window_terms and the decision details."""
         record = {
+            **self._source_audit(probe),
             **(audit or {}),
             "rollback_reason": rollback_reason,
             "probe_wall_clock_ms": self._probe_wall_clock_ms(probe),
@@ -946,6 +1292,19 @@ def _clock_tolerance_ms(config: SafeScaleConfig) -> float:
 
 def _evidence_step_ms(config: SafeScaleConfig) -> int:
     return max(1, int(getattr(config, "evidence_step_ms", 10_000.0) or 10_000))
+
+
+def _direct_poll_ms(config: SafeScaleConfig) -> int:
+    return max(1, int(getattr(config, "evidence_poll_ms", 2_000.0) or 2_000))
+
+
+def _latency_violations(ttft_p95_ms: float | None, tpot_p95_ms: float | None, thresholds: dict[str, Any]) -> list[str]:
+    violations = []
+    if ttft_p95_ms is not None and ttft_p95_ms > thresholds["ttft_ms"]:
+        violations.append("ttft")
+    if tpot_p95_ms is not None and tpot_p95_ms > thresholds["tpot_ms"]:
+        violations.append("tpot")
+    return violations
 
 
 def _deadline_cap(probe: SafeScaleProbe, config: SafeScaleConfig) -> int:
@@ -1280,6 +1639,8 @@ def _probe_record(
         record["extensions"] = probe.extensions
     if probe.window_base_ms is not None:
         record["window_base_ms"] = probe.window_base_ms
+    if probe.direct is not None:
+        record["direct_evidence"] = probe.direct.as_record()
     if probe.resolution is not None and status == "committing":
         record["resolution"] = probe.resolution
         record["resolution_reason"] = probe.resolution_reason
@@ -1351,6 +1712,7 @@ def _probe_from_record(row: dict[str, Any], store: ProbeStore) -> SafeScaleProbe
         start_wall_ms=_optional_int(row.get("start_wall_ms")),
         extensions=int(_optional_int(row.get("extensions")) or 0),
         window_base_ms=_optional_int(row.get("window_base_ms")),
+        direct=DirectState.from_record(row.get("direct_evidence")),
         **_committing_fields(row),
     )
 

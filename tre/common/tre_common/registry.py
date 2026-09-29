@@ -421,22 +421,62 @@ class SafeScaleRegistryConfig:
     min_commit_samples: int = 20
     #: The first gateway doc of the evidence window must be stamped within
     #: [hide, hide + this]; otherwise the probe rolls back (clock / missing-tick guard).
+    #: Redis evidence path only (``evidence_source: redis`` or the direct path's fallback).
     evidence_clock_tolerance_s: float = 20.0
+    #: Where the probe's latency / KV evidence comes from (2026-09-29 B+D):
+    #: ``direct`` - the controller scrapes the remaining pods' vLLM ``/metrics`` itself
+    #: (baseline at the SM's hide confirmation, then every ``evidence_poll_s``), falling
+    #: back to ``redis`` for a probe when every remaining pod fails; ``redis`` - the
+    #: gateway's histogram docs in Redis only (the 10 s doc grid).
+    evidence_source: str = "direct"
+    #: Direct path: scrape period (s) of a probe's remaining pods; also the deadline
+    #: extension step while the evidence is short.
+    evidence_poll_s: float = 2.0
+    #: Direct path: timeout (s) of one pod scrape (the scrapes of a tick run concurrently).
+    scrape_timeout_s: float = 1.0
+    #: Direct path: the port of a model pod serving ``GET /metrics`` (the pod's serving
+    #: port; with the reissue sidecar the sidecar forwards it to vLLM).
+    metrics_port: int = POD_SERVING_PORT
 
 
-SAFESCALE_KEYS = frozenset({"slo_mode", "window_ceiling_s", "min_commit_samples", "evidence_clock_tolerance_s"})
+SAFESCALE_KEYS = frozenset({
+    "slo_mode", "window_ceiling_s", "min_commit_samples", "evidence_clock_tolerance_s",
+    "evidence_source", "evidence_poll_s", "scrape_timeout_s", "metrics_port",
+})
+SAFESCALE_EVIDENCE_SOURCES = ("direct", "redis")
 
 
 def parse_safescale_config(raw: dict[str, Any] | None) -> SafeScaleRegistryConfig:
-    """Parse the optional ``safescale:`` registry section; raise ValueError on bad values."""
+    """Parse the optional ``safescale:`` registry section; raise ValueError on bad values.
+
+    Unknown keys are ignored with a warning (forward compatibility: a registry written
+    for a newer controller must not stop the service-manager / UI / an older controller
+    that parse this section too); invalid values of known keys refuse the start."""
     if raw is None:
         return SafeScaleRegistryConfig()
     if not isinstance(raw, dict):
         raise ValueError(f"safescale must be a mapping, got {raw!r}")
-    unknown = sorted(set(raw) - SAFESCALE_KEYS)
+    unknown = sorted(str(key) for key in set(raw) - SAFESCALE_KEYS)
     if unknown:
-        raise ValueError(f"safescale: unknown keys {unknown} (known: {sorted(SAFESCALE_KEYS)})")
+        LOG.warning("registry safescale: ignoring unknown keys %s (known: %s)", unknown, sorted(SAFESCALE_KEYS))
     defaults = SafeScaleRegistryConfig()
+    source = str(raw.get("evidence_source") or defaults.evidence_source).strip().lower()
+    if source not in SAFESCALE_EVIDENCE_SOURCES:
+        raise ValueError(f"safescale.evidence_source must be one of {SAFESCALE_EVIDENCE_SOURCES}, got {source!r}")
+    poll = _num(raw, "evidence_poll_s", defaults.evidence_poll_s)
+    scrape_timeout = _num(raw, "scrape_timeout_s", defaults.scrape_timeout_s)
+    for name, value in (("evidence_poll_s", poll), ("scrape_timeout_s", scrape_timeout)):
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(f"safescale.{name} must be a positive number, got {value!r}")
+    if scrape_timeout >= poll:
+        raise ValueError(
+            f"safescale.scrape_timeout_s ({scrape_timeout}) must be below evidence_poll_s ({poll}): "
+            "a tick's scrapes must finish before the next one"
+        )
+    port_raw = raw.get("metrics_port")
+    port = defaults.metrics_port if port_raw is None else port_raw
+    if isinstance(port, bool) or float(port) != int(float(port)) or not 1 <= int(float(port)) <= 65535:
+        raise ValueError(f"safescale.metrics_port must be a port number, got {port!r}")
     mode = str(raw.get("slo_mode") or defaults.slo_mode).strip().lower()
     if mode not in SAFESCALE_SLO_MODES:
         raise ValueError(f"safescale.slo_mode must be one of {SAFESCALE_SLO_MODES}, got {mode!r}")
@@ -454,6 +494,10 @@ def parse_safescale_config(raw: dict[str, Any] | None) -> SafeScaleRegistryConfi
         window_ceiling_s=float(ceiling),
         min_commit_samples=int(float(samples)),
         evidence_clock_tolerance_s=float(tolerance),
+        evidence_source=source,
+        evidence_poll_s=float(poll),
+        scrape_timeout_s=float(scrape_timeout),
+        metrics_port=int(float(port)),
     )
 
 

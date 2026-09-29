@@ -47,3 +47,25 @@ def test_summary_reports_rollback_rate_and_reason_distribution(tmp_path) -> None
     assert summary["extensions_total"] == 1
     assert summary["evidence_pre_hide_fraction_max"] == 0.0
     assert safescale_summary.main([str(path)]) == 0
+
+
+def test_summary_groups_the_resolved_probes_by_evidence_source() -> None:
+    def record(request_id, resolution, source, code=None):
+        terms = {"evidence_source_used": source} if source else {}
+        if code:
+            terms["rollback_reason"] = {"code": code}
+        return {"request_id": request_id, "status": "resolved", "resolution": resolution, "window_terms": terms}
+
+    summary = safescale_summary.summarize([
+        record("a", "commit", "direct"),
+        record("b", "rollback", "direct", "slo_violation_direct"),
+        record("c", "rollback", "redis_fallback", "evidence_unavailable"),
+        record("d", "commit", None),
+    ])
+    assert summary["by_evidence_source"] == {
+        "direct": {"decided": 2, "commits": 1, "rollbacks": 1, "rollback_rate": 0.5,
+                   "rollback_reasons": {"slo_violation_direct": 1}},
+        "redis_fallback": {"decided": 1, "commits": 0, "rollbacks": 1, "rollback_rate": 1.0,
+                           "rollback_reasons": {"evidence_unavailable": 1}},
+        "unknown": {"decided": 1, "commits": 1, "rollbacks": 0, "rollback_rate": 0.0, "rollback_reasons": {}},
+    }

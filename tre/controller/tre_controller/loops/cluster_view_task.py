@@ -83,7 +83,22 @@ def cluster_view_from_state(state: dict, topology: ClusterTopology) -> ClusterVi
                 hidden=bool(item.get("hidden", False)),
             )
         )
-    return ClusterView(topology=topology, bindings=tuple(bindings))
+    return ClusterView(topology=topology, bindings=tuple(bindings), pod_ips=_observed_pod_ips(state))
+
+
+def _observed_pod_ips(state: dict) -> dict[str, str]:
+    """pod name -> pod IP of the SM fleet state's observed bindings (best effort: a
+    malformed or missing ``fleet`` section yields no IPs, never an error)."""
+    fleet = state.get("fleet") if isinstance(state, dict) else None
+    observed = fleet.get("observed") if isinstance(fleet, dict) else None
+    ips: dict[str, str] = {}
+    for item in observed if isinstance(observed, list) else ():
+        if not isinstance(item, dict):
+            continue
+        pod, ip = item.get("pod_name"), item.get("pod_ip")
+        if pod and ip:
+            ips[str(pod)] = str(ip)
+    return ips
 
 
 async def refresh_cluster_view_once(

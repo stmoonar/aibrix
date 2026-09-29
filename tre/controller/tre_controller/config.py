@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Mapping
 
 from tre_common.rediskeys import SCRAPE_INTERVAL_MS
-from tre_common.registry import EXPECTED_SIGNAL_DIRECTIONS, SafeScaleRegistryConfig, load_registry
+from tre_common.registry import EXPECTED_SIGNAL_DIRECTIONS, POD_SERVING_PORT, SafeScaleRegistryConfig, load_registry
 from tre_controller.loops.metrics_task import REFRESH_MODES
 from tre_controller.signals.trs import DWELL_STATES
 
@@ -60,6 +60,19 @@ class SafeScaleConfig:
     min_commit_samples: int = 20
     evidence_clock_tolerance_ms: float = 20_000.0
     evidence_step_ms: float = 10_000.0
+    # Registry safescale.evidence_source / evidence_poll_s / scrape_timeout_s /
+    # metrics_port (2026-09-29 B+D). The registry default is "direct"; the dataclass
+    # default "redis" keeps direct constructions (tests, offline replays without pod
+    # access) on the gateway-doc path. Direct: the controller scrapes the remaining
+    # pods' vLLM /metrics (planning.safescale_direct); per-pod p95 rule = the metrics
+    # store's (percentile_mode, min_latency_samples = TRE_PERCENTILE_MODE /
+    # TRE_MIN_LATENCY_SAMPLES).
+    evidence_source: str = "redis"
+    evidence_poll_ms: float = 2_000.0
+    scrape_timeout_s: float = 1.0
+    metrics_port: int = POD_SERVING_PORT
+    percentile_mode: str = "bucket_upper"
+    min_latency_samples: int = 0
     hq: float = 0.25
     tau_low: float = 1.0
     probe_poll_seconds: float = 2.0
@@ -247,6 +260,12 @@ class ControllerConfig:
             min_commit_samples=int(safescale_registry.min_commit_samples),
             evidence_clock_tolerance_ms=float(safescale_registry.evidence_clock_tolerance_s) * 1000.0,
             evidence_step_ms=float(instant_sample_interval_ms),
+            evidence_source=safescale_registry.evidence_source,
+            evidence_poll_ms=float(safescale_registry.evidence_poll_s) * 1000.0,
+            scrape_timeout_s=float(safescale_registry.scrape_timeout_s),
+            metrics_port=int(safescale_registry.metrics_port),
+            percentile_mode=percentile_mode,
+            min_latency_samples=_get_nonneg_int(values, "TRE_MIN_LATENCY_SAMPLES", 10),
             hq=_get_positive_float(values, "SAFE_SCALE_HQ", 0.25),
             tau_low=_get_positive_float(values, "SAFE_SCALE_TAU_LOW", 1.0),
             probe_poll_seconds=_get_positive_float(values, "SAFE_SCALE_PROBE_POLL_SECONDS", 2.0),

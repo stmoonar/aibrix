@@ -487,6 +487,25 @@ data:
       # the probe rolls back (evidence_clock_skew: missed gateway ticks). Offsets of Redis
       # TIME / the controller clock beyond this are logged (safescale_clock_skew_alert).
       evidence_clock_tolerance_s: 20
+      # Where the probe's latency / KV-cache evidence comes from:
+      # direct - the controller scrapes the remaining pods' vLLM /metrics itself
+      #          (pod IP from the SM fleet state, port metrics_port): baseline at the
+      #          SM's hide confirmation, then every evidence_poll_s; an SLO violation
+      #          rolls back as soon as min_commit_samples requests are judged; the
+      #          deadline is confirmation + W (extended by evidence_poll_s while short).
+      #          A probe whose remaining pods all fail falls back to redis.
+      # redis  - the gateway's 10 s histogram docs only (evidence_clock_tolerance_s
+      #          applies to this path and to the fallback).
+      # The controller must reach pod IP:metrics_port (no NetworkPolicy today).
+      evidence_source: direct
+      # Direct path: scrape period (s) and deadline-extension step.
+      evidence_poll_s: 2
+      # Direct path: timeout (s) of one pod scrape (concurrent; must be below
+      # evidence_poll_s).
+      scrape_timeout_s: 1
+      # Direct path: the model pods' serving port (the reissue sidecar forwards
+      # GET /metrics to vLLM).
+      metrics_port: 8000
 kind: ConfigMap
 metadata:
   name: tre-v2-registry

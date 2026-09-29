@@ -699,9 +699,13 @@ def test_a_late_hide_moves_the_window_with_it() -> None:
     assert decision.details["evidence_start_ms"] == START + 50_000
 
 
-def test_registry_safescale_section_rejects_unknown_keys() -> None:
-    with pytest.raises(ValueError):
-        parse_safescale_config({"window_ceiling": 90})
+def test_registry_safescale_section_ignores_unknown_keys_with_a_warning(caplog) -> None:
+    # Forward compatibility (2026-09-29 B+D): a key added by a newer release must not
+    # stop the SM / UI / an older controller that parse this section too.
+    with caplog.at_level("WARNING"):
+        parsed = parse_safescale_config({"window_ceiling": 90, "min_commit_samples": 5})
+    assert parsed == SafeScaleRegistryConfig(min_commit_samples=5)
+    assert "window_ceiling" in caplog.text
 
 
 # ============================================================ 6. audit fields

@@ -18,6 +18,7 @@ from tre_controller.planning.planner import (
     UnhideAction,
 )
 from tre_controller.planning.safescale import ProbeObservation, SafeScaleCommand, SafeScaleProbe
+from tre_controller.planning.safescale_direct import DirectEvidenceCollector, DirectPoll
 from tre_controller.signals.sources import get_signal
 from tre_controller.signals.trs import SignalState, TRSComputer, TRSInput
 
@@ -82,6 +83,7 @@ def run_safescale_observation_tick(
     recovery_needs_fresh_view: bool = False,
     observe_mode: bool = False,
     maintenance: MaintenanceReader | None = None,
+    direct_polls: Mapping[str, DirectPoll] | None = None,
 ) -> SafeScaleObservationResult:
     """One SafeScale observation tick. ``fresh_cluster_view`` is the SM view only
     while fresh (``ClusterViewBox.fresh``): with it, probes whose pods are all
@@ -148,7 +150,10 @@ def run_safescale_observation_tick(
             hidden_pods=tuple(getattr(probe, "pods", ())),
             gateway=(gateway_counters or {}).get(probe.model),
         )
-        decision = safescale.observe(probe.model, observation, now_ms=snapshot.ts_ms)
+        poll = (direct_polls or {}).get(probe.model)
+        # Direct evidence (2026-09-29 B+D): this tick's scrape of the remaining pods.
+        extra = {"direct_poll": poll} if poll is not None else {}
+        decision = safescale.observe(probe.model, observation, now_ms=snapshot.ts_ms, **extra)
         events.append(f"safescale_{decision.reason}:{probe.model}")
         gate_failures = _gate_failures(safescale, probe.model, decision)
         if gate_failures:
@@ -167,7 +172,9 @@ def run_safescale_observation_tick(
                 f":requests={health.get('requests', 0):.0f}:rate={health.get('error_rate', 0.0):.4f}"
             )
         decision_details = getattr(decision, "details", None) or {}
-        if decision_details.get("latency_source") == "evidence" or getattr(decision, "reason", "") == "evidence_extended":
+        if decision_details.get("latency_source") in ("evidence", "direct") or getattr(
+            decision, "reason", ""
+        ) == "evidence_extended":
             # 2026-09-29 audit: the latency evidence window of this decision.
             events.append(format_evidence_event(probe.model, decision_details))
         if getattr(decision, "status", "") == "rollback" and decision_details.get("rollback_reason"):
@@ -229,7 +236,17 @@ async def safescale_task(
     gateway_source: GatewayCounterSource | None = None,
     is_observe: Callable[[], bool] | None = None,
     maintenance: MaintenanceReader | None = None,
+    direct: DirectEvidenceCollector | None = None,
 ) -> None:
+    """The SafeScale loop (one coroutine on the controller's event loop). With
+    ``direct`` (safescale.evidence_source: direct) each tick first scrapes the probes'
+    remaining pods - concurrently, in the collector's thread pool, bounded by
+    safescale.scrape_timeout_s - and hands the polls to the observation tick; the
+    loop then runs every min(SAFE_SCALE_PROBE_POLL_SECONDS, evidence_poll_s)."""
+    interval = float(getattr(getattr(cfg, "safescale"), "probe_poll_seconds"))
+    if direct is not None:
+        poll_s = float(getattr(getattr(cfg, "safescale"), "evidence_poll_ms", interval * 1000.0)) / 1000.0
+        interval = min(interval, poll_s) if poll_s > 0 else interval
     while True:
         snapshot = snapshot_box.get()
         if snapshot is not None:
@@ -238,6 +255,12 @@ async def safescale_task(
             if gateway_source is not None and not observe_mode and safescale.active_probes():
                 # A13: the donor's gateway counters, read off the event loop (HTTP).
                 counters = await asyncio.to_thread(gateway_source.read)
+            direct_polls = None
+            if direct is not None and not observe_mode and safescale.active_probes():
+                try:
+                    direct_polls = await direct.poll()
+                except Exception:  # noqa: BLE001 - no poll this tick (the deadline logic copes)
+                    LOG.exception("safescale direct evidence poll failed")
             result = run_safescale_observation_tick(
                 snapshot,
                 queue=queue,
@@ -251,9 +274,9 @@ async def safescale_task(
                 recovery_needs_fresh_view=cluster_view_box is not None,
                 observe_mode=observe_mode,
                 maintenance=maintenance,
+                direct_polls=direct_polls,
             )
             _log_resolutions(snapshot.ts_ms, result, gateway_available=counters is not None)
-        interval = getattr(getattr(cfg, "safescale"), "probe_poll_seconds")
         await sleep(interval)
 
 

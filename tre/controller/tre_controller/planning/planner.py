@@ -78,6 +78,10 @@ class ClusterView:
     #: Registry placement policy (``placement_policy_from_registry``), attached by the
     #: planner tick; None = plain buddy best-fit (tests without a registry).
     placement: PlacementPolicy | None = None
+    #: serve_id (pod name) -> pod IP, from the SM fleet state's observed bindings
+    #: (``/v2/state`` ``fleet.observed``); used by the SafeScale direct evidence
+    #: scrape. Empty when the SM reports no fleet state.
+    pod_ips: Mapping[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

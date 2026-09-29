@@ -10,7 +10,8 @@ of probe records. A probe record is what the controller keeps in
 Resolved probes are garbage-collected from that hash one hour after they resolve, so for
 runs longer than an hour the snapshot taken at the end misses the early ones; the
 controller log (``safescale_rollback_reason:`` / ``safescale_evidence:`` events) is the
-complete record.
+complete record. ``by_evidence_source`` splits the resolved probes by
+``evidence_source_used`` (``direct`` / ``redis_fallback`` / ``redis`` / ``unknown``).
 
     python3 -m scripts.analysis.safescale_summary <run_dir>/safescale.json
 """
@@ -60,6 +61,33 @@ def _rollback_code(record: Mapping[str, Any]) -> str:
     return reason.split(":", 1)[0].strip() or "unknown"
 
 
+def _evidence_source(record: Mapping[str, Any]) -> str:
+    """``direct`` / ``redis_fallback`` / ``redis`` (2026-09-29 B+D), ``unknown`` for
+    records of older controllers or probes resolved before any evidence was read."""
+    for section in ("window_terms", "terminal_details"):
+        source = (record.get(section) or {}).get("evidence_source_used")
+        if source:
+            return str(source)
+    return "unknown"
+
+
+def _by_source(decided: list[Mapping[str, Any]]) -> dict[str, Any]:
+    groups: dict[str, list[Mapping[str, Any]]] = {}
+    for record in decided:
+        groups.setdefault(_evidence_source(record), []).append(record)
+    out: dict[str, Any] = {}
+    for source, items in sorted(groups.items()):
+        rollbacks = [record for record in items if _resolution(record) == "rollback"]
+        out[source] = {
+            "decided": len(items),
+            "commits": len(items) - len(rollbacks),
+            "rollbacks": len(rollbacks),
+            "rollback_rate": len(rollbacks) / len(items),
+            "rollback_reasons": dict(Counter(_rollback_code(record) for record in rollbacks).most_common()),
+        }
+    return out
+
+
 def summarize(records: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
     records = list(records)
     decided = [record for record in records if _resolution(record) is not None]
@@ -98,6 +126,8 @@ def summarize(records: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
         "rollbacks": len(rollbacks),
         "rollback_rate": (len(rollbacks) / len(decided)) if decided else None,
         "rollback_reasons": dict(reasons.most_common()),
+        # Per evidence source (direct scrape / its Redis fallback / redis-only mode).
+        "by_evidence_source": _by_source(decided),
         "formal_gate_failures": dict(formal_gates.most_common()),
         "latency_gate": dict(gates.most_common()),
         "threshold_mode": dict(modes.most_common()),
