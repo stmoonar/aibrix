@@ -240,6 +240,9 @@ models:
   - --no-enable-prefix-caching
   - --max-num-seqs
   - '256'
+  - --enable-chunked-prefill
+  - --max-num-batched-tokens
+  - '2048'
   - --gpu-memory-utilization
   - '0.85'
   # --max-model-len; null = the model's maximum (131072), as in v1.

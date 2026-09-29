@@ -135,6 +135,10 @@ def test_shipped_manifests_carry_no_removed_030_flags():
         # on a <70 GiB / A100 GPU), written out; prefix caching is off on every model.
         assert command[command.index("--max-num-seqs") + 1] == "256"
         assert "--no-enable-prefix-caching" in command
+        # Symmetric engine args (2026-09-29): chunked prefill with a 2048-token step budget
+        # is explicit on every model, 14b included.
+        assert "--enable-chunked-prefill" in command
+        assert command[command.index("--max-num-batched-tokens") + 1] == "2048"
         env = _env(vllm)
         assert "VLLM_USE_MODELSCOPE" not in env
         assert env["HF_HUB_OFFLINE"] == "1"
