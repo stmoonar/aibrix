@@ -255,7 +255,8 @@ class MetricsEvidenceReader:
         """(newest histogram doc stamp of the model's pods or None, read failed)."""
         client = self._redis
         if client is None or getattr(self._store, "schema", "v2") != "v2":
-            return None, False
+            # No gateway stamps to anchor on (legacy v1 keys / no redis): unverifiable.
+            return None, True
         try:
             newest: int | None = None
             for raw_pod in client.smembers(pods_key(model)) or ():

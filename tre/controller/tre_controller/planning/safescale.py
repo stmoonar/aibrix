@@ -360,7 +360,12 @@ class SafeScaleStateMachine:
                     LOG.warning("safescale hide anchor of %s failed; using the controller clock", model, exc_info=True)
             if anchor is None:
                 now = int(self._wall_ms() or 0)
-                anchor = HideAnchor(ts_ms=now, source="controller_clock", controller_ts_ms=now)
+                # With an evidence source, a clock-only anchor cannot be verified
+                # against the gateway stamps: the probe rolls back (anchor_unverified).
+                anchor = HideAnchor(
+                    ts_ms=now, source="controller_clock", controller_ts_ms=now,
+                    newest_doc_error=self._evidence is not None,
+                )
         step = _evidence_step_ms(self._config)
         offsets = anchor_clock_offsets(anchor, period_ms=step, tolerance_ms=_clock_tolerance_ms(self._config))
         if offsets["clock_skew_alert"]:
@@ -421,6 +426,18 @@ class SafeScaleStateMachine:
                 reason=updated.abort_reason,
                 details={"aborted": updated.abort_reason},
                 rollback_reason={"code": "hide_failed", "detail": updated.abort_reason},
+            )
+        if self._evidence is not None and updated.hide_anchor is not None and updated.hide_anchor.newest_doc_error:
+            # The evidence start cannot be anchored on the gateway stamps: fail closed
+            # now instead of keeping the pods hidden until the deadline.
+            return self._rollback_now(
+                updated,
+                reason="evidence_clock_skew",
+                details={"anchor": updated.hide_anchor.as_record()},
+                rollback_reason={
+                    "code": "evidence_clock_skew", "check": "anchor_unverified",
+                    "hide_ts_ms": int(updated.hide_anchor.ts_ms),
+                },
             )
         violation = self._instant_violation(updated, observation) if is_new else None
         if violation is not None:
@@ -662,7 +679,26 @@ class SafeScaleStateMachine:
                 violations.append("tpot")
             audit.update(latency_gate="evaluated", latency_violations=violations)
             return _EvidenceOutcome("judge", audit=audit, latency_ok=not violations)
+        # Too few requests at all, or enough but spread over pods below the per-pod
+        # p95 minimum (no p95 to judge them by).
         short = "insufficient_samples" if samples < min_samples else "p95_unavailable"
+        if not evidence.first_doc_ts_ms and not can_extend:
+            # No doc of any remaining pod in [S, E] by W_max: the gateway wrote nothing
+            # for them (it writes cumulative docs for every pod every period, idle ones
+            # included) - no evidence is not evidence of health.
+            LOG.error(
+                json.dumps(
+                    {"event": "safescale_evidence_empty", "model": model, "request_id": probe.request_id,
+                     "evidence_start_ms": start, "evidence_end_ms": end, "pods": list(evidence.pods),
+                     **anchor.as_record()},
+                    sort_keys=True,
+                )
+            )
+            return _EvidenceOutcome(
+                "rollback", audit=audit,
+                rollback_reason={"code": "evidence_empty", "evidence_start_ms": start, "evidence_end_ms": end,
+                                 "check": "no_docs"},
+            )
         if can_extend:
             return _EvidenceOutcome("extend", audit={**audit, "extend_reason": short})
         # At the W ceiling with too little evidence.

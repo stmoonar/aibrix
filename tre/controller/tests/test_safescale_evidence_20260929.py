@@ -591,10 +591,51 @@ def test_an_unverifiable_anchor_fails_closed() -> None:
     broken = HideAnchor(ts_ms=HIDE, source="redis_time", newest_doc_ts_ms=None, newest_doc_error=True)
     machine = _machine(FakeEvidence([_window(50)], anchor=broken))
     _started(machine)
-    machine.observe(MODEL, _obs(110_000), now_ms=110_000)
-    decision = machine.observe(MODEL, _obs(120_000), now_ms=120_000)
+    # Rolled back at the next tick, not at the deadline.
+    decision = machine.observe(MODEL, _obs(110_000), now_ms=110_000)
     assert (decision.status, decision.reason) == ("rollback", "evidence_clock_skew")
     assert decision.details["rollback_reason"]["check"] == "anchor_unverified"
+
+
+def test_clock_only_anchors_fail_closed_with_an_evidence_source() -> None:
+    class Raising(FakeEvidence):
+        def hide_anchor(self, model):
+            raise ConnectionError("redis down")
+
+    machine = _machine(Raising([_window(50)]))
+    _started(machine)
+    assert machine.active_probe(MODEL).hide_anchor.newest_doc_error is True
+    assert machine.observe(MODEL, _obs(110_000), now_ms=110_000).reason == "evidence_clock_skew"
+    # Legacy v1 metric keys carry no gateway stamps to anchor on: unverifiable too.
+    store = MetricsStore(DocRedis(), _slo_registry(), instant_sample_interval_ms=10_000, schema="v1",
+                         histogram_lookback_ms=0)
+    assert MetricsEvidenceReader(store, redis_client=DocRedis()).hide_anchor(MODEL).newest_doc_error is True
+
+
+def test_no_doc_of_any_remaining_pod_by_the_ceiling_rolls_back_instead_of_committing() -> None:
+    empty = {**_window(0, ttft=None, tpot=None, first_doc=None), "pods": (), "judged_count": 0.0}
+    for traffic in (True, False):
+        machine = _machine(FakeEvidence([empty]))
+        _started(machine)
+        for ts in range(110_000, 170_000, 10_000):
+            decision = machine.observe(MODEL, _obs(ts, traffic=traffic, z=2.0 if traffic else None), now_ms=ts)
+        assert (decision.status, decision.reason) == ("rollback", "evidence_empty"), traffic
+        assert decision.details["rollback_reason"]["check"] == "no_docs"
+
+
+def test_a_restored_probe_keeps_its_late_window_base() -> None:
+    late = HideAnchor(ts_ms=START + 45_500, source="redis_time", newest_doc_ts_ms=START + 40_000,
+                      controller_ts_ms=START + 45_500)
+    store = FakeProbeStore()
+    machine = _machine(FakeEvidence([_window(50)], anchor=late), store=store)
+    probe = _started(machine)
+    restored = SafeScaleStateMachine(config=_cfg(), store=FakeProbeStore(unresolved=[store.records[probe.request_id]]),
+                                     evidence=FakeEvidence([_window(50)]))
+    assert restored.restore() == 1
+    again = restored.active_probe(MODEL)
+    assert (again.window_base_ms, again.deadline_ms, again.hide_anchor.controller_ts_ms) == (
+        START + 40_000, START + 60_000, START + 45_500,
+    )
 
 
 # ============================================================ review follow-ups
