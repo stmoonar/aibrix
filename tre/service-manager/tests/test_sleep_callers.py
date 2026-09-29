@@ -285,7 +285,7 @@ def test_v1_compat_scale_down_goes_through_primitive():
     response = client.post("/scale_service", params={"model_name": "m1", "scale_type": "down", "scale_value": 1})
 
     assert response.status_code == 200, response.text
-    assert [p[0] for p in h.paths] == ["scale_down"]  # APA drains exactly like TRE
+    assert [p[0] for p in h.paths] == ["apa"]  # APA: its own (no-drain) sleep path
     h.assert_hidden_before_every_sleep()
 
 

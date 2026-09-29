@@ -49,6 +49,9 @@ def test_overrides_and_soft_budget_resolution():
         {
             "sleep": {
                 "budgets_s": {"urgent": 12, "scale_down": None},
+                # Budget mechanics: every path drains (no-drain paths ignore budgets,
+                # service-manager/tests/test_sleep_no_drain.py).
+                "no_drain_paths": [],
                 "vllm_sleep_mode_param": "false",
                 "gateway_plugin_pods": {"namespace": "gw", "label_selector": None},
             },

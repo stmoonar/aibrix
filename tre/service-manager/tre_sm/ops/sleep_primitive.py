@@ -32,6 +32,15 @@ the same ordered protocol, and callers cannot skip a step:
       * state known, only continuable requests left past the soft budget ->
         /sleep ``mode=abort``, counted as a forced abort (the sidecar continues
         those requests).
+      **No-drain paths** (``service_manager.sleep.no_drain_paths``; default the
+      SafeScale commit, the fast-loop donors and APA - v1 / paper semantics,
+      2026-09-29) skip the wait: right after the ack one round reads the load
+      for the record, then nothing in flight -> ``mode=wait``, anything else
+      (continuable, non-continuable or unknown) -> ``mode=abort`` at once. No
+      rollback over in-flight requests; the outcome's ``aborted`` field counts
+      what was cut off (``non_continuable`` = truncated or re-run from scratch
+      by the sidecar, ``unclassified`` = engine-side requests the gateway did
+      not count, ``state_known`` = False when the counts could not be read).
       Every poll renews the reservation and checks shutdown / the writer fence;
       shutdown or a lost writer fence rolls back. A LOST reservation is never
       re-acquired: another sleep may own the binding by now, so the drain
@@ -458,6 +467,8 @@ class SleepBatch:
     operation_id: str | None = None
     #: Extra fields of every target's journal entry.
     journal_extra: dict = field(default_factory=dict)
+    #: No-drain path: abort everything in flight right after the ack.
+    no_drain: bool = False
     #: The drain found the reservation lost (resolve under the writer lock).
     reservation_lost: bool = False
     #: Serializes reservation renewals with per-target releases (commit threads).
@@ -590,6 +601,7 @@ class SleepPrimitive:
             started=clock.monotonic(),
             operation_id=self._operation_id(),
             journal_extra=dict(journal_extra or {}),
+            no_drain=self._policy.no_drain(path),
         )
         batch.token = self._reservations.acquire(
             [target.binding for target in targets],
@@ -642,7 +654,9 @@ class SleepPrimitive:
                 for pod in list(pending):
                     load = loads[id(pod)]
                     pod.last_load = load
-                    verdict = _decide(pod, load, now, soft_deadline, hard_deadline)
+                    verdict = _decide(
+                        pod, load, now, soft_deadline, hard_deadline, no_drain=batch.no_drain
+                    )
                     if verdict is None:
                         continue
                     pending.remove(pod)
@@ -651,7 +665,9 @@ class SleepPrimitive:
                         pod.decision = verdict
                         self._journal.update(
                             pod.pod,
-                            phase="drained" if verdict == "wait" else "drain_budget_spent",
+                            phase="drained"
+                            if verdict == "wait"
+                            else ("no_drain_abort" if batch.no_drain else "drain_budget_spent"),
                             in_flight=load.get("in_flight"),
                         )
                     else:
@@ -807,6 +823,7 @@ class SleepPrimitive:
                 "path": batch.path,
                 "soft_budget_s": batch.soft_s,
                 "hard_cap_s": batch.hard_s,
+                "drain_policy": "no_drain" if batch.no_drain else "drain",
                 "phase": "hiding",
                 "previous_state": pod.previous_state,
                 "owner": self._owner,
@@ -1042,6 +1059,7 @@ class SleepPrimitive:
         mode: str | None = ("wait" if drained else "abort") if supports_mode else None
         forced = not drained
         forced_count = int(load.get("in_flight") or 0) if forced else 0
+        aborted = _abort_breakdown(load) if forced else None
         self._journal.update(pod.pod, phase="sleeping", drained=drained, sleep_mode=mode)
         pod.sleep_called = True
         result = self._vllm.sleep(
@@ -1057,10 +1075,11 @@ class SleepPrimitive:
                 raise SleepFailed(f"vLLM sleep failed for {target.binding.serve_id}: {message}")
             # A straggler kept mode=wait from finishing within the call timeout.
             # Abort only when the drain state is KNOWN and nothing non-continuable
-            # is in flight; otherwise leave the pod hidden for the audit/recovery.
+            # is in flight (a no-drain path aborts regardless); otherwise leave the
+            # pod hidden for the audit/recovery.
             again = self._load(pod, batch.ack)
             pod.last_load = again
-            if not again["known"] or (pod.non_continuable or 0) > 0:
+            if not batch.no_drain and (not again["known"] or (pod.non_continuable or 0) > 0):
                 self._mark_unconfirmed(
                     batch,
                     pod,
@@ -1070,6 +1089,7 @@ class SleepPrimitive:
                 return
             forced = True
             forced_count = max(1, int(again.get("in_flight") or 0))
+            aborted = _abort_breakdown(again)
             mode = "abort"
             result = self._vllm.sleep(
                 target.pod_ip,
@@ -1081,7 +1101,12 @@ class SleepPrimitive:
             if not _success(result) and self._physical(target) is not True:
                 message = getattr(result, "message", "") or "operation failed"
                 raise SleepFailed(f"vLLM sleep failed for {target.binding.serve_id}: {message}")
-        pod.commit = {"mode": mode, "forced": forced, "forced_count": forced_count}
+        pod.commit = {
+            "mode": mode,
+            "forced": forced,
+            "forced_count": forced_count,
+            "aborted": aborted,
+        }
 
     def _confirm_all(self, batch: SleepBatch, pods: list[_PodSleep], clock: Clock) -> None:
         """Phase 2 of the commit: poll ``/is_sleeping`` of every sent pod (in
@@ -1156,6 +1181,7 @@ class SleepPrimitive:
         forced_count: int,
         reason: str | None = None,
         count: bool = True,
+        aborted: dict | None = None,
     ) -> None:
         self._runtime.write_binding_annotations(pod.target.binding, state=POD_STATE_SLEEPING)
         pod.done = True
@@ -1167,6 +1193,17 @@ class SleepPrimitive:
         if forced:
             self._journal.incr("forced_abort_total")
             self._journal.incr("forced_abort_requests_total", forced_count)
+        if count and batch.no_drain:
+            self._journal.incr("no_drain_sleeps_total")
+            if forced and aborted is not None:
+                truncated = int(aborted.get("non_continuable") or 0)
+                if truncated:
+                    self._journal.incr("no_drain_non_continuable_aborted_total", truncated)
+                unclassified = int(aborted.get("unclassified") or 0)
+                if unclassified:
+                    self._journal.incr("no_drain_unclassified_aborted_total", unclassified)
+                if not aborted.get("state_known", True):
+                    self._journal.incr("no_drain_unknown_state_abort_total")
         pod.outcome = self._outcome(
             batch,
             pod,
@@ -1175,6 +1212,7 @@ class SleepPrimitive:
             sleep_mode=mode,
             forced_abort=forced,
             forced_abort_requests=forced_count,
+            aborted=aborted if forced else None,
         )
         log = LOG.warning if forced else LOG.info
         log("sleep %s", json.dumps(pod.outcome, sort_keys=True))
@@ -1282,6 +1320,7 @@ class SleepPrimitive:
             "serve_id": pod.pod,
             "binding_id": pod.binding_id,
             "path": batch.path,
+            "drain_policy": "no_drain" if batch.no_drain else "drain",
             "status": status,
             "reason": reason,
             "previous_state": pod.previous_state,
@@ -1291,6 +1330,7 @@ class SleepPrimitive:
             "sleep_mode": None,
             "forced_abort": False,
             "forced_abort_requests": 0,
+            "aborted": None,
             "non_continuable_at_sleep": pod.last_load.get("non_continuable") or 0,
             "waited_s": round(pod.waited_s, 3),
         }
@@ -1331,11 +1371,21 @@ def _parallel(fn, items: list) -> dict[int, object]:
 
 
 def _decide(
-    pod: _PodSleep, load: dict, now: float, soft_deadline: float, hard_deadline: float
+    pod: _PodSleep,
+    load: dict,
+    now: float,
+    soft_deadline: float,
+    hard_deadline: float,
+    *,
+    no_drain: bool = False,
 ) -> str | None:
-    """None = keep waiting; "wait" / "abort" = go to /sleep; else a rollback counter."""
+    """None = keep waiting; "wait" / "abort" = go to /sleep; else a rollback counter.
+
+    ``no_drain``: never wait - anything in flight (or an unknown state) aborts."""
     if load["known"] and load["in_flight"] == 0:
         return "wait"
+    if no_drain:
+        return "abort"
     if now < soft_deadline:
         return None
     if not load["known"]:
@@ -1343,6 +1393,25 @@ def _decide(
     if (pod.non_continuable or 0) > 0:
         return None if now < hard_deadline else "non_continuable_rollback_total"
     return "abort"
+
+
+def _abort_breakdown(load: Mapping) -> dict:
+    """What a forced /sleep mode=abort cuts off, from one drain read: the
+    continuable requests (the reissue sidecar continues them), the gateway's
+    non-continuable ones (truncated, or re-run from scratch by the sidecar when
+    nothing was streamed yet) and engine-side requests the gateway did not count
+    (``unclassified``). ``state_known`` False: the counts are a lower bound."""
+    gateway = load.get("gateway_inflight")
+    non_continuable = max(0, int(load.get("non_continuable") or 0))
+    in_flight = max(0, int(load.get("in_flight") or 0))
+    gateway_total = max(0, int(gateway or 0))
+    return {
+        "state_known": bool(load.get("known")),
+        "in_flight": in_flight,
+        "continuable": max(0, gateway_total - non_continuable) if gateway is not None else None,
+        "non_continuable": non_continuable,
+        "unclassified": max(0, in_flight - gateway_total),
+    }
 
 
 def _previous_state(binding: Binding) -> str:

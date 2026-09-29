@@ -379,15 +379,28 @@ service_manager:
     # errors, metrics unavailable) or while non-continuable requests remain: it
     # keeps waiting up to the hard cap and then rolls the hide back. A caller may
     # pass its own budget (drain_budget_s), e.g. the SafeScale commit passes its
-    # probe window.
+    # probe window. Paths: safescale_commit, urgent (fast-loop *_immediate donors),
+    # scale_down (manual binding power / TRE without SafeScale), apa (APA via
+    # /scale_service), defrag, repair, startup, default.
+    # Budgets apply only to paths NOT listed in no_drain_paths.
     budgets_s:
       safescale_commit: null
       urgent: 30
       scale_down: null
+      apa: null
       defrag: 30
       repair: 30
       startup: 30
       default: 30
+    # Paths that do not drain (v1 / paper semantics, 2026-09-29): hide -> gateway
+    # ack -> /sleep mode=abort at once; budgets_s and the caller's drain_budget_s
+    # are ignored. The SafeScale probe window (pod already hidden) is the only drain
+    # of a TRE scale-down; fast-loop donors and APA release at once. Continuable
+    # requests are continued by the reissue sidecar; non-continuable ones (and
+    # requests whose state cannot be read) are cut off, never waited for and never
+    # rolled back - counted in the sleep outcome (aborted) and the SM stats
+    # (no_drain_*). [] = every path drains as above (pre-2026-09-29 behaviour).
+    no_drain_paths: [safescale_commit, urgent, apa]
   wake:
     # A wake fails closed unless gpu-truth shows every target GPU at or below this
     # fraction of its total memory: sleeping residents stay far below it, an awake

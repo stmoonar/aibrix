@@ -3100,6 +3100,7 @@ class ServiceManagerV2:
                 "shutdown_timeout_s": self._sm_config.shutdown_timeout_s(),
                 "vllm_sleep_mode_param": policy.vllm_sleep_mode_param,
                 "budgets_s": dict(policy.budgets_s),
+                "no_drain_paths": list(policy.no_drain_paths),
                 "worst_case_call_s": self._sm_config.worst_case_sleep_call_s(),
             },
             "reservations": {

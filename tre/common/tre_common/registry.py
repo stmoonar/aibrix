@@ -246,7 +246,8 @@ def gpu_memory_utilization(spec: Any) -> float:
 SLEEP_PATHS = (
     "safescale_commit",  # SafeScale commit of a hidden probe pod
     "urgent",  # controller *_immediate donor paths (fast loop)
-    "scale_down",  # ordinary scale-down (TRE slow loop and APA alike)
+    "scale_down",  # ordinary scale-down (manual / console, TRE without SafeScale)
+    "apa",  # APA scale-down through the v1-compatible /scale_service
     "defrag",  # buddy defragmentation migration
     "repair",  # fleet repair quarantine / resident pool rebuild
     "startup",  # startup admission / startup convergence
@@ -263,11 +264,25 @@ DEFAULT_SLEEP_BUDGETS_S: dict[str, float | None] = {
     # No deadline pressure: wait for in-flight requests up to the hard cap. The same
     # budget applies to TRE and APA scale-downs (both arms drain identically).
     "scale_down": None,
+    # APA through /scale_service (was "scale_down" before 2026-09-29): with "apa" in
+    # no_drain_paths (default) the budget is unused; without it, the old hard-cap drain.
+    "apa": None,
     "defrag": 30.0,
     "repair": 30.0,
     "startup": 30.0,
     "default": 30.0,
 }
+
+#: Sleep paths that do NOT drain (v1 / paper semantics, 2026-09-29): hide -> gateway ack
+#: -> /sleep ``mode=abort`` at once. Continuable requests are continued by the reissue
+#: sidecar; non-continuable ones (and requests whose state the SM cannot read) are cut
+#: off, never waited for and never a reason to roll back - the outcome counts them.
+#: The caller's drain_budget_s is ignored on these paths. The SafeScale probe window
+#: (the pod is already hidden while it runs) is the only drain of a TRE scale-down;
+#: the fast-loop donors (urgent) and APA scale-downs release at once. Maintenance
+#: paths (defrag, repair, startup, scale_down = manual binding power) keep draining.
+#: ``service_manager.sleep.no_drain_paths: []`` restores the draining behaviour.
+DEFAULT_NO_DRAIN_PATHS: tuple[str, ...] = ("safescale_commit", "urgent", "apa")
 
 #: Default ``gateway.route_timeout_s``: the gateway's per-request route timeout. The
 #: single source for the model HTTPRoute timeout (deploy/gen_model_manifests.py) and
@@ -456,14 +471,24 @@ class SleepPolicy:
     budgets_s: dict[str, float | None] = field(
         default_factory=lambda: dict(DEFAULT_SLEEP_BUDGETS_S)
     )
+    #: Paths that never drain (see DEFAULT_NO_DRAIN_PATHS); () = every path drains.
+    no_drain_paths: tuple[str, ...] = DEFAULT_NO_DRAIN_PATHS
+
+    def no_drain(self, path: str) -> bool:
+        """True when a sleep on ``path`` aborts everything in flight right after the
+        gateway ack (no drain, no rollback over in-flight requests)."""
+        return path in self.no_drain_paths
 
     def soft_budget_s(self, path: str, requested_s: float | None = None) -> float:
-        """Soft drain budget of one sleep: the caller's budget, else the path's."""
+        """Soft drain budget of one sleep: 0 on a no-drain path (the caller's
+        budget is ignored), else the caller's budget, else the path's."""
         if requested_s is not None:
             budget = float(requested_s)
             if not math.isfinite(budget) or budget < 0:
                 raise ValueError(f"drain budget must be a finite number >= 0, got {requested_s!r}")
-        else:
+        if self.no_drain(path):
+            return 0.0
+        if requested_s is None:
             key = path if path in self.budgets_s else "default"
             raw = self.budgets_s.get(key)
             budget = self.hard_cap_s if raw is None else float(raw)
@@ -966,6 +991,21 @@ def parse_service_manager_config(
                 f"(known: {', '.join(SLEEP_PATHS)})"
             )
         budgets[str(path)] = None if value is None else float(value)
+    no_drain_raw = sleep_raw.get("no_drain_paths", DEFAULT_NO_DRAIN_PATHS)
+    if no_drain_raw is None:
+        no_drain_raw = ()
+    if isinstance(no_drain_raw, str) or not isinstance(no_drain_raw, (list, tuple)):
+        raise ValueError(
+            "service_manager.sleep.no_drain_paths must be a list of sleep paths "
+            f"(known: {', '.join(SLEEP_PATHS)}), got {no_drain_raw!r}"
+        )
+    for path in no_drain_raw:
+        if str(path) not in SLEEP_PATHS:
+            raise ValueError(
+                f"service_manager.sleep.no_drain_paths: unknown sleep path {path!r} "
+                f"(known: {', '.join(SLEEP_PATHS)})"
+            )
+    no_drain_paths = tuple(dict.fromkeys(str(path) for path in no_drain_raw))
     sleep = SleepPolicy(
         ack_timeout_s=_num(sleep_raw, "ack_timeout_s", defaults.ack_timeout_s),
         instance_staleness_s=_num(sleep_raw, "instance_staleness_s", defaults.instance_staleness_s),
@@ -991,6 +1031,7 @@ def parse_service_manager_config(
         hard_cap_s=float(DEFAULT_ROUTE_TIMEOUT_S if hard_cap is None else hard_cap),
         reservation_ttl_s=_num(sleep_raw, "reservation_ttl_s", defaults.reservation_ttl_s),
         budgets_s=budgets,
+        no_drain_paths=no_drain_paths,
         plugin_namespace=str(plugin_pods_raw.get("namespace", defaults.plugin_namespace)),
         plugin_label_selector=plugin_pods_raw.get(
             "label_selector", defaults.plugin_label_selector
@@ -1101,6 +1142,9 @@ def _validate_service_manager(
             errors.append(f"service_manager.sleep.budgets_s: unknown sleep path {path}")
         elif value is not None and (not math.isfinite(value) or value < 0):
             errors.append(f"service_manager.sleep.budgets_s.{path} must be >= 0 or null")
+    for path in sleep.no_drain_paths:
+        if path not in SLEEP_PATHS:
+            errors.append(f"service_manager.sleep.no_drain_paths: unknown sleep path {path}")
     if gateway is not None:
         if not math.isfinite(gateway.route_timeout_s) or gateway.route_timeout_s <= 0:
             errors.append("gateway.route_timeout_s must be positive")

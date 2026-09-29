@@ -372,8 +372,10 @@ class SafeScaleStateMachine:
                 pods=probe.pods,
                 delta=-len(probe.pods),
                 reason=reason,
-                # Plan D1: the commit drains the (already hidden) probe pods for
-                # up to one probe window before /sleep; SM caps it at the route timeout.
+                # Plan D1: drain budget of the commit = one probe window. Used only
+                # when the SM registry drains safescale_commit (no_drain_paths without
+                # it); by default the commit does not drain - the probe window, with
+                # the pods already hidden, was the drain (v1 / paper, 2026-09-29).
                 drain_budget_s=(
                     float(probe.window_ms) / 1000.0 if probe.window_ms else None
                 ),

@@ -104,6 +104,12 @@ class ScaleAction:
     transfer_id: str | None = None
 
 
+#: SM sleep path of the fast-loop "*_immediate" donors (CRIT donor, idle proactive,
+#: low-fairness donor). With the default SM registry it does not drain: hide -> ack
+#: -> /sleep mode=abort, the reissue sidecar continues the cut-off requests (v1).
+IMMEDIATE_DONOR_SLEEP_PATH = "urgent"
+
+
 @dataclass(frozen=True)
 class HideAction:
     model: str
@@ -537,6 +543,7 @@ def build_plan(
                     receiver=recv.model_name,
                     pods=donor_slot_pods,
                     transfer_id=transfer_id,
+                    sleep_path=IMMEDIATE_DONOR_SLEEP_PATH,
                 )
                 _add_scale_action(
                     actions,
@@ -618,6 +625,7 @@ def build_plan(
                     reason="idle_proactive_immediate",
                     source_loop="rescue",
                     donor=idle.model_name,
+                    sleep_path=IMMEDIATE_DONOR_SLEEP_PATH,
                 )
 
         for high in high_models:
@@ -808,6 +816,7 @@ def build_plan(
                 donor=donor.model_name,
                 receiver=recv.model_name,
                 pods=donor_slot_pods,
+                sleep_path=IMMEDIATE_DONOR_SLEEP_PATH,
             )
             _add_scale_action(
                 actions,
@@ -1473,7 +1482,12 @@ def _add_scale_action(
     donor: str | None = None,
     pods: tuple[str, ...] = (),
     transfer_id: str | None = None,
+    sleep_path: str | None = None,
+    drain_budget_s: float | None = None,
 ) -> None:
+    """``sleep_path`` / ``drain_budget_s`` go to the SM sleep of a negative delta
+    (None = the dispatcher / SM default). The SM registry decides whether the path
+    drains at all (service_manager.sleep.no_drain_paths)."""
     if delta == 0:
         return
     deltas[model] = deltas.get(model, 0) + delta
@@ -1488,6 +1502,8 @@ def _add_scale_action(
             donor=donor,
             pods=tuple(pods),
             transfer_id=transfer_id,
+            sleep_path=sleep_path if delta < 0 else None,
+            drain_budget_s=drain_budget_s if delta < 0 else None,
         )
     )
 
