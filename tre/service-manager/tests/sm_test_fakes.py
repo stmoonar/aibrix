@@ -607,6 +607,9 @@ def policy(**overrides) -> SleepPolicy:
         vllm_sleep_mode_param="true",
         hard_cap_s=150.0,
         plugin_label_selector=None,
+        # The mechanism tests exercise the draining protocol on every path; the
+        # no-drain paths (production default) are covered by test_sleep_no_drain.
+        no_drain_paths=(),
     )
     budgets = overrides.pop("budgets_s", None)
     base.update(overrides)

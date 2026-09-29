@@ -40,9 +40,7 @@ def _cfg() -> SafeScaleConfig:
     return SafeScaleConfig(
         ttft_p95_slo_ms=1000.0,
         tpot_p95_slo_ms=100.0,
-        default_window_ms=60_000.0,
-        min_window_ms=15_000.0,
-        max_window_ms=300_000.0,
+        min_window_ms=60_000.0,
         hq=0.5,
         tau_low=1.0,
     )
@@ -97,15 +95,20 @@ def test_safescale_rolls_back_immediately_on_slo_violation() -> None:
             z_m=1.5,
             q_ctl=0.0,
             has_traffic=True,
+            # 2026-09-29: only a snapshot whose whole window follows the hide is judged.
+            window_start_ms=1_000,
+            window_end_ms=31_000,
         ),
         now_ms=2_000,
     )
 
-    assert decision == SafeScaleDecision(
-        status="rollback",
-        reason="slo_violation",
-        commands=(SafeScaleCommand(kind="unhide", model="donor", pods=("pod-a",), reason="slo_violation"),),
+    assert (decision.status, decision.reason, decision.commands) == (
+        "rollback",
+        "slo_violation",
+        (SafeScaleCommand(kind="unhide", model="donor", pods=("pod-a",), reason="slo_violation"),),
     )
+    assert decision.details["rollback_reason"]["code"] == "slo_violation"
+    assert decision.details["rollback_reason"]["metrics"] == ["ttft"]
     assert machine.active_probe("donor") is not None
     assert store.deleted == []
     assert machine.resolve(
@@ -249,88 +252,59 @@ def test_safescale_restored_tail_blocks_commit_on_prior_latency_violation() -> N
     assert decision.reason == "formal_commit_gate_failed"
 
 
-# --- A6: adaptive probe window (port of v1 _calc_probe_window_details) -------------------
+# --- A6: probe window W = max(e2e_multiplier * p95_e2e, min_window_ms) ---------------------
 
-_V1_CFG = SafeScaleConfig()  # W_lo 60 s, W_hi 120 s, default 60 s, cw2 fallback 60 s, cdec 2
+# floor 20 s, e2e multiplier 2, no ceiling (the controller sets registry
+# safescale.window_ceiling_s, 60 s by default; see test_safescale_evidence_20260929).
+_V1_CFG = SafeScaleConfig(window_ceiling_ms=None)
 
 
 def _inputs(**overrides) -> ProbeWindowInputs:
-    # 4 serving pods, Y_m = 30000 weighted tokens over a 30 s window -> arrival 1000/s;
-    # Z = 2 -> capacity 2000/s = 500/s per pod; hiding 1 leaves 1500/s -> gap 500/s.
-    values = dict(
-        p95_e2e_ms=5_000.0,
-        p95_tpot_ms=50.0,
-        q=10.0,
-        y_total=30_000.0,
-        y_per_pod=7_500.0,
-        z_m=2.0,
-        routable_pods=4,
-        interval_s=30.0,
-    )
+    values = dict(p95_e2e_ms=5_000.0, p95_tpot_ms=50.0, q=10.0, routable_pods=4)
     values.update(overrides)
     return ProbeWindowInputs(**values)
 
 
-def test_window_without_metrics_is_the_default_window() -> None:
+def test_window_without_metrics_is_the_floor() -> None:
     terms = calc_probe_window_details(ProbeWindowInputs(), hidden_count=1, config=_V1_CFG)
-    assert terms["W"] == 60_000.0
-    assert (terms["W1"], terms["W2"], terms["cW2"], terms["decode_term_ms"]) == (60_000.0, 60_000.0, None, None)
-    assert (terms["dominant"], terms["clamped"]) == ("default", None)
-
-
-def test_window_terms_follow_v1_formula_and_clamp_up_to_w_lo() -> None:
-    terms = calc_probe_window_details(_inputs(), hidden_count=1, config=_V1_CFG)
-    assert terms["rate_gap_per_second"] == 500.0
-    assert terms["cW2"] == 10.0 / 500.0 * 1000.0  # Q / rate_gap in ms
-    assert terms["decode_term_ms"] == 100.0  # cdec * p95_tpot
-    assert terms["W1"] == 10_000.0  # 2 * p95_e2e
-    assert terms["W_raw"] == 10_000.0
-    assert (terms["W"], terms["dominant"], terms["clamped"]) == (60_000.0, "e2e", "lo")
-
-
-def test_window_e2e_term_inside_the_band_and_clamped_at_w_hi() -> None:
-    inside = calc_probe_window_details(_inputs(p95_e2e_ms=40_000.0), hidden_count=1, config=_V1_CFG)
-    assert (inside["W"], inside["dominant"], inside["clamped"]) == (80_000.0, "e2e", None)
-    above = calc_probe_window_details(_inputs(p95_e2e_ms=90_000.0), hidden_count=1, config=_V1_CFG)
-    assert (above["W"], above["W_raw"], above["clamped"]) == (120_000.0, 180_000.0, "hi")
-
-
-def test_window_queue_term_dominates_when_the_post_hide_gap_is_small() -> None:
-    import pytest
-
-    # Z = 1.3336: capacity 1333.6/s, 333.4/s per pod; 3 left -> 1000.2/s -> gap 0.2/s.
-    terms = calc_probe_window_details(_inputs(q=20.0, z_m=1.3336), hidden_count=1, config=_V1_CFG)
-    assert terms["rate_gap_per_second"] == pytest.approx(0.2)
-    assert terms["cW2"] == pytest.approx(100_000.0)  # 20 / 0.2 per s
-    assert terms["W"] == pytest.approx(100_000.0)
-    assert (terms["dominant"], terms["clamped"], terms["cW2_fallback"]) == ("queue", None, False)
-
-
-def test_window_uses_the_60s_fallback_when_there_is_no_post_hide_spare_rate() -> None:
-    # Z <= 1: v1 treats capacity == arrival, so hiding a pod leaves a negative gap -> 0.
-    no_spare = calc_probe_window_details(_inputs(z_m=0.9), hidden_count=1, config=_V1_CFG)
-    assert no_spare["rate_gap_per_second"] == 0.0
-    assert (no_spare["cW2"], no_spare["cW2_fallback"], no_spare["W"], no_spare["dominant"]) == (
-        60_000.0,
-        True,
-        60_000.0,
-        "queue",
+    assert terms["W"] == 20_000.0
+    assert (terms["W1"], terms["W_floor"], terms["e2e_multiplier"]) == (None, 20_000.0, 2.0)
+    assert terms["dominant"] == "floor"
+    # Non-positive p95_e2e counts as missing; avg_ttft is no longer a fallback.
+    zero = calc_probe_window_details(
+        _inputs(p95_e2e_ms=0.0, avg_ttft_ms=45_000.0), hidden_count=1, config=_V1_CFG
     )
-    # Unknown gap (no token counts) with a queue -> fallback as well; the fallback is capped
-    # at W_hi like v1 (min(max_window, cw2_fallback)).
-    unknown = calc_probe_window_details(_inputs(y_total=None, y_per_pod=None), hidden_count=1, config=_V1_CFG)
-    assert (unknown["rate_gap_per_second"], unknown["cW2"], unknown["cW2_fallback"]) == (None, 60_000.0, True)
-    wide = SafeScaleConfig(cw2_fallback_ms=300_000.0)
-    capped = calc_probe_window_details(_inputs(z_m=0.9), hidden_count=1, config=wide)
-    assert (capped["cW2"], capped["W"], capped["clamped"]) == (120_000.0, 120_000.0, None)
-    # A lone pod cannot be hidden with anything left: no gap either.
-    lone = calc_probe_window_details(_inputs(routable_pods=1), hidden_count=1, config=_V1_CFG)
-    assert lone["rate_gap_per_second"] is None and lone["cW2_fallback"] is True
+    assert (zero["W"], zero["W1"], zero["dominant"]) == (20_000.0, None, "floor")
 
 
-def test_window_y_per_pod_backs_up_a_missing_y_total_like_v1() -> None:
-    terms = calc_probe_window_details(_inputs(y_total=None), hidden_count=1, config=_V1_CFG)
-    assert terms["rate_gap_per_second"] == 500.0
+def test_window_floor_applies_when_e2e_is_small() -> None:
+    terms = calc_probe_window_details(_inputs(p95_e2e_ms=5_000.0), hidden_count=1, config=_V1_CFG)
+    assert terms["W1"] == 10_000.0
+    assert (terms["W"], terms["dominant"]) == (20_000.0, "floor")
+    assert terms["inputs"] == {"p95_e2e_ms": 5_000.0, "hidden_count": 1}
+
+
+def test_window_e2e_dominates_above_the_floor() -> None:
+    terms = calc_probe_window_details(_inputs(p95_e2e_ms=40_000.0), hidden_count=2, config=_V1_CFG)
+    assert (terms["W"], terms["W1"], terms["dominant"]) == (80_000.0, 80_000.0, "e2e")
+    assert terms["inputs"]["hidden_count"] == 2
+    # Exactly at the floor the floor is reported as the dominant term.
+    tie = calc_probe_window_details(_inputs(p95_e2e_ms=10_000.0), hidden_count=1, config=_V1_CFG)
+    assert (tie["W"], tie["dominant"]) == (20_000.0, "floor")
+
+
+def test_window_multiplier_and_floor_are_configurable() -> None:
+    cfg = SafeScaleConfig(min_window_ms=5_000.0, e2e_multiplier=3.0)
+    terms = calc_probe_window_details(_inputs(p95_e2e_ms=4_000.0), hidden_count=1, config=cfg)
+    assert (terms["W"], terms["W1"], terms["e2e_multiplier"], terms["dominant"]) == (12_000.0, 12_000.0, 3.0, "e2e")
+    assert calc_probe_window_details(_inputs(p95_e2e_ms=1_000.0), hidden_count=1, config=cfg)["W"] == 5_000.0
+
+
+def test_window_has_no_upper_cap() -> None:
+    # Without a configured ceiling (window_ceiling_ms None: direct constructions, or an
+    # unreadable registry) W is not capped; from_env sets 2 x gateway.route_timeout_s.
+    terms = calc_probe_window_details(_inputs(p95_e2e_ms=150_000.0), hidden_count=1, config=_V1_CFG)
+    assert (terms["W"], terms["dominant"]) == (300_000.0, "e2e")
 
 
 def test_start_probe_uses_the_adaptive_window_and_persists_its_terms() -> None:
@@ -348,9 +322,9 @@ def test_start_probe_uses_the_adaptive_window_and_persists_its_terms() -> None:
     record = store.records[probe.request_id]
     assert record["window_ms"] == 90_000.0
     assert record["window_terms"]["W1"] == 90_000.0
-    assert record["window_terms"]["inputs"]["routable_pods"] == 4
+    assert record["window_terms"]["inputs"]["hidden_count"] == 1
     assert format_window_event("donor", decision.details).startswith(
-        "safescale_probe_window:donor:W=90000:dominant=e2e:clamped=none:e2e=90000:queue=20:decode=100:gap=500"
+        "safescale_probe_window:donor:W=90000:dominant=e2e:e2e=90000:floor=20000"
     )
 
     restored = SafeScaleStateMachine(
@@ -484,22 +458,3 @@ def test_preemption_request_is_idempotent_and_survives_restore() -> None:
     restored.restore()
     decision = restored.observe("donor", _healthy_observation(ts_ms=1_000), now_ms=1_000)
     assert (decision.status, decision.reason) == ("rollback", "receiver_need_upscale")
-
-
-
-def test_window_falls_back_to_mean_ttft_and_tpot_when_p95_is_missing_like_v1() -> None:
-    # Review P2-b: v1 start_hidden_probe uses p95_e2e or avg_ttft, p95_tpot or avg_tpot.
-    terms = calc_probe_window_details(
-        _inputs(p95_e2e_ms=None, avg_ttft_ms=45_000.0, p95_tpot_ms=None, avg_tpot_ms=80.0),
-        hidden_count=1,
-        config=_V1_CFG,
-    )
-    assert terms["W1"] == 90_000.0 and terms["W"] == 90_000.0
-    assert terms["decode_term_ms"] == 160.0
-    assert (terms["inputs"]["latency_source"], terms["inputs"]["decode_source"]) == ("avg_ttft", "avg_tpot")
-    # p95 present -> the mean is ignored.
-    primary = calc_probe_window_details(_inputs(avg_ttft_ms=45_000.0), hidden_count=1, config=_V1_CFG)
-    assert primary["W1"] == 10_000.0 and primary["inputs"]["latency_source"] == "p95_e2e"
-    # Neither -> default window, as before.
-    none = calc_probe_window_details(_inputs(p95_e2e_ms=None), hidden_count=1, config=_V1_CFG)
-    assert none["W1"] == 60_000.0 and none["inputs"]["latency_source"] is None

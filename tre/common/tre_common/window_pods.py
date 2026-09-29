@@ -54,6 +54,33 @@ def merged_hist_p95_ms(pods: list[PodWindowMetrics], rule: P95Rule) -> Optional[
     return None if p95_s is None else p95_s * 1000.0
 
 
+def pooled_p95_ms(hists, rule: P95Rule) -> Optional[float]:
+    """p95 (ms) of several cumulative histograms ``((upper_s, cumulative), ...)`` with
+    their observation counts, merged FIRST and then gated (``rule`` = (percentile mode,
+    minimum observations) applied to the merged count), like :func:`merged_hist_p95_ms`.
+    SafeScale judges it next to the per-pod maximum: a pod below the per-pod minimum
+    (an overloaded pod completes few requests) still weighs in. A p95 in the ``+Inf``
+    bucket is reported as the largest finite bound (a lower bound; keeps JSON strict)."""
+    mode, min_samples = rule
+    present = [(tuple(buckets), float(count or 0.0)) for buckets, count in hists if buckets]
+    if not present:
+        return None
+    count = sum(item for _, item in present)
+    if count <= 0 or (min_samples > 0 and count < min_samples):
+        return None
+    uppers = sorted({upper for buckets, _ in present for upper, _ in buckets})
+    merged = [(upper, sum(_cumulative_at(buckets, upper) for buckets, _ in present)) for upper in uppers]
+    p95_s = histogram_percentile(merged, 0.95, mode=mode)
+    if p95_s is None:
+        return None
+    if p95_s == float("inf"):
+        finite = [upper for upper in uppers if upper != float("inf")]
+        if not finite:
+            return None
+        p95_s = max(finite)
+    return float(p95_s) * 1000.0
+
+
 def _cumulative_at(buckets: tuple[tuple[float, float], ...], upper: float) -> float:
     counts = [count for bucket_upper, count in buckets if bucket_upper <= upper]
     return max(counts) if counts else 0.0

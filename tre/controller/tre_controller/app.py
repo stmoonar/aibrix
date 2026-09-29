@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 import time
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Mapping
@@ -28,6 +30,14 @@ from tre_controller.loops.metrics_task import MetricsTaskConfig, SnapshotBox, Sn
 from tre_controller.loops.rescue_task import rescue_task
 from tre_controller.loops.safescale_task import safescale_task
 from tre_controller.planning.safescale import SafeScaleStateMachine
+from tre_controller.planning.safescale_direct import (
+    DirectEvidenceCollector,
+    PodMetricsScraper,
+    cluster_view_remaining,
+    cluster_view_targets,
+    cluster_view_urls,
+)
+from tre_controller.planning.safescale_evidence import MetricsEvidenceReader, RegistryThresholds
 from tre_controller.signals.trs import SignalState
 from tre_controller.sm_client import AsyncTransport, ServiceManagerClient
 from tre_controller.store.metrics_store import MetricsStore
@@ -62,6 +72,9 @@ class ControllerDependencies:
     # the planner loops (no probe start) and the SafeScale loop (rollback), so a
     # period any of them saw counts against every probe window it overlaps.
     maintenance_watch: "MaintenanceWatch | None" = None
+    # 2026-09-29 B+D: direct /metrics evidence of SafeScale probes (None when the
+    # registry sets safescale.evidence_source: redis).
+    direct_evidence: "DirectEvidenceCollector | None" = None
 
 
 @dataclass(frozen=True)
@@ -149,6 +162,7 @@ def build_controller_task_specs(
                     # Observe (2026-09-28): open probes are rolled back (unhide).
                     is_observe=_observe_reader(deps),
                     maintenance=deps.maintenance_watch,
+                    direct=deps.direct_evidence,
                 ),
             )
         )
@@ -164,6 +178,17 @@ def build_controller_task_specs(
             )
         )
     return tuple(specs)
+
+
+def _sleeping_pods(view: Any, model: str) -> set[str]:
+    """Pods (SM serve_id) of ``model`` the fleet state reports asleep; empty without a view."""
+    if view is None:
+        return set()
+    return {
+        binding.serve_id
+        for binding in getattr(view, "bindings", ()) or ()
+        if binding.model == model and not binding.awake
+    }
 
 
 def _observe_reader(deps: ControllerDependencies) -> Callable[[], bool] | None:
@@ -229,12 +254,65 @@ def create_controller_dependencies(
         transport=sm_transport,
         slow_timeout_s=resolve_sm_call_timeout_s(cfg, registry),
     )
-    safescale = SafeScaleStateMachine(config=cfg.safescale, store=ControllerStateStore(redis_client))
-    safescale.restore()
-    observe_gate = ObserveModeGate(redis_client)
-    profiler = build_profiler(cfg, redis_client)
     # A view older than two refresh periods is not "fresh" (review 4 P2-1).
     cluster_view_box = ClusterViewBox(max_age_s=max(5.0, 2.5 * float(getattr(cfg, "fairness_interval_s", 10.0))))
+    # 2026-09-29: the commit gate's latency check reads the post-hide evidence window
+    # (remaining pods: probe pods and pods the fleet state reports asleep excluded),
+    # anchored on Redis TIME of the metrics store; thresholds from registry safescale.
+    safescale = SafeScaleStateMachine(
+        config=cfg.safescale,
+        store=ControllerStateStore(redis_client),
+        evidence=MetricsEvidenceReader(
+            # Same rules as the controller's store, but no histogram lookback: a pod's
+            # delta starts at its first doc stamped at or after the evidence start.
+            MetricsStore(
+                metrics_redis_client,
+                registry,
+                instant_sample_interval_ms=cfg.instant_sample_interval_ms,
+                percentile_mode=cfg.percentile_mode,
+                schema=cfg.metrics_schema,
+                histogram_lookback_ms=0,
+                min_latency_samples=cfg.min_latency_samples,
+            ),
+            redis_client=metrics_redis_client,
+            sleeping_pods=lambda model: _sleeping_pods(cluster_view_box.get(), model),
+        ),
+        thresholds=RegistryThresholds(
+            registry,
+            mode=cfg.safescale.slo_mode,
+            ttft_override_ms=cfg.safescale.ttft_p95_slo_ms,
+            tpot_override_ms=cfg.safescale.tpot_p95_slo_ms,
+        ),
+        # Redis mode: the remaining pods a commit needs evidence of (fresh view only).
+        remaining_pods=cluster_view_remaining(cluster_view_box.fresh),
+    )
+    safescale.restore()
+    # 2026-09-29 B+D: the controller scrapes the probe's remaining pods itself
+    # (pod IP from the SM fleet state, port = registry safescale.metrics_port).
+    direct_evidence = None
+    if safescale.direct_mode():
+        direct_evidence = DirectEvidenceCollector(
+            safescale,
+            PodMetricsScraper(timeout_s=cfg.safescale.scrape_timeout_s),
+            # Only a FRESH view names the remaining pods whose evidence a commit needs.
+            cluster_view_targets(cluster_view_box.fresh, port=cfg.safescale.metrics_port),
+            poll_ms=cfg.safescale.evidence_poll_ms,
+            urls=cluster_view_urls(cluster_view_box.get, port=cfg.safescale.metrics_port),
+        )
+    # The effective evidence settings (unknown registry keys are only warned about).
+    logging.getLogger("tre_controller.safescale").info(json.dumps({
+        "event": "safescale_config",
+        "evidence_source": cfg.safescale.evidence_source,
+        "evidence_poll_ms": cfg.safescale.evidence_poll_ms,
+        "scrape_timeout_s": cfg.safescale.scrape_timeout_s,
+        "baseline_delay_ms": cfg.safescale.baseline_delay_ms,
+        "metrics_port": cfg.safescale.metrics_port,
+        "min_commit_samples": cfg.safescale.min_commit_samples,
+        "window_ceiling_ms": cfg.safescale.window_ceiling_ms,
+        "slo_mode": cfg.safescale.slo_mode,
+    }, sort_keys=True))
+    observe_gate = ObserveModeGate(redis_client)
+    profiler = build_profiler(cfg, redis_client)
     model_state_box = ModelStateBox()
     return ControllerDependencies(
         store=store,
@@ -272,9 +350,21 @@ def create_controller_dependencies(
             # P3: a hide that did not take effect (failed / not sent in observe)
             # marks its probe for rollback instead of leaving it judged as hidden.
             on_hide_failed=lambda model, pods, reason: safescale.abort_probe(model, pods=pods, reason=reason),
+            # 2026-09-29: the SM confirmed a probe's hide - anchor its evidence window
+            # (and, on the direct path, start the baseline scrape of its remaining pods).
+            on_hide_done=(
+                direct_evidence.on_hide_done if direct_evidence is not None
+                else (lambda model, pods: safescale.mark_hidden(model, pods=pods))
+            ),
+            # P2-6: a donor the SM refused with 409 floor_violation is not picked for
+            # a scale-down again for TRE_FLOOR_VIOLATION_COOLDOWN_TICKS fast-loop ticks.
+            floor_violation_hold_ms=(
+                float(getattr(cfg, "floor_violation_cooldown_ticks", 6)) * float(cfg.rescue_interval_s) * 1000.0
+            ),
         ),
         observe_gate=observe_gate,
         maintenance_watch=MaintenanceWatch(redis_client),
+        direct_evidence=direct_evidence,
         model_state_box=model_state_box,
         sm_client=sm_client,
         cluster_view_box=cluster_view_box,
@@ -353,3 +443,7 @@ async def run_controller(deps: ControllerDependencies, cfg: MetricsTaskConfig) -
         shutdown = getattr(deps.queue, "shutdown", None)
         if callable(shutdown):
             await shutdown()
+        # The direct-evidence scrape pool (and its scheduled baselines).
+        direct = getattr(deps, "direct_evidence", None)
+        if direct is not None:
+            direct.close()

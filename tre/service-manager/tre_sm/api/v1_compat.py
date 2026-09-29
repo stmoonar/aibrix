@@ -31,7 +31,11 @@ def create_v1_compat_router(service) -> APIRouter:
         else:
             raise HTTPException(status_code=400, detail="scale_type must be up or down")
         try:
-            response = service.put_model_target(model_name, wake_replicas=target)
+            # APA scale-downs take the "apa" sleep path (no drain by default,
+            # service_manager.sleep.no_drain_paths); a scale-up ignores it.
+            response = service.put_model_target(
+                model_name, wake_replicas=target, sleep_path="apa"
+            )
         except (KeyError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return {"requested": scale_value, "actual": len(response["actions"])}

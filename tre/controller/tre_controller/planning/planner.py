@@ -78,6 +78,10 @@ class ClusterView:
     #: Registry placement policy (``placement_policy_from_registry``), attached by the
     #: planner tick; None = plain buddy best-fit (tests without a registry).
     placement: PlacementPolicy | None = None
+    #: serve_id (pod name) -> pod IP, from the SM fleet state's observed bindings
+    #: (``/v2/state`` ``fleet.observed``); used by the SafeScale direct evidence
+    #: scrape. Empty when the SM reports no fleet state.
+    pod_ips: Mapping[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -102,6 +106,12 @@ class ScaleAction:
     # one rescue transfer carry the same id; the ActionQueue executes them as ONE
     # compound action (sleep the donor, and only on success wake the receiver).
     transfer_id: str | None = None
+
+
+#: SM sleep path of the fast-loop "*_immediate" donors (CRIT donor, idle proactive,
+#: low-fairness donor). With the default SM registry it does not drain: hide -> ack
+#: -> /sleep mode=abort, the reissue sidecar continues the cut-off requests (v1).
+IMMEDIATE_DONOR_SLEEP_PATH = "urgent"
 
 
 @dataclass(frozen=True)
@@ -281,6 +291,7 @@ def build_plan(
     cooldowns: Mapping[str, str] | None = None,
     probe_backoff_models: set[str] | None = None,
     preemptible_models: set[str] | None = None,
+    floor_holds: set[str] | None = None,
 ) -> PlanResult:
     active_probe_models = active_probe_models or set()
     # Review 3 P2-3: models whose only in-flight work is a SafeScale commit waiting
@@ -290,7 +301,12 @@ def build_plan(
     # A13: models whose last SafeScale probe rolled back recently (no new HIGH proactive
     # probe until TRE_SAFESCALE_ROLLBACK_BACKOFF_MS has passed).
     probe_backoff_models = probe_backoff_models or set()
-    inflight_models = inflight_models or set()
+    # A local copy (the caller's set is never mutated). A donor taken earlier in this
+    # tick is NOT added to it: every take is recorded in ``deltas`` and each donor
+    # check subtracts the planned takes from the donor's replicas before comparing
+    # with its floor (min_replicas), so a 3-replica donor with floor 1 can give one
+    # replica to each of two receivers of one tick, a 2-replica one only once.
+    inflight_models = set(inflight_models or ())
     actions: list[Action] = []
     deltas: dict[str, int] = {}
     delayed_down_models: set[str] = set()
@@ -303,7 +319,9 @@ def build_plan(
     occupancy = _SlotOccupancy(cluster_view) if cluster_view is not None else None
     # Review F4 per-model cooldown: model -> direction ("up"/"down") of its last executed
     # action whose effect the decision window does not yet fully reflect.
-    cooldown = _Cooldown(cooldowns or {}, events)
+    # P2-6: donors the SM refused with 409 floor_violation recently are held out of
+    # every scale-down (never out of a scale-up) through the same cooldown gate.
+    cooldown = _Cooldown(cooldowns or {}, events, floor_holds=floor_holds)
 
     incomplete_models = _paper_state_incomplete_models(classifications)
     if not classifications or (incomplete_models and cfg.incomplete_policy == "drop_all"):
@@ -431,7 +449,13 @@ def build_plan(
                     cluster_view=cluster_view,
                     receiver=recv.model_name,
                     active_probe_models=active_probe_models,
-                    inflight_models=inflight_models | cooldown.down_blocked(),
+                    # One SafeScale probe per donor model at a time (the state
+                    # machine is keyed by model): a donor already shrunk for an earlier
+                    # receiver this tick cannot start a second probe - its extra
+                    # replicas stay available to the immediate donor loop below.
+                    inflight_models=inflight_models | cooldown.down_blocked() | slot_shrink_donors,
+                    planned_deltas=deltas,
+                    taken_serve_ids=occupancy.donor_taken_ids() if occupancy is not None else set(),
                     source_loop="rescue",
                 )
                 if same_slot_shrink is not None:
@@ -443,6 +467,15 @@ def build_plan(
                     actions.append(same_slot_shrink)
                     slot_shrink_donors.add(same_slot_shrink.donor)
                     delayed_down_models.add(same_slot_shrink.donor)
+                    # Replica floor (2026-09-29, fix C, relaxed): the shrink takes one
+                    # replica of the donor. It is recorded in the plan's deltas only, so
+                    # a later receiver's donor check counts it against the floor (two
+                    # takes from a 2-replica donor with min_replicas 1 would leave 0; a
+                    # 3-replica donor may still give one more). Its binding is marked
+                    # taken so no later action of this tick sleeps / hides the same pod.
+                    deltas[same_slot_shrink.donor] = deltas.get(same_slot_shrink.donor, 0) - 1
+                    if occupancy is not None:
+                        occupancy.take_donor(same_slot_shrink.serve_id)
                     events.append(
                         f"safescale_preemption:{same_slot_shrink.donor}->{recv.model_name}:{same_slot_shrink.reason}"
                     )
@@ -537,6 +570,7 @@ def build_plan(
                     receiver=recv.model_name,
                     pods=donor_slot_pods,
                     transfer_id=transfer_id,
+                    sleep_path=IMMEDIATE_DONOR_SLEEP_PATH,
                 )
                 _add_scale_action(
                     actions,
@@ -618,6 +652,7 @@ def build_plan(
                     reason="idle_proactive_immediate",
                     source_loop="rescue",
                     donor=idle.model_name,
+                    sleep_path=IMMEDIATE_DONOR_SLEEP_PATH,
                 )
 
         for high in high_models:
@@ -808,6 +843,7 @@ def build_plan(
                 donor=donor.model_name,
                 receiver=recv.model_name,
                 pods=donor_slot_pods,
+                sleep_path=IMMEDIATE_DONOR_SLEEP_PATH,
             )
             _add_scale_action(
                 actions,
@@ -881,11 +917,20 @@ class _Cooldown:
     last executed one. Same direction is held; after a scale-up a scale-down is held too;
     after a scale-down a scale-up is allowed only for a CRITICAL receiver (safety)."""
 
-    def __init__(self, cooldowns: Mapping[str, str], events: list[str]) -> None:
+    def __init__(
+        self, cooldowns: Mapping[str, str], events: list[str], *, floor_holds: set[str] | None = None
+    ) -> None:
         self._cooldowns = dict(cooldowns)
         self._events = events
+        #: P2-6: models held out of scale-downs after an SM floor_violation refusal.
+        self._floor_holds = set(floor_holds or ())
 
     def blocks(self, model: str, direction: str, *, critical: bool = False) -> bool:
+        if direction == "down" and model in self._floor_holds:
+            event = f"floor_violation_hold:{model}"
+            if event not in self._events:
+                self._events.append(event)
+            return True
         last = self._cooldowns.get(model)
         if last is None:
             return False
@@ -897,7 +942,7 @@ class _Cooldown:
         return True
 
     def down_blocked(self) -> set[str]:
-        return set(self._cooldowns)
+        return set(self._cooldowns) | self._floor_holds
 
 
 class _SlotOccupancy:
@@ -921,6 +966,9 @@ class _SlotOccupancy:
                 for gpu in binding.slot.gpu_ids:
                     self._awake[(binding.slot.node, gpu)] = binding
         self._claimed: set[tuple[str, int]] = set()
+        # Donor bindings this tick already sleeps / hides (slot-targeted donor pods, a
+        # same-slot shrink's binding): never taken a second time in the same tick.
+        self._donor_taken: set[str] = set()
         # Per model: GPUs claimed by this tick's planned wakes / creates, and how many.
         self._model_claimed: dict[str, set[tuple[str, int]]] = {}
         self._planned_counts: dict[str, int] = {}
@@ -934,6 +982,13 @@ class _SlotOccupancy:
         for model, planned in self._planned_counts.items():
             counts[model] = counts.get(model, 0) + planned
         return self._policy.for_awake(counts)
+
+    def take_donor(self, serve_id: str) -> None:
+        """Mark a donor binding as slept / hidden by this tick's plan."""
+        self._donor_taken.add(serve_id)
+
+    def donor_taken_ids(self) -> set[str]:
+        return set(self._donor_taken)
 
     def model_gpus(self, model: str) -> set[tuple[str, int]]:
         """GPUs ``model`` holds awake or has claimed this tick."""
@@ -1074,7 +1129,7 @@ class _SlotOccupancy:
             if len(occupants) != 1:
                 continue
             occupant = next(iter(occupants))
-            if occupant.model != donor or occupant.hidden:
+            if occupant.model != donor or occupant.hidden or occupant.serve_id in self._donor_taken:
                 continue
             matches.append((receiver_binding, occupant))
         policy = self.policy()
@@ -1310,8 +1365,9 @@ def _slot_targeted_transfer(
         if event not in events:
             events.append(event)
         return 0, (), ()
-    for _, receiver_binding in pairs:
+    for donor_pod, receiver_binding in pairs:
         occupancy.claim(receiver_binding)
+        occupancy.take_donor(donor_pod)
     return len(pairs), tuple(pod for pod, _ in pairs), tuple(binding.serve_id for _, binding in pairs)
 
 
@@ -1326,6 +1382,8 @@ def _try_plan_same_slot_high_shrink(
     active_probe_models: set[str],
     inflight_models: set[str],
     source_loop: SourceLoop,
+    planned_deltas: Mapping[str, int] | None = None,
+    taken_serve_ids: set[str] | None = None,
 ) -> ShrinkForSlotAction | None:
     high_by_model = {item.model_name: item for item in classifications if item.state == ModelState.HIGH}
     candidates: list[tuple[float, Binding]] = []
@@ -1341,8 +1399,13 @@ def _try_plan_same_slot_high_shrink(
             continue
         if binding.model == receiver or len(binding.slot.gpu_ids) != 1:
             continue
+        if binding.serve_id in (taken_serve_ids or ()):
+            continue  # this tick already sleeps this pod for another receiver
         donor_pods = _effective_routable_replicas(binding.model, model_contexts, model_replicas)
-        if donor_pods <= _min_replicas(cfg, binding.model):
+        # Takes already planned this tick (e.g. a critical_donor_immediate of an earlier
+        # receiver) count against the donor's floor too.
+        planned_take = abs(min((planned_deltas or {}).get(binding.model, 0), 0))
+        if donor_pods - planned_take <= _min_replicas(cfg, binding.model):
             continue
         if not _slot_mate_is_free(cluster_view, binding.slot, occupied):
             continue
@@ -1473,7 +1536,12 @@ def _add_scale_action(
     donor: str | None = None,
     pods: tuple[str, ...] = (),
     transfer_id: str | None = None,
+    sleep_path: str | None = None,
+    drain_budget_s: float | None = None,
 ) -> None:
+    """``sleep_path`` / ``drain_budget_s`` go to the SM sleep of a negative delta
+    (None = the dispatcher / SM default). The SM registry decides whether the path
+    drains at all (service_manager.sleep.no_drain_paths)."""
     if delta == 0:
         return
     deltas[model] = deltas.get(model, 0) + delta
@@ -1488,6 +1556,8 @@ def _add_scale_action(
             donor=donor,
             pods=tuple(pods),
             transfer_id=transfer_id,
+            sleep_path=sleep_path if delta < 0 else None,
+            drain_budget_s=drain_budget_s if delta < 0 else None,
         )
     )
 

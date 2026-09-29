@@ -8,11 +8,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 from dataclasses import replace
 
 import aiohttp
 import pytest
-from aiohttp.test_utils import TestServer
+from aiohttp.test_utils import TestServer, make_mocked_request
 
 from fake_vllm_fork import FakeEngine, FakeGateway, detok, reference_tokens, render_chat, tokenize
 from tre_reissue import sidecar as sc
@@ -577,27 +578,36 @@ async def test_metrics_render_kinds_and_overhead_histogram():
 # ------------------------------------------------------------------ pure helpers
 
 
-def test_non_continuable_mirrors_the_gateway_classification():
+#: Shared with the gateway plugin's TestTRENonContinuableContract
+#: (pkg/plugins/gateway/tre_transparent_sleep_test.go): one list of cases, two implementations.
+CONTRACT = Path(__file__).resolve().parents[1] / "contract" / "non_continuable_cases.json"
+REASONS = {"endpoint", "body", "n", "logprobs", "echo", "beam_search", "tools", "structured_output", "prompt_form"}
+
+
+def _contract_cases() -> list[dict]:
+    return json.loads(CONTRACT.read_text(encoding="utf-8"))["cases"]
+
+
+def test_non_continuable_contract_is_well_formed():
+    cases = _contract_cases()
+    assert len(cases) >= 40
+    names = [c["name"] for c in cases]
+    assert len(names) == len(set(names)), "case names must be unique"
+    for c in cases:
+        assert ("body" in c) != ("body_raw" in c), c["name"]
+        assert c["want"] is (c["reason"] is not None), c["name"]
+        assert c["reason"] is None or c["reason"] in REASONS, c["name"]
+    assert {c["reason"] for c in cases if c["reason"]} == REASONS, "every reason needs a case"
+    assert any("?" in c["path"] for c in cases if not c["want"]), "a query-string path must stay continuable"
+
+
+@pytest.mark.parametrize("case", _contract_cases(), ids=lambda c: c["name"])
+def test_non_continuable_contract(case):
     cfg = Config()
-    c, ch = cfg.completions_path, cfg.chat_path
-    ok = {"prompt": "x"}
-    assert sc.non_continuable_reason(c, ok, cfg) is None
-    assert sc.non_continuable_reason(c, {"prompt": [1, 2, 3]}, cfg) is None
-    assert sc.non_continuable_reason(ch, {"messages": [{"role": "user", "content": "x"}]}, cfg) is None
-    assert sc.non_continuable_reason(ch, {"messages": [{}], "tools": [], "tool_choice": "auto"}, cfg) is None
-    assert sc.non_continuable_reason(ch, {"messages": [{}], "tools": [{"x": 1}], "tool_choice": "none"}, cfg) is None
-    assert sc.non_continuable_reason(ch, {"messages": [{}], "response_format": {"type": "text"}}, cfg) is None
-    assert sc.non_continuable_reason(ch, {"messages": [{}], "logprobs": False}, cfg) is None
-    bad = [
-        (c, dict(ok, n=2)), (c, dict(ok, best_of=3)), (c, dict(ok, logprobs=0)), (ch, {"messages": [{}], "logprobs": True}),
-        (ch, {"messages": [{}], "top_logprobs": 2}), (c, dict(ok, prompt_logprobs=1)), (c, dict(ok, echo=True)),
-        (c, dict(ok, use_beam_search=True)), (ch, {"messages": [{}], "tools": [{"x": 1}]}),
-        (ch, {"messages": [{}], "tool_choice": "required"}), (ch, {"messages": [{}], "response_format": {"type": "json_object"}}),
-        (c, dict(ok, guided_json={})), (c, dict(ok, guided_json_object=True)), (c, dict(ok, structured_outputs={})),
-        (c, {"prompt": ["a", "b"]}), (c, dict(ok, suffix="x")), (c, dict(ok, n="2")), ("/v1/embeddings", ok),
-    ]
-    for path, body in bad:
-        assert sc.non_continuable_reason(path, body, cfg) is not None, body
+    raw = case["body_raw"].encode() if "body_raw" in case else json.dumps(case["body"]).encode()
+    # What _generation classifies: aiohttp's request.path (no query) and parse_body(raw).
+    path = make_mocked_request("POST", case["path"]).path
+    assert sc.non_continuable_reason(path, sc.parse_body(raw), cfg) == case["reason"]
 
 
 def test_build_continuation_budgets():

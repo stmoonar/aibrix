@@ -246,7 +246,8 @@ def gpu_memory_utilization(spec: Any) -> float:
 SLEEP_PATHS = (
     "safescale_commit",  # SafeScale commit of a hidden probe pod
     "urgent",  # controller *_immediate donor paths (fast loop)
-    "scale_down",  # ordinary scale-down (TRE slow loop and APA alike)
+    "scale_down",  # ordinary scale-down (manual / console, TRE without SafeScale)
+    "apa",  # APA scale-down through the v1-compatible /scale_service
     "defrag",  # buddy defragmentation migration
     "repair",  # fleet repair quarantine / resident pool rebuild
     "startup",  # startup admission / startup convergence
@@ -263,11 +264,25 @@ DEFAULT_SLEEP_BUDGETS_S: dict[str, float | None] = {
     # No deadline pressure: wait for in-flight requests up to the hard cap. The same
     # budget applies to TRE and APA scale-downs (both arms drain identically).
     "scale_down": None,
+    # APA through /scale_service (was "scale_down" before 2026-09-29): with "apa" in
+    # no_drain_paths (default) the budget is unused; without it, the old hard-cap drain.
+    "apa": None,
     "defrag": 30.0,
     "repair": 30.0,
     "startup": 30.0,
     "default": 30.0,
 }
+
+#: Sleep paths that do NOT drain (v1 / paper semantics, 2026-09-29): hide -> gateway ack
+#: -> /sleep ``mode=abort`` at once. Continuable requests are continued by the reissue
+#: sidecar; non-continuable ones (and requests whose state the SM cannot read) are cut
+#: off, never waited for and never a reason to roll back - the outcome counts them.
+#: The caller's drain_budget_s is ignored on these paths. The SafeScale probe window
+#: (the pod is already hidden while it runs) is the only drain of a TRE scale-down;
+#: the fast-loop donors (urgent) and APA scale-downs release at once. Maintenance
+#: paths (defrag, repair, startup, scale_down = manual binding power) keep draining.
+#: ``service_manager.sleep.no_drain_paths: []`` restores the draining behaviour.
+DEFAULT_NO_DRAIN_PATHS: tuple[str, ...] = ("safescale_commit", "urgent", "apa")
 
 #: Default ``gateway.route_timeout_s``: the gateway's per-request route timeout. The
 #: single source for the model HTTPRoute timeout (deploy/gen_model_manifests.py) and
@@ -383,6 +398,139 @@ class PlacementConfig:
     defrag_enabled: bool = False
 
 
+#: ``safescale.slo_mode``: where the SafeScale probe's latency thresholds come from.
+#: ``labels`` - the calibration label's rule (``tre_common.slo_labels.label_def_for_model``:
+#: TPOT 75 ms, TTFT = max(floor, k * (c + b * L)) with the mean prompt length L of the
+#: evidence window); ``fixed`` - the model's ``models[].slo`` ttft_p95_ms / tpot_p95_ms.
+SAFESCALE_SLO_MODES = ("labels", "fixed")
+
+
+@dataclass(frozen=True)
+class SafeScaleRegistryConfig:
+    """Registry ``safescale:`` section (controller only; every key optional).
+
+    Read at controller start (restart-to-apply). Controller images before this
+    section existed ignore it."""
+
+    slo_mode: str = "labels"
+    #: Upper bound (s) of the probe window W, deadline extensions included:
+    #: W = min(max(multiplier * p95_e2e, floor), window_ceiling_s).
+    window_ceiling_s: float = 60.0
+    #: Completed requests (TTFT count of the remaining pods over the evidence window)
+    #: needed before the latency part of the commit gate is judged.
+    min_commit_samples: int = 20
+    #: The first gateway doc of the evidence window must be stamped within
+    #: [hide, hide + this]; otherwise the probe rolls back (clock / missing-tick guard).
+    #: Redis evidence path only (``evidence_source: redis`` or the direct path's fallback).
+    evidence_clock_tolerance_s: float = 20.0
+    #: Where the probe's latency / KV evidence comes from (2026-09-29 B+D):
+    #: ``direct`` - the controller scrapes the remaining pods' vLLM ``/metrics`` itself
+    #: (baseline at the SM's hide confirmation, then every ``evidence_poll_s``), falling
+    #: back to ``redis`` for a probe when every remaining pod fails; ``redis`` - the
+    #: gateway's histogram docs in Redis only (the 10 s doc grid).
+    evidence_source: str = "direct"
+    #: Direct path: scrape period (s) of a probe's remaining pods; also the deadline
+    #: extension step while the evidence is short.
+    evidence_poll_s: float = 2.0
+    #: Direct path: timeout (s) of one pod scrape (the scrapes of a tick run concurrently).
+    scrape_timeout_s: float = 1.0
+    #: Direct path: the baseline scrape runs this long (ms) after the SM confirmed the
+    #: hide, so the gateway has applied it (pod watch) - a baseline taken while requests
+    #: still go to the hidden pods under-counts the remaining pods' load. The deadline
+    #: still counts from the confirmation.
+    baseline_delay_ms: float = 1000.0
+    #: Direct path: the port of a model pod serving ``GET /metrics`` (the pod's serving
+    #: port; with the reissue sidecar the sidecar forwards it to vLLM).
+    metrics_port: int = POD_SERVING_PORT
+
+
+SAFESCALE_KEYS = frozenset({
+    "slo_mode", "window_ceiling_s", "min_commit_samples", "evidence_clock_tolerance_s",
+    "evidence_source", "evidence_poll_s", "scrape_timeout_s", "metrics_port", "baseline_delay_ms",
+})
+SAFESCALE_EVIDENCE_SOURCES = ("direct", "redis")
+
+
+def _safescale_num(section: dict[str, Any], key: str, default: float) -> float:
+    """A number of the safescale section; anything unparsable is a ValueError."""
+    value = section.get(key)
+    if isinstance(value, bool):
+        raise ValueError(f"safescale.{key} must be a number, got {value!r}")
+    try:
+        return float(default if value is None else value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"safescale.{key} must be a number, got {value!r}") from exc
+
+
+def parse_safescale_config(raw: dict[str, Any] | None) -> SafeScaleRegistryConfig:
+    """Parse the optional ``safescale:`` registry section; raise ValueError on bad values.
+
+    Unknown keys are ignored with a warning (forward compatibility: a registry written
+    for a newer controller must not stop the service-manager / UI / an older controller
+    that parse this section too); invalid values of known keys refuse the start."""
+    if raw is None:
+        return SafeScaleRegistryConfig()
+    if not isinstance(raw, dict):
+        raise ValueError(f"safescale must be a mapping, got {raw!r}")
+    unknown = sorted(str(key) for key in set(raw) - SAFESCALE_KEYS)
+    if unknown:
+        LOG.warning("registry safescale: ignoring unknown keys %s (known: %s)", unknown, sorted(SAFESCALE_KEYS))
+    defaults = SafeScaleRegistryConfig()
+    source = str(raw.get("evidence_source") or defaults.evidence_source).strip().lower()
+    if source not in SAFESCALE_EVIDENCE_SOURCES:
+        raise ValueError(f"safescale.evidence_source must be one of {SAFESCALE_EVIDENCE_SOURCES}, got {source!r}")
+    poll = _safescale_num(raw, "evidence_poll_s", defaults.evidence_poll_s)
+    scrape_timeout = _safescale_num(raw, "scrape_timeout_s", defaults.scrape_timeout_s)
+    for name, value in (("evidence_poll_s", poll), ("scrape_timeout_s", scrape_timeout)):
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(f"safescale.{name} must be a positive number, got {value!r}")
+    if scrape_timeout >= poll:
+        raise ValueError(
+            f"safescale.scrape_timeout_s ({scrape_timeout}) must be below evidence_poll_s ({poll}): "
+            "a tick's scrapes must finish before the next one"
+        )
+    baseline_delay = _safescale_num(raw, "baseline_delay_ms", defaults.baseline_delay_ms)
+    if not math.isfinite(baseline_delay) or baseline_delay < 0:
+        raise ValueError(f"safescale.baseline_delay_ms must be a non-negative number, got {baseline_delay!r}")
+    port_raw = raw.get("metrics_port")
+    port = defaults.metrics_port if port_raw is None else port_raw
+    try:
+        valid_port = (
+            not isinstance(port, bool) and float(port) == int(float(port)) and 1 <= int(float(port)) <= 65535
+        )
+    except (TypeError, ValueError, OverflowError):
+        valid_port = False
+    if not valid_port:
+        raise ValueError(f"safescale.metrics_port must be a port number, got {port!r}")
+    mode = str(raw.get("slo_mode") or defaults.slo_mode).strip().lower()
+    if mode not in SAFESCALE_SLO_MODES:
+        raise ValueError(f"safescale.slo_mode must be one of {SAFESCALE_SLO_MODES}, got {mode!r}")
+    ceiling = _safescale_num(raw, "window_ceiling_s", defaults.window_ceiling_s)
+    tolerance = _safescale_num(raw, "evidence_clock_tolerance_s", defaults.evidence_clock_tolerance_s)
+    for name, value in (("window_ceiling_s", ceiling), ("evidence_clock_tolerance_s", tolerance)):
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(f"safescale.{name} must be a positive number, got {value!r}")
+    if baseline_delay >= 1000.0 * ceiling:
+        raise ValueError(
+            f"safescale.baseline_delay_ms ({baseline_delay}) must be below window_ceiling_s ({ceiling}) in ms"
+        )
+    samples_raw = raw.get("min_commit_samples")
+    samples = defaults.min_commit_samples if samples_raw is None else samples_raw
+    if isinstance(samples, bool) or float(samples) != int(float(samples)) or int(float(samples)) < 0:
+        raise ValueError(f"safescale.min_commit_samples must be a non-negative integer, got {samples!r}")
+    return SafeScaleRegistryConfig(
+        slo_mode=mode,
+        window_ceiling_s=float(ceiling),
+        min_commit_samples=int(float(samples)),
+        evidence_clock_tolerance_s=float(tolerance),
+        evidence_source=source,
+        evidence_poll_s=float(poll),
+        scrape_timeout_s=float(scrape_timeout),
+        metrics_port=int(float(port)),
+        baseline_delay_ms=float(baseline_delay),
+    )
+
+
 @dataclass(frozen=True)
 class GatewayConfig:
     """Registry ``gateway:`` section."""
@@ -456,14 +604,24 @@ class SleepPolicy:
     budgets_s: dict[str, float | None] = field(
         default_factory=lambda: dict(DEFAULT_SLEEP_BUDGETS_S)
     )
+    #: Paths that never drain (see DEFAULT_NO_DRAIN_PATHS); () = every path drains.
+    no_drain_paths: tuple[str, ...] = DEFAULT_NO_DRAIN_PATHS
+
+    def no_drain(self, path: str) -> bool:
+        """True when a sleep on ``path`` aborts everything in flight right after the
+        gateway ack (no drain, no rollback over in-flight requests)."""
+        return path in self.no_drain_paths
 
     def soft_budget_s(self, path: str, requested_s: float | None = None) -> float:
-        """Soft drain budget of one sleep: the caller's budget, else the path's."""
+        """Soft drain budget of one sleep: 0 on a no-drain path (the caller's
+        budget is ignored), else the caller's budget, else the path's."""
         if requested_s is not None:
             budget = float(requested_s)
             if not math.isfinite(budget) or budget < 0:
                 raise ValueError(f"drain budget must be a finite number >= 0, got {requested_s!r}")
-        else:
+        if self.no_drain(path):
+            return 0.0
+        if requested_s is None:
             key = path if path in self.budgets_s else "default"
             raw = self.budgets_s.get(key)
             budget = self.hard_cap_s if raw is None else float(raw)
@@ -519,6 +677,27 @@ class ServiceManagerConfig:
     #: Level of the tre_sm / tre_common loggers (a logging level name); the
     #: TRE_SM_LOG_LEVEL environment variable overrides it.
     log_level: str = "INFO"
+    #: Replica floor (``service_manager.replica_floor.enforce``, 2026-09-29): no hide
+    #: or sleep may leave a model with fewer routable replicas than its registry
+    #: ``min_replicas`` (hide / urgent / scale_down / defrag refused with 409
+    #: floor_violation, APA targets clamped, startup wakes another replica first
+    #: best effort and is otherwise exempt, fleet repair exempt; every exemption is
+    #: recorded). false = the previous behaviour.
+    replica_floor_enforce: bool = True
+    #: ``service_manager.replica_floor.log_interval_s``: the WARNING log of a floor
+    #: event is emitted at most once per (outcome, path, model) in this many seconds
+    #: (the counters always count; 0 = log every event).
+    replica_floor_log_interval_s: float = 60.0
+    #: ``service_manager.startup_admission.gate_seen_s``: a Pod counts as waiting in
+    #: its startup gate while its gate asked for admission within this many seconds
+    #: (the gate polls every 2 s, each call answering within its 15 s timeout).
+    startup_gate_seen_s: float = 30.0
+    #: ``service_manager.startup_admission.drift_grace_s``: a Pod waiting in its
+    #: startup gate is reported as ``startup_admission_pending`` (informational, no
+    #: fleet repair) instead of fleet drift for at most this long since its first
+    #: admission request; a Pod waiting longer is reported as drift again (a stuck
+    #: gate is not masked). 0 = never exempt.
+    startup_gate_drift_grace_s: float = 600.0
 
     @property
     def commit_wait_s(self) -> float:
@@ -608,7 +787,9 @@ class Registry:
         reissue: ReissueConfig | None = None,
         vllm: VllmConfig | None = None,
         placement: PlacementConfig | None = None,
+        safescale: SafeScaleRegistryConfig | None = None,
     ) -> None:
+        self._safescale = safescale or SafeScaleRegistryConfig()
         self._topology = topology
         self._placement = placement or PlacementConfig()
         self._models = tuple(models)
@@ -634,6 +815,9 @@ class Registry:
 
     def placement(self) -> PlacementConfig:
         return self._placement
+
+    def safescale(self) -> SafeScaleRegistryConfig:
+        return self._safescale
 
     def vllm_env_for(self, model: ModelSpec) -> dict[str, str]:
         """The vLLM container environment of ``model``'s pods (besides the per-binding
@@ -815,6 +999,7 @@ def _parse_registry(raw: dict[str, Any]) -> Registry:
         reissue=parse_reissue_config(raw.get("reissue")),
         vllm=parse_vllm_config(raw.get("vllm")),
         placement=parse_placement_config(raw.get("placement")),
+        safescale=parse_safescale_config(raw.get("safescale")),
     )
 
 
@@ -953,6 +1138,17 @@ def parse_service_manager_config(
     create_raw = raw.get("create") or {}
     skew_raw = raw.get("clock_skew") or {}
     pressure_raw = raw.get("node_pressure") or {}
+    floor_raw = raw.get("replica_floor") or {}
+    if not isinstance(floor_raw, dict):
+        raise ValueError(
+            f"service_manager.replica_floor must be a mapping (enforce: bool), got {floor_raw!r}"
+        )
+    startup_raw = raw.get("startup_admission") or {}
+    if not isinstance(startup_raw, dict):
+        raise ValueError(
+            "service_manager.startup_admission must be a mapping "
+            f"(gate_seen_s, drift_grace_s), got {startup_raw!r}"
+        )
     defaults = SleepPolicy()
     plugin_pods_raw = sleep_raw.get("gateway_plugin_pods") or {}
     hard_cap = sleep_raw.get("hard_cap_s")
@@ -966,6 +1162,21 @@ def parse_service_manager_config(
                 f"(known: {', '.join(SLEEP_PATHS)})"
             )
         budgets[str(path)] = None if value is None else float(value)
+    no_drain_raw = sleep_raw.get("no_drain_paths", DEFAULT_NO_DRAIN_PATHS)
+    if no_drain_raw is None:
+        no_drain_raw = ()
+    if isinstance(no_drain_raw, str) or not isinstance(no_drain_raw, (list, tuple)):
+        raise ValueError(
+            "service_manager.sleep.no_drain_paths must be a list of sleep paths "
+            f"(known: {', '.join(SLEEP_PATHS)}), got {no_drain_raw!r}"
+        )
+    for path in no_drain_raw:
+        if str(path) not in SLEEP_PATHS:
+            raise ValueError(
+                f"service_manager.sleep.no_drain_paths: unknown sleep path {path!r} "
+                f"(known: {', '.join(SLEEP_PATHS)})"
+            )
+    no_drain_paths = tuple(dict.fromkeys(str(path) for path in no_drain_raw))
     sleep = SleepPolicy(
         ack_timeout_s=_num(sleep_raw, "ack_timeout_s", defaults.ack_timeout_s),
         instance_staleness_s=_num(sleep_raw, "instance_staleness_s", defaults.instance_staleness_s),
@@ -991,6 +1202,7 @@ def parse_service_manager_config(
         hard_cap_s=float(DEFAULT_ROUTE_TIMEOUT_S if hard_cap is None else hard_cap),
         reservation_ttl_s=_num(sleep_raw, "reservation_ttl_s", defaults.reservation_ttl_s),
         budgets_s=budgets,
+        no_drain_paths=no_drain_paths,
         plugin_namespace=str(plugin_pods_raw.get("namespace", defaults.plugin_namespace)),
         plugin_label_selector=plugin_pods_raw.get(
             "label_selector", defaults.plugin_label_selector
@@ -1020,7 +1232,29 @@ def parse_service_manager_config(
         log_level=(
             base.log_level if raw.get("log_level") is None else str(raw["log_level"]).strip().upper()
         ),
+        replica_floor_enforce=_parse_bool(
+            floor_raw.get("enforce", base.replica_floor_enforce)
+        ),
+        replica_floor_log_interval_s=_nonneg_num(
+            floor_raw, "log_interval_s", base.replica_floor_log_interval_s,
+            "service_manager.replica_floor.log_interval_s",
+        ),
+        startup_gate_seen_s=_nonneg_num(
+            startup_raw, "gate_seen_s", base.startup_gate_seen_s,
+            "service_manager.startup_admission.gate_seen_s",
+        ),
+        startup_gate_drift_grace_s=_nonneg_num(
+            startup_raw, "drift_grace_s", base.startup_gate_drift_grace_s,
+            "service_manager.startup_admission.drift_grace_s",
+        ),
     )
+
+
+def _nonneg_num(section: dict[str, Any], key: str, default: float, name: str) -> float:
+    value = _num(section, key, default)
+    if not math.isfinite(value) or value < 0:
+        raise ValueError(f"{name} must be a finite number >= 0, got {section.get(key)!r}")
+    return value
 
 
 def parse_sleep_mode_param(value: Any) -> str:
@@ -1101,6 +1335,9 @@ def _validate_service_manager(
             errors.append(f"service_manager.sleep.budgets_s: unknown sleep path {path}")
         elif value is not None and (not math.isfinite(value) or value < 0):
             errors.append(f"service_manager.sleep.budgets_s.{path} must be >= 0 or null")
+    for path in sleep.no_drain_paths:
+        if path not in SLEEP_PATHS:
+            errors.append(f"service_manager.sleep.no_drain_paths: unknown sleep path {path}")
     if gateway is not None:
         if not math.isfinite(gateway.route_timeout_s) or gateway.route_timeout_s <= 0:
             errors.append("gateway.route_timeout_s must be positive")

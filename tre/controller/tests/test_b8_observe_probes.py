@@ -63,7 +63,7 @@ def _probe_snapshot():
 # ------------------------------------------------------------ 1. no probe in observe
 def test_observe_mode_starts_no_probe_and_submits_no_hide():
     queue = FakeQueue()
-    safescale = SafeScaleStateMachine(config=SafeScaleConfig(default_window_ms=60_000.0))
+    safescale = SafeScaleStateMachine(config=SafeScaleConfig(min_window_ms=60_000.0))
     registry = _registry_with_models("critical", "donor")
 
     result = run_rescue_tick(
@@ -82,7 +82,7 @@ def test_observe_mode_starts_no_probe_and_submits_no_hide():
 
 def test_observe_mode_does_not_preempt_a_running_probe():
     registry = _tick_registry()
-    safescale = SafeScaleStateMachine(config=SafeScaleConfig(default_window_ms=60_000.0))
+    safescale = SafeScaleStateMachine(config=SafeScaleConfig(min_window_ms=60_000.0))
     safescale.start_probe(model="critical", pods=("critical-1",), now_ms=0)
     snapshot = MetricsSnapshot(
         ts_ms=1_000,
@@ -114,7 +114,7 @@ def test_the_rescue_loop_reads_the_mode_gate_every_tick():
         raise Stop
 
     queue = FakeQueue()
-    safescale = SafeScaleStateMachine(config=SafeScaleConfig(default_window_ms=60_000.0))
+    safescale = SafeScaleStateMachine(config=SafeScaleConfig(min_window_ms=60_000.0))
     reads = []
 
     def is_observe():
