@@ -592,10 +592,26 @@ def _num_above(value: Any, limit: float) -> bool:
     return value > limit
 
 
+def _reject_constant(name: str) -> Any:
+    raise ValueError(f"non-standard JSON constant {name}")
+
+
+def parse_body(raw: bytes) -> Any:
+    """The request body as JSON, or None when it is not strict JSON (NaN / Infinity are
+    rejected, as the gateway's parser does)."""
+    try:
+        return json.loads(raw, parse_constant=_reject_constant)
+    except ValueError:
+        return None
+
+
 def non_continuable_reason(path: str, body: Any, cfg: "Config") -> str | None:
-    """Why a request cannot be resumed from its emitted tokens (None = it can). Mirrors
-    the gateway plugin's treNonContinuable (pkg/plugins/gateway/tre_transparent_sleep.go),
-    which makes the service-manager drain such requests instead of aborting them."""
+    """Why a request cannot be resumed from its emitted tokens (None = it can). The same
+    rules and reason strings as the gateway plugin's treNonContinuableReason
+    (pkg/plugins/gateway/tre_transparent_sleep.go), which makes the service-manager drain
+    such requests instead of aborting them; both are checked against the shared contract
+    tre/reissue/contract/non_continuable_cases.json. ``path`` excludes the query string
+    and ``body`` is :func:`parse_body` of the raw request body."""
     if path not in (cfg.completions_path, cfg.chat_path):
         return "endpoint"
     if not isinstance(body, dict):
@@ -1158,10 +1174,7 @@ class ReissueSidecar:
         body: Any = None
         generation = path in (cfg.completions_path, cfg.chat_path)
         if generation:
-            try:
-                body = json.loads(raw)
-            except ValueError:
-                body = None
+            body = parse_body(raw)
         nc_reason = non_continuable_reason(path, body, cfg) if generation else "endpoint"
         epoch = self.state.epoch
         headers = forward_headers(request.headers, self._local_drop)

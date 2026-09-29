@@ -60,7 +60,12 @@ cannot be resumed from their emitted tokens and must be drained rather than abor
 (streaming or not, unless `tool_choice`/`function_call` is `"none"`), structured output /
 guided decoding (`response_format` other than `text`, `guided_json`, `guided_regex`,
 `guided_choice`, `guided_grammar`, `guided_json_object`, `structural_tag`,
-`structured_outputs`) and every endpoint other than completions and chat completions.
+`structured_outputs`), a prompt form a continuation cannot extend (completions: `suffix`,
+`prompt_embeds`, or a prompt other than one string / one token-id list / a one-element
+batch; chat: `messages` missing or empty), a body that is not a JSON object, and every
+endpoint other than completions and chat completions (the query string of `:path` is
+ignored). The rules and reason strings are shared with the reissue sidecar and checked by
+both test suites against `tre/reissue/contract/non_continuable_cases.json`.
 Known semantic drift that is *not* classified as non-continuable: in a continuation the
 tokens generated before the seam are part of the prompt, so `presence_penalty` and
 `frequency_penalty` (which count generated tokens only) no longer penalise them

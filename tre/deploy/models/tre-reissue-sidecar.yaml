@@ -321,14 +321,22 @@ data:
     \ and > limit; present but not a number counts as above (conservative).\"\"\"\n\
     \    if value is None:\n        return False\n    if isinstance(value, bool) or\
     \ not isinstance(value, (int, float)):\n        return True\n    return value\
-    \ > limit\n\n\ndef non_continuable_reason(path: str, body: Any, cfg: \"Config\"\
-    ) -> str | None:\n    \"\"\"Why a request cannot be resumed from its emitted tokens\
-    \ (None = it can). Mirrors\n    the gateway plugin's treNonContinuable (pkg/plugins/gateway/tre_transparent_sleep.go),\n\
-    \    which makes the service-manager drain such requests instead of aborting them.\"\
-    \"\"\n    if path not in (cfg.completions_path, cfg.chat_path):\n        return\
-    \ \"endpoint\"\n    if not isinstance(body, dict):\n        return \"body\"\n\
-    \    if _num_above(body.get(\"n\"), 1) or _num_above(body.get(\"best_of\"), 1):\n\
-    \        return \"n\"\n    logprobs = body.get(\"logprobs\")\n    if _present(logprobs)\
+    \ > limit\n\n\ndef _reject_constant(name: str) -> Any:\n    raise ValueError(f\"\
+    non-standard JSON constant {name}\")\n\n\ndef parse_body(raw: bytes) -> Any:\n\
+    \    \"\"\"The request body as JSON, or None when it is not strict JSON (NaN /\
+    \ Infinity are\n    rejected, as the gateway's parser does).\"\"\"\n    try:\n\
+    \        return json.loads(raw, parse_constant=_reject_constant)\n    except ValueError:\n\
+    \        return None\n\n\ndef non_continuable_reason(path: str, body: Any, cfg:\
+    \ \"Config\") -> str | None:\n    \"\"\"Why a request cannot be resumed from its\
+    \ emitted tokens (None = it can). The same\n    rules and reason strings as the\
+    \ gateway plugin's treNonContinuableReason\n    (pkg/plugins/gateway/tre_transparent_sleep.go),\
+    \ which makes the service-manager drain\n    such requests instead of aborting\
+    \ them; both are checked against the shared contract\n    tre/reissue/contract/non_continuable_cases.json.\
+    \ ``path`` excludes the query string\n    and ``body`` is :func:`parse_body` of\
+    \ the raw request body.\"\"\"\n    if path not in (cfg.completions_path, cfg.chat_path):\n\
+    \        return \"endpoint\"\n    if not isinstance(body, dict):\n        return\
+    \ \"body\"\n    if _num_above(body.get(\"n\"), 1) or _num_above(body.get(\"best_of\"\
+    ), 1):\n        return \"n\"\n    logprobs = body.get(\"logprobs\")\n    if _present(logprobs)\
     \ and logprobs is not False:\n        return \"logprobs\"\n    if _num_above(body.get(\"\
     top_logprobs\"), 0) or _present(body.get(\"prompt_logprobs\")):\n        return\
     \ \"logprobs\"\n    if body.get(\"echo\") is True:\n        return \"echo\"\n\
@@ -641,8 +649,7 @@ data:
     \        if self.state.active:\n            return await self._retry(request,\
     \ raw, depth, \"local_sleeping\")\n        body: Any = None\n        generation\
     \ = path in (cfg.completions_path, cfg.chat_path)\n        if generation:\n  \
-    \          try:\n                body = json.loads(raw)\n            except ValueError:\n\
-    \                body = None\n        nc_reason = non_continuable_reason(path,\
+    \          body = parse_body(raw)\n        nc_reason = non_continuable_reason(path,\
     \ body, cfg) if generation else \"endpoint\"\n        epoch = self.state.epoch\n\
     \        headers = forward_headers(request.headers, self._local_drop)\n      \
     \  added.forwarded()\n        try:\n            resp = await self.local.request(\n\

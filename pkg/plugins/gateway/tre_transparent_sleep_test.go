@@ -17,10 +17,13 @@ limitations under the License.
 package gateway
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"io"
+	"os"
+	"path/filepath"
 	"strconv"
 	"sync"
 	"testing"
@@ -578,56 +581,56 @@ func TestTRECommit_RaceWithHideReroutes(t *testing.T) {
 // ---------------------------------------------------------------------------------------
 // item 3b: non_continuable classification
 
-func TestTRENonContinuable(t *testing.T) {
-	cases := []struct {
-		path, body string
-		want       bool
-	}{
-		{PathCompletions, `{"prompt":"x"}`, false},
-		{PathCompletions, `{"prompt":"x","n":1,"best_of":1,"logprobs":null,"echo":false}`, false},
-		{PathCompletions, `{"prompt":"x","n":2}`, true},
-		{PathCompletions, `{"prompt":"x","best_of":3}`, true},
-		{PathCompletions, `{"prompt":"x","logprobs":0}`, true},
-		{PathCompletions, `{"prompt":"x","logprobs":5}`, true},
-		{PathCompletions, `{"prompt":"x","echo":true}`, true},
-		{PathCompletions, `{"prompt":"x","prompt_logprobs":1}`, true},
-		{PathCompletions, `{"prompt":"x","use_beam_search":true}`, true},
-		{PathCompletions, `{"prompt":"x","n":"two"}`, true},
-		{PathChatCompletions, `{"messages":[]}`, false},
-		{PathChatCompletions, `{"messages":[],"logprobs":false,"top_logprobs":0}`, false},
-		{PathChatCompletions, `{"messages":[],"logprobs":true}`, true},
-		{PathChatCompletions, `{"messages":[],"top_logprobs":2}`, true},
-		{PathChatCompletions, `{"messages":[],"tools":[{"type":"function"}]}`, true}, // non-streaming tool calls too
-		{PathChatCompletions, `{"messages":[],"tools":[{"type":"function"}],"tool_choice":"none"}`, false},
-		{PathChatCompletions, `{"messages":[],"tool_choice":"auto"}`, false},
-		{PathChatCompletions, `{"messages":[],"tool_choice":{"type":"function","function":{"name":"f"}}}`, true},
-		{PathChatCompletions, `{"messages":[],"functions":[{"name":"f"}],"function_call":"none"}`, false},
-		{PathChatCompletions, `{"messages":[],"response_format":{"type":"text"}}`, false},
-		{PathChatCompletions, `{"messages":[],"response_format":{"type":"json_object"}}`, true},
-		{PathChatCompletions, `{"messages":[],"response_format":{"type":"json_schema","json_schema":{"name":"x","schema":{}}}}`, true},
-		{PathChatCompletions, `{"messages":[],"response_format":"weird"}`, true},
-		{PathCompletions, `{"prompt":"x","guided_json":{"type":"object"}}`, true},
-		{PathCompletions, `{"prompt":"x","guided_regex":"a+"}`, true},
-		{PathCompletions, `{"prompt":"x","guided_choice":["a","b"]}`, true},
-		{PathCompletions, `{"prompt":"x","guided_grammar":"root ::= \"a\""}`, true},
-		{PathCompletions, `{"prompt":"x","guided_json_object":true}`, true},
-		{PathCompletions, `{"prompt":"x","guided_json_object":false,"guided_regex":null}`, false},
-		{PathChatCompletions, `{"messages":[],"structured_outputs":{"json":{"type":"object"}}}`, true},
-		{PathChatCompletions, `{"messages":[],"structural_tag":"{}"}`, true},
-		{PathCompletions, `{"prompt":"x","seed":1,"presence_penalty":0.5,"repetition_penalty":1.1}`, false}, // documented drift, not drained
-		{PathChatCompletions, `{"messages":[],"stream":true,"tools":[{"type":"function"}]}`, true},
-		{PathChatCompletions, `{"messages":[],"stream":true,"tools":[]}`, false},
-		{PathChatCompletions, `{"messages":[],"stream":true,"tool_choice":"none"}`, false},
-		{PathChatCompletions, `{"messages":[],"stream":true,"tool_choice":"required"}`, true},
-		{PathChatCompletions, `{"messages":[],"stream":true,"functions":[{"name":"f"}]}`, true},
-		{PathChatCompletions, `not json`, true},
-		{PathEmbeddings, `{"input":"x"}`, true},
-		{PathResponses, `{"input":"x"}`, true},
-		{PathMessages, `{"messages":[]}`, true},
+// treNonContinuableContract is shared with the reissue sidecar's test_non_continuable_contract
+// (tre/reissue/tests/test_reissue_sidecar.py): one list of cases, two implementations. The
+// path is relative to this package directory (go test runs in it).
+var treNonContinuableContract = filepath.Join("..", "..", "..", "tre", "reissue", "contract", "non_continuable_cases.json")
+
+type treNCContractCase struct {
+	Name    string          `json:"name"`
+	Path    string          `json:"path"`
+	Body    json.RawMessage `json:"body"`
+	BodyRaw *string         `json:"body_raw"`
+	Want    bool            `json:"want"`
+	Reason  *string         `json:"reason"`
+}
+
+func TestTRENonContinuableContract(t *testing.T) {
+	data, err := os.ReadFile(treNonContinuableContract)
+	require.NoError(t, err)
+	var contract struct {
+		Description string              `json:"description"`
+		Cases       []treNCContractCase `json:"cases"`
 	}
-	for _, c := range cases {
-		assert.Equal(t, c.want, treNonContinuable(c.path, []byte(c.body)), "%s %s", c.path, c.body)
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	require.NoError(t, dec.Decode(&contract))
+	require.GreaterOrEqual(t, len(contract.Cases), 40)
+
+	reasons := map[string]bool{}
+	for _, c := range contract.Cases {
+		t.Run(c.Name, func(t *testing.T) {
+			require.True(t, (c.BodyRaw == nil) != (c.Body == nil), "exactly one of body / body_raw")
+			body := []byte(c.Body)
+			if c.BodyRaw != nil {
+				body = []byte(*c.BodyRaw)
+			}
+			want := ""
+			if c.Reason != nil {
+				want = *c.Reason
+				reasons[want] = true
+			}
+			assert.Equal(t, c.Want, want != "", "want and reason disagree")
+			assert.Equal(t, want, treNonContinuableReason(c.Path, body))
+			assert.Equal(t, c.Want, treNonContinuable(c.Path, body))
+		})
 	}
+	all := []string{treNCEndpoint, treNCBody, treNCN, treNCLogprobs, treNCEcho, treNCBeamSearch,
+		treNCTools, treNCStructuredOutput, treNCPromptForm}
+	for _, r := range all {
+		assert.True(t, reasons[r], "no contract case for reason %q", r)
+	}
+	assert.Len(t, reasons, len(all), "contract uses a reason the gateway does not know")
 }
 
 // ---------------------------------------------------------------------------------------

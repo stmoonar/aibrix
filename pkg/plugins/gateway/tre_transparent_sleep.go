@@ -295,96 +295,204 @@ func mergeTREExcludeHeader(prev, next string) string {
 	return prev + "," + next
 }
 
-// treSamplingFields are the request fields that make a generation impossible to resume
-// exactly from its already-emitted tokens (D6).
-type treSamplingFields struct {
-	N              json.RawMessage `json:"n"`
-	BestOf         json.RawMessage `json:"best_of"`
-	Logprobs       json.RawMessage `json:"logprobs"`
-	TopLogprobs    json.RawMessage `json:"top_logprobs"`
-	PromptLogprobs json.RawMessage `json:"prompt_logprobs"`
-	Echo           json.RawMessage `json:"echo"`
-	UseBeamSearch  json.RawMessage `json:"use_beam_search"`
-	Tools          json.RawMessage `json:"tools"`
-	Functions      json.RawMessage `json:"functions"`
-	ToolChoice     json.RawMessage `json:"tool_choice"`
-	FunctionCall   json.RawMessage `json:"function_call"`
-	// structured output / guided decoding: the grammar state at the seam is not
-	// reconstructible from the emitted tokens by a plain continuation request.
-	ResponseFormat    json.RawMessage `json:"response_format"`
-	GuidedJSON        json.RawMessage `json:"guided_json"`
-	GuidedRegex       json.RawMessage `json:"guided_regex"`
-	GuidedChoice      json.RawMessage `json:"guided_choice"`
-	GuidedGrammar     json.RawMessage `json:"guided_grammar"`
-	GuidedJSONObject  json.RawMessage `json:"guided_json_object"`
-	StructuralTag     json.RawMessage `json:"structural_tag"`
-	StructuredOutputs json.RawMessage `json:"structured_outputs"`
-}
+// Reasons a request cannot be resumed from its already-emitted tokens (D6). They are the
+// same strings the reissue sidecar uses (non_continuable_reason in
+// tre/reissue/tre_reissue/sidecar.py); both implementations are checked against the shared
+// contract tre/reissue/contract/non_continuable_cases.json.
+const (
+	treNCEndpoint         = "endpoint"          // only completions and chat completions have a continuation path
+	treNCBody             = "body"              // not a JSON object
+	treNCN                = "n"                 // n>1 / best_of>1
+	treNCLogprobs         = "logprobs"          // any logprobs output
+	treNCEcho             = "echo"              // echo
+	treNCBeamSearch       = "beam_search"       // use_beam_search
+	treNCTools            = "tools"             // tool / function calling possible
+	treNCStructuredOutput = "structured_output" // grammar state at the seam is not reconstructible
+	treNCPromptForm       = "prompt_form"       // batched / embedded prompt, suffix, no messages
+)
 
 // treNonContinuable reports whether a request cannot be continued after an abort and must
-// therefore be drained: n>1, best_of>1, any logprobs output, echo, beam search, tool or
-// function calling (streaming or not), structured output / guided decoding, and every
-// non-generation endpoint (only completions and chat completions have a continuation
-// path). Unparseable fields count as non-continuable.
+// therefore be drained (see treNonContinuableReason).
 func treNonContinuable(requestPath string, body []byte) bool {
-	if requestPath != PathCompletions && requestPath != PathChatCompletions {
-		return true
+	return treNonContinuableReason(requestPath, body) != ""
+}
+
+// treNonContinuableReason is why a request cannot be continued after an abort ("" = it
+// can): n>1, best_of>1, any logprobs output, echo, beam search, tool or function calling
+// (streaming or not), structured output / guided decoding, a prompt form the continuation
+// cannot extend (completions: suffix, prompt_embeds, a batch or anything but one string /
+// one token-id list; chat: messages missing or empty), and every non-generation endpoint.
+// requestPath is the raw :path; the query string is ignored. Field names match exactly
+// (no case folding) and unparseable fields count as non-continuable.
+func treNonContinuableReason(requestPath string, body []byte) string {
+	path := requestPath
+	if i := strings.IndexByte(path, '?'); i >= 0 {
+		path = path[:i]
 	}
-	var f treSamplingFields
-	if err := sonic.Unmarshal(body, &f); err != nil {
-		return true
+	if path != PathCompletions && path != PathChatCompletions {
+		return treNCEndpoint
 	}
-	if rawNumberAbove(f.N, 1) || rawNumberAbove(f.BestOf, 1) {
-		return true
+	f, ok := rawObject(body)
+	if !ok {
+		return treNCBody
+	}
+	if rawNumberAbove(f["n"], 1) || rawNumberAbove(f["best_of"], 1) {
+		return treNCN
 	}
 	// logprobs: completions int (0 still returns logprobs), chat bool.
-	if rawPresent(f.Logprobs) && !rawIs(f.Logprobs, "false") {
-		return true
+	if rawPresent(f["logprobs"]) && !rawIs(f["logprobs"], "false") {
+		return treNCLogprobs
 	}
-	if rawNumberAbove(f.TopLogprobs, 0) || rawPresent(f.PromptLogprobs) {
-		return true
+	if rawNumberAbove(f["top_logprobs"], 0) || rawPresent(f["prompt_logprobs"]) {
+		return treNCLogprobs
 	}
-	if rawIs(f.Echo, "true") || rawIs(f.UseBeamSearch, "true") {
-		return true
+	if rawIs(f["echo"], "true") {
+		return treNCEcho
+	}
+	if rawIs(f["use_beam_search"], "true") {
+		return treNCBeamSearch
 	}
 	if treToolCallsPossible(f) {
-		return true
+		return treNCTools
 	}
-	return treStructuredOutput(f)
+	if treStructuredOutput(f) {
+		return treNCStructuredOutput
+	}
+	if path == PathCompletions {
+		return treCompletionPromptForm(f)
+	}
+	if items, ok := rawArray(f["messages"]); ok && len(items) > 0 {
+		return ""
+	}
+	return treNCPromptForm
 }
 
 // treToolCallsPossible: tools/functions offered and not switched off with "none", or a
 // tool/function choice other than none/auto (which forces a call).
-func treToolCallsPossible(f treSamplingFields) bool {
-	offered := rawNonEmptyArray(f.Tools) || rawNonEmptyArray(f.Functions)
-	choice := f.ToolChoice
+func treToolCallsPossible(f map[string]json.RawMessage) bool {
+	offered := rawNonEmptyArray(f["tools"]) || rawNonEmptyArray(f["functions"])
+	choice := f["tool_choice"]
 	if !rawPresent(choice) {
-		choice = f.FunctionCall
+		choice = f["function_call"]
 	}
-	if rawIs(choice, `"none"`) {
+	if rawStringIs(choice, "none") {
 		return false
 	}
 	if offered {
 		return true
 	}
-	return rawPresent(choice) && !rawIs(choice, `"auto"`)
+	return rawPresent(choice) && !rawStringIs(choice, "auto")
 }
 
-func treStructuredOutput(f treSamplingFields) bool {
-	if rawPresent(f.ResponseFormat) {
-		var rf struct {
-			Type string `json:"type"`
+// treStructuredOutput: structured output / guided decoding; the grammar state at the seam
+// is not reconstructible from the emitted tokens by a plain continuation request.
+func treStructuredOutput(f map[string]json.RawMessage) bool {
+	if rf := f["response_format"]; rawPresent(rf) {
+		obj, ok := rawObject(rf)
+		if !ok {
+			return true
 		}
-		if err := sonic.Unmarshal(f.ResponseFormat, &rf); err != nil || (rf.Type != "" && rf.Type != "text") {
+		if t := obj["type"]; rawPresent(t) && !rawStringIs(t, "") && !rawStringIs(t, "text") {
 			return true
 		}
 	}
-	for _, r := range []json.RawMessage{f.GuidedJSON, f.GuidedRegex, f.GuidedChoice, f.GuidedGrammar, f.StructuralTag, f.StructuredOutputs} {
-		if rawPresent(r) {
+	for _, k := range []string{"guided_json", "guided_regex", "guided_choice", "guided_grammar", "structural_tag", "structured_outputs"} {
+		if rawPresent(f[k]) {
 			return true
 		}
 	}
-	return rawPresent(f.GuidedJSONObject) && !rawIs(f.GuidedJSONObject, "false")
+	return rawPresent(f["guided_json_object"]) && !rawIs(f["guided_json_object"], "false")
+}
+
+// treCompletionPromptForm: a completion is continued by appending the emitted token ids to
+// ONE prompt, so the prompt must be a string, a non-empty token-id list, or a one-element
+// batch holding a string or a list; suffix and prompt_embeds cannot be extended.
+func treCompletionPromptForm(f map[string]json.RawMessage) string {
+	if rawPresent(f["prompt_embeds"]) || rawPresent(f["suffix"]) {
+		return treNCPromptForm
+	}
+	prompt := f["prompt"]
+	if rawKind(prompt) == '"' {
+		return ""
+	}
+	items, ok := rawArray(prompt)
+	if !ok || len(items) == 0 {
+		return treNCPromptForm
+	}
+	allInts := true
+	for _, it := range items {
+		if !rawInteger(it) {
+			allInts = false
+			break
+		}
+	}
+	if allInts {
+		return ""
+	}
+	if len(items) == 1 {
+		if k := rawKind(items[0]); k == '"' || k == '[' {
+			return ""
+		}
+	}
+	return treNCPromptForm
+}
+
+// rawKind is the first non-space byte of a raw JSON value (0 when empty).
+func rawKind(r json.RawMessage) byte {
+	s := strings.TrimSpace(string(r))
+	if s == "" {
+		return 0
+	}
+	return s[0]
+}
+
+// rawObject decodes a JSON object with exact-case keys; ok=false for anything else.
+func rawObject(r []byte) (map[string]json.RawMessage, bool) {
+	if rawKind(r) != '{' {
+		return nil, false
+	}
+	var m map[string]json.RawMessage
+	if err := sonic.Unmarshal(r, &m); err != nil {
+		return nil, false
+	}
+	return m, true
+}
+
+// rawArray decodes a JSON array; ok=false for anything else (absent and null included).
+func rawArray(r json.RawMessage) ([]json.RawMessage, bool) {
+	if rawKind(r) != '[' {
+		return nil, false
+	}
+	var items []json.RawMessage
+	if err := sonic.Unmarshal(r, &items); err != nil {
+		return nil, false
+	}
+	return items, true
+}
+
+// rawInteger: a JSON integer literal (what Python's json decodes to int; 1.0 and 1e2 are
+// floats there and do not count).
+func rawInteger(r json.RawMessage) bool {
+	s := strings.TrimSpace(string(r))
+	s = strings.TrimPrefix(s, "-")
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// rawStringIs: a JSON string whose decoded value is want (escapes resolved).
+func rawStringIs(r json.RawMessage, want string) bool {
+	if rawKind(r) != '"' {
+		return false
+	}
+	var s string
+	return sonic.Unmarshal(r, &s) == nil && s == want
 }
 
 func rawPresent(r json.RawMessage) bool {
