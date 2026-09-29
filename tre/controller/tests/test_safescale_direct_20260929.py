@@ -12,6 +12,7 @@ import asyncio
 import json
 import math
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -128,6 +129,21 @@ class SimScraper:
         return out
 
 
+class FullEvidence(FakeEvidence):
+    """Redis evidence with docs of every remaining pod up to the window end (the
+    completeness a fallback commit needs, review F2)."""
+
+    def __init__(self, windows=(), *, anchor=None, pods=("m-0", "m-2")) -> None:
+        super().__init__(windows, anchor=anchor)
+        self.pods = tuple(pods)
+
+    def read(self, model, *, start_ms, end_ms, exclude_pods):
+        window = super().read(model, start_ms=start_ms, end_ms=end_ms, exclude_pods=exclude_pods)
+        first = min(window.first_doc_ts_ms.values()) if window.first_doc_ts_ms else start_ms
+        return replace(window, pods=self.pods, first_doc_ts_ms={pod: first for pod in self.pods},
+                       last_doc_ts_ms={pod: end_ms for pod in self.pods})
+
+
 class RaisingEvidence(FakeEvidence):
     def read(self, model, *, start_ms, end_ms, exclude_pods):
         raise ConnectionError("redis down")
@@ -155,7 +171,8 @@ class Harness:
         self.clock = Clock(START)
         self.sims = {pod: PodSim() for pod in pods}
         self.failing: dict[str, str] = {}
-        self.evidence = evidence if evidence is not None else FakeEvidence([_window(50)], anchor=_anchor())
+        self.evidence = evidence if evidence is not None else FullEvidence([_window(50)], anchor=_anchor(),
+                                                                          pods=pods)
         self.store = store
         self.machine = self._machine(cfg)
         self.cfg = cfg
@@ -294,7 +311,9 @@ def test_at_the_ceiling_traffic_skips_latency_and_idle_commits() -> None:
 
 
 # ============================================================ immediate rollback (D)
-@pytest.mark.parametrize("per_pod_per_tick, rollback_after_ms", [(8, 4_000), (20, 2_000)])
+# 8 per pod per tick: each pod is below the per-pod minimum (10) at the first poll, but
+# the pooled p95 (24 requests) already judges it (review F1).
+@pytest.mark.parametrize("per_pod_per_tick, rollback_after_ms", [(8, 2_000), (20, 2_000)])
 def test_a_violation_rolls_back_within_2_to_4_s_at_7b_load(per_pod_per_tick, rollback_after_ms) -> None:
     # 3 remaining pods at 4 / 10 req/s each (the 7b load range); TTFT 2 s > 500 ms.
     # Per-pod p95 needs TRE_MIN_LATENCY_SAMPLES (10) requests of that pod.
@@ -364,7 +383,9 @@ def test_a_pod_whose_scrapes_keep_failing_never_lets_a_subset_commit() -> None:
     assert decision.details["evidence_source_used"] == "redis_fallback"
     assert decision.details["direct_fallback"]["reason"] == "pods_missing"
     assert decision.details["direct_fallback"]["detail"] == {"m-2": "no_data:timeout"}
+    assert decision.details["direct_fallback"]["required_pods"] == ["m-0", "m-2"]
     assert decision.details["latency_source"] == "evidence"  # the gateway docs judged it
+    assert decision.details["evidence_pods"] == ["m-0", "m-2"]  # m-2 included
 
 
 def test_a_counter_reset_keeps_the_pod_from_zero_and_the_commit_goes_to_redis() -> None:

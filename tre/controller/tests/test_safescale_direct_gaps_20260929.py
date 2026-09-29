@@ -18,6 +18,7 @@ import time
 
 import pytest
 import yaml
+from dataclasses import replace
 
 from tre_common.registry import SafeScaleRegistryConfig, parse_safescale_config
 from tre_controller.config import ControllerConfig
@@ -38,6 +39,7 @@ from test_safescale_direct_20260929 import (
     TRE_DIR,
     W,
     FakeEvidence,
+    FullEvidence,
     Harness,
     PodSim,
     _anchor,
@@ -48,8 +50,8 @@ from test_safescale_direct_20260929 import (
 
 
 def _violating_redis() -> FakeEvidence:
-    """Redis evidence that sees the violation the direct window lost."""
-    return FakeEvidence([_window(50, ttft=2_000.0)], anchor=_anchor())
+    """Redis evidence (every remaining pod) that sees the violation the direct window lost."""
+    return FullEvidence([_window(50, ttft=2_000.0)], anchor=_anchor())
 
 
 # ============================================================ reproductions
@@ -389,3 +391,88 @@ def test_a_pending_pod_that_falls_asleep_is_late_not_silently_dropped() -> None:
     assert at == HIDE + W and decision.status == "rollback"
     assert decision.details["direct_fallback"]["reason"] == "late_baseline"
     assert decision.details["direct_fallback"]["detail"]["m-2"]["cause"] == "asleep_before_baseline"
+
+
+# ============================================================ review 2, F1: pooled p95
+def test_an_overloaded_pod_below_the_per_pod_minimum_still_weighs_in() -> None:
+    # m-0 serves 50 fast; overloaded m-2 completes only 9 (< TRE_MIN_LATENCY_SAMPLES 10)
+    # at 10 s: its own p95 is undefined, the per-pod maximum sees m-0 only.
+    h = Harness()
+    h.start()
+    h.sims["m-0"].serve(50, ttft_s=0.05)
+    h.sims["m-2"].serve(9, ttft_s=10.0)
+    decision = h.tick(HIDE + 2_000)
+    assert decision.status == "rollback"
+    assert decision.details["rollback_reason"]["code"] == "slo_violation_direct"
+    assert decision.details["rollback_reason"]["ttft_p95_ms"] == pytest.approx(10_000.0)
+    assert decision.details["evidence_pooled_ttft_p95_ms"] == pytest.approx(10_000.0)
+    assert decision.details["latency_samples_judged"] == 59
+
+
+def test_the_redis_reader_pools_the_pods_too() -> None:
+    from test_safescale_evidence_20260929 import DocRedis
+    from test_safescale_evidence_20260929 import _reader as evidence_reader
+
+    redis = DocRedis()
+    for ts, fast, slow in ((110_000, 0, 0), (120_000, 40, 5), (130_000, 80, 9)):
+        redis.add("m-0", ts, fast=fast, slow=0, prompt=float(fast))
+        redis.add("m-3", ts, fast=0, slow=slow, prompt=float(slow))
+    window = evidence_reader(redis).read(MODEL, start_ms=110_000, end_ms=130_000, exclude_pods=("m-1",))
+    assert window.pods == ("m-0", "m-3") and window.ttft_count == 89
+    assert window.pooled_ttft_p95_ms == 5_000.0 and window.ttft_p95_ms == 5_000.0  # m-3 alone has none
+    assert window.judged == 89
+    assert window.last_doc_ts_ms == {"m-0": 130_000, "m-3": 130_000}
+
+
+def test_pooled_p95_rule() -> None:
+    from tre_common.window_pods import pooled_p95_ms
+
+    fast = ((0.1, 50.0), (5.0, 50.0), (float("inf"), 50.0))
+    slow = ((0.1, 0.0), (5.0, 9.0), (float("inf"), 9.0))
+    assert pooled_p95_ms([(fast, 50.0), (slow, 9.0)], ("bucket_upper", 10)) == 5_000.0
+    assert pooled_p95_ms([(slow, 9.0)], ("bucket_upper", 10)) is None  # gate on the pooled count
+    assert pooled_p95_ms([(None, 0.0)], ("bucket_upper", 0)) is None
+    beyond = ((0.1, 0.0), (5.0, 0.0), (float("inf"), 20.0))
+    assert pooled_p95_ms([(beyond, 20.0)], ("bucket_upper", 0)) == 5_000.0  # +Inf -> largest finite
+
+
+# ============================================================ review 2, F2: Redis completeness
+def test_a_ceiling_fallback_never_commits_on_redis_evidence_missing_a_remaining_pod() -> None:
+    partial = FullEvidence([_window(50)], anchor=_anchor(), pods=("m-0",))  # gateway docs of m-0 only
+    h = Harness(evidence=partial, window_ceiling_ms=float(W))
+    h.start()
+    h.run_until(HIDE + W - 2_000, serve=5)
+    h.failing["m-2"] = "timeout"
+    decision = h.tick(HIDE + W, serve=5)
+    assert decision.status == "rollback"
+    assert decision.details["rollback_reason"]["code"] == "evidence_incomplete"
+    assert decision.details["rollback_reason"]["pods"] == {"m-2": "no_docs"}
+    assert decision.details["direct_fallback"]["required_pods"] == ["m-0", "m-2"]
+
+
+def test_redis_docs_of_a_remaining_pod_ending_early_do_not_commit() -> None:
+    class EarlyEnd(FullEvidence):
+        def read(self, model, *, start_ms, end_ms, exclude_pods):
+            window = super().read(model, start_ms=start_ms, end_ms=end_ms, exclude_pods=exclude_pods)
+            return replace(window, last_doc_ts_ms={**window.last_doc_ts_ms, "m-2": end_ms - 10_000})
+
+    h = Harness(evidence=EarlyEnd([_window(50)], anchor=_anchor()), window_ceiling_ms=float(W))
+    h.start()
+    h.run_until(HIDE + W - 2_000, serve=5)
+    h.failing["m-2"] = "timeout"
+    decision = h.tick(HIDE + W, serve=5)
+    assert decision.status == "rollback"
+    assert decision.details["rollback_reason"]["pods"] == {"m-2": "docs_end:110000"}
+
+
+def test_a_late_fallback_below_the_ceiling_extends_while_the_redis_evidence_is_incomplete() -> None:
+    partial = FullEvidence([_window(50)], anchor=_anchor(), pods=("m-0",))
+    h = Harness(evidence=partial)
+    h.failing["m-2"] = "timeout"
+    h.start()
+    del h.failing["m-2"]
+    decisions = h.run_until(HIDE + W, serve=5)
+    at, decision = decisions[-1]
+    assert at == HIDE + W and decision.status == "probing"
+    assert decision.reason == "evidence_extended" and decision.details["extend_reason"] == "evidence_incomplete"
+    assert decision.details["evidence_incomplete_pods"] == {"m-2": "no_docs"}

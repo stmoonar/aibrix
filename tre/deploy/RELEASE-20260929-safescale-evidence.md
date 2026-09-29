@@ -61,9 +61,12 @@ is now `safescale.evidence_source: redis` and the per-probe fallback of `direct`
   (`direct_fallback.reason = late_baseline`, `detail` = the late pods).
 - **Poll.** Every `evidence_poll_s` (2 s) the baseline pods are scraped again and
   differenced: per pod TTFT / TPOT p95 (`TRE_PERCENTILE_MODE`, per-pod minimum
-  `TRE_MIN_LATENCY_SAMPLES`), model p95 = max over the pods, `n` = TTFT count,
-  `n_judged` = TTFT count of the pods with a p95, `L` = prompt tokens / requests (labels
-  thresholds). Requests completed before the baseline are never in it (requests already
+  `TRE_MIN_LATENCY_SAMPLES`), model p95 = max over the pods AND the pooled p95 (the
+  pods' delta histograms merged first, the minimum applied to the merged count: an
+  overloaded pod that completes fewer requests than the per-pod minimum still weighs in;
+  `evidence_pooled_ttft_p95_ms` / `_tpot_`), `n` = TTFT count, `n_judged` = TTFT count of
+  the pods with a p95 (every request once the pooled p95 exists), `L` = prompt tokens /
+  requests (labels thresholds). The Redis evidence reader applies the same pooled rule. Requests completed before the baseline are never in it (requests already
   running on a remaining pod at the hide that finish later are, as on the Redis path).
 - **Immediate rollback (D).** Any poll with `n_judged >= min_commit_samples` and a p95
   above the threshold rolls back at once (`rollback_reason.code = slo_violation_direct`,
@@ -108,8 +111,15 @@ is now `safescale.evidence_source: redis` and the per-probe fallback of `direct`
   below, clock assertions included. Redis evidence unreadable too -> rollback
   `evidence_unavailable` (fail-closed). A p95 in the `+Inf` bucket is reported as the
   largest finite bucket bound (records stay strict JSON).
+- **Redis completeness after a fallback.** The fallback records the remaining pods the
+  direct path knew (`direct_fallback.required_pods`: live, pending and late pods). The
+  Redis evidence must hold a TTFT delta of every one of them whose last doc is stamped at
+  the evidence end `E`; otherwise the probe does not commit: `extend_reason =
+  evidence_incomplete` while it can extend, rollback `evidence_incomplete` (`pods`: pod ->
+  `no_docs` / `no_ttft_histogram` / `docs_end:<stamp>`) at the ceiling. A judged
+  violation still rolls back first. Audit: `evidence_incomplete_pods`.
 - **Redis path at the ceiling (unchanged semantics).** A probe that fell back is judged
-  by the 687cbd9c rules. In particular: when the fallback happens with the deadline
+  by the 687cbd9c rules (plus the completeness rule above). In particular: when the fallback happens with the deadline
   already at the ceiling (`W_max`) and the Redis evidence of the remaining pods has
   fewer than `min_commit_samples` judged requests, the latency gate is skipped
   (`latency_gate = skipped`, `latency_skip_reason` `insufficient_samples` /

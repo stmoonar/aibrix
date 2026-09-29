@@ -35,6 +35,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Collection, Mapping, Protocol
 
 from tre_common.rediskeys import hist_key, pods_key
+from tre_common.window_pods import pooled_p95_ms
 
 LOG = logging.getLogger("tre_controller.safescale")
 
@@ -139,6 +140,12 @@ class EvidenceWindow:
     #: TTFT count of the pods whose p95 is defined (the requests the p95 judges).
     #: None = same as ttft_count.
     judged_count: float | None = None
+    #: pod -> stamp (ms) of the last histogram doc its TTFT delta ends at.
+    last_doc_ts_ms: dict[str, int] = field(default_factory=dict)
+    #: p95 of the remaining pods' histograms pooled first (per-pod minimum not applied
+    #: per pod, but to the pooled count); already folded into ttft/tpot_p95_ms (max).
+    pooled_ttft_p95_ms: float | None = None
+    pooled_tpot_p95_ms: float | None = None
 
     @property
     def mean_prompt_tokens(self) -> float | None:
@@ -227,18 +234,38 @@ class MetricsEvidenceReader:
             for pod in pods.values()
             if pod.ttft_p95_ms is not None or pod.tpot_p95_ms is not None
         )
+        last_docs = {
+            str(getattr(pod, "pod", key)): int(pod.hist_last_ts_ms)
+            for key, pod in pods.items()
+            if getattr(pod, "hist_last_ts_ms", None) is not None
+        }
+        # Pooled p95 next to the per-pod maximum: a pod below the per-pod minimum
+        # samples (an overloaded pod completes few requests) still weighs in.
+        rule = getattr(self._store, "p95_rule", None) or ("bucket_upper", 0)
+        pooled_ttft = pooled_p95_ms(
+            ((getattr(pod, "ttft_hist", None), getattr(pod, "ttft_hist_count", None)) for pod in pods.values()), rule
+        )
+        pooled_tpot = pooled_p95_ms(
+            ((getattr(pod, "tpot_hist", None), getattr(pod, "tpot_hist_count", None)) for pod in pods.values()), rule
+        )
+        total = float(sum(float(getattr(pod, "ttft_count", None) or 0.0) for pod in pods.values()))
+        if pooled_ttft is not None or pooled_tpot is not None:
+            judged = total  # every request is in the pooled p95
         return EvidenceWindow(
             start_ms=int(start_ms),
             end_ms=int(end_ms),
             pods=tuple(sorted(str(getattr(pod, "pod", key)) for key, pod in pods.items())),
             excluded_pods=dropped,
-            ttft_p95_ms=_max_present(pod.ttft_p95_ms for pod in pods.values()),
-            tpot_p95_ms=_max_present(pod.tpot_p95_ms for pod in pods.values()),
-            ttft_count=float(sum(float(getattr(pod, "ttft_count", None) or 0.0) for pod in pods.values())),
+            ttft_p95_ms=_max_present([*(pod.ttft_p95_ms for pod in pods.values()), pooled_ttft]),
+            tpot_p95_ms=_max_present([*(pod.tpot_p95_ms for pod in pods.values()), pooled_tpot]),
+            ttft_count=total,
             prompt_tokens=_sum_present(getattr(pod, "prompt_tokens", None) for pod in pods.values()),
             prompt_count=_sum_present(getattr(pod, "request_count", None) for pod in pods.values()),
             first_doc_ts_ms=first_docs,
             judged_count=float(judged),
+            last_doc_ts_ms=last_docs,
+            pooled_ttft_p95_ms=pooled_ttft,
+            pooled_tpot_p95_ms=pooled_tpot,
         )
 
     def _now(self) -> tuple[int, str]:

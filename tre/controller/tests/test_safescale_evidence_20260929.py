@@ -677,13 +677,22 @@ def test_n_counts_only_the_pods_whose_p95_is_judged() -> None:
     assert partial.observe(MODEL, _obs(120_000), now_ms=120_000).reason == "evidence_extended"
 
 
-def test_reader_judged_count_excludes_pods_below_the_per_pod_minimum() -> None:
+def test_reader_judged_count_excludes_pods_below_the_per_pod_minimum_unless_pooled() -> None:
+    # 2026-09-29 review F1: the pooled p95 (per-pod minimum applied to the pooled count)
+    # judges every request, the pod below the per-pod minimum included.
     redis = DocRedis()
     for pod, fast in (("m-0", 6), ("m-3", 12)):
         redis.add(pod, 110_000, fast=0, slow=0, prompt=0.0)
         redis.add(pod, 120_000, fast=fast, slow=0, prompt=100.0 * fast)
     window = _reader(redis).read(MODEL, start_ms=110_000, end_ms=120_000, exclude_pods=())
-    assert (window.ttft_count, window.judged_count) == (18.0, 12.0)
+    assert (window.ttft_count, window.judged_count) == (18.0, 18.0)
+    assert window.pooled_ttft_p95_ms == 100.0
+    few = DocRedis()
+    for pod, fast in (("m-0", 3), ("m-3", 4)):  # 7 in all: below the minimum even pooled
+        few.add(pod, 110_000, fast=0, slow=0, prompt=0.0)
+        few.add(pod, 120_000, fast=fast, slow=0, prompt=100.0 * fast)
+    window = _reader(few).read(MODEL, start_ms=110_000, end_ms=120_000, exclude_pods=())
+    assert (window.ttft_count, window.judged_count, window.pooled_ttft_p95_ms) == (7.0, 0.0, None)
 
 
 def test_a_late_hide_moves_the_window_with_it() -> None:

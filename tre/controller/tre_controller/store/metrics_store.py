@@ -79,6 +79,11 @@ class MetricsStore:
     def histogram_lookback_ms(self) -> int:
         return self._histogram_lookback_ms
 
+    @property
+    def p95_rule(self) -> tuple[str, int]:
+        """(percentile mode, per-pod minimum latency samples) of this store."""
+        return (self._percentile_mode, int(self._min_latency_samples))
+
     def read_snapshot(
         self,
         window_start_ms: int,
@@ -312,6 +317,12 @@ class MetricsStore:
         e2e_hist, e2e_hist_count = self._hist_window_buckets(
             model, HISTOGRAM_METRICS["e2e"], hist_docs, window_start_ms
         )
+        ttft_hist, ttft_hist_count = self._hist_window_buckets(
+            model, HISTOGRAM_METRICS["ttft"], hist_docs, window_start_ms
+        )
+        tpot_hist, tpot_hist_count = self._hist_window_buckets(
+            model, HISTOGRAM_METRICS["tpot"], hist_docs, window_start_ms
+        )
 
         return PodWindowMetrics(
             pod=pod_name,
@@ -346,6 +357,11 @@ class MetricsStore:
             e2e_hist=e2e_hist,
             e2e_hist_count=e2e_hist_count,
             hist_first_ts_ms=_first_metric_doc_ts(model, HISTOGRAM_METRICS["ttft"], hist_docs),
+            hist_last_ts_ms=_last_metric_doc_ts(model, HISTOGRAM_METRICS["ttft"], hist_docs),
+            ttft_hist=ttft_hist,
+            ttft_hist_count=ttft_hist_count,
+            tpot_hist=tpot_hist,
+            tpot_hist_count=tpot_hist_count,
         )
 
     def _aggregate_model(
@@ -583,6 +599,14 @@ def _first_metric_doc_ts(model: str, metric: str, docs: list[dict[str, Any]]) ->
     """Timestamp of the first doc carrying ``metric`` - the doc ``_first_last_metric``
     takes the delta's baseline from (docs are sorted, baseline doc first)."""
     for doc in docs:
+        if _metric_entry(model, metric, doc) is not None and doc.get("timestamp") is not None:
+            return int(_number(doc.get("timestamp"), 0.0))
+    return None
+
+
+def _last_metric_doc_ts(model: str, metric: str, docs: list[dict[str, Any]]) -> int | None:
+    """Timestamp of the last doc carrying ``metric`` (the end of the delta)."""
+    for doc in reversed(docs):
         if _metric_entry(model, metric, doc) is not None and doc.get("timestamp") is not None:
             return int(_number(doc.get("timestamp"), 0.0))
     return None

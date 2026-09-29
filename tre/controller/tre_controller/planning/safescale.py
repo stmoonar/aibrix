@@ -531,6 +531,12 @@ class SafeScaleStateMachine:
         fallback: dict[str, Any] = {"reason": reason, "ts_ms": int(ts_ms)}
         if detail:
             fallback["detail"] = detail
+        # The remaining pods the direct path knew (live, pending, late - dropped
+        # sleepers included): the Redis evidence must cover every one of them to the
+        # end of its window, or the probe does not commit (2026-09-29 review F2).
+        required = sorted(set(state.live_pods()) | set(state.late))
+        if required:
+            fallback["required_pods"] = required
         LOG.warning(
             json.dumps(
                 {"event": "safescale_direct_fallback", "model": probe.model, "request_id": probe.request_id,
@@ -995,6 +1001,9 @@ class SafeScaleStateMachine:
         samples = float(evidence.ttft_count)
         judged = float(evidence.judged)
         mean_prompt = evidence.mean_prompt_tokens
+        incomplete = _evidence_incomplete(probe, evidence, end_ms=int(end))
+        if incomplete:
+            audit["evidence_incomplete_pods"] = incomplete
         thresholds = self._thresholds_for(model, mean_prompt)
         min_samples = int(getattr(cfg, "min_commit_samples", 20))
         audit.update(
@@ -1011,17 +1020,31 @@ class SafeScaleStateMachine:
         )
         if "fallback" in thresholds:
             audit["threshold_fallback"] = thresholds["fallback"]
+        audit.update(evidence_pooled_ttft_p95_ms=evidence.pooled_ttft_p95_ms,
+                     evidence_pooled_tpot_p95_ms=evidence.pooled_tpot_p95_ms)
         p95_available = evidence.ttft_p95_ms is not None or evidence.tpot_p95_ms is not None
-        # n counts only the pods whose p95 is judged (per-pod minimum samples, the
-        # snapshot rule): a pod below it neither decides the p95 nor fills the quota.
+        # n counts the requests the p95 judges: the pods whose own p95 is defined
+        # (per-pod minimum samples), or all of them once the pooled p95 exists.
         if min_samples <= 0 or (judged >= min_samples and p95_available):
             violations = []
             if evidence.ttft_p95_ms is not None and evidence.ttft_p95_ms > thresholds["ttft_ms"]:
                 violations.append("ttft")
             if evidence.tpot_p95_ms is not None and evidence.tpot_p95_ms > thresholds["tpot_ms"]:
                 violations.append("tpot")
+            if incomplete and not violations:
+                # A remaining pod of the direct path is not covered to the end of the
+                # window: no commit on the others (extend, else roll back).
+                if can_extend:
+                    return _EvidenceOutcome("extend", audit={**audit, "extend_reason": "evidence_incomplete"})
+                return _EvidenceOutcome("rollback", audit=audit, rollback_reason={
+                    "code": "evidence_incomplete", "pods": incomplete, "evidence_end_ms": int(end)})
             audit.update(latency_gate="evaluated", latency_violations=violations)
             return _EvidenceOutcome("judge", audit=audit, latency_ok=not violations)
+        if incomplete:
+            if can_extend:
+                return _EvidenceOutcome("extend", audit={**audit, "extend_reason": "evidence_incomplete"})
+            return _EvidenceOutcome("rollback", audit=audit, rollback_reason={
+                "code": "evidence_incomplete", "pods": incomplete, "evidence_end_ms": int(end)})
         # Too few requests at all, or enough but spread over pods below the per-pod
         # p95 minimum (no p95 to judge them by).
         short = "insufficient_samples" if samples < min_samples else "p95_unavailable"
@@ -1418,6 +1441,27 @@ def _direct_fresh_ms(config: SafeScaleConfig) -> float:
     delta is cumulative). Not at the deadline: a commit needs every live pod answered in
     the deciding poll (``_direct_outcome``)."""
     return 2.0 * _direct_poll_ms(config) + 1000.0 * float(getattr(config, "scrape_timeout_s", 1.0) or 1.0)
+
+
+def _evidence_incomplete(probe: SafeScaleProbe, evidence: EvidenceWindow, *, end_ms: int) -> dict[str, str]:
+    """Redis evidence of a probe that fell back from the direct path: every remaining
+    pod the direct path knew (``direct_fallback.required_pods``) must have a TTFT delta
+    in the window that ends at its end (a doc stamped >= ``end_ms``). pod -> why not;
+    {} = complete (or not a fallback probe)."""
+    fallback = probe.direct.fallback if probe.direct is not None else None
+    required = (fallback or {}).get("required_pods") or ()
+    missing: dict[str, str] = {}
+    present = set(evidence.pods)
+    for pod in required:
+        if pod not in present:
+            missing[pod] = "no_docs"
+        elif pod not in evidence.first_doc_ts_ms:
+            missing[pod] = "no_ttft_histogram"
+        else:
+            last = evidence.last_doc_ts_ms.get(pod)
+            if last is None or int(last) < int(end_ms):
+                missing[pod] = f"docs_end:{last}"
+    return missing
 
 
 def _hide_confirm_ms(probe: SafeScaleProbe) -> int | None:

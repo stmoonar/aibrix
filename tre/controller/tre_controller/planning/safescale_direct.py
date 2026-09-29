@@ -55,6 +55,7 @@ from typing import Any, Callable, Iterable, Mapping
 
 from tre_common.percentile import histogram_percentile
 from tre_common.vllm_metrics import vllm_candidates
+from tre_common.window_pods import pooled_p95_ms
 
 LOG = logging.getLogger("tre_controller.safescale")
 
@@ -321,6 +322,10 @@ class PodDelta:
     ttft_p95_ms: float | None
     tpot_p95_ms: float | None
     prompt: tuple[float, float] | None
+    #: The delta histograms (cumulative buckets) and counts, for the pooled p95.
+    ttft_hist: tuple[tuple[float, float], ...] = ()
+    tpot_hist: tuple[tuple[float, float], ...] = ()
+    tpot_n: float = 0.0
 
     def audit(self) -> dict[str, Any]:
         return {"n": self.n, "ttft_p95_ms": self.ttft_p95_ms, "tpot_p95_ms": self.tpot_p95_ms, "ts_ms": self.ts_ms}
@@ -358,6 +363,9 @@ class DirectWindow:
     #: pod -> {"cause", "lag_ms", "ts_ms"}: pods with a late baseline (see DirectState.late),
     #: live or not (a pending pod that went to sleep stays here).
     late: dict[str, dict[str, Any]] = field(default_factory=dict)
+    #: p95 of the pods' delta histograms pooled first (folded into the p95s above).
+    pooled_ttft_p95_ms: float | None = None
+    pooled_tpot_p95_ms: float | None = None
 
     @property
     def mean_prompt_tokens(self) -> float | None:
@@ -388,6 +396,8 @@ class DirectWindow:
             "mean_prompt_tokens": self.mean_prompt_tokens,
             "evidence_ttft_p95_ms": self.ttft_p95_ms,
             "evidence_tpot_p95_ms": self.tpot_p95_ms,
+            "evidence_pooled_ttft_p95_ms": self.pooled_ttft_p95_ms,
+            "evidence_pooled_tpot_p95_ms": self.pooled_tpot_p95_ms,
         }
 
 
@@ -614,6 +624,9 @@ def _pod_delta(
         ttft_p95_ms=_p95_ms(ttft[1], ttft[0], percentile_mode, min_latency_samples),
         tpot_p95_ms=_p95_ms(tpot[1], tpot[0], percentile_mode, min_latency_samples),
         prompt=prompt,
+        ttft_hist=tuple(ttft[1]),
+        tpot_hist=tuple(tpot[1]),
+        tpot_n=float(tpot[0]),
     )
 
 
@@ -727,6 +740,18 @@ def evaluate_poll(
     ttft_p95 = [d.ttft_p95_ms for d in deltas.values() if d.ttft_p95_ms is not None]
     tpot_p95 = [d.tpot_p95_ms for d in deltas.values() if d.tpot_p95_ms is not None]
     prompts = [d.prompt for d in deltas.values() if d.prompt is not None]
+    # Pooled p95 next to the per-pod maximum (2026-09-29 review F1): a pod below the
+    # per-pod minimum samples - an overloaded pod completes few requests - still
+    # weighs in; the minimum is applied to the pooled count.
+    rule = (percentile_mode, int(min_latency_samples))
+    pooled_ttft = pooled_p95_ms(((d.ttft_hist, d.n) for d in deltas.values()), rule)
+    pooled_tpot = pooled_p95_ms(((d.tpot_hist, d.tpot_n) for d in deltas.values()), rule)
+    ttft_p95 += [pooled_ttft] if pooled_ttft is not None else []
+    tpot_p95 += [pooled_tpot] if pooled_tpot is not None else []
+    total_n = float(sum(d.n for d in deltas.values()))
+    judged_n = float(sum(d.n for d in deltas.values() if d.ttft_p95_ms is not None or d.tpot_p95_ms is not None))
+    if pooled_ttft is not None or pooled_tpot is not None:
+        judged_n = total_n  # every request is in the pooled p95
     window = DirectWindow(
         start_ms=min(baseline[pod].ts_ms for pod in deltas),
         end_ms=now,
@@ -735,8 +760,8 @@ def evaluate_poll(
         missing=missing,
         ttft_p95_ms=max(ttft_p95) if ttft_p95 else None,
         tpot_p95_ms=max(tpot_p95) if tpot_p95 else None,
-        ttft_count=float(sum(d.n for d in deltas.values())),
-        judged_count=float(sum(d.n for d in deltas.values() if d.ttft_p95_ms is not None or d.tpot_p95_ms is not None)),
+        ttft_count=total_n,
+        judged_count=judged_n,
         prompt_tokens=sum(p[0] for p in prompts) if prompts else None,
         prompt_count=sum(p[1] for p in prompts) if prompts else None,
         kv_cache=(sum(kv_values) / len(kv_values)) if kv_values else None,
@@ -744,6 +769,8 @@ def evaluate_poll(
         per_pod={pod: delta.audit() for pod, delta in deltas.items()},
         unanswered={pod: reason for pod, reason in unanswered.items() if pod in live},
         late={pod: dict(value) for pod, value in late.items()},  # dropped ones included
+        pooled_ttft_p95_ms=pooled_ttft,
+        pooled_tpot_p95_ms=pooled_tpot,
     )
     return replace(updated, last=window), window
 
