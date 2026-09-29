@@ -1048,7 +1048,9 @@ class SafeScaleStateMachine:
         p95_available = evidence.ttft_p95_ms is not None or evidence.tpot_p95_ms is not None
         # n counts the requests the p95 judges: the pods whose own p95 is defined
         # (per-pod minimum samples), or all of them once the pooled p95 exists.
-        enough = min_samples <= 0 or (judged >= min_samples and p95_available)
+        # At least one judged request whatever min_commit_samples says (0 must not make
+        # the gate vacuous: no sample is not evidence of health).
+        enough = judged >= max(1, min_samples) and p95_available
         violations = _latency_violations(evidence.ttft_p95_ms, evidence.tpot_p95_ms, thresholds) if enough else []
         if violations:
             # A violation is one whatever pods are missing.
@@ -1180,7 +1182,9 @@ class SafeScaleStateMachine:
         )
         if "fallback" in thresholds:
             audit["threshold_fallback"] = thresholds["fallback"]
-        enough = min_samples <= 0 or (judged >= min_samples and window.p95_available)
+        # At least one judged request whatever min_commit_samples says (0 must not make
+        # the gate vacuous: no sample is not evidence of health).
+        enough = judged >= max(1, min_samples) and window.p95_available
         violations = _latency_violations(window.ttft_p95_ms, window.tpot_p95_ms, thresholds) if enough else []
         if violations:
             # A violation is one whatever pods are missing.
@@ -1193,8 +1197,11 @@ class SafeScaleStateMachine:
             return gap("late_baseline", {pod: dict(value) for pod, value in sorted(window.late.items())},
                        heals=False)
         if window.missing:
-            # A live pod has no fresh evidence (pending baseline, failing scrapes).
-            return gap("pods_missing", dict(sorted(window.missing.items())))
+            # A live pod has no fresh evidence (pending baseline, failing scrapes). A pod
+            # still waiting for its baseline cannot heal: once it answers it is late.
+            missing = dict(sorted(window.missing.items()))
+            pending = any(reason == "pending_baseline" for reason in missing.values())
+            return gap("pending_baseline" if pending else "pods_missing", missing, heals=not pending)
         if window.unanswered or int(window.end_ms) != int(wall_now_ms):
             # The deciding poll must have read every live pod: a pod whose latest scrape
             # failed (a timeout is often the overload itself) may hide the violation in

@@ -119,7 +119,9 @@ never falls back to it: the Redis evidence never decides a commit in `direct` mo
   `no_direct_window` / `direct_window_stale`), and at the ceiling the probe rolls back
   (`evidence_incomplete:<the same reason>`). Every remaining pod failing, even for many
   polls in a row, is the same: extend, then roll back - there is no switch to another
-  evidence source. No baseline by the deadline -> rollback `evidence_incomplete:no_baseline`
+  evidence source. A pod still waiting for its baseline at the deadline cannot heal (it
+  is late once it answers): rollback `evidence_incomplete:pending_baseline` at once. No
+  baseline by the deadline -> rollback `evidence_incomplete:no_baseline`
   (a later baseline would be late anyway); no remaining pod left in the evidence ->
   `evidence_incomplete:no_live_pods`. A pod reporting its engine asleep at the baseline
   is left out (while the view agrees). A p95 in the `+Inf` bucket is reported as the
@@ -182,8 +184,8 @@ one scrape timeout, `evidence_coverage_end_ms` >= deadline); no judged violation
 
 | Exit | Extra precondition | `latency_gate` |
 |---|---|---|
-| D1 enough samples | `n_judged >= min_commit_samples`, max(per pod, pooled) p95 <= thresholds | `evaluated` |
-| D2 low samples at the ceiling | deadline = ceiling, 1 <= n < `min_commit_samples`, max(per pod, pooled) p95 without a minimum <= thresholds | `evaluated_low_samples` (+ `low_sample_commit`) |
+| D1 enough samples | `n_judged >= max(1, min_commit_samples)` with a p95, max(per pod, pooled) p95 <= thresholds (`min_commit_samples: 0` never makes the gate vacuous) | `evaluated` |
+| D2 low samples at the ceiling | deadline = ceiling, n >= 1 but D1 not met (too few judged requests, or no p95 under the per-pod / pooled minimum), max(per pod, pooled) p95 without a minimum <= thresholds | `evaluated_low_samples` (+ `low_sample_commit`) |
 | D3 idle at the ceiling | deadline = ceiling, n = 0, no traffic in the snapshot tail, no request running / waiting on any remaining pod | `skipped` / `idle` |
 
 Redis mode (`evidence_source: redis`), all exits require: hide confirmed with a gateway

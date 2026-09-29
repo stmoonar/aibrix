@@ -387,3 +387,32 @@ def test_the_immediate_rollback_judges_the_pooled_p95_too() -> None:
     decision = machine.observe(MODEL, observation, now_ms=140_000)
     assert (decision.status, decision.reason) == ("rollback", "slo_violation")
     assert decision.details["rollback_reason"]["ttft_p95_ms"] == 5_000.0
+
+
+# ============================================================ review of 84936742
+def test_min_commit_samples_zero_never_makes_the_latency_gate_vacuous() -> None:
+    # Review P2-1: with min_commit_samples 0 a stalled model (requests running, none
+    # completed) committed with no p95 at all.
+    h = Harness(pods=("m-0",), min_commit_samples=0)
+    h.obs_kwargs = {"traffic": False}
+    original = h.sims["m-0"].text
+    h.sims["m-0"].text = lambda **kw: original(**kw) + 'vllm:num_requests_running{engine="0",model_name="m"} 3.0\n'
+    h.start()
+    at, decision = h.run_until(CAP)[-1]
+    assert (at, decision.status) == (CAP, "rollback")
+    assert decision.details["rollback_reason"]["code"] == "insufficient_evidence:stalled"
+    machine = redis_machine(FakeEvidence([redis_window(0, ttft=None, tpot=None)]), min_commit_samples=0)
+    _started(machine)
+    for ts in range(110_000, 170_000, 10_000):
+        decision = machine.observe(MODEL, redis_obs(ts, traffic=True), now_ms=ts)
+    assert (decision.status, decision.reason) == ("rollback", "insufficient_evidence:stalled")
+
+
+def test_a_pod_still_pending_at_the_deadline_rolls_back_without_extending() -> None:
+    # Review P3-2: it can never heal (its baseline, once taken, is late).
+    h = Harness()
+    h.failing["m-2"] = "timeout"
+    h.start()
+    at, decision = h.run_until(CAP, serve=5)[-1]
+    assert (at, decision.status) == (HIDE + W, "rollback")
+    assert decision.details["rollback_reason"]["code"] == "evidence_incomplete:pending_baseline"
