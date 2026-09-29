@@ -3,7 +3,9 @@
 No hide or sleep may leave a model with fewer ROUTABLE replicas than its registry
 ``min_replicas``: SafeScale hide / urgent / scale_down / binding power / defrag are
 refused (409 ``floor_violation``), APA targets are clamped, a startup admission
-wakes another replica first (else RetryLater), fleet repair is exempt but recorded.
+wakes another replica first (else it is exempt, recorded - never RetryLater), fleet
+repair is exempt but recorded. Routable replicas are binding ids (store and live
+view must agree).
 """
 
 from __future__ import annotations
@@ -73,38 +75,44 @@ def test_check_floor_only_counts_what_the_operation_takes_out_of_routing():
     assert check_floor("m", 0, {"a"}, {"a"}).ok
 
 
-def test_routable_excludes_reserved_waking_not_ready_unlabelled_and_counts_new_live_pods():
+class Lease:
+    def __init__(self, binding_id, phase, expires_at_ms=None):
+        self.binding_id, self.phase = binding_id, phase
+        self.expires_at_ms = int(time.time() * 1000) + 60_000 if expires_at_ms is None else expires_at_ms
+
+
+def test_routable_excludes_reserved_waking_not_ready_unlabelled_and_store_unknown_pods():
     world = _two_awake_world()
     service = world.service
-    assert service._routable_serve_ids("m1") == {"pod-a", "pod-b"}
+    assert service._routable_binding_ids("m1") == {"m1/node-a/0", "m1/node-a/1"}
 
     # a sleep reservation (a drain in progress) takes it out
     token = service._sleep_primitive.reservations.acquire(
         [binding_of(world.runtime.snapshots["pod-a"])], owner="t", operation_id=None, ttl_s=30
     )
-    assert service._routable_serve_ids("m1") == {"pod-b"}
+    assert service._routable_binding_ids("m1") == {"m1/node-a/1"}
     service._sleep_primitive.reservations.release(["m1/node-a/0"], token)
 
-    # a replica being woken (transient lease) does not count
-    class Lease:
-        def __init__(self, binding_id, phase):
-            self.binding_id, self.phase = binding_id, phase
-
+    # a replica being woken (unexpired transient lease) does not count
     world.leases.load = lambda: [Lease("m1/node-a/1", "waking")]
-    assert service._routable_serve_ids("m1") == {"pod-a"}
+    assert service._routable_binding_ids("m1") == {"m1/node-a/0"}
     world.leases.load = lambda: []
 
     # not Ready / routable label not "true"
     snaps = world.runtime.snapshots
     snaps["pod-a"] = replace(snaps["pod-a"], ready=False)
     snaps["pod-b"] = replace(snaps["pod-b"], routable=None)
-    assert service._routable_serve_ids("m1") == set()
+    assert service._routable_binding_ids("m1") == set()
     snaps["pod-a"] = replace(snaps["pod-a"], ready=True)
     snaps["pod-b"] = replace(snaps["pod-b"], routable=True)
 
-    # a Ready, routable Pod the store does not know yet (defrag destination) counts
+    # a Ready, routable Pod the store does not record awake counts only inside a
+    # make-before-break move that names it (the defrag destination)
     snaps["pod-new"] = pod("pod-new", "m1", (2,), ip="10.0.0.9")
-    assert service._routable_serve_ids("m1") == {"pod-a", "pod-b", "pod-new"}
+    assert service._routable_binding_ids("m1") == {"m1/node-a/0", "m1/node-a/1"}
+    with service._floor_counting(binding_of(snaps["pod-new"])):
+        assert service._routable_binding_ids("m1") == {"m1/node-a/0", "m1/node-a/1", "m1/node-a/2"}
+    assert service._routable_binding_ids("m1") == {"m1/node-a/0", "m1/node-a/1"}
 
 
 # ------------------------------------------------------------------ SafeScale hide
@@ -262,8 +270,8 @@ def test_concurrent_hide_and_urgent_sleep_never_both_take_the_last_replica():
 
     errors = [value for kind, value in results if kind == "error"]
     assert len(errors) == 1 and isinstance(errors[0], FloorViolation), results
-    assert world.service._routable_serve_ids("m1") != set()
-    assert len(world.service._routable_serve_ids("m1")) == 1
+    assert world.service._routable_binding_ids("m1") != set()
+    assert len(world.service._routable_binding_ids("m1")) == 1
 
 
 # ------------------------------------------------------------------ sleep paths
@@ -311,7 +319,7 @@ def test_apa_scale_down_is_clamped_to_the_floor_not_refused():
 
     assert response.status_code == 200, response.text
     assert response.json() == {"requested": 2, "actual": 1}
-    assert len(world.service._routable_serve_ids("m1")) == 1
+    assert len(world.service._routable_binding_ids("m1")) == 1
     counts = _floor_counts(world.service)
     assert counts["floor_clamped:apa:m1"] == 1 and "floor_rejected_total" not in counts
 
@@ -366,15 +374,20 @@ def test_startup_wakes_another_replica_before_sleeping_the_last_routable_one():
     assert counts["floor_makeup_wake:startup:m1"] == 1 and "floor_rejected_total" not in counts
 
 
-def test_startup_without_a_spare_replica_retries_later_and_sleeps_nothing():
+def test_startup_without_a_spare_replica_is_exempt_and_recorded_not_retried():
+    """Review 2026-09-29 P1-1: RetryLater would hold the Pod in its startup gate
+    (fleet drift -> fleet-wide repair); the start goes ahead, exempt and recorded."""
     world = _startup_world(spare_sleeping=False)
 
-    with pytest.raises(RetryLater, match="replica floor"):
-        world.service.admit_startup(pod_name="tp2-new", pod_uid="new-uid")
+    result = world.service.admit_startup(pod_name="tp2-new", pod_uid="new-uid")
 
-    assert world.vllm.sleeping["10.0.0.1"] is False
-    assert _hidden_patches(world) == []
-    assert _floor_counts(world.service)["floor_rejected:startup:m1"] == 1
+    assert result["status"] == "admitted"
+    assert world.vllm.sleeping["10.0.0.1"] is True
+    counts = _floor_counts(world.service)
+    assert counts["floor_exempt:startup:m1"] == 1 and "floor_rejected_total" not in counts
+    event = world.service.floor_state()["recent"][0]
+    assert event["event"] == "replica_floor_exempt" and event["path"] == "startup"
+    assert event["makeup_failed"] == "no_wakeable_replica"
 
 
 # ------------------------------------------------------------------ defrag

@@ -173,7 +173,7 @@ def test_config_centralizes_legacy_safescale_and_state_values() -> None:
             "PROACTIVE_RELEASE_MIN_TRS": "3000",
             "SAFE_SCALE_TTFT_P95_SLO_MS": "1300",
             "SAFE_SCALE_TPOT_P95_SLO_MS": "120",
-            "SAFE_SCALE_MIN_WINDOW_MS": "90000",
+            "SAFE_SCALE_WINDOW_FLOOR_MS": "90000",
             "SAFE_SCALE_E2E_MULTIPLIER": "3.5",
             "SAFE_SCALE_HQ": "0.5",
             "SAFE_SCALE_TAU_LOW": "1.25",
@@ -215,7 +215,7 @@ def test_safescale_short_floor_warns_instead_of_refusing_to_start(caplog) -> Non
     # A floor that satisfies the invariant (56000*0.75 = 42000) loads without the warning.
     caplog.clear()
     with caplog.at_level(logging.WARNING, logger="tre_controller.config"):
-        ControllerConfig.from_env({"SAFE_SCALE_MIN_WINDOW_MS": "56000"})
+        ControllerConfig.from_env({"SAFE_SCALE_WINDOW_FLOOR_MS": "56000"})
     assert not [r for r in caplog.records if "SAFE_SCALE_MIN_WINDOW_MS" in r.getMessage()]
 
 
@@ -226,7 +226,7 @@ def test_safescale_window_defaults_and_env_parsing() -> None:
     for gone in ("max_window_ms", "default_window_ms", "cw2_fallback_ms", "cdec"):
         assert not hasattr(safescale, gone)
     tuned = ControllerConfig.from_env(
-        {"SAFE_SCALE_MIN_WINDOW_MS": "30000", "SAFE_SCALE_E2E_MULTIPLIER": "1.5"}
+        {"SAFE_SCALE_WINDOW_FLOOR_MS": "30000", "SAFE_SCALE_E2E_MULTIPLIER": "1.5"}
     ).safescale
     assert (tuned.min_window_ms, tuned.e2e_multiplier) == (30_000.0, 1.5)
     for bad in ("0", "-1", "abc"):

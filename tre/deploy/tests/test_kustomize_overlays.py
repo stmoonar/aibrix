@@ -126,9 +126,14 @@ def test_tre_v2_overlay_declares_components_and_independent_redis() -> None:
     assert _env(controller)["TRE_DWELL_WINDOWS"] == "1"
     # A2 (v1/paper alignment): receiver-less HIGH proactive SafeScale shrink live.
     assert _env(controller)["TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE"] == "0"
-    # A6: SafeScale probe window W = max(multiplier * p95_e2e, floor), pinned.
-    assert _env(controller)["SAFE_SCALE_MIN_WINDOW_MS"] == "20000"
+    # A6: SafeScale probe window W = max(multiplier * p95_e2e, floor), pinned. The floor
+    # lives under the new env name; the legacy name stays at 60000 for rollback (P2-7):
+    # controller images before 2026-09-29 reject a legacy floor below 60 s at startup.
+    assert _env(controller)["SAFE_SCALE_WINDOW_FLOOR_MS"] == "20000"
+    assert _env(controller)["SAFE_SCALE_MIN_WINDOW_MS"] == "60000"
     assert _env(controller)["SAFE_SCALE_E2E_MULTIPLIER"] == "2"
+    # P2-6: donor hold after an SM floor_violation, in fast-loop ticks.
+    assert _env(controller)["TRE_FLOOR_VIOLATION_COOLDOWN_TICKS"] == "6"
     assert "SAFE_SCALE_MAX_WINDOW_MS" not in _env(controller)
     assert "SAFE_SCALE_CW2_FALLBACK_MS" not in _env(controller)
     # A12 / A13: KV-cache commit ceiling, donor-health guard source + thresholds, backoff.

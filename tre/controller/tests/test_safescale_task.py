@@ -116,6 +116,8 @@ def test_safescale_observation_tick_submits_commit_actions_after_deadline() -> N
     assert committed.events == (
         "safescale_formal_commit_gate_passed:donor",
         "safescale_kv_cache_unavailable:donor",
+        # P1-2 audit: hide at 0, window [0, 60 s] -> no pre-hide share; 2 judged.
+        "safescale_tail_pre_hide:donor:mean=0.000:max=0.000:n=2",
     )
 
 
@@ -189,6 +191,7 @@ def test_safescale_kv_cache_guard_blocks_commit_like_v1() -> None:
     assert result.events == (
         "safescale_formal_commit_gate_failed:donor",
         "safescale_gate_failures:donor:kv_cache",
+        "safescale_tail_pre_hide:donor:mean=0.000:max=0.000:n=2",
     )
 
     cool_queue = FakeQueue()
@@ -306,6 +309,8 @@ def test_kv_cache_unavailable_passes_the_gate_but_is_reported() -> None:
     assert result.events == (
         "safescale_formal_commit_gate_passed:donor",
         "safescale_kv_cache_unavailable:donor",
+        # P1-2 audit: hide at 0, window [0, 60 s] -> no pre-hide share; 2 judged.
+        "safescale_tail_pre_hide:donor:mean=0.000:max=0.000:n=2",
     )
     assert probe_holder["details"]["kv_cache"] == "unavailable"
     assert queue.submitted[-1][0].reason == "formal_commit_gate_passed"

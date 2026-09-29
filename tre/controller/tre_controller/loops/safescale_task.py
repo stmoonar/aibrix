@@ -158,6 +158,8 @@ def run_safescale_observation_tick(
         ):
             # P2-a: the KV-cache check could not be evaluated (fail-open, as v1) - say so.
             events.append(f"safescale_kv_cache_unavailable:{probe.model}")
+        if getattr(decision, "reason", "") in ("formal_commit_gate_passed", "formal_commit_gate_failed"):
+            events.append(format_tail_audit_event(probe.model, getattr(decision, "details", None) or {}))
         if getattr(decision, "reason", "") == "donor_health":
             health = _terminal_details(safescale, probe.model).get("donor_health") or {}
             events.append(
@@ -479,6 +481,22 @@ def _log_resolutions(ts_ms: int, result: SafeScaleObservationResult, *, gateway_
     )
 
 
+def format_tail_audit_event(model: str, details: Mapping) -> str:
+    """P1-2 audit event of a commit-gate decision: the share of the tail observations'
+    metrics windows that precedes the hide (mean / max, ``na`` = no window timestamps)
+    and how many observations the gate judged."""
+
+    def fmt(value) -> str:
+        return "na" if value is None else f"{float(value):.3f}"
+
+    return (
+        f"safescale_tail_pre_hide:{model}"
+        f":mean={fmt(details.get('tail_pre_hide_fraction_mean'))}"
+        f":max={fmt(details.get('tail_pre_hide_fraction_max'))}"
+        f":n={int(details.get('tail_observation_count') or 0)}"
+    )
+
+
 def _terminal_details(safescale: SafeScaleObserver, model: str) -> dict:
     active = getattr(safescale, "active_probe", None)
     probe = active(model) if callable(active) else None
@@ -538,6 +556,9 @@ def _observation_from_metrics(
         avg_gpu_cache_norm=remaining_pods_kv_cache(metrics, hidden_pods),
         gateway_requests=gateway.requests if gateway is not None else None,
         gateway_errors=gateway.errors if gateway is not None else None,
+        # P1-2 audit: the metrics window this observation read (from the snapshot).
+        window_start_ms=getattr(metrics, "window_start_ms", None),
+        window_end_ms=getattr(metrics, "window_end_ms", None),
     )
 
 

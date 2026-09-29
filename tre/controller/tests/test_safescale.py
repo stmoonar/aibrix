@@ -294,7 +294,8 @@ def test_window_multiplier_and_floor_are_configurable() -> None:
 
 
 def test_window_has_no_upper_cap() -> None:
-    # p95_e2e is bounded by the 150 s gateway route timeout -> W <= 300 s.
+    # Without a configured ceiling (window_ceiling_ms None: direct constructions, or an
+    # unreadable registry) W is not capped; from_env sets 2 x gateway.route_timeout_s.
     terms = calc_probe_window_details(_inputs(p95_e2e_ms=150_000.0), hidden_count=1, config=_V1_CFG)
     assert (terms["W"], terms["dominant"]) == (300_000.0, "e2e")
 

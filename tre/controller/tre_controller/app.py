@@ -272,6 +272,11 @@ def create_controller_dependencies(
             # P3: a hide that did not take effect (failed / not sent in observe)
             # marks its probe for rollback instead of leaving it judged as hidden.
             on_hide_failed=lambda model, pods, reason: safescale.abort_probe(model, pods=pods, reason=reason),
+            # P2-6: a donor the SM refused with 409 floor_violation is not picked for
+            # a scale-down again for TRE_FLOOR_VIOLATION_COOLDOWN_TICKS fast-loop ticks.
+            floor_violation_hold_ms=(
+                float(getattr(cfg, "floor_violation_cooldown_ticks", 6)) * float(cfg.rescue_interval_s) * 1000.0
+            ),
         ),
         observe_gate=observe_gate,
         maintenance_watch=MaintenanceWatch(redis_client),

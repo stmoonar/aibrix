@@ -109,14 +109,26 @@ spec:
               value: "500"
             - name: SAFE_SCALE_TPOT_P95_SLO_MS
               value: "75"
-            # A6: probe window W = max(E2E_MULTIPLIER * p95_e2e, MIN_WINDOW_MS), no ceiling
-            # (p95_e2e is bounded by the 150 s gateway route timeout, so W <= ~300 s, as v1).
-            # Missing p95_e2e -> W = MIN_WINDOW_MS. The 20 s floor is below the N2 tail
-            # guard (metrics window + refresh + offset), which is now only a startup warning.
-            - name: SAFE_SCALE_MIN_WINDOW_MS
+            # A6: probe window W = min(max(E2E_MULTIPLIER * p95_e2e, WINDOW_FLOOR_MS), W_max),
+            # W_max = 2 x registry gateway.route_timeout_s (300 s at 150 s). Missing p95_e2e
+            # -> W = WINDOW_FLOOR_MS. The 20 s floor is below the N2 tail guard (metrics
+            # window + refresh + offset), which is now only a startup warning; every probe
+            # records tail_pre_hide_fraction_mean/max (how much of the judged tail predates
+            # the hide).
+            - name: SAFE_SCALE_WINDOW_FLOOR_MS
               value: "20000"
             - name: SAFE_SCALE_E2E_MULTIPLIER
               value: "2"
+            # ROLLBACK COMPAT (P2-7) - keep at 60000. Read ONLY by controller images before
+            # 2026-09-29 (their N2 startup guard raises ValueError below 60000); images from
+            # 2026-09-29 on read SAFE_SCALE_WINDOW_FLOOR_MS above and ignore this one. So an
+            # image-only rollback still starts, with the old 60-120 s window band.
+            - name: SAFE_SCALE_MIN_WINDOW_MS
+              value: "60000"
+            # P2-6: after an SM 409 floor_violation the refused donor is not picked for a
+            # scale-down for this many fast-loop ticks (x TRE_RESCUE_INTERVAL_SECONDS; 0 = off).
+            - name: TRE_FLOOR_VIOLATION_COOLDOWN_TICKS
+              value: "6"
             # A12: commit gate rejects when the remaining pods' KV-cache fill > 0.8 (v1).
             - name: SAFE_SCALE_KV_CACHE_MAX
               value: "0.8"

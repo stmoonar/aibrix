@@ -207,6 +207,8 @@ def run_planner_tick(
         inflight_models=queue.inflight_models(),
         cluster_view=cluster_view,
         cooldowns=_action_cooldowns(snapshot, queue) if action_cooldown else None,
+        # P2-6: independent of TRE_ACTION_COOLDOWN (its own switch is the tick count).
+        floor_holds=_floor_held_models(queue),
         probe_backoff_models=_probe_backoff_models(safescale, snapshot.ts_ms),
         preemptible_models=_preemptible_models(queue) if rescue_due else None,
     )
@@ -290,6 +292,12 @@ def _preemptible_models(queue: PlannerQueue) -> set[str]:
 def _probe_backoff_models(safescale: SafeScaleController | None, now_ms: int) -> set[str]:
     backoff = getattr(safescale, "rollback_backoff_models", None)
     return set(backoff(now_ms)) if callable(backoff) else set()
+
+
+def _floor_held_models(queue: PlannerQueue) -> set[str]:
+    """P2-6: donors the SM recently refused with 409 floor_violation (ActionQueue)."""
+    held = getattr(queue, "floor_held_models", None)
+    return set(held()) if callable(held) else set()
 
 
 def _action_cooldowns(snapshot: MetricsSnapshot, queue: PlannerQueue) -> dict[str, str]:

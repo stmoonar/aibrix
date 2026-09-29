@@ -330,10 +330,24 @@ service_manager:
   # woken) than its models[].min_replicas - both arms (TRE and APA) use it.
   # SafeScale hide / urgent / scale_down / defrag: refused (409 floor_violation;
   # the controller re-plans next tick). APA (/scale_service): target clamped.
-  # Startup admission: another replica is woken first, else retry later. Fleet
-  # repair: exempt, recorded. Counters: GET /v2/sleep -> floor. false = off.
+  # Startup admission: another replica is woken first (best effort, in its own
+  # writer phase, within max_awake_replicas; after the start converges the
+  # suspended resident stays asleep - a swap); if none can be woken the start
+  # is exempt (recorded, never retried on the floor). Fleet repair: exempt,
+  # recorded. Counters (persistent, Redis): GET /v2/sleep -> floor. false = off.
+  # Defrag / make-up wakes are make-before-break: max_awake_replicas may be
+  # exceeded by one for the duration of one move.
   replica_floor:
     enforce: true
+    # WARNING log of a floor event at most once per (outcome, path, model) per
+    # this many seconds (counters always count; 0 = every event).
+    log_interval_s: 60
+  # A Pod whose startup gate is polling (asked within gate_seen_s) is reported
+  # as startup_admission_pending (informational, no fleet repair) instead of
+  # drift, for at most drift_grace_s since its first request; longer = drift.
+  startup_admission:
+    gate_seen_s: 30
+    drift_grace_s: 600
   sleep:
     # Every sleep runs hide (routable=false + route-gen bump) -> gateway plugin ack
     # -> drain -> /sleep (D1/D2); no caller can skip a step.

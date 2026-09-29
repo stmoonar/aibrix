@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, wait as futures_wait
 from contextlib import contextmanager
+import contextvars
 import logging
 import threading
 import time
@@ -216,7 +217,9 @@ class ServiceManagerV2:
         # (the Redis writer lock serializes them across processes); counters and
         # recent events of refusals / clamps / exemptions / make-up wakes.
         self._floor_lock = threading.RLock()
-        self._floor_recorder = FloorRecorder()
+        self._floor_recorder = FloorRecorder(
+            log_interval_s=float(getattr(self._sm_config, "replica_floor_log_interval_s", 0.0) or 0.0)
+        )
         self._sleep_primitive: SleepPrimitive | None = None
         if runtime_ops is not None and vllm_ops is not None:
             self._sleep_primitive = SleepPrimitive(
@@ -232,7 +235,12 @@ class ServiceManagerV2:
                 floor_guard=self._sleep_floor_guard,
                 floor_lock=self._floor_lock,
             )
+            # One set of floor counters (review 2026-09-29 P3): written to and read
+            # from the sleep journal's stats (Redis when configured), so
+            # ``floor.counts`` and ``stats`` of GET /v2/sleep agree and survive a
+            # restart.
             self._floor_recorder.incr = self._sleep_primitive.journal.incr
+            self._floor_recorder.read_counts = self._sleep_primitive.journal.stats
         self._store = store
         self._k8s_client = k8s_client
         self._runtime_ops = runtime_ops
@@ -254,6 +262,11 @@ class ServiceManagerV2:
             max_workers=ADMISSION_WORKERS, thread_name_prefix="startup-admit"
         )
         self._admission_lock = threading.Lock()
+        # Startup gates seen polling (review 2026-09-29 P1-1): pod name -> (UID,
+        # first request, last request) on this SM's monotonic clock. A Pod waiting
+        # in its gate is not fleet drift (detect_fleet_drift) for up to
+        # startup_admission.drift_grace_s; cleared once the Pod is admitted.
+        self._startup_gate_seen: dict[str, tuple[str, float, float]] = {}
         self._admission_jobs: dict[tuple[str, str], tuple] = {}
         if (
             runtime_ops is not None
@@ -992,7 +1005,7 @@ class ServiceManagerV2:
             if binding.hidden and binding.serve_id not in requested_hidden and binding.awake:
                 self._assert_confirmed_awake_for_unhide(binding)
         newly_hidden = {
-            binding.serve_id
+            binding.binding_id
             for binding in model_bindings
             if not binding.hidden and binding.serve_id in requested_hidden
         }
@@ -1150,7 +1163,15 @@ class ServiceManagerV2:
                 [binding.binding_id, destination_id], reason="defrag"
             ) as guard:
                 self._set_defrag_desired(list(updated_by_serve.values()), [migration])
-                self._run_defrag_migration(binding, migration, updated_by_serve, actions)
+                try:
+                    self._run_defrag_migration(binding, migration, updated_by_serve, actions)
+                except BaseException as exc:
+                    if getattr(exc, "defrag_source_slept", False):
+                        # P2-5: the source slept and the destination serves - the
+                        # move happened; its desired state stays (the cleanup step
+                        # that failed is left to the audit / supervisor).
+                        guard.settle()
+                    raise
                 guard.settle()  # moved: its desired state stays, whatever follows
                 updated = [updated_by_serve[serve_id] for serve_id in sorted(updated_by_serve)]
                 version = self._store.save(updated, expected_version=version)
@@ -1737,6 +1758,8 @@ class ServiceManagerV2:
             snapshots.setdefault(binding.binding_id, []).append(pod)
         admitted_startups = self._runtime_ops.list_admitted_startup_pods()
         admitted_ids = {pod.binding_id for pod in admitted_startups}
+        gates = self._startup_gates_waiting()
+        grace_s = float(getattr(self._sm_config, "startup_gate_drift_grace_s", 0.0) or 0.0)
         observed = {
             item.binding_id: item
             for item in self._fleet_store.load_observed().bindings
@@ -1753,6 +1776,33 @@ class ServiceManagerV2:
                 )
                 continue
             pods = snapshots.get(binding_id, [])
+            # Review 2026-09-29 P1-1: a Pod whose startup gate is polling right now
+            # (same UID, asked within startup_admission.gate_seen_s) is waiting for
+            # its admission, not drifted - a fleet repair would only restart the
+            # wait. Informational (the supervisor never repairs on it) for up to
+            # drift_grace_s since its first request; a gate waiting longer is
+            # reported as drift again, so a stuck admission is not masked.
+            gated = [
+                (pod, gates[pod.name][1])
+                for pod in pods
+                if pod.name in gates
+                and pod.pod_uid
+                and gates[pod.name][0] == pod.pod_uid
+                and not pod.annotations.get("tre.aibrix.io/startup-admitted-uid")
+            ]
+            if gated:
+                waited_s = max(waited for _pod, waited in gated)
+                if waited_s <= grace_s:
+                    issues.append(
+                        {
+                            "code": "startup_admission_pending",
+                            "binding_id": binding_id,
+                            "pods": sorted(pod.name for pod, _waited in gated),
+                            "waited_s": round(waited_s, 1),
+                            "informational": True,
+                        }
+                    )
+                    continue
             if len(pods) != 1:
                 if binding_id in admitted_ids or any(
                     pod.node == desired.node
@@ -2102,6 +2152,10 @@ class ServiceManagerV2:
                     try:
                         wanted = self._desired_binding(binding.binding_id)
                         if wanted.lifecycle == "resident" and wanted.power == "awake":
+                            # Replica floor swap (P2-3): a make-up replica woken for
+                            # it stays awake instead of the resident waking back.
+                            if self._swap_with_floor_makeup(binding.binding_id, pod.uid):
+                                continue
                             self._restore_desired_awake(binding.binding_id)
                     except Exception:
                         LOG.exception(
@@ -2270,18 +2324,23 @@ class ServiceManagerV2:
         # to observe since the unlocked pre-check in admit_startup (TOCTOU).
         # Only unrequested admissions get here - an owned (pre-authorized)
         # admission never sleeps residents through this path.
-        def before_prepare() -> None:
-            self._refuse_unrequested_startup_sleep(pod, awake)
-            # Replica floor: wake another replica of a resident's model first
-            # (make-before-break); the prepare re-checks and refuses (RetryLater).
-            self._startup_floor_makeup(pod, awake)
-
-        outcomes = self._split_sleep(
-            awake,
-            sleep_path="startup",
-            kind="startup_admit_sleep",
-            before_prepare=before_prepare,
-        )
+        #
+        # Replica floor (review 2026-09-29 P1-1 / P2-4): another replica of a
+        # resident's model is woken first, best effort, in its OWN writer phase
+        # (never under the prepare lock below). The prepare's floor check then
+        # only re-checks: a model still below its floor is exempt and recorded
+        # (path startup) - the admission never waits on the floor.
+        notes = self._startup_floor_makeup(pod, awake)
+        token = _FLOOR_EVENT_NOTES.set(notes)
+        try:
+            outcomes = self._split_sleep(
+                awake,
+                sleep_path="startup",
+                kind="startup_admit_sleep",
+                before_prepare=lambda: self._refuse_unrequested_startup_sleep(pod, awake),
+            )
+        finally:
+            _FLOOR_EVENT_NOTES.reset(token)
         slept_ids = {item.get("binding_id") for item in outcomes if item.get("status") == STATUS_SLEPT}
         return [binding for binding in awake if binding.binding_id in slept_ids]
 
@@ -2297,6 +2356,7 @@ class ServiceManagerV2:
         it gets a 200, so it needs no change."""
         key = (pod_name, pod_uid)
         now = time.monotonic()
+        self._note_startup_gate(pod_name, pod_uid, now)
         with self._admission_lock:
             for stale_key, (_job, started) in list(self._admission_jobs.items()):
                 if _job.done() and now - started > ADMISSION_RESULT_TTL_S:
@@ -2324,7 +2384,39 @@ class ServiceManagerV2:
             raise ServiceShuttingDown(
                 "service-manager is shutting down; retry the startup admission"
             )
-        return 200, job.result()  # raises the admission's error (409 / 503 / 400)
+        result = job.result()  # raises the admission's error (409 / 503 / 400)
+        with self._admission_lock:
+            seen = self._startup_gate_seen.get(pod_name)
+            if seen is not None and seen[0] == pod_uid:
+                self._startup_gate_seen.pop(pod_name, None)  # admitted: no longer waiting
+        return 200, result
+
+    def _note_startup_gate(self, pod_name: str, pod_uid: str, now: float) -> None:
+        """Record that ``pod_name``'s startup gate asked for admission (first and
+        last request per Pod UID); prunes gates not seen for a while."""
+        seen_s = float(getattr(self._sm_config, "startup_gate_seen_s", 0.0) or 0.0)
+        keep_s = max(4.0 * seen_s, 300.0)
+        with self._admission_lock:
+            for name, (_uid, _first, last) in list(self._startup_gate_seen.items()):
+                if now - last > keep_s:
+                    self._startup_gate_seen.pop(name, None)
+            entry = self._startup_gate_seen.get(pod_name)
+            first = entry[1] if entry is not None and entry[0] == pod_uid else now
+            self._startup_gate_seen[pod_name] = (pod_uid, first, now)
+
+    def _startup_gates_waiting(self) -> dict[str, tuple[str, float]]:
+        """Pods whose startup gate is polling now: pod name -> (UID, seconds since
+        its first admission request). A gate counts only while it asked within
+        ``startup_admission.gate_seen_s`` (a Pod that stopped polling - crashed,
+        deleted, admitted elsewhere - is not waiting)."""
+        seen_s = float(getattr(self._sm_config, "startup_gate_seen_s", 0.0) or 0.0)
+        now = time.monotonic()
+        with self._admission_lock:
+            return {
+                name: (uid, now - first)
+                for name, (uid, first, last) in self._startup_gate_seen.items()
+                if now - last <= seen_s
+            }
 
     def converge_startups(self) -> dict:
         """Converge admitted Pods after vLLM becomes reachable.
@@ -2428,6 +2520,9 @@ class ServiceManagerV2:
         for binding_id in suspended:
             wanted = self._desired_binding(binding_id)
             if wanted.lifecycle == "resident" and wanted.power == "awake":
+                # Replica floor swap (P2-3): its make-up replica stays awake instead.
+                if self._swap_with_floor_makeup(binding_id, snapshot.pod_uid):
+                    continue
                 self._restore_desired_awake(binding_id)
         self._runtime_ops.clear_startup_admission(snapshot.name)
         self._reconcile_unlocked(drop_missing=False)
@@ -2857,6 +2952,7 @@ class ServiceManagerV2:
         self._ensure_wake_headroom(binding)
         if self._gpu_leases is not None:
             self._gpu_leases.acquire(binding, phase="waking")
+        woke = False
         try:
             result = self._vllm_ops.wake_up(snapshot.pod_ip, port=8000)
             if not bool(getattr(result, "success", False)):
@@ -2871,9 +2967,30 @@ class ServiceManagerV2:
             self._runtime_ops.write_binding_annotations(binding, state=POD_STATE_AWAKE)
             if self._gpu_leases is not None:
                 self._gpu_leases.acquire(binding, phase="awake")
+            woke = True
         finally:
+            if not woke:
+                self._settle_failed_wake_lease(binding, snapshot.pod_ip)
             # Woken (or a failed wake, whatever state it left): observed follows (B2).
             self._refresh_observed([binding.binding_id])
+
+    def _settle_failed_wake_lease(self, binding: Binding, pod_ip: str) -> None:
+        """A failed wake must not leave its ``waking`` lease behind (review
+        2026-09-29): the floor would count the replica as "being woken" and the
+        admission checks would see a transient lease on its GPUs. Physically asleep
+        -> released (a sleeping binding holds no lease); physically awake -> the
+        ``awake`` lease (its GPUs are in use); unknown -> left to expire (the floor
+        and lease acquisition ignore an expired lease). Best effort."""
+        if self._gpu_leases is None:
+            return
+        try:
+            physical = self._vllm_ops.is_sleeping(pod_ip, port=8000)
+            if physical is True:
+                self._gpu_leases.release(binding)
+            elif physical is False:
+                self._gpu_leases.acquire(binding, phase="awake")
+        except Exception:  # noqa: BLE001 - the waking lease expires on its own
+            LOG.exception("settling the GPU lease of the failed wake of %s failed", binding.binding_id)
 
     def _sleep_bindings(
         self,
@@ -3188,67 +3305,96 @@ class ServiceManagerV2:
         except (KeyError, AttributeError, TypeError, ValueError):
             return 0
 
-    def _routable_serve_ids(self, model: str, bindings: list[Binding] | None = None) -> set[str]:
-        """Replicas of ``model`` that serve traffic right now: no sleep reservation,
-        no transient ``waking`` / ``starting`` GPU lease, and - with a Kubernetes
-        view - a Ready Pod carrying the routable label ``true`` (what the gateway
-        routes on; the legacy store lags behind a make-before-break defrag, whose
-        destination is recorded only when the migration is done). Without a
-        Kubernetes view (no runtime): awake and not hidden in the store."""
+    def _routable_binding_ids(self, model: str, bindings: list[Binding] | None = None) -> set[str]:
+        """Binding ids of ``model`` that serve traffic right now.
+
+        A replica counts only when BOTH views agree (review 2026-09-29 P3-9):
+
+        * the SM store (``bindings``, default a fresh load) records it awake and not
+          hidden - a Pod whose hide is in flight, or that the store does not know,
+          does not count;
+        * with a Kubernetes view, its Pod is Ready and carries the routable label
+          ``true`` (what the gateway routes on);
+
+        and it has no sleep reservation and no unexpired transient ``waking`` /
+        ``starting`` GPU lease (an expired one - e.g. left by a failed wake - no
+        longer means "being woken"). Pods are matched by binding id, never by pod
+        name (a replaced Pod keeps its binding). A make-before-break move counts its
+        destination explicitly (:meth:`_floor_counting`): the store records it only
+        once the move is done, but it must be Ready and routable in the live view."""
         if bindings is None:
             bindings = self._store.load().bindings
+        candidates = {
+            binding.binding_id
+            for binding in bindings
+            if binding.model == model and binding.awake and not binding.hidden
+        }
+        candidates |= {
+            binding_id for extra_model, binding_id in _FLOOR_EXTRA_ROUTABLE.get()
+            if extra_model == model
+        }
         reservations = self._reservations()
-        reserved = set(reservations.active()) if reservations is not None else set()
-        transient: set[str] = set()
-        if self._gpu_leases is not None:
-            transient = {
-                lease.binding_id
-                for lease in self._gpu_leases.load()
-                if lease.phase in TRANSIENT_LEASE_PHASES
-            }
-        live = None
+        if reservations is not None:
+            candidates -= set(reservations.active())
+        candidates -= self._transient_lease_ids()
         lister = getattr(self._runtime_ops, "list_pod_snapshots", None)
-        if self._runtime_ops is not None and callable(lister):
-            live = {snapshot.name: snapshot for snapshot in lister(model=model)}
-        routable: set[str] = set()
-        if live is None:
-            for binding in bindings:
-                if binding.model != model or not binding.awake or binding.hidden:
-                    continue
-                if binding.binding_id in reserved or binding.binding_id in transient:
-                    continue
-                routable.add(binding.serve_id)
-            return routable
-        for name, snapshot in live.items():
+        if self._runtime_ops is None or not callable(lister):
+            return candidates
+        live: set[str] = set()
+        for snapshot in lister(model=model):
             if snapshot.model != model or not snapshot.ready or snapshot.routable is not True:
                 continue
             try:
-                binding_id = _binding_from_snapshot(snapshot).binding_id
+                live.add(_binding_from_snapshot(snapshot).binding_id)
             except (KeyError, ValueError):
                 continue
-            if binding_id in reserved or binding_id in transient:
-                continue
-            routable.add(name)
-        return routable
+        return candidates & live
+
+    def _transient_lease_ids(self) -> set[str]:
+        """Bindings holding an UNEXPIRED transient (``waking`` / ``starting``) GPU
+        lease on any of their GPUs (a TP>1 binding holds one record per GPU)."""
+        if self._gpu_leases is None:
+            return set()
+        now_ms = int(time.time() * 1000)
+        return {
+            lease.binding_id
+            for lease in self._gpu_leases.load()
+            if lease.phase in TRANSIENT_LEASE_PHASES
+            and not _lease_expired(lease, now_ms)
+        }
+
+    @contextmanager
+    def _floor_counting(self, binding: Binding):
+        """Within the block, floor checks count ``binding`` as routable when the live
+        view says so although the store does not record it awake yet (the
+        destination of a make-before-break move)."""
+        token = _FLOOR_EXTRA_ROUTABLE.set(
+            _FLOOR_EXTRA_ROUTABLE.get() | {(binding.model, binding.binding_id)}
+        )
+        try:
+            yield
+        finally:
+            _FLOOR_EXTRA_ROUTABLE.reset(token)
 
     def _floor_check(
         self, model: str, removing, bindings: list[Binding] | None = None
     ) -> FloorCheck:
+        """``removing``: binding ids the operation takes out of routing."""
         return check_floor(
-            model, self._model_floor(model), self._routable_serve_ids(model, bindings), removing
+            model, self._model_floor(model), self._routable_binding_ids(model, bindings), removing
         )
 
     def _on_floor_violation(self, check: FloorCheck, path: str, **extra) -> None:
-        """A path's answer to a floor violation: ``repair`` is exempt (recorded);
-        ``startup`` retries later; everything else is refused."""
-        if path in EXEMPT_PATHS:
+        """A path's answer to a floor violation: ``repair`` is exempt; ``startup``
+        (whose make-up wake could not restore the floor) is exempt too - never
+        RetryLater, a Pod held in its startup gate would be seen as fleet drift and
+        trigger a fleet-wide repair (review 2026-09-29 P1-1); both are recorded.
+        Everything else is refused."""
+        if path in EXEMPT_PATHS or path in MAKEUP_PATHS:
             self._floor_recorder.record("exempt", check, path=path, **extra)
             return
         self._floor_recorder.record("rejected", check, path=path, **extra)
-        violation = FloorViolation(check, path=path)
-        if path in MAKEUP_PATHS:
-            raise RetryLater(f"{violation}; retry once another replica of {check.model} is awake")
-        raise violation
+        raise FloorViolation(check, path=path)
 
     def _sleep_floor_guard(self, targets: list[SleepTarget], path: str) -> None:
         """The sleep primitive's floor check: under the writer lock, right before
@@ -3257,18 +3403,19 @@ class ServiceManagerV2:
             return
         by_model: dict[str, set[str]] = {}
         for target in targets:
-            by_model.setdefault(target.binding.model, set()).add(target.binding.serve_id)
-        for model, serve_ids in sorted(by_model.items()):
-            check = self._floor_check(model, serve_ids)
+            by_model.setdefault(target.binding.model, set()).add(target.binding.binding_id)
+        notes = _FLOOR_EVENT_NOTES.get()
+        for model, binding_ids in sorted(by_model.items()):
+            check = self._floor_check(model, binding_ids)
             if not check.ok:
-                self._on_floor_violation(check, path)
+                self._on_floor_violation(check, path, **(notes.get(model) or {}))
 
     def _clamp_sleep_plan_to_floor(
         self, model: str, plan: dict, bindings: list[Binding], response: dict, *, path: str
     ) -> dict:
         """APA: keep awake as many of the planned sleeps as the floor needs (routable
         ones; hidden / not-yet-serving ones still sleep)."""
-        removing = {binding.serve_id for binding in plan["sleep"]}
+        removing = {binding.binding_id for binding in plan["sleep"]}
         check = self._floor_check(model, removing, bindings)
         if check.ok:
             return plan
@@ -3278,7 +3425,7 @@ class ServiceManagerV2:
         kept_awake: list[Binding] = []
         taken = 0
         for binding in plan["sleep"]:
-            if binding.serve_id in routable:
+            if binding.binding_id in routable:
                 if taken < allowed:
                     taken += 1
                     keep.append(binding)
@@ -3298,23 +3445,64 @@ class ServiceManagerV2:
             "target_bindings": list(plan["target_bindings"]) + kept_awake,
         }
 
-    def _startup_floor_makeup(self, pod: StartupPodRecord, residents: list[Binding]) -> None:
-        """Before a startup admission sleeps awake residents: wake another replica
-        of every model the sleep would take below its floor (not on the startup
-        Pod's GPUs). What cannot be made up is refused by the prepare's floor
-        check (RetryLater, the init gate polls again)."""
-        if not self._floor_enforced():
-            return
-        by_model: dict[str, set[str]] = {}
-        for binding in residents:
-            by_model.setdefault(binding.model, set()).add(binding.serve_id)
-        for model, serve_ids in sorted(by_model.items()):
-            check = self._floor_check(model, serve_ids)
-            for _ in range(check.deficit):
-                if self._makeup_wake(model, pod, check) is None:
-                    break
+    def _startup_floor_makeup(self, pod: StartupPodRecord, residents: list[Binding]) -> dict:
+        """Before a startup admission sleeps awake residents: wake another replica of
+        every model the sleep would take below its floor (not on the startup Pod's
+        GPUs), best effort.
 
-    def _makeup_wake(self, model: str, pod: StartupPodRecord, check: FloorCheck) -> Binding | None:
+        Runs in its OWN writer phase (review 2026-09-29 P2-4): the vLLM wake and
+        its gpu-truth headroom wait never run under the prepare lock of the sleep;
+        the prepare only re-checks the floor. Whatever changed in between (another
+        writer hid or slept the made-up replica) is caught by that re-check, which
+        exempts and records (startup never waits on the floor, P1-1). Returns the
+        per-model notes (why a make-up failed) for the exemption record."""
+        if not self._floor_enforced() or not residents:
+            return {}
+        by_model: dict[str, list[Binding]] = {}
+        for binding in residents:
+            by_model.setdefault(binding.model, []).append(binding)
+
+        def short_models() -> list[tuple[str, list[Binding], FloorCheck]]:
+            result = []
+            for model, members in sorted(by_model.items()):
+                check = self._floor_check(model, {b.binding_id for b in members})
+                if check.deficit > 0:
+                    result.append((model, members, check))
+            return result
+
+        if not short_models():  # nothing to make up: no extra writer phase
+            return {}
+        notes: dict[str, dict] = {}
+        try:
+            with self._writer("startup_floor_makeup"):
+                # SM actuation observe: a make-up wake is actuation (same refusal
+                # as the sleep it prepares).
+                self._refuse_unrequested_startup_sleep(pod, residents)
+                for model, members, check in short_models():  # again, under the lock
+                    removing = [b for b in members if b.binding_id in set(check.removing)]
+                    for resident in removing[: check.deficit]:
+                        woken, reason = self._makeup_wake(model, pod, check, for_binding=resident)
+                        if woken is None:
+                            notes[model] = {"makeup_failed": reason}
+                            break
+        except (RetryLater, ServiceShuttingDown):
+            raise
+        except Exception as exc:  # noqa: BLE001 - best effort; the prepare exempts
+            LOG.warning("floor make-up for the startup of %s failed: %s", pod.name, exc)
+            for binding in residents:
+                notes.setdefault(binding.model, {"makeup_failed": f"{type(exc).__name__}: {exc}"})
+        return notes
+
+    def _makeup_wake(
+        self, model: str, pod: StartupPodRecord, check: FloorCheck, *, for_binding: Binding
+    ) -> tuple[Binding | None, str | None]:
+        """Wake one sleeping replica of ``model`` for the startup of ``pod`` (which
+        suspends ``for_binding``). Obeys max_awake_replicas (review 2026-09-29
+        P2-3: over the cap = no make-up). The desired record goes first, inside a
+        desired guard: a binding without one is refused before anything wakes, a
+        failed wake restores it. Its reason names the suspended resident and the
+        Pod UID, so the admission's convergence can swap them (see
+        :meth:`_swap_with_floor_makeup`). Returns (binding, None) or (None, why)."""
         snapshot = self._store.load()
         pod_gpus = set(pod.gpu_ids)
         candidates: list[Binding] = []
@@ -3330,29 +3518,99 @@ class ServiceManagerV2:
             except (ReservationConflict, WakeConflict):
                 continue
             candidates.append(binding)
+        if not candidates:
+            return None, "no_wakeable_replica"
+        try:
+            self._ensure_wake_within_cap(candidates[0], snapshot.bindings)
+        except ValueError as exc:
+            LOG.warning("floor make-up wake for %s refused: %s", model, exc)
+            return None, "max_awake_replicas"
+        reason = f"{FLOOR_MAKEUP_REASON}:{for_binding.binding_id}:{pod.uid}"
+        last_error = "wake_failed"
         while candidates:
             binding = _wake_pick(candidates, snapshot.bindings, self._registry.topology(), self._placement)
             candidates.remove(binding)
+            woke = False
             try:
-                self._apply_runtime_power_action(binding, action="wake")
+                with self._desired_guard([binding.binding_id], reason=FLOOR_MAKEUP_REASON) as guard:
+                    self._update_desired(
+                        {binding.binding_id: {"power": "awake", "hidden": False}},
+                        updated_by=FLOOR_UPDATED_BY,
+                        reason=reason,
+                    )
+                    self._apply_runtime_power_action(binding, action="wake")
+                    woke = True
+                    guard.settle([binding.binding_id])  # awake now: keep its desired
+                    latest = self._store.load()
+                    self._store.save(
+                        [
+                            replace(item, awake=True, hidden=False)
+                            if item.binding_id == binding.binding_id
+                            else item
+                            for item in latest.bindings
+                        ],
+                        expected_version=latest.version,
+                    )
             except Exception as exc:  # noqa: BLE001 - try the next candidate
-                LOG.warning("floor make-up wake of %s failed: %s", binding.serve_id, exc)
-                continue
-            updated = [
-                replace(item, awake=True, hidden=False) if item.serve_id == binding.serve_id else item
-                for item in snapshot.bindings
-            ]
-            self._store.save(updated, expected_version=snapshot.version)
-            self._update_desired(
-                {binding.binding_id: {"power": "awake", "hidden": False}},
-                updated_by="service-manager-floor",
-                reason="replica_floor_makeup",
-            )
+                if not woke:
+                    LOG.warning("floor make-up wake of %s failed: %s", binding.serve_id, exc)
+                    last_error = f"{type(exc).__name__}: {exc}"
+                    continue
+                # Woken (desired awake, settled); only the store save failed - the
+                # reconcile catches the store up. It is a make-up all the same.
+                LOG.warning("recording the floor make-up wake of %s failed: %s", binding.serve_id, exc)
             self._floor_recorder.record(
-                "makeup_wake", check, path="startup", woken=binding.serve_id, for_pod=pod.name
+                "makeup_wake", check, path="startup", woken=binding.binding_id,
+                for_binding=for_binding.binding_id, for_pod=pod.name,
             )
-            return binding
-        return None
+            return binding, None
+        return None, last_error
+
+    def _swap_with_floor_makeup(self, binding_id: str, pod_uid: str | None) -> bool:
+        """Review 2026-09-29 P2-3: a resident suspended by a startup whose model got a
+        make-up replica for it (desired reason ``replica_floor_makeup:<id>:<uid>``,
+        still desired and stored awake) is NOT woken back: its desired power becomes
+        sleeping and the make-up replica stays awake - the model ends with as many
+        awake replicas as before the start (waking it back would add one, above what
+        the controller asked and possibly above max_awake_replicas, and would wake
+        it on a GPU the new Pod now uses). Returns True when swapped."""
+        if self._fleet_store is None or not pod_uid:
+            return False
+        reason = f"{FLOOR_MAKEUP_REASON}:{binding_id}:{pod_uid}"
+        stored_awake = {
+            item.binding_id for item in self._store.load().bindings if item.awake
+        }
+        partner = next(
+            (
+                item
+                for item in self._fleet_store.load_desired().bindings
+                if item.reason == reason
+                and item.updated_by == FLOOR_UPDATED_BY
+                and item.lifecycle == "resident"
+                and item.power == "awake"
+                and item.binding_id in stored_awake
+            ),
+            None,
+        )
+        if partner is None:
+            return False
+        self._update_desired(
+            {binding_id: {"power": "sleeping", "hidden": False}},
+            updated_by=FLOOR_UPDATED_BY,
+            reason=f"replica_floor_swap:{partner.binding_id}",
+        )
+        LOG.warning(
+            json.dumps(
+                {
+                    "event": "replica_floor_makeup_swap",
+                    "suspended": binding_id,
+                    "kept_awake": partner.binding_id,
+                    "pod_uid": pod_uid,
+                },
+                sort_keys=True,
+            )
+        )
+        return True
 
     def _record_repair_floor_exemptions(self, snapshots: list[K8sPodSnapshot]) -> None:
         """Fleet repair quarantines (hides) every resident at once: exempt from the
@@ -3362,9 +3620,13 @@ class ServiceManagerV2:
         by_model: dict[str, set[str]] = {}
         for snapshot in snapshots:
             if snapshot.ready and snapshot.routable is True:
-                by_model.setdefault(snapshot.model, set()).add(snapshot.name)
-        for model, names in sorted(by_model.items()):
-            check = check_floor(model, self._model_floor(model), names, names)
+                try:
+                    binding_id = _binding_from_snapshot(snapshot).binding_id
+                except (KeyError, ValueError):
+                    continue
+                by_model.setdefault(snapshot.model, set()).add(binding_id)
+        for model, binding_ids in sorted(by_model.items()):
+            check = check_floor(model, self._model_floor(model), binding_ids, binding_ids)
             if not check.ok:
                 self._on_floor_violation(check, "repair", reason="fleet_repair_quarantine")
 
@@ -3470,11 +3732,18 @@ class ServiceManagerV2:
                 {"action": "wake", "serve_id": destination.serve_id},
             ]
         # Make-before-break (replica floor, 2026-09-29): the destination wakes
-        # first, so the model never has one routable replica fewer while it moves.
+        # first, so the model never has one routable replica fewer while it moves
+        # (max_awake_replicas may be exceeded by one for the duration of the move).
         self._apply_runtime_power_action(destination, action="wake")
         try:
-            self._apply_runtime_power_action(binding, action="sleep", sleep_path="defrag")
-        except BaseException:
+            with self._floor_counting(destination):
+                self._apply_runtime_power_action(binding, action="sleep", sleep_path="defrag")
+        except BaseException as exc:
+            if not self._defrag_source_still_awake(binding, exc):
+                # Review 2026-09-29 P2-5: the source slept (or its state is unknown):
+                # the destination is the replica that serves now - keep it.
+                _mark_defrag_source_slept(exc)
+                raise
             # The source stays awake (the primitive rolled its hide back): put the
             # destination back to sleep so the layout is what it was.
             try:
@@ -3506,9 +3775,19 @@ class ServiceManagerV2:
         # routable before the source is hidden and slept.
         moved = self._start_defrag_destination(binding, migration, actions)
         try:
-            self._sleep_and_delete_defrag_source(binding, actions)
-        except BaseException:
-            if not any(item.get("action") == "delete_deployment" for item in actions):
+            with self._floor_counting(moved):
+                self._sleep_and_delete_defrag_source(binding, actions)
+        except BaseException as exc:
+            # Review 2026-09-29 P2-5: the new replica is removed again ONLY while the
+            # source has not slept (confirmed awake). Once the source slept - a later
+            # step (deleting its Deployment, waiting for its Pod) failed - or its
+            # state is unknown, the new replica is what serves: keep it.
+            source_slept = any(
+                item.get("action") == "sleep" for item in actions
+            ) or not self._defrag_source_still_awake(binding, exc)
+            if source_slept:
+                _mark_defrag_source_slept(exc)
+            else:
                 # The source still serves: remove the new replica again (best effort).
                 try:
                     self._runtime_ops.delete_model_deployment(moved)
@@ -3524,6 +3803,30 @@ class ServiceManagerV2:
                     self._refresh_observed([moved.binding_id])
             raise
         return actions, moved
+
+    def _defrag_source_still_awake(self, binding: Binding, exc: BaseException) -> bool:
+        """True only when the defrag source's sleep is confirmed NOT to have happened:
+        a floor refusal (nothing was hidden), or a failed sleep whose outcome does not
+        say slept and whose Pod vLLM reports awake. Unknown = False (keep the
+        destination: two replicas for a while beat none)."""
+        if isinstance(exc, FloorViolation):
+            return True
+        for outcome in getattr(exc, "outcomes", None) or []:
+            if (
+                isinstance(outcome, dict)
+                and outcome.get("binding_id") == binding.binding_id
+                and outcome.get("status") == STATUS_SLEPT
+            ):
+                return False
+        if self._vllm_ops is None:
+            return False
+        try:
+            pod_ip = self._snapshot_for_binding(binding).pod_ip
+            if not pod_ip:
+                return False
+            return self._vllm_ops.is_sleeping(pod_ip, port=8000) is False
+        except Exception:  # noqa: BLE001 - unknown: keep the destination
+            return False
 
     def _sleep_and_delete_defrag_source(self, binding: Binding, actions: list[dict]) -> None:
         # The primitive hides, waits for the gateway ack and drains before /sleep.
@@ -4083,9 +4386,20 @@ def create_app(service: ServiceManagerV2) -> FastAPI:
 
     return app
 
+#: Sleep paths an HTTP caller may name (review 2026-09-29 P3-8). ``repair``,
+#: ``startup`` and ``defrag`` are the SM's own paths with their own floor rules
+#: (exempt / make-up); ``default`` is for internal callers that name none.
+EXTERNAL_SLEEP_PATHS = ("scale_down", "urgent", "safescale_commit", "apa")
+
+
 def _sleep_path(value: str) -> str:
     if value not in SLEEP_PATHS:
         raise ValueError(f"unknown sleep_path {value!r} (known: {', '.join(SLEEP_PATHS)})")
+    if value not in EXTERNAL_SLEEP_PATHS:
+        raise ValueError(
+            f"sleep_path {value!r} is internal to the service-manager "
+            f"(allowed: {', '.join(EXTERNAL_SLEEP_PATHS)})"
+        )
     return value
 
 
@@ -4150,6 +4464,35 @@ def _wake_pick(feasible, planned, topology, policy: PlacementPolicy | None = Non
         if choice is not None:
             return scorable[choice.index]
     return min(feasible, key=lambda item: _natural_key(item.serve_id))
+
+
+#: Replica floor (2026-09-29): (model, binding id) pairs a floor check counts as
+#: routable although the store does not record them awake yet (the destination of a
+#: make-before-break move, set by ServiceManagerV2._floor_counting).
+_FLOOR_EXTRA_ROUTABLE: contextvars.ContextVar[frozenset] = contextvars.ContextVar(
+    "tre_sm_floor_extra_routable", default=frozenset()
+)
+#: Per-model notes a startup's make-up phase leaves for the exemption record of the
+#: sleep's floor check (why no make-up happened). Never mutated in place.
+_FLOOR_EVENT_NOTES: contextvars.ContextVar[dict] = contextvars.ContextVar(
+    "tre_sm_floor_event_notes", default={}
+)
+#: Desired-state reason prefix / writer of a startup's floor make-up wake; the reason
+#: is ``replica_floor_makeup:<suspended binding id>:<startup Pod UID>``.
+FLOOR_MAKEUP_REASON = "replica_floor_makeup"
+FLOOR_UPDATED_BY = "service-manager-floor"
+
+
+def _mark_defrag_source_slept(exc: BaseException) -> None:
+    try:
+        exc.defrag_source_slept = True
+    except Exception:  # noqa: BLE001 - an exception type without a __dict__
+        pass
+
+
+def _lease_expired(lease, now_ms: int) -> bool:
+    expires = int(getattr(lease, "expires_at_ms", 0) or 0)
+    return expires != 0 and expires <= now_ms
 
 
 def _slots_overlap(first: Slot, second: Slot) -> bool:

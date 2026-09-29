@@ -35,13 +35,22 @@ _FALSE_VALUES = {"0", "false", "no", "n", "off"}
 class SafeScaleConfig:
     ttft_p95_slo_ms: float = 500.0
     tpot_p95_slo_ms: float = 75.0
-    # A6: probe window W = max(e2e_multiplier * p95_e2e, min_window_ms). No upper bound:
-    # p95_e2e is bounded by the gateway route timeout (150 s), so W <= ~300 s (v1 cap).
+    # A6: probe window W = min(max(e2e_multiplier * p95_e2e, min_window_ms), window_ceiling_ms).
     # When p95_e2e is missing W = min_window_ms (no avg_ttft fallback). The 20 s floor is
     # short of the N2 invariant (see from_env): tail observations of a short probe read
-    # metrics windows that partly precede the hide, as in v1 (floor 15 s).
+    # metrics windows that partly precede the hide, as in v1 (floor 15 s); every probe
+    # records how much (tail_pre_hide_fraction_*). Env: SAFE_SCALE_WINDOW_FLOOR_MS (the
+    # legacy SAFE_SCALE_MIN_WINDOW_MS is read only when the new name is absent, see
+    # _safescale_window_floor_ms).
     min_window_ms: float = 20_000.0
     e2e_multiplier: float = 2.0
+    # P3-11: W ceiling = 2 x registry gateway.route_timeout_s (ms; no request - so no
+    # p95_e2e - outlives the route timeout, so a longer window only delays the commit).
+    # Set by from_env from the registry (the registry's own default route timeout, 150 s,
+    # applies when the key is absent -> 300 s, v1's cap). None = no ceiling: only when
+    # the registry could not be read (a warning is logged) or in direct constructions.
+    # Never below min_window_ms (calc_probe_window_details raises it to the floor).
+    window_ceiling_ms: float | None = None
     hq: float = 0.25
     tau_low: float = 1.0
     probe_poll_seconds: float = 2.0
@@ -63,8 +72,8 @@ class SafeScaleConfig:
     # queued behind a long action, or re-submitted after a controller restart - is not run
     # on that stale evidence: the ActionQueue turns it into the donor unhide (rollback,
     # reason ``commit_evidence_stale``). Retries of a commit that already started are
-    # exempt. 120 s is independent of the probe window W (which has no ceiling now): it
-    # bounds how stale the evidence a commit runs on may be. TRE_SAFESCALE_COMMIT_MAX_AGE_MS
+    # exempt. 120 s is independent of the probe window W (the age counts from the
+    # decision, after the window): it bounds how stale the evidence a commit runs on may be. TRE_SAFESCALE_COMMIT_MAX_AGE_MS
     # (0 disables).
     commit_max_age_ms: float = 120_000.0
 
@@ -152,6 +161,12 @@ class ControllerConfig:
     oneshot_retry_max_attempts: int = 6
     oneshot_retry_base_s: float = 2.0
     oneshot_retry_max_s: float = 30.0
+    # P2-6: after the SM refused a hide / sleep of a donor with 409 floor_violation, the
+    # planner does not pick that donor for any scale-down for this many fast-loop ticks
+    # (TRE_FLOOR_VIOLATION_COOLDOWN_TICKS; held for ticks * rescue_interval_s on the
+    # ActionQueue clock; 6 x 5 s = 30 s by default; 0 = off). Without it the fast loop
+    # re-plans the same urgent donor every tick against a stale view (livelock).
+    floor_violation_cooldown_ticks: int = 6
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "ControllerConfig":
@@ -215,8 +230,9 @@ class ControllerConfig:
         safescale = SafeScaleConfig(
             ttft_p95_slo_ms=_get_positive_float(values, "SAFE_SCALE_TTFT_P95_SLO_MS", 500.0),
             tpot_p95_slo_ms=_get_positive_float(values, "SAFE_SCALE_TPOT_P95_SLO_MS", 75.0),
-            min_window_ms=_get_positive_float(values, "SAFE_SCALE_MIN_WINDOW_MS", 20_000.0),
+            min_window_ms=_safescale_window_floor_ms(values),
             e2e_multiplier=_get_positive_float(values, "SAFE_SCALE_E2E_MULTIPLIER", 2.0),
+            window_ceiling_ms=_safescale_window_ceiling_ms(registry_path),
             hq=_get_positive_float(values, "SAFE_SCALE_HQ", 0.25),
             tau_low=_get_positive_float(values, "SAFE_SCALE_TAU_LOW", 1.0),
             probe_poll_seconds=_get_positive_float(values, "SAFE_SCALE_PROBE_POLL_SECONDS", 2.0),
@@ -341,7 +357,80 @@ class ControllerConfig:
             oneshot_retry_max_attempts=_get_positive_int(values, "TRE_ONESHOT_RETRY_MAX_ATTEMPTS", 6),
             oneshot_retry_base_s=_get_positive_float(values, "TRE_ONESHOT_RETRY_BASE_SECONDS", 2.0),
             oneshot_retry_max_s=_get_positive_float(values, "TRE_ONESHOT_RETRY_MAX_SECONDS", 30.0),
+            floor_violation_cooldown_ticks=_get_nonneg_int(values, "TRE_FLOOR_VIOLATION_COOLDOWN_TICKS", 6),
         )
+
+
+#: P2-7 (rollback safety): env names of the SafeScale probe-window floor. The new name
+#: is read by this image; the legacy name is what controller images before 2026-09-29
+#: read, and their N2 startup guard REJECTS a legacy value below 60 000 (min*(1-hq) >=
+#: metrics window + refresh + offset). The overlay therefore sets the new name to the
+#: new floor and leaves the legacy name at 60000, so an image rollback alone still
+#: starts (with its own 60 s band).
+WINDOW_FLOOR_ENV = "SAFE_SCALE_WINDOW_FLOOR_MS"
+LEGACY_WINDOW_FLOOR_ENV = "SAFE_SCALE_MIN_WINDOW_MS"
+#: Env keys of the pre-2026-09-29 window band that this image no longer reads.
+RETIRED_WINDOW_ENVS = (
+    "SAFE_SCALE_MAX_WINDOW_MS",
+    "SAFE_SCALE_DEFAULT_WINDOW_MS",
+    "SAFE_SCALE_CW2_FALLBACK_MS",
+    "SAFE_SCALE_CDEC",
+    "SAFE_SCALE_EPSILON_MU",
+)
+
+
+def _safescale_window_floor_ms(values: Mapping[str, str]) -> float:
+    """The probe-window floor (ms). Precedence:
+
+    1. ``SAFE_SCALE_WINDOW_FLOOR_MS`` set -> it wins; a legacy ``SAFE_SCALE_MIN_WINDOW_MS``
+       next to it is ignored (it is kept in the overlay only for older images) - logged
+       at INFO when the two differ;
+    2. only the legacy name set -> it is used, with a WARNING (an overlay predating the
+       rename: the floor it pins, e.g. 60 s, stays in force);
+    3. neither -> the default 20 s.
+    """
+    for key in RETIRED_WINDOW_ENVS:
+        if values.get(key) not in (None, ""):
+            LOG.warning("%s is set but no longer read by this controller (probe window A6)", key)
+    legacy_set = values.get(LEGACY_WINDOW_FLOOR_ENV) not in (None, "")
+    if values.get(WINDOW_FLOOR_ENV) not in (None, ""):
+        floor = _get_positive_float(values, WINDOW_FLOOR_ENV, SafeScaleConfig.min_window_ms)
+        if legacy_set:
+            legacy = _get_positive_float(values, LEGACY_WINDOW_FLOOR_ENV, floor)
+            if legacy != floor:
+                LOG.info(
+                    "%s=%s ignored: %s=%s takes precedence (the legacy name is kept for "
+                    "controller images before 2026-09-29 only)",
+                    LEGACY_WINDOW_FLOOR_ENV, legacy, WINDOW_FLOOR_ENV, floor,
+                )
+        return floor
+    if legacy_set:
+        floor = _get_positive_float(values, LEGACY_WINDOW_FLOOR_ENV, SafeScaleConfig.min_window_ms)
+        LOG.warning(
+            "%s is not set; using the legacy %s=%s as the SafeScale probe-window floor "
+            "(rename it to %s)",
+            WINDOW_FLOOR_ENV, LEGACY_WINDOW_FLOOR_ENV, floor, WINDOW_FLOOR_ENV,
+        )
+        return floor
+    return SafeScaleConfig.min_window_ms
+
+
+def _safescale_window_ceiling_ms(registry_path: str) -> float | None:
+    """P3-11: W ceiling = 2 x registry ``gateway.route_timeout_s`` (ms). The registry
+    parser supplies its default route timeout (150 s) when the key is absent, so the
+    ceiling is then 300 s. None (no ceiling, WARNING) only when the registry cannot be
+    loaded here or has no usable route timeout - the controller then runs as the
+    2026-09-29 commit did (W unbounded above)."""
+    try:
+        gateway = load_registry(registry_path).gateway()
+        timeout_s = float(gateway.route_timeout_s)
+    except Exception as exc:  # noqa: BLE001 - the ceiling is a safety bound, not a gate
+        LOG.warning("SafeScale probe window has no ceiling: registry gateway.route_timeout_s unreadable (%r)", exc)
+        return None
+    if not math.isfinite(timeout_s) or timeout_s <= 0:
+        LOG.warning("SafeScale probe window has no ceiling: gateway.route_timeout_s=%r is not positive", timeout_s)
+        return None
+    return 2.0 * timeout_s * 1000.0
 
 
 def _validate_signal_thresholds(registry_path: str, signal_source: str) -> None:

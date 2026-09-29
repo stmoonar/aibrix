@@ -200,6 +200,37 @@ rollback) or whose `/is_sleeping` is not a clear "awake".
   the event `rescue_waits_for_defrag:<models>`.
 - The service-manager, the controller and the gateway plugin of this change
   must be rolled out together.
+- An SM refusal `409 floor_violation` (a hide / sleep that would take a model below
+  its `min_replicas` routable replicas) is not retried; the refused model is held
+  out of every scale-down plan for `TRE_FLOOR_VIOLATION_COOLDOWN_TICKS` fast-loop
+  ticks (default 6 x `TRE_RESCUE_INTERVAL_SECONDS` = 30 s; `0` = off). Event
+  `floor_violation_hold:<model>`, counter `floor_violation_total`.
+
+### SafeScale probe window (controller env)
+
+`W = min(max(SAFE_SCALE_E2E_MULTIPLIER x p95_e2e, SAFE_SCALE_WINDOW_FLOOR_MS), W_max)`,
+`W_max = 2 x gateway.route_timeout_s` from the registry (300 s at 150 s; no ceiling,
+with a startup warning, only if the registry cannot be read). `window_terms` of every
+probe record carry `W`, `W1`, `W_floor`, `W_max`, `clamped`, `dominant`
+(`e2e` / `floor` / `ceiling`).
+
+With a floor below `TRE_METRICS_WINDOW_MS` + refresh + read offset the commit gate
+may judge metrics windows that partly precede the hide (startup warning). Every
+commit-gate decision records how much: `tail_pre_hide_fraction_mean` / `_max`
+(per judged tail observation: `max(0, hide_ts - window_start) / window_len`,
+`hide_ts` = the probe's start on the snapshot clock, so a lower bound) and
+`tail_observation_count`, in `terminal_details`, `window_terms` and the event
+`safescale_tail_pre_hide:<model>:mean=..:max=..:n=..`. Audit only: the commit
+criterion does not use it.
+
+Env names and rollback: controller images from 2026-09-29 read the floor from
+`SAFE_SCALE_WINDOW_FLOOR_MS`; older images read `SAFE_SCALE_MIN_WINDOW_MS` and refuse
+to start when it is below 60000 (their N2 startup guard). The overlay sets both (new
+name 20000, legacy name 60000), so an image-only rollback still starts. Precedence in
+the new image: the new name wins; only the legacy name set -> it is used, with a
+warning; neither -> 20000. Rule for every controller rollback: **restore the
+controller Deployment object of the backup (image AND env together), never
+`kubectl set image` alone** - env written for a newer image can stop an older one.
 
 ### Tests
 

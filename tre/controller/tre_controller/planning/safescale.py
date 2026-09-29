@@ -34,6 +34,12 @@ class ProbeObservation:
     #: Cumulative gateway counters of the donor model (A13 donor-health), None = unknown.
     gateway_requests: float | None = None
     gateway_errors: float | None = None
+    #: P1-2 audit: the metrics window this observation read (``ModelWindowMetrics``
+    #: ``window_start_ms`` / ``window_end_ms``, epoch ms on the snapshot clock - the
+    #: same clock as ``ts_ms`` and the probe's ``start_ms``). None = unknown (an
+    #: observation journalled by an older controller).
+    window_start_ms: int | None = None
+    window_end_ms: int | None = None
 
 
 @dataclass(frozen=True)
@@ -128,6 +134,10 @@ class ProbeTailSummary:
     sample_count: int
     tail_count: int
     gpu_cache_max: float | None = None
+    #: P1-2 audit (see :func:`tail_pre_hide_stats`): mean / max over the tail
+    #: observations of the share of their metrics window that precedes the hide.
+    pre_hide_fraction_mean: float | None = None
+    pre_hide_fraction_max: float | None = None
 
 
 class SafeScaleStateMachine:
@@ -260,7 +270,7 @@ class SafeScaleStateMachine:
             return SafeScaleDecision(status="none", reason="no_pods_to_probe")
 
         normalized_pending = _normalize_pending_upscales(pending_upscales)
-        # A6: adaptive window W = max(e2e_multiplier * p95_e2e, min_window_ms), no ceiling.
+        # A6: adaptive window W = min(max(e2e_multiplier * p95_e2e, floor), W_max).
         terms = calc_probe_window_details(
             window_inputs or ProbeWindowInputs(), hidden_count=len(pods), config=self._config
         )
@@ -334,19 +344,30 @@ class SafeScaleStateMachine:
         failures = tail_gate_failures(
             summary, tau_low=self._config.tau_low, kv_cache_max=self._config.kv_cache_max
         )
+        audit = {
+            "tail_pre_hide_fraction_mean": summary.pre_hide_fraction_mean,
+            "tail_pre_hide_fraction_max": summary.pre_hide_fraction_max,
+            "tail_observation_count": summary.tail_count,
+        }
         details: dict[str, Any] = {
             "gate_failures": list(failures),
             "tail": _tail_record(summary),
+            # P1-2 audit, also at the top level and in window_terms (reports read either).
+            **audit,
             # A12/P2-a: no KV-cache sample in the tail (no pod reported the gauge) - the
             # gate passes this check like v1, but the record says so explicitly.
             "kv_cache": "unavailable" if summary.gpu_cache_max is None else summary.gpu_cache_max,
         }
         if health is not None:
             details["donor_health"] = health
-        self._probes[model] = replace(updated, terminal_details=details)
+        updated = replace(updated, terminal_details=details, window_terms={**updated.window_terms, **audit})
+        self._probes[model] = updated
         if not failures:
-            return self._commit(updated, reason="formal_commit_gate_passed")
-        return self._rollback(updated, reason="formal_commit_gate_failed")
+            decision = self._commit(updated, reason="formal_commit_gate_passed")
+        else:
+            decision = self._rollback(updated, reason="formal_commit_gate_failed")
+        # The commit / rollback decision record carries the audit too.
+        return replace(decision, details={**decision.details, **audit})
 
     def restore(self) -> int:
         if self._store is None:
@@ -497,23 +518,32 @@ def calc_probe_window_details(
     hidden_count: int,
     config: SafeScaleConfig,
 ) -> dict[str, Any]:
-    """Probe window W = max(e2e_multiplier * p95_e2e_ms, min_window_ms).
+    """Probe window W = min(max(e2e_multiplier * p95_e2e_ms, min_window_ms), W_max).
 
-    No upper bound (p95_e2e is bounded by the gateway route timeout, so W <= ~300 s, v1's
-    cap). A missing / non-positive p95_e2e gives W = min_window_ms (no avg_ttft fallback).
-    Returns W, W1 (multiplier * p95_e2e or None), W_floor, e2e_multiplier, ``dominant``
-    (e2e / floor) and the inputs, for the probe record and events.
+    W_max = ``config.window_ceiling_ms`` (P3-11: 2 x registry gateway.route_timeout_s,
+    set by ControllerConfig.from_env; None = no ceiling), never below the floor. A
+    missing / non-positive p95_e2e gives W = min_window_ms (no avg_ttft fallback).
+    Returns W, W1 (multiplier * p95_e2e or None), W_floor, W_max, ``clamped`` (True when
+    W_max cut W1), e2e_multiplier, ``dominant`` (e2e / floor / ceiling) and the inputs,
+    for the probe record and events.
     """
     floor_ms = float(config.min_window_ms)
     multiplier = float(config.e2e_multiplier)
+    ceiling = _positive(getattr(config, "window_ceiling_ms", None))
+    ceiling_ms = max(ceiling, floor_ms) if ceiling is not None else None
     p95_e2e = _positive(inputs.p95_e2e_ms)
     w1 = multiplier * p95_e2e if p95_e2e is not None else None
     window = max(w1, floor_ms) if w1 is not None else floor_ms
-    dominant = "e2e" if w1 is not None and w1 > floor_ms else "floor"
+    clamped = ceiling_ms is not None and window > ceiling_ms
+    if clamped:
+        window = ceiling_ms
+    dominant = "ceiling" if clamped else ("e2e" if w1 is not None and w1 > floor_ms else "floor")
     return {
         "W": window,
         "W1": w1,
         "W_floor": floor_ms,
+        "W_max": ceiling_ms,
+        "clamped": clamped,
         "e2e_multiplier": multiplier,
         "dominant": dominant,
         "inputs": {
@@ -537,7 +567,8 @@ def format_window_event(model: str, terms: dict[str, Any]) -> str:
     return (
         f"safescale_probe_window:{model}:W={fmt(terms.get('W'))}"
         f":dominant={terms.get('dominant')}:e2e={fmt(terms.get('W1'))}"
-        f":floor={fmt(terms.get('W_floor'))}"
+        f":floor={fmt(terms.get('W_floor'))}:max={fmt(terms.get('W_max'))}"
+        f":clamped={fmt(bool(terms.get('clamped')))}"
     )
 
 
@@ -569,6 +600,7 @@ def _summarize_tail(
     else:
         desired_tail = max(2, int(hq_value))
     tail = observations[-min(sample_count, desired_tail) :]
+    pre_hide = tail_pre_hide_stats(tail, hide_ts_ms=probe.start_ms)
 
     latency_ok = True
     has_traffic = False
@@ -596,7 +628,43 @@ def _summarize_tail(
         sample_count=sample_count,
         tail_count=len(tail),
         gpu_cache_max=max(gpu_cache_values) if gpu_cache_values else None,
+        pre_hide_fraction_mean=pre_hide["tail_pre_hide_fraction_mean"],
+        pre_hide_fraction_max=pre_hide["tail_pre_hide_fraction_max"],
     )
+
+
+def tail_pre_hide_stats(
+    tail: tuple[ProbeObservation, ...] | list[ProbeObservation], *, hide_ts_ms: int
+) -> dict[str, Any]:
+    """P1-2 audit (the commit criterion is NOT changed by it): how much of the evidence
+    the commit gate judged predates the hide.
+
+    For each tail observation (the ``hq`` tail :func:`_summarize_tail` hands to the
+    commit gate) its pre-hide share is ``max(0, hide_ts - window_start) / window_len``,
+    capped at 1, where ``[window_start, window_end]`` is the metrics window that
+    observation read (``ModelWindowMetrics``; sliding window of TRE_METRICS_WINDOW_MS
+    ending at the snapshot's read boundary - the refresh period and read offset are
+    therefore already in ``window_start``) and ``hide_ts`` is the probe's ``start_ms``:
+    the snapshot time the probe (and its hide) was planned at. The hide reaches the
+    gateway only after that, so the share is a LOWER bound of the real one.
+
+    * ``tail_pre_hide_fraction_mean`` / ``_max``: mean / max of the shares over the
+      tail observations that carry window timestamps (None when none does);
+    * ``tail_observation_count``: how many observations the gate judged (the tail size,
+      with or without timestamps).
+    """
+    fractions: list[float] = []
+    for observation in tail:
+        start, end = observation.window_start_ms, observation.window_end_ms
+        if start is None or end is None or end <= start:
+            continue
+        share = max(0.0, float(hide_ts_ms) - float(start)) / float(end - start)
+        fractions.append(min(1.0, share))
+    return {
+        "tail_pre_hide_fraction_mean": (sum(fractions) / len(fractions)) if fractions else None,
+        "tail_pre_hide_fraction_max": max(fractions) if fractions else None,
+        "tail_observation_count": len(tail),
+    }
 
 
 def _tail_allows_commit(summary: ProbeTailSummary, *, tau_low: float, kv_cache_max: float = 0.8) -> bool:
@@ -633,6 +701,9 @@ def _tail_record(summary: ProbeTailSummary) -> dict[str, Any]:
         "sample_count": summary.sample_count,
         "tail_count": summary.tail_count,
         "gpu_cache_max": summary.gpu_cache_max,
+        "tail_pre_hide_fraction_mean": summary.pre_hide_fraction_mean,
+        "tail_pre_hide_fraction_max": summary.pre_hide_fraction_max,
+        "tail_observation_count": summary.tail_count,
     }
 
 
@@ -685,6 +756,8 @@ def _observation_record(observation: ProbeObservation) -> dict[str, Any]:
         "avg_gpu_cache_norm": observation.avg_gpu_cache_norm,
         "gateway_requests": observation.gateway_requests,
         "gateway_errors": observation.gateway_errors,
+        "window_start_ms": observation.window_start_ms,
+        "window_end_ms": observation.window_end_ms,
     }
 
 
@@ -799,6 +872,8 @@ def _observation_from_record(raw: dict[str, Any]) -> ProbeObservation | None:
         avg_gpu_cache_norm=_optional_float(raw.get("avg_gpu_cache_norm")),
         gateway_requests=_optional_float(raw.get("gateway_requests")),
         gateway_errors=_optional_float(raw.get("gateway_errors")),
+        window_start_ms=_optional_int(raw.get("window_start_ms")),
+        window_end_ms=_optional_int(raw.get("window_end_ms")),
     )
 
 
@@ -812,6 +887,11 @@ def _optional_float(value: Any) -> float | None:
     if not math.isfinite(parsed):
         return None
     return parsed
+
+
+def _optional_int(value: Any) -> int | None:
+    parsed = _optional_float(value)
+    return int(parsed) if parsed is not None else None
 
 
 def _normalize_pending_upscales(raw: dict[str, int] | None | Any) -> dict[str, int]:

@@ -547,9 +547,24 @@ class ServiceManagerConfig:
     #: Replica floor (``service_manager.replica_floor.enforce``, 2026-09-29): no hide
     #: or sleep may leave a model with fewer routable replicas than its registry
     #: ``min_replicas`` (hide / urgent / scale_down / defrag refused with 409
-    #: floor_violation, APA targets clamped, startup wakes another replica first,
-    #: fleet repair exempt but recorded). false = the previous behaviour.
+    #: floor_violation, APA targets clamped, startup wakes another replica first
+    #: best effort and is otherwise exempt, fleet repair exempt; every exemption is
+    #: recorded). false = the previous behaviour.
     replica_floor_enforce: bool = True
+    #: ``service_manager.replica_floor.log_interval_s``: the WARNING log of a floor
+    #: event is emitted at most once per (outcome, path, model) in this many seconds
+    #: (the counters always count; 0 = log every event).
+    replica_floor_log_interval_s: float = 60.0
+    #: ``service_manager.startup_admission.gate_seen_s``: a Pod counts as waiting in
+    #: its startup gate while its gate asked for admission within this many seconds
+    #: (the gate polls every 2 s, each call answering within its 15 s timeout).
+    startup_gate_seen_s: float = 30.0
+    #: ``service_manager.startup_admission.drift_grace_s``: a Pod waiting in its
+    #: startup gate is reported as ``startup_admission_pending`` (informational, no
+    #: fleet repair) instead of fleet drift for at most this long since its first
+    #: admission request; a Pod waiting longer is reported as drift again (a stuck
+    #: gate is not masked). 0 = never exempt.
+    startup_gate_drift_grace_s: float = 600.0
 
     @property
     def commit_wait_s(self) -> float:
@@ -989,6 +1004,12 @@ def parse_service_manager_config(
         raise ValueError(
             f"service_manager.replica_floor must be a mapping (enforce: bool), got {floor_raw!r}"
         )
+    startup_raw = raw.get("startup_admission") or {}
+    if not isinstance(startup_raw, dict):
+        raise ValueError(
+            "service_manager.startup_admission must be a mapping "
+            f"(gate_seen_s, drift_grace_s), got {startup_raw!r}"
+        )
     defaults = SleepPolicy()
     plugin_pods_raw = sleep_raw.get("gateway_plugin_pods") or {}
     hard_cap = sleep_raw.get("hard_cap_s")
@@ -1075,7 +1096,26 @@ def parse_service_manager_config(
         replica_floor_enforce=_parse_bool(
             floor_raw.get("enforce", base.replica_floor_enforce)
         ),
+        replica_floor_log_interval_s=_nonneg_num(
+            floor_raw, "log_interval_s", base.replica_floor_log_interval_s,
+            "service_manager.replica_floor.log_interval_s",
+        ),
+        startup_gate_seen_s=_nonneg_num(
+            startup_raw, "gate_seen_s", base.startup_gate_seen_s,
+            "service_manager.startup_admission.gate_seen_s",
+        ),
+        startup_gate_drift_grace_s=_nonneg_num(
+            startup_raw, "drift_grace_s", base.startup_gate_drift_grace_s,
+            "service_manager.startup_admission.drift_grace_s",
+        ),
     )
+
+
+def _nonneg_num(section: dict[str, Any], key: str, default: float, name: str) -> float:
+    value = _num(section, key, default)
+    if not math.isfinite(value) or value < 0:
+        raise ValueError(f"{name} must be a finite number >= 0, got {section.get(key)!r}")
+    return value
 
 
 def parse_sleep_mode_param(value: Any) -> str:

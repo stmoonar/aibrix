@@ -6,9 +6,12 @@ hides first) and the fleet repair quarantine - is checked against the model's
 floor: the number of ROUTABLE replicas left must stay >= the registry
 ``min_replicas`` (both arms, TRE and APA, use it).
 
-Routable = awake, not hidden, Ready, carrying the routable label (when the SM has a
-Kubernetes view), without a sleep reservation and not in a transient ``waking`` /
-``starting`` GPU lease. A replica that is being woken does not count.
+Routable (binding ids) = awake and not hidden in the SM store AND - when the SM has a
+Kubernetes view - a Ready Pod carrying the routable label, without a sleep
+reservation and not in an unexpired transient ``waking`` / ``starting`` GPU lease. A
+replica that is being woken does not count. A make-before-break move (defrag) counts
+its already-routable destination explicitly (the store records it only once the move
+is done).
 
 What happens when an operation would go below the floor depends on its path:
 
@@ -17,12 +20,16 @@ What happens when an operation would go below the floor depends on its path:
   floor_violation``; the controller treats it as permanent for this tick and
   re-plans on the next one).
 * ``apa``: the target is clamped so that the floor holds (no error).
-* ``startup``: another replica of the model is woken first; if none can be woken the
-  admission is refused with RetryLater (409, the init gate polls again).
+* ``startup``: another replica of the model is woken first, best effort (its own
+  writer phase, within max_awake_replicas); what cannot be made up is exempt and
+  recorded - never RetryLater: a Pod held in its startup gate would be seen as fleet
+  drift and trigger a fleet-wide repair (review 2026-09-29 P1-1).
 * ``repair``: exempt (fleet repair quarantines the whole fleet), recorded.
 
-Every refusal / clamp / exemption / make-up wake is counted (per path and model)
-and logged as a JSON event.
+Every refusal / clamp / exemption / make-up wake is counted (per path and model; the
+counters live in Redis with the sleep stats when the SM has Redis, so they survive a
+restart) and logged as a JSON event (WARNING at most once per outcome / path / model
+per ``log_interval_s``; DEBUG otherwise).
 """
 
 from __future__ import annotations
@@ -46,6 +53,7 @@ REJECT_PATHS = frozenset(
     {HIDE_PATH, "safescale_commit", "urgent", "scale_down", "default", "defrag"}
 )
 CLAMP_PATHS = frozenset({"apa"})
+#: Paths that wake another replica first (best effort) and are exempt otherwise.
 MAKEUP_PATHS = frozenset({"startup"})
 EXEMPT_PATHS = frozenset({"repair"})
 
@@ -62,9 +70,9 @@ RECENT_EVENTS = 50
 class FloorCheck:
     model: str
     floor: int
-    #: serve_ids routable now
+    #: binding ids routable now
     routable: tuple[str, ...]
-    #: serve_ids of the operation that are routable now (what it takes out of routing)
+    #: binding ids of the operation that are routable now (what it takes out of routing)
     removing: tuple[str, ...]
 
     @property
@@ -131,12 +139,23 @@ class FloorRecorder:
     """Counters (per outcome, and per outcome / path / model) and recent events.
 
     ``incr(name, amount)``: a counter sink (the sleep journal's Redis-backed
-    counters, so ``GET /v2/sleep`` shows them); None = in memory only."""
+    counters, so ``GET /v2/sleep`` shows them); None = in memory only.
+    ``read_counts()``: the sink's persistent counters (the journal's ``stats()``);
+    :meth:`counts` reads the ``floor_*`` ones from it, so ``floor.counts`` and
+    ``stats`` of ``GET /v2/sleep`` are one set of numbers that survives a restart
+    (None = the in-memory counts of this process).
+    ``log_interval_s``: WARNING at most once per (outcome, path, model) in this
+    many seconds, DEBUG in between (0 = every event); counting is unaffected."""
 
     incr: object = None
+    read_counts: object = None
+    log_interval_s: float = 0.0
+    clock: object = time.monotonic
     _counts: dict[str, int] = field(default_factory=dict)
     _recent: deque = field(default_factory=lambda: deque(maxlen=RECENT_EVENTS))
     _lock: threading.Lock = field(default_factory=threading.Lock)
+    _last_logged: dict[tuple[str, str, str], float] = field(default_factory=dict)
+    _suppressed: dict[tuple[str, str, str], int] = field(default_factory=dict)
 
     def record(self, outcome: str, check: FloorCheck, *, path: str, **extra) -> dict:
         if outcome not in OUTCOMES:
@@ -159,12 +178,37 @@ class FloorRecorder:
             **check.as_dict(),
             **extra,
         }
+        key = (outcome, path, check.model)
+        now = self.clock()
         with self._lock:
             self._recent.appendleft(event)
-        LOG.warning(json.dumps(event, sort_keys=True, default=str))
+            last = self._last_logged.get(key)
+            interval = float(self.log_interval_s or 0.0)
+            if interval > 0 and last is not None and now - last < interval:
+                self._suppressed[key] = self._suppressed.get(key, 0) + 1
+                warn = False
+            else:
+                self._last_logged[key] = now
+                suppressed = self._suppressed.pop(key, 0)
+                warn = True
+        if warn:
+            logged = {**event, "suppressed_since_last_log": suppressed} if suppressed else event
+            LOG.warning(json.dumps(logged, sort_keys=True, default=str))
+        else:
+            LOG.debug(json.dumps(event, sort_keys=True, default=str))
         return event
 
     def counts(self) -> dict[str, int]:
+        reader = self.read_counts
+        if callable(reader):
+            try:
+                return {
+                    name: int(value)
+                    for name, value in reader().items()
+                    if str(name).startswith("floor_")
+                }
+            except Exception:  # noqa: BLE001 - fall back to this process' counts
+                LOG.exception("reading the persistent floor counters failed")
         with self._lock:
             return dict(self._counts)
 

@@ -135,6 +135,9 @@ class DispatchResult:
     #: Pods the SM reported ``unconfirmed`` (/sleep sent, never confirmed asleep)
     #: or whose rollback failed (review 4 P2-2): they must stay hidden.
     unconfirmed: tuple[str, ...] = ()
+    #: The SM refused the call with 409 ``floor_violation`` (P2-6): the model is held
+    #: out of scale-down planning for a while (``ActionQueue.floor_held_models``).
+    floor_violation: bool = False
 
 
 @dataclass
@@ -187,8 +190,18 @@ class ActionQueue:
         commit_max_age_ms: float | None = None,
         is_observe_fresh: Callable[[], bool] | None = None,
         on_hide_failed: Callable[[str, tuple[str, ...], str], None] | None = None,
+        floor_violation_hold_ms: float | None = None,
     ) -> None:
         self._client = client
+        #: P2-6: how long (ms, on ``now_ms``) a model whose hide / sleep the SM refused
+        #: with 409 floor_violation stays out of scale-down planning (None / <= 0 = off).
+        self._floor_hold_ms = (
+            float(floor_violation_hold_ms)
+            if floor_violation_hold_ms is not None and floor_violation_hold_ms > 0
+            else None
+        )
+        #: model -> time (ms, ``now_ms``) its floor-violation hold ends.
+        self._floor_holds: dict[str, int] = {}
         #: P3: (model, pods, error) of a hide that did not take effect (failed, or
         #: not sent because of observe mode): its SafeScale probe is rolled back
         #: instead of being judged as if the pods were hidden.
@@ -248,6 +261,7 @@ class ActionQueue:
             "observe_hide_skipped_total": 0,
             "observe_transfer_stopped_total": 0,
             "observe_commit_stopped_total": 0,
+            "floor_violation_total": 0,
         }
 
     # ------------------------------------------------------------------ submit
@@ -329,6 +343,35 @@ class ActionQueue:
 
     def last_actions(self) -> dict[str, tuple[int, str]]:
         return dict(self._last_done)
+
+    def floor_held_models(self) -> set[str]:
+        """P2-6: models the SM refused a hide / sleep of with 409 floor_violation
+        less than ``floor_violation_hold_ms`` ago. The planner picks none of them as
+        a donor (any scale-down) meanwhile - otherwise the fast loop re-plans the
+        same donor against its stale view every tick and is refused every time."""
+        if not self._floor_holds:
+            return set()
+        now = int(self._now_ms())
+        for model, until in list(self._floor_holds.items()):
+            if now >= until:
+                del self._floor_holds[model]
+        return set(self._floor_holds)
+
+    def _note_floor_violation(self, result: DispatchResult) -> None:
+        if not result.floor_violation or result.model == CLUSTER_MODEL:
+            return
+        self._stats["floor_violation_total"] += 1
+        if self._floor_hold_ms is None:
+            return
+        until = int(self._now_ms() + self._floor_hold_ms)
+        self._floor_holds[result.model] = max(until, self._floor_holds.get(result.model, 0))
+        LOG.warning(
+            json.dumps(
+                {"event": "floor_violation_hold", "model": result.model, "error": result.error,
+                 "hold_ms": self._floor_hold_ms},
+                sort_keys=True,
+            )
+        )
 
     def has_request(self, request_id: str) -> bool:
         """A one-shot action of SafeScale probe ``request_id`` is queued, running
@@ -1097,6 +1140,7 @@ class ActionQueue:
                 ok=False,
                 error=f"dispatch_exception: {type(exc).__name__}: {exc}",
             )
+        self._note_floor_violation(result)
         if self._prof is not None:
             self._prof.record(
                 {
@@ -1369,7 +1413,9 @@ def _dispatch_result(*, model: str, action_kind: str, response: dict) -> Dispatc
         if isinstance(item, dict) and item.get("status") in UNCONFIRMED_OUTCOMES and item.get("serve_id")
     )
     return DispatchResult(
-        model=model, action_kind=action_kind, ok=ok, error=error, retriable=retriable, unconfirmed=unconfirmed
+        model=model, action_kind=action_kind, ok=ok, error=error, retriable=retriable, unconfirmed=unconfirmed,
+        # sm_client ServiceManagerError.result() sets the key only for a floor refusal.
+        floor_violation=(not ok) and "floor_violation" in response,
     )
 
 
