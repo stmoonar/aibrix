@@ -96,8 +96,6 @@ spec:
         - '2048'
         - --gpu-memory-utilization
         - '0.85'
-        - --max-model-len
-        - '32768'
         - --sleep-reject-new
         - --abort-return-token-ids
         env:

@@ -177,9 +177,10 @@ data:
       - '2048'
       - --gpu-memory-utilization
       - '0.85'
-      # --max-model-len: at util 0.85 vLLM 0.30 leaves ~15.8 GiB of KV cache, below the
-      # 16 GiB of the model's full 131072-token context, and refuses to start without it.
-      max_model_len: 32768
+      # --max-model-len; null = the model's maximum (131072), as in v1. Needs 16 GiB of KV:
+      # a clean start at util 0.85 gets 16.76 GiB, but a start beside a sleeping co-resident
+      # got 15.79 GiB and was refused (2026-09-26) - watch cold starts.
+      max_model_len: null
     - name: dsqwen-14b
       weights_path: /data/nfs_shared_data/Models/DeepSeek-R1-Distill-Qwen-14B
       tp_size: 2
@@ -242,10 +243,13 @@ data:
       - --no-enable-prefix-caching
       - --max-num-seqs
       - '256'
+      - --enable-chunked-prefill
+      - --max-num-batched-tokens
+      - '2048'
       - --gpu-memory-utilization
       - '0.85'
-      # --max-model-len (was in vllm_extra_args).
-      max_model_len: 12288
+      # --max-model-len; null = the model's maximum (131072), as in v1.
+      max_model_len: null
     # vLLM container settings shared by every model pod (make manifests and the
     # service-manager's runtime creates). env merges over the built-in
     # VLLM_SERVER_DEV_MODE=1 (vLLM >= 0.2x mounts /sleep, /wake_up, /is_sleeping only in dev
