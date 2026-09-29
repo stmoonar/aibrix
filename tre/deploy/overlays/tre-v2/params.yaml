@@ -481,9 +481,11 @@ data:
       # the ceiling: no traffic -> commit (v1 idle rule); traffic -> latency skipped,
       # Z / KV-cache judged.
       min_commit_samples: 20
-      # The first gateway doc of the evidence window must be stamped within
-      # [hide, hide + this] (hide = Redis TIME when the SM confirmed it); otherwise the
-      # probe rolls back (evidence_clock_skew: gateway clock skew or a missing tick).
+      # The evidence starts at the first gateway boundary after the hide (newest doc
+      # stamp at the SM's confirmation + one period, gateway clock only). Each remaining
+      # pod's first evidence doc must be stamped within [start, newest + this]; otherwise
+      # the probe rolls back (evidence_clock_skew: missed gateway ticks). Offsets of Redis
+      # TIME / the controller clock beyond this are logged (safescale_clock_skew_alert).
       evidence_clock_tolerance_s: 20
 kind: ConfigMap
 metadata:

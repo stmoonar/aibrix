@@ -10,24 +10,34 @@ registry section and ignore it). Nothing here has been applied. Image: to be bui
 
 | # | Before | Now |
 |---|---|---|
-| 1 | an observation per 2 s tick (one 10 s snapshot counted ~5x); every observation could roll back at once, pre-hide windows included | one observation per snapshot (`window_end_ms`); the immediate rollback judges a snapshot only when `window_start_ms >= hide`; donor health / preemption / abort still every tick |
-| 2 | commit latency = hq tail of the 30 s snapshots (~56 % pre-hide at W = 20 s) | evidence window `(S, E]`: `S` = first gateway boundary >= hide, `E` = newest snapshot, remaining pods only (probe pods + pods asleep excluded); `n < min_commit_samples` -> deadline + 10 s up to `W_max`; still short at `W_max`: idle -> commit, traffic -> latency skipped (Z / KV judged) |
-| 3 | `W_max = 2 x gateway.route_timeout_s` (300 s) | `W_max = safescale.window_ceiling_s` (60 s), extensions included |
+| 1 | an observation per 2 s tick (one 10 s snapshot counted ~5x); every observation could roll back at once, pre-hide windows included | one observation per snapshot (`window_end_ms`); the immediate rollback judges a snapshot only when `window_start_ms >= S` (its whole window follows the hide); donor health / preemption / abort still every tick |
+| 2 | commit latency = hq tail of the 30 s snapshots (~56 % pre-hide at W = 20 s) | evidence = docs stamped `[S, E]` (`S` = first gateway boundary after the hide, `E` = newest snapshot; read without histogram lookback, so a pod's delta starts at its first doc >= `S`), remaining pods only (probe pods + pods asleep excluded); `n_judged` (TTFT count of the pods that have a p95 under `TRE_MIN_LATENCY_SAMPLES`) `< min_commit_samples` -> deadline one period past the newest evidence, up to `W_max`; still short at `W_max`: idle (n = 0, nothing in flight) -> commit, traffic -> latency skipped (Z / KV judged) |
+| 3 | `W_max = 2 x gateway.route_timeout_s` (300 s) | `W_max = safescale.window_ceiling_s` (60 s), extensions included; W counts from the boundary before the confirmed hide (= the probe start unless the hide was confirmed late) |
 | 4 | thresholds = env 500 / 75 ms | registry `safescale.slo_mode`: `labels` (default; TPOT 75, TTFT = max(floor, k(c + bL)), L = mean prompt length of the judged window) or `fixed` (`models[].slo`); env = optional override |
-| 5 | - | clock check: first doc of the evidence stamped in `[hide, hide + 20 s]` and no doc stamped >= `S` present at the hide, else rollback `evidence_clock_skew` (ERROR log `safescale_evidence_clock_skew`) |
+| 5 | - | first evidence doc of every remaining pod stamped in `[S, N + 20 s]` (one missed gateway tick tolerated), else rollback `evidence_clock_skew` / `first_doc_outside` (ERROR log `safescale_evidence_clock_skew`); newest-doc read failed at the hide -> rollback `evidence_clock_skew` / `anchor_unverified`; no evidence by `W_max` -> rollback `evidence_empty` (ERROR log); clock offsets -> ERROR `safescale_clock_skew_alert` |
 | 6 | - | audit fields (below), events `safescale_evidence:` / `safescale_rollback_reason:`, summary script |
 
-Hide anchor: Redis `TIME` of the metrics Redis, read right after the SM confirmed the
-hide (ActionQueue `on_hide_done`), plus the model's newest gateway doc stamp at that
-moment. Reasons: node clocks here differ by up to 160 s (node9) and the controller can
-be scheduled on either node; Redis TIME is the clock of the store the gateway docs live
-in and the reference the SM's startup skew check (`service_manager.clock_skew`) already
-uses. The doc stamp catches a gateway running ahead of it. Redis TIME unavailable ->
-controller clock (recorded as `hide_anchor_source: controller_clock`). The anchor is the
-SM's confirmation (pod annotations written), not the gateway applying it; the gateway
-picks the annotation up through its pod watch, normally well inside the gap to `S`
-(0-10 s, ~5 s on average). Requests still routed to a hidden pod meanwhile are outside
-the evidence anyway (probe pods are excluded).
+Evidence anchor. `S = N + 10 s`, `N` = the newest gateway histogram doc stamp of the
+model when the SM confirmed the hide (ActionQueue `on_hide_done`): a doc stamped `S`
+is written after the confirmation, so the evidence is post-hide whatever the node clocks
+say (they differ by up to 160 s here: node9; the gateway stamps docs with its own clock,
+the snapshots read the same stamp grid). Residual: a doc whose scrape started just
+before the confirmation and was written just after it (sub-second). Without `N` (no
+doc of the model yet) `S = ceil(hide_ts / 10 s)`.
+
+`hide_ts` = Redis `TIME` of the metrics Redis at the confirmation (the reference the
+SM's `service_manager.clock_skew` check uses), else the controller clock
+(`hide_anchor_source`). It anchors nothing in the evidence; the offsets
+`gateway_offset_ms` (hide_ts - N, expected 0..10 s) and `controller_offset_ms`
+(controller clock - hide_ts) are recorded and, beyond `evidence_clock_tolerance_s`,
+logged as ERROR `safescale_clock_skew_alert` (alert only: a skewed Redis node must not
+disable SafeScale when the evidence is sound). A gateway running ahead of the
+controller makes `S` unreachable for the snapshots: the probe rolls back
+`evidence_empty` at `W_max`, with an ERROR log.
+
+The confirmation is the SM's (pod annotations written), not the gateway applying it;
+the gateway picks the annotation up through its pod watch. Requests still routed to a
+hidden pod meanwhile are outside the evidence anyway (probe pods are excluded).
 
 ## Registry (structural section, restart-to-apply)
 
@@ -44,8 +54,9 @@ safescale:
 Apply with `deploy/scripts/merge_live_registry.py` (the release adds the section, the
 live tunables are kept) -> `kubectl replace` the ConfigMap -> restart the controller.
 Not needed for the defaults: a controller of this release reading a registry without
-the section uses the same values. Invalid values refuse the start of every component
-that loads the registry (controller, SM, UI) - validate the merged file first.
+the section uses the same values. Invalid values or unknown keys in the section refuse
+the start of every component of this release that loads the registry (controller, SM,
+UI) - validate the merged file first (`merge_live_registry.py` does).
 `gateway.route_timeout_s` no longer affects the probe window.
 
 ## Controller env (`overlays/tre-v2/controller.yaml`)
@@ -63,21 +74,24 @@ threshold in both modes (`threshold_source: env_override` in the audit).
 
 In the decision details, the probe record (`terminal_details` and `window_terms`) and
 the events: `evidence_start_ms`, `evidence_end_ms`, `latency_samples`,
-`latency_gate` (`evaluated` / `skipped` + `latency_skip_reason` `idle` /
-`insufficient_samples` / `p95_unavailable`), `extensions`, `clamped` (W or the evidence
-cut by `W_max`; `window_clamped` = W only), `threshold_mode`, `ttft_threshold_ms`,
+`latency_samples_judged`, `latency_gate` (`evaluated` / `skipped` + `latency_skip_reason`
+`idle` / `insufficient_samples` / `p95_unavailable`), `extensions`, `clamped` (W or the
+evidence cut by `W_max`; `window_clamped` = W only), `window_base_ms`,
+`evidence_anchor` (`gateway_doc` / fallback), `gateway_offset_ms`,
+`controller_offset_ms`, `clock_skew_alert`, `threshold_mode`, `ttft_threshold_ms`,
 `tpot_threshold_ms`, `mean_prompt_tokens`, `rollback_reason` (`{"code": ...}`: 
 `slo_violation`, `formal_commit_gate_failed` + `gates`, `donor_health`, `preempted`,
 `hide_failed`, `hide_unconfirmed`, `evidence_empty`, `evidence_unavailable`,
 `evidence_clock_skew` + `check`), `probe_wall_clock_ms`, `hide_ts_ms` /
-`hide_anchor_source`, and `tail_pre_hide_fraction` (pre-hide share of the latency
-evidence: must be 0). `tail_pre_hide_fraction_mean` / `_max` keep describing the Z / KV
+`hide_anchor_source`, and `tail_pre_hide_fraction` (share of the latency evidence before
+`S`: must be 0). `tail_pre_hide_fraction_mean` / `_max` keep describing the Z / KV
 tail. New decision reasons: `evidence_extended` (probing), `hide_unconfirmed`,
 `evidence_empty`, `evidence_unavailable`, `evidence_clock_skew` (rollbacks).
 
 Run summary: `python3 -m scripts.analysis.safescale_summary <run_dir>/safescale.json`
-(rollback rate, rollback-reason distribution, formal-gate failures, latency-gate
-outcomes, extensions, max evidence pre-hide share). The controller GCs resolved probe
+(resolved probes only: rollback rate, rollback-reason distribution - structured code,
+else the terminal reason cut at ':' - formal-gate failures, latency-gate outcomes,
+extensions, max evidence pre-hide share). The controller GCs resolved probe
 records after one hour, so for longer runs the controller log is the complete record.
 
 ## Expected behaviour change
@@ -85,6 +99,11 @@ records after one hour, so for longer runs the controller log is the complete re
 - Short probes (W = 20 s) now usually need extensions: the first evidence read covers
   only one gateway period (hide at B + 2..5 s -> S = B + 10 s, deadline B + 20 s). At
   light load a probe runs up to 60 s before it commits or rolls back.
+- A gateway tick missed at `S` costs one period of evidence; two missed ticks roll the
+  probe back (`first_doc_outside`).
+- The evidence reads (one per new snapshot from the deadline on) and the hide anchor
+  (Redis TIME + one ZREVRANGEBYSCORE per pod of the model) are synchronous Redis calls
+  on the controller's event loop, like the probe-record writes.
 - No immediate latency rollback within ~30 s of the hide (no snapshot is fully post-hide
   before that); the latency gate at the deadline takes over.
 - Labels thresholds are prompt-length dependent: long-prompt models get a TTFT threshold

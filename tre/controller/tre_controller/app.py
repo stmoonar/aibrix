@@ -250,7 +250,17 @@ def create_controller_dependencies(
         config=cfg.safescale,
         store=ControllerStateStore(redis_client),
         evidence=MetricsEvidenceReader(
-            store,
+            # Same rules as the controller's store, but no histogram lookback: a pod's
+            # delta starts at its first doc stamped at or after the evidence start.
+            MetricsStore(
+                metrics_redis_client,
+                registry,
+                instant_sample_interval_ms=cfg.instant_sample_interval_ms,
+                percentile_mode=cfg.percentile_mode,
+                schema=cfg.metrics_schema,
+                histogram_lookback_ms=0,
+                min_latency_samples=cfg.min_latency_samples,
+            ),
             redis_client=metrics_redis_client,
             sleeping_pods=lambda model: _sleeping_pods(cluster_view_box.get(), model),
         ),

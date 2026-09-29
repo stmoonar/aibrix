@@ -166,8 +166,8 @@ def test_a_pre_hide_snapshot_never_triggers_the_immediate_rollback() -> None:
     decision = machine.observe(MODEL, _obs(140_000, ttft=5_000.0), now_ms=140_000)
     assert (decision.status, decision.reason) == ("rollback", "slo_violation")
     reason = decision.details["rollback_reason"]
-    assert (reason["code"], reason["metrics"], reason["window_start_ms"], reason["hide_ts_ms"]) == (
-        "slo_violation", ["ttft"], 110_000, HIDE,
+    assert (reason["code"], reason["metrics"], reason["window_start_ms"], reason["evidence_start_ms"]) == (
+        "slo_violation", ["ttft"], 110_000, 110_000,
     )
 
 
@@ -443,7 +443,7 @@ class DocRedis:
         self.zsets.setdefault(hist_key(pod), []).append((float(ts), json.dumps(doc)))
 
 
-def _history(redis: DocRedis, *, skip_boundary: bool = False) -> None:
+def _history(redis: DocRedis, *, skip: tuple[int, ...] = ()) -> None:
     # m-0 (stays): slow before the hide, fast after; m-1 (probe pod) and m-2 (asleep): slow.
     cumulative = {"m-0": [0, 0, 0.0], "m-1": [0, 0, 0.0], "m-2": [0, 0, 0.0]}
     for ts in range(70_000, 140_001, 10_000):
@@ -457,14 +457,14 @@ def _history(redis: DocRedis, *, skip_boundary: bool = False) -> None:
             else:
                 row[1] += 10
                 row[2] += 10 * 9_000.0
-            if skip_boundary and pod == "m-0" and ts == 110_000:
+            if pod == "m-0" and ts in skip:
                 continue  # the gateway missed this tick for m-0
             redis.add(pod, ts, fast=row[0], slow=row[1], prompt=row[2])
 
 
 def _reader(redis: DocRedis) -> MetricsEvidenceReader:
     store = MetricsStore(redis, _slo_registry(), instant_sample_interval_ms=10_000, min_latency_samples=10,
-                         histogram_lookback_ms=90_000)
+                         histogram_lookback_ms=0)
     return MetricsEvidenceReader(store, redis_client=redis, sleeping_pods=lambda model: {"m-2"})
 
 
@@ -493,32 +493,53 @@ def test_hide_anchor_is_redis_time_with_the_newest_gateway_doc() -> None:
     assert (anchor.ts_ms, anchor.source, anchor.newest_doc_ts_ms) == (103_250, "redis_time", 100_000)
 
 
-def test_real_reader_clock_check_fails_closed_on_a_missing_boundary_tick() -> None:
-    redis = DocRedis()
-    _history(redis, skip_boundary=True)
-    machine = SafeScaleStateMachine(
-        config=_cfg(), evidence=_reader(redis),
-        wall_clock_ms=lambda: 0,
-    )
-    machine.start_probe(model=MODEL, pods=("m-1",), now_ms=START)
-    machine.mark_hidden(MODEL, pods=("m-1",), anchor=HideAnchor(HIDE, "redis_time", 100_000))
-    machine.observe(MODEL, _obs(110_000), now_ms=110_000)
-    decision = machine.observe(MODEL, _obs(120_000), now_ms=120_000)
-    assert (decision.status, decision.reason) == ("rollback", "evidence_clock_skew")
-    reason = decision.details["rollback_reason"]
-    # The baseline fell back to the 100 s doc: before the hide -> fail closed.
-    assert (reason["check"], reason["first_doc_ts_ms"]) == ("first_doc_outside", {"m-0": 100_000})
-
-
-def test_real_reader_commits_on_post_hide_evidence() -> None:
-    redis = DocRedis()
-    _history(redis)
+def _real_machine(redis: DocRedis) -> SafeScaleStateMachine:
     machine = SafeScaleStateMachine(
         config=_cfg(), evidence=_reader(redis), thresholds=RegistryThresholds(_slo_registry()),
         wall_clock_ms=lambda: 0,
     )
     machine.start_probe(model=MODEL, pods=("m-1",), now_ms=START)
     machine.mark_hidden(MODEL, pods=("m-1",), anchor=HideAnchor(HIDE, "redis_time", 100_000))
+    return machine
+
+
+def test_one_missed_boundary_tick_is_tolerated_the_delta_starts_at_the_next_doc() -> None:
+    redis = DocRedis()
+    _history(redis, skip=(110_000,))
+    machine = _real_machine(redis)
+    machine.observe(MODEL, _obs(110_000), now_ms=110_000)
+    assert machine.observe(MODEL, _obs(120_000), now_ms=120_000).reason == "evidence_extended"  # 1 doc: n = 0
+    assert machine.observe(MODEL, _obs(130_000), now_ms=130_000).reason == "evidence_extended"  # n = 15
+    decision = machine.observe(MODEL, _obs(140_000), now_ms=140_000)
+    assert decision.status == "commit"
+    # Never the pre-hide 100 s doc as the baseline (no lookback).
+    assert (decision.details["evidence_first_doc_ts_ms"], decision.details["latency_samples"]) == (120_000, 30)
+
+
+def test_two_missed_ticks_fail_closed() -> None:
+    redis = DocRedis()
+    _history(redis, skip=(110_000, 120_000))
+    machine = _real_machine(redis)
+    machine.observe(MODEL, _obs(110_000), now_ms=110_000)
+    machine.observe(MODEL, _obs(120_000), now_ms=120_000)  # no m-0 doc yet: extended
+    decision = machine.observe(MODEL, _obs(130_000), now_ms=130_000)
+    assert (decision.status, decision.reason) == ("rollback", "evidence_clock_skew")
+    reason = decision.details["rollback_reason"]
+    assert (reason["check"], reason["first_doc_ts_ms"], reason["latest_allowed_ms"]) == (
+        "first_doc_outside", {"m-0": 130_000}, 120_000,
+    )
+
+
+def test_the_evidence_reader_refuses_a_store_with_histogram_lookback() -> None:
+    store = MetricsStore(DocRedis(), _slo_registry(), instant_sample_interval_ms=10_000, histogram_lookback_ms=90_000)
+    with pytest.raises(ValueError):
+        MetricsEvidenceReader(store)
+
+
+def test_real_reader_commits_on_post_hide_evidence() -> None:
+    redis = DocRedis()
+    _history(redis)
+    machine = _real_machine(redis)
     # Snapshots still show the pre-hide slowness (5 s TTFT): not judged, not in the gate.
     machine.observe(MODEL, _obs(110_000, ttft=5_000.0), now_ms=110_000)
     assert machine.observe(MODEL, _obs(120_000, ttft=5_000.0), now_ms=120_000).reason == "evidence_extended"
@@ -538,15 +559,108 @@ def test_first_doc_outside_the_tolerance_fails_closed() -> None:
     assert decision.details["rollback_reason"]["check"] == "first_doc_outside"
 
 
-def test_a_doc_newer_than_the_hide_existing_at_the_hide_means_a_gateway_clock_ahead() -> None:
-    # node9-style skew: the gateway stamps docs 160 s ahead of Redis TIME.
-    ahead = HideAnchor(ts_ms=HIDE, source="redis_time", newest_doc_ts_ms=HIDE + 160_000)
+def test_the_evidence_start_follows_the_gateway_stamps_not_redis_time() -> None:
+    # Redis 160 s ahead of the gateway (Redis on the fast node): S comes from the doc
+    # stamps, so the evidence is unaffected; the skew is alerted, not acted on.
+    ahead = HideAnchor(ts_ms=100_000 + 160_000, source="redis_time", newest_doc_ts_ms=100_000,
+                       controller_ts_ms=103_000)
+    evidence = FakeEvidence([_window(50)], anchor=ahead)
+    machine = _machine(evidence)
+    probe = _started(machine)
+    assert probe.window_terms["clock_skew_alert"] is True
+    assert probe.window_terms["gateway_offset_ms"] == 160_000
+    assert probe.deadline_ms == START + 20_000  # the window counts on the controller clock
+    machine.observe(MODEL, _obs(110_000), now_ms=110_000)
+    decision = machine.observe(MODEL, _obs(120_000), now_ms=120_000)
+    assert decision.status == "commit"
+    assert evidence.reads[0]["start_ms"] == 110_000
+
+
+def test_a_gateway_ahead_of_the_controller_never_yields_evidence_and_rolls_back_at_the_ceiling() -> None:
+    # node9-style skew: the gateway stamps docs 160 s ahead of Redis TIME / the controller.
+    ahead = HideAnchor(ts_ms=HIDE, source="redis_time", newest_doc_ts_ms=HIDE + 160_000, controller_ts_ms=HIDE)
     machine = _machine(FakeEvidence([_window(50)], anchor=ahead))
+    probe = _started(machine)
+    assert probe.window_terms["clock_skew_alert"] is True
+    for ts in range(110_000, 170_000, 10_000):
+        decision = machine.observe(MODEL, _obs(ts), now_ms=ts)
+    assert (decision.status, decision.reason) == ("rollback", "evidence_empty")
+
+
+def test_an_unverifiable_anchor_fails_closed() -> None:
+    broken = HideAnchor(ts_ms=HIDE, source="redis_time", newest_doc_ts_ms=None, newest_doc_error=True)
+    machine = _machine(FakeEvidence([_window(50)], anchor=broken))
     _started(machine)
     machine.observe(MODEL, _obs(110_000), now_ms=110_000)
     decision = machine.observe(MODEL, _obs(120_000), now_ms=120_000)
     assert (decision.status, decision.reason) == ("rollback", "evidence_clock_skew")
-    assert decision.details["rollback_reason"]["check"] == "doc_predates_hide"
+    assert decision.details["rollback_reason"]["check"] == "anchor_unverified"
+
+
+# ============================================================ review follow-ups
+def test_idle_needs_no_requests_in_flight_either() -> None:
+    # n = 0 but the tail shows traffic (queue) and no Z: not idle -> z_missing rollback.
+    machine = _machine(FakeEvidence([_window(0, ttft=None, tpot=None)]))
+    _started(machine)
+    for ts in range(110_000, 170_000, 10_000):
+        decision = machine.observe(MODEL, _obs(ts, z=None, traffic=True), now_ms=ts)
+    assert (decision.status, decision.reason) == ("rollback", "formal_commit_gate_failed")
+    assert decision.details["rollback_reason"]["gates"] == ["z_missing"]
+    assert decision.details["latency_skip_reason"] == "insufficient_samples"
+
+
+def test_a_snapshot_clock_jump_does_not_burn_extensions_on_the_same_evidence() -> None:
+    evidence = FakeEvidence([_window(8)])
+    machine = _machine(evidence)
+    _started(machine)
+    machine.observe(MODEL, _obs(110_000), now_ms=110_000)
+    # Stale hold, then the next published snapshot is 40 s later.
+    first = machine.observe(MODEL, _obs(150_000), now_ms=150_000)
+    assert (first.reason, first.details["deadline_ms"]) == ("evidence_extended", 160_000)
+    for _ in range(4):  # the 2 s loop re-reads the same snapshot
+        assert machine.observe(MODEL, _obs(150_000), now_ms=150_000).reason == "probe_pending"
+    assert machine.active_probe(MODEL).extensions == 1 and len(evidence.reads) == 1
+
+
+def test_n_counts_only_the_pods_whose_p95_is_judged() -> None:
+    # 24 requests spread over pods below the per-pod p95 minimum: no p95 is judged.
+    machine = _machine(FakeEvidence([{**_window(24, ttft=None, tpot=None), "judged_count": 0.0}]))
+    _started(machine)
+    machine.observe(MODEL, _obs(110_000), now_ms=110_000)
+    decision = machine.observe(MODEL, _obs(120_000), now_ms=120_000)
+    assert (decision.reason, decision.details["extend_reason"]) == ("evidence_extended", "p95_unavailable")
+    # A slow pod below the per-pod minimum does not let a fast pod fill the quota alone.
+    partial = _machine(FakeEvidence([{**_window(20, ttft=100.0), "judged_count": 11.0}]))
+    _started(partial)
+    partial.observe(MODEL, _obs(110_000), now_ms=110_000)
+    assert partial.observe(MODEL, _obs(120_000), now_ms=120_000).reason == "evidence_extended"
+
+
+def test_reader_judged_count_excludes_pods_below_the_per_pod_minimum() -> None:
+    redis = DocRedis()
+    for pod, fast in (("m-0", 6), ("m-3", 12)):
+        redis.add(pod, 110_000, fast=0, slow=0, prompt=0.0)
+        redis.add(pod, 120_000, fast=fast, slow=0, prompt=100.0 * fast)
+    window = _reader(redis).read(MODEL, start_ms=110_000, end_ms=120_000, exclude_pods=())
+    assert (window.ttft_count, window.judged_count) == (18.0, 12.0)
+
+
+def test_a_late_hide_moves_the_window_with_it() -> None:
+    late = HideAnchor(ts_ms=START + 45_500, source="redis_time", newest_doc_ts_ms=START + 40_000,
+                      controller_ts_ms=START + 45_500)
+    machine = _machine(FakeEvidence([_window(50, first_doc=START + 50_000)], anchor=late))
+    probe = _started(machine)
+    assert (probe.window_base_ms, probe.deadline_ms) == (START + 40_000, START + 60_000)
+    for ts in range(110_000, 160_000, 10_000):
+        assert machine.observe(MODEL, _obs(ts), now_ms=ts).status == "probing"
+    decision = machine.observe(MODEL, _obs(160_000), now_ms=160_000)
+    assert decision.status == "commit"
+    assert decision.details["evidence_start_ms"] == START + 50_000
+
+
+def test_registry_safescale_section_rejects_unknown_keys() -> None:
+    with pytest.raises(ValueError):
+        parse_safescale_config({"window_ceiling": 90})
 
 
 # ============================================================ 6. audit fields

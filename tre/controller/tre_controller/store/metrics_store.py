@@ -75,6 +75,10 @@ class MetricsStore:
     def schema(self) -> str:
         return self._schema
 
+    @property
+    def histogram_lookback_ms(self) -> int:
+        return self._histogram_lookback_ms
+
     def read_snapshot(
         self,
         window_start_ms: int,

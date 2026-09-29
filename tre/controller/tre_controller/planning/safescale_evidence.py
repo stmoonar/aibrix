@@ -5,25 +5,29 @@ A snapshot is the phase-aligned 30 s window ``(B - 30 s, B]`` published every 10
 with a 20 s probe more than half of the judged latency predated the hide. The latency
 part of the gate now reads ONE evidence window instead:
 
-* start ``S`` = the first gateway boundary at or after the hide (``ceil(hide / 10 s)``),
-  read half-open ``(S, E]`` so ``MetricsStore._with_baseline_doc`` takes the doc stamped
-  ``S`` as the delta's baseline (the ``+1 ms`` of ``start_exclusive``); ``E`` = the
-  newest snapshot's boundary;
+* start ``S`` = the first gateway boundary after the hide, anchored on the gateway's
+  own doc stamps: ``S = N + period`` with ``N`` = the newest histogram doc stamp of the
+  model when the SM confirmed the hide. A doc stamped ``S`` is written after the hide,
+  whatever the node clocks say (they differ by up to 160 s here), so no clock enters
+  the evidence. Without ``N`` (no doc yet) ``S = ceil(hide_ts / period)``;
+* the window holds the docs stamped in ``[S, E]`` (read without the histogram lookback,
+  so a pod's delta never starts from a pre-hide doc); ``E`` = the newest snapshot's
+  boundary (the same doc-stamp grid the snapshots read);
 * pods: the model's pods minus the probe's hidden pods and minus the pods the fleet
   state reports asleep (a pod the fleet state does not list is kept);
-* TTFT / TPOT p95 = max over those pods (the snapshot rule), ``n`` = their TTFT count,
-  mean prompt length ``L`` = their ``request_prompt_tokens`` sum / count delta.
+* TTFT / TPOT p95 = max over those pods (the snapshot rule, per-pod minimum samples
+  ``TRE_MIN_LATENCY_SAMPLES``), ``n`` = their TTFT count, ``n_judged`` = the TTFT count
+  of the pods that have a p95, mean prompt length ``L`` = their
+  ``request_prompt_tokens`` sum / count delta.
 
-The hide anchor is Redis ``TIME`` read right after the SM confirmed the hide: one
-clock for every controller replica and node (node clocks here differ by up to 160 s),
-the clock of the store the gateway docs live in, and the reference the service-manager's
-own startup skew check already uses. At the same moment the newest gateway doc stamp of
-the model is recorded: a doc stamped at or after ``S`` that already exists at the hide
-can only come from a gateway clock running ahead, i.e. the evidence baseline would
-predate the hide.
+``hide_ts`` is Redis ``TIME`` read right after the SM confirmed the hide (the reference
+the service-manager's clock-skew check uses too), else the controller clock. It is
+kept for the audit and the fallback above; the offsets of the gateway stamps and of the
+controller clock against it are recorded and alerted on (``safescale_clock_skew_alert``).
 """
 from __future__ import annotations
 
+import json
 import logging
 import math
 import time
@@ -45,16 +49,30 @@ DEFAULT_TPOT_SLO_MS = 75.0
 
 @dataclass(frozen=True)
 class HideAnchor:
-    """When the probe's hide took effect."""
+    """When the probe's hide took effect (the SM confirmed it)."""
 
     ts_ms: int
     #: ``redis_time`` (normal) or ``controller_clock`` (Redis TIME failed).
     source: str
-    #: Newest gateway histogram doc stamp of the model at the hide (None = unknown).
+    #: Newest gateway histogram doc stamp of the model at the hide (None = no doc yet).
     newest_doc_ts_ms: int | None = None
+    #: The controller's own clock at the same moment (audit / skew alert).
+    controller_ts_ms: int | None = None
+    #: The newest-doc read failed: the evidence start cannot be anchored on the gateway
+    #: stamps (the probe rolls back, fail-closed).
+    newest_doc_error: bool = False
 
     def as_record(self) -> dict[str, Any]:
-        return {"ts_ms": self.ts_ms, "source": self.source, "newest_doc_ts_ms": self.newest_doc_ts_ms}
+        record: dict[str, Any] = {
+            "ts_ms": self.ts_ms,
+            "source": self.source,
+            "newest_doc_ts_ms": self.newest_doc_ts_ms,
+        }
+        if self.controller_ts_ms is not None:
+            record["controller_ts_ms"] = self.controller_ts_ms
+        if self.newest_doc_error:
+            record["newest_doc_error"] = True
+        return record
 
     @classmethod
     def from_record(cls, raw: Any) -> "HideAnchor | None":
@@ -64,17 +82,47 @@ class HideAnchor:
             ts_ms = int(float(raw["ts_ms"]))
         except (KeyError, TypeError, ValueError):
             return None
-        newest = raw.get("newest_doc_ts_ms")
-        try:
-            newest_ms = int(float(newest)) if newest is not None else None
-        except (TypeError, ValueError):
-            newest_ms = None
-        return cls(ts_ms=ts_ms, source=str(raw.get("source") or "unknown"), newest_doc_ts_ms=newest_ms)
+        return cls(
+            ts_ms=ts_ms,
+            source=str(raw.get("source") or "unknown"),
+            newest_doc_ts_ms=_optional_ms(raw.get("newest_doc_ts_ms")),
+            controller_ts_ms=_optional_ms(raw.get("controller_ts_ms")),
+            newest_doc_error=bool(raw.get("newest_doc_error", False)),
+        )
+
+
+def evidence_start(anchor: HideAnchor, period_ms: int) -> int:
+    """First gateway boundary after the hide: ``newest doc stamp + period`` (gateway
+    clock, no cross-node clock involved), else ``ceil(hide_ts / period)``."""
+    if anchor.newest_doc_ts_ms is not None:
+        return int(anchor.newest_doc_ts_ms) + int(period_ms)
+    return ceil_boundary(anchor.ts_ms, period_ms)
+
+
+def anchor_reference_ms(anchor: HideAnchor) -> int:
+    """The hide in the doc-stamp domain: the newest doc stamp at the hide, else hide_ts.
+    The first evidence doc must lie in [evidence start, this + tolerance]."""
+    return int(anchor.newest_doc_ts_ms) if anchor.newest_doc_ts_ms is not None else int(anchor.ts_ms)
+
+
+def anchor_clock_offsets(anchor: HideAnchor, *, period_ms: int, tolerance_ms: float) -> dict[str, Any]:
+    """Offsets of the gateway stamps and of the controller clock against hide_ts.
+
+    ``gateway_offset_ms`` = hide_ts - newest doc stamp: 0 .. one period (+ write delay)
+    when the clocks agree. ``controller_offset_ms`` = controller clock - hide_ts: ~0.
+    ``clock_skew_alert`` is True when either is off by more than ``tolerance_ms``. Alert
+    only: the evidence window is anchored on the doc stamps and does not depend on it."""
+    gateway = None if anchor.newest_doc_ts_ms is None else int(anchor.ts_ms) - int(anchor.newest_doc_ts_ms)
+    controller = None if anchor.controller_ts_ms is None else int(anchor.controller_ts_ms) - int(anchor.ts_ms)
+    alert = (gateway is not None and not (-tolerance_ms <= gateway <= period_ms + tolerance_ms)) or (
+        controller is not None and anchor.source == "redis_time" and abs(controller) > tolerance_ms
+    )
+    return {"gateway_offset_ms": gateway, "controller_offset_ms": controller, "clock_skew_alert": bool(alert)}
 
 
 @dataclass(frozen=True)
 class EvidenceWindow:
-    """The remaining pods' latency evidence over ``(start_ms, end_ms]``."""
+    """The remaining pods' latency evidence over the docs stamped ``[start_ms, end_ms]``."""
 
     start_ms: int
     end_ms: int
@@ -88,12 +136,19 @@ class EvidenceWindow:
     prompt_count: float | None = None
     #: pod -> stamp (ms) of the first histogram doc its TTFT delta starts from.
     first_doc_ts_ms: dict[str, int] = field(default_factory=dict)
+    #: TTFT count of the pods whose p95 is defined (the requests the p95 judges).
+    #: None = same as ttft_count.
+    judged_count: float | None = None
 
     @property
     def mean_prompt_tokens(self) -> float | None:
         if self.prompt_tokens is None or not self.prompt_count or self.prompt_count <= 0:
             return None
         return float(self.prompt_tokens) / float(self.prompt_count)
+
+    @property
+    def judged(self) -> float:
+        return float(self.ttft_count if self.judged_count is None else self.judged_count)
 
 
 class EvidenceSource(Protocol):
@@ -113,7 +168,9 @@ def ceil_boundary(ts_ms: int, period_ms: int) -> int:
 
 
 class MetricsEvidenceReader:
-    """:class:`EvidenceSource` over the controller's :class:`MetricsStore`."""
+    """:class:`EvidenceSource` over a :class:`MetricsStore` built for it: same redis,
+    registry and percentile / minimum-sample rules as the controller's store, but
+    ``histogram_lookback_ms=0`` so a delta starts at the first doc stamped >= S."""
 
     def __init__(
         self,
@@ -123,6 +180,12 @@ class MetricsEvidenceReader:
         sleeping_pods: Callable[[str], Collection[str]] | None = None,
         clock_ms: Callable[[], int] | None = None,
     ) -> None:
+        lookback = getattr(store, "histogram_lookback_ms", 0)
+        if lookback:
+            raise ValueError(
+                f"the evidence store must read without histogram lookback (got {lookback} ms): "
+                "a lookback baseline would start the delta at a pre-hide doc"
+            )
         self._store = store
         self._redis = redis_client if redis_client is not None else getattr(store, "redis_client", None)
         self._sleeping_pods = sleeping_pods
@@ -130,11 +193,16 @@ class MetricsEvidenceReader:
 
     def hide_anchor(self, model: str) -> HideAnchor:
         ts_ms, source = self._now()
-        return HideAnchor(ts_ms=ts_ms, source=source, newest_doc_ts_ms=self._newest_doc_ts(model))
+        newest, error = self._newest_doc_ts(model)
+        return HideAnchor(
+            ts_ms=ts_ms, source=source, newest_doc_ts_ms=newest,
+            controller_ts_ms=int(self._clock_ms()), newest_doc_error=error,
+        )
 
     def read(self, model: str, *, start_ms: int, end_ms: int, exclude_pods: Collection[str]) -> EvidenceWindow:
+        # (S - 1, E] half-open == docs stamped [S, E]; no lookback -> no pre-S baseline.
         metrics = self._store.read_model_window(
-            model, int(start_ms), int(end_ms), use_cache=False, start_exclusive=True
+            model, int(start_ms) - 1, int(end_ms), use_cache=False, start_exclusive=True
         )
         excluded = set(exclude_pods)
         if self._sleeping_pods is not None:
@@ -142,21 +210,23 @@ class MetricsEvidenceReader:
                 excluded |= set(self._sleeping_pods(model) or ())
             except Exception:  # noqa: BLE001 - no fleet view: only the probe pods are dropped
                 LOG.warning("safescale evidence: sleeping pods of %s unavailable", model, exc_info=True)
+        per_pod = getattr(metrics, "per_pod", None) or {}
         pods = {
             key: pod
-            for key, pod in (getattr(metrics, "per_pod", None) or {}).items()
+            for key, pod in per_pod.items()
             if key not in excluded and getattr(pod, "pod", key) not in excluded
         }
-        dropped = tuple(sorted(
-            getattr(pod, "pod", key)
-            for key, pod in (getattr(metrics, "per_pod", None) or {}).items()
-            if key not in pods
-        ))
+        dropped = tuple(sorted(str(getattr(pod, "pod", key)) for key, pod in per_pod.items() if key not in pods))
         first_docs = {
             str(getattr(pod, "pod", key)): int(pod.hist_first_ts_ms)
             for key, pod in pods.items()
             if getattr(pod, "hist_first_ts_ms", None) is not None
         }
+        judged = sum(
+            float(getattr(pod, "ttft_count", None) or 0.0)
+            for pod in pods.values()
+            if pod.ttft_p95_ms is not None or pod.tpot_p95_ms is not None
+        )
         return EvidenceWindow(
             start_ms=int(start_ms),
             end_ms=int(end_ms),
@@ -168,6 +238,7 @@ class MetricsEvidenceReader:
             prompt_tokens=_sum_present(getattr(pod, "prompt_tokens", None) for pod in pods.values()),
             prompt_count=_sum_present(getattr(pod, "request_count", None) for pod in pods.values()),
             first_doc_ts_ms=first_docs,
+            judged_count=float(judged),
         )
 
     def _now(self) -> tuple[int, str]:
@@ -180,10 +251,11 @@ class MetricsEvidenceReader:
                 LOG.warning("safescale hide anchor: Redis TIME failed; using the controller clock", exc_info=True)
         return int(self._clock_ms()), "controller_clock"
 
-    def _newest_doc_ts(self, model: str) -> int | None:
+    def _newest_doc_ts(self, model: str) -> tuple[int | None, bool]:
+        """(newest histogram doc stamp of the model's pods or None, read failed)."""
         client = self._redis
         if client is None or getattr(self._store, "schema", "v2") != "v2":
-            return None
+            return None, False
         try:
             newest: int | None = None
             for raw_pod in client.smembers(pods_key(model)) or ():
@@ -192,10 +264,27 @@ class MetricsEvidenceReader:
                 for _, score in rows or ():
                     stamp = int(float(score))
                     newest = stamp if newest is None else max(newest, stamp)
-            return newest
-        except Exception:  # noqa: BLE001 - the cross-check is skipped (recorded as None)
+            return newest, False
+        except Exception:  # noqa: BLE001 - fail-closed downstream (newest_doc_error)
             LOG.warning("safescale hide anchor: newest gateway doc of %s unreadable", model, exc_info=True)
-            return None
+            return None, True
+
+
+def log_clock_skew_alert(model: str, request_id: str, anchor: HideAnchor, offsets: Mapping[str, Any]) -> None:
+    LOG.error(
+        json.dumps(
+            {"event": "safescale_clock_skew_alert", "model": model, "request_id": request_id,
+             **anchor.as_record(), **offsets},
+            sort_keys=True,
+        )
+    )
+
+
+def _optional_ms(value: Any) -> int | None:
+    try:
+        return int(float(value)) if value is not None else None
+    except (TypeError, ValueError):
+        return None
 
 
 class RegistryThresholds:

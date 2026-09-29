@@ -41,9 +41,10 @@ def load_probe_records(raw: Any) -> list[dict[str, Any]]:
 
 
 def _resolution(record: Mapping[str, Any]) -> str | None:
-    """commit / rollback for a resolved (or committing) probe; None while probing."""
+    """commit / rollback of a RESOLVED probe; None while probing or committing (the
+    action queue may still turn a commit into a rollback)."""
     resolution = record.get("resolution")
-    if resolution in ("commit", "rollback"):
+    if record.get("status") == "resolved" and resolution in ("commit", "rollback"):
         return str(resolution)
     return None
 
@@ -53,8 +54,10 @@ def _rollback_code(record: Mapping[str, Any]) -> str:
         reason = (record.get(section) or {}).get("rollback_reason")
         if isinstance(reason, Mapping) and reason.get("code"):
             return str(reason["code"])
-    # Records of controllers before 2026-09-29: the plain terminal reason.
-    return str(record.get("terminal_reason") or record.get("resolution_reason") or "unknown")
+    # Queue-side rollbacks (stale commit, observe, floor violation, failed commit) and
+    # records of older controllers: the terminal reason's code (details after ':' cut).
+    reason = str(record.get("terminal_reason") or record.get("resolution_reason") or "unknown")
+    return reason.split(":", 1)[0].strip() or "unknown"
 
 
 def summarize(records: Iterable[Mapping[str, Any]]) -> dict[str, Any]:

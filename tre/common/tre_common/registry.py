@@ -424,12 +424,18 @@ class SafeScaleRegistryConfig:
     evidence_clock_tolerance_s: float = 20.0
 
 
+SAFESCALE_KEYS = frozenset({"slo_mode", "window_ceiling_s", "min_commit_samples", "evidence_clock_tolerance_s"})
+
+
 def parse_safescale_config(raw: dict[str, Any] | None) -> SafeScaleRegistryConfig:
     """Parse the optional ``safescale:`` registry section; raise ValueError on bad values."""
     if raw is None:
         return SafeScaleRegistryConfig()
     if not isinstance(raw, dict):
         raise ValueError(f"safescale must be a mapping, got {raw!r}")
+    unknown = sorted(set(raw) - SAFESCALE_KEYS)
+    if unknown:
+        raise ValueError(f"safescale: unknown keys {unknown} (known: {sorted(SAFESCALE_KEYS)})")
     defaults = SafeScaleRegistryConfig()
     mode = str(raw.get("slo_mode") or defaults.slo_mode).strip().lower()
     if mode not in SAFESCALE_SLO_MODES:

@@ -220,18 +220,22 @@ Commit evidence (2026-09-29, `planning/safescale_evidence.py`, release note
   runs the donor-health guard and preemption / abort on every tick;
 - the immediate SLO rollback judges a snapshot only when its whole window follows the
   hide (`window_start_ms >= hide`);
-- at the deadline the latency check reads the evidence window `(S, E]`,
-  `S` = first gateway boundary at or after the hide (hide = Redis `TIME` when the SM
-  confirmed it), `E` = newest snapshot, remaining pods only (probe pods and pods the
-  fleet state reports asleep excluded). Fewer than `safescale.min_commit_samples`
-  completed requests: the deadline moves one gateway period, up to `W_max`; still short
-  there: no traffic -> commit, traffic -> latency skipped (Z / KV judged);
+- at the deadline the latency check reads the docs stamped `[S, E]`: `S` = newest
+  gateway doc stamp of the model when the SM confirmed the hide + one period (gateway
+  clock only; `ceil(Redis TIME)` without a doc), `E` = newest snapshot, remaining pods
+  only (probe pods and pods the fleet state reports asleep excluded), no histogram
+  lookback. Fewer than `safescale.min_commit_samples` requests on pods with a p95: the
+  deadline moves one gateway period past the newest evidence, up to `W_max` (W counts
+  from the confirmed hide); still short there: no traffic -> commit, traffic -> latency
+  skipped (Z / KV judged);
 - thresholds: registry `safescale.slo_mode` (`labels` = the calibration label rule,
   `fixed` = `models[].slo`); env `SAFE_SCALE_TTFT_P95_SLO_MS` / `SAFE_SCALE_TPOT_P95_SLO_MS`
   are optional overrides (unset);
-- clock check: the first doc of the evidence must be stamped in
-  `[hide, hide + safescale.evidence_clock_tolerance_s]` and no doc stamped at or after
-  `S` may exist at the hide; otherwise rollback `evidence_clock_skew`.
+- clock / continuity check (fail-closed, `evidence_clock_skew`): each remaining pod's
+  first evidence doc within `[S, N + safescale.evidence_clock_tolerance_s]`, and the
+  newest-doc read at the hide must have worked; offsets of Redis `TIME`, the gateway
+  stamps and the controller clock are alerted (`safescale_clock_skew_alert`), not
+  acted on.
 
 Z and the KV-cache fill still come from the tail of the snapshots, which may partly
 precede the hide: `tail_pre_hide_fraction_mean` / `_max` record how much. The
