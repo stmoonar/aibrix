@@ -115,7 +115,8 @@ def summarize(records: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
             extensions.append(int(terms["extensions"]))
         if terms.get("clamped"):
             clamped += 1
-        if terms.get("tail_pre_hide_fraction") is not None and terms.get("latency_source") == "evidence":
+        # Redis ("evidence") and direct-scrape ("direct") probes both record the pre-hide share.
+        if terms.get("tail_pre_hide_fraction") is not None and terms.get("latency_source") in ("evidence", "direct"):
             pre_hide.append(float(terms["tail_pre_hide_fraction"]))
         if terms.get("latency_samples") is not None:
             samples.append(float(terms["latency_samples"]))

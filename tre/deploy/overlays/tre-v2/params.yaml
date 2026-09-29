@@ -358,7 +358,8 @@ data:
         drift_grace_s: 600
       sleep:
         # Every sleep runs hide (routable=false + route-gen bump) -> gateway plugin ack
-        # -> drain -> /sleep (D1/D2); no caller can skip a step.
+        # -> drain -> /sleep (D1/D2); no caller can skip a step, except that the paths in
+        # no_drain_paths (below) skip the drain and abort at once.
         # Max wait for every live gateway plugin instance to report the new route-gen.
         ack_timeout_s: 10
         # A plugin instance is live while its heartbeat score (tre:v2:gw:instances)

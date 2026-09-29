@@ -69,3 +69,14 @@ def test_summary_groups_the_resolved_probes_by_evidence_source() -> None:
                            "rollback_reasons": {"evidence_unavailable": 1}},
         "unknown": {"decided": 1, "commits": 1, "rollbacks": 0, "rollback_rate": 0.0, "rollback_reasons": {}},
     }
+
+
+def test_summary_reports_the_pre_hide_share_of_direct_probes() -> None:
+    def record(request_id, source, pre_hide):
+        terms = {"latency_source": source, "tail_pre_hide_fraction": pre_hide, "evidence_source_used": "direct"}
+        return {"request_id": request_id, "status": "resolved", "resolution": "commit", "window_terms": terms}
+
+    summary = safescale_summary.summarize([record("a", "direct", 0.0), record("b", "direct", 0.25)])
+    assert summary["evidence_pre_hide_fraction_max"] == 0.25
+    summary = safescale_summary.summarize([record("c", "gateway", 0.5)])
+    assert summary["evidence_pre_hide_fraction_max"] is None

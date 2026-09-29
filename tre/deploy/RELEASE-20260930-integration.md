@@ -18,9 +18,31 @@ Component notes, compatibility and per-feature rollback details:
 `RELEASE-20260929-floor-probe-window.md`, `RELEASE-20260929-safescale-evidence.md`,
 `README.md` (SafeScale probe window, action queue, sleep paths).
 
+## 0. Calibration gate (theta) - read first
+
+A new vLLM image invalidates the calibrated theta (registry comment, plan D9; AGENTS:
+after an image change theta, lambda, tau and w_p are recalibrated and updated atomically
+together with the controller). The live theta was fitted on 2026-09-24, before the 0.30
+migration; this release adds the tokenizer fix (8b's byte-level BPE tokenization changes,
+which moves the TSS numerator) on top of the 14b chunked prefill that is already live.
+Therefore:
+
+- `active active` is used **only** for the smoke / acceptance steps 6.5-6.7 below;
+  afterwards controller and SM go back to `observe observe`.
+- **No TRE-arm experiment runs on this release until theta / lambda / tau / w_p are
+  recalibrated on `vllm-openai-tre:0.30.0-ts-8dc0f2a7`** (then applied through console
+  `PUT /api/params` + restart of controller and SM together), or the owner records an
+  explicit waiver in `HANDOFF.md`.
+- Evidence for the 8b decision: step 6.1 also compares token counts of the old and the
+  new image's tokenizer on the calibration prompts.
+
+## Conventions
+
 Throughout: `REPO=/data/nfs_shared_data/xxy/aibrix`, `WT=$REPO-wt/integ-20260930`
 (sibling of the repo: `/data/nfs_shared_data/xxy/aibrix-wt/integ-20260930`), `SHA` = the
-integration commit the images are built from (`git -C $WT rev-parse --short=8 HEAD`),
+integration commit the images are built from, **fixed once before any build and before
+the tag-bump commit of 1.3** (`SHA=$(git -C $WT rev-parse --short=8 HEAD)` evaluated
+now, then written down as a literal; the tag-bump commit moves HEAD),
 `TAG=$(date +%Y%m%d)-$SHA`. Node names below come from the registry
 (`cluster.nodes[].name`); read them, do not retype them:
 
@@ -117,7 +139,9 @@ git -C $REPO rev-parse main > $B/main-sha.txt
 `$B/rollback.sh` must exist and be reviewed before step 3. Requirements:
 
 1. Controller and SM to observe first (`set_run_mode.sh observe observe`).
-2. Roll back in reverse order: controller -> SM -> gateway plugin (-> UI).
+2. Registry ConfigMap first (item 4), so every restored component starts once, on the
+   old registry. Then images in reverse order: controller -> SM -> gateway plugin
+   (-> UI).
 3. **controller and SM: restore the whole Deployment object from `$B/tre-v2-ns.yaml`
    (image AND env AND strategy), never `kubectl set image` alone** - strip
    `resourceVersion`, `uid`, `creationTimestamp`, `generation`, `managedFields`,
@@ -131,12 +155,17 @@ git -C $REPO rev-parse main > $B/main-sha.txt
    back to ts-2be2d647 for the SM's runtime creates. (The old images ignore the new
    `safescale:` / `replica_floor` / `startup_admission` / `sleep.no_drain_paths` keys,
    so an image-only rollback also starts; only `sleep.budgets_s` paths are strict, and
-   this release adds none.) Then restart controller and SM.
-5. Model pods back to ts-2be2d647: sidecar ConfigMap from `$B/tre-reissue-sidecar-cm.yaml`,
-   then the same two-wave delete-then-create as section 5 with the Deployments from
+   this release adds none.)
+5. Model pods back to ts-2be2d647: sidecar ConfigMap from `$B/tre-reissue-sidecar-cm.yaml`
+   (strip `resourceVersion`, `uid`, `creationTimestamp`, `managedFields` before
+   `kubectl replace -f`), then the same two-wave delete-then-create as section 5 with the Deployments from
    `$B/default-models.yaml` (split per `tre.aibrix.io/node`, metadata stripped).
 6. Redis: restore `$B/tre-v2-redis.rdb` only if the desired state is corrupted.
 7. Never build or deploy 687cbd9c.
+8. Partial rollback: an old controller with the new SM treats the new SM's `409
+   floor_violation` as retriable (`RETRIABLE_STATUSES = {409, 503}`, up to 6 tries) and
+   has no floor hold. That combination may only run in `observe`; otherwise roll the SM
+   back with it. (New controller + old SM: no floor on the SM side; also observe only.)
 
 ## 3. Registry ConfigMap
 
@@ -192,6 +221,14 @@ The controller env of the overlay (`SAFE_SCALE_WINDOW_FLOOR_MS` 20000,
 `TRE_FLOOR_VIOLATION_COOLDOWN_TICKS` 6; `SAFE_SCALE_TTFT/TPOT_P95_SLO_MS` removed) goes
 with the image; see the 09-29 release notes. `GET /v2/audit` one-shot, never polled.
 
+**Behaviour change to confirm with the owner before step 4:** with the env overrides
+removed and `safescale.slo_mode: labels` (the default), the SafeScale TTFT threshold is
+`max(slo.ttft_floor_ms, k * (c + b * L))` of the judged window instead of the fixed
+500 ms of v1; with `max_model_len` now 131072, long prompts get a clearly looser TTFT
+gate (e.g. 7b at L = 4000: 1236 ms). This is intended (the calibration label rule), but
+for v1-aligned runs set `safescale.slo_mode: fixed` (`models[].slo`, 500 / 75 ms) via
+the registry merge + controller restart.
+
 ## 5. Model pods: delete then create, two waves by node
 
 Never roll in place (a new pod waits for GPU memory the old pod never frees). Stay in
@@ -216,15 +253,24 @@ same object from the same registry (so the apply is a no-op). Gates stalled > 10
 SM logs, `GET /v2/operations`, then `POST /v2/fleet/repair` (controller in observe).
 Every pod: `image: vllm-openai-tre:0.30.0-ts-8dc0f2a7`, sidecar on :8000.
 
+**8b KV headroom (watch in both waves and on any SM cold create):** with
+`max_model_len: null` 8b needs 16 GiB of KV at util 0.85; a clean start gets 16.76 GiB,
+a start beside a sleeping co-resident got 15.79 GiB and was refused (2026-09-26). If an
+8b pod logs insufficient KV cache / `max_model_len` too large or CrashLoops: stop the
+wave, controller stays observe; first retry that binding alone after its GPU's
+co-residents are asleep (start order); if it still fails, pin 8b `max_model_len` (e.g.
+the previous 32768) in the registry, `make manifests`, registry merge + SM restart, and
+recreate only the 8b Deployments - record the deviation from v1 in `HANDOFF.md`.
+
 ## 6. Smoke and acceptance (in order, stop at the first failure)
 
 Keep `observe observe` through 6.1-6.3; switch to the TRE arm (`active active`) only for
 6.5-6.7 and only with the owner's go-ahead.
 
-1. **Tokenizer self-check** (gate; CPU, run before section 5 on each node's image, and
-   repeatable after): `forks/vllm/tools/check_tokenizer_consistency.py` from fork
-   commit 8dc0f2a7 (worktree `forks/vllm-wt-tokenizer`), one run per model, each must
-   **exit 0**:
+1. **Tokenizer self-check** (gate; CPU, before section 5; run the loop below on **each**
+   node, i.e. on 76 and again over ssh on 75, against that node's local image):
+   `forks/vllm/tools/check_tokenizer_consistency.py` from fork commit 8dc0f2a7
+   (worktree `forks/vllm-wt-tokenizer`), one run per model, each must **exit 0**:
    ```bash
    T=/data/nfs_shared_data/xxy/forks/vllm-wt-tokenizer/tools
    for W in $(python3 -c 'import yaml,sys; print(" ".join(m["weights_path"] for m in yaml.safe_load(open(sys.argv[1]))["models"]))' $WT/tre/deploy/registry.yaml); do
@@ -234,6 +280,11 @@ Keep `observe observe` through 6.1-6.3; switch to the TRE arm (`active active`) 
    done
    ```
    The BOS line is a warning only (known, see backlog).
+   Calibration-gate evidence (section 0): tokenize a sample of the calibration prompts
+   (the prompt texts the calibration / loadgen runs send) with `get_tokenizer(<weights>)`
+   inside the old image `ts-2be2d647` and inside `ts-8dc0f2a7`, per model; report the
+   per-prompt token-count difference (expected: 8b differs, 7b / 14b identical). Any
+   difference -> that model's theta must be recalibrated before a TRE-arm run.
 2. **Fleet**: 20/20 Ready, no restarts; `GET /v2/audit` (one call) empty; each model
    answers `/v1/completions` and `/v1/chat/completions` through the gateway NodePort.
 3. **Serve args**: pod args show no `--max-model-len` (each model serves its maximum);
@@ -254,15 +305,25 @@ Keep `observe observe` through 6.1-6.3; switch to the TRE arm (`active active`) 
    the SLO on the remaining pods: `rollback_reason.code=slo_violation_direct` within a
    few seconds, pod routable again). Summarise with
    `python3 -m scripts.analysis.safescale_summary <run_dir>/safescale.json`;
-   `tail_pre_hide_fraction` must be 0.
+   `evidence_pre_hide_fraction_max` must be 0 (the summary covers direct probes since
+   this release). Require at least one `evidence_source_used=direct` probe whose
+   remaining pods are on **each** node (proves the controller reaches pod
+   IP:`metrics_port` across nodes; there is no NetworkPolicy today).
 7. **CRIT path**: drive one model's Z_m past `tau_crit`: fast-loop urgent wake within
    seconds, donors released on the no-drain `urgent` path without breaking their floor,
    no stuck reservation, `GET /v2/audit` empty afterwards.
 
 Any failure: controller back to observe, then `$B/rollback.sh` as far as needed.
+After 6.7 (pass or fail): `set_run_mode.sh observe observe` again (section 0).
 
 ## 7. After acceptance
 
-Record image IDs and the deployed sha in `HANDOFF.md`; merging `integ/tre-v2-20260930`
-into main and pushing are separate, owner-approved steps. Deferred issues:
-`docs/backlog-20260929.md` (SafeScale P2-2, P3-1..P3-6).
+Record image IDs and the deployed sha in `HANDOFF.md`. The release stays in
+`observe observe` until the calibration gate of section 0 is closed (recalibration on
+ts-8dc0f2a7 applied atomically, or the owner's waiver recorded). Merging
+`integ/tre-v2-20260930` into main and pushing are separate, owner-approved steps.
+
+Known limitations (deferred, see the local backlog): SafeScale P2-2 / P3-1..P3-6 of the
+implementation review; a SafeScale commit does not re-check the floor when a remaining
+pod drops out during the probe (the probed pod is already hidden, so the commit's
+floor guard sees nothing to remove) - abnormal path only.
