@@ -323,13 +323,15 @@ data:
     \ not isinstance(value, (int, float)):\n        return True\n    return value\
     \ > limit\n\n\ndef _reject_constant(name: str) -> Any:\n    raise ValueError(f\"\
     non-standard JSON constant {name}\")\n\n\ndef parse_body(raw: bytes) -> Any:\n\
-    \    \"\"\"The request body as JSON, or None when it is not strict JSON (NaN /\
-    \ Infinity are\n    rejected, as the gateway's parser does).\"\"\"\n    try:\n\
-    \        return json.loads(raw, parse_constant=_reject_constant)\n    except ValueError:\n\
-    \        return None\n\n\ndef non_continuable_reason(path: str, body: Any, cfg:\
-    \ \"Config\") -> str | None:\n    \"\"\"Why a request cannot be resumed from its\
-    \ emitted tokens (None = it can). The same\n    rules and reason strings as the\
-    \ gateway plugin's treNonContinuableReason\n    (pkg/plugins/gateway/tre_transparent_sleep.go),\
+    \    \"\"\"The request body as JSON, or None when it cannot be parsed, accepting\
+    \ what the\n    gateway's parser accepts: invalid UTF-8 and raw control characters\
+    \ inside strings\n    pass, NaN / Infinity / a byte-order mark do not; too deep\
+    \ nesting is None too.\"\"\"\n    try:\n        return json.loads(raw.decode(\"\
+    utf-8\", \"replace\"), strict=False, parse_constant=_reject_constant)\n    except\
+    \ (ValueError, RecursionError):\n        return None\n\n\ndef non_continuable_reason(path:\
+    \ str, body: Any, cfg: \"Config\") -> str | None:\n    \"\"\"Why a request cannot\
+    \ be resumed from its emitted tokens (None = it can). The same\n    rules and\
+    \ reason strings as the gateway plugin's treNonContinuableReason\n    (pkg/plugins/gateway/tre_transparent_sleep.go),\
     \ which makes the service-manager drain\n    such requests instead of aborting\
     \ them; both are checked against the shared contract\n    tre/reissue/contract/non_continuable_cases.json.\
     \ ``path`` excludes the query string\n    and ``body`` is :func:`parse_body` of\

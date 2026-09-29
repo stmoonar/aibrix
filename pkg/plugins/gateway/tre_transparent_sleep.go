@@ -322,11 +322,11 @@ func treNonContinuable(requestPath string, body []byte) bool {
 // (streaming or not), structured output / guided decoding, a prompt form the continuation
 // cannot extend (completions: suffix, prompt_embeds, a batch or anything but one string /
 // one token-id list; chat: messages missing or empty), and every non-generation endpoint.
-// requestPath is the raw :path; the query string is ignored. Field names match exactly
+// requestPath is the raw :path; a query string is ignored. Field names match exactly
 // (no case folding) and unparseable fields count as non-continuable.
 func treNonContinuableReason(requestPath string, body []byte) string {
 	path := requestPath
-	if i := strings.IndexByte(path, '?'); i >= 0 {
+	if i := strings.IndexByte(path, '?'); i >= 0 { // defensive: the request validation already rejects a query
 		path = path[:i]
 	}
 	if path != PathCompletions && path != PathChatCompletions {
@@ -361,7 +361,7 @@ func treNonContinuableReason(requestPath string, body []byte) string {
 	if path == PathCompletions {
 		return treCompletionPromptForm(f)
 	}
-	if items, ok := rawArray(f["messages"]); ok && len(items) > 0 {
+	if rawArrayNonEmpty(f["messages"]) {
 		return ""
 	}
 	return treNCPromptForm
@@ -411,42 +411,58 @@ func treCompletionPromptForm(f map[string]json.RawMessage) string {
 	if rawPresent(f["prompt_embeds"]) || rawPresent(f["suffix"]) {
 		return treNCPromptForm
 	}
-	prompt := f["prompt"]
-	if rawKind(prompt) == '"' {
+	prompt := jsonTrim(f["prompt"])
+	switch rawKind(prompt) {
+	case '"':
 		return ""
-	}
-	items, ok := rawArray(prompt)
-	if !ok || len(items) == 0 {
+	case '[':
+	default:
 		return treNCPromptForm
 	}
-	allInts := true
-	for _, it := range items {
-		if !rawInteger(it) {
-			allInts = false
-			break
-		}
+	inner := jsonTrim(prompt[1 : len(prompt)-1])
+	if len(inner) == 0 {
+		return treNCPromptForm
 	}
-	if allInts {
+	if rawIntegerList(inner) {
 		return ""
 	}
-	if len(items) == 1 {
-		if k := rawKind(items[0]); k == '"' || k == '[' {
+	if k := inner[0]; k == '"' || k == '[' { // rare: decode only a batch that may be one element
+		var items []json.RawMessage
+		if err := sonic.Unmarshal(prompt, &items); err == nil && len(items) == 1 {
 			return ""
 		}
 	}
 	return treNCPromptForm
 }
 
-// rawKind is the first non-space byte of a raw JSON value (0 when empty).
-func rawKind(r json.RawMessage) byte {
-	s := strings.TrimSpace(string(r))
-	if s == "" {
-		return 0
+// The helpers below work on sub-values of a body that already parsed as JSON, so a
+// value's first byte identifies its type and no copy of (possibly large) prompts or
+// message lists is needed.
+
+func isJSONSpace(c byte) bool { return c == ' ' || c == '\t' || c == '\n' || c == '\r' }
+
+// jsonTrim strips JSON whitespace from both ends without copying.
+func jsonTrim(b []byte) []byte {
+	i, j := 0, len(b)
+	for i < j && isJSONSpace(b[i]) {
+		i++
 	}
-	return s[0]
+	for j > i && isJSONSpace(b[j-1]) {
+		j--
+	}
+	return b[i:j]
 }
 
-// rawObject decodes a JSON object with exact-case keys; ok=false for anything else.
+// rawKind is the first non-space byte of a raw JSON value (0 when empty).
+func rawKind(r []byte) byte {
+	if t := jsonTrim(r); len(t) > 0 {
+		return t[0]
+	}
+	return 0
+}
+
+// rawObject decodes a JSON object with exact-case keys (duplicate keys: the last wins);
+// ok=false for anything else.
 func rawObject(r []byte) (map[string]json.RawMessage, bool) {
 	if rawKind(r) != '{' {
 		return nil, false
@@ -458,28 +474,21 @@ func rawObject(r []byte) (map[string]json.RawMessage, bool) {
 	return m, true
 }
 
-// rawArray decodes a JSON array; ok=false for anything else (absent and null included).
-func rawArray(r json.RawMessage) ([]json.RawMessage, bool) {
-	if rawKind(r) != '[' {
-		return nil, false
-	}
-	var items []json.RawMessage
-	if err := sonic.Unmarshal(r, &items); err != nil {
-		return nil, false
-	}
-	return items, true
-}
-
-// rawInteger: a JSON integer literal (what Python's json decodes to int; 1.0 and 1e2 are
-// floats there and do not count).
-func rawInteger(r json.RawMessage) bool {
-	s := strings.TrimSpace(string(r))
-	s = strings.TrimPrefix(s, "-")
-	if s == "" {
+// rawArrayNonEmpty: a JSON array with at least one element (absent / null / other = false).
+func rawArrayNonEmpty(r []byte) bool {
+	t := jsonTrim(r)
+	if len(t) < 2 || t[0] != '[' {
 		return false
 	}
-	for i := 0; i < len(s); i++ {
-		if s[i] < '0' || s[i] > '9' {
+	return len(jsonTrim(t[1:len(t)-1])) > 0
+}
+
+// rawIntegerList: the inside of a JSON array holds only integer literals (what Python's
+// json decodes to int; 1.0 and 1e2 are floats there and do not count). In valid JSON an
+// element made only of digits and '-' is an integer.
+func rawIntegerList(inner []byte) bool {
+	for _, c := range inner {
+		if !(c >= '0' && c <= '9' || c == '-' || c == ',' || isJSONSpace(c)) {
 			return false
 		}
 	}
@@ -496,35 +505,34 @@ func rawStringIs(r json.RawMessage, want string) bool {
 }
 
 func rawPresent(r json.RawMessage) bool {
-	s := strings.TrimSpace(string(r))
-	return s != "" && s != "null"
+	t := jsonTrim(r)
+	return len(t) > 0 && string(t) != "null"
 }
 
 func rawIs(r json.RawMessage, lit string) bool {
-	return strings.TrimSpace(string(r)) == lit
+	return string(jsonTrim(r)) == lit
 }
 
-// rawNumberAbove: present and > limit; present but not a number counts as above.
+// rawNumberAbove: present and > limit; present but not a number counts as above. An
+// out-of-range literal compares as the +-Inf ParseFloat returns (as Python's float does).
 func rawNumberAbove(r json.RawMessage, limit float64) bool {
 	if !rawPresent(r) {
 		return false
 	}
-	f, err := strconv.ParseFloat(strings.TrimSpace(string(r)), 64)
-	if err != nil {
+	f, err := strconv.ParseFloat(string(jsonTrim(r)), 64)
+	if err != nil && !errors.Is(err, strconv.ErrRange) {
 		return true
 	}
 	return f > limit
 }
 
+// rawNonEmptyArray: present and either a non-empty array or not an array at all
+// (conservative).
 func rawNonEmptyArray(r json.RawMessage) bool {
 	if !rawPresent(r) {
 		return false
 	}
-	var arr []json.RawMessage
-	if err := sonic.Unmarshal(r, &arr); err != nil {
-		return true // present but not an array: be conservative
-	}
-	return len(arr) > 0
+	return rawKind(r) != '[' || rawArrayNonEmpty(r)
 }
 
 // ---------------------------------------------------------------------------------------

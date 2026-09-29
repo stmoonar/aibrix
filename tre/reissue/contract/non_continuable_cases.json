@@ -28,6 +28,15 @@
     {"name": "body with surrounding whitespace", "path": "/v1/completions", "body_raw": "  {\"prompt\":\"x\"}\n", "want": false, "reason": null},
     {"name": "duplicate key: last value wins", "path": "/v1/completions", "body_raw": "{\"prompt\":\"x\",\"n\":2,\"n\":1}", "want": false, "reason": null},
 
+    {"name": "completions n written 1e0", "path": "/v1/completions", "body_raw": "{\"prompt\":\"x\",\"n\":1e0}", "want": false, "reason": null},
+    {"name": "completions n far below 1 (out of float range)", "path": "/v1/completions", "body_raw": "{\"prompt\":\"x\",\"n\":-1e400}", "want": false, "reason": null},
+    {"name": "completions token id -0", "path": "/v1/completions", "body_raw": "{\"prompt\":[-0, 5]}", "want": false, "reason": null},
+    {"name": "completions one-element batch of an empty list", "path": "/v1/completions", "body": {"prompt": [[]]}, "want": false, "reason": null},
+    {"name": "completions token ids with whitespace", "path": "/v1/completions", "body_raw": "{\"prompt\": [ 1 ,\n 2 ] }", "want": false, "reason": null},
+    {"name": "echo 1 is not true", "path": "/v1/completions", "body": {"prompt": "x", "echo": 1}, "want": false, "reason": null},
+    {"name": "chat response_format type null", "path": "/v1/chat/completions", "body": {"messages": [{}], "response_format": {"type": null}}, "want": false, "reason": null},
+    {"name": "chat messages with whitespace inside", "path": "/v1/chat/completions", "body_raw": "{\"messages\":[ {} ]}", "want": false, "reason": null},
+    {"name": "raw control character inside a string", "path": "/v1/completions", "body_raw": "{\"prompt\":\"a\tb\"}", "want": false, "reason": null},
     {"name": "embeddings endpoint", "path": "/v1/embeddings", "body": {"input": "x"}, "want": true, "reason": "endpoint"},
     {"name": "responses endpoint", "path": "/v1/responses", "body": {"input": "x"}, "want": true, "reason": "endpoint"},
     {"name": "anthropic messages endpoint", "path": "/v1/messages", "body": {"messages": [{}]}, "want": true, "reason": "endpoint"},
@@ -98,6 +107,13 @@
     {"name": "chat messages missing", "path": "/v1/chat/completions", "body": {"prompt": "x"}, "want": true, "reason": "prompt_form"},
     {"name": "chat messages null", "path": "/v1/chat/completions", "body": {"messages": null}, "want": true, "reason": "prompt_form"},
     {"name": "chat messages a string", "path": "/v1/chat/completions", "body": {"messages": "hi"}, "want": true, "reason": "prompt_form"},
-    {"name": "chat messages an object", "path": "/v1/chat/completions", "body": {"messages": {"role": "user"}}, "want": true, "reason": "prompt_form"}
+    {"name": "chat messages an object", "path": "/v1/chat/completions", "body": {"messages": {"role": "user"}}, "want": true, "reason": "prompt_form"},
+    {"name": "body with a UTF-8 byte-order mark", "path": "/v1/completions", "body_raw": "﻿{\"prompt\":\"x\"}", "want": true, "reason": "body"},
+    {"name": "top_logprobs numeric string", "path": "/v1/chat/completions", "body": {"messages": [{}], "top_logprobs": "2"}, "want": true, "reason": "logprobs"},
+    {"name": "n far above 1 (out of float range)", "path": "/v1/completions", "body_raw": "{\"prompt\":\"x\",\"n\":1e400}", "want": true, "reason": "n"},
+    {"name": "guided_json_object 0 is not false", "path": "/v1/completions", "body": {"prompt": "x", "guided_json_object": 0}, "want": true, "reason": "structured_output"},
+    {"name": "tools an object", "path": "/v1/chat/completions", "body": {"messages": [{}], "tools": {}}, "want": true, "reason": "tools"},
+    {"name": "completions batch of a string and a list", "path": "/v1/completions", "body": {"prompt": ["a", [1]]}, "want": true, "reason": "prompt_form"},
+    {"name": "completions token ids then a nested list", "path": "/v1/completions", "body": {"prompt": [1, [2]]}, "want": true, "reason": "prompt_form"}
   ]
 }

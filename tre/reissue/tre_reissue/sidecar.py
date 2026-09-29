@@ -597,11 +597,12 @@ def _reject_constant(name: str) -> Any:
 
 
 def parse_body(raw: bytes) -> Any:
-    """The request body as JSON, or None when it is not strict JSON (NaN / Infinity are
-    rejected, as the gateway's parser does)."""
+    """The request body as JSON, or None when it cannot be parsed, accepting what the
+    gateway's parser accepts: invalid UTF-8 and raw control characters inside strings
+    pass, NaN / Infinity / a byte-order mark do not; too deep nesting is None too."""
     try:
-        return json.loads(raw, parse_constant=_reject_constant)
-    except ValueError:
+        return json.loads(raw.decode("utf-8", "replace"), strict=False, parse_constant=_reject_constant)
+    except (ValueError, RecursionError):
         return None
 
 

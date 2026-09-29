@@ -63,8 +63,9 @@ guided decoding (`response_format` other than `text`, `guided_json`, `guided_reg
 `structured_outputs`), a prompt form a continuation cannot extend (completions: `suffix`,
 `prompt_embeds`, or a prompt other than one string / one token-id list / a one-element
 batch; chat: `messages` missing or empty), a body that is not a JSON object, and every
-endpoint other than completions and chat completions (the query string of `:path` is
-ignored). The rules and reason strings are shared with the reissue sidecar and checked by
+endpoint other than completions and chat completions. (A `:path` with a query string never
+reaches the classification: request validation matches the exact path. The classifier
+ignores the query anyway, as the sidecar does.) The rules and reason strings are shared with the reissue sidecar and checked by
 both test suites against `tre/reissue/contract/non_continuable_cases.json`.
 Known semantic drift that is *not* classified as non-continuable: in a continuation the
 tokens generated before the seam are part of the prompt, so `presence_penalty` and

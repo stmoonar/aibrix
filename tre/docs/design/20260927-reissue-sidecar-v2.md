@@ -56,7 +56,7 @@
 - `continue_final_message=true, add_generation_prompt=false` 要把部分回答作为文本重新渲染、重新分词：接缝处可能切分不同；且 DeepSeek-R1 系模板渲染 assistant 历史时会删掉 `</think>` 之前的内容、generation prompt 与历史 assistant 前缀不同，上下文对不上（旧分支已核实）。
 - completions 输出 chunk 改写回 chat 形态（`delta.content`、`object=chat.completion.chunk`、原 id/created/model）。代价：服务端若开 reasoning / tool parser，续发段不经过它们（tool 请求本来就不可续发；当前部署未开 reasoning parser）。
 
-**不可续发**（与网关插件 `treNonContinuableReason` 同一分类、同一组 reason 字符串；两边测试都读共享契约 `tre/reissue/contract/non_continuable_cases.json`，路径比对前去掉 query）：`n>1`、`best_of>1`、任何 logprobs、`echo`、beam search、
+**不可续发**（与网关插件 `treNonContinuableReason` 同一分类、同一组 reason 字符串；两边测试都读共享契约 `tre/reissue/contract/non_continuable_cases.json`；两边都忽略 query，网关的请求校验本就按精确路径匹配、带 query 的请求到不了分类）：`n>1`、`best_of>1`、任何 logprobs、`echo`、beam search、
 tools/functions（除非 `tool_choice: none`）、结构化输出 / guided decoding（`response_format` 非 text、`guided_*`、`structural_tag`、`structured_outputs`）、
 批量 prompt / `prompt_embeds` / `suffix`、chat 的 `messages` 缺失或为空、body 不是 JSON 对象、completions 与 chat 以外的端点。SM 对这些请求一律等排空；若仍被 abort：
 - 流式且已向客户端发过内容：abort 透传，计 `passthrough_abort{reason=non_continuable_*}`；
