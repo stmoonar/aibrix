@@ -459,6 +459,32 @@ data:
       node_pressure:
         # Only registry nodes (cluster.nodes) can block a cold start.
         registry_nodes_only: true
+    # SafeScale probe (controller only; read at start, restart-to-apply; every key
+    # optional, the values below are the built-in defaults). Controller images before
+    # 2026-09-29 (safescale-evidence) ignore this section.
+    safescale:
+      # Latency thresholds of the probe (immediate rollback and commit gate):
+      # labels - the calibration label's rule (tre_common.slo_labels): TPOT 75 ms,
+      #          TTFT = max(slo.ttft_floor_ms, k * (c + b * L)) with L the mean prompt
+      #          length of the judged window (L unknown -> the floor);
+      # fixed  - models[].slo.ttft_p95_ms / tpot_p95_ms (v1: 500 / 75 ms).
+      # The controller env SAFE_SCALE_TTFT_P95_SLO_MS / SAFE_SCALE_TPOT_P95_SLO_MS (unset
+      # by default) override the respective threshold in either mode.
+      slo_mode: labels
+      # Probe window W = min(max(SAFE_SCALE_E2E_MULTIPLIER x p95_e2e,
+      # SAFE_SCALE_WINDOW_FLOOR_MS), window_ceiling_s); deadline extensions (one gateway
+      # period each, while the post-hide evidence holds fewer than min_commit_samples
+      # completed requests) never pass it either.
+      window_ceiling_s: 60
+      # Completed requests (TTFT count of the remaining pods since the first gateway
+      # boundary after the hide) needed to judge latency at the deadline. Still short at
+      # the ceiling: no traffic -> commit (v1 idle rule); traffic -> latency skipped,
+      # Z / KV-cache judged.
+      min_commit_samples: 20
+      # The first gateway doc of the evidence window must be stamped within
+      # [hide, hide + this] (hide = Redis TIME when the SM confirmed it); otherwise the
+      # probe rolls back (evidence_clock_skew: gateway clock skew or a missing tick).
+      evidence_clock_tolerance_s: 20
 kind: ConfigMap
 metadata:
   name: tre-v2-registry

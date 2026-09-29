@@ -398,6 +398,59 @@ class PlacementConfig:
     defrag_enabled: bool = False
 
 
+#: ``safescale.slo_mode``: where the SafeScale probe's latency thresholds come from.
+#: ``labels`` - the calibration label's rule (``tre_common.slo_labels.label_def_for_model``:
+#: TPOT 75 ms, TTFT = max(floor, k * (c + b * L)) with the mean prompt length L of the
+#: evidence window); ``fixed`` - the model's ``models[].slo`` ttft_p95_ms / tpot_p95_ms.
+SAFESCALE_SLO_MODES = ("labels", "fixed")
+
+
+@dataclass(frozen=True)
+class SafeScaleRegistryConfig:
+    """Registry ``safescale:`` section (controller only; every key optional).
+
+    Read at controller start (restart-to-apply). Controller images before this
+    section existed ignore it."""
+
+    slo_mode: str = "labels"
+    #: Upper bound (s) of the probe window W, deadline extensions included:
+    #: W = min(max(multiplier * p95_e2e, floor), window_ceiling_s).
+    window_ceiling_s: float = 60.0
+    #: Completed requests (TTFT count of the remaining pods over the evidence window)
+    #: needed before the latency part of the commit gate is judged.
+    min_commit_samples: int = 20
+    #: The first gateway doc of the evidence window must be stamped within
+    #: [hide, hide + this]; otherwise the probe rolls back (clock / missing-tick guard).
+    evidence_clock_tolerance_s: float = 20.0
+
+
+def parse_safescale_config(raw: dict[str, Any] | None) -> SafeScaleRegistryConfig:
+    """Parse the optional ``safescale:`` registry section; raise ValueError on bad values."""
+    if raw is None:
+        return SafeScaleRegistryConfig()
+    if not isinstance(raw, dict):
+        raise ValueError(f"safescale must be a mapping, got {raw!r}")
+    defaults = SafeScaleRegistryConfig()
+    mode = str(raw.get("slo_mode") or defaults.slo_mode).strip().lower()
+    if mode not in SAFESCALE_SLO_MODES:
+        raise ValueError(f"safescale.slo_mode must be one of {SAFESCALE_SLO_MODES}, got {mode!r}")
+    ceiling = _num(raw, "window_ceiling_s", defaults.window_ceiling_s)
+    tolerance = _num(raw, "evidence_clock_tolerance_s", defaults.evidence_clock_tolerance_s)
+    for name, value in (("window_ceiling_s", ceiling), ("evidence_clock_tolerance_s", tolerance)):
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(f"safescale.{name} must be a positive number, got {value!r}")
+    samples_raw = raw.get("min_commit_samples")
+    samples = defaults.min_commit_samples if samples_raw is None else samples_raw
+    if isinstance(samples, bool) or float(samples) != int(float(samples)) or int(float(samples)) < 0:
+        raise ValueError(f"safescale.min_commit_samples must be a non-negative integer, got {samples!r}")
+    return SafeScaleRegistryConfig(
+        slo_mode=mode,
+        window_ceiling_s=float(ceiling),
+        min_commit_samples=int(float(samples)),
+        evidence_clock_tolerance_s=float(tolerance),
+    )
+
+
 @dataclass(frozen=True)
 class GatewayConfig:
     """Registry ``gateway:`` section."""
@@ -654,7 +707,9 @@ class Registry:
         reissue: ReissueConfig | None = None,
         vllm: VllmConfig | None = None,
         placement: PlacementConfig | None = None,
+        safescale: SafeScaleRegistryConfig | None = None,
     ) -> None:
+        self._safescale = safescale or SafeScaleRegistryConfig()
         self._topology = topology
         self._placement = placement or PlacementConfig()
         self._models = tuple(models)
@@ -680,6 +735,9 @@ class Registry:
 
     def placement(self) -> PlacementConfig:
         return self._placement
+
+    def safescale(self) -> SafeScaleRegistryConfig:
+        return self._safescale
 
     def vllm_env_for(self, model: ModelSpec) -> dict[str, str]:
         """The vLLM container environment of ``model``'s pods (besides the per-binding
@@ -861,6 +919,7 @@ def _parse_registry(raw: dict[str, Any]) -> Registry:
         reissue=parse_reissue_config(raw.get("reissue")),
         vllm=parse_vllm_config(raw.get("vllm")),
         placement=parse_placement_config(raw.get("placement")),
+        safescale=parse_safescale_config(raw.get("safescale")),
     )
 
 

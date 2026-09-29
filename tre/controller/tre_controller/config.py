@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Mapping
 
 from tre_common.rediskeys import SCRAPE_INTERVAL_MS
-from tre_common.registry import EXPECTED_SIGNAL_DIRECTIONS, load_registry
+from tre_common.registry import EXPECTED_SIGNAL_DIRECTIONS, SafeScaleRegistryConfig, load_registry
 from tre_controller.loops.metrics_task import REFRESH_MODES
 from tre_controller.signals.trs import DWELL_STATES
 
@@ -33,24 +33,33 @@ _FALSE_VALUES = {"0", "false", "no", "n", "off"}
 
 @dataclass(frozen=True)
 class SafeScaleConfig:
-    ttft_p95_slo_ms: float = 500.0
-    tpot_p95_slo_ms: float = 75.0
+    # Optional OVERRIDES of the probe's latency thresholds (env SAFE_SCALE_TTFT_P95_SLO_MS /
+    # SAFE_SCALE_TPOT_P95_SLO_MS, unset by default). None = the registry decides
+    # (safescale.slo_mode: labels -> tre_common.slo_labels rule, fixed -> models[].slo);
+    # without a registry resolver (direct constructions) None means 500 / 75 ms.
+    ttft_p95_slo_ms: float | None = None
+    tpot_p95_slo_ms: float | None = None
     # A6: probe window W = min(max(e2e_multiplier * p95_e2e, min_window_ms), window_ceiling_ms).
-    # When p95_e2e is missing W = min_window_ms (no avg_ttft fallback). The 20 s floor is
-    # short of the N2 invariant (see from_env): tail observations of a short probe read
-    # metrics windows that partly precede the hide, as in v1 (floor 15 s); every probe
-    # records how much (tail_pre_hide_fraction_*). Env: SAFE_SCALE_WINDOW_FLOOR_MS (the
-    # legacy SAFE_SCALE_MIN_WINDOW_MS is read only when the new name is absent, see
+    # When p95_e2e is missing W = min_window_ms (no avg_ttft fallback). The latency part of
+    # the commit gate reads an evidence window that starts at the first gateway boundary
+    # after the hide (never pre-hide data); only Z / KV still come from the tail of the
+    # (pre-hide overlapping) snapshots. Env: SAFE_SCALE_WINDOW_FLOOR_MS (the legacy
+    # SAFE_SCALE_MIN_WINDOW_MS is read only when the new name is absent, see
     # _safescale_window_floor_ms).
     min_window_ms: float = 20_000.0
     e2e_multiplier: float = 2.0
-    # P3-11: W ceiling = 2 x registry gateway.route_timeout_s (ms; no request - so no
-    # p95_e2e - outlives the route timeout, so a longer window only delays the commit).
-    # Set by from_env from the registry (the registry's own default route timeout, 150 s,
-    # applies when the key is absent -> 300 s, v1's cap). None = no ceiling: only when
-    # the registry could not be read (a warning is logged) or in direct constructions.
+    # W ceiling (ms), deadline extensions included: registry safescale.window_ceiling_s
+    # (default 60 s; replaces the 2 x gateway.route_timeout_s ceiling of 2026-09-29).
     # Never below min_window_ms (calc_probe_window_details raises it to the floor).
-    window_ceiling_ms: float | None = None
+    # None = no ceiling and no deadline extension (direct constructions only).
+    window_ceiling_ms: float | None = 60_000.0
+    # Registry safescale.slo_mode (labels | fixed), min_commit_samples and
+    # evidence_clock_tolerance_s (ms here); evidence_step_ms = the gateway write period
+    # (one deadline extension while the evidence has fewer than min_commit_samples).
+    slo_mode: str = "labels"
+    min_commit_samples: int = 20
+    evidence_clock_tolerance_ms: float = 20_000.0
+    evidence_step_ms: float = 10_000.0
     hq: float = 0.25
     tau_low: float = 1.0
     probe_poll_seconds: float = 2.0
@@ -227,12 +236,17 @@ class ControllerConfig:
         if metrics_phase_offset_ms >= instant_sample_interval_ms:
             raise ValueError("TRE_METRICS_PHASE_OFFSET_MS must be below the gateway period")
 
+        safescale_registry = _safescale_registry(registry_path)
         safescale = SafeScaleConfig(
-            ttft_p95_slo_ms=_get_positive_float(values, "SAFE_SCALE_TTFT_P95_SLO_MS", 500.0),
-            tpot_p95_slo_ms=_get_positive_float(values, "SAFE_SCALE_TPOT_P95_SLO_MS", 75.0),
+            ttft_p95_slo_ms=_get_optional_positive_float(values, "SAFE_SCALE_TTFT_P95_SLO_MS"),
+            tpot_p95_slo_ms=_get_optional_positive_float(values, "SAFE_SCALE_TPOT_P95_SLO_MS"),
             min_window_ms=_safescale_window_floor_ms(values),
             e2e_multiplier=_get_positive_float(values, "SAFE_SCALE_E2E_MULTIPLIER", 2.0),
-            window_ceiling_ms=_safescale_window_ceiling_ms(registry_path),
+            window_ceiling_ms=float(safescale_registry.window_ceiling_s) * 1000.0,
+            slo_mode=safescale_registry.slo_mode,
+            min_commit_samples=int(safescale_registry.min_commit_samples),
+            evidence_clock_tolerance_ms=float(safescale_registry.evidence_clock_tolerance_s) * 1000.0,
+            evidence_step_ms=float(instant_sample_interval_ms),
             hq=_get_positive_float(values, "SAFE_SCALE_HQ", 0.25),
             tau_low=_get_positive_float(values, "SAFE_SCALE_TAU_LOW", 1.0),
             probe_poll_seconds=_get_positive_float(values, "SAFE_SCALE_PROBE_POLL_SECONDS", 2.0),
@@ -270,10 +284,10 @@ class ControllerConfig:
         if safescale.min_window_ms - tail_span_ms < required_ms:
             LOG.warning(
                 "SAFE_SCALE_MIN_WINDOW_MS minus the commit-gate tail span is below "
-                "TRE_METRICS_WINDOW_MS + metrics refresh + read offset: tail observations of "
-                "a probe as short as the floor read metrics windows that partly precede the "
-                "hide (as in v1, floor 15 s); longer probes (2 x p95_e2e above the floor) are "
-                f"unaffected (min_window_ms={safescale.min_window_ms}, hq={safescale.hq}, "
+                "TRE_METRICS_WINDOW_MS + metrics refresh + read offset: the Z / KV-cache tail "
+                "of a probe as short as the floor reads metrics windows that partly precede the "
+                "hide (as in v1, floor 15 s); the latency check reads the post-hide evidence "
+                f"window and is unaffected (min_window_ms={safescale.min_window_ms}, hq={safescale.hq}, "
                 f"metrics_window_ms={metrics_window_ms}, refresh_ms={refresh_ms}, "
                 f"read_offset_ms={read_offset_ms})"
             )
@@ -415,22 +429,19 @@ def _safescale_window_floor_ms(values: Mapping[str, str]) -> float:
     return SafeScaleConfig.min_window_ms
 
 
-def _safescale_window_ceiling_ms(registry_path: str) -> float | None:
-    """P3-11: W ceiling = 2 x registry ``gateway.route_timeout_s`` (ms). The registry
-    parser supplies its default route timeout (150 s) when the key is absent, so the
-    ceiling is then 300 s. None (no ceiling, WARNING) only when the registry cannot be
-    loaded here or has no usable route timeout - the controller then runs as the
-    2026-09-29 commit did (W unbounded above)."""
+def _safescale_registry(registry_path: str) -> SafeScaleRegistryConfig:
+    """The registry ``safescale:`` section (window ceiling, threshold mode, minimum
+    commit samples, evidence clock tolerance). A registry without the section gets the
+    built-in defaults (60 s, labels, 20, 20 s). A section with invalid values refuses
+    the start (ValueError from the parser); an unreadable registry file only warns here
+    (the controller's own registry load fails right after)."""
     try:
-        gateway = load_registry(registry_path).gateway()
-        timeout_s = float(gateway.route_timeout_s)
-    except Exception as exc:  # noqa: BLE001 - the ceiling is a safety bound, not a gate
-        LOG.warning("SafeScale probe window has no ceiling: registry gateway.route_timeout_s unreadable (%r)", exc)
-        return None
-    if not math.isfinite(timeout_s) or timeout_s <= 0:
-        LOG.warning("SafeScale probe window has no ceiling: gateway.route_timeout_s=%r is not positive", timeout_s)
-        return None
-    return 2.0 * timeout_s * 1000.0
+        return load_registry(registry_path).safescale()
+    except ValueError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - load_registry fails loudly later on
+        LOG.warning("registry %s unreadable (%r): SafeScale uses its built-in defaults", registry_path, exc)
+        return SafeScaleRegistryConfig()
 
 
 def _validate_signal_thresholds(registry_path: str, signal_source: str) -> None:
@@ -487,6 +498,13 @@ def _get_positive_float(env: Mapping[str, str], key: str, default: float) -> flo
     if value <= 0.0:
         raise ValueError(f"{key} must be positive")
     return value
+
+
+def _get_optional_positive_float(env: Mapping[str, str], key: str) -> float | None:
+    """A positive float when ``key`` is set (non-empty), else None."""
+    if env.get(key) in (None, ""):
+        return None
+    return _get_positive_float(env, key, 1.0)
 
 
 def _get_nonneg_float(env: Mapping[str, str], key: str, default: float) -> float:

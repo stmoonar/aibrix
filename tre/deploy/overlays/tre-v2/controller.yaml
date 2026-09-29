@@ -101,20 +101,15 @@ spec:
             # This is the single window S1.4 / R3 theta_m refit must use.
             - name: TRE_METRICS_WINDOW_MS
               value: "30000"
-            # G5/N1.3: SafeScale commit-gate SLOs pinned explicitly to match the
-            # registry.yaml calibration SLOs (ttft 500 / tpot 75), overriding the
-            # looser 1200/100 code defaults so the shrink safety gate cannot silently
-            # drift wider than calibration.
-            - name: SAFE_SCALE_TTFT_P95_SLO_MS
-              value: "500"
-            - name: SAFE_SCALE_TPOT_P95_SLO_MS
-              value: "75"
+            # SafeScale latency thresholds come from the registry (safescale.slo_mode,
+            # 2026-09-29): SAFE_SCALE_TTFT_P95_SLO_MS / SAFE_SCALE_TPOT_P95_SLO_MS are
+            # optional overrides and deliberately NOT set here. (Older images default
+            # to the same 500 / 75 ms without them.)
             # A6: probe window W = min(max(E2E_MULTIPLIER * p95_e2e, WINDOW_FLOOR_MS), W_max),
-            # W_max = 2 x registry gateway.route_timeout_s (300 s at 150 s). Missing p95_e2e
-            # -> W = WINDOW_FLOOR_MS. The 20 s floor is below the N2 tail guard (metrics
-            # window + refresh + offset), which is now only a startup warning; every probe
-            # records tail_pre_hide_fraction_mean/max (how much of the judged tail predates
-            # the hide).
+            # W_max = registry safescale.window_ceiling_s (60 s). Missing p95_e2e
+            # -> W = WINDOW_FLOOR_MS. The latency gate reads the post-hide evidence
+            # window (first gateway boundary after the hide .. newest snapshot); only
+            # Z / KV-cache still come from the snapshot tail (tail_pre_hide_fraction_*).
             - name: SAFE_SCALE_WINDOW_FLOOR_MS
               value: "20000"
             - name: SAFE_SCALE_E2E_MULTIPLIER

@@ -191,6 +191,7 @@ class ActionQueue:
         is_observe_fresh: Callable[[], bool] | None = None,
         on_hide_failed: Callable[[str, tuple[str, ...], str], None] | None = None,
         floor_violation_hold_ms: float | None = None,
+        on_hide_done: Callable[[str, tuple[str, ...]], None] | None = None,
     ) -> None:
         self._client = client
         #: P2-6: how long (ms, on ``now_ms``) a model whose hide / sleep the SM refused
@@ -206,6 +207,9 @@ class ActionQueue:
         #: not sent because of observe mode): its SafeScale probe is rolled back
         #: instead of being judged as if the pods were hidden.
         self._on_hide_failed = on_hide_failed
+        #: 2026-09-29: (model, pods) right after the SM confirmed a hide - the
+        #: SafeScale probe anchors its post-hide evidence window at this moment.
+        self._on_hide_done = on_hide_done
         #: B8: a SafeScale commit whose decision (``decided_ms``) is older than this
         #: at its FIRST dispatch becomes the donor unhide (None / <= 0 = off).
         self._commit_max_age_ms = (
@@ -532,6 +536,14 @@ class ActionQueue:
         except Exception:  # noqa: BLE001 - the probe is still bounded by its window
             LOG.exception("marking the SafeScale probe of %s after a failed hide failed", action.model)
 
+    def _notify_hide_done(self, action) -> None:
+        if not isinstance(action, HideAction) or self._on_hide_done is None:
+            return
+        try:
+            self._on_hide_done(action.model, tuple(action.pods))
+        except Exception:  # noqa: BLE001 - the probe then extends / rolls back (hide_unconfirmed)
+            LOG.exception("anchoring the SafeScale probe of %s after its hide failed", action.model)
+
     def _notify_done(self, request_id: str, status: str, reason: str) -> None:
         if self._on_oneshot_done is None:
             return
@@ -796,6 +808,7 @@ class ActionQueue:
             return result, queued
         self._record_done(queued.model, action, result)
         results.append(replace(result, attempts=attempts))
+        self._notify_hide_done(action)
         return None, queued
 
     async def _attempt_commit(

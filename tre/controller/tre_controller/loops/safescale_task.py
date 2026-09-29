@@ -166,6 +166,12 @@ def run_safescale_observation_tick(
                 f"safescale_donor_health:{probe.model}:errors={health.get('errors', 0):.0f}"
                 f":requests={health.get('requests', 0):.0f}:rate={health.get('error_rate', 0.0):.4f}"
             )
+        decision_details = getattr(decision, "details", None) or {}
+        if decision_details.get("latency_source") == "evidence" or getattr(decision, "reason", "") == "evidence_extended":
+            # 2026-09-29 audit: the latency evidence window of this decision.
+            events.append(format_evidence_event(probe.model, decision_details))
+        if getattr(decision, "status", "") == "rollback" and decision_details.get("rollback_reason"):
+            events.append(format_rollback_reason_event(probe.model, decision_details["rollback_reason"]))
         actions = _commands_to_actions(
             decision.commands,
             cluster_view=cluster_view,
@@ -497,6 +503,42 @@ def format_tail_audit_event(model: str, details: Mapping) -> str:
     )
 
 
+def format_evidence_event(model: str, details: Mapping) -> str:
+    """One-line audit of the probe's latency evidence window (2026-09-29): interval,
+    samples, gate verdict, extensions, ceiling clamp, threshold mode / values and the
+    evidence's pre-hide share (must be 0)."""
+
+    def fmt(value) -> str:
+        if value is None:
+            return "na"
+        if isinstance(value, bool):
+            return "1" if value else "0"
+        if isinstance(value, (int, float)):
+            number = float(value)
+            return f"{number:.0f}" if abs(number) >= 1 or number == 0 else f"{number:.3g}"
+        return str(value)
+
+    gate = details.get("latency_gate") or details.get("extend_reason") or "na"
+    return (
+        f"safescale_evidence:{model}"
+        f":start={fmt(details.get('evidence_start_ms'))}:end={fmt(details.get('evidence_end_ms'))}"
+        f":n={fmt(details.get('latency_samples'))}:gate={gate}"
+        f":ext={fmt(details.get('extensions'))}:clamped={fmt(bool(details.get('clamped')))}"
+        f":mode={fmt(details.get('threshold_mode'))}"
+        f":ttft_thr={fmt(details.get('ttft_threshold_ms'))}:tpot_thr={fmt(details.get('tpot_threshold_ms'))}"
+        f":pre_hide={fmt(details.get('tail_pre_hide_fraction'))}"
+    )
+
+
+def format_rollback_reason_event(model: str, reason: Mapping) -> str:
+    """``safescale_rollback_reason:<model>:<code>[:<gates|metrics|check>]``."""
+    code = str(reason.get("code") or "unknown")
+    extra = reason.get("gates") or reason.get("metrics") or reason.get("check")
+    if isinstance(extra, (list, tuple)):
+        extra = ",".join(str(item) for item in extra)
+    return f"safescale_rollback_reason:{model}:{code}" + (f":{extra}" if extra else "")
+
+
 def _terminal_details(safescale: SafeScaleObserver, model: str) -> dict:
     active = getattr(safescale, "active_probe", None)
     probe = active(model) if callable(active) else None
@@ -559,7 +601,17 @@ def _observation_from_metrics(
         # P1-2 audit: the metrics window this observation read (from the snapshot).
         window_start_ms=getattr(metrics, "window_start_ms", None),
         window_end_ms=getattr(metrics, "window_end_ms", None),
+        # L of the labels-mode TTFT threshold: prompt-token sum / count delta.
+        mean_prompt_tokens=_mean_prompt_tokens(metrics),
     )
+
+
+def _mean_prompt_tokens(metrics: ModelWindowMetrics) -> float | None:
+    tokens = getattr(metrics, "prompt_tokens", None)
+    count = getattr(metrics, "request_count", None)
+    if tokens is None or not count or float(count) <= 0:
+        return None
+    return float(tokens) / float(count)
 
 
 def _probe_request_id(safescale: SafeScaleObserver, model: str) -> str | None:

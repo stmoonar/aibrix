@@ -95,15 +95,20 @@ def test_safescale_rolls_back_immediately_on_slo_violation() -> None:
             z_m=1.5,
             q_ctl=0.0,
             has_traffic=True,
+            # 2026-09-29: only a snapshot whose whole window follows the hide is judged.
+            window_start_ms=1_000,
+            window_end_ms=31_000,
         ),
         now_ms=2_000,
     )
 
-    assert decision == SafeScaleDecision(
-        status="rollback",
-        reason="slo_violation",
-        commands=(SafeScaleCommand(kind="unhide", model="donor", pods=("pod-a",), reason="slo_violation"),),
+    assert (decision.status, decision.reason, decision.commands) == (
+        "rollback",
+        "slo_violation",
+        (SafeScaleCommand(kind="unhide", model="donor", pods=("pod-a",), reason="slo_violation"),),
     )
+    assert decision.details["rollback_reason"]["code"] == "slo_violation"
+    assert decision.details["rollback_reason"]["metrics"] == ["ttft"]
     assert machine.active_probe("donor") is not None
     assert store.deleted == []
     assert machine.resolve(
@@ -249,7 +254,9 @@ def test_safescale_restored_tail_blocks_commit_on_prior_latency_violation() -> N
 
 # --- A6: probe window W = max(e2e_multiplier * p95_e2e, min_window_ms) ---------------------
 
-_V1_CFG = SafeScaleConfig()  # floor 20 s, e2e multiplier 2, no ceiling
+# floor 20 s, e2e multiplier 2, no ceiling (the controller sets registry
+# safescale.window_ceiling_s, 60 s by default; see test_safescale_evidence_20260929).
+_V1_CFG = SafeScaleConfig(window_ceiling_ms=None)
 
 
 def _inputs(**overrides) -> ProbeWindowInputs:

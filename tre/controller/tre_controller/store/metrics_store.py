@@ -341,6 +341,7 @@ class MetricsStore:
             tpot_count=self._hist_count_delta(model, HISTOGRAM_METRICS["tpot"], hist_docs, window_start_ms),
             e2e_hist=e2e_hist,
             e2e_hist_count=e2e_hist_count,
+            hist_first_ts_ms=_first_metric_doc_ts(model, HISTOGRAM_METRICS["ttft"], hist_docs),
         )
 
     def _aggregate_model(
@@ -572,6 +573,15 @@ def _first_last_metric(model: str, metric: str, docs: list[dict[str, Any]]) -> t
     if not entries:
         return None, None
     return entries[0], entries[-1]
+
+
+def _first_metric_doc_ts(model: str, metric: str, docs: list[dict[str, Any]]) -> int | None:
+    """Timestamp of the first doc carrying ``metric`` - the doc ``_first_last_metric``
+    takes the delta's baseline from (docs are sorted, baseline doc first)."""
+    for doc in docs:
+        if _metric_entry(model, metric, doc) is not None and doc.get("timestamp") is not None:
+            return int(_number(doc.get("timestamp"), 0.0))
+    return None
 
 
 def _with_baseline_doc(docs: list[dict[str, Any]], window_start_ms: int) -> list[dict[str, Any]]:

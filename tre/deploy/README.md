@@ -209,19 +209,35 @@ rollback) or whose `/is_sleeping` is not a clear "awake".
 ### SafeScale probe window (controller env)
 
 `W = min(max(SAFE_SCALE_E2E_MULTIPLIER x p95_e2e, SAFE_SCALE_WINDOW_FLOOR_MS), W_max)`,
-`W_max = 2 x gateway.route_timeout_s` from the registry (300 s at 150 s; no ceiling,
-with a startup warning, only if the registry cannot be read). `window_terms` of every
-probe record carry `W`, `W1`, `W_floor`, `W_max`, `clamped`, `dominant`
-(`e2e` / `floor` / `ceiling`).
+`W_max` = registry `safescale.window_ceiling_s` (default 60 s; since 2026-09-29, it
+replaced `2 x gateway.route_timeout_s`). `window_terms` of every probe record carry
+`W`, `W1`, `W_floor`, `W_max`, `clamped`, `dominant` (`e2e` / `floor` / `ceiling`).
 
-With a floor below `TRE_METRICS_WINDOW_MS` + refresh + read offset the commit gate
-may judge metrics windows that partly precede the hide (startup warning). Every
-commit-gate decision records how much: `tail_pre_hide_fraction_mean` / `_max`
-(per judged tail observation: `max(0, hide_ts - window_start) / window_len`,
-`hide_ts` = the probe's start on the snapshot clock, so a lower bound) and
-`tail_observation_count`, in `terminal_details`, `window_terms` and the event
-`safescale_tail_pre_hide:<model>:mean=..:max=..:n=..`. Audit only: the commit
-criterion does not use it.
+Commit evidence (2026-09-29, `planning/safescale_evidence.py`, release note
+`RELEASE-20260929-safescale-evidence.md`):
+
+- one observation per metrics snapshot (keyed by `window_end_ms`); the 2 s loop still
+  runs the donor-health guard and preemption / abort on every tick;
+- the immediate SLO rollback judges a snapshot only when its whole window follows the
+  hide (`window_start_ms >= hide`);
+- at the deadline the latency check reads the evidence window `(S, E]`,
+  `S` = first gateway boundary at or after the hide (hide = Redis `TIME` when the SM
+  confirmed it), `E` = newest snapshot, remaining pods only (probe pods and pods the
+  fleet state reports asleep excluded). Fewer than `safescale.min_commit_samples`
+  completed requests: the deadline moves one gateway period, up to `W_max`; still short
+  there: no traffic -> commit, traffic -> latency skipped (Z / KV judged);
+- thresholds: registry `safescale.slo_mode` (`labels` = the calibration label rule,
+  `fixed` = `models[].slo`); env `SAFE_SCALE_TTFT_P95_SLO_MS` / `SAFE_SCALE_TPOT_P95_SLO_MS`
+  are optional overrides (unset);
+- clock check: the first doc of the evidence must be stamped in
+  `[hide, hide + safescale.evidence_clock_tolerance_s]` and no doc stamped at or after
+  `S` may exist at the hide; otherwise rollback `evidence_clock_skew`.
+
+Z and the KV-cache fill still come from the tail of the snapshots, which may partly
+precede the hide: `tail_pre_hide_fraction_mean` / `_max` record how much. The
+latency evidence's own pre-hide share is `tail_pre_hide_fraction` (0 by construction,
+a regression assertion). Summary of a run: `python3 -m scripts.analysis.safescale_summary
+<run_dir>/safescale.json` (rollback rate, rollback reasons, latency-gate outcomes).
 
 Env names and rollback: controller images from 2026-09-29 read the floor from
 `SAFE_SCALE_WINDOW_FLOOR_MS`; older images read `SAFE_SCALE_MIN_WINDOW_MS` and refuse

@@ -28,6 +28,7 @@ from tre_controller.loops.metrics_task import MetricsTaskConfig, SnapshotBox, Sn
 from tre_controller.loops.rescue_task import rescue_task
 from tre_controller.loops.safescale_task import safescale_task
 from tre_controller.planning.safescale import SafeScaleStateMachine
+from tre_controller.planning.safescale_evidence import MetricsEvidenceReader, RegistryThresholds
 from tre_controller.signals.trs import SignalState
 from tre_controller.sm_client import AsyncTransport, ServiceManagerClient
 from tre_controller.store.metrics_store import MetricsStore
@@ -166,6 +167,17 @@ def build_controller_task_specs(
     return tuple(specs)
 
 
+def _sleeping_pods(view: Any, model: str) -> set[str]:
+    """Pods (SM serve_id) of ``model`` the fleet state reports asleep; empty without a view."""
+    if view is None:
+        return set()
+    return {
+        binding.serve_id
+        for binding in getattr(view, "bindings", ()) or ()
+        if binding.model == model and not binding.awake
+    }
+
+
 def _observe_reader(deps: ControllerDependencies) -> Callable[[], bool] | None:
     gate = deps.observe_gate
     return gate.is_observe if gate is not None else None
@@ -229,12 +241,29 @@ def create_controller_dependencies(
         transport=sm_transport,
         slow_timeout_s=resolve_sm_call_timeout_s(cfg, registry),
     )
-    safescale = SafeScaleStateMachine(config=cfg.safescale, store=ControllerStateStore(redis_client))
+    # A view older than two refresh periods is not "fresh" (review 4 P2-1).
+    cluster_view_box = ClusterViewBox(max_age_s=max(5.0, 2.5 * float(getattr(cfg, "fairness_interval_s", 10.0))))
+    # 2026-09-29: the commit gate's latency check reads the post-hide evidence window
+    # (remaining pods: probe pods and pods the fleet state reports asleep excluded),
+    # anchored on Redis TIME of the metrics store; thresholds from registry safescale.
+    safescale = SafeScaleStateMachine(
+        config=cfg.safescale,
+        store=ControllerStateStore(redis_client),
+        evidence=MetricsEvidenceReader(
+            store,
+            redis_client=metrics_redis_client,
+            sleeping_pods=lambda model: _sleeping_pods(cluster_view_box.get(), model),
+        ),
+        thresholds=RegistryThresholds(
+            registry,
+            mode=cfg.safescale.slo_mode,
+            ttft_override_ms=cfg.safescale.ttft_p95_slo_ms,
+            tpot_override_ms=cfg.safescale.tpot_p95_slo_ms,
+        ),
+    )
     safescale.restore()
     observe_gate = ObserveModeGate(redis_client)
     profiler = build_profiler(cfg, redis_client)
-    # A view older than two refresh periods is not "fresh" (review 4 P2-1).
-    cluster_view_box = ClusterViewBox(max_age_s=max(5.0, 2.5 * float(getattr(cfg, "fairness_interval_s", 10.0))))
     model_state_box = ModelStateBox()
     return ControllerDependencies(
         store=store,
@@ -272,6 +301,8 @@ def create_controller_dependencies(
             # P3: a hide that did not take effect (failed / not sent in observe)
             # marks its probe for rollback instead of leaving it judged as hidden.
             on_hide_failed=lambda model, pods, reason: safescale.abort_probe(model, pods=pods, reason=reason),
+            # 2026-09-29: the SM confirmed a probe's hide - anchor its evidence window.
+            on_hide_done=lambda model, pods: safescale.mark_hidden(model, pods=pods),
             # P2-6: a donor the SM refused with 409 floor_violation is not picked for
             # a scale-down again for TRE_FLOOR_VIOLATION_COOLDOWN_TICKS fast-loop ticks.
             floor_violation_hold_ms=(

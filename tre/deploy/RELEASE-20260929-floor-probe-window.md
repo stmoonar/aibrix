@@ -16,6 +16,9 @@ release. Nothing here has been applied. Images: to be built (`<YYYYMMDD>-<sha>`)
 
 Registry: no new key. `gateway.route_timeout_s` (existing) now also caps the probe
 window at 2x its value (restart-to-apply, like every registry read of the controller).
+Superseded in the same release train by `RELEASE-20260929-safescale-evidence.md`:
+`W_max` = registry `safescale.window_ceiling_s` (60 s), and the SafeScale threshold env
+`SAFE_SCALE_TTFT_P95_SLO_MS` / `SAFE_SCALE_TPOT_P95_SLO_MS` left the overlay.
 
 Behaviour: see `README.md` "SafeScale probe window (controller env)" and "Controller
 action queue" (floor-violation hold). New decision events:

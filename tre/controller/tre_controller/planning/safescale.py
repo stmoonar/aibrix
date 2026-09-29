@@ -1,10 +1,23 @@
 from __future__ import annotations
 
+import json
+import logging
 import math
+import time
 from dataclasses import dataclass, field, replace
-from typing import Any, Literal, Protocol
+from typing import Any, Callable, Literal, Protocol
 
 from tre_controller.config import SafeScaleConfig
+from tre_controller.planning.safescale_evidence import (
+    EvidenceSource,
+    EvidenceWindow,
+    HideAnchor,
+    ThresholdResolver,
+    ceil_boundary,
+    config_thresholds,
+)
+
+LOG = logging.getLogger("tre_controller.safescale")
 
 ProbeStatus = Literal["none", "probing", "commit", "rollback"]
 CommandKind = Literal["hide", "unhide", "scale_down", "scale_up"]
@@ -40,6 +53,9 @@ class ProbeObservation:
     #: observation journalled by an older controller).
     window_start_ms: int | None = None
     window_end_ms: int | None = None
+    #: Mean prompt length (tokens) of the window: ``request_prompt_tokens`` sum / count
+    #: delta (the L of the labels-mode TTFT threshold). None = no requests / unknown.
+    mean_prompt_tokens: float | None = None
 
 
 @dataclass(frozen=True)
@@ -124,6 +140,13 @@ class SafeScaleProbe:
     #: re-check right before the SM call): the probe is rolled back with this
     #: reason instead of being judged as if its pods were hidden.
     abort_reason: str | None = None
+    #: When the hide took effect (Redis TIME right after the SM confirmed it, see
+    #: :meth:`SafeScaleStateMachine.mark_hidden`). None = not confirmed yet.
+    hide_anchor: HideAnchor | None = None
+    #: Wall clock (ms) at probe start, for ``probe_wall_clock_ms`` in the audit.
+    start_wall_ms: int | None = None
+    #: Deadline extensions (one gateway period each) while the evidence was short.
+    extensions: int = 0
 
 
 @dataclass(frozen=True)
@@ -141,9 +164,26 @@ class ProbeTailSummary:
 
 
 class SafeScaleStateMachine:
-    def __init__(self, *, config: SafeScaleConfig, store: ProbeStore | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        config: SafeScaleConfig,
+        store: ProbeStore | None = None,
+        evidence: EvidenceSource | None = None,
+        thresholds: ThresholdResolver | None = None,
+        wall_clock_ms: Callable[[], int] | None = None,
+    ) -> None:
+        """``evidence`` (the live controller: ``MetricsEvidenceReader``) switches the
+        latency part of the commit gate to the post-hide evidence window (2026-09-29);
+        without it (direct constructions / offline replays) the gate reads the tail of
+        the snapshot observations as before. ``thresholds`` resolves the per-model
+        latency thresholds from the registry (``RegistryThresholds``); without it the
+        config values (or 500 / 75 ms) apply."""
         self._config = config
         self._store = store
+        self._evidence = evidence
+        self._thresholds = thresholds
+        self._wall_clock_ms = wall_clock_ms or (lambda: int(time.time() * 1000))
         self._probes: dict[str, SafeScaleProbe] = {}
         # A13 rollback backoff: model -> time (ms, snapshot clock) of its last rollback.
         # Deliberately in-memory only: a controller restart forgets it, i.e. at most one
@@ -284,6 +324,7 @@ class SafeScaleStateMachine:
             pending_upscales=normalized_pending,
             window_ms=window_ms,
             window_terms=terms,
+            start_wall_ms=self._wall_ms(),
         )
         self._probes[model] = probe
         self._persist_probe(probe)
@@ -294,61 +335,149 @@ class SafeScaleStateMachine:
             details=dict(terms),
         )
 
+    def mark_hidden(self, model: str, *, pods: tuple[str, ...], anchor: HideAnchor | None = None) -> bool:
+        """The SM confirmed the hide of ``pods`` (ActionQueue ``on_hide_done``): anchor
+        the probe's evidence at this moment - Redis TIME and the model's newest gateway
+        doc stamp via the evidence source (see ``safescale_evidence``), else the
+        controller clock. Only the first confirmation counts (a retried hide does not
+        move the anchor). False when no probing probe of ``model`` owns the pods."""
+        probe = self._probes.get(model)
+        if probe is None or probe.status != "probing" or not set(pods) & set(probe.pods):
+            return False
+        if probe.hide_anchor is not None:
+            return True
+        if anchor is None:
+            if self._evidence is not None:
+                try:
+                    anchor = self._evidence.hide_anchor(model)
+                except Exception:  # noqa: BLE001 - fall back to the local clock (recorded)
+                    LOG.warning("safescale hide anchor of %s failed; using the controller clock", model, exc_info=True)
+            if anchor is None:
+                anchor = HideAnchor(ts_ms=int(self._wall_ms() or 0), source="controller_clock")
+        probe = replace(probe, hide_anchor=anchor, window_terms={**probe.window_terms, **_anchor_terms(anchor)})
+        self._probes[model] = probe
+        self._persist_probe(probe)
+        return True
+
     def observe(self, model: str, observation: ProbeObservation, *, now_ms: int) -> SafeScaleDecision:
+        """One SafeScale tick (every ``probe_poll_seconds``) for ``model``'s probe.
+
+        Snapshots are published once per gateway period and re-read every tick, so an
+        observation is appended (journalled, counted in the hq tail) only once per
+        snapshot, keyed by its ``window_end_ms``. Preemption / abort and the donor-health
+        guard run on every tick (the gateway counters are fresh each time). The
+        immediate SLO rollback judges each snapshot once, and only a snapshot whose
+        whole window follows the hide (``window_start_ms >= hide``); earlier ones are
+        recorded, not judged. At the deadline the commit gate runs (:meth:`_judge`)."""
         probe = self._probes.get(model)
         if probe is None:
             return SafeScaleDecision(status="none", reason="probe_not_found")
         if probe.status != "probing":
             return SafeScaleDecision(status="none", reason="probe_committing")
 
-        updated = _with_gateway_baseline(
-            _replace_observations(probe, probe.observations + (observation,)), observation
-        )
+        key = _observation_key(observation)
+        is_new = all(_observation_key(seen) != key for seen in probe.observations)
+        updated = _replace_observations(probe, probe.observations + (observation,)) if is_new else probe
+        updated = _with_gateway_baseline(updated, observation)
         self._probes[model] = updated
-        self._persist_observation(updated, observation)
+        if is_new:
+            self._persist_observation(updated, observation)
 
         health = donor_health(updated, observation)
         if updated.preempt_reason is not None:
-            self._probes[model] = replace(updated, terminal_details={"preempted": updated.preempt_reason})
-            return self._rollback(updated, reason=updated.preempt_reason)
-        if updated.abort_reason is not None:
-            self._probes[model] = replace(updated, terminal_details={"aborted": updated.abort_reason})
-            return self._rollback(updated, reason=updated.abort_reason)
-        if self._violates_slo(observation):
-            self._probes[model] = replace(
+            return self._rollback_now(
                 updated,
-                terminal_details={
-                    "slo": {"ttft_p95_ms": observation.ttft_p95_ms, "tpot_p95_ms": observation.tpot_p95_ms}
-                },
+                reason=updated.preempt_reason,
+                details={"preempted": updated.preempt_reason},
+                rollback_reason={"code": "preempted", "detail": updated.preempt_reason},
             )
-            return self._rollback(updated, reason="slo_violation")
+        if updated.abort_reason is not None:
+            return self._rollback_now(
+                updated,
+                reason=updated.abort_reason,
+                details={"aborted": updated.abort_reason},
+                rollback_reason={"code": "hide_failed", "detail": updated.abort_reason},
+            )
+        violation = self._instant_violation(updated, observation) if is_new else None
+        if violation is not None:
+            return self._rollback_now(
+                updated,
+                reason="slo_violation",
+                details={"slo": {"ttft_p95_ms": observation.ttft_p95_ms, "tpot_p95_ms": observation.tpot_p95_ms}},
+                rollback_reason=violation,
+            )
 
         if (
             health is not None
             and health["requests"] >= self._config.donor_min_requests
             and health["error_rate"] > self._config.donor_error_rate_max
         ):
-            self._probes[model] = replace(updated, terminal_details={"donor_health": health})
-            return self._rollback(updated, reason="donor_health")
+            return self._rollback_now(
+                updated,
+                reason="donor_health",
+                details={"donor_health": health},
+                rollback_reason={"code": "donor_health", **health},
+            )
 
         if now_ms < updated.deadline_ms:
-            self._persist_probe(updated)
+            if updated is not probe:
+                self._persist_probe(updated)
             return SafeScaleDecision(status="probing", reason="probe_pending")
+        return self._judge(updated, health, now_ms=now_ms)
 
+    def _judge(self, probe: SafeScaleProbe, health: dict[str, float] | None, *, now_ms: int) -> SafeScaleDecision:
+        """The formal commit gate (v1 _tail_summary_allows_commit) at the deadline.
+
+        Z (tail min) and the KV-cache fill come from the hq tail of the snapshot
+        observations, as before. The latency check reads the post-hide evidence window
+        (:meth:`_evidence_outcome`) when an evidence source is wired; without one (direct
+        constructions) it reads the tail snapshots, as before 2026-09-29."""
+        model = probe.model
+        evidence_mode = self._evidence is not None
         summary = _summarize_tail(
-            updated,
+            probe,
             hq=self._config.hq,
-            ttft_p95_slo_ms=self._config.ttft_p95_slo_ms,
-            tpot_p95_slo_ms=self._config.tpot_p95_slo_ms,
+            thresholds=lambda observation: self._thresholds_for(model, observation.mean_prompt_tokens),
+            judge_latency=not evidence_mode,
         )
-        failures = tail_gate_failures(
-            summary, tau_low=self._config.tau_low, kv_cache_max=self._config.kv_cache_max
-        )
-        audit = {
+        tail_audit = {
             "tail_pre_hide_fraction_mean": summary.pre_hide_fraction_mean,
             "tail_pre_hide_fraction_max": summary.pre_hide_fraction_max,
             "tail_observation_count": summary.tail_count,
         }
+        idle = False
+        if evidence_mode:
+            outcome = self._evidence_outcome(probe, summary, now_ms=now_ms)
+            if outcome.kind == "extend":
+                return self._extend(probe, outcome.audit)
+            if outcome.kind == "rollback":
+                return self._rollback_now(
+                    probe,
+                    reason=str(outcome.rollback_reason.get("code")),
+                    details={"evidence": outcome.audit},
+                    rollback_reason=outcome.rollback_reason,
+                    audit={**tail_audit, **outcome.audit},
+                )
+            summary = replace(summary, latency_ok=outcome.latency_ok)
+            latency_audit = outcome.audit
+            idle = outcome.idle
+        else:
+            thresholds = self._thresholds_for(model, _last_mean_prompt(probe))
+            latency_audit = {
+                "latency_source": "tail_snapshots",
+                "latency_gate": "evaluated",
+                "threshold_mode": thresholds["mode"],
+                "ttft_threshold_ms": thresholds["ttft_ms"],
+                "tpot_threshold_ms": thresholds["tpot_ms"],
+                # The tail snapshots WERE the latency evidence.
+                "tail_pre_hide_fraction": summary.pre_hide_fraction_max,
+                "extensions": probe.extensions,
+                "clamped": bool(probe.window_terms.get("clamped")),
+            }
+        failures = () if idle else tail_gate_failures(
+            summary, tau_low=self._config.tau_low, kv_cache_max=self._config.kv_cache_max
+        )
+        audit = {**tail_audit, **latency_audit}
         details: dict[str, Any] = {
             "gate_failures": list(failures),
             "tail": _tail_record(summary),
@@ -358,9 +487,29 @@ class SafeScaleStateMachine:
             # gate passes this check like v1, but the record says so explicitly.
             "kv_cache": "unavailable" if summary.gpu_cache_max is None else summary.gpu_cache_max,
         }
+        if idle:
+            details["idle_commit"] = True
         if health is not None:
             details["donor_health"] = health
-        updated = replace(updated, terminal_details=details, window_terms={**updated.window_terms, **audit})
+        if failures:
+            rollback_reason: dict[str, Any] = {
+                "code": "formal_commit_gate_failed",
+                "gates": list(failures),
+                "z_min": _tail_record(summary)["z_min"],
+                "kv_cache_max": summary.gpu_cache_max,
+                "latency": {
+                    key: audit.get(key)
+                    for key in (
+                        "latency_gate", "latency_samples", "evidence_ttft_p95_ms", "evidence_tpot_p95_ms",
+                        "ttft_threshold_ms", "tpot_threshold_ms",
+                    )
+                    if key in audit
+                },
+            }
+            audit["rollback_reason"] = rollback_reason
+            details["rollback_reason"] = rollback_reason
+        audit["probe_wall_clock_ms"] = details["probe_wall_clock_ms"] = self._probe_wall_clock_ms(probe)
+        updated = replace(probe, terminal_details=details, window_terms={**probe.window_terms, **audit})
         self._probes[model] = updated
         if not failures:
             decision = self._commit(updated, reason="formal_commit_gate_passed")
@@ -368,6 +517,207 @@ class SafeScaleStateMachine:
             decision = self._rollback(updated, reason="formal_commit_gate_failed")
         # The commit / rollback decision record carries the audit too.
         return replace(decision, details={**decision.details, **audit})
+
+    def _evidence_outcome(
+        self, probe: SafeScaleProbe, summary: "ProbeTailSummary", *, now_ms: int
+    ) -> "_EvidenceOutcome":
+        """The latency verdict of the post-hide evidence window (module docstring of
+        ``safescale_evidence``), or "extend" (deadline + one gateway period, up to the
+        W ceiling) while the evidence is short, or "rollback" (fail-closed)."""
+        cfg = self._config
+        model = probe.model
+        step = _evidence_step_ms(cfg)
+        cap = _deadline_cap(probe, cfg)
+        can_extend = probe.deadline_ms < cap
+        window_clamped = bool(probe.window_terms.get("window_clamped", probe.window_terms.get("clamped")))
+        audit: dict[str, Any] = {
+            "latency_source": "evidence",
+            "extensions": probe.extensions,
+            "window_clamped": window_clamped,
+            "clamped": window_clamped,
+            "deadline_cap_ms": cap,
+        }
+        anchor = probe.hide_anchor
+        if anchor is None:
+            if can_extend:
+                return _EvidenceOutcome("extend", audit={**audit, "extend_reason": "hide_unconfirmed"})
+            return _EvidenceOutcome(
+                "rollback", audit=audit, rollback_reason={"code": "hide_unconfirmed", "deadline_cap_ms": cap}
+            )
+        hide_ts = int(anchor.ts_ms)
+        start = ceil_boundary(hide_ts, step)
+        end = _latest_window_end(probe)
+        if end is None:
+            end = int(now_ms)
+        audit.update(
+            evidence_start_ms=start,
+            evidence_end_ms=end,
+            hide_ts_ms=hide_ts,
+            hide_anchor_source=anchor.source,
+        )
+        if end <= start:
+            if can_extend:
+                return _EvidenceOutcome("extend", audit={**audit, "extend_reason": "evidence_empty"})
+            return _EvidenceOutcome(
+                "rollback", audit=audit,
+                rollback_reason={"code": "evidence_empty", "evidence_start_ms": start, "evidence_end_ms": end},
+            )
+        try:
+            evidence = self._evidence.read(model, start_ms=start, end_ms=end, exclude_pods=tuple(probe.pods))
+        except Exception as exc:  # noqa: BLE001 - fail closed
+            LOG.error("safescale evidence of %s unreadable: %r", model, exc)
+            return _EvidenceOutcome(
+                "rollback", audit=audit, rollback_reason={"code": "evidence_unavailable", "error": repr(exc)}
+            )
+        tolerance = float(getattr(cfg, "evidence_clock_tolerance_ms", 20_000.0))
+        clock = evidence_clock_failure(anchor, evidence, tolerance_ms=tolerance)
+        first_doc = min(evidence.first_doc_ts_ms.values()) if evidence.first_doc_ts_ms else None
+        audit.update(
+            evidence_first_doc_ts_ms=first_doc,
+            evidence_pods=list(evidence.pods),
+            evidence_excluded_pods=list(evidence.excluded_pods),
+            tail_pre_hide_fraction=_pre_hide_fraction(hide_ts, first_doc if first_doc is not None else start, end),
+        )
+        if clock is not None:
+            LOG.error(
+                json.dumps(
+                    {"event": "safescale_evidence_clock_skew", "model": model, "request_id": probe.request_id,
+                     **clock},
+                    sort_keys=True,
+                )
+            )
+            return _EvidenceOutcome(
+                "rollback", audit=audit, rollback_reason={"code": "evidence_clock_skew", **clock}
+            )
+        samples = float(evidence.ttft_count)
+        mean_prompt = evidence.mean_prompt_tokens
+        thresholds = self._thresholds_for(model, mean_prompt)
+        min_samples = int(getattr(cfg, "min_commit_samples", 20))
+        audit.update(
+            latency_samples=samples,
+            min_commit_samples=min_samples,
+            mean_prompt_tokens=mean_prompt,
+            evidence_ttft_p95_ms=evidence.ttft_p95_ms,
+            evidence_tpot_p95_ms=evidence.tpot_p95_ms,
+            threshold_mode=thresholds["mode"],
+            threshold_source=thresholds.get("source"),
+            ttft_threshold_ms=thresholds["ttft_ms"],
+            tpot_threshold_ms=thresholds["tpot_ms"],
+        )
+        if "fallback" in thresholds:
+            audit["threshold_fallback"] = thresholds["fallback"]
+        p95_available = evidence.ttft_p95_ms is not None or evidence.tpot_p95_ms is not None
+        if samples >= min_samples and (samples <= 0 or p95_available):
+            violations = []
+            if evidence.ttft_p95_ms is not None and evidence.ttft_p95_ms > thresholds["ttft_ms"]:
+                violations.append("ttft")
+            if evidence.tpot_p95_ms is not None and evidence.tpot_p95_ms > thresholds["tpot_ms"]:
+                violations.append("tpot")
+            audit.update(latency_gate="evaluated", latency_violations=violations)
+            return _EvidenceOutcome("judge", audit=audit, latency_ok=not violations)
+        short = "insufficient_samples" if samples < min_samples else "p95_unavailable"
+        if can_extend:
+            return _EvidenceOutcome("extend", audit={**audit, "extend_reason": short})
+        # At the W ceiling with too little evidence.
+        audit["clamped"] = True
+        if samples <= 0 and not summary.has_traffic:
+            # v1 idle rule: nothing served and nothing in flight -> commit.
+            audit.update(latency_gate="skipped", latency_skip_reason="idle")
+            return _EvidenceOutcome("judge", audit=audit, latency_ok=True, idle=True)
+        audit.update(latency_gate="skipped", latency_skip_reason=short)
+        return _EvidenceOutcome("judge", audit=audit, latency_ok=True)
+
+    def _extend(self, probe: SafeScaleProbe, audit: dict[str, Any]) -> SafeScaleDecision:
+        cap = _deadline_cap(probe, self._config)
+        deadline = min(int(probe.deadline_ms) + _evidence_step_ms(self._config), cap)
+        extensions = probe.extensions + 1
+        audit = {**audit, "extensions": extensions, "deadline_ms": deadline}
+        updated = replace(
+            probe, deadline_ms=deadline, extensions=extensions, window_terms={**probe.window_terms, **audit}
+        )
+        self._probes[probe.model] = updated
+        self._persist_probe(updated)
+        return SafeScaleDecision(status="probing", reason="evidence_extended", details=audit)
+
+    def _rollback_now(
+        self,
+        probe: SafeScaleProbe,
+        *,
+        reason: str,
+        details: dict[str, Any],
+        rollback_reason: dict[str, Any],
+        audit: dict[str, Any] | None = None,
+    ) -> SafeScaleDecision:
+        """A rollback decided before / instead of the formal gate, with its structured
+        reason in terminal_details, window_terms and the decision details."""
+        record = {
+            **(audit or {}),
+            "rollback_reason": rollback_reason,
+            "probe_wall_clock_ms": self._probe_wall_clock_ms(probe),
+        }
+        updated = replace(
+            probe,
+            terminal_details={**details, **record},
+            window_terms={**probe.window_terms, **record},
+        )
+        self._probes[probe.model] = updated
+        decision = self._rollback(updated, reason=reason)
+        return replace(decision, details={**decision.details, **record})
+
+    def _instant_violation(self, probe: SafeScaleProbe, observation: ProbeObservation) -> dict[str, Any] | None:
+        """The immediate SLO rollback of one snapshot, judged only when its whole
+        window follows the hide (window_start_ms >= hide). None = no violation / not
+        judged (pre-hide or overlapping window, unknown window, hide not confirmed)."""
+        hide_ts = self._gate_hide_ts(probe)
+        start = observation.window_start_ms
+        if hide_ts is None or start is None or int(start) < int(hide_ts):
+            return None
+        thresholds = self._thresholds_for(probe.model, observation.mean_prompt_tokens)
+        metrics = []
+        if observation.ttft_p95_ms is not None and observation.ttft_p95_ms > thresholds["ttft_ms"]:
+            metrics.append("ttft")
+        if observation.tpot_p95_ms is not None and observation.tpot_p95_ms > thresholds["tpot_ms"]:
+            metrics.append("tpot")
+        if not metrics:
+            return None
+        return {
+            "code": "slo_violation",
+            "metrics": metrics,
+            "ttft_p95_ms": observation.ttft_p95_ms,
+            "tpot_p95_ms": observation.tpot_p95_ms,
+            "ttft_threshold_ms": thresholds["ttft_ms"],
+            "tpot_threshold_ms": thresholds["tpot_ms"],
+            "threshold_mode": thresholds["mode"],
+            "window_start_ms": observation.window_start_ms,
+            "window_end_ms": observation.window_end_ms,
+            "hide_ts_ms": hide_ts,
+        }
+
+    def _gate_hide_ts(self, probe: SafeScaleProbe) -> int | None:
+        if probe.hide_anchor is not None:
+            return int(probe.hide_anchor.ts_ms)
+        # Without an evidence source nothing confirms the hide: the planned start.
+        return None if self._evidence is not None else int(probe.start_ms)
+
+    def _thresholds_for(self, model: str, mean_prompt_tokens: float | None) -> dict[str, Any]:
+        if self._thresholds is not None:
+            try:
+                return self._thresholds.resolve(model, mean_prompt_tokens)
+            except Exception:  # noqa: BLE001 - config values are the documented fallback
+                LOG.warning("safescale thresholds of %s failed; using the config values", model, exc_info=True)
+        return config_thresholds(self._config, mean_prompt_tokens)
+
+    def _wall_ms(self) -> int | None:
+        try:
+            return int(self._wall_clock_ms())
+        except Exception:  # noqa: BLE001 - audit only
+            return None
+
+    def _probe_wall_clock_ms(self, probe: SafeScaleProbe) -> int | None:
+        now = self._wall_ms()
+        if now is None or probe.start_wall_ms is None:
+            return None
+        return max(0, now - int(probe.start_wall_ms))
 
     def restore(self) -> int:
         if self._store is None:
@@ -438,15 +788,6 @@ class SafeScaleStateMachine:
             self._last_rollback_ms[model] = int(now_ms)
         return True
 
-    def _violates_slo(self, observation: ProbeObservation) -> bool:
-        return (
-            observation.ttft_p95_ms is not None
-            and observation.ttft_p95_ms > self._config.ttft_p95_slo_ms
-        ) or (
-            observation.tpot_p95_ms is not None
-            and observation.tpot_p95_ms > self._config.tpot_p95_slo_ms
-        )
-
     def _persist_probe(self, probe: SafeScaleProbe, *, terminal_reason: str | None = None) -> None:
         if self._store is None:
             return
@@ -482,6 +823,99 @@ class SafeScaleStateMachine:
                 resolved_ts=resolved_ts,
             ),
         )
+
+
+@dataclass(frozen=True)
+class _EvidenceOutcome:
+    kind: Literal["judge", "extend", "rollback"]
+    audit: dict[str, Any] = field(default_factory=dict)
+    latency_ok: bool = True
+    idle: bool = False
+    rollback_reason: dict[str, Any] = field(default_factory=dict)
+
+
+def _observation_key(observation: ProbeObservation) -> int:
+    """Observations are deduplicated per metrics snapshot: its window end, else its ts."""
+    if observation.window_end_ms is not None:
+        return int(observation.window_end_ms)
+    return int(observation.ts_ms)
+
+
+def _anchor_terms(anchor: HideAnchor) -> dict[str, Any]:
+    return {
+        "hide_ts_ms": int(anchor.ts_ms),
+        "hide_anchor_source": anchor.source,
+        "hide_newest_doc_ts_ms": anchor.newest_doc_ts_ms,
+    }
+
+
+def _evidence_step_ms(config: SafeScaleConfig) -> int:
+    return max(1, int(getattr(config, "evidence_step_ms", 10_000.0) or 10_000))
+
+
+def _deadline_cap(probe: SafeScaleProbe, config: SafeScaleConfig) -> int:
+    """The latest deadline: probe start + W_max (the W ceiling, never below the floor).
+    Without a ceiling the deadline is never extended."""
+    ceiling = _positive(getattr(config, "window_ceiling_ms", None))
+    if ceiling is None:
+        return int(probe.deadline_ms)
+    cap_ms = max(float(ceiling), float(config.min_window_ms))
+    return max(int(probe.deadline_ms), int(probe.start_ms + cap_ms))
+
+
+def _latest_window_end(probe: SafeScaleProbe) -> int | None:
+    ends = [int(obs.window_end_ms) for obs in probe.observations if obs.window_end_ms is not None]
+    return max(ends) if ends else None
+
+
+def _last_mean_prompt(probe: SafeScaleProbe) -> float | None:
+    for observation in reversed(probe.observations):
+        if observation.mean_prompt_tokens is not None:
+            return observation.mean_prompt_tokens
+    return None
+
+
+def _pre_hide_fraction(hide_ts_ms: int, start_ms: int, end_ms: int) -> float:
+    """Share of the latency evidence window ``[start, end]`` that precedes the hide.
+    0 by construction (start >= hide, enforced by the clock check): a regression
+    assertion in every probe record."""
+    span = float(end_ms) - float(start_ms)
+    if span <= 0:
+        return 0.0
+    return min(1.0, max(0.0, float(hide_ts_ms) - float(start_ms)) / span)
+
+
+def evidence_clock_failure(
+    anchor: HideAnchor, evidence: EvidenceWindow, *, tolerance_ms: float
+) -> dict[str, Any] | None:
+    """Fail-closed clock / continuity check of the evidence window (None = passed):
+
+    * ``doc_predates_hide``: a gateway doc stamped at or after the evidence start
+      already existed when the hide was confirmed - the gateway clock runs ahead of
+      Redis TIME, so the delta's baseline was taken before the hide;
+    * ``first_doc_outside``: the first doc a remaining pod's delta starts from is not
+      stamped within [hide, hide + tolerance] - a missing gateway tick (the baseline
+      falls back to a pre-hide doc) or a gateway clock behind / far ahead.
+
+    Pods without a TTFT histogram in the window (no docs) are not checked."""
+    newest = anchor.newest_doc_ts_ms
+    if newest is not None and int(newest) >= int(evidence.start_ms):
+        return {
+            "check": "doc_predates_hide",
+            "hide_ts_ms": int(anchor.ts_ms),
+            "newest_doc_ts_ms": int(newest),
+            "evidence_start_ms": int(evidence.start_ms),
+        }
+    lower, upper = int(anchor.ts_ms), int(anchor.ts_ms + float(tolerance_ms))
+    outside = {pod: int(ts) for pod, ts in sorted(evidence.first_doc_ts_ms.items()) if not lower <= int(ts) <= upper}
+    if outside:
+        return {
+            "check": "first_doc_outside",
+            "hide_ts_ms": lower,
+            "tolerance_ms": float(tolerance_ms),
+            "first_doc_ts_ms": outside,
+        }
+    return None
 
 
 def _replace_observations(probe: SafeScaleProbe, observations: tuple[ProbeObservation, ...]) -> SafeScaleProbe:
@@ -520,8 +954,9 @@ def calc_probe_window_details(
 ) -> dict[str, Any]:
     """Probe window W = min(max(e2e_multiplier * p95_e2e_ms, min_window_ms), W_max).
 
-    W_max = ``config.window_ceiling_ms`` (P3-11: 2 x registry gateway.route_timeout_s,
-    set by ControllerConfig.from_env; None = no ceiling), never below the floor. A
+    W_max = ``config.window_ceiling_ms`` (registry safescale.window_ceiling_s, 60 s by
+    default; deadline extensions never pass it either; None = no ceiling), never below
+    the floor. A
     missing / non-positive p95_e2e gives W = min_window_ms (no avg_ttft fallback).
     Returns W, W1 (multiplier * p95_e2e or None), W_floor, W_max, ``clamped`` (True when
     W_max cut W1), e2e_multiplier, ``dominant`` (e2e / floor / ceiling) and the inputs,
@@ -544,6 +979,7 @@ def calc_probe_window_details(
         "W_floor": floor_ms,
         "W_max": ceiling_ms,
         "clamped": clamped,
+        "window_clamped": clamped,
         "e2e_multiplier": multiplier,
         "dominant": dominant,
         "inputs": {
@@ -586,9 +1022,14 @@ def _summarize_tail(
     probe: SafeScaleProbe,
     *,
     hq: float,
-    ttft_p95_slo_ms: float,
-    tpot_p95_slo_ms: float,
+    ttft_p95_slo_ms: float | None = None,
+    tpot_p95_slo_ms: float | None = None,
+    thresholds: Callable[[ProbeObservation], dict[str, Any]] | None = None,
+    judge_latency: bool = True,
 ) -> ProbeTailSummary:
+    """The hq tail of the (one-per-snapshot) observations: Z min, traffic, KV max and -
+    with ``judge_latency`` (no evidence source) - the tail latency check against
+    ``thresholds(observation)`` or the fixed ``*_slo_ms`` values."""
     observations = probe.observations
     if not observations:
         return ProbeTailSummary(latency_ok=True, z_min=None, has_traffic=False, sample_count=0, tail_count=0)
@@ -600,7 +1041,8 @@ def _summarize_tail(
     else:
         desired_tail = max(2, int(hq_value))
     tail = observations[-min(sample_count, desired_tail) :]
-    pre_hide = tail_pre_hide_stats(tail, hide_ts_ms=probe.start_ms)
+    hide_ts = probe.hide_anchor.ts_ms if probe.hide_anchor is not None else probe.start_ms
+    pre_hide = tail_pre_hide_stats(tail, hide_ts_ms=int(hide_ts))
 
     latency_ok = True
     has_traffic = False
@@ -609,10 +1051,17 @@ def _summarize_tail(
     for observation in tail:
         if observation.has_traffic:
             has_traffic = True
-        if observation.ttft_p95_ms is not None and observation.ttft_p95_ms > ttft_p95_slo_ms:
-            latency_ok = False
-        if observation.tpot_p95_ms is not None and observation.tpot_p95_ms > tpot_p95_slo_ms:
-            latency_ok = False
+        if judge_latency:
+            if thresholds is not None:
+                limits = thresholds(observation)
+                ttft_limit, tpot_limit = limits["ttft_ms"], limits["tpot_ms"]
+            else:
+                ttft_limit = 500.0 if ttft_p95_slo_ms is None else ttft_p95_slo_ms
+                tpot_limit = 75.0 if tpot_p95_slo_ms is None else tpot_p95_slo_ms
+            if observation.ttft_p95_ms is not None and observation.ttft_p95_ms > ttft_limit:
+                latency_ok = False
+            if observation.tpot_p95_ms is not None and observation.tpot_p95_ms > tpot_limit:
+                latency_ok = False
         if observation.z_m is not None:
             z_values.append(float(observation.z_m))
         if observation.avg_gpu_cache_norm is not None:
@@ -733,6 +1182,12 @@ def _probe_record(
     }
     if probe.abort_reason is not None:
         record["abort_reason"] = probe.abort_reason
+    if probe.hide_anchor is not None:
+        record["hide_anchor"] = probe.hide_anchor.as_record()
+    if probe.start_wall_ms is not None:
+        record["start_wall_ms"] = probe.start_wall_ms
+    if probe.extensions:
+        record["extensions"] = probe.extensions
     if probe.resolution is not None and status == "committing":
         record["resolution"] = probe.resolution
         record["resolution_reason"] = probe.resolution_reason
@@ -758,6 +1213,7 @@ def _observation_record(observation: ProbeObservation) -> dict[str, Any]:
         "gateway_errors": observation.gateway_errors,
         "window_start_ms": observation.window_start_ms,
         "window_end_ms": observation.window_end_ms,
+        "mean_prompt_tokens": observation.mean_prompt_tokens,
     }
 
 
@@ -780,7 +1236,10 @@ def _probe_from_record(row: dict[str, Any], store: ProbeStore) -> SafeScaleProbe
         raw = entry.get("last_observation")
         if isinstance(raw, dict):
             observation = _observation_from_record(raw)
-            if observation is not None:
+            # One observation per snapshot (journals of older controllers hold one per tick).
+            if observation is not None and all(
+                _observation_key(seen) != _observation_key(observation) for seen in observations
+            ):
                 observations.append(observation)
 
     return SafeScaleProbe(
@@ -796,6 +1255,9 @@ def _probe_from_record(row: dict[str, Any], store: ProbeStore) -> SafeScaleProbe
         gateway_baseline=_baseline_from_record(row.get("gateway_baseline")),
         preempt_reason=str(row["preempt_reason"]) if row.get("preempt_reason") else None,
         abort_reason=str(row["abort_reason"]) if row.get("abort_reason") else None,
+        hide_anchor=HideAnchor.from_record(row.get("hide_anchor")),
+        start_wall_ms=_optional_int(row.get("start_wall_ms")),
+        extensions=int(_optional_int(row.get("extensions")) or 0),
         **_committing_fields(row),
     )
 
@@ -874,6 +1336,7 @@ def _observation_from_record(raw: dict[str, Any]) -> ProbeObservation | None:
         gateway_errors=_optional_float(raw.get("gateway_errors")),
         window_start_ms=_optional_int(raw.get("window_start_ms")),
         window_end_ms=_optional_int(raw.get("window_end_ms")),
+        mean_prompt_tokens=_optional_float(raw.get("mean_prompt_tokens")),
     )
 
 

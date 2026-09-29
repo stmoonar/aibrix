@@ -97,9 +97,9 @@ def test_commit_gate_records_the_pre_hide_share_of_the_judged_tail() -> None:
 
 def test_observations_carry_the_metrics_window_they_read() -> None:
     snapshot = _observation_snapshot(ts_ms=70_000)
-    metrics = snapshot.models["donor"]  # window [0, 60 s]
+    metrics = snapshot.models["donor"]  # window [0, 60 s + ts] (one snapshot per ts)
     observation = _observation_from_metrics(70_000, metrics, _donor_registry().model("donor"), "zm")
-    assert (observation.window_start_ms, observation.window_end_ms) == (0, 60_000)
+    assert (observation.window_start_ms, observation.window_end_ms) == (0, 130_000)
 
     queue = ObservationQueue()
     machine = SafeScaleStateMachine(
@@ -109,7 +109,8 @@ def test_observations_carry_the_metrics_window_they_read() -> None:
     result = run_safescale_observation_tick(
         _observation_snapshot(ts_ms=60_000), queue=queue, registry=_donor_registry(), safescale=machine
     )
-    assert "safescale_tail_pre_hide:donor:mean=0.750:max=0.750:n=1" in result.events
+    # window [0, 120 s], hide at 45 s -> 45/120 of it predates the hide.
+    assert "safescale_tail_pre_hide:donor:mean=0.375:max=0.375:n=1" in result.events
 
 
 # ------------------------------------------------------ P2-6 floor-violation hold
@@ -221,24 +222,25 @@ def test_window_is_capped_at_twice_the_route_timeout() -> None:
     assert (floor["W"], floor["W_max"], floor["clamped"]) == (20_000.0, 20_000.0, False)
 
 
-def test_window_ceiling_comes_from_the_registry_route_timeout(tmp_path, caplog) -> None:
-    # deploy/registry.yaml: gateway.route_timeout_s = 150 -> 300 s.
-    assert ControllerConfig.from_env({}).safescale.window_ceiling_ms == 300_000.0
+def test_window_ceiling_comes_from_the_registry_safescale_section(tmp_path, caplog) -> None:
+    # 2026-09-29: registry safescale.window_ceiling_s (60 s) replaced 2 x route timeout.
+    assert ControllerConfig.from_env({}).safescale.window_ceiling_ms == 60_000.0
     raw = yaml.safe_load((TRE_DIR / "deploy" / "registry.yaml").read_text(encoding="utf-8"))
-    raw["gateway"]["route_timeout_s"] = 90
+    raw["safescale"]["window_ceiling_s"] = 45
+    raw["gateway"]["route_timeout_s"] = 90  # no longer part of the ceiling
     tuned = tmp_path / "tuned.yaml"
     tuned.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
-    assert ControllerConfig.from_env({"TRE_REGISTRY_PATH": str(tuned)}).safescale.window_ceiling_ms == 180_000.0
-    # Key absent -> the registry's default route timeout (150 s) -> 300 s.
-    raw["gateway"].pop("route_timeout_s")
+    assert ControllerConfig.from_env({"TRE_REGISTRY_PATH": str(tuned)}).safescale.window_ceiling_ms == 45_000.0
+    # Section absent (a live registry not merged yet) -> the built-in 60 s.
+    raw.pop("safescale")
     absent = tmp_path / "absent.yaml"
     absent.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
-    assert ControllerConfig.from_env({"TRE_REGISTRY_PATH": str(absent)}).safescale.window_ceiling_ms == 300_000.0
-    # Registry unreadable -> no ceiling, with a warning.
+    assert ControllerConfig.from_env({"TRE_REGISTRY_PATH": str(absent)}).safescale.window_ceiling_ms == 60_000.0
+    # Registry unreadable -> the built-in defaults, with a warning.
     with caplog.at_level(logging.WARNING, logger="tre_controller.config"):
         missing = ControllerConfig.from_env({"TRE_REGISTRY_PATH": str(tmp_path / "missing.yaml")})
-    assert missing.safescale.window_ceiling_ms is None
-    assert any("no ceiling" in record.getMessage() for record in caplog.records)
+    assert missing.safescale.window_ceiling_ms == 60_000.0
+    assert any("built-in defaults" in record.getMessage() for record in caplog.records)
 
 
 def test_probe_record_keeps_w_max_and_clamped() -> None:
