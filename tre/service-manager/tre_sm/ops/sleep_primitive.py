@@ -1265,6 +1265,7 @@ class SleepPrimitive:
                         forced=forced,
                         forced_count=int(pod.last_load.get("in_flight") or 0) if forced else 0,
                         reason=reason,
+                        aborted=_abort_breakdown(pod.last_load) if forced else None,
                     )
                     return
                 if physical is None:

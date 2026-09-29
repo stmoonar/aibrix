@@ -95,7 +95,8 @@ def test_repo_registry_parses_and_documents_every_default():
     # The shipped file spells out the defaults (documentation), so parsing it and
     # parsing nothing must agree.
     assert registry.service_manager() == parse_service_manager_config(None)
-    assert set(raw["service_manager"]["sleep"]["budgets_s"]) == set(SLEEP_PATHS)
+    # "apa" (2026-09-29) is left out on purpose: older images reject unknown paths.
+    assert set(raw["service_manager"]["sleep"]["budgets_s"]) == set(SLEEP_PATHS) - {"apa"}
     assert len(render_binding_set(registry)) == sum(m.max_replicas for m in registry.models())
 
 

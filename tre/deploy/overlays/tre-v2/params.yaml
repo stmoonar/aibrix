@@ -386,11 +386,12 @@ data:
         # scale_down (manual binding power / TRE without SafeScale), apa (APA via
         # /scale_service), defrag, repair, startup, default.
         # Budgets apply only to paths NOT listed in no_drain_paths.
+        # apa (default null) is not spelled out below: service-manager / controller / UI
+        # images before 2026-09-29 reject an unknown budgets_s path at start.
         budgets_s:
           safescale_commit: null
           urgent: 30
           scale_down: null
-          apa: null
           defrag: 30
           repair: 30
           startup: 30

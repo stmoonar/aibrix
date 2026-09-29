@@ -164,6 +164,32 @@ def test_no_drain_wait_failure_aborts_even_with_unknown_state():
     assert outcome["aborted"]["state_known"] is False
 
 
+def test_no_drain_abort_that_errors_but_slept_still_counts_what_it_cut_off():
+    world = v1_world()
+    world.gateway.inflight("pod-a", "gw-1", total=2, non_continuable=1)
+    world.vllm.sleep_results = [Result(False, "read timeout")]
+    probes = []
+    original_probe = world.vllm.is_sleeping
+
+    def is_sleeping(pod_ip, **kwargs):
+        # The first probe (right after the failed /sleep) still sees it awake; the
+        # rollback's re-probe finds it asleep -> recorded as slept, not re-routed.
+        probes.append(pod_ip)
+        if len(probes) == 1:
+            return False
+        world.vllm.sleeping[pod_ip] = True
+        return original_probe(pod_ip, **kwargs)
+
+    world.vllm.is_sleeping = is_sleeping
+
+    [outcome] = world.sleep(path="urgent")
+
+    assert len(probes) >= 2
+    assert outcome["status"] == "slept" and outcome["forced_abort"] is True
+    assert outcome["aborted"]["non_continuable"] == 1
+    assert world.stats()["no_drain_non_continuable_aborted_total"] == 1
+
+
 def test_no_drain_still_rolls_back_when_the_gateway_never_acks_the_hide():
     world = v1_world(auto_ack=False)
 
