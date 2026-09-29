@@ -315,15 +315,52 @@ def test_below_min_commit_samples_a_violation_is_not_judged_yet() -> None:
 
 
 # ============================================================ failures
-def test_a_failing_pod_is_left_out_and_recorded() -> None:
+def test_one_failed_scrape_of_a_pod_is_tolerated_and_recorded() -> None:
+    h = Harness()
+    h.start()
+    h.run_until(HIDE + 8_000, serve=5)
+    h.failing["m-2"] = "timeout"
+    h.tick(HIDE + 10_000, serve=5)
+    last = h.machine.active_probe(MODEL).direct.last
+    assert last.excluded == {"m-2": "timeout"} and last.missing == {}  # its delta is still fresh
+    assert last.per_pod["m-2"]["n"] == 20 and last.per_pod["m-0"]["n"] == 25
+    del h.failing["m-2"]
+    at, decision = h.run_until(HIDE + W, serve=5, first=HIDE + 12_000)[-1]
+    assert (at, decision.status, decision.details["latency_samples"]) == (HIDE + W, "commit", 100)
+
+
+def test_a_pod_failing_only_at_the_baseline_gets_its_own_baseline_and_is_judged() -> None:
+    # Review P0 case A: the loaded pod misses the baseline scrape, then serves 5 s TTFT.
+    h = Harness()
+    h.failing["m-2"] = "timeout"
+    probe = h.start()
+    assert probe.direct.pending == ("m-2",) and sorted(probe.direct.baseline) == ["m-0"]
+    del h.failing["m-2"]
+    h.tick(HIDE + 2_000, serve=5)
+    state = h.machine.active_probe(MODEL).direct
+    assert state.pending == () and state.baseline["m-2"].ts_ms == HIDE + 2_000
+    assert state.last.missing == {"m-2": "no_data:baseline_taken"}
+    decisions = h.run_until(HIDE + W, serve=5, ttft_s=5.0, first=HIDE + 4_000)
+    at, decision = decisions[-1]
+    assert decision.status == "rollback" and decision.details["rollback_reason"]["code"] == "slo_violation_direct"
+
+
+def test_a_pod_whose_scrapes_keep_failing_never_lets_a_subset_commit() -> None:
+    # Review P0 case B: m-2 never answers; m-0 looks healthy. No commit on m-0 alone:
+    # the deadline extends while m-2 is missing and the Redis evidence decides at the cap.
     h = Harness()
     h.start()
     h.failing["m-2"] = "timeout"
-    at, decision = h.run_until(HIDE + W, serve=5)[-1]
-    assert decision.status == "commit" and decision.details["latency_samples"] == 50  # m-0 only
-    assert decision.details["direct_excluded_pods"] == {"m-2": "timeout"}
-    assert list(decision.details["direct_pods"]) == ["m-0"]
-    assert decision.details["direct_pods"]["m-0"]["n"] == 50
+    decisions = h.run_until(HIDE + 60_000, serve=5)
+    assert all(d.status == "probing" for _, d in decisions[:-1])
+    reasons = {d.details.get("extend_reason") for _, d in decisions if d.reason == "evidence_extended"}
+    assert reasons == {"pods_missing"}
+    at, decision = decisions[-1]
+    assert at == HIDE + 60_000 and decision.status == "commit"
+    assert decision.details["evidence_source_used"] == "redis_fallback"
+    assert decision.details["direct_fallback"]["reason"] == "pods_missing"
+    assert decision.details["direct_fallback"]["detail"] == {"m-2": "no_data:timeout"}
+    assert decision.details["latency_source"] == "evidence"  # the gateway docs judged it
 
 
 def test_a_counter_reset_drops_the_pod_for_good() -> None:
@@ -340,16 +377,19 @@ def test_a_counter_reset_drops_the_pod_for_good() -> None:
     assert "m-2" not in h.scraper.calls[-1][1]  # no longer polled
 
 
-def test_every_pod_failing_falls_back_to_the_redis_evidence() -> None:
+def test_every_pod_failing_twice_in_a_row_falls_back_to_the_redis_evidence() -> None:
     h = Harness()
     h.start()
     h.tick(HIDE + 2_000, serve=5)
     h.failing.update({"m-0": "timeout", "m-2": "error:URLError"})
     assert h.tick(HIDE + 4_000).status == "probing"
+    assert h.machine.active_probe(MODEL).direct.fallback is None  # one bad tick is not enough
+    assert h.tick(HIDE + 6_000).status == "probing"
     probe = h.machine.active_probe(MODEL)
     assert probe.direct.fallback["reason"] == "all_pods_failed"
     polls_before = len(h.scraper.calls)
-    h.tick(HIDE + 6_000)
+    h.failing.clear()
+    h.tick(HIDE + 8_000)
     assert len(h.scraper.calls) == polls_before  # sticky: no more scraping
     # The Redis path (687cbd9c logic) judges at the snapshot deadline.
     decision = h.tick(130_000, obs=_obs(130_000))
@@ -359,13 +399,31 @@ def test_every_pod_failing_falls_back_to_the_redis_evidence() -> None:
     assert h.evidence.reads and h.evidence.reads[-1]["start_ms"] == 110_000
 
 
-def test_a_failed_baseline_falls_back_at_once() -> None:
+def test_a_failed_baseline_is_retried_then_falls_back() -> None:
     h = Harness()
     h.failing.update({"m-0": "timeout", "m-2": "no_endpoint"})
     probe = h.start()
+    assert probe.direct.fallback is None and probe.direct.baseline is None
+    assert probe.direct.pending == ("m-0", "m-2") and probe.direct.failed_polls == 1
+    h.tick(HIDE + 2_000)  # the tick retries the baseline: still nothing -> Redis
+    probe = h.machine.active_probe(MODEL)
     assert probe.direct.fallback["reason"] == "baseline_failed"
-    assert probe.direct.dropped == {"m-0": {"reason": "baseline_timeout", "ts_ms": HIDE},
-                                    "m-2": {"reason": "baseline_no_endpoint", "ts_ms": HIDE}}
+    assert probe.direct.fallback["detail"] == {"m-0": "timeout", "m-2": "no_endpoint"}
+
+
+def test_no_cluster_view_yet_is_retried_not_a_fallback() -> None:
+    h = Harness()
+    known = {"ready": False}
+    h.collector = DirectEvidenceCollector(
+        h.machine, h.scraper,
+        lambda model, exclude: {} if not known["ready"] else {p: f"http://{p}" for p in h.sims if p not in exclude},
+        poll_ms=2_000.0, clock_ms=h.clock,
+    )
+    probe = h.start()
+    assert probe.direct.baseline is None and probe.direct.failed_polls == 0 and probe.direct.fallback is None
+    known["ready"] = True
+    h.tick(HIDE + 2_000)
+    assert h.machine.active_probe(MODEL).direct.baseline_ts_ms == HIDE + 2_000
 
 
 def test_redis_evidence_failing_too_fails_closed() -> None:
@@ -398,11 +456,63 @@ def test_the_kv_gate_reads_the_direct_scrape() -> None:
     assert decision.details["rollback_reason"]["gates"] == ["kv_cache"]
     assert (decision.details["kv_source"], decision.details["kv_direct"]) == ("direct", pytest.approx(0.9))
     assert decision.details["kv_redis_tail_max"] == 0.1 and decision.details["kv_ts_ms"] == HIDE + W
+    assert decision.details["kv_direct_tail_max"] == pytest.approx(0.9)
     ok = Harness(kv_cache_max=0.8)
     ok.obs_kwargs = {"kv": 0.95}
     ok.start()
     at, decision = ok.run_until(HIDE + W, serve=5)[-1]
     assert decision.status == "commit" and decision.details["kv_redis_tail_max"] == 0.95
+
+
+def test_the_kv_gate_takes_the_max_over_the_tail_of_the_polls_not_only_the_latest() -> None:
+    # Review P1: 0.95 for the whole probe but 0.1 on the deadline poll must not commit.
+    h = Harness(kv_cache_max=0.8)
+    for sim in h.sims.values():
+        sim.kv = 0.95
+    h.start()
+    h.run_until(HIDE + W - 2_000, serve=5)
+    for sim in h.sims.values():
+        sim.kv = 0.1
+    decision = h.tick(HIDE + W, serve=5)
+    assert decision.status == "rollback" and decision.details["rollback_reason"]["gates"] == ["kv_cache"]
+    assert decision.details["kv_direct"] == pytest.approx(0.1)
+    assert decision.details["kv_direct_tail_max"] == pytest.approx(0.95)
+
+
+# ============================================================ review P2 hardening
+def test_a_p95_in_the_inf_bucket_is_clamped_and_records_stay_strict_json() -> None:
+    store = FakeProbeStore()
+    h = Harness(store=store)
+    probe = h.start()
+    decision = h.tick(HIDE + 2_000, serve=20, ttft_s=5000.0)  # beyond the last finite TTFT bucket
+    assert decision.status == "rollback"
+    assert decision.details["rollback_reason"]["ttft_p95_ms"] == 2_560_000.0
+    json.dumps(decision.details, allow_nan=False)
+    json.dumps(store.records[probe.request_id], allow_nan=False)
+
+
+def test_a_malformed_direct_record_restores_without_crashing() -> None:
+    assert DirectState.from_record({"baseline": {}, "dropped": ["x"], "scrapes": "bad"}) is not None
+    assert DirectState.from_record({"baseline_ts_ms": "not-a-number"}) is None
+    assert DirectState.from_record({"kv_history": [[1, "x"]]}) is None
+
+
+def test_registry_numbers_of_the_section_raise_value_errors_only() -> None:
+    for bad in ({"metrics_port": [8000]}, {"metrics_port": float("inf")}, {"evidence_poll_s": [2]},
+                {"scrape_timeout_s": {"a": 1}}, {"evidence_poll_s": True}):
+        with pytest.raises(ValueError):
+            parse_safescale_config(bad)
+
+
+def test_urls_come_from_the_view_whatever_the_pod_state() -> None:
+    from tre_controller.planning.safescale_direct import cluster_view_urls
+
+    class View:
+        pod_ips = {"m-0": "10.0.0.5", "m-9": "fd00::7"}
+
+    urls = cluster_view_urls(lambda: View(), port=8000)("m", ("m-0", "m-9", "m-2"))
+    assert urls == {"m-0": "http://10.0.0.5:8000/metrics", "m-9": "http://[fd00::7]:8000/metrics", "m-2": None}
+    assert cluster_view_urls(lambda: None, port=8000)("m", ("m-0",)) == {"m-0": None}
 
 
 def test_the_z_gate_still_reads_the_snapshot_tail() -> None:
@@ -520,6 +630,7 @@ def test_the_cluster_view_carries_pod_ips_and_targets_skip_probe_and_sleeping_po
             {"serve_id": "m-1", "model": "m", "node": "n", "gpu_ids": [1], "awake": True, "hidden": True},
             {"serve_id": "m-2", "model": "m", "node": "n", "gpu_ids": [2], "awake": False, "hidden": False},
             {"serve_id": "m-3", "model": "m", "node": "n", "gpu_ids": [3], "awake": True, "hidden": False},
+            {"serve_id": "m-4", "model": "m", "node": "n", "gpu_ids": [3], "awake": True, "hidden": True},
         ],
         "fleet": {"observed": [{"pod_name": "m-0", "pod_ip": "10.0.0.5"}, {"pod_name": "m-1", "pod_ip": "10.0.0.6"},
                                {"pod_name": "m-2", "pod_ip": "10.0.0.7"}]},
@@ -586,5 +697,5 @@ def test_direct_state_record_roundtrip() -> None:
 
     state = take_baseline({"a": parse_vllm_metrics(sim.text(), ts_ms=5), "b": "timeout"}, ts_ms=6)
     again = DirectState.from_record(json.loads(json.dumps(state.as_record())))
-    assert again.baseline["a"].ttft.count == 12 and again.dropped == {"b": {"reason": "baseline_timeout", "ts_ms": 6}}
+    assert again.baseline["a"].ttft.count == 12 and again.pending == ("b",) and again.dropped == {}
     assert again.baseline_ts_ms == 5 and isinstance(again.baseline["a"].ttft, Hist)

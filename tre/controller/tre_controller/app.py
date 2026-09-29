@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 import time
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Mapping
@@ -32,6 +34,7 @@ from tre_controller.planning.safescale_direct import (
     DirectEvidenceCollector,
     PodMetricsScraper,
     cluster_view_targets,
+    cluster_view_urls,
 )
 from tre_controller.planning.safescale_evidence import MetricsEvidenceReader, RegistryThresholds
 from tre_controller.signals.trs import SignalState
@@ -290,7 +293,19 @@ def create_controller_dependencies(
             PodMetricsScraper(timeout_s=cfg.safescale.scrape_timeout_s),
             cluster_view_targets(cluster_view_box.get, port=cfg.safescale.metrics_port),
             poll_ms=cfg.safescale.evidence_poll_ms,
+            urls=cluster_view_urls(cluster_view_box.get, port=cfg.safescale.metrics_port),
         )
+    # The effective evidence settings (unknown registry keys are only warned about).
+    logging.getLogger("tre_controller.safescale").info(json.dumps({
+        "event": "safescale_config",
+        "evidence_source": cfg.safescale.evidence_source,
+        "evidence_poll_ms": cfg.safescale.evidence_poll_ms,
+        "scrape_timeout_s": cfg.safescale.scrape_timeout_s,
+        "metrics_port": cfg.safescale.metrics_port,
+        "min_commit_samples": cfg.safescale.min_commit_samples,
+        "window_ceiling_ms": cfg.safescale.window_ceiling_ms,
+        "slo_mode": cfg.safescale.slo_mode,
+    }, sort_keys=True))
     observe_gate = ObserveModeGate(redis_client)
     profiler = build_profiler(cfg, redis_client)
     model_state_box = ModelStateBox()

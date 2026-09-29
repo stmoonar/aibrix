@@ -446,6 +446,17 @@ SAFESCALE_KEYS = frozenset({
 SAFESCALE_EVIDENCE_SOURCES = ("direct", "redis")
 
 
+def _safescale_num(section: dict[str, Any], key: str, default: float) -> float:
+    """A number of the safescale section; anything unparsable is a ValueError."""
+    value = section.get(key)
+    if isinstance(value, bool):
+        raise ValueError(f"safescale.{key} must be a number, got {value!r}")
+    try:
+        return float(default if value is None else value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"safescale.{key} must be a number, got {value!r}") from exc
+
+
 def parse_safescale_config(raw: dict[str, Any] | None) -> SafeScaleRegistryConfig:
     """Parse the optional ``safescale:`` registry section; raise ValueError on bad values.
 
@@ -463,8 +474,8 @@ def parse_safescale_config(raw: dict[str, Any] | None) -> SafeScaleRegistryConfi
     source = str(raw.get("evidence_source") or defaults.evidence_source).strip().lower()
     if source not in SAFESCALE_EVIDENCE_SOURCES:
         raise ValueError(f"safescale.evidence_source must be one of {SAFESCALE_EVIDENCE_SOURCES}, got {source!r}")
-    poll = _num(raw, "evidence_poll_s", defaults.evidence_poll_s)
-    scrape_timeout = _num(raw, "scrape_timeout_s", defaults.scrape_timeout_s)
+    poll = _safescale_num(raw, "evidence_poll_s", defaults.evidence_poll_s)
+    scrape_timeout = _safescale_num(raw, "scrape_timeout_s", defaults.scrape_timeout_s)
     for name, value in (("evidence_poll_s", poll), ("scrape_timeout_s", scrape_timeout)):
         if not math.isfinite(value) or value <= 0:
             raise ValueError(f"safescale.{name} must be a positive number, got {value!r}")
@@ -475,13 +486,19 @@ def parse_safescale_config(raw: dict[str, Any] | None) -> SafeScaleRegistryConfi
         )
     port_raw = raw.get("metrics_port")
     port = defaults.metrics_port if port_raw is None else port_raw
-    if isinstance(port, bool) or float(port) != int(float(port)) or not 1 <= int(float(port)) <= 65535:
+    try:
+        valid_port = (
+            not isinstance(port, bool) and float(port) == int(float(port)) and 1 <= int(float(port)) <= 65535
+        )
+    except (TypeError, ValueError, OverflowError):
+        valid_port = False
+    if not valid_port:
         raise ValueError(f"safescale.metrics_port must be a port number, got {port!r}")
     mode = str(raw.get("slo_mode") or defaults.slo_mode).strip().lower()
     if mode not in SAFESCALE_SLO_MODES:
         raise ValueError(f"safescale.slo_mode must be one of {SAFESCALE_SLO_MODES}, got {mode!r}")
-    ceiling = _num(raw, "window_ceiling_s", defaults.window_ceiling_s)
-    tolerance = _num(raw, "evidence_clock_tolerance_s", defaults.evidence_clock_tolerance_s)
+    ceiling = _safescale_num(raw, "window_ceiling_s", defaults.window_ceiling_s)
+    tolerance = _safescale_num(raw, "evidence_clock_tolerance_s", defaults.evidence_clock_tolerance_s)
     for name, value in (("window_ceiling_s", ceiling), ("evidence_clock_tolerance_s", tolerance)):
         if not math.isfinite(value) or value <= 0:
             raise ValueError(f"safescale.{name} must be a positive number, got {value!r}")

@@ -451,8 +451,11 @@ class SafeScaleStateMachine:
         )
 
     def set_direct_baseline(self, model: str, *, request_id: str, results, ts_ms: int) -> bool:
-        """Store the baseline scrape of ``request_id``'s remaining pods (only once). No
-        usable pod -> the probe falls back to the Redis evidence path (sticky)."""
+        """Store the baseline scrape of ``request_id``'s remaining pods (only once; pods
+        that did not answer stay pending and get their baseline at their first later
+        successful scrape). No pod answered: retried at the next tick, and after
+        ``ALL_FAILED_POLLS`` such attempts the probe falls back to the Redis evidence
+        path (sticky). Empty ``results`` (no targets known yet) are not an attempt."""
         probe = self._probes.get(model)
         if (
             not self._direct_mode or probe is None or probe.request_id != request_id
@@ -461,15 +464,19 @@ class SafeScaleStateMachine:
             return False
         if probe.direct is not None and (probe.direct.baseline is not None or probe.direct.fallback is not None):
             return False
-        state = take_baseline(results, ts_ms=int(ts_ms))
+        if not results:
+            return False
+        state = take_baseline(results, ts_ms=int(ts_ms), previous=probe.direct)
         audit = {
             "direct_baseline_ts_ms": state.baseline_ts_ms,
             "direct_baseline_pods": sorted(state.baseline or {}),
+            "direct_pending_pods": list(state.pending),
             "direct_excluded_pods": {pod: value.get("reason") for pod, value in sorted(state.dropped.items())},
         }
         probe = replace(probe, direct=state, window_terms={**probe.window_terms, **audit})
-        if not state.baseline:
-            probe = self._fall_back(probe, reason="baseline_failed", ts_ms=int(ts_ms))
+        if not state.baseline and (state.failed_polls >= ALL_FAILED_POLLS or not state.live_pods()):
+            detail = {pod: (result if isinstance(result, str) else "unusable") for pod, result in sorted(results.items())}
+            probe = self._fall_back(probe, reason="baseline_failed", ts_ms=int(ts_ms), detail=detail)
         self._probes[model] = probe
         self._persist_probe(probe)
         return True
@@ -526,13 +533,20 @@ class SafeScaleStateMachine:
             state, poll,
             percentile_mode=str(getattr(self._config, "percentile_mode", "bucket_upper")),
             min_latency_samples=int(getattr(self._config, "min_latency_samples", 0) or 0),
+            fresh_ms=_direct_fresh_ms(self._config),
+            hq=float(getattr(self._config, "hq", 0.25)),
         )
         probe = replace(probe, direct=state)
         self._probes[probe.model] = probe
-        if window is None:
+        if state.failed_polls >= ALL_FAILED_POLLS or not state.live_pods():
+            # Every remaining pod failed (ALL_FAILED_POLLS polls in a row), or none is
+            # left (all restarted): the Redis evidence decides this probe from now on.
             excluded = {pod: (result if isinstance(result, str) else "unusable")
                         for pod, result in sorted(poll.results.items())}
-            return self._fall_back(probe, reason="all_pods_failed", ts_ms=wall_now, detail=excluded), wall_now, None
+            reason = "all_pods_failed" if state.live_pods() else "no_live_pods"
+            return self._fall_back(probe, reason=reason, ts_ms=wall_now, detail=excluded), wall_now, None
+        if window is None:
+            return probe, wall_now, None
         violation = self._direct_violation(probe, window)
         if violation is not None:
             return probe, wall_now, self._rollback_now(
@@ -540,7 +554,12 @@ class SafeScaleStateMachine:
                 reason="slo_violation_direct",
                 details={"slo": {"ttft_p95_ms": window.ttft_p95_ms, "tpot_p95_ms": window.tpot_p95_ms}},
                 rollback_reason=violation,
-                audit=self._direct_audit(probe),
+                audit={
+                    **self._direct_audit(probe), **window.latency_audit(), "latency_gate": "evaluated",
+                    "latency_violations": violation["metrics"], "threshold_mode": violation["threshold_mode"],
+                    "ttft_threshold_ms": violation["ttft_threshold_ms"],
+                    "tpot_threshold_ms": violation["tpot_threshold_ms"],
+                },
             )
         return probe, wall_now, None
 
@@ -581,9 +600,10 @@ class SafeScaleStateMachine:
         if state.last is not None:
             audit.update(state.last.audit())
             audit["direct_excluded_pods"] = dict(sorted(state.last.excluded.items()))
-            audit["kv_source"] = "direct" if state.last.kv_cache is not None else "redis_snapshot_tail"
+            audit["kv_source"] = "direct" if state.last.kv_tail_max is not None else "redis_snapshot_tail"
             audit["kv_direct"] = state.last.kv_cache
-            audit["kv_ts_ms"] = state.last.end_ms if state.last.kv_cache is not None else None
+            audit["kv_direct_tail_max"] = state.last.kv_tail_max
+            audit["kv_ts_ms"] = state.kv_history[-1][0] if state.kv_history else None
         return audit
 
     def _source_audit(self, probe: SafeScaleProbe) -> dict[str, Any]:
@@ -738,6 +758,14 @@ class SafeScaleStateMachine:
             )
         if direct_live:
             outcome = self._direct_outcome(probe, summary, wall_now_ms=int(wall_now_ms or now_ms))
+            if outcome.kind == "fallback":
+                # Live pods without fresh evidence at the ceiling: never commit on a
+                # subset - the Redis evidence (every pod the gateway scrapes) decides.
+                probe = self._fall_back(
+                    probe, reason=str(outcome.audit.get("fallback_reason")),
+                    ts_ms=int(wall_now_ms or now_ms), detail=outcome.audit.get("direct_missing_pods"),
+                )
+                return self._judge(probe, health, now_ms=now_ms)
             if outcome.kind == "extend":
                 return self._extend(probe, outcome.audit, direct_now_ms=int(wall_now_ms or now_ms))
             if outcome.kind == "rollback":
@@ -748,7 +776,7 @@ class SafeScaleStateMachine:
                     rollback_reason=outcome.rollback_reason,
                     audit={**tail_audit, **outcome.audit},
                 )
-            kv = probe.direct.last.kv_cache if probe.direct is not None and probe.direct.last is not None else None
+            kv = probe.direct.last.kv_tail_max if probe.direct is not None and probe.direct.last is not None else None
             summary = replace(summary, latency_ok=outcome.latency_ok,
                               gpu_cache_max=kv if kv is not None else summary.gpu_cache_max)
             latency_audit = outcome.audit
@@ -996,15 +1024,13 @@ class SafeScaleStateMachine:
         if anchor is not None:
             audit.update(hide_ts_ms=int(anchor.ts_ms), hide_anchor_source=anchor.source)
         window = probe.direct.last if probe.direct is not None else None
-        if window is None:
-            # Baseline taken but no poll differenced yet (restart / first tick).
+        if window is None or int(wall_now_ms) - int(window.end_ms) > _direct_fresh_ms(cfg):
+            # No poll differenced yet (restart / first tick) or the latest is stale (polls
+            # stopped): wait for a fresh one; at the ceiling the Redis evidence decides.
+            why = "no_direct_window" if window is None else "direct_window_stale"
             if can_extend:
-                return _EvidenceOutcome("extend", audit={**audit, "extend_reason": "no_direct_window"})
-            return _EvidenceOutcome(
-                "rollback", audit=audit,
-                rollback_reason={"code": "evidence_empty", "check": "no_direct_window",
-                                 "evidence_start_ms": (probe.direct.baseline_ts_ms if probe.direct else None)},
-            )
+                return _EvidenceOutcome("extend", audit={**audit, "extend_reason": why})
+            return _EvidenceOutcome("fallback", audit={**audit, "fallback_reason": why})
         confirm = probe.window_base_ms if probe.window_base_ms is not None else probe.start_ms
         samples, judged = float(window.ttft_count), float(window.judged_count)
         thresholds = self._thresholds_for(probe.model, window.mean_prompt_tokens)
@@ -1028,10 +1054,21 @@ class SafeScaleStateMachine:
         )
         if "fallback" in thresholds:
             audit["threshold_fallback"] = thresholds["fallback"]
-        if min_samples <= 0 or (judged >= min_samples and window.p95_available):
-            violations = _latency_violations(window.ttft_p95_ms, window.tpot_p95_ms, thresholds)
+        enough = min_samples <= 0 or (judged >= min_samples and window.p95_available)
+        violations = _latency_violations(window.ttft_p95_ms, window.tpot_p95_ms, thresholds) if enough else []
+        if enough and violations:
+            # A violation is one whatever pods are missing.
             audit.update(latency_gate="evaluated", latency_violations=violations)
-            return _EvidenceOutcome("judge", audit=audit, latency_ok=not violations)
+            return _EvidenceOutcome("judge", audit=audit, latency_ok=False)
+        if window.missing:
+            # A live pod has no fresh evidence (pending baseline, failing scrapes): its
+            # requests are not in the window - never commit on the subset.
+            if can_extend:
+                return _EvidenceOutcome("extend", audit={**audit, "extend_reason": "pods_missing"})
+            return _EvidenceOutcome("fallback", audit={**audit, "fallback_reason": "pods_missing"})
+        if enough:
+            audit.update(latency_gate="evaluated", latency_violations=violations)
+            return _EvidenceOutcome("judge", audit=audit, latency_ok=True)
         short = "insufficient_samples" if samples < min_samples else "p95_unavailable"
         if can_extend:
             return _EvidenceOutcome("extend", audit={**audit, "extend_reason": short})
@@ -1263,7 +1300,7 @@ class SafeScaleStateMachine:
 
 @dataclass(frozen=True)
 class _EvidenceOutcome:
-    kind: Literal["judge", "extend", "rollback"]
+    kind: Literal["judge", "extend", "rollback", "fallback"]
     audit: dict[str, Any] = field(default_factory=dict)
     latency_ok: bool = True
     idle: bool = False
@@ -1296,6 +1333,17 @@ def _evidence_step_ms(config: SafeScaleConfig) -> int:
 
 def _direct_poll_ms(config: SafeScaleConfig) -> int:
     return max(1, int(getattr(config, "evidence_poll_ms", 2_000.0) or 2_000))
+
+
+#: Direct evidence: consecutive scrapes without any answering pod before the probe falls
+#: back to the Redis evidence (one bad tick of a loaded pod is not enough).
+ALL_FAILED_POLLS = 2
+
+
+def _direct_fresh_ms(config: SafeScaleConfig) -> float:
+    """A pod's latest delta counts as fresh within two poll periods plus one scrape
+    timeout (one failed scrape in between is tolerated: its delta is cumulative)."""
+    return 2.0 * _direct_poll_ms(config) + 1000.0 * float(getattr(config, "scrape_timeout_s", 1.0) or 1.0)
 
 
 def _latency_violations(ttft_p95_ms: float | None, tpot_p95_ms: float | None, thresholds: dict[str, Any]) -> list[str]:
