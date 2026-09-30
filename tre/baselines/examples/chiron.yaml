@@ -1,0 +1,8 @@
+# Chiron baseline params (TRE_BL_POLICY=chiron, TRE_BL_POLICY_CONFIG=<this file>).
+alpha: 0.5          # paper: Alg.1 smoothing factor
+# b_init: 256       # ours: initial virtual B; default = model max_num_seqs, else 256
+# b_max: 256        # ours: cap on B; default = model max_num_seqs, else 256
+busy_def: at_cap    # ours: at_cap (running+waiting >= B) | nonidle (running > 0)
+theta:              # IBP threshold per model; "*" = default (paper's 3x example)
+  "*": 0.3333
+  # <model>: 0.25   # produce with: python3 -m tre_baselines.tools.chiron_theta --trace ...

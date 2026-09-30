@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Callable
 
 from tre_baselines.policies.base import Decision, Policy
+from tre_baselines.policies.chiron import ChironPolicy
 from tre_baselines.policies.static import StaticPolicy
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -17,6 +18,7 @@ if TYPE_CHECKING:  # pragma: no cover
 
 POLICIES: dict[str, Callable[["Config"], Policy]] = {
     "static": StaticPolicy,
+    "chiron": ChironPolicy,
 }
 
 
