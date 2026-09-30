@@ -199,7 +199,7 @@ class _Shards:
 
     @property
     def is_closed(self) -> bool:
-        return bool(self.clients) and all(getattr(c, "is_closed", False) for c in self.clients)
+        return bool(self.clients) and all(_is_closed(c) for c in self.clients)
 
     async def aclose(self) -> None:
         for client in self.clients:
@@ -366,15 +366,23 @@ def normalize_gateway_endpoint(base_url: str) -> str:
 V1_PLACEHOLDER_API_KEY = "dummy-key-for-local-gateway"
 
 
+#: SDK clients per worker process with ``pool_shards=None``. The default is v1's one
+#: client per process; sharding (every shard built exactly like v1's client) cut the
+#: send-lateness p99 at 200-300 rps only from 28-36 to 21-29 ms - the SDK's own
+#: per-request work dominates there (replayer/README.md) - so it stays opt-in.
+E1_MAX_POOL_SHARDS = 16
+
+
 class OpenAIChatTransport:
-    """v1's client, one per event loop: ``openai.AsyncOpenAI`` with v1's options, and the
+    """v1's client: ``openai.AsyncOpenAI`` with v1's options (per event loop, sharded like
+    :class:`HttpxStreamTransport`; ``pool_shards=1`` is v1's single client), and the
     request made through ``chat.completions.create``. See the module docstring."""
 
     name = TRANSPORT_OPENAI_SDK
 
     def __init__(self, gateway_endpoint: str, *, api_key: str = "", max_retries: int = 2,
                  timeout_s: float = 300.0, routing_strategy: Optional[str] = "least-gpu-cache",
-                 streaming: bool = True) -> None:
+                 streaming: bool = True, pool_shards: Optional[int] = 1) -> None:
         self.gateway_endpoint = normalize_gateway_endpoint(gateway_endpoint)
         if not self.gateway_endpoint:
             raise ValueError("the e1_v1 transport needs an explicit gateway base URL")
@@ -386,16 +394,27 @@ class OpenAIChatTransport:
         self.timeout_s = float(timeout_s)
         self.routing_strategy = routing_strategy or None
         self.streaming = bool(streaming)
-        self._clients = _PerLoop(self.make_client)
+        self.pool_shards = E1_MAX_POOL_SHARDS if pool_shards is None else max(1, int(pool_shards))
+        self._ssl = None
+        self._clients = _PerLoop(lambda: _Shards(self.make_client, self.pool_shards))
 
     def make_client(self):
         """Exactly v1's ``WorkerProcess.create_client``: the SDK's default httpx client
-        (same limits and redirects) with only the attempt hooks added."""
+        (same limits and redirects) with only the attempt hooks added (and one TLS
+        context shared by the shards: loading the CA store costs ~20 ms per client)."""
         import openai
 
+        extra = {}
+        if self.pool_shards > 1:
+            if self._ssl is None:
+                import httpx
+
+                self._ssl = httpx.create_ssl_context()
+            extra["verify"] = self._ssl
         http_client = openai.DefaultAsyncHttpxClient(
             timeout=self.timeout_s,
             event_hooks={"request": [_on_request_hook], "response": [_on_response_hook]},
+            **extra,
         )
         client = openai.AsyncOpenAI(api_key=self.api_key, base_url=self.base_url, max_retries=self.max_retries,
                                     timeout=self.timeout_s, http_client=http_client)
@@ -413,18 +432,29 @@ class OpenAIChatTransport:
         return {"transport": self.name, "openai_version": sdk, "base_url": self.base_url,
                 "max_retries": self.max_retries, "timeout_s": self.timeout_s,
                 "routing_strategy_header": self.routing_strategy, "streaming": self.streaming,
-                "pool": "openai.DefaultAsyncHttpxClient (1000 connections / 100 keep-alive)", **_versions()}
+                "pool": "openai.DefaultAsyncHttpxClient (1000 connections / 100 keep-alive) per client",
+                "pool_shards_max": self.pool_shards, **_versions()}
 
     async def prepare(self) -> None:
-        client = self._clients.get()
+        shards = self._clients.get()
+        if not shards.clients:
+            shards.pick()
         # The SDK loads its resource modules lazily on first attribute access.
-        _ = client.chat.completions
+        _ = shards.clients[0].chat.completions
 
     async def aclose(self) -> None:
         await self._clients.aclose()
 
     async def send_chat(self, kwargs: dict[str, Any]) -> StreamResult:
-        client = self._clients.get()
+        shards = self._clients.get()
+        index = shards.pick()
+        shards.load[index] += 1
+        try:
+            return await self._send_chat(shards.clients[index], kwargs)
+        finally:
+            shards.load[index] -= 1
+
+    async def _send_chat(self, client, kwargs: dict[str, Any]) -> StreamResult:
         tracker = AttemptTracker()
         token = _ATTEMPT_TRACKER.set(tracker)
         start = time.perf_counter()
@@ -438,7 +468,9 @@ class OpenAIChatTransport:
             _ATTEMPT_TRACKER.reset(token)
         res.attempts = tracker.count
         res.attempt_log = list(tracker.attempts)
-        if tracker.attempts:
+        if tracker.count > 1:
+            # The strict basis leaves the retries out: it is timed from the last attempt.
+            # A single attempt is timed from the call, like every other profile.
             res.last_attempt_offset_ms = max(0.0, (tracker.attempts[-1]["t"] - epoch) * 1000.0)
         return res
 

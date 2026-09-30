@@ -120,6 +120,9 @@ class V1ChatOptions:
     timeout_s: float = 300.0
     routing_strategy: Optional[str] = "least-gpu-cache"
     streaming: bool = True
+    #: SDK clients per worker process (1 = v1's single client, the default; None = up
+    #: to transport.E1_MAX_POOL_SHARDS, opened as load needs them). Not a request parameter.
+    pool_shards: Optional[int] = 1
 
     def kwargs_for(self, model: str, prompt: str, max_output_tokens: Optional[int]) -> dict[str, Any]:
         """``chat.completions.create`` keyword arguments, as v1 built them."""

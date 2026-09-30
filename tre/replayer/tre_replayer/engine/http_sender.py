@@ -258,7 +258,7 @@ class StreamingHttpSender:
                 transport = OpenAIChatTransport(
                     gateway_url, api_key=v1_options.api_key, max_retries=v1_options.max_retries,
                     timeout_s=v1_options.timeout_s, routing_strategy=v1_options.routing_strategy,
-                    streaming=v1_options.streaming,
+                    streaming=v1_options.streaming, pool_shards=v1_options.pool_shards,
                 )
             else:
                 transport = HttpxStreamTransport(max_connections=self._max_in_flight)
