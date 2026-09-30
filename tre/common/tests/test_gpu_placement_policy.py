@@ -126,11 +126,22 @@ def test_reservation_keeps_the_last_free_pair_when_an_alternative_exists():
     assert kept.block == gpu(N1, 3)
     assert kept.score[0] == 0  # no violation
 
-    # Without a reserve, same-model spread wins and breaks the last pair.
+    # Without a reserve the split cost still keeps the last pair (S5: the cost
+    # ranks before node load and same-model spread).
     spread = choose_placement(
         singles,
         nodes=TWO,
         occupied=occupied,
+        tp_size=1,
+        policy=PlacementPolicy(max_order=1, reserve_blocks=0),
+        model_occupied=a_gpus,
+    )
+    assert spread.block == gpu(N1, 3)
+    # With the fragment gone, same-model spread decides between equal fits.
+    spread = choose_placement(
+        singles,
+        nodes=TWO,
+        occupied=occupied | {(N1, 3)},
         tp_size=1,
         policy=PlacementPolicy(max_order=1, reserve_blocks=0),
         model_occupied=a_gpus,
@@ -145,14 +156,18 @@ def test_reservation_is_soft_and_bounded_by_headroom():
     reserve2 = PlacementPolicy(max_order=1, reserve_blocks=2, reserve_caps=(("C", 4),))
 
     assert choose_placement(singles, nodes=TWO, occupied=occupied, tp_size=1, policy=reserve2).block == gpu(N1, 3)
-    # Node balance alone would open the idle node.
+    # Without a reserve the fragment n1:3 is still filled first (split cost, S5).
     assert choose_placement(
         singles, nodes=TWO, occupied=occupied, tp_size=1, policy=PlacementPolicy(max_order=1)
-    ).block == gpu(N2, 0)
+    ).block == gpu(N1, 3)
     # C (the only tp2 model) is at its cap: nothing to reserve for.
     capped = reserve2.for_awake({"C": 4})
     assert capped.reserve_blocks == 0
-    assert choose_placement(singles, nodes=TWO, occupied=occupied, tp_size=1, policy=capped).block == gpu(N2, 0)
+    assert choose_placement(singles, nodes=TWO, occupied=occupied, tp_size=1, policy=capped).block == gpu(N1, 3)
+    # Node balance opens the idle node once no fragment is left.
+    assert choose_placement(
+        singles, nodes=TWO, occupied=occupied | {(N1, 3)}, tp_size=1, policy=PlacementPolicy(max_order=1)
+    ).block == gpu(N2, 0)
     assert reserve2.effective_reserve({"C": 3}) == 1
     assert reserve2.effective_reserve(None) == 2
 

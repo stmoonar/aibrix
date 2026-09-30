@@ -13,6 +13,7 @@ from scripts.campaign_queue import (
     baseline_errors,
     derive_actual_actions,
     deterministic_gzip,
+    freeze_baseline,
     generate_baseline,
     load_manifest,
     parse_controller_decisions,
@@ -360,3 +361,24 @@ def test_run_selection_supports_resume_boundary_and_limit():
         select_runs(runs, start_at="missing", limit=None)
     with pytest.raises(ValueError, match="positive"):
         select_runs(runs, start_at=None, limit=0)
+
+
+def test_freeze_baseline_pins_the_layout_in_the_manifest_for_both_arms(tmp_path, monkeypatch):
+    """S5 (2026-09-30): the generated baseline follows the placement ranking; a
+    frozen one is written into the manifest and never regenerated."""
+    import scripts.campaign_queue as campaign_queue
+
+    path = tmp_path / "manifest.json"
+    _write_manifest(path, baseline=None)
+
+    frozen = freeze_baseline(path, REGISTRY)
+
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    assert frozen == generate_baseline(REGISTRY) == raw["baseline"]
+    assert raw["baseline_frozen"]["source"].startswith("generate_baseline")
+    # a later ranking (here: a different generated layout) changes nothing
+    monkeypatch.setattr(campaign_queue, "generate_baseline", lambda registry: {"A": "A/n-b/3", "B": "B/n-b/2", "C": "C/n-a/2,3"})
+    manifest = load_manifest(path, registry=REGISTRY)
+    assert manifest.baseline == frozen and manifest.baseline_source == "manifest"
+    assert {run.arm for run in manifest.runs} == {"tre", "apa"}  # one baseline for both arms
+    assert freeze_baseline(path, REGISTRY) == frozen  # idempotent, never overwritten

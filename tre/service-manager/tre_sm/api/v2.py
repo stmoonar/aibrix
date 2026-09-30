@@ -368,9 +368,116 @@ class ServiceManagerV2:
             "models": self._model_counts(snapshot.bindings),
             "bindings": [self._binding_dict(binding) for binding in snapshot.bindings],
         }
+        gpus, nodes = self._gpu_states(snapshot.bindings)
+        state["gpus"] = gpus
+        state["nodes"] = nodes
         if self._fleet_store is not None:
             state["fleet"] = self.get_fleet_state()
         return state
+
+    #: Reasons a GPU is not wakeable in ``/v2/state`` ``gpus[]``, most binding first.
+    GPU_BLOCK_REASONS = ("awake", "draining", "loading", "waking", "gpu_truth_used")
+
+    def _gpu_states(self, bindings: list[Binding]) -> tuple[list[dict], dict]:
+        """``gpus[]`` and ``nodes{}`` of ``/v2/state`` (S5): per GPU whether a wake
+        could go there now and why not (an awake binding, a sleep draining, a Pod
+        loading, a wake in flight, gpu-truth showing it in use), the occupants and
+        how the wake gate would judge it; per node the gpu-truth health. Read only
+        (no refresh request, no probe); never fails the state call."""
+        try:
+            leases = self._active_leases()
+        except Exception:  # noqa: BLE001 - shown as unknown
+            leases = []
+        reservations = []
+        try:
+            store = self._reservations()
+            reservations = list(store.active().values()) if store is not None else []
+        except Exception:  # noqa: BLE001
+            reservations = []
+        gpus: list[dict] = []
+        nodes: dict[str, dict] = {}
+        for node in self._registry.topology().nodes:
+            truth = None
+            if self._gpu_truth is not None:
+                try:
+                    truth = self._gpu_truth.node_truth(node=node.name)
+                except Exception:  # noqa: BLE001
+                    truth = None
+            age = self._truth_age_s(node.name, truth)
+            nodes[node.name] = {
+                "gpus": int(node.gpus),
+                "truth_configured": self._gpu_truth is not None,
+                "truth_available": truth is not None,
+                "truth_age_s": age,
+                "truth_seq": getattr(truth, "seq", None),
+                "truth_refresh_seq": getattr(truth, "refresh_seq", None),
+                "truth_timestamp": getattr(truth, "timestamp", None),
+            }
+            for gpu in range(int(node.gpus)):
+                gpus.append(self._gpu_state(node, gpu, bindings, leases, reservations, truth, age))
+        return gpus, nodes
+
+    def _gpu_state(self, node, gpu: int, bindings, leases, reservations, truth, age) -> dict:
+        def holder(phase: str) -> str | None:
+            return next(
+                (
+                    lease.binding_id
+                    for lease in leases
+                    if lease.node == node.name
+                    and gpu in {int(item) for item in lease.gpu_ids}
+                    and str(getattr(lease, "phase", "")) == phase
+                ),
+                None,
+            )
+
+        awake = next(
+            (b.binding_id for b in bindings if b.awake and b.slot.node == node.name and gpu in b.slot.gpu_ids),
+            None,
+        )
+        draining = next(
+            (r.binding_id for r in reservations if r.node == node.name and gpu in {int(g) for g in r.gpu_ids}),
+            None,
+        )
+        loading = holder("starting")
+        waking = holder("waking")
+        used = limit = None
+        truth_source = "none"
+        over = False
+        if self._gpu_truth is not None:
+            gpu_uuid = _gpu_uuid(node, gpu)
+            trusted = truth is not None and not self._untrusted_gpus(node.name, (gpu,), truth)
+            if truth is not None and gpu_uuid is not None:
+                used = truth.used_mib(gpu_uuid)
+                total = getattr(truth, "total_mib", None)
+                limit = self._sm_config.wake_limit_mib(total(gpu_uuid) if callable(total) else None)
+            if trusted and used is not None and limit is not None:
+                truth_source = "gpu_truth"
+                over = used > limit
+            else:
+                truth_source = "is_sleeping_probe"
+        reasons = {
+            "awake": awake is not None,
+            "draining": draining is not None,
+            "loading": loading is not None,
+            "waking": waking is not None,
+            # An awake binding explains the memory; only unexplained use blocks.
+            "gpu_truth_used": over and awake is None,
+        }
+        reason = next((name for name in self.GPU_BLOCK_REASONS if reasons[name]), None)
+        return {
+            "node": node.name,
+            "gpu": gpu,
+            "wakeable": reason is None,
+            "reason": reason,
+            "awake_binding_id": awake,
+            "loading_binding_id": loading,
+            "waking_binding_id": waking,
+            "draining_binding_id": draining,
+            "used_mib": used,
+            "limit_mib": limit,
+            "truth_source": truth_source,
+            "truth_age_s": age,
+        }
 
     def put_model_target(
         self,
@@ -380,8 +487,15 @@ class ServiceManagerV2:
         sleep_path: str = "scale_down",
         drain_budget_s: float | None = None,
         at_least: bool = False,
+        hints: list[str] | tuple[str, ...] | None = None,
     ) -> dict:
         """Scale a model to ``wake_replicas`` awake bindings.
+
+        ``hints`` (S5): serve ids of sleeping bindings the caller would like woken.
+        The service-manager picks the GPUs (registry placement policy), taking the
+        feasible hints first; a binding it cannot wake (the account, a lease, the
+        wake gate) is substituted by the next best one. ``picked`` in the response
+        says which bindings woke where (``hinted`` false = substituted).
 
         ``at_least``: grow-only (review 3 P2-1) - a model that already has
         ``wake_replicas`` or more awake bindings is left as it is (no-op), so a
@@ -406,6 +520,7 @@ class ServiceManagerV2:
                 sleep_path=sleep_path,
                 drain_budget_s=drain_budget_s,
                 at_least=at_least,
+                hints=tuple(hints or ()),
             )
         if tickets:
             response["version"] = self._finish_split_wakes("put_model_target", tickets)
@@ -444,6 +559,7 @@ class ServiceManagerV2:
         sleep_path: str,
         drain_budget_s: float | None,
         at_least: bool = False,
+        hints: tuple[str, ...] = (),
     ) -> tuple[dict, object, list[SleepTarget], list["_WakeTicket"]]:
         spec = self._registry.model(model)
         if wake_replicas < 0:
@@ -516,18 +632,33 @@ class ServiceManagerV2:
             )
             return response, batch, targets, []
         split_wakes = bool(plan["wake"]) and not plan["create"] and self._split_wake_capable()
-        before = self._desired_records() if split_wakes else {}
+        if split_wakes:
+            before = self._desired_records()
+            tickets = self._prepare_target_wakes(
+                model, len(plan["wake"]), snapshot.bindings, hints, before
+            )
+            try:
+                with self._desired_guard(reason="model_target_request"):
+                    awake = [b for b in snapshot.bindings if b.model == model and b.awake]
+                    self._set_model_desired_target(
+                        model=model,
+                        target_bindings=awake + [ticket.binding for ticket in tickets],
+                        reason="model_target_request",
+                    )
+            except BaseException:
+                self._abort_prepared_wakes(tickets)
+                raise
+            unfilled = len(plan["wake"]) - len(tickets)
+            if unfilled:
+                response["unfilled"] = unfilled
+            # The intent stays: the commit phase restores what did not wake.
+            return response, None, [], tickets
         with self._desired_guard(reason="model_target_request") as guard:
             self._set_model_desired_target(
                 model=model,
                 target_bindings=plan["target_bindings"],
                 reason="model_target_request",
             )
-            if split_wakes:
-                tickets = self._prepare_wakes(plan["wake"], snapshot.bindings, before)
-                # The intent stays: the commit phase restores what did not wake.
-                guard.settle()
-                return response, None, [], tickets
             response, batch, targets = self._apply_model_target_plan(
                 model, wake_replicas, snapshot, plan, response, guard=guard
             )
@@ -546,21 +677,68 @@ class ServiceManagerV2:
             for item in self._fleet_store.load_desired().bindings
         }
 
-    def _prepare_wakes(
-        self, wakes: list[Binding], bindings: list[Binding], before: dict[str, tuple[str, bool]]
+    def _prepare_target_wakes(
+        self,
+        model: str,
+        need: int,
+        bindings: list[Binding],
+        hints: tuple[str, ...],
+        before: dict[str, tuple[str, bool]],
     ) -> list["_WakeTicket"]:
-        """Phase 1 of several wakes (writer lock held): all or nothing."""
-        tickets: list[_WakeTicket] = []
+        """Phase 1 of a model's growth by ``need`` wakes (writer lock held; S5). The
+        service-manager picks: among the sleeping bindings the account allows, the
+        caller's hints first, else the best by the registry placement policy
+        (``_wake_pick`` = ``tre_common.gpu_placement.choose_placement``, each pick
+        scored against the earlier ones). A candidate the wake gate / a lease /
+        a reservation refuses is skipped (``placement_substituted`` event) and the
+        next best tried. Fewer than ``need`` -> what could be prepared (none ->
+        the first refusal is raised)."""
+        hinted = [str(hint) for hint in hints]
         planning = list(bindings)
         leases = self._active_leases()
+        topology = self._registry.topology()
+        tickets: list[_WakeTicket] = []
+        refusals: list[BaseException] = []
+        tried: set[str] = set()
         try:
-            for binding in wakes:
-                tickets.append(
-                    self._prepare_wake(
+            while len(tickets) < need:
+                sleeping = [
+                    b for b in planning if b.model == model and not b.awake and b.serve_id not in tried
+                ]
+                blockers = {b.serve_id: self._wake_blocker(b, planning, leases) for b in sleeping}
+                feasible = [b for b in sleeping if blockers[b.serve_id] is None]
+                if not feasible:
+                    refusals.extend(blockers[b.serve_id] for b in sleeping[:1])
+                    break
+                preferred = [b for b in feasible if b.serve_id in hinted]
+                binding = _wake_pick(preferred or feasible, planning, topology, self._placement)
+                tried.add(binding.serve_id)
+                open_hints = [
+                    hint for hint in hinted
+                    if hint != binding.serve_id and hint not in {t.binding.serve_id for t in tickets}
+                ]
+                placement = {
+                    "hint_binding_id": binding.binding_id if binding.serve_id in hinted else (
+                        self._binding_id_of(open_hints[0], planning) if open_hints else None
+                    ),
+                    "chosen_binding_id": binding.binding_id,
+                    "source": "hint" if binding.serve_id in hinted else "sm_choose",
+                }
+                try:
+                    ticket = self._prepare_wake(
                         binding, planning, leases=leases,
-                        previous_desired=before.get(binding.binding_id),
+                        previous_desired=before.get(binding.binding_id), placement=placement,
                     )
-                )
+                except (WakeConflict, GpuLeaseConflict, ReservationConflict, ValueError) as exc:
+                    refusals.append(exc)
+                    _log_event(
+                        "placement_substituted",
+                        level=logging.WARNING,
+                        model=model, refused_binding_id=binding.binding_id,
+                        error_code=_error_code(exc), detail=str(exc),
+                    )
+                    continue
+                tickets.append(ticket)
                 planning = [
                     replace(item, awake=True, hidden=False) if item.serve_id == binding.serve_id else item
                     for item in planning
@@ -568,8 +746,16 @@ class ServiceManagerV2:
         except BaseException:
             self._abort_prepared_wakes(tickets)
             raise
+        if not tickets:
+            raise refusals[0] if refusals else WakeConflict(
+                f"no wakeable sleeping binding of {model}", node=None, gpus=()
+            )
         self._note_wake_details(tickets)
         return tickets
+
+    @staticmethod
+    def _binding_id_of(serve_id: str, bindings: list[Binding]) -> str | None:
+        return next((b.binding_id for b in bindings if b.serve_id == serve_id), None)
 
     def _apply_model_target_plan(
         self, model: str, wake_replicas: int, snapshot, plan: dict, response: dict, *, guard=None
@@ -5180,6 +5366,9 @@ class RetryLater(RuntimeError):
 
 class TargetRequest(BaseModel):
     wake_replicas: int
+    #: S5: serve ids of sleeping bindings to prefer (placement hints; the SM may
+    #: substitute a hint it cannot wake - see ``picked`` in the response).
+    hints: list[str] = []
     #: Grow-only: no-op when the model already has >= wake_replicas awake (review 3).
     at_least: bool = False
     #: Which sleep path this is (registry service_manager.sleep.budgets_s key).
@@ -5458,6 +5647,7 @@ def create_app(service: ServiceManagerV2) -> FastAPI:
                 sleep_path=_sleep_path(request.sleep_path),
                 drain_budget_s=request.drain_budget_s,
                 at_least=request.at_least,
+                hints=request.hints,
             )
         except WakeConflict:
             raise  # structured 409 (wake_conflict_handler)

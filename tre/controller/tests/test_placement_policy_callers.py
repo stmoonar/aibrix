@@ -36,19 +36,27 @@ def _a_everywhere(awake_at=(N1, 0)):
 
 
 def test_plan_wakes_spread_a_model_across_nodes():
+    # S5 (2026-09-30): the split cost ranks first - the free half of n1's used pair
+    # is filled before a whole pair is broken; then the lighter node n2.
     picks = _SlotOccupancy(_view(_a_everywhere())).plan_wakes("A", 2)
-    assert [b.serve_id for b in picks] == ["a-n2-0", "a-n1-1"]
+    assert [b.serve_id for b in picks] == ["a-n1-1", "a-n2-0"]
     # Reference best-fit (no policy) packs onto node n1.
     packed = _SlotOccupancy(_view(_a_everywhere(), placement=None)).plan_wakes("A", 2)
     assert [b.serve_id for b in packed] == ["a-n1-1", "a-n1-2"]
 
 
 def test_free_groups_and_find_slot_spread_a_model():
+    # A half-used pair is filled first (split cost, S5) ...
     bindings = [_b("a-0", "A", N1, (0,), awake=True)]
+    occupancy = _SlotOccupancy(_view(bindings))
+    assert occupancy.free_groups(1, "A")[0] == {(N1, 1)}
+    assert SlotAllocator(TOPOLOGY, bindings, policy=POLICY).find_slot(1, "A") == Slot(N1, (1,))
+    # ... without one, the lighter node (spread) wins over the lowest address.
+    bindings = [_b("a-0", "A", N1, (0,), awake=True), _b("x-1", "X", N1, (1,), awake=True)]
     occupancy = _SlotOccupancy(_view(bindings))
     assert occupancy.free_groups(1, "A")[0] == {(N2, 0)}
     assert SlotAllocator(TOPOLOGY, bindings, policy=POLICY).find_slot(1, "A") == Slot(N2, (0,))
-    assert SlotAllocator(TOPOLOGY, bindings).find_slot(1, "A") == Slot(N1, (1,))
+    assert SlotAllocator(TOPOLOGY, bindings).find_slot(1, "A") == Slot(N1, (2,))
 
 
 def test_donor_slot_pods_follow_the_policy():
@@ -60,7 +68,13 @@ def test_donor_slot_pods_follow_the_policy():
         _b("r-n2", "R", N2, (0,), awake=False),
     ]
     pairs = _SlotOccupancy(_view(bindings)).donor_slot_pods("D", "R")
-    assert [(donor, receiver.serve_id) for donor, receiver in pairs] == [("d-n2", "r-n2"), ("d-n1", "r-n1")]
+    # S5: r-n1 fills the pair r-0 half uses (split cost 0); r-n2 would break a pair.
+    assert [(donor, receiver.serve_id) for donor, receiver in pairs] == [("d-n1", "r-n1"), ("d-n2", "r-n2")]
+    # With a penalty on n1 (e.g. it runs the load generator) the cost still ranks
+    # first; the penalty only decides between equally fitting slots.
+    penalised = PlacementPolicy(max_order=1, reserve_blocks=1, node_penalty={N1: 1})
+    pairs = _SlotOccupancy(_view(bindings, placement=penalised)).donor_slot_pods("D", "R")
+    assert [(donor, receiver.serve_id) for donor, receiver in pairs] == [("d-n1", "r-n1"), ("d-n2", "r-n2")]
     packed = _SlotOccupancy(_view(bindings, placement=None)).donor_slot_pods("D", "R")
     assert [(donor, receiver.serve_id) for donor, receiver in packed] == [("d-n1", "r-n1"), ("d-n2", "r-n2")]
 
