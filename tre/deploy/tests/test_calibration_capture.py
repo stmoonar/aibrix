@@ -302,7 +302,59 @@ def test_dump_controller_ticks_writes_members_with_the_derived_raw_tss(tmp_path:
     assert rows[1]["tss_raw_source"] == cc.TSS_RAW_DERIVED
 
 
-# ----------------------------------------------------------- cell meta and layout
+class Cluster:
+    """A fake redis fed by a gateway and a phase-aligned controller whose clocks are off
+    redis TIME by ``gw_skew`` / ``ctl_skew``. The gateway writes round ``S`` (its own
+    clock) at redis time ``S - gw_skew + gw_phase``; the controller publishes window ``B``
+    (a gateway round) once its clock passed ``B + offset`` and the gateway wrote ``B``,
+    and it reaches the decision history one tick later."""
+
+    P = 10_000
+
+    def __init__(self, *, pods=("default/p",), gw_skew=0, gw_phase=3_000, ctl_skew=0, ctl_offset=2_000,
+                 ctl_tick=5_000, t0=900_000) -> None:
+        self.r = FakeRedis(now_ms=t0)
+        self.pods = list(pods)
+        self.gw_skew, self.gw_phase = gw_skew, gw_phase
+        self.ctl_skew, self.ctl_offset, self.ctl_tick = ctl_skew, ctl_offset, ctl_tick
+        self.gw_next = (t0 + gw_skew - 300_000) // self.P * self.P
+        self.ctl_next = self.gw_next
+        self.advance(t0)
+
+    def advance(self, t: int) -> None:
+        while self.gw_next - self.gw_skew + self.gw_phase <= t:
+            _seed_gateway(self.r, self.pods, [self.gw_next])
+            self.gw_next += self.P
+        while True:
+            b = self.ctl_next
+            at = max(b + self.ctl_offset - self.ctl_skew, b - self.gw_skew + self.gw_phase) + self.ctl_tick
+            if at > t:
+                break
+            self.r.zadd(decision_hist_key("m7"), {_tick(b): b})
+            self.ctl_next += self.P
+        self.r.now_ms = t
+
+
+def _tick(end: int) -> str:
+    return json.dumps({"window_end_ms": end, "ts": end, "trs": 1.0, "trs_raw": 2.0, "y_m": 2.0, "q_ctl": 1.0})
+
+
+CFG = cc.ClockDomainConfig(window_ms=30_000)
+RS, RE = 964_000, 994_000  # the cell in redis time
+
+
+def _run_cell(c: Cluster, layout: cc.CellLayout, *, driver_skew: int = 0, **kw) -> dict:
+    """Drive a 30 s cell on ``c`` the way r3_grid does: start mark, load, end mark, capture."""
+    now = lambda: c.r.now_ms + driver_skew  # noqa: E731 - the driver's clock
+    c.advance(RS)
+    start = cc.cell_clock_mark(c.r, "m7", CFG, now_ms=now, sleep=lambda s: None)
+    start_ms = now()
+    c.advance(RE)
+    end_ms = now()
+    end = cc.cell_clock_mark(c.r, "m7", CFG, start=start, now_ms=now, sleep=lambda s: None)
+    return cc.capture_after_cell(layout, model="m7", start_ms=start_ms, end_ms=end_ms, window_ms=30_000,
+                                 redis_client=c.r, clock_start=start, clock_end=end, clock_config=CFG,
+                                 flush_wait_s=0, now_ms=now, sleep=lambda s: None, **kw)
 
 
 def _write_legacy(model_dir: Path, stem: str, cell_id: str, *, void: bool = False) -> None:
@@ -315,31 +367,31 @@ def _write_legacy(model_dir: Path, stem: str, cell_id: str, *, void: bool = Fals
     (model_dir / f"{stem}.csv").write_text("scenario_id\n")
 
 
+# ----------------------------------------------------------- cell meta and layout
+
+
 def test_capture_after_cell_writes_the_cell_meta_and_the_reader_resolves_it(tmp_path: Path) -> None:
     layout = _layout(tmp_path)
     _write_legacy(layout.model_dir, layout.stem, layout.cell_id)
-    r = FakeRedis(now_ms=1_000_000)
-    _seed_gateway(r, ["default/p"], [930_000, 960_000, 990_000])
-    r.zadd(decision_hist_key("m7"), {json.dumps({"window_end_ms": 990_000, "y_m": 1.0, "q_ctl": 1.0}): 990_000})
+    c = Cluster()
     url = "http://10.0.0.1:8000/metrics"
     rec = cc.VllmMetricsRecorder(layout.vllm_metrics_dir, {url: "default/p"}, model="m7")
     rec.record(url, 960_000, _body())
-    meta = cc.capture_after_cell(
-        layout, model="m7", start_ms=960_000, end_ms=990_000, window_ms=30_000, redis_client=r,
-        targets=[{"key": "default/p", "url": url}], recorder=rec, flush_wait_s=0,
-        now_ms=lambda: 1_000_000, info={"guard_voided": False},
-    )
+    meta = _run_cell(c, layout, targets=[{"key": "default/p", "url": url}], recorder=rec,
+                     info={"guard_voided": False})
     assert meta["errors"] == []
     on_disk = json.loads(layout.meta_path.read_text())
     assert on_disk["layout_version"] == cc.CAPTURE_LAYOUT_VERSION and on_disk["guard_voided"] is False
     assert on_disk["legacy"]["requests_jsonl"] == "../../raw/m7_S1_hold_c1000001_a1/i0_o0_c1000001.jsonl"
-    # the dump reaches one window + one gateway round before the cell starts
-    assert on_disk["gateway_redis_dump"]["range_ms"][0] == 960_000 - 30_000 - 10_000
-    assert on_disk["clock"]["probe_before"]["redis_minus_local_ms"] == 0
-    assert on_disk["clock"]["gateway"]["shift_ms"] == 0 and on_disk["clock"]["controller"]["shift_ms"] == 0
-    assert "clock_skew_suspected" not in on_disk
+    clock = on_disk["clock"]
+    assert clock["redis_start_ms"] == RS and clock["redis_end_ms"] == RE
+    # redis time +- the margin (one window + one round + the check's 12 s blind spot)
+    assert clock["range_ms"] == [RS - 52_000, RE + 52_000] == on_disk["gateway_redis_dump"]["range_ms"]
+    assert clock["domain"] == {"gateway": "ok", "controller": "ok"} and "clock_domain_mismatch" not in on_disk
+    assert clock["cell_start"]["late_write_baseline_docs"] > 0 and "late_write_baseline" not in clock["cell_start"]
     # cut at the cell end: the controller has not processed the tail windows yet
-    assert on_disk["controller_ticks"]["complete"] is False and on_disk["controller_ticks"]["tail_ms"] == 1_010_000
+    ct = on_disk["controller_ticks"]
+    assert ct["complete"] is False and ct["reached_tail"] is False and ct["tail_ms"] == 1_030_000
     assert (layout.cell_dir / cc.BACKFILL_MARKER).exists()
     got = cc.resolve_cell_artifacts(layout.model_dir, layout.stem)
     assert got["layout_version"] == 1 and got["cell_id"] == layout.cell_id
@@ -361,9 +413,16 @@ def test_capture_never_raises_without_redis(tmp_path: Path) -> None:
         def smembers(self, key):
             raise ConnectionError("redis down")
 
+        def time(self):
+            raise ConnectionError("redis down")
+
+    down = Down()
+    start = cc.cell_clock_mark(down, "m7", CFG, sleep=lambda s: None)
+    assert start["check"]["ok"] is False and "redis error" in start["check"]["reasons"][0]
     meta = cc.capture_after_cell(layout, model="m7", start_ms=0, end_ms=1, window_ms=30_000,
-                                 redis_client=Down(), flush_wait_s=0)
-    assert any("gateway_redis_dump" in e for e in meta["errors"])
+                                 redis_client=down, clock_start=start, flush_wait_s=0, sleep=lambda s: None)
+    assert any("no redis-time span" in e for e in meta["errors"])
+    assert "gateway_redis_dump" not in meta and not (layout.cell_dir / cc.BACKFILL_MARKER).exists()
 
 
 def test_reader_resolves_a_legacy_run_without_cells(tmp_path: Path) -> None:
@@ -480,17 +539,25 @@ def test_campaign_cells_capture_next_to_the_online_csv_unless_disabled() -> None
     i = command.index("--capture-dir")
     assert Path(command[i + 1]) == Path("/o/m7/cells")
     assert command[command.index("--control-namespace") + 1] == "ctl"
+    # the run checked the clocks once; a cell that fails its own check is marked, not refused
+    assert command[command.index("--clock-domain-check") + 1] == "flag"
     off = Args()
     off.no_capture_extras = True
     assert "--capture-dir" not in campaign.cell_command(cell, off, Path("s.json"), Path("/o/x.csv"))
 
 
 def test_r3_grid_capture_flags_and_layout() -> None:
-    args = r3_grid.parse_args(["--model", "m7", "--gateway-url", "http://gw", "--output", "/o/m7/stem_a1.csv",
-                               "--schedule", "s.json", "--raw-dir", "/o/m7/raw",
-                               "--capture-dir", "/o/m7/cells"])
+    base = ["--model", "m7", "--gateway-url", "http://gw", "--output", "/o/m7/stem_a1.csv",
+            "--schedule", "s.json", "--raw-dir", "/o/m7/raw", "--capture-dir", "/o/m7/cells"]
+    args = r3_grid.parse_args(base)
     assert args.vllm_keyframe_every == cc.DEFAULT_KEYFRAME_EVERY
     assert args.gateway_flush_wait_s == cc.DEFAULT_GATEWAY_FLUSH_WAIT_S
+    assert args.clock_domain_check == "refuse"  # a standalone r3_grid cell is its own run
+    cfg = r3_grid.capture_clock_config(args)
+    assert cfg.margin == 52_000 and cfg.controller_lag_bounds == (-2_000, 26_500)
+    assert r3_grid.capture_clock_config(r3_grid.parse_args(base + ["--capture-margin-ms", "45000"])).margin == 45_000
+    with pytest.raises(SystemExit):  # a margin that cuts the first / last window is refused up front
+        r3_grid.parse_args(base + ["--capture-margin-ms", "30000"])
     assert not (args.no_gateway_dump or args.no_controller_ticks or args.no_vllm_metrics_capture)
     layout = r3_grid.capture_layout_for(args, "i0_o0_c1")
     assert layout.cell_dir == Path("/o/m7/cells/stem_a1")
@@ -505,83 +572,251 @@ def test_capture_config_is_json_safe() -> None:
                                                                       "d": None}
 
 
+# ------------------------------------------------------------------ the clock
+
+
+def test_range_and_tail_are_in_redis_time() -> None:
+    assert cc.dump_range_ms(960_000, 990_000, 40_000) == (920_000, 1_030_000)
+    # with a 40 s margin the tail is the last 10 s grid window end over the cell (as before)
+    assert cc.tail_ms(990_000 + 40_000) == 1_010_000
+    assert cc.tail_ms(991_608 + 40_000) == 1_020_000
+    # the default margin also covers a gateway offset inside the check's blind spot
+    assert CFG.margin == 52_000 and CFG.blind_spot_ms == 12_000
+    assert cc.tail_ms(990_000 + CFG.margin) == 1_030_000
+    assert CFG.gateway_lag_bounds == (-2_000, 12_000)
+    with pytest.raises(ValueError):
+        cc.ClockDomainConfig(window_ms=30_000, margin_ms=39_999)
+
+
+def _stamps(gateway_lag: int, controller_lag: int, now: int = 1_000_000) -> FakeRedis:
+    r = FakeRedis(now_ms=now)
+    _seed_gateway(r, ["default/p"], [now - gateway_lag])
+    r.zadd(decision_hist_key("m7"), {_tick(now - controller_lag): now - controller_lag})
+    return r
+
+
+@pytest.mark.parametrize("controller_lag", [2_000, 5_000, 8_000, 11_600, 14_000, 17_000, 24_500])
+def test_a_controller_trailing_by_its_normal_lag_is_in_the_domain(controller_lag: int) -> None:
+    # 2-17 s at the base read offset (2 s), up to 24.5 s once the offset adapted to a late gateway
+    v = cc.check_clock_domains(_stamps(4_000, controller_lag), "m7", CFG, sleep=lambda s: pytest.fail("retried"))
+    assert v["ok"] and v["controller"]["lag_ms"] == controller_lag and v["reasons"] == []
+
+
+@pytest.mark.parametrize("controller_lag", [-5_000, 40_000, 160_000])
+def test_a_controller_ahead_or_far_behind_is_not(controller_lag: int) -> None:
+    slept = []
+    v = cc.check_clock_domains(_stamps(4_000, controller_lag), "m7", CFG, sleep=slept.append)
+    assert not v["ok"] and v["gateway"]["ok"] and not v["controller"]["ok"]
+    assert v["attempts"] == CFG.attempts and slept == [CFG.retry_s] * (CFG.attempts - 1)
+    assert "controller" in v["reasons"][0]
+
+
+@pytest.mark.parametrize("gw_skew", [160_000, -160_000])
+def test_a_gateway_160_s_off_is_refused_before_the_run(gw_skew: int, monkeypatch) -> None:
+    c = Cluster(gw_skew=gw_skew)
+    c.advance(RS)
+    v = cc.check_clock_domains(c.r, "m7", CFG, sleep=lambda s: None)
+    assert not v["gateway"]["ok"] and abs(abs(v["gateway"]["lag_ms"]) - 160_000) <= 10_000
+    with pytest.raises(cc.ClockDomainMismatch, match="gateway"):
+        cc.require_clock_domains(c.r, ["m7"], CFG, sleep=lambda s: None)
+    # the campaign's pre-flight (every entry point calls it before driving)
+    import redis
+
+    monkeypatch.setattr(redis.Redis, "from_url", classmethod(lambda cls, url: c.r))
+    args = SimpleNamespace(models="m7", window_ms=30_000, redis_url=None)
+    monkeypatch.setattr(cc.time, "sleep", lambda s: None)
+    with pytest.raises(SystemExit, match="refusing to run"):
+        campaign.require_capture_clock_domains(args)
+    assert campaign.require_capture_clock_domains(SimpleNamespace(no_capture_extras=True)) is None
+
+
+def test_the_campaign_pre_flight_passes_an_in_sync_cluster(monkeypatch) -> None:
+    import redis
+
+    c = Cluster()
+    c.advance(RS)
+    monkeypatch.setattr(redis.Redis, "from_url", classmethod(lambda cls, url: c.r))
+    got = campaign.require_capture_clock_domains(SimpleNamespace(models="m7", window_ms=30_000, redis_url=None))
+    assert got["m7"]["ok"]
+
+
+@pytest.mark.parametrize("gw_skew", [160_000, -160_000])
+def test_a_gateway_160_s_off_marks_the_cell_and_never_completes_it(tmp_path: Path, gw_skew: int) -> None:
+    layout = _layout(tmp_path)
+    c = Cluster(gw_skew=gw_skew)
+    meta = _run_cell(c, layout)
+    assert meta["clock"]["domain"] == {"gateway": "clock_domain_mismatch", "controller": "clock_domain_mismatch"}
+    assert meta["clock_domain_mismatch"]["dumps"] == ["controller_ticks", "gateway_redis_dump"]
+    assert any("gateway" in r for r in meta["clock_domain_mismatch"]["reasons"])
+    # dumped unshifted, in redis time
+    assert meta["gateway_redis_dump"]["range_ms"] == [RS - 52_000, RE + 52_000]
+    c.advance(1_400_000)
+    cc.backfill_pending(layout.model_dir, c.r, sleep=lambda s: None)
+    on_disk = json.loads(layout.meta_path.read_text())
+    for name in ("gateway_redis_dump", "controller_ticks"):
+        assert on_disk[name]["complete"] is False, name
+        assert on_disk[name]["clock_domain"] == cc.CLOCK_DOMAIN_MISMATCH
+    assert on_disk["clock_domain_mismatch"]
+
+
+@pytest.mark.parametrize("driver_skew", [160_000, -160_000])
+def test_a_skewed_driver_does_not_move_the_redis_range(tmp_path: Path, driver_skew: int) -> None:
+    ref = _run_cell(Cluster(), _layout(tmp_path / "ref"))
+    layout = _layout(tmp_path / "skewed")
+    c = Cluster()
+    meta = _run_cell(c, layout, driver_skew=driver_skew)
+    assert meta["start_ms"] == RS + driver_skew  # the driver's own clock is recorded ...
+    assert meta["clock"]["range_ms"] == ref["clock"]["range_ms"] == [RS - 52_000, RE + 52_000]  # ... not used
+    assert meta["gateway_redis_dump"]["docs"] == ref["gateway_redis_dump"]["docs"]
+    assert meta["controller_ticks"]["members"] == ref["controller_ticks"]["members"]
+    assert meta["clock"]["domain"] == {"gateway": "ok", "controller": "ok"}
+    probe = meta["clock"]["cell_start"]["probe"]
+    assert probe["redis_minus_local_ms"] == -driver_skew  # audit only
+    c.advance(1_040_000)
+    done = cc.backfill_pending(layout.model_dir, c.r)
+    assert done[0]["complete"] is True
+
+
+def test_a_second_gateway_writer_behind_redis_fails_the_cell(tmp_path: Path) -> None:
+    layout = _layout(tmp_path)
+    c = Cluster()
+    c.advance(RS)
+    start = cc.cell_clock_mark(c.r, "m7", CFG, now_ms=lambda: c.r.now_ms)
+    assert start["check"]["ok"]
+    c.advance(RS + 10_000)
+    # another writer 30 s behind redis: its newest stamp never beats the in-sync one ...
+    c.r.zadd(inst_key("default/p"), {json.dumps({"timestamp": 940_000, "writer": "b"}): 940_000})
+    c.advance(RE)
+    end = cc.cell_clock_mark(c.r, "m7", CFG, start=start, now_ms=lambda: c.r.now_ms, sleep=lambda s: None)
+    # ... but it wrote a doc stamped before the cell while the cell ran
+    assert not end["check"]["gateway"]["ok"] and end["check"]["gateway"]["late_writes"] == 1
+    meta = cc.capture_after_cell(layout, model="m7", start_ms=RS, end_ms=RE, window_ms=30_000, redis_client=c.r,
+                                 clock_start=start, clock_end=end, clock_config=CFG, flush_wait_s=0)
+    assert meta["gateway_redis_dump"]["clock_domain"] == cc.CLOCK_DOMAIN_MISMATCH
+    assert meta["controller_ticks"]["clock_domain"] == cc.CLOCK_DOMAIN_MISMATCH
+
+
+def test_a_late_doc_after_the_end_mark_fails_the_capture_dump(tmp_path: Path) -> None:
+    c = Cluster()
+    c.advance(RS)
+    start = cc.cell_clock_mark(c.r, "m7", CFG, now_ms=lambda: c.r.now_ms)
+    c.advance(RE)
+    end = cc.cell_clock_mark(c.r, "m7", CFG, start=start, now_ms=lambda: c.r.now_ms)
+    assert end["check"]["ok"]
+    # a writer ~70 s behind redis: nothing of it in the range during the cell, one doc now
+    c.r.zadd(inst_key("default/p"), {json.dumps({"timestamp": 925_000, "writer": "b"}): 925_000})
+    meta = cc.capture_after_cell(_layout(tmp_path), model="m7", start_ms=RS, end_ms=RE, window_ms=30_000,
+                                 redis_client=c.r, clock_start=start, clock_end=end, clock_config=CFG,
+                                 flush_wait_s=0)
+    gd = meta["gateway_redis_dump"]
+    assert gd["late_writes"] == 1 and gd["clock_domain"] == cc.CLOCK_DOMAIN_MISMATCH
+    assert meta["controller_ticks"]["clock_domain"] == cc.CLOCK_DOMAIN_MISMATCH
+    assert any("capture dump" in r for r in meta["clock_domain_mismatch"]["reasons"])
+
+
+def test_a_late_doc_before_the_backfill_fails_the_backfilled_dumps(tmp_path: Path) -> None:
+    layout = _layout(tmp_path)
+    c = Cluster()
+    meta = _run_cell(c, layout)
+    assert meta["gateway_redis_dump"]["late_writes"] == 0 and meta["gateway_redis_dump"]["clock_domain"] == "ok"
+    c.advance(1_040_000)
+    c.r.zadd(hist_key("default/p"), {json.dumps({"timestamp": 970_000, "writer": "b"}): 970_000})
+    done = cc.backfill_pending(layout.model_dir, c.r, sleep=lambda s: None)
+    assert done[0]["complete"] is False
+    on_disk = json.loads(layout.meta_path.read_text())
+    assert on_disk["gateway_redis_dump"]["late_writes"] == 1
+    for name in ("gateway_redis_dump", "controller_ticks"):
+        assert on_disk[name]["clock_domain"] == cc.CLOCK_DOMAIN_MISMATCH and not on_disk[name]["complete"]
+
+
+def test_the_end_mark_is_taken_by_the_capture_when_not_given(tmp_path: Path) -> None:
+    c = Cluster()
+    c.advance(RS)
+    start = cc.cell_clock_mark(c.r, "m7", CFG, now_ms=lambda: c.r.now_ms)
+    c.advance(RE)
+    meta = cc.capture_after_cell(_layout(tmp_path), model="m7", start_ms=RS, end_ms=RE, window_ms=30_000,
+                                 redis_client=c.r, clock_start=start, flush_wait_s=0, now_ms=lambda: c.r.now_ms)
+    assert meta["clock"]["redis_end_ms"] == RE and meta["clock"]["domain"]["gateway"] == "ok"
+
+
 # ------------------------------------------------------------------ backfill
-
-
-def _tick(end: int) -> str:
-    return json.dumps({"window_end_ms": end, "ts": end, "trs": 1.0, "trs_raw": 2.0, "y_m": 2.0, "q_ctl": 1.0})
-
-
-def test_tail_is_the_last_grid_window_end_that_still_overlaps_the_cell() -> None:
-    assert cc.tail_ms(990_000, 30_000) == 1_010_000
-    assert cc.tail_ms(991_608, 30_000) == 1_020_000
-    assert cc.dump_range_ms(960_000, 990_000, 30_000) == (920_000, 1_030_000)
 
 
 def test_a_dump_cut_at_the_cell_end_is_marked_and_backfilled_later(tmp_path: Path) -> None:
     layout = _layout(tmp_path)
-    r = FakeRedis(now_ms=995_000)
-    _seed_gateway(r, ["default/p"], [950_000, 960_000, 970_000, 980_000, 990_000])
-    for end in (970_000, 980_000, 990_000):
-        r.zadd(decision_hist_key("m7"), {_tick(end): end})
-    meta = cc.capture_after_cell(layout, model="m7", start_ms=960_000, end_ms=990_000, window_ms=30_000,
-                                 redis_client=r, flush_wait_s=0, now_ms=lambda: 995_000)
+    c = Cluster()
+    meta = _run_cell(c, layout)
     assert meta["controller_ticks"]["complete"] is False and meta["gateway_redis_dump"]["complete"] is False
-    assert meta["controller_ticks"]["tail_ms"] == 1_010_000
+    assert meta["controller_ticks"]["tail_ms"] == 1_030_000
     assert cc.pending_cells(layout.model_dir) == [layout.cell_dir]
-    # the controller and the gateway catch up
-    _seed_gateway(r, ["default/p"], [1_000_000, 1_010_000])
-    for end in (1_000_000, 1_010_000):
-        r.zadd(decision_hist_key("m7"), {_tick(end): end})
-    r.now_ms = 1_040_000
-    done = cc.backfill_pending(layout.model_dir.parent, r)  # a run directory works too
-    assert len(done) == 1 and done[0]["complete"] is True
-    assert done[0]["controller_ticks"] == {"members_before": 3, "members_after": 5}
+    c.advance(1_040_000)  # the controller and the gateway catch up
+    done = cc.backfill_pending(layout.model_dir.parent, c.r)  # a run directory works too
+    assert len(done) == 1 and done[0]["complete"] is True and done[0]["clock_check"]["ok"]
+    assert done[0]["controller_ticks"]["members_after"] > done[0]["controller_ticks"]["members_before"]
     assert not (layout.cell_dir / cc.BACKFILL_MARKER).exists() and cc.pending_cells(layout.model_dir) == []
     on_disk = json.loads(layout.meta_path.read_text())
     assert on_disk["controller_ticks"]["complete"] and on_disk["gateway_redis_dump"]["complete"]
     assert on_disk["gateway_redis_dump"]["flush_wait"]["reason"] == "wait disabled"  # kept from the first dump
     assert len(on_disk["backfills"]) == 1
     rows = layout.controller_ticks_path.read_text().splitlines()[1:]
-    assert [json.loads(x)["window_end_ms"] for x in rows] == [970_000, 980_000, 990_000, 1_000_000, 1_010_000]
+    ends = [json.loads(x)["window_end_ms"] for x in rows]
+    assert ends[0] >= RS - 52_000 and ends[-1] == 1_030_000
     assert json.loads(rows[0])["tss_raw_source"] == cc.TSS_RAW_FROM_CONTROLLER
-    assert cc.backfill_pending(layout.model_dir, r) == []  # nothing left
+    assert cc.backfill_pending(layout.model_dir, c.r) == []  # nothing left
+
+
+def test_the_backfill_lists_the_pods_again(tmp_path: Path) -> None:
+    layout = _layout(tmp_path)
+    c = Cluster()
+    _run_cell(c, layout)
+    c.pods.append("default/q")  # a pod that came up in the cell's tail
+    c.advance(1_040_000)
+    done = cc.backfill_pending(layout.model_dir, c.r)
+    assert done[0]["gateway_docs"]["pods_before"] == 1 and done[0]["gateway_docs"]["pods_after"] == 2
+    on_disk = json.loads(layout.meta_path.read_text())
+    assert set(on_disk["gateway_redis_dump"]["files"]["inst"]) == {"default/p", "default/q"}
+    assert on_disk["gateway_redis_dump"]["complete"] is True
+
+
+def test_a_backfill_after_a_clock_step_marks_the_redumped_sources(tmp_path: Path) -> None:
+    layout = _layout(tmp_path)
+    c = Cluster()
+    _run_cell(c, layout)
+    c.gw_skew = 160_000  # the gateway's node steps its clock after the cell
+    c.advance(1_040_000)
+    done = cc.backfill_pending(layout.model_dir, c.r, sleep=lambda s: None)
+    assert not done[0]["clock_check"]["ok"] and done[0]["complete"] is False
+    on_disk = json.loads(layout.meta_path.read_text())
+    assert on_disk["gateway_redis_dump"]["clock_domain"] == cc.CLOCK_DOMAIN_MISMATCH
+    assert on_disk["controller_ticks"]["clock_domain"] == cc.CLOCK_DOMAIN_MISMATCH
+    assert any(r.startswith("backfill: gateway") for r in on_disk["clock_domain_mismatch"]["reasons"])
 
 
 def test_a_backfill_never_shrinks_a_dump(tmp_path: Path) -> None:
     layout = _layout(tmp_path)
-    r = FakeRedis()
-    for end in (970_000, 980_000):
-        r.zadd(decision_hist_key("m7"), {_tick(end): end})
-    cc.capture_after_cell(layout, model="m7", start_ms=960_000, end_ms=990_000, window_ms=30_000,
-                          redis_client=r, flush_wait_s=0, gateway_dump=False, now_ms=lambda: r.now_ms)
+    c = Cluster()
+    _run_cell(c, layout, gateway_dump=False)
     before = layout.controller_ticks_path.read_text()
-    r.zsets[decision_hist_key("m7")].clear()  # retention trimmed it
-    rec = cc.backfill_cell(layout.cell_dir, r)
+    c.r.zsets[decision_hist_key("m7")].clear()  # retention trimmed it
+    rec = cc.backfill_cell(layout.cell_dir, c.r, sleep=lambda s: None)
     assert "controller_ticks_kept" in rec and rec["complete"] is False
     assert layout.controller_ticks_path.read_text() == before
 
 
 def test_the_final_backfill_waits_for_the_controller_bounded(tmp_path: Path) -> None:
     layout = _layout(tmp_path)
-    r = FakeRedis(now_ms=995_000)
-    cc.capture_after_cell(layout, model="m7", start_ms=960_000, end_ms=990_000, window_ms=30_000,
-                          redis_client=r, flush_wait_s=0, gateway_dump=False, now_ms=lambda: r.now_ms)
+    c = Cluster()
+    _run_cell(c, layout, gateway_dump=False)
     slept = []
 
     def sleep(dt):
         slept.append(dt)
-        r.now_ms += int(dt * 1000)
+        c.advance(c.r.now_ms + int(dt * 1000))
 
-    clock = {"t": 0.0}
-
-    def monotonic():
-        clock["t"] = sum(slept)
-        return clock["t"]
-
-    cc.backfill_pending(layout.model_dir, r, wait_s=90, sleep=sleep, monotonic=monotonic)
-    # waited until two rounds past the tail (1_010_000 + 20_000), in steps of <= 5 s
-    assert r.now_ms >= 1_030_000 and max(slept) <= 5.0 and sum(slept) <= 90
+    cc.backfill_pending(layout.model_dir, c.r, wait_s=90, sleep=sleep, monotonic=lambda: sum(slept))
+    # waited until the tail (1_030_000) plus the controller's largest normal lag (26.5 s)
+    assert c.r.now_ms >= 1_056_500 and max(slept) <= 5.0 and sum(slept) <= 90
+    assert json.loads(layout.meta_path.read_text())["controller_ticks"]["complete"] is True
 
 
 def test_old_markers_are_left_to_the_cli(tmp_path: Path) -> None:
@@ -610,45 +845,6 @@ def test_finalize_run_backfills_pending_cells_with_the_given_or_default_redis(tm
     assert calls[0][1]["wait_s"] == cc.DEFAULT_FINAL_BACKFILL_WAIT_S
 
 
-# ------------------------------------------------------------ clocks and review fixes
-
-
-def test_source_clock_in_sync_is_not_shifted() -> None:
-    c = cc.source_clock(990_000, 996_000, redis_minus_local_ms=3.0, write_phase_ms=1_700)
-    assert c["shift_ms"] == 0 and c["suspect"] is None and c["lag_ms"] == 6_000
-
-
-def test_source_clock_detects_a_source_ahead_by_160_s() -> None:
-    # a gateway on a node 160 s fast stamps its rounds 160 s ahead of redis TIME
-    c = cc.source_clock(1_160_000, 1_001_500, redis_minus_local_ms=0.0)
-    assert c["suspect"] and abs(c["shift_ms"] - 160_000) <= 5_000
-    # the same from the write phase of a live gateway (seen 158.3 s *before* its stamp)
-    c = cc.source_clock(None, None, redis_minus_local_ms=0.0, write_phase_ms=-158_300)
-    assert c["suspect"] and abs(c["shift_ms"] - 160_000) <= 5_000
-
-
-def test_source_clock_adds_redis_offset_and_flags_a_stale_source() -> None:
-    c = cc.source_clock(1_160_000, 1_165_000, redis_minus_local_ms=160_000.0)
-    assert c["shift_ms"] == 160_000 and c["suspect"]  # redis and source on the fast node: both off the driver
-    c = cc.source_clock(700_000, 1_000_000, redis_minus_local_ms=0.0)
-    assert c["shift_ms"] == 0 and "stale" in c["suspect"]
-
-
-def test_a_skewed_gateway_gets_a_shifted_dump_range(tmp_path: Path) -> None:
-    layout = _layout(tmp_path)
-    r = FakeRedis(now_ms=1_000_000)
-    skew = 160_000
-    _seed_gateway(r, ["default/p"], [s + skew for s in (930_000, 960_000, 990_000)])
-    meta = cc.capture_after_cell(layout, model="m7", start_ms=960_000, end_ms=990_000, window_ms=30_000,
-                                 redis_client=r, flush_wait_s=0, now_ms=lambda: 1_000_000,
-                                 controller_ticks=False)
-    gw = meta["clock"]["gateway"]
-    assert meta["clock_skew_suspected"]["gateway"] and abs(gw["shift_ms"] - skew) <= 5_000
-    # all three rounds (in the gateway's clock) are inside the shifted range
-    assert sum(meta["gateway_redis_dump"]["docs"]["inst"].values()) == 3
-    assert meta["gateway_redis_dump"]["tail_ms"] == cc.tail_ms(990_000, 30_000, gw["shift_ms"]) + 10_000
-
-
 def test_active_pods_skips_pods_long_gone() -> None:
     r = FakeRedis()
     _seed_gateway(r, ["default/live"], [990_000])
@@ -656,46 +852,15 @@ def test_active_pods_skips_pods_long_gone() -> None:
     assert cc.active_pods(r, cc.model_pod_keys(r, "m7"), 900_000) == ["default/live"]
 
 
-def test_the_write_phase_is_measured_once_per_gateway_instance_set(tmp_path: Path) -> None:
-    from tre_common.rediskeys import GW_INSTANCES_KEY
-
-    r = FakeRedis(now_ms=1_000_000)
-    _seed_gateway(r, ["default/p"], [980_000, 990_000])
-    r.zadd(GW_INSTANCES_KEY, {"gw-a": 1.0})
-    clock = {"t": 0.0}
-
-    def sleep(dt):
-        clock["t"] += dt
-        if clock["t"] >= 1.0:
-            r.zadd(inst_key("default/p"), {"new": 1_000_000})
-            r.now_ms = 1_001_700
-
-    first = cc.capture_after_cell(_layout(tmp_path), model="m7", start_ms=960_000, end_ms=990_000,
-                                  window_ms=30_000, redis_client=r, sleep=sleep,
-                                  monotonic=lambda: clock["t"], now_ms=lambda: 1_001_700,
-                                  controller_ticks=False)
-    assert first["gateway_redis_dump"]["flush_wait"]["write_phase_ms"] == 1_700
-    second_layout = cc.CellLayout(tmp_path / "run" / "m7", "m7_S1_hold_c1000002_a1", "i0_o0_c1000002")
-    second = cc.capture_after_cell(second_layout, model="m7", start_ms=990_000, end_ms=1_000_000,
-                                   window_ms=30_000, redis_client=r, now_ms=lambda: 1_002_000,
-                                   sleep=lambda dt: pytest.fail("waited although the phase is cached"),
-                                   controller_ticks=False)
-    assert second["gateway_redis_dump"]["flush_wait"]["skipped"]
-    assert second["gateway_redis_dump"]["flush_wait"]["write_phase_ms"] == 1_700
-    r.zadd(GW_INSTANCES_KEY, {"gw-b": 2.0})  # a gateway restart: measure again
-    assert cc.cached_phase(second_layout.cell_dir.parent, cc.gateway_instances(r), now_ms=1_002_000) is None
-
-
 def test_a_rewrite_with_as_many_but_different_rows_is_not_a_superset(tmp_path: Path) -> None:
     layout = _layout(tmp_path)
-    r = FakeRedis()
-    for end in (970_000, 980_000):
-        r.zadd(decision_hist_key("m7"), {_tick(end): end})
-    cc.capture_after_cell(layout, model="m7", start_ms=960_000, end_ms=990_000, window_ms=30_000,
-                          redis_client=r, flush_wait_s=0, gateway_dump=False, now_ms=lambda: r.now_ms)
-    r.zsets[decision_hist_key("m7")].pop(_tick(970_000))  # the oldest trimmed ...
-    r.zadd(decision_hist_key("m7"), {_tick(990_000): 990_000})  # ... while the tail arrived
-    rec = cc.backfill_cell(layout.cell_dir, r)
+    c = Cluster()
+    _run_cell(c, layout, gateway_dump=False)
+    key = decision_hist_key("m7")
+    dumped = [kv for kv in c.r.zsets[key].items() if kv[1] >= RS - 52_000]
+    c.r.zsets[key].pop(min(dumped, key=lambda kv: kv[1])[0])  # the oldest dumped row trimmed ...
+    c.advance(RE + 10_000)  # ... while the tail arrived
+    rec = cc.backfill_cell(layout.cell_dir, c.r, sleep=lambda s: None)
     assert "controller_ticks_kept" in rec
 
 
@@ -754,24 +919,3 @@ def test_run_manifest_hashes_the_live_registry_configmap(tmp_path: Path) -> None
     live = json.loads(path.read_text())["registry"]["live_configmap"]
     assert live["name"] == "tre-v2-registry"
     assert live["data_sha256"]["registry.yaml"] == hashlib.sha256(b"models: {}\n").hexdigest()
-
-
-@pytest.mark.parametrize(
-    "case, latest, redis_now, rml, phase, expected_lag, want_shift",
-    [
-        # redis 160 s ahead of the driver, controller in sync with the driver: no shift
-        ("redis skewed, controller in sync", 990_000, 990_000 + 11_600 + 160_000, 160_000.0, None, 12_000, 0),
-        # controller 160 s ahead, redis = driver
-        ("controller ahead 160 s", 990_000 + 160_000, 1_001_600, 0.0, None, 12_000, 160_000),
-        # controller 8 s ahead, redis = driver
-        ("controller ahead 8 s", 990_000 + 8_000, 1_001_600, 0.0, None, 12_000, 8_000),
-        # gateway in sync with the driver, redis 160 s ahead, phase measured
-        ("gateway in sync, redis skewed", 990_000, 991_500 + 160_000, 160_000.0, 1_500 + 160_000, 5_000, 0),
-    ],
-)
-def test_source_clock_is_judged_against_the_driver(case, latest, redis_now, rml, phase, expected_lag,
-                                                    want_shift) -> None:
-    c = cc.source_clock(latest, redis_now, redis_minus_local_ms=rml, write_phase_ms=phase,
-                        expected_lag_ms=expected_lag, max_lag_ms=cc.CONTROLLER_MAX_LAG_MS)
-    assert abs(c["shift_ms"] - want_shift) <= 1_000, (case, c)
-    assert (c["suspect"] is None) == (want_shift == 0), (case, c)

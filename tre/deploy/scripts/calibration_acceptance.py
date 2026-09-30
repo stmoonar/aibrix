@@ -711,6 +711,7 @@ def run_acceptance_set(args, *, drive: Optional[Callable] = None,
             raise SystemExit(f"controller mode is {mode!r}, refusing to run (need "
                              f"{campaign.REQUIRED_CONTROLLER_MODE!r})")
         print(f"controller mode: {mode}")
+        campaign.require_capture_clock_domains(args)
     plan["run_manifest_sha256"] = ladder.write_frozen(out_dir / ladder.RUN_MANIFEST, manifest)
     (out_dir / "plan.json").write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")
     raw_dir = Path(args.raw_dir)

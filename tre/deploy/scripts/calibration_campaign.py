@@ -540,6 +540,30 @@ def sm_actuation(namespace: str = "tre-v2") -> str:
     return _redis_get(SM_ACTUATION_KEY, namespace)
 
 
+def require_capture_clock_domains(args, models: Optional[Sequence[str]] = None) -> Optional[dict]:
+    """The run-level clock pre-flight of the capture (:mod:`scripts.calibration_capture`):
+    for every model the gateway's round stamps and the controller's window ends must be
+    in redis's time domain (the capture places every redis dump in redis time and checks
+    each cell again; a cell that fails is marked ``clock_domain_mismatch``). Raises
+    SystemExit with the measured offsets otherwise. Skipped with --no-capture-extras."""
+    if getattr(args, "no_capture_extras", False):
+        return None
+    if models is None:
+        models = [m for m in str(getattr(args, "models", "") or "").split(",") if m]
+    import redis  # type: ignore[import-not-found]
+
+    url = getattr(args, "redis_url", None) or capture.DEFAULT_REDIS_URL
+    cfg = capture.ClockDomainConfig(window_ms=int(args.window_ms))
+    try:
+        verdicts = capture.require_clock_domains(redis.Redis.from_url(url), list(models), cfg)
+    except capture.ClockDomainMismatch as exc:
+        raise SystemExit(str(exc)) from None
+    for model, v in verdicts.items():
+        print(f"clock domains ({model}, vs redis TIME): gateway lag {v['gateway']['lag_ms']} ms, "
+              f"controller lag {v['controller']['lag_ms']} ms")
+    return verdicts
+
+
 def require_calibration_run_mode(namespace: str = "tre-v2") -> dict[str, str]:
     """Both switches must be set to observe explicitly (a missing key is observe
     for its reader, but calibration requires a deliberate setting). Raises
@@ -633,8 +657,11 @@ def cell_command(cell: Cell, args, schedule_path: Path, output: Path) -> list[st
         # The system-side evidence of the cell (scripts.calibration_capture): per-pod vLLM
         # metrics, the gateway's redis docs, the controller's ticks, under
         # <dir of the online CSV>/cells/<stem>/ - next to raw/, never inside it.
+        # The run checked the clock domains before its first cell (require_capture_clock_domains):
+        # a cell that fails the check later is run and its redis dumps marked, not refused.
         command += ["--capture-dir", str(Path(output).parent / capture.CELLS_DIRNAME),
-                    "--control-namespace", str(getattr(args, "controller_namespace", "tre-v2") or "")]
+                    "--control-namespace", str(getattr(args, "controller_namespace", "tre-v2") or ""),
+                    "--clock-domain-check", "flag"]
     if cell.drain_start_s is not None:
         command += ["--drain-start-s", str(cell.drain_start_s)]
     if getattr(args, "envoy_stats_url", None):
@@ -1705,6 +1732,7 @@ def run_reprobe(args, targets: Mapping[str, Sequence[str]]) -> int:
         return 0
 
     require_calibration_run_mode(args.controller_namespace)
+    require_capture_clock_domains(args, list(targets))
     index_path = Path(args.index)
     index = json.loads(index_path.read_text(encoding="utf-8")) if index_path.exists() else {}
     cap = admission.get_cap(args.cap or index.get("admission_cap", {}).get("name")
@@ -2057,6 +2085,7 @@ def run_campaign(args) -> int:
 
     modes = require_calibration_run_mode(args.controller_namespace)
     print(f"controller mode: {modes['controller_mode']}, SM actuation: {modes['sm_actuation']}")
+    require_capture_clock_domains(args, models)
 
     status, code = "failed", 1
     try:

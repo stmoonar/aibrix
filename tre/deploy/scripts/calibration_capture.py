@@ -47,6 +47,13 @@ never sees it (and :func:`scripts.rewindow_from_raw.discover_cell_files` also sk
 
 Nothing here may fail or void a cell: every capture step records its error in
 ``cell_meta.json`` and the cell goes on.
+
+Clocks: every redis dump is placed in *redis time* (redis ``TIME`` read when the cell
+starts and ends), never in the driver's clock, and nothing is shifted. The gateway's
+round stamps and the controller's window ends are checked to be in redis's time domain
+before a run (:func:`require_clock_domains`: a failure refuses the run) and around every
+cell (:func:`cell_clock_mark`: a failure marks the cell's dumps ``clock_domain_mismatch``
+- kept, never complete). See :class:`ClockDomainConfig`.
 """
 from __future__ import annotations
 
@@ -650,18 +657,6 @@ def endpoint_targets(urls: Sequence[str]) -> list[dict]:
 
 # -------------------------------------------------------------------- redis dumps
 
-#: A stamp source (gateway rounds, controller window ends) whose clock is further off
-#: redis TIME than this is treated as skewed and its dump range is shifted (see
-#: :func:`source_clock`); below it, offsets are recorded but ignored.
-CLOCK_SKEW_TOLERANCE_MS = 2_000
-#: The controller's newest window end normally trails redis TIME by one gateway round
-#: plus its own tick; a lag beyond this is flagged (stale controller or slow clock).
-CONTROLLER_MAX_LAG_MS = 120_000
-#: ... and in sync it trails by about one round plus its tick (measured 11.6 s).
-CONTROLLER_EXPECTED_LAG_MS = SCRAPE_INTERVAL_MS + CLOCK_SKEW_TOLERANCE_MS
-#: Pods whose newest doc is older than this before the dump range are not dumped or
-#: polled (wider than the largest known node skew, ~160 s).
-ACTIVE_POD_MARGIN_MS = 300_000
 #: The redis the gateway and the controller write to, as seen from inside the cluster
 #: (r3_grid's default too); a driver on a host passes ``--redis-url``.
 DEFAULT_REDIS_URL = "redis://tre-v2-redis:6379/0"
@@ -681,7 +676,8 @@ def redis_time_ms(redis_client: Any) -> Optional[int]:
 
 
 def clock_probe(redis_client: Any, now_ms: Callable[[], int]) -> dict:
-    """Redis TIME bracketed by the local clock: offset = redis - local midpoint."""
+    """Redis TIME bracketed by the local clock. Only ``redis_time_ms`` is used (as the
+    cell's time base); the local readings and ``redis_minus_local_ms`` are audit fields."""
     before = int(now_ms())
     server = redis_time_ms(redis_client)
     after = int(now_ms())
@@ -716,6 +712,16 @@ def _latest_inst_score(redis_client: Any, pods: Sequence[str]) -> Optional[int]:
     return best
 
 
+def _latest_gateway_score(redis_client: Any, pods: Sequence[str]) -> Optional[int]:
+    best: Optional[int] = None
+    for pod in pods:
+        for key in (inst_key(pod), hist_key(pod)):
+            s = _latest_score(redis_client, key)
+            if s is not None and (best is None or s > best):
+                best = s
+    return best
+
+
 def active_pods(redis_client: Any, pods: Sequence[str], since_ms: int) -> list[str]:
     """The pods of ``pods`` whose newest inst or hist doc is at or after ``since_ms`` -
     the ones that can hold a doc of the cell (the pod set also lists dead pods)."""
@@ -728,55 +734,264 @@ def active_pods(redis_client: Any, pods: Sequence[str], since_ms: int) -> list[s
     return out
 
 
-def source_clock(
-    latest_stamp_ms: Optional[int],
-    redis_now_ms: Optional[int],
-    *,
-    redis_minus_local_ms: Optional[float],
-    stamp_period_ms: int = SCRAPE_INTERVAL_MS,
-    max_lag_ms: int = SCRAPE_INTERVAL_MS + CLOCK_SKEW_TOLERANCE_MS,
-    expected_lag_ms: int = SCRAPE_INTERVAL_MS // 2,
-    write_phase_ms: Optional[int] = None,
-) -> dict:
-    """How far a stamp source's clock is from the *driver's*, and the shift its dump range
-    and tail need.
+# ------------------------------------------------------------ the clock: redis TIME
+#
+# Every redis stamp this module exports (gateway round stamps, controller window ends)
+# is read in *redis time*: the driver reads redis ``TIME`` when a cell starts and when it
+# ends, and dumps ``[redis_start - margin, redis_end + margin]``. The driver's own clock
+# never enters a dump range, so a skewed driver cannot misplace one. Nothing is shifted:
+# instead the gateway and the controller are *checked* to stamp in redis time (before
+# the run - a failure refuses the run - and around every cell - a failure marks the
+# cell's dumps ``clock_domain_mismatch``, never complete). The labels and the fit use the
+# client's own records only; what a mismatch costs is this supplementary evidence.
 
-    Everything is judged against the driver's clock (redis TIME minus redis's own offset
-    from the driver, ``redis_minus_local_ms`` from :func:`clock_probe`), because the
-    cell's ``start_ms`` / ``end_ms`` are in it. A source stamps with its own clock floored
-    to ``stamp_period_ms``; in sync its newest stamp trails the driver's now by
-    0 .. ``max_lag_ms`` (typically ``expected_lag_ms``), and a live gateway's write phase
-    (``write_phase_ms``, redis TIME at first sight minus the stamp) lies in
-    ``[0, period]`` once redis's offset is removed. A stamp more than half a period (plus
-    the tolerance) closer to the driver's now than ``expected_lag_ms``, or
-    a phase outside one period, means the source's clock is off: its offset is estimated
-    as ``expected lag - lag`` (from the phase: ``period / 2 - phase``), to within about half
-    a period. A lag beyond ``max_lag_ms`` without a measured phase is ambiguous (stale
-    source or slow clock): flagged, not shifted. The shift is applied only when it exceeds
-    :data:`CLOCK_SKEW_TOLERANCE_MS`."""
-    rml = float(redis_minus_local_ms or 0.0)
-    out: dict[str, Any] = {"latest_stamp_ms": latest_stamp_ms, "redis_time_ms": redis_now_ms,
-                           "redis_minus_local_ms": redis_minus_local_ms, "write_phase_ms": write_phase_ms,
-                           "expected_lag_ms": expected_lag_ms}
-    lag = None if latest_stamp_ms is None or redis_now_ms is None else int(redis_now_ms) - int(latest_stamp_ms)
-    lag_local = None if lag is None else int(round(lag - rml))
-    phase_local = None if write_phase_ms is None else int(round(write_phase_ms - rml))
-    out.update({"lag_ms": lag, "lag_vs_driver_ms": lag_local, "write_phase_vs_driver_ms": phase_local})
-    source_minus_local = 0
-    suspect = None
-    if phase_local is not None and not (-CLOCK_SKEW_TOLERANCE_MS <= phase_local
-                                        <= stamp_period_ms + CLOCK_SKEW_TOLERANCE_MS):
-        source_minus_local = stamp_period_ms // 2 - phase_local
-        suspect = "write phase outside one period"
-    elif phase_local is None and lag_local is not None and lag_local < (
-            int(expected_lag_ms) - stamp_period_ms // 2 - CLOCK_SKEW_TOLERANCE_MS):
-        source_minus_local = int(expected_lag_ms) - lag_local
-        suspect = "newest stamp ahead of the driver's clock"
-    elif phase_local is None and lag_local is not None and lag_local > max_lag_ms:
-        suspect = "newest stamp far behind the driver's clock (stale source or slow clock; not shifted)"
-    shift = int(source_minus_local) if abs(source_minus_local) > CLOCK_SKEW_TOLERANCE_MS else 0
-    out.update({"source_minus_local_est_ms": source_minus_local, "shift_ms": shift, "suspect": suspect})
+#: Host clocks agree to NTP accuracy, not better: a source's newest stamp may be this
+#: much ahead of redis TIME, or this much later than its normal lag, and still be in
+#: redis's time domain.
+DEFAULT_CLOCK_TOLERANCE_MS = 2_000
+#: The phase-aligned controller reads window ``B`` (a gateway round stamp: the window
+#: is only published once the gateway has written its tick ``B``) at ``B + offset``; the
+#: offset starts at ``TRE_METRICS_PHASE_OFFSET_MS`` (2 s) and adapts up to
+#: ``period - retry`` = 9.5 s when the gateway writes late in its round
+#: (``tre_controller.loops.metrics_task.PhaseAlignedSampler``).
+DEFAULT_CONTROLLER_READ_OFFSET_MS = SCRAPE_INTERVAL_MS - 500
+#: ... and the window reaches the decision history on the next loop tick (the rescue
+#: loop, ``TRE_RESCUE_INTERVAL_SECONDS`` = 5 s).
+DEFAULT_CONTROLLER_TICK_MS = 5_000
+#: A failed check is repeated (a gateway round or a controller tick may be late once).
+DEFAULT_CLOCK_CHECK_ATTEMPTS = 3
+DEFAULT_CLOCK_CHECK_RETRY_S = 4.0
+CLOCK_DOMAIN_OK = "ok"
+CLOCK_DOMAIN_MISMATCH = "clock_domain_mismatch"
+
+
+@dataclass(frozen=True)
+class ClockDomainConfig:
+    """The dump margin and the bounds of the clock-domain check.
+
+    In redis time a live gateway's newest round stamp trails redis ``TIME`` by its write
+    phase, ``[0, period]``; the controller's newest ``window_end_ms`` (a gateway round,
+    see :data:`DEFAULT_CONTROLLER_READ_OFFSET_MS`) by ``[0, period + read offset + tick]``
+    (2-17 s at the base offset, up to 24.5 s adapted). Each bound gets ``tolerance_ms`` on
+    both sides.
+
+    The gateway check cannot see an offset smaller than one round plus the tolerance
+    (:attr:`blind_spot_ms`, 12 s): a gateway that far ahead can still show a lag >= 0.
+    The default ``margin_ms`` therefore is the reach of the first and last controller
+    window over the cell (one window plus one round, 40 s at 30 s windows) plus that
+    blind spot: 52 s. ``margin_ms`` below one window plus one round is refused."""
+
+    window_ms: int = 30_000
+    period_ms: int = SCRAPE_INTERVAL_MS
+    tolerance_ms: int = DEFAULT_CLOCK_TOLERANCE_MS
+    controller_read_offset_ms: int = DEFAULT_CONTROLLER_READ_OFFSET_MS
+    controller_tick_ms: int = DEFAULT_CONTROLLER_TICK_MS
+    margin_ms: Optional[int] = None
+    attempts: int = DEFAULT_CLOCK_CHECK_ATTEMPTS
+    retry_s: float = DEFAULT_CLOCK_CHECK_RETRY_S
+
+    def __post_init__(self) -> None:
+        if min(self.window_ms, self.period_ms) <= 0 or min(
+                self.tolerance_ms, self.controller_read_offset_ms, self.controller_tick_ms) < 0:
+            raise ValueError(f"invalid clock-domain config: {self}")
+        if self.margin_ms is not None and self.margin_ms < self.window_ms + self.period_ms:
+            raise ValueError(f"capture margin {self.margin_ms} ms is below one window plus one gateway "
+                             f"round ({self.window_ms + self.period_ms} ms): the first and last "
+                             "controller windows over the cell would be cut")
+
+    @property
+    def blind_spot_ms(self) -> int:
+        return int(self.period_ms + self.tolerance_ms)
+
+    @property
+    def margin(self) -> int:
+        return int(self.margin_ms if self.margin_ms is not None
+                   else self.window_ms + self.period_ms + self.blind_spot_ms)
+
+    @property
+    def gateway_lag_bounds(self) -> tuple[int, int]:
+        return -int(self.tolerance_ms), int(self.period_ms + self.tolerance_ms)
+
+    @property
+    def controller_lag_bounds(self) -> tuple[int, int]:
+        return -int(self.tolerance_ms), int(self.period_ms + self.controller_read_offset_ms
+                                            + self.controller_tick_ms + self.tolerance_ms)
+
+    def as_dict(self) -> dict:
+        return {"basis": "redis TIME", "window_ms": self.window_ms, "period_ms": self.period_ms,
+                "tolerance_ms": self.tolerance_ms, "controller_read_offset_ms": self.controller_read_offset_ms,
+                "controller_tick_ms": self.controller_tick_ms, "margin_ms": self.margin,
+                "blind_spot_ms": self.blind_spot_ms, "gateway_lag_bounds_ms": list(self.gateway_lag_bounds),
+                "controller_lag_bounds_ms": list(self.controller_lag_bounds),
+                "attempts": self.attempts, "retry_s": self.retry_s}
+
+
+def dump_range_ms(redis_start_ms: int, redis_end_ms: int, margin_ms: int) -> tuple[int, int]:
+    """``[lo, hi]`` of a cell's redis dumps, in redis time."""
+    return int(redis_start_ms) - int(margin_ms), int(redis_end_ms) + int(margin_ms)
+
+
+def tail_ms(hi_ms: int, period_ms: int = SCRAPE_INTERVAL_MS) -> int:
+    """The last round stamp / window end a dump reaching ``hi_ms`` must hold to be
+    *complete*: the last grid point at least one round inside ``hi``. With the default
+    margin that is the last controller window that can hold data of the cell, a
+    blind-spot gateway offset included (``redis_end + 40 s`` at 30 s windows)."""
+    return (int(hi_ms) - int(period_ms) - 1) // int(period_ms) * int(period_ms)
+
+
+def _check_once(redis_client: Any, model: str, cfg: ClockDomainConfig) -> dict:
+    """Newest gateway round stamp and newest controller window end of ``model`` against
+    redis TIME (each stamp read *before* the TIME it is compared with)."""
+    reasons: list[str] = []
+    pods = model_pod_keys(redis_client, model)
+    g_stamp = _latest_gateway_score(redis_client, pods)
+    g_now = redis_time_ms(redis_client)
+    g_lag = None if g_stamp is None or g_now is None else g_now - g_stamp
+    lo, hi = cfg.gateway_lag_bounds
+    g_ok = g_lag is not None and lo <= g_lag <= hi
+    if not g_ok:
+        reasons.append("gateway: no doc of the model's pods or no redis TIME" if g_lag is None else
+                       f"gateway: newest round stamp is {g_lag} ms behind redis TIME, outside [{lo}, {hi}]")
+    c_stamp = _latest_score(redis_client, decision_hist_key(model))
+    c_now = redis_time_ms(redis_client)
+    c_lag = None if c_stamp is None or c_now is None else c_now - c_stamp
+    lo_c, hi_c = cfg.controller_lag_bounds
+    c_ok = c_lag is not None and lo_c <= c_lag <= hi_c
+    if not c_ok:
+        reasons.append("controller: no decision history for the model or no redis TIME" if c_lag is None else
+                       f"controller: newest window_end_ms is {c_lag} ms behind redis TIME, outside "
+                       f"[{lo_c}, {hi_c}]")
+    return {
+        "ok": g_ok and c_ok,
+        "gateway": {"ok": g_ok, "newest_stamp_ms": g_stamp, "redis_time_ms": g_now, "lag_ms": g_lag,
+                    "pods_in_set": len(pods)},
+        "controller": {"ok": c_ok, "newest_window_end_ms": c_stamp, "redis_time_ms": c_now, "lag_ms": c_lag},
+        "reasons": reasons,
+    }
+
+
+def check_clock_domains(redis_client: Any, model: str, cfg: ClockDomainConfig, *,
+                        sleep: Optional[Callable[[float], None]] = None) -> dict:
+    """Whether the gateway's round stamps and the controller's window ends of ``model``
+    are in redis's time domain (:class:`ClockDomainConfig` has the bounds). A failed check
+    is repeated up to ``cfg.attempts`` times, ``cfg.retry_s`` apart; the last verdict is
+    returned with ``attempts``. Never raises (a redis error is a failed check)."""
+    verdict: dict[str, Any] = {}
+    attempts = max(1, int(cfg.attempts))
+    for attempt in range(1, attempts + 1):
+        try:
+            verdict = _check_once(redis_client, model, cfg)
+        except Exception as exc:  # noqa: BLE001
+            verdict = {"ok": False, "gateway": {"ok": False}, "controller": {"ok": False},
+                       "reasons": [f"redis error: {exc!r}"]}
+        verdict["attempts"] = attempt
+        if verdict["ok"] or attempt == attempts:
+            break
+        (sleep or time.sleep)(cfg.retry_s)
+    return verdict
+
+
+class ClockDomainMismatch(RuntimeError):
+    """The run-level check failed: the run must not start."""
+
+
+def require_clock_domains(redis_client: Any, models: Iterable[str], cfg: ClockDomainConfig, *,
+                          sleep: Optional[Callable[[float], None]] = None) -> dict[str, dict]:
+    """The run-level (pre-flight) check: every model's gateway stamps and controller
+    window ends are in redis time, else :class:`ClockDomainMismatch` with the offsets."""
+    verdicts = {m: check_clock_domains(redis_client, m, cfg, sleep=sleep) for m in models}
+    bad = {m: v["reasons"] for m, v in verdicts.items() if not v["ok"]}
+    if bad:
+        raise ClockDomainMismatch(
+            "refusing to run: the capture's redis sources are not in redis's time domain "
+            f"({json.dumps(bad, sort_keys=True)}); fix the node clocks (NTP) or run with "
+            "--no-capture-extras")
+    return verdicts
+
+
+def _doc_key(kind: str, pod: str, score: Any, doc: Any) -> str:
+    """Identity of one gateway doc: ``kind|pod|score|sha1(canonical JSON)`` - the same for
+    a doc read from redis (parsed) and for a row of a dump file."""
+    canon = json.dumps(doc, sort_keys=True, separators=(",", ":"), default=str)
+    return f"{kind}|{pod}|{int(float(score))}|{hashlib.sha1(canon.encode('utf-8')).hexdigest()[:16]}"
+
+
+def _gateway_member_digests(redis_client: Any, model: str, lo_ms: int, hi_ms: int) -> set[str]:
+    """:func:`_doc_key` of every hist / inst doc of ``model`` with score in [lo, hi]."""
+    out: set[str] = set()
+    for pod in active_pods(redis_client, model_pod_keys(redis_client, model), lo_ms):
+        for kind in GATEWAY_KINDS:
+            key = hist_key(pod) if kind == "hist" else inst_key(pod)
+            for member, score in redis_client.zrangebyscore(key, lo_ms, hi_ms, withscores=True) or ():
+                out.add(_doc_key(kind, pod, score, _parse_member(member)))
     return out
+
+
+def _late_docs(fetched: Mapping[str, Mapping[str, list]], known: set, known_upto_ms: int) -> list[str]:
+    """Docs of ``fetched`` stamped at or before ``known_upto_ms`` that ``known`` (the docs
+    seen then) lacks: written more than one round after their stamp, in redis time."""
+    late = []
+    for kind, per_pod in fetched.items():
+        for pod, members in per_pod.items():
+            for member, score in members:
+                if int(float(score)) <= known_upto_ms:
+                    k = _doc_key(kind, pod, score, _parse_member(member))
+                    if k not in known:
+                        late.append(k)
+    return sorted(late)
+
+
+def cell_clock_mark(
+    redis_client: Any,
+    model: str,
+    cfg: ClockDomainConfig,
+    *,
+    start: Optional[Mapping[str, Any]] = None,
+    now_ms: Callable[[], int] = lambda: int(time.time() * 1000),
+    sleep: Callable[[float], None] = time.sleep,
+) -> dict:
+    """Redis TIME at a cell boundary plus the clock-domain check there. Call it right
+    before the load (``start=None``) and right after it drains (``start`` = the start
+    mark); redis TIME is read *before* the check (whose retries only move later), so the
+    start mark is never after the load's first request, and the end mark never before its
+    last response.
+
+    Late writes: every mark fingerprints the gateway docs stamped in ``[redis_start -
+    margin, its own redis TIME - blind spot]``. A doc that shows up there later was written
+    more than one round (+ tol) after its stamp - a writer behind redis (e.g. a second
+    gateway instance on a slow node) that the newest-stamp check cannot see. The end mark
+    compares against the start mark, the capture's dump against the end mark
+    (:func:`capture_after_cell`), each backfill against the previous dump file."""
+    try:
+        probe = clock_probe(redis_client, now_ms)
+    except Exception as exc:  # noqa: BLE001
+        probe = {"redis_time_ms": None, "error": repr(exc)}
+    check = check_clock_domains(redis_client, model, cfg, sleep=sleep)
+    mark: dict[str, Any] = {"probe": probe, "check": check}
+    try:
+        if start is not None:
+            rng = start.get("late_write_range_ms")
+            if not rng:
+                raise ValueError("the start mark has no late-write baseline")
+            late = _gateway_member_digests(redis_client, model, *rng) - set(start.get("late_write_baseline") or ())
+            check["gateway"]["late_writes"] = len(late)
+            if late:
+                check["gateway"]["ok"] = False
+                check["ok"] = False
+                check["reasons"].append(
+                    f"gateway: {len(late)} doc(s) stamped in {rng} (more than one round before the cell "
+                    f"started, in redis time) were written during the cell, e.g. {sorted(late)[0]}")
+        rt = probe.get("redis_time_ms")
+        if rt is not None:
+            lo = int(start["late_write_range_ms"][0]) if start is not None else int(rt) - cfg.margin
+            rng = [lo, int(rt) - cfg.blind_spot_ms]
+            mark["late_write_range_ms"] = rng
+            mark["late_write_baseline"] = sorted(_gateway_member_digests(redis_client, model, *rng))
+    except Exception as exc:  # noqa: BLE001 - an unverifiable cell is a mismatch
+        check["gateway"]["ok"] = False
+        check["ok"] = False
+        check["reasons"].append(f"gateway: late-write check failed: {exc!r}")
+    return mark
 
 
 def wait_for_gateway_write(
@@ -792,8 +1007,8 @@ def wait_for_gateway_write(
 
     The gateway stamps each round with ``now - now % 10 s`` (its own clock) but its
     ticker runs at an arbitrary phase, so ``redis TIME at first sight - round stamp`` is
-    the *write phase* (resolution: ``poll_s``; it includes the gateway-vs-redis clock
-    offset, see :func:`source_clock`). ``timeout_s <= 0`` skips the wait."""
+    the *write phase* (resolution: ``poll_s``; audit only - the clock-domain check decides
+    whether the gateway is in redis time). ``timeout_s <= 0`` skips the wait."""
     out: dict[str, Any] = {"timeout_s": timeout_s, "poll_s": poll_s, "waited_s": 0.0,
                            "new_round_seen": False}
     if not pods or timeout_s <= 0:
@@ -820,50 +1035,14 @@ def wait_for_gateway_write(
     return out
 
 
-#: Where a run keeps its last measured gateway write phase (under ``cells/``), so the
-#: flush wait runs once per gateway instance set and hour rather than once per cell.
-GATEWAY_PHASE_CACHE = ".gateway_write_phase.json"
-DEFAULT_PHASE_CACHE_S = 3600.0
-
-
 def gateway_instances(redis_client: Any) -> list[str]:
-    """The live gateway plugin instances (``tre:v2:gw:instances``): a restart changes the
-    set and, with it, the ticker phase."""
+    """The live gateway plugin instances (``tre:v2:gw:instances``; audit)."""
     from tre_common.rediskeys import GW_INSTANCES_KEY
 
     try:
         return sorted(_text(m) for m in (redis_client.zrange(GW_INSTANCES_KEY, 0, -1) or ()))
     except Exception:  # noqa: BLE001
         return []
-
-
-def cached_phase(cells_dir: Path, instances: Sequence[str], *, now_ms: int,
-                 max_age_s: float = DEFAULT_PHASE_CACHE_S) -> Optional[dict]:
-    """The run's cached write-phase measurement, if it is younger than ``max_age_s`` and
-    was made with the same gateway instances (and there are any)."""
-    if not instances or max_age_s <= 0:
-        return None
-    try:
-        doc = json.loads((Path(cells_dir) / GATEWAY_PHASE_CACHE).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-    if doc.get("instances") != list(instances) or doc.get("write_phase_ms") is None:
-        return None
-    if now_ms - int(doc.get("measured_at_ms") or 0) > max_age_s * 1000.0:
-        return None
-    return doc
-
-
-def store_phase(cells_dir: Path, instances: Sequence[str], wait: Mapping[str, Any], *, now_ms: int) -> None:
-    if not wait.get("new_round_seen") or not instances:
-        return
-    doc = {"instances": list(instances), "measured_at_ms": int(now_ms),
-           "write_phase_ms": wait.get("write_phase_ms"), "round_ms": wait.get("new_round_ms")}
-    path = Path(cells_dir) / GATEWAY_PHASE_CACHE
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(doc) + "\n", encoding="utf-8")
-    tmp.replace(path)
 
 
 def _parse_member(member: Any) -> Any:
@@ -924,14 +1103,22 @@ def dump_gateway_docs(
     lo_ms: int,
     hi_ms: int,
     previous: Optional[Mapping[str, Any]] = None,
+    known: Optional[set] = None,
+    known_upto_ms: Optional[int] = None,
 ) -> dict:
     """``ZRANGEBYSCORE [lo_ms, hi_ms]`` of every pod's hist and inst key, one JSONL per
     pod and kind: ``{"score": round stamp ms, "doc": parsed JSON}``. Pods with no doc in
-    the range get no file.
+    the range get no file. ``observed_at_redis_ms`` is redis TIME just before the read.
 
     ``previous`` (the summary of an earlier dump of the same cell): every row of the
     existing files must still be in the new dump, else :class:`NotASuperset` is raised
-    before anything is written - a backfill only ever widens a dump."""
+    before anything is written - a backfill only ever widens a dump.
+
+    ``known`` / ``known_upto_ms``: the docs (:func:`_doc_key`) already seen at an earlier
+    observation and the stamp up to which that observation was final (its redis TIME
+    minus the blind spot); ``late_writes`` counts the dumped docs stamped up to there that
+    were not seen then (:func:`_late_docs`)."""
+    observed_at = redis_time_ms(redis_client)
     fetched: dict[str, dict[str, list]] = {kind: {} for kind in GATEWAY_KINDS}
     for kind in GATEWAY_KINDS:
         key_of = hist_key if kind == "hist" else inst_key
@@ -965,7 +1152,12 @@ def dump_gateway_docs(
             total_bytes += _write_jsonl_atomic(path, header, rows)
             files[kind][pod] = _rel(path, layout.cell_dir)
     phases = sorted({s % SCRAPE_INTERVAL_MS for s in stamps})
+    late = (_late_docs(fetched, known, int(known_upto_ms))
+            if known is not None and known_upto_ms is not None else None)
     return {
+        "observed_at_redis_ms": observed_at,
+        "late_writes": None if late is None else len(late),
+        "late_write_example": late[0] if late else None,
         "dir": GATEWAY_DUMP_DIRNAME,
         "schema": GATEWAY_DUMP_SCHEMA,
         "range_ms": [lo_ms, hi_ms],
@@ -1198,42 +1390,92 @@ DEFAULT_FINAL_BACKFILL_WAIT_S = 90.0
 DEFAULT_BACKFILL_MAX_AGE_S = 6 * 3600.0
 
 
-def dump_range_ms(start_ms: int, end_ms: int, window_ms: int, shift_ms: int = 0) -> tuple[int, int]:
-    """``[lo, hi]`` of a redis dump of a cell, in the source's clock (``shift_ms`` = source
-    minus driver, :func:`source_clock`): from one window plus one gateway round before the
-    cell (the first window's read reaches that far back) to one window plus one round
-    after it (the last controller window that still holds part of the cell)."""
-    return (int(start_ms) + int(shift_ms) - int(window_ms) - SCRAPE_INTERVAL_MS,
-            int(end_ms) + int(shift_ms) + int(window_ms) + SCRAPE_INTERVAL_MS)
+def _config_from_clock(clock: Mapping[str, Any]) -> ClockDomainConfig:
+    """The :class:`ClockDomainConfig` a cell was captured with (``cell_meta["clock"]``)."""
+    c = clock.get("config") or {}
+    kw = {k: c[k] for k in ("window_ms", "period_ms", "tolerance_ms", "controller_read_offset_ms",
+                            "controller_tick_ms", "margin_ms", "attempts", "retry_s") if c.get(k) is not None}
+    return ClockDomainConfig(**kw)
 
 
-def tail_ms(end_ms: int, window_ms: int, shift_ms: int = 0) -> int:
-    """End of the last window on the 10 s grid that still overlaps the cell, in the
-    source's clock - a dump is *complete* once it reaches it (controller ticks:
-    ``window_end_ms``; gateway docs: round stamp)."""
-    end = int(end_ms) + int(shift_ms) + int(window_ms) - 1
-    return (end // SCRAPE_INTERVAL_MS) * SCRAPE_INTERVAL_MS
+def _mark_summary(mark: Optional[Mapping[str, Any]]) -> Optional[dict]:
+    if mark is None:
+        return None
+    out = {k: v for k, v in mark.items() if k != "late_write_baseline"}
+    if "late_write_baseline" in mark:
+        out["late_write_baseline_docs"] = len(mark["late_write_baseline"] or ())
+    return out
 
 
-def _shift_of(meta: Mapping[str, Any], source: str) -> int:
-    return int(((meta.get("clock") or {}).get(source) or {}).get("shift_ms") or 0)
+def clock_record(cfg: ClockDomainConfig, start: Optional[Mapping[str, Any]],
+                 end: Optional[Mapping[str, Any]]) -> dict:
+    """``cell_meta["clock"]``: the redis-time span of the cell, the dump range and tail
+    derived from it, both marks (:func:`cell_clock_mark`) and the per-source verdict.
+
+    The gateway is in redis's domain when both marks say so; the controller when both
+    marks say so for it *and* for the gateway (its windows are built from the gateway's
+    docs, so a skewed gateway makes them wrong whatever their stamps)."""
+    rs = ((start or {}).get("probe") or {}).get("redis_time_ms")
+    re_ = ((end or {}).get("probe") or {}).get("redis_time_ms")
+    rec: dict[str, Any] = {"config": cfg.as_dict(), "cell_start": _mark_summary(start),
+                           "cell_end": _mark_summary(end), "redis_start_ms": rs, "redis_end_ms": re_,
+                           "range_ms": None, "tail_ms": None}
+    reasons: list[str] = []
+    if rs is None or re_ is None:
+        reasons.append("no redis TIME at the cell " + ("start" if rs is None else "end"))
+    else:
+        lo, hi = dump_range_ms(rs, re_, cfg.margin)
+        rec.update({"range_ms": [lo, hi], "tail_ms": tail_ms(hi, cfg.period_ms)})
+    marks = [("cell start", start), ("cell end", end)]
+    gw_ok = rs is not None and re_ is not None and all(
+        m is not None and ((m.get("check") or {}).get("gateway") or {}).get("ok") for _, m in marks)
+    ctl_ok = gw_ok and all(
+        m is not None and ((m.get("check") or {}).get("controller") or {}).get("ok") for _, m in marks)
+    for where, m in marks:
+        reasons.extend(f"{where}: {r}" for r in (((m or {}).get("check") or {}).get("reasons") or ()))
+    rec["domain"] = {"gateway": CLOCK_DOMAIN_OK if gw_ok else CLOCK_DOMAIN_MISMATCH,
+                     "controller": CLOCK_DOMAIN_OK if ctl_ok else CLOCK_DOMAIN_MISMATCH}
+    rec["mismatch_reasons"] = reasons if not (gw_ok and ctl_ok) else []
+    return rec
+
+
+def _gateway_late(clock: dict, where: str, summary: dict) -> None:
+    """A gateway dump holding late-written docs (or one that could not be checked): the
+    gateway, and the controller whose windows are built from its docs, leave redis's time
+    domain for this cell."""
+    reason = (f"{where}: gateway docs not verifiable against the previous observation"
+              if summary.get("late_writes") is None else
+              f"{where}: {summary['late_writes']} gateway doc(s) written more than one round after their "
+              f"stamp, e.g. {summary.get('late_write_example')}")
+    summary["clock_domain"] = CLOCK_DOMAIN_MISMATCH
+    clock.setdefault("domain", {})["gateway"] = CLOCK_DOMAIN_MISMATCH
+    clock["domain"]["controller"] = CLOCK_DOMAIN_MISMATCH
+    clock.setdefault("mismatch_reasons", []).append(reason)
 
 
 def _mark_completeness(meta: dict) -> bool:
-    """Set ``complete`` (and ``tail_ms``) on the redis dumps of ``meta``; True when
-    something is still incomplete (a backfill is due)."""
+    """Set ``tail_ms`` / ``reached_tail`` / ``complete`` on the redis dumps of ``meta``;
+    True when a dump has not reached its tail yet (a backfill is due). ``complete`` also
+    needs the dump's ``clock_domain`` to be ``ok``: a ``clock_domain_mismatch`` dump is
+    kept and backfilled like any other, but never complete."""
+    tail = (meta.get("clock") or {}).get("tail_ms")
     pending = False
-    for name, source, last_key in (("gateway_redis_dump", "gateway", "last_round_ms"),
-                                   ("controller_ticks", "controller", "last_window_end_ms")):
+    for name, last_key in (("gateway_redis_dump", "last_round_ms"), ("controller_ticks", "last_window_end_ms")):
         dump = meta.get(name)
         if dump is None:
             continue
-        shift = _shift_of(meta, source)
-        # a shift is an estimate good to about half a round: then wait one round longer
-        tail = tail_ms(meta["end_ms"], meta["window_ms"], shift) + (SCRAPE_INTERVAL_MS if shift else 0)
+        reached = tail is not None and dump.get(last_key) is not None and dump[last_key] >= tail
         dump["tail_ms"] = tail
-        dump["complete"] = dump.get(last_key) is not None and dump[last_key] >= tail
-        pending |= not dump["complete"]
+        dump["reached_tail"] = reached
+        dump["complete"] = reached and dump.get("clock_domain") == CLOCK_DOMAIN_OK
+        pending |= tail is not None and not reached
+    mismatched = sorted(name for name in ("gateway_redis_dump", "controller_ticks")
+                        if meta.get(name) is not None and meta[name].get("clock_domain") != CLOCK_DOMAIN_OK)
+    if mismatched:
+        meta["clock_domain_mismatch"] = {"dumps": mismatched,
+                                         "reasons": (meta.get("clock") or {}).get("mismatch_reasons") or []}
+    else:
+        meta.pop("clock_domain_mismatch", None)
     return pending
 
 
@@ -1260,30 +1502,30 @@ def capture_after_cell(
     extra_legacy: Optional[Mapping[str, Optional[Path]]] = None,
     gateway_dump: bool = True,
     controller_ticks: bool = True,
+    clock_start: Optional[Mapping[str, Any]] = None,
+    clock_end: Optional[Mapping[str, Any]] = None,
+    clock_config: Optional[ClockDomainConfig] = None,
     flush_wait_s: float = DEFAULT_GATEWAY_FLUSH_WAIT_S,
-    phase_cache_s: float = DEFAULT_PHASE_CACHE_S,
     poll_s: float = DEFAULT_GATEWAY_POLL_S,
     now_ms: Callable[[], int] = lambda: int(time.time() * 1000),
     sleep: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
     info: Optional[Mapping[str, Any]] = None,
 ) -> dict:
-    """After a cell (its load drained): measure the clocks, dump the gateway docs and the
-    controller ticks over :func:`dump_range_ms`, write ``cell_meta.json``.
+    """After a cell (its load drained): dump the gateway docs and the controller ticks
+    over the cell's redis-time range, write ``cell_meta.json``.
 
-    Clocks: ``start_ms`` / ``end_ms`` are the driver's clock, the gateway stamps its
-    rounds and the controller its windows with their own. :func:`source_clock` estimates
-    each source's offset (redis TIME bracketed by the driver's clock, the source's newest
-    stamp, the gateway's write phase) and shifts that source's range when the offset
-    exceeds :data:`CLOCK_SKEW_TOLERANCE_MS`; everything is recorded under ``clock``.
+    Clocks: ``start_ms`` / ``end_ms`` are the driver's clock and are recorded only. The
+    dump range is ``[redis_start - margin, redis_end + margin]`` from ``clock_start`` /
+    ``clock_end`` (:func:`cell_clock_mark` right before and right after the load; the end
+    mark is taken here when not given). Without a start mark the cell has no redis time and
+    nothing is dumped from redis. A source that failed the clock-domain check at either
+    mark gets ``clock_domain: clock_domain_mismatch`` on its dump - dumped unshifted,
+    never ``complete`` - and ``cell_meta["clock_domain_mismatch"]`` says why.
 
-    The gateway's write phase is measured by waiting (at most ``flush_wait_s``) for its
-    next round - once per ``phase_cache_s`` and gateway instance set, not per cell.
-
-    Right after the cell the controller has not yet processed the windows that end up to
-    one window later, and the gateway has written at most one round past the end; such a
-    dump is marked ``complete: false`` and the cell directory gets a ``BACKFILL_PENDING``
-    marker. :func:`backfill_pending` - run by the next cell's driver and by the
+    Right after the cell the controller has not yet processed the tail windows, so the
+    dumps are usually short of ``tail_ms``: the cell directory gets a ``BACKFILL_PENDING``
+    marker and :func:`backfill_pending` - run by the next cell's driver and by the
     campaign's finalize - re-dumps it once the data exists (a re-dump only ever widens a
     dump). Never raises: a failed step leaves its error in ``cell_meta.json["errors"]``."""
     errors: list[str] = []
@@ -1313,66 +1555,43 @@ def capture_after_cell(
         except Exception as exc:  # noqa: BLE001
             errors.append(f"vllm_metrics: {exc!r}")
     if redis_client is not None and (gateway_dump or controller_ticks):
-        clock: dict[str, Any] = {}
+        cfg = clock_config or ClockDomainConfig(window_ms=int(window_ms))
+        if clock_end is None and clock_start is not None:
+            clock_end = cell_clock_mark(redis_client, model, cfg, start=clock_start, now_ms=now_ms, sleep=sleep)
+        clock = clock_record(cfg, clock_start, clock_end)
         meta["clock"] = clock
-        rml: Optional[float] = None
-        try:
-            probe = clock_probe(redis_client, now_ms)
-            clock["probe_before"] = probe
-            rml = probe["redis_minus_local_ms"]
-        except Exception as exc:  # noqa: BLE001
-            errors.append(f"redis clock: {exc!r}")
-        if gateway_dump:
-            try:
-                in_set = model_pod_keys(redis_client, model)
-                # widened by the largest plausible skew: a skewed gateway's stamps may lie
-                # before the unshifted range, and a pod must not be dropped for that
-                pods = active_pods(redis_client, in_set,
-                                   dump_range_ms(start_ms, end_ms, window_ms)[0] - ACTIVE_POD_MARGIN_MS)
-                instances = gateway_instances(redis_client)
-                cached = cached_phase(layout.cell_dir.parent, instances, now_ms=int(now_ms()),
-                                      max_age_s=phase_cache_s)
-                if cached is not None:
-                    wait = {"skipped": "write phase cached for this gateway instance set",
-                            "write_phase_ms": cached["write_phase_ms"],
-                            "measured_at_ms": cached["measured_at_ms"], "new_round_seen": False}
-                else:
+        if clock["range_ms"] is None:
+            errors.append("redis clock: the cell has no redis-time span (" + "; ".join(clock["mismatch_reasons"])
+                          + "): gateway docs and controller ticks not captured")
+        else:
+            lo, hi = clock["range_ms"]
+            if gateway_dump:
+                try:
+                    in_set = model_pod_keys(redis_client, model)
+                    pods = active_pods(redis_client, in_set, lo)
                     wait = wait_for_gateway_write(redis_client, pods, timeout_s=flush_wait_s, poll_s=poll_s,
                                                   sleep=sleep, monotonic=monotonic)
-                    try:
-                        store_phase(layout.cell_dir.parent, instances, wait, now_ms=int(now_ms()))
-                    except OSError as exc:
-                        errors.append(f"gateway phase cache: {exc!r}")
-                clock["gateway"] = source_clock(
-                    _latest_inst_score(redis_client, pods), redis_time_ms(redis_client),
-                    redis_minus_local_ms=rml, write_phase_ms=wait.get("write_phase_ms"),
-                )
-                lo, hi = dump_range_ms(start_ms, end_ms, window_ms, clock["gateway"]["shift_ms"])
-                summary = dump_gateway_docs(redis_client, layout, pods, lo_ms=lo, hi_ms=hi)
-                summary["flush_wait"] = wait
-                summary["pods_in_set"] = len(in_set)
-                summary["gateway_instances"] = instances
-                meta["gateway_redis_dump"] = summary
-            except Exception as exc:  # noqa: BLE001
-                errors.append(f"gateway_redis_dump: {exc!r}")
-        if controller_ticks:
-            try:
-                clock["controller"] = source_clock(
-                    _latest_score(redis_client, decision_hist_key(model)), redis_time_ms(redis_client),
-                    redis_minus_local_ms=rml, max_lag_ms=CONTROLLER_MAX_LAG_MS,
-                    expected_lag_ms=CONTROLLER_EXPECTED_LAG_MS,
-                )
-                lo, hi = dump_range_ms(start_ms, end_ms, window_ms, clock["controller"]["shift_ms"])
-                meta["controller_ticks"] = dump_controller_ticks(redis_client, layout, model, lo_ms=lo, hi_ms=hi)
-            except Exception as exc:  # noqa: BLE001
-                errors.append(f"controller_ticks: {exc!r}")
-        try:
-            clock["probe_after"] = clock_probe(redis_client, now_ms)
-        except Exception as exc:  # noqa: BLE001
-            errors.append(f"redis clock: {exc!r}")
-        suspects = {k: v.get("suspect") for k, v in clock.items() if isinstance(v, dict) and v.get("suspect")}
-        if suspects:
-            meta["clock_skew_suspected"] = suspects
+                    end_rng = (clock_end or {}).get("late_write_range_ms")
+                    summary = dump_gateway_docs(
+                        redis_client, layout, pods, lo_ms=lo, hi_ms=hi,
+                        known=set((clock_end or {}).get("late_write_baseline") or ()) if end_rng else None,
+                        known_upto_ms=end_rng[1] if end_rng else None)
+                    summary["flush_wait"] = wait
+                    summary["pods_in_set"] = len(in_set)
+                    summary["gateway_instances"] = gateway_instances(redis_client)
+                    summary["clock_domain"] = clock["domain"]["gateway"]
+                    if not end_rng or summary["late_writes"]:
+                        _gateway_late(clock, "capture dump", summary)
+                    meta["gateway_redis_dump"] = summary
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(f"gateway_redis_dump: {exc!r}")
+            if controller_ticks:
+                try:
+                    summary = dump_controller_ticks(redis_client, layout, model, lo_ms=lo, hi_ms=hi)
+                    summary["clock_domain"] = clock["domain"]["controller"]
+                    meta["controller_ticks"] = summary
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(f"controller_ticks: {exc!r}")
     elif gateway_dump or controller_ticks:
         errors.append("no redis client: gateway docs and controller ticks not captured")
     meta["errors"] = errors
@@ -1384,50 +1603,98 @@ def capture_after_cell(
 
 
 def backfill_cell(
-    cell_dir: Path, redis_client: Any, *, now_ms: Callable[[], int] = lambda: int(time.time() * 1000),
+    cell_dir: Path,
+    redis_client: Any,
+    *,
+    now_ms: Callable[[], int] = lambda: int(time.time() * 1000),
+    sleep: Callable[[float], None] = time.sleep,
+    checks: Optional[dict] = None,
 ) -> Optional[dict]:
-    """Re-dump the incomplete redis dumps of one cell over the same ranges (the clock
-    shifts measured after the cell are reused); returns the backfill record (also
-    appended to ``cell_meta.json["backfills"]``), None when the cell was already complete.
-    A re-dump that would lose a row of the existing file (retention) keeps the old file
-    and says so."""
+    """Re-dump the redis dumps of one cell that have not reached their tail, over the
+    cell's recorded redis-time range; returns the backfill record (also appended to
+    ``cell_meta.json["backfills"]``), None when nothing was due.
+
+    The gateway pods are listed again (every pod of the model still writing in the
+    range, plus the first dump's), so a pod that came up in the tail is included. The
+    clock-domain check is run again first (``checks`` caches it per model): the rows added
+    now were written since the cell, so a failed check marks the re-dumped source
+    ``clock_domain_mismatch``. A re-dump that would lose a row of the existing file
+    (retention) keeps the old file and says so."""
     cell_dir = Path(cell_dir)
     meta = json.loads((cell_dir / CELL_META).read_text(encoding="utf-8"))
     layout = CellLayout(cell_dir.parent.parent, meta["stem"], meta["cell_id"])
     _mark_completeness(meta)
     gd, ct = meta.get("gateway_redis_dump"), meta.get("controller_ticks")
-    todo_gw = gd is not None and not gd.get("complete")
-    todo_ct = ct is not None and not ct.get("complete")
-    if not (todo_gw or todo_ct):
+    todo_gw = gd is not None and not gd.get("reached_tail")
+    todo_ct = ct is not None and not ct.get("reached_tail")
+    clock = meta.get("clock") or {}
+    if not (todo_gw or todo_ct) or clock.get("range_ms") is None:
         _write_meta_and_marker(layout, meta)
         return None
-    record: dict[str, Any] = {"at_utc": utc_iso(), "redis_clock": clock_probe(redis_client, now_ms)}
+    lo, hi = clock["range_ms"]
+    model = meta["model"]
+    cache = checks if checks is not None else {}
+    if model not in cache:
+        cache[model] = check_clock_domains(redis_client, model, _config_from_clock(clock), sleep=sleep)
+    check = cache[model]
+    record: dict[str, Any] = {"at_utc": utc_iso(), "redis_clock": clock_probe(redis_client, now_ms),
+                              "clock_check": check}
+    gw_ok = bool((check.get("gateway") or {}).get("ok"))
+    ctl_ok = gw_ok and bool((check.get("controller") or {}).get("ok"))
+    if not (gw_ok and ctl_ok):
+        clock.setdefault("mismatch_reasons", []).extend(f"backfill: {r}" for r in check.get("reasons") or ())
     if todo_gw:
-        lo, hi = dump_range_ms(meta["start_ms"], meta["end_ms"], meta["window_ms"], _shift_of(meta, "gateway"))
         try:
-            new = dump_gateway_docs(redis_client, layout, gd.get("pods") or [], lo_ms=lo, hi_ms=hi, previous=gd)
+            pods = sorted(set(gd.get("pods") or ()) | set(active_pods(redis_client, model_pod_keys(redis_client, model), lo)))
+            seen_at = gd.get("observed_at_redis_ms")
+            new = dump_gateway_docs(
+                redis_client, layout, pods, lo_ms=lo, hi_ms=hi, previous=gd,
+                known=_dumped_doc_keys(layout, gd) if seen_at is not None else None,
+                known_upto_ms=(int(seen_at) - _config_from_clock(clock).blind_spot_ms) if seen_at is not None else None)
             for key in ("flush_wait", "pods_in_set", "gateway_instances"):
                 if key in gd:
                     new[key] = gd[key]
+            new["clock_domain"] = gd.get("clock_domain") if gw_ok else CLOCK_DOMAIN_MISMATCH
+            if new["late_writes"] is None or new["late_writes"]:
+                _gateway_late(clock, "backfill", new)
+                ctl_ok = False
+                if ct is not None and not todo_ct:
+                    ct["clock_domain"] = CLOCK_DOMAIN_MISMATCH
             record["gateway_docs"] = {"docs_before": sum(sum(v.values()) for v in (gd.get("docs") or {}).values()),
                                       "docs_after": sum(sum(v.values()) for v in new["docs"].values()),
+                                      "pods_before": len(gd.get("pods") or ()), "pods_after": len(pods),
                                       "last_round_before_ms": gd.get("last_round_ms"),
                                       "last_round_after_ms": new.get("last_round_ms")}
             meta["gateway_redis_dump"] = new
         except NotASuperset as exc:
             record["gateway_docs_kept"] = str(exc)
     if todo_ct:
-        lo, hi = dump_range_ms(meta["start_ms"], meta["end_ms"], meta["window_ms"], _shift_of(meta, "controller"))
         try:
-            new = dump_controller_ticks(redis_client, layout, meta["model"], lo_ms=lo, hi_ms=hi, previous=ct)
+            new = dump_controller_ticks(redis_client, layout, model, lo_ms=lo, hi_ms=hi, previous=ct)
+            new["clock_domain"] = ct.get("clock_domain") if ctl_ok else CLOCK_DOMAIN_MISMATCH
             record["controller_ticks"] = {"members_before": ct.get("members"), "members_after": new["members"]}
             meta["controller_ticks"] = new
         except NotASuperset as exc:
             record["controller_ticks_kept"] = str(exc)
     meta.setdefault("backfills", []).append(record)
     _write_meta_and_marker(layout, meta)
-    record["complete"] = not (layout.cell_dir / BACKFILL_MARKER).exists()
+    record["complete"] = all((meta.get(n) or {}).get("complete", True)
+                             for n in ("gateway_redis_dump", "controller_ticks"))
+    record["pending"] = (layout.cell_dir / BACKFILL_MARKER).exists()
     return record
+
+
+def _dumped_doc_keys(layout: CellLayout, dump: Mapping[str, Any]) -> set[str]:
+    """:func:`_doc_key` of every row of a gateway dump's files."""
+    out: set[str] = set()
+    for kind, per_pod in (dump.get("files") or {}).items():
+        for pod, rel in per_pod.items():
+            with (layout.cell_dir / rel).open(encoding="utf-8") as fh:
+                for line in fh:
+                    row = json.loads(line)
+                    if row.get("kind") != "header" and "score" in row:
+                        out.add(_doc_key(kind, pod, row["score"], row.get("doc")))
+    return out
 
 
 def pending_cells(root: Path, *, max_age_s: Optional[float] = DEFAULT_BACKFILL_MAX_AGE_S,
@@ -1460,24 +1727,23 @@ def backfill_pending(
     now_ms: Callable[[], int] = lambda: int(time.time() * 1000),
 ) -> list[dict]:
     """Backfill every pending cell under ``root``. With ``wait_s`` > 0 it first waits
-    (bounded) until redis time is two rounds past the latest pending tail, so the
-    controller has processed the last windows - what the campaign's finalize does after
-    its last cell. Returns one record per backfilled cell (``{"cell", "error"}`` on a
-    failure, which never stops the others)."""
+    (bounded) until redis time is past the latest pending tail plus the controller's
+    largest normal lag, so the controller has processed the last windows - what the
+    campaign's finalize does after its last cell. Returns one record per backfilled cell
+    (``{"cell", "error"}`` on a failure, which never stops the others)."""
     cells = pending_cells(root, max_age_s=max_age_s)
     if not cells:
         return []
     if wait_s > 0:
-        tails = []
+        targets = []
         for cell in cells:
             try:
-                m = json.loads((cell / CELL_META).read_text(encoding="utf-8"))
-                rml = (((m.get("clock") or {}).get("probe_before") or {}).get("redis_minus_local_ms") or 0.0)
-                # the cell's tail in redis's clock (the driver's end plus redis's offset)
-                tails.append(tail_ms(m["end_ms"], m["window_ms"], int(round(rml))))
+                clock = json.loads((cell / CELL_META).read_text(encoding="utf-8")).get("clock") or {}
+                if clock.get("tail_ms") is not None:
+                    targets.append(int(clock["tail_ms"]) + _config_from_clock(clock).controller_lag_bounds[1])
             except (OSError, ValueError, KeyError, TypeError):
                 continue
-        target = (max(tails) + 2 * SCRAPE_INTERVAL_MS) if tails else None
+        target = max(targets) if targets else None
         deadline = monotonic() + wait_s
         while target is not None:
             server = redis_time_ms(redis_client)
@@ -1486,9 +1752,10 @@ def backfill_pending(
                 break
             sleep(max(0.05, min((target - server) / 1000.0, left, 5.0)))
     out = []
+    checks: dict = {}
     for cell in cells:
         try:
-            rec = backfill_cell(cell, redis_client, now_ms=now_ms)
+            rec = backfill_cell(cell, redis_client, now_ms=now_ms, sleep=sleep, checks=checks)
             if rec is not None:
                 out.append({"cell": str(cell), **rec})
         except Exception as exc:  # noqa: BLE001 - one bad cell never stops the others

@@ -583,6 +583,20 @@ def capture_layout_for(args, cell_id: str):
     return capture.CellLayout(cells.parent, Path(args.output).stem, cell_id, raw_root=raw_root)
 
 
+def capture_clock_config(args):
+    """The capture's clock-domain config (:class:`scripts.calibration_capture.ClockDomainConfig`)
+    from the r3_grid arguments."""
+    from scripts import calibration_capture as capture
+
+    return capture.ClockDomainConfig(
+        window_ms=int(args.window_ms),
+        tolerance_ms=int(args.clock_tolerance_ms),
+        controller_read_offset_ms=int(args.controller_read_offset_ms),
+        controller_tick_ms=int(args.controller_tick_ms),
+        margin_ms=args.capture_margin_ms,
+    )
+
+
 def _redact(value):
     """A URL's userinfo (``scheme://user:secret@host``) is never written to disk."""
     if isinstance(value, str):
@@ -729,6 +743,25 @@ def run_schedule_cell(args, store, spec, redis_client=None) -> tuple[list, "open
             cluster_filter=args.envoy_cluster_filter or "",
         )
 
+    # The cell's time base for the redis dumps: redis TIME right before the load (and
+    # right after it, below), plus the check that the gateway and the controller stamp in
+    # redis time (scripts.calibration_capture.cell_clock_mark).
+    clock_cfg = clock_start = None
+    if layout is not None and redis_client is not None and not (args.no_gateway_dump and args.no_controller_ticks):
+        from scripts import calibration_capture as capture
+
+        clock_cfg = capture_clock_config(args)
+        clock_start = capture.cell_clock_mark(redis_client, args.model, clock_cfg)
+        if not clock_start["check"]["ok"]:
+            reasons = "; ".join(clock_start["check"]["reasons"])
+            if args.clock_domain_check == "refuse":
+                raise SystemExit(f"refusing to run cell {cell_id}: the capture's redis sources are not in "
+                                 f"redis's time domain ({reasons}); fix the node clocks (NTP), or pass "
+                                 "--clock-domain-check flag to run and mark the cell's redis dumps "
+                                 "clock_domain_mismatch")
+            print(f"WARNING: cell {cell_id}: {capture.CLOCK_DOMAIN_MISMATCH} at the cell start ({reasons}); "
+                  "its gateway docs / controller ticks will be kept but never marked complete")
+
     sender_records: list[dict] = []
     sidecar_samples: list[dict] = []
     start_ms, end_ms, guard = openloop.drive_cell_schedule(
@@ -764,6 +797,10 @@ def run_schedule_cell(args, store, spec, redis_client=None) -> tuple[list, "open
             "tpot_slo_ms": tpot_slo_ms,
         },
     )
+
+    clock_end = None
+    if clock_start is not None:
+        clock_end = capture.cell_clock_mark(redis_client, args.model, clock_cfg, start=clock_start)
 
     # The cell's windows, labelled by THE labelling path - rewindow_from_raw.label_cell -
     # on the raw records and sidecar samples this very drive produced (the same bytes the
@@ -844,12 +881,16 @@ def run_schedule_cell(args, store, spec, redis_client=None) -> tuple[list, "open
             gateway_dump=not args.no_gateway_dump,
             controller_ticks=not args.no_controller_ticks,
             flush_wait_s=args.gateway_flush_wait_s,
-            phase_cache_s=args.gateway_phase_cache_s,
+            clock_start=clock_start, clock_end=clock_end,
+            clock_config=clock_cfg or capture_clock_config(args),
             info={"guard_voided": guard.voided, "void_reasons": list(guard.void_reasons),
                   "truncated": guard.truncated},
         )
         gd = meta.get("gateway_redis_dump") or {}
         ct = meta.get("controller_ticks") or {}
+        if meta.get("clock_domain_mismatch"):
+            print(f"WARNING: cell {cell_id}: {capture.CLOCK_DOMAIN_MISMATCH}: "
+                  f"{json.dumps(meta['clock_domain_mismatch'], sort_keys=True)}")
         print(f"cell {cell_id} capture -> {layout.cell_dir}: gateway docs "
               f"{sum(sum(v.values()) for v in (gd.get('docs') or {}).values())}, "
               f"write phase {((gd.get('flush_wait') or {}).get('write_phase_ms'))} ms, "
@@ -1181,10 +1222,22 @@ def parse_args(argv: Optional[Sequence[str]] = None):
     ap.add_argument("--gateway-flush-wait-s", type=float, default=None,
                     help="after the cell, wait at most this long for the gateway's next redis "
                          "write before dumping (0 = no wait; default one round + 2 s)")
-    ap.add_argument("--gateway-phase-cache-s", type=float, default=_capture.DEFAULT_PHASE_CACHE_S,
-                    help="reuse the run's measured gateway write phase for this long (same gateway "
-                         "instances) instead of waiting for a gateway round after every cell; 0 = "
-                         "measure after every cell")
+    ap.add_argument("--clock-domain-check", default="refuse", choices=["refuse", "flag"],
+                    help="with --capture-dir: when the gateway's round stamps or the controller's "
+                         "window ends are not in redis's time domain at the cell start, refuse the "
+                         "cell (default) or run it and mark its redis dumps clock_domain_mismatch "
+                         "(the campaign passes flag: it checks once before the run)")
+    ap.add_argument("--capture-margin-ms", type=int, default=None,
+                    help="redis dumps cover [redis start - margin, redis end + margin] (default: "
+                         "window + one gateway round + the clock check's blind spot, 52 s at 30 s)")
+    ap.add_argument("--clock-tolerance-ms", type=int, default=_capture.DEFAULT_CLOCK_TOLERANCE_MS,
+                    help="slack of the clock-domain check on both sides of each source's normal lag")
+    ap.add_argument("--controller-read-offset-ms", type=int,
+                    default=_capture.DEFAULT_CONTROLLER_READ_OFFSET_MS,
+                    help="largest phase offset the controller reads a window at (its adapted "
+                         "TRE_METRICS_PHASE_OFFSET_MS; cap 9.5 s)")
+    ap.add_argument("--controller-tick-ms", type=int, default=_capture.DEFAULT_CONTROLLER_TICK_MS,
+                    help="controller loop tick that writes the decision history (rescue interval)")
     ap.add_argument("--registry-configmap", default="tre-v2-registry",
                     help="ConfigMap (in --control-namespace) holding the live registry, hashed "
                          "into the run manifest ('' = skip)")
@@ -1257,6 +1310,10 @@ def parse_args(argv: Optional[Sequence[str]] = None):
         args.vllm_keyframe_every = _capture.DEFAULT_KEYFRAME_EVERY
     if args.gateway_flush_wait_s is None:
         args.gateway_flush_wait_s = _capture.DEFAULT_GATEWAY_FLUSH_WAIT_S
+    try:
+        capture_clock_config(args)  # fail now on a margin that would cut the cell's windows
+    except ValueError as exc:
+        ap.error(str(exc))
     if args.step_ms is None:
         args.step_ms = args.window_ms
     if args.schedule is None and args.instant_source == "pod":

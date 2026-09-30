@@ -181,6 +181,9 @@ def test_reprobe_writes_new_boundaries_under_the_new_root_only(tmp_path, monkeyp
     monkeypatch.setattr(campaign, "controller_mode", lambda ns: campaign.REQUIRED_CONTROLLER_MODE)
     monkeypatch.setattr(campaign, "sm_actuation", lambda ns: campaign.REQUIRED_SM_ACTUATION)
     monkeypatch.setattr(campaign.time, "sleep", lambda s: None)
+    clock_checked = []  # the capture clock pre-flight (no redis here)
+    monkeypatch.setattr(campaign, "require_capture_clock_domains",
+                        lambda args, models=None: clock_checked.append(list(models)))
     seen = []
 
     def fake_drive(cell, measured, args, *, cap, schedule_dir, out_dir):
@@ -195,6 +198,7 @@ def test_reprobe_writes_new_boundaries_under_the_new_root_only(tmp_path, monkeyp
     assert campaign.main(["--reprobe-shapes", "dsllama-8b:S4", "--reprobe-source", str(src),
                           "--out-dir", str(out), "--index", str(tmp_path / "no_index.json")]) == 0
     assert seen == [("dsllama-8b", "S4", out / "dsllama-8b" / "raw", out / "dsllama-8b")]
+    assert clock_checked == [["dsllama-8b"]]
     body = json.loads((out / "dsllama-8b" / "boundary" / "dsllama-8b_S4.json").read_text())
     assert body["rho_star_status"] == "measured" and 2.0 <= body["rho_star"] <= 2.6
     assert (out / "dsllama-8b" / "capacity" / "dsllama-8b_S4.json").exists()
