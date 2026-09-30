@@ -308,21 +308,22 @@ Keep `observe observe` through 6.1-6.3; switch to the TRE arm (`active active`) 
    written by `tre_replayer.engine.prompt_store.materialize_prompts`, see
    `tre/deploy/scripts/openloop.py`), e.g.
    `/data/nfs_shared_data/xxy/calibration_supp_20260923/<model>/prompts/*/*.prompts.jsonl`.
-   Take the first 200 lines and count tokens in both images, then diff:
+   Take the first 200 lines and count tokens in both images with
+   `tre/deploy/scripts/compare_tokenizer_counts.sh` (the earlier inline `python3 -c` body
+   was indented and failed with `IndentationError`; the script keeps the program
+   flush-left, falls back to the `get_tokenizer` import of `check_tokenizer_consistency.py`
+   and fails loudly on an empty result):
    ```bash
-   W=<weights_path of the model>; F=<one .prompts.jsonl of that model>
-   for IMG in ts-2be2d647 ts-8dc0f2a7; do
-     docker run --rm --entrypoint python3 -e CUDA_VISIBLE_DEVICES= -e HF_HUB_OFFLINE=1        -v $W:$W:ro -v $F:/p.jsonl:ro vllm-openai-tre:0.30.0-$IMG -c "
-   import json,sys
-   from vllm.tokenizers import get_tokenizer
-   t=get_tokenizer('$W')
-   ps=[json.loads(l)['prompt'] for l,_ in zip(open('/p.jsonl'),range(200))]
-   print(json.dumps([len(t.encode(p,add_special_tokens=False)) for p in ps]))" > /tmp/tok-$IMG.json
+   C=/data/nfs_shared_data/xxy/calibration_supp_20260923
+   for m in dsqwen-7b:/data/nfs_shared_data/DeepSeek-R1-Distill-Qwen-7B             dsllama-8b:/data/nfs_shared_data/DeepSeek-R1-Distill-Llama-8B             dsqwen-14b:/data/nfs_shared_data/Models/DeepSeek-R1-Distill-Qwen-14B; do
+     M=${m%%:*}; W=${m#*:}; F=$(ls $C/$M/prompts/*/*.prompts.jsonl | head -1)
+     echo "$M"; deploy/scripts/compare_tokenizer_counts.sh        vllm-openai-tre:0.30.0-ts-2be2d647 vllm-openai-tre:0.30.0-ts-8dc0f2a7 "$W" "$F" 200
    done
-   python3 -c "import json;a,b=[json.load(open('/tmp/tok-ts-%s.json'%x)) for x in ('2be2d647','8dc0f2a7')];d=[y-x for x,y in zip(a,b)];print('n',len(d),'differ',sum(1 for x in d if x),'max|d|',max(map(abs,d)))"
    ```
-   (If the import path `vllm.tokenizers` differs in the image, use the same
-   `get_tokenizer` import as `check_tokenizer_consistency.py`.)
+   Result 2026-09-30 (200 prompts of the i2048 boundary cell each): 7b / 14b identical
+   (0 of 200 differ, mean 2047); 8b 200 of 200 differ, mean 2503.8 (old, SentencePiece
+   rebuild) -> 2047.0 (new, byte-level BPE; the generator's `prompt_tokens` is 2048),
+   i.e. -18.2 % per prompt: 8b's theta must be recalibrated.
 2. **Fleet**: 20/20 Ready, no restarts; `GET /v2/audit` (one call) empty; each model
    answers `/v1/completions` and `/v1/chat/completions` through the gateway NodePort.
 3. **Serve args**: pod args show no `--max-model-len` (each model serves its maximum);
