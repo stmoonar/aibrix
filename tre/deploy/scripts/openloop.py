@@ -1715,6 +1715,8 @@ def drive_cell_schedule(
     instant_sampler: Optional[Callable[[int], dict]] = None,
     instant_interval_s: float = DEFAULT_SIDECAR_INTERVAL_S,
     prompt_mode: Optional[str] = None,
+    corpus_lang: Optional[str] = None,
+    zh_ratio: Optional[float] = None,
     prompt_dir: Optional[Path] = None,
     prompt_workers: Optional[int] = None,
     rps_timeline_path: Optional[Path] = None,
@@ -1749,8 +1751,11 @@ def drive_cell_schedule(
 
     ``prompt_mode`` None means "whatever the sender defaults to"
     (:data:`tre_replayer.engine.prompts.DEFAULT_MODE`), so the default lives in exactly
-    one place. ``routing_strategy`` moves the requests onto the AIBrix-routed path, which
-    is the only path that reports a serving pod and is therefore the only way
+    one place; ``corpus_lang`` / ``zh_ratio`` likewise (None = the corpus defaults of
+    :mod:`tre_replayer.engine.corpus`), and both the materialiser and the sender's inline
+    fallback get the same values, so a miss still sends the same bytes.
+    ``routing_strategy`` moves the requests onto the AIBrix-routed path, which is the only
+    path that reports a serving pod and is therefore the only way
     :func:`routing_balance` sees anything - at the cost of changing who picks the pod.
 
     With ``prompt_dir`` every prompt of this cell's schedule is built in a process pool
@@ -1791,6 +1796,11 @@ def drive_cell_schedule(
 
     # Before anything else, and before any thread or sidecar exists: the pool forks, and
     # the whole point is that this cost is paid in setup rather than inside the loop.
+    corpus_kwargs = {}
+    if corpus_lang is not None:
+        corpus_kwargs["corpus_lang"] = corpus_lang
+    if zh_ratio is not None:
+        corpus_kwargs["zh_ratio"] = float(zh_ratio)
     prompt_store = None
     if prompt_dir is not None:
         prompt_store = materialize_prompts(
@@ -1798,9 +1808,12 @@ def drive_cell_schedule(
             path=prompt_file_path(prompt_dir, cell_id),
             mode=prompt_mode or DEFAULT_MODE,
             processes=prompt_workers,
+            **corpus_kwargs,
         )
 
-    sender_kwargs = {} if prompt_mode is None else {"prompt_mode": prompt_mode}
+    sender_kwargs = dict(corpus_kwargs)
+    if prompt_mode is not None:
+        sender_kwargs["prompt_mode"] = prompt_mode
     sender = StreamingHttpSender(
         gateway_url,
         stream_call=stream_call,

@@ -145,6 +145,25 @@ class ModelTokenizer:
         """Token count as vLLM will report it in ``usage.prompt_tokens``."""
         return len(self.encode_plain(text)) + self.overhead
 
+    def cjk_token_count(self, text: str) -> int:
+        """Plain tokens of ``text`` that carry Chinese: the token decodes to text holding
+        a CJK character, or to U+FFFD (a byte-level piece of a multi-byte character).
+
+        This is how the Chinese share of a corpus prompt is *measured*, independently of
+        how :func:`tre_replayer.engine.corpus.budgeted_text` *budgeted* it. The U+FFFD
+        rule is exact for the corpus, whose only multi-byte characters are CJK. Token
+        offsets are not used: the fleet's Llama-3 tokenizer reports empty spans for some
+        merged CJK tokens.
+        """
+        from tre_replayer.engine.corpus import is_cjk
+
+        count = 0
+        for token_id in self.encode_plain(text):
+            piece = self._backend.decode([token_id], skip_special_tokens=True)
+            if any(ch == "\ufffd" or is_cjk(ch) for ch in piece):
+                count += 1
+        return count
+
 
 _CACHE: dict[str, ModelTokenizer] = {}
 _CACHE_LOCK = threading.Lock()

@@ -481,6 +481,9 @@ def _settings_for(campaigns: Sequence[Path], overrides: dict) -> tuple[Settings,
             "code": prov.get("code"),
             "registry_path": prov.get("registry_path"),
             "registry_sha256": prov.get("registry_sha256"),
+            # What the prompts were written in (run_provenance); None = a campaign from
+            # before the corpus option, i.e. English prompts.
+            "prompt": prov.get("prompt"),
             "status": _read_json(campaign / "campaign_status.json") or None,
         }
         if plan.get("design") == LADDER_DESIGN:

@@ -135,6 +135,7 @@ from scripts import admission_cap as admission
 from scripts import calibration_capture as capture
 from scripts import gen_calibration_schedules as gen
 from scripts import openloop
+from scripts import r3_grid
 from scripts import static_grid
 from scripts.openloop import LIVE_GRID_MS
 
@@ -644,6 +645,9 @@ def cell_command(cell: Cell, args, schedule_path: Path, output: Path) -> list[st
         "--guard-mode", args.guard_mode,
         "--min-slo-windows", str(args.min_slo_windows),
         "--prompt-dir", str(Path(args.out_dir) / "prompts"),
+        # Pinned rather than left to r3_grid's default, so the run manifest's record of
+        # what the prompts were written in (run_provenance) is what every cell used.
+        *prompt_corpus_cli_args(args),
         "--shed-policy", openloop.SHED_POLICY_VOID,
         "--max-p99-delay-ms", str(openloop.CALIBRATION_MAX_P99_DELAY_MS),
         "--max-model-error-rate", str(args.max_model_error_rate),
@@ -1903,6 +1907,26 @@ def git_state(worktree: Path) -> dict:
     }
 
 
+def prompt_corpus(args) -> dict:
+    """The prompt text a campaign's cells are driven with (``r3_grid --corpus-lang`` /
+    ``--zh-ratio``); absent attributes (callers that build ``args`` by hand) mean the
+    defaults."""
+    return {
+        "prompt_mode": r3_grid.PROMPT_MODE_DEFAULT,
+        "corpus_lang": str(getattr(args, "corpus_lang", None) or r3_grid.CORPUS_LANG_DEFAULT),
+        "zh_ratio": float(
+            r3_grid.ZH_RATIO_DEFAULT
+            if getattr(args, "zh_ratio", None) is None
+            else args.zh_ratio
+        ),
+    }
+
+
+def prompt_corpus_cli_args(args) -> list[str]:
+    corpus = prompt_corpus(args)
+    return ["--corpus-lang", corpus["corpus_lang"], "--zh-ratio", repr(corpus["zh_ratio"])]
+
+
 def run_provenance(args) -> dict:
     """What a run was made with, recorded before it drives anything."""
     registry = registry_path_for(args)
@@ -1924,6 +1948,9 @@ def run_provenance(args) -> dict:
         "step_ms": args.fit_step_ms,
         "instant_sample_ms": args.instant_sample_ms,
         "window_align": getattr(args, "fit_window_align", "grid"),
+        # What the prompts were written in: theta fitted on English prompts does not
+        # transfer to a mixed workload, so a later set (M, T14) must match its training.
+        "prompt": prompt_corpus(args),
         "label": labels[models[0]] if models else None,
         "label_by_model": labels,
         "boundary": {
@@ -2388,6 +2415,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     help="--t14-set: an amendment of --preregistration-json (sidecar <file>.sha256, "
                          "amends.sha256 = the preregistration's); its overrides (the v1-lambda "
                          "parameter file binding only) apply before the binding check")
+    ap.add_argument("--corpus-lang", default=r3_grid.CORPUS_LANG_DEFAULT,
+                    choices=list(r3_grid.CORPUS_LANGS),
+                    help="text of every cell's prompts (r3_grid --corpus-lang; recorded in the "
+                         "run manifest): mix (default), en, zh")
+    ap.add_argument("--zh-ratio", type=r3_grid._unit_interval, default=r3_grid.ZH_RATIO_DEFAULT,
+                    help="Chinese share of each prompt's tokens under --corpus-lang mix "
+                         "(default %(default)s)")
     ap.add_argument("--routing-strategy", default=None,
                     help="pass --routing-strategy to every r3_grid cell (route through the "
                          "gateway plugin with this strategy, e.g. least-gpu-cache); default: "

@@ -48,7 +48,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
-from tre_replayer.engine.prompts import DEFAULT_MODE, MODE_NATURAL, build_prompt
+from tre_replayer.engine.prompts import (
+    DEFAULT_CORPUS_LANG,
+    DEFAULT_MODE,
+    DEFAULT_ZH_RATIO,
+    MODE_NATURAL,
+    build_prompt,
+    check_corpus,
+)
 
 #: File name suffix for one cell's materialised prompts.
 PROMPT_FILE_SUFFIX = ".prompts.jsonl"
@@ -179,13 +186,20 @@ _WORKER: dict[str, Any] = {}
 
 
 def _init_worker(
-    mode: str, model: str, tokenizer_path: str | None, tokenizer: Any | None = None
+    mode: str,
+    model: str,
+    tokenizer_path: str | None,
+    tokenizer: Any | None = None,
+    corpus_lang: str = DEFAULT_CORPUS_LANG,
+    zh_ratio: float = DEFAULT_ZH_RATIO,
 ) -> None:
     from tre_replayer.engine import model_tokenizer
 
     _WORKER["mode"] = mode
     _WORKER["model"] = model
     _WORKER["tokenizer"] = tokenizer
+    _WORKER["corpus_lang"] = corpus_lang
+    _WORKER["zh_ratio"] = zh_ratio
     if mode == MODE_NATURAL and tokenizer is None:
         # Load this worker's own tokenizer rather than inheriting the parent's across the
         # fork: the Rust backend is shared memory after a fork, and a tokenizer that has
@@ -200,10 +214,15 @@ def _build_chunk(chunk: Sequence[tuple[str, int, str]]) -> list[tuple[str, Any]]
     mode = _WORKER["mode"]
     model = _WORKER["model"]
     tokenizer = _WORKER["tokenizer"]
+    corpus_lang = _WORKER["corpus_lang"]
+    zh_ratio = _WORKER["zh_ratio"]
     return [
         (
             request_id,
-            build_prompt(token_count, seed_key, mode=mode, model=model, tokenizer=tokenizer),
+            build_prompt(
+                token_count, seed_key, mode=mode, model=model, tokenizer=tokenizer,
+                corpus_lang=corpus_lang, zh_ratio=zh_ratio,
+            ),
         )
         for request_id, token_count, seed_key in chunk
     ]
@@ -234,6 +253,8 @@ def build_prompts(
     tokenizer: Any | None = None,
     tokenizer_path: str | None = None,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
+    corpus_lang: str = DEFAULT_CORPUS_LANG,
+    zh_ratio: float = DEFAULT_ZH_RATIO,
 ) -> dict[str, Any]:
     """``{request_id: prompt}`` for ``specs``, built off the send path.
 
@@ -245,6 +266,7 @@ def build_prompts(
     Ordering of the result is irrelevant to reproducibility: every prompt is a pure
     function of its own spec, so which worker built it cannot change what it is.
     """
+    check_corpus(corpus_lang, zh_ratio)
     if not specs:
         return {}
     by_model: dict[str, list[PromptSpec]] = {}
@@ -256,7 +278,7 @@ def build_prompts(
         workers = default_processes(len(model_specs)) if processes is None else int(processes)
         items = [(s.request_id, s.token_count, s.seed_key) for s in model_specs]
         if tokenizer is not None or workers <= 1:
-            _init_worker(mode, model, tokenizer_path, tokenizer)
+            _init_worker(mode, model, tokenizer_path, tokenizer, corpus_lang, zh_ratio)
             prompts.update(dict(_build_chunk(items)))
             continue
         import multiprocessing
@@ -268,7 +290,7 @@ def build_prompts(
         with context.Pool(
             processes=workers,
             initializer=_init_worker,
-            initargs=(mode, model, tokenizer_path),
+            initargs=(mode, model, tokenizer_path, None, corpus_lang, zh_ratio),
         ) as pool:
             for built in pool.imap_unordered(_build_chunk, _chunks(items, chunk_size)):
                 prompts.update(dict(built))
@@ -310,6 +332,8 @@ def materialize_prompts(
     tokenizer: Any | None = None,
     tokenizer_path: str | None = None,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
+    corpus_lang: str = DEFAULT_CORPUS_LANG,
+    zh_ratio: float = DEFAULT_ZH_RATIO,
 ) -> PromptStore:
     """Build every prompt of ``requests``, write them to ``path``, return the store.
 
@@ -325,6 +349,8 @@ def materialize_prompts(
         tokenizer=tokenizer,
         tokenizer_path=tokenizer_path,
         chunk_size=chunk_size,
+        corpus_lang=corpus_lang,
+        zh_ratio=zh_ratio,
     )
     write_prompt_file(path, specs, prompts)
     return PromptStore(prompts, path=path)

@@ -292,10 +292,29 @@ class Checkpoint:
 #: importing this module never requires the replayer package (guarded by a test).
 PROMPT_MODE_DEFAULT = "natural"
 PROMPT_MODES = ("token_ids", "text", "natural")
+#: Mirror of ``tre_replayer.engine.corpus.DEFAULT_CORPUS_LANG`` / ``CORPUS_LANGS`` /
+#: ``DEFAULT_ZH_RATIO`` (same reason, same guard test): what a natural prompt is written
+#: in - English and Chinese sentences interleaved, half the tokens Chinese by default.
+CORPUS_LANG_DEFAULT = "mix"
+CORPUS_LANGS = ("en", "zh", "mix")
+ZH_RATIO_DEFAULT = 0.5
+
+
+def _unit_interval(text: str) -> float:
+    """argparse type: a float within [0, 1]."""
+    value = float(text)
+    if not 0.0 <= value <= 1.0:
+        raise argparse.ArgumentTypeError(f"must be within [0, 1], got {text}")
+    return value
 
 
 def _make_prompt(
-    input_tokens: int, seed_key: str, mode: str = PROMPT_MODE_DEFAULT, model: str | None = None
+    input_tokens: int,
+    seed_key: str,
+    mode: str = PROMPT_MODE_DEFAULT,
+    model: str | None = None,
+    corpus_lang: str = CORPUS_LANG_DEFAULT,
+    zh_ratio: float = ZH_RATIO_DEFAULT,
 ):
     """One request's prompt: ``input_tokens`` long and unique to ``seed_key``.
 
@@ -308,7 +327,9 @@ def _make_prompt(
     """
     from tre_replayer.engine.prompts import build_prompt
 
-    return build_prompt(input_tokens, seed_key, mode=mode, model=model)
+    return build_prompt(
+        input_tokens, seed_key, mode=mode, model=model, corpus_lang=corpus_lang, zh_ratio=zh_ratio
+    )
 
 
 def build_raw_record(cell_id: str, send_ts_ms: int, res) -> dict:
@@ -378,6 +399,8 @@ def drive_cell(
     prompt_mode: str = PROMPT_MODE_DEFAULT,
     routing_strategy: Optional[str] = None,
     run_key: str = "r3",
+    corpus_lang: str = CORPUS_LANG_DEFAULT,
+    zh_ratio: float = ZH_RATIO_DEFAULT,
     now_ms: Callable[[], int] = lambda: int(time.time() * 1000),
 ) -> tuple[int, int]:
     """Drive cell.concurrency workers against the model for duration_s.
@@ -405,7 +428,9 @@ def drive_cell(
     sequence = itertools.count()
 
     def request_body(seq: int) -> bytes:
-        prompt = _make_prompt(cell.input_tokens, f"{run_key}|{cell_id}|{seq}", prompt_mode, model)
+        prompt = _make_prompt(
+            cell.input_tokens, f"{run_key}|{cell_id}|{seq}", prompt_mode, model, corpus_lang, zh_ratio
+        )
         return json.dumps({
             "model": model, "prompt": prompt, "max_tokens": cell.output_tokens,
             "temperature": 0, "ignore_eos": True,
@@ -773,6 +798,8 @@ def run_schedule_cell(args, store, spec, redis_client=None) -> tuple[list, "open
         instant_sampler=sampler,
         instant_interval_s=args.instant_sample_ms / 1000.0,
         prompt_mode=args.prompt_mode,
+        corpus_lang=getattr(args, "corpus_lang", CORPUS_LANG_DEFAULT),
+        zh_ratio=getattr(args, "zh_ratio", ZH_RATIO_DEFAULT),
         prompt_dir=prompt_dir,
         prompt_workers=args.prompt_workers,
         rps_timeline_path=rps_path,
@@ -849,6 +876,11 @@ def run_schedule_cell(args, store, spec, redis_client=None) -> tuple[list, "open
         # How the load was actually generated and routed. Recorded per cell because a
         # capacity number is only comparable to another one made the same way.
         "prompt_mode": args.prompt_mode,
+        # What the natural prompts were written in, and the Chinese share of their tokens
+        # (tre_replayer.engine.corpus): a capacity made with English prompts is not the
+        # capacity of a mixed workload.
+        "corpus_lang": getattr(args, "corpus_lang", CORPUS_LANG_DEFAULT),
+        "zh_ratio": getattr(args, "zh_ratio", ZH_RATIO_DEFAULT),
         "routing_strategy": args.routing_strategy,
         # What made this cell's arrivals and prompts its own (see openloop).
         "schedule_seed": args.schedule_seed,
@@ -1156,9 +1188,16 @@ def parse_args(argv: Optional[Sequence[str]] = None):
                     help="processes used to pre-build prompts (default: one per core, "
                          "capped); the tokenizer holds the GIL, so threads do not help")
     ap.add_argument("--prompt-mode", default=PROMPT_MODE_DEFAULT, choices=list(PROMPT_MODES),
-                    help="natural: English prose cut to the exact token count with the "
-                         "model's own tokenizer (default). token_ids: uniformly random "
+                    help="natural: prose (see --corpus-lang) cut to the exact token count "
+                         "with the model's own tokenizer (default). token_ids: uniformly random "
                          "ids - exact, but not language. text: nominal length only.")
+    ap.add_argument("--corpus-lang", default=CORPUS_LANG_DEFAULT, choices=list(CORPUS_LANGS),
+                    help="text of the natural prompts: mix (default) interleaves English and "
+                         "Chinese sentences with --zh-ratio of the tokens Chinese, counted "
+                         "with the model's own tokenizer; en / zh are monolingual")
+    ap.add_argument("--zh-ratio", type=_unit_interval, default=ZH_RATIO_DEFAULT,
+                    help="Chinese share of each natural prompt's tokens under --corpus-lang "
+                         "mix (default %(default)s)")
     ap.add_argument("--routing-strategy", default=None,
                     help="Route via the AIBrix gateway plugin with this strategy (e.g. "
                          "least-request) instead of the per-model HTTPRoute. This is the "
@@ -1402,7 +1441,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             raw_path=raw_path, instant_path=instant_path,
             instant_sampler=instant_sampler, instant_interval_s=args.instant_sample_ms / 1000.0,
             prompt_mode=args.prompt_mode, routing_strategy=args.routing_strategy,
-            run_key=run_key,
+            run_key=run_key, corpus_lang=args.corpus_lang, zh_ratio=args.zh_ratio,
         )
         windows = []
         w = start_ms

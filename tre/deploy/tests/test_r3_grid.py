@@ -364,6 +364,27 @@ def test_prompt_mode_default_mirrors_the_replayer_constant() -> None:
     assert tuple(r3_grid.PROMPT_MODES) == tuple(prompts.MODES)
 
 
+def test_corpus_defaults_mirror_the_replayer_constants() -> None:
+    """Same arrangement for what a natural prompt is written in: the default is the 1:1
+    Chinese/English mix, and the grid's CLI offers exactly the replayer's languages."""
+    from tre_replayer.engine import corpus
+
+    assert r3_grid.CORPUS_LANG_DEFAULT == corpus.DEFAULT_CORPUS_LANG == corpus.LANG_MIX
+    assert tuple(r3_grid.CORPUS_LANGS) == tuple(corpus.CORPUS_LANGS)
+    assert r3_grid.ZH_RATIO_DEFAULT == corpus.DEFAULT_ZH_RATIO == 0.5
+
+
+def test_zh_ratio_outside_the_unit_interval_is_a_usage_error() -> None:
+    import argparse
+
+    import pytest
+
+    assert r3_grid._unit_interval("0.25") == 0.25
+    for bad in ("-0.1", "1.01"):
+        with pytest.raises(argparse.ArgumentTypeError):
+            r3_grid._unit_interval(bad)
+
+
 def test_drive_cell_sends_a_distinct_prompt_of_the_requested_length_per_request() -> None:
     """One prompt per cell made prefill free under prefix caching; each request now
     carries its own, keyed by run/cell/sequence."""

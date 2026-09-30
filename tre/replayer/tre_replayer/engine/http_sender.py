@@ -45,7 +45,13 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from tre_replayer.engine.prompt_store import PromptStore, sender_seed_key
-from tre_replayer.engine.prompts import DEFAULT_MODE, build_prompt
+from tre_replayer.engine.prompts import (
+    DEFAULT_CORPUS_LANG,
+    DEFAULT_MODE,
+    DEFAULT_ZH_RATIO,
+    build_prompt,
+    check_corpus,
+)
 from tre_replayer.engine.schedule import ScheduledRequest
 
 #: Response headers, in preference order, that name the pod that served a request.
@@ -184,6 +190,8 @@ class StreamingHttpSender:
         max_in_flight: int = 512,
         prompt_mode: str = DEFAULT_MODE,
         prompt_store: PromptStore | None = None,
+        corpus_lang: str = DEFAULT_CORPUS_LANG,
+        zh_ratio: float = DEFAULT_ZH_RATIO,
         routing_strategy: str | None = None,
         now_ms: Callable[[], int] = _now_ms,
         mono: Callable[[], float] = time.monotonic,
@@ -193,6 +201,11 @@ class StreamingHttpSender:
         self._in = input_tokens_default
         self._out = output_tokens_default
         self._prompt_mode = prompt_mode
+        # The inline fallback must build exactly what the materialiser built, so the
+        # corpus travels with the sender as well as with the store.
+        check_corpus(corpus_lang, zh_ratio)
+        self._corpus_lang = corpus_lang
+        self._zh_ratio = float(zh_ratio)
         # Prompts built before the run started (tre_replayer.engine.prompt_store). Without
         # one the sender falls back to fitting each prompt inline, which costs milliseconds
         # of GIL-held tokenizer work inside on_wire_delay_ms - see that module's docstring.
@@ -255,6 +268,8 @@ class StreamingHttpSender:
             sender_seed_key(request.model, request.request_id),
             mode=self._prompt_mode,
             model=request.model,
+            corpus_lang=self._corpus_lang,
+            zh_ratio=self._zh_ratio,
         )
 
     def _send_one(self, request: ScheduledRequest, scheduled_ts: float, actual_ts: float) -> dict[str, Any]:
