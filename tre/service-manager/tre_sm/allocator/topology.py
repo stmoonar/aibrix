@@ -26,6 +26,9 @@ class K8sPodSnapshot:
     pod_uid: str | None = None
     phase: str = "Running"
     restart_count: int = 0
+    #: State of the vLLM engine container (``ENGINE_CONTAINER``): True = running,
+    #: False = waiting / terminated (holds no GPU memory), None = unknown.
+    engine_running: bool | None = None
 
 
 def pod_records_from_snapshots(

@@ -723,9 +723,10 @@ class ServiceManagerConfig:
     #: entry are kept and the recovery rechecks it after this long.
     wake_transport_recheck_s: float = 30.0
     #: ``service_manager.startup_admission.placeholder_max_s``: a Pod admitted at its
-    #: startup gate holds its GPUs (the ``starting`` lease) until it converged or is
-    #: gone - at most this long while it is not Ready and not verifiably awake
-    #: (e.g. CrashLoopBackOff); then the lease is released with an alert.
+    #: startup gate (or whose engine container restarted) holds its GPUs (the
+    #: ``starting`` lease) until it converged or is gone. The lease is released only
+    #: while the engine container is not running and does not read awake; an engine
+    #: running but not Ready past this long is alerted, the lease kept.
     startup_placeholder_max_s: float = 900.0
     #: ``service_manager.test_hooks``: honour the fault-injection keys
     #: ``tre:v2:sm:fault:<refuse_wake|fail_wake>:<node>/<gpu>`` (acceptance tests

@@ -23,7 +23,7 @@ from tre_sm.state.fleet_seed import seed_desired
 from tre_sm.state.fleet_store import FleetStateStore
 from tre_sm.state.gpu_leases import GpuLeaseStore
 from tre_sm.state.store import StateStore
-from tre_sm.state.wake_journal import WakeJournal
+from tre_sm.state.wake_journal import RestartLedger, WakeJournal
 
 
 LOG = logging.getLogger(__name__)
@@ -197,6 +197,7 @@ def create_app() -> FastAPI:
         ),
         sleep_journal=SleepJournal(redis_client),
         wake_journal=wake_journal,
+        restart_ledger=RestartLedger(redis_client),
         # Read only while registry service_manager.test_hooks is true.
         fault_redis=redis_client,
         supervisor_enabled=os.environ.get(

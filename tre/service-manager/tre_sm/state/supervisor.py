@@ -149,6 +149,15 @@ class FleetSupervisor:
                 reap_leases()
             except OperationBusy:
                 pass  # a writer (possibly starting a Pod) is active; next pass
+        reap_waking = getattr(self._service, "reap_orphan_waking_leases", None)
+        if callable(reap_waking):
+            try:
+                reap_waking()
+            except OperationBusy:
+                pass  # next pass
+        # The restart guard runs BEFORE the placeholder reaper: a crash-looping
+        # engine that starts again gets its placeholder in the same pass the
+        # reaper looks at it (review P2-2).
         guard_restarts = getattr(self._service, "guard_container_restarts", None)
         if callable(guard_restarts):
             try:

@@ -109,6 +109,38 @@ class WakeJournal:
             self._redis.hset(self._key, binding_id, json.dumps(record, sort_keys=True))
 
 
+class RestartLedger:
+    """Container restart counts last seen per Pod UID (Redis HASH
+    ``tre:v2:sm:restart_seen``, or process memory): the restart guard compares
+    against it, so a restart while the service-manager was down is still seen."""
+
+    def __init__(self, redis_client=None, *, key: str = rediskeys.SM_RESTART_SEEN_KEY) -> None:
+        self._redis = redis_client
+        self._key = key
+        self._memory: dict[str, int] = {}
+
+    def load(self) -> dict[str, int]:
+        if self._redis is None:
+            return dict(self._memory)
+        out: dict[str, int] = {}
+        for field_name, raw in (self._redis.hgetall(self._key) or {}).items():
+            try:
+                out[_text(field_name)] = int(_text(raw))
+            except (TypeError, ValueError):
+                continue
+        return out
+
+    def set(self, uid: str, count: int) -> None:
+        self._memory[uid] = int(count)
+        if self._redis is not None:
+            self._redis.hset(self._key, uid, int(count))
+
+    def drop(self, uid: str) -> None:
+        self._memory.pop(uid, None)
+        if self._redis is not None:
+            self._redis.hdel(self._key, uid)
+
+
 def _decode(raw) -> dict:
     try:
         value = json.loads(_text(raw))

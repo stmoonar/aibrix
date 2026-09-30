@@ -375,6 +375,12 @@ service_manager:
   startup_admission:
     gate_seen_s: 30
     drift_grace_s: 600
+    # 2026-09-30 (uncomment once every component runs that release): a startup /
+    # container-restart placeholder (starting lease) whose engine container is
+    # running but not Ready past this long is alerted (startup_placeholder_overdue);
+    # it is released only while the engine container is not running and does not
+    # read awake (alert startup_placeholder_released).
+    # placeholder_max_s: 900
   # 2026-09-30 (commented out: older service-managers ignore them, but keep the
   # defaults visible). The operation journal (tre:v2:sm:operations) keeps at
   # most max_records finished records, oldest dropped first.
@@ -385,19 +391,6 @@ service_manager:
   # tre:v2:sm:fault:fail_wake:<node>/<gpu> (the wake fails after /wake_up) are
   # honoured. Default false: the keys are never read.
   # test_hooks: false
-  # wake:
-  #   # A wake the journal recovery cannot read (/is_sleeping unknown) is kept this
-  #   # many supervisor passes, then rolled back with an alert (at once when its
-  #   # pod is not Ready).
-  #   recovery_unknown_attempts: 12
-  #   # A /wake_up that timed out may still wake the engine: its waking lease and
-  #   # journal entry are kept and rechecked after this long.
-  #   transport_recheck_s: 30
-  # startup_admission:
-  #   # A startup / container-restart placeholder (starting lease) is released
-  #   # after this long, or earlier when its Pod restarts again, while the Pod is
-  #   # not Ready and not verifiably awake (alert startup_placeholder_released).
-  #   placeholder_max_s: 900
   sleep:
     # Every sleep runs hide (routable=false + route-gen bump) -> gateway plugin ack
     # -> drain -> /sleep (D1/D2); no caller can skip a step, except that the paths in
@@ -493,6 +486,13 @@ service_manager:
     # sample for up to this long). Missing truth still fails closed. (The wake
     # gate never waits, see above.)
     truth_wait_s: 10
+    # 2026-09-30 (uncomment once every component runs that release): a wake the
+    # journal recovery cannot read (/is_sleeping unknown) is kept this many
+    # supervisor passes, then rolled back with an alert (at once when its pod is
+    # not Ready); a /wake_up that timed out keeps its waking lease and journal
+    # entry and is rechecked after transport_recheck_s.
+    # recovery_unknown_attempts: 12
+    # transport_recheck_s: 30
   create:
     # A cold start (scale-up create, sparse defrag destination) fails closed unless
     # gpu-truth shows every target GPU at or below total x (1 - the created

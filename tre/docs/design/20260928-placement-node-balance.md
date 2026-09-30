@@ -142,3 +142,18 @@ controller restart 只重启 controller，两者都要重启，否则 controller
   （controller）返回 `unfilled` 与 `refusals`，controller 视为未完成并按 refusals 冷却对应卡。hinted 唤醒带
   `avoid_gpus`（在途接力占用的卡），SM 不会把 wake 换到这些卡上；接力本身始终是精确 binding。
 
+### 7.2 复审加固（2026-09-30）
+
+- 占位只在引擎容器（`vllm-openai`）处于 Waiting/Terminated 且读不到醒着时释放；Running 但未 Ready 超过
+  `placeholder_max_s` 只告警（`startup_placeholder_overdue`）。supervisor 先跑重启守卫再跑回收，CrashLoop 中
+  每次重新启动都会先拿到新占位。被释放的 binding 记为可疑：它的卡不信任 gpu-truth（强制走居民探测，
+  Running 未 Ready 的居民即拒绝），一旦 `/is_sleeping` 可读就按 desired 收敛（读到睡则解除可疑）。
+- 重启计数持久化在 `tre:v2:sm:restart_seen`，SM 重启后首轮即可发现停机期间的原地重启（从未记录过的 pod
+  只记基线）。SM observe 模式下重启占位也做记账收敛（醒着转 awake lease、睡着释放），只是不补 sleep。
+- lease 释放失败（fence 丢失、Redis 出错）时保留 journal 交给恢复；另有 supervisor 回收没有 journal 对应的
+  waking lease（先读物理状态：睡或 pod 不在则释放，醒着转 awake lease，读不到则保留）。
+- `avoid_gpus` 只是派发那一刻的快照：派发之后才入队的接力不在其中。SM 在 donor 排空期间本来就拒绝在该卡
+  上唤醒（sleep reservation 覆盖该卡）；如果 donor 刚睡下、receiver 还没唤醒，SM 的换卡可能先占到这张卡，
+  这时 receiver 会收到结构化 409，controller 冷却这张卡并重新规划（donor 那次 sleep 就浪费了）。这个窗口
+  很短，本轮不加处理，验收时留意 `wake_refused` 与 `placement_retry` 事件。
+

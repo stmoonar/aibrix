@@ -377,21 +377,52 @@ def _placeholder_world(**pod_overrides):
     return world
 
 
-def test_startup_placeholder_released_past_the_bound_when_not_ready(caplog):
-    world = _placeholder_world()
-    assert world.service.reap_stale_startup_placeholders(now=0.0) == []
-    assert world.service.reap_stale_startup_placeholders(now=899.0) == []
+def test_startup_placeholder_released_only_when_the_engine_container_is_not_running(caplog):
+    world = _placeholder_world(engine_running=False)
     with caplog.at_level(logging.ERROR, logger="tre_sm.api.v2"):
-        assert world.service.reap_stale_startup_placeholders(now=901.0) == ["tp2/node-a/0,1"]
+        assert world.service.reap_stale_startup_placeholders(now=0.0) == ["tp2/node-a/0,1"]
     assert _leases(world) == {}
     assert _events(caplog, "startup_placeholder_released")
+    assert "tp2/node-a/0,1" in world.service._suspects  # its GPUs are suspects now
 
 
-def test_startup_placeholder_released_early_when_the_pod_crashloops():
-    world = _placeholder_world(restart_count=1)
+def test_startup_placeholder_running_but_not_ready_is_only_alerted_past_the_bound(caplog):
+    world = _placeholder_world(engine_running=True)
     assert world.service.reap_stale_startup_placeholders(now=0.0) == []
-    world.runtime.snapshots["tp2-new"] = dataclasses.replace(world.runtime.snapshots["tp2-new"], restart_count=2)
-    assert world.service.reap_stale_startup_placeholders(now=10.0) == ["tp2/node-a/0,1"]
+    with caplog.at_level(logging.ERROR, logger="tre_sm.api.v2"):
+        assert world.service.reap_stale_startup_placeholders(now=901.0) == []
+        assert world.service.reap_stale_startup_placeholders(now=950.0) == []
+    assert len(_events(caplog, "startup_placeholder_overdue")) == 1
+    assert "tp2/node-a/0,1" in _leases(world)
+
+
+def test_startup_placeholder_covers_every_load_of_a_crash_looping_engine():
+    """Review P2-2: the restart guard runs before the reaper; a new attempt always
+    gets a placeholder before the reaper looks at it."""
+    world = _placeholder_world(engine_running=True, restart_count=0)
+
+    class Supervisor:  # the supervisor pass order (checked below)
+        @staticmethod
+        def run_once():
+            world.service.guard_container_restarts()
+            world.service.reap_stale_startup_placeholders()
+
+    supervisor = Supervisor()
+    supervisor.run_once()  # baseline counts; loading: kept
+    assert "tp2/node-a/0,1" in _leases(world)
+    for attempt in range(1, 4):
+        # crash: the engine waits (CrashLoopBackOff) -> released
+        world.runtime.snapshots["tp2-new"] = dataclasses.replace(
+            world.runtime.snapshots["tp2-new"], engine_running=False
+        )
+        supervisor.run_once()
+        assert _leases(world) == {}, attempt
+        # next attempt starts loading -> placeholder again, kept while it runs
+        world.runtime.snapshots["tp2-new"] = dataclasses.replace(
+            world.runtime.snapshots["tp2-new"], engine_running=True, restart_count=attempt
+        )
+        supervisor.run_once()
+        assert _leases(world)["tp2/node-a/0,1"][0] == "starting", attempt
 
 
 def test_loading_placeholder_kept_while_the_pod_is_ready_or_awake():
@@ -436,12 +467,108 @@ def test_startup_placeholder_for_a_container_restart_becomes_awake_when_desired_
     assert world.state("pod-a") == "awake"
 
 
-def test_startup_placeholder_for_a_container_restart_observe_only_holds_the_gpus():
+def test_startup_placeholder_for_a_container_restart_observe_records_but_sleeps_nothing():
+    """Review P2-5: observe converges the bookkeeping (awake -> awake lease)."""
     world = _restart_world("sleeping", actuation="observe")
     result = world.service.guard_container_restarts()
-    assert result == {"placed": ["m1/node-a/0"], "converged": []}
-    assert _leases(world)["m1/node-a/0"][0] == "starting"
+    assert result == {"placed": ["m1/node-a/0"], "converged": ["m1/node-a/0"]}
+    assert _leases(world)["m1/node-a/0"][0] == "awake"
+    assert world.store.load().bindings[0].awake is True
     assert world.vllm.sleeping["10.0.0.1"] is False  # nothing slept in observe
+
+
+def test_startup_placeholder_restart_seen_across_an_sm_restart():
+    """Review P2-4: the restart counts are persisted; a restart while the SM was
+    down is detected at the first pass of the next SM."""
+    from tre_sm.state.wake_journal import RestartLedger
+
+    world = _world([pod("pod-a", "m1", (0,), ip="10.0.0.1", state="sleeping")],
+                   [_desired("m1/node-a/0", "m1", (0,), "sleeping")])
+    ledger = RestartLedger(world.redis)
+    world.service._restart_ledger = ledger
+    world.service.guard_container_restarts()
+    assert ledger.load() == {"uid-pod-a": 0}
+    # SM down; the engine container restarts meanwhile
+    world.runtime.snapshots["pod-a"] = dataclasses.replace(world.runtime.snapshots["pod-a"], restart_count=1)
+    fresh = ServiceManagerV2(
+        world.service._registry, world.store, runtime_ops=world.runtime, vllm_ops=world.vllm,
+        operation_coordinator=world.coordinator, fleet_store=world.fleet, gpu_leases=world.leases,
+        wake_journal=world.journal, restart_ledger=RestartLedger(world.redis),
+    )
+    fresh._safety_gate = world.service._safety_gate
+    world.vllm.physical_override["10.0.0.1"] = None  # still loading
+    assert fresh.guard_container_restarts()["placed"] == ["m1/node-a/0"]
+    assert ledger.load() == {"uid-pod-a": 1}
+
+
+# ------------------------------------------------------------ review P2-1 orphan waking leases
+
+
+def test_parallel_wake_abort_keeps_the_journal_when_the_lease_cannot_be_released(monkeypatch):
+    world = _world()
+    with world.coordinator.operation("put_binding_power"):
+        snapshot = world.store.load()
+        binding = next(b for b in snapshot.bindings if b.serve_id == "pod-a")
+        ticket = world.service._begin_binding_wake(binding, snapshot.bindings)
+        monkeypatch.setattr(world.leases, "release", lambda b: (_ for _ in ()).throw(ConnectionError("x")))
+        world.service._abort_prepared_wakes([ticket])
+    assert set(world.journal.entries()) == {"m1/node-a/0"}
+    assert world.service._wakes_in_flight == set()
+    monkeypatch.undo()
+    assert world.service.recover_wake_journal()["resolved"][0]["result"] == "rolled_back"
+    assert _leases(world) == {}
+
+
+def test_parallel_wake_failed_settle_keeps_the_journal(monkeypatch):
+    world = _world()
+    world.vllm.wake_up = lambda pod_ip, *, port=None: Result(False, "cuda oom")
+    monkeypatch.setattr(world.leases, "release", lambda b: (_ for _ in ()).throw(ConnectionError("x")))
+    with pytest.raises(WakeFailed):
+        world.service.put_binding_power("pod-a", awake=True)
+    assert set(world.journal.entries()) == {"m1/node-a/0"}
+    monkeypatch.undo()
+    assert world.service.recover_wake_journal()["resolved"][0]["result"] == "rolled_back"
+
+
+def test_parallel_wake_orphan_waking_leases_are_settled_by_physical_state():
+    world = _world(
+        [pod("pod-a", "m1", (0,), ip="10.0.0.1", state="sleeping"),
+         pod("pod-b", "m1", (1,), ip="10.0.0.2", state="sleeping"),
+         pod("pod-c", "m1", (2,), ip="10.0.0.3", state="sleeping")],
+        [_desired(f"m1/node-a/{g}", "m1", (g,), "sleeping") for g in (0, 1, 2)],
+    )
+    with fence(world.redis):
+        for g in (0, 1, 2):
+            world.leases.acquire(Binding(f"x{g}", "m1", Slot("node-a", (g,)), awake=False), phase="waking")
+    world.vllm.sleeping["10.0.0.2"] = False  # awake
+    world.vllm.physical_override["10.0.0.3"] = None  # unknown
+
+    assert sorted(world.service.reap_orphan_waking_leases()) == ["m1/node-a/0", "m1/node-a/1"]
+    assert {k: v[0] for k, v in _leases(world).items()} == {"m1/node-a/1": "awake", "m1/node-a/2": "waking"}
+
+
+# ------------------------------------------------------------ review P2-3 suspects
+
+
+def test_truth_fallback_forced_for_a_suspect_gpu_and_cleared_once_converged():
+    world = _placeholder_world(engine_running=False)
+    world.service.reap_stale_startup_placeholders(now=0.0)
+    world.redis.values["tre:gpu_truth:node-a"] = json.dumps({"seq": 1, "refresh_seq": 0, "gpus": [
+        {"uuid": f"GPU-{g}", "used_mib": 500, "total_mib": 40960} for g in range(4)
+    ]})
+    truth = RedisGpuTruth(world.redis)
+    assert world.service._untrusted_gpus("node-a", (0, 1), truth.node_truth(node="node-a")) == [0, 1]
+    # it comes back and reads awake; desired asleep -> slept (active), suspect cleared
+    world.runtime.snapshots["tp2-new"] = dataclasses.replace(
+        world.runtime.snapshots["tp2-new"], engine_running=True, ready=True
+    )
+    world.vllm.physical_override.pop("10.0.0.9")
+    world.vllm.sleeping["10.0.0.9"] = False
+    result = world.service.guard_container_restarts()
+    assert result["converged"] == ["tp2/node-a/0,1"]
+    assert world.vllm.sleeping["10.0.0.9"] is True
+    assert world.service._suspects == {}
+
 
 
 # ------------------------------------------------------------ P3-9 trim low-water
@@ -471,3 +598,29 @@ def test_operation_journal_trims_to_a_low_water_mark():
     assert len(redis.hashes[rediskeys.SM_OPERATIONS_KEY]) == 90
     assert coordinator.trim() == 0  # below the high-water mark: no full read
 
+
+
+def test_startup_placeholder_supervisor_runs_the_restart_guard_before_the_reaper():
+    from tre_sm.state.supervisor import FleetSupervisor
+
+    calls = []
+
+    class Service:
+        def __getattr__(self, name):
+            def record(*args, **kwargs):
+                calls.append(name)
+                return [] if name != "converge_startups" else {}
+            return record
+
+        def recover_stale_fleet_repairs(self, **kwargs):
+            return None
+
+        def detect_fleet_drift(self):
+            return []
+
+        def actuation_observe(self):
+            return False
+
+    FleetSupervisor(Service()).run_once()
+    assert calls.index("guard_container_restarts") < calls.index("reap_stale_startup_placeholders")
+    assert "reap_orphan_waking_leases" in calls and "recover_wake_journal" in calls

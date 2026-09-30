@@ -83,7 +83,7 @@ from tre_sm.state.fleet_store import DesiredBinding, FleetStateConflict, FleetSt
 from tre_sm.state.safety import ClusterSafetyGate, MaintenanceLockLost, NodePressureActive
 from tre_sm.state.gpu_leases import GpuLeaseConflict, GpuLeaseStore
 from tre_sm.state.store import StateConflict, StateFenceError, StateStore
-from tre_sm.state.wake_journal import WakeJournal
+from tre_sm.state.wake_journal import RestartLedger, WakeJournal
 from tre_sm.api.v1_compat import create_v1_compat_router
 
 
@@ -205,6 +205,7 @@ class ServiceManagerV2:
         sleep_reservations: SleepReservations | None = None,
         wake_journal: WakeJournal | None = None,
         fault_redis=None,
+        restart_ledger: RestartLedger | None = None,
     ) -> None:
         self._registry = registry
         # Registry placement policy shared with the controller planner (design
@@ -282,8 +283,16 @@ class ServiceManagerV2:
         #: P2-8 / P1-3: starting lease binding id -> (monotonic time this SM first
         #: saw it, restart count of its Pod then).
         self._placeholder_seen: dict[str, tuple[float, int]] = {}
-        #: P1-4: pod UID -> restart count last seen (container restarts in place).
-        self._restarts_seen: dict[str, int] = {}
+        #: P1-4: pod UID -> restart count last seen (container restarts in place);
+        #: persisted (review P2-4) and loaded at the first guard pass.
+        self._restart_ledger = restart_ledger or RestartLedger()
+        self._restarts_seen: dict[str, int] | None = None
+        #: Released placeholders (review P2-3): binding id -> (node, gpu ids, pod).
+        #: Their GPUs are never trusted from gpu-truth (the probe path decides) until
+        #: the pod reads asleep, is gone, or is converged.
+        self._suspects: dict[str, tuple[str, tuple[int, ...], str]] = {}
+        #: Placeholders already alerted for exceeding placeholder_max_s.
+        self._placeholder_alerted: set[str] = set()
         #: P1-4: binding ids holding a restart placeholder (starting lease) that the
         #: restart guard converges.
         self._restart_placeholders: dict[str, str] = {}
@@ -3456,8 +3465,13 @@ class ServiceManagerV2:
             try:
                 if self._gpu_leases is not None:
                     self._gpu_leases.release(ticket.binding)
-            except Exception:  # noqa: BLE001 - the waking lease expires on its own
-                LOG.exception("releasing the waking lease of %s failed", ticket.binding.binding_id)
+            except Exception:  # noqa: BLE001 - kept for the recovery (review P2-1)
+                # The waking lease does not expire: keep the journal entry so the
+                # recovery releases it (the engine was never woken).
+                LOG.exception("releasing the waking lease of %s failed; left to the recovery",
+                              ticket.binding.binding_id)
+                self._forget_wake(ticket.binding.binding_id)
+                continue
             self._wake_journal.end(ticket.binding.binding_id)
             self._forget_wake(ticket.binding.binding_id)
 
@@ -3501,13 +3515,18 @@ class ServiceManagerV2:
                 continue
 
     def reap_stale_startup_placeholders(self, *, now: float | None = None) -> list[str]:
-        """Supervisor pass (P2-8 / P1-3): a ``starting`` lease (the placeholder of a
-        Pod admitted at its startup gate, S2, or of a container restart, P1-4) is
-        released when its Pod is not Ready and not verifiably awake (/is_sleeping
-        true or unreadable) AND either this SM has seen the lease for more than
-        ``startup_admission.placeholder_max_s``, or the Pod restarted again since
-        the lease appeared (CrashLoopBackOff, an OOM while loading). A Ready Pod or
-        one that reads awake is left to the convergence. Under the writer lock
+        """Supervisor pass (P2-8 / P1-3, review P2-2 / P2-3): a ``starting`` lease
+        (the placeholder of a Pod admitted at its startup gate, S2, or of a container
+        restart, P1-4) is released only while its engine container holds no GPU
+        memory - the Pod is gone, or the ``vllm-openai`` container is waiting /
+        terminated (CrashLoopBackOff between attempts) and /is_sleeping does not
+        read awake. A running but not Ready engine keeps its placeholder; past
+        ``startup_admission.placeholder_max_s`` that is only alerted
+        (``startup_placeholder_overdue``). Every load of a crash-looping engine is
+        covered: the restart guard runs first in the supervisor pass and places a
+        new placeholder when the container starts again. A released binding becomes
+        a suspect (its GPUs are never trusted from gpu-truth: the resident probe
+        decides) until it reads asleep or is converged. Under the writer lock
         (wait 0); an alert per release."""
         if self._gpu_leases is None or self._runtime_ops is None:
             return []
@@ -3522,30 +3541,44 @@ class ServiceManagerV2:
             if binding_id not in live:
                 del self._placeholder_seen[binding_id]
         restarts = self._restart_counts_by_binding()
-        overdue = []
+
+        def placeholder(lease) -> Binding:
+            return Binding(
+                "startup-placeholder", lease.binding_id.split("/", 1)[0],
+                Slot(lease.node, tuple(int(g) for g in lease.gpu_ids)), awake=False,
+            )
+
+        releasable = []
         for lease in starting:
-            first, restarts_then = self._placeholder_seen.setdefault(
+            first, _restarts_then = self._placeholder_seen.setdefault(
                 lease.binding_id, (now, restarts.get(lease.binding_id, 0))
             )
-            crashlooping = restarts.get(lease.binding_id, 0) > restarts_then
-            if now - first > limit or crashlooping:
-                overdue.append(lease)
-        if not overdue:
+            verdict = self._placeholder_verdict(placeholder(lease))
+            if verdict is None:
+                releasable.append(lease)
+            elif verdict == "engine_running" and now - first > limit and lease.binding_id not in self._placeholder_alerted:
+                self._placeholder_alerted.add(lease.binding_id)
+                _log_event(
+                    "startup_placeholder_overdue", level=logging.ERROR,
+                    binding_id=lease.binding_id, held_s=round(now - first, 1),
+                    detail="engine running but not Ready past placeholder_max_s; placeholder kept",
+                )
+        if not releasable:
             return []
         released: list[str] = []
         with self._writer("reap_stale_startup_placeholders", wait_s=0.0):
-            for lease in overdue:
-                binding = Binding(
-                    "startup-placeholder", lease.binding_id.split("/", 1)[0],
-                    Slot(lease.node, tuple(int(g) for g in lease.gpu_ids)), awake=False,
-                )
-                verdict = self._placeholder_verdict(binding)
-                if verdict is not None:
+            for lease in releasable:
+                binding = placeholder(lease)
+                if self._placeholder_verdict(binding) is not None:  # changed meanwhile
                     continue
                 first, restarts_then = self._placeholder_seen.get(lease.binding_id, (now, 0))
                 self._gpu_leases.release(binding)
                 self._placeholder_seen.pop(lease.binding_id, None)
-                self._restart_placeholders.pop(lease.binding_id, None)
+                self._placeholder_alerted.discard(lease.binding_id)
+                pod_name = self._restart_placeholders.pop(lease.binding_id, None) or ""
+                self._suspects[lease.binding_id] = (
+                    lease.node, tuple(int(g) for g in lease.gpu_ids), pod_name
+                )
                 self._note_binding_power_change(binding)
                 _log_event(
                     "startup_placeholder_released",
@@ -3553,10 +3586,61 @@ class ServiceManagerV2:
                     binding_id=lease.binding_id, node=lease.node, gpu_ids=list(lease.gpu_ids),
                     held_s=round(now - first, 1),
                     restarts=restarts.get(lease.binding_id, 0), restarts_when_seen=restarts_then,
-                    detail="Pod not Ready and not verifiably awake (placeholder_max_s or restarting)",
+                    detail="engine container not running and not verifiably awake; binding now a suspect",
                 )
                 released.append(lease.binding_id)
         return released
+
+    def reap_orphan_waking_leases(self) -> list[str]:
+        """Supervisor pass (review P2-1): a ``waking`` lease (it does not expire)
+        whose binding has no wake journal entry and no wake running here - e.g. its
+        release failed after the entry was ended. Settled from the pod's physical
+        state: gone or asleep -> released; awake -> converted to the ``awake``
+        lease it should be (alert); unknown -> kept. Under the writer lock (wait 0)."""
+        if self._gpu_leases is None or self._runtime_ops is None or self._vllm_ops is None:
+            return []
+
+        def orphans() -> list:
+            try:
+                journal = self._wake_journal.entries()
+                leases = [lease for lease in self._gpu_leases.load() if lease.phase == "waking"]
+            except Exception:  # noqa: BLE001 - next pass
+                return []
+            with self._wakes_lock:
+                running = set(self._wakes_in_flight)
+            return [
+                lease for lease in leases if lease.binding_id not in journal and lease.binding_id not in running
+            ]
+
+        if not orphans():
+            return []
+        settled: list[str] = []
+        with self._writer("reap_orphan_waking_leases", wait_s=0.0):
+            for lease in orphans():
+                model = lease.binding_id.split("/", 1)[0]
+                binding = Binding("orphan-waking", model, Slot(lease.node, tuple(int(g) for g in lease.gpu_ids)),
+                                  awake=False)
+                pods = [
+                    snapshot for snapshot in self._runtime_ops.list_pod_snapshots(model=model)
+                    if self._snapshot_binding_id(snapshot) == lease.binding_id
+                ]
+                physical = True if not pods else None
+                for snapshot in pods:
+                    if snapshot.pod_ip:
+                        physical = self._vllm_ops.is_sleeping(snapshot.pod_ip, port=8000)
+                if physical is None:
+                    continue
+                if physical is True:
+                    self._gpu_leases.release(binding)
+                else:
+                    self._gpu_leases.acquire(binding, phase="awake")
+                self._note_binding_power_change(binding)
+                _log_event(
+                    "orphan_waking_lease_settled", level=logging.WARNING,
+                    binding_id=lease.binding_id, physically_awake=physical is False,
+                )
+                settled.append(lease.binding_id)
+        return settled
 
     def _restart_counts_by_binding(self) -> dict[str, int]:
         counts: dict[str, int] = {}
@@ -3593,6 +3677,13 @@ class ServiceManagerV2:
             snapshots = list(lister())
         except Exception:  # noqa: BLE001 - next pass
             return {"placed": [], "converged": []}
+        if self._restarts_seen is None:
+            # First pass: the persisted counts (review P2-4) - a restart while this
+            # SM was down is detected now; a pod never recorded is a baseline.
+            try:
+                self._restarts_seen = dict(self._restart_ledger.load())
+            except Exception:  # noqa: BLE001 - start from scratch
+                self._restarts_seen = {}
         restarted = []
         for snapshot in snapshots:
             uid = snapshot.pod_uid or snapshot.name
@@ -3600,15 +3691,19 @@ class ServiceManagerV2:
             previous = self._restarts_seen.get(uid)
             if previous is not None and count > previous:
                 restarted.append(snapshot)
-            else:
-                self._restarts_seen[uid] = count
+            elif previous != count:
+                self._record_restart_count(uid, count)
         live = {snapshot.pod_uid or snapshot.name for snapshot in snapshots}
         for uid in list(self._restarts_seen):
             if uid not in live:
                 del self._restarts_seen[uid]
+                try:
+                    self._restart_ledger.drop(uid)
+                except Exception:  # noqa: BLE001 - stale field, harmless
+                    pass
         placed: list[str] = []
         converged: list[str] = []
-        if not restarted and not self._restart_placeholders:
+        if not restarted and not self._restart_placeholders and not self._suspects:
             return {"placed": placed, "converged": converged}
         with self._writer("guard_container_restarts", wait_s=0.0):
             for snapshot in restarted:
@@ -3635,23 +3730,52 @@ class ServiceManagerV2:
                         since=int(time.time() * 1000),
                     )
                 self._note_binding_power_change(binding)
-                self._restarts_seen[snapshot.pod_uid or snapshot.name] = int(snapshot.restart_count or 0)
-            if not self.actuation_observe():
-                by_name = {snapshot.name: snapshot for snapshot in snapshots}
-                for binding_id, pod_name in list(self._restart_placeholders.items()):
-                    snapshot = by_name.get(pod_name)
-                    if snapshot is None:
-                        self._restart_placeholders.pop(binding_id, None)
-                        continue
-                    if self._converge_restart(snapshot):
-                        self._restart_placeholders.pop(binding_id, None)
-                        converged.append(binding_id)
+                self._suspects.pop(binding.binding_id, None)
+                self._record_restart_count(snapshot.pod_uid or snapshot.name, int(snapshot.restart_count or 0))
+            # Converge placeholders and suspects once /is_sleeping answers; observe
+            # (review P2-5) records what it finds (leases, store) but sleeps nothing.
+            observe = self.actuation_observe()
+            by_name = {snapshot.name: snapshot for snapshot in snapshots}
+            for binding_id, pod_name in list(self._restart_placeholders.items()):
+                snapshot = by_name.get(pod_name)
+                if snapshot is None:
+                    self._restart_placeholders.pop(binding_id, None)
+                    continue
+                if self._converge_restart(snapshot, observe=observe):
+                    self._restart_placeholders.pop(binding_id, None)
+                    converged.append(binding_id)
+            for binding_id, (node, gpus, pod_name) in list(self._suspects.items()):
+                snapshot = by_name.get(pod_name) or next(
+                    (s for s in snapshots if self._snapshot_binding_id(s) == binding_id), None
+                )
+                if snapshot is None:
+                    self._suspects.pop(binding_id, None)
+                    continue
+                if self._converge_restart(snapshot, observe=observe, suspect=True):
+                    self._suspects.pop(binding_id, None)
+                    converged.append(binding_id)
         return {"placed": placed, "converged": converged}
 
-    def _converge_restart(self, snapshot) -> bool:
-        """Converge a restarted container once /is_sleeping answers (writer lock
-        held). True when done."""
-        if not snapshot.pod_ip or not snapshot.ready or self._vllm_ops is None:
+    def _record_restart_count(self, uid: str, count: int) -> None:
+        self._restarts_seen[uid] = int(count)
+        try:
+            self._restart_ledger.set(uid, int(count))
+        except Exception:  # noqa: BLE001 - next pass writes it again
+            LOG.warning("persisting the restart count of %s failed", uid, exc_info=True)
+
+    @staticmethod
+    def _snapshot_binding_id(snapshot) -> str | None:
+        try:
+            return _binding_from_snapshot(snapshot).binding_id
+        except (KeyError, ValueError):
+            return None
+
+    def _converge_restart(self, snapshot, *, observe: bool = False, suspect: bool = False) -> bool:
+        """Converge a restarted container (or a suspect, review P2-3) once
+        /is_sleeping answers (writer lock held). True when done. ``observe``
+        (review P2-5): bookkeeping only - an awake engine desired asleep keeps an
+        ``awake`` lease and is recorded awake (alert), nothing is slept."""
+        if not snapshot.pod_ip or self._vllm_ops is None:
             return False
         physical = self._vllm_ops.is_sleeping(snapshot.pod_ip, port=8000)
         if physical is None:
@@ -3659,9 +3783,20 @@ class ServiceManagerV2:
         binding = replace(_binding_from_snapshot(snapshot), awake=False, hidden=False)
         desired = self._desired_power_of(binding.binding_id)
         if physical is True:
+            if suspect:
+                self._note_binding_power_change(binding)
+                return True  # asleep: nothing held, nothing to record
             self._gpu_leases.release(binding)
             self._runtime_ops.write_binding_annotations(binding, state=POD_STATE_SLEEPING)
             self._set_store_power(binding.binding_id, awake=False, hidden=False)
+        elif desired is not None and desired[0] == "sleeping" and observe:
+            self._gpu_leases.acquire(binding, phase="awake")
+            self._set_store_power(binding.binding_id, awake=True, hidden=True)
+            _log_event(
+                "restart_awake_desired_asleep_observe", level=logging.ERROR,
+                binding_id=binding.binding_id,
+                detail="SM actuation observe: awake engine recorded (awake lease), not slept",
+            )
         elif desired is not None and desired[0] == "sleeping":
             if self._sleep_primitive is None:
                 return False
@@ -3702,8 +3837,11 @@ class ServiceManagerV2:
                 try:
                     if self._vllm_ops.is_sleeping(snapshot.pod_ip, port=8000) is False:
                         return "pod_awake"
-                except Exception:  # noqa: BLE001 - unreadable: not running
+                except Exception:  # noqa: BLE001 - unreadable
                     pass
+            if getattr(snapshot, "engine_running", None) is not False:
+                # Running (loading) or unknown: it may hold GPU memory (review P2-3).
+                return "engine_running"
         return None
 
     def _forget_wake(self, binding_id: str) -> None:
@@ -3846,6 +3984,11 @@ class ServiceManagerV2:
             return
         if not ticket.woke:
             self._settle_failed_wake(ticket)
+            if ticket.lease_unsettled:
+                # The lease could not be released / converted (a lost fence, Redis):
+                # the recovery settles it (review P2-1).
+                ticket.left_to_recovery = True
+                return
             if ticket.physical is False:
                 # The compensating sleep did not put it to sleep: the engine is awake
                 # (awake lease held). Keep the entry: the recovery completes it as a
@@ -3916,7 +4059,8 @@ class ServiceManagerV2:
                         sort_keys=True,
                     )
                 )
-        except Exception:  # noqa: BLE001 - the waking lease expires on its own
+        except Exception:  # noqa: BLE001 - kept for the recovery (review P2-1)
+            ticket.lease_unsettled = True
             LOG.exception("settling the GPU lease of the failed wake of %s failed", binding.binding_id)
 
     def _compensating_sleep(self, ticket: "_WakeTicket") -> dict:
@@ -4115,7 +4259,12 @@ class ServiceManagerV2:
         kept: list[dict] = []
         with self._writer("wake_journal_recovery", wait_s=self._sm_config.commit_wait_s):
             for binding_id, entry in sorted(stale().items()):
-                result = self._recover_wake_entry(binding_id, entry)
+                try:
+                    result = self._recover_wake_entry(binding_id, entry)
+                except Exception as exc:  # noqa: BLE001 - one entry never stops the pass
+                    LOG.exception("recovering the wake of %s failed", binding_id)
+                    kept.append({"binding_id": binding_id, "result": f"error: {type(exc).__name__}"})
+                    continue
                 (kept if result == "physical_state_unknown" else resolved).append(
                     {"binding_id": binding_id, "result": result}
                 )
@@ -4464,12 +4613,20 @@ class ServiceManagerV2:
         reflect yet: it must answer the refresh request sent after the change
         (``refresh_seq``), or - an agent without refreshes - be a later publish
         (``seq``); a sample with neither is untrusted after any change."""
+        suspect = {
+            int(gpu)
+            for node, gpus, _pod in list(self._suspects.values())
+            if node == node_name
+            for gpu in gpus
+        }
         with self._power_marks_lock:
             marks = {gpu: self._power_marks.get((node_name, int(gpu))) for gpu in gpu_ids}
         refresh_seq = getattr(node_truth, "refresh_seq", None)
         seq = getattr(node_truth, "seq", None)
-        stale: list[int] = []
+        stale: list[int] = [int(gpu) for gpu in gpu_ids if int(gpu) in suspect]
         for gpu, mark in marks.items():
+            if int(gpu) in suspect:
+                continue
             if mark is None:
                 continue
             if mark.refresh_seq is not None and isinstance(refresh_seq, int):
@@ -5749,6 +5906,8 @@ class _WakeTicket:
     left_to_recovery: bool = False
     #: /wake_up raised (transport error / timeout): the server may still wake it.
     uncertain: bool = False
+    #: Settling the lease of a failed wake raised: journal entry kept.
+    lease_unsettled: bool = False
 
 
 @dataclass(frozen=True)

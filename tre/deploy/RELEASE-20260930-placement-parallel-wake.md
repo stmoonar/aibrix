@@ -31,6 +31,15 @@ Notes only. Nothing is built or deployed from this branch yet; the release proce
    refresh requests (`refresh_seq`); agents without them still work, but after a local
    power change their samples are trusted only once published again.
 
+## Known gap
+
+`avoid_gpus` is a snapshot taken when a hinted wake is dispatched: a donor ->
+receiver relay queued after that moment is not in it. The SM already refuses to
+wake on a GPU whose donor is draining (sleep reservation). In the short window
+between the donor sleep commit and the receiver wake, an SM substitution can
+take that GPU; the receiver then gets a structured 409 and the controller cools
+the GPU down and re-plans. See design note §7.2.
+
 ## New observable surface
 
 - `GET /v2/wake`: wake counters and journal.

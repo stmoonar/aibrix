@@ -37,6 +37,7 @@ def create_service_app(
     gateway_state: GatewayState | None = None,
     sleep_journal: SleepJournal | None = None,
     wake_journal: WakeJournal | None = None,
+    restart_ledger=None,
     fault_redis=None,
     supervisor_enabled: bool = False,
     supervisor_interval_s: float = 5.0,
@@ -58,6 +59,7 @@ def create_service_app(
             gateway_state=gateway_state,
             sleep_journal=sleep_journal,
             wake_journal=wake_journal,
+            restart_ledger=restart_ledger,
             fault_redis=fault_redis,
         )
     app = create_app(service)

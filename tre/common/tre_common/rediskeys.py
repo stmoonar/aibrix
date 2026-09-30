@@ -115,6 +115,9 @@ SM_WAKE_OPS_KEY = "tre:v2:sm:wake_ops"
 #: HASH of wake counters (wake_done_total, wake_failed_total, wake_parallel_max,
 #: wake_compensating_sleep_total, truth_fallback_total:<reason>, ...): GET /v2/wake.
 SM_WAKE_STATS_KEY = "tre:v2:sm:wake_stats"
+#: HASH field=pod UID, value=container restart count last seen by the SM's restart
+#: guard (a restart while the SM was down is detected at its next start).
+SM_RESTART_SEEN_KEY = "tre:v2:sm:restart_seen"
 #: STRING (any value, with a TTL) per GPU: test hooks of the service-manager, read
 #: only while registry service_manager.test_hooks is true. ``refuse_wake`` refuses
 #: a wake on the GPU (409 gpu_busy); ``fail_wake`` makes the wake fail after
