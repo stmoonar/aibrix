@@ -9,8 +9,18 @@ live part is ``[it, it + length)`` and ``U[i]`` of the paper is slot ``(it + i) 
   head ``s`` adds ``(P + i) / M`` at absolute iteration ``s + i`` for ``i`` in ``[0, D)``
   (the paper's ``U'_i = (U_i * M + (P + i)) / M``).
 * Finishing early subtracts what is still ahead of the head (``i`` in ``[it - s, D)``).
-* Running past ``D`` without finishing extends ``D`` by ``ext_frac * D_pred`` (paper:
-  0.2), repeatedly, while the head is at or beyond the planned end.
+* Running past ``D`` without finishing:
+
+  - ``out_len_is_upper_bound=True`` (default, ours): ``D_pred`` is the request's
+    ``max_tokens``, a hard cap in vLLM, so it cannot run past it; its load simply ends at
+    ``D``. A request still in the map ``D_pred * (1 + phantom_margin)`` iterations after
+    it started is a *phantom* (its ``done`` event was lost, or the iteration clock runs
+    ahead): it is dropped and counted (``phantom_dropped``), so lost ``done`` events do
+    not keep load in the map forever.
+  - ``out_len_is_upper_bound=False`` (the paper, section 4.3.1): extend ``D`` by
+    ``ext_frac * D_pred`` (paper: 0.2), repeatedly, while the head is at or beyond the
+    planned end. The paper needs this because its response-length predictor can
+    under-estimate; ``max_tokens`` cannot.
 * Advancing the head by ``k`` consumes (zeroes) ``k`` slots and reveals ``k`` new tail
   slots, which are filled from the requests still active. Contributions beyond the
   current tail are never written early, so a request longer than the ring (``D`` above
@@ -54,11 +64,18 @@ class ActiveRequest:
 
 
 class LookaheadMap:
-    def __init__(self, length: int, *, ext_frac: float = 0.2) -> None:
+    def __init__(self, length: int, *, ext_frac: float = 0.2, out_len_is_upper_bound: bool = True,
+                 phantom_margin: float = 0.25) -> None:
         if length < 1:
             raise ValueError("look-ahead map length must be >= 1")
+        if phantom_margin < 0:
+            raise ValueError("phantom_margin must be >= 0")
         self.length = int(length)
         self.ext_frac = float(ext_frac)
+        self.upper_bound = bool(out_len_is_upper_bound)
+        self.phantom_margin = float(phantom_margin)
+        #: Requests dropped as phantoms so far.
+        self.phantom_dropped = 0
         self.U = [0.0] * self.length
         self.it = 0
         self.requests: dict[Hashable, ActiveRequest] = {}
@@ -111,21 +128,37 @@ class LookaheadMap:
             req.D += step
             req.extensions += 1
 
-    def advance(self, k: int) -> None:
-        """Move the head ``k`` iterations forward."""
+    def _phantom(self, req: ActiveRequest) -> bool:
+        return self.it - req.start > req.D_pred * (1.0 + self.phantom_margin)
+
+    def advance(self, k: int) -> list[Hashable]:
+        """Move the head ``k`` iterations forward; returns the keys dropped as phantoms."""
         k = int(k)
         if k <= 0:
-            return
+            return []
         if k >= self.length:
             self.U = [0.0] * self.length
         else:
             for a in range(self.it, self.it + k):
                 self.U[a % self.length] = 0.0
         self.it += k
-        for req in self.requests.values():
-            if self.it >= req.end:
+        dropped: list[Hashable] = []
+        for key, req in self.requests.items():
+            if self.upper_bound:
+                if self._phantom(req):
+                    dropped.append(key)
+                    continue
+            elif self.it >= req.end:
                 self._extend(req)
             self._fill(req)
+        for key in dropped:
+            self.remove(key)
+        self.phantom_dropped += len(dropped)
+        return dropped
+
+    def total(self) -> float:
+        """Sum of the whole ring (0 when no request is left)."""
+        return sum(self.U)
 
     # ------------------------------------------------------------------- reads
 

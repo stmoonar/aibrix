@@ -366,3 +366,54 @@ def test_injected_oracle_is_never_replaced_by_the_marker_seed() -> None:
     p = make()
     p.decide(snap(1000, [pod("p0", 1000)], replay=ReplayInfo(t0_ms=0, trace_path="x/trace.json", seed=3)))
     assert p.oracle is ORACLE
+
+
+# ------------------------------------------------------------ review fixes (P1 / P2)
+
+
+def test_lost_done_events_are_dropped_as_phantoms() -> None:
+    events = [e for i in range(10) for e in load(f"r{i}", "p0", 1000, 100, 20)]
+    p = make()
+    p.decide(snap(1000, [pod("p0", 1000)], events))
+    assert amap(p).total() > 0 and len(p._models["m"].active) == 10
+    # 2 s at the 75 ms SLO TPOT = 26 iterations > 20 * 1.25: every done was lost
+    d = p.decide(snap(3000, [pod("p0", 3000)]))
+    assert p.anomalies["m"]["phantom_dropped"] == 10 and d["m"].inputs["anom"]["phantom_dropped"] == 10
+    assert p._models["m"].active == {} and amap(p).requests == {} and amap(p).total() == 0.0
+    # a late done is then just unknown, never negative load
+    p.decide(snap(3000, [pod("p0", 3000)], [ev("done", "r0", "p0", 3000)]))
+    assert p.anomalies["m"]["unknown_req"] == 1 and amap(p).total() == 0.0
+    # the paper's mode keeps extending them instead
+    q = make(out_len_is_upper_bound=False)
+    q.decide(snap(1000, [pod("p0", 1000)], events))
+    q.decide(snap(3000, [pod("p0", 3000)]))
+    assert len(amap(q).requests) == 10 and amap(q).total() > 0
+    assert amap(q).requests[("r0", "p0")].extensions >= 1
+    with pytest.raises(ValueError):
+        make(phantom_margin=-1)
+
+
+def test_event_after_the_scrape_is_not_out_of_order() -> None:
+    p = make()
+    p.decide(snap(1000, [pod("p0", 1000)]))
+    # the event was written 5 ms after the pod was scraped (before the stream read)
+    d = p.decide(snap(3000, [pod("p0", 2990)], load("r", "p0", 2995, 100, 50)))
+    assert p.anomalies["m"]["out_of_order"] == 0 and "anom" not in d["m"].inputs
+    assert amap(p).requests[("r", "p0")].start == amap(p).it
+    # the next scrape walks on from the event time
+    p.decide(snap(5000, [pod("p0", 4995)]))
+    assert p.anomalies["m"]["out_of_order"] == 0 and amap(p).it == 53  # 26 + 27 (carry)
+
+
+def test_second_replay_restarts_tier1_at_window_0() -> None:
+    p = make(tier1="oracle")
+    pods = [pod("p0", 1000)]
+    assert p.decide(snap(1000, pods, replay=REPLAY))["m"].reason == "tier1_window"
+    d = p.decide(snap(600_000, pods, replay=REPLAY))
+    assert d["m"].inputs["tier1"]["window"] == 1 and d["m"].desired == 1
+    second = ReplayInfo(t0_ms=5_000_000, trace_path=REPLAY.trace_path)
+    d = p.decide(snap(5_001_000, pods, replay=second))  # a new run, same shell
+    assert d["m"].reason == "tier1_window" and d["m"].inputs["tier1"]["window"] == 0
+    assert d["m"].desired == 2
+    d = p.decide(snap(5_003_000, pods, replay=second))
+    assert d["m"].reason == "hold"

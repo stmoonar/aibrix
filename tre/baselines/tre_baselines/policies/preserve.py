@@ -4,8 +4,10 @@ Not reproduced: the mLSTM workload forecaster (Tier-1 uses the replayed trace, s
 :mod:`preserve_tier1`), the DistilBERT response-length predictor (Tier-2 uses the request's
 ``max_tokens`` as its predicted output length) and the load-aware router.
 
-Tier-1, once per window of ``window_s`` (paper: 10 min), on the first tick whose window
-index ``floor(((now - t0) / 1000 + lead_s) / window_s)`` differs from the last one handled:
+Tier-1, once per window of ``window_s`` (paper: 10 min), on the first tick whose
+``(replay t0, window index)`` differs from the last one handled (window index
+``floor(((now - t0) / 1000 + lead_s) / window_s)``; a new replay marker restarts at window 0
+without a shell restart):
 ``N = ceil(max(P/(mu_p W), D/(mu_d W), (P+D)/(mu_t W)))`` -> target ``N``.
 
 Tier-2, every tick, per awake pod: the load-look-ahead map (:mod:`preserve_anticipator`)
@@ -29,7 +31,16 @@ Iterations vs wall clock (ours; the paper is iteration-based): a pod's head adva
 ``dt / TPOT_pod`` iterations, fractional part carried, with ``TPOT_pod`` the mean
 inter-token latency between the pod's last two scrapes (``d itl_sum / d itl_count``) or the
 model's TPOT SLO when there is no sample. Each event first advances its pod to the event's
-Redis time, so a prefill that finished early in the tick lands where it belongs.
+Redis time, so a prefill that finished early in the tick lands where it belongs; the tick
+then walks each head to ``max(scrape time, last event time)`` (an event written between the
+scrape and the stream read is not "out of order").
+
+Output length (ours): the predicted output is the request's ``max_tokens``, which vLLM
+enforces, so by default (``out_len_is_upper_bound: true``) there is no virtual extension
+and a request still active ``D_pred * (1 + phantom_margin)`` iterations after its prefill
+is dropped as a phantom (lost ``done``; anomaly ``phantom_dropped``). The paper's 0.2 * D
+extension (``ext_frac``) exists because its length predictor can under-estimate; it is
+used only with ``out_len_is_upper_bound: false``.
 
 Params (``config.policy_params``, example in ``examples/preserve.yaml``):
 
@@ -54,7 +65,10 @@ lookahead_iters       100                   paper (l)
 kv_high               0.95                  paper
 overload_frac         0.10                  paper
 t_f                   0.30                  paper (T_f)
-ext_frac              0.2                   paper (virtual extension)
+ext_frac              0.2                   paper (virtual extension); only with
+                                            ``out_len_is_upper_bound: false``
+out_len_is_upper_bound true                 ours: max_tokens is a hard cap -> no extension
+phantom_margin        0.25                  ours: drop a request after D_pred * (1 + this)
 kv_capacity_tokens    {}                    ours: M per model when the pod lacks cache_config
 hold_mode             target                ours: target (keep the last target) | awake
 down_grace_s          60                    ours: no scale-down this soon after a window start
@@ -110,7 +124,8 @@ class _ModelState:
     #: active request key -> pod holding it.
     active: dict[tuple[str, Optional[str]], str] = field(default_factory=dict)
     target: Optional[int] = None
-    t1_window: Optional[int] = None
+    #: (replay t0_ms, window index) of the last Tier-1 firing.
+    t1_window: Optional[tuple[int, int]] = None
     t1_fired_ms: Optional[int] = None
     first_ms: Optional[int] = None
     credited: set[str] = field(default_factory=set)
@@ -168,6 +183,10 @@ class PreServePolicy:
         self.overload_frac = float(params.get("overload_frac", 0.10))
         self.t_f = float(params.get("t_f", 0.30))
         self.ext_frac = float(params.get("ext_frac", 0.2))
+        self.out_len_is_upper_bound = bool(params.get("out_len_is_upper_bound", True))
+        self.phantom_margin = float(params.get("phantom_margin", 0.25))
+        if self.phantom_margin < 0:
+            raise ValueError("preserve: phantom_margin must be >= 0")
         if self.l < 1 or self.map_factor < 1.0 or not 0 < self.t_f <= 1 or self.ext_frac <= 0:
             raise ValueError("preserve: need lookahead_iters >= 1, map_factor >= 1, 0 < t_f <= 1, ext_frac > 0")
         self.kv_capacity = _per_model(params.get("kv_capacity_tokens"), float)
@@ -199,7 +218,7 @@ class PreServePolicy:
         return float(cap) if cap and cap > 0 else None
 
     @staticmethod
-    def _advance_to(ps: _PodState, t_ms: int, anom: Counter) -> None:
+    def _advance_to(st: _ModelState, ps: _PodState, t_ms: int, anom: Counter) -> None:
         if ps.last_ms is None:
             ps.last_ms = int(t_ms)
             return
@@ -210,7 +229,11 @@ class PreServePolicy:
         k = int(math.floor(k_float))
         ps.carry = k_float - k
         ps.last_ms = int(t_ms)
-        ps.amap.advance(k)
+        dropped = ps.amap.advance(k)
+        for key in dropped:
+            st.active.pop(key, None)
+        if dropped:
+            anom["phantom_dropped"] += len(dropped)
 
     # ------------------------------------------------------------- Tier-2 feed
 
@@ -231,7 +254,10 @@ class PreServePolicy:
                 if M is None:
                     skipped[name] = "no_kv_capacity"
                     continue
-                ps = _PodState(amap=LookaheadMap(self.map_length(ms.model), ext_frac=self.ext_frac), M=M)
+                amap = LookaheadMap(self.map_length(ms.model), ext_frac=self.ext_frac,
+                                    out_len_is_upper_bound=self.out_len_is_upper_bound,
+                                    phantom_margin=self.phantom_margin)
+                ps = _PodState(amap=amap, M=M)
                 st.pods[name] = ps
             s, c = pod.counters.get("itl_sum"), pod.counters.get("itl_count")
             tpot = None
@@ -288,7 +314,7 @@ class PreServePolicy:
                 old_pod = st.active.pop(key)
                 if old_pod in st.pods:
                     st.pods[old_pod].amap.remove(key)
-            self._advance_to(ps, int(e.ts_ms), anom)
+            self._advance_to(st, ps, int(e.ts_ms), anom)
             ps.amap.add(key, int(P), int(D), ps.M, ts_ms=int(e.ts_ms))
             st.active[key] = pod
             return
@@ -298,7 +324,7 @@ class PreServePolicy:
                 pod = st.active.pop(akey)
                 ps = st.pods.get(pod)
                 if ps is not None:
-                    self._advance_to(ps, int(e.ts_ms), anom)
+                    self._advance_to(st, ps, int(e.ts_ms), anom)
                     ps.amap.remove(akey)
                 return
             info_key = key if key in st.arr else ((e.req_id, None) if (e.req_id, None) in st.arr else None)
@@ -396,11 +422,13 @@ class PreServePolicy:
         for pod in ms.pods:
             ps = st.pods.get(pod.pod)
             if ps is not None:
-                self._advance_to(ps, int(pod.scraped_at_ms), anom)
+                # An event may carry a Redis time a little after the scrape (written between
+                # the scrape and the stream read): the head is already there, not out of order.
+                self._advance_to(st, ps, max(int(pod.scraped_at_ms), ps.last_ms or 0), anom)
         for name in ms.unscraped:
             ps = st.pods.get(name)
             if ps is not None:
-                self._advance_to(ps, int(snap.now_ms), anom)
+                self._advance_to(st, ps, max(int(snap.now_ms), ps.last_ms or 0), anom)
         self._expire(st, int(snap.now_ms), anom)
 
         # Tier-2 read: U[0:l] of each evaluated pod.
@@ -435,8 +463,9 @@ class PreServePolicy:
         t1_info: dict = {"inactive": t1_off} if t1_off else {"window": idx}
         down_info: Optional[str] = None
 
-        if idx is not None and idx != st.t1_window:
-            st.t1_window = idx
+        t1_key = None if idx is None else (int(snap.replay.t0_ms), idx)
+        if t1_key is not None and t1_key != st.t1_window:
+            st.t1_window = t1_key
             st.t1_fired_ms = int(snap.now_ms)
             N, t1_info = self._tier1_n(ms.model, idx)
             st.credited = set(overloaded)
@@ -456,7 +485,7 @@ class PreServePolicy:
                 st.target = clamp(base + len(fresh))
                 reason = "tier2_overload"
             else:
-                down_key: Hashable = (idx if idx is not None
+                down_key: Hashable = (t1_key if t1_key is not None
                                       else ("wall", int(snap.now_ms) // int(self.window_s * 1000)))
                 since = max(st.t1_fired_ms or 0, st.first_ms or 0)
                 if not max_us:
