@@ -149,25 +149,60 @@ def _busy_snap(specs, awake):
 
 def test_busy_def_at_cap():
     pol = policy(busy_def="at_cap", b_init=10)
-    # p0 at cap via running, p1 via running+waiting, p2 idle -> IBP 2/3 > 1/3
+    # p0 at cap via running, p1 via running+waiting, p2 idle -> busy 2 -> ceil(2 / (1/3)) = 6
     d = one(pol, _busy_snap([(10, 0), (5, 5), (3, 0)], awake=3))
-    assert d.inputs["busy"] == 2 and d.reason == "ibp_above_theta" and d.desired == 4
+    assert d.inputs["busy"] == 2 and d.reason == "ibp_target" and d.desired == 6
+    assert d.inputs["IBP"] == pytest.approx(0.6667) and d.inputs["target"] == 6
 
 
 def test_busy_def_nonidle():
     pol = policy(busy_def="nonidle", b_init=10)
-    d = one(pol, _busy_snap([(1, 0), (0, 0), (0, 0)], awake=3))  # 1/3 == theta
-    assert d.inputs["busy"] == 1 and d.reason == "ibp_at_theta" and d.desired == 3
+    d = one(pol, _busy_snap([(1, 0), (0, 0), (0, 0)], awake=3))  # busy 1 at theta 1/3 -> 3
+    assert d.inputs["busy"] == 1 and d.reason == "ibp_target" and d.desired == 3
     d = one(policy(busy_def="nonidle", b_init=10), _busy_snap([(0, 0)] * 3, awake=3))
-    assert d.reason == "ibp_below_theta" and d.desired == 2
+    assert d.reason == "ibp_target" and d.desired == 1  # nothing busy: floor of one instance
 
 
 def test_theta_per_model_and_default():
     pol = policy(busy_def="nonidle", theta={M: 0.5, "*": 0.9})
-    d = one(pol, _busy_snap([(1, 0), (0, 0)], awake=2))  # IBP .5 == theta
-    assert d.reason == "ibp_at_theta" and d.inputs["theta"] == 0.5
+    d = one(pol, _busy_snap([(1, 0), (0, 0)], awake=2))  # busy 1 / .5 = 2
+    assert d.desired == 2 and d.inputs["theta"] == 0.5
     d = one(policy(busy_def="nonidle", theta={"other": 0.1}), _busy_snap([(1, 0)] * 2, awake=2))
     assert d.inputs["theta"] == pytest.approx(0.3333)  # default 1/3
+    assert d.desired == 6
+
+
+def test_exact_multiples_do_not_round_up():
+    for theta in (1 / 3, 0.3333333333, 0.25, 0.2, 0.5):
+        pol = policy(busy_def="nonidle", theta={"*": theta})
+        for busy in range(1, 9):
+            d = one(pol, _busy_snap([(1, 0)] * busy, awake=busy))
+            assert d.desired == busy * round(1 / theta), (theta, busy, d.desired)  # theta = 1/k
+
+
+def _closed_loop(theta, busy, awake0, ticks=40):
+    """Constant ``busy`` pods, the rest idle; the model follows the decision each tick."""
+    pol = policy(busy_def="nonidle", theta={"*": theta})
+    awake, seen = awake0, []
+    for t in range(ticks):
+        specs = [(1, 0)] * busy + [(0, 0)] * max(0, awake - busy)
+        d = pol.decide(snap([pod(f"p{i}", t * 2000, 0, 0, 0, running=r, waiting=w)
+                             for i, (r, w) in enumerate(specs)], awake=awake, t_ms=t * 2000))[M]
+        seen.append(d.desired)
+        awake = max(1, min(8, d.desired))
+    return seen
+
+
+@pytest.mark.parametrize("theta", [0.3333, 0.3333333333, 0.37, 0.45])
+@pytest.mark.parametrize("busy", [1, 2])
+def test_constant_load_never_flip_flops(theta, busy):
+    for awake0 in (1, 2, 3, 5, 8):
+        seen = _closed_loop(theta, busy, awake0)
+        assert len(set(seen[1:])) == 1, (theta, busy, awake0, seen[:10])  # settled after one tick
+        target = seen[-1]
+        assert target * theta >= busy - 1e-6  # IBP = busy / target <= theta
+    # the old +-1 rule flip-flopped here: theta .37, busy 1 -> N 2 (IBP .5) up, N 3 (.33) down
+    assert set(_closed_loop(0.37, 1, 2)) == {3}
 
 
 def test_bad_params():
@@ -175,6 +210,8 @@ def test_bad_params():
         policy(busy_def="bogus")
     with pytest.raises(ValueError):
         policy(alpha=0)
+    with pytest.raises(ValueError):
+        policy(theta={"*": 0})
 
 
 def test_deterministic_and_json_able():

@@ -8,7 +8,12 @@ Local loop (per pod, every tick), from deltas of the pod's cumulative counters:
   TBP = thr_prev/thr only when the cap was binding on the previous tick, else
   neutral (dropped from the max; a literal 1 would forbid growth);
   LocalBP = max(LBP, TBP); LocalBP < 1: B <- a*B/LocalBP + (1-a)*B, else B <- max(1, B/2).
-Global loop: IBP = busy pods / N; IBP > theta -> awake+1, IBP < theta -> awake-1.
+Global loop: IBP = busy pods / N; desired = max(1, ceil(busy / theta)) (reason
+  ``ibp_target``): the instance count at which IBP would sit at theta, i.e. the paper's
+  over-provisioning level (section 5.2: keep enough idle instances that a burst of
+  1/theta x fits). It depends only on ``busy``, so a constant load gives a constant target;
+  a +-1 step on ``IBP > theta`` / ``IBP < theta`` instead flip-flops whenever theta is not
+  exactly 1/k (e.g. theta 0.37, busy 1: N=2 -> .5 > .37 up, N=3 -> .33 < .37 down).
 
 Params (``config.policy_params``; see ``examples/chiron.yaml``):
 
@@ -24,6 +29,7 @@ theta           {"*": 1/3}   paper's 3x example as the default; per model via ch
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional
 
@@ -33,6 +39,8 @@ from tre_baselines.snapshot import ClusterSnapshot, ModelSnapshot, PodSnapshot
 DEFAULT_ALPHA = 0.5
 DEFAULT_THETA = 1.0 / 3.0  # the paper's 3x-burst example
 DEFAULT_B = 256  # not in paper; chosen: order of the engine default max-num-seqs
+#: busy / theta within this of an integer is that integer (theta written as 0.3333333333).
+_CEIL_TOL = 1e-6
 BUSY_DEFS = ("at_cap", "nonidle")
 _NEEDED = ("gen_tokens", "itl_sum", "itl_count")
 
@@ -67,6 +75,8 @@ class ChironPolicy:
         if not isinstance(theta, Mapping):
             theta = {"*": theta}
         self.theta = {str(k): float(v) for k, v in theta.items()}
+        if any(not 0.0 < v <= 1.0 for v in self.theta.values()):
+            raise ValueError("chiron: theta must be in (0, 1]")
         self._state: dict[str, dict[str, _PodState]] = {}
 
     def _theta_for(self, model: str) -> float:
@@ -146,15 +156,9 @@ class ChironPolicy:
                 info.update(B=_num(st.B, 2), busy=bool(is_busy))
                 per_pod[pod.pod] = info
             ibp = busy / n
-            # +-1 per tick: not specified in paper; chosen.
-            if ibp > theta:
-                desired, reason = ms.awake + 1, "ibp_above_theta"
-            elif ibp < theta:
-                desired, reason = ms.awake - 1, "ibp_below_theta"
-            else:
-                desired, reason = ms.awake, "ibp_at_theta"
-            out[model] = Decision(desired, reason, {
+            desired = max(1, int(math.ceil(busy / theta - _CEIL_TOL)))
+            out[model] = Decision(desired, "ibp_target", {
                 "IBP": _num(ibp), "theta": _num(theta), "N": n, "busy": busy,
-                "busy_def": self.busy_def, "pods": per_pod,
+                "target": desired, "busy_def": self.busy_def, "pods": per_pod,
             })
         return out
