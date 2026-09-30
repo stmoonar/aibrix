@@ -20,6 +20,12 @@ Every path is proxied transparently (streaming kept). On top of that:
   engine-rendered prompt ids (exact seam) and the chunks are reshaped back into chat
   chunks. The two segments are stitched (one id / created / model, one [DONE], merged
   usage with the ORIGINAL prompt_tokens, stop strings re-checked across the seam).
+* The loopback hop to vLLM is kept healthy: pooled connections idle at most
+  ``upstream_keepalive_s`` (below vLLM's own keep-alive), a request whose pooled
+  connection is dropped before the first response byte is re-sent once on a fresh
+  connection, and if the engine still cannot be reached before anything was sent the
+  client gets ``503`` + ``Retry-After`` (``error.layer = "sidecar_upstream"``), or the
+  request goes through the gateway when nothing listens locally / the pod is asleep.
 * ``POST /sleep`` (and ``/pause``) must carry ``X-TRE-Hidden: 1`` (sent by the
   service-manager after it hid the pod), else 409: fail closed.
 * ``GET /tre-reissue/metrics`` (Prometheus text), ``GET /tre-reissue/state``, one JSON log
@@ -43,6 +49,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import errno
 import json
 import os
 import sys
@@ -171,6 +178,20 @@ class Config:
     #: (GET /v1/models, cached).
     max_model_len: int = 0
     probe_interval_s: float = 2.0
+    #: Idle keep-alive of the pooled connections to the local vLLM. Must stay BELOW vLLM's
+    #: own keep-alive (``upstream_server_keepalive_s``): uvicorn closes an idle connection
+    #: after that, and a pooled connection reused just as the server closes it fails before
+    #: the first response byte (Server disconnected / Connection reset by peer).
+    upstream_keepalive_s: float = 2.0
+    #: vLLM's keep-alive (its VLLM_HTTP_TIMEOUT_KEEP_ALIVE; vLLM's default is 5 s). The
+    #: manifests render it from the vLLM container env; only used for the startup check.
+    upstream_server_keepalive_s: float = 5.0
+    #: Re-sends on a FRESH connection when a request to the local vLLM failed at the
+    #: connection level (disconnect / ECONNRESET / EPIPE) before any response byte and
+    #: before anything was written to the client. 0 = off.
+    local_reconnect_attempts: int = 1
+    #: Minimum seconds between two WARNING lines of the same kind (rate limit).
+    warn_interval_s: float = 10.0
     connect_timeout_s: float = 6.0
     #: Total timeout of proxied control / metadata calls (/health, /metrics, ...).
     proxy_timeout_s: float = 60.0
@@ -233,6 +254,9 @@ class Config:
         )
         if cfg.max_depth < 0 or cfg.retry_attempts < 1:
             raise ValueError("TRE_REISSUE_MAX_DEPTH must be >= 0 and TRE_REISSUE_RETRY_ATTEMPTS >= 1")
+        if not cfg.upstream_keepalive_s > 0 or cfg.local_reconnect_attempts < 0:
+            raise ValueError("TRE_REISSUE_UPSTREAM_KEEPALIVE_S must be > 0 and "
+                             "TRE_REISSUE_LOCAL_RECONNECT_ATTEMPTS >= 0")
         if not cfg.gateway_url.startswith(("http://", "https://")):
             raise ValueError(f"TRE_GATEWAY_URL must be an http(s) URL, got {cfg.gateway_url!r}")
         return cfg
@@ -329,6 +353,9 @@ class Metrics:
         self.forward = Histogram(OVERHEAD_BUCKETS_S)
         self.relay = Histogram(OVERHEAD_BUCKETS_S)
         self.gap = Histogram(GAP_BUCKETS_S)
+        #: Fresh-connection re-sends to the local engine, per attempt (see
+        #: ``ReissueSidecar._local_request``).
+        self.reconnect: dict[str, int] = {"ok": 0, "fail": 0}
 
     def observe_added(self, added: "AddedTime") -> None:
         added.stop()
@@ -390,6 +417,15 @@ class Metrics:
         ]
         for name, value in sorted(self.events.items()):
             lines.append(f'tre_reissue_events_total{{model="{model}",event="{name}"}} {value}')
+        lines += [
+            "# HELP tre_reissue_local_reconnect_total Re-sends to the local engine on a fresh "
+            "connection after the pooled connection failed before any response byte (keep-alive "
+            "race: disconnect / ECONNRESET / EPIPE), per attempt.",
+            "# TYPE tre_reissue_local_reconnect_total counter",
+        ]
+        for result in ("ok", "fail"):
+            lines.append(f'tre_reissue_local_reconnect_total{{model="{model}",result="{result}"}} '
+                         f'{self.reconnect[result]}')
         lines += [
             "# HELP tre_reissue_sleeping 1 while the local engine is (going to) sleep.",
             "# TYPE tre_reissue_sleeping gauge",
@@ -771,6 +807,39 @@ def _retry_after(value: str | None) -> float | None:
         return None
 
 
+def is_stale_connection_error(exc: BaseException) -> bool:
+    """A request on an ESTABLISHED (pooled) connection failed at the connection level
+    before any response byte: the server dropped it (``Server disconnected``), reset it
+    (ECONNRESET) or the write hit a closed socket (EPIPE / aiohttp's "Cannot write to
+    closing transport"). Typical cause: the connection was reused just as the server's
+    keep-alive timer closed it, so the server never saw the request. A failed CONNECT
+    (``ClientConnectorError``: refused, unreachable) is not one of these. aiohttp wraps a
+    failed body write as ``ClientOSError(errno=None, "Can not write request body")`` with
+    the reset as its ``__cause__``, so the cause chain is followed."""
+    if isinstance(exc, aiohttp.ClientConnectorError):
+        return False
+    seen = 0
+    current: BaseException | None = exc
+    while current is not None and seen < 4:
+        if isinstance(current, aiohttp.ServerDisconnectedError):
+            return True
+        if isinstance(current, (ConnectionResetError, BrokenPipeError)):
+            return True
+        if isinstance(current, OSError) and current.errno in (errno.ECONNRESET, errno.EPIPE):
+            return True
+        current = current.__cause__
+        seen += 1
+    return False
+
+
+def is_connection_refused(exc: BaseException) -> bool:
+    """Nothing listens on the local engine's port (vLLM not (yet / any more) up)."""
+    if not isinstance(exc, aiohttp.ClientConnectorError):
+        return False
+    os_error = getattr(exc, "os_error", None)
+    return isinstance(os_error, ConnectionRefusedError) or exc.errno == errno.ECONNREFUSED
+
+
 def _client_gone(request: web.Request) -> bool:
     transport = request.transport
     return transport is None or transport.is_closing()
@@ -800,7 +869,12 @@ class ReissueSidecar:
         self.state = SleepState()
         self.metrics = Metrics(cfg.model)
         self.local: aiohttp.ClientSession | None = None
+        #: One connection per request (force_close): the re-send after a stale pooled
+        #: connection must not pick another pooled connection of the same age.
+        self.local_fresh: aiohttp.ClientSession | None = None
         self.gateway: aiohttp.ClientSession | None = None
+        #: Rate-limited WARNING lines: kind -> (last emitted, monotonic; suppressed since).
+        self._warned: dict[str, tuple[float, int]] = {}
         self._monitor_task: asyncio.Task | None = None
         self._max_model_len: int | None = cfg.max_model_len or None
         self._sleep_error_mark = json.dumps(cfg.sleeping_error_type).encode()
@@ -812,9 +886,23 @@ class ReissueSidecar:
     # ---------------------------------------------------------------- lifecycle
 
     async def on_startup(self, app: web.Application) -> None:
-        timeout = aiohttp.ClientTimeout(total=None, sock_connect=self.cfg.connect_timeout_s)
+        cfg = self.cfg
+        timeout = aiohttp.ClientTimeout(total=None, sock_connect=cfg.connect_timeout_s)
+        if cfg.upstream_keepalive_s >= cfg.upstream_server_keepalive_s:
+            _log({"level": "WARNING", "event": "tre_upstream_keepalive_unsafe", "model": cfg.model,
+                  "pod": cfg.pod_name, "upstream_keepalive_s": cfg.upstream_keepalive_s,
+                  "upstream_server_keepalive_s": cfg.upstream_server_keepalive_s,
+                  "detail": "the sidecar's keep-alive to the local vLLM must be below vLLM's "
+                            "(VLLM_HTTP_TIMEOUT_KEEP_ALIVE), else pooled connections are reused "
+                            "while vLLM closes them; fresh-connection re-sends still cover it"})
+        # keepalive_timeout < vLLM's keep-alive: the pool drops an idle connection before
+        # the server can close it under a reused request.
         self.local = aiohttp.ClientSession(
-            connector=aiohttp.TCPConnector(limit=0), timeout=timeout, auto_decompress=False
+            connector=aiohttp.TCPConnector(limit=0, keepalive_timeout=cfg.upstream_keepalive_s),
+            timeout=timeout, auto_decompress=False,
+        )
+        self.local_fresh = aiohttp.ClientSession(
+            connector=aiohttp.TCPConnector(limit=0, force_close=True), timeout=timeout, auto_decompress=False
         )
         self.gateway = aiohttp.ClientSession(
             connector=aiohttp.TCPConnector(limit=0), timeout=timeout, auto_decompress=False
@@ -824,7 +912,7 @@ class ReissueSidecar:
     async def on_cleanup(self, app: web.Application) -> None:
         if self._monitor_task is not None:
             self._monitor_task.cancel()
-        for session in (self.local, self.gateway):
+        for session in (self.local, self.local_fresh, self.gateway):
             if session is not None:
                 await session.close()
 
@@ -894,6 +982,65 @@ class ReissueSidecar:
             _log({"event": "tre_state_corrected", "model": self.cfg.model, "pod": self.cfg.pod_name,
                   "change": change, "source": source})
 
+    # ------------------------------------------------------ local engine calls
+
+    async def _local_request(self, method: str, url: str, **kwargs: Any) -> aiohttp.ClientResponse:
+        """``self.local.request`` (the response headers are in when it returns), re-sent
+        on a fresh connection up to ``local_reconnect_attempts`` times when the attempt
+        failed with :func:`is_stale_connection_error` (keep-alive race; the engine never
+        saw the request). Callers invoke it before writing anything to the client, and the
+        body is ``bytes``, so the re-send is exact. Raises the last error."""
+        try:
+            return await self.local.request(method, url, **kwargs)
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+            if not is_stale_connection_error(exc) or self.cfg.local_reconnect_attempts < 1:
+                raise
+            first = exc
+        last: BaseException = first
+        for _ in range(self.cfg.local_reconnect_attempts):
+            try:
+                resp = await self.local_fresh.request(method, url, **kwargs)
+            except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+                self.metrics.reconnect["fail"] += 1
+                last = exc
+                if not is_stale_connection_error(exc):
+                    break  # refused / timed out: another fresh connection does not help
+                continue
+            self.metrics.reconnect["ok"] += 1
+            self._warn("local_reconnect", {"event": "tre_local_reconnect", "result": "ok", "path": url,
+                                           "error": f"{type(first).__name__}: {first}"[:300]})
+            return resp
+        raise last
+
+    def _warn(self, kind: str, record: dict) -> None:
+        """A WARNING line, at most one per ``warn_interval_s`` per ``kind``; the next line
+        says how many were suppressed in between."""
+        now = time.monotonic()
+        last, suppressed = self._warned.get(kind, (None, 0))
+        if last is not None and now - last < self.cfg.warn_interval_s:
+            self._warned[kind] = (last, suppressed + 1)
+            return
+        self._warned[kind] = (now, 0)
+        _log({"level": "WARNING", **record, "model": self.cfg.model, "pod": self.cfg.pod_name,
+              "suppressed": suppressed})
+
+    def _upstream_failed(self, request: web.Request, depth: int, exc: BaseException, *,
+                         status: int, account: bool = True) -> web.Response:
+        """The local engine could not be reached before anything was sent to the client.
+        503 + Retry-After (``error.layer = sidecar_upstream``): nothing reached the engine
+        either, so the client (or Envoy) may simply resend; 502 only where kept for
+        compatibility (connection refused on a plain proxied path)."""
+        error = f"{type(exc).__name__}: {exc}"[:300]
+        if account:
+            self._account("failed", "upstream_unavailable", request, depth, error=error, log=False)
+        if account or status == 503:  # not: a probe finding the engine not (yet) listening
+            self._warn(f"upstream_{status}", {"event": "tre_upstream_unavailable", "status": status,
+                                              "path": request.path, "error": error})
+        if status == 503:
+            return _error(503, f"local engine connection failed before any response ({error})",
+                          "ServiceUnavailable", headers={"Retry-After": "1"}, layer="sidecar_upstream")
+        return _error(status, f"upstream unavailable: {error}", "BadGateway", layer="sidecar_upstream")
+
     # ------------------------------------------------------------------ routing
 
     async def handle(self, request: web.Request) -> web.StreamResponse:
@@ -938,7 +1085,7 @@ class ReissueSidecar:
 
     async def _proxy_local(self, request: web.Request, body: bytes, *, timeout: float | None):
         try:
-            resp = await self.local.request(
+            resp = await self._local_request(
                 request.method, self.cfg.upstream_url + request.path_qs, data=body if body else None,
                 headers=forward_headers(request.headers, HOP_BY_HOP), allow_redirects=False,
                 timeout=self._timeout(timeout),
@@ -946,7 +1093,13 @@ class ReissueSidecar:
         except asyncio.TimeoutError:
             return _error(504, "upstream timed out", "GatewayTimeout")
         except (aiohttp.ClientError, OSError) as exc:
-            return _error(502, f"upstream unavailable: {exc}", "BadGateway")
+            # Only client API traffic is counted: probes of a starting / dead engine
+            # (/health, /metrics, ...) would flood tre_reissue_total{kind="failed"}.
+            api = request.path.startswith(self.cfg.retry_path_prefix)
+            depth = _int_header(request.headers.get(self.cfg.depth_header))
+            if is_stale_connection_error(exc):
+                return self._upstream_failed(request, depth, exc, status=503, account=api)
+            return self._upstream_failed(request, depth, exc, status=502, account=api)
         return await self._relay(request, resp)
 
     async def _relay(
@@ -1001,8 +1154,8 @@ class ReissueSidecar:
     async def _control_call(self, request: web.Request, body: bytes, drop: frozenset[str]):
         """(status, payload, headers) or (None, error, {})."""
         try:
-            async with self.local.post(
-                self.cfg.upstream_url + request.path_qs, data=body if body else None,
+            async with await self._local_request(
+                "POST", self.cfg.upstream_url + request.path_qs, data=body if body else None,
                 headers=forward_headers(request.headers, drop), timeout=self._timeout(self.cfg.control_timeout_s),
             ) as resp:
                 return resp.status, await resp.read(), response_headers(resp.headers)
@@ -1070,8 +1223,8 @@ class ReissueSidecar:
         """Proxied /is_sleeping; its answer also re-syncs the sleeping mark."""
         epoch = self.state.epoch
         try:
-            async with self.local.get(
-                self.cfg.upstream_url + request.path_qs, headers=forward_headers(request.headers, HOP_BY_HOP),
+            async with await self._local_request(
+                "GET", self.cfg.upstream_url + request.path_qs, headers=forward_headers(request.headers, HOP_BY_HOP),
                 timeout=self._timeout(self.cfg.proxy_timeout_s),
             ) as resp:
                 payload, status, headers = await resp.read(), resp.status, response_headers(resp.headers)
@@ -1181,13 +1334,18 @@ class ReissueSidecar:
         headers = forward_headers(request.headers, self._local_drop)
         added.forwarded()
         try:
-            resp = await self.local.request(
+            # Nothing has been written to the client yet: a stale pooled connection is
+            # re-sent on a fresh one inside _local_request.
+            resp = await self._local_request(
                 "POST", cfg.upstream_url + request.path_qs, data=raw, headers=headers,
             )
         except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
             if self.state.active:
-                return await self._retry(request, raw, depth, "local_unavailable_sleeping")
-            return _error(502, f"upstream unavailable: {exc}", "BadGateway")
+                return await self._retry(request, raw, depth, "local_unavailable_sleeping", added)
+            if is_connection_refused(exc):
+                # The engine is not listening (crashed / restarting): another instance.
+                return await self._retry(request, raw, depth, "local_refused", added)
+            return self._upstream_failed(request, depth, exc, status=503)
         if resp.status == 503:
             payload = await resp.read()
             resp.release()
@@ -1721,8 +1879,12 @@ class ReissueSidecar:
                 choice.pop(cfg.generated_ids_field, None)
                 choice.pop(cfg.prompt_ids_field, None)
 
-    def _account(self, kind: str, reason: str, request: web.Request, depth: int, **extra: Any) -> None:
+    def _account(self, kind: str, reason: str, request: web.Request, depth: int, *, log: bool = True,
+                 **extra: Any) -> None:
+        """Count, and (``log``) one JSON line; high-rate kinds log through ``_warn``."""
         self.metrics.count(kind, reason)
+        if not log:
+            return
         record = {"event": "tre_reissue", "ts": round(time.time(), 3), "model": self.cfg.model,
                   "pod": self.cfg.pod_name, "kind": kind, "reason": reason, "path": request.path, "depth": depth}
         for key, value in extra.items():
@@ -1782,11 +1944,14 @@ def _target(resp: aiohttp.ClientResponse) -> str:
     return resp.headers.get("target-pod") or resp.headers.get("target-pod-ip") or ""
 
 
-def _error(status: int, message: str, err_type: str, *, headers: dict[str, str] | None = None) -> web.Response:
-    return web.json_response(
-        {"error": {"message": f"tre-reissue sidecar: {message}", "type": err_type, "code": status}},
-        status=status, headers=headers,
-    )
+def _error(status: int, message: str, err_type: str, *, headers: dict[str, str] | None = None,
+           layer: str | None = None) -> web.Response:
+    """An OpenAI-style error. ``layer`` names the hop that failed (``sidecar_upstream``:
+    sidecar -> local vLLM) so clients / replayers can tell it from engine errors."""
+    error: dict[str, Any] = {"message": f"tre-reissue sidecar: {message}", "type": err_type, "code": status}
+    if layer:
+        error["layer"] = layer
+    return web.json_response({"error": error}, status=status, headers=headers)
 
 
 def build_app(cfg: Config) -> web.Application:
@@ -1803,7 +1968,10 @@ def main() -> None:
     cfg = Config.from_env()
     _log({"event": "tre_reissue_start", "model": cfg.model, "pod": cfg.pod_name, "listen": cfg.listen_port,
           "upstream": cfg.upstream_url, "gateway": cfg.gateway_url, "enabled": cfg.enabled,
-          "max_depth": cfg.max_depth, "retry_attempts": cfg.retry_attempts})
+          "max_depth": cfg.max_depth, "retry_attempts": cfg.retry_attempts,
+          "upstream_keepalive_s": cfg.upstream_keepalive_s,
+          "upstream_server_keepalive_s": cfg.upstream_server_keepalive_s,
+          "local_reconnect_attempts": cfg.local_reconnect_attempts})
     web.run_app(build_app(cfg), host=cfg.listen_host, port=cfg.listen_port, access_log=None, print=None,
                 backlog=2048, handle_signals=True)
 

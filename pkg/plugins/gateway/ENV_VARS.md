@@ -89,6 +89,31 @@ unaffected. `max_tokens` / `min_tokens` are the continuation sender's responsibi
 
 ---
 
+## TRE reissue sidecar (model pods, not this package)
+
+The retry / continuation sidecar (`tre/reissue/tre_reissue/sidecar.py`) sits between the
+gateway and vLLM in every model pod; every `Config` field `foo` is `TRE_REISSUE_FOO` (full
+list in `tre/docs/design/20260927-reissue-sidecar-v2.md` §8). Listed here are the settings
+of the loopback hop sidecar -> local vLLM, because they decide what the gateway sees when
+that hop fails. The manifests render them from the registry (`reissue:` and `vllm.env`).
+
+| Variable | Container | Type | Default | Description |
+|---|---|---|---|---|
+| `VLLM_HTTP_TIMEOUT_KEEP_ALIVE` | vLLM | int (s) | `5` (vLLM); registry `75` | uvicorn keep-alive of vLLM's HTTP server: an idle connection is closed after it. Changing it changes the model Deployments (pods must be recreated). |
+| `TRE_REISSUE_UPSTREAM_KEEPALIVE_S` | sidecar | float (s) | `2` | Idle keep-alive of the sidecar's pooled connections to vLLM; must be below `VLLM_HTTP_TIMEOUT_KEEP_ALIVE` (registry validation; WARNING at sidecar startup), else a pooled connection can be reused while vLLM closes it. Registry `reissue.upstream_keepalive_s`. |
+| `TRE_REISSUE_UPSTREAM_SERVER_KEEPALIVE_S` | sidecar | float (s) | `5` | vLLM's keep-alive as rendered on the vLLM container; only used for the startup check. |
+| `TRE_REISSUE_LOCAL_RECONNECT_ATTEMPTS` | sidecar | int | `1` | Re-sends on a fresh connection when a request to vLLM failed with a disconnect / ECONNRESET / EPIPE before the first response byte (nothing sent to the client yet). `0` = off. Registry `reissue.local_reconnect_attempts`. |
+| `TRE_REISSUE_WARN_INTERVAL_S` | sidecar | float (s) | `10` | Rate limit of the WARNING lines for re-sends and upstream failures (one per kind per interval, with a `suppressed` count). |
+
+If the hop still fails before anything was sent to the client, the sidecar answers
+**503 + `Retry-After: 1`** with `{"error": {"type": "ServiceUnavailable", "layer":
+"sidecar_upstream"}}` (it used to answer 502); when nothing listens on vLLM's port, or the
+pod is asleep, the request is instead retried through the gateway with
+`x-tre-exclude-pod: <pod>`. Counted in `tre_reissue_total{kind="failed",reason="upstream_unavailable"}`
+and `tre_reissue_local_reconnect_total{result="ok|fail"}`.
+
+---
+
 ## Response Processing
 
 | Variable | Type | Default | Description | Source |

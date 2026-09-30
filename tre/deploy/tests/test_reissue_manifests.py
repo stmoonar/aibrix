@@ -80,6 +80,10 @@ def test_sidecar_is_on_by_default_and_owns_the_serving_port(tmp_path):
     # the stable gateway Service (registry gateway: section), in-cluster DNS, no IP
     assert env["TRE_GATEWAY_URL"] == "http://tre-gateway.envoy-gateway-system.svc.cluster.local:80"
     assert env["TRE_REISSUE_REQUIRE_HIDDEN_HEADER"] == "true"
+    # loopback keep-alive: the sidecar's pool (2 s) below vLLM's (default 5 s when unset)
+    assert env["TRE_REISSUE_UPSTREAM_KEEPALIVE_S"] == "2"
+    assert env["TRE_REISSUE_UPSTREAM_SERVER_KEEPALIVE_S"] == "5"
+    assert env["TRE_REISSUE_LOCAL_RECONNECT_ATTEMPTS"] == "1"
     assert env["POD_NAME"] == {"fieldRef": {"fieldPath": "metadata.name"}}
     assert env["NVIDIA_VISIBLE_DEVICES"] == "void"
     assert sidecar["command"] == ["python3", "/opt/tre-reissue/sidecar.py"]
@@ -148,9 +152,32 @@ def test_registry_overrides_reach_the_sidecar(tmp_path):
     assert command[command.index("--port") + 1] == "9001"
 
 
+def test_keepalive_settings_reach_the_sidecar(tmp_path):
+    registry = _registry(tmp_path, textwrap.dedent("""
+        vllm:
+          env: {VLLM_HTTP_TIMEOUT_KEEP_ALIVE: '75'}
+        reissue:
+          upstream_keepalive_s: 1.5
+          local_reconnect_attempts: 2
+    """))
+    for deployment in build_deployments(registry):
+        containers = _containers(deployment)
+        assert _env(containers["vllm-openai"])["VLLM_HTTP_TIMEOUT_KEEP_ALIVE"] == "75"
+        env = _env(containers[REISSUE_CONTAINER])
+        assert env["TRE_REISSUE_UPSTREAM_KEEPALIVE_S"] == "1.5"
+        assert env["TRE_REISSUE_UPSTREAM_SERVER_KEEPALIVE_S"] == "75"
+        assert env["TRE_REISSUE_LOCAL_RECONNECT_ATTEMPTS"] == "2"
+
+
 @pytest.mark.parametrize(
     "extra,needle",
     [
+        ("reissue: {upstream_keepalive_s: 0}\n", "upstream_keepalive_s must be > 0"),
+        ("reissue: {local_reconnect_attempts: -1}\n", "local_reconnect_attempts"),
+        # the pool must be BELOW vLLM's keep-alive (default 5 s) of every model
+        ("reissue: {upstream_keepalive_s: 5}\n", "must be below vLLM's VLLM_HTTP_TIMEOUT_KEEP_ALIVE"),
+        ("vllm: {env: {VLLM_HTTP_TIMEOUT_KEEP_ALIVE: '2'}}\n", "must be below vLLM's VLLM_HTTP_TIMEOUT_KEEP_ALIVE"),
+        ("vllm: {env: {VLLM_HTTP_TIMEOUT_KEEP_ALIVE: '7.5'}}\n", "integer number of seconds"),
         ("reissue: {vllm_port: 8000}\n", "vllm_port"),
         ("reissue: {gateway_url: '10.0.0.1:80'}\n", "gateway_url"),
         ("reissue: {max_depth: -1}\n", "max_depth"),
@@ -207,6 +234,16 @@ def test_repo_registry_and_committed_manifests_carry_the_sidecar():
 
     live = _parse_registry(yaml.safe_load(params["data"]["registry.yaml"]))
     assert live.reissue() == replace(spec)
+    for model in registry.models():
+        assert live.vllm_env_for(live.model(model.name)) == registry.vllm_env_for(model)
+    # loopback keep-alive (2026-09-30 smoke 502s): vLLM keeps idle connections 75 s, the
+    # sidecar pools them 2 s
+    for deployment in build_deployments(registry):
+        containers = _containers(deployment)
+        assert _env(containers["vllm-openai"])["VLLM_HTTP_TIMEOUT_KEEP_ALIVE"] == "75"
+        env = _env(containers[REISSUE_CONTAINER])
+        assert env["TRE_REISSUE_UPSTREAM_SERVER_KEEPALIVE_S"] == "75"
+        assert env["TRE_REISSUE_UPSTREAM_KEEPALIVE_S"] == "2"
 
 
 def test_gateway_url_follows_the_gateway_service_settings(tmp_path):

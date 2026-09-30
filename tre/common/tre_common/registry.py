@@ -316,6 +316,17 @@ SLEEP_MODE_BACKENDS = ("cumem", "pinned_weights")
 DEFAULT_VLLM_ENV: dict[str, str] = {"VLLM_SERVER_DEV_MODE": "1"}
 #: Set per binding by the manifest generator; the registry may not set them.
 RESERVED_VLLM_ENV = frozenset({"NVIDIA_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES"})
+#: vLLM's HTTP keep-alive (uvicorn ``timeout_keep_alive``): an idle client connection is
+#: closed by vLLM after this many seconds; vLLM's default when the variable is unset.
+VLLM_KEEP_ALIVE_ENV = "VLLM_HTTP_TIMEOUT_KEEP_ALIVE"
+VLLM_DEFAULT_KEEP_ALIVE_S = 5.0
+
+
+def vllm_keep_alive_s(env: dict[str, str]) -> float:
+    """vLLM's effective keep-alive for a container environment. vLLM parses the variable
+    with ``int()``, so anything else is a ValueError here too."""
+    raw = env.get(VLLM_KEEP_ALIVE_ENV)
+    return VLLM_DEFAULT_KEEP_ALIVE_S if raw in (None, "") else float(int(raw))
 
 
 @dataclass(frozen=True)
@@ -367,6 +378,13 @@ class ReissueConfig:
     max_depth: int = 3
     #: Gateway attempts per retry / continuation.
     retry_attempts: int = 4
+    #: Idle keep-alive (s) of the sidecar's pooled connections to the local vLLM. Must be
+    #: below vLLM's own keep-alive (``VLLM_HTTP_TIMEOUT_KEEP_ALIVE`` of every model, default
+    #: 5 s), else the sidecar reuses connections vLLM is closing (502s before 2026-09-30).
+    upstream_keepalive_s: float = 2.0
+    #: Fresh-connection re-sends after a pooled connection to the local vLLM failed before
+    #: the first response byte (0 = off).
+    local_reconnect_attempts: int = 1
     #: None = the model's vllm_image (it ships python3 + aiohttp; the script comes from
     #: a ConfigMap, so no image build is needed).
     image: str | None = None
@@ -918,6 +936,18 @@ class Registry:
         if self._topology.max_bound_per_gpu < 1:
             errors.append("cluster.max_bound_per_gpu must be >= 1")
         errors.extend(_validate_reissue(self._reissue))
+        if self._reissue.enabled:
+            for model in self._models:
+                try:
+                    server_keep_alive = vllm_keep_alive_s(self.vllm_env_for(model))
+                except ValueError:
+                    errors.append(f"model {model.name}: {VLLM_KEEP_ALIVE_ENV} must be an integer number of seconds")
+                    continue
+                if self._reissue.upstream_keepalive_s >= server_keep_alive:
+                    errors.append(
+                        f"model {model.name}: reissue.upstream_keepalive_s ({self._reissue.upstream_keepalive_s}) "
+                        f"must be below vLLM's {VLLM_KEEP_ALIVE_ENV} ({server_keep_alive})"
+                    )
         if self._placement.reserve_tp_pairs < 0:
             errors.append("placement.reserve_tp_pairs must be >= 0")
         errors.extend(_validate_vllm_env("vllm.env", self._vllm.env))
@@ -1083,6 +1113,8 @@ def parse_reissue_config(raw: Any) -> ReissueConfig:
         vllm_port=int(raw.get("vllm_port", defaults.vllm_port)),
         max_depth=int(raw.get("max_depth", defaults.max_depth)),
         retry_attempts=int(raw.get("retry_attempts", defaults.retry_attempts)),
+        upstream_keepalive_s=float(raw.get("upstream_keepalive_s", defaults.upstream_keepalive_s)),
+        local_reconnect_attempts=int(raw.get("local_reconnect_attempts", defaults.local_reconnect_attempts)),
         image=(str(raw["image"]) if raw.get("image") else None),
         configmap=str(raw.get("configmap", defaults.configmap)),
         namespace=str(raw.get("namespace", defaults.namespace)),
@@ -1104,6 +1136,10 @@ def _validate_reissue(reissue: ReissueConfig) -> list[str]:
         errors.append(f"reissue.vllm_port must be a valid port other than {POD_SERVING_PORT}")
     if reissue.max_depth < 0:
         errors.append("reissue.max_depth must be non-negative")
+    if not reissue.upstream_keepalive_s > 0:
+        errors.append("reissue.upstream_keepalive_s must be > 0")
+    if reissue.local_reconnect_attempts < 0:
+        errors.append("reissue.local_reconnect_attempts must be >= 0")
     if reissue.retry_attempts < 1:
         errors.append("reissue.retry_attempts must be >= 1")
     for key in reissue.extra_env:

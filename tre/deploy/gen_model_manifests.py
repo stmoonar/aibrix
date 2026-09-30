@@ -15,6 +15,7 @@ from tre_common.registry import (
     DEFAULT_VLLM_ENV,
     POD_SERVING_PORT,
     VLLM_FEATURE_FLAGS,
+    vllm_keep_alive_s,
     ModelSpec,
     NodeSpec,
     Registry,
@@ -425,6 +426,9 @@ def _add_reissue_sidecar(deployment: dict, model: ModelSpec, spec: ReissueConfig
     readiness = vllm.pop("readinessProbe")
     vllm.pop("ports", None)
     pod["volumes"].append({"name": REISSUE_CONTAINER, "configMap": {"name": spec.configmap, "defaultMode": 0o444}})
+    # vLLM's keep-alive as rendered on its container: the sidecar checks at startup that its
+    # own pooled-connection keep-alive is below it (the registry validates the same).
+    server_keep_alive = vllm_keep_alive_s({e["name"]: e.get("value", "") for e in vllm.get("env") or ()})
     env = [
         {"name": "TRE_REISSUE_LISTEN_PORT", "value": str(POD_SERVING_PORT)},
         {"name": "TRE_REISSUE_UPSTREAM_URL", "value": f"http://127.0.0.1:{spec.vllm_port}"},
@@ -432,6 +436,9 @@ def _add_reissue_sidecar(deployment: dict, model: ModelSpec, spec: ReissueConfig
         {"name": "TRE_REISSUE_MODEL", "value": model.name},
         {"name": "TRE_REISSUE_MAX_DEPTH", "value": str(spec.max_depth)},
         {"name": "TRE_REISSUE_RETRY_ATTEMPTS", "value": str(spec.retry_attempts)},
+        {"name": "TRE_REISSUE_UPSTREAM_KEEPALIVE_S", "value": _num(spec.upstream_keepalive_s)},
+        {"name": "TRE_REISSUE_UPSTREAM_SERVER_KEEPALIVE_S", "value": _num(server_keep_alive)},
+        {"name": "TRE_REISSUE_LOCAL_RECONNECT_ATTEMPTS", "value": str(spec.local_reconnect_attempts)},
         # Fail closed: /sleep without X-TRE-Hidden: 1 (the SM sends it after the hide) is 409.
         {"name": "TRE_REISSUE_REQUIRE_HIDDEN_HEADER", "value": "true"},
         {"name": "POD_NAME", "valueFrom": {"fieldRef": {"fieldPath": "metadata.name"}}},
@@ -456,6 +463,11 @@ def _add_reissue_sidecar(deployment: dict, model: ModelSpec, spec: ReissueConfig
             "volumeMounts": [{"name": REISSUE_CONTAINER, "mountPath": REISSUE_MOUNT_DIR, "readOnly": True}],
         }
     )
+
+
+def _num(value: float) -> str:
+    """2.0 -> "2", 0.5 -> "0.5" (stable env text)."""
+    return str(int(value)) if float(value).is_integer() else str(value)
 
 
 def _dns_name(value: str) -> str:

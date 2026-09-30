@@ -14,6 +14,10 @@
   Service、网关 `target-pod`、SM（`/sleep` `/wake_up` `/is_sleeping` `/metrics` `/version`）、指标抓取、readiness probe 全部不变。
 - 所有路径透明代理（流式保持）；只有下面几类请求有额外行为。
 - 只用标准库 + aiohttp（vLLM 镜像自带；0.30 镜像为 python 3.12 + aiohttp 3.14 + uvloop），脚本经 ConfigMap 下发，不需要新镜像。
+- **回环连接 keep-alive（2026-09-30）**：sidecar 到本地 vLLM 的连接池空闲保留 `upstream_keepalive_s`（默认 2 s），必须小于 vLLM 的
+  `VLLM_HTTP_TIMEOUT_KEEP_ALIVE`（vLLM 默认 5 s，registry `vllm.env` 设为 75 s）。此前池用 aiohttp 默认的 15 s：vLLM 5 s 关掉空闲连接的同时
+  sidecar 正好复用它，请求在首字节前失败（`Server disconnected` / `Connection reset by peer` / `Can not write request body`），客户端收到 502
+  （09-30 smoke 的 17 个 502，与过载无关）。registry 校验两者关系，sidecar 启动时再查一次（不满足只打 WARNING）。见 §3a。
 
 ## 2. sidecar 如何知道本 pod 在睡 / 已隐藏（决定）
 
@@ -39,6 +43,27 @@
 - 全部失败：客户端收到 **503 + `Retry-After: 1`**（`error.type = ServiceUnavailable`）。
 - 成功：透传网关响应，加响应头 `x-tre-retried: <attempts>`。
 - 深度超过 `max_depth`（默认 3）：503 + Retry-After（上游 sidecar 会自己退避重试）。
+
+## 3a. 本地引擎连接在首字节前失败（2026-09-30）
+
+适用于 sidecar 发往本地 vLLM 的所有请求（生成路径 `_generation`、普通代理 `_proxy_local`、`/sleep` `/wake_up` 等控制调用、`/is_sleeping`），
+此时**还没有向客户端写过任何字节**：
+1. 连接级失败——`ServerDisconnectedError`，或 ECONNRESET / EPIPE（含 aiohttp 把写失败包成 `ClientOSError(errno=None, "Can not write request body")`、
+   原因链上是 reset 的情况）——用**新连接**（`force_close` 的独立 session，不会再拿到同龄的池连接）重发，最多 `local_reconnect_attempts`（默认 1）次。
+   请求体是已读完的 bytes，重发与原请求逐字节相同；这类失败说明 vLLM 没有处理该请求（它在关闭空闲连接）。
+   计数 `tre_reissue_local_reconnect_total{result=ok|fail}`（按次）。GET 等幂等请求 aiohttp 自己已会在同一个池上重发一次，sidecar 的新连接重发叠加在其后。
+2. 仍失败时，生成路径：本地已知在睡 → 经网关重试（`retry{local_unavailable_sleeping}`，原有）；**connection refused**（vLLM 没在监听：崩溃 / 重启）
+   → 经网关重试（`retry{local_refused}`，带 `x-tre-exclude-pod`）；其余 → **503 + `Retry-After: 1`**，
+   `{"error": {"type": "ServiceUnavailable", "layer": "sidecar_upstream"}}`（不再是 502），计 `failed{upstream_unavailable}`。
+3. 普通代理路径：连接级失败重发后仍失败 → 同样 503 + `layer=sidecar_upstream`；refused 等其它连接错误仍是 502（带 `layer`），不转网关
+   （`/health` 等探测必须反映本 pod）。只有 `/v1/*` 计入 `failed{upstream_unavailable}`，探测不计。
+4. 日志：重发成功与 503/502 各打限频的 WARNING 行（`tre_local_reconnect` / `tre_upstream_unavailable`，每类每 `warn_interval_s`=10 s 至多一行，带 `suppressed`）；
+   `failed{upstream_unavailable}` 不再逐条打 `tre_reissue` 行。
+5. **已经向客户端写过字节**（流已开始后上游断开）不在此范围：保持原行为（关闭客户端连接；睡眠导致的 abort 走 §4 续发），不本地重发。
+
+验证：`tre/reissue/tests/test_local_keepalive.py` 用真 uvicorn（keep-alive 1 s）+ sidecar 造“空闲略超 keep-alive 后复用”的时序：
+main 上 3000 个请求 14 个 502（测试失败）；修复后 0 失败、重发 > 0；只开第 1 层（池 0.5 s、不重发）0 失败；旧配置对照组的失败全为 503。
+vLLM 镜像（py3.12 + aiohttp 3.14 + uvloop + httptools，`--network none`）内同样时序 2000 请求：main 17–18 个 502，修复后 0（重发 13–23 次）。
 
 ## 4. 已开始的请求：token-id 续发（D6）
 
@@ -94,11 +119,12 @@ tools/functions（除非 `tool_choice: none`）、结构化输出 / guided decod
 
 | 指标 | 含义 |
 |---|---|
-| `tre_reissue_total{model,kind,reason}` | kind = `retry` / `continue` / `failed` / `passthrough_abort`；reason 细分（`engine_sleeping`、`local_sleeping`、`abort_before_output`、`abort_sleep`、`budget_spent`、`depth_limit`、`retry_exhausted`、`continuation_unavailable`、`continuation_aborted`、`continuation_broken`、`no_token_ids`、`not_sleeping`、`client_gone`、`non_continuable_*`、`abort_non_continuable_*`） |
+| `tre_reissue_total{model,kind,reason}` | kind = `retry` / `continue` / `failed` / `passthrough_abort`；reason 细分（`engine_sleeping`、`local_sleeping`、`local_refused`、`local_unavailable_sleeping`、`upstream_unavailable`、`abort_before_output`、`abort_sleep`、`budget_spent`、`depth_limit`、`retry_exhausted`、`continuation_unavailable`、`continuation_aborted`、`continuation_broken`、`no_token_ids`、`not_sleeping`、`client_gone`、`non_continuable_*`、`abort_non_continuable_*`） |
 | `tre_reissue_proxy_added_seconds` | sidecar 自身给一个本地应答请求增加的时间（直方图）：forward（读完客户端请求 → 交给上游 HTTP 客户端）+ relay（每个上游响应头 / 数据块从收到到写给客户端，按请求累加）；不含等待上游的时间（响应头，即非流式请求的整个生成过程、块间间隔、经网关的续写请求）；块写入在发送缓冲超过高水位时会包含客户端背压；被转发重试的请求不计入。两部分另见 `tre_reissue_proxy_forward_seconds` / `tre_reissue_proxy_relay_seconds` |
 | `tre_reissue_gap_seconds` | abort 到续发首 token（直方图） |
 | `tre_reissue_events_total{event}` | sleep 拒绝 / 失败、状态纠偏、`stop_at_seam` 等 |
 | `tre_reissue_sleeping` | 本地 sleeping 标记 |
+| `tre_reissue_local_reconnect_total{model,result}` | 首字节前连接级失败后的新连接重发次数，`result=ok/fail`（§3a） |
 
 P5 口径：每个 run 报 retry / continue / failed / passthrough_abort；`continue>0` 的 run 标为受污染（计划原文）。
 
@@ -107,7 +133,8 @@ P5 口径：每个 run 报 retry / continue / failed / passthrough_abort；`cont
 sidecar 每个 `Config` 字段 `foo` 都可由环境变量 `TRE_REISSUE_FOO` 覆盖（网关用 `TRE_GATEWAY_URL`，pod 名用 downward API 的 `POD_NAME`）：端口、上游、
 路径（`completions_path`、`chat_path`、`sleep_paths`、`wake_paths`、`is_sleeping_path`、`models_path`、自身指标路径）、头名（`hidden_header`、`exclude_header`、
 `continued_header`、`retried_header`、`depth_header`）、JSON 字段名（`generated_ids_field`、`prompt_ids_field`、`token_ids_field`、`continued_field`、`sleeping_error_type`）、
-重试次数与退避、深度上限、超时。默认值即 fork 与网关插件当前使用的名字。
+重试次数与退避、深度上限、超时、回环 keep-alive（`upstream_keepalive_s` 默认 2、`upstream_server_keepalive_s` 默认 5 仅用于启动检查、
+`local_reconnect_attempts` 默认 1、`warn_interval_s` 默认 10）。默认值即 fork 与网关插件当前使用的名字。
 
 registry（`deploy/registry.yaml` 与 `overlays/tre-v2/params.yaml` 中的 `tre-v2-registry` 副本保持一致，SM 运行时创建 Deployment 也读它）：
 
@@ -126,6 +153,12 @@ reissue:
   memory_request: 64Mi
   memory_limit: 256Mi
   extra_env: {}            # 额外 TRE_* 环境变量（字段名 / 头名覆盖）
+  # 可选（2026-09-30），仓库 registry 不写出，旧 SM 会拒绝未知 reissue 键：
+  # upstream_keepalive_s: 2       # 须小于每个模型的 VLLM_HTTP_TIMEOUT_KEEP_ALIVE（registry 校验）
+  # local_reconnect_attempts: 1
+vllm:
+  env:
+    VLLM_HTTP_TIMEOUT_KEEP_ALIVE: '75'   # vLLM 的 uvicorn keep-alive；改它会改模型 Deployment，须重建 pod
 models:
 - name: ...
   vllm_features: [sleep_reject_new, abort_return_token_ids]   # 镜像支持时才声明
@@ -155,7 +188,8 @@ gateway:
 - 生成 ConfigMap `<reissue.namespace>/<reissue.configmap>`，内容是 `sidecar.py`（守卫测试保证与源码一致，过期时提示 `make manifests`）。
 - 每个模型 Deployment：vLLM `--host 127.0.0.1 --port <vllm_port>`，去掉其 ports / readinessProbe；新增容器 `tre-reissue-sidecar`：镜像 = `reissue.image` 或模型镜像，
   `python3 /opt/tre-reissue/sidecar.py`，端口 8000，readiness `/health:8000`（经代理即 vLLM 的 /health），`NVIDIA_VISIBLE_DEVICES=void`，
-  `TRE_REISSUE_REQUIRE_HIDDEN_HEADER=true`，CPU 50m/500m、内存 64/256Mi。
+  `TRE_REISSUE_REQUIRE_HIDDEN_HEADER=true`，CPU 50m/500m、内存 64/256Mi；`TRE_REISSUE_UPSTREAM_KEEPALIVE_S` / `TRE_REISSUE_LOCAL_RECONNECT_ATTEMPTS`
+  来自 registry `reissue:`，`TRE_REISSUE_UPSTREAM_SERVER_KEEPALIVE_S` 取该 pod vLLM 容器的 `VLLM_HTTP_TIMEOUT_KEEP_ALIVE`（未设为 5）。
 - `model.aibrix.ai/port` 仍为 8000；Service targetPort 8000；SM 的 `build_model_deployment` 与渲染结果逐字段相同（有测试）。
 - `deploy/scripts/staggered_model_fleet.py` 的离线拉起 `/sleep` 带 `X-TRE-Hidden: 1`（拉起中的 pod 本就 routable=false）。
 
