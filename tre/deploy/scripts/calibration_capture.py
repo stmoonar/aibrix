@@ -868,17 +868,22 @@ def _check_once(redis_client: Any, model: str, cfg: ClockDomainConfig,
     redis TIME (read after it), then the gateway's write delay, measured by waiting (at
     most :attr:`ClockDomainConfig.gateway_wait_s`) for its next round."""
     reasons: list[str] = []
-    c_stamp = _latest_score(redis_client, decision_hist_key(model))
+    newest = redis_client.zrevrangebyscore(decision_hist_key(model), "+inf", "-inf", start=0, num=8,
+                                           withscores=True) or ()
+    ends = sorted({int(float(score)) for _m, score in newest}, reverse=True)[:2]
+    c_stamp = ends[0] if ends else None
     c_now = redis_time_ms(redis_client)
     c_lag = None if c_stamp is None or c_now is None else c_now - c_stamp
     lo_c, hi_c = cfg.controller_lag_bounds
-    on_grid = c_stamp is not None and c_stamp % cfg.period_ms == 0
+    # phase-aligned: window ends are gateway rounds, one round apart (free_running stamps
+    # its own clock: off the grid when sliding, one window apart when tumbling)
+    on_grid = (len(ends) == 2 and ends[0] % cfg.period_ms == 0 and ends[0] - ends[1] == cfg.period_ms)
     c_ok = c_lag is not None and on_grid and lo_c <= c_lag <= hi_c
     if c_lag is None:
         reasons.append("controller: no decision history for the model or no redis TIME")
     elif not on_grid:
-        reasons.append(f"controller: newest window_end_ms {c_stamp} is not on the {cfg.period_ms} ms gateway "
-                       "grid (not phase-aligned: it stamps its own clock)")
+        reasons.append(f"controller: newest window ends {ends} are not consecutive {cfg.period_ms} ms gateway "
+                       "rounds (not phase-aligned: it stamps its own clock)")
     elif not c_ok:
         reasons.append(f"controller: newest window_end_ms is {c_lag} ms behind redis TIME, outside "
                        f"[{lo_c}, {hi_c}]")
@@ -912,7 +917,8 @@ def _check_once(redis_client: Any, model: str, cfg: ClockDomainConfig,
                     "waited_s": wait.get("waited_s"), "newest_stamp_before_ms": g_stamp,
                     "lag_before_ms": None if g_stamp is None or now is None else now - g_stamp,
                     "pods_live": len(live), "pods_in_set": len(pods)},
-        "controller": {"ok": c_ok, "newest_window_end_ms": c_stamp, "redis_time_ms": c_now, "lag_ms": c_lag},
+        "controller": {"ok": c_ok, "newest_window_end_ms": c_stamp, "previous_window_end_ms":
+                       ends[1] if len(ends) > 1 else None, "redis_time_ms": c_now, "lag_ms": c_lag},
         "reasons": reasons,
     }
 
@@ -1029,7 +1035,9 @@ def cell_clock_mark(
             rng = start.get("late_write_range_ms")
             if not rng:
                 raise ValueError("the start mark has no late-write baseline")
-            late = (_gateway_member_digests(redis_client, start.get("late_write_pods") or (), *rng)
+            if not start.get("late_write_pods"):
+                raise ValueError("the start mark listed no gateway pods")
+            late = (_gateway_member_digests(redis_client, start["late_write_pods"], *rng)
                     - set(start.get("late_write_baseline") or ()))
             late_count = len(late)
             if late:
@@ -1077,10 +1085,10 @@ def wait_for_gateway_write(
         out["reason"] = "no pods" if not pods else "wait disabled"
         return out
     start = monotonic()
-    first = _latest_inst_score(redis_client, pods)
+    first = _latest_gateway_score(redis_client, pods)
     out["latest_round_before_ms"] = first
     while True:
-        latest = _latest_inst_score(redis_client, pods)
+        latest = _latest_gateway_score(redis_client, pods)
         if latest is not None and (first is None or latest > first):
             seen = redis_time_ms(redis_client)
             out.update({
@@ -1215,8 +1223,8 @@ def dump_gateway_docs(
             total_bytes += _write_jsonl_atomic(path, header, rows)
             files[kind][pod] = _rel(path, layout.cell_dir)
     phases = sorted({s % SCRAPE_INTERVAL_MS for s in stamps})
-    late = (_late_docs(fetched, known, int(known_upto_ms), known_pods or ())
-            if known is not None and known_upto_ms is not None else None)
+    late = (_late_docs(fetched, known, int(known_upto_ms), known_pods)
+            if known is not None and known_upto_ms is not None and known_pods else None)
     return {
         "observed_at_redis_ms": observed_at,
         "late_writes": None if late is None else len(late),

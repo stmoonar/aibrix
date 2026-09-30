@@ -92,8 +92,9 @@ files for either layout (old runs: the new entries are empty).
     `[d, d + 10 s)`, which cannot tell a late ticker from a slow clock). The check waits
     for the next round (at most 12 s) and requires redis `TIME` at first sight minus its
     stamp in `[-tol, round + tol]` = `[-2, 12]` s;
-  - controller: the newest `window_end_ms` must be on the 10 s grid (a free-running
-    controller stamps its own clock and is refused) and trail redis `TIME` by
+  - controller: the two newest `window_end_ms` must be consecutive 10 s grid rounds (a
+    free-running controller stamps its own clock - off the grid when sliding, 30 s apart
+    when tumbling - and is refused) and the newest must trail redis `TIME` by
     `[-tol, round + read offset + tick + tol]` = `[-2, 31.5]` s (2-17 s at the base read
     offset of 2 s and the 5 s rescue loop; the offset adapts up to 9.5 s behind a late
     gateway, and with the fast loop disabled only the 10 s fairness loop writes);
@@ -120,9 +121,14 @@ files for either layout (old runs: the new entries are empty).
   (`--capture-margin-ms`) is one window + one round + that 12 s = 52 s at 30 s windows
   (a smaller one is refused) and the tail includes it too, so such an offset still lands
   inside the dump and before its tail. `--window-ms` must be the controller's
-  `TRE_METRICS_WINDOW_MS` (the campaign's metrics window). Each mark waits for one
-  gateway round (~5 s, at most 12 s); the separate wait before the dump
-  (`--gateway-flush-wait-s`) defaults to 0 since the end mark has just waited.
+  `TRE_METRICS_WINDOW_MS` (the campaign's metrics window). Each check waits for one
+  gateway round (~5 s, at most 12 s; with its two retries at worst 3 x 12 + 2 x 4 = 44 s
+  per model, at each mark, in the pre-flight and in a backfill); the separate wait
+  before the dump (`--gateway-flush-wait-s`) defaults to 0 since the end mark has just
+  waited. Limit (controller, not capture): the phase-aligned sampler gives a window up
+  0.5 s before the next round, so a gateway whose ticker writes more than ~9.5 s into its
+  round leaves every controller window stale; the controller check then fails and the
+  run is refused - restart the gateway plugin to re-roll its ticker phase.
 * **Completeness and backfill.** A dump is `complete` when it reached `tail_ms` (the last
   10 s grid window end whose window can hold data of the cell, a blind-spot offset
   included: `floor((redis_end + window + 12 s - 1 ms) / 10 s) * 10 s`, i.e. redis end +

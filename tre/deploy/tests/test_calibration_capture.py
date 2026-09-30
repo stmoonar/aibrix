@@ -331,7 +331,14 @@ class Cluster:
             self.gw_next += self.P
         while self.controller:
             b = self.ctl_next
-            at = max(b + self.ctl_offset - self.ctl_skew, b - self.gw_skew + self.gw_phase) + self.ctl_tick
+            written = b - self.gw_skew + self.gw_phase
+            give_up = b + self.P - 500 - self.ctl_skew  # PhaseAlignedSampler: next round minus retry
+            if written > give_up:  # never fresh in time: a stale window, nothing written
+                if give_up > t:
+                    break
+                self.ctl_next += self.P
+                continue
+            at = max(b + self.ctl_offset - self.ctl_skew, written) + self.ctl_tick
             if at > t:
                 break
             self.r.zadd(decision_hist_key("m7"), {_tick(b): b})
@@ -602,7 +609,8 @@ def _controller_at(lag: int, *, end: int = 950_000) -> Cluster:
     behind redis TIME."""
     c = Cluster(controller=False)
     c.advance(end + lag)
-    c.r.zadd(decision_hist_key("m7"), {_tick(end): end})
+    for b in (end - 10_000, end):
+        c.r.zadd(decision_hist_key("m7"), {_tick(b): b})
     return c
 
 
@@ -623,18 +631,30 @@ def test_a_controller_ahead_or_far_behind_is_not(controller_lag: int) -> None:
     assert v["attempts"] == CFG.attempts and "controller" in v["reasons"][0]
 
 
-def test_a_free_running_controller_is_not() -> None:
+@pytest.mark.parametrize("ends", [(928_731, 958_731), (930_000, 960_000)])
+def test_a_free_running_controller_is_not(ends) -> None:
     # free_running stamps window ends with the controller's own clock: off the 10 s grid
+    # (sliding) or on it but one 30 s window apart (tumbling)
     c = Cluster(controller=False)
     c.advance(964_000)
-    c.r.zadd(decision_hist_key("m7"), {_tick(958_731): 958_731})
+    for b in ends:
+        c.r.zadd(decision_hist_key("m7"), {_tick(b): b})
     v = cc.check_clock_domains(c.r, "m7", CFG, sleep=c.sleep)
-    assert not v["controller"]["ok"] and "grid" in v["reasons"][0]
+    assert not v["controller"]["ok"] and "gateway rounds" in v["reasons"][0]
 
 
-@pytest.mark.parametrize("write_delay", [0, 5_000, 9_400, 9_900])
+def test_a_gateway_ticker_later_than_the_controller_retries_is_refused() -> None:
+    # documented limit: past ~9.5 s the phase-aligned controller never sees its windows fresh
+    c = Cluster(gw_phase=9_900)
+    c.advance(RS)
+    v = cc.check_clock_domains(c.r, "m7", CFG, sleep=c.sleep)
+    assert v["gateway"]["ok"] and not v["controller"]["ok"]
+
+
+@pytest.mark.parametrize("write_delay", [0, 5_000, 9_000, 9_400])
 def test_any_gateway_ticker_phase_is_in_the_domain(write_delay: int) -> None:
-    # the ticker starts where the gateway process started: any write delay in [0, 10 s)
+    # the ticker starts where the gateway process started: any write delay the controller
+    # can follow (up to period - retry = 9.5 s)
     c = Cluster(gw_phase=write_delay)
     c.advance(RS)
     for _ in range(12):  # probes all over the round
