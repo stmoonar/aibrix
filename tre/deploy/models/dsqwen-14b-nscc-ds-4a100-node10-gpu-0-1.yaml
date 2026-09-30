@@ -111,6 +111,8 @@ spec:
           value: spawn
         - name: HF_HUB_OFFLINE
           value: '1'
+        - name: VLLM_HTTP_TIMEOUT_KEEP_ALIVE
+          value: '75'
         resources: {}
         volumeMounts:
         - name: shm
@@ -136,6 +138,18 @@ spec:
           value: '3'
         - name: TRE_REISSUE_RETRY_ATTEMPTS
           value: '4'
+        - name: TRE_REISSUE_UPSTREAM_KEEPALIVE_S
+          value: '2'
+        - name: TRE_REISSUE_UPSTREAM_SERVER_KEEPALIVE_S
+          value: '75'
+        - name: TRE_REISSUE_LOCAL_RECONNECT_ATTEMPTS
+          value: '1'
+        - name: TRE_REISSUE_LOCAL_RECONNECT_WINDOW_S
+          value: '1'
+        - name: TRE_REISSUE_SERVER_KEEPALIVE_S
+          value: '75'
+        - name: TRE_REISSUE_GATEWAY_UPSTREAM_IDLE_S
+          value: '60'
         - name: TRE_REISSUE_REQUIRE_HIDDEN_HEADER
           value: 'true'
         - name: POD_NAME

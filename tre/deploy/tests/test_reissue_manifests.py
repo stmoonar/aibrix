@@ -80,6 +80,10 @@ def test_sidecar_is_on_by_default_and_owns_the_serving_port(tmp_path):
     # the stable gateway Service (registry gateway: section), in-cluster DNS, no IP
     assert env["TRE_GATEWAY_URL"] == "http://tre-gateway.envoy-gateway-system.svc.cluster.local:80"
     assert env["TRE_REISSUE_REQUIRE_HIDDEN_HEADER"] == "true"
+    # loopback keep-alive: the sidecar's pool (2 s) below vLLM's (default 5 s when unset)
+    assert env["TRE_REISSUE_UPSTREAM_KEEPALIVE_S"] == "2"
+    assert env["TRE_REISSUE_UPSTREAM_SERVER_KEEPALIVE_S"] == "5"
+    assert env["TRE_REISSUE_LOCAL_RECONNECT_ATTEMPTS"] == "1"
     assert env["POD_NAME"] == {"fieldRef": {"fieldPath": "metadata.name"}}
     assert env["NVIDIA_VISIBLE_DEVICES"] == "void"
     assert sidecar["command"] == ["python3", "/opt/tre-reissue/sidecar.py"]
@@ -97,7 +101,9 @@ def test_sidecar_is_on_by_default_and_owns_the_serving_port(tmp_path):
 
 
 def test_disabled_renders_the_plain_pod(tmp_path):
-    registry = _registry(tmp_path, "reissue: {enabled: false}\n")
+    # without the sidecar vLLM itself answers on the pod port: its keep-alive must outlast
+    # Envoy's upstream idle timeout
+    registry = _registry(tmp_path, "reissue: {enabled: false}\nvllm: {env: {VLLM_HTTP_TIMEOUT_KEEP_ALIVE: '75'}}\n")
     for deployment in build_deployments(registry):
         containers = _containers(deployment)
         assert list(containers) == ["vllm-openai"]
@@ -110,9 +116,9 @@ def test_disabled_renders_the_plain_pod(tmp_path):
         assert all(v["name"] != REISSUE_CONTAINER for v in deployment["spec"]["template"]["spec"]["volumes"])
     assert all(r["kind"] != "ConfigMap" for r in build_resources(registry))
     # identical to a registry without the section but with the sidecar switched off
-    plain = _registry(tmp_path)
+    plain = _registry(tmp_path, "vllm: {env: {VLLM_HTTP_TIMEOUT_KEEP_ALIVE: '75'}}")
     plain = Registry(plain.topology(), plain.models(), plain.service_manager(), plain.gateway(),
-                     ReissueConfig(enabled=False))
+                     ReissueConfig(enabled=False), plain.vllm())
     assert build_deployments(plain) == build_deployments(registry)
 
 
@@ -148,9 +154,63 @@ def test_registry_overrides_reach_the_sidecar(tmp_path):
     assert command[command.index("--port") + 1] == "9001"
 
 
+def test_keepalive_one_second_below_the_server_is_accepted(tmp_path):
+    _registry(tmp_path, "reissue: {upstream_keepalive_s: 4}\n")  # vLLM default 5 s; validates clean
+
+
+def test_keepalive_settings_reach_the_sidecar(tmp_path):
+    registry = _registry(tmp_path, textwrap.dedent("""
+        vllm:
+          env: {VLLM_HTTP_TIMEOUT_KEEP_ALIVE: '75'}
+        reissue:
+          upstream_keepalive_s: 1.5
+          local_reconnect_attempts: 2
+    """))
+    for deployment in build_deployments(registry):
+        containers = _containers(deployment)
+        assert _env(containers["vllm-openai"])["VLLM_HTTP_TIMEOUT_KEEP_ALIVE"] == "75"
+        env = _env(containers[REISSUE_CONTAINER])
+        assert env["TRE_REISSUE_UPSTREAM_KEEPALIVE_S"] == "1.5"
+        assert env["TRE_REISSUE_UPSTREAM_SERVER_KEEPALIVE_S"] == "75"
+        assert env["TRE_REISSUE_LOCAL_RECONNECT_ATTEMPTS"] == "2"
+
+
+def test_envoy_to_sidecar_keepalive_settings_reach_the_sidecar(tmp_path):
+    registry = _registry(tmp_path, textwrap.dedent("""
+        gateway: {upstream_idle_timeout_s: 30}
+        reissue: {server_keepalive_s: 120, local_reconnect_window_s: 0.5}
+    """))
+    for deployment in build_deployments(registry):
+        env = _env(_containers(deployment)[REISSUE_CONTAINER])
+        assert env["TRE_REISSUE_SERVER_KEEPALIVE_S"] == "120"
+        assert env["TRE_REISSUE_GATEWAY_UPSTREAM_IDLE_S"] == "30"
+        assert env["TRE_REISSUE_LOCAL_RECONNECT_WINDOW_S"] == "0.5"
+    # defaults: sidecar 75 s above Envoy's 60 s
+    for deployment in build_deployments(_registry(tmp_path)):
+        env = _env(_containers(deployment)[REISSUE_CONTAINER])
+        assert (env["TRE_REISSUE_SERVER_KEEPALIVE_S"], env["TRE_REISSUE_GATEWAY_UPSTREAM_IDLE_S"],
+                env["TRE_REISSUE_LOCAL_RECONNECT_WINDOW_S"]) == ("75", "60", "1")
+
+
 @pytest.mark.parametrize(
     "extra,needle",
     [
+        ("reissue: {upstream_keepalive_s: 0}\n", "upstream_keepalive_s must be > 0"),
+        ("reissue: {server_keepalive_s: 0}\n", "server_keepalive_s must be > 0"),
+        ("reissue: {local_reconnect_window_s: -1}\n", "local_reconnect_window_s must be >= 0"),
+        # Envoy's idle timeout must be >= 1 s below the sidecar's server keep-alive
+        ("reissue: {server_keepalive_s: 60}\n", "at least 1 s above gateway.upstream_idle_timeout_s"),
+        ("reissue: {server_keepalive_s: 60.5}\n", "at least 1 s above gateway.upstream_idle_timeout_s"),
+        ("gateway: {upstream_idle_timeout_s: 75}\n", "at least 1 s above gateway.upstream_idle_timeout_s"),
+        ("gateway: {upstream_idle_timeout_s: 0}\n", "upstream_idle_timeout_s must be positive"),
+        # without the sidecar the pod's server is vLLM itself (default keep-alive 5 s here)
+        ("reissue: {enabled: false}\n", "vLLM's VLLM_HTTP_TIMEOUT_KEEP_ALIVE (5) must be at least 1 s above"),
+        ("reissue: {local_reconnect_attempts: -1}\n", "local_reconnect_attempts"),
+        # the pool must be BELOW vLLM's keep-alive (default 5 s) of every model
+        ("reissue: {upstream_keepalive_s: 5}\n", "at least 1 s below vLLM's VLLM_HTTP_TIMEOUT_KEEP_ALIVE"),
+        ("reissue: {upstream_keepalive_s: 4.5}\n", "at least 1 s below vLLM's VLLM_HTTP_TIMEOUT_KEEP_ALIVE"),
+        ("vllm: {env: {VLLM_HTTP_TIMEOUT_KEEP_ALIVE: '2'}}\n", "at least 1 s below vLLM's VLLM_HTTP_TIMEOUT_KEEP_ALIVE"),
+        ("vllm: {env: {VLLM_HTTP_TIMEOUT_KEEP_ALIVE: '7.5'}}\n", "integer number of seconds"),
         ("reissue: {vllm_port: 8000}\n", "vllm_port"),
         ("reissue: {gateway_url: '10.0.0.1:80'}\n", "gateway_url"),
         ("reissue: {max_depth: -1}\n", "max_depth"),
@@ -207,6 +267,16 @@ def test_repo_registry_and_committed_manifests_carry_the_sidecar():
 
     live = _parse_registry(yaml.safe_load(params["data"]["registry.yaml"]))
     assert live.reissue() == replace(spec)
+    for model in registry.models():
+        assert live.vllm_env_for(live.model(model.name)) == registry.vllm_env_for(model)
+    # loopback keep-alive (2026-09-30 smoke 502s): vLLM keeps idle connections 75 s, the
+    # sidecar pools them 2 s
+    for deployment in build_deployments(registry):
+        containers = _containers(deployment)
+        assert _env(containers["vllm-openai"])["VLLM_HTTP_TIMEOUT_KEEP_ALIVE"] == "75"
+        env = _env(containers[REISSUE_CONTAINER])
+        assert env["TRE_REISSUE_UPSTREAM_SERVER_KEEPALIVE_S"] == "75"
+        assert env["TRE_REISSUE_UPSTREAM_KEEPALIVE_S"] == "2"
 
 
 def test_gateway_url_follows_the_gateway_service_settings(tmp_path):
@@ -214,3 +284,28 @@ def test_gateway_url_follows_the_gateway_service_settings(tmp_path):
     env = _env(_containers(build_deployments(registry)[0])[REISSUE_CONTAINER])
     assert env["TRE_GATEWAY_URL"] == "http://gw.proxies.svc.cluster.local:8080"
     assert registry.reissue().gateway_url is None  # derived, not stored
+
+
+#: ``reissue:`` keys known to controller / SM / UI 20260930-f8ccb0ca (its ReissueConfig fields):
+#: that parser raises on any other key, so the repo registry (which is what gets merged into
+#: the live one) may not carry a newer key until all three images are upgraded.
+F8CCB0CA_REISSUE_KEYS = {
+    "enabled", "gateway_url", "vllm_port", "max_depth", "retry_attempts", "image", "configmap",
+    "namespace", "cpu_request", "cpu_limit", "memory_request", "memory_limit", "extra_env",
+}
+
+
+@pytest.mark.parametrize(
+    "path",
+    [DEPLOY_ROOT / "registry.yaml", DEPLOY_ROOT / "overlays" / "tre-v2" / "params.yaml"],
+    ids=["registry.yaml", "params.yaml"],
+)
+def test_repo_registry_reissue_section_is_accepted_by_the_deployed_parser(path):
+    text = path.read_text(encoding="utf-8")
+    if path.name == "params.yaml":
+        text = yaml.safe_load(text)["data"]["registry.yaml"]
+    keys = set(yaml.safe_load(text)["reissue"])
+    assert keys <= F8CCB0CA_REISSUE_KEYS, (
+        f"{sorted(keys - F8CCB0CA_REISSUE_KEYS)} would crash the deployed controller / SM / UI "
+        "(unknown reissue keys raise); keep them commented out until all three are upgraded"
+    )

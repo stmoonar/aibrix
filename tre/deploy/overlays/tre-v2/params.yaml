@@ -264,6 +264,11 @@ data:
         VLLM_WORKER_MULTIPROC_METHOD: spawn
         # Weights are local paths; never reach out to a model hub.
         HF_HUB_OFFLINE: '1'
+        # uvicorn keep-alive of the vLLM HTTP server (vLLM default 5 s). The reissue sidecar
+        # pools its loopback connections to vLLM for reissue.upstream_keepalive_s (default 2 s,
+        # validated to be >= 1 s below this); 75 s keeps vLLM from closing a connection the sidecar is
+        # about to reuse (502s in the 2026-09-30 smoke). Takes effect when the pods are recreated.
+        VLLM_HTTP_TIMEOUT_KEEP_ALIVE: '75'
         # PYTORCH_ALLOC_CONF=pinned_max_round_threshold_mb:1 (exact-size pinned host blocks,
         # ~1.0x instead of ~1.9x the weights in host RAM) must NOT be set with the cumem
         # backend: with it every sleep after the first wake fails in CuMemAllocator.sleep
@@ -286,6 +291,14 @@ data:
       service_name: tre-gateway
       service_namespace: envoy-gateway-system
       service_port: 80
+      # Idle timeout of Envoy's upstream connections to the model pods (Envoy's own default
+      # is 1 h). Must be >= 1 s BELOW the keep-alive of the server on the pod's port 8000
+      # (reissue.server_keepalive_s with the sidecar, else vLLM's VLLM_HTTP_TIMEOUT_KEEP_ALIVE;
+      # the registry validates it): the sender closes idle connections first, else Envoy
+      # reuses a connection the pod is closing (503 UC). Keep the hand-written values equal
+      # (a guard test enforces it): the ORIGINAL_DST clusters in
+      # overlays/tre-v2/gateway-extproc.yaml and gateway-hardening/backendtrafficpolicy-tre-v2.yaml.
+      upstream_idle_timeout_s: 60
     # Retry / continuation sidecar in every model pod (plan 2026-09-27 D5/D6; design
     # tre/docs/design/20260927-reissue-sidecar-v2.md). Every key is optional; the values
     # below are the built-in defaults. The sidecar takes the serving port 8000 and vLLM
@@ -303,6 +316,19 @@ data:
       vllm_port: 8001
       max_depth: 3
       retry_attempts: 4
+      # Optional keys of the 2026-09-30 keep-alive fixes (defaults shown, deliberately left as
+      # comments): controller, service-manager and UI of 20260930-f8ccb0ca and older REJECT
+      # unknown reissue keys (parse_reissue_config raises; a controller would crashloop and
+      # the UI's PUT /api/params would fail). Write them into the LIVE registry only after
+      # controller, SM and UI are ALL upgraded to an image that knows them. A guard test
+      # (deploy/tests/test_reissue_manifests.py) keeps this section within the old key set.
+      #   upstream_keepalive_s: 2        # loopback sidecar -> vLLM pool idle; <= every model's
+      #                                  # VLLM_HTTP_TIMEOUT_KEEP_ALIVE - 1 (registry-validated)
+      #   local_reconnect_attempts: 1    # fresh-connection re-sends before the first byte (0 = off)
+      #   local_reconnect_window_s: 1    # ... only within this many s of the connection being
+      #                                  # handed out (the keep-alive race fails at once)
+      #   server_keepalive_s: 75         # sidecar's own HTTP server (Envoy -> sidecar); must be
+      #                                  # >= 1 s above gateway.upstream_idle_timeout_s
       # null = the model's vllm_image (python3 + aiohttp; the script comes from a ConfigMap).
       image: null
       cpu_request: 50m

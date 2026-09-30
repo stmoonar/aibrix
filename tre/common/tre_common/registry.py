@@ -289,6 +289,16 @@ DEFAULT_NO_DRAIN_PATHS: tuple[str, ...] = ("safescale_commit", "urgent", "apa")
 #: the service-manager drain hard cap (no request can outlive it anyway).
 DEFAULT_ROUTE_TIMEOUT_S = 150.0
 
+#: Default ``gateway.upstream_idle_timeout_s``: how long the tre-v2 Envoy keeps an idle
+#: connection to a model pod (Envoy's own default is 1 h). It must stay BELOW the server
+#: keep-alive of whatever answers on the pod's serving port (the reissue sidecar's
+#: ``server_keepalive_s``, else vLLM's ``VLLM_HTTP_TIMEOUT_KEEP_ALIVE``): the side that
+#: sends requests closes idle connections first, otherwise Envoy reuses a connection the
+#: server is closing (503 UC / reset).
+DEFAULT_GATEWAY_UPSTREAM_IDLE_S = 60.0
+#: Minimum margin (s) between a client's idle limit and the server's keep-alive.
+KEEPALIVE_MARGIN_S = 1.0
+
 #: ``service_manager.sleep.vllm_sleep_mode_param`` values.
 SLEEP_MODE_PARAM_CHOICES = ("auto", "true", "false")
 
@@ -316,6 +326,17 @@ SLEEP_MODE_BACKENDS = ("cumem", "pinned_weights")
 DEFAULT_VLLM_ENV: dict[str, str] = {"VLLM_SERVER_DEV_MODE": "1"}
 #: Set per binding by the manifest generator; the registry may not set them.
 RESERVED_VLLM_ENV = frozenset({"NVIDIA_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES"})
+#: vLLM's HTTP keep-alive (uvicorn ``timeout_keep_alive``): an idle client connection is
+#: closed by vLLM after this many seconds; vLLM's default when the variable is unset.
+VLLM_KEEP_ALIVE_ENV = "VLLM_HTTP_TIMEOUT_KEEP_ALIVE"
+VLLM_DEFAULT_KEEP_ALIVE_S = 5.0
+
+
+def vllm_keep_alive_s(env: dict[str, str]) -> float:
+    """vLLM's effective keep-alive for a container environment. vLLM parses the variable
+    with ``int()``, so anything else is a ValueError here too."""
+    raw = env.get(VLLM_KEEP_ALIVE_ENV)
+    return VLLM_DEFAULT_KEEP_ALIVE_S if raw in (None, "") else float(int(raw))
 
 
 @dataclass(frozen=True)
@@ -367,6 +388,21 @@ class ReissueConfig:
     max_depth: int = 3
     #: Gateway attempts per retry / continuation.
     retry_attempts: int = 4
+    #: Idle keep-alive (s) of the sidecar's pooled connections to the local vLLM. Must be
+    #: below vLLM's own keep-alive (``VLLM_HTTP_TIMEOUT_KEEP_ALIVE`` of every model, default
+    #: 5 s), else the sidecar reuses connections vLLM is closing (502s before 2026-09-30).
+    upstream_keepalive_s: float = 2.0
+    #: Fresh-connection re-sends after a pooled connection to the local vLLM failed before
+    #: the first response byte (0 = off).
+    local_reconnect_attempts: int = 1
+    #: The re-send above happens only when the failure came within this many seconds of the
+    #: pooled connection being handed to the request (the keep-alive race fails at once; a
+    #: later failure may have run the request).
+    local_reconnect_window_s: float = 1.0
+    #: Keep-alive (s) of the sidecar's own HTTP server, i.e. how long it keeps an idle
+    #: connection from Envoy. Must be at least 1 s ABOVE ``gateway.upstream_idle_timeout_s``
+    #: (Envoy, the sender, closes first). aiohttp's default is 75.
+    server_keepalive_s: float = 75.0
     #: None = the model's vllm_image (it ships python3 + aiohttp; the script comes from
     #: a ConfigMap, so no image build is needed).
     image: str | None = None
@@ -543,6 +579,11 @@ class GatewayConfig:
     service_name: str = DEFAULT_GATEWAY_SERVICE_NAME
     service_namespace: str = DEFAULT_GATEWAY_SERVICE_NAMESPACE
     service_port: int = DEFAULT_GATEWAY_SERVICE_PORT
+    #: Idle timeout (s) of Envoy's upstream connections to the model pods (see
+    #: ``DEFAULT_GATEWAY_UPSTREAM_IDLE_S``). The single source for the hand-written
+    #: ``connection_idle``/``idle_timeout`` of the ORIGINAL_DST clusters and the
+    #: BackendTrafficPolicy ``connectionIdleTimeout`` (a guard test keeps them equal).
+    upstream_idle_timeout_s: float = DEFAULT_GATEWAY_UPSTREAM_IDLE_S
 
     @property
     def internal_url(self) -> str:
@@ -918,6 +959,43 @@ class Registry:
         if self._topology.max_bound_per_gpu < 1:
             errors.append("cluster.max_bound_per_gpu must be >= 1")
         errors.extend(_validate_reissue(self._reissue))
+        if self._reissue.enabled:
+            for model in self._models:
+                try:
+                    server_keep_alive = vllm_keep_alive_s(self.vllm_env_for(model))
+                except ValueError:
+                    errors.append(f"model {model.name}: {VLLM_KEEP_ALIVE_ENV} must be an integer number of seconds")
+                    continue
+                # >= 1 s margin: the sidecar's pool clock lags vLLM's idle clock under
+                # CPU throttling (same rule as the sidecar's startup check).
+                if self._reissue.upstream_keepalive_s > server_keep_alive - 1.0:
+                    errors.append(
+                        f"model {model.name}: reissue.upstream_keepalive_s ({self._reissue.upstream_keepalive_s}) "
+                        f"must be at least 1 s below vLLM's {VLLM_KEEP_ALIVE_ENV} ({server_keep_alive})"
+                    )
+        # Envoy -> model pod: the connection is closed by the side that sends requests, so
+        # Envoy's idle timeout must be below the keep-alive of whatever serves port 8000
+        # (the sidecar when enabled, else vLLM itself).
+        idle = self._gateway.upstream_idle_timeout_s
+        if not math.isfinite(idle) or idle <= 0:
+            errors.append("gateway.upstream_idle_timeout_s must be positive")
+        elif self._reissue.enabled:
+            if self._reissue.server_keepalive_s < idle + KEEPALIVE_MARGIN_S:
+                errors.append(
+                    f"reissue.server_keepalive_s ({self._reissue.server_keepalive_s:g}) must be at least "
+                    f"{KEEPALIVE_MARGIN_S:g} s above gateway.upstream_idle_timeout_s ({idle:g})"
+                )
+        else:
+            for model in self._models:
+                try:
+                    server_keep_alive = vllm_keep_alive_s(self.vllm_env_for(model))
+                except ValueError:
+                    continue  # reported above / by the env validation
+                if server_keep_alive < idle + KEEPALIVE_MARGIN_S:
+                    errors.append(
+                        f"model {model.name}: vLLM's {VLLM_KEEP_ALIVE_ENV} ({server_keep_alive:g}) must be at "
+                        f"least {KEEPALIVE_MARGIN_S:g} s above gateway.upstream_idle_timeout_s ({idle:g})"
+                    )
         if self._placement.reserve_tp_pairs < 0:
             errors.append("placement.reserve_tp_pairs must be >= 0")
         errors.extend(_validate_vllm_env("vllm.env", self._vllm.env))
@@ -1083,6 +1161,10 @@ def parse_reissue_config(raw: Any) -> ReissueConfig:
         vllm_port=int(raw.get("vllm_port", defaults.vllm_port)),
         max_depth=int(raw.get("max_depth", defaults.max_depth)),
         retry_attempts=int(raw.get("retry_attempts", defaults.retry_attempts)),
+        upstream_keepalive_s=float(raw.get("upstream_keepalive_s", defaults.upstream_keepalive_s)),
+        local_reconnect_attempts=int(raw.get("local_reconnect_attempts", defaults.local_reconnect_attempts)),
+        local_reconnect_window_s=float(raw.get("local_reconnect_window_s", defaults.local_reconnect_window_s)),
+        server_keepalive_s=float(raw.get("server_keepalive_s", defaults.server_keepalive_s)),
         image=(str(raw["image"]) if raw.get("image") else None),
         configmap=str(raw.get("configmap", defaults.configmap)),
         namespace=str(raw.get("namespace", defaults.namespace)),
@@ -1104,6 +1186,14 @@ def _validate_reissue(reissue: ReissueConfig) -> list[str]:
         errors.append(f"reissue.vllm_port must be a valid port other than {POD_SERVING_PORT}")
     if reissue.max_depth < 0:
         errors.append("reissue.max_depth must be non-negative")
+    if not reissue.upstream_keepalive_s > 0:
+        errors.append("reissue.upstream_keepalive_s must be > 0")
+    if reissue.local_reconnect_attempts < 0:
+        errors.append("reissue.local_reconnect_attempts must be >= 0")
+    if not reissue.local_reconnect_window_s >= 0:
+        errors.append("reissue.local_reconnect_window_s must be >= 0")
+    if not reissue.server_keepalive_s > 0:
+        errors.append("reissue.server_keepalive_s must be > 0")
     if reissue.retry_attempts < 1:
         errors.append("reissue.retry_attempts must be >= 1")
     for key in reissue.extra_env:
@@ -1116,8 +1206,10 @@ def parse_gateway_config(raw: dict[str, Any] | None) -> GatewayConfig:
     """Parse the optional ``gateway:`` registry section."""
     raw = raw or {}
     timeout = raw.get("route_timeout_s")
+    idle = raw.get("upstream_idle_timeout_s")
     return GatewayConfig(
         route_timeout_s=float(DEFAULT_ROUTE_TIMEOUT_S if timeout is None else timeout),
+        upstream_idle_timeout_s=float(DEFAULT_GATEWAY_UPSTREAM_IDLE_S if idle is None else idle),
         service_name=str(raw.get("service_name") or DEFAULT_GATEWAY_SERVICE_NAME),
         service_namespace=str(raw.get("service_namespace") or DEFAULT_GATEWAY_SERVICE_NAMESPACE),
         service_port=int(raw.get("service_port") or DEFAULT_GATEWAY_SERVICE_PORT),

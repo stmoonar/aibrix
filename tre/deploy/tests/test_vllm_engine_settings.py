@@ -119,6 +119,9 @@ def test_shipped_registry_runs_the_030_fork_with_default_cumem():
         assert env["VLLM_SERVER_DEV_MODE"] == "1"
         # pinned_max_round_threshold_mb breaks the second cumem sleep (2026-09-28).
         assert "PYTORCH_ALLOC_CONF" not in env
+        # vLLM must not close idle loopback connections the reissue sidecar is about to
+        # reuse (2026-09-30 smoke: 502s); the sidecar pools them 2 s.
+        assert env["VLLM_HTTP_TIMEOUT_KEEP_ALIVE"] == "75"
     # v1 alignment (2026-09-29): no model pins --max-model-len; each serves its own maximum.
     assert all(model.max_model_len is None for model in registry.models())
 
