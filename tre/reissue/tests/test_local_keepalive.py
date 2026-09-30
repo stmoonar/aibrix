@@ -88,7 +88,8 @@ async def serve_sidecar(upstream_url: str, **overrides):
         await server.close()
 
 
-async def run_bursts(url: str, sidecar: ReissueSidecar, *, min_bursts: int, max_bursts: int, until) -> dict:
+async def run_bursts(url: str, sidecar: ReissueSidecar, *, min_bursts: int, max_bursts: int, until,
+                     gaps: tuple[float, ...] | None = None) -> dict:
     """Bursts of 100 concurrent requests (half streaming). Generations take 0.05-0.5 s, so
     the pooled connections are released over ~0.45 s and uvicorn closes each one 1 s
     later; the next burst starts 0.55-0.95 s after the last response, i.e. while those
@@ -109,7 +110,7 @@ async def run_bursts(url: str, sidecar: ReissueSidecar, *, min_bursts: int, max_
             await asyncio.gather(*(one(i) for i in range(100)))
             if burst + 1 >= min_bursts and until(sidecar, statuses):
                 break
-            await asyncio.sleep(random.uniform(0.55, 0.95))
+            await asyncio.sleep(gaps[burst % len(gaps)] if gaps else random.uniform(0.55, 0.95))
     return {"statuses": statuses, "errors": bodies, "bursts": burst + 1}
 
 
@@ -156,12 +157,15 @@ async def test_without_the_fix_the_race_fails_requests_with_503_not_502():
 async def test_pool_keepalive_below_the_server_keepalive_alone_avoids_the_race():
     """Layer 1 alone (no re-send): a pool keep-alive of 0.7 s (server 1 s) still reuses
     young connections across bursts (asserted), but drops the ones near uvicorn's close. The
-    unfixed control fails ~0.3-0.5 requests per burst, so 8 clean bursts is a real test."""
+    unfixed control fails ~0.3-0.5 requests per burst, so 9 clean bursts is a real test.
+    The gaps between bursts are a fixed cycle (0.3 / 0.6 / 0.9 s): the 0.3 s ones guarantee
+    connections idle < 0.7 s at the next burst, i.e. reuse (random gaps sometimes gave none)."""
     async with uvicorn_upstream() as upstream, serve_sidecar(
         upstream, upstream_keepalive_s=0.7, local_reconnect_attempts=0
     ) as (sidecar, url):
-        out = await run_bursts(url, sidecar, min_bursts=8, max_bursts=8, until=lambda *_: True)
-        assert out["statuses"] == {200: 800}, out
+        out = await run_bursts(url, sidecar, min_bursts=9, max_bursts=9, until=lambda *_: True,
+                               gaps=(0.3, 0.6, 0.9))
+        assert out["statuses"] == {200: 900}, out
         assert sidecar.metrics.reconnect == {"ok": 0, "fail": 0}
         # connections idle < 0.7 s are still reused (~20-30 per run); those idle ~1 s, the
         # ones uvicorn closes, are dropped by the pool instead
@@ -304,6 +308,11 @@ async def test_reused_connection_failing_late_is_resent_only_within_the_window(w
         else:
             assert status == 503 and headers["Retry-After"] == "1" and len(upstream.requests) == 2
             assert sidecar.metrics.reconnect == {"ok": 0, "fail": 0}
+            assert sidecar.metrics.reconnect_outside_window == 1
+            text = sidecar.metrics.render(sidecar.state)
+            assert 'tre_reissue_local_reconnect_total{model="m",result="outside_window"} 1' in text
+        if resent:
+            assert sidecar.metrics.reconnect_outside_window == 0
 
 
 @pytest.mark.asyncio

@@ -366,3 +366,7 @@ Known limitations (deferred, see the local backlog): SafeScale P2-2 / P3-1..P3-6
 implementation review; a SafeScale commit does not re-check the floor when a remaining
 pod drops out during the probe (the probed pod is already hidden, so the commit's
 floor guard sees nothing to remove) - abnormal path only.
+
+## 2026-09-30 addendum: reissue keep-alive keys (registry compatibility)
+
+The keep-alive fixes add reissue keys (`upstream_keepalive_s`, `local_reconnect_attempts`, `local_reconnect_window_s`, `server_keepalive_s`). Controller, service-manager and UI of 20260930-f8ccb0ca and older raise on unknown reissue keys (controller crashloop, UI `PUT /api/params` fails), so the repo registry keeps them commented out (defaults apply). Write them into the live registry only after controller, SM and UI are ALL upgraded to an image containing this change. `gateway.upstream_idle_timeout_s` is ignored by older versions and may be set at any time. The aibrix-system gateway (31592) keeps Envoy's default 1 h upstream idle timeout (ADR-0008: not changed); both experiment arms use 31094, so they are unaffected.

@@ -316,20 +316,19 @@ data:
       vllm_port: 8001
       max_depth: 3
       retry_attempts: 4
-      # Loopback hop sidecar -> vLLM (2026-09-30). NOTE: a service-manager older than this
-      # change rejects these keys (unknown reissue keys): deploy the new SM first.
-      # Idle keep-alive of the sidecar's pooled connections to vLLM: <= every model's
-      # VLLM_HTTP_TIMEOUT_KEEP_ALIVE - 1 (registry-validated).
-      upstream_keepalive_s: 2
-      # Fresh-connection re-sends after a pooled connection failed before the first byte
-      # (0 = off) ...
-      local_reconnect_attempts: 1
-      # ... but only when the failure came within this many seconds of the connection being
-      # handed to the request (the keep-alive race fails at once; a later one may have run).
-      local_reconnect_window_s: 1
-      # Hop Envoy -> sidecar: keep-alive of the sidecar's own HTTP server. Must be >= 1 s
-      # ABOVE gateway.upstream_idle_timeout_s (registry-validated; aiohttp default 75).
-      server_keepalive_s: 75
+      # Optional keys of the 2026-09-30 keep-alive fixes (defaults shown, deliberately left as
+      # comments): controller, service-manager and UI of 20260930-f8ccb0ca and older REJECT
+      # unknown reissue keys (parse_reissue_config raises; a controller would crashloop and
+      # the UI's PUT /api/params would fail). Write them into the LIVE registry only after
+      # controller, SM and UI are ALL upgraded to an image that knows them. A guard test
+      # (deploy/tests/test_reissue_manifests.py) keeps this section within the old key set.
+      #   upstream_keepalive_s: 2        # loopback sidecar -> vLLM pool idle; <= every model's
+      #                                  # VLLM_HTTP_TIMEOUT_KEEP_ALIVE - 1 (registry-validated)
+      #   local_reconnect_attempts: 1    # fresh-connection re-sends before the first byte (0 = off)
+      #   local_reconnect_window_s: 1    # ... only within this many s of the connection being
+      #                                  # handed out (the keep-alive race fails at once)
+      #   server_keepalive_s: 75         # sidecar's own HTTP server (Envoy -> sidecar); must be
+      #                                  # >= 1 s above gateway.upstream_idle_timeout_s
       # null = the model's vllm_image (python3 + aiohttp; the script comes from a ConfigMap).
       image: null
       cpu_request: 50m

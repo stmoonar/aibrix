@@ -386,6 +386,9 @@ class Metrics:
         #: Fresh-connection re-sends to the local engine, per attempt (see
         #: ``ReissueSidecar._local_request``).
         self.reconnect: dict[str, int] = {"ok": 0, "fail": 0}
+        #: Stale-connection failures on a reused connection NOT re-sent because they came
+        #: later than ``local_reconnect_window_s`` after the connection was handed out.
+        self.reconnect_outside_window = 0
 
     def observe_added(self, added: "AddedTime") -> None:
         added.stop()
@@ -453,12 +456,16 @@ class Metrics:
         lines += [
             "# HELP tre_reissue_local_reconnect_total Re-sends to the local engine on a fresh "
             "connection after the pooled connection failed before any response byte (keep-alive "
-            "race: disconnect / ECONNRESET / EPIPE), per attempt.",
+            "race: disconnect / ECONNRESET / EPIPE), per attempt; result=outside_window counts "
+            "failures on a reused connection that came too late (local_reconnect_window_s) to be "
+            "the race and were not re-sent.",
             "# TYPE tre_reissue_local_reconnect_total counter",
         ]
         for result in ("ok", "fail"):
             lines.append(f'tre_reissue_local_reconnect_total{{model="{model}",result="{result}"}} '
                          f'{self.reconnect[result]}')
+        lines.append(f'tre_reissue_local_reconnect_total{{model="{model}",result="outside_window"}} '
+                     f'{self.reconnect_outside_window}')
         lines += [
             "# HELP tre_reissue_sleeping 1 while the local engine is (going to) sleep.",
             "# TYPE tre_reissue_sleeping gauge",
@@ -1085,8 +1092,14 @@ class ReissueSidecar:
             return await self.local.request(method, url, trace_request_ctx=marker, **kwargs)
         except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
             if (not marker["reused"] or not is_stale_connection_error(exc)
-                    or self.cfg.local_reconnect_attempts < 1
-                    or time.monotonic() - marker["reused_at"] > self.cfg.local_reconnect_window_s):
+                    or self.cfg.local_reconnect_attempts < 1):
+                raise
+            if time.monotonic() - marker["reused_at"] > self.cfg.local_reconnect_window_s:
+                self.metrics.reconnect_outside_window += 1
+                self._warn("local_reconnect_outside_window", {
+                    "event": "tre_local_reconnect_outside_window", "path": url,
+                    "window_s": self.cfg.local_reconnect_window_s,
+                    "error": f"{type(exc).__name__}: {exc}"[:300]})
                 raise
             first = exc
         last: BaseException = first

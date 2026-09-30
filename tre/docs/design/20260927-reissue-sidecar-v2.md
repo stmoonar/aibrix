@@ -80,11 +80,17 @@ Envoy 上游连接空闲超时默认 1 h，表现是 Envoy 自己回 503（`UC`/
 - sidecar 服务端 keep-alive 可配：registry `reissue.server_keepalive_s`（默认 75，= aiohttp 默认），传给 `web.run_app(keepalive_timeout=...)`。
   registry 校验 `reissue.server_keepalive_s >= gateway.upstream_idle_timeout_s + 1`（默认 75 vs 60）；sidecar 关闭时改校验每个模型的 `VLLM_HTTP_TIMEOUT_KEEP_ALIVE`。
   单一来源是 registry `gateway.upstream_idle_timeout_s`（默认 60），守卫测试要求两份手写 YAML 与它相等。sidecar 启动时也做同样的检查（不满足只打 WARNING）。
-- 路由上没有 retry_policy（没有 retry_on），本次**不加**：对 POST 生成请求，Envoy 的 `reset` / `connect-failure` 重试无法区分“请求没被执行”和“执行了一半”，
-  `reset-before-request` 需要更新的 Envoy 才有，且窗口很窄。要不要加留给用户决定。
+- 路由上没有 retry_policy（没有 retry_on），本次**不加**：Envoy 1.33.2 已支持 `reset-before-request`，但 POST 生成请求的请求体可能已经写出，
+  且 ORIGINAL_DST 集群重试仍会打到同一个 pod（目标由 `target-pod` 头决定），换不了 pod；`reset` / `connect-failure` 更分不清“没执行”和“执行了一半”。
+  要不要加留给用户决定。
+- **aibrix-system 网关（31592）路径不在本次范围**：它也能路由到这些 pod，Envoy 空闲超时仍是默认 1 h，这一跳的竞态在该路径上依旧存在。
+  按 ADR-0008 不改 aibrix-system；实验两臂都走 31094（`campaign_queue.py` 的 GATEWAYS，第 80-90 行附近），所以实验不受影响。
 - 重发窗口（P2-1）：`local_reconnect_window_s`（默认 1 s）：拿到复用连接后超过这个时间才失败的请求（例如 vLLM 在长生成中途崩溃）不再重发，避免重复执行。
 - `upstream_keepalive_s` / `local_reconnect_attempts` / `local_reconnect_window_s` / `server_keepalive_s` 现在都写在仓库 registry.yaml 里；
-  **旧 SM 拒绝未知 reissue 键，须先升级 SM 再写入 live registry**。
+  **仓库 registry.yaml 里这四个键保持注释**：线上 controller / SM / UI（20260930-f8ccb0ca 及更早）的 `parse_reissue_config` 遇未知 reissue 键会 raise
+  （controller 启动即 crashloop，UI 的 `PUT /api/params` 全部失败）。**controller、SM、UI 三个镜像全部升级到含本提交的版本之后，才可在 live registry 里显式写这些键**
+  （不写时用代码默认值，行为相同）；守卫测试断言 registry.yaml 的 reissue 段只含旧版已知键。`gateway.upstream_idle_timeout_s` 旧版会忽略，可直接写。
+- 重发窗口之外失败的请求计入 `tre_reissue_local_reconnect_total{result="outside_window"}` 并写 WARNING `tre_local_reconnect_outside_window`。
 - 指标 `tre_reissue_gap_seconds` 拆出 label `mode`：`stream` = abort 到首个续发 token，`nonstream` = abort 到完整续发响应（含续发生成时间），两者不可比。
 - aiohttp 对幂等方法（GET/HEAD/OPTIONS/TRACE/PUT/DELETE）在持久连接失败时已内置重试一次；POST 没有，所以生成请求的重发只靠本层。
 
@@ -194,11 +200,11 @@ reissue:
   memory_request: 64Mi
   memory_limit: 256Mi
   extra_env: {}            # 额外 TRE_* 环境变量（字段名 / 头名覆盖）
-  # 2026-09-30（旧 SM 会拒绝这些键，须先升级 SM）：
-  upstream_keepalive_s: 2       # 须小于每个模型的 VLLM_HTTP_TIMEOUT_KEEP_ALIVE（registry 校验）
-  local_reconnect_attempts: 1
-  local_reconnect_window_s: 1   # 拿到复用连接后超过此时间才失败的不重发
-  server_keepalive_s: 75        # sidecar 自己的 HTTP 服务端 keep-alive；须比 gateway.upstream_idle_timeout_s 至少大 1 s
+  # 2026-09-30（旧版 controller/SM/UI 拒绝这些键：三个镜像都升级之后才可写进 live registry，仓库里保持注释）：
+  # upstream_keepalive_s: 2       # 须小于每个模型的 VLLM_HTTP_TIMEOUT_KEEP_ALIVE（registry 校验）
+  # local_reconnect_attempts: 1
+  # local_reconnect_window_s: 1   # 拿到复用连接后超过此时间才失败的不重发
+  # server_keepalive_s: 75        # sidecar 自己的 HTTP 服务端 keep-alive；须比 gateway.upstream_idle_timeout_s 至少大 1 s
 gateway:
   upstream_idle_timeout_s: 60   # Envoy 上游空闲连接超时；手写 YAML 里的值须相等（守卫测试）
 vllm:

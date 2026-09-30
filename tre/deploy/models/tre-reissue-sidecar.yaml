@@ -237,19 +237,22 @@ data:
     \ = {\"stream\": Histogram(GAP_BUCKETS_S), \"nonstream\": Histogram(GAP_BUCKETS_S)}\n\
     \        #: Fresh-connection re-sends to the local engine, per attempt (see\n\
     \        #: ``ReissueSidecar._local_request``).\n        self.reconnect: dict[str,\
-    \ int] = {\"ok\": 0, \"fail\": 0}\n\n    def observe_added(self, added: \"AddedTime\"\
-    ) -> None:\n        added.stop()\n        if not added.relayed:\n            return\n\
-    \        self.overhead.observe(added.total)\n        self.forward.observe(added.forward)\n\
-    \        self.relay.observe(added.relay)\n\n    def count(self, kind: str, reason:\
-    \ str) -> None:\n        key = (kind, reason)\n        self.reissue[key] = self.reissue.get(key,\
-    \ 0) + 1\n\n    def total(self, kind: str) -> int:\n        return sum(v for (k,\
-    \ _), v in self.reissue.items() if k == kind)\n\n    def event(self, name: str)\
-    \ -> None:\n        self.events[name] = self.events.get(name, 0) + 1\n\n    def\
-    \ render(self, state: \"SleepState\") -> str:\n        model = _label(self.model)\n\
-    \        lines = [\n            \"# HELP tre_reissue_total Requests the sidecar\
-    \ retried, continued, failed to \"\n            \"save, or passed an abort through\
-    \ for.\",\n            \"# TYPE tre_reissue_total counter\",\n        ]\n    \
-    \    for (kind, reason), value in sorted(self.reissue.items()):\n            lines.append(f'tre_reissue_total{{model=\"\
+    \ int] = {\"ok\": 0, \"fail\": 0}\n        #: Stale-connection failures on a reused\
+    \ connection NOT re-sent because they came\n        #: later than ``local_reconnect_window_s``\
+    \ after the connection was handed out.\n        self.reconnect_outside_window\
+    \ = 0\n\n    def observe_added(self, added: \"AddedTime\") -> None:\n        added.stop()\n\
+    \        if not added.relayed:\n            return\n        self.overhead.observe(added.total)\n\
+    \        self.forward.observe(added.forward)\n        self.relay.observe(added.relay)\n\
+    \n    def count(self, kind: str, reason: str) -> None:\n        key = (kind, reason)\n\
+    \        self.reissue[key] = self.reissue.get(key, 0) + 1\n\n    def total(self,\
+    \ kind: str) -> int:\n        return sum(v for (k, _), v in self.reissue.items()\
+    \ if k == kind)\n\n    def event(self, name: str) -> None:\n        self.events[name]\
+    \ = self.events.get(name, 0) + 1\n\n    def render(self, state: \"SleepState\"\
+    ) -> str:\n        model = _label(self.model)\n        lines = [\n           \
+    \ \"# HELP tre_reissue_total Requests the sidecar retried, continued, failed to\
+    \ \"\n            \"save, or passed an abort through for.\",\n            \"#\
+    \ TYPE tre_reissue_total counter\",\n        ]\n        for (kind, reason), value\
+    \ in sorted(self.reissue.items()):\n            lines.append(f'tre_reissue_total{{model=\"\
     {model}\",kind=\"{kind}\",reason=\"{reason}\"}} {value}')\n        lines += [\n\
     \            \"# HELP tre_reissue_proxy_added_seconds Time the sidecar itself\
     \ adds to a request \"\n            \"answered by the local engine: forward (full\
@@ -283,10 +286,14 @@ data:
     }} {value}')\n        lines += [\n            \"# HELP tre_reissue_local_reconnect_total\
     \ Re-sends to the local engine on a fresh \"\n            \"connection after the\
     \ pooled connection failed before any response byte (keep-alive \"\n         \
-    \   \"race: disconnect / ECONNRESET / EPIPE), per attempt.\",\n            \"\
-    # TYPE tre_reissue_local_reconnect_total counter\",\n        ]\n        for result\
-    \ in (\"ok\", \"fail\"):\n            lines.append(f'tre_reissue_local_reconnect_total{{model=\"\
+    \   \"race: disconnect / ECONNRESET / EPIPE), per attempt; result=outside_window\
+    \ counts \"\n            \"failures on a reused connection that came too late\
+    \ (local_reconnect_window_s) to be \"\n            \"the race and were not re-sent.\"\
+    ,\n            \"# TYPE tre_reissue_local_reconnect_total counter\",\n       \
+    \ ]\n        for result in (\"ok\", \"fail\"):\n            lines.append(f'tre_reissue_local_reconnect_total{{model=\"\
     {model}\",result=\"{result}\"}} '\n                         f'{self.reconnect[result]}')\n\
+    \        lines.append(f'tre_reissue_local_reconnect_total{{model=\"{model}\",result=\"\
+    outside_window\"}} '\n                     f'{self.reconnect_outside_window}')\n\
     \        lines += [\n            \"# HELP tre_reissue_sleeping 1 while the local\
     \ engine is (going to) sleep.\",\n            \"# TYPE tre_reissue_sleeping gauge\"\
     ,\n            f'tre_reissue_sleeping{{model=\"{model}\"}} {1 if state.active\
@@ -633,17 +640,21 @@ data:
     \         return await self.local.request(method, url, trace_request_ctx=marker,\
     \ **kwargs)\n        except (aiohttp.ClientError, asyncio.TimeoutError, OSError)\
     \ as exc:\n            if (not marker[\"reused\"] or not is_stale_connection_error(exc)\n\
-    \                    or self.cfg.local_reconnect_attempts < 1\n              \
-    \      or time.monotonic() - marker[\"reused_at\"] > self.cfg.local_reconnect_window_s):\n\
-    \                raise\n            first = exc\n        last: BaseException =\
-    \ first\n        for _ in range(self.cfg.local_reconnect_attempts):\n        \
-    \    try:\n                resp = await self.local_fresh.request(method, url,\
-    \ **kwargs)\n            except (aiohttp.ClientError, asyncio.TimeoutError, OSError)\
-    \ as exc:\n                self.metrics.reconnect[\"fail\"] += 1\n           \
-    \     last = exc\n                if not is_stale_connection_error(exc):\n   \
-    \                 break  # refused / timed out: another fresh connection does\
-    \ not help\n                continue\n            self.metrics.reconnect[\"ok\"\
-    ] += 1\n            self._warn(\"local_reconnect\", {\"event\": \"tre_local_reconnect\"\
+    \                    or self.cfg.local_reconnect_attempts < 1):\n            \
+    \    raise\n            if time.monotonic() - marker[\"reused_at\"] > self.cfg.local_reconnect_window_s:\n\
+    \                self.metrics.reconnect_outside_window += 1\n                self._warn(\"\
+    local_reconnect_outside_window\", {\n                    \"event\": \"tre_local_reconnect_outside_window\"\
+    , \"path\": url,\n                    \"window_s\": self.cfg.local_reconnect_window_s,\n\
+    \                    \"error\": f\"{type(exc).__name__}: {exc}\"[:300]})\n   \
+    \             raise\n            first = exc\n        last: BaseException = first\n\
+    \        for _ in range(self.cfg.local_reconnect_attempts):\n            try:\n\
+    \                resp = await self.local_fresh.request(method, url, **kwargs)\n\
+    \            except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:\n\
+    \                self.metrics.reconnect[\"fail\"] += 1\n                last =\
+    \ exc\n                if not is_stale_connection_error(exc):\n              \
+    \      break  # refused / timed out: another fresh connection does not help\n\
+    \                continue\n            self.metrics.reconnect[\"ok\"] += 1\n \
+    \           self._warn(\"local_reconnect\", {\"event\": \"tre_local_reconnect\"\
     , \"result\": \"ok\", \"path\": url,\n                                       \
     \    \"error\": f\"{type(first).__name__}: {first}\"[:300]})\n            return\
     \ resp\n        raise last\n\n    def _warn(self, kind: str, record: dict) ->\

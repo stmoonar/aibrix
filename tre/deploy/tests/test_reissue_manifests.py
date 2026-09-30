@@ -284,3 +284,28 @@ def test_gateway_url_follows_the_gateway_service_settings(tmp_path):
     env = _env(_containers(build_deployments(registry)[0])[REISSUE_CONTAINER])
     assert env["TRE_GATEWAY_URL"] == "http://gw.proxies.svc.cluster.local:8080"
     assert registry.reissue().gateway_url is None  # derived, not stored
+
+
+#: ``reissue:`` keys known to controller / SM / UI 20260930-f8ccb0ca (its ReissueConfig fields):
+#: that parser raises on any other key, so the repo registry (which is what gets merged into
+#: the live one) may not carry a newer key until all three images are upgraded.
+F8CCB0CA_REISSUE_KEYS = {
+    "enabled", "gateway_url", "vllm_port", "max_depth", "retry_attempts", "image", "configmap",
+    "namespace", "cpu_request", "cpu_limit", "memory_request", "memory_limit", "extra_env",
+}
+
+
+@pytest.mark.parametrize(
+    "path",
+    [DEPLOY_ROOT / "registry.yaml", DEPLOY_ROOT / "overlays" / "tre-v2" / "params.yaml"],
+    ids=["registry.yaml", "params.yaml"],
+)
+def test_repo_registry_reissue_section_is_accepted_by_the_deployed_parser(path):
+    text = path.read_text(encoding="utf-8")
+    if path.name == "params.yaml":
+        text = yaml.safe_load(text)["data"]["registry.yaml"]
+    keys = set(yaml.safe_load(text)["reissue"])
+    assert keys <= F8CCB0CA_REISSUE_KEYS, (
+        f"{sorted(keys - F8CCB0CA_REISSUE_KEYS)} would crash the deployed controller / SM / UI "
+        "(unknown reissue keys raise); keep them commented out until all three are upgraded"
+    )
