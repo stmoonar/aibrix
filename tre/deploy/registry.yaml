@@ -53,7 +53,7 @@ models:
   # vLLM 0.30 fork image (plan 2026-09-27 D9): upstream ced6857af + pinned_weights
   # sleep backend + sleep rollback fix + --sleep-reject-new / --abort-return-token-ids.
   # A new image invalidates the calibrated theta (D9: recalibrate after migrating).
-  vllm_image: vllm-openai-tre:0.30.0-ts-2be2d647
+  vllm_image: vllm-openai-tre:0.30.0-ts-8dc0f2a7
   # Fork features of that image; their engine flags are rendered while reissue.enabled.
   vllm_features:
   - sleep_reject_new
@@ -120,7 +120,7 @@ models:
   # vLLM 0.30 fork image (plan 2026-09-27 D9): upstream ced6857af + pinned_weights
   # sleep backend + sleep rollback fix + --sleep-reject-new / --abort-return-token-ids.
   # A new image invalidates the calibrated theta (D9: recalibrate after migrating).
-  vllm_image: vllm-openai-tre:0.30.0-ts-2be2d647
+  vllm_image: vllm-openai-tre:0.30.0-ts-8dc0f2a7
   # Fork features of that image; their engine flags are rendered while reissue.enabled.
   vllm_features:
   - sleep_reject_new
@@ -174,9 +174,13 @@ models:
   - '2048'
   - --gpu-memory-utilization
   - '0.85'
-  # --max-model-len: at util 0.85 vLLM 0.30 leaves ~15.8 GiB of KV cache, below the
-  # 16 GiB of the model's full 131072-token context, and refuses to start without it.
-  max_model_len: 32768
+  # --max-model-len; null = the model's maximum (131072), as in v1. Measured 2026-09-29 (current
+  # 0.30 image): KV is 16.76 GiB / 137,248 tok regardless of sleeping neighbours (vLLM budgets
+  # util x total memory). Real risks: margin only ~0.76 GiB (one full-length request at a time),
+  # and an AWAKE same-GPU neighbour fails the startup free-memory check. If 8b will not start,
+  # read the log: free memory short -> sleep neighbour / reorder; KV < max_model_len -> pin this
+  # (commit + make manifests first, then merge live; changes the theta calibration basis).
+  max_model_len: null
 - name: dsqwen-14b
   weights_path: /data/nfs_shared_data/Models/DeepSeek-R1-Distill-Qwen-14B
   tp_size: 2
@@ -190,7 +194,7 @@ models:
   # vLLM 0.30 fork image (plan 2026-09-27 D9): upstream ced6857af + pinned_weights
   # sleep backend + sleep rollback fix + --sleep-reject-new / --abort-return-token-ids.
   # A new image invalidates the calibrated theta (D9: recalibrate after migrating).
-  vllm_image: vllm-openai-tre:0.30.0-ts-2be2d647
+  vllm_image: vllm-openai-tre:0.30.0-ts-8dc0f2a7
   # Fork features of that image; their engine flags are rendered while reissue.enabled.
   vllm_features:
   - sleep_reject_new
@@ -239,10 +243,13 @@ models:
   - --no-enable-prefix-caching
   - --max-num-seqs
   - '256'
+  - --enable-chunked-prefill
+  - --max-num-batched-tokens
+  - '2048'
   - --gpu-memory-utilization
   - '0.85'
-  # --max-model-len (was in vllm_extra_args).
-  max_model_len: 12288
+  # --max-model-len; null = the model's maximum (131072), as in v1.
+  max_model_len: null
 # vLLM container settings shared by every model pod (make manifests and the
 # service-manager's runtime creates). env merges over the built-in
 # VLLM_SERVER_DEV_MODE=1 (vLLM >= 0.2x mounts /sleep, /wake_up, /is_sleeping only in dev
@@ -325,9 +332,34 @@ service_manager:
   # Level of the service-manager's own loggers (tre_sm, tre_common): CRITICAL,
   # ERROR, WARNING, INFO or DEBUG; the TRE_SM_LOG_LEVEL env var overrides it.
   log_level: INFO
+  # Replica floor (2026-09-29): no hide or sleep may leave a model with fewer
+  # ROUTABLE replicas (awake, not hidden, Ready, no sleep reservation, not being
+  # woken) than its models[].min_replicas - both arms (TRE and APA) use it.
+  # SafeScale hide / urgent / scale_down / defrag: refused (409 floor_violation;
+  # the controller re-plans next tick). APA (/scale_service): target clamped.
+  # Startup admission: another replica is woken first (best effort, in its own
+  # writer phase, within max_awake_replicas; after the start converges the
+  # suspended resident stays asleep - a swap); if none can be woken the start
+  # is exempt (recorded, never retried on the floor). Fleet repair: exempt,
+  # recorded. Counters (persistent, Redis): GET /v2/sleep -> floor. false = off.
+  # A defrag move is make-before-break: max_awake_replicas may be exceeded by
+  # one for the duration of one move. The startup make-up never exceeds it (at
+  # the cap there is no make-up: the start is exempt).
+  replica_floor:
+    enforce: true
+    # WARNING log of a floor event at most once per (outcome, path, model) per
+    # this many seconds (counters always count; 0 = every event).
+    log_interval_s: 60
+  # A Pod whose startup gate is polling (asked within gate_seen_s) is reported
+  # as startup_admission_pending (informational, no fleet repair) instead of
+  # drift, for at most drift_grace_s since its first request; longer = drift.
+  startup_admission:
+    gate_seen_s: 30
+    drift_grace_s: 600
   sleep:
     # Every sleep runs hide (routable=false + route-gen bump) -> gateway plugin ack
-    # -> drain -> /sleep (D1/D2); no caller can skip a step.
+    # -> drain -> /sleep (D1/D2); no caller can skip a step, except that the paths in
+    # no_drain_paths (below) skip the drain and abort at once.
     # Max wait for every live gateway plugin instance to report the new route-gen.
     ack_timeout_s: 10
     # A plugin instance is live while its heartbeat score (tre:v2:gw:instances)
@@ -379,7 +411,12 @@ service_manager:
     # errors, metrics unavailable) or while non-continuable requests remain: it
     # keeps waiting up to the hard cap and then rolls the hide back. A caller may
     # pass its own budget (drain_budget_s), e.g. the SafeScale commit passes its
-    # probe window.
+    # probe window. Paths: safescale_commit, urgent (fast-loop *_immediate donors),
+    # scale_down (manual binding power / TRE without SafeScale), apa (APA via
+    # /scale_service), defrag, repair, startup, default.
+    # Budgets apply only to paths NOT listed in no_drain_paths.
+    # apa (default null) is not spelled out below: service-manager / controller / UI
+    # images before 2026-09-29 reject an unknown budgets_s path at start.
     budgets_s:
       safescale_commit: null
       urgent: 30
@@ -388,6 +425,15 @@ service_manager:
       repair: 30
       startup: 30
       default: 30
+    # Paths that do not drain (v1 / paper semantics, 2026-09-29): hide -> gateway
+    # ack -> /sleep mode=abort at once; budgets_s and the caller's drain_budget_s
+    # are ignored. The SafeScale probe window (pod already hidden) is the only drain
+    # of a TRE scale-down; fast-loop donors and APA release at once. Continuable
+    # requests are continued by the reissue sidecar; non-continuable ones (and
+    # requests whose state cannot be read) are cut off, never waited for and never
+    # rolled back - counted in the sleep outcome (aborted) and the SM stats
+    # (no_drain_*). [] = every path drains as above (pre-2026-09-29 behaviour).
+    no_drain_paths: [safescale_commit, urgent, apa]
   wake:
     # A wake fails closed unless gpu-truth shows every target GPU at or below this
     # fraction of its total memory: sleeping residents stay far below it, an awake
@@ -418,3 +464,54 @@ service_manager:
   node_pressure:
     # Only registry nodes (cluster.nodes) can block a cold start.
     registry_nodes_only: true
+# SafeScale probe (controller only; read at start, restart-to-apply; every key
+# optional, the values below are the built-in defaults). Controller images before
+# 2026-09-29 (safescale-evidence) ignore this section.
+safescale:
+  # Latency thresholds of the probe (immediate rollback and commit gate):
+  # labels - the calibration label's rule (tre_common.slo_labels): TPOT 75 ms,
+  #          TTFT = max(slo.ttft_floor_ms, k * (c + b * L)) with L the mean prompt
+  #          length of the judged window (L unknown -> the floor);
+  # fixed  - models[].slo.ttft_p95_ms / tpot_p95_ms (v1: 500 / 75 ms).
+  # The controller env SAFE_SCALE_TTFT_P95_SLO_MS / SAFE_SCALE_TPOT_P95_SLO_MS (unset
+  # by default) override the respective threshold in either mode.
+  slo_mode: labels
+  # Probe window W = min(max(SAFE_SCALE_E2E_MULTIPLIER x p95_e2e,
+  # SAFE_SCALE_WINDOW_FLOOR_MS), window_ceiling_s); deadline extensions (one gateway
+  # period each, while the post-hide evidence holds fewer than min_commit_samples
+  # completed requests) never pass it either.
+  window_ceiling_s: 60
+  # Completed requests (TTFT count of the remaining pods since the first gateway
+  # boundary after the hide) needed to judge latency at the deadline. Still short at
+  # the ceiling: no traffic -> commit (v1 idle rule); traffic -> latency skipped,
+  # Z / KV-cache judged.
+  min_commit_samples: 20
+  # The evidence starts at the first gateway boundary after the hide (newest doc
+  # stamp at the SM's confirmation + one period, gateway clock only). Each remaining
+  # pod's first evidence doc must be stamped within [start, newest + this]; otherwise
+  # the probe rolls back (evidence_clock_skew: missed gateway ticks). Offsets of Redis
+  # TIME / the controller clock beyond this are logged (safescale_clock_skew_alert).
+  evidence_clock_tolerance_s: 20
+  # Where the probe's latency / KV-cache evidence comes from:
+  # direct - the controller scrapes the remaining pods' vLLM /metrics itself
+  #          (pod IP from the SM fleet state, port metrics_port): baseline at the
+  #          SM's hide confirmation, then every evidence_poll_s; an SLO violation
+  #          rolls back as soon as min_commit_samples requests are judged; the
+  #          deadline is confirmation + W (extended by evidence_poll_s while short).
+  #          A probe whose remaining pods all fail falls back to redis.
+  # redis  - the gateway's 10 s histogram docs only (evidence_clock_tolerance_s
+  #          applies to this path and to the fallback).
+  # The controller must reach pod IP:metrics_port (no NetworkPolicy today).
+  evidence_source: direct
+  # Direct path: scrape period (s) and deadline-extension step.
+  evidence_poll_s: 2
+  # Direct path: timeout (s) of one pod scrape (concurrent; must be below
+  # evidence_poll_s).
+  scrape_timeout_s: 1
+  # Direct path: the baseline scrape runs this long (ms) after the SM confirmed the
+  # hide (the gateway applies it through its pod watch meanwhile); the deadline
+  # still counts from the confirmation.
+  baseline_delay_ms: 1000
+  # Direct path: the model pods' serving port (the reissue sidecar forwards
+  # GET /metrics to vLLM).
+  metrics_port: 8000

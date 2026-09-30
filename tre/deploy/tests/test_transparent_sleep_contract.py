@@ -199,11 +199,21 @@ def test_sidecar_headers_and_continuability_match_the_gateway_plugin() -> None:
     go = _go_string_consts(TRE_GO)
     assert go["HeaderTREExcludePod"] == sidecar.Config().exclude_header
     # The plugin marks non_continuable requests (the SM drains them); the sidecar must
-    # never try to continue one of them: every request field the plugin inspects is
-    # also inspected by the sidecar's classification.
+    # never try to continue one of them. Behaviour is pinned case by case by the shared
+    # contract (tre/reissue/contract/non_continuable_cases.json, read by both test
+    # suites); here, source-level: every field name / literal the plugin's classifier
+    # inspects is also inspected by the sidecar, and the reason strings are the same set.
     source = inspect.getsource(sidecar.non_continuable_reason)
-    for tag in _go_struct_json_tags(TRE_GO, "treSamplingFields"):
-        assert f'"{tag}"' in source, tag
+    text = TRE_GO.read_text(encoding="utf-8")
+    start = text.index("func treNonContinuableReason(")
+    classifier = text[start:text.index("// rawKind is", start)]
+    literals = set(re.findall(r'"([a-z_]+)"', classifier)) - {"true", "false", "null"}  # JSON literals
+    assert {"n", "messages", "prompt", "suffix", "prompt_embeds", "response_format"} <= literals
+    for literal in sorted(literals):
+        assert f'"{literal}"' in source, literal
+    go_reasons = {v for k, v in go.items() if k.startswith("treNC")}
+    assert go_reasons == set(re.findall(r'return "(\w+)"', source)), go_reasons
+    assert (DEPLOY_ROOT.parent / "reissue" / "contract" / "non_continuable_cases.json").is_file()
     # the plugin's EngineSleeping fixture is the fork's error body the sidecar retries
     tests = (GATEWAY_GO / "tre_transparent_sleep_test.go").read_text(encoding="utf-8")
     assert '"type":"EngineSleeping"' in tests

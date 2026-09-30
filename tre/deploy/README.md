@@ -200,6 +200,68 @@ rollback) or whose `/is_sleeping` is not a clear "awake".
   the event `rescue_waits_for_defrag:<models>`.
 - The service-manager, the controller and the gateway plugin of this change
   must be rolled out together.
+- An SM refusal `409 floor_violation` (a hide / sleep that would take a model below
+  its `min_replicas` routable replicas) is not retried; the refused model is held
+  out of every scale-down plan for `TRE_FLOOR_VIOLATION_COOLDOWN_TICKS` fast-loop
+  ticks (default 6 x `TRE_RESCUE_INTERVAL_SECONDS` = 30 s; `0` = off). Event
+  `floor_violation_hold:<model>`, counter `floor_violation_total`.
+
+### SafeScale probe window (controller env)
+
+`W = min(max(SAFE_SCALE_E2E_MULTIPLIER x p95_e2e, SAFE_SCALE_WINDOW_FLOOR_MS), W_max)`,
+`W_max` = registry `safescale.window_ceiling_s` (default 60 s; since 2026-09-29, it
+replaced `2 x gateway.route_timeout_s`). `window_terms` of every probe record carry
+`W`, `W1`, `W_floor`, `W_max`, `clamped`, `dominant` (`e2e` / `floor` / `ceiling`).
+
+Commit evidence (2026-09-29, `planning/safescale_evidence.py`, release note
+`RELEASE-20260929-safescale-evidence.md`):
+
+- one observation per metrics snapshot (keyed by `window_end_ms`); the 2 s loop still
+  runs the donor-health guard and preemption / abort on every tick;
+- the immediate SLO rollback judges a snapshot only when its whole window follows the
+  hide (`window_start_ms >= hide`);
+- at the deadline the latency check reads the docs stamped `[S, E]`: `S` = newest
+  gateway doc stamp of the model when the SM confirmed the hide + one period (gateway
+  clock only; `ceil(Redis TIME)` without a doc), `E` = newest snapshot, remaining pods
+  only (probe pods and pods the fleet state reports asleep excluded), no histogram
+  lookback. Fewer than `safescale.min_commit_samples` requests on pods with a p95: the
+  deadline moves one gateway period past the newest evidence, up to `W_max` (W counts
+  from the confirmed hide); still short there: no traffic -> commit, traffic -> latency
+  skipped (Z / KV judged);
+- thresholds: registry `safescale.slo_mode` (`labels` = the calibration label rule,
+  `fixed` = `models[].slo`); env `SAFE_SCALE_TTFT_P95_SLO_MS` / `SAFE_SCALE_TPOT_P95_SLO_MS`
+  are optional overrides (unset);
+- clock / continuity check (fail-closed, `evidence_clock_skew`): each remaining pod's
+  first evidence doc within `[S, N + safescale.evidence_clock_tolerance_s]`, and the
+  newest-doc read at the hide must have worked; offsets of Redis `TIME`, the gateway
+  stamps and the controller clock are alerted (`safescale_clock_skew_alert`), not
+  acted on.
+
+The items above are the `redis` evidence path. The default is
+`safescale.evidence_source: direct` (`planning/safescale_direct.py`): the controller
+scrapes the remaining pods' vLLM `/metrics` (pod IP from the SM fleet state, port
+`safescale.metrics_port`) at the hide confirmation (baseline) and every
+`safescale.evidence_poll_s`; the difference gives the latency evidence (same p95 / sample
+rules and thresholds) and the KV-cache fill; a judged violation rolls back at once
+(`slo_violation_direct`); the deadline is confirmation + W on the controller clock,
+extended one poll period while short. A probe whose remaining pods all fail falls back to
+the `redis` path (`evidence_source_used: redis_fallback`). Z still comes from the snapshot
+tail. Needs controller -> pod IP:`metrics_port` reachability.
+
+On the redis path Z and the KV-cache fill come from the tail of the snapshots, which may partly
+precede the hide: `tail_pre_hide_fraction_mean` / `_max` record how much. The
+latency evidence's own pre-hide share is `tail_pre_hide_fraction` (0 by construction,
+a regression assertion). Summary of a run: `python3 -m scripts.analysis.safescale_summary
+<run_dir>/safescale.json` (rollback rate, rollback reasons, latency-gate outcomes).
+
+Env names and rollback: controller images from 2026-09-29 read the floor from
+`SAFE_SCALE_WINDOW_FLOOR_MS`; older images read `SAFE_SCALE_MIN_WINDOW_MS` and refuse
+to start when it is below 60000 (their N2 startup guard). The overlay sets both (new
+name 20000, legacy name 60000), so an image-only rollback still starts. Precedence in
+the new image: the new name wins; only the legacy name set -> it is used, with a
+warning; neither -> 20000. Rule for every controller rollback: **restore the
+controller Deployment object of the backup (image AND env together), never
+`kubectl set image` alone** - env written for a newer image can stop an older one.
 
 ### Tests
 

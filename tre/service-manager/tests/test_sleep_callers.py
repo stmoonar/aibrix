@@ -285,7 +285,7 @@ def test_v1_compat_scale_down_goes_through_primitive():
     response = client.post("/scale_service", params={"model_name": "m1", "scale_type": "down", "scale_value": 1})
 
     assert response.status_code == 200, response.text
-    assert [p[0] for p in h.paths] == ["scale_down"]  # APA drains exactly like TRE
+    assert [p[0] for p in h.paths] == ["apa"]  # APA: its own (no-drain) sleep path
     h.assert_hidden_before_every_sleep()
 
 
@@ -309,7 +309,10 @@ def test_defrag_migration_goes_through_primitive():
     )
 
     assert h.paths == [("defrag", None, ["pod-a"])]
-    assert [a["action"] for a in actions][:2] == ["hide", "sleep"]
+    # Make-before-break (replica floor): the new replica is up before the source sleeps.
+    assert [a["action"] for a in actions] == [
+        "create_deployment", "wake", "unhide", "hide", "sleep", "delete_deployment"
+    ]
     h.assert_hidden_before_every_sleep()
 
 

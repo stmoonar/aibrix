@@ -101,25 +101,29 @@ spec:
             # This is the single window S1.4 / R3 theta_m refit must use.
             - name: TRE_METRICS_WINDOW_MS
               value: "30000"
-            # G5/N1.3: SafeScale commit-gate SLOs pinned explicitly to match the
-            # registry.yaml calibration SLOs (ttft 500 / tpot 75), overriding the
-            # looser 1200/100 code defaults so the shrink safety gate cannot silently
-            # drift wider than calibration.
-            - name: SAFE_SCALE_TTFT_P95_SLO_MS
-              value: "500"
-            - name: SAFE_SCALE_TPOT_P95_SLO_MS
-              value: "75"
-            # A6: adaptive probe window W = clamp(MIN, MAX, max(2*p95_e2e, CDEC*p95_tpot,
-            # Q/rate_gap)) - v1's formula, NOT v1's band (v1: 15 s / 300 s / fallback 20 s).
-            # MIN 60 s is forced by the N2 startup guard MIN*(1-HQ) >= TRE_METRICS_WINDOW_MS
-            # + 10 s refresh + phase offset; MAX 120 s is new (2026-09 alignment); the queue
-            # term falls back to CW2_FALLBACK when the post-hide rate gap is ~0.
+            # SafeScale latency thresholds come from the registry (safescale.slo_mode,
+            # 2026-09-29): SAFE_SCALE_TTFT_P95_SLO_MS / SAFE_SCALE_TPOT_P95_SLO_MS are
+            # optional overrides and deliberately NOT set here. (Older images default
+            # to the same 500 / 75 ms without them.)
+            # A6: probe window W = min(max(E2E_MULTIPLIER * p95_e2e, WINDOW_FLOOR_MS), W_max),
+            # W_max = registry safescale.window_ceiling_s (60 s). Missing p95_e2e
+            # -> W = WINDOW_FLOOR_MS. The latency gate reads the post-hide evidence
+            # window (first gateway boundary after the hide .. newest snapshot); only
+            # Z / KV-cache still come from the snapshot tail (tail_pre_hide_fraction_*).
+            - name: SAFE_SCALE_WINDOW_FLOOR_MS
+              value: "20000"
+            - name: SAFE_SCALE_E2E_MULTIPLIER
+              value: "2"
+            # ROLLBACK COMPAT (P2-7) - keep at 60000. Read ONLY by controller images before
+            # 2026-09-29 (their N2 startup guard raises ValueError below 60000); images from
+            # 2026-09-29 on read SAFE_SCALE_WINDOW_FLOOR_MS above and ignore this one. So an
+            # image-only rollback still starts, with the old 60-120 s window band.
             - name: SAFE_SCALE_MIN_WINDOW_MS
               value: "60000"
-            - name: SAFE_SCALE_MAX_WINDOW_MS
-              value: "120000"
-            - name: SAFE_SCALE_CW2_FALLBACK_MS
-              value: "60000"
+            # P2-6: after an SM 409 floor_violation the refused donor is not picked for a
+            # scale-down for this many fast-loop ticks (x TRE_RESCUE_INTERVAL_SECONDS; 0 = off).
+            - name: TRE_FLOOR_VIOLATION_COOLDOWN_TICKS
+              value: "6"
             # A12: commit gate rejects when the remaining pods' KV-cache fill > 0.8 (v1).
             - name: SAFE_SCALE_KV_CACHE_MAX
               value: "0.8"

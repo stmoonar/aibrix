@@ -8,6 +8,7 @@ from typing import Awaitable, Callable, Mapping, Protocol
 
 from tre_common.metrics_schema import MetricsSnapshot, ModelWindowMetrics
 from tre_common.registry import Registry
+from tre_common.window_pods import pooled_p95_ms
 from tre_controller.gateway_health import GatewayCounters
 from tre_controller.loops.tick import serving_window
 from tre_controller.planning.planner import (
@@ -18,6 +19,7 @@ from tre_controller.planning.planner import (
     UnhideAction,
 )
 from tre_controller.planning.safescale import ProbeObservation, SafeScaleCommand, SafeScaleProbe
+from tre_controller.planning.safescale_direct import DirectEvidenceCollector, DirectPoll
 from tre_controller.signals.sources import get_signal
 from tre_controller.signals.trs import SignalState, TRSComputer, TRSInput
 
@@ -82,6 +84,7 @@ def run_safescale_observation_tick(
     recovery_needs_fresh_view: bool = False,
     observe_mode: bool = False,
     maintenance: MaintenanceReader | None = None,
+    direct_polls: Mapping[str, DirectPoll] | None = None,
 ) -> SafeScaleObservationResult:
     """One SafeScale observation tick. ``fresh_cluster_view`` is the SM view only
     while fresh (``ClusterViewBox.fresh``): with it, probes whose pods are all
@@ -148,7 +151,10 @@ def run_safescale_observation_tick(
             hidden_pods=tuple(getattr(probe, "pods", ())),
             gateway=(gateway_counters or {}).get(probe.model),
         )
-        decision = safescale.observe(probe.model, observation, now_ms=snapshot.ts_ms)
+        poll = (direct_polls or {}).get(probe.model)
+        # Direct evidence (2026-09-29 B+D): this tick's scrape of the remaining pods.
+        extra = {"direct_poll": poll} if poll is not None else {}
+        decision = safescale.observe(probe.model, observation, now_ms=snapshot.ts_ms, **extra)
         events.append(f"safescale_{decision.reason}:{probe.model}")
         gate_failures = _gate_failures(safescale, probe.model, decision)
         if gate_failures:
@@ -158,12 +164,22 @@ def run_safescale_observation_tick(
         ):
             # P2-a: the KV-cache check could not be evaluated (fail-open, as v1) - say so.
             events.append(f"safescale_kv_cache_unavailable:{probe.model}")
+        if getattr(decision, "reason", "") in ("formal_commit_gate_passed", "formal_commit_gate_failed"):
+            events.append(format_tail_audit_event(probe.model, getattr(decision, "details", None) or {}))
         if getattr(decision, "reason", "") == "donor_health":
             health = _terminal_details(safescale, probe.model).get("donor_health") or {}
             events.append(
                 f"safescale_donor_health:{probe.model}:errors={health.get('errors', 0):.0f}"
                 f":requests={health.get('requests', 0):.0f}:rate={health.get('error_rate', 0.0):.4f}"
             )
+        decision_details = getattr(decision, "details", None) or {}
+        if decision_details.get("latency_source") in ("evidence", "direct") or getattr(
+            decision, "reason", ""
+        ) == "evidence_extended":
+            # 2026-09-29 audit: the latency evidence window of this decision.
+            events.append(format_evidence_event(probe.model, decision_details))
+        if getattr(decision, "status", "") == "rollback" and decision_details.get("rollback_reason"):
+            events.append(format_rollback_reason_event(probe.model, decision_details["rollback_reason"]))
         actions = _commands_to_actions(
             decision.commands,
             cluster_view=cluster_view,
@@ -221,7 +237,17 @@ async def safescale_task(
     gateway_source: GatewayCounterSource | None = None,
     is_observe: Callable[[], bool] | None = None,
     maintenance: MaintenanceReader | None = None,
+    direct: DirectEvidenceCollector | None = None,
 ) -> None:
+    """The SafeScale loop (one coroutine on the controller's event loop). With
+    ``direct`` (safescale.evidence_source: direct) each tick first scrapes the probes'
+    remaining pods - concurrently, in the collector's thread pool, bounded by
+    safescale.scrape_timeout_s - and hands the polls to the observation tick; the
+    loop then runs every min(SAFE_SCALE_PROBE_POLL_SECONDS, evidence_poll_s)."""
+    interval = float(getattr(getattr(cfg, "safescale"), "probe_poll_seconds"))
+    if direct is not None:
+        poll_s = float(getattr(getattr(cfg, "safescale"), "evidence_poll_ms", interval * 1000.0)) / 1000.0
+        interval = min(interval, poll_s) if poll_s > 0 else interval
     while True:
         snapshot = snapshot_box.get()
         if snapshot is not None:
@@ -230,6 +256,12 @@ async def safescale_task(
             if gateway_source is not None and not observe_mode and safescale.active_probes():
                 # A13: the donor's gateway counters, read off the event loop (HTTP).
                 counters = await asyncio.to_thread(gateway_source.read)
+            direct_polls = None
+            if direct is not None and not observe_mode and safescale.active_probes():
+                try:
+                    direct_polls = await direct.poll()
+                except Exception:  # noqa: BLE001 - no poll this tick (the deadline logic copes)
+                    LOG.exception("safescale direct evidence poll failed")
             result = run_safescale_observation_tick(
                 snapshot,
                 queue=queue,
@@ -243,9 +275,9 @@ async def safescale_task(
                 recovery_needs_fresh_view=cluster_view_box is not None,
                 observe_mode=observe_mode,
                 maintenance=maintenance,
+                direct_polls=direct_polls,
             )
             _log_resolutions(snapshot.ts_ms, result, gateway_available=counters is not None)
-        interval = getattr(getattr(cfg, "safescale"), "probe_poll_seconds")
         await sleep(interval)
 
 
@@ -479,6 +511,58 @@ def _log_resolutions(ts_ms: int, result: SafeScaleObservationResult, *, gateway_
     )
 
 
+def format_tail_audit_event(model: str, details: Mapping) -> str:
+    """P1-2 audit event of a commit-gate decision: the share of the tail observations'
+    metrics windows that precedes the hide (mean / max, ``na`` = no window timestamps)
+    and how many observations the gate judged."""
+
+    def fmt(value) -> str:
+        return "na" if value is None else f"{float(value):.3f}"
+
+    return (
+        f"safescale_tail_pre_hide:{model}"
+        f":mean={fmt(details.get('tail_pre_hide_fraction_mean'))}"
+        f":max={fmt(details.get('tail_pre_hide_fraction_max'))}"
+        f":n={int(details.get('tail_observation_count') or 0)}"
+    )
+
+
+def format_evidence_event(model: str, details: Mapping) -> str:
+    """One-line audit of the probe's latency evidence window (2026-09-29): interval,
+    samples, gate verdict, extensions, ceiling clamp, threshold mode / values and the
+    evidence's pre-hide share (must be 0)."""
+
+    def fmt(value) -> str:
+        if value is None:
+            return "na"
+        if isinstance(value, bool):
+            return "1" if value else "0"
+        if isinstance(value, (int, float)):
+            number = float(value)
+            return f"{number:.0f}" if abs(number) >= 1 or number == 0 else f"{number:.3g}"
+        return str(value)
+
+    gate = details.get("latency_gate") or details.get("extend_reason") or "na"
+    return (
+        f"safescale_evidence:{model}"
+        f":start={fmt(details.get('evidence_start_ms'))}:end={fmt(details.get('evidence_end_ms'))}"
+        f":n={fmt(details.get('latency_samples'))}:gate={gate}"
+        f":ext={fmt(details.get('extensions'))}:clamped={fmt(bool(details.get('clamped')))}"
+        f":mode={fmt(details.get('threshold_mode'))}"
+        f":ttft_thr={fmt(details.get('ttft_threshold_ms'))}:tpot_thr={fmt(details.get('tpot_threshold_ms'))}"
+        f":pre_hide={fmt(details.get('tail_pre_hide_fraction'))}"
+    )
+
+
+def format_rollback_reason_event(model: str, reason: Mapping) -> str:
+    """``safescale_rollback_reason:<model>:<code>[:<gates|metrics|check>]``."""
+    code = str(reason.get("code") or "unknown")
+    extra = reason.get("gates") or reason.get("metrics") or reason.get("check")
+    if isinstance(extra, (list, tuple)):
+        extra = ",".join(str(item) for item in extra)
+    return f"safescale_rollback_reason:{model}:{code}" + (f":{extra}" if extra else "")
+
+
 def _terminal_details(safescale: SafeScaleObserver, model: str) -> dict:
     active = getattr(safescale, "active_probe", None)
     probe = active(model) if callable(active) else None
@@ -538,7 +622,35 @@ def _observation_from_metrics(
         avg_gpu_cache_norm=remaining_pods_kv_cache(metrics, hidden_pods),
         gateway_requests=gateway.requests if gateway is not None else None,
         gateway_errors=gateway.errors if gateway is not None else None,
+        # P1-2 audit: the metrics window this observation read (from the snapshot).
+        window_start_ms=getattr(metrics, "window_start_ms", None),
+        window_end_ms=getattr(metrics, "window_end_ms", None),
+        # L of the labels-mode TTFT threshold: prompt-token sum / count delta.
+        mean_prompt_tokens=_mean_prompt_tokens(metrics),
+        # The immediate rollback judges max(per pod, pooled) like the deadline gate.
+        pooled_ttft_p95_ms=_pooled_p95(metrics, hidden_pods, "ttft_hist", "ttft_hist_count"),
+        pooled_tpot_p95_ms=_pooled_p95(metrics, hidden_pods, "tpot_hist", "tpot_hist_count"),
     )
+
+
+def _pooled_p95(metrics: ModelWindowMetrics, hidden_pods: tuple[str, ...], hist: str, count: str) -> float | None:
+    """p95 of the remaining pods' window histograms pooled first (the store's rule, its
+    minimum samples on the pooled count). None without a rule / histograms."""
+    rule = getattr(metrics, "p95_rule", None)
+    if rule is None:
+        return None
+    hidden = set(hidden_pods)
+    pods = [pod for key, pod in (getattr(metrics, "per_pod", None) or {}).items()
+            if key not in hidden and getattr(pod, "pod", key) not in hidden]
+    return pooled_p95_ms(((getattr(pod, hist, None), getattr(pod, count, None)) for pod in pods), rule)
+
+
+def _mean_prompt_tokens(metrics: ModelWindowMetrics) -> float | None:
+    tokens = getattr(metrics, "prompt_tokens", None)
+    count = getattr(metrics, "request_count", None)
+    if tokens is None or not count or float(count) <= 0:
+        return None
+    return float(tokens) / float(count)
 
 
 def _probe_request_id(safescale: SafeScaleObserver, model: str) -> str | None:

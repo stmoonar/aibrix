@@ -57,7 +57,8 @@ def _metrics(*, ts_ms: int, generation: float = 120.0, ttft: float = 500.0, tpot
             "donor": ModelWindowMetrics(
                 model="donor",
                 window_start_ms=0,
-                window_end_ms=60_000,
+                # One snapshot per ts (observations are deduplicated by window end).
+                window_end_ms=60_000 + ts_ms,
                 prompt_tokens=0.0,
                 generation_tokens=generation,
                 avg_waiting=0.0,
@@ -80,7 +81,6 @@ def _machine() -> SafeScaleStateMachine:
         config=SafeScaleConfig(
             ttft_p95_slo_ms=1000.0,
             tpot_p95_slo_ms=100.0,
-            default_window_ms=1000.0,
             min_window_ms=1000.0,
             hq=0.5,
             tau_low=1.0,
@@ -117,6 +117,8 @@ def test_safescale_observation_tick_submits_commit_actions_after_deadline() -> N
     assert committed.events == (
         "safescale_formal_commit_gate_passed:donor",
         "safescale_kv_cache_unavailable:donor",
+        # P1-2 audit: hide at 0, window [0, 60 s] -> no pre-hide share; 2 judged.
+        "safescale_tail_pre_hide:donor:mean=0.000:max=0.000:n=2",
     )
 
 
@@ -134,7 +136,10 @@ def test_safescale_observation_tick_submits_rollback_unhide_on_slo_violation() -
 
     assert result.submitted == 1
     assert queue.submitted == [(UnhideAction("donor", ("pod-a",), "slo_violation", "safescale"),)]
-    assert result.events == ("safescale_slo_violation:donor",)
+    assert result.events == (
+        "safescale_slo_violation:donor",
+        "safescale_rollback_reason:donor:slo_violation:ttft",
+    )
 
 
 def _with_pod_kv(snapshot: MetricsSnapshot, fills: dict[str, float | None]) -> MetricsSnapshot:
@@ -190,6 +195,8 @@ def test_safescale_kv_cache_guard_blocks_commit_like_v1() -> None:
     assert result.events == (
         "safescale_formal_commit_gate_failed:donor",
         "safescale_gate_failures:donor:kv_cache",
+        "safescale_tail_pre_hide:donor:mean=0.000:max=0.000:n=2",
+        "safescale_rollback_reason:donor:formal_commit_gate_failed:kv_cache",
     )
 
     cool_queue = FakeQueue()
@@ -228,7 +235,7 @@ def test_safescale_resolution_record_carries_the_gate_failures() -> None:
     store = Store()
     machine = SafeScaleStateMachine(
         config=SafeScaleConfig(
-            ttft_p95_slo_ms=1000.0, tpot_p95_slo_ms=100.0, default_window_ms=1000.0, min_window_ms=1000.0, hq=0.5
+            ttft_p95_slo_ms=1000.0, tpot_p95_slo_ms=100.0, min_window_ms=1000.0, hq=0.5
         ),
         store=store,
     )
@@ -254,7 +261,7 @@ def test_observation_tick_feeds_gateway_counters_to_the_donor_health_guard() -> 
 
     queue = FakeQueue()
     machine = SafeScaleStateMachine(
-        config=SafeScaleConfig(ttft_p95_slo_ms=1000.0, tpot_p95_slo_ms=100.0, default_window_ms=60_000.0)
+        config=SafeScaleConfig(ttft_p95_slo_ms=1000.0, tpot_p95_slo_ms=100.0, min_window_ms=60_000.0)
     )
     machine.start_probe(model="donor", pods=("pod-a",), now_ms=0)
 
@@ -277,6 +284,7 @@ def test_observation_tick_feeds_gateway_counters_to_the_donor_health_guard() -> 
     assert result.events == (
         "safescale_donor_health:donor",
         "safescale_donor_health:donor:errors=5:requests=50:rate=0.1000",
+        "safescale_rollback_reason:donor:donor_health",
     )
     assert machine.active_probe("donor") is None
     assert machine.rollback_backoff_models(2_500) == {"donor"}
@@ -307,6 +315,8 @@ def test_kv_cache_unavailable_passes_the_gate_but_is_reported() -> None:
     assert result.events == (
         "safescale_formal_commit_gate_passed:donor",
         "safescale_kv_cache_unavailable:donor",
+        # P1-2 audit: hide at 0, window [0, 60 s] -> no pre-hide share; 2 judged.
+        "safescale_tail_pre_hide:donor:mean=0.000:max=0.000:n=2",
     )
     assert probe_holder["details"]["kv_cache"] == "unavailable"
     assert queue.submitted[-1][0].reason == "formal_commit_gate_passed"

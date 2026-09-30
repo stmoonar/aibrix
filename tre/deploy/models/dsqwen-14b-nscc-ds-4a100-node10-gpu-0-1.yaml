@@ -46,7 +46,7 @@ spec:
           defaultMode: 292
       initContainers:
       - name: tre-startup-gate
-        image: vllm-openai-tre:0.30.0-ts-2be2d647
+        image: vllm-openai-tre:0.30.0-ts-8dc0f2a7
         imagePullPolicy: IfNotPresent
         command:
         - python3
@@ -71,7 +71,7 @@ spec:
               fieldPath: metadata.uid
       containers:
       - name: vllm-openai
-        image: vllm-openai-tre:0.30.0-ts-2be2d647
+        image: vllm-openai-tre:0.30.0-ts-8dc0f2a7
         imagePullPolicy: IfNotPresent
         command:
         - python3
@@ -93,10 +93,11 @@ spec:
         - --no-enable-prefix-caching
         - --max-num-seqs
         - '256'
+        - --enable-chunked-prefill
+        - --max-num-batched-tokens
+        - '2048'
         - --gpu-memory-utilization
         - '0.85'
-        - --max-model-len
-        - '12288'
         - --sleep-reject-new
         - --abort-return-token-ids
         env:
@@ -117,7 +118,7 @@ spec:
         - name: models-volume
           mountPath: /data
       - name: tre-reissue-sidecar
-        image: vllm-openai-tre:0.30.0-ts-2be2d647
+        image: vllm-openai-tre:0.30.0-ts-8dc0f2a7
         imagePullPolicy: IfNotPresent
         command:
         - python3

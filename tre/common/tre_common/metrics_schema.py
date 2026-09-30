@@ -41,6 +41,21 @@ class PodWindowMetrics:
     #: see a few requests at low load still gets a p95. None = no histogram.
     e2e_hist: tuple[tuple[float, float], ...] | None = field(default=None, compare=False)
     e2e_hist_count: float | None = field(default=None, compare=False)
+    #: Timestamp (ms, the gateway's boundary stamp) of the first histogram doc the TTFT
+    #: delta was taken from: the baseline doc before the window when there is one, else
+    #: the window's first doc. None = no TTFT histogram. Provenance for the SafeScale
+    #: evidence clock check; excluded from equality.
+    hist_first_ts_ms: int | None = field(default=None, compare=False)
+    #: Timestamp (ms) of the last histogram doc the TTFT delta ends at (SafeScale
+    #: evidence completeness: a pod whose docs stop early has a hole at the end).
+    hist_last_ts_ms: int | None = field(default=None, compare=False)
+    #: The window's TTFT / TPOT histogram deltas, UNGATED (like ``e2e_hist``): the
+    #: SafeScale evidence pools them across the remaining pods, so a pod below the
+    #: per-pod minimum samples still weighs in.
+    ttft_hist: tuple[tuple[float, float], ...] | None = field(default=None, compare=False)
+    ttft_hist_count: float | None = field(default=None, compare=False)
+    tpot_hist: tuple[tuple[float, float], ...] | None = field(default=None, compare=False)
+    tpot_hist_count: float | None = field(default=None, compare=False)
 
 
 #: How a model-level p95 is formed from the pods' merged histograms:

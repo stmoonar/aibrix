@@ -45,9 +45,10 @@ it offers ``factor x C^_s`` rps (``capacity_source`` ``t14_capacity_prior``).
 Checks before anything is driven (a dry run runs them too)
 ----------------------------------------------------------
 * held out: every composed cell's shape is ``gen.is_held_out`` and its split holdout;
-* ``--max-model-len`` of the model in the registry (``vllm_extra_args``) >= the longest
-  input + output of the composition + :data:`MAX_MODEL_LEN_MARGIN` (G4096x64 needs 4160;
-  14b pins 12288);
+* the model's context limit >= the longest input + output of the composition +
+  :data:`MAX_MODEL_LEN_MARGIN` (G4096x64 needs 4160). The limit is the registry's
+  ``--max-model-len`` when pinned, else the model's own maximum (``max_position_embeddings``
+  of ``<weights_path>/config.json``, what vLLM uses when the flag is unset; 131072 for 14b);
 * the parameter files: ``--freeze-file`` (the D22 freeze) and ``--refit-params-file`` (the
   second parameter set, a ``dline_refit freeze`` of the v1-lambda refit) both verify
   (``dline_refit.verify_freeze``) and were frozen under the primary label this set is
@@ -381,6 +382,18 @@ def registry_max_model_len(model: str, registry: Optional[str] = None) -> Option
     return None
 
 
+def native_max_model_len(weights_path: str) -> Optional[int]:
+    """The model's own maximum context (``max_position_embeddings`` in
+    ``<weights_path>/config.json``) - what vLLM serves when ``--max-model-len`` is unset.
+    None when the file is unreadable or carries no such key."""
+    try:
+        config = json.loads((Path(weights_path) / "config.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    value = config.get("max_position_embeddings") if isinstance(config, dict) else None
+    return int(value) if isinstance(value, int) and value > 0 else None
+
+
 def _longest(length) -> int:
     return int(length.high) if hasattr(length, "high") else int(length)
 
@@ -388,8 +401,14 @@ def _longest(length) -> int:
 def check_max_model_len(model: str, shapes: Sequence[str], registry: Optional[str] = None,
                         *, max_model_len: Optional[int] = None) -> dict:
     """Every request of the composition fits: max(input + output) + margin <= max-model-len."""
+    source = "argument"
     if max_model_len is None:
-        max_model_len = registry_max_model_len(model, registry)
+        max_model_len, source = registry_max_model_len(model, registry), "registry"
+    if max_model_len is None:
+        from tre_common import registry as tre_registry
+
+        weights = tre_registry.load_registry(registry).model(model).weights_path
+        max_model_len, source = native_max_model_len(weights), "model config.json"
     longest, worst = 0, None
     for shape in shapes:
         for _w, i, o in gen.shape_components(shape):
@@ -397,11 +416,12 @@ def check_max_model_len(model: str, shapes: Sequence[str], registry: Optional[st
                 longest, worst = _longest(i) + _longest(o), shape
     need = longest + MAX_MODEL_LEN_MARGIN
     if max_model_len is None:
-        raise ValueError(f"{model}: the registry does not pin --max-model-len; T14 needs >= {need}")
+        raise ValueError(f"{model}: the registry does not pin --max-model-len and the model's "
+                         f"config.json has no max_position_embeddings; T14 needs >= {need}")
     if int(max_model_len) < need:
         raise ValueError(f"{model}: --max-model-len {max_model_len} < {need} ({worst}: {longest} "
                          f"tokens + {MAX_MODEL_LEN_MARGIN})")
-    return {"max_model_len": int(max_model_len), "longest_request_tokens": longest,
+    return {"max_model_len": int(max_model_len), "source": source, "longest_request_tokens": longest,
             "longest_shape": worst, "margin": MAX_MODEL_LEN_MARGIN, "needed": need, "ok": True}
 
 

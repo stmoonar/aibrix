@@ -310,23 +310,25 @@ async def test_p9_offline_integration_defrags_fragmented_capacity_then_expands_t
         Binding("serve-b-new", "m1", Slot("node-a", (1,)), awake=True),
         Binding("tp2-pod", "tp2", Slot("node-a", (2, 3)), awake=True),
     ]
+    # Make-before-break defrag (replica floor, 2026-09-29): the new m1 replica is up
+    # before serve-b is hidden, slept and deleted.
     assert runtime_ops.calls == [
+        ("create_deployment", "m1", (1,)),
+        ("wait_ready", "m1-deployment"),
+        ("annotate", "serve-b-new", "awake"),
         ("annotate", "serve-b", "hidden"),
         ("wait_unroutable", "serve-b"),
         ("annotate", "serve-b", "sleeping"),
         ("delete_deployment", "serve-b", (2,)),
         ("wait_deleted", "serve-b"),
-        ("create_deployment", "m1", (1,)),
-        ("wait_ready", "m1-deployment"),
-        ("annotate", "serve-b-new", "awake"),
         ("create_deployment", "tp2", (2, 3)),
         ("wait_ready", "tp2-deployment"),
         ("annotate", "tp2-pod", "awake"),
     ]
     assert vllm_ops.calls == [
-        ("sleep", "10.0.0.2", 8000),
         ("wait_until_ready", "10.0.0.3", 8000),
         ("wake_up", "10.0.0.3", 8000),
+        ("sleep", "10.0.0.2", 8000),
         ("wait_until_ready", "10.0.0.4", 8000),
         ("wake_up", "10.0.0.4", 8000),
     ]

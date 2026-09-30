@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 import logging
 import threading
@@ -28,6 +28,9 @@ class SupervisorSnapshot:
     drift_observations: int
     last_drift: list[dict]
     last_recovery_operation_id: str | None
+    #: Informational drift items (``informational: true``, e.g.
+    #: ``startup_admission_pending``) of the last pass: reported, never repaired.
+    informational: list[dict] = field(default_factory=list)
 
 
 class FleetSupervisor:
@@ -66,6 +69,7 @@ class FleetSupervisor:
         self._last_signature: tuple | None = None
         self._drift_observations = 0
         self._last_drift: list[dict] = []
+        self._last_informational: list[dict] = []
         self._last_error: str | None = None
         self._last_recovery_operation_id: str | None = None
         self._last_repair_at: float | None = None
@@ -95,6 +99,7 @@ class FleetSupervisor:
             drift_observations=self._drift_observations,
             last_drift=list(self._last_drift),
             last_recovery_operation_id=self._last_recovery_operation_id,
+            informational=list(self._last_informational),
         )
 
     def _actuation_observe(self) -> bool:
@@ -148,7 +153,19 @@ class FleetSupervisor:
             self._reset_drift()
             return
 
-        drift = self._service.detect_fleet_drift()
+        # Informational items (e.g. a Pod waiting in its startup gate, review
+        # 2026-09-29 P1-1) are reported but never count as drift: they neither
+        # start nor feed the observations that lead to a fleet repair.
+        reported = self._service.detect_fleet_drift()
+        informational = [item for item in reported if item.get("informational")]
+        def keys(items):
+            return sorted((item.get("code"), item.get("binding_id")) for item in items)
+
+        if informational and keys(informational) != keys(self._last_informational):
+            LOG.info(json.dumps({"event": "sm_supervisor_informational_drift",
+                                 "items": informational}, sort_keys=True, default=str))
+        self._last_informational = informational
+        drift = [item for item in reported if not item.get("informational")]
         signature = tuple(
             sorted(
                 (item.get("code"), item.get("binding_id"), item.get("count"))
