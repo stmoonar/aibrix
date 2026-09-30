@@ -55,13 +55,13 @@ def _cell_rows(code: int, *, shape: str, split: str, role: str, stage: str, sign
     return rows
 
 
-def _write_dataset(d: Path, rows: list[dict]) -> Path:
+def _write_dataset(d: Path, rows: list[dict], manifest: dict | None = None) -> Path:
     d.mkdir(parents=True, exist_ok=True)
     with (d / "windows.csv").open("w", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=COLUMNS, extrasaction="ignore")
         w.writeheader()
         w.writerows(rows)
-    (d / "manifest.json").write_text(json.dumps({"format_revision": 2}))
+    (d / "manifest.json").write_text(json.dumps({"format_revision": 2, **(manifest or {})}))
     return d
 
 
@@ -83,14 +83,14 @@ _PROBE = 3_000_301
 
 
 def _world(tmp_path: Path, *, stop_ok: bool = True, holdout_evaluated: bool = False,
-           false_alarm_cells: int = 0) -> dict:
+           false_alarm_cells: int = 0, train_manifest: dict | None = None) -> dict:
     """A trainset fit dir, a refit tree (the four stage outputs of one model) and an M
     dataset. ``false_alarm_cells`` healthy M cells carry a low signal (CRITICAL false alarms)."""
     # training set, cut by the trainset stage from a small dataset
     train = []
     for n, shape in enumerate(("S1", "S3", "S4", "S5", "S3", "S4")):
         train += _cell_rows(1_100_000 + n, shape=shape, split="train", role="ladder", stage="ladder")
-    _write_dataset(tmp_path / "run2" / "dataset", train)
+    _write_dataset(tmp_path / "run2" / "dataset", train, train_manifest)
     fit = tmp_path / "fit"
     assert dl.main(["trainset", "--fit-dir", str(fit), "--h2-dataset", str(tmp_path / "run2")]) == 0
 
@@ -213,6 +213,8 @@ def test_freeze_writes_one_self_hashed_read_only_document(tmp_path) -> None:
                               "tau_high": 1.59}
     assert e["registry"] == {"ema_tau_ms": 10_000.0, "ema_alpha": round(dl.alpha_of(10.0), 6)}
     assert e["stop_rule"]["satisfied"] and e["train_ba_at_published"] == TRAIN_BA
+    # a dataset without a load-path record predates it: English prompts, no routing header
+    assert e["prompt_corpus"] == {"corpus_lang": "en", "zh_ratio": 0.0} and e["routing_strategy"] is None
     vh = e["verdict_for_holdout"]
     assert set(vh) == {"model", "signal", "label_def", "signal_spec", "trim_ramp_windows", "fit_config",
                        "published", "merged"}
@@ -542,3 +544,20 @@ def test_the_cell_bootstrap_resamples_cells_and_scores_fixed_dwell_flags() -> No
     assert m["critical_recall_ttft_only"]["resamples_used"] == 0
     assert dl.acceptance_bootstrap(ws, crit, theta=100.0, direction="higher_is_healthier",
                                    n_resamples=200, seed=1) == boot
+
+
+def test_freeze_records_the_training_load_path_from_the_real_trainset(tmp_path) -> None:
+    """Trainset writer -> freeze reader, end to end (the reader once looked for a key the
+    writer never wrote and labelled every training set English)."""
+    w = _world(tmp_path, train_manifest={"load_path": {
+        "prompt": {"corpus_lang": "mix", "zh_ratio": 0.5}, "routing_strategy": "least-gpu-cache"}})
+    assert _freeze(w) == 0
+    e = dl.verify_freeze(w["freeze"])["models"][MODEL]
+    assert e["prompt_corpus"] == {"corpus_lang": "mix", "zh_ratio": 0.5}
+    assert e["routing_strategy"] == "least-gpu-cache"
+
+
+def test_freeze_refuses_when_a_training_dataset_manifest_changed(tmp_path) -> None:
+    w = _world(tmp_path)
+    (tmp_path / "run2" / "dataset" / "manifest.json").write_text(json.dumps({"format_revision": 3}))
+    assert _freeze(w) != 0

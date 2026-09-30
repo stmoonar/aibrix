@@ -88,15 +88,6 @@ def test_an_unreadable_or_changed_training_manifest_is_a_problem_not_a_default(t
     assert dline_refit.training_load_paths({"sources": []})[1]
 
 
-def test_the_trainset_writer_records_what_the_freeze_reads(tmp_path) -> None:
-    """Guard against the two drifting apart again (a freeze once read a key the trainset
-    manifest never had, and silently labelled every training set English)."""
-    import inspect
-
-    writer = inspect.getsource(dline_refit)
-    assert '"directory": str(s.directory)' in writer and '"manifest_sha256": sha256_file(man)' in writer
-
-
 def test_a_training_supplement_must_extend_its_base_run_on_the_same_load_path(tmp_path) -> None:
     import argparse
 
@@ -106,10 +97,21 @@ def test_a_training_supplement_must_extend_its_base_run_on_the_same_load_path(tm
     for model, prov in (("m", {}), ("other", {"prompt": MIX, "routing_strategy": "least-gpu-cache"})):
         (base / model).mkdir(parents=True)
         (base / model / "plan.json").write_text(json.dumps({"models": [model], "provenance": prov}))
-    legacy = argparse.Namespace(base_run=base, corpus_lang="en", zh_ratio=0.0, routing_strategy=None)
-    assert len(training.check_base_load_path(legacy, "m")) == 1
-    mixed = argparse.Namespace(base_run=base, corpus_lang="mix", zh_ratio=0.5,
-                               routing_strategy="least-gpu-cache")
-    with pytest.raises(ValueError, match="base run"):
-        training.check_base_load_path(mixed, "m")
-    assert training.check_base_load_path(mixed, "other")[0]["recorded"]["routing_strategy"] == "least-gpu-cache"
+    legacy = argparse.Namespace(base_run=base, boundary_supplement_run=base, corpus_lang="en",
+                                zh_ratio=0.0, routing_strategy=None)
+    assert len(training.check_source_load_paths(legacy, "m")) == 2  # base and boundary run
+    mixed = argparse.Namespace(base_run=base, boundary_supplement_run=base, corpus_lang="mix",
+                               zh_ratio=0.5, routing_strategy="least-gpu-cache")
+    with pytest.raises(ValueError, match="--base-run"):
+        training.check_source_load_paths(mixed, "m")
+    reports = training.check_source_load_paths(mixed, "other")
+    assert reports[0]["recorded"]["routing_strategy"] == "least-gpu-cache"
+    # a dry run reports instead of refusing
+    dry = argparse.Namespace(**{**vars(mixed), "dry_run": True})
+    assert training.check_source_load_paths(dry, "m")[0]["corpus_mismatch_allowed"]
+    # a source with no campaign of the model has an unknown load path
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    with pytest.raises(ValueError, match="no campaign"):
+        training.check_source_load_paths(
+            argparse.Namespace(**{**vars(legacy), "boundary_supplement_run": empty}), "m")

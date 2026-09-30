@@ -308,7 +308,8 @@ class DatasetSource:
             raise TrainingSetError(f"{path}: no {DATASET_WINDOWS} (a standard dataset directory)")
         if not name:
             name = d.parent.name if d.name == "dataset" else d.name
-        return cls(name=name, directory=d, sealed_to_h2=sealed_to_h2)
+        # Absolute, so a freeze run from another directory still finds the dataset.
+        return cls(name=name, directory=d.resolve(), sealed_to_h2=sealed_to_h2)
 
 
 def sha256_file(path: Path) -> str:
@@ -1600,7 +1601,11 @@ def training_load_paths(trainset_manifest: Mapping) -> tuple[dict[str, dict], li
                             f"{manifest}: its load path (prompt corpus, routing) is unknown")
             continue
         recorded = source.get("manifest_sha256")
-        if recorded and sha256_file(manifest) != recorded:
+        if not recorded:
+            problems.append(f"{manifest}: the trainset stage saw no dataset manifest here, so what "
+                            "is there now cannot be the training data's")
+            continue
+        if sha256_file(manifest) != recorded:
             problems.append(f"{manifest} changed since the trainset stage read it "
                             f"(sha256 {recorded})")
             continue

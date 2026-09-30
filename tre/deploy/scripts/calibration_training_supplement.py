@@ -462,26 +462,40 @@ def banner(lines: Sequence[str]) -> None:
     print(bar, flush=True)
 
 
-def check_base_load_path(args, model: str) -> list[dict]:
-    """The supplement extends --base-run's training set, so it must reach the engine the
-    same way (scripts.prompt_corpus): same prompt corpus, same routing. Every campaign of
-    the base run that drove ``model`` is compared (one without a record predates the
-    options: English, no routing header)."""
+def check_source_load_paths(args, model: str) -> list[dict]:
+    """The supplement extends --base-run's training set on --boundary-supplement-run's
+    anchors, so it must reach the engine the way both did (scripts.prompt_corpus): same
+    prompt corpus, same routing. Every campaign of either run that drove ``model`` is
+    compared (one without a record predates the options: English, no routing header); a
+    source with no such campaign is refused - its load path would be unknown. A dry run
+    reports instead of refusing, as M does. Returns the reports, which the plan and the
+    run manifest keep."""
     from scripts import calibration_dataset as dataset
     from scripts import prompt_corpus as corpus_record
 
+    flags = campaign.mismatch_flags(args)
+    if getattr(args, "dry_run", False):
+        flags = {k: True for k in flags}
     reports = []
-    base = Path(args.base_run)
-    for directory in (dataset.campaign_dirs(base) if base.is_dir() else []):
-        try:
-            plan = json.loads((directory / "plan.json").read_text(encoding="utf-8"))
-        except (OSError, ValueError) as exc:
-            raise ValueError(f"{directory}/plan.json: unreadable ({exc})")
-        if model not in (plan.get("models") or [model]):
-            continue
-        reports.append(corpus_record.check_load_path(
-            corpus_record.load_path(plan.get("provenance")), campaign.load_path(args),
-            what=f"base run {directory}", **campaign.mismatch_flags(args)))
+    for flag, source in (("--base-run", args.base_run),
+                         ("--boundary-supplement-run", args.boundary_supplement_run)):
+        root = Path(source)
+        found = 0
+        for directory in (dataset.campaign_dirs(root) if root.is_dir() else []):
+            try:
+                plan = json.loads((directory / "plan.json").read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                raise ValueError(f"{directory}/plan.json: unreadable ({exc})")
+            if model not in (plan.get("models") or [model]):
+                continue
+            found += 1
+            report = corpus_record.check_load_path(
+                corpus_record.load_path(plan.get("provenance")), campaign.load_path(args),
+                what=f"{flag} {directory}", **flags)
+            reports.append({"source": flag, "campaign": str(directory), **report})
+        if not found:
+            raise ValueError(f"{flag} {root}: no campaign (plan.json) of {model} found, so its load "
+                             "path (prompt corpus, routing) is unknown")
     return reports
 
 
@@ -499,12 +513,13 @@ def run_training_supplement(args, *, drive: Optional[Callable] = None,
     out_dir = Path(args.out_dir)
     for source in (args.base_run, args.boundary_supplement_run):
         supplement.check_new_out_dir(out_dir, Path(source))
-    check_base_load_path(args, model)
+    load_paths = check_source_load_paths(args, model)
     resolved = resolve_units(model, Path(args.base_run), Path(args.boundary_supplement_run))
     cap = resolve_cap(args)
     factory = design.CellFactory(model, int(args.design_seed), serial_base=SERIAL_BASE)
     sequence, _sentinels = build_cells(model, factory, resolved, int(args.design_seed))
     plan, manifest = build_plan(args, model, sequence, resolved, cap)
+    plan["source_load_paths"] = manifest["source_load_paths"] = load_paths
     out_dir.mkdir(parents=True, exist_ok=True)
     print_plan(plan, model)
     if args.dry_run:
