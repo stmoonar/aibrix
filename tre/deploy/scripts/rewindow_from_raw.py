@@ -859,6 +859,9 @@ def held_out_cell_ids(index: Mapping) -> set[str]:
 #: Everything else matching ``*.jsonl`` under the raw root is a cell, so a new sidecar
 #: that forgets to register here is silently re-windowed as if it were measurements.
 SIDECAR_JSONL_SUFFIXES = (".instant.jsonl", ".failures.jsonl", ".prompts.jsonl")
+#: The per-cell capture directory (``scripts.calibration_capture.CELLS_DIRNAME``; repeated
+#: here so this reader does not import the writer). Nothing under it is a cell.
+CAPTURE_DIRNAME = "cells"
 
 
 def raw_dir_shape(dirname: str, model: str) -> Optional[str]:
@@ -904,6 +907,11 @@ def discover_cell_files(
     skipped: list[str] = []
     for path in sorted(raw_dir.rglob("*.jsonl")):
         if path.name.endswith(SIDECAR_JSONL_SUFFIXES):
+            continue
+        if CAPTURE_DIRNAME in path.relative_to(raw_dir).parts[:-1]:
+            # scripts.calibration_capture's per-cell evidence (vLLM metrics, redis dumps,
+            # controller ticks): JSONL, but never per-request rows. It lives beside raw/,
+            # this only matters when the raw root is pointed at the run directory.
             continue
         cell_id = path.stem
         if shapes and raw_dir_shape(path.parent.name, str(model)) not in shapes:

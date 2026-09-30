@@ -696,4 +696,5 @@ def run_ladder_campaign(args, *, drive: Optional[Callable] = None,
             print(f"[{result['model']}] {result['status']}; sentinel drift: "
                   f"{result['sentinel_drift']['verdict']}; "
                   f"{len(result['possibly_contaminated_cells'])} possibly contaminated cell(s)")
-        campaign.finalize_run(out_dir, status=status, exit_code=code)
+        campaign.finalize_run(out_dir, status=status, exit_code=code,
+                              redis_url=getattr(args, "redis_url", None))

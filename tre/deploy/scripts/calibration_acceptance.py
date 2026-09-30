@@ -746,7 +746,8 @@ def run_acceptance_set(args, *, drive: Optional[Callable] = None,
     finally:
         if result is None:
             result = run.result(status)
-        training.finish(out_dir, plan, result, status, code)
+        training.finish(out_dir, plan, result, status, code,
+                        redis_url=getattr(args, "redis_url", None))
 
 
 def seal(out_dir: Path, raw_dir: Path, model: str, run: AcceptanceRun, retained: Mapping,

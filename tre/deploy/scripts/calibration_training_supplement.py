@@ -446,11 +446,12 @@ def check_primary_label(args, model: str) -> None:
                          f"refusing --fit-ttft-slo-mode {label.ttft_slo_mode}")
 
 
-def finish(out_dir: Path, plan: dict, result: dict, status: str, code: int) -> None:
+def finish(out_dir: Path, plan: dict, result: dict, status: str, code: int,
+           redis_url: Optional[str] = None) -> None:
     (out_dir / ladder.DESIGN_RESULT).write_text(
         json.dumps({"mode": plan.get("mode"), "run_manifest_sha256": plan.get("run_manifest_sha256"),
                     "models": [result]}, indent=2) + "\n", encoding="utf-8")
-    campaign.finalize_run(out_dir, status=status, exit_code=code)
+    campaign.finalize_run(out_dir, status=status, exit_code=code, redis_url=redis_url)
 
 
 def banner(lines: Sequence[str]) -> None:
@@ -529,4 +530,4 @@ def run_training_supplement(args, *, drive: Optional[Callable] = None,
     finally:
         if result is None:
             result = run.result(status)
-        finish(out_dir, plan, result, status, code)
+        finish(out_dir, plan, result, status, code, redis_url=getattr(args, "redis_url", None))

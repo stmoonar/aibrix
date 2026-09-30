@@ -568,7 +568,29 @@ def censor_after(rows: Sequence[dict], truncated_at_ts_ms: Optional[int]) -> tup
     return kept, len(rows) - len(kept)
 
 
-def run_schedule_cell(args, store, spec) -> tuple[list, "openloop.CellGuard"]:
+def capture_layout_for(args, cell_id: str):
+    """The capture layout of this cell (:mod:`scripts.calibration_capture`), or None when
+    ``--capture-dir`` is unset. ``--capture-dir`` is the ``cells/`` directory; its parent
+    is the model directory the run manifest goes to, and the attempt is named after
+    ``--output`` like its ``raw/<stem>/`` directory."""
+    if not getattr(args, "capture_dir", None):
+        return None
+    from scripts import calibration_capture as capture
+
+    cells = Path(args.capture_dir)
+    raw_root = None if args.no_raw else Path(args.raw_dir)
+    return capture.CellLayout(cells.parent, Path(args.output).stem, cell_id, raw_root=raw_root)
+
+
+def _capture_config(args) -> dict:
+    """The driver configuration recorded in the run manifest (JSON-safe)."""
+    out = {}
+    for key, value in sorted(vars(args).items()):
+        out[key] = value if isinstance(value, (str, int, float, bool, type(None), list)) else str(value)
+    return out
+
+
+def run_schedule_cell(args, store, spec, redis_client=None) -> tuple[list, "openloop.CellGuard"]:
     """Drive one open-loop cell from --schedule and return (window rows, guard)."""
     from tre_replayer.traces.loader import load_trace_segments
 
@@ -582,14 +604,72 @@ def run_schedule_cell(args, store, spec) -> tuple[list, "openloop.CellGuard"]:
     cell_id = args.cell_id or _cell_id_from_schedule(Path(args.schedule), args.model, segments)
     cell = GridCell.from_scenario_id(cell_id)  # fail now, not in rewindow_from_raw
 
+    layout = capture_layout_for(args, cell_id)
+    recorder = None
+    targets: list[dict] = []
     if args.instant_source == "pod":
-        endpoints = args.pod_endpoint or discover_pod_metrics_endpoints(
-            args.model, args.namespace, args.pod_metrics_port
+        if args.pod_endpoint:
+            endpoints = list(args.pod_endpoint)
+            if layout is not None:
+                from scripts import calibration_capture as capture
+
+                targets = capture.endpoint_targets(endpoints)
+        elif layout is not None:
+            # Same pods as discover_pod_metrics_endpoints, plus their names, nodes and
+            # images for the capture (the per-pod file names and cell_meta.json).
+            from scripts import calibration_capture as capture
+
+            targets = capture.discover_pod_targets(args.model, args.namespace, args.pod_metrics_port)
+            if not targets:
+                raise RuntimeError(
+                    f"no routable pods found for model {args.model!r} in namespace "
+                    f"{args.namespace!r}; the sidecar would have nothing to sample"
+                )
+            endpoints = [t["url"] for t in targets]
+        else:
+            endpoints = discover_pod_metrics_endpoints(
+                args.model, args.namespace, args.pod_metrics_port
+            )
+        if layout is not None and not args.no_vllm_metrics_capture:
+            from scripts import calibration_capture as capture
+
+            recorder = capture.VllmMetricsRecorder(
+                layout.vllm_metrics_dir, {t["url"]: t["key"] for t in targets},
+                model=args.model,
+                histograms=tuple(args.vllm_histogram or capture.DEFAULT_VLLM_HISTOGRAMS),
+                keyframe_every=args.vllm_keyframe_every,
+            )
+        sampler = openloop.make_pod_metrics_sampler(
+            endpoints, **({} if recorder is None else {"recorder": recorder})
         )
-        sampler = openloop.make_pod_metrics_sampler(endpoints)
-        print(f"sidecar: {len(endpoints)} pod /metrics endpoint(s) @ {args.instant_sample_ms}ms")
+        print(f"sidecar: {len(endpoints)} pod /metrics endpoint(s) @ {args.instant_sample_ms}ms"
+              + ("" if recorder is None else f"; vLLM metrics -> {layout.vllm_metrics_dir}"))
     else:
         sampler = _make_live_instant_sampler(store, args.model, 2 * SCRAPE_INTERVAL_MS)
+    if layout is not None:
+        from scripts import calibration_capture as capture
+
+        try:
+            written = capture.write_run_manifest(
+                layout.model_dir, model=args.model, config=_capture_config(args),
+                registry_path=(Path(args.registry) if args.registry
+                               else Path(__file__).resolve().parents[1] / "registry.yaml"),
+                repo=Path(__file__).resolve().parents[2], model_pods=targets,
+                control_namespace=args.control_namespace or None,
+            )
+            if written is not None:
+                print(f"run manifest: {written}")
+        except Exception as exc:  # noqa: BLE001 - provenance never fails a cell
+            print(f"WARNING: run manifest not written: {exc!r}")
+        if redis_client is not None:
+            # Earlier cells whose redis dumps were cut at their end (the controller had
+            # not processed their tail windows yet): complete them now, before the load.
+            try:
+                done = capture.backfill_pending(layout.model_dir, redis_client)
+                if done:
+                    print(f"capture backfill: {len(done)} earlier cell(s) re-dumped")
+            except Exception as exc:  # noqa: BLE001
+                print(f"WARNING: capture backfill failed: {exc!r}")
 
     raw_dir = None if args.no_raw else Path(args.raw_dir) / Path(args.output).stem
     if raw_dir is not None:
@@ -735,6 +815,32 @@ def run_schedule_cell(args, store, spec) -> tuple[list, "openloop.CellGuard"]:
             json.dumps(artifact, indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )
     print(f"cell {cell_id} guard: {json.dumps(artifact, sort_keys=True)}")
+    if layout is not None:
+        # The load has drained (the drive returned): keep what the system saw of it.
+        from scripts import calibration_capture as capture
+
+        meta = capture.capture_after_cell(
+            layout, model=args.model, start_ms=start_ms, end_ms=end_ms,
+            window_ms=args.window_ms, redis_client=redis_client, targets=targets,
+            recorder=recorder,
+            extra_legacy={
+                "prompts_jsonl": (None if prompt_dir is None
+                                  else openloop.prompt_file_path_for(prompt_dir, cell_id)),
+                "schedule": Path(args.schedule),
+            },
+            gateway_dump=not args.no_gateway_dump,
+            controller_ticks=not args.no_controller_ticks,
+            flush_wait_s=args.gateway_flush_wait_s,
+            info={"guard_voided": guard.voided, "void_reasons": list(guard.void_reasons),
+                  "truncated": guard.truncated},
+        )
+        gd = meta.get("gateway_redis_dump") or {}
+        ct = meta.get("controller_ticks") or {}
+        print(f"cell {cell_id} capture -> {layout.cell_dir}: gateway docs "
+              f"{sum(sum(v.values()) for v in (gd.get('docs') or {}).values())}, "
+              f"write phase {((gd.get('flush_wait') or {}).get('write_phase_ms'))} ms, "
+              f"controller ticks {ct.get('members')}"
+              + (f"; capture errors: {meta['errors']}" if meta.get("errors") else ""))
     if guard.unrecognised_proxy_failures:
         # Never silent. A wording no rule matched was counted as transient, which is the
         # forgiving side; if Envoy changed its wording for a real admission rejection,
@@ -1040,6 +1146,28 @@ def parse_args(argv: Optional[Sequence[str]] = None):
                     help="explicit http://ip:port/metrics endpoint; repeatable. Default: "
                          "discovered from the routable pods of --model")
     ap.add_argument("--max-p99-delay-ms", type=float, default=openloop.DEFAULT_MAX_P99_DELAY_MS)
+    # Per-cell system-side evidence (scripts.calibration_capture): off unless --capture-dir.
+    ap.add_argument("--capture-dir", default=None,
+                    help="the run's cells/ directory: per-cell vLLM metrics (1 Hz, per pod), "
+                         "the gateway's redis docs and the controller's ticks go to "
+                         "<capture-dir>/<output stem>/, the run manifest to its parent")
+    ap.add_argument("--no-vllm-metrics-capture", action="store_true",
+                    help="with --capture-dir: do not keep the per-pod vLLM counters/histograms")
+    ap.add_argument("--no-gateway-dump", action="store_true",
+                    help="with --capture-dir: do not dump the gateway's tre:v2:hist/inst docs")
+    ap.add_argument("--no-controller-ticks", action="store_true",
+                    help="with --capture-dir: do not dump the controller's decision history")
+    ap.add_argument("--vllm-histogram", action="append", default=[],
+                    help="vLLM histogram family to keep (repeatable; default: TTFT, inter-token "
+                         "latency, e2e, request prompt / generation tokens)")
+    ap.add_argument("--vllm-keyframe-every", type=int, default=None,
+                    help="rows between full snapshots in the per-pod vLLM metrics files")
+    ap.add_argument("--gateway-flush-wait-s", type=float, default=None,
+                    help="after the cell, wait at most this long for the gateway's next redis "
+                         "write before dumping (0 = no wait; default one round + 2 s)")
+    ap.add_argument("--control-namespace", default="tre-v2",
+                    help="namespace of the controller / SM / gateway plugins, for the image "
+                         "list of the run manifest ('' = skip)")
     ap.add_argument("--max-p99-pool-wait-ms", type=float,
                     default=openloop.DEFAULT_MAX_P99_POOL_WAIT_MS)
     # Only MODEL errors count against this budget. An admission overflow is the
@@ -1102,6 +1230,12 @@ def parse_args(argv: Optional[Sequence[str]] = None):
     ap.add_argument("--guard-mode", default="fail", choices=["fail", "warn"],
                     help="fail: a cell that did not deliver its load aborts the run")
     args = ap.parse_args(argv)
+    from scripts import calibration_capture as _capture
+
+    if args.vllm_keyframe_every is None:
+        args.vllm_keyframe_every = _capture.DEFAULT_KEYFRAME_EVERY
+    if args.gateway_flush_wait_s is None:
+        args.gateway_flush_wait_s = _capture.DEFAULT_GATEWAY_FLUSH_WAIT_S
     if args.step_ms is None:
         args.step_ms = args.window_ms
     if args.schedule is None and args.instant_source == "pod":
@@ -1168,7 +1302,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     instant_sampler = _make_live_instant_sampler(store, args.model, 2 * SCRAPE_INTERVAL_MS)
 
     if args.schedule is not None:
-        rows, _guard = run_schedule_cell(args, store, spec)
+        rows, _guard = run_schedule_cell(args, store, spec, redis_client=redis_client)
         write_csv(rows, out)
         print(f"wrote {len(rows)} rows to {out}")
         return 0

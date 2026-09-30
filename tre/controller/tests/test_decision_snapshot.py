@@ -71,6 +71,7 @@ def test_build_decision_snapshot_serializes_actions_and_events() -> None:
             "z_m": 0.5,
             "trs_z_m": 0.5,
             "trs": None,
+            "trs_raw": None,
             "q_ctl": None,
             "y_m": None,
             "eta_m": None,
@@ -140,7 +141,7 @@ def test_decision_snapshot_writer_appends_per_model_history() -> None:
     redis = FakeRedis()
     writer = DecisionSnapshotWriter(redis)
     snapshot = MetricsSnapshot(ts_ms=1000, stale=False, models={})
-    result = LoopTickResult(submitted=0, model_contexts={"m": {"z_m": 1.2, "trs": 500.0}})
+    result = LoopTickResult(submitted=0, model_contexts={"m": {"z_m": 1.2, "trs": 500.0, "trs_raw": 640.0}})
 
     writer.write("rescue", snapshot, result)
 
@@ -152,6 +153,7 @@ def test_decision_snapshot_writer_appends_per_model_history() -> None:
     assert score == 1000.0
     decoded = json.loads(member)
     assert decoded["model"] == "m" and decoded["z_m"] == 1.2 and decoded["trs"] == 500.0
+    assert decoded["trs_raw"] == 640.0  # pre-EMA TSS next to the EMA, for the calibration capture
 
 
 def test_decision_snapshot_writer_logs_even_when_redis_write_fails(caplog) -> None:

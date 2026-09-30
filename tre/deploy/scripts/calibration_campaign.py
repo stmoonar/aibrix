@@ -132,6 +132,7 @@ from tre_common import slo_labels
 
 from scripts import adaptive_boundary as boundary
 from scripts import admission_cap as admission
+from scripts import calibration_capture as capture
 from scripts import gen_calibration_schedules as gen
 from scripts import openloop
 from scripts import static_grid
@@ -628,6 +629,12 @@ def cell_command(cell: Cell, args, schedule_path: Path, output: Path) -> list[st
         # the fit trains on.
         *slo_labels.label_mode_cli_args(primary_label(args, cell.model)),
     ]
+    if not getattr(args, "no_capture_extras", False):
+        # The system-side evidence of the cell (scripts.calibration_capture): per-pod vLLM
+        # metrics, the gateway's redis docs, the controller's ticks, under
+        # <dir of the online CSV>/cells/<stem>/ - next to raw/, never inside it.
+        command += ["--capture-dir", str(Path(output).parent / capture.CELLS_DIRNAME),
+                    "--control-namespace", str(getattr(args, "controller_namespace", "tre-v2") or "")]
     if cell.drain_start_s is not None:
         command += ["--drain-start-s", str(cell.drain_start_s)]
     if getattr(args, "envoy_stats_url", None):
@@ -1903,14 +1910,32 @@ def run_provenance(args) -> dict:
 CAMPAIGN_STATUS_FILE = "campaign_status.json"
 
 
-def finalize_run(out_dir: Path, *, status: str, exit_code: int) -> None:
+def finalize_run(out_dir: Path, *, status: str, exit_code: int, redis_url: Optional[str] = None) -> None:
     """Record how the campaign ended, then build the standard dataset.
 
     Never raises: the dataset is a conversion of what is on disk and can always be
     rebuilt by hand (``python -m scripts.calibration_dataset <run>``); a failure here
     must not turn a finished campaign into a failed one.
+
+    With ``redis_url``, first completes the redis dumps of the last cell(s)
+    (:func:`scripts.calibration_capture.backfill_pending`, waiting at most
+    ``DEFAULT_FINAL_BACKFILL_WAIT_S`` for the controller to process their tail windows);
+    ``python -m scripts.calibration_capture backfill`` does the same by hand.
     """
     out_dir = Path(out_dir)
+    if redis_url and capture.pending_cells(out_dir):
+        try:
+            import redis  # type: ignore[import-not-found]
+
+            done = capture.backfill_pending(
+                out_dir, redis.Redis.from_url(redis_url),
+                wait_s=capture.DEFAULT_FINAL_BACKFILL_WAIT_S,
+            )
+            print(f"capture backfill: {len(done)} cell(s) re-dumped, "
+                  f"{len(capture.pending_cells(out_dir, max_age_s=None))} still pending")
+        except Exception as exc:  # noqa: BLE001 - see docstring
+            print(f"WARNING: capture backfill failed ({exc!r}); run python -m "
+                  f"scripts.calibration_capture backfill {out_dir} --redis-url <url>")
     (out_dir / CAMPAIGN_STATUS_FILE).write_text(
         json.dumps(
             {"status": status, "exit_code": exit_code, "finished_at_utc": utc_iso()},
@@ -2039,7 +2064,8 @@ def run_campaign(args) -> int:
         status = "interrupted"
         raise
     finally:
-        finalize_run(out_dir, status=status, exit_code=code)
+        finalize_run(out_dir, status=status, exit_code=code,
+                     redis_url=getattr(args, "redis_url", None))
     return code
 
 
@@ -2237,6 +2263,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--stop-on-failure", action="store_true")
     ap.add_argument("--registry", default=None)
     ap.add_argument("--redis-url", default=None)
+    ap.add_argument("--no-capture-extras", action="store_true",
+                    help="do not keep the per-cell system-side evidence (per-pod vLLM metrics, "
+                         "gateway redis docs, controller ticks; scripts.calibration_capture)")
     ap.add_argument("--model-namespace", default="default")
     ap.add_argument("--controller-namespace", default="tre-v2")
     ap.add_argument("--dry-run", action="store_true",
