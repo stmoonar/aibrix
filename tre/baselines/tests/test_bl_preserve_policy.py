@@ -335,3 +335,34 @@ def test_model_without_mu_is_held() -> None:
                        ttft_slo_ms=500.0, tpot_slo_ms=75.0, max_num_seqs=None, pods=(), events=())
     d = p.decide(ClusterSnapshot(now_ms=1, tick_s=2.0, models={"z": ms}))
     assert d["z"].reason == "no_mu" and d["z"].desired == 2
+
+
+# ------------------------------------------------------------ replay seed from the marker
+
+
+def test_replay_seed_of_the_marker_wins_over_trace_seed_param() -> None:
+    trace = str(FIX / "preserve_trace_segments.json")
+    params = {"mu": {"m": dict(MU)}, "trace_path": trace, "trace_seed": 0, "window_s": 60.0}
+    p = PreServePolicy(cfg(params))
+    seed0 = to.load_oracle(trace, window_s=60.0, seed=0)
+    seed7 = to.load_oracle(trace, window_s=60.0, seed=7)
+    assert seed0.totals != seed7.totals  # the seed really moves the arrivals
+    assert p.oracle.totals == seed0.totals
+    # no seed in the marker: the param stays in force
+    p.decide(snap(1000, [pod("p0", 1000)], replay=ReplayInfo(t0_ms=0, trace_path=trace)))
+    assert p.oracle.totals == seed0.totals
+    # marker seed: the oracle is rebuilt once with it
+    p.decide(snap(2000, [pod("p0", 2000)], replay=ReplayInfo(t0_ms=0, trace_path=trace, seed=7)))
+    assert p.oracle.totals == seed7.totals and p._oracle_seed == 7
+    oracle = p.oracle
+    p.decide(snap(3000, [pod("p0", 3000)], replay=ReplayInfo(t0_ms=0, trace_path=trace, seed=7)))
+    assert p.oracle is oracle  # not reloaded again
+    # a marker without seed after that keeps the last one (the marker is per run)
+    p.decide(snap(4000, [pod("p0", 4000)], replay=ReplayInfo(t0_ms=0, trace_path=trace)))
+    assert p.oracle is oracle
+
+
+def test_injected_oracle_is_never_replaced_by_the_marker_seed() -> None:
+    p = make()
+    p.decide(snap(1000, [pod("p0", 1000)], replay=ReplayInfo(t0_ms=0, trace_path="x/trace.json", seed=3)))
+    assert p.oracle is ORACLE

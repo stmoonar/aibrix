@@ -37,7 +37,8 @@ Params (``config.policy_params``, example in ``examples/preserve.yaml``):
 key                   default               origin
 ====================  ====================  ===================================================
 trace_path            (required)            ours: the trace the campaign replays (read once)
-trace_seed            0                     ours: the replay's ``--seed`` (segment traces)
+trace_seed            0                     ours: fallback of the replay's ``--seed``; the marker's
+                                            ``seed`` (``snap.replay.seed``) wins (segment traces)
 trace_schedule        poisson               ours: what ``tre_replayer.run_trace`` sends
 trace_match_parts     2                     ours: replay marker must end in the same N parts
 window_s              600                   paper (10 min window)
@@ -63,6 +64,7 @@ req_ttl_s             1800                  ours: forget requests/events older t
 """
 from __future__ import annotations
 
+import logging
 import math
 from collections import Counter
 from dataclasses import dataclass, field
@@ -73,6 +75,8 @@ from tre_baselines.policies import preserve_tier1 as tier1
 from tre_baselines.policies.base import Decision
 from tre_baselines.policies.preserve_anticipator import LookaheadMap
 from tre_baselines.snapshot import ClusterSnapshot, ModelSnapshot, PodSnapshot, RequestEvent
+
+LOG = logging.getLogger(__name__)
 
 DEFAULT_MAX_OUTPUT_LEN = 4096
 HOLD_MODES = ("target", "awake")
@@ -144,13 +148,15 @@ class PreServePolicy:
             raise ValueError("preserve: noise_sigma must be >= 0")
         self.mu = tier1.parse_mu(params.get("mu"), models)
         self.match_parts = int(params.get("trace_match_parts", 2))
+        self._oracle_injected = oracle is not None
+        self._trace_schedule = str(params.get("trace_schedule", trace_oracle.SCHEDULE_POISSON))
+        self._oracle_seed = int(params.get("trace_seed", 0))
         if oracle is None:
             path = params.get("trace_path")
             if not path:
                 raise ValueError("preserve: params.trace_path is required (Tier-1 reads the replayed trace)")
             oracle = trace_oracle.load_oracle(
-                str(path), window_s=self.window_s, seed=int(params.get("trace_seed", 0)),
-                schedule=str(params.get("trace_schedule", trace_oracle.SCHEDULE_POISSON)),
+                str(path), window_s=self.window_s, seed=self._oracle_seed, schedule=self._trace_schedule,
             )
         elif oracle.window_s != self.window_s:
             raise ValueError("preserve: oracle window_s differs from params.window_s")
@@ -327,6 +333,18 @@ class PreServePolicy:
         """(window index or None, inactive reason or None)."""
         if snap.replay is None:
             return None, "tier1_no_replay"
+        seed = snap.replay.seed
+        if (seed is not None and not self._oracle_injected and seed != self._oracle_seed
+                and self.oracle.fmt == trace_oracle.FORMAT_SEGMENTS):
+            # The campaign's marker carries the replay's --seed: a segment trace's arrival
+            # schedule depends on it, so rebuild the oracle with that seed (once per seed).
+            try:
+                self.oracle = trace_oracle.load_oracle(
+                    self.oracle.path, window_s=self.window_s, seed=int(seed), schedule=self._trace_schedule)
+            except (OSError, ValueError) as exc:
+                LOG.warning("preserve: cannot reload the trace with seed %s: %s", seed, exc)
+                return None, "tier1_oracle_reload_failed"
+            self._oracle_seed = int(seed)
         if not self.oracle.matches(snap.replay, self.match_parts):
             return None, "tier1_trace_mismatch"
         idx = trace_oracle.window_index(snap.now_ms, snap.replay, self.window_s, self.lead_s)

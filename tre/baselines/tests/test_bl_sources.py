@@ -85,6 +85,15 @@ def test_parse_event_fields_and_defaults() -> None:
     assert entry_ts_ms("42-7") == 42
 
 
+def test_event_token_sentinels_become_none() -> None:
+    # the gateway writes out_tokens=-1 when the response carried no usage
+    done = parse_event("m", "5-0", {"kind": "done", "req_id": "r", "out_tokens": "-1", "in_tokens": "0"})
+    assert done.out_tokens is None and done.in_tokens is None
+    ok = parse_event("m", "5-1", {"kind": "done", "req_id": "r", "out_tokens": "0", "in_tokens": "1"})
+    assert ok.out_tokens == 0 and ok.in_tokens == 1  # 0 output tokens is a real (empty) answer
+    assert parse_event("m", "5-2", {"kind": "arr", "req_id": "r", "in_tokens": "-5"}).in_tokens is None
+
+
 def test_event_reader_starts_at_now_and_keeps_cursor() -> None:
     redis = FakeRedis(now_ms=10_000)
     key = req_stream_key("m")
@@ -110,6 +119,11 @@ def test_replay_info() -> None:
     redis.set(REPLAY_T0_KEY, json.dumps({"t0_ms": 123, "trace_path": "traces/a.jsonl"}))
     info = read_replay_info(redis)
     assert (info.t0_ms, info.trace_path) == (123, "traces/a.jsonl")
+    assert info.seed is None  # additive field: markers without a seed still parse
+    redis.set(REPLAY_T0_KEY, json.dumps({"t0_ms": 5, "trace_path": "t", "seed": 42}))
+    assert read_replay_info(redis).seed == 42
+    redis.set(REPLAY_T0_KEY, json.dumps({"t0_ms": 5, "trace_path": "t", "seed": "7"}))
+    assert read_replay_info(redis).seed == 7
     redis.set(REPLAY_T0_KEY, "not json")
     assert read_replay_info(redis) is None
 

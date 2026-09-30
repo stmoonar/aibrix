@@ -200,6 +200,16 @@ def _opt_int(value: Any) -> Optional[int]:
         return None
 
 
+def _positive(value: Optional[int]) -> Optional[int]:
+    """in_tokens <= 0 means "unknown" (an empty or failed count), not a real prompt."""
+    return value if value is not None and value > 0 else None
+
+
+def _non_negative(value: Optional[int]) -> Optional[int]:
+    """out_tokens < 0 (the gateway writes -1 when the response carried no usage) = unknown."""
+    return value if value is not None and value >= 0 else None
+
+
 def _opt_str(value: Any) -> Optional[str]:
     if value is None:
         return None
@@ -226,10 +236,10 @@ def parse_event(model: str, entry_id: Any, fields: Mapping[Any, Any]) -> Optiona
         pod=_opt_str(data.get("pod")),
         req_id=str(data.get("req_id") or ""),
         ts_ms=entry_ts_ms(entry_id),
-        in_tokens=_opt_int(data.get("in_tokens")),
+        in_tokens=_positive(_opt_int(data.get("in_tokens"))),
         in_src=_opt_str(data.get("in_src")),
         max_tokens=_opt_int(data.get("max_tokens")),
-        out_tokens=_opt_int(data.get("out_tokens")),
+        out_tokens=_non_negative(_opt_int(data.get("out_tokens"))),
         status=_opt_str(data.get("status")),
         reissue=reissue,
         entry_id=entry_id,
@@ -293,7 +303,9 @@ def read_replay_info(redis: Any) -> Optional[ReplayInfo]:
         return None
     try:
         doc = json.loads(_decode(raw))
-        return ReplayInfo(t0_ms=int(doc["t0_ms"]), trace_path=str(doc.get("trace_path") or ""))
+        seed = doc.get("seed")
+        return ReplayInfo(t0_ms=int(doc["t0_ms"]), trace_path=str(doc.get("trace_path") or ""),
+                          seed=None if seed is None or isinstance(seed, bool) else int(seed))
     except (ValueError, KeyError, TypeError):
         LOG.warning("malformed %s: %r", REPLAY_T0_KEY, raw)
         return None

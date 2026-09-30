@@ -121,6 +121,8 @@ class ReplayInfo:
 
     t0_ms: int
     trace_path: str
+    #: The replay's ``--seed`` (segment traces are re-scheduled from it); None = not given.
+    seed: Optional[int] = None
 
 
 @dataclass(frozen=True)
