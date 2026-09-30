@@ -134,6 +134,9 @@ class FakeRedis:
         for field in fields:
             bucket.pop(_s(field), None)
 
+    def hlen(self, key):
+        return len(self.hashes.get(key, {}))
+
     def hincrby(self, key, field, amount=1):
         bucket = self.hashes.setdefault(key, {})
         bucket[_s(field)] = str(int(bucket.get(_s(field), "0")) + int(amount))
@@ -344,6 +347,9 @@ class FakeHandle:
 
     def advance(self, phase, *, details=None):
         self.phases.append((phase, details))
+
+    def note(self, **fields):
+        self.notes = {**getattr(self, "notes", {}), **fields}
 
     def assert_active(self):
         return None

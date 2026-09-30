@@ -124,6 +124,12 @@ class FleetSupervisor:
                 recover()
             except OperationBusy:
                 pass  # another writer; next pass
+        recover_wakes = getattr(self._service, "recover_wake_journal", None)
+        if callable(recover_wakes):
+            try:
+                recover_wakes()
+            except OperationBusy:
+                pass  # another writer; next pass
         ensure_seeded = getattr(self._service, "ensure_desired_seeded", None)
         if callable(ensure_seeded):
             try:

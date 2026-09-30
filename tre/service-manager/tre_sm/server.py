@@ -23,6 +23,7 @@ from tre_sm.state.fleet_seed import seed_desired
 from tre_sm.state.fleet_store import FleetStateStore
 from tre_sm.state.gpu_leases import GpuLeaseStore
 from tre_sm.state.store import StateStore
+from tre_sm.state.wake_journal import WakeJournal
 
 
 LOG = logging.getLogger(__name__)
@@ -109,6 +110,7 @@ def create_app() -> FastAPI:
         redis_client,
         owner=os.environ.get("HOSTNAME", "tre-v2-service-manager"),
         lease_ttl_ms=int(os.environ.get("TRE_SM_WRITER_LEASE_TTL_MS", "30000")),
+        max_records=sm_config.operations_max_records,
     )
     # Every vLLM probe of a sleep uses the registry's probe timeout: it is part of
     # the worst-case call duration the SM and the controller validate.
@@ -181,6 +183,9 @@ def create_app() -> FastAPI:
             plugin_pods=_plugin_pod_lister(k8s_ops, sm_config.sleep),
         ),
         sleep_journal=SleepJournal(redis_client),
+        wake_journal=WakeJournal(redis_client),
+        # Read only while registry service_manager.test_hooks is true.
+        fault_redis=redis_client,
         supervisor_enabled=os.environ.get(
             "TRE_SM_SUPERVISOR_ENABLED", "true"
         ).lower() in {"1", "true", "yes"},

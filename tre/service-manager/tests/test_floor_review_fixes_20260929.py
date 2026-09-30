@@ -368,7 +368,8 @@ def test_failed_wake_settles_its_waking_lease():
     # physically still asleep -> released (a sleeping binding holds no lease)
     assert world.leases.calls[-2:] == [("acquire", "m1/node-a/2", "waking"), ("release", "m1/node-a/2")]
 
-    # physically awake after the failure -> the awake lease (its GPU is in use)
+    # physically awake after the failure -> S4 (2026-09-30): a compensating sleep
+    # puts it back to sleep, then the lease is released (before: the awake lease)
     def half_wake(pod_ip, **_kwargs):
         world.vllm.sleeping[pod_ip] = False
         return Result(False, "timed out")
@@ -377,6 +378,17 @@ def test_failed_wake_settles_its_waking_lease():
     with pytest.raises(ValueError):
         with fence(world.redis):
             world.service._apply_runtime_power_action(target, action="wake")
+    assert world.vllm.sleeping["10.0.0.3"] is True
+    assert world.leases.calls[-1] == ("release", "m1/node-a/2")
+    assert ("acquire", "m1/node-a/2", "awake") not in world.leases.calls
+
+    # ... and when that sleep fails too: the awake lease (its GPU is in use)
+    world.vllm.fail_sleep_for.add("10.0.0.3")
+    world.vllm.sleeping["10.0.0.3"] = True
+    with pytest.raises(ValueError):
+        with fence(world.redis):
+            world.service._apply_runtime_power_action(target, action="wake")
+    assert world.vllm.sleeping["10.0.0.3"] is False
     assert world.leases.calls[-1] == ("acquire", "m1/node-a/2", "awake")
 
 

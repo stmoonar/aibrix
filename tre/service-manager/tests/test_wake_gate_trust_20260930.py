@@ -136,7 +136,7 @@ def test_trusted_busy_sample_refuses_at_once_and_asks_for_a_new_sample():
 # ------------------------------------------- sample older than a power change
 
 
-def test_sample_predating_a_local_power_change_is_not_trusted_residents_asleep_pass():
+def test_truth_fallback_stale_sample_residents_asleep_pass():
     # The stored sample still shows the donor awake; the donor's sleep commit just
     # happened on this SM (the agent has not answered the refresh yet).
     service, agent, vllm = _service(physical=BUSY_MIB, residents=[("donor", "tp2", True)])
@@ -148,7 +148,7 @@ def test_sample_predating_a_local_power_change_is_not_trusted_residents_asleep_p
     assert service._sleep_clock.slept == []
 
 
-def test_untrusted_sample_with_an_awake_resident_refuses():
+def test_truth_fallback_stale_sample_awake_resident_refuses():
     service, agent, vllm = _service(physical=FREE_MIB, residents=[("other", "tp2", False)])
     service._note_power_change("node-a", (0,))
 
@@ -160,7 +160,7 @@ def test_untrusted_sample_with_an_awake_resident_refuses():
     assert not _woke(vllm)
 
 
-def test_untrusted_sample_with_an_unreachable_resident_refuses():
+def test_truth_fallback_stale_sample_unreachable_resident_refuses():
     service, agent, vllm = _service(physical=FREE_MIB, residents=[("other", "tp2", None)])
     service._note_power_change("node-a", (0,))
 
@@ -215,7 +215,7 @@ def test_sleep_commit_marks_the_gpus_of_the_slept_binding():
 # ------------------------------------------------------------ missing sample
 
 
-def test_missing_sample_with_every_resident_asleep_passes():
+def test_truth_fallback_missing_sample_is_sleeping_fallback_passes():
     service, agent, vllm = _service(
         physical=FREE_MIB, publish=False, residents=[("donor", "tp2", True)]
     )
@@ -225,7 +225,7 @@ def test_missing_sample_with_every_resident_asleep_passes():
     assert _woke(vllm)
 
 
-def test_missing_sample_with_an_unverifiable_resident_is_a_node_scope_refusal():
+def test_truth_fallback_missing_sample_unverifiable_resident_node_scope():
     service, agent, vllm = _service(
         physical=FREE_MIB, publish=False, residents=[("other", "tp2", None)]
     )
@@ -238,7 +238,7 @@ def test_missing_sample_with_an_unverifiable_resident_is_a_node_scope_refusal():
     assert not _woke(vllm)
 
 
-def test_missing_sample_with_an_awake_resident_refuses():
+def test_truth_fallback_missing_sample_awake_resident_refuses():
     service, agent, vllm = _service(
         physical=FREE_MIB, publish=False, residents=[("other", "tp2", False)]
     )
@@ -256,11 +256,15 @@ def test_missing_sample_passes_without_probing_only_when_explicitly_permissive()
     assert _woke(vllm)
 
 
-def test_refusal_body_is_structured_and_keeps_the_plain_detail():
-    refusal = WakeConflict("slot busy", reason="lease_starting", node="n", gpus=(2, 3))
+def test_structured_409_body_keeps_the_plain_detail():
+    refusal = WakeConflict(
+        "slot busy", reason="lease_starting", node="n", gpus=(2, 3), binding_id="m/n/2,3",
+        blocking_binding_id="x/n/2,3",
+    )
 
-    body = refusal.body()
+    body = refusal.body(retry_after_s=30.0)
 
     assert body["detail"] == "slot busy"
-    assert body["error"] == "wake_conflict"
-    assert (body["reason"], body["node"], body["gpu"], body["scope"]) == ("lease_starting", "n", [2, 3], "gpu")
+    assert body["error"] == "resident_loading"
+    assert (body["reason"], body["node"], body["gpu_ids"], body["scope"]) == ("lease_starting", "n", [2, 3], "gpu")
+    assert (body["binding_id"], body["blocking_binding_id"], body["retry_after_s"]) == ("m/n/2,3", "x/n/2,3", 30.0)

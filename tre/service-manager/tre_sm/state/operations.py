@@ -165,6 +165,11 @@ class OperationHandle:
         self.fence = fence
         self.started_at = started_at
         self.request = dict(request or {})
+        #: Details that stay on the record whatever the phase (``note``): what the
+        #: operation changed (binding, placement, phase durations, error code).
+        self._notes: dict = {}
+        self._phase = "acquired"
+        self._phase_details: dict | None = None
         self._lost = threading.Event()
         self._stop = threading.Event()
         self._thread = threading.Thread(
@@ -188,10 +193,23 @@ class OperationHandle:
 
     def advance(self, phase: str, *, details: dict | None = None) -> None:
         self.assert_active()
+        self._phase = phase
+        self._phase_details = dict(details) if details else None
         record = self._record(status="running", phase=phase, details=details)
         if not self._coordinator._update(self.fence, record):
             self._lost.set()
             self.assert_active()
+
+    def note(self, **fields) -> None:
+        """Add details that stay on the operation record until it finishes (the
+        phase's own details win on a key clash). Best effort: a lost fence is
+        reported by the operation's end, not here."""
+        if self._lost.is_set():
+            return
+        self._notes.update(fields)
+        record = self._record(status="running", phase=self._phase, details=self._phase_details)
+        if not self._coordinator._update(self.fence, record):
+            self._lost.set()
 
     def supersede(self, operation_id: str) -> None:
         """Close a journal entry left running by a dead service-manager."""
@@ -234,8 +252,9 @@ class OperationHandle:
             "started_at": self.started_at,
             "updated_at": now,
         }
-        if details:
-            record["details"] = details
+        merged = {**self._notes, **(details or {})}
+        if merged:
+            record["details"] = merged
         if self.request:
             record["request"] = self.request
         if finished:
@@ -258,6 +277,7 @@ class OperationCoordinator:
         lease_ttl_ms: int = 30_000,
         poll_interval_s: float = 0.1,
         waiter_ttl_ms: int = 2_000,
+        max_records: int | None = None,
     ) -> None:
         if lease_ttl_ms < 3_000:
             raise ValueError("lease_ttl_ms must be at least 3000")
@@ -271,6 +291,10 @@ class OperationCoordinator:
         #: ... and loses its queue place when it stops polling for this long.
         self.waiter_ttl_ms = int(waiter_ttl_ms)
         self.renew_interval_s = lease_ttl_ms / 3000.0
+        #: Keep at most this many records in the journal (registry
+        #: service_manager.operations.max_records); None = never trimmed.
+        self.max_records = None if max_records is None else max(1, int(max_records))
+        self._finished_since_trim = 0
         self._submitted: dict[str, threading.Thread] = {}
         self._submitted_lock = threading.Lock()
 
@@ -478,7 +502,43 @@ class OperationCoordinator:
             fence.operation_id,
             json.dumps(record, sort_keys=True, separators=(",", ":")),
         )
-        return int(result) == 1
+        finished = int(result) == 1
+        if finished:
+            self._maybe_trim()
+        return finished
+
+    #: Trim the journal at most once per this many finished operations.
+    TRIM_EVERY = 50
+
+    def _maybe_trim(self) -> None:
+        if self.max_records is None:
+            return
+        self._finished_since_trim += 1
+        if self._finished_since_trim < self.TRIM_EVERY:
+            return
+        self._finished_since_trim = 0
+        try:
+            self.trim()
+        except Exception:  # noqa: BLE001 - the next finish tries again
+            pass
+
+    def trim(self) -> int:
+        """Drop the oldest finished records beyond ``max_records`` (running
+        records are never dropped). Returns how many were dropped."""
+        if self.max_records is None:
+            return 0
+        counter = getattr(self._redis, "hlen", None)
+        if callable(counter) and int(counter(rediskeys.SM_OPERATIONS_KEY)) <= self.max_records:
+            return 0
+        records = self.list_operations(limit=10**9)  # newest first
+        drop = [
+            str(record.get("operation_id"))
+            for record in records[self.max_records:]
+            if record.get("status") != "running" and record.get("operation_id")
+        ]
+        for start in range(0, len(drop), 500):
+            self._redis.hdel(rediskeys.SM_OPERATIONS_KEY, *drop[start:start + 500])
+        return len(drop)
 
     def _supersede(
         self, fence: WriterFence, operation_id: str, *, replacement_id: str

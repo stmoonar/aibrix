@@ -396,6 +396,19 @@ class PlacementConfig:
     #: as in v1. The manual service-manager ``POST /v2/defrag`` also refuses while it
     #: is off unless the request carries ``force: true``.
     defrag_enabled: bool = False
+    #: ``placement.placement_penalty``: node name -> extra load (a fraction of the
+    #: node, >= 0) added to the node's GPU load when ranking placements (S5,
+    #: 2026-09-30): a node that also runs the load generator or the control plane
+    #: fills later and is released earlier. Empty = no node is penalised. Keyed by
+    #: the registry's own node names (cluster.nodes), never by a built-in name.
+    node_penalty: dict[str, float] = field(default_factory=dict)
+    #: ``placement.wake_cooldown``: after the service-manager refused a wake on a GPU
+    #: (409 wake_conflict / wake_failed), the controller keeps its planner off that
+    #: GPU for ``gpu_s`` seconds; a node-scope refusal (no gpu-truth for the node
+    #: and a resident unverifiable) keeps it off the whole node for ``node_s``. The
+    #: service-manager reports the same values as ``retry_after_s``.
+    wake_cooldown_gpu_s: float = 30.0
+    wake_cooldown_node_s: float = 60.0
 
 
 #: ``safescale.slo_mode``: where the SafeScale probe's latency thresholds come from.
@@ -701,6 +714,14 @@ class ServiceManagerConfig:
     #: admission request; a Pod waiting longer is reported as drift again (a stuck
     #: gate is not masked). 0 = never exempt.
     startup_gate_drift_grace_s: float = 600.0
+    #: ``service_manager.test_hooks``: honour the fault-injection keys
+    #: ``tre:v2:sm:fault:<refuse_wake|fail_wake>:<node>/<gpu>`` (acceptance tests
+    #: only). Off by default: the keys are then never read.
+    test_hooks: bool = False
+    #: ``service_manager.operations.max_records``: the operation journal
+    #: (``tre:v2:sm:operations``) keeps at most this many finished records (oldest
+    #: dropped first; running ones are never dropped).
+    operations_max_records: int = 20000
 
     @property
     def commit_wait_s(self) -> float:
@@ -923,6 +944,9 @@ class Registry:
         errors.extend(_validate_reissue(self._reissue))
         if self._placement.reserve_tp_pairs < 0:
             errors.append("placement.reserve_tp_pairs must be >= 0")
+        node_names = {node.name for node in self._topology.nodes}
+        for node_name in sorted(set(self._placement.node_penalty) - node_names):
+            errors.append(f"placement.placement_penalty: unknown node {node_name!r} (not in cluster.nodes)")
         errors.extend(_validate_vllm_env("vllm.env", self._vllm.env))
         errors.extend(_validate_service_manager(self._service_manager, self._gateway))
         return errors
@@ -1040,10 +1064,38 @@ def parse_placement_config(raw: Any) -> PlacementConfig:
         return PlacementConfig()
     if not isinstance(raw, dict):
         raise ValueError("placement must be a mapping")
-    known = {"reserve_tp_pairs", "defrag"}
+    known = {"reserve_tp_pairs", "defrag", "placement_penalty", "wake_cooldown"}
     unknown = sorted(set(raw) - known)
     if unknown:
         raise ValueError(f"placement: unknown keys {unknown} (known: {', '.join(sorted(known))})")
+    penalty_raw = raw.get("placement_penalty")
+    if penalty_raw is None:
+        penalty_raw = {}
+    if not isinstance(penalty_raw, dict):
+        raise ValueError("placement.placement_penalty must be a mapping node name -> number")
+    node_penalty: dict[str, float] = {}
+    for node_name, value in penalty_raw.items():
+        if isinstance(value, bool):
+            raise ValueError(f"placement.placement_penalty[{node_name!r}] must be a number")
+        try:
+            number = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"placement.placement_penalty[{node_name!r}] must be a number") from exc
+        if not math.isfinite(number) or number < 0:
+            raise ValueError(f"placement.placement_penalty[{node_name!r}] must be a finite number >= 0")
+        node_penalty[str(node_name)] = number
+    cooldown_raw = raw.get("wake_cooldown")
+    if cooldown_raw is None:
+        cooldown_raw = {}
+    if not isinstance(cooldown_raw, dict):
+        raise ValueError("placement.wake_cooldown must be a mapping (gpu_s, node_s)")
+    unknown = sorted(set(cooldown_raw) - {"gpu_s", "node_s"})
+    if unknown:
+        raise ValueError(f"placement.wake_cooldown: unknown keys {unknown} (known: gpu_s, node_s)")
+    cooldowns = {
+        key: _nonneg_num(cooldown_raw, key, default, f"placement.wake_cooldown.{key}")
+        for key, default in (("gpu_s", PlacementConfig.wake_cooldown_gpu_s), ("node_s", PlacementConfig.wake_cooldown_node_s))
+    }
     defaults = PlacementConfig()
     defrag = raw.get("defrag")
     if defrag is None:
@@ -1063,6 +1115,9 @@ def parse_placement_config(raw: Any) -> PlacementConfig:
             if defrag.get("enabled") is None
             else _parse_bool(defrag["enabled"])
         ),
+        node_penalty=node_penalty,
+        wake_cooldown_gpu_s=cooldowns["gpu_s"],
+        wake_cooldown_node_s=cooldowns["node_s"],
     )
 
 
@@ -1151,6 +1206,11 @@ def parse_service_manager_config(
         raise ValueError(
             "service_manager.startup_admission must be a mapping "
             f"(gate_seen_s, drift_grace_s), got {startup_raw!r}"
+        )
+    operations_raw = raw.get("operations") or {}
+    if not isinstance(operations_raw, dict):
+        raise ValueError(
+            f"service_manager.operations must be a mapping (max_records), got {operations_raw!r}"
         )
     defaults = SleepPolicy()
     plugin_pods_raw = sleep_raw.get("gateway_plugin_pods") or {}
@@ -1250,6 +1310,10 @@ def parse_service_manager_config(
             startup_raw, "drift_grace_s", base.startup_gate_drift_grace_s,
             "service_manager.startup_admission.drift_grace_s",
         ),
+        test_hooks=_parse_bool(raw.get("test_hooks", base.test_hooks)),
+        operations_max_records=int(
+            _num(operations_raw, "max_records", base.operations_max_records)
+        ),
     )
 
 
@@ -1290,6 +1354,8 @@ def _validate_service_manager(
     config: ServiceManagerConfig, gateway: GatewayConfig | None = None
 ) -> list[str]:
     errors: list[str] = []
+    if config.operations_max_records < 100:
+        errors.append("service_manager.operations.max_records must be >= 100")
     sleep = config.sleep
     for name in (
         "ack_timeout_s",
