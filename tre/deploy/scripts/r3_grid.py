@@ -831,6 +831,7 @@ def run_schedule_cell(args, store, spec, redis_client=None) -> tuple[list, "open
 
     sender_records: list[dict] = []
     sidecar_samples: list[dict] = []
+    client_provenance: dict = {}
     start_ms, end_ms, guard = openloop.drive_cell_schedule(
         args.gateway_url, args.model, cell_id, segments,
         records_out=sender_records,
@@ -855,6 +856,8 @@ def run_schedule_cell(args, store, spec, redis_client=None) -> tuple[list, "open
         max_backlog=args.max_backlog,
         api=getattr(args, "api", API_DEFAULT),
         request_seed=getattr(args, "request_seed", None),
+        sender_processes=getattr(args, "sender_processes", None),
+        client_out=client_provenance,
         guard_kwargs={
             "max_p99_delay_ms": args.max_p99_delay_ms,
             "max_p99_pool_wait_ms": args.max_p99_pool_wait_ms,
@@ -955,6 +958,9 @@ def run_schedule_cell(args, store, spec, redis_client=None) -> tuple[list, "open
             else str(openloop.prompt_file_path_for(prompt_dir, cell_id))
         ),
         "rps_timeline": None if rps_path is None else str(rps_path),
+        # The client that sent the cell (tre_replayer.engine.profiles.client_provenance):
+        # profile, wire (transport, pool, keep-alive), sender processes, library versions.
+        "client": client_provenance,
     })
     if raw_dir is not None:
         (raw_dir / f"{cell_id}.guard.json").write_text(
@@ -1348,6 +1354,10 @@ def parse_args(argv: Optional[Sequence[str]] = None):
                          "guard records the stop as a truncation caused by the backlog "
                          "limit and the windows after it are censored")
     ap.add_argument("--max-in-flight", type=int, default=openloop.DEFAULT_MAX_IN_FLIGHT)
+    ap.add_argument("--sender-processes", type=int, default=None,
+                    help="worker processes the schedule is sent from (pre-sharded, each an "
+                         "asyncio loop firing at absolute times; tre_replayer.engine.procpool). "
+                         "Default: tre_replayer.engine.profiles.DEFAULT_SENDER_PROCESSES")
     # Sidecar source. "pod" scrapes the model pods' /metrics directly at
     # --instant-sample-ms (1 s for the campaign); "store" is the legacy redis read, which
     # cannot resolve faster than the gateway's 10 s grid.
