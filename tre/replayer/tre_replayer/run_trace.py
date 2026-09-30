@@ -84,8 +84,17 @@ def run_trace(
         zh_ratio=zh_ratio,
     )
     dispatch_kwargs = {"sleep": sleep} if sleep is not None else {}
+
+    async def _dispatch_then_close():
+        # The replay sends from this process: one asyncio loop, the pooled async
+        # transport (tre_replayer.engine.transport), closed on the loop that used it.
+        try:
+            return await dispatch_open_loop(schedule, sender, **dispatch_kwargs)
+        finally:
+            await sender.aclose()
+
     try:
-        report = asyncio.run(dispatch_open_loop(schedule, sender, **dispatch_kwargs))
+        report = asyncio.run(_dispatch_then_close())
     finally:
         sender.close()
     if out_path:
@@ -224,7 +233,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--window-ms", type=int, default=30_000)
     ap.add_argument("--step-ms", type=int, default=5_000)
-    ap.add_argument("--max-in-flight", type=int, default=512)  # sender thread pool (F5)
+    ap.add_argument("--max-in-flight", type=int, default=512)  # sender connection pool (F5)
     ap.add_argument("--trim-ramp-windows", type=int, default=1)
     ap.add_argument("--prompt-file", default=None,
                     help="materialise every prompt here before the replay starts, so no "
