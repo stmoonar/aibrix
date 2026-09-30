@@ -1,0 +1,24 @@
+# Example params for TRE_BL_POLICY=tokenscale (TRE_BL_POLICY_CONFIG points at this file).
+# Every velocity below is a PLACEHOLDER: the policy refuses to start with missing / <= 0
+# entries, and real values must be profiled on the current engine
+# (tools/tokenscale_profile.py) -- do not use these numbers for an experiment.
+models: [model-a]            # optional; default = every model in the registry
+bucket_edges:                # tertiles from tools/tokenscale_buckets.py ("*" = any model)
+  model-a:
+    in: [400, 1200]          # input-token edges: <=400 -> 0, <=1200 -> 1, else 2
+    out: [64, 160]           # max_tokens edges
+velocity:
+  model-a:
+    buckets:                 # (in+out) tokens/s per replica, rows = input bucket, cols = output bucket
+      - [4000, 3500, 3000]
+      - [5000, 4500, 4000]
+      - [6000, 5500, 5000]
+    v_prefill: 9000          # input tokens/s per replica (out = 1)
+out_len_source: max_tokens   # only implemented source
+default_out_tokens: 256      # used (and counted as missing_out) when an event has no max_tokens
+misbucket_rate: 0.15         # paper: 85 %-accurate length predictor
+seed: 0                      # default: TRE_BL_SEED
+skip_reissue: true
+window_s: 10                 # not in paper
+stale_s: 30                  # not in paper
+max_estimate_frac: 0.05      # not in paper
