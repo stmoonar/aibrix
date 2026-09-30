@@ -53,6 +53,11 @@ spec:
               value: default
             - name: TRE_BL_HTTP_PORT
               value: "8080"
+          # Readiness = the loop's ticks succeed (/healthz turns 503 after
+          # TRE_BL_MAX_TICK_FAILURES failed ticks, e.g. while the SM is down). Liveness only
+          # asks whether the process and its loop thread are alive (/livez), so an SM or
+          # Redis outage never restarts the pod (which would drop the owner lock and the
+          # in-memory policy state).
           readinessProbe:
             httpGet:
               path: /healthz
@@ -60,7 +65,7 @@ spec:
             periodSeconds: 10
           livenessProbe:
             httpGet:
-              path: /healthz
+              path: /livez
               port: http
             initialDelaySeconds: 30
             periodSeconds: 20
@@ -74,6 +79,10 @@ spec:
               readOnly: true
             - name: decision-logs
               mountPath: /var/log/tre-baselines
+            # PreServe Tier-1 reads the replayed trace from here (params.trace_path).
+            - name: traces
+              mountPath: /etc/tre-baselines-traces
+              readOnly: true
           resources:
             requests:
               cpu: 100m
@@ -94,9 +103,16 @@ spec:
                   name: tre-v2-baseline-tokenscale
               - configMap:
                   name: tre-v2-baseline-preserve
-        # Decision JSONL; also mirrored to Redis tre:v2:bl:decision:<model>. Patch in a
-        # persistent volume to keep the files past the pod.
+        # Decision JSONL; also mirrored to Redis (tre:v2:bl:decision:<model>, TTL 1 h, and
+        # the stream tre:v2:bl:decisions). `arm disable --execute --collect-dir` copies the
+        # files out before scaling to 0; or patch in a persistent volume.
         - name: decision-logs
+          emptyDir: {}
+        # Trace source of PreServe Tier-1. Empty by default (the image also carries
+        # tre/replayer/traces_* under /app/tre/replayer); patch this volume with a
+        # kustomize patch to a configMap / PVC / hostPath holding the campaign's traces
+        # (see tre/baselines/README.md, "Trace volume").
+        - name: traces
           emptyDir: {}
 ---
 apiVersion: v1

@@ -60,6 +60,25 @@ def test_deployment_ships_off_and_dry_run() -> None:
     assert projected == [f"tre-v2-baseline-{p}" for p in POLICIES]
 
 
+def test_probes_split_liveness_from_readiness() -> None:
+    (container,) = _one("Deployment", "tre-v2-baseline-scaler")["spec"]["template"]["spec"]["containers"]
+    # readiness follows the ticks (503 after repeated failures, e.g. SM down) ...
+    assert container["readinessProbe"]["httpGet"]["path"] == "/healthz"
+    # ... liveness only the loop: an SM / Redis outage must never restart the pod
+    assert container["livenessProbe"]["httpGet"]["path"] == "/livez"
+
+
+def test_trace_volume_is_a_patchable_empty_dir() -> None:
+    pod = _one("Deployment", "tre-v2-baseline-scaler")["spec"]["template"]["spec"]
+    (container,) = pod["containers"]
+    mounts = {m["name"]: m for m in container["volumeMounts"]}
+    assert mounts["traces"]["mountPath"] == "/etc/tre-baselines-traces" and mounts["traces"]["readOnly"] is True
+    volumes = {v["name"]: v for v in pod["volumes"]}
+    assert volumes["traces"] == {"name": "traces", "emptyDir": {}}  # no hostPath / PVC baked in
+    example = yaml.safe_load((TRE_ROOT / "baselines" / "examples" / "preserve.yaml").read_text(encoding="utf-8"))
+    assert example["trace_path"].startswith("/etc/tre-baselines-traces/")
+
+
 def test_policy_configmaps_present() -> None:
     for policy in POLICIES:
         cm = _one("ConfigMap", f"tre-v2-baseline-{policy}")
@@ -90,9 +109,13 @@ def test_nothing_cluster_specific() -> None:
 def test_dockerfile_contract() -> None:
     dockerfile = (TRE_ROOT / "baselines" / "Dockerfile").read_text(encoding="utf-8")
     assert "FROM python:3.11-slim" in dockerfile and "latest" not in dockerfile.lower()
-    for directive in ("COPY common", "COPY deploy", "COPY baselines", "requirements-test.txt"):
+    for directive in ("COPY common", "COPY deploy", "COPY replayer", "COPY baselines", "requirements-test.txt"):
         assert directive in dockerfile
-    assert "/app/tre/baselines" in dockerfile
+    (pythonpath,) = [ln for ln in dockerfile.splitlines() if ln.startswith("ENV PYTHONPATH=")]
+    entries = pythonpath.split("=", 1)[1].split(":")
+    # trace_oracle imports tre_replayer (segment traces of PreServe Tier-1)
+    for entry in ("/app/tre/common", "/app/tre/deploy", "/app/tre/replayer", "/app/tre/baselines"):
+        assert entry in entries, entry
     assert 'CMD ["python", "-m", "tre_baselines.main"]' in dockerfile
     for forbidden in ("COPY service-manager", "COPY controller", "COPY reissue"):
         assert forbidden not in dockerfile

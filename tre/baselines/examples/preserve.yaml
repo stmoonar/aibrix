@@ -2,10 +2,12 @@
 # See tre_baselines/policies/preserve.py for the full table (paper vs ours).
 
 # --- Tier-1 (window-level provisioning, paper §4.1 / Alg.2) ---
-# The trace the campaign replays, as mounted in the shell pod (read once at start). The
-# replay marker tre:v2:bl:replay_t0 must name the same trace (last trace_match_parts path
-# components equal), otherwise Tier-1 stays inactive.
-trace_path: /etc/tre-baselines/traces/case/trace.json   # replace with the run's trace
+# The trace the campaign replays, as mounted in the shell pod (read once at start): the
+# deployment's `traces` volume is mounted at /etc/tre-baselines-traces (an emptyDir until
+# patched, see README "Trace volume"); traces shipped in the image live under
+# /app/tre/replayer/traces_*. The replay marker tre:v2:bl:replay_t0 must name the same
+# trace (last trace_match_parts path components equal), otherwise Tier-1 stays inactive.
+trace_path: /etc/tre-baselines-traces/case/trace.json   # replace with the run's trace
 trace_seed: 0            # = the replay's --seed (segment traces are re-scheduled from it)
 trace_schedule: poisson  # what tre_replayer.run_trace sends
 trace_match_parts: 2
@@ -27,7 +29,9 @@ lookahead_iters: 100     # paper l
 kv_high: 0.95            # paper
 overload_frac: 0.10      # paper
 t_f: 0.30                # paper T_f
-ext_frac: 0.2            # paper virtual extension
+out_len_is_upper_bound: true  # ours: max_tokens is a hard cap in vLLM -> no virtual extension
+phantom_margin: 0.25     # ours: drop a request not done after D_pred * (1 + margin) iterations
+ext_frac: 0.2            # paper virtual extension (only used when out_len_is_upper_bound: false)
 # kv_capacity_tokens: {dsqwen-7b: 100000}   # only if a pod lacks vllm:cache_config_info
 hold_mode: target        # target | awake
 down_grace_s: 60

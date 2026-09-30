@@ -27,19 +27,27 @@ export TRE_REGISTRY_PATH=deploy/registry.yaml
 export TRE_BL_POLICY=chiron TRE_BL_POLICY_CONFIG=baselines/examples/chiron.yaml
 export TRE_BL_LOG_DIR=/tmp/bl-logs TRE_BL_HTTP_PORT=8080
 python3 -m tre_baselines.main          # one JSONL line per model per tick in $TRE_BL_LOG_DIR
-curl -s localhost:8080/healthz ; curl -s localhost:8080/metrics
+curl -s localhost:8080/healthz ; curl -s localhost:8080/livez ; curl -s localhost:8080/metrics
 ```
 
-`TRE_BL_DRY_RUN=false` actuates (needs the owner lock `tre:v2:bl:owner`, and the TRE
-controller must be in observe mode). The full list of environment variables is in the
-docstring of `tre_baselines/config.py`. In the cluster it is the deployment
-`tre-v2-baseline-scaler` (`deploy/baselines/tre/`), off (0 replicas) by default.
+`TRE_BL_DRY_RUN=false` actuates, but only in ticks where the shell holds the owner lock
+`tre:v2:bl:owner` **and** the TRE controller is in observe mode: the shell reads
+`tre:v2:controller:mode` every tick (missing = observe) and otherwise logs
+`guard_controller_active` instead of calling the SM (metric `tre_bl_controller_guard`).
+After an SM refusal a model backs off exponentially (`max(retry_after_s, tick)`, doubling,
+capped at `TRE_BL_BACKOFF_MAX_S` = 60 s; action `backoff`). Every decision line also goes
+to the Redis stream `tre:v2:bl:decisions` (`TRE_BL_DECISION_STREAM`, MAXLEN ~ 100000).
+`/healthz` (readiness) turns 503 after repeated failed ticks; `/livez` (liveness) only
+checks that the loop runs, so an SM outage never restarts the pod. The full list of
+environment variables is in the docstring of `tre_baselines/config.py`. In the cluster it
+is the deployment `tre-v2-baseline-scaler` (`deploy/baselines/tre/`), off (0 replicas) by
+default.
 
 ## Arm tool
 
 ```bash
 python3 -m tre_baselines.tools.arm enable --policy chiron|tokenscale|preserve [--dry-run-shell] [--models a,b] [--execute]
-python3 -m tre_baselines.tools.arm disable [--execute]
+python3 -m tre_baselines.tools.arm disable --collect-dir <dir> [--execute]   # or --skip-collect
 python3 -m tre_baselines.tools.arm mark-replay --trace <path> --seed <int> [--execute]
 ```
 
@@ -47,7 +55,10 @@ Without `--execute` it only prints the `kubectl` commands. With it, `enable` fir
 that the controller is in `observe` mode (`tre:v2:controller:mode`) and that no APA
 `PodAutoscaler` targets the managed models, then sets `TRE_BL_POLICY` /
 `TRE_BL_DRY_RUN`, scales the deployment to 1 and waits for `/healthz` 200 and the owner
-lock; `disable` scales to 0 and waits for the lock to go; `mark-replay` writes
+lock; `disable` first copies the decision logs out of the pod (`kubectl cp
+<ns>/<pod>:/var/log/tre-baselines <collect-dir>/<pod>`, `--collect-dir` required with
+`--execute` unless `--skip-collect`; a failed copy aborts before scaling), then scales to 0
+and waits for the lock to go; `mark-replay` writes
 `tre:v2:bl:replay_t0` = `{t0_ms (Redis TIME), trace_path, seed}`. Options `--namespace`,
 `--deployment`, `--redis-url` (env `TRE_REDIS_URL`; else `kubectl exec` into
 `--redis-deploy`). Nothing about the cluster is hard-coded.
@@ -60,6 +71,37 @@ each policy's docstring lists every key, marking what is from the paper and what
 choice (`# not in paper`). TokenScale velocities, Chiron theta and PreServe mu have no
 usable default and must be profiled (`tools/`); the policies refuse to start without them.
 
+## Trace volume (PreServe Tier-1)
+
+PreServe reads the replayed trace from `params.trace_path` inside the pod. The deployment
+mounts a volume named `traces` at `/etc/tre-baselines-traces` (read-only); it is an
+`emptyDir` in the shipped manifest, so nothing environment-specific is baked in. The image
+also carries `tre/replayer/traces_*` under `/app/tre/replayer/` (and `tre_replayer` itself,
+which segment traces need). To serve other traces, patch the volume in your own overlay,
+e.g.
+
+```yaml
+# kustomization.yaml of an overlay on deploy/baselines/tre
+patches:
+  - target: {kind: Deployment, name: tre-v2-baseline-scaler}
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata: {name: tre-v2-baseline-scaler, namespace: tre-v2}
+      spec:
+        template:
+          spec:
+            volumes:            # strategic merge: matched by name
+              - name: traces
+                emptyDir: null  # drop the default source
+                persistentVolumeClaim: {claimName: <your-trace-pvc>, readOnly: true}
+                # or configMap: {name: <cm-holding-trace.json>}
+                # or hostPath: {path: <dir-on-every-node>, type: Directory}
+```
+
+and set `trace_path: /etc/tre-baselines-traces/<case>/trace.json` in the PreServe policy
+file. The replay marker must name the same trace (last `trace_match_parts` components).
+
 ## Tests
 
 ```bash
@@ -69,19 +111,27 @@ cd tre && make check-redis    # also test_bl_e2e_real_redis.py against a throwaw
 
 ## Known gaps before on-cluster runs
 
-- Clients do not send the `x-tre-bl-in-tokens` header yet; the gateway falls back to a
-  character-count estimate (poor for Chinese text), and TokenScale degrades when too many
-  counts are estimates.
-- `campaign_queue.py` does not have the three baseline arms yet (it should call the arm
-  tool: `enable`, `mark-replay` at replay start, `disable`).
-- The service manager's structured 409 body and the new `/v2/state` fields are provisional
-  (the T1 line is not merged); the shell parses both plain and structured refusals.
-- The decision log is on an `emptyDir`: it is gone with the pod (the last line per model is
-  also kept in Redis for 1 h). Copy it out before `disable`, or patch in a volume.
-- The "controller is in observe mode" guard exists only in the arm tool; the shell itself
-  does not check it.
-- The E1 trace format and where the `*.effective.json` (per-request schedule) lands are not
-  verified; PreServe Tier-1 needs the trace of the replay and its seed.
-- TokenScale velocities V_b / V_P, Chiron theta and PreServe mu (and the shell's tick /
-  window settings) have not been measured on the current engine; the example files hold
-  placeholders. `tools/tokenscale_profile.py` has no HTTP sender yet.
+- **Client header.** Clients do not send `x-tre-bl-in-tokens` yet; the gateway falls back
+  to a character-count estimate (poor for Chinese text). Keep the header in the plan:
+  until clients send it, TokenScale sits in `degraded_estimate_frac` (it refuses to trust
+  a window where more than `max_estimate_frac` of the counts are estimates).
+- **Replay t0.** `arm mark-replay` stamps `t0_ms` when it runs; the replayer's own warm-up
+  can make that t0 lead the first real send. The replayer should write the marker at its
+  first send (not done: `tre/replayer` is outside this line); until then PreServe Tier-1
+  windows may start early by the warm-up.
+- **mu window.** `tools/preserve_mu.py` profiles over 30 s windows while Tier-1 plans over
+  600 s windows; a 30 s maximum is biased high relative to what a replica sustains over
+  10 min (fewer replicas planned). Decide the window on the cluster.
+- **ft vs TTFT.** The gateway's `ft` event (first byte through Envoy) is used as "prefill
+  done"; its alignment with vLLM's TTFT is not verified.
+- **T1 schema.** The service manager's structured 409 body and the new `/v2/state` fields
+  are provisional (the T1 line is not merged); the shell parses both plain and structured
+  refusals (and honours `retry_after_s` when present).
+- **Campaign.** `campaign_queue.py` does not have the three baseline arms yet (it should
+  call the arm tool: `enable`, `mark-replay` at replay start, `disable --collect-dir`).
+- **Unmeasured parameters.** TokenScale velocities V_b / V_P, Chiron theta
+  (`tools/chiron_theta.py --method peak_mean` by default) and PreServe mu, plus the shell's
+  tick / window settings, have not been measured on the current engine; the example files
+  hold placeholders. `tools/tokenscale_profile.py` has no HTTP sender yet.
+- The E1 trace format and where the `*.effective.json` (per-request schedule) lands are
+  not verified; PreServe Tier-1 needs the trace of the replay and its seed.
