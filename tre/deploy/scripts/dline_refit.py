@@ -88,11 +88,20 @@ Stages (``python -m scripts.dline_refit STAGE --model M --arm primary|fixed|k3 .
     frozen model; reads nothing but those. Refuses on a broken freeze, a training input
     changed since the freeze, an M manifest sealed under another freeze or label or whose
     raw-data sums moved, a manifest cell missing / duplicated / not ``holdout`` / not
-    ``valid`` in the datasets. Scores the manifest cells with ``holdout_report`` (dwell 2)
-    plus a cell bootstrap for the CIs; writes ``<stem>.accept.json`` (0444), the
+    ``valid`` in the datasets. Scores the manifest cells with ``holdout_report`` (the
+    freeze's dwell / window length; 2 x 30 s for a revision-1 freeze) plus a cell bootstrap
+    for the CIs, and discloses - never gates - the ranking metrics of pressure = -Z
+    (AUROC, Kendall tau-b per model / pooled / cross-model, ``tre_calibration.ranking``,
+    docs/design/20260930-ranking-metrics.md); writes ``<stem>.accept.json`` (0444), the
     validation CSVs under ``<stem>.accept.d/`` and the marker ``PATH.accepted``. Exit 0 =
     A, B and D pass for every model, 3 = evaluated and failed, other = refused. Runs once;
-    ``--recheck`` recomputes in a temp dir and compares, writing nothing.
+    ``--recheck`` recomputes in a temp dir and compares, writing nothing (a stored result
+    of an older format revision is compared without the keys added since).
+
+Windowing: ``--window-ms`` / ``--step-ms`` / ``--dt-ref-s`` / ``--horizon-ms`` /
+``--dwell-windows`` (defaults 30 s / 10 s / 10 s / 30 s / 2) are threaded through alpha,
+wp and final, recorded as ``windowing`` in their outputs and in the freeze (revision 2),
+and accept reads them from the freeze.
 
 Labels are ``tre_common.slo_labels``: ``primary`` is the D6' slowdown label of the
 registry profile (``max(500 ms, 5 * idle TTFT(L))``, TPOT 75 ms, >= 20 completions),
@@ -135,6 +144,15 @@ FA_MAX = 0.05
 SEED = 20260922
 DWELL_WINDOWS = 2
 TRIM_RAMP_WINDOWS = 1
+#: Windowing (2026-09-30): the window length and re-window step the fit CSVs were cut
+#: with. Every windowing constant - WINDOW_MS, STEP_MS, DT_REF_S, HORIZON_MS,
+#: DWELL_WINDOWS - is only a default: the stages take ``--window-ms`` / ``--step-ms`` /
+#: ``--dt-ref-s`` / ``--horizon-ms`` / ``--dwell-windows``, thread the values explicitly
+#: (no module state changes), record them as ``windowing`` in their outputs, and the
+#: freeze carries them to ``accept``: a different window only needs an offline re-run.
+WINDOW_MS = 30_000.0
+STEP_MS = 10_000.0
+WINDOWING_KEYS = ("window_ms", "step_ms", "dt_ref_s", "horizon_ms", "dwell_windows")
 #: Verdict resamples: the w_p grid, the lambda check, the final verdict.
 WP_RESAMPLES = (1000, 200)
 LAMBDA_RESAMPLES = (300, 100)
@@ -599,15 +617,37 @@ def shape_fn() -> Callable[[str], str]:
     return lambda sid: alpha_fit.shape_of(sid, table)
 
 
-def alpha_of(tau_s: float) -> float:
-    return 1.0 if tau_s <= 0 else 1.0 - math.exp(-DT_REF_S / tau_s)
+def windowing(*, window_ms: float = WINDOW_MS, step_ms: float = STEP_MS, dt_ref_s: float = DT_REF_S,
+              horizon_ms: int = HORIZON_MS, dwell_windows: int = DWELL_WINDOWS) -> dict[str, Any]:
+    """The windowing of one run of the stages (:data:`WINDOWING_KEYS`), validated."""
+    win = {"window_ms": float(window_ms), "step_ms": float(step_ms), "dt_ref_s": float(dt_ref_s),
+           "horizon_ms": int(horizon_ms), "dwell_windows": int(dwell_windows)}
+    bad = [k for k in ("window_ms", "step_ms", "dt_ref_s", "horizon_ms") if not win[k] > 0]
+    bad += ["dwell_windows"] if win["dwell_windows"] < 1 else []
+    if bad or not all(math.isfinite(float(v)) for v in win.values()):
+        raise ValueError(f"windowing {win}: {bad or 'non-finite'} out of range")
+    return win
 
 
-def step90_s(tau_s: float) -> float:
-    a = alpha_of(tau_s)
+DEFAULT_WINDOWING = windowing()
+
+
+def windowing_of(doc: Optional[Mapping[str, Any]]) -> dict[str, Any]:
+    """The windowing a stage output / freeze entry recorded; the defaults for keys (or a
+    whole block) an older document does not carry - the D22 freeze predates the record."""
+    rec = (doc or {}).get("windowing") or {}
+    return {k: rec.get(k, DEFAULT_WINDOWING[k]) for k in WINDOWING_KEYS}
+
+
+def alpha_of(tau_s: float, dt_ref_s: float = DT_REF_S) -> float:
+    return 1.0 if tau_s <= 0 else 1.0 - math.exp(-dt_ref_s / tau_s)
+
+
+def step90_s(tau_s: float, dt_ref_s: float = DT_REF_S) -> float:
+    a = alpha_of(tau_s, dt_ref_s)
     if a >= 1.0:
         return 0.0
-    return DT_REF_S * math.ceil(math.log(0.1) / math.log(1.0 - a))
+    return dt_ref_s * math.ceil(math.log(0.1) / math.log(1.0 - a))
 
 
 def spec_for(tau_s: float, w_p: float, lam: float):
@@ -630,20 +670,22 @@ def rates(pred: Sequence[bool], truth_violated: Sequence[bool]) -> tuple:
     return rec, fa, (rec + 1.0 - fa) / 2.0, tp + fn, fp + tn
 
 
-def future_pairs(windows, crit) -> list[tuple]:
-    """(cell, crit flag at t, violated at t+30 s) for every window whose +30 s window is labelled."""
+def future_pairs(windows, crit, *, horizon_ms: int = HORIZON_MS) -> list[tuple]:
+    """(cell, crit flag at t, violated at t + horizon) for every window whose t + horizon
+    window (default 30 s) is labelled."""
     idx = {(w.scenario_id, int(w.window_start_ms)): i for i, w in enumerate(windows)}
     out = []
     for i, w in enumerate(windows):
-        j = idx.get((w.scenario_id, int(w.window_start_ms) + HORIZON_MS))
+        j = idx.get((w.scenario_id, int(w.window_start_ms) + int(horizon_ms)))
         if j is not None:
             out.append((w.scenario_id, crit[i], not windows[j].slo_met))
     return out
 
 
-def detection_lags(windows, crit) -> list[Optional[float]]:
+def detection_lags(windows, crit, *, horizon_ms: int = HORIZON_MS) -> list[Optional[float]]:
     """Per violation episode (run of violated windows in a cell), seconds from its first
-    window to the first dwell-confirmed CRITICAL within [start-30 s, end]; None = missed."""
+    window to the first dwell-confirmed CRITICAL within [start - horizon, end] (default
+    30 s); None = missed."""
     by = defaultdict(list)
     for i, w in enumerate(windows):
         by[w.scenario_id].append(i)
@@ -661,7 +703,7 @@ def detection_lags(windows, crit) -> list[Optional[float]]:
             t0 = windows[idx[s]].window_start_ms
             t1 = windows[idx[k - 1]].window_start_ms
             hits = [windows[i].window_start_ms for i in idx
-                    if crit[i] and t0 - HORIZON_MS <= windows[i].window_start_ms <= t1]
+                    if crit[i] and t0 - horizon_ms <= windows[i].window_start_ms <= t1]
             lags.append((min(hits) - t0) / 1000.0 if hits else None)
     return lags
 
@@ -697,9 +739,14 @@ def boot_ba_se(pairs, n: int = 300, seed: int = SEED) -> float:
 # ------------------------------------------------------------------------- alpha
 
 
-def stage_alpha_refit0922(model: str, label, p: Mapping[str, Any], *, w_p: float) -> dict:
-    """The archived alpha stage (t + 30 s label; kept to reproduce 2026-09-22)."""
+def stage_alpha_refit0922(model: str, label, p: Mapping[str, Any], *, w_p: float,
+                          win: Optional[Mapping[str, Any]] = None) -> dict:
+    """The archived alpha stage (t + 30 s label; kept to reproduce 2026-09-22). ``win``:
+    the windowing (:func:`windowing`; default :data:`DEFAULT_WINDOWING`)."""
     from scripts import theta_verdict as tv
+
+    win = dict(DEFAULT_WINDOWING if win is None else win)
+    dt_ref, horizon = win["dt_ref_s"], win["horizon_ms"]
 
     shape_of = shape_fn()
     lam = LAMBDA_WAIT
@@ -717,19 +764,19 @@ def stage_alpha_refit0922(model: str, label, p: Mapping[str, Any], *, w_p: float
                 folds[s] = None
                 continue
             theta, tau_crit = fd[0], fd[1]
-            crit = tv.critical_dwell_flags(test, theta=theta, tau_crit=tau_crit,
-                                           direction=spec.direction, dwell_windows=DWELL_WINDOWS)
-            pairs += future_pairs(test, crit)
-            lags += detection_lags(test, crit)
+            crit = tv.critical_dwell_flags(test, theta=theta, tau_crit=tau_crit, direction=spec.direction,
+                                           dwell_windows=win["dwell_windows"], window_ms=win["window_ms"])
+            pairs += future_pairs(test, crit, horizon_ms=horizon)
+            lags += detection_lags(test, crit, horizon_ms=horizon)
             folds[s] = {"theta": theta, "tau_crit": tau_crit}
         rec, fa, ba, npos, nneg = rates([q for _, q, _ in pairs], [v for _, _, v in pairs])
         se = boot_ba_se(pairs)
         full = fit_theta_delta(windows, spec)
         hit = sorted(x for x in lags if x is not None)
         curve.append({
-            "tau_s": tau, "alpha": alpha_of(tau), "loso_ba": ba, "loso_ba_se": se, "recall": rec,
+            "tau_s": tau, "alpha": alpha_of(tau, dt_ref), "loso_ba": ba, "loso_ba_se": se, "recall": rec,
             "false_alarm": fa, "n_pos": npos, "n_neg": nneg, "feasible_fa": fa <= FA_MAX,
-            "step90_ema_s": step90_s(tau), "step90_with_dwell_s": step90_s(tau) + DT_REF_S,
+            "step90_ema_s": step90_s(tau, dt_ref), "step90_with_dwell_s": step90_s(tau, dt_ref) + dt_ref,
             "episodes": len(lags), "episodes_detected": len(hit),
             "detect_lag_median_s": hit[len(hit) // 2] if hit else None,
             "full_fit": ({"theta": full[0], "tau_crit": full[1], "delta_crit": full[2], "delta_high": full[3]}
@@ -751,15 +798,18 @@ def stage_alpha_refit0922(model: str, label, p: Mapping[str, Any], *, w_p: float
 
 def stage_alpha_d4prime(model: str, label, p: Mapping[str, Any], *, w_p: float,
                         ledgers: Sequence[str] = (), bootstrap: int = 1000,
-                        registry: Optional[str] = None) -> dict:
-    """D4' (:mod:`scripts.alpha_fit`) on the same fitting CSV and label."""
+                        registry: Optional[str] = None, win: Optional[Mapping[str, Any]] = None) -> dict:
+    """D4' (:mod:`scripts.alpha_fit`) on the same fitting CSV and label, at the windowing
+    ``win`` (dt_ref, dwell, re-window step and window length are passed through)."""
     from scripts import alpha_fit
 
+    win = dict(DEFAULT_WINDOWING if win is None else win)
     ns = argparse.Namespace(
         model=model, fitting_csv=str(p["fitting"]), w_p=w_p, lambda_wait=LAMBDA_WAIT, qmin=1.0,
         trim_ramp_windows=TRIM_RAMP_WINDOWS, tau_grid_s=[float(t) for t in TAUS_S],
-        dt_ref_s=DT_REF_S, dwell_windows=DWELL_WINDOWS, fa_max=FA_MAX,
-        step_ms=alpha_fit.DEFAULT_STEP_MS, se_resamples=alpha_fit.DEFAULT_SE_RESAMPLES,
+        dt_ref_s=win["dt_ref_s"], dwell_windows=win["dwell_windows"], fa_max=FA_MAX,
+        step_ms=win["step_ms"], window_ms=win["window_ms"], episode_margin_ms=None,
+        se_resamples=alpha_fit.DEFAULT_SE_RESAMPLES,
         bootstrap=bootstrap, bootstrap_refit=False, seed=alpha_fit.DEFAULT_SEED,
         ledger=list(ledgers),
         # the label: this arm's definition, passed field by field
@@ -852,18 +902,18 @@ def alpha_disclosure(doc: Mapping[str, Any], published_tau_s: float) -> dict:
     return out
 
 
-def publish_alpha(doc: dict, publish_tau_s: Optional[float]) -> dict:
+def publish_alpha(doc: dict, publish_tau_s: Optional[float], *, dt_ref_s: float = DT_REF_S) -> dict:
     """D18 on an alpha-stage document: the rule's pick stays ``chosen_tau_s`` (disclosed);
     ``published_tau_s`` - what w_p / theta / delta are fitted at and what deploys - is
     ``publish_tau_s``, or the rule's pick when that is None (``--publish-tau-s rule``)."""
     rule_tau = doc.get("chosen_tau_s")
     tau = rule_tau if publish_tau_s is None else float(publish_tau_s)
     doc["published_tau_s"] = tau
-    doc["published_alpha"] = alpha_of(tau) if tau is not None else None
+    doc["published_alpha"] = alpha_of(tau, dt_ref_s) if tau is not None else None
     doc["publish_rule"] = ("the alpha rule's pick (--publish-tau-s rule)" if publish_tau_s is None
                            else f"D18: the common tau {tau:g} s, whatever the rule picks")
     doc["published_registry_fields"] = (
-        {"ema_tau_ms": tau * 1000.0, "ema_alpha": round(alpha_of(tau), 6)} if tau is not None else None)
+        {"ema_tau_ms": tau * 1000.0, "ema_alpha": round(alpha_of(tau, dt_ref_s), 6)} if tau is not None else None)
     if tau is not None:
         doc["disclosure"] = alpha_disclosure(doc, tau)
     return doc
@@ -1061,14 +1111,16 @@ HOLDOUT_SKIPPED = ("not evaluated (--no-holdout): M is read once, after it is fr
 
 
 def stage_final(model: str, label, p: Mapping[str, Any], wp_doc: Mapping[str, Any], out_dir: Path,
-                *, holdout: bool = True) -> dict:
-    """D5 verdict at (tau, w_p*, lambda*); then, unless ``holdout`` is False, the M report.
+                *, holdout: bool = True, win: Optional[Mapping[str, Any]] = None) -> dict:
+    """D5 verdict at (tau, w_p*, lambda*); then, unless ``holdout`` is False, the M report
+    (dwell and window length from ``win``; the attainment tiles are one window long).
 
     With ``holdout=False`` the validation CSV is never opened (not even for its size)."""
     from tre_calibration.fit import threshold_balanced_accuracy
 
     from scripts import theta_verdict as tv
 
+    win = dict(DEFAULT_WINDOWING if win is None else win)
     tau, wp, lam = wp_doc["tau_s"], wp_doc["w_p_used"], wp_doc["lambda_star"]
     v = verdict(model, label, p, tau, wp, lam, *FINAL_RESAMPLES)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1085,7 +1137,7 @@ def stage_final(model: str, label, p: Mapping[str, Any], wp_doc: Mapping[str, An
         s = summarize(v)
         s["theta_family_rule"] = v["published"]["family_rule_theta"]
         return {
-            "model": model, "tau_s": tau, "alpha": alpha_of(tau), "w_p": wp, "lambda_wait": lam,
+            "model": model, "tau_s": tau, "alpha": alpha_of(tau, win["dt_ref_s"]), "w_p": wp, "lambda_wait": lam,
             **s, "stop_rule_d13": v["stop_rule"]["satisfied"],
             "d13_max_ci_half_width_fraction": v["stop_rule"].get("max_ci_half_width_fraction"),
             "stop_rule_15": _legacy_stop(v["stop_rule"]),
@@ -1098,7 +1150,7 @@ def stage_final(model: str, label, p: Mapping[str, Any], wp_doc: Mapping[str, An
     if not Path(p["validation"]).exists():
         raise SystemExit(f"{p['validation']} does not exist: a D16 training-set directory carries "
                          "no M - run final with --no-holdout until M is frozen")
-    h = tv.holdout_report(v, p["validation"], dwell_windows=DWELL_WINDOWS)
+    h = tv.holdout_report(v, p["validation"], dwell_windows=win["dwell_windows"], window_ms=win["window_ms"])
     (out_dir / "holdout_final.json").write_text(json.dumps(h, indent=1, default=str))
     # M BA CI (cell bootstrap; few M cells -> wide, reported as such)
     spec = spec_for(tau, wp, lam)
@@ -1117,14 +1169,15 @@ def stage_final(model: str, label, p: Mapping[str, Any], wp_doc: Mapping[str, An
             bas.append(r["balanced_accuracy"])
     bas.sort()
     ci = [bas[int(0.025 * len(bas))], bas[int(0.975 * len(bas)) - 1]] if bas else [None, None]
-    # per-length-bucket request attainment on M (non-overlapping 30 s tiles only)
+    # per-length-bucket request attainment on M (non-overlapping one-window tiles only)
+    tile_ms = int(win["window_ms"])
     att = defaultdict(lambda: [0, 0])
     first: dict[str, int] = {}
     with open(p["validation"], newline="") as fh:
         for row in csv.DictReader(fh):
             c, s = row["scenario_id"], int(row["window_start_ms"])
             first.setdefault(c, s)
-            if (s - first[c]) % HORIZON_MS:
+            if (s - first[c]) % tile_ms:
                 continue
             for ttft, length in slo_labels.parse_ttft_len_samples(row.get("ttft_len_samples") or ""):
                 b = bucket(length)
@@ -1134,7 +1187,7 @@ def stage_final(model: str, label, p: Mapping[str, Any], wp_doc: Mapping[str, An
     s = summarize(v)
     s["theta_family_rule"] = v["published"]["family_rule_theta"]
     return {
-        "model": model, "tau_s": tau, "alpha": alpha_of(tau), "w_p": wp, "lambda_wait": lam,
+        "model": model, "tau_s": tau, "alpha": alpha_of(tau, win["dt_ref_s"]), "w_p": wp, "lambda_wait": lam,
         **s, "stop_rule_d13": v["stop_rule"]["satisfied"],
         "d13_max_ci_half_width_fraction": v["stop_rule"].get("max_ci_half_width_fraction"),
         "stop_rule_15": _legacy_stop(v["stop_rule"]),
@@ -1257,7 +1310,10 @@ def stage_summary(out_root: Path, fit_dirs: Mapping[str, Path], *, registry: Opt
 # and writes its result and a marker once; ``--recheck`` recomputes in a temp dir and
 # compares, never writing next to the freeze.
 
-FREEZE_FORMAT_REVISION = 1
+#: 2 (2026-09-30): each model entry records its ``windowing``. Revision 1 freezes (the
+#: D22 one) still verify and accept: their windowing is :data:`DEFAULT_WINDOWING`.
+FREEZE_FORMAT_REVISION = 2
+FREEZE_READABLE_REVISIONS = (1, 2)
 M_MANIFEST_FORMAT_REVISION = 1
 #: The refit stage outputs a freeze reads (``<out>/<model>/<arm>/<name>.json``).
 FREEZE_STAGE_FILES = ("alpha", "wp", "final", "verdict_final")
@@ -1280,6 +1336,7 @@ B_FALSE_ALARM_CI_HIGH_MAX = 0.08
 ALL_VIOLATING_RECALL_TARGET = 0.70
 WINDOWS_PER_INDEPENDENT = 3
 ACCEPT_RESAMPLES = 1000
+#: The dwell accept applies when the freeze records no windowing (revision 1, e.g. D22).
 ACCEPT_DWELL_WINDOWS = DWELL_WINDOWS
 EXIT_REFUSED = 1
 EXIT_ACCEPT_FAILED = 3
@@ -1288,6 +1345,11 @@ EXIT_RECHECK_DIFFERS = 4
 #: code state of the run (provenance of the run, printed when it differs, not a result).
 ACCEPT_VOLATILE_KEYS = frozenset({"generated_at", "evaluated_at_utc", "validation_csv", "work_dir",
                                   "command", "code"})
+#: 2 (2026-09-30): the ranking disclosure (per model and pooled, never gating) and each
+#: model's windowing. A ``--recheck`` of a revision-1 result compares everything else.
+ACCEPT_FORMAT_REVISION = 2
+#: Keys a revision added, top level and per model: absent from an older stored result.
+ACCEPT_REVISION_KEYS = {2: {"top": ("ranking_disclosure",), "model": ("ranking_disclosure", "windowing")}}
 
 
 class FreezeError(RuntimeError):
@@ -1438,6 +1500,11 @@ def freeze_model(out_root: Path, fit_dir: Path, model: str, arm: str) -> tuple[O
             problems.append(f"stage outputs disagree on {what}: {a!r} != {b!r}")
     if not alpha.get("published_registry_fields"):
         problems.append("alpha.json publishes no registry fields (ema_tau_ms / ema_alpha)")
+    # one windowing for the whole refit (stage outputs written before the record carry none)
+    win = windowing_of(fin)
+    for name, doc in (("alpha", alpha), ("wp", wp)):
+        if "windowing" in doc and windowing_of(doc) != win:
+            problems.append(f"stage outputs disagree on the windowing: {name} {windowing_of(doc)} != final {win}")
 
     # training inputs: unchanged since final ran (D16 provenance)
     fit_dir = Path(fit_dir)
@@ -1481,6 +1548,8 @@ def freeze_model(out_root: Path, fit_dir: Path, model: str, arm: str) -> tuple[O
             "tau_crit": fin["tau_crit"], "tau_high": pub.get("tau_high"),
         },
         "registry": dict(alpha["published_registry_fields"]),
+        "windowing": {**win, "source": ("final.json" if "windowing" in fin
+                                        else "defaults: final.json predates the windowing record")},
         "train_ba_at_published": fin.get("train_ba_at_published"),
         "stop_rule": stop,
         "ci_half_frac": fin.get("ci_half_frac"), "publish_rate": fin.get("publish_rate"),
@@ -1570,8 +1639,8 @@ def verify_freeze(path: Path | str) -> dict:
     if doc.get("freeze_sha256") != canonical_sha256(body):
         raise FreezeError([f"{f}: embedded freeze_sha256 {doc.get('freeze_sha256')} does not match its content "
                            f"({canonical_sha256(body)})"])
-    if doc.get("format_revision") != FREEZE_FORMAT_REVISION or not isinstance(doc.get("models"), dict):
-        raise FreezeError([f"{f}: not a format revision {FREEZE_FORMAT_REVISION} freeze"])
+    if doc.get("format_revision") not in FREEZE_READABLE_REVISIONS or not isinstance(doc.get("models"), dict):
+        raise FreezeError([f"{f}: not a format revision {' / '.join(map(str, FREEZE_READABLE_REVISIONS))} freeze"])
     return doc
 
 
@@ -1858,28 +1927,70 @@ def _write_validation_csv(path: Path, header: Sequence[str], rows: Sequence[Mapp
             w.writerow([r.get(c, "") for c in header])
 
 
-def evaluate_model(entry: Mapping[str, Any], csv_path: Path, *, n_resamples: int, seed: int) -> dict:
-    """``theta_verdict.holdout_report`` for the point estimates (dwell 2), the cell
-    bootstrap for the CIs, then A-D."""
+def window_end_index(csv_path: Path) -> dict[tuple[str, float], float]:
+    """(scenario id, window start ms) -> window end ms of a window CSV (the instant the
+    cross-model ranking pairs windows by); rows without the two columns are skipped."""
+    out: dict[tuple[str, float], float] = {}
+    with open(csv_path, newline="", encoding="utf-8") as fh:
+        for row in csv.DictReader(fh):
+            try:
+                start, end = float(row["window_start_ms"]), float(row["window_end_ms"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            out[((row.get("scenario_id") or "unknown").strip() or "unknown", start)] = end
+    return out
+
+
+def ranking_records(model: str, windows: Sequence[Any], csv_path: Path, *, theta: float, direction: str,
+                    window_ms: float) -> list:
+    """The windows as ``tre_calibration.ranking`` records: Z at ``theta``, severity = the
+    label's ratio_max, instant = the CSV's window end (start + ``window_ms`` without one)."""
+    from tre_calibration import ranking
+
+    ends = window_end_index(csv_path)
+    instants = []
+    for w in windows:
+        start = w.window_start_ms
+        end = ends.get((w.scenario_id, float(start))) if start is not None else None
+        instants.append(end if end is not None else (None if start is None else float(start) + window_ms))
+    return ranking.records_from_windows(model, windows, theta=theta, direction=direction, instants=instants)
+
+
+def evaluate_model(entry: Mapping[str, Any], csv_path: Path, *, n_resamples: int, seed: int,
+                   records_sink: Optional[list] = None) -> dict:
+    """``theta_verdict.holdout_report`` for the point estimates (the freeze's dwell and
+    window length - 2 x 30 s for a freeze that predates the record), the cell bootstrap for
+    the CIs, then A-D; plus the ranking disclosure (AUROC, Kendall tau-b; never gating).
+    ``records_sink`` receives the ranking records (for the pooled disclosure)."""
+    from tre_calibration import ranking
+
     from scripts import theta_verdict as tv
 
     vh = entry["verdict_for_holdout"]
-    h = tv.holdout_report(vh, csv_path, dwell_windows=ACCEPT_DWELL_WINDOWS)
+    win = windowing_of(entry)
+    dwell, window_ms = int(win["dwell_windows"]), float(win["window_ms"])
+    h = tv.holdout_report(vh, csv_path, dwell_windows=dwell, window_ms=window_ms)
     spec = tv.SignalSpec.from_dict(vh["signal_spec"])
     label = slo_labels.LabelDefinition.from_dict(vh["label_def"])
     windows = spec.load(csv_path, label, int(vh["trim_ramp_windows"]))
     theta, tau_crit = float(vh["published"]["theta_m"]), float(vh["published"]["tau_crit"])
     direction = vh["fit_config"]["direction"]
     crit = tv.critical_dwell_flags(windows, theta=theta, tau_crit=tau_crit, direction=direction,
-                                   dwell_windows=ACCEPT_DWELL_WINDOWS)
+                                   dwell_windows=dwell, window_ms=window_ms)
     boot = acceptance_bootstrap(windows, crit, theta=theta, direction=direction,
                                 n_resamples=n_resamples, seed=seed)
+    records = ranking_records(vh["model"], windows, csv_path, theta=theta, direction=direction,
+                              window_ms=window_ms)
+    if records_sink is not None:
+        records_sink.extend(records)
     per_cell: dict[str, int] = defaultdict(int)
     for w in windows:
         per_cell[w.scenario_id] += 1
     criteria = acceptance_criteria(entry, h, boot)
     return {"holdout_report": h, "bootstrap": boot, "criteria": criteria,
             "passed": criteria["A"]["passed"] and criteria["B"]["passed"] and criteria["D"]["passed"],
+            "windowing": win,
+            "ranking_disclosure": ranking.ranking_disclosure(records, n_resamples=n_resamples, seed=seed),
             "M": {"windows": h["windows"], "cells": h["cells"], "violating": h["violating"],
                   "violating_fraction": (h["violating"] / h["windows"]) if h["windows"] else None,
                   "cell_windows": dict(sorted(per_cell.items()))}}
@@ -1949,13 +2060,16 @@ def _accept_result(freeze_file: Path, inp: Mapping[str, Any], work: Path, *, n_r
                  "windows_csv_sha256": sha256_file(s.windows),
                  "covered_by_m_sha256sums": str(s.windows) in sums_cover}
                 for s in inp["sources"]]
+    from tre_calibration import ranking
+
     models: dict[str, Any] = {}
+    records: list = []
     for model in sorted(doc["models"]):
         entry, man = doc["models"][model], inp["manifests"][model]
         mpath = inp["manifest_paths"][model]
         csv_path = work / f"{model}_validation.csv"
         _write_validation_csv(csv_path, m["header"][model], m["rows"][model])
-        ev = evaluate_model(entry, csv_path, n_resamples=n_resamples, seed=seed)
+        ev = evaluate_model(entry, csv_path, n_resamples=n_resamples, seed=seed, records_sink=records)
         cells = []
         for c in man["cells"]:
             placed = m["placed"][(model, str(c["cell_id"]), _attempt(c["attempt"]))]
@@ -1989,10 +2103,18 @@ def _accept_result(freeze_file: Path, inp: Mapping[str, Any], work: Path, *, n_r
                 if not crit["evaluable"]:
                     why.insert(0, "not evaluable on this M")
             failed.append(f"{model}: {g} failed - " + "; ".join(why))
+    wins = {model: windowing_of(e) for model, e in doc["models"].items()}
+    dwells = {model: w["dwell_windows"] for model, w in wins.items()}
+    steps = {w["step_ms"] for w in wins.values()}
+    step_bin = steps.pop() if len(steps) == 1 else STEP_MS
+    pooled = ranking.ranking_disclosure(records, n_resamples=n_resamples, seed=seed,
+                                        cross_model_bins=(None, step_bin))
+    pooled["note"] = ("pooled over the models' M windows (cells stratified by model); the cross-model "
+                      "tau_b is disclosed exact and with window ends rounded to the re-window step")
     return {
         "what": ("plan §6.9f acceptance A-D on M, evaluated once on the frozen parameters "
                  "(A, B, D gate; C and the all-violating recall are disclosed)"),
-        "format_revision": 1,
+        "format_revision": ACCEPT_FORMAT_REVISION,
         "evaluated_at_utc": _utc_now(),
         "command": list(command),
         "code": code_state(),
@@ -2005,14 +2127,48 @@ def _accept_result(freeze_file: Path, inp: Mapping[str, Any], work: Path, *, n_r
                              "false_alarm_ci_high_max": B_FALSE_ALARM_CI_HIGH_MAX,
                              "all_violating_recall_target": ALL_VIOLATING_RECALL_TARGET},
                        "C": {"windows_per_independent": WINDOWS_PER_INDEPENDENT},
-                       "dwell_windows": ACCEPT_DWELL_WINDOWS},
+                       "dwell_windows": (next(iter(set(dwells.values()))) if len(set(dwells.values())) == 1
+                                         else dict(sorted(dwells.items())))},
         "bootstrap": {"n_resamples": n_resamples, "seed": seed},
         "datasets": datasets,
         "work_dir": str(work),
         "models": models,
+        "ranking_disclosure": pooled,
         "passed": not failed,
         "failed": failed,
     }
+
+
+def as_revision(result: Mapping[str, Any], revision: Any) -> dict:
+    """``result`` without the keys revisions after ``revision`` added
+    (:data:`ACCEPT_REVISION_KEYS`) and with its ``format_revision``: what a result of that
+    older revision holds, so a ``--recheck`` of it compares everything it has."""
+    out = json.loads(json.dumps(result))
+    for rev, keys in sorted(ACCEPT_REVISION_KEYS.items()):
+        if not isinstance(revision, int) or revision >= rev:
+            continue
+        for k in keys["top"]:
+            out.pop(k, None)
+        for r in (out.get("models") or {}).values():
+            for k in keys["model"]:
+                r.pop(k, None)
+    out["format_revision"] = revision
+    return out
+
+
+def print_ranking_table(result: Mapping[str, Any]) -> None:
+    """The ranking disclosure of an accept result as a small table (not gating)."""
+    from tre_calibration import ranking
+
+    blocks = {m: r["ranking_disclosure"] for m, r in (result.get("models") or {}).items()
+              if r.get("ranking_disclosure")}
+    if result.get("ranking_disclosure"):
+        blocks["pooled"] = result["ranking_disclosure"]
+    if not blocks:
+        return
+    print("ranking disclosure (pressure = -Z; not gating):")
+    for row in ranking.disclosure_table(blocks):
+        print(f"  {row}")
 
 
 def result_differences(stored: Any, recomputed: Any, *, ignore: frozenset = ACCEPT_VOLATILE_KEYS,
@@ -2077,6 +2233,13 @@ def stage_accept(freeze_file: Path, datasets: Sequence[str], m_manifests: Sequen
         with tempfile.TemporaryDirectory(prefix="dline_accept_recheck_") as tmp:
             new = _accept_result(freeze_file, inp, Path(tmp), n_resamples=n_resamples, seed=seed, command=command)
         new = json.loads(_json_bytes(new).decode("utf-8"))
+        print_ranking_table(new)
+        stored_rev = stored.get("format_revision")
+        if stored_rev != new.get("format_revision"):
+            print(f"note: the stored result is format revision {stored_rev}; keys added since "
+                  f"({sorted({k for r, ks in ACCEPT_REVISION_KEYS.items() if not isinstance(stored_rev, int) or r > stored_rev for k in ks['top'] + ks['model']})}) "
+                  "are not compared")
+            new = as_revision(new, stored_rev)
         diffs = result_differences(stored, new)
         try:
             marker = json.loads(fp["marker"].read_text(encoding="utf-8"))
@@ -2112,6 +2275,7 @@ def stage_accept(freeze_file: Path, datasets: Sequence[str], m_manifests: Sequen
               + " ".join(f"{g}={'pass' if c[g]['passed'] else 'FAIL'}" for g in ("A", "B", "D"))
               + f" (C, disclosed: TTFT-only recall {c['C']['critical_recall_ttft_only']} "
                 f"on {c['C']['windows']} windows)")
+    print_ranking_table(result)
     print(f"wrote {fp['result']} and {fp['marker']}")
     if not result["passed"]:
         print("acceptance FAILED:")
@@ -2187,7 +2351,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     help="accept: recompute in a temp dir and compare with the stored result; writes nothing")
     ap.add_argument("--accept-resamples", type=int, default=ACCEPT_RESAMPLES,
                     help="accept: cell-bootstrap resamples of the A-C intervals")
+    win_group = ap.add_argument_group(
+        "windowing (alpha / wp / final; recorded in the stage outputs and the freeze, which accept reads)")
+    win_group.add_argument("--window-ms", type=float, default=WINDOW_MS,
+                           help=f"window length of the fit CSVs (default {WINDOW_MS:g})")
+    win_group.add_argument("--step-ms", type=float, default=STEP_MS,
+                           help=f"re-window step (default {STEP_MS:g})")
+    win_group.add_argument("--dt-ref-s", type=float, default=DT_REF_S,
+                           help=f"EMA reference period: alpha = 1 - exp(-dt_ref / tau) (default {DT_REF_S:g})")
+    win_group.add_argument("--horizon-ms", type=int, default=HORIZON_MS,
+                           help=f"refit0922 label horizon / detection look-back (default {HORIZON_MS})")
+    win_group.add_argument("--dwell-windows", type=int, default=DWELL_WINDOWS,
+                           help=f"CRITICAL dwell in new windows (default {DWELL_WINDOWS})")
     args = ap.parse_args(argv)
+    try:
+        win = windowing(window_ms=args.window_ms, step_ms=args.step_ms, dt_ref_s=args.dt_ref_s,
+                        horizon_ms=args.horizon_ms, dwell_windows=args.dwell_windows)
+    except ValueError as exc:
+        ap.error(str(exc))
     command = ["python", "-m", "scripts.dline_refit", *(sys.argv[1:] if argv is None else argv)]
     global D13_MAX_CI_FRACTION
     D13_MAX_CI_FRACTION = args.max_ci_half_width_fraction
@@ -2285,11 +2466,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if w_p is None:
             ap.error(f"no alpha-stage w_p for {model}: pass --alpha-w-p")
         if args.alpha_rule == "refit0922":
-            doc = stage_alpha_refit0922(model, label, p, w_p=w_p)
+            doc = stage_alpha_refit0922(model, label, p, w_p=w_p, win=win)
         else:
             doc = stage_alpha_d4prime(model, label, p, w_p=w_p, ledgers=lp,
-                                      bootstrap=args.alpha_bootstrap, registry=args.registry)
-        doc = publish_alpha(doc, args.publish_tau_s)
+                                      bootstrap=args.alpha_bootstrap, registry=args.registry, win=win)
+        doc = publish_alpha(doc, args.publish_tau_s, dt_ref_s=win["dt_ref_s"])
     elif args.stage == "wp" and args.lambda_method == "v1":
         from scripts import v1_lambda_fit
 
@@ -2303,11 +2484,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     elif args.stage == "wp":
         doc = stage_wp(model, label, p, _read_json(out / "alpha.json"))
     else:
-        doc = stage_final(model, label, p, _read_json(out / "wp.json"), out, holdout=not args.no_holdout)
+        doc = stage_final(model, label, p, _read_json(out / "wp.json"), out, holdout=not args.no_holdout, win=win)
     inputs = {k: str(v) for k, v in p.items() if k != "families"}
     if args.stage == "final" and args.no_holdout:
         inputs["validation"] = HOLDOUT_SKIPPED
     doc.update({"model": model, "arm": args.arm, "label_def": label.as_dict(), "training_set": training,
+                "windowing": win,
                 "inputs": inputs | {f"family_{k}": str(v) for k, v in p["families"].items()}})
     (out / f"{args.stage}.json").write_text(json.dumps(doc, indent=1, default=str))
     print(f"wrote {out / (args.stage + '.json')}")

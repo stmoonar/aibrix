@@ -3,7 +3,8 @@
 each signal's early-warning discriminability via AUROC (Mann-Whitney U).
 
 Reads only the canonical rerun evidence (read-only) and writes aligned per-run
-CSVs plus a summary (JSON + CSV) to ``--out``. Standard library only.
+CSVs plus a summary (JSON + CSV) to ``--out``. Standard library plus the tre tree's
+``tre_calibration.ranking`` (found next to this script when run as a plain script).
 """
 from __future__ import annotations
 
@@ -11,9 +12,17 @@ import argparse
 import csv
 import json
 import math
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Optional
+
+try:
+    from tre_calibration.ranking import auroc as _shared_auroc
+except ImportError:  # run as a plain script from the tre tree: calibration/ and common/ are siblings
+    _TRE_ROOT = Path(__file__).resolve().parents[3]
+    sys.path[:0] = [str(_TRE_ROOT / "calibration"), str(_TRE_ROOT / "common")]
+    from tre_calibration.ranking import auroc as _shared_auroc
 
 # Scoring window span (ms) used by the replayer when emitting violation windows.
 WINDOW_SPAN_MS = 5000
@@ -141,35 +150,10 @@ def auroc(scores_labels: list) -> Optional[float]:
 
     ``scores_labels`` is a list of ``(score, label_bool)``. Convention: a higher
     score means more likely positive (violated). Returns ``None`` if either class
-    is empty.
+    is empty. Delegates to :func:`tre_calibration.ranking.auroc` (the shared
+    implementation).
     """
-    pos = [s for s, label in scores_labels if label]
-    neg = [s for s, label in scores_labels if not label]
-    if not pos or not neg:
-        return None
-    ordered = sorted(scores_labels, key=lambda sl: sl[0])
-    ranks = _average_ranks([s for s, _ in ordered])
-    rank_sum_pos = sum(rank for rank, (_, label) in zip(ranks, ordered) if label)
-    n_pos = len(pos)
-    n_neg = len(neg)
-    u_pos = rank_sum_pos - n_pos * (n_pos + 1) / 2.0
-    return u_pos / (n_pos * n_neg)
-
-
-def _average_ranks(sorted_scores: list) -> list:
-    """Fractional (average) ranks, 1-based, for an already-sorted score list."""
-    ranks = [0.0] * len(sorted_scores)
-    i = 0
-    n = len(sorted_scores)
-    while i < n:
-        j = i
-        while j + 1 < n and sorted_scores[j + 1] == sorted_scores[i]:
-            j += 1
-        average = (i + 1 + j + 1) / 2.0  # mean of 1-based ranks in [i, j]
-        for k in range(i, j + 1):
-            ranks[k] = average
-        i = j + 1
-    return ranks
+    return _shared_auroc([s for s, _ in scores_labels], [bool(label) for _, label in scores_labels])
 
 
 def signal_score(fieldname: str, value: float) -> float:

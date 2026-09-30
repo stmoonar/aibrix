@@ -53,8 +53,11 @@ DT_REF_S = 10.0
 FA_MAX = 0.05
 DEFAULT_DWELL_WINDOWS = 2
 #: +- margin (ms) within which a violating window makes a CRITICAL episode non-spurious;
-#: also how early before a violation episode a confirmation counts as detecting it.
+#: also how early before a violation episode a confirmation counts as detecting it (one
+#: window length by default; ``--episode-margin-ms``).
 EPISODE_MARGIN_MS = 30_000
+#: Window length (ms): the dwell counter dates a window's end by start + window
+#: (``--window-ms``); and the re-window step (``--step-ms``, hours per window).
 DEFAULT_WINDOW_MS = 30_000.0
 DEFAULT_STEP_MS = 10_000.0
 DEFAULT_BOOTSTRAP = 1000
@@ -337,7 +340,7 @@ CritFn = Callable[[Sequence[Any], float, float], list[bool]]
 def loso_stats(
     windows: Sequence[Any], fit: FitFn, crit_fn: CritFn, *,
     shape_fn: Callable[[str], str], step_ms: float = DEFAULT_STEP_MS,
-    steady_fn: Callable[[str], bool] = is_steady_cell,
+    steady_fn: Callable[[str], bool] = is_steady_cell, margin_ms: float = EPISODE_MARGIN_MS,
 ) -> tuple[dict[str, CellStats], dict[str, Any]]:
     """Per-cell stats of the LOSO classifier under one alpha, and the per-fold fits."""
     shapes = sorted({shape_fn(w.scenario_id) for w in windows})
@@ -360,7 +363,8 @@ def loso_stats(
             idx.sort(key=lambda i: test[i].window_start_ms or 0.0)
             out[cell] = cell_stats(
                 cell, [float(test[i].window_start_ms or 0.0) for i in idx], [crit[i] for i in idx],
-                [not test[i].slo_met for i in idx], step_ms=step_ms, steady=steady_fn(cell),
+                [not test[i].slo_met for i in idx], step_ms=step_ms, margin_ms=margin_ms,
+                steady=steady_fn(cell),
             )
     return out, folds
 
@@ -388,6 +392,7 @@ def alpha_rule(
     bootstrap_refit: bool = False,
     steady_fn: Callable[[str], bool] = is_steady_cell,
     log: Callable[[str], None] = lambda _m: None,
+    margin_ms: float = EPISODE_MARGIN_MS,
 ) -> dict[str, Any]:
     """Apply the D4' rule. ``load(tau_s)`` returns the fitting windows with the tau-EMA
     applied; ``fit`` / ``crit_fn`` are the theta/delta fit and the deployed classifier;
@@ -404,7 +409,7 @@ def alpha_rule(
         if bootstrap_refit:
             loaded[tau] = windows
         stats, folds = loso_stats(windows, fit, crit_fn, shape_fn=shape_fn, step_ms=step_ms,
-                                  steady_fn=steady_fn)
+                                  steady_fn=steady_fn, margin_ms=margin_ms)
         per_alpha[tau] = stats
         agg = aggregate(list(stats.values()))
         se = ba_se(stats, n=se_resamples, seed=seed)
@@ -452,7 +457,7 @@ def alpha_rule(
                 ws = [replace(w, scenario_id=f"{c}{COPY_SEP}{k}")
                       for k, c in enumerate(smp) for w in by_cell[tau].get(c, ())]
                 st, _ = loso_stats(ws, fit, crit_fn, shape_fn=shape_fn, step_ms=step_ms,
-                                   steady_fn=steady_fn)
+                                   steady_fn=steady_fn, margin_ms=margin_ms)
                 agg = aggregate(list(st.values()))
             else:
                 st = per_alpha[tau]
@@ -473,7 +478,7 @@ def alpha_rule(
         "rule": "D4-prime: FA<=%.2f feasibility; same-window LOSO BA; within 1 SE -> fewest spurious "
                 "CRITICAL episodes/h on steady healthy cells -> larger alpha" % fa_max,
         "dt_ref_s": dt_ref_s, "dwell_windows": dwell_windows, "fa_max": fa_max,
-        "episode_margin_ms": EPISODE_MARGIN_MS, "tau_grid_s": list(tau_grid_s),
+        "episode_margin_ms": margin_ms, "step_ms": step_ms, "tau_grid_s": list(tau_grid_s),
         "label_horizon": "same window",
         "selection": sel,
         "bootstrap": {"resamples": bootstrap, "used": used, "seed": seed + 1,
@@ -538,9 +543,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         r = fit_full(windows)
         return None if r is None else (r["theta"], r["tau_crit"])
 
+    window_ms = float(getattr(args, "window_ms", None) or DEFAULT_WINDOW_MS)
+    margin_ms = getattr(args, "episode_margin_ms", None)
+    margin_ms = EPISODE_MARGIN_MS if margin_ms is None else margin_ms
+
     def crit(test, theta, tau_crit):
         return tv.critical_dwell_flags(test, theta=theta, tau_crit=tau_crit, direction=cur["spec"].direction,
-                                       dwell_windows=args.dwell_windows)
+                                       dwell_windows=args.dwell_windows, window_ms=window_ms)
 
     grid = tuple(float(x) for x in args.tau_grid_s) if args.tau_grid_s else TAU_GRID_S
     rep = alpha_rule(
@@ -548,7 +557,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         fa_max=args.fa_max, step_ms=args.step_ms, se_resamples=args.se_resamples,
         bootstrap=args.bootstrap, seed=args.seed, full_fit=fit_full, bootstrap_refit=args.bootstrap_refit,
         steady_fn=lambda sid: is_steady_cell(sid, ledger),
-        log=lambda m: print(f"[{args.model}] {m}", flush=True),
+        log=lambda m: print(f"[{args.model}] {m}", flush=True), margin_ms=margin_ms,
     )
     chosen = rep.get("chosen")
     if chosen is not None:
@@ -561,6 +570,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "label_def": label.as_dict(),
         "signal": {"signal": "tss", "w_p": args.w_p, "lambda_wait": args.lambda_wait, "qmin": args.qmin},
         "trim_ramp_windows": args.trim_ramp_windows,
+        "window_ms": window_ms,
         "steady_cells_from": ("ledger: " + ", ".join(map(str, args.ledger))) if ledger is not None
         else "cell-id load code (first-round ids only)",
         **rep,
@@ -584,6 +594,10 @@ def _parse(argv: Optional[Sequence[str]]) -> argparse.Namespace:
     p.add_argument("--fa-max", type=float, default=FA_MAX)
     p.add_argument("--step-ms", type=float, default=DEFAULT_STEP_MS,
                    help="re-window step (hours per window for the spurious rate)")
+    p.add_argument("--window-ms", type=float, default=DEFAULT_WINDOW_MS,
+                   help="window length: the dwell counter dates a window's end by start + this")
+    p.add_argument("--episode-margin-ms", type=float, default=EPISODE_MARGIN_MS,
+                   help="+- margin of a non-spurious CRITICAL episode / early detection (default one window)")
     p.add_argument("--se-resamples", type=int, default=DEFAULT_SE_RESAMPLES)
     p.add_argument("--bootstrap", type=int, default=DEFAULT_BOOTSTRAP)
     p.add_argument("--bootstrap-refit", action="store_true",

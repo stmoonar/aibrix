@@ -487,8 +487,10 @@ def cmd_verdict(args: argparse.Namespace) -> dict[str, Any]:
 
 def holdout_report(
     verdict: Mapping[str, Any], validation_csv: str | Path, *,
-    dwell_windows: int = DEFAULT_HOLDOUT_DWELL_WINDOWS,
+    dwell_windows: int = DEFAULT_HOLDOUT_DWELL_WINDOWS, window_ms: float = 30_000.0,
 ) -> dict[str, Any]:
+    """The hold-out report of ``verdict`` on ``validation_csv``; ``window_ms`` is the window
+    length the dwell counter dates a window's end by (window start + ``window_ms``)."""
     label = LabelDefinition.from_dict(verdict["label_def"])
     if "signal_spec" in verdict:
         spec = SignalSpec.from_dict(verdict["signal_spec"])
@@ -533,6 +535,7 @@ def holdout_report(
         ),
         "with_dwell": dwell_acceptance(
             windows, theta=theta, tau_crit=tau_crit, direction=direction, dwell_windows=dwell_windows,
+            window_ms=window_ms,
         ),
         "note": (
             "windows carry the fit's EMA (TSS recompute / signal_ema); the top-level CRITICAL "
