@@ -70,12 +70,23 @@
    09-30 smoke 里客户端看到的是 `{"error": {"message": "<sidecar 的整段 JSON>", "type": "api_error"}}`，`layer` 只以文本出现在 message 里，
    `Retry-After` 很可能被丢掉（待下次 smoke 经 31094 确认）。E1 分类按 message 中的子串 `sidecar_upstream` 判断。
 
-后续（不在本次修复内）：
-- Envoy → sidecar 这一跳有同类竞态：sidecar 服务端（aiohttp `web.run_app`）默认 75 s 关闭空闲连接，Envoy 上游 HTTP/1 连接空闲超时默认 1 h，
-  overlays 里没有 idle timeout / retryOn。概率低（Envoy 通常能及时发现对端关闭），表现是 Envoy 自己回 503（`UC`/`UF` 标志）。
-  修法：BackendTrafficPolicy 配小于 75 s 的连接空闲超时，或把 sidecar 服务端 keep-alive 调到比 Envoy 的长；可加 `reset-before-request` 重试。
-- `upstream_keepalive_s` / `local_reconnect_attempts` 没写进仓库 registry（旧 SM 拒绝未知 reissue 键）。SM 全部升级后写回 registry.yaml，
-  并考虑把 `parse_reissue_config` 对未知键改成告警而不是拒绝。
+Envoy → sidecar 这一跳（2026-09-30 补修）：同类竞态，方向相反（sidecar 是服务端）。sidecar 服务端（aiohttp `web.run_app`）默认 75 s 关闭空闲连接，
+Envoy 上游连接空闲超时默认 1 h，表现是 Envoy 自己回 503（`UC`/`UF` 标志）。原则同上：**连接由发请求的一方先关**，客户端空闲超时必须小于服务端。
+- 推理 POST 走 ext_proc 选 pod，上游是 `EnvoyPatchPolicy` 手写的 ORIGINAL_DST 集群（`overlays/tre-v2/gateway-extproc.yaml`，Envoy 1.33.2 / EG 1.2.8）。
+  BackendTrafficPolicy 只作用于 EG 自己从 HTTPRoute 生成的集群，**够不到**这些集群；所以在集群定义里直接设
+  `typed_extension_protocol_options.HttpProtocolOptions.common_http_protocol_options.idle_timeout: 60s`（仍是 HTTP/1.1）。
+  BackendTrafficPolicy `timeout.http.connectionIdleTimeout: 60s` 同时加在 `gateway-hardening/backendtrafficpolicy-tre-v2.yaml`，覆盖非推理请求走的 Service 路径集群。
+  另外 ORIGINAL_DST 集群的主机在 `cleanup_interval`（5 s）内没被用到就会被摘除，连接池随之排空，所以实际暴露面本来就小；显式 idle timeout 是纵深防御。
+- sidecar 服务端 keep-alive 可配：registry `reissue.server_keepalive_s`（默认 75，= aiohttp 默认），传给 `web.run_app(keepalive_timeout=...)`。
+  registry 校验 `reissue.server_keepalive_s >= gateway.upstream_idle_timeout_s + 1`（默认 75 vs 60）；sidecar 关闭时改校验每个模型的 `VLLM_HTTP_TIMEOUT_KEEP_ALIVE`。
+  单一来源是 registry `gateway.upstream_idle_timeout_s`（默认 60），守卫测试要求两份手写 YAML 与它相等。sidecar 启动时也做同样的检查（不满足只打 WARNING）。
+- 路由上没有 retry_policy（没有 retry_on），本次**不加**：对 POST 生成请求，Envoy 的 `reset` / `connect-failure` 重试无法区分“请求没被执行”和“执行了一半”，
+  `reset-before-request` 需要更新的 Envoy 才有，且窗口很窄。要不要加留给用户决定。
+- 重发窗口（P2-1）：`local_reconnect_window_s`（默认 1 s）：拿到复用连接后超过这个时间才失败的请求（例如 vLLM 在长生成中途崩溃）不再重发，避免重复执行。
+- `upstream_keepalive_s` / `local_reconnect_attempts` / `local_reconnect_window_s` / `server_keepalive_s` 现在都写在仓库 registry.yaml 里；
+  **旧 SM 拒绝未知 reissue 键，须先升级 SM 再写入 live registry**。
+- 指标 `tre_reissue_gap_seconds` 拆出 label `mode`：`stream` = abort 到首个续发 token，`nonstream` = abort 到完整续发响应（含续发生成时间），两者不可比。
+- aiohttp 对幂等方法（GET/HEAD/OPTIONS/TRACE/PUT/DELETE）在持久连接失败时已内置重试一次；POST 没有，所以生成请求的重发只靠本层。
 
 验证：`tre/reissue/tests/test_local_keepalive.py` 用真 uvicorn（keep-alive 1 s）+ sidecar 造“空闲略超 keep-alive 后复用”的时序：
 main 上 3000 个请求 14 个 502（测试失败）；修复后 0 失败、重发 > 0；只开第 1 层（池 0.5 s、不重发）0 失败；旧配置对照组的失败全为 503。
@@ -141,7 +152,7 @@ tools/functions（除非 `tool_choice: none`）、结构化输出 / guided decod
 |---|---|
 | `tre_reissue_total{model,kind,reason}` | kind = `retry` / `continue` / `failed` / `passthrough_abort`；reason 细分（`engine_sleeping`、`local_sleeping`、`local_refused`、`local_unavailable_sleeping`、`upstream_unavailable`、`abort_before_output`、`abort_sleep`、`budget_spent`、`depth_limit`、`retry_exhausted`、`continuation_unavailable`、`continuation_aborted`、`continuation_broken`、`no_token_ids`、`not_sleeping`、`client_gone`、`non_continuable_*`、`abort_non_continuable_*`） |
 | `tre_reissue_proxy_added_seconds` | sidecar 自身给一个本地应答请求增加的时间（直方图）：forward（读完客户端请求 → 交给上游 HTTP 客户端）+ relay（每个上游响应头 / 数据块从收到到写给客户端，按请求累加）；不含等待上游的时间（响应头，即非流式请求的整个生成过程、块间间隔、经网关的续写请求）；块写入在发送缓冲超过高水位时会包含客户端背压；被转发重试的请求不计入。两部分另见 `tre_reissue_proxy_forward_seconds` / `tre_reissue_proxy_relay_seconds` |
-| `tre_reissue_gap_seconds` | abort 到续发首 token（直方图） |
+| `tre_reissue_gap_seconds{mode}` | abort 到续发（直方图）：`mode="stream"` = 到首个续发 token，`mode="nonstream"` = 到完整续发响应（含续发生成时间），两者不可比 |
 | `tre_reissue_events_total{event}` | sleep 拒绝 / 失败、状态纠偏、`stop_at_seam` 等 |
 | `tre_reissue_sleeping` | 本地 sleeping 标记 |
 | `tre_reissue_local_reconnect_total{model,result}` | 首字节前连接级失败后的新连接重发次数，`result=ok/fail`（§3a） |
@@ -164,7 +175,7 @@ sidecar 每个 `Config` 字段 `foo` 都可由环境变量 `TRE_REISSUE_FOO` 覆
 路径（`completions_path`、`chat_path`、`sleep_paths`、`wake_paths`、`is_sleeping_path`、`models_path`、自身指标路径）、头名（`hidden_header`、`exclude_header`、
 `continued_header`、`retried_header`、`depth_header`）、JSON 字段名（`generated_ids_field`、`prompt_ids_field`、`token_ids_field`、`continued_field`、`sleeping_error_type`）、
 重试次数与退避、深度上限、超时、回环 keep-alive（`upstream_keepalive_s` 默认 2、`upstream_server_keepalive_s` 默认 5 仅用于启动检查、
-`local_reconnect_attempts` 默认 1、`warn_interval_s` 默认 10）。默认值即 fork 与网关插件当前使用的名字。
+`local_reconnect_attempts` 默认 1、`local_reconnect_window_s` 默认 1、`server_keepalive_s` 默认 75、`gateway_upstream_idle_s` 仅用于启动检查、`warn_interval_s` 默认 10）。默认值即 fork 与网关插件当前使用的名字。
 
 registry（`deploy/registry.yaml` 与 `overlays/tre-v2/params.yaml` 中的 `tre-v2-registry` 副本保持一致，SM 运行时创建 Deployment 也读它）：
 
@@ -183,9 +194,13 @@ reissue:
   memory_request: 64Mi
   memory_limit: 256Mi
   extra_env: {}            # 额外 TRE_* 环境变量（字段名 / 头名覆盖）
-  # 可选（2026-09-30），仓库 registry 不写出，旧 SM 会拒绝未知 reissue 键：
-  # upstream_keepalive_s: 2       # 须小于每个模型的 VLLM_HTTP_TIMEOUT_KEEP_ALIVE（registry 校验）
-  # local_reconnect_attempts: 1
+  # 2026-09-30（旧 SM 会拒绝这些键，须先升级 SM）：
+  upstream_keepalive_s: 2       # 须小于每个模型的 VLLM_HTTP_TIMEOUT_KEEP_ALIVE（registry 校验）
+  local_reconnect_attempts: 1
+  local_reconnect_window_s: 1   # 拿到复用连接后超过此时间才失败的不重发
+  server_keepalive_s: 75        # sidecar 自己的 HTTP 服务端 keep-alive；须比 gateway.upstream_idle_timeout_s 至少大 1 s
+gateway:
+  upstream_idle_timeout_s: 60   # Envoy 上游空闲连接超时；手写 YAML 里的值须相等（守卫测试）
 vllm:
   env:
     VLLM_HTTP_TIMEOUT_KEEP_ALIVE: '75'   # vLLM 的 uvicorn keep-alive；改它会改模型 Deployment，须重建 pod

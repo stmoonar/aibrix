@@ -142,6 +142,12 @@ spec:
           value: '75'
         - name: TRE_REISSUE_LOCAL_RECONNECT_ATTEMPTS
           value: '1'
+        - name: TRE_REISSUE_LOCAL_RECONNECT_WINDOW_S
+          value: '1'
+        - name: TRE_REISSUE_SERVER_KEEPALIVE_S
+          value: '75'
+        - name: TRE_REISSUE_GATEWAY_UPSTREAM_IDLE_S
+          value: '60'
         - name: TRE_REISSUE_REQUIRE_HIDDEN_HEADER
           value: 'true'
         - name: POD_NAME

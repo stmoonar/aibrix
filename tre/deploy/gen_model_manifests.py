@@ -11,6 +11,7 @@ import yaml
 
 from tre_common.bindings import MAX_BOUND_PER_GPU, feasible_slots, render_binding_set  # noqa: F401 (re-exported)
 from tre_common.registry import (
+    DEFAULT_GATEWAY_UPSTREAM_IDLE_S,
     DEFAULT_ROUTE_TIMEOUT_S,
     DEFAULT_VLLM_ENV,
     POD_SERVING_PORT,
@@ -75,6 +76,7 @@ def build_deployments(registry: Registry) -> list[dict]:
             spec.gpu_ids,
             reissue=reissue,
             vllm_env=registry.vllm_env_for(registry.model(spec.model)),
+            gateway_idle_s=registry.gateway().upstream_idle_timeout_s,
         )
         for spec in render_binding_set(registry)
     ]
@@ -114,7 +116,8 @@ def build_model_deployment(registry: Registry, model_name: str, node_name: str, 
     nodes = {node.name: node for node in registry.topology().nodes}
     model = registry.model(model_name)
     return _deployment(
-        model, nodes[node_name], gpu_ids, reissue=reissue_spec(registry), vllm_env=registry.vllm_env_for(model)
+        model, nodes[node_name], gpu_ids, reissue=reissue_spec(registry), vllm_env=registry.vllm_env_for(model),
+        gateway_idle_s=registry.gateway().upstream_idle_timeout_s,
     )
 
 
@@ -293,9 +296,12 @@ def _deployment(
     *,
     reissue: ReissueConfig | None = None,
     vllm_env: dict[str, str] | None = None,
+    gateway_idle_s: float = DEFAULT_GATEWAY_UPSTREAM_IDLE_S,
 ) -> dict:
     """``vllm_env``: the vLLM container environment besides the per-binding GPU variables
-    (``Registry.vllm_env_for``); None = ``DEFAULT_VLLM_ENV``."""
+    (``Registry.vllm_env_for``); None = ``DEFAULT_VLLM_ENV``. ``gateway_idle_s``: Envoy's
+    upstream idle timeout (registry ``gateway.upstream_idle_timeout_s``), handed to the
+    sidecar for its startup check."""
     gpu_value = ",".join(str(gpu) for gpu in gpu_ids)
     gpu_label_value = "-".join(str(gpu) for gpu in gpu_ids)
     cuda_value = ",".join(str(index) for index in range(model.tp_size))
@@ -409,11 +415,13 @@ def _deployment(
         },
     }
     if reissue is not None:
-        _add_reissue_sidecar(deployment, model, reissue)
+        _add_reissue_sidecar(deployment, model, reissue, gateway_idle_s)
     return deployment
 
 
-def _add_reissue_sidecar(deployment: dict, model: ModelSpec, spec: ReissueConfig) -> None:
+def _add_reissue_sidecar(
+    deployment: dict, model: ModelSpec, spec: ReissueConfig, gateway_idle_s: float = DEFAULT_GATEWAY_UPSTREAM_IDLE_S
+) -> None:
     """vLLM -> 127.0.0.1:<vllm_port>; the sidecar takes the serving port and the
     readiness probe (its /health is vLLM's /health, proxied), so everything that talks to
     the pod - Service, gateway target-pod, service-manager, scrapers - is unchanged."""
@@ -439,6 +447,11 @@ def _add_reissue_sidecar(deployment: dict, model: ModelSpec, spec: ReissueConfig
         {"name": "TRE_REISSUE_UPSTREAM_KEEPALIVE_S", "value": _num(spec.upstream_keepalive_s)},
         {"name": "TRE_REISSUE_UPSTREAM_SERVER_KEEPALIVE_S", "value": _num(server_keep_alive)},
         {"name": "TRE_REISSUE_LOCAL_RECONNECT_ATTEMPTS", "value": str(spec.local_reconnect_attempts)},
+        {"name": "TRE_REISSUE_LOCAL_RECONNECT_WINDOW_S", "value": _num(spec.local_reconnect_window_s)},
+        # Envoy -> sidecar: the sidecar keeps an idle connection longer than Envoy does; the
+        # sidecar checks the pair at startup (the registry validates the same).
+        {"name": "TRE_REISSUE_SERVER_KEEPALIVE_S", "value": _num(spec.server_keepalive_s)},
+        {"name": "TRE_REISSUE_GATEWAY_UPSTREAM_IDLE_S", "value": _num(gateway_idle_s)},
         # Fail closed: /sleep without X-TRE-Hidden: 1 (the SM sends it after the hide) is 409.
         {"name": "TRE_REISSUE_REQUIRE_HIDDEN_HEADER", "value": "true"},
         {"name": "POD_NAME", "valueFrom": {"fieldRef": {"fieldPath": "metadata.name"}}},

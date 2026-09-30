@@ -300,9 +300,11 @@ async def test_continuation_log_line_reports_the_gap_in_milliseconds(stream, cap
     (cont,) = [r for r in records if r.get("event") == "tre_reissue" and r.get("kind") == "continue"]
     assert "gap_s" not in cont  # renamed 2026-09-30: the value always was milliseconds
     assert isinstance(cont["gap_ms"], float) and cont["gap_ms"] >= 0
-    assert h.sidecar_a.metrics.gap.count == 1
+    mode, other = ("stream", "nonstream") if stream else ("nonstream", "stream")
+    gap = h.sidecar_a.metrics.gap
+    assert gap[mode].count == 1 and gap[other].count == 0  # the two modes never mix
     # the histogram stays in seconds: the logged ms value / 1000 (rounding to 0.1 ms)
-    assert abs(h.sidecar_a.metrics.gap.sum * 1000.0 - cont["gap_ms"]) <= 0.06
+    assert abs(gap[mode].sum * 1000.0 - cont["gap_ms"]) <= 0.06
 
 
 @pytest.mark.asyncio
@@ -587,7 +589,8 @@ async def test_metrics_render_kinds_and_overhead_histogram():
             text = await resp.text()
         assert 'tre_reissue_total{model="m",kind="continue",reason="abort_sleep"} 1' in text
         assert "tre_reissue_proxy_added_seconds_count" in text
-        assert "tre_reissue_gap_seconds_count" in text
+        assert 'tre_reissue_gap_seconds_count{model="m",mode="stream"} 1' in text
+        assert 'tre_reissue_gap_seconds_count{model="m",mode="nonstream"} 0' in text
 
 
 # ------------------------------------------------------------------ pure helpers

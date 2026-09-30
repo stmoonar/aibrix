@@ -291,6 +291,14 @@ data:
       service_name: tre-gateway
       service_namespace: envoy-gateway-system
       service_port: 80
+      # Idle timeout of Envoy's upstream connections to the model pods (Envoy's own default
+      # is 1 h). Must be >= 1 s BELOW the keep-alive of the server on the pod's port 8000
+      # (reissue.server_keepalive_s with the sidecar, else vLLM's VLLM_HTTP_TIMEOUT_KEEP_ALIVE;
+      # the registry validates it): the sender closes idle connections first, else Envoy
+      # reuses a connection the pod is closing (503 UC). Keep the hand-written values equal
+      # (a guard test enforces it): the ORIGINAL_DST clusters in
+      # overlays/tre-v2/gateway-extproc.yaml and gateway-hardening/backendtrafficpolicy-tre-v2.yaml.
+      upstream_idle_timeout_s: 60
     # Retry / continuation sidecar in every model pod (plan 2026-09-27 D5/D6; design
     # tre/docs/design/20260927-reissue-sidecar-v2.md). Every key is optional; the values
     # below are the built-in defaults. The sidecar takes the serving port 8000 and vLLM
@@ -308,10 +316,20 @@ data:
       vllm_port: 8001
       max_depth: 3
       retry_attempts: 4
-      # Optional (defaults shown; not written out so an older service-manager, which
-      # rejects unknown reissue keys, can still read this registry):
-      #   upstream_keepalive_s: 2        # <= every model's VLLM_HTTP_TIMEOUT_KEEP_ALIVE - 1
-      #   local_reconnect_attempts: 1    # fresh-connection re-sends before the first byte
+      # Loopback hop sidecar -> vLLM (2026-09-30). NOTE: a service-manager older than this
+      # change rejects these keys (unknown reissue keys): deploy the new SM first.
+      # Idle keep-alive of the sidecar's pooled connections to vLLM: <= every model's
+      # VLLM_HTTP_TIMEOUT_KEEP_ALIVE - 1 (registry-validated).
+      upstream_keepalive_s: 2
+      # Fresh-connection re-sends after a pooled connection failed before the first byte
+      # (0 = off) ...
+      local_reconnect_attempts: 1
+      # ... but only when the failure came within this many seconds of the connection being
+      # handed to the request (the keep-alive race fails at once; a later one may have run).
+      local_reconnect_window_s: 1
+      # Hop Envoy -> sidecar: keep-alive of the sidecar's own HTTP server. Must be >= 1 s
+      # ABOVE gateway.upstream_idle_timeout_s (registry-validated; aiohttp default 75).
+      server_keepalive_s: 75
       # null = the model's vllm_image (python3 + aiohttp; the script comes from a ConfigMap).
       image: null
       cpu_request: 50m

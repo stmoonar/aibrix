@@ -6,6 +6,11 @@
 # the identical RLIMIT_NOFILE=1024 exposure, so it needs the same protection;
 # the fd raise (envoyproxy-nofile-patch.yaml) is class-level and covers both
 # envoys at once.
+#
+# connectionIdleTimeout (2026-09-30) applies to the clusters Envoy Gateway generates from
+# the HTTPRoutes (the Service path: non-inference requests). Inference POSTs go to the
+# ORIGINAL_DST clusters of overlays/tre-v2/gateway-extproc.yaml, which carry the same
+# idle timeout in their own definition (a BackendTrafficPolicy cannot reach them).
 apiVersion: gateway.envoyproxy.io/v1alpha1
 kind: BackendTrafficPolicy
 metadata:
@@ -24,6 +29,11 @@ spec:
     maxPendingRequests: 1024
     maxParallelRequests: 4096
     maxParallelRetries: 16
+  timeout:
+    http:
+      # = registry gateway.upstream_idle_timeout_s (guard test); below the reissue
+      # sidecar's server keep-alive so Envoy closes idle upstream connections first.
+      connectionIdleTimeout: 60s
 ---
 apiVersion: gateway.envoyproxy.io/v1alpha1
 kind: BackendTrafficPolicy
@@ -43,6 +53,11 @@ spec:
     maxPendingRequests: 1024
     maxParallelRequests: 4096
     maxParallelRetries: 16
+  timeout:
+    http:
+      # = registry gateway.upstream_idle_timeout_s (guard test); below the reissue
+      # sidecar's server keep-alive so Envoy closes idle upstream connections first.
+      connectionIdleTimeout: 60s
 ---
 apiVersion: gateway.envoyproxy.io/v1alpha1
 kind: BackendTrafficPolicy
@@ -62,3 +77,8 @@ spec:
     maxPendingRequests: 1024
     maxParallelRequests: 4096
     maxParallelRetries: 16
+  timeout:
+    http:
+      # = registry gateway.upstream_idle_timeout_s (guard test); below the reissue
+      # sidecar's server keep-alive so Envoy closes idle upstream connections first.
+      connectionIdleTimeout: 60s

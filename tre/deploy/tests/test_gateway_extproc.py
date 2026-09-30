@@ -182,7 +182,7 @@ def test_original_dst_clusters_are_v1_clusters_with_the_per_model_admission_limi
         assert cluster["circuit_breakers"]["thresholds"] == [expected], name
         assert set(cluster) == {
             "name", "type", "lb_policy", "connect_timeout", "dns_lookup_family",
-            "original_dst_lb_config", "circuit_breakers",
+            "original_dst_lb_config", "circuit_breakers", "typed_extension_protocol_options",
         }, name
 
 
@@ -363,3 +363,23 @@ def test_extproc_route_timeout_equals_the_registry_route_timeout() -> None:
     raise_ = _gateway_policy("tre-route-timeouts")
     values = {patch["operation"]["value"] for patch in raise_["spec"]["jsonPatches"]}
     assert values == {expected}
+
+
+def test_upstream_idle_timeout_equals_the_registry_value_on_every_upstream_cluster() -> None:
+    """Envoy -> model pod: the sender closes idle connections first. gateway.upstream_idle_timeout_s
+    is the single source of the ORIGINAL_DST clusters' idle_timeout (BackendTrafficPolicy
+    cannot reach patch-created clusters) and of the BackendTrafficPolicy connectionIdleTimeout
+    (Service-path clusters); the registry keeps it below the pod server's keep-alive."""
+    from gen_model_manifests import route_timeout_text
+
+    registry = load_registry(str(DEPLOY_ROOT / "registry.yaml"))
+    expected = route_timeout_text(registry.gateway().upstream_idle_timeout_s)
+    for name, cluster in _clusters().items():
+        options = cluster["typed_extension_protocol_options"]["envoy.extensions.upstreams.http.v3.HttpProtocolOptions"]
+        assert options["common_http_protocol_options"] == {"idle_timeout": expected}, name
+        assert options["explicit_http_config"] == {"http_protocol_options": {}}, name  # HTTP/1.1, as before
+    for doc in _docs(TRE_ARM_BTP):
+        assert doc["spec"]["timeout"] == {"http": {"connectionIdleTimeout": expected}}, doc["metadata"]["name"]
+    # the sidecar keeps idle connections >= 1 s longer than Envoy does
+    assert registry.validate() == []
+    assert registry.reissue().server_keepalive_s >= registry.gateway().upstream_idle_timeout_s + 1.0

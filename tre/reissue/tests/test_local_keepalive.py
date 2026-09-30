@@ -15,6 +15,7 @@ import asyncio
 import contextlib
 import errno
 import json
+import os
 import random
 import socket
 import struct
@@ -78,7 +79,8 @@ async def serve_sidecar(upstream_url: str, **overrides):
         return None
 
     sidecar._monitor = no_monitor
-    server = TestServer(sidecar.build_app())
+    # the same keep-alive main() passes to web.run_app (serve_kwargs)
+    server = TestServer(sidecar.build_app(), keepalive_timeout=sc.serve_kwargs(cfg)["keepalive_timeout"])
     await server.start_server()
     try:
         yield sidecar, str(server.make_url("")).rstrip("/")
@@ -172,7 +174,7 @@ async def test_pool_keepalive_below_the_server_keepalive_alone_avoids_the_race()
 class ScriptedUpstream:
     """Raw HTTP/1.1 upstream (keep-alive); request N follows ``script[N]`` (then ``"ok"``):
     ``close`` read the request, close the connection (Server disconnected); ``rst`` read
-    the request, reset (ECONNRESET); ``close_stop`` stop listening, then ``close``;
+    the request, reset (ECONNRESET); ``close_stop`` stop listening, then ``close``; ``slow_close`` wait 0.5 s, then ``close``;
     ``ok`` answer; ``partial`` stream headers + one SSE event, then reset."""
 
     EVENT = (b'data: {"id":"c","object":"text_completion","model":"m","choices":[{"index":0,"text":"hi",'
@@ -216,6 +218,9 @@ class ScriptedUpstream:
                 self.requests.append(lines[0])
                 if action == "close_stop":
                     self.server.close()  # later connects are refused
+                    action = "close"
+                if action == "slow_close":
+                    await asyncio.sleep(0.5)
                     action = "close"
                 if action == "close":
                     writer.close()
@@ -279,6 +284,34 @@ async def test_failure_on_a_reused_connection_is_resent_on_a_fresh_one(stream, f
         assert sidecar.local_reused == 1
         assert sidecar.metrics.reconnect == {"ok": 1, "fail": 0}
         assert sidecar.metrics.total("failed") == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("window, resent", [(2.0, True), (0.2, False)])
+async def test_reused_connection_failing_late_is_resent_only_within_the_window(window, resent):
+    """The keep-alive race fails at once. A reused connection that dies 0.5 s after the
+    request went out (engine crash mid-generation) may have run it: re-sent only if the
+    window is longer than that."""
+    async with ScriptedUpstream(["ok", "slow_close"]) as upstream, serve_sidecar(
+        upstream.url, local_reconnect_window_s=window
+    ) as (sidecar, url):
+        await _warm(url)
+        status, headers, _ = await _post(url, completion_body(4, stream=False))
+        assert sidecar.local_reused == 1
+        if resent:
+            assert status == 200 and len(upstream.requests) == 3
+            assert sidecar.metrics.reconnect == {"ok": 1, "fail": 0}
+        else:
+            assert status == 503 and headers["Retry-After"] == "1" and len(upstream.requests) == 2
+            assert sidecar.metrics.reconnect == {"ok": 0, "fail": 0}
+
+
+@pytest.mark.asyncio
+async def test_503_text_says_the_request_may_have_run():
+    async with ScriptedUpstream(["rst"]) as upstream, serve_sidecar(upstream.url) as (_, url):
+        _, _, raw = await _post(url, completion_body(4, stream=False))
+    message = json.loads(raw)["error"]["message"]
+    assert "may have been executed" in message and "safe" not in message
 
 
 @pytest.mark.asyncio
@@ -478,3 +511,134 @@ def test_keepalive_settings_from_env():
         Config.from_env({"TRE_REISSUE_UPSTREAM_KEEPALIVE_S": "0"})
     with pytest.raises(ValueError):
         Config.from_env({"TRE_REISSUE_LOCAL_RECONNECT_ATTEMPTS": "-1"})
+
+
+# ------------------------------------------- hop Envoy -> sidecar (the sidecar is the server)
+
+
+@contextlib.asynccontextmanager
+async def sidecar_process(upstream_url: str, **env: str):
+    """The sidecar as its own process (``python -m tre_reissue.sidecar``, i.e. ``main()`` and
+    ``serve_kwargs``): in the test's own event loop the client would notice the server's
+    close within the same loop iteration and the race could not happen."""
+    port = _free_port()
+    environ = {**os.environ, "PYTHONPATH": str(HERE.parent), "TRE_REISSUE_LISTEN_HOST": "127.0.0.1",
+               "TRE_REISSUE_LISTEN_PORT": str(port), "TRE_REISSUE_UPSTREAM_URL": upstream_url,
+               "TRE_GATEWAY_URL": "http://127.0.0.1:9", "TRE_REISSUE_MODEL": "m", "POD_NAME": "pod-a",
+               "TRE_REISSUE_PROBE_INTERVAL_S": "3600", **env}
+    proc = subprocess.Popen([sys.executable, "-m", "tre_reissue.sidecar"], env=environ,
+                            stdout=subprocess.DEVNULL)
+    try:
+        for _ in range(300):
+            try:
+                socket.create_connection(("127.0.0.1", port), 0.1).close()
+                break
+            except OSError:
+                if proc.poll() is not None:
+                    pytest.fail("the sidecar process exited")
+                await asyncio.sleep(0.05)
+        else:
+            pytest.fail("the sidecar process did not start")
+        yield f"http://127.0.0.1:{port}"
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+
+
+async def run_envoy_like_bursts(url: str, *, client_idle_s: float, min_bursts: int, max_bursts: int,
+                                until, gap: tuple[float, float] = (0.55, 1.0)) -> dict:
+    """An Envoy-shaped client: pooled connections, a client-side idle limit (Envoy's
+    upstream connection idle timeout) and no retry of POSTs. Bursts of 100 concurrent
+    requests; the sidecar's upstream answers after 0.05-0.5 s, so the sidecar's server
+    closes its idle connections (``server_keepalive_s`` = 1 s after each response) spread
+    over ~0.45 s, and the next burst starts 0.55-1.0 s after the last response, i.e. while
+    those closes happen. Returns the status counts, the failures (exceptions the client
+    saw: Server disconnected / reset) and how many connections it reused."""
+    statuses: dict[int, int] = {}
+    errors: list[str] = []
+    reused = [0]
+
+    async def on_reuse(*_args) -> None:
+        reused[0] += 1
+
+    trace = aiohttp.TraceConfig()
+    trace.on_connection_reuseconn.append(on_reuse)
+    connector = aiohttp.TCPConnector(limit=0, keepalive_timeout=client_idle_s)
+    async with aiohttp.ClientSession(connector=connector, trace_configs=[trace]) as http:
+        async def one(index: int) -> None:
+            body = {"model": "m", "prompt": "x", "max_tokens": 1, "stream": index % 2 == 0}
+            try:
+                async with http.post(url + "/v1/completions", json=body) as resp:
+                    await resp.read()
+                    statuses[resp.status] = statuses.get(resp.status, 0) + 1
+            except (aiohttp.ClientError, ConnectionError) as exc:
+                errors.append(type(exc).__name__)
+
+        for burst in range(max_bursts):
+            await asyncio.gather(*(one(i) for i in range(100)))
+            if burst + 1 >= min_bursts and until(statuses, errors):
+                break
+            await asyncio.sleep(random.uniform(*gap))
+    return {"statuses": statuses, "errors": errors, "reused": reused[0], "bursts": burst + 1}
+
+
+@pytest.mark.asyncio
+async def test_envoy_idle_longer_than_the_sidecar_keepalive_fails_requests():
+    """Control (the misordering this fix guards against): the client keeps idle connections
+    (15 s, like Envoy's 1 h default) for longer than the sidecar's server keep-alive (1 s
+    here), so it reuses connections the sidecar is closing: failed requests."""
+    async with uvicorn_upstream(keep_alive=30) as upstream, sidecar_process(
+        upstream, TRE_REISSUE_SERVER_KEEPALIVE_S="1"
+    ) as url:
+        out = await run_envoy_like_bursts(url, client_idle_s=15.0, min_bursts=1, max_bursts=40,
+                                          until=lambda statuses, errors: bool(errors))
+        print("envoy idle 15 s > sidecar 1 s:", out)
+        assert out["errors"], "the race never happened: harness too gentle"
+        assert set(out["statuses"]) <= {200}
+
+
+@pytest.mark.asyncio
+async def test_envoy_idle_below_the_sidecar_keepalive_never_fails():
+    """Fixed order: the client (Envoy) closes idle connections after 0.7 s, below the
+    sidecar's 1 s. Young connections are still reused (asserted, so the gaps start at 0.2 s), none is reused while the
+    sidecar closes it. The control above fails ~0.3-0.5 requests per burst, so 10 clean
+    bursts are a real test."""
+    async with uvicorn_upstream(keep_alive=30) as upstream, sidecar_process(
+        upstream, TRE_REISSUE_SERVER_KEEPALIVE_S="1"
+    ) as url:
+        out = await run_envoy_like_bursts(url, client_idle_s=0.7, min_bursts=10, max_bursts=10, gap=(0.2, 1.0),
+                                          until=lambda *_: True)
+        assert out["errors"] == [] and out["statuses"] == {200: 1000}, out
+        assert out["reused"] > 0, "no connection was reused across bursts: vacuous"
+
+
+def test_server_keepalive_reaches_the_http_server():
+    assert sc.serve_kwargs(Config())["keepalive_timeout"] == 75.0
+    assert sc.serve_kwargs(Config(server_keepalive_s=120.0))["keepalive_timeout"] == 120.0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("idle, server, warns", [(60.0, 75.0, False), (74.5, 75.0, True), (80.0, 75.0, True),
+                                                 (0.0, 75.0, False)])
+async def test_startup_warns_when_the_server_keepalive_is_not_1s_above_envoys_idle(capsys, idle, server, warns):
+    async with serve_sidecar("http://127.0.0.1:9", server_keepalive_s=server, gateway_upstream_idle_s=idle):
+        pass
+    records = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.startswith("{")]
+    assert any(r.get("event") == "tre_server_keepalive_unsafe" for r in records) is warns
+
+
+def test_server_keepalive_and_window_from_env():
+    cfg = Config.from_env({"TRE_REISSUE_SERVER_KEEPALIVE_S": "120", "TRE_REISSUE_GATEWAY_UPSTREAM_IDLE_S": "60",
+                           "TRE_REISSUE_LOCAL_RECONNECT_WINDOW_S": "0.5"})
+    assert (cfg.server_keepalive_s, cfg.gateway_upstream_idle_s, cfg.local_reconnect_window_s) == (120.0, 60.0, 0.5)
+    defaults = Config.from_env({})
+    assert (defaults.server_keepalive_s, defaults.gateway_upstream_idle_s,
+            defaults.local_reconnect_window_s) == (75.0, 0.0, 1.0)
+    for bad in ({"TRE_REISSUE_SERVER_KEEPALIVE_S": "0"}, {"TRE_REISSUE_LOCAL_RECONNECT_WINDOW_S": "-1"},
+                {"TRE_REISSUE_GATEWAY_UPSTREAM_IDLE_S": "-1"}):
+        with pytest.raises(ValueError):
+            Config.from_env(bad)

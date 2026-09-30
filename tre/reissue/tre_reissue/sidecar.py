@@ -22,10 +22,15 @@ Every path is proxied transparently (streaming kept). On top of that:
   usage with the ORIGINAL prompt_tokens, stop strings re-checked across the seam).
 * The loopback hop to vLLM is kept healthy: pooled connections idle at most
   ``upstream_keepalive_s`` (below vLLM's own keep-alive), a request whose pooled
-  connection is dropped before the first response byte is re-sent once on a fresh
+  connection is dropped before the first response byte (and within
+  ``local_reconnect_window_s`` of being handed out) is re-sent once on a fresh
   connection, and if the engine still cannot be reached before anything was sent the
   client gets ``503`` + ``Retry-After`` (``error.layer = "sidecar_upstream"``), or the
   request goes through the gateway when nothing listens locally / the pod is asleep.
+* The hop Envoy -> sidecar is kept healthy the same way round: the sidecar's own server
+  keeps an idle connection ``server_keepalive_s`` (default 75 s), which must stay above
+  Envoy's upstream idle timeout (``gateway.upstream_idle_timeout_s``, default 60 s), so
+  Envoy - the side that sends requests - always closes an idle connection first.
 * ``POST /sleep`` (and ``/pause``) must carry ``X-TRE-Hidden: 1`` (sent by the
   service-manager after it hid the pod), else 409: fail closed.
 * ``GET /tre-reissue/metrics`` (Prometheus text), ``GET /tre-reissue/state``, one JSON log
@@ -190,6 +195,22 @@ class Config:
     #: connection level (disconnect / ECONNRESET / EPIPE) before any response byte and
     #: before anything was written to the client. 0 = off.
     local_reconnect_attempts: int = 1
+    #: A fresh-connection re-send happens only when the failure came within this many
+    #: seconds of the pooled connection being handed to the request. The keep-alive race
+    #: is instantaneous (the peer closed the idle connection a moment ago); a reused
+    #: connection that dies later (engine crash mid-generation) may have run the request,
+    #: so it is not re-sent. Must be >= 0.
+    local_reconnect_window_s: float = 1.0
+    #: Keep-alive of THIS sidecar's HTTP server (aiohttp ``keepalive_timeout``): how long
+    #: it keeps an idle client connection (Envoy's upstream connection) open. The peer
+    #: that sends requests must close first, so this must stay ABOVE Envoy's upstream idle
+    #: timeout (``gateway_upstream_idle_s``), else Envoy reuses a connection the sidecar is
+    #: closing (503 UC / reset). aiohttp's own default is 75 s.
+    server_keepalive_s: float = 75.0
+    #: Envoy's upstream connection idle timeout (registry ``gateway.upstream_idle_timeout_s``,
+    #: set on the tre-v2 gateway clusters). Only used for the startup check against
+    #: ``server_keepalive_s``; 0 = unknown, no check.
+    gateway_upstream_idle_s: float = 0.0
     #: Minimum seconds between two WARNING lines of the same kind (rate limit).
     warn_interval_s: float = 10.0
     connect_timeout_s: float = 6.0
@@ -257,6 +278,11 @@ class Config:
         if not cfg.upstream_keepalive_s > 0 or cfg.local_reconnect_attempts < 0:
             raise ValueError("TRE_REISSUE_UPSTREAM_KEEPALIVE_S must be > 0 and "
                              "TRE_REISSUE_LOCAL_RECONNECT_ATTEMPTS >= 0")
+        if cfg.local_reconnect_window_s < 0:
+            raise ValueError("TRE_REISSUE_LOCAL_RECONNECT_WINDOW_S must be >= 0")
+        if not cfg.server_keepalive_s > 0 or cfg.gateway_upstream_idle_s < 0:
+            raise ValueError("TRE_REISSUE_SERVER_KEEPALIVE_S must be > 0 and "
+                             "TRE_REISSUE_GATEWAY_UPSTREAM_IDLE_S >= 0")
         if not cfg.gateway_url.startswith(("http://", "https://")):
             raise ValueError(f"TRE_GATEWAY_URL must be an http(s) URL, got {cfg.gateway_url!r}")
         return cfg
@@ -352,7 +378,11 @@ class Metrics:
         self.overhead = Histogram(OVERHEAD_BUCKETS_S)
         self.forward = Histogram(OVERHEAD_BUCKETS_S)
         self.relay = Histogram(OVERHEAD_BUCKETS_S)
-        self.gap = Histogram(GAP_BUCKETS_S)
+        #: Abort -> continuation, per ``mode``: "stream" = to the FIRST continuation token
+        #: (the client sees it at once); "nonstream" = to the COMPLETE continuation
+        #: response (the client only sees anything then), so it also contains the
+        #: continued generation time. The two are not comparable.
+        self.gap = {"stream": Histogram(GAP_BUCKETS_S), "nonstream": Histogram(GAP_BUCKETS_S)}
         #: Fresh-connection re-sends to the local engine, per attempt (see
         #: ``ReissueSidecar._local_request``).
         self.reconnect: dict[str, int] = {"ok": 0, "fail": 0}
@@ -407,10 +437,13 @@ class Metrics:
         ]
         lines += self.relay.render("tre_reissue_proxy_relay_seconds", f'model="{model}"')
         lines += [
-            "# HELP tre_reissue_gap_seconds Abort to first continuation token.",
+            "# HELP tre_reissue_gap_seconds Abort to continuation: mode=stream is abort to the first "
+            "continuation token; mode=nonstream is abort to the complete continuation response "
+            "(includes the continued generation), so the two modes are not comparable.",
             "# TYPE tre_reissue_gap_seconds histogram",
         ]
-        lines += self.gap.render("tre_reissue_gap_seconds", f'model="{model}"')
+        for mode, hist in self.gap.items():
+            lines += hist.render("tre_reissue_gap_seconds", f'model="{model}",mode="{mode}"')
         lines += [
             "# HELP tre_reissue_events_total Sidecar events (sleep rejections, state corrections, ...).",
             "# TYPE tre_reissue_events_total counter",
@@ -814,7 +847,15 @@ KEEPALIVE_MARGIN_S = 1.0
 
 
 def keepalive_is_safe(pool_keepalive_s: float, server_keepalive_s: float) -> bool:
+    """The connection is closed by the side that SENDS requests first: the client's idle
+    limit must be at least ``KEEPALIVE_MARGIN_S`` below the server's."""
     return pool_keepalive_s <= server_keepalive_s - KEEPALIVE_MARGIN_S
+
+
+def serve_kwargs(cfg: "Config") -> dict[str, Any]:
+    """Keyword arguments of ``web.run_app`` (the sidecar's own HTTP server)."""
+    return {"host": cfg.listen_host, "port": cfg.listen_port, "access_log": None, "print": None,
+            "backlog": 2048, "handle_signals": True, "keepalive_timeout": cfg.server_keepalive_s}
 
 
 def is_stale_connection_error(exc: BaseException) -> bool:
@@ -914,6 +955,15 @@ class ReissueSidecar:
                             f"{KEEPALIVE_MARGIN_S:g} s below vLLM's (VLLM_HTTP_TIMEOUT_KEEP_ALIVE), else "
                             "pooled connections are reused while vLLM closes them; fresh-connection "
                             "re-sends still cover it"})
+        if cfg.gateway_upstream_idle_s > 0 and not keepalive_is_safe(
+                cfg.gateway_upstream_idle_s, cfg.server_keepalive_s):
+            _log({"level": "WARNING", "event": "tre_server_keepalive_unsafe", "model": cfg.model,
+                  "pod": cfg.pod_name, "server_keepalive_s": cfg.server_keepalive_s,
+                  "gateway_upstream_idle_s": cfg.gateway_upstream_idle_s,
+                  "detail": "the sidecar's own server keep-alive must be at least "
+                            f"{KEEPALIVE_MARGIN_S:g} s above Envoy's upstream idle timeout "
+                            "(gateway.upstream_idle_timeout_s), else Envoy reuses connections the "
+                            "sidecar is closing (503 UC / reset)"})
         # keepalive_timeout < vLLM's keep-alive: the pool drops an idle connection before
         # the server can close it under a reused request.
         reuse = aiohttp.TraceConfig()
@@ -1011,23 +1061,32 @@ class ReissueSidecar:
         marker = getattr(ctx, "trace_request_ctx", None)
         if isinstance(marker, dict):
             marker["reused"] = True
+            marker["reused_at"] = time.monotonic()
 
     async def _local_request(self, method: str, url: str, **kwargs: Any) -> aiohttp.ClientResponse:
         """``self.local.request`` (the response headers are in when it returns), re-sent
         on a fresh connection up to ``local_reconnect_attempts`` times when the attempt
-        ran on a REUSED pooled connection and failed with
-        :func:`is_stale_connection_error` - the keep-alive race: uvicorn closes a
-        connection only while it is idle (data arriving cancels its keep-alive timer), so
-        the request was not processed. A failure on a newly opened connection is not
-        re-sent (the server may have run the request, e.g. it crashed mid-generation).
+        ran on a REUSED pooled connection, failed with
+        :func:`is_stale_connection_error` and did so within ``local_reconnect_window_s``
+        of getting the connection - the keep-alive race: uvicorn closes a connection only
+        while it is idle (data arriving cancels its keep-alive timer), so the request was
+        not processed, and the failure shows up at once. A failure on a newly opened
+        connection, or on a reused one only after a long time (engine crash mid-
+        generation, so the request may have run), is not re-sent.
+
+        Layering note: aiohttp itself already retries once, inside ``request()``, when a
+        persistent connection fails for an IDEMPOTENT method (GET / HEAD / OPTIONS / TRACE /
+        PUT / DELETE); it never does for POST, which is what generation requests are, so
+        this method is the only retry for them.
         Callers invoke it before writing anything to the client, and the body is
         ``bytes``, so the re-send is exact. Raises the last error."""
-        marker = {"reused": False}
+        marker: dict[str, Any] = {"reused": False}
         try:
             return await self.local.request(method, url, trace_request_ctx=marker, **kwargs)
         except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
             if (not marker["reused"] or not is_stale_connection_error(exc)
-                    or self.cfg.local_reconnect_attempts < 1):
+                    or self.cfg.local_reconnect_attempts < 1
+                    or time.monotonic() - marker["reused_at"] > self.cfg.local_reconnect_window_s):
                 raise
             first = exc
         last: BaseException = first
@@ -1061,8 +1120,10 @@ class ReissueSidecar:
     def _upstream_failed(self, request: web.Request, depth: int, exc: BaseException, *,
                          status: int, account: bool = True) -> web.Response:
         """The local engine could not be reached before anything was sent to the client.
-        503 + Retry-After (``error.layer = sidecar_upstream``): retrying is safe for the
-        client (or Envoy); 502 only where kept for compatibility (connection refused etc.
+        503 + Retry-After (``error.layer = sidecar_upstream``): the request MAY have been
+        executed by the engine (a connection that died mid-request cannot tell), so it is
+        retryable for generation requests (they carry no side effects), not for anything
+        else; 502 only where kept for compatibility (connection refused etc.
         on a plain proxied path). Counted requests get one ``tre_reissue`` line each
         (with the request id) besides the rate-limited WARNING."""
         error = f"{type(exc).__name__}: {exc}"[:300]
@@ -1073,7 +1134,8 @@ class ReissueSidecar:
             self._warn(f"upstream_{status}", {"event": "tre_upstream_unavailable", "status": status,
                                               "path": request.path, "error": error})
         if status == 503:
-            return _error(503, f"local engine connection failed before any response ({error})",
+            return _error(503, f"local engine connection failed before any response; the request may "
+                               f"have been executed, generation requests can be retried ({error})",
                           "ServiceUnavailable", headers={"Retry-After": "1"}, layer="sidecar_upstream")
         return _error(status, f"upstream unavailable: {error}", "BadGateway", layer="sidecar_upstream")
 
@@ -1756,7 +1818,7 @@ class ReissueSidecar:
             self.metrics.event("stop_at_seam")
             cont_usage = {"completion_tokens": consumed}
         if gap_s is not None:
-            self.metrics.gap.observe(gap_s)
+            self.metrics.gap["stream"].observe(gap_s)
         tail_parts: list[bytes] = []
         if cont_failed or cont_finish is None or cont_finish == "abort":
             outcome, reason = "failed", ("continuation_aborted" if cont_finish == "abort" else "continuation_broken")
@@ -1880,7 +1942,7 @@ class ReissueSidecar:
                           request, depth, generated=generated, attempts=attempts, target=target, error=error)
             return web.Response(body=payload, status=resp.status, headers=headers)
         gap_s = time.monotonic() - t_abort
-        self.metrics.gap.observe(gap_s)
+        self.metrics.gap["nonstream"].observe(gap_s)
         second_text = second_choice.get("text") if plan.as_chat or not chat else None
         if second_text is None:
             second_text = choice_text(second_choice, chat)
@@ -2012,9 +2074,11 @@ def main() -> None:
           "max_depth": cfg.max_depth, "retry_attempts": cfg.retry_attempts,
           "upstream_keepalive_s": cfg.upstream_keepalive_s,
           "upstream_server_keepalive_s": cfg.upstream_server_keepalive_s,
-          "local_reconnect_attempts": cfg.local_reconnect_attempts})
-    web.run_app(build_app(cfg), host=cfg.listen_host, port=cfg.listen_port, access_log=None, print=None,
-                backlog=2048, handle_signals=True)
+          "local_reconnect_attempts": cfg.local_reconnect_attempts,
+          "local_reconnect_window_s": cfg.local_reconnect_window_s,
+          "server_keepalive_s": cfg.server_keepalive_s,
+          "gateway_upstream_idle_s": cfg.gateway_upstream_idle_s})
+    web.run_app(build_app(cfg), **serve_kwargs(cfg))
 
 
 if __name__ == "__main__":

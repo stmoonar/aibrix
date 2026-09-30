@@ -101,7 +101,9 @@ def test_sidecar_is_on_by_default_and_owns_the_serving_port(tmp_path):
 
 
 def test_disabled_renders_the_plain_pod(tmp_path):
-    registry = _registry(tmp_path, "reissue: {enabled: false}\n")
+    # without the sidecar vLLM itself answers on the pod port: its keep-alive must outlast
+    # Envoy's upstream idle timeout
+    registry = _registry(tmp_path, "reissue: {enabled: false}\nvllm: {env: {VLLM_HTTP_TIMEOUT_KEEP_ALIVE: '75'}}\n")
     for deployment in build_deployments(registry):
         containers = _containers(deployment)
         assert list(containers) == ["vllm-openai"]
@@ -114,9 +116,9 @@ def test_disabled_renders_the_plain_pod(tmp_path):
         assert all(v["name"] != REISSUE_CONTAINER for v in deployment["spec"]["template"]["spec"]["volumes"])
     assert all(r["kind"] != "ConfigMap" for r in build_resources(registry))
     # identical to a registry without the section but with the sidecar switched off
-    plain = _registry(tmp_path)
+    plain = _registry(tmp_path, "vllm: {env: {VLLM_HTTP_TIMEOUT_KEEP_ALIVE: '75'}}")
     plain = Registry(plain.topology(), plain.models(), plain.service_manager(), plain.gateway(),
-                     ReissueConfig(enabled=False))
+                     ReissueConfig(enabled=False), plain.vllm())
     assert build_deployments(plain) == build_deployments(registry)
 
 
@@ -173,10 +175,36 @@ def test_keepalive_settings_reach_the_sidecar(tmp_path):
         assert env["TRE_REISSUE_LOCAL_RECONNECT_ATTEMPTS"] == "2"
 
 
+def test_envoy_to_sidecar_keepalive_settings_reach_the_sidecar(tmp_path):
+    registry = _registry(tmp_path, textwrap.dedent("""
+        gateway: {upstream_idle_timeout_s: 30}
+        reissue: {server_keepalive_s: 120, local_reconnect_window_s: 0.5}
+    """))
+    for deployment in build_deployments(registry):
+        env = _env(_containers(deployment)[REISSUE_CONTAINER])
+        assert env["TRE_REISSUE_SERVER_KEEPALIVE_S"] == "120"
+        assert env["TRE_REISSUE_GATEWAY_UPSTREAM_IDLE_S"] == "30"
+        assert env["TRE_REISSUE_LOCAL_RECONNECT_WINDOW_S"] == "0.5"
+    # defaults: sidecar 75 s above Envoy's 60 s
+    for deployment in build_deployments(_registry(tmp_path)):
+        env = _env(_containers(deployment)[REISSUE_CONTAINER])
+        assert (env["TRE_REISSUE_SERVER_KEEPALIVE_S"], env["TRE_REISSUE_GATEWAY_UPSTREAM_IDLE_S"],
+                env["TRE_REISSUE_LOCAL_RECONNECT_WINDOW_S"]) == ("75", "60", "1")
+
+
 @pytest.mark.parametrize(
     "extra,needle",
     [
         ("reissue: {upstream_keepalive_s: 0}\n", "upstream_keepalive_s must be > 0"),
+        ("reissue: {server_keepalive_s: 0}\n", "server_keepalive_s must be > 0"),
+        ("reissue: {local_reconnect_window_s: -1}\n", "local_reconnect_window_s must be >= 0"),
+        # Envoy's idle timeout must be >= 1 s below the sidecar's server keep-alive
+        ("reissue: {server_keepalive_s: 60}\n", "at least 1 s above gateway.upstream_idle_timeout_s"),
+        ("reissue: {server_keepalive_s: 60.5}\n", "at least 1 s above gateway.upstream_idle_timeout_s"),
+        ("gateway: {upstream_idle_timeout_s: 75}\n", "at least 1 s above gateway.upstream_idle_timeout_s"),
+        ("gateway: {upstream_idle_timeout_s: 0}\n", "upstream_idle_timeout_s must be positive"),
+        # without the sidecar the pod's server is vLLM itself (default keep-alive 5 s here)
+        ("reissue: {enabled: false}\n", "vLLM's VLLM_HTTP_TIMEOUT_KEEP_ALIVE (5) must be at least 1 s above"),
         ("reissue: {local_reconnect_attempts: -1}\n", "local_reconnect_attempts"),
         # the pool must be BELOW vLLM's keep-alive (default 5 s) of every model
         ("reissue: {upstream_keepalive_s: 5}\n", "at least 1 s below vLLM's VLLM_HTTP_TIMEOUT_KEEP_ALIVE"),
