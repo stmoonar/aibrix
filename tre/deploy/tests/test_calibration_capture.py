@@ -208,6 +208,10 @@ class FakeRedis:
         items = items[start:start + num] if num is not None else items[start:]
         return items if withscores else [m for m, _ in items]
 
+    def zrange(self, key, start, stop):
+        items = [m.encode() for m, _ in self._sorted(key)]
+        return items[start:] if stop == -1 else items[start:stop + 1]
+
     def time(self):
         return self.now_ms // 1000, (self.now_ms % 1000) * 1000
 
@@ -331,9 +335,11 @@ def test_capture_after_cell_writes_the_cell_meta_and_the_reader_resolves_it(tmp_
     assert on_disk["legacy"]["requests_jsonl"] == "../../raw/m7_S1_hold_c1000001_a1/i0_o0_c1000001.jsonl"
     # the dump reaches one window + one gateway round before the cell starts
     assert on_disk["gateway_redis_dump"]["range_ms"][0] == 960_000 - 30_000 - 10_000
-    assert on_disk["redis_clock_before"]["redis_minus_local_ms"] == 0
+    assert on_disk["clock"]["probe_before"]["redis_minus_local_ms"] == 0
+    assert on_disk["clock"]["gateway"]["shift_ms"] == 0 and on_disk["clock"]["controller"]["shift_ms"] == 0
+    assert "clock_skew_suspected" not in on_disk
     # cut at the cell end: the controller has not processed the tail windows yet
-    assert on_disk["controller_ticks"]["complete"] is False and on_disk["tail_ms"] == 1_010_000
+    assert on_disk["controller_ticks"]["complete"] is False and on_disk["controller_ticks"]["tail_ms"] == 1_010_000
     assert (layout.cell_dir / cc.BACKFILL_MARKER).exists()
     got = cc.resolve_cell_artifacts(layout.model_dir, layout.stem)
     assert got["layout_version"] == 1 and got["cell_id"] == layout.cell_id
@@ -521,7 +527,7 @@ def test_a_dump_cut_at_the_cell_end_is_marked_and_backfilled_later(tmp_path: Pat
     meta = cc.capture_after_cell(layout, model="m7", start_ms=960_000, end_ms=990_000, window_ms=30_000,
                                  redis_client=r, flush_wait_s=0, now_ms=lambda: 995_000)
     assert meta["controller_ticks"]["complete"] is False and meta["gateway_redis_dump"]["complete"] is False
-    assert meta["tail_ms"] == 1_010_000
+    assert meta["controller_ticks"]["tail_ms"] == 1_010_000
     assert cc.pending_cells(layout.model_dir) == [layout.cell_dir]
     # the controller and the gateway catch up
     _seed_gateway(r, ["default/p"], [1_000_000, 1_010_000])
@@ -548,7 +554,7 @@ def test_a_backfill_never_shrinks_a_dump(tmp_path: Path) -> None:
     for end in (970_000, 980_000):
         r.zadd(decision_hist_key("m7"), {_tick(end): end})
     cc.capture_after_cell(layout, model="m7", start_ms=960_000, end_ms=990_000, window_ms=30_000,
-                          redis_client=r, flush_wait_s=0, gateway_dump=False)
+                          redis_client=r, flush_wait_s=0, gateway_dump=False, now_ms=lambda: r.now_ms)
     before = layout.controller_ticks_path.read_text()
     r.zsets[decision_hist_key("m7")].clear()  # retention trimmed it
     rec = cc.backfill_cell(layout.cell_dir, r)
@@ -560,7 +566,7 @@ def test_the_final_backfill_waits_for_the_controller_bounded(tmp_path: Path) -> 
     layout = _layout(tmp_path)
     r = FakeRedis(now_ms=995_000)
     cc.capture_after_cell(layout, model="m7", start_ms=960_000, end_ms=990_000, window_ms=30_000,
-                          redis_client=r, flush_wait_s=0, gateway_dump=False)
+                          redis_client=r, flush_wait_s=0, gateway_dump=False, now_ms=lambda: r.now_ms)
     slept = []
 
     def sleep(dt):
@@ -586,12 +592,165 @@ def test_old_markers_are_left_to_the_cli(tmp_path: Path) -> None:
     assert cc.pending_cells(layout.model_dir, max_age_s=None, now=lambda: 1e12) == [layout.cell_dir]
 
 
-def test_finalize_run_backfills_only_with_a_redis_url(tmp_path: Path, monkeypatch) -> None:
-    calls = []
-    monkeypatch.setattr(cc, "pending_cells", lambda root, **kw: [root])
+def test_finalize_run_backfills_pending_cells_with_the_given_or_default_redis(tmp_path: Path, monkeypatch) -> None:
+    import redis
+
+    calls, urls = [], []
+    pending = {"cells": []}
+    monkeypatch.setattr(cc, "pending_cells", lambda root, **kw: pending["cells"])
     monkeypatch.setattr(cc, "backfill_pending", lambda root, client, **kw: calls.append((root, kw)) or [])
+    monkeypatch.setattr(redis.Redis, "from_url", classmethod(lambda cls, url: urls.append(url) or object()))
     monkeypatch.setattr("scripts.calibration_dataset.build_dataset", lambda d: d)
     campaign.finalize_run(tmp_path, status="complete", exit_code=0)
-    assert calls == []
-    campaign.finalize_run(tmp_path, status="complete", exit_code=0, redis_url="redis://127.0.0.1:1/0")
-    assert calls and calls[0][1]["wait_s"] == cc.DEFAULT_FINAL_BACKFILL_WAIT_S
+    assert calls == []  # nothing pending: redis is not touched
+    pending["cells"] = [tmp_path]
+    campaign.finalize_run(tmp_path, status="complete", exit_code=0, redis_url="redis://10.0.0.1:6379/0")
+    campaign.finalize_run(tmp_path, status="complete", exit_code=0)
+    assert urls == ["redis://10.0.0.1:6379/0", cc.DEFAULT_REDIS_URL]
+    assert calls[0][1]["wait_s"] == cc.DEFAULT_FINAL_BACKFILL_WAIT_S
+
+
+# ------------------------------------------------------------ clocks and review fixes
+
+
+def test_source_clock_in_sync_is_not_shifted() -> None:
+    c = cc.source_clock(990_000, 996_000, redis_minus_local_ms=3.0, write_phase_ms=1_700)
+    assert c["shift_ms"] == 0 and c["suspect"] is None and c["lag_ms"] == 6_000
+
+
+def test_source_clock_detects_a_source_ahead_by_160_s() -> None:
+    # a gateway on a node 160 s fast stamps its rounds 160 s ahead of redis TIME
+    c = cc.source_clock(1_160_000, 1_001_500, redis_minus_local_ms=0.0)
+    assert c["suspect"] and abs(c["shift_ms"] - 160_000) <= 5_000
+    # the same from the write phase of a live gateway (seen 158.3 s *before* its stamp)
+    c = cc.source_clock(None, None, redis_minus_local_ms=0.0, write_phase_ms=-158_300)
+    assert c["suspect"] and abs(c["shift_ms"] - 160_000) <= 5_000
+
+
+def test_source_clock_adds_redis_offset_and_flags_a_stale_source() -> None:
+    c = cc.source_clock(1_160_000, 1_165_000, redis_minus_local_ms=160_000.0)
+    assert c["shift_ms"] == 160_000 and c["suspect"] is None  # redis and source on the fast node
+    c = cc.source_clock(700_000, 1_000_000, redis_minus_local_ms=0.0)
+    assert c["shift_ms"] == 0 and "stale" in c["suspect"]
+
+
+def test_a_skewed_gateway_gets_a_shifted_dump_range(tmp_path: Path) -> None:
+    layout = _layout(tmp_path)
+    r = FakeRedis(now_ms=1_000_000)
+    skew = 160_000
+    _seed_gateway(r, ["default/p"], [s + skew for s in (930_000, 960_000, 990_000)])
+    meta = cc.capture_after_cell(layout, model="m7", start_ms=960_000, end_ms=990_000, window_ms=30_000,
+                                 redis_client=r, flush_wait_s=0, now_ms=lambda: 1_000_000,
+                                 controller_ticks=False)
+    gw = meta["clock"]["gateway"]
+    assert meta["clock_skew_suspected"]["gateway"] and abs(gw["shift_ms"] - skew) <= 5_000
+    # all three rounds (in the gateway's clock) are inside the shifted range
+    assert sum(meta["gateway_redis_dump"]["docs"]["inst"].values()) == 3
+    assert meta["gateway_redis_dump"]["tail_ms"] == cc.tail_ms(990_000, 30_000, gw["shift_ms"])
+
+
+def test_active_pods_skips_pods_long_gone() -> None:
+    r = FakeRedis()
+    _seed_gateway(r, ["default/live"], [990_000])
+    _seed_gateway(r, ["default/gone"], [100_000])
+    assert cc.active_pods(r, cc.model_pod_keys(r, "m7"), 900_000) == ["default/live"]
+
+
+def test_the_write_phase_is_measured_once_per_gateway_instance_set(tmp_path: Path) -> None:
+    from tre_common.rediskeys import GW_INSTANCES_KEY
+
+    r = FakeRedis(now_ms=1_000_000)
+    _seed_gateway(r, ["default/p"], [980_000, 990_000])
+    r.zadd(GW_INSTANCES_KEY, {"gw-a": 1.0})
+    clock = {"t": 0.0}
+
+    def sleep(dt):
+        clock["t"] += dt
+        if clock["t"] >= 1.0:
+            r.zadd(inst_key("default/p"), {"new": 1_000_000})
+            r.now_ms = 1_001_700
+
+    first = cc.capture_after_cell(_layout(tmp_path), model="m7", start_ms=960_000, end_ms=990_000,
+                                  window_ms=30_000, redis_client=r, sleep=sleep,
+                                  monotonic=lambda: clock["t"], now_ms=lambda: 1_001_700,
+                                  controller_ticks=False)
+    assert first["gateway_redis_dump"]["flush_wait"]["write_phase_ms"] == 1_700
+    second_layout = cc.CellLayout(tmp_path / "run" / "m7", "m7_S1_hold_c1000002_a1", "i0_o0_c1000002")
+    second = cc.capture_after_cell(second_layout, model="m7", start_ms=990_000, end_ms=1_000_000,
+                                   window_ms=30_000, redis_client=r, now_ms=lambda: 1_002_000,
+                                   sleep=lambda dt: pytest.fail("waited although the phase is cached"),
+                                   controller_ticks=False)
+    assert second["gateway_redis_dump"]["flush_wait"]["skipped"]
+    assert second["gateway_redis_dump"]["flush_wait"]["write_phase_ms"] == 1_700
+    r.zadd(GW_INSTANCES_KEY, {"gw-b": 2.0})  # a gateway restart: measure again
+    assert cc.cached_phase(second_layout.cell_dir.parent, cc.gateway_instances(r), now_ms=1_002_000) is None
+
+
+def test_a_rewrite_with_as_many_but_different_rows_is_not_a_superset(tmp_path: Path) -> None:
+    layout = _layout(tmp_path)
+    r = FakeRedis()
+    for end in (970_000, 980_000):
+        r.zadd(decision_hist_key("m7"), {_tick(end): end})
+    cc.capture_after_cell(layout, model="m7", start_ms=960_000, end_ms=990_000, window_ms=30_000,
+                          redis_client=r, flush_wait_s=0, gateway_dump=False, now_ms=lambda: r.now_ms)
+    r.zsets[decision_hist_key("m7")].pop(_tick(970_000))  # the oldest trimmed ...
+    r.zadd(decision_hist_key("m7"), {_tick(990_000): 990_000})  # ... while the tail arrived
+    rec = cc.backfill_cell(layout.cell_dir, r)
+    assert "controller_ticks_kept" in rec
+
+
+def test_a_late_sample_after_close_is_dropped_not_written(tmp_path: Path) -> None:
+    url = "http://10.0.0.1:8000/metrics"
+    rec = cc.VllmMetricsRecorder(tmp_path / "v", {url: "default/p"})
+    rec.record(url, 1, _body())
+    rec.close()
+    rec.record(url, 2, _body())
+    rec.record_error(url, 3, "late")
+    lines = (tmp_path / "v" / "default_p.jsonl").read_text().splitlines()
+    assert len(lines) == 2 and rec.late_after_close == 2
+
+
+def test_seals_never_cover_the_mutable_capture(tmp_path: Path) -> None:
+    from scripts import calibration_acceptance, calibration_t14
+
+    out = tmp_path / "m"
+    (out / "raw" / "s_a1").mkdir(parents=True)
+    (out / "raw" / "s_a1" / "c.jsonl").write_text("{}\n")
+    (out / "cells.jsonl").write_text("{}\n")
+    (out / "manifest.json").write_text("{}\n")
+    cell = out / "cells" / "s_a1"
+    cell.mkdir(parents=True)
+    (cell / "cell_meta.json").write_text("{}\n")
+    (cell / "controller_ticks.jsonl").write_text("{}\n")
+
+    def names(files):
+        return sorted(Path(f).resolve().relative_to(out.resolve()).as_posix() for f in files)
+
+    want = ["cells.jsonl", "manifest.json", "raw/s_a1/c.jsonl"]
+    assert names(calibration_acceptance.sealed_files(out, {})) == want
+    assert names(calibration_t14.sealed_files(out, out / "raw", [])) == want
+
+
+def test_capture_config_redacts_url_credentials() -> None:
+    args = SimpleNamespace(redis_url="redis://user:s3cret@10.0.0.1:6379/0", gateway_url="http://gw:80/v1",
+                           pod_endpoint=["http://a:b@10.0.0.2:8000/metrics"])
+    cfg = r3_grid._capture_config(args)
+    assert cfg["redis_url"] == "redis://***@10.0.0.1:6379/0" and cfg["gateway_url"] == "http://gw:80/v1"
+    assert cfg["pod_endpoint"] == ["http://***@10.0.0.2:8000/metrics"]
+
+
+def test_run_manifest_hashes_the_live_registry_configmap(tmp_path: Path) -> None:
+    import hashlib
+
+    def run(argv, **kw):
+        if argv[0] == "git":
+            return SimpleNamespace(returncode=1, stdout="")
+        if "configmap" in argv:
+            return SimpleNamespace(returncode=0, stdout=json.dumps({"data": {"registry.yaml": "models: {}\n"}}))
+        return SimpleNamespace(returncode=0, stdout="{}")
+
+    path = cc.write_run_manifest(tmp_path, model="m7", config={}, registry_path=None, repo=tmp_path,
+                                 control_namespace="ns", registry_configmap="tre-v2-registry", run=run)
+    live = json.loads(path.read_text())["registry"]["live_configmap"]
+    assert live["name"] == "tre-v2-registry"
+    assert live["data_sha256"]["registry.yaml"] == hashlib.sha256(b"models: {}\n").hexdigest()

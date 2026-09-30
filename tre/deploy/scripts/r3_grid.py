@@ -42,6 +42,7 @@ import argparse
 import csv
 import itertools
 import json
+import re
 import threading
 import time
 from dataclasses import dataclass, field
@@ -582,11 +583,22 @@ def capture_layout_for(args, cell_id: str):
     return capture.CellLayout(cells.parent, Path(args.output).stem, cell_id, raw_root=raw_root)
 
 
+def _redact(value):
+    """A URL's userinfo (``scheme://user:secret@host``) is never written to disk."""
+    if isinstance(value, str):
+        return re.sub(r"(?<=://)[^/@\s]+@", "***@", value)
+    if isinstance(value, list):
+        return [_redact(v) for v in value]
+    return value
+
+
 def _capture_config(args) -> dict:
-    """The driver configuration recorded in the run manifest (JSON-safe)."""
+    """The driver configuration recorded in the run manifest (JSON-safe, URL credentials
+    redacted)."""
     out = {}
     for key, value in sorted(vars(args).items()):
-        out[key] = value if isinstance(value, (str, int, float, bool, type(None), list)) else str(value)
+        value = value if isinstance(value, (str, int, float, bool, type(None), list)) else str(value)
+        out[key] = _redact(value)
     return out
 
 
@@ -656,6 +668,7 @@ def run_schedule_cell(args, store, spec, redis_client=None) -> tuple[list, "open
                                else Path(__file__).resolve().parents[1] / "registry.yaml"),
                 repo=Path(__file__).resolve().parents[2], model_pods=targets,
                 control_namespace=args.control_namespace or None,
+                registry_configmap=args.registry_configmap or None,
             )
             if written is not None:
                 print(f"run manifest: {written}")
@@ -831,6 +844,7 @@ def run_schedule_cell(args, store, spec, redis_client=None) -> tuple[list, "open
             gateway_dump=not args.no_gateway_dump,
             controller_ticks=not args.no_controller_ticks,
             flush_wait_s=args.gateway_flush_wait_s,
+            phase_cache_s=args.gateway_phase_cache_s,
             info={"guard_voided": guard.voided, "void_reasons": list(guard.void_reasons),
                   "truncated": guard.truncated},
         )
@@ -1039,6 +1053,8 @@ class _SpecRegistry:
 
 def parse_args(argv: Optional[Sequence[str]] = None):
     """The driver's arguments, with the mode-dependent defaults filled in."""
+    from scripts import calibration_capture as _capture
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
     ap.add_argument("--gateway-url", required=True)
@@ -1061,7 +1077,7 @@ def parse_args(argv: Optional[Sequence[str]] = None):
                          "the phase-aligned controller's window (plan 6.11 D8; the campaign "
                          "passes grid with --step-ms 10000). none: free-phase windows from "
                          "the drive's start, [start, end)")
-    ap.add_argument("--redis-url", default="redis://tre-v2-redis:6379/0")
+    ap.add_argument("--redis-url", default=_capture.DEFAULT_REDIS_URL)
     ap.add_argument("--metrics-schema", default="v1")
     # Sidecar sampling cadence (how often WE sample the queue into the .instant.jsonl).
     # This is NOT the divisor MetricsStore uses: the redis buckets it reads are written by
@@ -1165,6 +1181,13 @@ def parse_args(argv: Optional[Sequence[str]] = None):
     ap.add_argument("--gateway-flush-wait-s", type=float, default=None,
                     help="after the cell, wait at most this long for the gateway's next redis "
                          "write before dumping (0 = no wait; default one round + 2 s)")
+    ap.add_argument("--gateway-phase-cache-s", type=float, default=_capture.DEFAULT_PHASE_CACHE_S,
+                    help="reuse the run's measured gateway write phase for this long (same gateway "
+                         "instances) instead of waiting for a gateway round after every cell; 0 = "
+                         "measure after every cell")
+    ap.add_argument("--registry-configmap", default="tre-v2-registry",
+                    help="ConfigMap (in --control-namespace) holding the live registry, hashed "
+                         "into the run manifest ('' = skip)")
     ap.add_argument("--control-namespace", default="tre-v2",
                     help="namespace of the controller / SM / gateway plugins, for the image "
                          "list of the run manifest ('' = skip)")
@@ -1230,8 +1253,6 @@ def parse_args(argv: Optional[Sequence[str]] = None):
     ap.add_argument("--guard-mode", default="fail", choices=["fail", "warn"],
                     help="fail: a cell that did not deliver its load aborts the run")
     args = ap.parse_args(argv)
-    from scripts import calibration_capture as _capture
-
     if args.vllm_keyframe_every is None:
         args.vllm_keyframe_every = _capture.DEFAULT_KEYFRAME_EVERY
     if args.gateway_flush_wait_s is None:

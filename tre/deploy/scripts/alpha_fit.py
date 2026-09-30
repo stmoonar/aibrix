@@ -544,8 +544,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         return None if r is None else (r["theta"], r["tau_crit"])
 
     window_ms = float(getattr(args, "window_ms", None) or DEFAULT_WINDOW_MS)
+    # One window length unless given: a CRITICAL episode is non-spurious when a violation
+    # lies within one window of it (30 s = EPISODE_MARGIN_MS at the default window).
     margin_ms = getattr(args, "episode_margin_ms", None)
-    margin_ms = EPISODE_MARGIN_MS if margin_ms is None else margin_ms
+    margin_ms = window_ms if margin_ms is None else margin_ms
 
     def crit(test, theta, tau_crit):
         return tv.critical_dwell_flags(test, theta=theta, tau_crit=tau_crit, direction=cur["spec"].direction,
@@ -596,7 +598,7 @@ def _parse(argv: Optional[Sequence[str]]) -> argparse.Namespace:
                    help="re-window step (hours per window for the spurious rate)")
     p.add_argument("--window-ms", type=float, default=DEFAULT_WINDOW_MS,
                    help="window length: the dwell counter dates a window's end by start + this")
-    p.add_argument("--episode-margin-ms", type=float, default=EPISODE_MARGIN_MS,
+    p.add_argument("--episode-margin-ms", type=float, default=None,
                    help="+- margin of a non-spurious CRITICAL episode / early detection (default one window)")
     p.add_argument("--se-resamples", type=int, default=DEFAULT_SE_RESAMPLES)
     p.add_argument("--bootstrap", type=int, default=DEFAULT_BOOTSTRAP)

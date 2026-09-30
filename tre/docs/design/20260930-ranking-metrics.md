@@ -52,6 +52,11 @@ frozen EMA).
    sorted. A resample on which a metric is undefined is skipped (`resamples_used`). With
    one model the draw sequence is identical to `acceptance_bootstrap`'s, so the per-model
    ranking intervals come from the same resamples as the BA interval.
+   **Caveat for tau_b (ii):** its pairs join cells of different models that ran at the
+   same time, but the bootstrap resamples each model's cells independently, so it ignores
+   the dependence the shared time span creates (e.g. a common gateway or node effect).
+   Its interval is therefore likely too narrow; read it as a lower bound on the
+   uncertainty. Resampling time-overlap clusters would be the fix if (ii) ever gates.
 
 ### Exact matrix bootstrap
 

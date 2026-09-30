@@ -57,7 +57,9 @@ import os
 import re
 import socket
 import subprocess
+import threading
 import time
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -497,6 +499,12 @@ class VllmMetricsRecorder:
         self.errors: dict[str, int] = {}
         self.bytes_written: dict[str, int] = {}
         self.parse_seconds = 0.0
+        self.late_after_close = 0
+        self._closed = False
+        # The sidecar thread records, the driver closes: a sample that arrives after
+        # close() (a scrape outliving the sidecar's join) is counted and dropped, never
+        # written to a re-opened file.
+        self._lock = threading.Lock()
 
     def pod_key(self, url: str) -> str:
         return self.pods.get(url) or url
@@ -531,27 +539,37 @@ class VllmMetricsRecorder:
         self.bytes_written[pod] = self.bytes_written.get(pod, 0) + len(line)
 
     def record(self, url: str, ts_ms: int, body: str) -> None:
-        t0 = time.perf_counter()
-        state = parse_vllm_metrics(body, histograms=self.histograms, gauges=self.gauges)
-        enc = self._encoders.setdefault(url, DeltaEncoder(self.keyframe_every))
-        row = enc.encode(ts_ms, state)
-        self.parse_seconds += time.perf_counter() - t0
-        self._write(url, row, state.get("model_name"))
-        pod = self.pod_key(url)
-        self.samples[pod] = self.samples.get(pod, 0) + 1
+        with self._lock:
+            if self._closed:
+                self.late_after_close += 1
+                return
+            t0 = time.perf_counter()
+            state = parse_vllm_metrics(body, histograms=self.histograms, gauges=self.gauges)
+            enc = self._encoders.setdefault(url, DeltaEncoder(self.keyframe_every))
+            row = enc.encode(ts_ms, state)
+            self.parse_seconds += time.perf_counter() - t0
+            self._write(url, row, state.get("model_name"))
+            pod = self.pod_key(url)
+            self.samples[pod] = self.samples.get(pod, 0) + 1
 
     def record_error(self, url: str, ts_ms: int, error: str) -> None:
-        self._write(url, {"ts_ms": int(ts_ms), "error": str(error)[:500]})
-        pod = self.pod_key(url)
-        self.errors[pod] = self.errors.get(pod, 0) + 1
+        with self._lock:
+            if self._closed:
+                self.late_after_close += 1
+                return
+            self._write(url, {"ts_ms": int(ts_ms), "error": str(error)[:500]})
+            pod = self.pod_key(url)
+            self.errors[pod] = self.errors.get(pod, 0) + 1
 
     def close(self) -> None:
-        for fh in self._files.values():
-            try:
-                fh.close()
-            except OSError:
-                pass
-        self._files.clear()
+        with self._lock:
+            self._closed = True
+            for fh in self._files.values():
+                try:
+                    fh.close()
+                except OSError:
+                    pass
+            self._files.clear()
 
     def summary(self, cell_dir: Path) -> dict:
         files = {}
@@ -570,6 +588,7 @@ class VllmMetricsRecorder:
             "errors": dict(sorted(self.errors.items())),
             "bytes": dict(sorted(self.bytes_written.items())),
             "parse_seconds_total": round(self.parse_seconds, 4),
+            "late_after_close": self.late_after_close,
         }
 
 
@@ -631,6 +650,17 @@ def endpoint_targets(urls: Sequence[str]) -> list[dict]:
 
 # -------------------------------------------------------------------- redis dumps
 
+#: A stamp source (gateway rounds, controller window ends) whose clock is further off
+#: redis TIME than this is treated as skewed and its dump range is shifted (see
+#: :func:`source_clock`); below it, offsets are recorded but ignored.
+CLOCK_SKEW_TOLERANCE_MS = 2_000
+#: The controller's newest window end normally trails redis TIME by one gateway round
+#: plus its own tick; a lag beyond this is flagged (stale controller or slow clock).
+CONTROLLER_MAX_LAG_MS = 120_000
+#: The redis the gateway and the controller write to, as seen from inside the cluster
+#: (r3_grid's default too); a driver on a host passes ``--redis-url``.
+DEFAULT_REDIS_URL = "redis://tre-v2-redis:6379/0"
+
 
 def _text(value: Any) -> str:
     return value.decode("utf-8", errors="replace") if isinstance(value, (bytes, bytearray)) else str(value)
@@ -660,18 +690,80 @@ def clock_probe(redis_client: Any, now_ms: Callable[[], int]) -> dict:
 
 
 def model_pod_keys(redis_client: Any, model: str) -> list[str]:
-    """The gateway's pod keys (``<ns>/<pod>``) for ``model``: ``SMEMBERS tre:v2:pods:<model>``."""
+    """The gateway's pod keys (``<ns>/<pod>``) for ``model``: ``SMEMBERS tre:v2:pods:<model>``
+    (never pruned: it also lists pods long gone - see :func:`active_pods`)."""
     return sorted(_text(p) for p in (redis_client.smembers(pods_key(model)) or ()))
+
+
+def _latest_score(redis_client: Any, key: str) -> Optional[int]:
+    got = redis_client.zrevrangebyscore(key, "+inf", "-inf", start=0, num=1, withscores=True)
+    for _member, score in got or ():
+        return int(float(score))
+    return None
 
 
 def _latest_inst_score(redis_client: Any, pods: Sequence[str]) -> Optional[int]:
     best: Optional[int] = None
     for pod in pods:
-        got = redis_client.zrevrangebyscore(inst_key(pod), "+inf", "-inf", start=0, num=1, withscores=True)
-        for _member, score in got or ():
-            s = int(float(score))
-            best = s if best is None or s > best else best
+        s = _latest_score(redis_client, inst_key(pod))
+        if s is not None and (best is None or s > best):
+            best = s
     return best
+
+
+def active_pods(redis_client: Any, pods: Sequence[str], since_ms: int) -> list[str]:
+    """The pods of ``pods`` whose newest inst or hist doc is at or after ``since_ms`` -
+    the ones that can hold a doc of the cell (the pod set also lists dead pods)."""
+    out = []
+    for pod in pods:
+        latest = [s for s in (_latest_score(redis_client, inst_key(pod)),
+                              _latest_score(redis_client, hist_key(pod))) if s is not None]
+        if latest and max(latest) >= since_ms:
+            out.append(pod)
+    return out
+
+
+def source_clock(
+    latest_stamp_ms: Optional[int],
+    redis_now_ms: Optional[int],
+    *,
+    redis_minus_local_ms: Optional[float],
+    stamp_period_ms: int = SCRAPE_INTERVAL_MS,
+    max_lag_ms: int = SCRAPE_INTERVAL_MS + CLOCK_SKEW_TOLERANCE_MS,
+    write_phase_ms: Optional[int] = None,
+) -> dict:
+    """How far a stamp source's clock is from the driver's, and the shift its dump range
+    and tail need.
+
+    A source stamps with its own clock floored to ``stamp_period_ms``, so in sync its
+    newest stamp trails redis TIME by 0 .. ``max_lag_ms`` (``write_phase_ms`` - redis TIME
+    when a new round was first seen minus its stamp - is the sharper version of the same
+    lag). A stamp *ahead* of redis TIME, or a live source's write phase outside
+    ``[0, period]``, means its clock is off; its offset is then estimated to within half a
+    period as ``period / 2 - lag``. A lag beyond ``max_lag_ms`` without a measured phase
+    is ambiguous (stale source or slow clock): flagged, not shifted. The shift adds redis's
+    own offset from the driver (``clock_probe``) and is applied only when it exceeds
+    :data:`CLOCK_SKEW_TOLERANCE_MS`."""
+    out: dict[str, Any] = {"latest_stamp_ms": latest_stamp_ms, "redis_time_ms": redis_now_ms,
+                           "redis_minus_local_ms": redis_minus_local_ms, "write_phase_ms": write_phase_ms}
+    lag = None if latest_stamp_ms is None or redis_now_ms is None else int(redis_now_ms) - int(latest_stamp_ms)
+    out["lag_ms"] = lag
+    source_minus_redis = 0
+    suspect = None
+    if write_phase_ms is not None and not (-CLOCK_SKEW_TOLERANCE_MS <= write_phase_ms
+                                           <= stamp_period_ms + CLOCK_SKEW_TOLERANCE_MS):
+        source_minus_redis = stamp_period_ms // 2 - int(write_phase_ms)
+        suspect = "write phase outside one period"
+    elif lag is not None and lag < -CLOCK_SKEW_TOLERANCE_MS:
+        source_minus_redis = stamp_period_ms // 2 - lag
+        suspect = "newest stamp ahead of redis TIME"
+    elif lag is not None and lag > max_lag_ms and write_phase_ms is None:
+        suspect = "newest stamp far behind redis TIME (stale source or slow clock; not shifted)"
+    shift = int(round((redis_minus_local_ms or 0.0) + source_minus_redis))
+    if abs(shift) <= CLOCK_SKEW_TOLERANCE_MS:
+        shift = 0
+    out.update({"source_minus_redis_est_ms": source_minus_redis, "shift_ms": shift, "suspect": suspect})
+    return out
 
 
 def wait_for_gateway_write(
@@ -685,11 +777,10 @@ def wait_for_gateway_write(
 ) -> dict:
     """Wait (bounded) until the gateway writes its next round, and time that write.
 
-    Called after the cell's load ended, so the first round that appears after the wait
-    starts was written after the cell - the dump that follows then covers the cell's
-    tail. The gateway stamps each round with ``now - now % 10 s`` but its ticker runs at
-    an arbitrary phase, so ``redis TIME at first sight - round stamp`` is the *write
-    phase* (resolution: ``poll_s``). ``timeout_s <= 0`` skips the wait."""
+    The gateway stamps each round with ``now - now % 10 s`` (its own clock) but its
+    ticker runs at an arbitrary phase, so ``redis TIME at first sight - round stamp`` is
+    the *write phase* (resolution: ``poll_s``; it includes the gateway-vs-redis clock
+    offset, see :func:`source_clock`). ``timeout_s <= 0`` skips the wait."""
     out: dict[str, Any] = {"timeout_s": timeout_s, "poll_s": poll_s, "waited_s": 0.0,
                            "new_round_seen": False}
     if not pods or timeout_s <= 0:
@@ -716,6 +807,52 @@ def wait_for_gateway_write(
     return out
 
 
+#: Where a run keeps its last measured gateway write phase (under ``cells/``), so the
+#: flush wait runs once per gateway instance set and hour rather than once per cell.
+GATEWAY_PHASE_CACHE = ".gateway_write_phase.json"
+DEFAULT_PHASE_CACHE_S = 3600.0
+
+
+def gateway_instances(redis_client: Any) -> list[str]:
+    """The live gateway plugin instances (``tre:v2:gw:instances``): a restart changes the
+    set and, with it, the ticker phase."""
+    from tre_common.rediskeys import GW_INSTANCES_KEY
+
+    try:
+        return sorted(_text(m) for m in (redis_client.zrange(GW_INSTANCES_KEY, 0, -1) or ()))
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def cached_phase(cells_dir: Path, instances: Sequence[str], *, now_ms: int,
+                 max_age_s: float = DEFAULT_PHASE_CACHE_S) -> Optional[dict]:
+    """The run's cached write-phase measurement, if it is younger than ``max_age_s`` and
+    was made with the same gateway instances (and there are any)."""
+    if not instances or max_age_s <= 0:
+        return None
+    try:
+        doc = json.loads((Path(cells_dir) / GATEWAY_PHASE_CACHE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if doc.get("instances") != list(instances) or doc.get("write_phase_ms") is None:
+        return None
+    if now_ms - int(doc.get("measured_at_ms") or 0) > max_age_s * 1000.0:
+        return None
+    return doc
+
+
+def store_phase(cells_dir: Path, instances: Sequence[str], wait: Mapping[str, Any], *, now_ms: int) -> None:
+    if not wait.get("new_round_seen") or not instances:
+        return
+    doc = {"instances": list(instances), "measured_at_ms": int(now_ms),
+           "write_phase_ms": wait.get("write_phase_ms"), "round_ms": wait.get("new_round_ms")}
+    path = Path(cells_dir) / GATEWAY_PHASE_CACHE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(doc) + "\n", encoding="utf-8")
+    tmp.replace(path)
+
+
 def _parse_member(member: Any) -> Any:
     text = _text(member)
     try:
@@ -740,8 +877,30 @@ def _write_jsonl_atomic(path: Path, header: Mapping[str, Any], rows: Iterable[Ma
 
 
 class NotASuperset(RuntimeError):
-    """A re-dump would hold fewer members than the file it replaces (retention trimmed
+    """A re-dump would not contain every row of the file it replaces (retention trimmed
     the range): the existing file is kept."""
+
+
+def _file_scores(path: Path) -> Counter:
+    """The multiset of ``score`` values of a dump file (header excluded)."""
+    out: Counter = Counter()
+    try:
+        with Path(path).open(encoding="utf-8") as fh:
+            for line in fh:
+                row = json.loads(line)
+                if row.get("kind") != "header" and "score" in row:
+                    out[int(row["score"])] += 1
+    except OSError:
+        pass
+    return out
+
+
+def _require_superset(old_path: Path, new_scores: Iterable[int], what: str) -> None:
+    old = _file_scores(old_path)
+    missing = old - Counter(int(s) for s in new_scores)
+    if missing:
+        raise NotASuperset(f"{what}: {sum(missing.values())} row(s) of the existing dump are no longer "
+                           f"in redis (e.g. score {min(missing)})")
 
 
 def dump_gateway_docs(
@@ -755,21 +914,22 @@ def dump_gateway_docs(
 ) -> dict:
     """``ZRANGEBYSCORE [lo_ms, hi_ms]`` of every pod's hist and inst key, one JSONL per
     pod and kind: ``{"score": round stamp ms, "doc": parsed JSON}``. Pods with no doc in
-    the range get no file but are counted in the summary.
+    the range get no file.
 
-    ``previous`` (the summary of an earlier dump of the same cell): the re-dump must hold
-    at least as many docs per pod and kind, else :class:`NotASuperset` is raised before
-    anything is written - a backfill only ever widens a dump."""
+    ``previous`` (the summary of an earlier dump of the same cell): every row of the
+    existing files must still be in the new dump, else :class:`NotASuperset` is raised
+    before anything is written - a backfill only ever widens a dump."""
     fetched: dict[str, dict[str, list]] = {kind: {} for kind in GATEWAY_KINDS}
     for kind in GATEWAY_KINDS:
         key_of = hist_key if kind == "hist" else inst_key
         for pod in pods:
             fetched[kind][pod] = list(redis_client.zrangebyscore(key_of(pod), lo_ms, hi_ms, withscores=True) or [])
     if previous:
-        for kind, per_pod in (previous.get("docs") or {}).items():
-            for pod, n in per_pod.items():
-                if len(fetched.get(kind, {}).get(pod, [])) < int(n):
-                    raise NotASuperset(f"{kind} {pod}: {len(fetched.get(kind, {}).get(pod, []))} < {n}")
+        for kind, per_pod in (previous.get("files") or {}).items():
+            for pod, rel in per_pod.items():
+                _require_superset(layout.cell_dir / rel,
+                                  (int(float(s)) for _m, s in fetched.get(kind, {}).get(pod, [])),
+                                  f"{kind} {pod}")
     files: dict[str, dict[str, str]] = {kind: {} for kind in GATEWAY_KINDS}
     counts: dict[str, dict[str, int]] = {kind: {} for kind in GATEWAY_KINDS}
     stamps: list[int] = []
@@ -778,9 +938,9 @@ def dump_gateway_docs(
         key_of = hist_key if kind == "hist" else inst_key
         for pod in pods:
             members = fetched[kind][pod]
-            counts[kind][pod] = len(members)
             if not members:
                 continue
+            counts[kind][pod] = len(members)
             rows = []
             for member, score in members:
                 s = int(float(score))
@@ -814,8 +974,9 @@ def tss_raw_of(member: Mapping[str, Any]) -> tuple[Optional[float], Optional[str
     """(pre-EMA TSS, where it came from) of one decision-history member.
 
     The controller writes ``trs_raw`` since 2026-09-30 (read-only field, see
-    ``tre_controller.loops.decision_snapshot``). A member written before has only ``trs``
-    (after the EMA), ``y_m`` (numerator) and ``q_ctl`` (floored queue); its raw TSS is
+    ``tre_controller.loops.decision_snapshot``; 0.0 also marks an idle / undefined
+    window, as ``trs`` does). A member written before has only ``trs`` (after the EMA),
+    ``y_m`` (numerator) and ``q_ctl`` (floored queue); its raw TSS is
     ``y_m / q_ctl * factor`` where the factor is the assigned/routable correction of the
     *serving window* - 1 whenever the controller has its fleet view (the normal path:
     ``serving_window`` sets both counts to the awake-and-not-hidden pods) - and is NOT
@@ -851,8 +1012,8 @@ def dump_controller_ticks(
     as in :func:`dump_gateway_docs`."""
     key = decision_hist_key(model)
     members = list(redis_client.zrangebyscore(key, lo_ms, hi_ms, withscores=True) or [])
-    if previous and len(members) < int(previous.get("members") or 0):
-        raise NotASuperset(f"{key}: {len(members)} < {previous.get('members')}")
+    if previous and previous.get("file"):
+        _require_superset(layout.cell_dir / previous["file"], (int(float(s)) for _m, s in members), key)
     rows = []
     for member, score in members:
         doc = _parse_member(member)
@@ -923,6 +1084,20 @@ def control_plane_images(namespace: str, run: Callable[..., Any] = subprocess.ru
     return dict(sorted(images.items()))
 
 
+def live_configmap(namespace: str, name: str, run: Callable[..., Any] = subprocess.run) -> dict:
+    """sha256 of every data key of a ConfigMap - for ``tre-v2-registry`` this is the
+    registry the controller and the SM actually read (its ``registry.yaml`` hash compares
+    directly with the repo file's); ``{"error": ...}`` when kubectl cannot say."""
+    try:
+        out = run(["kubectl", "-n", namespace, "get", "configmap", name, "-o", "json"],
+                  capture_output=True, text=True, check=True, timeout=30).stdout
+        data = (json.loads(out or "{}").get("data") or {})
+    except Exception as exc:  # noqa: BLE001
+        return {"namespace": namespace, "name": name, "error": repr(exc)}
+    return {"namespace": namespace, "name": name,
+            "data_sha256": {k: hashlib.sha256(str(v).encode("utf-8")).hexdigest() for k, v in sorted(data.items())}}
+
+
 def write_run_manifest(
     model_dir: Path,
     *,
@@ -932,13 +1107,15 @@ def write_run_manifest(
     repo: Path,
     model_pods: Sequence[Mapping[str, Any]] = (),
     control_namespace: Optional[str] = None,
+    registry_configmap: Optional[str] = None,
     run: Callable[..., Any] = subprocess.run,
 ) -> Optional[Path]:
     """``<model dir>/manifest.json`` - written once, by the first cell of the run
     (exclusive create: a second writer leaves it alone and gets None).
 
     Records what the run's data can only be interpreted against: the capture layout
-    version, the code (commit, branch, dirty), the registry (path, sha256), the model
+    version, the code (commit, branch, dirty), the registry (the driver's file and the
+    live ConfigMap the controller reads, both hashed), the model
     pods' and the control plane's images, the driver configuration, and the hashes of
     the campaign's own plan documents present at that moment (``plan.json``,
     ``fit_plan.json``, ``run_manifest.json``)."""
@@ -966,7 +1143,9 @@ def write_run_manifest(
         "model": model,
         "code": git_state(repo, run=run),
         "registry": {"path": None if registry_path is None else str(registry_path),
-                     "sha256": None if registry_path is None else file_sha256(Path(registry_path))},
+                     "sha256": None if registry_path is None else file_sha256(Path(registry_path)),
+                     "live_configmap": (live_configmap(control_namespace, registry_configmap, run=run)
+                                        if control_namespace and registry_configmap else None)},
         "images": {
             "model_pods": [
                 {"pod": p.get("key"), "node": p.get("node"), "containers": p.get("containers")}
@@ -1006,86 +1185,40 @@ DEFAULT_FINAL_BACKFILL_WAIT_S = 90.0
 DEFAULT_BACKFILL_MAX_AGE_S = 6 * 3600.0
 
 
-def dump_range_ms(start_ms: int, end_ms: int, window_ms: int) -> tuple[int, int]:
-    """``[lo, hi]`` of every redis dump of a cell: from one window plus one gateway round
-    before the cell (the first window's read reaches that far back) to one window plus
-    one round after it (the last controller window that still holds part of the cell)."""
-    return (int(start_ms) - int(window_ms) - SCRAPE_INTERVAL_MS,
-            int(end_ms) + int(window_ms) + SCRAPE_INTERVAL_MS)
+def dump_range_ms(start_ms: int, end_ms: int, window_ms: int, shift_ms: int = 0) -> tuple[int, int]:
+    """``[lo, hi]`` of a redis dump of a cell, in the source's clock (``shift_ms`` = source
+    minus driver, :func:`source_clock`): from one window plus one gateway round before the
+    cell (the first window's read reaches that far back) to one window plus one round
+    after it (the last controller window that still holds part of the cell)."""
+    return (int(start_ms) + int(shift_ms) - int(window_ms) - SCRAPE_INTERVAL_MS,
+            int(end_ms) + int(shift_ms) + int(window_ms) + SCRAPE_INTERVAL_MS)
 
 
-def tail_ms(end_ms: int, window_ms: int) -> int:
-    """End of the last window on the gateway's 10 s grid that still overlaps the cell -
-    a dump is *complete* once it reaches it (controller ticks: ``window_end_ms``;
-    gateway docs: round stamp)."""
-    return ((int(end_ms) + int(window_ms) - 1) // SCRAPE_INTERVAL_MS) * SCRAPE_INTERVAL_MS
+def tail_ms(end_ms: int, window_ms: int, shift_ms: int = 0) -> int:
+    """End of the last window on the 10 s grid that still overlaps the cell, in the
+    source's clock - a dump is *complete* once it reaches it (controller ticks:
+    ``window_end_ms``; gateway docs: round stamp)."""
+    end = int(end_ms) + int(shift_ms) + int(window_ms) - 1
+    return (end // SCRAPE_INTERVAL_MS) * SCRAPE_INTERVAL_MS
 
 
-def _mark_completeness(meta: dict) -> bool:
-    """Set ``complete`` on the redis dumps of ``meta``; True when something is still
-    incomplete (a backfill is due)."""
-    tail = tail_ms(meta["end_ms"], meta["window_ms"])
-    pending = False
-    gd = meta.get("gateway_redis_dump")
-    if gd is not None:
-        gd["complete"] = gd.get("last_round_ms") is not None and gd["last_round_ms"] >= tail
-        pending |= not gd["complete"]
-    ct = meta.get("controller_ticks")
-    if ct is not None:
-        ct["complete"] = ct.get("last_window_end_ms") is not None and ct["last_window_end_ms"] >= tail
-        pending |= not ct["complete"]
-    meta["tail_ms"] = tail
-    return pending
-
-
-def _write_meta_and_marker(layout: CellLayout, meta: dict) -> None:
-    pending = _mark_completeness(meta)
-    write_cell_meta(layout, meta)
-    marker = layout.cell_dir / BACKFILL_MARKER
-    if pending:
-        marker.write_text(utc_iso() + "\n", encoding="utf-8")
-    elif marker.exists():
-        marker.unlink()
-
-
-BACKFILL_MARKER = "BACKFILL_PENDING"
-#: How long ``finalize_run`` waits, at most, for the controller to have processed the
-#: last cell's tail windows before the final backfill.
-DEFAULT_FINAL_BACKFILL_WAIT_S = 90.0
-#: Cells whose marker is older than this are left alone by the per-cell backfill (the
-#: gateway docs are gone after 30 min anyway; the CLI can still be run by hand).
-DEFAULT_BACKFILL_MAX_AGE_S = 6 * 3600.0
-
-
-def dump_range_ms(start_ms: int, end_ms: int, window_ms: int) -> tuple[int, int]:
-    """``[lo, hi]`` of every redis dump of a cell: from one window plus one gateway round
-    before the cell (the first window's read reaches that far back) to one window plus
-    one round after it (the last controller window that still holds part of the cell)."""
-    return (int(start_ms) - int(window_ms) - SCRAPE_INTERVAL_MS,
-            int(end_ms) + int(window_ms) + SCRAPE_INTERVAL_MS)
-
-
-def tail_ms(end_ms: int, window_ms: int) -> int:
-    """End of the last window on the gateway's 10 s grid that still overlaps the cell -
-    a dump is *complete* once it reaches it (controller ticks: ``window_end_ms``;
-    gateway docs: round stamp)."""
-    return ((int(end_ms) + int(window_ms) - 1) // SCRAPE_INTERVAL_MS) * SCRAPE_INTERVAL_MS
+def _shift_of(meta: Mapping[str, Any], source: str) -> int:
+    return int(((meta.get("clock") or {}).get(source) or {}).get("shift_ms") or 0)
 
 
 def _mark_completeness(meta: dict) -> bool:
-    """Set ``complete`` on the redis dumps of ``meta``; True when something is still
-    incomplete (a backfill is due)."""
-    tail = tail_ms(meta["end_ms"], meta["window_ms"])
+    """Set ``complete`` (and ``tail_ms``) on the redis dumps of ``meta``; True when
+    something is still incomplete (a backfill is due)."""
     pending = False
-    gd = meta.get("gateway_redis_dump")
-    if gd is not None:
-        gd["complete"] = gd.get("last_round_ms") is not None and gd["last_round_ms"] >= tail
-        pending |= not gd["complete"]
-    ct = meta.get("controller_ticks")
-    if ct is not None:
-        ct["complete"] = ct.get("last_window_end_ms") is not None and ct["last_window_end_ms"] >= tail
-        pending |= not ct["complete"]
-    meta["tail_ms"] = tail
+    for name, source, last_key in (("gateway_redis_dump", "gateway", "last_round_ms"),
+                                   ("controller_ticks", "controller", "last_window_end_ms")):
+        dump = meta.get(name)
+        if dump is None:
+            continue
+        tail = tail_ms(meta["end_ms"], meta["window_ms"], _shift_of(meta, source))
+        dump["tail_ms"] = tail
+        dump["complete"] = dump.get(last_key) is not None and dump[last_key] >= tail
+        pending |= not dump["complete"]
     return pending
 
 
@@ -1113,15 +1246,24 @@ def capture_after_cell(
     gateway_dump: bool = True,
     controller_ticks: bool = True,
     flush_wait_s: float = DEFAULT_GATEWAY_FLUSH_WAIT_S,
+    phase_cache_s: float = DEFAULT_PHASE_CACHE_S,
     poll_s: float = DEFAULT_GATEWAY_POLL_S,
     now_ms: Callable[[], int] = lambda: int(time.time() * 1000),
     sleep: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
     info: Optional[Mapping[str, Any]] = None,
 ) -> dict:
-    """After a cell (its load drained): wait for the gateway's next write, dump the
-    gateway docs and the controller ticks over :func:`dump_range_ms`, write
-    ``cell_meta.json``.
+    """After a cell (its load drained): measure the clocks, dump the gateway docs and the
+    controller ticks over :func:`dump_range_ms`, write ``cell_meta.json``.
+
+    Clocks: ``start_ms`` / ``end_ms`` are the driver's clock, the gateway stamps its
+    rounds and the controller its windows with their own. :func:`source_clock` estimates
+    each source's offset (redis TIME bracketed by the driver's clock, the source's newest
+    stamp, the gateway's write phase) and shifts that source's range when the offset
+    exceeds :data:`CLOCK_SKEW_TOLERANCE_MS`; everything is recorded under ``clock``.
+
+    The gateway's write phase is measured by waiting (at most ``flush_wait_s``) for its
+    next round - once per ``phase_cache_s`` and gateway instance set, not per cell.
 
     Right after the cell the controller has not yet processed the windows that end up to
     one window later, and the gateway has written at most one round past the end; such a
@@ -1156,30 +1298,65 @@ def capture_after_cell(
         except Exception as exc:  # noqa: BLE001
             errors.append(f"vllm_metrics: {exc!r}")
     if redis_client is not None and (gateway_dump or controller_ticks):
-        lo, hi = dump_range_ms(start_ms, end_ms, window_ms)
+        clock: dict[str, Any] = {}
+        meta["clock"] = clock
+        rml: Optional[float] = None
         try:
-            meta["redis_clock_before"] = clock_probe(redis_client, now_ms)
+            probe = clock_probe(redis_client, now_ms)
+            clock["probe_before"] = probe
+            rml = probe["redis_minus_local_ms"]
         except Exception as exc:  # noqa: BLE001
             errors.append(f"redis clock: {exc!r}")
         if gateway_dump:
             try:
-                pods = model_pod_keys(redis_client, model)
-                wait = wait_for_gateway_write(redis_client, pods, timeout_s=flush_wait_s, poll_s=poll_s,
-                                              sleep=sleep, monotonic=monotonic)
+                in_set = model_pod_keys(redis_client, model)
+                # widened by the largest plausible skew: a skewed gateway's stamps may lie
+                # before the unshifted range, and a pod must not be dropped for that
+                pods = active_pods(redis_client, in_set,
+                                   dump_range_ms(start_ms, end_ms, window_ms)[0] - 10 * SCRAPE_INTERVAL_MS)
+                instances = gateway_instances(redis_client)
+                cached = cached_phase(layout.cell_dir.parent, instances, now_ms=int(now_ms()),
+                                      max_age_s=phase_cache_s)
+                if cached is not None:
+                    wait = {"skipped": "write phase cached for this gateway instance set",
+                            "write_phase_ms": cached["write_phase_ms"],
+                            "measured_at_ms": cached["measured_at_ms"], "new_round_seen": False}
+                else:
+                    wait = wait_for_gateway_write(redis_client, pods, timeout_s=flush_wait_s, poll_s=poll_s,
+                                                  sleep=sleep, monotonic=monotonic)
+                    try:
+                        store_phase(layout.cell_dir.parent, instances, wait, now_ms=int(now_ms()))
+                    except OSError as exc:
+                        errors.append(f"gateway phase cache: {exc!r}")
+                clock["gateway"] = source_clock(
+                    _latest_inst_score(redis_client, pods), redis_time_ms(redis_client),
+                    redis_minus_local_ms=rml, write_phase_ms=wait.get("write_phase_ms"),
+                )
+                lo, hi = dump_range_ms(start_ms, end_ms, window_ms, clock["gateway"]["shift_ms"])
                 summary = dump_gateway_docs(redis_client, layout, pods, lo_ms=lo, hi_ms=hi)
                 summary["flush_wait"] = wait
+                summary["pods_in_set"] = len(in_set)
+                summary["gateway_instances"] = instances
                 meta["gateway_redis_dump"] = summary
             except Exception as exc:  # noqa: BLE001
                 errors.append(f"gateway_redis_dump: {exc!r}")
         if controller_ticks:
             try:
+                clock["controller"] = source_clock(
+                    _latest_score(redis_client, decision_hist_key(model)), redis_time_ms(redis_client),
+                    redis_minus_local_ms=rml, max_lag_ms=CONTROLLER_MAX_LAG_MS,
+                )
+                lo, hi = dump_range_ms(start_ms, end_ms, window_ms, clock["controller"]["shift_ms"])
                 meta["controller_ticks"] = dump_controller_ticks(redis_client, layout, model, lo_ms=lo, hi_ms=hi)
             except Exception as exc:  # noqa: BLE001
                 errors.append(f"controller_ticks: {exc!r}")
         try:
-            meta["redis_clock_after"] = clock_probe(redis_client, now_ms)
+            clock["probe_after"] = clock_probe(redis_client, now_ms)
         except Exception as exc:  # noqa: BLE001
             errors.append(f"redis clock: {exc!r}")
+        suspects = {k: v.get("suspect") for k, v in clock.items() if isinstance(v, dict) and v.get("suspect")}
+        if suspects:
+            meta["clock_skew_suspected"] = suspects
     elif gateway_dump or controller_ticks:
         errors.append("no redis client: gateway docs and controller ticks not captured")
     meta["errors"] = errors
@@ -1193,10 +1370,11 @@ def capture_after_cell(
 def backfill_cell(
     cell_dir: Path, redis_client: Any, *, now_ms: Callable[[], int] = lambda: int(time.time() * 1000),
 ) -> Optional[dict]:
-    """Re-dump the incomplete redis dumps of one cell over the same range; returns the
-    backfill record (also appended to ``cell_meta.json["backfills"]``), None when the cell
-    was already complete. A re-dump that would lose members (retention) keeps the old
-    file and says so."""
+    """Re-dump the incomplete redis dumps of one cell over the same ranges (the clock
+    shifts measured after the cell are reused); returns the backfill record (also
+    appended to ``cell_meta.json["backfills"]``), None when the cell was already complete.
+    A re-dump that would lose a row of the existing file (retention) keeps the old file
+    and says so."""
     cell_dir = Path(cell_dir)
     meta = json.loads((cell_dir / CELL_META).read_text(encoding="utf-8"))
     layout = CellLayout(cell_dir.parent.parent, meta["stem"], meta["cell_id"])
@@ -1207,18 +1385,23 @@ def backfill_cell(
     if not (todo_gw or todo_ct):
         _write_meta_and_marker(layout, meta)
         return None
-    lo, hi = dump_range_ms(meta["start_ms"], meta["end_ms"], meta["window_ms"])
     record: dict[str, Any] = {"at_utc": utc_iso(), "redis_clock": clock_probe(redis_client, now_ms)}
     if todo_gw:
+        lo, hi = dump_range_ms(meta["start_ms"], meta["end_ms"], meta["window_ms"], _shift_of(meta, "gateway"))
         try:
             new = dump_gateway_docs(redis_client, layout, gd.get("pods") or [], lo_ms=lo, hi_ms=hi, previous=gd)
-            new["flush_wait"] = gd.get("flush_wait")
-            record["gateway_docs"] = {"before": gd.get("docs"), "last_round_before_ms": gd.get("last_round_ms"),
+            for key in ("flush_wait", "pods_in_set", "gateway_instances"):
+                if key in gd:
+                    new[key] = gd[key]
+            record["gateway_docs"] = {"docs_before": sum(sum(v.values()) for v in (gd.get("docs") or {}).values()),
+                                      "docs_after": sum(sum(v.values()) for v in new["docs"].values()),
+                                      "last_round_before_ms": gd.get("last_round_ms"),
                                       "last_round_after_ms": new.get("last_round_ms")}
             meta["gateway_redis_dump"] = new
         except NotASuperset as exc:
             record["gateway_docs_kept"] = str(exc)
     if todo_ct:
+        lo, hi = dump_range_ms(meta["start_ms"], meta["end_ms"], meta["window_ms"], _shift_of(meta, "controller"))
         try:
             new = dump_controller_ticks(redis_client, layout, meta["model"], lo_ms=lo, hi_ms=hi, previous=ct)
             record["controller_ticks"] = {"members_before": ct.get("members"), "members_after": new["members"]}
@@ -1273,8 +1456,10 @@ def backfill_pending(
         for cell in cells:
             try:
                 m = json.loads((cell / CELL_META).read_text(encoding="utf-8"))
-                tails.append(tail_ms(m["end_ms"], m["window_ms"]))
-            except (OSError, ValueError, KeyError):
+                rml = (((m.get("clock") or {}).get("probe_before") or {}).get("redis_minus_local_ms") or 0.0)
+                # the cell's tail in redis's clock (the driver's end plus redis's offset)
+                tails.append(tail_ms(m["end_ms"], m["window_ms"], int(round(rml))))
+            except (OSError, ValueError, KeyError, TypeError):
                 continue
         target = (max(tails) + 2 * SCRAPE_INTERVAL_MS) if tails else None
         deadline = monotonic() + wait_s

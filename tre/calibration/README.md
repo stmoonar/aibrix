@@ -64,28 +64,41 @@ files for either layout (old runs: the new entries are empty).
   yields the full state per second.
 * **`gateway_redis_dump/{hist,inst}/*.jsonl`** (`tre.gateway_redis_dump/v1`): header, then
   `{"score": round stamp ms, "doc": <the doc as the gateway wrote it>}` for every doc of
-  the model's pods (`tre:v2:pods:<model>`, sleeping residents included - the controller
-  reads them too) with score in `[start - window - 10 s, end + window + 10 s]`. After the
-  cell's load has drained the driver waits (at most one round + 2 s,
-  `--gateway-flush-wait-s`) for the gateway's next write. The gateway stamps a round
-  `now - now % 10 s` but its ticker runs at an arbitrary phase:
-  `cell_meta.json.gateway_redis_dump.flush_wait.write_phase_ms` (redis TIME when the new
-  round was first seen minus its stamp, resolution 250 ms) is that phase.
-  `redis_clock_before/after` bracket redis `TIME` with the driver's clock.
+  the model's pods with score in `[start - window - 10 s, end + window + 10 s]`. The pods
+  are those of `tre:v2:pods:<model>` that still write (the set is never pruned; sleeping
+  residents are included - the controller reads their docs too); `pods_in_set` counts the
+  rest.
 * **`controller_ticks.jsonl`** (`tre.controller_ticks/v1`): header, then every member of
   the controller's decision history whose `window_end_ms` is in the same range: `trs`
   (TSS after the EMA), `trs_z_m` (`trs / theta_m`), `z_m` (active signal's Z), `state`
-  (band), `window_end_ms`, `y_m`, `q_ctl`, replicas, plus `tss_raw` and `tss_raw_source`.
-  The rescue and the fairness loop may both write a member for one window; dedup by
-  `window_end_ms`.
+  (band), `window_end_ms`, `y_m`, `q_ctl`, replicas, plus `tss_raw` and `tss_raw_source`
+  (like `trs`, a raw TSS of 0.0 also marks an idle / undefined window). The rescue and the
+  fairness loop may both write a member for one window; dedup by `window_end_ms`.
+* **Clocks.** `start_ms` / `end_ms` are the driver's clock; the gateway stamps its rounds
+  (`now - now % 10 s`) and the controller its windows with their own clocks, and the
+  nodes may disagree (75 runs ~160 s ahead of 76). `cell_meta.json["clock"]` records redis
+  `TIME` bracketed by the driver's clock (`probe_before/after`), each source's newest
+  stamp and lag behind redis `TIME`, and the gateway's *write phase* (redis `TIME` when a
+  new round was first seen minus its stamp, resolution 250 ms: the ticker's arbitrary
+  phase plus any gateway-vs-redis offset). A source whose stamps run ahead of redis, or
+  whose write phase lies outside one round, is taken as skewed: its offset is estimated
+  to within half a round, its range and tail are shifted by it (`shift_ms`), and
+  `clock_skew_suspected` says so. A source far *behind* is only flagged (a stale source
+  looks the same). The write phase is measured by waiting (at most one round + 2 s,
+  `--gateway-flush-wait-s`) for the gateway's next write after a cell, once per hour and
+  gateway instance set (`tre:v2:gw:instances`; cached in `cells/.gateway_write_phase.json`,
+  `--gateway-phase-cache-s`).
 * **Completeness and backfill.** Right after a cell the controller has not yet processed
-  the windows ending up to one window later (`tail_ms` in `cell_meta.json`), so both dumps
-  are usually cut short: they are marked `complete: false` and the cell directory gets a
+  the windows ending up to one window later (`tail_ms` of each dump), so both dumps are
+  usually cut short: they are marked `complete: false` and the cell directory gets a
   `BACKFILL_PENDING` marker. The next cell's driver re-dumps every pending cell before it
   starts its load, and the campaign's finalize does the last one (waiting at most 90 s);
   by hand: `python -m scripts.calibration_capture backfill <run dir> --redis-url <url>`
-  (within 30 min for the gateway docs, ~24 h for the controller history). A re-dump only
-  replaces a file with a superset of it; every re-dump is logged in `cell_meta.json["backfills"]`.
+  (within 30 min for the gateway docs, ~24 h for the controller history). A re-dump
+  replaces a file only when every row of the old file is still in redis (otherwise the old
+  file is kept and the backfill record says why); every re-dump is logged in
+  `cell_meta.json["backfills"]`. Because the backfill may run after a set is sealed, the
+  M / T14 seals (`sha256sums`) exclude `cells/`.
 
 ### Controller ticks: no polling, one read-only field
 
@@ -102,14 +115,20 @@ deployed, `tss_raw` is derived as `y_m / q_ctl` (factor 1, the serving-window pa
 
 ### Cost
 
-Measured on a 60 s, 1 rps cell (one 7b pod, 8 pods in the model's gateway set): vLLM
-metrics 73 KB (median row 1.3 KB, keyframe 3.2 KB), gateway docs 209 KB (hist ~2.2 KB,
-inst ~0.33 KB per pod and round), controller ticks 4 KB, `cell_meta.json` 19 KB; parsing
-costs ~1.3 ms per scrape. A full 12 h, 3-model campaign adds roughly 0.4-0.7 GB (vLLM
-metrics 0.2-0.4 GB at 1.3-3.2 KB/s per pod, gateway docs ~0.3 GB for ~20 ready pods,
-the rest < 20 MB) against ~3.5 GB of existing output. The gateway flush wait adds on
-average ~5 s (at most 12 s) per cell, the backfill well under a second.
+Measured on a 60 s, 1 rps cell (one 7b pod, 8 pods with docs in the model's gateway set):
+vLLM metrics 73 KB (median row 1.3 KB, keyframe 3.2 KB), gateway docs 209 KB (hist
+~2.2 KB, inst ~0.33 KB per pod and round), controller ticks 4 KB, `cell_meta.json`
+19 KB; parsing costs ~1.3 ms per scrape. A full 12 h, 3-model campaign adds roughly
+0.4-0.7 GB (vLLM metrics 0.2-0.4 GB at 1.3-3.2 KB/s per pod, gateway docs ~0.3 GB for
+~20 ready pods, the rest < 20 MB) against ~3.5 GB of existing output. Time: the write
+phase wait (~5 s, at most 12 s) runs once per hour, the backfill takes well under a
+second per cell.
 
-Nothing in the capture can fail or void a cell: errors are recorded in
-`cell_meta.json["errors"]`. `calibration_campaign --no-capture-extras` turns it off;
-`r3_grid` captures only with `--capture-dir`.
+### Switches
+
+Every entry point of `calibration_campaign` (ladder, primitives, boundary / training
+supplement, M acceptance set, T14) captures by default through `campaign.cell_command`;
+`--no-capture-extras` turns it off for all of them. `r3_grid` alone captures only with
+`--capture-dir` (`--no-vllm-metrics-capture`, `--no-gateway-dump`,
+`--no-controller-ticks` drop one part). Nothing in the capture can fail or void a cell:
+errors are recorded in `cell_meta.json["errors"]`.

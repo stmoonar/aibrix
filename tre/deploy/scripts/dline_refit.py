@@ -2377,6 +2377,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if args.freeze_file is None:
             ap.error(f"{args.stage} needs --freeze-file")
         if args.stage == "accept":
+            if win != DEFAULT_WINDOWING:
+                # accept scores with the windowing recorded in the freeze, never the command line's
+                print(f"WARNING: accept ignores the windowing flags ({win}); it uses the windowing "
+                      "recorded in the freeze")
             return stage_accept(args.freeze_file, args.dataset, args.m_manifest, recheck=args.recheck,
                                 n_resamples=args.accept_resamples, command=command)
         try:

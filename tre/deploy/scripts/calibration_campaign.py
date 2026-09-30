@@ -1917,13 +1917,15 @@ def finalize_run(out_dir: Path, *, status: str, exit_code: int, redis_url: Optio
     rebuilt by hand (``python -m scripts.calibration_dataset <run>``); a failure here
     must not turn a finished campaign into a failed one.
 
-    With ``redis_url``, first completes the redis dumps of the last cell(s)
+    First completes the redis dumps of the last cell(s)
     (:func:`scripts.calibration_capture.backfill_pending`, waiting at most
-    ``DEFAULT_FINAL_BACKFILL_WAIT_S`` for the controller to process their tail windows);
+    ``DEFAULT_FINAL_BACKFILL_WAIT_S`` for the controller to process their tail windows),
+    through ``redis_url`` or, like ``r3_grid``, the in-cluster default;
     ``python -m scripts.calibration_capture backfill`` does the same by hand.
     """
     out_dir = Path(out_dir)
-    if redis_url and capture.pending_cells(out_dir):
+    if capture.pending_cells(out_dir):
+        redis_url = redis_url or capture.DEFAULT_REDIS_URL
         try:
             import redis  # type: ignore[import-not-found]
 
@@ -1934,8 +1936,9 @@ def finalize_run(out_dir: Path, *, status: str, exit_code: int, redis_url: Optio
             print(f"capture backfill: {len(done)} cell(s) re-dumped, "
                   f"{len(capture.pending_cells(out_dir, max_age_s=None))} still pending")
         except Exception as exc:  # noqa: BLE001 - see docstring
-            print(f"WARNING: capture backfill failed ({exc!r}); run python -m "
-                  f"scripts.calibration_capture backfill {out_dir} --redis-url <url>")
+            print(f"WARNING: capture backfill via {redis_url} failed ({exc!r}); "
+                  f"{len(capture.pending_cells(out_dir, max_age_s=None))} cell(s) still pending: run "
+                  f"python -m scripts.calibration_capture backfill {out_dir} --redis-url <url>")
     (out_dir / CAMPAIGN_STATUS_FILE).write_text(
         json.dumps(
             {"status": status, "exit_code": exit_code, "finished_at_utc": utc_iso()},

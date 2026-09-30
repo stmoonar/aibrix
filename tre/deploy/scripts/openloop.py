@@ -1243,19 +1243,24 @@ def make_pod_metrics_sampler(
         totals = {key: 0.0 for key in (gauges or POD_INSTANT_GAUGES)}
         errors = 0
         kv: list[float] = []
+        # the recorder's parse runs after every pod was fetched, so it never delays the
+        # next pod's scrape (the queue sample keeps its single instant)
+        handed: list[tuple] = []
         for url in endpoints:
             try:
                 body = fetch(url)
             except Exception as exc:  # noqa: BLE001 - a dead pod must not kill the sidecar
                 errors += 1
-                _hand("record_error", url, now_ms, repr(exc))
+                handed.append(("record_error", url, now_ms, repr(exc)))
                 continue
-            _hand("record", url, now_ms, body)
+            handed.append(("record", url, now_ms, body))
             for key, value in parse_pod_gauges(body, gauges).items():
                 totals[key] += value
             usage = parse_pod_kv_cache_usage(body)
             if usage is not None:
                 kv.append(usage)
+        for call in handed:
+            _hand(*call)
         totals["scrape_errors"] = float(errors)
         totals["pods_scraped"] = float(len(endpoints) - errors)
         totals[KV_CACHE_USAGE_KEY] = (sum(kv) / len(kv)) if kv else None
