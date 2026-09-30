@@ -26,22 +26,25 @@ TP4 模型预留整节点；排序 `(split_cost, address, index)` 又按自然�
 
 ## 3. 排序键
 
+> 2026-09-30（S5）起的排序键如下；2026-09-28 版本的 `node_block_load` 键已删除，见文末第 7 节。
+
 放置（每个空闲候选块，最小者胜）：
 
-`(violation, node_block_load_after, same_model_on_node, split_cost_capped, node_gpu_load_after, address, index)`
+`(violation, split_cost_capped, node_eff_load_after, same_model_on_node, address, index)`
 
 - `violation = max(0, reserve − 放置后剩余的空闲 max_order 块数)`：集群处于/低于预留线时，不消耗空闲对的
-  候选优先；高于预留线时为 0，由节点均衡决定。
-- `node_block_load_after`：放置后该节点 max_order 对齐组中"非全空"的比例。**按预留粒度计量是有意的**：
-  填满半用对的另一半不增加节点负载，所以 TP1 副本会两两成对；若用朴素的 GPU 占用比例，TP1 副本会
-  一个对放一个，把每个 TP2 能用的对都打散。`max_order == 0` 时退化为 GPU 比例。
+  候选优先；高于预留线时为 0。
+- `split_cost_capped`：候选块所在最大空闲块的阶数（封顶 max_order）减去块阶数（碎卡优先少）。它排在负载
+  之前，所以 TP1 副本总是先填半用对的另一半，不会一个对放一个把 TP2 能用的对都打散（原来靠按预留粒度
+  计量的 `node_block_load` 做到这一点）。
+- `node_eff_load_after`：放置后该节点的 GPU 占用比例 + registry `placement.placement_penalty[节点名]`
+  （跑负载生成器 / 控制面的节点可以配一个惩罚，节点名只出现在 registry 里）。
 - `same_model_on_node`：同模型已在该节点占用的 GPU 数（把一个模型的副本分散到不同节点）。
-- `split_cost_capped`：候选块所在最大空闲块的阶数（封顶 max_order）减去块阶数。
-- `node_gpu_load_after`、`address`（自然序 node, base GPU）：稳定的最后兜底。
+- `address`（自然序 node, base GPU）：稳定的最后兜底。
 
-释放（该模型持有的块，最大者胜，与放置对称）：
+释放（该模型持有的块，最大者胜，与放置互为镜像）：
 
-`(merge_gain_capped, node_block_load, same_model_on_node, node_gpu_load, address)`
+`(merge_gain_capped, node_eff_load, same_model_on_node, address, -index)`
 
 2 节点 × 4 卡、A/B tp1、C tp2、reserve 1，从空集群依次唤醒 A,B,C,A,B：
 A→n1:0，B→n1:1（与 A 共用一对），C→n2:0-1，A→n2:2（同模型分散），B→n2:3（不去碰最后一个空闲对 n1:2-3）。
@@ -71,7 +74,11 @@ registry `placement.defrag.enabled: false`（默认）：
 `generate_baseline(registry)`：按 registry 模型顺序、每模型一个副本，在空集群上用同一策略在 registry 渲染出的
 binding 中放置，返回 `model -> binding_id`，运行时经 SM 状态解析为 serve_id。显式覆盖：manifest 的
 `baseline:`（serve_id 或 binding_id），或 CLI `--baseline MODEL=ID`（可重复），`--registry` 指定 registry 文件。
-当前 registry 生成：7b→node9:0，8b→node9:1，14b→node10:0,1。
+当前 registry 生成：7b→node9:0，8b→node9:1，14b→node10:0,1（2026-09-30 的新排序键下不变）。
+
+`campaign_queue.py --manifest M --freeze-baseline`（2026-09-30）：manifest 还没有 `baseline:` 时，把生成的
+基线连同来源（`baseline_frozen`）写进 manifest 后退出；之后两臂都用这份固定布局，不随排序键或
+`placement_penalty` 的变化漂移。已有 `baseline:` 的 manifest 不会被覆盖。
 
 **警告：历史 campaign 的基线全部在 node9（7b gpu0、8b gpu1、14b gpu2-3），且历史运行期间放置策略是
 整节点打包。用新基线 / 新策略跑出的结果与历史实验在布局上不可比，不能直接并表对比；需要可比时用
@@ -89,3 +96,27 @@ controller restart 只重启 controller，两者都要重启，否则 controller
 不超过 binding 布局支持的 `MAX_SUPPORTED_TP_SIZE = 2`）。registry 加载时即拒绝（SM、controller、UI 都经它加载），
 `validate()`、SM `SlotAllocator`、`bindings.feasible_slots` 与 `placement_policy_from_registry`
 （后者只用 2 的幂 + 最宽节点这条通用规则）同规则报错；SM 不再对不支持的 tp_size 静默退回 best-fit。
+
+## 7. 2026-09-30 更新：选卡与并行唤醒（S1–S6）
+
+分支 `feat/placement-parallel-wake-20260930`。
+
+- **S1 唤醒门**：gpu-truth 样本在 Redis TTL 内即可用，不再等新采样；早于本 SM 在该卡上最后一次 power
+  变更（sleep commit、wake、启动、删除；每次变更发一个 refresh 请求并记下样本必须回应的 `refresh_seq`）
+  的样本不可信。可信且超过唤醒阈值 → 409 `gpu_busy`；缺失 / 不可信 → 探测同卡其它居民的
+  `/is_sleeping`：全睡 → 放行，有醒着的 → `resident_awake`，读不到 → `resident_loading`
+  （节点整体没有样本时 `truth_unavailable`，节点级）。冷启动门仍等新样本。
+- **S2 启动占位**：启动准入的 `starting` lease 不再 120 s 过期，一直持有到 Pod 收敛或 Pod 消失
+  （orphan reaper 释放）；唤醒账面把其它 binding 的任何有效 lease 视为占用。
+- **S3 结构化 409**：`{detail, error, reason, binding_id, node, gpu_ids, scope, blocking_binding_id,
+  retry_after_s}`；controller 解析后对该卡冷却 `placement.wake_cooldown.gpu_s`（默认 30 s），节点级
+  拒绝冷却整个节点 `node_s`（默认 60 s），下一 tick 换卡（事件 `gpu_cooldown` / `wake_refused` /
+  `placement_retry`）。旧 SM 的纯文本 409 仍按原样重试、不冷却。
+- **S4 补偿睡眠**：唤醒失败但引擎实际醒了 → 经 sleep primitive（path repair）补发 sleep 并确认。
+- **S5 选卡**：纯容量唤醒由 SM 选卡（planner 的 pod 只是 hint），不可行时 SM 自己换卡并在响应
+  `picked` 里回传；同卡接力仍由 planner 指定。`/v2/state` 增加 `gpus[]`（wakeable、reason、占用者、
+  truth_source、truth_age_s）与 `nodes{}`；planner 只把 wakeable 的卡算作容量。
+- **S6 三段唤醒**：锁内（账面、lease、journal、desired 意图）→ 锁外并发 `/wake_up` + `/is_sleeping` →
+  锁内提交；`tre:v2:sm:wake_ops` journal 供崩溃恢复（启动时与 supervisor 每轮）。观测：`GET /v2/wake`、
+  JSON 日志事件 `wake_start/wake_done/wake_failed/gpu_truth_fallback/startup_placeholder`，
+  ops 记录 `details` 带 binding、placement、truth_source、phases_ms、error_code、compensating_sleep。
