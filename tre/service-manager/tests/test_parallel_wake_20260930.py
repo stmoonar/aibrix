@@ -76,7 +76,7 @@ def _leases(world):
 # ------------------------------------------------------------ concurrency
 
 
-def test_two_wakes_of_one_request_run_concurrently_and_without_the_writer_lock():
+def test_parallel_wake_two_wakes_of_one_request_run_concurrently_and_without_the_writer_lock():
     world = _sleeping_pair()
     stats = _slow_wakes(world)
 
@@ -96,7 +96,7 @@ def test_two_wakes_of_one_request_run_concurrently_and_without_the_writer_lock()
     assert {p["serve_id"]: tuple(p["gpu_ids"]) for p in result["picked"]} == {"pod-a": (0,), "pod-b": (1,)}
 
 
-def test_a_wake_on_another_gpu_proceeds_while_the_first_one_is_running():
+def test_parallel_wake_a_wake_on_another_gpu_proceeds_while_the_first_one_is_running():
     world = _sleeping_pair()
     seen = {}
 
@@ -112,7 +112,7 @@ def test_a_wake_on_another_gpu_proceeds_while_the_first_one_is_running():
     assert _leases(world) == {"m1/node-a/0": "awake", "m1/node-a/1": "awake"}
 
 
-def test_the_waking_lease_keeps_other_writers_off_the_same_gpu():
+def test_parallel_wake_the_waking_lease_keeps_other_writers_off_the_same_gpu():
     world = _world(
         [
             pod("pod-a", "m1", (0,), ip="10.0.0.1", state="sleeping"),
@@ -156,7 +156,7 @@ def test_the_waking_lease_keeps_other_writers_off_the_same_gpu():
 # ------------------------------------------------------------ failures
 
 
-def test_a_failed_wake_outside_the_lock_is_rolled_back_in_the_commit_phase():
+def test_parallel_wake_a_failed_wake_outside_the_lock_is_rolled_back_in_the_commit_phase():
     world = _sleeping_pair()
     world.vllm.wake_up = lambda pod_ip, *, port=None: Result(False, "cuda oom")
 
@@ -170,7 +170,7 @@ def test_a_failed_wake_outside_the_lock_is_rolled_back_in_the_commit_phase():
     assert world.store.load().bindings[0].awake is False
 
 
-def test_one_failed_wake_of_a_request_keeps_the_other_awake():
+def test_parallel_wake_one_failed_wake_of_a_request_keeps_the_other_awake():
     world = _sleeping_pair()
     original = world.vllm.wake_up
 
@@ -214,7 +214,7 @@ def _crash_after_prepare(world, serve_id):
     return binding, fresh
 
 
-def test_recovery_completes_a_wake_that_happened_before_the_crash():
+def test_parallel_wake_recovery_completes_a_wake_that_happened_before_the_crash():
     world = _sleeping_pair()
     binding, fresh = _crash_after_prepare(world, "pod-a")
     world.vllm.sleeping["10.0.0.1"] = False  # /wake_up went through
@@ -229,7 +229,7 @@ def test_recovery_completes_a_wake_that_happened_before_the_crash():
     assert world.journal.entries() == {}
 
 
-def test_recovery_rolls_back_a_wake_that_never_happened():
+def test_parallel_wake_recovery_rolls_back_a_wake_that_never_happened():
     world = _sleeping_pair()
     binding, fresh = _crash_after_prepare(world, "pod-a")
     assert world.desired()["m1/node-a/0"][0] == "awake"  # the intent of phase 1
@@ -242,7 +242,7 @@ def test_recovery_rolls_back_a_wake_that_never_happened():
     assert world.journal.entries() == {}
 
 
-def test_recovery_keeps_an_entry_whose_pod_cannot_be_read():
+def test_parallel_wake_recovery_keeps_an_entry_whose_pod_cannot_be_read():
     world = _sleeping_pair()
     binding, fresh = _crash_after_prepare(world, "pod-a")
     world.vllm.physical_override["10.0.0.1"] = None
@@ -256,7 +256,7 @@ def test_recovery_keeps_an_entry_whose_pod_cannot_be_read():
         fresh.put_model_target("m1", wake_replicas=2)
 
 
-def test_recovery_never_touches_a_wake_this_process_is_running():
+def test_parallel_wake_recovery_never_touches_a_wake_this_process_is_running():
     world = _sleeping_pair()
     seen = {}
     _slow_wakes(world, during=lambda ip: seen.setdefault("recovery", world.service.recover_wake_journal()))
@@ -267,7 +267,7 @@ def test_recovery_never_touches_a_wake_this_process_is_running():
     assert _leases(world) == {"m1/node-a/0": "awake"}
 
 
-def test_a_commit_without_the_writer_lock_is_left_to_the_recovery():
+def test_parallel_wake_a_commit_without_the_writer_lock_is_left_to_the_recovery():
     world = _world(
         [pod("pod-a", "m1", (0,), ip="10.0.0.1", state="sleeping")],
         [_desired("m1/node-a/0", "m1", (0,), "sleeping")],

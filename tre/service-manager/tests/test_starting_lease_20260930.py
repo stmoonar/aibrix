@@ -23,7 +23,7 @@ from test_review4_sm import _deployment_name, _gate_world
 LOAD_S = 130  # a cold load longer than the old 120 s starting TTL
 
 
-def test_starting_lease_never_expires_by_default_waking_still_does():
+def test_startup_placeholder_lease_never_expires_by_default_waking_still_does():
     redis = FakeRedis()
     leases = GpuLeaseStore(redis)
     starting = Binding("new", "tp2", Slot("node-a", (0, 1)), awake=False)
@@ -58,7 +58,7 @@ def _admitted_world():
     return world
 
 
-def test_admission_takes_a_starting_lease_that_outlives_a_long_cold_load():
+def test_startup_placeholder_outlives_a_long_cold_load():
     world = _admitted_world()
 
     (lease,) = world.leases.load()
@@ -67,7 +67,7 @@ def test_admission_takes_a_starting_lease_that_outlives_a_long_cold_load():
     assert world.service._transient_lease_ids() == {"tp2/node-a/0,1"}
 
 
-def test_a_same_gpu_wake_is_refused_after_a_long_cold_load_without_gpu_truth():
+def test_loading_placeholder_refuses_a_same_gpu_wake_without_gpu_truth():
     world = _admitted_world()
     assert world.service._gpu_truth is None  # nothing but the account can stop it
     world.redis.now_ms += LOAD_S * 1000
@@ -81,7 +81,7 @@ def test_a_same_gpu_wake_is_refused_after_a_long_cold_load_without_gpu_truth():
     assert world.desired()["m1/node-a/0"][0] == "sleeping"  # intent rolled back
 
 
-def test_the_convergence_restore_path_is_refused_the_same_way():
+def test_loading_placeholder_refuses_the_convergence_restore_path():
     world = _admitted_world()
     world.redis.now_ms += LOAD_S * 1000
 
@@ -91,7 +91,7 @@ def test_the_convergence_restore_path_is_refused_the_same_way():
     assert not any(call[0] == "wake_up" for call in world.vllm.calls)
 
 
-def test_planning_skips_a_lease_blocked_binding_and_wakes_another():
+def test_loading_placeholder_planning_wakes_another_binding():
     world = _gate_world(
         [
             pod("pod-r", "m1", (0,), ip="10.0.0.1", state="sleeping"),

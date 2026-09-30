@@ -41,6 +41,25 @@ placement:
     # default, as in v1. While off, the service-manager POST /v2/defrag also refuses
     # (409) unless the request body carries force: true.
     enabled: false
+  # The keys below (2026-09-30) are shown commented out with their built-in
+  # defaults: components older than that release refuse unknown placement keys,
+  # so set them only once the controller, the service-manager and the UI run a
+  # release that knows them.
+  #
+  # Extra load (a fraction of the node, >= 0) added to a node's GPU load when
+  # ranking wakes / creates: a node that also runs the load generator or the
+  # control plane fills later and is released earlier. Keys are cluster.nodes
+  # names. Default: no penalty.
+  # placement_penalty:
+  #   <node name>: 0.25
+  # After the service-manager refused or failed a wake on a GPU (structured 409),
+  # the controller keeps that GPU out of wake planning for gpu_s seconds, or the
+  # whole node for node_s after a node-scope refusal (no gpu-truth for the node
+  # and a resident unverifiable). The service-manager reports the same values
+  # as retry_after_s.
+  # wake_cooldown:
+  #   gpu_s: 30
+  #   node_s: 60
 models:
 - name: dsqwen-7b
   weights_path: /data/nfs_shared_data/DeepSeek-R1-Distill-Qwen-7B
@@ -356,6 +375,16 @@ service_manager:
   startup_admission:
     gate_seen_s: 30
     drift_grace_s: 600
+  # 2026-09-30 (commented out: older service-managers ignore them, but keep the
+  # defaults visible). The operation journal (tre:v2:sm:operations) keeps at
+  # most max_records finished records, oldest dropped first.
+  # operations:
+  #   max_records: 20000
+  # Acceptance-test fault hooks: while true, the keys
+  # tre:v2:sm:fault:refuse_wake:<node>/<gpu> (409 gpu_busy) and
+  # tre:v2:sm:fault:fail_wake:<node>/<gpu> (the wake fails after /wake_up) are
+  # honoured. Default false: the keys are never read.
+  # test_hooks: false
   sleep:
     # Every sleep runs hide (routable=false + route-gen bump) -> gateway plugin ack
     # -> drain -> /sleep (D1/D2); no caller can skip a step, except that the paths in

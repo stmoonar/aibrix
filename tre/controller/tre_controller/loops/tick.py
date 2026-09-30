@@ -209,6 +209,9 @@ def run_planner_tick(
         cooldowns=_action_cooldowns(snapshot, queue) if action_cooldown else None,
         # P2-6: independent of TRE_ACTION_COOLDOWN (its own switch is the tick count).
         floor_holds=_floor_held_models(queue),
+        # S3: GPUs / nodes the SM recently refused a wake on (placement.wake_cooldown).
+        unavailable_gpus=_cooled_gpus(queue, registry),
+        refusals=_recent_refusals(queue),
         probe_backoff_models=_probe_backoff_models(safescale, snapshot.ts_ms),
         preemptible_models=_preemptible_models(queue) if rescue_due else None,
     )
@@ -229,6 +232,8 @@ def run_planner_tick(
         _safescale_ns = time.perf_counter_ns() - _phase_t0
         _phase_t0 = time.perf_counter_ns()
     queue_events = _defrag_blocking_events(queue, actions) if rescue_due else ()
+    # S3: gpu_cooldown / wake_refused / placement_retry recorded by the queue.
+    queue_events = tuple(queue_events) + tuple(_drain_queue_events(queue))
     if actions:
         queue.submit(actions)
     if _prof_on:
@@ -292,6 +297,30 @@ def _preemptible_models(queue: PlannerQueue) -> set[str]:
 def _probe_backoff_models(safescale: SafeScaleController | None, now_ms: int) -> set[str]:
     backoff = getattr(safescale, "rollback_backoff_models", None)
     return set(backoff(now_ms)) if callable(backoff) else set()
+
+
+def _cooled_gpus(queue: PlannerQueue, registry: Registry) -> set[tuple[str, int]]:
+    """S3: GPUs whose wake the SM refused recently (ActionQueue cooldowns); a
+    node-scope refusal cools every GPU of the node."""
+    gpus_of = getattr(queue, "cooled_gpus", None)
+    nodes_of = getattr(queue, "cooled_nodes", None)
+    cooled = set(gpus_of()) if callable(gpus_of) else set()
+    nodes = set(nodes_of()) if callable(nodes_of) else set()
+    if nodes:
+        for node in registry.topology().nodes:
+            if node.name in nodes:
+                cooled.update((node.name, gpu) for gpu in range(int(node.gpus)))
+    return cooled
+
+
+def _recent_refusals(queue: PlannerQueue) -> dict[str, str]:
+    refusals = getattr(queue, "recent_refusals", None)
+    return dict(refusals()) if callable(refusals) else {}
+
+
+def _drain_queue_events(queue: PlannerQueue) -> list[str]:
+    drain = getattr(queue, "drain_events", None)
+    return list(drain()) if callable(drain) else []
 
 
 def _floor_held_models(queue: PlannerQueue) -> set[str]:
