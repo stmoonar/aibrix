@@ -81,8 +81,8 @@ Old = `dcb8d5f3` (git archive), new = this branch; both driven by the same harne
   bodies and identical headers** (all SDK headers included); every non-clock field of
   every v1 record identical (success, status, tokens, finish reason, error message,
   `stream_interrupted` / `stream_error`, attempts, target pod); v1 formulas hold on every
-  new record. Clock fields: the old client's TTFT was longer by 125 ms median (270 ms max)
-  and E2E by 221 ms median — its blocking hand-off, not the server.
+  new record. Clock fields: the old client's TTFT was longer by 125 ms median (max 0.27 s /
+  0.67 s in two runs) and E2E by ~220 ms median — its blocking hand-off, not the server.
 
 * **gateway check** (3 single requests to dsqwen-7b through the tre-v2 gateway, no load
   running): new `calib` and `e1_v1` and the old calibration sender all answered 200 with
@@ -165,7 +165,7 @@ local fake server unless it says otherwise.
 | item | v1 | unified client | impact |
 |---|---|---|---|
 | processes / coroutines | `process_count` (v14 configs: 8) processes, each `asyncio.run` + one `AsyncOpenAI` | same model: `e1_v1` uses the config's `process_count`; `calib` 4 (`--sender-processes`); `replay` 1 | none |
-| hand-off | the main process puts the next 5 s window of requests on the least-loaded worker's `mp.Queue` every 0.5 s (first window split evenly); the worker reads it with a **blocking `Queue.get(timeout=0.1)` inside its event loop** | schedule pre-sharded round-robin before the fork; one "go" with a shared monotonic start; each worker fires at absolute times; nothing blocks a loop; records return over a pipe | v1: TTFT +125 ms median (270 max), E2E +221 ms median on 39 scenario requests; under load 0.3-1.1 s TTFT overhead (table above) |
+| hand-off | the main process puts the next 5 s window of requests on the least-loaded worker's `mp.Queue` every 0.5 s (first window split evenly); the worker reads it with a **blocking `Queue.get(timeout=0.1)` inside its event loop** | schedule pre-sharded round-robin before the fork; one "go" with a shared monotonic start; each worker fires at absolute times; nothing blocks a loop; records return over a pipe | v1: TTFT +125 ms median (max 0.27-0.67 s), E2E +~220 ms median on 39 scenario requests; under load 0.3-1.1 s TTFT overhead (table above) |
 | start instant | `base_time = time.time()` right after starting the workers | 0.25 s after every worker built its client | v1's first requests could fall before its workers were ready |
 | HTTP library / pool | openai SDK -> httpx, 1000 connections / 100 keep-alive / 5 s expiry, one pool per process | `e1_v1`: the same SDK client (optionally sharded, off by default); `calib`/`replay`: raw httpx, keep-alive, 64-connection pool shards up to `max_in_flight` (the old calibration sender: urllib, a new connection per request, `Connection: close`) | request bytes unchanged; transport headers differ for calib (`User-Agent: python-httpx`, `Connection: keep-alive`; `Accept-Encoding: identity` kept) |
 | request, `e1_v1` | `chat.completions.create(model, messages=[user prompt], temperature=config (null), stream, stream_options.include_usage, max_tokens = trace's else config's)`, no `ignore_eos`; headers `routing-strategy: least-gpu-cache`, `Authorization: Bearer dummy-key-for-local-gateway`, SDK `X-Stainless-*` | identical (same SDK call) | server saw byte-identical bodies and identical headers |
