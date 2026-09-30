@@ -85,8 +85,8 @@ usage-only closing chunk are not tokens. Every request records this basis as
 `ttft_basis: first_chunk_with_text` (sender row, raw log, guard artifact). TPOT stays the
 client-side `(e2e - TTFT) / (completion_tokens - 1)` with `completion_tokens` from `usage`.
 
-The E1 client (`tre/loadgen_v1`, `client_dispatcher.py`) uses another TTFT basis: it
-stamps the first chunk whose `delta.content is not None`, and the role-only opening chunk
+The E1 client (`tre/loadgen_v1`, profile `e1_v1`) reports v1's TTFT basis in its v1
+columns: it stamps the first chunk whose `delta.content is not None`, and the role-only opening chunk
 has `content: ""`, so its TTFT ends at the role chunk. vLLM emits that chunk in the same
 engine iteration as the first token's text, so the two bases normally differ by the
 serialisation of one chunk; they differ by one decode step (or more) whenever the first
@@ -94,8 +94,10 @@ token's text is empty - a byte of a multi-byte character (the mixed corpus makes
 output likely), text the detokenizer holds back, or, with a reasoning parser, reasoning
 that arrives outside `content`. The calibration TTFT is therefore never shorter than
 E1's for the same request, and the TPOT of the two differs by the same amount spread over
-`completion_tokens - 1`. The E1 client is not changed; compare TTFTs across the two
-clients only with this in mind.
+`completion_tokens - 1`. Since 2026-09-30 both are profiles of one client
+(`tre_replayer`, see `tre/replayer/README.md`): the E1 client's `performance_metrics.json`
+keeps its v1-basis `ttft` / `tpot` and carries this basis next to them (`ttft_strict_s`,
+`tpot_strict_s`, `success_strict`); compare TTFTs across the two only on the same basis.
 
 The D6' label's idle-TTFT fit (`slo.ttft_idle_c_ms` / `_b_ms_per_token` in the registry)
 was fitted on completions-era data; under chat each `L` includes the 5 template tokens

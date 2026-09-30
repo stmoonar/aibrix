@@ -15,7 +15,12 @@ CustomTraceGenerator - 增强版负载测试系统
   --max-retries    OpenAI SDK 重试次数（默认 2，与 v1 硬编码值相同）
   --routing-strategy  routing-strategy 请求头（默认取配置，v1 配置均为 least-gpu-cache；传 "" 不发该头）
   --trace-file     直接重放 v1 记录的逐请求计划 traces.json（跳过阶段1生成）
-以及 performance_metrics.json 每行追加的审计字段（见 client_dispatcher.ResponseRecord）。
+以及 performance_metrics.json 每行追加的审计字段。
+
+[2026-09-30] 发送改由全项目唯一的发送客户端 tre_replayer（profile e1_v1）完成，本包只剩
+壳、配置、trace 生成与分析：请求内容与 v1 相同；并发模型仍是 process_count 个进程 ×
+asyncio，但 schedule 预先分片、按绝对时间发送（去掉 v1 事件循环里的阻塞交接）；每行在
+v1 字段与审计字段之后追加严格口径与发送迟到字段。差异表见 tre/replayer/README.md。
 
 用法（重放 v1 投稿时记录的 trace）:
   python3 -m tre_loadgen_v1 --stage all \\
@@ -30,7 +35,6 @@ import os
 import json
 import shutil
 import hashlib
-import asyncio
 import argparse
 from pathlib import Path
 from datetime import datetime
@@ -234,6 +238,9 @@ class CustomTraceGenerator:
                 "max_coroutines_per_process": self.config.client.max_coroutines_per_process,
                 "task_batch_window": self.config.client.task_batch_window,
                 "load_monitor_interval": self.config.client.load_monitor_interval,
+                # v1 的批调度参数：统一客户端预分片、按绝对时间发送，这三项不再起作用（仅记录）
+                "v1_dispatch_params_ignored": ["max_coroutines_per_process", "task_batch_window",
+                                               "load_monitor_interval"],
                 "models": [{"name": m.name, "max_tokens": m.max_tokens, "temperature": m.temperature}
                            for m in self.config.models],
                 "openai_version": openai.__version__,
@@ -308,14 +315,12 @@ class CustomTraceGenerator:
             # 创建客户端调度器
             dispatcher = ClientDispatcher(self.config_manager)
             
-            # 执行请求调度 - 使用asyncio.run调用异步方法
+            # 执行请求调度（统一客户端：多进程、预分片、按绝对时间发送）
             print(f"\n🚀 开始发送请求...")
-            
-            # 使用asyncio运行异步dispatch_traces方法
-            response_records = asyncio.run(dispatcher.dispatch_traces(traces))
-            
-            # 显示基础统计
-            success_count = sum(1 for r in response_records if r.success)
+            response_records = dispatcher.dispatch_traces(traces)
+
+            # 显示基础统计（v1 口径）
+            success_count = sum(1 for r in response_records if r["success"])
             error_count = len(response_records) - success_count
             success_rate = success_count / len(response_records) * 100 if response_records else 0
             
@@ -327,10 +332,13 @@ class CustomTraceGenerator:
             print(f"   性能指标文件: {output_paths['performance_metrics']}")
 
             # [v2 port] 审计汇总（v1 口径的 success 里有多少其实是流中途断开/经过重试）
-            interrupted = sum(1 for r in response_records if getattr(r, 'stream_interrupted', False))
-            retried = sum(1 for r in response_records if getattr(r, 'attempts', 0) > 1)
+            interrupted = sum(1 for r in response_records if r.get('stream_interrupted'))
+            retried = sum(1 for r in response_records if (r.get('attempts') or 0) > 1)
+            strict_ok = sum(1 for r in response_records if r.get('success_strict'))
             print(f"   [审计] 流中途断开但记为成功: {interrupted}")
             print(f"   [审计] 发生过重试的请求: {retried}")
+            print(f"   [严格口径] 成功请求数: {strict_ok}")
+            from tre_replayer.engine.metrics import summarize_v1_records
             self._write_run_meta(trace_file, output_paths, extra={
                 "summary": {
                     "expected_requests": len(traces),
@@ -339,8 +347,14 @@ class CustomTraceGenerator:
                     "failed": error_count,
                     "success_but_stream_interrupted": interrupted,
                     "retried_requests": retried,
-                    "total_attempts": sum(getattr(r, 'attempts', 0) for r in response_records),
-                }
+                    "total_attempts": sum(int(r.get('attempts') or 0) for r in response_records),
+                    "success_strict": strict_ok,
+                    "failed_strict": len(response_records) - strict_ok,
+                },
+                # 两种口径的分位数与发送迟到（列名写明口径，见 tre_replayer.engine.metrics）
+                "metrics": summarize_v1_records(response_records),
+                "client": dispatcher.provenance,
+                "workers": dispatcher.workers,
             })
 
             return True

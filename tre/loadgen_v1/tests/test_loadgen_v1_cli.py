@@ -62,7 +62,9 @@ def test_replay_recorded_trace_end_to_end(fake_server, tmp_path):
     lines = [json.loads(line) for line in (out / "performance_metrics.json").read_text().splitlines() if line]
     assert len(lines) == 4
     for line in lines:
-        assert list(line.keys()) == V1_RESPONSE_FIELDS + AUDIT_FIELDS
+        # v1 fields, then the port's audit fields, then the unified client's strict basis
+        assert list(line.keys())[:len(V1_RESPONSE_FIELDS) + len(AUDIT_FIELDS)] == V1_RESPONSE_FIELDS + AUDIT_FIELDS
+        assert {"success_strict", "ttft_strict_s", "tpot_strict_s", "send_lateness_ms"} <= set(line)
     by_id = {line["request_id"]: line for line in lines}
     assert by_id["req_000003"]["phase_type"] == "transition"
     assert by_id["req_000001"]["output_tokens"] == 3 and by_id["req_000002"]["output_tokens"] == 6
@@ -77,6 +79,8 @@ def test_replay_recorded_trace_end_to_end(fake_server, tmp_path):
     assert meta["max_retries"] == 0 and meta["routing_strategy_header"] is None
     assert meta["gateway_endpoint"] == fake_server.url
     assert meta["summary"]["collected_records"] == 4 and meta["summary"]["failed"] == 1
+    assert meta["client"]["profile"]["name"] == "e1_v1" and meta["client"]["processes"] == 2
+    assert meta["metrics"]["strict"]["failed"] == 1 and "bases" in meta["metrics"]
 
     # --routing-strategy "" -> header not sent; base_url normalised to <gw>/v1/chat/completions
     reqs = fake_server.records_for({f"{tag} a", f"{tag} b", f"{tag} c", f"{tag} d"})
