@@ -425,7 +425,8 @@ def check_max_model_len(model: str, shapes: Sequence[str], registry: Optional[st
             "longest_shape": worst, "margin": MAX_MODEL_LEN_MARGIN, "needed": need, "ok": True}
 
 
-def check_param_file(path, model: str, registry: Optional[str], what: str) -> dict:
+def check_param_file(path, model: str, registry: Optional[str], what: str, *,
+                     corpus: Optional[dict] = None, allow_corpus_mismatch: bool = False) -> dict:
     """A ``dline_refit freeze`` file: verifies, and froze ``model`` under the primary label
     (the check ``calibration_acceptance.check_freeze`` makes)."""
     from scripts import dline_refit
@@ -441,9 +442,14 @@ def check_param_file(path, model: str, registry: Optional[str], what: str) -> di
     if dline_refit.canonical_sha256(ours) != dline_refit.canonical_sha256(theirs):
         raise ValueError(f"{what}: {path}: {model} was frozen under another label definition "
                          "than the one T14 is judged by")
+    from scripts import prompt_corpus as corpus_record
+
+    trained = corpus_record.check_matches_freeze(
+        doc, model, corpus, what=f"{what} {path}", allow_mismatch=allow_corpus_mismatch)
     return {"path": str(Path(path).resolve()), "sha256": _file_sha256(Path(path)),
             "freeze_sha256": doc.get("freeze_sha256"),
-            "label_def_sha256": dline_refit.canonical_sha256(theirs)}
+            "label_def_sha256": dline_refit.canonical_sha256(theirs),
+            "prompt_corpus": trained}
 
 
 def _dig(doc: Mapping, dotted: str):
@@ -958,10 +964,14 @@ def run_t14_set(args, *, drive: Optional[Callable] = None,
     mml = check_max_model_len(model, SHAPES, registry)
     freeze = refit = prereg = None
     if _required(getattr(args, "freeze_file", None), "--freeze-file", "the D22 freeze", dry):
-        freeze = check_param_file(args.freeze_file, model, registry, "--freeze-file")
+        freeze = check_param_file(args.freeze_file, model, registry, "--freeze-file",
+                                  corpus=campaign.prompt_corpus(args),
+                                  allow_corpus_mismatch=bool(getattr(args, "allow_prompt_corpus_mismatch", False)))
     if _required(getattr(args, "refit_params_file", None), "--refit-params-file",
                  "the v1-lambda parameter set", dry):
-        refit = check_param_file(args.refit_params_file, model, registry, "--refit-params-file")
+        refit = check_param_file(args.refit_params_file, model, registry, "--refit-params-file",
+                                 corpus=campaign.prompt_corpus(args),
+                                 allow_corpus_mismatch=bool(getattr(args, "allow_prompt_corpus_mismatch", False)))
     if _required(getattr(args, "preregistration_json", None), "--preregistration-json",
                  "the preregistration", dry):
         prereg = check_preregistration(Path(args.preregistration_json),

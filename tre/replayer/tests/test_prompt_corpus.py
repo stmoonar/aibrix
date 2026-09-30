@@ -309,3 +309,113 @@ def test_fleet_tokenizers_en_is_byte_identical_to_before(model: str) -> None:
         for i in range(5)
     ]
     assert _digest(texts) == GOLDEN_EN_FLEET[model]
+
+
+# ------------------------------------------------------------ byte-level splits (U+FFFD)
+
+
+class ByteSplitStubTokenizer(CjkStubTokenizer):
+    """Like :class:`CjkStubTokenizer`, but every CJK character is two tokens (as a
+    byte-level vocabulary splits a rare character), and decoding half of one yields
+    U+FFFD - the case the corpus cut and the fit must strip rather than send."""
+
+    path = "<byte-split-stub>"
+
+    def encode_plain(self, text: str) -> list[int]:
+        ids: list[int] = []
+        for piece in _TOKEN.findall(text):
+            if corpus.is_cjk(piece[-1]):
+                ids += [self._id(("a", piece)), self._id(("b", piece))]
+            else:
+                ids.append(self._id(("w", piece)))
+        return ids
+
+    def decode_plain(self, ids) -> str:
+        out, keys, i = [], [self._to_piece[j] for j in ids], 0
+        while i < len(keys):
+            kind, piece = keys[i]
+            if kind == "w":
+                out.append(piece)
+                i += 1
+            elif kind == "a" and i + 1 < len(keys) and keys[i + 1] == ("b", piece):
+                out.append(piece)
+                i += 2
+            else:
+                out.append(piece[:-1] + "\ufffd")
+                i += 1
+        return "".join(out)
+
+    def cjk_token_count(self, text: str) -> int:
+        return sum(1 for i in self.encode_plain(text) if self._to_piece[i][0] != "w")
+
+
+@pytest.mark.parametrize("lang", ["mix", "zh"])
+@pytest.mark.parametrize("target", [2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 377, 1000])
+def test_a_cut_through_a_split_character_is_stripped_and_the_count_stays_exact(lang, target) -> None:
+    tok = ByteSplitStubTokenizer()
+    for i in range(5):
+        text = prompts.build_natural_prompt(target, f"split|{lang}|{target}|{i}", tokenizer=tok,
+                                            corpus_lang=lang)
+        assert tok.count(text) == target
+        assert "\ufffd" not in text
+
+
+def test_a_high_ratio_mix_opens_in_chinese_and_holds_its_share() -> None:
+    """The reference line is charged to the language it is written in; opening a 0.75
+    mix in English would leave its short prompts well under their Chinese share."""
+    tok = CjkStubTokenizer()
+    key = "high|ratio"
+    text = prompts.build_natural_prompt(256, key, tokenizer=tok, zh_ratio=0.75)
+    assert corpus.is_cjk(text[0])
+    assert corpus.reference_id(prompts.prompt_seed(key)) in text[:20]
+    assert abs(_zh_share(tok, text) - 0.75) <= 0.03
+
+
+def test_a_mix_at_ratio_one_is_the_zh_corpus() -> None:
+    tok = CjkStubTokenizer()
+    for target in (16, 128, 700):
+        assert prompts.build_natural_prompt(target, "one", tokenizer=tok, zh_ratio=1.0) == \
+            prompts.build_natural_prompt(target, "one", tokenizer=tok, corpus_lang="zh")
+
+
+def test_run_trace_rejects_a_ratio_outside_the_unit_interval_as_a_usage_error() -> None:
+    from tre_replayer import run_trace
+
+    with pytest.raises(SystemExit) as exc:
+        run_trace.main(["--trace", "t.json", "--dry-run", "--zh-ratio", "1.5"])
+    assert exc.value.code == 2
+    assert run_trace.effective_zh_ratio("en", 0.5) == 0.0
+    assert run_trace.effective_zh_ratio("zh", 0.5) == 1.0
+
+
+@pytest.mark.parametrize("model", FLEET)
+def test_fleet_pool_materialisation_carries_the_corpus_to_the_workers(model: str, tmp_path) -> None:
+    """The process-pool branch (initargs), not the injected-tokenizer shortcut."""
+    tok = _fleet_tokenizer(model)
+    requests = [
+        ScheduledRequest(request_id=f"{model}-{i:06d}", model=model, scheduled_offset_s=i * 0.1,
+                         prompt_tokens=64 + 37 * i, max_output_tokens=16)
+        for i in range(24)
+    ]
+    for lang in ("mix", "zh"):
+        store = prompt_store.materialize_prompts(
+            requests, path=tmp_path / f"{lang}.prompts.jsonl", processes=2, chunk_size=4,
+            tokenizer_path=model_tokenizer.FLEET_TOKENIZER_PATHS[model], corpus_lang=lang,
+        )
+        for request in requests:
+            text = store.get(request.request_id)
+            assert tok.count(text) == request.prompt_tokens
+            assert text == prompts.build_prompt(
+                request.prompt_tokens, prompt_store.sender_seed_key(model, request.request_id),
+                model=model, tokenizer=tok, corpus_lang=lang)
+        assert store.misses == 0
+
+
+@pytest.mark.parametrize("model", FLEET)
+def test_fleet_tokenizers_tiny_targets_are_exact(model: str) -> None:
+    tok = _fleet_tokenizer(model)
+    for lang in ("mix", "zh"):
+        for target in range(2, 41):
+            text = prompts.build_natural_prompt(target, f"tiny|{target}", tokenizer=tok, corpus_lang=lang)
+            assert tok.count(text) == target
+            assert "\ufffd" not in text

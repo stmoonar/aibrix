@@ -7,9 +7,10 @@ looked up the way the sender does - and for each prompt:
 
 * the token-count error against the target (``usage.prompt_tokens`` semantics: the
   model's own tokenizer, special tokens included) - must be 0;
-* the Chinese share of its plain tokens, *measured* from the tokenizer's offsets
-  (:meth:`~tre_replayer.engine.model_tokenizer.ModelTokenizer.cjk_token_count`),
-  independently of how the corpus budgeted it;
+* the Chinese share of its plain tokens, *measured* by decoding every token on its own
+  (:meth:`~tre_replayer.engine.model_tokenizer.ModelTokenizer.cjk_token_count`: CJK
+  text or a byte-level piece of a character), independently of how the corpus budgeted
+  it;
 * the store's miss count after looking every request up - must be 0.
 
 Needs only the tokenizers on local disk (no GPU, no network, no cluster)::
@@ -35,7 +36,9 @@ from tre_replayer.engine import model_tokenizer
 from tre_replayer.engine.corpus import CORPUS_LANGS, DEFAULT_CORPUS_LANG, DEFAULT_ZH_RATIO
 from tre_replayer.engine.prompt_store import materialize_prompts
 
-DEFAULT_MODELS = ("dsqwen-7b", "dsllama-8b", "dsqwen-14b")
+#: The models whose tokenizers resolve without configuration (override with --models;
+#: any model resolvable by tre_replayer.engine.model_tokenizer works).
+DEFAULT_MODELS = tuple(model_tokenizer.FLEET_TOKENIZER_PATHS)
 
 
 @dataclass
@@ -47,6 +50,8 @@ class _Request:
 
 
 def _quantiles(values: list[float]) -> dict:
+    if not values:
+        return {"n": 0}
     ordered = sorted(values)
 
     def q(p: float) -> float:
@@ -97,7 +102,7 @@ def report_model(model: str, *, samples: int, lo: int, hi: int, seed: int,
         "token_count_error": {"nonzero": sum(1 for e in errors if e), "max_abs": max((abs(e) for e in errors), default=0)},
         "prompt_store_misses": store.misses,
         "zh_token_share": _quantiles(shares),
-        "zh_token_share_by_length": {k: _quantiles(v) | {"n": len(v)} for k, v in sorted(by_bucket.items())},
+        "zh_token_share_by_length": {k: {**_quantiles(v), "n": len(v)} for k, v in sorted(by_bucket.items())},
         "build_ms_per_prompt": round(build_ms / max(1, samples), 3),
     }
 

@@ -54,9 +54,13 @@ four or five sentences, so a fair coin would leave a large fraction of short pro
 far from 1:1 (or entirely monolingual). :func:`budgeted_text` instead always appends
 the language whose budget is *proportionally* least spent, and cuts the last sentence of
 a language at the token where its budget runs out, so the share is exact up to a few
-tokens of tokenizer boundary effects at every length. The mix opens with the English
-reference sentence (so the uniqueness argument above is unchanged); its tokens count
-against the English budget.
+tokens of tokenizer boundary effects once the prompt is long enough to hold more than
+its opening. The mix opens with the reference sentence (so the uniqueness argument above
+is unchanged) in the majority language - English at ``zh_ratio <= 0.5`` - and its ~20
+tokens count against that language's budget. Consequences: below ~50 tokens a 0.5 mix
+is mostly the English opening (measured on the fleet tokenizers: within 0.01 of 0.5 from
+64 tokens, within 0.002 from 256); and ``mix`` at ratio 0 / 1 is not byte-identical to
+``en`` / ``zh`` (``en`` keeps the legacy builder).
 """
 from __future__ import annotations
 
@@ -423,9 +427,10 @@ def budgeted_text(
     exact-length fit in :func:`tre_replayer.engine.prompts.build_natural_prompt` closes
     the rest.
 
-    The first sentence is always the reference line (English for ``en`` / ``mix``,
-    Chinese for ``zh``) and it is never cut unless it alone exceeds ``budget`` - that is
-    what keeps every seed's prompt distinct within its first handful of tokens.
+    The first sentence is always the reference line - Chinese for ``zh`` and for a ``mix``
+    with ``zh_ratio > 0.5``, English otherwise - and it is never cut unless it alone
+    exceeds ``budget``: that is what keeps every seed's prompt distinct within its first
+    handful of tokens.
 
     A byte-level vocabulary can split one CJK character over several tokens; a cut
     between them decodes to U+FFFD, which is stripped rather than sent (it would
@@ -441,10 +446,15 @@ def budgeted_text(
     total[LANG_EN] = budget - total[LANG_ZH]
     left = dict(total)
     used = {LANG_ZH: 0, LANG_EN: 0}
+    # The reference line opens in the majority language (see the module docstring).
+    opening = LANG_ZH if (lang == LANG_ZH or (lang == LANG_MIX and ratio > 0.5)) else LANG_EN
+    other = LANG_EN if opening == LANG_ZH else LANG_ZH
     streams = {
         LANG_EN: sentence_stream(seed),
-        LANG_ZH: zh_sentence_stream(seed, with_reference=(lang == LANG_ZH)),
+        LANG_ZH: zh_sentence_stream(seed, with_reference=(opening == LANG_ZH)),
     }
+    if opening == LANG_ZH:
+        next(streams[LANG_EN])  # the English stream's own reference line: never sent twice
     parts: list[tuple[str, str]] = []
     previous = {"text": "", "tokens": 0}
 
@@ -458,6 +468,8 @@ def budgeted_text(
         piece, spent, was_cut = sentence, cost(which, sentence), False
         if spent > room:
             was_cut = True
+            # The overrun is in-context, the cut is on the sentence's own ids; the two can
+            # differ by a boundary token, which the exact-length fit closes afterwards.
             ids = list(encode(sentence))
             keep = max(0, len(ids) - (spent - room))
             piece = decode(ids[:keep]).rstrip("\ufffd").rstrip()
@@ -477,8 +489,6 @@ def budgeted_text(
     # The reference line first, charged to its own language. If it overruns that
     # language's share the overrun comes out of the other language's share, so the total
     # stays ``budget``; only a prompt too short for the line itself gets it cut.
-    opening = LANG_ZH if lang == LANG_ZH else LANG_EN
-    other = LANG_EN if opening == LANG_ZH else LANG_ZH
     take(opening, next(streams[opening]), budget)
     remaining = budget - used[opening]
     left[opening] = max(0, min(left[opening], remaining))

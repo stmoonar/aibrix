@@ -135,6 +135,7 @@ from scripts import admission_cap as admission
 from scripts import calibration_capture as capture
 from scripts import gen_calibration_schedules as gen
 from scripts import openloop
+from scripts import prompt_corpus as corpus_record
 from scripts import r3_grid
 from scripts import static_grid
 from scripts.openloop import LIVE_GRID_MS
@@ -676,10 +677,13 @@ def cell_command(cell: Cell, args, schedule_path: Path, output: Path) -> list[st
         command += ["--registry", args.registry]
     if args.redis_url:
         command += ["--redis-url", args.redis_url]
-    if getattr(args, "routing_strategy", None):
-        # Through the gateway plugin with this strategy (r3_grid --routing-strategy); unset,
-        # the per-model HTTPRoute as before. T14 requires least-gpu-cache.
-        command += ["--routing-strategy", str(args.routing_strategy)]
+    routing = routing_strategy_for(args)
+    if routing:
+        # Through the gateway plugin with this strategy (r3_grid --routing-strategy):
+        # least-gpu-cache by default, what the replayer and v1 send, so a multi-replica
+        # calibration routes like the experiments it calibrates for. '' / 'none' sends no
+        # header (the per-model HTTPRoute). T14 requires least-gpu-cache.
+        command += ["--routing-strategy", routing]
     return command
 
 
@@ -1907,18 +1911,36 @@ def git_state(worktree: Path) -> dict:
     }
 
 
+#: The routing-strategy header every calibration cell carries unless told otherwise: the
+#: one the replayer (tre_replayer.engine.http_sender.DEFAULT_ROUTING_STRATEGY) and v1 send.
+DEFAULT_ROUTING_STRATEGY = "least-gpu-cache"
+#: --routing-strategy values that mean "send no header" (the per-model HTTPRoute path).
+NO_ROUTING_STRATEGY = ("", "none")
+
+
+def normalize_routing_strategy(value) -> Optional[str]:
+    """None for "no header", else the strategy; used on the CLI value and on hand-built args."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    return None if text.lower() in NO_ROUTING_STRATEGY else text
+
+
+def routing_strategy_for(args) -> Optional[str]:
+    """The routing strategy a campaign's cells send: ``args.routing_strategy`` normalised,
+    :data:`DEFAULT_ROUTING_STRATEGY` when the attribute is absent (hand-built ``args``)."""
+    return normalize_routing_strategy(getattr(args, "routing_strategy", DEFAULT_ROUTING_STRATEGY))
+
+
 def prompt_corpus(args) -> dict:
     """The prompt text a campaign's cells are driven with (``r3_grid --corpus-lang`` /
     ``--zh-ratio``); absent attributes (callers that build ``args`` by hand) mean the
-    defaults."""
+    defaults. ``zh_ratio`` is the effective one (en 0, zh 1)."""
+    lang = str(getattr(args, "corpus_lang", None) or r3_grid.CORPUS_LANG_DEFAULT)
     return {
         "prompt_mode": r3_grid.PROMPT_MODE_DEFAULT,
-        "corpus_lang": str(getattr(args, "corpus_lang", None) or r3_grid.CORPUS_LANG_DEFAULT),
-        "zh_ratio": float(
-            r3_grid.ZH_RATIO_DEFAULT
-            if getattr(args, "zh_ratio", None) is None
-            else args.zh_ratio
-        ),
+        "corpus_lang": lang,
+        "zh_ratio": corpus_record.effective_zh_ratio(lang, getattr(args, "zh_ratio", None)),
     }
 
 
@@ -1951,6 +1973,9 @@ def run_provenance(args) -> dict:
         # What the prompts were written in: theta fitted on English prompts does not
         # transfer to a mixed workload, so a later set (M, T14) must match its training.
         "prompt": prompt_corpus(args),
+        # How the cells were routed: the routing-strategy header (None = none sent, the
+        # per-model HTTPRoute). Irrelevant with one replica, decisive with several.
+        "routing_strategy": routing_strategy_for(args),
         "label": labels[models[0]] if models else None,
         "label_by_model": labels,
         "boundary": {
@@ -2422,10 +2447,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--zh-ratio", type=r3_grid._unit_interval, default=r3_grid.ZH_RATIO_DEFAULT,
                     help="Chinese share of each prompt's tokens under --corpus-lang mix "
                          "(default %(default)s)")
-    ap.add_argument("--routing-strategy", default=None,
-                    help="pass --routing-strategy to every r3_grid cell (route through the "
-                         "gateway plugin with this strategy, e.g. least-gpu-cache); default: "
-                         "the per-model HTTPRoute. --t14-set requires least-gpu-cache")
+    ap.add_argument("--allow-prompt-corpus-mismatch", action="store_true",
+                    help="--acceptance-set / --t14-set: warn instead of refusing when the "
+                         "frozen parameters were trained on another prompt corpus")
+    ap.add_argument("--routing-strategy", type=normalize_routing_strategy,
+                    default=DEFAULT_ROUTING_STRATEGY,
+                    help="routing-strategy header every r3_grid cell sends (default "
+                         "%(default)s, as the replayer and v1; recorded in the run manifest). "
+                         "'' or 'none' sends none (the per-model HTTPRoute). --t14-set "
+                         "requires least-gpu-cache")
     ap.add_argument("--design", choices=["ladder", "primitives"], default=None,
                     help="ladder (default): the second round's design (scripts.calibration_ladder). "
                          "primitives: the first round's steps / boundary / ramp / bursts - "

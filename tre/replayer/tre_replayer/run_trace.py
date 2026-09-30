@@ -19,6 +19,19 @@ from tre_replayer.engine.dispatcher import dispatch_open_loop
 from tre_replayer.engine.http_sender import DEFAULT_ROUTING_STRATEGY, StreamResult, StreamingHttpSender
 from tre_replayer.engine.prompt_store import materialize_prompts
 from tre_replayer.engine.prompts import CORPUS_LANGS, DEFAULT_CORPUS_LANG, DEFAULT_ZH_RATIO
+
+
+def _unit_interval(text: str) -> float:
+    """argparse type: a float within [0, 1]."""
+    value = float(text)
+    if not 0.0 <= value <= 1.0:
+        raise argparse.ArgumentTypeError(f"must be within [0, 1], got {text}")
+    return value
+
+
+def effective_zh_ratio(corpus_lang: str, zh_ratio: float) -> float:
+    """What a corpus actually targets: en 0, zh 1, mix its ratio (what gets recorded)."""
+    return 0.0 if corpus_lang == "en" else 1.0 if corpus_lang == "zh" else float(zh_ratio)
 from tre_replayer.engine.schedule import build_poisson_schedule
 from tre_replayer.scoring import compute_v_sys
 from tre_replayer.traces.loader import load_trace_segments
@@ -150,7 +163,7 @@ def run_trace(
         # What the prompts were written in (tre_replayer.engine.corpus): runs made with
         # different corpora are not comparable, so the summary says which it was.
         "corpus_lang": corpus_lang,
-        "zh_ratio": float(zh_ratio),
+        "zh_ratio": effective_zh_ratio(corpus_lang, zh_ratio),
         "target_pods": target_pods,
         "requests": len(sender.records),
         "schedule_p99_delay_ms": round(report.p99_delay_ms, 2),
@@ -230,7 +243,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--corpus-lang", default=DEFAULT_CORPUS_LANG, choices=list(CORPUS_LANGS),
                     help="text of the natural prompts: mix (default; English and Chinese "
                          "sentences, --zh-ratio of the tokens Chinese), en, zh")
-    ap.add_argument("--zh-ratio", type=float, default=DEFAULT_ZH_RATIO,
+    ap.add_argument("--zh-ratio", type=_unit_interval, default=DEFAULT_ZH_RATIO,
                     help="Chinese share of each prompt's tokens under --corpus-lang mix, "
                          "counted with the model's own tokenizer (default %(default)s)")
     args = ap.parse_args(argv)

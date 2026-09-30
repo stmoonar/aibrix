@@ -365,8 +365,13 @@ def check_freeze(args, model: str) -> dict:
     if dline_refit.canonical_sha256(ours) != dline_refit.canonical_sha256(theirs):
         raise ValueError(f"{path}: {model} was frozen under another label definition than the "
                          "one M would be judged by")
+    from scripts import prompt_corpus as corpus_record
+
+    trained = corpus_record.check_matches_freeze(
+        doc, model, campaign.prompt_corpus(args), what=str(path),
+        allow_mismatch=bool(getattr(args, "allow_prompt_corpus_mismatch", False)))
     return {"path": str(Path(path).resolve()), "sha256": design._sha256(Path(path)),
-            "freeze_sha256": doc.get("freeze_sha256")}
+            "freeze_sha256": doc.get("freeze_sha256"), "prompt_corpus": trained}
 
 
 def label_documents(args, model: str) -> dict:

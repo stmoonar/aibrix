@@ -1529,6 +1529,10 @@ def freeze_model(out_root: Path, fit_dir: Path, model: str, arm: str) -> tuple[O
                             "dir does not match this refit, or its training inputs changed since")
         else:
             man_doc = json.loads(man.read_text(encoding="utf-8"))
+            corpora = training_prompt_corpora(man_doc)
+            if len(corpora) > 1:
+                problems.append(f"the training set mixes prompt corpora {sorted(corpora)}: a theta "
+                                "fitted across corpora describes neither")
             lp = fit_dir / TRAINING_LEDGER
             try:
                 check_training_inputs(model, p, ledger=load_ledgers([str(lp)]) if lp.exists() else None)
@@ -1564,8 +1568,36 @@ def freeze_model(out_root: Path, fit_dir: Path, model: str, arm: str) -> tuple[O
                "cells_sha256": (man_doc.get("h2") or {}).get("cells_sha256"),
                "manifest_sha256": sha256_file(h2_path) if h2_path.exists() else None},
         "trainset": {"manifest_sha256": ts.get("trainset_manifest_sha256"), "sentinels": ts.get("sentinels")},
+        # What the training prompts were written in (scripts.prompt_corpus): M and T14 refuse
+        # to run under this freeze with another corpus. Absent in older freezes = English.
+        "prompt_corpus": next(iter(training_prompt_corpora(man_doc).values()), None),
     }
     return entry, []
+
+
+def training_prompt_corpora(trainset_manifest: Mapping) -> dict[str, dict]:
+    """``{description: corpus}`` over the standard datasets a training set was cut from,
+    read from each dataset's own manifest (``prompt_corpus``; an older dataset, or its
+    campaigns without a record, is English)."""
+    from scripts import prompt_corpus as corpus_record
+
+    found: dict[str, dict] = {}
+    for source in trainset_manifest.get("sources") or []:
+        windows = source.get("windows_csv")
+        if not windows:
+            continue
+        manifest = Path(windows).parent / "manifest.json"
+        try:
+            doc = json.loads(manifest.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            doc = {}
+        corpus = doc.get("prompt_corpus")
+        if corpus is None:
+            campaigns = doc.get("campaigns") or [{}]
+            corpus = (campaigns[0] or {}).get("prompt")
+        normal = corpus_record.normalize(corpus)
+        found[corpus_record.describe(normal)] = normal
+    return found
 
 
 def stage_freeze(out_root: Path, fit_dir_of: Callable[[str], Path], models: Sequence[str], arm: str,

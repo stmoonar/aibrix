@@ -102,6 +102,8 @@ def _args(tmp_path, **over):
         gateway_url="http://gw/v1/completions", guard_mode="warn", min_slo_windows=3,
         max_model_error_rate=0.05, envoy_stats_url=None, envoy_cluster_filter=None,
         freeze_file=tmp_path / "freeze.json", **_inputs(tmp_path),
+        # The fixture freeze predates the corpus record, i.e. was trained on English.
+        corpus_lang="en", zh_ratio=0.0,
     )
     base.update(over)
     return argparse.Namespace(**base)
@@ -339,3 +341,10 @@ def test_the_cli_dry_run_lists_m_without_a_freeze(tmp_path, capsys) -> None:
     assert len(plan["static_cells"][MODEL]) == 10 and len(plan["retained"]["cells"]) == 3
     assert plan["composition"]["evaluated_cells"] == 13
     assert not (out / ladder.RUN_MANIFEST).exists() and not (out / ac.M_MANIFEST).exists()
+
+
+def test_m_is_refused_under_a_freeze_trained_on_another_prompt_corpus(tmp_path, frozen) -> None:
+    """The freeze fixture predates the corpus record (English); M with the default mix
+    would judge an English theta on mixed prompts."""
+    with pytest.raises(ValueError, match="trained on en prompts"):
+        _run(tmp_path, corpus_lang="mix", zh_ratio=0.5)

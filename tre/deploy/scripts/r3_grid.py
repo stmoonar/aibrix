@@ -53,6 +53,7 @@ from tre_common import slo_labels
 from tre_common.rediskeys import SCRAPE_INTERVAL_MS
 
 from scripts import openloop
+from scripts import prompt_corpus
 
 
 @dataclass(frozen=True)
@@ -292,12 +293,12 @@ class Checkpoint:
 #: importing this module never requires the replayer package (guarded by a test).
 PROMPT_MODE_DEFAULT = "natural"
 PROMPT_MODES = ("token_ids", "text", "natural")
-#: Mirror of ``tre_replayer.engine.corpus.DEFAULT_CORPUS_LANG`` / ``CORPUS_LANGS`` /
-#: ``DEFAULT_ZH_RATIO`` (same reason, same guard test): what a natural prompt is written
-#: in - English and Chinese sentences interleaved, half the tokens Chinese by default.
-CORPUS_LANG_DEFAULT = "mix"
-CORPUS_LANGS = ("en", "zh", "mix")
-ZH_RATIO_DEFAULT = 0.5
+#: What a natural prompt is written in (mirrors of ``tre_replayer.engine.corpus``, kept in
+#: :mod:`scripts.prompt_corpus`; same reason, same guard test): English and Chinese
+#: sentences interleaved, half the tokens Chinese by default.
+CORPUS_LANG_DEFAULT = prompt_corpus.DEFAULT_CORPUS_LANG
+CORPUS_LANGS = prompt_corpus.CORPUS_LANGS
+ZH_RATIO_DEFAULT = prompt_corpus.DEFAULT_ZH_RATIO
 
 
 def _unit_interval(text: str) -> float:
@@ -879,8 +880,12 @@ def run_schedule_cell(args, store, spec, redis_client=None) -> tuple[list, "open
         # What the natural prompts were written in, and the Chinese share of their tokens
         # (tre_replayer.engine.corpus): a capacity made with English prompts is not the
         # capacity of a mixed workload.
+        # The effective ratio: en sends 0 % Chinese and zh 100 % whatever --zh-ratio says.
         "corpus_lang": getattr(args, "corpus_lang", CORPUS_LANG_DEFAULT),
-        "zh_ratio": getattr(args, "zh_ratio", ZH_RATIO_DEFAULT),
+        "zh_ratio": prompt_corpus.effective_zh_ratio(
+            getattr(args, "corpus_lang", CORPUS_LANG_DEFAULT),
+            getattr(args, "zh_ratio", ZH_RATIO_DEFAULT),
+        ),
         "routing_strategy": args.routing_strategy,
         # What made this cell's arrivals and prompts its own (see openloop).
         "schedule_seed": args.schedule_seed,

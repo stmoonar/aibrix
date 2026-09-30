@@ -464,6 +464,13 @@ class Settings:
         return "(start, end]" if self.window_align == rewindow_from_raw.WINDOW_ALIGN_GRID else "[start, end)"
 
 
+def _dataset_prompt_corpus(provenances: Sequence[dict]) -> dict:
+    from scripts import prompt_corpus as corpus_record
+
+    first = provenances[0].get("prompt") if provenances else None
+    return corpus_record.normalize(first)
+
+
 def _settings_for(campaigns: Sequence[Path], overrides: dict) -> tuple[Settings, list[dict]]:
     """Windowing and SLO the run declared, overridable; plus each campaign's provenance."""
     provenances = []
@@ -472,10 +479,14 @@ def _settings_for(campaigns: Sequence[Path], overrides: dict) -> tuple[Settings,
     online_label = None
     ttft = tpot = None
     registry = None
+    from scripts import prompt_corpus as corpus_record
+
+    corpora: dict[str, list[str]] = {}
     for campaign in campaigns:
         plan = _read_json(campaign / "plan.json")
         fit = _read_json(campaign / "fit_plan.json")
         prov = plan.get("provenance") or {}
+        corpora.setdefault(corpus_record.describe(prov.get("prompt")), []).append(campaign.name)
         entry = {
             "campaign": campaign.name,
             "code": prov.get("code"),
@@ -508,6 +519,10 @@ def _settings_for(campaigns: Sequence[Path], overrides: dict) -> tuple[Settings,
         tpot = tpot or slo.get(slo_labels.P95_TPOT_CLIENT)
         if prov.get("registry_path") and Path(prov["registry_path"]).exists():
             registry = registry or Path(prov["registry_path"])
+    if len(corpora) > 1:
+        # One dataset, one kind of prompt: a theta fitted across corpora describes neither.
+        raise SystemExit(f"these campaigns were driven with different prompt corpora, refusing to "
+                         f"build one dataset from them: {corpora}")
     if ttft is None or tpot is None:
         # Older runs recorded the pinned SLO on every cell's guard, not in the plan.
         for campaign in campaigns:
@@ -706,6 +721,9 @@ def build_dataset(
         },
         "run_root": str(run_dir),
         "campaigns": provenances,
+        # The one prompt corpus every campaign above was driven with (they may not differ;
+        # a campaign from before the option is English). dline_refit freeze carries it on.
+        "prompt_corpus": _dataset_prompt_corpus(provenances),
         "registry_used_for_labels": {
             "path": str(settings.label_registry_path),
             "sha256": _sha256(settings.label_registry_path),

@@ -360,3 +360,18 @@ def test_run_selection_supports_resume_boundary_and_limit():
         select_runs(runs, start_at="missing", limit=None)
     with pytest.raises(ValueError, match="positive"):
         select_runs(runs, start_at=None, limit=0)
+
+def test_manifest_pins_the_prompt_corpus_of_the_replays(tmp_path):
+    path = tmp_path / "manifest.json"
+    _write_manifest(path)
+    manifest = load_manifest(path, registry=REGISTRY)
+    assert (manifest.corpus_lang, manifest.zh_ratio) == ("mix", 0.5)
+    _write_manifest(path, corpus_lang="en")
+    assert (load_manifest(path, registry=REGISTRY).corpus_lang,
+            load_manifest(path, registry=REGISTRY).zh_ratio) == ("en", 0.0)
+    _write_manifest(path, corpus_lang="fr")
+    with pytest.raises(ValueError, match="corpus_lang"):
+        load_manifest(path, registry=REGISTRY)
+    _write_manifest(path, corpus_lang="mix", zh_ratio=1.5)
+    with pytest.raises(ValueError, match="zh_ratio"):
+        load_manifest(path, registry=REGISTRY)
