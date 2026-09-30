@@ -263,7 +263,7 @@ vllm:
     HF_HUB_OFFLINE: '1'
     # uvicorn keep-alive of the vLLM HTTP server (vLLM default 5 s). The reissue sidecar
     # pools its loopback connections to vLLM for reissue.upstream_keepalive_s (default 2 s,
-    # validated to be below this); 75 s keeps vLLM from closing a connection the sidecar is
+    # validated to be >= 1 s below this); 75 s keeps vLLM from closing a connection the sidecar is
     # about to reuse (502s in the 2026-09-30 smoke). Takes effect when the pods are recreated.
     VLLM_HTTP_TIMEOUT_KEEP_ALIVE: '75'
     # PYTORCH_ALLOC_CONF=pinned_max_round_threshold_mb:1 (exact-size pinned host blocks,
@@ -307,7 +307,7 @@ reissue:
   retry_attempts: 4
   # Optional (defaults shown; not written out so an older service-manager, which
   # rejects unknown reissue keys, can still read this registry):
-  #   upstream_keepalive_s: 2        # < every model's VLLM_HTTP_TIMEOUT_KEEP_ALIVE
+  #   upstream_keepalive_s: 2        # <= every model's VLLM_HTTP_TIMEOUT_KEEP_ALIVE - 1
   #   local_reconnect_attempts: 1    # fresh-connection re-sends before the first byte
   # null = the model's vllm_image (python3 + aiohttp; the script comes from a ConfigMap).
   image: null

@@ -943,10 +943,12 @@ class Registry:
                 except ValueError:
                     errors.append(f"model {model.name}: {VLLM_KEEP_ALIVE_ENV} must be an integer number of seconds")
                     continue
-                if self._reissue.upstream_keepalive_s >= server_keep_alive:
+                # >= 1 s margin: the sidecar's pool clock lags vLLM's idle clock under
+                # CPU throttling (same rule as the sidecar's startup check).
+                if self._reissue.upstream_keepalive_s > server_keep_alive - 1.0:
                     errors.append(
                         f"model {model.name}: reissue.upstream_keepalive_s ({self._reissue.upstream_keepalive_s}) "
-                        f"must be below vLLM's {VLLM_KEEP_ALIVE_ENV} ({server_keep_alive})"
+                        f"must be at least 1 s below vLLM's {VLLM_KEEP_ALIVE_ENV} ({server_keep_alive})"
                     )
         if self._placement.reserve_tp_pairs < 0:
             errors.append("placement.reserve_tp_pairs must be >= 0")

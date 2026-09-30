@@ -152,6 +152,10 @@ def test_registry_overrides_reach_the_sidecar(tmp_path):
     assert command[command.index("--port") + 1] == "9001"
 
 
+def test_keepalive_one_second_below_the_server_is_accepted(tmp_path):
+    _registry(tmp_path, "reissue: {upstream_keepalive_s: 4}\n")  # vLLM default 5 s; validates clean
+
+
 def test_keepalive_settings_reach_the_sidecar(tmp_path):
     registry = _registry(tmp_path, textwrap.dedent("""
         vllm:
@@ -175,8 +179,9 @@ def test_keepalive_settings_reach_the_sidecar(tmp_path):
         ("reissue: {upstream_keepalive_s: 0}\n", "upstream_keepalive_s must be > 0"),
         ("reissue: {local_reconnect_attempts: -1}\n", "local_reconnect_attempts"),
         # the pool must be BELOW vLLM's keep-alive (default 5 s) of every model
-        ("reissue: {upstream_keepalive_s: 5}\n", "must be below vLLM's VLLM_HTTP_TIMEOUT_KEEP_ALIVE"),
-        ("vllm: {env: {VLLM_HTTP_TIMEOUT_KEEP_ALIVE: '2'}}\n", "must be below vLLM's VLLM_HTTP_TIMEOUT_KEEP_ALIVE"),
+        ("reissue: {upstream_keepalive_s: 5}\n", "at least 1 s below vLLM's VLLM_HTTP_TIMEOUT_KEEP_ALIVE"),
+        ("reissue: {upstream_keepalive_s: 4.5}\n", "at least 1 s below vLLM's VLLM_HTTP_TIMEOUT_KEEP_ALIVE"),
+        ("vllm: {env: {VLLM_HTTP_TIMEOUT_KEEP_ALIVE: '2'}}\n", "at least 1 s below vLLM's VLLM_HTTP_TIMEOUT_KEEP_ALIVE"),
         ("vllm: {env: {VLLM_HTTP_TIMEOUT_KEEP_ALIVE: '7.5'}}\n", "integer number of seconds"),
         ("reissue: {vllm_port: 8000}\n", "vllm_port"),
         ("reissue: {gateway_url: '10.0.0.1:80'}\n", "gateway_url"),

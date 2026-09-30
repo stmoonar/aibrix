@@ -60,7 +60,11 @@ async def uvicorn_upstream(keep_alive: float = SERVER_KEEP_ALIVE_S):
         yield f"http://127.0.0.1:{port}"
     finally:
         proc.terminate()
-        proc.wait(timeout=10)
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
 
 
 @contextlib.asynccontextmanager
@@ -148,27 +152,33 @@ async def test_without_the_fix_the_race_fails_requests_with_503_not_502():
 
 @pytest.mark.asyncio
 async def test_pool_keepalive_below_the_server_keepalive_alone_avoids_the_race():
-    """Layer 1 alone (no re-send): the pool drops idle connections before uvicorn does.
-    The unfixed control fails ~0.3-0.5 requests per burst, so 8 clean bursts is a real test."""
+    """Layer 1 alone (no re-send): a pool keep-alive of 0.7 s (server 1 s) still reuses
+    young connections across bursts (asserted), but drops the ones near uvicorn's close. The
+    unfixed control fails ~0.3-0.5 requests per burst, so 8 clean bursts is a real test."""
     async with uvicorn_upstream() as upstream, serve_sidecar(
-        upstream, upstream_keepalive_s=0.5, local_reconnect_attempts=0
+        upstream, upstream_keepalive_s=0.7, local_reconnect_attempts=0
     ) as (sidecar, url):
         out = await run_bursts(url, sidecar, min_bursts=8, max_bursts=8, until=lambda *_: True)
         assert out["statuses"] == {200: 800}, out
         assert sidecar.metrics.reconnect == {"ok": 0, "fail": 0}
+        # connections idle < 0.7 s are still reused (~20-30 per run); those idle ~1 s, the
+        # ones uvicorn closes, are dropped by the pool instead
+        assert sidecar.local_reused > 0, "no connection was reused across bursts: vacuous"
 
 
 # ---------------------------------------------------------- scripted upstream units
 
 
 class ScriptedUpstream:
-    """Raw HTTP/1.1 upstream; connection N follows ``script[N]`` (then ``"ok"``):
-    ``close`` read the request, close (Server disconnected); ``rst`` read the request,
-    reset (ECONNRESET); ``close_stop`` stop listening, then ``close``; ``ok`` answer;
-    ``partial`` stream headers + one SSE event, reset."""
+    """Raw HTTP/1.1 upstream (keep-alive); request N follows ``script[N]`` (then ``"ok"``):
+    ``close`` read the request, close the connection (Server disconnected); ``rst`` read
+    the request, reset (ECONNRESET); ``close_stop`` stop listening, then ``close``;
+    ``ok`` answer; ``partial`` stream headers + one SSE event, then reset."""
 
-    EVENT = b'data: {"id":"c","object":"text_completion","model":"m","choices":[{"index":0,"text":"hi","finish_reason":null}]}\n\n'
-    LAST = b'data: {"id":"c","object":"text_completion","model":"m","choices":[{"index":0,"text":"!","finish_reason":"length"}]}\n\n'
+    EVENT = (b'data: {"id":"c","object":"text_completion","model":"m","choices":[{"index":0,"text":"hi",'
+             b'"finish_reason":null}]}\n\n')
+    LAST = (b'data: {"id":"c","object":"text_completion","model":"m","choices":[{"index":0,"text":"!",'
+            b'"finish_reason":"length"}]}\n\n')
 
     def __init__(self, script: list[str]) -> None:
         self.script = list(script)
@@ -191,7 +201,6 @@ class ScriptedUpstream:
         writer.transport.abort()
 
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        action = self.script[self.connections] if self.connections < len(self.script) else "ok"
         self.connections += 1
         try:
             while True:  # keep-alive: several requests per connection
@@ -202,6 +211,8 @@ class ScriptedUpstream:
                     if line.lower().startswith("content-length:"):
                         length = int(line.split(":", 1)[1])
                 body = await reader.readexactly(length) if length else b""
+                index = len(self.requests)
+                action = self.script[index] if index < len(self.script) else "ok"
                 self.requests.append(lines[0])
                 if action == "close_stop":
                     self.server.close()  # later connects are refused
@@ -212,7 +223,6 @@ class ScriptedUpstream:
                 if action == "rst":
                     self._reset(writer)
                     return
-                stream = b'"stream": true' in body or b'"stream":true' in body
                 if action == "partial":
                     writer.write(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n"
                                  b"transfer-encoding: chunked\r\n\r\n" + _chunk(self.EVENT))
@@ -220,12 +230,13 @@ class ScriptedUpstream:
                     await asyncio.sleep(0.05)
                     self._reset(writer)
                     return
-                if stream:
+                if b'"stream": true' in body or b'"stream":true' in body:
                     writer.write(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n"
                                  b"transfer-encoding: chunked\r\n\r\n" + _chunk(self.EVENT) + _chunk(self.LAST)
                                  + _chunk(b"data: [DONE]\n\n") + b"0\r\n\r\n")
                 else:
-                    payload = b'{"id":"c","object":"text_completion","model":"m","choices":[{"index":0,"text":"hi!","finish_reason":"length"}]}'
+                    payload = (b'{"id":"c","object":"text_completion","model":"m","choices":[{"index":0,'
+                               b'"text":"hi!","finish_reason":"length"}]}')
                     writer.write(b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: "
                                  + str(len(payload)).encode() + b"\r\n\r\n" + payload)
                 await writer.drain()
@@ -237,44 +248,76 @@ def _chunk(data: bytes) -> bytes:
     return f"{len(data):x}\r\n".encode() + data + b"\r\n"
 
 
-async def _post(url: str, body: dict) -> tuple[int, dict, bytes]:
+async def _request(url: str, method: str, path: str, body: dict | None = None,
+                   headers: dict | None = None) -> tuple[int, dict, bytes]:
     async with aiohttp.ClientSession() as http:
-        async with http.post(url + "/v1/completions", json=body) as resp:
+        async with http.request(method, url + path, json=body if body is not None else {"prompt": "x"},
+                                headers=headers or {}) as resp:
             return resp.status, dict(resp.headers), await resp.read()
+
+
+async def _post(url: str, body: dict) -> tuple[int, dict, bytes]:
+    return await _request(url, "POST", "/v1/completions", body)
+
+
+async def _warm(url: str, path: str = "/v1/completions") -> None:
+    """One good request: leaves an idle pooled sidecar -> upstream connection behind."""
+    status, _, _ = await _request(url, "POST", path, completion_body(4, stream=False))
+    assert status == 200
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stream", [True, False])
 @pytest.mark.parametrize("failure", ["close", "rst"])
-async def test_failure_before_the_first_byte_is_resent_on_a_fresh_connection(stream, failure):
-    async with ScriptedUpstream([failure]) as upstream, serve_sidecar(upstream.url) as (sidecar, url):
+async def test_failure_on_a_reused_connection_is_resent_on_a_fresh_one(stream, failure):
+    async with ScriptedUpstream(["ok", failure]) as upstream, serve_sidecar(upstream.url) as (sidecar, url):
+        await _warm(url)
         status, _, raw = await _post(url, completion_body(4, stream=stream))
         assert status == 200
         assert (b"[DONE]" in raw) if stream else json.loads(raw)["choices"][0]["text"] == "hi!"
-        assert upstream.connections == 2 and len(upstream.requests) == 2
+        assert len(upstream.requests) == 3 and upstream.connections == 2
+        assert sidecar.local_reused == 1
         assert sidecar.metrics.reconnect == {"ok": 1, "fail": 0}
         assert sidecar.metrics.total("failed") == 0
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stream", [True, False])
-async def test_reset_twice_gives_503_with_retry_after_not_502(stream):
+async def test_failure_on_a_new_connection_is_not_resent(stream):
+    """Not the keep-alive race (nothing was reused): the engine may have run the request."""
+    async with ScriptedUpstream(["rst"]) as upstream, serve_sidecar(upstream.url) as (sidecar, url):
+        status, headers, raw = await _post(url, completion_body(4, stream=stream))
+        assert status == 503 and headers["Retry-After"] == "1"
+        assert json.loads(raw)["error"]["layer"] == "sidecar_upstream"
+        assert len(upstream.requests) == 1
+        assert sidecar.metrics.reconnect == {"ok": 0, "fail": 0}
+        assert sidecar.metrics.reissue == {("failed", "upstream_unavailable"): 1}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [True, False])
+async def test_reset_twice_gives_503_with_retry_after_not_502(stream, capsys):
     async with Harness() as h:  # a working gateway, to prove it is NOT used here
-        async with ScriptedUpstream(["rst", "rst"]) as upstream, serve_sidecar(
+        async with ScriptedUpstream(["ok", "rst", "rst"]) as upstream, serve_sidecar(
             upstream.url, gateway_url=str(h.gw.make_url("")).rstrip("/")
         ) as (sidecar, url):
-            status, headers, raw = await _post(url, completion_body(4, stream=stream))
+            await _warm(url)
+            status, headers, raw = await _request(url, "POST", "/v1/completions", completion_body(4, stream=stream),
+                                                  headers={"x-request-id": "req-42"})
             assert status == 503
             assert headers["Retry-After"] == "1"
             error = json.loads(raw)["error"]
             assert error["layer"] == "sidecar_upstream" and error["type"] == "ServiceUnavailable"
-            assert upstream.connections == 2
+            assert len(upstream.requests) == 3
             assert sidecar.metrics.reconnect == {"ok": 0, "fail": 1}
             assert sidecar.metrics.reissue == {("failed", "upstream_unavailable"): 1}
             assert h.gateway.requests == []
             text = sidecar.metrics.render(sidecar.state)
             assert 'tre_reissue_local_reconnect_total{model="m",result="fail"} 1' in text
             assert 'tre_reissue_total{model="m",kind="failed",reason="upstream_unavailable"} 1' in text
+    records = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.startswith("{")]
+    (line,) = [r for r in records if r.get("event") == "tre_reissue" and r.get("reason") == "upstream_unavailable"]
+    assert line["request_id"] == "req-42" and line["status"] == 503  # one line per failed request
 
 
 @pytest.mark.asyncio
@@ -293,11 +336,12 @@ async def test_connection_refused_goes_through_the_gateway(stream):
 
 @pytest.mark.asyncio
 async def test_stale_connection_then_refused_goes_through_the_gateway():
-    """The engine dropped the connection and is gone when the re-send connects."""
+    """The engine dropped the reused connection and is gone when the re-send connects."""
     async with Harness() as h:
-        async with ScriptedUpstream(["close_stop"]) as upstream, serve_sidecar(
+        async with ScriptedUpstream(["ok", "close_stop"]) as upstream, serve_sidecar(
             upstream.url, gateway_url=str(h.gw.make_url("")).rstrip("/"), retry_attempts=2
         ) as (sidecar, url):
+            await _warm(url)
             status, headers, raw = await _post(url, completion_body(4))
             assert status == 200 and headers["x-tre-retried"] == "1", raw
             assert upstream.connections == 1
@@ -309,7 +353,8 @@ async def test_stale_connection_then_refused_goes_through_the_gateway():
 async def test_bytes_already_sent_to_the_client_are_not_resent():
     """A stream that breaks after its first event reached the client keeps the existing
     behaviour (client connection closed, no local re-send, no gateway retry)."""
-    async with ScriptedUpstream(["partial"]) as upstream, serve_sidecar(upstream.url) as (sidecar, url):
+    async with ScriptedUpstream(["ok", "partial"]) as upstream, serve_sidecar(upstream.url) as (sidecar, url):
+        await _warm(url)  # even on a reused connection
         received = b""
         async with aiohttp.ClientSession() as http:
             async with http.post(url + "/v1/completions", json=completion_body(4)) as resp:
@@ -318,47 +363,57 @@ async def test_bytes_already_sent_to_the_client_are_not_resent():
                     async for data in resp.content.iter_any():
                         received += data
         assert received == ScriptedUpstream.EVENT
-        assert upstream.connections == 1 and len(upstream.requests) == 1
+        assert upstream.connections == 1 and len(upstream.requests) == 2
+        assert sidecar.local_reused == 1
         assert sidecar.metrics.reconnect == {"ok": 0, "fail": 0}
         assert sidecar.metrics.total("retry") == 0 and sidecar.metrics.total("failed") == 0
-
-
-async def _request(url: str, method: str, path: str) -> tuple[int, dict, bytes]:
-    async with aiohttp.ClientSession() as http:
-        async with http.request(method, url + path, json={"prompt": "x"}) as resp:
-            return resp.status, dict(resp.headers), await resp.read()
 
 
 @pytest.mark.asyncio
 async def test_plain_proxied_paths_are_resent_too():
     # POST: aiohttp itself never retries it (the smoke's 502s were all POSTs).
-    async with ScriptedUpstream(["rst"]) as upstream, serve_sidecar(upstream.url) as (sidecar, url):
+    async with ScriptedUpstream(["ok", "rst"]) as upstream, serve_sidecar(upstream.url) as (sidecar, url):
+        await _warm(url, "/tokenize")
         status, _, _ = await _request(url, "POST", "/tokenize")
         assert status == 200 and upstream.connections == 2
         assert sidecar.metrics.reconnect == {"ok": 1, "fail": 0}
-    async with ScriptedUpstream(["rst", "rst"]) as upstream, serve_sidecar(upstream.url) as (sidecar, url):
+    async with ScriptedUpstream(["ok", "rst", "rst"]) as upstream, serve_sidecar(upstream.url) as (sidecar, url):
+        await _warm(url, "/tokenize")
         status, headers, raw = await _request(url, "POST", "/tokenize")
         assert status == 503 and headers["Retry-After"] == "1"
         assert json.loads(raw)["error"]["layer"] == "sidecar_upstream"
-        assert sidecar.metrics.total("failed") == 0  # not client API traffic (/v1/*): not counted
-    # GET: aiohttp already re-sends an idempotent request once on its own (same pool);
-    # the sidecar's fresh-connection re-send comes on top.
-    async with ScriptedUpstream(["rst", "rst"]) as upstream, serve_sidecar(upstream.url) as (sidecar, url):
-        status, _, _ = await _request(url, "GET", "/health")
-        assert status == 200 and upstream.connections == 3
-        assert sidecar.metrics.reconnect == {"ok": 1, "fail": 0}
+        assert sidecar.metrics.total("failed") == 0  # not a client API request (POST /v1/*): not counted
 
 
 @pytest.mark.asyncio
 async def test_disabled_sidecar_proxies_api_paths_with_the_same_failure_semantics():
-    async with ScriptedUpstream(["rst", "rst"]) as upstream, serve_sidecar(upstream.url, enabled=False) as (
+    async with ScriptedUpstream(["ok", "rst", "rst"]) as upstream, serve_sidecar(upstream.url, enabled=False) as (
         sidecar, url
     ):
+        await _warm(url)
         status, headers, raw = await _request(url, "POST", "/v1/completions")
         assert status == 503 and headers["Retry-After"] == "1"
         assert json.loads(raw)["error"]["layer"] == "sidecar_upstream"
         assert sidecar.metrics.reissue == {("failed", "upstream_unavailable"): 1}
         assert sidecar.metrics.reconnect == {"ok": 0, "fail": 1}
+
+
+@pytest.mark.asyncio
+async def test_sleep_control_call_is_resent_and_rolled_back_when_it_still_fails():
+    hidden = {"X-TRE-Hidden": "1"}
+    async with ScriptedUpstream(["ok", "rst"]) as upstream, serve_sidecar(upstream.url) as (sidecar, url):
+        await _warm(url, "/tokenize")
+        status, _, _ = await _request(url, "POST", "/sleep", headers=hidden)
+        assert status == 200 and sidecar.state.sleeping
+        assert sidecar.metrics.reconnect == {"ok": 1, "fail": 0}
+        assert upstream.requests[-1].startswith("POST /sleep")
+    async with ScriptedUpstream(["ok", "rst", "rst"]) as upstream, serve_sidecar(upstream.url) as (sidecar, url):
+        await _warm(url, "/tokenize")
+        status, _, _ = await _request(url, "POST", "/sleep", headers=hidden)
+        assert status == 502  # the engine did not confirm: the sleeping mark is rolled back
+        assert not sidecar.state.active
+        assert sidecar.metrics.reconnect == {"ok": 0, "fail": 1}
+        assert sidecar.metrics.events.get("sleep_failed") == 1
 
 
 # --------------------------------------------------------------- helpers and config
@@ -398,8 +453,9 @@ def test_warnings_are_rate_limited(capsys, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_startup_warns_when_the_pool_outlives_the_server_keepalive(capsys):
-    async with serve_sidecar("http://127.0.0.1:9", upstream_keepalive_s=5.0, upstream_server_keepalive_s=5.0):
+@pytest.mark.parametrize("pool", [5.0, 4.5])
+async def test_startup_warns_when_the_pool_is_not_1s_below_the_server_keepalive(capsys, pool):
+    async with serve_sidecar("http://127.0.0.1:9", upstream_keepalive_s=pool, upstream_server_keepalive_s=5.0):
         pass
     records = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.startswith("{")]
     assert any(r.get("event") == "tre_upstream_keepalive_unsafe" and r["level"] == "WARNING" for r in records)

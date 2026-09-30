@@ -100,17 +100,21 @@ that hop fails. The manifests render them from the registry (`reissue:` and `vll
 | Variable | Container | Type | Default | Description |
 |---|---|---|---|---|
 | `VLLM_HTTP_TIMEOUT_KEEP_ALIVE` | vLLM | int (s) | `5` (vLLM); registry `75` | uvicorn keep-alive of vLLM's HTTP server: an idle connection is closed after it. Changing it changes the model Deployments (pods must be recreated). |
-| `TRE_REISSUE_UPSTREAM_KEEPALIVE_S` | sidecar | float (s) | `2` | Idle keep-alive of the sidecar's pooled connections to vLLM; must be below `VLLM_HTTP_TIMEOUT_KEEP_ALIVE` (registry validation; WARNING at sidecar startup), else a pooled connection can be reused while vLLM closes it. Registry `reissue.upstream_keepalive_s`. |
+| `TRE_REISSUE_UPSTREAM_KEEPALIVE_S` | sidecar | float (s) | `2` | Idle keep-alive of the sidecar's pooled connections to vLLM; must be at least 1 s below `VLLM_HTTP_TIMEOUT_KEEP_ALIVE` (registry validation; WARNING at sidecar startup), else a pooled connection can be reused while vLLM closes it. Registry `reissue.upstream_keepalive_s`. |
 | `TRE_REISSUE_UPSTREAM_SERVER_KEEPALIVE_S` | sidecar | float (s) | `5` | vLLM's keep-alive as rendered on the vLLM container; only used for the startup check. |
-| `TRE_REISSUE_LOCAL_RECONNECT_ATTEMPTS` | sidecar | int | `1` | Re-sends on a fresh connection when a request to vLLM failed with a disconnect / ECONNRESET / EPIPE before the first response byte (nothing sent to the client yet). `0` = off. Registry `reissue.local_reconnect_attempts`. |
+| `TRE_REISSUE_LOCAL_RECONNECT_ATTEMPTS` | sidecar | int | `1` | Re-sends on a fresh connection when a request to vLLM failed on a REUSED pooled connection with a disconnect / ECONNRESET / EPIPE before the first response byte (nothing sent to the client yet). Failures on a newly opened connection are not re-sent. `0` = off. Registry `reissue.local_reconnect_attempts`. |
 | `TRE_REISSUE_WARN_INTERVAL_S` | sidecar | float (s) | `10` | Rate limit of the WARNING lines for re-sends and upstream failures (one per kind per interval, with a `suppressed` count). |
 
-If the hop still fails before anything was sent to the client, the sidecar answers
-**503 + `Retry-After: 1`** with `{"error": {"type": "ServiceUnavailable", "layer":
-"sidecar_upstream"}}` (it used to answer 502); when nothing listens on vLLM's port, or the
-pod is asleep, the request is instead retried through the gateway with
-`x-tre-exclude-pod: <pod>`. Counted in `tre_reissue_total{kind="failed",reason="upstream_unavailable"}`
-and `tre_reissue_local_reconnect_total{result="ok|fail"}`.
+If the hop still fails before anything was sent to the client, the sidecar's own response
+is **503 + `Retry-After: 1`** with `{"error": {"type": "ServiceUnavailable", "layer":
+"sidecar_upstream"}}` (it used to answer 502). On the generation path (`POST /v1/*` with the
+sidecar enabled), when nothing listens on vLLM's port or the pod is asleep, the request is
+instead retried through the gateway with `x-tre-exclude-pod: <pod>`; on plain proxied paths a
+refused connection still answers 502. Counted in
+`tre_reissue_total{kind="failed",reason="upstream_unavailable"}` (client `POST /v1/*` only)
+and `tre_reissue_local_reconnect_total{result="ok|fail"}`. Note that this plugin rewrites an
+upstream 5xx body in the response-body phase (`responseErrorProcessingWithHeaders`): the client
+sees the sidecar's JSON inside `error.message` and, most likely, no `Retry-After`.
 
 ---
 
