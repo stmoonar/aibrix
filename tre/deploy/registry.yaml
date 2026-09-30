@@ -435,16 +435,21 @@ service_manager:
     # (no_drain_*). [] = every path drains as above (pre-2026-09-29 behaviour).
     no_drain_paths: [safescale_commit, urgent, apa]
   wake:
-    # A wake fails closed unless gpu-truth shows every target GPU at or below this
-    # fraction of its total memory: sleeping residents stay far below it, an awake
-    # resident or a sleep leak far above.
+    # Wake gate (after the account: store, GPU leases, sleep reservations). A
+    # gpu-truth sample within its Redis TTL is used as is (no wait), unless it
+    # predates this SM's last power change on the GPU (a sleep commit, a wake, a
+    # start). Trusted: every target GPU must be at or below this fraction of its
+    # total memory (sleeping residents stay far below it, an awake resident or a
+    # sleep leak far above), else 409. Missing / untrusted: the other residents of
+    # the GPU are probed (/is_sleeping): all asleep -> wake, else 409.
     max_used_fraction: 0.2
     # Optional absolute override in MiB; null = use max_used_fraction.
     max_used_mib: null
-    # A wake / cold start asks the gpu-truth agent for a fresh sample
+    # A cold start asks the gpu-truth agent for a fresh sample
     # (tre:gpu_truth_refresh:<node>) and waits up to this long for one taken after
     # the request (an old agent without refresh support: re-read the periodic
-    # sample for up to this long). Missing truth still fails closed.
+    # sample for up to this long). Missing truth still fails closed. (The wake
+    # gate never waits, see above.)
     truth_wait_s: 10
   create:
     # A cold start (scale-up create, sparse defrag destination) fails closed unless

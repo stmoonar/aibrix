@@ -1,9 +1,10 @@
-"""B3: GPU headroom gates wait for a gpu-truth sample taken after they asked.
+"""B3: the cold-start gate waits for a gpu-truth sample taken after it asked.
 
-gpu-truth used to be sampled only every 30 s, so a wake right after a sleep on
-the same GPU saw the previous occupant and was refused (409 "insufficient wake
-headroom"). The service-manager now INCRs ``tre:gpu_truth_refresh:<node>`` and
-waits for a payload whose ``refresh_seq`` answers that request.
+gpu-truth used to be sampled only every 30 s, so a cold start right after a pod
+deletion on the same GPU saw the previous occupant. The service-manager INCRs
+``tre:gpu_truth_refresh:<node>`` and waits for a payload whose ``refresh_seq``
+answers that request. (The wake gate trusts a TTL-valid sample instead, unless it
+predates a local power change: test_wake_gate_trust_20260930.py.)
 """
 
 import json
@@ -11,7 +12,7 @@ import json
 import pytest
 
 from tre_sm.allocator.slots import Slot
-from tre_sm.api.v2 import ServiceManagerV2, WakeConflict
+from tre_sm.api.v2 import ServiceManagerV2
 from tre_sm.gpu_truth import RedisGpuTruth
 from tre_sm.state.store import StateStore
 
@@ -164,96 +165,8 @@ def test_request_refresh_failure_returns_none():
     assert RedisGpuTruth(Broken()).request_refresh(node="n") is None
 
 
-# ------------------------------------------------------------ wake gate
-
-
-def test_wake_right_after_a_sleep_waits_for_the_fresh_sample():
-    # The stored sample was taken while the previous occupant was awake; it has
-    # just slept (physical memory is free now) but no periodic sample since.
-    service, agent, vllm, clock = _service(physical=BUSY_MIB)
-    agent.physical = FREE_MIB
-    start = clock.now
-
-    service.put_binding_power("pod-a", awake=True)
-
-    assert _woke(vllm)
-    assert agent.incr_calls == 1
-    assert agent.samples[-1] == (pytest.approx(start + 0.4, abs=0.25), FREE_MIB)
-    assert clock.now - start < 1.0  # one refresh round trip, not a periodic interval
-
-
-def test_wake_does_not_trust_a_stale_fine_sample_when_the_agent_serves_refreshes():
-    # Stale sample: free. Fresh sample: an awake resident / leak -> refuse.
-    service, agent, vllm, clock = _service(physical=FREE_MIB, wait_s=2.0)
-    agent.physical = BUSY_MIB
-
-    with pytest.raises(WakeConflict, match="insufficient wake headroom"):
-        service.put_binding_power("pod-a", awake=True)
-    assert not _woke(vllm)
-    assert agent.incr_calls >= 2  # a fresh sample with a problem is asked for again
-
-
-def test_wake_passes_once_a_later_fresh_sample_shows_the_memory_released():
-    service, agent, vllm, clock = _service(physical=BUSY_MIB, wait_s=5.0)
-    # The sleep is still releasing memory at the first fresh sample.
-    clock.hooks.insert(0, lambda now: setattr(agent, "physical", FREE_MIB) if now > clock_start + 1.0 else None)
-    clock_start = clock.now
-
-    service.put_binding_power("pod-a", awake=True)
-
-    assert _woke(vllm)
-    assert agent.incr_calls >= 2
-
-
-def test_wake_with_an_old_agent_falls_back_to_rereading_the_periodic_sample():
-    service, agent, vllm, clock = _service(physical=BUSY_MIB, refresh=False)
-    agent.physical = FREE_MIB
-    agent.resample_at = clock.now + 3.0  # the old agent's next periodic sample
-
-    service.put_binding_power("pod-a", awake=True)
-
-    assert _woke(vllm)
-    assert agent.incr_calls == 1  # the request was sent; nobody answered it
-
-
-def test_wake_with_an_old_agent_refuses_after_the_wait():
-    service, agent, vllm, clock = _service(physical=BUSY_MIB, refresh=False, wait_s=3.0)
-    start = clock.now
-
-    with pytest.raises(WakeConflict, match="used_mib=33000"):
-        service.put_binding_power("pod-a", awake=True)
-    assert clock.now - start == pytest.approx(3.0, abs=0.3)
-    assert not _woke(vllm)
-
-
-def test_wake_fails_closed_without_gpu_truth_even_with_refresh_requests():
-    service, agent, vllm, clock = _service(physical=FREE_MIB, publish=False, latency_s=1e9, wait_s=2.0)
-
-    with pytest.raises(WakeConflict, match="gpu truth unavailable"):
-        service.put_binding_power("pod-a", awake=True)
-    assert not _woke(vllm)
-
-
-def test_wake_passes_without_gpu_truth_only_when_explicitly_permissive():
-    service, agent, vllm, clock = _service(physical=FREE_MIB, publish=False, latency_s=1e9, require=False)
-
-    service.put_binding_power("pod-a", awake=True)
-
-    assert _woke(vllm)
-
-
-def test_an_unanswered_refresh_falls_back_to_a_fine_stale_sample_at_the_deadline(caplog):
-    # A refresh-aware agent that stopped answering (e.g. wedged nvidia-smi on the
-    # refresh path) must not block wakes forever: the TTL-valid sample decides.
-    service, agent, vllm, clock = _service(physical=FREE_MIB, latency_s=1e9, wait_s=2.0)
-    start = clock.now
-
-    with caplog.at_level("WARNING", logger="tre_sm.api.v2"):
-        service.put_binding_power("pod-a", awake=True)
-
-    assert _woke(vllm)
-    assert clock.now - start == pytest.approx(2.0, abs=0.3)
-    assert "answered refresh" in caplog.text
+# The wake gate no longer waits for a fresh sample (S1, 2026-09-30): see
+# test_wake_gate_trust_20260930.py.
 
 
 # ------------------------------------------------------------ cold-start gate

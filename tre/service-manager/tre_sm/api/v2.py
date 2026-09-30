@@ -8,8 +8,7 @@ import threading
 import time
 import re
 import json
-from dataclasses import replace
-from dataclasses import asdict
+from dataclasses import asdict, dataclass, replace
 from functools import wraps
 from typing import Callable, Protocol
 
@@ -246,6 +245,13 @@ class ServiceManagerV2:
         self._runtime_ops = runtime_ops
         self._vllm_ops = vllm_ops
         self._gpu_truth = gpu_truth
+        # Wake gate trust (S1, 2026-09-30): (node, gpu) -> the gpu-truth sample a
+        # wake gate may trust again after the last local power change on that GPU
+        # (sleep commit, wake, start, deletion). Process-local: the SM is the only
+        # writer of power changes; after a restart every TTL-valid sample is trusted
+        # (the account and the GPU leases still fence every wake).
+        self._power_marks: dict[tuple[str, int], _PowerMark] = {}
+        self._power_marks_lock = threading.Lock()
         # Explicit absolute cold-start limit (env TRE_CREATE_MAX_USED_MIB); None =
         # service_manager.create.max_used_mib, else derived per GPU and model (B9).
         self._create_max_used_mib = create_max_used_mib
@@ -2504,6 +2510,7 @@ class ServiceManagerV2:
                 binding, awake=True, hidden=desired.hidden
             )
 
+        self._note_binding_power_change(binding)
         legacy = self._store.load()
         by_id = {item.binding_id: item for item in legacy.bindings}
         by_id[binding.binding_id] = binding
@@ -2971,7 +2978,9 @@ class ServiceManagerV2:
         finally:
             if not woke:
                 self._settle_failed_wake_lease(binding, snapshot.pod_ip)
-            # Woken (or a failed wake, whatever state it left): observed follows (B2).
+            # Woken, or a failed wake in whatever state it left: an earlier gpu-truth
+            # sample no longer describes these GPUs (S1), and observed follows (B2).
+            self._note_binding_power_change(binding)
             self._refresh_observed([binding.binding_id])
 
     def _settle_failed_wake_lease(self, binding: Binding, pod_ip: str) -> None:
@@ -3075,6 +3084,8 @@ class ServiceManagerV2:
         if self._gpu_leases is not None:
             for binding in slept:
                 self._gpu_leases.release(binding)
+        for binding in slept:
+            self._note_binding_power_change(binding)
         if not update_store:
             return
         slept_ids = {binding.binding_id for binding in slept}
@@ -3123,33 +3134,197 @@ class ServiceManagerV2:
         self._sleep_targets([SleepTarget(binding, pod_ip)], sleep_path="repair")
 
     def _ensure_wake_headroom(self, binding: Binding) -> None:
-        """Fail closed unless gpu-truth shows the binding's GPUs free enough to wake.
+        """The physical side of a wake's feasibility (S1, 2026-09-30).
 
-        Sleeping residents keep only a small footprint; an awake resident on the
-        same GPU (or a sleep leak) is far above the wake threshold (registry
-        ``service_manager.wake.max_used_fraction`` of the GPU's total memory, or
-        the absolute ``max_used_mib`` override) and would make the wake OOM or
-        double-book the GPU (the sleeping-capacity deadlock). A sleep that just
-        finished is not in the periodic sample yet: the gate waits for a fresh
-        one (:meth:`_gpu_truth_gate`).
-        """
+        The account (store, GPU leases, sleep reservations; :meth:`_ensure_feasible_wake`)
+        decides first; this gate only catches what the account cannot see - a sleep
+        leak, a Pod the store does not know. It never waits for a new gpu-truth
+        sample:
+
+        * the node's sample (present = within the agent's Redis TTL) is TRUSTED
+          unless it predates the last local power change on one of the binding's
+          GPUs (:meth:`_note_power_change`: the agent must have answered the refresh
+          request sent right after that change);
+        * trusted and every GPU at most the wake limit (registry
+          ``service_manager.wake.max_used_fraction`` / ``max_used_mib``) -> pass;
+          trusted and above it -> refuse (409 ``gpu_truth_used``; a refresh is
+          requested so the next attempt sees a new sample);
+        * missing, untrusted or incomplete -> neither pass nor refuse on it: probe
+          ``/is_sleeping`` of every other resident on those GPUs; all asleep -> pass,
+          any awake -> refuse (``resident_awake``), any unknown -> refuse
+          (``gpu_truth_unavailable`` when the node has no sample at all - a node
+          scope refusal - else ``resident_unknown``).
+
+        ``require_gpu_truth`` false keeps the permissive behaviour for a missing
+        sample (pass without probing)."""
         if self._gpu_truth is None:
             return
-        nodes = {node.name: node for node in self._registry.topology().nodes}
-        node = nodes.get(binding.slot.node)
-        problem = self._gpu_truth_gate(
-            binding.slot.node,
-            lambda node_truth: self._wake_headroom_problem(binding, node, node_truth),
-            retry_stale=True,
-            what=f"wake of {binding.serve_id}",
+        node_name = binding.slot.node
+        gpus = tuple(binding.slot.gpu_ids)
+        spec = {node.name: node for node in self._registry.topology().nodes}.get(node_name)
+        try:
+            truth = self._gpu_truth.node_truth(node=node_name)
+        except Exception:  # noqa: BLE001 - an unreadable sample is a missing one
+            LOG.warning("reading gpu truth of %s failed", node_name, exc_info=True)
+            truth = None
+        verdict, detail = self._wake_truth_verdict(binding, spec, truth)
+        if verdict == "ok":
+            return
+        if verdict == "over":
+            self._request_truth_refresh(node_name)
+            raise WakeConflict(
+                f"insufficient wake headroom: {detail}",
+                reason="gpu_truth_used", node=node_name, gpus=gpus, binding_id=binding.binding_id,
+            )
+        if truth is None and not self._require_gpu_truth:
+            return
+        residents = self._probe_gpu_residents(binding)
+        awake = sorted(binding_id for binding_id, sleeping in residents if sleeping is False)
+        unknown = sorted(binding_id for binding_id, sleeping in residents if sleeping is None)
+        if awake:
+            raise WakeConflict(
+                f"{binding.binding_id}: {detail}; resident(s) {awake} on "
+                f"{node_name}/{','.join(str(g) for g in gpus)} are awake",
+                reason="resident_awake", node=node_name, gpus=gpus, binding_id=binding.binding_id,
+            )
+        if unknown:
+            node_scope = truth is None
+            raise WakeConflict(
+                f"{binding.binding_id}: {detail}; cannot verify resident(s) {unknown} asleep",
+                reason="gpu_truth_unavailable" if node_scope else "resident_unknown",
+                node=node_name, gpus=gpus, scope="node" if node_scope else "gpu",
+                binding_id=binding.binding_id,
+            )
+        LOG.info(
+            json.dumps(
+                {"event": "wake_gate_probe_pass", "binding_id": binding.binding_id,
+                 "truth": detail, "residents_asleep": sorted(b for b, _ in residents)},
+                sort_keys=True,
+            )
         )
-        if problem is not None:
-            raise WakeConflict(f"insufficient wake headroom: {problem}")
+
+    def _wake_truth_verdict(self, binding: Binding, node, node_truth) -> tuple[str, str]:
+        """("ok" | "over" | "unknown", detail) of the gpu-truth sample for a wake of
+        ``binding`` (see :meth:`_ensure_wake_headroom`)."""
+        node_name = binding.slot.node
+        if node_truth is None:
+            return "unknown", (
+                f"gpu truth unavailable for node {node_name} "
+                "(is the tre-v2-gpu-truth DaemonSet healthy?)"
+            )
+        stale = self._untrusted_gpus(node_name, binding.slot.gpu_ids, node_truth)
+        if stale:
+            return "unknown", (
+                f"gpu truth sample of {node_name} (refresh_seq={node_truth.refresh_seq}, "
+                f"seq={node_truth.seq}) predates the last power change on gpu(s) {stale}"
+            )
+        missing: list[str] = []
+        for gpu_id in binding.slot.gpu_ids:
+            gpu_uuid = _gpu_uuid(node, gpu_id)
+            if gpu_uuid is None:
+                missing.append(f"{node_name}/{gpu_id} has no GPU UUID in the registry")
+                continue
+            used_mib = node_truth.used_mib(gpu_uuid)
+            if used_mib is None:
+                missing.append(f"gpu truth for {node_name}/{gpu_uuid} missing")
+                continue
+            total = getattr(node_truth, "total_mib", None)
+            limit = self._sm_config.wake_limit_mib(total(gpu_uuid) if callable(total) else None)
+            if limit is None:
+                missing.append(
+                    f"gpu truth for {node_name}/{gpu_uuid} reports no total memory "
+                    "(set service_manager.wake.max_used_mib to use an absolute threshold)"
+                )
+                continue
+            if used_mib > limit:
+                return "over", (
+                    f"{binding.binding_id}: {node_name}/{gpu_uuid} "
+                    f"used_mib={used_mib} > wake limit {limit} MiB"
+                )
+        if missing and self._require_gpu_truth:
+            return "unknown", "; ".join(missing)
+        return "ok", "gpu truth within the wake limit"
+
+    def _untrusted_gpus(self, node_name: str, gpu_ids, node_truth) -> list[int]:
+        """GPUs whose last local power change the sample ``node_truth`` does not
+        reflect yet: it must answer the refresh request sent after the change
+        (``refresh_seq``), or - an agent without refreshes - be a later publish
+        (``seq``); a sample with neither is untrusted after any change."""
+        with self._power_marks_lock:
+            marks = {gpu: self._power_marks.get((node_name, int(gpu))) for gpu in gpu_ids}
+        refresh_seq = getattr(node_truth, "refresh_seq", None)
+        seq = getattr(node_truth, "seq", None)
+        stale: list[int] = []
+        for gpu, mark in marks.items():
+            if mark is None:
+                continue
+            if mark.refresh_seq is not None and isinstance(refresh_seq, int):
+                if refresh_seq < mark.refresh_seq:
+                    stale.append(int(gpu))
+                continue
+            if mark.seq is not None and isinstance(seq, int):
+                if seq <= mark.seq:
+                    stale.append(int(gpu))
+                continue
+            stale.append(int(gpu))
+        return stale
+
+    def _note_power_change(self, node_name: str, gpu_ids) -> None:
+        """A local power change on ``node_name``/``gpu_ids`` (sleep commit, wake,
+        start, failed start, deletion; S1): a gpu-truth sample taken before it no
+        longer describes those GPUs. Asks the node's agent for a new sample (INCR,
+        never waits) and records what a sample must answer to be trusted again.
+        Best effort."""
+        if self._gpu_truth is None or not gpu_ids:
+            return
+        requested = self._request_truth_refresh(node_name)
+        seq = None
+        try:
+            truth = self._gpu_truth.node_truth(node=node_name)
+            value = getattr(truth, "seq", None) if truth is not None else None
+            seq = value if isinstance(value, int) and not isinstance(value, bool) else None
+        except Exception:  # noqa: BLE001 - the refresh counter alone is enough
+            seq = None
+        with self._power_marks_lock:
+            for gpu in gpu_ids:
+                key = (node_name, int(gpu))
+                self._power_marks[key] = _PowerMark.merged(self._power_marks.get(key), requested, seq)
+
+    def _note_binding_power_change(self, binding: Binding) -> None:
+        self._note_power_change(binding.slot.node, binding.slot.gpu_ids)
+
+    def _probe_gpu_residents(self, binding: Binding) -> list[tuple[str, bool | None]]:
+        """(binding id, /is_sleeping) of every other Pod on ``binding``'s GPUs; a
+        Pod without an IP or not Ready (e.g. still loading) is unknown (None)."""
+        lister = getattr(self._runtime_ops, "list_pod_snapshots", None)
+        if not callable(lister) or self._vllm_ops is None:
+            return [("<no runtime to probe residents>", None)]
+        wanted = set(binding.slot.gpu_ids)
+        residents: list[tuple[str, bool | None]] = []
+        for snapshot in lister():
+            if snapshot.name == binding.serve_id or snapshot.node != binding.slot.node:
+                continue
+            try:
+                other = _binding_from_snapshot(snapshot)
+            except (KeyError, ValueError):
+                continue
+            if not wanted.intersection(other.slot.gpu_ids):
+                continue
+            state: bool | None = None
+            if snapshot.pod_ip and snapshot.ready:
+                try:
+                    state = self._vllm_ops.is_sleeping(snapshot.pod_ip, port=8000)
+                except Exception:  # noqa: BLE001 - unreachable = unknown
+                    state = None
+            residents.append((other.binding_id, state))
+        return residents
 
     def _gpu_truth_gate(self, node_name: str, problem, *, retry_stale: bool, what: str) -> str | None:
         """Evaluate ``problem(node_truth)`` (None = pass, else the reason) on a
         gpu-truth sample taken AFTER this call started; returns the reason to
-        refuse, or None.
+        refuse, or None. Used by the cold-start gate only (a cold start writes a
+        whole model onto the GPU; the wake gate never waits, see
+        :meth:`_ensure_wake_headroom`).
 
         The agent samples periodically, so right after a sleep (or a pod deletion)
         on the same GPU the stored sample still shows the previous occupant. The
@@ -3206,41 +3381,6 @@ class ServiceManagerV2:
             LOG.warning("gpu-truth refresh request for %s failed", node_name, exc_info=True)
             return None
         return value if isinstance(value, int) and not isinstance(value, bool) else None
-
-    def _wake_headroom_problem(self, binding: Binding, node, node_truth) -> str | None:
-        if node_truth is None:
-            if not self._require_gpu_truth:
-                return None
-            return (
-                f"gpu truth unavailable for node {binding.slot.node} "
-                "(is the tre-v2-gpu-truth DaemonSet healthy?)"
-            )
-        for gpu_id in binding.slot.gpu_ids:
-            gpu_uuid = _gpu_uuid(node, gpu_id)
-            if gpu_uuid is None:
-                if not self._require_gpu_truth:
-                    continue
-                return f"{binding.slot.node}/{gpu_id} has no GPU UUID in the registry"
-            used_mib = node_truth.used_mib(gpu_uuid)
-            if used_mib is None:
-                if not self._require_gpu_truth:
-                    continue
-                return f"gpu truth for {binding.slot.node}/{gpu_uuid} missing"
-            total = getattr(node_truth, "total_mib", None)
-            limit = self._sm_config.wake_limit_mib(total(gpu_uuid) if callable(total) else None)
-            if limit is None:
-                if not self._require_gpu_truth:
-                    continue
-                return (
-                    f"gpu truth for {binding.slot.node}/{gpu_uuid} reports no total memory "
-                    "(set service_manager.wake.max_used_mib to use an absolute threshold)"
-                )
-            if used_mib > limit:
-                return (
-                    f"{binding.binding_id}: {binding.slot.node}/{gpu_uuid} "
-                    f"used_mib={used_mib} > wake limit {limit} MiB"
-                )
-        return None
 
     def sleep_state(self) -> dict:
         """Counters, in-progress journal and recent outcomes of the sleep primitive."""
@@ -3682,9 +3822,11 @@ class ServiceManagerV2:
                     self._gpu_leases.acquire(binding, phase="awake")
         except BaseException:
             self._discard_failed_start(planned, created)
+            self._note_binding_power_change(planned)
             self._refresh_observed([planned.binding_id])
             raise
         self._finish_admitted_start(ready.name)
+        self._note_binding_power_change(binding)
         self._refresh_observed([binding.binding_id])
         return binding
 
@@ -3838,6 +3980,7 @@ class ServiceManagerV2:
         actions.append({"action": "delete_deployment", "serve_id": binding.serve_id})
 
         self._runtime_ops.wait_pod_deleted(binding.serve_id)
+        self._note_binding_power_change(binding)  # its sleeping footprint is gone too (S1)
         self._refresh_observed([binding.binding_id])  # its pod is gone (B2)
 
     def _start_defrag_destination(
@@ -4109,7 +4252,74 @@ class DefragDisabled(DefragUnavailable):
 
 
 class WakeConflict(ValueError):
-    pass
+    """A wake refused on its GPUs (HTTP 409). ``reason`` names why (S3):
+
+    * ``slot_occupied`` - an awake binding holds one of the GPUs (the account);
+    * ``lease_starting`` / ``lease_waking`` - a Pod is loading / being woken there;
+    * ``wake_in_progress`` - this binding is being woken by another request;
+    * ``gpu_truth_used`` - a trusted gpu-truth sample shows the GPU in use;
+    * ``resident_awake`` / ``resident_unknown`` - the resident probe (no trusted
+      sample) found a resident awake / could not read one;
+    * ``gpu_truth_unavailable`` - the node has no gpu-truth sample and a resident
+      could not be verified (``scope`` ``node``: the whole node is suspect).
+
+    ``node`` / ``gpus`` locate the refusal, so a caller can avoid those GPUs (or
+    the node) for a while instead of retrying the same slot."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason: str = "slot_occupied",
+        node: str | None = None,
+        gpus=(),
+        scope: str = "gpu",
+        binding_id: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.reason = reason
+        self.node = node
+        self.gpus = tuple(int(gpu) for gpu in gpus)
+        self.scope = scope
+        self.binding_id = binding_id
+
+    def body(self) -> dict:
+        """The structured 409 body; ``detail`` keeps the plain message older
+        controllers read."""
+        return {
+            "detail": str(self),
+            "error": "wake_conflict",
+            "reason": self.reason,
+            "node": self.node,
+            "gpu": list(self.gpus),
+            "scope": self.scope,
+            "binding_id": self.binding_id,
+        }
+
+
+@dataclass(frozen=True)
+class _PowerMark:
+    """What a gpu-truth sample must answer to be trusted after the last local power
+    change on one GPU (S1): ``refresh_seq`` = the refresh request sent right after
+    the change, ``seq`` = the agent's publish counter seen at the change (for an
+    agent that does not serve refreshes). None = unknown."""
+
+    refresh_seq: int | None
+    seq: int | None
+
+    @staticmethod
+    def merged(previous: "_PowerMark | None", refresh_seq: int | None, seq: int | None) -> "_PowerMark":
+        if previous is None:
+            return _PowerMark(refresh_seq, seq)
+
+        def newest(old, new):
+            if old is None:
+                return new
+            if new is None:
+                return old
+            return max(old, new)
+
+        return _PowerMark(newest(previous.refresh_seq, refresh_seq), newest(previous.seq, seq))
 
 
 class RetryLater(RuntimeError):

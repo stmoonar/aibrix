@@ -635,16 +635,19 @@ LOG_LEVEL_NAMES = ("CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG")
 @dataclass(frozen=True)
 class ServiceManagerConfig:
     sleep: SleepPolicy = field(default_factory=SleepPolicy)
-    #: Wake fails closed unless every target GPU's used memory (gpu-truth) is at
-    #: most this fraction of the GPU's total memory: sleeping residents keep only
-    #: a small footprint; an awake resident (or a leak) is far above it.
+    #: A wake with a TRUSTED gpu-truth sample (within its TTL and not older than
+    #: the SM's last power change on the GPU) fails unless every target GPU's used
+    #: memory is at most this fraction of the GPU's total memory: sleeping
+    #: residents keep only a small footprint; an awake resident (or a leak) is far
+    #: above it. Without a trusted sample the GPU's residents are probed instead.
     wake_max_used_fraction: float = 0.2
     #: Optional absolute override (MiB) of the wake threshold; None = the fraction.
     wake_max_used_mib: int | None = None
-    #: How long a GPU headroom gate (wake, cold start) waits for a gpu-truth
-    #: sample taken AFTER it asked for one (the agent's on-demand refresh,
+    #: How long the cold-start headroom gate waits for a gpu-truth sample taken
+    #: AFTER it asked for one (the agent's on-demand refresh,
     #: ``tre:gpu_truth_refresh:<node>``); with an agent that does not answer
-    #: refreshes it re-reads the periodic sample for up to this long instead.
+    #: refreshes it re-reads the periodic sample for up to this long instead. The
+    #: wake gate never waits (2026-09-30).
     wake_truth_wait_s: float = 10.0
     #: Cold start (create) headroom (B9). vLLM refuses to start an engine unless the
     #: GPU's free memory is at least gpu_memory_utilization x total, so a create is
