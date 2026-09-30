@@ -587,6 +587,9 @@ def _model_contexts(
                 signal_warm = True
             context = {
                 "trs": result.TRS,
+                # Pre-EMA TSS, read-only: exposed so a capture can store raw TSS, EMA and Z
+                # of the same tick (the replica factor it includes is not otherwise exposed).
+                "trs_raw": result.TRS_raw,
                 "z_m": signal.z_m,
                 "signal_source": signal.source,
                 "signal_raw_value": signal.raw_value,
@@ -616,6 +619,7 @@ def _model_contexts(
             pass
             context = {
                 "trs": 0.0,
+                "trs_raw": None,
                 "z_m": None,
                 "signal_source": signal_source,
                 "signal_raw_value": None,

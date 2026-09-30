@@ -1210,6 +1210,7 @@ def make_pod_metrics_sampler(
     *,
     fetch: Callable[[str], str] = _default_fetch,
     gauges: dict[str, str] | None = None,
+    recorder=None,
 ) -> Callable[[int], dict]:
     """Instant queue snapshot read straight from the pods, summed across ``endpoints``.
 
@@ -1220,25 +1221,46 @@ def make_pod_metrics_sampler(
 
     Plus ``kv_cache_usage`` (diagnostic): the MEAN KV-cache usage over the pods that
     reported it this tick (:func:`parse_pod_kv_cache_usage`), None when none did.
+
+    ``recorder`` (a :class:`scripts.calibration_capture.VllmMetricsRecorder`) is handed
+    every body this sampler fetches - ``record(url, now_ms, body)``, or
+    ``record_error(url, now_ms, error)`` for a failed scrape - so the per-pod counters and
+    histograms are kept from the same scrape, not a second one. A recorder that raises is
+    ignored: it must never cost the queue sample.
     """
     if not endpoints:
         raise ValueError("make_pod_metrics_sampler needs at least one /metrics endpoint")
 
-    def sample(_now_ms: int) -> dict:
+    def _hand(method: str, *argv) -> None:
+        if recorder is None:
+            return
+        try:
+            getattr(recorder, method)(*argv)
+        except Exception:  # noqa: BLE001 - the capture never costs the queue sample
+            pass
+
+    def sample(now_ms: int) -> dict:
         totals = {key: 0.0 for key in (gauges or POD_INSTANT_GAUGES)}
         errors = 0
         kv: list[float] = []
+        # the recorder's parse runs after every pod was fetched, so it never delays the
+        # next pod's scrape (the queue sample keeps its single instant)
+        handed: list[tuple] = []
         for url in endpoints:
             try:
                 body = fetch(url)
-            except Exception:  # noqa: BLE001 - a dead pod must not kill the sidecar
+            except Exception as exc:  # noqa: BLE001 - a dead pod must not kill the sidecar
                 errors += 1
+                handed.append(("record_error", url, now_ms, repr(exc)))
                 continue
+            handed.append(("record", url, now_ms, body))
             for key, value in parse_pod_gauges(body, gauges).items():
                 totals[key] += value
             usage = parse_pod_kv_cache_usage(body)
             if usage is not None:
                 kv.append(usage)
+        for call in handed:
+            _hand(*call)
         totals["scrape_errors"] = float(errors)
         totals["pods_scraped"] = float(len(endpoints) - errors)
         totals[KV_CACHE_USAGE_KEY] = (sum(kv) / len(kv)) if kv else None

@@ -6,6 +6,7 @@ from typing import Iterable, Sequence
 
 from tre_calibration.dataset import CalibrationWindow
 from tre_calibration.fit import DEFAULT_SIGNAL_DIRECTION, signal_orientation
+from tre_calibration.ranking import auroc
 
 
 @dataclass(frozen=True)
@@ -98,19 +99,13 @@ def evaluate_signal_direction(
 
 
 def _auc(scores: Sequence[float], labels: Sequence[int]) -> float:
-    pos = [score for score, label in zip(scores, labels) if label == 1]
-    neg = [score for score, label in zip(scores, labels) if label == 0]
-    if not pos or not neg:
+    """AUROC of ``scores`` for ``labels == 1`` (:func:`tre_calibration.ranking.auroc`, the
+    shared Mann-Whitney implementation); 0.5 when a class is empty, as before."""
+    pairs = [(score, label == 1) for score, label in zip(scores, labels) if label in (0, 1)]
+    value = auroc([score for score, _ in pairs], [positive for _, positive in pairs])
+    if value is None:
         return 0.5
-
-    wins = 0.0
-    for pos_score in pos:
-        for neg_score in neg:
-            if pos_score > neg_score:
-                wins += 1.0
-            elif pos_score == neg_score:
-                wins += 0.5
-    return wins / (len(pos) * len(neg))
+    return value
 
 
 def _spearman(values_x: Sequence[float], values_y: Sequence[float]) -> float:

@@ -132,6 +132,7 @@ from tre_common import slo_labels
 
 from scripts import adaptive_boundary as boundary
 from scripts import admission_cap as admission
+from scripts import calibration_capture as capture
 from scripts import gen_calibration_schedules as gen
 from scripts import openloop
 from scripts import static_grid
@@ -539,6 +540,30 @@ def sm_actuation(namespace: str = "tre-v2") -> str:
     return _redis_get(SM_ACTUATION_KEY, namespace)
 
 
+def require_capture_clock_domains(args, models: Optional[Sequence[str]] = None) -> Optional[dict]:
+    """The run-level clock pre-flight of the capture (:mod:`scripts.calibration_capture`):
+    for every model the gateway's round stamps and the controller's window ends must be
+    in redis's time domain (the capture places every redis dump in redis time and checks
+    each cell again; a cell that fails is marked ``clock_domain_mismatch``). Raises
+    SystemExit with the measured offsets otherwise. Skipped with --no-capture-extras."""
+    if getattr(args, "no_capture_extras", False):
+        return None
+    if models is None:
+        models = [m for m in str(getattr(args, "models", "") or "").split(",") if m]
+    import redis  # type: ignore[import-not-found]
+
+    url = getattr(args, "redis_url", None) or capture.DEFAULT_REDIS_URL
+    cfg = capture.ClockDomainConfig(window_ms=int(args.window_ms))
+    try:
+        verdicts = capture.require_clock_domains(redis.Redis.from_url(url), list(models), cfg)
+    except capture.ClockDomainMismatch as exc:
+        raise SystemExit(str(exc)) from None
+    for model, v in verdicts.items():
+        print(f"clock domains ({model}, vs redis TIME): gateway write delay "
+              f"{v['gateway'].get('write_delay_ms')} ms, controller lag {v['controller'].get('lag_ms')} ms")
+    return verdicts
+
+
 def require_calibration_run_mode(namespace: str = "tre-v2") -> dict[str, str]:
     """Both switches must be set to observe explicitly (a missing key is observe
     for its reader, but calibration requires a deliberate setting). Raises
@@ -628,6 +653,15 @@ def cell_command(cell: Cell, args, schedule_path: Path, output: Path) -> list[st
         # the fit trains on.
         *slo_labels.label_mode_cli_args(primary_label(args, cell.model)),
     ]
+    if not getattr(args, "no_capture_extras", False):
+        # The system-side evidence of the cell (scripts.calibration_capture): per-pod vLLM
+        # metrics, the gateway's redis docs, the controller's ticks, under
+        # <dir of the online CSV>/cells/<stem>/ - next to raw/, never inside it.
+        # The run checked the clock domains before its first cell (require_capture_clock_domains):
+        # a cell that fails the check later is run and its redis dumps marked, not refused.
+        command += ["--capture-dir", str(Path(output).parent / capture.CELLS_DIRNAME),
+                    "--control-namespace", str(getattr(args, "controller_namespace", "tre-v2") or ""),
+                    "--clock-domain-check", "flag"]
     if cell.drain_start_s is not None:
         command += ["--drain-start-s", str(cell.drain_start_s)]
     if getattr(args, "envoy_stats_url", None):
@@ -1698,6 +1732,7 @@ def run_reprobe(args, targets: Mapping[str, Sequence[str]]) -> int:
         return 0
 
     require_calibration_run_mode(args.controller_namespace)
+    require_capture_clock_domains(args, list(targets))
     index_path = Path(args.index)
     index = json.loads(index_path.read_text(encoding="utf-8")) if index_path.exists() else {}
     cap = admission.get_cap(args.cap or index.get("admission_cap", {}).get("name")
@@ -1903,14 +1938,35 @@ def run_provenance(args) -> dict:
 CAMPAIGN_STATUS_FILE = "campaign_status.json"
 
 
-def finalize_run(out_dir: Path, *, status: str, exit_code: int) -> None:
+def finalize_run(out_dir: Path, *, status: str, exit_code: int, redis_url: Optional[str] = None) -> None:
     """Record how the campaign ended, then build the standard dataset.
 
     Never raises: the dataset is a conversion of what is on disk and can always be
     rebuilt by hand (``python -m scripts.calibration_dataset <run>``); a failure here
     must not turn a finished campaign into a failed one.
+
+    First completes the redis dumps of the last cell(s)
+    (:func:`scripts.calibration_capture.backfill_pending`, waiting at most
+    ``DEFAULT_FINAL_BACKFILL_WAIT_S`` for the controller to process their tail windows),
+    through ``redis_url`` or, like ``r3_grid``, the in-cluster default;
+    ``python -m scripts.calibration_capture backfill`` does the same by hand.
     """
     out_dir = Path(out_dir)
+    if capture.pending_cells(out_dir):
+        redis_url = redis_url or capture.DEFAULT_REDIS_URL
+        try:
+            import redis  # type: ignore[import-not-found]
+
+            done = capture.backfill_pending(
+                out_dir, redis.Redis.from_url(redis_url),
+                wait_s=capture.DEFAULT_FINAL_BACKFILL_WAIT_S,
+            )
+            print(f"capture backfill: {len(done)} cell(s) re-dumped, "
+                  f"{len(capture.pending_cells(out_dir, max_age_s=None))} still pending")
+        except Exception as exc:  # noqa: BLE001 - see docstring
+            print(f"WARNING: capture backfill via {redis_url} failed ({exc!r}); "
+                  f"{len(capture.pending_cells(out_dir, max_age_s=None))} cell(s) still pending: run "
+                  f"python -m scripts.calibration_capture backfill {out_dir} --redis-url <url>")
     (out_dir / CAMPAIGN_STATUS_FILE).write_text(
         json.dumps(
             {"status": status, "exit_code": exit_code, "finished_at_utc": utc_iso()},
@@ -2029,6 +2085,7 @@ def run_campaign(args) -> int:
 
     modes = require_calibration_run_mode(args.controller_namespace)
     print(f"controller mode: {modes['controller_mode']}, SM actuation: {modes['sm_actuation']}")
+    require_capture_clock_domains(args, models)
 
     status, code = "failed", 1
     try:
@@ -2039,7 +2096,8 @@ def run_campaign(args) -> int:
         status = "interrupted"
         raise
     finally:
-        finalize_run(out_dir, status=status, exit_code=code)
+        finalize_run(out_dir, status=status, exit_code=code,
+                     redis_url=getattr(args, "redis_url", None))
     return code
 
 
@@ -2237,6 +2295,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--stop-on-failure", action="store_true")
     ap.add_argument("--registry", default=None)
     ap.add_argument("--redis-url", default=None)
+    ap.add_argument("--no-capture-extras", action="store_true",
+                    help="do not keep the per-cell system-side evidence (per-pod vLLM metrics, "
+                         "gateway redis docs, controller ticks; scripts.calibration_capture)")
     ap.add_argument("--model-namespace", default="default")
     ap.add_argument("--controller-namespace", default="tre-v2")
     ap.add_argument("--dry-run", action="store_true",

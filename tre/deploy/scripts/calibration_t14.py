@@ -796,13 +796,18 @@ def print_plan(plan: Mapping, model: str) -> None:
 
 
 def sealed_files(out_dir: Path, raw_dir: Path, records: Sequence[Mapping]) -> list[Path]:
-    """Every file of the out-dir (``dataset/`` and the seal itself excluded) and every
-    attempt's raw capture."""
+    """Every file of the out-dir (``dataset/``, the seal itself and the per-cell capture
+    evidence ``cells/`` excluded - its redis dumps are completed by a backfill that may run
+    after the seal, see :mod:`scripts.calibration_capture`) and every attempt's raw
+    capture."""
+    from scripts.calibration_capture import CELLS_DIRNAME
+
     out_dir = Path(out_dir).resolve()
     skip = {T14_MANIFEST, T14_SHA256SUMS}
     files = {p.resolve() for p in out_dir.rglob("*")
              if p.is_file() and p.name not in skip
              and "dataset" not in p.relative_to(out_dir).parts[:1]
+             and CELLS_DIRNAME not in p.relative_to(out_dir).parts[:-1]
              and not p.name.startswith(".")}
     for r in records:
         raw = Path(raw_dir) / str(r["stem"])
@@ -991,6 +996,7 @@ def run_t14_set(args, *, drive: Optional[Callable] = None,
             raise SystemExit(f"controller mode is {mode!r}, refusing to run (need "
                              f"{campaign.REQUIRED_CONTROLLER_MODE!r})")
         print(f"controller mode: {mode}")
+        campaign.require_capture_clock_domains(args)
     plan["run_manifest_sha256"] = ladder.write_frozen(out_dir / ladder.RUN_MANIFEST, manifest)
     (out_dir / "plan.json").write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")
     raw_dir.mkdir(parents=True, exist_ok=True)
@@ -1024,7 +1030,8 @@ def run_t14_set(args, *, drive: Optional[Callable] = None,
     finally:
         if result is None:
             result = run.result(status)
-        training.finish(out_dir, plan, result, status, code)
+        training.finish(out_dir, plan, result, status, code,
+                        redis_url=getattr(args, "redis_url", None))
 
 
 # ---------------------------------------------------------------------------- CLI

@@ -569,6 +569,7 @@ def run_boundary_supplement(args, targets: Mapping[str, Sequence[str]], *,
             raise SystemExit(f"controller mode is {mode!r}, refusing to run (need "
                              f"{campaign.REQUIRED_CONTROLLER_MODE!r})")
         print(f"controller mode: {mode}")
+        campaign.require_capture_clock_domains(args)
     plan["run_manifest_sha256"] = ladder.write_frozen(out_dir / ladder.RUN_MANIFEST, manifest)
     (out_dir / "plan.json").write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")
 
@@ -618,4 +619,5 @@ def run_boundary_supplement(args, targets: Mapping[str, Sequence[str]], *,
         (out_dir / ladder.DESIGN_RESULT).write_text(
             json.dumps({"mode": MODE, "run_manifest_sha256": plan.get("run_manifest_sha256"),
                         "models": [result]}, indent=2) + "\n", encoding="utf-8")
-        campaign.finalize_run(out_dir, status=status, exit_code=code)
+        campaign.finalize_run(out_dir, status=status, exit_code=code,
+                              redis_url=getattr(args, "redis_url", None))

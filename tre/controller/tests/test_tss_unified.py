@@ -91,3 +91,6 @@ def test_in_flight_work_still_classifies_on_z() -> None:
     contexts, _ = _model_contexts(MetricsSnapshot(ts_ms=60_000, models={"m": wm}, stale=False), _registry(1500.0))
     assert contexts["m"]["tss_defined"] is True
     assert abs(contexts["m"]["z_m"] - 0.8) < 1e-12
+    # the pre-EMA TSS is exposed read-only (first window: the EMA starts at the raw value)
+    assert abs(contexts["m"]["trs_raw"] - 1200.0) < 1e-9
+    assert contexts["m"]["trs_raw"] == contexts["m"]["trs"]

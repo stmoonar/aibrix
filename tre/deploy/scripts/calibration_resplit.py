@@ -326,12 +326,10 @@ def rank_avg(v: Sequence[float]) -> list[float]:
 
 
 def auroc(scores: Sequence[float], pos: Sequence[bool]) -> float | None:
-    n1 = sum(pos)
-    n0 = len(pos) - n1
-    if not n1 or not n0:
-        return None
-    r = rank_avg(scores)
-    return (sum(ri for ri, p in zip(r, pos) if p) - n1 * (n1 + 1) / 2.0) / (n1 * n0)
+    """Mann-Whitney AUROC, None for one class: :func:`tre_calibration.ranking.auroc`."""
+    from tre_calibration.ranking import auroc as shared
+
+    return shared(scores, [bool(p) for p in pos])
 
 
 def spearman(x: Sequence[float], y: Sequence[float]) -> float | None:
