@@ -2106,10 +2106,10 @@ def _accept_result(freeze_file: Path, inp: Mapping[str, Any], work: Path, *, n_r
         for line in (mdir / str(man["sha256sums_file"])).read_text(encoding="utf-8").splitlines():
             if line.strip():
                 name = _parse_sums_line(line)[1]
-                sums_cover.add(str(Path(name) if Path(name).is_absolute() else mdir / name))
+                sums_cover.add(str((Path(name) if Path(name).is_absolute() else mdir / name).resolve()))
     datasets = [{"name": s.name, "directory": str(s.directory), "windows_csv": str(s.windows),
                  "windows_csv_sha256": sha256_file(s.windows),
-                 "covered_by_m_sha256sums": str(s.windows) in sums_cover}
+                 "covered_by_m_sha256sums": str(Path(s.windows).resolve()) in sums_cover}
                 for s in inp["sources"]]
     from tre_calibration import ranking
 
