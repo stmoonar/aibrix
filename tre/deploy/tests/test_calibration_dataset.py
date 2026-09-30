@@ -398,10 +398,39 @@ def test_a_chat_dataset_records_its_api_and_the_per_request_expected_length(tmp_
 
 def test_prompt_tokens_mismatched_counts_served_requests_off_their_length():
     records = [
-        {"http_status": 200, "expected_prompt_tokens": 512, "input_tokens": 512},
-        {"http_status": 200, "expected_prompt_tokens": 512, "input_tokens": 511},
-        {"http_status": 200, "expected_prompt_tokens": 512, "input_tokens": None},
-        {"http_status": 503, "expected_prompt_tokens": 512, "input_tokens": None},
+        {"http_status": 200, "e2e_ms": 5.0, "expected_prompt_tokens": 512, "input_tokens": 512},
+        {"http_status": 200, "e2e_ms": 5.0, "expected_prompt_tokens": 512, "input_tokens": 511},
+        {"http_status": 200, "e2e_ms": 5.0, "expected_prompt_tokens": 512, "input_tokens": None},
+        {"http_status": 503, "e2e_ms": 5.0, "expected_prompt_tokens": 512, "input_tokens": None},
+        {"http_status": 200, "e2e_ms": 5.0, "expected_prompt_tokens": 512, "input_tokens": None,
+         "outcome": "model_error"},
     ]
     assert dataset._prompt_tokens_mismatched(records) == 2
     assert dataset._prompt_tokens_mismatched([{"http_status": 200, "input_tokens": 5}]) is None
+
+
+def _put_off_length(campaign_dir: Path, model: str) -> None:
+    """Make the served requests of one cell report a prompt length other than their own."""
+    raw_path = campaign_dir / "raw" / f"{model}_S1_steps" / "i256_o128_c95.jsonl"
+    rows = [json.loads(line) for line in raw_path.read_text(encoding="utf-8").splitlines()]
+    for row in rows:
+        row["expected_prompt_tokens"] = (row.get("input_tokens") or 256) + 1
+    raw_path.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+
+
+def test_a_cell_off_its_prompt_length_refuses_the_dataset_unless_allowed(tmp_path):
+    from scripts import dline_refit
+
+    root = tmp_path / "run"
+    _put_off_length(_campaign(root, "dsqwen-7b"), "dsqwen-7b")
+    with pytest.raises(SystemExit, match="dsqwen-7b/i256_o128_c95 attempt"):
+        dataset.build_dataset(root)
+    assert not (root / "dataset").exists() and not list(root.glob(".dataset*"))
+    out = dataset.build_dataset(root, allow_prompt_token_mismatch=True)
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    assert any("allow-prompt-token-mismatch" in d for d in manifest["discrepancies"])
+    _, cells = _read(out / dataset.CELL_TABLE)
+    assert {c["cell_id"] for c in cells if c["prompt_tokens_mismatched"] not in ("", "0")} == {"i256_o128_c95"}
+    # ... and the trainset stage never trains on it
+    off = dline_refit.prompt_token_mismatched_cells(dline_refit.DatasetSource("run", out, False))
+    assert {cell for cell, _attempt in off} == {"i256_o128_c95"}

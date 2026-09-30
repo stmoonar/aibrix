@@ -61,6 +61,9 @@ from tre_replayer.engine.prompts import (
     check_corpus,
 )
 
+#: What a prompt file row without an ``api`` column was built for.
+LEGACY_API = "completions"
+
 #: File name suffix for one cell's materialised prompts.
 PROMPT_FILE_SUFFIX = ".prompts.jsonl"
 
@@ -141,19 +144,28 @@ class PromptStore:
     reported per cell so the regression cannot be silent.
     """
 
-    __slots__ = ("_prompts", "path", "_misses", "_lock")
+    __slots__ = ("_prompts", "path", "_misses", "_lock", "api")
 
     def __init__(
-        self, prompts: dict[str, Any] | None = None, *, path: str | Path | None = None
+        self, prompts: dict[str, Any] | None = None, *, path: str | Path | None = None,
+        api: str | None = None,
     ) -> None:
         self._prompts: dict[str, Any] = dict(prompts or {})
         self.path = None if path is None else Path(path)
+        #: The endpoint the prompts were fitted for (None = unknown, e.g. a hand-built
+        #: store); a sender of another endpoint refuses the store.
+        self.api = api
         self._misses = 0
         self._lock = threading.Lock()
 
     @classmethod
-    def load(cls, path: str | Path) -> "PromptStore":
+    def load(cls, path: str | Path, *, api: str | None = None) -> "PromptStore":
+        """Read a materialised prompt file. Every row's ``api`` (absent = a file from
+        before the column: completions) must be one endpoint, and ``api`` when given:
+        a chat prompt is fitted to the templated length and is the wrong length on the
+        completions path (and vice versa), so a mismatch is refused, never sent."""
         prompts: dict[str, Any] = {}
+        apis: set[str] = set()
         with Path(path).open("r", encoding="utf-8") as handle:
             for line in handle:
                 line = line.strip()
@@ -161,7 +173,13 @@ class PromptStore:
                     continue
                 row = json.loads(line)
                 prompts[str(row["request_id"])] = row["prompt"]
-        return cls(prompts, path=path)
+                apis.add(str(row.get("api") or LEGACY_API))
+        if len(apis) > 1:
+            raise ValueError(f"{path}: prompts of several APIs {sorted(apis)} in one file")
+        found = apis.pop() if apis else api
+        if api is not None and found != api:
+            raise ValueError(f"{path}: prompts built for the {found} API, but the sender sends {api}")
+        return cls(prompts, path=path, api=found)
 
     def get(self, request_id: str) -> Any | None:
         """The prompt for ``request_id``, or None - counting the miss."""
@@ -367,4 +385,4 @@ def materialize_prompts(
         api=api,
     )
     write_prompt_file(path, specs, prompts, api=api)
-    return PromptStore(prompts, path=path)
+    return PromptStore(prompts, path=path, api=api)

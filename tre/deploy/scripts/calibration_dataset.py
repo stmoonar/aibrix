@@ -472,11 +472,12 @@ class Settings:
 
 
 def _prompt_tokens_mismatched(records: Sequence[dict]) -> Optional[int]:
-    """Served requests (HTTP 200) whose ``input_tokens`` (usage.prompt_tokens) differs from
-    ``expected_prompt_tokens``; None when no record carries the expected length (a capture
-    from before 2026-09-30)."""
+    """Served requests (outcome ``ok``) whose ``input_tokens`` (usage.prompt_tokens) differs
+    from ``expected_prompt_tokens`` or is missing (no usage); None when no record carries
+    the expected length (a capture from before 2026-09-30)."""
     compared = [r for r in records
-                if r.get("http_status") == 200 and r.get("expected_prompt_tokens") is not None]
+                if rewindow_from_raw.request_outcome(r) == rewindow_from_raw.OUTCOME_OK
+                and r.get("expected_prompt_tokens") is not None]
     if not compared and not any(r.get("expected_prompt_tokens") is not None for r in records):
         return None
     return sum(1 for r in compared
@@ -637,8 +638,16 @@ def build_dataset(
     *,
     out_dir: Optional[Path] = None,
     overrides: Optional[dict] = None,
+    allow_prompt_token_mismatch: bool = False,
 ) -> Path:
     """Convert ``run_dir`` into the standard dataset; returns the dataset directory.
+
+    Refuses (SystemExit, nothing written) a run holding a non-void cell whose served
+    requests did not all prefill the length they were built to
+    (``prompt_tokens_mismatched > 0``: usage.prompt_tokens off, or no usage): its windows
+    are indexed by a length the engine did not see. ``allow_prompt_token_mismatch``
+    (``--allow-prompt-token-mismatch``) builds anyway and records the cells in the
+    manifest; the trainset stage still refuses to train on them.
 
     Reads only. The dataset is assembled in a sibling temporary directory and moved into
     place at the end, so a failed conversion never leaves a half-written dataset where a
@@ -729,6 +738,22 @@ def build_dataset(
             "30 s tumbling windows); they are kept as files but every window in this "
             "dataset is recomputed from raw"
         )
+    off_length = [
+        f"{c.get('model')}/{c.get('cell_id')} attempt {c.get('attempt')}: {c.get('prompt_tokens_mismatched')}"
+        for c in cell_rows
+        if c.get("status") != STATUS_VOID and (c.get("prompt_tokens_mismatched") or 0) > 0
+    ]
+    if off_length and not allow_prompt_token_mismatch:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise SystemExit(
+            f"{run_dir}: {len(off_length)} cell(s) served requests whose usage.prompt_tokens was not the "
+            f"length they were built to (or had no usage), so their windows are indexed by a length the "
+            f"engine did not prefill; refusing to build the dataset: {'; '.join(off_length)} "
+            "(re-run those cells, or pass --allow-prompt-token-mismatch to build it for inspection - "
+            "the trainset stage will still refuse them)")
+    if off_length:
+        discrepancies.append(f"built with --allow-prompt-token-mismatch: {len(off_length)} cell(s) "
+                             f"off their prompt length: {'; '.join(off_length)}")
     cells_written = _write_csv(staging / CELL_TABLE, CELL_COLUMNS, cell_rows)
     if README_SOURCE.exists():
         shutil.copyfile(README_SOURCE, staging / README)
@@ -1171,8 +1196,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--window-align", choices=list(rewindow_from_raw.WINDOW_ALIGN_CHOICES), default=None,
                     help=f"default {DEFAULT_WINDOW_ALIGN} (format revision {FORMAT_REVISION})")
     ap.add_argument("--min-completed-requests", type=int, default=None)
+    ap.add_argument("--allow-prompt-token-mismatch", action="store_true",
+                    help="build even when a cell's served requests were off their prompt length "
+                         "(recorded; dline_refit trainset still refuses those cells)")
     args = ap.parse_args(argv)
-    out = build_dataset(args.run_dir, out_dir=args.out_dir, overrides={
+    out = build_dataset(args.run_dir, out_dir=args.out_dir,
+                        allow_prompt_token_mismatch=args.allow_prompt_token_mismatch, overrides={
         "registry": args.registry, "label_registry": args.label_registry,
         "window_ms": args.window_ms, "step_ms": args.step_ms,
         "ttft_slo_ms": args.ttft_slo_ms, "tpot_slo_ms": args.tpot_slo_ms,

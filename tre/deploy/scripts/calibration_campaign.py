@@ -120,6 +120,7 @@ import argparse
 import hashlib
 import json
 import math
+import os
 import subprocess
 import sys
 import time
@@ -386,6 +387,9 @@ def _is_served(record: dict) -> bool:
         status is not None
         and 200 <= int(status) < 300
         and record.get("done_ts_ms") is not None
+        # a request the engine failed inside its 200 stream is not served
+        and (record.get("outcome") in (None, openloop.OUTCOME_NAMES[openloop.FAILURE_NONE]))
+        and not record.get("stream_error")
     )
 
 
@@ -1694,6 +1698,31 @@ def load_source_capacity(source: Path, model: str, shape: str) -> MeasuredCapaci
     return MeasuredCapacity(**{**raw, "levels": levels})
 
 
+def check_reprobe_source_load_paths(args, targets: Mapping[str, Sequence[str]]) -> list[dict]:
+    """Compare every re-probed model's source campaign (``<source>/<model>/plan.json``
+    provenance; none = before the options: English, no routing header, completions) with
+    this run's load path (:func:`scripts.prompt_corpus.check_load_path`): refused on a
+    difference - an API difference always, a corpus / routing one unless its
+    ``--allow-*`` flag is given; a dry run reports instead. A source without the plan is
+    refused: its load path would be unknown. Returns the reports (``reprobe_plan.json``)."""
+    flags = mismatch_flags(args)
+    if getattr(args, "dry_run", False):
+        flags = {k: True for k in flags}
+    reports = []
+    for model in targets:
+        plan_path = Path(args.reprobe_source) / model / "plan.json"
+        try:
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise ValueError(f"--reprobe-source: {plan_path} unreadable ({exc}): the load path "
+                             "(prompt corpus, routing, API) the reused capacity was measured on is unknown")
+        report = corpus_record.check_load_path(
+            corpus_record.load_path(plan.get("provenance")), load_path(args),
+            what=f"--reprobe-source {plan_path.parent}", **flags)
+        reports.append({"model": model, "source_plan": str(plan_path), **report})
+    return reports
+
+
 def reprobe_plan(args, targets: Mapping[str, Sequence[str]]) -> dict:
     coarse_s = float(getattr(args, "boundary_coarse_s", boundary.COARSE_SECONDS))
     entries = []
@@ -1737,6 +1766,10 @@ def run_reprobe(args, targets: Mapping[str, Sequence[str]]) -> int:
     source campaign. The source campaign is only read."""
     check_new_output_root(args.out_dir, args.reprobe_source)
     plan = reprobe_plan(args, targets)
+    # The re-probe reuses the source campaign's C_s: it must reach the engine the way the
+    # source did (prompt corpus, routing, API), or the capacity it builds on is another's.
+    plan["source_load_paths"] = check_reprobe_source_load_paths(args, targets)
+    plan["load_path"] = load_path(args)
     out_root = Path(args.out_dir)
     out_root.mkdir(parents=True, exist_ok=True)
     (out_root / "reprobe_plan.json").write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")
@@ -1751,7 +1784,8 @@ def run_reprobe(args, targets: Mapping[str, Sequence[str]]) -> int:
 
     require_calibration_run_mode(args.controller_namespace)
     require_capture_clock_domains(args, list(targets))
-    require_prompt_preflight(args, list(targets), out_root)
+    require_prompt_preflight(args, list(targets), out_root,
+                             shapes=sorted({s for shapes in targets.values() for s in shapes}))
     index_path = Path(args.index)
     index = json.loads(index_path.read_text(encoding="utf-8")) if index_path.exists() else {}
     cap = admission.get_cap(args.cap or index.get("admission_cap", {}).get("name")
@@ -1985,16 +2019,43 @@ def load_path(args) -> dict:
             "api": api_for(args)}
 
 
+#: Environment variable holding the gateway URL when --gateway-url is not given.
+GATEWAY_URL_ENV = "TRE_CALIBRATION_GATEWAY_URL"
+
 PROMPT_PREFLIGHT_FILE = "prompt_preflight.json"
+#: The middle preflight length, next to the run's shortest and longest cell input.
+PREFLIGHT_MID_TOKENS = 512
+
+
+def all_calibration_shapes() -> tuple[str, ...]:
+    """Every shape a calibration entry point can drive (training, M, acceptance, T14,
+    static grid): the default span of the preflight lengths."""
+    return (*gen.ALL_SHAPES, *gen.ACCEPTANCE_SHAPES, *gen.T14_SHAPES, *gen.STATIC_GRID_SHAPES)
+
+
+def preflight_input_lengths(shapes: Optional[Sequence[str]] = None) -> list[int]:
+    """The input lengths the run-level preflight checks: the shortest and the longest cell
+    input any of ``shapes`` can send (a sampled length's range ends included) and
+    :data:`PREFLIGHT_MID_TOKENS`. Without ``shapes``: over every calibration shape - a
+    superset of any one run's span."""
+    lows, highs = [], []
+    for shape in (shapes or all_calibration_shapes()):
+        for _weight, length, _out in gen.shape_components(shape):
+            lows.append(int(getattr(length, "low", length)))
+            highs.append(int(getattr(length, "high", length)))
+    return sorted({min(lows), PREFLIGHT_MID_TOKENS, max(highs)})
 
 
 def require_prompt_preflight(args, models: Optional[Sequence[str]] = None,
-                             out_dir: Optional[Path] = None) -> Optional[dict]:
-    """The run-level prompt-length pre-flight: for every model one request of the run's
-    exact kind (``openloop.preflight_prompt_tokens``: same builder, tokenizer, corpus,
-    endpoint, URL, routing header, seed) must report ``usage.prompt_tokens`` equal to
-    the length its prompt was fitted to, ``completion_tokens == max_tokens`` and a first
-    token. Raises SystemExit listing every failure otherwise - fail-closed, like the
+                             out_dir: Optional[Path] = None,
+                             shapes: Optional[Sequence[str]] = None) -> Optional[dict]:
+    """The run-level prompt-length pre-flight: for every model and every length of
+    :func:`preflight_input_lengths` (the run's shortest cell input, 512, its longest), one
+    request of the run's exact kind (``openloop.preflight_prompt_tokens``: same builder,
+    tokenizer, corpus, endpoint, URL, routing header, seed) must report
+    ``usage.prompt_tokens`` equal to the length its prompt was fitted to,
+    ``completion_tokens == max_tokens``, a first token and (mix) the content's Chinese
+    share. Raises SystemExit listing every failure otherwise - fail-closed, like the
     clock-domain pre-flight next to which every entry point calls it. The verdicts go to
     ``<out_dir>/prompt_preflight.json``. ``--prompt-preflight skip`` skips it (recorded
     in the provenance)."""
@@ -2004,28 +2065,31 @@ def require_prompt_preflight(args, models: Optional[Sequence[str]] = None,
     if models is None:
         models = [m for m in str(getattr(args, "models", "") or "").split(",") if m]
     corpus = prompt_corpus(args)
-    verdicts = {
-        model: openloop.preflight_prompt_tokens(
-            args.gateway_url, model, api=api_for(args), prompt_mode=corpus["prompt_mode"],
-            corpus_lang=corpus["corpus_lang"], zh_ratio=corpus["zh_ratio"],
-            routing_strategy=routing_strategy_for(args),
-            request_seed=getattr(args, "request_seed", None),
-        )
-        for model in models
-    }
-    for model, v in verdicts.items():
-        print(f"prompt preflight ({model}, {v['api']}): expected {v['expected_prompt_tokens']}, "
-              f"usage.prompt_tokens {v['prompt_tokens']}, completion {v['completion_tokens']}, "
-              f"first token in {v['first_token_field']!r}, template overhead {v['template_overhead']}")
-    doc = {"checked_at_utc": utc_iso(), "models": verdicts}
+    lengths = preflight_input_lengths(shapes)
+    checks: dict[str, list[dict]] = {}
+    for model in models:
+        for length in lengths:
+            v = openloop.preflight_prompt_tokens(
+                args.gateway_url, model, api=api_for(args), prompt_mode=corpus["prompt_mode"],
+                corpus_lang=corpus["corpus_lang"], zh_ratio=corpus["zh_ratio"],
+                routing_strategy=routing_strategy_for(args),
+                request_seed=getattr(args, "request_seed", None),
+                input_tokens=length,
+            )
+            checks.setdefault(model, []).append(v)
+            print(f"prompt preflight ({model}, {v['api']}, {length}): expected {v['expected_prompt_tokens']}, "
+                  f"usage.prompt_tokens {v['prompt_tokens']}, completion {v['completion_tokens']}, "
+                  f"first token in {v['first_token_field']!r}, template overhead {v['template_overhead']}")
+    doc = {"checked_at_utc": utc_iso(), "input_lengths": lengths,
+           "models": {m: {"ok": all(v["ok"] for v in vs), "checks": vs} for m, vs in checks.items()}}
     if out_dir is not None:
         Path(out_dir).mkdir(parents=True, exist_ok=True)
         (Path(out_dir) / PROMPT_PREFLIGHT_FILE).write_text(
             json.dumps(doc, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    failed = {m: v["reasons"] for m, v in verdicts.items() if not v["ok"]}
+    failed = [f"{m} @ {v['expected_prompt_tokens']}: {' / '.join(v['reasons'])}"
+              for m, vs in checks.items() for v in vs if not v["ok"]]
     if failed:
-        raise SystemExit("refusing to run: prompt preflight failed: "
-                         + "; ".join(f"{m}: {' / '.join(r)}" for m, r in failed.items()))
+        raise SystemExit("refusing to run: prompt preflight failed: " + "; ".join(failed))
     return doc
 
 
@@ -2235,7 +2299,8 @@ def run_campaign(args) -> int:
     modes = require_calibration_run_mode(args.controller_namespace)
     print(f"controller mode: {modes['controller_mode']}, SM actuation: {modes['sm_actuation']}")
     require_capture_clock_domains(args, models)
-    require_prompt_preflight(args, models, out_dir)
+    require_prompt_preflight(args, models, out_dir,
+                             shapes=None if static_cells else sorted({c.shape for c in runnable}))
 
     status, code = "failed", 1
     try:
@@ -2385,8 +2450,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--index", type=Path,
                     default=here / "replayer/traces_v2/calibration/INDEX.json")
     ap.add_argument("--models", default=",".join(gen.MODELS))
-    ap.add_argument("--gateway-url", default="http://192.168.223.76:31094/v1/chat/completions",
-                    help="the model gateway's endpoint URL; its path must match --api")
+    ap.add_argument("--gateway-url", default=os.environ.get(GATEWAY_URL_ENV) or None,
+                    help=f"the model gateway's endpoint URL, e.g. http://<gateway>/v1/chat/completions "
+                         f"(default: ${GATEWAY_URL_ENV}); its path must match --api. Required unless "
+                         "--dry-run / --static-grid-list")
     ap.add_argument("--out-dir", type=Path, required=True)
     ap.add_argument("--raw-dir", type=Path, default=Path("/root/tre-experiments/calibration_raw"))
     ap.add_argument("--cap", default=None,
@@ -2591,10 +2658,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     help="ladder design: the preregistration the run implements; its commit "
                          "is recorded in the run manifest")
     args = ap.parse_args(argv)
-    try:
-        corpus_record.check_gateway_url(args.gateway_url, args.api)
-    except ValueError as exc:
-        ap.error(str(exc))
+    if args.gateway_url:
+        try:
+            corpus_record.check_gateway_url(args.gateway_url, args.api)
+        except ValueError as exc:
+            ap.error(str(exc))
+    elif not (args.dry_run or args.static_grid_list):
+        ap.error(f"no gateway URL: pass --gateway-url http://<gateway>/v1/chat/completions or set "
+                 f"{GATEWAY_URL_ENV} (there is no built-in default: the address is the deployment's)")
     if args.design_seed is None:
         args.design_seed = 20260924 if args.t14_set else 20260923
     collection = bool(args.training_supplement or args.acceptance_set or args.t14_set)

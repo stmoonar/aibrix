@@ -246,9 +246,11 @@ def test_drive_cell_writes_raw_jsonl(tmp_path) -> None:
     lines = [l for l in raw_path.read_text().splitlines() if l.strip()]
     assert lines  # at least one request logged
     rec = _json.loads(lines[0])
-    assert set(rec.keys()) == set(r3_grid.RAW_COLUMNS)
+    # the grid path writes the per-request prompt pair too (and no outcome: it is derived)
+    assert set(rec.keys()) == set(r3_grid.RAW_COLUMNS) | {"expected_prompt_tokens", "stream_error", "ttft_basis"}
     assert rec["cell_id"] == "i512_o128_c8"
-    assert rec["input_tokens"] == 130
+    assert rec["input_tokens"] == 130 and rec["expected_prompt_tokens"] == 512
+    assert rec["ttft_basis"] == "first_chunk_with_text" and rec["stream_error"] is None
 
 
 def test_drive_cell_writes_instant_sidecar(tmp_path) -> None:

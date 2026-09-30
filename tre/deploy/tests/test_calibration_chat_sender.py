@@ -35,16 +35,24 @@ def test_the_raw_record_keeps_the_expected_length_next_to_the_engines() -> None:
 
 def test_prompt_tokens_check_counts_served_requests_only() -> None:
     records = [
-        {"request_id": "a", "http_status": 200, "input_tokens": 512, "prompt_tokens": 512},
-        {"request_id": "b", "http_status": 200, "input_tokens": 512, "prompt_tokens": 513},
-        {"request_id": "c", "http_status": 200, "input_tokens": 512, "prompt_tokens": None},
-        {"request_id": "d", "http_status": 503, "input_tokens": 512, "prompt_tokens": None},
+        {"request_id": "a", "http_status": 200, "e2e_ms": 9.0, "input_tokens": 512, "prompt_tokens": 512},
+        {"request_id": "b", "http_status": 200, "e2e_ms": 9.0, "input_tokens": 512, "prompt_tokens": 513},
+        {"request_id": "c", "http_status": 200, "e2e_ms": 9.0, "input_tokens": 512, "prompt_tokens": None},
+        {"request_id": "d", "http_status": 503, "e2e_ms": 9.0, "input_tokens": 512, "prompt_tokens": None},
+        # failed inside its 200 stream: not served, so not checked
+        {"request_id": "e", "http_status": 200, "e2e_ms": 9.0, "input_tokens": 512, "prompt_tokens": None,
+         "stream_error": "boom"},
     ]
     check = openloop.prompt_tokens_check(records)
     assert (check["served"], check["checked"], check["mismatched"], check["missing_usage"]) == (3, 2, 1, 1)
     assert check["max_abs_diff"] == 1 and not check["ok"]
     assert check["examples"] == [{"request_id": "b", "expected": 512, "prompt_tokens": 513}]
     assert openloop.prompt_tokens_check(records[:1])["ok"]
+    # the grid path's raw records: expected_prompt_tokens next to input_tokens (= usage)
+    raw = [{"http_status": 200, "e2e_ms": 9.0, "expected_prompt_tokens": 512, "input_tokens": n}
+           for n in (512, 510)]
+    grid = openloop.prompt_tokens_check(raw, expected_key="expected_prompt_tokens", actual_key="input_tokens")
+    assert (grid["served"], grid["mismatched"], grid["max_abs_diff"]) == (2, 1, 2)
 
 
 # ------------------------------------------------------------------------ the preflight
@@ -191,24 +199,29 @@ def test_the_campaign_preflight_checks_every_model_and_refuses_on_one_failure(tm
 
     def fake(url, model, **kw):
         calls.append((url, model, kw))
-        ok = model != "m2"
-        return {"model": model, "api": kw["api"], "expected_prompt_tokens": 512,
-                "prompt_tokens": 512 if ok else 507, "completion_tokens": 8, "first_token_field": "content",
-                "template_overhead": 5, "ok": ok, "reasons": [] if ok else ["usage.prompt_tokens 507 != 512"]}
+        n = kw["input_tokens"]
+        ok = not (model == "m2" and n == 4096)
+        return {"model": model, "api": kw["api"], "expected_prompt_tokens": n,
+                "prompt_tokens": n if ok else n - 1, "completion_tokens": 8, "first_token_field": "content",
+                "template_overhead": 5, "ok": ok, "reasons": [] if ok else [f"usage.prompt_tokens {n - 1} != {n}"]}
 
     monkeypatch.setattr(openloop, "preflight_prompt_tokens", fake)
-    with pytest.raises(SystemExit, match="m2: usage.prompt_tokens 507 != 512"):
+    with pytest.raises(SystemExit, match="m2 @ 4096: usage.prompt_tokens 4095 != 4096"):
         campaign.require_prompt_preflight(_campaign_args(tmp_path), out_dir=tmp_path)
-    assert [c[1] for c in calls] == ["m1", "m2"]
+    # every model at the shortest cell input of any calibration shape, 512 and the longest
+    assert [(c[1], c[2]["input_tokens"]) for c in calls] == \
+        [(m, n) for m in ("m1", "m2") for n in (128, 512, 4096)]
     kw = calls[0][2]
     assert (kw["api"], kw["corpus_lang"], kw["zh_ratio"], kw["routing_strategy"]) == \
         ("chat", "mix", 0.5, "least-gpu-cache")
     doc = json.loads((tmp_path / campaign.PROMPT_PREFLIGHT_FILE).read_text())
     assert set(doc["models"]) == {"m1", "m2"}  # written before refusing: the evidence stays
+    assert doc["models"]["m1"]["ok"] and not doc["models"]["m2"]["ok"] and doc["input_lengths"] == [128, 512, 4096]
 
     calls.clear()
-    doc = campaign.require_prompt_preflight(_campaign_args(tmp_path, models="m1"), out_dir=tmp_path)
-    assert doc["models"]["m1"]["ok"] and len(calls) == 1
+    doc = campaign.require_prompt_preflight(_campaign_args(tmp_path, models="m1"), out_dir=tmp_path,
+                                            shapes=["S1", "S3"])
+    assert doc["models"]["m1"]["ok"] and [c[2]["input_tokens"] for c in calls] == [256, 512, 2048]
     assert campaign.require_prompt_preflight(_campaign_args(tmp_path, prompt_preflight="skip")) is None
 
 
@@ -343,3 +356,37 @@ def test_a_chat_cell_sends_chat_and_records_its_prompt_check(tmp_path, monkeypat
     raw = [json.loads(line) for line in next((tmp_path / "raw").rglob("i64_o8_c1090.jsonl")).read_text().splitlines()]
     assert {r["expected_prompt_tokens"] for r in raw} == {64}
     assert sorted(r["input_tokens"] for r in raw).count(65) == 1
+
+
+def test_the_preflight_lengths_span_the_runs_cell_inputs() -> None:
+    assert campaign.preflight_input_lengths() == [128, 512, 4096]   # every calibration shape
+    assert campaign.preflight_input_lengths(["S1"]) == [256, 512]
+    assert campaign.preflight_input_lengths(["T9"]) == [300, 512, 2200]      # a sampled range's ends
+    assert campaign.preflight_input_lengths(["M"]) == [128, 512, 3072]
+
+
+def test_every_entry_point_runs_the_prompt_preflight_after_the_clock_check() -> None:
+    import inspect
+
+    from scripts import (calibration_acceptance, calibration_ladder, calibration_supplement, calibration_t14,
+                         calibration_training_supplement)
+
+    for module in (calibration_acceptance, calibration_ladder, calibration_supplement, calibration_t14,
+                   calibration_training_supplement):
+        src = inspect.getsource(module)
+        clock = src.index("campaign.require_capture_clock_domains(args)")
+        assert clock < src.index("campaign.require_prompt_preflight(args", clock), module.__name__
+    for fn in (campaign.run_campaign, campaign.run_reprobe):
+        assert "require_prompt_preflight(args" in inspect.getsource(fn), fn.__name__
+
+
+def test_the_campaign_needs_a_gateway_url_from_the_cli_or_the_environment(tmp_path, monkeypatch, capsys) -> None:
+    monkeypatch.delenv(campaign.GATEWAY_URL_ENV, raising=False)
+    with pytest.raises(SystemExit) as exc:
+        campaign.main(["--out-dir", str(tmp_path / "o"), "--models", "dsqwen-7b"])
+    assert exc.value.code == 2 and campaign.GATEWAY_URL_ENV in capsys.readouterr().err
+    # the environment supplies it (and is checked against --api like the flag)
+    monkeypatch.setenv(campaign.GATEWAY_URL_ENV, "http://gw/v1/completions")
+    with pytest.raises(SystemExit) as exc:
+        campaign.main(["--out-dir", str(tmp_path / "o"), "--models", "dsqwen-7b"])
+    assert exc.value.code == 2 and "chat/completions" in capsys.readouterr().err

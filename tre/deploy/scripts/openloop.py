@@ -432,6 +432,7 @@ def classify_failure(record: dict) -> str:
 
     Rules, in order:
 
+    * 2xx whose stream carried an ``{"error": ...}`` chunk (``stream_error``) -> model.
     * 2xx with a measured end-to-end time -> served.
     * the sender flagged ``client_timeout`` -> the client's own deadline fired. Checked
       before everything else because it is the only class the *sender* can attest to;
@@ -455,6 +456,10 @@ def classify_failure(record: dict) -> str:
     circuit breaker, void a whole 450 s cell.
     """
     status = record.get("http_status")
+    if record.get("stream_error") and status is not None and 200 <= int(status) < 300:
+        # The engine failed the request inside a 200 stream ({"error": ...} chunk): it
+        # answered for itself, so it is the model's failure, and never a completion.
+        return FAILURE_MODEL
     if status is not None and 200 <= int(status) < 300 and record.get("e2e_ms") is not None:
         return FAILURE_NONE
 
@@ -1999,6 +2004,9 @@ def _raw_from_sender_record(cell_id: str, record: dict) -> dict:
         # the templated total). ``input_tokens`` is what the engine reported
         # (usage.prompt_tokens); the two must be equal (prompt_tokens_check).
         "expected_prompt_tokens": record.get("input_tokens"),
+        # What ttft_ms measures (tre_replayer.engine.stream.TTFT_BASIS).
+        "ttft_basis": record.get("ttft_basis"),
+        "stream_error": record.get("stream_error"),
         "scheduled_send_ts_ms": (
             None if on_wire is None
             else round(float(record["actual_send_ts_ms"]) - float(on_wire), 3)
@@ -2018,24 +2026,27 @@ def _raw_from_sender_record(cell_id: str, record: dict) -> dict:
 PROMPT_TOKEN_EXAMPLES = 5
 
 
-def prompt_tokens_check(records: Sequence[dict]) -> dict:
+def prompt_tokens_check(records: Sequence[dict], *, expected_key: str = "input_tokens",
+                        actual_key: str = "prompt_tokens") -> dict:
     """Did every served request prefill the length it was built to?
 
-    Over the sender rows of a cell: a request that got an HTTP 200 must report
-    ``usage.prompt_tokens`` (``prompt_tokens``) equal to the length its prompt was fitted
-    to (``input_tokens``). ``mismatched`` counts those that did not, ``missing_usage``
-    served ones without a usage block (``stream_options.include_usage`` ignored),
-    ``max_abs_diff`` the largest difference; ``examples`` lists a few. Recorded in the
-    cell's guard artifact - the per-cell half of the preflight; never gates a cell.
+    Over the records of a cell: a served request (outcome ``ok``, :func:`outcome_of`) must
+    report ``usage.prompt_tokens`` (``actual_key``; ``prompt_tokens`` on a sender row,
+    ``input_tokens`` on a raw record) equal to the length its prompt was fitted to
+    (``expected_key``; ``input_tokens`` on a sender row, ``expected_prompt_tokens`` on a
+    raw record). ``mismatched`` counts those that did not, ``missing_usage`` served ones
+    without a usage block (``stream_options.include_usage`` ignored), ``max_abs_diff``
+    the largest difference; ``examples`` lists a few. Recorded per cell (guard artifact);
+    the standard dataset refuses a cell that fails it (``calibration_dataset``).
     """
     served = mismatched = missing = 0
     max_abs = 0
     examples: list[dict] = []
     for record in records:
-        if record.get("http_status") != 200:
+        if outcome_of(record) != OUTCOME_NAMES[FAILURE_NONE]:
             continue
         served += 1
-        actual, expected = record.get("prompt_tokens"), record.get("input_tokens")
+        actual, expected = record.get(actual_key), record.get(expected_key)
         if actual is None or expected is None:
             missing += 1
             continue

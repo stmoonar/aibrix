@@ -397,3 +397,52 @@ def test_result_fields_are_the_answers_part_of_a_record() -> None:
     assert (fields["ttft_ms"], fields["e2e_ms"], fields["prompt_tokens"], fields["completion_tokens"]) ==         (12.0, 90.0, 512, 8)
     assert fields["http_status"] == 200 and fields["first_token_field"] == "content"
     assert fields["client_timeout"] is False and fields["target_pod"] == "p"
+
+
+# ------------------------------------------------------------------ review round 1
+
+
+def test_an_error_chunk_inside_a_200_stream_is_a_failure_not_a_completion() -> None:
+    body = _sse(
+        {"choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}}]},
+        {"choices": [{"index": 0, "delta": {"content": "A"}}]},
+        {"error": {"message": "engine died", "type": "InternalServerError", "code": 500}},
+    )
+    server, url = _serve_once(body)
+    try:
+        res = _default_stream_call(url, {}, b"{}", 5.0)
+    finally:
+        server.shutdown()
+    assert res.status == 200 and res.stream_error == "engine died (code 500)"
+    assert res.error == "stream error: engine died (code 500)" and "engine died" in res.error_body
+    from tre_replayer.engine.stream import TTFT_BASIS, result_fields
+
+    fields = result_fields(res)
+    assert fields["stream_error"] == res.stream_error and fields["ttft_basis"] == TTFT_BASIS
+
+
+def test_the_completions_request_bytes_do_not_change() -> None:
+    """The review's constraint: only the parsing changed on the default path."""
+    assert json.dumps(api.request_body("m", [1, 2], 8)).encode() == (
+        b'{"model": "m", "prompt": [1, 2], "max_tokens": 8, "temperature": 0, "ignore_eos": true, '
+        b'"stream": true, "stream_options": {"include_usage": true}}')
+
+
+def test_a_prompt_file_of_another_api_is_refused(tmp_path) -> None:
+    tok = ChatStubTokenizer()
+    requests = [ScheduledRequest(request_id="m-0", model="m", scheduled_offset_s=0.0, prompt_tokens=40,
+                                 max_output_tokens=8)]
+    path = tmp_path / "c.prompts.jsonl"
+    store = prompt_store.materialize_prompts(requests, path=path, tokenizer=tok, api="chat")
+    assert store.api == "chat" and prompt_store.PromptStore.load(path, api="chat").api == "chat"
+    with pytest.raises(ValueError, match="built for the chat API"):
+        prompt_store.PromptStore.load(path, api="completions")
+    legacy = tmp_path / "old.prompts.jsonl"  # a file from before the api column: completions
+    legacy.write_text(json.dumps({"request_id": "m-0", "prompt": "x"}) + "\n", encoding="utf-8")
+    assert prompt_store.PromptStore.load(legacy).api == "completions"
+    with pytest.raises(ValueError, match="completions API"):
+        prompt_store.PromptStore.load(legacy, api="chat")
+    # the sender refuses a store of the other endpoint
+    with pytest.raises(ValueError, match="holds chat prompts"):
+        StreamingHttpSender("http://gw/v1/completions", prompt_store=store)
+    StreamingHttpSender(CHAT_URL, api="chat", prompt_store=store).close()

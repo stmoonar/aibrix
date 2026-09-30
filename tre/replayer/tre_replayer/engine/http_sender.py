@@ -89,6 +89,7 @@ from tre_replayer.engine.stream import (  # noqa: F401
     RETRIED_HEADER,
     StreamCall,
     StreamResult,
+    TTFT_BASIS,
     _chunk_has_content,
     _positive_int,
     chunk_token_field,
@@ -98,6 +99,7 @@ from tre_replayer.engine.stream import (  # noqa: F401
     read_error_body,
     reissue_from_headers,
     result_fields,
+    stream_error_message,
     stream_request,
 )
 from tre_replayer.engine.prompt_store import PromptStore, sender_seed_key
@@ -179,6 +181,11 @@ class StreamingHttpSender:
         # Prompts built before the run started (tre_replayer.engine.prompt_store). Without
         # one the sender falls back to fitting each prompt inline, which costs milliseconds
         # of GIL-held tokenizer work inside on_wire_delay_ms - see that module's docstring.
+        if prompt_store is not None and getattr(prompt_store, "api", None) not in (None, api):
+            # A chat prompt is fitted to the templated length, a completions one to the bare
+            # string: the other endpoint's prompts are the wrong length on this one.
+            raise ValueError(f"the prompt store {getattr(prompt_store, 'path', None)} holds {prompt_store.api} "
+                             f"prompts, but this sender sends {api}")
         self._prompt_store = prompt_store
         self._routing_strategy = routing_strategy
         self._now = now_ms

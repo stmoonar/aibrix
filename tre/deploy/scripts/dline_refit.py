@@ -378,6 +378,18 @@ def _dataset_header(src: DatasetSource) -> list[str]:
     return list(header)
 
 
+def prompt_token_mismatched_cells(src: DatasetSource) -> set[tuple[str, str]]:
+    """``(cell_id, attempt)`` of the source's cells whose served requests were off their
+    prompt length (``cells.csv`` ``prompt_tokens_mismatched > 0``; a dataset built with
+    ``--allow-prompt-token-mismatch``). Empty for a dataset without the column."""
+    path = src.directory / "cells.csv"
+    if not path.is_file():
+        return set()
+    with open(path, newline="", encoding="utf-8") as fh:
+        return {(row.get("cell_id", ""), row.get("attempt", "")) for row in csv.DictReader(fh)
+                if (row.get("prompt_tokens_mismatched") or "0").strip() not in ("", "0")}
+
+
 def build_training_set(sources: Sequence[DatasetSource], fit_dir: Path, *,
                        sentinels: bool = True, models: Optional[Sequence[str]] = None) -> dict:
     """D16: cut the training set (constant-load cells) out of standard datasets.
@@ -427,6 +439,7 @@ def build_training_set(sources: Sequence[DatasetSource], fit_dir: Path, *,
             writers[model] = ws
         return writers[model]
 
+    off_length = {s.name: prompt_token_mismatched_cells(s) for s in sources}
     try:
         for src in sources:
             header = headers[src.name]
@@ -452,6 +465,12 @@ def build_training_set(sources: Sequence[DatasetSource], fit_dir: Path, *,
                         continue
                     if models and model not in models:
                         continue
+                    if (row["cell_id"], row["attempt"]) in off_length[src.name]:
+                        raise TrainingSetError(
+                            f"{src.name}: training cell {row['cell_id']} attempt {row['attempt']} served "
+                            f"requests off their prompt length (cells.csv prompt_tokens_mismatched > 0; all "
+                            f"such cells of the source: {sorted(off_length[src.name])}); a theta is never "
+                            "fitted on windows indexed by a length the engine did not prefill")
                     sid = row["scenario_id"]
                     prev = owner.setdefault((model, sid), src.name)
                     if prev != src.name:

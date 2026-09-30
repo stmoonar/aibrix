@@ -37,38 +37,65 @@ suffix, checked on probe contents to render verbatim and to add a fixed number o
 so the user content is `input_tokens` minus the template. The zh/en mix ratio applies to
 that content (0.50 by token). The chat path needs `--prompt-mode natural`.
 
+Gateway URL. There is no built-in default: pass `--gateway-url
+http://<gateway>/v1/chat/completions` or set `TRE_CALIBRATION_GATEWAY_URL`; a run without
+either is refused (a `--dry-run` / `--static-grid-list` needs none).
+
 Checks, fail-closed:
 
 * **Preflight** (`require_prompt_preflight`, every campaign entry point, next to the
-  clock-domain check; standalone `r3_grid --prompt-preflight refuse`): per model, one
-  request of the run's exact kind (builder, tokenizer, corpus, endpoint, URL, routing
-  header, seed) must come back with `usage.prompt_tokens` = the fitted length (512),
-  `completion_tokens` = `max_tokens` and a first token; otherwise the run is refused.
-  Verdicts: `<out-dir>/prompt_preflight.json` (template overhead, SSE field of the first
-  token). `--prompt-preflight skip` turns it off and is recorded. The same check as a
-  standalone command (exit 0 only when every row is exact; one JSON row per model x target
-  with `model, target, prompt_tokens, completion_tokens, zh_token_ratio, ok, reasons`):
+  clock-domain check; standalone `r3_grid --prompt-preflight refuse`): per model and per
+  input length - the run's shortest cell input, 512 and its longest (a sampled shape's
+  range ends included; for the entry points that do not list their shapes, the span of
+  every calibration shape: 128 / 512 / 4096) - one request of the run's exact kind
+  (builder, tokenizer, corpus, endpoint, URL, routing header, seed) must come back with
+  `usage.prompt_tokens` = the fitted length, `completion_tokens` = `max_tokens`, a first
+  token in a recognised field and, for the mix, a content Chinese share within 0.01 of
+  the target; otherwise the run is refused. Verdicts: `<out-dir>/prompt_preflight.json`.
+  `--prompt-preflight skip` turns it off and is recorded. The same check as a standalone
+  command (exit 0 only when every row is exact; one JSON row per model x target with
+  `model, target, prompt_tokens, completion_tokens, zh_token_ratio, ok, reasons`):
   `cd tre/deploy && PYTHONPATH=../common:.:../replayer python3 -m scripts.calib_preflight
   --models dsqwen-7b,dsllama-8b,dsqwen-14b --gateway-url http://<gateway>/v1/chat/completions
   --out <file.jsonl> [--targets 128,512,2048]`.
 * **Per request / per cell**: the raw log keeps `expected_prompt_tokens` (the fitted
-  length) next to `input_tokens` (`usage.prompt_tokens`); the guard artifact
-  (`<cell>.guard.json`) records `api`, `chat_template_overhead`, `request_seed` and
-  `prompt_tokens_check` (served requests whose two numbers differ; never gates a cell);
-  the standard dataset carries `expected_prompt_tokens` per request and `api` /
-  `prompt_tokens_mismatched` per cell.
+  length) next to `input_tokens` (`usage.prompt_tokens`), on the schedule path and the
+  closed-loop grid path alike; the guard artifact (`<cell>.guard.json`; the grid path:
+  `<cell>.prompt_tokens_check.json`) records `api`, `chat_template_overhead`,
+  `request_seed` and `prompt_tokens_check` (served requests whose two numbers differ, or
+  without usage). The standard dataset carries `expected_prompt_tokens` per request and
+  `api` / `prompt_tokens_mismatched` per cell, and **refuses to build** when a non-void
+  cell has `prompt_tokens_mismatched > 0` (`--allow-prompt-token-mismatch` builds it for
+  inspection and records the cells); `dline_refit trainset` never trains on such a cell.
 * **Provenance**: `run_provenance["api"]` (endpoint, path, `ignore_eos`, seed, what
   `input_tokens` counts) is part of the load path (`scripts.prompt_corpus`). A dataset
   refuses campaigns of two APIs, a freeze records its training API and refuses a mixed
-  training set, M / T14 / the training supplement refuse another API - with **no**
-  override flag. Records without an API are the completions captures from before
-  2026-09-30.
+  training set, M / T14 / the training supplement / a `--reprobe-shapes` run (whose
+  reused C_s comes from `--reprobe-source`; its load path goes to `reprobe_plan.json`)
+  refuse another API - with **no** override flag. Records without an API are the
+  completions captures from before 2026-09-30. A materialised prompt file records its
+  `api` per row and a sender refuses a file of the other endpoint.
+* **Errors inside a 200 stream**: an `{"error": ...}` SSE chunk sets `stream_error` on
+  the request, which is then a model error (never a completion, never a latency sample).
 
 TTFT / TPOT. The first token is the first SSE chunk carrying text in `text`
 (completions), `delta.content`, or `delta.reasoning_content` / `delta.reasoning` (a
 reasoning parser, not enabled on the fleet today); the role-only opening chunk and the
-usage-only closing chunk are not tokens. TPOT stays the client-side
-`(e2e - TTFT) / (completion_tokens - 1)` with `completion_tokens` from `usage`.
+usage-only closing chunk are not tokens. Every request records this basis as
+`ttft_basis: first_chunk_with_text` (sender row, raw log, guard artifact). TPOT stays the
+client-side `(e2e - TTFT) / (completion_tokens - 1)` with `completion_tokens` from `usage`.
+
+The E1 client (`tre/loadgen_v1`, `client_dispatcher.py`) uses another TTFT basis: it
+stamps the first chunk whose `delta.content is not None`, and the role-only opening chunk
+has `content: ""`, so its TTFT ends at the role chunk. vLLM emits that chunk in the same
+engine iteration as the first token's text, so the two bases normally differ by the
+serialisation of one chunk; they differ by one decode step (or more) whenever the first
+token's text is empty - a byte of a multi-byte character (the mixed corpus makes Chinese
+output likely), text the detokenizer holds back, or, with a reasoning parser, reasoning
+that arrives outside `content`. The calibration TTFT is therefore never shorter than
+E1's for the same request, and the TPOT of the two differs by the same amount spread over
+`completion_tokens - 1`. The E1 client is not changed; compare TTFTs across the two
+clients only with this in mind.
 
 The D6' label's idle-TTFT fit (`slo.ttft_idle_c_ms` / `_b_ms_per_token` in the registry)
 was fitted on completions-era data; under chat each `L` includes the 5 template tokens

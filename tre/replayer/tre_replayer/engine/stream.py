@@ -11,7 +11,15 @@ Timing: ``first_token_ms`` and ``done_ms`` are measured from the call with
 ``time.perf_counter`` (the seam times itself). The first token is the first chunk carrying
 generated text in ``text`` (completions), ``delta.content`` or ``delta.reasoning_content``
 / ``delta.reasoning`` (chat, with a reasoning parser); a chat stream's role-only opening
-chunk and its usage-only closing chunk are not tokens.
+chunk and its usage-only closing chunk are not tokens (:data:`TTFT_BASIS`; the E1 client
+``loadgen_v1`` stamps TTFT on the first chunk of any kind, the role-only one included -
+about one decode step earlier, see ``tre/calibration/README.md``).
+
+Errors: a non-2xx answer or a transport failure comes back with its status and evidence.
+An error *inside* a 200 stream - an OpenAI-style ``{"error": ...}`` chunk, which vLLM
+sends when generation fails after the headers went out - sets :attr:`StreamResult.stream_error`
+(and ``error``); the status stays the 200 the server sent, and the request is a failure
+(``scripts.openloop.classify_failure``), never a completion.
 """
 from __future__ import annotations
 
@@ -19,6 +27,11 @@ import json
 import time
 from dataclasses import dataclass
 from typing import Any, Callable
+
+#: What ``first_token_ms`` measures, recorded with every request (``ttft_basis``): the
+#: first SSE chunk carrying generated text (see :func:`chunk_token_field`), not the first
+#: chunk of any kind.
+TTFT_BASIS = "first_chunk_with_text"
 
 #: Response headers, in preference order, that name the pod that served a request.
 #: ``target-pod`` / ``target-pod-ip`` are what the AIBrix gateway plugin sets on the
@@ -90,6 +103,9 @@ class StreamResult:
     #: The SSE field the first token arrived in (``text``, ``content``,
     #: ``reasoning_content``, ``reasoning``); None when no token arrived.
     first_token_field: str | None = None
+    #: The message of an ``{"error": ...}`` chunk inside a 2xx stream (None = none): the
+    #: server failed the request after answering 200. A failure, not a completion.
+    stream_error: str | None = None
 
 
 def _positive_int(value: Any) -> int | None:
@@ -126,6 +142,8 @@ def stream_request(url: str, headers: dict[str, str], body: bytes, timeout_s: fl
     completion_tokens: int | None = None
     finish_reason: str | None = None
     continued: int | None = None
+    stream_error: str | None = None
+    error_body: str | None = None
     try:
         req = Request(url, data=body, headers=headers, method="POST")
         with urlopen(req, timeout=timeout_s) as response:
@@ -153,6 +171,11 @@ def stream_request(url: str, headers: dict[str, str], body: bytes, timeout_s: fl
                     chunk = json.loads(payload)
                 except json.JSONDecodeError:
                     continue
+                if not isinstance(chunk, dict):
+                    continue
+                if chunk.get("error") is not None and stream_error is None:
+                    stream_error = stream_error_message(chunk["error"])
+                    error_body = payload[:MAX_ERROR_BODY_CHARS]
                 if first_token_ms is None:
                     field = chunk_token_field(chunk)
                     if field is not None:
@@ -170,7 +193,9 @@ def stream_request(url: str, headers: dict[str, str], body: bytes, timeout_s: fl
         return StreamResult(
             status, first_token_ms, done_ms, prompt_tokens, completion_tokens, target_pod=target_pod,
             finish_reason=finish_reason, tre_continued=continued, tre_retried=retried,
-            first_token_field=first_token_field,
+            first_token_field=first_token_field, stream_error=stream_error,
+            error=None if stream_error is None else f"stream error: {stream_error}",
+            error_body=error_body,
         )
     except HTTPError as exc:
         error_headers = lower_headers(exc.headers)
@@ -275,6 +300,15 @@ def _chunk_has_content(chunk: dict[str, Any]) -> bool:
     return chunk_token_field(chunk) is not None
 
 
+def stream_error_message(error: Any) -> str:
+    """The message of an in-stream ``error`` value (an OpenAI error object or a string)."""
+    if isinstance(error, dict):
+        message = error.get("message") or error.get("type") or json.dumps(error, sort_keys=True)
+        code = error.get("code")
+        return f"{message} (code {code})" if code is not None else str(message)
+    return str(error)
+
+
 def result_fields(res: StreamResult) -> dict[str, Any]:
     """The per-request record fields that come from the answer itself - what every client
     writes for a request, whatever drove it. Token counts are the engine's ``usage``;
@@ -295,4 +329,7 @@ def result_fields(res: StreamResult) -> dict[str, Any]:
         "tre_retried": getattr(res, "tre_retried", None),
         "client_timeout": bool(getattr(res, "timed_out", False)),
         "first_token_field": getattr(res, "first_token_field", None),
+        "stream_error": getattr(res, "stream_error", None),
+        # What ttft_ms measures (TTFT_BASIS): the first chunk carrying text.
+        "ttft_basis": TTFT_BASIS,
     }

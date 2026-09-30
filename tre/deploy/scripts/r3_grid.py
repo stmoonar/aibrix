@@ -243,6 +243,10 @@ RAW_REQUEST_COLUMNS = [
     # The prompt length the request was built to (captures from 2026-09-30 on); the
     # engine's usage.prompt_tokens is ``input_tokens``.
     "expected_prompt_tokens",
+    # What ttft_ms measures: "first_chunk_with_text" (tre_replayer.engine.stream.TTFT_BASIS).
+    "ttft_basis",
+    # The message of an {"error": ...} chunk inside a 200 stream (None = none): a failure.
+    "stream_error",
 ]
 
 # S4 disk estimate: each per-request line is ~200 bytes of JSON. Warn if a full run is
@@ -456,6 +460,8 @@ def drive_cell(
     from tre_replayer.engine.api import check_api_mode, check_api_url
     from tre_replayer.engine.api import request_body as api_request_body
 
+    from tre_replayer.engine.stream import TTFT_BASIS as ttft_basis
+
     check_api_url(gateway_url, api)
     check_api_mode(api, prompt_mode)
 
@@ -477,8 +483,13 @@ def drive_cell(
             except Exception:  # noqa: BLE001 - a failed send must not kill the worker
                 continue
             if raw_path is not None:
+                record = build_raw_record(cell_id, send_ts, res)
+                # the grid path keeps the same per-request pair as the schedule path
+                record["expected_prompt_tokens"] = cell.input_tokens
+                record["stream_error"] = getattr(res, "stream_error", None)
+                record["ttft_basis"] = ttft_basis
                 with lock:
-                    records.append(build_raw_record(cell_id, send_ts, res))
+                    records.append(record)
 
     def sampler() -> None:
         while not stop.is_set():
@@ -933,6 +944,8 @@ def run_schedule_cell(args, store, spec, redis_client=None) -> tuple[list, "open
         # Served requests whose usage.prompt_tokens differed from the length they were
         # built to (openloop.prompt_tokens_check); the per-request pair is in the raw log.
         "prompt_tokens_check": prompt_check,
+        # What every request's ttft_ms measures (tre_replayer.engine.stream.TTFT_BASIS).
+        "ttft_basis": "first_chunk_with_text",
         # What made this cell's arrivals and prompts its own (see openloop).
         "schedule_seed": args.schedule_seed,
         "prompt_key": args.prompt_key,
@@ -1567,6 +1580,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             min_latency_samples=args.min_latency_samples,
             label=primary_label(args, spec),
         ))
+        if raw_path is not None:
+            # The schedule path's per-cell prompt check, on the grid path's raw records.
+            check = openloop.prompt_tokens_check(
+                [r for r in _read_jsonl(raw_path) if r.get("cell_id") == cell.scenario_id],
+                expected_key="expected_prompt_tokens", actual_key="input_tokens")
+            (raw_dir / f"{cell.scenario_id}.prompt_tokens_check.json").write_text(
+                json.dumps(check, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            if not check["ok"]:
+                print(f"WARNING: cell {cell.scenario_id}: {check['mismatched']} served request(s) off their "
+                      f"prompt length, {check['missing_usage']} without usage: {json.dumps(check['examples'])}")
         cell_windows = len(windows)
         ckpt.mark(cell)
         write_csv(rows, out)
