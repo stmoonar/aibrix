@@ -88,6 +88,8 @@ type Server struct {
 	shutdownOnce sync.Once
 	// TRE-PATCH(P3-GW-007): heartbeat / seen-gen / inflight writer (nil when disabled).
 	treWriter *treRedisWriter
+	// TRE-PATCH(BL-GW-001): baseline request event stream (nil when disabled).
+	blEvents *blReqEmitter
 }
 
 type processState struct {
@@ -111,6 +113,8 @@ type processState struct {
 	treTicket *treInflightTicket
 	// TRE-PATCH(P3-GW-012): the response body reached end_of_stream.
 	respBodyEOS bool
+	// TRE-PATCH(BL-GW-001): baseline request event state; nil unless arr was emitted.
+	bl *blReqState
 }
 
 var podName = os.Getenv("POD_NAME")
@@ -155,16 +159,20 @@ func NewServer(redisClient *redis.Client, client kubernetes.Interface, gatewayCl
 		httprouteCacheTTL:   httpRouteCacheTTL(),
 		shutdownCh:          shutdown,
 		shutdown:            shutdown,
+		blEvents:            newBLReqEmitterFromEnv(redisClient),
 	}
 }
 
-func (s *Server) Process(srv extProcPb.ExternalProcessor_ProcessServer) error {
+func (s *Server) Process(srv extProcPb.ExternalProcessor_ProcessServer) (retErr error) {
 	st := &processState{
 		ctx:       srv.Context(),
 		requestID: uuid.New().String(),
 	}
 
 	defer func() {
+		// TRE-PATCH(BL-GW-001): every exit of the ext_proc stream ends the request, so the
+		// baseline "done" event is emitted here, once, for every request that had "arr".
+		s.blOnStreamEnd(st, retErr)
 		// TRE-PATCH(P3-GW-009): every exit of the ext_proc stream (completion, upstream or
 		// Envoy error, client disconnect, stream close, shutdown) ends the request, so
 		// the inflight slot is released here, exactly once.
@@ -354,6 +362,7 @@ func (s *Server) handleProcessingRequest(st *processState, req *extProcPb.Proces
 			st.treTicket = ticket
 		}
 		st.metricLabel = gatewayReqBody
+		s.blOnRequestBody(st, req, resp) // TRE-PATCH(BL-GW-001): arr
 		// create a ttftSpan to collect time from reqBody to first respBody
 		_, st.ttftSpan = tracer.Start(st.ctx, "Wait_For_LLM_First_Token")
 
@@ -363,6 +372,7 @@ func (s *Server) handleProcessingRequest(st *processState, req *extProcPb.Proces
 		if st.isRespError {
 			resp = s.responseForResponseHeaderError(st, resp)
 		}
+		s.blOnResponseHeaders(st) // TRE-PATCH(BL-GW-001)
 		st.metricLabel = gatewayRespHeaders
 
 	case *extProcPb.ProcessingRequest_ResponseBody:
@@ -374,11 +384,15 @@ func (s *Server) handleProcessingRequest(st *processState, req *extProcPb.Proces
 			st.ttftSpan.End()
 			st.ttftSpan = nil
 		}
+		// TRE-PATCH(BL-GW-001): ft on the first frame; the frame is not parsed.
+		s.blOnResponseBody(st, req.GetResponseBody().GetBody())
 		if st.isRespError {
 			body := string(req.Request.(*extProcPb.ProcessingRequest_ResponseBody).ResponseBody.GetBody())
 			resp = s.responseErrorProcessingWithHeaders(st.ctx, st.routerCtx, st.lastRespHeaders, st.respErrorCode, st.model, st.requestID, body)
 		} else {
-			resp, st.completed = s.HandleResponseBody(st.ctx, st.routerCtx, st.requestID, req, st.user, st.rpm, st.model, st.stream, st.traceTerm, st.completed)
+			var outTokens int64
+			resp, st.completed, outTokens = s.handleResponseBody(st.ctx, st.routerCtx, st.requestID, req, st.user, st.rpm, st.model, st.stream, st.traceTerm, st.completed)
+			s.blOnOutTokens(st, outTokens)
 		}
 		st.metricLabel = gatewayRespBody
 
@@ -392,6 +406,7 @@ func (s *Server) handleProcessingRequest(st *processState, req *extProcPb.Proces
 		s.cache.DoneRequestCount(st.routerCtx, st.requestID, st.model, st.traceTerm)
 		return nil, status.Errorf(codes.Internal, "no response generated for %T", req.Request)
 	}
+	s.blOnResponse(st, resp) // TRE-PATCH(BL-GW-001): status of a post-routing immediate response
 
 	if st.model == "" {
 		return resp, nil
@@ -663,6 +678,8 @@ func (s *Server) Shutdown() {
 	}
 	// TRE-PATCH(P3-GW-007): leave the live-instance set and clear own inflight fields.
 	s.stopTRECoordination()
+	// TRE-PATCH(BL-GW-001): flush buffered baseline request events.
+	s.blEvents.close()
 	if s.httpServer != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()

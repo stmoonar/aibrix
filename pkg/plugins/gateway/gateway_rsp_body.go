@@ -68,6 +68,13 @@ type OpenAIResponse struct {
 }
 
 func (s *Server) HandleResponseBody(ctx context.Context, routerCtx *types.RoutingContext, requestID string, req *extProcPb.ProcessingRequest, user utils.User, rpm int64, model string, stream bool, traceTerm int64, hasCompleted bool) (*extProcPb.ProcessingResponse, bool) {
+	resp, complete, _ := s.handleResponseBody(ctx, routerCtx, requestID, req, user, rpm, model, stream, traceTerm, hasCompleted)
+	return resp, complete
+}
+
+// handleResponseBody is HandleResponseBody plus the completion token count of the usage
+// accounted in this frame (TRE-PATCH BL-GW-001), or -1 when this frame accounted none.
+func (s *Server) handleResponseBody(ctx context.Context, routerCtx *types.RoutingContext, requestID string, req *extProcPb.ProcessingRequest, user utils.User, rpm int64, model string, stream bool, traceTerm int64, hasCompleted bool) (*extProcPb.ProcessingResponse, bool, int64) {
 	b := req.Request.(*extProcPb.ProcessingRequest_ResponseBody)
 	arrival := time.Now()
 
@@ -75,6 +82,7 @@ func (s *Server) HandleResponseBody(ctx context.Context, routerCtx *types.Routin
 	var promptTokens, completionTokens, totalTokens int64
 	var headers []*configPb.HeaderValueOption
 	complete := hasCompleted
+	outTokens := int64(-1)
 
 	// Omitted tracer.Start(ctx, "HandleResponseBody") here to avoid excessive CPU and gRPC overhead.
 	// Creating a span for each individual token in the stream is too resource-intensive.
@@ -136,7 +144,7 @@ func (s *Server) HandleResponseBody(ctx context.Context, routerCtx *types.Routin
 							[]*configPb.HeaderValueOption{{Header: &configPb.HeaderValue{
 								Key: HeaderErrorStreaming, RawValue: []byte("true"),
 							}}},
-							"malformed JSON in SSE stream", "", ""), complete
+							"malformed JSON in SSE stream", "", ""), complete, outTokens
 					}
 
 					// gjson avoids full deserialization by only extracting the usage field.
@@ -181,7 +189,7 @@ func (s *Server) HandleResponseBody(ctx context.Context, routerCtx *types.Routin
 		if isLanguageRequest(routerCtx.ReqPath) {
 			processingRes, complete, promptTokens, completionTokens, totalTokens = processLanguageResponse(requestID, b)
 			if processingRes != nil {
-				return processingRes, complete
+				return processingRes, complete, outTokens
 			}
 		}
 	}
@@ -189,6 +197,7 @@ func (s *Server) HandleResponseBody(ctx context.Context, routerCtx *types.Routin
 	// TRE-PATCH(P3-GW-012): account a request once, even if a later chunk repeats usage.
 	if totalTokens != 0 && !hasCompleted {
 		complete = true
+		outTokens = completionTokens
 
 		// Count token per user.
 		if user.Name != "" {
@@ -199,7 +208,7 @@ func (s *Server) HandleResponseBody(ctx context.Context, routerCtx *types.Routin
 					[]*configPb.HeaderValueOption{{Header: &configPb.HeaderValue{
 						Key: HeaderErrorIncrTPM, RawValue: []byte("true"),
 					}}},
-					err.Error(), "", ""), complete
+					err.Error(), "", ""), complete, outTokens
 			}
 
 			headers = buildEnvoyProxyHeaders(headers,
@@ -224,7 +233,7 @@ func (s *Server) HandleResponseBody(ctx context.Context, routerCtx *types.Routin
 				},
 			},
 		},
-	}, complete
+	}, complete, outTokens
 }
 
 // treFinalStreamUsage reports whether an SSE event's usage is the request's final usage:
