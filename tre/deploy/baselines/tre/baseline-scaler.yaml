@@ -1,0 +1,115 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tre-v2-baseline-scaler
+  namespace: tre-v2
+  labels:
+    app.kubernetes.io/name: tre-v2-baseline-scaler
+spec:
+  # Off by default. The campaign scales it to 1 for a baseline arm; at most one pod may
+  # actuate (owner lock tre:v2:bl:owner), and Recreate avoids an old+new overlap.
+  replicas: 0
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: tre-v2-baseline-scaler
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: tre-v2-baseline-scaler
+    spec:
+      serviceAccountName: tre-v2-baseline-scaler
+      containers:
+        - name: baseline-scaler
+          image: tre-v2-baseline-scaler:unbuilt
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+              name: http
+          env:
+            - name: TRE_BL_POLICY
+              value: static
+            # Decide and log only; set "false" (with the controller in observe) to actuate.
+            - name: TRE_BL_DRY_RUN
+              value: "true"
+            - name: TRE_BL_TICK_S
+              value: "2"
+            - name: TRE_SM_URL
+              value: http://tre-v2-service-manager:8000
+            - name: TRE_REDIS_URL
+              value: redis://tre-v2-redis:6379/0
+            - name: TRE_REGISTRY_PATH
+              value: /etc/tre/registry.yaml
+            - name: TRE_BL_POLICY_CONFIG
+              value: /etc/tre-baselines/$(TRE_BL_POLICY).yaml
+            - name: TRE_BL_LOG_DIR
+              value: /var/log/tre-baselines
+            - name: TRE_BL_WRITE_REDIS
+              value: "true"
+            - name: TRE_BL_SLEEP_PATH
+              value: scale_down
+            - name: TRE_MODEL_NAMESPACE
+              value: default
+            - name: TRE_BL_HTTP_PORT
+              value: "8080"
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            failureThreshold: 6
+          volumeMounts:
+            - name: registry
+              mountPath: /etc/tre
+              readOnly: true
+            - name: policies
+              mountPath: /etc/tre-baselines
+              readOnly: true
+            - name: decision-logs
+              mountPath: /var/log/tre-baselines
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+      volumes:
+        - name: registry
+          configMap:
+            name: tre-v2-registry
+        - name: policies
+          projected:
+            sources:
+              - configMap:
+                  name: tre-v2-baseline-chiron
+              - configMap:
+                  name: tre-v2-baseline-tokenscale
+              - configMap:
+                  name: tre-v2-baseline-preserve
+        # Decision JSONL; also mirrored to Redis tre:v2:bl:decision:<model>. Patch in a
+        # persistent volume to keep the files past the pod.
+        - name: decision-logs
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tre-v2-baseline-scaler
+  namespace: tre-v2
+  labels:
+    app.kubernetes.io/name: tre-v2-baseline-scaler
+spec:
+  selector:
+    app.kubernetes.io/name: tre-v2-baseline-scaler
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080

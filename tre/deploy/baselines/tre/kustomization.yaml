@@ -1,0 +1,13 @@
+# Baseline scaler (Chiron / TokenScale / PreServe arms). Ships scaled to zero and in
+# dry-run: an arm is started by the campaign (replicas 1 + TRE_BL_POLICY), and actuation
+# needs TRE_BL_DRY_RUN=false on top. Not part of overlays/tre-v2 on purpose.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - rbac.yaml
+  - policy-configmaps.yaml
+  - baseline-scaler.yaml
+images:
+  # Built locally from tre/ (docker build -f baselines/Dockerfile .); set the tag at deploy.
+  - name: tre-v2-baseline-scaler
+    newTag: unbuilt

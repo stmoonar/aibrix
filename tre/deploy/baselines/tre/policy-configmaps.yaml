@@ -1,0 +1,34 @@
+# Per-policy parameters, mounted together at /etc/tre-baselines/<policy>.yaml; the shell
+# reads the file named by TRE_BL_POLICY_CONFIG. Filled in by each policy (empty for now).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tre-v2-baseline-chiron
+  namespace: tre-v2
+  labels:
+    app.kubernetes.io/name: tre-v2-baseline-scaler
+data:
+  chiron.yaml: |
+    {}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tre-v2-baseline-tokenscale
+  namespace: tre-v2
+  labels:
+    app.kubernetes.io/name: tre-v2-baseline-scaler
+data:
+  tokenscale.yaml: |
+    {}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tre-v2-baseline-preserve
+  namespace: tre-v2
+  labels:
+    app.kubernetes.io/name: tre-v2-baseline-scaler
+data:
+  preserve.yaml: |
+    {}
