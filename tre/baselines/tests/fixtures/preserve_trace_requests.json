@@ -1,0 +1,55 @@
+[
+ {
+  "request_id": "req_000001",
+  "timestamp": 1.0,
+  "model_name": "dsqwen-7b",
+  "prompt": "a",
+  "prompt_length": 100,
+  "phase_type": "stable",
+  "max_output_tokens": 50
+ },
+ {
+  "request_id": "req_000002",
+  "timestamp": 5.0,
+  "model_name": "dsllama-8b",
+  "prompt": "b",
+  "prompt_length": 1000,
+  "phase_type": "stable",
+  "max_output_tokens": 500
+ },
+ {
+  "request_id": "req_000003",
+  "timestamp": 30.0,
+  "model_name": "dsqwen-7b",
+  "prompt": "c",
+  "prompt_length": 200,
+  "phase_type": "stable",
+  "max_output_tokens": 60
+ },
+ {
+  "request_id": "req_000004",
+  "timestamp": 61.0,
+  "model_name": "dsqwen-7b",
+  "prompt": "d",
+  "prompt_length": 300,
+  "phase_type": "stable",
+  "max_output_tokens": 70
+ },
+ {
+  "request_id": "req_000005",
+  "model_name": "dsqwen-7b",
+  "prompt": "no arrival",
+  "prompt_length": 5,
+  "phase_type": "stable",
+  "max_output_tokens": 5
+ },
+ {
+  "request_id": "req_000006",
+  "timestamp": 150.0,
+  "model_name": "dsqwen-7b",
+  "prompt": "e",
+  "prompt_length": 400,
+  "phase_type": "stable",
+  "max_output_tokens": null
+ }
+]

@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Callable
 
 from tre_baselines.policies.base import Decision, Policy
 from tre_baselines.policies.chiron import ChironPolicy
+from tre_baselines.policies.preserve import PreServePolicy
 from tre_baselines.policies.static import StaticPolicy
 from tre_baselines.policies.tokenscale import TokenScalePolicy
 
@@ -21,6 +22,7 @@ POLICIES: dict[str, Callable[["Config"], Policy]] = {
     "static": StaticPolicy,
     "chiron": ChironPolicy,
     "tokenscale": TokenScalePolicy,
+    "preserve": PreServePolicy,
 }
 
 

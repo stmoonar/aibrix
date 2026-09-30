@@ -1,0 +1,24 @@
+{
+ "dsqwen-7b": [
+  {
+   "start_time": 0,
+   "end_time": 120,
+   "rps": 1.0,
+   "input_tokens": 100,
+   "max_tokens": 50
+  }
+ ],
+ "dsllama-8b": [
+  {
+   "start_time": 0,
+   "end_time": 90,
+   "rps": 0.5,
+   "input_tokens_dist": {
+    "kind": "log_uniform",
+    "low": 10,
+    "high": 100
+   },
+   "max_tokens": 20
+  }
+ ]
+}

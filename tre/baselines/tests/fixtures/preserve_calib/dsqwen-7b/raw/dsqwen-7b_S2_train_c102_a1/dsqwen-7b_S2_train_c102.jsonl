@@ -1,0 +1,3 @@
+{"send_ts_ms": 1000000, "recv_first_token_ts_ms": 1000100, "done_ts_ms": 1005095, "input_tokens": 50000, "output_tokens": 1000, "ttft_ms": 100, "tpot_ms": 5, "e2e_ms": 5095, "http_status": 200, "cell_id": "dsqwen-7b_S2_train_c102", "outcome": "ok"}
+{"send_ts_ms": 1001000, "recv_first_token_ts_ms": 1001100, "done_ts_ms": 1006095, "input_tokens": 50000, "output_tokens": 1000, "ttft_ms": 100, "tpot_ms": 5, "e2e_ms": 5095, "http_status": 200, "cell_id": "dsqwen-7b_S2_train_c102", "outcome": "ok"}
+{"send_ts_ms": 1002000, "recv_first_token_ts_ms": 1002100, "done_ts_ms": 1007095, "input_tokens": 50000, "output_tokens": 1000, "ttft_ms": 100, "tpot_ms": 5, "e2e_ms": 5095, "http_status": 200, "cell_id": "dsqwen-7b_S2_train_c102", "outcome": "ok"}
