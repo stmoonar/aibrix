@@ -23,18 +23,20 @@ from test_review4_sm import _deployment_name, _gate_world
 LOAD_S = 130  # a cold load longer than the old 120 s starting TTL
 
 
-def test_startup_placeholder_lease_never_expires_by_default_waking_still_does():
+def test_startup_placeholder_and_waking_leases_never_expire_by_default():
     redis = FakeRedis()
     leases = GpuLeaseStore(redis)
     starting = Binding("new", "tp2", Slot("node-a", (0, 1)), awake=False)
     waking = Binding("pod-x", "m1", Slot("node-a", (2,)), awake=False)
     with fence(redis):
         assert leases.acquire(starting, phase="starting").expires_at_ms == 0
-        assert leases.acquire(waking, phase="waking").expires_at_ms == redis.now_ms + 120_000
+        # review P1-2: the waking lease lives until the commit / journal recovery
+        assert leases.acquire(waking, phase="waking").expires_at_ms == 0
         leases.rebuild_awake([], starting_bindings=[starting])
     assert [lease.expires_at_ms for lease in leases.load()] == [0]
     # an explicit TTL is still possible
     assert GpuLeaseStore(redis, starting_ttl_ms=5000).ttl_ms("starting") == 5000
+    assert GpuLeaseStore(redis, transient_ttl_ms=120_000).ttl_ms("waking") == 120_000
 
 
 def _admitted_world():

@@ -120,3 +120,25 @@ controller restart 只重启 controller，两者都要重启，否则 controller
   锁内提交；`tre:v2:sm:wake_ops` journal 供崩溃恢复（启动时与 supervisor 每轮）。观测：`GET /v2/wake`、
   JSON 日志事件 `wake_start/wake_done/wake_failed/gpu_truth_fallback/startup_placeholder`，
   ops 记录 `details` 带 binding、placement、truth_source、phases_ms、error_code、compensating_sleep。
+
+### 7.1 评审后的加固（2026-09-30）
+
+- 等待中的唤醒：waking lease 不再过期（TTL 0），只由 commit 或 journal 恢复释放；账面把 journal 里的 binding
+  视为占卡；prepare 阶段即打 power 标记。commit 拿不到锁会先重试一次；任何未完成的 commit（锁、Redis、
+  fence）都交给恢复，不再卡在本进程。恢复等待写锁（commit_lock_wait_s）；pod UID 变了（pod 被重建）
+  则回滚、不碰新 pod；物理状态读不到时最多保留 `wake.recovery_unknown_attempts` 轮（pod 非 Ready 则立即）
+  然后回滚并告警；`/wake_up` 传输超时、补偿 sleep 失败都保留条目（前者延迟 `wake.transport_recheck_s` 复核）。
+  SM 重启时 bootstrap 从 journal 重建 waking lease，并给这些卡打 power 标记。reconcile 不改 journal 中的
+  binding（不打 routable、不改 store），defrag 在有 journal 条目时拒绝。
+- 启动 / 重启占位：starting lease 在 Pod 非 Ready 且不能确认醒着时，超过
+  `startup_admission.placeholder_max_s`（默认 900 s）或期间再次重启（CrashLoop）即释放并告警。
+  vLLM 主容器原地重启（restartCount 增加、Pod 不重建）会带着醒着的引擎回来而不经过启动门：supervisor
+  每轮比较 restartCount，增加即给该 binding 加 starting 占位（`container_restart_placeholder`）；active 下
+  等 `/is_sleeping` 可读后按 desired 收敛（desired 睡则经 sleep primitive 补睡），observe 下只占位 + 告警。
+  **根治方案（本轮不做）**：让主容器的 entrypoint 每次启动都先走一次准入（与 init 门相同的
+  `/v2/startup/admit`，按容器实例而不是 Pod UID 去重），这样原地重启也拿到 starting 占位、由收敛负责；
+  supervisor 的 restartCount 比较只能在它看到的两次采样之间发现重启，SM 停机期间的重启会漏掉。
+- 部分扩容：精确目标（APA `/scale_service`）放不满返回 409 `partial`（已醒的保持醒）；`at_least`
+  （controller）返回 `unfilled` 与 `refusals`，controller 视为未完成并按 refusals 冷却对应卡。hinted 唤醒带
+  `avoid_gpus`（在途接力占用的卡），SM 不会把 wake 换到这些卡上；接力本身始终是精确 binding。
+

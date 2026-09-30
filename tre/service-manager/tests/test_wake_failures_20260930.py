@@ -122,7 +122,7 @@ def test_compensating_sleep_when_the_wake_cannot_be_recorded():
     assert "m1/node-a/1" not in _leases(world)
 
 
-def test_compensating_sleep_is_not_attempted_when_the_state_is_unknown(caplog):
+def test_compensating_sleep_is_not_attempted_when_the_state_is_unknown_entry_kept(caplog):
     world = _world()
 
     def unknown(pod_ip, *, port=None):
@@ -136,9 +136,16 @@ def test_compensating_sleep_is_not_attempted_when_the_state_is_unknown(caplog):
             world.service.put_binding_power("pod-b", awake=True)
 
     assert not any(call[0] == "sleep" for call in world.vllm.calls)
-    assert _leases(world)["m1/node-a/1"] == "waking"  # left to expire
+    # review P1-2 / P2: the waking lease (no TTL) and the journal entry stay for the
+    # recovery; the desired intent is not rolled back before the state is known.
+    assert _leases(world)["m1/node-a/1"] == "waking"
     assert _events(caplog, "wake_failed_state_unknown")
-    assert world.journal.entries() == {}
+    assert set(world.journal.entries()) == {"m1/node-a/1"}
+    assert world.desired()["m1/node-a/1"][0] == "awake"
+    world.vllm.physical_override.pop("10.0.0.2")
+    world.vllm.sleeping["10.0.0.2"] = True
+    assert world.service.recover_wake_journal()["resolved"] == [{"binding_id": "m1/node-a/1", "result": "rolled_back"}]
+    assert world.desired()["m1/node-a/1"][0] == "sleeping"
 
 
 # ------------------------------------------------------------ S3 structured 409

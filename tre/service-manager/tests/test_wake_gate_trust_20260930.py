@@ -117,7 +117,8 @@ def test_ttl_valid_sample_passes_without_waiting_or_probing():
     assert _woke(vllm)
     assert clock.slept == []  # never waited for a sample
     # The unreachable resident was never probed: the trusted sample decided.
-    assert agent.requested == 1  # only the post-wake power-change refresh
+    # only the power-change refreshes of the wake itself (prepare, commit)
+    assert agent.requested == 2
 
 
 def test_trusted_busy_sample_refuses_at_once_and_asks_for_a_new_sample():

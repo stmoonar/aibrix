@@ -714,6 +714,19 @@ class ServiceManagerConfig:
     #: admission request; a Pod waiting longer is reported as drift again (a stuck
     #: gate is not masked). 0 = never exempt.
     startup_gate_drift_grace_s: float = 600.0
+    #: ``service_manager.wake.recovery_unknown_attempts``: a wake the journal
+    #: recovery cannot read (/is_sleeping unknown) is kept this many supervisor
+    #: passes, then rolled back with an alert (at once when its pod is not Ready).
+    wake_recovery_unknown_attempts: int = 12
+    #: ``service_manager.wake.transport_recheck_s``: a /wake_up that raised (timeout,
+    #: transport error) may still wake the engine: its waking lease and journal
+    #: entry are kept and the recovery rechecks it after this long.
+    wake_transport_recheck_s: float = 30.0
+    #: ``service_manager.startup_admission.placeholder_max_s``: a Pod admitted at its
+    #: startup gate holds its GPUs (the ``starting`` lease) until it converged or is
+    #: gone - at most this long while it is not Ready and not verifiably awake
+    #: (e.g. CrashLoopBackOff); then the lease is released with an alert.
+    startup_placeholder_max_s: float = 900.0
     #: ``service_manager.test_hooks``: honour the fault-injection keys
     #: ``tre:v2:sm:fault:<refuse_wake|fail_wake>:<node>/<gpu>`` (acceptance tests
     #: only). Off by default: the keys are then never read.
@@ -1311,6 +1324,17 @@ def parse_service_manager_config(
             "service_manager.startup_admission.drift_grace_s",
         ),
         test_hooks=_parse_bool(raw.get("test_hooks", base.test_hooks)),
+        wake_recovery_unknown_attempts=int(
+            _num(wake_raw, "recovery_unknown_attempts", base.wake_recovery_unknown_attempts)
+        ),
+        wake_transport_recheck_s=_nonneg_num(
+            wake_raw, "transport_recheck_s", base.wake_transport_recheck_s,
+            "service_manager.wake.transport_recheck_s",
+        ),
+        startup_placeholder_max_s=_nonneg_num(
+            startup_raw, "placeholder_max_s", base.startup_placeholder_max_s,
+            "service_manager.startup_admission.placeholder_max_s",
+        ),
         operations_max_records=int(
             _num(operations_raw, "max_records", base.operations_max_records)
         ),
@@ -1356,6 +1380,10 @@ def _validate_service_manager(
     errors: list[str] = []
     if config.operations_max_records < 100:
         errors.append("service_manager.operations.max_records must be >= 100")
+    if config.wake_recovery_unknown_attempts < 1:
+        errors.append("service_manager.wake.recovery_unknown_attempts must be >= 1")
+    if config.startup_placeholder_max_s < 60:
+        errors.append("service_manager.startup_admission.placeholder_max_s must be >= 60")
     sleep = config.sleep
     for name in (
         "ack_timeout_s",

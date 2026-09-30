@@ -149,6 +149,18 @@ class FleetSupervisor:
                 reap_leases()
             except OperationBusy:
                 pass  # a writer (possibly starting a Pod) is active; next pass
+        guard_restarts = getattr(self._service, "guard_container_restarts", None)
+        if callable(guard_restarts):
+            try:
+                guard_restarts()
+            except OperationBusy:
+                pass  # next pass (the counts are compared again)
+        reap_placeholders = getattr(self._service, "reap_stale_startup_placeholders", None)
+        if callable(reap_placeholders):
+            try:
+                reap_placeholders()
+            except OperationBusy:
+                pass  # next pass
         recovered = (
             self._service.recover_stale_fleet_repairs(actuate=False)
             if observe

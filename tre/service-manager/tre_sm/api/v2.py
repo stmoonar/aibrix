@@ -279,6 +279,17 @@ class ServiceManagerV2:
         self._wake_executor = ThreadPoolExecutor(
             max_workers=WAKE_WORKERS, thread_name_prefix="wake"
         )
+        #: P2-8 / P1-3: starting lease binding id -> (monotonic time this SM first
+        #: saw it, restart count of its Pod then).
+        self._placeholder_seen: dict[str, tuple[float, int]] = {}
+        #: P1-4: pod UID -> restart count last seen (container restarts in place).
+        self._restarts_seen: dict[str, int] = {}
+        #: P1-4: binding ids holding a restart placeholder (starting lease) that the
+        #: restart guard converges.
+        self._restart_placeholders: dict[str, str] = {}
+        # P2-3: after a restart the power marks are empty; the GPUs of wakes still
+        # journaled may hold an engine the last gpu-truth sample does not show.
+        self._mark_journaled_wakes()
         self._supervisor = None
         self._fleet_repair = None
         # Background startup admissions (review 3 P2-5): (pod, uid) -> (job, start).
@@ -488,8 +499,12 @@ class ServiceManagerV2:
         drain_budget_s: float | None = None,
         at_least: bool = False,
         hints: list[str] | tuple[str, ...] | None = None,
+        avoid_gpus: list[str] | tuple[str, ...] | None = None,
     ) -> dict:
         """Scale a model to ``wake_replicas`` awake bindings.
+
+        ``avoid_gpus`` (``"node/gpu"``): GPUs the SM must not pick for a wake of this
+        request (the caller's donor / receiver relays in flight there).
 
         ``hints`` (S5): serve ids of sleeping bindings the caller would like woken.
         The service-manager picks the GPUs (registry placement policy), taking the
@@ -513,19 +528,43 @@ class ServiceManagerV2:
         its commit phase (only the bindings that slept go "sleeping"); growth
         restores the previous desired records of what did not wake.
         """
-        with self._writer("put_model_target"):
-            response, batch, targets, tickets = self._put_model_target_locked(
-                model,
-                wake_replicas=wake_replicas,
-                sleep_path=sleep_path,
-                drain_budget_s=drain_budget_s,
-                at_least=at_least,
-                hints=tuple(hints or ()),
-            )
+        tickets: list[_WakeTicket] = []
+        try:
+            with self._writer("put_model_target"):
+                response, batch, targets, tickets = self._put_model_target_locked(
+                    model,
+                    wake_replicas=wake_replicas,
+                    sleep_path=sleep_path,
+                    drain_budget_s=drain_budget_s,
+                    at_least=at_least,
+                    hints=tuple(hints or ()),
+                    avoid_gpus=tuple(avoid_gpus or ()),
+                )
+        except BaseException:
+            # Phase 1 prepared wakes but the writer phase itself failed on exit (a
+            # lost fence, Redis): they stay journaled with their leases; the
+            # journal recovery resolves them (P1-1).
+            self._hand_over_to_recovery(tickets, "the prepare phase ended with an error")
+            raise
         if tickets:
             response["version"] = self._finish_split_wakes("put_model_target", tickets)
             response["actions"] = [_wake_action(ticket) for ticket in tickets]
             response["picked"] = [_picked(ticket) for ticket in tickets]
+            refusals = response.pop("_refusals", [])
+            if refusals:
+                response["refusals"] = refusals
+            unfilled = int(response.get("unfilled") or 0)
+            if unfilled and not at_least:
+                # P2-7: an exact target (APA /scale_service) that could not be met
+                # is not a success; what did wake stays awake (committed).
+                first = refusals[0] if refusals else {}
+                raise WakeConflict(
+                    f"model target of {model}: {unfilled} of {len(tickets) + unfilled} wakes could not "
+                    f"be placed (woke {[t.binding.serve_id for t in tickets]}); refusals: "
+                    f"{[r.get('reason') for r in refusals]}",
+                    reason="partial", node=first.get("node"), gpus=first.get("gpu_ids") or (),
+                    blocking_binding_id=first.get("blocking_binding_id"),
+                )
             return response
         if batch is None:
             return response
@@ -560,6 +599,7 @@ class ServiceManagerV2:
         drain_budget_s: float | None,
         at_least: bool = False,
         hints: tuple[str, ...] = (),
+        avoid_gpus: tuple[str, ...] = (),
     ) -> tuple[dict, object, list[SleepTarget], list["_WakeTicket"]]:
         spec = self._registry.model(model)
         if wake_replicas < 0:
@@ -634,8 +674,8 @@ class ServiceManagerV2:
         split_wakes = bool(plan["wake"]) and not plan["create"] and self._split_wake_capable()
         if split_wakes:
             before = self._desired_records()
-            tickets = self._prepare_target_wakes(
-                model, len(plan["wake"]), snapshot.bindings, hints, before
+            tickets, refusals = self._prepare_target_wakes(
+                model, len(plan["wake"]), snapshot.bindings, hints, before, avoid_gpus=avoid_gpus
             )
             try:
                 with self._desired_guard(reason="model_target_request"):
@@ -651,6 +691,12 @@ class ServiceManagerV2:
             unfilled = len(plan["wake"]) - len(tickets)
             if unfilled:
                 response["unfilled"] = unfilled
+                # Where the SM could not wake (the controller cools those GPUs down).
+                response["_refusals"] = [
+                    exc.body(retry_after_s=self.wake_retry_after_s(exc.scope))
+                    for exc in refusals
+                    if isinstance(exc, WakeConflict)
+                ]
             # The intent stays: the commit phase restores what did not wake.
             return response, None, [], tickets
         with self._desired_guard(reason="model_target_request") as guard:
@@ -684,7 +730,9 @@ class ServiceManagerV2:
         bindings: list[Binding],
         hints: tuple[str, ...],
         before: dict[str, tuple[str, bool]],
-    ) -> list["_WakeTicket"]:
+        *,
+        avoid_gpus: tuple[str, ...] = (),
+    ) -> tuple[list["_WakeTicket"], list[BaseException]]:
         """Phase 1 of a model's growth by ``need`` wakes (writer lock held; S5). The
         service-manager picks: among the sleeping bindings the account allows, the
         caller's hints first, else the best by the registry placement policy
@@ -692,20 +740,24 @@ class ServiceManagerV2:
         scored against the earlier ones). A candidate the wake gate / a lease /
         a reservation refuses is skipped (``placement_substituted`` event) and the
         next best tried. Fewer than ``need`` -> what could be prepared (none ->
-        the first refusal is raised)."""
+        the first refusal is raised). Returns (tickets, refusals)."""
         hinted = [str(hint) for hint in hints]
         planning = list(bindings)
         leases = self._active_leases()
+        journal = self._wake_journal.entries()
         topology = self._registry.topology()
         tickets: list[_WakeTicket] = []
         refusals: list[BaseException] = []
         tried: set[str] = set()
+        avoid = {str(item) for item in avoid_gpus}
         try:
             while len(tickets) < need:
                 sleeping = [
-                    b for b in planning if b.model == model and not b.awake and b.serve_id not in tried
+                    b for b in planning
+                    if b.model == model and not b.awake and b.serve_id not in tried
+                    and not any(f"{b.slot.node}/{gpu}" in avoid for gpu in b.slot.gpu_ids)
                 ]
-                blockers = {b.serve_id: self._wake_blocker(b, planning, leases) for b in sleeping}
+                blockers = {b.serve_id: self._wake_blocker(b, planning, leases, journal) for b in sleeping}
                 feasible = [b for b in sleeping if blockers[b.serve_id] is None]
                 if not feasible:
                     refusals.extend(blockers[b.serve_id] for b in sleeping[:1])
@@ -726,7 +778,7 @@ class ServiceManagerV2:
                 }
                 try:
                     ticket = self._prepare_wake(
-                        binding, planning, leases=leases,
+                        binding, planning, leases=leases, journal=journal,
                         previous_desired=before.get(binding.binding_id), placement=placement,
                     )
                 except (WakeConflict, GpuLeaseConflict, ReservationConflict, ValueError) as exc:
@@ -751,7 +803,7 @@ class ServiceManagerV2:
                 f"no wakeable sleeping binding of {model}", node=None, gpus=()
             )
         self._note_wake_details(tickets)
-        return tickets
+        return tickets, refusals
 
     @staticmethod
     def _binding_id_of(serve_id: str, bindings: list[Binding]) -> str | None:
@@ -858,9 +910,10 @@ class ServiceManagerV2:
         wakes: list[Binding] = []
         existing_target = min(wake_replicas, len(model_bindings))
         leases = self._active_leases()
+        journal = self._wake_journal.entries()
         while sleeping and len(target) < existing_target:
             blockers = {
-                binding.serve_id: self._wake_blocker(binding, list(planning.values()), leases)
+                binding.serve_id: self._wake_blocker(binding, list(planning.values()), leases, journal)
                 for binding in sleeping
             }
             feasible = [binding for binding in sleeping if blockers[binding.serve_id] is None]
@@ -910,20 +963,25 @@ class ServiceManagerV2:
         (S6: /wake_up outside the writer lock)."""
         if awake:
             ticket = None
-            with self._writer("put_binding_power"):
-                # Controller-requested wake: same scaling cap as put_model_target. Fleet
-                # repair (_set_binding_power_by_id_unlocked) restores recorded desired
-                # state and is deliberately not capped here.
-                snapshot = self._store.load()
-                binding = next((item for item in snapshot.bindings if item.serve_id == serve_id), None)
-                if binding is not None and not binding.awake:
-                    self._ensure_wake_within_cap(binding, snapshot.bindings)
-                    if self._split_wake_capable():
-                        ticket = self._begin_binding_wake(binding, snapshot.bindings)
-                if ticket is None:
-                    return self._put_binding_power_unlocked(
-                        serve_id, awake=True, sleep_path=sleep_path, drain_budget_s=drain_budget_s
-                    )
+            try:
+                with self._writer("put_binding_power"):
+                    # Controller-requested wake: same scaling cap as put_model_target.
+                    # Fleet repair (_set_binding_power_by_id_unlocked) restores recorded
+                    # desired state and is deliberately not capped here.
+                    snapshot = self._store.load()
+                    binding = next((item for item in snapshot.bindings if item.serve_id == serve_id), None)
+                    if binding is not None and not binding.awake:
+                        self._ensure_wake_within_cap(binding, snapshot.bindings)
+                        if self._split_wake_capable():
+                            ticket = self._begin_binding_wake(binding, snapshot.bindings)
+                    if ticket is None:
+                        return self._put_binding_power_unlocked(
+                            serve_id, awake=True, sleep_path=sleep_path, drain_budget_s=drain_budget_s
+                        )
+            except BaseException:
+                self._hand_over_to_recovery([ticket] if ticket is not None else [],
+                                            "the prepare phase ended with an error")
+                raise
             version = self._finish_split_wakes("put_binding_power", [ticket])
             return {
                 "serve_id": serve_id,
@@ -1430,6 +1488,8 @@ class ServiceManagerV2:
                 "defrag forced while registry placement.defrag.enabled is false (tp_size=%s)",
                 tp_size,
             )
+        if self._wake_journal.entries():
+            raise DefragUnavailable("wake_in_progress")
         return self._defrag_serialized(tp_size=tp_size)
 
     @serialized_operation("defrag")
@@ -1562,6 +1622,13 @@ class ServiceManagerV2:
             prober=prober,
             label_writer=label_writer,
             drop_missing=drop_missing,
+            # A binding being woken (journaled) is neither re-labelled routable nor
+            # recorded awake by a reconcile: the wake's commit (or its recovery)
+            # decides - a failed wake's compensating sleep must never hit a pod
+            # the reconcile opened to traffic.
+            frozen_serve_ids={
+                str(entry.get("serve_id")) for entry in self._wake_journal.entries().values()
+            },
         )
         self._sync_observed(result.observations)
         return {
@@ -3310,6 +3377,7 @@ class ServiceManagerV2:
         *,
         check_account: bool = True,
         leases=None,
+        journal=None,
         previous_desired: tuple[str, bool] | None = None,
         placement: dict | None = None,
     ) -> "_WakeTicket":
@@ -3324,7 +3392,7 @@ class ServiceManagerV2:
                 binding_id=binding.binding_id, blocking_binding_id=binding.binding_id,
             )
         if check_account:
-            self._ensure_feasible_wake(binding, bindings or [], leases)
+            self._ensure_feasible_wake(binding, bindings or [], leases, journal)
         self._check_fault_hooks(binding)
         snapshot = self._snapshot_for_binding(binding)
         if not snapshot.pod_ip:
@@ -3360,12 +3428,17 @@ class ServiceManagerV2:
         with self._wakes_lock:
             self._wakes_in_flight.add(binding.binding_id)
         try:
+            # The waking lease does not expire (GpuLeaseStore: waking TTL 0): only
+            # the commit or the journal recovery releases it (P1-2).
             if self._gpu_leases is not None:
                 self._gpu_leases.acquire(binding, phase="waking")
         except BaseException:
             self._forget_wake(binding.binding_id)
             self._wake_journal.end(binding.binding_id)
             raise
+        # From here the engine may wake: a gpu-truth sample taken before this no
+        # longer describes these GPUs (P1-2, S1).
+        self._note_binding_power_change(binding)
         ticket.phases_ms["reserve"] = _elapsed_ms(started)
         _log_event(
             "wake_start",
@@ -3412,6 +3485,227 @@ class ServiceManagerV2:
                 binding_id=binding.binding_id,
             )
 
+    def _mark_journaled_wakes(self) -> None:
+        """Power marks for the GPUs of every journaled wake (startup): a sample
+        taken before that wake is not trusted."""
+        if self._gpu_truth is None:
+            return
+        try:
+            entries = self._wake_journal.entries()
+        except Exception:  # noqa: BLE001 - the recovery handles them anyway
+            return
+        for entry in entries.values():
+            try:
+                self._note_power_change(str(entry["node"]), [int(g) for g in entry["gpu_ids"]])
+            except (KeyError, TypeError, ValueError):
+                continue
+
+    def reap_stale_startup_placeholders(self, *, now: float | None = None) -> list[str]:
+        """Supervisor pass (P2-8 / P1-3): a ``starting`` lease (the placeholder of a
+        Pod admitted at its startup gate, S2, or of a container restart, P1-4) is
+        released when its Pod is not Ready and not verifiably awake (/is_sleeping
+        true or unreadable) AND either this SM has seen the lease for more than
+        ``startup_admission.placeholder_max_s``, or the Pod restarted again since
+        the lease appeared (CrashLoopBackOff, an OOM while loading). A Ready Pod or
+        one that reads awake is left to the convergence. Under the writer lock
+        (wait 0); an alert per release."""
+        if self._gpu_leases is None or self._runtime_ops is None:
+            return []
+        now = time.monotonic() if now is None else now
+        limit = float(getattr(self._sm_config, "startup_placeholder_max_s", 900.0))
+        try:
+            starting = [lease for lease in self._gpu_leases.load() if lease.phase == "starting"]
+        except Exception:  # noqa: BLE001 - next pass
+            return []
+        live = {lease.binding_id for lease in starting}
+        for binding_id in list(self._placeholder_seen):
+            if binding_id not in live:
+                del self._placeholder_seen[binding_id]
+        restarts = self._restart_counts_by_binding()
+        overdue = []
+        for lease in starting:
+            first, restarts_then = self._placeholder_seen.setdefault(
+                lease.binding_id, (now, restarts.get(lease.binding_id, 0))
+            )
+            crashlooping = restarts.get(lease.binding_id, 0) > restarts_then
+            if now - first > limit or crashlooping:
+                overdue.append(lease)
+        if not overdue:
+            return []
+        released: list[str] = []
+        with self._writer("reap_stale_startup_placeholders", wait_s=0.0):
+            for lease in overdue:
+                binding = Binding(
+                    "startup-placeholder", lease.binding_id.split("/", 1)[0],
+                    Slot(lease.node, tuple(int(g) for g in lease.gpu_ids)), awake=False,
+                )
+                verdict = self._placeholder_verdict(binding)
+                if verdict is not None:
+                    continue
+                first, restarts_then = self._placeholder_seen.get(lease.binding_id, (now, 0))
+                self._gpu_leases.release(binding)
+                self._placeholder_seen.pop(lease.binding_id, None)
+                self._restart_placeholders.pop(lease.binding_id, None)
+                self._note_binding_power_change(binding)
+                _log_event(
+                    "startup_placeholder_released",
+                    level=logging.ERROR,
+                    binding_id=lease.binding_id, node=lease.node, gpu_ids=list(lease.gpu_ids),
+                    held_s=round(now - first, 1),
+                    restarts=restarts.get(lease.binding_id, 0), restarts_when_seen=restarts_then,
+                    detail="Pod not Ready and not verifiably awake (placeholder_max_s or restarting)",
+                )
+                released.append(lease.binding_id)
+        return released
+
+    def _restart_counts_by_binding(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        lister = getattr(self._runtime_ops, "list_pod_snapshots", None)
+        if not callable(lister):
+            return counts
+        try:
+            for snapshot in lister():
+                try:
+                    binding_id = _binding_from_snapshot(snapshot).binding_id
+                except (KeyError, ValueError):
+                    continue
+                counts[binding_id] = max(counts.get(binding_id, 0), int(getattr(snapshot, "restart_count", 0) or 0))
+        except Exception:  # noqa: BLE001 - unknown: no crashloop verdict
+            return {}
+        return counts
+
+    def guard_container_restarts(self) -> dict:
+        """Supervisor pass (P1-4): a vLLM container restarted IN PLACE (restart count
+        up, same Pod) loads its weights and comes up AWAKE - the startup gate does not
+        run again and the store may record it asleep. The binding gets a
+        ``starting`` placeholder on its GPUs at once (same mechanism and bound as
+        S2; alert ``container_restart_placeholder``). SM actuation active: once
+        /is_sleeping answers, it is converged - desired sleeping and awake -> slept
+        through the sleep primitive; desired awake and awake -> the ``awake`` lease,
+        annotation and store; asleep -> placeholder released. Observe: placeholder
+        and alert only. The first pass only records the counts (a restart while
+        the SM was down is not seen: the root fix is an admission on every
+        container start, see the design note)."""
+        lister = getattr(self._runtime_ops, "list_pod_snapshots", None)
+        if self._gpu_leases is None or not callable(lister):
+            return {"placed": [], "converged": []}
+        try:
+            snapshots = list(lister())
+        except Exception:  # noqa: BLE001 - next pass
+            return {"placed": [], "converged": []}
+        restarted = []
+        for snapshot in snapshots:
+            uid = snapshot.pod_uid or snapshot.name
+            count = int(getattr(snapshot, "restart_count", 0) or 0)
+            previous = self._restarts_seen.get(uid)
+            if previous is not None and count > previous:
+                restarted.append(snapshot)
+            else:
+                self._restarts_seen[uid] = count
+        live = {snapshot.pod_uid or snapshot.name for snapshot in snapshots}
+        for uid in list(self._restarts_seen):
+            if uid not in live:
+                del self._restarts_seen[uid]
+        placed: list[str] = []
+        converged: list[str] = []
+        if not restarted and not self._restart_placeholders:
+            return {"placed": placed, "converged": converged}
+        with self._writer("guard_container_restarts", wait_s=0.0):
+            for snapshot in restarted:
+                try:
+                    binding = replace(_binding_from_snapshot(snapshot), awake=False, hidden=False)
+                except (KeyError, ValueError):
+                    self._restarts_seen[snapshot.pod_uid or snapshot.name] = int(snapshot.restart_count or 0)
+                    continue
+                try:
+                    self._gpu_leases.acquire(binding, phase="starting")
+                except GpuLeaseConflict as exc:
+                    _log_event(
+                        "container_restart_conflict", level=logging.ERROR,
+                        binding_id=binding.binding_id, pod=snapshot.name, occupant=exc.occupant,
+                        detail="restarted engine on GPUs another binding holds - possible double occupancy",
+                    )
+                else:
+                    self._restart_placeholders[binding.binding_id] = snapshot.name
+                    placed.append(binding.binding_id)
+                    _log_event(
+                        "container_restart_placeholder", level=logging.WARNING,
+                        binding_id=binding.binding_id, pod=snapshot.name, node=binding.slot.node,
+                        gpu_ids=list(binding.slot.gpu_ids), restart_count=int(snapshot.restart_count or 0),
+                        since=int(time.time() * 1000),
+                    )
+                self._note_binding_power_change(binding)
+                self._restarts_seen[snapshot.pod_uid or snapshot.name] = int(snapshot.restart_count or 0)
+            if not self.actuation_observe():
+                by_name = {snapshot.name: snapshot for snapshot in snapshots}
+                for binding_id, pod_name in list(self._restart_placeholders.items()):
+                    snapshot = by_name.get(pod_name)
+                    if snapshot is None:
+                        self._restart_placeholders.pop(binding_id, None)
+                        continue
+                    if self._converge_restart(snapshot):
+                        self._restart_placeholders.pop(binding_id, None)
+                        converged.append(binding_id)
+        return {"placed": placed, "converged": converged}
+
+    def _converge_restart(self, snapshot) -> bool:
+        """Converge a restarted container once /is_sleeping answers (writer lock
+        held). True when done."""
+        if not snapshot.pod_ip or not snapshot.ready or self._vllm_ops is None:
+            return False
+        physical = self._vllm_ops.is_sleeping(snapshot.pod_ip, port=8000)
+        if physical is None:
+            return False
+        binding = replace(_binding_from_snapshot(snapshot), awake=False, hidden=False)
+        desired = self._desired_power_of(binding.binding_id)
+        if physical is True:
+            self._gpu_leases.release(binding)
+            self._runtime_ops.write_binding_annotations(binding, state=POD_STATE_SLEEPING)
+            self._set_store_power(binding.binding_id, awake=False, hidden=False)
+        elif desired is not None and desired[0] == "sleeping":
+            if self._sleep_primitive is None:
+                return False
+            awake = replace(binding, awake=True, hidden=True)
+            outcomes = self._sleep_targets([SleepTarget(awake, snapshot.pod_ip)], sleep_path="repair")
+            if not any(item.get("status") == STATUS_SLEPT for item in outcomes):
+                return False
+            self._set_store_power(binding.binding_id, awake=False, hidden=False)
+        else:
+            hidden = bool(desired[1]) if desired is not None else False
+            self._runtime_ops.write_binding_annotations(
+                binding, state=POD_STATE_HIDDEN if hidden else POD_STATE_AWAKE
+            )
+            self._gpu_leases.acquire(binding, phase="awake")
+            self._set_store_power(binding.binding_id, awake=True, hidden=hidden)
+        self._note_binding_power_change(binding)
+        self._refresh_observed([binding.binding_id])
+        _log_event("container_restart_converged", binding_id=binding.binding_id,
+                   physically_awake=physical is False, desired=desired)
+        return True
+
+    def _placeholder_verdict(self, binding: Binding) -> str | None:
+        """None = the placeholder may be released; else why it is kept."""
+        pods = []
+        try:
+            for snapshot in self._runtime_ops.list_pod_snapshots(model=binding.model):
+                try:
+                    if _binding_from_snapshot(snapshot).binding_id == binding.binding_id:
+                        pods.append(snapshot)
+                except (KeyError, ValueError):
+                    continue
+        except Exception:  # noqa: BLE001 - cannot tell: keep it
+            return "pods_unreadable"
+        for snapshot in pods:
+            if snapshot.ready:
+                return "pod_ready"  # the convergence's job
+            if snapshot.pod_ip and self._vllm_ops is not None:
+                try:
+                    if self._vllm_ops.is_sleeping(snapshot.pod_ip, port=8000) is False:
+                        return "pod_awake"
+                except Exception:  # noqa: BLE001 - unreadable: not running
+                    pass
+        return None
+
     def _forget_wake(self, binding_id: str) -> None:
         with self._wakes_lock:
             self._wakes_in_flight.discard(binding_id)
@@ -3429,7 +3723,12 @@ class ServiceManagerV2:
             for ticket in tickets:
                 self._run_one_wake(ticket)
             return
-        futures = [self._wake_executor.submit(self._run_one_wake, ticket) for ticket in tickets]
+        try:
+            futures = [self._wake_executor.submit(self._run_one_wake, ticket) for ticket in tickets]
+        except RuntimeError:  # executor shut down (SIGTERM): run them one by one
+            for ticket in tickets:
+                self._run_one_wake(ticket)
+            return
         futures_wait(futures)
         for ticket, future in zip(tickets, futures):
             error = future.exception()
@@ -3461,9 +3760,19 @@ class ServiceManagerV2:
                         f"vLLM wake did not physically converge for {binding.serve_id}", "not_converged"
                     )
             ticket.woke = True
-        except Exception as exc:  # noqa: BLE001 - recorded, settled in phase 3
+        except WakeConflict as exc:
             ticket.woke = False
             ticket.exception = exc
+        except Exception as exc:  # noqa: BLE001 - a transport error: a failed wake (P3-12)
+            ticket.woke = False
+            # The request may still be running on the server (a timeout): the
+            # outcome is uncertain - kept for a delayed recheck by the recovery.
+            ticket.uncertain = True
+            failure = failed(
+                f"vLLM wake failed for {binding.serve_id}: {type(exc).__name__}: {exc}", "vllm_wake_failed"
+            )
+            failure.__cause__ = exc
+            ticket.exception = failure
         finally:
             ticket.phases_ms["wake_up"] = _elapsed_ms(started)
 
@@ -3483,34 +3792,12 @@ class ServiceManagerV2:
             binding = ticket.binding
             started = time.monotonic()
             try:
-                if ticket.woke:
-                    try:
-                        self._runtime_ops.write_binding_annotations(binding, state=POD_STATE_AWAKE)
-                        if self._gpu_leases is not None:
-                            self._gpu_leases.acquire(binding, phase="awake")
-                    except Exception as exc:  # noqa: BLE001 - settled below
-                        LOG.exception("recording the wake of %s failed", binding.binding_id)
-                        ticket.woke = False
-                        failure = WakeFailed(
-                            f"recording the wake of {binding.serve_id} failed: {type(exc).__name__}: {exc}",
-                            reason="not_recorded", node=binding.slot.node, gpus=binding.slot.gpu_ids,
-                            binding_id=binding.binding_id,
-                        )
-                        failure.__cause__ = exc
-                        ticket.exception = failure
-                if ticket.woke and update_store:
-                    try:
-                        self._set_store_power(binding.binding_id, awake=True, hidden=False)
-                    except Exception as exc:  # noqa: BLE001 - raised after the commit
-                        # Physically done (review 3 P3): desired stays awake; the
-                        # reconcile catches the legacy store up.
-                        LOG.exception("saving the wake of %s in the store failed", binding.binding_id)
-                        ticket.store_error = exc
-                if not ticket.woke:
-                    self._settle_failed_wake(ticket)
-                    if restore_desired:
-                        self._restore_wake_desired(ticket)
-                self._wake_journal.end(binding.binding_id)
+                self._commit_one_wake(ticket, restore_desired=restore_desired, update_store=update_store)
+            except Exception as exc:  # noqa: BLE001 - never stop the other tickets (P1-1)
+                # Left journaled (the entry is only ended once settled): the journal
+                # recovery resolves it.
+                LOG.exception("committing the wake of %s failed", binding.binding_id)
+                ticket.commit_error = exc
             finally:
                 self._forget_wake(binding.binding_id)
                 # Woken, or a failed wake in whatever state it left: an earlier
@@ -3520,6 +3807,61 @@ class ServiceManagerV2:
                 self._refresh_observed([binding.binding_id])
                 ticket.phases_ms["commit"] = _elapsed_ms(started)
                 self._log_wake_outcome(ticket)
+
+    def _commit_one_wake(self, ticket: "_WakeTicket", *, restore_desired: bool, update_store: bool) -> None:
+        binding = ticket.binding
+        if ticket.woke:
+            try:
+                self._runtime_ops.write_binding_annotations(binding, state=POD_STATE_AWAKE)
+                if self._gpu_leases is not None:
+                    self._gpu_leases.acquire(binding, phase="awake")
+            except Exception as exc:  # noqa: BLE001 - settled below
+                LOG.exception("recording the wake of %s failed", binding.binding_id)
+                ticket.woke = False
+                failure = WakeFailed(
+                    f"recording the wake of {binding.serve_id} failed: {type(exc).__name__}: {exc}",
+                    reason="not_recorded", node=binding.slot.node, gpus=binding.slot.gpu_ids,
+                    binding_id=binding.binding_id,
+                )
+                failure.__cause__ = exc
+                ticket.exception = failure
+        if ticket.woke and update_store:
+            try:
+                self._set_store_power(binding.binding_id, awake=True, hidden=False)
+            except Exception as exc:  # noqa: BLE001 - raised after the commit
+                # Physically done (review 3 P3): desired stays awake; the
+                # reconcile catches the legacy store up.
+                LOG.exception("saving the wake of %s in the store failed", binding.binding_id)
+                ticket.store_error = exc
+        if not ticket.woke and ticket.uncertain:
+            # A /wake_up that timed out may still wake the engine after we look:
+            # keep the waking lease + journal entry; the recovery rechecks after
+            # service_manager.wake.transport_recheck_s (desired restored then).
+            recheck_s = float(getattr(self._sm_config, "wake_transport_recheck_s", 30.0))
+            self._wake_journal.update(
+                binding.binding_id, recover_after_ms=int(time.time() * 1000 + recheck_s * 1000),
+                uncertain=str(ticket.exception),
+            )
+            ticket.left_to_recovery = True
+            return
+        if not ticket.woke:
+            self._settle_failed_wake(ticket)
+            if ticket.physical is False:
+                # The compensating sleep did not put it to sleep: the engine is awake
+                # (awake lease held). Keep the entry: the recovery completes it as a
+                # wake (desired stays awake) instead of recording a failure the
+                # cluster does not show.
+                ticket.left_to_recovery = True
+                return
+            if ticket.physical is None:
+                # State unknown: the waking lease (it does not expire) and
+                # the journal entry stay; the recovery decides once the
+                # pod can be read - or gives up after a bound (P2-5).
+                ticket.left_to_recovery = True
+                return
+            if restore_desired:
+                self._restore_wake_desired(ticket)
+        self._wake_journal.end(binding.binding_id)
 
     def _settle_failed_wake(self, ticket: "_WakeTicket") -> None:
         """A failed wake must not leave its ``waking`` lease behind (review
@@ -3533,8 +3875,10 @@ class ServiceManagerV2:
           through the sleep primitive (path ``repair``: floor-exempt; the pod was
           never made routable), confirmed by /is_sleeping; slept -> lease
           released, else the ``awake`` lease (its GPUs are in use) and an alert;
-        * unknown -> the ``waking`` lease is left to expire (the floor and lease
-          acquisition ignore an expired lease) and a warning is logged.
+        * unknown -> the ``waking`` lease and the journal entry are kept (the lease
+          does not expire): the journal recovery decides once the pod can be read,
+          or gives up after ``service_manager.wake.recovery_unknown_attempts`` /
+          when the pod is not Ready (P2-5). A warning is logged.
         Best effort; never raises."""
         binding = ticket.binding
         try:
@@ -3568,7 +3912,7 @@ class ServiceManagerV2:
                 LOG.warning(
                     json.dumps(
                         {"event": "wake_failed_state_unknown", "binding_id": binding.binding_id,
-                         "detail": "waking GPU lease left to expire"},
+                         "detail": "waking GPU lease and wake journal entry kept for the recovery"},
                         sort_keys=True,
                     )
                 )
@@ -3692,25 +4036,30 @@ class ServiceManagerV2:
         """Phases 2 and 3 of wakes prepared under the writer lock: /wake_up
         without the lock, then the commit under it. Returns the store version;
         raises the first failed wake's error (the others are committed)."""
-        self._run_wakes(tickets)
         try:
-            with self._writer(f"{kind}_commit", wait_s=self._sm_config.commit_wait_s) as operation:
-                if operation is not None:
-                    operation.advance(
-                        "committing_wake", details={"pods": [t.binding.serve_id for t in tickets]}
-                    )
-                self._commit_wakes(tickets, restore_desired=True, update_store=True)
-                self._note_wake_details(tickets)
-                version = self._store.load().version
-        except OperationBusy:
-            # No commit lock: the wakes stay journaled with their waking leases;
-            # the supervisor's wake-journal recovery completes or rolls them back.
-            for ticket in tickets:
-                self._forget_wake(ticket.binding.binding_id)
-            LOG.warning(
-                "wake commit of %s could not get the writer lock; left to the wake-journal recovery",
-                [t.binding.serve_id for t in tickets],
-            )
+            self._run_wakes(tickets)
+            for attempt in (1, 2):
+                try:
+                    with self._writer(f"{kind}_commit", wait_s=self._sm_config.commit_wait_s) as operation:
+                        if operation is not None:
+                            operation.advance(
+                                "committing_wake", details={"pods": [t.binding.serve_id for t in tickets]}
+                            )
+                        self._commit_wakes(tickets, restore_desired=True, update_store=True)
+                        self._note_wake_details(tickets)
+                        version = self._store.load().version
+                    break
+                except OperationBusy:
+                    # P1-2: try the commit once more before handing over.
+                    if attempt == 2:
+                        raise
+                    LOG.warning("wake commit of %s: writer lock busy, retrying",
+                                [t.binding.serve_id for t in tickets])
+        except BaseException:
+            # No commit (lock busy twice, a lost fence, Redis, shutdown): the wakes
+            # stay journaled with their waking leases (they do not expire); the
+            # wake-journal recovery completes or rolls them back (P1-1).
+            self._hand_over_to_recovery(tickets, "the commit phase did not complete")
             raise
         failed = [ticket for ticket in tickets if not ticket.woke]
         if failed:
@@ -3724,29 +4073,47 @@ class ServiceManagerV2:
             raise unsaved[0].store_error
         return version
 
+    def _hand_over_to_recovery(self, tickets: list["_WakeTicket"], why: str) -> None:
+        """Wakes this process stops tracking (their journal entries and waking
+        leases stay): the wake-journal recovery owns them from now on."""
+        pending = [ticket for ticket in tickets if ticket is not None]
+        for ticket in pending:
+            self._forget_wake(ticket.binding.binding_id)
+        if pending:
+            _log_event(
+                "wake_handed_to_recovery",
+                level=logging.WARNING,
+                binding_ids=[ticket.binding.binding_id for ticket in pending], reason=why,
+            )
+
     def recover_wake_journal(self) -> dict:
         """Resolve wake journal entries that no wake of this process owns (a
         service-manager died between the wake phases, or a commit could not get
         the writer lock), from the pod's physical state: awake -> the wake is
         completed (annotation, ``awake`` lease, store); asleep or gone -> rolled
         back (lease released, desired power restored from the entry); unknown ->
-        kept for the next pass. Under the writer lock; a busy lock skips the
-        pass (supervisor, startup)."""
+        kept for the next pass, at most ``service_manager.wake.recovery_unknown_attempts``
+        passes (then, or at once when the pod is not Ready, rolled back with an
+        alert, P2-5); a pod replaced since the wake (other UID) is rolled back
+        without touching the new pod (P2-4). Under the writer lock, waiting up to
+        ``commit_lock_wait_s`` for it (P1-2)."""
 
         def stale() -> dict[str, dict]:
             with self._wakes_lock:
                 running = set(self._wakes_in_flight)
+            now_ms = time.time() * 1000
             return {
                 binding_id: entry
                 for binding_id, entry in self._wake_journal.entries().items()
                 if binding_id not in running
+                and float(entry.get("recover_after_ms") or 0) <= now_ms
             }
 
         if not stale() or self._runtime_ops is None or self._vllm_ops is None:
             return {"resolved": [], "kept": []}
         resolved: list[dict] = []
         kept: list[dict] = []
-        with self._writer("wake_journal_recovery", wait_s=0.0):
+        with self._writer("wake_journal_recovery", wait_s=self._sm_config.commit_wait_s):
             for binding_id, entry in sorted(stale().items()):
                 result = self._recover_wake_entry(binding_id, entry)
                 (kept if result == "physical_state_unknown" else resolved).append(
@@ -3779,24 +4146,44 @@ class ServiceManagerV2:
         except ValueError:
             snapshot = None
         if snapshot is None or not snapshot.pod_ip:
-            if self._gpu_leases is not None:
-                self._gpu_leases.release(binding)
-            self._restore_wake_desired(ticket)
-            self._wake_journal.end(binding_id)
-            self._note_binding_power_change(binding)
+            self._roll_back_journaled_wake(ticket, binding_id)
             return "pod_gone"
+        journaled_uid = entry.get("pod_uid")
+        if journaled_uid and snapshot.pod_uid and str(snapshot.pod_uid) != str(journaled_uid):
+            # P2-4: the pod was replaced since the wake; the new one (loading, its
+            # own startup gate) is not the one we woke: never "complete" it.
+            self._roll_back_journaled_wake(ticket, binding_id)
+            return "pod_replaced"
         ticket.pod_ip = str(snapshot.pod_ip)
         physical = self._vllm_ops.is_sleeping(ticket.pod_ip, port=8000)
         if physical is None:
-            self._wake_journal.update(
-                binding_id, recovery_attempts=int(entry.get("recovery_attempts") or 0) + 1
-            )
+            attempts = int(entry.get("recovery_attempts") or 0) + 1
+            limit = int(getattr(self._sm_config, "wake_recovery_unknown_attempts", 12))
+            if attempts >= limit or not snapshot.ready:
+                # P2-5: do not freeze the model forever. The GPUs are marked (gpu
+                # truth untrusted) so the next wake there probes the residents.
+                _log_event(
+                    "wake_recovery_gave_up",
+                    level=logging.ERROR,
+                    binding_id=binding_id, attempts=attempts, pod_ready=bool(snapshot.ready),
+                    detail="physical state unreadable; waking lease released, desired power restored",
+                )
+                self._roll_back_journaled_wake(ticket, binding_id)
+                return "gave_up"
+            self._wake_journal.update(binding_id, recovery_attempts=attempts)
             return "physical_state_unknown"
         ticket.woke = physical is False
         if not ticket.woke:
             ticket.exception = ValueError(f"{binding.serve_id} was found asleep after an interrupted wake")
         self._commit_wakes([ticket], restore_desired=True, update_store=True)
         return "completed" if ticket.woke else "rolled_back"
+
+    def _roll_back_journaled_wake(self, ticket: "_WakeTicket", binding_id: str) -> None:
+        if self._gpu_leases is not None:
+            self._gpu_leases.release(ticket.binding)
+        self._restore_wake_desired(ticket)
+        self._wake_journal.end(binding_id)
+        self._note_binding_power_change(ticket.binding)
 
     def _sleep_bindings(
         self,
@@ -4498,6 +4885,7 @@ class ServiceManagerV2:
         snapshot = self._store.load()
         pod_gpus = set(pod.gpu_ids)
         leases = self._active_leases()
+        journal = self._wake_journal.entries()
         candidates: list[Binding] = []
         for binding in snapshot.bindings:
             if binding.model != model or binding.awake:
@@ -4506,7 +4894,7 @@ class ServiceManagerV2:
                 continue
             try:
                 self._assert_not_reserved(binding=binding, what=f"floor make-up wake of {binding.serve_id}")
-                if self._wake_blocker(binding, snapshot.bindings, leases) is not None:
+                if self._wake_blocker(binding, snapshot.bindings, leases, journal) is not None:
                     continue
             except (ReservationConflict, WakeConflict):
                 continue
@@ -4859,12 +5247,16 @@ class ServiceManagerV2:
         actions.append({"action": "unhide", "serve_id": new_serve_id})
         return moved
 
-    def _ensure_feasible_wake(self, binding: Binding, bindings: list[Binding], leases=None) -> None:
-        conflict = self._wake_blocker(binding, bindings, leases)
+    def _ensure_feasible_wake(
+        self, binding: Binding, bindings: list[Binding], leases=None, journal=None
+    ) -> None:
+        conflict = self._wake_blocker(binding, bindings, leases, journal)
         if conflict is not None:
             raise conflict
 
-    def _wake_blocker(self, binding: Binding, bindings: list[Binding], leases=None) -> "WakeConflict | None":
+    def _wake_blocker(
+        self, binding: Binding, bindings: list[Binding], leases=None, journal=None
+    ) -> "WakeConflict | None":
         """Why the account refuses a wake of ``binding`` right now, or None: an awake
         binding on one of its GPUs (the store), or an active GPU lease of another
         binding there - a ``starting`` Pod still loading (S2: that lease lives until
@@ -4901,6 +5293,22 @@ class ServiceManagerV2:
                 reason=reason, node=node, gpus=gpus, binding_id=binding.binding_id,
                 blocking_binding_id=lease.binding_id,
             )
+        # A journaled wake (in flight, or left for the recovery) occupies its GPUs
+        # whatever its lease says (P1-2): the engine may be awake already.
+        entries = self._wake_journal.entries() if journal is None else journal
+        for other_id, entry in entries.items():
+            if other_id == binding.binding_id or entry.get("node") != node:
+                continue
+            try:
+                overlap = sorted(set(gpus) & {int(gpu) for gpu in entry.get("gpu_ids") or ()})
+            except (TypeError, ValueError):
+                continue
+            if overlap:
+                return WakeConflict(
+                    f"{binding.serve_id}: {node}/{overlap[0]} has a wake of {other_id} in flight",
+                    reason="lease_waking", node=node, gpus=gpus, binding_id=binding.binding_id,
+                    blocking_binding_id=other_id,
+                )
         return None
 
     def _active_leases(self, leases=None) -> list:
@@ -5114,6 +5522,8 @@ def _picked(ticket: "_WakeTicket") -> dict:
         "node": ticket.binding.slot.node,
         "gpu_ids": list(ticket.binding.slot.gpu_ids),
         "hinted": bool(ticket.hinted),
+        # The hint this pick stands in for (None: no hint was open).
+        "hint_binding_id": (ticket.placement or {}).get("hint_binding_id"),
     }
 
 
@@ -5221,6 +5631,7 @@ class WakeConflict(ValueError):
         "wake_in_progress": "lease_conflict",
         "resident_awake": "resident_awake",
         "gpu_truth_unavailable": "truth_unavailable",
+        "partial": "partial",
     }
 
     def __init__(
@@ -5332,6 +5743,12 @@ class _WakeTicket:
     #: S4: {"done": bool, "result": str} of the sleep sent after a failed wake that
     #: had woken the engine anyway; None = not needed.
     compensating_sleep: dict | None = None
+    #: The commit of this ticket raised (it stays journaled for the recovery).
+    commit_error: BaseException | None = None
+    #: Failed with an unknown physical state: journal entry + waking lease kept.
+    left_to_recovery: bool = False
+    #: /wake_up raised (transport error / timeout): the server may still wake it.
+    uncertain: bool = False
 
 
 @dataclass(frozen=True)
@@ -5369,6 +5786,8 @@ class TargetRequest(BaseModel):
     #: S5: serve ids of sleeping bindings to prefer (placement hints; the SM may
     #: substitute a hint it cannot wake - see ``picked`` in the response).
     hints: list[str] = []
+    #: GPUs (``node/gpu``) not to wake on (relays of the caller in flight there).
+    avoid_gpus: list[str] = []
     #: Grow-only: no-op when the model already has >= wake_replicas awake (review 3).
     at_least: bool = False
     #: Which sleep path this is (registry service_manager.sleep.budgets_s key).
@@ -5648,6 +6067,7 @@ def create_app(service: ServiceManagerV2) -> FastAPI:
                 drain_budget_s=request.drain_budget_s,
                 at_least=request.at_least,
                 hints=request.hints,
+                avoid_gpus=request.avoid_gpus,
             )
         except WakeConflict:
             raise  # structured 409 (wake_conflict_handler)

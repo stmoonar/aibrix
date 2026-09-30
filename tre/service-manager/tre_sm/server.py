@@ -128,6 +128,16 @@ def create_app() -> FastAPI:
         )
         for pod in k8s_ops.list_admitted_startup_pods()
     ]
+    wake_journal = WakeJournal(redis_client)
+    waking_bindings = []
+    for entry in wake_journal.entries().values():
+        try:
+            waking_bindings.append(
+                Binding(str(entry["serve_id"]), str(entry["model"]),
+                        Slot(str(entry["node"]), tuple(int(g) for g in entry["gpu_ids"])), awake=False)
+            )
+        except (KeyError, TypeError, ValueError):
+            LOG.error("ignoring a corrupt wake journal entry at bootstrap: %s", entry)
     with operation_coordinator.operation("bootstrap_fleet_state"):
         fleet_store.bootstrap(legacy_store.load().bindings)
         # D7: every registry binding (and TRE-managed Deployment) gets a desired
@@ -140,6 +150,9 @@ def create_app() -> FastAPI:
         gpu_leases.rebuild_awake(
             legacy_store.load().bindings,
             starting_bindings=starting_bindings,
+            # Wakes a dead SM left between its phases keep their GPUs until the
+            # journal recovery resolves them (review P2-3).
+            waking_bindings=waking_bindings,
         )
     safety_gate = ClusterSafetyGate(
         redis_client,
@@ -183,7 +196,7 @@ def create_app() -> FastAPI:
             plugin_pods=_plugin_pod_lister(k8s_ops, sm_config.sleep),
         ),
         sleep_journal=SleepJournal(redis_client),
-        wake_journal=WakeJournal(redis_client),
+        wake_journal=wake_journal,
         # Read only while registry service_manager.test_hooks is true.
         fault_redis=redis_client,
         supervisor_enabled=os.environ.get(

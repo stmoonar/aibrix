@@ -107,8 +107,10 @@ class GpuLeaseStore:
     writer fence). Phases and their lifetime:
 
     * ``awake`` - never expires; released when the binding sleeps.
-    * ``waking`` - ``transient_ttl_ms`` (a wake takes seconds; a dead SM's lease
-      frees the GPU on its own).
+    * ``waking`` - ``transient_ttl_ms``; 0 (default since 2026-09-30) = never
+      expires: /wake_up runs outside the writer lock and the engine may be awake
+      before the commit records it, so only the commit or the wake-journal
+      recovery (``tre:v2:sm:wake_ops``) releases it.
     * ``starting`` - ``starting_ttl_ms``; 0 (default, S2 2026-09-30) = never
       expires: a Pod admitted at its startup gate holds its GPUs until it has
       converged (the lease becomes ``awake`` or is released) or its Pod is gone
@@ -121,7 +123,7 @@ class GpuLeaseStore:
         self,
         redis_client: GpuLeaseRedis,
         *,
-        transient_ttl_ms: int = 120_000,
+        transient_ttl_ms: int = 0,
         starting_ttl_ms: int = 0,
     ) -> None:
         self._redis = redis_client
@@ -213,7 +215,13 @@ class GpuLeaseStore:
         bindings: list[Binding],
         *,
         starting_bindings: list[Binding] | None = None,
+        waking_bindings: list[Binding] | None = None,
     ) -> None:
+        """Replace every lease by the awake bindings' ``awake`` leases, the admitted
+        startups' ``starting`` leases and (2026-09-30) the ``waking`` leases of the
+        wakes the journal says are in flight - a restart must not drop the fence of
+        an engine that may be waking. A waking binding that clashes with an awake /
+        starting one is skipped (the journal recovery resolves it)."""
         fence = current_fence()
         if fence is None:
             raise StateFenceError("GPU lease rebuild requires an active writer fence")
@@ -266,6 +274,28 @@ class GpuLeaseStore:
                         mapping[field] = payload
                         continue
                     raise GpuLeaseConflict(gpu=field, occupant=other)
+                mapping[field] = payload
+        for binding in waking_bindings or []:
+            record = GpuLease(
+                binding_id=binding.binding_id,
+                node=binding.slot.node,
+                gpu_ids=binding.slot.gpu_ids,
+                owner=fence.owner,
+                fencing_token=fence.token,
+                phase="waking",
+                expires_at_ms=(
+                    0 if self._transient_ttl_ms == 0 else int(time.time() * 1000) + self._transient_ttl_ms
+                ),
+            )
+            payload = json.dumps(
+                {**asdict(record), "gpu_ids": list(record.gpu_ids)},
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            fields = [_gpu_field(binding.slot.node, gpu_id) for gpu_id in binding.slot.gpu_ids]
+            if any(field in mapping and json.loads(mapping[field])["binding_id"] != binding.binding_id for field in fields):
+                continue
+            for field in fields:
                 mapping[field] = payload
         args = [fence.lock_value]
         for field, payload in sorted(mapping.items()):

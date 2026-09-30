@@ -523,7 +523,9 @@ class OperationCoordinator:
             pass
 
     def trim(self) -> int:
-        """Drop the oldest finished records beyond ``max_records`` (running
+        """Once the journal holds more than ``max_records`` records, drop the oldest
+        finished ones down to 90 % of it (a low-water mark: the full read + sort
+        runs once per ~10 % of max_records operations, not every check; running
         records are never dropped). Returns how many were dropped."""
         if self.max_records is None:
             return 0
@@ -531,9 +533,12 @@ class OperationCoordinator:
         if callable(counter) and int(counter(rediskeys.SM_OPERATIONS_KEY)) <= self.max_records:
             return 0
         records = self.list_operations(limit=10**9)  # newest first
+        if not callable(counter) and len(records) <= self.max_records:
+            return 0
+        keep = max(1, int(self.max_records * 0.9))
         drop = [
             str(record.get("operation_id"))
-            for record in records[self.max_records:]
+            for record in records[keep:]
             if record.get("status") != "running" and record.get("operation_id")
         ]
         for start in range(0, len(drop), 500):
