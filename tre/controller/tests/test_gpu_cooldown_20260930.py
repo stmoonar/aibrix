@@ -231,9 +231,10 @@ def test_gpu_cooldown_of_every_free_gpu_blocks_the_sleeping_capacity():
 
 def test_placement_retry_event_when_the_sm_substitutes_a_hint():
     class HintedClient:
-        async def scale_model_hinted(self, model, delta, *, hints):
+        async def scale_model_hinted(self, model, delta, *, hints, avoid_gpus=()):
             return {"ok": True, "response": {"picked": [
-                {"serve_id": "8b-6", "binding_id": "dsllama-8b/node10/2", "node": "node10", "gpu_ids": [2], "hinted": False},
+                {"serve_id": "8b-6", "binding_id": "dsllama-8b/node10/2", "node": "node10", "gpu_ids": [2],
+                 "hinted": False, "hint_binding_id": "dsllama-8b/node9/1"},
             ]}}
 
     slots = {b.serve_id: (b.slot.node, b.slot.gpu_ids) for b in _bindings()}
@@ -245,3 +246,51 @@ def test_placement_retry_event_when_the_sm_substitutes_a_hint():
 
     assert result.ok and result.picked[0]["node"] == "node10"
     assert queue.drain_events() == ["placement_retry:dsllama-8b:node9/1->node10/2"]
+
+
+# ------------------------------------------------------------------ review fixes
+
+
+def test_wake_failed_is_not_retried_at_once_but_cools_the_gpu():
+    body = dict(STRUCTURED, error="wake_failed", reason="vllm_wake_failed")
+    error = ServiceManagerError("HTTP 409", status=409, body=body)
+    assert error.retriable is False
+    assert error.wake_conflict["error"] == "wake_failed"
+
+
+def test_gpu_cooldown_from_the_refusals_of_a_partial_hinted_wake():
+    class PartialClient:
+        async def scale_model_hinted(self, model, delta, *, hints, avoid_gpus=()):
+            return {"ok": True, "response": {"picked": [], "unfilled": 1, "refusals": [
+                {"error": "gpu_busy", "reason": "gpu_truth_used", "node": "node9", "gpu_ids": [1], "scope": "gpu"},
+            ]}}
+
+    clock = {"now": 0}
+    queue = ActionQueue(PartialClient(), now_ms=lambda: clock["now"], wake_cooldown_s=(30.0, 60.0))
+    queue.submit([ScaleAction("dsllama-8b", 1, "critical_sleeping_capacity", "rescue", pods=("8b-1",), hint=True)])
+    (result,) = asyncio.run(queue.drain_once())
+
+    assert result.ok is False and result.error.startswith("partial")  # not a silent success
+    assert queue.cooled_gpus() == {("node9", 1)}
+
+
+def test_hinted_wake_avoids_the_gpus_of_relays_in_flight():
+    seen = {}
+
+    class Client:
+        async def scale_model_hinted(self, model, delta, *, hints, avoid_gpus=()):
+            seen["avoid"] = avoid_gpus
+            return {"ok": True, "response": {"picked": []}}
+
+        async def set_binding_power(self, serve_id, *, awake, **_kwargs):
+            await asyncio.sleep(0.05)
+            return {"ok": True}
+
+    slots = {b.serve_id: (b.slot.node, b.slot.gpu_ids) for b in _bindings()}
+    queue = ActionQueue(Client(), slot_of=slots.get)
+    relay = ScaleAction("dsqwen-7b", -1, "critical_donor_immediate", "rescue", pods=("7b-4",))
+    wake = ScaleAction("dsllama-8b", 1, "critical_sleeping_capacity", "rescue", pods=("8b-1",), hint=True)
+    queue.submit([relay, wake])
+    asyncio.run(queue.drain_once())
+
+    assert seen["avoid"] == ("node10/0",)  # 7b-4 sits on node10/0; the hint's own GPU is not avoided

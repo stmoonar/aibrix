@@ -414,7 +414,12 @@ class ActionQueue:
 
     def _note_wake_conflict(self, action, result: DispatchResult) -> None:
         conflict = result.wake_conflict
-        if conflict is None or self._wake_cooldown_ms is None or _action_direction(action) != "up":
+        if conflict is None or _action_direction(action) != "up":
+            return
+        self._cool(result.model, conflict)
+
+    def _cool(self, model: str, conflict: dict) -> None:
+        if self._wake_cooldown_ms is None or not conflict.get("node"):
             return
         gpu_ms, node_ms = self._wake_cooldown_ms
         now = int(self._now_ms())
@@ -422,7 +427,7 @@ class ActionQueue:
         gpus = [int(gpu) for gpu in conflict.get("gpu_ids") or ()]
         where = f"{node}/{','.join(str(gpu) for gpu in gpus)}"
         code = conflict.get("error")
-        self._events.append(f"wake_refused:{result.model}:{where}:{code}")
+        self._events.append(f"wake_refused:{model}:{where}:{code}")
         if conflict.get("scope") == "node":
             until = now + int(node_ms)
             self._node_cooldowns[node] = max(until, self._node_cooldowns.get(node, 0))
@@ -432,10 +437,10 @@ class ActionQueue:
             for gpu in gpus:
                 self._gpu_cooldowns[(node, gpu)] = max(until, self._gpu_cooldowns.get((node, gpu), 0))
                 self._events.append(f"gpu_cooldown:{node}/{gpu}:{until}")
-        self._refusals[result.model] = (where, until)
+        self._refusals[model] = (where, until)
         LOG.warning(
             json.dumps(
-                {"event": "gpu_cooldown", "model": result.model, "node": node, "gpu_ids": gpus,
+                {"event": "gpu_cooldown", "model": model, "node": node, "gpu_ids": gpus,
                  "scope": conflict.get("scope"), "error_code": code, "reason": conflict.get("reason"),
                  "until_ms": until, "blocking_binding_id": conflict.get("blocking_binding_id")},
                 sort_keys=True,
@@ -1272,8 +1277,14 @@ class ActionQueue:
             if action.delta > 0 and action.pods and getattr(action, "hint", False):
                 hinted = getattr(self._client, "scale_model_hinted", None)
                 if callable(hinted):
+                    # The SM may place the wake elsewhere: never on a GPU another
+                    # queued / running action (a donor -> receiver relay) is using.
                     return self._hinted_result(
-                        action, await hinted(action.model, action.delta, hints=tuple(action.pods))
+                        action,
+                        await hinted(
+                            action.model, action.delta, hints=tuple(action.pods),
+                            avoid_gpus=tuple(sorted(self._busy_gpus(except_action=action))),
+                        ),
                     )
             if action.delta != 0 and action.pods:
                 return await self._dispatch_binding_power(action)
@@ -1308,19 +1319,44 @@ class ActionQueue:
             return _dispatch_result(model=CLUSTER_MODEL, action_kind="defrag", response=response)
         return DispatchResult(model=model, action_kind="unknown", ok=False, error="unsupported_action")
 
+    def _busy_gpus(self, *, except_action=None) -> set[str]:
+        """``node/gpu`` of every GPU a queued or running action uses (resource keys)."""
+        items = list(self._running.values()) + list(self._pending)
+        return {
+            key[len("gpu:"):]
+            for item in items
+            if item.action is not except_action
+            for key in item.resources
+            if key.startswith("gpu:")
+        }
+
     def _hinted_result(self, action: ScaleAction, response: dict) -> DispatchResult:
-        """A hinted wake's result; ``placement_retry`` events for every replica the
-        SM woke somewhere else than the hint (S5)."""
+        """A hinted wake's result (S5): ``placement_retry`` for every replica the SM
+        woke somewhere else than its hint (paired by the hint's binding id, never by
+        position); the SM's refusals cool their GPUs down; an unfilled growth is not
+        a success - the planner re-plans (review P2-7)."""
         result = _dispatch_result(model=action.model, action_kind="scale", response=response)
-        picked = tuple(((response.get("response") or {}).get("picked") or ()) if response.get("ok") else ())
-        hint_slots = [self._slot_of(pod) if self._slot_of is not None else None for pod in action.pods]
-        for index, entry in enumerate(picked):
+        body = (response.get("response") or {}) if response.get("ok") else {}
+        picked = tuple(body.get("picked") or ())
+        for entry in picked:
             if not isinstance(entry, dict) or entry.get("hinted"):
                 continue
-            hint = hint_slots[index] if index < len(hint_slots) else None
-            source = f"{hint[0]}/{','.join(str(g) for g in hint[1])}" if hint else "?"
+            source = _binding_gpus(entry.get("hint_binding_id")) or "?"
             target = f"{entry.get('node')}/{','.join(str(g) for g in entry.get('gpu_ids') or ())}"
             self._events.append(f"placement_retry:{action.model}:{source}->{target}")
+        for refusal in body.get("refusals") or ():
+            if isinstance(refusal, dict):
+                self._cool(action.model, {
+                    "node": refusal.get("node"), "gpu_ids": refusal.get("gpu_ids") or refusal.get("gpu") or (),
+                    "scope": refusal.get("scope"), "error": refusal.get("error"), "reason": refusal.get("reason"),
+                    "blocking_binding_id": refusal.get("blocking_binding_id"),
+                })
+        unfilled = int(body.get("unfilled") or 0)
+        if unfilled > 0:
+            return replace(
+                result, ok=False, error=f"partial: {unfilled} of {action.delta} wakes unfilled",
+                retriable=False, picked=picked,
+            )
         return replace(result, picked=picked)
 
     async def _dispatch_binding_power(self, action: ScaleAction) -> DispatchResult:
@@ -1536,6 +1572,12 @@ def _dispatch_result(*, model: str, action_kind: str, response: dict) -> Dispatc
         floor_violation=(not ok) and "floor_violation" in response,
         wake_conflict=conflict if isinstance(conflict, dict) else None,
     )
+
+
+def _binding_gpus(binding_id) -> str | None:
+    """``node/gpus`` of a binding id ``model/node/gpus``."""
+    parts = str(binding_id or "").split("/")
+    return f"{parts[1]}/{parts[2]}" if len(parts) == 3 else None
 
 
 def _actor_for(action) -> str:

@@ -70,6 +70,11 @@ class ServiceManagerError(Exception):
     def retriable(self) -> bool:
         if self.floor_violation:
             return False
+        if (self.body or {}).get("error") == "wake_failed":
+            # The wake itself failed on that GPU (the SM settled it, possibly with a
+            # compensating sleep): not re-sent at once - the GPU cools down and the
+            # planner re-plans (review P3-11).
+            return False
         return self.timeout or self.transport or self.status in RETRIABLE_STATUSES
 
     @property
@@ -202,7 +207,9 @@ class ServiceManagerClient:
         except ServiceManagerError as exc:
             return exc.result()
 
-    async def scale_model_hinted(self, model: str, delta: int, *, hints: tuple[str, ...]) -> dict:
+    async def scale_model_hinted(
+        self, model: str, delta: int, *, hints: tuple[str, ...], avoid_gpus: tuple[str, ...] = ()
+    ) -> dict:
         """Grow ``model`` by ``delta`` awake replicas, waking the sleeping bindings
         ``hints`` names when the service-manager can (S5): it picks the GPUs itself
         (registry placement policy) and substitutes a hint it cannot wake; the
@@ -214,7 +221,10 @@ class ServiceManagerClient:
             response = await self._request(
                 "PUT",
                 f"/v2/models/{model}/target",
-                json={"wake_replicas": target, "at_least": True, "hints": list(hints)},
+                json={
+                    "wake_replicas": target, "at_least": True, "hints": list(hints),
+                    "avoid_gpus": list(avoid_gpus),
+                },
                 timeout_s=self._slow_timeout_s,
             )
             return {"ok": True, "response": response}
