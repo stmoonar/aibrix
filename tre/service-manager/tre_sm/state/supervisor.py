@@ -124,6 +124,12 @@ class FleetSupervisor:
                 recover()
             except OperationBusy:
                 pass  # another writer; next pass
+        recover_wakes = getattr(self._service, "recover_wake_journal", None)
+        if callable(recover_wakes):
+            try:
+                recover_wakes()
+            except OperationBusy:
+                pass  # another writer; next pass
         ensure_seeded = getattr(self._service, "ensure_desired_seeded", None)
         if callable(ensure_seeded):
             try:
@@ -143,6 +149,27 @@ class FleetSupervisor:
                 reap_leases()
             except OperationBusy:
                 pass  # a writer (possibly starting a Pod) is active; next pass
+        reap_waking = getattr(self._service, "reap_orphan_waking_leases", None)
+        if callable(reap_waking):
+            try:
+                reap_waking()
+            except OperationBusy:
+                pass  # next pass
+        # The restart guard runs BEFORE the placeholder reaper: a crash-looping
+        # engine that starts again gets its placeholder in the same pass the
+        # reaper looks at it (review P2-2).
+        guard_restarts = getattr(self._service, "guard_container_restarts", None)
+        if callable(guard_restarts):
+            try:
+                guard_restarts()
+            except OperationBusy:
+                pass  # next pass (the counts are compared again)
+        reap_placeholders = getattr(self._service, "reap_stale_startup_placeholders", None)
+        if callable(reap_placeholders):
+            try:
+                reap_placeholders()
+            except OperationBusy:
+                pass  # next pass
         recovered = (
             self._service.recover_stale_fleet_repairs(actuate=False)
             if observe

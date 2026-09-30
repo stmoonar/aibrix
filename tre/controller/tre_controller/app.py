@@ -361,6 +361,12 @@ def create_controller_dependencies(
             floor_violation_hold_ms=(
                 float(getattr(cfg, "floor_violation_cooldown_ticks", 6)) * float(cfg.rescue_interval_s) * 1000.0
             ),
+            # S3: a GPU / node the SM refused a wake on is kept out of wake planning
+            # (registry placement.wake_cooldown).
+            wake_cooldown_s=(
+                float(registry.placement().wake_cooldown_gpu_s),
+                float(registry.placement().wake_cooldown_node_s),
+            ),
         ),
         observe_gate=observe_gate,
         maintenance_watch=MaintenanceWatch(redis_client),

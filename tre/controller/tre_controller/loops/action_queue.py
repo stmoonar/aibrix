@@ -8,6 +8,7 @@ from collections import deque
 from dataclasses import dataclass, field, replace
 from typing import Awaitable, Callable, Iterable, Mapping, Protocol
 
+from tre_controller.sm_client import sm_actor
 from tre_controller.planning.planner import (
     Action,
     DefragAction,
@@ -138,6 +139,11 @@ class DispatchResult:
     #: The SM refused the call with 409 ``floor_violation`` (P2-6): the model is held
     #: out of scale-down planning for a while (``ActionQueue.floor_held_models``).
     floor_violation: bool = False
+    #: S3: the located wake refusal / failure of a structured 409 (node, gpu_ids,
+    #: scope, error), or None.
+    wake_conflict: dict | None = None
+    #: S5: where the SM woke the replicas (``picked`` of the response).
+    picked: tuple = ()
 
 
 @dataclass
@@ -192,8 +198,24 @@ class ActionQueue:
         on_hide_failed: Callable[[str, tuple[str, ...], str], None] | None = None,
         floor_violation_hold_ms: float | None = None,
         on_hide_done: Callable[[str, tuple[str, ...]], None] | None = None,
+        wake_cooldown_s: tuple[float, float] | None = (30.0, 60.0),
     ) -> None:
         self._client = client
+        #: S3: (gpu_s, node_s) a GPU / node the SM refused a wake on is kept out of
+        #: wake planning (registry placement.wake_cooldown); None = off.
+        self._wake_cooldown_ms = (
+            None
+            if wake_cooldown_s is None
+            else (max(0.0, float(wake_cooldown_s[0])) * 1000.0, max(0.0, float(wake_cooldown_s[1])) * 1000.0)
+        )
+        #: (node, gpu) / node -> time (ms, ``now_ms``) the cooldown ends.
+        self._gpu_cooldowns: dict[tuple[str, int], int] = {}
+        self._node_cooldowns: dict[str, int] = {}
+        #: model -> (``node/gpu`` of its last refused wake, cooldown end ms).
+        self._refusals: dict[str, tuple[str, int]] = {}
+        #: Decision events for the next planner tick (gpu_cooldown / wake_refused /
+        #: placement_retry), drained by :meth:`drain_events`.
+        self._events: list[str] = []
         #: P2-6: how long (ms, on ``now_ms``) a model whose hide / sleep the SM refused
         #: with 409 floor_violation stays out of scale-down planning (None / <= 0 = off).
         self._floor_hold_ms = (
@@ -360,6 +382,70 @@ class ActionQueue:
             if now >= until:
                 del self._floor_holds[model]
         return set(self._floor_holds)
+
+    # ------------------------------------------------------------ S3 wake cooldown
+    def cooled_gpus(self) -> set[tuple[str, int]]:
+        """GPUs the SM recently refused a wake on (their cooldown still runs)."""
+        now = int(self._now_ms())
+        for key, until in list(self._gpu_cooldowns.items()):
+            if now >= until:
+                del self._gpu_cooldowns[key]
+        return set(self._gpu_cooldowns)
+
+    def cooled_nodes(self) -> set[str]:
+        """Nodes the SM refused a wake on with node scope (no gpu-truth for the node)."""
+        now = int(self._now_ms())
+        for node, until in list(self._node_cooldowns.items()):
+            if now >= until:
+                del self._node_cooldowns[node]
+        return set(self._node_cooldowns)
+
+    def recent_refusals(self) -> dict[str, str]:
+        """model -> ``node/gpu`` of its last refused wake, while that cooldown runs."""
+        now = int(self._now_ms())
+        for model, (_where, until) in list(self._refusals.items()):
+            if now >= until:
+                del self._refusals[model]
+        return {model: where for model, (where, _until) in self._refusals.items()}
+
+    def drain_events(self) -> list[str]:
+        events, self._events = self._events, []
+        return events
+
+    def _note_wake_conflict(self, action, result: DispatchResult) -> None:
+        conflict = result.wake_conflict
+        if conflict is None or _action_direction(action) != "up":
+            return
+        self._cool(result.model, conflict)
+
+    def _cool(self, model: str, conflict: dict) -> None:
+        if self._wake_cooldown_ms is None or not conflict.get("node"):
+            return
+        gpu_ms, node_ms = self._wake_cooldown_ms
+        now = int(self._now_ms())
+        node = conflict["node"]
+        gpus = [int(gpu) for gpu in conflict.get("gpu_ids") or ()]
+        where = f"{node}/{','.join(str(gpu) for gpu in gpus)}"
+        code = conflict.get("error")
+        self._events.append(f"wake_refused:{model}:{where}:{code}")
+        if conflict.get("scope") == "node":
+            until = now + int(node_ms)
+            self._node_cooldowns[node] = max(until, self._node_cooldowns.get(node, 0))
+            self._events.append(f"gpu_cooldown:{node}/*:{until}")
+        else:
+            until = now + int(gpu_ms)
+            for gpu in gpus:
+                self._gpu_cooldowns[(node, gpu)] = max(until, self._gpu_cooldowns.get((node, gpu), 0))
+                self._events.append(f"gpu_cooldown:{node}/{gpu}:{until}")
+        self._refusals[model] = (where, until)
+        LOG.warning(
+            json.dumps(
+                {"event": "gpu_cooldown", "model": model, "node": node, "gpu_ids": gpus,
+                 "scope": conflict.get("scope"), "error_code": code, "reason": conflict.get("reason"),
+                 "until_ms": until, "blocking_binding_id": conflict.get("blocking_binding_id")},
+                sort_keys=True,
+            )
+        )
 
     def _note_floor_violation(self, result: DispatchResult) -> None:
         if not result.floor_violation or result.model == CLUSTER_MODEL:
@@ -1141,7 +1227,8 @@ class ActionQueue:
         failed, non-retriable result instead of killing the dispatch task."""
         started_ns = time.perf_counter_ns()
         try:
-            result = await self._dispatch(action, model)
+            with sm_actor(_actor_for(action)):
+                result = await self._dispatch(action, model)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - review 3 P3
@@ -1154,6 +1241,7 @@ class ActionQueue:
                 error=f"dispatch_exception: {type(exc).__name__}: {exc}",
             )
         self._note_floor_violation(result)
+        self._note_wake_conflict(action, result)
         if self._prof is not None:
             self._prof.record(
                 {
@@ -1186,6 +1274,18 @@ class ActionQueue:
             response = await self._client.scale_model_to(action.model, int(action.target))
             return _dispatch_result(model=action.model, action_kind="scale", response=response)
         if isinstance(action, ScaleAction):
+            if action.delta > 0 and action.pods and getattr(action, "hint", False):
+                hinted = getattr(self._client, "scale_model_hinted", None)
+                if callable(hinted):
+                    # The SM may place the wake elsewhere: never on a GPU another
+                    # queued / running action (a donor -> receiver relay) is using.
+                    return self._hinted_result(
+                        action,
+                        await hinted(
+                            action.model, action.delta, hints=tuple(action.pods),
+                            avoid_gpus=tuple(sorted(self._busy_gpus(except_action=action))),
+                        ),
+                    )
             if action.delta != 0 and action.pods:
                 return await self._dispatch_binding_power(action)
             response = await self._client.scale_model(
@@ -1218,6 +1318,46 @@ class ActionQueue:
             response = await self._client.defrag(tuple(action.migrations))
             return _dispatch_result(model=CLUSTER_MODEL, action_kind="defrag", response=response)
         return DispatchResult(model=model, action_kind="unknown", ok=False, error="unsupported_action")
+
+    def _busy_gpus(self, *, except_action=None) -> set[str]:
+        """``node/gpu`` of every GPU a queued or running action uses (resource keys)."""
+        items = list(self._running.values()) + list(self._pending)
+        return {
+            key[len("gpu:"):]
+            for item in items
+            if item.action is not except_action
+            for key in item.resources
+            if key.startswith("gpu:")
+        }
+
+    def _hinted_result(self, action: ScaleAction, response: dict) -> DispatchResult:
+        """A hinted wake's result (S5): ``placement_retry`` for every replica the SM
+        woke somewhere else than its hint (paired by the hint's binding id, never by
+        position); the SM's refusals cool their GPUs down; an unfilled growth is not
+        a success - the planner re-plans (review P2-7)."""
+        result = _dispatch_result(model=action.model, action_kind="scale", response=response)
+        body = (response.get("response") or {}) if response.get("ok") else {}
+        picked = tuple(body.get("picked") or ())
+        for entry in picked:
+            if not isinstance(entry, dict) or entry.get("hinted"):
+                continue
+            source = _binding_gpus(entry.get("hint_binding_id")) or "?"
+            target = f"{entry.get('node')}/{','.join(str(g) for g in entry.get('gpu_ids') or ())}"
+            self._events.append(f"placement_retry:{action.model}:{source}->{target}")
+        for refusal in body.get("refusals") or ():
+            if isinstance(refusal, dict):
+                self._cool(action.model, {
+                    "node": refusal.get("node"), "gpu_ids": refusal.get("gpu_ids") or refusal.get("gpu") or (),
+                    "scope": refusal.get("scope"), "error": refusal.get("error"), "reason": refusal.get("reason"),
+                    "blocking_binding_id": refusal.get("blocking_binding_id"),
+                })
+        unfilled = int(body.get("unfilled") or 0)
+        if unfilled > 0:
+            return replace(
+                result, ok=False, error=f"partial: {unfilled} of {action.delta} wakes unfilled",
+                retriable=False, picked=picked,
+            )
+        return replace(result, picked=picked)
 
     async def _dispatch_binding_power(self, action: ScaleAction) -> DispatchResult:
         # Sleep (delta < 0) or wake (delta > 0) exactly the named bindings: safescale
@@ -1425,11 +1565,26 @@ def _dispatch_result(*, model: str, action_kind: str, response: dict) -> Dispatc
         for item in (response.get("outcomes") or ())
         if isinstance(item, dict) and item.get("status") in UNCONFIRMED_OUTCOMES and item.get("serve_id")
     )
+    conflict = response.get("wake_conflict") if not ok else None
     return DispatchResult(
         model=model, action_kind=action_kind, ok=ok, error=error, retriable=retriable, unconfirmed=unconfirmed,
         # sm_client ServiceManagerError.result() sets the key only for a floor refusal.
         floor_violation=(not ok) and "floor_violation" in response,
+        wake_conflict=conflict if isinstance(conflict, dict) else None,
     )
+
+
+def _binding_gpus(binding_id) -> str | None:
+    """``node/gpus`` of a binding id ``model/node/gpus``."""
+    parts = str(binding_id or "").split("/")
+    return f"{parts[1]}/{parts[2]}" if len(parts) == 3 else None
+
+
+def _actor_for(action) -> str:
+    """``X-TRE-Actor`` of an SM call: controller/<loop>/<reason>."""
+    loop = getattr(action, "source_loop", None) or "unknown"
+    reason = getattr(action, "reason", None) or type(action).__name__
+    return f"controller/{loop}/{reason}"
 
 
 def _request_id(action) -> str | None:

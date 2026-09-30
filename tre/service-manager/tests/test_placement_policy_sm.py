@@ -67,9 +67,10 @@ def test_wake_pick_spreads_a_model_across_nodes():
 
     result = service.put_model_target("A", wake_replicas=3)
 
+    # S5: the half-used pair on n1 first (split cost), then the lighter node n2.
     assert result["actions"] == [
-        {"action": "wake", "serve_id": "a-n2-0"},
         {"action": "wake", "serve_id": "a-n1-1"},
+        {"action": "wake", "serve_id": "a-n2-0"},
     ]
     awake = {b.slot.node for b in store.load().bindings if b.awake}
     assert awake == {N1, N2}

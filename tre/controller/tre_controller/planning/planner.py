@@ -82,6 +82,10 @@ class ClusterView:
     #: (``/v2/state`` ``fleet.observed``); used by the SafeScale direct evidence
     #: scrape. Empty when the SM reports no fleet state.
     pod_ips: Mapping[str, str] = field(default_factory=dict)
+    #: S5: GPUs the SM reports not wakeable for a reason the bindings do not show
+    #: (a Pod loading there, a wake in flight, gpu-truth in use) - ``/v2/state``
+    #: ``gpus[].wakeable``. Empty with an SM that does not report it.
+    blocked_gpus: frozenset = frozenset()
 
 
 @dataclass(frozen=True)
@@ -106,6 +110,11 @@ class ScaleAction:
     # one rescue transfer carry the same id; the ActionQueue executes them as ONE
     # compound action (sleep the donor, and only on success wake the receiver).
     transfer_id: str | None = None
+    # S5 (2026-09-30): ``pods`` of a pure-capacity wake are placement HINTS - the SM
+    # picks the GPUs itself (registry placement policy) and substitutes a hint it
+    # cannot wake. False = exactly these pods (same-GPU donor / receiver relays,
+    # SafeScale commits, sleeps).
+    hint: bool = False
 
 
 #: SM sleep path of the fast-loop "*_immediate" donors (CRIT donor, idle proactive,
@@ -292,6 +301,8 @@ def build_plan(
     probe_backoff_models: set[str] | None = None,
     preemptible_models: set[str] | None = None,
     floor_holds: set[str] | None = None,
+    unavailable_gpus: set[tuple[str, int]] | None = None,
+    refusals: Mapping[str, str] | None = None,
 ) -> PlanResult:
     active_probe_models = active_probe_models or set()
     # Review 3 P2-3: models whose only in-flight work is a SafeScale commit waiting
@@ -316,7 +327,13 @@ def build_plan(
     slot_shrink_donors: set[str] = set()
     # Sleeping-capacity deadlock fix: GPU-slot occupancy so a receiver's sleeping binding
     # only counts as wakeable capacity when its slot has no awake binding (of any model).
-    occupancy = _SlotOccupancy(cluster_view) if cluster_view is not None else None
+    # S3: GPUs the SM refused a wake on recently (cooldown) are not wake / create
+    # capacity this tick; S5: nor are GPUs the SM reports not wakeable.
+    occupancy = (
+        _SlotOccupancy(cluster_view, unavailable=unavailable_gpus)
+        if cluster_view is not None
+        else None
+    )
     # Review F4 per-model cooldown: model -> direction ("up"/"down") of its last executed
     # action whose effect the decision window does not yet fully reflect.
     # P2-6: donors the SM refused with 409 floor_violation recently are held out of
@@ -434,6 +451,7 @@ def build_plan(
                     source_loop="rescue",
                     receiver=recv.model_name,
                     pods=wake_pods,
+                    hint=True,
                 )
                 raw_need -= gain_from_sleeping
                 if raw_need <= 0:
@@ -697,6 +715,7 @@ def build_plan(
 
     if not cfg.fairness_due:
         events.append("fairness_skipped_by_cadence")
+        _placement_retry_events(actions, cluster_view, refusals, events)
         return PlanResult(actions, delayed_down_models, probe_upscale_plans, events=events)
 
     def low_need(recv: ModelClassification) -> tuple[int, int] | None:
@@ -749,6 +768,7 @@ def build_plan(
                 source_loop="fairness",
                 receiver=recv.model_name,
                 pods=wake_pods,
+                hint=True,
             )
             needed -= sleeping_gain
 
@@ -909,7 +929,32 @@ def build_plan(
             pending[recv.model_name] = pending.get(recv.model_name, 0) + transfer
             needed -= transfer
 
+    _placement_retry_events(actions, cluster_view, refusals, events)
     return PlanResult(actions, delayed_down_models, probe_upscale_plans, events=events)
+
+
+def _placement_retry_events(
+    actions: list[Action],
+    cluster_view: ClusterView | None,
+    refusals: Mapping[str, str] | None,
+    events: list[str],
+) -> None:
+    """S3: ``placement_retry:<model>:<refused gpu>-><new gpu>`` for every wake of
+    a model whose last wake the SM refused (its GPU is cooling down): the plan
+    moved it to another GPU."""
+    if not refusals or cluster_view is None:
+        return
+    slots = {binding.serve_id: binding.slot for binding in cluster_view.bindings}
+    for action in actions:
+        if not isinstance(action, ScaleAction) or action.delta <= 0 or action.model not in refusals:
+            continue
+        for pod in action.pods:
+            slot = slots.get(pod)
+            if slot is None:
+                continue
+            target = f"{slot.node}/{','.join(str(gpu) for gpu in slot.gpu_ids)}"
+            if target != refusals[action.model]:
+                events.append(f"placement_retry:{action.model}:{refusals[action.model]}->{target}")
 
 
 class _Cooldown:
@@ -954,9 +999,18 @@ class _SlotOccupancy:
     freed by a planned slot-targeted donor sleep) are not counted twice in one tick.
     """
 
-    def __init__(self, cluster_view: ClusterView) -> None:
+    def __init__(
+        self, cluster_view: ClusterView, *, unavailable: set[tuple[str, int]] | None = None
+    ) -> None:
         self._topology = cluster_view.topology
         self._nodes = node_gpu_counts(cluster_view.topology)
+        #: GPUs that are no wake / create capacity this tick although no awake binding
+        #: holds them: S5 the SM reports them not wakeable (a Pod loading, a wake in
+        #: flight, gpu-truth in use), S3 a wake there was refused recently (cooldown).
+        self._blocked: set[tuple[str, int]] = {
+            (str(node), int(gpu))
+            for node, gpu in set(cluster_view.blocked_gpus) | set(unavailable or ())
+        }
         self._policy = cluster_view.placement
         self._planned_wakes: set[str] = set()
         self._bindings = tuple(cluster_view.bindings)
@@ -1010,8 +1064,9 @@ class _SlotOccupancy:
         )
 
     def occupied(self) -> set[tuple[str, int]]:
-        """Every GPU an awake binding holds or a planned wake has claimed."""
-        return set(self._awake) | set(self._claimed)
+        """Every GPU an awake binding holds, a planned wake has claimed, or that is
+        blocked (not wakeable / cooling down)."""
+        return set(self._awake) | set(self._claimed) | set(self._blocked)
 
     def wakeable(self, model: str) -> list[Binding]:
         """Sleeping bindings whose slot is free, least wasteful first."""
@@ -1028,7 +1083,10 @@ class _SlotOccupancy:
         sleeping = [
             binding
             for binding in self.sleeping(model)
-            if not any(gpu in self._awake or gpu in self._claimed for gpu in self._gpus(binding))
+            if not any(
+                gpu in self._awake or gpu in self._claimed or gpu in self._blocked
+                for gpu in self._gpus(binding)
+            )
         ]
         if need <= 0 or not sleeping:
             return []
@@ -1123,7 +1181,7 @@ class _SlotOccupancy:
         matches: list[tuple[Binding, Binding]] = []
         for receiver_binding in self.sleeping(receiver):
             gpus = self._gpus(receiver_binding)
-            if any(gpu in self._claimed for gpu in gpus):
+            if any(gpu in self._claimed or gpu in self._blocked for gpu in gpus):
                 continue
             occupants = {self._awake[gpu] for gpu in gpus if gpu in self._awake}
             if len(occupants) != 1:
@@ -1538,6 +1596,7 @@ def _add_scale_action(
     transfer_id: str | None = None,
     sleep_path: str | None = None,
     drain_budget_s: float | None = None,
+    hint: bool = False,
 ) -> None:
     """``sleep_path`` / ``drain_budget_s`` go to the SM sleep of a negative delta
     (None = the dispatcher / SM default). The SM registry decides whether the path
@@ -1558,6 +1617,7 @@ def _add_scale_action(
             transfer_id=transfer_id,
             sleep_path=sleep_path if delta < 0 else None,
             drain_budget_s=drain_budget_s if delta < 0 else None,
+            hint=bool(hint and delta > 0 and pods),
         )
     )
 

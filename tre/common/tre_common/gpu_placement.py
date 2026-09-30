@@ -27,31 +27,36 @@ A :class:`PlacementPolicy` is built from the registry by
   Soft -- it never blocks a placement, it only ranks candidates.  A no-op when
   ``max_order == 0``.  With the models' awake counts known it is further bounded
   by the widest models' remaining headroom (:meth:`PlacementPolicy.for_awake`).
+* ``node_penalty`` (registry ``placement.placement_penalty``): node -> extra load
+  added to the node's GPU load (a node that also runs the load generator or the
+  control plane fills later, is released earlier).  Keyed by the registry's node
+  names; empty = every node equal.
 
-Placement ranks every free candidate block by (lowest first)::
+Placement ranks every free candidate block by (lowest first; 2026-09-30, S5)::
 
-    (violation, node_block_load_after, same_model_on_node,
-     split_cost_capped, node_gpu_load_after, address, index)
+    (violation, split_cost_capped, node_eff_load_after, same_model_on_node,
+     address, index)
 
 * ``violation``: ``max(0, reserve - free max-order blocks left after placing)``.
-* ``node_block_load_after``: fraction of the node's max-order-aligned groups that
-  are not fully free after placing.  Load is measured at *reservation
-  granularity* on purpose: filling the free half of a half-used pair adds no
-  load, so single-GPU replicas pair up instead of scattering one per pair (a
-  plain GPU-fraction key would spread TP1 replicas across pairs and destroy
-  every pair a TP2 model could use).  With ``max_order == 0`` this is the GPU
-  fraction.
+* ``split_cost_capped``: order of the largest free block around the candidate,
+  capped at ``max_order``, minus the candidate's order (0 == perfect fit).  It
+  ranks before node load: a single-GPU replica fills the free half of a
+  half-used pair anywhere before it breaks a whole pair, so TP1 replicas pair
+  up instead of scattering one per pair and destroying every pair a TP2 model
+  could use (the former reservation-granularity node load key is gone).
+* ``node_eff_load_after``: awake GPU fraction of the node after placing plus the
+  node's ``node_penalty``.
 * ``same_model_on_node``: GPUs the same model already holds awake on the node
   (spread a model's replicas across nodes).
-* ``split_cost_capped``: order of the largest free block around the candidate,
-  capped at ``max_order``, minus the candidate's order (0 == perfect fit).
-* ``node_gpu_load_after``: awake GPU fraction on the node after placing.
 * ``address``: natural (node, base GPU) order -- deterministic, stable.
 
 Release is the mirror image among the blocks the shrinking model holds
 (highest first)::
 
-    (merge_gain_capped, node_block_load, same_model_on_node, node_gpu_load, address)
+    (merge_gain_capped, node_eff_load, same_model_on_node, address, -index)
+
+(the merge gain mirrors the split cost; the most loaded / penalised node, the
+node holding most of the model and the highest address go first).
 
 ``policy=None`` means :data:`BEST_FIT`: plain buddy best-fit with no node
 balancing, no cap below the node size and no reservation -- the reference
@@ -122,12 +127,14 @@ class PlacementPolicy:
     ``balance_nodes``: False drops the node-balance terms (reference best-fit).
     ``reserve_caps``: ``(model, max awake replicas)`` of the models whose tp is the
     max-order size; :meth:`for_awake` bounds the reserve by their headroom.
+    ``node_penalty``: ``(node, extra load)`` pairs (a mapping is accepted too).
     """
 
     max_order: int | None = None
     reserve_blocks: int = 0
     balance_nodes: bool = True
     reserve_caps: tuple[tuple[str, int], ...] = ()
+    node_penalty: tuple[tuple[str, Fraction], ...] = ()
 
     def __post_init__(self) -> None:
         if self.max_order is not None and int(self.max_order) < 0:
@@ -139,6 +146,22 @@ class PlacementPolicy:
             "reserve_caps",
             tuple((str(model), int(cap)) for model, cap in self.reserve_caps),
         )
+        pairs = self.node_penalty.items() if isinstance(self.node_penalty, Mapping) else self.node_penalty
+        penalty: list[tuple[str, Fraction]] = []
+        for node, value in pairs:
+            amount = Fraction(value).limit_denominator(10**6)
+            if amount < 0:
+                raise ValueError(f"node_penalty of {node!r} must be >= 0, got {value}")
+            if amount:
+                penalty.append((str(node), amount))
+        object.__setattr__(self, "node_penalty", tuple(sorted(penalty)))
+
+    def penalty(self, node: str) -> Fraction:
+        """The extra load of ``node`` (0 when it has none)."""
+        for name, amount in self.node_penalty:
+            if name == node:
+                return amount
+        return Fraction(0)
 
     def effective_reserve(self, awake_counts: Mapping[str, int] | None = None) -> int:
         """The reserve after the ``max_order == 0`` no-op rule and, with
@@ -203,6 +226,7 @@ def placement_policy_from_registry(
     placement = getattr(registry, "placement", None)
     config = placement() if callable(placement) else None
     reserve = int(getattr(config, "reserve_tp_pairs", DEFAULT_RESERVE_TP_PAIRS))
+    penalty = getattr(config, "node_penalty", None)
     policy = PlacementPolicy(
         max_order=block_order(max_tp),
         reserve_blocks=reserve,
@@ -212,6 +236,7 @@ def placement_policy_from_registry(
             for model in models
             if int(model.tp_size) == max_tp
         ),
+        node_penalty=dict(penalty) if isinstance(penalty, Mapping) else (),
     )
     return policy.for_awake(awake_counts)
 
@@ -379,14 +404,6 @@ def _groups(gpus: int, size: int) -> list[range]:
     return [range(base, min(base + size, gpus)) for base in range(0, gpus, size)]
 
 
-def _used_groups(node: str, gpus: int, size: int, occupied: set[GpuKey]) -> int:
-    return sum(
-        1
-        for group in _groups(gpus, size)
-        if any((node, gpu) in occupied for gpu in group)
-    )
-
-
 def _full_free_groups(node: str, gpus: int, size: int, occupied: set[GpuKey]) -> int:
     """Complete (not ragged) aligned groups with no occupied GPU."""
     return sum(
@@ -400,8 +417,9 @@ def _node_gpu_load(node: str, gpus: int, occupied: set[GpuKey]) -> Fraction:
     return Fraction(sum(1 for gpu in range(gpus) if (node, gpu) in occupied), gpus)
 
 
-def _node_block_load(node: str, gpus: int, size: int, occupied: set[GpuKey]) -> Fraction:
-    return Fraction(_used_groups(node, gpus, size, occupied), len(_groups(gpus, size)))
+def _node_eff_load(node: str, gpus: int, occupied: set[GpuKey], policy: PlacementPolicy) -> Fraction:
+    """Awake GPU fraction of the node plus its configured penalty."""
+    return _node_gpu_load(node, gpus, occupied) + policy.penalty(node)
 
 
 def _node_count(keys: Iterable[GpuKey], node: str) -> int:
@@ -480,15 +498,14 @@ def _choose_placement_indexed(
             after = occupied | set(block.keys)
             sort_key = (
                 violation,
-                _node_block_load(node, gpus, group_size, after),
-                _node_count(model_occupied, node),
                 cost,
-                _node_gpu_load(node, gpus, after),
+                _node_eff_load(node, gpus, after, policy),
+                _node_count(model_occupied, node),
                 block.address_key,
                 index,
             )
         else:
-            sort_key = (violation, 0, 0, cost, 0, block.address_key, index)
+            sort_key = (violation, cost, 0, 0, block.address_key, index)
         if best_key is None or sort_key < best_key:
             best_key = sort_key
             best = PlacementChoice(
@@ -502,12 +519,12 @@ def _choose_placement_indexed(
             )
     if best is None:
         return None
-    violation, node_load, same_model, _, gpu_load, _, _ = best.score
+    violation, _, node_load, same_model, _, _ = best.score
     reason = (
         f"placement tp={tp_size} -> {best.block} "
-        f"violation={violation} node_block_load={node_load} "
-        f"same_model_on_node={same_model} split_cost={best.split_cost} "
-        f"node_gpu_load={gpu_load} enclosing_order={best.enclosing_order} "
+        f"violation={violation} split_cost={best.split_cost} "
+        f"node_eff_load={node_load} same_model_on_node={same_model} "
+        f"enclosing_order={best.enclosing_order} "
         f"free_candidates={considered}/{len(candidates)}"
     )
     return replace(best, considered=considered, reason=reason)
@@ -615,7 +632,6 @@ def _choose_release_indexed(
     policy: PlacementPolicy,
 ) -> ReleaseChoice | None:
     group_order = _group_order(policy, nodes)
-    group_size = 1 << group_order
     best: ReleaseChoice | None = None
     considered = 0
     for index, block in candidates:
@@ -632,16 +648,15 @@ def _choose_release_indexed(
             held = occupied | set(block.keys)
             sort_key = (
                 gain,
-                _node_block_load(node, gpus, group_size, held),
+                _node_eff_load(node, gpus, held, policy),
                 _node_count(model_occupied, node),
-                _node_gpu_load(node, gpus, held),
                 block.address_key,
                 -index,
             )
         else:
             # Reference best-fit ranks by the merged order itself (equal to the
             # gain ranking whenever the candidates share one size, as a model's do).
-            sort_key = (merge_order, 0, 0, 0, block.address_key, -index)
+            sort_key = (merge_order, 0, 0, block.address_key, -index)
         if best is None or sort_key > best.score:
             best = ReleaseChoice(
                 index=index,
@@ -654,12 +669,11 @@ def _choose_release_indexed(
             )
     if best is None:
         return None
-    _, node_load, same_model, gpu_load, _, _ = best.score
+    _, node_load, same_model, _, _ = best.score
     reason = (
         f"release -> {best.block} merge_order={best.merge_order} "
-        f"gain={best.merge_gain} node_block_load={node_load} "
-        f"same_model_on_node={same_model} node_gpu_load={gpu_load} "
-        f"candidates={considered}"
+        f"gain={best.merge_gain} node_eff_load={node_load} "
+        f"same_model_on_node={same_model} candidates={considered}"
     )
     return replace(best, considered=considered, reason=reason)
 

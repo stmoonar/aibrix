@@ -41,6 +41,25 @@ placement:
     # default, as in v1. While off, the service-manager POST /v2/defrag also refuses
     # (409) unless the request body carries force: true.
     enabled: false
+  # The keys below (2026-09-30) are shown commented out with their built-in
+  # defaults: components older than that release refuse unknown placement keys,
+  # so set them only once the controller, the service-manager and the UI run a
+  # release that knows them.
+  #
+  # Extra load (a fraction of the node, >= 0) added to a node's GPU load when
+  # ranking wakes / creates: a node that also runs the load generator or the
+  # control plane fills later and is released earlier. Keys are cluster.nodes
+  # names. Default: no penalty.
+  # placement_penalty:
+  #   <node name>: 0.25
+  # After the service-manager refused or failed a wake on a GPU (structured 409),
+  # the controller keeps that GPU out of wake planning for gpu_s seconds, or the
+  # whole node for node_s after a node-scope refusal (no gpu-truth for the node
+  # and a resident unverifiable). The service-manager reports the same values
+  # as retry_after_s.
+  # wake_cooldown:
+  #   gpu_s: 30
+  #   node_s: 60
 models:
 - name: dsqwen-7b
   weights_path: /data/nfs_shared_data/DeepSeek-R1-Distill-Qwen-7B
@@ -382,6 +401,22 @@ service_manager:
   startup_admission:
     gate_seen_s: 30
     drift_grace_s: 600
+    # 2026-09-30 (uncomment once every component runs that release): a startup /
+    # container-restart placeholder (starting lease) whose engine container is
+    # running but not Ready past this long is alerted (startup_placeholder_overdue);
+    # it is released only while the engine container is not running and does not
+    # read awake (alert startup_placeholder_released).
+    # placeholder_max_s: 900
+  # 2026-09-30 (commented out: older service-managers ignore them, but keep the
+  # defaults visible). The operation journal (tre:v2:sm:operations) keeps at
+  # most max_records finished records, oldest dropped first.
+  # operations:
+  #   max_records: 20000
+  # Acceptance-test fault hooks: while true, the keys
+  # tre:v2:sm:fault:refuse_wake:<node>/<gpu> (409 gpu_busy) and
+  # tre:v2:sm:fault:fail_wake:<node>/<gpu> (the wake fails after /wake_up) are
+  # honoured. Default false: the keys are never read.
+  # test_hooks: false
   sleep:
     # Every sleep runs hide (routable=false + route-gen bump) -> gateway plugin ack
     # -> drain -> /sleep (D1/D2); no caller can skip a step, except that the paths in
@@ -461,17 +496,29 @@ service_manager:
     # (no_drain_*). [] = every path drains as above (pre-2026-09-29 behaviour).
     no_drain_paths: [safescale_commit, urgent, apa]
   wake:
-    # A wake fails closed unless gpu-truth shows every target GPU at or below this
-    # fraction of its total memory: sleeping residents stay far below it, an awake
-    # resident or a sleep leak far above.
+    # Wake gate (after the account: store, GPU leases, sleep reservations). A
+    # gpu-truth sample within its Redis TTL is used as is (no wait), unless it
+    # predates this SM's last power change on the GPU (a sleep commit, a wake, a
+    # start). Trusted: every target GPU must be at or below this fraction of its
+    # total memory (sleeping residents stay far below it, an awake resident or a
+    # sleep leak far above), else 409. Missing / untrusted: the other residents of
+    # the GPU are probed (/is_sleeping): all asleep -> wake, else 409.
     max_used_fraction: 0.2
     # Optional absolute override in MiB; null = use max_used_fraction.
     max_used_mib: null
-    # A wake / cold start asks the gpu-truth agent for a fresh sample
+    # A cold start asks the gpu-truth agent for a fresh sample
     # (tre:gpu_truth_refresh:<node>) and waits up to this long for one taken after
     # the request (an old agent without refresh support: re-read the periodic
-    # sample for up to this long). Missing truth still fails closed.
+    # sample for up to this long). Missing truth still fails closed. (The wake
+    # gate never waits, see above.)
     truth_wait_s: 10
+    # 2026-09-30 (uncomment once every component runs that release): a wake the
+    # journal recovery cannot read (/is_sleeping unknown) is kept this many
+    # supervisor passes, then rolled back with an alert (at once when its pod is
+    # not Ready); a /wake_up that timed out keeps its waking lease and journal
+    # entry and is rechecked after transport_recheck_s.
+    # recovery_unknown_attempts: 12
+    # transport_recheck_s: 30
   create:
     # A cold start (scale-up create, sparse defrag destination) fails closed unless
     # gpu-truth shows every target GPU at or below total x (1 - the created

@@ -16,6 +16,7 @@ from gen_model_manifests import (
     build_model_httproute,
     deployment_name,
 )
+from tre_common.bindings import ENGINE_CONTAINER
 from tre_common.rediskeys import ROUTE_GEN_ANNOTATION
 from tre_common.registry import Registry
 from tre_sm.allocator.slots import Binding
@@ -466,6 +467,7 @@ class K8sOps:
                     pod_uid=_optional_field(metadata, "uid", "uid"),
                     phase=str(_status(pod).get("phase", "Unknown")),
                     restart_count=_pod_restart_count(pod),
+                    engine_running=_engine_running(pod),
                 )
             )
         return sorted(snapshots, key=lambda item: item.name)
@@ -709,6 +711,24 @@ def _pod_ready(pod) -> bool:
     return bool(container_statuses) and all(
         bool(_field(item, "ready", "ready")) for item in container_statuses
     )
+
+
+
+
+def _engine_running(pod) -> bool | None:
+    """True while the engine container runs, False while it waits / terminated
+    (e.g. CrashLoopBackOff: no GPU memory held), None when unknown."""
+    statuses = _optional_field(_status(pod), "containerStatuses", "container_statuses") or []
+    for item in statuses:
+        if _optional_field(item, "name", "name") != ENGINE_CONTAINER:
+            continue
+        state = _optional_field(item, "state", "state") or {}
+        if _optional_field(state, "running", "running"):
+            return True
+        if _optional_field(state, "waiting", "waiting") or _optional_field(state, "terminated", "terminated"):
+            return False
+        return None
+    return None
 
 
 def _pod_restart_count(pod) -> int:

@@ -59,6 +59,27 @@ def generate_baseline(registry: Registry) -> dict[str, str]:
     return baseline
 
 
+def freeze_baseline(path: str | Path, registry: Registry) -> dict[str, str]:
+    """Write the generated baseline into the manifest at ``path`` (``baseline:``,
+    plus ``baseline_frozen`` provenance) unless it already names one, and return
+    the manifest's baseline. Both arms of the campaign then start from exactly
+    this layout, whatever the placement ranking of a later release would pick
+    (2026-09-30: the ranking keys changed; a generated baseline follows them)."""
+    path = Path(path)
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    if raw.get("baseline") is not None:
+        return {str(key): str(value) for key, value in raw["baseline"].items()}
+    baseline = generate_baseline(registry)
+    raw["baseline"] = baseline
+    raw["baseline_frozen"] = {
+        "at": utc_iso(),
+        "source": "generate_baseline (registry placement policy)",
+        "policy": repr(placement_policy_from_registry(registry)),
+    }
+    atomic_json(path, raw)
+    return baseline
+
+
 def resolve_baseline(state: dict[str, Any], baseline: dict[str, str]) -> dict[str, str]:
     """``{model: serve_id}``: a baseline entry is a serve_id or a binding_id
     (``model/node/gpus``, as :func:`generate_baseline` returns); binding_ids are
@@ -1026,6 +1047,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         metavar="MODEL=BINDING_OR_SERVE_ID",
         help="override one model's baseline replica (repeatable)",
     )
+    parser.add_argument(
+        "--freeze-baseline",
+        action="store_true",
+        help=(
+            "write the registry-generated baseline into the manifest (if it has none) "
+            "and exit: both arms then use that layout, whatever later ranking changes"
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -1041,6 +1070,10 @@ def _parse_baseline_overrides(values: Sequence[str]) -> dict[str, str]:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
+    if args.freeze_baseline:
+        frozen = freeze_baseline(args.manifest, load_registry(args.registry))
+        print(json.dumps({"manifest": str(Path(args.manifest).resolve()), "baseline": frozen}, indent=2))
+        return 0
     manifest = load_manifest(
         args.manifest,
         registry=load_registry(args.registry),

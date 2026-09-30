@@ -16,6 +16,7 @@ from tre_sm.state.fleet_store import FleetStateStore
 from tre_sm.state.gpu_leases import GpuLeaseStore
 from tre_sm.state.store import StateStore
 from tre_sm.state.supervisor import FleetSupervisor
+from tre_sm.state.wake_journal import WakeJournal
 
 
 def create_service_app(
@@ -35,6 +36,10 @@ def create_service_app(
     gpu_leases: GpuLeaseStore | None = None,
     gateway_state: GatewayState | None = None,
     sleep_journal: SleepJournal | None = None,
+    wake_journal: WakeJournal | None = None,
+    restart_ledger=None,
+    restored_placeholders=None,
+    fault_redis=None,
     supervisor_enabled: bool = False,
     supervisor_interval_s: float = 5.0,
 ) -> FastAPI:
@@ -54,6 +59,10 @@ def create_service_app(
             gpu_leases=gpu_leases,
             gateway_state=gateway_state,
             sleep_journal=sleep_journal,
+            wake_journal=wake_journal,
+            restart_ledger=restart_ledger,
+            restored_placeholders=restored_placeholders,
+            fault_redis=fault_redis,
         )
     app = create_app(service)
     install_lifecycle(app, service)
@@ -89,6 +98,12 @@ def install_lifecycle(app: FastAPI, service: ServiceManagerV2) -> None:
             service.recover_sleep_journal()
         except Exception:  # the supervisor retries; the audit shows what is left
             LOG.exception("sleep journal recovery at startup failed")
+        try:
+            # S6: wakes a dead SM left between its phases (the lease rebuild at
+            # bootstrap dropped their waking leases; the journal still has them).
+            service.recover_wake_journal()
+        except Exception:  # the supervisor retries
+            LOG.exception("wake journal recovery at startup failed")
         install_sigterm_hook(service)
 
     def on_shutdown() -> None:

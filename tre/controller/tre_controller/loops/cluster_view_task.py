@@ -83,7 +83,36 @@ def cluster_view_from_state(state: dict, topology: ClusterTopology) -> ClusterVi
                 hidden=bool(item.get("hidden", False)),
             )
         )
-    return ClusterView(topology=topology, bindings=tuple(bindings), pod_ips=_observed_pod_ips(state))
+    return ClusterView(
+        topology=topology,
+        bindings=tuple(bindings),
+        pod_ips=_observed_pod_ips(state),
+        blocked_gpus=_blocked_gpus(state),
+    )
+
+
+#: ``/v2/state`` ``gpus[].reason`` values that make a GPU no wake / create capacity
+#: although the bindings show no awake binding there (S5): a Pod loading, a wake in
+#: flight, gpu-truth showing memory in use that no binding explains. ``awake`` /
+#: ``draining`` GPUs hold an awake binding the planner sees itself.
+BLOCKING_GPU_REASONS = frozenset({"loading", "waking", "gpu_truth_used"})
+
+
+def _blocked_gpus(state: dict) -> frozenset:
+    """(node, gpu) the SM reports not wakeable for a reason the bindings do not
+    show. Empty for an SM that does not report ``gpus`` (best effort)."""
+    entries = state.get("gpus") if isinstance(state, dict) else None
+    blocked = set()
+    for entry in entries if isinstance(entries, list) else ():
+        if not isinstance(entry, dict) or entry.get("wakeable") is not False:
+            continue
+        if entry.get("reason") not in BLOCKING_GPU_REASONS:
+            continue
+        try:
+            blocked.add((str(entry["node"]), int(entry["gpu"])))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return frozenset(blocked)
 
 
 def _observed_pod_ips(state: dict) -> dict[str, str]:

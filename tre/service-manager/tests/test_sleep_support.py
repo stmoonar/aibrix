@@ -116,12 +116,18 @@ class Truth:
         )
 
 
-def _wake_service(truth, *, require=True, **config):
+def _wake_service(truth, *, require=True, unreachable_resident=False, **config):
     config = config or {"wake_max_used_mib": 8192}
     sleeping = pod("pod-a", "m1", (0,), ip="10.0.0.1", state="sleeping")
-    runtime = FakeRuntime([sleeping])
+    snapshots = [sleeping]
     vllm = FakeVllm()
     vllm.sleeping["10.0.0.1"] = True
+    if unreachable_resident:
+        # A resident on GPU 0 whose /is_sleeping cannot be read: without a trusted
+        # sample the wake gate cannot verify the GPU (S1 resident probe).
+        snapshots.append(pod("pod-t", "tp2", (0, 1), ip="10.0.0.9", state="sleeping"))
+        vllm.physical_override["10.0.0.9"] = None
+    runtime = FakeRuntime(snapshots)
     store = StateStore(LegacyRedis())
     store.save([binding_of(sleeping)], expected_version=0)
     service = ServiceManagerV2(
@@ -151,9 +157,12 @@ def test_wake_fails_closed_when_another_resident_is_awake_on_the_gpu():
     assert not any(call[0] == "wake_up" for call in vllm.calls)
 
 
-def test_wake_rereads_lagging_gpu_truth_after_a_sleep():
-    # First read still shows the previous occupant; the next one is fresh.
-    service, vllm = _wake_service(Truth([33_000, 900]))
+def test_wake_does_not_trust_a_sample_older_than_a_local_sleep():
+    # S1: the sample still shows the previous occupant, whose sleep this SM just
+    # committed: the sample is not trusted, the residents are probed instead (none
+    # left awake on GPU 0) - no wait for a new sample.
+    service, vllm = _wake_service(Truth([33_000]))
+    service._note_power_change("node-a", (0,))
 
     service.put_binding_power("pod-a", awake=True)
 
@@ -161,11 +170,11 @@ def test_wake_rereads_lagging_gpu_truth_after_a_sleep():
 
 
 def test_wake_fails_closed_without_gpu_truth_unless_explicitly_permissive():
-    service, vllm = _wake_service(Truth([0], missing=True))
+    service, vllm = _wake_service(Truth([0], missing=True), unreachable_resident=True)
     with pytest.raises(WakeConflict, match="gpu truth unavailable"):
         service.put_binding_power("pod-a", awake=True)
 
-    permissive, vllm2 = _wake_service(Truth([0], missing=True), require=False)
+    permissive, vllm2 = _wake_service(Truth([0], missing=True), require=False, unreachable_resident=True)
     permissive.put_binding_power("pod-a", awake=True)
     assert ("wake_up", "10.0.0.1") in vllm2.calls
 
@@ -187,7 +196,7 @@ def test_wake_threshold_is_a_fraction_of_the_gpu_total_by_default():
 
 
 def test_relative_wake_threshold_fails_closed_without_a_total():
-    service, vllm = _wake_service(Truth([100]), wake_max_used_fraction=0.2)
+    service, vllm = _wake_service(Truth([100]), wake_max_used_fraction=0.2, unreachable_resident=True)
     with pytest.raises(WakeConflict, match="reports no total memory"):
         service.put_binding_power("pod-a", awake=True)
     assert not any(call[0] == "wake_up" for call in vllm.calls)

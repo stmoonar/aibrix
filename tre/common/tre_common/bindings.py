@@ -17,6 +17,10 @@ from tre_common.registry import DEFAULT_MAX_BOUND_PER_GPU, ModelSpec, Registry, 
 #: ``cluster.max_bound_per_gpu`` (``registry.topology().max_bound_per_gpu``).
 MAX_BOUND_PER_GPU = DEFAULT_MAX_BOUND_PER_GPU
 
+#: Name of the vLLM engine container of a model Pod: rendered by
+#: deploy/gen_model_manifests.py, read by the service-manager (container state).
+ENGINE_CONTAINER = "vllm-openai"
+
 
 @dataclass(frozen=True)
 class BindingSpec:

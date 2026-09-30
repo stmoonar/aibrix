@@ -108,6 +108,21 @@ SM_SLEEP_OPS_KEY = "tre:v2:sm:sleep_ops"
 SM_SLEEP_RESERVATIONS_KEY = "tre:v2:sm:sleep_reservations"
 #: HASH of integer counters (sleeps, forced aborts, ack fallbacks, rollbacks, ...).
 SM_SLEEP_STATS_KEY = "tre:v2:sm:sleep_stats"
+#: HASH field=binding_id, value JSON: a wake whose /wake_up runs outside the writer
+#: lock (S6, 2026-09-30) - the pod, its GPUs and the desired power before the wake
+#: (crash evidence; resolved by ServiceManagerV2.recover_wake_journal).
+SM_WAKE_OPS_KEY = "tre:v2:sm:wake_ops"
+#: HASH of wake counters (wake_done_total, wake_failed_total, wake_parallel_max,
+#: wake_compensating_sleep_total, truth_fallback_total:<reason>, ...): GET /v2/wake.
+SM_WAKE_STATS_KEY = "tre:v2:sm:wake_stats"
+#: HASH field=pod UID, value=container restart count last seen by the SM's restart
+#: guard (a restart while the SM was down is detected at its next start).
+SM_RESTART_SEEN_KEY = "tre:v2:sm:restart_seen"
+#: STRING (any value, with a TTL) per GPU: test hooks of the service-manager, read
+#: only while registry service_manager.test_hooks is true. ``refuse_wake`` refuses
+#: a wake on the GPU (409 gpu_busy); ``fail_wake`` makes the wake fail after
+#: /wake_up (the engine is awake: exercises the compensating sleep).
+SM_FAULT_KEY_PREFIX = "tre:v2:sm:fault:"
 #: LIST of recent gateway-ack latencies (ms), newest first, capped.
 SM_SLEEP_ACK_LATENCY_KEY = "tre:v2:sm:sleep_ack_latency_ms"
 SM_SLEEP_ACK_LATENCY_MAX = 5000
@@ -132,3 +147,8 @@ def gpu_truth_key(node: str) -> str:
 
 def gpu_truth_refresh_key(node: str) -> str:
     return f"{GPU_TRUTH_REFRESH_KEY_PREFIX}{node}"
+
+
+def sm_fault_key(kind: str, node: str, gpu: int) -> str:
+    """``tre:v2:sm:fault:<kind>:<node>/<gpu>`` (see SM_FAULT_KEY_PREFIX)."""
+    return f"{SM_FAULT_KEY_PREFIX}{kind}:{node}/{int(gpu)}"

@@ -9,7 +9,7 @@ from typing import Iterable
 
 import yaml
 
-from tre_common.bindings import MAX_BOUND_PER_GPU, feasible_slots, render_binding_set  # noqa: F401 (re-exported)
+from tre_common.bindings import ENGINE_CONTAINER, MAX_BOUND_PER_GPU, feasible_slots, render_binding_set  # noqa: F401 (re-exported)
 from tre_common.registry import (
     DEFAULT_GATEWAY_UPSTREAM_IDLE_S,
     DEFAULT_ROUTE_TIMEOUT_S,
@@ -384,7 +384,7 @@ def _deployment(
                     ],
                     "containers": [
                         {
-                            "name": "vllm-openai",
+                            "name": ENGINE_CONTAINER,
                             "image": model.vllm_image,
                             "imagePullPolicy": "IfNotPresent",
                             "command": command,

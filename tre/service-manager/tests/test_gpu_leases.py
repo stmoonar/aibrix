@@ -171,7 +171,9 @@ def test_bootstrap_preserves_admitted_starting_lease():
     [lease] = store.load()
     assert lease.binding_id == "m1/node-a/0,1"
     assert lease.phase == "starting"
-    assert lease.expires_at_ms > 0
+    # S2 (2026-09-30): an admitted Pod keeps its GPUs until it converged or is
+    # gone (orphan reaper), however long its cold load takes.
+    assert lease.expires_at_ms == 0
     assert sorted(redis.hashes[rediskeys.SM_GPU_LEASES_KEY]) == [
         "node-a/0",
         "node-a/1",

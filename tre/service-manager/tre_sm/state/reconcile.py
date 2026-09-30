@@ -236,6 +236,7 @@ def reconcile_state(
     prober: PodPhysicalProber | None = None,
     label_writer: RoutableLabelWriter | None = None,
     drop_missing: bool = False,
+    frozen_serve_ids=(),
 ) -> ReconcileResult:
     persisted = store.load()
     persisted_by_serve = {binding.serve_id: binding for binding in persisted.bindings}
@@ -283,6 +284,12 @@ def reconcile_state(
         warnings.append(f"{binding.serve_id}: persisted binding has no matching pod observation")
         reconciled_by_serve[binding.serve_id] = binding
 
+    frozen = set(frozen_serve_ids or ())
+    for serve_id in frozen:
+        # A binding with a wake in flight keeps its persisted record (the wake's
+        # commit records the outcome).
+        if serve_id in persisted_by_serve and serve_id in reconciled_by_serve:
+            reconciled_by_serve[serve_id] = persisted_by_serve[serve_id]
     bindings = _quarantine_awake_conflicts(
         sorted(reconciled_by_serve.values(), key=binding_sort_key), warnings
     )
@@ -294,7 +301,11 @@ def reconcile_state(
     # loops: a pod that refuses to converge (leak) is simply left non-routable
     # and surfaced via the sleep_leak warning above (D8 leak candidate).
     if label_writer is not None:
-        _enforce_routable_labels(bindings, observed_by_serve, label_writer)
+        _enforce_routable_labels(
+            [binding for binding in bindings if binding.serve_id not in frozen],
+            observed_by_serve,
+            label_writer,
+        )
 
     allocator = SlotAllocator(topology, bindings, allow_awake_conflicts=True)
     observations = [

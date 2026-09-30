@@ -1,15 +1,41 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import contextmanager
+from contextvars import ContextVar
 import json
 import socket
-from typing import Any, Protocol
+from typing import Any, Iterator, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 #: HTTP statuses of the SM that mean "try again later" (review 2 P2-5): 409 = writer
 #: lock busy / sleep reservation / drain rolled back, 503 = shutting down.
 RETRIABLE_STATUSES = frozenset({409, 503})
+
+#: ``error`` codes of a structured 409 wake refusal / failure (S3, 2026-09-30):
+#: the body locates it (node, gpu_ids, scope), so the planner avoids that GPU (or
+#: node) for a while instead of re-planning the same slot. ``wake_conflict`` is
+#: accepted for a service-manager of the same series that sent the generic code.
+WAKE_ERROR_CODES = frozenset({
+    "gpu_busy", "resident_loading", "lease_conflict", "resident_awake",
+    "truth_unavailable", "wake_failed", "wake_conflict",
+})
+
+#: Caller identity of the SM calls made in this context (``X-TRE-Actor``,
+#: recorded as ``request.actor`` of the SM operation): controller/<loop>/<reason>.
+_ACTOR: ContextVar[str | None] = ContextVar("tre_controller_sm_actor", default=None)
+DEFAULT_ACTOR = "tre-controller"
+
+
+@contextmanager
+def sm_actor(actor: str | None) -> Iterator[None]:
+    """SM calls made inside the block send ``X-TRE-Actor: <actor>``."""
+    token = _ACTOR.set(actor)
+    try:
+        yield
+    finally:
+        _ACTOR.reset(token)
 
 
 class ServiceManagerError(Exception):
@@ -44,7 +70,41 @@ class ServiceManagerError(Exception):
     def retriable(self) -> bool:
         if self.floor_violation:
             return False
+        if (self.body or {}).get("error") == "wake_failed":
+            # The wake itself failed on that GPU (the SM settled it, possibly with a
+            # compensating sleep): not re-sent at once - the GPU cools down and the
+            # planner re-plans (review P3-11).
+            return False
         return self.timeout or self.transport or self.status in RETRIABLE_STATUSES
+
+    @property
+    def wake_conflict(self) -> dict | None:
+        """The located wake refusal of a structured 409 (S3), or None - also for
+        an older service-manager whose 409 is plain text (still retriable)."""
+        body = self.body or {}
+        if self.status != 409 or body.get("error") not in WAKE_ERROR_CODES:
+            return None
+        node = body.get("node")
+        raw = body.get("gpu_ids", body.get("gpu"))
+        if isinstance(raw, (int, str)) and not isinstance(raw, bool):
+            raw = [raw]
+        try:
+            gpus = [int(gpu) for gpu in raw or ()]
+        except (TypeError, ValueError):
+            gpus = []
+        if not node:
+            return None
+        retry = body.get("retry_after_s")
+        return {
+            "error": str(body.get("error")),
+            "reason": body.get("reason"),
+            "node": str(node),
+            "gpu_ids": gpus,
+            "scope": "node" if body.get("scope") == "node" else "gpu",
+            "retry_after_s": float(retry) if isinstance(retry, (int, float)) and not isinstance(retry, bool) else None,
+            "binding_id": body.get("binding_id"),
+            "blocking_binding_id": body.get("blocking_binding_id"),
+        }
 
     def result(self) -> dict:
         result = {
@@ -55,6 +115,9 @@ class ServiceManagerError(Exception):
         }
         if self.floor_violation:
             result["floor_violation"] = (self.body or {}).get("floor")
+        conflict = self.wake_conflict
+        if conflict is not None:
+            result["wake_conflict"] = conflict
         outcomes = (self.body or {}).get("outcomes")
         if isinstance(outcomes, list):
             # Per-pod sleep outcomes of a failed sleep (review 4 P2-2): which pods
@@ -138,6 +201,30 @@ class ServiceManagerClient:
                 "PUT",
                 f"/v2/models/{model}/target",
                 json={"wake_replicas": target, "at_least": True},
+                timeout_s=self._slow_timeout_s,
+            )
+            return {"ok": True, "response": response}
+        except ServiceManagerError as exc:
+            return exc.result()
+
+    async def scale_model_hinted(
+        self, model: str, delta: int, *, hints: tuple[str, ...], avoid_gpus: tuple[str, ...] = ()
+    ) -> dict:
+        """Grow ``model`` by ``delta`` awake replicas, waking the sleeping bindings
+        ``hints`` names when the service-manager can (S5): it picks the GPUs itself
+        (registry placement policy) and substitutes a hint it cannot wake; the
+        response's ``picked`` says where the replicas went. Relative (awake read at
+        dispatch) and grow-only (``at_least``); never retried."""
+        try:
+            counts = await self._model_counts(model)
+            target = counts["awake"] + int(delta)
+            response = await self._request(
+                "PUT",
+                f"/v2/models/{model}/target",
+                json={
+                    "wake_replicas": target, "at_least": True, "hints": list(hints),
+                    "avoid_gpus": list(avoid_gpus),
+                },
                 timeout_s=self._slow_timeout_s,
             )
             return {"ok": True, "response": response}
@@ -245,7 +332,7 @@ def _request_json(method: str, url: str, payload: dict | None, timeout_s: float)
     body = None
     # Caller identity for the SM operation log (2026-09-28): the SM HTTP write
     # API is shared by the TRE controller, the APA arm and operators.
-    headers = {"Accept": "application/json", "X-TRE-Actor": "tre-controller"}
+    headers = {"Accept": "application/json", "X-TRE-Actor": (_ACTOR.get() or DEFAULT_ACTOR)[:200]}
     if payload is not None:
         body = json.dumps(payload).encode("utf-8")
         headers["Content-Type"] = "application/json"
