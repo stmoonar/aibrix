@@ -23,6 +23,7 @@ from tre_sm.ops.k8s_ops import ModelDeploymentRecord, StartupPodRecord
 from tre_sm.state.fleet_store import _SAVE_HASH_SCRIPT
 from tre_sm.state.operations import WriterFence, _CURRENT_FENCE
 from tre_sm.state import sleep_reservations as _res
+from tre_sm.state import gpu_leases as _leases
 from tre_sm.state import safety as _safety
 
 
@@ -182,6 +183,8 @@ class FakeRedis:
             return self._reservation_renew(keys_and_args[0], [_s(a) for a in keys_and_args[numkeys:]])
         if script == _res._RELEASE_SCRIPT:
             return self._reservation_release(keys_and_args[0], [_s(a) for a in keys_and_args[numkeys:]])
+        if script in (_leases._ACQUIRE_GPU_SCRIPT, _leases._RELEASE_GPU_SCRIPT, _leases._REBUILD_GPU_SCRIPT):
+            return self._gpu_lease_script(script, keys_and_args[:numkeys], [_s(a) for a in keys_and_args[numkeys:]])
         assert script == _SAVE_HASH_SCRIPT, "unknown Lua script"
         state_key, version_key, lock_key = keys_and_args[:numkeys]
         expected, next_version, lock_value, *pairs = keys_and_args[numkeys:]
@@ -194,6 +197,51 @@ class FakeRedis:
         self.values[version_key] = str(next_version)
         return [1, int(next_version)]
 
+
+    def _gpu_lease_script(self, script, keys, argv):
+        """Python model of the GPU lease Lua scripts (tre_sm.state.gpu_leases)."""
+        leases_key, lock_key = (_s(key) for key in keys)
+        bucket = self.hashes.setdefault(leases_key, {})
+        if script == _leases._ACQUIRE_GPU_SCRIPT:
+            if self.values.get(lock_key) != argv[0]:
+                return [-1, "writer_fence_lost", ""]
+            binding_id, node, owner, token = argv[1], argv[2], argv[3], int(argv[4])
+            gpu_ids, ttl_ms, count = json.loads(argv[5]), int(argv[6]), int(argv[7])
+            fields, phase = argv[8 : 8 + count], argv[8 + count]
+            for field_name in fields:
+                raw = bucket.get(field_name)
+                if raw is None:
+                    continue
+                existing = json.loads(raw)
+                expires = int(existing["expires_at_ms"])
+                if (expires == 0 or expires > self.now_ms) and existing["binding_id"] != binding_id:
+                    return [0, field_name, existing["binding_id"]]
+            expires = 0 if ttl_ms == 0 else self.now_ms + ttl_ms
+            record = json.dumps({
+                "binding_id": binding_id, "node": node, "gpu_ids": gpu_ids, "owner": owner,
+                "fencing_token": token, "phase": phase, "expires_at_ms": expires,
+            })
+            for field_name in fields:
+                bucket[field_name] = record
+            return [1, str(expires), ""]
+        if script == _leases._RELEASE_GPU_SCRIPT:
+            if self.values.get(lock_key) != argv[0]:
+                return -1
+            binding_id, token, count = argv[1], int(argv[2]), int(argv[3])
+            for field_name in argv[4 : 4 + count]:
+                raw = bucket.get(field_name)
+                if raw is None:
+                    continue
+                existing = json.loads(raw)
+                if existing["binding_id"] == binding_id and int(existing["fencing_token"]) <= token:
+                    bucket.pop(field_name)
+            return 1
+        if self.values.get(lock_key) != argv[0]:
+            return -1
+        bucket.clear()
+        for index in range(1, len(argv), 2):
+            bucket[argv[index]] = argv[index + 1]
+        return 1
 
     def _reservation_acquire(self, key, argv):
         token, owner, operation_id, ttl_ms, count = argv[0], argv[1], argv[2], int(argv[3]), int(argv[4])

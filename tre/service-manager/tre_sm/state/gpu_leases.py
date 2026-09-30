@@ -103,15 +103,56 @@ class GpuLeaseConflict(RuntimeError):
 
 
 class GpuLeaseStore:
-    def __init__(self, redis_client: GpuLeaseRedis, *, transient_ttl_ms: int = 120_000) -> None:
+    """Per-GPU leases (one Redis hash field per GPU, written by Lua under the
+    writer fence). Phases and their lifetime:
+
+    * ``awake`` - never expires; released when the binding sleeps.
+    * ``waking`` - ``transient_ttl_ms`` (a wake takes seconds; a dead SM's lease
+      frees the GPU on its own).
+    * ``starting`` - ``starting_ttl_ms``; 0 (default, S2 2026-09-30) = never
+      expires: a Pod admitted at its startup gate holds its GPUs until it has
+      converged (the lease becomes ``awake`` or is released) or its Pod is gone
+      (``ServiceManagerV2.reap_orphan_starting_leases``). A cold vLLM load often
+      takes longer than any fixed TTL; an expired starting lease let a wake of a
+      resident on the same GPU through while the new Pod was still loading.
+    """
+
+    def __init__(
+        self,
+        redis_client: GpuLeaseRedis,
+        *,
+        transient_ttl_ms: int = 120_000,
+        starting_ttl_ms: int = 0,
+    ) -> None:
         self._redis = redis_client
         self._transient_ttl_ms = transient_ttl_ms
+        self._starting_ttl_ms = int(starting_ttl_ms)
+
+    def ttl_ms(self, phase: str) -> int:
+        """Lease lifetime of ``phase`` (0 = never expires)."""
+        if phase == "awake":
+            return 0
+        if phase == "starting":
+            return self._starting_ttl_ms
+        return self._transient_ttl_ms
+
+    def now_ms(self) -> int:
+        """Redis server time (ms), the clock lease expiries are written on; the
+        local clock when the client cannot tell."""
+        reader = getattr(self._redis, "time", None)
+        if callable(reader):
+            try:
+                seconds, micros = reader()
+                return int(seconds) * 1000 + int(micros) // 1000
+            except Exception:  # noqa: BLE001 - fall back to the local clock
+                pass
+        return int(time.time() * 1000)
 
     def acquire(self, binding: Binding, *, phase: str) -> GpuLease:
         fence = current_fence()
         if fence is None:
             raise StateFenceError("GPU lease acquisition requires an active writer fence")
-        ttl_ms = 0 if phase == "awake" else self._transient_ttl_ms
+        ttl_ms = self.ttl_ms(phase)
         fields = [_gpu_field(binding.slot.node, gpu) for gpu in binding.slot.gpu_ids]
         # ARGV layout: fence, binding, node, owner, token, gpu_ids_json,
         # ttl, count, fields..., phase. Lua derives a single expiry for all GPUs.
@@ -208,7 +249,9 @@ class GpuLeaseStore:
                 owner=fence.owner,
                 fencing_token=fence.token,
                 phase="starting",
-                expires_at_ms=int(time.time() * 1000) + self._transient_ttl_ms,
+                expires_at_ms=(
+                    0 if self._starting_ttl_ms == 0 else int(time.time() * 1000) + self._starting_ttl_ms
+                ),
             )
             payload = json.dumps(
                 {**asdict(record), "gpu_ids": list(record.gpu_ids)},

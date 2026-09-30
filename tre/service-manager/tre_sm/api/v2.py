@@ -592,16 +592,15 @@ class ServiceManagerV2:
         topology = self._registry.topology()
         wakes: list[Binding] = []
         existing_target = min(wake_replicas, len(model_bindings))
+        leases = self._active_leases()
         while sleeping and len(target) < existing_target:
-            feasible = [
-                binding
+            blockers = {
+                binding.serve_id: self._wake_blocker(binding, list(planning.values()), leases)
                 for binding in sleeping
-                if self._feasible_wake(binding, list(planning.values()))
-            ]
+            }
+            feasible = [binding for binding in sleeping if blockers[binding.serve_id] is None]
             if not feasible:
-                raise WakeConflict(
-                    f"{sleeping[0].serve_id}: slot already has awake binding"
-                )
+                raise blockers[sleeping[0].serve_id]
             binding = _wake_pick(feasible, planning.values(), topology, self._placement)
             sleeping.remove(binding)
             planning[binding.serve_id] = replace(
@@ -1040,8 +1039,16 @@ class ServiceManagerV2:
                 should_hide = binding.serve_id in requested_hidden
                 if binding.hidden == should_hide:
                     continue
-                if not should_hide and binding.awake:
-                    self._ensure_feasible_wake(binding, list(updated_by_serve.values()))
+                if not should_hide and binding.awake and not self._feasible_wake(
+                    binding, list(updated_by_serve.values())
+                ):
+                    # Unhiding an awake binding: only the account matters (its own
+                    # awake lease is on these GPUs by definition).
+                    raise WakeConflict(
+                        f"{binding.serve_id}: slot already has awake binding",
+                        node=binding.slot.node, gpus=binding.slot.gpu_ids,
+                        binding_id=binding.binding_id,
+                    )
                 if self._runtime_ops is not None:
                     state = POD_STATE_HIDDEN if should_hide else (
                         POD_STATE_AWAKE if binding.awake else POD_STATE_SLEEPING
@@ -3645,6 +3652,7 @@ class ServiceManagerV2:
         :meth:`_swap_with_floor_makeup`). Returns (binding, None) or (None, why)."""
         snapshot = self._store.load()
         pod_gpus = set(pod.gpu_ids)
+        leases = self._active_leases()
         candidates: list[Binding] = []
         for binding in snapshot.bindings:
             if binding.model != model or binding.awake:
@@ -3653,7 +3661,7 @@ class ServiceManagerV2:
                 continue
             try:
                 self._assert_not_reserved(binding=binding, what=f"floor make-up wake of {binding.serve_id}")
-                if not self._feasible_wake(binding, snapshot.bindings):
+                if self._wake_blocker(binding, snapshot.bindings, leases) is not None:
                     continue
             except (ReservationConflict, WakeConflict):
                 continue
@@ -4006,9 +4014,58 @@ class ServiceManagerV2:
         actions.append({"action": "unhide", "serve_id": new_serve_id})
         return moved
 
-    def _ensure_feasible_wake(self, binding: Binding, bindings: list[Binding]) -> None:
+    def _ensure_feasible_wake(self, binding: Binding, bindings: list[Binding], leases=None) -> None:
+        conflict = self._wake_blocker(binding, bindings, leases)
+        if conflict is not None:
+            raise conflict
+
+    def _wake_blocker(self, binding: Binding, bindings: list[Binding], leases=None) -> "WakeConflict | None":
+        """Why the account refuses a wake of ``binding`` right now, or None: an awake
+        binding on one of its GPUs (the store), or an active GPU lease of another
+        binding there - a ``starting`` Pod still loading (S2: that lease lives until
+        the Pod converged or is gone), a ``waking`` binding, an ``awake`` lease the
+        store does not show yet. ``leases``: a pre-loaded lease list (planning
+        loops load it once)."""
+        node = binding.slot.node
+        gpus = tuple(binding.slot.gpu_ids)
         if not self._feasible_wake(binding, bindings):
-            raise WakeConflict(f"{binding.serve_id}: slot already has awake binding")
+            occupants = sorted(
+                item.binding_id
+                for item in bindings
+                if item.awake
+                and item.serve_id != binding.serve_id
+                and item.slot.node == node
+                and set(item.slot.gpu_ids) & set(gpus)
+            )
+            return WakeConflict(
+                f"{binding.serve_id}: slot already has awake binding {occupants}",
+                reason="slot_occupied", node=node, gpus=gpus, binding_id=binding.binding_id,
+            )
+        for lease in self._active_leases(leases):
+            if lease.binding_id == binding.binding_id or lease.node != node:
+                continue
+            overlap = sorted(set(gpus) & {int(gpu) for gpu in lease.gpu_ids})
+            if not overlap:
+                continue
+            phase = str(getattr(lease, "phase", "") or "awake")
+            reason = f"lease_{phase}" if phase in ("starting", "waking") else "slot_occupied"
+            return WakeConflict(
+                f"{binding.serve_id}: {node}/{overlap[0]} is held by the {phase} GPU lease of "
+                f"{lease.binding_id}",
+                reason=reason, node=node, gpus=gpus, binding_id=binding.binding_id,
+            )
+        return None
+
+    def _active_leases(self, leases=None) -> list:
+        """Unexpired GPU leases (``expires_at_ms`` 0 = never expires), on the Redis
+        clock the Lua scripts write expiries with."""
+        if leases is None:
+            if self._gpu_leases is None:
+                return []
+            leases = self._gpu_leases.load()
+        now_reader = getattr(self._gpu_leases, "now_ms", None)
+        now_ms = int(now_reader()) if callable(now_reader) else int(time.time() * 1000)
+        return [lease for lease in leases if not _lease_expired(lease, now_ms)]
 
     def _ensure_target_within_cap(
         self, model: str, spec, target: int, bindings: list[Binding]
