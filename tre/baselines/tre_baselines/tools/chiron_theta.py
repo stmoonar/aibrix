@@ -1,11 +1,21 @@
 """Derive the per-model Chiron IBP threshold Theta from request-arrival traces.
 
-    python3 -m tre_baselines.tools.chiron_theta --trace T [--trace T2 ...] --interval-s 5
+    python3 -m tre_baselines.tools.chiron_theta --trace T [--trace T2 ...] --interval-s 5 \
+        [--method peak_mean|adjacent_p99]
 
-Per model: count arrivals per ``interval`` bin, take ratios of adjacent non-zero bins,
-r = p99 of the ratios, Theta = clamp(1/r, 0.1, 0.9); prints YAML ``theta: {model: value}``.
-The paper sets interval = model load time; ours defaults to 5 s (wake ~2.3 s + one tick),
-not specified in paper; chosen.
+Per model, arrivals are counted per ``interval`` bin over the trace's span, then:
+
+``peak_mean`` (default)
+    Theta = clamp(mean / peak, 0.1, 0.9) with peak = p99 of the bin counts and mean their
+    mean over all bins. The paper's example (a spike of 3x the usual load -> Theta = 1/3)
+    reads Theta as the idle headroom that absorbs the spike: at IBP = Theta the busy
+    instances are Theta of the fleet, so a load 1/Theta x the mean still fits.
+``adjacent_p99``
+    ratios of adjacent non-zero bins, r = p99 of the ratios, Theta = clamp(1/r, 0.1, 0.9):
+    sized for the largest *step* between two bins instead of the peak over the mean.
+
+Prints YAML ``theta: {model: value}``. The paper sets interval = model load time; ours
+defaults to 5 s (wake ~2.3 s + one tick), not specified in paper; chosen.
 
 Accepted trace formats:
 * replayer trace: JSON object ``{model: [{start_time, end_time, rps, ...}, ...]}``
@@ -27,6 +37,8 @@ from typing import Any, Iterable, Optional
 ARRIVAL_FIELDS = ("arrival_time", "arrival_s", "arrival", "timestamp", "ts", "time", "t", "start_time")
 THETA_MIN, THETA_MAX = 0.1, 0.9
 DEFAULT_INTERVAL_S = 5.0  # not specified in paper; chosen
+METHODS = ("peak_mean", "adjacent_p99")
+DEFAULT_METHOD = "peak_mean"
 
 
 class TraceFormatError(ValueError):
@@ -110,16 +122,36 @@ def bin_counts(segments: Iterable[tuple[float, float, float]], arrivals: Iterabl
     return counts
 
 
+def _clamp(theta: float) -> float:
+    return min(THETA_MAX, max(THETA_MIN, theta))
+
+
 def theta_from_counts(counts: list[float]) -> Optional[dict]:
+    """``adjacent_p99``: Theta = clamp(1 / p99(adjacent non-zero bin ratio))."""
     ratios = [b / a for a, b in zip(counts, counts[1:]) if a > 0 and b > 0]
     if not ratios:
         return None
     r = _percentile(ratios, 0.99)
-    return {"r": r, "theta": min(THETA_MAX, max(THETA_MIN, 1.0 / r)), "n_ratios": len(ratios)}
+    return {"method": "adjacent_p99", "r": r, "theta": _clamp(1.0 / r), "n_ratios": len(ratios)}
+
+
+def theta_peak_mean(counts: list[float]) -> Optional[dict]:
+    """``peak_mean``: Theta = clamp(mean / p99 of the bin counts)."""
+    if not counts:
+        return None
+    peak = _percentile(counts, 0.99)
+    if peak <= 0:
+        return None
+    mean = sum(counts) / len(counts)
+    return {"method": "peak_mean", "mean": mean, "peak": peak, "theta": _clamp(mean / peak),
+            "n_bins": len(counts)}
 
 
 def compute_theta(paths: list[Path], interval_s: float = DEFAULT_INTERVAL_S, model_field: str = "model",
-                  time_field: Optional[str] = None, time_scale: float = 1.0) -> dict[str, dict]:
+                  time_field: Optional[str] = None, time_scale: float = 1.0,
+                  method: str = DEFAULT_METHOD) -> dict[str, dict]:
+    if method not in METHODS:
+        raise ValueError(f"method must be one of {METHODS}, got {method!r}")
     segs: dict[str, list] = {}
     arrs: dict[str, list] = {}
     for p in paths:
@@ -130,10 +162,12 @@ def compute_theta(paths: list[Path], interval_s: float = DEFAULT_INTERVAL_S, mod
             arrs.setdefault(m, []).extend(v)
     out = {}
     for m in sorted(set(segs) | set(arrs)):
-        res = theta_from_counts(bin_counts(segs.get(m, []), arrs.get(m, []), interval_s))
+        counts = bin_counts(segs.get(m, []), arrs.get(m, []), interval_s)
+        res = theta_from_counts(counts) if method == "adjacent_p99" else theta_peak_mean(counts)
         if res is None:
             raise TraceFormatError(f"model {m!r}: fewer than two adjacent non-zero bins; "
-                                   "cannot estimate a ratio")
+                                   "cannot estimate a ratio" if method == "adjacent_p99"
+                                   else f"model {m!r}: no arrivals in any bin")
         out[m] = res
     return out
 
@@ -145,20 +179,28 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--model-field", default="model")
     ap.add_argument("--time-field", default=None)
     ap.add_argument("--time-unit", choices=("s", "ms"), default="s")
+    ap.add_argument("--method", choices=METHODS, default=DEFAULT_METHOD)
     a = ap.parse_args(argv)
     if a.interval_s <= 0:
         ap.error("--interval-s must be > 0")
     try:
         res = compute_theta(a.trace, a.interval_s, a.model_field, a.time_field,
-                            1e-3 if a.time_unit == "ms" else 1.0)
+                            1e-3 if a.time_unit == "ms" else 1.0, method=a.method)
     except (TraceFormatError, OSError) as exc:
         print(f"chiron_theta: {exc}", file=sys.stderr)
         return 2
-    print(f"# interval_s={a.interval_s}; theta = clamp(1/p99(adjacent non-zero bin ratio), "
-          f"{THETA_MIN}, {THETA_MAX})")
+    if a.method == "adjacent_p99":
+        rule = "clamp(1/p99(adjacent non-zero bin ratio)"
+    else:
+        rule = "clamp(mean bin count / p99 bin count"
+    print(f"# interval_s={a.interval_s} method={a.method}; theta = {rule}, {THETA_MIN}, {THETA_MAX})")
     print("theta:")
     for m, r in res.items():
-        print(f"  {m}: {r['theta']:.4f}  # r={r['r']:.3f} n={r['n_ratios']}")
+        if a.method == "adjacent_p99":
+            note = f"r={r['r']:.3f} n={r['n_ratios']}"
+        else:
+            note = f"mean={r['mean']:.2f} peak={r['peak']:.2f} bins={r['n_bins']}"
+        print(f"  {m}: {r['theta']:.10f}  # {note}")
     return 0
 
 
