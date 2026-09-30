@@ -286,17 +286,20 @@ data:
     }} {value}')\n        lines += [\n            \"# HELP tre_reissue_local_reconnect_total\
     \ Re-sends to the local engine on a fresh \"\n            \"connection after the\
     \ pooled connection failed before any response byte (keep-alive \"\n         \
-    \   \"race: disconnect / ECONNRESET / EPIPE), per attempt; result=outside_window\
-    \ counts \"\n            \"failures on a reused connection that came too late\
-    \ (local_reconnect_window_s) to be \"\n            \"the race and were not re-sent.\"\
-    ,\n            \"# TYPE tre_reissue_local_reconnect_total counter\",\n       \
-    \ ]\n        for result in (\"ok\", \"fail\"):\n            lines.append(f'tre_reissue_local_reconnect_total{{model=\"\
+    \   \"race: disconnect / ECONNRESET / EPIPE), per attempt.\",\n            \"\
+    # TYPE tre_reissue_local_reconnect_total counter\",\n        ]\n        for result\
+    \ in (\"ok\", \"fail\"):\n            lines.append(f'tre_reissue_local_reconnect_total{{model=\"\
     {model}\",result=\"{result}\"}} '\n                         f'{self.reconnect[result]}')\n\
-    \        lines.append(f'tre_reissue_local_reconnect_total{{model=\"{model}\",result=\"\
-    outside_window\"}} '\n                     f'{self.reconnect_outside_window}')\n\
-    \        lines += [\n            \"# HELP tre_reissue_sleeping 1 while the local\
-    \ engine is (going to) sleep.\",\n            \"# TYPE tre_reissue_sleeping gauge\"\
-    ,\n            f'tre_reissue_sleeping{{model=\"{model}\"}} {1 if state.active\
+    \        lines += [\n            \"# HELP tre_reissue_local_reconnect_skipped_total\
+    \ Connection-level failures before \"\n            \"any response byte that were\
+    \ NOT re-sent; reason=outside_window: the reused \"\n            \"connection\
+    \ failed later than local_reconnect_window_s after it was handed out \"\n    \
+    \        \"(not the keep-alive race).\",\n            \"# TYPE tre_reissue_local_reconnect_skipped_total\
+    \ counter\",\n            f'tre_reissue_local_reconnect_skipped_total{{model=\"\
+    {model}\",reason=\"outside_window\"}} '\n            f'{self.reconnect_outside_window}',\n\
+    \        ]\n        lines += [\n            \"# HELP tre_reissue_sleeping 1 while\
+    \ the local engine is (going to) sleep.\",\n            \"# TYPE tre_reissue_sleeping\
+    \ gauge\",\n            f'tre_reissue_sleeping{{model=\"{model}\"}} {1 if state.active\
     \ else 0}',\n        ]\n        return \"\\n\".join(lines) + \"\\n\"\n\n\ndef\
     \ _label(value: str) -> str:\n    return value.replace(\"\\\\\", \"\\\\\\\\\"\
     ).replace('\"', '\\\\\"').replace(\"\\n\", \" \")\n\n\n# -----------------------------------------------------------------------------\

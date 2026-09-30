@@ -86,11 +86,12 @@ Envoy 上游连接空闲超时默认 1 h，表现是 Envoy 自己回 503（`UC`/
 - **aibrix-system 网关（31592）路径不在本次范围**：它也能路由到这些 pod，Envoy 空闲超时仍是默认 1 h，这一跳的竞态在该路径上依旧存在。
   按 ADR-0008 不改 aibrix-system；实验两臂都走 31094（`campaign_queue.py` 的 GATEWAYS，第 80-90 行附近），所以实验不受影响。
 - 重发窗口（P2-1）：`local_reconnect_window_s`（默认 1 s）：拿到复用连接后超过这个时间才失败的请求（例如 vLLM 在长生成中途崩溃）不再重发，避免重复执行。
-- `upstream_keepalive_s` / `local_reconnect_attempts` / `local_reconnect_window_s` / `server_keepalive_s` 现在都写在仓库 registry.yaml 里；
+- `upstream_keepalive_s` / `local_reconnect_attempts` / `local_reconnect_window_s` / `server_keepalive_s`：
   **仓库 registry.yaml 里这四个键保持注释**：线上 controller / SM / UI（20260930-f8ccb0ca 及更早）的 `parse_reissue_config` 遇未知 reissue 键会 raise
   （controller 启动即 crashloop，UI 的 `PUT /api/params` 全部失败）。**controller、SM、UI 三个镜像全部升级到含本提交的版本之后，才可在 live registry 里显式写这些键**
   （不写时用代码默认值，行为相同）；守卫测试断言 registry.yaml 的 reissue 段只含旧版已知键。`gateway.upstream_idle_timeout_s` 旧版会忽略，可直接写。
-- 重发窗口之外失败的请求计入 `tre_reissue_local_reconnect_total{result="outside_window"}` 并写 WARNING `tre_local_reconnect_outside_window`。
+- 重发窗口之外失败的请求不重发，计入独立指标 `tre_reissue_local_reconnect_skipped_total{reason="outside_window"}` 并写 WARNING `tre_local_reconnect_outside_window`
+  （`tre_reissue_local_reconnect_total` 只数实际发生的重发，`result=ok/fail`；2026-10-01 之前的镜像把它记在 `tre_reissue_local_reconnect_total{result="outside_window"}` 里）。
 - 指标 `tre_reissue_gap_seconds` 拆出 label `mode`：`stream` = abort 到首个续发 token，`nonstream` = abort 到完整续发响应（含续发生成时间），两者不可比。
 - aiohttp 对幂等方法（GET/HEAD/OPTIONS/TRACE/PUT/DELETE）在持久连接失败时已内置重试一次；POST 没有，所以生成请求的重发只靠本层。
 
@@ -162,6 +163,7 @@ tools/functions（除非 `tool_choice: none`）、结构化输出 / guided decod
 | `tre_reissue_events_total{event}` | sleep 拒绝 / 失败、状态纠偏、`stop_at_seam` 等 |
 | `tre_reissue_sleeping` | 本地 sleeping 标记 |
 | `tre_reissue_local_reconnect_total{model,result}` | 首字节前连接级失败后的新连接重发次数，`result=ok/fail`（§3a） |
+| `tre_reissue_local_reconnect_skipped_total{model,reason}` | 首字节前连接级失败但**没有**重发的次数；`reason=outside_window`：复用连接在交出后超过 `local_reconnect_window_s` 才失败（不是 keep-alive 竞态，避免重复执行）（§3a） |
 
 P5 口径：每个 run 报 retry / continue / failed / passthrough_abort；`continue>0` 的 run 标为受污染（计划原文）。
 

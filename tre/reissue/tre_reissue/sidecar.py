@@ -456,16 +456,21 @@ class Metrics:
         lines += [
             "# HELP tre_reissue_local_reconnect_total Re-sends to the local engine on a fresh "
             "connection after the pooled connection failed before any response byte (keep-alive "
-            "race: disconnect / ECONNRESET / EPIPE), per attempt; result=outside_window counts "
-            "failures on a reused connection that came too late (local_reconnect_window_s) to be "
-            "the race and were not re-sent.",
+            "race: disconnect / ECONNRESET / EPIPE), per attempt.",
             "# TYPE tre_reissue_local_reconnect_total counter",
         ]
         for result in ("ok", "fail"):
             lines.append(f'tre_reissue_local_reconnect_total{{model="{model}",result="{result}"}} '
                          f'{self.reconnect[result]}')
-        lines.append(f'tre_reissue_local_reconnect_total{{model="{model}",result="outside_window"}} '
-                     f'{self.reconnect_outside_window}')
+        lines += [
+            "# HELP tre_reissue_local_reconnect_skipped_total Connection-level failures before "
+            "any response byte that were NOT re-sent; reason=outside_window: the reused "
+            "connection failed later than local_reconnect_window_s after it was handed out "
+            "(not the keep-alive race).",
+            "# TYPE tre_reissue_local_reconnect_skipped_total counter",
+            f'tre_reissue_local_reconnect_skipped_total{{model="{model}",reason="outside_window"}} '
+            f'{self.reconnect_outside_window}',
+        ]
         lines += [
             "# HELP tre_reissue_sleeping 1 while the local engine is (going to) sleep.",
             "# TYPE tre_reissue_sleeping gauge",

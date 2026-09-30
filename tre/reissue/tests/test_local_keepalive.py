@@ -310,7 +310,10 @@ async def test_reused_connection_failing_late_is_resent_only_within_the_window(w
             assert sidecar.metrics.reconnect == {"ok": 0, "fail": 0}
             assert sidecar.metrics.reconnect_outside_window == 1
             text = sidecar.metrics.render(sidecar.state)
-            assert 'tre_reissue_local_reconnect_total{model="m",result="outside_window"} 1' in text
+            assert 'tre_reissue_local_reconnect_skipped_total{model="m",reason="outside_window"} 1' in text
+            # a separate metric: the re-send counter keeps only result=ok|fail
+            assert 'result="outside_window"' not in text
+            assert "# TYPE tre_reissue_local_reconnect_skipped_total counter" in text
         if resent:
             assert sidecar.metrics.reconnect_outside_window == 0
 
