@@ -207,6 +207,7 @@ class ServiceManagerV2:
         fault_redis=None,
         restart_ledger: RestartLedger | None = None,
         restored_placeholders: list[tuple[str, str, tuple[int, ...], str]] | None = None,
+        restored_suspects: list[tuple[str, str, tuple[int, ...], str]] | None = None,
     ) -> None:
         self._registry = registry
         # Registry placement policy shared with the controller planner (design
@@ -303,6 +304,11 @@ class ServiceManagerV2:
         for binding_id, node, gpus, pod_name in restored_placeholders or ():
             self._restart_placeholders[binding_id] = pod_name
             self._suspects[binding_id] = (node, tuple(int(g) for g in gpus), pod_name)
+        # Engines reloading at bootstrap on GPUs another binding is recorded awake
+        # on (restart_placeholder_candidates ``conflicts``): no placeholder, but
+        # suspects until the restart guard converges them (integration 2026-10-01).
+        for binding_id, node, gpus, pod_name in restored_suspects or ():
+            self._suspects.setdefault(binding_id, (node, tuple(int(g) for g in gpus), pod_name))
         # P2-3: after a restart the power marks are empty; the GPUs of wakes still
         # journaled may hold an engine the last gpu-truth sample does not show.
         self._mark_journaled_wakes()
@@ -3730,13 +3736,22 @@ class ServiceManagerV2:
                 try:
                     self._gpu_leases.acquire(binding, phase="starting")
                 except GpuLeaseConflict as exc:
+                    # No placeholder: the binding stays (or becomes) a suspect, so
+                    # its GPUs are never trusted from gpu-truth and, should the
+                    # engine read awake, the suspect convergence below settles it
+                    # to its desired power (integration 2026-10-01).
+                    self._suspects[binding.binding_id] = (
+                        binding.slot.node, tuple(int(g) for g in binding.slot.gpu_ids), snapshot.name
+                    )
                     _log_event(
                         "container_restart_conflict", level=logging.ERROR,
                         binding_id=binding.binding_id, pod=snapshot.name, occupant=exc.occupant,
-                        detail="restarted engine on GPUs another binding holds - possible double occupancy",
+                        detail="restarted engine on GPUs another binding holds - possible double occupancy; binding kept a suspect",
                     )
                 else:
                     self._restart_placeholders[binding.binding_id] = snapshot.name
+                    # The placeholder now holds its GPUs: no longer a suspect.
+                    self._suspects.pop(binding.binding_id, None)
                     placed.append(binding.binding_id)
                     _log_event(
                         "container_restart_placeholder", level=logging.WARNING,
@@ -3745,7 +3760,6 @@ class ServiceManagerV2:
                         since=int(time.time() * 1000),
                     )
                 self._note_binding_power_change(binding)
-                self._suspects.pop(binding.binding_id, None)
                 self._record_restart_count(snapshot.pod_uid or snapshot.name, int(snapshot.restart_count or 0))
             # Converge placeholders and suspects once /is_sleeping answers; observe
             # (review P2-5) records what it finds (leases, store) but sleeps nothing.
@@ -5681,13 +5695,17 @@ WAKE_WORKERS = 8
 STARTING_BINDING_PHASE = "starting_binding"
 
 
-def restart_placeholder_candidates(snapshots, store_bindings) -> list[Binding]:
+def restart_placeholder_candidates(
+    snapshots, store_bindings, conflicts: list[Binding] | None = None
+) -> list[Binding]:
     """Bootstrap re-derivation (review, 2026-09-30): pods whose engine container
     runs but is not Ready, that were not admitted at their startup gate (those get
     their starting lease from the admission) and that the store does not record
     awake - an engine reloading after an in-place restart the previous SM may have
     been converging. They get a ``starting`` placeholder and are suspects until the
-    restart guard converges them; nothing of this lives only in memory."""
+    restart guard converges them; nothing of this lives only in memory. A
+    candidate on GPUs another binding is recorded awake on gets no placeholder; it
+    is appended to ``conflicts`` (when given) so the SM keeps it a suspect."""
     awake = {binding.binding_id for binding in store_bindings if binding.awake}
     out: list[Binding] = []
     for snapshot in snapshots:
@@ -5715,8 +5733,10 @@ def restart_placeholder_candidates(snapshots, store_bindings) -> list[Binding]:
             _log_event(
                 "container_restart_conflict", level=logging.ERROR,
                 binding_id=binding.binding_id, pod=snapshot.name, occupants=clash,
-                detail="engine reloading on GPUs another binding holds (at SM bootstrap)",
+                detail="engine reloading on GPUs another binding holds (at SM bootstrap); binding kept a suspect",
             )
+            if conflicts is not None:
+                conflicts.append(replace(binding, awake=False, hidden=True))
             continue
         out.append(replace(binding, awake=False, hidden=True))
     return out

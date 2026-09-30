@@ -141,8 +141,11 @@ def create_app() -> FastAPI:
             LOG.error("ignoring a corrupt wake journal entry at bootstrap: %s", entry)
     # Engines reloading after an in-place restart that no admission covers: a
     # placeholder again (the previous SM's in-memory state is gone).
+    # Those clashing with a binding recorded awake get no placeholder but stay
+    # suspects (restored_suspects) until the restart guard converges them.
+    restart_conflicts: list = []
     restart_placeholders = restart_placeholder_candidates(
-        k8s_ops.list_pod_snapshots(), legacy_store.load().bindings
+        k8s_ops.list_pod_snapshots(), legacy_store.load().bindings, conflicts=restart_conflicts
     )
     with operation_coordinator.operation("bootstrap_fleet_state"):
         fleet_store.bootstrap(legacy_store.load().bindings)
@@ -206,6 +209,9 @@ def create_app() -> FastAPI:
         restart_ledger=RestartLedger(redis_client),
         restored_placeholders=[
             (b.binding_id, b.slot.node, tuple(b.slot.gpu_ids), b.serve_id) for b in restart_placeholders
+        ],
+        restored_suspects=[
+            (b.binding_id, b.slot.node, tuple(b.slot.gpu_ids), b.serve_id) for b in restart_conflicts
         ],
         # Read only while registry service_manager.test_hooks is true.
         fault_redis=redis_client,
