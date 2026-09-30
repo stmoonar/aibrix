@@ -37,7 +37,9 @@ class FakeRedis:
 class FakeRunner:
     """Records argv; ``apa`` is the PodAutoscaler list JSON; healthz answers after N tries."""
 
-    def __init__(self, apa=APA_NONE, healthz_after=0, fail_on=None, redis=None, owner_on_healthy=True):
+    def __init__(self, apa=APA_NONE, healthz_after=0, fail_on=None, redis=None, owner_on_healthy=True,
+                 pods=("tre-v2-baseline-scaler-abc12",)):
+        self.pods = list(pods)
         self.calls = []
         self.apa = apa
         self.healthz_after = healthz_after
@@ -53,6 +55,8 @@ class FakeRunner:
             return RunResult(1, "", "boom")
         if argv[1:3] == ["get", arm.APA_RESOURCE]:
             return RunResult(0, self.apa)
+        if argv[3:5] == ["get", "pods"]:
+            return RunResult(0, " ".join(self.pods))
         if "python3" in argv and "-c" in argv:
             self.healthz_tries += 1
             ok = self.healthz_tries > self.healthz_after
@@ -157,15 +161,42 @@ def test_enable_times_out_and_reports_a_failing_step() -> None:
     assert code == arm.EXIT_FAIL and not any("rollout" in c for c in runner.calls)
 
 
-def test_disable_scales_to_zero_and_waits_for_the_lock_to_go() -> None:
+def test_disable_scales_to_zero_and_waits_for_the_lock_to_go(tmp_path) -> None:
     redis = FakeRedis({OWNER_KEY: "tok"})
-    runner = FakeRunner(redis=redis)
-    code, out = run(["disable", "--execute"], runner, redis)
-    assert code == 0 and runner.calls[0][3:] == ["scale", DEPLOY, "--replicas=0"]
-    assert OWNER_KEY not in redis.kv and "disabled" in out
+    runner = FakeRunner(redis=redis, pods=())
+    code, out = run(["disable", "--execute", "--collect-dir", str(tmp_path / "c")], runner, redis)
+    assert code == 0 and runner.calls[-1][3:] == ["scale", DEPLOY, "--replicas=0"]
+    assert OWNER_KEY not in redis.kv and "disabled" in out and "no decision logs" in out
     redis = FakeRedis({OWNER_KEY: "tok"})  # a lock that never goes away
-    code, _ = run(["disable", "--execute", "--timeout-s", "4"], FakeRunner(), redis)
+    code, _ = run(["disable", "--execute", "--skip-collect", "--timeout-s", "4"], FakeRunner(), redis)
     assert code == arm.EXIT_FAIL
+
+
+def test_disable_copies_the_decision_logs_out_before_scaling(tmp_path) -> None:
+    redis = FakeRedis({OWNER_KEY: "tok"})
+    runner = FakeRunner(redis=redis, pods=("scaler-a", "scaler-b"))
+    dest = tmp_path / "evidence"
+    code, out = run(["disable", "--execute", "--collect-dir", str(dest), "--namespace", "ns1"], runner, redis)
+    assert code == 0, out
+    get_pods, cp_a, cp_b, scale = runner.calls
+    assert get_pods[:6] == ["kubectl", "-n", "ns1", "get", "pods", "-l"]
+    assert get_pods[6] == "app.kubernetes.io/name=tre-v2-baseline-scaler"
+    assert cp_a == ["kubectl", "cp", "ns1/scaler-a:/var/log/tre-baselines", str(dest / "scaler-a")]
+    assert cp_b[2:] == ["ns1/scaler-b:/var/log/tre-baselines", str(dest / "scaler-b")]
+    assert scale[3:] == ["scale", DEPLOY, "--replicas=0"] and dest.is_dir()
+    # a failed copy aborts before the scale-down: the pod (and its logs) stays
+    runner = FakeRunner(redis=FakeRedis({OWNER_KEY: "tok"}), fail_on="cp")
+    code, _ = run(["disable", "--execute", "--collect-dir", str(dest)], runner, runner.redis)
+    assert code == arm.EXIT_FAIL and not any("--replicas=0" in c for c in runner.calls)
+
+
+def test_disable_execute_requires_a_collect_dir() -> None:
+    runner, redis = FakeRunner(), FakeRedis({OWNER_KEY: "tok"})
+    code, _ = run(["disable", "--execute"], runner, redis)
+    assert code == arm.EXIT_REFUSED and runner.calls == []
+    # print mode lists the copy, with a placeholder when no directory is given
+    code, out = run(["disable", "--log-dir", "/logs", "--selector", "app=x"], FakeRunner(), FakeRedis())
+    assert code == 0 and "tre-v2/<pod>:/logs" in out and "-l app=x" in out
 
 
 def test_mark_replay_writes_the_marker_from_the_redis_clock() -> None:

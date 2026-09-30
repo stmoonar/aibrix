@@ -1,7 +1,7 @@
 """Arm tool: switch the baseline-scaler arm on / off and mark the replay start.
 
     python3 -m tre_baselines.tools.arm enable --policy chiron [--dry-run-shell] [--execute]
-    python3 -m tre_baselines.tools.arm disable [--execute]
+    python3 -m tre_baselines.tools.arm disable [--collect-dir DIR | --skip-collect] [--execute]
     python3 -m tre_baselines.tools.arm mark-replay --trace PATH --seed N [--execute]
 
 Without ``--execute`` nothing is contacted: the tool prints the commands it would run
@@ -13,7 +13,13 @@ Without ``--execute`` nothing is contacted: the tool prints the commands it woul
   managed model. Then it sets ``TRE_BL_POLICY`` (and ``TRE_BL_DRY_RUN=false`` unless
   ``--dry-run-shell``) on the scaler deployment, scales it to 1 and waits until
   ``/healthz`` answers 200 and, when the shell actuates, the owner lock is held.
-* ``disable`` scales the deployment to 0 and waits until the owner lock is gone.
+* ``disable`` first copies the decision-log directory (``--log-dir``, the pod's
+  ``TRE_BL_LOG_DIR``) out of every scaler pod (``kubectl cp <ns>/<pod>:<log-dir>
+  <collect-dir>/<pod>``; the logs live on an ``emptyDir`` and die with the pod), then
+  scales the deployment to 0 and waits until the owner lock is gone. ``--collect-dir`` is
+  required with ``--execute`` unless ``--skip-collect`` says the files may be lost (the
+  lines are also in the Redis stream ``tre:v2:bl:decisions``, which additionally holds
+  the few ticks between the copy and the shutdown). A failed copy aborts before scaling.
 * ``mark-replay`` writes ``tre:v2:bl:replay_t0`` = ``{"t0_ms": <Redis TIME>, "trace_path",
   "seed"}``.
 
@@ -34,11 +40,9 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable, Optional, Protocol, Sequence
 
-from tre_baselines.keys import OWNER_KEY, REPLAY_T0_KEY
+from tre_baselines.keys import CONTROLLER_MODE_KEY, OWNER_KEY, REPLAY_T0_KEY
 
 POLICIES = ("chiron", "tokenscale", "preserve")
-#: Where set_run_mode.sh stores the TRE controller mode ("active" | "observe").
-CONTROLLER_MODE_KEY = "tre:v2:controller:mode"
 APA_RESOURCE = "podautoscalers.autoscaling.aibrix.ai"
 
 EXIT_OK, EXIT_FAIL, EXIT_REFUSED = 0, 1, 2
@@ -236,13 +240,54 @@ def cmd_enable(env: Env, a: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _selector(a: argparse.Namespace) -> str:
+    return a.selector or f"app.kubernetes.io/name={a.deployment}"
+
+
+def _list_pods_argv(env: Env, a: argparse.Namespace) -> list[str]:
+    return [env.kubectl, "-n", a.namespace, "get", "pods", "-l", _selector(a),
+            "-o", "jsonpath={.items[*].metadata.name}"]
+
+
+def _cp_argv(env: Env, a: argparse.Namespace, pod: str, dest: str) -> list[str]:
+    return [env.kubectl, "cp", f"{a.namespace}/{pod}:{a.log_dir}", dest]
+
+
+def collect_logs(env: Env, a: argparse.Namespace) -> list[str]:
+    """Copy the decision-log directory out of every scaler pod; returns the local dirs."""
+    pods = _step(env, _list_pods_argv(env, a)).stdout.split()
+    if not pods:
+        env.say(f"# no pod matches {_selector(a)} in {a.namespace}: no decision logs to collect")
+        return []
+    os.makedirs(a.collect_dir, exist_ok=True)
+    out = []
+    for pod in pods:
+        dest = os.path.join(a.collect_dir, pod)
+        _step(env, _cp_argv(env, a, pod, dest))
+        env.say(f"collected {a.namespace}/{pod}:{a.log_dir} -> {dest}")
+        out.append(dest)
+    return out
+
+
 def cmd_disable(env: Env, a: argparse.Namespace) -> int:
     scale = [env.kubectl, "-n", a.namespace, "scale", f"deploy/{a.deployment}", "--replicas=0"]
     if not a.execute:
         env.say("# dry print (nothing executed); add --execute to run")
+        if a.skip_collect:
+            env.say("# --skip-collect: the decision-log files are NOT copied out (Redis stream only)")
+        else:
+            env.say(_cmd(_list_pods_argv(env, a)))
+            env.say("# for each pod listed:")
+            env.say(_cmd(_cp_argv(env, a, "<pod>", os.path.join(a.collect_dir or "<collect-dir>", "<pod>"))))
         env.say(_cmd(scale))
         env.say(f"# then wait until redis GET {OWNER_KEY} is empty (released on shutdown, else after the lock TTL)")
         return EXIT_OK
+    if not a.skip_collect:
+        if not a.collect_dir:
+            raise ArmError("refusing: --collect-dir is required with --execute (the decision logs live on an "
+                           "emptyDir and are lost with the pod); pass --skip-collect to scale down without "
+                           "copying them", EXIT_REFUSED)
+        collect_logs(env, a)
     _step(env, scale)
     _poll(env, f"owner lock {OWNER_KEY} to disappear", lambda: not env.redis.get(OWNER_KEY),
           a.timeout_s, a.interval_s)
@@ -288,7 +333,15 @@ def build_parser() -> argparse.ArgumentParser:
     en.add_argument("--dry-run-shell", action="store_true", help="shell only logs (TRE_BL_DRY_RUN=true)")
     en.add_argument("--models", default="", help="comma list of managed models for the APA check (default: any APA CR)")
     en.add_argument("--http-port", type=int, default=8080)
-    sub.add_parser("disable", parents=[common], help="scale the shell to 0, wait until the owner lock is gone")
+    dis = sub.add_parser("disable", parents=[common],
+                         help="copy the decision logs out, scale the shell to 0, wait until the owner lock is gone")
+    dis.add_argument("--collect-dir", default=None,
+                     help="local directory receiving <pod>/ copies of the decision logs (required with --execute)")
+    dis.add_argument("--skip-collect", action="store_true",
+                     help="scale down without copying the decision logs (they remain in the Redis stream)")
+    dis.add_argument("--log-dir", default="/var/log/tre-baselines", help="TRE_BL_LOG_DIR inside the pod")
+    dis.add_argument("--selector", default=None,
+                     help="label selector of the scaler pods (default app.kubernetes.io/name=<deployment>)")
     mk = sub.add_parser("mark-replay", parents=[common], help=f"write {REPLAY_T0_KEY}")
     mk.add_argument("--trace", required=True)
     mk.add_argument("--seed", required=True, type=int)
