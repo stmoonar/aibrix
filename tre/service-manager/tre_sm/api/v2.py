@@ -206,6 +206,7 @@ class ServiceManagerV2:
         wake_journal: WakeJournal | None = None,
         fault_redis=None,
         restart_ledger: RestartLedger | None = None,
+        restored_placeholders: list[tuple[str, str, tuple[int, ...], str]] | None = None,
     ) -> None:
         self._registry = registry
         # Registry placement policy shared with the controller planner (design
@@ -296,6 +297,12 @@ class ServiceManagerV2:
         #: P1-4: binding ids holding a restart placeholder (starting lease) that the
         #: restart guard converges.
         self._restart_placeholders: dict[str, str] = {}
+        # Placeholders re-derived at bootstrap (restart_placeholder_candidates):
+        # (binding id, node, gpu ids, pod) - converged by the restart guard and
+        # suspects until then.
+        for binding_id, node, gpus, pod_name in restored_placeholders or ():
+            self._restart_placeholders[binding_id] = pod_name
+            self._suspects[binding_id] = (node, tuple(int(g) for g in gpus), pod_name)
         # P2-3: after a restart the power marks are empty; the GPUs of wakes still
         # journaled may hold an engine the last gpu-truth sample does not show.
         self._mark_journaled_wakes()
@@ -3624,16 +3631,24 @@ class ServiceManagerV2:
                     snapshot for snapshot in self._runtime_ops.list_pod_snapshots(model=model)
                     if self._snapshot_binding_id(snapshot) == lease.binding_id
                 ]
-                physical = True if not pods else None
-                for snapshot in pods:
-                    if snapshot.pod_ip:
-                        physical = self._vllm_ops.is_sleeping(snapshot.pod_ip, port=8000)
-                if physical is None:
-                    continue
+                readings = [
+                    self._vllm_ops.is_sleeping(snapshot.pod_ip, port=8000) if snapshot.pod_ip else None
+                    for snapshot in pods
+                ]
+                if any(reading is False for reading in readings):
+                    physical = False  # any pod of the binding awake: it holds the GPUs
+                elif any(reading is None for reading in readings):
+                    continue  # one unreadable: keep the fence, next pass
+                else:
+                    physical = True  # every pod asleep, or no pod at all
                 if physical is True:
                     self._gpu_leases.release(binding)
                 else:
+                    # Record what the cluster shows, like the restart convergence:
+                    # the awake lease and the store (hidden: never routed by this;
+                    # desired / routing are the reconcile's and the audit's).
                     self._gpu_leases.acquire(binding, phase="awake")
+                    self._set_store_power(lease.binding_id, awake=True, hidden=True)
                 self._note_binding_power_change(binding)
                 _log_event(
                     "orphan_waking_lease_settled", level=logging.WARNING,
@@ -3741,7 +3756,7 @@ class ServiceManagerV2:
                 if snapshot is None:
                     self._restart_placeholders.pop(binding_id, None)
                     continue
-                if self._converge_restart(snapshot, observe=observe):
+                if self._converge_isolated(snapshot, binding_id, observe=observe):
                     self._restart_placeholders.pop(binding_id, None)
                     converged.append(binding_id)
             for binding_id, (node, gpus, pod_name) in list(self._suspects.items()):
@@ -3751,10 +3766,19 @@ class ServiceManagerV2:
                 if snapshot is None:
                     self._suspects.pop(binding_id, None)
                     continue
-                if self._converge_restart(snapshot, observe=observe, suspect=True):
+                if self._converge_isolated(snapshot, binding_id, observe=observe, suspect=True):
                     self._suspects.pop(binding_id, None)
                     converged.append(binding_id)
         return {"placed": placed, "converged": converged}
+
+    def _converge_isolated(self, snapshot, binding_id: str, **kwargs) -> bool:
+        """One placeholder / suspect never starves the others (an error = retried
+        next pass)."""
+        try:
+            return self._converge_restart(snapshot, **kwargs)
+        except Exception:  # noqa: BLE001
+            LOG.exception("converging the restarted binding %s failed; next pass", binding_id)
+            return False
 
     def _record_restart_count(self, uid: str, count: int) -> None:
         self._restarts_seen[uid] = int(count)
@@ -5655,6 +5679,47 @@ WAKE_WORKERS = 8
 #: defrag, cold start): the Pod of ``details.binding_id`` is admitted without
 #: the writer lock (review 4 P1).
 STARTING_BINDING_PHASE = "starting_binding"
+
+
+def restart_placeholder_candidates(snapshots, store_bindings) -> list[Binding]:
+    """Bootstrap re-derivation (review, 2026-09-30): pods whose engine container
+    runs but is not Ready, that were not admitted at their startup gate (those get
+    their starting lease from the admission) and that the store does not record
+    awake - an engine reloading after an in-place restart the previous SM may have
+    been converging. They get a ``starting`` placeholder and are suspects until the
+    restart guard converges them; nothing of this lives only in memory."""
+    awake = {binding.binding_id for binding in store_bindings if binding.awake}
+    out: list[Binding] = []
+    for snapshot in snapshots:
+        if getattr(snapshot, "engine_running", None) is not True or snapshot.ready:
+            continue
+        admitted = snapshot.annotations.get("tre.aibrix.io/startup-admitted-uid")
+        if admitted and admitted == snapshot.pod_uid:
+            continue
+        try:
+            binding = _binding_from_snapshot(snapshot)
+        except (KeyError, ValueError):
+            continue
+        if binding.binding_id in awake:
+            continue
+        clash = sorted(
+            other.binding_id
+            for other in store_bindings
+            if other.awake and other.slot.node == binding.slot.node
+            and set(other.slot.gpu_ids) & set(binding.slot.gpu_ids)
+        )
+        if clash:
+            # Another binding is recorded awake there: a placeholder would clash
+            # with its lease at bootstrap. Reported (possible double occupancy);
+            # the restart guard / reconcile / audit see it.
+            _log_event(
+                "container_restart_conflict", level=logging.ERROR,
+                binding_id=binding.binding_id, pod=snapshot.name, occupants=clash,
+                detail="engine reloading on GPUs another binding holds (at SM bootstrap)",
+            )
+            continue
+        out.append(replace(binding, awake=False, hidden=True))
+    return out
 
 
 def _elapsed_ms(started: float) -> int:

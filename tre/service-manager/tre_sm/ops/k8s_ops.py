@@ -16,6 +16,7 @@ from gen_model_manifests import (
     build_model_httproute,
     deployment_name,
 )
+from tre_common.bindings import ENGINE_CONTAINER
 from tre_common.rediskeys import ROUTE_GEN_ANNOTATION
 from tre_common.registry import Registry
 from tre_sm.allocator.slots import Binding
@@ -712,9 +713,6 @@ def _pod_ready(pod) -> bool:
     )
 
 
-#: Name of the vLLM engine container of a model Pod (deploy/gen_model_manifests.py
-#: renders it; deploy/tests guard that both agree).
-ENGINE_CONTAINER = "vllm-openai"
 
 
 def _engine_running(pod) -> bool | None:

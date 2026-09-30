@@ -24,6 +24,7 @@ from tre_sm.state.fleet_store import FleetStateStore
 from tre_sm.state.gpu_leases import GpuLeaseStore
 from tre_sm.state.store import StateStore
 from tre_sm.state.wake_journal import RestartLedger, WakeJournal
+from tre_sm.api.v2 import restart_placeholder_candidates
 
 
 LOG = logging.getLogger(__name__)
@@ -138,6 +139,11 @@ def create_app() -> FastAPI:
             )
         except (KeyError, TypeError, ValueError):
             LOG.error("ignoring a corrupt wake journal entry at bootstrap: %s", entry)
+    # Engines reloading after an in-place restart that no admission covers: a
+    # placeholder again (the previous SM's in-memory state is gone).
+    restart_placeholders = restart_placeholder_candidates(
+        k8s_ops.list_pod_snapshots(), legacy_store.load().bindings
+    )
     with operation_coordinator.operation("bootstrap_fleet_state"):
         fleet_store.bootstrap(legacy_store.load().bindings)
         # D7: every registry binding (and TRE-managed Deployment) gets a desired
@@ -149,7 +155,7 @@ def create_app() -> FastAPI:
             LOG.info("seeded desired state from registry: %s", seeded)
         gpu_leases.rebuild_awake(
             legacy_store.load().bindings,
-            starting_bindings=starting_bindings,
+            starting_bindings=starting_bindings + restart_placeholders,
             # Wakes a dead SM left between its phases keep their GPUs until the
             # journal recovery resolves them (review P2-3).
             waking_bindings=waking_bindings,
@@ -198,6 +204,9 @@ def create_app() -> FastAPI:
         sleep_journal=SleepJournal(redis_client),
         wake_journal=wake_journal,
         restart_ledger=RestartLedger(redis_client),
+        restored_placeholders=[
+            (b.binding_id, b.slot.node, tuple(b.slot.gpu_ids), b.serve_id) for b in restart_placeholders
+        ],
         # Read only while registry service_manager.test_hooks is true.
         fault_redis=redis_client,
         supervisor_enabled=os.environ.get(

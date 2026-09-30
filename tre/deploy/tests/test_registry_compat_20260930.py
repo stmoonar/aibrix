@@ -43,7 +43,14 @@ def test_uncommenting_the_new_keys_gives_no_duplicate_blocks():
 
 
 def test_engine_container_name_matches_the_rendered_manifests():
+    import tre_sm.ops.k8s_ops as k8s_ops
+    from tre_common import bindings
     from tre_sm.ops.k8s_ops import ENGINE_CONTAINER, _engine_running
+
+    # one definition, shared by the manifest generator and the service-manager
+    assert k8s_ops.ENGINE_CONTAINER is bindings.ENGINE_CONTAINER
+    generator = (Path(__file__).resolve().parents[1] / "gen_model_manifests.py").read_text(encoding="utf-8")
+    assert '"vllm-openai"' not in generator and '"name": ENGINE_CONTAINER' in generator
 
     models = Path(__file__).resolve().parents[1] / "models"
     rendered = sorted(models.glob("*.yaml"))

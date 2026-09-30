@@ -624,3 +624,90 @@ def test_startup_placeholder_supervisor_runs_the_restart_guard_before_the_reaper
     FleetSupervisor(Service()).run_once()
     assert calls.index("guard_container_restarts") < calls.index("reap_stale_startup_placeholders")
     assert "reap_orphan_waking_leases" in calls and "recover_wake_journal" in calls
+
+
+# ------------------------------------------------------------ final review round
+
+
+def test_startup_placeholder_rederived_at_bootstrap_for_a_reloading_engine():
+    """An SM restarted while an engine reloads after an in-place restart re-derives
+    the placeholder from the cluster (no in-memory state needed)."""
+    from tre_sm.api.v2 import restart_placeholder_candidates
+
+    reloading = dataclasses.replace(
+        pod("pod-a", "m1", (0,), ip="10.0.0.1", state="sleeping"), ready=False, engine_running=True
+    )
+    admitted = dataclasses.replace(
+        pod("pod-n", "tp2", (2, 3), ip="10.0.0.5", state="hidden", admitted=True), ready=False, engine_running=True
+    )
+    ready = pod("pod-b", "m1", (1,), ip="10.0.0.2", state="sleeping")
+    waiting = dataclasses.replace(
+        pod("pod-c", "m1", (2,), ip="10.0.0.3", state="sleeping"), ready=False, engine_running=False
+    )
+    clash = dataclasses.replace(
+        pod("pod-t", "tp2", (0, 1), ip="10.0.0.4", state="sleeping"), ready=False, engine_running=True
+    )
+    store = [Binding("pod-x", "m1", Slot("node-a", (1,)), awake=True)]
+    found = restart_placeholder_candidates([reloading, admitted, ready, waiting, clash], store)
+    assert [b.binding_id for b in found] == ["m1/node-a/0"]
+
+    redis = FakeRedis()
+    leases = GpuLeaseStore(redis)
+    with fence(redis):
+        leases.rebuild_awake(store, starting_bindings=found)
+    assert {lease.binding_id: lease.phase for lease in leases.load()} == {
+        "m1/node-a/1": "awake", "m1/node-a/0": "starting",
+    }
+    service = ServiceManagerV2(
+        registry(), StateStore(FakeRedis()),
+        restored_placeholders=[(b.binding_id, b.slot.node, tuple(b.slot.gpu_ids), b.serve_id) for b in found],
+    )
+    assert service._restart_placeholders == {"m1/node-a/0": "pod-a"}
+    assert service._suspects == {"m1/node-a/0": ("node-a", (0,), "pod-a")}
+
+
+def test_startup_placeholder_convergence_isolates_a_failing_binding(monkeypatch):
+    world = _world()
+    world.service._suspects = {
+        "m1/node-a/0": ("node-a", (0,), "pod-a"),
+        "m1/node-a/1": ("node-a", (1,), "pod-b"),
+    }
+    world.vllm.sleeping["10.0.0.1"] = True
+    world.vllm.sleeping["10.0.0.2"] = True
+    original = world.service._converge_restart
+
+    def flaky(snapshot, **kwargs):
+        if snapshot.name == "pod-a":
+            raise ConnectionError("apiserver")
+        return original(snapshot, **kwargs)
+
+    monkeypatch.setattr(world.service, "_converge_restart", flaky)
+    world.service._restarts_seen = {}
+    result = world.service.guard_container_restarts()
+    assert result["converged"] == ["m1/node-a/1"]  # not starved by pod-a
+    assert set(world.service._suspects) == {"m1/node-a/0"}  # retried next pass
+
+
+def test_parallel_wake_orphan_waking_lease_any_awake_pod_wins_and_is_recorded():
+    world = _world(
+        [pod("pod-a", "m1", (0,), ip="10.0.0.1", state="sleeping"),
+         pod("pod-a2", "m1", (0,), ip="10.0.0.9", state="sleeping")],
+        [_desired("m1/node-a/0", "m1", (0,), "sleeping")],
+    )
+    with fence(world.redis):
+        world.leases.acquire(Binding("x", "m1", Slot("node-a", (0,)), awake=False), phase="waking")
+    world.vllm.sleeping["10.0.0.1"] = False  # the FIRST pod is awake, the last asleep
+    world.vllm.sleeping["10.0.0.9"] = True
+
+    assert world.service.reap_orphan_waking_leases() == ["m1/node-a/0"]
+    assert _leases(world)["m1/node-a/0"][0] == "awake"
+    assert {b.serve_id: b.awake for b in world.store.load().bindings}["pod-a"] is True
+
+    # one unreadable pod: kept
+    with fence(world.redis):
+        world.leases.release(Binding("x", "m1", Slot("node-a", (0,)), awake=False))
+        world.leases.acquire(Binding("x", "m1", Slot("node-a", (0,)), awake=False), phase="waking")
+    world.vllm.sleeping["10.0.0.1"] = True
+    world.vllm.physical_override["10.0.0.9"] = None
+    assert world.service.reap_orphan_waking_leases() == []
+    assert _leases(world)["m1/node-a/0"][0] == "waking"
