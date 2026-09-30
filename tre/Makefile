@@ -43,7 +43,7 @@ check-serial:
 REDIS_TEST_IMAGE ?= redis:7.2-alpine
 REDIS_TEST_PORT ?= 16399
 REDIS_TEST_CONTAINER ?= tre-check-redis
-REDIS_TESTS := service-manager/tests/test_operations.py service-manager/tests/test_maintenance_lock.py
+REDIS_TESTS := service-manager/tests/test_operations.py service-manager/tests/test_maintenance_lock.py baselines/tests/test_bl_e2e_real_redis.py
 REDIS_E2E_TESTS := service-manager/tests/test_sleep_e2e_redis.py
 
 check-redis:

@@ -179,6 +179,8 @@ class StubSM:
     def __init__(self, responder=None, delay_s: float = 0.0,
                  state: Optional[dict] = None) -> None:
         self.requests: list[tuple[str, str, dict, dict]] = []
+        #: time.monotonic() at which each PUT arrived (same order as ``requests``).
+        self.arrivals: list[float] = []
         self.responder = responder or (lambda model, body: (200, json.dumps({"model": model}).encode(), "application/json"))
         self.delay_s = delay_s
         self.state = state or {"version": 1, "models": {}, "bindings": []}
@@ -195,6 +197,7 @@ class StubSM:
                 length = int(self.headers.get("content-length") or 0)
                 body = json.loads(self.rfile.read(length) or b"{}")
                 model = self.path.split("/")[3] if self.path.startswith("/v2/models/") else ""
+                stub.arrivals.append(time.monotonic())
                 stub.requests.append(("PUT", self.path, body, {k.lower(): v for k, v in self.headers.items()}))
                 if stub.delay_s:
                     time.sleep(stub.delay_s)
