@@ -25,6 +25,8 @@ class FakeRedis:
         self.streams: dict[str, list[tuple[str, dict]]] = {}
         self._seq: dict[int, int] = {}
         self.set_calls: list[tuple[str, Any, dict]] = []
+        self.eval_calls: list[tuple] = []
+        self.xadd_calls: list[tuple] = []
 
     def time(self):
         return (self.now_ms // 1000, (self.now_ms % 1000) * 1000)
@@ -60,8 +62,23 @@ class FakeRedis:
         self.ttl_ms.pop(key, None)
         return int(existed)
 
-    def xadd(self, key, fields, id: Optional[str] = None):
-        if id is None:
+    def eval(self, script, numkeys, *args):
+        """The owner-lock scripts of ``tre_baselines.loop`` (compare-and-pexpire / -delete)."""
+        from tre_baselines.loop import RELEASE_LUA, RENEW_LUA
+
+        self.eval_calls.append((script, numkeys, args))
+        key, token = args[0], args[1]
+        if self.kv.get(key) != token:
+            return 0
+        if script == RENEW_LUA:
+            return int(self.pexpire(key, int(args[2])))
+        if script == RELEASE_LUA:
+            return self.delete(key)
+        raise NotImplementedError(script)
+
+    def xadd(self, key, fields, id: Optional[str] = None, maxlen=None, approximate=True):
+        self.xadd_calls.append((key, maxlen, approximate))
+        if id is None or id == "*":
             seq = self._seq.get(self.now_ms, 0)
             self._seq[self.now_ms] = seq + 1
             id = f"{self.now_ms}-{seq}"

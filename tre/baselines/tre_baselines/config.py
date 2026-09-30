@@ -26,17 +26,22 @@ Environment:
 ``TRE_BL_POLICY_CONFIG``    YAML file with the policy's parameters (optional)
 ``TRE_REGISTRY_PATH``       registry YAML (default ``/etc/tre/registry.yaml``)
 ``TRE_BL_WRITE_REDIS``      write ``tre:v2:bl:decision:<model>`` (default true)
+``TRE_BL_DECISION_STREAM``  also XADD every decision line to ``tre:v2:bl:decisions``
+                            (MAXLEN ~ 100000; default true)
 ``TRE_BL_MODELS``           comma list restricting the models acted on (default: all)
 ``TRE_MODEL_NAMESPACE``     namespace of the model pods (default ``default``)
 ``TRE_BL_METRICS_PORT``     pod port serving ``/metrics``; unset = the pod's
                             ``model.aibrix.ai/port`` label, else 8000
-``TRE_BL_SCRAPE_TIMEOUT_S`` per-pod scrape timeout (default 1.0)
+``TRE_BL_SCRAPE_TIMEOUT_S`` per-pod scrape timeout (default 2.5)
 ``TRE_BL_SM_TIMEOUT_S``     SM target-call timeout (default 300, the controller's)
 ``TRE_BL_SM_STATE_TIMEOUT_S`` SM ``/v2/state`` timeout (default 5)
 ``TRE_BL_SLEEP_PATH``       ``sleep_path`` of scale-downs (default ``scale_down``)
 ``TRE_BL_DRAIN_BUDGET_S``   optional ``drain_budget_s`` of scale-downs
 ``TRE_BL_MAX_TICK_FAILURES`` consecutive failed ticks before /healthz is 503 (default 5)
 ``TRE_BL_LOCK_TTL_S``       owner-lock TTL (default 30)
+``TRE_BL_BACKOFF_MAX_S``    cap of the per-model backoff after SM refusals (default 60)
+``TRE_BL_LIVENESS_STALL_S`` ``/livez`` fails when the loop has not ticked for this long
+                            (default 120)
 ``TRE_BL_HTTP_PORT``        /healthz + /metrics port (default 8080)
 ``TRE_BL_SEED``             seed handed to policies (default 0)
 ==========================  ==========================================================
@@ -89,16 +94,19 @@ class Config:
     policy_params: Mapping[str, Any] = field(default_factory=dict)
     registry_path: str = DEFAULT_REGISTRY_PATH
     write_redis: bool = True
+    decision_stream: bool = True
     models: Mapping[str, ModelLimits] = field(default_factory=dict)
     model_namespace: str = "default"
     metrics_port: Optional[int] = None
-    scrape_timeout_s: float = 1.0
+    scrape_timeout_s: float = 2.5
     sm_timeout_s: float = 300.0
     sm_state_timeout_s: float = 5.0
     sleep_path: str = DEFAULT_SLEEP_PATH
     drain_budget_s: Optional[float] = None
     max_tick_failures: int = 5
     lock_ttl_s: float = 30.0
+    backoff_max_s: float = 60.0
+    liveness_stall_s: float = 120.0
     http_port: int = 8080
     seed: int = 0
 
@@ -216,16 +224,19 @@ def load_config(env: Optional[Mapping[str, str]] = None, registry: Optional[Regi
         policy_params=load_policy_params(policy_config_path),
         registry_path=registry_path,
         write_redis=parse_bool(env.get("TRE_BL_WRITE_REDIS"), True),
+        decision_stream=parse_bool(env.get("TRE_BL_DECISION_STREAM"), True),
         models=model_limits(registry, only),
         model_namespace=env.get("TRE_MODEL_NAMESPACE", "").strip() or "default",
         metrics_port=int(port) if port else None,
-        scrape_timeout_s=float(env.get("TRE_BL_SCRAPE_TIMEOUT_S", "").strip() or 1.0),
+        scrape_timeout_s=float(env.get("TRE_BL_SCRAPE_TIMEOUT_S", "").strip() or 2.5),
         sm_timeout_s=float(env.get("TRE_BL_SM_TIMEOUT_S", "").strip() or 300.0),
         sm_state_timeout_s=float(env.get("TRE_BL_SM_STATE_TIMEOUT_S", "").strip() or 5.0),
         sleep_path=sleep_path,
         drain_budget_s=_opt_float(env, "TRE_BL_DRAIN_BUDGET_S"),
         max_tick_failures=int(env.get("TRE_BL_MAX_TICK_FAILURES", "").strip() or 5),
         lock_ttl_s=float(env.get("TRE_BL_LOCK_TTL_S", "").strip() or 30.0),
+        backoff_max_s=float(env.get("TRE_BL_BACKOFF_MAX_S", "").strip() or 60.0),
+        liveness_stall_s=float(env.get("TRE_BL_LIVENESS_STALL_S", "").strip() or 120.0),
         http_port=int(env.get("TRE_BL_HTTP_PORT", "").strip() or 8080),
         seed=int(env.get("TRE_BL_SEED", "").strip() or 0),
     )

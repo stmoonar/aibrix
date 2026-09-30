@@ -6,10 +6,10 @@ import urllib.error
 import urllib.request
 
 from bl_fakes import FakeCluster, FakeRedis, FakeSource, ScriptedPolicy, StubSM, limits, make_config, wait_until
-from tre_baselines.keys import OWNER_KEY, decision_key
-from tre_baselines.loop import BaselineShell, OwnerLock, clamp, make_http_server
+from tre_baselines.keys import CONTROLLER_MODE_KEY, DECISIONS_STREAM, OWNER_KEY, decision_key
+from tre_baselines.loop import RELEASE_LUA, RENEW_LUA, BaselineShell, OwnerLock, clamp, make_http_server
 from tre_baselines.policies.static import StaticPolicy
-from tre_baselines.sm_client import Dispatcher, SMClient
+from tre_baselines.sm_client import Backoff, Dispatcher, SMClient, SMResult
 
 MODELS = {"a": limits("a", 1, 4), "b": limits("b", 1, 4), "c": limits("c", 1, 3, tp=2)}
 
@@ -206,3 +206,208 @@ def test_owner_lock_renew_and_release() -> None:
     lock.release()
     assert OWNER_KEY not in redis.kv
     assert other.ensure()
+
+
+def test_owner_lock_renewal_never_touches_another_shells_lock() -> None:
+    redis = FakeRedis()
+    mine = OwnerLock(redis, 10, token="t1")
+    assert mine.ensure()
+    redis.kv[OWNER_KEY] = "t2"            # expired and taken by another shell in between
+    redis.ttl_ms[OWNER_KEY] = 5_000
+    assert not mine.ensure()              # compare-and-pexpire: no renewal, SET NX refused
+    assert redis.ttl_ms[OWNER_KEY] == 5_000 and redis.kv[OWNER_KEY] == "t2"
+    mine.release()                        # compare-and-delete: the other lock stays
+    assert redis.kv[OWNER_KEY] == "t2"
+    assert all(call[0] in (RENEW_LUA, RELEASE_LUA) for call in redis.eval_calls)
+
+
+# ------------------------------------------------------------------ controller-mode guard
+
+
+def test_controller_not_in_observe_forces_dry_run(tmp_path) -> None:
+    redis = FakeRedis()
+    redis.kv[CONTROLLER_MODE_KEY] = "active"
+    shell, cluster, redis, dispatcher = _shell(
+        tmp_path, ScriptedPolicy({t: {"b": 3} for t in range(20)}), dry_run=False, redis=redis)
+    lines = _run(shell, dispatcher, 2)
+    assert dispatcher.submitted == [] and cluster.calls == []
+    b = [l for l in lines[0] if l["model"] == "b"][0]
+    assert b["action"] == "guard_controller_active" and b["dry_run"] and b["controller_mode"] == "active"
+    assert [l["action"] for l in lines[0] if l["model"] != "b"] == ["none", "none"]
+    metrics = shell.metrics_text()
+    assert 'tre_bl_controller_guard{policy="scripted"} 1' in metrics
+    assert 'tre_bl_controller_guard_ticks_total{policy="scripted"} 2' in metrics
+    assert 'action="guard_controller_active"} 2' in metrics
+    assert shell.health_doc()["controller_guard"] is True
+    for mode in ("weird", "ACTIVE"):     # anything but observe is a guard
+        redis.kv[CONTROLLER_MODE_KEY] = mode
+        assert [l["action"] for l in shell.tick_once() if l["model"] == "b"] == ["guard_controller_active"]
+    redis.kv[CONTROLLER_MODE_KEY] = "observe"
+    line = [l for l in shell.tick_once() if l["model"] == "b"][0]
+    assert line["action"] == "up" and not line["dry_run"] and line["controller_mode"] == "observe"
+    assert 'tre_bl_controller_guard{policy="scripted"} 0' in shell.metrics_text()
+    assert wait_until(lambda: dispatcher.inflight_count() == 0)
+    dispatcher.close(join_s=1.0)
+
+
+def test_controller_mode_missing_is_observe_and_read_failure_guards(tmp_path) -> None:
+    shell, cluster, redis, dispatcher = _shell(tmp_path, ScriptedPolicy({0: {"b": 3}, 1: {"b": 4}}), dry_run=False)
+    assert CONTROLLER_MODE_KEY not in redis.kv
+    line = [l for l in shell.tick_once() if l["model"] == "b"][0]
+    assert line["action"] == "up" and "controller_mode" not in line
+    assert wait_until(lambda: dispatcher.inflight_count() == 0)
+    real_get = redis.get
+
+    def flaky_get(key):
+        if key == CONTROLLER_MODE_KEY:
+            raise ConnectionError("redis down")
+        return real_get(key)
+
+    redis.get = flaky_get
+    line = [l for l in shell.tick_once() if l["model"] == "b"][0]
+    assert line["action"] == "guard_controller_active" and line["controller_mode"] == "<read failed>"
+    dispatcher.close(join_s=1.0)
+
+
+def test_dry_run_shell_does_not_read_the_controller_mode(tmp_path) -> None:
+    redis = FakeRedis()
+    redis.kv[CONTROLLER_MODE_KEY] = "active"
+    shell, cluster, redis, dispatcher = _shell(tmp_path, ScriptedPolicy({0: {"b": 3}}), dry_run=True, redis=redis)
+    line = [l for l in shell.tick_once() if l["model"] == "b"][0]
+    assert line["action"] == "dry_run" and "controller_mode" not in line
+
+
+# ------------------------------------------------------------------ decision stream
+
+
+def test_decision_lines_are_mirrored_to_the_stream(tmp_path) -> None:
+    shell, cluster, redis, dispatcher = _shell(tmp_path, ScriptedPolicy(SCRIPT), dry_run=True)
+    lines = [l for tick in _run(shell, dispatcher, 3) for l in tick]
+    entries = redis.streams[DECISIONS_STREAM]
+    assert [json.loads(f["line"]) for _, f in entries] == [json.loads(json.dumps(l, sort_keys=True, default=str))
+                                                           for l in lines]
+    assert set(redis.xadd_calls) == {(DECISIONS_STREAM, 100_000, True)}
+    shell, cluster, redis, dispatcher = _shell(tmp_path, StaticPolicy(), dry_run=True, decision_stream=False,
+                                               log_dir=str(tmp_path / "l2"))
+    _run(shell, dispatcher, 2)
+    assert DECISIONS_STREAM not in redis.streams
+
+
+# ------------------------------------------------------------------ SM refusal backoff
+
+
+def _refusing_put(cluster, state, refuse_until_tick, retry_after_s=None):
+    calls = []
+
+    def put(model, body):
+        calls.append(state["tick"])
+        if state["tick"] < refuse_until_tick:
+            return SMResult(ok=False, code=409, error="gpu_busy", retry_after_s=retry_after_s)
+        return cluster.put_target(model, body)
+
+    return put, calls
+
+
+def _drive(shell, dispatcher, state, ticks):
+    lines = []
+    for t in range(ticks):
+        state["tick"] = t
+        lines.append({l["model"]: l for l in shell.tick_once()})
+        assert wait_until(lambda: dispatcher.inflight_count() == 0)
+    return lines
+
+
+def test_sm_refusals_back_off_exponentially(tmp_path) -> None:
+    state = {"tick": 0}
+    cluster = FakeCluster(awake={"a": 2, "b": 1, "c": 1})
+    put, calls = _refusing_put(cluster, state, refuse_until_tick=10)
+    config = make_config(tmp_path, MODELS, dry_run=False, tick_s=2.0)  # = FakeSource 2 s step
+    redis = FakeRedis()
+    dispatcher = Dispatcher(put)
+    shell = BaselineShell(config, FakeSource(config, cluster, redis), ScriptedPolicy({t: {"b": 3} for t in range(30)}),
+                          dispatcher, redis, lock=OwnerLock(redis, 30, token="me"))
+    lines = _drive(shell, dispatcher, state, 30)
+    # refused at ticks 0, 2, 5 (waits 2 s, 4 s, 8 s from the tick that saw the result), ok at 10
+    assert calls == [0, 2, 5, 10]
+    assert [lines[t]["b"]["action"] for t in range(11)] == [
+        "up", "backoff", "up", "backoff", "backoff", "up", "backoff", "backoff", "backoff", "backoff", "up"]
+    assert lines[6]["b"]["backoff_delay_s"] == 8.0 and lines[6]["b"]["backoff_s"] == 8.0
+    assert cluster.awake["b"] == 3 and all(lines[t]["b"]["action"] == "none" for t in range(12, 30))
+    assert shell.backoff.delay_s("b") is None                       # reset by the success
+    assert 'tre_bl_backoff_skips_total{policy="scripted"} 7' in shell.metrics_text()
+    dispatcher.close(join_s=1.0)
+
+
+def test_backoff_honours_retry_after_and_resets_when_desired_is_awake(tmp_path) -> None:
+    state = {"tick": 0}
+    cluster = FakeCluster(awake={"a": 2, "b": 1, "c": 1})
+    put, calls = _refusing_put(cluster, state, refuse_until_tick=1, retry_after_s=9.0)
+    config = make_config(tmp_path, MODELS, dry_run=False, tick_s=2.0)
+    redis = FakeRedis()
+    dispatcher = Dispatcher(put)
+    shell = BaselineShell(config, FakeSource(config, cluster, redis), ScriptedPolicy({t: {"b": 3} for t in range(8)}),
+                          dispatcher, redis, lock=OwnerLock(redis, 30, token="me"))
+    _drive(shell, dispatcher, state, 8)
+    assert calls == [0, 6]   # the result is seen at tick 1 (t=2 s); 9 s later is tick 6 (t=12 s)
+    # a model whose desired count goes back to awake forgets its backoff
+    state2 = {"tick": 0}
+    cluster2 = FakeCluster(awake={"a": 2, "b": 1, "c": 1})
+    put2, calls2 = _refusing_put(cluster2, state2, refuse_until_tick=1, retry_after_s=9.0)
+    dispatcher2 = Dispatcher(put2)
+    redis2 = FakeRedis()
+    shell2 = BaselineShell(config, FakeSource(config, cluster2, redis2),
+                           ScriptedPolicy({0: {"b": 3}, 1: {"b": 1}, 2: {"b": 3}}), dispatcher2, redis2,
+                           lock=None)
+    lines = _drive(shell2, dispatcher2, state2, 3)
+    assert [lines[t]["b"]["action"] for t in range(3)] == ["up", "none", "up"] and calls2 == [0, 2]
+    dispatcher.close(join_s=1.0)
+    dispatcher2.close(join_s=1.0)
+
+
+def test_backoff_schedule_and_cap() -> None:
+    b = Backoff(tick_s=2.0, max_s=60.0)
+    delays = [b.failed("m", 0) for _ in range(7)]
+    assert delays == [2.0, 4.0, 8.0, 16.0, 32.0, 60.0, 60.0]
+    assert b.failed("m", 0, retry_after_s=90.0) == 90.0          # the SM retry_after wins
+    b.reset("m")
+    assert b.remaining_s("m", 0) is None and b.failed("m", 1000, retry_after_s=0.5) == 2.0
+    assert b.remaining_s("m", 2000) == 1.0 and b.remaining_s("m", 3000) is None
+
+
+# ------------------------------------------------------------------ liveness vs readiness
+
+
+def test_livez_follows_the_loop_not_the_ticks(tmp_path) -> None:
+    config = make_config(tmp_path, MODELS, dry_run=True, max_tick_failures=2, tick_s=0.02, liveness_stall_s=5.0)
+    cluster = FakeCluster(awake={"a": 1, "b": 1, "c": 1})
+    redis = FakeRedis()
+    source = FakeSource(config, cluster, redis, fail=lambda tick: True)   # e.g. the SM is down
+    shell = BaselineShell(config, source, StaticPolicy(), Dispatcher(cluster.put_target), redis)
+    server = make_http_server(shell, 0, host="127.0.0.1")
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        assert _get(base + "/livez")[0] == 503                          # loop not started
+        loop = threading.Thread(target=shell.run, daemon=True)
+        loop.start()
+        assert wait_until(lambda: shell.stats.tick_failures >= 3)
+        assert _get(base + "/healthz")[0] == 503                        # not ready ...
+        assert _get(base + "/livez")[0] == 200                          # ... but alive
+        shell.stop()
+        loop.join(2.0)
+        assert _get(base + "/livez")[0] == 503
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_livez_fails_when_the_loop_is_wedged(tmp_path) -> None:
+    config = make_config(tmp_path, MODELS, dry_run=True, tick_s=0.02, liveness_stall_s=5.0)
+    shell, cluster, redis, dispatcher = _shell(tmp_path, StaticPolicy(), dry_run=True)
+    shell.config = config
+    import time as _time
+
+    shell._running, shell._beat = True, _time.monotonic() - 1000.0  # running, no tick for 1000 s
+    assert not shell.alive()
+    shell._beat = _time.monotonic()
+    assert shell.alive()

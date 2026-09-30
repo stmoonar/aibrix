@@ -32,8 +32,8 @@ from typing import Callable, Optional
 import pytest
 
 from bl_fakes import StubSM, limits, make_config, wait_until
-from tre_baselines.keys import OWNER_KEY, REPLAY_T0_KEY, req_stream_key
-from tre_baselines.loop import BaselineShell, DecisionLog, OwnerLock
+from tre_baselines.keys import CONTROLLER_MODE_KEY, DECISIONS_STREAM, OWNER_KEY, REPLAY_T0_KEY, req_stream_key
+from tre_baselines.loop import ACTIONS, BaselineShell, DecisionLog, OwnerLock
 from tre_baselines.policies import build_policy
 from tre_baselines.sm_client import Dispatcher, SMClient
 from tre_baselines.sources import LiveSource, PodEndpoint
@@ -70,6 +70,7 @@ def _clean(r) -> None:
     keys = r.keys("tre:v2:bl:*")
     if keys:
         r.delete(*keys)
+    r.delete(CONTROLLER_MODE_KEY)  # missing = observe (the tests that need "active" set it)
 
 
 # ------------------------------------------------------------------------ the simulated world
@@ -450,7 +451,7 @@ def _check_lines(lines: list[dict], policy: str) -> None:
         assert REQUIRED <= set(ln), REQUIRED - set(ln)
         assert ln["policy"] == policy and ln["model"] in (A, B)
         assert MIN_R <= ln["clamped"] <= MAX_R and MIN_R <= ln["awake"] <= MAX_R
-        assert ln["action"] in ("none", "up", "down", "inflight_skip", "dry_run")
+        assert ln["action"] in ACTIONS
         assert isinstance(ln["inputs"], dict)
         json.dumps(ln)
     assert len({(ln["model"], ln["tick"]) for ln in lines}) == len(lines)  # one line per model per tick
@@ -510,6 +511,9 @@ def test_low_high_low_scales_up_then_down(tmp_path, redis_url, redis, policy) ->
     assert any(b.get("at_least") for _, b, _ in h.puts) and any(not b.get("at_least") for _, b, _ in h.puts)
     # the decision is mirrored to Redis (TTL) and the stream saw all three kinds
     assert redis.ttl(f"tre:v2:bl:decision:{A}") > 0
+    # every decision line is also in the stream (evidence that survives the pod)
+    streamed = [json.loads(fields["line"]) for _, fields in redis.xrange(DECISIONS_STREAM)]
+    assert len(streamed) == len(lines) and streamed[-1] == lines[-1]
     assert all(h.events.written[k] > 0 for k in ("arr", "ft", "done"))
     if policy == "tokenscale":
         # Go-format events reached the policy: lambda > 0, odd events were counted, not fatal
@@ -552,7 +556,8 @@ def test_sm_refusals_do_not_stop_the_loop(tmp_path, redis_url, redis) -> None:
 
     params = _policy_params("chiron", tmp_path)
     with Harness(tmp_path, redis_url, redis, "chiron", params, dry_run=False, hook=hook) as h:
-        h.phase("high", 6.0, {A: HIGH, B: LOW})
+        # refusal 1 (retry_after 2 s) then refusal 2 (backoff 4 s): the third call ~7 s in
+        h.phase("high", 10.0, {A: HIGH, B: LOW})
         assert h.shell.healthy()
         ticks_before_stop = h.shell.stats.ticks
     lines = h.lines()
@@ -563,6 +568,10 @@ def test_sm_refusals_do_not_stop_the_loop(tmp_path, redis_url, redis) -> None:
     assert results[1]["ok"] is False and results[1]["code"] == 409 and results[1]["error"] == "http_error"
     assert results[1]["detail"] == "writer lock busy"
     assert any(r["ok"] for r in results[2:])                       # it kept trying and got through
+    mine = [ln for ln in lines if ln["model"] == A]
+    assert any(ln["action"] == "backoff" for ln in mine)            # but not every tick
+    a_puts = [p for p in h.puts if p[0] == A]
+    assert len(a_puts) < sum(ln["direction"] == "up" for ln in mine)
     assert max(ln["awake"] for ln in lines if ln["model"] == A) >= 2
     assert ticks_before_stop >= 12 and h.shell.stats.tick_failures == 0
     assert h.shell.stats.sm_failures == 2
@@ -600,3 +609,30 @@ def test_preserve_tier2_overload_scales_up(tmp_path, redis_url, redis) -> None:
     assert any(ln["inputs"]["tier1"].get("inactive") == "tier1_no_replay" for ln in mine)
     assert any("tier2_overload" in ln["reason"] for ln in mine)
     assert any(ln["action"] == "up" for ln in mine) and max(ln["awake"] for ln in mine) >= 2
+
+
+def test_owner_lock_scripts_in_real_redis(redis_url, redis) -> None:
+    a, b = OwnerLock(redis, 5.0, token="a"), OwnerLock(redis, 5.0, token="b")
+    assert a.ensure() and not b.ensure()
+    assert 0 < redis.pttl(OWNER_KEY) <= 5000
+    redis.pexpire(OWNER_KEY, 100)
+    assert a.ensure() and redis.pttl(OWNER_KEY) > 1000          # renewed (compare-and-pexpire)
+    redis.set(OWNER_KEY, "b", px=3000)                           # expired and taken over
+    assert not a.ensure() and redis.get(OWNER_KEY) == "b" and redis.pttl(OWNER_KEY) <= 3000
+    a.release()                                                  # compare-and-delete: not ours
+    assert redis.get(OWNER_KEY) == "b"
+    b.release()
+    assert redis.get(OWNER_KEY) is None
+
+
+def test_controller_active_suspends_actuation(tmp_path, redis_url, redis) -> None:
+    redis.set(CONTROLLER_MODE_KEY, "active")
+    params = _policy_params("chiron", tmp_path)
+    with Harness(tmp_path, redis_url, redis, "chiron", params, dry_run=False) as h:
+        h.phase("high", 3.0, {A: HIGH, B: LOW})
+        assert h.shell.healthy()
+    lines = h.lines()
+    _check_lines(lines, "chiron")
+    assert h.puts == [] and h.world.awake == {A: MIN_R, B: MIN_R}
+    assert "guard_controller_active" in [ln["action"] for ln in lines if ln["model"] == A]
+    assert all(ln["dry_run"] and ln["controller_mode"] == "active" for ln in lines)

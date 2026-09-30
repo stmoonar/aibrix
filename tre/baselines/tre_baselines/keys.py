@@ -13,6 +13,15 @@ DECISION_PREFIX = "tre:v2:bl:decision:"
 DECISION_TTL_S = 3600
 #: STRING, SET NX PX: the one shell allowed to actuate.
 OWNER_KEY = "tre:v2:bl:owner"
+#: STREAM (XADD * MAXLEN ~ DECISIONS_STREAM_MAXLEN), field ``line`` = one decision line as
+#: JSON: every decision of every model, so the evidence survives the pod (its JSONL files
+#: live on an emptyDir).
+DECISIONS_STREAM = "tre:v2:bl:decisions"
+DECISIONS_STREAM_MAXLEN = 100_000
+#: STRING ``active`` | ``observe`` (missing = observe): the TRE controller's run mode, owned
+#: by ``tre_common.rediskeys.CONTROLLER_MODE_KEY`` / ``deploy/scripts/set_run_mode.sh``.
+#: Repeated here so the arm tool does not need ``tre_common``; a test keeps them equal.
+CONTROLLER_MODE_KEY = "tre:v2:controller:mode"
 
 
 def req_stream_key(model: str) -> str:

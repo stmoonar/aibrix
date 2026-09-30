@@ -62,6 +62,9 @@ def test_config_reads_registry_limits_through_common_readers() -> None:
     assert config.tick_s == 2.0
     assert config.sm_url == "http://sm.test:8000"
     assert config.sleep_path == "scale_down"
+    assert config.scrape_timeout_s == 2.5 and config.decision_stream is True
+    assert config.backoff_max_s == 60.0 and config.liveness_stall_s == 120.0
+    assert load_config({**ENV, "TRE_BL_DECISION_STREAM": "false"}).decision_stream is False
     from tre_common.registry import load_registry
 
     registry = load_registry(REGISTRY)
@@ -91,3 +94,10 @@ def test_config_rejects_bad_values(tmp_path) -> None:
     assert cfg.policy_params == {"theta": 0.8, "window_s": 30}
     assert cfg.dry_run is False
     assert load_config({**ENV, "TRE_BL_POLICY_CONFIG": str(tmp_path / "missing.yaml")}).policy_params == {}
+
+
+def test_controller_mode_key_matches_tre_common() -> None:
+    from tre_common.rediskeys import CONTROLLER_MODE_KEY as COMMON_KEY
+    from tre_baselines.keys import CONTROLLER_MODE_KEY
+
+    assert CONTROLLER_MODE_KEY == COMMON_KEY

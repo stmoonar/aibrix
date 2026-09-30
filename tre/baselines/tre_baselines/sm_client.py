@@ -18,7 +18,7 @@ Contract (service manager on main, ``tre_sm/api/v2.py``):
   and falls back to the raw text.
 
 The dispatcher gives every model one worker thread and at most one SM call in flight;
-the tick never waits for the SM.
+the tick never waits for the SM. :class:`Backoff` spaces out retries after refusals.
 """
 from __future__ import annotations
 
@@ -183,6 +183,49 @@ def target_body(direction: str, target: int, *, sleep_path: str, drain_budget_s:
             body["drain_budget_s"] = float(drain_budget_s)
         return body
     raise ValueError(f"unknown direction {direction!r}")
+
+
+DEFAULT_BACKOFF_MAX_S = 60.0
+
+
+class Backoff:
+    """Per-model exponential backoff after a failed SM call (the MVP has no arbiter, so a
+    model the SM keeps refusing would otherwise be re-sent every tick).
+
+    The first failure waits ``max(retry_after_s, tick_s)``; each further consecutive
+    failure doubles the previous wait (capped at ``max_s``) but never waits less than the
+    SM's ``retry_after_s``. :meth:`reset` (a successful call, or the policy's desired count
+    back at the awake count) clears it. Times are the snapshot's Redis-clock ms.
+    """
+
+    def __init__(self, tick_s: float, max_s: float = DEFAULT_BACKOFF_MAX_S) -> None:
+        self.tick_s = max(0.0, float(tick_s))
+        self.max_s = max(self.tick_s, float(max_s))
+        self._delay_s: dict[str, float] = {}
+        self._until_ms: dict[str, int] = {}
+
+    def failed(self, model: str, now_ms: int, retry_after_s: Optional[float] = None) -> float:
+        retry = max(0.0, float(retry_after_s)) if retry_after_s is not None else 0.0
+        prev = self._delay_s.get(model)
+        delay = max(retry, self.tick_s) if prev is None else max(retry, prev * 2.0)
+        delay = max(min(delay, self.max_s), retry)  # the SM's own retry_after is honoured
+        self._delay_s[model] = delay
+        self._until_ms[model] = int(now_ms) + int(round(delay * 1000.0))
+        return delay
+
+    def remaining_s(self, model: str, now_ms: int) -> Optional[float]:
+        """Seconds still to wait, or None when a call may be sent."""
+        until = self._until_ms.get(model)
+        if until is None or int(now_ms) >= until:
+            return None
+        return (until - int(now_ms)) / 1000.0
+
+    def reset(self, model: str) -> None:
+        self._delay_s.pop(model, None)
+        self._until_ms.pop(model, None)
+
+    def delay_s(self, model: str) -> Optional[float]:
+        return self._delay_s.get(model)
 
 
 @dataclass(frozen=True)

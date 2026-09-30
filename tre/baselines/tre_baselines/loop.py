@@ -2,16 +2,28 @@
 
 * Dry-run (the default) logs every decision and never calls the SM. A shell configured
   to actuate falls back to dry-run for any tick in which it does not hold the owner lock
-  ``tre:v2:bl:owner`` (``SET NX PX``, renewed every tick), so two shells never actuate.
+  ``tre:v2:bl:owner`` (``SET NX PX``, renewed every tick by a compare-and-pexpire script),
+  so two shells never actuate.
+* Controller guard: a shell configured to actuate reads the TRE controller's run mode
+  (``tre:v2:controller:mode``, missing = observe, as ``tools/arm.py``) every tick; unless it
+  is ``observe`` (or the read fails) the tick is dry-run and every would-be SM call is
+  logged as ``guard_controller_active`` (metric ``tre_bl_controller_guard``), so the TRE
+  controller and a baseline never scale the same models.
 * The dispatcher is asynchronous: a model whose previous SM call is still running gets
   ``inflight_skip`` (not queued); the tick never waits for the SM.
 * No arbiter in the MVP: scale-downs are submitted before scale-ups in the same tick and
-  SM refusals are only logged (``sm_result`` on the model's next decision line).
+  SM refusals are logged (``sm_result`` on the model's next decision line). After a failed
+  call the model backs off (:class:`~tre_baselines.sm_client.Backoff`: ``max(retry_after_s,
+  tick_s)``, doubling, capped at ``TRE_BL_BACKOFF_MAX_S``); while it waits its line says
+  ``backoff`` and no call is sent. A success, or the desired count back at awake, resets it.
 * One JSONL line per model per tick to ``$TRE_BL_LOG_DIR/decisions-<policy>-<YYYYMMDD>.jsonl``
   (date of the Redis clock, UTC), mirrored to ``tre:v2:bl:decision:<model>`` (TTL 1 h)
-  unless ``TRE_BL_WRITE_REDIS=false``.
+  unless ``TRE_BL_WRITE_REDIS=false``, and appended to the stream ``tre:v2:bl:decisions``
+  (MAXLEN ~ 100000) unless ``TRE_BL_DECISION_STREAM=false``.
 * A tick that raises is logged and skipped; ``max_tick_failures`` consecutive failures
-  turn ``/healthz`` into 503.
+  turn ``/healthz`` (readiness) into 503. ``/livez`` (liveness) only says whether the loop
+  is running and has ticked within ``TRE_BL_LIVENESS_STALL_S``, so an SM / Redis outage
+  never restarts the pod.
 """
 from __future__ import annotations
 
@@ -28,15 +40,24 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Mapping, Optional, Protocol
 
-from tre_baselines.keys import DECISION_TTL_S, OWNER_KEY, decision_key
+from tre_baselines.keys import (
+    CONTROLLER_MODE_KEY,
+    DECISION_TTL_S,
+    DECISIONS_STREAM,
+    DECISIONS_STREAM_MAXLEN,
+    OWNER_KEY,
+    decision_key,
+)
 from tre_baselines.policies.base import Decision
-from tre_baselines.sm_client import Completed, Dispatcher
+from tre_baselines.sm_client import Backoff, Completed, Dispatcher
 from tre_baselines.snapshot import ClusterSnapshot
 
 LOG = logging.getLogger(__name__)
 
 REVERSAL_WINDOW_MS = 60_000
-ACTIONS = ("none", "up", "down", "inflight_skip", "dry_run")
+ACTIONS = ("none", "up", "down", "inflight_skip", "dry_run", "backoff", "guard_controller_active")
+#: Controller modes under which a baseline may actuate (missing key = observe).
+_CONTROLLER_OK = (None, "", "observe")
 
 
 class Source(Protocol):
@@ -47,8 +68,22 @@ def clamp(desired: int, lo: int, hi: int) -> int:
     return max(int(lo), min(int(hi), int(desired)))
 
 
+#: KEYS[1] = lock, ARGV[1] = token, ARGV[2] = ttl ms: renew only while the value is ours
+#: (atomic: a GET-then-PEXPIRE could extend a lock another shell took in between).
+RENEW_LUA = (
+    "if redis.call('get', KEYS[1]) == ARGV[1] then "
+    "return redis.call('pexpire', KEYS[1], ARGV[2]) else return 0 end"
+)
+#: KEYS[1] = lock, ARGV[1] = token: delete only while the value is ours.
+RELEASE_LUA = (
+    "if redis.call('get', KEYS[1]) == ARGV[1] then "
+    "return redis.call('del', KEYS[1]) else return 0 end"
+)
+
+
 class OwnerLock:
-    """``SET key token NX PX ttl``; renewed by ``PEXPIRE`` while the value is ours."""
+    """``SET key token NX PX ttl``; renewed (compare-and-pexpire) and released
+    (compare-and-delete) by Lua scripts, so neither can touch another shell's lock."""
 
     def __init__(self, redis: Any, ttl_s: float, *, key: str = OWNER_KEY, token: Optional[str] = None) -> None:
         self._redis = redis
@@ -56,14 +91,10 @@ class OwnerLock:
         self.key = key
         self.token = token or f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
 
-    @staticmethod
-    def _text(value: Any) -> Any:
-        return value.decode("utf-8", "replace") if isinstance(value, bytes) else value
-
     def ensure(self) -> bool:
         try:
-            if self._text(self._redis.get(self.key)) == self.token:
-                return bool(self._redis.pexpire(self.key, self._ttl_ms))
+            if int(self._redis.eval(RENEW_LUA, 1, self.key, self.token, self._ttl_ms) or 0) == 1:
+                return True
             return bool(self._redis.set(self.key, self.token, nx=True, px=self._ttl_ms))
         except Exception as exc:
             LOG.warning("owner lock check failed: %s", exc)
@@ -71,8 +102,7 @@ class OwnerLock:
 
     def release(self) -> None:
         try:
-            if self._text(self._redis.get(self.key)) == self.token:
-                self._redis.delete(self.key)
+            self._redis.eval(RELEASE_LUA, 1, self.key, self.token)
         except Exception as exc:
             LOG.warning("owner lock release failed: %s", exc)
 
@@ -94,6 +124,10 @@ class ShellStats:
     reversals: dict[str, int] = field(default_factory=dict)
     event_lag_s: dict[str, float] = field(default_factory=dict)
     scrape_failures: int = 0
+    controller_mode: Optional[str] = None
+    controller_guard: bool = False
+    guard_ticks: int = 0
+    backoff_skips: int = 0
 
 
 class DecisionLog:
@@ -135,7 +169,10 @@ class BaselineShell:
         self.lock = lock
         self.log = decision_log or DecisionLog(config.log_dir, config.policy)
         self.stats = ShellStats()
+        self.backoff = Backoff(config.tick_s, getattr(config, "backoff_max_s", 60.0))
         self._tick = 0
+        self._running = False
+        self._beat = 0.0
         self._last_dispatch: dict[str, tuple[str, int]] = {}
         self._stop = threading.Event()
         self._stats_lock = threading.Lock()
@@ -161,11 +198,35 @@ class BaselineShell:
             return True
         return self.lock.ensure()
 
+    def _controller_mode(self) -> tuple[Optional[str], bool]:
+        """(raw mode, guard). Guard = the controller may be acting (not observe) or its
+        mode cannot be read (fail closed)."""
+        if self.redis is None:
+            return "<no redis>", True
+        try:
+            raw = self.redis.get(CONTROLLER_MODE_KEY)
+        except Exception as exc:
+            LOG.warning("controller mode read failed (guard on): %s", exc)
+            return "<read failed>", True
+        mode = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw
+        mode = None if mode is None else str(mode).strip().lower()
+        return mode, mode not in _CONTROLLER_OK
+
     def tick_once(self) -> list[dict]:
-        results = self._collect_results()
         owner = self._owner()
-        effective_dry = bool(self.config.dry_run or not owner)
+        mode, guard = (None, False) if self.config.dry_run else self._controller_mode()
+        if guard and not self.stats.controller_guard:
+            LOG.warning("TRE controller mode is %r (%s), not observe: actuation suspended", mode,
+                        CONTROLLER_MODE_KEY)
+        effective_dry = bool(self.config.dry_run or not owner or guard)
         snap = self.source.gather(self._tick)
+        # After the gather: a tick whose gather raises leaves the results for the next one.
+        results = self._collect_results()
+        for model, done in results.items():
+            if done.result.ok:
+                self.backoff.reset(model)
+            else:
+                self.backoff.failed(model, snap.now_ms, done.result.retry_after_s)
         decisions: Mapping[str, Decision] = self.policy.decide(snap) or {}
 
         planned: list[dict] = []
@@ -186,10 +247,16 @@ class BaselineShell:
         lines: list[dict] = []
         for item in planned:
             model, direction = item["model"], item["direction"]
+            wait_s = None
             if direction == "none":
                 action = "none"
+                self.backoff.reset(model)  # the desired count is back at awake
+            elif guard:
+                action = "guard_controller_active"
             elif effective_dry:
                 action = "dry_run"
+            elif (wait_s := self.backoff.remaining_s(model, snap.now_ms)) is not None:
+                action = "backoff"
             elif self.dispatcher.submit(model, direction, item["clamped"]):
                 action = direction
                 self._note_dispatch(model, direction, snap.now_ms)
@@ -205,6 +272,11 @@ class BaselineShell:
                 "owner": owner,
                 "inflight": self.dispatcher.inflight(model),
             }
+            if mode is not None or guard:
+                line["controller_mode"] = mode
+            if wait_s is not None:
+                line["backoff_s"] = round(wait_s, 3)
+                line["backoff_delay_s"] = self.backoff.delay_s(model)
             done = results.get(model)
             if done is not None:
                 line["sm_result"] = {
@@ -215,6 +287,8 @@ class BaselineShell:
                 key = (model, action)
                 self.stats.actions[key] = self.stats.actions.get(key, 0) + 1
                 self.stats.decisions += 1
+                if action == "backoff":
+                    self.stats.backoff_skips += 1
 
         self.log.write(lines)
         self._write_redis(lines)
@@ -224,6 +298,9 @@ class BaselineShell:
             self.stats.consecutive_failures = 0
             self.stats.effective_dry_run = effective_dry
             self.stats.owner = owner
+            self.stats.controller_mode = mode
+            self.stats.controller_guard = guard
+            self.stats.guard_ticks += int(guard)
             self.stats.last_tick_ms = snap.now_ms
             self.stats.event_lag_s = dict(extra.get("event_lag_s") or {})
             self.stats.scrape_failures += int(extra.get("scrape_failed") or 0)
@@ -239,16 +316,27 @@ class BaselineShell:
             self._last_dispatch[model] = (direction, now_ms)
 
     def _write_redis(self, lines: list[dict]) -> None:
-        if not self.config.write_redis or self.redis is None:
+        if self.redis is None:
             return
+        to_key = bool(self.config.write_redis)
+        to_stream = bool(getattr(self.config, "decision_stream", False))
         for line in lines:
-            try:
-                self.redis.set(decision_key(line["model"]), json.dumps(line, sort_keys=True, default=str),
-                               ex=DECISION_TTL_S)
-            except Exception as exc:
-                with self._stats_lock:
-                    self.stats.redis_write_failures += 1
-                LOG.warning("decision key write failed for %s: %s", line["model"], exc)
+            text = json.dumps(line, sort_keys=True, default=str)
+            if to_key:
+                try:
+                    self.redis.set(decision_key(line["model"]), text, ex=DECISION_TTL_S)
+                except Exception as exc:
+                    with self._stats_lock:
+                        self.stats.redis_write_failures += 1
+                    LOG.warning("decision key write failed for %s: %s", line["model"], exc)
+            if to_stream:
+                try:
+                    self.redis.xadd(DECISIONS_STREAM, {"line": text}, maxlen=DECISIONS_STREAM_MAXLEN,
+                                    approximate=True)
+                except Exception as exc:
+                    with self._stats_lock:
+                        self.stats.redis_write_failures += 1
+                    LOG.warning("decision stream write failed for %s: %s", line["model"], exc)
 
     def safe_tick(self) -> Optional[list[dict]]:
         try:
@@ -268,22 +356,33 @@ class BaselineShell:
         period = float(self.config.tick_s)
         next_at = time.monotonic()
         done = 0
-        while not self._stop.is_set():
-            self.safe_tick()
-            done += 1
-            if max_ticks is not None and done >= max_ticks:
-                break
-            next_at += period
-            delay = next_at - time.monotonic()
-            if delay < 0:  # overran: skip the missed slots, never burst
-                next_at = time.monotonic()
-                delay = 0.0
-            self._stop.wait(delay)
+        self._beat = time.monotonic()
+        self._running = True
+        try:
+            while not self._stop.is_set():
+                self.safe_tick()
+                self._beat = time.monotonic()
+                done += 1
+                if max_ticks is not None and done >= max_ticks:
+                    break
+                next_at += period
+                delay = next_at - time.monotonic()
+                if delay < 0:  # overran: skip the missed slots, never burst
+                    next_at = time.monotonic()
+                    delay = 0.0
+                self._stop.wait(delay)
+        finally:
+            self._running = False
 
     def stop(self) -> None:
         self._stop.set()
 
     # -- health / metrics -------------------------------------------------------------
+
+    def alive(self) -> bool:
+        """Liveness: the loop is running and finished a tick (failed or not) recently."""
+        stall = max(float(getattr(self.config, "liveness_stall_s", 120.0)), 2.0 * float(self.config.tick_s))
+        return self._running and (time.monotonic() - self._beat) <= stall
 
     def healthy(self) -> bool:
         with self._stats_lock:
@@ -302,6 +401,8 @@ class BaselineShell:
                 "dry_run_effective": s.effective_dry_run,
                 "owner": s.owner,
                 "last_tick_ms": s.last_tick_ms,
+                "controller_mode": s.controller_mode,
+                "controller_guard": s.controller_guard,
             }
 
     def metrics_text(self) -> str:
@@ -331,6 +432,12 @@ class BaselineShell:
                 f'tre_bl_dry_run{{policy="{policy}"}} {int(s.effective_dry_run)}',
                 "# TYPE tre_bl_owner gauge",
                 f'tre_bl_owner{{policy="{policy}"}} {int(s.owner)}',
+                "# TYPE tre_bl_controller_guard gauge",
+                f'tre_bl_controller_guard{{policy="{policy}"}} {int(s.controller_guard)}',
+                "# TYPE tre_bl_controller_guard_ticks_total counter",
+                f'tre_bl_controller_guard_ticks_total{{policy="{policy}"}} {s.guard_ticks}',
+                "# TYPE tre_bl_backoff_skips_total counter",
+                f'tre_bl_backoff_skips_total{{policy="{policy}"}} {s.backoff_skips}',
                 "# TYPE tre_bl_actions_total counter",
             ]
             for (model, action), count in sorted(s.actions.items()):
@@ -347,7 +454,10 @@ class BaselineShell:
 def make_http_server(shell: BaselineShell, port: int, host: str = "0.0.0.0") -> ThreadingHTTPServer:
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802
-            if self.path.startswith("/healthz"):
+            if self.path.startswith("/livez"):
+                ok = shell.alive()
+                self._send(200 if ok else 503, b"ok\n" if ok else b"loop not running\n", "text/plain")
+            elif self.path.startswith("/healthz"):
                 doc = shell.health_doc()
                 body = json.dumps(doc, sort_keys=True).encode("utf-8")
                 self._send(200 if doc["ok"] else 503, body, "application/json")
