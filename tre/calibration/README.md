@@ -78,50 +78,66 @@ files for either layout (old runs: the new entries are empty).
   fairness loop may both write a member for one window; dedup by `window_end_ms`.
 * **Clocks: everything in redis time, checked, never shifted.** The driver reads redis
   `TIME` right before a cell's load and right after it drains; the dumps cover
-  `[redis_start - margin, redis_end + margin]` (`clock.range_ms`). The driver's own clock
-  (`start_ms` / `end_ms`, and `redis_minus_local_ms` in each probe) is recorded for audit
-  only, so a skewed driver cannot misplace a dump. The gateway stamps its rounds
+  `[redis_start - margin, redis_end + margin]` (`clock.range_ms`), so a skewed driver
+  cannot misplace a dump. The driver's own clock stays what the *client* files use
+  (`start_ms` / `end_ms`, the per-request log, the window CSV, the vLLM 1 Hz files):
+  to join those with the redis dumps, use the `redis_minus_local_ms` of
+  `clock.cell_start.probe` / `cell_end.probe`. The gateway stamps its rounds
   (`now - now % 10 s`) with its node's clock and the controller's `window_end_ms` is a
   gateway round (the phase-aligned sampler publishes window `B` only once the gateway
   wrote its tick `B`), so both must be in redis's time domain; that is *checked*, not
   estimated:
-  - gateway: redis `TIME` minus the newest round stamp of the model's pods lies in
-    `[-tol, round + tol]` = `[-2, 12]` s (its write phase);
-  - controller: redis `TIME` minus the newest `window_end_ms` lies in
-    `[-tol, round + read offset + tick + tol]` = `[-2, 26.5]` s (2-17 s at the base read
-    offset of 2 s; the offset adapts up to 9.5 s behind a late gateway; tick = the 5 s
-    rescue loop);
+  - gateway: its ticker started with the process, so it writes round `S` at `S + d` with
+    a fixed write delay `d` in `[0, 10 s)` (the newest stamp alone trails redis by
+    `[d, d + 10 s)`, which cannot tell a late ticker from a slow clock). The check waits
+    for the next round (at most 12 s) and requires redis `TIME` at first sight minus its
+    stamp in `[-tol, round + tol]` = `[-2, 12]` s;
+  - controller: the newest `window_end_ms` must be on the 10 s grid (a free-running
+    controller stamps its own clock and is refused) and trail redis `TIME` by
+    `[-tol, round + read offset + tick + tol]` = `[-2, 31.5]` s (2-17 s at the base read
+    offset of 2 s and the 5 s rescue loop; the offset adapts up to 9.5 s behind a late
+    gateway, and with the fast loop disabled only the 10 s fairness loop writes);
   - gateway late writes: a doc may not appear more than one round + tol after its stamp
     (a second writer on a slow node, which the newest stamp hides). Every observation -
     the start mark, the end mark, the capture's dump, each backfill - fingerprints the
-    docs it saw in the range; the next one fails the gateway on any older-stamped doc the
-    previous one did not see.
+    docs it saw in the range; the next one fails the gateway on any older-stamped doc, of
+    a pod it already listed, that the previous one did not see.
 
   Before a run every entry point of `calibration_campaign` checks each model and **refuses
-  to start** on a failure, printing the offsets (a standalone `r3_grid --capture-dir` cell
-  refuses too, `--clock-domain-check refuse`; the campaign passes `flag` to its cells).
-  Every cell is checked again at its start and end (`clock.cell_start` / `cell_end`); a
-  failed source gets `clock_domain: clock_domain_mismatch` on its dump (the controller
-  also when only the gateway failed: its windows are built from the gateway's docs),
-  `cell_meta.json["clock_domain_mismatch"]` says why, the driver prints a warning, and the
-  dump is kept unshifted but **never marked complete**. Labels and fits use the client's
-  own records only, so a mismatch costs this supplementary evidence, nothing else.
-  The check cannot see a gateway offset below one round + tol (12 s); the default margin
-  (`--capture-margin-ms`) is one window + one round + that 12 s = 52 s at 30 s windows, so
-  such an offset still lands inside the dump and before its tail. The gateway's write
-  phase is still timed once per cell (waiting at most one round + 2 s for its next write,
-  `--gateway-flush-wait-s`) and recorded under `flush_wait`, for audit only.
+  to start** on a failure, printing the reasons (a redis it cannot reach fails too: pass
+  `--redis-url` from a host). A standalone `r3_grid --capture-dir` cell is its own run and
+  refuses the same way (`--clock-domain-check refuse`); the campaign passes `flag` to its
+  cells. Every cell is checked again at its start and end (`clock.cell_start` /
+  `cell_end`); a failed source gets `clock_domain: clock_domain_mismatch` on its dump (the
+  controller also when only the gateway failed: its windows are built from the gateway's
+  docs), `cell_meta.json["clock_domain_mismatch"]` says why, the driver prints a warning,
+  and the dump is kept unshifted but **never marked complete**. `clock.domain` is the
+  verdict at the cell; a later backfill may mark a dump it re-dumps, so the per-dump
+  `clock_domain` is authoritative. Labels and fits use the client's own records only, so
+  a mismatch costs this supplementary evidence, nothing else.
+  The check cannot see a gateway offset up to one round + tol (12 s: that far ahead looks
+  like a late ticker, that far behind like an early one); the default margin
+  (`--capture-margin-ms`) is one window + one round + that 12 s = 52 s at 30 s windows
+  (a smaller one is refused) and the tail includes it too, so such an offset still lands
+  inside the dump and before its tail. `--window-ms` must be the controller's
+  `TRE_METRICS_WINDOW_MS` (the campaign's metrics window). Each mark waits for one
+  gateway round (~5 s, at most 12 s); the separate wait before the dump
+  (`--gateway-flush-wait-s`) defaults to 0 since the end mark has just waited.
 * **Completeness and backfill.** A dump is `complete` when it reached `tail_ms` (the last
-  10 s grid point one round inside `range_ms`: the last controller window that can hold
-  data of the cell, redis end + 40 s with the default margin) *and* its `clock_domain` is
-  `ok`. Right after a cell the controller has not processed those windows yet, so both
-  dumps are usually short (`reached_tail: false`) and the cell directory gets a
-  `BACKFILL_PENDING` marker. The next cell's driver re-dumps every pending cell before it
-  starts its load, and the campaign's finalize does the last one (waiting at most 90 s for
-  redis time to pass the tail plus the controller's largest normal lag). Each backfill runs
-  the clock-domain check again: rows added after a failed check make that dump
-  `clock_domain_mismatch`;
-  by hand: `python -m scripts.calibration_capture backfill <run dir> --redis-url <url>`
+  10 s grid window end whose window can hold data of the cell, a blind-spot offset
+  included: `floor((redis_end + window + 12 s - 1 ms) / 10 s) * 10 s`, i.e. redis end +
+  32..41 s at 30 s windows), its `clock_domain` is `ok` and, for the gateway docs, its
+  head was read before the gateway's 30 min retention could trim it
+  (`head_within_retention`; a cell longer than ~29 min is never complete). Right after a
+  cell the controller has not processed those windows yet, so both dumps are usually
+  short (`reached_tail: false`) and the cell directory gets a `BACKFILL_PENDING` marker.
+  The next cell's driver re-dumps every pending cell before it starts its load, and the
+  campaign's finalize does the last one (waiting at most 90 s for redis time to pass the
+  tail plus the controller's largest normal lag). Each backfill lists the model's pods
+  again (a pod that came up in the tail is kept) and runs the clock-domain check again:
+  rows added after a failed check, or late-written docs, make that dump
+  `clock_domain_mismatch`. By hand:
+  `python -m scripts.calibration_capture backfill <run dir> --redis-url <url>`
   (within 30 min for the gateway docs, ~24 h for the controller history). A re-dump
   replaces a file only when every row of the old file is still in redis (otherwise the old
   file is kept and the backfill record says why); every re-dump is logged in
@@ -148,9 +164,9 @@ vLLM metrics 73 KB (median row 1.3 KB, keyframe 3.2 KB), gateway docs 209 KB (hi
 ~2.2 KB, inst ~0.33 KB per pod and round), controller ticks 4 KB, `cell_meta.json`
 19 KB; parsing costs ~1.3 ms per scrape. A full 12 h, 3-model campaign adds roughly
 0.4-0.7 GB (vLLM metrics 0.2-0.4 GB at 1.3-3.2 KB/s per pod, gateway docs ~0.3 GB for
-~20 ready pods, the rest < 20 MB) against ~3.5 GB of existing output. Time: the write
-phase wait (~5 s, at most 12 s) runs after every cell, the clock checks take a few ms
-(each failed check is retried twice, 4 s apart), the backfill well under a second per
+~20 ready pods, the rest < 20 MB) against ~3.5 GB of existing output. Time: the clock
+check at each cell's start and end waits for one gateway round (~5 s each, at most 12 s;
+a failed check is retried twice, 4 s apart), the backfill takes well under a second per
 cell.
 
 ### Switches
@@ -160,5 +176,6 @@ supplement, M acceptance set, T14) captures by default through `campaign.cell_co
 `--no-capture-extras` turns it off for all of them. `r3_grid` alone captures only with
 `--capture-dir` (`--no-vllm-metrics-capture`, `--no-gateway-dump`,
 `--no-controller-ticks` drop one part). Nothing in the capture can fail or void a cell:
-errors are recorded in `cell_meta.json["errors"]`. The only refusal is the run-level
-clock-domain check above (before any load is sent).
+errors are recorded in `cell_meta.json["errors"]`. The only refusal is the clock-domain
+check above, before any load is sent: once per campaign run, or per cell for a
+standalone `r3_grid` (`--clock-domain-check refuse`, the default there).

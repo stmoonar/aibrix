@@ -893,7 +893,9 @@ def run_schedule_cell(args, store, spec, redis_client=None) -> tuple[list, "open
                   f"{json.dumps(meta['clock_domain_mismatch'], sort_keys=True)}")
         print(f"cell {cell_id} capture -> {layout.cell_dir}: gateway docs "
               f"{sum(sum(v.values()) for v in (gd.get('docs') or {}).values())}, "
-              f"write phase {((gd.get('flush_wait') or {}).get('write_phase_ms'))} ms, "
+              f"gateway write delay "
+              f"{((((meta.get('clock') or {}).get('cell_end') or {}).get('check') or {}).get('gateway') or {}).get('write_delay_ms')}"
+              f" ms, "
               f"controller ticks {ct.get('members')}"
               + (f"; capture errors: {meta['errors']}" if meta.get("errors") else ""))
     if guard.unrecognised_proxy_failures:
@@ -1221,7 +1223,8 @@ def parse_args(argv: Optional[Sequence[str]] = None):
                     help="rows between full snapshots in the per-pod vLLM metrics files")
     ap.add_argument("--gateway-flush-wait-s", type=float, default=None,
                     help="after the cell, wait at most this long for the gateway's next redis "
-                         "write before dumping (0 = no wait; default one round + 2 s)")
+                         "write before dumping (default 0: the end-of-cell clock check has just "
+                         "waited for a gateway round)")
     ap.add_argument("--clock-domain-check", default="refuse", choices=["refuse", "flag"],
                     help="with --capture-dir: when the gateway's round stamps or the controller's "
                          "window ends are not in redis's time domain at the cell start, refuse the "
@@ -1237,7 +1240,8 @@ def parse_args(argv: Optional[Sequence[str]] = None):
                     help="largest phase offset the controller reads a window at (its adapted "
                          "TRE_METRICS_PHASE_OFFSET_MS; cap 9.5 s)")
     ap.add_argument("--controller-tick-ms", type=int, default=_capture.DEFAULT_CONTROLLER_TICK_MS,
-                    help="controller loop tick that writes the decision history (rescue interval)")
+                    help="slowest controller loop tick that writes the decision history (fairness "
+                         "loop, 10 s; the rescue loop writes every 5 s when enabled)")
     ap.add_argument("--registry-configmap", default="tre-v2-registry",
                     help="ConfigMap (in --control-namespace) holding the live registry, hashed "
                          "into the run manifest ('' = skip)")
@@ -1309,7 +1313,7 @@ def parse_args(argv: Optional[Sequence[str]] = None):
     if args.vllm_keyframe_every is None:
         args.vllm_keyframe_every = _capture.DEFAULT_KEYFRAME_EVERY
     if args.gateway_flush_wait_s is None:
-        args.gateway_flush_wait_s = _capture.DEFAULT_GATEWAY_FLUSH_WAIT_S
+        args.gateway_flush_wait_s = _capture.DEFAULT_CAPTURE_FLUSH_WAIT_S
     try:
         capture_clock_config(args)  # fail now on a margin that would cut the cell's windows
     except ValueError as exc:

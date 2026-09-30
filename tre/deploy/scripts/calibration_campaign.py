@@ -559,8 +559,8 @@ def require_capture_clock_domains(args, models: Optional[Sequence[str]] = None) 
     except capture.ClockDomainMismatch as exc:
         raise SystemExit(str(exc)) from None
     for model, v in verdicts.items():
-        print(f"clock domains ({model}, vs redis TIME): gateway lag {v['gateway']['lag_ms']} ms, "
-              f"controller lag {v['controller']['lag_ms']} ms")
+        print(f"clock domains ({model}, vs redis TIME): gateway write delay "
+              f"{v['gateway'].get('write_delay_ms')} ms, controller lag {v['controller'].get('lag_ms')} ms")
     return verdicts
 
 
