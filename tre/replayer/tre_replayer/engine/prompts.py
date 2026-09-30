@@ -29,7 +29,8 @@ The key is hashed with BLAKE2b (not :func:`hash`, which is salted per process) i
 
 Modes
 -----
-:data:`MODE_NATURAL` (the default) sends English prose - see
+:data:`MODE_NATURAL` (the default) sends prose - English, Chinese or (the default,
+``corpus_lang="mix"``) the two interleaved 1:1 by token, see
 :mod:`tre_replayer.engine.corpus` - fitted to the exact target token count with the
 model's own tokenizer, loaded from local disk (see
 :mod:`tre_replayer.engine.model_tokenizer`). It keeps every property the calibration
@@ -56,11 +57,30 @@ vocabularies, not a guarantee.
 
 All three modes hold the same two invariants: content is a pure function of the seed
 key, and two different seed keys differ within the first few tokens by construction.
+
+Endpoint
+--------
+``api`` (:mod:`tre_replayer.engine.api`) says which endpoint will carry the prompt, and
+therefore what ``token_count`` counts. ``completions`` (the default, unchanged) counts
+the string as the completions path does. ``chat`` counts the prompt the engine builds
+from one user message - the chat template around the content - so the content is
+``token_count`` minus the template's tokens and ``usage.prompt_tokens`` is
+``token_count``; the corpus mix ratio applies to the content. ``chat`` needs
+:data:`MODE_NATURAL` (a token-id list is not a message, and the text mode's length is
+only nominal).
 """
 from __future__ import annotations
 
 import hashlib
 import random
+
+# Re-exported: the senders take their corpus defaults from here, next to DEFAULT_MODE.
+from tre_replayer.engine.api import API_CHAT, API_COMPLETIONS, DEFAULT_API, check_api_mode  # noqa: F401
+from tre_replayer.engine.corpus import (  # noqa: F401
+    CORPUS_LANGS,
+    DEFAULT_CORPUS_LANG,
+    DEFAULT_ZH_RATIO,
+)
 
 MODE_TOKEN_IDS = "token_ids"
 MODE_TEXT = "text"
@@ -185,12 +205,22 @@ def build_natural_prompt(
     model: str | None = None,
     tokenizer=None,
     tokenizer_path: str | None = None,
+    corpus_lang: str = DEFAULT_CORPUS_LANG,
+    zh_ratio: float = DEFAULT_ZH_RATIO,
+    api: str = DEFAULT_API,
 ) -> str:
-    """English prose of *exactly* ``token_count`` tokens, unique per ``seed_key``.
+    """Prose of *exactly* ``token_count`` tokens, unique per ``seed_key``.
+
+    ``corpus_lang`` picks the text (see :mod:`tre_replayer.engine.corpus`): ``en`` is the
+    English bank, byte-identical to the builder before the other languages existed;
+    ``zh`` the Chinese bank; ``mix`` (default) interleaves the two with ``zh_ratio`` of
+    the body's tokens - counted with *this* model's tokenizer - in Chinese.
 
     ``token_count`` is the count vLLM will report as ``usage.prompt_tokens`` - special
     tokens included - not the plain token count, because that is the number the caller
-    asked the engine for and the number the calibration grid is indexed by.
+    asked the engine for and the number the calibration grid is indexed by. Under
+    ``api="chat"`` that count includes the chat template the engine wraps the returned
+    content in (:func:`tre_replayer.engine.model_tokenizer.for_api`).
 
     ``tokenizer`` (a :class:`~tre_replayer.engine.model_tokenizer.ModelTokenizer`) is the
     seam the tests inject; otherwise ``model`` is resolved to a tokenizer on local disk.
@@ -203,9 +233,11 @@ def build_natural_prompt(
     carrying the seed - is never touched, which is what preserves uniqueness.
     """
     from tre_replayer.engine import corpus
+    from tre_replayer.engine.model_tokenizer import for_api
 
     target = max(1, int(token_count))
     tok = tokenizer if tokenizer is not None else _load_tokenizer(model, tokenizer_path)
+    tok = for_api(tok, api)
     # The tokenizer's own special tokens are part of what vLLM counts, so a prompt of one
     # token below them is unrepresentable - and an empty prompt is not a request.
     minimum = tok.overhead + 1
@@ -215,6 +247,10 @@ def build_natural_prompt(
             f"tokens ({tok.overhead} special token(s) plus at least one of its own); "
             f"asked for {target}"
         )
+
+    check_corpus(corpus_lang, zh_ratio)
+    if corpus_lang != corpus.LANG_EN:
+        return _fit_budgeted(target, prompt_seed(seed_key), tok, corpus_lang, zh_ratio, model)
 
     builder = corpus.TextBuilder(prompt_seed(seed_key))
     text = builder.ensure_words(int(target * WORDS_PER_TOKEN) + 24)
@@ -238,6 +274,60 @@ def build_natural_prompt(
     )
 
 
+def check_corpus(corpus_lang: str, zh_ratio: float) -> None:
+    """Refuse an unknown language or an out-of-range ratio - loudly, before any work."""
+    from tre_replayer.engine import corpus
+
+    if corpus_lang not in corpus.CORPUS_LANGS:
+        raise ValueError(
+            f"unknown corpus language: {corpus_lang!r} (expected one of {corpus.CORPUS_LANGS})"
+        )
+    ratio = float(zh_ratio)
+    if not 0.0 <= ratio <= 1.0:
+        raise ValueError(f"zh_ratio must be within [0, 1], got {zh_ratio!r}")
+
+
+def _fit_budgeted(target: int, seed: int, tok, corpus_lang: str, zh_ratio: float, model) -> str:
+    """The ``zh`` / ``mix`` fit: build to the body's token budget, then close the gap.
+
+    :func:`tre_replayer.engine.corpus.budgeted_text` costs each sentence on its own, so
+    the joined text is within a token or two of the budget; the loop below is the same
+    truncate-or-fill fit as the English path. A truncation that splits a multi-token
+    character decodes to U+FFFD, which is stripped (the resulting small deficit is then
+    filled) rather than sent.
+    """
+    from tre_replayer.engine import corpus
+
+    body = target - tok.overhead
+    text = corpus.budgeted_text(
+        seed, lang=corpus_lang, zh_ratio=zh_ratio, budget=body,
+        encode=tok.encode_plain, decode=tok.decode_plain,
+    ).text
+    for _ in range(MAX_FIT_ROUNDS):
+        realised = tok.count(text)
+        if realised == target:
+            return text
+        if realised > target:
+            ids = tok.encode_plain(text)
+            keep = max(1, len(ids) - (realised - target))
+            text = tok.decode_plain(ids[:keep]).rstrip("\ufffd")
+            continue
+        deficit = target - realised
+        if deficit <= SMALL_DEFICIT_TOKENS:
+            text = text + tok.filler * deficit
+            continue
+        # Boundary effects this large are not expected; rebuild with a larger budget.
+        body += deficit
+        text = corpus.budgeted_text(
+            seed, lang=corpus_lang, zh_ratio=zh_ratio, budget=body,
+            encode=tok.encode_plain, decode=tok.decode_plain,
+        ).text
+    raise PromptFitError(
+        f"could not fit a {corpus_lang} prompt to {target} tokens for model {model!r} in "
+        f"{MAX_FIT_ROUNDS} rounds (last realised {tok.count(text)})"
+    )
+
+
 def _load_tokenizer(model: str | None, tokenizer_path: str | None):
     from tre_replayer.engine.model_tokenizer import TokenizerUnavailable, load_tokenizer
 
@@ -257,14 +347,25 @@ def build_prompt(
     model: str | None = None,
     tokenizer=None,
     tokenizer_path: str | None = None,
+    corpus_lang: str = DEFAULT_CORPUS_LANG,
+    zh_ratio: float = DEFAULT_ZH_RATIO,
+    api: str = DEFAULT_API,
 ) -> list[int] | str:
-    """Dispatch to the per-mode builder. ``model`` is required by :data:`MODE_NATURAL`."""
+    """Dispatch to the per-mode builder. ``model`` is required by :data:`MODE_NATURAL`.
+
+    ``corpus_lang`` / ``zh_ratio`` select the text of :data:`MODE_NATURAL` and are
+    ignored by the other modes (which do not send language). ``api`` is the endpoint the
+    prompt goes to (see the module docstring); ``chat`` is refused for any mode but
+    :data:`MODE_NATURAL`.
+    """
+    check_api_mode(api, mode)
     if mode == MODE_TOKEN_IDS:
         return build_token_id_prompt(token_count, seed_key)
     if mode == MODE_TEXT:
         return build_text_prompt(token_count, seed_key)
     if mode == MODE_NATURAL:
         return build_natural_prompt(
-            token_count, seed_key, model=model, tokenizer=tokenizer, tokenizer_path=tokenizer_path
+            token_count, seed_key, model=model, tokenizer=tokenizer, tokenizer_path=tokenizer_path,
+            corpus_lang=corpus_lang, zh_ratio=zh_ratio, api=api,
         )
     raise ValueError(f"unknown prompt mode: {mode!r} (expected one of {MODES})")

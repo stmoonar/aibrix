@@ -15,12 +15,22 @@ import json
 from typing import Any
 
 from tre_replayer.engine import rps_timeline
+from tre_replayer.engine.corpus import effective_zh_ratio
 from tre_replayer.engine.dispatcher import dispatch_open_loop
 from tre_replayer.engine.http_sender import DEFAULT_ROUTING_STRATEGY, StreamResult, StreamingHttpSender
 from tre_replayer.engine.prompt_store import materialize_prompts
+from tre_replayer.engine.prompts import CORPUS_LANGS, DEFAULT_CORPUS_LANG, DEFAULT_ZH_RATIO
 from tre_replayer.engine.schedule import build_poisson_schedule
 from tre_replayer.scoring import compute_v_sys
 from tre_replayer.traces.loader import load_trace_segments
+
+
+def _unit_interval(text: str) -> float:
+    """argparse type: a float within [0, 1]."""
+    value = float(text)
+    if not 0.0 <= value <= 1.0:
+        raise argparse.ArgumentTypeError(f"must be within [0, 1], got {text}")
+    return value
 
 
 def _dry_stream_call(url: str, headers: dict[str, str], body: bytes, timeout_s: float) -> StreamResult:
@@ -46,6 +56,8 @@ def run_trace(
     rps_timeline_path: str | None = None,
     prompt_workers: int | None = None,
     routing_strategy: str | None = DEFAULT_ROUTING_STRATEGY,
+    corpus_lang: str = DEFAULT_CORPUS_LANG,
+    zh_ratio: float = DEFAULT_ZH_RATIO,
 ) -> dict[str, Any]:
     from tre_common.registry import load_registry
 
@@ -57,7 +69,10 @@ def run_trace(
     prompt_store = (
         None
         if prompt_path is None
-        else materialize_prompts(schedule, path=prompt_path, processes=prompt_workers)
+        else materialize_prompts(
+            schedule, path=prompt_path, processes=prompt_workers,
+            corpus_lang=corpus_lang, zh_ratio=zh_ratio,
+        )
     )
     sender = StreamingHttpSender(
         gateway_url,
@@ -65,6 +80,8 @@ def run_trace(
         max_in_flight=max_in_flight,
         prompt_store=prompt_store,
         routing_strategy=routing_strategy or None,
+        corpus_lang=corpus_lang,
+        zh_ratio=zh_ratio,
     )
     dispatch_kwargs = {"sleep": sleep} if sleep is not None else {}
     try:
@@ -139,6 +156,10 @@ def run_trace(
     return {
         "trace": trace_path,
         "routing_strategy": routing_strategy or None,
+        # What the prompts were written in (tre_replayer.engine.corpus): runs made with
+        # different corpora are not comparable, so the summary says which it was.
+        "corpus_lang": corpus_lang,
+        "zh_ratio": effective_zh_ratio(corpus_lang, zh_ratio),
         "target_pods": target_pods,
         "requests": len(sender.records),
         "schedule_p99_delay_ms": round(report.p99_delay_ms, 2),
@@ -215,6 +236,12 @@ def main(argv: list[str] | None = None) -> int:
                     help="routing-strategy request header (default %(default)s, what the v1 "
                          "client sent); '' or 'none' sends none and uses the per-model "
                          "Service path instead")
+    ap.add_argument("--corpus-lang", default=DEFAULT_CORPUS_LANG, choices=list(CORPUS_LANGS),
+                    help="text of the natural prompts: mix (default; English and Chinese "
+                         "sentences, --zh-ratio of the tokens Chinese), en, zh")
+    ap.add_argument("--zh-ratio", type=_unit_interval, default=DEFAULT_ZH_RATIO,
+                    help="Chinese share of each prompt's tokens under --corpus-lang mix, "
+                         "counted with the model's own tokenizer (default %(default)s)")
     args = ap.parse_args(argv)
     routing_strategy = None if args.routing_strategy.strip().lower() in ("", "none") else args.routing_strategy.strip()
     summary = run_trace(
@@ -224,6 +251,7 @@ def main(argv: list[str] | None = None) -> int:
         prompt_path=args.prompt_file, prompt_workers=args.prompt_workers,
         rps_timeline_path=args.rps_timeline,
         routing_strategy=routing_strategy,
+        corpus_lang=args.corpus_lang, zh_ratio=args.zh_ratio,
     )
     print(json.dumps(summary, indent=2))
     return 0

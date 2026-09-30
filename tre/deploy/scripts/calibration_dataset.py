@@ -96,6 +96,9 @@ REQUEST_COLUMNS = IDENTITY_COLUMNS + [
     "on_wire_delay_ms", "ttft_ms", "tpot_ms", "e2e_ms", "input_tokens", "output_tokens",
     "http_status", "outcome", "proxy_reason", "in_flight_at_send", "request_timeout_s",
     "target_pod",
+    # The prompt length the request was built to (captures from 2026-09-30 on; empty
+    # before). ``input_tokens`` is the engine's usage.prompt_tokens; they must be equal.
+    "expected_prompt_tokens",
 ]
 CELL_COLUMNS = [
     "model", "shape", "primitive", "stage", "rho", "cell_id", "attempt", "split",
@@ -107,6 +110,10 @@ CELL_COLUMNS = [
     "raw_path", "guard_path", "online_csv_path", "schedule_path",
     "role", "rho_factor", "replicate", "warmup_s", "arrival_seed", "prompt_key",
     "possibly_contaminated", "drained_before", "drain_waited_s", "backlog_stopped",
+    # The endpoint the cell sent (guard artifact; empty = a capture before the option,
+    # i.e. completions) and its served requests whose usage.prompt_tokens differed from
+    # the length they were built to (empty when the capture has no expected length).
+    "api", "prompt_tokens_mismatched",
 ]
 
 #: The ladder design's per-attempt ledger (see ``scripts.calibration_ladder``).
@@ -464,6 +471,28 @@ class Settings:
         return "(start, end]" if self.window_align == rewindow_from_raw.WINDOW_ALIGN_GRID else "[start, end)"
 
 
+def _prompt_tokens_mismatched(records: Sequence[dict]) -> Optional[int]:
+    """Served requests (outcome ``ok``) whose ``input_tokens`` (usage.prompt_tokens) differs
+    from ``expected_prompt_tokens`` or is missing (no usage); None when no record carries
+    the expected length (a capture from before 2026-09-30)."""
+    compared = [r for r in records
+                if rewindow_from_raw.request_outcome(r) == rewindow_from_raw.OUTCOME_OK
+                and r.get("expected_prompt_tokens") is not None]
+    if not compared and not any(r.get("expected_prompt_tokens") is not None for r in records):
+        return None
+    return sum(1 for r in compared
+               if r.get("input_tokens") is None
+               or int(r["input_tokens"]) != int(r["expected_prompt_tokens"]))
+
+
+def _dataset_load_path(provenances: Sequence[dict]) -> dict:
+    """The one load path of the dataset's campaigns - one, because _settings_for refused
+    to go on when they differ; so the first campaign's is every campaign's."""
+    from scripts import prompt_corpus as corpus_record
+
+    return corpus_record.load_path(provenances[0] if provenances else None)
+
+
 def _settings_for(campaigns: Sequence[Path], overrides: dict) -> tuple[Settings, list[dict]]:
     """Windowing and SLO the run declared, overridable; plus each campaign's provenance."""
     provenances = []
@@ -472,15 +501,27 @@ def _settings_for(campaigns: Sequence[Path], overrides: dict) -> tuple[Settings,
     online_label = None
     ttft = tpot = None
     registry = None
+    from scripts import prompt_corpus as corpus_record
+
+    load_paths: dict[str, list[str]] = {}
     for campaign in campaigns:
         plan = _read_json(campaign / "plan.json")
         fit = _read_json(campaign / "fit_plan.json")
         prov = plan.get("provenance") or {}
+        load_paths.setdefault(corpus_record.describe_load_path(corpus_record.load_path(prov)),
+                              []).append(campaign.name)
         entry = {
             "campaign": campaign.name,
             "code": prov.get("code"),
             "registry_path": prov.get("registry_path"),
             "registry_sha256": prov.get("registry_sha256"),
+            # The load path (run_provenance; scripts.prompt_corpus): what the prompts were
+            # written in and how they were routed. None = a campaign from before the
+            # option - English prompts, no routing header.
+            "prompt": prov.get("prompt"),
+            "routing_strategy": prov.get("routing_strategy"),
+            # The endpoint (None = before the option: completions).
+            "api": prov.get("api"),
             "status": _read_json(campaign / "campaign_status.json") or None,
         }
         if plan.get("design") == LADDER_DESIGN:
@@ -505,6 +546,10 @@ def _settings_for(campaigns: Sequence[Path], overrides: dict) -> tuple[Settings,
         tpot = tpot or slo.get(slo_labels.P95_TPOT_CLIENT)
         if prov.get("registry_path") and Path(prov["registry_path"]).exists():
             registry = registry or Path(prov["registry_path"])
+    if len(load_paths) > 1:
+        # One dataset, one load path: a theta fitted across two describes neither.
+        raise SystemExit(f"these campaigns were driven with different prompt corpora / routing / APIs "
+                         f"(load paths), refusing to build one dataset from them: {load_paths}")
     if ttft is None or tpot is None:
         # Older runs recorded the pinned SLO on every cell's guard, not in the plan.
         for campaign in campaigns:
@@ -593,8 +638,16 @@ def build_dataset(
     *,
     out_dir: Optional[Path] = None,
     overrides: Optional[dict] = None,
+    allow_prompt_token_mismatch: bool = False,
 ) -> Path:
     """Convert ``run_dir`` into the standard dataset; returns the dataset directory.
+
+    Refuses (SystemExit, nothing written) a run holding a non-void cell whose served
+    requests did not all prefill the length they were built to
+    (``prompt_tokens_mismatched > 0``: usage.prompt_tokens off, or no usage): its windows
+    are indexed by a length the engine did not see. ``allow_prompt_token_mismatch``
+    (``--allow-prompt-token-mismatch``) builds anyway and records the cells in the
+    manifest; the trainset stage still refuses to train on them.
 
     Reads only. The dataset is assembled in a sibling temporary directory and moved into
     place at the end, so a failed conversion never leaves a half-written dataset where a
@@ -685,6 +738,22 @@ def build_dataset(
             "30 s tumbling windows); they are kept as files but every window in this "
             "dataset is recomputed from raw"
         )
+    off_length = [
+        f"{c.get('model')}/{c.get('cell_id')} attempt {c.get('attempt')}: {c.get('prompt_tokens_mismatched')}"
+        for c in cell_rows
+        if c.get("status") != STATUS_VOID and (c.get("prompt_tokens_mismatched") or 0) > 0
+    ]
+    if off_length and not allow_prompt_token_mismatch:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise SystemExit(
+            f"{run_dir}: {len(off_length)} cell(s) served requests whose usage.prompt_tokens was not the "
+            f"length they were built to (or had no usage), so their windows are indexed by a length the "
+            f"engine did not prefill; refusing to build the dataset: {'; '.join(off_length)} "
+            "(re-run those cells, or pass --allow-prompt-token-mismatch to build it for inspection - "
+            "the trainset stage will still refuse them)")
+    if off_length:
+        discrepancies.append(f"built with --allow-prompt-token-mismatch: {len(off_length)} cell(s) "
+                             f"off their prompt length: {'; '.join(off_length)}")
     cells_written = _write_csv(staging / CELL_TABLE, CELL_COLUMNS, cell_rows)
     if README_SOURCE.exists():
         shutil.copyfile(README_SOURCE, staging / README)
@@ -703,6 +772,10 @@ def build_dataset(
         },
         "run_root": str(run_dir),
         "campaigns": provenances,
+        # The one load path (prompt corpus, routing) every campaign above was driven with
+        # (they may not differ; a campaign from before the options is English, no header).
+        # dline_refit freeze carries it on.
+        "load_path": _dataset_load_path(provenances),
         "registry_used_for_labels": {
             "path": str(settings.label_registry_path),
             "sha256": _sha256(settings.label_registry_path),
@@ -921,6 +994,7 @@ def _convert_attempt(attempt, run_dir, settings, registry, plan_cells, discrepan
             "in_flight_at_send": record.get("in_flight_at_send"),
             "request_timeout_s": record.get("request_timeout_s"),
             "target_pod": record.get("target_pod"),
+            "expected_prompt_tokens": record.get("expected_prompt_tokens"),
         })
     window_rows = (
         [{**identity, "in_warmup": in_warmup(row["window_start_ms"]), **row} for row in windows]
@@ -983,6 +1057,8 @@ def _convert_attempt(attempt, run_dir, settings, registry, plan_cells, discrepan
         "drained_before": (ledger.get("drain_before") or {}).get("drained"),
         "drain_waited_s": (ledger.get("drain_before") or {}).get("waited_s"),
         "backlog_stopped": ledger.get("backlog_stopped"),
+        "api": guard.get("api"),
+        "prompt_tokens_mismatched": _prompt_tokens_mismatched(records),
     }
     manifest_cell = {
         **{k: v for k, v in identity.items() if k != "cell_status"},
@@ -1120,8 +1196,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--window-align", choices=list(rewindow_from_raw.WINDOW_ALIGN_CHOICES), default=None,
                     help=f"default {DEFAULT_WINDOW_ALIGN} (format revision {FORMAT_REVISION})")
     ap.add_argument("--min-completed-requests", type=int, default=None)
+    ap.add_argument("--allow-prompt-token-mismatch", action="store_true",
+                    help="build even when a cell's served requests were off their prompt length "
+                         "(recorded; dline_refit trainset still refuses those cells)")
     args = ap.parse_args(argv)
-    out = build_dataset(args.run_dir, out_dir=args.out_dir, overrides={
+    out = build_dataset(args.run_dir, out_dir=args.out_dir,
+                        allow_prompt_token_mismatch=args.allow_prompt_token_mismatch, overrides={
         "registry": args.registry, "label_registry": args.label_registry,
         "window_ms": args.window_ms, "step_ms": args.step_ms,
         "ttft_slo_ms": args.ttft_slo_ms, "tpot_slo_ms": args.tpot_slo_ms,

@@ -140,6 +140,11 @@ class Manifest:
     runs: tuple[RunSpec, ...]
     #: "manifest" (explicit baseline:), "generated" (generate_baseline) or "cli".
     baseline_source: str = "manifest"
+    #: What the replay's prompts are written in (tre_replayer.engine.corpus), pinned on
+    #: every run_trace command and recorded in command.json. Manifest keys corpus_lang /
+    #: zh_ratio; default the 1:1 zh/en mix.
+    corpus_lang: str = "mix"
+    zh_ratio: float = 0.5
 
 
 @dataclass(frozen=True)
@@ -218,6 +223,14 @@ def load_manifest(
     images = {str(key): str(value) for key, value in raw["images"].items()}
     if set(images) != {"controller", "service-manager", "ui"}:
         raise ValueError("images must pin controller, service-manager, and ui")
+    from scripts import prompt_corpus as corpus_record
+
+    corpus_lang = str(raw.get("corpus_lang", corpus_record.DEFAULT_CORPUS_LANG))
+    if corpus_lang not in corpus_record.CORPUS_LANGS:
+        raise ValueError(f"corpus_lang must be one of {corpus_record.CORPUS_LANGS}, got {corpus_lang!r}")
+    zh_ratio = corpus_record.effective_zh_ratio(corpus_lang, raw.get("zh_ratio"))
+    if not 0.0 <= zh_ratio <= 1.0:
+        raise ValueError(f"zh_ratio must be within [0, 1], got {zh_ratio}")
     frozen_sha = str(raw["frozen_sha"])
     if len(frozen_sha) != 40:
         raise ValueError("frozen_sha must be a full 40-character SHA")
@@ -230,6 +243,8 @@ def load_manifest(
         cooldown_s=float(raw.get("cooldown_s", 600.0)),
         post_drain_s=float(raw.get("post_drain_s", 30.0)),
         runs=runs,
+        corpus_lang=corpus_lang,
+        zh_ratio=zh_ratio,
     )
 
 
@@ -851,6 +866,8 @@ class CampaignRunner:
             "--seed", str(spec.seed),
             "--max-in-flight", "512",
             "--trim-ramp-windows", "1",
+            "--corpus-lang", self.manifest.corpus_lang,
+            "--zh-ratio", repr(self.manifest.zh_ratio),
         ]
         metadata = {
             "run_id": spec.run_id,
@@ -860,6 +877,8 @@ class CampaignRunner:
             "trace_sha256": sha256_file(trace_path),
             "gateway": config.gateway,
             "routing_strategy": ROUTING_STRATEGY,
+            "prompt_corpus": {"corpus_lang": self.manifest.corpus_lang,
+                              "zh_ratio": self.manifest.zh_ratio},
             "command": command,
             "operator": "root via Codex",
             "controller_pod": controller_pod,

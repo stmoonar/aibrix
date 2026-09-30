@@ -765,7 +765,7 @@ def test_design_cells_are_driven_with_their_own_seed_key_prompts_and_valve(tmp_p
         assert command[command.index("--cell-id") + 1] == cell.cell_id
         assert command[command.index("--shed-policy") + 1] == openloop.SHED_POLICY_VOID
         assert ("--max-backlog" in command) == (cell.role == design.ROLE_BOUNDARY)
-    parsed = r3_grid.parse_args(["--model", MODEL, "--gateway-url", "g", "--output", "o.csv",
+    parsed = r3_grid.parse_args(["--model", MODEL, "--gateway-url", "http://g/v1/chat/completions", "--output", "o.csv",
                                  "--schedule", "s.json", "--prompt-key", "k",
                                  "--max-backlog", "7"])
     assert parsed.prompt_key == "k" and parsed.max_backlog == 7

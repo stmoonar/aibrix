@@ -331,7 +331,10 @@ def retained_cells(model: str, dataset_dir: Path) -> dict:
                       "shape": RETAINED_SHAPE, "primitive": primitive, "role": r.get("role") or "",
                       "origin": "retained", "seen_before": True, "note": RETAINED_NOTE,
                       "raw_files": [str(f) for f in files], "windows": int(r["windows"] or 0)})
+    from scripts import prompt_corpus as corpus_record
+
     return {"dataset": str(dataset_dir),
+            "load_path": corpus_record.dataset_load_path(manifest),
             "windows_csv_sha256": design._sha256(dataset_dir / "windows.csv"),
             "manifest_sha256": design._sha256(dataset_dir / "manifest.json"),
             "run_root": str(run_root), "cells": cells}
@@ -365,8 +368,12 @@ def check_freeze(args, model: str) -> dict:
     if dline_refit.canonical_sha256(ours) != dline_refit.canonical_sha256(theirs):
         raise ValueError(f"{path}: {model} was frozen under another label definition than the "
                          "one M would be judged by")
+    from scripts import prompt_corpus as corpus_record
+
+    load_path = corpus_record.check_matches_freeze(
+        doc, model, campaign.load_path(args), what=str(path), **campaign.mismatch_flags(args))
     return {"path": str(Path(path).resolve()), "sha256": design._sha256(Path(path)),
-            "freeze_sha256": doc.get("freeze_sha256")}
+            "freeze_sha256": doc.get("freeze_sha256"), "load_path": load_path}
 
 
 def label_documents(args, model: str) -> dict:
@@ -691,6 +698,15 @@ def run_acceptance_set(args, *, drive: Optional[Callable] = None,
     kv = gen.load_kv_cache_tokens(capacity_file)
     bursts = {i.shape: burst_sizing(i.shape, kv, cap) for i in COMPOSITION if i.kind == KIND_BURSTS}
     retained = retained_cells(model, Path(args.retained_dataset))
+    # The retained cells are judged next to the new ones: same load path, or refused.
+    from scripts import prompt_corpus as corpus_record
+
+    flags = campaign.mismatch_flags(args)
+    if getattr(args, "dry_run", False):  # a dry run reports, as it does for the freeze
+        flags = {k: True for k in flags}
+    retained["load_path"] = corpus_record.check_load_path(
+        retained["load_path"], campaign.load_path(args),
+        what=f"retained M cells ({args.retained_dataset})", **flags)
     seed = int(args.design_seed)
     cells = new_cells(model, seed)
     order = interleaved_order(cells, model, seed)
@@ -712,6 +728,7 @@ def run_acceptance_set(args, *, drive: Optional[Callable] = None,
                              f"{campaign.REQUIRED_CONTROLLER_MODE!r})")
         print(f"controller mode: {mode}")
         campaign.require_capture_clock_domains(args)
+        campaign.require_prompt_preflight(args, out_dir=out_dir)
     plan["run_manifest_sha256"] = ladder.write_frozen(out_dir / ladder.RUN_MANIFEST, manifest)
     (out_dir / "plan.json").write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")
     raw_dir = Path(args.raw_dir)
@@ -783,8 +800,9 @@ def seal(out_dir: Path, raw_dir: Path, model: str, run: AcceptanceRun, retained:
                          "status": (run.statuses.get(s) or {}).get("status")} for s in NEW_SHAPES},
         "cells": [*collected, *retained["cells"]],
         "sealed_probes": probes,
-        "retained_source": {k: retained[k] for k in ("dataset", "windows_csv_sha256",
-                                                      "manifest_sha256", "run_root")},
+        "retained_source": {k: retained.get(k) for k in ("dataset", "windows_csv_sha256",
+                                                          "manifest_sha256", "run_root",
+                                                          "load_path")},
         "run_manifest_sha256": plan.get("run_manifest_sha256"),
         "sha256sums_file": M_SHA256SUMS,
         "sha256sums_sha256": sums_sha,

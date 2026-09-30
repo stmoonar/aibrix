@@ -140,6 +140,8 @@ def _args(tmp_path, **over):
         max_model_error_rate=0.05, envoy_stats_url=None, envoy_cluster_filter=None,
         freeze_file=None, refit_params_file=None, preregistration_json=None,
         capacity_prior_file=None, routing_strategy="least-gpu-cache",
+        # The fixture freezes predate the corpus record, i.e. were trained on English.
+        corpus_lang="en", zh_ratio=0.0, api="completions",
     )
     base.update(over)
     return argparse.Namespace(**base)
@@ -496,15 +498,15 @@ def test_the_output_root_is_independent(tmp_path) -> None:
 # ----------------------------------------------------------------------- the CLI
 
 
-def test_routing_strategy_reaches_r3_grid_only_when_set(tmp_path) -> None:
+def test_routing_strategy_reaches_r3_grid_unless_switched_off(tmp_path) -> None:
     cell = campaign.Cell(MODEL, "G512x256", "hold", "i512_o256_c1280501", "s.json", 240.0, 0.0)
     plain = campaign.cell_command(cell, _args(tmp_path, routing_strategy=None),
                                   Path("s.json"), Path("o.csv"))
     assert "--routing-strategy" not in plain
-    old = _args(tmp_path)
-    delattr(old, "routing_strategy")            # a Namespace from before the flag existed
-    assert campaign.cell_command(cell, old, Path("s.json"), Path("o.csv")) == plain
     routed = campaign.cell_command(cell, _args(tmp_path), Path("s.json"), Path("o.csv"))
+    old = _args(tmp_path)
+    delattr(old, "routing_strategy")            # a hand-built Namespace: the default applies
+    assert campaign.cell_command(cell, old, Path("s.json"), Path("o.csv")) == routed
     assert routed[routed.index("--routing-strategy") + 1] == "least-gpu-cache"
     assert routed[:len(plain)] == plain and len(routed) == len(plain) + 2
     dc = t14.new_cells(MODEL, 20260924)[0]
@@ -546,7 +548,8 @@ def test_the_cli_dry_run_plans_24_cells_and_drives_nothing(tmp_path, capsys, mon
     assert campaign.main(argv) == 0
     text = capsys.readouterr().out
     assert "no --freeze-file" in text and "no --refit-params-file" in text
-    assert "no --preregistration-json" in text and "--routing-strategy is None" in text
+    # least-gpu-cache is the campaign default now, so the dry run has nothing to warn about
+    assert "no --preregistration-json" in text and "--routing-strategy is" not in text
     assert "max-model-len check: 131072 >= 4224" in text and "wall clock" in text
     plan = json.loads((out / "plan.json").read_text())
     assert plan["mode"] == t14.MODE and plan["design_seed"] == 20260924
@@ -578,6 +581,19 @@ def test_a_real_run_needs_its_bindings(tmp_path, frozen) -> None:
             t14.run_t14_set(_args(tmp_path, **{**full, missing: None}), check_controller=False)
     with pytest.raises(ValueError, match="least-gpu-cache"):
         t14.run_t14_set(_args(tmp_path, routing_strategy=None, **full), check_controller=False)
+    # The frozen parameters were trained on English prompts: a mixed T14 is refused.
+    with pytest.raises(ValueError, match="made with en prompts"):
+        t14.run_t14_set(_args(tmp_path, corpus_lang="mix", zh_ratio=0.5, **full),
+                        check_controller=False)
+    # a pre-registered set cannot waive its load path
+    with pytest.raises(ValueError, match="do not combine with --preregistration-json"):
+        t14.run_t14_set(_args(tmp_path, allow_prompt_corpus_mismatch=True, **full),
+                        check_controller=False)
+    # routing is fixed by T14 itself (least-gpu-cache), so it is recorded, not compared,
+    # and a hand-built Namespace without the attribute gets the campaign default
+    no_attr = _args(tmp_path, **full)
+    delattr(no_attr, "routing_strategy")
+    assert campaign.routing_strategy_for(no_attr) == t14.ROUTING_STRATEGY
     with pytest.raises(ValueError, match="dsqwen-14b set"):
         t14.run_t14_set(_args(tmp_path, models="dsqwen-7b", **full), check_controller=False)
     with pytest.raises(ValueError, match="does not bind"):

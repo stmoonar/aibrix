@@ -321,3 +321,116 @@ def test_a_campaign_builds_its_dataset_and_the_last_one_builds_the_merge(tmp_pat
     assert (second / "dataset" / "windows.csv").exists()
     _, windows = _read(root / "dataset" / "windows.csv")
     assert {w["model"] for w in windows} == {"dsqwen-7b", "dsllama-8b"}
+
+
+def _set_prompt(campaign_dir: Path, prompt) -> None:
+    plan = json.loads((campaign_dir / "plan.json").read_text(encoding="utf-8"))
+    plan["provenance"]["prompt"] = prompt
+    (campaign_dir / "plan.json").write_text(json.dumps(plan), encoding="utf-8")
+
+
+def test_the_dataset_records_its_one_prompt_corpus(tmp_path):
+    root = tmp_path / "run"
+    for model in ("dsqwen-7b", "dsllama-8b"):
+        _set_prompt(_campaign(root, model), {"prompt_mode": "natural", "corpus_lang": "mix", "zh_ratio": 0.5})
+    out = dataset.build_dataset(root)
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["load_path"] == {"prompt": {"corpus_lang": "mix", "zh_ratio": 0.5},
+                                     "routing_strategy": None, "api": "completions"}
+    assert {c["prompt"]["corpus_lang"] for c in manifest["campaigns"]} == {"mix"}
+
+
+def test_campaigns_of_different_prompt_corpora_do_not_make_one_dataset(tmp_path):
+    """A campaign from before the corpus option was English; a mixed one next to it would
+    give a theta fitted across two workloads."""
+    root = tmp_path / "run"
+    _campaign(root, "dsqwen-7b")
+    _set_prompt(_campaign(root, "dsllama-8b"), {"corpus_lang": "mix", "zh_ratio": 0.5})
+    with pytest.raises(SystemExit, match="different prompt corpora"):
+        dataset.build_dataset(root)
+    assert not (root / "dataset").exists()
+
+
+def test_campaigns_of_different_routing_do_not_make_one_dataset(tmp_path):
+    root = tmp_path / "run"
+    _campaign(root, "dsqwen-7b")
+    other = _campaign(root, "dsllama-8b")
+    plan = json.loads((other / "plan.json").read_text(encoding="utf-8"))
+    plan["provenance"]["routing_strategy"] = "least-gpu-cache"
+    (other / "plan.json").write_text(json.dumps(plan), encoding="utf-8")
+    with pytest.raises(SystemExit, match="routing"):
+        dataset.build_dataset(root)
+
+
+def _set_api(campaign_dir: Path, api) -> None:
+    plan = json.loads((campaign_dir / "plan.json").read_text(encoding="utf-8"))
+    plan["provenance"]["api"] = api
+    (campaign_dir / "plan.json").write_text(json.dumps(plan), encoding="utf-8")
+
+
+def test_campaigns_of_different_apis_do_not_make_one_dataset(tmp_path):
+    """A campaign without an API record is a completions capture; a chat one next to it
+    prefilled other token sequences for the same cells."""
+    root = tmp_path / "run"
+    _campaign(root, "dsqwen-7b")
+    _set_api(_campaign(root, "dsllama-8b"), {"endpoint": "chat", "path": "/v1/chat/completions"})
+    with pytest.raises(SystemExit, match="APIs"):
+        dataset.build_dataset(root)
+    assert not (root / "dataset").exists()
+
+
+def test_a_chat_dataset_records_its_api_and_the_per_request_expected_length(tmp_path):
+    root = tmp_path / "run"
+    for model in ("dsqwen-7b", "dsllama-8b"):
+        _set_api(_campaign(root, model), {"endpoint": "chat", "path": "/v1/chat/completions"})
+    out = dataset.build_dataset(root)
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["load_path"]["api"] == "chat"
+    assert {c["api"]["endpoint"] for c in manifest["campaigns"]} == {"chat"}
+    header, requests = _read(out / dataset.REQUEST_TABLE)
+    assert "expected_prompt_tokens" in header
+    # these captures predate the expected length: empty, never guessed
+    assert all(r["expected_prompt_tokens"] == "" for r in requests)
+    header, cells = _read(out / dataset.CELL_TABLE)
+    assert {"api", "prompt_tokens_mismatched"} <= set(header)
+    assert all(c["prompt_tokens_mismatched"] == "" for c in cells)
+
+
+def test_prompt_tokens_mismatched_counts_served_requests_off_their_length():
+    records = [
+        {"http_status": 200, "e2e_ms": 5.0, "expected_prompt_tokens": 512, "input_tokens": 512},
+        {"http_status": 200, "e2e_ms": 5.0, "expected_prompt_tokens": 512, "input_tokens": 511},
+        {"http_status": 200, "e2e_ms": 5.0, "expected_prompt_tokens": 512, "input_tokens": None},
+        {"http_status": 503, "e2e_ms": 5.0, "expected_prompt_tokens": 512, "input_tokens": None},
+        {"http_status": 200, "e2e_ms": 5.0, "expected_prompt_tokens": 512, "input_tokens": None,
+         "outcome": "model_error"},
+    ]
+    assert dataset._prompt_tokens_mismatched(records) == 2
+    assert dataset._prompt_tokens_mismatched([{"http_status": 200, "input_tokens": 5}]) is None
+
+
+def _put_off_length(campaign_dir: Path, model: str) -> None:
+    """Make the served requests of one cell report a prompt length other than their own."""
+    raw_path = campaign_dir / "raw" / f"{model}_S1_steps" / "i256_o128_c95.jsonl"
+    rows = [json.loads(line) for line in raw_path.read_text(encoding="utf-8").splitlines()]
+    for row in rows:
+        row["expected_prompt_tokens"] = (row.get("input_tokens") or 256) + 1
+    raw_path.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+
+
+def test_a_cell_off_its_prompt_length_refuses_the_dataset_unless_allowed(tmp_path):
+    from scripts import dline_refit
+
+    root = tmp_path / "run"
+    _put_off_length(_campaign(root, "dsqwen-7b"), "dsqwen-7b")
+    with pytest.raises(SystemExit, match="dsqwen-7b/i256_o128_c95 attempt"):
+        dataset.build_dataset(root)
+    assert not (root / "dataset").exists() and not list(root.glob(".dataset*"))
+    out = dataset.build_dataset(root, allow_prompt_token_mismatch=True)
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    assert any("allow-prompt-token-mismatch" in d for d in manifest["discrepancies"])
+    _, cells = _read(out / dataset.CELL_TABLE)
+    assert {c["cell_id"] for c in cells if c["prompt_tokens_mismatched"] not in ("", "0")} == {"i256_o128_c95"}
+    # ... and the trainset stage never trains on it
+    off = dline_refit.prompt_token_mismatched_cells(dline_refit.DatasetSource("run", out, False))
+    assert {cell for cell, _attempt in off} == {"i256_o128_c95"}

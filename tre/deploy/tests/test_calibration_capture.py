@@ -562,7 +562,7 @@ def test_campaign_cells_capture_next_to_the_online_csv_unless_disabled() -> None
 
 
 def test_r3_grid_capture_flags_and_layout() -> None:
-    base = ["--model", "m7", "--gateway-url", "http://gw", "--output", "/o/m7/stem_a1.csv",
+    base = ["--model", "m7", "--gateway-url", "http://gw/v1/chat/completions", "--output", "/o/m7/stem_a1.csv",
             "--schedule", "s.json", "--raw-dir", "/o/m7/raw", "--capture-dir", "/o/m7/cells"]
     args = r3_grid.parse_args(base)
     assert args.vllm_keyframe_every == cc.DEFAULT_KEYFRAME_EVERY
@@ -577,7 +577,7 @@ def test_r3_grid_capture_flags_and_layout() -> None:
     layout = r3_grid.capture_layout_for(args, "i0_o0_c1")
     assert layout.cell_dir == Path("/o/m7/cells/stem_a1")
     assert layout.raw_dir == Path("/o/m7/raw/stem_a1")
-    plain = r3_grid.parse_args(["--model", "m7", "--gateway-url", "http://gw", "--output", "/o/x.csv"])
+    plain = r3_grid.parse_args(["--model", "m7", "--gateway-url", "http://gw/v1/chat/completions", "--output", "/o/x.csv"])
     assert r3_grid.capture_layout_for(plain, "i0_o0_c1") is None
 
 

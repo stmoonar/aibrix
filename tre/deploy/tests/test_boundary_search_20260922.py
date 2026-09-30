@@ -3,6 +3,8 @@ coarse probes, outward extension, labelled rho*, re-probe mode, static-grid gate
 Nothing here drives load: every probe answers from a table."""
 from __future__ import annotations
 
+import argparse
+
 import json
 from pathlib import Path
 
@@ -124,6 +126,10 @@ def _source(tmp_path: Path, statuses: dict) -> Path:
     for model, by_shape in statuses.items():
         (root / model / "capacity").mkdir(parents=True)
         (root / model / "boundary").mkdir(parents=True)
+        # the source campaign's load path: the one a default re-probe run sends
+        (root / model / "plan.json").write_text(json.dumps({"models": [model], "provenance": {
+            "prompt": {"corpus_lang": "mix", "zh_ratio": 0.5}, "routing_strategy": "least-gpu-cache",
+            "api": {"endpoint": "chat"}}}))
         for shape in gen.TRAINING_SHAPES:
             (_w, i, o), = gen.shape_components(shape)
             cap = 1.0 / (gen._length_mean(i) / 20000.0 + gen._length_mean(o) / 2000.0)
@@ -184,6 +190,9 @@ def test_reprobe_writes_new_boundaries_under_the_new_root_only(tmp_path, monkeyp
     clock_checked = []  # the capture clock pre-flight (no redis here)
     monkeypatch.setattr(campaign, "require_capture_clock_domains",
                         lambda args, models=None: clock_checked.append(list(models)))
+    preflights = []  # the prompt pre-flight (no gateway here)
+    monkeypatch.setattr(campaign, "require_prompt_preflight",
+                        lambda args, models=None, out_dir=None, shapes=None: preflights.append((list(models), shapes)))
     seen = []
 
     def fake_drive(cell, measured, args, *, cap, schedule_dir, out_dir):
@@ -196,13 +205,46 @@ def test_reprobe_writes_new_boundaries_under_the_new_root_only(tmp_path, monkeyp
     monkeypatch.setattr(campaign, "drive_boundary_search", fake_drive)
     out = tmp_path / "reprobe_new"
     assert campaign.main(["--reprobe-shapes", "dsllama-8b:S4", "--reprobe-source", str(src),
-                          "--out-dir", str(out), "--index", str(tmp_path / "no_index.json")]) == 0
+                          "--out-dir", str(out), "--index", str(tmp_path / "no_index.json"),
+                          "--gateway-url", "http://gw/v1/chat/completions"]) == 0
     assert seen == [("dsllama-8b", "S4", out / "dsllama-8b" / "raw", out / "dsllama-8b")]
     assert clock_checked == [["dsllama-8b"]]
+    assert preflights == [(["dsllama-8b"], ["S4"])]
     body = json.loads((out / "dsllama-8b" / "boundary" / "dsllama-8b_S4.json").read_text())
     assert body["rho_star_status"] == "measured" and 2.0 <= body["rho_star"] <= 2.6
     assert (out / "dsllama-8b" / "capacity" / "dsllama-8b_S4.json").exists()
     assert {p: p.read_text() for p in src.rglob("*.json")} == before   # source untouched
+
+
+def test_reprobe_checks_the_source_campaigns_load_path(tmp_path, monkeypatch) -> None:
+    """The re-probe reuses the source's C_s: a source of another API / corpus / routing is
+    refused (an API difference whatever the flags); a dry run reports it."""
+    monkeypatch.setattr(campaign.subprocess, "run", lambda *a, **k: pytest.fail("dry run drove a cell"))
+    src = _source(tmp_path, {"dsllama-8b": {}})
+    plan_path = src / "dsllama-8b" / "plan.json"
+    out = tmp_path / "ok"
+    assert campaign.main(["--reprobe-shapes", "dsllama-8b:S1", "--reprobe-source", str(src),
+                          "--out-dir", str(out), "--dry-run"]) == 0
+    plan = json.loads((out / "reprobe_plan.json").read_text())
+    assert plan["load_path"]["api"] == "chat"
+    assert plan["source_load_paths"][0]["recorded"]["api"] == "chat"
+    plan_path.write_text(json.dumps({"models": ["dsllama-8b"], "provenance": {}}))  # a completions source
+    args = argparse.Namespace(reprobe_source=src, corpus_lang="en", zh_ratio=0.0, routing_strategy=None,
+                              api="chat", allow_prompt_corpus_mismatch=True, allow_routing_mismatch=True)
+    with pytest.raises(ValueError, match="completions API"):
+        campaign.check_reprobe_source_load_paths(args, {"dsllama-8b": ["S1"]})
+    args.api = "completions"
+    assert campaign.check_reprobe_source_load_paths(args, {"dsllama-8b": ["S1"]})[0]["recorded"]["api"] == "completions"
+    args.corpus_lang, args.zh_ratio, args.allow_prompt_corpus_mismatch = "mix", 0.5, False
+    with pytest.raises(ValueError, match="en prompts"):
+        campaign.check_reprobe_source_load_paths(args, {"dsllama-8b": ["S1"]})
+    # the dry run reports instead
+    report = campaign.check_reprobe_source_load_paths(
+        argparse.Namespace(**{**vars(args), "api": "chat", "dry_run": True}), {"dsllama-8b": ["S1"]})
+    assert report[0]["api_mismatch_reported"] and report[0]["corpus_mismatch_allowed"]
+    plan_path.unlink()
+    with pytest.raises(ValueError, match="unknown"):
+        campaign.check_reprobe_source_load_paths(args, {"dsllama-8b": ["S1"]})
 
 
 # ------------------------------------------------------------------ static-grid gate

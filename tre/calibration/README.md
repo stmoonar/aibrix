@@ -12,6 +12,95 @@ ranking metrics). The campaign that produces its input lives in `tre/deploy/scri
 | fit / freeze / accept | `dline_refit.py` (+ `alpha_fit.py`, `theta_verdict.py`) |
 | ranking disclosure (AUROC, Kendall tau-b) | see `tre/docs/design/20260930-ranking-metrics.md` |
 
+## Request endpoint: chat, fitted to the templated length
+
+Since 2026-09-30 every calibration cell sends `/v1/chat/completions` (`r3_grid --api chat`,
+`calibration_campaign --api chat`, both the default; `--gateway-url` must name the chat
+path). Why chat and not `/v1/completions`:
+
+* **It is what the experiments send.** v1 (calibration and experiments alike) and the E1
+  client (`tre/loadgen_v1`) send one user message through the chat endpoint, so the engine
+  prefills the model's chat template around the prompt. The completions endpoint prefills
+  the bare string - on vLLM 0.30 without even a BOS. A theta calibrated on one prefill
+  path is evidence about the other only by assumption.
+* **The prefill path is then identical** - the same template (`<BOS><｜User｜>…<｜Assistant｜><think>\n`
+  for all three DeepSeek-R1-Distill models, 5 tokens), the same BOS handling, the same
+  tokenizer call in the engine. The one remaining difference is deliberate: calibration
+  fixes the output length with `ignore_eos: true` + `max_tokens` (plus `temperature: 0`,
+  `stream_options.include_usage`, and `seed` when `--request-seed` is given).
+
+Exact length. `input_tokens` of a cell is the length of the prompt **after** the chat
+template, i.e. what the engine reports as `usage.prompt_tokens`. The natural-prompt fitter
+counts through the template (`tre_replayer.engine.model_tokenizer.for_api`: the template
+rendered once with `apply_chat_template(add_generation_prompt=True)` into a prefix and a
+suffix, checked on probe contents to render verbatim and to add a fixed number of tokens),
+so the user content is `input_tokens` minus the template. The zh/en mix ratio applies to
+that content (0.50 by token). The chat path needs `--prompt-mode natural`.
+
+Gateway URL. There is no built-in default: pass `--gateway-url
+http://<gateway>/v1/chat/completions` or set `TRE_CALIBRATION_GATEWAY_URL`; a run without
+either is refused (a `--dry-run` / `--static-grid-list` needs none).
+
+Checks, fail-closed:
+
+* **Preflight** (`require_prompt_preflight`, every campaign entry point, next to the
+  clock-domain check; standalone `r3_grid --prompt-preflight refuse`): per model and per
+  input length - the run's shortest cell input, 512 and its longest (a sampled shape's
+  range ends included; for the entry points that do not list their shapes, the span of
+  every calibration shape: 128 / 512 / 4096) - one request of the run's exact kind
+  (builder, tokenizer, corpus, endpoint, URL, routing header, seed) must come back with
+  `usage.prompt_tokens` = the fitted length, `completion_tokens` = `max_tokens`, a first
+  token in a recognised field and, for the mix, a content Chinese share within 0.01 of
+  the target; otherwise the run is refused. Verdicts: `<out-dir>/prompt_preflight.json`.
+  `--prompt-preflight skip` turns it off and is recorded. The same check as a standalone
+  command (exit 0 only when every row is exact; one JSON row per model x target with
+  `model, target, prompt_tokens, completion_tokens, zh_token_ratio, ok, reasons`):
+  `cd tre/deploy && PYTHONPATH=../common:.:../replayer python3 -m scripts.calib_preflight
+  --models dsqwen-7b,dsllama-8b,dsqwen-14b --gateway-url http://<gateway>/v1/chat/completions
+  --out <file.jsonl> [--targets 128,512,2048]`.
+* **Per request / per cell**: the raw log keeps `expected_prompt_tokens` (the fitted
+  length) next to `input_tokens` (`usage.prompt_tokens`), on the schedule path and the
+  closed-loop grid path alike; the guard artifact (`<cell>.guard.json`; the grid path:
+  `<cell>.prompt_tokens_check.json`) records `api`, `chat_template_overhead`,
+  `request_seed` and `prompt_tokens_check` (served requests whose two numbers differ, or
+  without usage). The standard dataset carries `expected_prompt_tokens` per request and
+  `api` / `prompt_tokens_mismatched` per cell, and **refuses to build** when a non-void
+  cell has `prompt_tokens_mismatched > 0` (`--allow-prompt-token-mismatch` builds it for
+  inspection and records the cells); `dline_refit trainset` never trains on such a cell.
+* **Provenance**: `run_provenance["api"]` (endpoint, path, `ignore_eos`, seed, what
+  `input_tokens` counts) is part of the load path (`scripts.prompt_corpus`). A dataset
+  refuses campaigns of two APIs, a freeze records its training API and refuses a mixed
+  training set, M / T14 / the training supplement / a `--reprobe-shapes` run (whose
+  reused C_s comes from `--reprobe-source`; its load path goes to `reprobe_plan.json`)
+  refuse another API - with **no** override flag. Records without an API are the
+  completions captures from before 2026-09-30. A materialised prompt file records its
+  `api` per row and a sender refuses a file of the other endpoint.
+* **Errors inside a 200 stream**: an `{"error": ...}` SSE chunk sets `stream_error` on
+  the request, which is then a model error (never a completion, never a latency sample).
+
+TTFT / TPOT. The first token is the first SSE chunk carrying text in `text`
+(completions), `delta.content`, or `delta.reasoning_content` / `delta.reasoning` (a
+reasoning parser, not enabled on the fleet today); the role-only opening chunk and the
+usage-only closing chunk are not tokens. Every request records this basis as
+`ttft_basis: first_chunk_with_text` (sender row, raw log, guard artifact). TPOT stays the
+client-side `(e2e - TTFT) / (completion_tokens - 1)` with `completion_tokens` from `usage`.
+
+The E1 client (`tre/loadgen_v1`, `client_dispatcher.py`) uses another TTFT basis: it
+stamps the first chunk whose `delta.content is not None`, and the role-only opening chunk
+has `content: ""`, so its TTFT ends at the role chunk. vLLM emits that chunk in the same
+engine iteration as the first token's text, so the two bases normally differ by the
+serialisation of one chunk; they differ by one decode step (or more) whenever the first
+token's text is empty - a byte of a multi-byte character (the mixed corpus makes Chinese
+output likely), text the detokenizer holds back, or, with a reasoning parser, reasoning
+that arrives outside `content`. The calibration TTFT is therefore never shorter than
+E1's for the same request, and the TPOT of the two differs by the same amount spread over
+`completion_tokens - 1`. The E1 client is not changed; compare TTFTs across the two
+clients only with this in mind.
+
+The D6' label's idle-TTFT fit (`slo.ttft_idle_c_ms` / `_b_ms_per_token` in the registry)
+was fitted on completions-era data; under chat each `L` includes the 5 template tokens
+(`b * 5` is ~0.3 ms).
+
 ## Result directory layout
 
 One campaign process per model writes `<run>/<model>/` (`--out-dir`). Capture layout

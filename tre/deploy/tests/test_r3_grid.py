@@ -4,6 +4,8 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
+import pytest
+
 from scripts import r3_grid
 
 
@@ -244,9 +246,11 @@ def test_drive_cell_writes_raw_jsonl(tmp_path) -> None:
     lines = [l for l in raw_path.read_text().splitlines() if l.strip()]
     assert lines  # at least one request logged
     rec = _json.loads(lines[0])
-    assert set(rec.keys()) == set(r3_grid.RAW_COLUMNS)
+    # the grid path writes the per-request prompt pair too (and no outcome: it is derived)
+    assert set(rec.keys()) == set(r3_grid.RAW_COLUMNS) | {"expected_prompt_tokens", "stream_error", "ttft_basis"}
     assert rec["cell_id"] == "i512_o128_c8"
-    assert rec["input_tokens"] == 130
+    assert rec["input_tokens"] == 130 and rec["expected_prompt_tokens"] == 512
+    assert rec["ttft_basis"] == "first_chunk_with_text" and rec["stream_error"] is None
 
 
 def test_drive_cell_writes_instant_sidecar(tmp_path) -> None:
@@ -291,6 +295,9 @@ def test_drive_cell_instant_sidecar_carries_the_pod_kv_cache_usage(tmp_path) -> 
         "http://gw", "dsqwen-7b", r3_grid.GridCell(128, 128, 1), duration_s=0.2,
         raw_path=raw_path, instant_path=instant_path,
         instant_sampler=fake_sampler, instant_interval_s=0.02, stream_call=fake_stream_call,
+        # The sidecar is under test, not the prompt: token ids need no tokenizer load
+        # inside a 0.2 s cell (which made this timing-sensitive under a loaded host).
+        prompt_mode="token_ids",
     )
     snaps = [_json.loads(l) for l in instant_path.read_text().splitlines() if l.strip()]
     assert len(snaps) >= 2
@@ -362,6 +369,25 @@ def test_prompt_mode_default_mirrors_the_replayer_constant() -> None:
 
     assert r3_grid.PROMPT_MODE_DEFAULT == prompts.DEFAULT_MODE == prompts.MODE_NATURAL
     assert tuple(r3_grid.PROMPT_MODES) == tuple(prompts.MODES)
+
+
+def test_corpus_defaults_mirror_the_replayer_constants() -> None:
+    """Same arrangement for what a natural prompt is written in: the default is the 1:1
+    Chinese/English mix, and the grid's CLI offers exactly the replayer's languages."""
+    from tre_replayer.engine import corpus
+
+    assert r3_grid.CORPUS_LANG_DEFAULT == corpus.DEFAULT_CORPUS_LANG == corpus.LANG_MIX
+    assert tuple(r3_grid.CORPUS_LANGS) == tuple(corpus.CORPUS_LANGS)
+    assert r3_grid.ZH_RATIO_DEFAULT == corpus.DEFAULT_ZH_RATIO == 0.5
+
+
+def test_zh_ratio_outside_the_unit_interval_is_a_usage_error() -> None:
+    import argparse
+
+    assert r3_grid._unit_interval("0.25") == 0.25
+    for bad in ("-0.1", "1.01"):
+        with pytest.raises(argparse.ArgumentTypeError):
+            r3_grid._unit_interval(bad)
 
 
 def test_drive_cell_sends_a_distinct_prompt_of_the_requested_length_per_request() -> None:
@@ -483,7 +509,51 @@ def test_r3_grid_accepts_a_prompt_directory_and_worker_count() -> None:
     """The campaign drives every cell through this CLI, so the materialisation has to be
     reachable from it or the boundary search silently falls back to inline builds."""
     args = r3_grid.parse_args([
-        "--model", "m", "--gateway-url", "http://gw", "--output", "o.csv",
+        "--model", "m", "--gateway-url", "http://gw/v1/chat/completions", "--output", "o.csv",
         "--prompt-dir", "/p", "--prompt-workers", "3",
     ])
     assert args.prompt_dir == "/p" and args.prompt_workers == 3
+
+
+def test_r3_grid_cli_defaults_to_the_mix_and_records_the_effective_ratio() -> None:
+    args = r3_grid.parse_args(["--model", "m", "--gateway-url", "http://gw/v1/chat/completions", "--output", "o.csv"])
+    assert (args.corpus_lang, args.zh_ratio) == ("mix", 0.5)
+    args = r3_grid.parse_args(["--model", "m", "--gateway-url", "http://gw/v1/chat/completions", "--output", "o.csv",
+                               "--corpus-lang", "en"])
+    assert args.corpus_lang == "en"
+    from scripts import prompt_corpus
+
+    assert prompt_corpus.effective_zh_ratio("en", 0.5) == 0.0
+    assert prompt_corpus.effective_zh_ratio("zh", 0.5) == 1.0
+    assert prompt_corpus.effective_zh_ratio("mix", 0.3) == 0.3
+
+
+def test_drive_cell_schedule_hands_the_corpus_to_the_materialiser_and_the_sender(monkeypatch, tmp_path) -> None:
+    """Both must get it: a miss falls back to the sender's inline build, which has to
+    produce the bytes the materialiser would have."""
+    from scripts import openloop
+    from tre_replayer.engine import http_sender, prompt_store
+    from tre_replayer.engine.schedule import RpsSegment
+
+    seen: dict = {}
+
+    class _Stop(Exception):
+        pass
+
+    def fake_materialize(events, **kwargs):
+        seen["materialize"] = kwargs
+        return prompt_store.PromptStore({})
+
+    class FakeSender:
+        def __init__(self, url, **kwargs):
+            seen["sender"] = kwargs
+            raise _Stop
+
+    monkeypatch.setattr(prompt_store, "materialize_prompts", fake_materialize)
+    monkeypatch.setattr(http_sender, "StreamingHttpSender", FakeSender)
+    segments = [RpsSegment(model="m", start_s=0.0, end_s=2.0, rps=5.0, input_tokens=64, max_output_tokens=8)]
+    with pytest.raises(_Stop):
+        openloop.drive_cell_schedule("http://gw", "m", "c1", segments, prompt_dir=tmp_path,
+                                     corpus_lang="zh", zh_ratio=0.5)
+    assert seen["materialize"]["corpus_lang"] == "zh" and seen["materialize"]["zh_ratio"] == 0.5
+    assert seen["sender"]["corpus_lang"] == "zh" and seen["sender"]["zh_ratio"] == 0.5

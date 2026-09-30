@@ -48,6 +48,12 @@ What is in here
   per second, binned on the schedule's own time base from the instants the requests
   really went on the wire. It is the evidence that the cell offered the intensity its
   schedule describes.
+* the **endpoint** (``api``): the campaign sends ``/v1/chat/completions`` (see
+  :mod:`tre_replayer.engine.api`), with each prompt fitted to the cell's length *after*
+  the chat template. :func:`prompt_tokens_check` compares every served request's
+  ``usage.prompt_tokens`` with that length (per cell, in the guard artifact) and
+  :func:`preflight_prompt_tokens` does it once per model before a run starts - one
+  request, refused on any difference.
 * :func:`make_pod_metrics_sampler` - a 1 Hz sidecar that scrapes the model pods'
   ``/metrics`` directly instead of reading the gateway's redis buckets. The gateway
   writes instantaneous gauges on a 10 s boundary-aligned ticker
@@ -426,6 +432,7 @@ def classify_failure(record: dict) -> str:
 
     Rules, in order:
 
+    * 2xx whose stream carried an ``{"error": ...}`` chunk (``stream_error``) -> model.
     * 2xx with a measured end-to-end time -> served.
     * the sender flagged ``client_timeout`` -> the client's own deadline fired. Checked
       before everything else because it is the only class the *sender* can attest to;
@@ -449,6 +456,10 @@ def classify_failure(record: dict) -> str:
     circuit breaker, void a whole 450 s cell.
     """
     status = record.get("http_status")
+    if record.get("stream_error") and status is not None and 200 <= int(status) < 300:
+        # The engine failed the request inside a 200 stream ({"error": ...} chunk): it
+        # answered for itself, so it is the model's failure, and never a completion.
+        return FAILURE_MODEL
     if status is not None and 200 <= int(status) < 300 and record.get("e2e_ms") is not None:
         return FAILURE_NONE
 
@@ -1715,6 +1726,8 @@ def drive_cell_schedule(
     instant_sampler: Optional[Callable[[int], dict]] = None,
     instant_interval_s: float = DEFAULT_SIDECAR_INTERVAL_S,
     prompt_mode: Optional[str] = None,
+    corpus_lang: Optional[str] = None,
+    zh_ratio: Optional[float] = None,
     prompt_dir: Optional[Path] = None,
     prompt_workers: Optional[int] = None,
     rps_timeline_path: Optional[Path] = None,
@@ -1732,6 +1745,8 @@ def drive_cell_schedule(
     instants_out: Optional[list] = None,
     request_key: Optional[str] = None,
     max_backlog: Optional[int] = None,
+    api: Optional[str] = None,
+    request_seed: Optional[int] = None,
 ) -> tuple:
     """Drive one open-loop cell from ``segments``; returns (start_ms, end_ms, guard).
 
@@ -1749,8 +1764,11 @@ def drive_cell_schedule(
 
     ``prompt_mode`` None means "whatever the sender defaults to"
     (:data:`tre_replayer.engine.prompts.DEFAULT_MODE`), so the default lives in exactly
-    one place. ``routing_strategy`` moves the requests onto the AIBrix-routed path, which
-    is the only path that reports a serving pod and is therefore the only way
+    one place; ``corpus_lang`` / ``zh_ratio`` likewise (None = the corpus defaults of
+    :mod:`tre_replayer.engine.corpus`), and both the materialiser and the sender's inline
+    fallback get the same values, so a miss still sends the same bytes.
+    ``routing_strategy`` moves the requests onto the AIBrix-routed path, which is the only
+    path that reports a serving pod and is therefore the only way
     :func:`routing_balance` sees anything - at the cost of changing who picks the pod.
 
     With ``prompt_dir`` every prompt of this cell's schedule is built in a process pool
@@ -1770,6 +1788,11 @@ def drive_cell_schedule(
     :class:`StopOnBacklog`; a stop is recorded on the guard as a truncation whose cause
     is :data:`TRUNCATION_BACKLOG`, and the windows after it are censored like any
     truncation's.
+
+    ``api`` is the endpoint (None = the sender's default, completions; ``r3_grid`` always
+    passes its ``--api``, chat by default) and reaches both the materialiser - a chat
+    prompt is fitted to the templated length - and the sender; ``request_seed`` is sent as
+    the requests' ``seed`` when given.
 
     The per-request raw lines use ``r3_grid.RAW_COLUMNS`` and the instant sidecar uses the
     ``r3_grid`` sidecar schema plus ``on_live_grid``, so the offline re-windowing path is
@@ -1791,6 +1814,13 @@ def drive_cell_schedule(
 
     # Before anything else, and before any thread or sidecar exists: the pool forks, and
     # the whole point is that this cost is paid in setup rather than inside the loop.
+    corpus_kwargs = {}
+    if corpus_lang is not None:
+        corpus_kwargs["corpus_lang"] = corpus_lang
+    if zh_ratio is not None:
+        corpus_kwargs["zh_ratio"] = float(zh_ratio)
+    if api is not None:
+        corpus_kwargs["api"] = api
     prompt_store = None
     if prompt_dir is not None:
         prompt_store = materialize_prompts(
@@ -1798,9 +1828,14 @@ def drive_cell_schedule(
             path=prompt_file_path(prompt_dir, cell_id),
             mode=prompt_mode or DEFAULT_MODE,
             processes=prompt_workers,
+            **corpus_kwargs,
         )
 
-    sender_kwargs = {} if prompt_mode is None else {"prompt_mode": prompt_mode}
+    sender_kwargs = dict(corpus_kwargs)
+    if prompt_mode is not None:
+        sender_kwargs["prompt_mode"] = prompt_mode
+    if request_seed is not None:
+        sender_kwargs["request_seed"] = int(request_seed)
     sender = StreamingHttpSender(
         gateway_url,
         stream_call=stream_call,
@@ -1965,6 +2000,13 @@ def _raw_from_sender_record(cell_id: str, record: dict) -> dict:
     on_wire = record.get("on_wire_delay_ms")
     raw.update({
         "request_id": record.get("request_id"),
+        # The prompt length the request was built to (the cell's input tokens; for chat
+        # the templated total). ``input_tokens`` is what the engine reported
+        # (usage.prompt_tokens); the two must be equal (prompt_tokens_check).
+        "expected_prompt_tokens": record.get("input_tokens"),
+        # What ttft_ms measures (tre_replayer.engine.stream.TTFT_BASIS).
+        "ttft_basis": record.get("ttft_basis"),
+        "stream_error": record.get("stream_error"),
         "scheduled_send_ts_ms": (
             None if on_wire is None
             else round(float(record["actual_send_ts_ms"]) - float(on_wire), 3)
@@ -1978,6 +2020,58 @@ def _raw_from_sender_record(cell_id: str, record: dict) -> dict:
         ),
     })
     return raw
+
+
+#: Mismatching requests listed by :func:`prompt_tokens_check` (the counts cover all).
+PROMPT_TOKEN_EXAMPLES = 5
+
+
+def prompt_tokens_check(records: Sequence[dict], *, expected_key: str = "input_tokens",
+                        actual_key: str = "prompt_tokens") -> dict:
+    """Did every served request prefill the length it was built to?
+
+    Over the records of a cell: a served request (outcome ``ok``, :func:`outcome_of`) must
+    report ``usage.prompt_tokens`` (``actual_key``; ``prompt_tokens`` on a sender row,
+    ``input_tokens`` on a raw record) equal to the length its prompt was fitted to
+    (``expected_key``; ``input_tokens`` on a sender row, ``expected_prompt_tokens`` on a
+    raw record). ``mismatched`` counts those that did not, ``missing_usage`` served ones
+    without a usage block (``stream_options.include_usage`` ignored), ``max_abs_diff``
+    the largest difference; ``examples`` lists a few. Recorded per cell (guard artifact);
+    the standard dataset refuses a cell that fails it (``calibration_dataset``).
+    """
+    served = mismatched = missing = 0
+    max_abs = 0
+    examples: list[dict] = []
+    for record in records:
+        if outcome_of(record) != OUTCOME_NAMES[FAILURE_NONE]:
+            continue
+        served += 1
+        actual, expected = record.get(actual_key), record.get(expected_key)
+        if actual is None or expected is None:
+            missing += 1
+            continue
+        diff = int(actual) - int(expected)
+        if diff:
+            mismatched += 1
+            max_abs = max(max_abs, abs(diff))
+            if len(examples) < PROMPT_TOKEN_EXAMPLES:
+                examples.append({"request_id": record.get("request_id"),
+                                 "expected": int(expected), "prompt_tokens": int(actual)})
+    return {"served": served, "checked": served - missing, "mismatched": mismatched,
+            "missing_usage": missing, "max_abs_diff": max_abs, "examples": examples,
+            "ok": mismatched == 0 and missing == 0}
+
+
+def preflight_prompt_tokens(gateway_url: str, model: str, **kwargs) -> dict:
+    """One request of the run's exact kind to ``model``; its verdict (``ok``, ``reasons``,
+    ``prompt_tokens`` against ``expected_prompt_tokens``, the SSE field of the first token,
+    the template overhead, the content's Chinese share). The check itself lives with the
+    sending core, :func:`tre_replayer.engine.preflight.preflight_prompt_tokens` (keyword
+    arguments pass through); this forwarder keeps the replayer import lazy, as everywhere
+    in this module."""
+    from tre_replayer.engine.preflight import preflight_prompt_tokens as check
+
+    return check(gateway_url, model, **kwargs)
 
 
 def _append_jsonl(path: Path, records: Sequence[dict]) -> None:

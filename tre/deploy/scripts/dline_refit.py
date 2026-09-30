@@ -308,7 +308,8 @@ class DatasetSource:
             raise TrainingSetError(f"{path}: no {DATASET_WINDOWS} (a standard dataset directory)")
         if not name:
             name = d.parent.name if d.name == "dataset" else d.name
-        return cls(name=name, directory=d, sealed_to_h2=sealed_to_h2)
+        # Absolute, so a freeze run from another directory still finds the dataset.
+        return cls(name=name, directory=d.resolve(), sealed_to_h2=sealed_to_h2)
 
 
 def sha256_file(path: Path) -> str:
@@ -377,6 +378,18 @@ def _dataset_header(src: DatasetSource) -> list[str]:
     return list(header)
 
 
+def prompt_token_mismatched_cells(src: DatasetSource) -> set[tuple[str, str]]:
+    """``(cell_id, attempt)`` of the source's cells whose served requests were off their
+    prompt length (``cells.csv`` ``prompt_tokens_mismatched > 0``; a dataset built with
+    ``--allow-prompt-token-mismatch``). Empty for a dataset without the column."""
+    path = src.directory / "cells.csv"
+    if not path.is_file():
+        return set()
+    with open(path, newline="", encoding="utf-8") as fh:
+        return {(row.get("cell_id", ""), row.get("attempt", "")) for row in csv.DictReader(fh)
+                if (row.get("prompt_tokens_mismatched") or "0").strip() not in ("", "0")}
+
+
 def build_training_set(sources: Sequence[DatasetSource], fit_dir: Path, *,
                        sentinels: bool = True, models: Optional[Sequence[str]] = None) -> dict:
     """D16: cut the training set (constant-load cells) out of standard datasets.
@@ -426,6 +439,7 @@ def build_training_set(sources: Sequence[DatasetSource], fit_dir: Path, *,
             writers[model] = ws
         return writers[model]
 
+    off_length = {s.name: prompt_token_mismatched_cells(s) for s in sources}
     try:
         for src in sources:
             header = headers[src.name]
@@ -451,6 +465,12 @@ def build_training_set(sources: Sequence[DatasetSource], fit_dir: Path, *,
                         continue
                     if models and model not in models:
                         continue
+                    if (row["cell_id"], row["attempt"]) in off_length[src.name]:
+                        raise TrainingSetError(
+                            f"{src.name}: training cell {row['cell_id']} attempt {row['attempt']} served "
+                            f"requests off their prompt length (cells.csv prompt_tokens_mismatched > 0; all "
+                            f"such cells of the source: {sorted(off_length[src.name])}); a theta is never "
+                            "fitted on windows indexed by a length the engine did not prefill")
                     sid = row["scenario_id"]
                     prev = owner.setdefault((model, sid), src.name)
                     if prev != src.name:
@@ -1529,6 +1549,11 @@ def freeze_model(out_root: Path, fit_dir: Path, model: str, arm: str) -> tuple[O
                             "dir does not match this refit, or its training inputs changed since")
         else:
             man_doc = json.loads(man.read_text(encoding="utf-8"))
+            load_paths, lp_problems = training_load_paths(man_doc)
+            problems += lp_problems
+            if len(load_paths) > 1:
+                problems.append(f"the training set mixes load paths {sorted(load_paths)}: a theta "
+                                "fitted across prompt corpora / routing / APIs describes neither")
             lp = fit_dir / TRAINING_LEDGER
             try:
                 check_training_inputs(model, p, ledger=load_ledgers([str(lp)]) if lp.exists() else None)
@@ -1564,8 +1589,57 @@ def freeze_model(out_root: Path, fit_dir: Path, model: str, arm: str) -> tuple[O
                "cells_sha256": (man_doc.get("h2") or {}).get("cells_sha256"),
                "manifest_sha256": sha256_file(h2_path) if h2_path.exists() else None},
         "trainset": {"manifest_sha256": ts.get("trainset_manifest_sha256"), "sentinels": ts.get("sentinels")},
+        # The training load path (scripts.prompt_corpus): what the prompts were written in
+        # and how they were routed. M and T14 refuse to run under this freeze with another.
+        # Absent in older freezes = English prompts, no routing header.
+        "prompt_corpus": next(iter(load_paths.values()))["prompt"],
+        "routing_strategy": next(iter(load_paths.values()))["routing_strategy"],
+        # ... and through which API (absent in older freezes = completions). The idle-TTFT
+        # fit of the D6' label and every length in ttft_len_samples count the prompt the
+        # way this API does (chat: template included).
+        "api": next(iter(load_paths.values()))["api"],
     }
     return entry, []
+
+
+def training_load_paths(trainset_manifest: Mapping) -> tuple[dict[str, dict], list[str]]:
+    """``({description: load path}, problems)`` over the standard datasets a training set
+    (the trainset stage's manifest, ``sources[].directory``) was cut from, each read from
+    the dataset's own manifest - whose sha256 must still be the one the trainset stage
+    recorded. A manifest that is missing, unreadable or changed is a problem, never a
+    silent default; a readable one without a record predates the options (English
+    prompts, no routing header)."""
+    from scripts import prompt_corpus as corpus_record
+
+    found: dict[str, dict] = {}
+    problems: list[str] = []
+    sources = trainset_manifest.get("sources") or []
+    if not sources:
+        problems.append("the trainset manifest lists no sources: the training load path is unknown")
+    for source in sources:
+        directory = source.get("directory")
+        manifest = Path(directory) / DATASET_MANIFEST if directory else None
+        if manifest is None or not manifest.is_file():
+            problems.append(f"training source {source.get('run')!r}: no dataset manifest at "
+                            f"{manifest}: its load path (prompt corpus, routing) is unknown")
+            continue
+        recorded = source.get("manifest_sha256")
+        if not recorded:
+            problems.append(f"{manifest}: the trainset stage saw no dataset manifest here, so what "
+                            "is there now cannot be the training data's")
+            continue
+        if sha256_file(manifest) != recorded:
+            problems.append(f"{manifest} changed since the trainset stage read it "
+                            f"(sha256 {recorded})")
+            continue
+        try:
+            doc = json.loads(manifest.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            problems.append(f"{manifest}: unreadable ({exc})")
+            continue
+        path = corpus_record.dataset_load_path(doc)
+        found[corpus_record.describe_load_path(path)] = path
+    return found, problems
 
 
 def stage_freeze(out_root: Path, fit_dir_of: Callable[[str], Path], models: Sequence[str], arm: str,
@@ -2055,10 +2129,10 @@ def _accept_result(freeze_file: Path, inp: Mapping[str, Any], work: Path, *, n_r
         for line in (mdir / str(man["sha256sums_file"])).read_text(encoding="utf-8").splitlines():
             if line.strip():
                 name = _parse_sums_line(line)[1]
-                sums_cover.add(str(Path(name) if Path(name).is_absolute() else mdir / name))
+                sums_cover.add(str((Path(name) if Path(name).is_absolute() else mdir / name).resolve()))
     datasets = [{"name": s.name, "directory": str(s.directory), "windows_csv": str(s.windows),
                  "windows_csv_sha256": sha256_file(s.windows),
-                 "covered_by_m_sha256sums": str(s.windows) in sums_cover}
+                 "covered_by_m_sha256sums": str(Path(s.windows).resolve()) in sums_cover}
                 for s in inp["sources"]]
     from tre_calibration import ranking
 

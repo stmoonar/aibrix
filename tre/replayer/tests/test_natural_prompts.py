@@ -73,7 +73,9 @@ def test_natural_prompts_diverge_inside_the_head_for_every_seed_key() -> None:
 
 
 def test_natural_prompt_reads_as_english_not_as_a_token_soup() -> None:
-    text = prompts.build_natural_prompt(128, "run|cell|1", tokenizer=StubTokenizer())
+    text = prompts.build_natural_prompt(
+        128, "run|cell|1", tokenizer=StubTokenizer(), corpus_lang="en"
+    )
     assert text.count(" ") > 60  # words, not one long blob
     assert "." in text  # sentences
     assert all(ord(ch) < 128 for ch in text)

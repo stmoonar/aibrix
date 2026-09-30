@@ -275,6 +275,38 @@ def test_cell_command_passes_the_drain_offset_so_truncation_can_jump_to_it() -> 
     assert command[command.index("--min-slo-windows") + 1] == "3"
 
 
+def test_cell_command_pins_the_prompt_corpus_and_the_manifest_records_it() -> None:
+    """Every cell is driven with the corpus the run manifest names - pinned on the
+    command line, not left to r3_grid's default - so a theta and the set that later
+    judges it (M, T14) can be checked to have seen the same kind of prompt."""
+    runnable, _ = campaign.build_plan(_index(), ["dsqwen-7b"])
+    ramp = next(c for c in runnable if c.primitive == "ramp")
+
+    class Args(_Args):
+        gateway_url = "http://gw/v1/completions"
+        raw_dir = Path("/raw")
+        model_namespace = "default"
+        guard_mode = "warn"
+        min_slo_windows = 3
+        registry = None
+        redis_url = None
+
+    command = campaign.cell_command(ramp, Args(), Path("/s/S1_ramp.json"), Path("/o/out.csv"))
+    assert command[command.index("--corpus-lang") + 1] == "mix"
+    assert float(command[command.index("--zh-ratio") + 1]) == 0.5
+    assert campaign.prompt_corpus(Args()) == {
+        "prompt_mode": "natural", "corpus_lang": "mix", "zh_ratio": 0.5,
+    }
+
+    class English(Args):
+        corpus_lang = "en"
+        zh_ratio = 0.0
+
+    command = campaign.cell_command(ramp, English(), Path("/s/S1_ramp.json"), Path("/o/out.csv"))
+    assert command[command.index("--corpus-lang") + 1] == "en"
+    assert campaign.prompt_corpus(English())["corpus_lang"] == "en"
+
+
 def test_a_cell_is_windowed_like_the_fit_so_its_probe_verdict_is_the_fit_s_label() -> None:
     class Args(_Args):
         gateway_url = "http://gw/v1/completions"
@@ -949,3 +981,51 @@ def test_calibration_requires_controller_and_sm_actuation_both_observe(monkeypat
     values[campaign.CONTROLLER_MODE_KEY] = "active"
     with pytest.raises(SystemExit, match="controller mode"):
         campaign.require_calibration_run_mode("tre-v2")
+
+
+def test_calibration_cells_route_with_least_gpu_cache_unless_told_otherwise() -> None:
+    """The replayer and v1 send routing-strategy: least-gpu-cache; a calibration that
+    left it out went through Envoy's own balancing instead, which only stops mattering
+    with one replica."""
+    runnable, _ = campaign.build_plan(_index(), ["dsqwen-7b"])
+    ramp = next(c for c in runnable if c.primitive == "ramp")
+
+    class Args(_Args):
+        gateway_url = "http://gw/v1/completions"
+        raw_dir = Path("/raw")
+        model_namespace = "default"
+        guard_mode = "warn"
+        min_slo_windows = 3
+        registry = None
+        redis_url = None
+
+    command = campaign.cell_command(ramp, Args(), Path("/s/S1_ramp.json"), Path("/o/out.csv"))
+    assert command[command.index("--routing-strategy") + 1] == "least-gpu-cache"
+    assert campaign.routing_strategy_for(Args()) == campaign.DEFAULT_ROUTING_STRATEGY == "least-gpu-cache"
+
+    for off in ("", "none", "None", None):
+        class NoHeader(Args):
+            routing_strategy = campaign.normalize_routing_strategy(off)
+
+        assert "--routing-strategy" not in campaign.cell_command(
+            ramp, NoHeader(), Path("/s/S1_ramp.json"), Path("/o/out.csv"))
+        assert campaign.routing_strategy_for(NoHeader()) is None
+
+    class Other(Args):
+        routing_strategy = "least-request"
+
+    command = campaign.cell_command(ramp, Other(), Path("/s/S1_ramp.json"), Path("/o/out.csv"))
+    assert command[command.index("--routing-strategy") + 1] == "least-request"
+
+
+def test_the_recorded_ratio_is_the_effective_one() -> None:
+    class English(_Args):
+        corpus_lang = "en"
+        zh_ratio = 0.5
+
+    class Chinese(_Args):
+        corpus_lang = "zh"
+        zh_ratio = 0.5
+
+    assert campaign.prompt_corpus(English())["zh_ratio"] == 0.0
+    assert campaign.prompt_corpus(Chinese())["zh_ratio"] == 1.0

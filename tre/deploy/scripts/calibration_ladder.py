@@ -660,6 +660,7 @@ def run_ladder_campaign(args, *, drive: Optional[Callable] = None,
                              f"{campaign.REQUIRED_CONTROLLER_MODE!r})")
         print(f"controller mode: {mode}")
         campaign.require_capture_clock_domains(args)
+        campaign.require_prompt_preflight(args, out_dir=out_dir)
     manifest_sha = write_frozen(out_dir / RUN_MANIFEST, manifest)
     plan_doc["run_manifest_sha256"] = manifest_sha
     (out_dir / "plan.json").write_text(json.dumps(plan_doc, indent=2) + "\n", encoding="utf-8")

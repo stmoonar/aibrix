@@ -43,6 +43,8 @@ def _write(path: Path, doc) -> Path:
 
 def _base_run(root: Path, model: str) -> Path:
     d = root / model
+    # a campaign from before the load-path record: English prompts, no routing header
+    _write(d / "plan.json", {"models": [model]})
     _write(d / ladder.DESIGN_RESULT, {"models": [{
         "model": model, "status": "complete", "anchors": dict(ANCHORS),
         "anchor_sources": {s: "midpoint of the final (healthy, violated) bracket" for s in ANCHORS}}]})
@@ -57,6 +59,7 @@ def _base_run(root: Path, model: str) -> Path:
 
 def _supp_run(root: Path, model: str, *, status=boundary.RHO_STAR_MEASURED,
               capacity=CAPACITY["S3"]) -> Path:
+    _write(root / model / "plan.json", {"models": [model]})
     _write(root / model / "boundary" / f"{model}_S3.json", {
         "mode": supplement.MODE, "rho_star_status": status, "anchor_rho": SUPP_S3,
         "rho_star_bracket": [SUPP_S3 * 0.98, SUPP_S3 * 1.02],
@@ -75,6 +78,8 @@ def _args(tmp_path, model="dsqwen-14b", **over):
         max_model_error_rate=0.05, envoy_stats_url=None, envoy_cluster_filter=None,
         base_run=_base_run(tmp_path / "base", model),
         boundary_supplement_run=_supp_run(tmp_path / "supp", model),
+        # the fixture runs predate the load-path record (English, no routing header)
+        corpus_lang="en", zh_ratio=0.0, routing_strategy=None, api="completions",
     )
     base.update(over)
     return argparse.Namespace(**base)

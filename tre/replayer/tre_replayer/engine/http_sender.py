@@ -34,6 +34,27 @@ than guessed at:
 ``scripts.openloop.check_cell``). The other three stay because they decompose it, and a
 cell that misses its deadline is only actionable once it is known which of the three
 segments consumed the time.
+
+Layout
+------
+This module is the open-loop *driver-facing* sender: scheduling hand-off, the worker pool,
+prompt lookup and the per-request record with its lateness decomposition. The sending
+core it is built on has no driver in it and is shared: :mod:`tre_replayer.engine.api`
+builds the request (body and headers) and :mod:`tre_replayer.engine.stream` makes one
+streamed call (timing, SSE parsing, usage, failure evidence; ``result_fields`` is the
+answer's part of the record). Their names are re-exported here.
+
+Endpoint
+--------
+``api`` (:mod:`tre_replayer.engine.api`) picks ``/v1/completions`` (the default - the
+trace replays send exactly what they always sent) or ``/v1/chat/completions`` (the
+calibration drivers, like v1 and the E1 client). The gateway URL must name the matching
+path. TTFT is the first chunk that carries generated text in any of the fields an
+OpenAI-compatible server puts it in: ``text`` (completions), ``delta.content``, and
+``delta.reasoning_content`` / ``delta.reasoning`` (chat with a reasoning parser, where a
+R1-style model's first tokens are reasoning). The role-only opening chunk of a chat
+stream (``delta: {"role": "assistant", "content": ""}``) carries no token and is not
+the first token; the field that carried it is recorded as ``first_token_field``.
 """
 from __future__ import annotations
 
@@ -41,110 +62,58 @@ import json
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
 from typing import Any, Callable
 
+# The sending core lives in two driver-free modules; everything is re-exported here so
+# every existing import of these names keeps working.
+from tre_replayer.engine.api import (  # noqa: F401
+    API_CHAT,
+    API_COMPLETIONS,
+    API_PATHS,
+    APIS,
+    DEFAULT_API,
+    DEFAULT_ROUTING_STRATEGY,
+    ROUTING_STRATEGY_HEADER,
+    build_request_headers,
+    check_api,
+    check_api_mode,
+    check_api_url,
+    request_body,
+)
+from tre_replayer.engine.stream import (  # noqa: F401
+    CHAT_TOKEN_FIELDS,
+    CONTINUED_FIELD,
+    CONTINUED_HEADER,
+    MAX_ERROR_BODY_CHARS,
+    POD_HEADER_KEYS,
+    RETRIED_HEADER,
+    StreamCall,
+    StreamResult,
+    TTFT_BASIS,
+    _chunk_has_content,
+    _positive_int,
+    chunk_token_field,
+    is_client_timeout,
+    lower_headers,
+    pod_from_headers,
+    read_error_body,
+    reissue_from_headers,
+    result_fields,
+    stream_error_message,
+    stream_request,
+)
 from tre_replayer.engine.prompt_store import PromptStore, sender_seed_key
-from tre_replayer.engine.prompts import DEFAULT_MODE, build_prompt
+from tre_replayer.engine.prompts import (
+    DEFAULT_CORPUS_LANG,
+    DEFAULT_MODE,
+    DEFAULT_ZH_RATIO,
+    build_prompt,
+    check_corpus,
+)
 from tre_replayer.engine.schedule import ScheduledRequest
 
-#: Response headers, in preference order, that name the pod that served a request.
-#: ``target-pod`` / ``target-pod-ip`` are what the AIBrix gateway plugin sets on the
-#: routed path (``pkg/plugins/gateway/gateway_rsp_headers.go``); the ``x-`` names are
-#: there so a header added at the Envoy layer - which is what the per-model HTTPRoute
-#: path would need - is picked up without another client change. The pod *name* is
-#: preferred over its address because it survives a pod IP being reused.
-POD_HEADER_KEYS = ("target-pod", "x-target-pod", "x-upstream-pod", "target-pod-ip")
-
-#: What the TRE reissue sidecar reports (tre/docs/design/20260927-reissue-sidecar-v2.md):
-#: ``x-tre-retried: <attempts>`` on a request that never started on the pod it was routed
-#: to and was resent through the gateway; ``x-tre-continued: <segments>`` on a
-#: non-streaming answer stitched from segments of several pods. A stream carries the
-#: segment count in the extension field ``tre_continued`` of its final (finish_reason)
-#: chunk and in a closing SSE comment ``: x-tre-continued: <segments>``.
-RETRIED_HEADER = "x-tre-retried"
-CONTINUED_HEADER = "x-tre-continued"
-CONTINUED_FIELD = "tre_continued"
-
-#: Request header that makes the AIBrix gateway plugin route (and therefore report the
-#: pod it routed to). See :class:`StreamingHttpSender`.
-ROUTING_STRATEGY_HEADER = "routing-strategy"
-
-#: What the v1 client sent on every request (OpenAI SDK ``default_headers``, all v1
-#: configs: ``client.routing_algorithm: least-gpu-cache``): the plugin picks the awake pod
-#: with the lowest ``vllm:kv_cache_usage_perc`` (``gpu_cache_usage_perc`` before 0.11).
-#: The trace replayer (``run_trace``) and the campaign default to it so both arms are
-#: routed the way v1 routed them.
-DEFAULT_ROUTING_STRATEGY = "least-gpu-cache"
-
-
-def pod_from_headers(headers: dict[str, str] | None) -> str | None:
-    """First :data:`POD_HEADER_KEYS` entry present in ``headers`` (already lower-cased)."""
-    if not headers:
-        return None
-    for key in POD_HEADER_KEYS:
-        value = headers.get(key)
-        if value:
-            return value
-    return None
-
-
-@dataclass
-class StreamResult:
-    """Outcome of one streamed completion. Durations are measured from request start
-    (the seam times itself); None where genuinely unavailable."""
-
-    status: int
-    first_token_ms: float | None
-    done_ms: float | None
-    prompt_tokens: int | None = None
-    completion_tokens: int | None = None
-    error: str | None = None
-    #: Verbatim body of a non-2xx answer, truncated. A failure cannot be attributed
-    #: without it: the serving path has two rejections wearing the same status code -
-    #: the engine answering with its own JSON error, and the gateway circuit breaker
-    #: rejecting at the Envoy cluster with a plain-text body, having never reached the
-    #: engine at all. See ``scripts.openloop.classify_failure``.
-    error_body: str | None = None
-    #: Lower-cased response headers of a non-2xx answer. The content type and any
-    #: ``x-envoy-*`` marker are what the classifier reads.
-    error_headers: dict[str, str] | None = None
-    #: Name (or address) of the pod that served this request, read from whichever of
-    #: :data:`POD_HEADER_KEYS` the answer carried. None when the serving path exposes no
-    #: such header - which is the case on the per-model HTTPRoute the campaign uses, so
-    #: a None here means "not attributable", never "no pod".
-    target_pod: str | None = None
-    #: The client gave up before the upstream answered. Its own class, because nothing
-    #: is known about what the engine did with the request: folding it into the model's
-    #: error budget would read as an engine fault, and folding it into the gateway's
-    #: would read as a shed. See ``scripts.openloop.classify_failure``.
-    timed_out: bool = False
-    #: ``finish_reason`` of the final choice chunk (``abort`` = the client saw a
-    #: truncated answer, e.g. a sleep the sidecar could not hide).
-    finish_reason: str | None = None
-    #: Continuation segments the reissue sidecar stitched in (None = not continued).
-    tre_continued: int | None = None
-    #: Gateway attempts of a sidecar retry (None = not retried).
-    tre_retried: int | None = None
-
-
-def _positive_int(value: Any) -> int | None:
-    try:
-        number = int(str(value).strip())
-    except (TypeError, ValueError):
-        return None
-    return number if number > 0 else None
-
-
-def reissue_from_headers(headers: dict[str, str] | None) -> tuple[int | None, int | None]:
-    """(tre_continued, tre_retried) from lower-cased response headers."""
-    if not headers:
-        return None, None
-    return _positive_int(headers.get(CONTINUED_HEADER)), _positive_int(headers.get(RETRIED_HEADER))
-
-
-# seam: (url, headers, body_bytes, timeout_s) -> StreamResult
-StreamCall = Callable[[str, dict[str, str], bytes, float], StreamResult]
+#: The default seam (kept under its old name).
+_default_stream_call = stream_request
 
 
 def _now_ms() -> int:
@@ -184,18 +153,39 @@ class StreamingHttpSender:
         max_in_flight: int = 512,
         prompt_mode: str = DEFAULT_MODE,
         prompt_store: PromptStore | None = None,
+        corpus_lang: str = DEFAULT_CORPUS_LANG,
+        zh_ratio: float = DEFAULT_ZH_RATIO,
         routing_strategy: str | None = None,
         now_ms: Callable[[], int] = _now_ms,
         mono: Callable[[], float] = time.monotonic,
+        api: str = DEFAULT_API,
+        request_seed: int | None = None,
     ) -> None:
+        # The endpoint, checked against the URL and the prompt mode before anything is
+        # built: a chat body on the completions path (or a token-id chat message) fails
+        # every request, so it is refused here, once.
+        check_api_url(gateway_url, api)
+        check_api_mode(api, prompt_mode)
+        self._api = api
+        self._request_seed = None if request_seed is None else int(request_seed)
         self._url = gateway_url
         self._call = stream_call or _default_stream_call
         self._in = input_tokens_default
         self._out = output_tokens_default
         self._prompt_mode = prompt_mode
+        # The inline fallback must build exactly what the materialiser built, so the
+        # corpus travels with the sender as well as with the store.
+        check_corpus(corpus_lang, zh_ratio)
+        self._corpus_lang = corpus_lang
+        self._zh_ratio = float(zh_ratio)
         # Prompts built before the run started (tre_replayer.engine.prompt_store). Without
         # one the sender falls back to fitting each prompt inline, which costs milliseconds
         # of GIL-held tokenizer work inside on_wire_delay_ms - see that module's docstring.
+        if prompt_store is not None and getattr(prompt_store, "api", None) not in (None, api):
+            # A chat prompt is fitted to the templated length, a completions one to the bare
+            # string: the other endpoint's prompts are the wrong length on this one.
+            raise ValueError(f"the prompt store {getattr(prompt_store, 'path', None)} holds {prompt_store.api} "
+                             f"prompts, but this sender sends {api}")
         self._prompt_store = prompt_store
         self._routing_strategy = routing_strategy
         self._now = now_ms
@@ -255,6 +245,9 @@ class StreamingHttpSender:
             sender_seed_key(request.model, request.request_id),
             mode=self._prompt_mode,
             model=request.model,
+            corpus_lang=self._corpus_lang,
+            zh_ratio=self._zh_ratio,
+            api=self._api,
         )
 
     def _send_one(self, request: ScheduledRequest, scheduled_ts: float, actual_ts: float) -> dict[str, Any]:
@@ -272,15 +265,7 @@ class StreamingHttpSender:
         # (see tre_replayer.engine.prompt_store).
         prompt = self._prompt_for(request, in_tokens)
         body = json.dumps(
-            {
-                "model": request.model,
-                "prompt": prompt,
-                "max_tokens": out_tokens,
-                "temperature": 0,
-                "ignore_eos": True,
-                "stream": True,
-                "stream_options": {"include_usage": True},
-            }
+            request_body(request.model, prompt, out_tokens, api=self._api, seed=self._request_seed)
         ).encode("utf-8")
         headers = build_request_headers(request.model, self._routing_strategy)
         timeout_s = max(30.0, out_tokens / 4.0)
@@ -315,24 +300,14 @@ class StreamingHttpSender:
             # Scheduled instant -> socket call. The guard's deadline; see the module
             # docstring for why the three segments above are not it.
             "on_wire_delay_ms": round(max(0.0, (wire_ts - scheduled_ts) * 1000.0), 3),
-            "ttft_ms": res.first_token_ms,
-            "e2e_ms": res.done_ms,
+            # The prompt length asked for - for chat the templated total, i.e. what
+            # usage.prompt_tokens (``prompt_tokens``) must equal.
             "input_tokens": in_tokens,
             "output_tokens": out_tokens,
-            "prompt_tokens": res.prompt_tokens,
-            "completion_tokens": res.completion_tokens,
-            "http_status": res.status,
-            "error": res.error,
-            "error_body": res.error_body,
-            "error_headers": res.error_headers,
-            "target_pod": res.target_pod,
-            "finish_reason": getattr(res, "finish_reason", None),
-            # Reissue sidecar: segments stitched in / gateway attempts of a retry.
-            "tre_continued": getattr(res, "tre_continued", None),
-            "tre_retried": getattr(res, "tre_retried", None),
-            "client_timeout": bool(getattr(res, "timed_out", False)),
+            **result_fields(res),
             "request_timeout_s": timeout_s,
             "in_flight_at_send": in_flight_at_send,
+            "api": self._api,
         }
 
     def write_jsonl(self, path: str) -> int:
@@ -340,158 +315,3 @@ class StreamingHttpSender:
             for record in self.records:
                 fh.write(json.dumps(record, separators=(",", ":")) + "\n")
         return len(self.records)
-
-
-def build_request_headers(model: str, routing_strategy: str | None = None) -> dict[str, str]:
-    """Request headers for one completion, and with them the serving path.
-
-    The ``model`` header is always sent. Without a routing strategy it is what the
-    per-model HTTPRoute matches (Service path). With one, the ``routing-strategy`` header
-    is added and the plugin-routed route - patched in AHEAD of the per-model routes on
-    both gateways, so it wins regardless of the ``model`` header - takes the request; on
-    tre-v2 that route is per model and matches the ``model`` header too (per-model
-    ORIGINAL_DST cluster). The plugin itself reads the model from the JSON body.
-
-    (Until 2026-09-24 the ``model`` header was dropped on the routed path, on the belief
-    that it would make the per-model HTTPRoute win; the patched route sits at index 0 of
-    the route table, so it never did.)
-    """
-    headers = {"Content-Type": "application/json", "Accept": "text/event-stream", "model": model}
-    if routing_strategy:
-        headers[ROUTING_STRATEGY_HEADER] = routing_strategy
-    return headers
-
-
-def _default_stream_call(url: str, headers: dict[str, str], body: bytes, timeout_s: float) -> StreamResult:
-    from urllib.error import HTTPError, URLError
-    from urllib.request import Request, urlopen
-
-    start = time.perf_counter()
-    first_token_ms: float | None = None
-    prompt_tokens: int | None = None
-    completion_tokens: int | None = None
-    finish_reason: str | None = None
-    continued: int | None = None
-    try:
-        req = Request(url, data=body, headers=headers, method="POST")
-        with urlopen(req, timeout=timeout_s) as response:
-            status = response.status
-            # Read before the body: the headers arrive with the first SSE byte and this
-            # is the only place the serving pod is ever named.
-            response_headers = lower_headers(response.headers)
-            target_pod = pod_from_headers(response_headers)
-            continued, retried = reissue_from_headers(response_headers)
-            for raw in response:
-                line = raw.decode("utf-8", errors="replace").strip()
-                if line.startswith(":"):
-                    # SSE comment; the reissue sidecar closes a stitched stream with
-                    # ": x-tre-continued: <segments>".
-                    name, _, value = line[1:].strip().partition(":")
-                    if name.strip().lower() == CONTINUED_HEADER:
-                        continued = _positive_int(value) or continued
-                    continue
-                if not line or not line.startswith("data:"):
-                    continue
-                payload = line[len("data:") :].strip()
-                if payload == "[DONE]":
-                    break
-                try:
-                    chunk = json.loads(payload)
-                except json.JSONDecodeError:
-                    continue
-                if first_token_ms is None and _chunk_has_content(chunk):
-                    first_token_ms = (time.perf_counter() - start) * 1000.0
-                for choice in chunk.get("choices") or []:
-                    if isinstance(choice, dict) and choice.get("finish_reason"):
-                        finish_reason = choice["finish_reason"]
-                continued = _positive_int(chunk.get(CONTINUED_FIELD)) or continued
-                usage = chunk.get("usage")
-                if isinstance(usage, dict):
-                    prompt_tokens = usage.get("prompt_tokens", prompt_tokens)
-                    completion_tokens = usage.get("completion_tokens", completion_tokens)
-        done_ms = (time.perf_counter() - start) * 1000.0
-        return StreamResult(
-            status, first_token_ms, done_ms, prompt_tokens, completion_tokens, target_pod=target_pod,
-            finish_reason=finish_reason, tre_continued=continued, tre_retried=retried,
-        )
-    except HTTPError as exc:
-        error_headers = lower_headers(exc.headers)
-        return StreamResult(
-            exc.code,
-            None,
-            (time.perf_counter() - start) * 1000.0,
-            error=f"HTTP {exc.code}",
-            error_body=read_error_body(exc),
-            error_headers=error_headers,
-            target_pod=pod_from_headers(error_headers),
-        )
-    except (URLError, TimeoutError, OSError) as exc:  # noqa: BLE001
-        return StreamResult(
-            0,
-            None,
-            (time.perf_counter() - start) * 1000.0,
-            error=type(exc).__name__,
-            timed_out=is_client_timeout(exc),
-        )
-
-
-def is_client_timeout(exc: BaseException) -> bool:
-    """True when this transport failure is the client giving up, not the peer refusing.
-
-    urllib surfaces a read timeout three ways depending on where it fires: as
-    :class:`TimeoutError` (``socket.timeout`` is an alias of it since 3.10), as a
-    :class:`urllib.error.URLError` wrapping one in ``reason``, or - on some stacks - as
-    an ``OSError`` whose text says so and nothing else does. Only the first two are
-    structural, so the text check comes last and is deliberately narrow.
-    """
-    if isinstance(exc, TimeoutError):
-        return True
-    reason = getattr(exc, "reason", None)
-    if isinstance(reason, TimeoutError):
-        return True
-    return "timed out" in str(exc).lower()
-
-
-
-#: How much of a non-2xx body to keep. An Envoy circuit-breaker body is ~80 bytes and a
-#: vLLM JSON error is small too; the cap only bounds a pathological upstream.
-MAX_ERROR_BODY_CHARS = 2048
-
-
-def read_error_body(exc) -> str | None:
-    """Verbatim body of an HTTPError, best effort.
-
-    Reading it can itself fail on a connection the proxy already reset, and losing the
-    body must never lose the request record - an unattributable failure is still a
-    failure, and the classifier has a documented fallback for a missing body.
-    """
-    try:
-        raw = exc.read()
-    except Exception:  # noqa: BLE001
-        return None
-    if not raw:
-        return None
-    if isinstance(raw, bytes):
-        raw = raw.decode("utf-8", errors="replace")
-    return raw[:MAX_ERROR_BODY_CHARS]
-
-
-def lower_headers(headers) -> dict[str, str] | None:
-    """Response headers as a lower-cased dict, or None when there are none."""
-    if not headers:
-        return None
-    try:
-        items = list(headers.items())
-    except AttributeError:
-        return None
-    return {str(key).lower(): str(value) for key, value in items}
-
-
-def _chunk_has_content(chunk: dict[str, Any]) -> bool:
-    for choice in chunk.get("choices", []) or []:
-        if choice.get("text"):
-            return True
-        delta = choice.get("delta")
-        if isinstance(delta, dict) and delta.get("content"):
-            return True
-    return False

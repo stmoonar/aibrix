@@ -262,7 +262,8 @@ class _FakeStore:
         return SimpleNamespace(ttft_p95_ms=250.0, tpot_p95_ms=100.0, e2e_p95_ms=900.0)
 
 
-def test_the_driver_itself_writes_what_the_re_window_reproduces(tmp_path, monkeypatch, spec):
+@pytest.mark.parametrize("api", ["completions", "chat"])
+def test_the_driver_itself_writes_what_the_re_window_reproduces(tmp_path, monkeypatch, spec, api):
     # End to end through r3_grid.run_schedule_cell - the code a probe really runs - rather
     # than through the helper it calls: drive a (tiny, fake-served) schedule, write the
     # online CSV, then re-window the capture it left on disk with the fit's parameters.
@@ -277,17 +278,23 @@ def test_the_driver_itself_writes_what_the_re_window_reproduces(tmp_path, monkey
         return real_drive(*args, **kwargs)
 
     monkeypatch.setattr(openloop, "drive_cell_schedule", drive)
+    if api == "chat":
+        # a chat prompt is natural text fitted through the template; its bytes do not
+        # matter here, only that the chat path writes what the re-window reproduces
+        monkeypatch.setattr("tre_replayer.engine.http_sender.build_prompt", lambda n, key, **kw: f"text {key}")
+    gateway = {"completions": "http://gw/v1/completions", "chat": "http://gw/v1/chat/completions"}[api]
+    mode = {"completions": "token_ids", "chat": "natural"}[api]
     monkeypatch.setattr(openloop, "make_pod_metrics_sampler",
                         lambda endpoints: (lambda now: {"waiting": 1.0, "running": 2.0}))
     out = tmp_path / "online" / "dsqwen-7b_S1_S1_hold1090_a1.csv"
     args = r3_grid.parse_args([
-        "--model", MODEL, "--gateway-url", "http://gw/v1/completions",
+        "--model", MODEL, "--gateway-url", gateway, "--api", api,
         "--schedule", str(schedule), "--cell-id", "i16_o8_c1090",
         "--output", str(out), "--raw-dir", str(tmp_path / "raw"),
         "--window-ms", "400", "--step-ms", "200", "--instant-sample-ms", "100",
         "--min-latency-samples", "1", "--ttft-slo-ms", "30", "--tpot-slo-ms", "75",
         "--min-completed-requests", "1",
-        "--pod-endpoint", "http://pod/metrics", "--prompt-mode", "token_ids",
+        "--pod-endpoint", "http://pod/metrics", "--prompt-mode", mode,
         "--registry", str(REGISTRY_PATH), "--guard-mode", "warn",
     ])
     rows, guard = r3_grid.run_schedule_cell(args, _FakeStore(), spec)
