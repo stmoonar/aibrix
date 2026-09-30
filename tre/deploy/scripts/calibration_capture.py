@@ -657,6 +657,11 @@ CLOCK_SKEW_TOLERANCE_MS = 2_000
 #: The controller's newest window end normally trails redis TIME by one gateway round
 #: plus its own tick; a lag beyond this is flagged (stale controller or slow clock).
 CONTROLLER_MAX_LAG_MS = 120_000
+#: ... and in sync it trails by about one round plus its tick (measured 11.6 s).
+CONTROLLER_EXPECTED_LAG_MS = SCRAPE_INTERVAL_MS + CLOCK_SKEW_TOLERANCE_MS
+#: Pods whose newest doc is older than this before the dump range are not dumped or
+#: polled (wider than the largest known node skew, ~160 s).
+ACTIVE_POD_MARGIN_MS = 300_000
 #: The redis the gateway and the controller write to, as seen from inside the cluster
 #: (r3_grid's default too); a driver on a host passes ``--redis-url``.
 DEFAULT_REDIS_URL = "redis://tre-v2-redis:6379/0"
@@ -730,39 +735,47 @@ def source_clock(
     redis_minus_local_ms: Optional[float],
     stamp_period_ms: int = SCRAPE_INTERVAL_MS,
     max_lag_ms: int = SCRAPE_INTERVAL_MS + CLOCK_SKEW_TOLERANCE_MS,
+    expected_lag_ms: int = SCRAPE_INTERVAL_MS // 2,
     write_phase_ms: Optional[int] = None,
 ) -> dict:
-    """How far a stamp source's clock is from the driver's, and the shift its dump range
+    """How far a stamp source's clock is from the *driver's*, and the shift its dump range
     and tail need.
 
-    A source stamps with its own clock floored to ``stamp_period_ms``, so in sync its
-    newest stamp trails redis TIME by 0 .. ``max_lag_ms`` (``write_phase_ms`` - redis TIME
-    when a new round was first seen minus its stamp - is the sharper version of the same
-    lag). A stamp *ahead* of redis TIME, or a live source's write phase outside
-    ``[0, period]``, means its clock is off; its offset is then estimated to within half a
-    period as ``period / 2 - lag``. A lag beyond ``max_lag_ms`` without a measured phase
-    is ambiguous (stale source or slow clock): flagged, not shifted. The shift adds redis's
-    own offset from the driver (``clock_probe``) and is applied only when it exceeds
+    Everything is judged against the driver's clock (redis TIME minus redis's own offset
+    from the driver, ``redis_minus_local_ms`` from :func:`clock_probe`), because the
+    cell's ``start_ms`` / ``end_ms`` are in it. A source stamps with its own clock floored
+    to ``stamp_period_ms``; in sync its newest stamp trails the driver's now by
+    0 .. ``max_lag_ms`` (typically ``expected_lag_ms``), and a live gateway's write phase
+    (``write_phase_ms``, redis TIME at first sight minus the stamp) lies in
+    ``[0, period]`` once redis's offset is removed. A stamp more than half a period (plus
+    the tolerance) closer to the driver's now than ``expected_lag_ms``, or
+    a phase outside one period, means the source's clock is off: its offset is estimated
+    as ``expected lag - lag`` (from the phase: ``period / 2 - phase``), to within about half
+    a period. A lag beyond ``max_lag_ms`` without a measured phase is ambiguous (stale
+    source or slow clock): flagged, not shifted. The shift is applied only when it exceeds
     :data:`CLOCK_SKEW_TOLERANCE_MS`."""
+    rml = float(redis_minus_local_ms or 0.0)
     out: dict[str, Any] = {"latest_stamp_ms": latest_stamp_ms, "redis_time_ms": redis_now_ms,
-                           "redis_minus_local_ms": redis_minus_local_ms, "write_phase_ms": write_phase_ms}
+                           "redis_minus_local_ms": redis_minus_local_ms, "write_phase_ms": write_phase_ms,
+                           "expected_lag_ms": expected_lag_ms}
     lag = None if latest_stamp_ms is None or redis_now_ms is None else int(redis_now_ms) - int(latest_stamp_ms)
-    out["lag_ms"] = lag
-    source_minus_redis = 0
+    lag_local = None if lag is None else int(round(lag - rml))
+    phase_local = None if write_phase_ms is None else int(round(write_phase_ms - rml))
+    out.update({"lag_ms": lag, "lag_vs_driver_ms": lag_local, "write_phase_vs_driver_ms": phase_local})
+    source_minus_local = 0
     suspect = None
-    if write_phase_ms is not None and not (-CLOCK_SKEW_TOLERANCE_MS <= write_phase_ms
-                                           <= stamp_period_ms + CLOCK_SKEW_TOLERANCE_MS):
-        source_minus_redis = stamp_period_ms // 2 - int(write_phase_ms)
+    if phase_local is not None and not (-CLOCK_SKEW_TOLERANCE_MS <= phase_local
+                                        <= stamp_period_ms + CLOCK_SKEW_TOLERANCE_MS):
+        source_minus_local = stamp_period_ms // 2 - phase_local
         suspect = "write phase outside one period"
-    elif lag is not None and lag < -CLOCK_SKEW_TOLERANCE_MS:
-        source_minus_redis = stamp_period_ms // 2 - lag
-        suspect = "newest stamp ahead of redis TIME"
-    elif lag is not None and lag > max_lag_ms and write_phase_ms is None:
-        suspect = "newest stamp far behind redis TIME (stale source or slow clock; not shifted)"
-    shift = int(round((redis_minus_local_ms or 0.0) + source_minus_redis))
-    if abs(shift) <= CLOCK_SKEW_TOLERANCE_MS:
-        shift = 0
-    out.update({"source_minus_redis_est_ms": source_minus_redis, "shift_ms": shift, "suspect": suspect})
+    elif phase_local is None and lag_local is not None and lag_local < (
+            int(expected_lag_ms) - stamp_period_ms // 2 - CLOCK_SKEW_TOLERANCE_MS):
+        source_minus_local = int(expected_lag_ms) - lag_local
+        suspect = "newest stamp ahead of the driver's clock"
+    elif phase_local is None and lag_local is not None and lag_local > max_lag_ms:
+        suspect = "newest stamp far behind the driver's clock (stale source or slow clock; not shifted)"
+    shift = int(source_minus_local) if abs(source_minus_local) > CLOCK_SKEW_TOLERANCE_MS else 0
+    out.update({"source_minus_local_est_ms": source_minus_local, "shift_ms": shift, "suspect": suspect})
     return out
 
 
@@ -1215,7 +1228,9 @@ def _mark_completeness(meta: dict) -> bool:
         dump = meta.get(name)
         if dump is None:
             continue
-        tail = tail_ms(meta["end_ms"], meta["window_ms"], _shift_of(meta, source))
+        shift = _shift_of(meta, source)
+        # a shift is an estimate good to about half a round: then wait one round longer
+        tail = tail_ms(meta["end_ms"], meta["window_ms"], shift) + (SCRAPE_INTERVAL_MS if shift else 0)
         dump["tail_ms"] = tail
         dump["complete"] = dump.get(last_key) is not None and dump[last_key] >= tail
         pending |= not dump["complete"]
@@ -1313,7 +1328,7 @@ def capture_after_cell(
                 # widened by the largest plausible skew: a skewed gateway's stamps may lie
                 # before the unshifted range, and a pod must not be dropped for that
                 pods = active_pods(redis_client, in_set,
-                                   dump_range_ms(start_ms, end_ms, window_ms)[0] - 10 * SCRAPE_INTERVAL_MS)
+                                   dump_range_ms(start_ms, end_ms, window_ms)[0] - ACTIVE_POD_MARGIN_MS)
                 instances = gateway_instances(redis_client)
                 cached = cached_phase(layout.cell_dir.parent, instances, now_ms=int(now_ms()),
                                       max_age_s=phase_cache_s)
@@ -1345,6 +1360,7 @@ def capture_after_cell(
                 clock["controller"] = source_clock(
                     _latest_score(redis_client, decision_hist_key(model)), redis_time_ms(redis_client),
                     redis_minus_local_ms=rml, max_lag_ms=CONTROLLER_MAX_LAG_MS,
+                    expected_lag_ms=CONTROLLER_EXPECTED_LAG_MS,
                 )
                 lo, hi = dump_range_ms(start_ms, end_ms, window_ms, clock["controller"]["shift_ms"])
                 meta["controller_ticks"] = dump_controller_ticks(redis_client, layout, model, lo_ms=lo, hi_ms=hi)

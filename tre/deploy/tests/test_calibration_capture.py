@@ -629,7 +629,7 @@ def test_source_clock_detects_a_source_ahead_by_160_s() -> None:
 
 def test_source_clock_adds_redis_offset_and_flags_a_stale_source() -> None:
     c = cc.source_clock(1_160_000, 1_165_000, redis_minus_local_ms=160_000.0)
-    assert c["shift_ms"] == 160_000 and c["suspect"] is None  # redis and source on the fast node
+    assert c["shift_ms"] == 160_000 and c["suspect"]  # redis and source on the fast node: both off the driver
     c = cc.source_clock(700_000, 1_000_000, redis_minus_local_ms=0.0)
     assert c["shift_ms"] == 0 and "stale" in c["suspect"]
 
@@ -646,7 +646,7 @@ def test_a_skewed_gateway_gets_a_shifted_dump_range(tmp_path: Path) -> None:
     assert meta["clock_skew_suspected"]["gateway"] and abs(gw["shift_ms"] - skew) <= 5_000
     # all three rounds (in the gateway's clock) are inside the shifted range
     assert sum(meta["gateway_redis_dump"]["docs"]["inst"].values()) == 3
-    assert meta["gateway_redis_dump"]["tail_ms"] == cc.tail_ms(990_000, 30_000, gw["shift_ms"])
+    assert meta["gateway_redis_dump"]["tail_ms"] == cc.tail_ms(990_000, 30_000, gw["shift_ms"]) + 10_000
 
 
 def test_active_pods_skips_pods_long_gone() -> None:
@@ -754,3 +754,24 @@ def test_run_manifest_hashes_the_live_registry_configmap(tmp_path: Path) -> None
     live = json.loads(path.read_text())["registry"]["live_configmap"]
     assert live["name"] == "tre-v2-registry"
     assert live["data_sha256"]["registry.yaml"] == hashlib.sha256(b"models: {}\n").hexdigest()
+
+
+@pytest.mark.parametrize(
+    "case, latest, redis_now, rml, phase, expected_lag, want_shift",
+    [
+        # redis 160 s ahead of the driver, controller in sync with the driver: no shift
+        ("redis skewed, controller in sync", 990_000, 990_000 + 11_600 + 160_000, 160_000.0, None, 12_000, 0),
+        # controller 160 s ahead, redis = driver
+        ("controller ahead 160 s", 990_000 + 160_000, 1_001_600, 0.0, None, 12_000, 160_000),
+        # controller 8 s ahead, redis = driver
+        ("controller ahead 8 s", 990_000 + 8_000, 1_001_600, 0.0, None, 12_000, 8_000),
+        # gateway in sync with the driver, redis 160 s ahead, phase measured
+        ("gateway in sync, redis skewed", 990_000, 991_500 + 160_000, 160_000.0, 1_500 + 160_000, 5_000, 0),
+    ],
+)
+def test_source_clock_is_judged_against_the_driver(case, latest, redis_now, rml, phase, expected_lag,
+                                                    want_shift) -> None:
+    c = cc.source_clock(latest, redis_now, redis_minus_local_ms=rml, write_phase_ms=phase,
+                        expected_lag_ms=expected_lag, max_lag_ms=cc.CONTROLLER_MAX_LAG_MS)
+    assert abs(c["shift_ms"] - want_shift) <= 1_000, (case, c)
+    assert (c["suspect"] is None) == (want_shift == 0), (case, c)
