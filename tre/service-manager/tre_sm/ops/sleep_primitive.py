@@ -1425,7 +1425,13 @@ def _abort_breakdown(load: Mapping) -> dict:
     continuable requests (the reissue sidecar continues them), the gateway's
     non-continuable ones (truncated, or re-run from scratch by the sidecar when
     nothing was streamed yet) and engine-side requests the gateway did not count
-    (``unclassified``). ``state_known`` False: the counts are a lower bound."""
+    (``unclassified``). ``state_known`` False: the counts are a lower bound.
+    The read happens BEFORE ``/sleep mode=abort`` is sent: requests that finish
+    normally in between are counted here but never aborted (the engine sends them
+    no abort output, so the sidecar has nothing to continue). These counts are
+    therefore an upper bound of what the abort cut off; e.g. the 2026-09-30 smoke
+    counted 135 forced-abort requests against 133 sidecar continuations, the two
+    missing ones having completed with 200 about 30 ms before the abort."""
     gateway = load.get("gateway_inflight")
     non_continuable = max(0, int(load.get("non_continuable") or 0))
     in_flight = max(0, int(load.get("in_flight") or 0))

@@ -1035,20 +1035,21 @@ data:
     \ tail_parts, base, merged_usage(prompt_tokens, generated, cont_usage),\n    \
     \                              wants_usage, segments if outcome == \"continue\"\
     \ else None)\n        self._account(outcome, reason, request, depth, generated=generated,\
-    \ attempts=attempts, target=target,\n                      gap_s=gap_s, segments=segments,\
-    \ error=error, stop_at_seam=stopped_at_seam)\n\n    async def _finish_stream(self,\
-    \ client: web.StreamResponse, parts: list[bytes], base: dict, usage: dict,\n \
-    \                            wants_usage: bool, segments: int | None) -> None:\n\
-    \        if wants_usage:\n            parts.append(sse(dict(base, choices=[],\
-    \ usage=usage)))\n        if segments:\n            parts.append(f\": {self.cfg.continued_header}:\
-    \ {segments}\\n\\n\".encode())\n        parts.append(SSE_DONE)\n        try:\n\
-    \            await client.write(b\"\".join(parts))\n            await client.write_eof()\n\
-    \        except ConnectionResetError:\n            pass\n\n    # --------------------------------------------------------\
-    \ non-streaming path\n\n    async def _non_stream(\n        self, request: web.Request,\
-    \ path: str, raw: bytes, body: dict, resp: aiohttp.ClientResponse,\n        depth:\
-    \ int, nc_reason: str | None, added: AddedTime,\n    ) -> web.StreamResponse:\n\
-    \        \"\"\"Relay time: the whole body received -> the response handed back\
-    \ to aiohttp\n        (which sends it after the handler returns; that socket write\
+    \ attempts=attempts, target=target,\n                      gap_ms=_ms(gap_s),\
+    \ segments=segments, error=error, stop_at_seam=stopped_at_seam)\n\n    async def\
+    \ _finish_stream(self, client: web.StreamResponse, parts: list[bytes], base: dict,\
+    \ usage: dict,\n                             wants_usage: bool, segments: int\
+    \ | None) -> None:\n        if wants_usage:\n            parts.append(sse(dict(base,\
+    \ choices=[], usage=usage)))\n        if segments:\n            parts.append(f\"\
+    : {self.cfg.continued_header}: {segments}\\n\\n\".encode())\n        parts.append(SSE_DONE)\n\
+    \        try:\n            await client.write(b\"\".join(parts))\n           \
+    \ await client.write_eof()\n        except ConnectionResetError:\n           \
+    \ pass\n\n    # -------------------------------------------------------- non-streaming\
+    \ path\n\n    async def _non_stream(\n        self, request: web.Request, path:\
+    \ str, raw: bytes, body: dict, resp: aiohttp.ClientResponse,\n        depth: int,\
+    \ nc_reason: str | None, added: AddedTime,\n    ) -> web.StreamResponse:\n   \
+    \     \"\"\"Relay time: the whole body received -> the response handed back to\
+    \ aiohttp\n        (which sends it after the handler returns; that socket write\
     \ is not timed),\n        minus the wait for a continuation through the gateway.\"\
     \"\"\n        cfg = self.cfg\n        try:\n            payload = await resp.read()\n\
     \        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:\n        \
@@ -1127,7 +1128,7 @@ data:
     ), dict) else None\n        merged[\"usage\"] = merged_usage(prompt_tokens, generated,\
     \ cont_usage)\n        segments = 1 + nested\n        self._account(\"continue\"\
     , \"abort_sleep\", request, depth, generated=generated, attempts=attempts,\n \
-    \                     target=target, gap_s=gap_s, segments=segments, stop_at_seam=stop_at_seam)\n\
+    \                     target=target, gap_ms=_ms(gap_s), segments=segments, stop_at_seam=stop_at_seam)\n\
     \        return web.json_response(merged, headers={cfg.continued_header: str(segments)})\n\
     \n    # ------------------------------------------------------------------ logging\n\
     \n    def _scrub(self, obj: dict) -> None:\n        \"\"\"Drop the abort-only\
@@ -1144,16 +1145,21 @@ data:
     \ \"kind\": kind, \"reason\": reason, \"path\": request.path, \"depth\": depth}\n\
     \        for key, value in extra.items():\n            if value is None or value\
     \ == \"\" or value is False:\n                continue\n            record[key]\
-    \ = round(value * 1000.0, 1) if key == \"gap_s\" else value\n        _log(record)\n\
-    \n\ndef _strip_ids(obj: dict, cfg: Config, body: dict) -> dict:\n    \"\"\"The\
-    \ aborted response without the token-id fields the fork added for us (kept\n \
-    \   when the client asked for them with return_token_ids).\"\"\"\n    merged =\
-    \ dict(obj)\n    if body.get(\"return_token_ids\"):\n        return merged\n \
-    \   merged.pop(cfg.prompt_ids_field, None)\n    choices = []\n    for choice in\
-    \ obj.get(\"choices\") or ():\n        if isinstance(choice, dict):\n        \
-    \    choice = {k: v for k, v in choice.items()\n                      if k not\
-    \ in (cfg.prompt_ids_field, cfg.token_ids_field, cfg.generated_ids_field)}\n \
-    \       choices.append(choice)\n    merged[\"choices\"] = choices\n    return\
+    \ = value\n        _log(record)\n\n\ndef _ms(seconds: float | None) -> float |\
+    \ None:\n    \"\"\"Log field ``gap_ms`` (abort -> first continuation token, milliseconds).\
+    \ Logs written\n    before 2026-09-30 carry the same millisecond value under the\
+    \ misleading name\n    ``gap_s``; readers of old logs must treat ``gap_s`` as\
+    \ milliseconds too. The metric\n    ``tre_reissue_gap_seconds`` is (and was) in\
+    \ seconds.\"\"\"\n    return None if seconds is None else round(seconds * 1000.0,\
+    \ 1)\n\n\ndef _strip_ids(obj: dict, cfg: Config, body: dict) -> dict:\n    \"\"\
+    \"The aborted response without the token-id fields the fork added for us (kept\n\
+    \    when the client asked for them with return_token_ids).\"\"\"\n    merged\
+    \ = dict(obj)\n    if body.get(\"return_token_ids\"):\n        return merged\n\
+    \    merged.pop(cfg.prompt_ids_field, None)\n    choices = []\n    for choice\
+    \ in obj.get(\"choices\") or ():\n        if isinstance(choice, dict):\n     \
+    \       choice = {k: v for k, v in choice.items()\n                      if k\
+    \ not in (cfg.prompt_ids_field, cfg.token_ids_field, cfg.generated_ids_field)}\n\
+    \        choices.append(choice)\n    merged[\"choices\"] = choices\n    return\
     \ merged\n\n\ndef _set_choice(obj: dict, chat: bool, text: str, finish: str |\
     \ None, stop_reason: Any) -> None:\n    choices = obj.get(\"choices\") or [{\"\
     index\": 0}]\n    choice = dict(choices[0])\n    if chat:\n        message = dict(choice.get(\"\

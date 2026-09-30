@@ -1731,7 +1731,7 @@ class ReissueSidecar:
         await self._finish_stream(client, tail_parts, base, merged_usage(prompt_tokens, generated, cont_usage),
                                   wants_usage, segments if outcome == "continue" else None)
         self._account(outcome, reason, request, depth, generated=generated, attempts=attempts, target=target,
-                      gap_s=gap_s, segments=segments, error=error, stop_at_seam=stopped_at_seam)
+                      gap_ms=_ms(gap_s), segments=segments, error=error, stop_at_seam=stopped_at_seam)
 
     async def _finish_stream(self, client: web.StreamResponse, parts: list[bytes], base: dict, usage: dict,
                              wants_usage: bool, segments: int | None) -> None:
@@ -1865,7 +1865,7 @@ class ReissueSidecar:
         merged["usage"] = merged_usage(prompt_tokens, generated, cont_usage)
         segments = 1 + nested
         self._account("continue", "abort_sleep", request, depth, generated=generated, attempts=attempts,
-                      target=target, gap_s=gap_s, segments=segments, stop_at_seam=stop_at_seam)
+                      target=target, gap_ms=_ms(gap_s), segments=segments, stop_at_seam=stop_at_seam)
         return web.json_response(merged, headers={cfg.continued_header: str(segments)})
 
     # ------------------------------------------------------------------ logging
@@ -1890,8 +1890,16 @@ class ReissueSidecar:
         for key, value in extra.items():
             if value is None or value == "" or value is False:
                 continue
-            record[key] = round(value * 1000.0, 1) if key == "gap_s" else value
+            record[key] = value
         _log(record)
+
+
+def _ms(seconds: float | None) -> float | None:
+    """Log field ``gap_ms`` (abort -> first continuation token, milliseconds). Logs written
+    before 2026-09-30 carry the same millisecond value under the misleading name
+    ``gap_s``; readers of old logs must treat ``gap_s`` as milliseconds too. The metric
+    ``tre_reissue_gap_seconds`` is (and was) in seconds."""
+    return None if seconds is None else round(seconds * 1000.0, 1)
 
 
 def _strip_ids(obj: dict, cfg: Config, body: dict) -> dict:

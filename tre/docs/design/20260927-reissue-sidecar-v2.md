@@ -64,6 +64,10 @@
 验证：`tre/reissue/tests/test_local_keepalive.py` 用真 uvicorn（keep-alive 1 s）+ sidecar 造“空闲略超 keep-alive 后复用”的时序：
 main 上 3000 个请求 14 个 502（测试失败）；修复后 0 失败、重发 > 0；只开第 1 层（池 0.5 s、不重发）0 失败；旧配置对照组的失败全为 503。
 vLLM 镜像（py3.12 + aiohttp 3.14 + uvloop + httptools，`--network none`）内同样时序 2000 请求：main 17–18 个 502，修复后 0（重发 13–23 次）。
+线上证据（09-30 smoke 重跑 `smoke-e1-20260930/rerun-1815/{tre,apa}/errors_evidence.*`）：7 个 502 全部来自同一个 7b pod（在飞最多的那个，
+连接池最大），sidecar 报文是 `upstream unavailable: Server disconnected` 或 `[Errno 104] Connection reset by peer`（正是本节第 1 类），
+Envoy 耗时 7–112 ms（很快失败、不是超时），发生时 waiting=0、running 正在陡降（如 141→38）——负载回落沿上大批连接变空闲、约 5 s 后被 vLLM 关闭，
+与 keep-alive 竞态吻合，与过载无关。
 
 ## 4. 已开始的请求：token-id 续发（D6）
 
@@ -127,6 +131,16 @@ tools/functions（除非 `tool_choice: none`）、结构化输出 / guided decod
 | `tre_reissue_local_reconnect_total{model,result}` | 首字节前连接级失败后的新连接重发次数，`result=ok/fail`（§3a） |
 
 P5 口径：每个 run 报 retry / continue / failed / passthrough_abort；`continue>0` 的 run 标为受污染（计划原文）。
+
+**与 SM 计数对账（2026-09-30）**：SM 的 `forced_abort_requests`（及 `aborted.in_flight` / `continuable`）是 `/sleep mode=abort`
+**发出之前**一次负载读数（引擎 running+waiting、网关 inflight），是被 abort 请求数的**上界**；读数到 abort 生效之间（`waited_s` 加提交阶段，
+约几十到一两百 ms）正常结束的请求算在里面，但引擎不会给它们发 abort，sidecar 也就不续发、不记任何事件，客户端拿到的是完整响应。
+所以 `continue + passthrough_abort + retry(abort_*) + failed ≤ forced_abort_requests`，差值不是丢请求。实例：09-30 smoke 重跑
+（`smoke-e1-20260930/rerun-1815/apa`）SM 计 135、sidecar 续发 133，差的 2 个都在 node9/gpu-2 的第二次睡眠（SM 计 20、续发 18）：
+Envoy 访问日志显示该 pod 在 10:42:50.70–.80 在飞 20 个，其中 2 个于 10:42:50.818 以 200 正常结束，abort 生效后在飞 18 个，18 个全部续发成功（时长 ≥10 s，经拼接）。
+
+日志字段：`tre_reissue` 行的 `gap_ms` 是 abort 到续发首 token 的毫秒数（2026-09-30 之前的日志里同一个毫秒值叫 `gap_s`，读旧日志时按毫秒处理）；
+指标 `tre_reissue_gap_seconds` 一直是秒。
 
 ## 8. 配置
 
