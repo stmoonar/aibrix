@@ -57,6 +57,17 @@ vocabularies, not a guarantee.
 
 All three modes hold the same two invariants: content is a pure function of the seed
 key, and two different seed keys differ within the first few tokens by construction.
+
+Endpoint
+--------
+``api`` (:mod:`tre_replayer.engine.api`) says which endpoint will carry the prompt, and
+therefore what ``token_count`` counts. ``completions`` (the default, unchanged) counts
+the string as the completions path does. ``chat`` counts the prompt the engine builds
+from one user message - the chat template around the content - so the content is
+``token_count`` minus the template's tokens and ``usage.prompt_tokens`` is
+``token_count``; the corpus mix ratio applies to the content. ``chat`` needs
+:data:`MODE_NATURAL` (a token-id list is not a message, and the text mode's length is
+only nominal).
 """
 from __future__ import annotations
 
@@ -64,6 +75,7 @@ import hashlib
 import random
 
 # Re-exported: the senders take their corpus defaults from here, next to DEFAULT_MODE.
+from tre_replayer.engine.api import API_CHAT, API_COMPLETIONS, DEFAULT_API, check_api_mode  # noqa: F401
 from tre_replayer.engine.corpus import (  # noqa: F401
     CORPUS_LANGS,
     DEFAULT_CORPUS_LANG,
@@ -195,6 +207,7 @@ def build_natural_prompt(
     tokenizer_path: str | None = None,
     corpus_lang: str = DEFAULT_CORPUS_LANG,
     zh_ratio: float = DEFAULT_ZH_RATIO,
+    api: str = DEFAULT_API,
 ) -> str:
     """Prose of *exactly* ``token_count`` tokens, unique per ``seed_key``.
 
@@ -205,7 +218,9 @@ def build_natural_prompt(
 
     ``token_count`` is the count vLLM will report as ``usage.prompt_tokens`` - special
     tokens included - not the plain token count, because that is the number the caller
-    asked the engine for and the number the calibration grid is indexed by.
+    asked the engine for and the number the calibration grid is indexed by. Under
+    ``api="chat"`` that count includes the chat template the engine wraps the returned
+    content in (:func:`tre_replayer.engine.model_tokenizer.for_api`).
 
     ``tokenizer`` (a :class:`~tre_replayer.engine.model_tokenizer.ModelTokenizer`) is the
     seam the tests inject; otherwise ``model`` is resolved to a tokenizer on local disk.
@@ -218,9 +233,11 @@ def build_natural_prompt(
     carrying the seed - is never touched, which is what preserves uniqueness.
     """
     from tre_replayer.engine import corpus
+    from tre_replayer.engine.model_tokenizer import for_api
 
     target = max(1, int(token_count))
     tok = tokenizer if tokenizer is not None else _load_tokenizer(model, tokenizer_path)
+    tok = for_api(tok, api)
     # The tokenizer's own special tokens are part of what vLLM counts, so a prompt of one
     # token below them is unrepresentable - and an empty prompt is not a request.
     minimum = tok.overhead + 1
@@ -332,12 +349,16 @@ def build_prompt(
     tokenizer_path: str | None = None,
     corpus_lang: str = DEFAULT_CORPUS_LANG,
     zh_ratio: float = DEFAULT_ZH_RATIO,
+    api: str = DEFAULT_API,
 ) -> list[int] | str:
     """Dispatch to the per-mode builder. ``model`` is required by :data:`MODE_NATURAL`.
 
     ``corpus_lang`` / ``zh_ratio`` select the text of :data:`MODE_NATURAL` and are
-    ignored by the other modes (which do not send language).
+    ignored by the other modes (which do not send language). ``api`` is the endpoint the
+    prompt goes to (see the module docstring); ``chat`` is refused for any mode but
+    :data:`MODE_NATURAL`.
     """
+    check_api_mode(api, mode)
     if mode == MODE_TOKEN_IDS:
         return build_token_id_prompt(token_count, seed_key)
     if mode == MODE_TEXT:
@@ -345,6 +366,6 @@ def build_prompt(
     if mode == MODE_NATURAL:
         return build_natural_prompt(
             token_count, seed_key, model=model, tokenizer=tokenizer, tokenizer_path=tokenizer_path,
-            corpus_lang=corpus_lang, zh_ratio=zh_ratio,
+            corpus_lang=corpus_lang, zh_ratio=zh_ratio, api=api,
         )
     raise ValueError(f"unknown prompt mode: {mode!r} (expected one of {MODES})")

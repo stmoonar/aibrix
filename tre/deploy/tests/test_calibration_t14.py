@@ -141,7 +141,7 @@ def _args(tmp_path, **over):
         freeze_file=None, refit_params_file=None, preregistration_json=None,
         capacity_prior_file=None, routing_strategy="least-gpu-cache",
         # The fixture freezes predate the corpus record, i.e. were trained on English.
-        corpus_lang="en", zh_ratio=0.0,
+        corpus_lang="en", zh_ratio=0.0, api="completions",
     )
     base.update(over)
     return argparse.Namespace(**base)

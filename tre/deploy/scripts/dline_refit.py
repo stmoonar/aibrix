@@ -1534,7 +1534,7 @@ def freeze_model(out_root: Path, fit_dir: Path, model: str, arm: str) -> tuple[O
             problems += lp_problems
             if len(load_paths) > 1:
                 problems.append(f"the training set mixes load paths {sorted(load_paths)}: a theta "
-                                "fitted across prompt corpora / routing describes neither")
+                                "fitted across prompt corpora / routing / APIs describes neither")
             lp = fit_dir / TRAINING_LEDGER
             try:
                 check_training_inputs(model, p, ledger=load_ledgers([str(lp)]) if lp.exists() else None)
@@ -1575,6 +1575,10 @@ def freeze_model(out_root: Path, fit_dir: Path, model: str, arm: str) -> tuple[O
         # Absent in older freezes = English prompts, no routing header.
         "prompt_corpus": next(iter(load_paths.values()))["prompt"],
         "routing_strategy": next(iter(load_paths.values()))["routing_strategy"],
+        # ... and through which API (absent in older freezes = completions). The idle-TTFT
+        # fit of the D6' label and every length in ttft_len_samples count the prompt the
+        # way this API does (chat: template included).
+        "api": next(iter(load_paths.values()))["api"],
     }
     return entry, []
 

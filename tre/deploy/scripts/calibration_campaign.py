@@ -619,6 +619,11 @@ def cell_command(cell: Cell, args, schedule_path: Path, output: Path) -> list[st
       the fit trains on are the same (``--window-align`` / ``--step-ms`` likewise put the
       online windows on the fitting re-window's 10 s grid, D8).
 
+    ``--api`` (chat by default) is pinned on every cell, and ``--prompt-preflight skip``
+    because the run checked each model once before its first cell
+    (:func:`require_prompt_preflight`) - a per-cell request would land in the quiet
+    window the cooldown exists to keep idle.
+
     ``--prompt-dir`` points every cell at this campaign's own ``<out-dir>/prompts``, so
     the prompts are built before each cell starts rather than inside its sends, and the
     bytes that went out are kept next to the measurement they produced. It is outside the
@@ -649,6 +654,9 @@ def cell_command(cell: Cell, args, schedule_path: Path, output: Path) -> list[st
         # Pinned rather than left to r3_grid's default, so the run manifest's record of
         # what the prompts were written in (run_provenance) is what every cell used.
         *prompt_corpus_cli_args(args),
+        # The endpoint likewise; the run's preflight covered the prompt lengths.
+        "--api", api_for(args),
+        "--prompt-preflight", "skip",
         "--shed-policy", openloop.SHED_POLICY_VOID,
         "--max-p99-delay-ms", str(openloop.CALIBRATION_MAX_P99_DELAY_MS),
         "--max-model-error-rate", str(args.max_model_error_rate),
@@ -677,6 +685,8 @@ def cell_command(cell: Cell, args, schedule_path: Path, output: Path) -> list[st
         command += ["--registry", args.registry]
     if args.redis_url:
         command += ["--redis-url", args.redis_url]
+    if getattr(args, "request_seed", None) is not None:
+        command += ["--request-seed", str(int(args.request_seed))]
     routing = routing_strategy_for(args)
     if routing:
         # Through the gateway plugin with this strategy (r3_grid --routing-strategy):
@@ -1741,6 +1751,7 @@ def run_reprobe(args, targets: Mapping[str, Sequence[str]]) -> int:
 
     require_calibration_run_mode(args.controller_namespace)
     require_capture_clock_domains(args, list(targets))
+    require_prompt_preflight(args, list(targets), out_root)
     index_path = Path(args.index)
     index = json.loads(index_path.read_text(encoding="utf-8")) if index_path.exists() else {}
     cap = admission.get_cap(args.cap or index.get("admission_cap", {}).get("name")
@@ -1944,17 +1955,87 @@ def prompt_corpus(args) -> dict:
     }
 
 
+def api_for(args) -> str:
+    """The endpoint a campaign's cells send (``--api``); absent attribute (hand-built
+    ``args``) = the calibration default, chat."""
+    return str(getattr(args, "api", None) or corpus_record.CALIBRATION_API)
+
+
+def api_record(args) -> dict:
+    """What the run's requests were, beyond the corpus and the routing: the endpoint and
+    its path, the fixed-output switch, the seed (None = not sent) and what the cells'
+    ``input_tokens`` count (for chat: the templated prompt, template included)."""
+    api = api_for(args)
+    return {
+        "endpoint": api,
+        "path": corpus_record.API_PATHS[api],
+        "ignore_eos": True,
+        "request_seed": getattr(args, "request_seed", None),
+        "input_tokens": ("chat-templated prompt (template tokens included)"
+                         if api == corpus_record.API_CHAT else "prompt string"),
+        "prompt_preflight": getattr(args, "prompt_preflight", "refuse"),
+    }
+
+
 def load_path(args) -> dict:
-    """The load path this run's cells take (scripts.prompt_corpus): prompt corpus and
-    routing header - what a dataset, a freeze and a held-out set must agree on."""
+    """The load path this run's cells take (scripts.prompt_corpus): prompt corpus,
+    routing header and API - what a dataset, a freeze and a held-out set must agree on."""
     return {"prompt": corpus_record.normalize(prompt_corpus(args)),
-            "routing_strategy": routing_strategy_for(args)}
+            "routing_strategy": routing_strategy_for(args),
+            "api": api_for(args)}
+
+
+PROMPT_PREFLIGHT_FILE = "prompt_preflight.json"
+
+
+def require_prompt_preflight(args, models: Optional[Sequence[str]] = None,
+                             out_dir: Optional[Path] = None) -> Optional[dict]:
+    """The run-level prompt-length pre-flight: for every model one request of the run's
+    exact kind (``openloop.preflight_prompt_tokens``: same builder, tokenizer, corpus,
+    endpoint, URL, routing header, seed) must report ``usage.prompt_tokens`` equal to
+    the length its prompt was fitted to, ``completion_tokens == max_tokens`` and a first
+    token. Raises SystemExit listing every failure otherwise - fail-closed, like the
+    clock-domain pre-flight next to which every entry point calls it. The verdicts go to
+    ``<out_dir>/prompt_preflight.json``. ``--prompt-preflight skip`` skips it (recorded
+    in the provenance)."""
+    if getattr(args, "prompt_preflight", "refuse") == "skip":
+        print("WARNING: --prompt-preflight skip: the prompt lengths were not checked against the engine")
+        return None
+    if models is None:
+        models = [m for m in str(getattr(args, "models", "") or "").split(",") if m]
+    corpus = prompt_corpus(args)
+    verdicts = {
+        model: openloop.preflight_prompt_tokens(
+            args.gateway_url, model, api=api_for(args), prompt_mode=corpus["prompt_mode"],
+            corpus_lang=corpus["corpus_lang"], zh_ratio=corpus["zh_ratio"],
+            routing_strategy=routing_strategy_for(args),
+            request_seed=getattr(args, "request_seed", None),
+        )
+        for model in models
+    }
+    for model, v in verdicts.items():
+        print(f"prompt preflight ({model}, {v['api']}): expected {v['expected_prompt_tokens']}, "
+              f"usage.prompt_tokens {v['prompt_tokens']}, completion {v['completion_tokens']}, "
+              f"first token in {v['first_token_field']!r}, template overhead {v['template_overhead']}")
+    doc = {"checked_at_utc": utc_iso(), "models": verdicts}
+    if out_dir is not None:
+        Path(out_dir).mkdir(parents=True, exist_ok=True)
+        (Path(out_dir) / PROMPT_PREFLIGHT_FILE).write_text(
+            json.dumps(doc, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    failed = {m: v["reasons"] for m, v in verdicts.items() if not v["ok"]}
+    if failed:
+        raise SystemExit("refusing to run: prompt preflight failed: "
+                         + "; ".join(f"{m}: {' / '.join(r)}" for m, r in failed.items()))
+    return doc
 
 
 def mismatch_flags(args) -> dict:
     """The --allow-*-mismatch flags, as keyword arguments of prompt_corpus.check_*."""
     return {"allow_corpus_mismatch": bool(getattr(args, "allow_prompt_corpus_mismatch", False)),
-            "allow_routing_mismatch": bool(getattr(args, "allow_routing_mismatch", False))}
+            "allow_routing_mismatch": bool(getattr(args, "allow_routing_mismatch", False)),
+            # No CLI flag: an API mismatch is always refused. A dry run, which turns every
+            # flag on to report instead of refusing, reports it too.
+            "allow_api_mismatch": False}
 
 
 def prompt_corpus_cli_args(args) -> list[str]:
@@ -1989,6 +2070,9 @@ def run_provenance(args) -> dict:
         # How the cells were routed: the routing-strategy header (None = none sent, the
         # per-model HTTPRoute). Irrelevant with one replica, decisive with several.
         "routing_strategy": routing_strategy_for(args),
+        # The endpoint (chat since 2026-09-30; absent = completions) and what the cells'
+        # input_tokens count. Part of the load path: data of two APIs is never combined.
+        "api": api_record(args),
         "label": labels[models[0]] if models else None,
         "label_by_model": labels,
         "boundary": {
@@ -2151,6 +2235,7 @@ def run_campaign(args) -> int:
     modes = require_calibration_run_mode(args.controller_namespace)
     print(f"controller mode: {modes['controller_mode']}, SM actuation: {modes['sm_actuation']}")
     require_capture_clock_domains(args, models)
+    require_prompt_preflight(args, models, out_dir)
 
     status, code = "failed", 1
     try:
@@ -2300,7 +2385,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--index", type=Path,
                     default=here / "replayer/traces_v2/calibration/INDEX.json")
     ap.add_argument("--models", default=",".join(gen.MODELS))
-    ap.add_argument("--gateway-url", default="http://192.168.223.76:31094/v1/completions")
+    ap.add_argument("--gateway-url", default="http://192.168.223.76:31094/v1/chat/completions",
+                    help="the model gateway's endpoint URL; its path must match --api")
     ap.add_argument("--out-dir", type=Path, required=True)
     ap.add_argument("--raw-dir", type=Path, default=Path("/root/tre-experiments/calibration_raw"))
     ap.add_argument("--cap", default=None,
@@ -2467,6 +2553,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--allow-routing-mismatch", action="store_true",
                     help="--acceptance-set / --training-supplement: the same for the routing "
                          "strategy. Refused with --preregistration-json")
+    ap.add_argument("--api", default=corpus_record.CALIBRATION_API, choices=list(corpus_record.APIS),
+                    help="endpoint every r3_grid cell sends (default %(default)s = "
+                         "/v1/chat/completions, as v1 and the E1 client; prompts fitted to the "
+                         "templated length). Part of the load path: datasets, freezes, M and "
+                         "T14 refuse to combine data of two APIs")
+    ap.add_argument("--request-seed", type=int, default=None,
+                    help="'seed' every request carries (default: none; recorded in the run "
+                         "manifest either way)")
+    ap.add_argument("--prompt-preflight", default="refuse", choices=["refuse", "skip"],
+                    help="refuse (default): before the first cell, one request per model must "
+                         "report usage.prompt_tokens equal to the length its prompt was fitted "
+                         "to (prompt_preflight.json). skip: do not check (recorded)")
     ap.add_argument("--routing-strategy", type=normalize_routing_strategy,
                     default=DEFAULT_ROUTING_STRATEGY,
                     help="routing-strategy header every r3_grid cell sends (default "
@@ -2493,6 +2591,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     help="ladder design: the preregistration the run implements; its commit "
                          "is recorded in the run manifest")
     args = ap.parse_args(argv)
+    try:
+        corpus_record.check_gateway_url(args.gateway_url, args.api)
+    except ValueError as exc:
+        ap.error(str(exc))
     if args.design_seed is None:
         args.design_seed = 20260924 if args.t14_set else 20260923
     collection = bool(args.training_supplement or args.acceptance_set or args.t14_set)

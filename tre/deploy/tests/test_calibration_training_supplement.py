@@ -79,7 +79,7 @@ def _args(tmp_path, model="dsqwen-14b", **over):
         base_run=_base_run(tmp_path / "base", model),
         boundary_supplement_run=_supp_run(tmp_path / "supp", model),
         # the fixture runs predate the load-path record (English, no routing header)
-        corpus_lang="en", zh_ratio=0.0, routing_strategy=None,
+        corpus_lang="en", zh_ratio=0.0, routing_strategy=None, api="completions",
     )
     base.update(over)
     return argparse.Namespace(**base)

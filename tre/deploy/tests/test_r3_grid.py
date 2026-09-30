@@ -507,16 +507,16 @@ def test_r3_grid_accepts_a_prompt_directory_and_worker_count() -> None:
     """The campaign drives every cell through this CLI, so the materialisation has to be
     reachable from it or the boundary search silently falls back to inline builds."""
     args = r3_grid.parse_args([
-        "--model", "m", "--gateway-url", "http://gw", "--output", "o.csv",
+        "--model", "m", "--gateway-url", "http://gw/v1/chat/completions", "--output", "o.csv",
         "--prompt-dir", "/p", "--prompt-workers", "3",
     ])
     assert args.prompt_dir == "/p" and args.prompt_workers == 3
 
 
 def test_r3_grid_cli_defaults_to_the_mix_and_records_the_effective_ratio() -> None:
-    args = r3_grid.parse_args(["--model", "m", "--gateway-url", "http://gw", "--output", "o.csv"])
+    args = r3_grid.parse_args(["--model", "m", "--gateway-url", "http://gw/v1/chat/completions", "--output", "o.csv"])
     assert (args.corpus_lang, args.zh_ratio) == ("mix", 0.5)
-    args = r3_grid.parse_args(["--model", "m", "--gateway-url", "http://gw", "--output", "o.csv",
+    args = r3_grid.parse_args(["--model", "m", "--gateway-url", "http://gw/v1/chat/completions", "--output", "o.csv",
                                "--corpus-lang", "en"])
     assert args.corpus_lang == "en"
     from scripts import prompt_corpus

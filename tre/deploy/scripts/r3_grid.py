@@ -35,6 +35,17 @@ the window CSV are unchanged, so `rewindow_from_raw.py` and `tre_calibration` co
 modes identically -- except that the sidecar samples at `--instant-sample-ms` (1000 ms for
 the calibration campaign, vs the live 10 s gateway grid), so an offline re-window must be
 given the matching `--instant-sample-ms`.
+
+ENDPOINT (`--api`, default chat since 2026-09-30): requests go to `/v1/chat/completions`
+as one user message, like v1 and the E1 client, so the prefill path (chat template, BOS,
+tokenizer) is the experiments'; `ignore_eos` + `max_tokens` fix the output length. Each
+prompt is fitted so the *templated* prompt is exactly the cell's input tokens
+(`tre_replayer.engine.model_tokenizer.for_api`). `--gateway-url` must name the chat path.
+Before driving, one request per run checks `usage.prompt_tokens` against that length and
+refuses to run on a difference (`--prompt-preflight refuse`, the default; the campaign
+checks once per run and passes `skip`); every cell's guard artifact counts the served
+requests whose `usage.prompt_tokens` differed (`prompt_tokens_check`) and the raw log
+keeps both numbers per request (`expected_prompt_tokens`, `input_tokens`).
 """
 from __future__ import annotations
 
@@ -229,6 +240,9 @@ RAW_COLUMNS = [
 RAW_REQUEST_COLUMNS = [
     "request_id", "scheduled_send_ts_ms", "on_wire_delay_ms", "in_flight_at_send",
     "request_timeout_s", "outcome", "proxy_reason",
+    # The prompt length the request was built to (captures from 2026-09-30 on); the
+    # engine's usage.prompt_tokens is ``input_tokens``.
+    "expected_prompt_tokens",
 ]
 
 # S4 disk estimate: each per-request line is ~200 bytes of JSON. Warn if a full run is
@@ -299,6 +313,11 @@ PROMPT_MODES = ("token_ids", "text", "natural")
 CORPUS_LANG_DEFAULT = prompt_corpus.DEFAULT_CORPUS_LANG
 CORPUS_LANGS = prompt_corpus.CORPUS_LANGS
 ZH_RATIO_DEFAULT = prompt_corpus.DEFAULT_ZH_RATIO
+#: The endpoint (mirrors of ``tre_replayer.engine.api``, kept in :mod:`scripts.prompt_corpus`):
+#: this driver sends chat unless told otherwise; the functions below keep the replayer's
+#: completions default for their library callers.
+API_DEFAULT = prompt_corpus.CALIBRATION_API
+APIS = prompt_corpus.APIS
 
 
 def _unit_interval(text: str) -> float:
@@ -316,8 +335,10 @@ def _make_prompt(
     model: str | None = None,
     corpus_lang: str = CORPUS_LANG_DEFAULT,
     zh_ratio: float = ZH_RATIO_DEFAULT,
+    api: str = prompt_corpus.API_COMPLETIONS,
 ):
-    """One request's prompt: ``input_tokens`` long and unique to ``seed_key``.
+    """One request's prompt: ``input_tokens`` long and unique to ``seed_key``; for
+    ``api="chat"`` long *after* the chat template.
 
     The grid used to send one constant prompt for a whole cell. On an engine with
     prefix caching enabled that serves every request after the first from cache, so
@@ -329,7 +350,8 @@ def _make_prompt(
     from tre_replayer.engine.prompts import build_prompt
 
     return build_prompt(
-        input_tokens, seed_key, mode=mode, model=model, corpus_lang=corpus_lang, zh_ratio=zh_ratio
+        input_tokens, seed_key, mode=mode, model=model, corpus_lang=corpus_lang, zh_ratio=zh_ratio,
+        api=api,
     )
 
 
@@ -403,9 +425,12 @@ def drive_cell(
     corpus_lang: str = CORPUS_LANG_DEFAULT,
     zh_ratio: float = ZH_RATIO_DEFAULT,
     now_ms: Callable[[], int] = lambda: int(time.time() * 1000),
+    api: str = prompt_corpus.API_COMPLETIONS,
+    request_seed: Optional[int] = None,
 ) -> tuple[int, int]:
     """Drive cell.concurrency workers against the model for duration_s.
-    Returns (start_ms, end_ms). Fixed output length via max_tokens + ignore_eos.
+    Returns (start_ms, end_ms). Fixed output length via max_tokens + ignore_eos; the body
+    is ``tre_replayer.engine.api.request_body`` for ``api`` (``main`` passes ``--api``).
 
     Every request gets its own prompt, keyed by ``run_key``/cell/sequence (see
     :func:`_make_prompt`); the sequence counter is shared by the workers, so the *set*
@@ -428,15 +453,20 @@ def drive_cell(
     # sequence without a lock; each value is used by exactly one request.
     sequence = itertools.count()
 
+    from tre_replayer.engine.api import check_api_mode, check_api_url
+    from tre_replayer.engine.api import request_body as api_request_body
+
+    check_api_url(gateway_url, api)
+    check_api_mode(api, prompt_mode)
+
     def request_body(seq: int) -> bytes:
         prompt = _make_prompt(
-            cell.input_tokens, f"{run_key}|{cell_id}|{seq}", prompt_mode, model, corpus_lang, zh_ratio
+            cell.input_tokens, f"{run_key}|{cell_id}|{seq}", prompt_mode, model, corpus_lang, zh_ratio,
+            api=api,
         )
-        return json.dumps({
-            "model": model, "prompt": prompt, "max_tokens": cell.output_tokens,
-            "temperature": 0, "ignore_eos": True,
-            "stream": True, "stream_options": {"include_usage": True},
-        }).encode()
+        return json.dumps(
+            api_request_body(model, prompt, cell.output_tokens, api=api, seed=request_seed)
+        ).encode()
 
     def worker() -> None:
         while not stop.is_set():
@@ -812,6 +842,8 @@ def run_schedule_cell(args, store, spec, redis_client=None) -> tuple[list, "open
         overflow_sentinel=sentinel,
         request_key=args.prompt_key,
         max_backlog=args.max_backlog,
+        api=getattr(args, "api", API_DEFAULT),
+        request_seed=getattr(args, "request_seed", None),
         guard_kwargs={
             "max_p99_delay_ms": args.max_p99_delay_ms,
             "max_p99_pool_wait_ms": args.max_p99_pool_wait_ms,
@@ -852,6 +884,12 @@ def run_schedule_cell(args, store, spec, redis_client=None) -> tuple[list, "open
     add_server_latency(rows, store, args.model)
     guard = guard.with_slo_windows(count_slo_windows(rows, label=label))
 
+    prompt_check = openloop.prompt_tokens_check(sender_records)
+    if not prompt_check["ok"]:
+        print(f"WARNING: cell {cell_id}: {prompt_check['mismatched']} served request(s) prefilled a "
+              f"prompt length other than the one they were built to (max |diff| "
+              f"{prompt_check['max_abs_diff']}), {prompt_check['missing_usage']} without usage: "
+              f"{json.dumps(prompt_check['examples'])}")
     artifact = guard.as_dict()
     artifact.update({
         "schedule": str(args.schedule),
@@ -887,6 +925,14 @@ def run_schedule_cell(args, store, spec, redis_client=None) -> tuple[list, "open
             getattr(args, "zh_ratio", ZH_RATIO_DEFAULT),
         ),
         "routing_strategy": args.routing_strategy,
+        # The endpoint, the template the prompts were fitted through, and the requests'
+        # seed (None = not sent). A capacity measured through one API is not one of the other.
+        "api": getattr(args, "api", API_DEFAULT),
+        "chat_template_overhead": template_overhead(args),
+        "request_seed": getattr(args, "request_seed", None),
+        # Served requests whose usage.prompt_tokens differed from the length they were
+        # built to (openloop.prompt_tokens_check); the per-request pair is in the raw log.
+        "prompt_tokens_check": prompt_check,
         # What made this cell's arrivals and prompts its own (see openloop).
         "schedule_seed": args.schedule_seed,
         "prompt_key": args.prompt_key,
@@ -974,6 +1020,43 @@ def run_schedule_cell(args, store, spec, redis_client=None) -> tuple[list, "open
     elif not guard.ok:
         print(f"WARNING: cell {cell_id} guard failed (continuing on --guard-mode warn)")
     return rows, guard
+
+
+def template_overhead(args) -> Optional[int]:
+    """Tokens the chat template adds around a prompt of ``args.model`` (0 for completions
+    in the sense of "no template"; None when the tokenizer cannot be loaded - recorded,
+    never fatal: the prompts of the cell were built with it already)."""
+    if getattr(args, "api", API_DEFAULT) != prompt_corpus.API_CHAT:
+        return 0
+    try:
+        from tre_replayer.engine.model_tokenizer import for_api, load_tokenizer
+
+        return for_api(load_tokenizer(args.model), prompt_corpus.API_CHAT).overhead
+    except Exception as exc:  # noqa: BLE001
+        print(f"WARNING: chat template overhead of {args.model} not recorded: {exc!r}")
+        return None
+
+
+def run_prompt_preflight(args) -> Optional[dict]:
+    """``--prompt-preflight refuse``: one request of this run's kind (endpoint, corpus,
+    routing, seed) through ``--gateway-url``; SystemExit unless the engine's
+    ``usage.prompt_tokens`` is the length the prompt was fitted to
+    (``openloop.preflight_prompt_tokens``). ``skip`` (the campaign's cells, whose run
+    checked before its first cell) does nothing."""
+    if getattr(args, "prompt_preflight", "refuse") == "skip":
+        return None
+    verdict = openloop.preflight_prompt_tokens(
+        args.gateway_url, args.model, api=args.api, prompt_mode=args.prompt_mode,
+        corpus_lang=args.corpus_lang, zh_ratio=args.zh_ratio,
+        routing_strategy=args.routing_strategy, request_seed=args.request_seed,
+    )
+    print(f"prompt preflight ({args.model}, {args.api}): expected {verdict['expected_prompt_tokens']}, "
+          f"usage.prompt_tokens {verdict['prompt_tokens']}, completion {verdict['completion_tokens']}, "
+          f"first token in {verdict['first_token_field']!r}, template overhead {verdict['template_overhead']}")
+    if not verdict["ok"]:
+        raise SystemExit(f"refusing to run {args.model}: prompt preflight failed: "
+                         + "; ".join(verdict["reasons"]))
+    return verdict
 
 
 def label_schedule_cell_windows(
@@ -1203,6 +1286,18 @@ def parse_args(argv: Optional[Sequence[str]] = None):
     ap.add_argument("--zh-ratio", type=_unit_interval, default=ZH_RATIO_DEFAULT,
                     help="Chinese share of each natural prompt's tokens under --corpus-lang "
                          "mix (default %(default)s)")
+    ap.add_argument("--api", default=API_DEFAULT, choices=list(APIS),
+                    help="endpoint (default %(default)s = /v1/chat/completions, like v1 and the "
+                         "E1 client; prompts are fitted to the templated length). "
+                         "--gateway-url must name the matching path")
+    ap.add_argument("--request-seed", type=int, default=None,
+                    help="'seed' sent with every request (default: none sent; greedy decoding "
+                         "at temperature 0 does not depend on it). Recorded per cell")
+    ap.add_argument("--prompt-preflight", default="refuse", choices=["refuse", "skip"],
+                    help="refuse (default): before driving, send one request of this run's "
+                         "kind and refuse to run unless usage.prompt_tokens equals the length "
+                         "the prompt was fitted to. skip: the campaign's cells (their run "
+                         "checked before its first cell)")
     ap.add_argument("--routing-strategy", default=None,
                     help="Route via the AIBrix gateway plugin with this strategy (e.g. "
                          "least-request) instead of the per-model HTTPRoute. This is the "
@@ -1354,6 +1449,13 @@ def parse_args(argv: Optional[Sequence[str]] = None):
     ap.add_argument("--guard-mode", default="fail", choices=["fail", "warn"],
                     help="fail: a cell that did not deliver its load aborts the run")
     args = ap.parse_args(argv)
+    try:
+        prompt_corpus.check_gateway_url(args.gateway_url, args.api)
+    except ValueError as exc:
+        ap.error(str(exc))
+    if args.api == prompt_corpus.API_CHAT and args.prompt_mode != PROMPT_MODE_DEFAULT:
+        ap.error(f"--api chat needs --prompt-mode {PROMPT_MODE_DEFAULT} (the exact templated length); "
+                 f"got {args.prompt_mode}")
     if args.vllm_keyframe_every is None:
         args.vllm_keyframe_every = _capture.DEFAULT_KEYFRAME_EVERY
     if args.gateway_flush_wait_s is None:
@@ -1426,6 +1528,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # range even with scrape/write lag (r3 SMOKE_FINDINGS defect 1); read_latest_instant
     # then takes the freshest bucket, not a lookback-wide average.
     instant_sampler = _make_live_instant_sampler(store, args.model, 2 * SCRAPE_INTERVAL_MS)
+    run_prompt_preflight(args)
 
     if args.schedule is not None:
         rows, _guard = run_schedule_cell(args, store, spec, redis_client=redis_client)
@@ -1447,6 +1550,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             instant_sampler=instant_sampler, instant_interval_s=args.instant_sample_ms / 1000.0,
             prompt_mode=args.prompt_mode, routing_strategy=args.routing_strategy,
             run_key=run_key, corpus_lang=args.corpus_lang, zh_ratio=args.zh_ratio,
+            api=args.api, request_seed=args.request_seed,
         )
         windows = []
         w = start_ms

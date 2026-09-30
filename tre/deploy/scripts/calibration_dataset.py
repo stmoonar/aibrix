@@ -96,6 +96,9 @@ REQUEST_COLUMNS = IDENTITY_COLUMNS + [
     "on_wire_delay_ms", "ttft_ms", "tpot_ms", "e2e_ms", "input_tokens", "output_tokens",
     "http_status", "outcome", "proxy_reason", "in_flight_at_send", "request_timeout_s",
     "target_pod",
+    # The prompt length the request was built to (captures from 2026-09-30 on; empty
+    # before). ``input_tokens`` is the engine's usage.prompt_tokens; they must be equal.
+    "expected_prompt_tokens",
 ]
 CELL_COLUMNS = [
     "model", "shape", "primitive", "stage", "rho", "cell_id", "attempt", "split",
@@ -107,6 +110,10 @@ CELL_COLUMNS = [
     "raw_path", "guard_path", "online_csv_path", "schedule_path",
     "role", "rho_factor", "replicate", "warmup_s", "arrival_seed", "prompt_key",
     "possibly_contaminated", "drained_before", "drain_waited_s", "backlog_stopped",
+    # The endpoint the cell sent (guard artifact; empty = a capture before the option,
+    # i.e. completions) and its served requests whose usage.prompt_tokens differed from
+    # the length they were built to (empty when the capture has no expected length).
+    "api", "prompt_tokens_mismatched",
 ]
 
 #: The ladder design's per-attempt ledger (see ``scripts.calibration_ladder``).
@@ -464,6 +471,19 @@ class Settings:
         return "(start, end]" if self.window_align == rewindow_from_raw.WINDOW_ALIGN_GRID else "[start, end)"
 
 
+def _prompt_tokens_mismatched(records: Sequence[dict]) -> Optional[int]:
+    """Served requests (HTTP 200) whose ``input_tokens`` (usage.prompt_tokens) differs from
+    ``expected_prompt_tokens``; None when no record carries the expected length (a capture
+    from before 2026-09-30)."""
+    compared = [r for r in records
+                if r.get("http_status") == 200 and r.get("expected_prompt_tokens") is not None]
+    if not compared and not any(r.get("expected_prompt_tokens") is not None for r in records):
+        return None
+    return sum(1 for r in compared
+               if r.get("input_tokens") is None
+               or int(r["input_tokens"]) != int(r["expected_prompt_tokens"]))
+
+
 def _dataset_load_path(provenances: Sequence[dict]) -> dict:
     """The one load path of the dataset's campaigns - one, because _settings_for refused
     to go on when they differ; so the first campaign's is every campaign's."""
@@ -499,6 +519,8 @@ def _settings_for(campaigns: Sequence[Path], overrides: dict) -> tuple[Settings,
             # option - English prompts, no routing header.
             "prompt": prov.get("prompt"),
             "routing_strategy": prov.get("routing_strategy"),
+            # The endpoint (None = before the option: completions).
+            "api": prov.get("api"),
             "status": _read_json(campaign / "campaign_status.json") or None,
         }
         if plan.get("design") == LADDER_DESIGN:
@@ -525,7 +547,7 @@ def _settings_for(campaigns: Sequence[Path], overrides: dict) -> tuple[Settings,
             registry = registry or Path(prov["registry_path"])
     if len(load_paths) > 1:
         # One dataset, one load path: a theta fitted across two describes neither.
-        raise SystemExit(f"these campaigns were driven with different prompt corpora / routing "
+        raise SystemExit(f"these campaigns were driven with different prompt corpora / routing / APIs "
                          f"(load paths), refusing to build one dataset from them: {load_paths}")
     if ttft is None or tpot is None:
         # Older runs recorded the pinned SLO on every cell's guard, not in the plan.
@@ -947,6 +969,7 @@ def _convert_attempt(attempt, run_dir, settings, registry, plan_cells, discrepan
             "in_flight_at_send": record.get("in_flight_at_send"),
             "request_timeout_s": record.get("request_timeout_s"),
             "target_pod": record.get("target_pod"),
+            "expected_prompt_tokens": record.get("expected_prompt_tokens"),
         })
     window_rows = (
         [{**identity, "in_warmup": in_warmup(row["window_start_ms"]), **row} for row in windows]
@@ -1009,6 +1032,8 @@ def _convert_attempt(attempt, run_dir, settings, registry, plan_cells, discrepan
         "drained_before": (ledger.get("drain_before") or {}).get("drained"),
         "drain_waited_s": (ledger.get("drain_before") or {}).get("waited_s"),
         "backlog_stopped": ledger.get("backlog_stopped"),
+        "api": guard.get("api"),
+        "prompt_tokens_mismatched": _prompt_tokens_mismatched(records),
     }
     manifest_cell = {
         **{k: v for k, v in identity.items() if k != "cell_status"},

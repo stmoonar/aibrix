@@ -37,7 +37,9 @@ A materialised prompt is identical to what the sender would have built inline:
   would hand a prefix-caching engine a repeat to serve for free;
 * the **per-request** token count, including the length a sampled segment
   (:class:`tre_replayer.engine.schedule.TokenRange`) drew for that one request, because
-  the specs are taken from the built schedule rather than from the segment.
+  the specs are taken from the built schedule rather than from the segment;
+* the **endpoint** (``api``): a chat prompt is fitted to the templated length, so it is
+  not the completions prompt of the same key. Each row of the file records its ``api``.
 """
 from __future__ import annotations
 
@@ -49,11 +51,13 @@ from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 from tre_replayer.engine.prompts import (
+    DEFAULT_API,
     DEFAULT_CORPUS_LANG,
     DEFAULT_MODE,
     DEFAULT_ZH_RATIO,
     MODE_NATURAL,
     build_prompt,
+    check_api_mode,
     check_corpus,
 )
 
@@ -192,6 +196,7 @@ def _init_worker(
     tokenizer: Any | None = None,
     corpus_lang: str = DEFAULT_CORPUS_LANG,
     zh_ratio: float = DEFAULT_ZH_RATIO,
+    api: str = DEFAULT_API,
 ) -> None:
     from tre_replayer.engine import model_tokenizer
 
@@ -200,6 +205,7 @@ def _init_worker(
     _WORKER["tokenizer"] = tokenizer
     _WORKER["corpus_lang"] = corpus_lang
     _WORKER["zh_ratio"] = zh_ratio
+    _WORKER["api"] = api
     if mode == MODE_NATURAL and tokenizer is None:
         # Load this worker's own tokenizer rather than inheriting the parent's across the
         # fork: the Rust backend is shared memory after a fork, and a tokenizer that has
@@ -216,12 +222,13 @@ def _build_chunk(chunk: Sequence[tuple[str, int, str]]) -> list[tuple[str, Any]]
     tokenizer = _WORKER["tokenizer"]
     corpus_lang = _WORKER["corpus_lang"]
     zh_ratio = _WORKER["zh_ratio"]
+    api = _WORKER.get("api", DEFAULT_API)
     return [
         (
             request_id,
             build_prompt(
                 token_count, seed_key, mode=mode, model=model, tokenizer=tokenizer,
-                corpus_lang=corpus_lang, zh_ratio=zh_ratio,
+                corpus_lang=corpus_lang, zh_ratio=zh_ratio, api=api,
             ),
         )
         for request_id, token_count, seed_key in chunk
@@ -255,6 +262,7 @@ def build_prompts(
     chunk_size: int = DEFAULT_CHUNK_SIZE,
     corpus_lang: str = DEFAULT_CORPUS_LANG,
     zh_ratio: float = DEFAULT_ZH_RATIO,
+    api: str = DEFAULT_API,
 ) -> dict[str, Any]:
     """``{request_id: prompt}`` for ``specs``, built off the send path.
 
@@ -267,6 +275,7 @@ def build_prompts(
     function of its own spec, so which worker built it cannot change what it is.
     """
     check_corpus(corpus_lang, zh_ratio)
+    check_api_mode(api, mode)
     if not specs:
         return {}
     by_model: dict[str, list[PromptSpec]] = {}
@@ -278,7 +287,7 @@ def build_prompts(
         workers = default_processes(len(model_specs)) if processes is None else int(processes)
         items = [(s.request_id, s.token_count, s.seed_key) for s in model_specs]
         if tokenizer is not None or workers <= 1:
-            _init_worker(mode, model, tokenizer_path, tokenizer, corpus_lang, zh_ratio)
+            _init_worker(mode, model, tokenizer_path, tokenizer, corpus_lang, zh_ratio, api)
             prompts.update(dict(_build_chunk(items)))
             continue
         import multiprocessing
@@ -290,15 +299,17 @@ def build_prompts(
         with context.Pool(
             processes=workers,
             initializer=_init_worker,
-            initargs=(mode, model, tokenizer_path, None, corpus_lang, zh_ratio),
+            initargs=(mode, model, tokenizer_path, None, corpus_lang, zh_ratio, api),
         ) as pool:
             for built in pool.imap_unordered(_build_chunk, _chunks(items, chunk_size)):
                 prompts.update(dict(built))
     return prompts
 
 
-def write_prompt_file(path: str | Path, specs: Sequence[PromptSpec], prompts: dict[str, Any]) -> int:
-    """Write ``specs`` (in schedule order) with their prompts as JSONL; returns rows."""
+def write_prompt_file(path: str | Path, specs: Sequence[PromptSpec], prompts: dict[str, Any],
+                      *, api: str = DEFAULT_API) -> int:
+    """Write ``specs`` (in schedule order) with their prompts as JSONL; returns rows.
+    ``prompt_tokens`` is the count the endpoint ``api`` will report (templated for chat)."""
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     written = 0
@@ -312,6 +323,7 @@ def write_prompt_file(path: str | Path, specs: Sequence[PromptSpec], prompts: di
                         "request_id": spec.request_id,
                         "model": spec.model,
                         "prompt_tokens": spec.token_count,
+                        "api": api,
                         "prompt": prompts[spec.request_id],
                     },
                     separators=(",", ":"),
@@ -334,6 +346,7 @@ def materialize_prompts(
     chunk_size: int = DEFAULT_CHUNK_SIZE,
     corpus_lang: str = DEFAULT_CORPUS_LANG,
     zh_ratio: float = DEFAULT_ZH_RATIO,
+    api: str = DEFAULT_API,
 ) -> PromptStore:
     """Build every prompt of ``requests``, write them to ``path``, return the store.
 
@@ -351,6 +364,7 @@ def materialize_prompts(
         chunk_size=chunk_size,
         corpus_lang=corpus_lang,
         zh_ratio=zh_ratio,
+        api=api,
     )
-    write_prompt_file(path, specs, prompts)
+    write_prompt_file(path, specs, prompts, api=api)
     return PromptStore(prompts, path=path)

@@ -281,7 +281,7 @@ def test_the_driver_itself_writes_what_the_re_window_reproduces(tmp_path, monkey
                         lambda endpoints: (lambda now: {"waiting": 1.0, "running": 2.0}))
     out = tmp_path / "online" / "dsqwen-7b_S1_S1_hold1090_a1.csv"
     args = r3_grid.parse_args([
-        "--model", MODEL, "--gateway-url", "http://gw/v1/completions",
+        "--model", MODEL, "--gateway-url", "http://gw/v1/completions", "--api", "completions",
         "--schedule", str(schedule), "--cell-id", "i16_o8_c1090",
         "--output", str(out), "--raw-dir", str(tmp_path / "raw"),
         "--window-ms", "400", "--step-ms", "200", "--instant-sample-ms", "100",

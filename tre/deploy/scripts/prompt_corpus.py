@@ -1,6 +1,6 @@
 """How a calibration run's load reached the engine - recorded, compared, enforced.
 
-Two properties of the load path decide what a measured window means, and neither can be
+Three properties of the load path decide what a measured window means, and none can be
 recovered from the windows themselves:
 
 * the **prompt corpus** (:mod:`tre_replayer.engine.corpus`): ``en``, ``zh`` or ``mix``
@@ -8,7 +8,13 @@ recovered from the windows themselves:
   Chinese). Prefill cost per token and KV footprint per character differ between them;
 * the **routing strategy** header (``least-gpu-cache`` by default; None = no header, the
   per-model HTTPRoute). The plugin path adds the ext_proc hop and its own admission
-  limits, both of which reach the TTFT label.
+  limits, both of which reach the TTFT label;
+* the **API** (endpoint): ``chat`` (``/v1/chat/completions``, default since 2026-09-30,
+  what v1 and the E1 client send) or ``completions``. The engine prefills a different
+  token sequence for each - the chat template (BOS, role markers, ``<think>``) around
+  the content, against the bare string without BOS on vLLM 0.30 - so the length the
+  TTFT label is indexed by and the prefill work behind it differ. Unlike the other two
+  this one has **no** ``--allow-*`` override: data of the two APIs is never combined.
 
 A theta fitted on one load path is not evidence about another. So every calibration
 artefact records its load path, and every place where two artefacts meet refuses to
@@ -27,7 +33,8 @@ combine different ones:
   supplement refuses a base run of another load path.
 
 Records made before these options existed read as :data:`LEGACY_LOAD_PATH`: English
-prompts, no routing header - what every campaign sent until 2026-09-30.
+prompts, no routing header, the completions API - what every campaign sent until
+2026-09-30.
 ``--allow-prompt-corpus-mismatch`` / ``--allow-routing-mismatch`` turn a refusal into a
 recorded warning for a deliberate cross-path evaluation; a pre-registered collection
 (T14 with ``--preregistration-json``) refuses them.
@@ -47,10 +54,20 @@ CORPUS_LANGS = (LANG_EN, LANG_ZH, LANG_MIX)
 DEFAULT_CORPUS_LANG = LANG_MIX
 DEFAULT_ZH_RATIO = 0.5
 
+#: Mirror of ``tre_replayer.engine.api`` (guarded by a test).
+API_COMPLETIONS = "completions"
+API_CHAT = "chat"
+APIS = (API_COMPLETIONS, API_CHAT)
+API_PATHS = {API_COMPLETIONS: "/v1/completions", API_CHAT: "/v1/chat/completions"}
+#: The API the calibration drivers (r3_grid, the campaign) send unless told otherwise.
+CALIBRATION_API = API_CHAT
+#: What a load-path record without an API means: every capture before 2026-09-30.
+LEGACY_API = API_COMPLETIONS
+
 #: What a corpus record from before the corpus option means.
 LEGACY = {"corpus_lang": LANG_EN, "zh_ratio": 0.0}
 #: What a load-path record from before these options means.
-LEGACY_LOAD_PATH = {"prompt": dict(LEGACY), "routing_strategy": None}
+LEGACY_LOAD_PATH = {"prompt": dict(LEGACY), "routing_strategy": None, "api": LEGACY_API}
 #: Routing values that mean "no header".
 NO_ROUTING = ("", "none")
 
@@ -83,6 +100,37 @@ def normalize_routing(value: Any) -> Optional[str]:
     return None if text.lower() in NO_ROUTING else text
 
 
+def normalize_api(value: Any) -> str:
+    """The endpoint of a recorded API: a name, or a ``run_provenance`` record
+    ``{"endpoint": ...}``; a missing record is :data:`LEGACY_API`. An unknown name is an
+    error - a record nobody can interpret must not compare equal to anything."""
+    if isinstance(value, Mapping):
+        value = value.get("endpoint")
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return LEGACY_API
+    text = str(value).strip()
+    if text not in APIS:
+        raise ValueError(f"unknown API {text!r} in a load-path record (expected one of {APIS})")
+    return text
+
+
+def check_gateway_url(url: str, api: str) -> None:
+    """Refuse a gateway URL whose path names the other endpoint (mirror of
+    ``tre_replayer.engine.api.check_api_url``: chat needs the chat path; completions
+    refuses only the chat path)."""
+    from urllib.parse import urlparse
+
+    if api not in APIS:
+        raise ValueError(f"unknown API: {api!r} (expected one of {APIS})")
+    path = urlparse(str(url)).path.rstrip("/")
+    if api == API_CHAT and not path.endswith(API_PATHS[API_CHAT]):
+        raise ValueError(f"--api {api} needs a gateway URL ending in {API_PATHS[API_CHAT]}, "
+                         f"got {url!r}")
+    if api == API_COMPLETIONS and path.endswith(API_PATHS[API_CHAT]):
+        raise ValueError(f"--api {api} sends completions bodies, but {url!r} is the chat "
+                         f"endpoint; pass the {API_PATHS[API_COMPLETIONS]} URL")
+
+
 def same(a: Optional[Mapping[str, Any]], b: Optional[Mapping[str, Any]]) -> bool:
     return normalize(a) == normalize(b)
 
@@ -92,11 +140,15 @@ def describe(doc: Optional[Mapping[str, Any]]) -> str:
     return n["corpus_lang"] if n["corpus_lang"] != LANG_MIX else f"mix(zh_ratio={n['zh_ratio']})"
 
 
+def _normalized_path(prompt: Any, routing: Any, api: Any) -> dict:
+    return {"prompt": normalize(prompt), "routing_strategy": normalize_routing(routing),
+            "api": normalize_api(api)}
+
+
 def load_path(provenance: Optional[Mapping[str, Any]]) -> dict:
     """The load path of a ``run_provenance`` (or a dataset's campaign entry)."""
     prov = provenance or {}
-    return {"prompt": normalize(prov.get("prompt")),
-            "routing_strategy": normalize_routing(prov.get("routing_strategy"))}
+    return _normalized_path(prov.get("prompt"), prov.get("routing_strategy"), prov.get("api"))
 
 
 def dataset_load_path(manifest: Mapping[str, Any]) -> dict:
@@ -104,28 +156,43 @@ def dataset_load_path(manifest: Mapping[str, Any]) -> dict:
     before that, its first campaign's provenance (all campaigns of a dataset share one)."""
     recorded = manifest.get("load_path")
     if recorded:
-        return {"prompt": normalize(recorded.get("prompt")),
-                "routing_strategy": normalize_routing(recorded.get("routing_strategy"))}
+        return _normalized_path(recorded.get("prompt"), recorded.get("routing_strategy"),
+                                recorded.get("api"))
     campaigns = manifest.get("campaigns") or [{}]
     return load_path(campaigns[0] or {})
 
 
 def describe_load_path(path: Mapping[str, Any]) -> str:
     routing = normalize_routing(path.get("routing_strategy"))
-    return f"{describe(path.get('prompt'))} prompts, routing {routing or 'none (per-model HTTPRoute)'}"
+    return (f"{describe(path.get('prompt'))} prompts, routing "
+            f"{routing or 'none (per-model HTTPRoute)'}, {normalize_api(path.get('api'))} API")
 
 
 def check_load_path(recorded: Mapping[str, Any], current: Mapping[str, Any], *, what: str,
                     allow_corpus_mismatch: bool = False, allow_routing_mismatch: bool = False,
-                    check_routing: bool = True) -> dict:
+                    check_routing: bool = True, allow_api_mismatch: bool = False) -> dict:
     """Refuse (ValueError) to combine ``current`` with an artefact of load path
-    ``recorded``; with an allow flag the mismatch is printed and reported instead."""
-    rec = {"prompt": normalize(recorded.get("prompt")),
-           "routing_strategy": normalize_routing(recorded.get("routing_strategy"))}
-    cur = {"prompt": normalize(current.get("prompt")),
-           "routing_strategy": normalize_routing(current.get("routing_strategy"))}
+    ``recorded``; with an allow flag a corpus / routing mismatch is printed and reported
+    instead. An API mismatch has no CLI flag - chat and completions prefill different
+    token sequences for the same content - and is refused; ``allow_api_mismatch`` exists
+    only so a dry run (which sets every flag) reports it instead."""
+    rec = _normalized_path(recorded.get("prompt"), recorded.get("routing_strategy"),
+                           recorded.get("api"))
+    cur = _normalized_path(current.get("prompt"), current.get("routing_strategy"),
+                           current.get("api"))
     report = {"recorded": rec, "current": cur, "corpus_mismatch_allowed": False,
-              "routing_mismatch_allowed": False, "routing_compared": bool(check_routing)}
+              "routing_mismatch_allowed": False, "routing_compared": bool(check_routing),
+              "api_mismatch_reported": False}
+    if rec["api"] != cur["api"]:
+        message = (f"{what}: made through the {rec['api']} API, but this run sends {cur['api']} "
+                   "requests; the engine prefills a different token sequence for each (chat "
+                   "template, BOS), so neither the prompt lengths nor the TTFT they cost carry "
+                   "over. Data of the two APIs is never combined (re-collect it through one API, "
+                   "or pass --api to match)")
+        if not allow_api_mismatch:
+            raise ValueError(message)
+        print(f"WARNING: {message}")
+        report["api_mismatch_reported"] = True
     if rec["prompt"] != cur["prompt"]:
         message = (f"{what}: made with {describe(rec['prompt'])} prompts, but this run sends "
                    f"{describe(cur['prompt'])} prompts; a theta says nothing about a corpus it "
@@ -148,10 +215,11 @@ def check_load_path(recorded: Mapping[str, Any], current: Mapping[str, Any], *, 
 
 
 def freeze_load_path(freeze_doc: Mapping[str, Any], model: str) -> dict:
-    """The training load path a freeze recorded for ``model`` (absent = LEGACY)."""
+    """The training load path a freeze recorded for ``model`` (absent = LEGACY, which
+    includes the completions API)."""
     entry = (freeze_doc.get("models") or {}).get(model) or {}
-    return {"prompt": normalize(entry.get("prompt_corpus")),
-            "routing_strategy": normalize_routing(entry.get("routing_strategy"))}
+    return _normalized_path(entry.get("prompt_corpus"), entry.get("routing_strategy"),
+                            entry.get("api"))
 
 
 def check_matches_freeze(freeze_doc: Mapping[str, Any], model: str,

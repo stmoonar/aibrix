@@ -104,7 +104,7 @@ def _args(tmp_path, **over):
         freeze_file=tmp_path / "freeze.json", **_inputs(tmp_path),
         # The fixture freeze and retained cells predate the load-path record: English
         # prompts, no routing header.
-        corpus_lang="en", zh_ratio=0.0, routing_strategy=None,
+        corpus_lang="en", zh_ratio=0.0, routing_strategy=None, api="completions",
     )
     base.update(over)
     return argparse.Namespace(**base)
@@ -355,3 +355,12 @@ def test_m_is_refused_under_a_freeze_trained_on_another_prompt_corpus(tmp_path, 
     code, _fake = _run(tmp_path, corpus_lang="mix", zh_ratio=0.5,
                        allow_prompt_corpus_mismatch=True)
     assert code == 0
+
+
+def test_m_is_refused_under_a_freeze_of_another_api_whatever_the_allow_flags(tmp_path, frozen) -> None:
+    """The freeze fixture predates the API record (completions); M sent through chat would
+    judge a completions theta on another prefill. No flag lets it through."""
+    with pytest.raises(ValueError, match="made through the completions API"):
+        _run(tmp_path, api="chat")
+    with pytest.raises(ValueError, match="made through the completions API"):
+        _run(tmp_path, api="chat", allow_prompt_corpus_mismatch=True, allow_routing_mismatch=True)

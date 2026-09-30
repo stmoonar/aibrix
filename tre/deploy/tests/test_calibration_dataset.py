@@ -336,7 +336,7 @@ def test_the_dataset_records_its_one_prompt_corpus(tmp_path):
     out = dataset.build_dataset(root)
     manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["load_path"] == {"prompt": {"corpus_lang": "mix", "zh_ratio": 0.5},
-                                     "routing_strategy": None}
+                                     "routing_strategy": None, "api": "completions"}
     assert {c["prompt"]["corpus_lang"] for c in manifest["campaigns"]} == {"mix"}
 
 
@@ -360,3 +360,48 @@ def test_campaigns_of_different_routing_do_not_make_one_dataset(tmp_path):
     (other / "plan.json").write_text(json.dumps(plan), encoding="utf-8")
     with pytest.raises(SystemExit, match="routing"):
         dataset.build_dataset(root)
+
+
+def _set_api(campaign_dir: Path, api) -> None:
+    plan = json.loads((campaign_dir / "plan.json").read_text(encoding="utf-8"))
+    plan["provenance"]["api"] = api
+    (campaign_dir / "plan.json").write_text(json.dumps(plan), encoding="utf-8")
+
+
+def test_campaigns_of_different_apis_do_not_make_one_dataset(tmp_path):
+    """A campaign without an API record is a completions capture; a chat one next to it
+    prefilled other token sequences for the same cells."""
+    root = tmp_path / "run"
+    _campaign(root, "dsqwen-7b")
+    _set_api(_campaign(root, "dsllama-8b"), {"endpoint": "chat", "path": "/v1/chat/completions"})
+    with pytest.raises(SystemExit, match="APIs"):
+        dataset.build_dataset(root)
+    assert not (root / "dataset").exists()
+
+
+def test_a_chat_dataset_records_its_api_and_the_per_request_expected_length(tmp_path):
+    root = tmp_path / "run"
+    for model in ("dsqwen-7b", "dsllama-8b"):
+        _set_api(_campaign(root, model), {"endpoint": "chat", "path": "/v1/chat/completions"})
+    out = dataset.build_dataset(root)
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["load_path"]["api"] == "chat"
+    assert {c["api"]["endpoint"] for c in manifest["campaigns"]} == {"chat"}
+    header, requests = _read(out / dataset.REQUEST_TABLE)
+    assert "expected_prompt_tokens" in header
+    # these captures predate the expected length: empty, never guessed
+    assert all(r["expected_prompt_tokens"] == "" for r in requests)
+    header, cells = _read(out / dataset.CELL_TABLE)
+    assert {"api", "prompt_tokens_mismatched"} <= set(header)
+    assert all(c["prompt_tokens_mismatched"] == "" for c in cells)
+
+
+def test_prompt_tokens_mismatched_counts_served_requests_off_their_length():
+    records = [
+        {"http_status": 200, "expected_prompt_tokens": 512, "input_tokens": 512},
+        {"http_status": 200, "expected_prompt_tokens": 512, "input_tokens": 511},
+        {"http_status": 200, "expected_prompt_tokens": 512, "input_tokens": None},
+        {"http_status": 503, "expected_prompt_tokens": 512, "input_tokens": None},
+    ]
+    assert dataset._prompt_tokens_mismatched(records) == 2
+    assert dataset._prompt_tokens_mismatched([{"http_status": 200, "input_tokens": 5}]) is None
