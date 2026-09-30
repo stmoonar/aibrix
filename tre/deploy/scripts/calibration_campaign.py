@@ -1944,6 +1944,19 @@ def prompt_corpus(args) -> dict:
     }
 
 
+def load_path(args) -> dict:
+    """The load path this run's cells take (scripts.prompt_corpus): prompt corpus and
+    routing header - what a dataset, a freeze and a held-out set must agree on."""
+    return {"prompt": corpus_record.normalize(prompt_corpus(args)),
+            "routing_strategy": routing_strategy_for(args)}
+
+
+def mismatch_flags(args) -> dict:
+    """The --allow-*-mismatch flags, as keyword arguments of prompt_corpus.check_*."""
+    return {"allow_corpus_mismatch": bool(getattr(args, "allow_prompt_corpus_mismatch", False)),
+            "allow_routing_mismatch": bool(getattr(args, "allow_routing_mismatch", False))}
+
+
 def prompt_corpus_cli_args(args) -> list[str]:
     corpus = prompt_corpus(args)
     return ["--corpus-lang", corpus["corpus_lang"], "--zh-ratio", repr(corpus["zh_ratio"])]
@@ -2448,8 +2461,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     help="Chinese share of each prompt's tokens under --corpus-lang mix "
                          "(default %(default)s)")
     ap.add_argument("--allow-prompt-corpus-mismatch", action="store_true",
-                    help="--acceptance-set / --t14-set: warn instead of refusing when the "
-                         "frozen parameters were trained on another prompt corpus")
+                    help="--acceptance-set / --t14-set / --training-supplement: warn (and record) "
+                         "instead of refusing when the frozen parameters, retained cells or base "
+                         "run used another prompt corpus. Refused with --preregistration-json")
+    ap.add_argument("--allow-routing-mismatch", action="store_true",
+                    help="--acceptance-set / --training-supplement: the same for the routing "
+                         "strategy. Refused with --preregistration-json")
     ap.add_argument("--routing-strategy", type=normalize_routing_strategy,
                     default=DEFAULT_ROUTING_STRATEGY,
                     help="routing-strategy header every r3_grid cell sends (default "

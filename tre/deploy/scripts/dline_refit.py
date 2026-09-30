@@ -1529,10 +1529,11 @@ def freeze_model(out_root: Path, fit_dir: Path, model: str, arm: str) -> tuple[O
                             "dir does not match this refit, or its training inputs changed since")
         else:
             man_doc = json.loads(man.read_text(encoding="utf-8"))
-            corpora = training_prompt_corpora(man_doc)
-            if len(corpora) > 1:
-                problems.append(f"the training set mixes prompt corpora {sorted(corpora)}: a theta "
-                                "fitted across corpora describes neither")
+            load_paths, lp_problems = training_load_paths(man_doc)
+            problems += lp_problems
+            if len(load_paths) > 1:
+                problems.append(f"the training set mixes load paths {sorted(load_paths)}: a theta "
+                                "fitted across prompt corpora / routing describes neither")
             lp = fit_dir / TRAINING_LEDGER
             try:
                 check_training_inputs(model, p, ledger=load_ledgers([str(lp)]) if lp.exists() else None)
@@ -1568,36 +1569,49 @@ def freeze_model(out_root: Path, fit_dir: Path, model: str, arm: str) -> tuple[O
                "cells_sha256": (man_doc.get("h2") or {}).get("cells_sha256"),
                "manifest_sha256": sha256_file(h2_path) if h2_path.exists() else None},
         "trainset": {"manifest_sha256": ts.get("trainset_manifest_sha256"), "sentinels": ts.get("sentinels")},
-        # What the training prompts were written in (scripts.prompt_corpus): M and T14 refuse
-        # to run under this freeze with another corpus. Absent in older freezes = English.
-        "prompt_corpus": next(iter(training_prompt_corpora(man_doc).values()), None),
+        # The training load path (scripts.prompt_corpus): what the prompts were written in
+        # and how they were routed. M and T14 refuse to run under this freeze with another.
+        # Absent in older freezes = English prompts, no routing header.
+        "prompt_corpus": next(iter(load_paths.values()))["prompt"],
+        "routing_strategy": next(iter(load_paths.values()))["routing_strategy"],
     }
     return entry, []
 
 
-def training_prompt_corpora(trainset_manifest: Mapping) -> dict[str, dict]:
-    """``{description: corpus}`` over the standard datasets a training set was cut from,
-    read from each dataset's own manifest (``prompt_corpus``; an older dataset, or its
-    campaigns without a record, is English)."""
+def training_load_paths(trainset_manifest: Mapping) -> tuple[dict[str, dict], list[str]]:
+    """``({description: load path}, problems)`` over the standard datasets a training set
+    (the trainset stage's manifest, ``sources[].directory``) was cut from, each read from
+    the dataset's own manifest - whose sha256 must still be the one the trainset stage
+    recorded. A manifest that is missing, unreadable or changed is a problem, never a
+    silent default; a readable one without a record predates the options (English
+    prompts, no routing header)."""
     from scripts import prompt_corpus as corpus_record
 
     found: dict[str, dict] = {}
-    for source in trainset_manifest.get("sources") or []:
-        windows = source.get("windows_csv")
-        if not windows:
+    problems: list[str] = []
+    sources = trainset_manifest.get("sources") or []
+    if not sources:
+        problems.append("the trainset manifest lists no sources: the training load path is unknown")
+    for source in sources:
+        directory = source.get("directory")
+        manifest = Path(directory) / DATASET_MANIFEST if directory else None
+        if manifest is None or not manifest.is_file():
+            problems.append(f"training source {source.get('run')!r}: no dataset manifest at "
+                            f"{manifest}: its load path (prompt corpus, routing) is unknown")
             continue
-        manifest = Path(windows).parent / "manifest.json"
+        recorded = source.get("manifest_sha256")
+        if recorded and sha256_file(manifest) != recorded:
+            problems.append(f"{manifest} changed since the trainset stage read it "
+                            f"(sha256 {recorded})")
+            continue
         try:
             doc = json.loads(manifest.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            doc = {}
-        corpus = doc.get("prompt_corpus")
-        if corpus is None:
-            campaigns = doc.get("campaigns") or [{}]
-            corpus = (campaigns[0] or {}).get("prompt")
-        normal = corpus_record.normalize(corpus)
-        found[corpus_record.describe(normal)] = normal
-    return found
+        except (OSError, ValueError) as exc:
+            problems.append(f"{manifest}: unreadable ({exc})")
+            continue
+        path = corpus_record.dataset_load_path(doc)
+        found[corpus_record.describe_load_path(path)] = path
+    return found, problems
 
 
 def stage_freeze(out_root: Path, fit_dir_of: Callable[[str], Path], models: Sequence[str], arm: str,

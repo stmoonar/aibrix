@@ -102,8 +102,9 @@ def _args(tmp_path, **over):
         gateway_url="http://gw/v1/completions", guard_mode="warn", min_slo_windows=3,
         max_model_error_rate=0.05, envoy_stats_url=None, envoy_cluster_filter=None,
         freeze_file=tmp_path / "freeze.json", **_inputs(tmp_path),
-        # The fixture freeze predates the corpus record, i.e. was trained on English.
-        corpus_lang="en", zh_ratio=0.0,
+        # The fixture freeze and retained cells predate the load-path record: English
+        # prompts, no routing header.
+        corpus_lang="en", zh_ratio=0.0, routing_strategy=None,
     )
     base.update(over)
     return argparse.Namespace(**base)
@@ -346,5 +347,11 @@ def test_the_cli_dry_run_lists_m_without_a_freeze(tmp_path, capsys) -> None:
 def test_m_is_refused_under_a_freeze_trained_on_another_prompt_corpus(tmp_path, frozen) -> None:
     """The freeze fixture predates the corpus record (English); M with the default mix
     would judge an English theta on mixed prompts."""
-    with pytest.raises(ValueError, match="trained on en prompts"):
+    with pytest.raises(ValueError, match="made with en prompts"):
         _run(tmp_path, corpus_lang="mix", zh_ratio=0.5)
+    with pytest.raises(ValueError, match="routed with no routing header"):
+        _run(tmp_path, routing_strategy="least-gpu-cache")
+    # a deliberate cross-path evaluation is allowed, and recorded
+    code, _fake = _run(tmp_path, corpus_lang="mix", zh_ratio=0.5,
+                       allow_prompt_corpus_mismatch=True)
+    assert code == 0

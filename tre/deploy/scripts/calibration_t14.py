@@ -426,7 +426,7 @@ def check_max_model_len(model: str, shapes: Sequence[str], registry: Optional[st
 
 
 def check_param_file(path, model: str, registry: Optional[str], what: str, *,
-                     corpus: Optional[dict] = None, allow_corpus_mismatch: bool = False) -> dict:
+                     load_path: Optional[dict] = None, allow_corpus_mismatch: bool = False) -> dict:
     """A ``dline_refit freeze`` file: verifies, and froze ``model`` under the primary label
     (the check ``calibration_acceptance.check_freeze`` makes)."""
     from scripts import dline_refit
@@ -444,12 +444,15 @@ def check_param_file(path, model: str, registry: Optional[str], what: str, *,
                          "than the one T14 is judged by")
     from scripts import prompt_corpus as corpus_record
 
-    trained = corpus_record.check_matches_freeze(
-        doc, model, corpus, what=f"{what} {path}", allow_mismatch=allow_corpus_mismatch)
+    # Routing is recorded, not compared: T14's routing is fixed to least-gpu-cache by its
+    # preregistration whatever the training used (scripts.prompt_corpus).
+    checked = corpus_record.check_matches_freeze(
+        doc, model, load_path or corpus_record.LEGACY_LOAD_PATH, what=f"{what} {path}",
+        allow_corpus_mismatch=allow_corpus_mismatch, check_routing=False)
     return {"path": str(Path(path).resolve()), "sha256": _file_sha256(Path(path)),
             "freeze_sha256": doc.get("freeze_sha256"),
             "label_def_sha256": dline_refit.canonical_sha256(theirs),
-            "prompt_corpus": trained}
+            "load_path": checked}
 
 
 def _dig(doc: Mapping, dotted: str):
@@ -725,7 +728,7 @@ def build_plan(args, model: str, cells: Sequence[design.DesignCell],
         "max_model_len_check": dict(mml),
         "parameter_sets": {"freeze": freeze, "v1lambda": refit},
         "preregistration": prereg,
-        "routing_strategy": getattr(args, "routing_strategy", None),
+        "routing_strategy": campaign.routing_strategy_for(args),
         "gateway_url": getattr(args, "gateway_url", None),
         "label": {**labels, "window_ms": args.window_ms, "step_ms": args.fit_step_ms},
         "order": [c.cell_id for c in order],
@@ -963,15 +966,21 @@ def run_t14_set(args, *, drive: Optional[Callable] = None,
     registry = getattr(args, "registry", None)
     mml = check_max_model_len(model, SHAPES, registry)
     freeze = refit = prereg = None
+    allow_corpus = bool(getattr(args, "allow_prompt_corpus_mismatch", False))
+    if getattr(args, "preregistration_json", None) and (
+            allow_corpus or getattr(args, "allow_routing_mismatch", False)):
+        raise ValueError("--allow-prompt-corpus-mismatch / --allow-routing-mismatch do not combine "
+                         "with --preregistration-json: a pre-registered set is judged on the load "
+                         "path its parameters were trained on")
     if _required(getattr(args, "freeze_file", None), "--freeze-file", "the D22 freeze", dry):
         freeze = check_param_file(args.freeze_file, model, registry, "--freeze-file",
-                                  corpus=campaign.prompt_corpus(args),
-                                  allow_corpus_mismatch=bool(getattr(args, "allow_prompt_corpus_mismatch", False)))
+                                  load_path=campaign.load_path(args),
+                                  allow_corpus_mismatch=allow_corpus)
     if _required(getattr(args, "refit_params_file", None), "--refit-params-file",
                  "the v1-lambda parameter set", dry):
         refit = check_param_file(args.refit_params_file, model, registry, "--refit-params-file",
-                                 corpus=campaign.prompt_corpus(args),
-                                 allow_corpus_mismatch=bool(getattr(args, "allow_prompt_corpus_mismatch", False)))
+                                 load_path=campaign.load_path(args),
+                                 allow_corpus_mismatch=allow_corpus)
     if _required(getattr(args, "preregistration_json", None), "--preregistration-json",
                  "the preregistration", dry):
         prereg = check_preregistration(Path(args.preregistration_json),
@@ -980,7 +989,7 @@ def run_t14_set(args, *, drive: Optional[Callable] = None,
                                        amendment=getattr(args, "preregistration_amendment_json", None))
     elif getattr(args, "preregistration_amendment_json", None):
         raise ValueError("--preregistration-amendment-json needs --preregistration-json")
-    routing = getattr(args, "routing_strategy", None)
+    routing = campaign.routing_strategy_for(args)
     if routing != ROUTING_STRATEGY:
         if not dry:
             raise ValueError(f"--t14-set needs --routing-strategy {ROUTING_STRATEGY} (the tre-v2 "

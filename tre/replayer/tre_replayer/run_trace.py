@@ -15,10 +15,14 @@ import json
 from typing import Any
 
 from tre_replayer.engine import rps_timeline
+from tre_replayer.engine.corpus import effective_zh_ratio
 from tre_replayer.engine.dispatcher import dispatch_open_loop
 from tre_replayer.engine.http_sender import DEFAULT_ROUTING_STRATEGY, StreamResult, StreamingHttpSender
 from tre_replayer.engine.prompt_store import materialize_prompts
 from tre_replayer.engine.prompts import CORPUS_LANGS, DEFAULT_CORPUS_LANG, DEFAULT_ZH_RATIO
+from tre_replayer.engine.schedule import build_poisson_schedule
+from tre_replayer.scoring import compute_v_sys
+from tre_replayer.traces.loader import load_trace_segments
 
 
 def _unit_interval(text: str) -> float:
@@ -27,14 +31,6 @@ def _unit_interval(text: str) -> float:
     if not 0.0 <= value <= 1.0:
         raise argparse.ArgumentTypeError(f"must be within [0, 1], got {text}")
     return value
-
-
-def effective_zh_ratio(corpus_lang: str, zh_ratio: float) -> float:
-    """What a corpus actually targets: en 0, zh 1, mix its ratio (what gets recorded)."""
-    return 0.0 if corpus_lang == "en" else 1.0 if corpus_lang == "zh" else float(zh_ratio)
-from tre_replayer.engine.schedule import build_poisson_schedule
-from tre_replayer.scoring import compute_v_sys
-from tre_replayer.traces.loader import load_trace_segments
 
 
 def _dry_stream_call(url: str, headers: dict[str, str], body: bytes, timeout_s: float) -> StreamResult:

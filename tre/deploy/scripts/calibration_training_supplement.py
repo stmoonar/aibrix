@@ -462,6 +462,29 @@ def banner(lines: Sequence[str]) -> None:
     print(bar, flush=True)
 
 
+def check_base_load_path(args, model: str) -> list[dict]:
+    """The supplement extends --base-run's training set, so it must reach the engine the
+    same way (scripts.prompt_corpus): same prompt corpus, same routing. Every campaign of
+    the base run that drove ``model`` is compared (one without a record predates the
+    options: English, no routing header)."""
+    from scripts import calibration_dataset as dataset
+    from scripts import prompt_corpus as corpus_record
+
+    reports = []
+    base = Path(args.base_run)
+    for directory in (dataset.campaign_dirs(base) if base.is_dir() else []):
+        try:
+            plan = json.loads((directory / "plan.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise ValueError(f"{directory}/plan.json: unreadable ({exc})")
+        if model not in (plan.get("models") or [model]):
+            continue
+        reports.append(corpus_record.check_load_path(
+            corpus_record.load_path(plan.get("provenance")), campaign.load_path(args),
+            what=f"base run {directory}", **campaign.mismatch_flags(args)))
+    return reports
+
+
 def run_training_supplement(args, *, drive: Optional[Callable] = None,
                             sample_factory: Optional[Callable[[str], Callable]] = None,
                             sleep: Callable[[float], None] = time.sleep,
@@ -476,6 +499,7 @@ def run_training_supplement(args, *, drive: Optional[Callable] = None,
     out_dir = Path(args.out_dir)
     for source in (args.base_run, args.boundary_supplement_run):
         supplement.check_new_out_dir(out_dir, Path(source))
+    check_base_load_path(args, model)
     resolved = resolve_units(model, Path(args.base_run), Path(args.boundary_supplement_run))
     cap = resolve_cap(args)
     factory = design.CellFactory(model, int(args.design_seed), serial_base=SERIAL_BASE)

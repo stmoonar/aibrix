@@ -349,6 +349,15 @@ _ZH_SLOT_BANKS = {
 _ZH_STREAM_SALT = 0x7A68_5F63_6F72_7075  # "zh_corpu"
 
 
+def effective_zh_ratio(corpus_lang: str, zh_ratio: float) -> float:
+    """What a corpus actually targets - en 0, zh 1, mix its ratio - i.e. what to record."""
+    if corpus_lang == LANG_EN:
+        return 0.0
+    if corpus_lang == LANG_ZH:
+        return 1.0
+    return float(zh_ratio)
+
+
 def is_cjk(ch: str) -> bool:
     """A CJK ideograph or CJK / fullwidth punctuation - what "Chinese text" means here."""
     code = ord(ch)
@@ -464,7 +473,8 @@ def budgeted_text(
         joined = previous["text"] + _separator(which) + piece
         return len(encode(joined)) - previous["tokens"]
 
-    def take(which: str, sentence: str, room: int) -> None:
+    def take(which: str, sentence: str, room: int) -> bool:
+        """Append ``sentence`` (cut to ``room``); True when it went in whole."""
         piece, spent, was_cut = sentence, cost(which, sentence), False
         if spent > room:
             was_cut = True
@@ -485,14 +495,28 @@ def budgeted_text(
         left[which] -= max(1, spent)
         if was_cut or not piece:
             left[which] = 0  # the language's last sentence was cut: it is closed
+        return not was_cut and bool(piece)
 
     # The reference line first, charged to its own language. If it overruns that
     # language's share the overrun comes out of the other language's share, so the total
     # stays ``budget``; only a prompt too short for the line itself gets it cut.
-    take(opening, next(streams[opening]), budget)
-    remaining = budget - used[opening]
-    left[opening] = max(0, min(left[opening], remaining))
-    left[other] = max(0, remaining - left[opening]) if total[other] > 0 else 0
+    opened_whole = take(opening, next(streams[opening]), budget)
+    if lang == LANG_MIX and opening == LANG_ZH and opened_whole:
+        # The Chinese opening carries the ASCII base-36 id: those tokens are not Chinese
+        # text, so they are charged to the English budget (measured, they count as such).
+        moved = min(used[LANG_ZH], len(encode(reference_id(seed))))
+        used[LANG_ZH] -= moved
+        used[LANG_EN] += moved
+    remaining = budget - used[LANG_ZH] - used[LANG_EN]
+    if not opened_whole:
+        left[opening] = 0
+        left[other] = remaining if total[other] > 0 else 0
+    else:
+        left = {lg: max(0, total[lg] - used[lg]) for lg in (LANG_ZH, LANG_EN)}
+        over = left[LANG_ZH] + left[LANG_EN] - remaining
+        if over > 0:  # one language overran its share: the overrun comes out of the other
+            poorer = LANG_ZH if left[LANG_ZH] >= left[LANG_EN] else LANG_EN
+            left[poorer] = max(0, left[poorer] - over)
 
     while left[LANG_ZH] > 0 or left[LANG_EN] > 0:
         open_langs = [lg for lg in (LANG_ZH, LANG_EN) if left[lg] > 0]

@@ -464,11 +464,12 @@ class Settings:
         return "(start, end]" if self.window_align == rewindow_from_raw.WINDOW_ALIGN_GRID else "[start, end)"
 
 
-def _dataset_prompt_corpus(provenances: Sequence[dict]) -> dict:
+def _dataset_load_path(provenances: Sequence[dict]) -> dict:
+    """The one load path of the dataset's campaigns - one, because _settings_for refused
+    to go on when they differ; so the first campaign's is every campaign's."""
     from scripts import prompt_corpus as corpus_record
 
-    first = provenances[0].get("prompt") if provenances else None
-    return corpus_record.normalize(first)
+    return corpus_record.load_path(provenances[0] if provenances else None)
 
 
 def _settings_for(campaigns: Sequence[Path], overrides: dict) -> tuple[Settings, list[dict]]:
@@ -481,20 +482,23 @@ def _settings_for(campaigns: Sequence[Path], overrides: dict) -> tuple[Settings,
     registry = None
     from scripts import prompt_corpus as corpus_record
 
-    corpora: dict[str, list[str]] = {}
+    load_paths: dict[str, list[str]] = {}
     for campaign in campaigns:
         plan = _read_json(campaign / "plan.json")
         fit = _read_json(campaign / "fit_plan.json")
         prov = plan.get("provenance") or {}
-        corpora.setdefault(corpus_record.describe(prov.get("prompt")), []).append(campaign.name)
+        load_paths.setdefault(corpus_record.describe_load_path(corpus_record.load_path(prov)),
+                              []).append(campaign.name)
         entry = {
             "campaign": campaign.name,
             "code": prov.get("code"),
             "registry_path": prov.get("registry_path"),
             "registry_sha256": prov.get("registry_sha256"),
-            # What the prompts were written in (run_provenance); None = a campaign from
-            # before the corpus option, i.e. English prompts.
+            # The load path (run_provenance; scripts.prompt_corpus): what the prompts were
+            # written in and how they were routed. None = a campaign from before the
+            # option - English prompts, no routing header.
             "prompt": prov.get("prompt"),
+            "routing_strategy": prov.get("routing_strategy"),
             "status": _read_json(campaign / "campaign_status.json") or None,
         }
         if plan.get("design") == LADDER_DESIGN:
@@ -519,10 +523,10 @@ def _settings_for(campaigns: Sequence[Path], overrides: dict) -> tuple[Settings,
         tpot = tpot or slo.get(slo_labels.P95_TPOT_CLIENT)
         if prov.get("registry_path") and Path(prov["registry_path"]).exists():
             registry = registry or Path(prov["registry_path"])
-    if len(corpora) > 1:
-        # One dataset, one kind of prompt: a theta fitted across corpora describes neither.
-        raise SystemExit(f"these campaigns were driven with different prompt corpora, refusing to "
-                         f"build one dataset from them: {corpora}")
+    if len(load_paths) > 1:
+        # One dataset, one load path: a theta fitted across two describes neither.
+        raise SystemExit(f"these campaigns were driven with different prompt corpora / routing "
+                         f"(load paths), refusing to build one dataset from them: {load_paths}")
     if ttft is None or tpot is None:
         # Older runs recorded the pinned SLO on every cell's guard, not in the plan.
         for campaign in campaigns:
@@ -721,9 +725,10 @@ def build_dataset(
         },
         "run_root": str(run_dir),
         "campaigns": provenances,
-        # The one prompt corpus every campaign above was driven with (they may not differ;
-        # a campaign from before the option is English). dline_refit freeze carries it on.
-        "prompt_corpus": _dataset_prompt_corpus(provenances),
+        # The one load path (prompt corpus, routing) every campaign above was driven with
+        # (they may not differ; a campaign from before the options is English, no header).
+        # dline_refit freeze carries it on.
+        "load_path": _dataset_load_path(provenances),
         "registry_used_for_labels": {
             "path": str(settings.label_registry_path),
             "sha256": _sha256(settings.label_registry_path),

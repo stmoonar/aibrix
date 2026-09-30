@@ -335,7 +335,8 @@ def test_the_dataset_records_its_one_prompt_corpus(tmp_path):
         _set_prompt(_campaign(root, model), {"prompt_mode": "natural", "corpus_lang": "mix", "zh_ratio": 0.5})
     out = dataset.build_dataset(root)
     manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest["prompt_corpus"] == {"corpus_lang": "mix", "zh_ratio": 0.5}
+    assert manifest["load_path"] == {"prompt": {"corpus_lang": "mix", "zh_ratio": 0.5},
+                                     "routing_strategy": None}
     assert {c["prompt"]["corpus_lang"] for c in manifest["campaigns"]} == {"mix"}
 
 
@@ -348,3 +349,14 @@ def test_campaigns_of_different_prompt_corpora_do_not_make_one_dataset(tmp_path)
     with pytest.raises(SystemExit, match="different prompt corpora"):
         dataset.build_dataset(root)
     assert not (root / "dataset").exists()
+
+
+def test_campaigns_of_different_routing_do_not_make_one_dataset(tmp_path):
+    root = tmp_path / "run"
+    _campaign(root, "dsqwen-7b")
+    other = _campaign(root, "dsllama-8b")
+    plan = json.loads((other / "plan.json").read_text(encoding="utf-8"))
+    plan["provenance"]["routing_strategy"] = "least-gpu-cache"
+    (other / "plan.json").write_text(json.dumps(plan), encoding="utf-8")
+    with pytest.raises(SystemExit, match="routing"):
+        dataset.build_dataset(root)

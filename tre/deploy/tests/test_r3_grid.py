@@ -293,6 +293,9 @@ def test_drive_cell_instant_sidecar_carries_the_pod_kv_cache_usage(tmp_path) -> 
         "http://gw", "dsqwen-7b", r3_grid.GridCell(128, 128, 1), duration_s=0.2,
         raw_path=raw_path, instant_path=instant_path,
         instant_sampler=fake_sampler, instant_interval_s=0.02, stream_call=fake_stream_call,
+        # The sidecar is under test, not the prompt: token ids need no tokenizer load
+        # inside a 0.2 s cell (which made this timing-sensitive under a loaded host).
+        prompt_mode="token_ids",
     )
     snaps = [_json.loads(l) for l in instant_path.read_text().splitlines() if l.strip()]
     assert len(snaps) >= 2

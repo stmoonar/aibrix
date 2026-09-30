@@ -582,9 +582,18 @@ def test_a_real_run_needs_its_bindings(tmp_path, frozen) -> None:
     with pytest.raises(ValueError, match="least-gpu-cache"):
         t14.run_t14_set(_args(tmp_path, routing_strategy=None, **full), check_controller=False)
     # The frozen parameters were trained on English prompts: a mixed T14 is refused.
-    with pytest.raises(ValueError, match="trained on en prompts"):
+    with pytest.raises(ValueError, match="made with en prompts"):
         t14.run_t14_set(_args(tmp_path, corpus_lang="mix", zh_ratio=0.5, **full),
                         check_controller=False)
+    # a pre-registered set cannot waive its load path
+    with pytest.raises(ValueError, match="do not combine with --preregistration-json"):
+        t14.run_t14_set(_args(tmp_path, allow_prompt_corpus_mismatch=True, **full),
+                        check_controller=False)
+    # routing is fixed by T14 itself (least-gpu-cache), so it is recorded, not compared,
+    # and a hand-built Namespace without the attribute gets the campaign default
+    no_attr = _args(tmp_path, **full)
+    delattr(no_attr, "routing_strategy")
+    assert campaign.routing_strategy_for(no_attr) == t14.ROUTING_STRATEGY
     with pytest.raises(ValueError, match="dsqwen-14b set"):
         t14.run_t14_set(_args(tmp_path, models="dsqwen-7b", **full), check_controller=False)
     with pytest.raises(ValueError, match="does not bind"):
