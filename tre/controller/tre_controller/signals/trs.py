@@ -590,7 +590,11 @@ class SignalState:
     def settle_breakpoint_ms(self, model: str) -> int | None:
         """The breakpoint C1 may settle a rescue target on: the onset, or a routable
         change seen between two views of this process - not one dated on the first
-        observation (a restart: the date is a guess and the SM may still be waking)."""
+        observation (a restart: the date is a guess and the SM may still be waking).
+        None while O1 is off or suspended (review P1): the windows are whole windows
+        then, still dominated by the old replica count, so C1 keeps its window-start rule."""
+        if not self._o1_enabled:
+            return None
         change = self._change_ms.get(model) if self._change_seen.get(model) else None
         points = [point for point in (self._onset_ms.get(model), change) if point is not None]
         return max(points) if points else None

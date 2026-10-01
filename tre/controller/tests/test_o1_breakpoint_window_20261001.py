@@ -848,3 +848,122 @@ def test_safescale_observation_in_fallback_mode_equals_legacy_bitwise():
         b = _observation_from_metrics(end, window, registry.model("m"), "zm", signal_state=off,
                                       routable_observation=(end, ()))
         assert (a.z_m, a.q_ctl, a.has_traffic) == (b.z_m, b.q_ctl, b.has_traffic), end
+
+
+
+# ===================================================== review round 3 (2026-10-01)
+
+
+def _c1_run(state_factory, registry, *, pattern, routables):
+    """Rescue ticks of a model with a C1 target done at 1_013_500 (1 -> 2 at the view of
+    1_023_000): returns per window end whether C1 kept its rescue basis."""
+    from tre_controller.loops.action_queue import RescueTargetRecord
+
+    class _TargetQueue(_Queue):
+        def rescue_targets(self):
+            return {"m": RescueTargetRecord(target=2, desired=2, base=1, covered_before=1, issued_ms=1_010_000,
+                                            done_ms=1_013_500)}
+
+    state = state_factory()
+    _prime_onset(state, 500_000)
+    queue = _TargetQueue({"m": (1_013_500, 1)})
+    held = {}
+    for k, (grids, routable) in enumerate(zip(pattern, routables)):
+        end = 1_000_000 + k * GRID
+        snap = _snap(_window(end, [grids] * 3, routable=routable))
+        ctx, _ = _model_contexts(snap, registry, signal_state=state,
+                                 cluster_view=_view(routable, fetched_ms=end + 3_000), queue=queue)
+        held[end] = "m" in _rescue_bases(snap, queue, registry, ctx)
+    return held
+
+
+def test_c1_settle_without_o1_or_while_suspended_is_c1_alone():
+    """Review P1: O1 off (fallback) or suspended (clock check) -> C1's window-start rule,
+    bit for bit the C1-only behaviour (no SignalState breakpoint at all)."""
+    registry = _registry(10_000.0)
+    pattern = [BURST] * 9
+    routables = [1, 1, 2, 2, 2, 2, 2, 2, 2]
+    c1_alone = _c1_run(lambda: SignalState(warmup_ms=-1), registry, pattern=pattern, routables=routables)
+    fallback = _c1_run(lambda: SignalState(warmup_ms=-1, breakpoint=BreakpointWindowConfig(enabled=False, grid_ms=GRID)),
+                       registry, pattern=pattern, routables=routables)
+
+    def suspended():
+        state = SignalState(warmup_ms=-1, breakpoint=O1)
+        state.suspend_breakpoint_window("gateway_clock:gateway_ahead")
+        return state
+
+    paused = _c1_run(suspended, registry, pattern=pattern, routables=routables)
+    assert fallback == c1_alone == paused
+    # The C1 rule: held until the window starts k*tau (20 s) after done (1_013_500).
+    assert c1_alone[1_060_000] is True and c1_alone[1_070_000] is False
+    o1 = _c1_run(lambda: SignalState(warmup_ms=-1, breakpoint=O1), registry, pattern=pattern, routables=routables)
+    assert o1[1_050_000] is False  # O1 on: settles once warm after the change (earlier)
+
+
+def test_hold_fallback_never_settles_c1():
+    """Review P2-1: the whole-window fallback still holds the old replica count."""
+    registry = _registry(10_000.0)
+    state = SignalState(warmup_ms=-1, breakpoint=replace(O1, hold_max_windows=2))
+    _prime_onset(state, 500_000)
+    last = None
+    for k in range(6):
+        end = 1_000_000 + k * GRID
+        routable = 1 + k % 2
+        ctx, events = _model_contexts(_snap(_window(end, [BURST] * 3, routable=routable)), registry,
+                                      signal_state=state, cluster_view=_view(routable, fetched_ms=end + 3_000),
+                                      queue=_Queue())
+        if any(e.startswith("breakpoint_hold_fallback:m") for e in events):
+            last = ctx["m"]
+    assert last is not None and last["signal_warm"] is True and last["signal_settle_ms"] is None
+
+
+def test_gateway_clock_measures_the_offset_from_written_ms():
+    """Review P2-2: with written_ms the offset is measured directly - a 1.5 s and a 3 s
+    offset are told apart whatever the gateway's write phase."""
+    from tre_controller.gateway_clock import GatewayClockMonitor, measure_written_offset_ms
+
+    class _Gateway:
+        """Writes a doc every 10 s at its own clock = controller clock + offset, phase 0."""
+
+        def __init__(self, clock, offset_ms):
+            self.clock, self.offset = clock, offset_ms
+
+        def smembers(self, key):
+            return {b"default/pod-a"} if key.endswith(":m") else set()
+
+        def zrange(self, key, start, end, withscores=False):
+            gw_now = self.clock["ms"] + self.offset
+            boundary = gw_now // GRID * GRID
+            return [(json.dumps({"timestamp": boundary, "written_ms": boundary}).encode(), float(boundary))]
+
+    for offset, ok in ((1_500, True), (3_000, False), (-3_000, False), (0, True)):
+        clock = {"ms": 1_000_000 + 4_321}
+
+        def sleep(seconds, clock=clock):
+            clock["ms"] += int(seconds * 1000)
+
+        gateway = _Gateway(clock, offset)
+        measured = measure_written_offset_ms(gateway, "tre:v2:inst:default/pod-a", clock_ms=lambda: clock["ms"],
+                                             sleep_s=sleep, poll_ms=250, max_wait_ms=12_000)
+        assert abs(measured - offset) <= 250, (offset, measured)
+        state = SignalState(warmup_ms=-1, breakpoint=O1)
+        monitor = GatewayClockMonitor(gateway, ["m"], state, period_ms=GRID, tolerance_ms=2_000,
+                                      clock_ms=lambda: clock["ms"], sleep_s=sleep)
+        assert monitor.check().ok is ok
+        assert (state.breakpoint_window_suspended is None) is ok
+
+
+def test_gateway_clock_falls_back_to_stamp_lag_without_written_ms():
+    from tre_controller.gateway_clock import GatewayClockMonitor
+
+    class _OldGateway:
+        def smembers(self, key):
+            return {b"default/pod-a"} if key.endswith(":m") else set()
+
+        def zrange(self, key, start, end, withscores=False):
+            return [(json.dumps({"timestamp": 1_160_000}).encode(), 1_160_000.0)]
+
+    state = SignalState(warmup_ms=-1, breakpoint=O1)
+    monitor = GatewayClockMonitor(_OldGateway(), ["m"], state, period_ms=GRID, tolerance_ms=2_000,
+                                  clock_ms=lambda: 1_000_000, sleep_s=lambda _s: None)
+    assert monitor.check().reason == "gateway_ahead"

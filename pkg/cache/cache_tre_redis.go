@@ -76,8 +76,12 @@ func (c *Store) writeTREPodMetricsToRedis(ctx context.Context, roundT int64) err
 			return true
 		}
 
+		// TRE O1 (2026-10-01): written_ms is the gateway wall clock at the write, so
+		// the controller can measure the gateway-vs-controller clock offset directly
+		// (timestamp is the boundary, written up to one period later).
 		base := map[string]any{
 			"timestamp":     roundT,
+			"written_ms":    treWallClockMS(),
 			"pod_name":      metaPod.Name,
 			"pod_namespace": metaPod.Namespace,
 			"pod_ip":        metaPod.Status.PodIP,
@@ -115,6 +119,9 @@ func (c *Store) writeTREPodMetricsToRedis(ctx context.Context, roundT int64) err
 	return firstErr
 }
 
+// treWallClockMS is the gateway wall clock in ms (a variable so tests can pin it).
+var treWallClockMS = func() int64 { return time.Now().UnixMilli() }
+
 func treMetricSchemaMode() (bool, bool, error) {
 	switch strings.ToLower(strings.TrimSpace(os.Getenv(treRedisSchemaEnv))) {
 	case "", "dual":
@@ -148,7 +155,15 @@ func (c *Store) writeTREMetricDocument(ctx context.Context, podKey string, round
 			prefix = treV2HistogramKeyPrefix
 		}
 		key := prefix + podKey
-		if err := c.redisClient.ZAdd(ctx, key, redis.Z{Score: float64(roundT), Member: string(value)}).Err(); err != nil {
+		// One doc per boundary: written_ms makes every write unique, so a rewrite of
+		// the same boundary replaces the earlier doc instead of adding a second one
+		// (the controller sums a window's instant docs).
+		boundary := fmt.Sprintf("%d", roundT)
+		if _, err := c.redisClient.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+			pipe.ZRemRangeByScore(ctx, key, boundary, boundary)
+			pipe.ZAdd(ctx, key, redis.Z{Score: float64(roundT), Member: string(value)})
+			return nil
+		}); err != nil {
 			return err
 		}
 		cutoff := roundT - treV2RetentionMS

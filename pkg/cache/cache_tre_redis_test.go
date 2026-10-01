@@ -79,6 +79,30 @@ func TestWriteTREPodMetricsToRedisDefaultsToDualSchema(t *testing.T) {
 	require.Equal(t, float64(67890), doc["timestamp"])
 }
 
+func TestWriteTREPodMetricsToRedisStampsWrittenMSAndKeepsOneDocPerBoundary(t *testing.T) {
+	t.Setenv("TRE_REDIS_SCHEMA", "v2")
+	store, client := newTREMetricStoreForTest(t)
+	clock := int64(1_000_000)
+	saved := treWallClockMS
+	treWallClockMS = func() int64 { return clock }
+	t.Cleanup(func() { treWallClockMS = saved })
+
+	require.NoError(t, store.writeTREPodMetricsToRedis(context.Background(), 990_000))
+	clock = 1_000_250 // the same boundary written again (retry / overlap)
+	require.NoError(t, store.writeTREPodMetricsToRedis(context.Background(), 990_000))
+
+	podKey := utils.GeneratePodKey("default", "pod-a")
+	for _, prefix := range []string{"tre:v2:inst:", "tre:v2:hist:"} {
+		entries, err := client.ZRangeByScore(context.Background(), prefix+podKey, &redis.ZRangeBy{Min: "990000", Max: "990000"}).Result()
+		require.NoError(t, err)
+		require.Len(t, entries, 1, prefix)
+		var doc map[string]any
+		require.NoError(t, json.Unmarshal([]byte(entries[0]), &doc))
+		require.Equal(t, float64(990_000), doc["timestamp"])
+		require.Equal(t, float64(1_000_250), doc["written_ms"])
+	}
+}
+
 func newTREMetricStoreForTest(t *testing.T) (*Store, *redis.Client) {
 	t.Helper()
 	mr := miniredis.RunT(t)

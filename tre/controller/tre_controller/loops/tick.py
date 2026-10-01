@@ -934,7 +934,11 @@ def _model_contexts(
                     {
                         "signal_full_window": window.full,
                         "signal_breakpoint_ms": window.breakpoint_ms,
-                        "signal_settle_ms": signal_state.settle_breakpoint_ms(model_name),
+                        # Review P2-1: a hold fallback decides on the whole window (old
+                        # replica count inside): C1 keeps its window-start rule.
+                        "signal_settle_ms": (
+                            None if computed.hold_fallback else signal_state.settle_breakpoint_ms(model_name)
+                        ),
                         "signal_window_start_ms": window.start_ms,
                         "signal_evidence_grids": window.grids,
                         "signal_hold_reason": None if computed.hold_fallback else window.reason,

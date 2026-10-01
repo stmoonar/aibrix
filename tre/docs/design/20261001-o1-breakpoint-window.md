@@ -98,8 +98,20 @@ as the fallback. In-flight protection and the base / covered bookkeeping are unc
   every `gateway_clock_check_s` (60 s): `lag = now - newest instant stamp` must lie in
   `[-tolerance, 2 * period + tolerance]` (tolerance `gateway_clock_tolerance_ms`, 2 s).
   The gateway's write phase is unknown, so only an offset beyond that phase window is
-  visible (75's +160 s is). A violation suspends O1 - whole windows and the onset guard,
-  event `breakpoint_window_suspended:<reason>` every tick - until 3 good checks.
+  visible that way (75's +160 s is). Review round 3: gateway images from 2026-10-01 write
+  `written_ms` (their wall clock at the write) into every doc and keep one doc per
+  boundary; the check then watches one pod's newest doc until a new one appears and
+  measures `offset = written_ms - write time on the controller clock` to ~0.2 s, phase
+  independent (the stamp-lag bounds stay the fallback for older gateways). **This needs
+  the gateway-plugins image rebuilt in the same release.** A violation suspends O1 -
+  whole windows, the onset guard, C1's own settle rule, event
+  `breakpoint_window_suspended:<reason>` every tick - until 3 good checks.
+* O1 off or suspended, or a receiver on the hold fallback: C1 settles by its window-start
+  rule only (`signal_settle_ms` None), as without O1 (review round 3 P1 / P2-1).
+* A persisting low-QPS misjudgment can add +1 per breakpoint, i.e. about every 30 s
+  (each +1 is a new breakpoint: 20 s evidence + the wake). Not gated further (a "two
+  consecutive low-evidence CRITICAL" rule would land the second decision on a whole
+  window, which is uncapped by design); bounded by the scaling cap.
 * a hint dates a change only in its own direction (`routable_changes()` carries +1 / -1);
   a held receiver's event names the reason (`receiver_held_breakpoint_window:<model>:<reason>`).
 * **restart under load**: the controller's first window with tokens is an onset (as with
