@@ -16,6 +16,8 @@ limitations under the License.
 
 package types
 
+import "time"
+
 // Annotation keys for PodAutoscaler configuration
 // These constants define the annotation keys used to configure autoscaling behavior
 const (
@@ -53,4 +55,17 @@ const (
 	// ScaleToZeroLabel enables/disables scaling to zero replicas
 	// Value: bool (e.g., "true", "false")
 	ScaleToZeroLabel = AutoscalingLabelPrefix + "scale-to-zero"
+
+	// APAWindowLabel sets the length of the stable metric window that the recommendation is
+	// averaged over. The key is the one used by the AIBrix APA samples (and by AIBrix <= v0.4).
+	// Value: duration (e.g., "20s", "1m"). Default: DefaultStableWindowDuration.
+	APAWindowLabel = "apa.autoscaling.aibrix.ai/window"
+)
+
+// DefaultStableWindowDuration is the stable metric window used when a PodAutoscaler does not
+// set APAWindowLabel. MinStableWindowDuration is the smallest accepted value (the window
+// buckets samples per second).
+const (
+	DefaultStableWindowDuration = 180 * time.Second
+	MinStableWindowDuration     = time.Second
 )

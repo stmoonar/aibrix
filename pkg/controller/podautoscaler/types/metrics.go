@@ -197,6 +197,33 @@ func (tw *TimeWindow) Record(timestamp time.Time, value float64) {
 	}
 }
 
+// Duration returns the length of the window
+func (tw *TimeWindow) Duration() time.Duration {
+	tw.mu.RLock()
+	defer tw.mu.RUnlock()
+	return tw.duration
+}
+
+// Span returns the time between the oldest and the newest sample in the window.
+func (tw *TimeWindow) Span() time.Duration {
+	tw.mu.RLock()
+	defer tw.mu.RUnlock()
+	if len(tw.buckets) == 0 {
+		return 0
+	}
+	first, last := true, true
+	var lo, hi int64
+	for b := range tw.buckets {
+		if first || b < lo {
+			lo, first = b, false
+		}
+		if last || b > hi {
+			hi, last = b, false
+		}
+	}
+	return time.Duration(hi-lo) * tw.granularity
+}
+
 // Size returns the number of data points in the window
 func (tw *TimeWindow) Size() int {
 	tw.mu.RLock()
