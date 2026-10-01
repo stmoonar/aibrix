@@ -574,6 +574,22 @@ data:
       # rescue target bookkeeping already keeps an unreflected scale-up from repeating.
       # Scale-down holds, LOW receivers and the slow loop keep the cooldown either way.
       scale_up_cooldown_enabled: false
+      # O1 breakpoint-aware window (design docs/design/20261001-o1-breakpoint-window.md,
+      # ADR-0015): a model decides on the part of its 30 s metrics window after its last
+      # breakpoint (traffic onset, routable replica-count change), complete 10 s gateway
+      # grids only (the grid holding the breakpoint excluded), the TSS numerator scaled to
+      # a whole window and the EMA restarted at the breakpoint. Scale-ups act after
+      # min_evidence_grids grids; scale-downs wait for a whole window after the breakpoint.
+      # Replaces the ADR-0013 onset warmup guard. Controller images before O1 ignore these
+      # keys (C1 images log them as unknown).
+      breakpoint_window: true
+      # The ADR-0013 onset warmup guard (TRE_SIGNAL_WARMUP_MS) on top of O1. Pre-O1
+      # behaviour = breakpoint_window: false + onset_warmup_guard: true.
+      onset_warmup_guard: false
+      # Complete post-breakpoint grids before a scale-up decision (2 = 20 s).
+      min_evidence_grids: 2
+      # Completed requests the post-breakpoint window also needs (0 = off).
+      min_evidence_requests: 0
 kind: ConfigMap
 metadata:
   name: tre-v2-registry

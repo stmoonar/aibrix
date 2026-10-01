@@ -103,6 +103,10 @@ class ClusterView:
     #: (a Pod loading there, a wake in flight, gpu-truth in use) - ``/v2/state``
     #: ``gpus[].wakeable``. Empty with an SM that does not report it.
     blocked_gpus: frozenset = frozenset()
+    #: Epoch ms the controller received this view from the SM (``refresh_cluster_view_once``);
+    #: a routable-count change it shows happened at or before it (O1 breakpoint time).
+    #: None = a synthetic view (tests / offline), see ``tick.breakpoint_observation``.
+    fetched_ms: int | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True)
@@ -411,22 +415,32 @@ def build_plan(
     # delayed at most one window (until the sliding window clears the traffic onset).
     # Band dwell (D8, SignalState.apply_dwell): a receiver whose band has not held for
     # the configured number of new metrics windows is suppressed the same way.
+    # O1 breakpoint window (signal_full_window present only with O1 on): a model whose
+    # metrics window still holds a breakpoint (traffic onset, routable-count change)
+    # takes part in no scale-down - neither HIGH / IDLE donor nor middle-zone donor - until
+    # a whole window lies after the breakpoint (scale-down stays cautious); as a receiver
+    # it acts once signal_warm (min_evidence_grids complete grids after the breakpoint).
     warmup_suppressed: list[str] = []
     dwell_suppressed: list[str] = []
+    breakpoint_held: list[str] = []
     kept: list = []
     for item in classifications:
+        ctx = model_contexts.get(item.model_name, {})
         if item.role == ModelRole.RECEIVER:
-            ctx = model_contexts.get(item.model_name, {})
             if not ctx.get("signal_warm", True):
                 warmup_suppressed.append(item.model_name)
                 continue
             if ctx.get("dwell_confirmed", True) is False:
                 dwell_suppressed.append(item.model_name)
                 continue
+        elif ctx.get("signal_full_window", True) is False:
+            breakpoint_held.append(item.model_name)
+            continue
         kept.append(item)
-    if warmup_suppressed or dwell_suppressed:
+    if warmup_suppressed or dwell_suppressed or breakpoint_held:
         events.extend(f"receiver_suppressed_signal_warmup:{model}" for model in warmup_suppressed)
         events.extend(f"receiver_suppressed_dwell:{model}" for model in dwell_suppressed)
+        events.extend(f"donor_suppressed_breakpoint_window:{model}" for model in breakpoint_held)
         classifications = kept
 
     critical_receivers = [item for item in classifications if item.state == ModelState.CRITICAL]

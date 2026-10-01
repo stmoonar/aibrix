@@ -45,6 +45,10 @@ class ModelStateBox:
                 not ctx.get("signal_warm", True) or ctx.get("dwell_confirmed", True) is False
             ):
                 state = UNCONFIRMED
+            elif ctx.get("signal_hold_reason") is not None:
+                # O1: too little evidence after a breakpoint - the state is the whole
+                # window's raw value, which the planner does not act on either.
+                state = UNCONFIRMED
             previous = self._states.get(model)
             if previous is None or previous[1] <= int(ts_ms):
                 self._states[model] = (str(state), int(ts_ms))

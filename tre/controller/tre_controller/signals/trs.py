@@ -13,6 +13,64 @@ from tre_common.tss import TssEma, replica_factor, signal_ema, tss_terms, window
 DWELL_STATES = ("critical", "low", "high")
 
 
+@dataclass(frozen=True)
+class BreakpointWindowConfig:
+    """O1 breakpoint-aware window (registry ``scaling:``, design
+    docs/design/20261001-o1-breakpoint-window.md).
+
+    * ``enabled`` (``scaling.breakpoint_window``): decide on the part of the metrics
+      window after the model's last breakpoint - its traffic onset or the last change of
+      its routable replica count - complete gateway grids only;
+    * ``onset_guard`` (``scaling.onset_warmup_guard``): additionally apply the ADR-0013
+      onset warmup guard (``TRE_SIGNAL_WARMUP_MS``). ``enabled=False, onset_guard=True``
+      is the pre-O1 behaviour;
+    * ``grid_ms``: the gateway write period (``SCRAPE_INTERVAL_MS``, 10 s);
+    * ``min_evidence_grids`` / ``min_evidence_requests``: post-breakpoint evidence a
+      window needs before the model's signal decides a scale-up.
+    """
+
+    enabled: bool = True
+    onset_guard: bool = False
+    grid_ms: int = 10_000
+    min_evidence_grids: int = 2
+    min_evidence_requests: int = 0
+
+    @classmethod
+    def from_registry(cls, registry: Any, *, grid_ms: int) -> "BreakpointWindowConfig":
+        scaling = getattr(registry, "scaling", None)
+        config = scaling() if callable(scaling) else None
+        defaults = cls()
+        return cls(
+            enabled=bool(getattr(config, "breakpoint_window", defaults.enabled)),
+            onset_guard=bool(getattr(config, "onset_warmup_guard", defaults.onset_guard)),
+            grid_ms=int(grid_ms),
+            min_evidence_grids=max(1, int(getattr(config, "min_evidence_grids", defaults.min_evidence_grids))),
+            min_evidence_requests=max(
+                0, int(getattr(config, "min_evidence_requests", defaults.min_evidence_requests))
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class EffectiveWindow:
+    """The window a model's signal is computed on this tick (O1).
+
+    ``full``: no breakpoint inside the metrics window - the whole window, exactly the
+    pre-O1 input (``numerator_scale`` 1.0). Otherwise the grid-aligned suffix after the
+    breakpoint (``metrics`` is that suffix, ``start_ms`` its start), the grid holding
+    the breakpoint excluded. ``warm``: enough post-breakpoint evidence for a scale-up
+    decision (a scale-down always needs ``full``). ``reason`` says why not warm.
+    """
+
+    metrics: ModelWindowMetrics
+    full: bool
+    warm: bool
+    breakpoint_ms: int | None
+    start_ms: int
+    grids: int
+    numerator_scale: float = 1.0
+    reason: str | None = None
+
 @dataclass
 class TRSInput:
     """Inputs of one window's TSS (the unified definition, ``tre_common.tss``).
@@ -146,8 +204,15 @@ class TRSComputer:
         return {"ema": self.current_ema, "prev_Y": self._prev_Y, "prev_Q_ctl": self._prev_Q_ctl}
 
     def compute(
-        self, inp: TRSInput, theta_m: float | None = None, *, window_end_ms: int | None = None
+        self,
+        inp: TRSInput,
+        theta_m: float | None = None,
+        *,
+        window_end_ms: int | None = None,
+        advance_ema: bool = True,
     ) -> TRSResult:
+        """``advance_ema=False`` (O1, a window without enough post-breakpoint evidence)
+        reports the raw TSS as TRS and leaves the EMA untouched."""
         effective_pods = max(1, inp.routable_pods)
         terms = tss_terms(
             prompt_tokens=inp.prompt_tokens_total,
@@ -170,7 +235,10 @@ class TRSComputer:
         # EMA passes through without advancing and compute_z_m maps to None.
         trs_raw = terms.raw if terms.raw is not None else 0.0
         idle = window_is_idle(inp.prompt_tokens_total, inp.generation_tokens_total)
-        trs = self._update_ema(trs_raw, window_end_ms=window_end_ms, window_ms=inp.window_ms, idle=idle)
+        if advance_ema:
+            trs = self._update_ema(trs_raw, window_end_ms=window_end_ms, window_ms=inp.window_ms, idle=idle)
+        else:
+            trs = trs_raw
         eta = compute_eta_m(trs, effective_pods)
         z_m = compute_z_m(trs, theta_m)
         saved_prev_y = self._prev_Y
@@ -310,8 +378,17 @@ class SignalState:
         *,
         dwell_windows: int = 1,
         dwell_states: Iterable[str] = DWELL_STATES,
+        breakpoint: BreakpointWindowConfig | None = None,
     ) -> None:
         self._by_model: dict[str, TRSComputer] = {}
+        # O1 (None = pre-O1: the onset warmup guard alone, as configured by warmup_ms).
+        self.breakpoint = breakpoint
+        # model -> (routable count, observation time) of the last cluster view seen.
+        self._routable: dict[str, tuple[int, int]] = {}
+        # model -> time of its last routable-count change (O1 breakpoint).
+        self._change_ms: dict[str, int] = {}
+        # model -> the breakpoint its EMAs were last restarted at.
+        self._ema_breakpoint: dict[str, int] = {}
         # Band dwell (plan §6.9i / D8): CRITICAL / LOW / HIGH only act after holding for
         # dwell_windows consecutive NEW metrics windows (tre_common.dwell). 1 = off.
         self.dwell_windows = max(1, int(dwell_windows))
@@ -391,16 +468,124 @@ class SignalState:
             self.reset_dwell(model)
             self._onset_ms[model] = None
             return True  # idle -> UNKNOWN, nothing to warm up for
-        if self._warmup_ms == 0:
-            return True  # disabled
         onset = self._onset_ms.get(model)
-        if onset is None:
+        if onset is None and (self._warmup_ms != 0 or self._o1_enabled):
+            # O1 needs the onset (a breakpoint) whatever the warmup guard is set to.
             onset = window_end_ms
             self._onset_ms[model] = onset
+        if self._warmup_ms == 0:
+            return True  # disabled
         if self._warmup_ms < 0:
             # auto: warm once the whole window lies inside the traffic period.
             return window_start_ms >= onset
         return (window_end_ms - onset) >= self._warmup_ms
+
+    # ------------------------------------------------------- O1 breakpoint window
+
+    @property
+    def _o1_enabled(self) -> bool:
+        return self.breakpoint is not None and self.breakpoint.enabled
+
+    def onset_guard_applies(self) -> bool:
+        """Whether the ADR-0013 onset warmup guard gates receivers: always pre-O1
+        (``breakpoint`` None), else only with ``scaling.onset_warmup_guard``."""
+        return self.breakpoint is None or self.breakpoint.onset_guard
+
+    def note_routable(
+        self,
+        model: str,
+        routable: int,
+        *,
+        observed_ms: int,
+        done_hints: Iterable[int | None] = (),
+    ) -> int | None:
+        """Track ``model``'s routable replica count (O1 breakpoints).
+
+        ``observed_ms`` is when the count was observed - the fetch time of the SM fleet
+        view it comes from, so the real change happened at or before it. A change is
+        recorded at the latest ``done_hints`` time (the controller's own completed
+        actions on the model: last scale/hide done, rescue target done) inside the
+        interval since the previous observation, else at ``observed_ms``: never before
+        the change, so the grid holding it is always excluded. The first observation
+        (start / restart) takes the latest hint, if any. Returns the recorded change
+        time (None: no change). Idempotent for the re-reads of one view."""
+        routable = int(routable)
+        observed_ms = int(observed_ms)
+        hints = [int(hint) for hint in done_hints if hint is not None and int(hint) <= observed_ms]
+        previous = self._routable.get(model)
+        if previous is None:
+            self._routable[model] = (routable, observed_ms)
+            if hints:
+                self._change_ms[model] = max(hints)
+                return self._change_ms[model]
+            return None
+        count, last_ms = previous
+        if routable == count:
+            if observed_ms > last_ms:
+                self._routable[model] = (count, observed_ms)
+            return None
+        explained = [hint for hint in hints if hint > last_ms]
+        change = max(explained) if explained else observed_ms
+        self._change_ms[model] = max(change, self._change_ms.get(model, change))
+        self._routable[model] = (routable, observed_ms)
+        return change
+
+    def breakpoint_ms(self, model: str) -> int | None:
+        """``max(traffic onset, last routable-count change)`` of ``model`` (O1)."""
+        points = [point for point in (self._onset_ms.get(model), self._change_ms.get(model)) if point is not None]
+        return max(points) if points else None
+
+    def effective_window(self, model: str, metrics: ModelWindowMetrics) -> EffectiveWindow:
+        """The part of ``metrics`` (a model's serving window) after its breakpoint.
+
+        Full window when O1 is off, no breakpoint lies inside the window or the
+        breakpoint sits at/before the window start. Otherwise the suffix starting at the
+        first grid boundary at or after the breakpoint (the partial grid holding it is
+        excluded); ``warm`` once it holds ``min_evidence_grids`` complete grids (and
+        ``min_evidence_requests`` completed requests). The model's EMAs are restarted
+        once per breakpoint (the first tick that sees it inside the window), so the
+        pre-breakpoint windows never leak into the signal through the EMA."""
+        start = int(metrics.window_start_ms)
+        end = int(metrics.window_end_ms)
+        span = end - start
+        cfg = self.breakpoint
+        point = self.breakpoint_ms(model) if self._o1_enabled else None
+        full = EffectiveWindow(
+            metrics=metrics, full=True, warm=True, breakpoint_ms=point, start_ms=start,
+            grids=(span // cfg.grid_ms) if cfg is not None and cfg.grid_ms > 0 else 0,
+        )
+        if cfg is None or not cfg.enabled or point is None or point <= start or span <= 0:
+            return full
+        grid = int(cfg.grid_ms)
+        eff_start = -(-int(point) // grid) * grid  # first grid boundary >= the breakpoint
+        if eff_start <= start:
+            return full
+        if self._ema_breakpoint.get(model) != point:
+            self._ema_breakpoint[model] = point
+            self.reset_ema(model)
+        grids = max(0, (end - eff_start) // grid)
+        partial = dict(full=False, breakpoint_ms=point, start_ms=eff_start, grids=grids)
+        if grids <= 0:
+            return EffectiveWindow(metrics=metrics, warm=False, reason="no_complete_grid", **partial)
+        suffix = next((item for item in metrics.suffix_windows if int(item.window_start_ms) == eff_start), None)
+        if suffix is None:
+            # No suffix (store without suffixes, unaligned / offline window): wait for a
+            # whole clean window, like the pre-O1 guard.
+            return EffectiveWindow(metrics=metrics, warm=False, reason="no_suffix", **partial)
+        scale = float(span) / float(end - eff_start)
+        if grids < cfg.min_evidence_grids:
+            return EffectiveWindow(
+                metrics=suffix, warm=False, numerator_scale=scale, reason="evidence_grids", **partial
+            )
+        if suffix.prompt_tokens is None or suffix.generation_tokens is None:
+            return EffectiveWindow(
+                metrics=suffix, warm=False, numerator_scale=scale, reason="evidence_tokens", **partial
+            )
+        if cfg.min_evidence_requests > 0 and float(suffix.request_count or 0.0) < cfg.min_evidence_requests:
+            return EffectiveWindow(
+                metrics=suffix, warm=False, numerator_scale=scale, reason="evidence_requests", **partial
+            )
+        return EffectiveWindow(metrics=suffix, warm=True, numerator_scale=scale, **partial)
 
     # ------------------------------------------------------------------ band dwell
 

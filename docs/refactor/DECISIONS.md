@@ -409,6 +409,9 @@ S4 raw-logging first) -> R7/R2/R4/R5. Phase C (delete the 3 old aibrix-system mo
 - Tests: `test_signal_warmup.py` (5 observe_traffic unit + 4 planner suppression/bypass/warm/back-compat).
   make check 324. Mini re-shakedown (trickle-suppressed + spike-bypassed legs) required before closing.
 - Reversible: `TRE_SIGNAL_WARMUP_MS=0` restores pre-fix behaviour.
+- **Superseded by ADR-0015 (2026-10-01)**: the guard is off by default (registry
+  `scaling.onset_warmup_guard: false`); the O1 breakpoint window decides on the post-onset
+  grids instead. `scaling.breakpoint_window: false` + `onset_warmup_guard: true` restores it.
 
 ## ADR-0014: Remove saturation-segment concept; z_m thresholds are the sole scaling trigger
 
@@ -530,3 +533,27 @@ and send both arms through it (`campaign_queue.py` GATEWAYS, replayer default
 table (requests with `routing-strategy` then fall to the per-model routes, which match on
 the `model` header the replayer still sends). Re-apply the previous `gateway-plugins.yaml`
 image for a full revert; point `campaign_queue.py` APA back at 31592 only together with it.
+
+## ADR-0015: O1 breakpoint-aware decision window (supersedes the ADR-0013 warmup guard)
+
+**Date:** 2026-10-01 · **Status:** Accepted (user decision) · Design:
+`tre/docs/design/20261001-o1-breakpoint-window.md` · Branch `feat/o1-breakpoint-window-20261001`.
+
+- Problem: the onset guard ignored receivers until the whole 30 s window lay after the
+  onset, so every idle -> loaded scale-up waited one window; after a scale-up the window and
+  the EMA kept describing the old replica count (C1 bridged it with `rescue_settle_ema_k`).
+- Decision: a model decides on the part of its window after its last **breakpoint**
+  (`max(onset, last routable-count change)`), complete 10 s grids only (the grid holding the
+  breakpoint excluded); numerator x `W / span`, Q averaged over those grids, EMA restarted at
+  the breakpoint. Scale-ups after `min_evidence_grids` (2) grids; scale-downs only once a
+  whole window follows the breakpoint. A change is dated by the controller's own action done
+  time or the SM view's fetch time - never before the real change. C1 settles a target once
+  the model is warm after the target's breakpoint.
+- Steady state (no breakpoint inside the window) is bit-identical to before; the TSS
+  definition, theta and the offline calibration are unchanged. The ADR-0014 saturation
+  bypass stays removed.
+- Effect (replay of the 2026-10-01 verify evidence): first CRITICAL decision 30 s -> 20 s
+  after the onset window in all 7 loaded episodes; no false CRITICAL on light onsets (raw
+  filling-window dip to Z = 0.20 vs O1 3.78, A-smoke-tre dsqwen-7b).
+- Knobs (registry `scaling:`): `breakpoint_window` (true), `onset_warmup_guard` (false),
+  `min_evidence_grids` (2), `min_evidence_requests` (0).

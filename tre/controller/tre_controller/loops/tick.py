@@ -166,6 +166,7 @@ def run_planner_tick(
         cluster_view=cluster_view,
         paper_state_cache=paper_state_cache,
         signal_state=signal_state,
+        queue=queue,
     )
     # Without model_control_configs every model silently falls back to the generic
     # delta_crit=0.2 / delta_high=0.25 and the fitted per-model bands in registry.yaml
@@ -345,8 +346,25 @@ def _rescue_bases(
             registry, model
         ):
             continue  # settled: the signal describes the new replica count
+        if record.done_ms is not None and _o1_settled((contexts or {}).get(model), int(record.done_ms)):
+            continue  # O1: decided on evidence gathered after the scale-up's breakpoint
         bases[model] = RescueBasis(base=int(record.base), covered=int(record.covered))
     return bases
+
+
+def _o1_settled(context: dict | None, done_ms: int) -> bool:
+    """O1 (C1 settle): the routable-count change of a completed rescue target is a
+    breakpoint; once the model's signal is warm on a window starting at or after it,
+    that signal describes the new replica count with a freshly restarted EMA - the
+    ``rescue_settle_ema_k`` extension (EMA lag) is not needed. The breakpoint carries
+    the target's ``done_ms`` (or a later observation time), never an earlier one, so
+    ``breakpoint >= done_ms`` means the change of this target (or a later one) was seen.
+    A target that changed nothing (every part failed) never moves the breakpoint and
+    settles by the window-start rule above."""
+    if not context or "signal_breakpoint_ms" not in context:
+        return False
+    point = context.get("signal_breakpoint_ms")
+    return point is not None and int(point) >= done_ms and bool(context.get("signal_warm"))
 
 
 def _defrag_blocking_events(queue: PlannerQueue, actions) -> tuple[str, ...]:
@@ -681,6 +699,133 @@ def _commands_to_actions(commands: tuple[SafeScaleCommand, ...], *, source_loop:
     return tuple(actions)
 
 
+@dataclass(frozen=True)
+class ModelSignal:
+    """One model's decision signal of one window (planner tick and SafeScale observation
+    share it, so both read the same Z and advance the shared EMA identically).
+
+    ``window`` is the O1 effective window (None without O1); ``metrics`` the window the
+    signal was computed on (the full serving window or its post-breakpoint suffix);
+    ``warm`` the receiver gate (O1 evidence and/or the ADR-0013 onset guard)."""
+
+    result: object
+    signal: object
+    metrics: ModelWindowMetrics
+    warm: bool
+    window: object | None = None
+
+
+def breakpoint_observation(
+    cluster_view: ClusterView | None, queue: object | None, model: str, fallback_ms: int
+) -> tuple[int, tuple[int | None, ...]]:
+    """(observed_ms, done hints) for :meth:`SignalState.note_routable`: the fleet view's
+    fetch time (``fallback_ms`` for a view without one - synthetic / test views) and the
+    completion times of the controller's own last actions on ``model`` (scale / hide
+    done, C1 rescue target done), which date a change more precisely than the view."""
+    observed = getattr(cluster_view, "fetched_ms", None)
+    hints: list[int | None] = []
+    last_actions = getattr(queue, "last_actions", None)
+    if callable(last_actions):
+        last = last_actions().get(model)
+        if last is not None:
+            hints.append(int(last[0]))
+    targets = getattr(queue, "rescue_targets", None)
+    if callable(targets):
+        record = targets().get(model)
+        if record is not None and record.done_ms is not None:
+            hints.append(int(record.done_ms))
+    return (int(observed) if observed is not None else int(fallback_ms)), tuple(hints)
+
+
+def compute_model_signal(
+    model_name: str,
+    metrics: ModelWindowMetrics,
+    spec: ModelSpec,
+    *,
+    signal_source: str,
+    signal_state: SignalState | None,
+    routable_observation: tuple[int, tuple[int | None, ...]] | None = None,
+    observe_onset: bool = True,
+) -> ModelSignal:
+    """TSS / Z of ``metrics`` (a serving window) with the O1 breakpoint window.
+
+    Without O1 (no ``signal_state`` or its ``breakpoint`` None) this is the pre-O1
+    computation: the full window, EMA advanced, ``warm`` = the onset guard.
+
+    With O1: the onset is recorded and the routable count noted (``routable_observation``
+    = (observed_ms, done hints), None when no fleet view knows the model), then the
+    effective window decides: a full window is computed exactly as before; a warm
+    suffix is computed with its numerator scaled to a whole window
+    (``numerator_scale = W / span``), its own queue average and the EMA restarted at
+    the breakpoint; a window without enough post-breakpoint evidence reports the full
+    window's raw value and leaves every EMA untouched (it decides nothing)."""
+    o1 = signal_state is not None and getattr(signal_state, "breakpoint", None) is not None
+    legacy_warm = True
+    if signal_state is not None and observe_onset:
+        # F-onset warmup guard (ADR-0013): see SignalState.observe_traffic. Called before
+        # the TSS so the onset is known to O1; on an idle window it resets the EMAs the
+        # TSS update would reset anyway (same state either order).
+        legacy_warm = signal_state.observe_traffic(
+            model_name,
+            has_traffic=not window_is_idle(metrics.prompt_tokens, metrics.generation_tokens),
+            window_start_ms=metrics.window_start_ms,
+            window_end_ms=metrics.window_end_ms,
+        )
+    if signal_state is not None:
+        computer = signal_state.computer_for(
+            model_name, ema_alpha=spec.trs.ema_alpha, ema_tau_ms=spec.trs.ema_tau_ms
+        )
+    else:
+        computer = TRSComputer(ema_alpha=spec.trs.ema_alpha, ema_tau_ms=spec.trs.ema_tau_ms)
+    if not o1:
+        result = computer.compute(
+            TRSInput.from_metrics(metrics, spec.trs),
+            theta_m=spec.trs.theta_m,
+            window_end_ms=metrics.window_end_ms,
+        )
+        signal = get_signal(metrics, spec, signal_source, trs_z_m=result.Z_m, signal_state=signal_state)
+        return ModelSignal(result=result, signal=signal, metrics=metrics, warm=legacy_warm)
+
+    if routable_observation is not None:
+        observed_ms, hints = routable_observation
+        signal_state.note_routable(
+            model_name, int(metrics.routable_pods), observed_ms=observed_ms, done_hints=hints
+        )
+    window = signal_state.effective_window(model_name, metrics)
+    guard_warm = legacy_warm if signal_state.onset_guard_applies() else True
+    if window.full:
+        result = computer.compute(
+            TRSInput.from_metrics(metrics, spec.trs),
+            theta_m=spec.trs.theta_m,
+            window_end_ms=metrics.window_end_ms,
+        )
+        signal = get_signal(metrics, spec, signal_source, trs_z_m=result.Z_m, signal_state=signal_state)
+        return ModelSignal(result=result, signal=signal, metrics=metrics, warm=guard_warm, window=window)
+    if not window.warm:
+        # No decision on this window: the full window's raw value for the record only.
+        result = computer.compute(
+            TRSInput.from_metrics(metrics, spec.trs),
+            theta_m=spec.trs.theta_m,
+            window_end_ms=metrics.window_end_ms,
+            advance_ema=False,
+        )
+        signal = get_signal(metrics, spec, signal_source, trs_z_m=result.Z_m, signal_state=None)
+        return ModelSignal(result=result, signal=signal, metrics=metrics, warm=False, window=window)
+    suffix = window.metrics
+    inp = TRSInput.from_metrics(suffix, spec.trs)
+    scale = window.numerator_scale
+    inp = replace(
+        inp,
+        prompt_tokens_total=inp.prompt_tokens_total * scale,
+        generation_tokens_total=inp.generation_tokens_total * scale,
+        # The EMA's idle-gap rule keeps the configured metrics window.
+        window_ms=float(metrics.window_end_ms - metrics.window_start_ms),
+    )
+    result = computer.compute(inp, theta_m=spec.trs.theta_m, window_end_ms=suffix.window_end_ms)
+    signal = get_signal(suffix, spec, signal_source, trs_z_m=result.Z_m, signal_state=signal_state)
+    return ModelSignal(result=result, signal=signal, metrics=suffix, warm=guard_warm, window=window)
+
+
 def _model_contexts(
     snapshot: MetricsSnapshot,
     registry: Registry,
@@ -689,6 +834,7 @@ def _model_contexts(
     cluster_view: ClusterView | None = None,
     paper_state_cache: PaperStateCache | None = None,
     signal_state: SignalState | None = None,
+    queue: object | None = None,
 ) -> tuple[dict[str, dict], tuple[str, ...]]:
     contexts: dict[str, dict] = {}
     events: list[str] = []
@@ -709,31 +855,25 @@ def _model_contexts(
         decode_tps = per_replica_token_rate(metrics, metrics.generation_tokens)
         prefill_tps = per_replica_token_rate(metrics, metrics.prompt_tokens)
         if tokens_available:
-            if signal_state is not None:
-                computer = signal_state.computer_for(
-                    model_name, ema_alpha=spec.trs.ema_alpha, ema_tau_ms=spec.trs.ema_tau_ms
-                )
-            else:
-                computer = TRSComputer(ema_alpha=spec.trs.ema_alpha, ema_tau_ms=spec.trs.ema_tau_ms)
-            result = computer.compute(
-                TRSInput.from_metrics(metrics, spec.trs),
-                theta_m=spec.trs.theta_m,
-                window_end_ms=metrics.window_end_ms,
+            computed = compute_model_signal(
+                model_name,
+                metrics,
+                spec,
+                signal_source=signal_source,
+                signal_state=signal_state,
+                routable_observation=(
+                    breakpoint_observation(cluster_view, queue, model_name, metrics.window_end_ms)
+                    if counts is not None
+                    else None
+                ),
             )
-            signal = get_signal(
-                metrics, spec, signal_source, trs_z_m=result.Z_m, signal_state=signal_state
-            )
-            # F-onset warmup guard: signal is trustworthy on the low side only once the
-            # window lies fully inside the traffic period (see SignalState.observe_traffic).
-            if signal_state is not None:
-                signal_warm = signal_state.observe_traffic(
-                    model_name,
-                    has_traffic=not window_is_idle(metrics.prompt_tokens, metrics.generation_tokens),
-                    window_start_ms=metrics.window_start_ms,
-                    window_end_ms=metrics.window_end_ms,
-                )
-            else:
-                signal_warm = True
+            result, signal, signal_warm = computed.result, computed.signal, computed.warm
+            window = computed.window
+            if window is not None and not window.full:
+                # Rates of the post-breakpoint window (the decision window).
+                request_rate_rps = _request_rate_rps(computed.metrics)
+                decode_tps = per_replica_token_rate(computed.metrics, computed.metrics.generation_tokens)
+                prefill_tps = per_replica_token_rate(computed.metrics, computed.metrics.prompt_tokens)
             context = {
                 "trs": result.TRS,
                 # Pre-EMA TSS, read-only: exposed so a capture can store raw TSS, EMA and Z
@@ -759,6 +899,18 @@ def _model_contexts(
                 "decode_tps": decode_tps,
                 "prefill_tps": prefill_tps,
             }
+            if window is not None:
+                # O1: a scale-down needs a whole window after the breakpoint
+                # (signal_full_window); a scale-up the evidence (signal_warm).
+                context.update(
+                    {
+                        "signal_full_window": window.full,
+                        "signal_breakpoint_ms": window.breakpoint_ms,
+                        "signal_window_start_ms": window.start_ms,
+                        "signal_evidence_grids": window.grids,
+                        "signal_hold_reason": window.reason,
+                    }
+                )
         else:
             # tokens_available=False means the metrics are MISSING (scrape gap / stale store),
             # not that the model is idle (a live idle pod reports zero-delta tokens, which is the

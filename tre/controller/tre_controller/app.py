@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import time
+import dataclasses
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Mapping
 
@@ -38,7 +39,7 @@ from tre_controller.planning.safescale_direct import (
     cluster_view_urls,
 )
 from tre_controller.planning.safescale_evidence import MetricsEvidenceReader, RegistryThresholds
-from tre_controller.signals.trs import SignalState
+from tre_controller.signals.trs import BreakpointWindowConfig, SignalState
 from tre_controller.sm_client import AsyncTransport, ServiceManagerClient
 from tre_controller.store.metrics_store import MetricsStore
 from tre_controller.store.state_store import ControllerStateStore
@@ -252,6 +253,12 @@ def create_controller_dependencies(
         if share
         else _create_redis_client(cfg.metrics_redis_url, redis_client_factory, timeout_s=metrics_timeout_s)
     )
+    breakpoint_config = BreakpointWindowConfig.from_registry(
+        registry, grid_ms=cfg.instant_sample_interval_ms
+    )
+    logging.getLogger("tre_controller.signals").info(
+        json.dumps({"event": "breakpoint_window_config", **dataclasses.asdict(breakpoint_config)}, sort_keys=True)
+    )
     store = MetricsStore(
         metrics_redis_client,
         registry,
@@ -260,6 +267,8 @@ def create_controller_dependencies(
         schema=cfg.metrics_schema,
         histogram_lookback_ms=cfg.histogram_lookback_ms,
         min_latency_samples=cfg.min_latency_samples,
+        # O1: the grid-aligned suffix windows the breakpoint window decides on.
+        suffix_period_ms=cfg.instant_sample_interval_ms if breakpoint_config.enabled else 0,
     )
     sm_client = ServiceManagerClient(
         cfg.service_manager_url,
@@ -396,6 +405,9 @@ def create_controller_dependencies(
             warmup_ms=cfg.signal_warmup_ms,
             dwell_windows=cfg.dwell_windows,
             dwell_states=cfg.dwell_states,
+            # O1 breakpoint window (registry scaling.breakpoint_window /
+            # onset_warmup_guard / min_evidence_*), on the gateway grid.
+            breakpoint=breakpoint_config,
         ),
         profiler=profiler,
         hidden_orphan_detector=HiddenOrphanDetector(

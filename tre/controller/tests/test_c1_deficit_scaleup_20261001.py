@@ -412,6 +412,8 @@ def test_shipped_registry_scaling_section():
     assert set(raw["scaling"]) == {
         "rescue_max_step_ratio", "scale_up_cooldown_enabled", "rescue_max_step_pods",
         "donor_surplus_release", "rescue_settle_ema_k",
+        # O1 (2026-10-01): the breakpoint window, at its built-in defaults.
+        "breakpoint_window", "onset_warmup_guard", "min_evidence_grids", "min_evidence_requests",
     }
     assert registry.scaling().donor_surplus_release is False
     assert registry.scaling().rescue_max_step_pods == 4

@@ -188,3 +188,11 @@ capacity assumed available, settle extension 20 s (k = 2, tau 10 s).
 * The Z ~ n assumption is rough at small n (prefill-heavy bursts, KV limits).
 * `rescue_settle_ema_k` lengthens the hold before the next round (20 s at the
   default); it never blocks a larger target computed from the base.
+
+## O1 follow-up (2026-10-01)
+
+With the O1 breakpoint window (`20261001-o1-breakpoint-window.md`, ADR-0015) a completed
+rescue target is a routable-count breakpoint: the target counts as reflected once the model
+is warm (2 complete grids) after a breakpoint at or after its `done_ms`, with the EMA
+restarted there. The `rescue_settle_ema_k` window-start rule stays as the fallback (a target
+that changed nothing never moves the breakpoint). One judgement, not two.

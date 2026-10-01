@@ -88,6 +88,15 @@ class ModelWindowMetrics:
     #: the model level); carried so a re-aggregation (``restrict_to_serving``)
     #: applies the same one. None = max of the per-pod p95s (no histograms).
     p95_rule: P95Rule | None = field(default=None, compare=False)
+    #: O1 (breakpoint-aware window, 2026-10-01): the same model window read over its
+    #: grid-aligned suffixes ``(s, window_end_ms]``, one per gateway boundary ``s``
+    #: strictly inside the window, ascending by ``s`` (for a 30 s window on the 10 s
+    #: grid: the last 20 s and the last 10 s). Built from the docs the full read
+    #: already fetched (``MetricsStore(suffix_period_ms=...)``); empty when off, for
+    #: unaligned windows and for offline / synthetic windows. The controller decides on
+    #: a suffix only while a breakpoint (traffic onset, routable-count change) lies
+    #: inside the window. Excluded from equality.
+    suffix_windows: tuple["ModelWindowMetrics", ...] = field(default=(), compare=False)
 
 
 @dataclass(frozen=True)

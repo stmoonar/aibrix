@@ -10,7 +10,12 @@ from tre_common.metrics_schema import MetricsSnapshot, ModelWindowMetrics
 from tre_common.registry import Registry
 from tre_common.window_pods import pooled_p95_ms
 from tre_controller.gateway_health import GatewayCounters
-from tre_controller.loops.tick import serving_window
+from tre_controller.loops.tick import (
+    _cluster_view_counts,
+    breakpoint_observation,
+    compute_model_signal,
+    serving_window,
+)
 from tre_controller.planning.planner import (
     Action,
     ClusterView,
@@ -150,6 +155,12 @@ def run_safescale_observation_tick(
             signal_state=signal_state,
             hidden_pods=tuple(getattr(probe, "pods", ())),
             gateway=(gateway_counters or {}).get(probe.model),
+            # O1: the same routable-count observation the planner tick makes.
+            routable_observation=(
+                breakpoint_observation(cluster_view, queue, probe.model, metrics.window_end_ms)
+                if probe.model in _cluster_view_counts(cluster_view)
+                else None
+            ),
         )
         poll = (direct_polls or {}).get(probe.model)
         # Direct evidence (2026-09-29 B+D): this tick's scrape of the remaining pods.
@@ -596,19 +607,35 @@ def _observation_from_metrics(
     signal_state: SignalState | None = None,
     hidden_pods: tuple[str, ...] = (),
     gateway: GatewayCounters | None = None,
+    routable_observation: tuple[int, tuple[int | None, ...]] | None = None,
 ) -> ProbeObservation:
-    if signal_state is not None:
-        computer = signal_state.computer_for(
-            spec.name, ema_alpha=spec.trs.ema_alpha, ema_tau_ms=spec.trs.ema_tau_ms
+    if signal_state is not None and getattr(signal_state, "breakpoint", None) is not None:
+        # O1: the planner tick's computation (same effective window, same EMA). The hide
+        # is a breakpoint: until the post-hide evidence is warm, Z is the whole window's
+        # raw value (no EMA - never the older, pre-hide-weighted EMA); then the post-hide
+        # window's. Both are at least as strict as the pre-O1 EMA'd straddling Z.
+        computed = compute_model_signal(
+            spec.name,
+            metrics,
+            spec,
+            signal_source=signal_source,
+            signal_state=signal_state,
+            routable_observation=routable_observation,
         )
+        result, signal = computed.result, computed.signal
     else:
-        computer = TRSComputer(ema_alpha=spec.trs.ema_alpha, ema_tau_ms=spec.trs.ema_tau_ms)
-    result = computer.compute(
-        TRSInput.from_metrics(metrics, spec.trs),
-        theta_m=spec.trs.theta_m,
-        window_end_ms=metrics.window_end_ms,
-    )
-    signal = get_signal(metrics, spec, signal_source, trs_z_m=result.Z_m, signal_state=signal_state)
+        if signal_state is not None:
+            computer = signal_state.computer_for(
+                spec.name, ema_alpha=spec.trs.ema_alpha, ema_tau_ms=spec.trs.ema_tau_ms
+            )
+        else:
+            computer = TRSComputer(ema_alpha=spec.trs.ema_alpha, ema_tau_ms=spec.trs.ema_tau_ms)
+        result = computer.compute(
+            TRSInput.from_metrics(metrics, spec.trs),
+            theta_m=spec.trs.theta_m,
+            window_end_ms=metrics.window_end_ms,
+        )
+        signal = get_signal(metrics, spec, signal_source, trs_z_m=result.Z_m, signal_state=signal_state)
     return ProbeObservation(
         ts_ms=ts_ms,
         ttft_p95_ms=metrics.ttft_p95_ms,

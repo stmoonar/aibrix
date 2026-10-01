@@ -480,12 +480,39 @@ class ScalingRegistryConfig:
     #: ``k * trs.ema_tau_ms`` after the scale-up completed (the EMA'd Z lags the raw
     #: window by about its time constant). 0 = the window start alone (F4 rule).
     rescue_settle_ema_k: float = 2.0
+    #: O1 (2026-10-01, design 20261001-o1-breakpoint-window): decide on the part of the
+    #: metrics window after the model's last breakpoint (traffic onset or routable-count
+    #: change), complete gateway grids only, the TSS numerator normalised to a whole
+    #: window and the EMA restarted at the breakpoint. Replaces the onset warmup guard.
+    breakpoint_window: bool = True
+    #: The ADR-0013 onset warmup guard (TRE_SIGNAL_WARMUP_MS) on top of / instead of O1.
+    #: Fallback: ``breakpoint_window: false`` + ``onset_warmup_guard: true`` = pre-O1.
+    onset_warmup_guard: bool = False
+    #: O1: complete gateway grids after the breakpoint before the model's signal decides
+    #: (scale-ups; scale-downs always need a whole clean window). 2 = 20 s on the 10 s grid.
+    min_evidence_grids: int = 2
+    #: O1: also this many completed requests in the post-breakpoint window (0 = off).
+    min_evidence_requests: int = 0
 
 
 SCALING_KEYS = frozenset({
     "rescue_max_step_ratio", "scale_up_cooldown_enabled", "rescue_max_step_pods",
     "donor_surplus_release", "rescue_settle_ema_k",
+    "breakpoint_window", "onset_warmup_guard", "min_evidence_grids", "min_evidence_requests",
 })
+
+
+def _scaling_count(raw: dict[str, Any], key: str, default: int, minimum: int) -> int:
+    value = raw.get(key)
+    if value is None:
+        return default
+    try:
+        valid = not isinstance(value, bool) and float(value) == int(float(value)) and int(float(value)) >= minimum
+    except (TypeError, ValueError, OverflowError):
+        valid = False
+    if not valid:
+        raise ValueError(f"scaling.{key} must be an integer >= {minimum}, got {value!r}")
+    return int(float(value))
 
 
 def _scaling_bool(raw: dict[str, Any], key: str, default: bool) -> bool:
@@ -542,6 +569,12 @@ def parse_scaling_config(raw: dict[str, Any] | None) -> ScalingRegistryConfig:
         rescue_max_step_pods=int(float(pods)),
         donor_surplus_release=_scaling_bool(raw, "donor_surplus_release", defaults.donor_surplus_release),
         rescue_settle_ema_k=settle_k,
+        breakpoint_window=_scaling_bool(raw, "breakpoint_window", defaults.breakpoint_window),
+        onset_warmup_guard=_scaling_bool(raw, "onset_warmup_guard", defaults.onset_warmup_guard),
+        min_evidence_grids=_scaling_count(raw, "min_evidence_grids", defaults.min_evidence_grids, 1),
+        min_evidence_requests=_scaling_count(
+            raw, "min_evidence_requests", defaults.min_evidence_requests, 0
+        ),
     )
 
 
