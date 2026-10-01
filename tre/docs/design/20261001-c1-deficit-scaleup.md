@@ -150,10 +150,15 @@ restart-to-apply; images before 2026-10-01 ignore the section):
 | Key | Default | Meaning |
 |---|---|---|
 | `rescue_max_step_ratio` | `2.0` | rescue target at most `max(n+1, floor(ratio*n), n+step_pods)`; `0` = legacy one step per window |
-| `rescue_max_step_pods` | `0` | `step_pods` above (4 = HPA's `max(100%, +4 pods)`) |
+| `rescue_max_step_pods` | `0` (shipped registry: `4`, user decision 2026-10-01) | `step_pods` above (4 = HPA's `max(100%, +4 pods)`) |
 | `scale_up_cooldown_enabled` | `false` | F4 hold of a CRITICAL receiver's scale-up |
 | `donor_surplus_release` | `false` | immediate donors give their surplus instead of one step |
 | `rescue_settle_ema_k` | `2.0` | a target counts as reflected `k * trs.ema_tau_ms` after the window start passes it |
+
+The scaling cap of both experiment arms is `models[].max_awake_replicas` (4 for
+every model; TRE planner, SM and the APA `maxReplicas`). `models[].max_replicas`
+(8 for 7b / 8b, 4 for 14b) is the GPU layout - how many bindings `make manifests`
+renders - not a replica ceiling; it is left unchanged.
 
 Rollback without a new image: `rescue_max_step_ratio: 0` and
 `scale_up_cooldown_enabled: true` give the previous behaviour.

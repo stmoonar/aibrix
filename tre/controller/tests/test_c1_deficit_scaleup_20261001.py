@@ -403,9 +403,10 @@ def test_scaling_registry_defaults_and_validation(caplog):
     assert "future_key" in caplog.text
 
 
-def test_shipped_registry_scaling_section_is_the_default():
+def test_shipped_registry_scaling_section():
     registry = load_registry()
-    assert registry.scaling() == ScalingRegistryConfig()
+    # Built-in defaults except rescue_max_step_pods: 4 (user decision 2026-10-01).
+    assert registry.scaling() == ScalingRegistryConfig(rescue_max_step_pods=4)
     raw = yaml.safe_load(open(__import__("pathlib").Path(__file__).resolve().parents[2] / "deploy" / "registry.yaml",
                               encoding="utf-8"))
     assert set(raw["scaling"]) == {
@@ -413,7 +414,12 @@ def test_shipped_registry_scaling_section_is_the_default():
         "donor_surplus_release", "rescue_settle_ema_k",
     }
     assert registry.scaling().donor_surplus_release is False
-    assert registry.scaling().rescue_max_step_pods == 0
+    assert registry.scaling().rescue_max_step_pods == 4
+    assert ScalingRegistryConfig().rescue_max_step_pods == 0  # code default unchanged
+    # With the shipped registry a single replica reaches the scaling cap (4) at once.
+    plan = _plan([_cls("r", ModelState.CRITICAL, 0.1)], {"r": 1}, idle_gpus=8, max_replicas=4,
+                 step_pods=registry.scaling().rescue_max_step_pods)
+    assert _deltas(plan) == {"r": 3}
 
 
 # ===================================================== review round (2026-10-01)
