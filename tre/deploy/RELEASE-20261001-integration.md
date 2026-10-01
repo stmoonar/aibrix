@@ -1,4 +1,4 @@
-# Release 2026-10-01: integration (calibration chat sender + sidecar keep-alive + placement / parallel wake) - DRAFT
+# Release 2026-10-01: integration (calibration chat sender + sidecar keep-alive + placement / parallel wake + unified client) - DRAFT
 
 Plan only: nothing here has been built or applied. Confirm with the owner before any
 step that touches the cluster (a parallel session may be using it). The cluster-touching
@@ -28,11 +28,24 @@ Branch `integ/tre-v2-20261001` (worktree `aibrix-wt/integ-20261001`), from main
    suspect (SM); outside-window reconnect skips counted in their own metric
    `tre_reissue_local_reconnect_skipped_total{reason="outside_window"}` (sidecar; the
    re-send counter `tre_reissue_local_reconnect_total` keeps `result=ok|fail` only).
+5. `--no-ff` merge of `feat/unified-client-20260930` (09efa281, based on dcb8d5f3; T5):
+   one sending core (SSE parser, pooled async transport, request profiles), a
+   process-pool open loop (`procpool`: N processes x asyncio, pre-sharded absolute-time
+   sending) under `openloop.py`, `loadgen_v1` reduced to a shell over profile `e1_v1`
+   (v1's request: chat, stream, no `ignore_eos`, `max_tokens` from the trace; the old v1
+   sender is removed), and `campaign_queue` manifests with `client_profile` (default
+   `e1_v1`; `replay` = the pre-2026-10-01 campaign request, completions + `ignore_eos`).
+   Host-side tooling only: no image, registry, overlay or manifest change. Client
+   numbers of the old senders (late sends under bursts, TTFT ~125 ms high) are not
+   comparable with the new ones.
 
-Verified on the branch (2026-10-01): `make check` 2956 passed / 4 skipped;
+Verified on the branch (2026-10-01, after the T5 merge): `make check` 3008 passed / 4 skipped;
 `make check-redis` 12 passed; Go (`pkg/plugins/gateway cache metrics types utils`,
-`-tags nozmq`) all ok; the four parallel-wake / wake-failure / review-fix / GPU-cooldown
-test files 3 x green; `make manifests` leaves no diff. The f8ccb0ca parser (controller,
+`-tags nozmq`) all 19 packages ok; the four parallel-wake / wake-failure / review-fix / GPU-cooldown
+test files green (3 x before T5, 1 x after); the T5 multi-process / equivalence tests
+(`replayer/tests/test_unified_client*.py`, `deploy/tests/test_openloop*.py`,
+`deploy/tests/test_probe_label_parity.py`, `loadgen_v1/tests`) green; `make manifests`
+leaves no diff. The f8ccb0ca parser (controller,
 SM `check_service_manager_config`, UI `apply_and_validate`) loads the repo
 `registry.yaml`, the `params.yaml` copy and the live registry merged with this release
 without an error: an old pod restarted mid-release still starts.
@@ -439,6 +452,22 @@ Rollback point R4: `rollback.sh` (models included, `NODES="$WAVE1 $WAVE2"`).
 
 Acceptance: `$VP` (`PLAN.md`, `scripts/`, run order P0-P9, ~1 h 40 min core), started
 in `observe active` with `EXPECT_CP_TAG=$TAG` exported. Before / during it:
+
+- **Client = this checkout.** The smoke (`$VP/scripts/A_smoke.sh`, derived from
+  `smoke-e1-20260930/tools/run_arm.sh`) still runs `python3 -m tre_loadgen_v1 --stage all`
+  with only `tre/loadgen_v1` on `PYTHONPATH`; since T5 that is a shell that sends through
+  the sibling `tre/replayer` (profile `e1_v1`, procpool). It sends with the unified
+  client only if `TRE_DIR` is a checkout containing T5: `env.sh` defaults to
+  `$TRE_REPO/tre` = main, which still has the old v1 sender until the branch is merged.
+  So export `TRE_DIR=$WT/tre` (or merge first), and do not put another `tre_replayer` on
+  `PYTHONPATH` (the shell warns and records which one it used). The 09-30
+  `run_arm.sh` itself has the main path built in: use it only after the merge.
+  Client-side latencies of this run are not comparable with 09-30 smoke numbers (old
+  sender) - compare server-side and error counts instead.
+- **Campaign request.** `campaign_queue` manifests without `client_profile` now send
+  `e1_v1` for every arm (TRE / APA / E1); a manifest that must reproduce an older
+  campaign request sets `"client_profile": "replay"`. The run's `command.json` and
+  `run_trace_summary.json` record the profile.
 
 - F6 uses `CALIB_PREFLIGHT_CMD="python3 -m scripts.calib_preflight ..."` run from
   `$WT/tre/deploy` (or main after the merge).
