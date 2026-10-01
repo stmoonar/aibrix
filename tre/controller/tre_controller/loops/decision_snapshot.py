@@ -89,6 +89,13 @@ def _action_to_dict(action: object) -> dict[str, Any]:
         }
         if action.pods:
             payload["pods"] = list(action.pods)
+        rescue = getattr(action, "rescue", None)
+        if rescue is not None:
+            # C1: the absolute rescue target this scale-up belongs to.
+            payload["rescue"] = {
+                "target": rescue.target, "desired": rescue.desired,
+                "base": rescue.base, "covered": rescue.covered,
+            }
         return payload
     if isinstance(action, HideAction):
         return {
@@ -140,6 +147,12 @@ def _model_states(
             "routable_pods": context.get("routable_pods"),
             "assigned_replicas": context.get("assigned_replicas"),
             "signal_warm": context.get("signal_warm"),
+            # O1 breakpoint window (absent / None without O1).
+            "signal_full_window": context.get("signal_full_window"),
+            "signal_breakpoint_ms": context.get("signal_breakpoint_ms"),
+            "signal_window_start_ms": context.get("signal_window_start_ms"),
+            "signal_evidence_grids": context.get("signal_evidence_grids"),
+            "signal_hold_reason": context.get("signal_hold_reason"),
             "state": state,
             "signal_source": context.get("signal_source"),
             "signal_unavailable_reason": context.get("signal_unavailable_reason"),

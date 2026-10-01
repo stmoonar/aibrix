@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Awaitable, Callable, Protocol
 
 from tre_common.registry import ClusterTopology
@@ -16,6 +16,12 @@ class StateClient(Protocol):
 
 class ClusterViewTaskConfig(Protocol):
     fairness_interval_s: float
+
+
+def wall_clock_ms() -> int:
+    """Epoch ms on the controller clock (the clock the action queue's done times and the
+    metrics sampler's window boundaries use)."""
+    return int(time.time() * 1000)
 
 
 #: Default age (s) past which a cluster view is not "fresh" (review 4 P2-1):
@@ -137,7 +143,11 @@ async def refresh_cluster_view_once(
 ) -> ClusterViewRefreshResult:
     try:
         state = await client.get_state()
-        cluster_view = cluster_view_from_state(state, topology)
+        # O1: stamped after the response arrived - every change the view shows happened
+        # at or before this time (an upper bound, so a breakpoint is never dated early).
+        cluster_view = replace(
+            cluster_view_from_state(state, topology), fetched_ms=int(wall_clock_ms())
+        )
     except Exception as exc:  # noqa: BLE001 - cached view is a conservative fallback.
         return ClusterViewRefreshResult(
             cluster_view=cluster_view_box.get(),

@@ -81,7 +81,15 @@ def freeze_snapshot(snapshot: MetricsSnapshot) -> MetricsSnapshot:
     the ``models`` / ``per_pod`` mappings read-only, so no decision loop can alter the
     window another loop is about to read."""
     models = {
-        name: replace(window, per_pod=MappingProxyType(dict(window.per_pod)))
+        name: replace(
+            window,
+            per_pod=MappingProxyType(dict(window.per_pod)),
+            # O1 suffix windows are read-only too.
+            suffix_windows=tuple(
+                replace(suffix, per_pod=MappingProxyType(dict(suffix.per_pod)))
+                for suffix in window.suffix_windows
+            ),
+        )
         for name, window in snapshot.models.items()
     }
     return replace(snapshot, models=MappingProxyType(models))

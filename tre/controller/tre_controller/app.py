@@ -4,12 +4,14 @@ import asyncio
 import json
 import logging
 import time
+import dataclasses
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Mapping
 
 from tre_common.registry import Registry, load_registry, sleep_call_timeout_errors
 from tre_controller.config import ControllerConfig
 from tre_controller.gateway_cadence import check_gateway_cadence
+from tre_controller.gateway_clock import GatewayClockMonitor, gateway_clock_task
 from tre_controller.gateway_health import EnvoyStatsSource
 from tre_controller.loops.action_queue import (
     ActionQueue,
@@ -38,7 +40,7 @@ from tre_controller.planning.safescale_direct import (
     cluster_view_urls,
 )
 from tre_controller.planning.safescale_evidence import MetricsEvidenceReader, RegistryThresholds
-from tre_controller.signals.trs import SignalState
+from tre_controller.signals.trs import BreakpointWindowConfig, SignalState
 from tre_controller.sm_client import AsyncTransport, ServiceManagerClient
 from tre_controller.store.metrics_store import MetricsStore
 from tre_controller.store.state_store import ControllerStateStore
@@ -166,6 +168,12 @@ def build_controller_task_specs(
                 ),
             )
         )
+    clock_monitor = _gateway_clock_monitor(deps, cfg)
+    if clock_monitor is not None:
+        interval_s = float(deps.registry.scaling().gateway_clock_check_s)
+        specs.append(
+            ControllerTaskSpec("gateway_clock", lambda: gateway_clock_task(clock_monitor, interval_s))
+        )
     specs.append(ControllerTaskSpec("action_queue", lambda: deps.queue.run()))
     if deps.profiler is not None:
         specs.append(ControllerTaskSpec("profile_flush", lambda: deps.profiler.flush_loop()))
@@ -178,6 +186,26 @@ def build_controller_task_specs(
             )
         )
     return tuple(specs)
+
+
+def _gateway_clock_monitor(deps: ControllerDependencies, cfg: Any) -> GatewayClockMonitor | None:
+    """O1 same-clock check (review P2-3): only with O1 on, a redis-backed store and
+    ``scaling.gateway_clock_check_s`` > 0."""
+    breakpoint = getattr(deps.signal_state, "breakpoint", None)
+    redis_client = getattr(deps.store, "redis_client", None)
+    scaling = getattr(deps.registry, "scaling", None)
+    if breakpoint is None or not breakpoint.enabled or redis_client is None or not callable(scaling):
+        return None
+    config = scaling()
+    if int(getattr(config, "gateway_clock_check_s", 0) or 0) <= 0:
+        return None
+    return GatewayClockMonitor(
+        redis_client,
+        [spec.name for spec in deps.registry.models()],
+        deps.signal_state,
+        period_ms=int(getattr(cfg, "instant_sample_interval_ms", breakpoint.grid_ms)),
+        tolerance_ms=int(config.gateway_clock_tolerance_ms),
+    )
 
 
 def _sleeping_pods(view: Any, model: str) -> set[str]:
@@ -234,11 +262,29 @@ def create_controller_dependencies(
 ) -> ControllerDependencies:
     registry = load_registry(cfg.registry_path)
     injected_redis_client = redis_client is not None
-    redis_client = redis_client if redis_client is not None else _create_redis_client(cfg.redis_url, redis_client_factory)
+    redis_timeout_s = float(getattr(cfg, "redis_socket_timeout_s", 0.0) or 0.0)
+    redis_client = (
+        redis_client
+        if redis_client is not None
+        else _create_redis_client(cfg.redis_url, redis_client_factory, timeout_s=redis_timeout_s)
+    )
+    # The metrics reads (per-pod window ZRANGEBYSCOREs) get their own, longer timeout
+    # than the state / scale-memory client: a separate client even on the same URL.
+    metrics_timeout_s = float(getattr(cfg, "redis_metrics_socket_timeout_s", 0.0) or 0.0)
+    share = injected_redis_client or (
+        cfg.metrics_redis_url == cfg.redis_url
+        and (redis_client_factory is not None or metrics_timeout_s == redis_timeout_s)
+    )
     metrics_redis_client = (
         redis_client
-        if injected_redis_client or cfg.metrics_redis_url == cfg.redis_url
-        else _create_redis_client(cfg.metrics_redis_url, redis_client_factory)
+        if share
+        else _create_redis_client(cfg.metrics_redis_url, redis_client_factory, timeout_s=metrics_timeout_s)
+    )
+    breakpoint_config = BreakpointWindowConfig.from_registry(
+        registry, grid_ms=cfg.instant_sample_interval_ms
+    )
+    logging.getLogger("tre_controller.signals").info(
+        json.dumps({"event": "breakpoint_window_config", **dataclasses.asdict(breakpoint_config)}, sort_keys=True)
     )
     store = MetricsStore(
         metrics_redis_client,
@@ -248,6 +294,8 @@ def create_controller_dependencies(
         schema=cfg.metrics_schema,
         histogram_lookback_ms=cfg.histogram_lookback_ms,
         min_latency_samples=cfg.min_latency_samples,
+        # O1: the grid-aligned suffix windows the breakpoint window decides on.
+        suffix_period_ms=cfg.instant_sample_interval_ms if breakpoint_config.enabled else 0,
     )
     sm_client = ServiceManagerClient(
         cfg.service_manager_url,
@@ -319,6 +367,9 @@ def create_controller_dependencies(
         snapshot_box=SnapshotBox(),
         queue=ActionQueue(
             sm_client,
+            # C1 review P2-2: last scale action / rescue target survive a restart.
+            scale_memory=ControllerStateStore(redis_client),
+            scale_memory_max_age_ms=float(getattr(cfg, "scale_memory_max_age_s", 50.0)) * 1000.0,
             is_observe=observe_gate.is_observe,
             # Uncached re-check right before every capacity-changing SM call.
             is_observe_fresh=observe_gate.is_observe_fresh,
@@ -381,6 +432,9 @@ def create_controller_dependencies(
             warmup_ms=cfg.signal_warmup_ms,
             dwell_windows=cfg.dwell_windows,
             dwell_states=cfg.dwell_states,
+            # O1 breakpoint window (registry scaling.breakpoint_window /
+            # onset_warmup_guard / min_evidence_*), on the gateway grid.
+            breakpoint=breakpoint_config,
         ),
         profiler=profiler,
         hidden_orphan_detector=HiddenOrphanDetector(
@@ -430,14 +484,25 @@ def verify_gateway_cadence(deps: ControllerDependencies, cfg: ControllerConfig) 
     )
 
 
-def _create_redis_client(redis_url: str, redis_client_factory: RedisClientFactory | None) -> Any:
+def _create_redis_client(
+    redis_url: str, redis_client_factory: RedisClientFactory | None, *, timeout_s: float = 0.0
+) -> Any:
     if redis_client_factory is not None:
         return redis_client_factory(redis_url)
     try:
         import redis  # type: ignore[import-not-found]
     except ModuleNotFoundError as exc:
         raise RuntimeError("redis package is required unless redis_client_factory is provided") from exc
-    return redis.Redis.from_url(redis_url)
+    return redis.Redis.from_url(redis_url, **redis_timeouts(timeout_s))
+
+
+def redis_timeouts(timeout_s: float) -> dict:
+    """C1 review P3-2: socket / connect timeout of a controller Redis client, so a
+    stalled Redis never blocks a loop (or a scale-memory write) indefinitely; a
+    timeout surfaces as an error the callers already handle. 0 = none."""
+    if not timeout_s or float(timeout_s) <= 0:
+        return {}
+    return {"socket_timeout": float(timeout_s), "socket_connect_timeout": float(timeout_s)}
 
 
 async def run_controller(deps: ControllerDependencies, cfg: MetricsTaskConfig) -> None:

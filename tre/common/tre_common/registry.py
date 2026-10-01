@@ -447,6 +447,174 @@ class PlacementConfig:
     wake_cooldown_node_s: float = 60.0
 
 
+@dataclass(frozen=True)
+class ScalingRegistryConfig:
+    """Registry ``scaling:`` section (controller only; every key optional; read at
+    controller start, restart-to-apply). Older images ignore the whole section
+    (the registry loader only reads the sections it knows).
+
+    C1 (2026-10-01, design 20261001-c1-deficit-scaleup): the fast-loop rescue of a
+    CRITICAL receiver asks for its whole deficit at once,
+    ``desired = min(max(n + 1, ceil(n * tau_crit / Z)), max(n + 1, floor(ratio * n)),
+    scaling cap, capacity found)`` with ``n`` its routable replicas, instead of one
+    ``ceil(0.1 * n)`` step per window."""
+
+    #: ``ratio`` above: the rescue target is at most ``ratio x n`` (never below n + 1).
+    #: 0 = the legacy one-step rescue (``ceil(0.1 * n)`` per decision window).
+    rescue_max_step_ratio: float = 2.0
+    #: Hold a CRITICAL receiver's next scale-up until a metrics window starting after
+    #: its last scale-up completed (review F4 cooldown, scale-up direction of the
+    #: fast loop). Off by default under C1: the rescue target bookkeeping already keeps
+    #: a not-yet-reflected scale-up from being repeated. Scale-down holds, the slow
+    #: loop and the LOW receivers keep the cooldown (TRE_ACTION_COOLDOWN).
+    scale_up_cooldown_enabled: bool = False
+    #: The rescue target may also reach ``n + rescue_max_step_pods`` (HPA's default
+    #: scale-up policy shape, "max(100%, +4 pods)"): cap = max(n + 1,
+    #: floor(ratio * n), n + pods). 0 = the ratio alone.
+    rescue_max_step_pods: int = 0
+    #: An immediate IDLE / HIGH donor of a CRITICAL receiver gives its whole surplus in
+    #: one tick (IDLE down to its floor, HIGH down to its tau_high level). Off: one step
+    #: per tick, as before C1 (scale-down stays cautious).
+    donor_surplus_release: bool = False
+    #: A rescue target counts as reflected once the model's decision window starts
+    #: ``k * trs.ema_tau_ms`` after the scale-up completed (the EMA'd Z lags the raw
+    #: window by about its time constant). 0 = the window start alone (F4 rule).
+    rescue_settle_ema_k: float = 2.0
+    #: O1 (2026-10-01, design 20261001-o1-breakpoint-window): decide on the part of the
+    #: metrics window after the model's last breakpoint (traffic onset or routable-count
+    #: change), complete gateway grids only, the TSS numerator normalised to a whole
+    #: window and the EMA restarted at the breakpoint. Replaces the onset warmup guard.
+    breakpoint_window: bool = True
+    #: The ADR-0013 onset warmup guard (TRE_SIGNAL_WARMUP_MS) on top of O1. With
+    #: ``breakpoint_window: false`` the guard always applies (= pre-O1), whatever this says.
+    onset_warmup_guard: bool = False
+    #: O1: complete gateway grids after the breakpoint before the model's signal decides
+    #: (scale-ups; scale-downs always need a whole clean window). 2 = 20 s on the 10 s grid.
+    min_evidence_grids: int = 2
+    #: O1: also this many completed requests in the post-breakpoint window (0 = off).
+    #: Tokens count at request completion: with one short request done and long ones
+    #: still running, a 20 s suffix can read Z ~ 5 % (review P2-1).
+    min_evidence_requests: int = 3
+    #: O1: added to a routable-count change time before rounding up to the gateway grid
+    #: (the gateway applies the SM's routable label through its pod informer).
+    breakpoint_margin_ms: int = 1000
+    #: O1 (review P2-1, evidence-gated): a C1 rescue decided on a partial
+    #: (post-breakpoint) window with fewer than ``breakpoint_lowevidence_requests``
+    #: completed requests adds at most ``breakpoint_partial_max_step`` replicas; with at
+    #: least that many it asks for the whole deficit (ratio / step_pods caps apply).
+    #: ``breakpoint_partial_max_step: 0`` = no cap at all.
+    breakpoint_partial_max_step: int = 1
+    breakpoint_lowevidence_requests: int = 10
+    #: O1: after this many consecutive held metrics windows (10 s each) a receiver
+    #: decides on the whole window again (donors still need a clean one) - a model whose
+    #: routable count keeps changing is not starved (review P2-2). 0 = never.
+    breakpoint_hold_max_windows: int = 6
+    #: O1 same-clock check (gateway doc stamps vs the controller clock, review P2-3):
+    #: tolerance and period (s, 0 = off). A violation suspends O1 (pre-O1 behaviour).
+    gateway_clock_tolerance_ms: int = 2000
+    gateway_clock_check_s: int = 60
+
+
+SCALING_KEYS = frozenset({
+    "rescue_max_step_ratio", "scale_up_cooldown_enabled", "rescue_max_step_pods",
+    "donor_surplus_release", "rescue_settle_ema_k",
+    "breakpoint_window", "onset_warmup_guard", "min_evidence_grids", "min_evidence_requests",
+    "breakpoint_margin_ms", "breakpoint_partial_max_step", "breakpoint_lowevidence_requests",
+    "breakpoint_hold_max_windows",
+    "gateway_clock_tolerance_ms", "gateway_clock_check_s",
+})
+
+
+def _scaling_count(raw: dict[str, Any], key: str, default: int, minimum: int) -> int:
+    value = raw.get(key)
+    if value is None:
+        return default
+    try:
+        valid = not isinstance(value, bool) and float(value) == int(float(value)) and int(float(value)) >= minimum
+    except (TypeError, ValueError, OverflowError):
+        valid = False
+    if not valid:
+        raise ValueError(f"scaling.{key} must be an integer >= {minimum}, got {value!r}")
+    return int(float(value))
+
+
+def _scaling_bool(raw: dict[str, Any], key: str, default: bool) -> bool:
+    value = raw.get(key)
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    raise ValueError(f"scaling.{key} must be true or false, got {value!r}")
+
+
+def parse_scaling_config(raw: dict[str, Any] | None) -> ScalingRegistryConfig:
+    """Parse the optional ``scaling:`` registry section; raise ValueError on bad values
+    (unknown keys are ignored with a warning, like ``safescale:``)."""
+    if raw is None:
+        return ScalingRegistryConfig()
+    if not isinstance(raw, dict):
+        raise ValueError(f"scaling must be a mapping, got {raw!r}")
+    unknown = sorted(str(key) for key in set(raw) - SCALING_KEYS)
+    if unknown:
+        LOG.warning("registry scaling: ignoring unknown keys %s (known: %s)", unknown, sorted(SCALING_KEYS))
+    defaults = ScalingRegistryConfig()
+    ratio_raw = raw.get("rescue_max_step_ratio")
+    if isinstance(ratio_raw, bool):
+        raise ValueError(f"scaling.rescue_max_step_ratio must be a number, got {ratio_raw!r}")
+    try:
+        ratio = float(defaults.rescue_max_step_ratio if ratio_raw is None else ratio_raw)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"scaling.rescue_max_step_ratio must be a number, got {ratio_raw!r}") from exc
+    if not math.isfinite(ratio) or ratio < 0 or 0 < ratio < 1:
+        raise ValueError(
+            f"scaling.rescue_max_step_ratio must be 0 (legacy step) or at least 1, got {ratio_raw!r}"
+        )
+    pods_raw = raw.get("rescue_max_step_pods")
+    pods = defaults.rescue_max_step_pods if pods_raw is None else pods_raw
+    try:
+        valid_pods = not isinstance(pods, bool) and float(pods) == int(float(pods)) and int(float(pods)) >= 0
+    except (TypeError, ValueError, OverflowError):
+        valid_pods = False
+    if not valid_pods:
+        raise ValueError(f"scaling.rescue_max_step_pods must be a non-negative integer, got {pods_raw!r}")
+    k_raw = raw.get("rescue_settle_ema_k")
+    if isinstance(k_raw, bool):
+        raise ValueError(f"scaling.rescue_settle_ema_k must be a number, got {k_raw!r}")
+    try:
+        settle_k = float(defaults.rescue_settle_ema_k if k_raw is None else k_raw)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"scaling.rescue_settle_ema_k must be a number, got {k_raw!r}") from exc
+    if not math.isfinite(settle_k) or settle_k < 0:
+        raise ValueError(f"scaling.rescue_settle_ema_k must be a non-negative number, got {k_raw!r}")
+    return ScalingRegistryConfig(
+        rescue_max_step_ratio=ratio,
+        scale_up_cooldown_enabled=_scaling_bool(raw, "scale_up_cooldown_enabled", defaults.scale_up_cooldown_enabled),
+        rescue_max_step_pods=int(float(pods)),
+        donor_surplus_release=_scaling_bool(raw, "donor_surplus_release", defaults.donor_surplus_release),
+        rescue_settle_ema_k=settle_k,
+        breakpoint_window=_scaling_bool(raw, "breakpoint_window", defaults.breakpoint_window),
+        onset_warmup_guard=_scaling_bool(raw, "onset_warmup_guard", defaults.onset_warmup_guard),
+        min_evidence_grids=_scaling_count(raw, "min_evidence_grids", defaults.min_evidence_grids, 1),
+        min_evidence_requests=_scaling_count(
+            raw, "min_evidence_requests", defaults.min_evidence_requests, 0
+        ),
+        breakpoint_margin_ms=_scaling_count(raw, "breakpoint_margin_ms", defaults.breakpoint_margin_ms, 0),
+        breakpoint_partial_max_step=_scaling_count(
+            raw, "breakpoint_partial_max_step", defaults.breakpoint_partial_max_step, 0
+        ),
+        breakpoint_lowevidence_requests=_scaling_count(
+            raw, "breakpoint_lowevidence_requests", defaults.breakpoint_lowevidence_requests, 0
+        ),
+        breakpoint_hold_max_windows=_scaling_count(
+            raw, "breakpoint_hold_max_windows", defaults.breakpoint_hold_max_windows, 0
+        ),
+        gateway_clock_tolerance_ms=_scaling_count(
+            raw, "gateway_clock_tolerance_ms", defaults.gateway_clock_tolerance_ms, 0
+        ),
+        gateway_clock_check_s=_scaling_count(raw, "gateway_clock_check_s", defaults.gateway_clock_check_s, 0),
+    )
+
+
 #: ``safescale.slo_mode``: where the SafeScale probe's latency thresholds come from.
 #: ``labels`` - the calibration label's rule (``tre_common.slo_labels.label_def_for_model``:
 #: TPOT 75 ms, TTFT = max(floor, k * (c + b * L)) with the mean prompt length L of the
@@ -867,8 +1035,10 @@ class Registry:
         vllm: VllmConfig | None = None,
         placement: PlacementConfig | None = None,
         safescale: SafeScaleRegistryConfig | None = None,
+        scaling: ScalingRegistryConfig | None = None,
     ) -> None:
         self._safescale = safescale or SafeScaleRegistryConfig()
+        self._scaling = scaling or ScalingRegistryConfig()
         self._topology = topology
         self._placement = placement or PlacementConfig()
         self._models = tuple(models)
@@ -897,6 +1067,9 @@ class Registry:
 
     def safescale(self) -> SafeScaleRegistryConfig:
         return self._safescale
+
+    def scaling(self) -> ScalingRegistryConfig:
+        return self._scaling
 
     def vllm_env_for(self, model: ModelSpec) -> dict[str, str]:
         """The vLLM container environment of ``model``'s pods (besides the per-binding
@@ -1119,6 +1292,7 @@ def _parse_registry(raw: dict[str, Any]) -> Registry:
         vllm=parse_vllm_config(raw.get("vllm")),
         placement=parse_placement_config(raw.get("placement")),
         safescale=parse_safescale_config(raw.get("safescale")),
+        scaling=parse_scaling_config(raw.get("scaling")),
     )
 
 

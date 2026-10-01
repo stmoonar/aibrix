@@ -145,7 +145,12 @@ def restrict_to_serving(
       per-replica alt signals divide by the serving count).
 
     A window with no per-pod breakdown (synthetic / offline) only gets the counts.
+    Its ``suffix_windows`` (O1) are restricted the same way.
     """
+    suffixes = tuple(
+        restrict_to_serving(suffix, sleeping_pods=sleeping_pods, routable_pods=routable_pods)
+        for suffix in metrics.suffix_windows
+    )
     per_pod = metrics.per_pod
     if per_pod and sleeping_pods:
         asleep = set(sleeping_pods)
@@ -159,4 +164,9 @@ def restrict_to_serving(
                 # Ticks are gateway-wide provenance (freshness), not a per-pod quantity.
                 instant_ticks_ms=metrics.instant_ticks_ms,
             )
-    return replace(metrics, routable_pods=int(routable_pods), assigned_replicas=int(routable_pods))
+    return replace(
+        metrics,
+        routable_pods=int(routable_pods),
+        assigned_replicas=int(routable_pods),
+        suffix_windows=suffixes,
+    )

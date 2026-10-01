@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from typing import Any
 
 from tre_common.metrics_schema import MetricsSnapshot, ModelWindowMetrics, PodWindowMetrics
@@ -45,9 +46,12 @@ class MetricsStore:
         schema: str = "v2",
         histogram_lookback_ms: int = 90_000,
         min_latency_samples: int = 0,
+        suffix_period_ms: int = 0,
     ) -> None:
         if instant_sample_interval_ms <= 0:
             raise ValueError("instant_sample_interval_ms must be positive")
+        if suffix_period_ms < 0:
+            raise ValueError("suffix_period_ms must be non-negative")
         if histogram_lookback_ms < 0:
             raise ValueError("histogram_lookback_ms must be non-negative")
         if min_latency_samples < 0:
@@ -64,6 +68,10 @@ class MetricsStore:
         # noisy to decide on (short windows + low QPS can have single-digit samples).
         # 0 disables the guard (default; the live controller sets it from config).
         self._min_latency_samples = min_latency_samples
+        # O1 (breakpoint-aware window): > 0 also builds every model window's grid-aligned
+        # suffixes (ModelWindowMetrics.suffix_windows) from the docs already read - no
+        # extra redis round trip. 0 = off (the SafeScale evidence store, older callers).
+        self._suffix_period_ms = int(suffix_period_ms)
         self._window_cache: dict[tuple[str, str, int, int], ModelWindowMetrics] = {}
 
     @property
@@ -128,7 +136,12 @@ class MetricsStore:
 
         # Timestamps are integer ms, so (start, end] == [start + 1, end].
         read_start_ms = int(window_start_ms) + 1 if start_exclusive else int(window_start_ms)
+        suffix_starts = self._suffix_starts(int(window_start_ms), int(window_end_ms))
+        suffix_pods: dict[int, dict[str, PodWindowMetrics]] = {start: {} for start in suffix_starts}
         if self._schema == "v1":
+            # O1 suffixes are built for the v2 schema only (v1 = legacy fallback: the
+            # controller then waits for a whole clean window after a breakpoint).
+            suffix_starts = ()
             per_pod = self._read_v1_model_window(
                 model, read_start_ms, window_end_ms, span_start_ms=window_start_ms
             )
@@ -149,11 +162,45 @@ class MetricsStore:
                 )
                 if pod_metrics is not None:
                     per_pod[pod_metrics.pod] = pod_metrics
+                for start in suffix_starts:
+                    # The suffix (start, end] from the same docs: the histogram baseline
+                    # is the newest doc before the suffix (the tick at ``start``), the
+                    # instant average runs over the suffix's ticks with the suffix's
+                    # expected-samples divisor - exactly what a read of that shorter
+                    # window would return.
+                    suffix_read = start + 1 if start_exclusive else start
+                    suffix_metrics = self._aggregate_pod(
+                        model,
+                        pod_key,
+                        _with_baseline_doc(hist_docs, suffix_read) if hist_docs else [],
+                        [doc for doc in inst_docs if _number(doc.get("timestamp"), 0.0) >= suffix_read],
+                        suffix_read,
+                        window_end_ms,
+                        span_start_ms=start,
+                    )
+                    if suffix_metrics is not None:
+                        suffix_pods[start][suffix_metrics.pod] = suffix_metrics
 
         model_metrics = self._aggregate_model(model, window_start_ms, window_end_ms, per_pod)
+        if suffix_starts:
+            model_metrics = replace(
+                model_metrics,
+                suffix_windows=tuple(
+                    self._aggregate_model(model, start, window_end_ms, suffix_pods[start])
+                    for start in suffix_starts
+                ),
+            )
         if use_cache:
             self._window_cache[cache_key] = model_metrics
         return model_metrics
+
+    def _suffix_starts(self, window_start_ms: int, window_end_ms: int) -> tuple[int, ...]:
+        """Gateway boundaries strictly inside an aligned window (O1 suffix starts);
+        () when suffixes are off or the window is not on the suffix grid."""
+        period = self._suffix_period_ms
+        if period <= 0 or window_start_ms % period or window_end_ms % period:
+            return ()
+        return tuple(range(window_start_ms + period, window_end_ms, period))
 
     def read_latest_instant(self, model: str, now_ms: int, lookback_ms: int) -> dict[str, float]:
         """Latest instant queue snapshot (waiting/running/swapping), summed across pods.

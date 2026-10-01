@@ -544,6 +544,70 @@ data:
       # Direct path: the model pods' serving port (the reissue sidecar forwards
       # GET /metrics to vLLM).
       metrics_port: 8000
+
+    # Fast-loop scale-up (controller only; read at start, restart-to-apply; every key
+    # optional, the values below are the built-in defaults). C1, design
+    # docs/design/20261001-c1-deficit-scaleup.md. Controller / SM / UI images before
+    # 2026-10-01 ignore this top-level section (the registry loader only reads the
+    # sections it knows).
+    scaling:
+      # A CRITICAL receiver's rescue asks for its whole deficit at once: target
+      # min(max(n+1, ceil(n * tau_crit / Z)), max(n+1, floor(ratio * n)), the scaling
+      # cap max_awake_replicas, the capacity found), n = its routable replicas, Z its
+      # decision-window signal. 0 = the legacy one step (ceil(0.1 * n)) per window.
+      rescue_max_step_ratio: 2.0
+      # The rescue target may also reach n + this many replicas: cap = max(n + 1,
+      # floor(ratio * n), n + pods) (HPA's default "max(100%, +4 pods)" shape). 0 = off
+      # (the built-in default); 4 = user decision 2026-10-01 (n = 1 can reach the
+      # scaling cap 4 in one decision).
+      rescue_max_step_pods: 4
+      # An immediate IDLE / HIGH donor of a CRITICAL receiver gives its whole surplus
+      # (IDLE to its floor, HIGH to its tau_high level) in one tick. false = one step
+      # per tick (scale-down stays cautious).
+      donor_surplus_release: false
+      # A rescue target counts as reflected once the decision window starts
+      # k * trs.ema_tau_ms after it completed (the EMA'd Z lags the window). 0 = the
+      # window start alone.
+      rescue_settle_ema_k: 2.0
+      # Also hold a CRITICAL receiver's scale-up until a metrics window starting after
+      # its last scale-up completed (the F4 cooldown, TRE_ACTION_COOLDOWN). Off: the
+      # rescue target bookkeeping already keeps an unreflected scale-up from repeating.
+      # Scale-down holds, LOW receivers and the slow loop keep the cooldown either way.
+      scale_up_cooldown_enabled: false
+      # O1 breakpoint-aware window (design docs/design/20261001-o1-breakpoint-window.md,
+      # ADR-0015): a model decides on the part of its 30 s metrics window after its last
+      # breakpoint (traffic onset, routable replica-count change), complete 10 s gateway
+      # grids only (the grid holding the breakpoint excluded), the TSS numerator scaled to
+      # a whole window and the EMA restarted at the breakpoint. Scale-ups act after
+      # min_evidence_grids grids; scale-downs wait for a whole window after the breakpoint.
+      # Replaces the ADR-0013 onset warmup guard. Controller images before O1 ignore these
+      # keys (C1 images log them as unknown).
+      breakpoint_window: true
+      # The ADR-0013 onset warmup guard (TRE_SIGNAL_WARMUP_MS) on top of O1. With
+      # breakpoint_window: false the guard always applies (= pre-O1 behaviour).
+      onset_warmup_guard: false
+      # Complete post-breakpoint grids before a scale-up decision (2 = 20 s).
+      min_evidence_grids: 2
+      # Completed requests the post-breakpoint window also needs (0 = off). Tokens count
+      # at completion: one short request done while long ones run reads Z ~ 5 %.
+      min_evidence_requests: 3
+      # Added to a routable-count change time before it is rounded up to the 10 s grid:
+      # the SM writes the routable label before it answers, the gateway applies it via
+      # its pod informer shortly after.
+      breakpoint_margin_ms: 1000
+      # A C1 rescue decided on a partial (post-breakpoint) window with fewer than
+      # breakpoint_lowevidence_requests completed requests adds at most
+      # breakpoint_partial_max_step replicas; with more, the whole deficit at once.
+      # breakpoint_partial_max_step: 0 = no cap.
+      breakpoint_partial_max_step: 1
+      breakpoint_lowevidence_requests: 10
+      # After this many consecutive held 10 s windows a receiver decides on the whole
+      # window again (routable count changing all the time); donors still wait. 0 = never.
+      breakpoint_hold_max_windows: 6
+      # Same-clock check of gateway doc stamps vs the controller clock (O1 compares them):
+      # beyond the tolerance O1 is suspended (pre-O1 behaviour) until 3 good checks.
+      gateway_clock_tolerance_ms: 2000
+      gateway_clock_check_s: 60
 kind: ConfigMap
 metadata:
   name: tre-v2-registry
