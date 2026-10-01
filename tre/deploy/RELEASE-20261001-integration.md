@@ -188,6 +188,25 @@ One commit on `integ/tre-v2-20261001` that changes only tags:
 - `make check` green, commit. Then `kubectl diff -f` of the four overlays must show the
   image line only (no env / RBAC / strategy change in this release).
 
+### 1.4 Built 2026-10-01 (done)
+
+`SHA=8b9d5980` (integration HEAD before the tag bump), `TAG=20261001-8b9d5980`, all four
+built from the clean clone `/tmp/aibrix-clean-8b9d5980` (porcelain empty), copied to
+node9 with `docker save | docker load`; image IDs identical on both nodes:
+
+| Image | ID |
+|---|---|
+| `aibrix/gateway-plugins:20261001-8b9d5980-nozmq2` | `2179ddd72b4f` (go1.22.6, `-tags=nozmq`, `vcs.revision=8b9d5980...`, `vcs.modified=false`) |
+| `tre-v2-service-manager:20261001-8b9d5980` | `41de0c914721` |
+| `tre-v2-controller:20261001-8b9d5980` | `59c1e7f523ca` |
+| `tre-v2-ui:20261001-8b9d5980` | `6c6b4aab9f8a` |
+
+As with every earlier bump (e.g. 19781f50 -> images of f8ccb0ca), the tag names the
+**source** commit the images were built from (8b9d5980); the tag-bump commit that
+follows it changes only the four overlay image lines and the four guard asserts, no
+image content. Deploy from the tag-bump commit (or a later one with no change under
+`tre/` that goes into an image). The model image is not rebuilt.
+
 ## 2. Backup and rollback.sh (window open; before any apply)
 
 ```bash
