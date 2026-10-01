@@ -63,5 +63,9 @@ const (
 )
 
 // DefaultStableWindowDuration is the stable metric window used when a PodAutoscaler does not
-// set APAWindowLabel.
-const DefaultStableWindowDuration = 180 * time.Second
+// set APAWindowLabel. MinStableWindowDuration is the smallest accepted value (the window
+// buckets samples per second).
+const (
+	DefaultStableWindowDuration = 180 * time.Second
+	MinStableWindowDuration     = time.Second
+)

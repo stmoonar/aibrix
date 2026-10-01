@@ -76,3 +76,16 @@ func TestEnsureStableWindow_Resize(t *testing.T) {
 	assert.Equal(t, 20*time.Second, c.StableWindowDuration(k))
 	assert.Equal(t, 0, c.stableWindows[k.String()].Size())
 }
+
+func TestTimeWindowSpan(t *testing.T) {
+	t0 := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	tw := types.NewTimeWindow(20*time.Second, time.Second)
+	assert.Equal(t, time.Duration(0), tw.Span())
+	tw.Record(t0, 1)
+	tw.Record(t0.Add(500*time.Millisecond), 2) // same 1 s bucket: overwrites
+	tw.Record(t0.Add(12*time.Second), 3)
+	assert.Equal(t, 12*time.Second, tw.Span())
+	assert.Equal(t, 2, tw.Size())
+	tw.Record(t0.Add(30*time.Second), 4) // cutoff t0+10 s: t0 ages out, t0+12 s stays
+	assert.Equal(t, 18*time.Second, tw.Span())
+}

@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	autoscalingv1alpha1 "github.com/vllm-project/aibrix/api/autoscaling/v1alpha1"
@@ -178,8 +179,9 @@ var annotationParsers = map[string]annotationParser{
 	},
 	types.APAWindowLabel: func(b *baseScalingContext, value string) error {
 		v, err := time.ParseDuration(value)
-		if err == nil && v <= 0 {
-			err = fmt.Errorf("%s must be positive, got %q", types.APAWindowLabel, value)
+		if err == nil && v < types.MinStableWindowDuration {
+			err = fmt.Errorf("%s must be at least %s, got %q", types.APAWindowLabel,
+				types.MinStableWindowDuration, value)
 		}
 		if err == nil {
 			b.StableWindow = v
@@ -223,11 +225,32 @@ func (b *baseScalingContext) UpdateByPaTypes(pa *autoscalingv1alpha1.PodAutoscal
 			}
 		} else if isAutoscalingAnnotation(key) {
 			// A misspelled or renamed key is otherwise silently ignored and the default applies.
-			klog.InfoS("Ignoring unrecognized autoscaling annotation; the default value applies",
-				"podAutoscaler", klog.KObj(pa), "annotation", key, "value", value)
+			warnOnce(pa, key, "Ignoring unrecognized autoscaling annotation; the default value applies", value)
 		}
 	}
+	// The window annotation is an APA key; other strategies keep the default stable window.
+	if _, ok := pa.Annotations[types.APAWindowLabel]; ok && pa.Spec.ScalingStrategy != autoscalingv1alpha1.APA {
+		warnOnce(pa, types.APAWindowLabel, "Ignoring APA window annotation on a non-APA PodAutoscaler",
+			pa.Annotations[types.APAWindowLabel])
+		b.StableWindow = types.DefaultStableWindowDuration
+	}
 	return nil
+}
+
+// warnedAnnotations remembers (PodAutoscaler UID or namespace/name, annotation key, value)
+// already reported, so each ignored annotation is logged once per PodAutoscaler instead of
+// on every reconcile.
+var warnedAnnotations sync.Map
+
+func warnOnce(pa *autoscalingv1alpha1.PodAutoscaler, key, msg, value string) {
+	id := string(pa.UID)
+	if id == "" {
+		id = pa.Namespace + "/" + pa.Name
+	}
+	if _, seen := warnedAnnotations.LoadOrStore(id+"|"+key+"="+value, struct{}{}); seen {
+		return
+	}
+	klog.InfoS(msg, "podAutoscaler", klog.KObj(pa), "annotation", key, "value", value)
 }
 
 // nonScalingContextAnnotations are autoscaling-prefixed keys consumed outside the scaling context.

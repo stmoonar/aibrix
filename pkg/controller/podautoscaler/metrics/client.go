@@ -215,7 +215,9 @@ func (c *MetricsClient) GetMetricValue(metricKey types.MetricKey, now time.Time)
 	}
 
 	klog.InfoS("Metrics window aggregation", "metricKey", metricKeyStr,
-		"stableAvg", stableValue, "panicAvg", panicValue, "stableWindowValues", stableWindow.Values(), "panicWindowValues", panicWindow.Values())
+		"stableAvg", stableValue, "panicAvg", panicValue,
+		"stableWindow", stableWindow.Duration().String(), "stableWindowSpan", stableWindow.Span().String(),
+		"stableWindowValues", stableWindow.Values(), "panicWindowValues", panicWindow.Values())
 
 	return stableValue, panicValue, nil
 }

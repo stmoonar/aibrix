@@ -30,6 +30,7 @@ import (
 func paWithAnnotations(annotations map[string]string) *autoscalingv1alpha1.PodAutoscaler {
 	return &autoscalingv1alpha1.PodAutoscaler{
 		ObjectMeta: v1.ObjectMeta{Name: "m-apa", Namespace: "default", Annotations: annotations},
+		Spec:       autoscalingv1alpha1.PodAutoscalerSpec{ScalingStrategy: autoscalingv1alpha1.APA},
 	}
 }
 
@@ -49,7 +50,7 @@ func TestStableWindow_Default(t *testing.T) {
 }
 
 func TestStableWindow_Invalid(t *testing.T) {
-	for _, v := range []string{"abc", "0s", "-5s"} {
+	for _, v := range []string{"abc", "0s", "-5s", "500ms"} {
 		ctx := NewBaseScalingContext()
 		err := ctx.UpdateByPaTypes(paWithAnnotations(map[string]string{types.APAWindowLabel: v}))
 		assert.Error(t, err, v)
@@ -88,4 +89,32 @@ func TestIsAutoscalingAnnotation(t *testing.T) {
 	assert.True(t, isAutoscalingAnnotation("kpa.autoscaling.aibrix.ai/stable-window"))
 	assert.False(t, isAutoscalingAnnotation("autoscaling.aibrix.ai/storm-service-mode"))
 	assert.False(t, isAutoscalingAnnotation("kubectl.kubernetes.io/last-applied-configuration"))
+}
+
+func TestStableWindow_MinimumAccepted(t *testing.T) {
+	ctx := NewBaseScalingContext()
+	require.NoError(t, ctx.UpdateByPaTypes(paWithAnnotations(map[string]string{types.APAWindowLabel: "1s"})))
+	assert.Equal(t, time.Second, ctx.GetStableWindow())
+}
+
+// The window annotation is APA-only: a KPA/HPA PodAutoscaler keeps the default.
+func TestStableWindow_NonAPAIgnored(t *testing.T) {
+	for _, s := range []autoscalingv1alpha1.ScalingStrategyType{autoscalingv1alpha1.KPA, autoscalingv1alpha1.HPA} {
+		pa := paWithAnnotations(map[string]string{types.APAWindowLabel: "20s"})
+		pa.Spec.ScalingStrategy = s
+		ctx := NewBaseScalingContext()
+		require.NoError(t, ctx.UpdateByPaTypes(pa))
+		assert.Equal(t, types.DefaultStableWindowDuration, ctx.GetStableWindow(), string(s))
+	}
+}
+
+func TestWarnOnce(t *testing.T) {
+	pa := paWithAnnotations(nil)
+	pa.Name = "warn-once"
+	key := "warn-once|autoscaling.aibrix.ai/x=1"
+	_, before := warnedAnnotations.Load("default/" + key)
+	assert.False(t, before)
+	warnOnce(pa, "autoscaling.aibrix.ai/x", "msg", "1")
+	_, after := warnedAnnotations.Load("default/" + key)
+	assert.True(t, after)
 }
