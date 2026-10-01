@@ -15,8 +15,10 @@ metadata:
     tre.aibrix.io/baseline: apa
     model.aibrix.ai/name: dsqwen-14b
   annotations:
-    autoscaling.aibrix.ai/scale-up-tolerance: '0.2'
-    autoscaling.aibrix.ai/scale-down-tolerance: '0.8'
+    # v1's effective tolerances (its defaults): the v1 files' up/down-fluctuation-tolerance
+    # 0.2 / 0.8 lacked the apa. prefix v1 reads (scaler/apa.go:39-41) and never applied.
+    autoscaling.aibrix.ai/scale-up-tolerance: '0.1'
+    autoscaling.aibrix.ai/scale-down-tolerance: '0.2'
     autoscaling.aibrix.ai/scale-down-cooldown-window: 0s
     apa.autoscaling.aibrix.ai/window: 20s
 spec:

@@ -76,10 +76,11 @@ func TestAPABaselineCRsEffectiveConfig(t *testing.T) {
 		sc.SetMinReplicas(*pa.Spec.MinReplicas)
 		sc.SetMaxReplicas(pa.Spec.MaxReplicas)
 
-		// v1-aligned values (see tre/deploy/RELEASE-20261001-apa-window.md).
+		// v1-aligned values (see tre/deploy/RELEASE-20261001-apa-window.md): tolerances are
+		// v1's effective 0.1 / 0.2 (its files' 0.2 / 0.8 lacked the apa. prefix v1 reads).
 		assert.Equal(t, 20*time.Second, sc.GetStableWindow(), f)
-		assert.Equal(t, 0.2, sc.GetUpFluctuationTolerance(), f)
-		assert.Equal(t, 0.8, sc.GetDownFluctuationTolerance(), f)
+		assert.Equal(t, 0.1, sc.GetUpFluctuationTolerance(), f)
+		assert.Equal(t, 0.2, sc.GetDownFluctuationTolerance(), f)
 		assert.Equal(t, 2.0, sc.GetMaxScaleUpRate(), f)
 		assert.Equal(t, 2.0, sc.GetMaxScaleDownRate(), f)
 		assert.Equal(t, time.Duration(0), sc.GetScaleUpCooldownWindow(), f)
@@ -106,7 +107,7 @@ func TestAPABaselineCRsEffectiveConfig(t *testing.T) {
 		}
 		require.NotEmpty(t, line, "no Effective autoscaling config log for %s", f)
 		for _, want := range []string{
-			`stableWindow="20s"`, "upTolerance=0.2", "downTolerance=0.8",
+			`stableWindow="20s"`, "upTolerance=0.1", "downTolerance=0.2",
 			"maxScaleUpRate=2", "maxScaleDownRate=2",
 			`scaleUpCooldown="0s"`, `scaleDownCooldown="0s"`,
 			"minReplicas=1", "maxReplicas=4",

@@ -21,8 +21,8 @@ Branch `feat/apa-window-20261001` from 7994da76, source commit 772415f8 (94a0d82
   | | before (live v2) | after | v1 file |
   |---|---|---|---|
   | stable window | 180 s (annotation ignored) | **20 s** | `apa.autoscaling.aibrix.ai/window: 20s` |
-  | scale-up tolerance | 0.1 (default; key ignored) | **0.2** | `autoscaling.aibrix.ai/up-fluctuation-tolerance: '0.2'` |
-  | scale-down tolerance | 0.1 (default; key ignored) | **0.8** | `autoscaling.aibrix.ai/down-fluctuation-tolerance: '0.8'` |
+  | scale-up tolerance | 0.1 (default; key ignored) | **0.1** (explicit) | `autoscaling.aibrix.ai/up-fluctuation-tolerance: '0.2'` - never applied; v1 effective 0.1 |
+  | scale-down tolerance | 0.1 (default; key ignored) | **0.2** | `autoscaling.aibrix.ai/down-fluctuation-tolerance: '0.8'` - never applied; v1 effective 0.2 |
   | max scale-up / down rate | 2 / 2 (default) | 2 / 2 (default) | `apa.autoscaling.aibrix.ai/max-scale-{up,down}-rate: '2.0'` |
   | scale-up cooldown | 0 s (default) | 0 s (default) | none |
   | scale-down cooldown | 300 s (default) | **0 s** (`scale-down-cooldown-window: 0s`) | none (v1 APA has no cooldown) |
@@ -32,8 +32,8 @@ Branch `feat/apa-window-20261001` from 7994da76, source commit 772415f8 (94a0d82
   Caveat on the tolerances: the v1 controller reads them under the
   `apa.autoscaling.aibrix.ai/` prefix (`/root/aibrix-main/pkg/controller/podautoscaler/scaler/apa.go`,
   the same at the v1 image source 12c1107), so the v1 files' keys were not parsed and the v1
-  runs used the v1 defaults, up 0.1 / down 0.2. The CRs follow the values written in the v1
-  files; to reproduce v1's effective behaviour instead, set 0.1 / 0.2. The v1
+  runs used the v1 defaults, up 0.1 / down 0.2. The CRs are aligned with v1's EFFECTIVE values: the v1 files' 0.2 / 0.8 never took effect because their keys lack the `apa.` prefix the v1 controller reads (`/root/aibrix-main/pkg/controller/podautoscaler/scaler/apa.go:39-41`)
+  (owner decision 2026-10-01; first drafted with the file values 0.2 / 0.8). The v1
   `max-scale-*-rate` keys were likewise unparsed in v1 (it reads
   `autoscaling.aibrix.ai/max-scale-*-rate`); its default was 2, so the result is the same.
 
@@ -122,7 +122,7 @@ Run on the control-plane node. `NS=aibrix-system`, `D=aibrix-controller-manager`
    canary (step 5) or briefly apply the CRs on an idle cluster in `observe observe`:
    ```bash
    kubectl -n $NS logs deploy/$D --since=2m | grep "Effective autoscaling config"
-   # expect per PA: stableWindow="20s" upTolerance=0.2 downTolerance=0.8 maxScaleUpRate=2
+   # expect per PA: stableWindow="20s" upTolerance=0.1 downTolerance=0.2 maxScaleUpRate=2
    #                maxScaleDownRate=2 scaleUpCooldown="0s" scaleDownCooldown="0s"
    #                minReplicas=1 maxReplicas=4
    kubectl -n $NS logs deploy/$D --since=2m | grep "Ignoring unrecognized autoscaling annotation"
@@ -142,8 +142,8 @@ Run on the control-plane node. `NS=aibrix-system`, `D=aibrix-controller-manager`
    ```
    Expect: `AbleToScale=True` x3; on the 8b KV-heavy load the first 1 -> 2 decision
    (`desiredScale>1`, then the service-manager wake) about 20-30 s after the load starts,
-   down from about 65 s with the 180 s window (scale-up now needs usage above 0.6 instead of
-   0.55); after the load, scale-down starts once the 20 s average falls below 0.1, with no
+   down from about 65 s with the 180 s window (scale-up needs usage above 0.55, as before); after
+   the load, scale-down starts once the 20 s average falls below 0.4, with no
    cooldown, instead of waiting 300 s. Keep the canary's
    `aibrix-controller-manager.log` and `apa_crs_after.yaml` as evidence, and check that it
    shows `stableWindow="20s"`.
@@ -163,8 +163,8 @@ Run on the control-plane node. `NS=aibrix-system`, `D=aibrix-controller-manager`
 
 ## Open points for the owner
 
-- Tolerances: the CRs use the v1 file values 0.2 / 0.8; v1's effective values were its
-  defaults 0.1 / 0.2 (see the caveat above). Switching is a CR annotation edit only.
+- Tolerances: decided 2026-10-01 - the CRs use v1's effective values 0.1 / 0.2 (the v1
+  files' 0.2 / 0.8 never applied, see the caveat above). Switching is a CR annotation edit only.
 - The event-driven chaining described above has no v1 counterpart checked here.
 
 `pkg/controller/podautoscaler/apa_baseline_crs_test.go` loads the three CRs, checks the
