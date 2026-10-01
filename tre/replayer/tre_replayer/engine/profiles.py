@@ -151,10 +151,39 @@ class V1ChatOptions:
         return out
 
 
+_CODE: Optional[dict] = None
+
+
+def code_provenance() -> dict:
+    """Which ``tre_replayer`` sent the run: its directory, the git commit of the tree it
+    is in and whether that tree had local changes (None where git cannot tell)."""
+    global _CODE
+    if _CODE is None:
+        import subprocess
+        from pathlib import Path
+
+        import tre_replayer
+
+        package = str(Path(tre_replayer.__file__).resolve().parent)
+        sha = dirty = None
+        try:
+            sha = subprocess.run(["git", "-C", package, "rev-parse", "HEAD"], capture_output=True, text=True,
+                                 timeout=10).stdout.strip() or None
+            if sha:
+                status = subprocess.run(["git", "-C", package, "status", "--porcelain", "--untracked-files=no",
+                                         "--", "."], capture_output=True, text=True, timeout=10)
+                dirty = bool(status.stdout.strip()) if status.returncode == 0 else None
+        except (OSError, subprocess.SubprocessError):
+            pass
+        _CODE = {"tre_replayer": package, "git_sha": sha, "git_dirty": dirty}
+    return dict(_CODE)
+
+
 def client_provenance(profile: str, *, transport: Any = None, processes: int = 1,
                       schedule: str = "absolute (per-process asyncio, pre-sharded)", **extra) -> dict:
     """What a run's requests were and how they were sent, for its manifest."""
-    out = {"profile": get_profile(profile).as_dict(), "processes": int(processes), "scheduling": schedule}
+    out = {"profile": get_profile(profile).as_dict(), "processes": int(processes), "scheduling": schedule,
+           "code": code_provenance()}
     if transport is not None and hasattr(transport, "provenance"):
         out["wire"] = transport.provenance()
     out.update(extra)

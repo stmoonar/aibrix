@@ -420,6 +420,10 @@ def _has_structured_body(body: Optional[str]) -> bool:
     return True
 
 
+def _is_admission_overflow(record: dict) -> bool:
+    return classify_failure(record) == FAILURE_ADMISSION_OVERFLOW
+
+
 def classify_failure(record: dict) -> str:
     """Attribute one request record to the model or to the gateway.
 
@@ -433,6 +437,8 @@ def classify_failure(record: dict) -> str:
     Rules, in order:
 
     * 2xx whose stream carried an ``{"error": ...}`` chunk (``stream_error``) -> model.
+    * 2xx whose body ended without ``[DONE]`` or a finish reason (``stream_complete``
+      False; absent on rows before 2026-10-01) -> model: a truncated answer.
     * 2xx with a measured end-to-end time -> served.
     * the sender flagged ``client_timeout`` -> the client's own deadline fired. Checked
       before everything else because it is the only class the *sender* can attest to;
@@ -459,6 +465,11 @@ def classify_failure(record: dict) -> str:
     if record.get("stream_error") and status is not None and 200 <= int(status) < 300:
         # The engine failed the request inside a 200 stream ({"error": ...} chunk): it
         # answered for itself, so it is the model's failure, and never a completion.
+        return FAILURE_MODEL
+    if record.get("stream_complete") is False and status is not None and 200 <= int(status) < 300:
+        # The 200 body just stopped - no [DONE], no finish reason: a truncated answer is
+        # not a completion (the strict basis of tre_replayer.engine.metrics agrees).
+        # Rows written before 2026-10-01 have no such field and are judged as before.
         return FAILURE_MODEL
     if status is not None and 200 <= int(status) < 300 and record.get("e2e_ms") is not None:
         return FAILURE_NONE
@@ -1812,7 +1823,7 @@ def drive_cell_schedule(
     from tre_replayer.engine import rps_timeline as rps
     from tre_replayer.engine.dispatcher import dispatch_open_loop
     from tre_replayer.engine.http_sender import StreamingHttpSender
-    from tre_replayer.engine.procpool import ProcessPoolRunner, StopGate
+    from tre_replayer.engine.procpool import ProcessPoolRunner, StopGate, monotonic_to_wall_ms
     from tre_replayer.engine.profiles import DEFAULT_SENDER_PROCESSES
     from tre_replayer.engine.prompt_store import materialize_prompts, prompt_file_path
     from tre_replayer.engine.prompts import DEFAULT_MODE
@@ -1885,16 +1896,14 @@ def drive_cell_schedule(
     if processes > 1:
         # Forked here, before the sidecar threads exist.
         if truncate_on_proxy_shed or max_backlog:
+            # The worker that receives the overflow trips the gate itself, before the
+            # record travels to this process; this process's observer is the backstop.
             gate = StopGate(truncate=truncate_on_proxy_shed, drain_start_s=drain_start_s,
-                            keep_drain=shed_policy != SHED_POLICY_VOID, max_backlog=max_backlog)
+                            keep_drain=shed_policy != SHED_POLICY_VOID, max_backlog=max_backlog,
+                            trip_if=_is_admission_overflow)
 
-        def observe(record: dict) -> None:
-            if (gate is not None and gate.truncate and not gate.truncated
-                    and classify_failure(record) == FAILURE_ADMISSION_OVERFLOW):
-                gate.trip_truncation(float(record.get("scheduled_offset_s") or 0.0),
-                                     record.get("actual_send_ts_ms"), record)
-
-        runner = ProcessPoolRunner(events, make_sender, processes=processes, gate=gate, observer=observe)
+        runner = ProcessPoolRunner(events, make_sender, processes=processes, gate=gate,
+                                   observer=None if gate is None else gate.observe)
         sender = None
         backlog = truncator = None
     else:
@@ -1910,21 +1919,23 @@ def drive_cell_schedule(
             if truncate_on_proxy_shed
             else None
         )
-    if client_out is not None:
-        client_out.update(local_sender.provenance(processes=runner.processes if runner else 1))
-
     start_ms = now_ms()
     instants: list = []
-    if sidecar is not None:
-        sidecar.start()
-    if overflow_sentinel is not None:
-        overflow_sentinel.start()
     prompt_store_misses = None
     try:
+        if client_out is not None:
+            client_out.update(local_sender.provenance(processes=runner.processes if runner else 1))
+        if sidecar is not None:
+            sidecar.start()
+        if overflow_sentinel is not None:
+            overflow_sentinel.start()
         if runner is not None:
             run = runner.run()
             records = run.records
             report = run.report
+            # The cell starts at the workers' shared start instant (offset 0), not when
+            # this process began waiting for them to be ready.
+            start_ms = monotonic_to_wall_ms(report.base_ts, now_ms)
             if gate is not None:
                 trunc_state, backlog_state = gate.summary(run.workers)
                 truncator = trunc_state if truncate_on_proxy_shed else None
@@ -1943,6 +1954,8 @@ def drive_cell_schedule(
             if prompt_store is not None:
                 prompt_store_misses = prompt_store.misses
     finally:
+        if runner is not None:
+            runner.close()  # no worker survives an error, whenever it happened
         if sender is not None:
             sender.close()
         if sidecar is not None:
@@ -2077,9 +2090,12 @@ def _raw_from_sender_record(cell_id: str, record: dict) -> dict:
         # What ttft_ms measures (tre_replayer.engine.stream.TTFT_BASIS).
         "ttft_basis": record.get("ttft_basis"),
         "stream_error": record.get("stream_error"),
+        # on_wire_delay_ms runs to the first byte on the wire, which is
+        # conn_acquire_ms after actual_send_ts_ms (the transport call).
         "scheduled_send_ts_ms": (
             None if on_wire is None
-            else round(float(record["actual_send_ts_ms"]) - float(on_wire), 3)
+            else round(float(record["actual_send_ts_ms"]) - float(on_wire)
+                       + float(record.get("conn_acquire_ms") or 0.0), 3)
         ),
         "on_wire_delay_ms": on_wire,
         "in_flight_at_send": record.get("in_flight_at_send"),

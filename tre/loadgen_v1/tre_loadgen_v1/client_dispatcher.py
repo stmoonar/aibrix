@@ -29,13 +29,25 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 
+#: The sending core this shell belongs with: the sibling package ``tre/replayer``.
+SIBLING_REPLAYER = Path(__file__).resolve().parents[2] / "replayer"
+
+
 def _ensure_replayer_importable() -> None:
     """``python3 -m tre_loadgen_v1`` is run with only ``tre/loadgen_v1`` on PYTHONPATH
-    (smoke/E1 run_arm.sh); the sending core is the sibling package ``tre/replayer``."""
+    (smoke/E1 run_arm.sh); the sending core is the sibling package ``tre/replayer``.
+    When some other ``tre_replayer`` is importable already, it is used - and said loudly,
+    because then the client is not the one this checkout ships."""
     try:
-        import tre_replayer  # noqa: F401
+        import tre_replayer
     except ImportError:
-        sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "replayer"))
+        sys.path.insert(0, str(SIBLING_REPLAYER))
+        return
+    found = Path(tre_replayer.__file__).resolve().parent.parent
+    if found != SIBLING_REPLAYER:
+        print(f"WARNING: tre_loadgen_v1 sends through tre_replayer from {found}, not the sibling "
+              f"{SIBLING_REPLAYER} (check PYTHONPATH); the run's provenance records which",
+              file=sys.stderr)
 
 
 _ensure_replayer_importable()
@@ -47,7 +59,7 @@ from tre_replayer.engine.http_sender import (  # noqa: E402
     StreamingHttpSender,
 )
 from tre_replayer.engine.metrics import summarize_v1_records  # noqa: E402
-from tre_replayer.engine.procpool import ProcessPoolRunner  # noqa: E402
+from tre_replayer.engine.procpool import ProcessPoolRunner, RunnerError  # noqa: E402
 from tre_replayer.engine.profiles import PROFILE_E1_V1, V1ChatOptions  # noqa: E402
 from tre_replayer.engine.schedule import ScheduledRequest  # noqa: E402
 
@@ -78,6 +90,13 @@ def scheduled_requests(traces: List[RequestTrace]) -> List[ScheduledRequest]:
                          prompt=t.prompt, max_output_tokens=getattr(t, "max_output_tokens", None))
         for t in traces
     ]
+
+
+def validate_request(request: ScheduledRequest) -> None:
+    """e1_v1 sends the trace's own prompt: a request without one is refused before any
+    worker starts (it would otherwise fail inside a worker, mid-run)."""
+    if not request.prompt:
+        raise ValueError(f"trace request {request.request_id} has no prompt; e1_v1 sends the trace's own text")
 
 
 def ordered_record(record: Dict[str, Any], phase_type: Optional[str]) -> Dict[str, Any]:
@@ -129,10 +148,20 @@ class ClientDispatcher:
         self.logger.info(f"开始调度 {len(requests)} 个请求；进程数 {self.process_count}；"
                          f"网关 {self.config.gateway_endpoint}")
         self.provenance = self.make_sender(0, None, None).provenance(processes=self.process_count)
-        runner = ProcessPoolRunner(requests, self.make_sender, processes=self.process_count)
-        run = runner.run()
-        self.workers = run.workers
-        records = [ordered_record(r, phase.get(r["request_id"])) for r in run.records]
+        failure: Optional[RunnerError] = None
+        # fork 之前在父进程校验：e1_v1 发送 trace 自带的 prompt，缺了就整体拒绝
+        with ProcessPoolRunner(requests, self.make_sender, processes=self.process_count,
+                               validate=validate_request) as runner:
+            try:
+                run = runner.run()
+                self.workers = run.workers
+                received = run.records
+            except RunnerError as exc:
+                # 运行中途失败：已收到的记录照样落盘，再把失败抛给调用方（运行标记为失败）
+                failure = exc
+                self.workers = exc.workers
+                received = exc.records
+        records = [ordered_record(r, phase.get(r["request_id"])) for r in received]
         missing = len(requests) - len(records)
         if missing:
             self.logger.warning(f"{missing} 个请求没有结果记录")
@@ -142,6 +171,9 @@ class ClientDispatcher:
             for record in records:
                 fh.write(json.dumps(record) + "\n")
         self.logger.info(f"性能指标已写入: {metrics_file}")
+        if failure is not None:
+            self.logger.error(f"发送中途失败，已写入 {len(records)}/{len(requests)} 条记录: {failure}")
+            raise failure
         summary = summarize_v1_records(records)
         self.logger.info("汇总: " + json.dumps({k: v for k, v in summary.items() if k != "bases"}, ensure_ascii=False))
         self._plots(metrics_file, records)

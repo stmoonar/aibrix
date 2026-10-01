@@ -351,22 +351,57 @@ class StreamingHttpSender:
         )
 
     async def __call__(self, request: ScheduledRequest, scheduled_ts: float, actual_ts: float) -> None:
-        if self._e1:
-            record = await self._send_e1(request, scheduled_ts, actual_ts)
-        else:
-            record = await self._send_fixed(request, scheduled_ts, actual_ts)
+        try:
+            if self._e1:
+                record = await self._send_e1(request, scheduled_ts, actual_ts)
+            else:
+                record = await self._send_fixed(request, scheduled_ts, actual_ts)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - a client fault is this request's record, now
+            # Before this, one request's exception surfaced only when the whole schedule
+            # had been sent, and took every record of the run with it.
+            record = self._client_error_record(request, scheduled_ts, actual_ts, exc)
         self.records.append(record)
         if self._on_record is not None:
             self._on_record(record)
 
-    def _lateness(self, scheduled_ts: float, actual_ts: float, pickup_ts: float, wire_ts: float) -> dict:
+    def _client_error_record(self, request: ScheduledRequest, scheduled_ts: float, actual_ts: float,
+                             exc: BaseException) -> dict[str, Any]:
+        """A failed request whose failure is the client's own (never sent or never read)."""
+        now = self._mono()
+        text = f"client error: {type(exc).__name__}: {exc}"
+        res = StreamResult(0, None, None, error=text, start_epoch_s=time.time(), v1_success=False,
+                           v1_error=text, v1_done_ms=0.0, v1_target_pod="", attempts=0)
+        lateness = self._lateness(scheduled_ts, actual_ts, now, now)
+        if self._e1:
+            record = e1_record(request, res, process_id=self.process_id, lateness=lateness, in_flight_at_send=0)
+        else:
+            out_tokens = request.max_output_tokens or self._out
+            record = {
+                "request_id": request.request_id, "model": request.model,
+                "scheduled_offset_ms": int(scheduled_ts * 1000),
+                "scheduled_offset_s": float(request.scheduled_offset_s),
+                "actual_send_ts_ms": self._now(), **lateness,
+                "input_tokens": request.prompt_tokens or self._in, "output_tokens": out_tokens,
+                **result_fields(res), "request_timeout_s": fixed_length_timeout_s(out_tokens),
+                "in_flight_at_send": 0, "api": self._api,
+            }
+        record["client_error"] = text
+        return record
+
+    def _lateness(self, scheduled_ts: float, actual_ts: float, pickup_ts: float, wire_ts: float,
+                  acquire_ms: float = 0.0) -> dict:
+        """``acquire_ms`` (the transport's wait for a connection - pool slot, TCP connect,
+        a repeated first attempt) is inside the send lateness: it is the time between the
+        transport call and the first byte on the wire. It is counted as pool wait."""
         return {
             "schedule_delay_ms": max(0.0, (actual_ts - scheduled_ts) * 1000.0),
-            "pool_wait_ms": round(max(0.0, (pickup_ts - actual_ts) * 1000.0), 3),
+            "pool_wait_ms": round(max(0.0, (pickup_ts - actual_ts) * 1000.0) + acquire_ms, 3),
             "body_build_ms": round(max(0.0, (wire_ts - pickup_ts) * 1000.0), 3),
-            # Scheduled instant -> socket call. The guard's deadline; see the module
-            # docstring for why the three segments above are not it.
-            "on_wire_delay_ms": round(max(0.0, (wire_ts - scheduled_ts) * 1000.0), 3),
+            # Scheduled instant -> first byte on the wire. The guard's deadline; see the
+            # module docstring for why the three segments above are not it.
+            "on_wire_delay_ms": round(max(0.0, (wire_ts - scheduled_ts) * 1000.0) + acquire_ms, 3),
         }
 
     async def _send_fixed(self, request: ScheduledRequest, scheduled_ts: float, actual_ts: float) -> dict[str, Any]:
@@ -410,7 +445,7 @@ class StreamingHttpSender:
                 res = await self._transport.send(self._url, headers, body, timeout_s)
         finally:
             self._in_flight.dec()
-        lateness = self._lateness(scheduled_ts, actual_ts, pickup_ts, wire_ts)
+        lateness = self._lateness(scheduled_ts, actual_ts, pickup_ts, wire_ts, res.conn_acquire_ms or 0.0)
         record = {
             "request_id": request.request_id,
             "model": request.model,
@@ -429,6 +464,11 @@ class StreamingHttpSender:
             "request_timeout_s": timeout_s,
             "in_flight_at_send": in_flight_at_send,
             "api": self._api,
+            # Connection evidence (None from a synthetic seam): see StreamResult.
+            "stream_complete": res.stream_complete,
+            "connection_reused": res.connection_reused,
+            "conn_acquire_ms": None if res.conn_acquire_ms is None else round(res.conn_acquire_ms, 3),
+            "transport_retries": res.transport_retries,
         }
         if self._dual:
             record.update(dual_fields_ms(res))

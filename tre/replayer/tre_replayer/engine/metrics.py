@@ -11,7 +11,7 @@ TTFT                      first chunk with ``delta.content`` not      first chun
                           None - the role-only chunk included         reasoning (``TTFT_BASIS``)
 TPOT                      (end - first) / completion_tokens           (E2E - TTFT) / (completion_tokens - 1)
 end                       end of the body (after ``[DONE]``)           the ``[DONE]`` line
-success                   any 2xx whose headers arrived: a stream      2xx, complete (``[DONE]`` or a finish
+success                   any 2xx whose headers arrived: a stream      2xx, not truncated (``[DONE]`` or a finish
                           cut mid-way, an in-stream error chunk and    reason), no in-stream error, >= 1
                           zero output are all successes               completion token
 missing TTFT              not counted (dropped from percentiles)       a violation (``ttft_missing_strict``)
@@ -54,7 +54,9 @@ def strict_failure(res: StreamResult) -> Optional[str]:
         return STRICT_FAILURE_TIMEOUT if res.timed_out else STRICT_FAILURE_TRANSPORT
     if res.stream_error is not None:
         return STRICT_FAILURE_STREAM_ERROR
-    if res.stream_interrupted or not (res.done_seen or res.finish_reason):
+    if res.stream_complete is False:
+        # The body ended without [DONE] or a finish reason: truncated. The calibration
+        # classifier (scripts.openloop.classify_failure) calls the same record unserved.
         return STRICT_FAILURE_INCOMPLETE
     if not res.completion_tokens or int(res.completion_tokens) < 1:
         return STRICT_FAILURE_ZERO_OUTPUT

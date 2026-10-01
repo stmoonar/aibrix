@@ -131,7 +131,7 @@ def test_strict_tpot_is_the_label_formula_and_v1_tpot_is_v1s() -> None:
     (dict(status=0, timed_out=True), metrics.STRICT_FAILURE_TIMEOUT),
     (dict(status=0), metrics.STRICT_FAILURE_TRANSPORT),
     (dict(stream_error="boom"), metrics.STRICT_FAILURE_STREAM_ERROR),
-    (dict(done_seen=False, finish_reason=None), metrics.STRICT_FAILURE_INCOMPLETE),
+    (dict(stream_complete=False), metrics.STRICT_FAILURE_INCOMPLETE),
     (dict(completion_tokens=0), metrics.STRICT_FAILURE_ZERO_OUTPUT),
 ])
 def test_what_v1_counted_as_success_the_strict_basis_fails(kw, failure) -> None:
@@ -221,12 +221,18 @@ class _Server:
                 if model == "slow":
                     time.sleep(0.4)
                 payload = _sse(ROLE, _tok("a"), _tok("b", "length"), USAGE) + b"data: [DONE]\n\n"
-                if model == "cut":
+                if model == "nodone":
+                    # a 200 body that just stops: no finish reason, no usage, no [DONE]
+                    payload = _sse(ROLE, _tok("a"))
+                if model == "cutcont":
+                    payload = _sse(ROLE, dict(_tok("a"), tre_continued=2), _tok("b")) + b"data: [DONE]\n\n"
+                if model in ("cut", "cutcont"):
                     self.send_response(200)
                     self.send_header("Content-Type", "text/event-stream")
                     self.send_header("Content-Length", str(len(payload) + 100))
                     self.end_headers()
-                    self.wfile.write(payload[:40])
+                    cut_at = 40 if model == "cut" else len(_sse(ROLE, dict(_tok("a"), tre_continued=2)))
+                    self.wfile.write(payload[:cut_at])
                     self.wfile.flush()
                     self.connection.shutdown(socket.SHUT_RDWR)
                     return

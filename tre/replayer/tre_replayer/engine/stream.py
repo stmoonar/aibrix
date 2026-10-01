@@ -161,6 +161,19 @@ class StreamResult:
     v1_finish_reason: str | None = None
     #: v1 read only the ``target-pod`` header ("" when the call failed before headers).
     v1_target_pod: str | None = None
+    # ---- connection evidence (httpx transport; None = not measured, e.g. a test seam) ----
+    #: A 2xx body ended normally: True when it carried ``[DONE]`` or a finish reason,
+    #: False when it just stopped (a truncated answer: a failure on both bases). None =
+    #: unknown (a synthetic result).
+    stream_complete: bool | None = None
+    #: The request went out on a kept-alive connection (no TCP connect for it).
+    connection_reused: bool | None = None
+    #: ms from the transport call to the request's first byte: waiting for a pool slot,
+    #: opening the connection, and a repeated first attempt - part of the send lateness.
+    conn_acquire_ms: float | None = None
+    #: Attempts repeated by the transport because not one byte of the request had left
+    #: (0 or 1); never a request the server could have seen.
+    transport_retries: int = 0
 
 
 def _positive_int(value: Any) -> int | None:

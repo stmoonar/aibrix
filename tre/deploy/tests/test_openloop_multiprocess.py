@@ -121,3 +121,35 @@ def test_the_backlog_ceiling_holds_across_processes(make_server) -> None:
     )
     assert guard.truncated and guard.truncation_cause == openloop.TRUNCATION_BACKLOG
     assert guard.backlog_limit == 5 and guard.sent == 5 and guard.sent + guard.censored == guard.scheduled
+
+
+def test_the_cell_starts_at_the_workers_start_instant(make_server) -> None:
+    """start_ms is offset 0 of the schedule (the workers' shared start), not the moment
+    this process began waiting for them - which used to put it ~0.3 s early."""
+    server = make_server()
+    records: list = []
+    start_ms, _, _ = openloop.drive_cell_schedule(
+        server.url, "m", "c4", _segments(rps=20.0, end_s=1.0), sender_processes=2, prompt_mode="text",
+        records_out=records,
+    )
+    implied = sorted(
+        r["actual_send_ts_ms"] + (r.get("conn_acquire_ms") or 0.0) - r["on_wire_delay_ms"]
+        - r["scheduled_offset_s"] * 1000.0
+        for r in records
+    )
+    assert abs(implied[len(implied) // 2] - start_ms) < 20.0
+
+
+def test_a_truncated_200_is_unserved_and_old_rows_are_judged_as_before() -> None:
+    base = {"http_status": 200, "e2e_ms": 40.0, "ttft_ms": 10.0, "completion_tokens": 3}
+    assert openloop.classify_failure(dict(base, stream_complete=False)) == openloop.FAILURE_MODEL
+    assert openloop.classify_failure(dict(base, stream_complete=True)) == openloop.FAILURE_NONE
+    assert openloop.classify_failure(dict(base)) == openloop.FAILURE_NONE  # written before the field
+
+
+def test_the_raw_scheduled_instant_allows_for_the_connection_wait() -> None:
+    record = {"request_id": "r", "actual_send_ts_ms": 10_000, "on_wire_delay_ms": 7.0, "conn_acquire_ms": 5.0,
+              "http_status": 200, "ttft_ms": 1.0, "e2e_ms": 2.0, "completion_tokens": 2, "prompt_tokens": 4}
+    raw = openloop._raw_from_sender_record("c", record)
+    # transport call at 10 000, first byte 5 ms later, 7 ms after the scheduled instant
+    assert raw["scheduled_send_ts_ms"] == 9_998.0

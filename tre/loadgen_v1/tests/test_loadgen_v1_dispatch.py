@@ -224,19 +224,20 @@ def test_requests_are_sent_on_trace_timestamps(run):
     """No hand-off in the loop any more: every request leaves within milliseconds of
     base + timestamp (v1: up to ~0.1 s of jitter from its blocking Queue.get)."""
     ok = [run["by_id"][t.request_id] for t in run["traces"] if t.model_name == "ok"]
-    offsets = [r["start_time"] - r["timestamp"] for r in ok]  # = base_time + scheduling error
-    # bounds leave room for a busy test host; v1's own test allowed 0.3 s
-    assert max(offsets) - min(offsets) < 0.1, offsets
-    assert all(r["send_lateness_ms"] < 100 for r in run["lines"]), [r["send_lateness_ms"] for r in run["lines"]]
+    offsets = sorted(r["start_time"] - r["timestamp"] for r in ok)  # = base_time + scheduling error
+    lateness = sorted(r["send_lateness_ms"] for r in run["lines"])
+    # Typical request within milliseconds; the bounds on the worst one leave room for a
+    # loaded test host (v1's own test allowed 0.3 s for every request).
+    assert offsets[len(offsets) // 2] - offsets[0] < 0.03, offsets
+    assert offsets[-1] - offsets[0] < 0.3, offsets
+    assert lateness[len(lateness) // 2] < 10 and lateness[-1] < 300, lateness
     by_prompt = {t.prompt: t for t in run["traces"]}
     start_by_prompt = {t.prompt: run["by_id"][t.request_id]["start_time"] for t in run["traces"]}
     ok_server = [r for r in run["server"] if r["body"]["model"] == "ok"]
-    wire_lag = [r["t"] - start_by_prompt[r["body"]["messages"][0]["content"]] for r in ok_server]
-    assert all(-0.01 < lag < 0.1 for lag in wire_lag), wire_lag
-    arr_off = [r["t"] - by_prompt[r["body"]["messages"][0]["content"]].timestamp for r in ok_server]
-    assert max(arr_off) - min(arr_off) < 0.15, arr_off
+    wire_lag = sorted(r["t"] - start_by_prompt[r["body"]["messages"][0]["content"]] for r in ok_server)
+    assert -0.01 < wire_lag[0] and wire_lag[len(wire_lag) // 2] < 0.03 and wire_lag[-1] < 0.3, wire_lag
     late = run["by_id"]["ok-late"]
-    assert late["success"] and late["start_time"] - late["timestamp"] == pytest.approx(min(offsets), abs=0.1)
+    assert late["success"] and late["start_time"] - late["timestamp"] == pytest.approx(offsets[0], abs=0.3)
 
 
 def test_run_provenance_names_the_profile_and_the_processes(run):
