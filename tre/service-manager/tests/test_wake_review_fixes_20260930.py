@@ -374,6 +374,9 @@ def _placeholder_world(**pod_overrides):
     with fence(world.redis):
         world.leases.acquire(Binding("tp2-new", "tp2", Slot("node-a", (0, 1)), awake=False), phase="starting")
     world.vllm.physical_override["10.0.0.9"] = None  # not listening (crash-looping / loading)
+    # These cases exercise the release rule itself (Running-only snapshots, no
+    # startup_pod_states); the minimum hold of 2026-10-01 is covered separately.
+    world.service._placeholder_min_hold_s = 0.0
     return world
 
 

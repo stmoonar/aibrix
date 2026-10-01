@@ -207,6 +207,15 @@ def create_app() -> FastAPI:
         sleep_journal=SleepJournal(redis_client),
         wake_journal=wake_journal,
         restart_ledger=RestartLedger(redis_client),
+        # 2026-10-01: a startup placeholder is held at least this long and released
+        # only for these engine waiting reasons (comma list; default in
+        # tre_sm.api.v2.PLACEHOLDER_RELEASE_REASONS).
+        placeholder_min_hold_s=float(os.environ.get("TRE_SM_PLACEHOLDER_MIN_HOLD_S", "120")),
+        placeholder_release_reasons=(
+            [item.strip() for item in os.environ["TRE_SM_PLACEHOLDER_RELEASE_REASONS"].split(",") if item.strip()]
+            if os.environ.get("TRE_SM_PLACEHOLDER_RELEASE_REASONS", "").strip()
+            else None
+        ),
         restored_placeholders=[
             (b.binding_id, b.slot.node, tuple(b.slot.gpu_ids), b.serve_id) for b in restart_placeholders
         ],

@@ -208,6 +208,8 @@ class ServiceManagerV2:
         restart_ledger: RestartLedger | None = None,
         restored_placeholders: list[tuple[str, str, tuple[int, ...], str]] | None = None,
         restored_suspects: list[tuple[str, str, tuple[int, ...], str]] | None = None,
+        placeholder_min_hold_s: float = 120.0,
+        placeholder_release_reasons=None,
     ) -> None:
         self._registry = registry
         # Registry placement policy shared with the controller planner (design
@@ -295,6 +297,15 @@ class ServiceManagerV2:
         self._suspects: dict[str, tuple[str, tuple[int, ...], str]] = {}
         #: Placeholders already alerted for exceeding placeholder_max_s.
         self._placeholder_alerted: set[str] = set()
+        #: A placeholder is never released before this SM has seen it this long
+        #: (second guard against releasing a Pod that is still starting; env
+        #: TRE_SM_PLACEHOLDER_MIN_HOLD_S).
+        self._placeholder_min_hold_s = max(0.0, float(placeholder_min_hold_s))
+        #: Waiting reasons of the engine container that mean "not running, holds
+        #: no GPU memory" (env TRE_SM_PLACEHOLDER_RELEASE_REASONS, comma list).
+        self._placeholder_release_reasons = frozenset(
+            PLACEHOLDER_RELEASE_REASONS if placeholder_release_reasons is None else placeholder_release_reasons
+        )
         #: P1-4: binding ids holding a restart placeholder (starting lease) that the
         #: restart guard converges.
         self._restart_placeholders: dict[str, str] = {}
@@ -3566,6 +3577,8 @@ class ServiceManagerV2:
             first, _restarts_then = self._placeholder_seen.setdefault(
                 lease.binding_id, (now, restarts.get(lease.binding_id, 0))
             )
+            if now - first < self._placeholder_min_hold_s:
+                continue  # 2026-10-01: never right after the placeholder appeared
             verdict = self._placeholder_verdict(placeholder(lease))
             if verdict is None:
                 releasable.append(lease)
@@ -3857,7 +3870,21 @@ class ServiceManagerV2:
         return True
 
     def _placeholder_verdict(self, binding: Binding) -> str | None:
-        """None = the placeholder may be released; else why it is kept."""
+        """None = the placeholder may be released; else why it is kept.
+
+        2026-10-01 (deployment finding): a Pod admitted at its startup gate is
+        still initialising (phase Pending, the gate init container running, the
+        engine container Waiting PodInitializing / ContainerCreating) and is NOT
+        in the Running-only Pod snapshots - it must never count as "gone" nor as
+        "not holding GPU memory". With the runtime's ``startup_pod_states`` (every
+        phase) a placeholder is releasable only when every Pod of the binding has
+        finished initialising and its engine container is terminated, or waiting
+        with a reason in the release set (CrashLoopBackOff, Error, image pull /
+        create errors), and /is_sleeping does not read awake. No Pod at all keeps
+        it too (the orphan starting-lease reaper owns that case)."""
+        lister = getattr(self._runtime_ops, "startup_pod_states", None)
+        if callable(lister):
+            return self._placeholder_verdict_from_states(binding, lister)
         pods = []
         try:
             for snapshot in self._runtime_ops.list_pod_snapshots(model=binding.model):
@@ -3880,6 +3907,44 @@ class ServiceManagerV2:
             if getattr(snapshot, "engine_running", None) is not False:
                 # Running (loading) or unknown: it may hold GPU memory (review P2-3).
                 return "engine_running"
+        if not pods:
+            return "no_running_pod"  # may be initialising (Pending): keep
+        return None
+
+    def _placeholder_verdict_from_states(self, binding: Binding, lister) -> str | None:
+        try:
+            states = [
+                state for state in lister(model=binding.model)
+                if state.get("binding_id") == binding.binding_id
+            ]
+        except Exception:  # noqa: BLE001 - cannot tell: keep it
+            return "pods_unreadable"
+        if not states:
+            return "no_pod"
+        for state in states:
+            if not state.get("init_done"):
+                return "initializing"
+            if state.get("ready"):
+                return "pod_ready"
+            engine = state.get("engine_state")
+            if engine == "running":
+                if state.get("pod_ip") and self._vllm_ops is not None:
+                    try:
+                        if self._vllm_ops.is_sleeping(state["pod_ip"], port=8000) is False:
+                            return "pod_awake"
+                    except Exception:  # noqa: BLE001
+                        pass
+                return "engine_running"
+            if engine == "waiting" and state.get("engine_reason") not in self._placeholder_release_reasons:
+                return "engine_starting"
+            if engine not in ("waiting", "terminated"):
+                return "engine_unknown"
+            if state.get("pod_ip") and self._vllm_ops is not None:
+                try:
+                    if self._vllm_ops.is_sleeping(state["pod_ip"], port=8000) is False:
+                        return "pod_awake"
+                except Exception:  # noqa: BLE001 - unreadable: not serving
+                    pass
         return None
 
     def _forget_wake(self, binding_id: str) -> None:
@@ -5684,6 +5749,14 @@ class ServiceManagerV2:
 ADMISSION_WORKERS = 4
 ADMISSION_SYNC_WAIT_S = 5.0
 ADMISSION_RESULT_TTL_S = 600.0
+
+#: Waiting reasons of the engine container under which a startup placeholder may
+#: be released (the engine is not running and holds no GPU memory). Anything else
+#: - PodInitializing, ContainerCreating, an unknown reason - keeps it.
+PLACEHOLDER_RELEASE_REASONS = (
+    "CrashLoopBackOff", "Error", "ImagePullBackOff", "ErrImagePull",
+    "CreateContainerError", "CreateContainerConfigError",
+)
 
 #: Wakes of one request run their /wake_up + /is_sleeping concurrently on this
 #: many threads (S6); different GPUs only - one binding per GPU is ever waking.

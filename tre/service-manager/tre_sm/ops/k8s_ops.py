@@ -232,6 +232,41 @@ class K8sOps:
             ready=_pod_ready(pod),
         )
 
+    def startup_pod_states(self, *, model: str | None = None) -> list[dict]:
+        """Every managed model Pod of ``model`` in ANY phase (Pending ones too:
+        a Pod admitted at its startup gate is still initialising) with what the
+        placeholder reaper needs to tell whether its engine may hold GPU memory:
+        ``binding_id``, ``phase``, ``deleting``, ``init_done`` (every init container
+        but the native sidecars finished with exit 0, and the Pod is past Pending),
+        ``engine_state`` (running / waiting / terminated / None) and
+        ``engine_reason`` of the ``vllm-openai`` container, ``ready``, ``pod_ip``."""
+        selector = f"{MANAGED_LABEL}=true" if model is None else f"{MANAGED_LABEL}=true,{MODEL_LABEL}={model}"
+        pods = _items(self._api.list_namespaced_pod(namespace=self._namespace, label_selector=selector))
+        states: list[dict] = []
+        for pod in pods:
+            status = _status(pod)
+            if status.get("phase") in {"Succeeded", "Failed"}:
+                continue
+            try:
+                record = self._startup_record_from_pod(pod)
+            except (KeyError, ValueError):
+                continue
+            engine_state, engine_reason = _engine_state(pod)
+            states.append(
+                {
+                    "name": record.name,
+                    "binding_id": record.binding_id,
+                    "phase": record.phase,
+                    "deleting": bool(_optional_field(_metadata(pod), "deletionTimestamp", "deletion_timestamp")),
+                    "init_done": _init_done(pod),
+                    "engine_state": engine_state,
+                    "engine_reason": engine_reason,
+                    "ready": record.ready,
+                    "pod_ip": record.pod_ip,
+                }
+            )
+        return states
+
     def startup_owner_problem(self, pod_name: str, pod_uid: str) -> str | None:
         """Why the Pod ``pod_name`` / ``pod_uid`` must not be admitted, or None
         (B11). A model Pod is admitted only while its whole owner chain is live:
@@ -729,6 +764,56 @@ def _engine_running(pod) -> bool | None:
             return False
         return None
     return None
+
+
+def _engine_state(pod) -> tuple[str | None, str | None]:
+    """(running | waiting | terminated | None, reason) of the engine container."""
+    statuses = _optional_field(_status(pod), "containerStatuses", "container_statuses") or []
+    for item in statuses:
+        if _optional_field(item, "name", "name") != ENGINE_CONTAINER:
+            continue
+        state = _optional_field(item, "state", "state") or {}
+        for kind in ("running", "waiting", "terminated"):
+            detail = _optional_field(state, kind, kind)
+            if detail:
+                reason = _optional_field(detail, "reason", "reason") if isinstance(detail, dict) else None
+                return kind, (str(reason) if reason else None)
+        return None, None
+    return None, None
+
+
+def _init_done(pod) -> bool:
+    """The Pod finished initialising: not Pending, and every init container that
+    is not a native sidecar (``restartPolicy: Always``) terminated with exit 0. A
+    Pod whose startup gate is still running (or that has no init status yet) is
+    not done."""
+    status = _status(pod)
+    if status.get("phase") == "Pending":
+        return False
+    sidecars = {
+        _optional_field(item, "name", "name")
+        for item in (_optional_field(_spec(pod), "initContainers", "init_containers") or [])
+        if _optional_field(item, "restartPolicy", "restart_policy") == "Always"
+    }
+    specs = [
+        _optional_field(item, "name", "name")
+        for item in (_optional_field(_spec(pod), "initContainers", "init_containers") or [])
+    ]
+    statuses = {
+        _optional_field(item, "name", "name"): item
+        for item in (_optional_field(status, "initContainerStatuses", "init_container_statuses") or [])
+    }
+    for name in specs:
+        if name in sidecars:
+            continue
+        item = statuses.get(name)
+        if item is None:
+            return False
+        state = _optional_field(item, "state", "state") or {}
+        terminated = _optional_field(state, "terminated", "terminated")
+        if not terminated or int(_optional_field(terminated, "exitCode", "exit_code") or 0) != 0:
+            return False
+    return True
 
 
 def _pod_restart_count(pod) -> int:
