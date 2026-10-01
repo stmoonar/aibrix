@@ -57,7 +57,7 @@ func TestStableWindow_Invalid(t *testing.T) {
 	}
 }
 
-// The annotation set used by the TRE APA baseline CRs: every key must take effect by name.
+// Every key the APA baseline CRs use takes effect by name (CR values: apa_baseline_crs_test.go).
 func TestAPABaselineAnnotationsTakeEffect(t *testing.T) {
 	ctx := NewBaseScalingContext()
 	require.NoError(t, ctx.UpdateByPaTypes(paWithAnnotations(map[string]string{

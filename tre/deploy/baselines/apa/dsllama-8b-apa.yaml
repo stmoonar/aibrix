@@ -14,8 +14,9 @@ metadata:
     tre.aibrix.io/baseline: apa
     model.aibrix.ai/name: dsllama-8b
   annotations:
-    autoscaling.aibrix.ai/scale-up-tolerance: '0.1'
-    autoscaling.aibrix.ai/scale-down-tolerance: '0.2'
+    autoscaling.aibrix.ai/scale-up-tolerance: '0.2'
+    autoscaling.aibrix.ai/scale-down-tolerance: '0.8'
+    autoscaling.aibrix.ai/scale-down-cooldown-window: 0s
     apa.autoscaling.aibrix.ai/window: 20s
 spec:
   scalingStrategy: APA

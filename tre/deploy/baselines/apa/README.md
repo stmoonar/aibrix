@@ -81,16 +81,27 @@ new one.
 The v2 controller only applies annotation keys it has a parser for
 (`pkg/controller/podautoscaler/context/context.go` `annotationParsers`); any other
 `autoscaling.aibrix.ai/`, `apa.autoscaling.aibrix.ai/` or `kpa.autoscaling.aibrix.ai/` key is
-ignored and logged as `Ignoring unrecognized autoscaling annotation`. The CRs use:
+ignored and logged as `Ignoring unrecognized autoscaling annotation`. The values follow the
+v1 APA configuration, `/root/aibrix-main/config_tre/autoscaler_hot/<model>_APA.yaml` (same values in `config_tre/autoscaler/`):
 
-| Key | Value | Notes |
-| --- | --- | --- |
-| `autoscaling.aibrix.ai/scale-up-tolerance` | `0.1` | AIBrix v0.4 name was `apa.autoscaling.aibrix.ai/up-fluctuation-tolerance` |
-| `autoscaling.aibrix.ai/scale-down-tolerance` | `0.2` | v0.4 name: `apa.autoscaling.aibrix.ai/down-fluctuation-tolerance` |
-| `apa.autoscaling.aibrix.ai/window` | `20s` | stable metric window, per PodAutoscaler; APA only, at least 1 s; default 180 s |
+| Key | Value | v1 annotation (value) | Notes |
+| --- | --- | --- | --- |
+| `autoscaling.aibrix.ai/scale-up-tolerance` | `0.2` | `autoscaling.aibrix.ai/up-fluctuation-tolerance` (`0.2`) | scale up when usage > target x 1.2 |
+| `autoscaling.aibrix.ai/scale-down-tolerance` | `0.8` | `autoscaling.aibrix.ai/down-fluctuation-tolerance` (`0.8`) | scale down when usage < target x 0.2 |
+| `autoscaling.aibrix.ai/scale-down-cooldown-window` | `0s` | none (v1 APA has no cooldown) | v2 default is 300 s |
+| `apa.autoscaling.aibrix.ai/window` | `20s` | `apa.autoscaling.aibrix.ai/window` (`20s`) | stable metric window, per PodAutoscaler; APA only, at least 1 s; default 180 s |
 
-Not set, so the controller defaults apply: `autoscaling.aibrix.ai/max-scale-up-rate` 2,
-`max-scale-down-rate` 2, `scale-up-cooldown-window` 0 s, `scale-down-cooldown-window` 300 s.
+Not set, so the controller defaults apply, equal to v1: `autoscaling.aibrix.ai/max-scale-up-rate` 2,
+`max-scale-down-rate` 2 (v1 files: `apa.autoscaling.aibrix.ai/max-scale-{up,down}-rate: '2.0'`),
+`scale-up-cooldown-window` 0 s. `minReplicas` 1 / `maxReplicas` 4 and `targetValue` 0.5 are
+as in the v1 `autoscaler_hot` files (v1 metric name `gpu_cache_usage_perc`, renamed
+`kv_cache_usage_perc` in vLLM 0.11+).
+
+Note on the v1 tolerance keys: the v1 controller (`pkg/controller/podautoscaler/scaler/apa.go`
+in `/root/aibrix-main`) reads tolerances under the `apa.autoscaling.aibrix.ai/` prefix, so the
+v1 files' `autoscaling.aibrix.ai/{up,down}-fluctuation-tolerance` keys were not parsed and the
+v1 run used its defaults, up 0.1 / down 0.2. The CRs here follow the values written in the v1
+files (owner decision 2026-10-01).
 The window keeps one sample per second bucket (a later sample in the same second overwrites)
 and averages the buckets of the last 20 s with equal weight. The sample count is not fixed:
 besides the 10 s resync (`DefaultResyncInterval`), the controller watches PodAutoscaler

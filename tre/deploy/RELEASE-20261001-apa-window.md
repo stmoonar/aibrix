@@ -14,17 +14,28 @@ Branch `feat/apa-window-20261001` from 7994da76, source commit 772415f8 (94a0d82
   (`pkg/controller/podautoscaler/metrics/client.go`); the CR annotation
   `apa.autoscaling.aibrix.ai/window` had no reader. It is now read per PodAutoscaler
   (positive duration; absent = 180 s, unchanged).
-- The APA baseline CRs (`tre/deploy/baselines/apa/*-apa.yaml`): window `30s` -> `20s`;
-  tolerance keys renamed to the names the controller reads. Effective values:
+- The APA baseline CRs (`tre/deploy/baselines/apa/*-apa.yaml`) are aligned with the v1
+  APA configuration (owner decision 2026-10-01), using the keys the v2 controller reads.
+  v1 source: `/root/aibrix-main/config_tre/autoscaler_hot/<model>_APA.yaml` (same values in `config_tre/autoscaler/`). Effective values:
 
-  | | before (live) | after |
-  |---|---|---|
-  | stable window | 180 s (annotation ignored) | 20 s |
-  | scale-up tolerance | 0.1 (default; key ignored) | 0.1 |
-  | scale-down tolerance | 0.1 (default; key ignored) | **0.2** |
-  | max scale-up / down rate | 2 / 2 (default) | 2 / 2 (default) |
-  | scale-up / down cooldown | 0 s / 300 s (default) | 0 s / 300 s (default) |
-  | min / max replicas, target | 1 / 4, `kv_cache_usage_perc` 0.5 | unchanged |
+  | | before (live v2) | after | v1 file |
+  |---|---|---|---|
+  | stable window | 180 s (annotation ignored) | **20 s** | `apa.autoscaling.aibrix.ai/window: 20s` |
+  | scale-up tolerance | 0.1 (default; key ignored) | **0.2** | `autoscaling.aibrix.ai/up-fluctuation-tolerance: '0.2'` |
+  | scale-down tolerance | 0.1 (default; key ignored) | **0.8** | `autoscaling.aibrix.ai/down-fluctuation-tolerance: '0.8'` |
+  | max scale-up / down rate | 2 / 2 (default) | 2 / 2 (default) | `apa.autoscaling.aibrix.ai/max-scale-{up,down}-rate: '2.0'` |
+  | scale-up cooldown | 0 s (default) | 0 s (default) | none |
+  | scale-down cooldown | 300 s (default) | **0 s** (`scale-down-cooldown-window: 0s`) | none (v1 APA has no cooldown) |
+  | min / max replicas | 1 / 4 | 1 / 4 | `minReplicas: 1`, `maxReplicas: 4` (`autoscaler_hot`) |
+  | target | `kv_cache_usage_perc` 0.5 | unchanged | `gpu_cache_usage_perc` 0.5 (metric renamed in vLLM 0.11+) |
+
+  Caveat on the tolerances: the v1 controller reads them under the
+  `apa.autoscaling.aibrix.ai/` prefix (`/root/aibrix-main/pkg/controller/podautoscaler/scaler/apa.go`,
+  the same at the v1 image source 12c1107), so the v1 files' keys were not parsed and the v1
+  runs used the v1 defaults, up 0.1 / down 0.2. The CRs follow the values written in the v1
+  files; to reproduce v1's effective behaviour instead, set 0.1 / 0.2. The v1
+  `max-scale-*-rate` keys were likewise unparsed in v1 (it reads
+  `autoscaling.aibrix.ai/max-scale-*-rate`); its default was 2, so the result is the same.
 
 - The window annotation applies to `scalingStrategy: APA` only (other strategies keep
   180 s) and must be at least 1 s (the window buckets samples per second).
@@ -111,8 +122,9 @@ Run on the control-plane node. `NS=aibrix-system`, `D=aibrix-controller-manager`
    canary (step 5) or briefly apply the CRs on an idle cluster in `observe observe`:
    ```bash
    kubectl -n $NS logs deploy/$D --since=2m | grep "Effective autoscaling config"
-   # expect per PA: stableWindow="20s" upTolerance=0.1 downTolerance=0.2 maxScaleUpRate=2
-   #                scaleDownCooldown="5m0s" minReplicas=1 maxReplicas=4
+   # expect per PA: stableWindow="20s" upTolerance=0.2 downTolerance=0.8 maxScaleUpRate=2
+   #                maxScaleDownRate=2 scaleUpCooldown="0s" scaleDownCooldown="0s"
+   #                minReplicas=1 maxReplicas=4
    kubectl -n $NS logs deploy/$D --since=2m | grep "Ignoring unrecognized autoscaling annotation"
    # expect nothing
    ```
@@ -130,8 +142,9 @@ Run on the control-plane node. `NS=aibrix-system`, `D=aibrix-controller-manager`
    ```
    Expect: `AbleToScale=True` x3; on the 8b KV-heavy load the first 1 -> 2 decision
    (`desiredScale>1`, then the service-manager wake) about 20-30 s after the load starts,
-   down from about 65 s with the 180 s window; after the load the scale-down still waits
-   for the 300 s cooldown and is now gated by the 0.2 down tolerance. Keep the canary's
+   down from about 65 s with the 180 s window (scale-up now needs usage above 0.6 instead of
+   0.55); after the load, scale-down starts once the 20 s average falls below 0.1, with no
+   cooldown, instead of waiting 300 s. Keep the canary's
    `aibrix-controller-manager.log` and `apa_crs_after.yaml` as evidence, and check that it
    shows `stableWindow="20s"`.
 6. Rollback (any failure in 2-5): `$B/rollback.sh` (sets the immutable tag above); confirm
@@ -148,17 +161,12 @@ Run on the control-plane node. `NS=aibrix-system`, `D=aibrix-controller-manager`
 - When no pod's metric can be scraped, `ProcessSnapshot` returns the error and the window
   keeps its previous values; APA keeps deciding on those values until scraping recovers.
 
-## Open points for the owner (differences from v1, not changed here)
+## Open points for the owner
 
-| | v1 (AIBrix 0.4 config) | v2 after this release |
-|---|---|---|
-| window | 20 s | 20 s |
-| up / down tolerance | 0.2 / 0.8 | 0.1 / 0.2 |
-| max scale-up rate | 2 | 2 (default) |
-| min / max replicas | 1 / 4 | 1 / 4 |
-| target | `gpu_cache_usage_perc` 0.5 | `kv_cache_usage_perc` 0.5 (renamed metric) |
-| scale-down cooldown | none | 300 s (default; `autoscaling.aibrix.ai/scale-down-cooldown-window` would set it) |
+- Tolerances: the CRs use the v1 file values 0.2 / 0.8; v1's effective values were its
+  defaults 0.1 / 0.2 (see the caveat above). Switching is a CR annotation edit only.
+- The event-driven chaining described above has no v1 counterpart checked here.
 
-Aligning the remaining rows means editing the CR annotations only
-(`scale-up-tolerance`, `scale-down-tolerance`, `scale-down-cooldown-window: 0s`); no
-image change is needed.
+`pkg/controller/podautoscaler/apa_baseline_crs_test.go` loads the three CRs, checks the
+parsed values and the `Effective autoscaling config` log line; it must be updated with any
+change to these annotations.
