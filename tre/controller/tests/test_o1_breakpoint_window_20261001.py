@@ -385,18 +385,19 @@ def test_queue_stamps_routable_changes_when_the_sm_call_returns():
     assert queue.routable_changes() == {}
     now["ms"] = 104_000
     asyncio.run(queue._timed_dispatch(UnhideAction("m", ("m-1",), "rollback", "safescale"), "m"))
-    assert queue.routable_changes() == {"m": 104_000}
+    assert queue.routable_changes() == {"m": (104_000, 1)}
     now["ms"] = 109_000
     asyncio.run(queue._timed_dispatch(HideAction("m", ("m-1",), "probe", "safescale"), "m"))
-    assert queue.routable_changes() == {"m": 109_000}
+    assert queue.routable_changes() == {"m": (109_000, -1)}
     now["ms"] = 111_000  # a failed (possibly partial) wake is stamped too
     asyncio.run(queue._timed_dispatch(ScaleAction("m", 1, "rescue", "rescue"), "m"))
-    assert queue.routable_changes() == {"m": 111_000}
+    assert queue.routable_changes() == {"m": (111_000, 1)}
     # Invariant: the view showing the new count (fetched 112 s, previous 101 s) dates
     # the change at the last return (+ margin), never at the 100 s planning stamp.
     state = SignalState(breakpoint=O1)
     state.note_routable("m", 1, observed_ms=101_000)
     observed, hints = breakpoint_observation(_view(3, fetched_ms=112_000), queue, "m", 0)
+    assert hints == ((111_000, 1),)
     assert state.note_routable("m", 3, observed_ms=observed, done_hints=hints) == 112_000
 
 
@@ -620,7 +621,9 @@ def test_safescale_observation_uses_the_planner_signal_under_o1():
 def test_shipped_registry_enables_o1_with_the_default_evidence():
     scaling = load_registry().scaling()
     assert scaling.breakpoint_window is True and scaling.onset_warmup_guard is False
-    assert scaling.min_evidence_grids == 2 and scaling.min_evidence_requests == 0
+    assert scaling.min_evidence_grids == 2 and scaling.min_evidence_requests == 3
+    assert scaling.breakpoint_partial_max_step == 1 and scaling.breakpoint_hold_max_windows == 6
+    assert scaling.gateway_clock_tolerance_ms == 2000 and scaling.gateway_clock_check_s == 60
     assert json.dumps(sorted(ScalingRegistryConfig.__dataclass_fields__))  # serialisable names
     assert math.isfinite(BreakpointWindowConfig().grid_ms)
 
@@ -641,3 +644,173 @@ def test_freeze_snapshot_freezes_the_suffix_pods():
     assert all(isinstance(item.per_pod, MappingProxyType) for item in frozen.suffix_windows)
     with pytest.raises(TypeError):
         frozen.suffix_windows[0].per_pod["b"] = pod
+
+
+
+# ===================================================== review round 2 (2026-10-01)
+
+
+def test_partial_window_needs_three_completed_requests_by_default():
+    """P2-1: tokens count at completion - one short request done in 20 s is no evidence."""
+    state = SignalState(breakpoint=BreakpointWindowConfig(grid_ms=GRID))
+    state.observe_traffic("m", has_traffic=True, window_start_ms=0, window_end_ms=30_000)
+    thin = state.effective_window("m", _window(50_000, [IDLE, (64.0, 3.0, 0.0, 1.0), (0.0, 3.0, 0.0, 0.0)]))
+    assert thin.grids == 2 and not thin.warm and thin.reason == "evidence_requests"
+    assert state.effective_window("m", _window(50_000, [IDLE, TRICKLE, TRICKLE])).warm
+
+
+def _c1_plan(full: bool | None, *, step: int = 1, z: float = 0.05):
+    cfg = PlanConfig(min_replicas_per_model=1, max_replicas_per_model=8, rescue_max_step_ratio=2.0,
+                     rescue_max_step_pods=4, partial_window_max_step=step)
+    ctx = {"assigned_replicas": 1, "routable_pods": 1, "awake_replicas": 1, "signal_warm": True}
+    if full is not None:
+        ctx["signal_full_window"] = full
+    return build_plan(model_contexts={"m": ctx}, classifications=[_cls("m", ModelState.CRITICAL, z)],
+                      model_replicas={"m": 1}, idle_gpus=6, cfg=cfg)
+
+
+def test_c1_step_is_capped_on_a_partial_window_only():
+    """P2-1: +1 on a partial window, the whole deficit (here +4) on a whole one."""
+    partial = _c1_plan(False)
+    assert sum(a.delta for a in _ups(partial.actions)) == 1
+    assert any(e.startswith("rescue_partial_window_step:m:4->1") for e in partial.events)
+    assert sum(a.delta for a in _ups(_c1_plan(True).actions)) == 4
+    assert sum(a.delta for a in _ups(_c1_plan(None).actions)) == 4  # pre-O1 contexts
+    assert sum(a.delta for a in _ups(_c1_plan(False, step=0).actions)) == 4  # cap off
+    # Wired from the registry only with O1 on.
+    from tre_controller.loops.tick import _scaling_options
+
+    assert _scaling_options(_registry())["partial_window_max_step"] == 1
+    assert _scaling_options(_registry(breakpoint_window=False))["partial_window_max_step"] == 0
+
+
+def test_starving_receiver_falls_back_to_the_whole_window_after_hold_max_windows():
+    """P2-2: a routable count that changes every window holds the model forever; after
+    hold_max_windows held windows the receiver decides on the whole window, donors not."""
+    registry = _registry(10_000.0)
+    state = SignalState(warmup_ms=-1, breakpoint=replace(O1, hold_max_windows=4))
+    _prime_onset(state, 500_000)
+    seen = []
+    for k in range(8):
+        end = 1_000_000 + k * GRID
+        routable = 1 + k % 2  # flaps every window
+        ctx, events = _model_contexts(_snap(_window(end, [BURST] * 3, routable=routable)), registry,
+                                      signal_state=state, cluster_view=_view(routable, fetched_ms=end + 3_000),
+                                      queue=_Queue())
+        seen.append((ctx["m"], events))
+    held = [c["signal_warm"] for c, _ in seen]
+    assert held[0] is True and held[1:4] == [False, False, False]  # k=0: first observation
+    fallback = [i for i, (_c, ev) in enumerate(seen) if any(e.startswith("breakpoint_hold_fallback:m") for e in ev)]
+    assert fallback and seen[fallback[0]][0]["signal_warm"] is True
+    assert seen[fallback[0]][0]["signal_full_window"] is False  # donors still wait
+    assert seen[fallback[0]][0]["signal_hold_reason"] is None
+    # Not before the limit: no fallback in the first 4 held windows.
+    assert fallback[0] >= 4
+
+
+def test_hint_only_dates_a_change_in_its_own_direction():
+    state = SignalState(breakpoint=O1)
+    state.note_routable("m", 2, observed_ms=100_000)
+    # A hide returned at 105 s, but the count went UP (external wake): view time.
+    assert state.note_routable("m", 3, observed_ms=110_000, done_hints=((105_000, -1),)) == 111_000
+    assert state.note_routable("m", 2, observed_ms=120_000, done_hints=((115_000, -1),)) == 116_000
+    assert state.note_routable("m", 3, observed_ms=130_000, done_hints=(125_000,)) == 126_000  # unknown sign
+
+
+def test_gateway_clock_check_suspends_and_resumes_o1():
+    from tre_controller.gateway_clock import GatewayClockMonitor, evaluate_clock
+
+    assert evaluate_clock(100_000, 95_000, period_ms=GRID, tolerance_ms=2_000).ok
+    assert evaluate_clock(100_000, None, period_ms=GRID, tolerance_ms=2_000).ok
+    assert evaluate_clock(100_000, 110_000, period_ms=GRID, tolerance_ms=2_000).reason == "gateway_ahead"
+    assert evaluate_clock(100_000, 70_000, period_ms=GRID, tolerance_ms=2_000).reason == "gateway_behind_or_stalled"
+    assert evaluate_clock(100_000, 101_500, period_ms=GRID, tolerance_ms=2_000).ok
+
+    class _Redis:
+        def __init__(self):
+            self.newest = 0
+
+        def smembers(self, key):
+            return {b"default/pod-a"} if key.endswith(":m") else set()
+
+        def zrange(self, key, start, end, withscores=False):
+            return [(b"doc", float(self.newest))]
+
+    redis = _Redis()
+    now = {"ms": 1_000_000}
+    state = SignalState(warmup_ms=-1, breakpoint=O1)
+    monitor = GatewayClockMonitor(redis, ["m"], state, period_ms=GRID, tolerance_ms=2_000,
+                                  resume_after=2, clock_ms=lambda: now["ms"])
+    redis.newest = 1_000_000 + 160_000  # the gateway runs 160 s ahead (75 vs 76)
+    assert not monitor.check().ok and state.breakpoint_window_suspended == "gateway_clock:gateway_ahead"
+    # Suspended: whole windows, the onset guard, an event every tick.
+    state.observe_traffic("m", has_traffic=True, window_start_ms=1_000_000, window_end_ms=1_030_000)
+    assert state.effective_window("m", _window(1_040_000, [IDLE, BURST, BURST])).full
+    assert state.onset_guard_applies()
+    _ctx, events = _model_contexts(_snap(_window(1_040_000, [IDLE, BURST, BURST])), _registry(), signal_state=state)
+    assert "breakpoint_window_suspended:gateway_clock:gateway_ahead" in events
+    redis.newest = now["ms"] - 4_000
+    assert monitor.check().ok and state.breakpoint_window_suspended is not None  # 1 good check
+    assert monitor.check().ok and state.breakpoint_window_suspended is None  # resumed after 2
+    assert not state.onset_guard_applies()
+
+
+def test_gateway_clock_task_is_wired_only_with_o1_and_a_redis_store():
+    from types import SimpleNamespace
+
+    from tre_controller.app import _gateway_clock_monitor
+
+    deps = SimpleNamespace(signal_state=SignalState(breakpoint=O1), store=SimpleNamespace(redis_client=object()),
+                           registry=_registry())
+    assert _gateway_clock_monitor(deps, SimpleNamespace(instant_sample_interval_ms=GRID)) is not None
+    deps.registry = _registry(gateway_clock_check_s=0)
+    assert _gateway_clock_monitor(deps, SimpleNamespace()) is None
+    deps.registry = _registry()
+    deps.signal_state = SignalState()
+    assert _gateway_clock_monitor(deps, SimpleNamespace()) is None
+    deps.signal_state = SignalState(breakpoint=O1)
+    deps.store = SimpleNamespace()
+    assert _gateway_clock_monitor(deps, SimpleNamespace()) is None
+
+
+def test_held_receiver_event_names_the_hold_reason():
+    cfg = PlanConfig(min_replicas_per_model=1, max_replicas_per_model=4)
+    ctx = {"m": {"assigned_replicas": 1, "routable_pods": 1, "signal_warm": False,
+                 "signal_full_window": False, "signal_hold_reason": "evidence_grids"}}
+    plan = build_plan(model_contexts=ctx, classifications=[_cls("m", ModelState.CRITICAL, 0.5)],
+                      model_replicas={"m": 1}, idle_gpus=3, cfg=cfg)
+    assert "receiver_held_breakpoint_window:m:evidence_grids" in plan.events
+    assert not any(e.startswith("receiver_suppressed_signal_warmup") for e in plan.events)
+
+
+def test_store_full_window_bitwise_equal_with_suffixes_on_or_off():
+    import dataclasses
+
+    registry = load_registry(str(Path(__file__).resolve().parents[2] / "deploy" / "registry.yaml"))
+    redis = _store_fixture()
+    on = MetricsStore(redis, registry, instant_sample_interval_ms=GRID, suffix_period_ms=GRID)
+    off = MetricsStore(redis, registry, instant_sample_interval_ms=GRID)
+    a = on.read_model_window("dsqwen-7b", 10_000, 40_000, use_cache=False, start_exclusive=True)
+    b = off.read_model_window("dsqwen-7b", 10_000, 40_000, use_cache=False, start_exclusive=True)
+    for field in dataclasses.fields(a):
+        if field.name != "suffix_windows":
+            assert getattr(a, field.name) == getattr(b, field.name), field.name
+    for name in a.per_pod:
+        for field in dataclasses.fields(a.per_pod[name]):
+            assert getattr(a.per_pod[name], field.name) == getattr(b.per_pod[name], field.name), field.name
+
+
+def test_safescale_observation_in_fallback_mode_equals_legacy_bitwise():
+    from tre_controller.loops.safescale_task import _observation_from_metrics
+
+    registry = _registry(10_000.0)
+    legacy = SignalState(warmup_ms=-1)
+    off = SignalState(warmup_ms=-1, breakpoint=BreakpointWindowConfig(enabled=False, grid_ms=GRID))
+    pattern = [IDLE, IDLE, IDLE, TRICKLE, BURST, BURST, (900.0, 7.0, 1.0, 40.0), IDLE, IDLE, IDLE, BURST, BURST]
+    for i in range(2, len(pattern)):
+        end = 1_000_000 + (i + 1) * GRID
+        window = _window(end, pattern[i - 2 : i + 1])
+        a = _observation_from_metrics(end, window, registry.model("m"), "zm", signal_state=legacy)
+        b = _observation_from_metrics(end, window, registry.model("m"), "zm", signal_state=off,
+                                      routable_observation=(end, ()))
+        assert (a.z_m, a.q_ctl, a.has_traffic) == (b.z_m, b.q_ctl, b.has_traffic), end

@@ -296,6 +296,9 @@ def _scaling_options(registry: Registry) -> dict:
         "scale_up_cooldown_enabled": bool(config.scale_up_cooldown_enabled),
         "rescue_max_step_pods": int(getattr(config, "rescue_max_step_pods", 0)),
         "donor_surplus_release": bool(getattr(config, "donor_surplus_release", False)),
+        "partial_window_max_step": int(getattr(config, "breakpoint_partial_max_step", 0) or 0)
+        if bool(getattr(config, "breakpoint_window", False))
+        else 0,
     }
 
 
@@ -716,6 +719,9 @@ class ModelSignal:
     metrics: ModelWindowMetrics
     warm: bool
     window: object | None = None
+    #: O1 review P2-2: consecutive held windows reached the limit - a receiver decides
+    #: on the whole window (donors still need a clean one). 0 = no fallback.
+    hold_fallback: int = 0
 
 
 def breakpoint_observation(
@@ -728,12 +734,12 @@ def breakpoint_observation(
     stamped after the answer, ok or not). Never a rescue target's ``done_ms``: a target
     covered by a probe preemption is stamped when planned, before its unhide ran."""
     observed = getattr(cluster_view, "fetched_ms", None)
-    hints: list[int | None] = []
+    hints: list = []
     changes = getattr(queue, "routable_changes", None)
     if callable(changes):
         stamp = changes().get(model)
         if stamp is not None:
-            hints.append(int(stamp))
+            hints.append(tuple(stamp) if isinstance(stamp, (tuple, list)) else int(stamp))
     return (int(observed) if observed is not None else int(fallback_ms)), tuple(hints)
 
 
@@ -793,6 +799,8 @@ def compute_model_signal(
         )
     window = signal_state.effective_window(model_name, metrics)
     guard_warm = legacy_warm if signal_state.onset_guard_applies() else True
+    # Review P2-2: consecutive held windows (a full or warm window resets the count).
+    held = signal_state.note_hold(model_name, int(metrics.window_end_ms), not window.warm)
     if window.full:
         result = computer.compute(
             TRSInput.from_metrics(metrics, spec.trs),
@@ -801,6 +809,20 @@ def compute_model_signal(
         )
         signal = get_signal(metrics, spec, signal_source, trs_z_m=result.Z_m, signal_state=signal_state)
         return ModelSignal(result=result, signal=signal, metrics=metrics, warm=guard_warm, window=window)
+    limit = int(getattr(signal_state.breakpoint, "hold_max_windows", 0) or 0)
+    if not window.warm and limit > 0 and held >= limit:
+        # Review P2-2: the routable count keeps changing (crash loop, probes): after
+        # ``hold_max_windows`` held windows a receiver decides on the whole window as
+        # before O1 (EMA advanced); donors keep waiting for a clean one (window.full).
+        result = computer.compute(
+            TRSInput.from_metrics(metrics, spec.trs),
+            theta_m=spec.trs.theta_m,
+            window_end_ms=metrics.window_end_ms,
+        )
+        signal = get_signal(metrics, spec, signal_source, trs_z_m=result.Z_m, signal_state=signal_state)
+        return ModelSignal(
+            result=result, signal=signal, metrics=metrics, warm=guard_warm, window=window, hold_fallback=held
+        )
     if not window.warm:
         # No decision on this window: the full window's raw value for the record only.
         result = computer.compute(
@@ -838,6 +860,9 @@ def _model_contexts(
 ) -> tuple[dict[str, dict], tuple[str, ...]]:
     contexts: dict[str, dict] = {}
     events: list[str] = []
+    suspended = getattr(signal_state, "breakpoint_window_suspended", None)
+    if suspended:
+        events.append(f"breakpoint_window_suspended:{suspended}")
     cluster_counts = _cluster_view_counts(cluster_view)
     awake_counts = _awake_including_hidden(cluster_view)
     for model_name, metrics in snapshot.models.items():
@@ -869,6 +894,8 @@ def _model_contexts(
             )
             result, signal, signal_warm = computed.result, computed.signal, computed.warm
             window = computed.window
+            if computed.hold_fallback:
+                events.append(f"breakpoint_hold_fallback:{model_name}:{computed.hold_fallback}")
             if window is not None and not window.full:
                 # Rates of the post-breakpoint window (the decision window).
                 request_rate_rps = _request_rate_rps(computed.metrics)
@@ -909,7 +936,7 @@ def _model_contexts(
                         "signal_settle_ms": signal_state.settle_breakpoint_ms(model_name),
                         "signal_window_start_ms": window.start_ms,
                         "signal_evidence_grids": window.grids,
-                        "signal_hold_reason": window.reason,
+                        "signal_hold_reason": None if computed.hold_fallback else window.reason,
                     }
                 )
         else:

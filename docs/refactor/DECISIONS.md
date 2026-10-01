@@ -557,5 +557,12 @@ image for a full revert; point `campaign_queue.py` APA back at 31592 only togeth
 - Effect (replay of the 2026-10-01 verify evidence): first CRITICAL decision 30 s -> 20 s
   after the onset window in all 7 loaded episodes; no false CRITICAL on light onsets (raw
   filling-window dip to Z = 0.20 vs O1 3.78, A-smoke-tre dsqwen-7b).
+- Premise: the controller and gateway clocks agree (NTP). Checked at start and every 60 s
+  (newest gateway stamp vs the controller clock, 2 s tolerance); a violation suspends O1.
+- Review round 2: `min_evidence_requests` 3; C1 adds at most +1 on a partial window
+  (1 -> 4 ~70 s slower than without the cap, see the design doc); after 6 held windows a
+  receiver falls back to the whole window; a restart under load is an onset.
 - Knobs (registry `scaling:`): `breakpoint_window` (true), `onset_warmup_guard` (false),
-  `min_evidence_grids` (2), `min_evidence_requests` (0), `breakpoint_margin_ms` (1000).
+  `min_evidence_grids` (2), `min_evidence_requests` (3), `breakpoint_margin_ms` (1000),
+  `breakpoint_partial_max_step` (1), `breakpoint_hold_max_windows` (6),
+  `gateway_clock_tolerance_ms` (2000), `gateway_clock_check_s` (60).

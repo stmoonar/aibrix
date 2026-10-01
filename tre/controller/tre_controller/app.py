@@ -11,6 +11,7 @@ from typing import Any, Awaitable, Callable, Mapping
 from tre_common.registry import Registry, load_registry, sleep_call_timeout_errors
 from tre_controller.config import ControllerConfig
 from tre_controller.gateway_cadence import check_gateway_cadence
+from tre_controller.gateway_clock import GatewayClockMonitor, gateway_clock_task
 from tre_controller.gateway_health import EnvoyStatsSource
 from tre_controller.loops.action_queue import (
     ActionQueue,
@@ -167,6 +168,12 @@ def build_controller_task_specs(
                 ),
             )
         )
+    clock_monitor = _gateway_clock_monitor(deps, cfg)
+    if clock_monitor is not None:
+        interval_s = float(deps.registry.scaling().gateway_clock_check_s)
+        specs.append(
+            ControllerTaskSpec("gateway_clock", lambda: gateway_clock_task(clock_monitor, interval_s))
+        )
     specs.append(ControllerTaskSpec("action_queue", lambda: deps.queue.run()))
     if deps.profiler is not None:
         specs.append(ControllerTaskSpec("profile_flush", lambda: deps.profiler.flush_loop()))
@@ -179,6 +186,26 @@ def build_controller_task_specs(
             )
         )
     return tuple(specs)
+
+
+def _gateway_clock_monitor(deps: ControllerDependencies, cfg: Any) -> GatewayClockMonitor | None:
+    """O1 same-clock check (review P2-3): only with O1 on, a redis-backed store and
+    ``scaling.gateway_clock_check_s`` > 0."""
+    breakpoint = getattr(deps.signal_state, "breakpoint", None)
+    redis_client = getattr(deps.store, "redis_client", None)
+    scaling = getattr(deps.registry, "scaling", None)
+    if breakpoint is None or not breakpoint.enabled or redis_client is None or not callable(scaling):
+        return None
+    config = scaling()
+    if int(getattr(config, "gateway_clock_check_s", 0) or 0) <= 0:
+        return None
+    return GatewayClockMonitor(
+        redis_client,
+        [spec.name for spec in deps.registry.models()],
+        deps.signal_state,
+        period_ms=int(getattr(cfg, "instant_sample_interval_ms", breakpoint.grid_ms)),
+        tolerance_ms=int(config.gateway_clock_tolerance_ms),
+    )
 
 
 def _sleeping_pods(view: Any, model: str) -> set[str]:

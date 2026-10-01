@@ -75,6 +75,9 @@ class PlanConfig:
     # donor of a CRITICAL receiver gives its whole surplus in one tick. Off (default):
     # one step per tick, as before C1 - scale-up is aggressive, scale-down cautious.
     donor_surplus_release: bool = False
+    #: O1 review P2-1: a C1 rescue decided on a partial (post-breakpoint) window -
+    #: ``signal_full_window`` False - adds at most this many replicas (0 = no cap).
+    partial_window_max_step: int = 0
 
     def __post_init__(self) -> None:
         # No silent fallback for a bad tp_size (the registry rejects it at load; this
@@ -438,7 +441,13 @@ def build_plan(
             continue
         kept.append(item)
     if warmup_suppressed or dwell_suppressed or breakpoint_held:
-        events.extend(f"receiver_suppressed_signal_warmup:{model}" for model in warmup_suppressed)
+        for model in warmup_suppressed:
+            reason = model_contexts.get(model, {}).get("signal_hold_reason")
+            events.append(
+                f"receiver_held_breakpoint_window:{model}:{reason}"
+                if reason
+                else f"receiver_suppressed_signal_warmup:{model}"
+            )
         events.extend(f"receiver_suppressed_dwell:{model}" for model in dwell_suppressed)
         events.extend(f"donor_suppressed_breakpoint_window:{model}" for model in breakpoint_held)
         classifications = kept
@@ -500,6 +509,17 @@ def build_plan(
                 base, recv.Z_m, recv.tau.tau_crit, cfg.rescue_max_step_ratio, cfg.rescue_max_step_pods
             )
             raw_need = min(desired - covered, recv_max - max(recv_awake, covered))
+            if (
+                cfg.partial_window_max_step > 0
+                and raw_need > cfg.partial_window_max_step
+                and model_contexts.get(recv.model_name, {}).get("signal_full_window") is False
+            ):
+                # O1 review P2-1: a partial window is thin evidence (tokens count at
+                # completion) - one step now, the whole deficit on a whole window.
+                events.append(
+                    f"rescue_partial_window_step:{recv.model_name}:{raw_need}->{cfg.partial_window_max_step}"
+                )
+                raw_need = cfg.partial_window_max_step
             if raw_need <= 0:
                 if basis is not None:
                     events.append(

@@ -492,17 +492,32 @@ class ScalingRegistryConfig:
     #: (scale-ups; scale-downs always need a whole clean window). 2 = 20 s on the 10 s grid.
     min_evidence_grids: int = 2
     #: O1: also this many completed requests in the post-breakpoint window (0 = off).
-    min_evidence_requests: int = 0
+    #: Tokens count at request completion: with one short request done and long ones
+    #: still running, a 20 s suffix can read Z ~ 5 % (review P2-1).
+    min_evidence_requests: int = 3
     #: O1: added to a routable-count change time before rounding up to the gateway grid
     #: (the gateway applies the SM's routable label through its pod informer).
     breakpoint_margin_ms: int = 1000
+    #: O1: a C1 rescue decided on a partial (post-breakpoint) window adds at most this
+    #: many replicas; the whole deficit at once once a whole window follows the
+    #: breakpoint (review P2-1). 0 = no cap.
+    breakpoint_partial_max_step: int = 1
+    #: O1: after this many consecutive held metrics windows (10 s each) a receiver
+    #: decides on the whole window again (donors still need a clean one) - a model whose
+    #: routable count keeps changing is not starved (review P2-2). 0 = never.
+    breakpoint_hold_max_windows: int = 6
+    #: O1 same-clock check (gateway doc stamps vs the controller clock, review P2-3):
+    #: tolerance and period (s, 0 = off). A violation suspends O1 (pre-O1 behaviour).
+    gateway_clock_tolerance_ms: int = 2000
+    gateway_clock_check_s: int = 60
 
 
 SCALING_KEYS = frozenset({
     "rescue_max_step_ratio", "scale_up_cooldown_enabled", "rescue_max_step_pods",
     "donor_surplus_release", "rescue_settle_ema_k",
     "breakpoint_window", "onset_warmup_guard", "min_evidence_grids", "min_evidence_requests",
-    "breakpoint_margin_ms",
+    "breakpoint_margin_ms", "breakpoint_partial_max_step", "breakpoint_hold_max_windows",
+    "gateway_clock_tolerance_ms", "gateway_clock_check_s",
 })
 
 
@@ -580,6 +595,16 @@ def parse_scaling_config(raw: dict[str, Any] | None) -> ScalingRegistryConfig:
             raw, "min_evidence_requests", defaults.min_evidence_requests, 0
         ),
         breakpoint_margin_ms=_scaling_count(raw, "breakpoint_margin_ms", defaults.breakpoint_margin_ms, 0),
+        breakpoint_partial_max_step=_scaling_count(
+            raw, "breakpoint_partial_max_step", defaults.breakpoint_partial_max_step, 0
+        ),
+        breakpoint_hold_max_windows=_scaling_count(
+            raw, "breakpoint_hold_max_windows", defaults.breakpoint_hold_max_windows, 0
+        ),
+        gateway_clock_tolerance_ms=_scaling_count(
+            raw, "gateway_clock_tolerance_ms", defaults.gateway_clock_tolerance_ms, 0
+        ),
+        gateway_clock_check_s=_scaling_count(raw, "gateway_clock_check_s", defaults.gateway_clock_check_s, 0),
     )
 
 

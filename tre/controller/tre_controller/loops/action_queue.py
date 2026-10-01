@@ -281,7 +281,7 @@ class ActionQueue:
         #: (scale / wake / sleep / hide / unhide / receiver target) returned - ok or not.
         #: A change the SM made during that call happened before this stamp, so it
         #: never dates a breakpoint early. In memory only (a restart starts empty).
-        self._routable_change: dict[str, int] = {}
+        self._routable_change: dict[str, tuple[int, int]] = {}
         #: C1: model -> its last rescue target (see :meth:`rescue_targets`).
         self._rescue: dict[str, RescueTargetRecord] = {}
         #: C1 review P3: id(queued action) -> the record that part belongs to (a part of
@@ -432,9 +432,10 @@ class ActionQueue:
     def last_actions(self) -> dict[str, tuple[int, str]]:
         return dict(self._last_done)
 
-    def routable_changes(self) -> dict[str, int]:
-        """O1: model -> when the last SM call that can change its routable count
-        returned (see ``_routable_change``); the only breakpoint dating hint."""
+    def routable_changes(self) -> dict[str, tuple[int, int]]:
+        """O1: model -> (when the last SM call that can change its routable count
+        returned, the direction it could move it: +1 / -1) - see ``_routable_change``;
+        the only breakpoint dating hint."""
         return dict(self._routable_change)
 
     def rescue_targets(self) -> dict[str, RescueTargetRecord]:
@@ -1487,7 +1488,9 @@ class ActionQueue:
         if isinstance(action, (ScaleAction, ReceiverTarget, HideAction, UnhideAction)):
             # O1: stamped after the SM answered, whatever the outcome (a failed or
             # partial wake may still have changed the routable set).
-            self._routable_change[getattr(action, "model", model)] = int(self._now_ms())
+            self._routable_change[getattr(action, "model", model)] = (
+                int(self._now_ms()), _routable_direction(action)
+            )
         if self._prof is not None:
             self._prof.record(
                 {
@@ -1787,6 +1790,17 @@ def _action_kind(action) -> str:
     if isinstance(action, DefragAction):
         return "defrag"
     return "unknown"
+
+
+def _routable_direction(action) -> int:
+    """+1 / -1: the direction an SM call can move a model's routable count."""
+    if isinstance(action, (ReceiverTarget, UnhideAction)):
+        return 1
+    if isinstance(action, HideAction):
+        return -1
+    if isinstance(action, ScaleAction):
+        return 1 if action.delta > 0 else -1
+    return 0
 
 
 def _action_direction(action) -> str | None:

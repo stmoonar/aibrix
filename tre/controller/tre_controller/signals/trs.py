@@ -36,8 +36,10 @@ class BreakpointWindowConfig:
     onset_guard: bool = False
     grid_ms: int = 10_000
     min_evidence_grids: int = 2
-    min_evidence_requests: int = 0
+    min_evidence_requests: int = 3
     margin_ms: int = 1_000
+    #: Consecutive held windows after which a receiver decides on the whole window (0 = never).
+    hold_max_windows: int = 6
 
     @classmethod
     def from_registry(cls, registry: Any, *, grid_ms: int) -> "BreakpointWindowConfig":
@@ -53,6 +55,9 @@ class BreakpointWindowConfig:
                 0, int(getattr(config, "min_evidence_requests", defaults.min_evidence_requests))
             ),
             margin_ms=max(0, int(getattr(config, "breakpoint_margin_ms", defaults.margin_ms))),
+            hold_max_windows=max(
+                0, int(getattr(config, "breakpoint_hold_max_windows", defaults.hold_max_windows))
+            ),
         )
 
 
@@ -397,6 +402,10 @@ class SignalState:
         # model -> whether its last change was seen between two views of this process
         # (False: dated on the first observation, e.g. after a restart - a guess).
         self._change_seen: dict[str, bool] = {}
+        # model -> (last window_end counted, consecutive held windows) - review P2-2.
+        self._hold: dict[str, tuple[int, int]] = {}
+        # O1 suspended (same-clock check failed, review P2-3): reason, None = active.
+        self.breakpoint_window_suspended: str | None = None
         # Band dwell (plan §6.9i / D8): CRITICAL / LOW / HIGH only act after holding for
         # dwell_windows consecutive NEW metrics windows (tre_common.dwell). 1 = off.
         self.dwell_windows = max(1, int(dwell_windows))
@@ -492,14 +501,35 @@ class SignalState:
 
     @property
     def _o1_enabled(self) -> bool:
-        return self.breakpoint is not None and self.breakpoint.enabled
+        return (
+            self.breakpoint is not None
+            and self.breakpoint.enabled
+            and self.breakpoint_window_suspended is None
+        )
+
+    def suspend_breakpoint_window(self, reason: str) -> None:
+        """Fall back to whole windows and the onset guard (the gateway clock check)."""
+        self.breakpoint_window_suspended = str(reason)
+
+    def resume_breakpoint_window(self) -> None:
+        self.breakpoint_window_suspended = None
+
+    def note_hold(self, model: str, window_end_ms: int, held: bool) -> int:
+        """Consecutive held (not warm, post-breakpoint) windows of ``model`` up to this
+        one, counted once per distinct ``window_end_ms``; 0 once a window is not held."""
+        last_end, streak = self._hold.get(model, (None, 0))
+        if last_end == int(window_end_ms):
+            return streak
+        streak = streak + 1 if held else 0
+        self._hold[model] = (int(window_end_ms), streak)
+        return streak
 
     def onset_guard_applies(self) -> bool:
         """Whether the ADR-0013 onset warmup guard gates receivers: always without O1
         (``breakpoint`` None or ``scaling.breakpoint_window: false`` - turning O1 off
         never leaves the model without onset protection, review P2-b), on top of O1 only
         with ``scaling.onset_warmup_guard``."""
-        return self.breakpoint is None or not self.breakpoint.enabled or self.breakpoint.onset_guard
+        return self.breakpoint is None or not self._o1_enabled or self.breakpoint.onset_guard
 
     def note_routable(
         self,
@@ -521,7 +551,17 @@ class SignalState:
         time (None: no change). Idempotent for the re-reads of one view."""
         routable = int(routable)
         observed_ms = int(observed_ms)
-        hints = [int(hint) for hint in done_hints if hint is not None and int(hint) <= observed_ms]
+        # A hint is ``ms`` (direction unknown) or ``(ms, sign)`` with sign +1 / -1 the
+        # routable direction the SM call could move the count in (review P3: a hint only
+        # dates a change in its own direction; an external change keeps the view time).
+        signed = []
+        for hint in done_hints:
+            if hint is None:
+                continue
+            ms, sign = (hint[0], hint[1]) if isinstance(hint, tuple) else (hint, 0)
+            if ms is not None and int(ms) <= observed_ms:
+                signed.append((int(ms), int(sign)))
+        hints = [ms for ms, _sign in signed]
         margin = int(self.breakpoint.margin_ms) if self.breakpoint is not None else 0
         previous = self._routable.get(model)
         if previous is None:
@@ -538,7 +578,8 @@ class SignalState:
             if observed_ms > last_ms:
                 self._routable[model] = (count, observed_ms)
             return None
-        explained = [hint for hint in hints if hint > last_ms]
+        direction = 1 if routable > count else -1
+        explained = [ms for ms, sign in signed if ms > last_ms and sign in (0, direction)]
         change = (max(explained) if explained else observed_ms) + margin
         if change >= self._change_ms.get(model, change):
             self._change_ms[model] = change
@@ -578,7 +619,7 @@ class SignalState:
             metrics=metrics, full=True, warm=True, breakpoint_ms=point, start_ms=start,
             grids=(span // cfg.grid_ms) if cfg is not None and cfg.grid_ms > 0 else 0,
         )
-        if cfg is None or not cfg.enabled or point is None or point <= start or span <= 0:
+        if cfg is None or not self._o1_enabled or point is None or point <= start or span <= 0:
             return full
         grid = int(cfg.grid_ms)
         eff_start = -(-int(point) // grid) * grid  # first grid boundary >= the breakpoint
