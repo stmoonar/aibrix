@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import socket
 import subprocess
 import sys
@@ -9,7 +10,8 @@ import time
 from urllib.parse import unquote, urlparse
 
 # Redis keys (kept equal to tre_common.rediskeys by deploy/tests/test_gpu_truth_agent.py;
-# this script runs standalone from a ConfigMap and cannot import tre_common).
+# this script runs standalone in its own image (tre/gpu-truth/Dockerfile) and
+# cannot import tre_common).
 GPU_TRUTH_KEY_PREFIX = "tre:gpu_truth:"
 GPU_TRUTH_REFRESH_KEY_PREFIX = "tre:gpu_truth_refresh:"
 
@@ -80,6 +82,88 @@ def collect_nvidia_smi(*, timeout_s: float = NVIDIA_SMI_TIMEOUT_S) -> list[dict]
     return parse_nvidia_smi_csv(output)
 
 
+#: Consecutive failed GPU samples (nvidia-smi errors / timeouts) after which the
+#: agent exits non-zero so the kubelet restarts the container (CLI default; the
+#: library default of run_agent is 0 = never exit).
+DEFAULT_MAX_COLLECT_FAILURES = 6
+#: Default max heartbeat age (s) accepted by --check-heartbeat (= 6 samples of 10 s).
+DEFAULT_HEARTBEAT_MAX_AGE_S = 60.0
+#: Exit status after DEFAULT_MAX_COLLECT_FAILURES consecutive failed samples.
+EXIT_COLLECT_FAILURES = 3
+
+
+class CollectFailuresExceeded(RuntimeError):
+    """Too many consecutive failed GPU samples: NVML is likely gone in this container."""
+
+
+class AgentHealth:
+    """Liveness bookkeeping of the publish loop.
+
+    ``published()`` is called after a sample was collected AND written to Redis:
+    it resets the failure streak and touches ``heartbeat_path`` (the kubelet's
+    exec liveness probe runs ``--check-heartbeat`` against its mtime).
+    ``failed(collected=...)`` is called after a failed round; only failed GPU
+    samples count towards ``max_collect_failures`` (a Redis outage only lets the
+    heartbeat go stale). ``max_collect_failures`` 0 never raises.
+    """
+
+    def __init__(self, *, heartbeat_path: str | None = None, max_collect_failures: int = 0, stream=None) -> None:
+        if max_collect_failures < 0:
+            raise ValueError("max_collect_failures must be >= 0")
+        self.heartbeat_path = heartbeat_path
+        self.max_collect_failures = max_collect_failures
+        self.collect_failures = 0
+        self._stream = stream if stream is not None else sys.stderr
+
+    def published(self) -> None:
+        self.collect_failures = 0
+        if self.heartbeat_path:
+            try:
+                touch_heartbeat(self.heartbeat_path)
+            except OSError as exc:
+                print(f"gpu_truth: heartbeat write failed ({self.heartbeat_path}): {exc!r}",
+                      file=self._stream, flush=True)
+
+    def failed(self, *, collected: bool) -> None:
+        if collected:
+            return
+        self.collect_failures += 1
+        if self.max_collect_failures and self.collect_failures >= self.max_collect_failures:
+            raise CollectFailuresExceeded(
+                f"{self.collect_failures} consecutive GPU samples failed (limit {self.max_collect_failures})"
+            )
+
+
+def touch_heartbeat(path: str, *, now: float | None = None) -> None:
+    """Create ``path`` if needed and set its mtime to ``now`` (default: wall clock)."""
+    with open(path, "a", encoding="utf-8"):
+        pass
+    stamp = time.time() if now is None else now
+    os.utime(path, (stamp, stamp))
+
+
+def heartbeat_age_s(path: str, *, now: float | None = None) -> float | None:
+    """Seconds since the last heartbeat; None when the file does not exist."""
+    try:
+        mtime = os.stat(path).st_mtime
+    except FileNotFoundError:
+        return None
+    return (time.time() if now is None else now) - mtime
+
+
+def check_heartbeat(path: str, max_age_s: float, *, now: float | None = None, stream=None) -> int:
+    """Liveness probe: 0 when the heartbeat is at most ``max_age_s`` old, else 1."""
+    stream = stream if stream is not None else sys.stderr
+    age = heartbeat_age_s(path, now=now)
+    if age is None:
+        print(f"gpu_truth: no heartbeat at {path}", file=stream, flush=True)
+        return 1
+    if age > max_age_s:
+        print(f"gpu_truth: heartbeat {age:.1f}s old > {max_age_s:g}s ({path})", file=stream, flush=True)
+        return 1
+    return 0
+
+
 def publish_once(
     redis_client,
     *,
@@ -126,8 +210,15 @@ def run_agent(
     refresh_poll_s: float = DEFAULT_REFRESH_POLL_S,
     iterations: int | None = None,
     error_stream=None,
+    health: AgentHealth | None = None,
 ) -> int:
     """Publish GPU truth forever, surviving transient collection/publish faults.
+
+    Liveness (``health``): every round that collected a sample and wrote it to
+    Redis touches the heartbeat file; ``health.max_collect_failures``
+    consecutive failed samples end the loop with ``EXIT_COLLECT_FAILURES`` so
+    the kubelet restarts the container (a persistently broken NVML is not
+    recovered by retrying inside the same process).
 
     A single nvidia-smi hiccup (exit 255 on a driver blip) used to kill the
     process and put the DaemonSet into CrashLoopBackOff. On failure we log and
@@ -148,11 +239,27 @@ def run_agent(
     sleep = sleep or time.sleep
     monotonic = monotonic or time.monotonic
     stream = error_stream if error_stream is not None else sys.stderr
-    if not callable(getattr(redis_client, "get", None)):
-        return _run_periodic(
-            redis_client, node=node, ttl_s=ttl_s, interval_s=interval_s,
-            collect=collect, sleep=sleep, iterations=iterations, stream=stream,
+    health = health or AgentHealth(stream=stream)
+    try:
+        if not callable(getattr(redis_client, "get", None)):
+            return _run_periodic(
+                redis_client, node=node, ttl_s=ttl_s, interval_s=interval_s,
+                collect=collect, sleep=sleep, iterations=iterations, stream=stream, health=health,
+            )
+        return _run_refreshing(
+            redis_client, node=node, ttl_s=ttl_s, interval_s=interval_s, collect=collect,
+            sleep=sleep, monotonic=monotonic, refresh_poll_s=refresh_poll_s,
+            iterations=iterations, stream=stream, health=health,
         )
+    except CollectFailuresExceeded as exc:
+        print(f"gpu_truth: exiting for a container restart, node={node}: {exc}", file=stream, flush=True)
+        return EXIT_COLLECT_FAILURES
+
+
+def _run_refreshing(
+    redis_client, *, node, ttl_s, interval_s, collect, sleep, monotonic, refresh_poll_s,
+    iterations, stream, health,
+) -> int:
     served = 0
     seq = 0
     completed = 0
@@ -175,7 +282,7 @@ def run_agent(
             seq += 1
             _publish_logged(
                 redis_client, node=node, ttl_s=ttl_s, collect=collect, stream=stream,
-                seq=seq, refresh_seq=served,
+                seq=seq, refresh_seq=served, health=health,
             )
             completed += 1
             next_sample = monotonic() + interval_s
@@ -185,14 +292,16 @@ def run_agent(
     return 0
 
 
-def _run_periodic(redis_client, *, node, ttl_s, interval_s, collect, sleep, iterations, stream) -> int:
+def _run_periodic(redis_client, *, node, ttl_s, interval_s, collect, sleep, iterations, stream, health) -> int:
     """Periodic samples only (a client without GET: no on-demand refresh; the
     payload carries no ``refresh_seq``)."""
     completed = 0
     seq = 0
     while iterations is None or completed < iterations:
         seq += 1
-        _publish_logged(redis_client, node=node, ttl_s=ttl_s, collect=collect, stream=stream, seq=seq)
+        _publish_logged(
+            redis_client, node=node, ttl_s=ttl_s, collect=collect, stream=stream, seq=seq, health=health
+        )
         completed += 1
         if iterations is not None and completed >= iterations:
             break
@@ -200,13 +309,22 @@ def _run_periodic(redis_client, *, node, ttl_s, interval_s, collect, sleep, iter
     return 0
 
 
-def _publish_logged(redis_client, *, node, ttl_s, collect, stream, seq, refresh_seq=None) -> None:
+def _publish_logged(redis_client, *, node, ttl_s, collect, stream, seq, refresh_seq=None, health=None) -> None:
+    collect_fn = collect or collect_nvidia_smi
+    collected = False
+
+    def tracked_collect():
+        nonlocal collected
+        gpus = collect_fn()
+        collected = True
+        return gpus
+
     try:
         publish_once(
             redis_client,
             node=node,
             ttl_s=ttl_s,
-            collect=collect,
+            collect=tracked_collect,
             seq=seq,
             refresh_seq=refresh_seq,
         )
@@ -216,6 +334,11 @@ def _publish_logged(redis_client, *, node, ttl_s, collect, stream, seq, refresh_
             file=stream,
             flush=True,
         )
+        if health is not None:
+            health.failed(collected=collected)  # may raise CollectFailuresExceeded
+        return
+    if health is not None:
+        health.published()
 
 
 class RawRedisClient:
@@ -339,9 +462,9 @@ def read_reply(reader):
     raise RuntimeError(f"unexpected redis reply: {line!r}")
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Publish node GPU memory truth to TRE Redis.")
-    parser.add_argument("--redis-url", required=True)
+    parser.add_argument("--redis-url")
     parser.add_argument("--node", default=socket.gethostname())
     parser.add_argument("--interval-s", type=float, default=DEFAULT_INTERVAL_S)
     parser.add_argument(
@@ -352,7 +475,30 @@ def main() -> int:
     )
     parser.add_argument("--ttl-s", type=int, default=120)
     parser.add_argument("--once", action="store_true")
-    args = parser.parse_args()
+    parser.add_argument(
+        "--heartbeat-file",
+        help="touched after every sample collected AND written to Redis (liveness); unset = no heartbeat",
+    )
+    parser.add_argument(
+        "--max-collect-failures",
+        type=int,
+        default=DEFAULT_MAX_COLLECT_FAILURES,
+        help=f"exit {EXIT_COLLECT_FAILURES} after this many consecutive failed GPU samples (0 = never)",
+    )
+    parser.add_argument(
+        "--check-heartbeat",
+        metavar="PATH",
+        help="probe mode: exit 0 iff PATH was touched within --heartbeat-max-age-s, then stop",
+    )
+    parser.add_argument("--heartbeat-max-age-s", type=float, default=DEFAULT_HEARTBEAT_MAX_AGE_S)
+    args = parser.parse_args(argv)
+
+    if args.check_heartbeat:
+        return check_heartbeat(args.check_heartbeat, args.heartbeat_max_age_s)
+    if not args.redis_url:
+        parser.error("--redis-url is required (unless --check-heartbeat)")
+    if args.max_collect_failures < 0:
+        parser.error("--max-collect-failures must be >= 0")
 
     try:
         import redis  # type: ignore[import-not-found]
@@ -372,6 +518,7 @@ def main() -> int:
         ttl_s=args.ttl_s,
         interval_s=args.interval_s,
         refresh_poll_s=args.refresh_poll_s if args.refresh_poll_s > 0 else DEFAULT_REFRESH_POLL_S,
+        health=AgentHealth(heartbeat_path=args.heartbeat_file, max_collect_failures=args.max_collect_failures),
     )
 
 

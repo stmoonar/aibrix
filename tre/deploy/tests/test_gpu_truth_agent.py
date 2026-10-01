@@ -396,3 +396,125 @@ def test_raw_client_raises_redis_errors(mini_redis):
     with pytest.raises(gpu_truth_agent.RedisReplyError):
         client.execute("FLUSHALL")
     client.close()
+
+
+# ---------------------------------------------------------------- liveness (2026-10-01)
+
+
+def _failing_collect():
+    raise subprocess.CalledProcessError(255, ["nvidia-smi"])
+
+
+def test_heartbeat_is_touched_only_after_a_sample_reached_redis(tmp_path):
+    beat = tmp_path / "heartbeat"
+    attempts = []
+
+    def collect():
+        attempts.append(1)
+        if len(attempts) == 1:
+            return _ok_gpus()
+        raise subprocess.CalledProcessError(255, ["nvidia-smi"])
+
+    health = gpu_truth_agent.AgentHealth(heartbeat_path=str(beat), max_collect_failures=0)
+    run_agent(RecordingSetexClient(), node="n", ttl_s=120, interval_s=10.0, collect=collect,
+              sleep=lambda _s: None, iterations=1, health=health)
+    assert beat.exists()
+    import os
+
+    os.utime(beat, (1000.0, 1000.0))
+    run_agent(RecordingSetexClient(), node="n", ttl_s=120, interval_s=10.0, collect=collect,
+              sleep=lambda _s: None, iterations=1, health=health)
+    assert beat.stat().st_mtime == 1000.0  # failed sample: heartbeat not refreshed
+
+
+def test_heartbeat_not_touched_when_the_redis_write_fails(tmp_path):
+    class FailingClient(RecordingSetexClient):
+        def setex(self, key, ttl_s, value):
+            raise OSError("redis unreachable")
+
+    beat = tmp_path / "heartbeat"
+    health = gpu_truth_agent.AgentHealth(heartbeat_path=str(beat), max_collect_failures=2)
+    rc = run_agent(FailingClient(), node="n", ttl_s=120, interval_s=10.0, collect=_ok_gpus,
+                   sleep=lambda _s: None, iterations=5, health=health)
+    assert rc == 0 and not beat.exists()
+    assert health.collect_failures == 0  # Redis faults never trigger the self-exit
+
+
+def test_check_heartbeat_judges_age(tmp_path):
+    beat = tmp_path / "heartbeat"
+    check = gpu_truth_agent.check_heartbeat
+    assert check(str(beat), 60, now=2000.0) == 1  # missing
+    gpu_truth_agent.touch_heartbeat(str(beat), now=1950.0)
+    assert check(str(beat), 60, now=2000.0) == 0
+    assert check(str(beat), 60, now=2010.0) == 0  # exactly at the limit
+    assert check(str(beat), 60, now=2010.5) == 1
+
+
+def test_check_heartbeat_cli_mode_needs_no_redis(tmp_path):
+    beat = tmp_path / "heartbeat"
+    gpu_truth_agent.touch_heartbeat(str(beat))
+    assert gpu_truth_agent.main(["--check-heartbeat", str(beat)]) == 0
+    assert gpu_truth_agent.main(["--check-heartbeat", str(tmp_path / "none")]) == 1
+
+
+def test_agent_exits_nonzero_after_consecutive_collect_failures(capsys):
+    client = RecordingSetexClient()
+    health = gpu_truth_agent.AgentHealth(max_collect_failures=6)
+    attempts = []
+
+    def collect():
+        attempts.append(1)
+        _failing_collect()
+
+    rc = run_agent(client, node="n", ttl_s=120, interval_s=10.0, collect=collect,
+                   sleep=lambda _s: None, iterations=100, health=health)
+    assert rc == gpu_truth_agent.EXIT_COLLECT_FAILURES != 0
+    assert len(attempts) == 6 and client.calls == []
+    assert "container restart" in capsys.readouterr().err
+
+
+def test_a_good_sample_resets_the_failure_streak():
+    pattern = iter([False] * 5 + [True] + [False] * 5 + [True])
+
+    def collect():
+        if next(pattern):
+            return _ok_gpus()
+        _failing_collect()
+
+    health = gpu_truth_agent.AgentHealth(max_collect_failures=6)
+    rc = run_agent(RecordingSetexClient(), node="n", ttl_s=120, interval_s=10.0, collect=collect,
+                   sleep=lambda _s: None, iterations=12, health=health)
+    assert rc == 0 and health.collect_failures == 0
+
+
+def test_periodic_mode_also_exits_after_consecutive_failures():
+    class SetexOnly:
+        def setex(self, key, ttl_s, value):
+            raise AssertionError("never reached")
+
+    health = gpu_truth_agent.AgentHealth(max_collect_failures=3)
+    rc = run_agent(SetexOnly(), node="n", ttl_s=120, interval_s=10.0, collect=_failing_collect,
+                   sleep=lambda _s: None, iterations=10, health=health)
+    assert rc == gpu_truth_agent.EXIT_COLLECT_FAILURES
+
+
+def test_library_default_never_exits():
+    rc = run_agent(RecordingSetexClient(), node="n", ttl_s=120, interval_s=10.0, collect=_failing_collect,
+                   sleep=lambda _s: None, iterations=20)
+    assert rc == 0
+
+
+def test_refreshing_mode_exits_after_consecutive_failures_and_beats_on_success(tmp_path):
+    class GetSetexClient(RecordingSetexClient):
+        def get(self, key):
+            return None
+
+    clock = iter(range(0, 10_000, 10))
+    beat = tmp_path / "heartbeat"
+    health = gpu_truth_agent.AgentHealth(heartbeat_path=str(beat), max_collect_failures=6)
+    rc = run_agent(GetSetexClient(), node="n", ttl_s=120, interval_s=10.0, collect=_ok_gpus,
+                   sleep=lambda _s: None, monotonic=lambda: next(clock), iterations=3, health=health)
+    assert rc == 0 and beat.exists()
+    rc = run_agent(GetSetexClient(), node="n", ttl_s=120, interval_s=10.0, collect=_failing_collect,
+                   sleep=lambda _s: None, monotonic=lambda: next(clock), iterations=50, health=health)
+    assert rc == gpu_truth_agent.EXIT_COLLECT_FAILURES and health.collect_failures == 6

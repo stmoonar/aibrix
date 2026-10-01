@@ -56,7 +56,8 @@ def test_daemonset_targets_registry_nodes_and_writes_tre_v2_redis() -> None:
     assert ds["spec"]["updateStrategy"]["rollingUpdate"]["maxUnavailable"] == 1
     spec = ds["spec"]["template"]["spec"]
     assert spec["hostPID"] is False
-    assert "volumes" not in spec
+    # only the heartbeat emptyDir (no agent ConfigMap)
+    assert spec["volumes"] == [{"name": "heartbeat", "emptyDir": {"medium": "Memory", "sizeLimit": "1Mi"}}]
     terms = spec["affinity"]["nodeAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"]["nodeSelectorTerms"]
     hostnames = terms[0]["matchExpressions"][0]
     assert hostnames["key"] == "kubernetes.io/hostname"
@@ -72,10 +73,38 @@ def test_daemonset_targets_registry_nodes_and_writes_tre_v2_redis() -> None:
     assert env["NVIDIA_VISIBLE_DEVICES"]["value"] == "all"
     assert env["NVIDIA_DRIVER_CAPABILITIES"]["value"] == "utility"
     assert env["NODE_NAME"]["valueFrom"]["fieldRef"]["fieldPath"] == "spec.nodeName"
-    assert "volumeMounts" not in container
+    assert container["volumeMounts"] == [{"name": "heartbeat", "mountPath": gen.HEARTBEAT_DIR}]
     security = container["securityContext"]
     assert security["runAsNonRoot"] is True and security["runAsUser"] != 0
     assert security["allowPrivilegeEscalation"] is False
+    assert security["readOnlyRootFilesystem"] is True
+
+
+def test_liveness_probe_checks_a_fresh_heartbeat_conservatively() -> None:
+    container = _daemonset()["spec"]["template"]["spec"]["containers"][0]
+    command = container["command"]
+    args = dict(zip(command[2::2], command[3::2]))
+    assert args["--heartbeat-file"] == gen.HEARTBEAT_FILE
+    assert gen.HEARTBEAT_FILE.startswith(gen.HEARTBEAT_DIR + "/")
+    assert args["--max-collect-failures"] == "6"
+    probe = container["livenessProbe"]
+    assert probe["exec"]["command"] == [
+        "python3", gen.AGENT_IN_IMAGE, "--check-heartbeat", gen.HEARTBEAT_FILE, "--heartbeat-max-age-s", "60",
+    ]
+    # restart only after the heartbeat is stale for >= max_age + (threshold-1) x period
+    assert probe["initialDelaySeconds"] >= 60 and probe["periodSeconds"] >= 10
+    assert probe["failureThreshold"] >= 3 and probe["timeoutSeconds"] >= 5
+    # the probe's limit is >= 6 samples, and the agent self-exits after 6 failed samples
+    assert float(probe["exec"]["command"][-1]) >= 6 * float(args["--interval-s"])
+
+
+def test_probe_and_agent_flags_exist_in_the_agent() -> None:
+    from scripts import gpu_truth_agent
+
+    assert gpu_truth_agent.DEFAULT_HEARTBEAT_MAX_AGE_S == gen.DEFAULT_HEARTBEAT_MAX_AGE_S
+    assert gpu_truth_agent.DEFAULT_MAX_COLLECT_FAILURES == gen.DEFAULT_MAX_COLLECT_FAILURES
+    with pytest.raises(ValueError):
+        gen.render(image="img:1", nodes=["n1"], heartbeat_max_age_s=20)  # < 3 samples of 10 s
 
 
 def test_daemonset_samples_every_10s_and_polls_refresh_requests() -> None:

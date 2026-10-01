@@ -93,6 +93,28 @@ spec:
             - "{refresh_poll_s}"
             - --ttl-s
             - "{ttl_s}"
+            - --heartbeat-file
+            - {heartbeat_file}
+            - --max-collect-failures
+            - "{max_collect_failures}"
+          # Liveness: the agent touches the heartbeat after every sample that
+          # reached Redis; a heartbeat older than {heartbeat_max_age_s}s on
+          # {liveness_failure_threshold} probes in a row ({liveness_period_s}s apart) restarts the
+          # container. The agent also exits by itself after
+          # {max_collect_failures} failed nvidia-smi samples in a row.
+          livenessProbe:
+            exec:
+              command:
+                - python3
+                - {agent}
+                - --check-heartbeat
+                - {heartbeat_file}
+                - --heartbeat-max-age-s
+                - "{heartbeat_max_age_s}"
+            initialDelaySeconds: {liveness_initial_delay_s}
+            periodSeconds: {liveness_period_s}
+            timeoutSeconds: 10
+            failureThreshold: {liveness_failure_threshold}
           env:
             - name: NODE_NAME
               valueFrom:
@@ -109,6 +131,9 @@ spec:
             runAsGroup: 65532
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: heartbeat
+              mountPath: {heartbeat_dir}
           resources:
             requests:
               cpu: 50m
@@ -116,6 +141,12 @@ spec:
             limits:
               cpu: 250m
               memory: 256Mi
+      volumes:
+        # Heartbeat only (the root fs is read-only); survives container restarts.
+        - name: heartbeat
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Mi
 """
 
 
@@ -126,6 +157,19 @@ DEFAULT_INTERVAL_S = 10.0
 DEFAULT_REFRESH_POLL_S = 0.25
 #: TTL of tre:gpu_truth:<node>; expiry = truth unavailable (gates fail closed).
 DEFAULT_TTL_S = 120
+#: Heartbeat file (an emptyDir: the root fs is read-only).
+HEARTBEAT_DIR = "/run/gpu-truth"
+HEARTBEAT_FILE = HEARTBEAT_DIR + "/heartbeat"
+#: Max heartbeat age accepted by the liveness probe (= 6 samples of 10 s).
+DEFAULT_HEARTBEAT_MAX_AGE_S = 60.0
+#: The agent exits after this many failed nvidia-smi samples in a row (0 = never).
+DEFAULT_MAX_COLLECT_FAILURES = 6
+#: Conservative probe timing: the first probe after 120 s (room for a slow first
+#: nvidia-smi and Redis connect), every 30 s, restart after 3 failures in a row,
+#: so a restart needs the heartbeat stale for at least max_age + 60 s.
+LIVENESS_INITIAL_DELAY_S = 120
+LIVENESS_PERIOD_S = 30
+LIVENESS_FAILURE_THRESHOLD = 3
 
 
 def _num(value: float) -> str:
@@ -156,9 +200,15 @@ def render(
     interval_s: float = DEFAULT_INTERVAL_S,
     refresh_poll_s: float = DEFAULT_REFRESH_POLL_S,
     ttl_s: int = DEFAULT_TTL_S,
+    heartbeat_max_age_s: float = DEFAULT_HEARTBEAT_MAX_AGE_S,
+    max_collect_failures: int = DEFAULT_MAX_COLLECT_FAILURES,
 ) -> str:
     if interval_s <= 0 or refresh_poll_s < 0 or ttl_s <= interval_s:
         raise ValueError("need interval_s > 0, refresh_poll_s >= 0 and ttl_s > interval_s")
+    if heartbeat_max_age_s < 3 * interval_s:
+        raise ValueError("need heartbeat_max_age_s >= 3 x interval_s (a probe must not race a sample)")
+    if max_collect_failures < 0:
+        raise ValueError("need max_collect_failures >= 0")
     if not image or not nodes:
         raise ValueError("need an image and at least one node")
     node_values = "\n".join(f"                      - {node}" for node in nodes)
@@ -169,6 +219,13 @@ def render(
         interval_s=_num(interval_s),
         refresh_poll_s=_num(refresh_poll_s),
         ttl_s=int(ttl_s),
+        heartbeat_dir=HEARTBEAT_DIR,
+        heartbeat_file=HEARTBEAT_FILE,
+        heartbeat_max_age_s=_num(heartbeat_max_age_s),
+        max_collect_failures=int(max_collect_failures),
+        liveness_initial_delay_s=LIVENESS_INITIAL_DELAY_S,
+        liveness_period_s=LIVENESS_PERIOD_S,
+        liveness_failure_threshold=LIVENESS_FAILURE_THRESHOLD,
     )
 
 
@@ -184,6 +241,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--interval-s", type=float, default=DEFAULT_INTERVAL_S)
     parser.add_argument("--refresh-poll-s", type=float, default=DEFAULT_REFRESH_POLL_S)
     parser.add_argument("--ttl-s", type=int, default=DEFAULT_TTL_S)
+    parser.add_argument("--heartbeat-max-age-s", type=float, default=DEFAULT_HEARTBEAT_MAX_AGE_S)
+    parser.add_argument("--max-collect-failures", type=int, default=DEFAULT_MAX_COLLECT_FAILURES)
     parser.add_argument("--output", type=Path, default=MANIFEST)
     args = parser.parse_args(argv)
     content = render_from_registry(
@@ -191,6 +250,8 @@ def main(argv: list[str] | None = None) -> int:
         interval_s=args.interval_s,
         refresh_poll_s=args.refresh_poll_s,
         ttl_s=args.ttl_s,
+        heartbeat_max_age_s=args.heartbeat_max_age_s,
+        max_collect_failures=args.max_collect_failures,
     )
     args.output.write_text(content, encoding="utf-8")
     print(f"wrote {args.output} ({len(content)} bytes)")

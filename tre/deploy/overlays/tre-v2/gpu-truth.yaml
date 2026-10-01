@@ -60,6 +60,28 @@ spec:
             - "0.25"
             - --ttl-s
             - "120"
+            - --heartbeat-file
+            - /run/gpu-truth/heartbeat
+            - --max-collect-failures
+            - "6"
+          # Liveness: the agent touches the heartbeat after every sample that
+          # reached Redis; a heartbeat older than 60s on
+          # 3 probes in a row (30s apart) restarts the
+          # container. The agent also exits by itself after
+          # 6 failed nvidia-smi samples in a row.
+          livenessProbe:
+            exec:
+              command:
+                - python3
+                - /app/gpu_truth_agent.py
+                - --check-heartbeat
+                - /run/gpu-truth/heartbeat
+                - --heartbeat-max-age-s
+                - "60"
+            initialDelaySeconds: 120
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
           env:
             - name: NODE_NAME
               valueFrom:
@@ -76,6 +98,9 @@ spec:
             runAsGroup: 65532
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: heartbeat
+              mountPath: /run/gpu-truth
           resources:
             requests:
               cpu: 50m
@@ -83,3 +108,9 @@ spec:
             limits:
               cpu: 250m
               memory: 256Mi
+      volumes:
+        # Heartbeat only (the root fs is read-only); survives container restarts.
+        - name: heartbeat
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Mi
