@@ -87,13 +87,20 @@ ignored and logged as `Ignoring unrecognized autoscaling annotation`. The CRs us
 | --- | --- | --- |
 | `autoscaling.aibrix.ai/scale-up-tolerance` | `0.1` | AIBrix v0.4 name was `apa.autoscaling.aibrix.ai/up-fluctuation-tolerance` |
 | `autoscaling.aibrix.ai/scale-down-tolerance` | `0.2` | v0.4 name: `apa.autoscaling.aibrix.ai/down-fluctuation-tolerance` |
-| `apa.autoscaling.aibrix.ai/window` | `20s` | stable metric window, per PodAutoscaler; default 180 s |
+| `apa.autoscaling.aibrix.ai/window` | `20s` | stable metric window, per PodAutoscaler; APA only, at least 1 s; default 180 s |
 
 Not set, so the controller defaults apply: `autoscaling.aibrix.ai/max-scale-up-rate` 2,
 `max-scale-down-rate` 2, `scale-up-cooldown-window` 0 s, `scale-down-cooldown-window` 300 s.
-The controller evaluates every 10 s (`DefaultResyncInterval`), so a 20 s window averages the
-last 2-3 samples. Each evaluation logs the values in force:
-`kubectl -n aibrix-system logs deploy/aibrix-controller-manager | grep "Effective autoscaling config"`.
+The window keeps one sample per second bucket (a later sample in the same second overwrites)
+and averages the buckets of the last 20 s with equal weight. The sample count is not fixed:
+besides the 10 s resync (`DefaultResyncInterval`), the controller watches PodAutoscaler
+objects without an event filter, so its own status write-back and every scaling step trigger
+an immediate re-evaluation that adds a sample. Under load this chains decisions: one canary
+went 1 -> 2 -> 3 -> 4 within 5.5 s (`max-scale-up-rate` caps each step, not the chain;
+scale-up cooldown is 0 s). This is the stock controller behaviour and is kept as the baseline.
+Each evaluation logs the values in force, and the window itself:
+`kubectl -n aibrix-system logs deploy/aibrix-controller-manager | grep -E "Effective autoscaling config|Metrics window aggregation"`
+(`stableWindow`, `stableWindowSpan` = time from the oldest to the newest sample, at most the window).
 
 ## Leftover assumptions (verify on the live cluster after R3)
 
