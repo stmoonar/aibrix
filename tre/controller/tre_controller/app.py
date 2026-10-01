@@ -240,10 +240,17 @@ def create_controller_dependencies(
         if redis_client is not None
         else _create_redis_client(cfg.redis_url, redis_client_factory, timeout_s=redis_timeout_s)
     )
+    # The metrics reads (per-pod window ZRANGEBYSCOREs) get their own, longer timeout
+    # than the state / scale-memory client: a separate client even on the same URL.
+    metrics_timeout_s = float(getattr(cfg, "redis_metrics_socket_timeout_s", 0.0) or 0.0)
+    share = injected_redis_client or (
+        cfg.metrics_redis_url == cfg.redis_url
+        and (redis_client_factory is not None or metrics_timeout_s == redis_timeout_s)
+    )
     metrics_redis_client = (
         redis_client
-        if injected_redis_client or cfg.metrics_redis_url == cfg.redis_url
-        else _create_redis_client(cfg.metrics_redis_url, redis_client_factory, timeout_s=redis_timeout_s)
+        if share
+        else _create_redis_client(cfg.metrics_redis_url, redis_client_factory, timeout_s=metrics_timeout_s)
     )
     store = MetricsStore(
         metrics_redis_client,

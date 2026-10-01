@@ -99,9 +99,12 @@ model on the legacy fixed-alpha EMA has no extension).
   dropped, and so is one the first tick finds contradicted by the fleet (fewer
   routable replicas than it had counted before its scale-up), so a restart
   never holds a model on stale memory. Best effort: a Redis error only loses
-  the memory (the previous behaviour) and is logged; the controller's Redis
-  clients have a socket / connect timeout (`TRE_REDIS_SOCKET_TIMEOUT_SECONDS`,
-  2 s), so a stalled Redis cannot block dispatch. The SM fleet view carries no
+  the memory (the previous behaviour) and is logged; the controller's state
+  Redis client has a socket / connect timeout (`TRE_REDIS_SOCKET_TIMEOUT_SECONDS`,
+  2 s), so a stalled Redis cannot block dispatch. The metrics-read client has its
+  own (`TRE_REDIS_METRICS_SOCKET_TIMEOUT_SECONDS`, 10 s: measured on the live
+  tre-v2 Redis, read-only, per call p99 0.35 ms / max 73 ms, a whole tick's reads
+  p99 162 ms / max 241 ms; default max(10 s, 5 x p99)). The SM fleet view carries no
   wake timestamps, so it could not serve as the source.
 
 Decision log: `rescue_target:<m>:n=..:z=..:desired=..:covered=..:planned=..`

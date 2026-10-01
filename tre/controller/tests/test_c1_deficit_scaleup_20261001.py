@@ -742,3 +742,30 @@ def test_create_redis_client_passes_the_timeouts(monkeypatch):
     monkeypatch.setitem(sys.modules, "redis", types.SimpleNamespace(Redis=_Redis))
     app._create_redis_client("redis://r:6379/0", None, timeout_s=2.0)
     assert seen == {"url": "redis://r:6379/0", "socket_timeout": 2.0, "socket_connect_timeout": 2.0}
+
+
+def test_metrics_redis_client_has_its_own_longer_timeout(monkeypatch):
+    from tre_controller import app
+    from tre_controller.config import ControllerConfig
+
+    cfg = ControllerConfig.from_env({})
+    assert cfg.redis_metrics_socket_timeout_s == 10.0 and cfg.redis_socket_timeout_s == 2.0
+    custom = ControllerConfig.from_env({"TRE_REDIS_METRICS_SOCKET_TIMEOUT_SECONDS": "30"})
+    assert custom.redis_metrics_socket_timeout_s == 30.0
+
+    created = []
+
+    def fake_create(url, factory, *, timeout_s=0.0):
+        created.append((url, timeout_s))
+        return object()
+
+    def stop(*_args, **_kwargs):
+        raise RuntimeError("stop after the clients")
+
+    monkeypatch.setattr(app, "_create_redis_client", fake_create)
+    monkeypatch.setattr(app, "MetricsStore", stop)
+    with pytest.raises(RuntimeError, match="stop after the clients"):
+        app.create_controller_dependencies(cfg)
+    # Same URL, different timeouts: two clients (state 2 s, metrics 10 s).
+    assert created == [(cfg.redis_url, 2.0), (cfg.metrics_redis_url, 10.0)]
+    assert cfg.metrics_redis_url == cfg.redis_url
