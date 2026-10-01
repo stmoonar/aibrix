@@ -498,10 +498,13 @@ class ScalingRegistryConfig:
     #: O1: added to a routable-count change time before rounding up to the gateway grid
     #: (the gateway applies the SM's routable label through its pod informer).
     breakpoint_margin_ms: int = 1000
-    #: O1: a C1 rescue decided on a partial (post-breakpoint) window adds at most this
-    #: many replicas; the whole deficit at once once a whole window follows the
-    #: breakpoint (review P2-1). 0 = no cap.
+    #: O1 (review P2-1, evidence-gated): a C1 rescue decided on a partial
+    #: (post-breakpoint) window with fewer than ``breakpoint_lowevidence_requests``
+    #: completed requests adds at most ``breakpoint_partial_max_step`` replicas; with at
+    #: least that many it asks for the whole deficit (ratio / step_pods caps apply).
+    #: ``breakpoint_partial_max_step: 0`` = no cap at all.
     breakpoint_partial_max_step: int = 1
+    breakpoint_lowevidence_requests: int = 10
     #: O1: after this many consecutive held metrics windows (10 s each) a receiver
     #: decides on the whole window again (donors still need a clean one) - a model whose
     #: routable count keeps changing is not starved (review P2-2). 0 = never.
@@ -516,7 +519,8 @@ SCALING_KEYS = frozenset({
     "rescue_max_step_ratio", "scale_up_cooldown_enabled", "rescue_max_step_pods",
     "donor_surplus_release", "rescue_settle_ema_k",
     "breakpoint_window", "onset_warmup_guard", "min_evidence_grids", "min_evidence_requests",
-    "breakpoint_margin_ms", "breakpoint_partial_max_step", "breakpoint_hold_max_windows",
+    "breakpoint_margin_ms", "breakpoint_partial_max_step", "breakpoint_lowevidence_requests",
+    "breakpoint_hold_max_windows",
     "gateway_clock_tolerance_ms", "gateway_clock_check_s",
 })
 
@@ -597,6 +601,9 @@ def parse_scaling_config(raw: dict[str, Any] | None) -> ScalingRegistryConfig:
         breakpoint_margin_ms=_scaling_count(raw, "breakpoint_margin_ms", defaults.breakpoint_margin_ms, 0),
         breakpoint_partial_max_step=_scaling_count(
             raw, "breakpoint_partial_max_step", defaults.breakpoint_partial_max_step, 0
+        ),
+        breakpoint_lowevidence_requests=_scaling_count(
+            raw, "breakpoint_lowevidence_requests", defaults.breakpoint_lowevidence_requests, 0
         ),
         breakpoint_hold_max_windows=_scaling_count(
             raw, "breakpoint_hold_max_windows", defaults.breakpoint_hold_max_windows, 0

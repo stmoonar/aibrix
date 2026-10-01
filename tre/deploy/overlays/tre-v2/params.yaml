@@ -595,9 +595,12 @@ data:
       # the SM writes the routable label before it answers, the gateway applies it via
       # its pod informer shortly after.
       breakpoint_margin_ms: 1000
-      # A C1 rescue decided on a partial (post-breakpoint) window adds at most this many
-      # replicas; the whole deficit once a whole window follows the breakpoint. 0 = no cap.
+      # A C1 rescue decided on a partial (post-breakpoint) window with fewer than
+      # breakpoint_lowevidence_requests completed requests adds at most
+      # breakpoint_partial_max_step replicas; with more, the whole deficit at once.
+      # breakpoint_partial_max_step: 0 = no cap.
       breakpoint_partial_max_step: 1
+      breakpoint_lowevidence_requests: 10
       # After this many consecutive held 10 s windows a receiver decides on the whole
       # window again (routable count changing all the time); donors still wait. 0 = never.
       breakpoint_hold_max_windows: 6

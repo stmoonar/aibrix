@@ -81,9 +81,13 @@ as the fallback. In-flight protection and the base / covered bookkeeping are unc
 
 * *low-QPS evidence* (P2-1): tokens count at request completion, so a 20 s suffix with one
   short request done and long ones running can read Z ~ 5 %. `min_evidence_requests`
-  defaults to 3, and a C1 rescue decided on a partial window adds at most
-  `breakpoint_partial_max_step` (1) replica; the whole deficit only on a whole window
-  (event `rescue_partial_window_step`). Cost: see the timeline below.
+  defaults to 3 (can the window decide at all), and a C1 rescue decided on a partial
+  window **with fewer than `breakpoint_lowevidence_requests` (10) completed requests**
+  adds at most `breakpoint_partial_max_step` (1) replica (event
+  `rescue_low_evidence_step`); with 10+ requests the whole deficit at once (ratio /
+  step_pods caps). At 0.1 rps a 20 s suffix holds ~2 completions (< 3: no decision); a
+  partial-window misjudgment needs 3-9 completions and then adds at most +1 replica per
+  breakpoint (instead of C1's +4).
 * *starvation* (P2-2): after `breakpoint_hold_max_windows` (6 windows = 60 s; a single
   change holds at most 3, an onset 2) consecutive held windows a receiver decides on the
   whole window again (EMA advanced, event `breakpoint_hold_fallback`); donors still need
@@ -105,25 +109,19 @@ as the fallback. In-flight protection and the base / covered bookkeeping are unc
 
 | event | pre-O1 | O1 |
 |---|---|---|
-| idle -> load, first CRITICAL decision | onset + 30 s | onset + 20 s (+1 replica with the partial cap) |
+| idle -> load, first CRITICAL decision | onset + 30 s | onset + 20 s (+1 only on < 10 requests) |
 | scale-up done -> next decision on the new count | window start >= done + 20 s (~done + 60-70 s) | ceil(done) + 20 s (~done + 30-40 s) |
 | scale-down eligibility after any breakpoint | F4: window start >= done | whole window after the breakpoint |
 
-With the partial cap (review P2-1, default 1) every step after a breakpoint is +1 until a
-whole window follows it, so 1 -> 4 takes three rounds of (wake ~3 s, change rounded to the
-grid, 20 s evidence). Replay (decision offsets from the logs, wake 3 s from `sm.log`), time
-after the load start:
+Replay (decision offsets from the logs, wake 3 s from `sm.log`), time after the load
+start. These loads complete hundreds of requests per grid, so the evidence gate never
+caps them: 1 -> 2 and 1 -> 4 happen in the same step.
 
-| run | pre-O1 + C1: 1 -> 4 | O1, no cap: 1 -> 4 | O1 + cap 1: 1 -> 2 / 3 / 4 |
+| run | pre-O1 + C1: 1 -> 4 | O1 (evidence-gated cap): 1 -> 4 | an always-on partial cap: 1 -> 2 / 3 / 4 |
 |---|---|---|---|
 | C-crit | 53.7 s | 43.7 s | 43.7 / 83.7 / 123.7 s |
 | F4-161915 | 55.7 s | 45.7 s | 45.7 / 85.7 / 125.7 s |
 | F4-161559 | 50.5 s | 40.5 s | 40.5 / 80.5 / 120.5 s |
-
-The cap trades ~70 s of 1 -> 4 for the low-QPS case; `breakpoint_partial_max_step: 0`
-removes it. A cap that applies only to thin evidence (few completed requests in the
-suffix) would keep both; not done. `min_evidence_requests: 3` does not move the first
-decision in these runs (hundreds of requests per grid).
 
 Replay on the 2026-10-01 verify evidence (ctrl_ticks deconvolved per grid; the pre-O1
 replay reproduces the logged first scale-up of all 6 episodes that logged one): first
@@ -139,7 +137,8 @@ Z = 0.20 (< tau_crit 0.56, the ADR-0013 false CRITICAL); O1's first decided Z = 
 | `breakpoint_window` | true | O1 on; false = pre-O1 (the onset guard then always applies) |
 | `onset_warmup_guard` | false | also apply the ADR-0013 guard on top of O1 |
 | `breakpoint_margin_ms` | 1000 | added to a routable change time before grid rounding |
-| `breakpoint_partial_max_step` | 1 | C1 step cap on a partial window (0 = none) |
+| `breakpoint_partial_max_step` | 1 | C1 step cap on a low-evidence partial window (0 = none) |
+| `breakpoint_lowevidence_requests` | 10 | below this many completed requests a partial window is capped |
 | `breakpoint_hold_max_windows` | 6 | held windows before a receiver falls back to the whole window (0 = never) |
 | `gateway_clock_tolerance_ms` / `gateway_clock_check_s` | 2000 / 60 | same-clock check (0 s = off) |
 | `min_evidence_grids` | 2 | complete grids after the breakpoint before a scale-up |
@@ -168,7 +167,7 @@ inside the window) is bit-identical.
 
 * A model whose routable count keeps changing gets no decision for up to
   `breakpoint_hold_max_windows` windows (then the whole-window fallback).
-* The partial-window cap slows 1 -> 4 by ~70 s (table above).
+* A partial window with 3-9 completions still steps +1 at a time (low-QPS loads only).
 * Clock offsets inside the gateway's write phase are invisible to the same-clock check.
 * The onset is still "first window with a completed request": a long prefill (14b, E-14b)
   shows queue 30 s before its first completion. An activity onset (Q > 0) would gain

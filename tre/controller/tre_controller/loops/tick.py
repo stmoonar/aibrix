@@ -299,6 +299,7 @@ def _scaling_options(registry: Registry) -> dict:
         "partial_window_max_step": int(getattr(config, "breakpoint_partial_max_step", 0) or 0)
         if bool(getattr(config, "breakpoint_window", False))
         else 0,
+        "partial_window_lowevidence_requests": int(getattr(config, "breakpoint_lowevidence_requests", 0) or 0),
     }
 
 
@@ -937,6 +938,11 @@ def _model_contexts(
                         "signal_window_start_ms": window.start_ms,
                         "signal_evidence_grids": window.grids,
                         "signal_hold_reason": None if computed.hold_fallback else window.reason,
+                        # Completed requests of the post-breakpoint window (the C1 step
+                        # cap's evidence); None on a whole window.
+                        "signal_evidence_requests": (
+                            None if window.full else getattr(window.metrics, "request_count", None)
+                        ),
                     }
                 )
         else:

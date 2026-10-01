@@ -623,6 +623,7 @@ def test_shipped_registry_enables_o1_with_the_default_evidence():
     assert scaling.breakpoint_window is True and scaling.onset_warmup_guard is False
     assert scaling.min_evidence_grids == 2 and scaling.min_evidence_requests == 3
     assert scaling.breakpoint_partial_max_step == 1 and scaling.breakpoint_hold_max_windows == 6
+    assert scaling.breakpoint_lowevidence_requests == 10
     assert scaling.gateway_clock_tolerance_ms == 2000 and scaling.gateway_clock_check_s == 60
     assert json.dumps(sorted(ScalingRegistryConfig.__dataclass_fields__))  # serialisable names
     assert math.isfinite(BreakpointWindowConfig().grid_ms)
@@ -659,29 +660,62 @@ def test_partial_window_needs_three_completed_requests_by_default():
     assert state.effective_window("m", _window(50_000, [IDLE, TRICKLE, TRICKLE])).warm
 
 
-def _c1_plan(full: bool | None, *, step: int = 1, z: float = 0.05):
+def _c1_plan(full: bool | None, *, step: int = 1, z: float = 0.05, requests: float | None = 5.0,
+             low: int = 10):
     cfg = PlanConfig(min_replicas_per_model=1, max_replicas_per_model=8, rescue_max_step_ratio=2.0,
-                     rescue_max_step_pods=4, partial_window_max_step=step)
+                     rescue_max_step_pods=4, partial_window_max_step=step,
+                     partial_window_lowevidence_requests=low)
     ctx = {"assigned_replicas": 1, "routable_pods": 1, "awake_replicas": 1, "signal_warm": True}
     if full is not None:
         ctx["signal_full_window"] = full
+        ctx["signal_evidence_requests"] = None if full else requests
     return build_plan(model_contexts={"m": ctx}, classifications=[_cls("m", ModelState.CRITICAL, z)],
                       model_replicas={"m": 1}, idle_gpus=6, cfg=cfg)
 
 
-def test_c1_step_is_capped_on_a_partial_window_only():
-    """P2-1: +1 on a partial window, the whole deficit (here +4) on a whole one."""
-    partial = _c1_plan(False)
-    assert sum(a.delta for a in _ups(partial.actions)) == 1
-    assert any(e.startswith("rescue_partial_window_step:m:4->1") for e in partial.events)
+def test_c1_step_is_capped_only_on_low_evidence_partial_windows():
+    """P2-1 (evidence-gated): +1 on a partial window with < 10 completed requests (a
+    low-QPS heavy-tailed load), the whole deficit (+4) with enough requests or a whole window."""
+    low = _c1_plan(False, requests=4.0)
+    assert sum(a.delta for a in _ups(low.actions)) == 1
+    assert any(e.startswith("rescue_low_evidence_step:m:4->1:requests=4.0") for e in low.events)
+    assert sum(a.delta for a in _ups(_c1_plan(False, requests=10.0).actions)) == 4
+    assert sum(a.delta for a in _ups(_c1_plan(False, requests=None).actions)) == 1  # unknown = low
     assert sum(a.delta for a in _ups(_c1_plan(True).actions)) == 4
     assert sum(a.delta for a in _ups(_c1_plan(None).actions)) == 4  # pre-O1 contexts
-    assert sum(a.delta for a in _ups(_c1_plan(False, step=0).actions)) == 4  # cap off
-    # Wired from the registry only with O1 on.
+    assert sum(a.delta for a in _ups(_c1_plan(False, requests=4.0, step=0).actions)) == 4  # cap off
     from tre_controller.loops.tick import _scaling_options
 
-    assert _scaling_options(_registry())["partial_window_max_step"] == 1
+    options = _scaling_options(_registry())
+    assert options["partial_window_max_step"] == 1 and options["partial_window_lowevidence_requests"] == 10
     assert _scaling_options(_registry(breakpoint_window=False))["partial_window_max_step"] == 0
+    assert parse_scaling_config({"breakpoint_lowevidence_requests": 0}).breakpoint_lowevidence_requests == 0
+    with pytest.raises(ValueError):
+        parse_scaling_config({"breakpoint_lowevidence_requests": -1})
+
+
+def test_low_qps_heavy_tail_scales_at_most_one_step_per_breakpoint():
+    """0.1-0.3 rps with long requests: the 20 s suffix holds 3-9 completions; a short one
+    done and long ones running reads Z far below tau_crit - the rescue adds +1, not +4."""
+    registry = _registry(10_000.0, rescue_max_step_pods=4)
+    state = SignalState(warmup_ms=-1, breakpoint=BreakpointWindowConfig(grid_ms=GRID))
+    thin = (12.0, 4.0, 2.0, 2.0)  # 2 short completions per grid, 4 long requests running
+    queue = _Queue()
+    for i in range(2, 6):
+        end = 1_000_000 + (i + 1) * GRID
+        run_rescue_tick(_snap(_window(end, ([IDLE] * 3 + [thin] * 3)[i - 2 : i + 1])), queue=queue,
+                        registry=registry, signal_state=state)
+    ups = _ups(queue.submitted)
+    assert ups and sum(a.delta for a in ups) == 1
+    # A deep overload (Z = 0.10) with 10+ completions in the suffix: the whole deficit.
+    DEEP = (1000.0, 30.0, 100.0, 100.0)
+    state = SignalState(warmup_ms=-1, breakpoint=BreakpointWindowConfig(grid_ms=GRID))
+    queue = _Queue()
+    for i in range(2, 6):
+        end = 1_000_000 + (i + 1) * GRID
+        run_rescue_tick(_snap(_window(end, ([IDLE] * 3 + [DEEP] * 3)[i - 2 : i + 1])), queue=queue,
+                        registry=registry, signal_state=state)
+    assert sum(a.delta for a in _ups(queue.submitted)) == 3  # 1 -> 4 (scaling cap)
 
 
 def test_starving_receiver_falls_back_to_the_whole_window_after_hold_max_windows():

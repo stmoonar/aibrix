@@ -75,9 +75,13 @@ class PlanConfig:
     # donor of a CRITICAL receiver gives its whole surplus in one tick. Off (default):
     # one step per tick, as before C1 - scale-up is aggressive, scale-down cautious.
     donor_surplus_release: bool = False
-    #: O1 review P2-1: a C1 rescue decided on a partial (post-breakpoint) window -
-    #: ``signal_full_window`` False - adds at most this many replicas (0 = no cap).
+    #: O1 review P2-1 (evidence-gated): a C1 rescue decided on a partial
+    #: (post-breakpoint) window - ``signal_full_window`` False - whose
+    #: ``signal_evidence_requests`` is below ``partial_window_lowevidence_requests``
+    #: adds at most ``partial_window_max_step`` replicas (0 = no cap); with more
+    #: evidence the whole deficit at once.
     partial_window_max_step: int = 0
+    partial_window_lowevidence_requests: int = 0
 
     def __post_init__(self) -> None:
         # No silent fallback for a bad tp_size (the registry rejects it at load; this
@@ -509,15 +513,20 @@ def build_plan(
                 base, recv.Z_m, recv.tau.tau_crit, cfg.rescue_max_step_ratio, cfg.rescue_max_step_pods
             )
             raw_need = min(desired - covered, recv_max - max(recv_awake, covered))
+            recv_ctx = model_contexts.get(recv.model_name, {})
+            evidence = recv_ctx.get("signal_evidence_requests")
             if (
                 cfg.partial_window_max_step > 0
                 and raw_need > cfg.partial_window_max_step
-                and model_contexts.get(recv.model_name, {}).get("signal_full_window") is False
+                and recv_ctx.get("signal_full_window") is False
+                and (evidence is None or float(evidence) < cfg.partial_window_lowevidence_requests)
             ):
-                # O1 review P2-1: a partial window is thin evidence (tokens count at
-                # completion) - one step now, the whole deficit on a whole window.
+                # O1 review P2-1: a partial window with few completed requests is thin
+                # evidence (tokens count at completion) - one step now; with enough
+                # requests (or on a whole window) the whole deficit at once.
                 events.append(
-                    f"rescue_partial_window_step:{recv.model_name}:{raw_need}->{cfg.partial_window_max_step}"
+                    f"rescue_low_evidence_step:{recv.model_name}:{raw_need}->{cfg.partial_window_max_step}"
+                    f":requests={evidence}"
                 )
                 raw_need = cfg.partial_window_max_step
             if raw_need <= 0:
