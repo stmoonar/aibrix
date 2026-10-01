@@ -17,7 +17,7 @@ DOCKERFILE = TRE_ROOT / "gpu-truth" / "Dockerfile"
 
 #: The agent image this release runs (bump together with registry.yaml gpu_truth.image,
 #: the bootstrap copy in overlays/tre-v2/params.yaml, and regenerate the manifest).
-EXPECTED_IMAGE = "tre-v2-gpu-truth:20261001-e14151b1"
+EXPECTED_IMAGE = "tre-v2-gpu-truth:20261001-8d8b2565"
 
 
 def _docs() -> list[dict]:

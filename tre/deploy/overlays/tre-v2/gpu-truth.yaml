@@ -45,7 +45,7 @@ spec:
           # Built from tre/gpu-truth/Dockerfile (python slim + the agent); no
           # CUDA userspace in the image, nvidia-smi / NVML come from the host
           # driver via the NVIDIA container runtime.
-          image: tre-v2-gpu-truth:20261001-e14151b1
+          image: tre-v2-gpu-truth:20261001-8d8b2565
           imagePullPolicy: IfNotPresent
           command:
             - python3

@@ -657,4 +657,4 @@ scaling:
 # reads this section; the controller, service-manager and UI ignore it.
 gpu_truth:
   # Agent image built from tre/gpu-truth/Dockerfile (build context tre/).
-  image: tre-v2-gpu-truth:20261001-e14151b1
+  image: tre-v2-gpu-truth:20261001-8d8b2565
