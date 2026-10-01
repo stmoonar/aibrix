@@ -608,6 +608,12 @@ data:
       # beyond the tolerance O1 is suspended (pre-O1 behaviour) until 3 good checks.
       gateway_clock_tolerance_ms: 2000
       gateway_clock_check_s: 60
+    # Node GPU-truth agent DaemonSet (deploy/gen_gpu_truth_manifest.py renders
+    # overlays/tre-v2/gpu-truth.yaml from this and cluster.nodes). Only the generator
+    # reads this section; the controller, service-manager and UI ignore it.
+    gpu_truth:
+      # Agent image built from tre/gpu-truth/Dockerfile (build context tre/).
+      image: tre-v2-gpu-truth:20261001-e14151b1
 kind: ConfigMap
 metadata:
   name: tre-v2-registry

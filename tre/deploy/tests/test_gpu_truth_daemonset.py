@@ -2,64 +2,84 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 import yaml
 
 import gen_gpu_truth_manifest as gen
+from tre_common.registry import load_registry
 
 
 DEPLOY_ROOT = Path(__file__).resolve().parents[1]
+TRE_ROOT = DEPLOY_ROOT.parent
 MANIFEST = DEPLOY_ROOT / "overlays" / "tre-v2" / "gpu-truth.yaml"
-AGENT_SCRIPT = DEPLOY_ROOT / "scripts" / "gpu_truth_agent.py"
+REGISTRY = DEPLOY_ROOT / "registry.yaml"
+DOCKERFILE = TRE_ROOT / "gpu-truth" / "Dockerfile"
+
+#: The agent image this release runs (bump together with registry.yaml gpu_truth.image,
+#: the bootstrap copy in overlays/tre-v2/params.yaml, and regenerate the manifest).
+EXPECTED_IMAGE = "tre-v2-gpu-truth:20261001-e14151b1"
 
 
 def _docs() -> list[dict]:
-    return list(yaml.safe_load_all(MANIFEST.read_text(encoding="utf-8")))
+    return [doc for doc in yaml.safe_load_all(MANIFEST.read_text(encoding="utf-8")) if doc]
 
 
-def _by_kind(kind: str) -> dict:
-    return next(doc for doc in _docs() if doc["kind"] == kind)
+def _daemonset() -> dict:
+    return next(doc for doc in _docs() if doc["kind"] == "DaemonSet")
 
 
-def test_configmap_script_is_single_source_copy() -> None:
-    configmap = _by_kind("ConfigMap")
-    assert configmap["metadata"]["name"] == "tre-v2-gpu-truth-agent"
-    assert configmap["metadata"]["namespace"] == "tre-v2"
-    embedded = configmap["data"]["gpu_truth_agent.py"]
-    source = AGENT_SCRIPT.read_text(encoding="utf-8")
-    # Block scalar round-trips to the original script; guard against drift.
-    assert embedded.rstrip("\n") == source.rstrip("\n")
+def _registry_raw() -> dict:
+    return yaml.safe_load(REGISTRY.read_text(encoding="utf-8"))
 
 
 def test_manifest_matches_generator_output() -> None:
-    expected = gen.render(AGENT_SCRIPT.read_text(encoding="utf-8"))
-    assert MANIFEST.read_text(encoding="utf-8") == expected
+    assert MANIFEST.read_text(encoding="utf-8") == gen.render_from_registry(REGISTRY)
 
 
-def test_daemonset_targets_gpu_nodes_and_writes_tre_v2_redis() -> None:
-    ds = _by_kind("DaemonSet")
+def test_manifest_has_no_agent_configmap() -> None:
+    # The agent is baked into its image; no ConfigMap copy that could drift.
+    assert [doc["kind"] for doc in _docs()] == ["DaemonSet"]
+
+
+def test_image_comes_from_the_registry_and_is_our_own_build() -> None:
+    container = _daemonset()["spec"]["template"]["spec"]["containers"][0]
+    assert _registry_raw()["gpu_truth"]["image"] == EXPECTED_IMAGE
+    assert container["image"] == EXPECTED_IMAGE
+    assert container["imagePullPolicy"] == "IfNotPresent"
+    assert "vllm" not in container["image"] and "latest" not in container["image"]
+
+
+def test_daemonset_targets_registry_nodes_and_writes_tre_v2_redis() -> None:
+    ds = _daemonset()
     assert ds["metadata"]["name"] == "tre-v2-gpu-truth"
     assert ds["metadata"]["namespace"] == "tre-v2"
+    assert ds["spec"]["updateStrategy"]["rollingUpdate"]["maxUnavailable"] == 1
     spec = ds["spec"]["template"]["spec"]
     assert spec["hostPID"] is False
+    assert "volumes" not in spec
     terms = spec["affinity"]["nodeAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"]["nodeSelectorTerms"]
     hostnames = terms[0]["matchExpressions"][0]
     assert hostnames["key"] == "kubernetes.io/hostname"
     assert hostnames["operator"] == "In"
-    assert set(hostnames["values"]) == {"nscc-ds-4a100-node9", "nscc-ds-4a100-node10"}
+    registry_nodes = [node.name for node in load_registry(str(REGISTRY))._topology.nodes]
+    assert registry_nodes and hostnames["values"] == registry_nodes
     container = spec["containers"][0]
-    assert container["image"] == "vllm/vllm-openai:0.10.1-sleep"
     command = container["command"]
-    assert "/agent/gpu_truth_agent.py" in command
+    assert command[:2] == ["python3", gen.AGENT_IN_IMAGE]
     assert "redis://tre-v2-redis:6379/0" in command
     assert "$(NODE_NAME)" in command
     env = {item["name"]: item for item in container["env"]}
     assert env["NVIDIA_VISIBLE_DEVICES"]["value"] == "all"
+    assert env["NVIDIA_DRIVER_CAPABILITIES"]["value"] == "utility"
     assert env["NODE_NAME"]["valueFrom"]["fieldRef"]["fieldPath"] == "spec.nodeName"
-    assert container["volumeMounts"][0]["mountPath"] == "/agent"
+    assert "volumeMounts" not in container
+    security = container["securityContext"]
+    assert security["runAsNonRoot"] is True and security["runAsUser"] != 0
+    assert security["allowPrivilegeEscalation"] is False
 
 
 def test_daemonset_samples_every_10s_and_polls_refresh_requests() -> None:
-    command = _by_kind("DaemonSet")["spec"]["template"]["spec"]["containers"][0]["command"]
+    command = _daemonset()["spec"]["template"]["spec"]["containers"][0]["command"]
     args = dict(zip(command[2::2], command[3::2]))
     assert args["--interval-s"] == "10"
     assert args["--refresh-poll-s"] == "0.25"
@@ -67,14 +87,47 @@ def test_daemonset_samples_every_10s_and_polls_refresh_requests() -> None:
 
 
 def test_generator_renders_a_custom_interval() -> None:
-    import pytest
-
-    script = AGENT_SCRIPT.read_text(encoding="utf-8")
-    custom = list(yaml.safe_load_all(gen.render(script, interval_s=5, refresh_poll_s=0.5, ttl_s=60)))
-    ds = next(doc for doc in custom if doc["kind"] == "DaemonSet")
+    custom = list(
+        yaml.safe_load_all(gen.render(image="img:1", nodes=["n1"], interval_s=5, refresh_poll_s=0.5, ttl_s=60))
+    )
+    ds = next(doc for doc in custom if doc and doc["kind"] == "DaemonSet")
     command = ds["spec"]["template"]["spec"]["containers"][0]["command"]
     assert command[command.index("--interval-s") + 1] == "5"
     assert command[command.index("--refresh-poll-s") + 1] == "0.5"
     assert command[command.index("--ttl-s") + 1] == "60"
     with pytest.raises(ValueError):
-        gen.render(script, interval_s=120, ttl_s=120)
+        gen.render(image="img:1", nodes=["n1"], interval_s=120, ttl_s=120)
+
+
+def test_generator_requires_an_image_and_nodes() -> None:
+    raw = _registry_raw()
+    with pytest.raises(ValueError, match="gpu_truth.image"):
+        gen.settings_from_registry({**raw, "gpu_truth": {}})
+    with pytest.raises(ValueError, match="unknown keys"):
+        gen.settings_from_registry({**raw, "gpu_truth": {"image": "x:1", "imagee": "y"}})
+    with pytest.raises(ValueError, match="cluster.nodes"):
+        gen.settings_from_registry({**raw, "cluster": {"nodes": []}})
+    image, nodes = gen.settings_from_registry({**raw, "cluster": {"nodes": [{"name": "a"}, {"name": "b"}]}})
+    assert image == EXPECTED_IMAGE and nodes == ["a", "b"]
+
+
+def test_components_ignore_the_gpu_truth_section() -> None:
+    """Old and new registry parsers read named top-level sections only, so the
+    gpu_truth: section (read only by the generator) cannot stop a component."""
+    raw = _registry_raw()
+    assert "gpu_truth" in raw
+    without = {key: value for key, value in raw.items() if key != "gpu_truth"}
+    from tre_common.registry import _parse_registry
+
+    assert _parse_registry(raw)._topology == _parse_registry(without)._topology
+
+
+def test_dockerfile_bakes_the_agent_at_the_commanded_path() -> None:
+    text = DOCKERFILE.read_text(encoding="utf-8")
+    assert f"COPY deploy/scripts/gpu_truth_agent.py {gen.AGENT_IN_IMAGE}" in text
+    assert "COPY gpu-truth/requirements.txt" in text
+    assert "NVIDIA_DRIVER_CAPABILITIES=utility" in text
+    assert "\nUSER 65532:65532\n" in text
+    requirements = (TRE_ROOT / "gpu-truth" / "requirements.txt").read_text(encoding="utf-8")
+    pins = [line for line in requirements.splitlines() if line and not line.startswith("#")]
+    assert pins == ["redis==6.4.0"]

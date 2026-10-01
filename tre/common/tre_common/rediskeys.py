@@ -133,7 +133,7 @@ SM_SLEEP_ACK_LATENCY_MAX = 5000
 
 
 # --- gpu-truth: DaemonSet agent <-> service-manager ---------------------------------
-# The agent (deploy/scripts/gpu_truth_agent.py) runs standalone from a ConfigMap and
+# The agent (deploy/scripts/gpu_truth_agent.py) runs standalone in its own image and
 # repeats these literals; deploy/tests/test_gpu_truth_agent.py keeps them equal.
 #: STRING (JSON) per node, SETEX by the agent: {"node", "timestamp", "gpus": [{"uuid",
 #: "used_mib", "total_mib"}], "seq", "refresh_seq"}. Readers SCAN ``tre:gpu_truth:*``.
