@@ -40,8 +40,7 @@ Branch `feat/apa-window-20261001` from 7994da76, source commit 772415f8 (94a0d82
   evaluation adds a sample (one per 1 s bucket, equal weight). Under load the decisions
   chain: in the canary 1 -> 2 -> 3 -> 4 happened within 5.5 s; `max-scale-up-rate` 2 caps
   each step, not the chain, and the scale-up cooldown is 0 s.
-- Review findings P3-1 and P3-4 (2026-10-01) are about pre-existing controller behaviour
-  and are not changed by this release.
+- Known pre-existing behaviour (not changed): see the section of that name below.
 - The binary also carries the non-autoscaler changes between the live image's source
   (7d3535b1) and 7994da76: the vLLM metric-name fallback in `pkg/metrics`
   (`kv_cache_usage_perc` is still read as `vllm:kv_cache_usage_perc` first) and the
@@ -138,6 +137,16 @@ Run on the control-plane node. `NS=aibrix-system`, `D=aibrix-controller-manager`
 6. Rollback (any failure in 2-5): `$B/rollback.sh` (sets the immutable tag above); confirm
    the pod's `imageID` ends in `4c658acb5caf` and the lease is held. The CR files are plain manifests: re-apply the
    old ones from `main` if the window or tolerance keys need to go back.
+
+## Known pre-existing behaviour (not changed by this release)
+
+- Window objects of a deleted PodAutoscaler are not reclaimed: `cleanupDeletedPA`
+  (`pkg/controller/podautoscaler/podautoscaler_controller.go`) leaves its stable / panic
+  windows and histories in the shared `MetricsClient`. Memory is bounded here because the
+  baseline uses three fixed PA names; when a PA of the same name is recreated, the old
+  samples are dropped by timestamp at the first new record.
+- When no pod's metric can be scraped, `ProcessSnapshot` returns the error and the window
+  keeps its previous values; APA keeps deciding on those values until scraping recovers.
 
 ## Open points for the owner (differences from v1, not changed here)
 
