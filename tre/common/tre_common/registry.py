@@ -447,6 +447,64 @@ class PlacementConfig:
     wake_cooldown_node_s: float = 60.0
 
 
+@dataclass(frozen=True)
+class ScalingRegistryConfig:
+    """Registry ``scaling:`` section (controller only; every key optional; read at
+    controller start, restart-to-apply). Older images ignore the whole section
+    (the registry loader only reads the sections it knows).
+
+    C1 (2026-10-01, design 20261001-c1-deficit-scaleup): the fast-loop rescue of a
+    CRITICAL receiver asks for its whole deficit at once,
+    ``desired = min(max(n + 1, ceil(n * tau_crit / Z)), max(n + 1, floor(ratio * n)),
+    scaling cap, capacity found)`` with ``n`` its routable replicas, instead of one
+    ``ceil(0.1 * n)`` step per window."""
+
+    #: ``ratio`` above: the rescue target is at most ``ratio x n`` (never below n + 1).
+    #: 0 = the legacy one-step rescue (``ceil(0.1 * n)`` per decision window).
+    rescue_max_step_ratio: float = 2.0
+    #: Hold a CRITICAL receiver's next scale-up until a metrics window starting after
+    #: its last scale-up completed (review F4 cooldown, scale-up direction of the
+    #: fast loop). Off by default under C1: the rescue target bookkeeping already keeps
+    #: a not-yet-reflected scale-up from being repeated. Scale-down holds, the slow
+    #: loop and the LOW receivers keep the cooldown (TRE_ACTION_COOLDOWN).
+    scale_up_cooldown_enabled: bool = False
+
+
+SCALING_KEYS = frozenset({"rescue_max_step_ratio", "scale_up_cooldown_enabled"})
+
+
+def parse_scaling_config(raw: dict[str, Any] | None) -> ScalingRegistryConfig:
+    """Parse the optional ``scaling:`` registry section; raise ValueError on bad values
+    (unknown keys are ignored with a warning, like ``safescale:``)."""
+    if raw is None:
+        return ScalingRegistryConfig()
+    if not isinstance(raw, dict):
+        raise ValueError(f"scaling must be a mapping, got {raw!r}")
+    unknown = sorted(str(key) for key in set(raw) - SCALING_KEYS)
+    if unknown:
+        LOG.warning("registry scaling: ignoring unknown keys %s (known: %s)", unknown, sorted(SCALING_KEYS))
+    defaults = ScalingRegistryConfig()
+    ratio_raw = raw.get("rescue_max_step_ratio")
+    if isinstance(ratio_raw, bool):
+        raise ValueError(f"scaling.rescue_max_step_ratio must be a number, got {ratio_raw!r}")
+    try:
+        ratio = float(defaults.rescue_max_step_ratio if ratio_raw is None else ratio_raw)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"scaling.rescue_max_step_ratio must be a number, got {ratio_raw!r}") from exc
+    if not math.isfinite(ratio) or ratio < 0 or 0 < ratio < 1:
+        raise ValueError(
+            f"scaling.rescue_max_step_ratio must be 0 (legacy step) or at least 1, got {ratio_raw!r}"
+        )
+    cooldown_raw = raw.get("scale_up_cooldown_enabled")
+    if cooldown_raw is None:
+        cooldown = defaults.scale_up_cooldown_enabled
+    elif isinstance(cooldown_raw, bool):
+        cooldown = cooldown_raw
+    else:
+        raise ValueError(f"scaling.scale_up_cooldown_enabled must be true or false, got {cooldown_raw!r}")
+    return ScalingRegistryConfig(rescue_max_step_ratio=ratio, scale_up_cooldown_enabled=cooldown)
+
+
 #: ``safescale.slo_mode``: where the SafeScale probe's latency thresholds come from.
 #: ``labels`` - the calibration label's rule (``tre_common.slo_labels.label_def_for_model``:
 #: TPOT 75 ms, TTFT = max(floor, k * (c + b * L)) with the mean prompt length L of the
@@ -867,8 +925,10 @@ class Registry:
         vllm: VllmConfig | None = None,
         placement: PlacementConfig | None = None,
         safescale: SafeScaleRegistryConfig | None = None,
+        scaling: ScalingRegistryConfig | None = None,
     ) -> None:
         self._safescale = safescale or SafeScaleRegistryConfig()
+        self._scaling = scaling or ScalingRegistryConfig()
         self._topology = topology
         self._placement = placement or PlacementConfig()
         self._models = tuple(models)
@@ -897,6 +957,9 @@ class Registry:
 
     def safescale(self) -> SafeScaleRegistryConfig:
         return self._safescale
+
+    def scaling(self) -> ScalingRegistryConfig:
+        return self._scaling
 
     def vllm_env_for(self, model: ModelSpec) -> dict[str, str]:
         """The vLLM container environment of ``model``'s pods (besides the per-binding
@@ -1119,6 +1182,7 @@ def _parse_registry(raw: dict[str, Any]) -> Registry:
         vllm=parse_vllm_config(raw.get("vllm")),
         placement=parse_placement_config(raw.get("placement")),
         safescale=parse_safescale_config(raw.get("safescale")),
+        scaling=parse_scaling_config(raw.get("scaling")),
     )
 
 

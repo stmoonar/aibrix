@@ -588,3 +588,20 @@ safescale:
   # Direct path: the model pods' serving port (the reissue sidecar forwards
   # GET /metrics to vLLM).
   metrics_port: 8000
+
+# Fast-loop scale-up (controller only; read at start, restart-to-apply; every key
+# optional, the values below are the built-in defaults). C1, design
+# docs/design/20261001-c1-deficit-scaleup.md. Controller / SM / UI images before
+# 2026-10-01 ignore this top-level section (the registry loader only reads the
+# sections it knows).
+scaling:
+  # A CRITICAL receiver's rescue asks for its whole deficit at once: target
+  # min(max(n+1, ceil(n * tau_crit / Z)), max(n+1, floor(ratio * n)), the scaling
+  # cap max_awake_replicas, the capacity found), n = its routable replicas, Z its
+  # decision-window signal. 0 = the legacy one step (ceil(0.1 * n)) per window.
+  rescue_max_step_ratio: 2.0
+  # Also hold a CRITICAL receiver's scale-up until a metrics window starting after
+  # its last scale-up completed (the F4 cooldown, TRE_ACTION_COOLDOWN). Off: the
+  # rescue target bookkeeping already keeps an unreflected scale-up from repeating.
+  # Scale-down holds, LOW receivers and the slow loop keep the cooldown either way.
+  scale_up_cooldown_enabled: false

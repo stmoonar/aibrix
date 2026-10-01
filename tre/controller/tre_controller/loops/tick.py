@@ -22,6 +22,7 @@ from tre_controller.planning.planner import (
     HideAction,
     IncompletePolicy,
     PlanConfig,
+    RescueBasis,
     ScaleAction,
     ShrinkForSlotAction,
     UnhideAction,
@@ -196,6 +197,7 @@ def run_planner_tick(
         suppress_hot_proactive_probe=suppress_hot_proactive_probe,
         disable_eta_gate=disable_eta_gate,
         defrag_enabled=_defrag_enabled(registry),
+        **_scaling_options(registry),
     )
     plan = build_plan(
         model_contexts=contexts,
@@ -214,6 +216,8 @@ def run_planner_tick(
         refusals=_recent_refusals(queue),
         probe_backoff_models=_probe_backoff_models(safescale, snapshot.ts_ms),
         preemptible_models=_preemptible_models(queue) if rescue_due else None,
+        # C1: earlier rescue targets the decision windows do not reflect yet.
+        rescue_bases=_rescue_bases(snapshot, queue) if rescue_due else None,
     )
     if _prof_on:
         _plan_ns = time.perf_counter_ns() - _phase_t0
@@ -269,6 +273,37 @@ def run_planner_tick(
 def _defrag_enabled(registry: Registry) -> bool:
     placement = getattr(registry, "placement", None)
     return bool(getattr(placement(), "defrag_enabled", False)) if callable(placement) else False
+
+
+def _scaling_options(registry: Registry) -> dict:
+    """Registry ``scaling:`` (C1) as PlanConfig keywords; a registry without the
+    section (tests, older loaders) keeps the PlanConfig defaults."""
+    scaling = getattr(registry, "scaling", None)
+    if not callable(scaling):
+        return {}
+    config = scaling()
+    return {
+        "rescue_max_step_ratio": float(config.rescue_max_step_ratio),
+        "scale_up_cooldown_enabled": bool(config.scale_up_cooldown_enabled),
+    }
+
+
+def _rescue_bases(snapshot: MetricsSnapshot, queue: PlannerQueue) -> dict[str, RescueBasis]:
+    """C1: per model, the last rescue target the queue issued whose effect the model's
+    decision window does not fully reflect yet (still running, or the window starts
+    before it completed - the same rule as the F4 cooldown)."""
+    targets = getattr(queue, "rescue_targets", None)
+    if not callable(targets):
+        return {}
+    bases: dict[str, RescueBasis] = {}
+    for model, record in targets().items():
+        metrics = snapshot.models.get(model)
+        if metrics is None:
+            continue
+        if record.done_ms is not None and metrics.window_start_ms >= record.done_ms:
+            continue  # settled: the window describes the new replica count
+        bases[model] = RescueBasis(base=int(record.base), covered=int(record.covered))
+    return bases
 
 
 def _defrag_blocking_events(queue: PlannerQueue, actions) -> tuple[str, ...]:
@@ -381,8 +416,19 @@ def _apply_safescale(
                     f"safescale_probe_preempted:{action.model}:restored={restored}:up_needed={max(0, up_needed)}"
                 )
                 if up_needed > 0:
+                    rescue = getattr(action, "rescue", None)
                     converted.append(
-                        replace(action, delta=up_needed, pods=tuple(action.pods[:up_needed]) if action.pods else ())
+                        replace(
+                            action,
+                            delta=up_needed,
+                            pods=tuple(action.pods[:up_needed]) if action.pods else (),
+                            # C1: the restored pods count toward the target already.
+                            rescue=(
+                                replace(rescue, covered=rescue.covered + min(restored, action.delta))
+                                if rescue is not None
+                                else None
+                            ),
+                        )
                     )
                 continue
         if not _requires_safescale_probe(action):

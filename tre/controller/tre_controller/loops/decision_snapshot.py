@@ -89,6 +89,13 @@ def _action_to_dict(action: object) -> dict[str, Any]:
         }
         if action.pods:
             payload["pods"] = list(action.pods)
+        rescue = getattr(action, "rescue", None)
+        if rescue is not None:
+            # C1: the absolute rescue target this scale-up belongs to.
+            payload["rescue"] = {
+                "target": rescue.target, "desired": rescue.desired,
+                "base": rescue.base, "covered": rescue.covered,
+            }
         return payload
     if isinstance(action, HideAction):
         return {

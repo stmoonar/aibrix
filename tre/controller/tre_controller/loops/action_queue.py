@@ -147,6 +147,30 @@ class DispatchResult:
 
 
 @dataclass
+class RescueTargetRecord:
+    """C1: the last fast-loop rescue target of one model (planner ``RescuePlan``).
+
+    ``covered`` = replicas the target's scale-ups really added on top of what the plan
+    counted already: the planner computes the next desired from ``base`` and plans only
+    what exceeds it while the model's decision window does not reflect the scale-up
+    (``done_ms`` None = still running; the window starts before ``done_ms``)."""
+
+    target: int
+    desired: int
+    base: int
+    covered_before: int
+    issued_ms: int
+    outstanding: int = 0
+    gained: int = 0
+    failures: int = 0
+    done_ms: int | None = None
+
+    @property
+    def covered(self) -> int:
+        return self.covered_before + self.gained
+
+
+@dataclass
 class _Backoff:
     """A one-shot action of a running dispatch task waiting out its retry backoff.
     A rescue action may preempt it (review 3 P2-3): ``queued`` is replaced, the
@@ -251,6 +275,8 @@ class ActionQueue:
         # Review F4: model -> (epoch ms the last successful dispatch completed, "up"/"down").
         self._now_ms = now_ms or (lambda: int(time.time() * 1000))
         self._last_done: dict[str, tuple[int, str]] = {}
+        #: C1: model -> its last rescue target (see :meth:`rescue_targets`).
+        self._rescue: dict[str, RescueTargetRecord] = {}
         self._retry = retry or RetryPolicy()
         self._revalidate = revalidate
         self._revalidate_commit = revalidate_commit
@@ -312,6 +338,8 @@ class ActionQueue:
         dropped: list[tuple[str, str]] = []
         replaced: list[tuple[str, SourceLoop]] = []
         observe = self._is_observe()
+        #: C1: models whose rescue target this submit (re)started.
+        rescue_started: set[str] = set()
 
         for queued in queued_actions:
             if queued.source_loop == "rescue":
@@ -332,6 +360,7 @@ class ActionQueue:
             self._pending.append(queued)
             self._inflight.update(queued.models)
             accepted += 2 if isinstance(queued.action, TransferAction) else 1
+            self._register_rescue(queued.action, rescue_started)
             if observe and queued.source_loop == "safescale":
                 held += 1
 
@@ -369,6 +398,64 @@ class ActionQueue:
 
     def last_actions(self) -> dict[str, tuple[int, str]]:
         return dict(self._last_done)
+
+    def rescue_targets(self) -> dict[str, RescueTargetRecord]:
+        """C1: model -> its last rescue target (copies). The planner tick keeps the
+        ones whose effect the decision window does not reflect yet."""
+        return {model: replace(record) for model, record in self._rescue.items()}
+
+    def _register_rescue(self, action, started: set[str]) -> None:
+        part = _rescue_part(action)
+        if part is None:
+            return
+        plan = part.rescue
+        record = self._rescue.get(part.model)
+        if part.model not in started or record is None:
+            # A new rescue decision supersedes the previous target of the model.
+            started.add(part.model)
+            record = RescueTargetRecord(
+                target=int(plan.target), desired=int(plan.desired), base=int(plan.base),
+                covered_before=int(plan.covered), issued_ms=int(self._now_ms()),
+            )
+            self._rescue[part.model] = record
+        record.outstanding += 1
+
+    def _note_rescue_result(self, action, result: DispatchResult) -> None:
+        """C1: count what a rescue scale-up really added (a partial hinted wake
+        counts the replicas the SM picked)."""
+        part = _rescue_part(action)
+        if part is None:
+            return
+        record = self._rescue.get(part.model)
+        if record is None:
+            return
+        if result.ok:
+            record.gained += int(part.delta)
+        else:
+            record.failures += 1
+            record.gained += min(int(part.delta), len(result.picked or ()))
+
+    def _finish_rescue(self, action) -> None:
+        """C1: one rescue scale-up ended (done, failed, dropped): the target is done
+        once all of them ended."""
+        part = _rescue_part(action)
+        if part is None:
+            return
+        record = self._rescue.get(part.model)
+        if record is None or record.outstanding <= 0:
+            return
+        record.outstanding -= 1
+        if record.outstanding == 0:
+            record.done_ms = int(self._now_ms())
+            LOG.info(
+                json.dumps(
+                    {"event": "rescue_target_done", "model": part.model, "target": record.target,
+                     "desired": record.desired, "base": record.base, "covered": record.covered,
+                     "failures": record.failures, "issued_ms": record.issued_ms,
+                     "done_ms": record.done_ms},
+                    sort_keys=True,
+                )
+            )
 
     def floor_held_models(self) -> set[str]:
         """P2-6: models the SM refused a hide / sleep of with 409 floor_violation
@@ -579,6 +666,7 @@ class ActionQueue:
             if observe and not _runs_in_observe(queued):
                 results.extend(_observe_skipped(queued))
                 self._notify_hide_failed(queued.action, "observe_skipped")
+                self._finish_rescue(queued.action)
                 continue
             busy |= queued.resources
             task = asyncio.ensure_future(self._run_item(queued, results))
@@ -607,6 +695,7 @@ class ActionQueue:
         finally:
             self._running.pop(task, None)
             self._backoff.pop(task, None)
+            self._finish_rescue(queued.action)
             self._release_idle_models()
             if request_id is not None and done is not None:
                 self._notify_done(request_id, *done)
@@ -890,6 +979,7 @@ class ActionQueue:
         if isinstance(action, SafeScaleCommitAction):
             return await self._attempt_commit(queued, results)
         result = await self._timed_dispatch(action, queued.model)
+        self._note_rescue_result(action, result)
         if not result.ok:
             return result, queued
         self._record_done(queued.model, action, result)
@@ -1093,8 +1183,15 @@ class ActionQueue:
         up_needed = action.delta - restored
         if up_needed <= 0:
             return None
+        rescue = getattr(action, "rescue", None)
         return self._queued(
-            replace(action, delta=up_needed, pods=tuple(action.pods[:up_needed]) if action.pods else ())
+            replace(
+                action,
+                delta=up_needed,
+                pods=tuple(action.pods[:up_needed]) if action.pods else (),
+                # C1: the restored pods already count toward the rescue target.
+                rescue=replace(rescue, covered=rescue.covered + restored) if rescue is not None else None,
+            )
         )
 
     def _preempt_commit(self, task: asyncio.Future, slot: _Backoff, model: str) -> int:
@@ -1219,6 +1316,7 @@ class ActionQueue:
                 ),
             ]
         receiver_result = await self._timed_dispatch(receiver, receiver.model)
+        self._note_rescue_result(action, receiver_result)
         self._record_done(receiver.model, receiver, receiver_result)
         return [donor_result, receiver_result]
 
@@ -1466,6 +1564,15 @@ def _runs_in_observe(queued: QueuedAction) -> bool:
     return queued.source_loop in ONE_SHOT_LOOPS and isinstance(
         queued.action, (UnhideAction, SafeScaleCommitAction)
     )
+
+
+def _rescue_part(action) -> ScaleAction | None:
+    """The C1-tagged rescue scale-up of an action (a transfer's receiver half)."""
+    if isinstance(action, TransferAction):
+        action = action.receiver
+    if isinstance(action, ScaleAction) and action.delta > 0 and getattr(action, "rescue", None) is not None:
+        return action
+    return None
 
 
 def _retry_safe(action) -> bool:

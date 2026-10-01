@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Literal, Mapping
 
 from tre_common.registry import ClusterTopology, tp_size_error
@@ -58,6 +58,16 @@ class PlanConfig:
     # Registry placement.defrag.enabled: gates the critical_tp_defrag migration plan.
     # Off by default, as in v1 (design 20260928-placement-node-balance).
     defrag_enabled: bool = False
+    # C1 (registry scaling.rescue_max_step_ratio): a CRITICAL receiver's rescue asks for
+    # its whole deficit at once - target min(max(n+1, ceil(n*tau_crit/Z)),
+    # max(n+1, floor(ratio*n)), scaling cap, capacity found). 0 = legacy one step
+    # (ceil(scale_step_ratio * n)) per decision window.
+    rescue_max_step_ratio: float = 2.0
+    # C1 (registry scaling.scale_up_cooldown_enabled): the review F4 cooldown also holds
+    # a CRITICAL receiver's scale-up. Off by default: the rescue target bookkeeping
+    # (``rescue_bases``) keeps an unreflected scale-up from being repeated. Scale-down
+    # holds and LOW receivers keep the cooldown either way.
+    scale_up_cooldown_enabled: bool = False
 
     def __post_init__(self) -> None:
         # No silent fallback for a bad tp_size (the registry rejects it at load; this
@@ -89,6 +99,34 @@ class ClusterView:
 
 
 @dataclass(frozen=True)
+class RescuePlan:
+    """C1 bookkeeping of a fast-loop rescue scale-up (metadata on its ScaleActions).
+
+    ``target`` = ``covered`` + the replicas this tick planned for the receiver (an
+    absolute routable count); ``desired`` = the deficit target before capacity limits;
+    ``base`` = the routable count ``desired`` was computed from (the replicas the
+    decision window's Z describes); ``covered`` = replicas already counted before this
+    plan (the routable count, or an earlier target the window does not reflect yet)."""
+
+    target: int
+    desired: int
+    base: int
+    covered: int
+
+
+@dataclass(frozen=True)
+class RescueBasis:
+    """An earlier rescue scale-up of a model whose effect its decision window does not
+    reflect yet (C1): the next desired is computed from ``base`` (the replicas the
+    window's Z still describes) and only the part above ``covered`` (what that
+    scale-up achieved) is planned - an unrefreshed window yields the same desired, so
+    nothing is added; a deeper CRITICAL (load still rising) raises the target."""
+
+    base: int
+    covered: int
+
+
+@dataclass(frozen=True)
 class ScaleAction:
     model: str
     delta: int
@@ -115,6 +153,9 @@ class ScaleAction:
     # cannot wake. False = exactly these pods (same-GPU donor / receiver relays,
     # SafeScale commits, sleeps).
     hint: bool = False
+    # C1: the rescue target this scale-up belongs to (a CRITICAL receiver's wakes /
+    # creates / relay wakes). Bookkeeping only: not part of the action's identity.
+    rescue: RescuePlan | None = field(default=None, compare=False)
 
 
 #: SM sleep path of the fast-loop "*_immediate" donors (CRIT donor, idle proactive,
@@ -303,6 +344,7 @@ def build_plan(
     floor_holds: set[str] | None = None,
     unavailable_gpus: set[tuple[str, int]] | None = None,
     refusals: Mapping[str, str] | None = None,
+    rescue_bases: Mapping[str, RescueBasis] | None = None,
 ) -> PlanResult:
     active_probe_models = active_probe_models or set()
     # Review 3 P2-3: models whose only in-flight work is a SafeScale commit waiting
@@ -397,13 +439,22 @@ def build_plan(
     ]
     middle_zone.sort(key=lambda item: (0 if item.state == ModelState.HEALTHY else 1, -(item.Z_m or 0.0)))
 
+    rescue_bases = rescue_bases or {}
+    c1 = cfg.rescue_max_step_ratio > 0
     if cfg.rescue_due:
+        # C1: (desired, base, covered) of each CRITICAL receiver planned this tick.
+        rescue_ctx: dict[str, tuple[int, int, int]] = {}
 
         def critical_need(recv: ModelClassification) -> tuple[int, int] | None:
             """(replicas needed, of which wakeable from sleeping bindings), None = skip."""
+            # In-flight protection: a model whose previous scale-up is still queued or
+            # running (seconds; a cold create longer) is not planned again - a raise
+            # would wait behind it on the model resource anyway.
             if recv.model_name in inflight_models and recv.model_name not in preemptible_models:
                 return None
-            if cooldown.blocks(recv.model_name, "up", critical=True):
+            if (cfg.scale_up_cooldown_enabled or not c1) and cooldown.blocks(
+                recv.model_name, "up", critical=True
+            ):
                 return None
             recv_pods = _effective_routable_replicas(recv.model_name, model_contexts, model_replicas)
             recv_assigned = _effective_assigned_replicas(recv.model_name, model_contexts, model_replicas)
@@ -413,9 +464,26 @@ def build_plan(
             recv_awake = _awake_replicas(recv.model_name, model_contexts, model_replicas)
             if recv_awake >= recv_max:
                 return None
-            raw_need = min(_scale_step(recv_pods, cfg.scale_step_ratio), recv_max - recv_awake)
+            if not c1:
+                raw_need = min(_scale_step(recv_pods, cfg.scale_step_ratio), recv_max - recv_awake)
+                if raw_need <= 0:
+                    return None
+                return raw_need, min(raw_need, max(0, recv_assigned - recv_pods))
+            # C1: one absolute target for the whole deficit. With an earlier scale-up
+            # the window does not reflect yet, the target is computed from the replicas
+            # the window's Z describes and only what exceeds that scale-up is planned.
+            basis = rescue_bases.get(recv.model_name)
+            base = basis.base if basis is not None else recv_pods
+            covered = max(basis.covered, recv_pods) if basis is not None else recv_pods
+            desired = rescue_desired(base, recv.Z_m, recv.tau.tau_crit, cfg.rescue_max_step_ratio)
+            raw_need = min(desired - covered, recv_max - max(recv_awake, covered))
             if raw_need <= 0:
+                if basis is not None:
+                    events.append(
+                        f"rescue_target_hold:{recv.model_name}:desired={desired}:covered={covered}"
+                    )
                 return None
+            rescue_ctx[recv.model_name] = (desired, base, covered)
             return raw_need, min(raw_need, max(0, recv_assigned - recv_pods))
 
         critical_needs = {recv.model_name: critical_need(recv) for recv in critical_receivers}
@@ -432,222 +500,247 @@ def build_plan(
             if need is None:
                 continue
             raw_need, wake_need = need
-
-            gain_from_sleeping, wake_pods = _take_reserved_wakes(
-                occupancy,
-                reserved_wakes,
-                receiver=recv.model_name,
-                need=wake_need,
-                events=events,
-                blocked_event="critical_sleeping_blocked",
-            )
-            if gain_from_sleeping > 0:
-                _add_scale_action(
-                    actions,
-                    deltas,
-                    model=recv.model_name,
-                    delta=gain_from_sleeping,
-                    reason="critical_sleeping_capacity",
-                    source_loop="rescue",
+            first_action = len(actions)
+            try:
+                gain_from_sleeping, wake_pods = _take_reserved_wakes(
+                    occupancy,
+                    reserved_wakes,
                     receiver=recv.model_name,
-                    pods=wake_pods,
-                    hint=True,
-                )
-                raw_need -= gain_from_sleeping
-                if raw_need <= 0:
-                    continue
-
-            tp_size = _tp_size(cfg, recv.model_name)
-            if tp_size > 1 and cluster_view is not None:
-                same_slot_shrink = _try_plan_same_slot_high_shrink(
-                    classifications=classifications,
-                    model_contexts=model_contexts,
-                    model_replicas=model_replicas,
-                    cfg=cfg,
-                    cluster_view=cluster_view,
-                    receiver=recv.model_name,
-                    active_probe_models=active_probe_models,
-                    # One SafeScale probe per donor model at a time (the state
-                    # machine is keyed by model): a donor already shrunk for an earlier
-                    # receiver this tick cannot start a second probe - its extra
-                    # replicas stay available to the immediate donor loop below.
-                    inflight_models=inflight_models | cooldown.down_blocked() | slot_shrink_donors,
-                    planned_deltas=deltas,
-                    taken_serve_ids=occupancy.donor_taken_ids() if occupancy is not None else set(),
-                    source_loop="rescue",
-                )
-                if same_slot_shrink is not None:
-                    # t1: this IS a legitimate scale-down probe on a hot (HIGH) donor, but
-                    # it is demand-driven preemption -- a CRITICAL receiver blocked on a
-                    # fragmented TP slot and no idle capacity. Keep it (the suppress-hot
-                    # guard only gates the receiver-less proactive path) and log the
-                    # preemption reason explicitly in the decision stream.
-                    actions.append(same_slot_shrink)
-                    slot_shrink_donors.add(same_slot_shrink.donor)
-                    delayed_down_models.add(same_slot_shrink.donor)
-                    # Replica floor (2026-09-29, fix C, relaxed): the shrink takes one
-                    # replica of the donor. It is recorded in the plan's deltas only, so
-                    # a later receiver's donor check counts it against the floor (two
-                    # takes from a 2-replica donor with min_replicas 1 would leave 0; a
-                    # 3-replica donor may still give one more). Its binding is marked
-                    # taken so no later action of this tick sleeps / hides the same pod.
-                    deltas[same_slot_shrink.donor] = deltas.get(same_slot_shrink.donor, 0) - 1
-                    if occupancy is not None:
-                        occupancy.take_donor(same_slot_shrink.serve_id)
-                    events.append(
-                        f"safescale_preemption:{same_slot_shrink.donor}->{recv.model_name}:{same_slot_shrink.reason}"
-                    )
-                    continue
-
-                tp_planned = _try_plan_tp_capacity(
-                    actions,
-                    model=recv.model_name,
-                    tp_size=tp_size,
-                    cluster_view=cluster_view,
+                    need=wake_need,
                     events=events,
-                    source_loop="rescue",
-                    occupancy=occupancy,
-                    defrag_enabled=cfg.defrag_enabled,
+                    blocked_event="critical_sleeping_blocked",
                 )
-                if tp_planned:
+                if gain_from_sleeping > 0:
                     _add_scale_action(
                         actions,
                         deltas,
                         model=recv.model_name,
-                        delta=1,
-                        reason=tp_planned,
+                        delta=gain_from_sleeping,
+                        reason="critical_sleeping_capacity",
+                        source_loop="rescue",
+                        receiver=recv.model_name,
+                        pods=wake_pods,
+                        hint=True,
+                    )
+                    raw_need -= gain_from_sleeping
+                    if raw_need <= 0:
+                        continue
+
+                tp_size = _tp_size(cfg, recv.model_name)
+                if tp_size > 1 and cluster_view is not None:
+                    same_slot_shrink = _try_plan_same_slot_high_shrink(
+                        classifications=classifications,
+                        model_contexts=model_contexts,
+                        model_replicas=model_replicas,
+                        cfg=cfg,
+                        cluster_view=cluster_view,
+                        receiver=recv.model_name,
+                        active_probe_models=active_probe_models,
+                        # One SafeScale probe per donor model at a time (the state
+                        # machine is keyed by model): a donor already shrunk for an earlier
+                        # receiver this tick cannot start a second probe - its extra
+                        # replicas stay available to the immediate donor loop below.
+                        inflight_models=inflight_models | cooldown.down_blocked() | slot_shrink_donors,
+                        planned_deltas=deltas,
+                        taken_serve_ids=occupancy.donor_taken_ids() if occupancy is not None else set(),
+                        source_loop="rescue",
+                    )
+                    if same_slot_shrink is not None:
+                        # t1: this IS a legitimate scale-down probe on a hot (HIGH) donor, but
+                        # it is demand-driven preemption -- a CRITICAL receiver blocked on a
+                        # fragmented TP slot and no idle capacity. Keep it (the suppress-hot
+                        # guard only gates the receiver-less proactive path) and log the
+                        # preemption reason explicitly in the decision stream.
+                        actions.append(same_slot_shrink)
+                        slot_shrink_donors.add(same_slot_shrink.donor)
+                        delayed_down_models.add(same_slot_shrink.donor)
+                        # Replica floor (2026-09-29, fix C, relaxed): the shrink takes one
+                        # replica of the donor. It is recorded in the plan's deltas only, so
+                        # a later receiver's donor check counts it against the floor (two
+                        # takes from a 2-replica donor with min_replicas 1 would leave 0; a
+                        # 3-replica donor may still give one more). Its binding is marked
+                        # taken so no later action of this tick sleeps / hides the same pod.
+                        deltas[same_slot_shrink.donor] = deltas.get(same_slot_shrink.donor, 0) - 1
+                        if occupancy is not None:
+                            occupancy.take_donor(same_slot_shrink.serve_id)
+                        events.append(
+                            f"safescale_preemption:{same_slot_shrink.donor}->{recv.model_name}:{same_slot_shrink.reason}"
+                        )
+                        # C1: a multi-replica deficit also takes free slot pairs below.
+                        raw_need -= 1
+                        if raw_need <= 0:
+                            continue
+
+                    # C1: up to raw_need free slot groups (one action); a defrag plan is
+                    # still one migration at a time (it is a cluster-wide action).
+                    empty_slots = 0
+                    while raw_need > empty_slots:
+                        tp_planned = _try_plan_tp_capacity(
+                            actions,
+                            model=recv.model_name,
+                            tp_size=tp_size,
+                            cluster_view=cluster_view,
+                            events=events,
+                            source_loop="rescue",
+                            occupancy=occupancy,
+                            defrag_enabled=cfg.defrag_enabled,
+                        )
+                        if tp_planned == "critical_empty_slot":
+                            empty_slots += 1
+                            continue
+                        if tp_planned:
+                            _add_scale_action(
+                                actions,
+                                deltas,
+                                model=recv.model_name,
+                                delta=1,
+                                reason=tp_planned,
+                                source_loop="rescue",
+                                receiver=recv.model_name,
+                            )
+                        break
+                    if empty_slots:
+                        _add_scale_action(
+                            actions,
+                            deltas,
+                            model=recv.model_name,
+                            delta=empty_slots,
+                            reason="critical_empty_slot",
+                            source_loop="rescue",
+                            receiver=recv.model_name,
+                        )
+                    continue
+
+                if occupancy is not None:
+                    gain_from_idle = _plan_create_capacity(
+                        occupancy,
+                        receiver=recv.model_name,
+                        tp_size=tp_size,
+                        need=raw_need,
+                        events=events,
+                        blocked_event="critical_idle_unusable",
+                    )
+                else:
+                    gain_from_idle = min(raw_need, remaining_idle) if remaining_idle > 0 else 0
+                if gain_from_idle > 0:
+                    _add_scale_action(
+                        actions,
+                        deltas,
+                        model=recv.model_name,
+                        delta=gain_from_idle,
+                        reason="critical_idle_capacity",
                         source_loop="rescue",
                         receiver=recv.model_name,
                     )
-                continue
+                    remaining_idle -= gain_from_idle
 
-            if occupancy is not None:
-                gain_from_idle = _plan_create_capacity(
-                    occupancy,
-                    receiver=recv.model_name,
-                    tp_size=tp_size,
-                    need=raw_need,
-                    events=events,
-                    blocked_event="critical_idle_unusable",
-                )
-            else:
-                gain_from_idle = min(raw_need, remaining_idle) if remaining_idle > 0 else 0
-            if gain_from_idle > 0:
-                _add_scale_action(
-                    actions,
-                    deltas,
-                    model=recv.model_name,
-                    delta=gain_from_idle,
-                    reason="critical_idle_capacity",
-                    source_loop="rescue",
-                    receiver=recv.model_name,
-                )
-                remaining_idle -= gain_from_idle
+                still_needed = raw_need - gain_from_idle
+                for donor in _slot_matched_first(paper_donors, occupancy, recv.model_name):
+                    if still_needed <= 0:
+                        break
+                    if (
+                        donor.model_name == recv.model_name
+                        or donor.model_name in active_probe_models
+                        or donor.model_name in inflight_models
+                        or donor.state not in (ModelState.IDLE, ModelState.HIGH)
+                    ):
+                        continue
+                    if cooldown.blocks(donor.model_name, "down"):
+                        continue
+                    donor_pods = _effective_routable_replicas(donor.model_name, model_contexts, model_replicas)
+                    donor_min = _min_replicas(cfg, donor.model_name)
+                    if donor_pods <= donor_min:
+                        continue
+                    planned_take = abs(min(deltas.get(donor.model_name, 0), 0))
+                    transfer = min(
+                        still_needed,
+                        _donor_give(donor, donor_pods, cfg),
+                        max(0, donor_pods - planned_take - donor_min),
+                    )
+                    if transfer <= 0:
+                        continue
+                    transfer, donor_slot_pods, receiver_slot_pods = _slot_targeted_transfer(
+                        occupancy, donor=donor.model_name, receiver=recv.model_name, transfer=transfer, events=events
+                    )
+                    if transfer <= 0:
+                        continue
+                    # One transfer: the receiver's wake needs the GPU the donor's sleep
+                    # frees, so the queue runs the pair in order as one compound action.
+                    transfer_id = f"{donor.model_name}->{recv.model_name}#{len(actions)}"
+                    _add_scale_action(
+                        actions,
+                        deltas,
+                        model=donor.model_name,
+                        delta=-transfer,
+                        reason="critical_donor_immediate",
+                        source_loop="rescue",
+                        donor=donor.model_name,
+                        receiver=recv.model_name,
+                        pods=donor_slot_pods,
+                        transfer_id=transfer_id,
+                        sleep_path=IMMEDIATE_DONOR_SLEEP_PATH,
+                    )
+                    _add_scale_action(
+                        actions,
+                        deltas,
+                        model=recv.model_name,
+                        delta=transfer,
+                        reason="critical_donor_immediate",
+                        source_loop="rescue",
+                        donor=donor.model_name,
+                        receiver=recv.model_name,
+                        pods=receiver_slot_pods,
+                        transfer_id=transfer_id,
+                    )
+                    still_needed -= transfer
 
-            still_needed = raw_need - gain_from_idle
-            for donor in _slot_matched_first(paper_donors, occupancy, recv.model_name):
-                if still_needed <= 0:
-                    break
-                if (
-                    donor.model_name == recv.model_name
-                    or donor.model_name in active_probe_models
-                    or donor.model_name in inflight_models
-                    or donor.state not in (ModelState.IDLE, ModelState.HIGH)
-                ):
-                    continue
-                if cooldown.blocks(donor.model_name, "down"):
-                    continue
-                donor_pods = _effective_routable_replicas(donor.model_name, model_contexts, model_replicas)
-                donor_min = _min_replicas(cfg, donor.model_name)
-                if donor_pods <= donor_min:
-                    continue
-                planned_take = abs(min(deltas.get(donor.model_name, 0), 0))
-                transfer = min(
-                    still_needed,
-                    _scale_step(donor_pods, cfg.scale_step_ratio),
-                    max(0, donor_pods - planned_take - donor_min),
-                )
-                if transfer <= 0:
-                    continue
-                transfer, donor_slot_pods, receiver_slot_pods = _slot_targeted_transfer(
-                    occupancy, donor=donor.model_name, receiver=recv.model_name, transfer=transfer, events=events
-                )
-                if transfer <= 0:
-                    continue
-                # One transfer: the receiver's wake needs the GPU the donor's sleep
-                # frees, so the queue runs the pair in order as one compound action.
-                transfer_id = f"{donor.model_name}->{recv.model_name}#{len(actions)}"
-                _add_scale_action(
-                    actions,
-                    deltas,
-                    model=donor.model_name,
-                    delta=-transfer,
-                    reason="critical_donor_immediate",
-                    source_loop="rescue",
-                    donor=donor.model_name,
-                    receiver=recv.model_name,
-                    pods=donor_slot_pods,
-                    transfer_id=transfer_id,
-                    sleep_path=IMMEDIATE_DONOR_SLEEP_PATH,
-                )
-                _add_scale_action(
-                    actions,
-                    deltas,
-                    model=recv.model_name,
-                    delta=transfer,
-                    reason="critical_donor_immediate",
-                    source_loop="rescue",
-                    donor=donor.model_name,
-                    receiver=recv.model_name,
-                    pods=receiver_slot_pods,
-                    transfer_id=transfer_id,
-                )
-                still_needed -= transfer
-
-            for middle in _slot_matched_first(middle_zone, occupancy, recv.model_name):
-                if still_needed <= 0:
-                    break
-                if (
-                    middle.model_name == recv.model_name
-                    or middle.model_name in active_probe_models
-                    or middle.model_name in inflight_models
-                ):
-                    continue
-                if cooldown.blocks(middle.model_name, "down"):
-                    continue
-                middle_pods = _effective_routable_replicas(middle.model_name, model_contexts, model_replicas)
-                middle_min = _min_replicas(cfg, middle.model_name)
-                if middle_pods <= middle_min:
-                    continue
-                planned_take = abs(min(deltas.get(middle.model_name, 0), 0))
-                transfer = min(
-                    still_needed,
-                    _scale_step(middle_pods, cfg.scale_step_ratio),
-                    max(0, middle_pods - planned_take - middle_min),
-                )
-                if transfer <= 0:
-                    continue
-                transfer, middle_slot_pods, _ = _slot_targeted_transfer(
-                    occupancy, donor=middle.model_name, receiver=recv.model_name, transfer=transfer, events=events
-                )
-                if transfer <= 0:
-                    continue
-                _add_scale_action(
-                    actions,
-                    deltas,
-                    model=middle.model_name,
-                    delta=-transfer,
-                    reason="critical_middle_zone_safescale",
-                    source_loop="rescue",
-                    requires_safescale=True,
-                    donor=middle.model_name,
-                    receiver=recv.model_name,
-                    pods=middle_slot_pods,
-                )
-                delayed_down_models.add(middle.model_name)
-                pending = probe_upscale_plans.setdefault(middle.model_name, {})
-                pending[recv.model_name] = pending.get(recv.model_name, 0) + transfer
-                still_needed -= transfer
+                for middle in _slot_matched_first(middle_zone, occupancy, recv.model_name):
+                    if still_needed <= 0:
+                        break
+                    if (
+                        middle.model_name == recv.model_name
+                        or middle.model_name in active_probe_models
+                        or middle.model_name in inflight_models
+                    ):
+                        continue
+                    if cooldown.blocks(middle.model_name, "down"):
+                        continue
+                    middle_pods = _effective_routable_replicas(middle.model_name, model_contexts, model_replicas)
+                    middle_min = _min_replicas(cfg, middle.model_name)
+                    if middle_pods <= middle_min:
+                        continue
+                    planned_take = abs(min(deltas.get(middle.model_name, 0), 0))
+                    transfer = min(
+                        still_needed,
+                        _scale_step(middle_pods, cfg.scale_step_ratio),
+                        max(0, middle_pods - planned_take - middle_min),
+                    )
+                    if transfer <= 0:
+                        continue
+                    transfer, middle_slot_pods, _ = _slot_targeted_transfer(
+                        occupancy, donor=middle.model_name, receiver=recv.model_name, transfer=transfer, events=events
+                    )
+                    if transfer <= 0:
+                        continue
+                    _add_scale_action(
+                        actions,
+                        deltas,
+                        model=middle.model_name,
+                        delta=-transfer,
+                        reason="critical_middle_zone_safescale",
+                        source_loop="rescue",
+                        requires_safescale=True,
+                        donor=middle.model_name,
+                        receiver=recv.model_name,
+                        pods=middle_slot_pods,
+                    )
+                    delayed_down_models.add(middle.model_name)
+                    pending = probe_upscale_plans.setdefault(middle.model_name, {})
+                    pending[recv.model_name] = pending.get(recv.model_name, 0) + transfer
+                    still_needed -= transfer
+            finally:
+                if recv.model_name in rescue_ctx:
+                    _tag_rescue_actions(actions, first_action, recv, rescue_ctx[recv.model_name], events)
 
         for idle in idle_models:
             if idle.model_name in active_probe_models or idle.model_name in inflight_models:
@@ -1619,6 +1712,68 @@ def _add_scale_action(
             drain_budget_s=drain_budget_s if delta < 0 else None,
             hint=bool(hint and delta > 0 and pods),
         )
+    )
+
+
+def rescue_desired(n: int, z_m: float | None, tau_crit: float, ratio: float) -> int:
+    """C1 rescue target (routable replicas) of a CRITICAL receiver with ``n`` routable
+    replicas and decision-window signal ``z_m``: the replicas that bring Z back to
+    ``tau_crit`` under Z proportional to n at fixed load, ``ceil(n * tau_crit / Z)``,
+    at least n + 1 and at most ``max(n + 1, floor(ratio * n))``. Z missing / <= 0
+    or n <= 0: n + 1."""
+    n = max(0, int(n))
+    floor_target = n + 1
+    if n <= 0 or z_m is None or not math.isfinite(z_m) or z_m <= 0 or tau_crit <= 0:
+        return floor_target
+    want = math.ceil(n * float(tau_crit) / float(z_m) - 1e-9)
+    cap = max(floor_target, math.floor(float(ratio) * n + 1e-9))
+    return min(max(want, floor_target), cap)
+
+
+def _donor_give(donor: ModelClassification, donor_pods: int, cfg: PlanConfig) -> int:
+    """Replicas an immediate (IDLE / HIGH) donor may give one CRITICAL receiver in one
+    tick, before its floor. Legacy: one step. C1: its surplus - an IDLE donor all of
+    it; a HIGH donor the replicas above ``ceil(n * tau_high / Z)`` (its projected Z
+    stays >= tau_high), never less than one step."""
+    step = _scale_step(donor_pods, cfg.scale_step_ratio)
+    if cfg.rescue_max_step_ratio <= 0:
+        return step
+    if donor.state == ModelState.IDLE:
+        return max(step, donor_pods)
+    z_m = donor.Z_m
+    tau_high = donor.tau.tau_high
+    if z_m is None or not math.isfinite(z_m) or z_m <= 0 or tau_high <= 0:
+        return step
+    keep = math.ceil(donor_pods * float(tau_high) / float(z_m) - 1e-9)
+    return max(step, donor_pods - keep)
+
+
+def _tag_rescue_actions(
+    actions: list[Action],
+    first: int,
+    recv: ModelClassification,
+    ctx: tuple[int, int, int],
+    events: list[str],
+) -> None:
+    """Attach the C1 :class:`RescuePlan` to the receiver's rescue scale-ups planned
+    from ``actions[first:]`` and log the decision (``rescue_target``)."""
+    desired, base, covered = ctx
+    model = recv.model_name
+    planned = sum(
+        action.delta
+        for action in actions[first:]
+        if isinstance(action, ScaleAction) and action.model == model and action.delta > 0
+    )
+    plan = RescuePlan(target=covered + planned, desired=desired, base=base, covered=covered)
+    for index in range(first, len(actions)):
+        action = actions[index]
+        if isinstance(action, ScaleAction) and action.model == model and action.delta > 0:
+            actions[index] = replace(action, rescue=plan)
+    if planned <= 0:
+        return  # nothing planned: the capacity events of the paths say why
+    z_text = "none" if recv.Z_m is None else f"{recv.Z_m:.4f}"
+    events.append(
+        f"rescue_target:{model}:n={base}:z={z_text}:desired={desired}:covered={covered}:planned={planned}"
     )
 
 

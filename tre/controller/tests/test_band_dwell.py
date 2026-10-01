@@ -10,7 +10,9 @@ import pytest
 
 from tre_common.dwell import DwellCounter, dwell_confirmed_series
 from tre_common.metrics_schema import MetricsSnapshot, ModelWindowMetrics
-from tre_common.registry import ClusterTopology, ModelSpec, NodeSpec, Registry, SloSpec, TrsParams
+from tre_common.registry import (
+    ClusterTopology, ModelSpec, NodeSpec, Registry, ScalingRegistryConfig, SloSpec, TrsParams,
+)
 from tre_controller.loops.fairness_task import run_fairness_tick
 from tre_controller.loops.rescue_task import run_rescue_tick
 from tre_controller.planning.classify import ModelState
@@ -73,7 +75,7 @@ class _Queue:
         return self._cooldown
 
 
-def _registry() -> Registry:
+def _registry(scaling=None) -> Registry:
     slo = SloSpec(ttft_p95_ms=500.0, tpot_p95_ms=75.0, e2e_p95_ms=10_000.0)
     trs = TrsParams(
         w_p=0.0, w_d=1.0, lambda_wait=0.0, qmin=1.0, ema_alpha=0.5, theta_m=THETA,
@@ -86,6 +88,7 @@ def _registry() -> Registry:
         ClusterTopology(nodes=(NodeSpec(name="node-a", gpus=4, two_gpu_slots=((0, 1), (2, 3))),)),
         [ModelSpec(name="m", weights_path="/w", tp_size=1, min_replicas=0, max_replicas=4,
                    vllm_image="img", slo=slo, trs=trs)],
+        scaling=scaling,
     )
 
 
@@ -102,7 +105,9 @@ def _snap(end: int, z: float | None, *, idle: bool = False) -> MetricsSnapshot:
 
 
 def _tick(state: SignalState, snap: MetricsSnapshot, *, loop=run_rescue_tick, queue=None):
-    return loop(snap, queue=queue or _Queue(), registry=_registry(), signal_state=state,
+    # C1: the CRITICAL scale-up cooldown is opt-in (registry scaling.scale_up_cooldown_enabled).
+    registry = _registry(ScalingRegistryConfig(scale_up_cooldown_enabled=True)) if queue is not None else _registry()
+    return loop(snap, queue=queue or _Queue(), registry=registry, signal_state=state,
                 action_cooldown=queue is not None)
 
 
