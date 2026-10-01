@@ -68,6 +68,13 @@ class PlanConfig:
     # (``rescue_bases``) keeps an unreflected scale-up from being repeated. Scale-down
     # holds and LOW receivers keep the cooldown either way.
     scale_up_cooldown_enabled: bool = False
+    # C1 (registry scaling.rescue_max_step_pods): the rescue target may also reach
+    # n + this many replicas (HPA-style "max(ratio x n, n + pods)"); 0 = ratio only.
+    rescue_max_step_pods: int = 0
+    # C1 review P1 (registry scaling.donor_surplus_release): an immediate IDLE / HIGH
+    # donor of a CRITICAL receiver gives its whole surplus in one tick. Off (default):
+    # one step per tick, as before C1 - scale-up is aggressive, scale-down cautious.
+    donor_surplus_release: bool = False
 
     def __post_init__(self) -> None:
         # No silent fallback for a bad tp_size (the registry rejects it at load; this
@@ -475,7 +482,9 @@ def build_plan(
             basis = rescue_bases.get(recv.model_name)
             base = basis.base if basis is not None else recv_pods
             covered = max(basis.covered, recv_pods) if basis is not None else recv_pods
-            desired = rescue_desired(base, recv.Z_m, recv.tau.tau_crit, cfg.rescue_max_step_ratio)
+            desired = rescue_desired(
+                base, recv.Z_m, recv.tau.tau_crit, cfg.rescue_max_step_ratio, cfg.rescue_max_step_pods
+            )
             raw_need = min(desired - covered, recv_max - max(recv_awake, covered))
             if raw_need <= 0:
                 if basis is not None:
@@ -573,8 +582,11 @@ def build_plan(
 
                     # C1: up to raw_need free slot groups (one action); a defrag plan is
                     # still one migration at a time (it is a cluster-wide action).
+                    # Without a slot occupancy (no claims) the allocator would return
+                    # the same free slot again: one slot per tick then (review P3).
                     empty_slots = 0
-                    while raw_need > empty_slots:
+                    slot_limit = raw_need if occupancy is not None else 1
+                    while slot_limit > empty_slots:
                         tp_planned = _try_plan_tp_capacity(
                             actions,
                             model=recv.model_name,
@@ -1715,28 +1727,33 @@ def _add_scale_action(
     )
 
 
-def rescue_desired(n: int, z_m: float | None, tau_crit: float, ratio: float) -> int:
+def rescue_desired(
+    n: int, z_m: float | None, tau_crit: float, ratio: float, step_pods: int = 0
+) -> int:
     """C1 rescue target (routable replicas) of a CRITICAL receiver with ``n`` routable
     replicas and decision-window signal ``z_m``: the replicas that bring Z back to
     ``tau_crit`` under Z proportional to n at fixed load, ``ceil(n * tau_crit / Z)``,
-    at least n + 1 and at most ``max(n + 1, floor(ratio * n))``. Z missing / <= 0
-    or n <= 0: n + 1."""
+    at least n + 1 and at most ``max(n + 1, floor(ratio * n), n + step_pods)``. Z
+    missing / <= 0 or n <= 0: n + 1."""
     n = max(0, int(n))
     floor_target = n + 1
+    cap = max(floor_target, math.floor(float(ratio) * n + 1e-9), n + max(0, int(step_pods)))
     if n <= 0 or z_m is None or not math.isfinite(z_m) or z_m <= 0 or tau_crit <= 0:
         return floor_target
     want = math.ceil(n * float(tau_crit) / float(z_m) - 1e-9)
-    cap = max(floor_target, math.floor(float(ratio) * n + 1e-9))
     return min(max(want, floor_target), cap)
 
 
 def _donor_give(donor: ModelClassification, donor_pods: int, cfg: PlanConfig) -> int:
     """Replicas an immediate (IDLE / HIGH) donor may give one CRITICAL receiver in one
-    tick, before its floor. Legacy: one step. C1: its surplus - an IDLE donor all of
+    tick, before its floor. Default (and legacy): one step - the paper's bounded
+    pairwise transfer moves at most one step per pair per tick, the donor side
+    included. ``donor_surplus_release`` (opt-in): its surplus - an IDLE donor all of
     it; a HIGH donor the replicas above ``ceil(n * tau_high / Z)`` (its projected Z
-    stays >= tau_high), never less than one step."""
+    stays >= tau_high), never less than one step. The relay is capped by what the
+    receiver still needs either way (caller)."""
     step = _scale_step(donor_pods, cfg.scale_step_ratio)
-    if cfg.rescue_max_step_ratio <= 0:
+    if cfg.rescue_max_step_ratio <= 0 or not cfg.donor_surplus_release:
         return step
     if donor.state == ModelState.IDLE:
         return max(step, donor_pods)

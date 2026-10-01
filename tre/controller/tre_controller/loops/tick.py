@@ -217,11 +217,12 @@ def run_planner_tick(
         probe_backoff_models=_probe_backoff_models(safescale, snapshot.ts_ms),
         preemptible_models=_preemptible_models(queue) if rescue_due else None,
         # C1: earlier rescue targets the decision windows do not reflect yet.
-        rescue_bases=_rescue_bases(snapshot, queue) if rescue_due else None,
+        rescue_bases=_rescue_bases(snapshot, queue, registry) if rescue_due else None,
     )
     if _prof_on:
         _plan_ns = time.perf_counter_ns() - _phase_t0
         _phase_t0 = time.perf_counter_ns()
+    covered_targets: dict = {}
     actions, safescale_events = _apply_safescale(
         snapshot,
         tuple(plan.actions),
@@ -231,7 +232,14 @@ def run_planner_tick(
         contexts=contexts,
         observe_mode=observe_mode,
         probe_block_reason=probe_block_reason,
+        covered_targets=covered_targets,
     )
+    # C1 review P2-1: a rescue target fully covered by the pods a probe preemption gives
+    # back is still a target the window does not reflect yet.
+    record_covered = getattr(queue, "record_rescue_covered", None)
+    if callable(record_covered):
+        for model, rescue in covered_targets.items():
+            record_covered(model, rescue)
     if _prof_on:
         _safescale_ns = time.perf_counter_ns() - _phase_t0
         _phase_t0 = time.perf_counter_ns()
@@ -285,13 +293,35 @@ def _scaling_options(registry: Registry) -> dict:
     return {
         "rescue_max_step_ratio": float(config.rescue_max_step_ratio),
         "scale_up_cooldown_enabled": bool(config.scale_up_cooldown_enabled),
+        "rescue_max_step_pods": int(getattr(config, "rescue_max_step_pods", 0)),
+        "donor_surplus_release": bool(getattr(config, "donor_surplus_release", False)),
     }
 
 
-def _rescue_bases(snapshot: MetricsSnapshot, queue: PlannerQueue) -> dict[str, RescueBasis]:
+def rescue_settle_ms(registry: Registry | None, model: str) -> float:
+    """C1 review P2-3: how long after a rescue target completed the decision window
+    must start before it counts as reflected - ``scaling.rescue_settle_ema_k`` times
+    the model's ``trs.ema_tau_ms`` (the EMA'd Z lags the raw window by about its time
+    constant). 0 without a registry, a scaling section or a tau (legacy fixed-alpha)."""
+    scaling = getattr(registry, "scaling", None)
+    if registry is None or not callable(scaling):
+        return 0.0
+    k = float(getattr(scaling(), "rescue_settle_ema_k", 0.0) or 0.0)
+    if k <= 0:
+        return 0.0
+    try:
+        tau = registry.model(model).trs.ema_tau_ms
+    except Exception:  # noqa: BLE001 - unknown model: no extension
+        return 0.0
+    return k * float(tau) if tau is not None and float(tau) > 0 else 0.0
+
+
+def _rescue_bases(
+    snapshot: MetricsSnapshot, queue: PlannerQueue, registry: Registry | None = None
+) -> dict[str, RescueBasis]:
     """C1: per model, the last rescue target the queue issued whose effect the model's
-    decision window does not fully reflect yet (still running, or the window starts
-    before it completed - the same rule as the F4 cooldown)."""
+    decision signal does not fully reflect yet: still running, or the window starts
+    before it completed (the F4 rule) plus ``rescue_settle_ms`` for the EMA."""
     targets = getattr(queue, "rescue_targets", None)
     if not callable(targets):
         return {}
@@ -300,8 +330,10 @@ def _rescue_bases(snapshot: MetricsSnapshot, queue: PlannerQueue) -> dict[str, R
         metrics = snapshot.models.get(model)
         if metrics is None:
             continue
-        if record.done_ms is not None and metrics.window_start_ms >= record.done_ms:
-            continue  # settled: the window describes the new replica count
+        if record.done_ms is not None and metrics.window_start_ms >= record.done_ms + rescue_settle_ms(
+            registry, model
+        ):
+            continue  # settled: the signal describes the new replica count
         bases[model] = RescueBasis(base=int(record.base), covered=int(record.covered))
     return bases
 
@@ -388,12 +420,25 @@ def _apply_safescale(
     contexts: dict[str, dict] | None = None,
     observe_mode: bool = False,
     probe_block_reason: str | None = None,
+    covered_targets: dict | None = None,
 ) -> tuple[tuple[Action, ...], tuple[str, ...]]:
+    """``covered_targets`` (out): model -> its C1 rescue plan when the pods a probe
+    preemption gives back cover every planned scale-up part (none is submitted)."""
     if safescale is None:
         return actions, ()
 
     converted: list[Action] = []
     events: list[str] = []
+    # C1 review P2-1: one preemption per receiver model per tick; the pods it gives
+    # back are deducted across all of the model's scale-up parts, in plan order.
+    up_totals: dict[str, int] = {}
+    for action in actions:
+        if isinstance(action, ScaleAction) and action.delta > 0:
+            up_totals[action.model] = up_totals.get(action.model, 0) + action.delta
+    restore_left: dict[str, int] = {}
+    restore_used: dict[str, int] = {}
+    survived: set[str] = set()
+    rescue_of: dict[str, object] = {}
     for action in actions:
         if observe_mode:
             # B8: never start (or preempt) a probe while paused. The planned
@@ -405,32 +450,46 @@ def _apply_safescale(
                 converted.append(action)
             continue
         if isinstance(action, ScaleAction) and action.delta > 0:
-            preempt = getattr(safescale, "request_preemption", None)
-            restored = preempt(action.model, reason="receiver_need_upscale") if callable(preempt) else 0
-            if restored > 0:
-                # v1 apply_safescale_to_deltas: rollback_probe(receiver_need_upscale), then
-                # up_needed = delta - probe_hidden. The rollback (unhide) is issued by the
-                # safescale loop's next observation, one-shot and observe-mode safe.
-                up_needed = action.delta - restored
-                events.append(
-                    f"safescale_probe_preempted:{action.model}:restored={restored}:up_needed={max(0, up_needed)}"
-                )
+            model = action.model
+            if model not in restore_left:
+                preempt = getattr(safescale, "request_preemption", None)
+                restored = preempt(model, reason="receiver_need_upscale") if callable(preempt) else 0
+                restored = max(0, int(restored or 0))
+                restore_left[model] = restored
+                restore_used[model] = min(restored, up_totals.get(model, 0))
+                if restored > 0:
+                    # v1 apply_safescale_to_deltas: rollback_probe(receiver_need_upscale),
+                    # then up_needed = delta - probe_hidden. The rollback (unhide) is issued
+                    # by the safescale loop's next observation, one-shot and observe-mode safe.
+                    events.append(
+                        f"safescale_probe_preempted:{model}:restored={restored}"
+                        f":up_needed={max(0, up_totals.get(model, 0) - restored)}"
+                    )
+            rescue = getattr(action, "rescue", None)
+            if rescue is not None and restore_used.get(model, 0) > 0:
+                # C1: the restored pods count toward the target already.
+                rescue = replace(rescue, covered=rescue.covered + restore_used[model])
+                rescue_of[model] = rescue
+            take = min(restore_left[model], action.delta)
+            if take > 0:
+                restore_left[model] -= take
+                up_needed = action.delta - take
                 if up_needed > 0:
-                    rescue = getattr(action, "rescue", None)
+                    survived.add(model)
                     converted.append(
                         replace(
                             action,
                             delta=up_needed,
                             pods=tuple(action.pods[:up_needed]) if action.pods else (),
-                            # C1: the restored pods count toward the target already.
-                            rescue=(
-                                replace(rescue, covered=rescue.covered + min(restored, action.delta))
-                                if rescue is not None
-                                else None
-                            ),
+                            rescue=rescue,
                         )
                     )
                 continue
+            if rescue is not getattr(action, "rescue", None):
+                action = replace(action, rescue=rescue)
+            survived.add(model)
+            converted.append(action)
+            continue
         if not _requires_safescale_probe(action):
             converted.append(action)
             continue
@@ -455,6 +514,10 @@ def _apply_safescale(
         if decision.reason == "probe_started" and getattr(decision, "details", None):
             events.append(format_window_event(probe_model, decision.details))
         converted.extend(_commands_to_actions(decision.commands, source_loop=action.source_loop))
+    if covered_targets is not None:
+        for model, rescue in rescue_of.items():
+            if model not in survived:
+                covered_targets[model] = rescue
     return tuple(converted), tuple(events)
 
 

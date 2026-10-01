@@ -600,6 +600,17 @@ scaling:
   # cap max_awake_replicas, the capacity found), n = its routable replicas, Z its
   # decision-window signal. 0 = the legacy one step (ceil(0.1 * n)) per window.
   rescue_max_step_ratio: 2.0
+  # The rescue target may also reach n + this many replicas: cap = max(n + 1,
+  # floor(ratio * n), n + pods) (HPA's default "max(100%, +4 pods)" shape). 0 = off.
+  rescue_max_step_pods: 0
+  # An immediate IDLE / HIGH donor of a CRITICAL receiver gives its whole surplus
+  # (IDLE to its floor, HIGH to its tau_high level) in one tick. false = one step
+  # per tick (scale-down stays cautious).
+  donor_surplus_release: false
+  # A rescue target counts as reflected once the decision window starts
+  # k * trs.ema_tau_ms after it completed (the EMA'd Z lags the window). 0 = the
+  # window start alone.
+  rescue_settle_ema_k: 2.0
   # Also hold a CRITICAL receiver's scale-up until a metrics window starting after
   # its last scale-up completed (the F4 cooldown, TRE_ACTION_COOLDOWN). Off: the
   # rescue target bookkeeping already keeps an unreflected scale-up from repeating.

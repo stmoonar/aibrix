@@ -223,6 +223,7 @@ class ActionQueue:
         floor_violation_hold_ms: float | None = None,
         on_hide_done: Callable[[str, tuple[str, ...]], None] | None = None,
         wake_cooldown_s: tuple[float, float] | None = (30.0, 60.0),
+        scale_memory: object | None = None,
     ) -> None:
         self._client = client
         #: S3: (gpu_s, node_s) a GPU / node the SM refused a wake on is kept out of
@@ -277,6 +278,15 @@ class ActionQueue:
         self._last_done: dict[str, tuple[int, str]] = {}
         #: C1: model -> its last rescue target (see :meth:`rescue_targets`).
         self._rescue: dict[str, RescueTargetRecord] = {}
+        #: C1 review P3: id(queued action) -> the record that part belongs to (a part of
+        #: a superseded target updates that record, never its successor).
+        self._rescue_parts: dict[int, RescueTargetRecord] = {}
+        #: C1 review P2-2: durable copy of ``_last_done`` / ``_rescue`` (controller
+        #: state store: ``load_scale_memory()`` / ``save_scale_memory(model, record)``),
+        #: so a restarted controller neither repeats an unreflected scale-up nor drops
+        #: a cooldown. None = in memory only.
+        self._scale_memory = scale_memory
+        self._load_scale_memory()
         self._retry = retry or RetryPolicy()
         self._revalidate = revalidate
         self._revalidate_commit = revalidate_commit
@@ -340,12 +350,19 @@ class ActionQueue:
         observe = self._is_observe()
         #: C1: models whose rescue target this submit (re)started.
         rescue_started: set[str] = set()
+        #: C1 review P2-1: pods a commit preemption gave back, per receiver model, not
+        #: yet deducted from one of its scale-up parts (one preemption, all parts).
+        restore_credit: dict[str, int] = {}
 
         for queued in queued_actions:
             if queued.source_loop == "rescue":
                 for model in queued.models:
                     replaced.extend(self._remove_pending_fairness_for_model(model))
-                preempted = self._preempt_for_rescue(queued)
+                part = _rescue_part(queued.action)
+                preempted, taken = self._preempt_for_rescue(queued, restore_credit)
+                if part is not None and taken > 0:
+                    # The restored pods count toward the target without a dispatch.
+                    self._rescue_record_for(part, rescue_started).gained += taken
                 if preempted is None:
                     dropped.append((queued.model, "covered_by_preempted_commit"))
                     continue
@@ -363,6 +380,12 @@ class ActionQueue:
             self._register_rescue(queued.action, rescue_started)
             if observe and queued.source_loop == "safescale":
                 held += 1
+
+        for model in rescue_started:
+            record = self._rescue[model]
+            if record.outstanding == 0 and record.done_ms is None:
+                record.done_ms = int(self._now_ms())  # covered by restored pods only
+            self._persist_scale_memory(model)
 
         return SubmitResult(
             accepted=accepted,
@@ -404,29 +427,45 @@ class ActionQueue:
         ones whose effect the decision window does not reflect yet."""
         return {model: replace(record) for model, record in self._rescue.items()}
 
-    def _register_rescue(self, action, started: set[str]) -> None:
-        part = _rescue_part(action)
-        if part is None:
-            return
-        plan = part.rescue
+    def _rescue_record_for(self, part: ScaleAction, started: set[str]) -> RescueTargetRecord:
+        """The record of ``part``'s rescue target in this submit: the first part of a
+        model starts a new one (it supersedes the previous target of the model)."""
         record = self._rescue.get(part.model)
         if part.model not in started or record is None:
-            # A new rescue decision supersedes the previous target of the model.
             started.add(part.model)
+            plan = part.rescue
             record = RescueTargetRecord(
                 target=int(plan.target), desired=int(plan.desired), base=int(plan.base),
                 covered_before=int(plan.covered), issued_ms=int(self._now_ms()),
             )
             self._rescue[part.model] = record
+        return record
+
+    def _register_rescue(self, action, started: set[str]) -> None:
+        part = _rescue_part(action)
+        if part is None:
+            return
+        record = self._rescue_record_for(part, started)
         record.outstanding += 1
+        record.done_ms = None
+        self._rescue_parts[id(action)] = record
+
+    def record_rescue_covered(self, model: str, plan) -> None:
+        """C1 review P2-1: a rescue target the planner tick found fully covered by the
+        pods a SafeScale probe preemption gives back (nothing submitted): recorded as
+        done now, so the next ticks hold until the window reflects those pods."""
+        self._rescue[model] = RescueTargetRecord(
+            target=int(plan.target), desired=int(plan.desired), base=int(plan.base),
+            covered_before=int(plan.covered), issued_ms=int(self._now_ms()),
+            done_ms=int(self._now_ms()),
+        )
+        self._persist_scale_memory(model)
 
     def _note_rescue_result(self, action, result: DispatchResult) -> None:
         """C1: count what a rescue scale-up really added (a partial hinted wake
         counts the replicas the SM picked)."""
         part = _rescue_part(action)
-        if part is None:
-            return
-        record = self._rescue.get(part.model)
+        record = self._rescue_parts.get(id(action)) if part is not None else None
         if record is None:
             return
         if result.ok:
@@ -437,16 +476,16 @@ class ActionQueue:
 
     def _finish_rescue(self, action) -> None:
         """C1: one rescue scale-up ended (done, failed, dropped): the target is done
-        once all of them ended."""
-        part = _rescue_part(action)
-        if part is None:
-            return
-        record = self._rescue.get(part.model)
+        once all of its parts ended."""
+        record = self._rescue_parts.pop(id(action), None)
         if record is None or record.outstanding <= 0:
             return
+        part = _rescue_part(action)
         record.outstanding -= 1
         if record.outstanding == 0:
             record.done_ms = int(self._now_ms())
+            if self._rescue.get(part.model) is record:
+                self._persist_scale_memory(part.model)
             LOG.info(
                 json.dumps(
                     {"event": "rescue_target_done", "model": part.model, "target": record.target,
@@ -1152,7 +1191,66 @@ class ActionQueue:
         return slot.queued
 
     # -------------------------------------------------------------- preemption
-    def _preempt_for_rescue(self, queued: QueuedAction) -> QueuedAction | None:
+    def _load_scale_memory(self) -> None:
+        """C1 review P2-2: restore ``_last_done`` / ``_rescue`` of a previous controller.
+        A target that was still running then is taken as done now (its wake may have
+        completed just before the restart): the next windows hold until they reflect
+        it."""
+        loader = getattr(self._scale_memory, "load_scale_memory", None)
+        if not callable(loader):
+            return
+        try:
+            memory = loader() or {}
+        except Exception as exc:  # noqa: BLE001 - durable memory is best effort
+            LOG.warning("scale memory not loaded: %r", exc)
+            return
+        now = int(self._now_ms())
+        for model, entry in memory.items():
+            if not isinstance(entry, dict):
+                continue
+            last = entry.get("last_done")
+            try:
+                if last:
+                    self._last_done[str(model)] = (int(last[0]), str(last[1]))
+                rescue = entry.get("rescue")
+                if rescue:
+                    done = rescue.get("done_ms")
+                    self._rescue[str(model)] = RescueTargetRecord(
+                        target=int(rescue["target"]), desired=int(rescue["desired"]),
+                        base=int(rescue["base"]), covered_before=int(rescue["covered_before"]),
+                        issued_ms=int(rescue["issued_ms"]), gained=int(rescue.get("gained", 0)),
+                        failures=int(rescue.get("failures", 0)),
+                        done_ms=now if done is None or int(rescue.get("outstanding", 0)) > 0 else int(done),
+                    )
+            except (KeyError, TypeError, ValueError, IndexError) as exc:
+                LOG.warning("scale memory of %s ignored: %r", model, exc)
+        if self._rescue or self._last_done:
+            LOG.info(json.dumps({"event": "scale_memory_restored", "rescue": sorted(self._rescue),
+                                 "last_done": sorted(self._last_done)}, sort_keys=True))
+
+    def _persist_scale_memory(self, model: str) -> None:
+        saver = getattr(self._scale_memory, "save_scale_memory", None)
+        if not callable(saver):
+            return
+        last = self._last_done.get(model)
+        record = self._rescue.get(model)
+        entry = {
+            "last_done": list(last) if last else None,
+            "rescue": None if record is None else {
+                "target": record.target, "desired": record.desired, "base": record.base,
+                "covered_before": record.covered_before, "issued_ms": record.issued_ms,
+                "outstanding": record.outstanding, "gained": record.gained,
+                "failures": record.failures, "done_ms": record.done_ms,
+            },
+        }
+        try:
+            saver(model, entry)
+        except Exception as exc:  # noqa: BLE001 - durable memory is best effort
+            LOG.warning("scale memory of %s not saved: %r", model, exc)
+
+    def _preempt_for_rescue(
+        self, queued: QueuedAction, credit: dict[str, int] | None = None
+    ) -> tuple[QueuedAction | None, int]:
         """A rescue action scaling up a model whose SafeScale commit waits out a
         retry backoff preempts that commit (review 3 P2-3). The donor itself
         needing capacity: the commit becomes an unhide of its hidden pods; the
@@ -1160,39 +1258,42 @@ class ActionQueue:
         view shows awake and hidden (review 4 P2-3; v1 ``up_needed = delta -
         probe_hidden``); a receiver: its pending upscale is cancelled (the rescue
         action replaces it). None = the rescue action is fully covered by the
-        restored pods."""
-        if not self._backoff:
-            return queued
+        restored pods. Also returns how many restored pods this action used.
+
+        ``credit`` (C1 review P2-1, per submit): pods restored by an earlier part's
+        preemption that it did not use - deducted from the model's later parts, so
+        several scale-up parts of one receiver never each count the same pods."""
+        credit = {} if credit is None else credit
         action = queued.action
         if isinstance(action, TransferAction):
-            ups = {action.receiver.model: action.receiver.delta}
+            model, delta = action.receiver.model, action.receiver.delta
         elif isinstance(action, ScaleAction) and action.delta > 0:
-            ups = {action.model: action.delta}
+            model, delta = action.model, action.delta
         else:
-            return queued
+            return queued, 0
         restored = 0
-        for model in ups:
-            for task, slot in list(self._backoff.items()):
-                commit = slot.queued.action
-                if isinstance(commit, SafeScaleCommitAction) and model in commit.touched_models:
-                    restored += self._preempt_commit(task, slot, model)
-        if restored <= 0:
-            return queued
+        for task, slot in list(self._backoff.items()):
+            commit = slot.queued.action
+            if isinstance(commit, SafeScaleCommitAction) and model in commit.touched_models:
+                restored += self._preempt_commit(task, slot, model)
+        available = credit.get(model, 0) + restored
+        if available <= 0:
+            return queued, 0
         if isinstance(action, TransferAction):
-            return None if restored >= action.receiver.delta else queued
-        up_needed = action.delta - restored
+            # A relay is not split: covered entirely, or kept whole (credit kept).
+            if available >= delta:
+                credit[model] = available - delta
+                return None, delta
+            credit[model] = available
+            return queued, 0
+        taken = min(available, delta)
+        credit[model] = available - taken
+        up_needed = delta - taken
         if up_needed <= 0:
-            return None
-        rescue = getattr(action, "rescue", None)
+            return None, taken
         return self._queued(
-            replace(
-                action,
-                delta=up_needed,
-                pods=tuple(action.pods[:up_needed]) if action.pods else (),
-                # C1: the restored pods already count toward the rescue target.
-                rescue=replace(rescue, covered=rescue.covered + restored) if rescue is not None else None,
-            )
-        )
+            replace(action, delta=up_needed, pods=tuple(action.pods[:up_needed]) if action.pods else ())
+        ), taken
 
     def _preempt_commit(self, task: asyncio.Future, slot: _Backoff, model: str) -> int:
         """Returns how many awake pods the preemption gives back to ``model``."""
@@ -1474,6 +1575,7 @@ class ActionQueue:
         direction = _action_direction(action)
         if result.ok and direction is not None:
             self._last_done[model] = (int(self._now_ms()), direction)
+            self._persist_scale_memory(model)
 
     def _has_pending_model(self, model: str) -> bool:
         return any(model in item.models for item in self._pending)

@@ -468,9 +468,33 @@ class ScalingRegistryConfig:
     #: a not-yet-reflected scale-up from being repeated. Scale-down holds, the slow
     #: loop and the LOW receivers keep the cooldown (TRE_ACTION_COOLDOWN).
     scale_up_cooldown_enabled: bool = False
+    #: The rescue target may also reach ``n + rescue_max_step_pods`` (HPA's default
+    #: scale-up policy shape, "max(100%, +4 pods)"): cap = max(n + 1,
+    #: floor(ratio * n), n + pods). 0 = the ratio alone.
+    rescue_max_step_pods: int = 0
+    #: An immediate IDLE / HIGH donor of a CRITICAL receiver gives its whole surplus in
+    #: one tick (IDLE down to its floor, HIGH down to its tau_high level). Off: one step
+    #: per tick, as before C1 (scale-down stays cautious).
+    donor_surplus_release: bool = False
+    #: A rescue target counts as reflected once the model's decision window starts
+    #: ``k * trs.ema_tau_ms`` after the scale-up completed (the EMA'd Z lags the raw
+    #: window by about its time constant). 0 = the window start alone (F4 rule).
+    rescue_settle_ema_k: float = 2.0
 
 
-SCALING_KEYS = frozenset({"rescue_max_step_ratio", "scale_up_cooldown_enabled"})
+SCALING_KEYS = frozenset({
+    "rescue_max_step_ratio", "scale_up_cooldown_enabled", "rescue_max_step_pods",
+    "donor_surplus_release", "rescue_settle_ema_k",
+})
+
+
+def _scaling_bool(raw: dict[str, Any], key: str, default: bool) -> bool:
+    value = raw.get(key)
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    raise ValueError(f"scaling.{key} must be true or false, got {value!r}")
 
 
 def parse_scaling_config(raw: dict[str, Any] | None) -> ScalingRegistryConfig:
@@ -495,14 +519,30 @@ def parse_scaling_config(raw: dict[str, Any] | None) -> ScalingRegistryConfig:
         raise ValueError(
             f"scaling.rescue_max_step_ratio must be 0 (legacy step) or at least 1, got {ratio_raw!r}"
         )
-    cooldown_raw = raw.get("scale_up_cooldown_enabled")
-    if cooldown_raw is None:
-        cooldown = defaults.scale_up_cooldown_enabled
-    elif isinstance(cooldown_raw, bool):
-        cooldown = cooldown_raw
-    else:
-        raise ValueError(f"scaling.scale_up_cooldown_enabled must be true or false, got {cooldown_raw!r}")
-    return ScalingRegistryConfig(rescue_max_step_ratio=ratio, scale_up_cooldown_enabled=cooldown)
+    pods_raw = raw.get("rescue_max_step_pods")
+    pods = defaults.rescue_max_step_pods if pods_raw is None else pods_raw
+    try:
+        valid_pods = not isinstance(pods, bool) and float(pods) == int(float(pods)) and int(float(pods)) >= 0
+    except (TypeError, ValueError, OverflowError):
+        valid_pods = False
+    if not valid_pods:
+        raise ValueError(f"scaling.rescue_max_step_pods must be a non-negative integer, got {pods_raw!r}")
+    k_raw = raw.get("rescue_settle_ema_k")
+    if isinstance(k_raw, bool):
+        raise ValueError(f"scaling.rescue_settle_ema_k must be a number, got {k_raw!r}")
+    try:
+        settle_k = float(defaults.rescue_settle_ema_k if k_raw is None else k_raw)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"scaling.rescue_settle_ema_k must be a number, got {k_raw!r}") from exc
+    if not math.isfinite(settle_k) or settle_k < 0:
+        raise ValueError(f"scaling.rescue_settle_ema_k must be a non-negative number, got {k_raw!r}")
+    return ScalingRegistryConfig(
+        rescue_max_step_ratio=ratio,
+        scale_up_cooldown_enabled=_scaling_bool(raw, "scale_up_cooldown_enabled", defaults.scale_up_cooldown_enabled),
+        rescue_max_step_pods=int(float(pods)),
+        donor_surplus_release=_scaling_bool(raw, "donor_surplus_release", defaults.donor_surplus_release),
+        rescue_settle_ema_k=settle_k,
+    )
 
 
 #: ``safescale.slo_mode``: where the SafeScale probe's latency thresholds come from.

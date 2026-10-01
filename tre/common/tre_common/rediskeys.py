@@ -55,6 +55,10 @@ CONTROLLER_SAFESCALE_PROBES_KEY = "tre:v2:controller:safescale:probes"
 CONTROLLER_ORPHAN_WATCH_KEY = "tre:v2:controller:orphan_watch"
 CONTROLLER_HIDDEN_ORPHAN_ALERTS_KEY = "tre:v2:controller:alerts:hidden_orphans"
 CONTROLLER_SIGNAL_LOG_KEY = "tre:v2:controller:signal_log"
+#: HASH model -> JSON {"last_done": [ms, "up"|"down"] | null, "rescue": {...} | null}:
+#: the ActionQueue's last executed scale action and C1 rescue target per model, so a
+#: restarted controller keeps them (C1 review P2-2).
+CONTROLLER_SCALE_MEMORY_KEY = "tre:v2:controller:scale_memory"
 
 
 def controller_safescale_probe_journal_key(request_id: str) -> str:

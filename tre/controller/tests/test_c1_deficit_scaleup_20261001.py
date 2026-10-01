@@ -53,7 +53,8 @@ def _cls(model, state, z, role=None, tier=None):
 
 
 def _plan(classifications, pods, *, idle_gpus=0, max_replicas=8, ratio=2.0, bases=None,
-          inflight=None, rescue_due=True, fairness_due=True, cluster_view=None, tp=None):
+          inflight=None, rescue_due=True, fairness_due=True, cluster_view=None, tp=None,
+          surplus=False, step_pods=0):
     contexts = {model: {"routable_pods": n, "assigned_replicas": n} for model, n in pods.items()}
     return build_plan(
         model_contexts=contexts,
@@ -68,6 +69,8 @@ def _plan(classifications, pods, *, idle_gpus=0, max_replicas=8, ratio=2.0, base
             suppress_hot_proactive_probe=True,
             rescue_max_step_ratio=ratio,
             model_tp_sizes=tp or {},
+            donor_surplus_release=surplus,
+            rescue_max_step_pods=step_pods,
         ),
         rescue_bases=bases,
         inflight_models=inflight,
@@ -141,23 +144,46 @@ def test_capacity_short_plans_what_exists_and_records_the_partial_target():
     assert ups[0].rescue == RescuePlan(target=3, desired=4, base=2, covered=2)
 
 
-def test_immediate_high_donor_gives_its_surplus_not_one_step():
+def test_immediate_donor_gives_one_step_per_tick_by_default():
+    """Review P1: scale-down stays cautious - the relay is the receiver's need, the
+    donor side one step per pair per tick (paper section 4)."""
+    classifications = [
+        _cls("r", ModelState.CRITICAL, 0.4),
+        _cls("d", ModelState.HIGH, 2.5, tier="surplus"),
+    ]
+    assert _deltas(_plan(classifications, {"r": 2, "d": 4})) == {"r": 1, "d": -1}
+    idle = [_cls("r", ModelState.CRITICAL, 0.2), _cls("i", ModelState.IDLE, 10.0, tier="idle")]
+    assert _deltas(_plan(idle, {"r": 3, "i": 4})) == {"r": 1, "i": -1}
+    # Same as the legacy rescue on the donor side.
+    assert _deltas(_plan(classifications, {"r": 2, "d": 4}, ratio=0)) == {"r": 1, "d": -1}
+
+
+def test_donor_surplus_release_switch_gives_the_surplus():
     classifications = [
         _cls("r", ModelState.CRITICAL, 0.4),
         # keep ceil(4 * 1.25 / 2.5) = 2 -> gives 2
         _cls("d", ModelState.HIGH, 2.5, tier="surplus"),
     ]
-    plan = _plan(classifications, {"r": 2, "d": 4})
-    assert _deltas(plan) == {"r": 2, "d": -2}
+    assert _deltas(_plan(classifications, {"r": 2, "d": 4}, surplus=True)) == {"r": 2, "d": -2}
     # A barely-HIGH donor (keep ceil(4 * 1.25 / 1.3) = 4) still gives one step.
-    barely = _plan([classifications[0], _cls("d", ModelState.HIGH, 1.3, tier="surplus")], {"r": 2, "d": 4})
-    assert _deltas(barely) == {"r": 1, "d": -1}
+    barely = [classifications[0], _cls("d", ModelState.HIGH, 1.3, tier="surplus")]
+    assert _deltas(_plan(barely, {"r": 2, "d": 4}, surplus=True)) == {"r": 1, "d": -1}
+    idle = [_cls("r", ModelState.CRITICAL, 0.2), _cls("i", ModelState.IDLE, 10.0, tier="idle")]
+    assert _deltas(_plan(idle, {"r": 3, "i": 4}, surplus=True)) == {"r": 3, "i": -3}  # floor 1
+    # The relay never exceeds what the receiver still needs (desired 4 -> needs 2).
+    rich = [_cls("r", ModelState.CRITICAL, 0.4), _cls("i", ModelState.IDLE, 10.0, tier="idle")]
+    assert _deltas(_plan(rich, {"r": 2, "i": 8}, surplus=True)) == {"r": 2, "i": -2}
 
 
-def test_idle_donor_gives_down_to_its_floor():
-    classifications = [_cls("r", ModelState.CRITICAL, 0.2), _cls("i", ModelState.IDLE, 10.0, tier="idle")]
-    plan = _plan(classifications, {"r": 3, "i": 4})
-    assert _deltas(plan) == {"r": 3, "i": -3}  # floor 1; desired 6 needs 3
+def test_high_donor_is_not_pushed_to_its_tau_high_edge_without_the_switch():
+    """Review P3 (ping-pong): only the opt-in surplus release takes a HIGH donor down
+    to exactly tau_high (its next window HEALTHY, then LOW on a small rise). By
+    default it gives one step, so 8 -> 7 at Z 2.5 keeps it well above tau_high."""
+    classifications = [_cls("r", ModelState.CRITICAL, 0.1), _cls("d", ModelState.HIGH, 2.5, tier="surplus")]
+    default = _deltas(_plan(classifications, {"r": 4, "d": 8}))
+    assert default["d"] == -1
+    released = _deltas(_plan(classifications, {"r": 4, "d": 8}, surplus=True))
+    assert released["d"] == -4  # keep ceil(8 * 1.25 / 2.5) = 4: Z -> exactly tau_high
 
 
 def test_tp_receiver_takes_several_free_slot_pairs_in_one_action():
@@ -382,4 +408,239 @@ def test_shipped_registry_scaling_section_is_the_default():
     assert registry.scaling() == ScalingRegistryConfig()
     raw = yaml.safe_load(open(__import__("pathlib").Path(__file__).resolve().parents[2] / "deploy" / "registry.yaml",
                               encoding="utf-8"))
-    assert set(raw["scaling"]) == {"rescue_max_step_ratio", "scale_up_cooldown_enabled"}
+    assert set(raw["scaling"]) == {
+        "rescue_max_step_ratio", "scale_up_cooldown_enabled", "rescue_max_step_pods",
+        "donor_surplus_release", "rescue_settle_ema_k",
+    }
+    assert registry.scaling().donor_surplus_release is False
+    assert registry.scaling().rescue_max_step_pods == 0
+
+
+# ===================================================== review round (2026-10-01)
+from dataclasses import replace as _replace  # noqa: E402
+
+from tre_controller.loops.tick import _apply_safescale, _rescue_bases, rescue_settle_ms  # noqa: E402
+from tre_controller.planning.planner import SafeScaleCommitAction  # noqa: E402
+
+
+def test_rescue_max_step_pods_extends_the_cap_hpa_style():
+    assert rescue_desired(1, 0.01, 0.8, 2.0, 0) == 2
+    assert rescue_desired(1, 0.01, 0.8, 2.0, 4) == 5      # max(2n, n + 4)
+    assert rescue_desired(8, 0.01, 0.8, 2.0, 4) == 16     # 2n wins for a large n
+    assert rescue_desired(1, 0.5, 0.8, 2.0, 4) == 2       # the Z deficit still rules
+    plan = _plan([_cls("r", ModelState.CRITICAL, 0.1)], {"r": 1}, idle_gpus=8, step_pods=3)
+    assert _deltas(plan) == {"r": 3}
+    assert _deltas(_plan([_cls("r", ModelState.CRITICAL, 0.1)], {"r": 1}, idle_gpus=8)) == {"r": 1}
+    assert parse_scaling_config({"rescue_max_step_pods": 4}).rescue_max_step_pods == 4
+    for bad in (-1, 1.5, True, "x"):
+        with pytest.raises(ValueError):
+            parse_scaling_config({"rescue_max_step_pods": bad})
+
+
+class _Preempting:
+    """SafeScale stand-in: the first preemption request of a model gives back
+    ``restored`` hidden probe pods, later ones nothing (the probe is gone)."""
+
+    def __init__(self, restored: int) -> None:
+        self.restored = restored
+        self.calls: list[str] = []
+
+    def request_preemption(self, model, *, reason):
+        self.calls.append(model)
+        return self.restored if len(self.calls) == 1 else 0
+
+
+def _parts(plan):
+    return (
+        ScaleAction("r", 1, "critical_sleeping_capacity", "rescue", receiver="r", pods=("r-2",), hint=True, rescue=plan),
+        ScaleAction("r", 2, "critical_idle_capacity", "rescue", receiver="r", rescue=plan),
+    )
+
+
+def test_tick_preempts_once_per_receiver_and_deducts_across_parts():
+    plan = RescuePlan(target=5, desired=5, base=2, covered=2)
+    safescale = _Preempting(restored=2)
+    covered: dict = {}
+    actions, events = _apply_safescale(_snapshot(5_000), _parts(plan), {}, safescale=safescale,
+                                       covered_targets=covered)
+    assert safescale.calls == ["r"]  # one preemption for the receiver, not one per part
+    assert [(a.delta, a.reason) for a in actions] == [(1, "critical_idle_capacity")]
+    assert actions[0].rescue == _replace(plan, covered=4)  # 2 routable + 2 restored
+    assert covered == {}
+    assert "safescale_probe_preempted:r:restored=2:up_needed=1" in events
+
+
+def test_tick_records_a_target_fully_covered_by_restored_pods():
+    plan = RescuePlan(target=5, desired=5, base=2, covered=2)
+    covered: dict = {}
+    actions, _ = _apply_safescale(_snapshot(5_000), _parts(plan), {}, safescale=_Preempting(3),
+                                  covered_targets=covered)
+    assert actions == ()
+    assert covered == {"r": _replace(plan, covered=5)}
+    queue = ActionQueue(_Client(), now_ms=_Clock(7_000))
+    queue.record_rescue_covered("r", covered["r"])
+    record = queue.rescue_targets()["r"]
+    assert (record.covered, record.outstanding, record.done_ms) == (5, 0, 7_000)
+
+
+class _FakeTask:
+    pass
+
+
+def _queue_with_backoff_commit(restored: int) -> ActionQueue:
+    queue = ActionQueue(_Client(), now_ms=_Clock(9_000))
+    task = _FakeTask()
+    slot = type("Slot", (), {})()
+    slot.queued = type("Q", (), {"action": SafeScaleCommitAction(donor="r", pods=("r-9",), reason="x")})()
+    queue._backoff = {task: slot}
+
+    def preempt(task_, slot_, model):
+        queue._backoff.pop(task_, None)
+        return restored
+
+    queue._preempt_commit = preempt
+    return queue
+
+
+def test_queue_commit_preemption_credit_spans_all_parts():
+    plan = RescuePlan(target=5, desired=5, base=2, covered=2)
+    queue = _queue_with_backoff_commit(restored=2)
+    result = queue.submit(list(_parts(plan)))
+    assert result.dropped == (("r", "covered_by_preempted_commit"),)
+    assert [(item.action.delta, item.action.reason) for item in queue.pending_actions()] == [
+        (1, "critical_idle_capacity")
+    ]
+    record = queue.rescue_targets()["r"]
+    assert (record.gained, record.outstanding, record.done_ms) == (2, 1, None)
+
+
+def test_queue_records_a_target_covered_entirely_by_a_commit_preemption():
+    plan = RescuePlan(target=5, desired=5, base=2, covered=2)
+    queue = _queue_with_backoff_commit(restored=3)
+    result = queue.submit(list(_parts(plan)))
+    assert result.accepted == 0 and len(result.dropped) == 2
+    record = queue.rescue_targets()["r"]
+    assert (record.covered, record.outstanding, record.done_ms) == (5, 0, 9_000)
+
+
+def test_superseded_target_parts_never_complete_the_new_target_early():
+    queue = ActionQueue(_Client(), now_ms=_Clock(1_000))
+    old = RescuePlan(target=3, desired=3, base=2, covered=2)
+    new = RescuePlan(target=4, desired=4, base=2, covered=3)
+    queue.submit([ScaleAction("r", 1, "critical_idle_capacity", "rescue", receiver="r", rescue=old)])
+    queue.submit([ScaleAction("r", 1, "critical_idle_capacity", "rescue", receiver="r", rescue=new)])
+    first = queue.pending_actions()[0].action
+    queue._finish_rescue(first)  # a part of the superseded target ends
+    record = queue.rescue_targets()["r"]
+    assert (record.target, record.outstanding, record.done_ms) == (4, 1, None)
+
+
+def _json_roundtrip(record):
+    import json
+
+    return json.loads(json.dumps(record))
+
+
+class _MemoryStore:
+    def __init__(self) -> None:
+        self.data: dict = {}
+
+    def save_scale_memory(self, model, record):
+        self.data[model] = _json_roundtrip(record)
+
+    def load_scale_memory(self):
+        return dict(self.data)
+
+
+def test_scale_memory_survives_a_controller_restart():
+    store = _MemoryStore()
+    queue = ActionQueue(_Client(), now_ms=_Clock(65_000), scale_memory=store)
+    run_rescue_tick(_snapshot(5_000), queue=queue, registry=_registry())
+    asyncio.run(queue.drain_once())
+    before = queue.rescue_targets()["critical"]
+
+    restarted = ActionQueue(_Client(), now_ms=_Clock(70_000), scale_memory=store)
+    after = restarted.rescue_targets()["critical"]
+    assert (after.base, after.target, after.covered, after.done_ms) == (
+        before.base, before.target, before.covered, 65_000,
+    )
+    assert restarted.last_actions() == {"critical": (65_000, "up")}
+    # The restarted controller holds on the unreflected window instead of waking again.
+    held = run_rescue_tick(_snapshot(20_000), queue=restarted, registry=_registry())
+    assert held.submitted == 0
+    assert "rescue_target_hold:critical:desired=4:covered=4" in held.events
+
+
+def test_scale_memory_of_a_target_still_running_at_the_restart_is_done_at_load():
+    store = _MemoryStore()
+    queue = ActionQueue(_Client(), now_ms=_Clock(65_000), scale_memory=store)
+    run_rescue_tick(_snapshot(5_000), queue=queue, registry=_registry())  # submitted, never drained
+    restarted = ActionQueue(_Client(), now_ms=_Clock(80_000), scale_memory=store)
+    record = restarted.rescue_targets()["critical"]
+    assert (record.outstanding, record.done_ms) == (0, 80_000)
+
+
+def test_scale_memory_errors_never_break_the_queue():
+    class _Broken:
+        def load_scale_memory(self):
+            raise RuntimeError("redis down")
+
+        def save_scale_memory(self, model, record):
+            raise RuntimeError("redis down")
+
+    queue = ActionQueue(_Client(), now_ms=_Clock(65_000), scale_memory=_Broken())
+    run_rescue_tick(_snapshot(5_000), queue=queue, registry=_registry())
+    asyncio.run(queue.drain_once())
+    assert queue.rescue_targets()["critical"].covered == 4
+
+
+def test_controller_state_store_scale_memory_roundtrip():
+    from tre_controller.store.state_store import ControllerStateStore
+
+    class _Redis:
+        def __init__(self):
+            self.h: dict = {}
+
+        def hset(self, name, key=None, value=None, mapping=None):
+            self.h.setdefault(name, {}).update(mapping or {key: value})
+
+        def hgetall(self, name):
+            return {k.encode(): v.encode() for k, v in self.h.get(name, {}).items()}
+
+    store = ControllerStateStore(_Redis())
+    store.save_scale_memory("m", {"last_done": [1, "up"], "rescue": None})
+    assert store.load_scale_memory() == {"m": {"last_done": [1, "up"], "rescue": None}}
+
+
+def _registry_with_tau(tau_ms, **scaling):
+    base = _base_registry()
+    spec = base.model("critical")
+    spec = _replace(spec, trs=_replace(spec.trs, ema_tau_ms=tau_ms))
+    return Registry(base.topology(), [spec], scaling=ScalingRegistryConfig(**scaling))
+
+
+def test_settle_waits_k_ema_time_constants_after_the_window_start():
+    queue = ActionQueue(_Client(), now_ms=_Clock(65_000))
+    queue.record_rescue_covered("critical", RescuePlan(target=4, desired=4, base=2, covered=4))
+    registry = _registry_with_tau(10_000.0)  # default k = 2 -> 20 s
+    assert rescue_settle_ms(registry, "critical") == 20_000.0
+    assert "critical" in _rescue_bases(_snapshot(65_000), queue, registry)  # the F4 rule alone: settled
+    assert "critical" in _rescue_bases(_snapshot(84_999), queue, registry)
+    assert "critical" not in _rescue_bases(_snapshot(85_000), queue, registry)
+    no_ext = _registry_with_tau(10_000.0, rescue_settle_ema_k=0)
+    assert "critical" not in _rescue_bases(_snapshot(65_000), queue, no_ext)
+    assert rescue_settle_ms(_registry_with_tau(None), "critical") == 0.0  # legacy fixed alpha
+    for bad in (-1, "x", True):
+        with pytest.raises(ValueError):
+            parse_scaling_config({"rescue_settle_ema_k": bad})
+
+
+def test_tp_slot_loop_without_occupancy_counts_one_slot():
+    # Defensive (build_plan always has an occupancy with a cluster view): the allocator
+    # path does not claim, so a second iteration would count the same slot again.
+    import inspect
+
+    from tre_controller.planning import planner
+
+    source = inspect.getsource(planner.build_plan)
+    assert "slot_limit = raw_need if occupancy is not None else 1" in source

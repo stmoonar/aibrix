@@ -83,6 +83,20 @@ class ControllerStateStore:
             records.append((request_id, record))
         return [record for _, record in sorted(records, key=lambda item: item[0])]
 
+    def save_scale_memory(self, model: str, record: dict[str, Any]) -> None:
+        """C1 review P2-2: the ActionQueue's per-model scale memory (last executed
+        action, last rescue target)."""
+        self._redis.hset(rediskeys.CONTROLLER_SCALE_MEMORY_KEY, mapping={model: _to_json(record)})
+
+    def load_scale_memory(self) -> dict[str, dict[str, Any]]:
+        raw = self._redis.hgetall(rediskeys.CONTROLLER_SCALE_MEMORY_KEY) or {}
+        memory: dict[str, dict[str, Any]] = {}
+        for raw_model, raw_payload in raw.items():
+            record = _decode_mapping(raw_payload)
+            if record is not None:
+                memory[_to_text(raw_model)] = record
+        return memory
+
     def append_probe_journal(self, request_id: str, record: dict[str, Any]) -> None:
         self._redis.rpush(
             rediskeys.controller_safescale_probe_journal_key(request_id),

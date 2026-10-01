@@ -319,6 +319,8 @@ def create_controller_dependencies(
         snapshot_box=SnapshotBox(),
         queue=ActionQueue(
             sm_client,
+            # C1 review P2-2: last scale action / rescue target survive a restart.
+            scale_memory=ControllerStateStore(redis_client),
             is_observe=observe_gate.is_observe,
             # Uncached re-check right before every capacity-changing SM call.
             is_observe_fresh=observe_gate.is_observe_fresh,
