@@ -461,7 +461,9 @@ in `observe active` with `EXPECT_CP_TAG=$TAG` exported. Before / during it:
   `$TRE_REPO/tre` = main, which still has the old v1 sender until the branch is merged.
   So export `TRE_DIR=$WT/tre` (or merge first), and do not put another `tre_replayer` on
   `PYTHONPATH` (the shell warns and records which one it used). The 09-30
-  `run_arm.sh` itself has the main path built in: use it only after the merge.
+  `smoke-e1-20260930/tools/run_arm.sh` (outside the repo) takes the same override since
+  2026-10-01: `TRE_DIR=$WT/tre bash run_arm.sh <arm> ...` (default unchanged: main;
+  backup `run_arm.sh.bak-20261001`).
   Client-side latencies of this run are not comparable with 09-30 smoke numbers (old
   sender) - compare server-side and error counts instead.
 - **Campaign request.** `campaign_queue` manifests without `client_profile` now send

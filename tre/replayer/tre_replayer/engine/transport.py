@@ -256,7 +256,7 @@ class HttpxStreamTransport:
 
     def provenance(self) -> dict:
         return {"transport": self.name, "http": "HTTP/1.1 keep-alive (pooled)",
-                "retries": "0; one repeat only when not a byte of the request left (never seen by the server)",
+                "retries": "0; one repeat only when the request headers never started to go out (never seen by the server)",
                 "pool_max_connections": self.max_connections, "pool_shards_max": self.shards,
                 "pool_shard_connections": self.shard_connections,
                 "pool_shard_keepalive_connections": self.shard_keepalive,
@@ -279,9 +279,13 @@ class HttpxStreamTransport:
             first_start = time.perf_counter()
             res, wire = await self._send(shards.clients[index], url, headers, body, timeout_s)
             if res.status == 0 and not wire["sent"] and not res.timed_out:
-                # Not one byte left (a kept-alive connection found dead, a refused
-                # connect): the server never saw the request, so repeating it once adds
-                # no load the schedule did not plan. Nothing else is ever repeated.
+                # The request headers never started to go out (no
+                # http11.send_request_headers.started: a refused / failed connect, a
+                # pooled connection found closed before the write): the server never saw
+                # the request, so repeating it once adds no load the schedule did not
+                # plan. A dead kept-alive connection that takes the write and fails on
+                # the read counts as sent and is not repeated. Nothing else is ever
+                # repeated.
                 first_log = list(res.attempt_log)
                 spent_ms = (time.perf_counter() - first_start) * 1000.0
                 res, wire = await self._send(shards.clients[index], url, headers, body, timeout_s)

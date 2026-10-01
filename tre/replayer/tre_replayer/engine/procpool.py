@@ -29,6 +29,13 @@ A worker never outlives its parent: on Linux it asks the kernel for ``SIGKILL`` 
 parent dies (``prctl(PR_SET_PDEATHSIG)``); everywhere it also watches ``getppid()`` and
 stops sending the moment its pipe to the parent breaks. The parent terminates its
 workers on ``SIGTERM`` and on any error, including one before :meth:`run`.
+
+``PR_SET_PDEATHSIG`` follows the **thread** that forked the worker, not the process: the
+signal fires when that thread exits, even while the rest of the parent lives on. The
+workers are forked in :class:`ProcessPoolRunner`'s constructor, so create the runner in
+the main thread or in a thread that outlives the whole run - never in a short-lived
+worker thread (e.g. an executor job that returns before :meth:`ProcessPoolRunner.run`
+finishes), or every worker is killed when that thread ends.
 """
 from __future__ import annotations
 
@@ -329,7 +336,9 @@ class ProcessPoolRunner:
     ``validate(event)`` runs on every event in the parent before anything forks (a
     request that cannot be sent is refused up front, not discovered in a worker).
     Use it as a context manager, or call :meth:`close`, so workers that never ran are
-    not left behind.
+    not left behind. The constructor forks: create it in the main thread or a thread
+    that outlives the run (``PR_SET_PDEATHSIG`` follows the forking thread; see the
+    module docstring).
     """
 
     def __init__(self, events: Sequence, make_sender: SenderFactory, *, processes: int,

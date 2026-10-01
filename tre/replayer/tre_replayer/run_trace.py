@@ -191,7 +191,15 @@ def _run_e1(schedule, *, gateway_url, prompt_path, prompt_workers, routing_strat
 def e1_replay_row(record: dict, event) -> dict:
     """An e1_v1 record with the replay row's keys on the strict basis (what the scoring,
     the request-health gate and the arrival series read). The v1 fields stay as they
-    are; where a name is taken, the v1 value moves to ``*_v1``."""
+    are; where a name is taken, the v1 value moves to ``*_v1``.
+
+    Token fields: ``input_tokens`` is the prompt length the trace asked for (the replay
+    row's meaning; v1's usage value is kept as ``input_tokens_v1`` and ``prompt_tokens``);
+    ``output_tokens`` is the ACTUAL completion length (usage; e1_v1 sends no
+    ``ignore_eos``, so it may end below the bound), also kept as ``output_tokens_v1`` and
+    ``completion_tokens``; the trace's upper bound (``max_tokens``) is
+    ``max_output_tokens``. The scoring reads ``completion_tokens`` / ``ttft_ms`` /
+    ``e2e_ms`` / ``http_status`` / ``error``, the request-health gate ``http_status``."""
     ms = (lambda s: None if s is None else s * 1000.0)
     strict_ok = bool(record.get("success_strict"))
     row = dict(record)
@@ -202,10 +210,13 @@ def e1_replay_row(record: dict, event) -> dict:
         "on_wire_delay_ms": record.get("send_lateness_ms"),
         "ttft_ms": ms(record.get("ttft_strict_s")),
         "e2e_ms": ms(record.get("e2e_strict_s")),
+        "input_tokens_v1": record.get("input_tokens"),
+        "output_tokens_v1": record.get("output_tokens"),
         "prompt_tokens": record.get("input_tokens"),
         "completion_tokens": record.get("output_tokens"),
         "input_tokens": event.prompt_tokens,
-        "output_tokens": event.max_output_tokens,
+        "output_tokens": record.get("output_tokens"),
+        "max_output_tokens": event.max_output_tokens,
         "http_status_v1": record.get("http_status"),
         "http_status": record.get("http_status_strict"),
         "error": None if strict_ok else (
