@@ -263,6 +263,24 @@ func (a *DefaultAutoScaler) executeScalingPipeline(
 	// Use scaling context from request (single source of truth)
 	scalingContext := request.ScalingContext
 
+	// The stable window length is per PodAutoscaler (apa.autoscaling.aibrix.ai/window).
+	if scalingContext != nil {
+		a.metricsClient.EnsureStableWindow(metricKey, scalingContext.GetStableWindow())
+		klog.InfoS("Effective autoscaling config",
+			"podAutoscaler", workloadKey,
+			"strategy", request.PodAutoscaler.Spec.ScalingStrategy,
+			"metric", metricKey.MetricName,
+			"stableWindow", a.metricsClient.StableWindowDuration(metricKey).String(),
+			"upTolerance", scalingContext.GetUpFluctuationTolerance(),
+			"downTolerance", scalingContext.GetDownFluctuationTolerance(),
+			"maxScaleUpRate", scalingContext.GetMaxScaleUpRate(),
+			"maxScaleDownRate", scalingContext.GetMaxScaleDownRate(),
+			"scaleUpCooldown", scalingContext.GetScaleUpCooldownWindow().String(),
+			"scaleDownCooldown", scalingContext.GetScaleDownCooldownWindow().String(),
+			"minReplicas", scalingContext.GetMinReplicas(),
+			"maxReplicas", scalingContext.GetMaxReplicas())
+	}
+
 	// Step 2: Process and aggregate metrics
 	klog.InfoS("Processing metrics snapshot", "source", workloadKey, "healthy metrics pods", len(snapshot.Values), "values", snapshot.Values)
 	if err := a.aggregator.ProcessSnapshot(metricKey, snapshot); err != nil {

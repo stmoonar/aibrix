@@ -19,6 +19,7 @@ package context
 import (
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	autoscalingv1alpha1 "github.com/vllm-project/aibrix/api/autoscaling/v1alpha1"
@@ -53,6 +54,7 @@ type ScalingContext interface {
 	GetScaleUpCooldownWindow() time.Duration
 	GetScaleDownCooldownWindow() time.Duration
 	GetScaleToZero() bool
+	GetStableWindow() time.Duration
 }
 
 // baseScalingContext provides a base implementation of the ScalingContext interface.
@@ -77,6 +79,8 @@ type baseScalingContext struct {
 	ScaleDownCooldownWindow time.Duration
 	// Scale to zero flag
 	ScaleToZero bool
+	// Length of the stable metric window the recommendation is averaged over
+	StableWindow time.Duration
 	// Panic threshold for KPA
 	PanicThreshold float64
 
@@ -114,6 +118,7 @@ func NewBaseScalingContext() *baseScalingContext {
 		ScaleToZero:              false,             // Default: do not scale to zero
 		PanicThreshold:           2.0,               // Default panic threshold for KPA
 		MetricTargets:            make(map[string]MetricTarget),
+		StableWindow:             types.DefaultStableWindowDuration, // overridden by apa.autoscaling.aibrix.ai/window
 	}
 }
 
@@ -171,6 +176,16 @@ var annotationParsers = map[string]annotationParser{
 		}
 		return err
 	},
+	types.APAWindowLabel: func(b *baseScalingContext, value string) error {
+		v, err := time.ParseDuration(value)
+		if err == nil && v <= 0 {
+			err = fmt.Errorf("%s must be positive, got %q", types.APAWindowLabel, value)
+		}
+		if err == nil {
+			b.StableWindow = v
+		}
+		return err
+	},
 	types.ScaleToZeroLabel: func(b *baseScalingContext, value string) error {
 		v, err := strconv.ParseBool(value)
 		if err == nil {
@@ -206,9 +221,31 @@ func (b *baseScalingContext) UpdateByPaTypes(pa *autoscalingv1alpha1.PodAutoscal
 			if err := parser(b, value); err != nil {
 				return err
 			}
+		} else if isAutoscalingAnnotation(key) {
+			// A misspelled or renamed key is otherwise silently ignored and the default applies.
+			klog.InfoS("Ignoring unrecognized autoscaling annotation; the default value applies",
+				"podAutoscaler", klog.KObj(pa), "annotation", key, "value", value)
 		}
 	}
 	return nil
+}
+
+// nonScalingContextAnnotations are autoscaling-prefixed keys consumed outside the scaling context.
+var nonScalingContextAnnotations = map[string]bool{
+	types.AutoscalingLabelPrefix + "storm-service-mode": true,
+}
+
+func isAutoscalingAnnotation(key string) bool {
+	if nonScalingContextAnnotations[key] {
+		return false
+	}
+	for _, prefix := range []string{types.AutoscalingLabelPrefix, "apa." + types.AutoscalingLabelPrefix,
+		"kpa." + types.AutoscalingLabelPrefix} {
+		if strings.HasPrefix(key, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func (b *baseScalingContext) SetCurrentUsePerPod(value float64) {
@@ -316,4 +353,8 @@ func (b *baseScalingContext) GetScaleDownCooldownWindow() time.Duration {
 
 func (b *baseScalingContext) GetScaleToZero() bool {
 	return b.ScaleToZero
+}
+
+func (b *baseScalingContext) GetStableWindow() time.Duration {
+	return b.StableWindow
 }

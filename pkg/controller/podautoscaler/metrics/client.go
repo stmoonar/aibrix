@@ -25,7 +25,7 @@ import (
 )
 
 const (
-	stableWindowDuration = 180 * time.Second
+	stableWindowDuration = types.DefaultStableWindowDuration
 	panicWindowDuration  = 60 * time.Second
 )
 
@@ -101,6 +101,40 @@ func (c *MetricsClient) ensureWindowsForKey(metricKeyStr string) {
 	c.stableHistory[metricKeyStr] = types.NewMetricHistory(stableWindowDuration * 10)
 	c.panicWindows[metricKeyStr] = types.NewTimeWindow(panicWindowDuration, c.granularity)
 	c.panicHistory[metricKeyStr] = types.NewMetricHistory(panicWindowDuration * 10)
+}
+
+// EnsureStableWindow sets the stable window length for metricKey (per PodAutoscaler).
+// A non-positive duration selects the default. If the key already has a stable window of a
+// different length, the window and its history are rebuilt (the samples are discarded).
+func (c *MetricsClient) EnsureStableWindow(metricKey types.MetricKey, duration time.Duration) {
+	if duration <= 0 {
+		duration = stableWindowDuration
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	metricKeyStr := metricKey.String()
+	if w, exists := c.stableWindows[metricKeyStr]; exists {
+		if w.Duration() == duration {
+			return
+		}
+		klog.InfoS("Resizing stable metric window", "metricKey", metricKeyStr,
+			"from", w.Duration(), "to", duration)
+	}
+	c.ensureWindowsForKey(metricKeyStr)
+	c.stableWindows[metricKeyStr] = types.NewTimeWindow(duration, c.granularity)
+	c.stableHistory[metricKeyStr] = types.NewMetricHistory(duration * 10)
+}
+
+// StableWindowDuration returns the stable window length configured for metricKey, or the
+// default if the key has no window yet.
+func (c *MetricsClient) StableWindowDuration(metricKey types.MetricKey) time.Duration {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if w, exists := c.stableWindows[metricKey.String()]; exists {
+		return w.Duration()
+	}
+	return stableWindowDuration
 }
 
 // UpdateMetrics records metrics to all configured windows for the given metricKey

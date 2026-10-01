@@ -149,6 +149,10 @@ func (m *mockScalingContext) GetScaleDownCooldownWindow() time.Duration {
 	return 300 * time.Second
 }
 
+func (m *mockScalingContext) GetStableWindow() time.Duration {
+	return 180 * time.Second
+}
+
 func (m *mockScalingContext) GetScaleToZero() bool {
 	return false
 }

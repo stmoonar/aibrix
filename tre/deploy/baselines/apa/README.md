@@ -76,6 +76,25 @@ may be live:
 `toggle_tre_apa.sh` always stops the old source and verifies it is gone before starting the
 new one.
 
+## Annotations (keys the controller actually reads)
+
+The v2 controller only applies annotation keys it has a parser for
+(`pkg/controller/podautoscaler/context/context.go` `annotationParsers`); any other
+`autoscaling.aibrix.ai/`, `apa.autoscaling.aibrix.ai/` or `kpa.autoscaling.aibrix.ai/` key is
+ignored and logged as `Ignoring unrecognized autoscaling annotation`. The CRs use:
+
+| Key | Value | Notes |
+| --- | --- | --- |
+| `autoscaling.aibrix.ai/scale-up-tolerance` | `0.1` | AIBrix v0.4 name was `apa.autoscaling.aibrix.ai/up-fluctuation-tolerance` |
+| `autoscaling.aibrix.ai/scale-down-tolerance` | `0.2` | v0.4 name: `apa.autoscaling.aibrix.ai/down-fluctuation-tolerance` |
+| `apa.autoscaling.aibrix.ai/window` | `20s` | stable metric window, per PodAutoscaler; default 180 s |
+
+Not set, so the controller defaults apply: `autoscaling.aibrix.ai/max-scale-up-rate` 2,
+`max-scale-down-rate` 2, `scale-up-cooldown-window` 0 s, `scale-down-cooldown-window` 300 s.
+The controller evaluates every 10 s (`DefaultResyncInterval`), so a 20 s window averages the
+last 2-3 samples. Each evaluation logs the values in force:
+`kubectl -n aibrix-system logs deploy/aibrix-controller-manager | grep "Effective autoscaling config"`.
+
 ## Leftover assumptions (verify on the live cluster after R3)
 
 1. **`SERVICE_MANAGE_URL` / `APA_SCALE_SLEEP_MODE` on the aibrix-system podautoscaler

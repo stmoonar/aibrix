@@ -197,6 +197,13 @@ func (tw *TimeWindow) Record(timestamp time.Time, value float64) {
 	}
 }
 
+// Duration returns the length of the window
+func (tw *TimeWindow) Duration() time.Duration {
+	tw.mu.RLock()
+	defer tw.mu.RUnlock()
+	return tw.duration
+}
+
 // Size returns the number of data points in the window
 func (tw *TimeWindow) Size() int {
 	tw.mu.RLock()
