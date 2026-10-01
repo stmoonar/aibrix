@@ -420,6 +420,10 @@ def _has_structured_body(body: Optional[str]) -> bool:
     return True
 
 
+def _is_admission_overflow(record: dict) -> bool:
+    return classify_failure(record) == FAILURE_ADMISSION_OVERFLOW
+
+
 def classify_failure(record: dict) -> str:
     """Attribute one request record to the model or to the gateway.
 
@@ -433,6 +437,8 @@ def classify_failure(record: dict) -> str:
     Rules, in order:
 
     * 2xx whose stream carried an ``{"error": ...}`` chunk (``stream_error``) -> model.
+    * 2xx whose body ended without ``[DONE]`` or a finish reason (``stream_complete``
+      False; absent on rows before 2026-10-01) -> model: a truncated answer.
     * 2xx with a measured end-to-end time -> served.
     * the sender flagged ``client_timeout`` -> the client's own deadline fired. Checked
       before everything else because it is the only class the *sender* can attest to;
@@ -459,6 +465,11 @@ def classify_failure(record: dict) -> str:
     if record.get("stream_error") and status is not None and 200 <= int(status) < 300:
         # The engine failed the request inside a 200 stream ({"error": ...} chunk): it
         # answered for itself, so it is the model's failure, and never a completion.
+        return FAILURE_MODEL
+    if record.get("stream_complete") is False and status is not None and 200 <= int(status) < 300:
+        # The 200 body just stopped - no [DONE], no finish reason: a truncated answer is
+        # not a completion (the strict basis of tre_replayer.engine.metrics agrees).
+        # Rows written before 2026-10-01 have no such field and are judged as before.
         return FAILURE_MODEL
     if status is not None and 200 <= int(status) < 300 and record.get("e2e_ms") is not None:
         return FAILURE_NONE
@@ -1747,6 +1758,8 @@ def drive_cell_schedule(
     max_backlog: Optional[int] = None,
     api: Optional[str] = None,
     request_seed: Optional[int] = None,
+    sender_processes: Optional[int] = None,
+    client_out: Optional[dict] = None,
 ) -> tuple:
     """Drive one open-loop cell from ``segments``; returns (start_ms, end_ms, guard).
 
@@ -1798,10 +1811,20 @@ def drive_cell_schedule(
     ``r3_grid`` sidecar schema plus ``on_live_grid``, so the offline re-windowing path is
     unchanged (pass ``--instant-sample-ms 1000`` to ``rewindow_from_raw`` to match this
     cadence).
+
+    ``sender_processes`` (None = :data:`tre_replayer.engine.profiles.DEFAULT_SENDER_PROCESSES`)
+    is how many worker processes send the cell (:mod:`tre_replayer.engine.procpool`: the
+    schedule is pre-sharded and every worker fires its requests at their absolute times on
+    its own event loop); the truncation and backlog rules then run through a shared
+    :class:`~tre_replayer.engine.procpool.StopGate` with the same semantics. 1 sends from
+    this process; a synchronous ``stream_call`` seam always does. ``client_out`` receives
+    the client's provenance (profile, wire, pool, processes).
     """
     from tre_replayer.engine import rps_timeline as rps
     from tre_replayer.engine.dispatcher import dispatch_open_loop
     from tre_replayer.engine.http_sender import StreamingHttpSender
+    from tre_replayer.engine.procpool import ProcessPoolRunner, StopGate, monotonic_to_wall_ms
+    from tre_replayer.engine.profiles import DEFAULT_SENDER_PROCESSES
     from tre_replayer.engine.prompt_store import materialize_prompts, prompt_file_path
     from tre_replayer.engine.prompts import DEFAULT_MODE
     from tre_replayer.engine.schedule import build_poisson_schedule
@@ -1836,15 +1859,25 @@ def drive_cell_schedule(
         sender_kwargs["prompt_mode"] = prompt_mode
     if request_seed is not None:
         sender_kwargs["request_seed"] = int(request_seed)
-    sender = StreamingHttpSender(
-        gateway_url,
-        stream_call=stream_call,
-        max_in_flight=max_in_flight,
-        routing_strategy=routing_strategy,
-        now_ms=now_ms,
-        prompt_store=prompt_store,
-        **sender_kwargs,
-    )
+    processes = int(DEFAULT_SENDER_PROCESSES if sender_processes is None else sender_processes)
+    if stream_call is not None or processes < 1:
+        # A synchronous seam is a test / dry-run stand-in for the network: in-process.
+        processes = 1
+
+    def make_sender(index: int = 0, in_flight=None, on_record=None):
+        return StreamingHttpSender(
+            gateway_url,
+            stream_call=stream_call,
+            max_in_flight=max_in_flight,
+            routing_strategy=routing_strategy,
+            now_ms=now_ms,
+            prompt_store=prompt_store,
+            in_flight=in_flight,
+            on_record=on_record,
+            process_id=index,
+            **sender_kwargs,
+        )
+
     sidecar = None
     if instant_sampler is not None:
         sidecar = _Sidecar(sampler=instant_sampler, interval_s=instant_interval_s, now_ms=now_ms)
@@ -1853,35 +1886,85 @@ def drive_cell_schedule(
     # segment - whose only job is to capture a recovery tail as evidence - is dead time.
     # Truncation itself is kept: see TruncateOnProxyShed.
     shed_policy = (guard_kwargs or {}).get("shed_policy", DEFAULT_SHED_POLICY)
-    backlog = StopOnBacklog(sender, max_backlog=max_backlog) if max_backlog else None
-    inner = backlog or sender
-    truncator = (
-        TruncateOnProxyShed(
-            inner,
-            drain_start_s=drain_start_s,
-            keep_drain=shed_policy != SHED_POLICY_VOID,
-        )
-        if truncate_on_proxy_shed
-        else None
-    )
+    runner = None
+    gate = None
+    inner = None
+    # Built here whatever the process count: a misconfigured sender (URL of the other
+    # API, prompt mode) is refused in this process, before anything forks, and this one
+    # object states the client's provenance.
+    local_sender = make_sender()
+    if processes > 1:
+        # Forked here, before the sidecar threads exist.
+        if truncate_on_proxy_shed or max_backlog:
+            # The worker that receives the overflow trips the gate itself, before the
+            # record travels to this process; this process's observer is the backstop.
+            gate = StopGate(truncate=truncate_on_proxy_shed, drain_start_s=drain_start_s,
+                            keep_drain=shed_policy != SHED_POLICY_VOID, max_backlog=max_backlog,
+                            trip_if=_is_admission_overflow)
 
+        runner = ProcessPoolRunner(events, make_sender, processes=processes, gate=gate,
+                                   observer=None if gate is None else gate.observe)
+        sender = None
+        backlog = truncator = None
+    else:
+        sender = local_sender
+        backlog = StopOnBacklog(sender, max_backlog=max_backlog) if max_backlog else None
+        inner = backlog or sender
+        truncator = (
+            TruncateOnProxyShed(
+                inner,
+                drain_start_s=drain_start_s,
+                keep_drain=shed_policy != SHED_POLICY_VOID,
+            )
+            if truncate_on_proxy_shed
+            else None
+        )
     start_ms = now_ms()
     instants: list = []
-    if sidecar is not None:
-        sidecar.start()
-    if overflow_sentinel is not None:
-        overflow_sentinel.start()
+    prompt_store_misses = None
     try:
-        report = asyncio.run(dispatch_open_loop(events, truncator or inner))
+        if client_out is not None:
+            client_out.update(local_sender.provenance(processes=runner.processes if runner else 1))
+        if sidecar is not None:
+            sidecar.start()
+        if overflow_sentinel is not None:
+            overflow_sentinel.start()
+        if runner is not None:
+            run = runner.run()
+            records = run.records
+            report = run.report
+            # The cell starts at the workers' shared start instant (offset 0), not when
+            # this process began waiting for them to be ready.
+            start_ms = monotonic_to_wall_ms(report.base_ts, now_ms)
+            if gate is not None:
+                trunc_state, backlog_state = gate.summary(run.workers)
+                truncator = trunc_state if truncate_on_proxy_shed else None
+                backlog = backlog_state if max_backlog else None
+            if prompt_store is not None:
+                prompt_store_misses = run.prompt_store_misses
+        else:
+            async def _dispatch_then_close():
+                try:
+                    return await dispatch_open_loop(events, truncator or inner)
+                finally:
+                    await sender.aclose()
+
+            report = asyncio.run(_dispatch_then_close())
+            records = sender.records
+            if prompt_store is not None:
+                prompt_store_misses = prompt_store.misses
     finally:
-        sender.close()
+        if runner is not None:
+            runner.close()  # no worker survives an error, whenever it happened
+        if sender is not None:
+            sender.close()
         if sidecar is not None:
             instants = sidecar.stop()
     end_ms = now_ms()
     overflow_delta = overflow_sentinel.delta() if overflow_sentinel is not None else None
 
     scheduled_offsets = [float(event.scheduled_offset_s) for event in events]
-    achieved_offsets = achieved_arrival_offsets(sender.records)
+    achieved_offsets = achieved_arrival_offsets(records)
     if rps_timeline_path is not None:
         rps.write_rps_timeline_csv(
             rps_timeline_path,
@@ -1909,7 +1992,7 @@ def drive_cell_schedule(
     guard = check_cell(
         cell_id,
         scheduled=scheduled,
-        records=sender.records,
+        records=records,
         p99_delay_ms=report.p99_delay_ms,
         truncated=first_stop is not None,
         truncated_at_offset_s=None if first_stop is None else first_stop[1],
@@ -1918,21 +2001,21 @@ def drive_cell_schedule(
         truncation_cause=None if first_stop is None else first_stop[2],
         backlog_limit=int(max_backlog) if max_backlog else None,
         pending_overflow_delta=overflow_delta,
-        prompt_store_misses=(None if prompt_store is None else prompt_store.misses),
+        prompt_store_misses=prompt_store_misses,
         rps_error_ratio=rps_error_ratio,
         **(guard_kwargs or {}),
     )
     if failures_path is not None:
         failures = [
             failure_signature(record)
-            for record in sender.records
+            for record in records
             if classify_failure(record) != FAILURE_NONE
         ]
         if failures:
             _append_jsonl(failures_path, failures)
 
     if raw_path is not None:
-        raw = [_raw_from_sender_record(cell_id, rec) for rec in sender.records]
+        raw = [_raw_from_sender_record(cell_id, rec) for rec in records]
         _append_jsonl(raw_path, raw)
     if instant_path is not None and instants:
         _append_jsonl(instant_path, instants)
@@ -1941,7 +2024,7 @@ def drive_cell_schedule(
         # windows. The raw JSONL cannot serve that: it carries neither the failure class
         # nor the send-side concurrency, by design (it is the metrics schema, not a log
         # of what the driver did).
-        records_out.extend(sender.records)
+        records_out.extend(records)
     if instants_out is not None:
         # The sidecar samples (live-grid tagged), for a caller that labels the cell's
         # windows in-process - the same samples the .instant.jsonl receives.
@@ -2007,9 +2090,12 @@ def _raw_from_sender_record(cell_id: str, record: dict) -> dict:
         # What ttft_ms measures (tre_replayer.engine.stream.TTFT_BASIS).
         "ttft_basis": record.get("ttft_basis"),
         "stream_error": record.get("stream_error"),
+        # on_wire_delay_ms runs to the first byte on the wire, which is
+        # conn_acquire_ms after actual_send_ts_ms (the transport call).
         "scheduled_send_ts_ms": (
             None if on_wire is None
-            else round(float(record["actual_send_ts_ms"]) - float(on_wire), 3)
+            else round(float(record["actual_send_ts_ms"]) - float(on_wire)
+                       + float(record.get("conn_acquire_ms") or 0.0), 3)
         ),
         "on_wire_delay_ms": on_wire,
         "in_flight_at_send": record.get("in_flight_at_send"),

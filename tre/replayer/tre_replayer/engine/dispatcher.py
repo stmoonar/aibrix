@@ -88,14 +88,22 @@ async def dispatch_open_loop(
     *,
     clock: Clock = time.monotonic,
     sleep: Sleep = asyncio.sleep,
+    start_at: float | None = None,
 ) -> DispatchReport:
+    """Fire every event at ``base + scheduled_offset_s`` on ``clock``.
+
+    ``base`` is now, or ``start_at`` (a ``clock`` reading, typically in the near future):
+    the workers of :mod:`tre_replayer.engine.procpool` each run their shard of one
+    schedule on the same ``start_at``, which works because ``time.monotonic`` is the
+    same system-wide clock in every process of a host.
+    """
     ordered = sorted(events, key=lambda event: event.scheduled_offset_s)
+    base_ts = clock() if start_at is None else float(start_at)
     if not ordered:
         return DispatchReport(
-            records=[], planned_duration_s=0.0, actual_duration_s=0.0, base_ts=clock()
+            records=[], planned_duration_s=0.0, actual_duration_s=0.0, base_ts=base_ts
         )
 
-    base_ts = clock()
     records: list[DispatchRecord] = []
     tasks: list[asyncio.Task[None]] = []
     for event in ordered:

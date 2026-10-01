@@ -339,3 +339,80 @@ def test_every_label_column_is_written_by_one_function(spec, window_align, step_
     # the fixed arm is the 500 / 75 ms threshold pair, with the min-n guard of the primary
     assert arms["fixed_comparison"].latency_slo_ms() == slo_labels.slo_targets(
         ttft_slo_ms=TTFT_SLO, tpot_slo_ms=TPOT_SLO)
+
+
+class _PhasedServer:
+    """A local engine stand-in: requests asking for 5 output tokens are slow (TTFT
+    800 ms), the rest answer at once - so a deterministic cell has healthy and violated
+    windows whatever process sent it."""
+
+    def __init__(self) -> None:
+        import threading
+        import time as _time
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        def sse(*objs) -> bytes:
+            return b"".join(b"data: " + json.dumps(o).encode() + b"\n\n" for o in objs) + b"data: [DONE]\n\n"
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_POST(self):  # noqa: N802
+                body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
+                out = int(body.get("max_tokens") or 4)
+                if out == 5:
+                    _time.sleep(0.8)
+                chunks = [{"choices": [{"index": 0, "text": " t", "finish_reason": None}]} for _ in range(out - 1)]
+                chunks.append({"choices": [{"index": 0, "text": " t", "finish_reason": "length"}]})
+                chunks.append({"choices": [], "usage": {"prompt_tokens": 16, "completion_tokens": out}})
+                payload = sse(*chunks)
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *args):
+                pass
+
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.httpd.daemon_threads = True
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+        self.url = f"http://127.0.0.1:{self.httpd.server_address[1]}/v1/completions"
+
+
+def test_one_process_and_several_label_the_same_cell_identically(spec):
+    """The label path the probe and the fit share, on a cell sent from 1 and from 2
+    worker processes against a real (local) HTTP server: window for window the same."""
+    from tre_replayer.engine.schedule import RpsSegment
+
+    server = _PhasedServer()
+    try:
+        segments = [  # fast, a gap, slow, a gap, fast: phase edges are far from any window edge's reach
+            RpsSegment(model=MODEL, start_s=0.0, end_s=1.0, rps=20.0, input_tokens=16, max_output_tokens=4),
+            RpsSegment(model=MODEL, start_s=2.5, end_s=3.5, rps=20.0, input_tokens=16, max_output_tokens=5),
+            RpsSegment(model=MODEL, start_s=5.5, end_s=6.5, rps=20.0, input_tokens=16, max_output_tokens=4),
+        ]
+        args = Namespace(window_ms=1000, step_ms=500, percentile_mode="bucket_upper", min_latency_samples=1,
+                         window_align="none")
+        label = slo_labels.label_def_for_model(MODEL, ttft_p95_ms=200.0, tpot_p95_ms=75.0,
+                                               mode=slo_labels.TTFT_SLO_MODE_FIXED, min_completed_requests=1,
+                                               registry=str(REGISTRY_PATH))
+        labels = {}
+        for processes in (1, 2):
+            records, instants = [], []
+            start_ms, end_ms, _ = openloop.drive_cell_schedule(
+                server.url, MODEL, "i16_o4_c1090", segments, seed=7, prompt_mode="text",
+                instant_sampler=lambda now: {"waiting": 0.0, "running": 1.0}, instant_interval_s=0.5,
+                records_out=records, instants_out=instants, sender_processes=processes,
+            )
+            rows = r3_grid.label_schedule_cell_windows(
+                args, spec, r3_grid.GridCell.from_scenario_id("i16_o4_c1090"), "i16_o4_c1090",
+                records, instants, start_ms=start_ms, end_ms=start_ms + 7_500,
+                truncated_at_ts_ms=None, label=label,
+            )
+            labels[processes] = [r["slo_label"] for r in rows]
+        assert labels[1] == labels[2]
+        assert "violated" in labels[1] and "healthy" in labels[1]
+    finally:
+        server.httpd.shutdown()
