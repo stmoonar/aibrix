@@ -94,7 +94,15 @@ def measure_written_offset_ms(
     max_wait_ms: int = 12_000,
 ) -> Optional[int]:
     """Gateway clock minus controller clock (ms) from the next doc written on ``key``;
-    None when no new doc appears within ``max_wait_ms``."""
+    None when no new doc appears within ``max_wait_ms``.
+
+    The write is bracketed by the last poll that saw the old doc (``before``) and the
+    first that sees the new one (``now``). When that bracket is wider than
+    ``2 * poll_ms`` (the polling thread stalled: GIL, a slow redis call, a suspended
+    process) the midpoint no longer dates the write to ``poll_ms / 2``, so the
+    measurement is discarded: the new doc becomes the reference and the next write is
+    waited for; None if none comes before the deadline (the caller then falls back to
+    the stamp-lag bounds)."""
     last = _newest_written(redis_client, key)
     before = clock_ms()
     deadline = before + int(max_wait_ms)
@@ -103,6 +111,13 @@ def measure_written_offset_ms(
         now = clock_ms()
         current = _newest_written(redis_client, key)
         if current is not None and current != last:
+            if now - before > 2 * int(poll_ms):
+                LOG.info(json.dumps({"event": "gateway_clock_measurement_discarded",
+                                     "bracket_ms": int(now - before), "poll_ms": int(poll_ms)},
+                                    sort_keys=True))
+                last = current
+                before = now
+                continue
             return int(current - (before + now) / 2)
         before = now
     return None
