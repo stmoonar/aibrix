@@ -375,3 +375,28 @@ def test_manifest_pins_the_prompt_corpus_of_the_replays(tmp_path):
     _write_manifest(path, corpus_lang="mix", zh_ratio=1.5)
     with pytest.raises(ValueError, match="zh_ratio"):
         load_manifest(path, registry=REGISTRY)
+
+
+def test_the_arms_send_v1s_request_unless_the_manifest_says_replay(tmp_path):
+    """E1 = v1's request (chat, stream, no ignore_eos, max_tokens from the trace): every
+    arm sends the e1_v1 profile unless the manifest names the old replay request."""
+    import inspect
+
+    from scripts import campaign_queue
+
+    path = tmp_path / "manifest.json"
+    _write_manifest(path)
+    assert load_manifest(path, registry=REGISTRY).client_profile == "e1_v1"
+    _write_manifest(path, client_profile="replay")
+    assert load_manifest(path, registry=REGISTRY).client_profile == "replay"
+    _write_manifest(path, client_profile="calib")
+    with pytest.raises(ValueError, match="client_profile"):
+        load_manifest(path, registry=REGISTRY)
+    # the run command and its command.json carry the profile
+    source = inspect.getsource(campaign_queue.CampaignRunner.run_one)
+    assert '"--client-profile", self.manifest.client_profile' in source
+    assert '"client_profile": self.manifest.client_profile' in source
+    from tre_replayer import run_trace
+
+    with pytest.raises(SystemExit):  # the flag exists and refuses unknown profiles
+        run_trace.main(["--trace", "t.json", "--client-profile", "calib"])

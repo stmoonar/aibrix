@@ -90,6 +90,9 @@ GATEWAYS = {
 }
 #: routing-strategy header every replayed request carries (the v1 client's value).
 ROUTING_STRATEGY = "least-gpu-cache"
+#: Manifest key ``client_profile``: what the E1 / TRE / APA arms send.
+CLIENT_PROFILES = ("e1_v1", "replay")
+DEFAULT_CLIENT_PROFILE = "e1_v1"
 SIGNAL_ARMS = {"zm", "queue_len", "decode_tps", "prefill_tps"}
 ALLOWED_ARMS = {"tre", "apa", *SIGNAL_ARMS}
 ORPHAN_KEY = "tre:v2:controller:alerts:hidden_orphans"
@@ -145,6 +148,10 @@ class Manifest:
     #: zh_ratio; default the 1:1 zh/en mix.
     corpus_lang: str = "mix"
     zh_ratio: float = 0.5
+    #: The client profile every run's requests are sent with (tre_replayer.engine.profiles):
+    #: ``e1_v1`` - v1's request, as smoke-E1's run_arm.sh sends it - unless the manifest
+    #: names ``replay`` (completions + ignore_eos, the pre-2026-10-01 campaign request).
+    client_profile: str = "e1_v1"
 
 
 @dataclass(frozen=True)
@@ -231,6 +238,9 @@ def load_manifest(
     zh_ratio = corpus_record.effective_zh_ratio(corpus_lang, raw.get("zh_ratio"))
     if not 0.0 <= zh_ratio <= 1.0:
         raise ValueError(f"zh_ratio must be within [0, 1], got {zh_ratio}")
+    client_profile = str(raw.get("client_profile", DEFAULT_CLIENT_PROFILE))
+    if client_profile not in CLIENT_PROFILES:
+        raise ValueError(f"client_profile must be one of {CLIENT_PROFILES}, got {client_profile!r}")
     frozen_sha = str(raw["frozen_sha"])
     if len(frozen_sha) != 40:
         raise ValueError("frozen_sha must be a full 40-character SHA")
@@ -245,6 +255,7 @@ def load_manifest(
         runs=runs,
         corpus_lang=corpus_lang,
         zh_ratio=zh_ratio,
+        client_profile=client_profile,
     )
 
 
@@ -868,6 +879,7 @@ class CampaignRunner:
             "--trim-ramp-windows", "1",
             "--corpus-lang", self.manifest.corpus_lang,
             "--zh-ratio", repr(self.manifest.zh_ratio),
+            "--client-profile", self.manifest.client_profile,
         ]
         metadata = {
             "run_id": spec.run_id,
@@ -879,6 +891,8 @@ class CampaignRunner:
             "routing_strategy": ROUTING_STRATEGY,
             "prompt_corpus": {"corpus_lang": self.manifest.corpus_lang,
                               "zh_ratio": self.manifest.zh_ratio},
+            # The request the run sent (run_trace_summary.json has the full client provenance).
+            "client_profile": self.manifest.client_profile,
             "command": command,
             "operator": "root via Codex",
             "controller_pod": controller_pod,

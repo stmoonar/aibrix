@@ -25,11 +25,12 @@ in their **profile**.
 | body | `api.request_body`: `model`, `messages`=[user], `max_tokens`, `temperature: 0`, `ignore_eos: true`, `stream`, `stream_options.include_usage`, `seed` if given | same with `prompt` | v1's `create()` kwargs: `model`, `messages`=[user], `temperature` from the model config (unset → `null`), `stream`, `stream_options.include_usage`, `max_tokens` = trace's, else config's, else absent; **no** `ignore_eos` |
 | headers | `Content-Type`, `Accept: text/event-stream`, `model`, `routing-strategy` if set | same | SDK headers (`Authorization: Bearer dummy-key-for-local-gateway`, `X-Stainless-*`, UA `AsyncOpenAI/Python`), `routing-strategy` (config, `least-gpu-cache`) |
 | prompt | materialised natural prompt, exact templated length | materialised | the trace's text, verbatim |
-| transport | `httpx.AsyncClient`, keep-alive, sharded pools (64 connections, 16 idle kept per shard; shards up to `max_in_flight`), `Accept-Encoding: identity` | same | `openai.DefaultAsyncHttpxClient` (1000 / 100), as v1 |
-| retries | none | none | SDK `max_retries` (default 2; `run_arm.sh` passes 0) |
+| transport | `httpx.AsyncClient`, keep-alive (idle expiry 4 s, `TRE_SENDER_KEEPALIVE_EXPIRY_S`), sharded pools (64 connections, 16 idle kept per shard; shards up to `max_in_flight`), `Accept-Encoding: identity` | same | `openai.DefaultAsyncHttpxClient` (1000 / 100), as v1 |
+| retries | none - except one repeat of an attempt of which not a byte left (a dead kept-alive connection, a refused connect: the server never saw it; `transport_retries`) | same | SDK `max_retries` (default 2; `run_arm.sh` and the campaign pass 0) |
 | timeout | `max(30, max_tokens/4)` s per connect / read / write | same | config `timeout` (300 s) |
 | record | calibration row (unchanged; `dual_metrics=True` adds both bases) | same | v1's `performance_metrics.json` line + audit + strict + lateness |
-| processes | `--sender-processes` (default `DEFAULT_SENDER_PROCESSES` = 4) | 1 (in-process) | config `process_count` (v14 configs: 8) |
+| processes | `--sender-processes` (default `DEFAULT_SENDER_PROCESSES` = 4) | 1 (in-process) | config `process_count` (v14 configs: 8); `run_trace` 8 |
+| used by | `r3_grid` / `calibration_campaign` (openloop cells) | `run_trace --client-profile replay`, a campaign manifest with `"client_profile": "replay"` | `python3 -m tre_loadgen_v1` (run_arm.sh), and the campaign's E1 / TRE / APA arms by default (`campaign_queue` -> `run_trace --client-profile e1_v1`, recorded in `command.json` and `run_trace_summary.json`) |
 
 All three recognise the reissue sidecar: `x-tre-retried` (header), `x-tre-continued`
 (header, `tre_continued` on the final chunk, `: x-tre-continued: N` SSE comment).
@@ -46,8 +47,21 @@ the calibration stop rules live (`StopGate`: admission-overflow truncation, back
 ceiling; same semantics as `openloop.TruncateOnProxyShed` / `StopOnBacklog`).
 
 Every record carries its **send lateness** — `on_wire_delay_ms` (calib / replay) /
-`send_lateness_ms` (e1): the scheduled instant to the transport call — decomposed into
-`schedule_delay_ms`, `pool_wait_ms`, `body_build_ms`.
+`send_lateness_ms` (e1): the scheduled instant to the first byte on the wire —
+decomposed into `schedule_delay_ms`, `pool_wait_ms` (including `conn_acquire_ms`: the
+wait for a pool slot, a TCP connect, a repeated first attempt; measured with httpcore's
+trace hooks, so `max_p99_pool_wait_ms` guards it), `body_build_ms`. Calibration rows also
+say `connection_reused` and `stream_complete`. (The e1_v1 transport is the OpenAI SDK,
+which exposes no such hook: its lateness ends at the `create()` call.)
+
+A worker never outlives the run: it asks the kernel to SIGKILL it when its parent dies
+(Linux `PR_SET_PDEATHSIG`; a `getppid` watch everywhere), stops sending the moment its
+pipe to the parent breaks, and the parent terminates its workers on SIGTERM and on any
+error, before or during the run. A request whose sending raises becomes a failed record
+(`client_error`) instead of ending the run; a run that fails anyway hands back every
+record it received (`RunnerError.records`; the E1 shell writes them, then fails).
+`client.code` in the provenance names the `tre_replayer` directory and git commit that
+sent the run.
 
 ## Two metric bases (column names say which)
 
@@ -59,7 +73,11 @@ Every record carries its **send lateness** — `on_wire_delay_ms` (calib / repla
 | missing TTFT | dropped from percentiles | a violation (`ttft_missing_strict`) |
 | retries | inside TTFT / E2E | excluded: timed from the last attempt; `retries`, `retry_wait_s` reported |
 
-Calibration labels stay on the strict basis (`test_probe_label_parity`).
+Calibration labels stay on the strict basis (`test_probe_label_parity`, also for a cell
+sent from one process and from two). A 2xx body that ends without `[DONE]` and without a
+finish reason (`stream_complete: false`) is a failure on both: `incomplete_stream` on the
+strict basis, `model_error` (unserved) in the calibration classifier - rows written
+before 2026-10-01 carry no such field and are judged as before.
 
 ## Equivalence (2026-09-30, `scripts/verify_unified_client.py`, local fake server)
 
