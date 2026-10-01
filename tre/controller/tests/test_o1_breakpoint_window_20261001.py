@@ -107,9 +107,9 @@ def _series(pattern: list) -> list[tuple[int, ModelWindowMetrics]]:
 
 
 class _Queue:
-    def __init__(self, last_done: dict | None = None):
+    def __init__(self, changes: dict | None = None):
         self.submitted: list = []
-        self._last = dict(last_done or {})
+        self._changes = dict(changes or {})
 
     def inflight_models(self) -> set[str]:
         return set()
@@ -118,8 +118,8 @@ class _Queue:
         self.submitted.extend(actions)
         return object()
 
-    def last_actions(self):
-        return dict(self._last)
+    def routable_changes(self):
+        return dict(self._changes)
 
 
 def _ups(actions) -> list[ScaleAction]:
@@ -284,35 +284,120 @@ def test_routable_change_dated_by_the_done_hint_and_its_grid_excluded():
     state = SignalState(breakpoint=O1)
     assert state.note_routable("m", 1, observed_ms=100_000) is None
     assert state.note_routable("m", 1, observed_ms=110_000) is None
-    # Change seen at 120 s, our scale-up completed at 113.5 s: dated 113.5 s.
-    assert state.note_routable("m", 3, observed_ms=120_000, done_hints=(113_500, 90_000)) == 113_500
+    # Change seen at 120 s, our scale-up returned at 113.5 s: dated 113.5 s + 1 s margin.
+    assert state.note_routable("m", 3, observed_ms=120_000, done_hints=(113_500, 90_000)) == 114_500
     window = replace(_window(140_000, [TRICKLE] * 3, routable=3))
     eff = state.effective_window("m", window)
     assert eff.start_ms == 120_000 and eff.grids == 2 and eff.warm and not eff.full
     # An unexplained change (no hint after the previous observation) -> the observation time.
-    assert state.note_routable("m", 2, observed_ms=130_000, done_hints=(113_500,)) == 130_000
-    # Re-reads of the same view are idempotent.
+    assert state.note_routable("m", 2, observed_ms=130_000, done_hints=(113_500,)) == 131_000
+    # Re-reads of the same view are idempotent; an older view is ignored (review P3).
     assert state.note_routable("m", 2, observed_ms=130_000) is None
-    assert state.breakpoint_ms("m") == 130_000
+    assert state.note_routable("m", 5, observed_ms=125_000) is None
+    assert state.breakpoint_ms("m") == 131_000 == state.settle_breakpoint_ms("m")
 
 
-def test_first_observation_after_restart_takes_the_latest_hint():
+def test_margin_pushes_a_change_near_a_boundary_to_the_next_grid():
     state = SignalState(breakpoint=O1)
-    assert state.note_routable("m", 3, observed_ms=200_000, done_hints=(185_000, None)) == 185_000
+    state.note_routable("m", 1, observed_ms=100_000)
+    assert state.note_routable("m", 2, observed_ms=125_000, done_hints=(119_500,)) == 120_500
+    eff = state.effective_window("m", _window(150_000, [TRICKLE] * 3, routable=2))
+    assert eff.start_ms == 130_000  # the gateway may route to the new pod only after 120 s
+    no_margin = SignalState(breakpoint=replace(O1, margin_ms=0))
+    no_margin.note_routable("m", 1, observed_ms=100_000)
+    no_margin.note_routable("m", 2, observed_ms=125_000, done_hints=(119_500,))
+    assert no_margin.effective_window("m", _window(150_000, [TRICKLE] * 3, routable=2)).start_ms == 120_000
+
+
+def test_first_observation_takes_the_latest_hint_but_never_settles_c1():
+    state = SignalState(breakpoint=O1)
+    assert state.note_routable("m", 3, observed_ms=200_000, done_hints=(185_000, None)) == 186_000
+    assert state.breakpoint_ms("m") == 186_000
+    assert state.settle_breakpoint_ms("m") is None  # review P2-a: a guessed date
     assert SignalState(breakpoint=O1).note_routable("m", 3, observed_ms=200_000) is None
 
 
-def test_breakpoint_observation_uses_view_time_and_queue_hints():
-    class _RescueQueue(_Queue):
+def test_restart_with_an_inflight_target_keeps_the_c1_basis():
+    """Review P2-a: after a restart the restored in-flight target is stamped done=now; a
+    breakpoint dated on the first observation must not settle it (the SM may still be
+    waking); a count change seen afterwards does."""
+    from tre_controller.loops.action_queue import RescueTargetRecord
+
+    class _TargetQueue(_Queue):
         def rescue_targets(self):
+            return {"m": RescueTargetRecord(target=3, desired=3, base=1, covered_before=1, issued_ms=0,
+                                            done_ms=200_000)}
+
+    registry = _registry(10_000.0)
+    state = SignalState(warmup_ms=-1, breakpoint=O1)
+    _prime_onset(state, 100_000)
+    queue = _TargetQueue({"m": 200_000})
+    contexts = {}
+    for end, routable in ((200_000, 1), (210_000, 1), (220_000, 1), (230_000, 1), (240_000, 3), (250_000, 3),
+                          (260_000, 3), (270_000, 3)):
+        ctx, _ = _model_contexts(_snap(_window(end, [BURST] * 3, routable=routable)), registry, signal_state=state,
+                                 cluster_view=_view(routable, fetched_ms=end + 3_000), queue=queue)
+        contexts[end] = ctx["m"]
+        settled = "m" not in _rescue_bases(_snap(_window(end, [BURST] * 3, routable=routable)), queue, registry, ctx)
+        contexts[end]["settled"] = settled
+    # First observation dated a change at 201 s from the hint: windows hold it, C1 does not settle.
+    assert contexts[230_000]["signal_warm"] is True and contexts[230_000]["signal_settle_ms"] < 200_000
+    assert contexts[230_000]["settled"] is False
+    # The wake the SM finished later is a change seen between two views: settles once warm.
+    assert contexts[270_000]["signal_settle_ms"] >= 200_000 and contexts[270_000]["settled"] is True
+
+
+def test_breakpoint_observation_uses_view_time_and_routable_change_stamps_only():
+    class _RescueQueue(_Queue):
+        def rescue_targets(self):  # never a hint (review P1): stamped when planned
             from tre_controller.loops.action_queue import RescueTargetRecord
 
             return {"m": RescueTargetRecord(target=3, desired=3, base=1, covered_before=1, issued_ms=1, done_ms=7_000)}
 
-    observed, hints = breakpoint_observation(_view(2, fetched_ms=9_000), _RescueQueue({"m": (6_000, "up")}), "m", 1)
-    assert observed == 9_000 and set(hints) == {6_000, 7_000}
+        def last_actions(self):
+            return {"m": (6_000, "up")}
+
+    observed, hints = breakpoint_observation(_view(2, fetched_ms=9_000), _RescueQueue({"m": 8_000}), "m", 1)
+    assert observed == 9_000 and hints == (8_000,)
     observed, hints = breakpoint_observation(_view(2, fetched_ms=None), None, "m", 4_000)
     assert observed == 4_000 and hints == ()
+
+
+def test_queue_stamps_routable_changes_when_the_sm_call_returns():
+    """Review P1: a rescue target covered by a probe preemption is recorded done when
+    planned; the unhide that really raises the routable count runs later. The breakpoint
+    hint is the unhide's return time, never the planning time."""
+    import asyncio
+
+    from tre_controller.loops.action_queue import ActionQueue
+    from tre_controller.planning.planner import HideAction, RescuePlan, UnhideAction
+
+    class _Client:
+        async def set_routable(self, model, hidden_pods):
+            return {"ok": True}
+
+        async def scale_model(self, model, delta, **_kwargs):
+            return {"ok": False, "error": "HTTP 409: WakeConflict"}
+
+    now = {"ms": 100_000}
+    queue = ActionQueue(_Client(), now_ms=lambda: now["ms"])
+    queue.record_rescue_covered("m", RescuePlan(target=3, desired=3, base=1, covered=3))  # done 100 s
+    assert queue.routable_changes() == {}
+    now["ms"] = 104_000
+    asyncio.run(queue._timed_dispatch(UnhideAction("m", ("m-1",), "rollback", "safescale"), "m"))
+    assert queue.routable_changes() == {"m": 104_000}
+    now["ms"] = 109_000
+    asyncio.run(queue._timed_dispatch(HideAction("m", ("m-1",), "probe", "safescale"), "m"))
+    assert queue.routable_changes() == {"m": 109_000}
+    now["ms"] = 111_000  # a failed (possibly partial) wake is stamped too
+    asyncio.run(queue._timed_dispatch(ScaleAction("m", 1, "rescue", "rescue"), "m"))
+    assert queue.routable_changes() == {"m": 111_000}
+    # Invariant: the view showing the new count (fetched 112 s, previous 101 s) dates
+    # the change at the last return (+ margin), never at the 100 s planning stamp.
+    state = SignalState(breakpoint=O1)
+    state.note_routable("m", 1, observed_ms=101_000)
+    observed, hints = breakpoint_observation(_view(3, fetched_ms=112_000), queue, "m", 0)
+    assert state.note_routable("m", 3, observed_ms=observed, done_hints=hints) == 112_000
 
 
 def test_scale_up_restarts_the_ema_and_holds_scale_downs_for_a_whole_window():
@@ -328,10 +413,10 @@ def test_scale_up_restarts_the_ema_and_holds_scale_downs_for_a_whole_window():
         view = _view(routable, fetched_ms=end + 3_000)
         grids = [BURST] * 3 if routable == 1 else [TRICKLE] * 3
         ctx, _ = _model_contexts(_snap(_window(end, grids, routable=routable)), registry, signal_state=state,
-                                 cluster_view=view, queue=_Queue({"m": (done, "up")}))
+                                 cluster_view=view, queue=_Queue({"m": done}))
         contexts[end] = ctx["m"]
     # Seen in the view fetched at base+23 s, dated by the done time (after the previous fetch).
-    assert contexts[base + 2 * GRID]["signal_breakpoint_ms"] == done
+    assert contexts[base + 2 * GRID]["signal_breakpoint_ms"] == done + O1.margin_ms
     assert contexts[base + 2 * GRID]["signal_hold_reason"] == "no_complete_grid"
     assert contexts[base + 3 * GRID]["signal_hold_reason"] == "no_complete_grid"  # (20, 30] holds it
     assert contexts[base + 4 * GRID]["signal_hold_reason"] == "evidence_grids"
@@ -421,11 +506,14 @@ def test_c1_target_settles_once_warm_after_its_breakpoint():
 
     registry = _registry(10_000.0)  # k = 2 -> pre-O1 rule needs window_start >= 133.5 s
     snapshot = _snap(_window(140_000, [TRICKLE] * 3, routable=3))  # window_start 110 s
-    held = {"m": {"signal_breakpoint_ms": 100_000, "signal_warm": True, "routable_pods": 3}}
+    held = {"m": {"signal_settle_ms": 100_000, "signal_warm": True, "routable_pods": 3}}
     assert "m" in _rescue_bases(snapshot, _TargetQueue(), registry, held)
-    warm = {"m": {"signal_breakpoint_ms": 113_500, "signal_warm": True, "routable_pods": 3}}
+    warm = {"m": {"signal_settle_ms": 113_500, "signal_warm": True, "routable_pods": 3}}
     assert "m" not in _rescue_bases(snapshot, _TargetQueue(), registry, warm)
-    cold = {"m": {"signal_breakpoint_ms": 113_500, "signal_warm": False, "routable_pods": 3}}
+    # A first-observation breakpoint (signal_settle_ms None) never settles (review P2-a).
+    guessed = {"m": {"signal_settle_ms": None, "signal_breakpoint_ms": 120_000, "signal_warm": True}}
+    assert "m" in _rescue_bases(snapshot, _TargetQueue(), registry, guessed)
+    cold = {"m": {"signal_settle_ms": 113_500, "signal_warm": False, "routable_pods": 3}}
     assert "m" in _rescue_bases(snapshot, _TargetQueue(), registry, cold)
     # Without O1 context keys the pre-O1 rule alone decides.
     assert "m" in _rescue_bases(snapshot, _TargetQueue(), registry, {"m": {"routable_pods": 3}})
@@ -468,6 +556,11 @@ def test_trickle_from_idle_never_scales_and_a_burst_scales_after_two_grids():
     fallback = BreakpointWindowConfig(enabled=False, onset_guard=True, grid_ms=GRID)
     assert _run(SignalState(warmup_ms=-1, breakpoint=fallback), burst, registry) == legacy
     assert _run(SignalState(warmup_ms=-1, breakpoint=fallback), trickle, registry) == []
+    # Review P2-b: turning O1 off alone keeps the onset guard (never both off).
+    off = BreakpointWindowConfig(enabled=False, onset_guard=False, grid_ms=GRID)
+    assert _run(SignalState(warmup_ms=-1, breakpoint=off), burst, registry) == legacy
+    assert _run(SignalState(warmup_ms=-1, breakpoint=off), trickle, registry) == []
+    assert BreakpointWindowConfig.from_registry(_registry(breakpoint_window=False), grid_ms=GRID).enabled is False
 
 
 # ----------------------------------------------------------------- registry
@@ -479,7 +572,10 @@ def test_scaling_registry_o1_keys():
                                 "min_evidence_grids": 3, "min_evidence_requests": 5})
     assert (cfg.breakpoint_window, cfg.onset_warmup_guard, cfg.min_evidence_grids, cfg.min_evidence_requests) == (
         False, True, 3, 5)
+    assert parse_scaling_config({"breakpoint_margin_ms": 0}).breakpoint_margin_ms == 0
+    assert parse_scaling_config(None).breakpoint_margin_ms == 1000
     for bad in ({"min_evidence_grids": 0}, {"min_evidence_grids": 1.5}, {"min_evidence_requests": -1},
+                {"breakpoint_margin_ms": -1},
                 {"breakpoint_window": "yes"}, {"min_evidence_grids": True}):
         with pytest.raises(ValueError):
             parse_scaling_config(bad)
@@ -527,3 +623,21 @@ def test_shipped_registry_enables_o1_with_the_default_evidence():
     assert scaling.min_evidence_grids == 2 and scaling.min_evidence_requests == 0
     assert json.dumps(sorted(ScalingRegistryConfig.__dataclass_fields__))  # serialisable names
     assert math.isfinite(BreakpointWindowConfig().grid_ms)
+
+
+def test_freeze_snapshot_freezes_the_suffix_pods():
+    from types import MappingProxyType
+
+    from tre_common.metrics_schema import PodWindowMetrics
+    from tre_controller.loops.metrics_task import freeze_snapshot
+
+    pod = PodWindowMetrics(pod="a", prompt_tokens=0.0, generation_tokens=1.0, avg_waiting=0.0, avg_running=1.0,
+                           avg_swapping=0.0, kv_cache_hit_rate=0.0, ttft_p95_ms=None, tpot_p95_ms=None,
+                           e2e_p95_ms=None)
+    window = _window(60_000, [TRICKLE] * 3)
+    window = replace(window, per_pod={"a": pod},
+                     suffix_windows=tuple(replace(item, per_pod={"a": pod}) for item in window.suffix_windows))
+    frozen = freeze_snapshot(_snap(window)).models["m"]
+    assert all(isinstance(item.per_pod, MappingProxyType) for item in frozen.suffix_windows)
+    with pytest.raises(TypeError):
+        frozen.suffix_windows[0].per_pod["b"] = pod

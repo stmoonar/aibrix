@@ -485,20 +485,24 @@ class ScalingRegistryConfig:
     #: change), complete gateway grids only, the TSS numerator normalised to a whole
     #: window and the EMA restarted at the breakpoint. Replaces the onset warmup guard.
     breakpoint_window: bool = True
-    #: The ADR-0013 onset warmup guard (TRE_SIGNAL_WARMUP_MS) on top of / instead of O1.
-    #: Fallback: ``breakpoint_window: false`` + ``onset_warmup_guard: true`` = pre-O1.
+    #: The ADR-0013 onset warmup guard (TRE_SIGNAL_WARMUP_MS) on top of O1. With
+    #: ``breakpoint_window: false`` the guard always applies (= pre-O1), whatever this says.
     onset_warmup_guard: bool = False
     #: O1: complete gateway grids after the breakpoint before the model's signal decides
     #: (scale-ups; scale-downs always need a whole clean window). 2 = 20 s on the 10 s grid.
     min_evidence_grids: int = 2
     #: O1: also this many completed requests in the post-breakpoint window (0 = off).
     min_evidence_requests: int = 0
+    #: O1: added to a routable-count change time before rounding up to the gateway grid
+    #: (the gateway applies the SM's routable label through its pod informer).
+    breakpoint_margin_ms: int = 1000
 
 
 SCALING_KEYS = frozenset({
     "rescue_max_step_ratio", "scale_up_cooldown_enabled", "rescue_max_step_pods",
     "donor_surplus_release", "rescue_settle_ema_k",
     "breakpoint_window", "onset_warmup_guard", "min_evidence_grids", "min_evidence_requests",
+    "breakpoint_margin_ms",
 })
 
 
@@ -575,6 +579,7 @@ def parse_scaling_config(raw: dict[str, Any] | None) -> ScalingRegistryConfig:
         min_evidence_requests=_scaling_count(
             raw, "min_evidence_requests", defaults.min_evidence_requests, 0
         ),
+        breakpoint_margin_ms=_scaling_count(raw, "breakpoint_margin_ms", defaults.breakpoint_margin_ms, 0),
     )
 
 

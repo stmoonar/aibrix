@@ -277,6 +277,11 @@ class ActionQueue:
         # Review F4: model -> (epoch ms the last successful dispatch completed, "up"/"down").
         self._now_ms = now_ms or (lambda: int(time.time() * 1000))
         self._last_done: dict[str, tuple[int, str]] = {}
+        #: O1: model -> epoch ms the last SM call that can change its routable count
+        #: (scale / wake / sleep / hide / unhide / receiver target) returned - ok or not.
+        #: A change the SM made during that call happened before this stamp, so it
+        #: never dates a breakpoint early. In memory only (a restart starts empty).
+        self._routable_change: dict[str, int] = {}
         #: C1: model -> its last rescue target (see :meth:`rescue_targets`).
         self._rescue: dict[str, RescueTargetRecord] = {}
         #: C1 review P3: id(queued action) -> the record that part belongs to (a part of
@@ -426,6 +431,11 @@ class ActionQueue:
 
     def last_actions(self) -> dict[str, tuple[int, str]]:
         return dict(self._last_done)
+
+    def routable_changes(self) -> dict[str, int]:
+        """O1: model -> when the last SM call that can change its routable count
+        returned (see ``_routable_change``); the only breakpoint dating hint."""
+        return dict(self._routable_change)
 
     def rescue_targets(self) -> dict[str, RescueTargetRecord]:
         """C1: model -> its last rescue target (copies). The planner tick keeps the
@@ -1474,6 +1484,10 @@ class ActionQueue:
             )
         self._note_floor_violation(result)
         self._note_wake_conflict(action, result)
+        if isinstance(action, (ScaleAction, ReceiverTarget, HideAction, UnhideAction)):
+            # O1: stamped after the SM answered, whatever the outcome (a failed or
+            # partial wake may still have changed the routable set).
+            self._routable_change[getattr(action, "model", model)] = int(self._now_ms())
         if self._prof is not None:
             self._prof.record(
                 {

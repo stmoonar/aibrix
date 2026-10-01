@@ -411,7 +411,8 @@ S4 raw-logging first) -> R7/R2/R4/R5. Phase C (delete the 3 old aibrix-system mo
 - Reversible: `TRE_SIGNAL_WARMUP_MS=0` restores pre-fix behaviour.
 - **Superseded by ADR-0015 (2026-10-01)**: the guard is off by default (registry
   `scaling.onset_warmup_guard: false`); the O1 breakpoint window decides on the post-onset
-  grids instead. `scaling.breakpoint_window: false` + `onset_warmup_guard: true` restores it.
+  grids instead. `scaling.breakpoint_window: false` restores it (the guard always applies
+  without O1).
 
 ## ADR-0014: Remove saturation-segment concept; z_m thresholds are the sole scaling trigger
 
@@ -546,8 +547,9 @@ image for a full revert; point `campaign_queue.py` APA back at 31592 only togeth
   (`max(onset, last routable-count change)`), complete 10 s grids only (the grid holding the
   breakpoint excluded); numerator x `W / span`, Q averaged over those grids, EMA restarted at
   the breakpoint. Scale-ups after `min_evidence_grids` (2) grids; scale-downs only once a
-  whole window follows the breakpoint. A change is dated by the controller's own action done
-  time or the SM view's fetch time - never before the real change. C1 settles a target once
+  whole window follows the breakpoint. A change is dated by the return time of the
+  controller's last SM call that can change the routable set, or the SM view's fetch time,
+  plus a 1 s informer margin - never before the real change. C1 settles a target once
   the model is warm after the target's breakpoint.
 - Steady state (no breakpoint inside the window) is bit-identical to before; the TSS
   definition, theta and the offline calibration are unchanged. The ADR-0014 saturation
@@ -556,4 +558,4 @@ image for a full revert; point `campaign_queue.py` APA back at 31592 only togeth
   after the onset window in all 7 loaded episodes; no false CRITICAL on light onsets (raw
   filling-window dip to Z = 0.20 vs O1 3.78, A-smoke-tre dsqwen-7b).
 - Knobs (registry `scaling:`): `breakpoint_window` (true), `onset_warmup_guard` (false),
-  `min_evidence_grids` (2), `min_evidence_requests` (0).
+  `min_evidence_grids` (2), `min_evidence_requests` (0), `breakpoint_margin_ms` (1000).

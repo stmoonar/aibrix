@@ -359,11 +359,14 @@ def _o1_settled(context: dict | None, done_ms: int) -> bool:
     ``rescue_settle_ema_k`` extension (EMA lag) is not needed. The breakpoint carries
     the target's ``done_ms`` (or a later observation time), never an earlier one, so
     ``breakpoint >= done_ms`` means the change of this target (or a later one) was seen.
+    Only breakpoints this process saw happen count (``signal_settle_ms``: the onset, or a
+    count change between two views - never the first observation after a restart, whose
+    date is a guess, review P2-a).
     A target that changed nothing (every part failed) never moves the breakpoint and
     settles by the window-start rule above."""
-    if not context or "signal_breakpoint_ms" not in context:
+    if not context or "signal_settle_ms" not in context:
         return False
-    point = context.get("signal_breakpoint_ms")
+    point = context.get("signal_settle_ms")
     return point is not None and int(point) >= done_ms and bool(context.get("signal_warm"))
 
 
@@ -720,20 +723,17 @@ def breakpoint_observation(
 ) -> tuple[int, tuple[int | None, ...]]:
     """(observed_ms, done hints) for :meth:`SignalState.note_routable`: the fleet view's
     fetch time (``fallback_ms`` for a view without one - synthetic / test views) and the
-    completion times of the controller's own last actions on ``model`` (scale / hide
-    done, C1 rescue target done), which date a change more precisely than the view."""
+    time the controller's last SM call that can change ``model``'s routable count
+    returned (``ActionQueue.routable_changes``: scale / wake / sleep / hide / unhide,
+    stamped after the answer, ok or not). Never a rescue target's ``done_ms``: a target
+    covered by a probe preemption is stamped when planned, before its unhide ran."""
     observed = getattr(cluster_view, "fetched_ms", None)
     hints: list[int | None] = []
-    last_actions = getattr(queue, "last_actions", None)
-    if callable(last_actions):
-        last = last_actions().get(model)
-        if last is not None:
-            hints.append(int(last[0]))
-    targets = getattr(queue, "rescue_targets", None)
-    if callable(targets):
-        record = targets().get(model)
-        if record is not None and record.done_ms is not None:
-            hints.append(int(record.done_ms))
+    changes = getattr(queue, "routable_changes", None)
+    if callable(changes):
+        stamp = changes().get(model)
+        if stamp is not None:
+            hints.append(int(stamp))
     return (int(observed) if observed is not None else int(fallback_ms)), tuple(hints)
 
 
@@ -906,6 +906,7 @@ def _model_contexts(
                     {
                         "signal_full_window": window.full,
                         "signal_breakpoint_ms": window.breakpoint_ms,
+                        "signal_settle_ms": signal_state.settle_breakpoint_ms(model_name),
                         "signal_window_start_ms": window.start_ms,
                         "signal_evidence_grids": window.grids,
                         "signal_hold_reason": window.reason,

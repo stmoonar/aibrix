@@ -27,12 +27,18 @@ model's routable replica count - the window mixes two regimes:
 * onset: unchanged (`SignalState.observe_traffic`): the `window_end` of the first
   window with tokens after an idle window; an idle window clears it.
 * routable change (`SignalState.note_routable`): the count is the SM fleet view's
-  (awake and not hidden). A change is dated by the latest completion time of the
-  controller's own actions on the model (last scale / hide done, C1 rescue target done)
-  that falls after the previous view showing the old count, else by the fetch time of
-  the view showing the new count (`ClusterView.fetched_ms`, stamped after the response).
-  Both are at or after the real change, never before. A first observation (start /
-  restart) takes the latest done time, if any (the restored C1 scale memory).
+  (awake and not hidden). A change is dated by `ActionQueue.routable_changes()` - the time
+  the controller's last SM call that can change the model's routable set (scale, wake,
+  sleep, hide, unhide, receiver target) *returned*, ok or not - when that falls after the
+  previous view showing the old count; else by the fetch time of the view showing the new
+  count (`ClusterView.fetched_ms`, stamped after the response). Both are at or after the
+  real change. A C1 rescue target's `done_ms` is never used: a target covered by a probe
+  preemption is stamped when planned, before its unhide ran (review P1). Plus
+  `breakpoint_margin_ms` (1 s) before rounding up to the grid: the SM writes the routable
+  label (and route generation) before it answers - checked in `_commit_one_wake` /
+  `write_binding_annotations` - so the margin only covers the gateway's pod-informer
+  propagation. A view older than one already seen is ignored. A first observation (start /
+  restart) takes the latest stamp, if any, but such a guessed date never settles C1.
 
 **Effective window** `(eff_start, window_end]`, `eff_start` = first gateway boundary at
 or after `t_break` (the grid holding the breakpoint is excluded, only complete grids).
@@ -63,8 +69,10 @@ post-hide evidence is warm, then the post-hide window's - both at least as stric
 pre-O1 EMA, which weighed the pre-hide windows.
 
 **C1 settle**: a rescue target counts as reflected once the model is warm and its
-breakpoint is at or after the target's `done_ms` (the change carries that time, or a
-later one): its Z then describes the new replica count with a fresh EMA, so the
+settle breakpoint (`signal_settle_ms`: the onset, or a count change seen between two
+views of this process - not a first-observation date, review P2-a: after a restart the
+restored in-flight target is stamped done=now while the SM may still be waking) is at or
+after the target's `done_ms`: its Z then describes the new replica count with a fresh EMA, so the
 `rescue_settle_ema_k` extension is not needed. A target that changed nothing (all parts
 failed) never moves the breakpoint and settles by the old window-start rule, which stays
 as the fallback. In-flight protection and the base / covered bookkeeping are unchanged.
@@ -88,12 +96,14 @@ Z = 0.20 (< tau_crit 0.56, the ADR-0013 false CRITICAL); O1's first decided Z = 
 
 | key | default | meaning |
 |---|---|---|
-| `breakpoint_window` | true | O1 on |
-| `onset_warmup_guard` | false | also apply the ADR-0013 guard (`TRE_SIGNAL_WARMUP_MS`) |
+| `breakpoint_window` | true | O1 on; false = pre-O1 (the onset guard then always applies) |
+| `onset_warmup_guard` | false | also apply the ADR-0013 guard on top of O1 |
+| `breakpoint_margin_ms` | 1000 | added to a routable change time before grid rounding |
 | `min_evidence_grids` | 2 | complete grids after the breakpoint before a scale-up |
 | `min_evidence_requests` | 0 | completed requests the post-breakpoint window needs |
 
-Pre-O1 behaviour: `breakpoint_window: false`, `onset_warmup_guard: true`. Controller
+Pre-O1 behaviour: `breakpoint_window: false` (review P2-b: turning O1 off never leaves
+both guards off). Controller
 images before O1 ignore the keys (C1 images warn "unknown keys"). The schema `v1` store
 and unaligned (free-running) windows have no suffixes: O1 then waits for a whole clean
 window (reason `no_suffix`).
@@ -123,3 +133,27 @@ inside the window) is bit-identical.
   `min_evidence_requests` is the knob.
 * A view without `fetched_ms` (synthetic / offline) dates a change at the snapshot's
   window end (tests only; the live view always carries it).
+
+## Follow-up (not done): activity onset
+
+The replay shows another ~10 s (C-crit 40.7 -> 30.7 s after the load start; E-14b up to
+20 s) if the onset is the first window with anything in flight rather than the first
+window with a completed request: long prefills keep Q > 0 for 10-30 s before the first
+token total appears. Concretely:
+
+* add `window_is_active(prompt, generation, running, waiting)` = tokens > 0 or
+  running + waiting > 0 in `tre_common.tss` next to `window_is_idle`;
+* `SignalState` keeps a separate O1 onset: recorded at the first *active* window, cleared
+  only by a window that is neither active nor carrying tokens; `breakpoint_ms` uses it;
+* leave `window_is_idle` itself unchanged. Its callers and what they would see:
+  `TssEma.update(idle=...)` (online `TRSComputer`, offline `smooth_series` /
+  calibration recompute - the EMA reset and theta stay as calibrated),
+  `SignalState.observe_traffic` (the ADR-0013 onset, the idle EMA / dwell reset - a
+  Q-only window keeps resetting them, so the first active window's Z stays undefined as
+  today), `sources._thresholded_signal` (alt-signal EMA reset),
+  `tick.compute_model_signal` (`has_traffic`). Only the O1 breakpoint would move.
+* Risks: a request stuck in flight keeps a model "active" (no new onset after it really
+  idles); the first post-onset grids hold queue but few completions, so the numerator
+  over 2 grids is low - needs `min_evidence_requests` or a "first completion inside the
+  effective window" condition, plus a replay of light-load onsets (A-smoke 7b / 14b) to
+  rule out a false CRITICAL.

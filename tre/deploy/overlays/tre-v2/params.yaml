@@ -583,13 +583,17 @@ data:
       # Replaces the ADR-0013 onset warmup guard. Controller images before O1 ignore these
       # keys (C1 images log them as unknown).
       breakpoint_window: true
-      # The ADR-0013 onset warmup guard (TRE_SIGNAL_WARMUP_MS) on top of O1. Pre-O1
-      # behaviour = breakpoint_window: false + onset_warmup_guard: true.
+      # The ADR-0013 onset warmup guard (TRE_SIGNAL_WARMUP_MS) on top of O1. With
+      # breakpoint_window: false the guard always applies (= pre-O1 behaviour).
       onset_warmup_guard: false
       # Complete post-breakpoint grids before a scale-up decision (2 = 20 s).
       min_evidence_grids: 2
       # Completed requests the post-breakpoint window also needs (0 = off).
       min_evidence_requests: 0
+      # Added to a routable-count change time before it is rounded up to the 10 s grid:
+      # the SM writes the routable label before it answers, the gateway applies it via
+      # its pod informer shortly after.
+      breakpoint_margin_ms: 1000
 kind: ConfigMap
 metadata:
   name: tre-v2-registry

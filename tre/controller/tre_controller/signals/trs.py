@@ -22,11 +22,14 @@ class BreakpointWindowConfig:
       window after the model's last breakpoint - its traffic onset or the last change of
       its routable replica count - complete gateway grids only;
     * ``onset_guard`` (``scaling.onset_warmup_guard``): additionally apply the ADR-0013
-      onset warmup guard (``TRE_SIGNAL_WARMUP_MS``). ``enabled=False, onset_guard=True``
-      is the pre-O1 behaviour;
+      onset warmup guard (``TRE_SIGNAL_WARMUP_MS``) on top of O1. With ``enabled=False``
+      the guard always applies (pre-O1 behaviour), whatever this flag says;
     * ``grid_ms``: the gateway write period (``SCRAPE_INTERVAL_MS``, 10 s);
     * ``min_evidence_grids`` / ``min_evidence_requests``: post-breakpoint evidence a
-      window needs before the model's signal decides a scale-up.
+      window needs before the model's signal decides a scale-up;
+    * ``margin_ms`` (``scaling.breakpoint_margin_ms``): added to a routable-count change
+      time before it is rounded up to the grid - the SM writes the routable label before
+      it answers, the gateway applies it through its pod informer shortly after.
     """
 
     enabled: bool = True
@@ -34,6 +37,7 @@ class BreakpointWindowConfig:
     grid_ms: int = 10_000
     min_evidence_grids: int = 2
     min_evidence_requests: int = 0
+    margin_ms: int = 1_000
 
     @classmethod
     def from_registry(cls, registry: Any, *, grid_ms: int) -> "BreakpointWindowConfig":
@@ -48,6 +52,7 @@ class BreakpointWindowConfig:
             min_evidence_requests=max(
                 0, int(getattr(config, "min_evidence_requests", defaults.min_evidence_requests))
             ),
+            margin_ms=max(0, int(getattr(config, "breakpoint_margin_ms", defaults.margin_ms))),
         )
 
 
@@ -389,6 +394,9 @@ class SignalState:
         self._change_ms: dict[str, int] = {}
         # model -> the breakpoint its EMAs were last restarted at.
         self._ema_breakpoint: dict[str, int] = {}
+        # model -> whether its last change was seen between two views of this process
+        # (False: dated on the first observation, e.g. after a restart - a guess).
+        self._change_seen: dict[str, bool] = {}
         # Band dwell (plan §6.9i / D8): CRITICAL / LOW / HIGH only act after holding for
         # dwell_windows consecutive NEW metrics windows (tre_common.dwell). 1 = off.
         self.dwell_windows = max(1, int(dwell_windows))
@@ -487,9 +495,11 @@ class SignalState:
         return self.breakpoint is not None and self.breakpoint.enabled
 
     def onset_guard_applies(self) -> bool:
-        """Whether the ADR-0013 onset warmup guard gates receivers: always pre-O1
-        (``breakpoint`` None), else only with ``scaling.onset_warmup_guard``."""
-        return self.breakpoint is None or self.breakpoint.onset_guard
+        """Whether the ADR-0013 onset warmup guard gates receivers: always without O1
+        (``breakpoint`` None or ``scaling.breakpoint_window: false`` - turning O1 off
+        never leaves the model without onset protection, review P2-b), on top of O1 only
+        with ``scaling.onset_warmup_guard``."""
+        return self.breakpoint is None or not self.breakpoint.enabled or self.breakpoint.onset_guard
 
     def note_routable(
         self,
@@ -512,23 +522,37 @@ class SignalState:
         routable = int(routable)
         observed_ms = int(observed_ms)
         hints = [int(hint) for hint in done_hints if hint is not None and int(hint) <= observed_ms]
+        margin = int(self.breakpoint.margin_ms) if self.breakpoint is not None else 0
         previous = self._routable.get(model)
         if previous is None:
             self._routable[model] = (routable, observed_ms)
             if hints:
-                self._change_ms[model] = max(hints)
+                self._change_ms[model] = max(hints) + margin
+                self._change_seen[model] = False
                 return self._change_ms[model]
             return None
         count, last_ms = previous
+        if observed_ms < last_ms:
+            return None  # an older view than one already seen (review P3): ignored
         if routable == count:
             if observed_ms > last_ms:
                 self._routable[model] = (count, observed_ms)
             return None
         explained = [hint for hint in hints if hint > last_ms]
-        change = max(explained) if explained else observed_ms
-        self._change_ms[model] = max(change, self._change_ms.get(model, change))
+        change = (max(explained) if explained else observed_ms) + margin
+        if change >= self._change_ms.get(model, change):
+            self._change_ms[model] = change
+            self._change_seen[model] = True
         self._routable[model] = (routable, observed_ms)
         return change
+
+    def settle_breakpoint_ms(self, model: str) -> int | None:
+        """The breakpoint C1 may settle a rescue target on: the onset, or a routable
+        change seen between two views of this process - not one dated on the first
+        observation (a restart: the date is a guess and the SM may still be waking)."""
+        change = self._change_ms.get(model) if self._change_seen.get(model) else None
+        points = [point for point in (self._onset_ms.get(model), change) if point is not None]
+        return max(points) if points else None
 
     def breakpoint_ms(self, model: str) -> int | None:
         """``max(traffic onset, last routable-count change)`` of ``model`` (O1)."""
