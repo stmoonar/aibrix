@@ -1,0 +1,4 @@
+# Runtime dependency of deploy/scripts/gpu_truth_agent.py (it falls back to a
+# built-in RESP client without it). Pinned to the version the agent ran with
+# on the previous (borrowed vLLM) image.
+redis==6.4.0
