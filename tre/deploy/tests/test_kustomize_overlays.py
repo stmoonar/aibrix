@@ -84,8 +84,8 @@ def test_tre_v2_overlay_declares_components_and_independent_redis() -> None:
     sm = _load_yaml(overlay / "service-manager.yaml")
     ui = _load_yaml(overlay / "ui.yaml")
 
-    assert _image(controller) == "tre-v2-controller:20261001-8b9d5980"
-    assert _image(sm) == "tre-v2-service-manager:20261001-bba6fc55"
+    assert _image(controller) == "tre-v2-controller:20261001-ba5b558f"
+    assert _image(sm) == "tre-v2-service-manager:20261001-ba5b558f"
     sm_container = sm["spec"]["template"]["spec"]["containers"][0]
     # Review P1-2: single writer across rollouts, and a grace period derived from
     # the registry sleep policy (a sleep past /sleep finishes; drains roll back).
@@ -98,7 +98,7 @@ def test_tre_v2_overlay_declares_components_and_independent_redis() -> None:
         "path": "/healthz",
         "port": "http",
     }
-    assert _image(ui) == "tre-v2-ui:20261001-8b9d5980"
+    assert _image(ui) == "tre-v2-ui:20261001-ba5b558f"
     assert "latest" not in "\n".join([_image(controller), _image(sm), _image(ui)]).lower()
     gateway_plugins = next(
         d
@@ -106,7 +106,7 @@ def test_tre_v2_overlay_declares_components_and_independent_redis() -> None:
         if d and d["kind"] == "Deployment"
     )
     # Rebuilt by deploy/scripts/build_gateway_plugins_nozmq.sh (TRE-PATCH P2-GW-004/005).
-    assert _image(gateway_plugins) == "aibrix/gateway-plugins:20261001-8b9d5980-nozmq2"
+    assert _image(gateway_plugins) == "aibrix/gateway-plugins:20261001-ba5b558f-nozmq2"
 
     assert _env(controller)["TRE_REDIS_URL"] == "redis://tre-v2-redis:6379/0"
     assert _env(controller)["TRE_SERVICE_MANAGER_URL"] == "http://tre-v2-service-manager:8000"

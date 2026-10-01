@@ -18,6 +18,12 @@
 #                                         only if the desired state is corrupted
 #        DRY_RUN=1 ./rollback.sh          replace/delete --dry-run=server, create --dry-run=client,
 #                                         awake moves and Redis writes printed only
+#        DROP_KEYS="k1 k2" DROP_SCAN="p*"  Redis keys of the release being rolled back (the restored
+#                                         images neither read nor update them), dropped once the old
+#                                         SM runs. Default: the keys of the 2026-10-01 placement
+#                                         release (rolling back to f8ccb0ca). A release on top of it
+#                                         passes its own (e.g. DROP_KEYS=tre:v2:controller:scale_memory
+#                                         DROP_SCAN=) so the older SM keeps its wake journal.
 # Env: TRE_NS (tre-v2), MODEL_NS (default), REDIS_DEPLOY (tre-v2-redis). Never touches
 # aibrix-system.
 set -euo pipefail
@@ -30,6 +36,8 @@ SRV=""; CLI=""; PYDRY=""
 if [ "$DRY" = 1 ]; then SRV="--dry-run=server"; CLI="--dry-run=client"; PYDRY="--dry-run"; fi
 NODES="${NODES:-$(python3 -c 'import sys,yaml; print(" ".join(n["name"] for n in yaml.safe_load(open(sys.argv[1]))["cluster"]["nodes"]))' "$B/live-registry.yaml")}"
 REDIS="kubectl -n $TRE_NS exec deploy/$REDIS_DEPLOY -- redis-cli"
+DROP_KEYS="${DROP_KEYS-tre:v2:sm:wake_ops tre:v2:sm:wake_stats tre:v2:sm:restart_seen}"
+DROP_SCAN="${DROP_SCAN-tre:v2:sm:fault:*}"
 W="$(mktemp -d "${TMPDIR:-/tmp}/tre-rollback-$(date +%Y%m%d-%H%M%S)-XXXX")"
 run() { echo "+ $*"; "$@"; }
 say() { if [ "$DRY" = 1 ]; then echo "[dry-run skip] $*"; else run "$@"; fi; }
@@ -64,16 +72,21 @@ if [ "${ONLY_MODELS:-0}" != 1 ]; then
       fi
     fi
     if [ "$D" = tre-v2-service-manager ]; then
-      # The old SM runs now (Recreate: the new one is gone, nothing writes these any more).
+      # The old SM runs now (Recreate: the new one is gone; the controller was restored
+      # before it), so nothing of the release writes these any more.
       # Keys of the release (tre_common.rediskeys SM_WAKE_OPS_KEY, SM_WAKE_STATS_KEY,
       # SM_RESTART_SEEN_KEY, SM_FAULT_KEY_PREFIX): the old SM neither reads nor updates them,
       # so they only go stale; a later re-upgrade would then recover wakes that were settled
       # long ago (wake journal), compare container restart counts against old values
       # (spurious restart placeholders) and honour a leftover fault key as soon as
       # test_hooks is on. Drop them.
-      echo "   drop the release's SM keys"
-      python3 "$B/redis_state.py" delete-keys tre:v2:sm:wake_ops tre:v2:sm:wake_stats tre:v2:sm:restart_seen \
-          --scan 'tre:v2:sm:fault:*' $PYDRY
+      echo "   drop the release's keys: [$DROP_KEYS] scan [$DROP_SCAN]"
+      set -f   # the scan patterns are Redis globs, not shell globs
+      SCANS=(); for pat in $DROP_SCAN; do SCANS+=(--scan "$pat"); done
+      if [ -n "$DROP_KEYS$DROP_SCAN" ]; then
+        python3 "$B/redis_state.py" delete-keys $DROP_KEYS ${SCANS[@]+"${SCANS[@]}"} $PYDRY
+      fi
+      set +f
     fi
   done
 
