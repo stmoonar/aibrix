@@ -217,7 +217,7 @@ def run_planner_tick(
         probe_backoff_models=_probe_backoff_models(safescale, snapshot.ts_ms),
         preemptible_models=_preemptible_models(queue) if rescue_due else None,
         # C1: earlier rescue targets the decision windows do not reflect yet.
-        rescue_bases=_rescue_bases(snapshot, queue, registry) if rescue_due else None,
+        rescue_bases=_rescue_bases(snapshot, queue, registry, contexts) if rescue_due else None,
     )
     if _prof_on:
         _plan_ns = time.perf_counter_ns() - _phase_t0
@@ -317,7 +317,10 @@ def rescue_settle_ms(registry: Registry | None, model: str) -> float:
 
 
 def _rescue_bases(
-    snapshot: MetricsSnapshot, queue: PlannerQueue, registry: Registry | None = None
+    snapshot: MetricsSnapshot,
+    queue: PlannerQueue,
+    registry: Registry | None = None,
+    contexts: dict[str, dict] | None = None,
 ) -> dict[str, RescueBasis]:
     """C1: per model, the last rescue target the queue issued whose effect the model's
     decision signal does not fully reflect yet: still running, or the window starts
@@ -325,6 +328,14 @@ def _rescue_bases(
     targets = getattr(queue, "rescue_targets", None)
     if not callable(targets):
         return {}
+    check = getattr(queue, "check_restored_targets", None)
+    if callable(check) and contexts:
+        # P3-1: restored targets the live routable count contradicts are dropped.
+        check({
+            model: int(ctx["routable_pods"])
+            for model, ctx in contexts.items()
+            if ctx.get("routable_pods") is not None
+        })
     bases: dict[str, RescueBasis] = {}
     for model, record in targets().items():
         metrics = snapshot.models.get(model)

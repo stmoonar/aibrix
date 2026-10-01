@@ -644,3 +644,101 @@ def test_tp_slot_loop_without_occupancy_counts_one_slot():
 
     source = inspect.getsource(planner.build_plan)
     assert "slot_limit = raw_need if occupancy is not None else 1" in source
+
+
+# ===================================================== review round 2 (2026-10-01)
+def _snapshot_routable(window_start_ms: int, routable: int) -> MetricsSnapshot:
+    snap = _snapshot(window_start_ms)
+    metrics = _replace(snap.models["critical"], routable_pods=routable, assigned_replicas=routable)
+    return MetricsSnapshot(ts_ms=snap.ts_ms, stale=False, models={"critical": metrics})
+
+
+def _store_with_target(issued_ms: int = 65_000) -> _MemoryStore:
+    store = _MemoryStore()
+    queue = ActionQueue(_Client(), now_ms=_Clock(issued_ms), scale_memory=store)
+    run_rescue_tick(_snapshot(5_000), queue=queue, registry=_registry())  # 2 -> 4
+    asyncio.run(queue.drain_once())
+    return store
+
+
+def test_restored_target_older_than_the_max_age_is_dropped_at_load():
+    store = _store_with_target(issued_ms=65_000)
+    late = ActionQueue(_Client(), now_ms=_Clock(65_000 + 50_001), scale_memory=store)
+    assert "critical" not in late.rescue_targets()
+    assert late.last_actions() == {"critical": (65_000, "up")}  # the F4 memory is kept
+    fresh = ActionQueue(_Client(), now_ms=_Clock(65_000 + 50_000), scale_memory=store)
+    assert "critical" in fresh.rescue_targets()
+    keep_all = ActionQueue(_Client(), now_ms=_Clock(10**9), scale_memory=store, scale_memory_max_age_ms=0)
+    assert "critical" in keep_all.rescue_targets()
+
+
+def test_restored_target_contradicted_by_the_routable_count_is_dropped():
+    store = _store_with_target()
+    restarted = ActionQueue(_Client(), now_ms=_Clock(70_000), scale_memory=store)
+    assert "critical" in restarted.rescue_targets()
+    # One of the 2 replicas the target counted before its scale-up is gone: no hold.
+    result = run_rescue_tick(_snapshot_routable(20_000, 1), queue=restarted, registry=_registry())
+    assert "critical" not in restarted.rescue_targets() or restarted.rescue_targets()["critical"].issued_ms == 70_000
+    assert result.submitted == 1
+    assert not any(e.startswith("rescue_target_hold") for e in result.events)
+    assert store.data["critical"]["rescue"] is None or store.data["critical"]["rescue"]["issued_ms"] == 70_000
+
+
+def test_restored_target_consistent_with_the_fleet_is_checked_once_and_kept():
+    store = _store_with_target()
+    restarted = ActionQueue(_Client(), now_ms=_Clock(70_000), scale_memory=store)
+    assert restarted.check_restored_targets({"critical": 4}) == []
+    assert "critical" in restarted.rescue_targets()
+    # Checked once: a later dip is ordinary live behaviour, not a stale restore.
+    assert restarted.check_restored_targets({"critical": 1}) == []
+    assert "critical" in restarted.rescue_targets()
+
+
+def test_scale_memory_write_failure_is_logged_and_never_blocks_dispatch(caplog):
+    class _Timeout:
+        def load_scale_memory(self):
+            return {}
+
+        def save_scale_memory(self, model, record):
+            raise TimeoutError("Timeout reading from socket")
+
+    client = _Client()
+    queue = ActionQueue(client, now_ms=_Clock(65_000), scale_memory=_Timeout())
+    with caplog.at_level(logging.WARNING):
+        result = run_rescue_tick(_snapshot(5_000), queue=queue, registry=_registry())
+        asyncio.run(queue.drain_once())
+    assert result.submitted == 1 and client.calls == [("critical", 2)]
+    assert "scale memory of critical not saved" in caplog.text
+
+
+def test_controller_redis_clients_get_socket_timeouts():
+    from tre_controller.app import redis_timeouts
+    from tre_controller.config import ControllerConfig
+
+    assert redis_timeouts(2.0) == {"socket_timeout": 2.0, "socket_connect_timeout": 2.0}
+    assert redis_timeouts(0) == {}
+    cfg = ControllerConfig.from_env({})
+    assert cfg.redis_socket_timeout_s == 2.0 and cfg.scale_memory_max_age_s == 50.0
+    custom = ControllerConfig.from_env(
+        {"TRE_REDIS_SOCKET_TIMEOUT_SECONDS": "0.5", "TRE_SCALE_MEMORY_MAX_AGE_SECONDS": "90"}
+    )
+    assert custom.redis_socket_timeout_s == 0.5 and custom.scale_memory_max_age_s == 90.0
+
+
+def test_create_redis_client_passes_the_timeouts(monkeypatch):
+    import sys
+    import types
+
+    from tre_controller import app
+
+    seen = {}
+
+    class _Redis:
+        @staticmethod
+        def from_url(url, **kwargs):
+            seen.update(kwargs, url=url)
+            return object()
+
+    monkeypatch.setitem(sys.modules, "redis", types.SimpleNamespace(Redis=_Redis))
+    app._create_redis_client("redis://r:6379/0", None, timeout_s=2.0)
+    assert seen == {"url": "redis://r:6379/0", "socket_timeout": 2.0, "socket_connect_timeout": 2.0}

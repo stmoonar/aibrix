@@ -224,6 +224,7 @@ class ActionQueue:
         on_hide_done: Callable[[str, tuple[str, ...]], None] | None = None,
         wake_cooldown_s: tuple[float, float] | None = (30.0, 60.0),
         scale_memory: object | None = None,
+        scale_memory_max_age_ms: float | None = 50_000.0,
     ) -> None:
         self._client = client
         #: S3: (gpu_s, node_s) a GPU / node the SM refused a wake on is kept out of
@@ -286,6 +287,10 @@ class ActionQueue:
         #: so a restarted controller neither repeats an unreflected scale-up nor drops
         #: a cooldown. None = in memory only.
         self._scale_memory = scale_memory
+        #: P3-1: a persisted target issued longer ago than this is not restored.
+        self._scale_memory_max_age_ms = scale_memory_max_age_ms
+        #: P3-1: restored targets not yet checked against the live routable count.
+        self._restored_unchecked: set[str] = set()
         self._load_scale_memory()
         self._retry = retry or RetryPolicy()
         self._revalidate = revalidate
@@ -439,6 +444,7 @@ class ActionQueue:
                 covered_before=int(plan.covered), issued_ms=int(self._now_ms()),
             )
             self._rescue[part.model] = record
+            self._restored_unchecked.discard(part.model)
         return record
 
     def _register_rescue(self, action, started: set[str]) -> None:
@@ -1213,6 +1219,12 @@ class ActionQueue:
                 if last:
                     self._last_done[str(model)] = (int(last[0]), str(last[1]))
                 rescue = entry.get("rescue")
+                max_age = self._scale_memory_max_age_ms
+                if rescue and max_age is not None and max_age > 0 and now - int(rescue["issued_ms"]) > max_age:
+                    LOG.info(json.dumps({"event": "scale_memory_rescue_expired", "model": str(model),
+                                         "issued_ms": int(rescue["issued_ms"]), "now_ms": now},
+                                        sort_keys=True))
+                    rescue = None
                 if rescue:
                     done = rescue.get("done_ms")
                     self._rescue[str(model)] = RescueTargetRecord(
@@ -1222,11 +1234,32 @@ class ActionQueue:
                         failures=int(rescue.get("failures", 0)),
                         done_ms=now if done is None or int(rescue.get("outstanding", 0)) > 0 else int(done),
                     )
+                    self._restored_unchecked.add(str(model))
             except (KeyError, TypeError, ValueError, IndexError) as exc:
                 LOG.warning("scale memory of %s ignored: %r", model, exc)
         if self._rescue or self._last_done:
             LOG.info(json.dumps({"event": "scale_memory_restored", "rescue": sorted(self._rescue),
                                  "last_done": sorted(self._last_done)}, sort_keys=True))
+
+    def check_restored_targets(self, routable: Mapping[str, int]) -> list[str]:
+        """C1 review P3-1: once, at the first tick after a restart, drop every restored
+        rescue target the fleet contradicts - fewer routable replicas now than the
+        target had counted before its scale-up (a pod went away meanwhile): holding
+        on it would starve the model for a window. Returns the dropped models."""
+        dropped: list[str] = []
+        for model in sorted(self._restored_unchecked):
+            if model not in routable:
+                continue
+            self._restored_unchecked.discard(model)
+            record = self._rescue.get(model)
+            if record is not None and int(routable[model]) < record.covered_before:
+                del self._rescue[model]
+                dropped.append(model)
+                LOG.info(json.dumps({"event": "scale_memory_rescue_dropped", "model": model,
+                                     "routable": int(routable[model]),
+                                     "covered_before": record.covered_before}, sort_keys=True))
+                self._persist_scale_memory(model)
+        return dropped
 
     def _persist_scale_memory(self, model: str) -> None:
         saver = getattr(self._scale_memory, "save_scale_memory", None)

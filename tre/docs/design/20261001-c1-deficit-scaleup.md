@@ -94,9 +94,15 @@ model on the legacy fixed-alpha EMA has no extension).
 * Restart: the queue persists `_last_done` and the rescue records per model
   (Redis hash `tre:v2:controller:scale_memory`, controller state store) and
   reloads them at start; a target still running at the restart is taken as done
-  at load time. Best effort: a Redis error only loses the memory (the previous
-  behaviour). The SM fleet view carries no wake timestamps, so it could not
-  serve as the source.
+  at load time. A restored target issued more than
+  `TRE_SCALE_MEMORY_MAX_AGE_SECONDS` (50 s, ~ W + settle) before the start is
+  dropped, and so is one the first tick finds contradicted by the fleet (fewer
+  routable replicas than it had counted before its scale-up), so a restart
+  never holds a model on stale memory. Best effort: a Redis error only loses
+  the memory (the previous behaviour) and is logged; the controller's Redis
+  clients have a socket / connect timeout (`TRE_REDIS_SOCKET_TIMEOUT_SECONDS`,
+  2 s), so a stalled Redis cannot block dispatch. The SM fleet view carries no
+  wake timestamps, so it could not serve as the source.
 
 Decision log: `rescue_target:<m>:n=..:z=..:desired=..:covered=..:planned=..`
 and the `rescue` object on each scale-up action of the decision snapshot.

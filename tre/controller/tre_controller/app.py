@@ -234,11 +234,16 @@ def create_controller_dependencies(
 ) -> ControllerDependencies:
     registry = load_registry(cfg.registry_path)
     injected_redis_client = redis_client is not None
-    redis_client = redis_client if redis_client is not None else _create_redis_client(cfg.redis_url, redis_client_factory)
+    redis_timeout_s = float(getattr(cfg, "redis_socket_timeout_s", 0.0) or 0.0)
+    redis_client = (
+        redis_client
+        if redis_client is not None
+        else _create_redis_client(cfg.redis_url, redis_client_factory, timeout_s=redis_timeout_s)
+    )
     metrics_redis_client = (
         redis_client
         if injected_redis_client or cfg.metrics_redis_url == cfg.redis_url
-        else _create_redis_client(cfg.metrics_redis_url, redis_client_factory)
+        else _create_redis_client(cfg.metrics_redis_url, redis_client_factory, timeout_s=redis_timeout_s)
     )
     store = MetricsStore(
         metrics_redis_client,
@@ -321,6 +326,7 @@ def create_controller_dependencies(
             sm_client,
             # C1 review P2-2: last scale action / rescue target survive a restart.
             scale_memory=ControllerStateStore(redis_client),
+            scale_memory_max_age_ms=float(getattr(cfg, "scale_memory_max_age_s", 50.0)) * 1000.0,
             is_observe=observe_gate.is_observe,
             # Uncached re-check right before every capacity-changing SM call.
             is_observe_fresh=observe_gate.is_observe_fresh,
@@ -432,14 +438,25 @@ def verify_gateway_cadence(deps: ControllerDependencies, cfg: ControllerConfig) 
     )
 
 
-def _create_redis_client(redis_url: str, redis_client_factory: RedisClientFactory | None) -> Any:
+def _create_redis_client(
+    redis_url: str, redis_client_factory: RedisClientFactory | None, *, timeout_s: float = 0.0
+) -> Any:
     if redis_client_factory is not None:
         return redis_client_factory(redis_url)
     try:
         import redis  # type: ignore[import-not-found]
     except ModuleNotFoundError as exc:
         raise RuntimeError("redis package is required unless redis_client_factory is provided") from exc
-    return redis.Redis.from_url(redis_url)
+    return redis.Redis.from_url(redis_url, **redis_timeouts(timeout_s))
+
+
+def redis_timeouts(timeout_s: float) -> dict:
+    """C1 review P3-2: socket / connect timeout of a controller Redis client, so a
+    stalled Redis never blocks a loop (or a scale-memory write) indefinitely; a
+    timeout surfaces as an error the callers already handle. 0 = none."""
+    if not timeout_s or float(timeout_s) <= 0:
+        return {}
+    return {"socket_timeout": float(timeout_s), "socket_connect_timeout": float(timeout_s)}
 
 
 async def run_controller(deps: ControllerDependencies, cfg: MetricsTaskConfig) -> None:

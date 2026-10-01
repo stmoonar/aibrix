@@ -192,6 +192,12 @@ class ControllerConfig:
     # ActionQueue clock; 6 x 5 s = 30 s by default; 0 = off). Without it the fast loop
     # re-plans the same urgent donor every tick against a stale view (livelock).
     floor_violation_cooldown_ticks: int = 6
+    # C1 review P3-1: a persisted rescue target older than this at controller start is
+    # dropped (TRE_SCALE_MEMORY_MAX_AGE_SECONDS; ~ W + settle; 0 = keep any age).
+    scale_memory_max_age_s: float = 50.0
+    # C1 review P3-2: socket / connect timeout (s) of the controller's Redis clients
+    # (TRE_REDIS_SOCKET_TIMEOUT_SECONDS; 0 = none, the redis-py default).
+    redis_socket_timeout_s: float = 2.0
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "ControllerConfig":
@@ -395,6 +401,8 @@ class ControllerConfig:
             oneshot_retry_base_s=_get_positive_float(values, "TRE_ONESHOT_RETRY_BASE_SECONDS", 2.0),
             oneshot_retry_max_s=_get_positive_float(values, "TRE_ONESHOT_RETRY_MAX_SECONDS", 30.0),
             floor_violation_cooldown_ticks=_get_nonneg_int(values, "TRE_FLOOR_VIOLATION_COOLDOWN_TICKS", 6),
+            scale_memory_max_age_s=_get_nonneg_float(values, "TRE_SCALE_MEMORY_MAX_AGE_SECONDS", 50.0),
+            redis_socket_timeout_s=_get_nonneg_float(values, "TRE_REDIS_SOCKET_TIMEOUT_SECONDS", 2.0),
         )
 
 
