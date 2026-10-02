@@ -115,11 +115,14 @@ class ClusterView:
     #: None = a synthetic view (tests / offline), see ``tick.breakpoint_observation``.
     fetched_ms: int | None = field(default=None, compare=False)
     #: Timer cleanup review P2-2: epoch ms at or AFTER which the SM state of this view was
-    #: produced (a lower bound): the SM's own ``/v2/state`` ``fetched_ms`` clamped into
-    #: [request sent, response received], else the time the request was sent. An action
-    #: that completed at or before it is shown by the view (O1 view-pending gate).
-    #: None = unknown (synthetic views): ``fetched_ms`` is used.
+    #: produced (a lower bound): the time the controller sent the request (controller
+    #: clock - timestamps are never compared across machines). An action that completed
+    #: at or before it is shown by the view (O1 view-pending gate). None = unknown
+    #: (synthetic views): ``fetched_ms`` is used.
     state_ms: int | None = field(default=None, compare=False)
+    #: The SM's own ``/v2/state`` ``fetched_ms`` (SM clock): reference only, never
+    #: compared with controller times.
+    sm_fetched_ms: int | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True)

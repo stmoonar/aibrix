@@ -270,9 +270,10 @@ dwell"), `controller/tests/test_c1_deficit_scaleup_20261001.py`
 * **View time is a lower bound (P2-2).** `ClusterView.fetched_ms` (response
   received) is an upper bound of the state's time, right for dating O1
   breakpoints but not for "the view shows this action". The view now also carries
-  `state_ms`: the SM's own `/v2/state` `fetched_ms` when it reports one, clamped
-  into [request sent, response received] (a skewed SM clock cannot move it out of
-  that interval), else the request time. The view-pending gate compares the
+  `state_ms`: the time the controller sent the request. Timestamps are never
+  compared across machines: the SM's own `/v2/state` `fetched_ms` (SM clock; one
+  cluster node runs about 160 s ahead of another) is kept on the view as
+  `sm_fetched_ms` for reference only and decides nothing. The view-pending gate compares the
   action's completion with `state_ms`; O1 dating keeps `fetched_ms`.
 * **No fresh view (P3-6): alert only, holds kept on purpose.** A view that stops
   refreshing happens only on failures (SM restart / crash, Redis down, network,
@@ -280,8 +281,8 @@ dwell"), `controller/tests/test_c1_deficit_scaleup_20261001.py`
   conservative by design: the view-pending gate keeps holding LOW scale-ups and
   scale-downs of a model with a pending change (CRITICAL receivers pass); it does
   not fall back to F4, which would resume normal control without data. The cluster
-  view task logs `cluster_view_stale` (age from the view's state time - the SM
-  `fetched_ms`, else the request time - and the last refresh error) once when the
+  view task logs `cluster_view_stale` (age from the view's state time - the controller's
+  request time, never the SM clock - and the last refresh error) once when the
   age exceeds `TRE_VIEW_STALE_PERIODS` (default 3) refresh periods, and
   `cluster_view_recovered` once a fresh view arrives. No control change.
 * **Early commit evidence (P2-3).** Condition (d) of item 3 is now: the newest

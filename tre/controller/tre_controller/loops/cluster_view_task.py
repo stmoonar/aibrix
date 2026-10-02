@@ -142,18 +142,21 @@ def _observed_pod_ips(state: dict) -> dict[str, str]:
 
 
 def state_time_lower_bound(state: dict, requested_ms: int, fetched_ms: int) -> int:
-    """When the SM state was produced, as a lower bound on the controller clock: the SM's
-    own ``fetched_ms`` (``/v2/state``, when it reports one) clamped into
-    [requested_ms, fetched_ms] - a skewed SM clock can never move it outside the request
-    interval - else ``requested_ms``."""
+    """When the SM state was produced, as a lower bound on the controller clock: the time
+    the request was sent. Timestamps are never compared across machines: the SM's own
+    ``fetched_ms`` is on the SM clock (which may run ahead or behind; a fast SM clock
+    clamped into the request interval would become an upper bound), so it is kept on
+    the view for reference only (:func:`sm_state_ms`) and decides nothing."""
+    return int(requested_ms)
+
+
+def sm_state_ms(state: dict) -> int | None:
+    """The SM's own ``/v2/state`` ``fetched_ms`` (SM clock): logs / snapshots only."""
     raw = state.get("fetched_ms") if isinstance(state, dict) else None
     try:
-        value = int(float(raw)) if raw is not None and not isinstance(raw, bool) else None
+        return int(float(raw)) if raw is not None and not isinstance(raw, bool) else None
     except (TypeError, ValueError, OverflowError):
-        value = None
-    if value is None:
-        return int(requested_ms)
-    return max(int(requested_ms), min(int(fetched_ms), value))
+        return None
 
 
 async def refresh_cluster_view_once(
@@ -172,6 +175,7 @@ async def refresh_cluster_view_once(
             cluster_view_from_state(state, topology),
             fetched_ms=fetched_ms,
             state_ms=state_time_lower_bound(state, requested_ms, fetched_ms),
+            sm_fetched_ms=sm_state_ms(state),
         )
     except Exception as exc:  # noqa: BLE001 - cached view is a conservative fallback.
         return ClusterViewRefreshResult(
@@ -186,8 +190,8 @@ async def refresh_cluster_view_once(
 class StaleViewAlert:
     """Review P3-6: alert (no control change) while the fleet view cannot be refreshed.
 
-    The view's age is measured from its state time (``state_ms``: the SM's own
-    ``fetched_ms`` clamped into the request interval, else the request time; else
+    The view's age is measured from its state time (``state_ms``: the controller's
+    request time, never the SM clock; else
     ``fetched_ms``). Past ``stale_ms`` the event ``cluster_view_stale`` (age, last
     refresh error) is logged once per stale period; the first fresh view afterwards
     logs ``cluster_view_recovered``. The planner keeps its holds while stale on purpose:
