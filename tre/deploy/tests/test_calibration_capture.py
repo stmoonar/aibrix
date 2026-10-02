@@ -66,6 +66,12 @@ def test_parse_vllm_metrics_keeps_counters_gauges_and_cumulative_buckets() -> No
     assert 'vllm:iteration_tokens_total{engine="0"}' not in st["h"]  # not in the default list
 
 
+def test_parse_vllm_metrics_keeps_cache_config_info_with_all_labels() -> None:
+    info = 'vllm:cache_config_info{block_size="16",engine="0",model_name="m7",num_gpu_blocks="12345"} 1.0'
+    st = cc.parse_vllm_metrics(_body(extra=info))
+    assert st["g"]['vllm:cache_config_info{block_size="16",engine="0",num_gpu_blocks="12345"}'] == 1
+
+
 def test_parse_vllm_metrics_histogram_list_is_configurable_and_nan_is_a_string() -> None:
     st = cc.parse_vllm_metrics(
         _body(extra='vllm:kv_cache_usage_perc{engine="1",model_name="m7"} NaN'),

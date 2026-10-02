@@ -144,7 +144,8 @@ files for either layout (old runs: the new entries are empty).
 
 * **`vllm_metrics_1hz/*.jsonl`** (`tre.vllm_metrics_1hz/v1`): a header line, then one row
   per sample. Kept: every `vllm:*_total` counter, the per-pod gauges (running, waiting, KV
-  usage, swapped, sleep state) and the cumulative buckets + `_sum` + `_count` of the
+  usage, swapped, sleep state, `cache_config_info` with all its labels such as
+  `num_gpu_blocks` / `block_size`) and the cumulative buckets + `_sum` + `_count` of the
   histograms TTFT, inter-token latency (0.10 name `time_per_output_token_seconds` too),
   e2e latency, request prompt tokens, request generation tokens (`r3_grid
   --vllm-histogram` to change). Series keys are Prometheus-style without `model_name`

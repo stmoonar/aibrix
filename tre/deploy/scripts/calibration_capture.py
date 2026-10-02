@@ -114,6 +114,8 @@ DEFAULT_VLLM_GAUGES: tuple[str, ...] = (
     *vllm_candidates("kv_cache_usage_perc"),
     "vllm:num_requests_swapped",
     "vllm:engine_sleep_state",
+    # info gauge, value always 1: the content is in its labels (num_gpu_blocks, block_size, ...)
+    "vllm:cache_config_info",
 )
 #: Counters: every ``vllm:*_total`` family (prompt / generation tokens, preemptions,
 #: request_success by finish reason, prefix-cache queries / hits, ...).
