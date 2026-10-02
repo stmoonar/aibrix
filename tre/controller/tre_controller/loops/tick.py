@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import json
-import logging
 import time
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Callable, Protocol, Union
@@ -39,8 +37,6 @@ from tre_controller.planning.safescale import (
 from tre_controller.signals.sources import get_signal, per_replica_token_rate
 from tre_controller.signals.trs import SignalState, TRSComputer, TRSInput
 from tre_sm.allocator.slots import natural_key, release_order
-
-LOG = logging.getLogger("tre_controller.tick")
 
 
 class PlannerQueue(Protocol):
@@ -465,26 +461,20 @@ def _apply_safescale(
     """``covered_targets`` (out): model -> its C1 rescue plan when the pods a probe
     preemption gives back cover every planned scale-up part (none is submitted)."""
     if safescale is None:
-        # No SafeScale: a shrink that needs a probe must NOT be dispatched as is. It
-        # has no sleep_path, so the queue would send it down the SM default
-        # `scale_down` path (SM-side drain, up to 150 s), bypassing the rule that the
-        # controller's SafeScale alone owns draining. Drop it; keep scale-ups and the
-        # explicit-`urgent` immediate donors.
+        # No SafeScale: a shrink that needs a probe has no sleep_path and must not be
+        # dispatched (the controller's SafeScale alone owns draining; the queue would
+        # now refuse it anyway). Drop it with a ``safescale_probe_skipped`` event, like
+        # the observe / probe-block skips; keep scale-ups and `urgent` donors.
         kept: list[Action] = []
+        none_events: list[str] = []
         for action in actions:
             if _requires_safescale_probe(action):
-                LOG.warning(
-                    json.dumps(
-                        {"event": "safescale_unavailable_shrink_dropped",
-                         "model": _safescale_probe_model(action),
-                         "reason": str(action.reason),
-                         "action": type(action).__name__},
-                        sort_keys=True,
-                    )
+                none_events.append(
+                    f"safescale_probe_skipped:{_safescale_probe_model(action)}:safescale_unavailable"
                 )
                 continue
             kept.append(action)
-        return tuple(kept), ()
+        return tuple(kept), tuple(none_events)
 
     converted: list[Action] = []
     events: list[str] = []

@@ -322,6 +322,7 @@ class ActionQueue:
             "commit_receiver_dropped_total": 0,
             "oneshot_preempted_total": 0,
             "dispatch_exceptions_total": 0,
+            "sleep_path_refused_total": 0,
             "commit_abandoned_after_gate_total": 0,
             "commit_upscale_preempted_total": 0,
             "commit_failed_unhide_total": 0,
@@ -1469,11 +1470,29 @@ class ActionQueue:
         """One SM call. An exception (a client bug, a malformed answer) becomes a
         failed, non-retriable result instead of killing the dispatch task."""
         started_ns = time.perf_counter_ns()
+        refused = False
         try:
             with sm_actor(_actor_for(action)):
                 result = await self._dispatch(action, model)
         except asyncio.CancelledError:
             raise
+        except SleepPathRefused as exc:
+            # Nothing reached the SM: own counter, one error line, no traceback, and
+            # no routable-change stamp below (O1 must not see a change that never was).
+            refused = True
+            self._stats["sleep_path_refused_total"] += 1
+            LOG.error(
+                json.dumps(
+                    {"event": "scale_down_without_sleep_path_refused", "model": model,
+                     "reason": str(getattr(action, "reason", "")),
+                     "delta": getattr(action, "delta", None)},
+                    sort_keys=True,
+                )
+            )
+            result = DispatchResult(
+                model=model, action_kind=_action_kind(action), ok=False,
+                error=f"sleep_path_refused: {exc}", retriable=False,
+            )
         except Exception as exc:  # noqa: BLE001 - review 3 P3
             self._stats["dispatch_exceptions_total"] += 1
             LOG.exception("SM call for %s (%s) raised", model, _action_kind(action))
@@ -1485,7 +1504,7 @@ class ActionQueue:
             )
         self._note_floor_violation(result)
         self._note_wake_conflict(action, result)
-        if isinstance(action, (ScaleAction, ReceiverTarget, HideAction, UnhideAction)):
+        if not refused and isinstance(action, (ScaleAction, ReceiverTarget, HideAction, UnhideAction)):
             # O1: stamped after the SM answered, whatever the outcome (a failed or
             # partial wake may still have changed the routable set).
             self._routable_change[getattr(action, "model", model)] = (
@@ -1759,6 +1778,10 @@ def _observe_skipped(queued: QueuedAction) -> list[DispatchResult]:
     ]
 
 
+class SleepPathRefused(ValueError):
+    """A scale-down that names no sleep path: refused before any SM call."""
+
+
 def _sleep_kwargs(action: ScaleAction) -> dict:
     """SM sleep path + drain budget of a scale-down (plan 2026-09-27 D1).
 
@@ -1772,16 +1795,9 @@ def _sleep_kwargs(action: ScaleAction) -> dict:
     if path is None:
         # Every legitimate shrink names its path ("urgent" donors, "safescale_commit").
         # A path-less one would silently take the SM default `scale_down` (SM-side
-        # drain, up to 150 s), bypassing SafeScale: refuse. The dispatch wrappers turn
-        # the exception into a failed, logged DispatchResult.
-        LOG.error(
-            json.dumps(
-                {"event": "scale_down_without_sleep_path_refused", "model": action.model,
-                 "reason": str(action.reason), "delta": action.delta},
-                sort_keys=True,
-            )
-        )
-        raise ValueError(
+        # drain, up to 150 s), bypassing SafeScale: refuse. ``_timed_dispatch`` turns
+        # it into one failed, non-retriable result (single error log, own counter).
+        raise SleepPathRefused(
             f"scale-down of {action.model} ({action.reason}) has no sleep_path: "
             "refusing the implicit SM scale_down default"
         )

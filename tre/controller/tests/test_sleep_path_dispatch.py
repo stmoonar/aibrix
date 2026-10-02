@@ -50,15 +50,17 @@ def test_pathless_scale_down_is_refused_not_sent_to_the_sm_default():
     results = asyncio.run(queue.drain_once())
     assert client.calls == []
     assert [r.ok for r in results] == [False]
-    assert "dispatch_exception" in (results[0].error or "")
+    assert results[0].error.startswith("sleep_path_refused") and results[0].retriable is False
 
 
 def test_pathless_binding_scale_down_is_refused_too():
     client = RecordingClient()
     queue = ActionQueue(client)
     queue.submit((ScaleAction("m", -1, "high_release", "fairness", pods=("pod-a",)),))
-    asyncio.run(queue.drain_once())
+    results = asyncio.run(queue.drain_once())
     assert client.calls == []
+    assert [r.ok for r in results] == [False]
+    assert "no sleep_path" in results[0].error
 
 
 def test_sleep_kwargs_keeps_explicit_paths_and_ignores_scale_ups():
