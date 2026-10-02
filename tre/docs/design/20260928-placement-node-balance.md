@@ -120,10 +120,13 @@ controller restart 只重启 controller，两者都要重启，否则 controller
   锁内提交；`tre:v2:sm:wake_ops` journal 供崩溃恢复（启动时与 supervisor 每轮）。观测：`GET /v2/wake`、
   JSON 日志事件 `wake_start/wake_done/wake_failed/gpu_truth_fallback/startup_placeholder`，
   ops 记录 `details` 带 binding、placement、truth_source、phases_ms、error_code、compensating_sleep。
+  （S6 的三段式已被 [20261002-sm-wholelock](20261002-sm-wholelock.md) 取代：唤醒从检查到提交都在
+  一次持锁内完成，请求内的 `/wake_up` 仍并行；journal 只用于崩溃恢复。）
 
 ### 7.1 评审后的加固（2026-09-30）
 
-- 等待中的唤醒：waking lease 不再过期（TTL 0），只由 commit 或 journal 恢复释放；账面把 journal 里的 binding
+- （本条中锁外阶段、waking lease、commit 交接的部分已被 [20261002-sm-wholelock](20261002-sm-wholelock.md)
+  取代。）等待中的唤醒：waking lease 不再过期（TTL 0），只由 commit 或 journal 恢复释放；账面把 journal 里的 binding
   视为占卡；prepare 阶段即打 power 标记。commit 拿不到锁会先重试一次；任何未完成的 commit（锁、Redis、
   fence）都交给恢复，不再卡在本进程。恢复等待写锁（commit_lock_wait_s）；pod UID 变了（pod 被重建）
   则回滚、不碰新 pod；物理状态读不到时最多保留 `wake.recovery_unknown_attempts` 轮（pod 非 Ready 则立即）
@@ -151,9 +154,12 @@ controller restart 只重启 controller，两者都要重启，否则 controller
 - 重启计数持久化在 `tre:v2:sm:restart_seen`，SM 重启后首轮即可发现停机期间的原地重启（从未记录过的 pod
   只记基线）。SM observe 模式下重启占位也做记账收敛（醒着转 awake lease、睡着释放），只是不补 sleep。
 - lease 释放失败（fence 丢失、Redis 出错）时保留 journal 交给恢复；另有 supervisor 回收没有 journal 对应的
-  waking lease（先读物理状态：睡或 pod 不在则释放，醒着转 awake lease，读不到则保留）。
+  waking lease（先读物理状态：睡或 pod 不在则释放，醒着转 awake lease，读不到则保留）。（waking lease 及其
+  回收已被 [20261002-sm-wholelock](20261002-sm-wholelock.md) 取代。）
 - `avoid_gpus` 只是派发那一刻的快照：派发之后才入队的接力不在其中。SM 在 donor 排空期间本来就拒绝在该卡
   上唤醒（sleep reservation 覆盖该卡）；如果 donor 刚睡下、receiver 还没唤醒，SM 的换卡可能先占到这张卡，
   这时 receiver 会收到结构化 409，controller 冷却这张卡并重新规划（donor 那次 sleep 就浪费了）。这个窗口
-  很短，本轮不加处理，验收时留意 `wake_refused` 与 `placement_retry` 事件。
+  很短，本轮不加处理，验收时留意 `wake_refused` 与 `placement_retry` 事件。（已被
+  [20261002-sm-wholelock](20261002-sm-wholelock.md) 取代：sleep reservation 已删除，同卡接力由
+  `POST /v2/transfers` 在一次持锁内完成，这个窗口不再存在。）
 
