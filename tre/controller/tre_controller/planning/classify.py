@@ -54,6 +54,11 @@ class ModelClassification:
     #: exempt from the "Z missing -> incomplete" drop, see plan 6.4 idle rule.
     signal_idle: bool = False
     eta_low: float | None = None
+    #: Onset saturation rescue (design 20261002-saturation-onset-rescue): CRITICAL because
+    #: the engines are full while the TSS cannot decide yet (numerator zero / O1 hold).
+    #: Z_m is then the TSS value for the record only (often None); the planner sizes the
+    #: step by bounded doubling, not by ``ceil(n * tau_crit / Z)``.
+    saturation_rescue: bool = False
 
 
 def classify_model(

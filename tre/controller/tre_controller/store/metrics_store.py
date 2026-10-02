@@ -409,7 +409,24 @@ class MetricsStore:
             ttft_hist_count=ttft_hist_count,
             tpot_hist=tpot_hist,
             tpot_hist_count=tpot_hist_count,
+            **self._latest_instant(model, inst_docs),
         )
+
+    def _latest_instant(self, model: str, inst_docs: list[dict[str, Any]]) -> dict[str, Any]:
+        """The newest instant doc's queue gauges and KV-cache fill (onset saturation
+        rescue: the latest grid, not the window average). Docs are sorted ascending."""
+        for doc in reversed(inst_docs):
+            metrics = doc.get("model_metrics")
+            if not isinstance(metrics, dict):
+                continue
+            kv = doc_lookup(metrics, model, INSTANT_METRICS["gpu_cache"])
+            return {
+                "latest_waiting": _number(doc_lookup(metrics, model, INSTANT_METRICS["waiting"]), 0.0),
+                "latest_running": _number(doc_lookup(metrics, model, INSTANT_METRICS["running"]), 0.0),
+                "latest_gpu_cache": None if kv is None else _number(kv, 0.0),
+                "latest_instant_ms": int(_number(doc.get("timestamp"), 0.0)),
+            }
+        return {}
 
     def _aggregate_model(
         self,

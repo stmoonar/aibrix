@@ -417,6 +417,9 @@ def test_shipped_registry_scaling_section():
         "breakpoint_margin_ms", "breakpoint_partial_max_step", "breakpoint_lowevidence_requests",
         "breakpoint_hold_max_windows",
         "gateway_clock_tolerance_ms", "gateway_clock_check_s",
+        # Onset saturation rescue (2026-10-02), at its built-in defaults.
+        "saturation_rescue", "saturation_kv_threshold", "saturation_consecutive_ticks",
+        "saturation_max_step_factor",
     }
     assert registry.scaling().donor_surplus_release is False
     assert registry.scaling().rescue_max_step_pods == 4

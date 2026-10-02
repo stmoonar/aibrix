@@ -684,6 +684,23 @@ scaling:
   # beyond the tolerance O1 is suspended (pre-O1 behaviour) until 3 good checks.
   gateway_clock_tolerance_ms: 2000
   gateway_clock_check_s: 60
+  # Onset saturation rescue (design docs/design/20261002-saturation-onset-rescue.md):
+  # while a model's TSS cannot decide yet - its window numerator is zero (tokens count at
+  # request completion, so nothing has completed) or the O1 evidence gate above still
+  # holds it - a model whose engines are full on saturation_consecutive_ticks consecutive
+  # 10 s metrics windows is a CRITICAL receiver of the fast loop. "Full" = vLLM
+  # num_requests_waiting summed over its routable pods > 0, or their mean KV-cache fill
+  # >= saturation_kv_threshold, both from the latest gateway sample (not the 30 s mean).
+  # Not full (e.g. one long request still running) keeps the TSS verdict (no receiver).
+  # Target per decision: min(max(n + 1, floor(saturation_max_step_factor * n)),
+  # max_awake_replicas), n = routable replicas (1 -> 2 -> 4, not straight to the cap); the
+  # next step needs the condition again on windows after the routable count changed.
+  # Capacity order, donors, SafeScale, O1 and C1 are unchanged; once the TSS is warm the
+  # TSS / Z / C1 rules alone decide. false = off (TSS rules only).
+  saturation_rescue: true
+  saturation_kv_threshold: 0.9
+  saturation_consecutive_ticks: 2
+  saturation_max_step_factor: 2
 # Node GPU-truth agent DaemonSet (deploy/gen_gpu_truth_manifest.py renders
 # overlays/tre-v2/gpu-truth.yaml from this and cluster.nodes). Only the generator
 # reads this section; the controller, service-manager and UI ignore it.

@@ -13,6 +13,8 @@ from tre_common.registry import Registry, ModelSpec
 from tre_common.tss import window_is_idle
 from tre_common.window_pods import restrict_to_serving
 from tre_controller.planning.classify import (
+    ModelRole,
+    ModelState,
     classify_all_models,
     model_control_configs_from_registry,
 )
@@ -33,6 +35,11 @@ from tre_controller.planning.safescale import (
     SafeScaleCommand,
     SafeScaleDecision,
     format_window_event,
+)
+from tre_controller.signals.saturation import (
+    SaturationSample,
+    eligibility_reason,
+    saturation_sample,
 )
 from tre_controller.signals.sources import get_signal, per_replica_token_rate
 from tre_controller.signals.trs import SignalState, TRSComputer, TRSInput
@@ -181,6 +188,11 @@ def run_planner_tick(
         # Band dwell (D8): counted per distinct window_end_ms in the shared SignalState,
         # so the rescue/fairness re-reads of one snapshot never advance it twice.
         classifications, dwell_events = signal_state.apply_dwell(classifications, contexts, snapshot.models)
+    # Onset saturation rescue: after the band dwell (which only sees the TSS verdict).
+    classifications, saturation_events = _apply_saturation_rescue(
+        classifications, contexts, snapshot, signal_state
+    )
+    dwell_events = tuple(dwell_events) + saturation_events
     if _prof_on:
         _signals_ns = time.perf_counter_ns() - _phase_t0
         _phase_t0 = time.perf_counter_ns()
@@ -220,6 +232,7 @@ def run_planner_tick(
         # C1: earlier rescue targets the decision windows do not reflect yet.
         rescue_bases=_rescue_bases(snapshot, queue, registry, contexts) if rescue_due else None,
     )
+    _note_saturation_steps(plan.actions, classifications, contexts, snapshot, signal_state)
     if _prof_on:
         _plan_ns = time.perf_counter_ns() - _phase_t0
         _phase_t0 = time.perf_counter_ns()
@@ -300,7 +313,90 @@ def _scaling_options(registry: Registry) -> dict:
         if bool(getattr(config, "breakpoint_window", False))
         else 0,
         "partial_window_lowevidence_requests": int(getattr(config, "breakpoint_lowevidence_requests", 0) or 0),
+        "saturation_max_step_factor": float(getattr(config, "saturation_max_step_factor", 2.0) or 2.0),
     }
+
+
+def _apply_saturation_rescue(
+    classifications: list,
+    contexts: dict[str, dict],
+    snapshot: MetricsSnapshot,
+    signal_state: SignalState | None,
+) -> tuple[list, tuple[str, ...]]:
+    """Onset saturation rescue (design 20261002-saturation-onset-rescue): a model whose
+    TSS cannot decide yet (numerator zero / receiver gate not warm) and whose engines are
+    full on ``saturation_consecutive_ticks`` consecutive windows becomes a CRITICAL
+    receiver (``saturation_rescue``). A warm TSS is never overridden."""
+    tracker = getattr(signal_state, "saturation", None)
+    if tracker is None or not tracker.config.enabled:
+        return classifications, ()
+    need = tracker.config.consecutive_ticks
+    events: list[str] = []
+    out: list = []
+    for item in classifications:
+        model = item.model_name
+        ctx = contexts.get(model)
+        metrics = snapshot.models.get(model)
+        if ctx is None or metrics is None:
+            out.append(item)
+            continue
+        tokens = metrics.prompt_tokens is not None and metrics.generation_tokens is not None
+        reason = eligibility_reason(ctx) if tokens else None
+        sample = None
+        if ctx.get("saturation_sample_ms") is not None:
+            sample = SaturationSample(
+                waiting=float(ctx.get("saturation_waiting") or 0.0),
+                kv=ctx.get("saturation_kv"),
+                pods=int(ctx.get("saturation_pods") or 0),
+                sample_ms=int(ctx["saturation_sample_ms"]),
+            )
+        verdict = tracker.observe(
+            model,
+            window_end_ms=int(metrics.window_end_ms),
+            routable=int(ctx.get("routable_pods") or 0),
+            reason=reason,
+            sample=sample,
+        )
+        ctx["saturation_ticks"] = verdict.ticks
+        ctx["saturation_reason"] = verdict.reason
+        if verdict.fire:
+            ctx["saturation_rescue"] = True
+            item = replace(
+                item, state=ModelState.CRITICAL, role=ModelRole.RECEIVER, donor_tier=None, saturation_rescue=True
+            )
+        elif verdict.full:
+            events.append(
+                f"saturation_pending:{model}:{verdict.ticks}/{need}:reason={verdict.reason}"
+                f":waiting={sample.waiting:.0f}:kv={'none' if sample.kv is None else f'{sample.kv:.2f}'}"
+            )
+        out.append(item)
+    return out, tuple(events)
+
+
+def _note_saturation_steps(
+    actions,
+    classifications: list,
+    contexts: dict[str, dict],
+    snapshot: MetricsSnapshot,
+    signal_state: SignalState | None,
+) -> None:
+    """A planned saturation-rescue scale-up restarts the model's count: the next step
+    needs the condition again on windows after its routable count changed."""
+    tracker = getattr(signal_state, "saturation", None)
+    if tracker is None:
+        return
+    up = {action.model for action in actions if isinstance(action, ScaleAction) and action.delta > 0}
+    for item in classifications:
+        if not getattr(item, "saturation_rescue", False) or item.model_name not in up:
+            continue
+        metrics = snapshot.models.get(item.model_name)
+        if metrics is None:
+            continue
+        tracker.note_step(
+            item.model_name,
+            window_end_ms=int(metrics.window_end_ms),
+            routable=int((contexts.get(item.model_name) or {}).get("routable_pods") or 0),
+        )
 
 
 def rescue_settle_ms(registry: Registry | None, model: str) -> float:
@@ -879,6 +975,7 @@ def _model_contexts(
         events.append(f"breakpoint_window_suspended:{suspended}")
     cluster_counts = _cluster_view_counts(cluster_view)
     awake_counts = _awake_including_hidden(cluster_view)
+    hidden_pods = _hidden_pods(cluster_view)
     for model_name, metrics in snapshot.models.items():
         spec = registry.model(model_name)
         counts = cluster_counts.get(model_name)
@@ -993,6 +1090,23 @@ def _model_contexts(
             }
         # Scaling-cap count (A1/P1-2): awake bindings incl. hidden probe pods.
         context["awake_replicas"] = awake_counts.get(model_name, metrics.routable_pods)
+        tracker = getattr(signal_state, "saturation", None)
+        if tracker is not None and tracker.config.enabled:
+            # Onset saturation rescue: the routable pods' newest gateway samples (the
+            # serving window minus hidden probe pods), not the window averages.
+            sample = saturation_sample(
+                metrics,
+                hidden_pods=hidden_pods.get(model_name, ()),
+                fresh_after_ms=int(metrics.window_end_ms) - int(tracker.config.grid_ms),
+            )
+            context.update(
+                {
+                    "saturation_waiting": sample.waiting if sample is not None else None,
+                    "saturation_kv": sample.kv if sample is not None else None,
+                    "saturation_pods": sample.pods if sample is not None else 0,
+                    "saturation_sample_ms": sample.sample_ms if sample is not None else None,
+                }
+            )
         if paper_state_cache is not None:
             context, model_events = paper_state_cache.apply(model_name, context, tokens_available=tokens_available)
             events.extend(model_events)
@@ -1039,6 +1153,15 @@ def serving_window(
         if binding.model == metrics.model and not binding.awake
     }
     return restrict_to_serving(metrics, sleeping_pods=sleeping, routable_pods=counts[0])
+
+
+def _hidden_pods(cluster_view: ClusterView | None) -> dict[str, set[str]]:
+    """model -> serve_ids (== pod names) of its hidden (probe) bindings."""
+    hidden: dict[str, set[str]] = {}
+    for binding in getattr(cluster_view, "bindings", ()) or ():
+        if binding.hidden:
+            hidden.setdefault(binding.model, set()).add(binding.serve_id)
+    return hidden
 
 
 def _awake_including_hidden(cluster_view: ClusterView | None) -> dict[str, int]:

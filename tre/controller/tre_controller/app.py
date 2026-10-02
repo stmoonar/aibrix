@@ -40,6 +40,7 @@ from tre_controller.planning.safescale_direct import (
     cluster_view_urls,
 )
 from tre_controller.planning.safescale_evidence import MetricsEvidenceReader, RegistryThresholds
+from tre_controller.signals.saturation import SaturationRescueConfig, SaturationTracker
 from tre_controller.signals.trs import BreakpointWindowConfig, SignalState
 from tre_controller.sm_client import AsyncTransport, ServiceManagerClient
 from tre_controller.store.metrics_store import MetricsStore
@@ -286,6 +287,10 @@ def create_controller_dependencies(
     logging.getLogger("tre_controller.signals").info(
         json.dumps({"event": "breakpoint_window_config", **dataclasses.asdict(breakpoint_config)}, sort_keys=True)
     )
+    saturation_config = SaturationRescueConfig.from_registry(registry, grid_ms=cfg.instant_sample_interval_ms)
+    logging.getLogger("tre_controller.signals").info(
+        json.dumps({"event": "saturation_rescue_config", **dataclasses.asdict(saturation_config)}, sort_keys=True)
+    )
     store = MetricsStore(
         metrics_redis_client,
         registry,
@@ -435,6 +440,8 @@ def create_controller_dependencies(
             # O1 breakpoint window (registry scaling.breakpoint_window /
             # onset_warmup_guard / min_evidence_*), on the gateway grid.
             breakpoint=breakpoint_config,
+            # Onset saturation rescue (registry scaling.saturation_*).
+            saturation=SaturationTracker(saturation_config),
         ),
         profiler=profiler,
         hidden_orphan_detector=HiddenOrphanDetector(

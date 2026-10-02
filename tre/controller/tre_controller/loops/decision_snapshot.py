@@ -158,6 +158,18 @@ def _model_states(
             "signal_unavailable_reason": context.get("signal_unavailable_reason"),
             "window_end_ms": getattr(window, "window_end_ms", None),
         }
+        if "saturation_ticks" in context:
+            # Onset saturation rescue (only with the tracker on): the latest-sample
+            # engine gauges, the eligibility reason and the confirmed-window count.
+            out[model].update(
+                {
+                    "saturation_rescue": bool(context.get("saturation_rescue", False)),
+                    "saturation_reason": context.get("saturation_reason"),
+                    "saturation_ticks": context.get("saturation_ticks"),
+                    "saturation_waiting": context.get("saturation_waiting"),
+                    "saturation_kv": context.get("saturation_kv"),
+                }
+            )
     return out
 
 

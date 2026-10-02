@@ -56,6 +56,16 @@ class PodWindowMetrics:
     ttft_hist_count: float | None = field(default=None, compare=False)
     tpot_hist: tuple[tuple[float, float], ...] | None = field(default=None, compare=False)
     tpot_hist_count: float | None = field(default=None, compare=False)
+    #: The pod's NEWEST gateway instant sample in the window (not a window average):
+    #: vLLM ``num_requests_waiting`` / ``num_requests_running`` / KV-cache fill (0..1,
+    #: None when the doc does not carry it) and the sample's timestamp (ms). Read by the
+    #: controller's onset saturation rescue (design 20261002-saturation-onset-rescue),
+    #: which judges "engine full" on the latest grid, not on the 30 s mean. None = no
+    #: instant doc in the window. Excluded from equality.
+    latest_waiting: float | None = field(default=None, compare=False)
+    latest_running: float | None = field(default=None, compare=False)
+    latest_gpu_cache: float | None = field(default=None, compare=False)
+    latest_instant_ms: int | None = field(default=None, compare=False)
 
 
 #: How a model-level p95 is formed from the pods' merged histograms:

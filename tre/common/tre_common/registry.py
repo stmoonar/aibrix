@@ -535,6 +535,20 @@ class ScalingRegistryConfig:
     #: tolerance and period (s, 0 = off). A violation suspends O1 (pre-O1 behaviour).
     gateway_clock_tolerance_ms: int = 2000
     gateway_clock_check_s: int = 60
+    #: Onset saturation rescue (2026-10-02, design 20261002-saturation-onset-rescue):
+    #: while a model's TSS cannot decide yet - its window numerator is zero (no request
+    #: completed) or the O1 evidence gate holds it - a model whose engines are full
+    #: (``num_requests_waiting`` summed over its routable pods > 0, or their mean KV-cache
+    #: fill >= ``saturation_kv_threshold``, latest gateway sample) on
+    #: ``saturation_consecutive_ticks`` consecutive metrics windows is a CRITICAL
+    #: receiver. Its fast-loop target is ``min(max(n + 1, floor(factor * n)),
+    #: max_awake_replicas)``; each further step needs the condition again on windows
+    #: after the routable count changed. Off: the TSS rules alone (numerator zero = no
+    #: decision until requests complete).
+    saturation_rescue: bool = True
+    saturation_kv_threshold: float = 0.9
+    saturation_consecutive_ticks: int = 2
+    saturation_max_step_factor: float = 2.0
 
 
 SCALING_KEYS = frozenset({
@@ -544,7 +558,24 @@ SCALING_KEYS = frozenset({
     "breakpoint_margin_ms", "breakpoint_partial_max_step", "breakpoint_lowevidence_requests",
     "breakpoint_hold_max_windows",
     "gateway_clock_tolerance_ms", "gateway_clock_check_s",
+    "saturation_rescue", "saturation_kv_threshold", "saturation_consecutive_ticks",
+    "saturation_max_step_factor",
 })
+
+
+def _scaling_number(raw: dict[str, Any], key: str, default: float, *, low: float, high: float | None = None) -> float:
+    """A finite number in ``[low, high]`` (``high`` None = unbounded)."""
+    value = raw.get(key)
+    if value is None:
+        return default
+    bound = f"in [{low:g}, {high:g}]" if high is not None else f">= {low:g}"
+    try:
+        number = float(value) if not isinstance(value, bool) else math.nan
+    except (TypeError, ValueError, OverflowError):
+        number = math.nan
+    if not math.isfinite(number) or number < low or (high is not None and number > high):
+        raise ValueError(f"scaling.{key} must be a number {bound}, got {value!r}")
+    return number
 
 
 def _scaling_count(raw: dict[str, Any], key: str, default: int, minimum: int) -> int:
@@ -634,6 +665,17 @@ def parse_scaling_config(raw: dict[str, Any] | None) -> ScalingRegistryConfig:
             raw, "gateway_clock_tolerance_ms", defaults.gateway_clock_tolerance_ms, 0
         ),
         gateway_clock_check_s=_scaling_count(raw, "gateway_clock_check_s", defaults.gateway_clock_check_s, 0),
+        saturation_rescue=_scaling_bool(raw, "saturation_rescue", defaults.saturation_rescue),
+        # A KV threshold of 0 would call every model with a live pod full.
+        saturation_kv_threshold=_scaling_number(
+            raw, "saturation_kv_threshold", defaults.saturation_kv_threshold, low=0.01, high=1.0
+        ),
+        saturation_consecutive_ticks=_scaling_count(
+            raw, "saturation_consecutive_ticks", defaults.saturation_consecutive_ticks, 1
+        ),
+        saturation_max_step_factor=_scaling_number(
+            raw, "saturation_max_step_factor", defaults.saturation_max_step_factor, low=1.0
+        ),
     )
 
 

@@ -389,8 +389,14 @@ class SignalState:
         dwell_windows: int = 1,
         dwell_states: Iterable[str] = DWELL_STATES,
         breakpoint: BreakpointWindowConfig | None = None,
+        saturation: Any | None = None,
     ) -> None:
         self._by_model: dict[str, TRSComputer] = {}
+        #: Onset saturation rescue (``tre_controller.signals.saturation.SaturationTracker``;
+        #: None = off): shared by the rescue / fairness loops like the EMAs, counted once
+        #: per distinct window end. Independent of the idle reset (a numerator-zero window
+        #: is exactly the case it watches).
+        self.saturation = saturation
         # O1 (None = pre-O1: the onset warmup guard alone, as configured by warmup_ms).
         self.breakpoint = breakpoint
         # model -> (routable count, observation time) of the last cluster view seen.

@@ -82,6 +82,10 @@ class PlanConfig:
     #: evidence the whole deficit at once.
     partial_window_max_step: int = 0
     partial_window_lowevidence_requests: int = 0
+    #: Onset saturation rescue (registry scaling.saturation_max_step_factor): a
+    #: ``saturation_rescue`` CRITICAL receiver's target is min(max(n + 1,
+    #: floor(factor * n)), scaling cap) - bounded doubling without throughput evidence.
+    saturation_max_step_factor: float = 2.0
 
     def __post_init__(self) -> None:
         # No silent fallback for a bad tp_size (the registry rejects it at load; this
@@ -433,6 +437,11 @@ def build_plan(
     kept: list = []
     for item in classifications:
         ctx = model_contexts.get(item.model_name, {})
+        if getattr(item, "saturation_rescue", False):
+            # Onset saturation rescue: CRITICAL exactly because the TSS is not warm yet
+            # (its own consecutive-window confirmation replaces the warmup / dwell gates).
+            kept.append(item)
+            continue
         if item.role == ModelRole.RECEIVER:
             if not ctx.get("signal_warm", True):
                 warmup_suppressed.append(item.model_name)
@@ -498,6 +507,8 @@ def build_plan(
             recv_awake = _awake_replicas(recv.model_name, model_contexts, model_replicas)
             if recv_awake >= recv_max:
                 return None
+            if getattr(recv, "saturation_rescue", False):
+                return saturation_need(recv, recv_pods, recv_assigned, recv_max, recv_awake)
             if not c1:
                 raw_need = min(_scale_step(recv_pods, cfg.scale_step_ratio), recv_max - recv_awake)
                 if raw_need <= 0:
@@ -538,7 +549,39 @@ def build_plan(
             rescue_ctx[recv.model_name] = (desired, base, covered)
             return raw_need, min(raw_need, max(0, recv_assigned - recv_pods))
 
-        critical_needs = {recv.model_name: critical_need(recv) for recv in critical_receivers}
+        def saturation_need(
+            recv: ModelClassification, recv_pods: int, recv_assigned: int, recv_max: int, recv_awake: int
+        ) -> tuple[int, int] | None:
+            """Onset saturation rescue: bounded doubling of the routable count (no
+            throughput evidence: never ``ceil(n * tau_crit / Z)``, which a zero Z sends
+            to the cap). The O1 low-evidence step cap does not apply (it bounds a TSS
+            decision on a thin partial window; this path is not a TSS decision and
+            re-confirms saturation after every step instead). An earlier rescue target
+            the routable count does not show yet counts as covered (C1 bookkeeping)."""
+            basis = rescue_bases.get(recv.model_name)
+            covered = max(basis.covered, recv_pods) if basis is not None else recv_pods
+            desired = min(
+                max(recv_pods + 1, math.floor(cfg.saturation_max_step_factor * recv_pods + 1e-9)), recv_max
+            )
+            raw_need = min(desired - covered, recv_max - max(recv_awake, covered))
+            ctx = model_contexts.get(recv.model_name, {})
+            kv = ctx.get("saturation_kv")
+            events.append(
+                f"saturation_rescue:{recv.model_name}:n={recv_pods}:target={desired}"
+                f":waiting={_num_text(ctx.get('saturation_waiting'))}:kv={_num_text(kv, 2)}"
+                f":reason={ctx.get('saturation_reason')}:ticks={ctx.get('saturation_ticks')}"
+                f":planned_max={max(0, raw_need)}"
+            )
+            if raw_need <= 0:
+                if basis is not None:
+                    events.append(
+                        f"rescue_target_hold:{recv.model_name}:desired={desired}:covered={covered}"
+                    )
+                return None
+            rescue_ctx[recv.model_name] = (desired, recv_pods, covered)
+            return raw_need, min(raw_need, max(0, recv_assigned - recv_pods))
+
+        critical_needs ={recv.model_name: critical_need(recv) for recv in critical_receivers}
         # Every CRITICAL receiver's sleeping-binding wakes are assigned jointly up
         # front, so an earlier receiver never takes the one free slot a later one
         # can wake into while it had another (multi-receiver slot stealing).
@@ -1731,8 +1774,23 @@ def _paper_state_incomplete_models(classifications: list[ModelClassification]) -
         item.model_name
         for item in classifications
         if item.state == ModelState.UNKNOWN
-        or (item.Z_m is None and item.state != ModelState.IDLE and not getattr(item, "signal_idle", False))
+        or (
+            item.Z_m is None
+            and item.state != ModelState.IDLE
+            and not getattr(item, "signal_idle", False)
+            # Onset saturation rescue: CRITICAL on the engine gauges, Z not defined yet.
+            and not getattr(item, "saturation_rescue", False)
+        )
     )
+
+
+def _num_text(value: Any, digits: int = 0) -> str:
+    if value is None:
+        return "none"
+    try:
+        return f"{float(value):.{digits}f}"
+    except (TypeError, ValueError):
+        return "none"
 
 
 def _add_scale_action(
