@@ -80,13 +80,6 @@ class ServiceManagerClient(Protocol):
 
     async def transfer(self, donor_model: str, receiver_model: str, count: int, *, sleep_path: str) -> dict: ...
 
-    async def get_transfers(self) -> dict: ...
-
-
-#: ``pairs[].status`` of a ``POST /v2/transfers`` pair that the service-manager's
-#: recovery continues (``left_to_recovery``): the receiver may still wake.
-TRANSFER_OPEN_STATUSES = frozenset({"pending", "receiver_waking"})
-
 
 @dataclass(frozen=True)
 class RetryPolicy:
@@ -161,7 +154,7 @@ class DispatchResult:
     #: done, taken, unfilled, clamped_by_floor, pairs with pod names, refusals).
     transfer: dict | None = None
     #: 2026-10-02: the SM refused the call before changing anything (``routable_unknown``,
-    #: ``RetryLater``, ``writer_busy``, ``floor_violation``, a located wake refusal, 400):
+    #: ``writer_busy``, ``floor_violation``, a located wake refusal, a plain RetryLater, 400):
     #: accounted as not executed - no view-pending / O1 stamp, no last action.
     not_executed: bool = False
 
@@ -210,9 +203,8 @@ class ActionQueue:
     (review P1-3 / review 2 P1-1). A donor -> receiver relay (TransferIntent,
     2026-10-02) is ONE service-manager call (``POST /v2/transfers``) holding both
     models; the SM picks the pods / GPUs, sleeps the donors and wakes the
-    receivers. A pair the SM hands to its recovery (``left_to_recovery``) keeps
-    both models held until ``GET /v2/transfers`` no longer lists the transfer (a
-    state gate, no timer). A SafeScale commit is an ordered unit for its hidden
+    receivers under its global writer lock, so when the call returns the relay
+    has completed or failed. A SafeScale commit is an ordered unit for its hidden
     donor pods and its follow-up receivers (review 3 P2-2). One-shot actions (SafeScale commit /
     rollback) that fail retriably are retried with bounded backoff and
     re-validated before every retry; a retry only ever re-sends idempotent
@@ -251,20 +243,12 @@ class ActionQueue:
         on_hide_done: Callable[[str, tuple[str, ...]], None] | None = None,
         scale_memory: object | None = None,
         scale_memory_max_age_ms: float | None = 50_000.0,
-        transfer_poll_s: float = 2.0,
     ) -> None:
         self._client = client
         #: Observation events for the next planner tick (transfer outcomes,
         #: wake_refused, *_clamped_by_floor, placement_substituted), drained by
         #: :meth:`drain_events`. No timer follows any of them (2026-10-02).
         self._events: list[str] = []
-        #: 2026-10-02: how often a relay the SM left to its recovery is looked up in
-        #: ``GET /v2/transfers`` (the poll period of a state gate: the models stay held
-        #: until the transfer is no longer listed, however long that takes).
-        self._transfer_poll_s = max(0.0, float(transfer_poll_s))
-        #: transfer_id -> {donor_model, receiver_model, pairs, since_ms} of relays the
-        #: SM is still finishing (``left_to_recovery``), see :meth:`recovering_transfers`.
-        self._recovering: dict[str, dict] = {}
         #: P3: (model, pods, error) of a hide that did not take effect (failed, or
         #: not sent because of observe mode): its SafeScale probe is rolled back
         #: instead of being judged as if the pods were hidden.
@@ -359,7 +343,6 @@ class ActionQueue:
             "transfer_partial_total": 0,
             "transfer_failed_total": 0,
             "transfer_clamped_by_floor_total": 0,
-            "transfer_left_to_recovery_total": 0,
             "transfer_unsupported_total": 0,
             "scale_clamped_by_floor_total": 0,
         }
@@ -472,12 +455,6 @@ class ActionQueue:
         relay records both sides (donor "down", receiver "up"); a call that changed
         nothing (``taken: 0``, a relay side with no pair) records nothing (2026-10-02)."""
         return dict(self._view_change)
-
-    def recovering_transfers(self) -> dict[str, dict]:
-        """2026-10-02: relays the service-manager is still finishing (pairs it left to
-        its recovery) -> {donor_model, receiver_model, pairs, since_ms}. Both models are
-        held (in flight) until ``GET /v2/transfers`` no longer lists the transfer."""
-        return {key: dict(value) for key, value in self._recovering.items()}
 
     def rescue_targets(self) -> dict[str, RescueTargetRecord]:
         """C1: model -> its last rescue target (copies). The planner tick keeps the
@@ -1446,69 +1423,7 @@ class ActionQueue:
                     sort_keys=True,
                 )
             )
-        recovering = summary.get("left_to_recovery") or ()
-        if summary.get("transfer_id") and recovering:
-            await self._await_transfer_recovery(action, str(summary["transfer_id"]), list(recovering))
         return [donor_result, result]
-
-    async def _await_transfer_recovery(self, action: TransferIntent, transfer_id: str, pairs: list) -> None:
-        """Hold the relay's models (this dispatch task keeps their resources) until the
-        service-manager's ``GET /v2/transfers`` no longer lists ``transfer_id`` - in
-        progress or running in its process. A state gate: it ends when the SM finished
-        (or gave up) the transfer, however long that takes; an unreadable answer keeps
-        the gate closed."""
-        self._stats["transfer_left_to_recovery_total"] += 1
-        self._recovering[transfer_id] = {
-            "donor_model": action.donor_model, "receiver_model": action.receiver_model,
-            "pairs": pairs, "since_ms": int(self._now_ms()),
-        }
-        self._events.append(
-            f"transfer_left_to_recovery:{action.donor_model}->{action.receiver_model}:{transfer_id}:{len(pairs)}"
-        )
-        LOG.warning(
-            json.dumps(
-                {"event": "transfer_left_to_recovery", "transfer_id": transfer_id,
-                 "donor": action.donor_model, "receiver": action.receiver_model, "pairs": pairs},
-                sort_keys=True,
-            )
-        )
-        reader = getattr(self._client, "get_transfers", None)
-        try:
-            while not self._closed:
-                await self._sleep(self._transfer_poll_s)
-                if not callable(reader):
-                    break  # a client without the lookup cannot track it (tests only)
-                try:
-                    with sm_actor(_actor_for(action)):
-                        response = await reader()
-                except Exception as exc:  # noqa: BLE001 - unreadable: the gate stays closed
-                    LOG.warning("GET /v2/transfers failed while tracking %s: %r", transfer_id, exc)
-                    continue
-                if not bool(response.get("ok", False)):
-                    continue
-                body = response.get("response") or {}
-                in_progress = body.get("in_progress") or {}
-                running = body.get("running_here") or ()
-                if transfer_id in in_progress or transfer_id in running:
-                    continue
-                break
-        finally:
-            info = self._recovering.pop(transfer_id, None)
-        now = int(self._now_ms())
-        # The recovery may have changed both routable counts: stamped when it ended.
-        for model, direction, hold in (
-            (action.donor_model, -1, "down"), (action.receiver_model, 1, "up")
-        ):
-            self._routable_change[model] = (now, direction)
-            self._view_change[model] = (now, hold)
-        self._events.append(f"transfer_recovered:{action.donor_model}->{action.receiver_model}:{transfer_id}")
-        LOG.info(
-            json.dumps(
-                {"event": "transfer_recovery_tracked", "transfer_id": transfer_id,
-                 "since_ms": (info or {}).get("since_ms"), "ended_ms": now},
-                sort_keys=True,
-            )
-        )
 
     async def _timed_dispatch(self, action, model: str) -> DispatchResult:
         """One SM call. An exception (a client bug, a malformed answer) becomes a
@@ -1582,7 +1497,7 @@ class ActionQueue:
         if not isinstance(action, (ScaleAction, ReceiverTarget, HideAction, UnhideAction)):
             return
         if result.not_executed:
-            return  # refused before any change (RetryLater, routable_unknown, ...)
+            return  # refused before any change (writer_busy, routable_unknown, ...)
         if isinstance(action, ScaleAction) and action.delta < 0 and result.ok and result.taken == 0:
             return  # the replica floor clamped the shrink to nothing: no change
         stamp(getattr(action, "model", model), _routable_direction(action), _view_hold_direction(action))
@@ -1719,8 +1634,8 @@ class ActionQueue:
         body = response.get("response") if (response.get("ok") or response.get("partial")) else None
         if not isinstance(body, dict):
             status = response.get("status")
-            # Refused before any change (400, 409 routable_unknown / writer_busy /
-            # RetryLater, ...): nothing happened. Anything else (timeout, transport,
+            # Refused before any change (400, 409 routable_unknown / writer_busy, ...):
+            # nothing happened (writer_busy: the SM writer lock wait timed out). Anything else (timeout, transport,
             # 5xx, another 409): whether anything happened is unknown.
             outcome = "refused" if response.get("not_executed") else "unknown"
             self._stats["transfer_failed_total"] += 1
@@ -1946,8 +1861,6 @@ def _transfer_summary(body: dict) -> dict:
             "gpu_ids": list(item.get("gpu_ids") or ()),
             "status": str(item.get("status") or "unknown"),
         }
-        if item.get("left_to_recovery"):
-            pair["left_to_recovery"] = True
         if item.get("compensating_sleep"):
             pair["compensating_sleep"] = item.get("compensating_sleep")
         error = item.get("error")
@@ -1965,7 +1878,6 @@ def _transfer_summary(body: dict) -> dict:
         "unfilled": num("unfilled"),
         "clamped_by_floor": bool(body.get("clamped_by_floor")),
         "pairs": pairs,
-        "left_to_recovery": [pair for pair in pairs if pair.get("left_to_recovery")],
         "refusals": len(body.get("refusals") or ()),
         "skipped": {str(key): value for key, value in skipped.items()},
         "picked": [
@@ -1985,9 +1897,7 @@ def _transfer_changed(result: DispatchResult) -> tuple[bool, bool]:
         return False, False
     pairs = summary.get("pairs") or ()
     donor = bool(summary.get("taken")) or bool(pairs)
-    receiver = bool(summary.get("done")) or any(
-        pair.get("status") in ({"receiver_wake_failed"} | TRANSFER_OPEN_STATUSES) for pair in pairs
-    )
+    receiver = bool(summary.get("done")) or any(pair.get("status") == "receiver_wake_failed" for pair in pairs)
     return donor, receiver
 
 

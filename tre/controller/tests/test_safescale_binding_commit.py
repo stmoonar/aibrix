@@ -14,7 +14,7 @@ from tre_controller.loops.metrics_task import SnapshotBox
 from tre_controller.loops.rescue_task import rescue_task
 from tre_controller.loops.safescale_task import run_safescale_observation_tick
 from tre_controller.loops.tick import _commands_to_actions, _idle_gpus, _pods_to_probe
-from tre_controller.planning.planner import ClusterView, ScaleAction, TransferIntent
+from tre_controller.planning.planner import ClusterView, TransferIntent
 from tre_controller.planning.safescale import SafeScaleStateMachine
 from tre_sm.allocator.slots import Binding, Slot, natural_key
 from tre_sm.api.v2 import ServiceManagerV2
@@ -118,9 +118,6 @@ class InProcessServiceManager:
             return {"ok": False, "error": "HTTP 409: partial", "status": 409, "retriable": False,
                     "partial": True, "response": body}
         return {"ok": True, "response": body}
-
-    async def get_transfers(self):
-        return {"ok": True, "response": {"in_progress": {}, "running_here": [], "stats": {}}}
 
 
 def _trs() -> TrsParams:

@@ -5,10 +5,11 @@
   GPU); free capacity is used first; ``pairable_count`` bounds the intent; a donor
   gives at most its SM ``floor_headroom``; the IDLE proactive shrink is a model-level
   ``/target`` call;
-* ActionQueue: one ``POST /v2/transfers`` per intent, accounted by done / taken /
-  unfilled (also when partial); pairs left to the SM recovery hold both models until
-  ``GET /v2/transfers`` no longer lists them; refusals, floor clamps and ``taken: 0``
-  are events only; a 404 degrades to "not executed";
+* ActionQueue: one ``POST /v2/transfers`` per intent (the SM completes or fails it
+  under its global writer lock before answering), accounted by done / taken /
+  unfilled (also when partial); refusals, floor clamps and ``taken: 0`` are events
+  only; ``writer_busy`` / ``routable_unknown`` count as not executed; a 404 degrades
+  to "not executed";
 * SM view: ``routable`` / ``floor_headroom`` straight from ``/v2/state`` with a
   fallback (and an event) when the SM does not report them.
 """
@@ -216,50 +217,28 @@ def test_clamped_by_floor_is_an_event_only_and_changes_nothing():
     assert queue.submit((_intent(2),)).accepted == 1
 
 
-def test_left_to_recovery_holds_both_models_until_get_transfers_drops_it():
-    body = transfer_body(2, statuses=["done", "pending"], done=1, taken=2, left_to_recovery=(1,))
-    listed = {"ok": True, "response": {"in_progress": {"tr-1": {"phase": "receiver_waking"}}, "running_here": []}}
-    sm = ScriptedSM(results={
-        "transfer:7b->8b": [{"ok": True, "response": body}],
-        "get_transfers": [listed, listed, listed],
-    })
-    clock = {"ms": 1_000}
+def test_a_relay_is_finished_when_its_call_returns():
+    """Plan B (SM global writer lock): the call returns with every pair done or failed;
+    the queue frees both models at once and never looks the transfer up again."""
+    body = transfer_body(2, statuses=["done", "receiver_wake_failed"])
+    sm = ScriptedSM(results={"transfer:7b->8b": [{"ok": True, "response": body}]}, gated={"transfer:7b->8b"})
 
     async def scenario():
-        polls = asyncio.Event()
-
-        async def poll_sleep(_seconds):
-            await polls.wait()
-            polls.clear()
-
-        queue = ActionQueue(sm, sleep=poll_sleep, now_ms=lambda: clock["ms"], transfer_poll_s=2.0)
+        queue = ActionQueue(sm)
         runner = asyncio.ensure_future(queue.run(poll_interval_s=0.001))
         queue.submit((_intent(2),))
-        assert await _until(lambda: "tr-1" in queue.recovering_transfers())
-        assert queue.inflight_models() == {"7b", "8b"}
-        # A conflicting re-plannable action on either model is not dispatched meanwhile.
-        dropped = queue.submit((ScaleAction("8b", 1, "low_fairness_idle_capacity", "fairness"),))
-        assert dropped.dropped == (("8b", "inflight"),)
-        for _ in range(3):  # three lookups still list it: the gate stays closed
-            polls.set()
-            await asyncio.sleep(0.005)
-            assert "tr-1" in queue.recovering_transfers()
-        clock["ms"] = 9_000
-        polls.set()  # the fourth lookup no longer lists it
-        assert await _until(lambda: queue.recovering_transfers() == {})
+        assert await _until(lambda: _calls(sm) == [("7b->8b", "transfer", 2)])
+        assert queue.inflight_models() == {"7b", "8b"}  # held only while the call runs
+        sm.gates["transfer:7b->8b"].set()
         assert await _until(lambda: queue.inflight_models() == set())
         runner.cancel()
         await asyncio.gather(runner, return_exceptions=True)
         return queue
 
     queue = asyncio.run(scenario())
-    assert [e for e in sm.events if e[0] == "lookup"] == [("lookup", "sm", "get_transfers")] * 4
-    events = queue.drain_events()
-    assert "transfer_left_to_recovery:7b->8b:tr-1:1" in events
-    assert "transfer_recovered:7b->8b:tr-1" in events
-    # The recovery may have changed both counts: stamped when it ended.
-    assert queue.view_changes() == {"7b": (9_000, "down"), "8b": (9_000, "up")}
-    assert queue.stats()["transfer_left_to_recovery_total"] == 1
+    assert _calls(sm) == [("7b->8b", "transfer", 2)]
+    assert not hasattr(queue, "recovering_transfers")
+    assert queue.view_changes().keys() == {"7b", "8b"}
 
 
 def test_transfer_404_degrades_to_not_executed_with_an_error_event(caplog):
@@ -279,17 +258,21 @@ def test_transfer_404_degrades_to_not_executed_with_an_error_event(caplog):
     assert any("transfer_endpoint_missing" in record.getMessage() for record in caplog.records)
 
 
-def test_routable_unknown_and_retry_later_are_accounted_as_not_executed():
+def test_writer_busy_and_routable_unknown_are_accounted_as_not_executed():
     routable_unknown = ServiceManagerError(
         "HTTP 409", status=409, body={"error": "routable_unknown", "reason": "routable_unknown", "detail": "x"}
     ).result()
-    retry_later = ServiceManagerError(
-        "HTTP 409", status=409, body={"detail": "model target of 8b: wake of ['8b-1'] in progress; retry"}
+    # Plan B: requests queue on the SM writer lock; a lock wait that timed out is
+    # 409 writer_busy - nothing done, retriable (the next tick re-plans).
+    writer_busy = ServiceManagerError(
+        "HTTP 409", status=409, body={"error": "writer_busy", "detail": "writer lock wait timed out"}
     ).result()
-    assert routable_unknown["not_executed"] and retry_later["not_executed"]
+    assert routable_unknown["not_executed"] and writer_busy["not_executed"] and writer_busy["retriable"]
+    # A plain RetryLater 409 (other endpoints) is still classified as not executed.
+    assert ServiceManagerError("HTTP 409", status=409, body={"detail": "a wake of it is in progress; retry"}).not_executed
     sm = ScriptedSM(results={
-        "transfer:7b->8b": [dict(routable_unknown, retriable=False)],
-        "scale:8b": [retry_later],
+        "transfer:7b->8b": [dict(routable_unknown, retriable=False), dict(writer_busy, retriable=False)],
+        "scale:8b": [writer_busy],
         "scale:7b": [routable_unknown],
     })
     queue = ActionQueue(sm)
@@ -303,6 +286,8 @@ def test_routable_unknown_and_retry_later_are_accounted_as_not_executed():
     # Nothing was executed: only the unrelated 9b scale-up is stamped; nothing cools down.
     assert set(queue.view_changes()) == {"9b"} and set(queue.last_actions()) == {"9b"}
     assert queue.submit((_intent(1),)).accepted == 1
+    results = asyncio.run(queue.drain_once())  # the relay again: writer_busy this time
+    assert all(result.not_executed for result in results) and set(queue.view_changes()) == {"9b"}
 
 
 def test_target_scale_down_is_accounted_by_taken():
@@ -351,15 +336,14 @@ class _Transport:
         return answer
 
 
-def test_sm_client_transfer_and_get_transfers():
+def test_sm_client_transfer():
     body = transfer_body(1)
-    transport = _Transport({("POST", "/v2/transfers"): body,
-                            ("GET", "/v2/transfers"): {"in_progress": {}, "running_here": [], "stats": {}}})
+    transport = _Transport({("POST", "/v2/transfers"): body})
     client = ServiceManagerClient("http://sm", transport=transport)
     assert asyncio.run(client.transfer("7b", "8b", 1)) == {"ok": True, "response": body}
-    assert transport.calls[0] == ("POST", "/v2/transfers",
-                                  {"donor_model": "7b", "receiver_model": "8b", "count": 1, "sleep_path": "urgent"})
-    assert asyncio.run(client.get_transfers())["response"]["in_progress"] == {}
+    assert transport.calls == [("POST", "/v2/transfers",
+                                {"donor_model": "7b", "receiver_model": "8b", "count": 1, "sleep_path": "urgent"})]
+    assert not hasattr(client, "get_transfers")  # plan B: nothing to track after the call
 
     partial = dict(transfer_body(1, statuses=["donor_sleep_failed"], done=0, taken=0), error="partial")
     transport.answers[("POST", "/v2/transfers")] = ServiceManagerError("HTTP 409", status=409, body=partial)

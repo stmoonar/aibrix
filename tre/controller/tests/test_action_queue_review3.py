@@ -79,16 +79,9 @@ class ScriptedSM:
             return {"ok": True, "response": transfer_body(count)}
         return result
 
-    async def get_transfers(self):
-        self.events.append(("lookup", "sm", "get_transfers"))
-        scripted = self.results.get("get_transfers")
-        if scripted:
-            return scripted.pop(0)
-        return {"ok": True, "response": {"in_progress": {}, "running_here": [], "stats": {}}}
-
 
 def transfer_body(count, *, done=None, taken=None, unfilled=0, clamped=False, statuses=None,
-                  refusals=(), skipped=None, transfer_id="tr-1", left_to_recovery=()):
+                  refusals=(), skipped=None, transfer_id="tr-1"):
     """A ``POST /v2/transfers`` response body: ``count`` pairs 7b-i -> 8b-i on n/i."""
     statuses = list(statuses) if statuses is not None else ["done"] * count
     pairs = []
@@ -96,8 +89,6 @@ def transfer_body(count, *, done=None, taken=None, unfilled=0, clamped=False, st
         pair = {"donor": f"7b-{index}", "donors": [f"7b-{index}"], "donor_binding_ids": [f"7b/n/{index}"],
                 "receiver": f"8b-{index}", "receiver_binding_id": f"8b/n/{index}", "node": "n",
                 "gpu_ids": [index], "status": status}
-        if index in left_to_recovery:
-            pair["left_to_recovery"] = True
         pairs.append(pair)
     done = sum(1 for status in statuses if status == "done") if done is None else done
     taken = sum(1 for status in statuses if status != "donor_sleep_failed") if taken is None else taken

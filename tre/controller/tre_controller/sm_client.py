@@ -123,9 +123,10 @@ class ServiceManagerError(Exception):
         """The SM refused the call BEFORE changing anything (2026-10-02): a 400 / 404, a
         503 while shutting down, or a 409 whose code says it was refused up front
         (``routable_unknown``, ``floor_violation``, ``writer_busy``, a located wake
-        refusal other than ``wake_failed``) or a plain ``RetryLater`` 409 (``...; retry``,
-        e.g. a ``/target`` of a model whose transfer receiver is still waking). The
-        controller then records no change (no view-pending / O1 stamp, no last action)."""
+        refusal other than ``wake_failed``) or a plain ``RetryLater`` 409 (``...; retry``;
+        ``/target`` and ``/v2/transfers`` no longer send it - concurrent requests queue on
+        the SM writer lock). The controller then records no change (no view-pending / O1
+        stamp, no last action) and re-plans on the next tick."""
         if self.status in (400, 404, 503):
             return True
         if self.status != 409:
@@ -269,7 +270,10 @@ class ServiceManagerClient:
         """``POST /v2/transfers`` (2026-10-02, design 20261002-controller-transfer): the
         service-manager hands ``count`` donor replicas' GPUs to the receiver model -
         it picks the pairs (same GPUs, TP coverage), sleeps the donors and wakes the
-        receivers in one request. Never retried (not idempotent; the planner re-plans).
+        receivers in one request under its global writer lock: when the call returns,
+        the relay has completed or failed (no follow-up tracking). Never retried (not
+        idempotent; the planner re-plans). A writer-lock wait that timed out is a 409
+        ``writer_busy`` (``not_executed``).
 
         Returns ``{"ok": True, "response": body}`` on 200 (which may still be a
         PARTIAL transfer - account by ``done`` / ``taken`` / ``unfilled``, never by
@@ -301,14 +305,6 @@ class ServiceManagerClient:
                 result["partial"] = True
                 result["response"] = body
             return result
-
-    async def get_transfers(self) -> dict:
-        """``GET /v2/transfers``: ``{"in_progress": {transfer_id: entry}, "running_here":
-        [...], "stats": {...}}`` wrapped as ``{"ok": True, "response": ...}``."""
-        try:
-            return {"ok": True, "response": await self._request("GET", "/v2/transfers")}
-        except ServiceManagerError as exc:
-            return exc.result()
 
     async def model_awake(self, model: str) -> dict:
         """{"ok": True, "awake": n} from the SM state, or a failed result."""
