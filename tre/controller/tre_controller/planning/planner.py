@@ -613,6 +613,12 @@ def build_plan(
                         # 3-replica donor may still give one more). Its binding is marked
                         # taken so no later action of this tick sleeps / hides the same pod.
                         deltas[same_slot_shrink.donor] = deltas.get(same_slot_shrink.donor, 0) - 1
+                        # Ledger (2026-10-02): the tick commits this probe with exactly
+                        # {beneficiary: 1} (_safescale_pending_upscales). Record it, or the
+                        # fairness piggyback sees unclaimed == 1 and promises the same
+                        # shrink to a LOW receiver whose upscale the tick then drops.
+                        pending = probe_upscale_plans.setdefault(same_slot_shrink.donor, {})
+                        pending[same_slot_shrink.beneficiary] = pending.get(same_slot_shrink.beneficiary, 0) + 1
                         if occupancy is not None:
                             occupancy.take_donor(same_slot_shrink.serve_id)
                         events.append(
