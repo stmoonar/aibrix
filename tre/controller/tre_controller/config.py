@@ -88,10 +88,18 @@ class SafeScaleConfig:
     # donor_min_requests requests were seen. Needs TRE_GATEWAY_STATS_URL (else fail-open).
     donor_error_rate_max: float = 0.01
     donor_min_requests: float = 20.0
-    # A13 rollback backoff: after a probe of a model rolls back, no receiver-less HIGH
-    # proactive probe of that model for this long (v1 had no cooldown for demand-driven
-    # donor releases, so those are not held). 0 disables.
+    # A13 rollback backoff - DEPRECATED, ignored since the timer cleanup (2026-10-02):
+    # TRE_SAFESCALE_ROLLBACK_BACKOFF_MS still parses (an old overlay keeps starting) and
+    # a set value is logged as ignored. The next receiver-less HIGH probe of a model
+    # whose probe rolled back now waits for evidence instead (rollback_retry_z_margin).
     rollback_backoff_ms: float = 60_000.0
+    # Timer cleanup (registry safescale.rollback_retry_z_margin): after a capacity
+    # rollback (SLO violation, formal commit gate, donor health) the next receiver-less
+    # HIGH probe of the model needs a metrics window ending after the rollback AND either
+    # a routable count different from the one the failed probe started from or a Z at
+    # least this much above the Z that started it. Other rollbacks (evidence gaps,
+    # maintenance, observe mode, hide failures) need the new window only.
+    rollback_retry_z_margin: float = 0.25
     # B8: max age (ms) of a probe's commit evidence at the commit's FIRST dispatch. A commit
     # decided (probe marked ``committing``) longer ago than this - held in observe mode,
     # queued behind a long action, or re-submitted after a controller restart - is not run
@@ -290,7 +298,8 @@ class ControllerConfig:
             kv_cache_max=_get_positive_float(values, "SAFE_SCALE_KV_CACHE_MAX", 0.8),
             donor_error_rate_max=_get_positive_float(values, "TRE_SAFESCALE_DONOR_ERROR_RATE_MAX", 0.01),
             donor_min_requests=_get_positive_float(values, "TRE_SAFESCALE_DONOR_MIN_REQUESTS", 20.0),
-            rollback_backoff_ms=_get_nonneg_float(values, "TRE_SAFESCALE_ROLLBACK_BACKOFF_MS", 60_000.0),
+            rollback_backoff_ms=_deprecated_rollback_backoff_ms(values),
+            rollback_retry_z_margin=float(safescale_registry.rollback_retry_z_margin),
             commit_max_age_ms=_get_nonneg_float(
                 values, "TRE_SAFESCALE_COMMIT_MAX_AGE_MS", SafeScaleConfig.commit_max_age_ms
             ),
@@ -469,6 +478,20 @@ def _safescale_window_floor_ms(values: Mapping[str, str]) -> float:
         )
         return floor
     return SafeScaleConfig.min_window_ms
+
+
+def _deprecated_rollback_backoff_ms(values) -> float:
+    """TRE_SAFESCALE_ROLLBACK_BACKOFF_MS: still parsed (an invalid value still refuses
+    the start, as before) but ignored since the timer cleanup (2026-10-02) - the
+    rollback retry is gated by evidence (registry safescale.rollback_retry_z_margin)."""
+    value = _get_nonneg_float(values, "TRE_SAFESCALE_ROLLBACK_BACKOFF_MS", 60_000.0)
+    if "TRE_SAFESCALE_ROLLBACK_BACKOFF_MS" in values:
+        LOG.warning(
+            "TRE_SAFESCALE_ROLLBACK_BACKOFF_MS=%s is deprecated and ignored: a rolled-back probe is "
+            "retried on new evidence (registry safescale.rollback_retry_z_margin)",
+            values.get("TRE_SAFESCALE_ROLLBACK_BACKOFF_MS"),
+        )
+    return value
 
 
 def _safescale_registry(registry_path: str) -> SafeScaleRegistryConfig:

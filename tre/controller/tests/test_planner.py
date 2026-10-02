@@ -741,8 +741,14 @@ def test_high_proactive_probe_is_held_during_rollback_backoff() -> None:
 
     assert ("hot", "high_proactive_safescale") in reasons(free)
     assert ("hot", "high_proactive_safescale") not in reasons(held)
-    assert "safescale_rollback_backoff:hot" in held.events
+    assert "safescale_rollback_hold:hot:evidence" in held.events
     assert reasons(held) == reasons(free) - {("hot", "high_proactive_safescale")}
+    # The tick passes the hold reason through.
+    reasoned = build_plan(
+        model_contexts=contexts, classifications=classifications, model_replicas=replicas, idle_gpus=0,
+        cfg=cfg, probe_backoff_models={"hot": "same_evidence"},
+    )
+    assert "safescale_rollback_hold:hot:same_evidence" in reasoned.events
 
 
 
@@ -794,8 +800,8 @@ def test_rollback_backoff_event_only_for_models_that_would_be_probed() -> None:
             probe_backoff_models={"hot"},
         ).events
 
-    assert "safescale_rollback_backoff:hot" not in events(1)
-    assert "safescale_rollback_backoff:hot" in events(3)
+    assert "safescale_rollback_hold:hot:evidence" not in events(1)
+    assert "safescale_rollback_hold:hot:evidence" in events(3)
 
 
 def test_tp_aware_critical_receiver_plans_no_defrag_while_disabled() -> None:

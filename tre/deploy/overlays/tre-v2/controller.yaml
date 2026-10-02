@@ -148,8 +148,10 @@ spec:
               value: "0.01"
             - name: TRE_SAFESCALE_DONOR_MIN_REQUESTS
               value: "20"
-            # A13: no receiver-less HIGH proactive probe of a model for 60 s after one of
-            # its probes rolled back (stops hide/unhide flapping).
+            # ROLLBACK COMPAT - keep at 60000. The fixed A13 rollback backoff is read ONLY
+            # by controller images before the timer cleanup (2026-10-02); newer images log
+            # it as deprecated and ignore it: a rolled-back model is re-probed on new
+            # evidence instead (registry safescale.rollback_retry_z_margin).
             - name: TRE_SAFESCALE_ROLLBACK_BACKOFF_MS
               value: "60000"
             # --- Ablation switches (D4); production defaults ---

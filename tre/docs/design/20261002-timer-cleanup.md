@@ -101,3 +101,66 @@ receivers.
   dates a change at the window end it is first seen in.
 
 Tests: `controller/tests/test_timer_cleanup_f4_o1_20261002.py`.
+
+## 2. SafeScale rollback backoff -> rollback evidence gate
+
+### Before
+
+A13 (commit 90c18c73, `TRE_SAFESCALE_ROLLBACK_BACKOFF_MS` = 60000): after a probe
+of a model rolled back (any reason except a preemption for the model's own
+scale-up), no receiver-less HIGH proactive probe of that model for 60 s. Purpose:
+stop hide / unhide flapping. Demand-driven releases were never held.
+
+### Why a fixed time is the wrong measure
+
+A rollback says "with the load seen at the probe's start, the model could not
+spare these pods". Sixty seconds later the same load gives the same answer, so
+under steady load the probe repeated every 60 s + W; after a real load drop the
+model still waited the full 60 s.
+
+### Gate
+
+At the rollback the state machine keeps `RollbackEvidence`: the Z and routable
+count of the planner decision that **started** the probe (`ProbeWindowInputs`,
+stored on the probe as `start_z_m` / `start_routable` and in its record), the
+rollback time and code. The Z observed during the probe is not used: it was
+measured with the probe pods hidden, and the unhide alone raises it again.
+
+The next receiver-less HIGH probe of the model is planned only when
+
+1. a metrics window ends after the rollback (new evidence; hold reason
+   `no_new_window`), and
+2. for a capacity rollback (`slo_violation`, `slo_violation_direct`,
+   `formal_commit_gate_failed`, `donor_health`): the routable count differs from
+   the starting one, or Z >= starting Z + `safescale.rollback_retry_z_margin`
+   (registry, default 0.25 in Z units; hold reason `same_evidence`).
+
+Other rollbacks (evidence gaps, hide failures, SM maintenance, observe mode,
+pods gone) say nothing about capacity and only need step 1. A model without a
+signal this tick is held (`no_signal`). Event: `safescale_rollback_hold:<m>:<reason>`
+(was `safescale_rollback_backoff:<m>`). The evidence is cleared by the model's
+next commit and replaced by its next rollback; a preemption records nothing.
+
+With O1 active the unhide of a rollback is itself a routable-count change, so the
+donor is additionally held until a whole window follows it (O1 donor rule).
+
+### Configuration
+
+* `safescale.rollback_retry_z_margin: 0.25` (registry and its params mirror).
+* `TRE_SAFESCALE_ROLLBACK_BACKOFF_MS` still parses (invalid values still refuse the
+  start) and is logged as deprecated; the overlay keeps `60000` for image rollback
+  (older images read it).
+
+### Risks
+
+* Under steady load a model whose probe failed is not probed again until its
+  Z or replica count changes - by design. Z is not monotonic in load; a model
+  whose load falls to IDLE releases through the idle path, which this gate does
+  not hold (it never held demand-driven or idle releases).
+* A probe restored after a controller restart has no starting Z: the first window
+  after its rollback becomes the reference (one extra window of hold).
+* Repeated non-capacity rollbacks (for example a persistent scrape failure) can
+  now repeat once per new window plus W; each such probe only hides pods (no
+  request is cut) and is visible in the rollback-reason events.
+
+Tests: `controller/tests/test_timer_cleanup_rollback_gate_20261002.py`.

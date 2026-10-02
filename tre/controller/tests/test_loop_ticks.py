@@ -802,7 +802,10 @@ def test_rescue_tick_converts_same_slot_shrink_to_safescale_probe_hide() -> None
 
 
 def test_rescue_tick_holds_high_probe_of_a_model_in_rollback_backoff() -> None:
-    # A13 wiring: run_planner_tick reads the state machine's rollback backoff.
+    # Wiring (timer cleanup 2026-10-02): run_planner_tick hands the decision window's
+    # Z / routable count / window end to the state machine's rollback evidence hold.
+    from dataclasses import replace
+
     registry = _registry_with_models("hot")
     snapshot = MetricsSnapshot(
         ts_ms=100_000,
@@ -817,7 +820,15 @@ def test_rescue_tick_holds_high_probe_of_a_model_in_rollback_backoff() -> None:
 
     held = run_rescue_tick(snapshot, queue=FakeQueue(), registry=registry, safescale=safescale)
     assert not any(isinstance(a, HideAction) for a in held.actions)
-    assert "safescale_rollback_backoff:hot" in held.events
+    # The snapshot window (end 60 s) predates the rollback at 90 s.
+    assert "safescale_rollback_hold:hot:no_new_window" in held.events
+    later = MetricsSnapshot(
+        ts_ms=200_000, stale=False, models={"hot": replace(snapshot.models["hot"], window_start_ms=100_000,
+                                                            window_end_ms=160_000)},
+    )
+    same = run_rescue_tick(later, queue=FakeQueue(), registry=registry, safescale=safescale)
+    assert not any(isinstance(a, HideAction) for a in same.actions)
+    assert "safescale_rollback_hold:hot:same_evidence" in same.events
 
 
 
@@ -890,8 +901,8 @@ def test_scale_up_of_a_probing_model_preempts_its_probe_like_v1() -> None:
     assert queue.submitted == [(UnhideAction("critical", ("critical-1",), "receiver_need_upscale", "safescale"),)]
     assert observed.events[0] == "safescale_receiver_need_upscale:critical"
     assert safescale.active_probe("critical") is None
-    # Preemption is not a failed probe: no rollback backoff.
-    assert safescale.rollback_backoff_models(1_000) == set()
+    # Preemption is not a failed probe: no rollback evidence hold.
+    assert safescale.rollback_evidence() == {}
 
 
 

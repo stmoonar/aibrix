@@ -150,6 +150,7 @@ def test_tre_v2_overlay_declares_components_and_independent_redis() -> None:
     assert _env(controller)["TRE_GATEWAY_ROUTE_NAMESPACE"] == _env(sm)["TRE_ROUTE_NAMESPACE"] == "tre-v2"
     assert _env(controller)["TRE_SAFESCALE_DONOR_ERROR_RATE_MAX"] == "0.01"
     assert _env(controller)["TRE_SAFESCALE_DONOR_MIN_REQUESTS"] == "20"
+    # Rollback compat only (ignored by images since the timer cleanup 2026-10-02).
     assert _env(controller)["TRE_SAFESCALE_ROLLBACK_BACKOFF_MS"] == "60000"
     stats = _load_yaml(overlay / "gateway-stats.yaml")
     assert (stats["kind"], stats["metadata"]["name"], stats["metadata"]["namespace"]) == (

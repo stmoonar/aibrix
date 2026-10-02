@@ -5,7 +5,7 @@ import logging
 import math
 import time
 from dataclasses import dataclass, field, replace
-from typing import Any, Callable, Collection, Literal, Protocol
+from typing import Any, Callable, Collection, Literal, Mapping, Protocol
 
 from tre_controller.config import SafeScaleConfig
 from tre_controller.planning.safescale_direct import (
@@ -170,6 +170,34 @@ class SafeScaleProbe:
     #: Direct evidence path (``safescale.evidence_source: direct``): baseline, drops,
     #: scrape log, fallback (planning.safescale_direct). None = not started / redis.
     direct: DirectState | None = None
+    #: Timer cleanup (2026-10-02): the decision state that started the probe - the
+    #: donor's Z and routable count of the planner tick (``ProbeWindowInputs``). A
+    #: capacity rollback keeps them as the evidence a retry must beat. None = unknown.
+    start_z_m: float | None = None
+    start_routable: int | None = None
+
+
+#: Rollback codes that say the model could not spare the probe pods (the retry needs
+#: new evidence: another routable count or a clearly higher Z). Every other rollback
+#: (evidence gaps, hide failures, maintenance, observe mode, pods gone) says nothing
+#: about capacity and only needs a metrics window after it.
+CAPACITY_ROLLBACK_CODES = frozenset(
+    {"slo_violation", "slo_violation_direct", "formal_commit_gate_failed", "donor_health"}
+)
+
+
+@dataclass(frozen=True)
+class RollbackEvidence:
+    """Timer cleanup (2026-10-02): what a rolled-back probe of a model showed, kept
+    until the model's next probe resolves. Replaces the fixed A13 rollback backoff."""
+
+    rolled_back_ms: int
+    reason: str
+    capacity: bool
+    #: Z / routable count of the decision that started the failed probe (None = unknown;
+    #: an unknown Z is taken from the first window after the rollback).
+    z_m: float | None
+    routable: int | None
 
 
 @dataclass(frozen=True)
@@ -224,11 +252,13 @@ class SafeScaleStateMachine:
         self._direct_mode = str(getattr(config, "evidence_source", SOURCE_REDIS) or SOURCE_REDIS) == SOURCE_DIRECT
         self._wall_clock_ms = wall_clock_ms or (lambda: int(time.time() * 1000))
         self._probes: dict[str, SafeScaleProbe] = {}
-        # A13 rollback backoff: model -> time (ms, snapshot clock) of its last rollback.
-        # Deliberately in-memory only: a controller restart forgets it, i.e. at most one
-        # extra HIGH probe per model right after a restart (the probe itself is still
-        # guarded by SLO / donor-health / commit gate). Not worth a persisted schema.
-        self._last_rollback_ms: dict[str, int] = {}
+        # Timer cleanup (2026-10-02, replaces the A13 60 s rollback backoff): model -> the
+        # evidence of its last rolled-back probe; a receiver-less HIGH probe of the model
+        # waits until the planner's signal beats it (:meth:`rollback_retry_holds`).
+        # In-memory only, like the backoff was: a controller restart forgets it, i.e. at
+        # most one extra HIGH probe per model right after a restart (the probe itself is
+        # still guarded by SLO / donor-health / commit gate).
+        self._rollback_evidence: dict[str, RollbackEvidence] = {}
         #: request_id -> committing-probe recoveries submitted by this process.
         self._recoveries: dict[str, int] = {}
 
@@ -326,13 +356,52 @@ class SafeScaleStateMachine:
             self._persist_probe(probe)
         return True
 
-    def rollback_backoff_models(self, now_ms: int) -> set[str]:
-        """Models whose last probe rolled back less than rollback_backoff_ms ago (A13):
-        the planner holds their receiver-less HIGH proactive probe meanwhile."""
-        backoff = float(getattr(self._config, "rollback_backoff_ms", 0.0) or 0.0)
-        if backoff <= 0:
-            return set()
-        return {model for model, ts in self._last_rollback_ms.items() if 0 <= now_ms - ts < backoff}
+    def rollback_evidence(self) -> dict[str, RollbackEvidence]:
+        """Model -> the evidence of its last rolled-back probe (until its next probe
+        resolves)."""
+        return dict(self._rollback_evidence)
+
+    def rollback_retry_holds(
+        self, signals: Mapping[str, tuple[float | None, int | None, int | None]]
+    ) -> dict[str, str]:
+        """Timer cleanup (2026-10-02): models whose receiver-less HIGH probe stays held
+        after a rollback -> why. ``signals`` = model -> (Z, routable count, window end
+        ms) of the planner tick's decision window. A model is free again once
+
+        * a metrics window ends after the rollback (new evidence; else ``no_new_window``),
+        * and, after a capacity rollback (:data:`CAPACITY_ROLLBACK_CODES`), its routable
+          count differs from the one the failed probe started from, or its Z is at least
+          ``rollback_retry_z_margin`` above the Z that started it (else ``same_evidence``).
+
+        A model without a signal this tick is held (``no_signal``). A capacity rollback
+        whose starting Z is unknown takes the Z of the first window after it."""
+        margin = float(getattr(self._config, "rollback_retry_z_margin", 0.25) or 0.0)
+        holds: dict[str, str] = {}
+        for model, evidence in list(self._rollback_evidence.items()):
+            z, routable, window_end = signals.get(model, (None, None, None))
+            if window_end is None:
+                holds[model] = "no_signal"
+                continue
+            if int(window_end) <= int(evidence.rolled_back_ms):
+                holds[model] = "no_new_window"
+                continue
+            if not evidence.capacity:
+                continue
+            if routable is not None and evidence.routable is not None and int(routable) != int(evidence.routable):
+                continue
+            if z is None:
+                holds[model] = "same_evidence"
+                continue
+            if evidence.z_m is None:
+                # The starting Z is unknown (e.g. a probe restored after a restart): the
+                # first window after the rollback becomes the reference.
+                self._rollback_evidence[model] = replace(evidence, z_m=float(z))
+                holds[model] = "same_evidence"
+                continue
+            if float(z) >= float(evidence.z_m) + margin:
+                continue
+            holds[model] = "same_evidence"
+        return holds
 
     def start_probe(
         self,
@@ -354,6 +423,7 @@ class SafeScaleStateMachine:
             window_inputs or ProbeWindowInputs(), hidden_count=len(pods), config=self._config
         )
         window_ms = float(terms["W"])
+        inputs = window_inputs or ProbeWindowInputs()
         probe = SafeScaleProbe(
             model=model,
             pods=tuple(pods),
@@ -364,6 +434,8 @@ class SafeScaleStateMachine:
             window_ms=window_ms,
             window_terms=terms,
             start_wall_ms=self._wall_ms(),
+            start_z_m=_optional_float(inputs.z_m),
+            start_routable=_optional_int(inputs.routable_pods),
         )
         self._probes[model] = probe
         self._persist_probe(probe)
@@ -1443,9 +1515,19 @@ class SafeScaleStateMachine:
             resolved_ts=float(now_ms) / 1000.0,
         )
         self._probes.pop(model, None)
-        # A preemption for the model's own scale-up is not a failed probe: no backoff.
+        # A preemption for the model's own scale-up is not a failed probe: no evidence
+        # hold. A commit clears the previous rollback's evidence.
         if status == "rollback" and probe.preempt_reason is None:
-            self._last_rollback_ms[model] = int(now_ms)
+            code = _rollback_code(probe, reason)
+            self._rollback_evidence[model] = RollbackEvidence(
+                rolled_back_ms=int(now_ms),
+                reason=code,
+                capacity=code in CAPACITY_ROLLBACK_CODES,
+                z_m=probe.start_z_m,
+                routable=probe.start_routable,
+            )
+        elif status == "commit":
+            self._rollback_evidence.pop(model, None)
         return True
 
     def _persist_probe(self, probe: SafeScaleProbe, *, terminal_reason: str | None = None) -> None:
@@ -1613,6 +1695,16 @@ def _latency_violations(ttft_p95_ms: float | None, tpot_p95_ms: float | None, th
     if tpot_p95_ms is not None and tpot_p95_ms > thresholds["tpot_ms"]:
         violations.append("tpot")
     return violations
+
+
+def _rollback_code(probe: SafeScaleProbe, reason: str) -> str:
+    """The structured rollback code of a resolved probe (its terminal details), else the
+    decision reason recorded when it was handed to the queue, else ``reason``."""
+    details = probe.terminal_details or {}
+    rollback = details.get("rollback_reason") if isinstance(details, dict) else None
+    if isinstance(rollback, dict) and rollback.get("code"):
+        return str(rollback["code"])
+    return str(probe.resolution_reason or reason or "")
 
 
 def _deadline_cap(probe: SafeScaleProbe, config: SafeScaleConfig) -> int:
@@ -1947,6 +2039,10 @@ def _probe_record(
         record["extensions"] = probe.extensions
     if probe.window_base_ms is not None:
         record["window_base_ms"] = probe.window_base_ms
+    if probe.start_z_m is not None:
+        record["start_z_m"] = probe.start_z_m
+    if probe.start_routable is not None:
+        record["start_routable"] = probe.start_routable
     if probe.direct is not None:
         record["direct_evidence"] = probe.direct.as_record()
     if probe.resolution is not None and status == "committing":
@@ -2023,6 +2119,8 @@ def _probe_from_record(row: dict[str, Any], store: ProbeStore) -> SafeScaleProbe
         extensions=int(_optional_int(row.get("extensions")) or 0),
         window_base_ms=_optional_int(row.get("window_base_ms")),
         direct=DirectState.from_record(row.get("direct_evidence")),
+        start_z_m=_optional_float(row.get("start_z_m")),
+        start_routable=_optional_int(row.get("start_routable")),
         **_committing_fields(row),
     )
 

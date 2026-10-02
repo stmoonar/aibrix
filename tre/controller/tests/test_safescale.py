@@ -424,23 +424,25 @@ def test_commit_gate_records_donor_health_alongside_gate_failures() -> None:
     assert details["donor_health"] == {"requests": 500.0, "errors": 1.0, "error_rate": 0.002}
 
 
-def test_rollback_backoff_window_follows_the_last_rollback() -> None:
+def test_rollback_hold_follows_evidence_not_time() -> None:
+    # Timer cleanup (2026-10-02): no fixed backoff - the configured rollback_backoff_ms is
+    # ignored; a capacity rollback holds until the signal beats the probe's start.
     machine = SafeScaleStateMachine(config=SafeScaleConfig(rollback_backoff_ms=60_000.0))
-    machine.start_probe(model="donor", pods=("pod-a",), now_ms=0)
+    machine.start_probe(model="donor", pods=("pod-a",), now_ms=0,
+                        window_inputs=ProbeWindowInputs(z_m=1.5, routable_pods=3))
     machine.observe("donor", _gw(1_000, 0, 0, ttft_p95_ms=5_000.0), now_ms=1_000)
     machine.resolve("donor", status="rollback", reason="slo_violation", now_ms=1_000)
 
-    assert machine.rollback_backoff_models(1_000) == {"donor"}
-    assert machine.rollback_backoff_models(60_999) == {"donor"}
-    assert machine.rollback_backoff_models(61_000) == set()
-    # A commit does not start a backoff; 0 disables it.
+    assert machine.rollback_retry_holds({"donor": (1.5, 3, 1_000)}) == {"donor": "no_new_window"}
+    # Long after the old 60 s, the same evidence still holds it ...
+    assert machine.rollback_retry_holds({"donor": (1.6, 3, 600_000)}) == {"donor": "same_evidence"}
+    # ... a clearly higher Z (>= start + 0.25) or another routable count frees it at once.
+    assert machine.rollback_retry_holds({"donor": (1.75, 3, 11_000)}) == {}
+    assert machine.rollback_retry_holds({"donor": (1.5, 4, 11_000)}) == {}
+    # A commit does not start a hold.
     machine.start_probe(model="other", pods=("pod-o",), now_ms=0)
     machine.resolve("other", status="commit", reason="formal_commit_gate_passed", now_ms=2_000)
-    assert "other" not in machine.rollback_backoff_models(2_000)
-    off = SafeScaleStateMachine(config=SafeScaleConfig(rollback_backoff_ms=0.0))
-    off.start_probe(model="donor", pods=("pod-a",), now_ms=0)
-    off.resolve("donor", status="rollback", reason="slo_violation", now_ms=1_000)
-    assert off.rollback_backoff_models(1_000) == set()
+    assert "other" not in machine.rollback_evidence()
 
 
 

@@ -239,7 +239,8 @@ def run_planner_tick(
         # S3: GPUs / nodes the SM recently refused a wake on (placement.wake_cooldown).
         unavailable_gpus=_cooled_gpus(queue, registry),
         refusals=_recent_refusals(queue),
-        probe_backoff_models=_probe_backoff_models(safescale, snapshot.ts_ms),
+        # Timer cleanup (2026-10-02): rolled-back probes wait for new evidence (no 60 s backoff).
+        probe_backoff_models=_probe_backoff_models(safescale, snapshot, contexts),
         preemptible_models=_preemptible_models(queue) if rescue_due else None,
         # C1: earlier rescue targets the decision windows do not reflect yet.
         rescue_bases=_rescue_bases(snapshot, queue, registry, contexts) if rescue_due else None,
@@ -544,9 +545,26 @@ def _preemptible_models(queue: PlannerQueue) -> set[str]:
     return set(preemptible()) if callable(preemptible) else set()
 
 
-def _probe_backoff_models(safescale: SafeScaleController | None, now_ms: int) -> set[str]:
-    backoff = getattr(safescale, "rollback_backoff_models", None)
-    return set(backoff(now_ms)) if callable(backoff) else set()
+def _probe_backoff_models(
+    safescale: SafeScaleController | None, snapshot: MetricsSnapshot, contexts: dict[str, dict]
+) -> dict[str, str]:
+    """Models whose receiver-less HIGH probe is held after a rollback -> why
+    (``SafeScaleStateMachine.rollback_retry_holds``, timer cleanup 2026-10-02): the
+    decision window's Z, routable count and window end are the evidence a retry needs."""
+    holds = getattr(safescale, "rollback_retry_holds", None)
+    if not callable(holds):
+        return {}
+    signals = {}
+    for model, metrics in snapshot.models.items():
+        context = contexts.get(model) or {}
+        z = context.get("z_m")
+        routable = context.get("routable_pods")
+        signals[model] = (
+            float(z) if z is not None else None,
+            int(routable) if routable is not None else None,
+            int(metrics.window_end_ms),
+        )
+    return dict(holds(signals))
 
 
 def _cooled_gpus(queue: PlannerQueue, registry: Registry) -> set[tuple[str, int]]:

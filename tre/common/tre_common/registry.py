@@ -725,11 +725,18 @@ class SafeScaleRegistryConfig:
     #: Direct path: the port of a model pod serving ``GET /metrics`` (the pod's serving
     #: port; with the reissue sidecar the sidecar forwards it to vLLM).
     metrics_port: int = POD_SERVING_PORT
+    #: Timer cleanup (2026-10-02): after a probe of a model rolled back for capacity
+    #: (SLO violation, formal commit gate, donor health), its next receiver-less HIGH
+    #: probe needs new evidence: the model's routable count differs from the one the
+    #: failed probe started from, or its Z is at least this much (absolute, Z units)
+    #: above the Z that started it. Replaces the fixed 60 s rollback backoff.
+    rollback_retry_z_margin: float = 0.25
 
 
 SAFESCALE_KEYS = frozenset({
     "slo_mode", "window_ceiling_s", "min_commit_samples", "evidence_clock_tolerance_s",
     "evidence_source", "evidence_poll_s", "scrape_timeout_s", "metrics_port", "baseline_delay_ms",
+    "rollback_retry_z_margin",
 })
 SAFESCALE_EVIDENCE_SOURCES = ("direct", "redis")
 
@@ -801,6 +808,9 @@ def parse_safescale_config(raw: dict[str, Any] | None) -> SafeScaleRegistryConfi
     samples = defaults.min_commit_samples if samples_raw is None else samples_raw
     if isinstance(samples, bool) or float(samples) != int(float(samples)) or int(float(samples)) < 0:
         raise ValueError(f"safescale.min_commit_samples must be a non-negative integer, got {samples!r}")
+    z_margin = _safescale_num(raw, "rollback_retry_z_margin", defaults.rollback_retry_z_margin)
+    if not math.isfinite(z_margin) or z_margin < 0:
+        raise ValueError(f"safescale.rollback_retry_z_margin must be a non-negative number, got {z_margin!r}")
     return SafeScaleRegistryConfig(
         slo_mode=mode,
         window_ceiling_s=float(ceiling),
@@ -811,6 +821,7 @@ def parse_safescale_config(raw: dict[str, Any] | None) -> SafeScaleRegistryConfi
         scrape_timeout_s=float(scrape_timeout),
         metrics_port=int(float(port)),
         baseline_delay_ms=float(baseline_delay),
+        rollback_retry_z_margin=float(z_margin),
     )
 
 

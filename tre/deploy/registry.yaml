@@ -620,6 +620,15 @@ safescale:
   # Direct path: the model pods' serving port (the reissue sidecar forwards
   # GET /metrics to vLLM).
   metrics_port: 8000
+  # After a probe rolled back for capacity (SLO violation, formal commit gate, donor
+  # health), the model's next receiver-less HIGH probe waits for new evidence instead
+  # of a fixed backoff (timer cleanup, docs/design/20261002-timer-cleanup.md): a
+  # metrics window ending after the rollback AND either a routable count different
+  # from the one the failed probe started from or a Z at least this much (absolute)
+  # above the Z that started it. Other rollbacks (evidence gaps, maintenance, hide
+  # failures) need the new window only. Controller images before 2026-10-02 log this
+  # key as unknown (they use TRE_SAFESCALE_ROLLBACK_BACKOFF_MS).
+  rollback_retry_z_margin: 0.25
 
 # Fast-loop scale-up (controller only; read at start, restart-to-apply; every key
 # optional, the values below are the built-in defaults). C1, design

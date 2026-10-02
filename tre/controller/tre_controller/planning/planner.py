@@ -51,7 +51,8 @@ class PlanConfig:
     # intentionally NOT gated. Default OFF since the v1/paper alignment (A2): the path is
     # v1's paper_high_proactive_shrink (rescue tick, HIGH, replicas > floor, no active
     # probe, not moved by another path this tick -> SafeScale shrink by one step), now
-    # protected by the SafeScale KV-cache / donor-health guards and the rollback backoff.
+    # protected by the SafeScale KV-cache / donor-health guards and the rollback evidence
+    # hold (a rolled-back model is re-probed only on new evidence, timer cleanup 2026-10-02).
     # TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE=1 re-enables the guard.
     suppress_hot_proactive_probe: bool = False
     disable_eta_gate: bool = False
@@ -361,7 +362,7 @@ def build_plan(
     inflight_models: set[str] | None = None,
     cluster_view: ClusterView | None = None,
     cooldowns: Mapping[str, str] | None = None,
-    probe_backoff_models: set[str] | None = None,
+    probe_backoff_models: Mapping[str, str] | set[str] | None = None,
     preemptible_models: set[str] | None = None,
     floor_holds: set[str] | None = None,
     unavailable_gpus: set[tuple[str, int]] | None = None,
@@ -374,9 +375,14 @@ def build_plan(
     # out a retry backoff. A CRITICAL receiver among them is still planned: the
     # queue preempts that retry when the rescue action is submitted.
     preemptible_models = preemptible_models or set()
-    # A13: models whose last SafeScale probe rolled back recently (no new HIGH proactive
-    # probe until TRE_SAFESCALE_ROLLBACK_BACKOFF_MS has passed).
-    probe_backoff_models = probe_backoff_models or set()
+    # Models whose last SafeScale probe rolled back and whose signal does not show new
+    # evidence yet (timer cleanup 2026-10-02, replaces the A13 60 s backoff): model ->
+    # hold reason (a plain set = reason "evidence"). No new HIGH proactive probe.
+    probe_backoff_models = (
+        dict(probe_backoff_models)
+        if isinstance(probe_backoff_models, Mapping)
+        else {model: "evidence" for model in probe_backoff_models or ()}
+    )
     # A local copy (the caller's set is never mutated). A donor taken earlier in this
     # tick is NOT added to it: every take is recorded in ``deltas`` and each donor
     # check subtracts the planned takes from the donor's replicas before comparing
@@ -890,10 +896,12 @@ def build_plan(
             high_min = _serving_floor(cfg, high.model_name, model_contexts, model_replicas)
             if pods <= high_min:
                 continue
-            # A13 backoff, checked (and logged) only for a model that would otherwise be
-            # probed - a model already at its floor stays silent every tick.
+            # Rollback evidence hold, checked (and logged) only for a model that would
+            # otherwise be probed - a model already at its floor stays silent every tick.
             if high.model_name in probe_backoff_models:
-                events.append(f"safescale_rollback_backoff:{high.model_name}")
+                events.append(
+                    f"safescale_rollback_hold:{high.model_name}:{probe_backoff_models[high.model_name]}"
+                )
                 continue
             shrink = min(_scale_step(pods, cfg.scale_step_ratio), pods - high_min)
             if shrink > 0:

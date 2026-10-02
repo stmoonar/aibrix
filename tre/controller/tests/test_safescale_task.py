@@ -287,7 +287,8 @@ def test_observation_tick_feeds_gateway_counters_to_the_donor_health_guard() -> 
         "safescale_rollback_reason:donor:donor_health",
     )
     assert machine.active_probe("donor") is None
-    assert machine.rollback_backoff_models(2_500) == {"donor"}
+    assert machine.rollback_evidence()["donor"].capacity is True
+    assert machine.rollback_evidence()["donor"].reason == "donor_health"
 
 
 
