@@ -46,7 +46,7 @@ class FleetSupervisor:
     recovery, reaping rejected Deployments - only logs and records what it
     would have done. State-consistency passes that change no awake count keep
     running: sleep / wake journal recovery, desired seeding, startup
-    convergence of admitted Pods, orphan ``starting`` lease reaping.
+    convergence of admitted Pods, orphan GPU lease reaping.
 
     Every recovery / housekeeping step is isolated (:meth:`_step`): an error is
     logged and recorded and the pass continues with the next step.
@@ -158,9 +158,9 @@ class FleetSupervisor:
         reap = getattr(service, "reap_rejected_deployments", None)
         if callable(reap):
             self._step("reap_rejected_deployments", (lambda: reap(actuate=False)) if observe else reap)
-        reap_leases = getattr(service, "reap_orphan_starting_leases", None)
+        reap_leases = getattr(service, "reap_orphan_leases", None)
         if callable(reap_leases):
-            self._step("reap_orphan_starting_leases", reap_leases)
+            self._step("reap_orphan_leases", reap_leases)
         # The restart guard runs BEFORE the placeholder reaper: a crash-looping
         # engine that starts again gets its placeholder in the same pass the
         # reaper looks at it (review P2-2).

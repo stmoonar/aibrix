@@ -115,7 +115,7 @@ class GpuLeaseStore:
     * ``starting`` - ``starting_ttl_ms``; 0 (default, S2 2026-09-30) = never
       expires: a Pod admitted at its startup gate holds its GPUs until it has
       converged (the lease becomes ``awake`` or is released) or its Pod is gone
-      (``ServiceManagerV2.reap_orphan_starting_leases``). A cold vLLM load often
+      (``ServiceManagerV2.reap_orphan_leases``). A cold vLLM load often
       takes longer than any fixed TTL; an expired starting lease let a wake of a
       resident on the same GPU through while the new Pod was still loading.
     """

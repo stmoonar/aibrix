@@ -56,8 +56,8 @@ class ObserveAwareService(FakeService):
     def ensure_desired_seeded(self):
         self.calls.append(("ensure_desired_seeded",))
 
-    def reap_orphan_starting_leases(self):
-        self.calls.append(("reap_orphan_starting_leases",))
+    def reap_orphan_leases(self):
+        self.calls.append(("reap_orphan_leases",))
         return []
 
     def reap_rejected_deployments(self, *, actuate=True):
@@ -92,7 +92,7 @@ def test_supervisor_in_observe_records_a_fleet_repair_instead_of_starting_it():
     assert service.suppressed == [("fleet_repair", {"drift": drift})]
     # consistency passes ran every pass; the capacity-changing ones as dry runs
     names = [call[0] for call in service.calls]
-    for name in ("recover_sleep_journal", "ensure_desired_seeded", "reap_orphan_starting_leases"):
+    for name in ("recover_sleep_journal", "ensure_desired_seeded", "reap_orphan_leases"):
         assert names.count(name) == 3
     assert service.converges == 3
     assert ("reap_rejected_deployments", False) in service.calls

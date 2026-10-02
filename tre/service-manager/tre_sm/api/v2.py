@@ -1520,6 +1520,7 @@ class ServiceManagerV2:
     def _reconcile_unlocked(self, *, drop_missing: bool = False) -> dict:
         if self._k8s_client is None:
             raise ValueError("k8s_client is required for reconcile")
+        before = {binding.binding_id for binding in self._store.load().bindings}
         prober = self._pod_prober()
         label_writer = None
         if self._runtime_ops is not None and hasattr(self._runtime_ops, "set_pod_routable"):
@@ -1542,11 +1543,19 @@ class ServiceManagerV2:
             },
         )
         self._sync_observed(result.observations)
-        return {
+        response = {
             "version": result.version,
             "warnings": result.warnings,
             "bindings": [self._binding_dict(binding) for binding in result.bindings],
         }
+        if drop_missing and self._gpu_leases is not None:
+            # A binding dropped from the store takes its GPU leases with it (in
+            # this lock hold), unless a Pod of it still exists (2026-10-02: a
+            # dropped binding's awake lease used to block its GPUs forever).
+            dropped = before - {binding.binding_id for binding in result.bindings}
+            if dropped:
+                response["released_leases"] = self._release_orphan_leases(dropped)
+        return response
 
     @serialized_operation("seed_desired")
     def seed_desired(self) -> dict:
@@ -2420,42 +2429,63 @@ class ServiceManagerV2:
         if problem:
             raise RetryLater(f"startup denied for {pod.name}: {problem}")
 
-    def reap_orphan_starting_leases(self) -> list[str]:
-        """Supervisor pass (B11): release every ``starting`` GPU lease whose
-        binding has no Pod object any more. Outside a writer operation a
-        ``starting`` lease belongs to an admitted Pod that has not converged
-        yet (a creator holds the writer lock from before its Deployment exists
-        until its Pod is converged); once that Pod is gone the lease is an
-        orphan - expired or not - that would keep refusing startups on its GPUs
-        (the admission checks do not look at the expiry). Under the writer lock
-        (no start in progress); a busy lock skips the pass."""
+    def reap_orphan_leases(self) -> list[str]:
+        """Supervisor pass: release every GPU lease - ``starting`` (B11) or
+        ``awake`` (2026-10-02) - whose binding has no Pod object any more.
+        Outside a writer operation no write is half-way (whole-lock: a creator
+        holds the lock from before its Deployment exists until its Pod
+        converged), so such a lease is an orphan that would refuse every start
+        and wake on its GPUs forever (409 lease_conflict naming a Pod that is
+        gone): a starting lease of a Pod that died in its gate, an awake lease
+        of a Pod deleted with its Deployment. The Pod list unreadable -> nothing
+        released (fail closed). Under the writer lock (wait 0, re-checked
+        there); a busy lock skips the pass. One event per release:
+        ``orphan_awake_lease_released`` / ``orphan_starting_lease_released``."""
+        if self._gpu_leases is None or not self._gpu_leases.load():
+            return []
+        if not self._orphan_leases():
+            return []
+        with self._writer("reap_orphan_leases", wait_s=0.0):
+            return self._release_orphan_leases()
+
+    def _orphan_leases(self, binding_ids=None) -> list:
+        """Leases (of ``binding_ids``, None = all) whose binding has no live Pod
+        object; [] when the Pod list cannot be read (fail closed)."""
         lister = getattr(self._runtime_ops, "list_live_model_pod_binding_ids", None)
         if self._gpu_leases is None or not callable(lister):
             return []
-        if not any(lease.phase == "starting" for lease in self._gpu_leases.load()):
-            return []
-        if not self._orphan_starting_leases(lister()):
-            return []
-        reaped: list[str] = []
-        with self._writer("reap_orphan_starting_leases", wait_s=0.0):
-            for lease in self._orphan_starting_leases(lister()):
-                model = lease.binding_id.rsplit("/", 2)[0]
-                self._gpu_leases.release(
-                    Binding("orphan-starting-lease", model, Slot(lease.node, tuple(lease.gpu_ids)), awake=False)
-                )
-                LOG.warning(
-                    "released orphan starting GPU lease of %s on %s/%s: no Pod of the binding exists",
-                    lease.binding_id, lease.node, list(lease.gpu_ids),
-                )
-                reaped.append(lease.binding_id)
-        return reaped
-
-    def _orphan_starting_leases(self, live_binding_ids: set[str]) -> list:
-        return [
-            lease
-            for lease in self._gpu_leases.load()
-            if lease.phase == "starting" and lease.binding_id not in live_binding_ids
+        leases = [
+            lease for lease in self._gpu_leases.load()
+            if binding_ids is None or lease.binding_id in binding_ids
         ]
+        if not leases:
+            return []
+        try:
+            live = set(lister())
+        except Exception:  # noqa: BLE001 - unreadable: keep every lease
+            LOG.warning("listing the model Pods failed; no orphan GPU lease released", exc_info=True)
+            return []
+        return [lease for lease in leases if lease.binding_id not in live]
+
+    def _release_orphan_leases(self, binding_ids=None) -> list[str]:
+        """Release the orphan leases (writer lock held); returns their binding ids."""
+        stored = {binding.binding_id for binding in self._store.load().bindings}
+        released: list[str] = []
+        for lease in self._orphan_leases(binding_ids):
+            model = lease.binding_id.split("/", 1)[0]
+            self._gpu_leases.release(
+                Binding("orphan-lease", model, Slot(lease.node, tuple(lease.gpu_ids)), awake=False)
+            )
+            self._note_power_change(lease.node, lease.gpu_ids)
+            _log_event(
+                "orphan_awake_lease_released" if lease.phase == "awake" else f"orphan_{lease.phase}_lease_released",
+                level=logging.WARNING,
+                binding_id=lease.binding_id, node=lease.node, gpu_ids=list(lease.gpu_ids),
+                phase=lease.phase, in_store=lease.binding_id in stored,
+                detail="no Pod object of the binding exists",
+            )
+            released.append(lease.binding_id)
+        return released
 
     def _restore_failed_admission_residents(
         self, pod: StartupPodRecord, slept: list[Binding]

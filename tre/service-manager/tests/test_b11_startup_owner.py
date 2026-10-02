@@ -211,18 +211,18 @@ def test_b11_the_supervisor_releases_a_starting_lease_whose_pod_is_gone():
     _hold(world, "m1/node-a/0", (0,), "awake")
     _hold(world, "m1/node-a/1", (1,), "starting")
 
-    assert world.service.reap_orphan_starting_leases() == ["m1/node-a/1"]
+    assert world.service.reap_orphan_leases() == ["m1/node-a/1"]
 
     assert "m1/node-a/1" not in world.leases.held
-    assert world.leases.held["m1/node-a/0"][1] == "awake"  # awake leases untouched
-    assert world.service.reap_orphan_starting_leases() == []
+    assert world.leases.held["m1/node-a/0"][1] == "awake"  # its Pod exists: kept
+    assert world.service.reap_orphan_leases() == []
 
 
 def test_b11_a_starting_lease_of_a_pod_still_in_the_gate_or_loading_is_kept():
     world = _lease_world(live={"m1/node-a/0", "m1/node-a/1"})
     _hold(world, "m1/node-a/1", (1,), "starting")
 
-    assert world.service.reap_orphan_starting_leases() == []
+    assert world.service.reap_orphan_leases() == []
     assert world.leases.held["m1/node-a/1"][1] == "starting"
 
 
@@ -233,9 +233,9 @@ def test_b11_the_lease_reaper_skips_while_a_writer_holds_the_lock():
 
     with world.coordinator.operation("put_model_target"):
         with pytest.raises(OperationBusy):
-            world.service.reap_orphan_starting_leases()
+            world.service.reap_orphan_leases()
     assert "m1/node-a/1" in world.leases.held
-    assert world.service.reap_orphan_starting_leases() == ["m1/node-a/1"]
+    assert world.service.reap_orphan_leases() == ["m1/node-a/1"]
 
 
 def test_b11_the_lease_reaper_rechecks_the_pods_under_the_lock():
@@ -249,7 +249,7 @@ def test_b11_the_lease_reaper_rechecks_the_pods_under_the_lock():
         return set() if len(calls) == 1 else {"m1/node-a/1"}
 
     world.runtime.list_live_model_pod_binding_ids = lister
-    assert world.service.reap_orphan_starting_leases() == []
+    assert world.service.reap_orphan_leases() == []
     assert "m1/node-a/1" in world.leases.held
 
 
@@ -265,7 +265,7 @@ def test_b11_the_supervisor_runs_the_lease_reaper_and_tolerates_a_busy_writer():
             raise OperationBusy("other-writer:1")
         return []
 
-    service.reap_orphan_starting_leases = reap
+    service.reap_orphan_leases = reap
     supervisor = FleetSupervisor(service, drift_observations_required=1)
     supervisor.run_once()
     supervisor.run_once()
