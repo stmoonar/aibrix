@@ -29,6 +29,7 @@ from tre_controller.loops.tick import _scaling_options, run_planner_tick
 from tre_controller.planning.classify import ModelClassification, ModelRole, ModelState, TauThresholds
 from tre_controller.planning.planner import ClusterView, PlanConfig, ScaleAction, build_plan
 from tre_controller.signals.saturation import (
+    PodSample,
     SaturationRescueConfig,
     SaturationSample,
     SaturationTracker,
@@ -517,19 +518,19 @@ def test_o1_hold_after_a_foreign_breakpoint_never_triggers(before, after):
         assert not any(e.startswith(("saturation_rescue:", "saturation_pending:")) for e in result.events)
 
 
-def test_new_onset_reopens_the_o1_hold_path():
+def test_an_idle_window_reopens_the_o1_hold_path():
     tracker = SaturationTracker()
     full = SaturationSample(waiting=5.0, kv=0.5, pods=1, sample_ms=0, running=10.0)
 
-    def obs(i, reason, *, warm=False, onset=100):
+    def obs(i, reason, *, warm=False, idle=False):
         return tracker.observe("m", window_end_ms=i * GRID, routable=1, reason=reason, sample=full,
-                               tss_warm=warm, onset_ms=onset)
+                               tss_warm=warm, idle=idle)
 
     obs(1, None, warm=True)
     assert obs(2, "o1_hold").reason is None and obs(3, "o1_hold").ticks == 0  # closed
     assert obs(4, "numerator_zero").ticks == 1  # numerator zero stays eligible
-    assert obs(5, "o1_hold", onset=None).ticks == 2  # idle reset / new onset: open again
-    assert obs(6, "o1_hold", onset=60 * GRID).fire
+    assert obs(5, "numerator_zero", idle=True).ticks == 2  # idle window: open again
+    assert obs(6, "o1_hold").fire
 
 
 def test_backlog_on_the_old_pod_does_not_confirm_the_next_step():
@@ -680,3 +681,94 @@ def test_decision_snapshot_exports_the_rescue_state():
         {"pod": "m-0", "waiting": 6.0, "kv": 0.5, "running": 40.0},
         {"pod": "m-1", "waiting": 6.0, "kv": 0.5, "running": 40.0},
     ]
+
+
+# ================================================== review round 3 (2026-10-02)
+
+
+def test_a_step_landing_in_parts_is_the_steps_own():
+    """P2-1: target 4 lands 2 -> 3 -> 4 over two windows: both rises are the step, the
+    added-pods rule and the chain survive (no external reset)."""
+    tracker = SaturationTracker()
+    old = (PodSample("a", 50.0, 0.98, 40.0), PodSample("b", 50.0, 0.98, 40.0))
+    idle_new = PodSample("c", 0.0, 0.1, 3.0)
+
+    def obs(i, routable, pods, reason="o1_hold", warm=False):
+        sample = SaturationSample(waiting=sum(p.waiting for p in pods), kv=0.7, pods=len(pods), sample_ms=0,
+                                  running=sum(p.running for p in pods), per_pod=tuple(pods))
+        return tracker.observe("m", window_end_ms=i * GRID, routable=routable, reason=reason, sample=sample,
+                               tss_warm=warm)
+
+    obs(1, 2, old, reason=None, warm=True)  # warm before the step: only its own chain re-opens o1_hold
+    tracker.note_step("m", window_end_ms=GRID, routable=2, pods=("a", "b"), target=4)
+    first = obs(2, 3, old + (idle_new,))
+    assert first.events == ("saturation_step_landed:m:2->3",)
+    second = obs(3, 4, old + (idle_new, PodSample("d", 0.0, 0.1, 3.0)))
+    assert second.events == ("saturation_step_landed:m:3->4",)  # not saturation_reset_external
+    assert not second.full  # the added pods have room: no sum-based next step
+    # The chain is intact: an O1 hold (caused by the step) stays eligible.
+    assert second.reason == "o1_hold" and obs(4, 4, old + (idle_new,)).reason == "o1_hold"
+    busy = (PodSample("c", 3.0, 0.5, 30.0), PodSample("d", 2.0, 0.5, 30.0))
+    assert obs(5, 4, old + busy).ticks == 1 and obs(6, 4, old + busy).fire
+    # Above the target or down: external.
+    assert obs(7, 6, old + busy).events == ("saturation_reset_external:m:4->6",)
+
+
+def test_step_pods_come_from_the_fleet_view_not_the_fresh_samples():
+    """P2-2: an old pod whose sample was stale at the decision is not an added pod later."""
+    state = _state()
+    queue = _Queue()
+    registry = _registry(max_awake=8)
+    sat = [STARTING] * 3
+
+    def window(i, awake, latest_by_pod=None, stale=()):
+        w = _window(BASE + i * GRID, sat, (8.0, 0.6), awake=awake, latest_by_pod=latest_by_pod)
+        per_pod = {name: (replace(pod, latest_instant_ms=w.window_end_ms - 3 * GRID) if name in stale else pod)
+                   for name, pod in w.per_pod.items()}
+        return replace(w, per_pod=per_pod)
+
+    def tick(i, awake, **kw):
+        return _tick(state, window(i, awake, **kw), awake=awake, queue=queue, registry=registry)
+
+    tick(3, 2, stale=("m-1",))
+    step1 = tick(4, 2, stale=("m-1",))
+    assert _planned(step1) == 2 and step1.model_contexts["m"]["saturation_pods"] == 1  # 2 -> 4
+    tick(5, 4)  # landed
+    # m-1 (old) has room now; the added m-2, m-3 are full themselves -> next step 4 -> 8.
+    pods = {"m-0": (8.0, 0.6), "m-1": (0.0, 0.1), "m-2": (5.0, 0.6), "m-3": (5.0, 0.6)}
+    tick(6, 4, latest_by_pod=pods)
+    assert _planned(tick(7, 4, latest_by_pod=pods)) == 4
+
+
+def test_events_are_reported_once_per_window():
+    state = _state()
+    queue = _Queue()
+    sat = [STARTING] * 3
+    for i in (3, 4, 5):
+        _tick(state, _window(BASE + i * GRID, sat, (8.0, 0.6)), awake=1, queue=queue)
+    first = _tick(state, _window(BASE + 6 * GRID, sat, (8.0, 0.6), awake=2), awake=2, queue=queue)
+    again = _tick(state, _window(BASE + 6 * GRID, sat, (8.0, 0.6), awake=2), awake=2, queue=queue)
+    assert "saturation_step_landed:m:1->2" in first.events
+    assert not any(e.startswith("saturation_step_") for e in again.events)
+
+
+def test_o1_resume_after_a_suspension_does_not_reopen_the_hold_path():
+    """warmup 0 + O1 suspended: no onset is recorded; the O1 resume records one and holds
+    the model for two grids - that is no new traffic period (no idle window), so a warm
+    model stays out of the saturation path."""
+    state = SignalState(
+        warmup_ms=0,
+        breakpoint=BreakpointWindowConfig(enabled=True, onset_guard=False, grid_ms=GRID, min_evidence_grids=2),
+        saturation=SaturationTracker(),
+    )
+    state.suspend_breakpoint_window("gateway_clock")
+    for i in (3, 4, 5):
+        warm = _tick(state, _window(BASE + i * GRID, [WARM] * 3, (0.0, 0.1)), awake=1)
+        assert warm.model_contexts["m"]["signal_warm"] is True
+    state.resume_breakpoint_window()
+    for i in (6, 7):
+        held = _tick(state, _window(BASE + i * GRID, [WARM] * 3, (20.0, 0.95)), awake=1)
+        ctx = held.model_contexts["m"]
+        assert ctx["signal_warm"] is False  # the resume's onset holds it
+        assert ctx["saturation_reason"] is None and ctx["saturation_ticks"] == 0
+        assert not held.classifications["m"].saturation_rescue

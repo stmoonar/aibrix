@@ -503,10 +503,6 @@ class SignalState:
             return window_start_ms >= onset
         return (window_end_ms - onset) >= self._warmup_ms
 
-    def onset_ms(self, model: str) -> int | None:
-        """The model's current traffic onset (None: idle / not seen yet)."""
-        return self._onset_ms.get(model)
-
     # ------------------------------------------------------- O1 breakpoint window
 
     @property

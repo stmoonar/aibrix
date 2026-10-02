@@ -18,17 +18,22 @@ CRITICAL receiver anyway:
     an O1 hold caused by anything else (a C1 scale-up, a donor release, a SafeScale hide
     or unhide) is not eligible until the next idle reset / traffic onset;
 
-  a warm TSS decides alone (TSS / Z / C1 rules unchanged);
+  a warm TSS decides alone (TSS / Z / C1 rules unchanged). The O1-hold path re-opens on
+  an idle window (no token: the same predicate that clears the O1 onset), not on a mere
+  change of the recorded onset (an O1 resume after a suspension records one);
 * **engine full**, from each routable pod's newest gateway sample in the window (not the
   30 s average): ``num_requests_waiting`` summed over the routable pods > 0, or their mean
   KV-cache fill >= ``kv_threshold`` with at least ``kv_min_running`` requests running (a
   single very long prompt can fill the KV cache alone). After a rescue step, the pods that
   step added must be full themselves (vLLM's waiting queue is per pod: a backlog left on
-  the old pods is not a reason for the next step);
+  the old pods is not a reason for the next step). Every added pod must be full - a
+  deliberately conservative rule: one added replica with room means capacity exists;
 * **confirmed** on ``consecutive_ticks`` consecutive metrics windows (counted once per
   distinct window end: the rescue / fairness re-reads of one snapshot never count twice);
 * after a rescue step the count restarts and only windows after the routable count rose
-  above the decision's count count again (bounded doubling 1 -> 2 -> 4). A step that never
+  above the decision's count count again (bounded doubling 1 -> 2 -> 4); a step may land
+  in parts over several windows (2 -> 3 -> 4 for target 4), every rise up to its target is
+  the step's own. A step that never
   lands (refused, observe mode) releases the wait after ``await_timeout_ms``
   (``saturation_step_unconfirmed``); a routable change the tracker did not cause restarts
   the count too.
@@ -210,14 +215,16 @@ class _ModelState:
     await_end: int | None = None
     #: Only windows ending after this count (a routable change was seen on it).
     count_after: int | None = None
-    #: A window of the current traffic period was warm (``warm_onset`` = its onset):
-    #: an O1 hold is then only eligible inside this tracker's own step chain.
+    #: A window of the current traffic period was warm: an O1 hold is then only
+    #: eligible inside this tracker's own step chain (until an idle window).
     warm: bool = False
-    warm_onset: int | None = None
     #: The breakpoint is (or follows) this tracker's own step.
     chain: bool = False
     #: Pods routable when the last landed step was decided (the added pods must be full).
     step_pods: frozenset[str] | None = None
+    #: Target routable count of the last step: rises up to it are the step landing (in
+    #: parts); None once reached (or no step).
+    step_target: int | None = None
 
 
 class SaturationTracker:
@@ -255,36 +262,57 @@ class SaturationTracker:
         reason: str | None,
         sample: SaturationSample | None,
         tss_warm: bool = False,
-        onset_ms: int | None = None,
+        idle: bool = False,
     ) -> SaturationVerdict:
         """The model's verdict for the window ending at ``window_end_ms``; a re-read of
         the same window returns the same verdict without counting again.
 
         ``reason``: :func:`eligibility_reason` of the window; ``tss_warm``: the TSS
-        decides this window (tokens present, not eligible); ``onset_ms``: the model's
-        current traffic onset (a new onset re-opens the O1-hold eligibility)."""
+        decides this window (tokens present, not eligible); ``idle``: the window carried
+        no token (``window_is_idle``: the O1 onset is cleared, the next traffic is a new
+        onset) - re-opens the O1-hold eligibility. Events are reported once, on the first
+        read of a window."""
         state = self._state.setdefault(model, _ModelState())
         end = int(window_end_ms)
         routable = int(routable)
         if state.last_end == end and state.verdict is not None:
-            return state.verdict
+            return replace(state.verdict, events=())  # re-read: the events were reported
         if state.last_end is not None and end < state.last_end:
             # An older window than one already counted: report, never count.
             return SaturationVerdict(model, end, None, sample, False, 0, False)
         state.last_end = end
         cfg = self.config
         events: list[str] = []
-        if state.warm and onset_ms != state.warm_onset:
-            # New traffic period (an idle reset cleared the onset, or a new one began).
+        if idle and state.warm:
+            # Idle window: the O1 onset is cleared, the next traffic is a new period.
             state.warm = False
             state.chain = False
             state.step_pods = None
+            state.step_target = None
         changed = state.last_routable is not None and routable != state.last_routable
-        if state.await_n is not None:
-            if routable > state.await_n:
+        landing = (
+            state.await_n is None
+            and state.step_target is not None
+            and changed
+            and state.last_routable < routable <= state.step_target
+        )
+        if landing:
+            # A later part of the same step (it lands over several windows).
+            events.append(f"saturation_step_landed:{model}:{state.last_routable}->{routable}")
+            state.count_after = end
+            if routable >= state.step_target:
+                state.step_target = None
+        elif state.await_n is not None:
+            target = state.step_target if state.step_target is not None else routable
+            if state.await_n < routable <= target:
                 events.append(f"saturation_step_landed:{model}:{state.await_n}->{routable}")
                 state.count_after = end  # this window's sample may predate the change
                 state.await_n = state.await_end = None
+                if routable >= target:
+                    state.step_target = None
+            elif routable > target:
+                events.append(f"saturation_reset_external:{model}:{state.await_n}->{routable}")
+                self._external(state, end)
             elif routable < state.await_n:
                 events.append(f"saturation_reset_external:{model}:{state.await_n}->{routable}")
                 self._external(state, end)
@@ -293,15 +321,16 @@ class SaturationTracker:
                 state.count_after = end
                 state.await_n = state.await_end = None
                 state.step_pods = None  # nothing landed: the next step is a first step again
+                state.step_target = None
         elif changed:
             events.append(f"saturation_reset_external:{model}:{state.last_routable}->{routable}")
             self._external(state, end)
         state.last_routable = routable
         if tss_warm:
             state.warm = True
-            state.warm_onset = onset_ms
             state.chain = False
             state.step_pods = None
+            state.step_target = None
         effective = reason
         if reason == REASON_O1_HOLD and state.warm and not state.chain:
             effective = None  # the hold comes from a breakpoint the tracker did not cause
@@ -338,13 +367,22 @@ class SaturationTracker:
         state.await_n = state.await_end = None
         state.chain = False
         state.step_pods = None
+        state.step_target = None
 
     def note_step(
-        self, model: str, *, window_end_ms: int, routable: int, pods: Iterable[str] = ()
+        self,
+        model: str,
+        *,
+        window_end_ms: int,
+        routable: int,
+        pods: Iterable[str] = (),
+        target: int | None = None,
     ) -> None:
-        """A rescue scale-up was planned from this window (``pods`` = the routable pods
-        then): restart the count, wait for the routable count to rise above
-        ``routable``, and require the added pods to be full for the next step."""
+        """A rescue scale-up was planned from this window (``pods`` = the model's routable
+        bindings then - every awake, not hidden one, whatever its sample; ``target`` = the
+        planned routable count): restart the count, wait for the routable count to rise
+        above ``routable`` (any rise up to ``target`` is this step landing, possibly in
+        parts), and require the added pods to be full for the next step."""
         state = self._state.setdefault(model, _ModelState())
         state.streak = 0
         state.await_n = int(routable)
@@ -352,6 +390,7 @@ class SaturationTracker:
         state.last_routable = int(routable)
         state.chain = True
         state.step_pods = frozenset(str(pod) for pod in pods)
+        state.step_target = int(target) if target is not None and int(target) > int(routable) else None
         if state.verdict is not None and state.verdict.window_end_ms == int(window_end_ms):
             state.verdict = replace(state.verdict, fire=False, ticks=0, awaiting_step=True)
 

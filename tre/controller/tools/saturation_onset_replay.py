@@ -29,8 +29,8 @@ A5 one decision per window, on the first rescue tick of the window (the controll
 A6 once the simulated model's TSS is warm again and the recorded tick says CRITICAL, the
    C1 hand-off is estimated with ``rescue_desired`` on the recorded Z rescaled to the
    simulated replica count (Z ~ n at fixed load, the C1 assumption);
-A7 the traffic onset (which re-opens the O1-hold path) is approximated by the recorded
-   idle windows (numerator 0 and Q at qmin); after a simulated step the pods it would
+A7 the idle windows (which re-open the O1-hold path) are approximated by the recorded
+   windows with numerator 0 and Q at qmin; after a simulated step the pods it would
    add are not in the recording, so the "added pods full" check never confirms a second
    saturation step there (only the C1 hand-off can add more).
 
@@ -68,7 +68,7 @@ APPROXIMATIONS = (
     "A4 a step lands --wake-s after the tick; capacity always found",
     "A5 one decision per window (first rescue tick of the window)",
     "A6 after the TSS warms again: C1 hand-off estimated from the recorded Z rescaled to the simulated n",
-    "A7 onset ~ recorded idle windows; simulated added pods are not recorded (no 2nd saturation step from them)",
+    "A7 idle ~ recorded numerator 0 and Q at qmin; simulated added pods are not recorded (no 2nd saturation step)",
 )
 
 
@@ -227,7 +227,6 @@ def replay_run(
         landing: tuple[float, int] | None = None
         changes: list[int] = []
         simulated = False
-        onset: int | None = None
         for end_ms in sorted(rescue):
             row = rescue[end_ms]
             state = (row.get("model_states") or {}).get(model)
@@ -264,15 +263,11 @@ def replay_run(
                     reason = REASON_O1_HOLD
             y_total = state.get("y_m")
             idle = y_total is not None and float(y_total) <= 1e-9 and float(state.get("q_ctl") or 0.0) <= 1.0 + 1e-9
-            if idle:
-                onset = None
-            elif onset is None and y_total is not None:
-                onset = end_ms  # A7: the first non-idle window after an idle one
             tss_warm = reason is None and y_total is not None and state.get("signal_source", "zm") == "zm"
             view = layout.routable_prefixes(model, end_ms / 1000.0)
             sample = _sample(_gauge_near(gauges, end_ms / 1000.0), model, view[0] if view else None)
             verdict = tracker.observe(model, window_end_ms=end_ms, routable=n_view, reason=reason, sample=sample,
-                                      tss_warm=tss_warm, onset_ms=onset)
+                                      tss_warm=tss_warm, idle=idle)
             info = {
                 "window_end_s": round(end_ms / 1000.0 - t0, 1),
                 "tick_s": round(tick_ts - t0, 1),
@@ -307,7 +302,7 @@ def replay_run(
                 continue
             target = saturation_target(n_view, config.max_step_factor, cap)
             report.steps.append({**info, "target": target, "path": "saturation"})
-            tracker.note_step(model, window_end_ms=end_ms, routable=n_view,
+            tracker.note_step(model, window_end_ms=end_ms, routable=n_view, target=target,
                               pods=[pod.pod for pod in sample.per_pod] if sample is not None else ())
             landing = (tick_ts + wake_s, target)
             if not simulated:

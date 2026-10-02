@@ -43,7 +43,9 @@ the rescue and fairness loops read every window more than once and never count i
     traffic onset or the routable change of the rescue's own last step. Once a window of
     the current traffic period was warm, an O1 hold caused by anything else - a C1
     scale-up, an immediate donor release, a SafeScale hide or unhide - is not eligible;
-    the path re-opens only after an idle reset / a new traffic onset.
+    the path re-opens only after an idle window (no token: the predicate that clears the
+    O1 onset). An O1 resume after a suspension records an onset without an idle window
+    and does not re-open it.
 
   TSS signal source (`zm`) only. A warm TSS decides alone (TSS / Z / C1 rules).
 * **Engine full**, from each routable pod's **newest gateway instant sample** in the
@@ -65,7 +67,12 @@ the rescue and fairness loops read every window more than once and never count i
   after the one the change was seen on (its sample may predate it). **The pods the step
   added must be full themselves** (their own newest sample: waiting > 0, or KV above the
   threshold with >= 2 running): vLLM's waiting queue is per pod, and a backlog left on the
-  old pod is no reason for the next step. A step whose change never shows (SM refusal,
+  old pod is no reason for the next step. *Every* added pod must be full - deliberately
+  conservative: one added replica with room means capacity exists. The pods before the
+  step are the model's awake, not hidden bindings of the fleet view at the decision (not
+  only those with a fresh sample). A step may land in parts over several windows (target
+  4: 2 -> 3, then 3 -> 4); every rise up to its target is the step's own
+  (`saturation_step_landed` each time), only a fall or a rise above the target is external. A step whose change never shows (SM refusal,
   observe mode) releases the wait after three grids (`saturation_step_unconfirmed`) and the
   next step is a first step again. A routable change the rescue did not cause (donor,
   probe, C1) restarts the count (`saturation_reset_external`).
@@ -148,6 +155,8 @@ protection would only add controller state.
   for a full window not yet confirmed; `saturation_step_landed:<model>:<n>-><m>`,
   `saturation_step_unconfirmed:<model>:n=<n>:waited_ms=<ms>` (refused / observe mode),
   `saturation_reset_external:<model>:<a>-><b>` (a routable change the rescue did not cause).
+  Each event is reported once, on the first read of its window (the re-reads of the
+  rescue / fairness loops do not repeat it).
 * Decision snapshot `model_states.<model>` (present when the feature is on):
   `saturation_rescue`, `saturation_reason`, `saturation_ticks`, `saturation_waiting`,
   `saturation_kv`, `saturation_running`, `saturation_pods`, `saturation_sample_ms`,
@@ -172,7 +181,7 @@ routable pods from `layout.jsonl`. Limits:
   be found, the pods a simulated step adds are not in the recording (so the "added pods
   full" check never confirms a second saturation step there), and once the TSS is warm
   again the C1 hand-off is estimated from the recorded Z rescaled to the simulated n;
-* the traffic onset is approximated by the recorded idle windows;
+* the idle windows are approximated by the recorded windows with numerator 0 and Q at qmin;
 * `E-14b-crit-20261001-143058` was recorded with a build before O1 (onset warmup guard),
   so its "hold" windows are the onset guard's.
 
@@ -208,7 +217,9 @@ windows -> CRITICAL (1 window -> nothing, re-reads do not count); running-only, 
 request filling the KV cache -> stays healthy; O1 hold at the onset + KV >= 0.9 ->
 trigger; warm TSS -> never; O1 holds after a C1 scale-up, a donor release and a SafeScale
 hide on a warm model -> never; a new onset re-opens; bounded doubling 1 -> 2 -> 4 with two
-fresh windows after the change; old-pod backlog with an idle added pod -> no second step;
+fresh windows after the change; a step landing in parts; step pods from the fleet view
+(a stale-sampled old pod is not "added"); events once per window; O1 resume after a
+suspension does not re-open; old-pod backlog with an idle added pod -> no second step;
 capped by `max_awake_replicas`; external routable change restarts the count; observe mode
 -> `saturation_step_unconfirmed`, then counting restarts; probe preemption covers the step
 (restore deduction) and its unhide lands it; free capacity before donors, immediate HIGH

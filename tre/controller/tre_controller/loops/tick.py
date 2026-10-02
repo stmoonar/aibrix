@@ -237,7 +237,7 @@ def run_planner_tick(
         # C1: earlier rescue targets the decision windows do not reflect yet.
         rescue_bases=_rescue_bases(snapshot, queue, registry, contexts) if rescue_due else None,
     )
-    _note_saturation_steps(plan.actions, classifications, contexts, snapshot, signal_state)
+    _note_saturation_steps(plan.actions, classifications, contexts, snapshot, signal_state, cluster_view)
     if _prof_on:
         _plan_ns = time.perf_counter_ns() - _phase_t0
         _phase_t0 = time.perf_counter_ns()
@@ -357,7 +357,7 @@ def _apply_saturation_rescue(
             reason=reason,
             sample=_context_sample(ctx),
             tss_warm=tss_warm,
-            onset_ms=_onset_ms(signal_state, model),
+            idle=bool(tokens and window_is_idle(metrics.prompt_tokens, metrics.generation_tokens)),
         )
         events.extend(verdict.events)
         sample = verdict.sample
@@ -396,24 +396,24 @@ def _context_sample(ctx: dict) -> SaturationSample | None:
     )
 
 
-def _onset_ms(signal_state: SignalState | None, model: str) -> int | None:
-    onset = getattr(signal_state, "onset_ms", None)
-    return onset(model) if callable(onset) else None
-
-
 def _note_saturation_steps(
     actions,
     classifications: list,
     contexts: dict[str, dict],
     snapshot: MetricsSnapshot,
     signal_state: SignalState | None,
+    cluster_view: ClusterView | None = None,
 ) -> None:
     """A planned saturation-rescue scale-up restarts the model's count: the next step
-    needs the condition again on windows after its routable count changed."""
+    needs the condition again on windows after its routable count rose, and the pods it
+    added must be full. The pods before the step are the model's awake, not hidden
+    bindings of the fleet view (the sampled pods without one); the target is the step's
+    rescue target (the routable count plus its planned scale-ups without one)."""
     tracker = getattr(signal_state, "saturation", None)
     if tracker is None:
         return
-    up = {action.model for action in actions if isinstance(action, ScaleAction) and action.delta > 0}
+    ups = [action for action in actions if isinstance(action, ScaleAction) and action.delta > 0]
+    up = {action.model for action in ups}
     for item in classifications:
         if not getattr(item, "saturation_rescue", False) or item.model_name not in up:
             continue
@@ -421,11 +421,24 @@ def _note_saturation_steps(
         if metrics is None:
             continue
         ctx = contexts.get(item.model_name) or {}
+        routable = int(ctx.get("routable_pods") or 0)
+        mine = [action for action in ups if action.model == item.model_name]
+        targets = [int(action.rescue.target) for action in mine if getattr(action, "rescue", None) is not None]
+        target = max(targets) if targets else routable + sum(action.delta for action in mine)
+        if cluster_view is not None:
+            pods = [
+                binding.serve_id
+                for binding in cluster_view.bindings
+                if binding.model == item.model_name and binding.awake and not binding.hidden
+            ]
+        else:
+            pods = [sample["pod"] for sample in ctx.get("saturation_pod_samples") or ()]
         tracker.note_step(
             item.model_name,
             window_end_ms=int(metrics.window_end_ms),
-            routable=int(ctx.get("routable_pods") or 0),
-            pods=[sample["pod"] for sample in ctx.get("saturation_pod_samples") or ()],
+            routable=routable,
+            pods=pods,
+            target=target,
         )
         ctx["saturation_awaiting_step"] = True
 
