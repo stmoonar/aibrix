@@ -107,7 +107,11 @@ class SafeScaleConfig:
     # (gateway count and vLLM running + waiting) and early_commit_min_observe_ms passed
     # since the hide confirmation (min grids x the gateway period). Rollbacks unchanged.
     early_commit: bool = True
-    early_commit_min_observe_ms: float = 10_000.0
+    early_commit_min_observe_ms: float = 20_000.0
+    # Review P2-3: complete post-hide gateway grids the newest snapshot window must hold
+    # (max of safescale.early_commit_min_grids and scaling.min_evidence_grids); the
+    # early commit also waits for max(p95 e2e, W / 2) since the hide confirmation.
+    early_commit_min_grids: int = 2
     # B8: max age (ms) of a probe's commit evidence at the commit's FIRST dispatch. A commit
     # decided (probe marked ``committing``) longer ago than this - held in observe mode,
     # queued behind a long action, or re-submitted after a controller restart - is not run
@@ -187,6 +191,11 @@ class ControllerConfig:
     # (2026-10-02): the D8 band dwell (off since the v1/paper alignment A5) was removed.
     # Still parsed with the old validation (an old overlay keeps starting) and logged.
     dwell_windows: int = 1
+    # Timer cleanup review P3-6 (TRE_VIEW_STALE_PERIODS): a fleet view older than this
+    # many refresh periods (TRE_FAIRNESS_INTERVAL_SECONDS) raises the cluster_view_stale
+    # alert (cluster_view_recovered once fresh again). Alert only: the planner keeps its
+    # holds on missing data. 0 = no alert.
+    view_stale_periods: int = 3
     dwell_states: tuple[str, ...] = ("critical", "low", "high")
     # TRE_GATEWAY_INTERVAL_CHECK: fail (default) | warn | off.
     gateway_interval_check: str = "fail"
@@ -283,6 +292,7 @@ class ControllerConfig:
             raise ValueError("TRE_METRICS_PHASE_OFFSET_MS must be below the gateway period")
 
         safescale_registry = _safescale_registry(registry_path)
+        early_grids = max(int(safescale_registry.early_commit_min_grids), _o1_min_evidence_grids(registry_path))
         safescale = SafeScaleConfig(
             ttft_p95_slo_ms=_get_optional_positive_float(values, "SAFE_SCALE_TTFT_P95_SLO_MS"),
             tpot_p95_slo_ms=_get_optional_positive_float(values, "SAFE_SCALE_TPOT_P95_SLO_MS"),
@@ -309,8 +319,8 @@ class ControllerConfig:
             rollback_backoff_ms=_deprecated_rollback_backoff_ms(values),
             rollback_retry_z_margin=float(safescale_registry.rollback_retry_z_margin),
             early_commit=bool(safescale_registry.early_commit),
-            early_commit_min_observe_ms=float(safescale_registry.early_commit_min_grids)
-            * float(instant_sample_interval_ms),
+            early_commit_min_observe_ms=float(early_grids) * float(instant_sample_interval_ms),
+            early_commit_min_grids=early_grids,
             commit_max_age_ms=_get_nonneg_float(
                 values, "TRE_SAFESCALE_COMMIT_MAX_AGE_MS", SafeScaleConfig.commit_max_age_ms
             ),
@@ -418,6 +428,7 @@ class ControllerConfig:
             metrics_phase_retry_ms=_get_positive_int(values, "TRE_METRICS_PHASE_RETRY_MS", 500),
             metrics_stale_hold_windows=_get_nonneg_int(values, "TRE_METRICS_STALE_HOLD_WINDOWS", 2),
             dwell_windows=_deprecated_dwell_windows(values),
+            view_stale_periods=_get_nonneg_int(values, "TRE_VIEW_STALE_PERIODS", 3),
             dwell_states=dwell_states,
             gateway_interval_check=gateway_interval_check,
             gateway_stats_urls=tuple(
@@ -489,6 +500,15 @@ def _safescale_window_floor_ms(values: Mapping[str, str]) -> float:
         )
         return floor
     return SafeScaleConfig.min_window_ms
+
+
+def _o1_min_evidence_grids(registry_path: str) -> int:
+    """Registry scaling.min_evidence_grids (O1 warm rule; 2 without a readable registry)."""
+    try:
+        scaling = load_registry(registry_path).scaling()
+        return int(getattr(scaling, "min_evidence_grids", 2) or 1)
+    except Exception:  # noqa: BLE001 - the registry load fails loudly elsewhere
+        return 2
 
 
 def _deprecated_dwell_windows(values) -> int:

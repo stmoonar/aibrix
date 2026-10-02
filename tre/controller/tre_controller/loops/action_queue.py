@@ -282,6 +282,11 @@ class ActionQueue:
         #: A change the SM made during that call happened before this stamp, so it
         #: never dates a breakpoint early. In memory only (a restart starts empty).
         self._routable_change: dict[str, tuple[int, int]] = {}
+        #: Timer cleanup review P2-1: model -> (when the last SM call that can change its
+        #: routable count returned, ok or not, "up" / "down" hold rule) for the O1
+        #: view-pending gate. An unhide (probe rollback) holds like "down": a CRITICAL
+        #: receiver passes, LOW receivers and donors wait for a view showing it.
+        self._view_change: dict[str, tuple[int, str]] = {}
         #: C1: model -> its last rescue target (see :meth:`rescue_targets`).
         self._rescue: dict[str, RescueTargetRecord] = {}
         #: C1 review P3: id(queued action) -> the record that part belongs to (a part of
@@ -438,6 +443,11 @@ class ActionQueue:
         returned, the direction it could move it: +1 / -1) - see ``_routable_change``;
         the only breakpoint dating hint."""
         return dict(self._routable_change)
+
+    def view_changes(self) -> dict[str, tuple[int, str]]:
+        """Timer cleanup review P2-1: model -> (when its last routable-changing SM call
+        returned - also a failed or partial one, also an unhide -, hold direction)."""
+        return dict(self._view_change)
 
     def rescue_targets(self) -> dict[str, RescueTargetRecord]:
         """C1: model -> its last rescue target (copies). The planner tick keeps the
@@ -1510,6 +1520,9 @@ class ActionQueue:
             self._routable_change[getattr(action, "model", model)] = (
                 int(self._now_ms()), _routable_direction(action)
             )
+            self._view_change[getattr(action, "model", model)] = (
+                int(self._now_ms()), _view_hold_direction(action)
+            )
         if self._prof is not None:
             self._prof.record(
                 {
@@ -1832,6 +1845,17 @@ def _routable_direction(action) -> int:
     if isinstance(action, ScaleAction):
         return 1 if action.delta > 0 else -1
     return 0
+
+
+def _view_hold_direction(action) -> str:
+    """O1 view-pending hold rule of a routable-changing SM call: a wake / scale-up holds
+    like "up" (no scale-down, no scale-up); a sleep, hide or unhide like "down" (a
+    CRITICAL receiver still scales up, nothing else)."""
+    if isinstance(action, ReceiverTarget):
+        return "up"
+    if isinstance(action, ScaleAction) and action.delta > 0:
+        return "up"
+    return "down"
 
 
 def _action_direction(action) -> str | None:

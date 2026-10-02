@@ -183,7 +183,12 @@ class SafeScaleProbe:
 #: (evidence gaps, hide failures, maintenance, observe mode, pods gone) says nothing
 #: about capacity and only needs a metrics window after it.
 CAPACITY_ROLLBACK_CODES = frozenset(
-    {"slo_violation", "slo_violation_direct", "formal_commit_gate_failed", "donor_health"}
+    {
+        "slo_violation", "slo_violation_direct", "formal_commit_gate_failed", "donor_health",
+        # Review P2-4: traffic in flight and not one request completed within W - the
+        # remaining pods are saturated.
+        "insufficient_evidence:stalled",
+    }
 )
 
 
@@ -1376,14 +1381,27 @@ class SafeScaleStateMachine:
         if window is None or window.coverage_end_ms is None or int(window.end_ms) != int(wall_now_ms):
             return None
         elapsed = int(wall_now_ms) - int(probe.window_base_ms)
-        if elapsed < float(getattr(cfg, "early_commit_min_observe_ms", 0.0) or 0.0):
+        # Review P2-3: never before half of W, one p95 end-to-end latency (the remaining
+        # pods' concurrency needs about one e2e to reach its new steady state) and the
+        # configured post-hide grids.
+        inputs = (probe.window_terms or {}).get("inputs") or {}
+        p95_e2e = _optional_float(inputs.get("p95_e2e_ms")) if isinstance(inputs, dict) else None
+        grids = max(1, int(getattr(cfg, "early_commit_min_grids", 2) or 1))
+        min_elapsed = max(
+            float(getattr(cfg, "early_commit_min_observe_ms", 0.0) or 0.0),
+            0.5 * float(probe.window_ms or 0.0),
+            float(p95_e2e or 0.0),
+        )
+        if elapsed < min_elapsed:
             return None
         min_samples = int(getattr(cfg, "min_commit_samples", 20))
         if not window.p95_available or window.judged_count < max(1, min_samples):
             return None
+        # O1-style warm tail: the newest snapshot window holds ``grids`` complete gateway
+        # grids after the first boundary following the hide.
         post_hide = self._post_hide_start(probe)
         latest = _latest_window_end(probe)
-        if post_hide is None or latest is None or int(latest) < int(post_hide) + _evidence_step_ms(cfg):
+        if post_hide is None or latest is None or int(latest) < int(post_hide) + grids * _evidence_step_ms(cfg):
             return None
         drained = _hidden_drained(probe, poll)
         if drained is None:
@@ -1393,6 +1411,8 @@ class SafeScaleStateMachine:
             early={
                 "deadline_ms": int(window.coverage_end_ms),
                 "elapsed_ms": elapsed,
+                "min_elapsed_ms": int(min_elapsed),
+                "post_hide_grids": grids,
                 "samples": float(window.judged_count),
                 "planned_deadline_ms": int(probe.deadline_ms),
                 **drained,

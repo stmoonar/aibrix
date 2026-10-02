@@ -114,6 +114,12 @@ class ClusterView:
     #: a routable-count change it shows happened at or before it (O1 breakpoint time).
     #: None = a synthetic view (tests / offline), see ``tick.breakpoint_observation``.
     fetched_ms: int | None = field(default=None, compare=False)
+    #: Timer cleanup review P2-2: epoch ms at or AFTER which the SM state of this view was
+    #: produced (a lower bound): the SM's own ``/v2/state`` ``fetched_ms`` clamped into
+    #: [request sent, response received], else the time the request was sent. An action
+    #: that completed at or before it is shown by the view (O1 view-pending gate).
+    #: None = unknown (synthetic views): ``fetched_ms`` is used.
+    state_ms: int | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True)

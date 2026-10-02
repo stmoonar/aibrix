@@ -735,10 +735,12 @@ class SafeScaleRegistryConfig:
     rollback_retry_z_margin: float = 0.25
     #: Timer cleanup (2026-10-02): commit a direct-evidence probe before its deadline
     #: once min_commit_samples requests are judged, every commit gate passes, the hidden
-    #: pods have nothing in flight (gateway count and vLLM running + waiting) and at
-    #: least ``early_commit_min_grids`` gateway grids passed since the hide confirmation.
+    #: pods have nothing in flight (gateway count and vLLM running + waiting), the newest
+    #: snapshot window holds ``early_commit_min_grids`` complete post-hide gateway grids
+    #: (at least scaling.min_evidence_grids, the O1 warm rule) and at least max(those
+    #: grids, p95 e2e, W / 2) passed since the hide confirmation.
     early_commit: bool = True
-    early_commit_min_grids: int = 1
+    early_commit_min_grids: int = 2
 
 
 SAFESCALE_KEYS = frozenset({

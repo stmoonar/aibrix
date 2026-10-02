@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 import time
 from dataclasses import dataclass, replace
 from typing import Awaitable, Callable, Protocol
@@ -8,6 +10,9 @@ from typing import Awaitable, Callable, Protocol
 from tre_common.registry import ClusterTopology
 from tre_controller.planning.planner import ClusterView
 from tre_sm.allocator.slots import Binding, Slot
+
+
+LOG = logging.getLogger("tre_controller.cluster_view")
 
 
 class StateClient(Protocol):
@@ -136,17 +141,37 @@ def _observed_pod_ips(state: dict) -> dict[str, str]:
     return ips
 
 
+def state_time_lower_bound(state: dict, requested_ms: int, fetched_ms: int) -> int:
+    """When the SM state was produced, as a lower bound on the controller clock: the SM's
+    own ``fetched_ms`` (``/v2/state``, when it reports one) clamped into
+    [requested_ms, fetched_ms] - a skewed SM clock can never move it outside the request
+    interval - else ``requested_ms``."""
+    raw = state.get("fetched_ms") if isinstance(state, dict) else None
+    try:
+        value = int(float(raw)) if raw is not None and not isinstance(raw, bool) else None
+    except (TypeError, ValueError, OverflowError):
+        value = None
+    if value is None:
+        return int(requested_ms)
+    return max(int(requested_ms), min(int(fetched_ms), value))
+
+
 async def refresh_cluster_view_once(
     client: StateClient,
     topology: ClusterTopology,
     cluster_view_box: ClusterViewBox,
 ) -> ClusterViewRefreshResult:
     try:
+        # Timer cleanup review P2-2: the request time is a lower bound of the state's time.
+        requested_ms = int(wall_clock_ms())
         state = await client.get_state()
         # O1: stamped after the response arrived - every change the view shows happened
         # at or before this time (an upper bound, so a breakpoint is never dated early).
+        fetched_ms = int(wall_clock_ms())
         cluster_view = replace(
-            cluster_view_from_state(state, topology), fetched_ms=int(wall_clock_ms())
+            cluster_view_from_state(state, topology),
+            fetched_ms=fetched_ms,
+            state_ms=state_time_lower_bound(state, requested_ms, fetched_ms),
         )
     except Exception as exc:  # noqa: BLE001 - cached view is a conservative fallback.
         return ClusterViewRefreshResult(
@@ -158,6 +183,41 @@ async def refresh_cluster_view_once(
     return ClusterViewRefreshResult(cluster_view=cluster_view, refreshed=True)
 
 
+class StaleViewAlert:
+    """Review P3-6: alert (no control change) while the fleet view cannot be refreshed.
+
+    The view's age is measured from its state time (``state_ms``: the SM's own
+    ``fetched_ms`` clamped into the request interval, else the request time; else
+    ``fetched_ms``). Past ``stale_ms`` the event ``cluster_view_stale`` (age, last
+    refresh error) is logged once per stale period; the first fresh view afterwards
+    logs ``cluster_view_recovered``. The planner keeps its holds while stale on purpose:
+    without fresh state it stays conservative (no LOW scale-up, no scale-down of a model
+    with a pending change; CRITICAL receivers still scale up)."""
+
+    def __init__(self, stale_ms: float) -> None:
+        self.stale_ms = float(stale_ms)
+        self.stale = False
+
+    def check(self, view: ClusterView | None, now_ms: int, error: str | None) -> dict | None:
+        if self.stale_ms <= 0:
+            return None
+        stamp = None
+        if view is not None:
+            stamp = view.state_ms if view.state_ms is not None else view.fetched_ms
+        age = None if stamp is None else int(now_ms) - int(stamp)
+        if age is not None and age <= self.stale_ms:
+            if self.stale:
+                self.stale = False
+                return {"event": "cluster_view_recovered", "age_ms": age}
+            return None
+        if age is None and view is None and error is None:
+            return None  # nothing fetched yet and nothing failed: starting up
+        if self.stale:
+            return None
+        self.stale = True
+        return {"event": "cluster_view_stale", "age_ms": age, "last_error": error}
+
+
 async def cluster_view_task(
     client: StateClient,
     topology: ClusterTopology,
@@ -165,7 +225,16 @@ async def cluster_view_task(
     cfg: ClusterViewTaskConfig,
     *,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    clock_ms: Callable[[], int] | None = None,
 ) -> None:
+    alert = StaleViewAlert(
+        float(getattr(cfg, "view_stale_periods", 3) or 0) * float(cfg.fairness_interval_s) * 1000.0
+    )
+    clock = clock_ms or wall_clock_ms
     while True:
-        await refresh_cluster_view_once(client, topology, cluster_view_box)
+        result = await refresh_cluster_view_once(client, topology, cluster_view_box)
+        event = alert.check(result.cluster_view, clock(), result.error)
+        if event is not None:
+            log = LOG.warning if event["event"] == "cluster_view_stale" else LOG.info
+            log(json.dumps(event, sort_keys=True))
         await sleep(cfg.fairness_interval_s)

@@ -227,7 +227,9 @@ def run_planner_tick(
         # F4 cooldown: only for models O1 does not track this tick (O1 off / suspended,
         # no fleet view, stale-held context, hold fallback) - timer cleanup 2026-10-02.
         cooldowns=_action_cooldowns(snapshot, queue, contexts) if action_cooldown else None,
-        # O1 evidence gate: the fleet view predates the model's last action.
+        # O1 evidence gate: the fleet view predates the model's last action. A view that
+        # stops refreshing keeps holding (conservative on missing data, review P3-6;
+        # cluster_view_task raises the cluster_view_stale alert).
         view_pending=_o1_view_pending(queue, contexts, cluster_view),
         # P2-6: independent of TRE_ACTION_COOLDOWN (its own switch is the tick count).
         floor_holds=_floor_held_models(queue),
@@ -294,7 +296,10 @@ def run_planner_tick(
     return LoopTickResult(
         submitted=len(actions),
         actions=actions,
-        events=paper_events + tuple(saturation_events) + tuple(plan.events) + safescale_events + queue_events,
+        events=(
+            paper_events + tuple(saturation_events) + tuple(plan.events)
+            + safescale_events + queue_events
+        ),
         model_contexts=contexts,
         classifications={item.model_name: item for item in classifications},
     )
@@ -627,18 +632,33 @@ def _action_cooldowns(
 def _o1_view_pending(
     queue: PlannerQueue, contexts: dict[str, dict] | None, cluster_view: ClusterView | None
 ) -> dict[str, str]:
-    """O1 evidence gate (timer cleanup 2026-10-02): models O1 tracks whose last executed
-    action completed after the fleet view of this tick was fetched -> its direction.
-    That view cannot show the routable change yet, so no breakpoint holds the model;
-    it is held (same direction rules as F4) until a view fetched after the action
-    exists. A view without a fetch time (synthetic / offline) holds nothing."""
-    fetched = getattr(cluster_view, "fetched_ms", None)
-    last_actions = getattr(queue, "last_actions", None)
-    if fetched is None or not callable(last_actions):
+    """O1 evidence gate (timer cleanup 2026-10-02): models O1 tracks whose last
+    routable-changing SM call returned after the SM state of this tick's fleet view was
+    produced -> hold direction. That view cannot show the change yet, so no breakpoint
+    holds the model; it is held (F4 direction rules) until a newer view exists.
+
+    Sources (review P2-1): ``ActionQueue.view_changes`` - every routable-changing call,
+    failed / partial ones and probe unhides included (an unhide holds like "down") -
+    and ``last_actions``; the later one per model decides. The view's time is its lower
+    bound ``state_ms`` (review P2-2; ``fetched_ms`` for a view without one). A view
+    without either (synthetic / offline) holds nothing."""
+    bound = getattr(cluster_view, "state_ms", None)
+    if bound is None:
+        bound = getattr(cluster_view, "fetched_ms", None)
+    if bound is None:
         return {}
+    latest: dict[str, tuple[int, str]] = {}
+    for source in ("view_changes", "last_actions"):
+        read = getattr(queue, source, None)
+        if not callable(read):
+            continue
+        for model, (done_ms, direction) in read().items():
+            current = latest.get(model)
+            if current is None or int(done_ms) > current[0]:
+                latest[model] = (int(done_ms), str(direction))
     pending: dict[str, str] = {}
-    for model, (done_ms, direction) in last_actions().items():
-        if _o1_tracks((contexts or {}).get(model)) and int(done_ms) > int(fetched):
+    for model, (done_ms, direction) in latest.items():
+        if _o1_tracks((contexts or {}).get(model)) and done_ms > int(bound):
             pending[model] = direction
     return pending
 

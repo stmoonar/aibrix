@@ -187,7 +187,7 @@ poll:
 | (a) | at least `min_commit_samples` requests of the remaining pods judged, p95 available |
 | (b) | the formal commit gates pass on the evidence covered so far (`_judge` in early mode: latency SLO, complete evidence of every remaining pod in this poll, fresh cluster view, KV-cache ceiling, Z tail >= tau_low); the evidence must cover up to the poll's read time instead of the deadline |
 | (c) | the hidden pods have nothing in flight: vLLM `num_requests_running + num_requests_waiting` of each hidden pod (scraped in the same poll, never part of the evidence) known and 0, and the gateway in-flight count (`tre:v2:gw:inflight:<pod>` totals, any instance, with at least one registered gateway instance) known and 0 |
-| (d) | `early_commit_min_grids` gateway grids (default 1 = 10 s) passed since the hide confirmation, and the snapshot tail holds a window ending a whole grid after the first gateway boundary following the hide |
+| (d) | see "Review fixes" (P2-3): `early_commit_min_grids` complete post-hide grids in the newest snapshot window (default 2) and max(those grids, p95 e2e, W / 2) since the hide confirmation |
 
 In early mode nothing but a commit is acted on: an outcome that would extend,
 wait, roll back or fail a gate leaves the probe probing, and the deadline decides
@@ -199,7 +199,7 @@ follow-up upscales; its decision carries `early_commit` {`elapsed_ms`, `samples`
 
 ### Configuration
 
-Registry `safescale.early_commit: true`, `safescale.early_commit_min_grids: 1`
+Registry `safescale.early_commit: true`, `safescale.early_commit_min_grids: 2`
 (and the params mirror). `false` = deadline only. The controller wires the hidden
 pod scrape and the gateway reader only when enabled.
 
@@ -255,3 +255,52 @@ still need post-breakpoint evidence.
 Tests: `controller/tests/test_band_dwell.py` (offline helper + "no controller
 dwell"), `controller/tests/test_c1_deficit_scaleup_20261001.py`
 (`test_scale_up_cooldown_key_is_ignored`), `controller/tests/test_action_cooldown.py`.
+
+## Review fixes (independent review, 2026-10-02)
+
+* **View-pending sources (P2-1).** The O1 view-pending gate read only
+  `last_actions`, which holds completed scaling decisions: a probe-rollback unhide
+  (no direction) and failed or partial SM calls were missing. Between a rollback
+  unhide and the next view refresh, a LOW receiver could scale up again on the
+  hidden-pod count. The gate now also reads `ActionQueue.view_changes()`: every
+  routable-changing SM call (stamped after the answer, ok or not) with a hold rule -
+  a wake / scale-up holds like "up", a sleep / hide / unhide like "down" (a CRITICAL
+  receiver passes, LOW receivers and scale-downs wait). The later of the two sources
+  per model decides.
+* **View time is a lower bound (P2-2).** `ClusterView.fetched_ms` (response
+  received) is an upper bound of the state's time, right for dating O1
+  breakpoints but not for "the view shows this action". The view now also carries
+  `state_ms`: the SM's own `/v2/state` `fetched_ms` when it reports one, clamped
+  into [request sent, response received] (a skewed SM clock cannot move it out of
+  that interval), else the request time. The view-pending gate compares the
+  action's completion with `state_ms`; O1 dating keeps `fetched_ms`.
+* **No fresh view (P3-6): alert only, holds kept on purpose.** A view that stops
+  refreshing happens only on failures (SM restart / crash, Redis down, network,
+  slow Kubernetes API timing out `/v2/state`). The controller then stays
+  conservative by design: the view-pending gate keeps holding LOW scale-ups and
+  scale-downs of a model with a pending change (CRITICAL receivers pass); it does
+  not fall back to F4, which would resume normal control without data. The cluster
+  view task logs `cluster_view_stale` (age from the view's state time - the SM
+  `fetched_ms`, else the request time - and the last refresh error) once when the
+  age exceeds `TRE_VIEW_STALE_PERIODS` (default 3) refresh periods, and
+  `cluster_view_recovered` once a fresh view arrives. No control change.
+* **Early commit evidence (P2-3).** Condition (d) of item 3 is now: the newest
+  snapshot window holds `early_commit_min_grids` complete post-hide grids (default
+  2, at least `scaling.min_evidence_grids`: the O1 warm rule), and the time since
+  the hide confirmation is at least max(those grids, the donor's p95 end-to-end
+  latency, W / 2). The remaining pods' concurrency needs about one end-to-end
+  latency to reach its new level; an early commit at most halves W.
+* **Stalled probe (P2-4).** `insufficient_evidence:stalled` (traffic in flight, not
+  one request completed within W) is a capacity rollback for the item-2 gate.
+* **Permanent hold under unchanged evidence (P3-5).** After a capacity rollback, a
+  model whose Z and routable count stay the same is not probed again - by design:
+  the same load gives the same answer. The unhide restarts the O1 EMA, so the first
+  post-rollback windows are noisier than the steady EMA; a Z excursion can cross
+  the 0.25 margin through noise alone and allow one more probe (which is then
+  judged by the full SafeScale gates).
+* **Oscillation (P3-7).** Two models trading a replica back and forth: each hop
+  needs the receiver's post-change evidence (min_evidence_grids) and the donor's
+  whole post-change window, so a reverse hop waits at least one whole window after
+  the forward one (tested).
+
+Tests: `controller/tests/test_timer_cleanup_review_20261002.py`.
