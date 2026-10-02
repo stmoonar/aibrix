@@ -18,7 +18,6 @@ from tre_controller.loops.action_queue import (
     RetryPolicy,
     revalidate_commit_from_signals,
     revalidate_from_cluster_view,
-    slot_lookup_from_cluster_view,
 )
 from tre_controller.maintenance import MaintenanceWatch
 from tre_controller.mode import ObserveModeGate
@@ -263,6 +262,7 @@ def create_controller_dependencies(
     sm_transport: AsyncTransport | None = None,
 ) -> ControllerDependencies:
     registry = load_registry(cfg.registry_path)
+    log_deprecated_settings(cfg, registry)
     injected_redis_client = redis_client is not None
     redis_timeout_s = float(getattr(cfg, "redis_socket_timeout_s", 0.0) or 0.0)
     redis_client = (
@@ -392,15 +392,13 @@ def create_controller_dependencies(
                 base_backoff_s=float(getattr(cfg, "oneshot_retry_base_s", 2.0)),
                 max_backoff_s=float(getattr(cfg, "oneshot_retry_max_s", 30.0)),
             ),
-            # One-shot retries re-check the latest cluster view; actions on a shared
-            # GPU are serialized (review 2 P1-1 / P1-2).
+            # One-shot retries re-check the latest cluster view (review 2 P1-2).
             # Only a FRESH view may skip a retry (review 4 P2-1).
             revalidate=revalidate_from_cluster_view(cluster_view_box.fresh),
             # Review 3: a SafeScale commit is revalidated on the current signal state
             # (donor needing capacity -> unhide instead; receiver no longer needing it
             # -> upscale dropped) before every (re)try.
             revalidate_commit=revalidate_commit_from_signals(model_state_box.get, cluster_view_box.fresh),
-            slot_of=slot_lookup_from_cluster_view(cluster_view_box.get),
             # Review 4 P2-3 / P2-4: preemption compensation and failed-commit
             # unhides use the view only while fresh; a SafeScale probe is resolved
             # when its one-shot action is finished (durable lifecycle).
@@ -420,17 +418,8 @@ def create_controller_dependencies(
                 direct_evidence.on_hide_done if direct_evidence is not None
                 else (lambda model, pods: safescale.mark_hidden(model, pods=pods))
             ),
-            # P2-6: a donor the SM refused with 409 floor_violation is not picked for
-            # a scale-down again for TRE_FLOOR_VIOLATION_COOLDOWN_TICKS fast-loop ticks.
-            floor_violation_hold_ms=(
-                float(getattr(cfg, "floor_violation_cooldown_ticks", 6)) * float(cfg.rescue_interval_s) * 1000.0
-            ),
-            # S3: a GPU / node the SM refused a wake on is kept out of wake planning
-            # (registry placement.wake_cooldown).
-            wake_cooldown_s=(
-                float(registry.placement().wake_cooldown_gpu_s),
-                float(registry.placement().wake_cooldown_node_s),
-            ),
+            # 2026-10-02 (design 20261002-controller-transfer): no floor-violation hold
+            # and no GPU wake cooldown - see log_deprecated_settings.
         ),
         observe_gate=observe_gate,
         maintenance_watch=MaintenanceWatch(redis_client),
@@ -464,6 +453,28 @@ def create_controller_dependencies(
             else None
         ),
     )
+
+
+def log_deprecated_settings(cfg: Any, registry: Registry) -> list[str]:
+    """2026-10-02 (design 20261002-controller-transfer): settings that are still parsed
+    but no longer used - logged once at start. Returns the warnings (tests)."""
+    log = logging.getLogger("tre_controller.config")
+    warnings: list[str] = []
+    for key in getattr(cfg, "deprecated_env_set", ()) or ():
+        warnings.append(f"{key} is deprecated and ignored: the floor-violation hold was removed "
+                        "(the planner bounds every donor by the service-manager floor_headroom)")
+    placement = getattr(registry, "placement", None)
+    config = placement() if callable(placement) else None
+    if config is not None:
+        gpu_s = getattr(config, "wake_cooldown_gpu_s", 30.0)
+        node_s = getattr(config, "wake_cooldown_node_s", 60.0)
+        if (float(gpu_s), float(node_s)) != (30.0, 60.0):
+            warnings.append(f"registry placement.wake_cooldown (gpu_s={gpu_s}, node_s={node_s}) is ignored by "
+                            "the controller (the service-manager still reports it as retry_after_s): a refused "
+                            "wake is an event, the next tick re-plans")
+    for warning in warnings:
+        log.warning(json.dumps({"event": "deprecated_setting_ignored", "detail": warning}, sort_keys=True))
+    return warnings
 
 
 async def main(

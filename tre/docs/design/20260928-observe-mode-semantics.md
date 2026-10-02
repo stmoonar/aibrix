@@ -89,12 +89,15 @@ its reader, but that is a fail-closed fallback, not a configuration):
   `observe_entered`. A queued / recovered commit is never carried out: it runs
   as the unhide of its donor pods (never an unconfirmed pod, never one a fresh
   view shows asleep).
-* A transfer or commit already running re-checks the mode (fresh read) before
-  each capacity-changing step: donor sleep, receiver wake, each follow-up
-  upscale. A donor that already slept stays asleep; its receiver is **not**
-  woken. Recorded as a failed receiver result `observe_entered: …`, a JSON log
-  event (`observe_entered_mid_transfer` / `observe_entered_mid_commit`) and the
-  queue counters `observe_transfer_stopped_total` / `observe_commit_stopped_total`.
+* A commit already running re-checks the mode (fresh read) before each
+  capacity-changing step: donor sleep, each follow-up upscale. A donor that
+  already slept stays asleep; its receivers are **not** woken. Recorded as a
+  failed receiver result `observe_entered: …`, the JSON log event
+  `observe_entered_mid_commit` and the queue counter `observe_commit_stopped_total`.
+  (Since 2026-10-02 a donor -> receiver relay is ONE service-manager call,
+  `POST /v2/transfers`: the mode is read right before it, and a relay already sent
+  is completed by the SM - logged as `observe_entered_during_transfer`, counter
+  `observe_transfer_completed_total`; see `20261002-controller-transfer.md` §6.)
   A commit stopped after its donor slept resolves as a commit (the donor did
   sleep) with the reason suffix `observe_entered: follow-up upscales not issued`.
 * A hide is re-checked right before its SM call (closes B8's ~1 s cache window

@@ -20,6 +20,7 @@ from tre_controller.planning.planner import (
     _add_scale_action,
     build_plan,
 )
+from relay_view import expand_relays, relays  # noqa: F401 - 2026-10-02 relay intents
 
 from test_planner import _classification
 
@@ -59,7 +60,12 @@ def _plan():
 
 def test_immediate_donors_carry_the_urgent_sleep_path_and_receivers_none():
     assert IMMEDIATE_DONOR_SLEEP_PATH == "urgent"
-    actions = [a for a in _plan().actions if isinstance(a, ScaleAction)]
+    plan = _plan()
+    # 2026-10-02: a relay is one TransferIntent carrying the donor's sleep path.
+    assert {(r.reason, r.sleep_path) for r in relays(plan.actions)} == {
+        ("critical_donor_immediate", "urgent"), ("low_fairness_donor_immediate", "urgent"),
+    }
+    actions = [a for a in expand_relays(plan.actions) if isinstance(a, ScaleAction)]
     donors = [a for a in actions if a.delta < 0]
     receivers = [a for a in actions if a.delta > 0]
     assert {a.reason for a in donors} >= {"critical_donor_immediate", "low_fairness_donor_immediate"}
@@ -94,7 +100,7 @@ def test_idle_proactive_immediate_donor_dispatches_on_the_urgent_path():
         idle_gpus=0,
         cfg=PlanConfig(min_replicas_per_model=1, max_replicas_per_model=4),
     )
-    shrink = next(a for a in plan.actions if isinstance(a, ScaleAction) and a.model == "idle")
+    shrink = next(a for a in expand_relays(plan.actions) if isinstance(a, ScaleAction) and a.model == "idle")
     assert shrink.reason == "idle_proactive_immediate" and shrink.sleep_path == "urgent"
 
     client = RecordingClient()

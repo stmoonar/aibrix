@@ -9,7 +9,7 @@ import pytest
 
 from tre_common.metrics_schema import MetricsSnapshot
 from tre_controller.loops.tick import _apply_safescale
-from tre_controller.planning.planner import HideAction, ScaleAction, ShrinkForSlotAction
+from tre_controller.planning.planner import HideAction, ScaleAction, ShrinkForSlotAction, TransferIntent
 
 
 def _snap() -> MetricsSnapshot:
@@ -51,12 +51,8 @@ def test_run_planner_tick_keeps_the_immediate_donor_transfer_and_drops_probe_shr
     from tre_controller.loops import tick as tick_mod
     from test_loop_ticks import FakeQueue, _metrics, _registry
 
-    pair = (
-        ScaleAction("donor", -1, "critical_donor_immediate", "rescue", donor="donor",
-                    receiver="critical", pods=("donor-0",), transfer_id="t", sleep_path="urgent"),
-        ScaleAction("critical", 1, "critical_donor_immediate", "rescue", donor="donor",
-                    receiver="critical", pods=("critical-1",), transfer_id="t"),
-    )
+    # 2026-10-02: the immediate relay is one TransferIntent (a count, no pods).
+    pair = (TransferIntent("donor", "critical", 1, "critical_donor_immediate", "rescue"),)
     probe = ScaleAction("other", -1, "high_proactive_safescale", "rescue", requires_safescale=True)
     real = tick_mod.build_plan
 
@@ -89,22 +85,19 @@ class _Client:
         return {"ok": True}
 
 
-def test_transfer_with_a_pathless_donor_sends_nothing_and_drops_the_receiver():
+def test_a_pathless_scale_down_sends_nothing():
+    # (2026-10-02: the former donor/receiver pair is a TransferIntent, which always
+    # carries its sleep path; a path-less shrink is still refused before the SM.)
     from tre_controller.loops.action_queue import ActionQueue
 
     client = _Client()
     queue = ActionQueue(client)
-    donor = ScaleAction("donor", -1, "critical_same_slot_high_shrink", "rescue",
-                        pods=("donor-0",), transfer_id="t")
-    receiver = ScaleAction("recv", 1, "critical_same_slot_high_shrink", "rescue",
-                           pods=("recv-0",), transfer_id="t")
-    queue.submit((donor, receiver))
-    results = asyncio.run(queue.drain_once())
-    by_model = {r.model: r for r in results}
+    donor = ScaleAction("donor", -1, "critical_same_slot_high_shrink", "rescue", pods=("donor-0",))
+    queue.submit((donor,))
+    [result] = asyncio.run(queue.drain_once())
     assert client.calls == []
-    assert by_model["donor"].ok is False and by_model["donor"].error.startswith("sleep_path_refused")
-    assert by_model["donor"].retriable is False
-    assert by_model["recv"].ok is False and by_model["recv"].error.startswith("donor_sleep_failed")
+    assert result.ok is False and result.error.startswith("sleep_path_refused")
+    assert result.retriable is False
     assert queue.stats()["sleep_path_refused_total"] == 1
     assert queue.stats()["dispatch_exceptions_total"] == 0
     # O1 must not see a routable change that never happened.

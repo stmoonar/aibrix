@@ -9,6 +9,7 @@ from typing import Awaitable, Callable, Protocol
 
 from tre_common.registry import ClusterTopology
 from tre_controller.planning.planner import ClusterView
+from tre_controller.sm_client import parse_state_routable
 from tre_sm.allocator.slots import Binding, Slot
 
 
@@ -94,11 +95,19 @@ def cluster_view_from_state(state: dict, topology: ClusterTopology) -> ClusterVi
                 hidden=bool(item.get("hidden", False)),
             )
         )
+    # 2026-10-02: the SM's own routable count (its floor check) and floor headroom; a
+    # missing / null field leaves ``routable_ids`` None and the tick falls back to its
+    # own count with an event (``sm_routable_fallback``).
+    routable = parse_state_routable(state)
     return ClusterView(
         topology=topology,
         bindings=tuple(bindings),
         pod_ips=_observed_pod_ips(state),
         blocked_gpus=_blocked_gpus(state),
+        routable_ids=routable.routable_ids,
+        model_floors=dict(routable.models),
+        floor_enforced=routable.floor_enforced,
+        routable_error=routable.error,
     )
 
 

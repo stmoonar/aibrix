@@ -38,6 +38,7 @@ from tre_controller.planning.safescale import CAPACITY_ROLLBACK_CODES, ProbeWind
 from tre_controller.config import SafeScaleConfig
 from tre_controller.signals.trs import BreakpointWindowConfig, SignalState
 from tre_sm.allocator.slots import Binding, Slot
+from relay_view import expand_relays  # 2026-10-02 relay intents
 
 from test_timer_cleanup_f4_o1_20261002 import BASE, LOW, _ActionQueue, _state
 from test_o1_breakpoint_window_20261001 import GRID, O1, _registry, _snap, _ups, _view, _window
@@ -282,7 +283,7 @@ def _two_tick(state, queue, *, end, awake_a, fetched, load_a, load_b):
 
 def _transfers(result) -> dict[str, int]:
     out: dict[str, int] = {}
-    for action in result.actions:
+    for action in expand_relays(result.actions):  # a relay intent = donor -n / receiver +n
         if isinstance(action, ScaleAction):
             out[action.model] = out.get(action.model, 0) + action.delta
     return out

@@ -14,9 +14,9 @@ from tre_controller.loops.metrics_task import SnapshotBox
 from tre_controller.loops.rescue_task import rescue_task
 from tre_controller.loops.safescale_task import run_safescale_observation_tick
 from tre_controller.loops.tick import _commands_to_actions, _idle_gpus, _pods_to_probe
-from tre_controller.planning.planner import ClusterView, ScaleAction
+from tre_controller.planning.planner import ClusterView, ScaleAction, TransferIntent
 from tre_controller.planning.safescale import SafeScaleStateMachine
-from tre_sm.allocator.slots import Binding, Slot
+from tre_sm.allocator.slots import Binding, Slot, natural_key
 from tre_sm.api.v2 import ServiceManagerV2
 from tre_sm.state.store import StateStore
 
@@ -71,6 +71,56 @@ class InProcessServiceManager:
 
     async def defrag(self, migrations):
         return {"ok": True}
+
+    async def transfer(self, donor_model, receiver_model, count, *, sleep_path="urgent"):
+        """Fake ``POST /v2/transfers`` (2026-10-02) on the in-process service, whose
+        service-manager has no transfer primitive: the SM's pair rule (a sleeping, not
+        hidden receiver binding all of whose GPUs awake, not hidden donor bindings hold),
+        then a binding-level donor sleep and receiver wake per pair; the response has
+        the SM's shape (pairs, done, taken, unfilled, picked)."""
+        self.calls.append(("transfer", donor_model, receiver_model, int(count)))
+        state = self.service.get_state()
+        awake = {}
+        for item in state["bindings"]:
+            if item.get("awake"):
+                for gpu in item.get("gpu_ids") or ():
+                    awake[(item["node"], int(gpu))] = item
+        used: set[str] = set()
+        pairs, taken = [], 0
+        receivers = sorted(
+            (item for item in state["bindings"]
+             if item["model"] == receiver_model and not item.get("awake") and not item.get("hidden")),
+            key=lambda item: natural_key(item["serve_id"]),
+        )
+        for item in receivers:
+            gpus = [(item["node"], int(gpu)) for gpu in item.get("gpu_ids") or ()]
+            if not gpus or not all(gpu in awake for gpu in gpus):
+                continue
+            occupants = {awake[gpu]["serve_id"]: awake[gpu] for gpu in gpus}
+            if any(o["model"] != donor_model or o.get("hidden") or sid in used for sid, o in occupants.items()):
+                continue
+            if taken + len(occupants) > int(count):
+                continue
+            for serve_id in occupants:
+                self.service.put_binding_power(serve_id, awake=False, sleep_path=sleep_path)
+            self.service.put_binding_power(item["serve_id"], awake=True)
+            used.update(occupants)
+            taken += len(occupants)
+            pairs.append({"donor": next(iter(occupants)), "donors": sorted(occupants),
+                          "receiver": item["serve_id"], "node": item["node"],
+                          "gpu_ids": list(item.get("gpu_ids") or ()), "status": "done"})
+        body = {"transfer_id": f"tr-fake-{len(self.calls)}", "donor_model": donor_model,
+                "receiver_model": receiver_model, "count": int(count), "pairs": pairs,
+                "done": len(pairs), "taken": taken, "clamped_by_floor": False,
+                "unfilled": int(count) - taken, "refusals": [], "skipped": {},
+                "picked": [{"serve_id": pair["receiver"]} for pair in pairs]}
+        if not pairs:
+            return {"ok": False, "error": "HTTP 409: partial", "status": 409, "retriable": False,
+                    "partial": True, "response": body}
+        return {"ok": True, "response": body}
+
+    async def get_transfers(self):
+        return {"ok": True, "response": {"in_progress": {}, "running_here": [], "stats": {}}}
 
 
 def _trs() -> TrsParams:
@@ -287,10 +337,14 @@ def _run_rescue_once(*, probed: bool) -> list:
 
 def test_rescue_task_excludes_actively_probed_model_from_immediate_donors() -> None:
     control = _run_rescue_once(probed=False)
+    # 2026-10-02: the immediate relay is one TransferIntent (donor -> receiver, a count).
     assert any(
-        isinstance(action, ScaleAction) and action.model == "donor" and action.delta < 0
+        isinstance(action, TransferIntent) and action.donor_model == "donor" and action.count >= 1
         for action in control
     )
 
     probed = _run_rescue_once(probed=True)
-    assert not any(getattr(action, "model", None) == "donor" for action in probed)
+    assert not any(
+        getattr(action, "model", None) == "donor" or getattr(action, "donor_model", None) == "donor"
+        for action in probed
+    )

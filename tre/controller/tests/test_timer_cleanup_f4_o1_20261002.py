@@ -20,6 +20,7 @@ from tre_controller.loops.tick import (
 from tre_controller.planning.classify import ModelState
 from tre_controller.planning.planner import PlanConfig, ScaleAction, build_plan
 from tre_controller.signals.trs import SignalState
+from relay_view import expand_relays, relays  # noqa: F401 - 2026-10-02 relay intents
 
 from test_o1_breakpoint_window_20261001 import (
     GRID,
@@ -152,8 +153,10 @@ def test_contexts_mark_o1_tracking_and_a_stale_hold_clears_it():
     assert events == ("paper_state_stale_hold:m",) and held["o1_routable_tracked"] is False
 
 
-def _plan(classifications, *, view_pending=None, cooldowns=None, floor_holds=None):
+def _plan(classifications, *, view_pending=None, cooldowns=None, floor_headroom=None):
     contexts = {item.model_name: {"routable_pods": 3, "assigned_replicas": 3} for item in classifications}
+    for model, headroom in (floor_headroom or {}).items():
+        contexts[model]["floor_headroom"] = headroom
     return build_plan(
         model_contexts=contexts,
         classifications=classifications,
@@ -162,13 +165,12 @@ def _plan(classifications, *, view_pending=None, cooldowns=None, floor_holds=Non
         cfg=PlanConfig(min_replicas_per_model=1, max_replicas_per_model=4, suppress_hot_proactive_probe=True),
         cooldowns=cooldowns,
         view_pending=view_pending,
-        floor_holds=floor_holds,
     )
 
 
 def _deltas(plan):
     out = {}
-    for action in plan.actions:
+    for action in expand_relays(plan.actions):
         if isinstance(action, ScaleAction):
             out[action.model] = out.get(action.model, 0) + action.delta
     return out
@@ -189,9 +191,11 @@ def test_planner_view_pending_gate_uses_the_f4_direction_rules():
     assert _deltas(_plan(idle, view_pending={"i": "down"})) == {}
 
 
-def test_floor_violation_hold_is_unchanged():
+def test_the_floor_violation_hold_is_replaced_by_the_sm_floor_headroom():
+    """2026-10-02: no timed floor hold - a donor is bounded by its SM floor_headroom."""
     idle = [_cls("i", ModelState.IDLE, 10.0)]
-    held = _plan(idle, floor_holds={"i"})
-    assert _deltas(held) == {} and held.events == ["floor_violation_hold:i"]
+    held = _plan(idle, floor_headroom={"i": 0})
+    assert _deltas(held) == {} and held.events == []
+    assert _deltas(_plan(idle, floor_headroom={"i": 2})) == {"i": -1}
     # Never out of a scale-up.
-    assert _deltas(_plan([_cls("r", ModelState.LOW, 0.9)], floor_holds={"r"})) == {"r": 1}
+    assert _deltas(_plan([_cls("r", ModelState.LOW, 0.9)], floor_headroom={"r": 0})) == {"r": 1}

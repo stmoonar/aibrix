@@ -1,13 +1,16 @@
-"""S3 (2026-09-30): a structured 409 wake refusal names its node / GPUs; the
-controller keeps that GPU (or, node scope, that node) out of wake planning for
-registry placement.wake_cooldown, so the next tick picks another GPU instead of
-re-planning the refused slot every tick. A plain-text 409 of an older SM stays
-what it was (retriable, no cooldown)."""
+"""S3 (2026-09-30) wake refusals, rewritten for 2026-10-02 (design
+20261002-controller-transfer): a structured 409 wake refusal still names its node /
+GPUs (parsed by the client), but the controller no longer cools that GPU / node down
+(the 30 / 60 s ``placement.wake_cooldown`` timers were removed): the refusal is an
+observation event (``wake_refused``) and the next tick re-plans from a new view, in
+which the service-manager reports the GPU's state itself (``/v2/state gpus[]``,
+``blocked_gpus``). A plain-text 409 of an older SM stays retriable, no event."""
 
 from __future__ import annotations
 
 import asyncio
-import json
+
+import pytest
 
 from tre_controller.loops.action_queue import ActionQueue
 from tre_controller.planning.classify import ModelRole, ModelState
@@ -54,7 +57,7 @@ def test_structured_409_legacy_shape_single_gpu_and_generic_code():
     assert error.wake_conflict["gpu_ids"] == [3]
 
 
-def test_plain_text_409_stays_retriable_without_a_cooldown():
+def test_plain_text_409_stays_retriable_without_a_located_conflict():
     for body in (None, {"detail": "slot already has awake binding"}):
         error = ServiceManagerError("HTTP 409: slot already has awake binding", status=409, body=body)
         assert error.wake_conflict is None
@@ -106,57 +109,47 @@ class RefusingClient:
 
 
 def _queue(client, clock):
-    return ActionQueue(client, now_ms=lambda: clock["now"], wake_cooldown_s=(30.0, 60.0))
+    return ActionQueue(client, now_ms=lambda: clock["now"])
 
 
 def _wake(pod="8b-1"):
     return ScaleAction("dsllama-8b", 1, "critical_sleeping_capacity", "rescue", receiver="dsllama-8b", pods=(pod,))
 
 
-def test_gpu_cooldown_after_a_refused_wake_then_expiry():
+def test_a_refused_wake_is_an_event_only_and_starts_no_cooldown():
     clock = {"now": 1_000_000}
     queue = _queue(RefusingClient(STRUCTURED), clock)
     queue.submit([_wake()])
     (result,) = asyncio.run(queue.drain_once())
 
     assert result.ok is False and result.wake_conflict["node"] == "node9"
-    assert queue.cooled_gpus() == {("node9", 1)}
-    assert queue.recent_refusals() == {"dsllama-8b": "node9/1"}
-    events = queue.drain_events()
-    assert "gpu_cooldown:node9/1:1030000" in events
-    assert "wake_refused:dsllama-8b:node9/1:gpu_busy" in events
+    assert queue.drain_events() == ["wake_refused:dsllama-8b:node9/1:gpu_busy"]
     assert queue.drain_events() == []
+    for removed in ("cooled_gpus", "cooled_nodes", "recent_refusals", "floor_held_models"):
+        assert not hasattr(queue, removed)
+    # The same wake is accepted again at once (no timer; the next tick re-plans).
+    assert queue.submit([_wake()]).accepted == 1
 
-    clock["now"] += 30_000
-    assert queue.cooled_gpus() == set()
-    assert queue.recent_refusals() == {}
 
-
-def test_gpu_cooldown_node_scope_for_missing_gpu_truth():
-    clock = {"now": 5_000}
+def test_a_node_scope_refusal_is_an_event_too():
     body = dict(STRUCTURED, error="truth_unavailable", reason="gpu_truth_unavailable", scope="node")
-    queue = _queue(RefusingClient(body), clock)
+    queue = _queue(RefusingClient(body), {"now": 5_000})
     queue.submit([_wake()])
     asyncio.run(queue.drain_once())
-
-    assert queue.cooled_gpus() == set()
-    assert queue.cooled_nodes() == {"node9"}
-    assert "gpu_cooldown:node9/*:65000" in queue.drain_events()
-    clock["now"] += 60_000
-    assert queue.cooled_nodes() == set()
+    assert queue.drain_events() == ["wake_refused:dsllama-8b:node9/1:truth_unavailable"]
 
 
-def test_gpu_cooldown_is_not_set_by_a_plain_409_or_a_sleep():
+def test_no_wake_refused_event_for_a_plain_409_or_a_sleep():
     clock = {"now": 0}
     queue = _queue(RefusingClient({"detail": "busy"}), clock)
     queue.submit([_wake()])
     asyncio.run(queue.drain_once())
-    assert queue.cooled_gpus() == set()
+    assert queue.drain_events() == []
 
     sleep_refused = _queue(RefusingClient(STRUCTURED), clock)
     sleep_refused.submit([ScaleAction("dsllama-8b", -1, "idle_proactive_immediate", "rescue", pods=("8b-1",))])
     asyncio.run(sleep_refused.drain_once())
-    assert sleep_refused.cooled_gpus() == set()
+    assert sleep_refused.drain_events() == []
 
 
 # ------------------------------------------------------------------ planner
@@ -172,7 +165,7 @@ def _bindings():
     return tuple(bindings)
 
 
-def _plan(**kwargs):
+def _plan(*, blocked=frozenset(), **kwargs):
     return build_plan(
         model_contexts={
             "dsqwen-7b": {"routable_pods": 6, "assigned_replicas": 8},
@@ -185,7 +178,7 @@ def _plan(**kwargs):
         model_replicas={"dsqwen-7b": 8, "dsllama-8b": 8},
         idle_gpus=0,
         cfg=_cfg(),
-        cluster_view=ClusterView(TOPOLOGY, _bindings()),
+        cluster_view=ClusterView(TOPOLOGY, _bindings(), blocked_gpus=frozenset(blocked)),
         **kwargs,
     )
 
@@ -199,29 +192,25 @@ def _wake_pods(plan):
     ]
 
 
-def test_gpu_cooldown_makes_the_next_plan_pick_another_gpu():
+def test_the_planner_has_no_cooldown_inputs_and_replans_from_the_view():
     first = _wake_pods(_plan())
     assert len(first) == 1
+    # Same view, same plan: a refusal changes nothing by itself ...
+    assert _wake_pods(_plan()) == first
+    # ... the SM's next view does (it reports the GPU not wakeable: S5 blocked_gpus).
     slots = {b.serve_id: b.slot for b in _bindings()}
     refused = slots[first[0]]
-    refused_key = (refused.node, refused.gpu_ids[0])
-
-    retry = _plan(
-        unavailable_gpus={refused_key},
-        refusals={"dsllama-8b": f"{refused.node}/{refused.gpu_ids[0]}"},
-    )
-
+    retry = _plan(blocked={(refused.node, refused.gpu_ids[0])})
     second = _wake_pods(retry)
     assert len(second) == 1 and second != first
-    moved = slots[second[0]]
-    assert (moved.node, moved.gpu_ids[0]) != refused_key
-    assert f"placement_retry:dsllama-8b:{refused.node}/{refused.gpu_ids[0]}->{moved.node}/{moved.gpu_ids[0]}" in retry.events
     action = next(a for a in retry.actions if isinstance(a, ScaleAction) and a.reason == "critical_sleeping_capacity")
     assert action.hint is True  # pure-capacity wake: the SM may substitute (S5)
+    with pytest.raises(TypeError):
+        _plan(unavailable_gpus={("node9", 1)})
 
 
-def test_gpu_cooldown_of_every_free_gpu_blocks_the_sleeping_capacity():
-    plan = _plan(unavailable_gpus={("node9", 1), ("node10", 2)})
+def test_every_free_gpu_blocked_in_the_view_blocks_the_sleeping_capacity():
+    plan = _plan(blocked={("node9", 1), ("node10", 2)})
     assert _wake_pods(plan) == []
     assert "critical_sleeping_blocked:dsllama-8b" in plan.events
 
@@ -229,68 +218,58 @@ def test_gpu_cooldown_of_every_free_gpu_blocks_the_sleeping_capacity():
 # ------------------------------------------------------------------ hinted dispatch
 
 
-def test_placement_retry_event_when_the_sm_substitutes_a_hint():
+def test_placement_substituted_event_when_the_sm_substitutes_a_hint():
     class HintedClient:
-        async def scale_model_hinted(self, model, delta, *, hints, avoid_gpus=()):
+        async def scale_model_hinted(self, model, delta, *, hints):
             return {"ok": True, "response": {"picked": [
                 {"serve_id": "8b-6", "binding_id": "dsllama-8b/node10/2", "node": "node10", "gpu_ids": [2],
                  "hinted": False, "hint_binding_id": "dsllama-8b/node9/1"},
             ]}}
 
-    slots = {b.serve_id: (b.slot.node, b.slot.gpu_ids) for b in _bindings()}
-    queue = ActionQueue(HintedClient(), slot_of=slots.get)
+    queue = ActionQueue(HintedClient())
     queue.submit([ScaleAction(
         "dsllama-8b", 1, "critical_sleeping_capacity", "rescue", receiver="dsllama-8b", pods=("8b-1",), hint=True,
     )])
     (result,) = asyncio.run(queue.drain_once())
 
     assert result.ok and result.picked[0]["node"] == "node10"
-    assert queue.drain_events() == ["placement_retry:dsllama-8b:node9/1->node10/2"]
+    assert queue.drain_events() == ["placement_substituted:dsllama-8b:node9/1->node10/2"]
 
 
 # ------------------------------------------------------------------ review fixes
 
 
-def test_wake_failed_is_not_retried_at_once_but_cools_the_gpu():
+def test_wake_failed_is_not_retried_at_once():
     body = dict(STRUCTURED, error="wake_failed", reason="vllm_wake_failed")
     error = ServiceManagerError("HTTP 409", status=409, body=body)
     assert error.retriable is False
     assert error.wake_conflict["error"] == "wake_failed"
 
 
-def test_gpu_cooldown_from_the_refusals_of_a_partial_hinted_wake():
+def test_refusals_of_a_partial_hinted_wake_are_events_only():
     class PartialClient:
-        async def scale_model_hinted(self, model, delta, *, hints, avoid_gpus=()):
+        async def scale_model_hinted(self, model, delta, *, hints):
             return {"ok": True, "response": {"picked": [], "unfilled": 1, "refusals": [
                 {"error": "gpu_busy", "reason": "gpu_truth_used", "node": "node9", "gpu_ids": [1], "scope": "gpu"},
             ]}}
 
-    clock = {"now": 0}
-    queue = ActionQueue(PartialClient(), now_ms=lambda: clock["now"], wake_cooldown_s=(30.0, 60.0))
+    queue = ActionQueue(PartialClient(), now_ms=lambda: 0)
     queue.submit([ScaleAction("dsllama-8b", 1, "critical_sleeping_capacity", "rescue", pods=("8b-1",), hint=True)])
     (result,) = asyncio.run(queue.drain_once())
 
     assert result.ok is False and result.error.startswith("partial")  # not a silent success
-    assert queue.cooled_gpus() == {("node9", 1)}
+    assert queue.drain_events() == ["wake_refused:dsllama-8b:node9/1:gpu_busy"]
 
 
-def test_hinted_wake_avoids_the_gpus_of_relays_in_flight():
+def test_hinted_wake_sends_no_avoid_gpus():
     seen = {}
 
     class Client:
-        async def scale_model_hinted(self, model, delta, *, hints, avoid_gpus=()):
-            seen["avoid"] = avoid_gpus
+        async def scale_model_hinted(self, model, delta, **kwargs):
+            seen.update(kwargs)
             return {"ok": True, "response": {"picked": []}}
 
-        async def set_binding_power(self, serve_id, *, awake, **_kwargs):
-            await asyncio.sleep(0.05)
-            return {"ok": True}
-
-    slots = {b.serve_id: (b.slot.node, b.slot.gpu_ids) for b in _bindings()}
-    queue = ActionQueue(Client(), slot_of=slots.get)
-    relay = ScaleAction("dsqwen-7b", -1, "critical_donor_immediate", "rescue", pods=("7b-4",))
-    wake = ScaleAction("dsllama-8b", 1, "critical_sleeping_capacity", "rescue", pods=("8b-1",), hint=True)
-    queue.submit([relay, wake])
+    queue = ActionQueue(Client())
+    queue.submit([ScaleAction("dsllama-8b", 1, "critical_sleeping_capacity", "rescue", pods=("8b-1",), hint=True)])
     asyncio.run(queue.drain_once())
-
-    assert seen["avoid"] == ("node10/0",)  # 7b-4 sits on node10/0; the hint's own GPU is not avoided
+    assert seen == {"hints": ("8b-1",)}  # GPU use is serialized by the SM, not the queue

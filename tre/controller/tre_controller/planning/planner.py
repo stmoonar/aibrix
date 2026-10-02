@@ -8,7 +8,6 @@ from tre_common.registry import ClusterTopology, tp_size_error
 from tre_controller.planning.classify import ModelClassification, ModelRole, ModelState, donor_mock_cost_key
 from tre_common.gpu_placement import (
     PlacementPolicy,
-    choose_placement,
     choose_release,
     plan_placements,
 )
@@ -123,6 +122,17 @@ class ClusterView:
     #: The SM's own ``/v2/state`` ``fetched_ms`` (SM clock): reference only, never
     #: compared with controller times.
     sm_fetched_ms: int | None = field(default=None, compare=False)
+    #: 2026-10-02 (design 20261002-controller-transfer): serve ids the SM counts
+    #: routable - the same function its replica-floor check uses (``/v2/state``
+    #: ``bindings[].routable``). None = not reported / not readable: the controller's
+    #: own count (awake and not hidden) is used and ``routable_error`` says why.
+    routable_ids: frozenset | None = field(default=None, compare=False)
+    #: model -> ``sm_client.ModelFloor`` (routable, floor, floor_headroom) of the SM.
+    model_floors: Mapping[str, Any] = field(default_factory=dict, compare=False)
+    #: ``/v2/state`` ``floor_enforced`` (None = not reported).
+    floor_enforced: bool | None = field(default=None, compare=False)
+    #: Why ``routable_ids`` is None (``routable_missing`` / ``routable_unavailable: ...``).
+    routable_error: str | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True)
@@ -171,14 +181,9 @@ class ScaleAction:
     sleep_path: str | None = None
     # Soft drain budget (s) for the SM's hide -> ack -> drain -> /sleep; None = SM default.
     drain_budget_s: float | None = None
-    # Donor -> receiver pair (review 2 P1-1): the donor sleep and the receiver wake of
-    # one rescue transfer carry the same id; the ActionQueue executes them as ONE
-    # compound action (sleep the donor, and only on success wake the receiver).
-    transfer_id: str | None = None
     # S5 (2026-09-30): ``pods`` of a pure-capacity wake are placement HINTS - the SM
     # picks the GPUs itself (registry placement policy) and substitutes a hint it
-    # cannot wake. False = exactly these pods (same-GPU donor / receiver relays,
-    # SafeScale commits, sleeps).
+    # cannot wake. False = exactly these pods (SafeScale probes / commits).
     hint: bool = False
     # C1: the rescue target this scale-up belongs to (a CRITICAL receiver's wakes /
     # creates / relay wakes). Bookkeeping only: not part of the action's identity.
@@ -189,6 +194,48 @@ class ScaleAction:
 #: low-fairness donor). With the default SM registry it does not drain: hide -> ack
 #: -> /sleep mode=abort, the reissue sidecar continues the cut-off requests (v1).
 IMMEDIATE_DONOR_SLEEP_PATH = "urgent"
+
+
+@dataclass(frozen=True)
+class TransferIntent:
+    """An immediate donor -> receiver relay expressed as a COUNT (2026-10-02, design
+    20261002-controller-transfer). The controller decides the quantity - how many
+    replicas, from which model, to which model, in which order; the service-manager
+    (``POST /v2/transfers``) decides the placement - which donor pods, which receiver
+    bindings, which GPUs - and keeps the replica floor and "one awake model per GPU"
+    under its writer lock. No pod or GPU is named here.
+
+    ``count`` = donor replicas to hand over (the SM's ``count``); ``pairs`` = receiver
+    replicas the planner expects from them (equal unless a TP receiver needs several
+    single-GPU donors). The SM may complete fewer: the ActionQueue accounts by the
+    response's ``done`` / ``taken`` / ``unfilled``, never by ``count``."""
+
+    donor_model: str
+    receiver_model: str
+    count: int
+    reason: str
+    source_loop: SourceLoop
+    sleep_path: str = IMMEDIATE_DONOR_SLEEP_PATH
+    pairs: int = 0
+    #: C1: the rescue target the receiver side belongs to (bookkeeping only).
+    rescue: RescuePlan | None = field(default=None, compare=False)
+
+    def __post_init__(self) -> None:
+        if self.pairs <= 0:
+            object.__setattr__(self, "pairs", int(self.count))
+
+    @property
+    def model(self) -> str:
+        """The receiver (the model the relay serves; queue / rescue key)."""
+        return self.receiver_model
+
+    @property
+    def donor(self) -> str:
+        return self.donor_model
+
+    @property
+    def receiver(self) -> str:
+        return self.receiver_model
 
 
 @dataclass(frozen=True)
@@ -231,23 +278,17 @@ class ShrinkForSlotAction:
     source_loop: SourceLoop
 
 
-Action = ScaleAction | HideAction | UnhideAction | DefragAction | ShrinkForSlotAction
+Action = ScaleAction | TransferIntent | HideAction | UnhideAction | DefragAction | ShrinkForSlotAction
 
 
-@dataclass(frozen=True)
-class TransferAction:
-    """A donor-sleep -> receiver-wake pair executed in order by one dispatch worker
-    (review 2 P1-1). Built by :func:`fuse_transfers` from two ScaleActions that share
-    a ``transfer_id``; never produced by the planner itself (its output stays two
-    ScaleActions, which the decision log / tests inspect)."""
-
-    donor: ScaleAction
-    receiver: ScaleAction
-    source_loop: SourceLoop = "rescue"
-
-    @property
-    def model(self) -> str:
-        return self.receiver.model
+def upscale_of(action: object) -> tuple[str, int] | None:
+    """(model, receiver replicas) a planned action adds, or None: a ScaleAction with a
+    positive delta, or a TransferIntent's receiver side (its expected ``pairs``)."""
+    if isinstance(action, ScaleAction) and action.delta > 0:
+        return action.model, int(action.delta)
+    if isinstance(action, TransferIntent):
+        return action.receiver_model, int(action.pairs)
+    return None
 
 
 @dataclass(frozen=True)
@@ -268,8 +309,7 @@ class ReceiverTarget:
 @dataclass(frozen=True)
 class SafeScaleCommitAction:
     """One SafeScale commit batch (review 3 P2-1..P2-3), executed by the
-    ActionQueue as an ordered one-shot unit - the SafeScale analogue of
-    :class:`TransferAction`:
+    ActionQueue as an ordered one-shot unit:
 
     1. revalidate against the CURRENT signal state (before every (re)try): the
        donor now needing capacity abandons the commit (its hidden pods are
@@ -321,31 +361,6 @@ class SafeScaleCommitAction:
         )
 
 
-def fuse_transfers(actions) -> list:
-    """Replace each donor/receiver ScaleAction pair sharing a ``transfer_id`` by one
-    :class:`TransferAction` (at the donor's position). A half whose partner is
-    missing (e.g. dropped by a probe preemption) stays a plain ScaleAction."""
-    fused: list = []
-    donors: dict[str, int] = {}
-    for action in actions:
-        transfer_id = action.transfer_id if isinstance(action, ScaleAction) else None
-        if transfer_id is None:
-            fused.append(action)
-            continue
-        if action.delta < 0:
-            donors[transfer_id] = len(fused)
-            fused.append(action)
-            continue
-        index = donors.pop(transfer_id, None)
-        if index is None:
-            fused.append(action)
-            continue
-        fused[index] = TransferAction(
-            donor=fused[index], receiver=action, source_loop=action.source_loop
-        )
-    return fused
-
-
 @dataclass(frozen=True)
 class PlanResult:
     actions: list[Action]
@@ -368,12 +383,16 @@ def build_plan(
     cooldowns: Mapping[str, str] | None = None,
     probe_backoff_models: Mapping[str, str] | set[str] | None = None,
     preemptible_models: set[str] | None = None,
-    floor_holds: set[str] | None = None,
-    unavailable_gpus: set[tuple[str, int]] | None = None,
-    refusals: Mapping[str, str] | None = None,
     rescue_bases: Mapping[str, RescueBasis] | None = None,
     view_pending: Mapping[str, str] | None = None,
 ) -> PlanResult:
+    """One plan. Quantity only for the immediate relays (2026-10-02): a CRITICAL / LOW
+    receiver's need is met first from free capacity (its sleeping bindings on free
+    GPUs, then free slot groups), then by :class:`TransferIntent` s from IMMEDIATE
+    donors (count only; the SM places them), then by middle-zone SafeScale probes. A
+    donor gives at most its ``floor_headroom`` (SM count, ``_donor_headroom``) minus
+    what this tick already took from it. Whatever the relays cannot cover is planned
+    again on the next tick from a new view (free capacity first)."""
     active_probe_models = active_probe_models or set()
     # Review 3 P2-3: models whose only in-flight work is a SafeScale commit waiting
     # out a retry backoff. A CRITICAL receiver among them is still planned: the
@@ -402,21 +421,17 @@ def build_plan(
     slot_shrink_donors: set[str] = set()
     # Sleeping-capacity deadlock fix: GPU-slot occupancy so a receiver's sleeping binding
     # only counts as wakeable capacity when its slot has no awake binding (of any model).
-    # S3: GPUs the SM refused a wake on recently (cooldown) are not wake / create
-    # capacity this tick; S5: nor are GPUs the SM reports not wakeable.
-    occupancy = (
-        _SlotOccupancy(cluster_view, unavailable=unavailable_gpus)
-        if cluster_view is not None
-        else None
-    )
+    # S5: GPUs the SM reports not wakeable are no wake / create capacity this tick (the
+    # S3 per-GPU wake cooldown was removed on 2026-10-02: a refusal is an event only).
+    occupancy = _SlotOccupancy(cluster_view) if cluster_view is not None else None
     # Review F4 per-model cooldown (fallback since the timer cleanup 2026-10-02): model ->
     # direction ("up"/"down") of its last executed action whose effect the decision
     # window does not yet fully reflect - only for models O1 does not track this tick.
     # ``view_pending`` (O1 evidence gate): models O1 tracks whose last action completed
     # after the fleet view was fetched (no breakpoint can hold them yet), same rules.
-    # P2-6: donors the SM refused with 409 floor_violation recently are held out of
-    # every scale-down (never out of a scale-up) through the same cooldown gate.
-    cooldown = _Cooldown(cooldowns or {}, events, floor_holds=floor_holds, view_pending=view_pending)
+    # (The P2-6 floor-violation hold was removed on 2026-10-02: the donor's SM
+    # ``floor_headroom`` decides, and the SM clamps model-level shrinks.)
+    cooldown = _Cooldown(cooldowns or {}, events, view_pending=view_pending)
 
     incomplete_models = _paper_state_incomplete_models(classifications)
     if not classifications or (incomplete_models and cfg.incomplete_policy == "drop_all"):
@@ -649,7 +664,7 @@ def build_plan(
                         # replicas stay available to the immediate donor loop below.
                         inflight_models=inflight_models | cooldown.down_blocked() | slot_shrink_donors,
                         planned_deltas=deltas,
-                        taken_serve_ids=occupancy.donor_taken_ids() if occupancy is not None else set(),
+                        taken_serve_ids=occupancy.released_donor_ids() if occupancy is not None else set(),
                         source_loop="rescue",
                     )
                     if same_slot_shrink is not None:
@@ -675,7 +690,7 @@ def build_plan(
                         pending = probe_upscale_plans.setdefault(same_slot_shrink.donor, {})
                         pending[same_slot_shrink.beneficiary] = pending.get(same_slot_shrink.beneficiary, 0) + 1
                         if occupancy is not None:
-                            occupancy.take_donor(same_slot_shrink.serve_id)
+                            occupancy.count_released((same_slot_shrink.serve_id,))
                         events.append(
                             f"safescale_preemption:{same_slot_shrink.donor}->{recv.model_name}:{same_slot_shrink.reason}"
                         )
@@ -751,7 +766,7 @@ def build_plan(
                     remaining_idle -= gain_from_idle
 
                 still_needed = raw_need - gain_from_idle
-                for donor in _slot_matched_first(paper_donors, occupancy, recv.model_name):
+                for donor in paper_donors:
                     if still_needed <= 0:
                         break
                     if (
@@ -763,54 +778,26 @@ def build_plan(
                         continue
                     if cooldown.blocks(donor.model_name, "down"):
                         continue
+                    headroom = _donor_headroom(cfg, donor.model_name, model_contexts, model_replicas)
+                    if headroom <= 0:
+                        continue
                     donor_pods = _effective_routable_replicas(donor.model_name, model_contexts, model_replicas)
-                    donor_min = _min_replicas(cfg, donor.model_name)
-                    if donor_pods <= donor_min:
-                        continue
                     planned_take = abs(min(deltas.get(donor.model_name, 0), 0))
-                    transfer = min(
-                        still_needed,
-                        _donor_give(donor, donor_pods, cfg),
-                        max(0, donor_pods - planned_take - donor_min),
-                    )
-                    if transfer <= 0:
-                        continue
-                    transfer, donor_slot_pods, receiver_slot_pods = _slot_targeted_transfer(
-                        occupancy, donor=donor.model_name, receiver=recv.model_name, transfer=transfer, events=events
-                    )
-                    if transfer <= 0:
-                        continue
-                    # One transfer: the receiver's wake needs the GPU the donor's sleep
-                    # frees, so the queue runs the pair in order as one compound action.
-                    transfer_id = f"{donor.model_name}->{recv.model_name}#{len(actions)}"
-                    _add_scale_action(
+                    gained = _plan_transfer_intent(
                         actions,
                         deltas,
-                        model=donor.model_name,
-                        delta=-transfer,
-                        reason="critical_donor_immediate",
-                        source_loop="rescue",
+                        occupancy,
                         donor=donor.model_name,
                         receiver=recv.model_name,
-                        pods=donor_slot_pods,
-                        transfer_id=transfer_id,
-                        sleep_path=IMMEDIATE_DONOR_SLEEP_PATH,
-                    )
-                    _add_scale_action(
-                        actions,
-                        deltas,
-                        model=recv.model_name,
-                        delta=transfer,
+                        need=still_needed,
+                        donor_limit=min(_donor_give(donor, donor_pods, cfg), headroom - planned_take),
                         reason="critical_donor_immediate",
                         source_loop="rescue",
-                        donor=donor.model_name,
-                        receiver=recv.model_name,
-                        pods=receiver_slot_pods,
-                        transfer_id=transfer_id,
+                        events=events,
                     )
-                    still_needed -= transfer
+                    still_needed -= gained
 
-                for middle in _slot_matched_first(middle_zone, occupancy, recv.model_name):
+                for middle in middle_zone:
                     if still_needed <= 0:
                         break
                     if (
@@ -821,39 +808,26 @@ def build_plan(
                         continue
                     if cooldown.blocks(middle.model_name, "down"):
                         continue
+                    headroom = _donor_headroom(cfg, middle.model_name, model_contexts, model_replicas)
+                    if headroom <= 0:
+                        continue
                     middle_pods = _effective_routable_replicas(middle.model_name, model_contexts, model_replicas)
-                    middle_min = _min_replicas(cfg, middle.model_name)
-                    if middle_pods <= middle_min:
-                        continue
                     planned_take = abs(min(deltas.get(middle.model_name, 0), 0))
-                    transfer = min(
-                        still_needed,
-                        _scale_step(middle_pods, cfg.scale_step_ratio),
-                        max(0, middle_pods - planned_take - middle_min),
-                    )
-                    if transfer <= 0:
-                        continue
-                    transfer, middle_slot_pods, _ = _slot_targeted_transfer(
-                        occupancy, donor=middle.model_name, receiver=recv.model_name, transfer=transfer, events=events
-                    )
-                    if transfer <= 0:
-                        continue
-                    _add_scale_action(
+                    gained = _plan_middle_zone_probe(
                         actions,
                         deltas,
-                        model=middle.model_name,
-                        delta=-transfer,
-                        reason="critical_middle_zone_safescale",
-                        source_loop="rescue",
-                        requires_safescale=True,
+                        occupancy,
                         donor=middle.model_name,
                         receiver=recv.model_name,
-                        pods=middle_slot_pods,
+                        need=still_needed,
+                        donor_limit=min(_scale_step(middle_pods, cfg.scale_step_ratio), headroom - planned_take),
+                        reason="critical_middle_zone_safescale",
+                        source_loop="rescue",
+                        events=events,
+                        delayed_down_models=delayed_down_models,
+                        probe_upscale_plans=probe_upscale_plans,
                     )
-                    delayed_down_models.add(middle.model_name)
-                    pending = probe_upscale_plans.setdefault(middle.model_name, {})
-                    pending[recv.model_name] = pending.get(recv.model_name, 0) + transfer
-                    still_needed -= transfer
+                    still_needed -= gained
             finally:
                 if recv.model_name in rescue_ctx:
                     _tag_rescue_actions(actions, first_action, recv, rescue_ctx[recv.model_name], events)
@@ -869,7 +843,14 @@ def build_plan(
             idle_min = _serving_floor(cfg, idle.model_name, model_contexts, model_replicas)
             if pods <= idle_min:
                 continue
-            shrink = min(_scale_step(pods, cfg.scale_step_ratio), pods - idle_min)
+            # A model-level scale-down (PUT /target, no receiver, no pod named): the SM
+            # picks the replicas and clamps the shrink at the model's replica floor
+            # (2026-10-02); the planner still never asks beyond the SM floor_headroom.
+            shrink = min(
+                _scale_step(pods, cfg.scale_step_ratio),
+                pods - idle_min,
+                _donor_headroom(cfg, idle.model_name, model_contexts, model_replicas),
+            )
             if shrink > 0:
                 _add_scale_action(
                     actions,
@@ -902,7 +883,11 @@ def build_plan(
                     f"safescale_rollback_hold:{high.model_name}:{probe_backoff_models[high.model_name]}"
                 )
                 continue
-            shrink = min(_scale_step(pods, cfg.scale_step_ratio), pods - high_min)
+            shrink = min(
+                _scale_step(pods, cfg.scale_step_ratio),
+                pods - high_min,
+                _donor_headroom(cfg, high.model_name, model_contexts, model_replicas),
+            )
             if shrink > 0:
                 # t1 guard: never launch a receiver-less proactive scale-down probe on a
                 # hot (HIGH) donor. It has no beneficiary and, during a spike, hiding a
@@ -926,7 +911,6 @@ def build_plan(
 
     if not cfg.fairness_due:
         events.append("fairness_skipped_by_cadence")
-        _placement_retry_events(actions, cluster_view, refusals, events)
         return PlanResult(actions, delayed_down_models, probe_upscale_plans, events=events)
 
     def low_need(recv: ModelClassification) -> tuple[int, int] | None:
@@ -1025,7 +1009,7 @@ def build_plan(
         # former saturation gate (emit "fairness_blocked_unsaturated" unless Q_ctl >= qsat)
         # was removed -- a non-saturated LOW/CRITICAL receiver now receives donor surplus.
 
-        for donor in _slot_matched_first(paper_donors, occupancy, recv.model_name):
+        for donor in paper_donors:
             if needed <= 0:
                 break
             if (
@@ -1037,147 +1021,192 @@ def build_plan(
                 continue
             if cooldown.blocks(donor.model_name, "down"):
                 continue
+            headroom = _donor_headroom(cfg, donor.model_name, model_contexts, model_replicas)
+            if headroom <= 0:
+                continue
+            needed = _piggyback_probe(
+                donor.model_name, recv.model_name, needed, deltas, delayed_down_models, probe_upscale_plans
+            )
+            if needed <= 0:
+                continue
             donor_pods = _effective_routable_replicas(donor.model_name, model_contexts, model_replicas)
-            donor_min = _min_replicas(cfg, donor.model_name)
-            if donor_pods <= donor_min:
-                continue
-            existing_shrink = abs(min(deltas.get(donor.model_name, 0), 0))
-            existing_claimed = sum(probe_upscale_plans.get(donor.model_name, {}).values())
-            unclaimed = existing_shrink - existing_claimed
-            if unclaimed > 0 and donor.model_name in delayed_down_models:
-                piggyback = min(needed, unclaimed)
-                pending = probe_upscale_plans.setdefault(donor.model_name, {})
-                pending[recv.model_name] = pending.get(recv.model_name, 0) + piggyback
-                needed -= piggyback
-                if needed <= 0:
-                    continue
             planned_take = abs(min(deltas.get(donor.model_name, 0), 0))
-            transfer = min(
-                needed,
-                _scale_step(donor_pods, cfg.scale_step_ratio),
-                max(0, donor_pods - planned_take - donor_min),
-            )
-            if transfer <= 0:
-                continue
-            transfer, donor_slot_pods, receiver_slot_pods = _slot_targeted_transfer(
-                occupancy, donor=donor.model_name, receiver=recv.model_name, transfer=transfer, events=events
-            )
-            if transfer <= 0:
-                continue
-            _add_scale_action(
+            needed -= _plan_transfer_intent(
                 actions,
                 deltas,
-                model=donor.model_name,
-                delta=-transfer,
-                reason="low_fairness_donor_immediate",
-                source_loop="fairness",
+                occupancy,
                 donor=donor.model_name,
                 receiver=recv.model_name,
-                pods=donor_slot_pods,
-                sleep_path=IMMEDIATE_DONOR_SLEEP_PATH,
-            )
-            _add_scale_action(
-                actions,
-                deltas,
-                model=recv.model_name,
-                delta=transfer,
+                need=needed,
+                donor_limit=min(_scale_step(donor_pods, cfg.scale_step_ratio), headroom - planned_take),
                 reason="low_fairness_donor_immediate",
                 source_loop="fairness",
-                donor=donor.model_name,
-                receiver=recv.model_name,
-                pods=receiver_slot_pods,
+                events=events,
             )
-            needed -= transfer
 
-        for middle in _slot_matched_first(middle_zone, occupancy, recv.model_name):
+        for middle in middle_zone:
             if needed <= 0:
                 break
             if middle.model_name == recv.model_name or middle.model_name in active_probe_models or middle.model_name in inflight_models:
                 continue
             if cooldown.blocks(middle.model_name, "down"):
                 continue
+            headroom = _donor_headroom(cfg, middle.model_name, model_contexts, model_replicas)
+            if headroom <= 0:
+                continue
+            needed = _piggyback_probe(
+                middle.model_name, recv.model_name, needed, deltas, delayed_down_models, probe_upscale_plans
+            )
+            if needed <= 0:
+                continue
             donor_pods = _effective_routable_replicas(middle.model_name, model_contexts, model_replicas)
-            donor_min = _min_replicas(cfg, middle.model_name)
-            if donor_pods <= donor_min:
-                continue
-            existing_shrink = abs(min(deltas.get(middle.model_name, 0), 0))
-            existing_claimed = sum(probe_upscale_plans.get(middle.model_name, {}).values())
-            unclaimed = existing_shrink - existing_claimed
-            if unclaimed > 0 and middle.model_name in delayed_down_models:
-                piggyback = min(needed, unclaimed)
-                pending = probe_upscale_plans.setdefault(middle.model_name, {})
-                pending[recv.model_name] = pending.get(recv.model_name, 0) + piggyback
-                needed -= piggyback
-                if needed <= 0:
-                    continue
             planned_take = abs(min(deltas.get(middle.model_name, 0), 0))
-            transfer = min(
-                needed,
-                _scale_step(donor_pods, cfg.scale_step_ratio),
-                max(0, donor_pods - planned_take - donor_min),
-            )
-            if transfer <= 0:
-                continue
-            transfer, middle_slot_pods, _ = _slot_targeted_transfer(
-                occupancy, donor=middle.model_name, receiver=recv.model_name, transfer=transfer, events=events
-            )
-            if transfer <= 0:
-                continue
-            _add_scale_action(
+            needed -= _plan_middle_zone_probe(
                 actions,
                 deltas,
-                model=middle.model_name,
-                delta=-transfer,
-                reason="low_fairness_middle_zone_safescale",
-                source_loop="fairness",
-                requires_safescale=True,
+                occupancy,
                 donor=middle.model_name,
                 receiver=recv.model_name,
-                pods=middle_slot_pods,
+                need=needed,
+                donor_limit=min(_scale_step(donor_pods, cfg.scale_step_ratio), headroom - planned_take),
+                reason="low_fairness_middle_zone_safescale",
+                source_loop="fairness",
+                events=events,
+                delayed_down_models=delayed_down_models,
+                probe_upscale_plans=probe_upscale_plans,
             )
-            delayed_down_models.add(middle.model_name)
-            pending = probe_upscale_plans.setdefault(middle.model_name, {})
-            pending[recv.model_name] = pending.get(recv.model_name, 0) + transfer
-            needed -= transfer
 
-    _placement_retry_events(actions, cluster_view, refusals, events)
     return PlanResult(actions, delayed_down_models, probe_upscale_plans, events=events)
 
 
-def _placement_retry_events(
+def _piggyback_probe(
+    donor: str,
+    receiver: str,
+    needed: int,
+    deltas: Mapping[str, int],
+    delayed_down_models: set[str],
+    probe_upscale_plans: dict[str, dict[str, int]],
+) -> int:
+    """A SafeScale probe this tick already plans on ``donor`` whose freed replicas no
+    receiver has claimed yet serves this receiver first (piggyback). Returns what is
+    still needed."""
+    existing_shrink = abs(min(deltas.get(donor, 0), 0))
+    existing_claimed = sum(probe_upscale_plans.get(donor, {}).values())
+    unclaimed = existing_shrink - existing_claimed
+    if unclaimed > 0 and donor in delayed_down_models:
+        piggyback = min(needed, unclaimed)
+        pending = probe_upscale_plans.setdefault(donor, {})
+        pending[receiver] = pending.get(receiver, 0) + piggyback
+        needed -= piggyback
+    return needed
+
+
+def _plan_transfer_intent(
     actions: list[Action],
-    cluster_view: ClusterView | None,
-    refusals: Mapping[str, str] | None,
+    deltas: dict[str, int],
+    occupancy: "_SlotOccupancy | None",
+    *,
+    donor: str,
+    receiver: str,
+    need: int,
+    donor_limit: int,
+    reason: str,
+    source_loop: SourceLoop,
     events: list[str],
-) -> None:
-    """S3: ``placement_retry:<model>:<refused gpu>-><new gpu>`` for every wake of
-    a model whose last wake the SM refused (its GPU is cooling down): the plan
-    moved it to another GPU."""
-    if not refusals or cluster_view is None:
-        return
-    slots = {binding.serve_id: binding.slot for binding in cluster_view.bindings}
-    for action in actions:
-        if not isinstance(action, ScaleAction) or action.delta <= 0 or action.model not in refusals:
-            continue
-        for pod in action.pods:
-            slot = slots.get(pod)
-            if slot is None:
-                continue
-            target = f"{slot.node}/{','.join(str(gpu) for gpu in slot.gpu_ids)}"
-            if target != refusals[action.model]:
-                events.append(f"placement_retry:{action.model}:{refusals[action.model]}->{target}")
+) -> int:
+    """One immediate relay as a :class:`TransferIntent` (count only). With a cluster
+    view its size is bounded by :meth:`_SlotOccupancy.pairable_count` - pairs the SM
+    can form (receiver bindings whose every GPU this donor holds awake) - so no intent
+    is sent that cannot be filled; without one, by ``need`` / ``donor_limit``.
+    Returns the receiver replicas it is expected to add."""
+    if need <= 0 or donor_limit <= 0:
+        return 0
+    if occupancy is None:
+        pairs = count = min(need, donor_limit)
+    else:
+        pairs, count = occupancy.pairable_count(donor, receiver, max_pairs=need, max_donors=donor_limit)
+        if pairs <= 0:
+            event = f"donor_no_slot_match:{donor}:{receiver}"
+            if event not in events:
+                events.append(event)
+            return 0
+    deltas[donor] = deltas.get(donor, 0) - count
+    deltas[receiver] = deltas.get(receiver, 0) + pairs
+    actions.append(
+        TransferIntent(
+            donor_model=donor,
+            receiver_model=receiver,
+            count=count,
+            pairs=pairs,
+            reason=reason,
+            source_loop=source_loop,
+            sleep_path=IMMEDIATE_DONOR_SLEEP_PATH,
+        )
+    )
+    return pairs
+
+
+def _plan_middle_zone_probe(
+    actions: list[Action],
+    deltas: dict[str, int],
+    occupancy: "_SlotOccupancy | None",
+    *,
+    donor: str,
+    receiver: str,
+    need: int,
+    donor_limit: int,
+    reason: str,
+    source_loop: SourceLoop,
+    events: list[str],
+    delayed_down_models: set[str],
+    probe_upscale_plans: dict[str, dict[str, int]],
+) -> int:
+    """A middle-zone donor's SafeScale probe for ``receiver`` (unchanged path: SafeScale
+    hides named pods). With a cluster view the probe pods are the donor pods of the
+    pairs :meth:`_SlotOccupancy.pairable` counts (sleeping them frees receiver GPUs).
+    Returns the receiver replicas promised to the commit's follow-up upscale."""
+    if need <= 0 or donor_limit <= 0:
+        return 0
+    pods: tuple[str, ...] = ()
+    if occupancy is None:
+        pairs = count = min(need, donor_limit)
+    else:
+        estimate = occupancy.pairable(donor, receiver, max_pairs=need, max_donors=donor_limit)
+        if estimate.pairs <= 0:
+            event = f"donor_no_slot_match:{donor}:{receiver}"
+            if event not in events:
+                events.append(event)
+            return 0
+        pairs, count, pods = estimate.pairs, estimate.donors, estimate.donor_pods
+    _add_scale_action(
+        actions,
+        deltas,
+        model=donor,
+        delta=-count,
+        reason=reason,
+        source_loop=source_loop,
+        requires_safescale=True,
+        donor=donor,
+        receiver=receiver,
+        pods=pods,
+    )
+    delayed_down_models.add(donor)
+    pending = probe_upscale_plans.setdefault(donor, {})
+    pending[receiver] = pending.get(receiver, 0) + pairs
+    return pairs
 
 
 class _Cooldown:
-    """Per-model holds of the planner (one gate, three sources):
+    """Per-model holds of the planner (one gate, two sources):
 
     * review F4 (``cooldowns``; fallback since the timer cleanup 2026-10-02 - only for
       models O1 does not track): hold a model's next action until a fresh metrics window
       reflects its last executed one;
     * O1 evidence gate (``view_pending``): the fleet view predates the model's last
-      action, so no breakpoint holds it yet - held until a newer view exists;
-    * P2-6 (``floor_holds``): a donor the SM refused with 409 floor_violation is held
-      out of scale-downs.
+      action, so no breakpoint holds it yet - held until a newer view exists.
+
+    (The P2-6 floor-violation hold - a timed hold after a 409 ``floor_violation`` - was
+    removed on 2026-10-02: a donor gives at most its SM ``floor_headroom``.)
 
     F4 / view-pending direction rules: same direction is held; after a scale-up a
     scale-down is held too; after a scale-down a scale-up is allowed only for a CRITICAL
@@ -1188,19 +1217,13 @@ class _Cooldown:
         cooldowns: Mapping[str, str],
         events: list[str],
         *,
-        floor_holds: set[str] | None = None,
         view_pending: Mapping[str, str] | None = None,
     ) -> None:
         self._cooldowns = dict(cooldowns)
         self._events = events
-        #: P2-6: models held out of scale-downs after an SM floor_violation refusal.
-        self._floor_holds = set(floor_holds or ())
         self._view_pending = dict(view_pending or {})
 
     def blocks(self, model: str, direction: str, *, critical: bool = False) -> bool:
-        if direction == "down" and model in self._floor_holds:
-            self._event(f"floor_violation_hold:{model}")
-            return True
         for holds, name in ((self._cooldowns, "cooldown_hold"), (self._view_pending, "o1_view_pending_hold")):
             last = holds.get(model)
             if last is None:
@@ -1216,7 +1239,7 @@ class _Cooldown:
             self._events.append(event)
 
     def down_blocked(self) -> set[str]:
-        return set(self._cooldowns) | set(self._view_pending) | self._floor_holds
+        return set(self._cooldowns) | set(self._view_pending)
 
 
 class _SlotOccupancy:
@@ -1225,20 +1248,21 @@ class _SlotOccupancy:
     Under multi-model-per-GPU residency a receiver's sleeping binding is only real
     capacity when no other binding is awake on its GPU(s); the SM rejects any other wake
     with WakeConflict (the E1 dsllama-8b deadlock). Slots claimed by a planned wake (or
-    freed by a planned slot-targeted donor sleep) are not counted twice in one tick.
+    counted for a planned relay) are not counted twice in one tick.
+
+    Since 2026-10-02 it only COUNTS relay capacity (:meth:`pairable_count`): which donor
+    pods and receiver bindings a relay uses is the service-manager's choice
+    (``POST /v2/transfers``); nothing it counts here is sent to the SM.
     """
 
-    def __init__(
-        self, cluster_view: ClusterView, *, unavailable: set[tuple[str, int]] | None = None
-    ) -> None:
+    def __init__(self, cluster_view: ClusterView) -> None:
         self._topology = cluster_view.topology
         self._nodes = node_gpu_counts(cluster_view.topology)
         #: GPUs that are no wake / create capacity this tick although no awake binding
         #: holds them: S5 the SM reports them not wakeable (a Pod loading, a wake in
-        #: flight, gpu-truth in use), S3 a wake there was refused recently (cooldown).
+        #: flight, gpu-truth in use).
         self._blocked: set[tuple[str, int]] = {
-            (str(node), int(gpu))
-            for node, gpu in set(cluster_view.blocked_gpus) | set(unavailable or ())
+            (str(node), int(gpu)) for node, gpu in set(cluster_view.blocked_gpus)
         }
         self._policy = cluster_view.placement
         self._planned_wakes: set[str] = set()
@@ -1249,9 +1273,10 @@ class _SlotOccupancy:
                 for gpu in binding.slot.gpu_ids:
                     self._awake[(binding.slot.node, gpu)] = binding
         self._claimed: set[tuple[str, int]] = set()
-        # Donor bindings this tick already sleeps / hides (slot-targeted donor pods, a
-        # same-slot shrink's binding): never taken a second time in the same tick.
-        self._donor_taken: set[str] = set()
+        # Donor bindings this tick's plan already counts as released (relay estimates,
+        # a same-slot shrink's binding): never counted a second time in the same tick.
+        # Counting only - the SM picks the donors of a relay itself.
+        self._released: set[str] = set()
         # Per model: GPUs claimed by this tick's planned wakes / creates, and how many.
         self._model_claimed: dict[str, set[tuple[str, int]]] = {}
         self._planned_counts: dict[str, int] = {}
@@ -1266,12 +1291,12 @@ class _SlotOccupancy:
             counts[model] = counts.get(model, 0) + planned
         return self._policy.for_awake(counts)
 
-    def take_donor(self, serve_id: str) -> None:
-        """Mark a donor binding as slept / hidden by this tick's plan."""
-        self._donor_taken.add(serve_id)
+    def count_released(self, serve_ids) -> None:
+        """Count donor bindings as released by this tick's plan (estimate only)."""
+        self._released.update(serve_ids)
 
-    def donor_taken_ids(self) -> set[str]:
-        return set(self._donor_taken)
+    def released_donor_ids(self) -> set[str]:
+        return set(self._released)
 
     def model_gpus(self, model: str) -> set[tuple[str, int]]:
         """GPUs ``model`` holds awake or has claimed this tick."""
@@ -1400,55 +1425,71 @@ class _SlotOccupancy:
             self._model_claimed.setdefault(model, set()).update(gpus)
             self._planned_counts[model] = self._planned_counts.get(model, 0) + 1
 
-    def donor_slot_pods(self, donor: str, receiver: str) -> list[tuple[str, Binding]]:
-        """(donor serve_id, receiver sleeping binding) pairs: sleeping that single awake
-        donor binding frees exactly a slot the receiver can wake into.
-
-        Ranked by the placement policy (the receiver slot is scored as if its donor
-        had already slept), greedily, one receiver slot per donor binding; slots the
-        buddy model cannot score keep the natural order at the tail."""
-        matches: list[tuple[Binding, Binding]] = []
+    def pairable(
+        self, donor: str, receiver: str, *, max_pairs: int, max_donors: int
+    ) -> "PairEstimate":
+        """How many relay pairs ``donor`` -> ``receiver`` the SM can form (the same rule
+        as its pair selection, design 20261002-sm-transfer section 3): a sleeping, not
+        hidden receiver binding on GPUs not claimed / blocked, EVERY one of which an
+        awake, not hidden binding of ``donor`` holds (a GPU without one is
+        ``uncovered_gpu``: no relay; a GPU with no occupant at all is a plain wake).
+        A pair consumes all its occupants (a TP receiver may take two single-GPU donors).
+        At most ``max_pairs`` pairs and ``max_donors`` donor replicas; pairs with fewer
+        donors first. The pairs found are counted (receiver GPUs claimed, donors
+        released) so a later relay / wake of this tick does not count them again."""
+        if max_pairs <= 0 or max_donors <= 0:
+            return PairEstimate(0, 0, ())
+        candidates: list[tuple[Binding, tuple[Binding, ...]]] = []
         for receiver_binding in self.sleeping(receiver):
             gpus = self._gpus(receiver_binding)
             if any(gpu in self._claimed or gpu in self._blocked for gpu in gpus):
                 continue
-            occupants = {self._awake[gpu] for gpu in gpus if gpu in self._awake}
-            if len(occupants) != 1:
+            if not all(gpu in self._awake for gpu in gpus):
+                continue  # no occupant (plain wake) or uncovered_gpu (no relay)
+            occupants = {self._awake[gpu].serve_id: self._awake[gpu] for gpu in gpus}
+            if any(
+                occupant.model != donor or occupant.hidden or occupant.serve_id in self._released
+                for occupant in occupants.values()
+            ):
                 continue
-            occupant = next(iter(occupants))
-            if occupant.model != donor or occupant.hidden or occupant.serve_id in self._donor_taken:
+            candidates.append(
+                (receiver_binding, tuple(sorted(occupants.values(), key=lambda b: natural_key(b.serve_id))))
+            )
+        candidates.sort(key=lambda item: (len(item[1]), natural_key(item[0].serve_id)))
+        pairs = donors = 0
+        donor_pods: list[str] = []
+        for receiver_binding, occupants in candidates:
+            if pairs >= max_pairs:
+                break
+            ids = [occupant.serve_id for occupant in occupants]
+            if any(serve_id in self._released for serve_id in ids) or donors + len(ids) > max_donors:
                 continue
-            matches.append((receiver_binding, occupant))
-        policy = self.policy()
-        occupied = self.occupied()
-        receiver_gpus = self.model_gpus(receiver)
-        pairs: list[tuple[str, Binding]] = []
-        used: set[str] = set()
-        while True:
-            best: tuple[tuple, int] | None = None
-            for index, (receiver_binding, occupant) in enumerate(matches):
-                if occupant.serve_id in used or any(
-                    binding.serve_id == receiver_binding.serve_id for _, binding in pairs
-                ):
-                    continue
-                choice = None
-                if is_buddy_aligned(receiver_binding.slot, self._nodes):
-                    choice = choose_placement(
-                        [slot_block(receiver_binding.slot)],
-                        nodes=self._nodes,
-                        occupied=occupied - self._gpus(occupant),
-                        policy=policy,
-                        model_occupied=receiver_gpus,
-                    )
-                key = ((0, choice.score) if choice is not None else (1, ()), index)
-                if best is None or key < best[0]:
-                    best = (key, index)
-            if best is None:
-                return pairs
-            receiver_binding, occupant = matches[best[1]]
-            used.add(occupant.serve_id)
-            receiver_gpus = receiver_gpus | self._gpus(receiver_binding)
-            pairs.append((occupant.serve_id, receiver_binding))
+            self.claim(receiver_binding)
+            self._released.update(ids)
+            pairs += 1
+            donors += len(ids)
+            donor_pods.extend(ids)
+        return PairEstimate(pairs, donors, tuple(donor_pods))
+
+    def pairable_count(
+        self, donor: str, receiver: str, *, max_pairs: int, max_donors: int
+    ) -> tuple[int, int]:
+        """(pairs, donor replicas) of :meth:`pairable`: the size of a relay intent that
+        the SM can fill on this view (an intent larger than that would come back
+        ``unfilled``)."""
+        estimate = self.pairable(donor, receiver, max_pairs=max_pairs, max_donors=max_donors)
+        return estimate.pairs, estimate.donors
+
+
+@dataclass(frozen=True)
+class PairEstimate:
+    """:meth:`_SlotOccupancy.pairable`: receiver replicas (``pairs``), donor replicas
+    they consume (``donors``) and those donor pods (used only to name a middle-zone
+    SafeScale probe's pods; a relay intent names none)."""
+
+    pairs: int
+    donors: int
+    donor_pods: tuple[str, ...]
 
 
 def _plan_sleeping_wakes(
@@ -1615,49 +1656,6 @@ def _plan_create_capacity(
     return len(taken)
 
 
-def _slot_matched_first(
-    candidates: list[ModelClassification],
-    occupancy: _SlotOccupancy | None,
-    receiver: str,
-) -> list[ModelClassification]:
-    """Stable re-order: donors whose awake binding sits on a receiver-sleeping slot first."""
-    if occupancy is None or not occupancy.sleeping(receiver):
-        return candidates
-    return sorted(
-        candidates,
-        key=lambda item: 0 if occupancy.donor_slot_pods(item.model_name, receiver) else 1,
-    )
-
-
-def _slot_targeted_transfer(
-    occupancy: _SlotOccupancy | None,
-    *,
-    donor: str,
-    receiver: str,
-    transfer: int,
-    events: list[str],
-) -> tuple[int, tuple[str, ...], tuple[str, ...]]:
-    """Pin a donor shrink to the bindings that free receiver-sleeping slots.
-
-    Returns (transfer, donor pods to sleep/probe, receiver pods to wake). With a cluster
-    view a donor is only paired when sleeping it frees a GPU slot the receiver holds a
-    binding on; otherwise transfer=0 and ``donor_no_slot_match`` is emitted (a
-    model-level shrink would sleep a tail pod the receiver cannot use). Without a cluster
-    view the legacy model-level pair is kept."""
-    if occupancy is None:
-        return transfer, (), ()
-    pairs = occupancy.donor_slot_pods(donor, receiver)[:transfer]
-    if not pairs:
-        event = f"donor_no_slot_match:{donor}:{receiver}"
-        if event not in events:
-            events.append(event)
-        return 0, (), ()
-    for donor_pod, receiver_binding in pairs:
-        occupancy.claim(receiver_binding)
-        occupancy.take_donor(donor_pod)
-    return len(pairs), tuple(pod for pod, _ in pairs), tuple(binding.serve_id for _, binding in pairs)
-
-
 def _try_plan_same_slot_high_shrink(
     *,
     classifications: list[ModelClassification],
@@ -1687,12 +1685,11 @@ def _try_plan_same_slot_high_shrink(
         if binding.model == receiver or len(binding.slot.gpu_ids) != 1:
             continue
         if binding.serve_id in (taken_serve_ids or ()):
-            continue  # this tick already sleeps this pod for another receiver
-        donor_pods = _effective_routable_replicas(binding.model, model_contexts, model_replicas)
+            continue  # this tick already counts this pod as released for another receiver
         # Takes already planned this tick (e.g. a critical_donor_immediate of an earlier
-        # receiver) count against the donor's floor too.
+        # receiver) count against the donor's floor headroom too.
         planned_take = abs(min((planned_deltas or {}).get(binding.model, 0), 0))
-        if donor_pods - planned_take <= _min_replicas(cfg, binding.model):
+        if _donor_headroom(cfg, binding.model, model_contexts, model_replicas) - planned_take <= 0:
             continue
         if not _slot_mate_is_free(cluster_view, binding.slot, occupied):
             continue
@@ -1849,7 +1846,6 @@ def _add_scale_action(
     receiver: str | None = None,
     donor: str | None = None,
     pods: tuple[str, ...] = (),
-    transfer_id: str | None = None,
     sleep_path: str | None = None,
     drain_budget_s: float | None = None,
     hint: bool = False,
@@ -1870,7 +1866,6 @@ def _add_scale_action(
             receiver=receiver,
             donor=donor,
             pods=tuple(pods),
-            transfer_id=transfer_id,
             sleep_path=sleep_path if delta < 0 else None,
             drain_budget_s=drain_budget_s if delta < 0 else None,
             hint=bool(hint and delta > 0 and pods),
@@ -1927,15 +1922,16 @@ def _tag_rescue_actions(
     from ``actions[first:]`` and log the decision (``rescue_target``)."""
     desired, base, covered = ctx
     model = recv.model_name
-    planned = sum(
-        action.delta
-        for action in actions[first:]
-        if isinstance(action, ScaleAction) and action.model == model and action.delta > 0
-    )
+    planned = 0
+    for action in actions[first:]:
+        up = upscale_of(action)
+        if up is not None and up[0] == model:
+            planned += up[1]
     plan = RescuePlan(target=covered + planned, desired=desired, base=base, covered=covered)
     for index in range(first, len(actions)):
         action = actions[index]
-        if isinstance(action, ScaleAction) and action.model == model and action.delta > 0:
+        up = upscale_of(action)
+        if up is not None and up[0] == model:
             actions[index] = replace(action, rescue=plan)
     if planned <= 0:
         return  # nothing planned: the capacity events of the paths say why
@@ -1968,6 +1964,28 @@ def _tp_size(cfg: PlanConfig, model_name: str) -> int:
 
 def _min_replicas(cfg: PlanConfig, model_name: str) -> int:
     return cfg.min_replicas_by_model.get(model_name, cfg.min_replicas_per_model)
+
+
+def _donor_headroom(
+    cfg: PlanConfig,
+    model_name: str,
+    model_contexts: Mapping[str, Mapping[str, Any]],
+    model_replicas: Mapping[str, int],
+) -> int:
+    """Replicas ``model_name`` may give before its replica floor (2026-10-02): the SM's
+    ``floor_headroom`` (``/v2/state``: routable - enforced min_replicas, the count its
+    floor check uses) when the tick context carries it, never more than the routable
+    count minus the registry ``min_replicas`` (the SM floor is 0 while it is not
+    enforced; the planner's own floor still holds then). Without the SM value (an
+    unreadable or older ``/v2/state``): routable - min_replicas, as before."""
+    own = _effective_routable_replicas(model_name, model_contexts, model_replicas) - _min_replicas(cfg, model_name)
+    sm = (model_contexts.get(model_name) or {}).get("floor_headroom")
+    if sm is None:
+        return max(0, own)
+    try:
+        return max(0, min(int(sm), own))
+    except (TypeError, ValueError):
+        return max(0, own)
 
 
 def _serving_floor(

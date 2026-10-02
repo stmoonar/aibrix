@@ -133,8 +133,9 @@ def test_tre_v2_overlay_declares_components_and_independent_redis() -> None:
     assert _env(controller)["SAFE_SCALE_WINDOW_FLOOR_MS"] == "20000"
     assert _env(controller)["SAFE_SCALE_MIN_WINDOW_MS"] == "60000"
     assert _env(controller)["SAFE_SCALE_E2E_MULTIPLIER"] == "2"
-    # P2-6: donor hold after an SM floor_violation, in fast-loop ticks.
-    assert _env(controller)["TRE_FLOOR_VIOLATION_COOLDOWN_TICKS"] == "6"
+    # P2-6 donor hold removed (2026-10-02, design 20261002-controller-transfer): the
+    # deprecated key is not set any more (it would only log a deprecation warning).
+    assert "TRE_FLOOR_VIOLATION_COOLDOWN_TICKS" not in _env(controller)
     # Timer cleanup (2026-10-02): the F4 cooldown is the fallback while O1 is not active.
     assert _env(controller)["TRE_ACTION_COOLDOWN"] == "1"
     # 2026-09-29: SafeScale thresholds come from registry safescale.slo_mode; the env

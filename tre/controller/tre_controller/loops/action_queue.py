@@ -17,9 +17,8 @@ from tre_controller.planning.planner import (
     SafeScaleCommitAction,
     ScaleAction,
     SourceLoop,
-    TransferAction,
+    TransferIntent,
     UnhideAction,
-    fuse_transfers,
 )
 
 if False:  # annotations are strings (from __future__); avoids an import cycle
@@ -28,7 +27,7 @@ if False:  # annotations are strings (from __future__); avoids an import cycle
 CLUSTER_MODEL = "__cluster__"
 #: Resource key of a cluster-wide action (defrag): it conflicts with EVERY other
 #: action - a defrag migrates pods of any model across any GPU, so nothing that
-#: touches a pod, a GPU or a model runs next to it (review 3 P3).
+#: touches a pod or a model runs next to it (review 3 P3).
 CLUSTER_RESOURCE = "cluster:*"
 
 #: Source loops whose actions are one-shot: the source never re-emits them (the
@@ -39,7 +38,7 @@ ONE_SHOT_LOOPS = frozenset({"safescale"})
 
 LOG = logging.getLogger(__name__)
 
-QueueAction = Action | TransferAction | SafeScaleCommitAction
+QueueAction = Action | SafeScaleCommitAction
 
 #: Signal states in which a model needs capacity (rescue / fairness receivers),
 #: and those in which it clearly does not. Anything else (unknown, a receiver
@@ -47,8 +46,6 @@ QueueAction = Action | TransferAction | SafeScaleCommitAction
 NEEDS_CAPACITY_STATES = frozenset({"critical", "low"})
 NO_NEED_STATES = frozenset({"healthy", "high", "idle"})
 
-#: (node, gpu ids) of a binding by serve_id, or None when unknown.
-SlotLookup = Callable[[str], "tuple[str, tuple[int, ...]] | None"]
 #: None = the action is still wanted; else the reason it no longer is.
 Revalidate = Callable[[QueueAction], "str | None"]
 
@@ -81,6 +78,15 @@ class ServiceManagerClient(Protocol):
 
     async def defrag(self, migrations: tuple) -> dict: ...
 
+    async def transfer(self, donor_model: str, receiver_model: str, count: int, *, sleep_path: str) -> dict: ...
+
+    async def get_transfers(self) -> dict: ...
+
+
+#: ``pairs[].status`` of a ``POST /v2/transfers`` pair that the service-manager's
+#: recovery continues (``left_to_recovery``): the receiver may still wake.
+TRANSFER_OPEN_STATUSES = frozenset({"pending", "receiver_waking"})
+
 
 @dataclass(frozen=True)
 class RetryPolicy:
@@ -103,7 +109,8 @@ class QueuedAction:
     #: Every model the action changes (inflight accounting); default (model,).
     models: tuple[str, ...] = ()
     #: Serialization keys: two queued actions sharing a key never run concurrently
-    #: and keep their submit order (models, pods, and GPUs when known).
+    #: and keep their submit order (models and pods; the GPU keys were removed on
+    #: 2026-10-02 - the service-manager serializes GPU use under its writer lock).
     resources: frozenset[str] = frozenset()
     #: Failed retriable attempts so far (one-shot actions).
     failures: int = 0
@@ -136,14 +143,27 @@ class DispatchResult:
     #: Pods the SM reported ``unconfirmed`` (/sleep sent, never confirmed asleep)
     #: or whose rollback failed (review 4 P2-2): they must stay hidden.
     unconfirmed: tuple[str, ...] = ()
-    #: The SM refused the call with 409 ``floor_violation`` (P2-6): the model is held
-    #: out of scale-down planning for a while (``ActionQueue.floor_held_models``).
+    #: The SM refused the call with 409 ``floor_violation`` (a binding-level sleep or a
+    #: SafeScale hide): recorded as an event only since 2026-10-02 (no hold).
     floor_violation: bool = False
     #: S3: the located wake refusal / failure of a structured 409 (node, gpu_ids,
-    #: scope, error), or None.
+    #: scope, error), or None. An event only since 2026-10-02 (no GPU cooldown).
     wake_conflict: dict | None = None
     #: S5: where the SM woke the replicas (``picked`` of the response).
     picked: tuple = ()
+    #: 2026-10-02: replicas a scale-down really put to sleep (``taken`` of a model-level
+    #: ``/target`` shrink, a transfer's donor side); None = not reported. 0 = nothing
+    #: changed (the floor clamped it): not a scale-down for any hold or stamp.
+    taken: int | None = None
+    #: 2026-10-02: receiver replicas a transfer woke (``done``); None for other actions.
+    done: int | None = None
+    #: 2026-10-02: the transfer summary of a TransferIntent's result (transfer_id,
+    #: done, taken, unfilled, clamped_by_floor, pairs with pod names, refusals).
+    transfer: dict | None = None
+    #: 2026-10-02: the SM refused the call before changing anything (``routable_unknown``,
+    #: ``RetryLater``, ``writer_busy``, ``floor_violation``, a located wake refusal, 400):
+    #: accounted as not executed - no view-pending / O1 stamp, no last action.
+    not_executed: bool = False
 
 
 @dataclass
@@ -185,12 +205,15 @@ class _Backoff:
 class ActionQueue:
     """Dispatches controller actions to the service-manager.
 
-    Actions run concurrently unless they share a resource (a model, a pod, a GPU;
-    a defrag conflicts with everything): those run one at a time in submit order
-    (review P1-3 / review 2 P1-1). A donor -> receiver transfer is one compound
-    action touching both models: the receiver is woken only after the donor
-    slept; a SafeScale commit is the same for its hidden donor pods and its
-    follow-up receivers (review 3 P2-2). One-shot actions (SafeScale commit /
+    Actions run concurrently unless they share a resource (a model, a pod; a
+    defrag conflicts with everything): those run one at a time in submit order
+    (review P1-3 / review 2 P1-1). A donor -> receiver relay (TransferIntent,
+    2026-10-02) is ONE service-manager call (``POST /v2/transfers``) holding both
+    models; the SM picks the pods / GPUs, sleeps the donors and wakes the
+    receivers. A pair the SM hands to its recovery (``left_to_recovery``) keeps
+    both models held until ``GET /v2/transfers`` no longer lists the transfer (a
+    state gate, no timer). A SafeScale commit is an ordered unit for its hidden
+    donor pods and its follow-up receivers (review 3 P2-2). One-shot actions (SafeScale commit /
     rollback) that fail retriably are retried with bounded backoff and
     re-validated before every retry; a retry only ever re-sends idempotent
     requests (named bindings, absolute targets - review 3 P2-1). A rescue action
@@ -200,7 +223,13 @@ class ActionQueue:
     Observe mode (user decision 2026-09-28, record only): re-plannable actions
     are dropped; a SafeScale one-shot action runs only as the unhide of its
     probe pods; the mode is re-read (uncached) right before every
-    capacity-changing step, so a transfer / commit already running stops there.
+    capacity-changing step, so a commit already running stops there. A relay is
+    checked right before its one ``POST /v2/transfers``; once sent, the SM
+    completes it (design 20261002-controller-transfer).
+
+    Refusals, ``clamped_by_floor`` and ``taken: 0`` are observation events only
+    (``wake_refused``, ``transfer_clamped_by_floor``, ``scale_clamped_by_floor``):
+    no GPU cooldown, no floor hold - the next tick re-plans from a new view.
     """
 
     def __init__(
@@ -213,44 +242,29 @@ class ActionQueue:
         retry: RetryPolicy | None = None,
         revalidate: Revalidate | None = None,
         revalidate_commit: CommitRevalidate | None = None,
-        slot_of: SlotLookup | None = None,
         sleep: Callable[[float], Awaitable[None]] | None = None,
         fresh_view: Callable[[], object] | None = None,
         on_oneshot_done: Callable[[str, str, str], None] | None = None,
         commit_max_age_ms: float | None = None,
         is_observe_fresh: Callable[[], bool] | None = None,
         on_hide_failed: Callable[[str, tuple[str, ...], str], None] | None = None,
-        floor_violation_hold_ms: float | None = None,
         on_hide_done: Callable[[str, tuple[str, ...]], None] | None = None,
-        wake_cooldown_s: tuple[float, float] | None = (30.0, 60.0),
         scale_memory: object | None = None,
         scale_memory_max_age_ms: float | None = 50_000.0,
+        transfer_poll_s: float = 2.0,
     ) -> None:
         self._client = client
-        #: S3: (gpu_s, node_s) a GPU / node the SM refused a wake on is kept out of
-        #: wake planning (registry placement.wake_cooldown); None = off.
-        self._wake_cooldown_ms = (
-            None
-            if wake_cooldown_s is None
-            else (max(0.0, float(wake_cooldown_s[0])) * 1000.0, max(0.0, float(wake_cooldown_s[1])) * 1000.0)
-        )
-        #: (node, gpu) / node -> time (ms, ``now_ms``) the cooldown ends.
-        self._gpu_cooldowns: dict[tuple[str, int], int] = {}
-        self._node_cooldowns: dict[str, int] = {}
-        #: model -> (``node/gpu`` of its last refused wake, cooldown end ms).
-        self._refusals: dict[str, tuple[str, int]] = {}
-        #: Decision events for the next planner tick (gpu_cooldown / wake_refused /
-        #: placement_retry), drained by :meth:`drain_events`.
+        #: Observation events for the next planner tick (transfer outcomes,
+        #: wake_refused, *_clamped_by_floor, placement_substituted), drained by
+        #: :meth:`drain_events`. No timer follows any of them (2026-10-02).
         self._events: list[str] = []
-        #: P2-6: how long (ms, on ``now_ms``) a model whose hide / sleep the SM refused
-        #: with 409 floor_violation stays out of scale-down planning (None / <= 0 = off).
-        self._floor_hold_ms = (
-            float(floor_violation_hold_ms)
-            if floor_violation_hold_ms is not None and floor_violation_hold_ms > 0
-            else None
-        )
-        #: model -> time (ms, ``now_ms``) its floor-violation hold ends.
-        self._floor_holds: dict[str, int] = {}
+        #: 2026-10-02: how often a relay the SM left to its recovery is looked up in
+        #: ``GET /v2/transfers`` (the poll period of a state gate: the models stay held
+        #: until the transfer is no longer listed, however long that takes).
+        self._transfer_poll_s = max(0.0, float(transfer_poll_s))
+        #: transfer_id -> {donor_model, receiver_model, pairs, since_ms} of relays the
+        #: SM is still finishing (``left_to_recovery``), see :meth:`recovering_transfers`.
+        self._recovering: dict[str, dict] = {}
         #: P3: (model, pods, error) of a hide that did not take effect (failed, or
         #: not sent because of observe mode): its SafeScale probe is rolled back
         #: instead of being judged as if the pods were hidden.
@@ -305,7 +319,6 @@ class ActionQueue:
         self._retry = retry or RetryPolicy()
         self._revalidate = revalidate
         self._revalidate_commit = revalidate_commit
-        self._slot_of = slot_of
         self._sleep = sleep or asyncio.sleep
         #: The cluster view only while fresh (review 4 P2-1), else None.
         self._fresh_view = fresh_view
@@ -321,7 +334,6 @@ class ActionQueue:
             "oneshot_retries_total": 0,
             "oneshot_abandoned_total": 0,
             "oneshot_not_wanted_total": 0,
-            "transfer_receiver_dropped_total": 0,
             "commit_abandoned_total": 0,
             "commit_upscale_dropped_total": 0,
             "commit_receiver_dropped_total": 0,
@@ -334,17 +346,27 @@ class ActionQueue:
             "unconfirmed_kept_hidden_total": 0,
             "commit_evidence_stale_total": 0,
             "oneshot_cancelled_total": 0,
-            # Observe mode (2026-09-28): hides not sent, transfers / commits
-            # stopped between steps, commits turned into their donor unhide.
+            # Observe mode (2026-09-28): hides not sent, commits stopped between
+            # steps, commits turned into their donor unhide; a relay the SM was
+            # already running when observe began is completed by the SM.
             "observe_hide_skipped_total": 0,
-            "observe_transfer_stopped_total": 0,
             "observe_commit_stopped_total": 0,
+            "observe_transfer_completed_total": 0,
             "floor_violation_total": 0,
+            # 2026-10-02 relays (POST /v2/transfers) and floor clamps.
+            "transfer_total": 0,
+            "transfer_pairs_done_total": 0,
+            "transfer_partial_total": 0,
+            "transfer_failed_total": 0,
+            "transfer_clamped_by_floor_total": 0,
+            "transfer_left_to_recovery_total": 0,
+            "transfer_unsupported_total": 0,
+            "scale_clamped_by_floor_total": 0,
         }
 
     # ------------------------------------------------------------------ submit
     def submit(self, actions: tuple[Action, ...] | list[Action]) -> SubmitResult:
-        queued_actions = tuple(self._queued(action) for action in fuse_transfers(actions))
+        queued_actions = tuple(self._queued(action) for action in actions)
         if len(queued_actions) > 1 and all(
             queued.source_loop == "safescale" for queued in queued_actions
         ):
@@ -392,7 +414,7 @@ class ActionQueue:
 
             self._pending.append(queued)
             self._inflight.update(queued.models)
-            accepted += 2 if isinstance(queued.action, TransferAction) else 1
+            accepted += 1
             self._register_rescue(queued.action, rescue_started)
             if observe and queued.source_loop == "safescale":
                 held += 1
@@ -446,8 +468,16 @@ class ActionQueue:
 
     def view_changes(self) -> dict[str, tuple[int, str]]:
         """Timer cleanup review P2-1: model -> (when its last routable-changing SM call
-        returned - also a failed or partial one, also an unhide -, hold direction)."""
+        returned - also a failed or partial one, also an unhide -, hold direction). A
+        relay records both sides (donor "down", receiver "up"); a call that changed
+        nothing (``taken: 0``, a relay side with no pair) records nothing (2026-10-02)."""
         return dict(self._view_change)
+
+    def recovering_transfers(self) -> dict[str, dict]:
+        """2026-10-02: relays the service-manager is still finishing (pairs it left to
+        its recovery) -> {donor_model, receiver_model, pairs, since_ms}. Both models are
+        held (in flight) until ``GET /v2/transfers`` no longer lists the transfer."""
+        return {key: dict(value) for key, value in self._recovering.items()}
 
     def rescue_targets(self) -> dict[str, RescueTargetRecord]:
         """C1: model -> its last rescue target (copies). The planner tick keeps the
@@ -496,6 +526,13 @@ class ActionQueue:
         record = self._rescue_parts.get(id(action)) if part is not None else None
         if record is None:
             return
+        if isinstance(part, TransferIntent):
+            # A relay adds the receivers the SM really woke (``done``), never ``count``.
+            done = int(result.done or 0)
+            record.gained += min(int(part.pairs), done)
+            if done < int(part.pairs):
+                record.failures += 1
+            return
         if result.ok:
             record.gained += int(part.delta)
         else:
@@ -524,97 +561,45 @@ class ActionQueue:
                 )
             )
 
-    def floor_held_models(self) -> set[str]:
-        """P2-6: models the SM refused a hide / sleep of with 409 floor_violation
-        less than ``floor_violation_hold_ms`` ago. The planner picks none of them as
-        a donor (any scale-down) meanwhile - otherwise the fast loop re-plans the
-        same donor against its stale view every tick and is refused every time."""
-        if not self._floor_holds:
-            return set()
-        now = int(self._now_ms())
-        for model, until in list(self._floor_holds.items()):
-            if now >= until:
-                del self._floor_holds[model]
-        return set(self._floor_holds)
-
-    # ------------------------------------------------------------ S3 wake cooldown
-    def cooled_gpus(self) -> set[tuple[str, int]]:
-        """GPUs the SM recently refused a wake on (their cooldown still runs)."""
-        now = int(self._now_ms())
-        for key, until in list(self._gpu_cooldowns.items()):
-            if now >= until:
-                del self._gpu_cooldowns[key]
-        return set(self._gpu_cooldowns)
-
-    def cooled_nodes(self) -> set[str]:
-        """Nodes the SM refused a wake on with node scope (no gpu-truth for the node)."""
-        now = int(self._now_ms())
-        for node, until in list(self._node_cooldowns.items()):
-            if now >= until:
-                del self._node_cooldowns[node]
-        return set(self._node_cooldowns)
-
-    def recent_refusals(self) -> dict[str, str]:
-        """model -> ``node/gpu`` of its last refused wake, while that cooldown runs."""
-        now = int(self._now_ms())
-        for model, (_where, until) in list(self._refusals.items()):
-            if now >= until:
-                del self._refusals[model]
-        return {model: where for model, (where, _until) in self._refusals.items()}
-
     def drain_events(self) -> list[str]:
         events, self._events = self._events, []
         return events
 
-    def _note_wake_conflict(self, action, result: DispatchResult) -> None:
+    def _note_wake_refused(self, action, result: DispatchResult) -> None:
+        """A located wake refusal (structured 409): an observation event only - the next
+        tick re-plans from a new view (the per-GPU / per-node cooldown was removed on
+        2026-10-02)."""
         conflict = result.wake_conflict
         if conflict is None or _action_direction(action) != "up":
             return
-        self._cool(result.model, conflict)
+        self._wake_refused_event(result.model, conflict)
 
-    def _cool(self, model: str, conflict: dict) -> None:
-        if self._wake_cooldown_ms is None or not conflict.get("node"):
+    def _wake_refused_event(self, model: str, conflict: dict) -> None:
+        if not conflict.get("node"):
             return
-        gpu_ms, node_ms = self._wake_cooldown_ms
-        now = int(self._now_ms())
-        node = conflict["node"]
-        gpus = [int(gpu) for gpu in conflict.get("gpu_ids") or ()]
-        where = f"{node}/{','.join(str(gpu) for gpu in gpus)}"
-        code = conflict.get("error")
-        self._events.append(f"wake_refused:{model}:{where}:{code}")
-        if conflict.get("scope") == "node":
-            until = now + int(node_ms)
-            self._node_cooldowns[node] = max(until, self._node_cooldowns.get(node, 0))
-            self._events.append(f"gpu_cooldown:{node}/*:{until}")
-        else:
-            until = now + int(gpu_ms)
-            for gpu in gpus:
-                self._gpu_cooldowns[(node, gpu)] = max(until, self._gpu_cooldowns.get((node, gpu), 0))
-                self._events.append(f"gpu_cooldown:{node}/{gpu}:{until}")
-        self._refusals[model] = (where, until)
-        LOG.warning(
+        gpus = [str(gpu) for gpu in conflict.get("gpu_ids") or ()]
+        where = f"{conflict['node']}/{','.join(gpus)}"
+        self._events.append(f"wake_refused:{model}:{where}:{conflict.get('error')}")
+        LOG.info(
             json.dumps(
-                {"event": "gpu_cooldown", "model": model, "node": node, "gpu_ids": gpus,
-                 "scope": conflict.get("scope"), "error_code": code, "reason": conflict.get("reason"),
-                 "until_ms": until, "blocking_binding_id": conflict.get("blocking_binding_id")},
+                {"event": "wake_refused", "model": model, "node": conflict.get("node"),
+                 "gpu_ids": conflict.get("gpu_ids") or [], "scope": conflict.get("scope"),
+                 "error_code": conflict.get("error"), "reason": conflict.get("reason"),
+                 "blocking_binding_id": conflict.get("blocking_binding_id")},
                 sort_keys=True,
             )
         )
 
     def _note_floor_violation(self, result: DispatchResult) -> None:
+        """A 409 ``floor_violation`` (binding-level sleep, SafeScale hide): counted and
+        logged; no hold (removed 2026-10-02) - the donor's ``floor_headroom`` in the next
+        view bounds the planner."""
         if not result.floor_violation or result.model == CLUSTER_MODEL:
             return
         self._stats["floor_violation_total"] += 1
-        if self._floor_hold_ms is None:
-            return
-        until = int(self._now_ms() + self._floor_hold_ms)
-        self._floor_holds[result.model] = max(until, self._floor_holds.get(result.model, 0))
+        self._events.append(f"floor_violation:{result.model}")
         LOG.warning(
-            json.dumps(
-                {"event": "floor_violation_hold", "model": result.model, "error": result.error,
-                 "hold_ms": self._floor_hold_ms},
-                sort_keys=True,
-            )
+            json.dumps({"event": "floor_violation", "model": result.model, "error": result.error}, sort_keys=True)
         )
 
     def has_request(self, request_id: str) -> bool:
@@ -804,7 +789,7 @@ class ActionQueue:
             results.extend(_observe_skipped(queued))
             self._notify_hide_failed(queued.action, "observe_skipped")
             return None
-        if isinstance(queued.action, TransferAction):
+        if isinstance(queued.action, TransferIntent):
             results.extend(await self._execute_transfer(queued.action))
             return ("done", "transfer")
         if isinstance(queued.action, SafeScaleCommitAction):
@@ -1320,8 +1305,8 @@ class ActionQueue:
         several scale-up parts of one receiver never each count the same pods."""
         credit = {} if credit is None else credit
         action = queued.action
-        if isinstance(action, TransferAction):
-            model, delta = action.receiver.model, action.receiver.delta
+        if isinstance(action, TransferIntent):
+            model, delta = action.receiver_model, action.pairs
         elif isinstance(action, ScaleAction) and action.delta > 0:
             model, delta = action.model, action.delta
         else:
@@ -1334,7 +1319,7 @@ class ActionQueue:
         available = credit.get(model, 0) + restored
         if available <= 0:
             return queued, 0
-        if isinstance(action, TransferAction):
+        if isinstance(action, TransferIntent):
             # A relay is not split: covered entirely, or kept whole (credit kept).
             if available >= delta:
                 credit[model] = available - delta
@@ -1435,46 +1420,95 @@ class ActionQueue:
             self._running[task] = queued
             self._release_idle_models()
 
-    async def _execute_transfer(self, action: TransferAction) -> list[DispatchResult]:
-        donor, receiver = action.donor, action.receiver
-        donor_result = await self._timed_dispatch(donor, donor.model)
-        self._record_done(donor.model, donor, donor_result)
-        if not donor_result.ok:
-            # The receiver's wake needs what the donor's sleep frees: never run it.
-            self._stats["transfer_receiver_dropped_total"] += 1
-            reason = f"donor_sleep_failed: {donor_result.error}"
-            LOG.warning(
-                "transfer %s -> %s: donor sleep failed, receiver wake dropped (%s)",
-                donor.model, receiver.model, donor_result.error,
-            )
-            return [
-                donor_result,
-                DispatchResult(model=receiver.model, action_kind="scale", ok=False, error=reason),
-            ]
-        if self._is_observe_fresh():
-            # Observe entered while the donor slept (2026-09-28): the donor sleep
-            # is done and stays done; the receiver is NOT woken - recorded.
-            self._stats["observe_transfer_stopped_total"] += 1
+    async def _execute_transfer(self, action: TransferIntent) -> list[DispatchResult]:
+        """One relay = one ``POST /v2/transfers`` (2026-10-02). Accounting follows the
+        response, never ``count``: the donor side by ``taken`` (donor replicas slept),
+        the receiver side by ``done`` (receivers woken); a 200 may be partial. Pairs the
+        SM left to its recovery keep both models held here until ``GET /v2/transfers``
+        no longer lists the transfer."""
+        result = await self._timed_dispatch(action, action.receiver_model)
+        summary = result.transfer or {}
+        donor_result = DispatchResult(
+            model=action.donor_model, action_kind="transfer", ok=result.ok, error=result.error,
+            retriable=False, taken=result.taken, transfer=result.transfer, not_executed=result.not_executed,
+        )
+        self._note_rescue_result(action, result)
+        self._record_transfer_done(action, result)
+        if result.ok and self._is_observe_fresh():
+            # Observe began while the SM ran the relay: it was sent before (the mode is
+            # read right before the call) and the SM completes it - recorded only.
+            self._stats["observe_transfer_completed_total"] += 1
             LOG.warning(
                 json.dumps(
-                    {"event": "observe_entered_mid_transfer", "donor": donor.model,
-                     "donor_pods": list(donor.pods), "donor_delta": donor.delta,
-                     "receiver": receiver.model, "receiver_delta": receiver.delta,
-                     "reason": getattr(receiver, "reason", None)},
+                    {"event": "observe_entered_during_transfer", "donor": action.donor_model,
+                     "receiver": action.receiver_model, "transfer_id": summary.get("transfer_id"),
+                     "done": result.done, "taken": result.taken},
                     sort_keys=True,
                 )
             )
-            return [
-                donor_result,
-                DispatchResult(
-                    model=receiver.model, action_kind="scale", ok=False,
-                    error="observe_entered: receiver wake not issued (donor already slept)",
-                ),
-            ]
-        receiver_result = await self._timed_dispatch(receiver, receiver.model)
-        self._note_rescue_result(action, receiver_result)
-        self._record_done(receiver.model, receiver, receiver_result)
-        return [donor_result, receiver_result]
+        recovering = summary.get("left_to_recovery") or ()
+        if summary.get("transfer_id") and recovering:
+            await self._await_transfer_recovery(action, str(summary["transfer_id"]), list(recovering))
+        return [donor_result, result]
+
+    async def _await_transfer_recovery(self, action: TransferIntent, transfer_id: str, pairs: list) -> None:
+        """Hold the relay's models (this dispatch task keeps their resources) until the
+        service-manager's ``GET /v2/transfers`` no longer lists ``transfer_id`` - in
+        progress or running in its process. A state gate: it ends when the SM finished
+        (or gave up) the transfer, however long that takes; an unreadable answer keeps
+        the gate closed."""
+        self._stats["transfer_left_to_recovery_total"] += 1
+        self._recovering[transfer_id] = {
+            "donor_model": action.donor_model, "receiver_model": action.receiver_model,
+            "pairs": pairs, "since_ms": int(self._now_ms()),
+        }
+        self._events.append(
+            f"transfer_left_to_recovery:{action.donor_model}->{action.receiver_model}:{transfer_id}:{len(pairs)}"
+        )
+        LOG.warning(
+            json.dumps(
+                {"event": "transfer_left_to_recovery", "transfer_id": transfer_id,
+                 "donor": action.donor_model, "receiver": action.receiver_model, "pairs": pairs},
+                sort_keys=True,
+            )
+        )
+        reader = getattr(self._client, "get_transfers", None)
+        try:
+            while not self._closed:
+                await self._sleep(self._transfer_poll_s)
+                if not callable(reader):
+                    break  # a client without the lookup cannot track it (tests only)
+                try:
+                    with sm_actor(_actor_for(action)):
+                        response = await reader()
+                except Exception as exc:  # noqa: BLE001 - unreadable: the gate stays closed
+                    LOG.warning("GET /v2/transfers failed while tracking %s: %r", transfer_id, exc)
+                    continue
+                if not bool(response.get("ok", False)):
+                    continue
+                body = response.get("response") or {}
+                in_progress = body.get("in_progress") or {}
+                running = body.get("running_here") or ()
+                if transfer_id in in_progress or transfer_id in running:
+                    continue
+                break
+        finally:
+            info = self._recovering.pop(transfer_id, None)
+        now = int(self._now_ms())
+        # The recovery may have changed both routable counts: stamped when it ended.
+        for model, direction, hold in (
+            (action.donor_model, -1, "down"), (action.receiver_model, 1, "up")
+        ):
+            self._routable_change[model] = (now, direction)
+            self._view_change[model] = (now, hold)
+        self._events.append(f"transfer_recovered:{action.donor_model}->{action.receiver_model}:{transfer_id}")
+        LOG.info(
+            json.dumps(
+                {"event": "transfer_recovery_tracked", "transfer_id": transfer_id,
+                 "since_ms": (info or {}).get("since_ms"), "ended_ms": now},
+                sort_keys=True,
+            )
+        )
 
     async def _timed_dispatch(self, action, model: str) -> DispatchResult:
         """One SM call. An exception (a client bug, a malformed answer) becomes a
@@ -1513,16 +1547,9 @@ class ActionQueue:
                 error=f"dispatch_exception: {type(exc).__name__}: {exc}",
             )
         self._note_floor_violation(result)
-        self._note_wake_conflict(action, result)
-        if not refused and isinstance(action, (ScaleAction, ReceiverTarget, HideAction, UnhideAction)):
-            # O1: stamped after the SM answered, whatever the outcome (a failed or
-            # partial wake may still have changed the routable set).
-            self._routable_change[getattr(action, "model", model)] = (
-                int(self._now_ms()), _routable_direction(action)
-            )
-            self._view_change[getattr(action, "model", model)] = (
-                int(self._now_ms()), _view_hold_direction(action)
-            )
+        self._note_wake_refused(action, result)
+        if not refused:
+            self._stamp_changes(action, model, result)
         if self._prof is not None:
             self._prof.record(
                 {
@@ -1533,6 +1560,32 @@ class ActionQueue:
                 }
             )
         return result
+
+    def _stamp_changes(self, action, model: str, result: DispatchResult) -> None:
+        """O1 / view-pending stamps, after the SM answered: a failed or partial call may
+        still have changed the routable set, so it is stamped too - except a call that
+        certainly changed nothing (2026-10-02): a model-level shrink with ``taken: 0``,
+        a relay side without any pair, a refused / unsupported relay."""
+        now = int(self._now_ms())
+
+        def stamp(target: str, direction: int, hold: str) -> None:
+            self._routable_change[target] = (now, direction)
+            self._view_change[target] = (now, hold)
+
+        if isinstance(action, TransferIntent):
+            donor_changed, receiver_changed = _transfer_changed(result)
+            if donor_changed:
+                stamp(action.donor_model, -1, "down")
+            if receiver_changed:
+                stamp(action.receiver_model, 1, "up")
+            return
+        if not isinstance(action, (ScaleAction, ReceiverTarget, HideAction, UnhideAction)):
+            return
+        if result.not_executed:
+            return  # refused before any change (RetryLater, routable_unknown, ...)
+        if isinstance(action, ScaleAction) and action.delta < 0 and result.ok and result.taken == 0:
+            return  # the replica floor clamped the shrink to nothing: no change
+        stamp(getattr(action, "model", model), _routable_direction(action), _view_hold_direction(action))
 
     def _still_wanted(self, action: QueueAction) -> str | None:
         if self._revalidate is None:
@@ -1554,25 +1607,30 @@ class ActionQueue:
             # Absolute, grow-only target: re-sending it is a no-op (review 3 P2-1).
             response = await self._client.scale_model_to(action.model, int(action.target))
             return _dispatch_result(model=action.model, action_kind="scale", response=response)
+        if isinstance(action, TransferIntent):
+            transfer = getattr(self._client, "transfer", None)
+            if not callable(transfer):
+                response = {"ok": False, "error": "service-manager client has no transfer()",
+                            "status": 404, "retriable": False, "unsupported": True}
+            else:
+                response = await transfer(
+                    action.donor_model, action.receiver_model, int(action.count), sleep_path=action.sleep_path
+                )
+            return self._transfer_result(action, response)
         if isinstance(action, ScaleAction):
             if action.delta > 0 and action.pods and getattr(action, "hint", False):
                 hinted = getattr(self._client, "scale_model_hinted", None)
                 if callable(hinted):
-                    # The SM may place the wake elsewhere: never on a GPU another
-                    # queued / running action (a donor -> receiver relay) is using.
+                    # The SM may place the wake elsewhere (it serializes GPU use itself).
                     return self._hinted_result(
-                        action,
-                        await hinted(
-                            action.model, action.delta, hints=tuple(action.pods),
-                            avoid_gpus=tuple(sorted(self._busy_gpus(except_action=action))),
-                        ),
+                        action, await hinted(action.model, action.delta, hints=tuple(action.pods))
                     )
             if action.delta != 0 and action.pods:
                 return await self._dispatch_binding_power(action)
             response = await self._client.scale_model(
                 action.model, action.delta, **_sleep_kwargs(action)
             )
-            return _dispatch_result(model=action.model, action_kind="scale", response=response)
+            return self._scale_result(action, response)
         if isinstance(action, HideAction):
             if self._is_observe_fresh():
                 # B8 gap: a SafeScale probe start's hide queued just before the
@@ -1600,22 +1658,128 @@ class ActionQueue:
             return _dispatch_result(model=CLUSTER_MODEL, action_kind="defrag", response=response)
         return DispatchResult(model=model, action_kind="unknown", ok=False, error="unsupported_action")
 
-    def _busy_gpus(self, *, except_action=None) -> set[str]:
-        """``node/gpu`` of every GPU a queued or running action uses (resource keys)."""
-        items = list(self._running.values()) + list(self._pending)
-        return {
-            key[len("gpu:"):]
-            for item in items
-            if item.action is not except_action
-            for key in item.resources
-            if key.startswith("gpu:")
-        }
+    def _scale_result(self, action: ScaleAction, response: dict) -> DispatchResult:
+        """A model-level ``/target`` call. A shrink reports ``taken`` (replicas really
+        put to sleep) and ``clamped_by_floor`` (2026-10-02: the SM clamps every
+        model-level shrink at the replica floor and answers 200): accounted by
+        ``taken`` - 0 changed nothing; a clamp is an event (``scale_clamped_by_floor``),
+        never a hold."""
+        result = _dispatch_result(model=action.model, action_kind="scale", response=response)
+        if action.delta >= 0 or not result.ok:
+            return result
+        body = response.get("response") or {}
+        if not isinstance(body, dict) or "taken" not in body:
+            return result  # no shrink planned by the SM (already at / below target)
+        try:
+            taken = max(0, int(body.get("taken") or 0))
+        except (TypeError, ValueError):
+            return result
+        asked = -int(action.delta)
+        if taken < asked:
+            if body.get("clamped_by_floor"):
+                self._stats["scale_clamped_by_floor_total"] += 1
+                self._events.append(f"scale_clamped_by_floor:{action.model}:taken={taken}:asked={asked}")
+            else:
+                self._events.append(f"scale_down_short:{action.model}:taken={taken}:asked={asked}")
+            LOG.info(
+                json.dumps(
+                    {"event": "scale_down_taken", "model": action.model, "asked": asked, "taken": taken,
+                     "clamped_by_floor": bool(body.get("clamped_by_floor")), "floor": body.get("floor")},
+                    sort_keys=True, default=str,
+                )
+            )
+        return replace(result, taken=taken)
+
+    def _transfer_result(self, action: TransferIntent, response: dict) -> DispatchResult:
+        """``POST /v2/transfers`` -> the receiver-side result with the transfer summary.
+        ``ok`` = at least one pair done; ``done`` / ``taken`` say what really happened
+        (a 200 may be partial; 409 ``partial`` = nothing completed). Refusals, a floor
+        clamp and ``taken: 0`` are observation events only."""
+        donor, receiver = action.donor_model, action.receiver_model
+        relay = f"{donor}->{receiver}"
+        self._stats["transfer_total"] += 1
+        if response.get("unsupported"):
+            # Deployed against a service-manager without the endpoint: not executed.
+            self._stats["transfer_unsupported_total"] += 1
+            self._events.append(f"transfer_unsupported:{relay}")
+            LOG.error(
+                json.dumps(
+                    {"event": "transfer_endpoint_missing", "donor": donor, "receiver": receiver,
+                     "count": action.count, "detail": "POST /v2/transfers returned 404: the controller "
+                     "must be deployed together with a service-manager that implements it",
+                     "error": response.get("error")},
+                    sort_keys=True,
+                )
+            )
+            return DispatchResult(
+                model=receiver, action_kind="transfer", ok=False,
+                error="transfer_unsupported: the service-manager has no POST /v2/transfers",
+                taken=0, done=0, transfer={"outcome": "unsupported"},
+            )
+        body = response.get("response") if (response.get("ok") or response.get("partial")) else None
+        if not isinstance(body, dict):
+            status = response.get("status")
+            # Refused before any change (400, 409 routable_unknown / writer_busy /
+            # RetryLater, ...): nothing happened. Anything else (timeout, transport,
+            # 5xx, another 409): whether anything happened is unknown.
+            outcome = "refused" if response.get("not_executed") else "unknown"
+            self._stats["transfer_failed_total"] += 1
+            error = str(response.get("error") or "transfer_failed")
+            self._events.append(f"transfer_failed:{relay}:{outcome}:{error[:160]}")
+            return DispatchResult(
+                model=receiver, action_kind="transfer", ok=False, error=error, retriable=False,
+                taken=0 if outcome == "refused" else None, done=0 if outcome == "refused" else None,
+                transfer={"outcome": outcome, "status": status}, not_executed=outcome == "refused",
+            )
+        summary = _transfer_summary(body)
+        done, taken, unfilled = summary["done"], summary["taken"], summary["unfilled"]
+        self._stats["transfer_pairs_done_total"] += done
+        if done < action.pairs:
+            self._stats["transfer_partial_total"] += 1
+        self._events.append(
+            f"transfer_done:{relay}:count={action.count}:done={done}:taken={taken}:unfilled={unfilled}"
+            f":id={summary['transfer_id']}"
+        )
+        for pair in summary["pairs"]:
+            self._events.append(
+                f"transfer_pair:{relay}:{'+'.join(pair['donors'])}->{pair['receiver']}"
+                f"@{pair['node']}/{','.join(str(gpu) for gpu in pair['gpu_ids'])}:{pair['status']}"
+            )
+        for refusal in body.get("refusals") or ():
+            if isinstance(refusal, dict):
+                self._wake_refused_event(receiver, _refusal_conflict(refusal))
+        if summary["clamped_by_floor"]:
+            self._stats["transfer_clamped_by_floor_total"] += 1
+            self._events.append(f"transfer_clamped_by_floor:{relay}:taken={taken}:count={action.count}")
+        if unfilled > 0:
+            skipped = ",".join(f"{key}={value}" for key, value in sorted(summary["skipped"].items()))
+            self._events.append(f"transfer_unfilled:{relay}:{unfilled}:{skipped}")
+        LOG.info(
+            json.dumps(
+                {"event": "transfer_result", "donor": donor, "receiver": receiver, "count": action.count,
+                 "reason": action.reason, **summary},
+                sort_keys=True, default=str,
+            )
+        )
+        error = None
+        if done <= 0:
+            error = (
+                "clamped_by_floor: no donor replica taken" if summary["clamped_by_floor"] and taken == 0
+                else str(response.get("error") or "partial: no pair completed")
+            )
+        elif done < action.pairs:
+            error = f"partial: {done} of {action.pairs} pairs done"
+        return DispatchResult(
+            model=receiver, action_kind="transfer", ok=done > 0, error=error, retriable=False,
+            picked=tuple(body.get("picked") or ()), taken=taken, done=done, transfer=summary,
+        )
 
     def _hinted_result(self, action: ScaleAction, response: dict) -> DispatchResult:
-        """A hinted wake's result (S5): ``placement_retry`` for every replica the SM
-        woke somewhere else than its hint (paired by the hint's binding id, never by
-        position); the SM's refusals cool their GPUs down; an unfilled growth is not
-        a success - the planner re-plans (review P2-7)."""
+        """A hinted wake's result (S5): ``placement_substituted`` for every replica the
+        SM woke somewhere else than its hint (paired by the hint's binding id, never by
+        position); the SM's refusals are ``wake_refused`` events (no cooldown since
+        2026-10-02); an unfilled growth is not a success - the planner re-plans
+        (review P2-7)."""
         result = _dispatch_result(model=action.model, action_kind="scale", response=response)
         body = (response.get("response") or {}) if response.get("ok") else {}
         picked = tuple(body.get("picked") or ())
@@ -1624,14 +1788,10 @@ class ActionQueue:
                 continue
             source = _binding_gpus(entry.get("hint_binding_id")) or "?"
             target = f"{entry.get('node')}/{','.join(str(g) for g in entry.get('gpu_ids') or ())}"
-            self._events.append(f"placement_retry:{action.model}:{source}->{target}")
+            self._events.append(f"placement_substituted:{action.model}:{source}->{target}")
         for refusal in body.get("refusals") or ():
             if isinstance(refusal, dict):
-                self._cool(action.model, {
-                    "node": refusal.get("node"), "gpu_ids": refusal.get("gpu_ids") or refusal.get("gpu") or (),
-                    "scope": refusal.get("scope"), "error": refusal.get("error"), "reason": refusal.get("reason"),
-                    "blocking_binding_id": refusal.get("blocking_binding_id"),
-                })
+                self._wake_refused_event(action.model, _refusal_conflict(refusal))
         unfilled = int(body.get("unfilled") or 0)
         if unfilled > 0:
             return replace(
@@ -1641,8 +1801,8 @@ class ActionQueue:
         return replace(result, picked=picked)
 
     async def _dispatch_binding_power(self, action: ScaleAction) -> DispatchResult:
-        # Sleep (delta < 0) or wake (delta > 0) exactly the named bindings: safescale
-        # commit of the hidden pod, slot-targeted donor, or a planned slot-aware wake.
+        # Sleep (delta < 0) or wake (delta > 0) exactly the named bindings: the
+        # SafeScale commit of the hidden probe pods.
         # Stops at the first failure (a retry re-sends every pod: the SM answers a
         # binding already in the wanted power state with a no-op).
         for pod in action.pods:
@@ -1655,9 +1815,23 @@ class ActionQueue:
 
     def _record_done(self, model: str, action, result: DispatchResult) -> None:
         direction = _action_direction(action)
-        if result.ok and direction is not None:
-            self._last_done[model] = (int(self._now_ms()), direction)
-            self._persist_scale_memory(model)
+        if not result.ok or direction is None:
+            return
+        if direction == "down" and result.taken == 0:
+            return  # clamped to nothing (2026-10-02): no scale-down happened
+        self._last_done[model] = (int(self._now_ms()), direction)
+        self._persist_scale_memory(model)
+
+    def _record_transfer_done(self, action: TransferIntent, result: DispatchResult) -> None:
+        """F4 / scale memory of a relay, by what really happened: the donor "down" when
+        it gave a replica (``taken``), the receiver "up" when one woke (``done``)."""
+        now = int(self._now_ms())
+        if (result.taken or 0) > 0:
+            self._last_done[action.donor_model] = (now, "down")
+            self._persist_scale_memory(action.donor_model)
+        if (result.done or 0) > 0:
+            self._last_done[action.receiver_model] = (now, "up")
+            self._persist_scale_memory(action.receiver_model)
 
     def _has_pending_model(self, model: str) -> bool:
         return any(model in item.models for item in self._pending)
@@ -1683,9 +1857,10 @@ class ActionQueue:
             )
         if isinstance(action, SafeScaleCommitAction):
             return self._commit_queued(action)
-        if isinstance(action, TransferAction):
-            models = tuple(dict.fromkeys((action.donor.model, action.receiver.model)))
-            pods = action.donor.pods + action.receiver.pods
+        if isinstance(action, TransferIntent):
+            # Both models; no pod / GPU - the SM picks them under its writer lock.
+            models = tuple(dict.fromkeys((action.donor_model, action.receiver_model)))
+            pods = ()
         else:
             models = (action.model,)
             pods = tuple(getattr(action, "pods", ()) or ())
@@ -1698,8 +1873,8 @@ class ActionQueue:
         )
 
     def _commit_queued(self, action: SafeScaleCommitAction, *, failures: int = 0) -> QueuedAction:
-        """Queued form of a commit: it holds the donor (and its pods / GPUs) only
-        until the donor slept, then just the receivers still pending."""
+        """Queued form of a commit: it holds the donor (and its pods) only until the
+        donor slept, then just the receivers still pending."""
         models = action.touched_models or (action.donor,)
         pods = () if action.donor_done else action.pods
         return QueuedAction(
@@ -1712,21 +1887,10 @@ class ActionQueue:
         )
 
     def _resources(self, models: Iterable[str], pods: Iterable[str]) -> set[str]:
-        """Models, pods and - when the cluster view knows the pod - its GPUs: two
-        actions on one GPU (e.g. a donor sleep and another model's wake there) are
-        serialized even when they come from different ticks."""
+        """Models and pods. GPU keys were removed on 2026-10-02: the service-manager
+        serializes GPU use (sleep reservations, GPU leases, writer lock)."""
         keys = {f"model:{model}" for model in models}
-        for pod in pods:
-            keys.add(f"pod:{pod}")
-            slot = None
-            if self._slot_of is not None:
-                try:
-                    slot = self._slot_of(pod)
-                except Exception:  # noqa: BLE001 - serialization hint only
-                    slot = None
-            if slot is not None:
-                node, gpus = slot
-                keys.update(f"gpu:{node}/{int(gpu)}" for gpu in gpus)
+        keys.update(f"pod:{pod}" for pod in pods)
         return keys
 
 
@@ -1750,13 +1914,91 @@ def _runs_in_observe(queued: QueuedAction) -> bool:
     )
 
 
-def _rescue_part(action) -> ScaleAction | None:
-    """The C1-tagged rescue scale-up of an action (a transfer's receiver half)."""
-    if isinstance(action, TransferAction):
-        action = action.receiver
+def _rescue_part(action):
+    """The C1-tagged rescue scale-up of an action (a ScaleAction or a relay intent's
+    receiver side), or None."""
+    if isinstance(action, TransferIntent):
+        return action if action.rescue is not None else None
     if isinstance(action, ScaleAction) and action.delta > 0 and getattr(action, "rescue", None) is not None:
         return action
     return None
+
+
+def _transfer_summary(body: dict) -> dict:
+    """The accounting view of a ``POST /v2/transfers`` answer (200, or the body of a
+    409 ``partial``): what was done, with the pod names of every pair."""
+
+    def num(key: str) -> int:
+        try:
+            return max(0, int(body.get(key) or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    pairs = []
+    for item in body.get("pairs") or ():
+        if not isinstance(item, dict):
+            continue
+        donors = item.get("donors") or ([item["donor"]] if item.get("donor") else [])
+        pair = {
+            "donors": [str(pod) for pod in donors],
+            "receiver": str(item.get("receiver") or ""),
+            "node": str(item.get("node") or ""),
+            "gpu_ids": list(item.get("gpu_ids") or ()),
+            "status": str(item.get("status") or "unknown"),
+        }
+        if item.get("left_to_recovery"):
+            pair["left_to_recovery"] = True
+        if item.get("compensating_sleep"):
+            pair["compensating_sleep"] = item.get("compensating_sleep")
+        error = item.get("error")
+        if isinstance(error, dict) and error.get("error"):
+            pair["error"] = str(error.get("error"))
+        pairs.append(pair)
+    done = num("done") if "done" in body else sum(1 for pair in pairs if pair["status"] == "done")
+    taken = num("taken") if "taken" in body else num("donors_slept")
+    skipped = body.get("skipped") if isinstance(body.get("skipped"), dict) else {}
+    return {
+        "transfer_id": body.get("transfer_id"),
+        "outcome": "ok" if done > 0 else "partial",
+        "done": done,
+        "taken": taken,
+        "unfilled": num("unfilled"),
+        "clamped_by_floor": bool(body.get("clamped_by_floor")),
+        "pairs": pairs,
+        "left_to_recovery": [pair for pair in pairs if pair.get("left_to_recovery")],
+        "refusals": len(body.get("refusals") or ()),
+        "skipped": {str(key): value for key, value in skipped.items()},
+        "picked": [
+            entry.get("serve_id") for entry in body.get("picked") or () if isinstance(entry, dict)
+        ],
+        "phases_ms": body.get("phases_ms") if isinstance(body.get("phases_ms"), dict) else {},
+    }
+
+
+def _transfer_changed(result: DispatchResult) -> tuple[bool, bool]:
+    """(donor side changed, receiver side changed) of a relay result - for the O1 /
+    view-pending stamps. Unknown outcome (timeout, transport, 5xx, exception): both."""
+    summary = result.transfer
+    if not summary or summary.get("outcome") == "unknown":
+        return True, True
+    if summary.get("outcome") in ("unsupported", "refused"):
+        return False, False
+    pairs = summary.get("pairs") or ()
+    donor = bool(summary.get("taken")) or bool(pairs)
+    receiver = bool(summary.get("done")) or any(
+        pair.get("status") in ({"receiver_wake_failed"} | TRANSFER_OPEN_STATUSES) for pair in pairs
+    )
+    return donor, receiver
+
+
+def _refusal_conflict(refusal: dict) -> dict:
+    """A structured refusal body (``refusals[]`` of /target or /v2/transfers) in the
+    shape of ``ServiceManagerError.wake_conflict``."""
+    return {
+        "node": refusal.get("node"), "gpu_ids": refusal.get("gpu_ids") or refusal.get("gpu") or (),
+        "scope": refusal.get("scope"), "error": refusal.get("error"), "reason": refusal.get("reason"),
+        "blocking_binding_id": refusal.get("blocking_binding_id"),
+    }
 
 
 def _retry_safe(action) -> bool:
@@ -1775,10 +2017,10 @@ def _observe_skipped(queued: QueuedAction) -> list[DispatchResult]:
             DispatchResult(model=model, action_kind="scale", ok=True, error="observe_skipped")
             for model in queued.models
         ]
-    if isinstance(action, TransferAction):
+    if isinstance(action, TransferIntent):
         return [
-            DispatchResult(model=part.model, action_kind="scale", ok=True, error="observe_skipped")
-            for part in (action.donor, action.receiver)
+            DispatchResult(model=model, action_kind="transfer", ok=True, error="observe_skipped")
+            for model in (action.donor_model, action.receiver_model)
         ]
     return [
         DispatchResult(
@@ -1825,7 +2067,9 @@ def _sleep_kwargs(action: ScaleAction) -> dict:
 def _action_kind(action) -> str:
     if isinstance(action, SafeScaleCommitAction):
         return "safescale_commit"
-    if isinstance(action, (ScaleAction, TransferAction, ReceiverTarget)):
+    if isinstance(action, TransferIntent):
+        return "transfer"
+    if isinstance(action, (ScaleAction, ReceiverTarget)):
         return "scale"
     if isinstance(action, HideAction):
         return "hide"
@@ -1893,6 +2137,7 @@ def _dispatch_result(*, model: str, action_kind: str, response: dict) -> Dispatc
     conflict = response.get("wake_conflict") if not ok else None
     return DispatchResult(
         model=model, action_kind=action_kind, ok=ok, error=error, retriable=retriable, unconfirmed=unconfirmed,
+        not_executed=(not ok) and bool(response.get("not_executed")),
         # sm_client ServiceManagerError.result() sets the key only for a floor refusal.
         floor_violation=(not ok) and "floor_violation" in response,
         wake_conflict=conflict if isinstance(conflict, dict) else None,
@@ -1965,19 +2210,6 @@ def revalidate_from_cluster_view(get_view: Callable[[], object]) -> Revalidate:
         return None
 
     return still_wanted
-
-
-def slot_lookup_from_cluster_view(get_view: Callable[[], object]) -> SlotLookup:
-    def slot_of(serve_id: str):
-        view = get_view()
-        if view is None:
-            return None
-        for binding in getattr(view, "bindings", ()):
-            if binding.serve_id == serve_id:
-                return binding.slot.node, tuple(binding.slot.gpu_ids)
-        return None
-
-    return slot_of
 
 
 def revalidate_commit_from_signals(

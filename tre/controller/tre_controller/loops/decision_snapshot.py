@@ -13,7 +13,7 @@ from tre_common.rediskeys import (
 )
 from tre_controller.loops.tick import LoopTickResult
 from tre_controller.loops.signal_log import SignalLogWriter
-from tre_controller.planning.planner import DefragAction, HideAction, ScaleAction, UnhideAction
+from tre_controller.planning.planner import DefragAction, HideAction, ScaleAction, TransferIntent, UnhideAction
 
 
 _LOGGER = logging.getLogger("tre_controller.decision")
@@ -97,6 +97,27 @@ def _action_to_dict(action: object) -> dict[str, Any]:
                 "base": rescue.base, "covered": rescue.covered,
             }
         return payload
+    if isinstance(action, TransferIntent):
+        # 2026-10-02: a relay is a count; the pods / GPUs the service-manager picked
+        # reach the decision stream as queue events of a later tick
+        # (transfer_pair:<donor>-><receiver>:<donor pods>-><receiver pod>@<node/gpus>:<status>).
+        payload = {
+            "kind": "transfer",
+            "model": action.receiver_model,
+            "donor": action.donor_model,
+            "receiver": action.receiver_model,
+            "count": action.count,
+            "pairs": action.pairs,
+            "reason": action.reason,
+            "source_loop": action.source_loop,
+            "sleep_path": action.sleep_path,
+        }
+        if action.rescue is not None:
+            payload["rescue"] = {
+                "target": action.rescue.target, "desired": action.rescue.desired,
+                "base": action.rescue.base, "covered": action.rescue.covered,
+            }
+        return payload
     if isinstance(action, HideAction):
         return {
             "kind": "hide",
@@ -158,6 +179,10 @@ def _model_states(
             "signal_unavailable_reason": context.get("signal_unavailable_reason"),
             "window_end_ms": getattr(window, "window_end_ms", None),
         }
+        if context.get("floor_headroom") is not None:
+            # 2026-10-02: the SM replica floor view the planner bounded donors by.
+            out[model]["floor"] = context.get("floor")
+            out[model]["floor_headroom"] = context.get("floor_headroom")
         if "saturation_ticks" in context:
             # Onset saturation rescue (only with the tracker on): the latest-sample
             # engine gauges, the eligibility reason and the confirmed-window count.

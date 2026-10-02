@@ -16,7 +16,7 @@ from tre_controller.loops.fairness_task import run_fairness_tick
 from tre_controller.loops.rescue_task import run_rescue_tick
 from tre_controller.loops.tick import _idle_gpus
 from tre_controller.planning.classify import ModelState
-from tre_controller.planning.planner import ScaleAction
+from tre_controller.planning.planner import ScaleAction, TransferIntent
 from tre_sm.allocator.slots import Binding, Slot
 from tre_sm.api.v2 import ServiceManagerV2
 from tre_sm.state.store import StateStore
@@ -83,6 +83,19 @@ def _scale(result) -> list[tuple[str, int, str, tuple[str, ...]]]:
     return [(a.model, a.delta, a.reason, a.pods) for a in result.actions if isinstance(a, ScaleAction)]
 
 
+def _relays(result) -> list[tuple[str, str, int, str]]:
+    """2026-10-02: immediate relays are TransferIntents (counts); the SM places them."""
+    return [(a.donor_model, a.receiver_model, a.count, a.reason) for a in result.actions if isinstance(a, TransferIntent)]
+
+
+def _relay_moved(before: list[Binding], awake: set[str], donor: str, receiver: str) -> list[tuple[str, str]]:
+    """(donor pod slept, receiver pod woken) on the same slot - what the SM's relay did."""
+    slots = {b.serve_id: (b.slot.node, b.slot.gpu_ids) for b in before}
+    slept = [b.serve_id for b in before if b.model == donor and b.awake and b.serve_id not in awake]
+    woke = [b.serve_id for b in before if b.model == receiver and not b.awake and b.serve_id in awake]
+    return [(d, r) for d in slept for r in woke if slots[d] == slots[r]]
+
+
 REG_7B_8B = (("dsqwen-7b", 1, 1, 8), ("dsllama-8b", 1, 1, 8))
 
 
@@ -99,14 +112,12 @@ def test_e1_receiver_gets_the_slot_the_donor_frees() -> None:
     assert idle == 0
     assert result.classifications["dsllama-8b"].state == ModelState.CRITICAL
     assert result.classifications["dsqwen-7b"].state == ModelState.HIGH
-    # Placement policy: 8b already has a replica on node9, so the donor slot picked for
-    # the receiver is the first one on node10 (same-model spread).
-    assert _scale(result) == [
-        ("dsqwen-7b", -1, "critical_donor_immediate", ("7b-4",)),
-        ("dsllama-8b", 1, "critical_donor_immediate", ("8b-4",)),
-    ]
-    assert calls == [("set_binding_power", "7b-4", False), ("set_binding_power", "8b-4", True)]
-    assert {"8b-0", "8b-4"} <= awake and "7b-4" not in awake
+    # 2026-10-02: one relay intent (a count); which 7b / 8b pair moves is the SM's
+    # choice (its placement policy), here the fake SM's pair rule.
+    assert _scale(result) == []
+    assert _relays(result) == [("dsqwen-7b", "dsllama-8b", 1, "critical_donor_immediate")]
+    assert calls[0] == ("transfer", "dsqwen-7b", "dsllama-8b", 1)
+    assert "8b-0" in awake and len(_relay_moved(bindings, awake, "dsqwen-7b", "dsllama-8b")) == 1
 
 
 def test_repro_a_gpu_with_only_a_foreign_sleeping_binding_is_not_receiver_idle_capacity() -> None:
@@ -127,12 +138,9 @@ def test_repro_a_gpu_with_only_a_foreign_sleeping_binding_is_not_receiver_idle_c
 
     assert idle == 1  # the raw free-GPU count is still reported ...
     assert "critical_idle_unusable:dsllama-8b" in result.events  # ... but not usable by 8b
-    # Placement policy: node10 has the free GPU, so it is the less loaded node.
-    assert _scale(result) == [
-        ("dsqwen-7b", -1, "critical_donor_immediate", ("7b-4",)),
-        ("dsllama-8b", 1, "critical_donor_immediate", ("8b-4",)),
-    ]
-    assert "8b-4" in awake and "7b-4" not in awake
+    assert _scale(result) == []
+    assert _relays(result) == [("dsqwen-7b", "dsllama-8b", 1, "critical_donor_immediate")]
+    assert len(_relay_moved(bindings, awake, "dsqwen-7b", "dsllama-8b")) == 1
 
 
 def test_repro_a_fully_empty_gpu_is_not_receiver_idle_capacity_while_it_has_blocked_sleepers() -> None:
@@ -149,7 +157,8 @@ def test_repro_a_fully_empty_gpu_is_not_receiver_idle_capacity_while_it_has_bloc
 
     assert idle == 1
     assert not any(reason == "critical_idle_capacity" for _, _, reason, _ in _scale(result))
-    assert "8b-4" in awake  # the less loaded node10 (placement policy)
+    assert _relays(result) == [("dsqwen-7b", "dsllama-8b", 1, "critical_donor_immediate")]
+    assert len(_relay_moved(bindings, awake, "dsqwen-7b", "dsllama-8b")) == 1
 
 
 def test_empty_gpu_is_used_by_create_when_receiver_has_no_sleeping_binding() -> None:

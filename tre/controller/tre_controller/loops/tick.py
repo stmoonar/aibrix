@@ -27,8 +27,10 @@ from tre_controller.planning.planner import (
     RescueBasis,
     ScaleAction,
     ShrinkForSlotAction,
+    TransferIntent,
     UnhideAction,
     build_plan,
+    upscale_of,
 )
 from tre_controller.planning.safescale import (
     ProbeWindowInputs,
@@ -115,6 +117,9 @@ class PaperStateCache:
                 "routable_pods": context.get("routable_pods", held.get("routable_pods", 0)),
                 "assigned_replicas": context.get("assigned_replicas", held.get("assigned_replicas", 0)),
                 "awake_replicas": context.get("awake_replicas", held.get("awake_replicas")),
+                # 2026-10-02: the SM floor headroom of THIS tick's view (never a held one).
+                "floor": context.get("floor"),
+                "floor_headroom": context.get("floor_headroom"),
                 # Timer cleanup (2026-10-02): a held context was not recomputed - O1 saw
                 # no routable change this tick, so the F4 cooldown applies again.
                 "o1_routable_tracked": False,
@@ -239,11 +244,8 @@ def run_planner_tick(
         # stops refreshing keeps holding (conservative on missing data, review P3-6;
         # cluster_view_task raises the cluster_view_stale alert).
         view_pending=_o1_view_pending(queue, contexts, cluster_view),
-        # P2-6: independent of TRE_ACTION_COOLDOWN (its own switch is the tick count).
-        floor_holds=_floor_held_models(queue),
-        # S3: GPUs / nodes the SM recently refused a wake on (placement.wake_cooldown).
-        unavailable_gpus=_cooled_gpus(queue, registry),
-        refusals=_recent_refusals(queue),
+        # 2026-10-02: no floor-violation hold and no GPU wake cooldown any more - a
+        # donor's SM floor_headroom bounds it, refusals are events (queue events below).
         # Timer cleanup (2026-10-02): rolled-back probes wait for new evidence (no 60 s backoff).
         probe_backoff_models=_probe_backoff_models(safescale, snapshot, contexts),
         preemptible_models=_preemptible_models(queue) if rescue_due else None,
@@ -276,7 +278,8 @@ def run_planner_tick(
         _safescale_ns = time.perf_counter_ns() - _phase_t0
         _phase_t0 = time.perf_counter_ns()
     queue_events = _defrag_blocking_events(queue, actions) if rescue_due else ()
-    # S3: gpu_cooldown / wake_refused / placement_retry recorded by the queue.
+    # Observation events of the queue (transfer outcomes, wake_refused,
+    # *_clamped_by_floor, placement_substituted) - no timer follows any of them.
     queue_events = tuple(queue_events) + tuple(_drain_queue_events(queue))
     if actions:
         queue.submit(actions)
@@ -432,8 +435,8 @@ def _note_saturation_steps(
     tracker = getattr(signal_state, "saturation", None)
     if tracker is None:
         return
-    ups = [action for action in actions if isinstance(action, ScaleAction) and action.delta > 0]
-    up = {action.model for action in ups}
+    ups = [action for action in actions if upscale_of(action) is not None]
+    up = {upscale_of(action)[0] for action in ups}
     for item in classifications:
         if not getattr(item, "saturation_rescue", False) or item.model_name not in up:
             continue
@@ -442,9 +445,9 @@ def _note_saturation_steps(
             continue
         ctx = contexts.get(item.model_name) or {}
         routable = int(ctx.get("routable_pods") or 0)
-        mine = [action for action in ups if action.model == item.model_name]
+        mine = [action for action in ups if upscale_of(action)[0] == item.model_name]
         targets = [int(action.rescue.target) for action in mine if getattr(action, "rescue", None) is not None]
-        target = max(targets) if targets else routable + sum(action.delta for action in mine)
+        target = max(targets) if targets else routable + sum(upscale_of(action)[1] for action in mine)
         if cluster_view is not None:
             pods = [
                 binding.serve_id
@@ -541,13 +544,7 @@ def _defrag_blocking_events(queue: PlannerQueue, actions) -> tuple[str, ...]:
     active = getattr(queue, "cluster_action_active", None)
     if not callable(active) or not active():
         return ()
-    models = sorted(
-        {
-            getattr(action, "model", "")
-            for action in actions
-            if isinstance(action, ScaleAction) and action.delta > 0
-        }
-    )
+    models = sorted({up[0] for up in map(upscale_of, actions) if up is not None})
     return (f"rescue_waits_for_defrag:{','.join(models)}",) if models else ()
 
 
@@ -579,34 +576,9 @@ def _probe_backoff_models(
     return dict(holds(signals))
 
 
-def _cooled_gpus(queue: PlannerQueue, registry: Registry) -> set[tuple[str, int]]:
-    """S3: GPUs whose wake the SM refused recently (ActionQueue cooldowns); a
-    node-scope refusal cools every GPU of the node."""
-    gpus_of = getattr(queue, "cooled_gpus", None)
-    nodes_of = getattr(queue, "cooled_nodes", None)
-    cooled = set(gpus_of()) if callable(gpus_of) else set()
-    nodes = set(nodes_of()) if callable(nodes_of) else set()
-    if nodes:
-        for node in registry.topology().nodes:
-            if node.name in nodes:
-                cooled.update((node.name, gpu) for gpu in range(int(node.gpus)))
-    return cooled
-
-
-def _recent_refusals(queue: PlannerQueue) -> dict[str, str]:
-    refusals = getattr(queue, "recent_refusals", None)
-    return dict(refusals()) if callable(refusals) else {}
-
-
 def _drain_queue_events(queue: PlannerQueue) -> list[str]:
     drain = getattr(queue, "drain_events", None)
     return list(drain()) if callable(drain) else []
-
-
-def _floor_held_models(queue: PlannerQueue) -> set[str]:
-    """P2-6: donors the SM recently refused with 409 floor_violation (ActionQueue)."""
-    held = getattr(queue, "floor_held_models", None)
-    return set(held()) if callable(held) else set()
 
 
 def _o1_tracks(context: dict | None) -> bool:
@@ -712,8 +684,9 @@ def _apply_safescale(
     # back are deducted across all of the model's scale-up parts, in plan order.
     up_totals: dict[str, int] = {}
     for action in actions:
-        if isinstance(action, ScaleAction) and action.delta > 0:
-            up_totals[action.model] = up_totals.get(action.model, 0) + action.delta
+        up = upscale_of(action)
+        if up is not None:
+            up_totals[up[0]] = up_totals.get(up[0], 0) + up[1]
     restore_left: dict[str, int] = {}
     restore_used: dict[str, int] = {}
     survived: set[str] = set()
@@ -728,8 +701,8 @@ def _apply_safescale(
             else:
                 converted.append(action)
             continue
-        if isinstance(action, ScaleAction) and action.delta > 0:
-            model = action.model
+        if upscale_of(action) is not None:
+            model, delta = upscale_of(action)
             if model not in restore_left:
                 preempt = getattr(safescale, "request_preemption", None)
                 restored = preempt(model, reason="receiver_need_upscale") if callable(preempt) else 0
@@ -749,6 +722,17 @@ def _apply_safescale(
                 # C1: the restored pods count toward the target already.
                 rescue = replace(rescue, covered=rescue.covered + restore_used[model])
                 rescue_of[model] = rescue
+            if isinstance(action, TransferIntent):
+                # A relay is never split (its count is the SM's donor count): covered
+                # entirely by restored pods (dropped), or kept whole.
+                if restore_left[model] >= delta:
+                    restore_left[model] -= delta
+                    continue
+                if rescue is not getattr(action, "rescue", None):
+                    action = replace(action, rescue=rescue)
+                survived.add(model)
+                converted.append(action)
+                continue
             take = min(restore_left[model], action.delta)
             if take > 0:
                 restore_left[model] -= take
@@ -1107,6 +1091,11 @@ def _model_contexts(
     suspended = getattr(signal_state, "breakpoint_window_suspended", None)
     if suspended:
         events.append(f"breakpoint_window_suspended:{suspended}")
+    routable_error = getattr(cluster_view, "routable_error", None)
+    if cluster_view is not None and routable_error:
+        # The SM did not report its routable view (older SM, or it could not read the
+        # Pods / reservations / leases): the controller's own count is used this tick.
+        events.append(f"sm_routable_fallback:{routable_error}")
     cluster_counts = _cluster_view_counts(cluster_view)
     awake_counts = _awake_including_hidden(cluster_view)
     hidden_pods = _hidden_pods(cluster_view)
@@ -1232,6 +1221,8 @@ def _model_contexts(
             }
         # Scaling-cap count (A1/P1-2): awake bindings incl. hidden probe pods.
         context["awake_replicas"] = awake_counts.get(model_name, metrics.routable_pods)
+        # 2026-10-02: the SM replica floor / headroom (donor bound of the planner).
+        context.update(_sm_floor_context(cluster_view, model_name))
         tracker = getattr(signal_state, "saturation", None)
         if tracker is not None and tracker.config.enabled:
             # Onset saturation rescue: the routable pods' newest gateway samples (the
@@ -1339,16 +1330,36 @@ def _routable_pod_ids(cluster_view: ClusterView | None) -> dict[str, frozenset[s
 
 
 def _cluster_view_counts(cluster_view: ClusterView | None) -> dict[str, tuple[int, int]]:
+    """model -> (routable, bound) of the fleet view. Routable is the SM's own count
+    (``/v2/state`` ``bindings[].routable``, the function its replica-floor check uses,
+    2026-10-02); without it (``routable_ids`` None) the controller's former count:
+    awake and not hidden."""
     if cluster_view is None:
         return {}
+    routable_ids = getattr(cluster_view, "routable_ids", None)
     counts: dict[str, list[int]] = {}
     for binding in cluster_view.bindings:
         model_counts = counts.setdefault(binding.model, [0, 0])
         if not binding.hidden:
             model_counts[1] += 1
-        if binding.awake and not binding.hidden:
+        if routable_ids is not None:
+            if binding.serve_id in routable_ids:
+                model_counts[0] += 1
+        elif binding.awake and not binding.hidden:
             model_counts[0] += 1
     return {model: (values[0], values[1]) for model, values in counts.items()}
+
+
+def _sm_floor_context(cluster_view: ClusterView | None, model: str) -> dict:
+    """``floor`` / ``floor_headroom`` of ``model`` from the SM view (only while the SM
+    routable view is readable: the planner then bounds every donor by it)."""
+    if cluster_view is None or getattr(cluster_view, "routable_ids", None) is None:
+        return {}
+    entry = (getattr(cluster_view, "model_floors", None) or {}).get(model)
+    headroom = getattr(entry, "floor_headroom", None)
+    if headroom is None:
+        return {}
+    return {"floor": getattr(entry, "floor", None), "floor_headroom": int(headroom)}
 
 
 def _idle_gpus(

@@ -200,11 +200,16 @@ rollback) or whose `/is_sleeping` is not a clear "awake".
   the event `rescue_waits_for_defrag:<models>`.
 - The service-manager, the controller and the gateway plugin of this change
   must be rolled out together.
-- An SM refusal `409 floor_violation` (a hide / sleep that would take a model below
-  its `min_replicas` routable replicas) is not retried; the refused model is held
-  out of every scale-down plan for `TRE_FLOOR_VIOLATION_COOLDOWN_TICKS` fast-loop
-  ticks (default 6 x `TRE_RESCUE_INTERVAL_SECONDS` = 30 s; `0` = off). Event
-  `floor_violation_hold:<model>`, counter `floor_violation_total`.
+- An SM refusal `409 floor_violation` (a binding-level sleep or a SafeScale hide that
+  would take a model below its `min_replicas` routable replicas) is not retried and
+  holds nothing (since 2026-10-02): event `floor_violation:<model>`, counter
+  `floor_violation_total`. Model-level shrinks and relays are clamped at the floor by
+  the service-manager (200 with `taken` / `clamped_by_floor`; events
+  `scale_clamped_by_floor` / `transfer_clamped_by_floor`), and the planner bounds every
+  donor by the SM `floor_headroom`. `TRE_FLOOR_VIOLATION_COOLDOWN_TICKS` and the
+  controller's use of registry `placement.wake_cooldown` are deprecated (parsed,
+  ignored, logged) - see `docs/design/20261002-controller-transfer.md`. The controller
+  of this change needs a service-manager with `POST /v2/transfers` (same rollout).
 
 ### SafeScale probe window (controller env)
 

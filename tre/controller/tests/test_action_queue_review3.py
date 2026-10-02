@@ -20,7 +20,7 @@ from tre_controller.planning.planner import (
     ReceiverTarget,
     SafeScaleCommitAction,
     ScaleAction,
-    TransferAction,
+    TransferIntent,
     build_plan,
 )
 from tre_controller.planning.safescale import SafeScaleCommand
@@ -71,6 +71,44 @@ class ScriptedSM:
 
     async def defrag(self, migrations):
         return await self._call("defrag", ("cluster", "defrag"))
+
+    async def transfer(self, donor_model, receiver_model, count, *, sleep_path="urgent"):
+        relay = f"{donor_model}->{receiver_model}"
+        result = await self._call(f"transfer:{relay}", (relay, "transfer", count))
+        if result == {"ok": True}:  # nothing scripted: every pair done
+            return {"ok": True, "response": transfer_body(count)}
+        return result
+
+    async def get_transfers(self):
+        self.events.append(("lookup", "sm", "get_transfers"))
+        scripted = self.results.get("get_transfers")
+        if scripted:
+            return scripted.pop(0)
+        return {"ok": True, "response": {"in_progress": {}, "running_here": [], "stats": {}}}
+
+
+def transfer_body(count, *, done=None, taken=None, unfilled=0, clamped=False, statuses=None,
+                  refusals=(), skipped=None, transfer_id="tr-1", left_to_recovery=()):
+    """A ``POST /v2/transfers`` response body: ``count`` pairs 7b-i -> 8b-i on n/i."""
+    statuses = list(statuses) if statuses is not None else ["done"] * count
+    pairs = []
+    for index, status in enumerate(statuses):
+        pair = {"donor": f"7b-{index}", "donors": [f"7b-{index}"], "donor_binding_ids": [f"7b/n/{index}"],
+                "receiver": f"8b-{index}", "receiver_binding_id": f"8b/n/{index}", "node": "n",
+                "gpu_ids": [index], "status": status}
+        if index in left_to_recovery:
+            pair["left_to_recovery"] = True
+        pairs.append(pair)
+    done = sum(1 for status in statuses if status == "done") if done is None else done
+    taken = sum(1 for status in statuses if status != "donor_sleep_failed") if taken is None else taken
+    return {
+        "transfer_id": transfer_id, "donor_model": "7b", "receiver_model": "8b", "count": count,
+        "pairs": pairs, "done": done, "taken": taken, "clamped_by_floor": clamped,
+        "donors_slept": taken, "receivers_woken": done, "unfilled": unfilled,
+        "refusals": list(refusals), "skipped": dict(skipped or {}),
+        "picked": [{"serve_id": pair["receiver"]} for pair in pairs if pair["status"] == "done"],
+        "phases_ms": {"L1": 1, "U1": 2, "L2": 1, "U2": 2, "L3": 1},
+    }
 
 
 def _commit(*, donor="7b", pods=("7b-1",), upscales=(("8b", 1, 3),)):
@@ -518,19 +556,19 @@ def test_worker_exception_becomes_a_failed_result_and_frees_the_model() -> None:
     asyncio.run(scenario())
 
 
-def test_transfer_donor_exception_drops_the_receiver_with_a_reason() -> None:
+def test_transfer_exception_is_a_failed_result_for_both_models() -> None:
     async def scenario():
-        sm = ScriptedSM(raises={"7b-1": ConnectionResetError("reset")})
+        sm = ScriptedSM(raises={"transfer:7b->8b": ConnectionResetError("reset")})
         queue = ActionQueue(sm)
-        donor = ScaleAction("7b", -1, "critical_donor_immediate", "rescue", pods=("7b-1",), transfer_id="t")
-        receiver = ScaleAction("8b", 1, "critical_donor_immediate", "rescue", pods=("8b-1",), transfer_id="t")
-        queue.submit((donor, receiver))
+        queue.submit((TransferIntent("7b", "8b", 1, "critical_donor_immediate", "rescue"),))
         results = await queue.drain_once()
         by_model = {r.model: r for r in results}
         assert by_model["7b"].error.startswith("dispatch_exception: ConnectionResetError")
-        assert by_model["8b"].error.startswith("donor_sleep_failed: dispatch_exception")
-        assert ("start", "8b-1", "wake") not in sm.events
-        assert isinstance(TransferAction(donor, receiver), TransferAction)
+        assert by_model["8b"].error.startswith("dispatch_exception: ConnectionResetError")
+        # whether the SM did anything is unknown: both models wait for a newer view
+        assert set(queue.view_changes()) == {"7b", "8b"}
+        assert queue.last_actions() == {}
+        assert queue.inflight_models() == set()
 
     asyncio.run(scenario())
 

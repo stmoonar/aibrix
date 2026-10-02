@@ -19,6 +19,7 @@ from tre_controller.planning.planner import (
     build_plan,
 )
 from tre_sm.allocator.slots import Binding, Slot
+from relay_view import expand_relays, relays  # noqa: F401 - 2026-10-02 relay intents
 
 
 def _cls(model: str, state: ModelState, role: ModelRole, z: float | None, tier: str | None = None):
@@ -38,7 +39,7 @@ def _cls(model: str, state: ModelState, role: ModelRole, z: float | None, tier: 
 def _taken(plan, model: str) -> int:
     """Replicas the plan takes from ``model`` (same-slot shrinks + negative scales)."""
     shrinks = sum(1 for a in plan.actions if isinstance(a, ShrinkForSlotAction) and a.donor == model)
-    scales = sum(-a.delta for a in plan.actions if isinstance(a, ScaleAction) and a.model == model and a.delta < 0)
+    scales = sum(-a.delta for a in expand_relays(plan.actions) if isinstance(a, ScaleAction) and a.model == model and a.delta < 0)
     return shrinks + scales
 
 
@@ -125,7 +126,7 @@ def test_same_slot_shrink_then_tp1_critical_donor_loop_skips_the_claimed_donor()
     assert [(a.donor, a.beneficiary) for a in plan.actions if isinstance(a, ShrinkForSlotAction)] == [
         ("high", "tp2")
     ]
-    assert not [a for a in plan.actions if isinstance(a, ScaleAction) and a.model == "high"]
+    assert not [a for a in expand_relays(plan.actions) if isinstance(a, ScaleAction) and a.model == "high"]
     assert _taken(plan, "high") == 1
 
     # Without the TP=2 receiver the same crit1 does take the donor (the skip above is
@@ -139,7 +140,7 @@ def test_same_slot_shrink_then_tp1_critical_donor_loop_skips_the_claimed_donor()
         cluster_view=view,
     )
     assert _taken(alone, "high") == 1
-    assert [a.reason for a in alone.actions if isinstance(a, ScaleAction) and a.model == "high"] == [
+    assert [a.reason for a in expand_relays(alone.actions) if isinstance(a, ScaleAction) and a.model == "high"] == [
         "critical_donor_immediate"
     ]
 

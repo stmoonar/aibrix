@@ -4,8 +4,10 @@
   evidence predates the hide (``tail_pre_hide_fraction_mean`` / ``_max`` and
   ``tail_observation_count``), from the metrics-window timestamps each observation
   now carries.
-* P2-6: an SM 409 floor_violation holds the refused donor out of scale-down planning
-  for TRE_FLOOR_VIOLATION_COOLDOWN_TICKS fast-loop ticks (no per-tick livelock).
+* P2-6 (superseded 2026-10-02, design 20261002-controller-transfer): the timed hold
+  of a donor after a 409 floor_violation was removed. The SM clamps a model-level
+  shrink at the floor (200, ``taken`` / ``clamped_by_floor``), the queue records an
+  event only, and the planner bounds every donor by the SM ``floor_headroom``.
 * P2-7: the probe-window floor moved to SAFE_SCALE_WINDOW_FLOOR_MS; the legacy
   SAFE_SCALE_MIN_WINDOW_MS stays at 60000 in the overlay for older images.
 * P3-11: W is capped at 2 x registry gateway.route_timeout_s.
@@ -39,6 +41,7 @@ from tre_controller.planning.safescale import (
     format_window_event,
 )
 from tre_sm.allocator.slots import Binding, Slot
+from relay_view import expand_relays, relays  # noqa: F401 - 2026-10-02 relay intents
 
 from test_action_queue_review3 import ScriptedSM
 from test_loop_ticks import _metrics as _tick_metrics
@@ -133,52 +136,70 @@ def _idle_warm_snapshot() -> MetricsSnapshot:
     )
 
 
-def test_a_floor_violation_holds_the_donor_for_n_ticks_then_releases_it() -> None:
+FLOOR_CLAMP = {"ok": True, "response": {"model": "warm", "wake_replicas": 1, "actions": [], "taken": 0,
+                                         "clamped_by_floor": True,
+                                         "floor": {"clamped": True, "min_replicas": 1, "kept_awake": 1}}}
+
+
+def test_a_floor_clamp_is_an_event_and_the_next_tick_replans_without_a_hold() -> None:
     registry = _registry_with_model_bounds({"warm": (1, 4)})
-    clock = {"ms": 1_000_000}
-    ticks, interval_s = 6, 5.0
-    sm = ScriptedSM(results={"scale:warm": [FLOOR_REFUSAL]})
-    queue = ActionQueue(sm, now_ms=lambda: clock["ms"], floor_violation_hold_ms=ticks * interval_s * 1000.0)
+    sm = ScriptedSM(results={"scale:warm": [FLOOR_CLAMP]})
+    queue = ActionQueue(sm)
 
     first = run_rescue_tick(_idle_warm_snapshot(), queue=queue, registry=registry)
     assert [(a.model, a.delta) for a in first.actions] == [("warm", -1)]
+    [clamped] = asyncio.run(queue.drain_once())
+    assert (clamped.ok, clamped.taken) == (True, 0)
+    # taken 0 changed nothing: no scale-down recorded, no view-pending stamp.
+    assert queue.last_actions() == {} and queue.view_changes() == {} and queue.routable_changes() == {}
+    assert queue.stats()["scale_clamped_by_floor_total"] == 1
+
+    # The next tick plans from its (new) view again - no timed hold; the clamp is an event.
+    second = run_rescue_tick(_idle_warm_snapshot(), queue=queue, registry=registry)
+    assert [(a.model, a.delta) for a in second.actions] == [("warm", -1)]
+    assert "scale_clamped_by_floor:warm:taken=0:asked=1" in second.events
+    assert not any(event.startswith("floor_violation_hold") for event in second.events)
+
+
+def test_a_409_floor_violation_is_counted_and_logged_but_holds_nothing() -> None:
+    registry = _registry_with_model_bounds({"warm": (1, 4)})
+    queue = ActionQueue(ScriptedSM(results={"scale:warm": [FLOOR_REFUSAL]}))
+    run_rescue_tick(_idle_warm_snapshot(), queue=queue, registry=registry)
     [refused] = asyncio.run(queue.drain_once())
     assert (refused.ok, refused.floor_violation) == (False, True)
-
-    # The next tick does not pick the refused donor again (no livelock) ...
-    clock["ms"] += int(interval_s * 1000)
-    second = run_rescue_tick(_idle_warm_snapshot(), queue=queue, registry=registry)
-    assert second.actions == () and "floor_violation_hold:warm" in second.events
-    # ... for the whole hold ...
-    clock["ms"] = 1_000_000 + int((ticks * interval_s - 1) * 1000)
-    assert run_rescue_tick(_idle_warm_snapshot(), queue=queue, registry=registry).actions == ()
-    # ... and plans it again once N ticks have passed.
-    clock["ms"] = 1_000_000 + int(ticks * interval_s * 1000)
-    third = run_rescue_tick(_idle_warm_snapshot(), queue=queue, registry=registry)
-    assert [(a.model, a.delta) for a in third.actions] == [("warm", -1)]
     assert queue.stats()["floor_violation_total"] == 1
+    assert not hasattr(queue, "floor_held_models")
+    again = run_rescue_tick(_idle_warm_snapshot(), queue=queue, registry=registry)
+    assert [(a.model, a.delta) for a in again.actions] == [("warm", -1)]
+    assert "floor_violation:warm" in again.events
 
 
-def test_only_floor_refusals_hold_and_zero_ticks_disables_the_hold() -> None:
-    registry = _registry_with_model_bounds({"warm": (1, 4)})
-    busy = {"ok": False, "error": "HTTP 409: writer busy", "status": 409, "retriable": True}
-    queue = ActionQueue(ScriptedSM(results={"scale:warm": [busy]}), floor_violation_hold_ms=30_000.0)
-    run_rescue_tick(_idle_warm_snapshot(), queue=queue, registry=registry)
-    asyncio.run(queue.drain_once())
-    assert queue.floor_held_models() == set()
-
-    off = ActionQueue(ScriptedSM(results={"scale:warm": [FLOOR_REFUSAL]}), floor_violation_hold_ms=0.0)
-    run_rescue_tick(_idle_warm_snapshot(), queue=off, registry=registry)
-    asyncio.run(off.drain_once())
-    assert off.floor_held_models() == set()
-    assert run_rescue_tick(_idle_warm_snapshot(), queue=off, registry=registry).actions != ()
+def test_a_donor_without_sm_floor_headroom_is_not_planned() -> None:
+    """The planner bounds a donor by the SM ``floor_headroom`` (its floor check's count)."""
+    plan = build_plan(
+        model_contexts={"warm": {"assigned_replicas": 2, "routable_pods": 2, "floor": 2, "floor_headroom": 0}},
+        classifications=[_cls("warm", ModelState.IDLE, ModelRole.DONOR, 10.0, "idle")],
+        model_replicas={"warm": 2},
+        idle_gpus=0,
+        cfg=PlanConfig(min_replicas_per_model=1, max_replicas_per_model=4),
+    )
+    assert plan.actions == []
 
 
-def test_floor_violation_cooldown_ticks_config() -> None:
+def test_floor_violation_cooldown_ticks_config_is_parsed_but_deprecated(caplog) -> None:
+    from tre_controller.app import log_deprecated_settings
+
     assert ControllerConfig.from_env({}).floor_violation_cooldown_ticks == 6
-    assert ControllerConfig.from_env({"TRE_FLOOR_VIOLATION_COOLDOWN_TICKS": "0"}).floor_violation_cooldown_ticks == 0
+    assert ControllerConfig.from_env({}).deprecated_env_set == ()
+    cfg = ControllerConfig.from_env({"TRE_FLOOR_VIOLATION_COOLDOWN_TICKS": "0"})
+    assert cfg.floor_violation_cooldown_ticks == 0
+    assert cfg.deprecated_env_set == ("TRE_FLOOR_VIOLATION_COOLDOWN_TICKS",)
     with pytest.raises(ValueError, match="TRE_FLOOR_VIOLATION_COOLDOWN_TICKS"):
         ControllerConfig.from_env({"TRE_FLOOR_VIOLATION_COOLDOWN_TICKS": "-1"})
+    with caplog.at_level(logging.WARNING, logger="tre_controller.config"):
+        warnings = log_deprecated_settings(cfg, _registry_with_model_bounds({"warm": (1, 4)}))
+    assert len(warnings) == 1 and "TRE_FLOOR_VIOLATION_COOLDOWN_TICKS" in warnings[0]
+    assert any("deprecated_setting_ignored" in record.getMessage() for record in caplog.records)
 
 
 # ------------------------------------------------ P2-7 window-floor env rename
@@ -326,10 +347,13 @@ def test_three_replica_donor_with_floor_one_serves_two_receivers_in_one_tick() -
     plan = _two_receiver_plan(3)
     shrinks = [(a.donor, a.beneficiary) for a in plan.actions if isinstance(a, ShrinkForSlotAction)]
     assert shrinks == [("high", "tp2")]
-    immediate = [a for a in plan.actions if isinstance(a, ScaleAction) and a.model == "high"]
-    assert [(a.delta, a.reason, a.pods) for a in immediate] == [(-1, "critical_donor_immediate", ("high-b1",))]
-    taken = _taken(plan, "high")
-    assert len(taken) == 2 and len(set(taken)) == 2  # two different pods, 1 left = floor
+    # 2026-10-02: the relay is a count (the SM picks the pod: only high-b1 pairs with
+    # crit1's sleeping binding); the same-slot shrink took a node-a replica.
+    [relay] = [r for r in relays(plan.actions) if r.donor_model == "high"]
+    assert (relay.receiver_model, relay.count, relay.reason) == ("crit1", 1, "critical_donor_immediate")
+    [shrink] = [a for a in plan.actions if isinstance(a, ShrinkForSlotAction)]
+    assert shrink.serve_id != "high-b1"
+    assert len(_taken(plan, "high")) + relay.count == 2  # 1 left = floor
 
 
 def test_two_replica_donor_with_floor_one_is_taken_once() -> None:
@@ -337,7 +361,7 @@ def test_two_replica_donor_with_floor_one_is_taken_once() -> None:
     assert [(a.donor, a.beneficiary) for a in plan.actions if isinstance(a, ShrinkForSlotAction)] == [
         ("high", "tp2")
     ]
-    assert not [a for a in plan.actions if isinstance(a, ScaleAction) and a.model == "high"]
+    assert not [a for a in expand_relays(plan.actions) if isinstance(a, ScaleAction) and a.model == "high"]
     assert len(_taken(plan, "high")) == 1
 
 

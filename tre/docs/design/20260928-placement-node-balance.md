@@ -112,6 +112,8 @@ controller restart 只重启 controller，两者都要重启，否则 controller
   retry_after_s}`；controller 解析后对该卡冷却 `placement.wake_cooldown.gpu_s`（默认 30 s），节点级
   拒绝冷却整个节点 `node_s`（默认 60 s），下一 tick 换卡（事件 `gpu_cooldown` / `wake_refused` /
   `placement_retry`）。旧 SM 的纯文本 409 仍按原样重试、不冷却。
+  2026-10-02 起控制器不再冷却（只发 `wake_refused` 事件，下一 tick 按新视图重新规划；hint 被替换的事件改名
+  `placement_substituted`），见 [`20261002-controller-transfer.md`](./20261002-controller-transfer.md)。
 - **S4 补偿睡眠**：唤醒失败但引擎实际醒了 → 经 sleep primitive（path repair）补发 sleep 并确认。
 - **S5 选卡**：纯容量唤醒由 SM 选卡（planner 的 pod 只是 hint），不可行时 SM 自己换卡并在响应
   `picked` 里回传；同卡接力仍由 planner 指定。`/v2/state` 增加 `gpus[]`（wakeable、reason、占用者、

@@ -40,6 +40,7 @@ from tre_controller.signals.saturation import (
 from tre_controller.signals.trs import BreakpointWindowConfig, SignalState
 from tre_controller.store.metrics_store import MetricsStore
 from tre_sm.allocator.slots import Binding, Slot
+from relay_view import expand_relays, relays  # noqa: F401 - 2026-10-02 relay intents
 
 GRID = 10_000
 W = 30_000
@@ -139,7 +140,7 @@ def _tick(state, window, *, awake, registry=None, queue=None, hidden=(), **kwarg
 
 
 def _ups(actions) -> list[ScaleAction]:
-    return [a for a in actions if isinstance(a, ScaleAction) and a.delta > 0]
+    return [a for a in expand_relays(actions) if isinstance(a, ScaleAction) and a.delta > 0]
 
 
 def _planned(result) -> int:
@@ -359,15 +360,15 @@ def _two_model_plan(idle_gpus: int):
 
 def test_capacity_order_free_capacity_before_any_donor():
     plan = _two_model_plan(idle_gpus=2)
-    reasons = {(a.model, a.reason) for a in plan.actions if isinstance(a, ScaleAction)}
+    reasons = {(a.model, a.reason) for a in expand_relays(plan.actions) if isinstance(a, ScaleAction)}
     assert ("r", "critical_idle_capacity") in reasons
     assert not any(a.model == "d" and a.delta < 0 and a.reason == "critical_donor_immediate"
-                   for a in plan.actions if isinstance(a, ScaleAction))
+                   for a in expand_relays(plan.actions) if isinstance(a, ScaleAction))
 
 
 def test_without_free_capacity_a_high_donor_is_released_immediately():
     plan = _two_model_plan(idle_gpus=0)
-    donor = [a for a in plan.actions if isinstance(a, ScaleAction) and a.model == "d"]
+    donor = [a for a in expand_relays(plan.actions) if isinstance(a, ScaleAction) and a.model == "d"]
     assert donor and donor[0].delta == -1 and donor[0].reason == "critical_donor_immediate"
     assert _ups(plan.actions)[0].model == "r"
 

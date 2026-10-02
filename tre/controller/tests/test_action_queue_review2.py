@@ -1,4 +1,7 @@
-"""Review 2: ordered donor->receiver transfers, one-shot retries, resource serialization."""
+"""Review 2: donor->receiver relays, one-shot retries, resource serialization.
+
+2026-10-02: a relay is one TransferIntent (``POST /v2/transfers``); the former
+TransferAction / fuse_transfers pair and the GPU resource keys were removed."""
 
 from __future__ import annotations
 
@@ -11,9 +14,8 @@ from tre_controller.loops.action_queue import (
 )
 from tre_controller.planning.planner import (
     ScaleAction,
-    TransferAction,
+    TransferIntent,
     UnhideAction,
-    fuse_transfers,
 )
 from tre_sm.allocator.slots import Binding, Slot
 
@@ -53,14 +55,27 @@ class GatedPowerClient:
     async def defrag(self, migrations):
         return {"ok": True}
 
+    async def transfer(self, donor_model, receiver_model, count, *, sleep_path):
+        self.events.append(("transfer_start", f"{donor_model}->{receiver_model}", count))
+        gate = self.gates.get(f"{donor_model}->{receiver_model}")
+        if gate is not None:
+            await gate.wait()
+        else:
+            await asyncio.sleep(0)
+        self.events.append(("transfer_end", f"{donor_model}->{receiver_model}", count))
+        scripted = self.results.get(f"transfer:{donor_model}->{receiver_model}")
+        if scripted:
+            return scripted.pop(0)
+        return {"ok": True, "response": {
+            "transfer_id": "tr-1", "pairs": [{"donor": "7b-1", "donors": ["7b-1"], "receiver": "8b-1",
+                                             "node": "n", "gpu_ids": [0], "status": "done"}],
+            "done": count, "taken": count, "unfilled": 0, "clamped_by_floor": False,
+            "refusals": [], "skipped": {}, "picked": [{"serve_id": "8b-1"}],
+        }}
 
-def _pair(donor="7b", receiver="8b", donor_pod="7b-1", receiver_pod="8b-1", tid="7b->8b#0"):
-    return (
-        ScaleAction(donor, -1, "critical_donor_immediate", "rescue", donor=donor,
-                    receiver=receiver, pods=(donor_pod,), transfer_id=tid),
-        ScaleAction(receiver, 1, "critical_donor_immediate", "rescue", donor=donor,
-                    receiver=receiver, pods=(receiver_pod,), transfer_id=tid),
-    )
+
+def _pair(donor="7b", receiver="8b"):
+    return (TransferIntent(donor, receiver, 1, "critical_donor_immediate", "rescue"),)
 
 
 async def _until(predicate, steps=400):
@@ -71,68 +86,58 @@ async def _until(predicate, steps=400):
     return predicate()
 
 
-def test_fuse_transfers_pairs_by_transfer_id_and_keeps_unpaired_halves() -> None:
-    donor, receiver = _pair()
-    other = ScaleAction("x", 1, "critical", "rescue")
-    lonely = ScaleAction("9b", 1, "critical_donor_immediate", "rescue", pods=("9b-1",), transfer_id="gone")
+def test_relay_intent_is_one_queued_action_holding_both_models() -> None:
+    queue = ActionQueue(GatedPowerClient())
+    result = queue.submit(_pair())
+    assert result.accepted == 1
+    [queued] = queue.pending_actions()
+    assert queued.models == ("7b", "8b")
+    assert queued.resources == frozenset({"model:7b", "model:8b"})  # no pod, no GPU key
 
-    fused = fuse_transfers([donor, other, receiver, lonely])
 
-    assert fused == [TransferAction(donor, receiver), other, lonely]
-
-
-def test_cross_model_rescue_pair_wakes_the_receiver_only_after_the_donor_slept() -> None:
+def test_relay_holds_both_models_until_the_sm_answers() -> None:
     async def scenario():
-        client = GatedPowerClient(gated={"7b-1"})
+        client = GatedPowerClient(gated={"7b->8b"})
         queue = ActionQueue(client)
         runner = asyncio.ensure_future(queue.run(poll_interval_s=0.001))
-        result = queue.submit(_pair())
-        assert result.accepted == 2
+        queue.submit(_pair())
         assert queue.inflight_models() == {"7b", "8b"}
-        # an unrelated model is not blocked by the draining donor
+        # an unrelated model is not blocked by the relay
         queue.submit((ScaleAction("14b", 1, "critical", "rescue"),))
         assert await _until(lambda: ("scale", "14b", True) in client.events)
-        await asyncio.sleep(0.01)
-        assert ("start", "8b-1", True) not in client.events  # receiver waits for the donor
-        # a second receiver action queued meanwhile stays behind the transfer
+        # a second receiver action queued meanwhile stays behind the relay
         queue.submit((ScaleAction("8b", 1, "critical", "rescue", pods=("8b-2",)),))
         await asyncio.sleep(0.01)
         assert ("start", "8b-2", True) not in client.events
-        client.gates["7b-1"].set()
+        client.gates["7b->8b"].set()
         assert await _until(lambda: ("end", "8b-2", True) in client.events)
         runner.cancel()
         await asyncio.gather(runner, return_exceptions=True)
-        power = [e for e in client.events if e[0] in ("start", "end")]
-        assert power == [
-            ("start", "7b-1", False),
-            ("end", "7b-1", False),
-            ("start", "8b-1", True),
-            ("end", "8b-1", True),
-            ("start", "8b-2", True),
-            ("end", "8b-2", True),
-        ]
+        order = [e[:2] for e in client.events if e[0] in ("transfer_end", "start")]
+        assert order == [("transfer_end", "7b->8b"), ("start", "8b-2")]
         assert queue.inflight_models() == set()
         assert {m: d for m, (_, d) in queue.last_actions().items()} == {"7b": "down", "8b": "up", "14b": "up"}
 
     asyncio.run(scenario())
 
 
-def test_donor_failure_drops_the_receiver_wake_and_records_why() -> None:
+def test_relay_with_no_pair_done_is_reported_and_not_retried() -> None:
     async def scenario():
-        client = GatedPowerClient(
-            results={"7b-1": [{"ok": False, "error": "HTTP 409: drain rolled back", "retriable": True}]}
-        )
+        partial = {"transfer_id": "tr-2", "pairs": [{"donor": "7b-1", "donors": ["7b-1"], "receiver": "8b-1",
+                   "node": "n", "gpu_ids": [0], "status": "donor_sleep_failed"}],
+                   "done": 0, "taken": 0, "unfilled": 0, "clamped_by_floor": False, "refusals": [], "skipped": {}}
+        client = GatedPowerClient(results={"transfer:7b->8b": [
+            {"ok": False, "error": "HTTP 409: partial", "status": 409, "retriable": False,
+             "partial": True, "response": partial},
+        ]})
         queue = ActionQueue(client)
         queue.submit(_pair())
         results = await queue.drain_once()
-        assert ("start", "8b-1", True) not in client.events
         by_model = {r.model: r for r in results}
-        assert by_model["7b"].ok is False
-        assert by_model["8b"].ok is False
-        assert by_model["8b"].error.startswith("donor_sleep_failed: HTTP 409")
-        assert queue.stats()["transfer_receiver_dropped_total"] == 1
-        # a re-plannable (rescue) transfer is not retried
-        assert [e for e in client.events if e[1] == "7b-1" and e[0] == "start"] == [("start", "7b-1", False)]
+        assert by_model["7b"].ok is False and by_model["7b"].taken == 0
+        assert by_model["8b"].ok is False and by_model["8b"].done == 0
+        assert [e for e in client.events if e[0] == "transfer_start"] == [("transfer_start", "7b->8b", 1)]
+        assert queue.last_actions() == {}
         assert queue.inflight_models() == set()
 
     asyncio.run(scenario())
@@ -243,20 +248,20 @@ def test_replannable_actions_are_not_retried() -> None:
     asyncio.run(scenario())
 
 
-def test_actions_on_a_shared_gpu_are_serialized_across_models() -> None:
+def test_actions_of_different_models_are_not_serialized_by_gpu() -> None:
+    """2026-10-02: no ``gpu:`` resource keys - the service-manager serializes GPU use
+    (reservations, leases, writer lock); the queue only orders by model and pod."""
     async def scenario():
-        slots = {"a-1": ("n", (0,)), "b-1": ("n", (0,)), "c-1": ("n", (1,))}
         client = GatedPowerClient(gated={"a-1"})
-        queue = ActionQueue(client, slot_of=slots.get)
+        queue = ActionQueue(client)
         runner = asyncio.ensure_future(queue.run(poll_interval_s=0.001))
         queue.submit((ScaleAction("a", -1, "high", "fairness", sleep_path="urgent", pods=("a-1",)),))
         await asyncio.sleep(0.005)
         queue.submit((ScaleAction("b", 1, "critical", "rescue", pods=("b-1",)),))
-        queue.submit((ScaleAction("c", 1, "critical", "rescue", pods=("c-1",)),))
-        assert await _until(lambda: ("end", "c-1", True) in client.events)  # other GPU: free
-        assert ("start", "b-1", True) not in client.events  # same GPU: waits
+        assert await _until(lambda: ("end", "b-1", True) in client.events)  # not behind a-1
+        assert ("end", "a-1", False) not in client.events
         client.gates["a-1"].set()
-        assert await _until(lambda: ("end", "b-1", True) in client.events)
+        assert await _until(lambda: ("end", "a-1", False) in client.events)
         runner.cancel()
         await asyncio.gather(runner, return_exceptions=True)
 

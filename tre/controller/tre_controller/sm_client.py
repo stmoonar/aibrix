@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import contextmanager
 from contextvars import ContextVar
+from dataclasses import dataclass, field
 import json
 import socket
 from typing import Any, Iterator, Protocol
@@ -13,13 +14,24 @@ from urllib.request import Request, urlopen
 #: lock busy / sleep reservation / drain rolled back, 503 = shutting down.
 RETRIABLE_STATUSES = frozenset({409, 503})
 
-#: ``error`` codes of a structured 409 wake refusal / failure (S3, 2026-09-30):
-#: the body locates it (node, gpu_ids, scope), so the planner avoids that GPU (or
-#: node) for a while instead of re-planning the same slot. ``wake_conflict`` is
-#: accepted for a service-manager of the same series that sent the generic code.
+#: ``error`` codes of a structured 409 wake refusal / failure (S3, 2026-09-30): the
+#: body locates it (node, gpu_ids, scope). Since 2026-10-02 the controller only
+#: records it as an observation event (``wake_refused``); the next tick re-plans from
+#: a new view (no GPU cooldown). ``wake_conflict`` is accepted for a service-manager
+#: of the same series that sent the generic code.
 WAKE_ERROR_CODES = frozenset({
     "gpu_busy", "resident_loading", "lease_conflict", "resident_awake",
     "truth_unavailable", "wake_failed", "wake_conflict",
+})
+
+#: 409 ``error`` codes the service-manager answers BEFORE it changes anything
+#: (2026-10-02): the routable view unreadable (fail closed), the replica floor, the
+#: writer lock busy, and the located wake refusals of the prepare step. ``wake_failed``
+#: (the wake itself failed and was settled) and ``partial`` (a transfer: see its
+#: pairs) are not in it.
+NOT_EXECUTED_CODES = frozenset({
+    "routable_unknown", "floor_violation", "writer_busy",
+    "gpu_busy", "resident_loading", "lease_conflict", "resident_awake", "truth_unavailable", "wake_conflict",
 })
 
 #: Caller identity of the SM calls made in this context (``X-TRE-Actor``,
@@ -72,8 +84,8 @@ class ServiceManagerError(Exception):
             return False
         if (self.body or {}).get("error") == "wake_failed":
             # The wake itself failed on that GPU (the SM settled it, possibly with a
-            # compensating sleep): not re-sent at once - the GPU cools down and the
-            # planner re-plans (review P3-11).
+            # compensating sleep): not re-sent at once - the planner re-plans from a
+            # new view (review P3-11).
             return False
         return self.timeout or self.transport or self.status in RETRIABLE_STATUSES
 
@@ -106,6 +118,24 @@ class ServiceManagerError(Exception):
             "blocking_binding_id": body.get("blocking_binding_id"),
         }
 
+    @property
+    def not_executed(self) -> bool:
+        """The SM refused the call BEFORE changing anything (2026-10-02): a 400 / 404, a
+        503 while shutting down, or a 409 whose code says it was refused up front
+        (``routable_unknown``, ``floor_violation``, ``writer_busy``, a located wake
+        refusal other than ``wake_failed``) or a plain ``RetryLater`` 409 (``...; retry``,
+        e.g. a ``/target`` of a model whose transfer receiver is still waking). The
+        controller then records no change (no view-pending / O1 stamp, no last action)."""
+        if self.status in (400, 404, 503):
+            return True
+        if self.status != 409:
+            return False
+        body = self.body or {}
+        code = body.get("error")
+        if code is None:
+            return str(body.get("detail") or "").rstrip().endswith("retry")
+        return code in NOT_EXECUTED_CODES
+
     def result(self) -> dict:
         result = {
             "ok": False,
@@ -113,6 +143,8 @@ class ServiceManagerError(Exception):
             "status": self.status,
             "retriable": self.retriable,
         }
+        if self.not_executed:
+            result["not_executed"] = True
         if self.floor_violation:
             result["floor_violation"] = (self.body or {}).get("floor")
         conflict = self.wake_conflict
@@ -207,9 +239,7 @@ class ServiceManagerClient:
         except ServiceManagerError as exc:
             return exc.result()
 
-    async def scale_model_hinted(
-        self, model: str, delta: int, *, hints: tuple[str, ...], avoid_gpus: tuple[str, ...] = ()
-    ) -> dict:
+    async def scale_model_hinted(self, model: str, delta: int, *, hints: tuple[str, ...]) -> dict:
         """Grow ``model`` by ``delta`` awake replicas, waking the sleeping bindings
         ``hints`` names when the service-manager can (S5): it picks the GPUs itself
         (registry placement policy) and substitutes a hint it cannot wake; the
@@ -221,13 +251,62 @@ class ServiceManagerClient:
             response = await self._request(
                 "PUT",
                 f"/v2/models/{model}/target",
+                json={"wake_replicas": target, "at_least": True, "hints": list(hints)},
+                timeout_s=self._slow_timeout_s,
+            )
+            return {"ok": True, "response": response}
+        except ServiceManagerError as exc:
+            return exc.result()
+
+    async def transfer(
+        self,
+        donor_model: str,
+        receiver_model: str,
+        count: int,
+        *,
+        sleep_path: str = "urgent",
+    ) -> dict:
+        """``POST /v2/transfers`` (2026-10-02, design 20261002-controller-transfer): the
+        service-manager hands ``count`` donor replicas' GPUs to the receiver model -
+        it picks the pairs (same GPUs, TP coverage), sleeps the donors and wakes the
+        receivers in one request. Never retried (not idempotent; the planner re-plans).
+
+        Returns ``{"ok": True, "response": body}`` on 200 (which may still be a
+        PARTIAL transfer - account by ``done`` / ``taken`` / ``unfilled``, never by
+        ``count``). A 409 that carries the transfer response (``error: partial``, no
+        pair completed) returns ``ok: False`` with that body as ``response`` and
+        ``partial: True``. A 404 (service-manager without the endpoint) returns
+        ``ok: False`` with ``unsupported: True``."""
+        try:
+            response = await self._request(
+                "POST",
+                "/v2/transfers",
                 json={
-                    "wake_replicas": target, "at_least": True, "hints": list(hints),
-                    "avoid_gpus": list(avoid_gpus),
+                    "donor_model": donor_model,
+                    "receiver_model": receiver_model,
+                    "count": int(count),
+                    "sleep_path": sleep_path,
                 },
                 timeout_s=self._slow_timeout_s,
             )
             return {"ok": True, "response": response}
+        except ServiceManagerError as exc:
+            result = exc.result()
+            # A transfer is never re-sent as is (the planner re-plans from a new view).
+            result["retriable"] = False
+            body = exc.body or {}
+            if exc.status == 404:
+                result["unsupported"] = True
+            elif exc.status == 409 and isinstance(body.get("pairs"), list):
+                result["partial"] = True
+                result["response"] = body
+            return result
+
+    async def get_transfers(self) -> dict:
+        """``GET /v2/transfers``: ``{"in_progress": {transfer_id: entry}, "running_here":
+        [...], "stats": {...}}`` wrapped as ``{"ok": True, "response": ...}``."""
+        try:
+            return {"ok": True, "response": await self._request("GET", "/v2/transfers")}
         except ServiceManagerError as exc:
             return exc.result()
 
@@ -317,6 +396,81 @@ class ServiceManagerClient:
         if not isinstance(response, dict):
             raise ServiceManagerError("service-manager response must be a JSON object")
         return response
+
+
+@dataclass(frozen=True)
+class ModelFloor:
+    """One model's replica-floor view of ``/v2/state`` (2026-10-02): ``routable`` is the
+    service-manager's own floor-check count, ``floor`` the enforced ``min_replicas`` (0
+    while the floor is off), ``floor_headroom = routable - floor``. None = not readable."""
+
+    routable: int | None = None
+    floor: int | None = None
+    floor_headroom: int | None = None
+
+
+@dataclass(frozen=True)
+class StateRoutable:
+    """The routable / floor fields of one ``/v2/state`` answer.
+
+    ``routable_ids`` (serve ids the SM counts routable) is None when the SM did not
+    report a per-binding ``routable`` (an older SM: key missing) or could not compute
+    it (``routable: null`` with ``routable_error``); ``error`` then says why and the
+    controller falls back to its own count (awake and not hidden)."""
+
+    routable_ids: frozenset[str] | None
+    models: dict[str, ModelFloor] = field(default_factory=dict)
+    floor_enforced: bool | None = None
+    error: str | None = None
+
+
+def parse_state_routable(state: dict) -> StateRoutable:
+    """The SM routable / floor view of a ``/v2/state`` answer (never raises)."""
+    if not isinstance(state, dict):
+        return StateRoutable(routable_ids=None, error="malformed_state")
+    enforced = state.get("floor_enforced")
+    enforced = bool(enforced) if isinstance(enforced, bool) else None
+    models: dict[str, ModelFloor] = {}
+    raw_models = state.get("models")
+    for model, entry in (raw_models.items() if isinstance(raw_models, dict) else ()):
+        if isinstance(entry, dict):
+            models[str(model)] = ModelFloor(
+                routable=_opt_int(entry.get("routable")),
+                floor=_opt_int(entry.get("floor")),
+                floor_headroom=_opt_int(entry.get("floor_headroom")),
+            )
+    error: str | None = None
+    ids: set[str] = set()
+    bindings = state.get("bindings")
+    for item in bindings if isinstance(bindings, list) else ():
+        if not isinstance(item, dict):
+            continue
+        if "routable" not in item:
+            error = "routable_missing"
+            break
+        value = item.get("routable")
+        if not isinstance(value, bool):
+            error = f"routable_unavailable: {state.get('routable_error') or 'null'}"
+            break
+        if value:
+            ids.add(str(item.get("serve_id")))
+    if error is None and state.get("routable_error"):
+        error = f"routable_unavailable: {state.get('routable_error')}"
+    return StateRoutable(
+        routable_ids=None if error is not None else frozenset(ids),
+        models=models,
+        floor_enforced=enforced,
+        error=error,
+    )
+
+
+def _opt_int(value: Any) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _sleep_fields(sleep_path: str | None, drain_budget_s: float | None) -> dict:

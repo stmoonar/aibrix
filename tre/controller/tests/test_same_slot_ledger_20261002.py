@@ -19,6 +19,7 @@ from tre_controller.planning.planner import (
     build_plan,
 )
 from tre_sm.allocator.slots import Binding, Slot
+from relay_view import expand_relays, relays  # noqa: F401 - 2026-10-02 relay intents
 
 
 def _same_slot_plan(high_replicas: int, *, low_replicas: int = 1):
@@ -67,18 +68,21 @@ def test_same_slot_shrink_is_claimed_in_the_ledger_and_not_piggybacked_by_low():
     assert [(a.donor, a.beneficiary) for a in shrinks] == [("high", "tp2")]
     assert plan.probe_upscale_plans == {"high": {"tp2": 1}}
     assert "low" not in plan.probe_upscale_plans.get("high", {})
-    assert not [a for a in plan.actions if isinstance(a, ScaleAction) and a.model in {"high", "low"}]
+    assert not [a for a in expand_relays(plan.actions) if isinstance(a, ScaleAction) and a.model in {"high", "low"}]
 
 
 def test_three_replica_donor_still_feeds_low_through_an_immediate_pair_on_another_pod():
     plan = _same_slot_plan(3)
     [shrink] = [a for a in plan.actions if isinstance(a, ShrinkForSlotAction)]
     assert plan.probe_upscale_plans == {"high": {"tp2": 1}}
-    scales = [a for a in plan.actions if isinstance(a, ScaleAction)]
+    scales = [a for a in expand_relays(plan.actions) if isinstance(a, ScaleAction)]
     pair = [a for a in scales if a.reason == "low_fairness_donor_immediate"]
     assert sorted((a.model, a.delta) for a in pair) == [("high", -1), ("low", 1)]
-    donor_pair = next(a for a in pair if a.model == "high")
-    assert shrink.serve_id not in donor_pair.pods and donor_pair.pods
+    # 2026-10-02: the relay names no pod (the SM picks it); the only donor pod that pairs
+    # with low's sleeping binding is high-2, which the same-slot shrink did not take.
+    [relay] = relays(plan.actions)
+    assert (relay.donor_model, relay.receiver_model, relay.count) == ("high", "low", 1)
+    assert shrink.serve_id != "high-2"
 
 
 def _proactive(n_low: int, high_replicas: int):
@@ -103,14 +107,14 @@ def _proactive(n_low: int, high_replicas: int):
 
 def test_proactive_high_probe_still_hands_its_shrink_to_low_receivers():
     plan = _proactive(1, 2)
-    [shrink] = [a for a in plan.actions if isinstance(a, ScaleAction) and a.model == "high"]
+    [shrink] = [a for a in expand_relays(plan.actions) if isinstance(a, ScaleAction) and a.model == "high"]
     assert shrink.reason == "high_proactive_safescale" and shrink.delta < 0
     assert plan.probe_upscale_plans["high"] == {"low0": -shrink.delta}
 
 
 def test_proactive_high_probe_claims_never_exceed_the_shrink_with_two_low_receivers():
     plan = _proactive(2, 4)
-    shrinks = [a for a in plan.actions if isinstance(a, ScaleAction) and a.reason == "high_proactive_safescale"]
+    shrinks = [a for a in expand_relays(plan.actions) if isinstance(a, ScaleAction) and a.reason == "high_proactive_safescale"]
     assert shrinks
     assert sum(plan.probe_upscale_plans["high"].values()) == sum(-a.delta for a in shrinks)
 
@@ -133,7 +137,7 @@ def test_middle_zone_claim_leaves_nothing_unclaimed_for_a_later_low_receiver():
         idle_gpus=0,
         cfg=PlanConfig(min_replicas_per_model=1, max_replicas_per_model=4),
     )
-    shrinks = [a for a in plan.actions if isinstance(a, ScaleAction) and a.model == "healthy"]
+    shrinks = [a for a in expand_relays(plan.actions) if isinstance(a, ScaleAction) and a.model == "healthy"]
     assert [(a.reason, a.delta) for a in shrinks] == [("critical_middle_zone_safescale", -1)]
     # The CRITICAL claim covers the whole shrink: LOW gets no piggyback.
     assert plan.probe_upscale_plans == {"healthy": {"critical": 1}}

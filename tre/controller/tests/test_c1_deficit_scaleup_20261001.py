@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from relay_view import expand_relays, relays  # noqa: F401 - 2026-10-02 relay intents
 
 import pytest
 import yaml
@@ -80,7 +81,7 @@ def _plan(classifications, pods, *, idle_gpus=0, max_replicas=8, ratio=2.0, base
 
 def _deltas(plan):
     out: dict[str, int] = {}
-    for action in plan.actions:
+    for action in expand_relays(plan.actions):
         if isinstance(action, ScaleAction):
             out[action.model] = out.get(action.model, 0) + action.delta
     return out
@@ -112,7 +113,7 @@ def test_rescue_desired(n, z, ratio, expected):
 def test_critical_receiver_gets_the_whole_deficit_in_one_tick():
     plan = _plan([_cls("r", ModelState.CRITICAL, 0.4)], {"r": 2}, idle_gpus=4)
 
-    ups = [a for a in plan.actions if isinstance(a, ScaleAction) and a.delta > 0]
+    ups = [a for a in expand_relays(plan.actions) if isinstance(a, ScaleAction) and a.delta > 0]
     assert [(a.model, a.delta, a.reason) for a in ups] == [("r", 2, "critical_idle_capacity")]
     assert ups[0].rescue == RescuePlan(target=4, desired=4, base=2, covered=2)
     assert "rescue_target:r:n=2:z=0.4000:desired=4:covered=2:planned=2" in plan.events
@@ -139,7 +140,7 @@ def test_missing_z_falls_back_to_one_more_replica():
 
 def test_capacity_short_plans_what_exists_and_records_the_partial_target():
     plan = _plan([_cls("r", ModelState.CRITICAL, 0.2)], {"r": 2}, idle_gpus=1)
-    ups = [a for a in plan.actions if isinstance(a, ScaleAction) and a.delta > 0]
+    ups = [a for a in expand_relays(plan.actions) if isinstance(a, ScaleAction) and a.delta > 0]
     assert [a.delta for a in ups] == [1]
     assert ups[0].rescue == RescuePlan(target=3, desired=4, base=2, covered=2)
 
@@ -201,14 +202,14 @@ def test_tp_receiver_takes_several_free_slot_pairs_in_one_action():
         ),
     )
     plan = _plan([_cls("r", ModelState.CRITICAL, 0.2)], {"r": 2}, cluster_view=view, tp={"r": 2})
-    ups = [a for a in plan.actions if isinstance(a, ScaleAction) and a.delta > 0]
+    ups = [a for a in expand_relays(plan.actions) if isinstance(a, ScaleAction) and a.delta > 0]
     assert [(a.delta, a.reason) for a in ups] == [(2, "critical_empty_slot")]
 
 
 # --------------------------------------------------- idempotence / protection
 def test_unrefreshed_window_recomputes_the_same_target_and_adds_nothing():
     first = _plan([_cls("r", ModelState.CRITICAL, 0.4)], {"r": 2}, idle_gpus=4)
-    target = next(a.rescue for a in first.actions if isinstance(a, ScaleAction))
+    target = next(a.rescue for a in expand_relays(first.actions) if isinstance(a, ScaleAction))
     basis = {"r": RescueBasis(base=target.base, covered=target.target)}
     # The cluster view may already show the woken replicas (4) or still the old count (2).
     for routable in (2, 4):
@@ -220,7 +221,7 @@ def test_unrefreshed_window_recomputes_the_same_target_and_adds_nothing():
 def test_load_still_rising_raises_the_target_by_the_difference_only():
     basis = {"r": RescueBasis(base=4, covered=6)}  # 4 -> 6 issued from Z=0.6
     plan = _plan([_cls("r", ModelState.CRITICAL, 0.4)], {"r": 6}, idle_gpus=4, bases=basis)
-    ups = [a for a in plan.actions if isinstance(a, ScaleAction) and a.delta > 0]
+    ups = [a for a in expand_relays(plan.actions) if isinstance(a, ScaleAction) and a.delta > 0]
     assert sum(a.delta for a in ups) == 2  # desired ceil(4 * 0.8 / 0.4) = 8 = cap 2 * 4
     assert ups[0].rescue == RescuePlan(target=8, desired=8, base=4, covered=6)
 
@@ -248,7 +249,7 @@ def test_slow_loop_moves_at_most_one_pair_per_receiver_and_is_unchanged_by_c1():
     c1 = _plan(classifications, pods, rescue_due=False)
     legacy = _plan(classifications, pods, rescue_due=False, ratio=0)
     assert c1.actions == legacy.actions and c1.events == legacy.events
-    transfers = [a for a in c1.actions if isinstance(a, ScaleAction) and a.delta > 0]
+    transfers = [a for a in expand_relays(c1.actions) if isinstance(a, ScaleAction) and a.delta > 0]
     assert [(a.model, a.delta, a.reason) for a in transfers] == [("low", 1, "low_fairness_donor_immediate")]
 
 

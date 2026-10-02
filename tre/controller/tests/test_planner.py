@@ -4,6 +4,7 @@ from tre_controller.planning.classify import ModelClassification, ModelRole, Mod
 from tre_common.registry import ClusterTopology, NodeSpec
 from tre_controller.planning.planner import ClusterView, DefragAction, PlanConfig, ScaleAction, ShrinkForSlotAction, build_plan
 from tre_sm.allocator.slots import Binding, Migration, Slot
+from relay_view import expand_relays, relays  # noqa: F401 - 2026-10-02 relay intents
 
 
 def _classification(model: str, state: ModelState, role: ModelRole, z: float | None, tier: str | None = None) -> ModelClassification:
@@ -69,7 +70,7 @@ def test_build_plan_rescue_serves_critical_from_idle_and_probes_the_high_donor()
         ),
     )
 
-    scale_actions = [action for action in plan.actions if isinstance(action, ScaleAction)]
+    scale_actions = [action for action in expand_relays(plan.actions) if isinstance(action, ScaleAction)]
     # The idle donor's replica moves to the critical receiver in the same tick; the high
     # donor is serving, so it is only probed (safescale) and never shrunk outright.
     assert _deltas(scale_actions) == {"idle": -1, "critical": 1, "high": -1}
@@ -100,7 +101,7 @@ def test_build_plan_rescue_serves_critical_from_idle_and_probes_the_high_donor()
             rescue_max_step_ratio=0,
         ),
     )
-    assert _deltas([a for a in guarded.actions if isinstance(a, ScaleAction)]) == {"idle": -1, "critical": 1}
+    assert _deltas([a for a in expand_relays(guarded.actions) if isinstance(a, ScaleAction)]) == {"idle": -1, "critical": 1}
     assert guarded.delayed_down_models == set()
     assert guarded.events == ["safescale_probe_suppressed_hot:high"]
 
@@ -114,7 +115,7 @@ def test_build_plan_rescue_serves_critical_from_idle_and_probes_the_high_donor()
         idle_gpus=0,
         cfg=PlanConfig(min_replicas_per_model=1, max_replicas_per_model=4, suppress_hot_proactive_probe=False),
     )
-    c1_actions = [a for a in c1.actions if isinstance(a, ScaleAction)]
+    c1_actions = [a for a in expand_relays(c1.actions) if isinstance(a, ScaleAction)]
     assert _deltas(c1_actions) == {"idle": -1, "critical": 2, "high": -1}
     assert {a.reason for a in c1_actions} == {"critical_donor_immediate"}
     assert c1.events == ["rescue_target:critical:n=2:z=0.5000:desired=4:covered=2:planned=2"]
@@ -146,7 +147,7 @@ def test_build_plan_middle_zone_shrinks_healthy_under_safescale_for_a_critical_r
         cfg=PlanConfig(min_replicas_per_model=1, max_replicas_per_model=4),
     )
 
-    scale_actions = [action for action in plan.actions if isinstance(action, ScaleAction)]
+    scale_actions = [action for action in expand_relays(plan.actions) if isinstance(action, ScaleAction)]
     # No immediate +1 for the receiver: the replica is only promised, via the probe plan.
     assert _deltas(scale_actions) == {"healthy": -1}
     assert plan.delayed_down_models == {"healthy"}
@@ -196,7 +197,7 @@ def test_build_plan_serves_a_low_and_a_critical_receiver_in_one_tick() -> None:
         ),
     )
 
-    scale_actions = [action for action in plan.actions if isinstance(action, ScaleAction)]
+    scale_actions = [action for action in expand_relays(plan.actions) if isinstance(action, ScaleAction)]
     assert _deltas(scale_actions) == {"idle": -2, "critical": 1, "low": 1}
     # Conservation: what leaves the donors is exactly what reaches the receivers.
     assert sum(action.delta for action in scale_actions) == 0
@@ -235,7 +236,7 @@ def test_build_plan_low_fairness_receiver_needs_no_saturation() -> None:
         cfg=PlanConfig(min_replicas_per_model=1, max_replicas_per_model=4, rescue_due=False, fairness_due=True),
     )
 
-    upscales = [a for a in plan.actions if isinstance(a, ScaleAction) and a.delta > 0]
+    upscales = [a for a in expand_relays(plan.actions) if isinstance(a, ScaleAction) and a.delta > 0]
     assert any(a.model == "low" for a in upscales), "non-saturated LOW receiver must now receive"
     assert not any(e.startswith("fairness_blocked_unsaturated") for e in plan.events)
     assert {action.source_loop for action in plan.actions} == {"fairness"}
@@ -410,7 +411,7 @@ def test_tp_aware_critical_receiver_uses_complete_two_gpu_slot() -> None:
     )
 
     assert [action for action in plan.actions if isinstance(action, DefragAction)] == []
-    scale = next(action for action in plan.actions if isinstance(action, ScaleAction))
+    scale = next(action for action in expand_relays(plan.actions) if isinstance(action, ScaleAction))
     assert scale.model == "tp2"
     assert scale.delta == 1
     assert scale.reason == "critical_empty_slot"
@@ -447,7 +448,7 @@ def test_tp_aware_critical_receiver_plans_defrag_for_fragmented_two_gpu_capacity
             to_slot=Slot("node-a", (1,)),
         ),
     )
-    scale = next(action for action in plan.actions if isinstance(action, ScaleAction))
+    scale = next(action for action in expand_relays(plan.actions) if isinstance(action, ScaleAction))
     assert scale.model == "tp2"
     assert scale.delta == 1
     assert scale.reason == "critical_tp_defrag"
@@ -477,7 +478,7 @@ def test_tp_aware_critical_receiver_records_capacity_blocked_when_no_slot_or_def
         cluster_view=cluster_view,
     )
 
-    assert [action for action in plan.actions if isinstance(action, ScaleAction)] == []
+    assert [action for action in expand_relays(plan.actions) if isinstance(action, ScaleAction)] == []
     assert [action for action in plan.actions if isinstance(action, DefragAction)] == []
     assert plan.events == ["capacity_blocked:tp2"]
 
@@ -514,7 +515,7 @@ def test_tp_aware_critical_receiver_prefers_high_same_slot_shrink_before_defrag(
     )
 
     assert [action for action in plan.actions if isinstance(action, DefragAction)] == []
-    assert [action for action in plan.actions if isinstance(action, ScaleAction)] == []
+    assert [action for action in expand_relays(plan.actions) if isinstance(action, ScaleAction)] == []
     assert plan.actions == [
         ShrinkForSlotAction(
             donor="high",
@@ -548,8 +549,8 @@ def test_high_proactive_probe_suppressed_for_hot_model_when_guard_enabled() -> N
         cfg=PlanConfig(min_replicas_per_model=1, max_replicas_per_model=4, suppress_hot_proactive_probe=True),  # guard ON (opt-in)
     )
 
-    assert [a for a in plan.actions if isinstance(a, ScaleAction) and a.requires_safescale] == []
-    assert not any(a for a in plan.actions if isinstance(a, ScaleAction) and a.delta < 0)
+    assert [a for a in expand_relays(plan.actions) if isinstance(a, ScaleAction) and a.requires_safescale] == []
+    assert not any(a for a in expand_relays(plan.actions) if isinstance(a, ScaleAction) and a.delta < 0)
     assert "safescale_probe_suppressed_hot:hot" in plan.events
     assert plan.delayed_down_models == set()
     assert plan.probe_upscale_plans == {}
@@ -568,7 +569,7 @@ def test_high_proactive_probe_emitted_when_guard_disabled() -> None:
         cfg=PlanConfig(min_replicas_per_model=1, max_replicas_per_model=4, suppress_hot_proactive_probe=False),
     )
 
-    shrink = next(a for a in plan.actions if isinstance(a, ScaleAction) and a.model == "hot")
+    shrink = next(a for a in expand_relays(plan.actions) if isinstance(a, ScaleAction) and a.model == "hot")
     assert shrink.delta < 0
     assert shrink.requires_safescale is True
     assert shrink.reason == "high_proactive_safescale"
@@ -646,7 +647,7 @@ def test_middle_zone_safescale_donor_not_suppressed_by_hot_guard() -> None:
         cfg=PlanConfig(min_replicas_per_model=1, max_replicas_per_model=4, suppress_hot_proactive_probe=True),  # guard ON (opt-in)
     )
 
-    shrink = next(a for a in plan.actions if isinstance(a, ScaleAction) and a.model == "healthy")
+    shrink = next(a for a in expand_relays(plan.actions) if isinstance(a, ScaleAction) and a.model == "healthy")
     assert shrink.requires_safescale is True
     assert shrink.reason == "critical_middle_zone_safescale"
     assert plan.probe_upscale_plans == {"healthy": {"critical": 1}}
@@ -667,7 +668,7 @@ def test_idle_proactive_immediate_shrink_not_affected_by_hot_guard() -> None:
         cfg=PlanConfig(min_replicas_per_model=1, max_replicas_per_model=4, suppress_hot_proactive_probe=True),  # guard ON (opt-in)
     )
 
-    shrink = next(a for a in plan.actions if isinstance(a, ScaleAction) and a.model == "idle")
+    shrink = next(a for a in expand_relays(plan.actions) if isinstance(a, ScaleAction) and a.model == "idle")
     assert shrink.delta < 0
     assert shrink.requires_safescale is False
     assert shrink.reason == "idle_proactive_immediate"
@@ -700,7 +701,7 @@ def test_disable_eta_gate_uses_signal_independent_natural_donor_order() -> None:
 
     donor_shrinks = [
         action
-        for action in plan.actions
+        for action in expand_relays(plan.actions)
         if isinstance(action, ScaleAction) and action.delta < 0
     ]
     assert donor_shrinks
@@ -737,7 +738,7 @@ def test_high_proactive_probe_is_held_during_rollback_backoff() -> None:
     )
 
     def reasons(plan):
-        return {(a.model, a.reason) for a in plan.actions if isinstance(a, ScaleAction)}
+        return {(a.model, a.reason) for a in expand_relays(plan.actions) if isinstance(a, ScaleAction)}
 
     assert ("hot", "high_proactive_safescale") in reasons(free)
     assert ("hot", "high_proactive_safescale") not in reasons(held)
@@ -780,7 +781,7 @@ def test_receiver_cap_counts_hidden_probe_pods_like_v1_assigned() -> None:
         idle_gpus=2,
         cfg=cfg,
     )
-    assert [a for a in fairness.actions if isinstance(a, ScaleAction)] == []
+    assert [a for a in expand_relays(fairness.actions) if isinstance(a, ScaleAction)] == []
 
 
 
@@ -828,6 +829,6 @@ def test_tp_aware_critical_receiver_plans_no_defrag_while_disabled() -> None:
 
     assert PlanConfig(min_replicas_per_model=0, max_replicas_per_model=2).defrag_enabled is False
     assert [action for action in plan.actions if isinstance(action, DefragAction)] == []
-    assert [action for action in plan.actions if isinstance(action, ScaleAction)] == []
+    assert [action for action in expand_relays(plan.actions) if isinstance(action, ScaleAction)] == []
     assert "defrag_disabled:tp2" in plan.events
     assert "capacity_blocked:tp2" in plan.events

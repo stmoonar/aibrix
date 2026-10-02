@@ -1,6 +1,9 @@
 """Sleeping-capacity deadlock (E1 canonical_rerun t1/t2/t7): dsqwen-7b awake on every
 GPU, dsllama-8b CRITICAL with sleeping bindings only on those GPUs. The planner used to
-emit a critical_sleeping_capacity wake every tick that the SM rejected (WakeConflict)."""
+emit a critical_sleeping_capacity wake every tick that the SM rejected (WakeConflict).
+
+2026-10-02: the relay is a TransferIntent (count); ``pairable_count`` bounds it to the
+pairs the SM can form (see also test_controller_transfer_20261002)."""
 from __future__ import annotations
 
 import asyncio
@@ -12,6 +15,7 @@ from tre_controller.planning.planner import (
     ClusterView,
     PlanConfig,
     ScaleAction,
+    TransferIntent,
     _plan_sleeping_wakes,
     _SlotOccupancy,
     build_plan,
@@ -86,19 +90,13 @@ def test_e1_deadlock_high_donor_frees_a_slot_where_receiver_sleeps() -> None:
     scale = [a for a in plan.actions if isinstance(a, ScaleAction)]
     assert not any(a.reason == "critical_sleeping_capacity" for a in scale)
     assert "critical_sleeping_blocked:dsllama-8b" in plan.events
-    donor = next(a for a in scale if a.model == "dsqwen-7b")
-    receiver = next(a for a in scale if a.model == "dsllama-8b")
-    assert (donor.delta, donor.reason, donor.pods, donor.requires_safescale) == (
-        -1,
-        "critical_donor_immediate",
-        ("7b-0",),  # 7b-0 is awake on node9/gpu0 where 8b-0 sleeps
-        False,
-    )
-    assert (receiver.delta, receiver.reason) == (1, "critical_donor_immediate")
-    # Serial FIFO queue: the donor sleep is dispatched (and awaited) before the wake.
-    assert scale.index(donor) < scale.index(receiver)
-    # Review 2 P1-1: the pair is one transfer (the queue runs it as one compound action).
-    assert donor.transfer_id is not None and donor.transfer_id == receiver.transfer_id
+    # 2026-10-02: the relay is ONE TransferIntent - a count, no pod and no GPU (the SM
+    # pairs 7b replicas with the 8b bindings sleeping under them).
+    [relay] = [a for a in plan.actions if isinstance(a, TransferIntent)]
+    assert (relay.donor_model, relay.receiver_model, relay.count, relay.pairs) == ("dsqwen-7b", "dsllama-8b", 1, 1)
+    assert (relay.reason, relay.sleep_path) == ("critical_donor_immediate", "urgent")
+    assert not hasattr(relay, "pods")
+    assert not scale  # no binding-level donor sleep / receiver wake any more
 
 
 def test_e1_deadlock_healthy_donor_probe_is_pinned_to_receiver_slot() -> None:
@@ -174,8 +172,10 @@ def test_low_fairness_sleeping_path_is_slot_aware() -> None:
     scale = [a for a in plan.actions if isinstance(a, ScaleAction)]
     assert not any(a.reason == "low_fairness_sleeping_capacity" for a in scale)
     assert "low_fairness_sleeping_blocked:dsllama-8b" in plan.events
-    donor = next(a for a in scale if a.model == "dsqwen-7b")
-    assert (donor.reason, donor.pods) == ("low_fairness_donor_immediate", ("7b-0",))
+    [relay] = [a for a in plan.actions if isinstance(a, TransferIntent)]
+    assert (relay.donor_model, relay.receiver_model, relay.count, relay.reason) == (
+        "dsqwen-7b", "dsllama-8b", 1, "low_fairness_donor_immediate"
+    )
 
 
 def _registry() -> Registry:
@@ -205,10 +205,15 @@ def test_e1_plan_executes_through_serial_queue_without_wake_conflict() -> None:
     results = asyncio.run(queue.drain_once())
 
     assert all(result.ok for result in results), results
+    # The (fake) SM picked the pair: one 7b replica slept, the 8b binding under it woke.
     bindings = {b.serve_id: b for b in store.load().bindings}
-    assert bindings["7b-0"].awake is False
-    assert bindings["8b-0"].awake is True
     assert sum(b.awake for b in bindings.values() if b.model == "dsqwen-7b") == 7
+    [woken] = [b for b in bindings.values() if b.model == "dsllama-8b" and b.awake]
+    [slept] = [b for b in bindings.values() if b.model == "dsqwen-7b" and not b.awake]
+    assert woken.slot == slept.slot
+    by_model = {result.model: result for result in results}
+    assert (by_model["dsqwen-7b"].taken, by_model["dsllama-8b"].done) == (1, 1)
+    assert queue.view_changes().keys() == {"dsqwen-7b", "dsllama-8b"}
 
 
 # ---------------------------------------------------------------- buddy packing

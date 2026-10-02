@@ -12,6 +12,7 @@ from tre_controller.planning.classify import ModelClassification, ModelRole, Mod
 from tre_controller.planning.planner import PlanConfig, ScaleAction, build_plan
 
 from tre_common.registry import Registry, ScalingRegistryConfig
+from relay_view import expand_relays, relays  # noqa: F401 - 2026-10-02 relay intents
 
 from test_loop_ticks import _registry as _base_registry
 
@@ -193,7 +194,7 @@ def _plan(classifications, cooldowns, *, idle_gpus=0, rescue_due=True, scale_up_
 
 def _deltas(plan):
     out = {}
-    for action in plan.actions:
+    for action in expand_relays(plan.actions):
         if isinstance(action, ScaleAction):
             out[action.model] = out.get(action.model, 0) + action.delta
     return out

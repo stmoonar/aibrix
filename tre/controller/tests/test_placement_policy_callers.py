@@ -59,7 +59,9 @@ def test_free_groups_and_find_slot_spread_a_model():
     assert SlotAllocator(TOPOLOGY, bindings).find_slot(1, "A") == Slot(N1, (2,))
 
 
-def test_donor_slot_pods_follow_the_policy():
+def test_relay_pairing_is_counted_not_placed():
+    """2026-10-02: which donor pod pairs with which receiver binding is the SM's choice
+    (its ``_release_pick`` / ``_wake_pick``); the planner only counts the pairs."""
     bindings = [
         _b("r-0", "R", N1, (0,), awake=True),
         _b("d-n1", "D", N1, (1,), awake=True),
@@ -67,16 +69,12 @@ def test_donor_slot_pods_follow_the_policy():
         _b("r-n1", "R", N1, (1,), awake=False),
         _b("r-n2", "R", N2, (0,), awake=False),
     ]
-    pairs = _SlotOccupancy(_view(bindings)).donor_slot_pods("D", "R")
-    # S5: r-n1 fills the pair r-0 half uses (split cost 0); r-n2 would break a pair.
-    assert [(donor, receiver.serve_id) for donor, receiver in pairs] == [("d-n1", "r-n1"), ("d-n2", "r-n2")]
-    # With a penalty on n1 (e.g. it runs the load generator) the cost still ranks
-    # first; the penalty only decides between equally fitting slots.
-    penalised = PlacementPolicy(max_order=1, reserve_blocks=1, node_penalty={N1: 1})
-    pairs = _SlotOccupancy(_view(bindings, placement=penalised)).donor_slot_pods("D", "R")
-    assert [(donor, receiver.serve_id) for donor, receiver in pairs] == [("d-n1", "r-n1"), ("d-n2", "r-n2")]
-    packed = _SlotOccupancy(_view(bindings, placement=None)).donor_slot_pods("D", "R")
-    assert [(donor, receiver.serve_id) for donor, receiver in packed] == [("d-n1", "r-n1"), ("d-n2", "r-n2")]
+    for placement in (POLICY, None):
+        occupancy = _SlotOccupancy(_view(bindings, placement=placement))
+        assert occupancy.pairable_count("D", "R", max_pairs=5, max_donors=1) == (1, 1)
+        assert occupancy.pairable_count("D", "R", max_pairs=5, max_donors=5) == (1, 1)  # one left
+        assert occupancy.pairable_count("D", "R", max_pairs=5, max_donors=5) == (0, 0)  # counted once
+    assert not hasattr(_SlotOccupancy, "donor_slot_pods")
 
 
 def test_safescale_probe_pick_releases_from_the_most_loaded_node():
