@@ -543,8 +543,10 @@ class ScalingRegistryConfig:
     #: ``saturation_consecutive_ticks`` consecutive metrics windows is a CRITICAL
     #: receiver. Its fast-loop target is ``min(max(n + 1, floor(factor * n)),
     #: max_awake_replicas)``; each further step needs the condition again on windows
-    #: after the routable count changed. Off: the TSS rules alone (numerator zero = no
-    #: decision until requests complete).
+    #: after the routable count changed (the pods the last step added must be full
+    #: themselves); the KV condition alone also needs >= 2 running requests; an O1 hold
+    #: only counts for the traffic onset or the rescue's own steps. Off: the TSS rules
+    #: alone (numerator zero = no decision until requests complete). Factor in [1, 4].
     saturation_rescue: bool = True
     saturation_kv_threshold: float = 0.9
     saturation_consecutive_ticks: int = 2
@@ -674,7 +676,7 @@ def parse_scaling_config(raw: dict[str, Any] | None) -> ScalingRegistryConfig:
             raw, "saturation_consecutive_ticks", defaults.saturation_consecutive_ticks, 1
         ),
         saturation_max_step_factor=_scaling_number(
-            raw, "saturation_max_step_factor", defaults.saturation_max_step_factor, low=1.0
+            raw, "saturation_max_step_factor", defaults.saturation_max_step_factor, low=1.0, high=4.0
         ),
     )
 

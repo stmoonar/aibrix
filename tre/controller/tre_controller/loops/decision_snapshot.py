@@ -168,6 +168,13 @@ def _model_states(
                     "saturation_ticks": context.get("saturation_ticks"),
                     "saturation_waiting": context.get("saturation_waiting"),
                     "saturation_kv": context.get("saturation_kv"),
+                    "saturation_running": context.get("saturation_running"),
+                    "saturation_pods": context.get("saturation_pods"),
+                    "saturation_sample_ms": context.get("saturation_sample_ms"),
+                    "saturation_awaiting_step": context.get("saturation_awaiting_step"),
+                    "saturation_count_after": context.get("saturation_count_after"),
+                    # Per routable pod: newest waiting / KV / running sample.
+                    "saturation_pod_samples": context.get("saturation_pod_samples"),
                 }
             )
     return out

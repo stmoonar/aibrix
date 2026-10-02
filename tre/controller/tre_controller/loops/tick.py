@@ -37,6 +37,7 @@ from tre_controller.planning.safescale import (
     format_window_event,
 )
 from tre_controller.signals.saturation import (
+    PodSample,
     SaturationSample,
     eligibility_reason,
     saturation_sample,
@@ -166,6 +167,10 @@ def run_planner_tick(
         _ru_u0, _ru_s0 = prof.rusage_ms()
         _phase_t0 = _tick_t0
 
+    tracker = getattr(signal_state, "saturation", None)
+    if tracker is not None:
+        # Onset saturation rescue: scaling.saturation_* read every tick, like PlanConfig.
+        tracker.configure(registry)
     contexts, paper_events = _model_contexts(
         snapshot,
         registry,
@@ -342,23 +347,24 @@ def _apply_saturation_rescue(
             continue
         tokens = metrics.prompt_tokens is not None and metrics.generation_tokens is not None
         reason = eligibility_reason(ctx) if tokens else None
-        sample = None
-        if ctx.get("saturation_sample_ms") is not None:
-            sample = SaturationSample(
-                waiting=float(ctx.get("saturation_waiting") or 0.0),
-                kv=ctx.get("saturation_kv"),
-                pods=int(ctx.get("saturation_pods") or 0),
-                sample_ms=int(ctx["saturation_sample_ms"]),
-            )
+        tss_warm = bool(
+            tokens and reason is None and "tss_defined" in ctx and ctx.get("signal_source", "zm") == "zm"
+        )
         verdict = tracker.observe(
             model,
             window_end_ms=int(metrics.window_end_ms),
             routable=int(ctx.get("routable_pods") or 0),
             reason=reason,
-            sample=sample,
+            sample=_context_sample(ctx),
+            tss_warm=tss_warm,
+            onset_ms=_onset_ms(signal_state, model),
         )
+        events.extend(verdict.events)
+        sample = verdict.sample
         ctx["saturation_ticks"] = verdict.ticks
         ctx["saturation_reason"] = verdict.reason
+        ctx["saturation_awaiting_step"] = verdict.awaiting_step
+        ctx["saturation_count_after"] = verdict.count_after
         if verdict.fire:
             ctx["saturation_rescue"] = True
             item = replace(
@@ -371,6 +377,28 @@ def _apply_saturation_rescue(
             )
         out.append(item)
     return out, tuple(events)
+
+
+def _context_sample(ctx: dict) -> SaturationSample | None:
+    if ctx.get("saturation_sample_ms") is None:
+        return None
+    return SaturationSample(
+        waiting=float(ctx.get("saturation_waiting") or 0.0),
+        kv=ctx.get("saturation_kv"),
+        pods=int(ctx.get("saturation_pods") or 0),
+        sample_ms=int(ctx["saturation_sample_ms"]),
+        running=float(ctx.get("saturation_running") or 0.0),
+        per_pod=tuple(
+            PodSample(pod=str(item["pod"]), waiting=float(item["waiting"]), kv=item.get("kv"),
+                      running=float(item.get("running") or 0.0))
+            for item in ctx.get("saturation_pod_samples") or ()
+        ),
+    )
+
+
+def _onset_ms(signal_state: SignalState | None, model: str) -> int | None:
+    onset = getattr(signal_state, "onset_ms", None)
+    return onset(model) if callable(onset) else None
 
 
 def _note_saturation_steps(
@@ -392,11 +420,14 @@ def _note_saturation_steps(
         metrics = snapshot.models.get(item.model_name)
         if metrics is None:
             continue
+        ctx = contexts.get(item.model_name) or {}
         tracker.note_step(
             item.model_name,
             window_end_ms=int(metrics.window_end_ms),
-            routable=int((contexts.get(item.model_name) or {}).get("routable_pods") or 0),
+            routable=int(ctx.get("routable_pods") or 0),
+            pods=[sample["pod"] for sample in ctx.get("saturation_pod_samples") or ()],
         )
+        ctx["saturation_awaiting_step"] = True
 
 
 def rescue_settle_ms(registry: Registry | None, model: str) -> float:
@@ -1103,8 +1134,13 @@ def _model_contexts(
                 {
                     "saturation_waiting": sample.waiting if sample is not None else None,
                     "saturation_kv": sample.kv if sample is not None else None,
+                    "saturation_running": sample.running if sample is not None else None,
                     "saturation_pods": sample.pods if sample is not None else 0,
                     "saturation_sample_ms": sample.sample_ms if sample is not None else None,
+                    "saturation_pod_samples": [
+                        {"pod": pod.pod, "waiting": pod.waiting, "kv": pod.kv, "running": pod.running}
+                        for pod in (sample.per_pod if sample is not None else ())
+                    ],
                 }
             )
         if paper_state_cache is not None:

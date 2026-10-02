@@ -466,6 +466,9 @@ def build_plan(
         classifications = kept
 
     critical_receivers = [item for item in classifications if item.state == ModelState.CRITICAL]
+    # TSS-confirmed CRITICAL receivers first (their order unchanged); onset saturation
+    # receivers after them, the most backlogged per replica (waiting / n) first.
+    critical_receivers.sort(key=lambda item: _critical_order(item, model_contexts))
     low_receivers = [item for item in classifications if item.state == ModelState.LOW]
     high_models = [item for item in classifications if item.state == ModelState.HIGH]
     idle_models = [item for item in classifications if item.state == ModelState.IDLE]
@@ -1782,6 +1785,18 @@ def _paper_state_incomplete_models(classifications: list[ModelClassification]) -
             and not getattr(item, "saturation_rescue", False)
         )
     )
+
+
+def _critical_order(item: ModelClassification, model_contexts: Mapping[str, Any]) -> tuple[int, float]:
+    if not getattr(item, "saturation_rescue", False):
+        return (0, 0.0)
+    ctx = model_contexts.get(item.model_name) or {}
+    try:
+        waiting = float(ctx.get("saturation_waiting") or 0.0)
+        pods = max(1, int(ctx.get("routable_pods") or 0))
+    except (TypeError, ValueError):
+        return (1, 0.0)
+    return (1, -waiting / pods)
 
 
 def _num_text(value: Any, digits: int = 0) -> str:
