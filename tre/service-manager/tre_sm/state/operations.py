@@ -262,10 +262,23 @@ class OperationHandle:
         return record
 
     def _renew_loop(self) -> None:
+        last_renewed = time.monotonic()
+        ttl_s = self._coordinator.lease_ttl_ms / 1000.0
         while not self._stop.wait(self._coordinator.renew_interval_s):
-            if not self._coordinator._renew(self.fence):
+            try:
+                renewed = self._coordinator._renew(self.fence)
+            except Exception:  # noqa: BLE001 - Redis unreachable: retried
+                # The lease may expire meanwhile: once a whole TTL passed without
+                # a renewal another writer may hold the lock - the fence is lost
+                # (the operation stops at its next check, e.g. before /sleep).
+                if time.monotonic() - last_renewed >= ttl_s:
+                    self._lost.set()
+                    return
+                continue
+            if not renewed:
                 self._lost.set()
                 return
+            last_renewed = time.monotonic()
 
 
 class OperationCoordinator:

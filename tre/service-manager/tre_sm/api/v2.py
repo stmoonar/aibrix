@@ -1936,6 +1936,30 @@ class ServiceManagerV2:
             response["recovered_from"] = recovered_from
         return response
 
+    def supersede_stale_operations(self) -> list[str]:
+        """Supervisor pass: operation records left ``running`` by a writer whose
+        lock lease expired (its service-manager died mid-operation) are marked
+        ``superseded`` - fleet repairs excepted (:meth:`recover_stale_fleet_repairs`
+        resumes them). What such an operation left half-done is settled by the
+        sleep / wake journal recoveries; the record only stops claiming to run."""
+        coordinator = self._operation_coordinator
+        lister = getattr(coordinator, "stale_running_operations", None)
+        if coordinator is None or not callable(lister):
+            return []
+        if not [record for record in lister() if record.get("kind") != "fleet_repair"]:
+            return []
+        superseded: list[str] = []
+        with self._writer("supersede_stale_operations", wait_s=0.0) as operation:
+            for record in lister():
+                if record.get("kind") == "fleet_repair" or not record.get("operation_id"):
+                    continue
+                if operation is not None:
+                    operation.supersede(str(record["operation_id"]))
+                superseded.append(str(record["operation_id"]))
+        if superseded:
+            _log_event("stale_operations_superseded", level=logging.WARNING, operation_ids=superseded)
+        return superseded
+
     def recover_stale_fleet_repairs(self, *, actuate: bool = True) -> dict | None:
         """Supervisor pass: resume a fleet repair a dead SM left running. With
         ``actuate=False`` (SM actuation observe) it is only recorded."""

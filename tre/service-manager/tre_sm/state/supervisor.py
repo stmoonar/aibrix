@@ -45,8 +45,11 @@ class FleetSupervisor:
     deletes workloads - B7 recreate, drift -> fleet repair, stale repair
     recovery, reaping rejected Deployments - only logs and records what it
     would have done. State-consistency passes that change no awake count keep
-    running: sleep journal recovery, desired seeding, startup convergence of
-    admitted Pods, orphan ``starting`` lease reaping.
+    running: sleep / wake journal recovery, desired seeding, startup
+    convergence of admitted Pods, orphan ``starting`` lease reaping.
+
+    Every recovery / housekeeping step is isolated (:meth:`_step`): an error is
+    logged and recorded and the pass continues with the next step.
     """
 
     def __init__(
@@ -72,6 +75,8 @@ class FleetSupervisor:
         self._last_error: str | None = None
         self._last_recovery_operation_id: str | None = None
         self._last_repair_at: float | None = None
+        #: Errors of the isolated steps of the current pass.
+        self._step_errors: list[str] = []
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -115,54 +120,56 @@ class FleetSupervisor:
             LOG.warning(json.dumps({"event": "sm_supervisor_action_suppressed", "action": action,
                                     "detail": detail}, sort_keys=True, default=str))
 
+    def _step(self, name: str, call) -> None:
+        """One recovery / housekeeping step of a pass. A busy writer lock skips
+        it until the next pass; ANY other error is logged and recorded
+        (``last_error``) and the pass goes on with the next step (2026-10-02:
+        one failing recovery never starves the others)."""
+        try:
+            call()
+        except OperationBusy:
+            pass  # another writer holds the lock; next pass
+        except Exception as exc:  # noqa: BLE001 - isolated, the pass continues
+            self._step_errors.append(f"{name}: {type(exc).__name__}: {exc}")
+            LOG.exception("supervisor step %s failed; continuing with the next step", name)
+
     def run_once(self) -> None:
         observe = self._actuation_observe()
-        recover = getattr(self._service, "recover_sleep_journal", None)
-        if callable(recover):
-            try:
-                recover()
-            except OperationBusy:
-                pass  # another writer; next pass
-        recover_wakes = getattr(self._service, "recover_wake_journal", None)
-        if callable(recover_wakes):
-            try:
-                recover_wakes()
-            except OperationBusy:
-                pass  # another writer; next pass
-        ensure_seeded = getattr(self._service, "ensure_desired_seeded", None)
-        if callable(ensure_seeded):
-            try:
-                ensure_seeded()
-            except OperationBusy:
-                pass  # another writer; next pass
-        self._service.converge_startups()
-        reap = getattr(self._service, "reap_rejected_deployments", None)
+        self._step_errors = []
+        try:
+            self._run_steps(observe)
+        finally:
+            if self._step_errors:
+                self._last_error = "; ".join(self._step_errors)
+
+    def _run_steps(self, observe: bool) -> None:
+        service = self._service
+        # Crash recovery first: every sleep and wake holds the writer lock from
+        # start to end (whole-lock, 2026-10-02), so a journal entry seen under
+        # the lock is a crash's or an unreadable engine's - settled from the
+        # physical state. Stale operation records (a lease that expired with
+        # its holder) are marked superseded.
+        for name in ("supersede_stale_operations", "recover_sleep_journal", "recover_wake_journal",
+                     "ensure_desired_seeded"):
+            method = getattr(service, name, None)
+            if callable(method):
+                self._step(name, method)
+        self._step("converge_startups", service.converge_startups)
+        reap = getattr(service, "reap_rejected_deployments", None)
         if callable(reap):
-            try:
-                reap(actuate=False) if observe else reap()
-            except OperationBusy:
-                pass  # a writer (possibly starting a Pod) is active; next pass
-        reap_leases = getattr(self._service, "reap_orphan_starting_leases", None)
+            self._step("reap_rejected_deployments", (lambda: reap(actuate=False)) if observe else reap)
+        reap_leases = getattr(service, "reap_orphan_starting_leases", None)
         if callable(reap_leases):
-            try:
-                reap_leases()
-            except OperationBusy:
-                pass  # a writer (possibly starting a Pod) is active; next pass
+            self._step("reap_orphan_starting_leases", reap_leases)
         # The restart guard runs BEFORE the placeholder reaper: a crash-looping
         # engine that starts again gets its placeholder in the same pass the
         # reaper looks at it (review P2-2).
-        guard_restarts = getattr(self._service, "guard_container_restarts", None)
+        guard_restarts = getattr(service, "guard_container_restarts", None)
         if callable(guard_restarts):
-            try:
-                guard_restarts()
-            except OperationBusy:
-                pass  # next pass (the counts are compared again)
-        reap_placeholders = getattr(self._service, "reap_stale_startup_placeholders", None)
+            self._step("guard_container_restarts", guard_restarts)
+        reap_placeholders = getattr(service, "reap_stale_startup_placeholders", None)
         if callable(reap_placeholders):
-            try:
-                reap_placeholders()
-            except OperationBusy:
-                pass  # next pass
+            self._step("reap_stale_startup_placeholders", reap_placeholders)
         recovered = (
             self._service.recover_stale_fleet_repairs(actuate=False)
             if observe
@@ -236,7 +243,8 @@ class FleetSupervisor:
         while not self._stop.is_set():
             try:
                 self.run_once()
-                self._last_error = None
+                if not self._step_errors:
+                    self._last_error = None
             except (OperationBusy, MaintenanceLockLost, NodePressureActive):
                 # Expected gates: another writer is converging, the maintenance
                 # lock was taken away, or pressure remains. Retry without
