@@ -134,6 +134,8 @@ def test_tre_v2_overlay_declares_components_and_independent_redis() -> None:
     assert _env(controller)["SAFE_SCALE_E2E_MULTIPLIER"] == "2"
     # P2-6: donor hold after an SM floor_violation, in fast-loop ticks.
     assert _env(controller)["TRE_FLOOR_VIOLATION_COOLDOWN_TICKS"] == "6"
+    # Timer cleanup (2026-10-02): the F4 cooldown is the fallback while O1 is not active.
+    assert _env(controller)["TRE_ACTION_COOLDOWN"] == "1"
     # 2026-09-29: SafeScale thresholds come from registry safescale.slo_mode; the env
     # values are optional overrides and must not be pinned by the overlay.
     assert "SAFE_SCALE_TTFT_P95_SLO_MS" not in _env(controller)

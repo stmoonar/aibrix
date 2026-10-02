@@ -513,6 +513,14 @@ class SignalState:
             and self.breakpoint_window_suspended is None
         )
 
+    @property
+    def o1_active(self) -> bool:
+        """O1 breakpoint windows are configured, enabled and not suspended (the gateway
+        clock check passes): a routable-count change then holds the model's decisions
+        until post-change evidence exists (timer cleanup 2026-10-02: the F4 action
+        cooldown only applies while this is False)."""
+        return self._o1_enabled
+
     def suspend_breakpoint_window(self, reason: str) -> None:
         """Fall back to whole windows and the onset guard (the gateway clock check)."""
         self.breakpoint_window_suspended = str(reason)

@@ -367,6 +367,7 @@ def build_plan(
     unavailable_gpus: set[tuple[str, int]] | None = None,
     refusals: Mapping[str, str] | None = None,
     rescue_bases: Mapping[str, RescueBasis] | None = None,
+    view_pending: Mapping[str, str] | None = None,
 ) -> PlanResult:
     active_probe_models = active_probe_models or set()
     # Review 3 P2-3: models whose only in-flight work is a SafeScale commit waiting
@@ -398,11 +399,14 @@ def build_plan(
         if cluster_view is not None
         else None
     )
-    # Review F4 per-model cooldown: model -> direction ("up"/"down") of its last executed
-    # action whose effect the decision window does not yet fully reflect.
+    # Review F4 per-model cooldown (fallback since the timer cleanup 2026-10-02): model ->
+    # direction ("up"/"down") of its last executed action whose effect the decision
+    # window does not yet fully reflect - only for models O1 does not track this tick.
+    # ``view_pending`` (O1 evidence gate): models O1 tracks whose last action completed
+    # after the fleet view was fetched (no breakpoint can hold them yet), same rules.
     # P2-6: donors the SM refused with 409 floor_violation recently are held out of
     # every scale-down (never out of a scale-up) through the same cooldown gate.
-    cooldown = _Cooldown(cooldowns or {}, events, floor_holds=floor_holds)
+    cooldown = _Cooldown(cooldowns or {}, events, floor_holds=floor_holds, view_pending=view_pending)
 
     incomplete_models = _paper_state_incomplete_models(classifications)
     if not classifications or (incomplete_models and cfg.incomplete_policy == "drop_all"):
@@ -1158,36 +1162,54 @@ def _placement_retry_events(
 
 
 class _Cooldown:
-    """Review F4: hold a model's next action until a fresh metrics window reflects its
-    last executed one. Same direction is held; after a scale-up a scale-down is held too;
-    after a scale-down a scale-up is allowed only for a CRITICAL receiver (safety)."""
+    """Per-model holds of the planner (one gate, three sources):
+
+    * review F4 (``cooldowns``; fallback since the timer cleanup 2026-10-02 - only for
+      models O1 does not track): hold a model's next action until a fresh metrics window
+      reflects its last executed one;
+    * O1 evidence gate (``view_pending``): the fleet view predates the model's last
+      action, so no breakpoint holds it yet - held until a newer view exists;
+    * P2-6 (``floor_holds``): a donor the SM refused with 409 floor_violation is held
+      out of scale-downs.
+
+    F4 / view-pending direction rules: same direction is held; after a scale-up a
+    scale-down is held too; after a scale-down a scale-up is allowed only for a CRITICAL
+    receiver (safety)."""
 
     def __init__(
-        self, cooldowns: Mapping[str, str], events: list[str], *, floor_holds: set[str] | None = None
+        self,
+        cooldowns: Mapping[str, str],
+        events: list[str],
+        *,
+        floor_holds: set[str] | None = None,
+        view_pending: Mapping[str, str] | None = None,
     ) -> None:
         self._cooldowns = dict(cooldowns)
         self._events = events
         #: P2-6: models held out of scale-downs after an SM floor_violation refusal.
         self._floor_holds = set(floor_holds or ())
+        self._view_pending = dict(view_pending or {})
 
     def blocks(self, model: str, direction: str, *, critical: bool = False) -> bool:
         if direction == "down" and model in self._floor_holds:
-            event = f"floor_violation_hold:{model}"
-            if event not in self._events:
-                self._events.append(event)
+            self._event(f"floor_violation_hold:{model}")
             return True
-        last = self._cooldowns.get(model)
-        if last is None:
-            return False
-        if direction == "up" and last == "down" and critical:
-            return False
-        event = f"cooldown_hold:{model}"
+        for holds, name in ((self._cooldowns, "cooldown_hold"), (self._view_pending, "o1_view_pending_hold")):
+            last = holds.get(model)
+            if last is None:
+                continue
+            if direction == "up" and last == "down" and critical:
+                continue
+            self._event(f"{name}:{model}")
+            return True
+        return False
+
+    def _event(self, event: str) -> None:
         if event not in self._events:
             self._events.append(event)
-        return True
 
     def down_blocked(self) -> set[str]:
-        return set(self._cooldowns) | self._floor_holds
+        return set(self._cooldowns) | set(self._view_pending) | self._floor_holds
 
 
 class _SlotOccupancy:

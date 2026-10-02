@@ -124,6 +124,15 @@ spec:
             # scale-down for this many fast-loop ticks (x TRE_RESCUE_INTERVAL_SECONDS; 0 = off).
             - name: TRE_FLOOR_VIOLATION_COOLDOWN_TICKS
               value: "6"
+            # Review F4 action cooldown, a FALLBACK since the timer cleanup (2026-10-02,
+            # docs/design/20261002-timer-cleanup.md): it holds a model until a metrics
+            # window starts after its last action only while O1 (registry
+            # scaling.breakpoint_window) does not track the model - O1 off or suspended
+            # by the gateway clock check, no fleet view, stale-held context. With O1
+            # active the routable-count change is a breakpoint and holds the model until
+            # post-change evidence exists. "0" also disables the fallback.
+            - name: TRE_ACTION_COOLDOWN
+              value: "1"
             # A12: commit gate rejects when the remaining pods' KV-cache fill > 0.8 (v1).
             - name: SAFE_SCALE_KV_CACHE_MAX
               value: "0.8"

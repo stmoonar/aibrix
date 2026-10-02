@@ -648,7 +648,8 @@ scaling:
   # Also hold a CRITICAL receiver's scale-up until a metrics window starting after
   # its last scale-up completed (the F4 cooldown, TRE_ACTION_COOLDOWN). Off: the
   # rescue target bookkeeping already keeps an unreflected scale-up from repeating.
-  # Scale-down holds, LOW receivers and the slow loop keep the cooldown either way.
+  # Scale-downs and LOW receivers wait for O1 post-change evidence (the F4 cooldown
+  # is only the fallback while O1 is off or suspended, timer cleanup 2026-10-02).
   scale_up_cooldown_enabled: false
   # O1 breakpoint-aware window (design docs/design/20261001-o1-breakpoint-window.md,
   # ADR-0015): a model decides on the part of its 30 s metrics window after its last

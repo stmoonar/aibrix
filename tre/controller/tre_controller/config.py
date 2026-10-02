@@ -142,7 +142,9 @@ class ControllerConfig:
     safescale_suppress_hot_proactive: bool
     proactive_release_min_trs: float
     # Review F4: per-model action cooldown (hold a model's next action until a metrics
-    # window starting after its last executed action). TRE_ACTION_COOLDOWN=0 disables.
+    # window starting after its last executed action). Since the timer cleanup
+    # (2026-10-02) only a fallback for models O1 does not track (O1 off / suspended, no
+    # fleet view, stale-held context); TRE_ACTION_COOLDOWN=0 disables the fallback.
     action_cooldown: bool
     # Opt-in control-loop profiling (research toggle, off by default). When
     # profile_enabled is False the profiler object is None everywhere (zero overhead).

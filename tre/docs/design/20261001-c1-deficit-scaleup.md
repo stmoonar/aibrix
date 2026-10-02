@@ -117,6 +117,11 @@ a CRITICAL receiver's scale-up. Unchanged: the F4 hold of scale-downs (after a
 scale-up or scale-down), the floor-violation hold, LOW receivers (the slow
 loop) and the `TRE_ACTION_COOLDOWN` switch itself.
 
+Since the timer cleanup (`20261002-timer-cleanup.md`, item 1) the F4 hold is only
+a fallback for models O1 does not track (O1 off or suspended, no fleet view,
+stale-held context); with O1 active the breakpoint gate and the O1 view-pending
+gate hold the model instead.
+
 ### Unchanged
 
 * Slow loop (fairness, LOW receivers): one step per receiver per tick, the

@@ -115,6 +115,9 @@ class PaperStateCache:
                 "routable_pods": context.get("routable_pods", held.get("routable_pods", 0)),
                 "assigned_replicas": context.get("assigned_replicas", held.get("assigned_replicas", 0)),
                 "awake_replicas": context.get("awake_replicas", held.get("awake_replicas")),
+                # Timer cleanup (2026-10-02): a held context was not recomputed - O1 saw
+                # no routable change this tick, so the F4 cooldown applies again.
+                "o1_routable_tracked": False,
             }
         )
         return held, (f"paper_state_stale_hold:{model_name}",)
@@ -226,7 +229,11 @@ def run_planner_tick(
         active_probe_models=active_probe_models or set(),
         inflight_models=queue.inflight_models(),
         cluster_view=cluster_view,
-        cooldowns=_action_cooldowns(snapshot, queue) if action_cooldown else None,
+        # F4 cooldown: only for models O1 does not track this tick (O1 off / suspended,
+        # no fleet view, stale-held context, hold fallback) - timer cleanup 2026-10-02.
+        cooldowns=_action_cooldowns(snapshot, queue, contexts) if action_cooldown else None,
+        # O1 evidence gate: the fleet view predates the model's last action.
+        view_pending=_o1_view_pending(queue, contexts, cluster_view),
         # P2-6: independent of TRE_ACTION_COOLDOWN (its own switch is the tick count).
         floor_holds=_floor_held_models(queue),
         # S3: GPUs / nodes the SM recently refused a wake on (placement.wake_cooldown).
@@ -572,18 +579,56 @@ def _floor_held_models(queue: PlannerQueue) -> set[str]:
     return set(held()) if callable(held) else set()
 
 
-def _action_cooldowns(snapshot: MetricsSnapshot, queue: PlannerQueue) -> dict[str, str]:
-    """Models whose decision window starts before their last executed action completed
-    (the window does not yet fully reflect it) -> direction of that action."""
+def _o1_tracks(context: dict | None) -> bool:
+    """Timer cleanup (2026-10-02): O1 covers this model's last action - O1 is active,
+    the model's routable count came from this tick's fleet view and its signal was
+    computed this tick (not a stale-held context, not a hold fallback)."""
+    return bool(context) and context.get("o1_routable_tracked") is True
+
+
+def _action_cooldowns(
+    snapshot: MetricsSnapshot, queue: PlannerQueue, contexts: dict[str, dict] | None = None
+) -> dict[str, str]:
+    """Review F4 (fallback since the timer cleanup 2026-10-02): models whose decision
+    window starts before their last executed action completed (the window does not yet
+    fully reflect it) -> direction of that action.
+
+    Only for models O1 does not track this tick (:func:`_o1_tracks`): with O1 active the
+    routable-count change of the action is a breakpoint, and the model takes part in no
+    scale-down until a whole window follows it and is a receiver only on
+    ``min_evidence_grids`` grids of post-change evidence - the window-start rule would
+    only add a fixed wait on top. While O1 is off or suspended (gateway clock check),
+    without a fleet view of the model or on a stale-held context this rule still holds."""
     last_actions = getattr(queue, "last_actions", None)
     if last_actions is None:
         return {}
     cooldowns: dict[str, str] = {}
     for model, (done_ms, direction) in last_actions().items():
+        if _o1_tracks((contexts or {}).get(model)):
+            continue
         metrics = snapshot.models.get(model)
         if metrics is not None and metrics.window_start_ms < done_ms:
             cooldowns[model] = direction
     return cooldowns
+
+
+def _o1_view_pending(
+    queue: PlannerQueue, contexts: dict[str, dict] | None, cluster_view: ClusterView | None
+) -> dict[str, str]:
+    """O1 evidence gate (timer cleanup 2026-10-02): models O1 tracks whose last executed
+    action completed after the fleet view of this tick was fetched -> its direction.
+    That view cannot show the routable change yet, so no breakpoint holds the model;
+    it is held (same direction rules as F4) until a view fetched after the action
+    exists. A view without a fetch time (synthetic / offline) holds nothing."""
+    fetched = getattr(cluster_view, "fetched_ms", None)
+    last_actions = getattr(queue, "last_actions", None)
+    if fetched is None or not callable(last_actions):
+        return {}
+    pending: dict[str, str] = {}
+    for model, (done_ms, direction) in last_actions().items():
+        if _o1_tracks((contexts or {}).get(model)) and int(done_ms) > int(fetched):
+            pending[model] = direction
+    return pending
 
 
 def _apply_safescale(
@@ -1100,6 +1145,14 @@ def _model_contexts(
                         # cap's evidence); None on a whole window.
                         "signal_evidence_requests": (
                             None if window.full else getattr(window.metrics, "request_count", None)
+                        ),
+                        # Timer cleanup (2026-10-02): O1 is active and saw this model's
+                        # routable count in the fleet view this tick, so a change of it
+                        # holds the model until post-change evidence exists - the F4
+                        # cooldown is then not applied (``_action_cooldowns``). Not on a
+                        # hold fallback (the whole window decides again).
+                        "o1_routable_tracked": bool(
+                            signal_state.o1_active and counts is not None and not computed.hold_fallback
                         ),
                     }
                 )
