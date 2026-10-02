@@ -11,6 +11,7 @@ import json
 from dataclasses import asdict, dataclass, field, replace
 from functools import wraps
 from typing import Callable, Protocol
+from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -46,6 +47,17 @@ from tre_sm.allocator.slots import (
 from tre_sm.allocator.topology import K8sPodSnapshot
 from tre_sm.gpu_truth import GpuTruthProvider
 from tre_sm.ops.k8s_ops import StartupPodRecord
+from tre_sm.ops.transfer import (
+    SKIP_FLOOR,
+    TRANSFER_DONE,
+    TRANSFER_DONOR_FAILED,
+    TRANSFER_PENDING,
+    TRANSFER_RECEIVER_FAILED,
+    TransferPair,
+    TransferSelection,
+    busy_binding_ids,
+    select_transfer_pairs,
+)
 from tre_sm.ops.sleep_primitive import (
     PHASE_SLEPT,
     STATUS_SLEPT,
@@ -4212,6 +4224,423 @@ class ServiceManagerV2:
         self._wake_journal.end(binding_id)
         self._note_binding_power_change(ticket.binding)
 
+    # --------------------------------------------------------------- transfer
+    # POST /v2/transfers (2026-10-02): hand GPUs from a donor model to a receiver
+    # model - sleep the donor binding(s) and wake the receiver binding that sleeps
+    # on the same GPUs - in ONE writer-lock hold (whole-lock, design
+    # docs/design/20261002-sm-wholelock.md): select the pairs (pure,
+    # tre_sm.ops.transfer), the donors' sleep (hide -> ack -> /sleep ->
+    # confirmation, every donor in parallel), the receivers' wake (every receiver
+    # whose donors all slept, in parallel) and its commit. No other writer can
+    # take the freed GPUs in between; nothing is journaled beyond the ordinary
+    # sleep and wake journals - after a crash those settle each binding from its
+    # physical state (a donor may have slept for nothing: the controller re-plans
+    # on its next tick).
+
+    def transfer(
+        self,
+        *,
+        donor_model: str,
+        receiver_model: str,
+        count: int = 1,
+        sleep_path: str = "urgent",
+        donor_bindings: list[str] | tuple[str, ...] | None = None,
+        avoid_gpus: list[str] | tuple[str, ...] = (),
+    ) -> dict:
+        """Transfer ``count`` donor replicas' GPUs to the receiver model (see the
+        section comment). Returns the per-pair outcome (``pairs[].status`` done |
+        donor_sleep_failed | receiver_wake_failed); raises :class:`TransferFailed`
+        (409 ``partial``) when no pair completed, unless the donor's replica floor
+        held the whole transfer back (200, ``clamped_by_floor``)."""
+        self._registry.model(donor_model)
+        self._registry.model(receiver_model)
+        if donor_model == receiver_model:
+            raise ValueError("donor_model and receiver_model must differ")
+        count = int(count)
+        if count < 1:
+            raise ValueError("count must be at least 1")
+        if sleep_path == "safescale_commit":
+            # A SafeScale commit sleeps a HIDDEN probe pod; a transfer's donors are
+            # serving (not hidden) replicas.
+            raise ValueError("sleep_path safescale_commit is not a transfer path (donors are not hidden)")
+        if self._sleep_primitive is None or not self._physical_wake_capable():
+            raise ValueError("a transfer needs the runtime and vLLM ops")
+        op = _Transfer(
+            transfer_id=f"tr-{uuid4().hex[:12]}",
+            donor_model=donor_model,
+            receiver_model=receiver_model,
+            count=count,
+            sleep_path=sleep_path,
+        )
+        request = {
+            "transfer_id": op.transfer_id, "donor_model": donor_model, "receiver_model": receiver_model,
+            "count": count, "sleep_path": sleep_path,
+        }
+        with self._writer("transfer", request=request) as operation:
+            started = time.monotonic()
+            op.selection = self._select_transfer(
+                op,
+                donor_filter=None if donor_bindings is None else tuple(donor_bindings),
+                avoid_gpus=tuple(avoid_gpus or ()),
+            )
+            op.phases_ms["select"] = _elapsed_ms(started)
+            for item in op.selection.substituted:
+                _log_event(
+                    "placement_substituted", level=logging.WARNING,
+                    transfer_id=op.transfer_id, model=receiver_model,
+                    refused_binding_id=item["refused_binding_id"], error_code=item["reason"],
+                    detail=item["detail"],
+                )
+            op.pairs = [_TransferPairState(pair) for pair in op.selection.pairs]
+            if op.pairs:
+                _log_event(
+                    "transfer_start",
+                    transfer_id=op.transfer_id, donor_model=donor_model, receiver_model=receiver_model,
+                    count=count, sleep_path=sleep_path,
+                    pairs=[_transfer_pair_brief(state.pair) for state in op.pairs],
+                    unfilled=op.selection.unfilled,
+                )
+                phase = time.monotonic()
+                self._transfer_sleep_donors(op)
+                op.phases_ms["donor_sleep"] = _elapsed_ms(phase)
+                phase = time.monotonic()
+                self._transfer_wake_receivers(op)
+                op.phases_ms["receiver_wake"] = _elapsed_ms(phase)
+            op.phases_ms["total"] = _elapsed_ms(started)
+            op.version = self._store.load().version
+            self._note_transfer(op, operation)
+            return self._finish_transfer(op)
+
+    def _select_transfer(self, op: "_Transfer", *, donor_filter, avoid_gpus: tuple[str, ...]) -> TransferSelection:
+        """The pair selection (pure, :mod:`tre_sm.ops.transfer`) on the current
+        books, with the account's wake blocker, the fault hook and the resident
+        probe injected. The donor model's routable view unreadable -> 409
+        ``routable_unknown`` before anything is hidden."""
+        bindings = self._store.load().bindings
+        leases = self._active_leases()
+        wake_entries = self._wake_journal.entries()
+        busy = busy_binding_ids(
+            wake_journal=wake_entries,
+            sleep_journal=self._sleep_primitive.journal.entries(),
+            transient_lease_ids=[
+                lease.binding_id for lease in leases
+                if str(getattr(lease, "phase", "")) in TRANSIENT_LEASE_PHASES
+            ],
+        )
+        floor = self._model_floor(op.donor_model) if self._floor_enforced() else None
+        routable = (
+            set(self._floor_check(op.donor_model, set(), bindings).routable) if floor is not None else set()
+        )
+        spec = self._registry.model(op.receiver_model)
+        awake = sum(1 for binding in bindings if binding.model == op.receiver_model and binding.awake)
+        budget = max(0, scale_max_replicas(spec) - awake)
+        topology = self._registry.topology()
+
+        def blocker(receiver: Binding, planning: list[Binding], ignored: frozenset[str]):
+            return self._wake_blocker(
+                receiver, planning, [lease for lease in leases if lease.binding_id not in ignored], wake_entries
+            )
+
+        def pick(receivers: list[Binding], planning: list[Binding]) -> Binding:
+            return _wake_pick(receivers, planning, topology, self._placement)
+
+        return select_transfer_pairs(
+            bindings,
+            donor_model=op.donor_model,
+            receiver_model=op.receiver_model,
+            count=op.count,
+            topology=topology,
+            policy=self._placement,
+            busy=busy,
+            donor_floor=floor,
+            donor_routable=routable,
+            receiver_budget=budget,
+            donor_filter=donor_filter,
+            avoid_gpus=avoid_gpus,
+            wake_blocker=blocker,
+            veto=self._transfer_veto,
+            receiver_pick=pick,
+        )
+
+    def _transfer_veto(self, pair: TransferPair) -> "WakeConflict | None":
+        """Why the pair about to be taken must not be (None = take it): the
+        ``refuse_wake`` test hook, a donor without a pod IP, or a resident of the
+        receiver's GPUs (other than the donors) that is not confirmed asleep. The
+        donor is still awake, so gpu-truth shows the GPU in use: only the
+        resident /is_sleeping probe can tell whether a third resident sleeps."""
+        receiver = pair.receiver
+        node = receiver.slot.node
+        gpus = tuple(receiver.slot.gpu_ids)
+        if self._fault_active("refuse_wake", receiver):
+            return WakeConflict(
+                f"{receiver.serve_id}: wake refused by the test hook "
+                f"{rediskeys.SM_FAULT_KEY_PREFIX}refuse_wake (service_manager.test_hooks)",
+                reason="fault_injected", node=node, gpus=gpus, binding_id=receiver.binding_id,
+            )
+        for donor in pair.donors:
+            try:
+                pod_ip = self._snapshot_for_binding(donor).pod_ip
+            except ValueError:
+                pod_ip = None
+            if not pod_ip:
+                return WakeConflict(
+                    f"{receiver.binding_id}: donor {donor.serve_id} has no pod IP",
+                    reason="resident_unknown", node=node, gpus=gpus, binding_id=receiver.binding_id,
+                    blocking_binding_id=donor.binding_id,
+                )
+        donors = set(pair.donor_ids)
+        try:
+            probed = self._probe_gpu_residents(receiver)
+        except Exception as exc:  # noqa: BLE001 - a failed Pod LIST: unknown residents
+            return WakeConflict(
+                f"{receiver.binding_id}: residents cannot be listed ({type(exc).__name__}: {exc})",
+                reason="resident_unknown", node=node, gpus=gpus, binding_id=receiver.binding_id,
+            )
+        residents = [item for item in probed if item[0] not in donors]
+        awake = sorted(binding_id for binding_id, sleeping in residents if sleeping is False)
+        unknown = sorted(binding_id for binding_id, sleeping in residents if sleeping is None)
+        if awake:
+            return WakeConflict(
+                f"{receiver.binding_id}: resident(s) {awake} on {node}/{','.join(str(g) for g in gpus)} "
+                "are awake (besides the donor)",
+                reason="resident_awake", node=node, gpus=gpus, binding_id=receiver.binding_id,
+                blocking_binding_id=awake[0],
+            )
+        if unknown:
+            return WakeConflict(
+                f"{receiver.binding_id}: cannot verify resident(s) {unknown} asleep",
+                reason="resident_unknown", node=node, gpus=gpus, binding_id=receiver.binding_id,
+                blocking_binding_id=unknown[0],
+            )
+        return None
+
+    def _transfer_sleep_donors(self, op: "_Transfer") -> None:
+        """Every donor of every pair in ONE sleep call (in parallel; writer lock
+        held). A pair whose donors did not all sleep fails
+        (``donor_sleep_failed``) and its receiver is not touched."""
+        donors = [donor for state in op.pairs for donor in state.pair.donors]
+        error: BaseException | None = None
+        try:
+            outcomes = self._sleep_targets(
+                self._sleep_targets_for(donors),
+                sleep_path=op.sleep_path,
+                journal_extra={**DESIRED_ON_SLEEP, "transfer_id": op.transfer_id},
+                desired_sleeping=True,
+                update_store=True,
+            )
+        except SleepFailed as exc:
+            outcomes, error = exc.outcomes, exc
+        by_id = {item.get("binding_id"): item for item in outcomes or ()}
+        slept = {binding_id for binding_id, item in by_id.items() if item.get("status") == STATUS_SLEPT}
+        op.donors_slept |= slept
+        for state in op.pairs:
+            missing = [donor for donor in state.pair.donor_ids if donor not in slept]
+            if missing:
+                outcome = by_id.get(missing[0]) or {}
+                state.status = TRANSFER_DONOR_FAILED
+                state.error = SleepFailed(
+                    f"donor {missing[0]} did not sleep ({outcome.get('status')}: {outcome.get('reason') or error})",
+                    outcomes=[outcome] if outcome else [],
+                )
+
+    def _transfer_wake_receivers(self, op: "_Transfer") -> None:
+        """The wake of every receiver whose donors all slept, in parallel, then
+        the commit (writer lock held). A receiver the account / the wake gate
+        refuses now, or whose wake fails (S4: an engine that woke anyway gets a
+        compensating sleep), fails its pair (``receiver_wake_failed``); its donors
+        stay asleep."""
+        tickets: list[_WakeTicket] = []
+        for state in op.pairs:
+            if state.status != TRANSFER_PENDING:
+                continue
+            try:
+                state.ticket = self._prepare_transfer_wake(op, state.pair)
+            except Exception as exc:  # noqa: BLE001 - this pair fails, the others go on
+                state.status = TRANSFER_RECEIVER_FAILED
+                state.error = exc
+                continue
+            tickets.append(state.ticket)
+        if not tickets:
+            return
+        self._note_wake_details(tickets)
+        self._run_wakes(tickets)
+        self._commit_wakes(tickets, restore_desired=True, update_store=True)
+        for state in op.pairs:
+            ticket = state.ticket
+            if ticket is None:
+                continue
+            if ticket.woke:
+                state.status = TRANSFER_DONE
+            else:
+                state.status = TRANSFER_RECEIVER_FAILED
+                state.error = ticket.exception or WakeFailed(
+                    f"wake of {ticket.binding.serve_id} failed", node=ticket.binding.slot.node,
+                    gpus=ticket.binding.slot.gpu_ids, binding_id=ticket.binding.binding_id,
+                )
+
+    def _prepare_transfer_wake(self, op: "_Transfer", pair: TransferPair) -> "_WakeTicket":
+        """The wake prepare of one receiver (writer lock held): the books must
+        still show it asleep and not hidden; the cap, the account and the wake
+        gate decide as for any wake; then its desired power is awake."""
+        snapshot = self._store.load()
+        receiver = next((b for b in snapshot.bindings if b.binding_id == pair.receiver.binding_id), None)
+        if receiver is None:
+            raise ValueError(f"transfer receiver {pair.receiver.binding_id} is no longer bound")
+        if receiver.awake or receiver.hidden:
+            raise WakeConflict(
+                f"transfer receiver {receiver.serve_id} changed since the selection "
+                f"(awake={receiver.awake}, hidden={receiver.hidden})",
+                reason="wake_in_progress", node=receiver.slot.node, gpus=receiver.slot.gpu_ids,
+                binding_id=receiver.binding_id, blocking_binding_id=receiver.binding_id,
+            )
+        self._ensure_wake_within_cap(receiver, snapshot.bindings)
+        placement = {
+            "source": "transfer",
+            "transfer_id": op.transfer_id,
+            "chosen_binding_id": receiver.binding_id,
+            "hint_binding_id": None,
+            "donor_binding_ids": list(pair.donor_ids),
+        }
+        ticket = self._prepare_wake(
+            receiver, snapshot.bindings,
+            previous_desired=self._desired_power_of(receiver.binding_id), placement=placement,
+        )
+        try:
+            self._update_desired(
+                {receiver.binding_id: {"power": "awake"}},
+                updated_by="service-manager-transfer",
+                reason="transfer",
+            )
+        except BaseException:
+            self._abort_prepared_wakes([ticket])
+            raise
+        return ticket
+
+    def _finish_transfer(self, op: "_Transfer") -> dict:
+        """Counters, the transfer_done / transfer_pair_failed events and the
+        response; :class:`TransferFailed` (409 partial) when no pair completed
+        and the floor did not hold the whole transfer back."""
+        response = self._transfer_response(op)
+        done = [state for state in op.pairs if state.status == TRANSFER_DONE]
+        failed = [state for state in op.pairs if state.status != TRANSFER_DONE]
+        for name, amount in (
+            ("transfer_pairs_done_total", len(done)),
+            ("transfer_donor_sleep_failed_total",
+             sum(1 for state in failed if state.status == TRANSFER_DONOR_FAILED)),
+            ("transfer_receiver_wake_failed_total",
+             sum(1 for state in failed if state.status == TRANSFER_RECEIVER_FAILED)),
+        ):
+            if amount:
+                self._wake_journal.incr(name, amount)
+        for item in response["pairs"]:
+            if item["status"] != TRANSFER_DONE:
+                _log_event(
+                    "transfer_pair_failed", level=logging.WARNING,
+                    transfer_id=op.transfer_id, **{k: v for k, v in item.items() if k != "transfer_id"},
+                )
+        _log_event(
+            "transfer_done",
+            level=logging.INFO if done else logging.WARNING,
+            transfer_id=op.transfer_id, donor_model=op.donor_model, receiver_model=op.receiver_model,
+            count=op.count, done=len(done), failed=len(failed), unfilled=response["unfilled"],
+            phases_ms=dict(op.phases_ms),
+        )
+        if done or (not op.pairs and response["clamped_by_floor"]):
+            return response
+        failed_pair = next((item for item in response["pairs"] if item["status"] != TRANSFER_DONE), None)
+        if failed_pair is not None:
+            error = failed_pair.get("error") or {}
+            first = {
+                **error,
+                "node": error.get("node") or failed_pair["node"],
+                "gpu_ids": error.get("gpu_ids") or failed_pair["gpu_ids"],
+                "binding_id": error.get("binding_id") or failed_pair["receiver_binding_id"],
+            }
+        else:
+            first = response["refusals"][0] if response["refusals"] else {}
+        raise TransferFailed(
+            f"transfer {op.donor_model} -> {op.receiver_model}: no pair completed "
+            f"(pairs {[(item['receiver'], item['status']) for item in response['pairs']]}, "
+            f"skipped {response['skipped']}, refusals {[r.get('reason') for r in response['refusals']]})",
+            response=response, first=first,
+        )
+
+    def _transfer_response(self, op: "_Transfer") -> dict:
+        selection = op.selection
+        pairs = []
+        for state in op.pairs:
+            item = {**_transfer_pair_brief(state.pair), "status": state.status}
+            if state.error is not None:
+                item["error"] = self._transfer_error_body(state.error)
+            ticket = state.ticket
+            if ticket is not None and ticket.compensating_sleep:
+                item["compensating_sleep"] = ticket.compensating_sleep
+            pairs.append(item)
+        done = [state for state in op.pairs if state.status == TRANSFER_DONE]
+        clamped = bool(selection is not None and selection.unfilled > 0 and SKIP_FLOOR in selection.skipped)
+        return {
+            "transfer_id": op.transfer_id,
+            "donor_model": op.donor_model,
+            "receiver_model": op.receiver_model,
+            "count": op.count,
+            "sleep_path": op.sleep_path,
+            "pairs": pairs,
+            "done": len(done),
+            # What the transfer took from the donor model (donor replicas put to
+            # sleep) and whether the donor's replica floor held part of it back
+            # (same fields as a clamped /target shrink).
+            "taken": len(op.donors_slept),
+            "clamped_by_floor": clamped,
+            "donors_slept": len(op.donors_slept),
+            "receivers_woken": len(done),
+            "unfilled": op.count if selection is None else selection.unfilled,
+            "refusals": [] if selection is None else [self._transfer_refusal_body(r) for r in selection.refusals],
+            "skipped": {} if selection is None else dict(selection.skipped),
+            "picked": [_picked(state.ticket) for state in done if state.ticket is not None],
+            "phases_ms": dict(op.phases_ms),
+            "version": op.version,
+        }
+
+    def _transfer_error_body(self, exc: BaseException) -> dict:
+        if isinstance(exc, WakeConflict):
+            return exc.body(retry_after_s=self.wake_retry_after_s(exc.scope))
+        body = {"detail": str(exc), "error": _error_code(exc)}
+        if isinstance(exc, SleepFailed) and exc.outcomes:
+            body["outcomes"] = exc.outcomes
+        return body
+
+    def _transfer_refusal_body(self, refusal) -> dict:
+        if isinstance(refusal.error, WakeConflict):
+            return refusal.error.body(retry_after_s=self.wake_retry_after_s(refusal.error.scope))
+        return {
+            "detail": refusal.detail, "error": "gpu_busy", "reason": refusal.reason,
+            "binding_id": refusal.receiver_binding_id, "node": refusal.node,
+            "gpu_ids": list(refusal.gpu_ids), "gpu": list(refusal.gpu_ids), "scope": "gpu",
+            "blocking_binding_id": refusal.blocking_binding_id,
+            "retry_after_s": self.wake_retry_after_s("gpu"),
+        }
+
+    def _note_transfer(self, op: "_Transfer", operation) -> None:
+        """The transfer on its operation record (``GET /v2/operations``):
+        ``details.transfer`` with the pairs and ``details.phases_ms``."""
+        note = getattr(operation, "note", None)
+        if not callable(note):
+            return
+        try:
+            note(
+                transfer={
+                    "transfer_id": op.transfer_id,
+                    "donor_model": op.donor_model,
+                    "receiver_model": op.receiver_model,
+                    "count": op.count,
+                    "pairs": [{**_transfer_pair_brief(state.pair), "status": state.status} for state in op.pairs],
+                    "unfilled": None if op.selection is None else op.selection.unfilled,
+                },
+                phases_ms=dict(op.phases_ms),
+            )
+        except Exception:  # noqa: BLE001 - observability only
+            LOG.warning("recording the transfer in the operation record failed", exc_info=True)
+
     def _sleep_bindings(
         self,
         bindings: list[Binding],
@@ -5860,6 +6289,29 @@ class WakeFailed(WakeConflict):
         return body
 
 
+class TransferFailed(WakeConflict):
+    """No pair of a transfer completed (HTTP 409 ``error: partial``, the
+    structured WakeConflict body plus the transfer response: ``pairs``,
+    ``refusals``, ``unfilled``, ...). ``node`` / ``gpu_ids`` /
+    ``blocking_binding_id`` are those of the first failure."""
+
+    def __init__(self, message: str, *, response: dict, first: dict | None = None) -> None:
+        first = first or {}
+        super().__init__(
+            message,
+            reason="partial",
+            node=first.get("node"),
+            gpus=first.get("gpu_ids") or (),
+            scope=first.get("scope") or "gpu",
+            binding_id=first.get("binding_id"),
+            blocking_binding_id=first.get("blocking_binding_id"),
+        )
+        self.response = dict(response)
+
+    def body(self, *, retry_after_s: float | None = None) -> dict:
+        return {**self.response, **super().body(retry_after_s=retry_after_s)}
+
+
 def _error_code(exc: BaseException | None) -> str | None:
     """Stable error code of a failed wake (ops details / logs)."""
     if exc is None:
@@ -5915,6 +6367,48 @@ class _WakeTicket:
     lease_unsettled: bool = False
 
 
+@dataclass
+class _TransferPairState:
+    """One pair of a transfer."""
+
+    pair: TransferPair
+    status: str = TRANSFER_PENDING
+    error: BaseException | None = None
+    #: The receiver's wake.
+    ticket: "_WakeTicket | None" = None
+
+
+@dataclass
+class _Transfer:
+    """One ``POST /v2/transfers``."""
+
+    transfer_id: str
+    donor_model: str
+    receiver_model: str
+    count: int
+    sleep_path: str
+    selection: TransferSelection | None = None
+    pairs: list[_TransferPairState] = field(default_factory=list)
+    #: Phase durations (ms): select, donor_sleep, receiver_wake, total.
+    phases_ms: dict = field(default_factory=dict)
+    #: Donor binding ids recorded asleep.
+    donors_slept: set = field(default_factory=set)
+    version: int | None = None
+
+
+def _transfer_pair_brief(pair: TransferPair) -> dict:
+    """The identity of a pair in the response / events / operation record."""
+    return {
+        "donor": pair.donors[0].serve_id,
+        "donors": [donor.serve_id for donor in pair.donors],
+        "donor_binding_ids": [donor.binding_id for donor in pair.donors],
+        "receiver": pair.receiver.serve_id,
+        "receiver_binding_id": pair.receiver.binding_id,
+        "node": pair.node,
+        "gpu_ids": list(pair.gpu_ids),
+    }
+
+
 @dataclass(frozen=True)
 class _PowerMark:
     """What a gpu-truth sample must answer to be trusted after the last local power
@@ -5961,6 +6455,20 @@ class TargetRequest(BaseModel):
     sleep_path: str = "scale_down"
     #: Deprecated and ignored (2026-10-02): the service-manager never drains.
     drain_budget_s: float | None = None
+
+
+class TransferRequest(BaseModel):
+    donor_model: str
+    receiver_model: str
+    #: Donor replicas to hand over (a TP=2 receiver taking two single-GPU donors
+    #: counts 2).
+    count: int = 1
+    #: Sleep path of the donors (external paths only; safescale_commit -> 400).
+    sleep_path: str = "urgent"
+    #: Serve ids or binding ids the donors must be among (None = any).
+    donor_bindings: list[str] | None = None
+    #: GPUs (``node/gpu``) no receiver may use.
+    avoid_gpus: list[str] = []
 
 
 class BindingPowerRequest(BaseModel):
@@ -6229,6 +6737,25 @@ def create_app(service: ServiceManagerV2) -> FastAPI:
                 drain_budget_s=request.drain_budget_s,
                 at_least=request.at_least,
                 hints=request.hints,
+                avoid_gpus=request.avoid_gpus,
+            )
+        except WakeConflict:
+            raise  # structured 409 (wake_conflict_handler)
+        except (KeyError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/v2/transfers")
+    def post_transfer(request: TransferRequest) -> dict:
+        # 200: at least one pair done (``pairs[].status``), or the donor's floor
+        # held the whole transfer back (``clamped_by_floor``); 409 ``partial``:
+        # no pair completed; 400: bad parameters.
+        try:
+            return service.transfer(
+                donor_model=request.donor_model,
+                receiver_model=request.receiver_model,
+                count=request.count,
+                sleep_path=_sleep_path(request.sleep_path),
+                donor_bindings=request.donor_bindings,
                 avoid_gpus=request.avoid_gpus,
             )
         except WakeConflict:
