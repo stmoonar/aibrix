@@ -45,7 +45,7 @@ def test_slow_model_does_not_block_another_models_urgent_action() -> None:
         client = GatedClient({"slow"})
         queue = ActionQueue(client)
         runner = asyncio.ensure_future(queue.run(poll_interval_s=0.001))
-        queue.submit((ScaleAction("slow", -1, "high", "fairness"),))
+        queue.submit((ScaleAction("slow", -1, "high", "fairness", sleep_path="urgent"),))
         await asyncio.sleep(0.01)
         queue.submit((ScaleAction("fast", 1, "critical_immediate", "rescue"),))
         for _ in range(100):
@@ -73,7 +73,7 @@ def test_actions_of_one_model_stay_serialized_and_in_order() -> None:
         client = GatedClient({"m"})
         queue = ActionQueue(client)
         runner = asyncio.ensure_future(queue.run(poll_interval_s=0.001))
-        queue.submit((ScaleAction("m", -1, "high", "fairness"),))
+        queue.submit((ScaleAction("m", -1, "high", "fairness", sleep_path="urgent"),))
         await asyncio.sleep(0.01)
         # A rescue for the same model is queued behind the running action.
         queue.submit((ScaleAction("m", 2, "critical", "rescue"),))

@@ -236,7 +236,7 @@ def test_replannable_actions_are_not_retried() -> None:
     async def scenario():
         client = GatedPowerClient(results={"m-1": [{"ok": False, "error": "HTTP 409", "retriable": True}]})
         queue = ActionQueue(client)
-        queue.submit((ScaleAction("m", -1, "high", "fairness", pods=("m-1",)),))
+        queue.submit((ScaleAction("m", -1, "high", "fairness", sleep_path="urgent", pods=("m-1",)),))
         [result] = await queue.drain_once()
         assert not result.ok and result.retriable and result.attempts == 1
 
@@ -249,7 +249,7 @@ def test_actions_on_a_shared_gpu_are_serialized_across_models() -> None:
         client = GatedPowerClient(gated={"a-1"})
         queue = ActionQueue(client, slot_of=slots.get)
         runner = asyncio.ensure_future(queue.run(poll_interval_s=0.001))
-        queue.submit((ScaleAction("a", -1, "high", "fairness", pods=("a-1",)),))
+        queue.submit((ScaleAction("a", -1, "high", "fairness", sleep_path="urgent", pods=("a-1",)),))
         await asyncio.sleep(0.005)
         queue.submit((ScaleAction("b", 1, "critical", "rescue", pods=("b-1",)),))
         queue.submit((ScaleAction("c", 1, "critical", "rescue", pods=("c-1",)),))
@@ -268,7 +268,7 @@ def test_cancelling_run_cancels_dispatches_in_flight() -> None:
         client = GatedPowerClient(gated={"m-1"})
         queue = ActionQueue(client)
         runner = asyncio.ensure_future(queue.run(poll_interval_s=0.001))
-        queue.submit((ScaleAction("m", -1, "high", "fairness", pods=("m-1",)),))
+        queue.submit((ScaleAction("m", -1, "high", "fairness", sleep_path="urgent", pods=("m-1",)),))
         assert await _until(lambda: ("start", "m-1", False) in client.events)
         running = list(queue._running)
         runner.cancel()

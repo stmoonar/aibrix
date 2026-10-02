@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+import logging
+
 from tre_common.metrics_schema import MetricsSnapshot, ModelWindowMetrics, PodWindowMetrics
 from tre_common.registry import ClusterTopology, ModelSpec, NodeSpec, Registry, SloSpec, TrsParams
 from tre_common.registry import PlacementConfig
@@ -327,7 +330,7 @@ def test_rescue_tick_converts_safescale_required_downscale_to_probe_hide() -> No
     )
 
 
-def test_rescue_tick_honors_latency_signal_source_for_classification() -> None:
+def test_rescue_tick_honors_latency_signal_source_for_classification(caplog) -> None:
     queue = FakeQueue()
     snapshot = MetricsSnapshot(
         ts_ms=1,
@@ -339,20 +342,20 @@ def test_rescue_tick_honors_latency_signal_source_for_classification() -> None:
     # (good latency) and the proactive scale-down is the observable proving the signal was
     # applied. The t1 suppress-hot-proactive guard is disabled here so that observable remains;
     # the guard's own behaviour is covered in test_planner.py.
-    result = run_rescue_tick(
-        snapshot,
-        queue=queue,
-        registry=_registry(),
-        signal_source="latency_p95",
-        suppress_hot_proactive_probe=False,
-    )
+    # 2026-10-02: with no SafeScale the probe-requiring shrink is dropped (never sent
+    # as a path-less scale-down), so the observable is the drop log of that reason.
+    with caplog.at_level(logging.WARNING, logger="tre_controller.tick"):
+        result = run_rescue_tick(
+            snapshot,
+            queue=queue,
+            registry=_registry(),
+            signal_source="latency_p95",
+            suppress_hot_proactive_probe=False,
+        )
 
-    assert result.submitted == 1
-    action = queue.submitted[0][0]
-    assert isinstance(action, ScaleAction)
-    assert action.model == "critical"
-    assert action.delta == -1
-    assert action.source_loop == "rescue"
+    assert result.submitted == 0 and not queue.submitted
+    dropped = [json.loads(r.getMessage()) for r in caplog.records if "shrink_dropped" in r.getMessage()]
+    assert [(d["model"], d["reason"]) for d in dropped] == [("critical", "high_proactive_safescale")]
 
 
 def test_rescue_tick_honors_per_model_min_replicas_for_idle_model() -> None:

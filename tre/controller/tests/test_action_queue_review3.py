@@ -509,7 +509,7 @@ def test_worker_exception_becomes_a_failed_result_and_frees_the_model() -> None:
     async def scenario():
         sm = ScriptedSM(raises={"m-1": RuntimeError("boom")})
         queue = ActionQueue(sm)
-        queue.submit((ScaleAction("m", -1, "high", "fairness", pods=("m-1",)),))
+        queue.submit((ScaleAction("m", -1, "high", "fairness", pods=("m-1",), sleep_path="urgent"),))
         [result] = await queue.drain_once()
         assert not result.ok and result.error == "dispatch_exception: RuntimeError: boom"
         assert queue.inflight_models() == set()
@@ -558,7 +558,7 @@ def test_one_shot_retry_attempts_unchanged_for_binding_power() -> None:
     async def scenario():
         sm = ScriptedSM(results={"m-1": [{"ok": False, "error": "HTTP 409", "retriable": True}]})
         queue = ActionQueue(sm, retry=RetryPolicy(max_attempts=3), sleep=lambda _s: asyncio.sleep(0))
-        queue.submit((ScaleAction("m", -1, "formal_commit_gate_passed", "safescale", pods=("m-1",)),))
+        queue.submit((ScaleAction("m", -1, "formal_commit_gate_passed", "safescale", pods=("m-1",), sleep_path="safescale_commit"),))
         [result] = await queue.drain_once()
         assert result.ok and result.attempts == 2
 

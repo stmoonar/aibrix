@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import logging
 import time
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Callable, Protocol, Union
@@ -37,6 +39,8 @@ from tre_controller.planning.safescale import (
 from tre_controller.signals.sources import get_signal, per_replica_token_rate
 from tre_controller.signals.trs import SignalState, TRSComputer, TRSInput
 from tre_sm.allocator.slots import natural_key, release_order
+
+LOG = logging.getLogger("tre_controller.tick")
 
 
 class PlannerQueue(Protocol):
@@ -461,7 +465,26 @@ def _apply_safescale(
     """``covered_targets`` (out): model -> its C1 rescue plan when the pods a probe
     preemption gives back cover every planned scale-up part (none is submitted)."""
     if safescale is None:
-        return actions, ()
+        # No SafeScale: a shrink that needs a probe must NOT be dispatched as is. It
+        # has no sleep_path, so the queue would send it down the SM default
+        # `scale_down` path (SM-side drain, up to 150 s), bypassing the rule that the
+        # controller's SafeScale alone owns draining. Drop it; keep scale-ups and the
+        # explicit-`urgent` immediate donors.
+        kept: list[Action] = []
+        for action in actions:
+            if _requires_safescale_probe(action):
+                LOG.warning(
+                    json.dumps(
+                        {"event": "safescale_unavailable_shrink_dropped",
+                         "model": _safescale_probe_model(action),
+                         "reason": str(action.reason),
+                         "action": type(action).__name__},
+                        sort_keys=True,
+                    )
+                )
+                continue
+            kept.append(action)
+        return tuple(kept), ()
 
     converted: list[Action] = []
     events: list[str] = []

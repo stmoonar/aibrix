@@ -1762,14 +1762,29 @@ def _observe_skipped(queued: QueuedAction) -> list[DispatchResult]:
 def _sleep_kwargs(action: ScaleAction) -> dict:
     """SM sleep path + drain budget of a scale-down (plan 2026-09-27 D1).
 
-    Only non-default values are sent: the SM default path is "scale_down".
+    Only non-default values are sent. A negative delta must name its path (explicitly
+    or via an "*_immediate" reason): there is no implicit "scale_down" any more.
     "*_immediate" planner reasons are the fast-loop donor paths ("urgent").
     """
     if action.delta >= 0:
         return {}
-    path = action.sleep_path or (
-        "urgent" if str(action.reason).endswith("_immediate") else "scale_down"
-    )
+    path = action.sleep_path or ("urgent" if str(action.reason).endswith("_immediate") else None)
+    if path is None:
+        # Every legitimate shrink names its path ("urgent" donors, "safescale_commit").
+        # A path-less one would silently take the SM default `scale_down` (SM-side
+        # drain, up to 150 s), bypassing SafeScale: refuse. The dispatch wrappers turn
+        # the exception into a failed, logged DispatchResult.
+        LOG.error(
+            json.dumps(
+                {"event": "scale_down_without_sleep_path_refused", "model": action.model,
+                 "reason": str(action.reason), "delta": action.delta},
+                sort_keys=True,
+            )
+        )
+        raise ValueError(
+            f"scale-down of {action.model} ({action.reason}) has no sleep_path: "
+            "refusing the implicit SM scale_down default"
+        )
     kwargs: dict = {}
     if path != "scale_down":
         kwargs["sleep_path"] = path

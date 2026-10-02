@@ -6,7 +6,7 @@ import asyncio
 
 import pytest
 
-from tre_controller.loops.action_queue import ActionQueue
+from tre_controller.loops.action_queue import ActionQueue, _sleep_kwargs
 from tre_controller.planning.planner import ScaleAction
 from tre_controller.sm_client import ServiceManagerClient
 
@@ -38,9 +38,35 @@ def test_immediate_donor_paths_are_urgent():
     assert calls == [("scale", "m", -1, {"sleep_path": "urgent"})]
 
 
-def test_ordinary_scale_down_uses_the_sm_default_path():
-    calls = _dispatch(ScaleAction("m", -1, "high_release", "fairness"))
-    assert calls == [("scale", "m", -1, {})]
+def test_pathless_scale_down_is_refused_not_sent_to_the_sm_default():
+    # 2026-10-02: no implicit `scale_down` path; the dispatch wrapper reports a
+    # failed result and nothing reaches the SM.
+    client = RecordingClient()
+    queue = ActionQueue(client)
+    action = ScaleAction("m", -1, "high_release", "fairness")
+    with pytest.raises(ValueError, match="no sleep_path"):
+        _sleep_kwargs(action)
+    queue.submit((action,))
+    results = asyncio.run(queue.drain_once())
+    assert client.calls == []
+    assert [r.ok for r in results] == [False]
+    assert "dispatch_exception" in (results[0].error or "")
+
+
+def test_pathless_binding_scale_down_is_refused_too():
+    client = RecordingClient()
+    queue = ActionQueue(client)
+    queue.submit((ScaleAction("m", -1, "high_release", "fairness", pods=("pod-a",)),))
+    asyncio.run(queue.drain_once())
+    assert client.calls == []
+
+
+def test_sleep_kwargs_keeps_explicit_paths_and_ignores_scale_ups():
+    assert _sleep_kwargs(ScaleAction("m", 1, "x", "rescue")) == {}
+    assert _sleep_kwargs(ScaleAction("m", -1, "x_immediate", "rescue")) == {"sleep_path": "urgent"}
+    assert _sleep_kwargs(ScaleAction("m", -1, "x", "safescale", sleep_path="safescale_commit")) == {
+        "sleep_path": "safescale_commit"
+    }
 
 
 def test_scale_up_sends_no_sleep_fields():
