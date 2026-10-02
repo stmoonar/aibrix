@@ -107,9 +107,6 @@ def gw_inflight_key(pod: str) -> str:
 # Written by the service-manager sleep primitive.
 #: HASH field=pod name, value JSON: the sleep in progress for that pod (crash evidence).
 SM_SLEEP_OPS_KEY = "tre:v2:sm:sleep_ops"
-#: HASH field=binding_id, value JSON: the sleep reservation fencing a draining binding
-#: and its GPUs while the drain runs outside the writer lock (expiry = Redis TIME).
-SM_SLEEP_RESERVATIONS_KEY = "tre:v2:sm:sleep_reservations"
 #: HASH of integer counters (sleeps, forced aborts, ack fallbacks, rollbacks, ...).
 SM_SLEEP_STATS_KEY = "tre:v2:sm:sleep_stats"
 #: HASH field=binding_id, value JSON: a wake whose /wake_up runs outside the writer

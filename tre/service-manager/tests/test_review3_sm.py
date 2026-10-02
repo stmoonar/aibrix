@@ -15,7 +15,7 @@ from tre_common.registry import ServiceManagerConfig
 from tre_sm.allocator.slots import Binding, Migration, Slot
 from tre_sm.api import v2 as v2_module
 from tre_sm.api.v2 import RetryLater, ServiceManagerV2, create_app
-from tre_sm.ops.sleep_primitive import ReservationLost, SleepPrimitive, SleepTarget
+from tre_sm.ops.sleep_primitive import GatewayState, SleepPrimitive, SleepTarget
 from tre_sm.state.fleet_store import FleetStateStore
 from tre_sm.state.gpu_leases import GpuLease, GpuLeaseConflict
 from tre_sm.state.operations import OperationBusy
@@ -23,6 +23,7 @@ from tre_sm.state.store import StateStore
 
 from sm_test_fakes import (
     FakeCoordinator,
+    FakeGateway,
     FakeRedis,
     FakeRuntime,
     LegacyRedis,
@@ -265,63 +266,13 @@ def test_startup_gate_gets_an_admission_error_once(monkeypatch):
     assert client.post("/v2/startup/admit", json=body).status_code == 409 and len(calls) == 2
 
 
-# ------------------------------------------------------------ P3 resolve_lost
-def _lose_reservation_while_draining(world, *, physical):
-    world.gateway.inflight("pod-a", "gw-1", total=1)
-    done = {}
-
-    def expire(now):
-        if now < 1003 or done:
-            return
-        done["x"] = True
-        world.redis.now_ms += 31_000  # the reservation expired meanwhile
-        world.vllm.physical_override["10.0.0.1"] = physical  # e.g. slept by another owner
-
-    world.hooks.append(expire)
-
-
-def test_a_lost_reservation_on_a_pod_found_asleep_does_not_reopen_routing():
-    world = World(_two_pods(), _two_desired())
-    _lose_reservation_while_draining(world, physical=True)
-
-    with pytest.raises(ReservationLost) as lost:
-        world.service.put_binding_power("pod-a", awake=False)
-
-    assert [o["status"] for o in lost.value.outcomes] == ["slept"]
-    assert world.state("pod-a") == "sleeping"  # never re-routed
-    assert not any(call[0] == "sleep" for call in world.vllm.calls)  # not our /sleep
-    assert world.primitive.journal.stats().get("sleeps_total", 0) == 0
-
-
-def test_a_lost_reservation_on_a_pod_of_unknown_state_stays_hidden():
-    world = World(_two_pods(), _two_desired())
-    _lose_reservation_while_draining(world, physical=None)
-
-    with pytest.raises(ReservationLost) as lost:
-        world.service.put_binding_power("pod-a", awake=False)
-
-    assert [o["status"] for o in lost.value.outcomes] == ["unconfirmed"]
-    assert world.state("pod-a") == "hidden"
-
-
-def test_a_lost_reservation_on_an_awake_pod_is_still_rolled_back():
-    world = World(_two_pods(), _two_desired())
-    _lose_reservation_while_draining(world, physical=False)
-
-    with pytest.raises(ReservationLost) as lost:
-        world.service.put_binding_power("pod-a", awake=False)
-
-    assert [o["status"] for o in lost.value.outcomes] == ["rolled_back"]
-    assert world.state("pod-a") == "awake"
-
-
-# ------------------------------------------------------------ P3 time budget
+# ------------------------------------------------- whole-lock time budget
 class TimedVllm:
     """Every vLLM call costs its full timeout on the virtual clock (worst case)."""
 
-    def __init__(self, clock, *, probe_s, sleep_s, abort_succeeds):
+    def __init__(self, clock, *, probe_s, sleep_s, outcome):
         self.clock, self.probe_s, self.sleep_s = clock, probe_s, sleep_s
-        self.abort_succeeds = abort_succeeds
+        self.outcome = outcome
 
     def version(self, pod_ip, *, port=None):
         self.clock.now += self.probe_s
@@ -329,43 +280,67 @@ class TimedVllm:
 
     def sleep(self, pod_ip, *, port=None, mode=None, timeout_s=None, hidden=False):
         self.clock.now += self.sleep_s
-        return Result(bool(self.abort_succeeds and mode == "abort"), "timed out")
+        if self.outcome == "unanswered":
+            return type("R", (), {"success": False, "status_code": None, "message": "timed out"})()
+        return Result(self.outcome == "accepted", "refused")
 
     def is_sleeping(self, pod_ip, *, port=None):
         self.clock.now += self.probe_s
         return False  # never converges
+
+    def is_paused(self, pod_ip, *, port=None):
+        self.clock.now += self.probe_s
+        return None  # unreadable: the rollback goes on to /resume
+
+    def resume(self, pod_ip, *, port=None):
+        self.clock.now += self.probe_s
+        return Result(True)
 
     def metrics(self, pod_ip, *, port=None):
         self.clock.now += self.probe_s
         return "vllm:num_requests_running 0.0\nvllm:num_requests_waiting 0.0\n"
 
 
-@pytest.mark.parametrize("abort_succeeds", [False, True])
-def test_the_commit_phase_stays_within_the_documented_worst_case(abort_succeeds):
+@pytest.mark.parametrize("outcome", ["refused", "accepted", "unanswered"])
+def test_one_sleep_stays_within_the_documented_worst_case_lock_hold(outcome):
+    """Defaults: ack 5 s, /sleep 10 s, confirmation 8 s, probes 2 s. Every vLLM
+    call costs its full timeout; the gateway never acks fast (it acks at the
+    deadline) - the call still ends within worst_case_sleep_lock_s."""
     sleep_policy = policy(
-        vllm_sleep_mode_param="auto", probe_timeout_s=5.0, sleep_call_timeout_s=45.0,
-        physical_confirm_timeout_s=15.0, poll_interval_s=0.5, no_plugin_grace_s=0.0,
+        vllm_sleep_mode_param="auto", ack_timeout_s=5.0, probe_timeout_s=2.0, sleep_call_timeout_s=10.0,
+        physical_confirm_timeout_s=8.0, poll_interval_s=0.5, io_margin_s=2.0,
     )
     config = ServiceManagerConfig(sleep=sleep_policy)
-    clock = TickingClock()
+    assert config.worst_case_sleep_lock_s() == 29.0
+    redis = FakeRedis()
     snapshot = pod("pod-a", "m1", (0,), ip="10.0.0.1")
+    runtime = FakeRuntime([snapshot])
+    gateway = FakeGateway(redis, runtime)
+    gateway.heartbeat("gw-1")
+    gateway.auto_ack.add("gw-1")
+    gateway.ack_after_polls = 9  # acks right at the 5 s ack deadline
+    clock = TickingClock(lambda now: gateway.tick())
     primitive = SleepPrimitive(
-        runtime_ops=FakeRuntime([snapshot]),
-        vllm_ops=TimedVllm(clock, probe_s=5.0, sleep_s=45.0, abort_succeeds=abort_succeeds),
+        runtime_ops=runtime,
+        vllm_ops=TimedVllm(clock, probe_s=2.0, sleep_s=10.0, outcome=outcome),
         policy=sleep_policy,
+        gateway=GatewayState(redis, monotonic=lambda: clock.monotonic()),
         clock=clock,
     )
-    batch = primitive.prepare([SleepTarget(binding_of(snapshot), snapshot.pod_ip)], path="scale_down")
-    primitive.drain(batch)
     started = clock.now
-    with pytest.raises(Exception):
-        primitive.commit(batch)
+    with pytest.raises(Exception) as info:
+        primitive.sleep([SleepTarget(binding_of(snapshot), snapshot.pod_ip)], path="scale_down")
     elapsed = clock.now - started
-    if not abort_succeeds:
-        # send failure: 5 probes (incl. the rollback re-probe) + 2 sleeps
-        assert elapsed == pytest.approx(5 * 5 + 2 * 45)
+    [result] = info.value.outcomes
+    if outcome == "unanswered":
+        # No probe after the timed-out /sleep: left hidden at once.
+        assert result["status"] == "unconfirmed"
+        assert elapsed <= 5.0 + 0.5 + 2.0 + 2.0 + 10.0
+    elif outcome == "refused":
+        # Re-probe, /is_paused, /resume, /is_paused, then routing restored.
+        assert result["status"] == "rolled_back"
     else:
-        # abort accepted but never confirmed: 3 probes + 2 sleeps, the
-        # confirmation window with its overshooting round, the rollback re-probe
-        assert 3 * 5 + 2 * 45 + 15 + 5 < elapsed
-    assert elapsed <= config.worst_case_commit_s()
+        # Accepted but never confirmed: hidden after the confirmation window.
+        assert result["status"] == "unconfirmed"
+        assert elapsed >= 10.0 + 8.0
+    assert elapsed <= config.worst_case_sleep_lock_s()

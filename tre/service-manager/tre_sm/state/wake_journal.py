@@ -1,12 +1,11 @@
-"""Journal of the wakes in flight (S6, 2026-09-30).
+"""Journal of the wakes (crash evidence).
 
-A wake runs in three phases, like a sleep: under the writer lock the account is
-checked and a ``waking`` GPU lease taken (phase 1), ``/wake_up`` +
-``/is_sleeping`` run WITHOUT the lock so wakes on different GPUs overlap (phase
-2), and the outcome is recorded under the lock again (phase 3). Between the
-phases only the lease (TTL) and this journal say that the binding is being
-woken. An entry is written in phase 1 and removed in phase 3; an entry left by
-a service-manager that died in between is resolved by
+A wake holds the service-manager writer lock from its checks to its commit
+(whole-lock, 2026-10-02): the account is checked, the binding's ``awake`` GPU
+lease taken and this entry written, ``/wake_up`` + ``/is_sleeping`` run (every
+binding of the request concurrently), and the outcome is recorded - all in one
+lock hold. An entry outlives the lock only when the service-manager died
+mid-wake or the engine's state could not be read; it is resolved by
 ``ServiceManagerV2.recover_wake_journal`` from the pod's physical state
 (``/is_sleeping``): awake -> the wake is completed, asleep -> rolled back
 (desired power restored from the entry), unknown -> kept for the next pass.

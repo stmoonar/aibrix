@@ -279,12 +279,14 @@ def test_sm_call_timeout_defaults_to_the_registry_and_must_outlast_a_sleep() -> 
     registry = Registry(ClusterTopology(nodes=()), [], service_manager=parse_service_manager_config(None))
     assert resolve_sm_call_timeout_s(SimpleNamespace(sm_slow_timeout_s=None), registry) == 360.0
     assert resolve_sm_call_timeout_s(SimpleNamespace(sm_slow_timeout_s=400.0), registry) == 400.0
-    with pytest.raises(ValueError, match="TRE_SM_SLOW_TIMEOUT_SECONDS = 120s"):
-        resolve_sm_call_timeout_s(SimpleNamespace(sm_slow_timeout_s=120.0), registry)
+    # whole-lock (2026-10-02): the worst-case call is 110 s with the defaults
+    with pytest.raises(ValueError, match="TRE_SM_SLOW_TIMEOUT_SECONDS = 100s"):
+        resolve_sm_call_timeout_s(SimpleNamespace(sm_slow_timeout_s=100.0), registry)
     slow = Registry(
         ClusterTopology(nodes=()),
         [],
-        service_manager=parse_service_manager_config({"sleep": {"sleep_call_timeout_s": 120}}),
+        # 150 s: one sleep, a compensating sleep and the lock wait exceed 360 s.
+        service_manager=parse_service_manager_config({"sleep": {"sleep_call_timeout_s": 150}}),
     )
     with pytest.raises(ValueError, match="api_call_timeout_s = 360s"):
         resolve_sm_call_timeout_s(SimpleNamespace(sm_slow_timeout_s=None), slow)

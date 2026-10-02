@@ -171,14 +171,15 @@ def test_fleet_repair_cannot_be_built_without_the_sleep_primitive():
 
 
 def spy_on(primitive, paths):
-    """Record (path, budget, pods) of every sleep: every sleep starts with prepare()."""
-    original = SleepPrimitive.prepare
+    """Record (path, budget, pods) of every sleep: every sleep is one sleep() call
+    (whole-lock, 2026-10-02)."""
+    original = SleepPrimitive.sleep
 
     def spy(self, targets, *, path, drain_budget_s=None, **kwargs):
         paths.append((path, drain_budget_s, [t.binding.serve_id for t in targets]))
         return original(self, targets, path=path, drain_budget_s=drain_budget_s, **kwargs)
 
-    primitive.prepare = spy.__get__(primitive)
+    primitive.sleep = spy.__get__(primitive)
 
 
 class Harness:
@@ -250,7 +251,8 @@ def test_model_target_shrink_goes_through_primitive_with_request_path():
     )
 
     assert response.status_code == 200, response.text
-    assert h.paths == [("urgent", 12.5, ["pod-b"])]
+    # drain_budget_s is accepted and ignored: the SM never drains (2026-10-02)
+    assert h.paths == [("urgent", None, ["pod-b"])]
     h.assert_hidden_before_every_sleep()
 
 
@@ -273,7 +275,7 @@ def test_binding_power_sleep_goes_through_primitive():
     )
 
     assert response.status_code == 200, response.text
-    assert h.paths == [("safescale_commit", 40.0, ["pod-a"])]
+    assert h.paths == [("safescale_commit", None, ["pod-a"])]
     h.assert_hidden_before_every_sleep()
     assert ("release", "m1/node-a/0") in h.leases.calls
 

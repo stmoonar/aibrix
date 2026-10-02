@@ -136,9 +136,9 @@ def test_compensating_sleep_is_not_attempted_when_the_state_is_unknown_entry_kep
             world.service.put_binding_power("pod-b", awake=True)
 
     assert not any(call[0] == "sleep" for call in world.vllm.calls)
-    # review P1-2 / P2: the waking lease (no TTL) and the journal entry stay for the
+    # review P1-2 / P2: the lease (no TTL) and the journal entry stay for the
     # recovery; the desired intent is not rolled back before the state is known.
-    assert _leases(world)["m1/node-a/1"] == "waking"
+    assert _leases(world)["m1/node-a/1"] == "awake"
     assert _events(caplog, "wake_failed_state_unknown")
     assert set(world.journal.entries()) == {"m1/node-a/1"}
     assert world.desired()["m1/node-a/1"][0] == "awake"
@@ -255,10 +255,9 @@ def test_wake_details_land_in_the_operation_records(caplog):
         world.service.put_binding_power("pod-b", awake=True)
 
     kinds = [kind for kind, _ in handles]
-    assert kinds == ["put_binding_power", "put_binding_power_commit"]
-    prepare, commit = (handle.notes for _, handle in handles)
-    assert prepare["binding_id"] == "m1/node-a/1" and prepare["gpu_ids"] == [1]
-    assert set(prepare["phases_ms"]) == {"reserve"}
+    assert kinds == ["put_binding_power"]  # one writer-lock hold (whole-lock)
+    [commit] = [handle.notes for _, handle in handles]
+    assert commit["binding_id"] == "m1/node-a/1" and commit["gpu_ids"] == [1]
     assert set(commit["phases_ms"]) == {"reserve", "wake_up", "commit"}
     assert commit["truth_source"] == "none" and commit["wake_attempts"] == 1
     assert "error_code" not in commit

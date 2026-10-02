@@ -9,6 +9,8 @@ def create_v1_compat_router(service) -> APIRouter:
 
     @router.post("/models_replicas")
     def models_replicas(models: str = Query(...)) -> dict[str, int]:
+        # The light state (store only, no Pod LIST): awake and not hidden - the
+        # base /scale_service converts a delta from.
         state = service.get_state()
         result: dict[str, int] = {}
         for model in _split_models(models):
@@ -23,19 +25,21 @@ def create_v1_compat_router(service) -> APIRouter:
     ) -> dict[str, int]:
         if scale_value < 0:
             raise HTTPException(status_code=400, detail="scale_value must be non-negative")
-        current = _awake_count(service.get_state(), model_name)
         if scale_type == "up":
-            target = current + scale_value
+            delta = scale_value
         elif scale_type == "down":
-            target = max(0, current - scale_value)
+            delta = -scale_value
         else:
             raise HTTPException(status_code=400, detail="scale_type must be up or down")
         try:
-            # APA scale-downs take the "apa" sleep path (no drain by default,
-            # service_manager.sleep.no_drain_paths); a scale-up ignores it.
-            response = service.put_model_target(
-                model_name, wake_replicas=target, sleep_path="apa"
-            )
+            # A delta, converted under the writer lock from the awake and not
+            # hidden count (2026-10-02; it was converted here, outside the lock,
+            # from the same count): the same target as before for one call, and
+            # two concurrent calls add up instead of converting from one base.
+            # APA scale-downs take the "apa" sleep path (no drain, like every
+            # sleep of the service-manager); a scale-up ignores it. ``actual``
+            # stays the number of wake / sleep actions of THIS call.
+            response = service.put_model_target(model_name, delta=delta, sleep_path="apa")
         except (KeyError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return {"requested": scale_value, "actual": len(response["actions"])}
@@ -47,15 +51,14 @@ def create_v1_compat_router(service) -> APIRouter:
         queue_len: int = Query(0),
     ) -> dict:
         del kind, queue_len
-        state = service.get_state()
-        current = _awake_count(state, model_name)
-        bound = state["models"].get(model_name, {}).get("bound", 0)
-        if current >= bound:
-            return _wake_response(success=False, delayed=True, wake_ids=[])
         try:
-            response = service.put_model_target(model_name, wake_replicas=current + 1)
+            # One more than awake and not hidden, under the writer lock; never past
+            # the model's bindings (no cold create) - "delayed" then, as before.
+            response = service.put_model_target(model_name, delta=1, within_bindings=True)
         except (KeyError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if response.get("at_bindings_limit"):
+            return _wake_response(success=False, delayed=True, wake_ids=[])
         wake_ids = [action["serve_id"] for action in response["actions"] if action["action"] == "wake"]
         return _wake_response(success=bool(wake_ids), delayed=False, wake_ids=wake_ids)
 

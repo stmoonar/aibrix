@@ -81,17 +81,10 @@ class Lease:
         self.expires_at_ms = int(time.time() * 1000) + 60_000 if expires_at_ms is None else expires_at_ms
 
 
-def test_routable_excludes_reserved_waking_not_ready_unlabelled_and_store_unknown_pods():
+def test_routable_excludes_starting_not_ready_unlabelled_and_store_unknown_pods():
     world = _two_awake_world()
     service = world.service
     assert service._routable_binding_ids("m1") == {"m1/node-a/0", "m1/node-a/1"}
-
-    # a sleep reservation (a drain in progress) takes it out
-    token = service._sleep_primitive.reservations.acquire(
-        [binding_of(world.runtime.snapshots["pod-a"])], owner="t", operation_id=None, ttl_s=30
-    )
-    assert service._routable_binding_ids("m1") == {"m1/node-a/1"}
-    service._sleep_primitive.reservations.release(["m1/node-a/0"], token)
 
     # a replica being woken (unexpired transient lease) does not count
     world.leases.load = lambda: [Lease("m1/node-a/1", "waking")]
@@ -218,11 +211,10 @@ def _race(calls):
     return results
 
 
-@pytest.mark.parametrize("coordinated", [True, False])
-def test_two_concurrent_hides_never_both_pass_the_floor(coordinated):
+def test_two_concurrent_hides_never_both_pass_the_floor():
     """Two SafeScale hides of different pods of a 2-replica min-1 model at once
     (two callers with a stale view: each sends its own full hidden set): exactly
-    one goes through (writer lock / process floor lock + one snapshot)."""
+    one goes through (the writer lock + one snapshot)."""
     from sm_test_fakes import FakeRedis
 
     redis = FakeRedis()
@@ -237,7 +229,7 @@ def test_two_concurrent_hides_never_both_pass_the_floor(coordinated):
         store,
         runtime_ops=runtime,
         vllm_ops=vllm,
-        operation_coordinator=LockingCoordinator(redis) if coordinated else None,
+        operation_coordinator=LockingCoordinator(redis),
     )
     _slow_hide(runtime)
 
@@ -254,10 +246,10 @@ def test_two_concurrent_hides_never_both_pass_the_floor(coordinated):
     assert sum(1 for b in store.load().bindings if b.hidden) == 1
 
 
-def test_concurrent_hide_and_urgent_sleep_never_both_take_the_last_replica():
+def test_concurrent_hide_and_urgent_shrink_never_both_take_the_last_replica():
     """A SafeScale hide and an urgent model-target shrink of the same 2-replica
-    min-1 model at once: one of them is refused (the sleep's prepare checks under
-    the same lock the hide holds)."""
+    min-1 model at once: whichever runs second finds one routable replica left -
+    a hide is refused, a shrink is clamped (both under the one writer lock)."""
     world = _two_awake_world()
     world.coordinator = None
     world.service._operation_coordinator = LockingCoordinator(world.redis)
@@ -269,27 +261,26 @@ def test_concurrent_hide_and_urgent_sleep_never_both_take_the_last_replica():
     ])
 
     errors = [value for kind, value in results if kind == "error"]
-    assert len(errors) == 1 and isinstance(errors[0], FloorViolation), results
-    assert world.service._routable_binding_ids("m1") != set()
+    assert all(isinstance(error, FloorViolation) for error in errors), results
     assert len(world.service._routable_binding_ids("m1")) == 1
 
 
 # ------------------------------------------------------------------ sleep paths
 @pytest.mark.parametrize("path", ["urgent", "scale_down"])
-def test_model_target_shrink_below_the_floor_is_refused_before_anything_is_hidden(path):
+def test_model_target_shrink_below_the_floor_is_clamped_on_every_path(path):
+    """2026-10-02: a model-level shrink is clamped at the floor on every path
+    (it was refused with 409 except for apa): 200, taken + clamped_by_floor."""
     world = _two_awake_world()
     client = TestClient(create_app(world.service))
 
     response = client.put("/v2/models/m1/target", json={"wake_replicas": 0, "sleep_path": path})
 
-    assert response.status_code == 409
-    assert response.json()["error"] == "floor_violation" and response.json()["path"] == path
-    assert _hidden_patches(world) == []
-    assert not [c for c in world.vllm.calls if c[0] == "sleep"]
-    assert world.service.sleep_state()["reservations"] == {}
-    # one replica is fine
-    assert client.put("/v2/models/m1/target", json={"wake_replicas": 1, "sleep_path": path}).status_code == 200
-    assert _floor_counts(world.service)[f"floor_rejected:{path}:m1"] == 1
+    assert response.status_code == 200
+    body = response.json()
+    assert body["taken"] == 1 and body["clamped_by_floor"] is True
+    assert len(_hidden_patches(world)) == 1  # one replica slept, the floor kept the other
+    assert len(world.service._routable_binding_ids("m1")) == 1
+    assert _floor_counts(world.service)[f"floor_clamped:{path}:m1"] == 1
 
 
 def test_binding_power_sleep_of_the_last_routable_replica_is_refused():

@@ -126,53 +126,50 @@ def test_sleep_mode_param_accepts_auto_and_booleans():
         parse_sleep_mode_param("sometimes")
 
 
-def test_worst_case_sleep_call_must_fit_the_api_call_timeout():
+def test_worst_case_lock_holds_and_the_call_bound_fit_the_api_call_timeout():
+    """Whole-lock (2026-10-02): one sleep holds the writer lock for at most ack 5 +
+    one probe round 2 + /sleep 10 + max(confirmation 8 + its last probe 2, the
+    failed-call rollback's 4 probes) + io 2 = 29 s, whatever the target count."""
     config = ServiceManagerConfig()
-    # review 2 P2-2: every probe timeout counted; commit targets run in parallel,
-    # so the bound does not depend on the number of targets. Review 3 P3: a failed
-    # send's rollback re-probe and the last confirmation round (poll interval +
-    # probe) plus the non-converged pod's rollback re-probe are counted too.
-    send = 5 * 5 + 2 * 45
-    confirm = 15 + 0.5 + 2 * 5
-    commit = send + confirm
-    assert config.worst_case_commit_s() == commit == 140.5
-    assert config.worst_case_sleep_call_s() == 10 + (10 + 150 + 5) + 10 + commit + 5 == 330.5
+    assert config.worst_case_sleep_lock_s() == 5 + 2 + 10 + max(8 + 2, 4 * 2) + 2 == 29
+    # A wake: resident probes 2 + /wake_up 10 + convergence and settlement probes
+    # 2 x 2 + a compensating sleep 29 + io 2.
+    assert config.worst_case_wake_lock_s() == 2 + 10 + 2 * 2 + 29 + 2 == 47
+    assert config.worst_case_transfer_lock_s() == 2 + 29 + 47 == 78
+    assert config.worst_case_lock_hold_s() == 78
+    assert config.worst_case_sleep_call_s() == 30 + 78 + 2 == 110
     assert config.worst_case_sleep_call_s() < config.api_call_timeout_s
-    assert config.shutdown_timeout_s() == 10 + commit + 0.5 + 5 + 5
+    assert config.shutdown_timeout_s() == 78 + 2
 
-    slow = parse_service_manager_config({"sleep": {"sleep_call_timeout_s": 90}})
+    slow = parse_service_manager_config({"sleep": {"sleep_call_timeout_s": 200}})
     errors = Registry(ClusterTopology(nodes=()), [], service_manager=slow).validate()
-    assert any("worst-case sleeping service-manager call is 420.5s" in e for e in errors)
+    assert any("worst-case service-manager call is 490s" in e for e in errors)
 
     from tre_common.registry import sleep_call_timeout_errors
 
     assert sleep_call_timeout_errors(config, 360.0) == []
-    assert sleep_call_timeout_errors(config, 300.0, name="TRE_SM_SLOW_TIMEOUT_SECONDS")[0].endswith(
-        "the caller would time out mid-drain"
+    assert sleep_call_timeout_errors(config, 100.0, name="TRE_SM_SLOW_TIMEOUT_SECONDS")[0].endswith(
+        "the caller would time out mid-operation"
     )
 
 
-def test_reservation_ttl_must_outlive_the_longest_renewal_gap():
-    ok = parse_service_manager_config({})
-    assert not [e for e in Registry(ClusterTopology(nodes=()), [], service_manager=ok).validate() if "renewal gap" in e]
-    short = parse_service_manager_config(
-        {"commit_lock_wait_s": 25, "sleep": {"reservation_ttl_s": 30}, "api_call_timeout_s": 1000}
+def test_the_deprecated_reservation_and_drain_settings_are_no_longer_validated():
+    old = parse_service_manager_config(
+        {"commit_lock_wait_s": 25, "sleep": {"reservation_ttl_s": 1, "hard_cap_s": 900}, "api_call_timeout_s": 1000}
     )
-    errors = Registry(ClusterTopology(nodes=()), [], service_manager=short).validate()
-    assert any("longest renewal gap 35.5s" in e for e in errors)
-    assert short.commit_wait_s == 25 and ok.commit_wait_s == ok.writer_lock_wait_s
+    errors = Registry(ClusterTopology(nodes=()), [], service_manager=old).validate()
+    assert not [e for e in errors if "reservation_ttl_s" in e or "hard_cap_s" in e or "commit_lock" in e]
     probe = parse_service_manager_config({"sleep": {"probe_timeout_s": 0}})
     assert any("probe_timeout_s must be positive" in e for e in Registry(ClusterTopology(nodes=()), [], service_manager=probe).validate())
+    idle = parse_service_manager_config({"sleep": {"sleep_mode_when_idle": "keep"}})
+    assert any("sleep_mode_when_idle" in e for e in Registry(ClusterTopology(nodes=()), [], service_manager=idle).validate())
+    wake = parse_service_manager_config({"wake": {"call_timeout_s": 0}})
+    assert any("wake.call_timeout_s" in e for e in Registry(ClusterTopology(nodes=()), [], service_manager=wake).validate())
 
 
-def test_hard_cap_may_not_exceed_the_gateway_route_timeout():
-    from tre_common.registry import GatewayConfig, parse_gateway_config
+def test_gateway_route_timeout_still_parses():
+    from tre_common.registry import parse_gateway_config
 
-    config = parse_service_manager_config({"sleep": {"hard_cap_s": 200}})
-    errors = Registry(
-        ClusterTopology(nodes=()), [], service_manager=config, gateway=GatewayConfig(150)
-    ).validate()
-    assert any("must not exceed gateway.route_timeout_s" in e for e in errors)
     assert parse_gateway_config(None).route_timeout_s == 150.0
     assert parse_gateway_config({"route_timeout_s": 60}).route_timeout_s == 60.0
 

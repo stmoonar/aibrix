@@ -16,7 +16,6 @@ from tre_sm.ops.sleep_primitive import GatewayState, SleepFailed, SleepJournal
 from tre_sm.server import K8sPodClientFromOps
 from tre_sm.state.fleet_store import DesiredBinding, FleetStateStore
 from tre_sm.state.reconcile import observe_bindings
-from tre_sm.state.sleep_reservations import SleepReservations
 from tre_sm.state.store import StateStore
 
 from sm_test_fakes import (
@@ -124,7 +123,6 @@ class World:
             gpu_leases=self.leases,
             gateway_state=GatewayState(self.redis, monotonic=lambda: self.clock.monotonic()),
             sleep_journal=SleepJournal(self.redis),
-            sleep_reservations=SleepReservations(self.redis),
             sleep_clock=self.clock,
         )
         # The observed snapshot starts in sync (a reconcile after start).

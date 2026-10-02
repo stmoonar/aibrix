@@ -12,7 +12,6 @@ from tre_sm.app import install_lifecycle, install_sigterm_hook
 from tre_sm.ops.sleep_primitive import GatewayState, SleepJournal
 from tre_sm.server import K8sPodClientFromOps
 from tre_sm.state.fleet_store import DesiredBinding, FleetStateStore
-from tre_sm.state.sleep_reservations import SleepReservations
 from tre_sm.state.store import StateStore
 
 from sm_test_fakes import (
@@ -51,7 +50,6 @@ class World:
         with fence(self.redis):
             self.fleet.save_desired(desired, expected_version=0)
         self.journal = SleepJournal(self.redis)
-        self.reservations = SleepReservations(self.redis)
         self.leases = FakeLeases()
         self.gateway = FakeGateway(self.redis, self.runtime)
         self.clock = TickingClock(lambda now: self.gateway.tick())
@@ -67,7 +65,6 @@ class World:
             gpu_leases=self.leases,
             gateway_state=GatewayState(self.redis, monotonic=lambda: self.clock.monotonic()),
             sleep_journal=self.journal,
-            sleep_reservations=self.reservations,
             sleep_clock=self.clock,
         )
 
@@ -89,7 +86,9 @@ class World:
         return self.runtime.snapshots[name].annotations["tre.aibrix.io/state"]
 
 
-@pytest.mark.parametrize("phase", ["hiding", "awaiting_ack", "draining", "drained", "drain_budget_spent"])
+@pytest.mark.parametrize(
+    "phase", ["hiding", "awaiting_ack", "acked", "idle", "in_flight_abort", "draining", "drained", "drain_budget_spent"]
+)
 def test_bootstrap_rolls_back_an_awake_pod_from_any_phase_before_sleep(phase):
     hidden = pod("pod-a", "m1", (0,), ip="10.0.0.1", state="hidden")
     world = World([hidden], [_desired("m1/node-a/0", "m1", (0,), "sleeping")], physical={"10.0.0.1": False})
@@ -160,19 +159,6 @@ def test_a_vanished_pod_just_drops_the_entry():
     assert world.journal.entries() == {}
 
 
-def test_a_drain_with_a_live_reservation_is_left_alone():
-    hidden = pod("pod-a", "m1", (0,), ip="10.0.0.1", state="hidden")
-    world = World([hidden], [_desired("m1/node-a/0", "m1", (0,), "sleeping")], physical={"10.0.0.1": False})
-    token = world.reservations.acquire([binding_of(hidden)], owner="other-sm", operation_id="op", ttl_s=30)
-    world.left_over("pod-a", "m1/node-a/0", phase="draining", token=token)
-
-    assert world.service.recover_sleep_journal() == {"resolved": [], "kept": []}
-    assert world.state("pod-a") == "hidden"
-
-    world.redis.now_ms += 60_000  # its owner died: the reservation expires
-    assert world.service.recover_sleep_journal()["resolved"][0]["result"] == "rolled_back_to_awake"
-
-
 def test_startup_event_runs_the_recovery():
     hidden = pod("pod-a", "m1", (0,), ip="10.0.0.1", state="hidden")
     world = World([hidden], [_desired("m1/node-a/0", "m1", (0,), "sleeping")], physical={"10.0.0.1": False})
@@ -188,12 +174,12 @@ def test_startup_event_runs_the_recovery():
 
 
 # --------------------------------------------------------------------- SIGTERM
-def test_sigterm_rolls_back_a_drain_in_progress_and_refuses_new_sleeps():
+def test_sigterm_rolls_back_a_sleep_waiting_for_its_ack_and_refuses_new_sleeps():
     awake = pod("pod-a", "m1", (0,), ip="10.0.0.1")
     world = World([awake], [_desired("m1/node-a/0", "m1", (0,), "awake")], physical={"10.0.0.1": False})
     world.gateway.heartbeat("gw-1")
     world.gateway.auto_ack.add("gw-1")
-    world.gateway.inflight("pod-a", "gw-1", total=1)  # a long request keeps it draining
+    world.gateway.ack_after_polls = 20  # a slow informer keeps it waiting for the ack
     world.clock.hooks.append(lambda now: world.service.begin_shutdown() if now > 1003 else None)
     client = TestClient(create_app(world.service))
 

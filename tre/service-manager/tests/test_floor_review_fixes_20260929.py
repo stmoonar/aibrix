@@ -355,7 +355,7 @@ def test_expired_waking_lease_of_a_tp2_replica_does_not_refuse_its_peer_hide():
     assert world.service._routable_binding_ids("tp2") == set()
 
 
-def test_failed_wake_settles_its_waking_lease():
+def test_failed_wake_settles_its_lease():
     pods = [pod("pod-a", "m1", (0,), ip="10.0.0.1"), pod("pod-c", "m1", (2,), ip="10.0.0.3", state="sleeping")]
     desired = [_desired("m1/node-a/0", "m1", (0,), "awake"), _desired("m1/node-a/2", "m1", (2,), "sleeping")]
     world = World(pods, desired, sm_registry=floor_registry())
@@ -365,8 +365,9 @@ def test_failed_wake_settles_its_waking_lease():
     with pytest.raises(ValueError):
         with fence(world.redis):
             world.service._apply_runtime_power_action(target, action="wake")
-    # physically still asleep -> released (a sleeping binding holds no lease)
-    assert world.leases.calls[-2:] == [("acquire", "m1/node-a/2", "waking"), ("release", "m1/node-a/2")]
+    # physically still asleep -> released (a sleeping binding holds no lease); the
+    # wake took the GPUs with an awake lease from its prepare (whole-lock)
+    assert world.leases.calls[-2:] == [("acquire", "m1/node-a/2", "awake"), ("release", "m1/node-a/2")]
 
     # physically awake after the failure -> S4 (2026-09-30): a compensating sleep
     # puts it back to sleep, then the lease is released (before: the awake lease)
@@ -380,7 +381,6 @@ def test_failed_wake_settles_its_waking_lease():
             world.service._apply_runtime_power_action(target, action="wake")
     assert world.vllm.sleeping["10.0.0.3"] is True
     assert world.leases.calls[-1] == ("release", "m1/node-a/2")
-    assert ("acquire", "m1/node-a/2", "awake") not in world.leases.calls
 
     # ... and when that sleep fails too: the awake lease (its GPU is in use)
     world.vllm.fail_sleep_for.add("10.0.0.3")

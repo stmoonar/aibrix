@@ -7,19 +7,23 @@ floor: the number of ROUTABLE replicas left must stay >= the registry
 ``min_replicas`` (both arms, TRE and APA, use it).
 
 Routable (binding ids) = awake and not hidden in the SM store AND - when the SM has a
-Kubernetes view - a Ready Pod carrying the routable label, without a sleep
-reservation and not in an unexpired transient ``waking`` / ``starting`` GPU lease. A
-replica that is being woken does not count. A make-before-break move (defrag) counts
-its already-routable destination explicitly (the store records it only once the move
-is done).
+Kubernetes view - a Ready Pod carrying the routable label, and not in an unexpired
+transient ``starting`` (or old ``waking``) GPU lease. A make-before-break move (defrag)
+counts its already-routable destination explicitly (the store records it only once
+the move is done). The routable view unreadable (a failed Pod LIST, Redis) refuses
+the operation with 409 ``routable_unknown`` before anything is hidden - except on
+the exempt / make-up paths below.
 
 What happens when an operation would go below the floor depends on its path:
 
-* ``safescale_hide``, ``urgent``, ``scale_down``, ``safescale_commit``, ``default``,
-  ``defrag``: refused with :class:`FloorViolation` (HTTP 409, ``error:
-  floor_violation``; the controller treats it as permanent for this tick and
-  re-plans on the next one).
-* ``apa``: the target is clamped so that the floor holds (no error).
+* a model-level shrink - ``PUT /v2/models/{m}/target`` on ANY path (2026-10-02;
+  before only ``apa``) and ``POST /v2/transfers`` (the donor model) - is clamped so
+  that the floor holds: HTTP 200 with ``taken`` and ``clamped_by_floor``, never 409;
+* a named binding or pod - ``PUT /v2/bindings/{b}/power`` (``urgent``,
+  ``scale_down``, ``safescale_commit``, ``default``), the SafeScale hide
+  (``safescale_hide``) and ``defrag``: refused with :class:`FloorViolation` (HTTP
+  409, ``error: floor_violation``; the controller treats it as permanent for this
+  tick and re-plans on the next one).
 * ``startup``: another replica of the model is woken first, best effort (its own
   writer phase, within max_awake_replicas); what cannot be made up is exempt and
   recorded - never RetryLater: a Pod held in its startup gate would be seen as fleet
@@ -52,6 +56,8 @@ HIDE_PATH = "safescale_hide"
 REJECT_PATHS = frozenset(
     {HIDE_PATH, "safescale_commit", "urgent", "scale_down", "default", "defrag"}
 )
+#: Historical: /target clamped only these paths; since 2026-10-02 it clamps every
+#: path (model-level shrinks are clamped, binding-level sleeps refused).
 CLAMP_PATHS = frozenset({"apa"})
 #: Paths that wake another replica first (best effort) and are exempt otherwise.
 MAKEUP_PATHS = frozenset({"startup"})

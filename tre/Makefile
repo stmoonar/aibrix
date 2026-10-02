@@ -35,14 +35,16 @@ check:
 check-serial:
 	PYTHONPATH=$(TRE_PYTHONPATH) $(PYTHON) -m pytest -q common/tests deploy/tests controller/tests service-manager/tests calibration/tests replayer/tests loadgen_v1/tests reissue/tests ui/tests
 
-# Real-Redis Lua tests (sleep reservations, fair writer lock, maintenance lock) against a throwaway
-# Redis container that is removed afterwards. `make check` stays hermetic: it runs
-# the same tests against Python models of the scripts. Needs docker; override
-# REDIS_TEST_IMAGE / REDIS_TEST_PORT / REDIS_TEST_CONTAINER if needed.
+# Real-Redis Lua tests (fair writer lock, maintenance lock) and the sleep primitive end to
+# end (real Redis + HTTP) against a throwaway Redis container that is removed afterwards.
+# `make check` stays hermetic: it runs the Lua tests against Python models of the scripts
+# and skips the e2e. Needs docker; override REDIS_TEST_IMAGE / REDIS_TEST_PORT /
+# REDIS_TEST_CONTAINER if needed.
 REDIS_TEST_IMAGE ?= redis:7.2-alpine
 REDIS_TEST_PORT ?= 16399
 REDIS_TEST_CONTAINER ?= tre-check-redis
-REDIS_TESTS := service-manager/tests/test_sleep_reservations.py service-manager/tests/test_operations.py service-manager/tests/test_maintenance_lock.py
+REDIS_TESTS := service-manager/tests/test_operations.py service-manager/tests/test_maintenance_lock.py
+REDIS_E2E_TESTS := service-manager/tests/test_sleep_e2e_redis.py
 
 check-redis:
 	@docker rm -f $(REDIS_TEST_CONTAINER) >/dev/null 2>&1 || true
@@ -50,6 +52,7 @@ check-redis:
 	@status=0; \
 	for i in 1 2 3 4 5 6 7 8 9 10; do docker exec $(REDIS_TEST_CONTAINER) redis-cli ping >/dev/null 2>&1 && break; sleep 0.5; done; \
 	TRE_TEST_REDIS_URL=redis://127.0.0.1:$(REDIS_TEST_PORT)/0 PYTHONPATH=$(TRE_PYTHONPATH) $(PYTHON) -m pytest -q -rA -k real-redis $(REDIS_TESTS) || status=$$?; \
+	TRE_SM_E2E_REDIS_URL=redis://127.0.0.1:$(REDIS_TEST_PORT)/1 PYTHONPATH=$(TRE_PYTHONPATH) $(PYTHON) -m pytest -q -rA $(REDIS_E2E_TESTS) || status=$$?; \
 	docker rm -f $(REDIS_TEST_CONTAINER) >/dev/null 2>&1; \
 	exit $$status
 

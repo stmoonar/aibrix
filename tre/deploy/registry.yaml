@@ -377,30 +377,35 @@ reissue:
 # so restart it afterwards (kubectl -n tre-v2 rollout restart
 # deploy/tre-v2-service-manager).
 service_manager:
-  # A request that needs the SM writer lock waits up to this long for it (waiters
-  # are served first-come first-served). The lock is held only for short phases
-  # (hide, commit); a drain runs outside it.
-  writer_lock_wait_s: 10
-  # How long the commit phase of a drained sleep waits for the writer lock
-  # (null = writer_lock_wait_s); the sleep reservation must outlive it.
+  # Whole-lock (2026-10-02, design docs/design/20261002-sm-wholelock.md): every
+  # write holds the SM writer lock from start to end - a sleep from its hide to
+  # its bookkeeping, a wake from its checks to its commit, a transfer for both.
+  # A request waits up to writer_lock_wait_s for the lock (first-come
+  # first-served), then gets 409 writer_busy. 30 s queue behind at least one
+  # worst-case sleep (29 s) or several ordinary 2-5 s operations.
+  writer_lock_wait_s: 30
+  # Deprecated and ignored (2026-10-02: a sleep has no separate commit phase).
   commit_lock_wait_s: null
   # Timeout clients (the controller) use for slow SM calls. Must exceed the
-  # worst-case sleeping call, for any number of targets = writer_lock_wait_s +
-  # sleep.ack_timeout_s + sleep.hard_cap_s + commit-lock wait + 2 x
-  # sleep.sleep_call_timeout_s + 8 x sleep.probe_timeout_s +
-  # sleep.physical_confirm_timeout_s + sleep.poll_interval_s +
-  # sleep.io_margin_s (330.5 s with these
-  # values); validated at SM and controller start. The controller uses it
-  # unless TRE_SM_SLOW_TIMEOUT_SECONDS overrides it.
+  # worst-case call = writer_lock_wait_s + the longest writer-lock hold (a
+  # transfer: its donors' sleep - ack_timeout_s + probe_timeout_s +
+  # sleep_call_timeout_s + max(physical_confirm_timeout_s + probe_timeout_s,
+  # 4 x probe_timeout_s) + io_margin_s = 29 s - plus its receivers' wake -
+  # probe_timeout_s + wake.call_timeout_s + 2 x probe_timeout_s + a compensating
+  # sleep (29 s) + io_margin_s = 47 s - plus one selection probe) + io_margin_s
+  # = 30 + 78 + 2 = 110 s with these values; validated at SM and controller
+  # start. The controller uses it unless TRE_SM_SLOW_TIMEOUT_SECONDS overrides it.
   api_call_timeout_s: 360
   # Level of the service-manager's own loggers (tre_sm, tre_common): CRITICAL,
   # ERROR, WARNING, INFO or DEBUG; the TRE_SM_LOG_LEVEL env var overrides it.
   log_level: INFO
   # Replica floor (2026-09-29): no hide or sleep may leave a model with fewer
-  # ROUTABLE replicas (awake, not hidden, Ready, no sleep reservation, not being
-  # woken) than its models[].min_replicas - both arms (TRE and APA) use it.
-  # SafeScale hide / urgent / scale_down / defrag: refused (409 floor_violation;
-  # the controller re-plans next tick). APA (/scale_service): target clamped.
+  # ROUTABLE replicas (awake, not hidden, Ready, not starting) than its
+  # models[].min_replicas - both arms (TRE and APA) use it. A model-level shrink
+  # (/target on any path, /scale_service, a transfer's donor model): clamped (200,
+  # taken + clamped_by_floor). A named binding (/power), the SafeScale hide and
+  # defrag: refused (409 floor_violation; the controller re-plans next tick).
+  # Routable view unreadable: 409 routable_unknown before anything is hidden.
   # Startup admission: another replica is woken first (best effort, in its own
   # writer phase, within max_awake_replicas; after the start converges the
   # suspended resident stays asleep - a swap); if none can be woken the start
@@ -438,10 +443,13 @@ service_manager:
   # test_hooks: false
   sleep:
     # Every sleep runs hide (routable=false + route-gen bump) -> gateway plugin ack
-    # -> drain -> /sleep (D1/D2); no caller can skip a step, except that the paths in
-    # no_drain_paths (below) skip the drain and abort at once.
-    # Max wait for every live gateway plugin instance to report the new route-gen.
-    ack_timeout_s: 10
+    # -> one load read -> ONE /sleep -> physical confirmation (D1/D2), all under
+    # the writer lock (whole-lock, 2026-10-02); no caller can skip a step and
+    # nothing drains (draining is the controller's job). The four timeouts below
+    # bound one sleep's lock hold: 5 + 2 + 10 + max(8 + 2, 4 x 2) + 2 = 29 s.
+    # Max wait for every live gateway plugin instance to report the new route-gen
+    # (measured 7-15 ms; a timeout rolls the hide back).
+    ack_timeout_s: 5
     # A plugin instance is live while its heartbeat score (tre:v2:gw:instances)
     # keeps advancing: the SM saw it change within this many seconds of its own
     # monotonic clock (never compared with a wall clock).
@@ -455,27 +463,33 @@ service_manager:
     fallback_no_plugin: false
     no_plugin_grace_s: 5
     poll_interval_s: 0.5
-    # HTTP timeout of one /sleep call (weight offload); a failed mode=wait is
-    # retried once with mode=abort.
-    sleep_call_timeout_s: 45
-    # HTTP timeout of the other vLLM probes of a sleep (/metrics, /version,
-    # /is_sleeping). Targets are probed and committed in parallel.
-    probe_timeout_s: 5
-    # Allowance for Redis / Kubernetes calls in the worst-case call duration.
-    io_margin_s: 5
-    # After /sleep, wait this long for /is_sleeping to report true. Still unknown
-    # then: the pod stays hidden, the journal entry stays, the audit reports it.
-    physical_confirm_timeout_s: 15
-    # auto: probe GET /version per pod and send mode=wait|abort only to vLLM
-    # versions that accept it (>= 0.18); true/false force it. Without it the SM
-    # drains fully before a plain /sleep.
+    # HTTP timeout of the ONE /sleep call (weight offload, measured 1-3 s). No
+    # answer in time: the pod stays hidden, its journal entry is marked
+    # sleep_unconfirmed, the lock is released at once and the journal recovery
+    # settles it from the physical state (no second call).
+    sleep_call_timeout_s: 10
+    # HTTP timeout of every other vLLM probe (/metrics, /version, /is_sleeping,
+    # /is_paused, /resume, the wake gate's resident probes). No answer reads as
+    # "unknown", which every caller treats fail-closed. Targets are probed in
+    # parallel.
+    probe_timeout_s: 2
+    # Allowance for Redis / Kubernetes calls in the worst-case lock hold.
+    io_margin_s: 2
+    # After /sleep, wait this long for /is_sleeping to report true. Not confirmed
+    # then: the pod stays hidden (sleep_unconfirmed), the audit reports it and
+    # the journal recovery settles it.
+    physical_confirm_timeout_s: 8
+    # auto: probe GET /version per pod and send mode=abort|wait only to vLLM
+    # versions that accept it (>= 0.18); true/false force it. Without it a sleep
+    # with requests in flight is rolled back (false: a plain /sleep is sent).
     vllm_sleep_mode_param: auto
-    # Absolute drain cap. null = gateway.route_timeout_s (may not exceed it).
+    # Mode of the /sleep when the load read shows nothing in flight: abort (a
+    # sleep interrupts) or wait (opt-in). With requests in flight: always abort;
+    # the reissue sidecar continues what it can.
+    sleep_mode_when_idle: abort
+    # Deprecated and ignored (2026-10-02: no drain, no sleep reservation); still
+    # parsed so older registries keep loading.
     hard_cap_s: null
-    # TTL of the per-binding reservation that fences a draining binding while the
-    # drain runs outside the writer lock (renewed every poll and during the
-    # commit). Must exceed commit-lock wait + poll_interval_s + probe_timeout_s +
-    # io_margin_s (validated); a lost reservation rolls the sleep back.
     reservation_ttl_s: 30
     # Plugin instances that must ack = advancing heartbeats UNION Ready pods
     # matching this selector: a plugin with Redis trouble may still route while
@@ -485,18 +499,11 @@ service_manager:
     gateway_plugin_pods:
       namespace: tre-v2
       label_selector: app=tre-gateway-plugins
-    # Soft drain budget per sleep path (s); null = only the hard cap. Past the soft
-    # budget the SM aborts requests the gateway knows are continuable (counted as
-    # forced aborts). It never aborts while the drain state is unknown (read
-    # errors, metrics unavailable) or while non-continuable requests remain: it
-    # keeps waiting up to the hard cap and then rolls the hide back. A caller may
-    # pass its own budget (drain_budget_s), e.g. the SafeScale commit passes its
-    # probe window. Paths: safescale_commit, urgent (fast-loop *_immediate donors),
-    # scale_down (manual binding power / TRE without SafeScale), apa (APA via
-    # /scale_service), defrag, repair, startup, default.
-    # Budgets apply only to paths NOT listed in no_drain_paths.
-    # apa (default null) is not spelled out below: service-manager / controller / UI
-    # images before 2026-09-29 reject an unknown budgets_s path at start.
+    # Deprecated and ignored (2026-10-02: the service-manager never drains on any
+    # path): the former soft drain budgets per sleep path and the no-drain paths.
+    # Still parsed (the controller reads budgets_s.safescale_commit for its own
+    # probe window); apa is not spelled out: images before 2026-09-29 reject an
+    # unknown budgets_s path at start.
     budgets_s:
       safescale_commit: null
       urgent: 30
@@ -505,17 +512,13 @@ service_manager:
       repair: 30
       startup: 30
       default: 30
-    # Paths that do not drain (v1 / paper semantics, 2026-09-29): hide -> gateway
-    # ack -> /sleep mode=abort at once; budgets_s and the caller's drain_budget_s
-    # are ignored. The SafeScale probe window (pod already hidden) is the only drain
-    # of a TRE scale-down; fast-loop donors and APA release at once. Continuable
-    # requests are continued by the reissue sidecar; non-continuable ones (and
-    # requests whose state cannot be read) are cut off, never waited for and never
-    # rolled back - counted in the sleep outcome (aborted) and the SM stats
-    # (no_drain_*). [] = every path drains as above (pre-2026-09-29 behaviour).
     no_drain_paths: [safescale_commit, urgent, apa]
   wake:
-    # Wake gate (after the account: store, GPU leases, sleep reservations). A
+    # HTTP timeout of ONE /wake_up call (single attempt, measured 1.5-3 s). No
+    # answer in time: the wake stays journaled (with its GPU lease) and the
+    # journal recovery rechecks it after transport_recheck_s; the lock is released.
+    call_timeout_s: 10
+    # Wake gate (after the account: store, GPU leases, journaled wakes). A
     # gpu-truth sample within its Redis TTL is used as is (no wait), unless it
     # predates this SM's last power change on the GPU (a sleep commit, a wake, a
     # start). Trusted: every target GPU must be at or below this fraction of its
@@ -534,7 +537,7 @@ service_manager:
     # 2026-09-30 (uncomment once every component runs that release): a wake the
     # journal recovery cannot read (/is_sleeping unknown) is kept this many
     # supervisor passes, then rolled back with an alert (at once when its pod is
-    # not Ready); a /wake_up that timed out keeps its waking lease and journal
+    # not Ready); a /wake_up that timed out keeps its GPU lease and journal
     # entry and is rechecked after transport_recheck_s.
     # recovery_unknown_attempts: 12
     # transport_recheck_s: 30

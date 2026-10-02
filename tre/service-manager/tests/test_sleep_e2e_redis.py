@@ -1,8 +1,8 @@
 """End-to-end sleep primitive against a REAL Redis, a fake gateway plugin and a fake
 vLLM HTTP server (plan 2026-09-27 D1-D4, integration of the SM and gateway branches).
 
-What is real here: redis-py against a real Redis server (the reservation Lua script,
-the journal / stats hashes, the gateway contract keys), the SM's ``VllmOps`` over
+What is real here: redis-py against a real Redis server (the journal / stats
+hashes, the gateway contract keys), the SM's ``VllmOps`` over
 HTTP, ``GatewayState`` with the real monotonic clock. What is fake: k8s (the
 ``FakeRuntime`` pod patches), the gateway plugin (a thread that mimics the Go plugin
 in pkg/plugins/gateway/tre_transparent_sleep.go: heartbeat ZSET score = epoch ms,
@@ -36,7 +36,6 @@ from tre_sm.ops.sleep_primitive import (
     SleepTarget,
 )
 from tre_sm.ops.vllm_ops import VllmOps
-from tre_sm.state.sleep_reservations import SleepReservations
 
 from sm_test_fakes import FakeRuntime, binding_of, pod, policy
 
@@ -257,7 +256,6 @@ def _primitive(redis, runtime, **overrides) -> SleepPrimitive:
         sleep_call_timeout_s=5.0,
         physical_confirm_timeout_s=3.0,
         vllm_sleep_mode_param="auto",  # probes GET /version over HTTP
-        hard_cap_s=10.0,
     )
     base.update(overrides)
     return SleepPrimitive(
@@ -266,7 +264,6 @@ def _primitive(redis, runtime, **overrides) -> SleepPrimitive:
         policy=policy(**base),
         gateway=GatewayState(redis),
         journal=SleepJournal(redis),
-        reservations=SleepReservations(redis),
         # Real time (conftest swaps DEFAULT_CLOCK for a virtual one): the plugin and
         # engine here are threads that only make progress in wall time.
         clock=sp.Clock(),
@@ -288,48 +285,34 @@ def _hash_json(redis, key):
 
 
 # --------------------------------------------------------------------------- tests
-def test_hide_ack_drain_sleep_ordering_over_real_redis_and_http(world):
+def test_hide_ack_and_one_abort_sleep_ordering_over_real_redis_and_http(world):
+    """Whole-lock (2026-10-02): no drain - right after the plugin acked the hide,
+    ONE /sleep mode=abort cuts the requests in flight (the sidecar continues
+    them); the outcome counts them."""
     redis, runtime, engine, events, target = world
     engine.running = 2
     with FakePlugin(redis, runtime, events, ack_delay_s=0.3) as plugin:
         plugin.set_inflight(2)
         time.sleep(0.3)  # a few heartbeats: the SM must see the score ADVANCE
-
-        def finish_requests():
-            # both requests end ~0.8 s after the plugin acked the hide
-            deadline = time.monotonic() + 5
-            while time.monotonic() < deadline:
-                if any(e[0] == "gw_ack" and e[3] is False for e in events.kinds()):
-                    break
-                time.sleep(0.02)
-            time.sleep(0.8)
-            engine.running = 0
-            plugin.set_inflight(0)
-
-        finisher = threading.Thread(target=finish_requests, daemon=True)
-        finisher.start()
         [outcome] = _primitive(redis, runtime).sleep([target], path="scale_down")
-        finisher.join(timeout=5)
 
     hide = events.index(lambda e: e[:3] == ("patch", POD, "hidden"))
     hidden_gen = events.kinds()[hide][3]
     ack = events.index(lambda e: e[0] == "gw_ack" and e[2] == hidden_gen and e[3] is False)
-    drained = events.index(lambda e: e == ("gw_inflight", 0, 0))
     slept = events.index(lambda e: e[0] == "vllm_sleep")
     committed = events.index(lambda e: e[:3] == ("patch", POD, "sleeping"))
-    assert hide < ack < drained < slept < committed, events.kinds()
+    assert hide < ack < slept < committed, events.kinds()
 
-    assert engine.sleep_calls == [{"mode": "wait", "hidden": "1", "running": 0}]
+    assert engine.sleep_calls == [{"mode": "abort", "hidden": "1", "running": 2}]
     assert engine.sleeping is True
     assert outcome["ack_mode"] == "plugin"
-    assert outcome["drained"] is True and outcome["forced_abort"] is False
+    assert outcome["forced_abort"] is True and outcome["forced_abort_requests"] == 2
     assert outcome["ack_latency_ms"] >= 250  # waited for the (delayed) plugin ack
-    # SM state in real Redis: counters, ack latency, journal and reservation cleared.
+    # SM state in real Redis: counters, ack latency, journal cleared.
     stats = {k.decode(): int(v) for k, v in redis.hgetall(rediskeys.SM_SLEEP_STATS_KEY).items()}
     assert stats.get("sleeps_total") == 1 and "rollback_total" not in stats
     assert redis.llen(rediskeys.SM_SLEEP_ACK_LATENCY_KEY) == 1
     assert redis.hlen(rediskeys.SM_SLEEP_OPS_KEY) == 0
-    assert redis.hlen(rediskeys.SM_SLEEP_RESERVATIONS_KEY) == 0
     # The plugin's contract keys as the SM read them (Go field names).
     assert _hash_json(redis, rediskeys.gw_seen_key(POD))[INSTANCE]["gen"] >= hidden_gen
     assert set(_hash_json(redis, rediskeys.gw_inflight_key(POD))[INSTANCE]) == {"total", "non_continuable", "ts"}
@@ -349,27 +332,3 @@ def test_missing_plugin_ack_rolls_back_without_touching_the_engine(world):
     stats = {k.decode(): int(v) for k, v in redis.hgetall(rediskeys.SM_SLEEP_STATS_KEY).items()}
     assert stats.get("ack_timeout_total") == 1 and stats.get("rollback_total") == 1
     assert redis.hlen(rediskeys.SM_SLEEP_OPS_KEY) == 0
-    assert redis.hlen(rediskeys.SM_SLEEP_RESERVATIONS_KEY) == 0
-
-
-def test_non_continuable_inflight_past_the_hard_cap_rolls_back(world):
-    redis, runtime, engine, events, target = world
-    engine.running = 1
-    with FakePlugin(redis, runtime, events, ack_delay_s=0.1) as plugin:
-        plugin.set_inflight(1, non_continuable=1)  # e.g. a beam-search request: never aborted
-        time.sleep(0.3)
-        with pytest.raises(SleepFailed):
-            _primitive(redis, runtime, hard_cap_s=1.5, budgets_s={"scale_down": 0.3}).sleep(
-                [target], path="scale_down"
-            )
-
-    kinds = events.kinds()
-    assert any(e[0] == "gw_ack" and e[3] is False for e in kinds)  # it was acked ...
-    patches = [e for e in kinds if e[0] == "patch"]
-    assert [p[2] for p in patches] == ["hidden", "awake"]  # ... but never slept
-    assert engine.sleep_calls == [] and engine.sleeping is False
-    stats = {k.decode(): int(v) for k, v in redis.hgetall(rediskeys.SM_SLEEP_STATS_KEY).items()}
-    assert stats.get("non_continuable_rollback_total") == 1
-    assert "forced_abort_total" not in stats
-    assert redis.hlen(rediskeys.SM_SLEEP_OPS_KEY) == 0
-    assert redis.hlen(rediskeys.SM_SLEEP_RESERVATIONS_KEY) == 0

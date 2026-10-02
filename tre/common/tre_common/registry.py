@@ -241,8 +241,9 @@ def gpu_memory_utilization(spec: Any) -> float:
 
 
 #: Sleep paths (plan 2026-09-27 D1): every caller that puts a binding to sleep names
-#: one; the service-manager looks up its soft drain budget in
-#: ``service_manager.sleep.budgets_s``.
+#: one (recorded with the outcome; replica-floor rules). The service-manager never
+#: drains on any path (2026-10-02), so ``service_manager.sleep.budgets_s`` keyed by
+#: them is ignored.
 SLEEP_PATHS = (
     "safescale_commit",  # SafeScale commit of a hidden probe pod
     "urgent",  # controller *_immediate donor paths (fast loop)
@@ -254,9 +255,13 @@ SLEEP_PATHS = (
     "default",  # any caller that names no path
 )
 
-#: Soft drain budgets (s). ``None`` = only the hard cap. Every drain is additionally
-#: capped by ``hard_cap_s``; requests the gateway marks non-continuable are always
-#: waited for up to the hard cap (never aborted at the soft budget).
+#: DEPRECATED (2026-10-02): the service-manager never drains - every sleep is
+#: hide -> gateway ack -> one load read -> /sleep, all under its writer lock
+#: (design docs/design/20261002-sm-wholelock.md). ``budgets_s``, ``no_drain_paths``,
+#: ``hard_cap_s`` and ``reservation_ttl_s`` still parse (live registries and the
+#: controller still carry them) but the service-manager ignores them and logs a
+#: deprecation line at start. Former meaning: soft drain budgets (s), ``None`` =
+#: only the hard cap.
 DEFAULT_SLEEP_BUDGETS_S: dict[str, float | None] = {
     # The caller passes the probe window as drain_budget_s; without one, hard cap.
     "safescale_commit": None,
@@ -281,12 +286,12 @@ DEFAULT_SLEEP_BUDGETS_S: dict[str, float | None] = {
 #: (the pod is already hidden while it runs) is the only drain of a TRE scale-down;
 #: the fast-loop donors (urgent) and APA scale-downs release at once. Maintenance
 #: paths (defrag, repair, startup, scale_down = manual binding power) keep draining.
-#: ``service_manager.sleep.no_drain_paths: []`` restores the draining behaviour.
+#: DEPRECATED (2026-10-02): every path is a no-drain path now; ignored.
 DEFAULT_NO_DRAIN_PATHS: tuple[str, ...] = ("safescale_commit", "urgent", "apa")
 
 #: Default ``gateway.route_timeout_s``: the gateway's per-request route timeout. The
 #: single source for the model HTTPRoute timeout (deploy/gen_model_manifests.py) and
-#: the service-manager drain hard cap (no request can outlive it anyway).
+#: the default of the deprecated (ignored) ``service_manager.sleep.hard_cap_s``.
 DEFAULT_ROUTE_TIMEOUT_S = 150.0
 
 #: Default ``gateway.upstream_idle_timeout_s``: how long the tre-v2 Envoy keeps an idle
@@ -776,13 +781,17 @@ class GatewayConfig:
 
 @dataclass(frozen=True)
 class SleepPolicy:
-    """How the service-manager puts a vLLM pod to sleep (plan D1-D4).
-
-    hide (routable=false + route-gen bump) -> gateway ack -> drain -> /sleep.
+    """How the service-manager puts a vLLM pod to sleep (plan D1-D4; whole-lock
+    since 2026-10-02): hide (routable=false + route-gen bump) -> gateway ack ->
+    one load read -> one /sleep -> physical confirmation, all under the writer
+    lock. The timeouts below bound how long one sleep holds that lock
+    (:meth:`ServiceManagerConfig.worst_case_sleep_lock_s`).
     """
 
-    #: Max wait for every live gateway plugin instance to ack the hide.
-    ack_timeout_s: float = 10.0
+    #: Max wait for every live gateway plugin instance to ack the hide. The ack
+    #: is measured at 7-15 ms; 5 s leaves room for a slow informer and keeps the
+    #: lock hold short (a timeout rolls the hide back).
+    ack_timeout_s: float = 5.0
     #: A plugin instance is live while its heartbeat score keeps ADVANCING: the SM
     #: saw the score change within this many seconds of its own monotonic clock.
     #: The score is never compared with any wall clock (clock-skew proof).
@@ -799,27 +808,39 @@ class SleepPolicy:
     #: Grace delay of the opt-in no-plugin fallback, for informers to catch up.
     no_plugin_grace_s: float = 5.0
     poll_interval_s: float = 0.5
-    #: HTTP timeout of one /sleep call (weight offload). A mode=wait call that
-    #: fails is retried once with mode=abort, so a sleep spends up to 2x this.
-    sleep_call_timeout_s: float = 45.0
+    #: HTTP timeout of the ONE /sleep call of a sleep (weight offload; measured
+    #: 1-3 s, 2026-10-02). There is no second call: a call without an answer in
+    #: this time leaves the pod hidden and its journal entry ``sleep_unconfirmed``
+    #: (the lock is released at once; the journal recovery settles it).
+    sleep_call_timeout_s: float = 10.0
     #: HTTP timeout of every other vLLM probe of a sleep (``GET /metrics``,
-    #: ``/version``, ``/is_sleeping``); part of the worst-case call duration.
-    probe_timeout_s: float = 5.0
-    #: Allowance for the Redis / Kubernetes calls of one sleep (patches, journal,
-    #: reservation renewals) in the worst-case call duration.
-    io_margin_s: float = 5.0
-    #: After /sleep returned, wait this long for /is_sleeping to report true.
-    physical_confirm_timeout_s: float = 15.0
+    #: ``/version``, ``/is_sleeping``, ``/is_paused``, ``/resume``) and of the wake
+    #: gate's resident probes. A probe without an answer reads "unknown", which
+    #: every caller treats fail-closed; part of the worst-case lock hold.
+    probe_timeout_s: float = 2.0
+    #: Allowance for the Redis / Kubernetes calls of one sleep (patches, journal)
+    #: in the worst-case lock hold.
+    io_margin_s: float = 2.0
+    #: After /sleep returned, wait this long for /is_sleeping to report true; a
+    #: pod not confirmed by then stays hidden (``sleep_unconfirmed``).
+    physical_confirm_timeout_s: float = 8.0
     #: ``auto``: probe the pod's ``GET /version`` (cached per pod) and send
     #: ``mode=wait|abort`` on /sleep only to vLLM versions that accept it;
-    #: ``true`` / ``false`` force it. Without the mode parameter the SM drains
-    #: fully before a plain /sleep.
+    #: ``true`` / ``false`` force it. Without the mode parameter a sleep with
+    #: requests in flight is rolled back (``false``: a plain /sleep is sent).
     vllm_sleep_mode_param: str = "auto"
-    #: Absolute drain cap; defaults to (and may not exceed) gateway.route_timeout_s.
+    #: Mode of the /sleep sent when the load read shows nothing in flight:
+    #: ``abort`` (default, 2026-10-02: a sleep interrupts, draining is the
+    #: controller's job) or ``wait`` (opt-in). With requests in flight (or an
+    #: unknown load) it is always ``abort``: vLLM's mode=wait pauses new
+    #: scheduling and waits for the running queue, an HTTP timeout does not
+    #: cancel it, and the waiting queue stays frozen.
+    sleep_mode_when_idle: str = "abort"
+    #: DEPRECATED, ignored (2026-10-02: no drain). Parsed for compatibility;
+    #: defaults to gateway.route_timeout_s.
     hard_cap_s: float = DEFAULT_ROUTE_TIMEOUT_S
-    #: TTL of the per-binding sleep reservation that fences a draining binding
-    #: (and its GPUs) while the drain runs outside the writer lock. Renewed every
-    #: poll; the reservation of a dead owner expires after this long.
+    #: DEPRECATED, ignored (2026-10-02: no sleep reservation - every sleep holds
+    #: the writer lock from the hide to the bookkeeping). Parsed for compatibility.
     reservation_ttl_s: float = 30.0
     #: Gateway plugin pods that must ack, besides advancing heartbeats: a plugin
     #: with Redis trouble may still route while its heartbeat stalls, so Ready pods
@@ -829,17 +850,17 @@ class SleepPolicy:
     budgets_s: dict[str, float | None] = field(
         default_factory=lambda: dict(DEFAULT_SLEEP_BUDGETS_S)
     )
-    #: Paths that never drain (see DEFAULT_NO_DRAIN_PATHS); () = every path drains.
+    #: DEPRECATED, ignored (2026-10-02): see DEFAULT_NO_DRAIN_PATHS.
     no_drain_paths: tuple[str, ...] = DEFAULT_NO_DRAIN_PATHS
 
     def no_drain(self, path: str) -> bool:
-        """True when a sleep on ``path`` aborts everything in flight right after the
-        gateway ack (no drain, no rollback over in-flight requests)."""
+        """DEPRECATED (2026-10-02): what ``no_drain_paths`` configures. The
+        service-manager no longer reads it - it never drains on any path."""
         return path in self.no_drain_paths
 
     def soft_budget_s(self, path: str, requested_s: float | None = None) -> float:
-        """Soft drain budget of one sleep: 0 on a no-drain path (the caller's
-        budget is ignored), else the caller's budget, else the path's."""
+        """DEPRECATED (2026-10-02): the drain budget the old configuration would
+        give. The service-manager no longer reads it - it never drains."""
         if requested_s is not None:
             budget = float(requested_s)
             if not math.isfinite(budget) or budget < 0:
@@ -891,16 +912,22 @@ class ServiceManagerConfig:
     clock_skew_fail_s: float | None = None
     #: Only nodes in cluster.nodes can block a cold start with node pressure.
     pressure_registry_nodes_only: bool = True
-    #: A request that needs the SM writer lock waits up to this long for it (the
-    #: lock is held only for short phases; a drain runs outside it). Waiters are
-    #: served first-come first-served.
-    writer_lock_wait_s: float = 10.0
-    #: How long the commit phase of a drained sleep waits for the writer lock
-    #: (None = writer_lock_wait_s). The sleep reservation must outlive it.
+    #: A request that needs the SM writer lock waits up to this long for it, then
+    #: gets 409 ``writer_busy``. Every write holds the lock from start to end
+    #: (whole-lock, 2026-10-02): 30 s queue behind at least one worst-case sleep
+    #: (:meth:`worst_case_sleep_lock_s`) or several ordinary 2-5 s operations.
+    #: Waiters are served first-come first-served.
+    writer_lock_wait_s: float = 30.0
+    #: DEPRECATED, ignored (2026-10-02: a sleep has no separate commit phase).
     commit_lock_wait_s: float | None = None
+    #: ``service_manager.wake.call_timeout_s``: HTTP timeout of one /wake_up call
+    #: (single attempt; measured 1.5-3 s). A call without an answer leaves the
+    #: wake journaled (the engine may still wake) for the journal recovery.
+    wake_call_timeout_s: float = 10.0
     #: Timeout clients (the controller) use for slow SM calls (scale / binding
-    #: power / defrag). Must exceed :meth:`worst_case_sleep_call_s`; the controller
-    #: uses it unless TRE_SM_SLOW_TIMEOUT_SECONDS overrides it (validated too).
+    #: power / transfer / defrag). Must exceed :meth:`worst_case_sleep_call_s`
+    #: (lock wait + worst-case lock hold); the controller uses it unless
+    #: TRE_SM_SLOW_TIMEOUT_SECONDS overrides it (validated too).
     api_call_timeout_s: float = 360.0
     #: Level of the tre_sm / tre_common loggers (a logging level name); the
     #: TRE_SM_LOG_LEVEL environment variable overrides it.
@@ -949,62 +976,78 @@ class ServiceManagerConfig:
     #: dropped first; running ones are never dropped).
     operations_max_records: int = 20000
 
-    @property
-    def commit_wait_s(self) -> float:
-        return self.writer_lock_wait_s if self.commit_lock_wait_s is None else self.commit_lock_wait_s
-
-    def worst_case_commit_s(self) -> float:
-        """The commit phase once it holds the lock (targets are committed in
-        parallel - sends, confirmation rounds and rollback probes alike - so this
-        does not grow with the number of targets):
-
-        * send, per target: ``/version`` probe + /sleep mode=wait +
-          ``/is_sleeping`` + ``/metrics`` re-read + /sleep mode=abort +
-          ``/is_sleeping``, and a failed send's rollback re-probes
-          ``/is_sleeping`` once (5 probes + 2 sleeps);
-        * confirmation: ``physical_confirm_timeout_s``, overshot by one poll
-          interval and one probe round, then the rollback of a pod that never
-          converged re-probes it once (review 3 P3: the rollback probe and the
-          final-round overshoot were not counted before)."""
+    def worst_case_sleep_lock_s(self) -> float:
+        """Longest writer-lock hold of ONE sleep call, any number of targets (they
+        run every step in parallel): gateway ack (``ack_timeout_s``) + the load /
+        ``/version`` probe round (``probe_timeout_s``) + the one /sleep
+        (``sleep_call_timeout_s``; no answer = unconfirmed, nothing else) + the
+        longer of the physical confirmation (``physical_confirm_timeout_s`` plus
+        its last probe round) and the rollback of a failed /sleep
+        (``/is_sleeping``, ``/is_paused``, ``/resume``, ``/is_paused``: 4 probes)
+        + the Redis / Kubernetes allowance (``io_margin_s``). Defaults:
+        5 + 2 + 10 + max(8 + 2, 8) + 2 = 29 s."""
         sleep = self.sleep
-        send = 5 * sleep.probe_timeout_s + 2 * sleep.sleep_call_timeout_s
-        confirm = (
-            sleep.physical_confirm_timeout_s
-            + sleep.poll_interval_s
-            + 2 * sleep.probe_timeout_s
+        after_call = max(
+            sleep.physical_confirm_timeout_s + sleep.probe_timeout_s,
+            4 * sleep.probe_timeout_s,
         )
-        return send + confirm
-
-    def worst_case_drain_s(self) -> float:
-        """Gateway ack + drain up to the hard cap + the last poll round (engine
-        metrics of every target read in parallel, so one probe timeout)."""
-        sleep = self.sleep
-        return sleep.ack_timeout_s + sleep.hard_cap_s + sleep.probe_timeout_s
-
-    def worst_case_sleep_call_s(self) -> float:
-        """Upper bound of one sleeping SM call, for any number of targets:
-        writer-lock wait (hide phase) + drain + commit-lock wait + commit +
-        the Redis / Kubernetes allowance."""
         return (
-            self.writer_lock_wait_s
-            + self.worst_case_drain_s()
-            + self.commit_wait_s
-            + self.worst_case_commit_s()
-            + self.sleep.io_margin_s
-        )
-
-    def shutdown_timeout_s(self) -> float:
-        """How long SIGTERM waits for sleeps in progress: a drain rolls back at its
-        next poll (after at most one poll round, or once its commit-lock wait
-        ends), a commit already past /sleep finishes."""
-        sleep = self.sleep
-        return (
-            self.commit_wait_s
-            + self.worst_case_commit_s()
-            + sleep.poll_interval_s
+            sleep.ack_timeout_s
             + sleep.probe_timeout_s
+            + sleep.sleep_call_timeout_s
+            + after_call
             + sleep.io_margin_s
         )
+
+    def worst_case_wake_lock_s(self) -> float:
+        """Longest writer-lock hold of ONE wake call, any number of bindings (their
+        /wake_up run in parallel): the wake gate's resident probes (one parallel
+        round) + /wake_up (``wake_call_timeout_s``) + the /is_sleeping
+        convergence probe + a failed wake's settlement probe and compensating
+        sleep (:meth:`worst_case_sleep_lock_s`) + ``io_margin_s``. Defaults:
+        2 + 10 + 2 + 2 + 29 + 2 = 47 s; without a compensating sleep 18 s."""
+        sleep = self.sleep
+        return (
+            sleep.probe_timeout_s
+            + self.wake_call_timeout_s
+            + 2 * sleep.probe_timeout_s
+            + self.worst_case_sleep_lock_s()
+            + sleep.io_margin_s
+        )
+
+    def worst_case_transfer_lock_s(self) -> float:
+        """Longest writer-lock hold of one ``POST /v2/transfers``: the selection's
+        resident probe of the pair taken + the donors' sleep + the receivers'
+        wake. Defaults: 2 + 29 + 47 = 78 s (both failure paths at their bound)."""
+        return (
+            self.sleep.probe_timeout_s
+            + self.worst_case_sleep_lock_s()
+            + self.worst_case_wake_lock_s()
+        )
+
+    def worst_case_lock_hold_s(self) -> float:
+        """Longest writer-lock hold of any one API-timed service-manager call (a
+        transfer; a sleep or a wake alone holds it for less). Cold starts,
+        defrag and fleet repair hold it longer by design (a pod start) and are
+        not part of the controller's planning loop."""
+        return max(
+            self.worst_case_sleep_lock_s(),
+            self.worst_case_wake_lock_s(),
+            self.worst_case_transfer_lock_s(),
+        )
+
+    def worst_case_sleep_call_s(self) -> float:
+        """Upper bound of one sleeping / waking / transfer SM call as its client
+        sees it: the wait for the writer lock (``writer_lock_wait_s``, then 409
+        writer_busy) + the longest lock hold + ``io_margin_s``. Defaults:
+        30 + 78 + 2 = 110 s."""
+        return self.writer_lock_wait_s + self.worst_case_lock_hold_s() + self.sleep.io_margin_s
+
+    def shutdown_timeout_s(self) -> float:
+        """How long SIGTERM waits for the operation holding the writer lock: a
+        sleep waiting for its gateway ack rolls back at its next poll, anything
+        past /sleep or /wake_up finishes - at most the longest lock hold."""
+        return self.worst_case_lock_hold_s() + self.sleep.io_margin_s
 
     def wake_limit_mib(self, total_mib: int | None) -> int | None:
         """Max used MiB for a wake on a GPU of ``total_mib`` (None = unknown)."""
@@ -1545,6 +1588,9 @@ def parse_service_manager_config(
         vllm_sleep_mode_param=parse_sleep_mode_param(
             sleep_raw.get("vllm_sleep_mode_param", defaults.vllm_sleep_mode_param)
         ),
+        sleep_mode_when_idle=str(
+            sleep_raw.get("sleep_mode_when_idle", defaults.sleep_mode_when_idle)
+        ).strip().lower(),
         hard_cap_s=float(DEFAULT_ROUTE_TIMEOUT_S if hard_cap is None else hard_cap),
         reservation_ttl_s=_num(sleep_raw, "reservation_ttl_s", defaults.reservation_ttl_s),
         budgets_s=budgets,
@@ -1574,6 +1620,7 @@ def parse_service_manager_config(
         commit_lock_wait_s=(
             None if raw.get("commit_lock_wait_s") is None else float(raw["commit_lock_wait_s"])
         ),
+        wake_call_timeout_s=_num(wake_raw, "call_timeout_s", base.wake_call_timeout_s),
         api_call_timeout_s=_num(raw, "api_call_timeout_s", base.api_call_timeout_s),
         log_level=(
             base.log_level if raw.get("log_level") is None else str(raw["log_level"]).strip().upper()
@@ -1661,8 +1708,6 @@ def _validate_service_manager(
         "poll_interval_s",
         "sleep_call_timeout_s",
         "physical_confirm_timeout_s",
-        "hard_cap_s",
-        "reservation_ttl_s",
         "probe_timeout_s",
     ):
         value = float(getattr(sleep, name))
@@ -1679,24 +1724,10 @@ def _validate_service_manager(
             "service_manager.sleep.vllm_sleep_mode_param must be one of "
             f"{', '.join(SLEEP_MODE_PARAM_CHOICES)}"
         )
-    if sleep.reservation_ttl_s <= 2 * sleep.poll_interval_s:
-        errors.append(
-            "service_manager.sleep.reservation_ttl_s must exceed 2 x poll_interval_s "
-            "(the reservation is renewed once per poll)"
-        )
-    # Review 2 P2-1: the longest gap between two renewals is the last drain poll
-    # round (every target's engine metrics, read in parallel) followed by the wait
-    # for the commit-phase writer lock; the reservation must survive it, or the
-    # commit finds it lost and rolls back.
-    renew_gap = (
-        config.commit_wait_s + sleep.poll_interval_s + sleep.probe_timeout_s + sleep.io_margin_s
-    )
-    if sleep.reservation_ttl_s <= renew_gap:
-        errors.append(
-            f"service_manager.sleep.reservation_ttl_s ({sleep.reservation_ttl_s:g}) must "
-            f"exceed the longest renewal gap {renew_gap:g}s (commit-lock wait + "
-            "poll_interval_s + probe_timeout_s + io_margin_s)"
-        )
+    if sleep.sleep_mode_when_idle not in ("abort", "wait"):
+        errors.append("service_manager.sleep.sleep_mode_when_idle must be abort or wait")
+    if not math.isfinite(config.wake_call_timeout_s) or config.wake_call_timeout_s <= 0:
+        errors.append("service_manager.wake.call_timeout_s must be positive")
     for path, value in sleep.budgets_s.items():
         if path not in SLEEP_PATHS:
             errors.append(f"service_manager.sleep.budgets_s: unknown sleep path {path}")
@@ -1708,12 +1739,8 @@ def _validate_service_manager(
     if gateway is not None:
         if not math.isfinite(gateway.route_timeout_s) or gateway.route_timeout_s <= 0:
             errors.append("gateway.route_timeout_s must be positive")
-        elif sleep.hard_cap_s > gateway.route_timeout_s:
-            errors.append(
-                f"service_manager.sleep.hard_cap_s ({sleep.hard_cap_s:g}) must not exceed "
-                f"gateway.route_timeout_s ({gateway.route_timeout_s:g}): no request "
-                "outlives the route timeout"
-            )
+        # sleep.hard_cap_s is no longer checked against the route timeout: it is
+        # deprecated and ignored (2026-10-02, the service-manager never drains).
     if not (0.0 < config.wake_max_used_fraction <= 1.0):
         errors.append("service_manager.wake.max_used_fraction must be in (0, 1]")
     if config.wake_max_used_mib is not None and config.wake_max_used_mib <= 0:
@@ -1730,8 +1757,6 @@ def _validate_service_manager(
         errors.append("service_manager.clock_skew.fail_s must be positive or null")
     if config.writer_lock_wait_s < 0:
         errors.append("service_manager.writer_lock_wait_s must be >= 0")
-    if config.commit_lock_wait_s is not None and config.commit_lock_wait_s < 0:
-        errors.append("service_manager.commit_lock_wait_s must be >= 0 or null")
     if config.log_level not in LOG_LEVEL_NAMES:
         errors.append(
             f"service_manager.log_level must be one of {', '.join(LOG_LEVEL_NAMES)}, "
@@ -1750,12 +1775,12 @@ def sleep_call_timeout_errors(
     if worst < call_timeout_s:
         return []
     return [
-        f"worst-case sleeping service-manager call is {worst:g}s (writer_lock_wait_s + "
-        "sleep.ack_timeout_s + sleep.hard_cap_s + commit-lock wait + 2 x "
-        "sleep.sleep_call_timeout_s + 8 x sleep.probe_timeout_s + "
-        "sleep.physical_confirm_timeout_s + sleep.poll_interval_s + "
+        f"worst-case service-manager call is {worst:g}s (writer_lock_wait_s + the longest "
+        "writer-lock hold, a transfer: its donors' sleep - sleep.ack_timeout_s + "
+        "sleep.sleep_call_timeout_s + sleep.physical_confirm_timeout_s + probes - and its "
+        "receivers' wake - wake.call_timeout_s + probes + a compensating sleep - + "
         "sleep.io_margin_s), not below "
-        f"{name} = {call_timeout_s:g}s: the caller would time out mid-drain"
+        f"{name} = {call_timeout_s:g}s: the caller would time out mid-operation"
     ]
 
 

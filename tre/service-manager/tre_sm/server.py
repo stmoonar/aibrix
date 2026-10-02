@@ -14,7 +14,7 @@ from tre_sm.app import create_service_app
 from tre_sm.clock_check import check_clock_skew
 from tre_sm.gpu_truth import RedisGpuTruth
 from tre_sm.ops.k8s_ops import K8sOps
-from tre_sm.ops.sleep_primitive import GatewayState, SleepJournal
+from tre_sm.ops.sleep_primitive import GatewayState, SleepJournal, log_ignored_drain_settings
 from tre_sm.ops.vllm_ops import VllmOps
 from tre_sm.state.reconcile import PodRecord
 from tre_sm.state.operations import OperationCoordinator
@@ -101,6 +101,9 @@ def create_app() -> FastAPI:
     redis_url = os.environ.get("TRE_REDIS_URL", "redis://aibrix-redis-master:6379/0")
     redis_client = redis.Redis.from_url(redis_url)
     sm_config = registry.service_manager()
+    # 2026-10-02: the SM never drains and has no sleep reservation; those
+    # settings parse but are ignored.
+    log_ignored_drain_settings(sm_config.sleep, LOG)
     check_clock_skew(
         redis_client,
         warn_s=sm_config.clock_skew_warn_s,
@@ -113,9 +116,13 @@ def create_app() -> FastAPI:
         lease_ttl_ms=int(os.environ.get("TRE_SM_WRITER_LEASE_TTL_MS", "30000")),
         max_records=sm_config.operations_max_records,
     )
-    # Every vLLM probe of a sleep uses the registry's probe timeout: it is part of
-    # the worst-case call duration the SM and the controller validate.
-    vllm_ops = VllmOps(timeout_s=sm_config.sleep.probe_timeout_s)
+    # Every vLLM probe uses the registry's probe timeout and /wake_up its own
+    # (one attempt): both bound the writer-lock hold the SM and the controller
+    # validate (ServiceManagerConfig.worst_case_*).
+    vllm_ops = VllmOps(
+        timeout_s=sm_config.sleep.probe_timeout_s,
+        wake_timeout_s=sm_config.wake_call_timeout_s,
+    )
     legacy_store = StateStore(redis_client, require_fence=True)
     fleet_store = FleetStateStore(redis_client)
     gpu_leases = GpuLeaseStore(redis_client)
@@ -159,8 +166,8 @@ def create_app() -> FastAPI:
         gpu_leases.rebuild_awake(
             legacy_store.load().bindings,
             starting_bindings=starting_bindings + restart_placeholders,
-            # Wakes a dead SM left between its phases keep their GPUs until the
-            # journal recovery resolves them (review P2-3).
+            # Wakes a dead SM left journaled keep their GPUs until the journal
+            # recovery resolves them (review P2-3).
             waking_bindings=waking_bindings,
         )
     safety_gate = ClusterSafetyGate(

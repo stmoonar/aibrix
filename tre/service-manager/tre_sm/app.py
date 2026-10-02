@@ -92,10 +92,10 @@ def install_lifecycle(app: FastAPI, service: ServiceManagerV2) -> None:
     """Startup: resolve sleep journal entries a dead SM left behind (review P1-2)
     and chain a SIGTERM hook. Shutdown: wait (bounded) for sleeps to finish.
 
-    On SIGTERM the hook stops new sleeps at once and makes every drain that has
-    not reached /sleep roll back at its next poll, so uvicorn's graceful shutdown
-    (which waits for in-flight requests) is not held up by minutes of draining.
-    The Deployment's terminationGracePeriodSeconds must cover the rest (see the
+    On SIGTERM the hook stops new sleeps at once and makes a sleep waiting for
+    its gateway ack roll back at its next poll; an operation past /sleep or
+    /wake_up finishes (at most ``shutdown_timeout_s``, the longest writer-lock
+    hold). The Deployment's terminationGracePeriodSeconds must cover it (see the
     tre-v2 overlay).
     """
 
@@ -105,8 +105,8 @@ def install_lifecycle(app: FastAPI, service: ServiceManagerV2) -> None:
         except Exception:  # the supervisor retries; the audit shows what is left
             LOG.exception("sleep journal recovery at startup failed")
         try:
-            # S6: wakes a dead SM left between its phases (the lease rebuild at
-            # bootstrap dropped their waking leases; the journal still has them).
+            # Wakes a dead SM left journaled (the lease rebuild at bootstrap kept
+            # their GPUs; the physical state decides).
             service.recover_wake_journal()
         except Exception:  # the supervisor retries
             LOG.exception("wake journal recovery at startup failed")

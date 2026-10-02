@@ -1,9 +1,11 @@
-"""Review 2 of the transparent-sleep service-manager.
+"""Review 2 of the transparent-sleep service-manager, as it stands after the
+whole-lock SM (2026-10-02: no sleep reservation, no phase outside the writer
+lock).
 
-P1-2 sleeps sharing a GPU, P1-3 seeding trust, P2-1 lost reservations are never
-re-acquired, P2-2 time budget with many targets, P2-3 desired state follows the
-outcome, P2-4 startup paths drain outside the writer lock, P3 recovery / TOCTOU /
-per-pod convergence.
+P1-3 seeding trust, P2-2 time budget with many targets, P2-3 desired state
+follows the outcome, P2-4 startup paths sleep under one writer-lock hold, P3
+recovery / TOCTOU / per-pod convergence. Also the shared ``World`` of many SM
+tests.
 """
 
 from datetime import datetime, timezone
@@ -15,14 +17,12 @@ import pytest
 from tre_sm.api.v2 import RetryLater, ServiceManagerV2, WakeConflict
 from tre_sm.ops.sleep_primitive import (
     GatewayState,
-    ReservationLost,
     SleepJournal,
     SleepPrimitive,
     SleepTarget,
 )
 from tre_sm.state.fleet_seed import seed_desired
 from tre_sm.state.fleet_store import DesiredBinding, FleetStateStore
-from tre_sm.state.sleep_reservations import ReservationConflict, SleepReservations
 from tre_sm.state.store import StateStore
 
 from sm_test_fakes import (
@@ -41,9 +41,9 @@ from sm_test_fakes import (
     pod,
     policy,
     registry,
+    StrictCoordinator,
     startup_pod,
 )
-from test_sleep_lock_phases import StrictCoordinator
 
 
 def _desired(binding_id, model, gpus, power, hidden=False):
@@ -84,7 +84,6 @@ class World:
             gpu_leases=self.leases,
             gateway_state=GatewayState(self.redis, monotonic=lambda: self.clock.monotonic()),
             sleep_journal=SleepJournal(self.redis),
-            sleep_reservations=SleepReservations(self.redis),
             sleep_clock=self.clock,
         )
 
@@ -110,132 +109,6 @@ def _two_pods():
 
 def _two_desired():
     return [_desired("m1/node-a/0", "m1", (0,), "awake"), _desired("m1/node-a/1", "m1", (1,), "sleeping")]
-
-
-# ------------------------------------------------------------------ P1-2
-def test_two_bindings_sharing_a_gpu_sleep_concurrently_but_wakes_there_are_fenced():
-    world = World(
-        [
-            pod("pod-a", "m1", (0,), ip="10.0.0.1"),
-            pod("pod-t", "tp2", (0, 1), ip="10.0.0.5"),
-            pod("pod-b", "m1", (1,), ip="10.0.0.2", state="sleeping"),
-        ],
-        [_desired("m1/node-a/0", "m1", (0,), "awake"), _desired("tp2/node-a/0,1", "tp2", (0, 1), "awake"),
-         _desired("m1/node-a/1", "m1", (1,), "sleeping")],
-    )
-    primitive = world.primitive
-    target = lambda name: SleepTarget(binding_of(world.runtime.snapshots[name]), world.runtime.snapshots[name].pod_ip)
-
-    first = primitive.prepare([target("pod-a")], path="scale_down")
-    second = primitive.prepare([target("pod-t")], path="scale_down")  # same GPU 0: allowed
-
-    assert set(primitive.reservations.active()) == {"m1/node-a/0", "tp2/node-a/0,1"}
-    # A wake on an overlapping GPU still needs the GPU: refused while they drain.
-    sleeping_b = binding_of(world.runtime.snapshots["pod-b"])
-    with pytest.raises(ReservationConflict):
-        world.service._apply_runtime_power_action(sleeping_b, action="wake")
-    assert not any(call[0] == "wake_up" for call in world.vllm.calls)
-    # A second sleep of the SAME binding is still refused.
-    with pytest.raises(ReservationConflict):
-        primitive.prepare([target("pod-a")], path="scale_down")
-
-    for batch in (first, second):
-        primitive.drain(batch)
-    assert [o["status"] for o in primitive.commit(first) + primitive.commit(second)] == ["slept", "slept"]
-    assert world.vllm.sleeping["10.0.0.1"] and world.vllm.sleeping["10.0.0.5"]
-    assert primitive.reservations.active() == {}
-
-
-# ------------------------------------------------------------------ P2-1
-def test_expired_reservation_recovered_then_the_drain_rolls_back_without_reacquiring():
-    world = World(_two_pods(), _two_desired())
-    world.gateway.inflight("pod-a", "gw-1", total=1)  # keeps draining
-    seen = {}
-
-    def expire_then_recover(now):
-        if now < 1003 or seen:
-            return
-        world.redis.now_ms += 31_000  # a Redis stall: the reservation expired
-        seen["recovery"] = world.service.recover_sleep_journal()
-        seen["state"] = world.state("pod-a")
-
-    world.hooks.append(expire_then_recover)
-
-    with pytest.raises(ReservationLost) as lost:
-        world.service.put_binding_power("pod-a", awake=False)
-
-    assert seen["recovery"]["resolved"] == [{"serve_id": "pod-a", "result": "rolled_back_to_awake"}]
-    assert seen["state"] == "awake"
-    assert [o["status"] for o in lost.value.outcomes] == ["rolled_back"]
-    assert world.primitive.reservations.active() == {}  # never re-acquired
-    assert not any(call[0] == "sleep" for call in world.vllm.calls)
-    assert world.state("pod-a") == "awake"
-    assert world.desired()["m1/node-a/0"][0] == "awake"
-    assert "put_binding_power_reservation_lost" in world.coordinator.kinds
-    assert world.primitive.journal.stats()["reservation_lost_total"] == 1
-
-
-def test_a_binding_taken_over_after_expiry_is_left_to_its_new_owner():
-    world = World(_two_pods(), _two_desired())
-    world.gateway.inflight("pod-a", "gw-1", total=1)
-    other = {}
-
-    def expire_and_take_over(now):
-        if now < 1003 or other:
-            return
-        world.redis.now_ms += 31_000
-        binding = binding_of(world.runtime.snapshots["pod-a"])
-        other["token"] = world.primitive.reservations.acquire(
-            [binding], owner="sm-2", operation_id="op-2", ttl_s=300
-        )
-        world.primitive.journal.begin("pod-a", {"reservation_token": other["token"], "phase": "draining"})
-
-    world.hooks.append(expire_and_take_over)
-
-    with pytest.raises(ReservationLost) as lost:
-        world.service.put_binding_power("pod-a", awake=False)
-
-    assert [o["status"] for o in lost.value.outcomes] == ["reservation_lost"]
-    assert world.state("pod-a") == "hidden"  # the new owner's hide is untouched
-    assert world.primitive.journal.get("pod-a")["reservation_token"] == other["token"]
-    assert world.primitive.reservations.active()["m1/node-a/0"].owner == "sm-2"
-
-
-def test_monolithic_sleep_resolves_a_lost_reservation_itself():
-    world = World(_two_pods(), _two_desired())
-    world.gateway.inflight("pod-a", "gw-1", total=1)
-    world.hooks.append(lambda now: setattr(world.redis, "now_ms", world.redis.now_ms + 31_000) if 1003 <= now < 1003.6 else None)
-    snapshot = world.runtime.snapshots["pod-a"]
-
-    with pytest.raises(ReservationLost) as lost:
-        world.primitive.sleep([SleepTarget(binding_of(snapshot), snapshot.pod_ip)], path="repair")
-
-    assert [o["status"] for o in lost.value.outcomes] == ["rolled_back"]
-    assert world.state("pod-a") == "awake"
-    assert world.primitive.active_count() == 0
-
-
-def test_renewal_redis_error_rolls_back_and_leaves_desired_untouched():
-    world = World(_two_pods(), _two_desired())
-    world.gateway.inflight("pod-a", "gw-1", total=1)
-    original_eval = world.redis.eval
-    broken = {"on": False}
-
-    def flaky_eval(script, numkeys, *args):
-        if broken["on"]:
-            raise ConnectionError("redis down")
-        return original_eval(script, numkeys, *args)
-
-    world.redis.eval = flaky_eval
-    world.hooks.append(lambda now: broken.update(on=True) if now >= 1003 else None)
-
-    with pytest.raises(ConnectionError):
-        world.service.put_binding_power("pod-a", awake=False)
-
-    broken["on"] = False
-    assert world.state("pod-a") == "awake"
-    assert world.desired()["m1/node-a/0"][0] == "awake"
-    assert not any(call[0] == "sleep" for call in world.vllm.calls)
 
 
 # ------------------------------------------------------------------ P2-2
@@ -291,14 +164,13 @@ def _primitive_world(vllm, n, **policy_overrides):
         policy=policy(**policy_overrides),
         gateway=GatewayState(redis, monotonic=lambda: clock.monotonic()),
         journal=SleepJournal(redis),
-        reservations=SleepReservations(redis),
         clock=clock,
     )
     targets = [SleepTarget(binding_of(s), s.pod_ip) for s in snapshots]
     return primitive, targets, clock, hooks, gateway
 
 
-def test_many_targets_are_drained_and_committed_in_parallel():
+def test_many_targets_are_read_and_slept_in_parallel():
     vllm = SlowVllm(sleep_s=0.3, metrics_s=0.2)
     primitive, targets, _clock, _hooks, _gateway = _primitive_world(vllm, 4)
 
@@ -312,59 +184,16 @@ def test_many_targets_are_drained_and_committed_in_parallel():
     assert elapsed < 1.2
 
 
-def test_the_last_drain_round_is_decided_at_the_hard_cap():
-    vllm = FakeVllm()
-    primitive, targets, clock, _hooks, _gateway = _primitive_world(
-        vllm, 1, hard_cap_s=10.0, budgets_s={"scale_down": 5.0}
-    )
-    vllm.metrics_down.add("10.0.0.1")  # drain state unknown until the hard cap
-    original = vllm.metrics
-
-    def slow_metrics(pod_ip, *, port=None):
-        clock.now += 3.0  # every read costs 3 s of (virtual) probe time
-        return original(pod_ip, port=port)
-
-    vllm.metrics = slow_metrics
-    started = clock.monotonic()
-
-    with pytest.raises(Exception):
-        primitive.sleep(targets, path="scale_down")
-
-    [outcome] = primitive.recent()
-    assert outcome["status"] == "rolled_back"
-    # decided in the round that crossed the hard cap: no read after it
-    assert clock.monotonic() - started <= 10.0 + 3.0 + 1.0
-
-
-def test_commit_renews_the_reservation_while_slow_sleeps_run():
-    vllm = SlowVllm(sleep_s=0.35, metrics_s=0.0)
-    primitive, targets, _clock, _hooks, _gateway = _primitive_world(vllm, 2, poll_interval_s=0.1)
-    renewals = []
-    original = primitive.reservations.renew
-    primitive.reservations.renew = lambda ids, token, *, ttl_s: renewals.append(time.monotonic()) or original(ids, token, ttl_s=ttl_s)
-
-    batch = primitive.prepare(targets, path="scale_down")
-    primitive.drain(batch)
-    before = len(renewals)
-    primitive.commit(batch)
-
-    assert len(renewals) - before >= 3  # the commit start + rounds during the slow /sleep
-
-
 # ------------------------------------------------------------------ P2-3
-def test_binding_sleep_writes_desired_only_after_the_commit():
+def test_binding_sleep_writes_desired_only_after_the_sleep_is_confirmed():
     world = World(_two_pods(), _two_desired())
-    world.gateway.inflight("pod-a", "gw-1", total=1)
+    world.gateway.ack_after_polls = 2  # a few ack polls while the sleep runs
     during = []
-    world.hooks.append(
-        lambda now: during.append(world.desired()["m1/node-a/0"][0]) or (
-            world.gateway.inflight("pod-a", "gw-1", total=0) if now > 1003 else None
-        )
-    )
+    world.hooks.append(lambda now: during.append(world.desired()["m1/node-a/0"][0]))
 
     world.service.put_binding_power("pod-a", awake=False)
 
-    assert during and set(during) == {"awake"}  # never "sleeping" while it drained
+    assert during and set(during) == {"awake"}  # never "sleeping" before /sleep confirmed
     assert world.desired()["m1/node-a/0"] == ("sleeping", False, "resident")
 
 
@@ -496,39 +325,18 @@ def _startup_world():
     return world
 
 
-def test_startup_admission_drains_the_overlapping_resident_outside_the_writer_lock():
+def test_startup_admission_sleeps_the_overlapping_resident_in_one_writer_lock_hold():
     world = _startup_world()
-    world.gateway.inflight("pod-tp2", "gw-1", total=1)
+    world.gateway.ack_after_polls = 2
     held = []
-    world.hooks.append(
-        lambda now: held.append(world.coordinator.active is not None)
-        if now < 1004
-        else world.gateway.inflight("pod-tp2", "gw-1", total=0)
-    )
+    world.hooks.append(lambda now: held.append(world.coordinator.active is not None))
 
     result = world.service.admit_startup(pod_name="m1-new", pod_uid="new-uid")
 
-    assert held and not any(held)
+    assert held and all(held)  # whole-lock: the sleep never runs without the lock
     assert result["suspended_binding_ids"] == ["tp2/node-a/0,1"]
-    assert world.coordinator.kinds == ["startup_admit_sleep", "startup_admit_sleep_commit", "startup_admit"]
+    assert world.coordinator.kinds == ["startup_admit_sleep", "startup_admit"]
     assert world.desired()["tp2/node-a/0,1"][0] == "awake"  # suspended, not re-targeted
-
-
-def test_startup_admission_checks_reservations_under_the_writer_lock():
-    world = _startup_world()
-    world.vllm.sleeping["10.0.0.5"] = True
-    checked = []
-    original = world.primitive.reservations.assert_free
-
-    def spy(**kwargs):
-        checked.append((kwargs.get("what"), world.coordinator.active and world.coordinator.active["kind"]))
-        return original(**kwargs)
-
-    world.primitive.reservations.assert_free = spy
-
-    world.service.admit_startup(pod_name="m1-new", pod_uid="new-uid")
-
-    assert ("startup admission of m1-new", "startup_admit") in checked
 
 
 def test_startup_admission_retries_when_the_resident_woke_again():
@@ -558,25 +366,19 @@ def test_one_conflicting_startup_pod_does_not_abort_convergence_of_the_others():
     world.runtime.list_startup_resident_snapshots = lambda: world.runtime.list_pod_snapshots()
     world.runtime.clear_startup_admission = lambda name: None
     world.service._reconcile_unlocked = lambda drop_missing=False: {}
-    # pod-a's binding is being slept by someone else right now
-    token = world.primitive.reservations.acquire(
-        [binding_of(snapshots[0])], owner="sm-2", operation_id="x", ttl_s=300
-    )
+    # pod-a's /sleep fails this pass (the engine refuses it)
+    world.vllm.fail_sleep_for.add("10.0.0.1")
 
     result = world.service.converge_startups()
 
     assert result == {"converged": ["pod-c"], "pending": ["pod-a"]}
-    world.primitive.reservations.release(["m1/node-a/0"], token)
+    world.vllm.fail_sleep_for.clear()
     held = []
-    world.gateway.inflight("pod-a", "gw-1", total=1)
-    world.hooks.append(
-        lambda now: held.append(world.coordinator.active is not None)
-        if now < 1004
-        else world.gateway.inflight("pod-a", "gw-1", total=0)
-    )
+    world.gateway.ack_after_polls = world.gateway._polls + 2
+    world.hooks.append(lambda now: held.append(world.coordinator.active is not None))
     result = world.service.converge_startups()
     assert "pod-a" in result["converged"]
-    assert held and not any(held)  # its sleep drained outside the writer lock
+    assert held and all(held)  # its sleep ran under one writer-lock hold
     assert world.vllm.sleeping["10.0.0.1"] is True
 
 

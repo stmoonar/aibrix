@@ -106,11 +106,12 @@ class GpuLeaseStore:
     """Per-GPU leases (one Redis hash field per GPU, written by Lua under the
     writer fence). Phases and their lifetime:
 
-    * ``awake`` - never expires; released when the binding sleeps.
-    * ``waking`` - ``transient_ttl_ms``; 0 (default since 2026-09-30) = never
-      expires: /wake_up runs outside the writer lock and the engine may be awake
-      before the commit records it, so only the commit or the wake-journal
-      recovery (``tre:v2:sm:wake_ops``) releases it.
+    * ``awake`` - never expires; taken when a wake starts (whole-lock,
+      2026-10-02: the GPUs are the binding's from its prepare on) and released
+      when the binding sleeps or a failed wake is settled asleep.
+    * ``waking`` - no longer written (2026-10-02: a wake holds the writer lock
+      from start to end and takes the ``awake`` lease at once); an old one is
+      still honoured (``transient_ttl_ms``) until the bootstrap rebuild drops it.
     * ``starting`` - ``starting_ttl_ms``; 0 (default, S2 2026-09-30) = never
       expires: a Pod admitted at its startup gate holds its GPUs until it has
       converged (the lease becomes ``awake`` or is released) or its Pod is gone
@@ -218,10 +219,11 @@ class GpuLeaseStore:
         waking_bindings: list[Binding] | None = None,
     ) -> None:
         """Replace every lease by the awake bindings' ``awake`` leases, the admitted
-        startups' ``starting`` leases and (2026-09-30) the ``waking`` leases of the
-        wakes the journal says are in flight - a restart must not drop the fence of
-        an engine that may be waking. A waking binding that clashes with an awake /
-        starting one is skipped (the journal recovery resolves it)."""
+        startups' ``starting`` leases and the ``awake`` leases of the wakes the
+        journal still holds (``waking_bindings``: a dead service-manager's wake) -
+        a restart must not drop the fence of an engine that may be awake. A
+        journaled binding that clashes with an awake / starting one is skipped
+        (the journal recovery resolves it)."""
         fence = current_fence()
         if fence is None:
             raise StateFenceError("GPU lease rebuild requires an active writer fence")
@@ -282,10 +284,8 @@ class GpuLeaseStore:
                 gpu_ids=binding.slot.gpu_ids,
                 owner=fence.owner,
                 fencing_token=fence.token,
-                phase="waking",
-                expires_at_ms=(
-                    0 if self._transient_ttl_ms == 0 else int(time.time() * 1000) + self._transient_ttl_ms
-                ),
+                phase="awake",
+                expires_at_ms=0,
             )
             payload = json.dumps(
                 {**asdict(record), "gpu_ids": list(record.gpu_ids)},

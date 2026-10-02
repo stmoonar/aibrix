@@ -9,7 +9,6 @@ from typing import Protocol
 
 from tre_sm.state.operations import OperationBusy
 from tre_sm.state.safety import MaintenanceLockLost, NodePressureActive
-from tre_sm.state.sleep_reservations import ReservationConflict
 
 LOG = logging.getLogger(__name__)
 
@@ -149,12 +148,6 @@ class FleetSupervisor:
                 reap_leases()
             except OperationBusy:
                 pass  # a writer (possibly starting a Pod) is active; next pass
-        reap_waking = getattr(self._service, "reap_orphan_waking_leases", None)
-        if callable(reap_waking):
-            try:
-                reap_waking()
-            except OperationBusy:
-                pass  # next pass
         # The restart guard runs BEFORE the placeholder reaper: a crash-looping
         # engine that starts again gets its placeholder in the same pass the
         # reaper looks at it (review P2-2).
@@ -244,10 +237,10 @@ class FleetSupervisor:
             try:
                 self.run_once()
                 self._last_error = None
-            except (OperationBusy, MaintenanceLockLost, NodePressureActive, ReservationConflict):
+            except (OperationBusy, MaintenanceLockLost, NodePressureActive):
                 # Expected gates: another writer is converging, the maintenance
-                # lock was taken away, pressure remains, or a sleep is draining.
-                # Retry without mutating intent.
+                # lock was taken away, or pressure remains. Retry without
+                # mutating intent.
                 pass
             except Exception as exc:  # keep supervision alive and observable.
                 self._last_error = f"{type(exc).__name__}: {exc}"

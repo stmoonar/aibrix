@@ -167,9 +167,10 @@ def test_v2_defrag_moves_one_gpu_serve_and_frees_two_gpu_slot():
             {"action": "unhide", "serve_id": "serve-b"},
         ],
     }
+    # GET /v2/state adds each binding's routable view (no runtime here: the store's).
     assert client.get("/v2/state").json()["bindings"] == [
-        {"binding_id": "m1/node-a/0", "serve_id": "serve-a", "model": "m1", "node": "node-a", "gpu_ids": [0], "awake": True, "hidden": False},
-        {"binding_id": "m1/node-a/1", "serve_id": "serve-b", "model": "m1", "node": "node-a", "gpu_ids": [1], "awake": True, "hidden": False},
+        {"binding_id": "m1/node-a/0", "serve_id": "serve-a", "model": "m1", "node": "node-a", "gpu_ids": [0], "awake": True, "hidden": False, "routable": True},
+        {"binding_id": "m1/node-a/1", "serve_id": "serve-b", "model": "m1", "node": "node-a", "gpu_ids": [1], "awake": True, "hidden": False, "routable": True},
     ]
 
 

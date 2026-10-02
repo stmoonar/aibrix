@@ -1,9 +1,9 @@
-"""Review fixes of the placement / parallel-wake branch (2026-09-30): wakes whose
-commit does not complete are handed to the journal recovery (never stuck in this
-process), the waking lease and the journal fence the GPU until resolved, the
-recovery is bounded and never completes a replaced pod, startup / restart
+"""Review fixes of the placement / parallel-wake branch (2026-09-30), as they stand
+after the whole-lock SM (2026-10-02): a wake left journaled (a crash, an
+unreadable engine) keeps its GPUs fenced until the journal recovery resolves it,
+the recovery is bounded and never completes a replaced pod, startup / restart
 placeholders are bounded, partial growth is not a silent success, reconcile and
-defrag keep off wakes in flight."""
+defrag keep off journaled wakes."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from contextlib import contextmanager
 import pytest
 
 from tre_sm.allocator.slots import Binding, Slot
-from tre_sm.api.v2 import DefragUnavailable, RetryLater, ServiceManagerV2, WakeConflict, WakeFailed
+from tre_sm.api.v2 import DefragUnavailable, ServiceManagerV2, WakeConflict, WakeFailed
 from tre_sm.gpu_truth import RedisGpuTruth
 from tre_sm.state.gpu_leases import GpuLeaseStore
 from tre_sm.state.operations import OperationBusy
@@ -25,7 +25,7 @@ from tre_sm.state.wake_journal import WakeJournal
 
 from sm_test_fakes import FakeRedis, Result, fence, pod, registry
 from test_review2_sleep import World, _desired
-from test_sleep_lock_phases import StrictCoordinator
+from sm_test_fakes import StrictCoordinator
 
 
 def _world(snapshots=None, desired=None, *, sm_config=None):
@@ -65,49 +65,7 @@ def _events(caplog, name):
     return out
 
 
-# ------------------------------------------------------------ P1-1 hand-over
-
-
-def test_parallel_wake_commit_error_hands_over_to_recovery():
-    world = _world()
-    original = world.service._writer
-
-    @contextmanager
-    def broken_commit(kind, **kwargs):
-        if kind.endswith("_commit"):
-            raise ConnectionError("redis down")
-        with original(kind, **kwargs) as operation:
-            yield operation
-
-    world.service._writer = broken_commit
-    with pytest.raises(ConnectionError):
-        world.service.put_binding_power("pod-a", awake=True)
-
-    assert world.service._wakes_in_flight == set()  # never stuck in this process
-    assert set(world.journal.entries()) == {"m1/node-a/0"}
-    assert _leases(world)["m1/node-a/0"] == ("waking", 0)
-    world.service._writer = original
-    assert world.service.recover_wake_journal()["resolved"] == [{"binding_id": "m1/node-a/0", "result": "completed"}]
-    assert _leases(world)["m1/node-a/0"][0] == "awake"
-    world.service.put_model_target("m1", wake_replicas=2)  # the model is not frozen
-
-
-def test_parallel_wake_prepare_phase_exit_error_hands_over_to_recovery():
-    world = _world()
-    original = world.coordinator.operation
-
-    @contextmanager
-    def failing_exit(kind, **kwargs):
-        with original(kind, **kwargs) as handle:
-            yield handle
-        if kind == "put_binding_power":
-            raise ConnectionError("fence lost on exit")
-
-    world.coordinator.operation = failing_exit
-    with pytest.raises(ConnectionError):
-        world.service.put_binding_power("pod-a", awake=True)
-    assert world.service._wakes_in_flight == set()
-    assert set(world.journal.entries()) == {"m1/node-a/0"}
+# ------------------------------------------------------------ P1-1 commit errors
 
 
 def test_parallel_wake_one_commit_error_does_not_stop_the_other_tickets(monkeypatch):
@@ -123,28 +81,7 @@ def test_parallel_wake_one_commit_error_does_not_stop_the_other_tickets(monkeypa
     world.service.put_model_target("m1", wake_replicas=2)
 
     assert {k: v[0] for k, v in _leases(world).items()} == {"m1/node-a/0": "awake", "m1/node-a/1": "awake"}
-    assert world.service._wakes_in_flight == set()
     assert set(world.journal.entries()) == {"m1/node-a/0"}  # the recovery completes it again
-
-
-def test_parallel_wake_commit_retries_once_when_the_lock_is_busy():
-    world = _world()
-
-    class OnceBusy(StrictCoordinator):
-        refused = False
-
-        @contextmanager
-        def operation(self, kind, **kwargs):
-            if kind.endswith("_commit") and not OnceBusy.refused:
-                OnceBusy.refused = True
-                raise OperationBusy("busy once")
-            with super().operation(kind, **kwargs) as handle:
-                yield handle
-
-    world.coordinator = OnceBusy(world.redis)
-    world.service._operation_coordinator = world.coordinator
-    world.service.put_binding_power("pod-a", awake=True)
-    assert _leases(world)["m1/node-a/0"][0] == "awake"
 
 
 # ------------------------------------------------------------ P1-2 fence until resolved
@@ -179,13 +116,14 @@ def test_parallel_wake_recovery_waits_for_the_writer_lock():
 
     world.service._writer = spy
     world.service.recover_wake_journal()
-    assert waits == [("wake_journal_recovery", world.service._sm_config.commit_wait_s)]
+    # The ordinary writer-lock wait (writer_lock_wait_s): there is no commit phase.
+    assert waits == [("wake_journal_recovery", None)]
 
 
 # ------------------------------------------------------------ P2-3 restart
 
 
-def test_parallel_wake_bootstrap_rebuild_keeps_waking_leases_and_marks():
+def test_parallel_wake_bootstrap_rebuild_keeps_the_gpus_of_journaled_wakes_and_marks():
     redis = FakeRedis()
     leases = GpuLeaseStore(redis)
     awake = Binding("pod-x", "m1", Slot("node-a", (2,)), awake=True)
@@ -194,7 +132,9 @@ def test_parallel_wake_bootstrap_rebuild_keeps_waking_leases_and_marks():
     with fence(redis):
         leases.rebuild_awake([awake], waking_bindings=[waking, clash])
     phases = {lease.binding_id: (lease.phase, lease.expires_at_ms) for lease in leases.load()}
-    assert phases == {"m1/node-a/2": ("awake", 0), "m1/node-a/0": ("waking", 0)}
+    # A journaled wake's GPUs are fenced like an awake binding's (whole-lock: no
+    # waking phase any more).
+    assert phases == {"m1/node-a/2": ("awake", 0), "m1/node-a/0": ("awake", 0)}
 
     journal = WakeJournal(redis)
     journal.begin("m1/node-a/0", {"serve_id": "pod-a", "model": "m1", "node": "node-a", "gpu_ids": [0]})
@@ -280,7 +220,7 @@ def test_parallel_wake_transport_timeout_keeps_the_fence_for_a_delayed_recheck()
         world.service.put_binding_power("pod-a", awake=True)
 
     assert caught.value.reason == "vllm_wake_failed"
-    assert _leases(world)["m1/node-a/0"][0] == "waking"  # not released on the early "asleep"
+    assert _leases(world)["m1/node-a/0"][0] == "awake"  # not released on the early "asleep"
     entry = world.journal.get("m1/node-a/0")
     assert entry["recover_after_ms"] > 0
     assert world.service.recover_wake_journal() == {"resolved": [], "kept": []}  # not yet
@@ -504,22 +444,7 @@ def test_startup_placeholder_restart_seen_across_an_sm_restart():
     assert ledger.load() == {"uid-pod-a": 1}
 
 
-# ------------------------------------------------------------ review P2-1 orphan waking leases
-
-
-def test_parallel_wake_abort_keeps_the_journal_when_the_lease_cannot_be_released(monkeypatch):
-    world = _world()
-    with world.coordinator.operation("put_binding_power"):
-        snapshot = world.store.load()
-        binding = next(b for b in snapshot.bindings if b.serve_id == "pod-a")
-        ticket = world.service._begin_binding_wake(binding, snapshot.bindings)
-        monkeypatch.setattr(world.leases, "release", lambda b: (_ for _ in ()).throw(ConnectionError("x")))
-        world.service._abort_prepared_wakes([ticket])
-    assert set(world.journal.entries()) == {"m1/node-a/0"}
-    assert world.service._wakes_in_flight == set()
-    monkeypatch.undo()
-    assert world.service.recover_wake_journal()["resolved"][0]["result"] == "rolled_back"
-    assert _leases(world) == {}
+# ------------------------------------------------------------ review P2-1 unsettled leases
 
 
 def test_parallel_wake_failed_settle_keeps_the_journal(monkeypatch):
@@ -531,23 +456,6 @@ def test_parallel_wake_failed_settle_keeps_the_journal(monkeypatch):
     assert set(world.journal.entries()) == {"m1/node-a/0"}
     monkeypatch.undo()
     assert world.service.recover_wake_journal()["resolved"][0]["result"] == "rolled_back"
-
-
-def test_parallel_wake_orphan_waking_leases_are_settled_by_physical_state():
-    world = _world(
-        [pod("pod-a", "m1", (0,), ip="10.0.0.1", state="sleeping"),
-         pod("pod-b", "m1", (1,), ip="10.0.0.2", state="sleeping"),
-         pod("pod-c", "m1", (2,), ip="10.0.0.3", state="sleeping")],
-        [_desired(f"m1/node-a/{g}", "m1", (g,), "sleeping") for g in (0, 1, 2)],
-    )
-    with fence(world.redis):
-        for g in (0, 1, 2):
-            world.leases.acquire(Binding(f"x{g}", "m1", Slot("node-a", (g,)), awake=False), phase="waking")
-    world.vllm.sleeping["10.0.0.2"] = False  # awake
-    world.vllm.physical_override["10.0.0.3"] = None  # unknown
-
-    assert sorted(world.service.reap_orphan_waking_leases()) == ["m1/node-a/0", "m1/node-a/1"]
-    assert {k: v[0] for k, v in _leases(world).items()} == {"m1/node-a/1": "awake", "m1/node-a/2": "waking"}
 
 
 # ------------------------------------------------------------ review P2-3 suspects
@@ -626,7 +534,8 @@ def test_startup_placeholder_supervisor_runs_the_restart_guard_before_the_reaper
 
     FleetSupervisor(Service()).run_once()
     assert calls.index("guard_container_restarts") < calls.index("reap_stale_startup_placeholders")
-    assert "reap_orphan_waking_leases" in calls and "recover_wake_journal" in calls
+    assert "recover_wake_journal" in calls and "recover_sleep_journal" in calls
+    assert "reap_orphan_waking_leases" not in calls  # gone with the waking phase
 
 
 # ------------------------------------------------------------ final review round
@@ -689,28 +598,3 @@ def test_startup_placeholder_convergence_isolates_a_failing_binding(monkeypatch)
     result = world.service.guard_container_restarts()
     assert result["converged"] == ["m1/node-a/1"]  # not starved by pod-a
     assert set(world.service._suspects) == {"m1/node-a/0"}  # retried next pass
-
-
-def test_parallel_wake_orphan_waking_lease_any_awake_pod_wins_and_is_recorded():
-    world = _world(
-        [pod("pod-a", "m1", (0,), ip="10.0.0.1", state="sleeping"),
-         pod("pod-a2", "m1", (0,), ip="10.0.0.9", state="sleeping")],
-        [_desired("m1/node-a/0", "m1", (0,), "sleeping")],
-    )
-    with fence(world.redis):
-        world.leases.acquire(Binding("x", "m1", Slot("node-a", (0,)), awake=False), phase="waking")
-    world.vllm.sleeping["10.0.0.1"] = False  # the FIRST pod is awake, the last asleep
-    world.vllm.sleeping["10.0.0.9"] = True
-
-    assert world.service.reap_orphan_waking_leases() == ["m1/node-a/0"]
-    assert _leases(world)["m1/node-a/0"][0] == "awake"
-    assert {b.serve_id: b.awake for b in world.store.load().bindings}["pod-a"] is True
-
-    # one unreadable pod: kept
-    with fence(world.redis):
-        world.leases.release(Binding("x", "m1", Slot("node-a", (0,)), awake=False))
-        world.leases.acquire(Binding("x", "m1", Slot("node-a", (0,)), awake=False), phase="waking")
-    world.vllm.sleeping["10.0.0.1"] = True
-    world.vllm.physical_override["10.0.0.9"] = None
-    assert world.service.reap_orphan_waking_leases() == []
-    assert _leases(world)["m1/node-a/0"][0] == "waking"

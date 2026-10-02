@@ -1221,6 +1221,8 @@ def test_v2_put_target_treats_matching_state_conflict_after_runtime_action_as_su
         "wake_replicas": 0,
         "version": 2,
         "actions": [{"action": "sleep", "serve_id": "serve-a"}],
+        "taken": 1,
+        "clamped_by_floor": False,
     }
     assert vllm_ops.calls == [("sleep", "10.0.0.1", 8000)]
     assert runtime_ops.annotations == [("serve-a", "hidden"), ("serve-a", "sleeping")]

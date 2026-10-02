@@ -22,7 +22,6 @@ from tre_sm.allocator.topology import GPU_IDS_ANNOTATION, STATE_ANNOTATION, K8sP
 from tre_sm.ops.k8s_ops import ModelDeploymentRecord, StartupPodRecord
 from tre_sm.state.fleet_store import _SAVE_HASH_SCRIPT
 from tre_sm.state.operations import WriterFence, _CURRENT_FENCE
-from tre_sm.state import sleep_reservations as _res
 from tre_sm.state import gpu_leases as _leases
 from tre_sm.state import safety as _safety
 
@@ -180,12 +179,6 @@ class FakeRedis:
         modelled = maintenance_lua(self.values, self.ttls_ms, script, keys_and_args)
         if modelled is not NotImplemented:
             return modelled
-        if script == _res._ACQUIRE_SCRIPT:
-            return self._reservation_acquire(keys_and_args[0], [_s(a) for a in keys_and_args[numkeys:]])
-        if script == _res._RENEW_SCRIPT:
-            return self._reservation_renew(keys_and_args[0], [_s(a) for a in keys_and_args[numkeys:]])
-        if script == _res._RELEASE_SCRIPT:
-            return self._reservation_release(keys_and_args[0], [_s(a) for a in keys_and_args[numkeys:]])
         if script in (_leases._ACQUIRE_GPU_SCRIPT, _leases._RELEASE_GPU_SCRIPT, _leases._REBUILD_GPU_SCRIPT):
             return self._gpu_lease_script(script, keys_and_args[:numkeys], [_s(a) for a in keys_and_args[numkeys:]])
         assert script == _SAVE_HASH_SCRIPT, "unknown Lua script"
@@ -245,62 +238,6 @@ class FakeRedis:
         for index in range(1, len(argv), 2):
             bucket[argv[index]] = argv[index + 1]
         return 1
-
-    def _reservation_acquire(self, key, argv):
-        token, owner, operation_id, ttl_ms, count = argv[0], argv[1], argv[2], int(argv[3]), int(argv[4])
-        wanted = []
-        for i in range(count):
-            base = 5 + i * 4
-            wanted.append(
-                {"id": argv[base], "node": argv[base + 1], "gpus": json.loads(argv[base + 2]), "serve": argv[base + 3]}
-            )
-        bucket = self.hashes.setdefault(key, {})
-        for field_name, raw in list(bucket.items()):
-            record = json.loads(raw)
-            if int(record["expires_at_ms"]) <= self.now_ms:
-                bucket.pop(field_name)
-            elif record["token"] != token:
-                for w in wanted:
-                    if record["binding_id"] == w["id"]:
-                        return [0, record["binding_id"]]
-        expires = self.now_ms + ttl_ms
-        for w in wanted:
-            bucket[w["id"]] = json.dumps(
-                {
-                    "binding_id": w["id"], "serve_id": w["serve"], "node": w["node"],
-                    "gpu_ids": w["gpus"], "token": token, "owner": owner,
-                    "operation_id": operation_id, "expires_at_ms": expires,
-                }
-            )
-        return [1, str(expires)]
-
-    def _reservation_renew(self, key, argv):
-        token, ttl_ms, ids = argv[0], int(argv[1]), argv[2:]
-        bucket = self.hashes.setdefault(key, {})
-        for binding_id in ids:
-            raw = bucket.get(binding_id)
-            if raw is None:
-                return 0
-            record = json.loads(raw)
-            if record["token"] != token or int(record["expires_at_ms"]) <= self.now_ms:
-                return 0
-        for binding_id in ids:
-            record = json.loads(bucket[binding_id])
-            record["expires_at_ms"] = self.now_ms + ttl_ms
-            bucket[binding_id] = json.dumps(record)
-        return 1
-
-    def _reservation_release(self, key, argv):
-        token, ids = argv[0], argv[1:]
-        bucket = self.hashes.setdefault(key, {})
-        released = 0
-        for binding_id in ids:
-            raw = bucket.get(binding_id)
-            if raw is not None and json.loads(raw)["token"] == token:
-                bucket.pop(binding_id)
-                released += 1
-        return released
-
 
 class LegacyRedis:
     """Legacy StateStore backend without EVAL (the store's in-memory test path)."""
@@ -661,9 +598,6 @@ def policy(**overrides) -> SleepPolicy:
         vllm_sleep_mode_param="true",
         hard_cap_s=150.0,
         plugin_label_selector=None,
-        # The mechanism tests exercise the draining protocol on every path; the
-        # no-drain paths (production default) are covered by test_sleep_no_drain.
-        no_drain_paths=(),
     )
     budgets = overrides.pop("budgets_s", None)
     base.update(overrides)
@@ -731,3 +665,44 @@ def startup_pod(name, model, gpus, *, uid, node="node-a"):
         name=name, uid=uid, model=model, node=node, gpu_ids=tuple(gpus),
         annotations={}, labels={}, pod_ip=None, phase="Pending", ready=False,
     )
+
+
+class StrictCoordinator:
+    """Non-reentrant writer lock: entering while held raises OperationBusy, so a
+    test fails when an operation takes the lock twice (whole-lock: every write
+    holds it once, from start to end)."""
+
+    owner = "sm-test"
+
+    def __init__(self, redis, *, refuse=()):
+        self.redis = redis
+        self.active = None
+        self.kinds = []
+        self.refuse = set(refuse)
+
+    @contextmanager
+    def operation(self, kind, *, request=None, wait_s=0.0):
+        from tre_sm.state.operations import OperationBusy, _CURRENT_OPERATION
+
+        if self.active is not None or kind in self.refuse:
+            raise OperationBusy(f"held by {self.active and self.active['kind']}")
+        self.kinds.append(kind)
+        operation_id = f"{kind}-{len(self.kinds)}"
+        self.active = {"operation_id": operation_id, "kind": kind, "status": "running"}
+        handle = FakeHandle(operation_id)
+        token = _CURRENT_OPERATION.set(handle)
+        try:
+            with fence(self.redis, operation_id):
+                yield handle
+        finally:
+            _CURRENT_OPERATION.reset(token)
+            self.active = None
+
+    def active_operation(self, *, kind=None):
+        return self.active
+
+    def stale_running_operations(self, *, kind=None):
+        return []
+
+    def list_operations(self, *, limit=100):
+        return []
