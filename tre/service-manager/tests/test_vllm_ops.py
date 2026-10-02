@@ -98,3 +98,51 @@ def test_vllm_ops_is_sleeping_returns_none_on_transport_error():
     ops = VllmOps(http=FakeGetHttp(TimeoutError("boom")))
 
     assert ops.is_sleeping("10.0.0.9") is None
+
+
+class _JsonResponse(FakeResponse):
+    def __init__(self, status_code, payload):
+        super().__init__(status_code)
+        self._payload = payload
+
+    def json(self):
+        return self._payload
+
+
+class _GetHttp(FakeHttp):
+    def __init__(self, outcomes, gets):
+        super().__init__(outcomes)
+        self.gets = list(gets)
+
+    def get(self, url, *, timeout):
+        self.calls.append((url, timeout))
+        outcome = self.gets.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+
+def test_is_paused_and_resume_use_the_dev_endpoints():
+    http = _GetHttp(
+        [FakeResponse(200, '{"status": "resumed"}'), TimeoutError("slow")],
+        [_JsonResponse(200, {"is_paused": True}), FakeResponse(404), TimeoutError("down"), _JsonResponse(200, {})],
+    )
+    ops = VllmOps(http=http, timeout_s=2.0, max_attempts=3)
+
+    assert ops.is_paused("10.0.0.9") is True
+    assert ops.is_paused("10.0.0.9") is None  # not served (older engine)
+    assert ops.is_paused("10.0.0.9") is None  # unreachable
+    assert ops.is_paused("10.0.0.9") is None  # undecodable
+    assert ops.resume("10.0.0.9").success is True
+    timed_out = ops.resume("10.0.0.9")
+    assert timed_out.success is False and timed_out.attempts == 1  # single attempt
+
+
+def test_wake_up_is_one_attempt_with_its_own_timeout_when_configured():
+    http = FakeHttp([TimeoutError("slow")])
+    ops = VllmOps(http=http, timeout_s=2.0, max_attempts=3, wake_timeout_s=10.0)
+
+    result = ops.wake_up("10.0.0.9")
+
+    assert result.success is False and result.status_code is None  # no HTTP answer
+    assert http.calls == [("http://10.0.0.9:8000/wake_up", 10.0)]  # one attempt, 10 s

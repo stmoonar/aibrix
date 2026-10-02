@@ -28,11 +28,18 @@ class VllmOps:
         timeout_s: float = 5.0,
         max_attempts: int = 3,
         default_port: int = 8000,
+        wake_timeout_s: float | None = None,
     ) -> None:
+        """``timeout_s``: every probe (and, without ``wake_timeout_s``, each of
+        up to ``max_attempts`` /wake_up attempts). ``wake_timeout_s``
+        (registry ``service_manager.wake.call_timeout_s``): ONE /wake_up attempt
+        with this timeout - the service-manager holds its writer lock through
+        the call (2026-10-02), so its length is bounded once."""
         if max_attempts < 1:
             raise ValueError("max_attempts must be at least 1")
         self._http = http or _RequestsTransport()
         self._timeout_s = timeout_s
+        self._wake_timeout_s = wake_timeout_s
         self._max_attempts = max_attempts
         self._default_port = default_port
 
@@ -103,7 +110,33 @@ class VllmOps:
         return None
 
     def wake_up(self, pod_ip: str, *, port: int | None = None) -> VllmOpResult:
+        if self._wake_timeout_s is not None:
+            return self._post(pod_ip, "wake_up", port=port, timeout_s=self._wake_timeout_s, max_attempts=1)
         return self._post(pod_ip, "wake_up", port=port)
+
+    def is_paused(self, pod_ip: str, *, port: int | None = None) -> bool | None:
+        """``GET /is_paused`` (vLLM dev-mode router, next to /sleep): whether the
+        engine's scheduler is paused - e.g. a /sleep paused it and then failed.
+        None when unreachable, not served (older engines) or undecodable."""
+        url = f"http://{pod_ip}:{port or self._default_port}/is_paused"
+        try:
+            response = self._http.get(url, timeout=self._timeout_s)
+            status = int(response.status_code)
+        except Exception:
+            return None
+        if not (200 <= status < 300):
+            return None
+        json_method = getattr(response, "json", None)
+        try:
+            payload = json_method() if callable(json_method) else None
+        except Exception:
+            return None
+        value = payload.get("is_paused") if isinstance(payload, dict) else None
+        return value if isinstance(value, bool) else None
+
+    def resume(self, pod_ip: str, *, port: int | None = None) -> VllmOpResult:
+        """``POST /resume``: un-pause the scheduler (single attempt, probe timeout)."""
+        return self._post(pod_ip, "resume", port=port, timeout_s=self._timeout_s, max_attempts=1)
 
     def is_sleeping(self, pod_ip: str, *, port: int | None = None) -> bool | None:
         """Physical /is_sleeping probe (OBSERVED ground truth).
