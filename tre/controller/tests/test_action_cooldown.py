@@ -17,10 +17,11 @@ from test_loop_ticks import _registry as _base_registry
 
 
 def _registry(**scaling) -> Registry:
-    """The test_loop_ticks registry; by default with the scale-up cooldown these F4
-    cases exercise (C1 made it opt-in: registry scaling.scale_up_cooldown_enabled)."""
+    """The test_loop_ticks registry; by default with C1 off (legacy one-step rescue),
+    the only rescue the F4 hold still applies to a CRITICAL receiver's scale-up (the
+    opt-in scale_up_cooldown_enabled switch was removed in the timer cleanup)."""
     base = _base_registry()
-    scaling.setdefault("scale_up_cooldown_enabled", True)
+    scaling.setdefault("rescue_max_step_ratio", 0.0)
     return Registry(base.topology(), list(base.models()), scaling=ScalingRegistryConfig(**scaling))
 
 
@@ -116,7 +117,7 @@ def test_c1_without_cooldown_wakes_the_deficit_once_until_the_window_reflects_it
     client = _OkClient()
     clock = _Clock(65_000)
     queue = ActionQueue(client, now_ms=clock)
-    registry = _registry(scale_up_cooldown_enabled=False)
+    registry = _registry(rescue_max_step_ratio=2.0)
 
     first = run_rescue_tick(_critical_snapshot(5_000), queue=queue, registry=registry, action_cooldown=True)
     asyncio.run(queue.drain_once())
@@ -141,7 +142,7 @@ def test_cooldown_disabled_keeps_legacy_repeat_behaviour() -> None:
     client = _OkClient()
     queue = ActionQueue(client, now_ms=_Clock(65_000))
     # Legacy one-step rescue (rescue_max_step_ratio 0) without the cooldown.
-    registry = _registry(rescue_max_step_ratio=0.0, scale_up_cooldown_enabled=False)
+    registry = _registry(rescue_max_step_ratio=0.0)
 
     for start in (5_000, 10_000):
         result = run_rescue_tick(_critical_snapshot(start), queue=queue, registry=registry)
@@ -183,7 +184,8 @@ def _plan(classifications, cooldowns, *, idle_gpus=0, rescue_due=True, scale_up_
             max_replicas_per_model=4,
             rescue_due=rescue_due,
             suppress_hot_proactive_probe=True,
-            scale_up_cooldown_enabled=scale_up_cooldown,
+            # C1 off = the legacy step, which keeps the F4 hold of a CRITICAL scale-up.
+            rescue_max_step_ratio=0.0 if scale_up_cooldown else 2.0,
         ),
         cooldowns=cooldowns,
     )
@@ -204,13 +206,13 @@ def test_critical_scale_up_allowed_during_scale_down_cooldown_but_not_after_scal
     held = _plan(receiver, {"r": "up"}, idle_gpus=1)
     assert _deltas(held) == {}
     assert held.events == ["cooldown_hold:r"]
-    # C1 default: the scale-up cooldown no longer holds a CRITICAL receiver.
+    # C1 (default): the F4 cooldown never holds a CRITICAL receiver.
     free = _plan(receiver, {"r": "up"}, idle_gpus=1, scale_up_cooldown=False)
     assert _deltas(free) == {"r": 1}
     assert not any(event.startswith("cooldown_hold") for event in free.events)
 
 
-def test_low_receiver_keeps_the_scale_up_cooldown_without_the_c1_switch() -> None:
+def test_low_receiver_keeps_the_scale_up_cooldown_under_c1() -> None:
     receiver = [_cls("r", ModelState.LOW, ModelRole.RECEIVER, 0.9)]
 
     held = _plan(receiver, {"r": "up"}, idle_gpus=1, rescue_due=False, scale_up_cooldown=False)

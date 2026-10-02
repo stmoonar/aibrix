@@ -10,7 +10,8 @@ from typing import Mapping
 from tre_common.rediskeys import SCRAPE_INTERVAL_MS
 from tre_common.registry import EXPECTED_SIGNAL_DIRECTIONS, POD_SERVING_PORT, SafeScaleRegistryConfig, load_registry
 from tre_controller.loops.metrics_task import REFRESH_MODES
-from tre_controller.signals.trs import DWELL_STATES
+#: TRE_DWELL_STATES values (deprecated, ignored: the band dwell was removed).
+DWELL_STATES = ("critical", "low", "high")
 
 LOG = logging.getLogger(__name__)
 
@@ -182,9 +183,9 @@ class ControllerConfig:
     # TRE_METRICS_STALE_HOLD_WINDOWS: stale windows during which the previous snapshot
     # keeps being served before it is marked stale (decision loops then hold).
     metrics_stale_hold_windows: int = 2
-    # TRE_DWELL_WINDOWS (1 = off) / TRE_DWELL_STATES (subset of critical,low,high).
-    # Default 1 = off (v1/paper alignment A5: neither the paper nor v1 has a band dwell;
-    # a band acts on the first window that shows it). >= 2 re-enables the D8 dwell.
+    # TRE_DWELL_WINDOWS / TRE_DWELL_STATES - DEPRECATED, ignored since the timer cleanup
+    # (2026-10-02): the D8 band dwell (off since the v1/paper alignment A5) was removed.
+    # Still parsed with the old validation (an old overlay keeps starting) and logged.
     dwell_windows: int = 1
     dwell_states: tuple[str, ...] = ("critical", "low", "high")
     # TRE_GATEWAY_INTERVAL_CHECK: fail (default) | warn | off.
@@ -416,7 +417,7 @@ class ControllerConfig:
             metrics_phase_adapt=_get_bool(values, "TRE_METRICS_PHASE_ADAPT", True),
             metrics_phase_retry_ms=_get_positive_int(values, "TRE_METRICS_PHASE_RETRY_MS", 500),
             metrics_stale_hold_windows=_get_nonneg_int(values, "TRE_METRICS_STALE_HOLD_WINDOWS", 2),
-            dwell_windows=_get_positive_int(values, "TRE_DWELL_WINDOWS", 1),
+            dwell_windows=_deprecated_dwell_windows(values),
             dwell_states=dwell_states,
             gateway_interval_check=gateway_interval_check,
             gateway_stats_urls=tuple(
@@ -488,6 +489,16 @@ def _safescale_window_floor_ms(values: Mapping[str, str]) -> float:
         )
         return floor
     return SafeScaleConfig.min_window_ms
+
+
+def _deprecated_dwell_windows(values) -> int:
+    """TRE_DWELL_WINDOWS / TRE_DWELL_STATES: parsed (old values still start) but ignored
+    since the timer cleanup (2026-10-02) removed the band dwell."""
+    windows = _get_positive_int(values, "TRE_DWELL_WINDOWS", 1)
+    for key in ("TRE_DWELL_WINDOWS", "TRE_DWELL_STATES"):
+        if key in values:
+            LOG.warning("%s=%s is deprecated and ignored: the band dwell was removed", key, values.get(key))
+    return windows
 
 
 def _deprecated_rollback_backoff_ms(values) -> float:

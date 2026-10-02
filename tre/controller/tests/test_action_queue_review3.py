@@ -344,7 +344,7 @@ def test_model_state_box_marks_unconfirmed_receivers_and_expires() -> None:
             "b": cls("b", ModelState.LOW, ModelRole.RECEIVER),
             "c": cls("c", ModelState.HIGH, ModelRole.DONOR),
         },
-        {"b": {"dwell_confirmed": False}},
+        {"b": {"signal_warm": False}},
         ts_ms=95_000,
     )
     assert box.get() == {"a": "critical", "b": UNCONFIRMED, "c": "high"}

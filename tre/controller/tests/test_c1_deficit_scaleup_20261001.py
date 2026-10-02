@@ -377,14 +377,22 @@ def test_queue_counts_every_part_of_one_target():
     assert (record.covered, record.outstanding, record.done_ms) == (5, 0, 2_000)
 
 
-def test_scale_up_cooldown_switch_holds_a_critical_receiver_again():
-    queue = ActionQueue(_Client(), now_ms=_Clock(65_000))
-    queue._last_done["critical"] = (65_000, "up")
-    on = run_rescue_tick(_snapshot(5_000), queue=queue, registry=_registry(scale_up_cooldown_enabled=True),
+def test_scale_up_cooldown_key_is_ignored(caplog):
+    # Timer cleanup (2026-10-02): the opt-in F4 hold of a C1 rescue was dead code (off in
+    # every shipped registry) and was removed; the key still parses, logged as deprecated.
+    def queue():
+        q = ActionQueue(_Client(), now_ms=_Clock(65_000))
+        q._last_done["critical"] = (65_000, "up")
+        return q
+
+    on = run_rescue_tick(_snapshot(5_000), queue=queue(), registry=_registry(scale_up_cooldown_enabled=True),
                          action_cooldown=True)
-    off = run_rescue_tick(_snapshot(5_000), queue=queue, registry=_registry(), action_cooldown=True)
-    assert on.submitted == 0 and "cooldown_hold:critical" in on.events
-    assert off.submitted == 1 and "cooldown_hold:critical" not in off.events
+    off = run_rescue_tick(_snapshot(5_000), queue=queue(), registry=_registry(), action_cooldown=True)
+    assert on.submitted == off.submitted == 1
+    assert "cooldown_hold:critical" not in on.events
+    with caplog.at_level(logging.WARNING):
+        parse_scaling_config({"scale_up_cooldown_enabled": True})
+    assert "scale_up_cooldown_enabled is deprecated" in caplog.text
 
 
 # ---------------------------------------------------------------- registry
@@ -410,7 +418,7 @@ def test_shipped_registry_scaling_section():
     raw = yaml.safe_load(open(__import__("pathlib").Path(__file__).resolve().parents[2] / "deploy" / "registry.yaml",
                               encoding="utf-8"))
     assert set(raw["scaling"]) == {
-        "rescue_max_step_ratio", "scale_up_cooldown_enabled", "rescue_max_step_pods",
+        "rescue_max_step_ratio", "rescue_max_step_pods",
         "donor_surplus_release", "rescue_settle_ema_k",
         # O1 (2026-10-01): the breakpoint window, at its built-in defaults.
         "breakpoint_window", "onset_warmup_guard", "min_evidence_grids", "min_evidence_requests",

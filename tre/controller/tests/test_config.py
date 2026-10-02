@@ -43,7 +43,8 @@ def test_config_defaults_are_plan_aligned() -> None:
     assert config.disable_eta_gate is False
     # v1/paper alignment A2: the receiver-less HIGH proactive SafeScale shrink is live.
     assert config.safescale_suppress_hot_proactive is False
-    # A5: band dwell off by default (1 = act on the first window); opt-in via TRE_DWELL_WINDOWS.
+    # Timer cleanup (2026-10-02): the band dwell was removed; TRE_DWELL_WINDOWS still parses
+    # (ignored, logged as deprecated).
     assert config.dwell_windows == 1
     assert ControllerConfig.from_env({"TRE_DWELL_WINDOWS": "2"}).dwell_windows == 2
 

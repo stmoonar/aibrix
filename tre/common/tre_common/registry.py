@@ -484,11 +484,10 @@ class ScalingRegistryConfig:
     #: ``ratio`` above: the rescue target is at most ``ratio x n`` (never below n + 1).
     #: 0 = the legacy one-step rescue (``ceil(0.1 * n)`` per decision window).
     rescue_max_step_ratio: float = 2.0
-    #: Hold a CRITICAL receiver's next scale-up until a metrics window starting after
-    #: its last scale-up completed (review F4 cooldown, scale-up direction of the
-    #: fast loop). Off by default under C1: the rescue target bookkeeping already keeps
-    #: a not-yet-reflected scale-up from being repeated. Scale-down holds, the slow
-    #: loop and the LOW receivers keep the cooldown (TRE_ACTION_COOLDOWN).
+    #: DEPRECATED, ignored since the timer cleanup (2026-10-02): the opt-in F4 hold of a
+    #: CRITICAL receiver's scale-up under C1 (off in every shipped registry; the rescue
+    #: target bookkeeping keeps an unreflected scale-up from repeating). Still parsed so
+    #: an older registry loads; a set key is logged.
     scale_up_cooldown_enabled: bool = False
     #: The rescue target may also reach ``n + rescue_max_step_pods`` (HPA's default
     #: scale-up policy shape, "max(100%, +4 pods)"): cap = max(n + 1,
@@ -641,6 +640,9 @@ def parse_scaling_config(raw: dict[str, Any] | None) -> ScalingRegistryConfig:
         raise ValueError(f"scaling.rescue_settle_ema_k must be a number, got {k_raw!r}") from exc
     if not math.isfinite(settle_k) or settle_k < 0:
         raise ValueError(f"scaling.rescue_settle_ema_k must be a non-negative number, got {k_raw!r}")
+    if "scale_up_cooldown_enabled" in raw:
+        LOG.warning("registry scaling.scale_up_cooldown_enabled is deprecated and ignored (timer cleanup "
+                    "2026-10-02: the C1 rescue target bookkeeping holds an unreflected scale-up)")
     return ScalingRegistryConfig(
         rescue_max_step_ratio=ratio,
         scale_up_cooldown_enabled=_scaling_bool(raw, "scale_up_cooldown_enabled", defaults.scale_up_cooldown_enabled),

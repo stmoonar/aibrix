@@ -4,14 +4,9 @@ import math
 from dataclasses import dataclass, replace
 from typing import Any, Iterable
 
-from tre_common.dwell import DwellCounter
 from tre_common.metrics_schema import ModelWindowMetrics
 from tre_common.registry import TrsParams
 from tre_common.tss import TssEma, replica_factor, signal_ema, tss_terms, window_is_idle
-
-#: Raw classification states the controller's band dwell can gate (TRE_DWELL_STATES).
-DWELL_STATES = ("critical", "low", "high")
-
 
 @dataclass(frozen=True)
 class BreakpointWindowConfig:
@@ -386,8 +381,6 @@ class SignalState:
         self,
         warmup_ms: int = -1,
         *,
-        dwell_windows: int = 1,
-        dwell_states: Iterable[str] = DWELL_STATES,
         breakpoint: BreakpointWindowConfig | None = None,
         saturation: Any | None = None,
     ) -> None:
@@ -412,17 +405,10 @@ class SignalState:
         self._hold: dict[str, tuple[int, int]] = {}
         # O1 suspended (same-clock check failed, review P2-3): reason, None = active.
         self.breakpoint_window_suspended: str | None = None
-        # Band dwell (plan §6.9i / D8): CRITICAL / LOW / HIGH only act after holding for
-        # dwell_windows consecutive NEW metrics windows (tre_common.dwell). 1 = off.
-        self.dwell_windows = max(1, int(dwell_windows))
-        states = {str(state).strip().lower() for state in dwell_states if str(state).strip()}
-        unknown = states - set(DWELL_STATES)
-        if unknown:
-            raise ValueError(f"dwell_states must be a subset of {DWELL_STATES}, got {sorted(unknown)}")
-        self.dwell_states = frozenset(states)
-        # model -> band -> counter; bands: "critical" (Z < tau_crit), "receiver"
-        # (Z < tau_low, CRITICAL or LOW), "high" (Z > tau_high).
-        self._dwell: dict[str, dict[str, DwellCounter]] = {}
+        # The D8 band dwell (TRE_DWELL_WINDOWS, off since the v1 alignment A5) was removed
+        # in the timer cleanup (2026-10-02): a band acts on the first window showing it;
+        # O1 already requires post-breakpoint evidence (tre_common.dwell stays for the
+        # offline calibration tools).
         # warmup_ms: -1 = auto (window fully inside traffic period), 0 = disabled
         # (pre-fix behaviour, for A/B ablation), >0 = explicit span since onset.
         self._warmup_ms = warmup_ms
@@ -488,7 +474,6 @@ class SignalState:
         happens even when the warmup guard is disabled."""
         if not has_traffic:
             self.reset_ema(model)
-            self.reset_dwell(model)
             self._onset_ms[model] = None
             return True  # idle -> UNKNOWN, nothing to warm up for
         onset = self._onset_ms.get(model)
@@ -669,92 +654,3 @@ class SignalState:
                 metrics=suffix, warm=False, numerator_scale=scale, reason="evidence_requests", **partial
             )
         return EffectiveWindow(metrics=suffix, warm=True, numerator_scale=scale, **partial)
-
-    # ------------------------------------------------------------------ band dwell
-
-    def reset_dwell(self, model: str) -> None:
-        for counter in self._dwell.get(model, {}).values():
-            counter.reset()
-
-    def dwell_run(self, model: str, band: str) -> int:
-        counter = self._dwell.get(model, {}).get(band)
-        return counter.run if counter is not None else 0
-
-    def apply_dwell(
-        self,
-        classifications: list,
-        contexts: dict[str, dict],
-        windows: dict[str, ModelWindowMetrics],
-    ) -> tuple[list, tuple[str, ...]]:
-        """Gate band changes on ``dwell_windows`` consecutive new windows.
-
-        Called once per planner tick, after classification. Counters advance at most once
-        per distinct ``window_end_ms`` of the model's window (rescue/fairness re-reads of
-        one snapshot do not count twice) and only for windows whose tokens are present
-        (a scrape gap, whose context the paper-state cache may be holding, neither counts
-        nor resets). Composition with the other guards:
-
-        * warmup: a window whose signal is not yet warm (``signal_warm`` False) resets the
-          receiver runs - the onset windows are exactly the structurally-low ones the
-          warmup guard distrusts, so they must not pre-confirm a CRITICAL;
-        * idle: an idle tick (``observe_traffic(has_traffic=False)``) resets every run,
-          like the EMA; a gap > one metrics window restarts the run (TssEma's rule);
-        * cooldown: independent - counting continues, the planner's cooldown still holds
-          the action.
-
-        Verdicts (``dwell_states`` picks which raw states are gated):
-
-        * CRITICAL not confirmed -> LOW if the receiver band (Z < tau_low) is confirmed,
-          otherwise the receiver is suppressed for this tick (``dwell_confirmed=False`` in
-          its context; ``build_plan`` drops it like a warming-up receiver, so it is
-          neither a receiver nor a donor);
-        * LOW not confirmed -> suppressed the same way;
-        * HIGH not confirmed -> HEALTHY/NEUTRAL (it is at least healthy).
-        """
-        if self.dwell_windows <= 1 or not self.dwell_states:
-            return classifications, ()
-        from tre_controller.planning.classify import ModelRole, ModelState
-
-        events: list[str] = []
-        out: list = []
-        for item in classifications:
-            model = item.model_name
-            ctx = contexts.get(model)
-            metrics = windows.get(model)
-            if ctx is None or metrics is None:
-                out.append(item)
-                continue
-            counters = self._dwell.setdefault(model, {})
-            window_ms = float(metrics.window_end_ms - metrics.window_start_ms)
-            for band in ("critical", "receiver", "high"):
-                if band not in counters:
-                    counters[band] = DwellCounter(required=self.dwell_windows, max_gap_ms=window_ms)
-            tokens_present = metrics.prompt_tokens is not None and metrics.generation_tokens is not None
-            if tokens_present:
-                warm = bool(ctx.get("signal_warm", True))
-                state = item.state
-                end = int(metrics.window_end_ms)
-                counters["critical"].update(end, state == ModelState.CRITICAL, eligible=warm)
-                counters["receiver"].update(
-                    end, state in (ModelState.CRITICAL, ModelState.LOW), eligible=warm
-                )
-                counters["high"].update(end, state == ModelState.HIGH)
-            crit_ok = "critical" not in self.dwell_states or counters["critical"].confirmed
-            recv_ok = "low" not in self.dwell_states or counters["receiver"].confirmed
-            high_ok = "high" not in self.dwell_states or counters["high"].confirmed
-            n = self.dwell_windows
-            if item.state == ModelState.CRITICAL and not crit_ok:
-                events.append(f"dwell_hold:{model}:critical:{counters['critical'].run}/{n}")
-                if recv_ok:
-                    item = replace(item, state=ModelState.LOW, role=ModelRole.RECEIVER)
-                else:
-                    ctx["dwell_confirmed"] = False
-            elif item.state == ModelState.LOW and not recv_ok:
-                events.append(f"dwell_hold:{model}:low:{counters['receiver'].run}/{n}")
-                ctx["dwell_confirmed"] = False
-            elif item.state == ModelState.HIGH and not high_ok:
-                events.append(f"dwell_hold:{model}:high:{counters['high'].run}/{n}")
-                item = replace(item, state=ModelState.HEALTHY, role=ModelRole.NEUTRAL, donor_tier=None)
-            ctx["dwell_runs"] = {band: counter.run for band, counter in counters.items()}
-            out.append(item)
-        return out, tuple(events)

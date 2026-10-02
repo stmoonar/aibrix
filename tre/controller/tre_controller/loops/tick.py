@@ -191,16 +191,11 @@ def run_planner_tick(
         model_control_configs=model_control_configs_from_registry(registry, signal_source),
         signal_idle_rps_eps=signal_idle_rps_eps,
     )
-    dwell_events: tuple[str, ...] = ()
-    if signal_state is not None:
-        # Band dwell (D8): counted per distinct window_end_ms in the shared SignalState,
-        # so the rescue/fairness re-reads of one snapshot never advance it twice.
-        classifications, dwell_events = signal_state.apply_dwell(classifications, contexts, snapshot.models)
-    # Onset saturation rescue: after the band dwell (which only sees the TSS verdict).
+    # Onset saturation rescue (the D8 band dwell that ran before it was removed in the
+    # timer cleanup 2026-10-02; it had been off since the v1 alignment A5).
     classifications, saturation_events = _apply_saturation_rescue(
         classifications, contexts, snapshot, signal_state
     )
-    dwell_events = tuple(dwell_events) + saturation_events
     if _prof_on:
         _signals_ns = time.perf_counter_ns() - _phase_t0
         _phase_t0 = time.perf_counter_ns()
@@ -299,7 +294,7 @@ def run_planner_tick(
     return LoopTickResult(
         submitted=len(actions),
         actions=actions,
-        events=paper_events + dwell_events + tuple(plan.events) + safescale_events + queue_events,
+        events=paper_events + tuple(saturation_events) + tuple(plan.events) + safescale_events + queue_events,
         model_contexts=contexts,
         classifications={item.model_name: item for item in classifications},
     )
@@ -319,7 +314,6 @@ def _scaling_options(registry: Registry) -> dict:
     config = scaling()
     return {
         "rescue_max_step_ratio": float(config.rescue_max_step_ratio),
-        "scale_up_cooldown_enabled": bool(config.scale_up_cooldown_enabled),
         "rescue_max_step_pods": int(getattr(config, "rescue_max_step_pods", 0)),
         "donor_surplus_release": bool(getattr(config, "donor_surplus_release", False)),
         "partial_window_max_step": int(getattr(config, "breakpoint_partial_max_step", 0) or 0)

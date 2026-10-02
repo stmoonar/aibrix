@@ -443,8 +443,6 @@ def create_controller_dependencies(
         registry=registry,
         signal_state=SignalState(
             warmup_ms=cfg.signal_warmup_ms,
-            dwell_windows=cfg.dwell_windows,
-            dwell_states=cfg.dwell_states,
             # O1 breakpoint window (registry scaling.breakpoint_window /
             # onset_warmup_guard / min_evidence_*), on the gateway grid.
             breakpoint=breakpoint_config,

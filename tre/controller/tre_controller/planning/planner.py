@@ -64,11 +64,6 @@ class PlanConfig:
     # max(n+1, floor(ratio*n)), scaling cap, capacity found). 0 = legacy one step
     # (ceil(scale_step_ratio * n)) per decision window.
     rescue_max_step_ratio: float = 2.0
-    # C1 (registry scaling.scale_up_cooldown_enabled): the review F4 cooldown also holds
-    # a CRITICAL receiver's scale-up. Off by default: the rescue target bookkeeping
-    # (``rescue_bases``) keeps an unreflected scale-up from being repeated. Scale-down
-    # holds and LOW receivers keep the cooldown either way.
-    scale_up_cooldown_enabled: bool = False
     # C1 (registry scaling.rescue_max_step_pods): the rescue target may also reach
     # n + this many replicas (HPA-style "max(ratio x n, n + pods)"); 0 = ratio only.
     rescue_max_step_pods: int = 0
@@ -434,15 +429,12 @@ def build_plan(
     # ADR-0014: the former saturation bypass ("unless Q_ctl >= qsat") was removed. Warmup
     # suppression is now unconditional; a genuine flash crowd in the warmup window is
     # delayed at most one window (until the sliding window clears the traffic onset).
-    # Band dwell (D8, SignalState.apply_dwell): a receiver whose band has not held for
-    # the configured number of new metrics windows is suppressed the same way.
     # O1 breakpoint window (signal_full_window present only with O1 on): a model whose
     # metrics window still holds a breakpoint (traffic onset, routable-count change)
     # takes part in no scale-down - neither HIGH / IDLE donor nor middle-zone donor - until
     # a whole window lies after the breakpoint (scale-down stays cautious); as a receiver
     # it acts once signal_warm (min_evidence_grids complete grids after the breakpoint).
     warmup_suppressed: list[str] = []
-    dwell_suppressed: list[str] = []
     breakpoint_held: list[str] = []
     kept: list = []
     for item in classifications:
@@ -456,14 +448,11 @@ def build_plan(
             if not ctx.get("signal_warm", True):
                 warmup_suppressed.append(item.model_name)
                 continue
-            if ctx.get("dwell_confirmed", True) is False:
-                dwell_suppressed.append(item.model_name)
-                continue
         elif ctx.get("signal_full_window", True) is False:
             breakpoint_held.append(item.model_name)
             continue
         kept.append(item)
-    if warmup_suppressed or dwell_suppressed or breakpoint_held:
+    if warmup_suppressed or breakpoint_held:
         for model in warmup_suppressed:
             reason = model_contexts.get(model, {}).get("signal_hold_reason")
             events.append(
@@ -471,7 +460,6 @@ def build_plan(
                 if reason
                 else f"receiver_suppressed_signal_warmup:{model}"
             )
-        events.extend(f"receiver_suppressed_dwell:{model}" for model in dwell_suppressed)
         events.extend(f"donor_suppressed_breakpoint_window:{model}" for model in breakpoint_held)
         classifications = kept
 
@@ -508,9 +496,11 @@ def build_plan(
             # would wait behind it on the model resource anyway.
             if recv.model_name in inflight_models and recv.model_name not in preemptible_models:
                 return None
-            if (cfg.scale_up_cooldown_enabled or not c1) and cooldown.blocks(
-                recv.model_name, "up", critical=True
-            ):
+            # Legacy one-step rescue (C1 off) only: without the C1 target bookkeeping the
+            # F4 / O1 holds keep an unreflected scale-up from being repeated. With C1 the
+            # rescue target ledger does (the opt-in scale_up_cooldown_enabled switch was
+            # removed in the timer cleanup 2026-10-02).
+            if not c1 and cooldown.blocks(recv.model_name, "up", critical=True):
                 return None
             recv_pods = _effective_routable_replicas(recv.model_name, model_contexts, model_replicas)
             recv_assigned = _effective_assigned_replicas(recv.model_name, model_contexts, model_replicas)

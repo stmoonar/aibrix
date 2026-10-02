@@ -42,7 +42,7 @@ class ModelStateBox:
             role = getattr(getattr(item, "role", None), "value", None)
             ctx = contexts.get(model) or {}
             if role == "receiver" and (
-                not ctx.get("signal_warm", True) or ctx.get("dwell_confirmed", True) is False
+                not ctx.get("signal_warm", True)
             ):
                 state = UNCONFIRMED
             elif ctx.get("signal_hold_reason") is not None:

@@ -222,3 +222,36 @@ commit needs at least the evidence volume the deadline commit needs
 * Each poll reads the hidden pods too (a few more scrapes per probe).
 
 Tests: `controller/tests/test_timer_cleanup_early_commit_20261002.py`.
+
+## 4. Dead timers removed
+
+### CRIT scale-up cooldown (`scaling.scale_up_cooldown_enabled`)
+
+C1 made the F4 hold of a CRITICAL receiver's scale-up opt-in; every shipped
+registry had it off, because the C1 rescue-target bookkeeping (`rescue_bases`)
+already keeps an unreflected scale-up from being repeated. The switch and its
+`PlanConfig` field are removed. The F4 / O1 view-pending hold of a CRITICAL
+scale-up remains only for the legacy one-step rescue (`rescue_max_step_ratio: 0`,
+C1 off), which has no target bookkeeping. The registry key still parses (a set
+key is logged as deprecated and ignored) and is no longer in the shipped
+registry / params mirror.
+
+### Band dwell (`TRE_DWELL_WINDOWS`, `TRE_DWELL_STATES`)
+
+The D8 dwell (a band acts only after N consecutive new windows) had been off
+(`1`) since the v1/paper alignment A5. `SignalState.apply_dwell`, its counters,
+the `dwell_confirmed` receiver suppression in the planner and the model-state box
+are removed. The environment variables still parse with the old validation and
+are logged as deprecated; the overlay no longer sets `TRE_DWELL_WINDOWS` (images
+before the cleanup default to `1` without it). `tre_common.dwell` stays: the
+offline calibration and hold-out tools use it.
+
+### Risks
+
+None in behaviour with the shipped configuration (both were off). A registry or
+environment that turned either on loses that hold; with O1 active, receivers
+still need post-breakpoint evidence.
+
+Tests: `controller/tests/test_band_dwell.py` (offline helper + "no controller
+dwell"), `controller/tests/test_c1_deficit_scaleup_20261001.py`
+(`test_scale_up_cooldown_key_is_ignored`), `controller/tests/test_action_cooldown.py`.

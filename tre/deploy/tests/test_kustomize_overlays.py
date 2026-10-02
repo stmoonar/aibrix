@@ -123,7 +123,8 @@ def test_tre_v2_overlay_declares_components_and_independent_redis() -> None:
     # alignment A5), also pinned: "1" = act on the first window.
     assert _env(controller)["TRE_METRICS_REFRESH_MODE"] == "phase_aligned"
     assert _env(controller)["TRE_METRICS_PHASE_OFFSET_MS"] == "2000"
-    assert _env(controller)["TRE_DWELL_WINDOWS"] == "1"
+    # Timer cleanup (2026-10-02): the band dwell was removed; older images default to off.
+    assert "TRE_DWELL_WINDOWS" not in _env(controller)
     # A2 (v1/paper alignment): receiver-less HIGH proactive SafeScale shrink live.
     assert _env(controller)["TRE_SAFESCALE_SUPPRESS_HOT_PROACTIVE"] == "0"
     # A6: SafeScale probe window W = max(multiplier * p95_e2e, floor), pinned. The floor
