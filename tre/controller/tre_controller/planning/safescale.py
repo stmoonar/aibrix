@@ -14,6 +14,7 @@ from tre_controller.planning.safescale_direct import (
     DirectPoll,
     DirectState,
     DirectWindow,
+    PodScrape,
     evaluate_poll,
     take_baseline,
 )
@@ -830,6 +831,12 @@ class SafeScaleStateMachine:
             # Deadline on the controller clock (hide confirmation + W), checked every tick.
             clock = int(wall_now if wall_now is not None else (self._wall_ms() or 0))
             if clock < updated.deadline_ms:
+                # Timer cleanup (2026-10-02): commit before the deadline when the evidence
+                # is already complete (every rollback check above ran first, unchanged).
+                early = self._try_early_commit(updated, health, now_ms=now_ms, wall_now_ms=clock,
+                                               poll=direct_poll)
+                if early is not None:
+                    return early
                 if updated is not probe:
                     self._persist_probe(updated)
                 return SafeScaleDecision(status="probing", reason="probe_pending")
@@ -841,17 +848,30 @@ class SafeScaleStateMachine:
         return self._judge(updated, health, now_ms=now_ms)
 
     def _judge(
-        self, probe: SafeScaleProbe, health: dict[str, float] | None, *, now_ms: int, wall_now_ms: int | None = None
-    ) -> SafeScaleDecision:
+        self,
+        probe: SafeScaleProbe,
+        health: dict[str, float] | None,
+        *,
+        now_ms: int,
+        wall_now_ms: int | None = None,
+        early: dict[str, Any] | None = None,
+    ) -> SafeScaleDecision | None:
         """The formal commit gate (v1 _tail_summary_allows_commit) at the deadline.
 
         Z (tail min) comes from the hq tail of the snapshot observations, as before. The
         latency check (and, on the direct path, the KV-cache fill) reads the direct
         scrape window (:meth:`_direct_outcome`), else the post-hide Redis evidence window
         (:meth:`_evidence_outcome`) when an evidence source is wired; without either
-        (direct constructions) it reads the tail snapshots, as before 2026-09-29."""
+        (direct constructions) it reads the tail snapshots, as before 2026-09-29.
+
+        ``early`` (timer cleanup 2026-10-02, direct path only): the same gates before
+        the deadline, on the evidence covered so far (``early["deadline_ms"]``). Returns
+        None - and changes nothing - unless every gate passes (no extension, wait,
+        rollback or gate failure is acted on early: the deadline decides those)."""
         model = probe.model
         direct_live = self._direct_live(probe)
+        if early is not None and not (self._direct_mode and direct_live):
+            return None
         evidence_mode = self._evidence is not None
         summary = _summarize_tail(
             probe,
@@ -877,9 +897,16 @@ class SafeScaleStateMachine:
             # Direct mode: only the direct evidence decides a commit (review P1-A). A
             # hide never confirmed extends to the ceiling, then rolls back.
             if direct_live:
-                outcome = self._direct_outcome(probe, summary, wall_now_ms=int(wall_now_ms or now_ms))
+                outcome = self._direct_outcome(
+                    probe, summary, wall_now_ms=int(wall_now_ms or now_ms),
+                    deadline_ms=early["deadline_ms"] if early is not None else None,
+                )
             else:
                 outcome = self._unconfirmed_outcome(probe)
+            if early is not None and (
+                outcome.kind != "judge" or not outcome.latency_ok or outcome.idle or outcome.low_samples
+            ):
+                return None
             if outcome.kind == "extend":
                 return self._extend(probe, outcome.audit,
                                     direct_now_ms=int(wall_now_ms or now_ms) if direct_live else None)
@@ -933,7 +960,11 @@ class SafeScaleStateMachine:
         failures = () if idle else tail_gate_failures(
             summary, tau_low=self._config.tau_low, kv_cache_max=self._config.kv_cache_max
         )
+        if early is not None and failures:
+            return None
         audit = {**tail_audit, **latency_audit}
+        if early is not None:
+            audit["early_commit"] = {key: value for key, value in early.items() if key != "deadline_ms"}
         details: dict[str, Any] = {
             "gate_failures": list(failures),
             "tail": _tail_record(summary),
@@ -945,6 +976,11 @@ class SafeScaleStateMachine:
         }
         if idle:
             details["idle_commit"] = True
+        if early is not None:
+            LOG.info(json.dumps({
+                "event": "safescale_early_commit", "model": model, "request_id": probe.request_id,
+                **audit["early_commit"],
+            }, sort_keys=True))
         if health is not None:
             details["donor_health"] = health
         if failures:
@@ -1190,7 +1226,8 @@ class SafeScaleStateMachine:
         )
 
     def _direct_outcome(
-        self, probe: SafeScaleProbe, summary: "ProbeTailSummary", *, wall_now_ms: int
+        self, probe: SafeScaleProbe, summary: "ProbeTailSummary", *, wall_now_ms: int,
+        deadline_ms: int | None = None,
     ) -> "_EvidenceOutcome":
         """The latency verdict of the direct window at the deadline.
 
@@ -1202,8 +1239,12 @@ class SafeScaleStateMachine:
         gap that can heal extends the deadline by one poll period (up to the ceiling);
         one that cannot, or any gap at the ceiling, rolls back
         ``evidence_incomplete:<gap>``. The Redis evidence is never consulted. A judged
-        violation rolls back whatever is missing."""
+        violation rolls back whatever is missing.
+
+        ``deadline_ms`` (early commit): the evidence must cover up to this moment
+        instead of the probe's deadline."""
         cfg = self._config
+        deadline = int(probe.deadline_ms) if deadline_ms is None else int(deadline_ms)
         cap = _deadline_cap(probe, cfg)
         can_extend = probe.deadline_ms < cap
         window_clamped = bool(probe.window_terms.get("window_clamped", probe.window_terms.get("clamped")))
@@ -1250,7 +1291,7 @@ class SafeScaleStateMachine:
             threshold_source=thresholds.get("source"),
             ttft_threshold_ms=thresholds["ttft_ms"],
             tpot_threshold_ms=thresholds["tpot_ms"],
-            deadline_ms=int(probe.deadline_ms),
+            deadline_ms=deadline,
         )
         if "fallback" in thresholds:
             audit["threshold_fallback"] = thresholds["fallback"]
@@ -1289,13 +1330,13 @@ class SafeScaleStateMachine:
         if outside:
             # Defensive: evaluate_poll already makes such a pod late.
             return gap("pods_outside_evidence", outside, heals=False)
-        if window.coverage_end_ms is None or window.coverage_end_ms < int(probe.deadline_ms):
+        if window.coverage_end_ms is None or window.coverage_end_ms < deadline:
             # The deciding poll's reads were sent before the deadline: the evidence ends
             # short of it. The next poll covers it; the deadline stays.
-            if int(wall_now_ms) - int(probe.deadline_ms) <= _direct_fresh_ms(cfg):
+            if int(wall_now_ms) - deadline <= _direct_fresh_ms(cfg):
                 return _EvidenceOutcome("wait", audit={**audit, "wait_reason": "coverage_before_deadline"})
             return gap("coverage_short", {"coverage_end_ms": window.coverage_end_ms,
-                                          "deadline_ms": int(probe.deadline_ms)}, heals=False)
+                                          "deadline_ms": deadline}, heals=False)
         if enough:
             audit.update(latency_gate="evaluated", latency_violations=[])
             return _EvidenceOutcome("judge", audit=audit, latency_ok=True)
@@ -1306,6 +1347,56 @@ class SafeScaleStateMachine:
         return _ceiling_outcome(
             audit, samples=samples, has_traffic=summary.has_traffic or in_flight, short=short,
             thresholds=thresholds, ttft_ms=window.low_ttft_p95_ms, tpot_ms=window.low_tpot_p95_ms,
+        )
+
+    def _try_early_commit(
+        self,
+        probe: SafeScaleProbe,
+        health: dict[str, float] | None,
+        *,
+        now_ms: int,
+        wall_now_ms: int,
+        poll: DirectPoll | None,
+    ) -> SafeScaleDecision | None:
+        """Timer cleanup (2026-10-02): commit a direct-evidence probe before its deadline
+        when (a) ``min_commit_samples`` requests of the remaining pods are judged, (b) the
+        formal commit gates pass on the evidence so far (:meth:`_judge` early mode: SLO,
+        KV-cache, Z tail, evidence completeness), (c) the hidden pods have nothing in
+        flight - the gateway's in-flight count and vLLM running + waiting both known and
+        0 - and (d) ``early_commit_min_observe_ms`` passed since the hide confirmation
+        and the snapshot tail holds a window ending a whole gateway grid after the hide.
+        None = keep probing (the deadline decides as before)."""
+        cfg = self._config
+        if not bool(getattr(cfg, "early_commit", False)) or poll is None:
+            return None
+        if poll.request_id != probe.request_id or probe.window_base_ms is None:
+            return None
+        state = probe.direct
+        window = state.last if state is not None else None
+        if window is None or window.coverage_end_ms is None or int(window.end_ms) != int(wall_now_ms):
+            return None
+        elapsed = int(wall_now_ms) - int(probe.window_base_ms)
+        if elapsed < float(getattr(cfg, "early_commit_min_observe_ms", 0.0) or 0.0):
+            return None
+        min_samples = int(getattr(cfg, "min_commit_samples", 20))
+        if not window.p95_available or window.judged_count < max(1, min_samples):
+            return None
+        post_hide = self._post_hide_start(probe)
+        latest = _latest_window_end(probe)
+        if post_hide is None or latest is None or int(latest) < int(post_hide) + _evidence_step_ms(cfg):
+            return None
+        drained = _hidden_drained(probe, poll)
+        if drained is None:
+            return None
+        return self._judge(
+            probe, health, now_ms=now_ms, wall_now_ms=wall_now_ms,
+            early={
+                "deadline_ms": int(window.coverage_end_ms),
+                "elapsed_ms": elapsed,
+                "samples": float(window.judged_count),
+                "planned_deadline_ms": int(probe.deadline_ms),
+                **drained,
+            },
         )
 
     def _unconfirmed_outcome(self, probe: SafeScaleProbe) -> "_EvidenceOutcome":
@@ -1695,6 +1786,21 @@ def _latency_violations(ttft_p95_ms: float | None, tpot_p95_ms: float | None, th
     if tpot_p95_ms is not None and tpot_p95_ms > thresholds["tpot_ms"]:
         violations.append("tpot")
     return violations
+
+
+def _hidden_drained(probe: SafeScaleProbe, poll: DirectPoll) -> dict[str, Any] | None:
+    """Early-commit condition (c): every hidden probe pod was scraped in this poll with
+    vLLM running + waiting known and 0, and the gateway's in-flight count of the hidden
+    pods is known and 0. None = not drained or unknown."""
+    hidden = getattr(poll, "hidden", None)
+    gateway = getattr(poll, "gateway_inflight", None)
+    if hidden is None or gateway is None or float(gateway) != 0.0:
+        return None
+    for pod in probe.pods:
+        scrape = hidden.get(pod)
+        if not isinstance(scrape, PodScrape) or scrape.in_flight is None or float(scrape.in_flight) != 0.0:
+            return None
+    return {"hidden_in_flight": 0.0, "gateway_in_flight": 0.0}
 
 
 def _rollback_code(probe: SafeScaleProbe, reason: str) -> str:

@@ -50,6 +50,7 @@ the gateway's TPOT is the same per-token histogram), ``vllm:request_prompt_token
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
 import re
@@ -602,6 +603,12 @@ class DirectPoll:
     #: The model's remaining pods in a FRESH cluster view at this poll (awake, not
     #: hidden, not the probe's); None = no fresh view.
     view_pods: tuple[str, ...] | None = None
+    #: Timer cleanup (early commit): the same poll's scrape of the probe's HIDDEN pods
+    #: (vLLM running + waiting), never part of the evidence. None = not scraped.
+    hidden: Mapping[str, "PodScrape | str"] | None = None
+    #: Gateway in-flight requests on the hidden pods (``tre:v2:gw:inflight:<pod>``
+    #: totals); None = unknown (not read, no live gateway instance, read error).
+    gateway_inflight: float | None = None
 
 
 def _late_entry(cause: str, *, lag_ms: int | None, ts_ms: int) -> dict[str, Any]:
@@ -1086,8 +1093,15 @@ class DirectEvidenceCollector:
         poll_ms: float,
         urls: Callable[[str, tuple[str, ...]], Mapping[str, str | None]] | None = None,
         clock_ms: Callable[[], int] | None = None,
+        hidden_scrape: bool = False,
+        gateway_inflight: Callable[[tuple[str, ...]], float | None] | None = None,
     ) -> None:
+        """``hidden_scrape`` / ``gateway_inflight`` (timer cleanup, early commit): each
+        poll also reads the probe's hidden pods' ``/metrics`` (running + waiting) and
+        their gateway in-flight count (``gateway_inflight(pods)``, None = unknown)."""
         self._safescale = safescale
+        self._hidden_scrape = bool(hidden_scrape)
+        self._gateway_inflight = gateway_inflight
         self._scraper = scraper
         self._targets = targets
         self._urls = urls or (lambda model, pods: {pod: dict(targets(model, ())).get(pod) for pod in pods})
@@ -1189,16 +1203,45 @@ class DirectEvidenceCollector:
             except Exception:  # noqa: BLE001 - no view this tick
                 LOG.exception("safescale direct remaining pods of %s unavailable", probe.model)
                 view = None
-            jobs.append((probe, {pod: urls.get(pod) for pod in pods}, view))
+            hidden: dict[str, str | None] = {}
+            if self._hidden_scrape:
+                try:
+                    hidden = {pod: url for pod, url in dict(self._urls(probe.model, tuple(probe.pods))).items()
+                              if pod not in pods}
+                except Exception:  # noqa: BLE001 - no hidden-pod data: no early commit
+                    LOG.exception("safescale hidden pod URLs of %s unavailable", probe.model)
+                    hidden = {}
+            jobs.append((probe, {pod: urls.get(pod) for pod in pods}, view, hidden))
         if not jobs:
             return polls
+        # One scrape per probe: the remaining pods (evidence) and the hidden pods (early
+        # commit drain check) read concurrently, split again below.
         results = await asyncio.gather(
-            *(self._scraper.scrape(targets, model_name=probe.model) for probe, targets, _ in jobs)
+            *(self._scraper.scrape({**targets, **hidden}, model_name=probe.model)
+              for probe, targets, _, hidden in jobs)
         )
+        gateway = await asyncio.gather(*(self._read_gateway_inflight(probe, hidden) for probe, _, _, hidden in jobs))
         ts_ms = int(self._clock_ms())
-        for (probe, _, view), result in zip(jobs, results):
-            polls[probe.model] = DirectPoll(request_id=probe.request_id, ts_ms=ts_ms, results=result, view_pods=view)
+        for (probe, targets, view, hidden), result, inflight in zip(jobs, results, gateway):
+            result = dict(result)
+            polls[probe.model] = DirectPoll(
+                request_id=probe.request_id, ts_ms=ts_ms,
+                results={pod: value for pod, value in result.items() if pod in targets},
+                view_pods=view,
+                hidden={pod: result[pod] for pod in hidden if pod in result} if self._hidden_scrape else None,
+                gateway_inflight=inflight,
+            )
         return polls
+
+    async def _read_gateway_inflight(self, probe: Any, hidden: Mapping[str, str | None]) -> float | None:
+        if not self._hidden_scrape or self._gateway_inflight is None or not hidden:
+            return None
+        try:
+            value = await asyncio.to_thread(self._gateway_inflight, tuple(probe.pods))
+        except Exception:  # noqa: BLE001 - unknown: no early commit
+            LOG.warning("safescale gateway in-flight of %s unavailable", probe.model, exc_info=True)
+            return None
+        return None if value is None else float(value)
 
     def close(self) -> None:
         """App shutdown: cancel the scheduled baselines and shut the scrape pool down."""
@@ -1207,6 +1250,38 @@ class DirectEvidenceCollector:
         close = getattr(self._scraper, "close", None)
         if callable(close):
             close()
+
+
+class GatewayInflightReader:
+    """Gateway in-flight requests on a set of pods (timer cleanup, early commit): the
+    sum of the ``total`` fields of ``tre:v2:gw:inflight:<pod>`` (one field per gateway
+    plugin instance, written by the transparent-sleep coordination). Conservative: a
+    field of any instance counts (also a stale one), and the answer is unknown (None)
+    when no plugin instance is registered (``tre:v2:gw:instances`` empty: nothing
+    writes the counts), on a read error or an unparsable field."""
+
+    def __init__(self, redis_client: Any) -> None:
+        self._redis = redis_client
+
+    def __call__(self, pods: tuple[str, ...]) -> float | None:
+        from tre_common import rediskeys
+
+        try:
+            if int(self._redis.zcard(rediskeys.GW_INSTANCES_KEY) or 0) <= 0:
+                return None
+            total = 0.0
+            for pod in pods:
+                for raw in (self._redis.hgetall(rediskeys.gw_inflight_key(pod)) or {}).values():
+                    text = raw.decode() if isinstance(raw, (bytes, bytearray)) else str(raw)
+                    payload = json.loads(text)
+                    value = float(payload["total"])
+                    if not math.isfinite(value) or value < 0:
+                        return None
+                    total += value
+            return total
+        except Exception:  # noqa: BLE001 - unknown: no early commit
+            LOG.warning("gateway in-flight read failed", exc_info=True)
+            return None
 
 
 def cluster_view_targets(view_getter: Callable[[], Any], *, port: int):

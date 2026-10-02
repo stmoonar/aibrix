@@ -164,3 +164,61 @@ donor is additionally held until a whole window follows it (O1 donor rule).
   request is cut) and is visible in the rollback-reason events.
 
 Tests: `controller/tests/test_timer_cleanup_rollback_gate_20261002.py`.
+
+## 3. SafeScale early commit
+
+### Before
+
+The probe window W = min(max(2 x p95_e2e, 20 s), 60 s) after the hide
+confirmation. A judged violation rolled back at once; otherwise the probe always
+waited for the deadline, even when the evidence was complete and the hidden pods
+were already idle - the probe pods stayed awake (and their GPUs unavailable to a
+receiver) for the rest of W.
+
+### Gate
+
+Direct evidence path only (`safescale.evidence_source: direct`; the Redis path
+keeps the deadline). On every poll before the deadline, after all rollback checks
+of that tick ran unchanged, the probe commits when all of these hold on the same
+poll:
+
+| | Condition |
+|---|---|
+| (a) | at least `min_commit_samples` requests of the remaining pods judged, p95 available |
+| (b) | the formal commit gates pass on the evidence covered so far (`_judge` in early mode: latency SLO, complete evidence of every remaining pod in this poll, fresh cluster view, KV-cache ceiling, Z tail >= tau_low); the evidence must cover up to the poll's read time instead of the deadline |
+| (c) | the hidden pods have nothing in flight: vLLM `num_requests_running + num_requests_waiting` of each hidden pod (scraped in the same poll, never part of the evidence) known and 0, and the gateway in-flight count (`tre:v2:gw:inflight:<pod>` totals, any instance, with at least one registered gateway instance) known and 0 |
+| (d) | `early_commit_min_grids` gateway grids (default 1 = 10 s) passed since the hide confirmation, and the snapshot tail holds a window ending a whole grid after the first gateway boundary following the hide |
+
+In early mode nothing but a commit is acted on: an outcome that would extend,
+wait, roll back or fail a gate leaves the probe probing, and the deadline decides
+as before. The commit is the same `scale_down` of the hidden pods with the same
+follow-up upscales; its decision carries `early_commit` {`elapsed_ms`, `samples`,
+`planned_deadline_ms`, in-flight counts}, logged as the JSON event
+`safescale_early_commit` and as the tick event
+`safescale_early_commit:<m>:elapsed_ms=..:samples=..`.
+
+### Configuration
+
+Registry `safescale.early_commit: true`, `safescale.early_commit_min_grids: 1`
+(and the params mirror). `false` = deadline only. The controller wires the hidden
+pod scrape and the gateway reader only when enabled.
+
+### Why rollback is not weakened
+
+The rollback checks (preemption, hide failure, direct SLO violation, donor
+health) run before the early check on every tick, exactly as before. An early
+commit needs at least the evidence volume the deadline commit needs
+(`min_commit_samples`) and passes the same gates.
+
+### Risks
+
+* Less elapsed time means fewer samples of slow phases (for example long decodes
+  that complete later); (a) and (d) bound this, and min grids can be raised.
+* The Z gate reads the snapshot tail, whose 30 s windows still include pre-hide
+  grids early in the probe (as at a 20 s deadline); (d) requires one whole
+  post-hide grid in the newest window.
+* The gateway count includes fields of instances that stopped without clearing
+  them; that only blocks an early commit (the deadline still decides).
+* Each poll reads the hidden pods too (a few more scrapes per probe).
+
+Tests: `controller/tests/test_timer_cleanup_early_commit_20261002.py`.

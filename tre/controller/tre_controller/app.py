@@ -34,6 +34,7 @@ from tre_controller.loops.safescale_task import safescale_task
 from tre_controller.planning.safescale import SafeScaleStateMachine
 from tre_controller.planning.safescale_direct import (
     DirectEvidenceCollector,
+    GatewayInflightReader,
     PodMetricsScraper,
     cluster_view_remaining,
     cluster_view_targets,
@@ -351,6 +352,10 @@ def create_controller_dependencies(
             cluster_view_targets(cluster_view_box.fresh, port=cfg.safescale.metrics_port),
             poll_ms=cfg.safescale.evidence_poll_ms,
             urls=cluster_view_urls(cluster_view_box.get, port=cfg.safescale.metrics_port),
+            # Timer cleanup (early commit): the hidden pods' running + waiting and their
+            # gateway in-flight count (TRE Redis, transparent-sleep coordination keys).
+            hidden_scrape=bool(cfg.safescale.early_commit),
+            gateway_inflight=GatewayInflightReader(redis_client) if cfg.safescale.early_commit else None,
         )
     # The effective evidence settings (unknown registry keys are only warned about).
     logging.getLogger("tre_controller.safescale").info(json.dumps({
@@ -363,6 +368,9 @@ def create_controller_dependencies(
         "min_commit_samples": cfg.safescale.min_commit_samples,
         "window_ceiling_ms": cfg.safescale.window_ceiling_ms,
         "slo_mode": cfg.safescale.slo_mode,
+        "early_commit": cfg.safescale.early_commit,
+        "early_commit_min_observe_ms": cfg.safescale.early_commit_min_observe_ms,
+        "rollback_retry_z_margin": cfg.safescale.rollback_retry_z_margin,
     }, sort_keys=True))
     observe_gate = ObserveModeGate(redis_client)
     profiler = build_profiler(cfg, redis_client)

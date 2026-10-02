@@ -585,6 +585,15 @@ data:
       # failures) need the new window only. Controller images before 2026-10-02 log this
       # key as unknown (they use TRE_SAFESCALE_ROLLBACK_BACKOFF_MS).
       rollback_retry_z_margin: 0.25
+      # Direct path: commit before the deadline (timer cleanup) once, on the same poll,
+      # min_commit_samples requests are judged, every commit gate passes (SLO, KV cache,
+      # Z tail, complete evidence of every remaining pod), the hidden pods have nothing in
+      # flight (gateway in-flight count and vLLM running + waiting, both known and 0) and
+      # early_commit_min_grids gateway grids (10 s each) passed since the hide
+      # confirmation. Rollback checks are unchanged and run first on every tick. false =
+      # commit at the deadline only.
+      early_commit: true
+      early_commit_min_grids: 1
 
     # Fast-loop scale-up (controller only; read at start, restart-to-apply; every key
     # optional, the values below are the built-in defaults). C1, design

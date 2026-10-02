@@ -731,12 +731,18 @@ class SafeScaleRegistryConfig:
     #: failed probe started from, or its Z is at least this much (absolute, Z units)
     #: above the Z that started it. Replaces the fixed 60 s rollback backoff.
     rollback_retry_z_margin: float = 0.25
+    #: Timer cleanup (2026-10-02): commit a direct-evidence probe before its deadline
+    #: once min_commit_samples requests are judged, every commit gate passes, the hidden
+    #: pods have nothing in flight (gateway count and vLLM running + waiting) and at
+    #: least ``early_commit_min_grids`` gateway grids passed since the hide confirmation.
+    early_commit: bool = True
+    early_commit_min_grids: int = 1
 
 
 SAFESCALE_KEYS = frozenset({
     "slo_mode", "window_ceiling_s", "min_commit_samples", "evidence_clock_tolerance_s",
     "evidence_source", "evidence_poll_s", "scrape_timeout_s", "metrics_port", "baseline_delay_ms",
-    "rollback_retry_z_margin",
+    "rollback_retry_z_margin", "early_commit", "early_commit_min_grids",
 })
 SAFESCALE_EVIDENCE_SOURCES = ("direct", "redis")
 
@@ -811,6 +817,17 @@ def parse_safescale_config(raw: dict[str, Any] | None) -> SafeScaleRegistryConfi
     z_margin = _safescale_num(raw, "rollback_retry_z_margin", defaults.rollback_retry_z_margin)
     if not math.isfinite(z_margin) or z_margin < 0:
         raise ValueError(f"safescale.rollback_retry_z_margin must be a non-negative number, got {z_margin!r}")
+    early = raw.get("early_commit", defaults.early_commit)
+    if not isinstance(early, bool):
+        raise ValueError(f"safescale.early_commit must be true or false, got {early!r}")
+    grids_raw = raw.get("early_commit_min_grids")
+    grids = defaults.early_commit_min_grids if grids_raw is None else grids_raw
+    try:
+        valid_grids = not isinstance(grids, bool) and float(grids) == int(float(grids)) and int(float(grids)) >= 1
+    except (TypeError, ValueError, OverflowError):
+        valid_grids = False
+    if not valid_grids:
+        raise ValueError(f"safescale.early_commit_min_grids must be an integer >= 1, got {grids!r}")
     return SafeScaleRegistryConfig(
         slo_mode=mode,
         window_ceiling_s=float(ceiling),
@@ -822,6 +839,8 @@ def parse_safescale_config(raw: dict[str, Any] | None) -> SafeScaleRegistryConfi
         metrics_port=int(float(port)),
         baseline_delay_ms=float(baseline_delay),
         rollback_retry_z_margin=float(z_margin),
+        early_commit=early,
+        early_commit_min_grids=int(float(grids)),
     )
 
 

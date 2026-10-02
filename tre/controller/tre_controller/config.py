@@ -100,6 +100,13 @@ class SafeScaleConfig:
     # least this much above the Z that started it. Other rollbacks (evidence gaps,
     # maintenance, observe mode, hide failures) need the new window only.
     rollback_retry_z_margin: float = 0.25
+    # Timer cleanup (registry safescale.early_commit / early_commit_min_grids): a
+    # direct-evidence probe commits before its deadline once min_commit_samples requests
+    # are judged, every commit gate passes, the hidden pods have nothing in flight
+    # (gateway count and vLLM running + waiting) and early_commit_min_observe_ms passed
+    # since the hide confirmation (min grids x the gateway period). Rollbacks unchanged.
+    early_commit: bool = True
+    early_commit_min_observe_ms: float = 10_000.0
     # B8: max age (ms) of a probe's commit evidence at the commit's FIRST dispatch. A commit
     # decided (probe marked ``committing``) longer ago than this - held in observe mode,
     # queued behind a long action, or re-submitted after a controller restart - is not run
@@ -300,6 +307,9 @@ class ControllerConfig:
             donor_min_requests=_get_positive_float(values, "TRE_SAFESCALE_DONOR_MIN_REQUESTS", 20.0),
             rollback_backoff_ms=_deprecated_rollback_backoff_ms(values),
             rollback_retry_z_margin=float(safescale_registry.rollback_retry_z_margin),
+            early_commit=bool(safescale_registry.early_commit),
+            early_commit_min_observe_ms=float(safescale_registry.early_commit_min_grids)
+            * float(instant_sample_interval_ms),
             commit_max_age_ms=_get_nonneg_float(
                 values, "TRE_SAFESCALE_COMMIT_MAX_AGE_MS", SafeScaleConfig.commit_max_age_ms
             ),

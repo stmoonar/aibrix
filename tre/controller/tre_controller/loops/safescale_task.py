@@ -167,6 +167,13 @@ def run_safescale_observation_tick(
         extra = {"direct_poll": poll} if poll is not None else {}
         decision = safescale.observe(probe.model, observation, now_ms=snapshot.ts_ms, **extra)
         events.append(f"safescale_{decision.reason}:{probe.model}")
+        early = (getattr(decision, "details", None) or {}).get("early_commit")
+        if early:
+            # Timer cleanup (2026-10-02): committed before the probe's deadline.
+            events.append(
+                f"safescale_early_commit:{probe.model}:elapsed_ms={int(early.get('elapsed_ms', 0))}"
+                f":samples={float(early.get('samples', 0.0)):.0f}"
+            )
         gate_failures = _gate_failures(safescale, probe.model, decision)
         if gate_failures:
             events.append(f"safescale_gate_failures:{probe.model}:{','.join(gate_failures)}")
