@@ -398,6 +398,34 @@ def test_dry_run_writes_the_plan_without_driving_anything(tmp_path, monkeypatch)
     assert set(provenance["label_by_model"]) == {"dsqwen-7b"}
 
 
+def test_a_real_run_that_drives_every_cell_ends_complete(tmp_path, monkeypatch) -> None:
+    # 2026-10-03: all of round 1 was driven, then the run died on a name the driver did
+    # not have (static_cells) and recorded itself as failed. Dry runs stop before that
+    # code, so drive a real run here (nothing runnable, the cluster checks faked).
+    index = _index()
+    for entry in index["schedules"]:
+        entry["skipped"] = True
+        entry["reason"] = "nothing to drive in this test"
+    index_path = tmp_path / "INDEX.json"
+    index_path.write_text(json.dumps(index), encoding="utf-8")
+    monkeypatch.setattr(campaign, "require_calibration_run_mode",
+                        lambda *a, **k: {"controller_mode": "observe", "sm_actuation": "observe"})
+    monkeypatch.setattr(campaign, "require_capture_clock_domains", lambda *a, **k: None)
+    monkeypatch.setattr(campaign, "require_prompt_preflight", lambda *a, **k: None)
+
+    exit_code = campaign.main([
+        "--design", "primitives",
+        "--index", str(index_path), "--models", "dsqwen-7b",
+        "--out-dir", str(tmp_path / "out"), "--raw-dir", str(tmp_path / "raw"),
+        "--gateway-url", "http://gateway.invalid/v1/chat/completions",
+        "--stop-on-failure",
+    ])
+
+    assert exit_code == 0
+    status = json.loads((tmp_path / "out" / campaign.CAMPAIGN_STATUS_FILE).read_text(encoding="utf-8"))
+    assert (status["status"], status["exit_code"]) == ("complete", 0)
+
+
 # ------------------------------------------------------------------ boundary search
 
 

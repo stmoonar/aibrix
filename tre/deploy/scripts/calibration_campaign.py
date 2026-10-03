@@ -2310,6 +2310,7 @@ def run_campaign(args) -> int:
     status, code = "failed", 1
     try:
         code = _drive_campaign(args, index=index, cap=cap, runnable=runnable,
+                               static_cells=static_cells,
                                out_dir=out_dir, raw_dir=raw_dir, schedule_root=schedule_root)
         status = "complete" if code == 0 else "stopped"
     except KeyboardInterrupt:
@@ -2321,7 +2322,8 @@ def run_campaign(args) -> int:
     return code
 
 
-def _drive_campaign(args, *, index, cap, runnable, out_dir, raw_dir, schedule_root) -> int:
+def _drive_campaign(args, *, index, cap, runnable, static_cells, out_dir, raw_dir,
+                    schedule_root) -> int:
     measured_dir = out_dir / "capacity"
     measured_dir.mkdir(parents=True, exist_ok=True)
     boundary_dir = out_dir / "boundary"

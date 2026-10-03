@@ -26,11 +26,23 @@
 # on; D2 / D4 compute into $CALIB_ROOT/dryrun. Point RUN1_ROOT / PRIORS_DIR / RUN2_ROOT /
 # SUPP_ROOT at an earlier round to exercise the later steps before their inputs exist.
 #
+# Resume after D1 (CHAIN_REUSE_RUN1=1): D1 is not driven; the run1 already under
+# RUN1_ROOT/<model> is accepted only if it is verifiably complete (run1_reuse_check:
+# every planned cell and boundary search on disk, every dataset row valid, no guard
+# voided, no backfill pending, clean code commit). Then run1.<model>.rc = 0, the evidence
+# in $CHAIN_DIR/run1.<model>.reused.json and a CHAIN_STATUS line D1 "reused"; otherwise
+# run1.<model>.rc = 1 and the chain stops. run1 is only read: its campaign_status.json
+# stays as the run wrote it. Used on 2026-10-03: run1 of cc3964b6 drove every cell, then
+# died in _drive_campaign (NameError static_cells) and recorded status "failed". Start
+# every chain with the switch and no chain/run1.*.rc left from an earlier attempt.
+#
 # Environment (nothing site-specific is written here):
 #   CALIB_ROOT        (required) this round's root; every output, log and status is under it
 #   DESIGN_SEED       (required) passed to every launcher
 #   TRE_CALIBRATION_GATEWAY_URL, TRE_EXCLUSIVE_WINDOW_FILE, CALIB_TASKSET   for the launchers
 #   CHAIN_MODELS      models the D2 barrier waits for (default: the three calibration models)
+#   CHAIN_REUSE_RUN1  1 = reuse a complete run1 instead of driving D1 (see above; default 0)
+#   CHAIN_REUSE_RUN1_NOTE  free text recorded with the reuse (why D1 is not re-driven)
 #   RUN1_ROOT PRIORS_DIR RUN2_ROOT SUPP_ROOT P1_ROOT
 #                     default $CALIB_ROOT/{run1,prereg,run2,supp,p1}
 #   TRAINING_PLAN     D5 plan (default p1-deep-overload)
@@ -76,6 +88,8 @@ export DESIGN_SEED
 : "${CHAIN_POLL_S:=60}"
 : "${CHAIN_BARRIER_TIMEOUT_S:=86400}"
 : "${CALIB_DRYRUN_ROOT:=$CALIB_ROOT/dryrun}"
+: "${CHAIN_REUSE_RUN1:=0}"
+[[ "$CHAIN_REUSE_RUN1" =~ ^[01]$ ]] || { echo "FATAL: CHAIN_REUSE_RUN1 must be 0 or 1" >&2; exit 2; }
 export CALIB_DRYRUN_ROOT
 if [[ "$DRY" == 1 ]]; then
   CHAIN_DIR="$CALIB_DRYRUN_ROOT/chain"
@@ -249,13 +263,116 @@ d5() {
     bash "$CAL/run_stage3.sh" "$MODEL" ${DRY_FLAG[@]+"${DRY_FLAG[@]}"}
 }
 
+# ---------------------------------------------------------------- D1 reuse
+# run1_reuse_check <evidence.json>: CHAIN_REUSE_RUN1=1 accepts the run1 already on disk
+# instead of driving D1, only when it is verifiably complete: one campaign of this model,
+# clean code commit, every cell plan.json scheduled present in the standard dataset
+# (run1/<model>/dataset/cells.csv), every dataset row valid with its csv / raw / guard
+# on disk and the guard not voided, every planned boundary search written without a stop
+# reason, no capture backfill pending, no static grid planned. Reads run1 only; writes
+# the evidence JSON and prints a one-line summary (exit 1 + reason on stderr otherwise).
+run1_reuse_check() {
+  ( enter_deploy
+    python3 - "$RUN1_ROOT/$MODEL" "$MODEL" "$1" \
+      "$(git -C "$CALIB_REPO" rev-parse HEAD 2>/dev/null || echo unknown)" \
+      "${CHAIN_REUSE_RUN1_NOTE:-}" <<'PY'
+import csv, json, sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+from scripts import calibration_capture as capture
+
+run, model, evidence_path, chain_git, note = (Path(sys.argv[1]), sys.argv[2], Path(sys.argv[3]),
+                                              sys.argv[4], sys.argv[5])
+
+
+def fail(why):
+    sys.exit(f"run1 of {model} at {run} is not reusable: {why}")
+
+
+def load(path):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        fail(f"{path.name}: {exc}")
+
+
+plan = load(run / "plan.json")
+status = load(run / "campaign_status.json")
+code = (plan.get("provenance") or {}).get("code") or {}
+if plan.get("models") != [model]:
+    fail(f"plan.json models {plan.get('models')}")
+if not code.get("commit") or code.get("dirty") is not False:
+    fail(f"plan.json code {code} is not a clean commit")
+if (plan.get("static_grid") or {}).get("cells"):
+    fail("plan.json has static-grid cells (not checked here)")
+try:
+    with open(run / "dataset" / "cells.csv", newline="", encoding="utf-8") as fh:
+        rows = list(csv.DictReader(fh))
+except OSError as exc:
+    fail(f"dataset/cells.csv: {exc}")
+if not rows or {r["model"] for r in rows} != {model}:
+    fail("dataset/cells.csv is empty or holds another model")
+bad = [f"{r['shape']}/{r['primitive']}/{r['stage']}/{r['cell_id']}={r['status']}"
+       for r in rows if r["status"] != "valid"]
+if bad:
+    fail(f"{len(bad)} dataset row(s) not valid: {', '.join(bad[:5])}")
+for r in rows:
+    for col in ("online_csv_path", "raw_path", "guard_path"):
+        p = run / r[col] if r[col] else None
+        if p is None or not p.is_file() or p.stat().st_size == 0:
+            fail(f"{r['cell_id']} ({r['shape']}/{r['primitive']}): {col} {r[col]!r} missing or empty")
+    if load(run / r["guard_path"]).get("voided") is not False:
+        fail(f"guard {r['guard_path']} is voided")
+planned = sorted((c["shape"], c["primitive"]) for c in plan.get("cells") or [])
+driven = sorted((r["shape"], r["primitive"]) for r in rows if r["primitive"] != "hold")
+if not planned or driven != planned:
+    fail(f"planned cells {planned} != dataset cells {driven}")
+searches = {}
+for b in plan.get("boundary_cells") or []:
+    doc = load(run / "boundary" / f"{model}_{b['shape']}.json")
+    if doc.get("stopped_reason") or doc.get("rho_star") is None:
+        fail(f"boundary {b['shape']}: rho_star {doc.get('rho_star')} stopped {doc.get('stopped_reason')!r}")
+    if not any(r["shape"] == b["shape"] and r["primitive"] == "hold" for r in rows):
+        fail(f"boundary {b['shape']}: no probe cell in the dataset")
+    searches[b["shape"]] = {"rho_star": doc["rho_star"], "status": doc.get("rho_star_status")}
+pending = capture.pending_cells(run, max_age_s=None)
+if pending:
+    fail(f"{len(pending)} capture backfill(s) pending: {[p.name for p in pending][:5]}")
+evidence_path.write_text(json.dumps({
+    "model": model, "run": str(run), "run_code_commit": code["commit"],
+    "campaign_status": status, "planned_cells": len(planned),
+    "boundary_searches": searches, "dataset_rows": len(rows),
+    "reused_at_utc": datetime.now(timezone.utc).isoformat(), "chain_code_commit": chain_git,
+    "note": note,
+}, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+print(f"run1 not re-driven: driven at git {code['commit'][:8]}, campaign_status "
+      f"{status.get('status')} exit {status.get('exit_code')}; {len(planned)} planned cells + "
+      f"{len(searches)} boundary searches complete, {len(rows)} dataset rows valid; "
+      f"evidence {evidence_path}" + (f"; {note}" if note else ""))
+PY
+  )
+}
+
 # ================================================================= main
-status chain start null "dry_run=$DRY repo=$CALIB_REPO git=$(git -C "$CALIB_REPO" rev-parse --short HEAD 2>/dev/null || echo unknown) run1=$RUN1_ROOT priors=$PRIORS_DIR run2=$RUN2_ROOT supp=$SUPP_ROOT p1=$P1_ROOT plan=$TRAINING_PLAN"
+status chain start null "dry_run=$DRY repo=$CALIB_REPO git=$(git -C "$CALIB_REPO" rev-parse --short HEAD 2>/dev/null || echo unknown) run1=$RUN1_ROOT priors=$PRIORS_DIR run2=$RUN2_ROOT supp=$SUPP_ROOT p1=$P1_ROOT plan=$TRAINING_PLAN reuse_run1=$CHAIN_REUSE_RUN1"
 
 # D1
-set +e; run_step D1 "$(step_log D1)" d1; rc=$?; set -e
-[[ "$DRY" == 1 ]] || echo "$rc" > "$CHAIN_DIR/run1.$MODEL.rc"
-[[ "$rc" == 0 ]] || stop D1 "$rc" "run1 failed"
+if [[ "$CHAIN_REUSE_RUN1" == 1 ]]; then
+  log="$(step_log D1reuse)"
+  status D1 reuse_check null "run1=$RUN1_ROOT/$MODEL log=$log"
+  set +e; detail="$(run1_reuse_check "$CHAIN_DIR/run1.$MODEL.reused.json" 2>"$log")"; rc=$?; set -e
+  if [[ "$rc" != 0 ]]; then
+    [[ "$DRY" == 1 ]] || echo 1 > "$CHAIN_DIR/run1.$MODEL.rc"
+    stop D1 1 "CHAIN_REUSE_RUN1=1 but run1 is not verifiably complete: $(tail -n 1 "$log")"
+  fi
+  [[ "$DRY" == 1 ]] || echo 0 > "$CHAIN_DIR/run1.$MODEL.rc"
+  status D1 reused 0 "$detail"
+else
+  set +e; run_step D1 "$(step_log D1)" d1; rc=$?; set -e
+  [[ "$DRY" == 1 ]] || echo "$rc" > "$CHAIN_DIR/run1.$MODEL.rc"
+  [[ "$rc" == 0 ]] || stop D1 "$rc" "run1 failed"
+fi
 
 # barrier + D2
 [[ "$DRY" == 1 ]] || barrier_run1
