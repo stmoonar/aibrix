@@ -858,6 +858,7 @@ def run_schedule_cell(args, store, spec, redis_client=None) -> tuple[list, "open
         request_seed=getattr(args, "request_seed", None),
         sender_processes=getattr(args, "sender_processes", None),
         client_out=client_provenance,
+        arrivals=getattr(args, "arrivals", openloop.ARRIVALS_POISSON),
         guard_kwargs={
             "max_p99_delay_ms": args.max_p99_delay_ms,
             "max_p99_pool_wait_ms": args.max_p99_pool_wait_ms,
@@ -951,6 +952,7 @@ def run_schedule_cell(args, store, spec, redis_client=None) -> tuple[list, "open
         "ttft_basis": "first_chunk_with_text",
         # What made this cell's arrivals and prompts its own (see openloop).
         "schedule_seed": args.schedule_seed,
+        "arrivals": getattr(args, "arrivals", openloop.ARRIVALS_POISSON),
         "prompt_key": args.prompt_key,
         "prompt_file": (
             None
@@ -1344,6 +1346,10 @@ def parse_args(argv: Optional[Sequence[str]] = None):
                          "default is the same for every cell, so two cells with the same "
                          "segments get the same arrival instants; a campaign whose cells "
                          "must be independent passes one per cell")
+    ap.add_argument("--arrivals", default=openloop.ARRIVALS_POISSON, choices=list(openloop.ARRIVALS),
+                    help="arrival process of the schedule cell: poisson (default) or "
+                         "deterministic (every 1/rps s from each segment's start; one request "
+                         "per one-interval segment - the idle-TTFT capture)")
     ap.add_argument("--prompt-key", default=None,
                     help="namespace for this cell's request ids, and therefore for its "
                          "prompt seeds. Without it request k of every schedule of a model "

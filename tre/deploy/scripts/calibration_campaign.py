@@ -2048,7 +2048,8 @@ def preflight_input_lengths(shapes: Optional[Sequence[str]] = None) -> list[int]
 
 def require_prompt_preflight(args, models: Optional[Sequence[str]] = None,
                              out_dir: Optional[Path] = None,
-                             shapes: Optional[Sequence[str]] = None) -> Optional[dict]:
+                             shapes: Optional[Sequence[str]] = None,
+                             lengths: Optional[Sequence[int]] = None) -> Optional[dict]:
     """The run-level prompt-length pre-flight: for every model and every length of
     :func:`preflight_input_lengths` (the run's shortest cell input, 512, its longest), one
     request of the run's exact kind (``openloop.preflight_prompt_tokens``: same builder,
@@ -2058,14 +2059,15 @@ def require_prompt_preflight(args, models: Optional[Sequence[str]] = None,
     share. Raises SystemExit listing every failure otherwise - fail-closed, like the
     clock-domain pre-flight next to which every entry point calls it. The verdicts go to
     ``<out_dir>/prompt_preflight.json``. ``--prompt-preflight skip`` skips it (recorded
-    in the provenance)."""
+    in the provenance). ``lengths`` replaces the shape-derived lengths (a run whose
+    cells are not calibration shapes, e.g. :mod:`scripts.ttft_idle_capture`)."""
     if getattr(args, "prompt_preflight", "refuse") == "skip":
         print("WARNING: --prompt-preflight skip: the prompt lengths were not checked against the engine")
         return None
     if models is None:
         models = [m for m in str(getattr(args, "models", "") or "").split(",") if m]
     corpus = prompt_corpus(args)
-    lengths = preflight_input_lengths(shapes)
+    lengths = sorted({int(n) for n in lengths}) if lengths else preflight_input_lengths(shapes)
     checks: dict[str, list[dict]] = {}
     for model in models:
         for length in lengths:
