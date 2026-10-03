@@ -397,90 +397,9 @@ def fit_model(model: str, label, fitting_csv: Path, *, trim: int,
 
 
 # ------------------------------------------------------- B' (severity-aligned CRITICAL)
-
-
-def severity(w) -> float:
-    """Severity of one v2 window, as ``tre_calibration.fit.fit_delta_margins`` grades it:
-    0.8 * p95 ratio + 0.2 * average ratio, the average falling back to the p95 ratio
-    (always so under the slowdown label, whose windows carry no average ratio)."""
-    p95 = w.latency_ratio_p95 if w.latency_ratio_p95 is not None else (1.0 / w.health_score) - 1.0
-    avg = w.latency_ratio_avg if w.latency_ratio_avg is not None else p95
-    return 0.8 * p95 + 0.2 * avg
-
-
-def severity_cut(train_windows: Sequence[Any], q: float = 0.65) -> float:
-    """The training set's severity quantile of the violating windows - the cut
-    ``fit_delta_margins`` labels its critical windows with (same ``_quantile``)."""
-    from tre_calibration.fit import _quantile
-
-    sev = [severity(w) for w in train_windows if math.isfinite(w.signal) and not w.slo_met]
-    cut = _quantile(sev, q)
-    if cut is None:
-        raise ValueError("no violating training window")
-    return float(cut)
-
-
-def b_prime_point(windows: Sequence[Any], *, theta: float, tau_crit: float, cut: float,
-                  crit0: Sequence[bool], crit2: Sequence[bool]) -> dict:
-    """B' on one window list: CRITICAL recall of violations with severity >= ``cut``
-    (no dwell / dwell 2), healthy false alarm, all-violation recall, and where the
-    violations fall (CRITICAL / LOW band tau_crit <= Z < 1 / Z >= 1)."""
-    def rate(sel, flags):
-        return (sum(1 for i in sel if flags[i]) / len(sel)) if sel else None
-
-    idx = [i for i, w in enumerate(windows) if math.isfinite(w.signal)]
-    viol = [i for i in idx if not windows[i].slo_met]
-    ok = [i for i in idx if windows[i].slo_met]
-    sev = [i for i in viol if severity(windows[i]) >= cut]
-    z = {i: windows[i].signal / theta for i in idx}
-    missed = [i for i in viol if not crit0[i]]
-    low = [i for i in viol if tau_crit <= z[i] < 1.0]
-    return {
-        "violating": len(viol), "healthy": len(ok), "severe_windows": len(sev), "severity_cut": cut,
-        "nodwell": {"recall_severe": rate(sev, crit0), "false_alarm": rate(ok, crit0),
-                    "recall_all": rate(viol, crit0)},
-        "dwell2": {"recall_severe": rate(sev, crit2), "false_alarm": rate(ok, crit2),
-                   "recall_all": rate(viol, crit2)},
-        "violations_by_band": {
-            "critical": (sum(1 for i in viol if z[i] < tau_crit) / len(viol)) if viol else None,
-            "low": (len(low) / len(viol)) if viol else None,
-            "healthy_side_z_ge_1": (sum(1 for i in viol if z[i] >= 1.0) / len(viol)) if viol else None,
-        },
-        "missed_caught_by_slow_loop": (sum(1 for i in missed if z[i] < 1.0) / len(missed)) if missed else None,
-    }
-
-
-def b_prime_boot(windows: Sequence[Any], *, theta: float, tau_crit: float, cut: float,
-                 crit: Sequence[bool], n: int = 1000, seed: int = 20260922) -> dict:
-    """Cell bootstrap (scenario ids with replacement) CI95 of the B' recall / false alarm
-    for one flag series."""
-    import random
-
-    by: dict[str, list[int]] = defaultdict(list)
-    for i, w in enumerate(windows):
-        if math.isfinite(w.signal):
-            by[w.scenario_id].append(i)
-    cells = sorted(by)
-    cnt = {}
-    for c in cells:
-        sev = [i for i in by[c] if not windows[i].slo_met and severity(windows[i]) >= cut]
-        ok = [i for i in by[c] if windows[i].slo_met]
-        cnt[c] = (sum(crit[i] for i in sev), len(sev), sum(crit[i] for i in ok), len(ok))
-    rec, fa = [], []
-    rng = random.Random(seed)
-    for _ in range(n if cells else 0):
-        pick = [rng.choice(cells) for _ in cells]
-        a = [sum(cnt[c][k] for c in pick) for k in range(4)]
-        if a[1]:
-            rec.append(a[0] / a[1])
-        if a[3]:
-            fa.append(a[2] / a[3])
-
-    def ci(v):
-        v = sorted(v)
-        return [v[int(0.025 * len(v))], v[int(0.975 * len(v)) - 1]] if v else [None, None]
-
-    return {"recall_severe_ci95": ci(rec), "false_alarm_ci95": ci(fa), "n": n, "seed": seed}
+# Moved to scripts.b_prime (2026-10-03: B' is the accept gate of dline_refit); re-exported
+# here for v1_lambda_compare and older callers.
+from scripts.b_prime import b_prime_boot, b_prime_point, severity, severity_cut  # noqa: E402,F401
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

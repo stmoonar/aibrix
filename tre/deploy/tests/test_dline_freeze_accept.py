@@ -22,6 +22,7 @@ ARM = "fixed"          # the fixed 500 / 75 ms label: the windows' outcome is se
 TAU_CRIT = 0.73
 TRAIN_BA = 0.9
 BOOT = 40
+TRAIN_VIOLATING_TPOT = 90.0
 
 _IDENTITY = ["model", "shape", "primitive", "stage", "rho", "cell_id", "attempt", "split", "cell_status", "role",
              "rho_factor", "replicate", "possibly_contaminated", "in_warmup"]
@@ -90,6 +91,10 @@ def _world(tmp_path: Path, *, stop_ok: bool = True, holdout_evaluated: bool = Fa
     train = []
     for n, shape in enumerate(("S1", "S3", "S4", "S5", "S3", "S4")):
         train += _cell_rows(1_100_000 + n, shape=shape, split="train", role="ladder", stage="ladder")
+    # two violating training cells (TPOT 90 / 75 ms: severity 1.2) - the B' cut's source
+    for n, shape in enumerate(("S1", "S5")):
+        train += _cell_rows(1_100_010 + n, shape=shape, split="train", role="ladder", stage="ladder", signal="lo",
+                            tpot=TRAIN_VIOLATING_TPOT)
     _write_dataset(tmp_path / "run2" / "dataset", train, train_manifest)
     fit = tmp_path / "fit"
     assert dl.main(["trainset", "--fit-dir", str(fit), "--h2-dataset", str(tmp_path / "run2")]) == 0
@@ -352,6 +357,13 @@ def test_accept_runs_once_and_scores_a_known_m(tmp_path, capsys) -> None:
     assert c["C"]["independent_windows"] == pytest.approx(11 / 3) and c["C"]["gating"] is False
     assert c["D"]["passed"] and c["D"]["family_gap_within_ci_half_width"] is True
     assert r["holdout_report"]["with_dwell"]["dwell_windows"] == 2
+    assert c["B"]["gating"] is False                                   # old B: disclosed
+    # B' gates, at the controller's dwell (1) by default: every severe violation caught
+    bp = c["B_prime"]
+    assert bp["gating"] and bp["passed"] and bp["dwell_windows"] == dl.ONLINE_DWELL_WINDOWS == 1
+    assert res["thresholds"]["B_prime"]["dwell_windows"] == 1 and "TRE_DWELL_WINDOWS" in bp["dwell_source"]
+    assert bp["criteria"][0]["value"] == 1.0 and bp["criteria"][2]["value"] == 0.0
+    assert bp["by_dwell"]["2"]["recall_severe"] == pytest.approx(60 / 66)  # disclosed
     # once only
     capsys.readouterr()
     assert _accept(w, man) == dl.EXIT_REFUSED
@@ -407,10 +419,11 @@ def test_accept_fails_b_on_false_alarms_and_exits_3(tmp_path, capsys) -> None:
     assert _freeze(w) == 0
     assert _accept(w, _seal(w)) == dl.EXIT_ACCEPT_FAILED
     out = capsys.readouterr().out
-    assert "acceptance FAILED" in out and f"{MODEL}: B failed" in out
+    assert "acceptance FAILED" in out and f"{MODEL}: B_prime failed" in out
     res = json.loads(dl.freeze_paths(w["freeze"])["result"].read_text())
     c = res["models"][MODEL]["criteria"]
-    assert res["passed"] is False and not c["B"]["passed"]
+    assert res["passed"] is False and not c["B"]["passed"] and not c["B_prime"]["passed"]
+    assert c["B_prime"]["criteria"][2]["value"] == pytest.approx(22 / 66)  # dwell 1: every low window
     fa = c["B"]["criteria"][2]
     assert fa["value"] == pytest.approx(20 / 66) and not fa["met"]
     # BA without dwell: 44 of 66 healthy windows on the healthy side, every violating one caught

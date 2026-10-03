@@ -80,7 +80,10 @@ Stages (``python -m scripts.dline_refit STAGE --model M --arm primary|fixed|k3 .
     commit; self-hashed (``freeze_sha256``, :func:`canonical_sha256`), a sha256sum sidecar
     ``PATH.sha256``, mode 0444. Refuses - listing every reason, writing nothing - unless
     each model's final ran with ``--no-holdout``, meets the stop rule and still sits on
-    the training inputs it was fitted on, and the freeze file is new.
+    the training inputs it was fitted on, and the freeze file is new. Format revision 3
+    (2026-10-03) also seals each model's B' severity cut (``b_prime``: the .65 quantile of
+    the TRAINING violating windows' severity, :mod:`scripts.b_prime`) and the B' gate
+    (``b_prime_gate``), so the cut exists before M / T14 is collected.
 ``verify-freeze``
     checks the sidecar and the self hash (:func:`verify_freeze`); exit 0 = intact.
 ``accept`` (plan §6.9f A-D, once)
@@ -93,15 +96,22 @@ Stages (``python -m scripts.dline_refit STAGE --model M --arm primary|fixed|k3 .
     for the CIs, and discloses - never gates - the ranking metrics of pressure = -Z
     (AUROC, Kendall tau-b per model / pooled / cross-model, ``tre_calibration.ranking``,
     docs/design/20260930-ranking-metrics.md); writes ``<stem>.accept.json`` (0444), the
-    validation CSVs under ``<stem>.accept.d/`` and the marker ``PATH.accepted``. Exit 0 =
-    A, B and D pass for every model, 3 = evaluated and failed, other = refused. Runs once;
+    validation CSVs under ``<stem>.accept.d/`` and the marker ``PATH.accepted``.
+    The gate is A, B' and D (user 2026-10-03; :mod:`scripts.b_prime`): B' is judged at
+    ``--dwell-windows`` (default :data:`ONLINE_DWELL_WINDOWS` = the controller's
+    ``TRE_DWELL_WINDOWS``), dwell 1 and 2 are disclosed next to it; the old B (both /
+    TPOT-only recall at the freeze's dwell) is disclosed, no longer gating. The severity
+    cut comes from the freeze (revision 3) or, for an older freeze, from an explicit
+    ``--b-prime-thresholds FILE`` - never silently from anywhere else. Exit 0 =
+    A, B' and D pass for every model, 3 = evaluated and failed, other = refused. Runs once;
     ``--recheck`` recomputes in a temp dir and compares, writing nothing (a stored result
     of an older format revision is compared without the keys added since).
 
 Windowing: ``--window-ms`` / ``--step-ms`` / ``--dt-ref-s`` / ``--horizon-ms`` /
 ``--dwell-windows`` (defaults 30 s / 10 s / 10 s / 30 s / 2) are threaded through alpha,
 wp and final, recorded as ``windowing`` in their outputs and in the freeze (revision 2),
-and accept reads them from the freeze.
+and accept reads them from the freeze - except ``--dwell-windows``, which for accept is
+the B' gate's dwell (default :data:`ONLINE_DWELL_WINDOWS`).
 
 Labels are ``tre_common.slo_labels``: ``primary`` is the D6' slowdown label of the
 registry profile (``max(500 ms, 5 * idle TTFT(L))``, TPOT 75 ms, >= 20 completions),
@@ -143,6 +153,11 @@ HORIZON_MS = 30_000
 FA_MAX = 0.05
 SEED = 20260922
 DWELL_WINDOWS = 2
+#: The CRITICAL dwell the controller runs with: ``TRE_DWELL_WINDOWS`` of
+#: deploy/overlays/tre-v2/controller.yaml (= tre_controller.config default, 1 = off since
+#: the v1 alignment A5). accept judges B' at this dwell unless ``--dwell-windows`` says
+#: otherwise (a guard test keeps it equal to the overlay).
+ONLINE_DWELL_WINDOWS = 1
 TRIM_RAMP_WINDOWS = 1
 #: Windowing (2026-09-30): the window length and re-window step the fit CSVs were cut
 #: with. Every windowing constant - WINDOW_MS, STEP_MS, DT_REF_S, HORIZON_MS,
@@ -1332,8 +1347,11 @@ def stage_summary(out_root: Path, fit_dirs: Mapping[str, Path], *, registry: Opt
 
 #: 2 (2026-09-30): each model entry records its ``windowing``. Revision 1 freezes (the
 #: D22 one) still verify and accept: their windowing is :data:`DEFAULT_WINDOWING`.
-FREEZE_FORMAT_REVISION = 2
-FREEZE_READABLE_REVISIONS = (1, 2)
+#: 3 (2026-10-03): each model entry seals its B' severity cut (``b_prime``) and the
+#: document the B' gate (``b_prime_gate``). Older freezes accept only with an explicit
+#: ``--b-prime-thresholds`` file.
+FREEZE_FORMAT_REVISION = 3
+FREEZE_READABLE_REVISIONS = (1, 2, 3)
 M_MANIFEST_FORMAT_REVISION = 1
 #: The refit stage outputs a freeze reads (``<out>/<model>/<arm>/<name>.json``).
 FREEZE_STAGE_FILES = ("alpha", "wp", "final", "verdict_final")
@@ -1367,9 +1385,18 @@ ACCEPT_VOLATILE_KEYS = frozenset({"generated_at", "evaluated_at_utc", "validatio
                                   "command", "code"})
 #: 2 (2026-09-30): the ranking disclosure (per model and pooled, never gating) and each
 #: model's windowing. A ``--recheck`` of a revision-1 result compares everything else.
-ACCEPT_FORMAT_REVISION = 2
+#: 3 (2026-10-03): the gate is A, B' and D (``criteria.B_prime``, ``thresholds.B_prime``);
+#: the old B is disclosed. A ``--recheck`` of an older result compares it under its own
+#: gate (A, B, D) without the B' keys (:func:`as_revision`).
+ACCEPT_FORMAT_REVISION = 3
 #: Keys a revision added, top level and per model: absent from an older stored result.
-ACCEPT_REVISION_KEYS = {2: {"top": ("ranking_disclosure",), "model": ("ranking_disclosure", "windowing")}}
+ACCEPT_REVISION_KEYS = {2: {"top": ("ranking_disclosure",), "model": ("ranking_disclosure", "windowing")},
+                        3: {"top": (), "model": ()}}
+LEGACY_ACCEPT_WHAT = ("plan §6.9f acceptance A-D on M, evaluated once on the frozen parameters "
+                      "(A, B, D gate; C and the all-violating recall are disclosed)")
+#: The criteria that gate, by accept format revision.
+GATING_CRITERIA = ("A", "B_prime", "D")
+LEGACY_GATING_CRITERIA = ("A", "B", "D")
 
 
 class FreezeError(RuntimeError):
@@ -1561,6 +1588,12 @@ def freeze_model(out_root: Path, fit_dir: Path, model: str, arm: str) -> tuple[O
                 problems.append(f"training inputs: {exc}")
     if problems:
         return None, problems
+    # B' (2026-10-03): the severity cut, from these training windows only, sealed now -
+    # before any M / T14 window exists
+    try:
+        b_prime_rec = b_prime_freeze_record(verdict_for_holdout(ver), p["fitting"])
+    except (ValueError, KeyError) as exc:
+        return None, [f"B' severity cut: {exc}"]
 
     h2_path = fit_dir / H2_MANIFEST
     stage_files = {name: d / f"{name}.json" for name in FREEZE_STAGE_FILES}
@@ -1598,8 +1631,28 @@ def freeze_model(out_root: Path, fit_dir: Path, model: str, arm: str) -> tuple[O
         # fit of the D6' label and every length in ttft_len_samples count the prompt the
         # way this API does (chat: template included).
         "api": next(iter(load_paths.values()))["api"],
+        "b_prime": b_prime_rec,
     }
     return entry, []
+
+
+def b_prime_freeze_record(vh: Mapping[str, Any], training_csv: Path) -> dict:
+    """The sealed B' cut of one model: the :data:`scripts.b_prime.SEVERITY_QUANTILE` of
+    the violating windows' severity in ``training_csv`` (the freeze's fitting CSV), loaded
+    with the frozen signal spec, label and ramp trim. Raises ``ValueError`` without a
+    violating training window."""
+    from scripts import b_prime
+    from scripts import theta_verdict as tv
+
+    spec = tv.SignalSpec.from_dict(vh["signal_spec"])
+    label = slo_labels.LabelDefinition.from_dict(vh["label_def"])
+    windows = spec.load(Path(training_csv), label, int(vh["trim_ramp_windows"]))
+    cut = b_prime.severity_cut(windows, b_prime.SEVERITY_QUANTILE)
+    return {"severity_cut": cut, "severity_quantile": b_prime.SEVERITY_QUANTILE,
+            "severity": b_prime.SEVERITY_RULE,
+            "violating_training_windows": len(b_prime.violating_severities(windows)),
+            "training_csv": str(training_csv), "training_csv_sha256": sha256_file(Path(training_csv)),
+            "windows": "the training fitting CSV, frozen signal spec / label / ramp trim; violating, finite signal"}
 
 
 def training_load_paths(trainset_manifest: Mapping) -> tuple[dict[str, dict], list[str]]:
@@ -1672,6 +1725,9 @@ def stage_freeze(out_root: Path, fit_dir_of: Callable[[str], Path], models: Sequ
         "code": code_state(),
         "refit_out_dir": str(out_root),
         "models": entries,
+        "b_prime_gate": {**b_prime_gate_defaults(),
+                         "decided": "user 2026-10-03: B' replaces B as the accept gate (b_prime_thresholds.json "
+                                    "of 2026-09-24); judged at the controller's dwell, dwell 2 disclosed"},
         "self_hash_rule": ("freeze_sha256 = sha256 of json.dumps(doc without freeze_sha256, sort_keys=True, "
                            "separators=(',', ':'), ensure_ascii=False) in UTF-8"),
     }
@@ -1681,6 +1737,13 @@ def stage_freeze(out_root: Path, fit_dir_of: Callable[[str], Path], models: Sequ
     _write_once(fp["freeze"], data)
     _write_once(fp["sidecar"], f"{hashlib.sha256(data).hexdigest()}  {fp['freeze'].name}\n".encode())
     return doc
+
+
+def b_prime_gate_defaults() -> dict:
+    from scripts import b_prime
+
+    return {**b_prime.DEFAULT_GATE, "severity_quantile": b_prime.SEVERITY_QUANTILE,
+            "online_dwell_windows": ONLINE_DWELL_WINDOWS}
 
 
 def verify_freeze(path: Path | str) -> dict:
@@ -1977,6 +2040,7 @@ def acceptance_criteria(entry: Mapping[str, Any], h: Mapping[str, Any], boot: Ma
         "A": {"criteria": a, "evaluable": ba is not None, "passed": all(c["met"] for c in a),
               "train_ba_at_published": train},
         "B": {"criteria": b, "evaluable": b_eval, "passed": b_eval and all(c["met"] for c in b),
+              "gating": False, "note": "disclosed since 2026-10-03; B_prime gates",
               "both_tpot_windows": wd["both_tpot_windows"], "healthy_windows": wd["healthy_windows"],
               "dwell_windows": wd["dwell_windows"],
               "all_violating_recall": {"value": all_rec, "target": ALL_VIOLATING_RECALL_TARGET,
@@ -1991,6 +2055,25 @@ def acceptance_criteria(entry: Mapping[str, Any], h: Mapping[str, Any], boot: Ma
               "family_gap_within_ci_half_width": (gap <= half) if gap is not None and half is not None else None,
               "source": "the training stop rule (D13) as recorded at freeze time"},
     }
+
+
+def failures(models: Mapping[str, Any], gates: Sequence[str]) -> list[str]:
+    """One line per model and failed gating criterion, with every unmet threshold."""
+    failed = []
+    for model, r in models.items():
+        for g in gates:
+            crit = r["criteria"][g]
+            if crit["passed"]:
+                continue
+            if g == "D":
+                why = [str(x) for x in (crit["reasons"] or ["stop rule not satisfied"])]
+            else:
+                why = [f"{c['name']} {c['value']} {c['op']} {c['threshold']} not met"
+                       for c in crit["criteria"] if not c["met"]]
+                if not crit["evaluable"]:
+                    why.insert(0, str(crit.get("reason") or "not evaluable on this M"))
+            failed.append(f"{model}: {g} failed - " + "; ".join(why))
+    return failed
 
 
 def _write_validation_csv(path: Path, header: Sequence[str], rows: Sequence[Mapping[str, str]]) -> None:
@@ -2030,8 +2113,45 @@ def ranking_records(model: str, windows: Sequence[Any], csv_path: Path, *, theta
     return ranking.records_from_windows(model, windows, theta=theta, direction=direction, instants=instants)
 
 
+def b_prime_evaluation(windows: Sequence[Any], *, theta: float, tau_crit: float, direction: str,
+                       window_ms: float, cfg: Mapping[str, Any], n_resamples: int, seed: int) -> dict:
+    """Criterion B' (:mod:`scripts.b_prime`) of one model's windows: the gate at
+    ``cfg["dwell_windows"]``, every dwell of :data:`scripts.b_prime.DISCLOSED_DWELL_WINDOWS`
+    disclosed with its CI95. No cut (``cfg["severity_cut"]`` None) = not evaluable = not
+    passed."""
+    from scripts import b_prime
+    from scripts import theta_verdict as tv
+
+    dwell, cut, gate = int(cfg["dwell_windows"]), cfg.get("severity_cut"), cfg["gate"]
+    out: dict[str, Any] = {"gating": True, "dwell_windows": dwell, "dwell_source": cfg.get("dwell_source"),
+                           "severity_cut": cut, "cut_source": cfg.get("cut_source"),
+                           "severity_quantile": b_prime.SEVERITY_QUANTILE, "gate": dict(gate)}
+    if cut is None:
+        out.update({"criteria": [], "evaluable": False, "passed": False,
+                    "reason": cfg.get("missing") or "no severity cut"})
+        return out
+    by_dwell: dict[str, Any] = {}
+    for d in sorted({dwell, *b_prime.DISCLOSED_DWELL_WINDOWS}):
+        crit = tv.critical_dwell_flags(windows, theta=theta, tau_crit=tau_crit, direction=direction,
+                                       dwell_windows=d, window_ms=window_ms)
+        point = b_prime.series_point(windows, theta=theta, cut=cut, crit=crit)
+        ci = b_prime.b_prime_boot(windows, cut=cut, crit=crit, n=n_resamples, seed=seed)
+        by_dwell[str(d)] = {**point, "recall_severe_ci95": ci["recall_severe_ci95"],
+                            "false_alarm_ci95": ci["false_alarm_ci95"]}
+    g = by_dwell[str(dwell)]
+    crits = b_prime.criteria(g, g, gate)
+    shares = b_prime.band_shares(windows, theta=theta, cut=cut, tau_crit=tau_crit)
+    evaluable = shares["severe_windows"] > 0 and shares["healthy"] > 0
+    out.update({"criteria": crits, "evaluable": evaluable, "passed": evaluable and all(c["met"] for c in crits),
+                **{k: shares[k] for k in ("violating", "healthy", "severe_windows", "violations_by_band")},
+                "by_dwell": by_dwell,
+                "disclosed_not_gating": ["recall_all (every violation)", "violations_by_band (LOW band = slow loop)",
+                                         "missed_caught_by_slow_loop", "the dwells other than dwell_windows"]})
+    return out
+
+
 def evaluate_model(entry: Mapping[str, Any], csv_path: Path, *, n_resamples: int, seed: int,
-                   records_sink: Optional[list] = None) -> dict:
+                   records_sink: Optional[list] = None, b_prime_cfg: Optional[Mapping[str, Any]] = None) -> dict:
     """``theta_verdict.holdout_report`` for the point estimates (the freeze's dwell and
     window length - 2 x 30 s for a freeze that predates the record), the cell bootstrap for
     the CIs, then A-D; plus the ranking disclosure (AUROC, Kendall tau-b; never gating).
@@ -2061,8 +2181,13 @@ def evaluate_model(entry: Mapping[str, Any], csv_path: Path, *, n_resamples: int
     for w in windows:
         per_cell[w.scenario_id] += 1
     criteria = acceptance_criteria(entry, h, boot)
+    criteria["B_prime"] = b_prime_evaluation(
+        windows, theta=theta, tau_crit=tau_crit, direction=direction, window_ms=window_ms,
+        cfg=b_prime_cfg or {"dwell_windows": ONLINE_DWELL_WINDOWS, "severity_cut": None,
+                            "gate": b_prime_gate_defaults(), "missing": "no B' configuration"},
+        n_resamples=n_resamples, seed=seed)
     return {"holdout_report": h, "bootstrap": boot, "criteria": criteria,
-            "passed": criteria["A"]["passed"] and criteria["B"]["passed"] and criteria["D"]["passed"],
+            "passed": all(criteria[g]["passed"] for g in GATING_CRITERIA),
             "windowing": win,
             "ranking_disclosure": ranking.ranking_disclosure(records, n_resamples=n_resamples, seed=seed),
             "M": {"windows": h["windows"], "cells": h["cells"], "violating": h["violating"],
@@ -2120,9 +2245,72 @@ def _accept_inputs(freeze_file: Path, datasets: Sequence[str],
             "sources": sources, "m": m}, problems
 
 
+def b_prime_inputs(doc: Mapping[str, Any], thresholds_file: Optional[Path], dwell_windows: int,
+                   dwell_source: str) -> tuple[dict, dict, list[str]]:
+    """``({model: B' config}, summary, problems)`` for accept. The cut of each model
+    comes from its freeze entry (revision 3, sealed at freeze time) or - for a freeze
+    that predates it, and only then - from ``thresholds_file``; a model with neither is a
+    problem (B' is never judged against a cut taken from the data it judges)."""
+    from scripts import b_prime
+
+    problems: list[str] = []
+    models = doc.get("models") or {}
+    sealed = {m: e["b_prime"] for m, e in models.items() if isinstance(e.get("b_prime"), dict)}
+    file_rec, file_info = None, None
+    if thresholds_file is not None:
+        if sealed:
+            problems.append(f"--b-prime-thresholds {thresholds_file}: the freeze seals its own B' cuts "
+                            f"({sorted(sealed)}); the file is only for a freeze that predates them")
+        else:
+            try:
+                file_rec = b_prime.load_thresholds(Path(thresholds_file))
+                file_info = {"path": str(thresholds_file), "sha256": sha256_file(Path(thresholds_file))}
+            except ValueError as exc:
+                problems.append(f"--b-prime-thresholds: {exc}")
+    gate = None
+    if sealed:
+        try:
+            gate = b_prime.check_gate(doc.get("b_prime_gate") or {})
+        except ValueError as exc:
+            problems.append(f"the freeze's b_prime_gate: {exc}")
+    elif file_rec is not None:
+        gate = file_rec["gate"]
+    frozen_dwell = (doc.get("b_prime_gate") or {}).get("online_dwell_windows")
+    cfgs: dict[str, dict] = {}
+    for m in sorted(models):
+        cfg: dict[str, Any] = {"dwell_windows": int(dwell_windows), "dwell_source": dwell_source,
+                               "gate": gate or dict(b_prime.DEFAULT_GATE), "severity_cut": None}
+        if m in sealed:
+            cfg["severity_cut"] = _finite_or_none(sealed[m].get("severity_cut"))
+            cfg["cut_source"] = {"source": "freeze", "freeze_sha256": doc.get("freeze_sha256"),
+                                 **{k: sealed[m].get(k) for k in ("severity_quantile", "training_csv",
+                                                                   "training_csv_sha256",
+                                                                   "violating_training_windows")}}
+            if cfg["severity_cut"] is None:
+                problems.append(f"{m}: the freeze's B' severity cut {sealed[m].get('severity_cut')!r} is not a number")
+        elif file_rec is not None and m in file_rec["severity_cut_train"]:
+            cfg["severity_cut"] = file_rec["severity_cut_train"][m]
+            cfg["cut_source"] = {"source": "thresholds_file", **file_info}
+        elif file_rec is not None:
+            problems.append(f"{m}: --b-prime-thresholds {thresholds_file} has no severity_cut_train for it")
+        else:
+            cfg["missing"] = (f"the freeze (format revision {doc.get('format_revision')}) seals no B' severity cut "
+                              f"for {m}")
+            problems.append(f"{m}: {cfg['missing']}: pass --b-prime-thresholds <file decided before M> "
+                            "(severity_cut_train + gate), or accept under a revision-3 freeze")
+        cfgs[m] = cfg
+    summary = {**(gate or dict(b_prime.DEFAULT_GATE)), "dwell_windows": int(dwell_windows),
+               "dwell_source": dwell_source, "disclosed_dwell_windows": list(b_prime.DISCLOSED_DWELL_WINDOWS),
+               "severity_quantile": b_prime.SEVERITY_QUANTILE, "severity": b_prime.SEVERITY_RULE,
+               "cut_source": "freeze" if sealed else ("thresholds_file" if file_rec else None),
+               "thresholds_file": file_info, "freeze_online_dwell_windows": frozen_dwell}
+    return cfgs, summary, problems
+
+
 def _accept_result(freeze_file: Path, inp: Mapping[str, Any], work: Path, *, n_resamples: int, seed: int,
                    command: Sequence[str]) -> dict:
     doc, m = inp["doc"], inp["m"]
+    bp_cfgs, bp_summary = inp["b_prime"], inp["b_prime_summary"]
     sums_cover: set[str] = set()
     for model, man in inp["manifests"].items():
         mdir = inp["manifest_paths"][model].parent
@@ -2143,7 +2331,8 @@ def _accept_result(freeze_file: Path, inp: Mapping[str, Any], work: Path, *, n_r
         mpath = inp["manifest_paths"][model]
         csv_path = work / f"{model}_validation.csv"
         _write_validation_csv(csv_path, m["header"][model], m["rows"][model])
-        ev = evaluate_model(entry, csv_path, n_resamples=n_resamples, seed=seed, records_sink=records)
+        ev = evaluate_model(entry, csv_path, n_resamples=n_resamples, seed=seed, records_sink=records,
+                            b_prime_cfg=bp_cfgs.get(model))
         cells = []
         for c in man["cells"]:
             placed = m["placed"][(model, str(c["cell_id"]), _attempt(c["attempt"]))]
@@ -2163,20 +2352,7 @@ def _accept_result(freeze_file: Path, inp: Mapping[str, Any], work: Path, *, n_r
             "published": entry["published"],
             **ev,
         }
-    failed = []
-    for model, r in models.items():
-        for g in ("A", "B", "D"):
-            crit = r["criteria"][g]
-            if crit["passed"]:
-                continue
-            if g == "D":
-                why = [str(x) for x in (crit["reasons"] or ["stop rule not satisfied"])]
-            else:
-                why = [f"{c['name']} {c['value']} {c['op']} {c['threshold']} not met"
-                       for c in crit["criteria"] if not c["met"]]
-                if not crit["evaluable"]:
-                    why.insert(0, "not evaluable on this M")
-            failed.append(f"{model}: {g} failed - " + "; ".join(why))
+    failed = failures(models, GATING_CRITERIA)
     wins = {model: windowing_of(e) for model, e in doc["models"].items()}
     dwells = {model: w["dwell_windows"] for model, w in wins.items()}
     steps = {w["step_ms"] for w in wins.values()}
@@ -2187,7 +2363,8 @@ def _accept_result(freeze_file: Path, inp: Mapping[str, Any], work: Path, *, n_r
                       "tau_b is disclosed exact and with window ends rounded to the re-window step")
     return {
         "what": ("plan §6.9f acceptance A-D on M, evaluated once on the frozen parameters "
-                 "(A, B, D gate; C and the all-violating recall are disclosed)"),
+                 "(A, B' and D gate - B' since 2026-10-03; the old B, C and the all-violating "
+                 "recall are disclosed)"),
         "format_revision": ACCEPT_FORMAT_REVISION,
         "evaluated_at_utc": _utc_now(),
         "command": list(command),
@@ -2196,7 +2373,8 @@ def _accept_result(freeze_file: Path, inp: Mapping[str, Any], work: Path, *, n_r
                    "freeze_sha256": doc["freeze_sha256"], "arm": doc.get("arm")},
         "thresholds": {"A": {"ba_min": A_BA_MIN, "ba_ci_low_min": A_BA_CI_LOW_MIN,
                              "max_drop_from_training": A_MAX_DROP_FROM_TRAINING},
-                       "B": {"recall_min": B_RECALL_MIN, "recall_ci_low_min": B_RECALL_CI_LOW_MIN,
+                       "B_prime": bp_summary,
+                       "B": {"gating": False, "recall_min": B_RECALL_MIN, "recall_ci_low_min": B_RECALL_CI_LOW_MIN,
                              "false_alarm_max": B_FALSE_ALARM_MAX,
                              "false_alarm_ci_high_max": B_FALSE_ALARM_CI_HIGH_MAX,
                              "all_violating_recall_target": ALL_VIOLATING_RECALL_TARGET},
@@ -2226,6 +2404,21 @@ def as_revision(result: Mapping[str, Any], revision: Any) -> dict:
         for r in (out.get("models") or {}).values():
             for k in keys["model"]:
                 r.pop(k, None)
+    if not isinstance(revision, int) or revision < 3:
+        # before 2026-10-03 the gate was A, B, D and B' did not exist
+        for r in (out.get("models") or {}).values():
+            crit = r.get("criteria") or {}
+            crit.pop("B_prime", None)
+            for k in ("gating", "note"):
+                (crit.get("B") or {}).pop(k, None)
+            if all(g in crit for g in LEGACY_GATING_CRITERIA):
+                r["passed"] = all(crit[g]["passed"] for g in LEGACY_GATING_CRITERIA)
+        th = out.get("thresholds") or {}
+        th.pop("B_prime", None)
+        (th.get("B") or {}).pop("gating", None)
+        out["what"] = LEGACY_ACCEPT_WHAT
+        out["failed"] = failures(out.get("models") or {}, LEGACY_GATING_CRITERIA)
+        out["passed"] = not out["failed"]
     out["format_revision"] = revision
     return out
 
@@ -2277,7 +2470,8 @@ def result_differences(stored: Any, recomputed: Any, *, ignore: frozenset = ACCE
 
 def stage_accept(freeze_file: Path, datasets: Sequence[str], m_manifests: Sequence[str], *,
                  recheck: bool = False, n_resamples: int = ACCEPT_RESAMPLES,
-                 command: Sequence[str] = ()) -> int:
+                 command: Sequence[str] = (), b_prime_thresholds: Optional[Path] = None,
+                 dwell_windows: Optional[int] = None) -> int:
     """Plan §6.9f A-D, once. Returns 0 = evaluated and passed, :data:`EXIT_ACCEPT_FAILED`
     = evaluated and failed, :data:`EXIT_REFUSED` = refused (nothing written); with
     ``recheck``: 0 = the stored result reproduces, :data:`EXIT_RECHECK_DIFFERS` = not."""
@@ -2287,28 +2481,54 @@ def stage_accept(freeze_file: Path, datasets: Sequence[str], m_manifests: Sequen
     freeze_file = Path(freeze_file)
     fp = freeze_paths(freeze_file)
     problems: list[str] = []
+    stored_bytes, stored = b"", {}
     if recheck:
         if not fp["result"].exists():
             problems.append(f"{fp['result']} does not exist: nothing to recheck")
+        else:
+            stored_bytes = fp["result"].read_bytes()
+            try:
+                stored = json.loads(stored_bytes.decode("utf-8"))
+            except ValueError as exc:
+                problems.append(f"{fp['result']}: not JSON ({exc})")
     else:
         problems += [f"{fp[k]} already exists: M is evaluated once (--recheck reproduces it)"
                      for k in ("result", "marker", "work") if fp[k].exists()]
+    stored_rev = stored.get("format_revision") if stored else None
+    stored_bp = ((stored.get("thresholds") or {}).get("B_prime") or {}) if stored else {}
+    if recheck and stored_bp.get("dwell_windows") is not None:
+        if dwell_windows is not None and int(dwell_windows) != int(stored_bp["dwell_windows"]):
+            print(f"note: --recheck uses the stored B' dwell {stored_bp['dwell_windows']}, not --dwell-windows "
+                  f"{dwell_windows}")
+        dwell, dwell_source = int(stored_bp["dwell_windows"]), stored_bp.get("dwell_source")
+    elif dwell_windows is not None:
+        dwell, dwell_source = int(dwell_windows), "--dwell-windows"
+    else:
+        dwell, dwell_source = ONLINE_DWELL_WINDOWS, ("default: ONLINE_DWELL_WINDOWS = the controller's "
+                                                     "TRE_DWELL_WINDOWS (deploy/overlays/tre-v2/controller.yaml)")
     inp, pr = _accept_inputs(freeze_file, datasets, m_manifests)
     problems += pr
+    if "doc" in inp:
+        bp_cfgs, bp_summary, bp_problems = b_prime_inputs(inp["doc"], b_prime_thresholds, dwell, dwell_source)
+        # a recheck of a result from before B' existed does not need a cut
+        if not recheck or not isinstance(stored_rev, int) or stored_rev >= 3:
+            problems += bp_problems
+        inp["b_prime"], inp["b_prime_summary"] = bp_cfgs, bp_summary
+        frozen = bp_summary.get("freeze_online_dwell_windows")
+        if frozen is not None and int(frozen) != dwell:
+            print(f"WARNING: B' is judged at dwell {dwell} ({dwell_source}); the freeze recorded the "
+                  f"controller's dwell as {frozen}")
     if problems:
         print("accept REFUSED - nothing was written:")
         for x in problems:
             print(f"  - {x}")
         return EXIT_REFUSED
     if recheck:
-        stored_bytes = fp["result"].read_bytes()
-        stored = json.loads(stored_bytes.decode("utf-8"))
         n_resamples, seed = int(stored["bootstrap"]["n_resamples"]), int(stored["bootstrap"]["seed"])
         with tempfile.TemporaryDirectory(prefix="dline_accept_recheck_") as tmp:
             new = _accept_result(freeze_file, inp, Path(tmp), n_resamples=n_resamples, seed=seed, command=command)
         new = json.loads(_json_bytes(new).decode("utf-8"))
         print_ranking_table(new)
-        stored_rev = stored.get("format_revision")
         if stored_rev != new.get("format_revision"):
             print(f"note: the stored result is format revision {stored_rev}; keys added since "
                   f"({sorted({k for r, ks in ACCEPT_REVISION_KEYS.items() if not isinstance(stored_rev, int) or r > stored_rev for k in ks['top'] + ks['model']})}) "
@@ -2343,12 +2563,17 @@ def stage_accept(freeze_file: Path, datasets: Sequence[str], m_manifests: Sequen
     _write_once(fp["marker"], _json_bytes({"result": str(fp["result"]),
                                            "result_sha256": hashlib.sha256(data).hexdigest(),
                                            "accepted_at_utc": _utc_now()}))
+    bp = result["thresholds"]["B_prime"]
+    print(f"B' (gating) judged at dwell {bp['dwell_windows']} ({bp['dwell_source']}); severity cut from "
+          f"{bp['cut_source']}; dwell {', '.join(map(str, bp['disclosed_dwell_windows']))} disclosed")
     for model, r in result["models"].items():
         c = r["criteria"]
+        g2 = (c["B_prime"].get("by_dwell") or {}).get("2") or {}
         print(f"[{model}] M {r['M']['windows']} windows / {r['M']['cells']} cells: "
-              + " ".join(f"{g}={'pass' if c[g]['passed'] else 'FAIL'}" for g in ("A", "B", "D"))
-              + f" (C, disclosed: TTFT-only recall {c['C']['critical_recall_ttft_only']} "
-                f"on {c['C']['windows']} windows)")
+              + " ".join(f"{g}={'pass' if c[g]['passed'] else 'FAIL'}" for g in GATING_CRITERIA)
+              + f" (disclosed: B' dwell 2 recall {g2.get('recall_severe')} / false alarm {g2.get('false_alarm')}; "
+                f"old B {'pass' if c['B']['passed'] else 'fail'}; "
+                f"C TTFT-only recall {c['C']['critical_recall_ttft_only']} on {c['C']['windows']} windows)")
     print_ranking_table(result)
     print(f"wrote {fp['result']} and {fp['marker']}")
     if not result["passed"]:
@@ -2425,6 +2650,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     help="accept: recompute in a temp dir and compare with the stored result; writes nothing")
     ap.add_argument("--accept-resamples", type=int, default=ACCEPT_RESAMPLES,
                     help="accept: cell-bootstrap resamples of the A-C intervals")
+    ap.add_argument("--b-prime-thresholds", type=Path, default=None,
+                    help="accept, only under a freeze older than format revision 3 (no sealed B' cut): "
+                         "the B' thresholds decided before M (severity_cut_train {model: cut} + gate, "
+                         "e.g. b_prime_thresholds.json of 2026-09-24); refused with a revision-3 freeze")
     win_group = ap.add_argument_group(
         "windowing (alpha / wp / final; recorded in the stage outputs and the freeze, which accept reads)")
     win_group.add_argument("--window-ms", type=float, default=WINDOW_MS,
@@ -2435,12 +2664,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                            help=f"EMA reference period: alpha = 1 - exp(-dt_ref / tau) (default {DT_REF_S:g})")
     win_group.add_argument("--horizon-ms", type=int, default=HORIZON_MS,
                            help=f"refit0922 label horizon / detection look-back (default {HORIZON_MS})")
-    win_group.add_argument("--dwell-windows", type=int, default=DWELL_WINDOWS,
-                           help=f"CRITICAL dwell in new windows (default {DWELL_WINDOWS})")
+    win_group.add_argument("--dwell-windows", type=int, default=None,
+                           help=f"alpha / wp / final: CRITICAL dwell in new windows (default {DWELL_WINDOWS}); "
+                                f"accept: the dwell B' is judged at (default {ONLINE_DWELL_WINDOWS} = the "
+                                "controller's TRE_DWELL_WINDOWS; dwell 1 and 2 are always disclosed)")
     args = ap.parse_args(argv)
+    if args.dwell_windows is not None and args.dwell_windows < 1:
+        ap.error("--dwell-windows must be >= 1")
     try:
         win = windowing(window_ms=args.window_ms, step_ms=args.step_ms, dt_ref_s=args.dt_ref_s,
-                        horizon_ms=args.horizon_ms, dwell_windows=args.dwell_windows)
+                        horizon_ms=args.horizon_ms,
+                        dwell_windows=DWELL_WINDOWS if args.dwell_windows is None else args.dwell_windows)
     except ValueError as exc:
         ap.error(str(exc))
     command = ["python", "-m", "scripts.dline_refit", *(sys.argv[1:] if argv is None else argv)]
@@ -2451,12 +2685,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if args.freeze_file is None:
             ap.error(f"{args.stage} needs --freeze-file")
         if args.stage == "accept":
-            if win != DEFAULT_WINDOWING:
+            if {k: v for k, v in win.items() if k != "dwell_windows"} != {
+                    k: v for k, v in DEFAULT_WINDOWING.items() if k != "dwell_windows"}:
                 # accept scores with the windowing recorded in the freeze, never the command line's
                 print(f"WARNING: accept ignores the windowing flags ({win}); it uses the windowing "
-                      "recorded in the freeze")
+                      "recorded in the freeze (--dwell-windows is the B' gate's dwell)")
             return stage_accept(args.freeze_file, args.dataset, args.m_manifest, recheck=args.recheck,
-                                n_resamples=args.accept_resamples, command=command)
+                                n_resamples=args.accept_resamples, command=command,
+                                b_prime_thresholds=args.b_prime_thresholds, dwell_windows=args.dwell_windows)
         try:
             doc = verify_freeze(args.freeze_file)
         except FreezeError as exc:
