@@ -29,10 +29,10 @@ from scripts import calibration_supplement as supplement
 from scripts import calibration_training_supplement as ts
 from scripts import dline_refit as dl
 
-ANCHORS = {"S2": 1.4, "S3": 1.5, "T8": 0.9}      # rho*_run2 (x C_s)
-CAPACITY = {"S2": 7.5, "S3": 2.0, "T8": 6.0}      # C_s (rps)
+ANCHORS = {"S2": 1.4, "S3": 1.5, "T8": 0.9, "S4": 1.9, "S5": 1.4}  # rho*_run2 (x C_s)
+CAPACITY = {"S2": 7.5, "S3": 2.0, "T8": 6.0, "S4": 6.4, "S5": 5.5}  # C_s (rps)
 SUPP_S3 = 2.1                                     # rho*_D6'(S3) (x C_s)
-LENGTH = {"S2": 768, "S3": 2048, "T8": 1600}
+LENGTH = {"S2": 768, "S3": 2048, "T8": 1600, "S4": 256, "S5": 768}
 
 
 def _write(path: Path, doc) -> Path:
@@ -297,3 +297,87 @@ def test_the_cli_keeps_the_collection_flags_together(tmp_path) -> None:
         with pytest.raises(SystemExit):
             campaign.main([*argv, "--models", "dsqwen-7b", "--out-dir", str(tmp_path / "o"),
                            "--dry-run"])
+
+
+# ------------------------------------------------------------- P1 deep overload plan
+
+
+def _p1_run(tmp_path, model="dsqwen-7b", *, drive=None, busy_s=0.0):
+    """A p1-deep-overload run without a boundary supplement; every cell violates. The
+    engine stays busy ``busy_s`` after each cell (a backlog the client's aborts missed)."""
+    clock = _Clock()
+    fake = _FakeCluster({s: 0.0 for s in ANCHORS})
+    busy_until = [0.0]
+
+    def drive_and_leave_backlog(cell, *a):
+        out = (drive or fake.drive)(cell, *a)
+        busy_until[0] = clock.t + busy_s
+        return out
+
+    def sample():
+        busy = clock.t < busy_until[0]
+        return {"running": 5 if busy else 0, "waiting": 0, "pods_scraped": 1, "scrape_errors": 0}
+
+    args = _args(tmp_path, model, training_plan=ts.PLAN_P1, boundary_supplement_run=None)
+    code = ts.run_training_supplement(
+        args, drive=drive_and_leave_backlog, sample_factory=lambda _m: sample,
+        sleep=clock.sleep, clock=clock, check_controller=False)
+    return code, fake
+
+
+def test_the_p1_plan_is_15_training_holds_far_past_rho_star(tmp_path) -> None:
+    code, fake = _p1_run(tmp_path, busy_s=200.0)
+    assert code == 0                     # all violated: no both-sides check for P1
+    records = _ledger(tmp_path)
+    holds = [r for r in records if r["role"] == design.ROLE_LADDER]
+    assert sorted((r["shape"], r["rho_factor"]) for r in holds) == sorted(
+        (s, f) for s in ts.P1_SHAPES for f in ts.P1_FACTORS)
+    assert len([r for r in records if r["role"] == design.ROLE_SENTINEL]) == 3
+    for r in holds:
+        assert r["rho"] == pytest.approx(r["rho_factor"] * ANCHORS[r["shape"]])
+        assert r["duration_s"] == ts.P1_SECONDS and r["serial"] > ts.P1_SERIAL_BASE
+    # D16: every line trains
+    for r in records:
+        row = {k: r[k] for k in ("model", "cell_id", "attempt", "shape", "primitive", "role",
+                                 "split", "stage")}
+        assert dl.assign_set(row, sealed_to_h2=False, sentinels=True) == dl.SET_TRAINING
+    # a 200 s backlog after a 3 x cell is waited out, so no cell starts on a busy engine
+    result = json.loads((tmp_path / "out" / ladder.DESIGN_RESULT).read_text())["models"][0]
+    assert result["possibly_contaminated_cells"] == [] and result["check_failures"] == []
+    manifest = json.loads((tmp_path / "out" / ladder.RUN_MANIFEST).read_text())
+    assert manifest["training_plan"] == ts.PLAN_P1 and manifest["boundary_supplement_run"] is None
+
+
+def test_a_p1_cell_without_labelled_windows_fails_the_check(tmp_path, capsys) -> None:
+    fake = _FakeCluster({s: 0.0 for s in ANCHORS})
+
+    def drive(cell, attempt, schedule_path, output, prompt_dir):
+        rows, guard, rc = fake.drive(cell, attempt, schedule_path, output, prompt_dir)
+        if cell.shape == "S4" and cell.rho_factor == 3.0:
+            rows = [{**w, "completed_requests": 0} for w in rows]
+        return rows, guard, rc
+
+    code, _ = _p1_run(tmp_path, drive=drive)
+    assert code == ts.EXIT_CHECK_FAILED
+    assert "S4 part p1" in capsys.readouterr().out
+
+
+def test_the_cli_plans_p1_without_a_supplement_and_keeps_the_flag_with_it(tmp_path, capsys) -> None:
+    model = "dsqwen-14b"
+    base = _base_run(tmp_path / "base", model)
+    out = tmp_path / "dry"
+    argv = ["--training-supplement", "--training-plan", "p1-deep-overload", "--models", model,
+            "--base-run", str(base), "--out-dir", str(out), "--raw-dir", str(out / "raw"),
+            "--dry-run", "--index", str(tmp_path / "absent.json")]
+    assert campaign.main(argv) == 0
+    assert "18 cells" in capsys.readouterr().out
+    plan = json.loads((out / "plan.json").read_text())
+    assert plan["training_plan"] == ts.PLAN_P1 and plan["drain_limit_s"] == ts.P1_DRAIN_LIMIT_S
+    assert len(plan["in_flight"]["cells"]) == 15 and plan["in_flight"]["limit"] > 0
+    # the legacy plan still needs the supplement; the flag belongs to the collection
+    with pytest.raises(ValueError, match="--boundary-supplement-run"):
+        ts.run_training_supplement(_args(tmp_path, model, boundary_supplement_run=None,
+                                         dry_run=True), check_controller=False)
+    with pytest.raises(SystemExit):
+        campaign.main(["--training-plan", "p1-deep-overload", "--models", model,
+                       "--out-dir", str(tmp_path / "o"), "--dry-run"])

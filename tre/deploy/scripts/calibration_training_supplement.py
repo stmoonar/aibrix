@@ -45,6 +45,28 @@ manifest). Their rho is absolute, in units of each shape's second-round C_s.
 The run ends with checks, printed as a banner and recorded in ``design_result.json``; any
 failure makes it exit :data:`EXIT_CHECK_FAILED` (D22: stop and ask the user): a ladder
 shape without both a healthy and a violated cell, and a sentinel drift flag.
+
+Training plans (``--training-plan``, :data:`TRAINING_PLANS`)
+------------------------------------------------------------
+The cells above are the plan ``legacy-20260923`` (the default, kept so that run can be
+re-planned as it was). ``p1-deep-overload`` (2026-10-03, the vLLM 0.30 re-calibration) is
+the P1 shape supplement: per model S2 / S3 / T8 / S4 / S5 x {1.5, 2.0, 3.0} x rho*_run2,
+one 150 s hold each (15 cells), plus the same three S2 sentinels. They are training cells
+(role ``ladder``, stage ``ladder``: D16 holds train) deep in the violated region, so:
+
+* no both-sides check - every P1 cell is meant to violate. Its check is that each P1 cell
+  was driven and judged on at least one labelled post-warm-up window (not void, not
+  inconclusive for lack of windows);
+* no boundary supplement is needed (``--boundary-supplement-run`` optional; when given it
+  is load-path checked and recorded like the base run);
+* the drain before each cell waits for an idle engine (``running + waiting == 0``) for up
+  to :data:`P1_DRAIN_LIMIT_S` instead of ``DRAIN_LIMIT_S``. A 3 x rho* cell leaves a
+  waiting queue of roughly ``2 x lambda* x`` the client timeout (up to 112 s for S4) that
+  vLLM serves for minutes if the client's aborts do not reach it. The gate is state-based:
+  it ends as soon as the engine is idle, so it costs nothing when aborts propagate;
+* the plan reports each cell's in-flight estimate (engine running limit + the excess
+  arrivals of one client timeout) against the lower of the client's connection limit and
+  Envoy's shed ceiling: past either the cell would be void (dispatch delay / shed).
 """
 from __future__ import annotations
 
@@ -64,6 +86,7 @@ from scripts import calibration_campaign as campaign
 from scripts import calibration_design as design
 from scripts import calibration_ladder as ladder
 from scripts import calibration_supplement as supplement
+from scripts import openloop
 
 MODE = "training_supplement"
 #: Serials of this collection start here: the second round used a few hundred per model
@@ -121,6 +144,62 @@ PLAN: dict[str, tuple[Group, ...]] = {
 #: The ladder shapes the both-sides check applies to (③a, and ③b's T8 for 14b).
 BOTH_SIDES_PARTS = ("3a", "3b")
 
+
+@dataclass(frozen=True)
+class TrainingPlan:
+    """One selectable cell plan of this collection (``--training-plan``)."""
+
+    name: str
+    groups: Mapping[str, tuple[Group, ...]]
+    #: Parts whose shapes must each have a healthy and a violated cell.
+    both_sides_parts: tuple[str, ...]
+    #: Parts whose every cell must merely be driven and judged on >= 1 labelled window.
+    driven_parts: tuple[str, ...]
+    serial_base: int
+    drain_limit_s: float
+    why: str
+
+    def needs_supplement(self, model: str) -> bool:
+        return any(g.unit == UNIT_S3_D6PRIME for g in self.groups[model])
+
+
+PLAN_LEGACY = "legacy-20260923"
+PLAN_P1 = "p1-deep-overload"
+P1_SHAPES = ("S2", "S3", "T8", "S4", "S5")
+P1_FACTORS = (1.5, 2.0, 3.0)
+P1_SECONDS = 150.0
+#: Drain gate before each P1 cell: > 2 x the longest client timeout of the P1 shapes
+#: (S4: 112 s), the backlog a 3 x cell leaves when the client's aborts do not reach vLLM.
+P1_DRAIN_LIMIT_S = 300.0
+#: Clear of the legacy plan's 60_001+, M's 70_000 / 70_500 and T14's 80_500.
+P1_SERIAL_BASE = 62_000
+_P1_WHY = ("P1 deep overload: violated-side training windows far past the boundary "
+           "(the D16 training set had none above 1.3 x rho*)")
+P1_PLAN: dict[str, tuple[Group, ...]] = {
+    model: tuple(Group("p1", shape, UNIT_RUN2, P1_FACTORS, 1, P1_SECONDS, _P1_WHY)
+                 for shape in P1_SHAPES)
+    for model in PLAN
+}
+
+TRAINING_PLANS: dict[str, TrainingPlan] = {
+    PLAN_LEGACY: TrainingPlan(
+        PLAN_LEGACY, PLAN, BOTH_SIDES_PARTS, (), SERIAL_BASE, design.DRAIN_LIMIT_S,
+        "plan 2026-09-21 §6.11 D16-D22 step ③: constant-load training cells on the D6' "
+        "boundaries (③a S3 ladder, ③b 14b CI, 7b T8 top-up, ③d sentinels)"),
+    PLAN_P1: TrainingPlan(
+        PLAN_P1, P1_PLAN, (), ("p1",), P1_SERIAL_BASE, P1_DRAIN_LIMIT_S,
+        "2026-10-03 re-calibration on vLLM 0.30, shape supplement P1: S2/S3/T8/S4/S5 x "
+        "{1.5, 2.0, 3.0} x rho*_run2, 150 s holds, training (D16), plus ③d sentinels"),
+}
+DEFAULT_TRAINING_PLAN = PLAN_LEGACY
+
+
+def training_plan(args) -> TrainingPlan:
+    name = getattr(args, "training_plan", None) or DEFAULT_TRAINING_PLAN
+    if name not in TRAINING_PLANS:
+        raise ValueError(f"unknown --training-plan {name!r} (expected one of {sorted(TRAINING_PLANS)})")
+    return TRAINING_PLANS[name]
+
 SENTINEL_SHAPE = design.SENTINEL_SHAPE
 SENTINEL_FACTOR = design.SENTINEL_RHO_FACTOR
 SENTINEL_SECONDS = design.SENTINEL_SECONDS
@@ -150,15 +229,19 @@ def supplement_sha256(path: Path) -> str:
     return design._sha256(Path(path))
 
 
-def resolve_units(model: str, base_root: Path, supp_root: Path) -> dict:
+def resolve_units(model: str, base_root: Path, supp_root: Optional[Path],
+                  plan: Optional[TrainingPlan] = None) -> dict:
     """Per (shape, unit) the rho (of the shape's run-2 C_s) a factor of 1 means, with
     where it came from; plus each shape's C_s."""
-    shapes = sorted({g.shape for g in PLAN[model]} | {SENTINEL_SHAPE})
+    groups = (plan or TRAINING_PLANS[DEFAULT_TRAINING_PLAN]).groups[model]
+    shapes = sorted({g.shape for g in groups} | {SENTINEL_SHAPE})
     bases = {s: supplement.load_base_anchor(base_root, model, s) for s in shapes}
     units: dict[tuple[str, str], dict] = {}
-    for group in PLAN[model]:
+    for group in groups:
         base = bases[group.shape]
         if group.unit == UNIT_S3_D6PRIME:
+            if supp_root is None:
+                raise ValueError(f"{model}: {group.unit} needs --boundary-supplement-run")
             anchor = load_supplement_anchor(supp_root, base)
             units[(group.shape, group.unit)] = {"rho": anchor["anchor_rho"], "source": anchor}
         elif group.unit == UNIT_RUN2:
@@ -201,11 +284,12 @@ def interleave(cells: Sequence[design.DesignCell], rng: random.Random) -> list[d
 
 
 def build_cells(model: str, factory: design.CellFactory, resolved: Mapping,
-                design_seed: int) -> tuple[list[design.DesignCell], list[design.DesignCell]]:
+                design_seed: int, plan: Optional[TrainingPlan] = None,
+                ) -> tuple[list[design.DesignCell], list[design.DesignCell]]:
     """(the run's cell sequence, the sentinels). Ids and seeds are fixed here."""
     units = resolved["units"]
     holds = []
-    for group in PLAN[model]:
+    for group in (plan or TRAINING_PLANS[DEFAULT_TRAINING_PLAN]).groups[model]:
         unit_rho = units[(group.shape, group.unit)]["rho"]
         for factor in group.factors:
             for rep in range(1, group.replicates + 1):
@@ -231,13 +315,14 @@ def part_of(cell: design.DesignCell) -> str:
     return cell.note.split(":", 1)[0].replace("part ", "") if cell.note.startswith("part ") else ""
 
 
-def estimate(sequence: Sequence[design.DesignCell], cooldown_s: float) -> dict:
+def estimate(sequence: Sequence[design.DesignCell], cooldown_s: float,
+             drain_limit_s: float = design.DRAIN_LIMIT_S) -> dict:
     """Wall clock: every cell pays a gap (expected: the cooldown, upper: the drain limit;
     plus the driver's start-up); a cell above its boundary can outlive its schedule by the
     request deadline while its backlog finishes (expected: the cells at >= 1.05 x, upper:
     all of them)."""
     gap_exp = max(cooldown_s, 0.0) + ladder.DRIVER_OVERHEAD_S
-    gap_up = max(cooldown_s, design.DRAIN_LIMIT_S) + ladder.DRIVER_OVERHEAD_S
+    gap_up = max(cooldown_s, drain_limit_s) + ladder.DRIVER_OVERHEAD_S
     load = sum(c.duration_s for c in sequence)
     tails_exp = sum(design.request_timeout_s(c.shape) for c in sequence
                     if c.role != design.ROLE_SENTINEL and (c.rho_factor or 0) >= 1.05)
@@ -245,6 +330,37 @@ def estimate(sequence: Sequence[design.DesignCell], cooldown_s: float) -> dict:
     return {"cells": len(sequence), "offered_load_s": load,
             "seconds_expected": round(load + tails_exp + len(sequence) * gap_exp, 1),
             "seconds_upper": round(load + tails_up + len(sequence) * gap_up, 1)}
+
+
+#: An estimate past this share of the in-flight limit is reported as at risk.
+IN_FLIGHT_WARN_SHARE = 0.8
+
+
+def in_flight_estimate(sequence: Sequence[design.DesignCell], resolved: Mapping, cap) -> dict:
+    """Peak in-flight requests of every cell above its shape's rho*_run2: the engine's
+    running limit plus the arrivals beyond rho*_run2 x C_s during one client timeout (a
+    request still waiting then is abandoned by the client; an engine serving faster than
+    rho* only lowers it). Against the lower of the client's connection limit
+    (``openloop.DEFAULT_MAX_IN_FLIGHT``: past it the sender pool waits -> dispatch-delay
+    void) and Envoy's shed ceiling (past it Envoy sheds -> shed void)."""
+    limit = min(int(openloop.DEFAULT_MAX_IN_FLIGHT), int(cap.shed_ceiling))
+    cells = []
+    for cell in sequence:
+        base = resolved["bases"].get(cell.shape)
+        if cell.rho is None or base is None:
+            continue
+        excess_rps = (float(cell.rho) - float(base["anchor_rho"])) * float(base["capacity_rps"])
+        if excess_rps <= 0:
+            continue
+        seconds = min(design.request_timeout_s(cell.shape), float(cell.duration_s))
+        peak = cap.fleet_sequence_limit + excess_rps * seconds
+        cells.append({"cell_id": cell.cell_id, "shape": cell.shape, "rho_factor": cell.rho_factor,
+                      "in_flight": int(round(peak)),
+                      "at_risk": peak > IN_FLIGHT_WARN_SHARE * limit})
+    return {"limit": limit, "warn_share": IN_FLIGHT_WARN_SHARE, "cells": cells,
+            "at_risk": [c["cell_id"] for c in cells if c["at_risk"]],
+            "rule": ("running limit + (rho - rho*_run2) x C_s x min(client timeout, cell "
+                     "seconds), vs min(client max in-flight, Envoy shed ceiling)")}
 
 
 def label_doc(label: slo_labels.LabelDefinition, args) -> dict:
@@ -258,29 +374,45 @@ def label_doc(label: slo_labels.LabelDefinition, args) -> dict:
     }
 
 
+def checks_text(tplan: TrainingPlan) -> str:
+    parts = []
+    if tplan.both_sides_parts:
+        parts.append(f"both sides: every part {'/'.join(tplan.both_sides_parts)} shape has >= 1 "
+                     "healthy and >= 1 violated hold cell")
+    if tplan.driven_parts:
+        parts.append(f"driven: every part {'/'.join(tplan.driven_parts)} cell has a healthy or "
+                     "violated verdict on >= 1 labelled post-warm-up window")
+    parts.append("sentinel drift not flagged")
+    return "; ".join(parts) + f". A failure exits {EXIT_CHECK_FAILED} (D22)"
+
+
 def build_plan(args, model: str, sequence: Sequence[design.DesignCell], resolved: Mapping,
-               cap) -> tuple[dict, dict]:
+               cap, tplan: Optional[TrainingPlan] = None) -> tuple[dict, dict]:
     """(plan.json, run manifest)."""
+    tplan = tplan or TRAINING_PLANS[DEFAULT_TRAINING_PLAN]
     label = campaign.primary_label(args, model)
     provenance = campaign.run_provenance(args)
     units_doc = [{"shape": s, "unit": u, "rho": v["rho"], "source": v["source"]}
                  for (s, u), v in sorted(resolved["units"].items())]
     groups = [{"part": g.part, "shape": g.shape, "unit": g.unit, "factors": list(g.factors),
                "replicates": g.replicates, "seconds": g.seconds, "why": g.why}
-              for g in PLAN[model]]
+              for g in tplan.groups[model]]
     cells = [c.as_dict() for c in sequence]
-    est = estimate(sequence, args.cooldown_s)
+    est = estimate(sequence, args.cooldown_s, tplan.drain_limit_s)
+    supp = getattr(args, "boundary_supplement_run", None)
     plan = {
         # "ladder": the standard dataset reads this run from its ledger like any ladder run.
         "design": ladder.DESIGN_NAME,
         "mode": MODE,
+        "training_plan": tplan.name,
         "generated_at_utc": campaign.utc_iso(),
         "provenance": provenance,
         "admission_cap": cap.as_dict(),
         "models": [model],
         "design_seed": int(args.design_seed),
-        "serial_base": SERIAL_BASE,
+        "serial_base": tplan.serial_base,
         "cooldown_s": args.cooldown_s,
+        "drain_limit_s": tplan.drain_limit_s,
         "run_manifest": ladder.RUN_MANIFEST,
         "static_cells": {model: cells},
         "sequence": [c.cell_id for c in sequence],
@@ -289,27 +421,27 @@ def build_plan(args, model: str, sequence: Sequence[design.DesignCell], resolved
         "capacity_rps": resolved["capacity"],
         "label": label_doc(label, args),
         "estimate": est,
+        "in_flight": in_flight_estimate(sequence, resolved, cap),
     }
     manifest = {
         "design": ladder.DESIGN_NAME,
         "mode": MODE,
+        "training_plan": tplan.name,
         "written_at_utc": campaign.utc_iso(),
-        "why": ("plan 2026-09-21 §6.11 D16-D22 step ③: constant-load training cells on the "
-                "D6' boundaries (③a S3 ladder, ③b 14b CI, 7b T8 top-up, ③d sentinels)"),
+        "why": tplan.why,
         "base_run": str(args.base_run),
-        "boundary_supplement_run": str(args.boundary_supplement_run),
+        "boundary_supplement_run": None if supp is None else str(supp),
         "bases": resolved["bases"],
         "units": units_doc,
         "groups": groups,
         "sentinel_rule": (f"{SENTINEL_FACTOR} x rho*_run2({SENTINEL_SHAPE}), {SENTINEL_SECONDS:g} s, "
                           f"positions {list(SENTINEL_POSITIONS)}; drift on "
                           f"{design.SENTINEL_DRIFT_THRESHOLDS}"),
-        "checks": ("both sides: every ③a / ③b shape has >= 1 healthy and >= 1 violated hold "
-                   "cell; sentinel drift not flagged. A failure exits "
-                   f"{EXIT_CHECK_FAILED} (D22)"),
+        "checks": checks_text(tplan),
+        "drain_limit_s": tplan.drain_limit_s,
         "label": provenance.get("label"),
         "design_seed": int(args.design_seed),
-        "serial_base": SERIAL_BASE,
+        "serial_base": tplan.serial_base,
         "seed_derivation": ("as the ladder design (calibration_design.CellFactory); order from "
                             "random.Random(derived_seed(design_seed, model, "
                             "'training-supplement-order')), shapes interleaved"),
@@ -341,7 +473,16 @@ def print_plan(plan: dict, model: str) -> None:
     est = plan["estimate"]
     print(f"  {est['cells']} cells, offered load {est['offered_load_s'] / 60:.0f} min; wall clock "
           f"~{est['seconds_expected'] / 3600:.2f} h expected, <= {est['seconds_upper'] / 3600:.2f} h "
-          "(re-drives of void cells excluded)")
+          f"(drain gate <= {plan.get('drain_limit_s', design.DRAIN_LIMIT_S):g} s; re-drives of "
+          "void cells excluded)")
+    flight = plan.get("in_flight") or {}
+    if flight.get("cells"):
+        top = max(flight["cells"], key=lambda c: c["in_flight"])
+        print(f"  in-flight estimate: max {top['in_flight']} ({top['shape']} {top['rho_factor']:g} x) "
+              f"of limit {flight['limit']}")
+    for cid in flight.get("at_risk", []):
+        print(f"  WARNING: {cid} may exceed {flight['warn_share']:.0%} of the in-flight limit "
+              f"{flight['limit']} - a dispatch-delay / shed void is likely")
 
 
 # ----------------------------------------------------------------------------- run
@@ -385,9 +526,12 @@ class PlannedRun(ladder.LadderRun):
 
 
 class TrainingSupplementRun(PlannedRun):
-    def __init__(self, *a, sequence: Sequence[design.DesignCell], **kw) -> None:
+    def __init__(self, *a, sequence: Sequence[design.DesignCell],
+                 plan: Optional[TrainingPlan] = None, **kw) -> None:
         super().__init__(*a, **kw)
         self.sequence = list(sequence)
+        self.training_plan = plan or TRAINING_PLANS[DEFAULT_TRAINING_PLAN]
+        self.drain_limit_s = self.training_plan.drain_limit_s
 
     def run(self, shapes: Sequence[str] = ()) -> None:
         for cell in self.sequence:
@@ -395,7 +539,16 @@ class TrainingSupplementRun(PlannedRun):
 
     def failures(self) -> list[str]:
         out = []
-        for part in BOTH_SIDES_PARTS:
+        for o in self.outcomes:
+            if o["part"] not in self.training_plan.driven_parts:
+                continue
+            judged = o["verdict"] in (boundary.VERDICT_HEALTHY, boundary.VERDICT_VIOLATED)
+            if not judged or not (o.get("labeled_windows") or 0):
+                out.append(f"{self.model}/{o['shape']} part {o['part']} {o['cell_id']} "
+                           f"({o['rho_factor']:g} x): verdict {o['verdict']!r} on "
+                           f"{o.get('labeled_windows') or 0} labelled windows - not a usable "
+                           "training cell")
+        for part in self.training_plan.both_sides_parts:
             by_shape: dict[str, list[str]] = {}
             for o in self.outcomes:
                 if o["part"] == part:
@@ -462,6 +615,14 @@ def banner(lines: Sequence[str]) -> None:
     print(bar, flush=True)
 
 
+def source_runs(args) -> list[tuple[str, Path]]:
+    """The run roots this collection is placed from (the supplement only when given)."""
+    out = [("--base-run", Path(args.base_run))]
+    if getattr(args, "boundary_supplement_run", None):
+        out.append(("--boundary-supplement-run", Path(args.boundary_supplement_run)))
+    return out
+
+
 def check_source_load_paths(args, model: str) -> list[dict]:
     """The supplement extends --base-run's training set on --boundary-supplement-run's
     anchors, so it must reach the engine the way both did (scripts.prompt_corpus): same
@@ -477,9 +638,7 @@ def check_source_load_paths(args, model: str) -> list[dict]:
     if getattr(args, "dry_run", False):
         flags = {k: True for k in flags}
     reports = []
-    for flag, source in (("--base-run", args.base_run),
-                         ("--boundary-supplement-run", args.boundary_supplement_run)):
-        root = Path(source)
+    for flag, root in source_runs(args):
         found = 0
         for directory in (dataset.campaign_dirs(root) if root.is_dir() else []):
             try:
@@ -508,17 +667,22 @@ def run_training_supplement(args, *, drive: Optional[Callable] = None,
     ladder.check_label_args(args)
     model = single_model(args)
     check_primary_label(args, model)
-    if not args.base_run or not args.boundary_supplement_run:
-        raise ValueError("--training-supplement needs --base-run and --boundary-supplement-run")
+    tplan = training_plan(args)
+    if not args.base_run:
+        raise ValueError("--training-supplement needs --base-run")
+    supp = getattr(args, "boundary_supplement_run", None)
+    if tplan.needs_supplement(model) and not supp:
+        raise ValueError(f"--training-plan {tplan.name} needs --boundary-supplement-run "
+                         f"(S3's measured rho* under D6')")
     out_dir = Path(args.out_dir)
-    for source in (args.base_run, args.boundary_supplement_run):
-        supplement.check_new_out_dir(out_dir, Path(source))
+    for _flag, source in source_runs(args):
+        supplement.check_new_out_dir(out_dir, source)
     load_paths = check_source_load_paths(args, model)
-    resolved = resolve_units(model, Path(args.base_run), Path(args.boundary_supplement_run))
+    resolved = resolve_units(model, Path(args.base_run), Path(supp) if supp else None, tplan)
     cap = resolve_cap(args)
-    factory = design.CellFactory(model, int(args.design_seed), serial_base=SERIAL_BASE)
-    sequence, _sentinels = build_cells(model, factory, resolved, int(args.design_seed))
-    plan, manifest = build_plan(args, model, sequence, resolved, cap)
+    factory = design.CellFactory(model, int(args.design_seed), serial_base=tplan.serial_base)
+    sequence, _sentinels = build_cells(model, factory, resolved, int(args.design_seed), tplan)
+    plan, manifest = build_plan(args, model, sequence, resolved, cap, tplan)
     plan["source_load_paths"] = manifest["source_load_paths"] = load_paths
     out_dir.mkdir(parents=True, exist_ok=True)
     print_plan(plan, model)
@@ -546,7 +710,7 @@ def run_training_supplement(args, *, drive: Optional[Callable] = None,
     run = TrainingSupplementRun(
         args, model, resolved["capacity"], factory=factory, cap=cap, out_dir=out_dir,
         raw_dir=raw_dir, drive=drive, sample=sample_factory(model), sleep=sleep, clock=clock,
-        sequence=sequence)
+        sequence=sequence, plan=tplan)
     status, code = "failed", 1
     result = None
     try:

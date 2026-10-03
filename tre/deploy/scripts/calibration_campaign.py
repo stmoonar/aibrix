@@ -2570,6 +2570,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     help="step ③ of plan §6.11 (scripts.calibration_training_supplement): the "
                          "constant-load training cells on the D6' boundaries of one model "
                          "(--models MODEL), placed from --base-run and --boundary-supplement-run")
+    ap.add_argument("--training-plan", default=None,
+                    choices=["legacy-20260923", "p1-deep-overload"],
+                    help="--training-supplement: the cell plan (scripts.calibration_training_"
+                         "supplement.TRAINING_PLANS). legacy-20260923 (default): the 2026-09-23 "
+                         "③a/③b/③d cells (needs --boundary-supplement-run). p1-deep-overload: "
+                         "S2/S3/T8/S4/S5 x {1.5, 2.0, 3.0} x rho*_run2, 150 s holds")
     ap.add_argument("--acceptance-set", action="store_true",
                     help="step ④ of plan §6.11 (scripts.calibration_acceptance): the acceptance "
                          "set M of one model - D6' probes of its new shapes, its ten cells, then "
@@ -2595,6 +2601,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                          "probes, then sealed (T14_manifest.json). A real run needs "
                          "--freeze-file, --refit-params-file, --preregistration-json and "
                          "--routing-strategy least-gpu-cache")
+    ap.add_argument("--forbidden-root", type=Path, action="append", default=[],
+                    help="--t14-set: a training / M / refit / freeze root T14's --out-dir and "
+                         "--raw-dir must stay out of (repeatable; joined with the "
+                         "preregistration's t14.forbidden_roots and the capacity prior's input "
+                         "runs)")
     ap.add_argument("--capacity-prior-file", type=Path, default=None,
                     help="--t14-set: the pre-registered capacity prior "
                          "(python -m scripts.calibration_t14 capacity-prior)")
@@ -2689,6 +2700,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                  "--boundary-supplement-run / --boundary-table / --retained-dataset belong to "
                  "--training-supplement / --acceptance-set (and to calibration_t14 "
                  "capacity-prior)")
+    if args.training_plan and not args.training_supplement:
+        ap.error("--training-plan belongs to --training-supplement")
+    if args.forbidden_root and not args.t14_set:
+        ap.error("--forbidden-root belongs to --t14-set")
     if not args.t14_set and (args.capacity_prior_file or args.refit_params_file
                              or args.preregistration_json or args.preregistration_amendment_json):
         ap.error("--capacity-prior-file / --refit-params-file / --preregistration-json belong "

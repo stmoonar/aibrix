@@ -278,6 +278,8 @@ class LadderRun:
         self.ladder_outcomes: dict[str, list[design.CellOutcome]] = {}
         self.supplement_decisions: list[dict] = []
         self.sentinel_summaries: list[dict] = []
+        #: The longest wait for an idle engine before a cell (``wait_for_drain``).
+        self.drain_limit_s: float = design.DRAIN_LIMIT_S
         self.contaminated: list[dict] = []
         self.records: list[dict] = []
         #: The primary window label every hold cell of this model is judged on (D6').
@@ -291,7 +293,8 @@ class LadderRun:
     def gap(self) -> dict:
         """Wait for the engine to drain (bounded), with the cooldown as a floor."""
         t0 = self.clock()
-        drain = wait_for_drain(self.sample, clock=self.clock, sleep=self.sleep)
+        drain = wait_for_drain(self.sample, limit_s=self.drain_limit_s, clock=self.clock,
+                               sleep=self.sleep)
         elapsed = self.clock() - t0
         floor = float(self.args.cooldown_s)
         if elapsed < floor:
