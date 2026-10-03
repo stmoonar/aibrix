@@ -20,6 +20,7 @@ from pathlib import Path
 import pytest
 
 from tre_common import slo_labels
+from tre_common.registry import load_registry
 
 from scripts import adaptive_boundary as boundary
 from scripts import calibration_campaign as campaign
@@ -33,9 +34,11 @@ SHAPE = "S3"
 ANCHOR = 1.5      # rho*_base, in rho of the base run's C_s
 CAPACITY = 2.0    # C_s (rps)
 GRID = "1.3,1.45,1.6,1.8"
-#: S3 is i2048_o96: the 7b D6' TTFT SLO there is max(500, 5 * (36.4 + 0.0527 * 2048)) ms.
+#: S3 is i2048_o96: the 7b D6' TTFT SLO there is max(500, 5 * (c + b * 2048)) ms, c / b the
+#: registry's idle fit (the CLI dry run below reads the committed registry).
 S3_INPUT = 2048
-D6_TTFT_SLO_MS = 5 * (36.4 + 0.0527 * S3_INPUT)
+_SLO = load_registry().model(MODEL).slo
+D6_TTFT_SLO_MS = 5 * (_SLO.ttft_idle_c_ms + _SLO.ttft_idle_b_ms_per_token * S3_INPUT)
 
 
 def _write(path: Path, doc) -> Path:

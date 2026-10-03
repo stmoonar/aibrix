@@ -70,9 +70,11 @@ data:
         e2e_p95_ms: 12000.0
         # Idle TTFT(L) = c + b * prompt_tokens: the calibration label's slowdown TTFT SLO
         # is max(floor, k * idle); primary label k = 5, floor 500 ms (plan 2026-09-21 6.11 D6'). Offline label only; provenance
-        # docs/refactor/p11_evidence/ttft_idle_fit_20260922.yaml
-        ttft_idle_c_ms: 36.4
-        ttft_idle_b_ms_per_token: 0.0527
+        # 2026-10-03 idle capture on vllm-openai-tre:0.30.0-ts-8dc0f2a7 (scripts.ttft_idle_capture, chat api,
+        # one request in flight, L 128-4096 x 30), fit scripts.ttft_idle_fit --min-gap-ms 500 over the full
+        # L range (n 210 per model; an L <= 2048 fit differs < 7 % on L 256-2200). Old engine: 09-22 fit.
+        ttft_idle_c_ms: 41.1
+        ttft_idle_b_ms_per_token: 0.0694
         ttft_slo_mode: slowdown
         ttft_slowdown_k: 5.0
         ttft_floor_ms: 500.0
@@ -137,9 +139,11 @@ data:
         e2e_p95_ms: 12000.0
         # Idle TTFT(L) = c + b * prompt_tokens: the calibration label's slowdown TTFT SLO
         # is max(floor, k * idle); primary label k = 5, floor 500 ms (plan 2026-09-21 6.11 D6'). Offline label only; provenance
-        # docs/refactor/p11_evidence/ttft_idle_fit_20260922.yaml
-        ttft_idle_c_ms: 39.3
-        ttft_idle_b_ms_per_token: 0.0555
+        # 2026-10-03 idle capture on vllm-openai-tre:0.30.0-ts-8dc0f2a7 (scripts.ttft_idle_capture, chat api,
+        # one request in flight, L 128-4096 x 30), fit scripts.ttft_idle_fit --min-gap-ms 500 over the full
+        # L range (n 210 per model; an L <= 2048 fit differs < 7 % on L 256-2200). Old engine: 09-22 fit.
+        ttft_idle_c_ms: 48.1
+        ttft_idle_b_ms_per_token: 0.0717
         ttft_slo_mode: slowdown
         ttft_slowdown_k: 5.0
         ttft_floor_ms: 500.0
@@ -211,9 +215,11 @@ data:
         e2e_p95_ms: 15000.0
         # Idle TTFT(L) = c + b * prompt_tokens: the calibration label's slowdown TTFT SLO
         # is max(floor, k * idle); primary label k = 5, floor 500 ms (plan 2026-09-21 6.11 D6'). Offline label only; provenance
-        # docs/refactor/p11_evidence/ttft_idle_fit_20260922.yaml
-        ttft_idle_c_ms: 43.4
-        ttft_idle_b_ms_per_token: 0.0683
+        # 2026-10-03 idle capture on vllm-openai-tre:0.30.0-ts-8dc0f2a7 (scripts.ttft_idle_capture, chat api,
+        # one request in flight, L 128-4096 x 30), fit scripts.ttft_idle_fit --min-gap-ms 500 over the full
+        # L range (n 210 per model; an L <= 2048 fit differs < 7 % on L 256-2200). Old engine: 09-22 fit.
+        ttft_idle_c_ms: 45.3
+        ttft_idle_b_ms_per_token: 0.0879
         ttft_slo_mode: slowdown
         ttft_slowdown_k: 5.0
         ttft_floor_ms: 500.0
