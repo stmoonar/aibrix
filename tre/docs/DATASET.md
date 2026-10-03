@@ -170,6 +170,14 @@ train = w[(w.split == "train") & (w.slo_label != "unlabeled")]
 | `p95_tpot_server_ms` | ms | 同上，TPOT（按 token 间隔计，含单 token 卡顿） |
 | `p95_e2e_server_ms` | ms | 同上，端到端 |
 
+**L3 数据集**（`calibration_dataset --numerator vllm_counter`，默认目录 `dataset_l3/`）：`prompt_tokens_total` / `generation_tokens_total` / `trs` 换成各 pod vLLM 计数器 `vllm:prompt_tokens_total` / `vllm:generation_tokens_total` 在窗口内的增量之和（引擎**处理**的 token，不是完成请求的 token；规则见 `scripts/l3_numerator.py`）；作废窗口（重置、1 Hz 空洞、缺样本）不写入，按原因计数在 manifest `numerator`。另加三列：
+
+| 列 | 单位 | 含义 |
+|---|---|---|
+| `numerator_source` | – | `vllm_counter` |
+| `prompt_tokens_gateway` | tokens | 同一窗口的默认（网关）分子 prompt 值，供对照 |
+| `generation_tokens_gateway` | tokens | 同上，generation |
+
 ## 6. `requests.csv`
 
 一行一个请求；**所有 attempt（包括 void）**。这是最原始的证据：换标签定义时可以从它重算一切。

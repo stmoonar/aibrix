@@ -69,6 +69,7 @@ Assumptions (documented, doc15 §4 leaves them to "most conservative choice"):
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import subprocess
 from collections import Counter
@@ -76,7 +77,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from statistics import median
-from typing import Iterable, Mapping, Optional, Sequence
+from typing import Callable, Iterable, Mapping, Optional, Sequence
 
 from tre_common import slo_labels
 from tre_common.metrics_schema import ModelWindowMetrics
@@ -646,10 +647,18 @@ def rewindow_cell(
     routable_pods: int = 1,
     assigned_replicas: int = 1,
     window_align: str = WINDOW_ALIGN_NONE,
+    token_source: Optional[Callable[[int, int], Optional[tuple[float, float]]]] = None,
 ) -> list[dict]:
     """Re-window one cell's raw into calibration CSV rows (reusing r3_grid.window_row +
     compute_window_results for the trs column). Latency columns are client-side; the
     rows carry no SLO label and no unserved counts yet - :func:`label_cell` adds both.
+
+    ``token_source`` replaces the TSS numerator: called with each window's
+    ``(start_ms, end_ms)``, it returns that window's ``(prompt_tokens, generation_tokens)``
+    or None (the window is dropped before the EMA, as a window with no sample).
+    None (default) keeps the per-request totals of the completions in the window (the
+    gateway's count-at-completion numerator); :mod:`scripts.l3_numerator` supplies the
+    vLLM token-counter deltas (L3). Queue, latency and labels never depend on it.
 
     ``window_align="grid"`` ends every window on the ``SCRAPE_INTERVAL_MS`` grid and reads
     it half-open ``(start, end]`` (instants stamped with their gateway tick on the live
@@ -688,6 +697,14 @@ def rewindow_cell(
         )
         for ws, we in windows_ms
     ]
+    if token_source is not None:
+        replaced = []
+        for wm in metrics:
+            tokens = token_source(wm.window_start_ms, wm.window_end_ms)
+            if tokens is not None:
+                replaced.append(dataclasses.replace(
+                    wm, prompt_tokens=float(tokens[0]), generation_tokens=float(tokens[1])))
+        metrics = replaced
     results = r3_grid.compute_window_results(metrics, spec)
     rows = []
     for wm, result in zip(metrics, results):
@@ -725,6 +742,7 @@ def label_cell(
     routable_pods: int = 1,
     assigned_replicas: int = 1,
     window_align: str = WINDOW_ALIGN_NONE,
+    token_source: Optional[Callable[[int, int], Optional[tuple[float, float]]]] = None,
 ) -> list[dict]:
     """One cell's window rows, each with its SLO labels. THE labelling path.
 
@@ -762,7 +780,7 @@ def label_cell(
         instant_grid=instant_grid,
         start_ms=start_ms, end_ms=end_ms,
         routable_pods=routable_pods, assigned_replicas=assigned_replicas,
-        window_align=window_align,
+        window_align=window_align, token_source=token_source,
     )
     rows = openloop.mark_unserved_request_windows(
         rows, records, closed_right=window_align == WINDOW_ALIGN_GRID

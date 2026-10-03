@@ -393,6 +393,20 @@ def _dataset_header(src: DatasetSource) -> list[str]:
     return list(header)
 
 
+def dataset_numerator(directory: Path) -> str:
+    """The TSS numerator a standard dataset's signal columns were built with (its
+    manifest's ``numerator.source``, :mod:`scripts.l3_numerator`); a manifest from before
+    the record is ``gateway``, the only numerator there was."""
+    from scripts import l3_numerator as l3
+
+    man = Path(directory) / DATASET_MANIFEST
+    try:
+        doc = json.loads(man.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return l3.NUMERATOR_GATEWAY
+    return str((doc.get("numerator") or {}).get("source") or l3.NUMERATOR_GATEWAY)
+
+
 def prompt_token_mismatched_cells(src: DatasetSource) -> set[tuple[str, str]]:
     """``(cell_id, attempt)`` of the source's cells whose served requests were off their
     prompt length (``cells.csv`` ``prompt_tokens_mismatched > 0``; a dataset built with
@@ -423,6 +437,11 @@ def build_training_set(sources: Sequence[DatasetSource], fit_dir: Path, *,
     families = gen.families()
     if set(families) != set(FAMILY_FILES):
         raise TrainingSetError(f"families {sorted(families)} != {sorted(FAMILY_FILES)}")
+    numerators = {s.name: dataset_numerator(s.directory) for s in sources}
+    if len(set(numerators.values())) > 1:
+        # one theta, one numerator: gateway and L3 totals of a window differ by design
+        raise TrainingSetError(f"the datasets were built with different TSS numerators {numerators}; "
+                               "rebuild them with one calibration_dataset --numerator")
     family_of = {shape: fam for fam, shapes in families.items() for shape in shapes}
     headers = {s.name: _dataset_header(s) for s in sources}
     out_header = ["run"]
@@ -553,6 +572,7 @@ def build_training_set(sources: Sequence[DatasetSource], fit_dir: Path, *,
             "run": s.name, "directory": str(s.directory), "sealed_split": SET_H2 if s.sealed_to_h2 else SET_M,
             "windows_csv_sha256": sha256_file(s.windows),
             "manifest_sha256": sha256_file(man) if man.exists() else None, "format_revision": rev,
+            "numerator": numerators[s.name],
         })
     doc = {
         "what": "D16 training set: the constant-load cells of the sources (theta is fitted on these only)",
@@ -565,6 +585,8 @@ def build_training_set(sources: Sequence[DatasetSource], fit_dir: Path, *,
             "families": {fam: list(shapes) for fam, shapes in families.items()},
         },
         "sentinels": sentinels,
+        # The TSS numerator of every source (scripts.l3_numerator; one by construction).
+        "numerator": next(iter(numerators.values()), None),
         "sources": source_docs,
         "models": model_docs,
         "h2": {"manifest": str(fit_dir / H2_MANIFEST), "manifest_sha256": sha256_file(fit_dir / H2_MANIFEST),
@@ -1631,6 +1653,9 @@ def freeze_model(out_root: Path, fit_dir: Path, model: str, arm: str) -> tuple[O
         # fit of the D6' label and every length in ttft_len_samples count the prompt the
         # way this API does (chat: template included).
         "api": next(iter(load_paths.values()))["api"],
+        # The TSS numerator the training windows carried (scripts.l3_numerator; absent in
+        # older freezes = gateway). accept refuses an M dataset built with another.
+        "numerator": man_doc.get("numerator") or "gateway",
         "b_prime": b_prime_rec,
     }
     return entry, []
@@ -2237,6 +2262,14 @@ def _accept_inputs(freeze_file: Path, datasets: Sequence[str],
         problems.append("no --dataset given")
     if len({s.name for s in sources}) != len(sources):
         problems.append(f"two datasets share a run name: {[s.name for s in sources]}")
+    frozen_numerators = {m_: str(e.get("numerator") or "gateway") for m_, e in sorted(doc["models"].items())}
+    for s in sources:
+        have = dataset_numerator(s.directory)
+        wrong = sorted(m_ for m_, n in frozen_numerators.items() if n != have)
+        if wrong:
+            problems.append(f"dataset {s.name} ({s.directory}) was built with the {have!r} TSS numerator; the "
+                            f"freeze fitted {wrong} with {sorted({frozen_numerators[m_] for m_ in wrong})} "
+                            "(rebuild it with calibration_dataset --numerator)")
     m: dict = {"header": {}, "rows": {}, "placed": {}}
     if not problems:
         m, pr = collect_m_rows(sources, manifests)
