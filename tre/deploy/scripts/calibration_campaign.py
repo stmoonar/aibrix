@@ -2112,6 +2112,73 @@ def prompt_corpus_cli_args(args) -> list[str]:
     return ["--corpus-lang", corpus["corpus_lang"], "--zh-ratio", repr(corpus["zh_ratio"])]
 
 
+#: The gateway-plugins Deployment (in ``--controller-namespace``) whose image a run records.
+DEFAULT_GATEWAY_PLUGINS_DEPLOYMENT = "tre-gateway-plugins"
+#: The runner :func:`image_provenance` calls kubectl with (read-only ``get``); the tests
+#: replace it so they never reach a cluster.
+IMAGE_PROVENANCE_RUN = subprocess.run
+KUBECTL_TIMEOUT_S = 20.0
+
+
+def _pod_images(item: Mapping) -> dict:
+    meta, spec, status = item.get("metadata") or {}, item.get("spec") or {}, item.get("status") or {}
+    ids = {c.get("name"): c.get("imageID") for c in status.get("containerStatuses") or []}
+    return {"pod": f"{meta.get('namespace')}/{meta.get('name')}", "node": spec.get("nodeName"),
+            "containers": [{"name": c.get("name"), "image": c.get("image"), "image_id": ids.get(c.get("name"))}
+                           for c in spec.get("containers") or []]}
+
+
+def image_provenance(models: Sequence[str], *, model_namespace: str, control_namespace: str,
+                     gateway_deployment: str = DEFAULT_GATEWAY_PLUGINS_DEPLOYMENT, run=None) -> dict:
+    """The images the run is measured on, read with ``kubectl get`` (read-only): every
+    routable pod of each model (each container's image tag and image ID - the vLLM image
+    among them) and the gateway-plugins Deployment's image plus its pods' image IDs.
+
+    Never fails a run: whatever cannot be read is recorded as None, the reason goes to
+    ``warnings`` and is printed as a WARNING."""
+    run = run or IMAGE_PROVENANCE_RUN
+    warnings: list[str] = []
+
+    def kubectl_json(*argv: str) -> Optional[dict]:
+        try:
+            out = run(["kubectl", *argv, "-o", "json"], capture_output=True, text=True, check=True,
+                      timeout=KUBECTL_TIMEOUT_S).stdout
+            doc = json.loads(out or "{}")
+            return doc if isinstance(doc, dict) else None
+        except Exception as exc:  # noqa: BLE001 - provenance never fails a run
+            warnings.append(f"kubectl {' '.join(argv)}: {exc!r}")
+            return None
+
+    model_pods: dict[str, Optional[list]] = {}
+    for m in models:
+        doc = kubectl_json("-n", model_namespace, "get", "pods", "-l",
+                           f"model.aibrix.ai/name={m},tre.aibrix.io/routable=true")
+        if doc is None:
+            model_pods[m] = None
+            continue
+        pods = sorted((_pod_images(i) for i in doc.get("items") or []), key=lambda p: p["pod"])
+        if not pods:
+            warnings.append(f"{m}: no routable pod in namespace {model_namespace}")
+        model_pods[m] = pods or None
+    gateway: Optional[dict] = None
+    dep = kubectl_json("-n", control_namespace, "get", "deployment", gateway_deployment)
+    if dep is not None:
+        spec = ((dep.get("spec") or {}).get("template") or {}).get("spec") or {}
+        labels = ((dep.get("spec") or {}).get("selector") or {}).get("matchLabels") or {}
+        pods_doc = (kubectl_json("-n", control_namespace, "get", "pods", "-l",
+                                 ",".join(f"{k}={v}" for k, v in sorted(labels.items())))
+                    if labels else None)
+        gateway = {"namespace": control_namespace, "deployment": gateway_deployment,
+                   "containers": [{"name": c.get("name"), "image": c.get("image")}
+                                  for c in spec.get("containers") or []],
+                   "pods": (sorted((_pod_images(i) for i in pods_doc.get("items") or []), key=lambda p: p["pod"])
+                            if pods_doc is not None else None)}
+    for w in warnings:
+        print(f"WARNING: run provenance: {w} (recorded as null)", file=sys.stderr)
+    return {"model_pods": model_pods, "gateway_plugins": gateway, "warnings": warnings,
+            "source": "kubectl get (read-only), when the run was planned"}
+
+
 def run_provenance(args) -> dict:
     """What a run was made with, recorded before it drives anything."""
     registry = registry_path_for(args)
@@ -2127,6 +2194,13 @@ def run_provenance(args) -> dict:
     }
     return {
         "code": git_state(Path(__file__).resolve().parents[2]),
+        # The model pods' (vLLM) and the gateway plugins' images (null + warning when
+        # kubectl cannot say): theta is only valid on the engine it was fitted on.
+        "images": image_provenance(
+            models, model_namespace=str(getattr(args, "model_namespace", None) or "default"),
+            control_namespace=str(getattr(args, "controller_namespace", None) or "tre-v2"),
+            gateway_deployment=str(getattr(args, "gateway_plugins_deployment", None)
+                                   or DEFAULT_GATEWAY_PLUGINS_DEPLOYMENT)),
         "registry_path": str(registry),
         "registry_sha256": file_sha256(registry),
         "window_ms": args.window_ms,
@@ -2530,6 +2604,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                          "gateway redis docs, controller ticks; scripts.calibration_capture)")
     ap.add_argument("--model-namespace", default="default")
     ap.add_argument("--controller-namespace", default="tre-v2")
+    ap.add_argument("--gateway-plugins-deployment", default=DEFAULT_GATEWAY_PLUGINS_DEPLOYMENT,
+                    help="Deployment (in --controller-namespace) whose image the run provenance records")
     ap.add_argument("--dry-run", action="store_true",
                     help="write plan.json and fit_plan.json, print the time estimate, "
                          "drive nothing")
