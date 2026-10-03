@@ -120,3 +120,25 @@ def test_a_freeze_without_a_sealed_cut_refuses_unless_given_an_explicit_file(tmp
     res = json.loads(dl.freeze_paths(w["freeze"])["result"].read_text())
     src = res["models"][MODEL]["criteria"]["B_prime"]["cut_source"]
     assert src["source"] == "thresholds_file" and src["sha256"] == base._sha(thresholds)
+
+
+def test_the_decision_reports_b_prime_from_accept_at_the_controllers_dwell(tmp_path) -> None:
+    from scripts.analysis import calibration_decision as cd
+
+    w = base._world(tmp_path)
+    assert base._freeze(w) == 0
+    assert base._accept(w, base._seal(w)) == 0
+    result_path = dl.freeze_paths(w["freeze"])["result"]
+    stored = json.loads(result_path.read_text())["models"][MODEL]["criteria"]["B_prime"]
+    bp = cd.b_prime_from_accept(result_path)
+    m = bp["models"][MODEL]
+    assert bp["gate_dwell_windows"] == dl.ONLINE_DWELL_WINDOWS
+    assert m["gate_point"] == stored["by_dwell"][str(dl.ONLINE_DWELL_WINDOWS)]
+    assert m["passed"] == stored["passed"] and m["agrees_with_accept"] and bp["passed"] == m["passed"]
+    assert "2" in m["disclosed_not_gating"] and str(dl.ONLINE_DWELL_WINDOWS) not in m["disclosed_not_gating"]
+    # judged at dwell 2 instead: the stored dwell-2 point, and dwell 1 becomes the disclosure
+    two = cd.b_prime_from_accept(result_path, online_dwell=2)["models"][MODEL]
+    assert two["gate_point"] == stored["by_dwell"]["2"] and "1" in two["disclosed_not_gating"]
+    # a dwell accept never stored is not evaluable, never passed
+    five = cd.b_prime_from_accept(result_path, online_dwell=5)["models"][MODEL]
+    assert five["evaluable"] is False and five["passed"] is False

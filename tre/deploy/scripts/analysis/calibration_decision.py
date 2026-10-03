@@ -76,12 +76,19 @@ scored with ``tre_calibration.fit.threshold_balanced_accuracy``. Window rows bec
 every label is a ``tre_common.slo_labels.LabelDefinition`` rebuilt from the manifest and
 checked, window by window, against the column the dataset recorded.
 
+B′ (the acceptance gate since 2026-10-03, ``scripts.b_prime``) is not recomputed here:
+M is evaluated once, by ``dline_refit accept``. ``--accept-result`` reads that run's
+``<stem>.accept.json`` and the output carries, per model, B′ judged at the controller's
+dwell (:data:`scripts.dline_refit.ONLINE_DWELL_WINDOWS`, the live ``TRE_DWELL_WINDOWS``)
+from the per-dwell points accept stored, with every other dwell (2 among them) disclosed,
+not gating (:func:`b_prime_from_accept`).
+
 Usage::
 
     python3 -m scripts.analysis.calibration_decision <dataset_dir> \\
         --regime-groups <regime_groups.json> --out-dir <dir> \\
         [--rule dline|preregistered] [--w-p MODEL=VALUE ... | --dline-dir DIR] \\
-        [--profile preregistered]
+        [--profile preregistered] [--accept-result <freeze stem>.accept.json]
 """
 from __future__ import annotations
 
@@ -1472,6 +1479,103 @@ def analyse(
     return head | {"selection": frozen.selection, "holdout": holdout_result, "decision": decision}
 
 
+# ----------------------------------------------------------------- B' (from accept)
+
+
+def b_prime_from_accept(path: Path, *, online_dwell: int | None = None) -> dict[str, Any]:
+    """B′ per model from a ``dline_refit accept`` result, gated at ``online_dwell``
+    (default: the controller's dwell, ``dline_refit.ONLINE_DWELL_WINDOWS``).
+
+    The point and CI95 at that dwell are the ones accept stored (``criteria.B_prime.by_dwell``)
+    and are judged against the gate accept recorded (``thresholds.B_prime``) with
+    ``b_prime.criteria`` - nothing is recomputed from M. Every other stored dwell is
+    disclosed, not gating. A model whose result has no point at the gate dwell, or no
+    severe / healthy window, is not evaluable and does not pass. ``agrees_with_accept``
+    says whether accept's own verdict (judged at its ``dwell_windows``) is the same."""
+    from scripts import b_prime
+    from scripts.dline_refit import ONLINE_DWELL_WINDOWS
+
+    path = Path(path)
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise InputError(f"--accept-result {path}: unreadable ({exc})") from exc
+    th = (doc.get("thresholds") or {}).get("B_prime")
+    if not isinstance(th, dict):
+        raise InputError(f"--accept-result {path}: no thresholds.B_prime (an accept result from before B′, "
+                         f"format revision {doc.get('format_revision')})")
+    try:
+        gate = b_prime.check_gate(th)
+    except ValueError as exc:
+        raise InputError(f"--accept-result {path}: {exc}") from exc
+    dwell = int(ONLINE_DWELL_WINDOWS if online_dwell is None else online_dwell)
+    models: dict[str, Any] = {}
+    for model, r in sorted((doc.get("models") or {}).items()):
+        bp = (r.get("criteria") or {}).get("B_prime") or {}
+        by = bp.get("by_dwell") or {}
+        point = by.get(str(dwell))
+        entry: dict[str, Any] = {
+            "severity_cut": bp.get("severity_cut"), "cut_source": bp.get("cut_source"),
+            "accept_dwell_windows": bp.get("dwell_windows"), "accept_passed": bp.get("passed"),
+            "disclosed_not_gating": {d: v for d, v in sorted(by.items()) if d != str(dwell)},
+            **{k: bp.get(k) for k in ("violating", "healthy", "severe_windows", "violations_by_band")},
+        }
+        if point is None or not bp.get("evaluable"):
+            entry.update({"evaluable": False, "passed": False, "criteria": [],
+                          "reason": (bp.get("reason") or "no severe or no healthy M window") if point is not None
+                          else f"accept stored no B′ point at dwell {dwell} (dwells {sorted(by)})"})
+        else:
+            crits = b_prime.criteria(point, point, gate)
+            entry.update({"evaluable": True, "passed": all(c["met"] for c in crits), "criteria": crits,
+                          "gate_point": point})
+        entry["agrees_with_accept"] = entry["passed"] == bool(bp.get("passed"))
+        models[model] = entry
+    return {
+        "source": {"path": str(path), "sha256": _sha256(path), "format_revision": doc.get("format_revision"),
+                   "freeze_sha256": (doc.get("freeze") or {}).get("freeze_sha256")},
+        "gate": gate, "gate_dwell_windows": dwell,
+        "gate_dwell_source": ("--b-prime-dwell" if online_dwell is not None else
+                              "dline_refit.ONLINE_DWELL_WINDOWS = the controller's TRE_DWELL_WINDOWS"),
+        "accept_dwell_windows": th.get("dwell_windows"),
+        "severity_quantile": th.get("severity_quantile"),
+        "models": models,
+        "passed": bool(models) and all(m["passed"] for m in models.values()),
+    }
+
+
+def _render_b_prime(result: Mapping[str, Any]) -> list[str]:
+    bp = result.get("b_prime")
+    if not bp:
+        return ["## B′ (acceptance gate)", "",
+                "- Not provided: pass `--accept-result <freeze stem>.accept.json` (the `dline_refit accept` "
+                "result; M is evaluated once, there).", ""]
+    lines = ["## B′ (acceptance gate, from `dline_refit accept`)", "",
+             f"- Source `{bp['source']['path']}` (sha256 {bp['source']['sha256'][:12]}); gate judged at dwell "
+             f"{bp['gate_dwell_windows']} ({bp['gate_dwell_source']}); accept judged at dwell "
+             f"{bp['accept_dwell_windows']}. Other dwells are disclosed, not gating.",
+             f"- Gate: recall_severe ≥ {bp['gate']['recall_severe_min']:g} (CI95 low ≥ "
+             f"{bp['gate']['recall_severe_ci95_low_min']:g}), false alarm ≤ {bp['gate']['false_alarm_max']:g} "
+             f"(CI95 high ≤ {bp['gate']['false_alarm_ci95_high_max']:g}).",
+             f"- **B′ {'PASS' if bp['passed'] else 'FAIL'}** over all models.", "",
+             "| model | B′ | recall_severe [CI95] | false alarm [CI95] | dwell 2 (disclosed) recall / FA | "
+             "agrees with accept |",
+             "|---|---|---|---|---|---|"]
+    for m, e in bp["models"].items():
+        g = e.get("gate_point") or {}
+        d2 = (e.get("disclosed_not_gating") or {}).get("2") or {}
+        verdict = "PASS" if e["passed"] else ("not evaluable" if not e["evaluable"] else "FAIL")
+
+        def pc(point, key):
+            ci = point.get(f"{key}_ci95") or [None, None]
+            return f"{_frac(point.get(key))} [{_frac(ci[0])}, {_frac(ci[1])}]"
+
+        lines.append(f"| {m} | {verdict} | {pc(g, 'recall_severe') if g else '—'} | "
+                     f"{pc(g, 'false_alarm') if g else '—'} | "
+                     f"{_frac(d2.get('recall_severe'))} / {_frac(d2.get('false_alarm'))} | {e['agrees_with_accept']} |")
+    lines.append("")
+    return lines
+
+
 # ------------------------------------------------------------------------- report
 
 
@@ -1569,6 +1673,7 @@ def _render_dline(result: Mapping[str, Any]) -> str:
                 f"[{_num(p['ci90_points'][0])}, {_num(p['ci90_points'][1])}] | {dsum} in {p['discordant_cells']} cells | "
                 f"{p['verdict']} |")
     lines.append("")
+    lines += _render_b_prime(result)
     return "\n".join(lines)
 
 
@@ -1679,6 +1784,7 @@ def _render_preregistered(result: Mapping[str, Any]) -> str:
         if h.get("m_only_ba"):
             lines.append(f"- {m}: " + ", ".join(f"{k} {_pt(v)}" for k, v in h["m_only_ba"].items()))
     lines.append("")
+    lines += _render_b_prime(result)
     return "\n".join(lines)
 
 
@@ -1706,6 +1812,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     ap.add_argument("--bootstrap", type=int, default=DEFAULT_BOOTSTRAP)
     ap.add_argument("--seed", type=int, default=DEFAULT_SEED)
     ap.add_argument("--processes", type=int, default=max(1, (multiprocessing.cpu_count() or 2) // 2))
+    ap.add_argument("--accept-result", type=Path, default=None,
+                    help="the dline_refit accept result (<freeze stem>.accept.json): its B\u2032 joins the "
+                         "output, gated at the controller's dwell, dwell 2 disclosed")
+    ap.add_argument("--b-prime-dwell", type=int, default=None,
+                    help="judge B\u2032 at this dwell instead of the controller's (dline_refit.ONLINE_DWELL_WINDOWS)")
     args = ap.parse_args(argv)
     try:
         w_p = parse_w_p_args(args.w_p)
@@ -1724,6 +1835,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         result = analyse(args.dataset_dir, args.regime_groups, policy=policy, registry_path=args.registry,
                          rule=args.rule, w_p=w_p, dline_dir=args.dline_dir, dline_arm=args.dline_arm,
                          n_boot=args.bootstrap, seed=args.seed, processes=args.processes)
+        if args.accept_result is not None:
+            result["b_prime"] = b_prime_from_accept(args.accept_result, online_dwell=args.b_prime_dwell)
     except InputError as exc:
         ap.error(str(exc))
     args.out_dir.mkdir(parents=True, exist_ok=True)
