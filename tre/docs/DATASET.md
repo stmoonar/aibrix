@@ -226,6 +226,8 @@ train = w[(w.split == "train") & (w.slo_label != "unlabeled")]
 | `arrival_seed` / `prompt_key` | – | 仅第二轮：该 cell 自己的到达种子与 prompt key |
 | `possibly_contaminated` / `drained_before` / `drain_waited_s` | – | 仅第二轮：开始前的排空结果与等待时长 |
 | `backlog_stopped` | – | 仅第二轮：probe 因客户端在途数达到上限（1024）被提前停发；这样的 probe 判为 violated |
+| `reissue_status` | – | 续发 sidecar 检查（2026-10-03 起）：`clean` / `contaminated`（cell 期间该模型任一 pod 的 `tre_reissue_total{kind="continue"}` 增加）/ `unmeasured`（有 pod 前后没读到计数，不当 0）/ `not_checked`（驱动用了 `--reissue-check off`）/ `not_recorded`（检查之前的采集）。`contaminated` 与 `unmeasured` 的 attempt 一律算 void，窗口不进 windows.csv |
+| `reissue_continue_delta` | 请求数 | cell 期间各 pod continue 计数增量之和；`unmeasured` 时为空 |
 
 第二轮的 `probe_verdict` 对每个 hold cell（probe、ladder、adaptive、哨兵）都给出，在 **warm-up 之后**的窗口上用**主标签**计算；只有 probe 会因证据不足而 `status = inconclusive`，其余 cell 证据不足仍是 `valid`。第二轮在线时用的是固定标签（修订 1 口径），所以 `probe_verdict_recorded` 与 `probe_verdict` 不同的 probe 会列进 `discrepancies`——这是口径变了，不是数据错。
 
@@ -245,5 +247,6 @@ train = w[(w.split == "train") & (w.slo_label != "unlabeled")]
 | `probe_rule` | probe 判定规则（最少独立窗口数、违规窗口比例） |
 | `tables` | 每张表的行数与列 |
 | `cells[]` | 每个 attempt：标识、`status`、`void_reasons`、两种 probe 判定、`files`（该 attempt 所有文件的相对路径）、`online_csv_parity` |
+| `reissue_check` | 续发 sidecar 检查：规则、各状态的 attempt 数（`counts`）、因 `contaminated` / `unmeasured` 被排除的 attempt（`excluded`） |
 | `boundary_searches[]` | 每个 (model, shape) 的边界搜索原始记录 + 每个 probe 的 `verdict_recorded` 与 `verdict_current_rule` |
 | `discrepancies[]` | 转换时发现的所有对不上的地方（原样列出，不做修补） |

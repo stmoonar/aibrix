@@ -23,6 +23,10 @@ wrong latency column. This tool does the assembly once, in one place:
 * ``requests.csv`` - every request of every attempt (void included): the raw evidence
   from which any other label definition can be recomputed.
 * ``cells.csv`` - one row per attempt: status, verdicts, outcome counts, files.
+  An attempt whose guard artifact records a reissue check ``contaminated`` (a request
+  the reissue sidecar continued during the cell) or ``unmeasured`` (a pod's counter not
+  read) is void here whatever the driver's policy was: its windows are excluded and the
+  manifest counts it under ``reissue_check``.
 * ``DATASET.md`` - what every column means (a copy of ``tre/docs/DATASET.md``).
 
 A campaign of the preregistered ladder design (``plan.json`` says ``"design":
@@ -57,6 +61,7 @@ from tre_common import slo_labels
 from tre_common.rediskeys import SCRAPE_INTERVAL_MS
 
 from scripts import adaptive_boundary as boundary
+from scripts import calibration_capture as capture
 from scripts import gen_calibration_schedules as gen
 from scripts import openloop, r3_grid, rewindow_from_raw
 
@@ -114,6 +119,10 @@ CELL_COLUMNS = [
     # i.e. completions) and its served requests whose usage.prompt_tokens differed from
     # the length they were built to (empty when the capture has no expected length).
     "api", "prompt_tokens_mismatched",
+    # The reissue-sidecar check of the cell (scripts.calibration_capture.reissue_check):
+    # clean / contaminated / unmeasured / not_checked, not_recorded before the check; and
+    # tre_reissue_total{kind="continue"} increase over the model's pods (empty = unmeasured).
+    "reissue_status", "reissue_continue_delta",
 ]
 
 #: The ladder design's per-attempt ledger (see ``scripts.calibration_ladder``).
@@ -754,6 +763,15 @@ def build_dataset(
     if off_length:
         discrepancies.append(f"built with --allow-prompt-token-mismatch: {len(off_length)} cell(s) "
                              f"off their prompt length: {'; '.join(off_length)}")
+    reissue_summary = reissue_check_summary(manifest_cells)
+    if reissue_summary["excluded"]:
+        discrepancies.append(
+            f"reissue check: {len(reissue_summary['excluded'])} attempt(s) excluded as void "
+            f"(contaminated {reissue_summary['counts'].get(capture.REISSUE_CONTAMINATED, 0)}, unmeasured "
+            f"{reissue_summary['counts'].get(capture.REISSUE_UNMEASURED, 0)}); see manifest reissue_check")
+    if reissue_summary["counts"].get(capture.REISSUE_NOT_CHECKED):
+        discrepancies.append(f"reissue check: {reissue_summary['counts'][capture.REISSUE_NOT_CHECKED]} attempt(s) "
+                             "driven with --reissue-check off: their contamination is unknown")
     cells_written = _write_csv(staging / CELL_TABLE, CELL_COLUMNS, cell_rows)
     if README_SOURCE.exists():
         shutil.copyfile(README_SOURCE, staging / README)
@@ -827,6 +845,7 @@ def build_dataset(
                          "contains": "one row per attempt, void and missing included"},
         },
         "cells": manifest_cells,
+        "reissue_check": reissue_summary,
         "boundary_searches": boundary_docs,
         "discrepancies": discrepancies,
     }
@@ -857,6 +876,26 @@ def _probe_summary(probe: dict, manifest_cells: Sequence[dict], search: dict) ->
     }
 
 
+def reissue_check_summary(manifest_cells: Sequence[dict]) -> dict:
+    """The manifest's ``reissue_check``: the attempts per reissue status and the ones
+    excluded for it (contaminated / unmeasured)."""
+    counts: dict[str, int] = {}
+    excluded = []
+    for c in manifest_cells:
+        state = c.get("reissue_status")
+        if state is None:
+            continue
+        counts[state] = counts.get(state, 0) + 1
+        if state in (capture.REISSUE_CONTAMINATED, capture.REISSUE_UNMEASURED):
+            excluded.append({k: c.get(k) for k in ("model", "shape", "cell_id", "attempt", "split")}
+                            | {"reissue_status": state})
+    return {"rule": (f"an attempt whose guard records reissue {capture.REISSUE_CONTAMINATED} (a request "
+                     f"continued by the reissue sidecar during the cell) or {capture.REISSUE_UNMEASURED} "
+                     "(a pod's counter not read at both ends) is void: no window of it is in "
+                     f"{WINDOW_TABLE}; {capture.REISSUE_NOT_RECORDED} = captured before the check"),
+            "counts": dict(sorted(counts.items())), "excluded": excluded}
+
+
 def _convert_attempt(attempt, run_dir, settings, registry, plan_cells, discrepancies,
                      fixed_min_n_diffs: Optional[dict] = None, *, label_registry=None) -> dict:
     guard = attempt.guard
@@ -865,6 +904,12 @@ def _convert_attempt(attempt, run_dir, settings, registry, plan_cells, discrepan
         void_reasons = void_reasons or ["raw capture quarantined as void"]
     if attempt.raw_path is not None and not guard:
         void_reasons = void_reasons or ["no guard artifact"]
+    # a continued request (or a pod not read) contaminates the cell, whatever the
+    # driver's --reissue-check policy did with it
+    reissue_state = capture.reissue_status(guard)
+    if (reissue_state in (capture.REISSUE_CONTAMINATED, capture.REISSUE_UNMEASURED)
+            and not any(r.startswith(capture.REISSUE_VOID_PREFIX) for r in void_reasons)):
+        void_reasons.append(capture.reissue_void_reason(guard["reissue"]))
     meta = _cell_metadata(attempt, plan_cells)
     ledger = attempt.ledger or {}
     identity = {
@@ -1059,6 +1104,8 @@ def _convert_attempt(attempt, run_dir, settings, registry, plan_cells, discrepan
         "backlog_stopped": ledger.get("backlog_stopped"),
         "api": guard.get("api"),
         "prompt_tokens_mismatched": _prompt_tokens_mismatched(records),
+        "reissue_status": reissue_state if attempt.raw_path is not None else None,
+        "reissue_continue_delta": (guard.get("reissue") or {}).get("continue_delta"),
     }
     manifest_cell = {
         **{k: v for k, v in identity.items() if k != "cell_status"},
@@ -1066,6 +1113,7 @@ def _convert_attempt(attempt, run_dir, settings, registry, plan_cells, discrepan
         "void_reasons": void_reasons,
         "probe_verdict": current,
         "probe_verdict_recorded": recorded,
+        "reissue_status": reissue_state if attempt.raw_path is not None else None,
         "files": files,
     }
     manifest_cell["online_csv_parity"] = online_parity

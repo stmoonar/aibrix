@@ -54,6 +54,13 @@ round stamps and the controller's window ends are checked to be in redis's time 
 before a run (:func:`require_clock_domains`: a failure refuses the run) and around every
 cell (:func:`cell_clock_mark`: a failure marks the cell's dumps ``clock_domain_mismatch``
 - kept, never complete). See :class:`ClockDomainConfig`.
+
+Reissue contamination (2026-10-03): the driver reads every model pod's reissue-sidecar
+counter ``tre_reissue_total`` right before and after the load (:func:`scrape_reissue`,
+:func:`reissue_check`) and records the delta in the guard artifact and ``cell_meta.json``
+(``reissue``); a cell during which a request was continued is ``contaminated``, a pod
+that could not be read is ``unmeasured`` (never 0). The driver voids such a cell (its
+``--reissue-check`` policy) and ``calibration_dataset`` excludes it either way.
 """
 from __future__ import annotations
 
@@ -602,6 +609,173 @@ class VllmMetricsRecorder:
             "parse_seconds_total": round(self.parse_seconds, 4),
             "late_after_close": self.late_after_close,
         }
+
+
+# ------------------------------------------------------ reissue sidecar contamination
+#
+# The model pods' reissue sidecar (reissue/tre_reissue/sidecar.py) CONTINUES a started
+# request on another instance when a sleep aborts it: the client sees one answer, but its
+# latency includes a re-prefill on another pod - a calibration window holding one does not
+# measure the engine at that load. Rule (2026-10-03): a cell during which any pod of the
+# model counted tre_reissue_total{kind="continue"} is contaminated. The counter is read
+# from every pod of the model (routable or not: the continuation is counted on the pod
+# that was put to sleep) right before and right after the load. A pod whose counter
+# could not be read at both ends, or went down (sidecar restart), is UNMEASURED - never
+# read as 0.
+
+REISSUE_SCHEMA = "tre.reissue_check/v1"
+REISSUE_METRICS_PATH = "/tre-reissue/metrics"
+REISSUE_COUNTER = "tre_reissue_total"
+REISSUE_KIND_CONTINUE = "continue"
+REISSUE_CLEAN = "clean"
+REISSUE_CONTAMINATED = "contaminated"
+REISSUE_UNMEASURED = "unmeasured"
+#: The driver ran with ``--reissue-check off`` (recorded, so it is never mistaken for clean).
+REISSUE_NOT_CHECKED = "not_checked"
+#: A capture from before the check (no ``reissue`` record in its guard artifact).
+REISSUE_NOT_RECORDED = "not_recorded"
+#: ``void`` (default): a contaminated or unmeasured cell is void (re-driven once by the
+#: campaign, excluded by the dataset); ``record``: only recorded - the dataset still
+#: excludes it; ``off``: not scraped, recorded as not_checked.
+REISSUE_POLICIES = ("void", "record", "off")
+DEFAULT_REISSUE_POLICY = "void"
+#: Void reasons of this check start with this.
+REISSUE_VOID_PREFIX = "reissue_"
+DEFAULT_REISSUE_TIMEOUT_S = 5.0
+_REISSUE_LINE = re.compile(r"^" + REISSUE_COUNTER + r"\{(?P<labels>[^}]*)\}\s+(?P<value>\S+)")
+_LABEL = re.compile(r'(\w+)="((?:[^"\\]|\\.)*)"')
+
+
+def reissue_metrics_url(metrics_url: str, path: str = REISSUE_METRICS_PATH) -> str:
+    """The sidecar's metrics URL on the same host:port as a pod's ``/metrics`` URL (the
+    sidecar owns the pod's serving port)."""
+    from urllib.parse import urlsplit, urlunsplit
+
+    u = urlsplit(metrics_url)
+    return urlunsplit((u.scheme or "http", u.netloc, path, "", ""))
+
+
+def parse_reissue_counters(body: str) -> dict[str, float]:
+    """``{kind: total over reasons}`` of one sidecar metrics body. The counter family has
+    no series until its first event, so an absent kind is 0 - but only when the body
+    declares the family (``# TYPE tre_reissue_total counter``); a body without it is not a
+    reissue sidecar's and raises ``ValueError``."""
+    if f"# TYPE {REISSUE_COUNTER} counter" not in body:
+        raise ValueError(f"no '# TYPE {REISSUE_COUNTER} counter' in the body: not a reissue sidecar")
+    out: dict[str, float] = {}
+    for line in body.splitlines():
+        m = _REISSUE_LINE.match(line.strip())
+        if not m:
+            continue
+        labels = dict(_LABEL.findall(m.group("labels")))
+        value = _parse_value(m.group("value"))
+        if value is None or not math.isfinite(value):
+            raise ValueError(f"unreadable {REISSUE_COUNTER} value in {line!r}")
+        kind = labels.get("kind", "")
+        out[kind] = out.get(kind, 0.0) + value
+    return out
+
+
+def _http_get(url: str, timeout_s: float) -> str:
+    import urllib.request
+
+    with urllib.request.urlopen(url, timeout=timeout_s) as resp:  # noqa: S310 - pod-local http
+        return resp.read().decode("utf-8", errors="replace")
+
+
+def scrape_reissue(targets: Mapping[str, str], *, fetch: Optional[Callable[[str, float], str]] = None,
+                   timeout_s: float = DEFAULT_REISSUE_TIMEOUT_S,
+                   now_ms: Callable[[], int] = lambda: int(time.time() * 1000)) -> dict:
+    """One read of every pod's reissue counters: ``{"at_ms", "pods": {pod: {"url",
+    "counters"} or {"url", "error"}}}``. Never raises."""
+    fetch = fetch or _http_get
+    pods: dict[str, dict] = {}
+    for pod, url in sorted(targets.items()):
+        try:
+            pods[pod] = {"url": url, "counters": parse_reissue_counters(fetch(url, timeout_s))}
+        except Exception as exc:  # noqa: BLE001 - recorded, the pod is unmeasured
+            pods[pod] = {"url": url, "error": f"{type(exc).__name__}: {exc}"[:300]}
+    return {"at_ms": int(now_ms()), "pods": pods}
+
+
+def reissue_check(before: Mapping[str, Any], after: Mapping[str, Any], *, policy: str = DEFAULT_REISSUE_POLICY,
+                  discovery_error: Optional[str] = None) -> dict:
+    """The cell's reissue record from the reads before and after the load.
+
+    ``contaminated`` when a measured pod's continue count went up (whatever the other
+    pods say); else ``unmeasured`` when any pod could not be read at both ends, its
+    counters went down, or there was no pod to read; else ``clean``."""
+    pods: dict[str, dict] = {}
+    unmeasured: list[str] = []
+    reasons: list[str] = []
+    if discovery_error:
+        reasons.append(f"pod discovery failed: {discovery_error}")
+    names = sorted(set((before.get("pods") or {})) | set((after.get("pods") or {})))
+    total: dict[str, float] = {}
+    for pod in names:
+        b = (before.get("pods") or {}).get(pod) or {"error": "not read before the cell"}
+        a = (after.get("pods") or {}).get(pod) or {"error": "not read after the cell"}
+        rec: dict[str, Any] = {"before": b.get("counters"), "after": a.get("counters"), "delta": None}
+        err = b.get("error") or a.get("error")
+        if err is None:
+            kinds = sorted(set(b["counters"]) | set(a["counters"]))
+            delta = {k: a["counters"].get(k, 0.0) - b["counters"].get(k, 0.0) for k in kinds}
+            if any(v < 0 for v in delta.values()):
+                err = f"counter went down ({delta}): the sidecar restarted during the cell"
+            else:
+                rec["delta"] = {k: _json_number(v) for k, v in delta.items()}
+                for k, v in delta.items():
+                    total[k] = total.get(k, 0.0) + v
+        if err is not None:
+            rec["error"] = err
+            unmeasured.append(pod)
+            reasons.append(f"{pod}: {err}")
+        pods[pod] = rec
+    if not names:
+        reasons.append("no model pod was read")
+    cont = {p: r["delta"].get(REISSUE_KIND_CONTINUE, 0) for p, r in pods.items()
+            if r["delta"] and r["delta"].get(REISSUE_KIND_CONTINUE, 0) > 0}
+    if cont:
+        status = REISSUE_CONTAMINATED
+    elif unmeasured or not names or discovery_error:
+        status = REISSUE_UNMEASURED
+    else:
+        status = REISSUE_CLEAN
+    return {
+        "schema": REISSUE_SCHEMA, "policy": policy, "status": status,
+        "rule": (f"contaminated iff any pod's {REISSUE_COUNTER}{{kind=\"{REISSUE_KIND_CONTINUE}\"}} rose "
+                 "between the reads right before and right after the load; a pod not read at both ends "
+                 "is unmeasured, never 0"),
+        "continue_delta": _json_number(sum(cont.values())) if cont or not unmeasured else None,
+        "continue_by_pod": {p: _json_number(v) for p, v in cont.items()},
+        "delta_by_kind": {k: _json_number(v) for k, v in sorted(total.items())},
+        "unmeasured_pods": unmeasured, "reasons": reasons,
+        "before_at_ms": before.get("at_ms"), "after_at_ms": after.get("at_ms"), "pods": pods,
+    }
+
+
+def reissue_not_checked(policy: str = "off") -> dict:
+    return {"schema": REISSUE_SCHEMA, "policy": policy, "status": REISSUE_NOT_CHECKED,
+            "continue_delta": None, "reasons": ["--reissue-check off: the sidecar counters were not read"]}
+
+
+def reissue_void_reason(rec: Optional[Mapping[str, Any]]) -> Optional[str]:
+    """The void reason of a contaminated / unmeasured record (None otherwise)."""
+    status = (rec or {}).get("status")
+    if status == REISSUE_CONTAMINATED:
+        return (f"{REISSUE_VOID_PREFIX}contaminated: {rec.get('continue_delta')} request(s) continued by the "
+                f"reissue sidecar during the cell ({REISSUE_COUNTER}{{kind=\"{REISSUE_KIND_CONTINUE}\"}} on "
+                f"{', '.join(sorted(rec.get('continue_by_pod') or {}))})")
+    if status == REISSUE_UNMEASURED:
+        return (f"{REISSUE_VOID_PREFIX}unmeasured: the reissue sidecar counters could not be compared "
+                f"({'; '.join(rec.get('reasons') or [])[:400]})")
+    return None
+
+
+def reissue_status(guard: Mapping[str, Any]) -> str:
+    """The reissue status a guard artifact records (:data:`REISSUE_NOT_RECORDED` without one)."""
+    rec = guard.get("reissue") if isinstance(guard, Mapping) else None
+    return str(rec.get("status")) if isinstance(rec, Mapping) and rec.get("status") else REISSUE_NOT_RECORDED
 
 
 # ------------------------------------------------------------------ pod discovery

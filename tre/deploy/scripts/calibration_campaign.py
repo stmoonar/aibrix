@@ -678,7 +678,10 @@ def cell_command(cell: Cell, args, schedule_path: Path, output: Path) -> list[st
         # a cell that fails the check later is run and its redis dumps marked, not refused.
         command += ["--capture-dir", str(Path(output).parent / capture.CELLS_DIRNAME),
                     "--control-namespace", str(getattr(args, "controller_namespace", "tre-v2") or ""),
-                    "--clock-domain-check", "flag"]
+                    "--clock-domain-check", "flag",
+                    # a request continued by the reissue sidecar during the cell (or a pod
+                    # whose counter could not be read) voids it (scripts.calibration_capture)
+                    "--reissue-check", str(getattr(args, "reissue_check", None) or capture.DEFAULT_REISSUE_POLICY)]
     if cell.drain_start_s is not None:
         command += ["--drain-start-s", str(cell.drain_start_s)]
     if getattr(args, "envoy_stats_url", None):
@@ -2515,6 +2518,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--stop-on-failure", action="store_true")
     ap.add_argument("--registry", default=None)
     ap.add_argument("--redis-url", default=None)
+    ap.add_argument("--reissue-check", default=capture.DEFAULT_REISSUE_POLICY, choices=list(capture.REISSUE_POLICIES),
+                    help="per cell (r3_grid --reissue-check): a request the reissue sidecar continued during "
+                         "the cell, or a model pod whose tre_reissue_total could not be read, voids the "
+                         "cell (void, default; re-driven once) or is only recorded (record); "
+                         "calibration_dataset excludes such cells either way")
     ap.add_argument("--no-capture-extras", action="store_true",
                     help="do not keep the per-cell system-side evidence (per-pod vLLM metrics, "
                          "gateway redis docs, controller ticks; scripts.calibration_capture)")
