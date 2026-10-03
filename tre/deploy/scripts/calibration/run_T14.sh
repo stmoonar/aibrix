@@ -6,24 +6,27 @@
 #
 # Guards on top of lib.sh's: exactly ONE routable dsqwen-14b pod; an EnvoyPatchPolicy in the
 # TRE namespace (the least-gpu-cache ext_proc route); the preregistration verifies against
-# its .sha256 sidecar; every parameter file verifies.
+# its .sha256 sidecar; every parameter file verifies. The campaign itself checks the
+# preregistration's bindings (capacity prior sha, seeds, factors, hold, shapes, api, gateway
+# url, parameter-set shas) and isolation roots (t14.forbidden_roots + --forbidden-root).
 #
 # Environment:
 #   OUT_ROOT, TRE_CALIBRATION_GATEWAY_URL, TRE_EXCLUSIVE_WINDOW_FILE   as run_primitives.sh
 #   PREREG_JSON          the T14 preregistration (+ PREREG_JSON.sha256)
 #   CAPACITY_PRIOR       the capacity prior it binds (calibration_t14 capacity-prior)
 #   FREEZE_FILE          the frozen parameters
-#   REFIT_PARAMS_FILE    (optional) the second parameter set the preregistration names
-#   DESIGN_SEED          (optional; must equal the preregistration's)
+#   REFIT_PARAMS_FILE    the second parameter set the preregistration names (the campaign
+#                        requires one; with a single frozen set, name the freeze file again)
+#   DESIGN_SEED          must equal the preregistration's t14.design_seed
 set -euo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 calib_parse_args "$@"
 [[ "$MODEL" == dsqwen-14b ]] || calib_die "T14 is dsqwen-14b only"
-for v in PREREG_JSON CAPACITY_PRIOR FREEZE_FILE; do calib_require_env "$v"; done
-calib_require_file "$PREREG_JSON" "$PREREG_JSON.sha256" "$CAPACITY_PRIOR" "$FREEZE_FILE"
+for v in PREREG_JSON CAPACITY_PRIOR FREEZE_FILE REFIT_PARAMS_FILE DESIGN_SEED; do calib_require_env "$v"; done
+calib_require_file "$PREREG_JSON" "$PREREG_JSON.sha256" "$CAPACITY_PRIOR" "$FREEZE_FILE" "$REFIT_PARAMS_FILE"
 ( cd "$(dirname "$PREREG_JSON")" && sha256sum -c "$(basename "$PREREG_JSON").sha256" ) \
   || calib_die "$PREREG_JSON does not match its sha256 sidecar"
-for f in "$FREEZE_FILE" ${REFIT_PARAMS_FILE:+"$REFIT_PARAMS_FILE"}; do
+for f in "$FREEZE_FILE" "$REFIT_PARAMS_FILE"; do
   ( calib_enter_deploy && python3 -m scripts.dline_refit verify-freeze --freeze-file "$f" ) \
     || calib_die "$f does not verify"
 done
@@ -32,9 +35,10 @@ calib_require_routable "$MODEL" 1
   || calib_die "no EnvoyPatchPolicy in $TRE_NS - the least-gpu-cache ext_proc route is not deployed"
 calib_launch T14 \
   --t14-set \
+  --api chat \
   --routing-strategy least-gpu-cache \
   --capacity-prior-file "$CAPACITY_PRIOR" \
   --freeze-file "$FREEZE_FILE" \
-  ${REFIT_PARAMS_FILE:+--refit-params-file "$REFIT_PARAMS_FILE"} \
+  --refit-params-file "$REFIT_PARAMS_FILE" \
   --preregistration-json "$PREREG_JSON" \
-  ${DESIGN_SEED:+--design-seed "$DESIGN_SEED"}
+  --design-seed "$DESIGN_SEED"
