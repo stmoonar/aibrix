@@ -59,8 +59,10 @@ Checks before anything is driven (a dry run runs them too)
 * ``--routing-strategy least-gpu-cache`` (the tre-v2 ext_proc gateway path, NodePort 31094,
   headers ``model`` + ``routing-strategy``). Required for a real run;
 * independent output: ``--out-dir`` absent or empty and, like ``--raw-dir``, outside every
-  training / M / resplit / freeze root (:data:`FORBIDDEN_ROOTS`); no raw directory of a T14
-  cell may pre-exist under ``--raw-dir``;
+  training / M / resplit / freeze root (:func:`forbidden_roots`: the preregistration's
+  ``t14.forbidden_roots``, every ``--forbidden-root`` and the capacity prior's input runs;
+  a real run needs at least one root from the first two); no raw directory of a T14 cell
+  may pre-exist under ``--raw-dir``;
 * (real run) the controller is in ``observe``.
 
 What is written, and the seal
@@ -113,6 +115,7 @@ from scripts import calibration_design as design
 from scripts import calibration_ladder as ladder
 from scripts import calibration_training_supplement as training
 from scripts import gen_calibration_schedules as gen
+from scripts import prompt_corpus as corpus_record
 
 MODE = "t14_set"
 MODEL = "dsqwen-14b"
@@ -134,22 +137,18 @@ T14_MANIFEST = "T14_manifest.json"
 T14_SHA256SUMS = "T14_SHA256SUMS"
 MANIFEST_FORMAT_REVISION = 1   # the M manifest format (dline_refit.M_MANIFEST_FORMAT_REVISION)
 
-#: Roots this collection must stay out of: the training rounds, their supplements, M, the
-#: refits, the resplit and the freeze.
-_DATA = Path("/data/nfs_shared_data/xxy")
-FORBIDDEN_ROOTS: tuple[Path, ...] = tuple(_DATA / name for name in (
-    "calibration_20260921", "calibration_run2_20260923", "calibration_rev2_20260923",
-    "calibration_run2_main_20260923", "calibration_supp_20260923", "calibration_supp3_20260923",
-    "calibration_M_20260923", "calibration_accept_20260923", "calibration_refit_prelim_20260923",
-    "calibration_refit_final_20260923", "calibration_resplit_20260924",
-    "calibration_freeze_20260923",
-))
+#: The roots this collection must stay out of (the training rounds, their supplements, M,
+#: the refits, the resplit and the freeze of the round under test) are the deployment's, so
+#: none is built in: the preregistration lists them under this key (and ``--forbidden-root``
+#: adds more) - see :func:`forbidden_roots`.
+PREREG_FORBIDDEN_ROOTS_KEY = "t14.forbidden_roots"
 
 #: The preregistration keys :func:`check_preregistration` checks (dotted paths).
 PREREG_KEYS_REQUIRED = ("t14.capacity_prior.sha256", "t14.design_seed", "t14.cell_serial_base",
                         "t14.factors", "t14.hold_s", "t14.shapes")
 PREREG_KEYS_OPTIONAL = ("t14.model", "parameter_sets.freeze.sha256",
-                        "parameter_sets.v1lambda.sha256")
+                        "parameter_sets.v1lambda.sha256", "t14.api", "t14.gateway.url",
+                        PREREG_FORBIDDEN_ROOTS_KEY)
 PREREG_KEYS = (*PREREG_KEYS_REQUIRED, *PREREG_KEYS_OPTIONAL)
 
 
@@ -558,7 +557,7 @@ def _set(doc: dict, dotted: str, value) -> None:
 
 def check_preregistration(path, *, capacity_sha256: str, design_seed: int,
                           freeze: Optional[Mapping], refit: Optional[Mapping],
-                          model: str = MODEL, amendment=None) -> dict:
+                          model: str = MODEL, amendment=None, api: Optional[str] = None) -> dict:
     """The preregistration JSON, bound to this run (ValueError on any mismatch).
 
     Its sidecar ``<path>.sha256`` (sha256sum format, naming the file) must match. Then the
@@ -570,7 +569,10 @@ def check_preregistration(path, *, capacity_sha256: str, design_seed: int,
     "extrapolation": [...]}``. The optional keys, when present: ``t14.model`` = the model;
     ``parameter_sets.freeze.sha256`` / ``parameter_sets.v1lambda.sha256`` = the sha256 of
     ``--freeze-file`` / ``--refit-params-file`` (present but its file not given - only
-    possible in a dry run - is reported as unchecked)."""
+    possible in a dry run - is reported as unchecked); ``t14.api`` = ``api`` (the run's
+    ``--api``); ``t14.gateway.url`` must be the endpoint of that API
+    (``prompt_corpus.check_gateway_url``: ``/v1/chat/completions`` for chat);
+    ``t14.forbidden_roots`` a list of paths, returned as ``forbidden_roots``."""
     path = Path(path)
     side = Path(f"{path}.sha256")
     if not path.is_file():
@@ -632,21 +634,59 @@ def check_preregistration(path, *, capacity_sha256: str, design_seed: int,
         checked.append(key)
         if not isinstance(value, str) or value.lower() != given["sha256"]:
             problems.append(f"{key} = {value!r}, {flag} has sha256 {given['sha256']}")
+    want_api = api if api is not None else (_dig(doc, "t14.api") if _has(doc, "t14.api") else None)
+    if _has(doc, "t14.api"):
+        checked.append("t14.api")
+        if api is not None and _dig(doc, "t14.api") != api:
+            problems.append(f"t14.api = {_dig(doc, 't14.api')!r}, this run sends --api {api}")
+    if _has(doc, "t14.gateway.url"):
+        if want_api is None:
+            unchecked.append("t14.gateway.url (no API to check it against)")
+        else:
+            checked.append("t14.gateway.url")
+            try:
+                corpus_record.check_gateway_url(str(_dig(doc, "t14.gateway.url")), want_api)
+            except ValueError as exc:
+                problems.append(f"t14.gateway.url: {exc}")
+    roots: list[str] = []
+    if _has(doc, PREREG_FORBIDDEN_ROOTS_KEY):
+        checked.append(PREREG_FORBIDDEN_ROOTS_KEY)
+        value = _dig(doc, PREREG_FORBIDDEN_ROOTS_KEY)
+        if not isinstance(value, list) or not all(isinstance(v, str) and v for v in value):
+            problems.append(f"{PREREG_FORBIDDEN_ROOTS_KEY} = {value!r}, not a list of paths")
+        else:
+            roots = list(value)
     if problems:
         raise ValueError(f"{path}: the preregistration does not bind this run: " + "; ".join(problems))
     return {"path": str(path.resolve()), "sha256": got, "checked_keys": checked,
-            "unchecked": unchecked, "amendment": amended}
+            "unchecked": unchecked, "amendment": amended, "forbidden_roots": roots}
 
 
 def _overlaps(path: Path, root: Path) -> bool:
     return path == root or root in path.parents or path in root.parents
 
 
-def check_output_roots(out_dir: Path, raw_dir: Path,
-                       roots: Optional[Sequence[Path]] = None) -> None:
+def forbidden_roots(args, prior: Optional[Mapping], prereg: Optional[Mapping]
+                    ) -> tuple[list[Path], list[Path]]:
+    """(every root T14 must stay out of, the explicitly named ones). Explicit: every
+    ``--forbidden-root`` and the preregistration's ``t14.forbidden_roots``; implied: the
+    capacity prior's input runs (the second round and the boundary supplement)."""
+    explicit = [Path(p) for p in (getattr(args, "forbidden_root", None) or [])]
+    explicit += [Path(p) for p in ((prereg or {}).get("forbidden_roots") or [])]
+    inputs = (prior or {}).get("inputs") or {}
+    implied = [Path(inputs[k]) for k in ("base_run", "boundary_supplement_run") if inputs.get(k)]
+    out, seen = [], set()
+    for root in (*explicit, *implied):
+        key = str(Path(root).resolve())
+        if key not in seen:
+            seen.add(key)
+            out.append(Path(root))
+    return out, explicit
+
+
+def check_output_roots(out_dir: Path, raw_dir: Path, roots: Sequence[Path]) -> None:
     """``--out-dir`` absent or empty; neither it nor ``--raw-dir`` inside (or around) a
-    training / M / resplit / freeze root (:data:`FORBIDDEN_ROOTS`)."""
-    roots = FORBIDDEN_ROOTS if roots is None else roots
+    training / M / resplit / freeze root (:func:`forbidden_roots`)."""
     out, raw = Path(out_dir).resolve(), Path(raw_dir).resolve()
     for root in roots:
         root = Path(root).resolve()
@@ -706,7 +746,7 @@ def _prior_summary(prior: Mapping) -> dict:
 def build_plan(args, model: str, cells: Sequence[design.DesignCell],
                order: Sequence[design.DesignCell], prior: Mapping, labels: Mapping,
                freeze: Optional[Mapping], refit: Optional[Mapping], prereg: Optional[Mapping],
-               mml: Mapping, cap) -> tuple[dict, dict]:
+               mml: Mapping, cap, roots: Sequence[Path] = ()) -> tuple[dict, dict]:
     """(plan.json, run manifest)."""
     composition = {
         "cells": len(cells),
@@ -730,6 +770,8 @@ def build_plan(args, model: str, cells: Sequence[design.DesignCell],
         "preregistration": prereg,
         "routing_strategy": campaign.routing_strategy_for(args),
         "gateway_url": getattr(args, "gateway_url", None),
+        "api": getattr(args, "api", corpus_record.CALIBRATION_API),
+        "forbidden_roots": [str(Path(r).resolve()) for r in roots],
         "label": {**labels, "window_ms": args.window_ms, "step_ms": args.fit_step_ms},
         "order": [c.cell_id for c in order],
         "provenance": campaign.run_provenance(args),
@@ -798,7 +840,10 @@ def print_plan(plan: Mapping, model: str) -> None:
                   f"{sorted(am['overrides'])}")
     else:
         print("  preregistration: NOT CHECKED (no --preregistration-json; dry run)")
-    print(f"  routing strategy: {plan['routing_strategy']} via {plan['gateway_url']}")
+    print(f"  routing strategy: {plan['routing_strategy']} via {plan['gateway_url']} "
+          f"(--api {plan['api']})")
+    print(f"  output kept out of {len(plan['forbidden_roots'])} roots: "
+          + ", ".join(plan["forbidden_roots"]))
 
 
 # --------------------------------------------------------------------------- sealing
@@ -955,7 +1000,8 @@ def run_t14_set(args, *, drive: Optional[Callable] = None,
     seed = int(args.design_seed)
     dry = bool(args.dry_run)
     out_dir, raw_dir = Path(args.out_dir), Path(args.raw_dir)
-    check_output_roots(out_dir, raw_dir)
+    # emptiness and the command line's roots first; the full set once the prereg is read
+    check_output_roots(out_dir, raw_dir, forbidden_roots(args, None, None)[0])
     if not getattr(args, "capacity_prior_file", None):
         raise ValueError("--t14-set needs --capacity-prior-file")
     prior = load_capacity_prior(Path(args.capacity_prior_file), model)
@@ -986,9 +1032,19 @@ def run_t14_set(args, *, drive: Optional[Callable] = None,
         prereg = check_preregistration(Path(args.preregistration_json),
                                        capacity_sha256=prior["sha256"], design_seed=seed,
                                        freeze=freeze, refit=refit, model=model,
-                                       amendment=getattr(args, "preregistration_amendment_json", None))
+                                       amendment=getattr(args, "preregistration_amendment_json", None),
+                                       api=getattr(args, "api", corpus_record.CALIBRATION_API))
     elif getattr(args, "preregistration_amendment_json", None):
         raise ValueError("--preregistration-amendment-json needs --preregistration-json")
+    roots, explicit = forbidden_roots(args, prior, prereg)
+    if not explicit:
+        if not dry:
+            raise ValueError(f"no forbidden roots: list the round's training / M / refit / freeze "
+                             f"roots under {PREREG_FORBIDDEN_ROOTS_KEY} in the preregistration "
+                             "(or pass --forbidden-root)")
+        print(f"WARNING: no {PREREG_FORBIDDEN_ROOTS_KEY} / --forbidden-root; the real run "
+              "requires them")
+    check_output_roots(out_dir, raw_dir, roots)
     routing = campaign.routing_strategy_for(args)
     if routing != ROUTING_STRATEGY:
         if not dry:
@@ -999,7 +1055,7 @@ def run_t14_set(args, *, drive: Optional[Callable] = None,
     labels = acceptance.label_documents(args, model)
     cap = training.resolve_cap(args)
     plan, manifest = build_plan(args, model, cells, order, prior, labels, freeze, refit, prereg,
-                                mml, cap)
+                                mml, cap, roots)
     out_dir.mkdir(parents=True, exist_ok=True)
     print_plan(plan, model)
     if dry:

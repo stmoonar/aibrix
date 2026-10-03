@@ -96,7 +96,9 @@ def _prereg(tmp_path: Path, prior: Path, *, freeze=None, refit=None, name="prere
                    "cell_serial_base": t14.CELL_SERIAL_BASE, "factors": [0.9, 1.0, 1.1],
                    "hold_s": 240, "shapes": {"interpolation": list(gen.T14_INTERPOLATION_SHAPES),
                                              "extrapolation": list(gen.T14_EXTRAPOLATION_SHAPES)},
-                   "model": MODEL},
+                   "model": MODEL, "api": "completions",
+                   "gateway": {"url": "http://gw/v1/completions"},
+                   "forbidden_roots": [str(tmp_path / "train_root")]},
            "parameter_sets": {}}
     if freeze:
         doc["parameter_sets"]["freeze"] = {"sha256": _sha(freeze)}
@@ -366,11 +368,13 @@ def test_the_preregistration_binds_the_run(tmp_path, frozen) -> None:
     prior = _prior(tmp_path)
     fr = t14.check_param_file(frozen["freeze"], MODEL, None, "--freeze-file")
     rf = t14.check_param_file(frozen["refit"], MODEL, None, "--refit-params-file")
-    kw = dict(capacity_sha256=_sha(prior), design_seed=20260924, freeze=fr, refit=rf)
+    kw = dict(capacity_sha256=_sha(prior), design_seed=20260924, freeze=fr, refit=rf,
+              api="completions")
     good = _prereg(tmp_path, prior, freeze=frozen["freeze"], refit=frozen["refit"])
     body = t14.check_preregistration(good, **kw)
     assert body["sha256"] == _sha(good) and body["unchecked"] == []
     assert set(body["checked_keys"]) == set(t14.PREREG_KEYS)
+    assert body["forbidden_roots"] == [str(tmp_path / "train_root")]
     # the list form of t14.shapes is accepted too
     t14.check_preregistration(_prereg(tmp_path, prior, name="list.json",
                                       t14__shapes=list(t14.SHAPES)), **kw)
@@ -384,6 +388,9 @@ def test_the_preregistration_binds_the_run(tmp_path, frozen) -> None:
         "model": dict(t14__model="dsqwen-7b"),
         "freeze": dict(parameter_sets__freeze={"sha256": "11" * 32}),
         "refit": dict(parameter_sets__v1lambda={"sha256": "22" * 32}),
+        "api": dict(t14__api="chat"),
+        "gateway": dict(t14__gateway={"url": "http://gw/v1/chat/completions"}),
+        "roots": dict(t14__forbidden_roots="/one/root"),
     }
     for name, over in bad.items():
         path = _prereg(tmp_path, prior, name=f"bad_{name}.json", **over)
@@ -421,6 +428,19 @@ def _amendment(tmp_path, prereg: Path, overrides: dict, *, name="amend.json", am
     path.write_text(json.dumps(doc), encoding="utf-8")
     Path(f"{path}.sha256").write_text(f"{_sha(path)}  {path.name}\n", encoding="utf-8")
     return path
+
+
+def test_the_preregistered_gateway_url_must_be_the_chat_endpoint_under_api_chat(tmp_path) -> None:
+    prior = _prior(tmp_path)
+    kw = dict(capacity_sha256=_sha(prior), design_seed=20260924, freeze=None, refit=None,
+              api="chat")
+    chat = _prereg(tmp_path, prior, name="chat.json", t14__api="chat",
+                   t14__gateway={"url": "http://gw:1/v1/chat/completions"})
+    assert "t14.gateway.url" in t14.check_preregistration(chat, **kw)["checked_keys"]
+    old = _prereg(tmp_path, prior, name="old.json", t14__api="chat",
+                  t14__gateway={"url": "http://gw:1/v1/completions"})
+    with pytest.raises(ValueError, match="t14.gateway.url"):
+        t14.check_preregistration(old, **kw)
 
 
 def test_an_amendment_rebinds_the_second_parameter_set_only(tmp_path, frozen) -> None:
@@ -464,10 +484,6 @@ def test_a_parameter_file_frozen_under_another_label_is_refused(tmp_path, frozen
 
 
 def test_the_output_root_is_independent(tmp_path) -> None:
-    assert {p.name for p in t14.FORBIDDEN_ROOTS} >= {
-        "calibration_rev2_20260923", "calibration_run2_main_20260923", "calibration_supp_20260923",
-        "calibration_supp3_20260923", "calibration_M_20260923", "calibration_refit_final_20260923",
-        "calibration_resplit_20260924", "calibration_freeze_20260923"}
     root = tmp_path / "calibration_M_20260923"
     root.mkdir()
     roots = (root,)
@@ -485,10 +501,12 @@ def test_the_output_root_is_independent(tmp_path) -> None:
     (tmp_path / "empty").mkdir()
     t14.check_output_roots(tmp_path / "empty", tmp_path / "raw", roots)
     t14.check_output_roots(tmp_path / "new", tmp_path / "raw", roots)
-    # the real list refuses the real roots
-    with pytest.raises(ValueError, match="overlaps"):
-        t14.check_output_roots(Path("/data/nfs_shared_data/xxy/calibration_M_20260923/t14"),
-                               tmp_path / "raw")
+    # the roots: --forbidden-root, the preregistration's, the capacity prior's input runs
+    args = argparse.Namespace(forbidden_root=[tmp_path / "cli"])
+    prior = {"inputs": {"base_run": str(tmp_path / "run2"), "boundary_supplement_run": None}}
+    roots, explicit = t14.forbidden_roots(args, prior, {"forbidden_roots": [str(root)]})
+    assert set(roots) == {tmp_path / "cli", root, tmp_path / "run2"}
+    assert set(explicit) == {tmp_path / "cli", root}
     cells = t14.new_cells(MODEL, 20260924)
     (tmp_path / "raw" / cells[3].stem(1)).mkdir(parents=True)
     with pytest.raises(ValueError, match="already exist"):
@@ -598,6 +616,16 @@ def test_a_real_run_needs_its_bindings(tmp_path, frozen) -> None:
         t14.run_t14_set(_args(tmp_path, models="dsqwen-7b", **full), check_controller=False)
     with pytest.raises(ValueError, match="does not bind"):
         t14.run_t14_set(_args(tmp_path, design_seed=20260923, **full), check_controller=False)
+    # isolation: no root named anywhere, or an out-dir inside a preregistered root
+    bare = _prereg(tmp_path, prior, freeze=frozen["freeze"], refit=frozen["refit"],
+                   name="bare.json", t14__forbidden_roots=[])
+    with pytest.raises(ValueError, match="no forbidden roots"):
+        t14.run_t14_set(_args(tmp_path, **{**full, "preregistration_json": bare}),
+                        check_controller=False)
+    inside = tmp_path / "train_root" / "t14"
+    with pytest.raises(ValueError, match="overlaps"):
+        t14.run_t14_set(_args(tmp_path, out_dir=inside, raw_dir=inside / "raw", **full),
+                        check_controller=False)
     assert not (tmp_path / "out").exists()
 
 
