@@ -40,13 +40,17 @@ type Pod struct {
 	// Log frenquency control
 	lastTraceLogTimestamp int64
 
-	// TRE: gateway wall-clock ms (treWallClockMS) of the last successful engine metrics
-	// scrape; 0 = never. Accessed atomically.
+	// TRE: gateway wall-clock ms (treWallClockMS) taken just before the fetch of the last
+	// successful engine metrics scrape; 0 = never. Accessed atomically. The stored metrics
+	// were sampled at or after it (except in the overlap case on markScrapeSucceeded).
 	lastScrapeSuccessMS int64
 }
 
-// markScrapeSucceeded records a successful engine metrics scrape at ms. It never moves
-// backwards, so an older scrape finishing late cannot undo a newer one.
+// markScrapeSucceeded records a successful engine metrics scrape that started at ms. It
+// never moves backwards, so it keeps the newest start time. Caveat: the pod is re-queued
+// every refresh tick, so two scrapes of one pod can overlap, and the older one can store
+// its metrics last (metric stores are not ordered, as upstream). The pod then briefly
+// holds metrics up to one fetch timeout older than this time, until the next scrape.
 func (pod *Pod) markScrapeSucceeded(ms int64) {
 	for {
 		prev := atomic.LoadInt64(&pod.lastScrapeSuccessMS)

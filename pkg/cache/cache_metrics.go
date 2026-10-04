@@ -280,13 +280,15 @@ func (c *Store) refreshPodMetrics(pod *Pod) {
 	endpoint := fmt.Sprintf("%s:%d", pod.Status.PodIP, podMetricPort)
 	engineType := metrics.GetEngineType(*pod.Pod)
 	identifier := pod.Name
+	// TRE: stamp before the fetch (which can take up to the 5 s timeout), so scraped_ms
+	// never claims the metrics are newer than they are.
+	scrapedMS := treWallClockMS()
 	result, err := c.engineMetricsFetcher.FetchAllTypedMetrics(ctx, endpoint, engineType, identifier, metricsToFetch)
 	if err != nil {
 		klog.V(4).InfoS("Failed to fetch typed metrics from engine pod",
 			"pod", pod.Name, "podIP", pod.Status.PodIP, "port", podMetricPort, "error", err)
 		return
 	}
-	scrapedMS := treWallClockMS()
 
 	for metricName, metricValue := range result.Metrics {
 		sanitizeMetricValueLabels(pod, metricValue)
