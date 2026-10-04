@@ -740,6 +740,32 @@ def test_step_pods_come_from_the_fleet_view_not_the_fresh_samples():
     assert _planned(tick(7, 4, latest_by_pod=pods)) == 4
 
 
+def test_an_added_pod_without_a_fresh_sample_blocks_the_next_step():
+    """2026-10-04 (I3): the added pods come from the fleet view's routable set. After
+    1 -> 3, the added m-1 is full but m-2 has no fresh sample (unknown, not "room" and not
+    skipped) -> no further step; once m-2 is sampled and full the next step follows."""
+    state = _state()
+    queue = _Queue()
+    registry = _registry(max_awake=8, saturation_max_step_factor=3.0)
+    sat = [STARTING] * 3
+
+    def tick(i, awake, stale=()):
+        w = _window(BASE + i * GRID, sat, (8.0, 0.6), awake=awake)
+        per_pod = {name: (replace(pod, latest_instant_ms=w.window_end_ms - 3 * GRID) if name in stale else pod)
+                   for name, pod in w.per_pod.items()}
+        return _tick(state, replace(w, per_pod=per_pod), awake=awake, queue=queue, registry=registry)
+
+    tick(3, 1)
+    assert _planned(tick(4, 1)) == 2  # 1 -> 3
+    tick(5, 3, stale=("m-2",))  # landed
+    for i in (6, 7, 8):
+        result = tick(i, 3, stale=("m-2",))
+        assert not _ups(result.actions)
+        assert result.model_contexts["m"]["saturation_ticks"] == 0
+    tick(9, 3)
+    assert _planned(tick(10, 3)) > 0
+
+
 def test_events_are_reported_once_per_window():
     state = _state()
     queue = _Queue()

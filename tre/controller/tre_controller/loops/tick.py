@@ -199,7 +199,7 @@ def run_planner_tick(
     # Onset saturation rescue (the D8 band dwell that ran before it was removed in the
     # timer cleanup 2026-10-02; it had been off since the v1 alignment A5).
     classifications, saturation_events = _apply_saturation_rescue(
-        classifications, contexts, snapshot, signal_state
+        classifications, contexts, snapshot, signal_state, cluster_view
     )
     if _prof_on:
         _signals_ns = time.perf_counter_ns() - _phase_t0
@@ -339,6 +339,7 @@ def _apply_saturation_rescue(
     contexts: dict[str, dict],
     snapshot: MetricsSnapshot,
     signal_state: SignalState | None,
+    cluster_view: ClusterView | None = None,
 ) -> tuple[list, tuple[str, ...]]:
     """Onset saturation rescue (design 20261002-saturation-onset-rescue): a model whose
     TSS cannot decide yet (numerator zero / receiver gate not warm) and whose engines are
@@ -348,6 +349,7 @@ def _apply_saturation_rescue(
     if tracker is None or not tracker.config.enabled:
         return classifications, ()
     need = tracker.config.consecutive_ticks
+    routable_by_model = _routable_pod_ids(cluster_view)
     events: list[str] = []
     out: list = []
     for item in classifications:
@@ -370,6 +372,9 @@ def _apply_saturation_rescue(
             sample=_context_sample(ctx),
             tss_warm=tss_warm,
             idle=bool(tokens and window_is_idle(metrics.prompt_tokens, metrics.generation_tokens)),
+            routable_ids=(
+                routable_by_model.get(model, frozenset()) if routable_by_model is not None else None
+            ),
         )
         events.extend(verdict.events)
         sample = verdict.sample
@@ -1312,6 +1317,22 @@ def _awake_including_hidden(cluster_view: ClusterView | None) -> dict[str, int]:
         if binding.awake:
             counts[binding.model] += 1
     return counts
+
+
+def _routable_pod_ids(cluster_view: ClusterView | None) -> dict[str, frozenset[str]] | None:
+    """model -> serve_ids (== pod names) of its routable bindings, by the same rule as
+    :func:`_cluster_view_counts`; None without a fleet view."""
+    if cluster_view is None:
+        return None
+    routable_ids = getattr(cluster_view, "routable_ids", None)
+    out: dict[str, set[str]] = {}
+    for binding in cluster_view.bindings:
+        routable = (
+            binding.serve_id in routable_ids if routable_ids is not None else binding.awake and not binding.hidden
+        )
+        if routable:
+            out.setdefault(binding.model, set()).add(binding.serve_id)
+    return {model: frozenset(ids) for model, ids in out.items()}
 
 
 def _cluster_view_counts(cluster_view: ClusterView | None) -> dict[str, tuple[int, int]]:

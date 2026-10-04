@@ -263,6 +263,7 @@ class SaturationTracker:
         sample: SaturationSample | None,
         tss_warm: bool = False,
         idle: bool = False,
+        routable_ids: Iterable[str] | None = None,
     ) -> SaturationVerdict:
         """The model's verdict for the window ending at ``window_end_ms``; a re-read of
         the same window returns the same verdict without counting again.
@@ -270,8 +271,10 @@ class SaturationTracker:
         ``reason``: :func:`eligibility_reason` of the window; ``tss_warm``: the TSS
         decides this window (tokens present, not eligible); ``idle``: the window carried
         no token (``window_is_idle``: the O1 onset is cleared, the next traffic is a new
-        onset) - re-opens the O1-hold eligibility. Events are reported once, on the first
-        read of a window."""
+        onset) - re-opens the O1-hold eligibility; ``routable_ids``: the model's routable
+        pods of the fleet view (the pods a landed step added are taken from it; None
+        without a fleet view: from the sampled pods). Events are reported once, on the
+        first read of a window."""
         state = self._state.setdefault(model, _ModelState())
         end = int(window_end_ms)
         routable = int(routable)
@@ -335,7 +338,9 @@ class SaturationTracker:
         if reason == REASON_O1_HOLD and state.warm and not state.chain:
             effective = None  # the hold comes from a breakpoint the tracker did not cause
         eligible = cfg.enabled and effective is not None and sample is not None and routable > 0
-        full = bool(eligible and self.engine_full(sample) and self._added_pods_full(state, sample))
+        full = bool(
+            eligible and self.engine_full(sample) and self._added_pods_full(state, sample, routable_ids)
+        )
         counted = state.await_n is None and (state.count_after is None or end > state.count_after)
         state.streak = state.streak + 1 if (full and counted) else 0
         fire = state.streak >= cfg.consecutive_ticks
@@ -353,12 +358,22 @@ class SaturationTracker:
         )
         return state.verdict
 
-    def _added_pods_full(self, state: _ModelState, sample: SaturationSample | None) -> bool:
-        """After a landed step: every pod that step added is full itself."""
+    def _added_pods_full(
+        self, state: _ModelState, sample: SaturationSample | None, routable_ids: Iterable[str] | None = None
+    ) -> bool:
+        """After a landed step: every pod that step added is full itself. The added pods
+        are the routable pods of the fleet view outside the step's pods (I3, 2026-10-04):
+        an added pod without a fresh sample is unknown, so not full - never skipped."""
         if state.step_pods is None or state.await_n is not None or sample is None:
             return True
-        added = [pod for pod in sample.per_pod if pod.pod not in state.step_pods]
-        return bool(added) and all(self._pod_full(pod) for pod in added)
+        sampled = {pod.pod: pod for pod in sample.per_pod}
+        if routable_ids is None:
+            added_ids = [name for name in sampled if name not in state.step_pods]
+        else:
+            added_ids = sorted({str(name) for name in routable_ids} - state.step_pods)
+        return bool(added_ids) and all(
+            name in sampled and self._pod_full(sampled[name]) for name in added_ids
+        )
 
     @staticmethod
     def _external(state: _ModelState, end: int) -> None:
