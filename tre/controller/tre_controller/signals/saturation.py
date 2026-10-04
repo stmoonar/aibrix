@@ -50,6 +50,11 @@ from tre_common.metrics_schema import ModelWindowMetrics
 
 REASON_NUMERATOR_ZERO = "numerator_zero"
 REASON_O1_HOLD = "o1_hold"
+#: 2026-10-04: the gateway scraper is alive, but no serving pod of the model answered
+#: /metrics during the whole window (vLLM serves /metrics on the API-server event loop:
+#: it is saturated) and the gateway holds routed, unfinished requests for those pods.
+#: Fires on the first such window, one replica per step (planner).
+REASON_SCRAPE_STALE_INFLIGHT = "scrape_stale_inflight"
 
 #: Upper bound of ``scaling.saturation_max_step_factor`` (the registry enforces it too).
 MAX_STEP_FACTOR_LIMIT = 4.0
@@ -188,6 +193,8 @@ def eligibility_reason(context: Mapping[str, Any] | None) -> str | None:
     (the TSS decides). TSS (``zm``) signal only; never on missing metrics."""
     if not context or context.get("signal_source", "zm") != "zm":
         return None
+    if (context.get("scrape_stale_inflight") or 0) > 0:
+        return REASON_SCRAPE_STALE_INFLIGHT
     if context.get("signal_unavailable_reason") == "tokens_missing" or "tss_defined" not in context:
         return None
     y_total = context.get("Y_m")
@@ -337,13 +344,17 @@ class SaturationTracker:
         effective = reason
         if reason == REASON_O1_HOLD and state.warm and not state.chain:
             effective = None  # the hold comes from a breakpoint the tracker did not cause
-        eligible = cfg.enabled and effective is not None and sample is not None and routable > 0
+        # Frozen scrape: no engine sample exists by definition; the evidence is the
+        # stale scrape plus the gateway's in-flight requests (no added-pods check).
+        frozen = effective == REASON_SCRAPE_STALE_INFLIGHT
+        eligible = cfg.enabled and effective is not None and (sample is not None or frozen) and routable > 0
         full = bool(
-            eligible and self.engine_full(sample) and self._added_pods_full(state, sample, routable_ids)
+            eligible
+            and (frozen or (self.engine_full(sample) and self._added_pods_full(state, sample, routable_ids)))
         )
         counted = state.await_n is None and (state.count_after is None or end > state.count_after)
         state.streak = state.streak + 1 if (full and counted) else 0
-        fire = state.streak >= cfg.consecutive_ticks
+        fire = state.streak >= (1 if frozen else cfg.consecutive_ticks)
         state.verdict = SaturationVerdict(
             model=model,
             window_end_ms=end,

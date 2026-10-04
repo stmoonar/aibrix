@@ -86,6 +86,22 @@ Capacity order is the existing fast-loop order: sleeping-replica wakes, then fre
 (`critical_idle_capacity` / TP slots), then IDLE / HIGH donors released immediately
 (`critical_donor_immediate`), then middle-zone SafeScale donors.
 
+### Frozen scrape (2026-10-04)
+
+A third eligibility reason, `scrape_stale_inflight`, for a model whose tokens are
+missing because no serving pod answered /metrics during the whole window (every
+serving pod scrape-stale, design O1 "Signal validity"), while the gateway scraper is
+alive (some pod of some model has a `scraped_ms` inside the window). vLLM V1 serves
+/metrics on the API-server event loop, so this means that loop is saturated. Evidence of
+demand: the gateway's in-flight mirror `tre:v2:gw:inflight:<pod>` summed over the
+serving pods, fields of live instances only (heartbeat in `tre:v2:gw:instances` within
+one window of Redis TIME; the field `ts` is not checked - the mirror is write-on-change).
+In-flight > 0 fires on the **first** window (no engine sample exists to confirm) and
+steps **+1** (no doubling). A further step waits for the tracker's landing and a window
+after it; the new replica is scraped normally, so the model is then partially stale
+(never a donor) and the normal paths take over. A dead scraper (every pod stale) is no
+evidence; a broken network path to one healthy pod costs one neighbour sleep.
+
 ## Parameters (registry `scaling:`)
 
 | key | default | meaning |

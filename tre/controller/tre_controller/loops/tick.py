@@ -39,6 +39,7 @@ from tre_controller.planning.safescale import (
     format_window_event,
 )
 from tre_controller.signals.saturation import (
+    REASON_SCRAPE_STALE_INFLIGHT,
     PodSample,
     SaturationSample,
     eligibility_reason,
@@ -123,6 +124,8 @@ class PaperStateCache:
                 # Timer cleanup (2026-10-02): a held context was not recomputed - O1 saw
                 # no routable change this tick, so the F4 cooldown applies again.
                 "o1_routable_tracked": False,
+                # This tick's frozen-scrape demand (never a held one).
+                "scrape_stale_inflight": context.get("scrape_stale_inflight"),
                 # I4 (2026-10-04): a held level was not computed from tokens of the
                 # current window - never scale-down / release evidence (the planner's
                 # donor gate), and the UI shows the model UNCONFIRMED.
@@ -366,7 +369,9 @@ def _apply_saturation_rescue(
             out.append(item)
             continue
         tokens = metrics.prompt_tokens is not None and metrics.generation_tokens is not None
-        reason = eligibility_reason(ctx) if tokens else None
+        reason = eligibility_reason(ctx)
+        if not tokens and reason != REASON_SCRAPE_STALE_INFLIGHT:
+            reason = None
         tss_warm = bool(
             tokens and reason is None and "tss_defined" in ctx and ctx.get("signal_source", "zm") == "zm"
         )
@@ -393,7 +398,7 @@ def _apply_saturation_rescue(
             item = replace(
                 item, state=ModelState.CRITICAL, role=ModelRole.RECEIVER, donor_tier=None, saturation_rescue=True
             )
-        elif verdict.full:
+        elif verdict.full and sample is not None:
             events.append(
                 f"saturation_pending:{model}:{verdict.ticks}/{need}:reason={verdict.reason}"
                 f":waiting={sample.waiting:.0f}:kv={'none' if sample.kv is None else f'{sample.kv:.2f}'}"
@@ -1097,7 +1102,10 @@ def _model_contexts(
     awake_counts = _awake_including_hidden(cluster_view)
     hidden_pods = _hidden_pods(cluster_view)
     routable_by_model = _routable_pod_ids(cluster_view)
+    # The gateway scraper is alive: some pod of some model was scraped in the window.
+    scraper_alive = any(getattr(window, "scrape_fresh", False) for window in snapshot.models.values())
     for model_name, metrics in snapshot.models.items():
+        raw_metrics = metrics
         spec = registry.model(model_name)
         stale_pods = getattr(metrics, "scrape_stale_pods", ())
         if stale_pods:
@@ -1234,6 +1242,12 @@ def _model_contexts(
             # evidence (the planner's donor gate); a receiver still acts (step-capped).
             context["signal_full_window"] = False
             context["signal_hold_reason"] = "scrape_stale"
+        elif not tokens_available and stale_pods and scraper_alive:
+            demand = _frozen_scrape_demand(raw_metrics, routable_by_model, model_name)
+            if demand is not None:
+                # No serving pod answered /metrics in the whole window while the scraper
+                # works: saturation-rescue evidence when requests are in flight.
+                context["scrape_stale_inflight"] = demand
         tracker = getattr(signal_state, "saturation", None)
         if tracker is not None and tracker.config.enabled:
             # Onset saturation rescue: the routable pods' newest gateway samples (the
@@ -1322,6 +1336,21 @@ def _awake_including_hidden(cluster_view: ClusterView | None) -> dict[str, int]:
         if binding.awake:
             counts[binding.model] += 1
     return counts
+
+
+def _frozen_scrape_demand(
+    metrics: ModelWindowMetrics, routable_by_model: dict[str, frozenset[str]] | None, model: str
+) -> int | None:
+    """The gateway in-flight requests on the model's serving pods when every serving pod
+    is scrape-stale for the window; None when some serving pod has valid data (or none
+    serves). Without a fleet view every pod with docs counts as serving."""
+    valid = set(metrics.per_pod or ())
+    stale = set(getattr(metrics, "scrape_stale_pods", ()))
+    serving = set(routable_by_model.get(model, frozenset())) if routable_by_model is not None else valid | stale
+    if not serving or serving & valid:
+        return None
+    inflight = getattr(metrics, "scrape_stale_inflight", None) or {}
+    return sum(int(inflight.get(pod, 0)) for pod in serving)
 
 
 def _routable_pod_ids(cluster_view: ClusterView | None) -> dict[str, frozenset[str]] | None:

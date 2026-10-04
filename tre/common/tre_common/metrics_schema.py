@@ -111,6 +111,12 @@ class ModelWindowMetrics:
     #: successful scrape of them (doc ``scraped_ms``) lies before the window - their
     #: docs repeat frozen values. Diagnostics only; excluded from equality.
     scrape_stale_pods: tuple[str, ...] = field(default=(), compare=False)
+    #: Some pod of this model (sleeping ones included) has a successful gateway scrape
+    #: inside the window: the gateway scraper is alive. False for an old gateway.
+    scrape_fresh: bool = field(default=False, compare=False)
+    #: ``scrape_stale_pods`` -> routed, unfinished requests on the pod (gateway in-flight
+    #: mirror, live gateway instances only; ``tre_common.gateway_inflight``).
+    scrape_stale_inflight: dict[str, int] = field(default_factory=dict, compare=False)
 
 
 @dataclass(frozen=True)

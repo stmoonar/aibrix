@@ -6,6 +6,7 @@ from dataclasses import replace
 from typing import Any
 
 from tre_common.metrics_schema import MetricsSnapshot, ModelWindowMetrics, PodWindowMetrics
+from tre_common.gateway_inflight import live_gateway_instances, pod_inflight
 from tre_common.percentile import histogram_percentile
 from tre_common.rediskeys import hist_key, inst_key, pods_key
 from tre_common.vllm_metrics import doc_lookup
@@ -190,8 +191,17 @@ class MetricsStore:
         all_ticks = tuple(sorted({tick for pod in per_pod.values() for tick in pod.instant_ticks_ms}))
         per_pod, stale_pods = _scrape_valid(per_pod, scraped, read_start_ms)
         model_metrics = self._aggregate_model(model, window_start_ms, window_end_ms, per_pod)
+        scrape_fresh = any(value is not None and value >= read_start_ms for value in scraped.values())
         if stale_pods:
-            model_metrics = replace(model_metrics, instant_ticks_ms=all_ticks, scrape_stale_pods=stale_pods)
+            model_metrics = replace(
+                model_metrics,
+                instant_ticks_ms=all_ticks,
+                scrape_stale_pods=stale_pods,
+                scrape_fresh=scrape_fresh,
+                scrape_stale_inflight=self._stale_inflight(stale_pods, int(window_end_ms) - int(window_start_ms)),
+            )
+        elif scrape_fresh:
+            model_metrics = replace(model_metrics, scrape_fresh=True)
         if suffix_starts:
             model_metrics = replace(
                 model_metrics,
@@ -208,6 +218,16 @@ class MetricsStore:
         if use_cache:
             self._window_cache[cache_key] = model_metrics
         return model_metrics
+
+    def _stale_inflight(self, pods: tuple[str, ...], window_ms: int) -> dict[str, int]:
+        """The gateway's in-flight count of each scrape-stale pod (live instances: a
+        heartbeat inside one window). Read only when pods are stale; {} when the gateway
+        coordination keys cannot be read."""
+        try:
+            live = live_gateway_instances(self._redis, max_age_ms=max(1, int(window_ms)))
+            return {pod: pod_inflight(self._redis, pod, live) for pod in pods}
+        except Exception:  # noqa: BLE001 - no evidence: the frozen-scrape rescue stays off
+            return {}
 
     def _suffix_starts(self, window_start_ms: int, window_end_ms: int) -> tuple[int, ...]:
         """Gateway boundaries strictly inside an aligned window (O1 suffix starts);

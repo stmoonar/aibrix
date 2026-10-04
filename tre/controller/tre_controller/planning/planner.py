@@ -587,11 +587,15 @@ def build_plan(
             the routable count does not show yet counts as covered (C1 bookkeeping)."""
             basis = rescue_bases.get(recv.model_name)
             covered = max(basis.covered, recv_pods) if basis is not None else recv_pods
-            desired = min(
-                max(recv_pods + 1, math.floor(cfg.saturation_max_step_factor * recv_pods + 1e-9)), recv_max
-            )
-            raw_need = min(desired - covered, recv_max - max(recv_awake, covered))
             ctx = model_contexts.get(recv.model_name, {})
+            if ctx.get("saturation_reason") == "scrape_stale_inflight":
+                # Frozen scrape (no engine sample, demand only): one replica per step.
+                desired = min(recv_pods + 1, recv_max)
+            else:
+                desired = min(
+                    max(recv_pods + 1, math.floor(cfg.saturation_max_step_factor * recv_pods + 1e-9)), recv_max
+                )
+            raw_need = min(desired - covered, recv_max - max(recv_awake, covered))
             kv = ctx.get("saturation_kv")
             events.append(
                 f"saturation_rescue:{recv.model_name}:n={recv_pods}:target={desired}"

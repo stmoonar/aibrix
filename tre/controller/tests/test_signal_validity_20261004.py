@@ -11,10 +11,13 @@ import json
 import pytest
 
 from relay_view import expand_relays
+from tre_common import rediskeys
 from tre_common.registry import ClusterTopology, ModelSpec, NodeSpec, Registry, SloSpec, TrsParams
 from tre_controller.loops.tick import PaperStateCache, run_planner_tick
 from tre_controller.planning.classify import ModelState, classify_all_models
 from tre_controller.planning.planner import ClusterView, PlanConfig, ScaleAction, build_plan
+from tre_controller.signals.saturation import SaturationRescueConfig, SaturationTracker
+from tre_controller.signals.trs import SignalState
 from tre_controller.store.metrics_store import MetricsStore
 from tre_sm.allocator.slots import Binding, Slot
 
@@ -112,9 +115,22 @@ def test_held_receiver_rescue_is_capped_like_thin_evidence():
 
 
 class _Redis:
-    def __init__(self):
+    def __init__(self, now_ms: int = 7_000_000):
         self.sets: dict = {}
         self.zsets: dict = {}
+        self.hashes: dict = {}
+        self.instances: dict = {}  # tre:v2:gw:instances member -> heartbeat (Redis TIME ms)
+        self.now_ms = now_ms  # Redis TIME: its own clock, unrelated to the doc stamps
+
+    def time(self):
+        return self.now_ms // 1000, (self.now_ms % 1000) * 1000
+
+    def zrange(self, key, start, stop, withscores=False):
+        assert key == rediskeys.GW_INSTANCES_KEY
+        return sorted(self.instances.items(), key=lambda item: item[1])
+
+    def hgetall(self, key):
+        return dict(self.hashes.get(key, {}))
 
     def sadd(self, key, *values):
         self.sets.setdefault(key, set()).update(values)
@@ -267,3 +283,52 @@ def test_scrape_validity_is_judged_per_o1_suffix():
     last_20s, last_10s = window.suffix_windows
     assert last_20s.generation_tokens is not None
     assert last_10s.generation_tokens is None and not last_10s.per_pod
+
+
+# ---------------------------------------- frozen-scrape rescue (2026-10-04)
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["rescue", "dead_gateway_instance", "scraper_dead", "no_inflight"],
+)
+def test_frozen_scrape_with_inflight_demand_is_a_one_step_rescue(case):
+    """No serving pod of m answered /metrics in the whole window, while the gateway
+    scraper works (model o was scraped): vLLM's API-server loop is saturated. With
+    requests in flight on m-0 (live gateway instance) m gets +1 on this first window and
+    is never a donor. No rescue when the in-flight count comes only from a dead gateway
+    instance, when every pod of every model is stale (the scraper is dead), or when
+    nothing is in flight."""
+    redis = _Redis()
+    stale = END - 35_000
+    _write_pod(redis, "m", "m-0", gen_per_grid=0, running=0, waiting=0, scraped_ms=stale)
+    _write_pod(redis, "o", "o-0", gen_per_grid=2_000, running=4, waiting=0,
+               scraped_ms=stale if case == "scraper_dead" else END)
+    live_hb, dead_hb = redis.now_ms - 2_000, redis.now_ms - 120_000
+    redis.instances = {"gw-live": live_hb, "gw-dead": dead_hb}
+    inflight = {"rescue": {"gw-live": 6}, "dead_gateway_instance": {"gw-dead": 6},
+                "scraper_dead": {"gw-live": 6}, "no_inflight": {"gw-live": 0}}[case]
+    redis.hashes[rediskeys.gw_inflight_key("m-0")] = {
+        instance: json.dumps({"total": total, "non_continuable": 0, "ts": 1}) for instance, total in inflight.items()
+    }
+    registry = _registry("m", "o")
+    snapshot = MetricsStore(redis, registry, instant_sample_interval_ms=10_000).read_snapshot(
+        END - 30_000, END, use_cache=False, start_exclusive=True
+    )
+
+    def binding(pod, model, gpu, awake=True):
+        return Binding(serve_id=pod, model=model, slot=Slot("n", (gpu,)), awake=awake)
+
+    view = ClusterView(topology=registry.topology(), bindings=(
+        binding("m-0", "m", 0), binding("m-1", "m", 1, awake=False), binding("o-0", "o", 2),
+    ))
+    state = SignalState(saturation=SaturationTracker(SaturationRescueConfig()))
+    result = run_planner_tick(snapshot, queue=_Queue(), registry=registry, rescue_due=True, fairness_due=True,
+                              cluster_view=view, signal_state=state, paper_state_cache=PaperStateCache())
+    deltas = [a.delta for a in expand_relays(result.actions) if isinstance(a, ScaleAction) and a.model == "m"]
+    assert all(delta >= 0 for delta in deltas)  # never a donor
+    if case == "rescue":
+        assert sum(deltas) == 1
+        assert result.model_contexts["m"]["saturation_reason"] == "scrape_stale_inflight"
+    else:
+        assert sum(deltas) == 0
