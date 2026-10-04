@@ -39,6 +39,28 @@ type Pod struct {
 
 	// Log frenquency control
 	lastTraceLogTimestamp int64
+
+	// TRE: gateway wall-clock ms (treWallClockMS) of the last successful engine metrics
+	// scrape; 0 = never. Accessed atomically.
+	lastScrapeSuccessMS int64
+}
+
+// markScrapeSucceeded records a successful engine metrics scrape at ms. It never moves
+// backwards, so an older scrape finishing late cannot undo a newer one.
+func (pod *Pod) markScrapeSucceeded(ms int64) {
+	for {
+		prev := atomic.LoadInt64(&pod.lastScrapeSuccessMS)
+		if ms <= prev || atomic.CompareAndSwapInt64(&pod.lastScrapeSuccessMS, prev, ms) {
+			return
+		}
+	}
+}
+
+// lastScrapeSuccess returns the time of the last successful engine metrics scrape, and
+// false if the pod has never been scraped successfully.
+func (pod *Pod) lastScrapeSuccess() (int64, bool) {
+	ms := atomic.LoadInt64(&pod.lastScrapeSuccessMS)
+	return ms, ms > 0
 }
 
 func (pod *Pod) CanLogPodTrace(level klog.Level) bool {

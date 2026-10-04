@@ -263,71 +263,81 @@ func (c *Store) updatePodMetrics() {
 
 func (c *Store) worker(jobs <-chan *Pod) {
 	for pod := range jobs {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		podMetricPort := getPodMetricPort(pod)
+		c.refreshPodMetrics(pod)
+	}
+}
 
-		// Use centralized typed metrics fetcher for better engine abstraction and error handling
-		metricsToFetch := c.getAllAvailableMetrics()
-		endpoint := fmt.Sprintf("%s:%d", pod.Status.PodIP, podMetricPort)
-		engineType := metrics.GetEngineType(*pod.Pod)
-		identifier := pod.Name
-		result, err := c.engineMetricsFetcher.FetchAllTypedMetrics(ctx, endpoint, engineType, identifier, metricsToFetch)
-		if err != nil {
-			klog.V(4).InfoS("Failed to fetch typed metrics from engine pod",
-				"pod", pod.Name, "podIP", pod.Status.PodIP, "port", podMetricPort, "error", err)
-			cancel()
+// refreshPodMetrics scrapes one engine pod and updates its cached metrics. On a fetch
+// error the pod keeps its previous metrics and its last-successful-scrape time is not
+// advanced.
+func (c *Store) refreshPodMetrics(pod *Pod) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	podMetricPort := getPodMetricPort(pod)
+
+	// Use centralized typed metrics fetcher for better engine abstraction and error handling
+	metricsToFetch := c.getAllAvailableMetrics()
+	endpoint := fmt.Sprintf("%s:%d", pod.Status.PodIP, podMetricPort)
+	engineType := metrics.GetEngineType(*pod.Pod)
+	identifier := pod.Name
+	result, err := c.engineMetricsFetcher.FetchAllTypedMetrics(ctx, endpoint, engineType, identifier, metricsToFetch)
+	if err != nil {
+		klog.V(4).InfoS("Failed to fetch typed metrics from engine pod",
+			"pod", pod.Name, "podIP", pod.Status.PodIP, "port", podMetricPort, "error", err)
+		return
+	}
+	scrapedMS := treWallClockMS()
+
+	for metricName, metricValue := range result.Metrics {
+		sanitizeMetricValueLabels(pod, metricValue)
+		if shouldSkipMetric(pod.Name, metricName) {
+			continue
+		}
+		metrics.EmitMetricToPrometheus(&types.RoutingContext{Model: ""}, pod.Pod, metricName, metricValue, metricValue.GetLabelValues())
+	}
+
+	for metricName, metricValue := range result.ModelMetrics {
+		sanitizeMetricValueLabels(pod, metricValue)
+		parts := strings.SplitN(metricName, "/", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		model := parts[0]
+		metric := parts[1]
+
+		model = resolveMetricModelName(pod, model)
+
+		if shouldSkipMetric(pod.Name, metric) {
 			continue
 		}
 
-		for metricName, metricValue := range result.Metrics {
-			sanitizeMetricValueLabels(pod, metricValue)
-			if shouldSkipMetric(pod.Name, metricName) {
-				continue
-			}
-			metrics.EmitMetricToPrometheus(&types.RoutingContext{Model: ""}, pod.Pod, metricName, metricValue, metricValue.GetLabelValues())
-		}
-
-		for metricName, metricValue := range result.ModelMetrics {
-			sanitizeMetricValueLabels(pod, metricValue)
-			parts := strings.SplitN(metricName, "/", 2)
-			if len(parts) != 2 {
-				continue
-			}
-			model := parts[0]
-			metric := parts[1]
-
-			model = resolveMetricModelName(pod, model)
-
-			if shouldSkipMetric(pod.Name, metric) {
-				continue
-			}
-
-			c.updateThroughputToksPerS(pod, model, metric, metricValue)
-			metrics.EmitMetricToPrometheus(&types.RoutingContext{Model: model}, pod.Pod, metric, metricValue, metricValue.GetLabelValues())
-		}
-		// Update pod metrics using typed results
-		c.updatePodMetricsFromTypedResult(pod, result)
-
-		c.syncRunningRequestsGlobally(pod)
-
-		c.updateRealtimeRunningRequestsDrainRate1m(pod)
-
-		// Handle Prometheus-based metrics separately (these require PromQL queries)
-		if c.prometheusApi != nil {
-			c.enqueuePromQL(pod)
-		} else {
-			klog.V(4).InfoS("Prometheus API not initialized, skipping PromQL metrics", "pod", pod.Name)
-		}
-
-		// Log successful processing
-		klog.V(5).InfoS("Successfully processed metrics for pod",
-			"pod", pod.Name,
-			"podMetrics", len(result.Metrics),
-			"modelMetrics", len(result.ModelMetrics),
-			"errors", len(result.Errors))
-
-		cancel()
+		c.updateThroughputToksPerS(pod, model, metric, metricValue)
+		metrics.EmitMetricToPrometheus(&types.RoutingContext{Model: model}, pod.Pod, metric, metricValue, metricValue.GetLabelValues())
 	}
+	// Update pod metrics using typed results
+	c.updatePodMetricsFromTypedResult(pod, result)
+	// TRE: mark the scrape only after its metrics are stored. The TRE Redis writer reads
+	// this time before the metrics, so a doc's scraped_ms never claims a scrape whose
+	// metrics it does not yet carry.
+	pod.markScrapeSucceeded(scrapedMS)
+
+	c.syncRunningRequestsGlobally(pod)
+
+	c.updateRealtimeRunningRequestsDrainRate1m(pod)
+
+	// Handle Prometheus-based metrics separately (these require PromQL queries)
+	if c.prometheusApi != nil {
+		c.enqueuePromQL(pod)
+	} else {
+		klog.V(4).InfoS("Prometheus API not initialized, skipping PromQL metrics", "pod", pod.Name)
+	}
+
+	// Log successful processing
+	klog.V(5).InfoS("Successfully processed metrics for pod",
+		"pod", pod.Name,
+		"podMetrics", len(result.Metrics),
+		"modelMetrics", len(result.ModelMetrics),
+		"errors", len(result.Errors))
 }
 
 func (c *Store) updateMetricFromPromQL(ctx context.Context, pod *Pod) (queryErr error) {

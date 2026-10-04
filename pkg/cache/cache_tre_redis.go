@@ -86,6 +86,13 @@ func (c *Store) writeTREPodMetricsToRedis(ctx context.Context, roundT int64) err
 			"pod_namespace": metaPod.Namespace,
 			"pod_ip":        metaPod.Status.PodIP,
 		}
+		// TRE (2026-10-04): scraped_ms is the gateway wall clock of the pod's last
+		// successful engine scrape (omitted if none yet). A failed scrape keeps the old
+		// metrics but does not advance it, so the controller can tell stale metrics from
+		// fresh ones. Read before the metrics: they are at least as new as scraped_ms.
+		if scrapedMS, ok := metaPod.lastScrapeSuccess(); ok {
+			base["scraped_ms"] = scrapedMS
+		}
 		instantMetrics, instantModels := collectTREInstantMetrics(metaPod)
 		histogramMetrics, histogramModels := collectTREHistogramMetrics(metaPod)
 
