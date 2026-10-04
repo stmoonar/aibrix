@@ -50,38 +50,18 @@ first sample; inside the warm-up of every ladder cell) and windows around a rest
 
 Per model `m`, after the D stages finished. Each numerator gets its **own** fit and refit
 directories (the trainset stage rewrites `trainset.json`; per-model directories also keep
-one model's trainset from replacing another's).
-
-```bash
-cd $T/deploy   # PYTHONPATH as in RUN §0
-for m in $MODELS; do
-  # 1. L3 datasets next to the default ones (the default `dataset/` is the gateway numerator)
-  for s in run1 run2 supp p1; do
-    python3 -m scripts.calibration_dataset $CALIB_ROOT/$s/$m --numerator vllm_counter
-    python3 -c 'import json,sys; d=json.load(open(sys.argv[1]))["numerator"]; print(sys.argv[1], d["windows_kept"], d["windows_void"])' \
-        $CALIB_ROOT/$s/$m/dataset_l3/manifest.json
-  done
-  # 2. one fit per numerator (N = gateway | l3; D = dataset | dataset_l3)
-  for N in gateway l3; do
-    D=$([ $N = l3 ] && echo dataset_l3 || echo dataset)
-    F=$CALIB_ROOT/fit/$N/$m/fit; O=$CALIB_ROOT/fit/$N/refit
-    python3 -m scripts.dline_refit trainset --fit-dir $F --model $m \
-        --h2-dataset run1=$CALIB_ROOT/run1/$m/$D --h2-dataset run2=$CALIB_ROOT/run2/$m/$D \
-        --dataset supp=$CALIB_ROOT/supp/$m/$D --dataset p1=$CALIB_ROOT/p1/$m/$D
-    python3 -m scripts.dline_refit alpha --fit-dir $F --out-dir $O --model $m --publish-tau-s 10
-    python3 -m scripts.dline_refit wp    --fit-dir $F --out-dir $O --model $m
-    python3 -m scripts.dline_refit final --fit-dir $F --out-dir $O --model $m --no-holdout
-  done
-done
-# (the v1-λ variant: the same loop with --lambda-method v1 on wp, into fit/$N-v1lambda)
-```
+one model's trainset from replacing another's). The exact commands - the L3 dataset builds,
+the per-model run roots (14b's run2 is `run2b`, 7b's P1 is `p1r2`), the fit / refit layout
+`fit/<N>/<model>/fit`, `fit/<N>/refit`, `fit/<N>/refit-v1lambda` (`N` = `gateway` | `l3`) -
+are the stage script in RUN §E (`tre/deploy/RUN-calib-theta-20261003.md`); both numerators
+run from this branch's worktree.
 
 Report per model and numerator: θ, CI half width (D13), training BA, B′ on the training
 set (dwell 1 gate, dwell 2 disclosed), and the L3 void counts. The run names (`run1=`,
 `run2=` ...) are required: two `dataset_l3` directories would otherwise get the same name.
 
 After the owner picks the numerator, §F freezes from that numerator's `--fit-dir` template
-(`$CALIB_ROOT/fit/<N>/{model}/fit`, `--out-dir $CALIB_ROOT/fit/<N>/refit`). With L3, §G's M
+(`$CALIB_ROOT/fit/<N>/{model}/fit`, `--out-dir $CALIB_ROOT/fit/<N>/refit` or `refit-v1lambda`). With L3, §G's M
 and T14 datasets are rebuilt with `--numerator vllm_counter` before §H, and `accept` /
 `calibration_decision` are pointed at `dataset_l3`; accept refuses the default ones.
 
