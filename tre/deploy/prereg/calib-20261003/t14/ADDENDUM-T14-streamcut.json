@@ -1,0 +1,33 @@
+{
+ "what": "Addendum to the T14 preregistration of the 2026-10-03 round: the model-error void limit and the route-timeout stream-cut rule. Registered before any T14 data exists (user decision 2026-10-04).",
+ "written_at_utc": "2026-10-04T11:49:19.018819+00:00",
+ "amends": {
+  "path": "/data/nfs_shared_data/xxy/calib_20261003/t14/preregistration.json",
+  "sha256": "59608505fc055bc2d36cbb64aadb8038112f32c4eb0cae20aed42fbccb1daf30",
+  "note": "adds rules only; changes no bound key of the preregistration (design, seeds, cells, prior, parameter sets)"
+ },
+ "parameter_set": {
+  "path": "/data/nfs_shared_data/xxy/calib_20261003/freeze/params_freeze.json",
+  "sha256": "eb2d59e10a84bb3563e7872cb5252b1142855f662b0549c9172efeafe322e531",
+  "freeze_sha256": "ca7fe45235da713c4faf8d8b8d766343dd96405439eeb3fa185cc80bac5a1f60"
+ },
+ "sibling_addendum": {
+  "path": "/data/nfs_shared_data/xxy/calib_20261003/prereg/ADDENDUM-T14-crossshape.json",
+  "sha256": "2848c70527fcc203ab2922face2054ba0145a546985a7fc536b3a84037c4fcb7"
+ },
+ "why": "In this round the tre-v2 HTTPRoute total timeout (150 s: HTTPRoute timeouts.request + EnvoyPatchPolicy tre-route-timeouts) cut streams mid-decode under overload; the client sees RemoteProtocolError with e2e about 151 s and records it as model_error. 7b P1 at 3 x rho* voided twice on it (5.23 % / 5.18 % > 5 %; ATTEMPTS 2026-10-04T13:58) and was rerun as p1r2 with the same treatment as here.",
+ "runtime_limit": {
+  "max_model_error_rate": 0.1,
+  "default_was": 0.05,
+  "how": "calibration_campaign --max-model-error-rate 0.10 (passed to every r3_grid cell; openloop.check_cell voids a cell when model_errors / sent > the limit). T14 is launched by hand as `run_T14.sh dsqwen-14b -- --max-model-error-rate 0.10`, every other input as RUN plan G4 / chain/run_G.sh.",
+  "unchanged": "every other guard (shed void, proxy transient budget, 50 ms lateness p99, reissue contamination, drain gate, void re-drive once then stop)"
+ },
+ "audit_rule": {
+  "cut": "a request with outcome model_error and e2e_ms >= 150000 (the route timeout) is a route-timeout cut: censored, not a model_error",
+  "same_as": "the p1r2 audit rule (ATTEMPTS 2026-10-04T13:58)",
+  "rule": "every model_error in an accepted T14 cell must be a route-timeout cut; any other model_error is a real engine error, reported per cell and judged against the original 0.05 limit (a cell above it is void at audit)",
+  "label": "the SLO label is unchanged: a cut request did not complete within the route timeout and stays an unserved request (violated window), as in training and M; the rule only changes the void audit and the error accounting",
+  "report": "per cell: model_error count, cuts, non-cut errors, cut share of sent"
+ },
+ "does_not_change_acceptance": "the T14 evaluation (A, B' at dwell 1) and RUN plan H are unchanged"
+}
