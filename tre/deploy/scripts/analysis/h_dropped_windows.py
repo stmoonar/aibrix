@@ -216,13 +216,15 @@ def _add(c: dict, f: RowFate) -> None:
             c["invalid_cell_zero_token_with_backlog_or_failure"] += f.backlog or f.failure
 
 
-def audit_csv(path: Path, entry: Mapping[str, Any], *, model: str, sealed_to_h2: bool) -> dict:
+def audit_csv(path: Path, entry: Mapping[str, Any], *, model: str, sealed_to_h2: bool,
+              read_holdout: bool = False) -> dict:
     """Counts for one windows CSV (rows of ``model`` only), per set and in total, plus the
-    cells holding zero-token windows with evidence."""
+    cells holding zero-token windows with evidence. ``read_holdout`` True only for a CSV that
+    IS the evaluated set (the T14 scorer's validation CSV, after its seal checks)."""
     spec, label, _trim = frozen_spec_and_label(entry)
     all_rows = read_rows(path)
     signals = row_signals(all_rows, spec)
-    fates = classify_rows(all_rows, signals, label)
+    fates = classify_rows(all_rows, signals, label, read_holdout=read_holdout)
     by_set: dict[str, dict] = defaultdict(_blank)
     total = _blank()
     cells: dict[tuple, Counter] = defaultdict(Counter)

@@ -45,6 +45,57 @@ Addendum ``prereg/ADDENDUM-T14-crossshape.json`` (sha256 2848c705...), reported,
         BA <= the median per-shape BA CI95 half width; stated separately for interpolation
         and extrapolation"
 
+Prereg ``t14.void_rule`` - quoted:
+
+    "a void cell is re-driven once; a second void stops the run; a stopped run is never
+     evaluated - re-run all 24 cells into a new root"
+
+(the stream-cut addendum's ``runtime_limit.unchanged`` names the same guard: "void re-drive
+once then stop"; the campaign machinery it refers to, ``calibration_ladder.drive_cell`` /
+``adaptive_boundary.next_void_attempt``, counts the second void PER CELL).
+
+Decisions (design discussion 2026-10-04; each is a rule below and a line of the H addendum):
+
+D1 cross-shape SD: the claim uses the SAMPLE standard deviation (n - 1) of the per-shape BA;
+   the population SD is reported for disclosure only.
+D2 single-class shape: a shape whose windows are all one class has no BA and no AUROC
+   (``undefined``); the claim of its kind is then ``not_evaluable`` - the shape is NOT
+   dropped to claim on the rest; the SD over the remaining shapes is disclosure only. The
+   pooled A is computed on all windows as usual.
+D3 void at audit: the prereg's void_rule, mechanically. A cell void at audit whose evaluated
+   attempt is its first (attempt 1) -> ``void_redrive_required:<cell ids>`` (re-drive it once,
+   then evaluate); a cell void at audit whose evaluated attempt is already a re-drive
+   (attempt >= 2: its second void) -> ``run_void`` (the run is stopped, never evaluated;
+   re-run all 24 into a new root). In both cases there is no verdict; every metric is still
+   written under ``disclosure_not_an_evaluation``. CONFLICT FLAGGED (not implemented): the
+   discussion's "two or more void cells -> run_void" is not the prereg's per-cell reading;
+   it is reported as ``status_if_two_void_cells_stop_the_run`` for the owner, nothing more.
+D4 a model_error without ``e2e_ms`` is non-cut.
+D5 A's training BA is the freeze's pooled ``train_ba_at_published`` (as accept).
+
+Further rules (also in the H addendum):
+
+* audit scope: only the evaluated (valid) attempt of each manifest cell - a voided earlier
+  attempt is excluded; every request of that attempt counts, warm-up INCLUDED. The prereg
+  does not name warm-up; the stream-cut addendum judges "every model_error in an accepted
+  T14 cell" and its runtime limit is ``openloop.check_cell``'s ``model_errors / sent`` over
+  the whole cell, so the audit uses the same whole-cell denominator.
+* zero-token windows: the dropped-window counts of the T14 validation CSV
+  (:mod:`scripts.analysis.h_dropped_windows`) and the conservative variant (dropped windows
+  with backlog / failure evidence counted as non-CRITICAL misses) - disclosure, as at H.
+* per-shape AUROC follows D2.
+* Fig 2.1 KV usage: the scorer does not draw Fig 2.1; it discloses, per cell, the share of
+  missing 1 Hz samples of the instant sidecar (``<cell>.instant.jsonl``, the
+  ``kv_cache_usage`` source the cross-shape addendum names; it falls behind under overload)
+  over the whole cell and after the warm-up, plus the largest gap.
+* B' unit: ``recall_severe`` (``b_prime.series_point``) is a rate over WINDOWS (severe
+  violating windows that are CRITICAL at dwell 1 / severe violating windows), not over
+  episodes; its CI resamples cells.
+* scorer identity: the output records this file's path and sha256 and the commit
+  (``dline_refit.code_state``); the rule is "dry run on the frozen / training set first": a
+  real run refuses unless ``--dry-run-result`` is a dry-run output of the same commit and
+  the same scorer sha256, with a clean tree.
+
 How it is implemented (every number through the accept code path):
 
 * inputs checked first, every problem listed, nothing written on a refusal: the prereg and
@@ -59,23 +110,16 @@ How it is implemented (every number through the accept code path):
   (warm-up rows ``in_warmup`` dropped by the loader);
 * A, B' (dwell 1, the freeze's sealed cut and gate), old B / C / D and the ranking
   disclosure: ``dline_refit.evaluate_model`` with ``b_prime_inputs`` - the accept function.
-  Verdict = A passed and B' passed (D is not part of the T14 rule);
-* per shape and per kind (interpolation / extrapolation): BA at the published theta with
-  ``dline_refit.acceptance_bootstrap`` (1000, seed 20260922) and AUROC with
-  ``tre_calibration.ranking.ranking_disclosure`` (same resamples); the cross-shape claim per
-  kind with the SAMPLE standard deviation (n - 1) - the population SD is reported next to it
-  (the addendum does not say which; see ``ambiguities`` in the output);
-* censoring audit from the T14 dataset's ``requests.csv`` (every request of the cell's
-  attempt, warm-up included - the runtime guard counts the same): model_error with
-  ``e2e_ms >= 150000`` = cut; any other model_error (an ``e2e_ms`` missing included) = non-cut;
-  a cell whose non-cut errors / sent > 0.05 is ``void_at_audit``. With such a cell the
-  verdict is ``undetermined_audit_void`` (the prereg does not say whether the run is then
-  evaluated without the cell or re-run; owner decision);
-* also disclosed (draft H addendum, not preregistered): the conservative variant of
-  :mod:`scripts.analysis.h_conservative_score` on the same validation CSV.
+  Verdict (only with status ``evaluated``) = A passed and B' passed (D is not in the T14 rule);
+* per shape and per kind: BA at the published theta with ``dline_refit.acceptance_bootstrap``
+  (1000, seed 20260922) and AUROC with ``tre_calibration.ranking.ranking_disclosure``;
+  the cross-shape claim per kind by D1 / D2;
+* censoring audit from the T14 dataset's ``requests.csv``: model_error with
+  ``e2e_ms >= 150000`` = cut, any other model_error = non-cut (D4); non-cut / sent > 0.05 =
+  void at audit -> D3.
 
-Not implemented (disclosure only in the cross-shape addendum): Fig 2.1 (needs the 1 Hz KV
-sidecar), the lambda disclosure.
+Not implemented (disclosure only in the cross-shape addendum): the Fig 2.1 drawing and the
+lambda disclosure.
 
 Runs once: ``--out`` and ``<out>.d/`` must not exist; both are made read-only.
 
@@ -83,7 +127,8 @@ Runs once: ``--out`` and ``<out>.d/`` must not exist; both are made read-only.
       python3 -m scripts.analysis.t14_score --prereg $C/t14/preregistration.json \\
         --addendum $C/prereg/ADDENDUM-T14-streamcut.json --addendum $C/prereg/ADDENDUM-T14-crossshape.json \\
         --freeze-file $C/freeze/params_freeze.json --t14-manifest $C/T14/dsqwen-14b/T14_manifest.json \\
-        --dataset $C/T14/dsqwen-14b/dataset --out $C/eval/T14_score.json
+        --dataset $C/T14/dsqwen-14b/dataset --dry-run-result <dry-run output of this commit> \\
+        --out $C/eval/T14_score.json
 
 ``--dry-run-dataset DIR`` replaces the manifest and the T14 dataset with a TRAINING dataset
 (its training-set hold cells, fake interpolation / extrapolation kinds by shape) to prove
@@ -117,20 +162,29 @@ KINDS = ("interpolation", "extrapolation")
 DRY_RUN_KINDS = {"S1": "interpolation", "S2": "interpolation", "S3": "interpolation", "S4": "interpolation",
                  "S5": "extrapolation", "T8": "extrapolation", "T9": "extrapolation"}
 
-AMBIGUITIES = [
-    "cross-shape claim rule: 'the SD of the per-shape BA' does not say sample (n-1) or population (n); "
-    "this draft uses the sample SD and reports both (with 4 shapes they differ by x1.155)",
-    "cross-shape claim rule: a shape whose windows hold one class only has no BA; this draft leaves it out "
-    "of the SD and the median and reports it (the addendum is silent)",
-    "stream-cut audit: what happens to the evaluation when a cell is void at audit (non-cut model errors "
-    "> 0.05) is not stated (drop the cell, or re-run all 24 as the void_rule does for a stopped run); this "
-    "draft then reports the metrics but no verdict ('undetermined_audit_void')",
-    "stream-cut audit: a model_error without e2e_ms is counted as non-cut (cannot be shown to be a cut)",
-    "A's 'max_drop_from_training_ba': the training BA is the freeze's train_ba_at_published (all training "
-    "shapes pooled), as accept uses it",
-    "per-kind pooled BA / AUROC are reported in addition to the per-shape tables (the prereg asks only for "
-    "per-shape BA split by kind)",
-]
+DECISIONS = {
+    "D1_cross_shape_sd": "the claim uses the sample SD (n-1) of the per-shape BA; the population SD is disclosure only",
+    "D2_single_class_shape": "a single-class shape has no BA and no AUROC; its kind's claim is not_evaluable (the "
+                             "shape is not dropped); the SD over the remaining shapes is disclosure only; pooled A "
+                             "unaffected",
+    "D3_void_at_audit": "prereg void_rule per cell: void at audit on attempt 1 -> void_redrive_required:<cells> "
+                        "(re-drive once, then evaluate); on a re-driven attempt (>= 2, its second void) -> run_void "
+                        "(re-run all 24); no verdict in either case, metrics only as disclosure",
+    "D3_conflict_flagged": "'two or more void cells -> run_void' (design discussion) is not the prereg's per-cell "
+                           "reading of 'a second void stops the run'; reported as "
+                           "status_if_two_void_cells_stop_the_run, owner decides",
+    "D4_model_error_without_e2e": "non-cut",
+    "D5_training_ba": "the freeze's pooled train_ba_at_published",
+    "audit_scope": "the evaluated (valid) attempt only, voided earlier attempts excluded; warm-up included "
+                   "(whole-cell denominator of openloop.check_cell, which the stream-cut addendum names)",
+    "b_prime_unit": "recall_severe at dwell 1 is per window (b_prime.series_point), not per episode",
+    "kv_source": "1 Hz instant sidecar <cell>.instant.jsonl (kv_cache_usage); missing-sample share per cell disclosed",
+    "scorer_identity": "path, sha256 and commit recorded; dry run on the frozen/training set first (enforced)",
+}
+STATUS_EVALUATED = "evaluated"
+STATUS_REDRIVE = "void_redrive_required"
+STATUS_RUN_VOID = "run_void"
+CLAIM_NOT_EVALUABLE = "not_evaluable"
 
 
 class Refused(RuntimeError):
@@ -285,14 +339,22 @@ def manifest_rows(inp: Mapping[str, Any], manifest_path: Path, dataset_dir: Path
         problems.append(f"{dataset_dir} lies under a forbidden root of the prereg")
     if problems:
         raise Refused(problems)
-    cells = {(str(c["cell_id"]), int(c["attempt"])): {"shape": c["shape"], "kind": c["kind"]} for c in man["cells"]}
+    cells = {}
+    for c in man["cells"]:
+        raw = [str(f) for f in c.get("raw_files") or []]
+        cells[(str(c["cell_id"]), int(c["attempt"]))] = {
+            "shape": c["shape"], "kind": c["kind"], "warmup_s": c.get("warmup_s"),
+            "instant": next((f for f in raw if f.endswith(".instant.jsonl")), None),
+            "guard": next((f for f in raw if f.endswith(".guard.json")), None)}
     return man, cells, Path(dataset_dir)
 
 
 def censoring_audit(requests_csv: Path, cells: Mapping[tuple, Mapping[str, Any]]) -> dict:
-    """The stream-cut audit per cell (every request of the cell's listed attempt)."""
-    per: dict[tuple, dict] = {k: {"sent": 0, "model_error": 0, "cut": 0, "non_cut": 0, "non_cut_no_e2e": 0}
-                              for k in cells}
+    """The stream-cut audit per cell: every request of the cell's EVALUATED attempt (the
+    manifest's; voided earlier attempts are other keys and are not read), warm-up included
+    (the whole-cell ``model_errors / sent`` of ``openloop.check_cell``)."""
+    per: dict[tuple, dict] = {k: {"sent": 0, "sent_in_warmup": 0, "model_error": 0, "cut": 0, "non_cut": 0,
+                                  "non_cut_no_e2e": 0} for k in cells}
     with open(requests_csv, newline="", encoding="utf-8") as fh:
         for r in csv.DictReader(fh):
             try:
@@ -303,6 +365,7 @@ def censoring_audit(requests_csv: Path, cells: Mapping[tuple, Mapping[str, Any]]
             if c is None:
                 continue
             c["sent"] += 1
+            c["sent_in_warmup"] += str(r.get("in_warmup") or "").strip().lower() in ("1", "true", "yes")
             if (r.get("outcome") or "").strip() != OUTCOME_MODEL_ERROR:
                 continue
             c["model_error"] += 1
@@ -326,16 +389,92 @@ def censoring_audit(requests_csv: Path, cells: Mapping[tuple, Mapping[str, Any]]
                     "void_at_audit": bool(sent == 0 or (rate is not None and rate > NON_CUT_ERROR_LIMIT)),
                     "runtime_limit_exceeded": bool(sent and c["model_error"] / sent > RUNTIME_MODEL_ERROR_LIMIT)})
     return {"rule": {"cut": f"outcome {OUTCOME_MODEL_ERROR} and e2e_ms >= {ROUTE_TIMEOUT_CUT_MS:.0f}",
+                     "non_cut": "any other model_error, e2e_ms missing included (D4)",
                      "non_cut_limit": NON_CUT_ERROR_LIMIT, "runtime_limit": RUNTIME_MODEL_ERROR_LIMIT,
-                     "denominator": "every request of the cell attempt in requests.csv (warm-up included)"},
+                     "scope": "the evaluated (valid) attempt only; voided earlier attempts excluded",
+                     "denominator": "every request of that attempt in requests.csv, warm-up included"},
             "requests_csv": str(requests_csv), "cells": out,
             "void_at_audit": [c["cell_id"] for c in out if c["void_at_audit"]],
             "totals": {k: sum(c[k] for c in out) for k in ("sent", "model_error", "cut", "non_cut")}}
 
 
+def void_status(audit: Mapping[str, Any]) -> dict:
+    """D3: the prereg's void_rule applied to the cells void at audit, per cell."""
+    void = [c for c in audit["cells"] if c["void_at_audit"]]
+    second = sorted(c["cell_id"] for c in void if int(c["attempt"]) >= 2)
+    first = sorted(c["cell_id"] for c in void if int(c["attempt"]) < 2)
+    if second:
+        status = STATUS_RUN_VOID
+        why = (f"cell(s) {second} void at audit on a re-driven attempt (their second void): the run is stopped "
+               "and never evaluated - re-run all 24 cells into a new root")
+    elif first:
+        status = f"{STATUS_REDRIVE}:{','.join(first)}"
+        why = (f"cell(s) {first} void at audit on attempt 1: re-drive each once, then evaluate (the re-driven "
+               "attempt is scored in place of the void one)")
+    else:
+        status, why = STATUS_EVALUATED, "no cell void at audit"
+    alt = (STATUS_RUN_VOID if len(void) >= 2 else status)
+    return {"status": status, "why": why, "void_rule": VOID_RULE_TEXT,
+            "void_cells_first_attempt": first, "void_cells_second_void": second,
+            "status_if_two_void_cells_stop_the_run": alt,
+            "status_if_two_void_cells_stop_the_run_note": "NOT the implemented rule (conflict flagged, owner decides)"}
+
+
+VOID_RULE_TEXT = ("a void cell is re-driven once; a second void stops the run; a stopped run is never evaluated - "
+                  "re-run all 24 cells into a new root")
+
+
+def kv_missing(cells: Mapping[tuple, Mapping[str, Any]]) -> dict:
+    """Per cell, the share of missing 1 Hz instant-sidecar samples (``kv_cache_usage``),
+    over the cell [guard start_ms, end_ms] and after the warm-up, and the largest gap. A
+    sample counts when it has a finite ``kv_cache_usage``, ``scrape_errors`` 0 and at least
+    one pod scraped. ``cells`` values carry ``instant`` / ``guard`` paths and ``warmup_s``."""
+    out = []
+    for (cid, att), meta in sorted(cells.items()):
+        rec: dict[str, Any] = {"cell_id": cid, "attempt": att, "instant": meta.get("instant")}
+        try:
+            g = json.loads(Path(meta["guard"]).read_text(encoding="utf-8"))
+            start, end = float(g["start_ms"]), float(g["end_ms"])
+            step = float(g.get("instant_sample_ms") or 1000.0)
+            ts = []
+            with open(meta["instant"], encoding="utf-8") as fh:
+                for line in fh:
+                    if not line.strip():
+                        continue
+                    x = json.loads(line)
+                    kv = x.get("kv_cache_usage")
+                    ok = (isinstance(kv, (int, float)) and math.isfinite(kv) and not (x.get("scrape_errors") or 0)
+                          and (x.get("pods_scraped") or 0) >= 1)
+                    if ok and start <= float(x["ts_ms"]) <= end:
+                        ts.append(float(x["ts_ms"]))
+        except (KeyError, OSError, TypeError, ValueError) as exc:
+            rec["error"] = f"{type(exc).__name__}: {exc}"
+            out.append(rec)
+            continue
+        ts.sort()
+        warm = start + 1000.0 * float(meta.get("warmup_s") or 0.0)
+
+        def share(lo: float) -> Optional[float]:
+            expected = int((end - lo) // step) + 1
+            got = sum(1 for t in ts if t >= lo)
+            return max(0.0, 1.0 - got / expected) if expected > 0 else None
+
+        edges = [start, *ts, end]
+        rec.update({"sample_ms": step, "samples": len(ts), "missing_share_cell": share(start),
+                    "missing_share_after_warmup": share(warm),
+                    "max_gap_ms": max(b - a for a, b in zip(edges, edges[1:]))})
+        out.append(rec)
+    shares = [c["missing_share_cell"] for c in out if c.get("missing_share_cell") is not None]
+    return {"source": "1 Hz instant sidecar <cell>.instant.jsonl, kv_cache_usage (the Fig 2.1 KV source); "
+                      "disclosure only", "cells": out,
+            "max_missing_share_cell": max(shares) if shares else None,
+            "cells_unreadable": [c["cell_id"] for c in out if "error" in c]}
+
+
 def _ba_ci_auroc(entry: Mapping[str, Any], windows: Sequence[Any], *, n_resamples: int, seed: int) -> dict:
     """BA at the published theta (+ cell-bootstrap CI95, accept's bootstrap) and AUROC
-    (+ CI95, ``ranking.ranking_disclosure``) of one window subset."""
+    (+ CI95, ``ranking.ranking_disclosure``) of one window subset; both ``undefined`` (None)
+    when the subset holds one class only (D2)."""
     from tre_calibration import ranking
     from tre_calibration.fit import threshold_balanced_accuracy
 
@@ -347,24 +486,54 @@ def _ba_ci_auroc(entry: Mapping[str, Any], windows: Sequence[Any], *, n_resample
     direction = vh["fit_config"]["direction"]
     viol = sum(1 for w in windows if not w.slo_met)
     cells = len({w.scenario_id for w in windows})
-    ba = (threshold_balanced_accuracy(windows, theta=theta, direction=direction)["balanced_accuracy"]
-          if 0 < viol < len(windows) else None)
+    single = not 0 < viol < len(windows)
+    base = {"windows": len(windows), "violating": viol, "cells": cells, "single_class": single}
+    if single:
+        return {**base, "ba": None, "ba_ci95": [None, None], "ba_ci95_half_width": None, "auroc": None,
+                "auroc_ci95": [None, None], "undefined": "one class only: BA and AUROC undefined (D2)"}
+    ba = threshold_balanced_accuracy(windows, theta=theta, direction=direction)["balanced_accuracy"]
     crit = tv.critical_dwell_flags(windows, theta=theta, tau_crit=tau_crit, direction=direction,
                                    dwell_windows=dl.ONLINE_DWELL_WINDOWS)
     boot = dl.acceptance_bootstrap(windows, crit, theta=theta, direction=direction, n_resamples=n_resamples,
                                    seed=seed)
     ci = boot["metrics"]["balanced_accuracy"]["ci95"]
     recs = ranking.records_from_windows(vh["model"], windows, theta=theta, direction=direction)
-    rd = ranking.ranking_disclosure(recs, n_resamples=n_resamples, seed=seed)
-    return {"windows": len(windows), "violating": viol, "cells": cells, "ba": ba, "ba_ci95": ci,
-            "ba_ci95_half_width": ((ci[1] - ci[0]) / 2.0) if None not in ci and ba is not None else None,
+    au = ranking.ranking_disclosure(recs, n_resamples=n_resamples, seed=seed).get("auroc") or {}
+    return {**base, "ba": ba, "ba_ci95": ci,
+            "ba_ci95_half_width": ((ci[1] - ci[0]) / 2.0) if None not in ci else None,
             "ba_resamples_used": boot["metrics"]["balanced_accuracy"]["resamples_used"],
-            "auroc": (rd.get("auroc") or {}), "single_class": ba is None}
+            "auroc": au.get("value"), "auroc_ci95": au.get("ci95"), "auroc_resamples_used": au.get("resamples_used")}
+
+
+def claim(table: Mapping[str, Mapping[str, Any]]) -> dict:
+    """The cross-shape claim of one kind (D1, D2)."""
+    single = sorted(s for s, t in table.items() if t["single_class"])
+    bas = [t["ba"] for s, t in sorted(table.items()) if not t["single_class"]]
+    halves = [t["ba_ci95_half_width"] for s, t in sorted(table.items())
+              if not t["single_class"] and t["ba_ci95_half_width"] is not None]
+    sd_s = statistics.stdev(bas) if len(bas) >= 2 else None
+    sd_p = statistics.pstdev(bas) if bas else None
+    med = statistics.median(halves) if halves else None
+    out = {"rule": "'one theta transfers across shapes' iff the SD (sample, n-1) of the per-shape BA <= the "
+                   "median per-shape BA CI95 half width",
+           "shapes": len(table), "single_class_shapes": single,
+           "role": "claim rule for the text; not an acceptance gate"}
+    if not table or single or sd_s is None or med is None or len(halves) != len(table):
+        out.update({"one_theta_transfers": CLAIM_NOT_EVALUABLE,
+                    "why": ("single-class shape(s) " + str(single) + ": BA undefined, the shape is not dropped (D2)"
+                            if single else "fewer than 2 shapes with a BA and a CI"),
+                    "disclosure_only_over_remaining_shapes": {"sd_sample": sd_s, "sd_population": sd_p,
+                                                              "median_ci95_half_width": med,
+                                                              "shapes": len(bas)}})
+    else:
+        out.update({"one_theta_transfers": sd_s <= med, "sd_sample": sd_s, "median_ci95_half_width": med,
+                    "disclosure_population_sd": {"sd_population": sd_p, "would_claim": sd_p <= med}})
+    return out
 
 
 def cross_shape(entry: Mapping[str, Any], windows: Sequence[Any], shape_of: Mapping[str, str],
                 kind_of: Mapping[str, str], *, n_resamples: int, seed: int) -> dict:
-    """Per-shape tables split by kind, per-kind pooled numbers, and the claim rule per kind."""
+    """Per-shape tables split by kind, per-kind pooled numbers (disclosure), the claim per kind."""
     by_shape: dict[str, list] = defaultdict(list)
     for w in windows:
         by_shape[shape_of[w.scenario_id]].append(w)
@@ -372,24 +541,11 @@ def cross_shape(entry: Mapping[str, Any], windows: Sequence[Any], shape_of: Mapp
     for kind in KINDS:
         shapes = sorted(s for s in by_shape if kind_of[s] == kind)
         table = {s: _ba_ci_auroc(entry, by_shape[s], n_resamples=n_resamples, seed=seed) for s in shapes}
-        bas = [t["ba"] for t in table.values() if t["ba"] is not None]
-        halves = [t["ba_ci95_half_width"] for t in table.values() if t["ba_ci95_half_width"] is not None]
-        sd_s = statistics.stdev(bas) if len(bas) >= 2 else None
-        sd_p = statistics.pstdev(bas) if len(bas) >= 1 else None
-        med = statistics.median(halves) if halves else None
         pooled = [w for s in shapes for w in by_shape[s]]
-        out[kind] = {
-            "per_shape": table,
-            "pooled": _ba_ci_auroc(entry, pooled, n_resamples=n_resamples, seed=seed) if pooled else None,
-            "claim": {
-                "rule": "SD of the per-shape BA <= the median per-shape BA CI95 half width",
-                "shapes_with_ba": len(bas), "shapes_single_class": [s for s, t in table.items() if t["ba"] is None],
-                "sd_sample": sd_s, "sd_population": sd_p, "median_ci95_half_width": med,
-                "one_theta_transfers": (sd_s <= med) if sd_s is not None and med is not None else None,
-                "one_theta_transfers_population_sd": (sd_p <= med) if sd_p is not None and med is not None else None,
-                "role": "claim rule for the text; not an acceptance gate",
-            },
-        }
+        out[kind] = {"per_shape": table,
+                     "pooled_disclosure": (_ba_ci_auroc(entry, pooled, n_resamples=n_resamples, seed=seed)
+                                           if pooled else None),
+                     "claim": claim(table)}
     return out
 
 
@@ -402,7 +558,8 @@ def _write_csv(path: Path, header: Sequence[str], rows: Sequence[Mapping[str, st
 
 
 def dry_run_rows(dataset_dir: Path, model: str) -> tuple[list[str], list[dict], dict]:
-    """A TRAINING dataset's training-set rows of ``model`` (dry run only)."""
+    """A TRAINING dataset's training-set rows of ``model`` (dry run only), and its cells with
+    their raw sidecar paths (``cells.csv`` raw_path / guard_path under the manifest's run_root)."""
     from scripts import dline_refit as dl
 
     with open(dataset_dir / "windows.csv", newline="", encoding="utf-8") as fh:
@@ -412,8 +569,19 @@ def dry_run_rows(dataset_dir: Path, model: str) -> tuple[list[str], list[dict], 
                 and (r.get("split") or "") != "holdout"
                 and dl.assign_set(r, sealed_to_h2=True, sentinels=True) == dl.SET_TRAINING
                 and r.get("shape") in DRY_RUN_KINDS]
-    cells = {(r["cell_id"], int(float(r["attempt"] or 1))): {"shape": r["shape"], "kind": DRY_RUN_KINDS[r["shape"]]}
-             for r in rows}
+    root = Path(json.loads((dataset_dir / "manifest.json").read_text(encoding="utf-8")).get("run_root") or dataset_dir.parent)
+    meta: dict[tuple, dict] = {}
+    with open(dataset_dir / "cells.csv", newline="", encoding="utf-8") as fh:
+        for c in csv.DictReader(fh):
+            raw = c.get("raw_path") or ""
+            meta[(c["cell_id"], int(float(c["attempt"] or 1)))] = {
+                "warmup_s": c.get("warmup_s"),
+                "instant": str(root / (raw[:-len(".jsonl")] + ".instant.jsonl")) if raw.endswith(".jsonl") else None,
+                "guard": str(root / c["guard_path"]) if c.get("guard_path") else None}
+    cells = {}
+    for r in rows:
+        key = (r["cell_id"], int(float(r["attempt"] or 1)))
+        cells[key] = {"shape": r["shape"], "kind": DRY_RUN_KINDS[r["shape"]], **meta.get(key, {})}
     return header, rows, cells
 
 
@@ -440,28 +608,63 @@ def evaluate(inp: Mapping[str, Any], csv_path: Path, cells: Mapping[tuple, Mappi
             sid = (r.get("scenario_id") or "unknown").strip() or "unknown"
             meta = cells[(r["cell_id"], int(float(r["attempt"] or 1)))]
             shape_of[sid], kind_of[meta["shape"]] = meta["shape"], meta["kind"]
-    audit = censoring_audit(requests_csv, cells)
+    audit = censoring_audit(requests_csv, {k: {"shape": v["shape"], "kind": v["kind"]} for k, v in cells.items()})
+    vs = void_status(audit)
     if dry_run:
-        verdict = "dry_run_no_verdict"
-    elif audit["void_at_audit"]:
-        verdict = "undetermined_audit_void"
+        status, verdict = "dry_run", None
+    elif vs["status"] != STATUS_EVALUATED:
+        status, verdict = vs["status"], None
     else:
-        verdict = "pass" if a_ok and bp_ok else "fail"
-    return {
-        "verdict": verdict,
-        "verdict_rule": "pass iff A (BA >= .80, CI95 low >= .75, drop from training <= .08) and B' (dwell 1) all "
-                        "met; fail = reported as is",
+        status, verdict = STATUS_EVALUATED, ("pass" if a_ok and bp_ok else "fail")
+    dropped = hd.audit_csv(csv_path, entry, model=model, sealed_to_h2=False, read_holdout=True)
+    metrics = {
         "A": crit["A"], "B_prime": crit["B_prime"],
+        "B_prime_unit": "recall_severe = severe violating WINDOWS CRITICAL at dwell 1 / severe violating windows "
+                        "(b_prime.series_point; per window, not per episode); CI resamples cells",
         "disclosed": {"B_old": crit["B"], "C": crit["C"], "D": crit["D"],
                       "ranking_disclosure": ev["ranking_disclosure"], "holdout_report": ev["holdout_report"]},
         "b_prime_config": bp_summary,
-        "M_like_counts": ev["M"],
+        "counts": ev["M"],
         "cross_shape": cross_shape(entry, windows, shape_of, kind_of, n_resamples=n_resamples, seed=PREREG_SEED),
-        "censoring_audit": audit,
+        "zero_token_dropped_windows": {"what": "disclosure (same as H)", "total": dropped["total"]},
         "conservative_disclosure": hcs.score_model(entry, csv_path, b_prime_cfg=cfgs[model],
                                                    n_resamples=n_resamples, seed=PREREG_SEED,
                                                    check_accept_path=False),
+        "kv_missing_samples": kv_missing(cells),
     }
+    out = {"status": status, "verdict": verdict,
+           "verdict_rule": "only with status 'evaluated': pass iff A (BA >= .80, CI95 low >= .75, drop from "
+                           "training <= .08) and B' (dwell 1) all met; fail = reported as is",
+           "void_status": vs, "censoring_audit": audit}
+    if status == STATUS_EVALUATED:
+        out["evaluation"] = metrics
+    else:
+        out["disclosure_not_an_evaluation"] = {
+            "note": ("DRY RUN on training data" if dry_run else
+                     f"status {status}: no verdict; every metric below is disclosure, not an evaluation"),
+            **metrics}
+    return out
+
+
+def check_dry_run_record(path: Optional[Path], scorer_sha: str, code: Mapping[str, Any]) -> list[str]:
+    """'dry run on the frozen / training set first': a real run needs a dry-run output of
+    this commit and this scorer file, from a clean tree."""
+    if path is None:
+        return ["--dry-run-result is required for a real run (dry run on the frozen / training set first)"]
+    try:
+        d = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return [f"--dry-run-result {path}: unreadable ({exc})"]
+    problems = []
+    if d.get("dry_run") is not True:
+        problems.append(f"{path}: not a dry-run output")
+    if not code.get("commit") or code.get("dirty") is not False:
+        problems.append(f"code state {code}: a real run needs a known commit and a clean tree")
+    if (d.get("code") or {}).get("commit") != code.get("commit"):
+        problems.append(f"{path}: dry run of commit {(d.get('code') or {}).get('commit')}, not {code.get('commit')}")
+    if (d.get("scorer") or {}).get("sha256") != scorer_sha:
+        problems.append(f"{path}: dry run of another scorer file")
+    return problems
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -475,6 +678,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--dataset", type=Path, default=None, help="the T14 standard dataset directory")
     ap.add_argument("--dry-run-dataset", type=Path, default=None,
                     help="a TRAINING dataset instead of T14 (proves the code runs; no verdict)")
+    ap.add_argument("--dry-run-result", type=Path, default=None,
+                    help="real run: the dry-run output of this commit and scorer (required)")
     ap.add_argument("--resamples", type=int, default=PREREG_RESAMPLES,
                     help="dry run only; a real run refuses anything but the prereg's 1000")
     ap.add_argument("--out", type=Path, required=True, help="result JSON (write once; <out>.d/ holds the CSV)")
@@ -487,6 +692,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     work = Path(f"{args.out}.d")
     if args.out.exists() or work.exists():
         ap.error(f"{args.out} or {work} exists: T14 is scored once")
+    scorer = {"path": str(Path(__file__).resolve()), "sha256": _sha256(Path(__file__).resolve()),
+              "rule": "dry run on the frozen / training set first (a real run refuses without a dry-run output "
+                      "of the same commit and scorer sha256)"}
+    code = dl.code_state()
     try:
         inp = check_inputs(args.prereg, args.addendum, args.freeze_file)
         if dry:
@@ -497,6 +706,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             header, rows, cells = dry_run_rows(ds, inp["model"])
             manifest_info = {"dry_run_dataset": str(ds)}
         else:
+            pr = check_dry_run_record(args.dry_run_result, scorer["sha256"], code)
+            if pr:
+                raise Refused(pr)
             man, cells, ds = manifest_rows(inp, args.t14_manifest, args.dataset)
             src = dl.DatasetSource.parse(f"T14={ds}", sealed_to_h2=False)
             if dl.dataset_numerator(src.directory) != "gateway":
@@ -506,7 +718,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 raise Refused(pr)
             header, rows, ds = m["header"][inp["model"]], m["rows"][inp["model"]], src.directory
             manifest_info = {"path": str(args.t14_manifest), "sha256": _sha256(args.t14_manifest),
-                             "sha256sums_sha256": man["sha256sums_sha256"]}
+                             "sha256sums_sha256": man["sha256sums_sha256"],
+                             "dry_run_result": {"path": str(args.dry_run_result),
+                                                "sha256": _sha256(args.dry_run_result)}}
     except Refused as exc:
         print("t14_score REFUSED - nothing was written:")
         for p in exc.problems:
@@ -518,9 +732,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     os.chmod(csv_path, 0o444)
     result = {
         "what": ("T14 evaluation by the preregistered rule (DRAFT scorer; prereg t14/preregistration.json + "
-                 "ADDENDUM-T14-streamcut + ADDENDUM-T14-crossshape)"),
+                 "ADDENDUM-T14-streamcut + ADDENDUM-T14-crossshape; decisions D1-D5 of 2026-10-04)"),
         "dry_run": dry,
         "dry_run_note": ("DRY RUN on a TRAINING dataset with fake kinds - not T14, no verdict" if dry else None),
+        "scorer": scorer,
+        "code": code,
         "prereg": {"path": str(args.prereg), "sha256": inp["prereg_sha256"]},
         "addenda": {k: {"path": v["path"], "sha256": v["sha256"]} for k, v in inp["addenda"].items()},
         "freeze": {"path": str(args.freeze_file), "sha256": inp["freeze_sha256"],
@@ -529,9 +745,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "manifest": manifest_info,
         "dataset": str(ds),
         "validation_csv": {"path": str(csv_path), "sha256": _sha256(csv_path), "rows": len(rows)},
-        "code": dl.code_state(),
         "bootstrap": {"n_resamples": args.resamples, "seed": PREREG_SEED},
-        "ambiguities": AMBIGUITIES,
+        "decisions": DECISIONS,
         "model": inp["model"],
         **evaluate(inp, csv_path, cells, Path(ds) / "requests.csv", n_resamples=args.resamples, dry_run=dry),
     }
@@ -539,16 +754,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         json.dump(result, fh, indent=1, sort_keys=True, default=str)
         fh.write("\n")
     os.chmod(args.out, 0o444)
-    a, bp = result["A"], result["B_prime"]
-    print(f"[{inp['model']}] {'DRY RUN ' if dry else ''}verdict {result['verdict']}: "
+    body = result.get("evaluation") or result["disclosure_not_an_evaluation"]
+    a, bp = body["A"], body["B_prime"]
+    print(f"[{inp['model']}] status {result['status']} verdict {result['verdict']} "
+          f"(void status {result['void_status']['status']}): "
           f"A {'pass' if a['passed'] else 'FAIL'} (BA {a['criteria'][0]['value']}, CI low {a['criteria'][1]['value']}); "
           f"B' {'pass' if bp['passed'] else 'FAIL'} ({[(c['name'], c['value']) for c in bp.get('criteria', [])]})")
-    for kind, block in result["cross_shape"].items():
+    for kind, block in body["cross_shape"].items():
         cl = block["claim"]
         print(f"  {kind}: per-shape BA " + ", ".join(f"{s} {t['ba']}" for s, t in block["per_shape"].items())
-              + f"; claim {cl['one_theta_transfers']} (sd {cl['sd_sample']} vs median half {cl['median_ci95_half_width']})")
+              + f"; claim {cl['one_theta_transfers']} (sample sd {cl.get('sd_sample')} vs median half "
+                f"{cl.get('median_ci95_half_width')})")
+    z = body["zero_token_dropped_windows"]["total"]["zero_token"]
+    kv = body["kv_missing_samples"]
     print(f"  censoring audit totals {result['censoring_audit']['totals']}; void at audit "
-          f"{result['censoring_audit']['void_at_audit']}")
+          f"{result['censoring_audit']['void_at_audit']}; zero-token dropped {z['total']} (evidence "
+          f"{z['backlog_or_failure']}); conservative added {body['conservative_disclosure']['added']}; "
+          f"KV max missing share {kv['max_missing_share_cell']} unreadable {len(kv['cells_unreadable'])}")
     print(f"wrote {args.out}")
     return 0
 

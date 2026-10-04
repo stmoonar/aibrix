@@ -402,20 +402,35 @@ python3 -m scripts.analysis.h_conservative_score --freeze-file $C/freeze/params_
 ```
 Its `frozen` variant must equal accept's A / B′ numbers (`accept_path_check` = true).
 
-**H4. T14 score - ONCE** (preregistered rule + both addenda; write-once, refuses if the
-output or `<out>.d/` exists; exit 1 = refused, nothing written).
+**H4. T14 score - ONCE** (preregistered rule + both addenda + decisions D1-D5 of
+2026-10-04; write-once, refuses if the output or `<out>.d/` exists; exit 1 = refused,
+nothing written). First the dry run on the frozen / training set with the same commit (on
+76: the provenance needs git there), then the real run, which refuses without it:
 ```bash
 cd $HP/deploy
 python3 -m scripts.analysis.t14_score --prereg $C/t14/preregistration.json \
   --addendum $C/prereg/ADDENDUM-T14-streamcut.json --addendum $C/prereg/ADDENDUM-T14-crossshape.json \
+  --freeze-file $C/freeze/params_freeze.json --dry-run-dataset $C/run2b/dsqwen-14b/dataset \
+  --out $C/eval/T14_score.dryrun_run2b.json
+python3 -m scripts.analysis.t14_score --prereg $C/t14/preregistration.json \
+  --addendum $C/prereg/ADDENDUM-T14-streamcut.json --addendum $C/prereg/ADDENDUM-T14-crossshape.json \
   --freeze-file $C/freeze/params_freeze.json \
   --t14-manifest $C/T14/dsqwen-14b/T14_manifest.json --dataset $C/T14/dsqwen-14b/dataset \
+  --dry-run-result $C/eval/T14_score.dryrun_run2b.json \
   --out $C/eval/T14_score.json 2>&1 | tee $C/logs/H_t14_score.log
 ```
-Verdict `pass` / `fail` (A and B′ at dwell 1), or `undetermined_audit_void` when a cell has
-non-cut model errors > 0.05 (owner decision; see the scorer's `ambiguities`). Also written:
-per-shape / per-kind BA and AUROC with CIs, the cross-shape claim per kind, the censoring
-audit per cell, and the conservative variant (disclosure).
+`status`:
+- `evaluated`: `verdict` is `pass` / `fail` (A and B′ at dwell 1).
+- `void_redrive_required:<cells>`: a cell is void at audit (non-cut model errors > 0.05) on
+  its first attempt. Prereg void_rule: re-drive that cell once, then score again.
+- `run_void`: a cell void at audit was already a re-drive (its second void). The run is
+  stopped and never evaluated; re-run all 24 into a new root.
+
+In the last two cases the metrics are written under `disclosure_not_an_evaluation`. Also
+written: per-shape / per-kind BA and AUROC with CIs, the cross-shape claim per kind
+(`not_evaluable` if a shape is single-class), the censoring audit per cell, the zero-token
+drop counts, the conservative variant, and the 1 Hz KV missing-sample share per cell (all
+disclosure).
 
 **H5. calibration_decision - disclosure only, never a verdict on the frozen set.** It fits
 its own θ, at its hard-coded λ = 1 (`DLINE_LAMBDA`), compares TRS at the given w_p against

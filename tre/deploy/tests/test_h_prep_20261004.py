@@ -170,3 +170,51 @@ def test_t14_scorer_refuses_a_changed_prereg_and_writes_nothing(tmp_path, capsys
     assert rc == 1 and "REFUSED" in text
     assert "!= its sidecar" in text and "amends" in text and "cross" in text   # every problem listed
     assert not out.exists() and not Path(f"{out}.d").exists()
+
+
+def _win(cell: str, k: int, *, signal: float, ok: bool):
+    from tre_calibration.dataset import CalibrationWindow
+
+    return CalibrationWindow(scenario_id=cell, scenario_family="f", signal=signal, slo_met=ok,
+                             health_score=0.5, window_start_ms=1_790_000_000_000 + 10_000 * k,
+                             latency_ratio_p95=0.5 if ok else 1.5, violation_class=None if ok else "tpot_only")
+
+
+def test_t14_single_class_shape_makes_the_claim_not_evaluable_and_is_never_dropped(tmp_path) -> None:
+    entry, _ = _world(tmp_path)
+    theta = entry["verdict_for_holdout"]["published"]["theta_m"]
+    windows, shape_of = [], {}
+    for shape, cells in (("GA", ("a1", "a2")), ("GC", ("c1", "c2")), ("GB", ("b1", "b2"))):
+        for n, cell in enumerate(cells):
+            shape_of[cell] = shape
+            bad = shape != "GB" and n == 1           # GB: healthy windows only
+            windows += [_win(cell, k, signal=(0.1 if bad else 5.0) * theta, ok=not bad) for k in range(4)]
+    kind_of = {"GA": "interpolation", "GB": "interpolation", "GC": "interpolation"}
+    out = t14.cross_shape(entry, windows, shape_of, kind_of, n_resamples=20, seed=dl.SEED)["interpolation"]
+    gb = out["per_shape"]["GB"]
+    assert gb["single_class"] and gb["ba"] is None and gb["auroc"] is None
+    assert out["per_shape"]["GA"]["ba"] == 1.0 and out["per_shape"]["GA"]["auroc"] == 1.0
+    c = out["claim"]
+    # GA and GC alone would claim (SD 0 <= half width 0): the single-class shape is not dropped
+    assert c["one_theta_transfers"] == t14.CLAIM_NOT_EVALUABLE and c["single_class_shapes"] == ["GB"]
+    assert c["disclosure_only_over_remaining_shapes"]["shapes"] == 2 and "sd_sample" not in c
+    full = t14.claim({s: t for s, t in out["per_shape"].items() if s != "GB"})
+    assert full["one_theta_transfers"] is True                  # the rule itself works on two-class shapes
+    assert out["pooled_disclosure"]["ba"] == 1.0                # pooled numbers keep every window
+
+
+def test_t14_void_at_audit_follows_the_prereg_void_rule_per_cell() -> None:
+    def audit(*cells):
+        return {"cells": [{"cell_id": c, "attempt": a, "void_at_audit": v} for c, a, v in cells]}
+
+    assert t14.void_status(audit(("c1", 1, False), ("c2", 2, False)))["status"] == t14.STATUS_EVALUATED
+    one = t14.void_status(audit(("c1", 1, True), ("c2", 1, False)))
+    assert one["status"] == "void_redrive_required:c1" and one["status_if_two_void_cells_stop_the_run"] == one["status"]
+    # a re-driven attempt void at audit is that cell's second void: the run is stopped
+    assert t14.void_status(audit(("c1", 2, True), ("c2", 1, True)))["status"] == t14.STATUS_RUN_VOID
+    # two cells void on their first attempt: each re-driven once (prereg, per cell); the
+    # "two void cells stop the run" reading is reported, not applied
+    two = t14.void_status(audit(("c1", 1, True), ("c3", 1, True)))
+    assert two["status"] == "void_redrive_required:c1,c3"
+    assert two["status_if_two_void_cells_stop_the_run"] == t14.STATUS_RUN_VOID
+    assert "second void stops the run" in two["void_rule"]
