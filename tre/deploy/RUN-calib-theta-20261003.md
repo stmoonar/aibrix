@@ -160,27 +160,107 @@ being measured, only with idle api servers and Envoy.
   verified; if not, the 300 s drain gate catches it and marks the next cell.
 - HANDOFF before D1 and before D3 (both are long; the KV cache expires).
 
-## E. Dataset and offline fits (~1 h, CPU only)
+## E. Dataset and offline fits (~0.5-1 h, CPU only)
 
-1. Training set and the four variants (λ: v2 rule / v1-λ; numerator: D2 gateway tokens /
-   L3 vLLM counter deltas):
+**Accepted attempts (ATTEMPTS.md; every later stage reads these, per model):**
+
+| model | run1 | run2 | supp | P1 |
+|---|---|---|---|---|
+| dsqwen-7b | `run1/dsqwen-7b` | `run2/dsqwen-7b` | `supp/dsqwen-7b` | **`p1r2/dsqwen-7b`** |
+| dsllama-8b | `run1/dsllama-8b` | `run2/dsllama-8b` | `supp/dsllama-8b` | `p1/dsllama-8b` |
+| dsqwen-14b | `run1/dsqwen-14b` | **`run2b/dsqwen-14b`** | `supp/dsqwen-14b` | `p1/dsqwen-14b` |
+
+Never read `run2/dsqwen-14b` (node10 EMFILE voids, 10-03 23:31), `p1/dsqwen-7b` (route
+timeout voids, 10-04 13:58), or the merged `run2/dataset` / `p1/dataset` (they contain
+those void attempts). A tool that takes one run root for all models (`--base-run`, a
+merged dataset) is run once per model with that model's root.
+
+Code: worktree `aibrix-wt/calib-l3-20261003` (branch `feat/calib-l3-20261003` = this
+branch + the L3 numerator, design `tre/docs/design/20261003-calib-l3-numerator.md`). Both
+numerators run from that one commit, so the two fits differ only in the numerator. Its
+`registry.yaml` is this branch's (c/b of §C; sha256 `90d8ba14…`), passed explicitly.
+
+Layout: `fit/<N>/<model>/fit` (training set; one per numerator and model, since
+`trainset` rewrites `trainset.json` and the freeze checks its sha256),
+`fit/<N>/refit` (v2 λ rule) and `fit/<N>/refit-v1lambda` (v1-λ; `alpha.json` copied
+from `refit`, as on 09-24: τ is published at 10 s by D18 whatever λ is), `N` = `gateway`
+| `l3`. Gateway = the existing `dataset/`; L3 = `dataset_l3/` built in E1.
+
+1. Write the stage script into the result directory and run it detached:
    ```bash
-   F=$CALIB_ROOT/fit
-   python3 -m scripts.dline_refit trainset --fit-dir $F --model $m \
-       --h2-dataset run1=$CALIB_ROOT/run1/$m/dataset --h2-dataset run2=$CALIB_ROOT/run2/$m/dataset \
-       --dataset supp=$CALIB_ROOT/supp/$m/dataset --dataset p1=$CALIB_ROOT/p1/$m/dataset
-   python3 -m scripts.dline_refit alpha --fit-dir $F --model $m --publish-tau-s 10
-   python3 -m scripts.dline_refit wp    --fit-dir $F --model $m                     # λ = v2 rule
-   python3 -m scripts.dline_refit wp    --fit-dir $F/v1lambda --model $m --lambda-method v1
-   python3 -m scripts.dline_refit final --fit-dir $F --model $m --no-holdout
+   mkdir -p $CALIB_ROOT/fit/logs
+   cat > $CALIB_ROOT/fit/run_E.sh <<'EOF'
+   #!/bin/bash
+   # RUN §E: L3 datasets + gateway / L3 fits (v2 λ and v1-λ), 3 models. CPU only, M never read.
+   set -u
+   REPO=/data/nfs_shared_data/xxy/aibrix
+   L3WT=$REPO-wt/calib-l3-20261003/tre
+   C=/data/nfs_shared_data/xxy/calib_20261003
+   FIT=$C/fit
+   REG=$L3WT/deploy/registry.yaml
+   MODELS="${MODELS:-dsqwen-7b dsllama-8b dsqwen-14b}"
+   declare -A RUN2=([dsqwen-7b]=run2 [dsllama-8b]=run2 [dsqwen-14b]=run2b)
+   declare -A P1=([dsqwen-7b]=p1r2 [dsllama-8b]=p1 [dsqwen-14b]=p1)
+   cd $L3WT/deploy
+   export PYTHONPATH=../common:.:../controller:../service-manager:../calibration:../replayer:../ui
+   export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 PYTHONDONTWRITEBYTECODE=1
+   PY="nice -n 19 python3"
+   { git -C $L3WT rev-parse HEAD; git -C $L3WT status --short; sha256sum $REG; } > $FIT/code_commit.txt
+   # E1. L3 datasets next to the default ones (dataset_l3/; dataset/ is never touched)
+   for m in $MODELS; do
+     for s in run1 ${RUN2[$m]} supp ${P1[$m]}; do
+       $PY -m scripts.calibration_dataset $C/$s/$m --numerator vllm_counter --label-registry $REG \
+         > $FIT/logs/dataset_l3.$s.$m.log 2>&1 || { echo "E1 FAILED $s $m"; exit 1; }
+       python3 -c 'import json,sys; d=json.load(open(sys.argv[1]))["numerator"]; print(sys.argv[1], d["windows_labelled"], d["windows_kept"], d["windows_void"], d["attempts_without_metrics"])' \
+         $C/$s/$m/dataset_l3/manifest.json
+     done
+   done
+   # E2. per numerator and model: trainset -> alpha -> wp -> final (v2 λ), then wp -> final (v1-λ)
+   fit_one() {
+     local N=$1 m=$2 D F O O1 c
+     D=$([ $N = l3 ] && echo dataset_l3 || echo dataset)
+     F=$FIT/$N/$m/fit; O=$FIT/$N/refit; O1=$FIT/$N/refit-v1lambda
+     c="--model $m --arm primary --fit-dir $F --registry $REG"
+     date
+     $PY -m scripts.dline_refit trainset --fit-dir $F --model $m \
+         --h2-dataset run1=$C/run1/$m/$D --h2-dataset ${RUN2[$m]}=$C/${RUN2[$m]}/$m/$D \
+         --dataset supp=$C/supp/$m/$D --dataset ${P1[$m]}=$C/${P1[$m]}/$m/$D || return 1
+     $PY -m scripts.dline_refit alpha $c --out-dir $O --publish-tau-s 10 || return 1
+     $PY -m scripts.dline_refit wp    $c --out-dir $O || return 1
+     $PY -m scripts.dline_refit final $c --out-dir $O --no-holdout || return 1
+     mkdir -p $O1/$m/primary && cp $O/$m/primary/alpha.json $O1/$m/primary/alpha.json \
+       && sha256sum $O/$m/primary/alpha.json > $O1/$m/primary/alpha.json.copied_from || return 1
+     $PY -m scripts.dline_refit wp    $c --out-dir $O1 --lambda-method v1 || return 1
+     $PY -m scripts.dline_refit final $c --out-dir $O1 --no-holdout || return 1
+     date
+   }
+   for N in gateway l3; do for m in $MODELS; do
+     ( fit_one $N $m; echo "EXIT $?" ) > $FIT/logs/fit.$N.$m.log 2>&1 &
+   done; done
+   wait
+   for N in gateway l3; do for O in refit refit-v1lambda; do
+     $PY -m scripts.dline_refit summary --model dsqwen-7b --model dsllama-8b --model dsqwen-14b \
+       --fit-dir "$FIT/$N/{model}/fit" --out-dir $FIT/$N/$O --registry $REG > $FIT/logs/summary.$N.$O.log 2>&1
+     echo "summary $N $O EXIT $?"
+   done; done
+   grep -H EXIT $FIT/logs/fit.*.log
+   echo ALLDONE > $FIT/ALLDONE
+   EOF
+   nohup bash $CALIB_ROOT/fit/run_E.sh > $CALIB_ROOT/fit/logs/run_E.log 2>&1 &
+   # poll: tail -3 $CALIB_ROOT/fit/logs/run_E.log; grep -H EXIT $CALIB_ROOT/fit/logs/fit.*.log
    ```
-2. L3 (numerator from `vllm_metrics_1hz/` counter deltas): **not implemented yet**. It is
-   an offline re-windowing of data the capture already keeps (all `vllm:*_total`
-   counters at 1 Hz per pod, running and waiting separately). Write it on a branch during
-   D (no cluster needed), then rerun step 1 with the L3 numerator.
-3. Report per model and variant: θ, CI half width (D13 ≤ 20 %), training BA, B′ on the
-   training set at dwell 1 and 2, and the λ / numerator curves. Training data only - no M,
-   no T14.
+   E1 is serial (12 builds, ~1-2 min each for run2, seconds for supp / P1); E2 runs the
+   six (numerator, model) chains in parallel, one core each. Disk: `dataset_l3/` ≈ the
+   size of `dataset/` (~0.5 GB for the 12), fit dirs ~0.1-0.2 GB.
+2. L3 void windows (`no_sample` / `gap` / `reset` / `missing_series` / `no_metrics`) are
+   dropped before the EMA and counted (manifest `numerator`, per cell). Expected: the first
+   window of every cell (`no_sample`: it starts before the capture's first 1 Hz sample).
+   So the L3 training set is the gateway one minus those windows; report both window
+   counts. Before reading the table, check the L3 / gateway numerator ratio on the hold
+   cells (`prompt_tokens_gateway` / `generation_tokens_gateway` columns of `dataset_l3`).
+3. Report per model and variant (numerator x λ rule): θ, CI half width (D13 ≤ 20 %),
+   training BA, B′ on the training set at dwell 1 and 2, the λ / numerator curves and the
+   L3 void counts. Training data only - no M, no T14.
 
 ## ⏸ PAUSE: the owner picks λ and the numerator (D2 or L3)
 
@@ -190,8 +270,12 @@ The cluster stays in `observe observe` under the window (or close the window and
 
 ## F. Freeze (~10 min)
 
+From the §E worktree (`aibrix-wt/calib-l3-20261003`, same commit as §E; it records the
+numerator). `N` = the picked numerator (`gateway` | `l3`), `O` = `refit` (v2 λ) or
+`refit-v1lambda`. `--out-dir` is the refit root the stage outputs are read from, not the
+freeze directory:
 ```bash
-python3 -m scripts.dline_refit freeze --out-dir $CALIB_ROOT/freeze --fit-dir $F \
+python3 -m scripts.dline_refit freeze --out-dir $CALIB_ROOT/fit/$N/$O --fit-dir "$CALIB_ROOT/fit/$N/{model}/fit" \
     --model dsqwen-7b --model dsllama-8b --model dsqwen-14b --freeze-file $CALIB_ROOT/freeze/params_freeze.json
 python3 -m scripts.dline_refit verify-freeze --freeze-file $CALIB_ROOT/freeze/params_freeze.json
 ```
@@ -199,18 +283,26 @@ python3 -m scripts.dline_refit verify-freeze --freeze-file $CALIB_ROOT/freeze/pa
 owner). Freeze format revision 3 seals, per model, `b_prime.severity_cut` (.65 quantile of
 the training violating windows' severity) and `b_prime_gate` (.80 / .70 / .05 / .08) under
 the freeze's own hash, i.e. before M / T14 exist. Check:
-`python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print({m: v.get("b_prime") for m, v in d.items() if isinstance(v, dict) and "b_prime" in v})' $CALIB_ROOT/freeze/params_freeze.json`
+`python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print({m: v.get("b_prime") for m, v in d["models"].items()}, d.get("b_prime_gate"))' $CALIB_ROOT/freeze/params_freeze.json`
 
 ## G. M (3 models) and T14 (14b) (~6 h) - load
 
 1. b50 table and T14 capacity prior (CPU, from training data only):
+   One table per model (each with its own run2 root: `--base-run` reads
+   `<base-run>/<model>/design_result.json`, and `run2/dsqwen-14b` is void), then
+   concatenated. Labels only, so the gateway `dataset/` serves both numerators. Each
+   per-model table should equal the chain's `chain/b50_run2.<model>.csv` (same inputs, same
+   code); check with `cmp`.
    ```bash
-   R2=$CALIB_ROOT/run2
-   python3 -m scripts.analysis.boundary_b50_table --base-run $R2 --out $CALIB_ROOT/b50.csv \
-       --windows $R2/dsqwen-7b/dataset/windows.csv --windows $R2/dsllama-8b/dataset/windows.csv \
-       --windows $R2/dsqwen-14b/dataset/windows.csv
+   declare -A RUN2=([dsqwen-7b]=run2 [dsllama-8b]=run2 [dsqwen-14b]=run2b)
+   for m in $MODELS; do
+     python3 -m scripts.analysis.boundary_b50_table --base-run $CALIB_ROOT/${RUN2[$m]} \
+         --windows $CALIB_ROOT/${RUN2[$m]}/$m/dataset/windows.csv --out $CALIB_ROOT/b50.$m.csv
+     cmp $CALIB_ROOT/b50.$m.csv $CALIB_ROOT/chain/b50_run2.$m.csv
+   done
+   { head -1 $CALIB_ROOT/b50.dsqwen-7b.csv; for m in $MODELS; do tail -n +2 $CALIB_ROOT/b50.$m.csv; done; } > $CALIB_ROOT/b50.csv
    # (reproduces the 09-23 boundary_d6prime_run2.csv byte for byte from the old inputs)
-   python3 -m scripts.calibration_t14 capacity-prior --model dsqwen-14b --base-run $CALIB_ROOT/run2 \
+   python3 -m scripts.calibration_t14 capacity-prior --model dsqwen-14b --base-run $CALIB_ROOT/run2b \
        --boundary-supplement-run $CALIB_ROOT/supp --boundary-table $CALIB_ROOT/b50.csv \
        --out $CALIB_ROOT/t14/capacity_prior_dsqwen-14b.json
    ```
@@ -221,14 +313,15 @@ the freeze's own hash, i.e. before M / T14 exist. Check:
    [0.9, 1.0, 1.1], `t14.hold_s` 240, `t14.shapes` (the 8 held-out shapes). Checked when
    present (write all): `t14.model`, `t14.api` "chat", `t14.gateway.url` ending in
    `/v1/chat/completions`, `parameter_sets.freeze.sha256`, `parameter_sets.v1lambda.sha256`
-   (or the second set's), `t14.forbidden_roots` = this round's run1 / run2 / supp / p1 /
-   fit / freeze / M roots (a real run refuses with no roots). Also write: label sha256
+   (or the second set's), `t14.forbidden_roots` = this round's run1 / run2 / run2b / supp /
+   p1 / p1r2 / fit / freeze / M roots (a real run refuses with no roots). Also write: label sha256
    (new c/b), engine image tag, prompt corpus (mix 0.5), B′ cut, expected wall clock.
    The campaign needs **two** parameter sets (`--refit-params-file`); with one frozen set,
    name it twice and say so in the file.
-3. M, all three models in parallel:
-   `OUT_ROOT=$CALIB_ROOT/M BASE_RUN=$CALIB_ROOT/run2 SUPP_RUN=$CALIB_ROOT/supp BOUNDARY_TABLE=$CALIB_ROOT/b50.csv RETAINED_DATASET=$CALIB_ROOT/run1/$m/dataset FREEZE_FILE=$CALIB_ROOT/freeze/params_freeze.json bash $CAL/run_M.sh $m`
-   (2.6-3.0 h; exit 3 = stop for the owner).
+3. M, all three models in parallel (`RUN2` as in G1: `run2b` for 14b):
+   `OUT_ROOT=$CALIB_ROOT/M BASE_RUN=$CALIB_ROOT/${RUN2[$m]} SUPP_RUN=$CALIB_ROOT/supp BOUNDARY_TABLE=$CALIB_ROOT/b50.csv RETAINED_DATASET=$CALIB_ROOT/run1/$m/dataset FREEZE_FILE=$CALIB_ROOT/freeze/params_freeze.json bash $CAL/run_M.sh $m`
+   (2.6-3.0 h; exit 3 = stop for the owner). With the L3 numerator, rebuild each M dataset
+   and run1's with `--numerator vllm_counter` (`dataset_l3/`) before §H.
 4. T14 after 14b's M (one routable 14b pod; 7b/8b M may still run):
    `OUT_ROOT=$CALIB_ROOT/T14 PREREG_JSON=$CALIB_ROOT/t14/preregistration.json CAPACITY_PRIOR=$CALIB_ROOT/t14/capacity_prior_dsqwen-14b.json FREEZE_FILE=$CALIB_ROOT/freeze/params_freeze.json REFIT_PARAMS_FILE=<second set> DESIGN_SEED=<t14.design_seed> bash $CAL/run_T14.sh dsqwen-14b`
    (24 cells: 2.2 h expected, 2.9 h upper).
@@ -244,7 +337,8 @@ python3 -m scripts.dline_refit accept --freeze-file $CALIB_ROOT/freeze/params_fr
 # the result also reports B' at dwell 2, old B, all-violation recall and the LOW-band share (not gating).
 python3 -m scripts.analysis.calibration_decision <dataset> --regime-groups $CALIB_ROOT/prereg/regime_groups.json --out-dir $CALIB_ROOT/decision
 ```
-Gate = A, B′ (dwell = live value 1), D; disclosures as the preregistration §6. Old-vs-new
+With the L3 numerator, every `dataset` above is `dataset_l3` (accept refuses a dataset of
+another numerator than the freeze's). Gate = A, B′ (dwell = live value 1), D; disclosures as the preregistration §6. Old-vs-new
 parameter table to the owner. **Going live with θ is a separate release** (θ, λ, τ, w_p,
 c/b atomically; console PUT + restart controller and SM, idle ≥ 60 s).
 
@@ -301,7 +395,7 @@ HANDOFF: roots, verdicts, attempts.
 | D3 run2 | 11.4 h |
 | D4 supp | 0.7 h |
 | D5 P1 (serial across models: 3 x 1.34 h; parallel: 1.34 h) | 1.3-4.0 h |
-| E fits (+ L3 code, written during D) | 1 h |
+| E L3 datasets + fits (L3 code on `feat/calib-l3-20261003`) | 0.5-1 h |
 | pause | owner |
 | F | 0.2 h |
 | G M then T14 (14b) | 3.0 + 2.9 h |
