@@ -64,8 +64,9 @@ D2 single-class shape: a shape whose windows are all one class has no BA and no 
    pooled A is computed on all windows as usual.
 D3 void at audit (interpretation decided 2026-10-04 evening +08:00, before any M or T14 data
    was opened; owner approval). A cell is void at audit when its non-cut model errors /
-   sent > 0.05. Voids of a cell = its void attempts at run time (attempt - 1: the machinery
-   re-drives only a void attempt) + 1 if it is void at audit.
+   sent > 0.05. Voids of a cell = its void attempts at run time (the T14 manifest's
+   ``attempts`` with ``void_reasons``; in a dry run the dataset's ``cells.csv`` rows with
+   status ``void``) + 1 if it is void at audit.
    PRIMARY reading (decides status and verdict) - per cell, as ``calibration_ladder.drive_cell``
    counts "a second void": a cell with 2 voids -> ``run_void`` (stopped, never evaluated;
    re-run all 24 into a new root); else a cell void at audit -> ``void_redrive_required:<cells>``
@@ -345,11 +346,16 @@ def manifest_rows(inp: Mapping[str, Any], manifest_path: Path, dataset_dir: Path
         problems.append(f"{dataset_dir} lies under a forbidden root of the prereg")
     if problems:
         raise Refused(problems)
+    void_attempts: dict[str, int] = defaultdict(int)
+    for a in man.get("attempts") or []:
+        if a.get("void_reasons"):
+            void_attempts[str(a["cell_id"])] += 1
     cells = {}
     for c in man["cells"]:
         raw = [str(f) for f in c.get("raw_files") or []]
         cells[(str(c["cell_id"]), int(c["attempt"]))] = {
             "shape": c["shape"], "kind": c["kind"], "warmup_s": c.get("warmup_s"),
+            "runtime_voids": void_attempts.get(str(c["cell_id"]), 0),
             "instant": next((f for f in raw if f.endswith(".instant.jsonl")), None),
             "guard": next((f for f in raw if f.endswith(".guard.json")), None)}
     return man, cells, Path(dataset_dir)
@@ -406,8 +412,11 @@ def censoring_audit(requests_csv: Path, cells: Mapping[tuple, Mapping[str, Any]]
 
 def void_status(audit: Mapping[str, Any]) -> dict:
     """D3: the prereg's void_rule under the primary (per cell) and the sensitivity (run
-    level) reading, side by side. Run-time voids of a cell = its evaluated attempt - 1."""
-    voids = {c["cell_id"]: (int(c["attempt"]) - 1) + int(bool(c["void_at_audit"])) for c in audit["cells"]}
+    level) reading, side by side. Run-time voids of a cell = ``runtime_voids`` of the audit
+    cell (from the manifest's attempt records), else its evaluated attempt - 1 (the T14
+    machinery re-drives only a void attempt)."""
+    voids = {c["cell_id"]: int(c.get("runtime_voids", int(c["attempt"]) - 1)) + int(bool(c["void_at_audit"]))
+             for c in audit["cells"]}
     audit_void = sorted(c["cell_id"] for c in audit["cells"] if c["void_at_audit"])
     voided = sorted(cid for cid, n in voids.items() if n >= 1)
     twice = sorted(cid for cid, n in voids.items() if n >= 2)
@@ -585,17 +594,23 @@ def dry_run_rows(dataset_dir: Path, model: str) -> tuple[list[str], list[dict], 
                 and r.get("shape") in DRY_RUN_KINDS]
     root = Path(json.loads((dataset_dir / "manifest.json").read_text(encoding="utf-8")).get("run_root") or dataset_dir.parent)
     meta: dict[tuple, dict] = {}
+    void_attempts: dict[str, int] = defaultdict(int)
     with open(dataset_dir / "cells.csv", newline="", encoding="utf-8") as fh:
-        for c in csv.DictReader(fh):
-            raw = c.get("raw_path") or ""
-            meta[(c["cell_id"], int(float(c["attempt"] or 1)))] = {
-                "warmup_s": c.get("warmup_s"),
-                "instant": str(root / (raw[:-len(".jsonl")] + ".instant.jsonl")) if raw.endswith(".jsonl") else None,
-                "guard": str(root / c["guard_path"]) if c.get("guard_path") else None}
+        crow = list(csv.DictReader(fh))
+    for c in crow:
+        if (c.get("status") or "").strip() == "void" or (c.get("void_reasons") or "").strip():
+            void_attempts[c["cell_id"]] += 1
+    for c in crow:
+        raw = c.get("raw_path") or ""
+        meta[(c["cell_id"], int(float(c["attempt"] or 1)))] = {
+            "warmup_s": c.get("warmup_s"),
+            "instant": str(root / (raw[:-len(".jsonl")] + ".instant.jsonl")) if raw.endswith(".jsonl") else None,
+            "guard": str(root / c["guard_path"]) if c.get("guard_path") else None}
     cells = {}
     for r in rows:
         key = (r["cell_id"], int(float(r["attempt"] or 1)))
-        cells[key] = {"shape": r["shape"], "kind": DRY_RUN_KINDS[r["shape"]], **meta.get(key, {})}
+        cells[key] = {"shape": r["shape"], "kind": DRY_RUN_KINDS[r["shape"]], **meta.get(key, {}),
+                      "runtime_voids": void_attempts.get(r["cell_id"], 0)}
     return header, rows, cells
 
 
@@ -622,7 +637,9 @@ def evaluate(inp: Mapping[str, Any], csv_path: Path, cells: Mapping[tuple, Mappi
             sid = (r.get("scenario_id") or "unknown").strip() or "unknown"
             meta = cells[(r["cell_id"], int(float(r["attempt"] or 1)))]
             shape_of[sid], kind_of[meta["shape"]] = meta["shape"], meta["kind"]
-    audit = censoring_audit(requests_csv, {k: {"shape": v["shape"], "kind": v["kind"]} for k, v in cells.items()})
+    audit = censoring_audit(requests_csv, {k: {"shape": v["shape"], "kind": v["kind"],
+                                               "runtime_voids": int(v.get("runtime_voids") or 0)}
+                                           for k, v in cells.items()})
     vs = void_status(audit)
     if dry_run:
         status, verdict = "dry_run", None

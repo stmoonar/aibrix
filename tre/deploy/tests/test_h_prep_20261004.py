@@ -217,5 +217,10 @@ def test_t14_void_rule_primary_per_cell_with_run_level_sensitivity_side_by_side(
     assert vs(("c1", 1, True), ("c3", 1, True)) == (2, "void_redrive_required:c1,c3", t14.STATUS_RUN_VOID)
     # a run-time void elsewhere (c2 valid on attempt 2) plus one audit void: only the sensitivity stops
     assert vs(("c1", 1, True), ("c2", 2, False)) == (2, "void_redrive_required:c1", t14.STATUS_RUN_VOID)
+    # run-time voids come from the attempt records when given: a re-probe (attempt 2, no void) is not a void
+    rp = t14.void_status({"cells": [{"cell_id": "c1", "attempt": 2, "void_at_audit": True, "runtime_voids": 0},
+                                    {"cell_id": "c2", "attempt": 2, "void_at_audit": False, "runtime_voids": 0}]})
+    assert (rp["voided_cells"], rp["void_status_primary"]["status"],
+            rp["void_status_run_level_sensitivity"]["status"]) == (1, "void_redrive_required:c1", "void_redrive_required:c1")
     r = t14.void_status({"cells": [{"cell_id": "c1", "attempt": 1, "void_at_audit": True}]})
     assert "second void stops the run" in r["void_rule"] and "decides" in r["void_status_primary"]["reading"]
