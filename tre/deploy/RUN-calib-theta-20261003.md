@@ -327,20 +327,124 @@ the freeze's own hash, i.e. before M / T14 exist. Check:
    (24 cells: 2.2 h expected, 2.9 h upper).
 5. HANDOFF before G.
 
-## H. Accept and decision (~0.5 h, CPU)
+## H. Accept, T14 score, disclosures (~0.5-1 h, CPU) - accept and the T14 score run ONCE
+
+Corrected 2026-10-04 (branch `calib/h-prep-20261004`, DRAFT until the owner signs off). What
+changed from the first version of this section: accept takes **all three** M manifests in
+**one** call (it refuses a call that misses a frozen model); every `--dataset` carries a
+unique `NAME=` (two datasets default to the same name, the model directory, and accept
+refuses); T14 is **not** scored by accept (accept takes one M manifest per model and would
+refuse a second 14b manifest) but by `scripts.analysis.t14_score`; `calibration_decision`
+never scores the frozen set (disclosure only, below).
 
 ```bash
-python3 -m scripts.dline_refit accept --freeze-file $CALIB_ROOT/freeze/params_freeze.json \
-    --dataset M=$CALIB_ROOT/M/<m>/dataset --dataset run1=$CALIB_ROOT/run1/<m>/dataset \
-    --m-manifest $CALIB_ROOT/M/<m>/M_manifest.json --dwell-windows 1   # one --m-manifest per model; T14_manifest the same way
-# --dwell-windows 1 = the live TRE_DWELL_WINDOWS (a guard test keeps the default equal to the overlay);
-# the result also reports B' at dwell 2, old B, all-violation recall and the LOW-band share (not gating).
-python3 -m scripts.analysis.calibration_decision <dataset> --regime-groups $CALIB_ROOT/prereg/regime_groups.json --out-dir $CALIB_ROOT/decision
+C=$CALIB_ROOT                                    # /data/nfs_shared_data/xxy/calib_20261003
+ACC=$REPO-wt/calib-theta-20261003/tre            # accept runs from the sealed calib code (da0ff2cc, clean)
+HP=$REPO-wt/calib-h-prep-20261004/tre            # the H disclosure tools (sha recorded in the addendum)
+export PYTHONPATH=../common:.:../controller:../service-manager:../calibration:../replayer:../ui
+mkdir -p $C/eval $C/decision
 ```
-With the L3 numerator, every `dataset` above is `dataset_l3` (accept refuses a dataset of
-another numerator than the freeze's). Gate = A, B′ (dwell = live value 1), D; disclosures as the preregistration §6. Old-vs-new
-parameter table to the owner. **Going live with θ is a separate release** (θ, λ, τ, w_p,
-c/b atomically; console PUT + restart controller and SM, idle ≥ 60 s).
+
+**H0. Before anything reads M or T14.**
+1. G is finished: `$C/M/<m>/M_manifest.json` for the three models and
+   `$C/T14/dsqwen-14b/T14_manifest.json` exist (CHAIN_STATUS `G_M end rc=0` x3, `G_T14 end rc=0`).
+2. The H disclosure addendum (`prereg/ADDENDUM-H-dropped-windows.json`, draft in
+   `tre/docs/calib-h-20261004/`) is registered with its sha256 sidecar and the h-prep commit
+   it names - **before** H1, so the conservative variant is fixed before M is read.
+3. `git -C $ACC status --short` is empty and `git -C $ACC rev-parse HEAD` = the freeze's
+   `code.commit` (accept records `code_state()`).
+
+**H1. accept - ONCE.** It is write-once: it refuses (exit 1, nothing written) when
+`params_freeze.accept.json`, `params_freeze.json.accepted` or `params_freeze.accept.d/`
+exists. A refusal (exit 1) writes nothing and may be fixed and re-run; exit 0 (passed) or 3
+(evaluated, failed) is final.
+
+```bash
+cd $ACC/deploy
+python3 -m scripts.dline_refit accept --freeze-file $C/freeze/params_freeze.json \
+  --dataset M.dsqwen-7b=$C/M/dsqwen-7b/dataset \
+  --dataset M.dsllama-8b=$C/M/dsllama-8b/dataset \
+  --dataset M.dsqwen-14b=$C/M/dsqwen-14b/dataset \
+  --dataset run1.dsqwen-7b=$C/run1/dsqwen-7b/dataset \
+  --dataset run1.dsllama-8b=$C/run1/dsllama-8b/dataset \
+  --dataset run1.dsqwen-14b=$C/run1/dsqwen-14b/dataset \
+  --m-manifest $C/M/dsqwen-7b/M_manifest.json \
+  --m-manifest $C/M/dsllama-8b/M_manifest.json \
+  --m-manifest $C/M/dsqwen-14b/M_manifest.json \
+  --dwell-windows 1 2>&1 | tee $C/logs/H_accept.log; echo "exit ${PIPESTATUS[0]}"   # 0 pass, 3 fail, 1 refused
+```
+- Why the run1 datasets: each M manifest lists 13 cells, 10 collected (rows in
+  `M/<m>/dataset`, built from the M out-dir only) and 3 retained mixture cells whose rows
+  are in `run1/<m>/dataset` (split holdout, `calibration_acceptance.retained_cells`). Accept
+  matches every manifest cell to exactly one dataset (`collect_m_rows`): without run1 it
+  refuses "not found in any dataset"; a cell found twice is refused "found in 2 datasets".
+  The sealed probes in the M datasets are skipped (not manifest cells).
+- `--dwell-windows 1` = the controller's `TRE_DWELL_WINDOWS` (also the default). Gate = A,
+  B′ at dwell 1 (the freeze's sealed cuts and gate), D (training stop rule). Disclosed: B′
+  at dwell 2, old B, C, all-violation recall, LOW-band share, ranking (AUROC / Kendall).
+- Outputs (all next to the freeze, read-only): `$C/freeze/params_freeze.accept.json`
+  (result), `$C/freeze/params_freeze.json.accepted` (marker with the result's sha256),
+  `$C/freeze/params_freeze.accept.d/<model>_validation.csv` (the exact rows scored).
+
+**H2. recheck (optional, writes nothing).** The same command plus `--recheck`: recomputes
+from the same inputs and compares with the stored result (exit 0 identical, 4 differs).
+
+**H3. Conservative variant (disclosure, the H addendum).** Same frozen parameters, same rows
+(accept's validation CSVs); dropped zero-token windows with a backlog or failure evidence
+counted as non-CRITICAL misses. The gate stays H1's.
+```bash
+cd $HP/deploy
+python3 -m scripts.analysis.h_conservative_score --freeze-file $C/freeze/params_freeze.json \
+  --csv dsqwen-7b=$C/freeze/params_freeze.accept.d/dsqwen-7b_validation.csv \
+  --csv dsllama-8b=$C/freeze/params_freeze.accept.d/dsllama-8b_validation.csv \
+  --csv dsqwen-14b=$C/freeze/params_freeze.accept.d/dsqwen-14b_validation.csv \
+  --label "H3 on M (accept validation CSVs)" --out $C/eval/H_conservative_M.json
+```
+Its `frozen` variant must equal accept's A / B′ numbers (`accept_path_check` = true).
+
+**H4. T14 score - ONCE** (preregistered rule + both addenda; write-once, refuses if the
+output or `<out>.d/` exists; exit 1 = refused, nothing written).
+```bash
+cd $HP/deploy
+python3 -m scripts.analysis.t14_score --prereg $C/t14/preregistration.json \
+  --addendum $C/prereg/ADDENDUM-T14-streamcut.json --addendum $C/prereg/ADDENDUM-T14-crossshape.json \
+  --freeze-file $C/freeze/params_freeze.json \
+  --t14-manifest $C/T14/dsqwen-14b/T14_manifest.json --dataset $C/T14/dsqwen-14b/dataset \
+  --out $C/eval/T14_score.json 2>&1 | tee $C/logs/H_t14_score.log
+```
+Verdict `pass` / `fail` (A and B′ at dwell 1), or `undetermined_audit_void` when a cell has
+non-cut model errors > 0.05 (owner decision; see the scorer's `ambiguities`). Also written:
+per-shape / per-kind BA and AUROC with CIs, the cross-shape claim per kind, the censoring
+audit per cell, and the conservative variant (disclosure).
+
+**H5. calibration_decision - disclosure only, never a verdict on the frozen set.** It fits
+its own θ, at its hard-coded λ = 1 (`DLINE_LAMBDA`), compares TRS at the given w_p against
+w_p = 0, queue-per-replica and two signals on ONE dataset; it has no `--freeze-file`, reads
+accept only through `--accept-result` (B′ copied from the stored result, nothing
+recomputed), and overwrites `decision.json` / `decision.md` in `--out-dir`. So: one run per
+model, on that model's TRAINING ladder dataset (never M / T14 - it fits on whatever the
+policy calls training), frozen w_p passed explicitly, one out-dir per model:
+```bash
+cd $ACC/deploy
+declare -A RUN2=([dsqwen-7b]=run2 [dsllama-8b]=run2 [dsqwen-14b]=run2b)
+for m in dsqwen-7b dsllama-8b dsqwen-14b; do
+  wp=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["models"][sys.argv[2]]["published"]["w_p"])' \
+       $C/freeze/params_freeze.json $m)
+  nice -n 19 python3 -m scripts.analysis.calibration_decision $C/${RUN2[$m]}/$m/dataset \
+    --regime-groups $C/prereg/regime_groups.json --w-p $m=$wp --processes 2 \
+    --accept-result $C/freeze/params_freeze.accept.json --out-dir $C/decision/$m \
+    > $C/logs/H_decision.$m.log 2>&1
+done
+```
+Report it as "comparison at λ = 1, own θ" (14b: frozen w_p = 0, so TRS vs w_p = 0 is the
+same signal). Its B′ block must agree with H1 (`agrees_with_accept`).
+
+**H6.** Old-vs-new parameter table, H1 / H3 / H4 / H5 to the owner; HANDOFF. **Going live
+with θ is a separate release** (θ, λ, τ, w_p, c/b atomically; console PUT + restart
+controller and SM, idle ≥ 60 s).
+
+With the L3 numerator (not this round's choice) every `dataset` above would be
+`dataset_l3`; accept refuses a dataset of another numerator than the freeze's.
 
 ## I. Restore (~10 min) - cluster change
 
@@ -399,7 +503,7 @@ HANDOFF: roots, verdicts, attempts.
 | pause | owner |
 | F | 0.2 h |
 | G M then T14 (14b) | 3.0 + 2.9 h |
-| H | 0.5 h |
+| H | 0.5-1 h |
 | I | 0.2 h |
 | **Total** | **~28-30 h + pause** (P1 parallel vs serial; without run1: ~5.5 h less) |
 
