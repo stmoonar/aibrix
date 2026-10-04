@@ -140,14 +140,41 @@ class _Queue:
         self.submitted.extend(actions)
 
 
-def _registry() -> Registry:
-    spec = ModelSpec(
-        name="m", weights_path="/w", tp_size=1, min_replicas=1, max_replicas=4, vllm_image="img",
-        slo=SloSpec(ttft_p95_ms=1200.0, tpot_p95_ms=100.0, e2e_p95_ms=10_000.0),
-        trs=TrsParams(w_p=0.04, w_d=1.0, lambda_wait=2.625, qmin=1.0, ema_alpha=1.0, theta_m=100.0,
-                      tau_crit=0.8, tau_low=1.0, tau_high=1.25, qsat=4.0, epsat=0.05, hsat=1),
-    )
-    return Registry(ClusterTopology(nodes=(NodeSpec(name="n", gpus=4, two_gpu_slots=((0, 1), (2, 3))),)), [spec])
+def _registry(*names: str) -> Registry:
+    specs = [
+        ModelSpec(
+            name=name, weights_path="/w", tp_size=1, min_replicas=1, max_replicas=4, vllm_image="img",
+            slo=SloSpec(ttft_p95_ms=1200.0, tpot_p95_ms=100.0, e2e_p95_ms=10_000.0),
+            trs=TrsParams(w_p=0.04, w_d=1.0, lambda_wait=2.625, qmin=1.0, ema_alpha=1.0, theta_m=100.0,
+                          tau_crit=0.8, tau_low=1.0, tau_high=1.25, qsat=4.0, epsat=0.05, hsat=1),
+        )
+        for name in names or ("m",)
+    ]
+    return Registry(ClusterTopology(nodes=(NodeSpec(name="n", gpus=4, two_gpu_slots=((0, 1), (2, 3))),)), specs)
+
+
+END = 1_000_000_000_000
+
+
+def _write_pod(redis, model: str, pod: str, *, gen_per_grid: float, running: float, waiting: float,
+               scraped_ms: int | None) -> None:
+    """Gateway docs of one pod on the 10 s grid over (END - 40 s, END]; the counters grow
+    by ``gen_per_grid`` per grid until ``scraped_ms`` (the last successful fetch), then
+    repeat (a frozen scrape). ``scraped_ms`` None: written by an old gateway, fresh."""
+    redis.sadd(f"tre:v2:pods:{model}", f"default/{pod}")
+    for i, ts in enumerate(range(END - 40_000, END + 1, 10_000)):
+        frozen_at = i if scraped_ms is None or scraped_ms >= ts else (scraped_ms - (END - 40_000)) // 10_000
+        base = {"timestamp": ts, "written_ms": ts + 300, "pod_name": pod}
+        if scraped_ms is not None:
+            base["scraped_ms"] = min(scraped_ms, ts)
+        n = 100 + 10 * frozen_at
+        redis.zadd(f"tre:v2:hist:default/{pod}", {**base, "model_histogram_metrics": {
+            f"{model}/request_prompt_tokens": {"sum": 50.0 * n, "count": n, "buckets": {"+Inf": n}},
+            f"{model}/request_generation_tokens": {"sum": gen_per_grid * frozen_at, "count": n, "buckets": {"+Inf": n}},
+        }}, ts)
+        redis.zadd(f"tre:v2:inst:default/{pod}", {**base, "model_metrics": {
+            f"{model}/num_requests_running": running, f"{model}/num_requests_waiting": waiting,
+        }}, ts)
 
 
 @pytest.mark.parametrize("gateway_writes_scraped_ms", [True, False], ids=["scraped_ms", "old_gateway"])
@@ -190,3 +217,53 @@ def test_frozen_scrape_is_unknown_not_a_zero_token_window(gateway_writes_scraped
     else:
         assert snapshot.models["m"].generation_tokens == 0.0  # former behaviour
         assert state != ModelState.UNKNOWN
+
+
+@pytest.mark.parametrize("stale", [False, True], ids=["both_fresh", "one_stale"])
+def test_a_stale_serving_pod_makes_no_donor(stale):
+    """E review P2-1: m has 2 serving pods; m-1 (the overloaded one) times out on
+    /metrics. Its docs are left out, so the level comes from the light m-0 alone (HIGH)
+    - not evidence that m can give a GPU to the CRITICAL r. With both pods fresh the
+    same HIGH level is released (control)."""
+    redis = _Redis()
+    fresh = END
+    _write_pod(redis, "m", "m-0", gen_per_grid=20_000, running=2, waiting=0, scraped_ms=fresh)
+    _write_pod(redis, "m", "m-1", gen_per_grid=20_000, running=2, waiting=0,
+               scraped_ms=END - 35_000 if stale else fresh)
+    for pod in ("r-0", "r-1"):
+        _write_pod(redis, "r", pod, gen_per_grid=100, running=20, waiting=10, scraped_ms=fresh)
+    registry = _registry("m", "r")
+    snapshot = MetricsStore(redis, registry, instant_sample_interval_ms=10_000).read_snapshot(
+        END - 30_000, END, use_cache=False, start_exclusive=True
+    )
+
+    def binding(pod, model, gpu, awake=True):
+        return Binding(serve_id=pod, model=model, slot=Slot("n", (gpu,)), awake=awake)
+
+    view = ClusterView(topology=registry.topology(), bindings=(
+        binding("m-0", "m", 0), binding("m-1", "m", 1), binding("r-0", "r", 2), binding("r-1", "r", 3),
+        binding("r-2", "r", 0, awake=False), binding("r-3", "r", 1, awake=False),
+    ))
+    result = run_planner_tick(snapshot, queue=_Queue(), registry=registry, rescue_due=True, fairness_due=True,
+                              cluster_view=view)
+    assert result.classifications["m"].state == ModelState.HIGH
+    assert result.classifications["r"].state == ModelState.CRITICAL
+    released = any(isinstance(a, ScaleAction) and a.model == "m" and a.delta < 0
+                   for a in expand_relays(result.actions))
+    assert released is not stale
+    if stale:
+        assert result.model_contexts["m"]["signal_hold_reason"] == "scrape_stale"
+
+
+def test_scrape_validity_is_judged_per_o1_suffix():
+    """E: each O1 suffix window is judged against its own start - a pod whose last
+    successful fetch lies inside the window but before the last grid is valid for the
+    whole window and the 20 s suffix, not for the last 10 s."""
+    redis = _Redis()
+    _write_pod(redis, "m", "m-0", gen_per_grid=1_000, running=4, waiting=0, scraped_ms=END - 15_000)
+    store = MetricsStore(redis, _registry("m"), instant_sample_interval_ms=10_000, suffix_period_ms=10_000)
+    window = store.read_model_window("m", END - 30_000, END, use_cache=False, start_exclusive=True)
+    assert window.generation_tokens is not None
+    last_20s, last_10s = window.suffix_windows
+    assert last_20s.generation_tokens is not None
+    assert last_10s.generation_tokens is None and not last_10s.per_pod

@@ -46,8 +46,9 @@ class ModelStateBox:
             ):
                 state = UNCONFIRMED
             elif ctx.get("signal_hold_reason") is not None:
-                # O1: too little evidence after a breakpoint - the state is the whole
-                # window's raw value, which the planner does not act on either.
+                # Not a level of the current window's full evidence (O1 breakpoint,
+                # tokens missing -> held context, a stale pod scrape): the planner takes
+                # no donor from it, but a receiver may still act on it (step-capped).
                 state = UNCONFIRMED
             previous = self._states.get(model)
             if previous is None or previous[1] <= int(ts_ms):

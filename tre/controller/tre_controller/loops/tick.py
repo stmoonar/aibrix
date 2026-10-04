@@ -449,11 +449,8 @@ def _note_saturation_steps(
         targets = [int(action.rescue.target) for action in mine if getattr(action, "rescue", None) is not None]
         target = max(targets) if targets else routable + sum(upscale_of(action)[1] for action in mine)
         if cluster_view is not None:
-            pods = [
-                binding.serve_id
-                for binding in cluster_view.bindings
-                if binding.model == item.model_name and binding.awake and not binding.hidden
-            ]
+            # The step's pods: the routable set the added pods are later taken from.
+            pods = sorted((_routable_pod_ids(cluster_view) or {}).get(item.model_name, ()))
         else:
             pods = [sample["pod"] for sample in ctx.get("saturation_pod_samples") or ()]
         tracker.note_step(
@@ -1099,6 +1096,7 @@ def _model_contexts(
     cluster_counts = _cluster_view_counts(cluster_view)
     awake_counts = _awake_including_hidden(cluster_view)
     hidden_pods = _hidden_pods(cluster_view)
+    routable_by_model = _routable_pod_ids(cluster_view)
     for model_name, metrics in snapshot.models.items():
         spec = registry.model(model_name)
         stale_pods = getattr(metrics, "scrape_stale_pods", ())
@@ -1228,6 +1226,14 @@ def _model_contexts(
         context["awake_replicas"] = awake_counts.get(model_name, metrics.routable_pods)
         # 2026-10-02: the SM replica floor / headroom (donor bound of the planner).
         context.update(_sm_floor_context(cluster_view, model_name))
+        if tokens_available and stale_pods and (
+            routable_by_model is None or set(stale_pods) & routable_by_model.get(model_name, frozenset())
+        ):
+            # I4: a serving pod's data is missing from this window (its scrape is stale),
+            # so the level comes from the other pods only - no scale-down / release
+            # evidence (the planner's donor gate); a receiver still acts (step-capped).
+            context["signal_full_window"] = False
+            context["signal_hold_reason"] = "scrape_stale"
         tracker = getattr(signal_state, "saturation", None)
         if tracker is not None and tracker.config.enabled:
             # Onset saturation rescue: the routable pods' newest gateway samples (the
@@ -1326,12 +1332,17 @@ def _routable_pod_ids(cluster_view: ClusterView | None) -> dict[str, frozenset[s
     routable_ids = getattr(cluster_view, "routable_ids", None)
     out: dict[str, set[str]] = {}
     for binding in cluster_view.bindings:
-        routable = (
-            binding.serve_id in routable_ids if routable_ids is not None else binding.awake and not binding.hidden
-        )
-        if routable:
+        if _is_routable(binding, routable_ids):
             out.setdefault(binding.model, set()).add(binding.serve_id)
     return {model: frozenset(ids) for model, ids in out.items()}
+
+
+def _is_routable(binding, routable_ids) -> bool:
+    """The SM's routable set (``/v2/state`` ``bindings[].routable``); without it the
+    controller's former rule: awake and not hidden."""
+    if routable_ids is not None:
+        return binding.serve_id in routable_ids
+    return bool(binding.awake and not binding.hidden)
 
 
 def _cluster_view_counts(cluster_view: ClusterView | None) -> dict[str, tuple[int, int]]:
@@ -1347,10 +1358,7 @@ def _cluster_view_counts(cluster_view: ClusterView | None) -> dict[str, tuple[in
         model_counts = counts.setdefault(binding.model, [0, 0])
         if not binding.hidden:
             model_counts[1] += 1
-        if routable_ids is not None:
-            if binding.serve_id in routable_ids:
-                model_counts[0] += 1
-        elif binding.awake and not binding.hidden:
+        if _is_routable(binding, routable_ids):
             model_counts[0] += 1
     return {model: (values[0], values[1]) for model, values in counts.items()}
 

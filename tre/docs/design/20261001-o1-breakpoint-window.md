@@ -168,6 +168,31 @@ Observability: decision snapshot `model_states` gains `signal_full_window`,
 `evidence_requests` / `no_suffix`); planner event `donor_suppressed_breakpoint_window`;
 startup log `breakpoint_window_config`.
 
+## Signal validity (2026-10-04, I3 / I4)
+
+I3: every observation carries its own validity; data older than the window is unknown,
+not 0 and not the last value. I4: a model is a donor (scale-down or release) only on a
+level computed from tokens observed in the current window. Both reuse the O1 donor gate
+(`signal_full_window: false` + `signal_hold_reason`), no new timer:
+
+* **held context** (`signal_hold_reason: tokens_missing`): the window has no token data,
+  `PaperStateCache` holds the last context (at most `paper_stale_max_windows`, 3);
+* **stale scrape** (`scrape_stale`): the gateway writes `scraped_ms` (its wall clock at
+  the pod's last successful /metrics fetch). `MetricsStore.read_model_window` leaves out
+  a pod whose newest in-window `scraped_ms` is before the window's (or O1 suffix's) read
+  start - both values are gateway clock. A serving pod left out puts the model on the
+  donor gate: the remaining pods may be the light ones. No valid pod left: tokens None
+  (the held / UNKNOWN path). An old gateway (no `scraped_ms` on any doc of the model
+  in the window) keeps every pod. Event `scrape_stale:<model>:<pods>`.
+
+**Deliberate exception (scale-up stays aggressive):** a receiver on such a level still
+acts - a held CRITICAL on its last value, a scrape-stale CRITICAL on its valid pods. The
+rescue step is capped like a thin partial window: `breakpoint_partial_max_step` (1)
+replica per decision (`rescue_low_evidence_step`). A wrong +1 costs one wake and is
+slept again by the next donor decision on full evidence; withholding it from a model
+that may be overloaded costs SLO. The ModelStateBox reports these models UNCONFIRMED
+(commit revalidation keeps the plan).
+
 ## Not affected
 
 The TSS definition (`tre_common.tss`), the offline calibration (`calibration/`,
