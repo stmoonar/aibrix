@@ -90,7 +90,9 @@ def _replacement_pod(world, deployment):
 def test_b11_the_replacement_pod_of_a_rolled_back_cold_start_is_not_admitted():
     world = _registry_slot_world()
     deployment = _fail_cold_start(world)
-    assert "m1/node-a/1" not in world.leases.held
+    # I1 (2026-10-04): the failed start's lease stays until no Pod of the binding
+    # exists (orphan lease reaper) - the replacement Pod below still does.
+    assert world.leases.held["m1/node-a/1"][1] == "starting"
     # desired state was rolled back to what it was: still resident
     assert world.desired()["m1/node-a/1"][2] == "resident"
     name, uid = _replacement_pod(world, deployment)
@@ -101,7 +103,6 @@ def test_b11_the_replacement_pod_of_a_rolled_back_cold_start_is_not_admitted():
 
     assert name not in world.runtime.admitted
     assert world.leases.calls == []  # no (orphan) starting lease
-    assert "m1/node-a/1" not in world.leases.held
 
 
 def test_b11_without_the_owner_check_the_replacement_pod_took_an_orphan_lease(monkeypatch):
@@ -120,11 +121,12 @@ def test_b11_the_async_gate_gets_a_retriable_error_not_an_admission():
     world = _registry_slot_world()
     deployment = _fail_cold_start(world)
     name, uid = _replacement_pod(world, deployment)
+    world.leases.calls.clear()
 
     with pytest.raises(RetryLater):
         world.service.request_startup_admission(pod_name=name, pod_uid=uid)
     assert name not in world.runtime.admitted
-    assert "m1/node-a/1" not in world.leases.held
+    assert world.leases.calls == []  # no (orphan) starting lease
 
 
 def test_b11_the_owner_chain_is_checked_again_under_the_writer_lock():

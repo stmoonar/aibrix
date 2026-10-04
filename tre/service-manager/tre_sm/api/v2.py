@@ -2297,8 +2297,16 @@ class ServiceManagerV2:
         """A cold start / defrag destination failed after its Deployment was
         created (review 4 P1): its desired record is rolled back (absent), so a
         Deployment left behind would only make its Pod's init gate loop on 400
-        "non-resident desired binding". Delete it and release the ``starting``
-        lease (best effort; the supervisor reaps what is left)."""
+        "non-resident desired binding". Delete it (best effort; the supervisor's
+        ``reap_rejected_deployments`` deletes what is left).
+
+        The ``starting`` lease is NOT released here (I1, 2026-10-04): an accepted
+        delete is no evidence - the Pod may still be loading or awake on those
+        GPUs (or its /wake_up may not have answered). The binding becomes a
+        suspect (its GPUs never trusted from gpu-truth; the caller requests a
+        fresh sample): the suspect convergence releases the lease once the
+        engine reads asleep with no wake in flight (or sleeps it per desired),
+        ``reap_orphan_leases`` once no Pod of the binding exists."""
         if deployment_created and hasattr(self._runtime_ops, "delete_model_deployment"):
             try:
                 self._runtime_ops.delete_model_deployment(planned)
@@ -2308,10 +2316,15 @@ class ServiceManagerV2:
                     "the supervisor reaps it", planned.binding_id,
                 )
         if self._gpu_leases is not None:
-            try:
-                self._gpu_leases.release(planned)
-            except Exception:
-                LOG.exception("releasing the starting lease of %s failed", planned.binding_id)
+            self._suspects[planned.binding_id] = (
+                planned.slot.node, tuple(int(g) for g in planned.slot.gpu_ids), ""
+            )
+            _log_event(
+                "failed_start_lease_kept", level=logging.WARNING,
+                binding_id=planned.binding_id, node=planned.slot.node,
+                gpu_ids=list(planned.slot.gpu_ids), deployment_created=deployment_created,
+                detail="starting lease kept until the Pod is gone or reads asleep; binding now a suspect",
+            )
 
     def _finish_admitted_start(self, pod_name: str) -> None:
         """The creator converged its own Pod (awake, annotated, leased): clear

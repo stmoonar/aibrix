@@ -294,7 +294,6 @@ def test_without_pre_authorization_the_gate_and_the_creator_deadlock(monkeypatch
     assert world.runtime.deleted == world.runtime.created
     new_id = "m1/node-a/1"
     assert world.desired().get(new_id, (None, None, "absent"))[2] == "absent"
-    assert new_id not in world.leases.held
 
 
 @contextmanager
@@ -360,17 +359,30 @@ def test_a_pre_authorized_admission_still_checks_pressure_and_the_lease():
     assert world.runtime.admitted == {}
 
 
-def test_a_failed_cold_start_deletes_its_deployment_and_releases_the_lease():
+def test_a_failed_cold_start_deletes_its_deployment_and_keeps_the_lease_until_the_pod_is_gone():
+    """I1 (2026-10-04): an accepted Deployment delete is no evidence - the Pod
+    may still hold the GPU. The ``starting`` lease stays until no Pod of the
+    binding exists (the orphan lease reaper)."""
     world = _cold_start_world()
     world.vllm.wait_until_ready = lambda pod_ip, *, port=None: SimpleNamespace(success=False, message="engine crashed")
+    world.runtime.list_live_model_pod_binding_ids = lambda: {
+        binding_of(s).binding_id for s in world.runtime.snapshots.values()
+    }
 
     with pytest.raises(ValueError, match="engine crashed"):
         world.service.put_model_target("m1", wake_replicas=2)
 
     assert world.runtime.created and world.runtime.deleted == world.runtime.created
-    assert "m1/node-a/1" not in world.leases.held
     assert world.desired().get("m1/node-a/1", (None, None, "absent"))[2] == "absent"
     assert world.service.reap_rejected_deployments() == []
+    assert world.leases.held["m1/node-a/1"][1] == "starting"
+    assert world.service.reap_orphan_leases() == []  # its Pod still exists (terminating)
+    assert world.leases.held["m1/node-a/1"][1] == "starting"
+
+    del world.runtime.snapshots[world.runtime.pending[world.runtime.created[0]][0]]  # the Pod is gone
+
+    assert world.service.reap_orphan_leases() == ["m1/node-a/1"]
+    assert "m1/node-a/1" not in world.leases.held
 
 
 def test_the_supervisor_reaps_a_deployment_whose_cleanup_failed():

@@ -118,6 +118,11 @@ SM 已经改成"不排空、一律 abort"，sleep 留在锁外的只是十几毫
 - 不变量 I1（10-04）：GPU 租约只凭新鲜的物理证据释放——动作结束后读到的 `/is_sleeping == true`、
   Pod 已从 Pod 列表消失、或 refresh_seq 新于该动作的 gpu-truth 样本；传输超时、HTTP 5xx、k8s 接受了
   delete、重试用尽、"放弃"都不算。
+- 冷启动 / defrag 目标失败（10-04）：删除 Deployment（best effort，删不掉由 `reap_rejected_deployments`
+  补删），**不释放** `starting` 租约；binding 进入 suspect 并请求新的 gpu-truth 样本。租约由已有的收敛释放：
+  Pod 从列表消失 → `reap_orphan_leases`；Pod 还在且读到睡着、sidecar 无在途 wake → suspect 收敛；
+  读到醒着 → 按 desired（回滚后是 sleeping）经 sleep primitive 睡下后释放。冷启动里的 `/wake_up`
+  没有应答时也走这条路。
 - 写锁 lease 由后台线程续约；进程活着但 Redis 连续一个 TTL 续约失败时 fence 视为丢失，操作在下一
   次检查（例如发 `/sleep` 之前）停下。持锁进程死掉时 lease 过期，下一个写操作拿到锁，
   `supersede_stale_operations` 把它留下的 running 记录标为 superseded，journal 恢复结算它做了一半的事。
