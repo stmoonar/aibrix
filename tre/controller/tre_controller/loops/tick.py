@@ -1101,6 +1101,11 @@ def _model_contexts(
     hidden_pods = _hidden_pods(cluster_view)
     for model_name, metrics in snapshot.models.items():
         spec = registry.model(model_name)
+        stale_pods = getattr(metrics, "scrape_stale_pods", ())
+        if stale_pods:
+            # I3: the gateway's last successful scrape of these pods predates the window;
+            # their docs are left out (no valid pod left -> tokens missing, not zero).
+            events.append(f"scrape_stale:{model_name}:{','.join(stale_pods)}")
         counts = cluster_counts.get(model_name)
         assigned_replicas = metrics.assigned_replicas
         if counts is not None:

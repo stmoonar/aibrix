@@ -107,6 +107,10 @@ class ModelWindowMetrics:
     #: a suffix only while a breakpoint (traffic onset, routable-count change) lies
     #: inside the window. Excluded from equality.
     suffix_windows: tuple["ModelWindowMetrics", ...] = field(default=(), compare=False)
+    #: I3 (2026-10-04): pods left out of this window because the gateway's last
+    #: successful scrape of them (doc ``scraped_ms``) lies before the window - their
+    #: docs repeat frozen values. Diagnostics only; excluded from equality.
+    scrape_stale_pods: tuple[str, ...] = field(default=(), compare=False)
 
 
 @dataclass(frozen=True)

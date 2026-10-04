@@ -138,12 +138,15 @@ class MetricsStore:
         read_start_ms = int(window_start_ms) + 1 if start_exclusive else int(window_start_ms)
         suffix_starts = self._suffix_starts(int(window_start_ms), int(window_end_ms))
         suffix_pods: dict[int, dict[str, PodWindowMetrics]] = {start: {} for start in suffix_starts}
+        # I3: pod name -> newest ``scraped_ms`` of its docs in the window (None: no doc
+        # carries the field); only pods with a doc in the window.
+        scraped: dict[str, int | None] = {}
         if self._schema == "v1":
             # O1 suffixes are built for the v2 schema only (v1 = legacy fallback: the
             # controller then waits for a whole clean window after a breakpoint).
             suffix_starts = ()
             per_pod = self._read_v1_model_window(
-                model, read_start_ms, window_end_ms, span_start_ms=window_start_ms
+                model, read_start_ms, window_end_ms, span_start_ms=window_start_ms, scraped=scraped
             )
         else:
             pods = sorted(_decode_text(pod) for pod in self._redis.smembers(pods_key(model)))
@@ -162,6 +165,7 @@ class MetricsStore:
                 )
                 if pod_metrics is not None:
                     per_pod[pod_metrics.pod] = pod_metrics
+                    _note_scraped(scraped, pod_metrics.pod, hist_docs, inst_docs, read_start_ms)
                 for start in suffix_starts:
                     # The suffix (start, end] from the same docs: the histogram baseline
                     # is the newest doc before the suffix (the tick at ``start``), the
@@ -181,12 +185,23 @@ class MetricsStore:
                     if suffix_metrics is not None:
                         suffix_pods[start][suffix_metrics.pod] = suffix_metrics
 
+        # Ticks are gateway-wide provenance (window freshness): a frozen pod's docs were
+        # still written on the gateway's ticker.
+        all_ticks = tuple(sorted({tick for pod in per_pod.values() for tick in pod.instant_ticks_ms}))
+        per_pod, stale_pods = _scrape_valid(per_pod, scraped, read_start_ms)
         model_metrics = self._aggregate_model(model, window_start_ms, window_end_ms, per_pod)
+        if stale_pods:
+            model_metrics = replace(model_metrics, instant_ticks_ms=all_ticks, scrape_stale_pods=stale_pods)
         if suffix_starts:
             model_metrics = replace(
                 model_metrics,
                 suffix_windows=tuple(
-                    self._aggregate_model(model, start, window_end_ms, suffix_pods[start])
+                    self._aggregate_model(
+                        model,
+                        start,
+                        window_end_ms,
+                        _scrape_valid(suffix_pods[start], scraped, start + 1 if start_exclusive else start)[0],
+                    )
                     for start in suffix_starts
                 ),
             )
@@ -266,6 +281,7 @@ class MetricsStore:
         window_end_ms: int,
         *,
         span_start_ms: int | None = None,
+        scraped: dict[str, int | None] | None = None,
     ) -> dict[str, PodWindowMetrics]:
         hist_by_pod = self._read_legacy_docs(
             LEGACY_HIST_PREFIX,
@@ -288,6 +304,11 @@ class MetricsStore:
             )
             if pod_metrics is not None:
                 per_pod[pod_metrics.pod] = pod_metrics
+                if scraped is not None:
+                    _note_scraped(
+                        scraped, pod_metrics.pod, hist_by_pod.get(pod_key, []), inst_by_pod.get(pod_key, []),
+                        window_start_ms,
+                    )
         return per_pod
 
     def _read_legacy_docs(
@@ -569,6 +590,67 @@ class MetricsStore:
         if not values:
             return None
         return sum(values) / len(values)
+
+
+def _note_scraped(
+    scraped: dict[str, int | None],
+    pod: str,
+    hist_docs: list[dict[str, Any]],
+    inst_docs: list[dict[str, Any]],
+    read_start_ms: int,
+) -> None:
+    """``scraped[pod]`` = the newest gateway ``scraped_ms`` (wall-clock ms of the pod's
+    last successful /metrics fetch) of the pod's docs inside the window, None when none
+    carries it. A pod without a doc in the window (only the histogram baseline before
+    it) is not recorded: it contributes no window data either way."""
+    in_window = False
+    newest: int | None = None
+    for doc in (*hist_docs, *inst_docs):
+        if _number(doc.get("timestamp"), 0.0) < read_start_ms:
+            continue
+        in_window = True
+        raw = doc.get("scraped_ms")
+        if raw is None:
+            continue
+        value = int(_number(raw, -1.0))
+        if value >= 0 and (newest is None or value > newest):
+            newest = value
+    if in_window:
+        scraped[pod] = newest
+
+
+def _scrape_valid(
+    per_pod: dict[str, PodWindowMetrics], scraped: dict[str, int | None], read_start_ms: int
+) -> tuple[dict[str, PodWindowMetrics], tuple[str, ...]]:
+    """I3 (2026-10-04): the pods whose data is valid for a window, and the pods left out.
+
+    The gateway keeps a pod's last metrics when a /metrics fetch fails and still writes
+    them every round: frozen counters read as a zero-token window with a frozen queue.
+    A pod is valid for the window ``[read_start_ms, end]`` only if its last successful
+    scrape (``scraped_ms``) is at or after ``read_start_ms`` - compared with the doc
+    timestamps' clock (both are the gateway's wall clock; the window bounds are doc
+    timestamps), never with the controller's clock. A pod left out contributes nothing
+    (tokens, queue, latency); with no valid pod left the model's tokens are None
+    (unknown), never zero.
+
+    Backward compatibility: a gateway that does not write ``scraped_ms`` (no doc of the
+    model in the window carries it) keeps every pod. Once one doc carries it, the
+    gateway is new and a pod without it was never scraped successfully: left out. A pod
+    with no doc in the window (not in ``scraped``) is kept as before."""
+    if not any(value is not None for value in scraped.values()):
+        return per_pod, ()
+    kept: dict[str, PodWindowMetrics] = {}
+    stale: list[str] = []
+    for name, pod in per_pod.items():
+        if name not in scraped:
+            kept[name] = pod
+            continue
+        value = scraped[name]
+        if value is not None and value >= read_start_ms:
+            kept[name] = pod
+        else:
+            stale.append(name)
+    return kept, tuple(sorted(stale))
 
 
 def _doc_ticks(docs: list[dict[str, Any]]) -> tuple[int, ...]:
