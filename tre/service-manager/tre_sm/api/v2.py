@@ -3702,6 +3702,10 @@ class ServiceManagerV2:
         ``awake`` lease and is recorded awake (alert), nothing is slept."""
         if not snapshot.pod_ip or self._vllm_ops is None:
             return False
+        # A suspect may still hold its GPU lease (a gave-up wake recovery, a failed
+        # cold start; I1, 2026-10-04): it is released on "asleep" only when no wake
+        # is in flight - the sidecar's count is read BEFORE /is_sleeping.
+        waking = self._sidecar_waking(snapshot.pod_ip) if suspect else None
         physical = self._vllm_ops.is_sleeping(snapshot.pod_ip, port=8000)
         if physical is None:
             return False
@@ -3709,6 +3713,15 @@ class ServiceManagerV2:
         desired = self._desired_power_of(binding.binding_id)
         if physical is True:
             if suspect:
+                if self._holds_gpu_lease(binding.binding_id):
+                    if waking != 0:
+                        return False  # a wake may be in flight: next pass
+                    self._gpu_leases.release(binding)
+                    _log_event(
+                        "suspect_lease_released", level=logging.WARNING,
+                        binding_id=binding.binding_id, pod=snapshot.name,
+                        detail="engine reads asleep and the sidecar reports no wake in flight",
+                    )
                 self._note_binding_power_change(binding)
                 return True  # asleep: nothing held, nothing to record
             self._gpu_leases.release(binding)
@@ -3742,6 +3755,11 @@ class ServiceManagerV2:
         _log_event("container_restart_converged", binding_id=binding.binding_id,
                    physically_awake=physical is False, desired=desired)
         return True
+
+    def _holds_gpu_lease(self, binding_id: str) -> bool:
+        if self._gpu_leases is None:
+            return False
+        return any(lease.binding_id == binding_id for lease in self._gpu_leases.load())
 
     def _placeholder_verdict(self, binding: Binding) -> str | None:
         """None = the placeholder may be released; else why it is kept.
@@ -3859,6 +3877,11 @@ class ServiceManagerV2:
             result = self._vllm_ops.wake_up(ticket.pod_ip, port=8000)
             if not bool(getattr(result, "success", False)):
                 message = getattr(result, "message", "") or "operation failed"
+                if _unanswered(result):
+                    # No HTTP answer (VllmOps folds a timeout / connection error
+                    # into status_code None): the engine may still be waking - the
+                    # outcome is uncertain, not failed (I1, 2026-10-04).
+                    ticket.uncertain = True
                 raise failed(f"vLLM wake failed for {binding.serve_id}: {message}", "vllm_wake_failed")
             if self._fault_active("fail_wake", binding):
                 raise failed(f"vLLM wake failed for {binding.serve_id}: fault injected", "fault_injected")
@@ -3942,9 +3965,11 @@ class ServiceManagerV2:
                 LOG.exception("saving the wake of %s in the store failed", binding.binding_id)
                 ticket.store_error = exc
         if not ticket.woke and ticket.uncertain:
-            # A /wake_up that timed out may still wake the engine after we look:
-            # keep the lease + journal entry; the recovery rechecks after
-            # service_manager.wake.transport_recheck_s (desired restored then).
+            # A /wake_up without an answer may still wake the engine after we look:
+            # keep the lease + journal entry (``uncertain``). The recovery looks
+            # again no earlier than service_manager.wake.transport_recheck_s (a
+            # floor, not the proof) and releases only on the sidecar's waking == 0
+            # AND /is_sleeping true in one pass (desired restored then).
             recheck_s = float(getattr(self._sm_config, "wake_transport_recheck_s", 30.0))
             self._wake_journal.update(
                 binding.binding_id, recover_after_ms=int(time.time() * 1000 + recheck_s * 1000),
@@ -3989,8 +4014,9 @@ class ServiceManagerV2:
           released, else the ``awake`` lease (its GPUs are in use) and an alert;
         * unknown -> the lease and the journal entry are kept (the lease does not
           expire): the journal recovery decides once the pod can be read,
-          or gives up after ``service_manager.wake.recovery_unknown_attempts`` /
-          when the pod is not Ready (P2-5). A warning is logged.
+          or hands the binding to the suspect convergence (lease kept) after
+          ``service_manager.wake.recovery_unknown_attempts`` / when the pod is
+          not Ready (P2-5). A warning is logged.
         Best effort; never raises."""
         binding = ticket.binding
         try:
@@ -4146,9 +4172,13 @@ class ServiceManagerV2:
         (annotation, ``awake`` lease, store); asleep or gone -> rolled back (lease
         released, desired power restored from the entry); unknown -> kept for
         the next pass, at most ``service_manager.wake.recovery_unknown_attempts``
-        passes (then, or at once when the pod is not Ready, rolled back with an
-        alert, P2-5); a pod replaced since the wake (other UID) is rolled back
-        without touching the new pod (P2-4)."""
+        passes (then, or at once when the pod is not Ready, the desired power is
+        restored and the binding becomes a suspect that KEEPS its lease, with an
+        alert, P2-5 / I1); a pod replaced since the wake (other UID) is rolled back
+        without touching the new pod (P2-4). An unanswered /wake_up (entry
+        ``uncertain``) is rolled back only when the sidecar reports no wake in
+        flight AND the engine reads asleep in the same pass; else kept
+        (``wake_unsettled``)."""
 
         def stale() -> dict[str, dict]:
             now_ms = time.time() * 1000
@@ -4170,7 +4200,7 @@ class ServiceManagerV2:
                     LOG.exception("recovering the wake of %s failed", binding_id)
                     kept.append({"binding_id": binding_id, "result": f"error: {type(exc).__name__}"})
                     continue
-                (kept if result == "physical_state_unknown" else resolved).append(
+                (kept if result in _WAKE_RECOVERY_KEPT else resolved).append(
                     {"binding_id": binding_id, "result": result}
                 )
         if resolved or kept:
@@ -4209,28 +4239,61 @@ class ServiceManagerV2:
             self._roll_back_journaled_wake(ticket, binding_id)
             return "pod_replaced"
         ticket.pod_ip = str(snapshot.pod_ip)
+        uncertain = bool(entry.get("uncertain"))
+        # An unanswered /wake_up (``uncertain``): the sidecar's in-flight count is
+        # read BEFORE /is_sleeping - a wake still running then shows waking > 0; one
+        # that ended before it is reflected by /is_sleeping.
+        waking = self._sidecar_waking(ticket.pod_ip) if uncertain else None
         physical = self._vllm_ops.is_sleeping(ticket.pod_ip, port=8000)
         if physical is None:
             attempts = int(entry.get("recovery_attempts") or 0) + 1
             limit = int(getattr(self._sm_config, "wake_recovery_unknown_attempts", 12))
             if attempts >= limit or not snapshot.ready:
-                # P2-5: do not freeze the model forever. The GPUs are marked (gpu
-                # truth untrusted) so the next wake there probes the residents.
+                # P2-5: do not freeze the model forever - but never release the
+                # lease without evidence (I1, 2026-10-04): the binding becomes a
+                # suspect (GPUs never trusted from gpu-truth); the suspect
+                # convergence settles it once the pod reads asleep, or the orphan
+                # lease reaper once the Pod is gone.
                 _log_event(
                     "wake_recovery_gave_up",
                     level=logging.ERROR,
                     binding_id=binding_id, attempts=attempts, pod_ready=bool(snapshot.ready),
-                    detail="physical state unreadable; waking lease released, desired power restored",
+                    detail="physical state unreadable; GPU lease kept, binding now a suspect, desired power restored",
                 )
-                self._roll_back_journaled_wake(ticket, binding_id)
+                self._restore_wake_desired(ticket)
+                self._suspects[binding_id] = (
+                    binding.slot.node, tuple(int(g) for g in binding.slot.gpu_ids), str(snapshot.name or "")
+                )
+                self._wake_journal.end(binding_id)
+                self._note_binding_power_change(binding)
                 return "gave_up"
             self._wake_journal.update(binding_id, recovery_attempts=attempts)
             return "physical_state_unknown"
+        if physical is True and uncertain and waking != 0:
+            # Asleep now, but the unanswered /wake_up may still be running (or the
+            # sidecar cannot tell): kept for the next pass.
+            _log_event(
+                "wake_recovery_wake_in_flight", level=logging.WARNING,
+                binding_id=binding_id, sidecar_waking=waking,
+                detail="engine reads asleep but a wake may be in flight; GPU lease and journal entry kept",
+            )
+            return "wake_unsettled"
         ticket.woke = physical is False
         if not ticket.woke:
             ticket.exception = ValueError(f"{binding.serve_id} was found asleep after an interrupted wake")
         self._commit_wakes([ticket], restore_desired=True, update_store=True)
         return "completed" if ticket.woke else "rolled_back"
+
+    def _sidecar_waking(self, pod_ip: str) -> int | None:
+        """The reissue sidecar's count of /wake_up calls in flight (None =
+        unreadable: a wake may be in flight)."""
+        reader = getattr(self._vllm_ops, "sidecar_waking", None)
+        if not callable(reader) or not pod_ip:
+            return None
+        try:
+            return reader(pod_ip, port=8000)
+        except Exception:  # noqa: BLE001 - unreadable
+            return None
 
     def _roll_back_journaled_wake(self, ticket: "_WakeTicket", binding_id: str) -> None:
         if self._gpu_leases is not None:
@@ -6107,6 +6170,21 @@ def restart_placeholder_candidates(
 
 def _elapsed_ms(started: float) -> int:
     return int(round((time.monotonic() - started) * 1000))
+
+
+#: Wake journal recovery results that keep the entry for the next pass.
+_WAKE_RECOVERY_KEPT = frozenset({"physical_state_unknown", "wake_unsettled"})
+
+
+def _unanswered(result) -> bool:
+    """A vLLM call that got no HTTP answer (timeout / connection error:
+    ``VllmOpResult.status_code`` None) - the server may still act on it.
+    Results without a ``status_code`` attribute (test doubles) never count."""
+    return (
+        not bool(getattr(result, "success", False))
+        and hasattr(result, "status_code")
+        and result.status_code is None
+    )
 
 
 def _log_event(event: str, *, level: int = logging.INFO, **fields) -> None:

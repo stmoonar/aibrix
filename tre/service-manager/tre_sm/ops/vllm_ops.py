@@ -110,9 +110,36 @@ class VllmOps:
         return None
 
     def wake_up(self, pod_ip: str, *, port: int | None = None) -> VllmOpResult:
+        """POST /wake_up. Never retried after a call without an answer (2026-10-04):
+        the first one may still be running on the engine, and a retry only makes
+        the outcome harder to read. Such a result has status_code None: the
+        caller treats the wake as uncertain, not failed."""
         if self._wake_timeout_s is not None:
             return self._post(pod_ip, "wake_up", port=port, timeout_s=self._wake_timeout_s, max_attempts=1)
-        return self._post(pod_ip, "wake_up", port=port)
+        return self._post(pod_ip, "wake_up", port=port, retry_unanswered=False)
+
+    def sidecar_waking(self, pod_ip: str, *, port: int | None = None) -> int | None:
+        """``waking`` of the reissue sidecar's ``GET /tre-reissue/state`` (the
+        sidecar serves the pod's port and counts the /wake_up calls it is
+        forwarding to the engine). None when unreachable, not served or
+        undecodable - the caller must then assume a wake may be in flight."""
+        url = f"http://{pod_ip}:{port or self._default_port}/tre-reissue/state"
+        try:
+            response = self._http.get(url, timeout=self._timeout_s)
+            status = int(response.status_code)
+        except Exception:
+            return None
+        if not (200 <= status < 300):
+            return None
+        json_method = getattr(response, "json", None)
+        try:
+            payload = json_method() if callable(json_method) else None
+        except Exception:
+            return None
+        value = payload.get("waking") if isinstance(payload, dict) else None
+        if isinstance(value, bool) or not isinstance(value, int):
+            return None
+        return value
 
     def is_paused(self, pod_ip: str, *, port: int | None = None) -> bool | None:
         """``GET /is_paused`` (vLLM dev-mode router, next to /sleep): whether the
@@ -211,6 +238,7 @@ class VllmOps:
         headers: dict[str, str] | None = None,
         timeout_s: float | None = None,
         max_attempts: int | None = None,
+        retry_unanswered: bool = True,
     ) -> VllmOpResult:
         url = f"http://{pod_ip}:{port or self._default_port}/{action}"
         if query:
@@ -226,7 +254,12 @@ class VllmOps:
                 else:
                     response = self._http.post(url, timeout=timeout)
             except Exception as exc:  # pragma: no cover - exact transport exceptions vary.
+                # The last attempt decides: no answer = status_code None.
+                last_status = None
                 last_message = str(exc)
+                if not retry_unanswered:
+                    attempts = attempt
+                    break
                 continue
 
             last_status = int(response.status_code)

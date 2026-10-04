@@ -415,6 +415,9 @@ class FakeVllm:
         self.version_calls: list[str] = []
         #: pod IP -> /is_sleeping answer override (e.g. None = unreachable)
         self.physical_override: dict[str, bool | None] = {}
+        #: pod IP -> the reissue sidecar's in-flight /wake_up count (default 0;
+        #: None = /tre-reissue/state unreadable)
+        self.sidecar_wakes: dict[str, int | None] = {}
 
     def _log(self, *event):
         self.calls.append(event)
@@ -442,6 +445,9 @@ class FakeVllm:
         if pod_ip in self.physical_override:
             return self.physical_override[pod_ip]
         return self.sleeping.get(pod_ip)
+
+    def sidecar_waking(self, pod_ip, *, port=None):
+        return self.sidecar_wakes.get(pod_ip, 0)
 
     def version(self, pod_ip, *, port=None):
         self.version_calls.append(pod_ip)

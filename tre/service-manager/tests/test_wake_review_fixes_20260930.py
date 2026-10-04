@@ -168,6 +168,8 @@ def test_parallel_wake_recovery_gives_up_on_an_unreadable_pod(caplog):
     world.journal.begin("m1/node-a/0", {"serve_id": "pod-a", "model": "m1", "node": "node-a", "gpu_ids": [0],
                                         "pod_uid": "uid-pod-a", "previous_power": "sleeping"})
     world.vllm.physical_override["10.0.0.1"] = None
+    with fence(world.redis):
+        world.leases.acquire(Binding("pod-a", "m1", Slot("node-a", (0,)), awake=False), phase="awake")
 
     assert world.service.recover_wake_journal()["kept"][0]["result"] == "physical_state_unknown"
     with caplog.at_level(logging.ERROR, logger="tre_sm.api.v2"):
@@ -176,6 +178,13 @@ def test_parallel_wake_recovery_gives_up_on_an_unreadable_pod(caplog):
     assert result["resolved"] == [{"binding_id": "m1/node-a/0", "result": "gave_up"}]
     assert world.journal.entries() == {}
     assert _events(caplog, "wake_recovery_gave_up")
+    # I1 (2026-10-04): giving up is no evidence - the lease stays, the binding
+    # is a suspect until it reads asleep or its Pod is gone.
+    assert _leases(world)["m1/node-a/0"][0] == "awake"
+    assert "m1/node-a/0" in world.service._suspects
+    world.vllm.physical_override.pop("10.0.0.1")
+    world.service.guard_container_restarts()
+    assert _leases(world) == {}  # asleep, no wake in flight: released
 
 
 def test_parallel_wake_recovery_gives_up_at_once_when_the_pod_is_not_ready():

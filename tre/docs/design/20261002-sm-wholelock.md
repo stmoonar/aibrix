@@ -106,9 +106,18 @@ SM 已经改成"不排空、一律 abort"，sleep 留在锁外的只是十几毫
 - sleep：`/sleep` 10 s 内没有应答 → pod 保持隐藏，journal 标 `sleep_unconfirmed`，GPU 租约保留，
   立即返回并释放锁；之后每轮 supervisor 由 `recover_sleep_journal` 按物理状态结算（读到睡着记为
   已睡；仍读不到就继续隐藏并计数，审计报 `sleep_unconfirmed`）。
-- wake：`/wake_up` 10 s 内没有应答 → wake journal 与 `awake` 租约保留（卡继续被占），返回 409
-  `wake_failed` 并释放锁；`recover_wake_journal` 在 `wake.transport_recheck_s` 之后复核：醒了补记账，
-  睡着回滚，读不到最多保留 `wake.recovery_unknown_attempts` 轮。
+- wake：`/wake_up` 10 s 内没有应答（超时、连接错误；`VllmOps` 把它记为 `status_code` None，且
+  `/wake_up` 不再重试）→ 结果是"不确定"而不是"失败"：wake journal（标 `uncertain`）与 `awake` 租约
+  保留（卡继续被占），返回 409 `wake_failed` 并释放锁。`recover_wake_journal` 最早在
+  `wake.transport_recheck_s` 之后复核（这是正确性下限，不是证据）：醒了补记账；同一轮里先读 sidecar
+  的 `GET /tre-reissue/state` 得到 `waking == 0`、再读 `/is_sleeping == true` 才回滚并释放租约；其他组合
+  （包括 sidecar 读不到）保留到下一轮（`wake_unsettled`）。有 HTTP 应答的失败（4xx/5xx）仍是确定的失败。
+  引擎读不到时最多保留 `wake.recovery_unknown_attempts` 轮，之后（或 pod 不 Ready 时）恢复 desired、
+  结束 journal，但**不释放租约**：binding 进入 suspect，由重启守卫的 suspect 收敛处理（同样要
+  `waking == 0` 且读到睡着才释放；读到醒着按 desired 收敛），Pod 消失时由孤儿租约回收释放。
+- 不变量 I1（10-04）：GPU 租约只凭新鲜的物理证据释放——动作结束后读到的 `/is_sleeping == true`、
+  Pod 已从 Pod 列表消失、或 refresh_seq 新于该动作的 gpu-truth 样本；传输超时、HTTP 5xx、k8s 接受了
+  delete、重试用尽、"放弃"都不算。
 - 写锁 lease 由后台线程续约；进程活着但 Redis 连续一个 TTL 续约失败时 fence 视为丢失，操作在下一
   次检查（例如发 `/sleep` 之前）停下。持锁进程死掉时 lease 过期，下一个写操作拿到锁，
   `supersede_stale_operations` 把它留下的 running 记录标为 superseded，journal 恢复结算它做了一半的事。
