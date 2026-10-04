@@ -163,7 +163,9 @@ def create_app() -> FastAPI:
         seeded = seed_desired(registry, fleet_store, runtime_ops=k8s_ops, vllm_ops=vllm_ops)
         if seeded["added"]:
             LOG.info("seeded desired state from registry: %s", seeded)
-        gpu_leases.rebuild_awake(
+        carried_suspects = rebuild_gpu_leases(
+            gpu_leases,
+            k8s_ops,
             legacy_store.load().bindings,
             starting_bindings=starting_bindings + restart_placeholders,
             # Wakes a dead SM left journaled keep their GPUs until the journal
@@ -228,7 +230,7 @@ def create_app() -> FastAPI:
         ],
         restored_suspects=[
             (b.binding_id, b.slot.node, tuple(b.slot.gpu_ids), b.serve_id) for b in restart_conflicts
-        ],
+        ] + carried_suspects,
         # Read only while registry service_manager.test_hooks is true.
         fault_redis=redis_client,
         supervisor_enabled=os.environ.get(
@@ -238,6 +240,53 @@ def create_app() -> FastAPI:
             os.environ.get("TRE_SM_SUPERVISOR_INTERVAL_S", "5")
         ),
     )
+
+
+def rebuild_gpu_leases(
+    gpu_leases: GpuLeaseStore,
+    runtime_ops,
+    bindings: list[Binding],
+    *,
+    starting_bindings: list[Binding],
+    waking_bindings: list[Binding],
+) -> list[tuple[str, str, tuple[int, ...], str]]:
+    """Bootstrap lease rebuild (writer fence held). Returns the suspects to
+    restore.
+
+    I1 (2026-10-04): the previous service-manager may hold leases it had no
+    evidence to release - its suspects (a gave-up wake recovery, a failed cold
+    start), kept only in its memory. A lease the rebuild does not cover is
+    carried over unchanged, and its binding restored as a suspect, while any Pod
+    object of the binding exists (terminating included); the suspect
+    convergence or the orphan lease reaper then settles it on evidence. A lease
+    without a Pod is dropped (the Pod being gone is the evidence). The Pod list
+    unreadable: every such lease is carried (fail closed)."""
+    covered = {binding.binding_id for binding in bindings if binding.awake}
+    covered |= {binding.binding_id for binding in starting_bindings}
+    covered |= {binding.binding_id for binding in waking_bindings}
+    candidates = [lease for lease in gpu_leases.load() if lease.binding_id not in covered]
+    if candidates:
+        try:
+            live = set(runtime_ops.list_live_model_pod_binding_ids())
+        except Exception:  # noqa: BLE001 - fail closed: keep them all
+            LOG.warning("listing the model Pods failed at bootstrap; every uncovered GPU lease is kept", exc_info=True)
+            live = None
+        candidates = [lease for lease in candidates if live is None or lease.binding_id in live]
+    carried = gpu_leases.rebuild_awake(
+        bindings,
+        starting_bindings=starting_bindings,
+        waking_bindings=waking_bindings,
+        carried_leases=candidates,
+    )
+    carried_ids = {lease.binding_id for lease in carried}
+    for lease in candidates:
+        LOG.log(
+            logging.WARNING if lease.binding_id in carried_ids else logging.ERROR,
+            "bootstrap: GPU lease of %s (%s on %s/%s) %s; binding restored as a suspect",
+            lease.binding_id, lease.phase, lease.node, list(lease.gpu_ids),
+            "carried over" if lease.binding_id in carried_ids else "clashes with a rebuilt lease, not carried",
+        )
+    return [(lease.binding_id, lease.node, tuple(lease.gpu_ids), "") for lease in candidates]
 
 
 def check_service_manager_config(registry) -> None:

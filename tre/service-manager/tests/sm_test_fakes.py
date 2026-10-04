@@ -478,10 +478,16 @@ class FakeRuntime:
         self.patches: list[tuple[str, str, int]] = []
         self.events: list[tuple] | None = None
         self.fail_hide_for: set[str] = set()
+        #: UIDs of Pods that are terminating: no longer in the Running snapshots,
+        #: still Pod objects (K8sOps.list_live_model_pod_uids)
+        self.terminating_uids: set[str] = set()
 
     def list_pod_snapshots(self, *, model=None):
         values = list(self.snapshots.values())
         return [s for s in values if model is None or s.model == model]
+
+    def list_live_model_pod_uids(self):
+        return {s.pod_uid for s in self.snapshots.values() if s.pod_uid} | set(self.terminating_uids)
 
     def write_binding_annotations(self, binding, *, state):
         if state == "hidden" and binding.serve_id in self.fail_hide_for:

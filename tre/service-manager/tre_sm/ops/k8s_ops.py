@@ -330,21 +330,33 @@ class K8sOps:
         has not finished (Pending - e.g. waiting in the startup gate -, Running
         or terminating). A ``starting`` GPU lease whose binding has no such Pod
         outside a writer operation is an orphan (B11)."""
+        binding_ids: set[str] = set()
+        for pod in self._live_model_pods():
+            try:
+                binding_ids.add(self._startup_record_from_pod(pod).binding_id)
+            except (KeyError, ValueError):
+                continue
+        return binding_ids
+
+    def list_live_model_pod_uids(self) -> set[str]:
+        """UIDs of the same Pod objects as :meth:`list_live_model_pod_binding_ids`
+        (terminating ones included): a journaled wake's Pod is gone only when
+        its UID is not here (I1, 2026-10-04)."""
+        uids: set[str] = set()
+        for pod in self._live_model_pods():
+            uid = _metadata(pod).get("uid")
+            if uid:
+                uids.add(str(uid))
+        return uids
+
+    def _live_model_pods(self) -> list:
         pods = _items(
             self._api.list_namespaced_pod(
                 namespace=self._namespace,
                 label_selector=f"{MANAGED_LABEL}=true",
             )
         )
-        binding_ids: set[str] = set()
-        for pod in pods:
-            if _status(pod).get("phase") in {"Succeeded", "Failed"}:
-                continue
-            try:
-                binding_ids.add(self._startup_record_from_pod(pod).binding_id)
-            except (KeyError, ValueError):
-                continue
-        return binding_ids
+        return [pod for pod in pods if _status(pod).get("phase") not in {"Succeeded", "Failed"}]
 
     def admit_startup_pod(
         self,

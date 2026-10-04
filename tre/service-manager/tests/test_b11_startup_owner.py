@@ -395,7 +395,7 @@ def test_k8s_live_pod_binding_ids_include_gated_and_terminating_pods_only():
     def variant(name, gpus, phase, deleting=False):
         item = {
             "metadata": {
-                **base["metadata"], "name": name,
+                **base["metadata"], "name": name, "uid": f"uid-{name}",
                 "annotations": {GPU_IDS_ANNOTATION: gpus},
                 "deletionTimestamp": "2026-09-28T00:00:00Z" if deleting else None,
             },
@@ -414,3 +414,6 @@ def test_k8s_live_pod_binding_ids_include_gated_and_terminating_pods_only():
     assert _ops(api).list_live_model_pod_binding_ids() == {
         "m1/node-a/0", "m1/node-a/1", "m1/node-a/2",
     }
+    # I1 (2026-10-04): the same Pod objects by UID (a journaled wake's Pod).
+    assert {"uid-gated", "uid-running", "uid-terminating"} <= _ops(api).list_live_model_pod_uids()
+    assert "uid-failed" not in _ops(api).list_live_model_pod_uids()

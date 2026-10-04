@@ -217,13 +217,19 @@ class GpuLeaseStore:
         *,
         starting_bindings: list[Binding] | None = None,
         waking_bindings: list[Binding] | None = None,
-    ) -> None:
+        carried_leases: list[GpuLease] | None = None,
+    ) -> list[GpuLease]:
         """Replace every lease by the awake bindings' ``awake`` leases, the admitted
         startups' ``starting`` leases and the ``awake`` leases of the wakes the
         journal still holds (``waking_bindings``: a dead service-manager's wake) -
         a restart must not drop the fence of an engine that may be awake. A
         journaled binding that clashes with an awake / starting one is skipped
-        (the journal recovery resolves it)."""
+        (the journal recovery resolves it).
+
+        ``carried_leases``: previous leases kept as they are (phase, expiry) -
+        leases the last service-manager held without evidence to release them
+        (I1, 2026-10-04: its suspects). One that clashes with a lease rebuilt
+        above is skipped. Returns the carried leases actually written."""
         fence = current_fence()
         if fence is None:
             raise StateFenceError("GPU lease rebuild requires an active writer fence")
@@ -297,6 +303,19 @@ class GpuLeaseStore:
                 continue
             for field in fields:
                 mapping[field] = payload
+        carried: list[GpuLease] = []
+        for lease in carried_leases or []:
+            fields = [_gpu_field(lease.node, gpu_id) for gpu_id in lease.gpu_ids]
+            if any(field in mapping for field in fields):
+                continue
+            payload = json.dumps(
+                {**asdict(lease), "gpu_ids": list(lease.gpu_ids)},
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            for field in fields:
+                mapping[field] = payload
+            carried.append(lease)
         args = [fence.lock_value]
         for field, payload in sorted(mapping.items()):
             args.extend((field, payload))
@@ -309,6 +328,7 @@ class GpuLeaseStore:
         )
         if int(result) == -1:
             raise StateFenceError("writer fence is no longer active")
+        return carried
 
     def load(self) -> list[GpuLease]:
         raw = self._redis.hgetall(rediskeys.SM_GPU_LEASES_KEY) or {}

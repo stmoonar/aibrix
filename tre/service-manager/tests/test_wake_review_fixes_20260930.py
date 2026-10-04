@@ -181,10 +181,30 @@ def test_parallel_wake_recovery_gives_up_on_an_unreadable_pod(caplog):
     # I1 (2026-10-04): giving up is no evidence - the lease stays, the binding
     # is a suspect until it reads asleep or its Pod is gone.
     assert _leases(world)["m1/node-a/0"][0] == "awake"
-    assert "m1/node-a/0" in world.service._suspects
     world.vllm.physical_override.pop("10.0.0.1")
+    world.vllm.sidecar_wakes["10.0.0.1"] = 1
+    world.service.guard_container_restarts()
+    assert _leases(world)["m1/node-a/0"][0] == "awake"  # asleep, a wake in flight: kept
+    world.vllm.sidecar_wakes["10.0.0.1"] = 0
     world.service.guard_container_restarts()
     assert _leases(world) == {}  # asleep, no wake in flight: released
+
+
+def test_parallel_wake_recovery_of_a_dead_sm_entry_waits_for_the_wake_in_flight():
+    """An entry a dead SM left mid-wake (not marked uncertain): its /wake_up may
+    still be running too - the sidecar's count decides, like for an unanswered one."""
+    world = _world()
+    world.journal.begin("m1/node-a/0", {"serve_id": "pod-a", "model": "m1", "node": "node-a", "gpu_ids": [0],
+                                        "pod_uid": "uid-pod-a", "previous_power": "sleeping"})
+    with fence(world.redis):
+        world.leases.acquire(Binding("pod-a", "m1", Slot("node-a", (0,)), awake=False), phase="awake")
+    world.vllm.sidecar_wakes["10.0.0.1"] = 1
+
+    assert world.service.recover_wake_journal()["kept"][0]["result"] == "wake_unsettled"
+    assert _leases(world)["m1/node-a/0"][0] == "awake"
+    world.vllm.sidecar_wakes["10.0.0.1"] = 0
+    assert world.service.recover_wake_journal()["resolved"][0]["result"] == "rolled_back"
+    assert _leases(world) == {}
 
 
 def test_parallel_wake_recovery_gives_up_at_once_when_the_pod_is_not_ready():

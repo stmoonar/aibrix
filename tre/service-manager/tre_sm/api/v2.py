@@ -70,6 +70,7 @@ from tre_sm.ops.sleep_primitive import (
     SleepTarget,
     _parallel,
 )
+from tre_sm.ops.vllm_ops import NO_SIDECAR
 from tre_sm.state.replica_floor import (
     EXEMPT_PATHS,
     HIDE_PATH,
@@ -3716,9 +3717,12 @@ class ServiceManagerV2:
         if not snapshot.pod_ip or self._vllm_ops is None:
             return False
         # A suspect may still hold its GPU lease (a gave-up wake recovery, a failed
-        # cold start; I1, 2026-10-04): it is released on "asleep" only when no wake
-        # is in flight - the sidecar's count is read BEFORE /is_sleeping.
+        # cold start, a lease carried over a restart; I1, 2026-10-04): it is
+        # released on "asleep" only when no wake is in flight - the sidecar's count
+        # is read BEFORE /is_sleeping (no answer: next pass, no second probe).
         waking = self._sidecar_waking(snapshot.pod_ip) if suspect else None
+        if suspect and waking is None:
+            return False
         physical = self._vllm_ops.is_sleeping(snapshot.pod_ip, port=8000)
         if physical is None:
             return False
@@ -3727,8 +3731,8 @@ class ServiceManagerV2:
         if physical is True:
             if suspect:
                 if self._holds_gpu_lease(binding.binding_id):
-                    if waking != 0:
-                        return False  # a wake may be in flight: next pass
+                    if not self._no_wake_in_flight(waking, binding.binding_id, "suspect"):
+                        return False  # a wake is in flight: next pass
                     self._gpu_leases.release(binding)
                     _log_event(
                         "suspect_lease_released", level=logging.WARNING,
@@ -4242,22 +4246,30 @@ class ServiceManagerV2:
             snapshot = self._snapshot_for_binding(binding)
         except ValueError:
             snapshot = None
-        if snapshot is None or not snapshot.pod_ip:
-            self._roll_back_journaled_wake(ticket, binding_id)
-            return "pod_gone"
         journaled_uid = entry.get("pod_uid")
-        if journaled_uid and snapshot.pod_uid and str(snapshot.pod_uid) != str(journaled_uid):
-            # P2-4: the pod was replaced since the wake; the new one (loading, its
-            # own startup gate) is not the one we woke: never "complete" it.
+        # P2-4: the pod was replaced since the wake; the new one (loading, its own
+        # startup gate) is not the one we woke: never "complete" it.
+        replaced = bool(
+            snapshot is not None and journaled_uid and snapshot.pod_uid
+            and str(snapshot.pod_uid) != str(journaled_uid)
+        )
+        if snapshot is None or not snapshot.pod_ip or replaced:
+            # Not among the Running, non-terminating Pods - but a terminating Pod's
+            # engine may still be awake in its grace period (I1, 2026-10-04): rolled
+            # back only once no Pod object of it exists any more.
+            if not self._journaled_pod_gone(binding, journaled_uid):
+                return "pod_still_present"
             self._roll_back_journaled_wake(ticket, binding_id)
-            return "pod_replaced"
+            return "pod_replaced" if replaced else "pod_gone"
         ticket.pod_ip = str(snapshot.pod_ip)
         uncertain = bool(entry.get("uncertain"))
-        # An unanswered /wake_up (``uncertain``): the sidecar's in-flight count is
-        # read BEFORE /is_sleeping - a wake still running then shows waking > 0; one
-        # that ended before it is reflected by /is_sleeping.
-        waking = self._sidecar_waking(ticket.pod_ip) if uncertain else None
-        physical = self._vllm_ops.is_sleeping(ticket.pod_ip, port=8000)
+        # Every entry (an unanswered /wake_up, or one a dead SM left mid-wake): the
+        # sidecar's in-flight count is read BEFORE /is_sleeping - a wake still
+        # running then shows waking > 0; one that ended before it is reflected by
+        # /is_sleeping. A sidecar without an answer: the engine behind the same
+        # port is not probed (unknown this pass).
+        waking = self._sidecar_waking(ticket.pod_ip)
+        physical = None if waking is None else self._vllm_ops.is_sleeping(ticket.pod_ip, port=8000)
         if physical is None:
             attempts = int(entry.get("recovery_attempts") or 0) + 1
             limit = int(getattr(self._sm_config, "wake_recovery_unknown_attempts", 12))
@@ -4282,13 +4294,12 @@ class ServiceManagerV2:
                 return "gave_up"
             self._wake_journal.update(binding_id, recovery_attempts=attempts)
             return "physical_state_unknown"
-        if physical is True and uncertain and waking != 0:
-            # Asleep now, but the unanswered /wake_up may still be running (or the
-            # sidecar cannot tell): kept for the next pass.
+        if physical is True and not self._no_wake_in_flight(waking, binding_id, "wake_recovery"):
+            # Asleep now, but a /wake_up may still be running: kept for the next pass.
             _log_event(
                 "wake_recovery_wake_in_flight", level=logging.WARNING,
-                binding_id=binding_id, sidecar_waking=waking,
-                detail="engine reads asleep but a wake may be in flight; GPU lease and journal entry kept",
+                binding_id=binding_id, sidecar_waking=waking, uncertain=uncertain,
+                detail="engine reads asleep but a wake is in flight; GPU lease and journal entry kept",
             )
             return "wake_unsettled"
         ticket.woke = physical is False
@@ -4297,16 +4308,54 @@ class ServiceManagerV2:
         self._commit_wakes([ticket], restore_desired=True, update_store=True)
         return "completed" if ticket.woke else "rolled_back"
 
-    def _sidecar_waking(self, pod_ip: str) -> int | None:
-        """The reissue sidecar's count of /wake_up calls in flight (None =
-        unreadable: a wake may be in flight)."""
+    def _sidecar_waking(self, pod_ip: str) -> int | str | None:
+        """The reissue sidecar's count of /wake_up calls in flight;
+        :data:`NO_SIDECAR` when the pod has none (also: vLLM ops that cannot
+        ask); None = no answer (a wake may be in flight)."""
         reader = getattr(self._vllm_ops, "sidecar_waking", None)
-        if not callable(reader) or not pod_ip:
+        if not callable(reader):
+            return NO_SIDECAR
+        if not pod_ip:
             return None
         try:
             return reader(pod_ip, port=8000)
         except Exception:  # noqa: BLE001 - unreadable
             return None
+
+    @staticmethod
+    def _no_wake_in_flight(waking, binding_id: str, context: str) -> bool:
+        """Whether ``waking`` (read before an /is_sleeping that said asleep) rules
+        out a wake still in flight. No sidecar (404): /is_sleeping alone is the
+        evidence - weaker (a wake still queued in front of the engine is not
+        seen), logged as such."""
+        if waking == 0:
+            return True
+        if waking == NO_SIDECAR:
+            _log_event(
+                "lease_release_weak_evidence", level=logging.WARNING,
+                binding_id=binding_id, context=context,
+                detail="no reissue sidecar (GET /tre-reissue/state 404): /is_sleeping alone taken as evidence",
+            )
+            return True
+        return False
+
+    def _journaled_pod_gone(self, binding: Binding, pod_uid) -> bool:
+        """No Pod object (Pending, Running or terminating) of the journaled wake
+        exists any more: by its UID, else by its binding. Unreadable - or a
+        runtime that cannot tell - is not gone (fail closed)."""
+        if pod_uid:
+            lister = getattr(self._runtime_ops, "list_live_model_pod_uids", None)
+            key = str(pod_uid)
+        else:
+            lister = getattr(self._runtime_ops, "list_live_model_pod_binding_ids", None)
+            key = binding.binding_id
+        if not callable(lister):
+            return False
+        try:
+            return key not in set(lister())
+        except Exception:  # noqa: BLE001 - unreadable: kept
+            LOG.warning("listing the model Pods failed; journaled wake of %s kept", binding.binding_id, exc_info=True)
+            return False
 
     def _roll_back_journaled_wake(self, ticket: "_WakeTicket", binding_id: str) -> None:
         if self._gpu_leases is not None:
@@ -6186,7 +6235,7 @@ def _elapsed_ms(started: float) -> int:
 
 
 #: Wake journal recovery results that keep the entry for the next pass.
-_WAKE_RECOVERY_KEPT = frozenset({"physical_state_unknown", "wake_unsettled"})
+_WAKE_RECOVERY_KEPT = frozenset({"physical_state_unknown", "wake_unsettled", "pod_still_present"})
 
 
 def _unanswered(result) -> bool:

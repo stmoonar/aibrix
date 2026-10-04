@@ -162,7 +162,7 @@ class World:
         self.service = self.make_service()
         self.client = TestClient(create_app(self.service))
 
-    def make_service(self) -> ServiceManagerV2:
+    def make_service(self, **extra) -> ServiceManagerV2:
         """A service-manager process on this world's state (a restart = a new one)."""
         return ServiceManagerV2(
             self.registry,
@@ -177,6 +177,7 @@ class World:
             sleep_journal=SleepJournal(self.redis),
             wake_journal=WakeJournal(self.redis),
             sleep_clock=self.clock,
+            **extra,
         )
 
     def _guard_one_awake_engine_per_gpu(self) -> None:

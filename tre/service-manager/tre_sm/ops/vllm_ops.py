@@ -4,6 +4,10 @@ from dataclasses import dataclass
 from typing import Protocol
 
 
+#: :meth:`VllmOps.sidecar_waking` when the pod has no reissue sidecar (404).
+NO_SIDECAR = "no_sidecar"
+
+
 class HttpTransport(Protocol):
     def post(self, url: str, *, timeout: float, headers: dict[str, str] | None = None): ...
     def get(self, url: str, *, timeout: float): ...
@@ -118,17 +122,26 @@ class VllmOps:
             return self._post(pod_ip, "wake_up", port=port, timeout_s=self._wake_timeout_s, max_attempts=1)
         return self._post(pod_ip, "wake_up", port=port, retry_unanswered=False)
 
-    def sidecar_waking(self, pod_ip: str, *, port: int | None = None) -> int | None:
+    def sidecar_waking(self, pod_ip: str, *, port: int | None = None) -> int | str | None:
         """``waking`` of the reissue sidecar's ``GET /tre-reissue/state`` (the
         sidecar serves the pod's port and counts the /wake_up calls it is
-        forwarding to the engine). None when unreachable, not served or
-        undecodable - the caller must then assume a wake may be in flight."""
+        forwarding to the engine).
+
+        * an int: the in-flight count;
+        * :data:`NO_SIDECAR`: HTTP 404 - no sidecar in front of the engine
+          (reissue disabled: the path reaches vLLM); the caller may fall back to
+          weaker evidence;
+        * None: no answer (timeout, connection error), another status or an
+          undecodable body - a wake may be in flight; the engine on the same
+          port is not worth probing either."""
         url = f"http://{pod_ip}:{port or self._default_port}/tre-reissue/state"
         try:
             response = self._http.get(url, timeout=self._timeout_s)
             status = int(response.status_code)
         except Exception:
             return None
+        if status == 404:
+            return NO_SIDECAR
         if not (200 <= status < 300):
             return None
         json_method = getattr(response, "json", None)
