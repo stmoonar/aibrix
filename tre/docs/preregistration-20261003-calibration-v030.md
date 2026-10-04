@@ -115,3 +115,8 @@
 ## 偏离记录
 
 （采集开始后，任何对上文的偏离追加于此。）
+
+- 2026-10-04（T14 开始前登记；采集期间更早的偏离见 `calib_20261003/ATTEMPTS.md`：14b run2 → run2b、7b P1 → p1r2）
+  - **T14 预注册的 `t14.gateway.known_difference` 写错了**（`t14/preregistration.json`，sha256 `59608505…`）。它说训练 / M 走按模型的 HTTPRoute、T14 走 ext_proc。本轮实际上训练（run1 / run2b / supp / p1 的数据集 manifest `load_path`）、M 和 T14 都走 `least-gpu-cache`、同一个 chat URL，没有路径差别。不重新封存，以本条为准。对结论无影响。
+  - **容量先验 S1 留一误差 −265% 的来源是 S2，不是 S1。** 14b 的 S2 边界是外推值：`P_b50_rf` 2.065 > `rf_max` 1.3（斜率 2.8，数据内没有转折）。去掉 S2 重拟合，8 个 T14 形状的预测只变 −8.5% 到 +7.1%（G512x256 −8.5%，G512x1024 +7.1%，其余在 ±4.3% 内）；去掉 S2 后 S1 的留一误差为 −29%。先验的形式由计划固定，不重新锚定，T14 照原先验（sha256 已封存）采集。
+  - **run1 14b 的用途更正。** ATTEMPTS 10-03 23:31 那条说"run1 14b（node10）只作 D2 先验"。实际上：冻结用的训练集包含 `run1/dsqwen-14b` 的恒定负载 cell（trainset `run1|*` 共 445 行：bisect 62、coarse 149、dwell 85、extend 149）；M 的 3 个保留混合 cell 也来自 `run1/dsqwen-14b/dataset`（run_M.sh `RETAINED_DATASET`）。run1 14b 采集时没有 void（ATTEMPTS 10-03 18:31），每个 cell 都过了 reissue 污染检查。以本条为准。
