@@ -569,8 +569,7 @@ class ServiceManagerV2:
         self,
         model: str,
         *,
-        wake_replicas: int | None = None,
-        delta: int | None = None,
+        wake_replicas: int,
         within_bindings: bool = False,
         sleep_path: str = "scale_down",
         drain_budget_s: float | None = None,
@@ -585,12 +584,11 @@ class ServiceManagerV2:
         concurrent request waits for the lock (``writer_lock_wait_s``, then 409
         ``writer_busy``); it never sees this one half-way.
 
-        ``delta`` (instead of ``wake_replicas``): a relative target, converted
-        under the writer lock from the model's awake and not hidden bindings -
-        the count ``/models_replicas`` reports, which the APA arm computes its
-        delta from - so two concurrent relative requests never convert from the
-        same base. ``within_bindings``: a growth past the model's bindings is a
-        no-op answered with ``at_bindings_limit`` (no cold create; v1 /wake_up).
+        ``wake_replicas`` is an absolute target (I2, 2026-10-04): a replayed or
+        duplicated request is harmless. Relative callers (v1 /scale_service,
+        /wake_up) convert at arrival, outside the lock - see v1_compat.
+        ``within_bindings``: a growth past the model's bindings is a no-op
+        answered with ``at_bindings_limit`` (no cold create; v1 /wake_up).
 
         A shrink is clamped at the replica floor on EVERY path (2026-10-02):
         200 with ``taken`` (bindings put to sleep) and ``clamped_by_floor``
@@ -611,12 +609,11 @@ class ServiceManagerV2:
         slept go "sleeping"; a failed wake's desired record is restored.
         ``drain_budget_s`` is deprecated and ignored (the SM never drains).
         """
-        request = {"model": model, "wake_replicas": wake_replicas, "delta": delta, "sleep_path": sleep_path}
+        request = {"model": model, "wake_replicas": wake_replicas, "sleep_path": sleep_path}
         with self._writer("put_model_target", request=request):
             return self._put_model_target_locked(
                 model,
                 wake_replicas=wake_replicas,
-                delta=delta,
                 within_bindings=within_bindings,
                 sleep_path=sleep_path,
                 at_least=at_least,
@@ -628,37 +625,25 @@ class ServiceManagerV2:
         self,
         model: str,
         *,
-        wake_replicas: int | None,
+        wake_replicas: int,
         sleep_path: str,
-        delta: int | None = None,
         within_bindings: bool = False,
         at_least: bool = False,
         hints: tuple[str, ...] = (),
         avoid_gpus: tuple[str, ...] = (),
     ) -> dict:
         spec = self._registry.model(model)
-        if (wake_replicas is None) == (delta is None):
-            raise ValueError("exactly one of wake_replicas and delta is required")
-        if delta is not None and at_least:
-            raise ValueError("at_least applies to an absolute wake_replicas only")
-        if wake_replicas is not None and wake_replicas < 0:
+        if wake_replicas < 0:
             raise ValueError("wake_replicas must be non-negative")
         snapshot = self._store.load()
         model_bindings = [binding for binding in snapshot.bindings if binding.model == model]
         awake = [binding for binding in model_bindings if binding.awake]
-        base = None
-        if delta is not None:
-            base = sum(1 for binding in awake if not binding.hidden)
-            wake_replicas = max(0, base + int(delta))
         response = {
             "model": model,
             "wake_replicas": wake_replicas,
             "version": snapshot.version,
             "actions": [],
         }
-        if delta is not None:
-            response["delta"] = int(delta)
-            response["base"] = base
         if within_bindings and wake_replicas > len(model_bindings):
             # v1 /wake_up: no cold create - answered "delayed" by the caller.
             response["at_bindings_limit"] = True
@@ -6470,10 +6455,8 @@ class RetryLater(RuntimeError):
 
 
 class TargetRequest(BaseModel):
-    #: Absolute target; or ``delta`` (relative to the awake and not hidden
-    #: bindings, converted under the writer lock). Exactly one of them.
-    wake_replicas: int | None = None
-    delta: int | None = None
+    #: Absolute target (I2: a replay is harmless).
+    wake_replicas: int
     #: S5: serve ids of sleeping bindings to prefer (placement hints; the SM may
     #: substitute a hint it cannot wake - see ``picked`` in the response).
     hints: list[str] = []
@@ -6762,7 +6745,6 @@ def create_app(service: ServiceManagerV2) -> FastAPI:
             return service.put_model_target(
                 model,
                 wake_replicas=request.wake_replicas,
-                delta=request.delta,
                 sleep_path=_sleep_path(request.sleep_path),
                 drain_budget_s=request.drain_budget_s,
                 at_least=request.at_least,

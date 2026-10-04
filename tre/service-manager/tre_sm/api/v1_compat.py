@@ -10,7 +10,7 @@ def create_v1_compat_router(service) -> APIRouter:
     @router.post("/models_replicas")
     def models_replicas(models: str = Query(...)) -> dict[str, int]:
         # The light state (store only, no Pod LIST): awake and not hidden - the
-        # base /scale_service converts a delta from.
+        # base /scale_service converts a delta from (at arrival).
         state = service.get_state()
         result: dict[str, int] = {}
         for model in _split_models(models):
@@ -25,21 +25,25 @@ def create_v1_compat_router(service) -> APIRouter:
     ) -> dict[str, int]:
         if scale_value < 0:
             raise HTTPException(status_code=400, detail="scale_value must be non-negative")
+        # The delta becomes an absolute target HERE, at arrival, from the same
+        # count /models_replicas reports (2026-10-04, I2): APA computed its delta
+        # from that count, so a retried or duplicated call converts to the same
+        # target and is harmless. (Converting under the writer lock instead let
+        # retries stack: two "+1" from one base woke two.) Remaining race: two
+        # DIFFERENT deltas computed from one base by different callers - only an
+        # absolute desiredReplicas from APA removes it (deferred, design note).
+        current = _awake_count(service.get_state(), model_name)
         if scale_type == "up":
-            delta = scale_value
+            target = current + scale_value
         elif scale_type == "down":
-            delta = -scale_value
+            target = max(0, current - scale_value)
         else:
             raise HTTPException(status_code=400, detail="scale_type must be up or down")
         try:
-            # A delta, converted under the writer lock from the awake and not
-            # hidden count (2026-10-02; it was converted here, outside the lock,
-            # from the same count): the same target as before for one call, and
-            # two concurrent calls add up instead of converting from one base.
             # APA scale-downs take the "apa" sleep path (no drain, like every
             # sleep of the service-manager); a scale-up ignores it. ``actual``
-            # stays the number of wake / sleep actions of THIS call.
-            response = service.put_model_target(model_name, delta=delta, sleep_path="apa")
+            # is the number of wake / sleep actions of THIS call.
+            response = service.put_model_target(model_name, wake_replicas=target, sleep_path="apa")
         except (KeyError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return {"requested": scale_value, "actual": len(response["actions"])}
@@ -51,10 +55,12 @@ def create_v1_compat_router(service) -> APIRouter:
         queue_len: int = Query(0),
     ) -> dict:
         del kind, queue_len
+        # One more than awake and not hidden, converted at arrival like
+        # /scale_service (a replay is harmless); never past the model's bindings
+        # (no cold create) - "delayed" then, as before.
+        current = _awake_count(service.get_state(), model_name)
         try:
-            # One more than awake and not hidden, under the writer lock; never past
-            # the model's bindings (no cold create) - "delayed" then, as before.
-            response = service.put_model_target(model_name, delta=1, within_bindings=True)
+            response = service.put_model_target(model_name, wake_replicas=current + 1, within_bindings=True)
         except (KeyError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         if response.get("at_bindings_limit"):

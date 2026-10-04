@@ -3,7 +3,7 @@ every write holds the writer lock from start to end; requests queue on it.
 
 One test per risk: concurrent requests serialize and keep one awake engine per
 GPU, a hung /sleep or /wake_up leaves the books fenced and releases the lock for
-the recovery, relative targets are converted under the lock, the transfer
+the recovery, a replayed relative target is harmless (converted at arrival), the transfer
 primitive (POST /v2/transfers) and its failure / crash paths, /v2/state's
 routable view, the floor and routable_unknown answers, supervisor isolation.
 
@@ -261,24 +261,32 @@ def test_two_concurrent_requests_serialize_on_the_lock_and_keep_one_engine_per_g
     assert world.violations == []
 
 
-def test_a_relative_target_is_converted_under_the_lock_two_ups_wake_two():
-    """/scale_service up 1 twice at once (APA): each converts its delta from the
-    awake count it sees under the lock - two more awake, not one."""
+def test_a_replayed_scale_up_from_one_base_is_harmless():
+    """I2 (2026-10-04): APA's /scale_service up 1, sent again (a retry after its
+    client timeout) while the first still runs, converts at arrival from the same
+    awake count - the target is base + 1 both times, not base + 2."""
     world = World(pods=(("x-2", "x", (2,), "sleeping"), ("x-3", "x", (3,), "sleeping")))
     call = lambda: world.client.post("/scale_service", params={"model_name": "x", "scale_type": "up", "scale_value": 1})
-    entered, release = world.hold_inside("wake_up", world.ip_of["x-2"])
+    entered, release = threading.Event(), threading.Event()
+    original = world.vllm.wake_up
+
+    def hold_first(pod_ip, *, port=None):  # whichever binding the SM picks
+        if not entered.is_set():
+            entered.set()
+            assert release.wait(5)
+        return original(pod_ip, port=port)
+
+    world.vllm.wake_up = hold_first
     first, first_box = _run(call)
     assert entered.wait(5)
     second, second_box = _run(call)
-    assert world.coordinator.waiting.wait(5)
+    assert world.coordinator.waiting.wait(5)  # converted, now queued on the lock
     release.set()
     first.join(5)
     second.join(5)
 
-    statuses = [box["result"].status_code for box in (first_box, second_box)]
-    assert statuses == [200, 200]
-    assert [box["result"].json()["actual"] for box in (first_box, second_box)] == [1, 1]
-    assert world.awake("x-2") and world.awake("x-3")
+    assert [box["result"].status_code for box in (first_box, second_box)] == [200, 200]
+    assert [world.awake("x-2"), world.awake("x-3")].count(True) == 1
     assert world.violations == []
 
 

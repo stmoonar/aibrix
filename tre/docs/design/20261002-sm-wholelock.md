@@ -122,8 +122,9 @@ SM 已经改成"不排空、一律 abort"，sleep 留在锁外的只是十几毫
 - **`/target` 的 floor**：所有缩容路径都按 floor 收紧，返回 200，带 `taken`（实际睡下的数量）和
   `clamped_by_floor`（floor 留下了副本时为 true）；只有 `/power` 点名的 sleep 和 SafeScale 隐藏仍返回
   409 `floor_violation`。Pod LIST 或 Redis 读取失败时，在任何隐藏之前返回结构化 409 `routable_unknown`。
-- **相对量**：`/target` 接受 `delta`（与 `wake_replicas` 二选一），在锁内按"醒着且未隐藏"的数量换算；
-  v1 的 `/scale_service`、`/wake_up` 改用它，返回形状不变。
+- **相对量**（10-04 改回 main 的语义）：`/target` 只接受绝对量 `wake_replicas`，不再接受 `delta`。
+  v1 的 `/scale_service`、`/wake_up` 在请求到达时（锁外）按"醒着且未隐藏"的数量把相对量换成绝对目标，
+  再调 `/target`；返回形状不变。原因见 §7"重放与重试"。
 - **`POST /v2/transfers`** `{donor_model, receiver_model, count, sleep_path（默认 urgent；safescale_commit
   → 400）, donor_bindings?, avoid_gpus?}`。响应 `{transfer_id, pairs[{donor, donors, donor_binding_ids,
   receiver, receiver_binding_id, node, gpu_ids, status: done|donor_sleep_failed|receiver_wake_failed,
@@ -157,18 +158,26 @@ AIBrix 的 APA 臂（`pkg/controller/podautoscaler/workload_scale.go`）先 `POS
 重新算 delta）。它的 HTTP 客户端超时是 10 s。
 
 - 单次调用的结果与改动前相同：`/models_replicas` 仍是"醒着且未隐藏"的数量（轻量路径，不做 Pod
-  LIST）；`/scale_service` 的 delta 以同一个数量为基数换算，只是换算从锁外移到了锁内；缩容走 `apa`
+  LIST）；`/scale_service` 的 delta 在请求到达时以同一个数量为基数换算（与 main 相同）；缩容走 `apa`
   路径，floor 收紧与改动前相同（原来就只对 `apa` 收紧）；不排空、abort 的行为与改动前的 no-drain
   路径相同（无在途请求时由 `mode=wait` 改成 `mode=abort`，效果相同）；放不满的扩容仍按原来的方式报错；
   返回 `{requested, actual}` 不变。`/wake_up` 仍是"醒着且未隐藏的数量 + 1，不超过 binding 数，超过时
   `delayed`"。
-- 并发时更准确：两次并发的相对调用不会再从同一个基数换算（原来在锁外读数）。
+- **重放与重试**（10-04）：外部请求按绝对目标执行（不变量 I2：重放无害）。10-02 版曾把换算移到锁内，
+  结果是重试会叠加：APA 的调用超过 10 s 客户端超时后，AIBrix 重新 reconcile 时 SM 端的第一次调用可能
+  还在锁上排队或执行，此时 `/models_replicas` 还没反映它，APA 再发一次同样的 "+1"，两次在锁内依次
+  换算成 base+1 和 base+2，多醒一个。在到达时换算后，两次都是 base+1，第二次是空操作。
+- **剩下的竞态**：同一次 reconcile 内，两个**不同的**调用方（或不同的 delta）从同一个基数各自换算，
+  后执行的会覆盖先执行的（lost update）。完整的修法是 APA 直接发绝对的 `desiredReplicas`（改 AIBrix
+  的 Go 代码和 SM 的 v1 接口），推迟到 E1 之后。gateway 的 `/wake_up`（+1）同样在到达时换算；
+  当前部署 `HOT_SWITCH=0`，不会调用它。
 - RetryLater 的 409 不再出现：原来一个唤醒还在锁外进行时，APA 的调用会收到 409，AIBrix 记一次
   `FailedRescale` 并退避重试；现在调用在锁上等待后执行，少了这类失败事件和退避。
 - 需要注意的一点：调用现在可能在锁上等待。APA 臂里 TRE controller 处于 observe，只有 APA 自己和
   supervisor 的维护操作会写，排队通常只有几秒；但如果等待加执行超过 AIBrix 的 10 s 客户端超时，
   AIBrix 会把这次调用记为失败并重新 reconcile，而 SM 端的请求仍会执行（同步处理函数不会因为客户端
-  断开而取消）。下一次 reconcile 会按新的数量重新算 delta，最多产生一次额外的扩 / 缩，随后被纠正。
+  断开而取消）。下一次 reconcile 会按新的数量重新算 delta；若第一次还没执行完，第二次按同一基数换算出同一个
+  绝对目标，不会叠加（见上面"重放与重试"）。
   这一点在改动前也存在（原来的等锁上限是 10 s），只是现在的等锁上限变为 30 s。
 
 ## 8. 测试
