@@ -62,14 +62,21 @@ D2 single-class shape: a shape whose windows are all one class has no BA and no 
    (``undefined``); the claim of its kind is then ``not_evaluable`` - the shape is NOT
    dropped to claim on the rest; the SD over the remaining shapes is disclosure only. The
    pooled A is computed on all windows as usual.
-D3 void at audit: the prereg's void_rule, mechanically. A cell void at audit whose evaluated
-   attempt is its first (attempt 1) -> ``void_redrive_required:<cell ids>`` (re-drive it once,
-   then evaluate); a cell void at audit whose evaluated attempt is already a re-drive
-   (attempt >= 2: its second void) -> ``run_void`` (the run is stopped, never evaluated;
-   re-run all 24 into a new root). In both cases there is no verdict; every metric is still
-   written under ``disclosure_not_an_evaluation``. CONFLICT FLAGGED (not implemented): the
-   discussion's "two or more void cells -> run_void" is not the prereg's per-cell reading;
-   it is reported as ``status_if_two_void_cells_stop_the_run`` for the owner, nothing more.
+D3 void at audit (interpretation decided 2026-10-04 evening +08:00, before any M or T14 data
+   was opened; owner approval). A cell is void at audit when its non-cut model errors /
+   sent > 0.05. Voids of a cell = its void attempts at run time (attempt - 1: the machinery
+   re-drives only a void attempt) + 1 if it is void at audit.
+   PRIMARY reading (decides status and verdict) - per cell, as ``calibration_ladder.drive_cell``
+   counts "a second void": a cell with 2 voids -> ``run_void`` (stopped, never evaluated;
+   re-run all 24 into a new root); else a cell void at audit -> ``void_redrive_required:<cells>``
+   (re-drive each once, then evaluate); else ``evaluated``. Rationale: the prereg text refers
+   to this registered machinery, and T14 is collected under it.
+   SENSITIVITY reading (disclosed with equal visibility, never decides) - run level: 2 or more
+   voids anywhere in the run (2 voided cells, or one cell voided twice) -> ``run_void``; one
+   void that is an audit void -> ``void_redrive_required:<cell>``; else ``evaluated``.
+   The output carries ``voided_cells``, ``void_status_primary`` and
+   ``void_status_run_level_sensitivity`` side by side. Without a verdict every metric is
+   written under ``disclosure_not_an_evaluation``.
 D4 a model_error without ``e2e_ms`` is non-cut.
 D5 A's training BA is the freeze's pooled ``train_ba_at_published`` (as accept).
 
@@ -167,12 +174,11 @@ DECISIONS = {
     "D2_single_class_shape": "a single-class shape has no BA and no AUROC; its kind's claim is not_evaluable (the "
                              "shape is not dropped); the SD over the remaining shapes is disclosure only; pooled A "
                              "unaffected",
-    "D3_void_at_audit": "prereg void_rule per cell: void at audit on attempt 1 -> void_redrive_required:<cells> "
-                        "(re-drive once, then evaluate); on a re-driven attempt (>= 2, its second void) -> run_void "
-                        "(re-run all 24); no verdict in either case, metrics only as disclosure",
-    "D3_conflict_flagged": "'two or more void cells -> run_void' (design discussion) is not the prereg's per-cell "
-                           "reading of 'a second void stops the run'; reported as "
-                           "status_if_two_void_cells_stop_the_run, owner decides",
+    "D3_void_rule_primary": "per cell (calibration_ladder.drive_cell): a cell with 2 voids (run-time void attempts + "
+                            "audit void) -> run_void; else an audit-void cell -> void_redrive_required:<cells>; decides",
+    "D3_void_rule_sensitivity": "run level: 2 or more voids in the run (2 voided cells or one cell twice) -> run_void; "
+                                "one audit void -> void_redrive_required:<cell>; disclosed side by side, never decides",
+    "D3_decided": "2026-10-04 evening +08:00, owner approval, before any M or T14 data was opened",
     "D4_model_error_without_e2e": "non-cut",
     "D5_training_ba": "the freeze's pooled train_ba_at_published",
     "audit_scope": "the evaluated (valid) attempt only, voided earlier attempts excluded; warm-up included "
@@ -399,25 +405,33 @@ def censoring_audit(requests_csv: Path, cells: Mapping[tuple, Mapping[str, Any]]
 
 
 def void_status(audit: Mapping[str, Any]) -> dict:
-    """D3: the prereg's void_rule applied to the cells void at audit, per cell."""
-    void = [c for c in audit["cells"] if c["void_at_audit"]]
-    second = sorted(c["cell_id"] for c in void if int(c["attempt"]) >= 2)
-    first = sorted(c["cell_id"] for c in void if int(c["attempt"]) < 2)
-    if second:
-        status = STATUS_RUN_VOID
-        why = (f"cell(s) {second} void at audit on a re-driven attempt (their second void): the run is stopped "
-               "and never evaluated - re-run all 24 cells into a new root")
-    elif first:
-        status = f"{STATUS_REDRIVE}:{','.join(first)}"
-        why = (f"cell(s) {first} void at audit on attempt 1: re-drive each once, then evaluate (the re-driven "
-               "attempt is scored in place of the void one)")
+    """D3: the prereg's void_rule under the primary (per cell) and the sensitivity (run
+    level) reading, side by side. Run-time voids of a cell = its evaluated attempt - 1."""
+    voids = {c["cell_id"]: (int(c["attempt"]) - 1) + int(bool(c["void_at_audit"])) for c in audit["cells"]}
+    audit_void = sorted(c["cell_id"] for c in audit["cells"] if c["void_at_audit"])
+    voided = sorted(cid for cid, n in voids.items() if n >= 1)
+    twice = sorted(cid for cid, n in voids.items() if n >= 2)
+    if twice:
+        primary = (STATUS_RUN_VOID, f"cell(s) {twice} voided twice (per-cell second void): the run is stopped, "
+                                    "never evaluated - re-run all 24 cells into a new root")
+    elif audit_void:
+        primary = (f"{STATUS_REDRIVE}:{','.join(audit_void)}",
+                   f"cell(s) {audit_void} void at audit, first void each: re-drive each once, then evaluate")
     else:
-        status, why = STATUS_EVALUATED, "no cell void at audit"
-    alt = (STATUS_RUN_VOID if len(void) >= 2 else status)
-    return {"status": status, "why": why, "void_rule": VOID_RULE_TEXT,
-            "void_cells_first_attempt": first, "void_cells_second_void": second,
-            "status_if_two_void_cells_stop_the_run": alt,
-            "status_if_two_void_cells_stop_the_run_note": "NOT the implemented rule (conflict flagged, owner decides)"}
+        primary = (STATUS_EVALUATED, "no cell void at audit")
+    total = sum(voids.values())
+    if total >= 2:
+        sens = (STATUS_RUN_VOID, f"{total} voids in the run (cells {voided}): a second void stops the run")
+    elif audit_void:
+        sens = (f"{STATUS_REDRIVE}:{','.join(audit_void)}", "one void in the run, at audit: re-drive it once")
+    else:
+        sens = (STATUS_EVALUATED, "at most one void in the run, none at audit")
+    return {"void_rule": VOID_RULE_TEXT, "voided_cells": len(voided), "voided_cell_ids": voided,
+            "voids_in_run": total, "audit_void_cells": audit_void,
+            "void_status_primary": {"status": primary[0], "why": primary[1], "reading": "per cell (decides)"},
+            "void_status_run_level_sensitivity": {"status": sens[0], "why": sens[1],
+                                                  "reading": "run level (disclosure, never decides)"},
+            "decided": "2026-10-04 evening +08:00, before any M or T14 data was opened"}
 
 
 VOID_RULE_TEXT = ("a void cell is re-driven once; a second void stops the run; a stopped run is never evaluated - "
@@ -612,8 +626,8 @@ def evaluate(inp: Mapping[str, Any], csv_path: Path, cells: Mapping[tuple, Mappi
     vs = void_status(audit)
     if dry_run:
         status, verdict = "dry_run", None
-    elif vs["status"] != STATUS_EVALUATED:
-        status, verdict = vs["status"], None
+    elif vs["void_status_primary"]["status"] != STATUS_EVALUATED:
+        status, verdict = vs["void_status_primary"]["status"], None
     else:
         status, verdict = STATUS_EVALUATED, ("pass" if a_ok and bp_ok else "fail")
     dropped = hd.audit_csv(csv_path, entry, model=model, sealed_to_h2=False, read_holdout=True)
@@ -757,7 +771,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     body = result.get("evaluation") or result["disclosure_not_an_evaluation"]
     a, bp = body["A"], body["B_prime"]
     print(f"[{inp['model']}] status {result['status']} verdict {result['verdict']} "
-          f"(void status {result['void_status']['status']}): "
+          f"(voided cells {result['void_status']['voided_cells']}; primary "
+          f"{result['void_status']['void_status_primary']['status']}; run-level sensitivity "
+          f"{result['void_status']['void_status_run_level_sensitivity']['status']}): "
           f"A {'pass' if a['passed'] else 'FAIL'} (BA {a['criteria'][0]['value']}, CI low {a['criteria'][1]['value']}); "
           f"B' {'pass' if bp['passed'] else 'FAIL'} ({[(c['name'], c['value']) for c in bp.get('criteria', [])]})")
     for kind, block in body["cross_shape"].items():

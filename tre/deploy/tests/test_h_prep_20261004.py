@@ -203,18 +203,19 @@ def test_t14_single_class_shape_makes_the_claim_not_evaluable_and_is_never_dropp
     assert out["pooled_disclosure"]["ba"] == 1.0                # pooled numbers keep every window
 
 
-def test_t14_void_at_audit_follows_the_prereg_void_rule_per_cell() -> None:
-    def audit(*cells):
-        return {"cells": [{"cell_id": c, "attempt": a, "void_at_audit": v} for c, a, v in cells]}
+def test_t14_void_rule_primary_per_cell_with_run_level_sensitivity_side_by_side() -> None:
+    def vs(*cells):
+        r = t14.void_status({"cells": [{"cell_id": c, "attempt": a, "void_at_audit": v} for c, a, v in cells]})
+        return (r["voided_cells"], r["void_status_primary"]["status"], r["void_status_run_level_sensitivity"]["status"])
 
-    assert t14.void_status(audit(("c1", 1, False), ("c2", 2, False)))["status"] == t14.STATUS_EVALUATED
-    one = t14.void_status(audit(("c1", 1, True), ("c2", 1, False)))
-    assert one["status"] == "void_redrive_required:c1" and one["status_if_two_void_cells_stop_the_run"] == one["status"]
-    # a re-driven attempt void at audit is that cell's second void: the run is stopped
-    assert t14.void_status(audit(("c1", 2, True), ("c2", 1, True)))["status"] == t14.STATUS_RUN_VOID
-    # two cells void on their first attempt: each re-driven once (prereg, per cell); the
-    # "two void cells stop the run" reading is reported, not applied
-    two = t14.void_status(audit(("c1", 1, True), ("c3", 1, True)))
-    assert two["status"] == "void_redrive_required:c1,c3"
-    assert two["status_if_two_void_cells_stop_the_run"] == t14.STATUS_RUN_VOID
-    assert "second void stops the run" in two["void_rule"]
+    assert vs(("c1", 1, False), ("c2", 1, False)) == (0, t14.STATUS_EVALUATED, t14.STATUS_EVALUATED)
+    # one audit void, first void of its cell: both readings re-drive it once
+    assert vs(("c1", 1, True), ("c2", 1, False)) == (1, "void_redrive_required:c1", "void_redrive_required:c1")
+    # a re-driven cell void again at audit: its second void stops the run under both readings
+    assert vs(("c1", 2, True), ("c2", 1, False)) == (1, t14.STATUS_RUN_VOID, t14.STATUS_RUN_VOID)
+    # two cells void at audit on attempt 1: primary re-drives each once; run level stops the run
+    assert vs(("c1", 1, True), ("c3", 1, True)) == (2, "void_redrive_required:c1,c3", t14.STATUS_RUN_VOID)
+    # a run-time void elsewhere (c2 valid on attempt 2) plus one audit void: only the sensitivity stops
+    assert vs(("c1", 1, True), ("c2", 2, False)) == (2, "void_redrive_required:c1", t14.STATUS_RUN_VOID)
+    r = t14.void_status({"cells": [{"cell_id": "c1", "attempt": 1, "void_at_audit": True}]})
+    assert "second void stops the run" in r["void_rule"] and "decides" in r["void_status_primary"]["reading"]

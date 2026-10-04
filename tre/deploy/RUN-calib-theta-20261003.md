@@ -419,13 +419,16 @@ python3 -m scripts.analysis.t14_score --prereg $C/t14/preregistration.json \
   --dry-run-result $C/eval/T14_score.dryrun_run2b.json \
   --out $C/eval/T14_score.json 2>&1 | tee $C/logs/H_t14_score.log
 ```
-`status`:
+`status` follows the PRIMARY void_rule reading (per cell, as `calibration_ladder.drive_cell`;
+decided 2026-10-04, `prereg/ADDENDUM-T14-scoring.json`):
 - `evaluated`: `verdict` is `pass` / `fail` (A and B′ at dwell 1).
-- `void_redrive_required:<cells>`: a cell is void at audit (non-cut model errors > 0.05) on
-  its first attempt. Prereg void_rule: re-drive that cell once, then score again.
-- `run_void`: a cell void at audit was already a re-drive (its second void). The run is
-  stopped and never evaluated; re-run all 24 into a new root.
+- `void_redrive_required:<cells>`: cell(s) void at audit (non-cut model errors > 0.05), first
+  void each: re-drive each once, then score again.
+- `run_void`: a cell voided twice (run time + audit). Never evaluated; re-run all 24.
 
+`void_status` also carries `voided_cells` and the run-level sensitivity reading
+(`void_status_run_level_sensitivity`: 2 or more voids in the run stop it). Report both
+statuses side by side; only the primary decides.
 In the last two cases the metrics are written under `disclosure_not_an_evaluation`. Also
 written: per-shape / per-kind BA and AUROC with CIs, the cross-shape claim per kind
 (`not_evaluable` if a shape is single-class), the censoring audit per cell, the zero-token
