@@ -433,3 +433,35 @@ def test_shell_holds_a_scale_down_on_incomplete_evidence(tmp_path) -> None:
     assert lines["a"]["inputs"]["policy_reason"] == "scripted" and lines["a"]["inputs"]["gaps"] == ["unscraped"]
     assert lines["b"]["action"] == "up"                  # scale-up still acts on the evidence there is
     assert [m for _, m, _, _ in dispatcher.submitted] == ["b"]
+
+
+class _TakeoverPolicy:
+    """Scales model a up; while deciding, another shell takes the lock or the TRE
+    controller is switched to active (the review's stale-owner repro)."""
+
+    name = "scripted"
+
+    def __init__(self, redis, change) -> None:
+        self.redis, self.change = redis, change
+
+    def decide(self, snap):
+        self.change(self.redis)
+        from tre_baselines.policies.base import Decision
+        return {"a": Decision(desired=3, reason="scripted")}
+
+
+def test_owner_or_mode_change_between_decision_and_call_drops_the_call(tmp_path) -> None:
+    for change, why in (
+        (lambda r: r.set(OWNER_KEY, "new-shell"), "owner_lost"),
+        (lambda r: r.set(CONTROLLER_MODE_KEY, "active"), "controller_mode=active"),
+    ):
+        redis = FakeRedis()
+        shell, cluster, redis, dispatcher = _shell(tmp_path, _TakeoverPolicy(redis, change), dry_run=False,
+                                                   redis=redis)
+        first = _run(shell, dispatcher, 1)[0]
+        assert [l["action"] for l in first if l["model"] == "a"] == ["up"]   # decided as owner, observe
+        assert cluster.calls == []                                          # ... but never sent
+        result = [l for l in _run(shell, dispatcher, 1)[0] if l["model"] == "a"][0]["sm_result"]
+        assert result["error"] == "dropped" and result["reason"] == why
+        assert shell.stats.sm_dropped == 1 and shell.stats.sm_failures == 0
+        assert shell.backoff.delay_s("a") is None                           # a drop is not a refusal

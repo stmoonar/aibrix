@@ -18,7 +18,11 @@ Contract (service manager on main, ``tre_sm/api/v2.py``):
   and falls back to the raw text.
 
 The dispatcher gives every model one worker thread and at most one SM call in flight;
-the tick never waits for the SM. :class:`Backoff` spaces out retries after refusals.
+the tick never waits for the SM. Right before each call the worker asks the dispatcher's
+``guard`` (set by the shell: still the owner-lock holder, controller still in observe);
+when the answer is a reason, the call is dropped (``SMResult.error = "dropped"``,
+``reason`` = why) and never reaches the SM. :class:`Backoff` spaces out retries after
+refusals.
 """
 from __future__ import annotations
 
@@ -36,6 +40,8 @@ from urllib.request import Request, urlopen
 LOG = logging.getLogger(__name__)
 
 ACTOR = "tre-baseline-scaler"
+#: ``SMResult.error`` of a call the dispatcher's guard dropped before it reached the SM.
+DROPPED = "dropped"
 _STRUCTURED_KEYS = ("error", "reason", "node", "gpu_ids", "scope", "retry_after_s")
 
 
@@ -253,8 +259,11 @@ class Dispatcher:
     """
 
     def __init__(self, put_target: Callable[[str, Mapping[str, Any]], SMResult], *,
-                 sleep_path: str = "scale_down", drain_budget_s: Optional[float] = None) -> None:
+                 sleep_path: str = "scale_down", drain_budget_s: Optional[float] = None,
+                 guard: Optional[Callable[[], Optional[str]]] = None) -> None:
         self._put = put_target
+        #: Called right before every SM call: None = go, a string = drop the call (why).
+        self.guard = guard
         self._sleep_path = sleep_path
         self._drain_budget_s = drain_budget_s
         self._lock = threading.Lock()
@@ -303,6 +312,17 @@ class Dispatcher:
             if job is None:
                 return
             seq, direction, target, body = job
+            try:
+                why = self.guard() if self.guard is not None else None
+            except Exception as exc:  # cannot tell whether we may act: do not act
+                why = f"guard_failed: {exc!r}"[:200]
+            if why:
+                LOG.warning("SM call %s %s->%s dropped: %s", model, direction, target, why)
+                result = SMResult(ok=False, error=DROPPED, reason=str(why))
+                self._results.put(Completed(model, direction, target, body, result, seq))
+                with self._lock:
+                    self._inflight.pop(model, None)
+                continue
             try:
                 result = self._put(model, body)
             except Exception as exc:  # the client should not raise; never lose the flag

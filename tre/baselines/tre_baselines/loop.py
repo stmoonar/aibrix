@@ -9,6 +9,12 @@
   is ``observe`` (or the read fails) the tick is dry-run and every would-be SM call is
   logged as ``guard_controller_active`` (metric ``tre_bl_controller_guard``), so the TRE
   controller and a baseline never scale the same models.
+* Both checks are repeated by the SM worker immediately before each call
+  (:meth:`BaselineShell.actuation_guard`: the owner lock still holds our token, the mode is
+  still observe). A gather or decide that outlived the lock TTL, or a mode switch in the
+  meantime, drops the call (``sm_result.error = "dropped"``, no backoff). The window left
+  is the time between that check and the SM handling the request; closing it needs the
+  SM to reject a stale owner generation.
 * Unknown is not idle (backstop): a scale-down is held at ``awake`` (reason
   ``incomplete``, the policy's own reason in ``inputs.policy_reason``) whenever
   :func:`~tre_baselines.snapshot.evidence_gaps` lists a gap for the model (with the
@@ -54,7 +60,7 @@ from tre_baselines.keys import (
     decision_key,
 )
 from tre_baselines.policies.base import INCOMPLETE, Decision
-from tre_baselines.sm_client import Backoff, Completed, Dispatcher
+from tre_baselines.sm_client import DROPPED, Backoff, Completed, Dispatcher
 from tre_baselines.snapshot import ClusterSnapshot, evidence_gaps
 
 LOG = logging.getLogger(__name__)
@@ -105,6 +111,16 @@ class OwnerLock:
             LOG.warning("owner lock check failed: %s", exc)
             return False
 
+    def held(self) -> bool:
+        """Read-only: the lock still holds our token (no renewal; fails closed)."""
+        try:
+            raw = self._redis.get(self.key)
+        except Exception as exc:
+            LOG.warning("owner lock read failed: %s", exc)
+            return False
+        raw = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw
+        return raw == self.token
+
     def release(self) -> None:
         try:
             self._redis.eval(RELEASE_LUA, 1, self.key, self.token)
@@ -120,6 +136,7 @@ class ShellStats:
     decisions: int = 0
     sm_calls: int = 0
     sm_failures: int = 0
+    sm_dropped: int = 0
     redis_write_failures: int = 0
     effective_dry_run: bool = True
     owner: bool = False
@@ -181,16 +198,31 @@ class BaselineShell:
         self._last_dispatch: dict[str, tuple[str, int]] = {}
         self._stop = threading.Event()
         self._stats_lock = threading.Lock()
+        dispatcher.guard = self.actuation_guard
+
+    def actuation_guard(self) -> Optional[str]:
+        """Checked by the SM worker right before each call: None = the call may go."""
+        if self.config.dry_run:
+            return "dry_run"
+        if self.lock is not None and not self.lock.held():
+            return "owner_lost"
+        mode, guard = self._controller_mode()
+        if guard:
+            return f"controller_mode={mode}"
+        return None
 
     # -- one tick ---------------------------------------------------------------------
 
     def _collect_results(self) -> dict[str, Completed]:
         latest: dict[str, Completed] = {}
         for done in self.dispatcher.drain_results():
+            dropped = done.result.error == DROPPED
             with self._stats_lock:
-                if not done.result.ok:
+                if dropped:
+                    self.stats.sm_dropped += 1
+                elif not done.result.ok:
                     self.stats.sm_failures += 1
-            if not done.result.ok:
+            if not done.result.ok and not dropped:
                 LOG.warning("SM refused %s %s->%s: %s", done.model, done.direction, done.target,
                             done.result.as_dict())
             latest[done.model] = done
@@ -230,7 +262,7 @@ class BaselineShell:
         for model, done in results.items():
             if done.result.ok:
                 self.backoff.reset(model)
-            else:
+            elif done.result.error != DROPPED:  # a dropped call never reached the SM
                 self.backoff.failed(model, snap.now_ms, done.result.retry_after_s)
         decisions: Mapping[str, Decision] = self.policy.decide(snap) or {}
 
@@ -434,6 +466,8 @@ class BaselineShell:
                 f'tre_bl_sm_calls_total{{policy="{policy}"}} {s.sm_calls}',
                 "# TYPE tre_bl_sm_failures_total counter",
                 f'tre_bl_sm_failures_total{{policy="{policy}"}} {s.sm_failures}',
+                "# TYPE tre_bl_sm_dropped_total counter",
+                f'tre_bl_sm_dropped_total{{policy="{policy}"}} {s.sm_dropped}',
                 "# TYPE tre_bl_scrape_failures_total counter",
                 f'tre_bl_scrape_failures_total{{policy="{policy}"}} {s.scrape_failures}',
                 "# TYPE tre_bl_redis_write_failures_total counter",
