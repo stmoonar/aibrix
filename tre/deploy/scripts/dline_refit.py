@@ -27,6 +27,13 @@ Stages (``python -m scripts.dline_refit STAGE --model M --arm primary|fixed|k3 .
     split of a ``--dataset`` is M and is skipped unread. Sentinels train unless
     ``--no-sentinels``. Every later stage refuses a fitting / family CSV holding a row that
     is not a constant-load training row (:func:`check_training_inputs`), whoever built it.
+    ``--train-dynamic`` (next round, design 2026-10-05 item 2, cancels D16's "constant load
+    only"): the TRAIN-split dynamic cells (steps / ramp / bursts; run 1's) train too, pooled
+    with the holds at equal weight per window; the sealed split (the run-2 ramps) stays H2.
+    The flag is recorded in trainset.json (``dynamic_training``) and the fit stages accept
+    dynamic rows only from a training set that records it. Sources of two label
+    attributions (completion / hybrid, the dataset manifest's ``attribution``) are refused,
+    like two numerators; the attribution is recorded and the fit stages label with it.
 ``alpha`` (D4', published per D18)
     the TSS EMA time constant. ``--alpha-rule d4prime`` (default) is
     :mod:`scripts.alpha_fit` - same-window LOSO balanced accuracy of the deployed
@@ -67,7 +74,11 @@ Stages (``python -m scripts.dline_refit STAGE --model M --arm primary|fixed|k3 .
     attainment of the TTFT SLO on non-overlapping 30 s tiles. ``--no-holdout`` stops
     after the verdict and never opens the validation CSV: M is evaluated exactly once,
     after it is frozen and hashed (plan §6.11 note 9), so every refit before that runs
-    without it.
+    without it. 2026-10-05: theta stays the BA-argmax candidate (exact ties: the fit's
+    existing deterministic rule, :data:`THETA_SELECTION_RULE`; no midpoint rule); recorded
+    beside it are the theta uncertainty band - the fit's own candidates within
+    :data:`PLATEAU_BA_TOLERANCE` BA of the best (``theta_selection.plateau``) - and the
+    absolute thresholds theta * tau_crit / theta * tau_high (``absolute_thresholds``).
 ``summary``
     the table of every model and arm under ``--out-dir`` plus the boundary-band window
     counts per shape / family and what hold cells a family short of
@@ -83,7 +94,11 @@ Stages (``python -m scripts.dline_refit STAGE --model M --arm primary|fixed|k3 .
     the training inputs it was fitted on, and the freeze file is new. Format revision 3
     (2026-10-03) also seals each model's B' severity cut (``b_prime``: the .65 quantile of
     the TRAINING violating windows' severity, :mod:`scripts.b_prime`) and the B' gate
-    (``b_prime_gate``), so the cut exists before M / T14 is collected.
+    (``b_prime_gate``), so the cut exists before M / T14 is collected. Revision 4
+    (2026-10-05) also seals the accept gate (``accept_gate``: ``--accept-gate onset``, the
+    default, or ``b_prime``) with every onset-gate parameter, each model's theta selection
+    plateau (uncertainty band), absolute thresholds, label attribution, dynamic-training record and
+    the A dead band's s0 (training label noise, :func:`scripts.b_prime.label_noise_s0`).
 ``verify-freeze``
     checks the sidecar and the self hash (:func:`verify_freeze`); exit 0 = intact.
 ``accept`` (plan §6.9f A-D, once)
@@ -106,6 +121,15 @@ Stages (``python -m scripts.dline_refit STAGE --model M --arm primary|fixed|k3 .
     A, B' and D pass for every model, 3 = evaluated and failed, other = refused. Runs once;
     ``--recheck`` recomputes in a temp dir and compares, writing nothing (a stored result
     of an older format revision is compared without the keys added since).
+    Revision 4 (2026-10-05, design item 3, user decisions 2): under a freeze whose
+    ``accept_gate.rule`` is ``onset`` the gate is (i) the onset episodes of the dynamic M
+    cells caught within the lag budget (:func:`scripts.b_prime.onset_detection`), (ii) the
+    window false alarm, (iii) A and (iv) D, and each model gets a three-way ``verdict``:
+    ``pass`` (all four), ``pass_a_disclosed`` (only A fails: go-live allowed, A disclosed as
+    a limitation) or ``fail``; B', the old B, dwell 2 and the A dead band are disclosed.
+    Under an older freeze the gate stays A, B', D and the onset-gate fields are added
+    beside it as a disclosure. A dataset whose label attribution differs from the frozen
+    label's is refused.
 
 Windowing: ``--window-ms`` / ``--step-ms`` / ``--dt-ref-s`` / ``--horizon-ms`` /
 ``--dwell-windows`` (defaults 30 s / 10 s / 10 s / 30 s / 2) are threaded through alpha,
@@ -235,6 +259,16 @@ TRAINING_SPLITS = frozenset({"train", "auxiliary"})
 ROLE_SENTINEL = "sentinel"
 SET_TRAINING, SET_H2, SET_M, SET_SENTINEL_OFF = "training", "h2", "m", "sentinel_excluded"
 KIND_CONSTANT, KIND_DYNAMIC, KIND_SEALED, KIND_UNKNOWN = "constant_load", "dynamic", "sealed", "unknown"
+#: ``--train-dynamic``: the only split whose dynamic cells train (run 1's steps / ramp / bursts).
+SPLIT_TRAIN_DYNAMIC = "train"
+DYNAMIC_TRAINING_RULE = ("--train-dynamic (design 2026-10-05 item 2): dynamic cells (steps / ramp / bursts) "
+                         "of the train split train with the constant-load cells; windows pooled with equal "
+                         "weight (one window, one vote, as the BA fit always counted); the sealed split "
+                         "(split holdout: run-2 ramps, held-out shape) stays H2")
+#: Label attributions (the labels branch's tre_common.slo_labels.ATTRIBUTIONS; mirrored so
+#: this module runs before that branch is merged). A manifest / label without one = completion.
+ATTRIBUTION_COMPLETION, ATTRIBUTION_HYBRID = "completion", "hybrid"
+ATTRIBUTIONS = (ATTRIBUTION_COMPLETION, ATTRIBUTION_HYBRID)
 #: Identity columns a dataset row must carry for the training set to be cut from it.
 REQUIRED_DATASET_COLUMNS = ("model", "shape", "primitive", "stage", "split", "role",
                             "cell_id", "attempt", "scenario_id")
@@ -268,12 +302,14 @@ def cell_kind(primitive: str, role: str, split: str, shape: str = "") -> str:
     return KIND_DYNAMIC
 
 
-def assign_set(row: Mapping[str, str], *, sealed_to_h2: bool, sentinels: bool) -> str:
+def assign_set(row: Mapping[str, str], *, sealed_to_h2: bool, sentinels: bool,
+               train_dynamic: bool = False) -> str:
     """The set one standard-dataset row belongs to (training / h2 / m / sentinel_excluded).
 
     Read from the row's own ``split`` / ``shape`` / ``primitive`` / ``role`` (never its
     stage or cell id): a smoke hold (role smoke, stage dwell, split auxiliary) trains - D21,
-    :func:`cell_kind`."""
+    :func:`cell_kind`. ``train_dynamic`` (design 2026-10-05 item 2): a dynamic cell of the
+    ``train`` split trains instead of joining H2 (the sealed split never trains)."""
     from scripts import gen_calibration_schedules as gen
 
     split, shape = row.get("split") or "", row.get("shape") or ""
@@ -290,7 +326,7 @@ def assign_set(row: Mapping[str, str], *, sealed_to_h2: bool, sentinels: bool) -
     if kind == KIND_UNKNOWN:
         raise TrainingSetError(f"{where}: no primitive - a cell is not classified by its id")
     if kind == KIND_DYNAMIC:
-        return SET_H2
+        return SET_TRAINING if train_dynamic and split == SPLIT_TRAIN_DYNAMIC else SET_H2
     if not sentinels and (row.get("role") or "") == ROLE_SENTINEL:
         return SET_SENTINEL_OFF
     return SET_TRAINING
@@ -407,6 +443,46 @@ def dataset_numerator(directory: Path) -> str:
     return str((doc.get("numerator") or {}).get("source") or l3.NUMERATOR_GATEWAY)
 
 
+def dataset_attribution(directory: Path) -> str:
+    """The label attribution a standard dataset was built with (its manifest's
+    ``attribution.value``; ``calibration_dataset.dataset_attribution`` when the labels
+    branch provides it). A manifest without the record - or no manifest - is completion."""
+    try:
+        from scripts.calibration_dataset import dataset_attribution as _da  # the labels branch
+    except ImportError:
+        _da = None
+    if _da is not None:
+        return str(_da(Path(directory)))
+    d = Path(directory)
+    man = d / DATASET_MANIFEST
+    if not man.exists() and (d / "dataset" / DATASET_MANIFEST).exists():
+        man = d / "dataset" / DATASET_MANIFEST
+    try:
+        doc = json.loads(man.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ATTRIBUTION_COMPLETION
+    rec = doc.get("attribution") if isinstance(doc, dict) else None
+    value = rec.get("value") if isinstance(rec, dict) else rec
+    return str(value or ATTRIBUTION_COMPLETION)
+
+
+def label_attribution(label_def: Optional[Mapping[str, Any]]) -> str:
+    """The attribution of a label record (``LabelDefinition.as_dict()``); absent = completion
+    (every v1 record)."""
+    return str((label_def or {}).get("attribution") or ATTRIBUTION_COMPLETION)
+
+
+def trainset_attribution(fit_dir: Path) -> str:
+    """The attribution trainset.json of ``fit_dir`` recorded; completion without one (a
+    hand-built fit dir, or one written before the record)."""
+    man = Path(fit_dir) / TRAINSET_MANIFEST
+    try:
+        doc = json.loads(man.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ATTRIBUTION_COMPLETION
+    return str(doc.get("attribution") or ATTRIBUTION_COMPLETION)
+
+
 def prompt_token_mismatched_cells(src: DatasetSource) -> set[tuple[str, str]]:
     """``(cell_id, attempt)`` of the source's cells whose served requests were off their
     prompt length (``cells.csv`` ``prompt_tokens_mismatched > 0``; a dataset built with
@@ -420,8 +496,10 @@ def prompt_token_mismatched_cells(src: DatasetSource) -> set[tuple[str, str]]:
 
 
 def build_training_set(sources: Sequence[DatasetSource], fit_dir: Path, *,
-                       sentinels: bool = True, models: Optional[Sequence[str]] = None) -> dict:
-    """D16: cut the training set (constant-load cells) out of standard datasets.
+                       sentinels: bool = True, models: Optional[Sequence[str]] = None,
+                       train_dynamic: bool = False) -> dict:
+    """D16: cut the training set (constant-load cells) out of standard datasets;
+    ``train_dynamic``: plus the train-split dynamic cells (:data:`DYNAMIC_TRAINING_RULE`).
 
     Writes, into ``fit_dir``, what the fit stages read - ``<model>_fitting.csv`` and one
     ``<model>_fitting_<family>.csv`` per family, rows in dataset order (the loaders EMA a
@@ -442,6 +520,14 @@ def build_training_set(sources: Sequence[DatasetSource], fit_dir: Path, *,
         # one theta, one numerator: gateway and L3 totals of a window differ by design
         raise TrainingSetError(f"the datasets were built with different TSS numerators {numerators}; "
                                "rebuild them with one calibration_dataset --numerator")
+    attributions = {s.name: dataset_attribution(s.directory) for s in sources}
+    if len(set(attributions.values())) > 1:
+        # one theta, one label: completion and hybrid label a window's requests differently
+        raise TrainingSetError(f"the datasets were built with different label attributions {attributions}; "
+                               "rebuild them with one calibration_dataset --attribution")
+    bad_attr = sorted({a for a in attributions.values() if a not in ATTRIBUTIONS})
+    if bad_attr:
+        raise TrainingSetError(f"unknown label attribution(s) {bad_attr} (known: {list(ATTRIBUTIONS)})")
     family_of = {shape: fam for fam, shapes in families.items() for shape in shapes}
     headers = {s.name: _dataset_header(s) for s in sources}
     out_header = ["run"]
@@ -482,7 +568,8 @@ def build_training_set(sources: Sequence[DatasetSource], fit_dir: Path, *,
                 next(reader)
                 for values in reader:
                     row = dict(zip(header, values))
-                    target = assign_set(row, sealed_to_h2=src.sealed_to_h2, sentinels=sentinels)
+                    target = assign_set(row, sealed_to_h2=src.sealed_to_h2, sentinels=sentinels,
+                                        train_dynamic=train_dynamic)
                     model = row["model"]
                     if target == SET_M:
                         # M: the split column decided it; nothing else of the row is used.
@@ -516,9 +603,16 @@ def build_training_set(sources: Sequence[DatasetSource], fit_dir: Path, *,
                     if fam is not None:
                         ws[fam].writerow(out)
                     c = counts.setdefault(model, {"fitting": 0, "cells": set(), "by_run_role": {},
-                                                  "by_cell_status": {}, **{f: 0 for f in FAMILY_FILES}})
+                                                  "by_cell_status": {}, "dynamic_windows": 0,
+                                                  "dynamic_cells": set(), "dynamic_by_run_primitive": {},
+                                                  **{f: 0 for f in FAMILY_FILES}})
                     c["fitting"] += 1
                     c["cells"].add((src.name, sid))
+                    if cell_kind(row["primitive"], row["role"], row["split"], row["shape"]) == KIND_DYNAMIC:
+                        c["dynamic_windows"] += 1
+                        c["dynamic_cells"].add((src.name, sid))
+                        dk = f"{src.name}|{row['primitive']}"
+                        c["dynamic_by_run_primitive"][dk] = c["dynamic_by_run_primitive"].get(dk, 0) + 1
                     rk = f"{src.name}|{row['role'] or row['stage']}"
                     c["by_run_role"][rk] = c["by_run_role"].get(rk, 0) + 1
                     st = row.get("cell_status") or ""
@@ -556,6 +650,8 @@ def build_training_set(sources: Sequence[DatasetSource], fit_dir: Path, *,
             "by_run_role": dict(sorted(c["by_run_role"].items())),
             "by_cell_status": dict(sorted(c["by_cell_status"].items())),
             "family_windows": {fam: c[fam] for fam in FAMILY_FILES},
+            "dynamic": {"windows": c["dynamic_windows"], "cells": len(c["dynamic_cells"]),
+                        "by_run_primitive": dict(sorted(c["dynamic_by_run_primitive"].items()))},
             **({"excluded": dict(other[model])} if model in other else {}),
             "files": {k: {"path": str(p), "sha256": sha256_file(p)} for k, p in files.items()},
         }
@@ -572,21 +668,35 @@ def build_training_set(sources: Sequence[DatasetSource], fit_dir: Path, *,
             "run": s.name, "directory": str(s.directory), "sealed_split": SET_H2 if s.sealed_to_h2 else SET_M,
             "windows_csv_sha256": sha256_file(s.windows),
             "manifest_sha256": sha256_file(man) if man.exists() else None, "format_revision": rev,
-            "numerator": numerators[s.name],
+            "numerator": numerators[s.name], "attribution": attributions[s.name],
         })
     doc = {
-        "what": "D16 training set: the constant-load cells of the sources (theta is fitted on these only)",
+        "what": ("D16 training set: the constant-load cells of the sources (theta is fitted on these only)"
+                 if not train_dynamic else
+                 "training set: the constant-load cells and the train-split dynamic cells of the sources "
+                 "(--train-dynamic, design 2026-10-05 item 2)"),
         "rules": {
             "training": ("split in {train, auxiliary}, primitive in alpha_fit.STEADY_PRIMITIVES, role "
-                         "not in alpha_fit.UNSTEADY_ROLES - read from each row's own dataset columns"),
+                         "not in alpha_fit.UNSTEADY_ROLES - read from each row's own dataset columns"
+                         + ("; plus every dynamic cell (steps / ramp / bursts) of split train" if train_dynamic
+                            else "")),
             "sentinels": "role sentinel trains" if sentinels else "role sentinel excluded (--no-sentinels)",
-            "h2": "dynamic cells of every source + the sealed split (split holdout) of --h2-dataset sources",
+            "h2": ("the sealed split (split holdout) of --h2-dataset sources + dynamic cells outside split train"
+                   if train_dynamic else
+                   "dynamic cells of every source + the sealed split (split holdout) of --h2-dataset sources"),
             "m": "the sealed split of --dataset sources: skipped unread (counts only)",
             "families": {fam: list(shapes) for fam, shapes in families.items()},
         },
         "sentinels": sentinels,
         # The TSS numerator of every source (scripts.l3_numerator; one by construction).
         "numerator": next(iter(numerators.values()), None),
+        # The label attribution of every source (one by construction); the fit stages label with it.
+        "attribution": next(iter(attributions.values()), ATTRIBUTION_COMPLETION),
+        "dynamic_training": {"admitted": bool(train_dynamic),
+                             "rule": DYNAMIC_TRAINING_RULE if train_dynamic else
+                             "off: D16 - constant-load cells only (no --train-dynamic)",
+                             "splits": [SPLIT_TRAIN_DYNAMIC] if train_dynamic else [],
+                             "weights": "equal per window"},
         "sources": source_docs,
         "models": model_docs,
         "h2": {"manifest": str(fit_dir / H2_MANIFEST), "manifest_sha256": sha256_file(fit_dir / H2_MANIFEST),
@@ -630,6 +740,7 @@ def check_training_inputs(model: str, p: Mapping[str, Any], *,
     fit_dir = files["fitting"].parent
     man_path = fit_dir / TRAINSET_MANIFEST
     prov: dict[str, Any] = {"trainset_manifest": None}
+    allowed = {KIND_CONSTANT}
     if man_path.exists():
         man = json.loads(man_path.read_text(encoding="utf-8"))
         entry = (man.get("models") or {}).get(model)
@@ -639,28 +750,50 @@ def check_training_inputs(model: str, p: Mapping[str, Any], *,
             want = (entry["files"].get(key) or {}).get("sha256")
             if want is not None and path.exists() and sha256_file(path) != want:
                 raise SystemExit(f"{path} is not the file the trainset stage wrote ({man_path})")
+        dyn = (man.get("dynamic_training") or {}).get("admitted") is True
+        if dyn:
+            allowed.add(KIND_DYNAMIC)
         prov = {"trainset_manifest": str(man_path), "trainset_manifest_sha256": sha256_file(man_path),
                 "sentinels": man.get("sentinels"), "h2_rows_sha256": man["h2"]["rows_sha256"],
-                "h2_cells_sha256": man["h2"]["cells_sha256"]}
+                "h2_cells_sha256": man["h2"]["cells_sha256"], "dynamic_training": dyn,
+                "attribution": str(man.get("attribution") or ATTRIBUTION_COMPLETION)}
     kinds = {}
     for key, path in files.items():
         if not path.exists():
             continue
         k = kinds[key] = scan_training_rows(path, ledger)
-        bad = {kind: n for kind, n in k.items() if kind != KIND_CONSTANT and n}
+        bad = {kind: n for kind, n in k.items() if kind not in allowed and n}
         if bad:
             raise SystemExit(
-                f"{path}: D16 - theta is fitted on constant-load cells only, and this file holds "
-                f"{bad} window rows that are not (unknown = no primitive column and no ledger line). "
-                "Build the training set with `dline_refit trainset`.")
+                f"{path}: D16 - theta is fitted on constant-load cells only"
+                + (" (and the train-split dynamic cells the trainset manifest admits)" if KIND_DYNAMIC in allowed
+                   else "")
+                + f", and this file holds {bad} window rows that are not (unknown = no primitive column and no "
+                "ledger line). Build the training set with `dline_refit trainset` (--train-dynamic admits the "
+                "train-split dynamic cells).")
     prov["rows"] = kinds
     return prov
 
 
-def label_for(model: str, arm: str, registry: Optional[str] = None) -> slo_labels.LabelDefinition:
-    """The label of one arm: the registry profile's D6' primary, or an arm of it."""
+def label_for(model: str, arm: str, registry: Optional[str] = None,
+              attribution: Optional[str] = None) -> slo_labels.LabelDefinition:
+    """The label of one arm: the registry profile's D6' primary, or an arm of it.
+
+    ``attribution`` (completion / hybrid; None = completion): the attribution of the
+    datasets it labels - trainset.json's for the fit stages, the freeze label's
+    (``label_def["attribution"]``) for anything compared with a freeze. Completion builds
+    the v1 label exactly as before."""
+    attribution = attribution or ATTRIBUTION_COMPLETION
+    if attribution not in ATTRIBUTIONS:
+        raise SystemExit(f"label attribution {attribution!r} is not one of {list(ATTRIBUTIONS)}")
+    extra: dict[str, Any] = {}
+    if attribution != ATTRIBUTION_COMPLETION:
+        if "attribution" not in getattr(slo_labels.LabelDefinition, "__dataclass_fields__", {}):
+            raise SystemExit(f"a {attribution} label needs tre_common.slo_labels with label attributions "
+                             "(branch calib/next-20261005)")
+        extra["attribution"] = attribution
     primary = slo_labels.label_def_for_model(
-        model, ttft_p95_ms=500.0, tpot_p95_ms=75.0, mode=None, registry=registry)
+        model, ttft_p95_ms=500.0, tpot_p95_ms=75.0, mode=None, registry=registry, **extra)
     if arm == "primary":
         return primary
     arms = slo_labels.label_arms(primary)
@@ -1162,6 +1295,58 @@ def _legacy_stop(stop: Mapping[str, Any]) -> Optional[bool]:
     return bool(not others and frac < boundary.LEGACY_CI_HALF_WIDTH_FRACTION)
 
 
+#: The theta uncertainty band disclosed next to D (coordinator 2026-10-05, replacing the
+#: dropped plateau-midpoint rule): the fit's own candidates within this BA of the best.
+PLATEAU_BA_TOLERANCE = 0.005
+THETA_SELECTION_RULE = ("theta = the BA-argmax candidate of tre_calibration.fit.fit_theta_by_balanced_accuracy "
+                        "(candidates: the fit config's healthy-quantile grid); exact BA ties (1e-12) break on the "
+                        "higher violating-window specificity, then on the larger oriented theta (the threshold "
+                        "admitting fewer windows as healthy) - the existing pipeline's rule, unchanged. No "
+                        "midpoint rule (dropped 2026-10-05).")
+PLATEAU_RULE = ("disclosed, not selecting: the fit's own candidates whose training BA is within "
+                "PLATEAU_BA_TOLERANCE of the best; [min, max] of their theta is the theta uncertainty band "
+                "next to D (the CI half width <= 20 %, which stays the identifiability gate)")
+
+
+def theta_plateau(windows: Sequence[Any], config: Any, *, fit_theta: Optional[float] = None,
+                  tol: float = PLATEAU_BA_TOLERANCE) -> dict:
+    """The BA plateau over the fit's OWN candidate grid (:data:`PLATEAU_RULE`) - the same
+    candidates ``config.fit`` searches, scored with ``threshold_balanced_accuracy``."""
+    from tre_calibration import fit as tf
+
+    o = tf.signal_orientation(config.direction)
+    rows = [w for w in windows if math.isfinite(w.signal)]
+    healthy = [o * w.signal for w in rows if w.slo_met]
+    if not healthy or all(w.slo_met for w in rows):
+        return {"rule": PLATEAU_RULE, "tolerance": tol, "candidates": 0, "ba_max": None}
+    if config.candidate_grid == "unique":
+        cands = tf._unique_candidates(healthy, config.healthy_quantile_candidates, o)
+    else:
+        cands = [(q, tf._quantile(healthy, q)) for q in config.healthy_quantile_candidates]
+    pts = []
+    for q, ot in cands:
+        if ot is None:
+            continue
+        theta = o * float(ot)
+        ba = tf.threshold_balanced_accuracy(rows, theta=theta, direction=config.direction)["balanced_accuracy"]
+        pts.append({"healthy_quantile": q, "theta": theta, "ba": ba})
+    best = max(p["ba"] for p in pts)
+    inside = [p for p in pts if p["ba"] >= best - tol - 1e-12]
+    lo, hi = min(p["theta"] for p in inside), max(p["theta"] for p in inside)
+    return {"rule": PLATEAU_RULE, "tolerance": tol, "candidates": len(pts), "ba_max": best,
+            "inside": inside, "theta_lo": lo, "theta_hi": hi,
+            "band_frac_of_fit_theta": ([lo / fit_theta - 1.0, hi / fit_theta - 1.0]
+                                       if fit_theta else None),
+            "argmax_unique_within_tolerance": len(inside) == 1}
+
+
+def absolute_thresholds(theta: Optional[float], tau_crit: Optional[float], tau_high: Optional[float]) -> dict:
+    """Disclosure (design item 2): the absolute CRITICAL / HIGH lines theta * tau."""
+    ok = all(isinstance(x, (int, float)) and math.isfinite(x) for x in (theta, tau_crit, tau_high))
+    return {"theta": theta, "tau_crit": tau_crit, "tau_high": tau_high,
+            "critical_abs": theta * tau_crit if ok else None, "high_abs": theta * tau_high if ok else None}
+
+
 #: What ``final.json`` says instead of the M numbers when the stage ran with ``--no-holdout``.
 HOLDOUT_SKIPPED = ("not evaluated (--no-holdout): M is read once, after it is frozen and "
                    "hashed (plan 2026-09-21 §6.11 note 9)")
@@ -1169,8 +1354,9 @@ HOLDOUT_SKIPPED = ("not evaluated (--no-holdout): M is read once, after it is fr
 
 def stage_final(model: str, label, p: Mapping[str, Any], wp_doc: Mapping[str, Any], out_dir: Path,
                 *, holdout: bool = True, win: Optional[Mapping[str, Any]] = None) -> dict:
-    """D5 verdict at (tau, w_p*, lambda*); then, unless ``holdout`` is False, the M report
-    (dwell and window length from ``win``; the attainment tiles are one window long).
+    """D5 verdict at (tau, w_p*, lambda*) with the theta plateau disclosed
+    (:func:`theta_plateau`); then, unless ``holdout`` is False, the M report (dwell and
+    window length from ``win``; the attainment tiles are one window long).
 
     With ``holdout=False`` the validation CSV is never opened (not even for its size)."""
     from tre_calibration.fit import threshold_balanced_accuracy
@@ -1188,14 +1374,22 @@ def stage_final(model: str, label, p: Mapping[str, Any], wp_doc: Mapping[str, An
     v["published"]["family_rule_theta"] = v["published"]["theta_m"]
     v["published"]["theta_m"] = v["merged"]["theta"]
     v["published"]["d5_merged_published"] = True
+    # the theta uncertainty band (disclosed; theta stays the fit's argmax), on the training windows
+    spec_f = spec_for(tau, wp, lam)
+    selection = {"rule": THETA_SELECTION_RULE, "theta": v["published"]["theta_m"],
+                 "plateau": theta_plateau(spec_f.load(p["fitting"], label, TRIM_RAMP_WINDOWS),
+                                          spec_f.default_config(), fit_theta=v["published"]["theta_m"])}
     (out_dir / "verdict_final.json").write_text(json.dumps(v, indent=1, default=str))
+    pub = v["published"]
+    extra = {"theta_selection": selection,
+             "absolute_thresholds": absolute_thresholds(pub["theta_m"], pub["tau_crit"], pub.get("tau_high"))}
     if not holdout:
         spec = spec_for(tau, wp, lam)
         s = summarize(v)
         s["theta_family_rule"] = v["published"]["family_rule_theta"]
         return {
             "model": model, "tau_s": tau, "alpha": alpha_of(tau, win["dt_ref_s"]), "w_p": wp, "lambda_wait": lam,
-            **s, "stop_rule_d13": v["stop_rule"]["satisfied"],
+            **s, **extra, "stop_rule_d13": v["stop_rule"]["satisfied"],
             "d13_max_ci_half_width_fraction": v["stop_rule"].get("max_ci_half_width_fraction"),
             "stop_rule_15": _legacy_stop(v["stop_rule"]),
             "appendix_10_met": v["stop_rule"].get("appendix_ci_target_met"),
@@ -1245,7 +1439,7 @@ def stage_final(model: str, label, p: Mapping[str, Any], wp_doc: Mapping[str, An
     s["theta_family_rule"] = v["published"]["family_rule_theta"]
     return {
         "model": model, "tau_s": tau, "alpha": alpha_of(tau, win["dt_ref_s"]), "w_p": wp, "lambda_wait": lam,
-        **s, "stop_rule_d13": v["stop_rule"]["satisfied"],
+        **s, **extra, "stop_rule_d13": v["stop_rule"]["satisfied"],
         "d13_max_ci_half_width_fraction": v["stop_rule"].get("max_ci_half_width_fraction"),
         "stop_rule_15": _legacy_stop(v["stop_rule"]),
         "appendix_10_met": v["stop_rule"].get("appendix_ci_target_met"),
@@ -1284,7 +1478,8 @@ def band_counts(model: str, arm: str, final: Mapping[str, Any], p: Mapping[str, 
     family_of = {s: fam for fam, shapes in families.items() for s in shapes}
     shape_of = shape_fn()
     spec = spec_for(final["tau_s"], final["w_p"], final["lambda_wait"])
-    ws = spec.load(p["fitting"], label_for(model, arm, registry), TRIM_RAMP_WINDOWS)
+    ws = spec.load(p["fitting"], label_for(model, arm, registry, trainset_attribution(Path(p["fitting"]).parent)),
+                   TRIM_RAMP_WINDOWS)
     theta = final["theta_published"]
     band: dict[str, list[int]] = defaultdict(lambda: [0, 0])
     cellband: dict[str, list[int]] = defaultdict(lambda: [0, 0])
@@ -1372,8 +1567,21 @@ def stage_summary(out_root: Path, fit_dirs: Mapping[str, Path], *, registry: Opt
 #: 3 (2026-10-03): each model entry seals its B' severity cut (``b_prime``) and the
 #: document the B' gate (``b_prime_gate``). Older freezes accept only with an explicit
 #: ``--b-prime-thresholds`` file.
-FREEZE_FORMAT_REVISION = 3
-FREEZE_READABLE_REVISIONS = (1, 2, 3)
+#: 4 (2026-10-05): the accept gate (``accept_gate``: onset or b_prime) and, per model, the
+#: theta selection / plateau, absolute thresholds, label attribution, dynamic-training
+#: record and the A dead band's s0. A revision <= 3 freeze accepts under the A, B', D gate.
+FREEZE_FORMAT_REVISION = 4
+FREEZE_READABLE_REVISIONS = (1, 2, 3, 4)
+#: ``freeze --accept-gate``: onset = design 2026-10-05 item 3 (the default); b_prime = the
+#: 2026-10-03 gate (A, B', D).
+ACCEPT_GATE_ONSET, ACCEPT_GATE_B_PRIME = "onset", "b_prime"
+ACCEPT_GATES = (ACCEPT_GATE_ONSET, ACCEPT_GATE_B_PRIME)
+#: Three-way verdict of the onset gate (user 2026-10-05, decision 2; one rule for every model).
+VERDICT_PASS, VERDICT_PASS_A_DISCLOSED, VERDICT_FAIL = "pass", "pass_a_disclosed", "fail"
+ONSET_GATING_CRITERIA = ("onset", "window_fa", "A", "D")
+VERDICT_RULE = ("pass = onset, window_fa, A and D all pass; pass_a_disclosed = only A fails (every other gate "
+                "passes): go-live allowed, A disclosed as a limitation; fail = anything else. Same rule for "
+                "every model (user 2026-10-05)")
 M_MANIFEST_FORMAT_REVISION = 1
 #: The refit stage outputs a freeze reads (``<out>/<model>/<arm>/<name>.json``).
 FREEZE_STAGE_FILES = ("alpha", "wp", "final", "verdict_final")
@@ -1410,10 +1618,20 @@ ACCEPT_VOLATILE_KEYS = frozenset({"generated_at", "evaluated_at_utc", "validatio
 #: 3 (2026-10-03): the gate is A, B' and D (``criteria.B_prime``, ``thresholds.B_prime``);
 #: the old B is disclosed. A ``--recheck`` of an older result compares it under its own
 #: gate (A, B, D) without the B' keys (:func:`as_revision`).
-ACCEPT_FORMAT_REVISION = 3
+#: 4 (2026-10-05): the accept gate rule (``gate_rule``), the onset gate / window false alarm
+#: / A dead band (``criteria.onset``, ``criteria.window_fa``, ``criteria.A_deadband``), the
+#: per-model and overall ``verdict``, ``disclosed_limitations``, the datasets' attribution
+#: and ``thresholds.accept_gate``. Under an older freeze the gate is still A, B', D, so a
+#: ``--recheck`` of a revision-3 result compares it without these keys.
+ACCEPT_FORMAT_REVISION = 4
 #: Keys a revision added, top level and per model: absent from an older stored result.
 ACCEPT_REVISION_KEYS = {2: {"top": ("ranking_disclosure",), "model": ("ranking_disclosure", "windowing")},
-                        3: {"top": (), "model": ()}}
+                        3: {"top": (), "model": ()},
+                        4: {"top": ("gate_rule", "verdict", "disclosed_limitations", "attribution"),
+                            "model": ("gate_rule", "verdict")}}
+#: Revision 4 keys one level down: under ``criteria`` and ``thresholds``.
+ACCEPT_REV4_CRITERIA = ("onset", "window_fa", "A_deadband")
+ACCEPT_REV4_THRESHOLDS = ("accept_gate",)
 LEGACY_ACCEPT_WHAT = ("plan §6.9f acceptance A-D on M, evaluated once on the frozen parameters "
                       "(A, B, D gate; C and the all-violating recall are disclosed)")
 #: The criteria that gate, by accept format revision.
@@ -1608,6 +1826,10 @@ def freeze_model(out_root: Path, fit_dir: Path, model: str, arm: str) -> tuple[O
                 check_training_inputs(model, p, ledger=load_ledgers([str(lp)]) if lp.exists() else None)
             except SystemExit as exc:
                 problems.append(f"training inputs: {exc}")
+            ts_attr = str(man_doc.get("attribution") or ATTRIBUTION_COMPLETION)
+            if label_attribution(ver.get("label_def")) != ts_attr:
+                problems.append(f"the fitted label's attribution {label_attribution(ver.get('label_def'))!r} != the "
+                                f"training datasets' {ts_attr!r} (trainset.json): rerun the fit stages")
     if problems:
         return None, problems
     # B' (2026-10-03): the severity cut, from these training windows only, sealed now -
@@ -1616,6 +1838,7 @@ def freeze_model(out_root: Path, fit_dir: Path, model: str, arm: str) -> tuple[O
         b_prime_rec = b_prime_freeze_record(verdict_for_holdout(ver), p["fitting"])
     except (ValueError, KeyError) as exc:
         return None, [f"B' severity cut: {exc}"]
+    a_deadband = deadband_freeze_record(verdict_for_holdout(ver), p["fitting"])
 
     h2_path = fit_dir / H2_MANIFEST
     stage_files = {name: d / f"{name}.json" for name in FREEZE_STAGE_FILES}
@@ -1657,8 +1880,28 @@ def freeze_model(out_root: Path, fit_dir: Path, model: str, arm: str) -> tuple[O
         # older freezes = gateway). accept refuses an M dataset built with another.
         "numerator": man_doc.get("numerator") or "gateway",
         "b_prime": b_prime_rec,
+        # revision 4 (2026-10-05)
+        "label_attribution": label_attribution(ver["label_def"]),
+        "dynamic_training": man_doc.get("dynamic_training") or {"admitted": False,
+                                                                 "rule": "trainset.json predates the record"},
+        "theta_selection": fin.get("theta_selection") or {"rule": "final.json predates the record: the BA argmax"},
+        "absolute_thresholds": absolute_thresholds(fin["theta_published"], fin["tau_crit"], pub.get("tau_high")),
+        "a_deadband": a_deadband,
     }
     return entry, []
+
+
+def deadband_freeze_record(vh: Mapping[str, Any], training_csv: Path) -> dict:
+    """The A dead band's s0 (disclosure only) from the freeze's training CSV:
+    :func:`scripts.b_prime.label_noise_s0` under the frozen label."""
+    from scripts import b_prime
+
+    label = slo_labels.LabelDefinition.from_dict(vh["label_def"])
+    with open(training_csv, newline="", encoding="utf-8") as fh:
+        rows = list(csv.DictReader(fh))
+    rec = b_prime.label_noise_s0(rows, label)
+    return {**rec, "training_csv": str(training_csv), "training_csv_sha256": sha256_file(Path(training_csv)),
+            "gating": False, "use": "A dead band: BA with violating windows of severity < s0 left out (disclosed)"}
 
 
 def b_prime_freeze_record(vh: Mapping[str, Any], training_csv: Path) -> dict:
@@ -1721,7 +1964,7 @@ def training_load_paths(trainset_manifest: Mapping) -> tuple[dict[str, dict], li
 
 
 def stage_freeze(out_root: Path, fit_dir_of: Callable[[str], Path], models: Sequence[str], arm: str,
-                 freeze_file: Path, *, command: Sequence[str] = ()) -> dict:
+                 freeze_file: Path, *, command: Sequence[str] = (), accept_gate: str = ACCEPT_GATE_ONSET) -> dict:
     """D22: freeze every model's published parameters into ``freeze_file`` (or refuse,
     raising :class:`FreezeError` with every reason, before anything is written)."""
     fp = freeze_paths(freeze_file)
@@ -1731,6 +1974,8 @@ def stage_freeze(out_root: Path, fit_dir_of: Callable[[str], Path], models: Sequ
             problems.append(f"{fp[key]} already exists: a freeze is never overwritten")
     if len(set(models)) != len(models):
         problems.append(f"a model is given twice: {list(models)}")
+    if accept_gate not in ACCEPT_GATES:
+        problems.append(f"accept gate {accept_gate!r} not in {ACCEPT_GATES}")
     entries: dict[str, dict] = {}
     for model in models:
         entry, pr = freeze_model(out_root, fit_dir_of(model), model, arm)
@@ -1753,6 +1998,7 @@ def stage_freeze(out_root: Path, fit_dir_of: Callable[[str], Path], models: Sequ
         "b_prime_gate": {**b_prime_gate_defaults(),
                          "decided": "user 2026-10-03: B' replaces B as the accept gate (b_prime_thresholds.json "
                                     "of 2026-09-24); judged at the controller's dwell, dwell 2 disclosed"},
+        "accept_gate": accept_gate_record(accept_gate),
         "self_hash_rule": ("freeze_sha256 = sha256 of json.dumps(doc without freeze_sha256, sort_keys=True, "
                            "separators=(',', ':'), ensure_ascii=False) in UTF-8"),
     }
@@ -1762,6 +2008,26 @@ def stage_freeze(out_root: Path, fit_dir_of: Callable[[str], Path], models: Sequ
     _write_once(fp["freeze"], data)
     _write_once(fp["sidecar"], f"{hashlib.sha256(data).hexdigest()}  {fp['freeze'].name}\n".encode())
     return doc
+
+
+def accept_gate_record(rule: str) -> dict:
+    """The accept gate a freeze seals (revision 4): which rule gates, and every parameter
+    of the onset gate, window false alarm and verdict (also sealed under ``b_prime``, where
+    they are disclosed)."""
+    from scripts import b_prime
+
+    return {"rule": rule, "gating_criteria": list(ONSET_GATING_CRITERIA if rule == ACCEPT_GATE_ONSET
+                                                  else GATING_CRITERIA),
+            "onset": {**b_prime.ONSET_GATE, "dynamic_primitives": list(b_prime.ONSET_DYNAMIC_PRIMITIVES),
+                      "rule": b_prime.ONSET_RULE, "ci_rule": b_prime.ONSET_CI_RULE,
+                      "icc_undefined_value": b_prime.ICC_UNDEFINED_VALUE},
+            "window_fa": dict(b_prime.WINDOW_FA_GATE),
+            "severity_cut": "each model's b_prime.severity_cut (training .65 quantile under the frozen label)",
+            "dwell_windows": ONLINE_DWELL_WINDOWS, "verdict_rule": VERDICT_RULE,
+            "disclosed": ["B' (window severe recall)", "old B", "dwell 2", "A dead band at s0",
+                          "theta plateau", "absolute thresholds"],
+            "decided": ("design docs/calib-next-round-design-20261005.md item 3 and user decision 2 (2026-10-05)"
+                        if rule == ACCEPT_GATE_ONSET else "user 2026-10-03: A, B', D")}
 
 
 def b_prime_gate_defaults() -> dict:
@@ -2175,8 +2441,41 @@ def b_prime_evaluation(windows: Sequence[Any], *, theta: float, tau_crit: float,
     return out
 
 
+def accept_gate_of(doc: Mapping[str, Any]) -> dict:
+    """The accept gate of a freeze: its sealed ``accept_gate`` (revision 4), else - an older
+    freeze - the A, B', D gate with the onset-gate defaults for the disclosure."""
+    from scripts import b_prime
+
+    rec = doc.get("accept_gate")
+    if isinstance(rec, Mapping):
+        onset = b_prime.check_onset_gate(rec.get("onset") or {})
+        fa = {k: float((rec.get("window_fa") or {})[k]) for k in b_prime.WINDOW_FA_GATE}
+        return {"rule": rec.get("rule"), "onset": onset, "window_fa": fa, "source": "freeze accept_gate"}
+    return {"rule": ACCEPT_GATE_B_PRIME, "onset": dict(b_prime.ONSET_GATE), "window_fa": dict(b_prime.WINDOW_FA_GATE),
+            "source": f"defaults: the freeze (format revision {doc.get('format_revision')}) predates accept_gate; "
+                      "the gate is A, B', D and the onset gate is disclosed"}
+
+
+def verdict_of(criteria: Mapping[str, Any]) -> str:
+    """:data:`VERDICT_RULE` on one model's criteria."""
+    others = all(criteria[g]["passed"] for g in ONSET_GATING_CRITERIA if g != "A")
+    if others and criteria["A"]["passed"]:
+        return VERDICT_PASS
+    return VERDICT_PASS_A_DISCLOSED if others else VERDICT_FAIL
+
+
+def primitives_by_scenario(csv_path: Path) -> dict[str, str]:
+    """scenario id -> the cell's primitive, from a validation CSV."""
+    out: dict[str, str] = {}
+    with open(csv_path, newline="", encoding="utf-8") as fh:
+        for row in csv.DictReader(fh):
+            out.setdefault((row.get("scenario_id") or "unknown").strip() or "unknown", row.get("primitive") or "")
+    return out
+
+
 def evaluate_model(entry: Mapping[str, Any], csv_path: Path, *, n_resamples: int, seed: int,
-                   records_sink: Optional[list] = None, b_prime_cfg: Optional[Mapping[str, Any]] = None) -> dict:
+                   records_sink: Optional[list] = None, b_prime_cfg: Optional[Mapping[str, Any]] = None,
+                   gate_cfg: Optional[Mapping[str, Any]] = None) -> dict:
     """``theta_verdict.holdout_report`` for the point estimates (the freeze's dwell and
     window length - 2 x 30 s for a freeze that predates the record), the cell bootstrap for
     the CIs, then A-D; plus the ranking disclosure (AUROC, Kendall tau-b; never gating).
@@ -2211,8 +2510,44 @@ def evaluate_model(entry: Mapping[str, Any], csv_path: Path, *, n_resamples: int
         cfg=b_prime_cfg or {"dwell_windows": ONLINE_DWELL_WINDOWS, "severity_cut": None,
                             "gate": b_prime_gate_defaults(), "missing": "no B' configuration"},
         n_resamples=n_resamples, seed=seed)
+    # 2026-10-05: the onset gate, the window false alarm and the A dead band - gating under an
+    # onset freeze (verdict), disclosed under an older one
+    from scripts import b_prime
+
+    gate = dict(gate_cfg or {"rule": ACCEPT_GATE_B_PRIME, "onset": dict(b_prime.ONSET_GATE),
+                             "window_fa": dict(b_prime.WINDOW_FA_GATE)})
+    onset_rule = gate["rule"] == ACCEPT_GATE_ONSET
+    bp = criteria["B_prime"]
+    bp["gating"] = not onset_rule
+    bp_dwell, cut = int(bp["dwell_windows"]), bp.get("severity_cut")
+    prim = primitives_by_scenario(csv_path)
+    if cut is None:
+        criteria["onset"] = {"evaluable": False, "passed": False, "criteria": [], "reason": "no severity cut"}
+        criteria["window_fa"] = {"evaluable": False, "passed": False, "criteria": [], "reason": "no severity cut"}
+    else:
+        onset_by_dwell = {}
+        for d in sorted({bp_dwell, *b_prime.DISCLOSED_DWELL_WINDOWS}):
+            cd = tv.critical_dwell_flags(windows, theta=theta, tau_crit=tau_crit, direction=direction,
+                                         dwell_windows=d, window_ms=window_ms)
+            onset_by_dwell[d] = b_prime.onset_detection(windows, cd, cut=cut, primitive_of=prim, gate=gate["onset"],
+                                                        n_resamples=n_resamples, seed=seed)
+        criteria["onset"] = {**onset_by_dwell[bp_dwell], "gating": onset_rule, "dwell_windows": bp_dwell,
+                             "disclosed_dwells": {str(d): {k: o.get(k) for k in ("onset", "passed", "success_rate",
+                                                                                   "n_eff", "icc")}
+                                                  for d, o in onset_by_dwell.items() if d != bp_dwell}}
+        g = bp["by_dwell"][str(bp_dwell)]
+        criteria["window_fa"] = {**b_prime.window_fa(g, g, gate["window_fa"]), "gating": onset_rule,
+                                 "dwell_windows": bp_dwell}
+    dead = gate.get("a_deadband") or entry.get("a_deadband") or {}
+    s0 = _finite_or_none(dead.get("s0"))
+    criteria["A_deadband"] = ({**b_prime.deadband_ba(windows, theta=theta, s0=s0, direction=direction),
+                               "gating": False, "s0_source": dead.get("source", "freeze a_deadband")}
+                              if s0 is not None else {"gating": False, "s0": None,
+                                                      "reason": "no s0 (freeze has no a_deadband)"})
+    verdict = verdict_of(criteria)
     return {"holdout_report": h, "bootstrap": boot, "criteria": criteria,
-            "passed": all(criteria[g]["passed"] for g in GATING_CRITERIA),
+            "passed": (verdict != VERDICT_FAIL) if onset_rule else all(criteria[g]["passed"] for g in GATING_CRITERIA),
+            "gate_rule": gate["rule"], "verdict": verdict if onset_rule else {"disclosed": verdict, "gating": False},
             "windowing": win,
             "ranking_disclosure": ranking.ranking_disclosure(records, n_resamples=n_resamples, seed=seed),
             "M": {"windows": h["windows"], "cells": h["cells"], "violating": h["violating"],
@@ -2270,6 +2605,15 @@ def _accept_inputs(freeze_file: Path, datasets: Sequence[str],
             problems.append(f"dataset {s.name} ({s.directory}) was built with the {have!r} TSS numerator; the "
                             f"freeze fitted {wrong} with {sorted({frozen_numerators[m_] for m_ in wrong})} "
                             "(rebuild it with calibration_dataset --numerator)")
+    frozen_attr = {m_: label_attribution((e.get("verdict_for_holdout") or {}).get("label_def"))
+                   for m_, e in sorted(doc["models"].items())}
+    for s in sources:
+        have = dataset_attribution(s.directory)
+        wrong = sorted(m_ for m_, a in frozen_attr.items() if a != have)
+        if wrong:
+            problems.append(f"dataset {s.name} ({s.directory}) carries {have!r} label attribution; the freeze's "
+                            f"label for {wrong} is {sorted({frozen_attr[m_] for m_ in wrong})} (use the matching "
+                            "dataset directory, e.g. dataset_hybrid/, or rebuild with calibration_dataset --attribution)")
     m: dict = {"header": {}, "rows": {}, "placed": {}}
     if not problems:
         m, pr = collect_m_rows(sources, manifests)
@@ -2357,6 +2701,8 @@ def _accept_result(freeze_file: Path, inp: Mapping[str, Any], work: Path, *, n_r
                 for s in inp["sources"]]
     from tre_calibration import ranking
 
+    gate = accept_gate_of(doc)
+    onset_rule = gate["rule"] == ACCEPT_GATE_ONSET
     models: dict[str, Any] = {}
     records: list = []
     for model in sorted(doc["models"]):
@@ -2364,8 +2710,15 @@ def _accept_result(freeze_file: Path, inp: Mapping[str, Any], work: Path, *, n_r
         mpath = inp["manifest_paths"][model]
         csv_path = work / f"{model}_validation.csv"
         _write_validation_csv(csv_path, m["header"][model], m["rows"][model])
+        gcfg = dict(gate)
+        if not isinstance(entry.get("a_deadband"), Mapping) and isinstance(entry.get("b_prime"), Mapping):
+            # an older freeze: s0 from its own (hash-checked) training CSV, never from M
+            gcfg["a_deadband"] = {**deadband_freeze_record(entry["verdict_for_holdout"],
+                                                           Path(entry["b_prime"]["training_csv"])),
+                                  "source": "computed at accept from the frozen training CSV (the freeze predates "
+                                            "a_deadband)"}
         ev = evaluate_model(entry, csv_path, n_resamples=n_resamples, seed=seed, records_sink=records,
-                            b_prime_cfg=bp_cfgs.get(model))
+                            b_prime_cfg=bp_cfgs.get(model), gate_cfg=gcfg)
         cells = []
         for c in man["cells"]:
             placed = m["placed"][(model, str(c["cell_id"]), _attempt(c["attempt"]))]
@@ -2385,7 +2738,17 @@ def _accept_result(freeze_file: Path, inp: Mapping[str, Any], work: Path, *, n_r
             "published": entry["published"],
             **ev,
         }
-    failed = failures(models, GATING_CRITERIA)
+    if onset_rule:
+        failed = failures({k: r for k, r in models.items() if r["verdict"] == VERDICT_FAIL}, ONSET_GATING_CRITERIA)
+        limitations = [x for x in failures({k: r for k, r in models.items()
+                                            if r["verdict"] == VERDICT_PASS_A_DISCLOSED}, ("A",))]
+        verdicts = {k: r["verdict"] for k, r in models.items()}
+        overall = (VERDICT_FAIL if VERDICT_FAIL in verdicts.values() else
+                   VERDICT_PASS_A_DISCLOSED if VERDICT_PASS_A_DISCLOSED in verdicts.values() else VERDICT_PASS)
+    else:
+        failed = failures(models, GATING_CRITERIA)
+        limitations, overall = [], {"disclosed": {k: r["verdict"]["disclosed"] for k, r in models.items()},
+                                    "gating": False}
     wins = {model: windowing_of(e) for model, e in doc["models"].items()}
     dwells = {model: w["dwell_windows"] for model, w in wins.items()}
     steps = {w["step_ms"] for w in wins.values()}
@@ -2395,9 +2758,19 @@ def _accept_result(freeze_file: Path, inp: Mapping[str, Any], work: Path, *, n_r
     pooled["note"] = ("pooled over the models' M windows (cells stratified by model); the cross-model "
                       "tau_b is disclosed exact and with window ends rounded to the re-window step")
     return {
-        "what": ("plan §6.9f acceptance A-D on M, evaluated once on the frozen parameters "
-                 "(A, B' and D gate - B' since 2026-10-03; the old B, C and the all-violating "
-                 "recall are disclosed)"),
+        "what": (("acceptance on M, evaluated once on the frozen parameters: onset episodes, window false "
+                  "alarm, A and D gate with a three-way verdict (design 2026-10-05 item 3, user decision 2); "
+                  "B', the old B, C, dwell 2 and the A dead band are disclosed") if onset_rule else
+                 ("plan §6.9f acceptance A-D on M, evaluated once on the frozen parameters "
+                  "(A, B' and D gate - B' since 2026-10-03; the old B, C and the all-violating "
+                  "recall are disclosed)")),
+        "gate_rule": {"rule": gate["rule"], "source": gate["source"],
+                      "gating_criteria": list(ONSET_GATING_CRITERIA if onset_rule else GATING_CRITERIA)},
+        "verdict": overall,
+        "disclosed_limitations": limitations,
+        "attribution": {"datasets": {s.name: dataset_attribution(s.directory) for s in inp["sources"]},
+                        "frozen_labels": {k: label_attribution(e["verdict_for_holdout"]["label_def"])
+                                          for k, e in sorted(doc["models"].items())}},
         "format_revision": ACCEPT_FORMAT_REVISION,
         "evaluated_at_utc": _utc_now(),
         "command": list(command),
@@ -2412,6 +2785,7 @@ def _accept_result(freeze_file: Path, inp: Mapping[str, Any], work: Path, *, n_r
                              "false_alarm_ci_high_max": B_FALSE_ALARM_CI_HIGH_MAX,
                              "all_violating_recall_target": ALL_VIOLATING_RECALL_TARGET},
                        "C": {"windows_per_independent": WINDOWS_PER_INDEPENDENT},
+                       "accept_gate": {**gate, "verdict_rule": VERDICT_RULE},
                        "dwell_windows": (next(iter(set(dwells.values()))) if len(set(dwells.values())) == 1
                                          else dict(sorted(dwells.items())))},
         "bootstrap": {"n_resamples": n_resamples, "seed": seed},
@@ -2437,6 +2811,12 @@ def as_revision(result: Mapping[str, Any], revision: Any) -> dict:
         for r in (out.get("models") or {}).values():
             for k in keys["model"]:
                 r.pop(k, None)
+    if not isinstance(revision, int) or revision < 4:
+        for r in (out.get("models") or {}).values():
+            for k in ACCEPT_REV4_CRITERIA:
+                (r.get("criteria") or {}).pop(k, None)
+        for k in ACCEPT_REV4_THRESHOLDS:
+            (out.get("thresholds") or {}).pop(k, None)
     if not isinstance(revision, int) or revision < 3:
         # before 2026-10-03 the gate was A, B, D and B' did not exist
         for r in (out.get("models") or {}).values():
@@ -2597,24 +2977,35 @@ def stage_accept(freeze_file: Path, datasets: Sequence[str], m_manifests: Sequen
                                            "result_sha256": hashlib.sha256(data).hexdigest(),
                                            "accepted_at_utc": _utc_now()}))
     bp = result["thresholds"]["B_prime"]
-    print(f"B' (gating) judged at dwell {bp['dwell_windows']} ({bp['dwell_source']}); severity cut from "
+    onset_rule = result["gate_rule"]["rule"] == ACCEPT_GATE_ONSET
+    print(f"B' ({'disclosed' if onset_rule else 'gating'}) judged at dwell {bp['dwell_windows']} "
+          f"({bp['dwell_source']}); severity cut from "
           f"{bp['cut_source']}; dwell {', '.join(map(str, bp['disclosed_dwell_windows']))} disclosed")
+    gates = ONSET_GATING_CRITERIA if onset_rule else GATING_CRITERIA
+    print(f"gate: {result['gate_rule']['rule']} ({', '.join(gates)})")
     for model, r in result["models"].items():
         c = r["criteria"]
         g2 = (c["B_prime"].get("by_dwell") or {}).get("2") or {}
+        on = (c.get("onset") or {}).get("onset") or {}
         print(f"[{model}] M {r['M']['windows']} windows / {r['M']['cells']} cells: "
-              + " ".join(f"{g}={'pass' if c[g]['passed'] else 'FAIL'}" for g in GATING_CRITERIA)
+              + " ".join(f"{g}={'pass' if c[g]['passed'] else 'FAIL'}" for g in gates)
+              + (f" -> verdict {r['verdict']}" if onset_rule else "")
+              + f" (onset episodes {on.get('within_budget')}/{on.get('episodes')} within budget, "
+                f"n_eff {c.get('onset', {}).get('n_eff')}; B' {'pass' if c['B_prime']['passed'] else 'fail'})")
+        print(f"[{model}]"
               + f" (disclosed: B' dwell 2 recall {g2.get('recall_severe')} / false alarm {g2.get('false_alarm')}; "
                 f"old B {'pass' if c['B']['passed'] else 'fail'}; "
                 f"C TTFT-only recall {c['C']['critical_recall_ttft_only']} on {c['C']['windows']} windows)")
     print_ranking_table(result)
     print(f"wrote {fp['result']} and {fp['marker']}")
+    for x in result.get("disclosed_limitations") or []:
+        print(f"  limitation (disclosed, not failing): {x}")
     if not result["passed"]:
         print("acceptance FAILED:")
         for x in result["failed"]:
             print(f"  - {x}")
         return EXIT_ACCEPT_FAILED
-    print("acceptance passed")
+    print("acceptance passed" + (f" (verdict {result['verdict']})" if onset_rule else ""))
     return 0
 
 
@@ -2644,6 +3035,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--h2-dataset", action="append", default=[], metavar="[RUN=]DIR",
                     help="trainset: a standard dataset whose sealed split joins H2 (D16: run 1 and run 2); "
                          "its constant-load train / auxiliary cells still train")
+    ap.add_argument("--train-dynamic", action="store_true",
+                    help="trainset: the train-split dynamic cells (steps / ramp / bursts) train with the "
+                         "constant-load cells, equal weight per window (design 2026-10-05 item 2; recorded "
+                         "in trainset.json); default: D16, constant-load cells only")
+    ap.add_argument("--accept-gate", choices=ACCEPT_GATES, default=ACCEPT_GATE_ONSET,
+                    help="freeze: the accept gate sealed in the freeze - onset (default; design 2026-10-05 "
+                         "item 3: onset episodes, window false alarm, A, D, three-way verdict) or b_prime "
+                         "(the 2026-10-03 A, B', D gate)")
     ap.add_argument("--no-sentinels", action="store_true",
                     help="trainset: leave the sentinel cells out of the training set (default: they train)")
     ap.add_argument("--alpha-rule", choices=ALPHA_RULES, default="d4prime")
@@ -2753,10 +3152,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             ap.error("trainset needs --dataset and / or --h2-dataset")
         try:
             doc = build_training_set(sources, args.fit_dir, sentinels=not args.no_sentinels,
-                                     models=args.model or None)
+                                     models=args.model or None, train_dynamic=args.train_dynamic)
         except TrainingSetError as exc:
             raise SystemExit(f"trainset: {exc}")
-        print(json.dumps({"models": {m: {k: v[k] for k in ("windows", "cells", "family_windows")}
+        print(json.dumps({"attribution": doc["attribution"], "dynamic_training": doc["dynamic_training"]["admitted"],
+                          "models": {m: {k: v[k] for k in ("windows", "cells", "family_windows", "dynamic")}
                                      for m, v in doc["models"].items()},
                           "h2_rows_sha256": doc["h2"]["rows_sha256"], "m_unread": doc["m_unread"]}, indent=1))
         print(f"wrote {args.fit_dir / TRAINSET_MANIFEST} and {args.fit_dir / H2_MANIFEST}")
@@ -2778,7 +3178,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if args.freeze_file is None:
             ap.error("freeze needs --freeze-file")
         try:
-            doc = stage_freeze(args.out_dir, fit_dir, args.model, args.arm, args.freeze_file, command=command)
+            doc = stage_freeze(args.out_dir, fit_dir, args.model, args.arm, args.freeze_file, command=command,
+                               accept_gate=args.accept_gate)
         except FreezeError as exc:
             print(f"freeze REFUSED - nothing was written ({len(exc.problems)} problem(s)):")
             for x in exc.problems:
@@ -2786,8 +3187,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return EXIT_REFUSED
         for model, e in doc["models"].items():
             q = e["published"]
+            ab, pl = e["absolute_thresholds"], (e["theta_selection"].get("plateau") or {})
             print(f"[{model}] theta={q['theta']:.6g} w_p={q['w_p']:g} tau_s={q['tau_s']:g} "
-                  f"lambda_wait={q['lambda_wait']:g} delta_crit={q['delta_crit']:g} delta_high={q['delta_high']:g}")
+                  f"lambda_wait={q['lambda_wait']:g} delta_crit={q['delta_crit']:g} delta_high={q['delta_high']:g} "
+                  f"CRIT abs={ab['critical_abs']} HIGH abs={ab['high_abs']} "
+                  f"plateau=[{pl.get('theta_lo')}, {pl.get('theta_hi')}] s0={e['a_deadband'].get('s0')} "
+                  f"attribution={e['label_attribution']}")
+        print(f"accept gate: {doc['accept_gate']['rule']}")
         print(f"wrote {args.freeze_file} (freeze_sha256 {doc['freeze_sha256']}) and "
               f"{freeze_paths(args.freeze_file)['sidecar']}")
         return 0
@@ -2801,7 +3207,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if len(args.model) != 1:
         ap.error(f"stage {args.stage} takes one --model")
     model = args.model[0]
-    label = label_for(model, args.arm, args.registry)
+    # the label of the training datasets' attribution (trainset.json; completion without one)
+    label = label_for(model, args.arm, args.registry, trainset_attribution(fit_dir(model)))
     p = paths(fit_dir(model), model)
     lp = ledger_paths([model])
     # D16: nothing but constant-load training rows reaches a fit (H2 / M cut at the entry)

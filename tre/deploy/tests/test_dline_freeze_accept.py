@@ -84,9 +84,11 @@ _PROBE = 3_000_301
 
 
 def _world(tmp_path: Path, *, stop_ok: bool = True, holdout_evaluated: bool = False,
-           false_alarm_cells: int = 0, train_manifest: dict | None = None) -> dict:
+           false_alarm_cells: int = 0, train_manifest: dict | None = None, steps_cells: int = 0) -> dict:
     """A trainset fit dir, a refit tree (the four stage outputs of one model) and an M
-    dataset. ``false_alarm_cells`` healthy M cells carry a low signal (CRITICAL false alarms)."""
+    dataset. ``false_alarm_cells`` healthy M cells carry a low signal (CRITICAL false alarms).
+    ``steps_cells`` > 0: the TPOT-violating cells are that many ``steps`` cells (onset
+    episodes for the onset gate) instead of the five hold cells."""
     # training set, cut by the trainset stage from a small dataset
     train = []
     for n, shape in enumerate(("S1", "S3", "S4", "S5", "S3", "S4")):
@@ -102,11 +104,14 @@ def _world(tmp_path: Path, *, stop_ok: bool = True, holdout_evaluated: bool = Fa
     # M: the evaluated cells, one sealed probe and one training row in the same dataset
     m_rows, cells = [], []
     specs = [(c, "lo" if k < false_alarm_cells else s, t, p) for k, (c, s, t, p) in enumerate(_HEALTHY)]
-    for code, sig, ttft, tpot in specs + _TPOT + _TTFT_ONLY:
+    tpot_cells = ([(3_000_101 + k, "lo", 200.0, 100.0) for k in range(steps_cells)] if steps_cells else _TPOT)
+    steps = {c for c, *_ in tpot_cells} if steps_cells else set()
+    for code, sig, ttft, tpot in specs + tpot_cells + _TTFT_ONLY:
+        prim = "steps" if code in steps else "hold"
         m_rows += _cell_rows(code, shape="M", split="holdout", role="ladder", stage="ladder", signal=sig,
-                             ttft=ttft, tpot=tpot)
+                             ttft=ttft, tpot=tpot, primitive=prim)
         cells.append({"model": MODEL, "cell_id": f"i0_o0_c{code}", "attempt": 1, "shape": "M",
-                      "primitive": "hold", "role": "ladder",
+                      "primitive": prim, "role": "ladder",
                       "origin": "retained" if code == _HEALTHY[0][0] else "collected",
                       "seen_before": code == _HEALTHY[0][0],
                       "note": "first-round M cell, looked at once by the 09-22 refit" if code == _HEALTHY[0][0] else ""})
@@ -157,9 +162,10 @@ def _world(tmp_path: Path, *, stop_ok: bool = True, holdout_evaluated: bool = Fa
             "freeze": tmp_path / "freeze" / "params_freeze.json", "mroot": tmp_path / "M"}
 
 
-def _freeze(w: dict) -> int:
+def _freeze(w: dict, gate: str = "b_prime") -> int:
+    # the A, B', D gate: these tests pin it on hold-only M (the onset gate: test_dline_onset_gate.py)
     return dl.main(["freeze", "--model", MODEL, "--arm", ARM, "--fit-dir", str(w["fit"]), "--out-dir", str(w["out"]),
-                    "--freeze-file", str(w["freeze"])])
+                    "--freeze-file", str(w["freeze"]), "--accept-gate", gate])
 
 
 def _seal(w: dict, *, label_def=None, freeze_sha=None, cells=None, sums_extra: list[Path] = ()) -> Path:
