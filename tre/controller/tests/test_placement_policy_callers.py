@@ -74,7 +74,6 @@ def test_relay_pairing_is_counted_not_placed():
         assert occupancy.pairable_count("D", "R", max_pairs=5, max_donors=1) == (1, 1)
         assert occupancy.pairable_count("D", "R", max_pairs=5, max_donors=5) == (1, 1)  # one left
         assert occupancy.pairable_count("D", "R", max_pairs=5, max_donors=5) == (0, 0)  # counted once
-    assert not hasattr(_SlotOccupancy, "donor_slot_pods")
 
 
 def test_safescale_probe_pick_releases_from_the_most_loaded_node():

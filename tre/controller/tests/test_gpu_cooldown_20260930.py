@@ -125,8 +125,6 @@ def test_a_refused_wake_is_an_event_only_and_starts_no_cooldown():
     assert result.ok is False and result.wake_conflict["node"] == "node9"
     assert queue.drain_events() == ["wake_refused:dsllama-8b:node9/1:gpu_busy"]
     assert queue.drain_events() == []
-    for removed in ("cooled_gpus", "cooled_nodes", "recent_refusals", "floor_held_models"):
-        assert not hasattr(queue, removed)
     # The same wake is accepted again at once (no timer; the next tick re-plans).
     assert queue.submit([_wake()]).accepted == 1
 

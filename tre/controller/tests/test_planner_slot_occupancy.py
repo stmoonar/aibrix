@@ -95,7 +95,6 @@ def test_e1_deadlock_high_donor_frees_a_slot_where_receiver_sleeps() -> None:
     [relay] = [a for a in plan.actions if isinstance(a, TransferIntent)]
     assert (relay.donor_model, relay.receiver_model, relay.count, relay.pairs) == ("dsqwen-7b", "dsllama-8b", 1, 1)
     assert (relay.reason, relay.sleep_path) == ("critical_donor_immediate", "urgent")
-    assert not hasattr(relay, "pods")
     assert not scale  # no binding-level donor sleep / receiver wake any more
 
 

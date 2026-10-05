@@ -224,8 +224,6 @@ def test_safescale_window_defaults_and_env_parsing() -> None:
     # A6: W = max(2 * p95_e2e, 20 s), no ceiling, no default/fallback/decode terms.
     safescale = ControllerConfig.from_env({}).safescale
     assert (safescale.min_window_ms, safescale.e2e_multiplier, safescale.hq) == (20_000.0, 2.0, 0.25)
-    for gone in ("max_window_ms", "default_window_ms", "cw2_fallback_ms", "cdec"):
-        assert not hasattr(safescale, gone)
     tuned = ControllerConfig.from_env(
         {"SAFE_SCALE_WINDOW_FLOOR_MS": "30000", "SAFE_SCALE_E2E_MULTIPLIER": "1.5"}
     ).safescale

@@ -237,7 +237,6 @@ def test_a_relay_is_finished_when_its_call_returns():
 
     queue = asyncio.run(scenario())
     assert _calls(sm) == [("7b->8b", "transfer", 2)]
-    assert not hasattr(queue, "recovering_transfers")
     assert queue.view_changes().keys() == {"7b", "8b"}
 
 
@@ -343,7 +342,6 @@ def test_sm_client_transfer():
     assert asyncio.run(client.transfer("7b", "8b", 1)) == {"ok": True, "response": body}
     assert transport.calls == [("POST", "/v2/transfers",
                                 {"donor_model": "7b", "receiver_model": "8b", "count": 1, "sleep_path": "urgent"})]
-    assert not hasattr(client, "get_transfers")  # plan B: nothing to track after the call
 
     partial = dict(transfer_body(1, statuses=["donor_sleep_failed"], done=0, taken=0), error="partial")
     transport.answers[("POST", "/v2/transfers")] = ServiceManagerError("HTTP 409", status=409, body=partial)

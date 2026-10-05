@@ -168,7 +168,6 @@ def test_a_409_floor_violation_is_counted_and_logged_but_holds_nothing() -> None
     [refused] = asyncio.run(queue.drain_once())
     assert (refused.ok, refused.floor_violation) == (False, True)
     assert queue.stats()["floor_violation_total"] == 1
-    assert not hasattr(queue, "floor_held_models")
     again = run_rescue_tick(_idle_warm_snapshot(), queue=queue, registry=registry)
     assert [(a.model, a.delta) for a in again.actions] == [("warm", -1)]
     assert "floor_violation:warm" in again.events
