@@ -70,12 +70,30 @@ def test_dry_run_twenty_ticks_sends_nothing(tmp_path) -> None:
     assert any(call[2]["ex"] == 3600 for call in redis.set_calls if call[0] == decision_key("a"))
 
 
+class StickyScripted(ScriptedPolicy):
+    """Like a real policy: keeps wanting its last scripted count until the script changes it."""
+
+    def __init__(self, script) -> None:
+        super().__init__(script)
+        self._want: dict = {}
+
+    def decide(self, snap):
+        self._want.update(self.script.get(snap.tick, {}))
+        self.seen.append(snap.tick)
+        from tre_baselines.policies.base import Decision
+        return {m: Decision(desired=d, reason="scripted") for m, d in self._want.items()}
+
+
 def test_active_put_sequence_downs_before_ups(tmp_path) -> None:
-    shell, cluster, redis, dispatcher = _shell(tmp_path, ScriptedPolicy(SCRIPT), dry_run=False)
+    shell, cluster, redis, dispatcher = _shell(tmp_path, StickyScripted(SCRIPT), dry_run=False)
     lines = _run(shell, dispatcher, 20)
     assert redis.kv[OWNER_KEY] == "me"
-    # tick 0: a down first, then b and c up (c clamped to its cap 3)
-    assert dispatcher.submitted[:3] == [(1, "a", "down", 1), (2, "b", "up", 3), (3, "c", "up", 3)]
+    # tick 0: a down first; b and c up (c clamped to its cap 3) wait for the donor's answer
+    assert dispatcher.submitted[:1] == [(1, "a", "down", 1)]
+    assert [(l["model"], l["action"]) for l in lines[0]] == [("a", "down"), ("b", "wait_donor"), ("c", "wait_donor")]
+    assert lines[0][1]["wait_donor"] == ["a"]
+    # tick 1: the down was answered -> the scale-ups go out
+    assert [(m, d, t) for _, m, d, t in dispatcher.submitted[1:3]] == [("b", "up", 3), ("c", "up", 3)]
     # bodies (the arrival order at the SM is up to the worker threads)
     assert sorted(cluster.calls[:3], key=lambda c: c[0]) == [
         ("a", {"wake_replicas": 1, "sleep_path": "scale_down"}),
@@ -85,18 +103,19 @@ def test_active_put_sequence_downs_before_ups(tmp_path) -> None:
     # tick 3: a asks for 0, clamped to min 1 == awake -> nothing sent
     assert [l["action"] for l in lines[3]] == ["none", "none", "none"]
     assert lines[3][0]["raw_desired"] == 0 and lines[3][0]["clamped"] == 1
-    # tick 5: downs (b, c) before the up (a)
+    # tick 5: downs (b, c) first; the up (a) waits for them and goes at tick 6
     assert [(m, d, t) for _, m, d, t in dispatcher.submitted[3:6]] == [
         ("b", "down", 1), ("c", "down", 1), ("a", "up", 4)]
+    assert [l["action"] for l in lines[5]] == ["down", "down", "wait_donor"] and lines[6][0]["action"] == "up"
     # tick 9: b up to 2
     assert [(m, d, t) for _, m, d, t in dispatcher.submitted[6:]] == [("b", "up", 2)]
     assert cluster.awake == {"a": 4, "b": 2, "c": 1}
     # results come back on the following tick's line
-    assert lines[1][0]["sm_result"]["ok"] is True
+    assert [l for l in lines[1] if l["model"] == "a"][0]["sm_result"]["ok"] is True
     metrics = shell.metrics_text()
     assert 'tre_bl_actions_total{policy="scripted",model="a",action="down"} 1' in metrics
     assert 'tre_bl_actions_total{policy="scripted",model="a",action="up"} 1' in metrics
-    # a: down at t0, up at t5 (10 s later) -> reversal; b: up, down, up -> 2 reversals
+    # a: down at t0, up at t6 (12 s later) -> reversal; b: up, down, up -> 2 reversals
     assert 'tre_bl_direction_reversals_60s_total{policy="scripted",model="a"} 1' in metrics
     assert 'tre_bl_direction_reversals_60s_total{policy="scripted",model="b"} 2' in metrics
     dispatcher.close(join_s=1.0)
@@ -465,3 +484,37 @@ def test_owner_or_mode_change_between_decision_and_call_drops_the_call(tmp_path)
         assert result["error"] == "dropped" and result["reason"] == why
         assert shell.stats.sm_dropped == 1 and shell.stats.sm_failures == 0
         assert shell.backoff.delay_s("a") is None                           # a drop is not a refusal
+
+
+def test_donor_scale_down_is_answered_before_the_dependent_scale_up(tmp_path) -> None:
+    """10-04 P2 repro: submit(down a), submit(up b) used to run down_started -> up_started
+    -> down_finished. The scale-up now goes out only after the SM answered the scale-down."""
+    shell, cluster, redis, dispatcher = _shell(tmp_path, StickyScripted({0: {"a": 1, "b": 2}}), dry_run=False)
+    cluster.delay_s = 0.05
+    lines = []
+    for _ in range(4):  # ticks do not wait for the SM here
+        lines.append({l["model"]: l for l in shell.tick_once()})
+        wait_until(lambda: dispatcher.inflight_downs() == [], timeout_s=2.0)
+    assert wait_until(lambda: dispatcher.inflight_count() == 0)
+    assert cluster.trace[:4] == [("a", "start"), ("a", "end"), ("b", "start"), ("b", "end")]
+    assert lines[0]["b"]["action"] == "wait_donor" and lines[1]["b"]["action"] == "up"
+
+
+def test_refusal_backoff_clears_when_the_sm_state_changes(tmp_path) -> None:
+    state = {"tick": 0}
+    cluster = FakeCluster(awake={"a": 2, "b": 1, "c": 1})
+    put, calls = _refusing_put(cluster, state, refuse_until_tick=1)
+    config = make_config(tmp_path, MODELS, dry_run=False, tick_s=2.0)
+    redis = FakeRedis()
+    dispatcher = Dispatcher(put)
+    shell = BaselineShell(config, FakeSource(config, cluster, redis), ScriptedPolicy({t: {"b": 3} for t in range(6)}),
+                          dispatcher, redis, lock=OwnerLock(redis, 30, token="me"))
+    lines = _drive(shell, dispatcher, state, 2)
+    assert calls == [0] and lines[1]["b"]["action"] == "backoff"       # refused, waiting
+    with cluster.lock:
+        cluster.version += 1                                            # e.g. another model went to sleep
+    state["tick"] = 2
+    line = {l["model"]: l for l in shell.tick_once()}["b"]
+    assert wait_until(lambda: dispatcher.inflight_count() == 0)
+    assert line["action"] == "up" and calls == [0, 2]                   # retried at once, not after the wait
+    dispatcher.close(join_s=1.0)

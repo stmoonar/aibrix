@@ -63,7 +63,7 @@ def test_config_reads_registry_limits_through_common_readers() -> None:
     assert config.sm_url == "http://sm.test:8000"
     assert config.sleep_path == "scale_down"
     assert config.scrape_timeout_s == 2.5 and config.decision_stream is True
-    assert config.backoff_max_s == 60.0 and config.liveness_stall_s == 120.0
+    assert config.backoff_max_s == 10.0 and config.liveness_stall_s == 120.0
     assert load_config({**ENV, "TRE_BL_DECISION_STREAM": "false"}).decision_stream is False
     from tre_common.registry import load_registry
 

@@ -22,11 +22,18 @@
   themselves; this one covers any policy that does not.
 * The dispatcher is asynchronous: a model whose previous SM call is still running gets
   ``inflight_skip`` (not queued); the tick never waits for the SM.
-* No arbiter in the MVP: scale-downs are submitted before scale-ups in the same tick and
-  SM refusals are logged (``sm_result`` on the model's next decision line). After a failed
+* Donor before dependent (no arbiter): scale-downs are submitted first, and no scale-up is
+  sent while any scale-down call is still in flight (action ``wait_donor``): the SM answers
+  a scale-down only after the sleep is committed and the GPU released, so the scale-up that
+  may need that GPU goes out on the first tick after that answer (state, not a timer;
+  thread scheduling and model names no longer decide who gets a shared GPU).
+* SM refusals are logged (``sm_result`` on the model's next decision line). After a failed
   call the model backs off (:class:`~tre_baselines.sm_client.Backoff`: ``max(retry_after_s,
-  tick_s)``, doubling, capped at ``TRE_BL_BACKOFF_MAX_S``); while it waits its line says
-  ``backoff`` and no call is sent. A success, or the desired count back at awake, resets it.
+  tick_s)``, doubling, capped at ``TRE_BL_BACKOFF_MAX_S``, default 10 s); while it waits its
+  line says ``backoff`` and no call is sent. A success, the desired count back at awake, or
+  - for a refusal (an HTTP answer, not a transport error) - any change of the SM state
+  version (``/v2/state`` ``version``) resets it: the state that caused the refusal is gone.
+  The remaining wait only bounds retries whose cause the state does not show.
 * One JSONL line per model per tick to ``$TRE_BL_LOG_DIR/decisions-<policy>-<YYYYMMDD>.jsonl``
   (date of the Redis clock, UTC), mirrored to ``tre:v2:bl:decision:<model>`` (TTL 1 h)
   unless ``TRE_BL_WRITE_REDIS=false``, and appended to the stream ``tre:v2:bl:decisions``
@@ -60,13 +67,13 @@ from tre_baselines.keys import (
     decision_key,
 )
 from tre_baselines.policies.base import INCOMPLETE, Decision
-from tre_baselines.sm_client import DROPPED, Backoff, Completed, Dispatcher
+from tre_baselines.sm_client import DEFAULT_BACKOFF_MAX_S, DROPPED, Backoff, Completed, Dispatcher
 from tre_baselines.snapshot import ClusterSnapshot, evidence_gaps
 
 LOG = logging.getLogger(__name__)
 
 REVERSAL_WINDOW_MS = 60_000
-ACTIONS = ("none", "up", "down", "inflight_skip", "dry_run", "backoff", "guard_controller_active")
+ACTIONS = ("none", "up", "down", "inflight_skip", "dry_run", "backoff", "guard_controller_active", "wait_donor")
 #: Controller modes under which a baseline may actuate (missing key = observe).
 _CONTROLLER_OK = (None, "", "observe")
 
@@ -191,7 +198,10 @@ class BaselineShell:
         self.lock = lock
         self.log = decision_log or DecisionLog(config.log_dir, config.policy)
         self.stats = ShellStats()
-        self.backoff = Backoff(config.tick_s, getattr(config, "backoff_max_s", 60.0))
+        self.backoff = Backoff(config.tick_s, getattr(config, "backoff_max_s", DEFAULT_BACKOFF_MAX_S))
+        #: Models backing off after an SM refusal (cleared when the SM state changes).
+        self._refused: set[str] = set()
+        self._sm_version: Any = None
         self._tick = 0
         self._running = False
         self._beat = 0.0
@@ -259,11 +269,21 @@ class BaselineShell:
         snap = self.source.gather(self._tick)
         # After the gather: a tick whose gather raises leaves the results for the next one.
         results = self._collect_results()
+        version = (snap.extra or {}).get("sm_state_version")
+        if version is not None and version != self._sm_version:
+            if self._sm_version is not None:  # the SM state changed: retry refused models now
+                for model in self._refused:
+                    self.backoff.reset(model)
+                self._refused.clear()
+            self._sm_version = version
         for model, done in results.items():
             if done.result.ok:
                 self.backoff.reset(model)
+                self._refused.discard(model)
             elif done.result.error != DROPPED:  # a dropped call never reached the SM
                 self.backoff.failed(model, snap.now_ms, done.result.retry_after_s)
+                if done.result.code is not None:  # an SM answer, not a transport error
+                    self._refused.add(model)
         decisions: Mapping[str, Decision] = self.policy.decide(snap) or {}
 
         needs_events = bool(getattr(self.policy, "needs_events", False))
@@ -292,13 +312,17 @@ class BaselineShell:
         for item in planned:
             model, direction = item["model"], item["direction"]
             wait_s = None
+            donors: list[str] = []
             if direction == "none":
                 action = "none"
                 self.backoff.reset(model)  # the desired count is back at awake
+                self._refused.discard(model)
             elif guard:
                 action = "guard_controller_active"
             elif effective_dry:
                 action = "dry_run"
+            elif direction == "up" and (donors := self.dispatcher.inflight_downs()):
+                action = "wait_donor"  # the GPU it may need is released when that call returns
             elif (wait_s := self.backoff.remaining_s(model, snap.now_ms)) is not None:
                 action = "backoff"
             elif self.dispatcher.submit(model, direction, item["clamped"]):
@@ -318,6 +342,8 @@ class BaselineShell:
             }
             if mode is not None or guard:
                 line["controller_mode"] = mode
+            if donors:
+                line["wait_donor"] = donors
             if wait_s is not None:
                 line["backoff_s"] = round(wait_s, 3)
                 line["backoff_delay_s"] = self.backoff.delay_s(model)

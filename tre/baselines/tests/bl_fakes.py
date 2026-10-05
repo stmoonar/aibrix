@@ -114,13 +114,20 @@ class FakeCluster:
     delay_s: float = 0.0
     refuse: set = field(default_factory=set)
     lock: threading.Lock = field(default_factory=threading.Lock)
+    #: ``/v2/state`` version: bumped by every applied target.
+    version: int = 1
+    #: (model, "start" | "end") in the order the calls ran.
+    trace: list = field(default_factory=list)
 
     def put_target(self, model: str, body: Mapping[str, Any]) -> SMResult:
         with self.lock:
             self.calls.append((model, dict(body)))
+            self.trace.append((model, "start"))
         if self.delay_s:
             time.sleep(self.delay_s)
         if model in self.refuse:
+            with self.lock:
+                self.trace.append((model, "end"))
             return SMResult(ok=False, code=409, error="http_error", detail="refused")
         with self.lock:
             target = int(body["wake_replicas"])
@@ -128,6 +135,8 @@ class FakeCluster:
                 self.awake[model] = max(self.awake[model], target)
             else:
                 self.awake[model] = target
+            self.version += 1
+            self.trace.append((model, "end"))
         return SMResult(ok=True, code=200, raw={"model": model})
 
 
@@ -165,6 +174,7 @@ class FakeSource:
             raise RuntimeError(f"source failure at tick {tick}")
         with self.cluster.lock:
             awake = dict(self.cluster.awake)
+            version = self.cluster.version
         models = {
             name: ModelSnapshot(
                 model=name, awake=awake[name], min_replicas=lim.min_replicas,
@@ -175,7 +185,8 @@ class FakeSource:
             for name, lim in sorted(self.config.models.items())
         }
         return ClusterSnapshot(now_ms=self.redis.now_ms, tick_s=self.config.tick_s, models=models,
-                               tick=tick, extra={"event_lag_s": {}, "scrape_failed": 0})
+                               tick=tick, extra={"event_lag_s": {}, "scrape_failed": 0,
+                                                 "sm_state_version": version})
 
 
 class ScriptedPolicy:

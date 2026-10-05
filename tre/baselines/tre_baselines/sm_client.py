@@ -191,7 +191,11 @@ def target_body(direction: str, target: int, *, sleep_path: str, drain_budget_s:
     raise ValueError(f"unknown direction {direction!r}")
 
 
-DEFAULT_BACKOFF_MAX_S = 60.0
+#: Cap of the fallback wait. Not a hold: a refusal is retried as soon as the SM state
+#: changes (the shell clears it); this cap only bounds the wait when the cause of a
+#: refusal is not visible in ``/v2/state`` (writer lock busy, a gpu-truth sample not yet
+#: fresh) or the SM is unreachable - a few ticks, not the cold-start minute.
+DEFAULT_BACKOFF_MAX_S = 10.0
 
 
 class Backoff:
@@ -200,8 +204,9 @@ class Backoff:
 
     The first failure waits ``max(retry_after_s, tick_s)``; each further consecutive
     failure doubles the previous wait (capped at ``max_s``) but never waits less than the
-    SM's ``retry_after_s``. :meth:`reset` (a successful call, or the policy's desired count
-    back at the awake count) clears it. Times are the snapshot's Redis-clock ms.
+    SM's ``retry_after_s``. :meth:`reset` (a successful call, the policy's desired count
+    back at the awake count, or - for an SM refusal - any change of the SM state version)
+    clears it. Times are the snapshot's Redis-clock ms.
     """
 
     def __init__(self, tick_s: float, max_s: float = DEFAULT_BACKOFF_MAX_S) -> None:
@@ -282,6 +287,11 @@ class Dispatcher:
     def inflight_count(self) -> int:
         with self._lock:
             return len(self._inflight)
+
+    def inflight_downs(self) -> list[str]:
+        """Models whose scale-down call is queued or running (not yet answered)."""
+        with self._lock:
+            return sorted(m for m, (direction, _t) in self._inflight.items() if direction == "down")
 
     def submit(self, model: str, direction: str, target: int) -> bool:
         body = target_body(direction, target, sleep_path=self._sleep_path, drain_budget_s=self._drain_budget_s)
