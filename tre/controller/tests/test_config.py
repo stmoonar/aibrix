@@ -43,10 +43,12 @@ def test_config_defaults_are_plan_aligned() -> None:
     assert config.disable_eta_gate is False
     # v1/paper alignment A2: the receiver-less HIGH proactive SafeScale shrink is live.
     assert config.safescale_suppress_hot_proactive is False
-    # Timer cleanup (2026-10-02): the band dwell and the fixed rollback backoff were
-    # removed. Their old variables are ignored without validation: an old overlay starts.
+    # Timer cleanup (2026-10-02): the band dwell, the fixed rollback backoff and the
+    # floor-violation donor hold were removed. Their old variables are ignored without
+    # validation: an old overlay starts.
     for key, value in (("TRE_DWELL_WINDOWS", "2"), ("TRE_DWELL_STATES", "bogus"),
-                       ("TRE_SAFESCALE_ROLLBACK_BACKOFF_MS", "-1")):
+                       ("TRE_SAFESCALE_ROLLBACK_BACKOFF_MS", "-1"),
+                       ("TRE_FLOOR_VIOLATION_COOLDOWN_TICKS", "-1")):
         ControllerConfig.from_env({key: value})  # no ValueError
 
 

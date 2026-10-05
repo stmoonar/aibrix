@@ -12,7 +12,13 @@ from tre_common.registry import EXPECTED_SIGNAL_DIRECTIONS, POD_SERVING_PORT, Sa
 from tre_controller.loops.metrics_task import REFRESH_MODES
 #: Environment variables of timers the timer cleanup (2026-10-02) removed. A set one is
 #: logged once and otherwise ignored (no validation): an old overlay still starts.
-REMOVED_TIMER_ENV = ("TRE_DWELL_WINDOWS", "TRE_DWELL_STATES", "TRE_SAFESCALE_ROLLBACK_BACKOFF_MS")
+#: TRE_FLOOR_VIOLATION_COOLDOWN_TICKS: the P2-6 donor hold after a 409 floor_violation
+#: (design 20261002-controller-transfer; the planner bounds every donor by the SM
+#: floor_headroom).
+REMOVED_TIMER_ENV = (
+    "TRE_DWELL_WINDOWS", "TRE_DWELL_STATES", "TRE_SAFESCALE_ROLLBACK_BACKOFF_MS",
+    "TRE_FLOOR_VIOLATION_COOLDOWN_TICKS",
+)
 
 LOG = logging.getLogger(__name__)
 
@@ -32,9 +38,6 @@ GATEWAY_INTERVAL_CHECKS = {"fail", "warn", "off"}
 _TRUE_VALUES = {"1", "true", "yes", "y", "on"}
 _FALSE_VALUES = {"0", "false", "no", "n", "off"}
 
-
-#: Env keys still parsed but ignored since 2026-10-02 (design 20261002-controller-transfer).
-DEPRECATED_ENV_KEYS = ("TRE_FLOOR_VIOLATION_COOLDOWN_TICKS",)
 
 @dataclass(frozen=True)
 class SafeScaleConfig:
@@ -207,14 +210,6 @@ class ControllerConfig:
     oneshot_retry_max_attempts: int = 6
     oneshot_retry_base_s: float = 2.0
     oneshot_retry_max_s: float = 30.0
-    # DEPRECATED (2026-10-02, design 20261002-controller-transfer): the P2-6 30 s hold of
-    # a donor after a 409 floor_violation was removed - the planner bounds every donor
-    # by the service-manager's floor_headroom and the SM clamps model-level shrinks.
-    # TRE_FLOOR_VIOLATION_COOLDOWN_TICKS is still parsed (invalid values still fail) but
-    # ignored; setting it logs ``deprecated_setting_ignored`` at start.
-    floor_violation_cooldown_ticks: int = 6
-    #: Deprecated env keys present in the environment (logged at start, ignored).
-    deprecated_env_set: tuple[str, ...] = ()
     # C1 review P3-1: a persisted rescue target older than this at controller start is
     # dropped (TRE_SCALE_MEMORY_MAX_AGE_SECONDS; ~ W + settle; 0 = keep any age).
     scale_memory_max_age_s: float = 50.0
@@ -427,8 +422,6 @@ class ControllerConfig:
             oneshot_retry_max_attempts=_get_positive_int(values, "TRE_ONESHOT_RETRY_MAX_ATTEMPTS", 6),
             oneshot_retry_base_s=_get_positive_float(values, "TRE_ONESHOT_RETRY_BASE_SECONDS", 2.0),
             oneshot_retry_max_s=_get_positive_float(values, "TRE_ONESHOT_RETRY_MAX_SECONDS", 30.0),
-            floor_violation_cooldown_ticks=_get_nonneg_int(values, "TRE_FLOOR_VIOLATION_COOLDOWN_TICKS", 6),
-            deprecated_env_set=tuple(key for key in DEPRECATED_ENV_KEYS if key in values),
             scale_memory_max_age_s=_get_nonneg_float(values, "TRE_SCALE_MEMORY_MAX_AGE_SECONDS", 50.0),
             redis_socket_timeout_s=_get_nonneg_float(values, "TRE_REDIS_SOCKET_TIMEOUT_SECONDS", 2.0),
             redis_metrics_socket_timeout_s=_get_nonneg_float(

@@ -136,11 +136,12 @@ refusals（`wake_refused:<model>:<node>/<gpus>:<code>`）、`clamped_by_floor`�
 方案 B 下也不再有接力的事后跟踪（`left_to_recovery`、`pending` / `receiver_waking` 状态、`GET /v2/transfers`
 轮询）——它们只存在于多阶段方案。
 
-仍能解析但忽略（启动时打 `deprecated_setting_ignored` 日志，`app.log_deprecated_settings`）：
+10-06 起：
 
-- env `TRE_FLOOR_VIOLATION_COOLDOWN_TICKS`（非法值仍报错；overlay 已不再设置它）；
-- registry `placement.wake_cooldown`：控制器不再用；SM 仍把它作为 `retry_after_s` 报出，所以键本身保留，
-  取非默认值时打日志。
+- env `TRE_FLOOR_VIOLATION_COOLDOWN_TICKS` 已删除，列入 `config.REMOVED_TIMER_ENV`：设置了只打一次日志，
+  不解析、不校验（overlay 已不再设置它）；
+- registry `placement.wake_cooldown`：控制器不读；它只是 SM 报出的建议值 `retry_after_s`，所以键本身保留。
+  控制器启动时不再对它打日志（`app.log_deprecated_settings` 已删）。
 
 ## 7. observe 模式
 

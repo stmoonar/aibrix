@@ -206,9 +206,10 @@ rollback) or whose `/is_sleeping` is not a clear "awake".
   `floor_violation_total`. Model-level shrinks and relays are clamped at the floor by
   the service-manager (200 with `taken` / `clamped_by_floor`; events
   `scale_clamped_by_floor` / `transfer_clamped_by_floor`), and the planner bounds every
-  donor by the SM `floor_headroom`. `TRE_FLOOR_VIOLATION_COOLDOWN_TICKS` and the
-  controller's use of registry `placement.wake_cooldown` are deprecated (parsed,
-  ignored, logged) - see `docs/design/20261002-controller-transfer.md`. The controller
+  donor by the SM `floor_headroom`. `TRE_FLOOR_VIOLATION_COOLDOWN_TICKS` was removed
+  (a set value is logged once and ignored, never validated); registry
+  `placement.wake_cooldown` is only the service-manager's advisory `retry_after_s`
+  (the controller has no wake cooldown) - see `docs/design/20261002-controller-transfer.md`. The controller
   of this change needs a service-manager with `POST /v2/transfers` (same rollout).
 
 ### SafeScale probe window (controller env)

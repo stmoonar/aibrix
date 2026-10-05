@@ -186,22 +186,6 @@ def test_a_donor_without_sm_floor_headroom_is_not_planned() -> None:
     assert plan.actions == []
 
 
-def test_floor_violation_cooldown_ticks_config_is_parsed_but_deprecated(caplog) -> None:
-    from tre_controller.app import log_deprecated_settings
-
-    assert ControllerConfig.from_env({}).floor_violation_cooldown_ticks == 6
-    assert ControllerConfig.from_env({}).deprecated_env_set == ()
-    cfg = ControllerConfig.from_env({"TRE_FLOOR_VIOLATION_COOLDOWN_TICKS": "0"})
-    assert cfg.floor_violation_cooldown_ticks == 0
-    assert cfg.deprecated_env_set == ("TRE_FLOOR_VIOLATION_COOLDOWN_TICKS",)
-    with pytest.raises(ValueError, match="TRE_FLOOR_VIOLATION_COOLDOWN_TICKS"):
-        ControllerConfig.from_env({"TRE_FLOOR_VIOLATION_COOLDOWN_TICKS": "-1"})
-    with caplog.at_level(logging.WARNING, logger="tre_controller.config"):
-        warnings = log_deprecated_settings(cfg, _registry_with_model_bounds({"warm": (1, 4)}))
-    assert len(warnings) == 1 and "TRE_FLOOR_VIOLATION_COOLDOWN_TICKS" in warnings[0]
-    assert any("deprecated_setting_ignored" in record.getMessage() for record in caplog.records)
-
-
 # ------------------------------------------------ P2-7 window-floor env rename
 def test_new_window_floor_env_wins_over_the_legacy_one(caplog) -> None:
     both = ControllerConfig.from_env({"SAFE_SCALE_WINDOW_FLOOR_MS": "20000", "SAFE_SCALE_MIN_WINDOW_MS": "60000"})

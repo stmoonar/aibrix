@@ -262,7 +262,6 @@ def create_controller_dependencies(
     sm_transport: AsyncTransport | None = None,
 ) -> ControllerDependencies:
     registry = load_registry(cfg.registry_path)
-    log_deprecated_settings(cfg, registry)
     injected_redis_client = redis_client is not None
     redis_timeout_s = float(getattr(cfg, "redis_socket_timeout_s", 0.0) or 0.0)
     redis_client = (
@@ -419,7 +418,8 @@ def create_controller_dependencies(
                 else (lambda model, pods: safescale.mark_hidden(model, pods=pods))
             ),
             # 2026-10-02 (design 20261002-controller-transfer): no floor-violation hold
-            # and no GPU wake cooldown - see log_deprecated_settings.
+            # and no GPU wake cooldown (registry placement.wake_cooldown is only the
+            # service-manager's advisory retry_after_s).
         ),
         observe_gate=observe_gate,
         maintenance_watch=MaintenanceWatch(redis_client),
@@ -453,28 +453,6 @@ def create_controller_dependencies(
             else None
         ),
     )
-
-
-def log_deprecated_settings(cfg: Any, registry: Registry) -> list[str]:
-    """2026-10-02 (design 20261002-controller-transfer): settings that are still parsed
-    but no longer used - logged once at start. Returns the warnings (tests)."""
-    log = logging.getLogger("tre_controller.config")
-    warnings: list[str] = []
-    for key in getattr(cfg, "deprecated_env_set", ()) or ():
-        warnings.append(f"{key} is deprecated and ignored: the floor-violation hold was removed "
-                        "(the planner bounds every donor by the service-manager floor_headroom)")
-    placement = getattr(registry, "placement", None)
-    config = placement() if callable(placement) else None
-    if config is not None:
-        gpu_s = getattr(config, "wake_cooldown_gpu_s", 30.0)
-        node_s = getattr(config, "wake_cooldown_node_s", 60.0)
-        if (float(gpu_s), float(node_s)) != (30.0, 60.0):
-            warnings.append(f"registry placement.wake_cooldown (gpu_s={gpu_s}, node_s={node_s}) is ignored by "
-                            "the controller (the service-manager still reports it as retry_after_s): a refused "
-                            "wake is an event, the next tick re-plans")
-    for warning in warnings:
-        log.warning(json.dumps({"event": "deprecated_setting_ignored", "detail": warning}, sort_keys=True))
-    return warnings
 
 
 async def main(

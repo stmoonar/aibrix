@@ -118,8 +118,8 @@ spec:
             - name: SAFE_SCALE_MIN_WINDOW_MS
               value: "60000"
             # (TRE_FLOOR_VIOLATION_COOLDOWN_TICKS was removed on 2026-10-02: the controller
-            # bounds donors by the service-manager floor_headroom; the key is still parsed but
-            # ignored with a deprecation log - docs/design/20261002-controller-transfer.md.)
+            # bounds donors by the service-manager floor_headroom; a set value is logged once
+            # and ignored, never validated - docs/design/20261002-controller-transfer.md.)
             # Review F4 action cooldown, a FALLBACK since the timer cleanup (2026-10-02,
             # docs/design/20261002-timer-cleanup.md): it holds a model until a metrics
             # window starts after its last action only while O1 (registry
