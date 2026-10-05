@@ -106,3 +106,16 @@ def test_controller_mode_key_matches_tre_common() -> None:
     from tre_baselines.keys import CONTROLLER_MODE_KEY
 
     assert CONTROLLER_MODE_KEY == COMMON_KEY
+
+
+def test_missing_idle_ttft_fit_refuses_an_actuating_shell(tmp_path) -> None:
+    """c/b are live values (the TRE arm's TTFT SLO): no silent 500/75 fallback when acting."""
+    text = Path(REGISTRY).read_text(encoding="utf-8")
+    stripped = "\n".join(ln for ln in text.splitlines()
+                          if "ttft_idle_c_ms:" not in ln and "ttft_idle_b_ms_per_token:" not in ln)
+    reg = tmp_path / "registry.yaml"
+    reg.write_text(stripped + "\n", encoding="utf-8")
+    env = {**ENV, "TRE_REGISTRY_PATH": str(reg)}
+    with pytest.raises(ValueError, match="ttft_idle_c_ms"):
+        load_config({**env, "TRE_BL_DRY_RUN": "false"})
+    assert load_config(env).dry_run is True  # dry-run: warns, falls back to the fixed arm

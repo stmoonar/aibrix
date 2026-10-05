@@ -220,10 +220,11 @@ def profile_model(model_dir: Path, label: Any, *, window_s: float = DEFAULT_WIND
 
 def label_for(model: str, registry: Any) -> Any:
     """The model's label definition, through the shell's own reader (registry SLO, the
-    shared ``slo_labels`` definition, fixed-arm fallback)."""
+    shared ``slo_labels`` definition). mu is exported for actuating runs, so a registry
+    without the live idle-TTFT fit (c/b) is refused, as the shell does."""
     from tre_baselines.config import _slo_definition
 
-    return _slo_definition(model, registry.model(model), registry)
+    return _slo_definition(model, registry.model(model), registry, strict=True)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

@@ -136,9 +136,12 @@ def _max_num_seqs(args: tuple[str, ...]) -> Optional[int]:
     return max_num_seqs_from_args(args)
 
 
-def _slo_definition(model: str, spec: Any, registry: Registry) -> Any:
-    """The model's SLO definition via the shared label reader; falls back to the fixed arm
-    when the registry has no idle-TTFT fit (the slowdown arm needs one)."""
+def _slo_definition(model: str, spec: Any, registry: Registry, *, strict: bool) -> Any:
+    """The model's SLO definition via the shared label reader. Without the registry's
+    idle-TTFT fit (``slo.ttft_idle_c_ms`` / ``ttft_idle_b_ms_per_token``, the live c/b the
+    TRE arm uses) a shell that actuates refuses to start (``strict``): it would judge
+    requests by a different SLO than the other arms. A dry-run shell warns and falls back
+    to the fixed arm."""
     try:
         return label_def_for_model(
             model,
@@ -147,7 +150,10 @@ def _slo_definition(model: str, spec: Any, registry: Registry) -> Any:
             registry=registry,
         )
     except (SystemExit, ValueError) as exc:
-        LOG.warning("model %s: slowdown SLO unavailable (%s); using the fixed arm", model, exc)
+        if strict:
+            raise ValueError(f"model {model}: no slowdown SLO ({exc}); the registry needs the live "
+                             "slo.ttft_idle_c_ms / ttft_idle_b_ms_per_token (dry-run falls back)") from None
+        LOG.warning("model %s: slowdown SLO unavailable (%s); dry-run: using the fixed arm", model, exc)
         return label_def_for_model(
             model,
             ttft_p95_ms=spec.slo.ttft_p95_ms,
@@ -157,12 +163,12 @@ def _slo_definition(model: str, spec: Any, registry: Registry) -> Any:
         )
 
 
-def model_limits(registry: Registry, only: Optional[set[str]] = None) -> dict[str, ModelLimits]:
+def model_limits(registry: Registry, only: Optional[set[str]] = None, *, strict: bool = True) -> dict[str, ModelLimits]:
     out: dict[str, ModelLimits] = {}
     for spec in registry.models():
         if only and spec.name not in only:
             continue
-        slo = _slo_definition(spec.name, spec, registry)
+        slo = _slo_definition(spec.name, spec, registry, strict=strict)
         out[spec.name] = ModelLimits(
             name=spec.name,
             min_replicas=int(spec.min_replicas),
@@ -223,11 +229,12 @@ def load_config(env: Optional[Mapping[str, str]] = None, registry: Optional[Regi
         raise ValueError("TRE_BL_TICK_S must be > 0")
     port = env.get("TRE_BL_METRICS_PORT", "").strip()
     policy_config_path = env.get("TRE_BL_POLICY_CONFIG", "").strip() or None
+    dry_run = parse_bool(env.get("TRE_BL_DRY_RUN"), True)
     return Config(
         sm_url=_required(env, "TRE_SM_URL").rstrip("/"),
         redis_url=_required(env, "TRE_REDIS_URL"),
         policy=_required(env, "TRE_BL_POLICY"),
-        dry_run=parse_bool(env.get("TRE_BL_DRY_RUN"), True),
+        dry_run=dry_run,
         tick_s=tick_s,
         log_dir=env.get("TRE_BL_LOG_DIR", "").strip() or "./bl-logs",
         policy_config_path=policy_config_path,
@@ -235,7 +242,7 @@ def load_config(env: Optional[Mapping[str, str]] = None, registry: Optional[Regi
         registry_path=registry_path,
         write_redis=parse_bool(env.get("TRE_BL_WRITE_REDIS"), True),
         decision_stream=parse_bool(env.get("TRE_BL_DECISION_STREAM"), True),
-        models=model_limits(registry, only),
+        models=model_limits(registry, only, strict=not dry_run),
         model_namespace=env.get("TRE_MODEL_NAMESPACE", "").strip() or "default",
         metrics_port=int(port) if port else None,
         scrape_timeout_s=float(env.get("TRE_BL_SCRAPE_TIMEOUT_S", "").strip() or 2.5),
