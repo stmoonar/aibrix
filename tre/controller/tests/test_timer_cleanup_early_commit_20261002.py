@@ -266,6 +266,18 @@ def test_gateway_inflight_reader_counts_live_instances_only():
     assert GatewayInflightReader(_FakeRedis(fail=True))(("m-1",)) is None
 
 
+@pytest.mark.parametrize("raw", [b"not-json", b'{"total":"x"}', b'{"non_continuable":0}'])
+def test_an_unreadable_live_inflight_field_is_unknown_and_blocks_early_commit(raw):
+    """Review 2026-10-06 P3-1: a live instance whose in-flight field cannot be read may
+    hold requests on the hidden pod - unknown (no early commit), never 0. The same
+    field of a dead instance is ignored."""
+    key = "tre:v2:gw:inflight:m-1"
+    fields = {b"gw-a": b'{"total":0,"non_continuable":0,"ts":1}', b"gw-b": raw}
+    assert GatewayInflightReader(_FakeRedis(hashes={key: fields}))(("m-1",)) is None
+    dead_b = {"gw-a": NOW_MS, "gw-b": NOW_MS - 60_000}
+    assert GatewayInflightReader(_FakeRedis(dead_b, {key: fields}), max_age_ms=10_000)(("m-1",)) == 0.0
+
+
 def test_registry_and_config_keys(tmp_path):
     assert SafeScaleRegistryConfig().early_commit is True
     shipped = load_registry(str(TRE_DIR / "deploy" / "registry.yaml"))

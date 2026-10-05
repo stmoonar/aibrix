@@ -123,8 +123,9 @@ class ModelWindowMetrics:
     scrape_current_pods: frozenset[str] = field(default=frozenset(), compare=False)
     #: P2-2: the gateway in-flight count of each pod with docs in the window (live
     #: gateway instances; ``tre_common.gateway_inflight``), read only when the window has
-    #: no token and no running / waiting request. None = not read or unknown.
-    gateway_inflight: dict[str, int] | None = field(default=None, compare=False)
+    #: no token and no running / waiting request. None = not read or unknown (a pod's
+    #: count is None when unknown).
+    gateway_inflight: dict[str, int | None] | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True)

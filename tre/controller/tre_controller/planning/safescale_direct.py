@@ -1258,7 +1258,7 @@ class GatewayInflightReader:
     heartbeat in ``tre:v2:gw:instances`` is at most ``max_age_ms`` old (Redis TIME). A
     field left by a dead instance does not count (it would block the early commit until
     its key expires). Unknown (None) when no instance is live (nothing writes the
-    counts) or on a read error."""
+    counts), when a live instance's field is unreadable, or on a read error."""
 
     def __init__(self, redis_client: Any, *, max_age_ms: int = 10_000) -> None:
         self._redis = redis_client
@@ -1271,7 +1271,10 @@ class GatewayInflightReader:
             live = live_gateway_instances(self._redis, max_age_ms=self._max_age_ms)
             if not live:
                 return None
-            return float(sum(pod_inflight(self._redis, pod, live) for pod in pods))
+            counts = [pod_inflight(self._redis, pod, live) for pod in pods]
+            if any(count is None for count in counts):
+                return None  # unknown: blocks the early commit
+            return float(sum(counts))
         except Exception:  # noqa: BLE001 - unknown: no early commit
             LOG.warning("gateway in-flight read failed", exc_info=True)
             return None

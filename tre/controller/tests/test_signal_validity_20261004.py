@@ -290,15 +290,15 @@ def test_scrape_validity_is_judged_per_o1_suffix():
 
 @pytest.mark.parametrize(
     "case",
-    ["rescue", "dead_gateway_instance", "scraper_dead", "no_inflight"],
+    ["rescue", "dead_gateway_instance", "scraper_dead", "no_inflight", "unreadable_inflight"],
 )
 def test_frozen_scrape_with_inflight_demand_is_a_one_step_rescue(case):
     """No serving pod of m answered /metrics in the whole window, while the gateway
     scraper works (model o was scraped): vLLM's API-server loop is saturated. With
     requests in flight on m-0 (live gateway instance) m gets +1 on this first window and
     is never a donor. No rescue when the in-flight count comes only from a dead gateway
-    instance, when every pod of every model is stale (the scraper is dead), or when
-    nothing is in flight."""
+    instance, when every pod of every model is stale (the scraper is dead), when
+    nothing is in flight, or when the in-flight count is unknown."""
     redis = _Redis()
     stale = END - 35_000
     _write_pod(redis, "m", "m-0", gen_per_grid=0, running=0, waiting=0, scraped_ms=stale)
@@ -307,9 +307,12 @@ def test_frozen_scrape_with_inflight_demand_is_a_one_step_rescue(case):
     live_hb, dead_hb = redis.now_ms - 2_000, redis.now_ms - 120_000
     redis.instances = {"gw-live": live_hb, "gw-dead": dead_hb}
     inflight = {"rescue": {"gw-live": 6}, "dead_gateway_instance": {"gw-dead": 6},
-                "scraper_dead": {"gw-live": 6}, "no_inflight": {"gw-live": 0}}[case]
+                "scraper_dead": {"gw-live": 6}, "no_inflight": {"gw-live": 0},
+                "unreadable_inflight": {"gw-live": None}}[case]
     redis.hashes[rediskeys.gw_inflight_key("m-0")] = {
-        instance: json.dumps({"total": total, "non_continuable": 0, "ts": 1}) for instance, total in inflight.items()
+        # P3-1: an unreadable live field is unknown - it never invents rescue demand.
+        instance: "not-json" if total is None else json.dumps({"total": total, "non_continuable": 0, "ts": 1})
+        for instance, total in inflight.items()
     }
     registry = _registry("m", "o")
     snapshot = MetricsStore(redis, registry, instant_sample_interval_ms=10_000).read_snapshot(

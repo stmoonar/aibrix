@@ -50,14 +50,18 @@ def pod_inflight_fields(redis: Any, pod: str) -> dict[str, dict | None]:
     return out
 
 
-def pod_inflight(redis: Any, pod: str, live_instances: Collection[str]) -> int:
-    """Routed, unfinished requests on ``pod`` summed over the live gateway instances."""
+def pod_inflight(redis: Any, pod: str, live_instances: Collection[str]) -> int | None:
+    """Routed, unfinished requests on ``pod`` summed over the live gateway instances.
+    None (unknown, review 2026-10-06 P3-1) when a LIVE instance's field cannot be read
+    (not JSON, no integer ``total``): that instance may hold requests there. A field of
+    a dead instance is ignored either way; no field at all is 0 (nothing routed). A
+    caller that turns the count into demand counts unknown as no demand."""
     total = 0
     for instance, payload in pod_inflight_fields(redis, pod).items():
-        if instance not in live_instances or payload is None:
+        if instance not in live_instances:
             continue
-        try:
-            total += max(0, int(payload.get("total", 0)))
-        except (TypeError, ValueError):
-            continue
+        value = None if payload is None else payload.get("total")
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value != value:
+            return None
+        total += max(0, int(value))
     return total

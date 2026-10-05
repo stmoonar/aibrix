@@ -241,13 +241,16 @@ class MetricsStore:
 
     def _stale_inflight(self, pods: tuple[str, ...], window_ms: int) -> dict[str, int]:
         """The gateway's in-flight count of each scrape-stale pod. Read only when pods
-        are stale; {} when it is unknown (no evidence: the frozen-scrape rescue stays off)."""
-        return self._pods_inflight(pods, window_ms) or {}
+        are stale; an unknown count is 0 here (no evidence: it never invents
+        frozen-scrape rescue demand)."""
+        counts = self._pods_inflight(pods, window_ms) or {}
+        return {pod: count or 0 for pod, count in counts.items()}
 
-    def _pods_inflight(self, pods: tuple[str, ...], window_ms: int) -> dict[str, int] | None:
+    def _pods_inflight(self, pods: tuple[str, ...], window_ms: int) -> dict[str, int | None] | None:
         """pod -> routed, unfinished requests at the gateway, summed over the live
-        gateway instances (a heartbeat inside one window). None = unknown: the gateway
-        coordination keys cannot be read, or no gateway instance is live."""
+        gateway instances (a heartbeat inside one window); a pod's count is None when a
+        live instance's field is unreadable. None = unknown: the gateway coordination
+        keys cannot be read, or no gateway instance is live."""
         try:
             live = live_gateway_instances(self._redis, max_age_ms=max(1, int(window_ms)))
             if not live:
