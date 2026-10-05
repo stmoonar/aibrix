@@ -2694,7 +2694,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--composition", default=None, choices=["m1-20260923", "m2-20261005"],
                     help="--acceptance-set: which M (scripts.calibration_acceptance). m1-20260923 "
                          "(default): stage G's 13 cells (probes + 10 collected + 3 retained). "
-                         "m2-20261005: the next round's M2 - 24 collected cells, rho* reused "
+                         "m2-20261005: the next round's M2 - 28 collected cells, rho* reused "
                          "from --rho-star-run, no probes, no retained cells")
     ap.add_argument("--rho-star-run", type=Path, default=None,
                     help="--composition m2-20261005: the sealed M root whose measured rho* M2 "

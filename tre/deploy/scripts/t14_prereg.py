@@ -41,6 +41,7 @@ from typing import Any, Mapping, Optional, Sequence
 from scripts import calibration_campaign as campaign
 from scripts import calibration_design as design
 from scripts import calibration_t14 as t14
+from scripts.analysis import t14_score
 
 SCHEMA = "t14-prereg-v2"
 PLACEHOLDER = "PLACEHOLDER"
@@ -282,9 +283,11 @@ def build(args) -> dict:
                                    "dwell": "dwell 1 (and dwell 2) disclosed"},
             "cross_shape": {
                 "what": ("fixed Z = 1 (the published theta of the freeze): BA and AUROC per T14 shape, interpolation "
-                         f"and extrapolation in separate tables, cell-bootstrap CI per shape ({SCORE_RESAMPLES} "
-                         f"resamples, seed {SCORE_SEED})"),
+                         "and extrapolation in separate tables; per-shape BA CI95 by ci_method (moving-block "
+                         "bootstrap over windows, blocks within a cell - user 2026-10-05: the 2026-10-03 cell "
+                         "bootstrap degenerates with 3 cells per shape); AUROC CI as ranking_disclosure"),
                 "claim_rule": CROSS_SHAPE_CLAIM_RULE,
+                "ci_method": dict(t14_score.CROSS_SHAPE_CI_METHOD),
                 "role": "claim rule for the text, sealed under the hybrid label; not an acceptance gate"},
             "scoring": {"decisions": DECISIONS, "disclosure_rules": DISCLOSURE_RULES,
                         "scorer": {"module": "scripts.analysis.t14_score (rule v2)",

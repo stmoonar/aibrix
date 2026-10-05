@@ -226,6 +226,25 @@ CLAIM_NOT_EVALUABLE = "not_evaluable"
 
 #: The ``schema`` of a next-round (v2) preregistration; a preregistration without it is v1.
 PREREG_SCHEMA_V2 = "t14-prereg-v2"
+#: The per-shape BA CI of the cross-shape claim (user 2026-10-05, CI method only; the claim
+#: rule is unchanged). v1 (2026-10-03) used the accept's cell bootstrap, which with 3 cells
+#: per shape degenerates (half width 0). v2: a moving-block bootstrap over the windows of the
+#: shape, blocks of CROSS_SHAPE_BLOCK_WINDOWS consecutive windows kept inside one cell.
+CROSS_SHAPE_CI_METHOD = {
+    "method": "moving_block_bootstrap",
+    "block_windows": 6,
+    "blocks_within": "cell",
+    "resamples": 1000,
+    "seed": 20260922,
+    "interval": "95 % percentile (dline_refit._ci95 index rule)",
+    "resample": ("draw blocks uniformly (with replacement) from every block of block_windows consecutive "
+                 "windows of each cell of the shape (a cell shorter than a block is one block), concatenate "
+                 "until the shape's window count is reached, truncate; BA at the published theta; a "
+                 "single-class resample is skipped"),
+    "block_length_why": ("the method docs' 'independent samples ~ windows / 6' (theta-recalibration.md section 3; "
+                         "preregistration-20261003 interval note): one block spans the overlap of a window's "
+                         "neighbours, so blocks are about independent"),
+}
 #: Label attributions (``tre_common.slo_labels.ATTRIBUTIONS`` of label v2; absent = completion).
 ATTRIBUTION_COMPLETION, ATTRIBUTION_HYBRID = "completion", "hybrid"
 ATTRIBUTIONS = (ATTRIBUTION_COMPLETION, ATTRIBUTION_HYBRID)
@@ -353,6 +372,10 @@ def _v2_rule_checks(prereg: Mapping[str, Any]) -> list[str]:
     missing = [k for k in V2_DECISION_KEYS if k not in ((ev.get("scoring") or {}).get("decisions") or {})]
     if missing:
         problems.append(f"prereg evaluation.scoring.decisions misses {missing}")
+    ci_m = (ev.get("cross_shape") or {}).get("ci_method")
+    if json.dumps(ci_m, sort_keys=True) != json.dumps(CROSS_SHAPE_CI_METHOD, sort_keys=True):
+        problems.append(f"prereg evaluation.cross_shape.ci_method {ci_m!r} is not the implemented per-shape CI "
+                        f"{CROSS_SHAPE_CI_METHOD!r}")
     if t14.get("void_rule") != VOID_RULE_TEXT:
         problems.append(f"prereg t14.void_rule {t14.get('void_rule')!r} is not the implemented rule")
     if "pass_a_disclosed" not in (ev.get("outcome_statements") or {}):
@@ -648,10 +671,49 @@ def kv_missing(cells: Mapping[tuple, Mapping[str, Any]]) -> dict:
             "cells_unreadable": [c["cell_id"] for c in out if "error" in c]}
 
 
-def _ba_ci_auroc(entry: Mapping[str, Any], windows: Sequence[Any], *, n_resamples: int, seed: int) -> dict:
-    """BA at the published theta (+ cell-bootstrap CI95, accept's bootstrap) and AUROC
-    (+ CI95, ``ranking.ranking_disclosure``) of one window subset; both ``undefined`` (None)
-    when the subset holds one class only (D2)."""
+def moving_block_ba_ci(windows: Sequence[Any], *, theta: float, direction: str,
+                       method: Mapping[str, Any] = CROSS_SHAPE_CI_METHOD) -> dict:
+    """The BA CI95 of :data:`CROSS_SHAPE_CI_METHOD`: a moving-block bootstrap over the
+    windows, blocks of ``block_windows`` consecutive windows (by window start) kept within a
+    cell."""
+    import random
+
+    from tre_calibration.fit import threshold_balanced_accuracy
+
+    from scripts import dline_refit as dl
+
+    length = int(method["block_windows"])
+    by: dict[str, list] = defaultdict(list)
+    for w in windows:
+        by[w.scenario_id].append(w)
+    blocks = []
+    for cell in sorted(by):
+        ws = sorted(by[cell], key=lambda w: w.window_start_ms)
+        if len(ws) <= length:
+            blocks.append(ws)
+        else:
+            blocks += [ws[i:i + length] for i in range(len(ws) - length + 1)]
+    n = len(windows)
+    rng = random.Random(int(method["seed"]))
+    vals = []
+    for _ in range(int(method["resamples"])):
+        smp: list = []
+        while len(smp) < n:
+            smp += rng.choice(blocks)
+        smp = smp[:n]
+        if any(w.slo_met for w in smp) and any(not w.slo_met for w in smp):
+            vals.append(threshold_balanced_accuracy(smp, theta=theta, direction=direction)["balanced_accuracy"])
+    ci = dl._ci95(vals)
+    return {"ci95": ci, "half_width": ((ci[1] - ci[0]) / 2.0) if None not in ci else None,
+            "resamples_used": len(vals), "blocks": len(blocks), "method": dict(method)}
+
+
+def _ba_ci_auroc(entry: Mapping[str, Any], windows: Sequence[Any], *, n_resamples: int, seed: int,
+                 ci_method: Optional[Mapping[str, Any]] = None) -> dict:
+    """BA at the published theta (+ CI95) and AUROC (+ CI95, ``ranking.ranking_disclosure``)
+    of one window subset; both ``undefined`` (None) when the subset holds one class only
+    (D2). The BA CI: ``ci_method`` (rule v2, :data:`CROSS_SHAPE_CI_METHOD`, moving blocks) or,
+    None, the accept's cell bootstrap (rule v1)."""
     from tre_calibration import ranking
     from tre_calibration.fit import threshold_balanced_accuracy
 
@@ -671,14 +733,19 @@ def _ba_ci_auroc(entry: Mapping[str, Any], windows: Sequence[Any], *, n_resample
     ba = threshold_balanced_accuracy(windows, theta=theta, direction=direction)["balanced_accuracy"]
     crit = tv.critical_dwell_flags(windows, theta=theta, tau_crit=tau_crit, direction=direction,
                                    dwell_windows=dl.ONLINE_DWELL_WINDOWS)
-    boot = dl.acceptance_bootstrap(windows, crit, theta=theta, direction=direction, n_resamples=n_resamples,
-                                   seed=seed)
-    ci = boot["metrics"]["balanced_accuracy"]["ci95"]
+    if ci_method is not None:
+        mb = moving_block_ba_ci(windows, theta=theta, direction=direction, method=ci_method)
+        ci, used, how = mb["ci95"], mb["resamples_used"], f"{ci_method['method']} ({mb['blocks']} blocks)"
+    else:
+        boot = dl.acceptance_bootstrap(windows, crit, theta=theta, direction=direction, n_resamples=n_resamples,
+                                       seed=seed)
+        ci, used, how = (boot["metrics"]["balanced_accuracy"]["ci95"],
+                         boot["metrics"]["balanced_accuracy"]["resamples_used"], "cell bootstrap (rule v1)")
     recs = ranking.records_from_windows(vh["model"], windows, theta=theta, direction=direction)
     au = ranking.ranking_disclosure(recs, n_resamples=n_resamples, seed=seed).get("auroc") or {}
     return {**base, "ba": ba, "ba_ci95": ci,
             "ba_ci95_half_width": ((ci[1] - ci[0]) / 2.0) if None not in ci else None,
-            "ba_resamples_used": boot["metrics"]["balanced_accuracy"]["resamples_used"],
+            "ba_ci_method": how, "ba_resamples_used": used,
             "auroc": au.get("value"), "auroc_ci95": au.get("ci95"), "auroc_resamples_used": au.get("resamples_used")}
 
 
@@ -709,19 +776,22 @@ def claim(table: Mapping[str, Mapping[str, Any]]) -> dict:
 
 
 def cross_shape(entry: Mapping[str, Any], windows: Sequence[Any], shape_of: Mapping[str, str],
-                kind_of: Mapping[str, str], *, n_resamples: int, seed: int) -> dict:
-    """Per-shape tables split by kind, per-kind pooled numbers (disclosure), the claim per kind."""
+                kind_of: Mapping[str, str], *, n_resamples: int, seed: int,
+                ci_method: Optional[Mapping[str, Any]] = None) -> dict:
+    """Per-shape tables split by kind, per-kind pooled numbers (disclosure), the claim per kind;
+    ``ci_method``: the per-shape BA CI (rule v2's moving blocks; None = rule v1's cell bootstrap)."""
     by_shape: dict[str, list] = defaultdict(list)
     for w in windows:
         by_shape[shape_of[w.scenario_id]].append(w)
     out: dict[str, Any] = {}
     for kind in KINDS:
         shapes = sorted(s for s in by_shape if kind_of[s] == kind)
-        table = {s: _ba_ci_auroc(entry, by_shape[s], n_resamples=n_resamples, seed=seed) for s in shapes}
+        table = {s: _ba_ci_auroc(entry, by_shape[s], n_resamples=n_resamples, seed=seed, ci_method=ci_method)
+                 for s in shapes}
         pooled = [w for s in shapes for w in by_shape[s]]
         out[kind] = {"per_shape": table,
-                     "pooled_disclosure": (_ba_ci_auroc(entry, pooled, n_resamples=n_resamples, seed=seed)
-                                           if pooled else None),
+                     "pooled_disclosure": (_ba_ci_auroc(entry, pooled, n_resamples=n_resamples, seed=seed,
+                                                        ci_method=ci_method) if pooled else None),
                      "claim": claim(table)}
     return out
 
@@ -871,7 +941,8 @@ def evaluate(inp: Mapping[str, Any], csv_path: Path, cells: Mapping[tuple, Mappi
                       "ranking_disclosure": ev["ranking_disclosure"], "holdout_report": ev["holdout_report"]},
         "b_prime_config": bp_summary,
         "counts": ev["M"],
-        "cross_shape": cross_shape(entry, windows, shape_of, kind_of, n_resamples=n_resamples, seed=PREREG_SEED),
+        "cross_shape": cross_shape(entry, windows, shape_of, kind_of, n_resamples=n_resamples, seed=PREREG_SEED,
+                                   ci_method=CROSS_SHAPE_CI_METHOD if v2 else None),
         "zero_token_dropped_windows": {"what": "disclosure (same as H)", "total": dropped["total"]},
         "conservative_disclosure": hcs.score_model(entry, csv_path, b_prime_cfg=cfgs[model],
                                                    n_resamples=n_resamples, seed=PREREG_SEED,

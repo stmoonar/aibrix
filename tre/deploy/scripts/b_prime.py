@@ -209,7 +209,8 @@ def criteria(point: Mapping[str, Any], ci: Mapping[str, Any], gate: Mapping[str,
 #   success rate on the effective number of episodes n / (1 + (m - 1) ICC), ICC = the
 #   one-way ICC(1) of the per-cell lags (challenge_checks.posthoc.json's estimator;
 #   undefined -> 1, the conservative end; negative -> 0), must reach detection_ci_low_min;
-#   a cell-cluster bootstrap bound is disclosed (it never decides with miss_tolerance 0).
+#   a cell-cluster bootstrap bound is disclosed, never deciding (user 2026-10-05: miss_tolerance 2,
+#   the CP bound on n_eff decides - next-dryrun-20261005/m2/power_cp_only/sim_hybrid.py).
 #
 # Every parameter lives in :data:`ONSET_GATE` and is sealed in the freeze (``accept_gate``).
 
@@ -221,7 +222,7 @@ ONSET_GATE = {
     "episode_step_ms": 10_000.0,      # consecutive = <= one re-window step apart
     "detection_ci_low_min": 0.80,
     "ci_alpha_one_sided": 0.05,       # both lower bounds are one-sided 95 % (design: n_eff 14, 0 misses -> .81)
-    "miss_tolerance": 0,              # design item 3 (i): every onset is caught
+    "miss_tolerance": 2,              # user 2026-10-05: at most 2 onset episodes missed / late
 }
 ONSET_GATE_KEYS = tuple(ONSET_GATE)
 #: Window false alarm (design item 3 (ii)): CRITICAL on healthy windows at the gate's dwell.
@@ -237,12 +238,12 @@ ONSET_RULE = ("episode = maximal run of consecutive violating windows (<= episod
               "ONSET_DYNAMIC_PRIMITIVES")
 #: Sealed with the onset parameters: how the look-back is clipped (coordinator 2026-10-05).
 ONSET_LOOKBACK_CLIP = "previous_episode_end_exclusive"
-ONSET_CI_RULE = ("decides: at most miss_tolerance onset episodes missed (or later than the lag budget) AND the "
-                 "one-sided (ci_alpha_one_sided) Clopper-Pearson lower bound of the success rate on n_eff = "
-                 "n / (1 + (m - 1) ICC) reaches detection_ci_low_min (m = episodes per cell, ICC = one-way ICC(1) "
-                 "of the per-cell lags of detected episodes, undefined -> 1, negative -> 0; x_eff = rate * "
-                 "n_eff). The cell-cluster bootstrap percentile lower bound is disclosed, not deciding (with "
-                 "miss_tolerance 0 it is 1 whenever the miss criterion passes)")
+ONSET_CI_RULE = ("decides (user 2026-10-05): at most miss_tolerance (2) onset episodes missed or later than the "
+                 "lag budget AND the one-sided 95 % (ci_alpha_one_sided .05) Clopper-Pearson lower bound on "
+                 "(x_eff, n_eff) reaches detection_ci_low_min (.80), n_eff = N / (1 + (m - 1) ICC), x_eff = "
+                 "n_eff * detected_within_budget / N (m = episodes per cell, N = onset episodes, ICC = one-way "
+                 "ICC(1) of the per-cell lags of detected episodes, undefined -> 1, negative -> 0). The "
+                 "cell-cluster bootstrap percentile lower bound is disclosed, not deciding")
 
 
 def check_onset_gate(gate: Mapping[str, Any]) -> dict:

@@ -1,6 +1,6 @@
 """The next round's M2 (``calibration_acceptance --composition m2-20261005``).
 
-Invariants: the composition (24 cells: 16 heterogeneous-spike bursts, 2 ramps, 2 steps,
+Invariants: the composition (28 cells: 20 heterogeneous-spike bursts, 2 ramps, 2 steps,
 three deep holds and one 0.9 x rho* hold; every spike its own seed, all three heights in
 every burst cell, room to drain between spikes); every cell code and seed new (unique, and
 in no earlier ledger); rho* reused from M's sealed boundary records, recorded with its
@@ -116,16 +116,16 @@ def _freeze(tmp_path, monkeypatch, label) -> Path:
 
 def test_m2_composition_kinds_and_heterogeneous_spikes() -> None:
     items = ac.M2_COMPOSITION
-    assert len(items) == 24
-    assert Counter(i.kind for i in items) == {"bursts": 16, "ramp": 2, "steps": 2, "hold": 4}
+    assert len(items) == 28
+    assert Counter(i.kind for i in items) == {"bursts": 20, "ramp": 2, "steps": 2, "hold": 4}
     assert sorted(i.factor for i in items if i.kind == "hold") == [0.9, 1.15, 1.25, 1.4]
-    assert Counter(i.shape for i in items if i.kind == "bursts") == {s: 4 for s in ac.M2_SHAPES}
+    assert Counter(i.shape for i in items if i.kind == "bursts") == {s: 5 for s in ac.M2_SHAPES}
     cap = gen.get_cap(gen.DEFAULT_CAP_NAME)
     drain_s = ac.M2_SPIKE_EXCESS_S / (1.0 - ac.M2_BURST_BASE_RHO)  # backlog served at rho* only
     heights = Counter()
     for model, table in ac.M2_RHO_STAR.items():
         cells, spikes = ac.m2_cells(model, SEED)
-        assert len(cells) == 24 and len(spikes) == 16
+        assert len(cells) == 28 and len(spikes) == 20
         assert all(c.split == design.SPLIT_HOLDOUT and c.role == design.ROLE_ACCEPTANCE for c in cells)
         anchors = {s: a for s, (a, _c) in table.items()}
         capacity = {s: c for s, (_a, c) in table.items()}
@@ -151,7 +151,7 @@ def test_m2_composition_kinds_and_heterogeneous_spikes() -> None:
             starts = [s["start_s"] for s in plan]
             assert all(nxt - end >= drain_s + 30.0 for end, nxt in zip(ends, starts[1:]))
             assert cell.duration_s - ends[-1] >= drain_s + 30.0
-    # 3 models x 16 cells x (all three heights + one rotating) -> balanced within one cell
+    # 3 models x 20 cells x (all three heights + one rotating) -> balanced within one cell
     assert max(heights.values()) - min(heights.values()) <= 3
 
 
@@ -164,13 +164,14 @@ def test_m2_ids_and_seeds_are_new(tmp_path) -> None:
     spikes = {m: v[1] for m, v in per_model.items()}
     serials = [c.serial for v in cells.values() for c in v]
     assert all(ac.M2_CELL_SERIAL_BASE < s < ac.M2_CELL_SERIAL_BASE + 100 for s in serials)
+    assert sorted({c.serial for c in cells[MODEL]}) == list(range(74_001, 74_029))  # 74_001-74_028
     # an earlier ledger (M's own ids) shares nothing
     old = tmp_path / "ledgers" / "M" / MODEL / "cells.jsonl"
     old.parent.mkdir(parents=True)
     old.write_text(json.dumps({"cell_id": "i0_o0_c1070501", "arrival_seed": 380691728}) + "\n")
     report = ac.check_new_ids(cells, spikes, [tmp_path / "ledgers"])
     assert report["problems"] == [] and report["ledgers_scanned"] == 1
-    assert report["m2_seeds"] == 3 * (24 + 16 * 4)  # arrival seeds + one per spike, all distinct
+    assert report["m2_seeds"] == 3 * (28 + 20 * 4)  # arrival seeds + one per spike, all distinct
     # a ledger that already used an M2 cell id, or an M2 spike seed as an arrival seed
     victim = cells[MODEL][3]
     spike_seed = spikes["dsllama-8b"][next(iter(spikes["dsllama-8b"]))][2]["seed"]
@@ -202,7 +203,7 @@ def test_m2_run_records_the_rho_star_source_and_seals(tmp_path, monkeypatch, att
     code = ac.run_acceptance_set(args, drive=fake.drive, sample_factory=lambda _m: fake.sample,
                                  sleep=fake.sleep, clock=fake.clock, check_controller=False)
     assert code == 0
-    assert len(fake.driven) == 24 and {c.role for c, _b in fake.driven} == {design.ROLE_ACCEPTANCE}
+    assert len(fake.driven) == 28 and {c.role for c, _b in fake.driven} == {design.ROLE_ACCEPTANCE}
     man_path = tmp_path / "out" / ac.M_MANIFEST
     man = json.loads(man_path.read_text())
     assert man["composition_name"] == ac.COMPOSITION_M2 == man["composition"]["name"]
@@ -210,7 +211,7 @@ def test_m2_run_records_the_rho_star_source_and_seals(tmp_path, monkeypatch, att
     assert man["label_def"] == frozen_label.as_dict()
     plan = json.loads((tmp_path / "out" / "plan.json").read_text())
     assert plan["label"]["label_def"] == frozen_label.as_dict()  # what finalize_run reads
-    assert len(man["cells"]) == 24 and all(c["origin"] == "collected" for c in man["cells"])
+    assert len(man["cells"]) == 28 and all(c["origin"] == "collected" for c in man["cells"])
     assert "retained_source" not in man and man["sealed_probes"] == []
     src = man["rho_star_source"]
     for shape, (anchor, cs) in ac.M2_RHO_STAR[MODEL].items():

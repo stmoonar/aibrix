@@ -85,3 +85,22 @@ def test_t14_v2_verdict_uses_the_accept_vocabulary() -> None:
     assert t14_score.v2_verdict(False, True) == dl.VERDICT_PASS_A_DISCLOSED
     assert t14_score.v2_verdict(True, False) == dl.VERDICT_FAIL
     assert t14_score.v2_verdict(False, False) == dl.VERDICT_FAIL
+
+
+def test_the_per_shape_ci_does_not_degenerate_with_three_cells_per_shape() -> None:
+    """User 2026-10-05: with 3 cells per shape the cell bootstrap gave a half width of 0 (each
+    cell all-healthy or all-violating draws the same BA); the moving-block bootstrap over
+    windows within cells does not."""
+    from tre_calibration.dataset import CalibrationWindow
+
+    def w(cell: str, k: int, sig: float, ok: bool) -> CalibrationWindow:
+        return CalibrationWindow(scenario_id=cell, scenario_family="F", signal=sig, slo_met=ok,
+                                 health_score=1.0 if ok else 0.5, window_start_ms=k * 10_000.0)
+
+    windows = []
+    for cell, ok_until in (("c09", 20), ("c10", 12), ("c11", 4)):       # 0.9 / 1.0 / 1.1 x C^_s
+        windows += [w(cell, k, 1.0 + (20 - k) * 0.05, k < ok_until) for k in range(20)]
+    mb = t14.moving_block_ba_ci(windows, theta=1.5, direction="higher_is_healthier")
+    assert mb["half_width"] is not None and mb["half_width"] > 0.01
+    assert mb["blocks"] == 3 * (20 - t14.CROSS_SHAPE_CI_METHOD["block_windows"] + 1)
+    assert mb["method"]["block_windows"] == 6 and mb["method"]["blocks_within"] == "cell"

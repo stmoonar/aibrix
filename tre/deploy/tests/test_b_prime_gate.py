@@ -180,7 +180,8 @@ def test_onset_episodes_score_onsets_not_drain_tails_and_count_misses_and_late_h
     assert lags == {"burst": 10.0, "missed": None, "late": 30.0, "lead": -20.0, "hold": None}
     assert (got["onset"]["episodes"], got["onset"]["detected"], got["onset"]["within_budget"]) == (4, 3, 2)
     assert got["hold_disclosed"]["episodes"] == 1
-    assert got["criteria"][0]["value"] == 2 and not got["passed"]   # a miss and a late hit fail the gate
+    # a miss and a late hit: within the miss tolerance (2), but 2 of 4 fails the CP bound
+    assert got["criteria"][0]["value"] == 2 and got["criteria"][0]["met"] and not got["passed"]
     # the same burst scored per window (B') counts the drain tail as misses
     burst = [i for i, w in enumerate(windows) if w.scenario_id == "burst"]
     point = b_prime.series_point([windows[i] for i in burst], theta=1.0, cut=cut, crit=[crit[i] for i in burst])
@@ -217,7 +218,7 @@ def test_the_onset_gate_has_three_verdicts_one_rule_for_every_model(tmp_path, mo
     w = base._world(tmp_path / "pass", steps_cells=16)
     assert base._freeze(w, "onset") == 0
     gate = dl.verify_freeze(w["freeze"])["accept_gate"]
-    assert gate["rule"] == "onset" and gate["onset"]["lag_budget_s"] == 20.0 and gate["onset"]["miss_tolerance"] == 0
+    assert gate["rule"] == "onset" and gate["onset"]["lag_budget_s"] == 20.0 and gate["onset"]["miss_tolerance"] == 2
     assert base._accept(w, base._seal(w)) == 0
     res = _result(w)
     r, c = res["models"][MODEL], res["models"][MODEL]["criteria"]
@@ -326,3 +327,22 @@ def test_a_new_freeze_has_one_gate_and_refuses_another_tau(tmp_path, monkeypatch
     monkeypatch.setattr(dl, "ONSET_TAU_S", 5.0)   # the lag budget's base tau != the fit's 10 s
     assert base._freeze(w, "onset") == dl.EXIT_REFUSED
     assert "tau_s 10.0 != 5" in capsys.readouterr().out and not w["freeze"].exists()
+
+
+def test_the_onset_gate_tolerates_two_misses_and_the_cp_bound_decides() -> None:
+    """User 2026-10-05: misses <= 2 AND the one-sided 95 % CP lower bound on (x_eff, n_eff) >= .80."""
+    def run(n_cells: int, misses: int) -> dict:
+        windows, crit, prim = [], [], {}
+        for k in range(n_cells):
+            c = f"c{k}"
+            prim[c] = "bursts"
+            for t, r in [(0, .5), (10, 6), (20, 6), (30, .5)]:
+                windows.append(_ew(c, t, r))
+                crit.append(r > 1 and k >= misses)
+        return b_prime.onset_detection(windows, crit, cut=5.0, primitive_of=prim, gate=b_prime.ONSET_GATE,
+                                       n_resamples=100)
+
+    two = run(40, 2)          # one episode per cell -> n_eff 40, x_eff 38: CP low ~.85
+    assert two["passed"] and two["clopper_pearson_lower"] >= 0.80
+    assert not run(40, 3)["passed"]                      # a third miss fails, whatever the bound
+    assert not run(10, 2)["passed"]                      # 2 misses of 10: the CP bound fails

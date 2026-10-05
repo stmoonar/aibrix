@@ -62,14 +62,15 @@ Compositions (``--composition``)
 
 ``m2-20261005`` is the next round's M2 (local workspace
 ``docs/calib-next-round-design-20261005.md`` item 5 and user decision 3; sizing from
-``scripts/analysis/m2_power_sim.py``). 24 cells per model, all collected, no retained cell
+``scripts/analysis/m2_power_sim.py``; 20 burst cells by user decision 2026-10-05 with the onset
+gate's miss tolerance 2). 28 cells per model, all collected, no retained cell
 (M is DEV now), no probes:
 
 * rho* is M's measured boundary, reused as a design constant (:data:`M2_RHO_STAR`, from
   ``<M root>/<model>/boundary/<model>_<shape>.json`` = ``M_manifest.json`` ``rho_star``).
   ``--rho-star-run <M root>`` is checked against the constants (refused on any difference)
   and every source file's path and sha256 go into the plan and the manifest.
-* 16 burst cells (:data:`M2_BURST_CELLS`), the shapes MP / MD / U512x512 / G800x240 in
+* 20 burst cells (:data:`M2_BURST_CELLS`, 5 per shape), the shapes MP / MD / U512x512 / G800x240 in
   turn: 0.6 x rho* for 500 s and four heterogeneous spikes, each with its own seed. A
   spike's total offered load is 2, 3 or 4 x rho* (every cell has all three plus one more,
   rotating) and its width carries the same 20 s of rho* work above the boundary
@@ -184,7 +185,7 @@ M2_DESIGN_SEED = 20261005
 M2_DRAIN_LIMIT_S = 300.0
 #: The bursts' shapes, in turn.
 M2_SHAPES: tuple[str, ...] = ("MP", "MD", "U512x512", "G800x240")
-M2_BURST_CELLS = 16
+M2_BURST_CELLS = 20
 M2_SPIKES = 4
 #: A spike's total offered load, x rho*.
 M2_SPIKE_HEIGHTS: tuple[float, ...] = (2.0, 3.0, 4.0)
@@ -441,7 +442,7 @@ def m2_serial_base(serial_offset: int = 0) -> int:
 
 def m2_cells(model: str, design_seed: int, serial_offset: int = 0
              ) -> tuple[list[design.DesignCell], dict[str, list[dict]]]:
-    """M2's 24 cells (ids and seeds fixed, load filled in by :func:`place`) and the spike
+    """M2's 28 cells (ids and seeds fixed, load filled in by :func:`place`) and the spike
     plan of each burst cell; ``serial_offset`` is the restart rule (:func:`m2_serial_base`)."""
     factory = design.CellFactory(model, design_seed, serial_base=m2_serial_base(serial_offset))
     cells, spikes, burst_index = [], {}, 0
@@ -1310,8 +1311,8 @@ def m2_composition_doc(cells: Sequence[design.DesignCell]) -> dict:
                    "spike_seed": "derived_seed(design_seed, model, cell_id, 'spike', k): jitters "
                                  "the start; the arrivals come from the cell's arrival seed",
                    "shapes_in_turn": list(M2_SHAPES)},
-        "sizing": ("scripts/analysis/m2_power_sim.py: the episode gate's CP bound needs n_eff "
-                   ">= 14-17; 16 burst cells keep it there even at a within-cell ICC of 1"),
+        "sizing": ("user 2026-10-05: 20 burst cells (5 per shape) with the onset gate's miss tolerance 2 "
+                   "(next-dryrun-20261005/m2/power_cp_only/sim_hybrid.py; the CP bound on n_eff decides)"),
         "drain_gate": {"rule": "running + waiting == 0 before every cell (P1's state gate)",
                        "limit_s": M2_DRAIN_LIMIT_S},
     }
