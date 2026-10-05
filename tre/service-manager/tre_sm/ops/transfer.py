@@ -63,12 +63,10 @@ SKIP_NO_DONOR = "no_awake_occupant"
 SKIP_FOREIGN_OCCUPANT = "occupant_not_donor_model"
 SKIP_OCCUPANT_HIDDEN = "occupant_hidden"
 SKIP_OCCUPANT_BUSY = "occupant_busy"
-SKIP_NOT_IN_DONOR_FILTER = "occupant_not_requested"
 SKIP_UNCOVERED_GPU = "uncovered_gpu"
 SKIP_OVER_COUNT = "over_count"
 SKIP_FLOOR = "donor_floor"
 SKIP_RECEIVER_BUSY = "receiver_busy"
-SKIP_AVOIDED = "avoid_gpus"
 SKIP_RECEIVER_CAP = "receiver_cap"
 
 
@@ -140,8 +138,6 @@ def select_transfer_pairs(
     donor_floor: int | None = None,
     donor_routable: Iterable[str] = (),
     receiver_budget: int | None = None,
-    donor_filter: Iterable[str] | None = None,
-    avoid_gpus: Iterable[str] = (),
     wake_blocker: WakeBlocker | None = None,
     veto: Veto | None = None,
     receiver_pick: ReceiverPick | None = None,
@@ -152,9 +148,7 @@ def select_transfer_pairs(
     something in progress (never a donor or a receiver). ``donor_floor``: the
     donor model's replica floor (None = not enforced) over ``donor_routable``
     (its routable binding ids). ``receiver_budget``: how many receivers may still
-    be woken (scaling cap; None = no cap). ``donor_filter``: serve ids or binding
-    ids the caller allows as donors (None = any). ``avoid_gpus``: ``node/gpu``
-    keys no receiver may use. ``wake_blocker(receiver, planning, ignored_ids)``
+    be woken (scaling cap; None = no cap). ``wake_blocker(receiver, planning, ignored_ids)``
     returns why the account refuses the wake (None = allowed) with the donors
     asleep in ``planning`` and their leases in ``ignored_ids``. ``veto(pair)``
     returns why the pair must not be taken (None = take it).
@@ -163,8 +157,6 @@ def select_transfer_pairs(
     count = max(0, int(count))
     busy_ids = frozenset(str(item) for item in busy)
     routable = set(str(item) for item in donor_routable)
-    allowed = None if donor_filter is None else frozenset(str(item) for item in donor_filter)
-    avoid = frozenset(str(item) for item in avoid_gpus)
     planning: dict[str, Binding] = {binding.serve_id: binding for binding in bindings}
     selection = TransferSelection()
     remaining = count
@@ -202,9 +194,6 @@ def select_transfer_pairs(
             if receiver.binding_id in busy_ids:
                 skip(receiver, SKIP_RECEIVER_BUSY)
                 continue
-            if any(f"{receiver.slot.node}/{gpu}" in avoid for gpu in receiver.slot.gpu_ids):
-                skip(receiver, SKIP_AVOIDED)
-                continue
             wanted = set(receiver.slot.gpu_ids)
             occupants = sorted(
                 (
@@ -220,7 +209,7 @@ def select_transfer_pairs(
             if not occupants:
                 skip(receiver, SKIP_NO_DONOR)  # a plain wake, not a transfer
                 continue
-            reason = _occupant_problem(occupants, donor_model, busy_ids, allowed)
+            reason = _occupant_problem(occupants, donor_model, busy_ids)
             if reason is not None:
                 skip(receiver, reason)
                 continue
@@ -284,9 +273,7 @@ def select_transfer_pairs(
     return selection
 
 
-def _occupant_problem(
-    occupants: list[Binding], donor_model: str, busy: frozenset[str], allowed: frozenset[str] | None
-) -> str | None:
+def _occupant_problem(occupants: list[Binding], donor_model: str, busy: frozenset[str]) -> str | None:
     for item in occupants:
         if item.model != donor_model:
             return SKIP_FOREIGN_OCCUPANT
@@ -294,8 +281,6 @@ def _occupant_problem(
             return SKIP_OCCUPANT_HIDDEN
         if item.binding_id in busy:
             return SKIP_OCCUPANT_BUSY
-        if allowed is not None and item.serve_id not in allowed and item.binding_id not in allowed:
-            return SKIP_NOT_IN_DONOR_FILTER
     return None
 
 

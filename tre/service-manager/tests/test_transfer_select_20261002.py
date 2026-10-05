@@ -8,7 +8,6 @@ from tre_sm.ops.transfer import (
     SKIP_FLOOR,
     SKIP_FOREIGN_OCCUPANT,
     SKIP_NO_DONOR,
-    SKIP_NOT_IN_DONOR_FILTER,
     SKIP_OCCUPANT_BUSY,
     SKIP_OCCUPANT_HIDDEN,
     SKIP_OVER_COUNT,
@@ -179,18 +178,6 @@ def test_count_batches_pairs_across_gpus():
     assert len({p.donors[0].serve_id for p in selection.pairs}) == 3
     capped = select(fleet, count=3, receiver_budget=1)
     assert len(capped.pairs) == 1 and capped.unfilled == 2
-
-
-def test_donor_filter_and_avoid_gpus():
-    fleet = [
-        b("d-0", "d", (0,), awake=True), b("r-0", "r", (0,)),
-        b("d-1", "d", (1,), awake=True), b("r-1", "r", (1,)),
-    ]
-    only_d1 = select(fleet, donor_filter=["d-1"])
-    assert pairs_of(only_d1) == [("r-1", ["d-1"])]
-    assert only_d1.skipped == {SKIP_NOT_IN_DONOR_FILTER: 1}
-    assert pairs_of(select(fleet, donor_filter=["d/node-a/0"])) == [("r-0", ["d-0"])]
-    assert pairs_of(select(fleet, avoid_gpus=["node-a/0"])) == [("r-1", ["d-1"])]
 
 
 def test_release_order_is_the_planner_release_pick_not_the_serve_id():

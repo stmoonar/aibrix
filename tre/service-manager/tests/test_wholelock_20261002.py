@@ -376,7 +376,7 @@ def test_transfer_sleeps_the_donor_and_wakes_the_receiver_in_one_lock_hold():
     body = response.json()
     [pair] = body["pairs"]
     assert pair["status"] == "done"
-    assert body["done"] == body["taken"] == body["donors_slept"] == body["receivers_woken"] == 1
+    assert body["done"] == body["taken"] == 1
     assert body["unfilled"] == 0 and body["clamped_by_floor"] is False
     assert set(body["phases_ms"]) == {"select", "donor_sleep", "receiver_wake", "total"}
     assert not world.awake(pair["donor"]) and world.awake(pair["receiver"])

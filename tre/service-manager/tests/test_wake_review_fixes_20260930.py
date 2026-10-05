@@ -14,6 +14,8 @@ from contextlib import contextmanager
 
 import pytest
 
+from tre_common import rediskeys
+
 from tre_sm.allocator.slots import Binding, Slot
 from tre_sm.api.v2 import DefragUnavailable, ServiceManagerV2, WakeConflict, WakeFailed
 from tre_sm.gpu_truth import RedisGpuTruth
@@ -476,6 +478,23 @@ def test_startup_placeholder_restart_seen_across_an_sm_restart():
 # ------------------------------------------------------------ review P2-1 unsettled leases
 
 
+def test_an_aborted_wake_prepare_keeps_the_journal_when_the_lease_cannot_be_released(monkeypatch):
+    # Restored 2026-10-06 (dropped with the S6 split wake): a prepared wake that
+    # never ran must not lose its lease AND its journal entry - the entry is what
+    # lets the recovery release the lease later.
+    world = _world()
+    with world.coordinator.operation("put_binding_power"):
+        snapshot = world.store.load()
+        binding = next(b for b in snapshot.bindings if b.serve_id == "pod-a")
+        ticket = world.service._prepare_wake(binding, snapshot.bindings)
+        monkeypatch.setattr(world.leases, "release", lambda b: (_ for _ in ()).throw(ConnectionError("x")))
+        world.service._abort_prepared_wakes([ticket])
+    assert set(world.journal.entries()) == {"m1/node-a/0"}
+    monkeypatch.undo()
+    assert world.service.recover_wake_journal()["resolved"][0]["result"] == "rolled_back"
+    assert _leases(world) == {}
+
+
 def test_parallel_wake_failed_settle_keeps_the_journal(monkeypatch):
     world = _world()
     world.vllm.wake_up = lambda pod_ip, *, port=None: Result(False, "cuda oom")
@@ -627,3 +646,32 @@ def test_startup_placeholder_convergence_isolates_a_failing_binding(monkeypatch)
     result = world.service.guard_container_restarts()
     assert result["converged"] == ["m1/node-a/1"]  # not starved by pod-a
     assert set(world.service._suspects) == {"m1/node-a/0"}  # retried next pass
+
+
+# ------------------------------------------- lock hold independent of N (2026-10-06)
+
+
+def test_failed_wakes_that_woke_anyway_get_one_compensating_sleep_call():
+    # Two wakes of one call fail after /wake_up (both engines woke): the
+    # settlement probes them in one round and sleeps them in ONE sleep call, so
+    # the writer-lock hold does not grow with the number of failed wakes.
+    world = _world(sm_config={"test_hooks": True})
+    world.service._fault_redis = world.redis
+    for gpu in (0, 1):
+        world.redis.values[rediskeys.sm_fault_key("fail_wake", "node-a", gpu)] = "1"
+    primitive = world.service._sleep_primitive
+    calls = []
+    original = primitive.sleep
+
+    def counting(targets, **kwargs):
+        calls.append(sorted(target.binding.serve_id for target in targets))
+        return original(targets, **kwargs)
+
+    primitive.sleep = counting
+
+    with pytest.raises(WakeFailed):
+        world.service.put_model_target("m1", wake_replicas=2)
+
+    assert calls == [["pod-a", "pod-b"]]
+    assert world.vllm.sleeping["10.0.0.1"] is True and world.vllm.sleeping["10.0.0.2"] is True
+    assert _leases(world) == {} and world.journal.entries() == {}

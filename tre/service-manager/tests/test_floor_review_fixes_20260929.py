@@ -219,7 +219,8 @@ def test_convergence_swaps_the_suspended_resident_for_its_makeup_replica():
     world.runtime.clear_startup_admission = lambda name: None
     world.service._reconcile_unlocked = lambda drop_missing=False: {}
 
-    world.service._converge_startup(started, True)
+    with world.service._writer("startup_converge"):
+        world.service._converge_startup(started, True)
 
     desired = _desired_power(world)
     assert desired["m1/node-a/0"] == "sleeping"  # the suspended resident stays asleep
