@@ -18,7 +18,7 @@ def _json(status, doc):
 def test_200_up_body_is_grow_only_and_actor_header_sent() -> None:
     with StubSM(_json(200, {"model": "m", "actions": [{"action": "wake"}]})) as sm:
         client = SMClient(sm.url, actor="tre-baseline-scaler/test")
-        body = target_body("up", 3, sleep_path="scale_down", drain_budget_s=None)
+        body = target_body("up", 3)
         result = client.put_target("m", body)
     assert result.ok and result.code == 200
     assert result.raw["actions"] == [{"action": "wake"}]
@@ -29,13 +29,11 @@ def test_200_up_body_is_grow_only_and_actor_header_sent() -> None:
     assert result.as_dict()["actions"] == [{"action": "wake"}]
 
 
-def test_down_body_is_absolute_with_sleep_path() -> None:
-    assert target_body("down", 1, sleep_path="scale_down", drain_budget_s=None) == {
-        "wake_replicas": 1, "sleep_path": "scale_down"}
-    assert target_body("down", 2, sleep_path="apa", drain_budget_s=30) == {
-        "wake_replicas": 2, "sleep_path": "apa", "drain_budget_s": 30.0}
+def test_down_body_is_absolute_on_the_abort_path_and_never_asks_for_a_drain() -> None:
+    assert target_body("down", 1) == {"wake_replicas": 1, "sleep_path": "urgent"}
+    assert target_body("down", 2, abort_sleep_path="apa") == {"wake_replicas": 2, "sleep_path": "apa"}
     with pytest.raises(ValueError):
-        target_body("sideways", 1, sleep_path="scale_down", drain_budget_s=None)
+        target_body("sideways", 1)
 
 
 def test_structured_409_is_parsed() -> None:
@@ -60,7 +58,7 @@ def test_structured_409_nested_under_detail_is_parsed() -> None:
 
 def test_plain_detail_409_current_main() -> None:
     with StubSM(_json(409, {"detail": "model m has a binding reserved for sleep"})) as sm:
-        result = SMClient(sm.url).put_target("m", {"wake_replicas": 1, "sleep_path": "scale_down"})
+        result = SMClient(sm.url).put_target("m", {"wake_replicas": 1, "sleep_path": "urgent"})
     assert not result.ok and result.code == 409
     assert result.error == "http_error" and result.reason is None and result.gpu_ids is None
     assert result.detail == "model m has a binding reserved for sleep"

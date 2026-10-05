@@ -47,8 +47,11 @@ spec:
               value: /var/log/tre-baselines
             - name: TRE_BL_WRITE_REDIS
               value: "true"
-            - name: TRE_BL_SLEEP_PATH
-              value: scale_down
+            # Scale-downs sleep on a no-drain path (hide, gateway ack, /sleep mode=abort,
+            # sidecar continuation) like every other arm; must be in the registry's
+            # service_manager.sleep.no_drain_paths or the shell refuses to start.
+            - name: TRE_BL_ABORT_SLEEP_PATH
+              value: urgent
             - name: TRE_MODEL_NAMESPACE
               value: default
             - name: TRE_BL_HTTP_PORT

@@ -35,8 +35,11 @@ Environment:
 ``TRE_BL_SCRAPE_TIMEOUT_S`` per-pod scrape timeout (default 2.5)
 ``TRE_BL_SM_TIMEOUT_S``     SM target-call timeout (default 300, the controller's)
 ``TRE_BL_SM_STATE_TIMEOUT_S`` SM ``/v2/state`` timeout (default 5)
-``TRE_BL_SLEEP_PATH``       ``sleep_path`` of scale-downs (default ``scale_down``)
-``TRE_BL_DRAIN_BUDGET_S``   optional ``drain_budget_s`` of scale-downs
+``TRE_BL_ABORT_SLEEP_PATH`` ``sleep_path`` of scale-downs (default ``urgent``): must be one
+                            of the registry's ``service_manager.sleep.no_drain_paths`` -
+                            every arm sleeps the same way (hide, gateway ack, ``/sleep
+                            mode=abort``, sidecar continuation; no drain). The old
+                            ``TRE_BL_SLEEP_PATH`` / ``TRE_BL_DRAIN_BUDGET_S`` are refused.
 ``TRE_BL_MAX_TICK_FAILURES`` consecutive failed ticks before /healthz is 503 (default 5)
 ``TRE_BL_LOCK_TTL_S``       owner-lock TTL (default 30)
 ``TRE_BL_BACKOFF_MAX_S``    cap of the per-model backoff after SM refusals (default 10; a
@@ -60,14 +63,18 @@ import yaml
 from tre_common.registry import Registry, load_registry
 from tre_common.slo_labels import TTFT_SLO_MODE_FIXED, label_def_for_model
 
+from tre_baselines.sm_client import DEFAULT_ABORT_SLEEP_PATH
+
 LOG = logging.getLogger(__name__)
 
 DEFAULT_REGISTRY_PATH = "/etc/tre/registry.yaml"
-DEFAULT_SLEEP_PATH = "scale_down"
 #: Sleep paths the service manager accepts from an HTTP caller
 #: (``tre_sm.api.v2.EXTERNAL_SLEEP_PATHS``; not imported: the shell must not depend on
 #: the service-manager package).
 EXTERNAL_SLEEP_PATHS = ("scale_down", "urgent", "safescale_commit", "apa")
+#: Environment names of the old drain semantics; refused so a stale manifest cannot
+#: silently ask for a drain the shell no longer claims.
+RETIRED_ENV = ("TRE_BL_SLEEP_PATH", "TRE_BL_DRAIN_BUDGET_S")
 
 
 @dataclass(frozen=True)
@@ -102,8 +109,8 @@ class Config:
     scrape_timeout_s: float = 2.5
     sm_timeout_s: float = 300.0
     sm_state_timeout_s: float = 5.0
-    sleep_path: str = DEFAULT_SLEEP_PATH
-    drain_budget_s: Optional[float] = None
+    #: Scale-down sleep path: a no-drain (abort) path (see ``sm_client``).
+    abort_sleep_path: str = DEFAULT_ABORT_SLEEP_PATH
     max_tick_failures: int = 5
     lock_ttl_s: float = 30.0
     backoff_max_s: float = 10.0
@@ -195,20 +202,22 @@ def _required(env: Mapping[str, str], key: str) -> str:
     return value
 
 
-def _opt_float(env: Mapping[str, str], key: str) -> Optional[float]:
-    value = env.get(key, "").strip()
-    return float(value) if value else None
-
-
 def load_config(env: Optional[Mapping[str, str]] = None, registry: Optional[Registry] = None) -> Config:
     env = dict(os.environ if env is None else env)
     registry_path = env.get("TRE_REGISTRY_PATH", "").strip() or DEFAULT_REGISTRY_PATH
     if registry is None:
         registry = load_registry(registry_path)
     only = {m.strip() for m in env.get("TRE_BL_MODELS", "").split(",") if m.strip()} or None
-    sleep_path = env.get("TRE_BL_SLEEP_PATH", "").strip() or DEFAULT_SLEEP_PATH
-    if sleep_path not in EXTERNAL_SLEEP_PATHS:
-        raise ValueError(f"TRE_BL_SLEEP_PATH {sleep_path!r} not in {EXTERNAL_SLEEP_PATHS}")
+    retired = [k for k in RETIRED_ENV if env.get(k, "").strip()]
+    if retired:
+        raise ValueError(f"{retired} are retired (the shell never drains): use TRE_BL_ABORT_SLEEP_PATH")
+    abort_path = env.get("TRE_BL_ABORT_SLEEP_PATH", "").strip() or DEFAULT_ABORT_SLEEP_PATH
+    if abort_path not in EXTERNAL_SLEEP_PATHS:
+        raise ValueError(f"TRE_BL_ABORT_SLEEP_PATH {abort_path!r} not in {EXTERNAL_SLEEP_PATHS}")
+    if not registry.service_manager().sleep.no_drain(abort_path):
+        raise ValueError(f"TRE_BL_ABORT_SLEEP_PATH {abort_path!r} drains on this registry "
+                         f"(service_manager.sleep.no_drain_paths="
+                         f"{list(registry.service_manager().sleep.no_drain_paths)})")
     tick_s = float(env.get("TRE_BL_TICK_S", "").strip() or 2.0)
     if tick_s <= 0:
         raise ValueError("TRE_BL_TICK_S must be > 0")
@@ -232,8 +241,7 @@ def load_config(env: Optional[Mapping[str, str]] = None, registry: Optional[Regi
         scrape_timeout_s=float(env.get("TRE_BL_SCRAPE_TIMEOUT_S", "").strip() or 2.5),
         sm_timeout_s=float(env.get("TRE_BL_SM_TIMEOUT_S", "").strip() or 300.0),
         sm_state_timeout_s=float(env.get("TRE_BL_SM_STATE_TIMEOUT_S", "").strip() or 5.0),
-        sleep_path=sleep_path,
-        drain_budget_s=_opt_float(env, "TRE_BL_DRAIN_BUDGET_S"),
+        abort_sleep_path=abort_path,
         max_tick_failures=int(env.get("TRE_BL_MAX_TICK_FAILURES", "").strip() or 5),
         lock_ttl_s=float(env.get("TRE_BL_LOCK_TTL_S", "").strip() or 30.0),
         backoff_max_s=float(env.get("TRE_BL_BACKOFF_MAX_S", "").strip() or 10.0),

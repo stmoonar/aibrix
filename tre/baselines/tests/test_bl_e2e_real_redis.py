@@ -347,7 +347,7 @@ class Harness:
             lock_ttl_s=5.0, max_tick_failures=3,
         )
         client = SMClient(self.sm.url, timeout_s=10.0)
-        self.dispatcher = Dispatcher(client.put_target, sleep_path=self.config.sleep_path)
+        self.dispatcher = Dispatcher(client.put_target, abort_sleep_path=self.config.abort_sleep_path)
         self.source = LiveSource(self.config, redis, client.get_state, self._list_pods)
         self.shell = BaselineShell(
             self.config, self.source, build_policy(policy, self.config), self.dispatcher, redis,
@@ -526,7 +526,7 @@ def test_low_high_low_scales_up_then_down(tmp_path, redis_url, redis, policy) ->
     assert len(h.puts) == len(dispatched)
     for model, body, status in h.puts:
         assert 1 <= body["wake_replicas"] <= MAX_R and status == 200
-        assert body.get("at_least") is True or body.get("sleep_path") == "scale_down"
+        assert body.get("at_least") is True or body == {"wake_replicas": body["wake_replicas"], "sleep_path": "urgent"}
     assert any(b.get("at_least") for _, b, _ in h.puts) and any(not b.get("at_least") for _, b, _ in h.puts)
     # the decision is mirrored to Redis (TTL) and the stream saw all three kinds
     assert redis.ttl(f"tre:v2:bl:decision:{A}") > 0

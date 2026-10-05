@@ -47,6 +47,9 @@ def test_deployment_ships_off_and_dry_run() -> None:
                 "TRE_BL_POLICY_CONFIG", "TRE_REGISTRY_PATH"):
         assert env.get(key), key
     assert env["TRE_REGISTRY_PATH"] == "/etc/tre/registry.yaml"
+    # no drain is ever asked for: the abort path, and none of the retired names
+    assert env["TRE_BL_ABORT_SLEEP_PATH"] == "urgent"
+    assert "TRE_BL_SLEEP_PATH" not in env and "TRE_BL_DRAIN_BUDGET_S" not in env
     assert env["TRE_BL_POLICY_CONFIG"] == "/etc/tre-baselines/$(TRE_BL_POLICY).yaml"
     names = [e["name"] for e in container["env"]]
     assert names.index("TRE_BL_POLICY") < names.index("TRE_BL_POLICY_CONFIG")  # $(VAR) needs it first

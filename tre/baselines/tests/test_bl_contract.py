@@ -61,7 +61,7 @@ def test_config_reads_registry_limits_through_common_readers() -> None:
     assert config.dry_run is True  # default
     assert config.tick_s == 2.0
     assert config.sm_url == "http://sm.test:8000"
-    assert config.sleep_path == "scale_down"
+    assert config.abort_sleep_path == "urgent"  # a no-drain path: hide, ack, abort + continue
     assert config.scrape_timeout_s == 2.5 and config.decision_stream is True
     assert config.backoff_max_s == 10.0 and config.liveness_stall_s == 120.0
     assert load_config({**ENV, "TRE_BL_DECISION_STREAM": "false"}).decision_stream is False
@@ -81,7 +81,12 @@ def test_config_reads_registry_limits_through_common_readers() -> None:
 
 def test_config_rejects_bad_values(tmp_path) -> None:
     with pytest.raises(ValueError):
-        load_config({**ENV, "TRE_BL_SLEEP_PATH": "repair"})
+        load_config({**ENV, "TRE_BL_ABORT_SLEEP_PATH": "repair"})
+    with pytest.raises(ValueError, match="drains"):  # scale_down drains on the SM on main
+        load_config({**ENV, "TRE_BL_ABORT_SLEEP_PATH": "scale_down"})
+    for retired in ("TRE_BL_SLEEP_PATH", "TRE_BL_DRAIN_BUDGET_S"):
+        with pytest.raises(ValueError, match="retired"):
+            load_config({**ENV, retired: "30"})
     with pytest.raises(ValueError):
         load_config({k: v for k, v in ENV.items() if k != "TRE_SM_URL"})
     with pytest.raises(ValueError):

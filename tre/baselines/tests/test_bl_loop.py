@@ -18,7 +18,7 @@ def _shell(tmp_path, policy, *, dry_run, awake=None, lock=True, redis=None, sm_p
     config = make_config(tmp_path, MODELS, dry_run=dry_run, **cfg)
     cluster = FakeCluster(awake=dict(awake or {"a": 2, "b": 1, "c": 1}))
     redis = redis or FakeRedis()
-    dispatcher = Dispatcher(sm_put or cluster.put_target, sleep_path=config.sleep_path)
+    dispatcher = Dispatcher(sm_put or cluster.put_target, abort_sleep_path=config.abort_sleep_path)
     owner = OwnerLock(redis, config.lock_ttl_s, token="me") if lock else None
     shell = BaselineShell(config, FakeSource(config, cluster, redis), policy, dispatcher, redis, lock=owner)
     return shell, cluster, redis, dispatcher
@@ -96,7 +96,7 @@ def test_active_put_sequence_downs_before_ups(tmp_path) -> None:
     assert [(m, d, t) for _, m, d, t in dispatcher.submitted[1:3]] == [("b", "up", 3), ("c", "up", 3)]
     # bodies (the arrival order at the SM is up to the worker threads)
     assert sorted(cluster.calls[:3], key=lambda c: c[0]) == [
-        ("a", {"wake_replicas": 1, "sleep_path": "scale_down"}),
+        ("a", {"wake_replicas": 1, "sleep_path": "urgent"}),
         ("b", {"wake_replicas": 3, "at_least": True}),
         ("c", {"wake_replicas": 3, "at_least": True}),
     ]

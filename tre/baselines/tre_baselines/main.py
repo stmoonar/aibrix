@@ -24,7 +24,7 @@ def main() -> None:
                   actor=f"{ACTOR}/{config.policy}")
     pods = K8sPodLister(config.model_namespace, port_override=config.metrics_port)
     source = LiveSource(config, redis, sm.get_state, pods.list_routable)
-    dispatcher = Dispatcher(sm.put_target, sleep_path=config.sleep_path, drain_budget_s=config.drain_budget_s)
+    dispatcher = Dispatcher(sm.put_target, abort_sleep_path=config.abort_sleep_path)
     policy = build_policy(config.policy, config)
     lock = OwnerLock(redis, config.lock_ttl_s)
     shell = BaselineShell(config, source, policy, dispatcher, redis, lock=lock,

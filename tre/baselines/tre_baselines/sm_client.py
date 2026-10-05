@@ -2,12 +2,16 @@
 
 Contract (service manager on main, ``tre_sm/api/v2.py``):
 
-* ``PUT /v2/models/{m}/target`` body ``{wake_replicas, at_least, sleep_path,
-  drain_budget_s}``. ``at_least`` = grow-only (no-op when the model already has that many
-  awake), so a re-sent scale-up never shrinks a model. A scale-down is an absolute
-  ``wake_replicas`` with a ``sleep_path`` from ``EXTERNAL_SLEEP_PATHS``; the handler
-  blocks until the drain ends and wake / create run synchronously inside it, so a call
-  can take minutes (the controller uses a 300 s timeout for the same call).
+* ``PUT /v2/models/{m}/target`` body ``{wake_replicas, at_least}`` (scale-up) or
+  ``{wake_replicas, sleep_path}`` (scale-down). ``at_least`` = grow-only (no-op when the
+  model already has that many awake), so a re-sent scale-up never shrinks a model. A
+  scale-down is an absolute ``wake_replicas`` on the **abort sleep path**: no drain. The SM
+  hides the pod, waits for the gateway ack and sleeps it with ``mode=abort``; requests in
+  flight are cut off and continued by the reissue sidecar (the transparent sleep every arm
+  shares). ``sleep_path`` names a path in the registry's
+  ``service_manager.sleep.no_drain_paths`` (default ``urgent``; the SM on main drains on
+  the other paths, the whole-lock SM never drains); ``drain_budget_s`` is never sent. The
+  handler returns once the sleep is committed (GPU released) or the wake done.
 * ``GET /v2/state`` -> ``{"version", "models": {m: {"awake", "bound"}}, "bindings":
   [{"serve_id" (= pod name), "model", "node", "gpu_ids", "awake", "hidden"}], ...}``.
 * Refusals are HTTP 409 (writer lock busy, reservation, floor violation, wake conflict,
@@ -179,15 +183,19 @@ class SMClient:
         return SMResult(ok=True, code=code, raw=parsed, elapsed_s=elapsed)
 
 
-def target_body(direction: str, target: int, *, sleep_path: str, drain_budget_s: Optional[float]) -> dict:
-    """Request body of one scale action (``up`` = grow-only, ``down`` = absolute)."""
+#: Default sleep path of a scale-down: a no-drain (abort) path on the SM on main
+#: (``DEFAULT_NO_DRAIN_PATHS``) and the whole-lock SM's default; floor violations are
+#: refused (409, counted) rather than silently clamped.
+DEFAULT_ABORT_SLEEP_PATH = "urgent"
+
+
+def target_body(direction: str, target: int, *, abort_sleep_path: str = DEFAULT_ABORT_SLEEP_PATH) -> dict:
+    """Request body of one scale action (``up`` = grow-only, ``down`` = absolute, abort
+    sleep: hide -> gateway ack -> ``/sleep mode=abort``, no drain)."""
     if direction == "up":
         return {"wake_replicas": int(target), "at_least": True}
     if direction == "down":
-        body: dict[str, Any] = {"wake_replicas": int(target), "sleep_path": sleep_path}
-        if drain_budget_s is not None:
-            body["drain_budget_s"] = float(drain_budget_s)
-        return body
+        return {"wake_replicas": int(target), "sleep_path": abort_sleep_path}
     raise ValueError(f"unknown direction {direction!r}")
 
 
@@ -264,13 +272,12 @@ class Dispatcher:
     """
 
     def __init__(self, put_target: Callable[[str, Mapping[str, Any]], SMResult], *,
-                 sleep_path: str = "scale_down", drain_budget_s: Optional[float] = None,
+                 abort_sleep_path: str = DEFAULT_ABORT_SLEEP_PATH,
                  guard: Optional[Callable[[], Optional[str]]] = None) -> None:
         self._put = put_target
         #: Called right before every SM call: None = go, a string = drop the call (why).
         self.guard = guard
-        self._sleep_path = sleep_path
-        self._drain_budget_s = drain_budget_s
+        self._abort_sleep_path = abort_sleep_path
         self._lock = threading.Lock()
         self._inflight: dict[str, tuple[str, int]] = {}
         self._workers: dict[str, _Worker] = {}
@@ -294,7 +301,7 @@ class Dispatcher:
             return sorted(m for m, (direction, _t) in self._inflight.items() if direction == "down")
 
     def submit(self, model: str, direction: str, target: int) -> bool:
-        body = target_body(direction, target, sleep_path=self._sleep_path, drain_budget_s=self._drain_budget_s)
+        body = target_body(direction, target, abort_sleep_path=self._abort_sleep_path)
         with self._lock:
             if self._closed:
                 raise RuntimeError("dispatcher is closed")
