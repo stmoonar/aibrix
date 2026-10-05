@@ -2705,6 +2705,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     help="--t14-set: an amendment of --preregistration-json (sidecar <file>.sha256, "
                          "amends.sha256 = the preregistration's); its overrides (the v1-lambda "
                          "parameter file binding only) apply before the binding check")
+    ap.add_argument("--t14-cell-serial-base", type=int, default=None,
+                    help="--t14-set: the first cell serial - 1 (default 80500, the 2026-09-24 / "
+                         "2026-10-03 rounds); a new round takes a fresh base, bound by the "
+                         "preregistration's t14.cell_serial_base")
     ap.add_argument("--corpus-lang", default=r3_grid.CORPUS_LANG_DEFAULT,
                     choices=list(r3_grid.CORPUS_LANGS),
                     help="text of every cell's prompts (r3_grid --corpus-lang; recorded in the "
@@ -2791,9 +2795,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.forbidden_root and not args.t14_set:
         ap.error("--forbidden-root belongs to --t14-set")
     if not args.t14_set and (args.capacity_prior_file or args.refit_params_file
-                             or args.preregistration_json or args.preregistration_amendment_json):
-        ap.error("--capacity-prior-file / --refit-params-file / --preregistration-json belong "
-                 "to --t14-set")
+                             or args.preregistration_json or args.preregistration_amendment_json
+                             or args.t14_cell_serial_base is not None):
+        ap.error("--capacity-prior-file / --refit-params-file / --preregistration-json / "
+                 "--t14-cell-serial-base belong to --t14-set")
     if args.t14_set and not args.capacity_prior_file:
         ap.error("--t14-set needs --capacity-prior-file")
     supplement = args.reprobe_base is not None
