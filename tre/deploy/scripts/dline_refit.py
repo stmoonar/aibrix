@@ -2020,6 +2020,7 @@ def accept_gate_record(rule: str) -> dict:
                                                   else GATING_CRITERIA),
             "onset": {**b_prime.ONSET_GATE, "dynamic_primitives": list(b_prime.ONSET_DYNAMIC_PRIMITIVES),
                       "rule": b_prime.ONSET_RULE, "ci_rule": b_prime.ONSET_CI_RULE,
+                      "lookback_clip": b_prime.ONSET_LOOKBACK_CLIP,
                       "icc_undefined_value": b_prime.ICC_UNDEFINED_VALUE},
             "window_fa": dict(b_prime.WINDOW_FA_GATE),
             "severity_cut": "each model's b_prime.severity_cut (training .65 quantile under the frozen label)",
