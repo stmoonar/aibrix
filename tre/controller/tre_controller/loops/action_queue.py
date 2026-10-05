@@ -183,10 +183,19 @@ class RescueTargetRecord:
     gained: int = 0
     failures: int = 0
     done_ms: int | None = None
+    #: Process-unique id of a target started by a submit (> 0); 0 = restored from the
+    #: durable memory or recorded as covered by a probe preemption (no dispatch).
+    seq: int = 0
 
     @property
     def covered(self) -> int:
         return self.covered_before + self.gained
+
+    @property
+    def added_nothing(self) -> bool:
+        """Every dispatched part of this target ended (done, failed, refused, dropped in
+        observe mode) and none added a replica: the target will never land."""
+        return self.seq > 0 and self.outstanding == 0 and self.done_ms is not None and self.gained == 0
 
 
 @dataclass
@@ -299,6 +308,8 @@ class ActionQueue:
         #: C1 review P3: id(queued action) -> the record that part belongs to (a part of
         #: a superseded target updates that record, never its successor).
         self._rescue_parts: dict[int, RescueTargetRecord] = {}
+        #: Last ``RescueTargetRecord.seq`` handed out.
+        self._rescue_seq = 0
         #: C1 review P2-2: durable copy of ``_last_done`` / ``_rescue`` (controller
         #: state store: ``load_scale_memory()`` / ``save_scale_memory(model, record)``),
         #: so a restarted controller neither repeats an unreflected scale-up nor drops
@@ -503,9 +514,10 @@ class ActionQueue:
         if part.model not in started or record is None:
             started.add(part.model)
             plan = part.rescue
+            self._rescue_seq += 1
             record = RescueTargetRecord(
                 target=int(plan.target), desired=int(plan.desired), base=int(plan.base),
-                covered_before=int(plan.covered), issued_ms=int(self._now_ms()),
+                covered_before=int(plan.covered), issued_ms=int(self._now_ms()), seq=self._rescue_seq,
             )
             self._rescue[part.model] = record
             self._restored_unchecked.discard(part.model)

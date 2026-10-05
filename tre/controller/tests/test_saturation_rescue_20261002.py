@@ -24,6 +24,7 @@ from tre_common.registry import (
     parse_scaling_config,
 )
 from tre_common.window_pods import aggregate_pods
+from tre_controller.loops.action_queue import RescueTargetRecord
 from tre_controller.loops.decision_snapshot import _model_states
 from tre_controller.loops.tick import _scaling_options, run_planner_tick
 from tre_controller.planning.classify import ModelClassification, ModelRole, ModelState, TauThresholds
@@ -605,8 +606,9 @@ def test_receiver_order_tss_critical_first_then_waiting_per_replica():
 
 
 def test_observe_mode_step_is_unconfirmed_and_counting_restarts():
-    """A step the queue drops (observe mode) or the SM refuses never changes the routable
-    count: after 3 grids ``saturation_step_unconfirmed``, then 2 fresh windows again."""
+    """Fallback: a step that never changes the routable count and whose dispatch result
+    never reaches the tracker (this queue reports no rescue targets): after 3 grids
+    ``saturation_step_unconfirmed``, then 2 fresh windows again."""
     state = _state()
     queue = _Queue()
     sat = [STARTING] * 3
@@ -619,6 +621,55 @@ def test_observe_mode_step_is_unconfirmed_and_counting_restarts():
     assert any(e.startswith("saturation_step_unconfirmed:m:n=1:waited_ms=30000") for e in results[7].events)
     assert not results[8].actions and results[8].model_contexts["m"]["saturation_ticks"] == 1
     assert _planned(results[9]) == 1
+
+
+class _ResultQueue(_Queue):
+    """Reports its rescue targets like the ActionQueue (one per model and submit)."""
+
+    def __init__(self):
+        super().__init__()
+        self.records: dict = {}
+        self.seq = 0
+
+    def submit(self, actions) -> object:
+        super().submit(actions)
+        for model in sorted({a.model for a in _ups(actions)}):
+            self.seq += 1
+            self.records[model] = RescueTargetRecord(
+                target=2, desired=2, base=1, covered_before=1, issued_ms=0, outstanding=1, seq=self.seq
+            )
+        return object()
+
+    def rescue_targets(self) -> dict:
+        return {model: replace(record) for model, record in self.records.items()}
+
+    def end(self, model: str, gained: int) -> None:
+        record = self.records[model]
+        record.outstanding, record.gained, record.done_ms = 0, gained, 1
+
+
+def test_a_step_whose_dispatch_added_nothing_is_released_at_once():
+    """The queue reports the step's rescue target ended without adding a replica (SM
+    refusal, failure, observe drop): the wait ends on that result - also on a re-read of
+    the same window - not after the 3-grid fallback. A dispatch that added a replica keeps
+    waiting for the fleet view to show it."""
+    state = _state()
+    queue = _ResultQueue()
+    sat = [STARTING] * 3
+
+    def tick(i):
+        return _tick(state, _window(BASE + i * GRID, sat, (8.0, 0.6)), awake=1, queue=queue)
+
+    tick(3)
+    assert _planned(tick(4)) == 1
+    queue.end("m", gained=1)  # woke one: the view will show it
+    assert tick(4).model_contexts["m"]["saturation_awaiting_step"] is True
+    queue.end("m", gained=0)  # nothing was added: the step never lands
+    again = tick(4)  # second tick on the same window
+    assert "saturation_step_failed:m:n=1" in again.events
+    assert again.model_contexts["m"]["saturation_awaiting_step"] is False
+    assert tick(5).model_contexts["m"]["saturation_ticks"] == 1
+    assert _planned(tick(6)) == 1  # the fallback alone would still wait (unconfirmed at 7)
 
 
 class _PreemptingSafeScale:

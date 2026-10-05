@@ -72,9 +72,15 @@ the rescue and fairness loops read every window more than once and never count i
   step are the model's awake, not hidden bindings of the fleet view at the decision (not
   only those with a fresh sample). A step may land in parts over several windows (target
   4: 2 -> 3, then 3 -> 4); every rise up to its target is the step's own
-  (`saturation_step_landed` each time), only a fall or a rise above the target is external. A step whose change never shows (SM refusal,
-  observe mode) releases the wait after three grids (`saturation_step_unconfirmed`) and the
-  next step is a first step again. A routable change the rescue did not cause (donor,
+  (`saturation_step_landed` each time), only a fall or a rise above the target is external. A step that never lands is released on
+  its **dispatch result** (2026-10-06): the tick links the step to the C1 rescue target its
+  submit started in the ActionQueue (`RescueTargetRecord.seq`); once every part of that
+  target ended without adding a replica (SM refusal, failure, not executed, dropped in
+  observe mode: `added_nothing`), the wait ends at the next tick, also on a re-read of the
+  same window (`saturation_step_failed`), and the next step is a first step again. The
+  three-grid bound (`await_timeout_ms`, `saturation_step_unconfirmed`) is only the
+  fallback for a result that never reaches the tracker: a step whose submit started no
+  target (covered by a probe preemption, planned behind a probe) or a lost result. A routable change the rescue did not cause (donor,
   probe, C1) restarts the count (`saturation_reset_external`).
 * Not full (only running requests, or one request filling the KV cache) keeps the TSS
   verdict - no receiver.
@@ -169,7 +175,9 @@ protection would only add controller state.
   in the rescue tick's events (`ctrl_ticks`, decision snapshot), followed by the usual
   `rescue_target:` event; `saturation_pending:<model>:<k>/<K>:reason=...:waiting=...:kv=...`
   for a full window not yet confirmed; `saturation_step_landed:<model>:<n>-><m>`,
-  `saturation_step_unconfirmed:<model>:n=<n>:waited_ms=<ms>` (refused / observe mode),
+  `saturation_step_failed:<model>:n=<n>` (the queue reports the step's target ended
+  without adding a replica: refused, failed, observe drop),
+  `saturation_step_unconfirmed:<model>:n=<n>:waited_ms=<ms>` (fallback: no dispatch result),
   `saturation_reset_external:<model>:<a>-><b>` (a routable change the rescue did not cause).
   Each event is reported once, on the first read of its window (the re-reads of the
   rescue / fairness loops do not repeat it).
@@ -236,8 +244,10 @@ hide on a warm model -> never; a new onset re-opens; bounded doubling 1 -> 2 -> 
 fresh windows after the change; a step landing in parts; step pods from the fleet view
 (a stale-sampled old pod is not "added"); events once per window; O1 resume after a
 suspension does not re-open; old-pod backlog with an idle added pod -> no second step;
-capped by `max_awake_replicas`; external routable change restarts the count; observe mode
--> `saturation_step_unconfirmed`, then counting restarts; probe preemption covers the step
+capped by `max_awake_replicas`; external routable change restarts the count; a step whose
+dispatch added nothing -> `saturation_step_failed` at once (also on a re-read), a dispatch
+that added a replica keeps waiting for the view; no dispatch result (fallback) ->
+`saturation_step_unconfirmed` after three grids, then counting restarts; probe preemption covers the step
 (restore deduction) and its unhide lands it; free capacity before donors, immediate HIGH
 donor without it; TSS CRITICAL before saturation receivers, then by waiting / n;
 no incomplete-drop; sample selection (hidden / stale pods); store latest-sample fields;

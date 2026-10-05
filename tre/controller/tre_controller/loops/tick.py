@@ -210,7 +210,7 @@ def run_planner_tick(
     # Onset saturation rescue (the D8 band dwell that ran before it was removed in the
     # timer cleanup 2026-10-02; it had been off since the v1 alignment A5).
     classifications, saturation_events = _apply_saturation_rescue(
-        classifications, contexts, snapshot, signal_state, cluster_view
+        classifications, contexts, snapshot, signal_state, cluster_view, queue
     )
     if _prof_on:
         _signals_ns = time.perf_counter_ns() - _phase_t0
@@ -257,7 +257,9 @@ def run_planner_tick(
         # Review P2-1: relays the SM answered with nothing done on a still-current view.
         relay_holds=_relay_holds(queue),
     )
-    _note_saturation_steps(plan.actions, classifications, contexts, snapshot, signal_state, cluster_view)
+    saturation_steps = _note_saturation_steps(
+        plan.actions, classifications, contexts, snapshot, signal_state, cluster_view
+    )
     if _prof_on:
         _plan_ns = time.perf_counter_ns() - _phase_t0
         _phase_t0 = time.perf_counter_ns()
@@ -287,7 +289,10 @@ def run_planner_tick(
     # *_clamped_by_floor, placement_substituted) - no timer follows any of them.
     queue_events = tuple(queue_events) + tuple(_drain_queue_events(queue))
     if actions:
+        before = _rescue_seqs(queue) if saturation_steps else {}
         queue.submit(actions)
+        if saturation_steps:
+            _link_saturation_steps(queue, signal_state, saturation_steps, before)
     if _prof_on:
         _submit_ns = time.perf_counter_ns() - _phase_t0
         _ru_u1, _ru_s1 = prof.rusage_ms()
@@ -351,16 +356,24 @@ def _apply_saturation_rescue(
     snapshot: MetricsSnapshot,
     signal_state: SignalState | None,
     cluster_view: ClusterView | None = None,
+    queue: PlannerQueue | None = None,
 ) -> tuple[list, tuple[str, ...]]:
     """Onset saturation rescue (design 20261002-saturation-onset-rescue): a model whose
     TSS cannot decide yet (numerator zero / receiver gate not warm) and whose engines are
     full on ``saturation_consecutive_ticks`` consecutive windows becomes a CRITICAL
-    receiver (``saturation_rescue``). A warm TSS is never overridden."""
+    receiver (``saturation_rescue``). A warm TSS is never overridden. A step whose rescue
+    target the queue reports as ended without adding a replica is released at once."""
     tracker = getattr(signal_state, "saturation", None)
     if tracker is None or not tracker.config.enabled:
         return classifications, ()
     need = tracker.config.consecutive_ticks
     routable_by_model = _routable_pod_ids(cluster_view)
+    targets = getattr(queue, "rescue_targets", None)
+    failed_dispatch = (
+        {model: record.seq for model, record in targets().items() if getattr(record, "added_nothing", False)}
+        if callable(targets)
+        else {}
+    )
     events: list[str] = []
     out: list = []
     for item in classifications:
@@ -388,6 +401,7 @@ def _apply_saturation_rescue(
             routable_ids=(
                 routable_by_model.get(model, frozenset()) if routable_by_model is not None else None
             ),
+            failed_dispatch=failed_dispatch.get(model),
         )
         events.extend(verdict.events)
         sample = verdict.sample
@@ -433,15 +447,17 @@ def _note_saturation_steps(
     snapshot: MetricsSnapshot,
     signal_state: SignalState | None,
     cluster_view: ClusterView | None = None,
-) -> None:
+) -> set[str]:
     """A planned saturation-rescue scale-up restarts the model's count: the next step
     needs the condition again on windows after its routable count rose, and the pods it
     added must be full. The pods before the step are the model's awake, not hidden
     bindings of the fleet view (the sampled pods without one); the target is the step's
-    rescue target (the routable count plus its planned scale-ups without one)."""
+    rescue target (the routable count plus its planned scale-ups without one). Returns
+    the models whose step was noted."""
     tracker = getattr(signal_state, "saturation", None)
+    noted: set[str] = set()
     if tracker is None:
-        return
+        return noted
     ups = [action for action in actions if upscale_of(action) is not None]
     up = {upscale_of(action)[0] for action in ups}
     for item in classifications:
@@ -468,6 +484,28 @@ def _note_saturation_steps(
             target=target,
         )
         ctx["saturation_awaiting_step"] = True
+        noted.add(item.model_name)
+    return noted
+
+
+def _rescue_seqs(queue: PlannerQueue) -> dict[str, int]:
+    targets = getattr(queue, "rescue_targets", None)
+    return {model: int(getattr(record, "seq", 0)) for model, record in targets().items()} if callable(targets) else {}
+
+
+def _link_saturation_steps(
+    queue: PlannerQueue, signal_state: SignalState | None, models: set[str], before: dict[str, int]
+) -> None:
+    """Link each saturation step noted this tick to the rescue target its submit started
+    in the queue: the target's dispatch result releases the step's wait. A step whose
+    submit started no target (covered by a probe preemption, planned behind a probe) is
+    not linked: the tracker's time bound is its fallback."""
+    tracker = getattr(signal_state, "saturation", None)
+    if tracker is None:
+        return
+    for model, seq in _rescue_seqs(queue).items():
+        if model in models and seq > 0 and seq != before.get(model):
+            tracker.link_step(model, seq)
 
 
 def rescue_settle_ms(registry: Registry | None, model: str) -> float:

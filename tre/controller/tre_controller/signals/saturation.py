@@ -33,10 +33,13 @@ CRITICAL receiver anyway:
 * after a rescue step the count restarts and only windows after the routable count rose
   above the decision's count count again (bounded doubling 1 -> 2 -> 4); a step may land
   in parts over several windows (2 -> 3 -> 4 for target 4), every rise up to its target is
-  the step's own. A step that never
-  lands (refused, observe mode) releases the wait after ``await_timeout_ms``
-  (``saturation_step_unconfirmed``); a routable change the tracker did not cause restarts
-  the count too.
+  the step's own. A step that never lands is released on its dispatch result: when the
+  ActionQueue reports that every part of the step's rescue target ended without adding a
+  replica (refused, failed, not executed, dropped in observe mode), the wait ends at once
+  (``saturation_step_failed``). ``await_timeout_ms`` is only the fallback for a result
+  that never reaches the tracker (no linked queue record: a step covered by a probe
+  preemption or planned behind a probe; a lost result): ``saturation_step_unconfirmed``.
+  A routable change the tracker did not cause restarts the count too.
 
 Not full - a single long request running, a stuck request - stays with the TSS verdict:
 the v2 idle rule (no completed token is no evidence of starvation) is kept.
@@ -74,8 +77,10 @@ class SaturationRescueConfig:
     #: Gateway instant-sample period: a pod's newest sample older than one grid before
     #: the window end is stale and ignored.
     grid_ms: int = 10_000
-    #: A rescue step whose routable change is not seen within this long releases the
-    #: wait (the SM refused it, observe mode): counting restarts from that window.
+    #: Fallback only: a rescue step whose routable change is not seen within this long
+    #: and whose dispatch result never arrived (no linked queue record, a lost result)
+    #: releases the wait; counting restarts from that window. A step the queue reports
+    #: as ended without adding a replica is released at once (``step_failed``).
     await_timeout_ms: int = 30_000
 
     @classmethod
@@ -139,8 +144,8 @@ class SaturationVerdict:
     awaiting_step: bool = False
     #: Only windows ending after this count (a routable change was seen on it).
     count_after: int | None = None
-    #: ``saturation_step_landed`` / ``saturation_step_unconfirmed`` /
-    #: ``saturation_reset_external`` events of this window.
+    #: ``saturation_step_landed`` / ``saturation_step_failed`` /
+    #: ``saturation_step_unconfirmed`` / ``saturation_reset_external`` events of this window.
     events: tuple[str, ...] = ()
 
 
@@ -220,6 +225,8 @@ class _ModelState:
     #: Routable count at the last rescue step while its change is not yet seen.
     await_n: int | None = None
     await_end: int | None = None
+    #: The ActionQueue's id (``RescueTargetRecord.seq``) of the awaited step's dispatch.
+    await_ref: int | None = None
     #: Only windows ending after this count (a routable change was seen on it).
     count_after: int | None = None
     #: A window of the current traffic period was warm: an O1 hold is then only
@@ -271,6 +278,7 @@ class SaturationTracker:
         tss_warm: bool = False,
         idle: bool = False,
         routable_ids: Iterable[str] | None = None,
+        failed_dispatch: int | None = None,
     ) -> SaturationVerdict:
         """The model's verdict for the window ending at ``window_end_ms``; a re-read of
         the same window returns the same verdict without counting again.
@@ -280,12 +288,28 @@ class SaturationTracker:
         no token (``window_is_idle``: the O1 onset is cleared, the next traffic is a new
         onset) - re-opens the O1-hold eligibility; ``routable_ids``: the model's routable
         pods of the fleet view (the pods a landed step added are taken from it; None
-        without a fleet view: from the sampled pods). Events are reported once, on the
-        first read of a window."""
+        without a fleet view: from the sampled pods); ``failed_dispatch``: the queue id
+        of the model's last rescue target if it ended without adding a replica - the
+        awaited step linked to it (:meth:`link_step`) is released at once, also on a
+        re-read. Events are reported once, on the first read of a window."""
         state = self._state.setdefault(model, _ModelState())
         end = int(window_end_ms)
         routable = int(routable)
+        failed = (
+            failed_dispatch is not None
+            and state.await_n is not None
+            and state.await_ref == int(failed_dispatch)
+            and routable == state.await_n
+        )
         if state.last_end == end and state.verdict is not None:
+            if failed:
+                # The dispatch result arrived after this window was read: release now.
+                event = f"saturation_step_failed:{model}:n={routable}"
+                self._release_unlanded(state, end)
+                state.verdict = replace(
+                    state.verdict, awaiting_step=False, count_after=state.count_after, events=(event,)
+                )
+                return state.verdict
             return replace(state.verdict, events=())  # re-read: the events were reported
         if state.last_end is not None and end < state.last_end:
             # An older window than one already counted: report, never count.
@@ -293,6 +317,10 @@ class SaturationTracker:
         state.last_end = end
         cfg = self.config
         events: list[str] = []
+        if failed:
+            # The queue reports the step ended without adding a replica: it never lands.
+            events.append(f"saturation_step_failed:{model}:n={routable}")
+            self._release_unlanded(state, end)
         if idle and state.warm:
             # Idle window: the O1 onset is cleared, the next traffic is a new period.
             state.warm = False
@@ -317,7 +345,7 @@ class SaturationTracker:
             if state.await_n < routable <= target:
                 events.append(f"saturation_step_landed:{model}:{state.await_n}->{routable}")
                 state.count_after = end  # this window's sample may predate the change
-                state.await_n = state.await_end = None
+                state.await_n = state.await_end = state.await_ref = None
                 if routable >= target:
                     state.step_target = None
             elif routable > target:
@@ -327,11 +355,9 @@ class SaturationTracker:
                 events.append(f"saturation_reset_external:{model}:{state.await_n}->{routable}")
                 self._external(state, end)
             elif end - int(state.await_end or end) >= cfg.await_timeout_ms:
+                # Fallback: no dispatch result reached the tracker (see await_timeout_ms).
                 events.append(f"saturation_step_unconfirmed:{model}:n={routable}:waited_ms={end - int(state.await_end)}")
-                state.count_after = end
-                state.await_n = state.await_end = None
-                state.step_pods = None  # nothing landed: the next step is a first step again
-                state.step_target = None
+                self._release_unlanded(state, end)
         elif changed:
             events.append(f"saturation_reset_external:{model}:{state.last_routable}->{routable}")
             self._external(state, end)
@@ -387,10 +413,18 @@ class SaturationTracker:
         )
 
     @staticmethod
+    def _release_unlanded(state: _ModelState, end: int) -> None:
+        """The awaited step never lands: counting restarts after ``end``."""
+        state.count_after = end
+        state.await_n = state.await_end = state.await_ref = None
+        state.step_pods = None  # nothing landed: the next step is a first step again
+        state.step_target = None
+
+    @staticmethod
     def _external(state: _ModelState, end: int) -> None:
         state.streak = 0
         state.count_after = end
-        state.await_n = state.await_end = None
+        state.await_n = state.await_end = state.await_ref = None
         state.chain = False
         state.step_pods = None
         state.step_target = None
@@ -413,12 +447,20 @@ class SaturationTracker:
         state.streak = 0
         state.await_n = int(routable)
         state.await_end = int(window_end_ms)
+        state.await_ref = None
         state.last_routable = int(routable)
         state.chain = True
         state.step_pods = frozenset(str(pod) for pod in pods)
         state.step_target = int(target) if target is not None and int(target) > int(routable) else None
         if state.verdict is not None and state.verdict.window_end_ms == int(window_end_ms):
             state.verdict = replace(state.verdict, fire=False, ticks=0, awaiting_step=True)
+
+    def link_step(self, model: str, dispatch: int) -> None:
+        """The awaited step was submitted as the queue's rescue target ``dispatch``
+        (``RescueTargetRecord.seq``): its result releases the wait (``failed_dispatch``)."""
+        state = self._state.get(model)
+        if state is not None and state.await_n is not None:
+            state.await_ref = int(dispatch)
 
     def reset(self, model: str) -> None:
         self._state.pop(model, None)
