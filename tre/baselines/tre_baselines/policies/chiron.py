@@ -30,7 +30,14 @@ key             default      origin
 ==============  ===========  ==============================================================
 alpha           0.5          paper (Alg.1 smoothing factor)
 b_init          None         ours: initial B = b_init, else model max_num_seqs, else 256
-b_max           None         ours: cap on B = b_max, else max_num_seqs, else 256
+b_max           None         ours (part of adaptation 4): cap on B = b_max, else
+                             min(max_num_seqs, floor(num_gpu_blocks x block_size /
+                             kv_request_tokens)) - the requests of the trace shape the
+                             engine's KV cache holds at once (num_gpu_blocks / block_size
+                             from the pods' vllm:cache_config_info) - else max_num_seqs,
+                             else 256; the value and its source are in the decision inputs
+kv_request_tokens None       ours: in + out tokens of one request of the trace shape (the
+                             profile shape, e.g. 492 + 400 = 892)
 busy_def        effective    ours (see above): effective (packed busy count) | at_cap
                              (running+waiting >= B) | nonidle (running > 0); the last two
                              only as sensitivity runs
@@ -87,6 +94,10 @@ class ChironPolicy:
             raise ValueError("chiron: alpha must be in (0, 1]")
         self.b_init = params.get("b_init")
         self.b_max = params.get("b_max")
+        kv_req = params.get("kv_request_tokens")
+        self.kv_request_tokens = None if kv_req is None else int(kv_req)
+        if self.kv_request_tokens is not None and self.kv_request_tokens <= 0:
+            raise ValueError("chiron: kv_request_tokens must be > 0")
         self.busy_def = str(params.get("busy_def", "effective"))
         if self.busy_def not in BUSY_DEFS:
             raise ValueError(f"chiron: busy_def must be one of {BUSY_DEFS}")
@@ -113,9 +124,22 @@ class ChironPolicy:
         except KeyError:
             raise ValueError(f"chiron: no theta for {model!r}") from None
 
+    def _b_max(self, ms: ModelSnapshot) -> tuple[float, str]:
+        """(cap on the virtual B, where it came from)."""
+        if self.b_max is not None:
+            return float(self.b_max), "param"
+        seqs = ms.max_num_seqs or DEFAULT_B
+        if self.kv_request_tokens:
+            caps = [p.num_gpu_blocks * p.block_size // self.kv_request_tokens for p in ms.pods
+                    if p.num_gpu_blocks and p.block_size]
+            if caps:  # the requests of the trace shape the KV cache holds at once
+                kv = max(1, min(caps))
+                return float(min(seqs, kv)), "kv_cache" if kv < seqs else "max_num_seqs"
+        return float(seqs), "max_num_seqs"
+
     def _b_bounds(self, ms: ModelSnapshot) -> tuple[float, float]:
         b_init = self.b_init if self.b_init is not None else (ms.max_num_seqs or DEFAULT_B)
-        b_max = self.b_max if self.b_max is not None else (ms.max_num_seqs or DEFAULT_B)
+        b_max, self._b_max_src = self._b_max(ms)
         return float(b_init), float(b_max)
 
     def _local(self, st: _PodState, pod: PodSnapshot, ms: ModelSnapshot, b_max: float) -> dict:
@@ -202,7 +226,8 @@ class ChironPolicy:
             desired = max(1, int(math.ceil(busy / theta - _CEIL_TOL)))
             decision = Decision(desired, "ibp_target", {
                 "IBP": _num(ibp), "theta": _num(theta), "N": n, "busy": busy, **extra,
-                "target": desired, "busy_def": self.busy_def, "pods": per_pod,
+                "target": desired, "busy_def": self.busy_def, "b_max": _num(b_max, 1), "b_max_src": self._b_max_src,
+                "pods": per_pod,
             })
             gaps = evidence_gaps(ms, snap.now_ms, snap.tick_s)
             out[model] = hold_if_incomplete(decision, ms.awake, gaps)

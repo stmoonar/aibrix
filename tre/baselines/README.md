@@ -108,7 +108,9 @@ usable default and must be measured (`tools/`); the policies refuse to start wit
 
 - Chiron-global: `busy_def: effective` (busy = ceil(sum(running+waiting) / mean virtual B),
   the packed busy count; the paper's IBP assumes packing routing, ours spreads) for the main
-  runs, `nonidle` / `at_cap` only as sensitivity runs; theta = theta_trace from `tools/chiron_theta --method peak_mean
+  runs, `nonidle` / `at_cap` only as sensitivity runs; part of the same adaptation: B is capped
+  at min(max_num_seqs, floor(num_gpu_blocks x block_size / (in + out))) of the trace shape
+  (`kv_request_tokens`, engine cache info), recorded as `b_max` / `b_max_src` per decision; theta = theta_trace from `tools/chiron_theta --method peak_mean
   --interval-s 5` on the replayed trace (CPU only), 1/3 as a sensitivity row.
 - TokenScale-colocated and PreServe-oracle, one run (`tools/tokenscale_profile`): the hot alt
   trace has one shape (in ~492, out 400), so the buckets degenerate to one cell (disclose).

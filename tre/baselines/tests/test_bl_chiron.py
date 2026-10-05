@@ -279,3 +279,20 @@ def test_effective_busy_spread_load_gives_a_constant_target_no_ratchet():
     for awake0 in (1, 3, 8):
         assert set(run("effective", awake0)) == {want}, awake0
     assert min(cap, run("nonidle", 1)[-1]) == cap  # the old definition ratchets up to the cap
+
+
+def test_b_max_is_what_the_kv_cache_holds_for_the_trace_shape():
+    """Review P2-C: B is capped by min(max_num_seqs, KV blocks x block size / (in + out))."""
+    def kv_pod(blocks):
+        return PodSnapshot(pod="p0", model=M, node=None, gpu_ids=(0,), running=1.0, waiting=0.0, kv_usage=None,
+                           counters={}, num_gpu_blocks=blocks, block_size=16, scraped_at_ms=0)
+
+    d = one(policy(kv_request_tokens=892), snap([kv_pod(20381)], max_num_seqs=1024))
+    assert d.inputs["b_max"] == 365 and d.inputs["b_max_src"] == "kv_cache"   # 20381 * 16 // 892
+    assert info(d)["B"] == 365                                                  # b_init capped too
+    d = one(policy(kv_request_tokens=892), snap([kv_pod(20381)], max_num_seqs=256))
+    assert (d.inputs["b_max"], d.inputs["b_max_src"]) == (256, "max_num_seqs")
+    d = one(policy(), snap([kv_pod(20381)], max_num_seqs=1024))                 # shape not configured
+    assert (d.inputs["b_max"], d.inputs["b_max_src"]) == (1024, "max_num_seqs")
+    d = one(policy(b_max=50, kv_request_tokens=892), snap([kv_pod(20381)]))
+    assert (d.inputs["b_max"], d.inputs["b_max_src"]) == (50, "param")

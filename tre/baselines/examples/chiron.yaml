@@ -3,7 +3,8 @@
 # the engine) - disclose as an adaptation.
 alpha: 0.5          # paper: Alg.1 smoothing factor
 # b_init: 256       # ours: initial virtual B; default = model max_num_seqs, else 256
-# b_max: 256        # ours: cap on B; default = model max_num_seqs, else 256
+# b_max: 256        # ours: cap on B; default = min(max_num_seqs, KV tokens / kv_request_tokens)
+kv_request_tokens: 892  # in + out of one request of the trace shape (profile shape 492 + 400)
 busy_def: effective # main runs: busy = ceil(sum(running+waiting) / mean B) - the packed busy count
                     # (our gateway spreads requests; disclosed adaptation). Sensitivity only:
                     # nonidle (running > 0, ratchets to the cap under spreading) | at_cap
