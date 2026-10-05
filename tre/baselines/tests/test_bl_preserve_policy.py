@@ -160,7 +160,7 @@ def test_out_of_order_unknown_and_missing_events_do_not_crash() -> None:
         ev("arr", "q", "p0", 5000, 10, 5), ev("done", "q", "p0", 5000),
         ev("ft", "q", "p0", 5000),                                     # ft after its done
         ev("ft", "w", "p0", 5000, 100, 10),                            # ft without arr
-        ev("arr", "x", "pZ", 5000, 10, 5), ev("ft", "x", "pZ", 5000),  # pod not in snapshot
+        ev("arr", "x", "pZ", 5000, 10, 5), ev("ft", "x", "pZ", 5000),  # pod not in snapshot (yet)
         ev("arr", "y", "p0", 5000, 10, None), ev("ft", "y", "p0", 5000),  # no max_tokens
         ev("arr", "v", None, 5000, None, 5), ev("ft", "v", "p0", 5000),   # no in_tokens, arr without pod
         ev("ft", "o", "p0", 4000, 1, 1),                               # older than the pod's clock
@@ -168,7 +168,7 @@ def test_out_of_order_unknown_and_missing_events_do_not_crash() -> None:
     d = p.decide(snap(5000, pods, events))
     anom = p.anomalies["m"]
     assert anom["unknown_req"] == 1 and anom["done_before_ft"] == 1 and anom["ft_after_done"] == 1
-    assert anom["ft_without_arr"] == 2 and anom["unknown_pod"] == 1
+    assert anom["ft_without_arr"] == 2 and anom["ft_buffered"] == 1  # pZ: kept until it appears
     assert anom["missing_max_tokens"] == 1 and anom["missing_in_tokens"] == 1
     assert anom["out_of_order"] == 1
     assert d["m"].inputs["anom"]["unknown_req"] == 1
@@ -463,3 +463,15 @@ def test_tier2_never_isolates_below_the_windows_tier1_n() -> None:
     # next window N=1: the floor follows the window
     d = p.decide(snap(600_000, two(600_000), awake=2, replay=REPLAY))["m"]
     assert d.desired == 1 and d.inputs["tier1_n"] == 1
+
+
+def test_ft_for_a_pod_not_yet_in_the_snapshot_is_applied_when_it_appears() -> None:
+    """Review P2-5: the event stream can run ahead of /v2/state (a pod just woke)."""
+    p = make()
+    p.decide(snap(1000, [pod("p0", 1000)], load("r", "p1", 1000, 500, 100) + load("s", "p1", 1000, 300, 100)))
+    assert p.anomalies["m"]["ft_buffered"] == 2 and p.anomalies["m"]["unknown_pod"] == 0
+    p.decide(snap(1500, [pod("p0", 1500)], [ev("done", "s", "p1", 1400)]))  # s ends before p1 shows up
+    d = p.decide(snap(3000, [pod("p0", 3000), pod("p1", 3000)]))["m"]
+    assert list(amap(p, "p1").requests) == [("r", "p1")] and p._models["m"].active == {("r", "p1"): "p1"}
+    assert d.inputs["anom"]["ft_buffered_applied"] == 1 and p.anomalies["m"]["done_while_buffered"] == 1
+    assert amap(p, "p1").requests[("r", "p1")].start == 0 and amap(p, "p1").it == 26  # walked from 1000 ms

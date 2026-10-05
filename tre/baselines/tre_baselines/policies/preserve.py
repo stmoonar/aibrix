@@ -134,6 +134,9 @@ class _ModelState:
     arr: dict[tuple[str, Optional[str]], _ArrInfo] = field(default_factory=dict)
     #: (req_id, pod) whose ``done`` came before their ``ft`` -> ts_ms.
     tombstones: dict[tuple[str, Optional[str]], int] = field(default_factory=dict)
+    #: pod -> request key -> (arr info, ft ts): ``ft`` events for a pod the snapshot does
+    #: not show yet (the stream can run ahead of /v2/state); applied when the pod appears.
+    pending_ft: dict[str, dict[tuple[str, Optional[str]], tuple["_ArrInfo", int]]] = field(default_factory=dict)
     #: active request key -> pod holding it.
     active: dict[tuple[str, Optional[str]], str] = field(default_factory=dict)
     target: Optional[int] = None
@@ -310,28 +313,21 @@ class PreServePolicy:
                 anom["ft_without_arr"] += 1
                 info = _ArrInfo(e.in_tokens, e.max_tokens, int(e.ts_ms))
             pod = e.pod
-            ps = st.pods.get(pod) if pod else None
-            if ps is None:
+            if not pod:
                 anom["unknown_pod"] += 1
                 return
-            P = info.in_tokens
-            if P is None:
-                anom["missing_in_tokens"] += 1
-                P = 0
-            D = info.max_tokens
-            if D is None or D <= 0:
-                anom["missing_max_tokens"] += 1
-                D = self._default_D(ms.model)
-            if key in st.active:
-                anom["dup_ft"] += 1
-                old_pod = st.active.pop(key)
-                if old_pod in st.pods:
-                    st.pods[old_pod].amap.remove(key)
-            self._advance_to(st, ps, int(e.ts_ms), anom)
-            ps.amap.add(key, int(P), int(D), ps.M, ts_ms=int(e.ts_ms))
-            st.active[key] = pod
+            ps = st.pods.get(pod)
+            if ps is None:  # the pod is not in the snapshot (yet): keep the ft for it
+                st.pending_ft.setdefault(pod, {})[key] = (info, int(e.ts_ms))
+                anom["ft_buffered"] += 1
+                return
+            self._add_ft(ms, st, key, info, pod, ps, int(e.ts_ms), anom)
             return
         if e.kind == "done":
+            for pod_name in ([e.pod] if e.pod else list(st.pending_ft)):
+                if st.pending_ft.get(pod_name, {}).pop(key, None) is not None:
+                    anom["done_while_buffered"] += 1
+                    return
             akey = self._find_active(st, e.req_id, e.pod)
             if akey is not None:
                 pod = st.active.pop(akey)
@@ -350,6 +346,33 @@ class PreServePolicy:
             return
         anom["bad_event"] += 1
 
+    def _add_ft(self, ms: ModelSnapshot, st: _ModelState, key, info: "_ArrInfo", pod: str, ps: _PodState,
+                ts_ms: int, anom: Counter) -> None:
+        P = info.in_tokens
+        if P is None:
+            anom["missing_in_tokens"] += 1
+            P = 0
+        D = info.max_tokens
+        if D is None or D <= 0:
+            anom["missing_max_tokens"] += 1
+            D = self._default_D(ms.model)
+        if key in st.active:
+            anom["dup_ft"] += 1
+            old_pod = st.active.pop(key)
+            if old_pod in st.pods:
+                st.pods[old_pod].amap.remove(key)
+        self._advance_to(st, ps, int(ts_ms), anom)
+        ps.amap.add(key, int(P), int(D), ps.M, ts_ms=int(ts_ms))
+        st.active[key] = pod
+
+    def _apply_buffered(self, ms: ModelSnapshot, st: _ModelState, anom: Counter) -> None:
+        """``ft`` events kept for a pod that has now appeared: added at their own time."""
+        for pod in [p for p in st.pending_ft if p in st.pods]:
+            ps = st.pods[pod]
+            for key, (info, ts) in sorted(st.pending_ft.pop(pod).items(), key=lambda kv: kv[1][1]):
+                self._add_ft(ms, st, key, info, pod, ps, ts, anom)
+                anom["ft_buffered_applied"] += 1
+
     def _expire(self, st: _ModelState, now_ms: int, anom: Counter) -> None:
         """Bookkeeping only: arr records whose ft never came and tombstones. A request in
         the map is never expired by age (it leaves on done)."""
@@ -359,6 +382,12 @@ class PreServePolicy:
             anom["expired_arr"] += 1
         for key in [k for k, ts in st.tombstones.items() if ts < horizon]:
             del st.tombstones[key]
+        for pod in list(st.pending_ft):
+            for key in [k for k, (_i, ts) in st.pending_ft[pod].items() if ts < horizon]:
+                del st.pending_ft[pod][key]
+                anom["expired_buffered_ft"] += 1
+            if not st.pending_ft[pod]:
+                del st.pending_ft[pod]
 
     @staticmethod
     def _engine_idle(st: _ModelState, ps: _PodState, pod: PodSnapshot, anom: Counter) -> None:
@@ -434,6 +463,7 @@ class PreServePolicy:
         # Tier-2 feed: pods, events, then walk every head to its scrape instant.
         skipped: dict[str, str] = {}
         self._sync_pods(ms, st, anom, skipped)
+        self._apply_buffered(ms, st, anom)
         for e in ms.events:
             self._on_event(ms, st, e, anom)
         for pod in ms.pods:
